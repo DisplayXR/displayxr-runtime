@@ -8,3 +8,8 @@
 -keep class **.R$* {
     <fields>;
 }
+
+-keep class com.leia.sdk.** { *; }
+-keep class com.leia.core.** { *; }
+-keep class com.leia.internal.** { *; }
+-keep class com.leia.headtracking.** { *; }

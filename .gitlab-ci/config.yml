@@ -57,7 +57,7 @@ fdo_ci_templates_sha: 7811ba9814a3bad379377241c6c6b62d78b20eac
 
 # These config defines are used for all NDK builds
 .android_cmake_defines: &android_cmake_defines
-  ANDROID_PLATFORM: 26
+  ANDROID_PLATFORM: 29
   CMAKE_TOOLCHAIN_FILE: /opt/android-ndk/build/cmake/android.toolchain.cmake
   Eigen3_DIR: /usr/lib/cmake/eigen3/
   EIGEN3_INCLUDE_DIR: /usr/include/eigen3
@@ -259,7 +259,7 @@ distributions:
               CMAKE_CXX_COMPILER: /usr/bin/clang++
 
 android:
-  platform: 26
+  platform: 29
 
 packaging:
   # Name and email associated with the package

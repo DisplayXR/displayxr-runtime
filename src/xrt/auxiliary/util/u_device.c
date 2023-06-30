@@ -206,20 +206,20 @@ u_device_setup_split_side_by_side(struct xrt_device *xdev, const struct u_device
 	xdev->hmd->views[1].viewport.h_pixels = h_pixels;
 	xdev->hmd->views[1].rot = u_device_rotation_ident;
 
+	// Override distorsion fov with our fov.
 	{
-		/* right eye */
-		if (!math_compute_fovs(w_meters, lens_center_x_meters[1], info->fov[1], h_meters,
-		                       lens_center_y_meters[1], 0, &xdev->hmd->distortion.fov[1])) {
-			return false;
-		}
-	}
-	{
-		/* left eye - mirroring right eye */
-		xdev->hmd->distortion.fov[0].angle_up = xdev->hmd->distortion.fov[1].angle_up;
-		xdev->hmd->distortion.fov[0].angle_down = xdev->hmd->distortion.fov[1].angle_down;
+		const float halfAngle0 = info->fov[0] / 2.0f;
+		const float halfAngle1 = info->fov[1] / 2.0f;
 
-		xdev->hmd->distortion.fov[0].angle_left = -xdev->hmd->distortion.fov[1].angle_right;
-		xdev->hmd->distortion.fov[0].angle_right = -xdev->hmd->distortion.fov[1].angle_left;
+		xdev->hmd->distortion.fov[0].angle_up = halfAngle0;
+		xdev->hmd->distortion.fov[0].angle_down = -halfAngle0;
+		xdev->hmd->distortion.fov[0].angle_left = -halfAngle0;
+		xdev->hmd->distortion.fov[0].angle_right = halfAngle0;
+
+		xdev->hmd->distortion.fov[1].angle_up = halfAngle1;
+		xdev->hmd->distortion.fov[1].angle_down = -halfAngle1;
+		xdev->hmd->distortion.fov[1].angle_left = -halfAngle1;
+		xdev->hmd->distortion.fov[1].angle_right = halfAngle1;
 	}
 
 	return true;
@@ -393,6 +393,20 @@ u_device_get_view_pose(const struct xrt_vec3 *eye_relation, uint32_t view_index,
 	if (pose.position.z > 0.0f && adjust) {
 		pose.position.z = -pose.position.z;
 	}
+
+	/*
+	float baselineScaling = 10.0f; // emulate default CNSDK LWETest values. In OpenVR, we used the IPD (eye_relation here) to change the effective baseline scaling
+	if (view_index == 0) {
+		pose.position.x = -5.0f;
+		pose.position.y = 0.0f;
+		pose.position.z = 0.0f;
+	}
+	else {
+		pose.position.x = 5.0f;
+		pose.position.y = 0.0f;
+		pose.position.z = 0.0f;
+	}
+	*/
 
 	*out_pose = pose;
 }

@@ -32,6 +32,10 @@
 #include "main/comp_frame.h"
 #include "main/comp_mirror_to_debug_gui.h"
 
+#ifdef XRT_OS_ANDROID
+#include "android/android_globals.h"
+#endif
+
 #ifdef XRT_FEATURE_WINDOW_PEEK
 #include "main/comp_window_peek.h"
 #endif
@@ -40,6 +44,12 @@
 #include "vk/vk_cmd.h"
 #include "vk/vk_image_readback_to_xf_pool.h"
 #include "vk/vk_cmd.h"
+
+#ifdef XRT_HAVE_CNSDK
+#include <leia/sdk/core.h>
+#include <leia/sdk/core.interlacer.vulkan.h>
+#include <leia/common/version.h>
+#endif
 
 #include <string.h>
 #include <stdlib.h>
@@ -67,6 +77,9 @@
  * Private struct(s).
  *
  */
+
+struct leia_core;
+struct leia_interlacer;
 
 /*!
  * Holds associated vulkan objects and state to render with a distortion.
@@ -120,6 +133,9 @@ struct comp_renderer
 	 */
 	struct comp_layer_renderer *lr;
 	//! @}
+
+	struct leia_core* cnsdk;
+    struct leia_interlacer* interlacer;
 };
 
 
@@ -455,6 +471,24 @@ renderer_create_layer_renderer(struct comp_renderer *r)
 	if (layer_count != 0) {
 		comp_layer_renderer_allocate_layers(r->lr, layer_count);
 	}
+
+#ifdef XRT_HAVE_CNSDK
+	leia_platform_on_library_load();
+
+    struct leia_core_init_configuration* config = leia_core_init_configuration_alloc(CNSDK_VERSION);
+#ifdef XRT_OS_ANDROID
+    leia_core_init_configuration_set_platform_android_java_vm(config, (JavaVM*)android_globals_get_vm());
+    leia_core_init_configuration_set_platform_android_handle(config, LEIA_CORE_ANDROID_HANDLE_ACTIVITY, (jobject)android_globals_get_activity());
+#endif
+    leia_core_init_configuration_set_platform_log_level(config, kLeiaLogLevelTrace);
+    leia_core_init_configuration_set_enable_validation(config, true);
+    r->cnsdk = leia_core_init_async(config);
+    if (r->cnsdk)
+    {
+        leia_core_set_backlight(r->cnsdk, true);
+    }
+    leia_core_init_configuration_free(config);
+#endif
 }
 
 /*!
@@ -810,6 +844,20 @@ renderer_fini(struct comp_renderer *r)
 
 	// Do this after the mirror struct.
 	comp_layer_renderer_destroy(&(r->lr));
+
+#ifdef XRT_HAVE_CNSDK
+    if (r->interlacer) {
+        leia_interlacer_release(r->interlacer);
+        r->interlacer = NULL;
+    }
+
+    if (r->cnsdk) {
+        leia_core_release(r->cnsdk);
+        r->cnsdk = NULL;
+    }
+
+    leia_platform_on_library_unload();
+#endif // XRT_HAVE_CNSDK
 }
 
 static VkImageView
@@ -859,6 +907,43 @@ do_gfx_mesh_and_proj(struct comp_renderer *r,
 	};
 
 	renderer_build_rendering(r, rr, rts, src_samplers, src_image_views, src_norm_rects);
+}
+
+static void
+do_cnsdk_interlacing(struct comp_renderer *r,
+                     struct render_gfx_target_resources *rtr,
+                     const struct comp_layer *layer,
+                     const struct xrt_layer_projection_view_data *lvd,
+                     const struct xrt_layer_projection_view_data *rvd)
+{
+#ifdef XRT_HAVE_CNSDK
+	if (!r->interlacer && leia_core_is_initialized(r->cnsdk)) {
+		struct leia_interlacer_init_configuration *ic = leia_interlacer_init_configuration_alloc();
+		leia_interlacer_init_configuration_set_use_atlas_for_views(ic, false);
+		r->interlacer = leia_interlacer_vulkan_initialize(
+		    r->cnsdk, ic, r->c->base.vk.device, r->c->base.vk.physical_device, VK_FORMAT_B8G8R8A8_SRGB,
+		    r->c->target->format, VK_FORMAT_D32_SFLOAT, 3);
+		leia_interlacer_init_configuration_free(ic);
+	}
+	if (r->interlacer) {
+		// Get swapchain images.
+		const struct comp_swapchain_image *left = &layer->sc_array[0]->images[lvd->sub.image_index];
+		const struct comp_swapchain_image *right = &layer->sc_array[1]->images[rvd->sub.image_index];
+
+		// Get swapchain image views.
+		VkImageView imageViewLeft = get_image_view(left, layer->data.flags, lvd->sub.array_index);
+		VkImageView imageViewRight = get_image_view(right, layer->data.flags, rvd->sub.array_index);
+
+		// Perform interlacing.
+		leia_interlacer_set_flip_input_uv_vertical(r->interlacer, true);
+		leia_interlacer_vulkan_set_view_for_texture_array(r->interlacer, 0, imageViewLeft, 0);
+		leia_interlacer_vulkan_set_view_for_texture_array(r->interlacer, 1, imageViewRight, 0);
+		leia_interlacer_set_shader_debug_mode(r->interlacer, LEIA_SHADER_DEBUG_MODE_NONE);
+		leia_interlacer_vulkan_do_post_process(
+		    r->interlacer, rtr->data.width, rtr->data.height, false, rtr->framebuffer,
+		    r->c->target->images[r->acquired_buffer].handle, NULL, NULL, NULL, 0);
+	}
+#endif
 }
 
 /*!
@@ -927,9 +1012,13 @@ dispatch_graphics(struct comp_renderer *r, struct render_gfx *rr)
 		c->base.slot.fovs[0] = lvd->fov;
 		c->base.slot.fovs[1] = rvd->fov;
 
-		do_gfx_mesh_and_proj(r, rr, rtr, layer, lvd, rvd);
+		if (r->cnsdk) {
+			do_cnsdk_interlacing(r, rtr, layer, lvd, rvd);
+		} else {
+            do_gfx_mesh_and_proj(r, rr, rtr, layer, lvd, rvd);
 
-		renderer_submit_queue(r, rr->r->cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+            renderer_submit_queue(r, rr->r->cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+        }
 
 		// We mark afterwards to not include CPU time spent.
 		comp_target_mark_submit(ct, c->frame.rendering.id, os_monotonic_get_ns());
@@ -945,9 +1034,13 @@ dispatch_graphics(struct comp_renderer *r, struct render_gfx *rr)
 		c->base.slot.fovs[0] = lvd->fov;
 		c->base.slot.fovs[1] = rvd->fov;
 
-		do_gfx_mesh_and_proj(r, rr, rtr, layer, lvd, rvd);
+        if (r->cnsdk) {
+			do_cnsdk_interlacing(r, rtr, layer, lvd, rvd);
+		} else {
+			do_gfx_mesh_and_proj(r, rr, rtr, layer, lvd, rvd);
 
-		renderer_submit_queue(r, rr->r->cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+			renderer_submit_queue(r, rr->r->cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+		}
 
 		// We mark afterwards to not include CPU time spent.
 		comp_target_mark_submit(ct, c->frame.rendering.id, os_monotonic_get_ns());

@@ -61,8 +61,7 @@ get_vk(struct comp_window_android *cwa)
 static bool
 comp_window_android_init(struct comp_target *ct)
 {
-	(void)ct;
-
+    struct comp_window_android *cwa = (struct comp_window_android *)ct;
 	return true;
 }
 
@@ -75,7 +74,7 @@ comp_window_android_destroy(struct comp_target *ct)
 
 	android_custom_surface_destroy(&cwa->custom_surface);
 
-	free(ct);
+    free(ct);
 }
 
 static void

@@ -442,7 +442,7 @@ u_distortion_mesh_fill_in_none(struct xrt_device *xdev)
 	// Make the target mostly usable.
 	target->distortion.models |= XRT_DISTORTION_MODEL_NONE;
 	target->distortion.models |= XRT_DISTORTION_MODEL_MESHUV;
-	target->distortion.preferred = XRT_DISTORTION_MODEL_MESHUV;
+	target->distortion.preferred = XRT_DISTORTION_MODEL_NONE;
 }
 
 void

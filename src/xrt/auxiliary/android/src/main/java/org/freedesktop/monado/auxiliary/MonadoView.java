@@ -135,7 +135,7 @@ public class MonadoView extends SurfaceView
     public static DisplayMetrics getDisplayMetrics(@NonNull Context context) {
         DisplayMetrics displayMetrics = new DisplayMetrics();
         WindowManager wm = (WindowManager) context.getSystemService(Context.WINDOW_SERVICE);
-        wm.getDefaultDisplay().getMetrics(displayMetrics);
+        wm.getDefaultDisplay().getRealMetrics(displayMetrics);
         return displayMetrics;
     }
 

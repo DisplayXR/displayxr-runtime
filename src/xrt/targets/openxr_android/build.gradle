@@ -137,6 +137,9 @@ android {
                 println "Path to Python 3 explicitly specified: ${project.pythonBinary}"
                 cmake.arguments "-DPYTHON_EXECUTABLE=${project.pythonBinary}"
             }
+
+            cmake.arguments "-DCMAKE_PREFIX_PATH=${project.cnsdkDir}"
+            cmake.arguments "-DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH"
         }
 
         // Be sure to copy over licenses formatted as required.
@@ -144,6 +147,27 @@ android {
 
         // We also need the unpacked Eigen
         preBuild.dependsOn(unpackEigen)
+
+        //noinspection ChromeOsAbiSupport
+        ndk { abiFilters 'arm64-v8a' }
+        packagingOptions {
+            jniLibs {
+                exclude 'lib/arm64-v8a/libleiaSDK.so'
+            }
+        }
+
+        // TODO: conditional
+        packagingOptions {
+            doNotStrip '**/*.so'
+
+            jniLibs {
+                keepDebugSymbols += "**/*.so"
+            }
+        }
+
+        ndk {
+            debugSymbolLevel 'FULL'
+        }
     }
 
     buildTypes {
@@ -157,6 +181,7 @@ android {
     externalNativeBuild {
         cmake {
             path "${rootDir}/CMakeLists.txt"
+            version "3.22.1"
         }
     }
 
@@ -230,5 +255,10 @@ dependencies {
     // for Hilt dependency injection
     implementation "com.google.dagger:hilt-android:$hiltVersion"
     kapt "com.google.dagger:hilt-compiler:$hiltVersion"
-
 }
+
+def addFileDependency(dependencies, depFile) {
+    assert file(depFile).exists()
+    dependencies.add('implementation', files(depFile))
+}
+addFileDependency(dependencies, "${project.cnsdkDir}/android/sdk-faceTrackingService-${project.cnsdkVersion}.aar")

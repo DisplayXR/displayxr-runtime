@@ -19,6 +19,11 @@
 
 #undef ALLOW_CLOSING_WINDOW
 
+static bool          g_use_secondary_monitor = true;
+static bool          g_use_fullscreen        = true;
+static int           g_monitor_info_count    = 0;
+static MONITORINFOEX g_monitor_info[16]      = { 0 };
+
 /*
  *
  * Private structs.
@@ -188,21 +193,127 @@ comp_window_mswin_flush(struct comp_target *ct)
 	struct comp_window_mswin *cwm = (struct comp_window_mswin *)ct;
 }
 
+static BOOL CALLBACK GetDefaultWindowStartPos_MonitorEnumProc(__in HMONITOR hMonitor, __in HDC hdcMonitor, __in LPRECT lprcMonitor, __in LPARAM dwData)
+{
+	MONITORINFOEX info;
+	ZeroMemory(&info, sizeof(info));
+	info.cbSize = sizeof(info);
+	GetMonitorInfo(hMonitor, &info);
+	g_monitor_info[g_monitor_info_count++] = info;
+	return TRUE;
+}
+
+static bool get_leia_display_top_left_coordinate(int* x, int* y)
+{
+	// Get connected monitor info.
+	g_monitor_info_count = 0;
+	EnumDisplayMonitors(NULL, NULL, GetDefaultWindowStartPos_MonitorEnumProc, NULL);
+
+	const char kLeiaDisplayIDPrefix[] = "\\\\?\\DISPLAY#AUO2E9A";
+	for (int iMonitor = 0; iMonitor < g_monitor_info_count; ++iMonitor) {
+		int iDevice = 0;
+		while (true) {
+			DISPLAY_DEVICE device;
+			device.cb = sizeof(device);
+			if (!EnumDisplayDevices(g_monitor_info[iMonitor].szDevice, iDevice, &device,
+						EDD_GET_DEVICE_INTERFACE_NAME)) {
+				break;
+			}
+
+			if (strncmp(device.DeviceID, kLeiaDisplayIDPrefix, sizeof(kLeiaDisplayIDPrefix) - 1) == 0) {
+				RECT *rect = &g_monitor_info[iMonitor].rcMonitor;
+				*x = rect->left;
+				*y = rect->top;
+				return true;
+			}
+
+			++iDevice;
+		}
+	}
+
+	if (!g_use_secondary_monitor) {
+		return false;
+	}
+
+	// If we have multiple monitors, select the first non-primary one.
+	for (int i = 0; i < g_monitor_info_count; i++)
+	{
+		if (0 == (g_monitor_info[i].dwFlags & MONITORINFOF_PRIMARY)) {
+			*x = g_monitor_info[i].rcMonitor.left;
+			*y = g_monitor_info[i].rcMonitor.top;
+			return true;
+		}
+	}
+
+	// Didn't find a non-primary, there is only one display connected.
+	x = 0;
+	y = 0;
+	return false;
+}
+
+void set_fullscreen(HWND hWnd, bool fullscreen)
+{
+	static int windowPrevX = 0;
+	static int windowPrevY = 0;
+	static int windowPrevWidth = 0;
+	static int windowPrevHeight = 0;
+
+	DWORD style = GetWindowLong(hWnd, GWL_STYLE);
+	if (fullscreen) {
+		RECT rect;
+		MONITORINFO mi = { sizeof(mi) };
+		GetWindowRect(hWnd, &rect);
+
+		windowPrevX = rect.left;
+		windowPrevY = rect.top;
+		windowPrevWidth = rect.right - rect.left;
+		windowPrevHeight = rect.bottom - rect.top;
+
+		GetMonitorInfo(MonitorFromWindow(hWnd, MONITOR_DEFAULTTOPRIMARY), &mi);
+		SetWindowLong(hWnd, GWL_STYLE, style & ~WS_OVERLAPPEDWINDOW);
+		SetWindowPos(hWnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
+			mi.rcMonitor.right - mi.rcMonitor.left,
+			mi.rcMonitor.bottom - mi.rcMonitor.top,
+			SWP_NOOWNERZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+	}
+	else
+	{
+		MONITORINFO mi = { sizeof(mi) };
+		UINT flags = SWP_NOZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW;
+		GetMonitorInfo(MonitorFromWindow(hWnd, MONITOR_DEFAULTTOPRIMARY), &mi);
+		SetWindowLong(hWnd, GWL_STYLE, style | WS_OVERLAPPEDWINDOW);
+		SetWindowPos(hWnd, HWND_NOTOPMOST, windowPrevX, windowPrevY, windowPrevWidth, windowPrevHeight, flags);
+	}
+}
+
 static void
 comp_window_mswin_window_loop(struct comp_window_mswin *cwm)
 {
 	struct comp_target *ct = &cwm->base.base;
 	RECT rc = {0, 0, (LONG)(ct->width), (LONG)ct->height};
 
+	int secondary_monitor_X = 0;
+	int secondary_monitor_y = 0;
+	if (get_leia_display_top_left_coordinate(&secondary_monitor_X, &secondary_monitor_y)) {
+		rc.left   = secondary_monitor_X;
+		rc.top    = secondary_monitor_y;
+		rc.right  = secondary_monitor_X + ct->width;
+		rc.bottom = secondary_monitor_y + ct->height;
+	}
+
 	COMP_INFO(ct->c, "Creating window");
 	cwm->window =
-	    CreateWindowExW(0, szWindowClass, L"Monado (Windowed)", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
+	    CreateWindowExW(0, szWindowClass, L"Monado (Windowed)", WS_OVERLAPPEDWINDOW, rc.left, rc.top,
 	                    rc.right - rc.left, rc.bottom - rc.top, NULL, NULL, cwm->instance, NULL);
 	if (cwm->window == NULL) {
 		COMP_ERROR_GETLASTERROR(ct->c, "Failed to create window: %s", "Failed to create window");
 		// parent thread will be notified (by caller) that we have exited.
 		return;
 	}
+
+	// Set fullscreen if requested.
+	if (g_use_fullscreen)
+		set_fullscreen(cwm->window, true);
 
 	COMP_INFO(ct->c, "Setting window properties and showing window");
 	SetPropW(cwm->window, szWindowData, cwm);

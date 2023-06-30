@@ -58,9 +58,9 @@ android_sensor_callback(int fd, int events, void *data)
 			break;
 		}
 		case ASENSOR_TYPE_GYROSCOPE: {
-			gyro.x = -event.data[1];
-			gyro.y = event.data[0];
-			gyro.z = event.data[2];
+			gyro.x = event.data[1];
+			gyro.y = -event.data[0];
+			gyro.z = -event.data[2];
 
 			ANDROID_TRACE(d, "gyro %ld %.2f %.2f %.2f", event.timestamp, gyro.x, gyro.y, gyro.z);
 
@@ -201,10 +201,54 @@ static bool
 android_device_compute_distortion(
     struct xrt_device *xdev, uint32_t view, float u, float v, struct xrt_uv_triplet *result)
 {
-	struct android_device *d = android_device(xdev);
-	return u_compute_distortion_cardboard(&d->cardboard.values[view], u, v, result);
+//	struct android_device *d = android_device(xdev);
+//	return u_compute_distortion_cardboard(&d->cardboard.values[view], u, v, result);
+    result->r.x = u;
+    result->r.y = v;
+    result->g.x = u;
+    result->g.y = v;
+    result->b.x = u;
+    result->b.y = v;
+    return true;
 }
 
+
+static void
+u_distortion_lumepad_calculate(uint32_t screen_w_pixels, uint32_t screen_h_pixels, struct xrt_fov const* fov,
+                                 struct xrt_hmd_parts *parts)
+{
+    uint32_t w_pixels = screen_w_pixels / 2;
+    uint32_t h_pixels = screen_h_pixels;
+
+    // Base assumption, the driver can change afterwards.
+    if (parts->blend_mode_count == 0) {
+        size_t idx = 0;
+        parts->blend_modes[idx++] = XRT_BLEND_MODE_OPAQUE;
+        parts->blend_mode_count = idx;
+    }
+
+    // Use the full screen.
+    parts->screens[0].w_pixels = screen_w_pixels;
+    parts->screens[0].h_pixels = screen_h_pixels;
+
+    parts->views[0].viewport.x_pixels = 0;
+    parts->views[0].viewport.y_pixels = 0;
+    parts->views[0].viewport.w_pixels = w_pixels;
+    parts->views[0].viewport.h_pixels = h_pixels;
+    parts->views[0].display.w_pixels = w_pixels;
+    parts->views[0].display.h_pixels = h_pixels;
+    parts->views[0].rot = u_device_rotation_ident;
+    parts->distortion.fov[0] = *fov;
+
+    parts->views[1].viewport.x_pixels = w_pixels;
+    parts->views[1].viewport.y_pixels = 0;
+    parts->views[1].viewport.w_pixels = w_pixels;
+    parts->views[1].viewport.h_pixels = h_pixels;
+    parts->views[1].display.w_pixels = w_pixels;
+    parts->views[1].display.h_pixels = h_pixels;
+    parts->views[1].rot = u_device_rotation_ident;
+    parts->distortion.fov[1] = *fov;
+}
 
 struct android_device *
 android_device_create()
@@ -262,34 +306,16 @@ android_device_create()
 	const uint32_t ppi = metrics.density_dpi;
 
 	const float angle = 45 * M_PI / 180.0; // 0.698132; // 40Deg in rads
-	const float w_meters = ((float)w_pixels / (float)ppi) * 0.0254f;
-	const float h_meters = ((float)h_pixels / (float)ppi) * 0.0254f;
+    struct xrt_fov fov =
+    {
+        .angle_left = -angle,
+        .angle_right = angle,
+        .angle_up = angle,
+        .angle_down = -angle,
+    };
+    u_distortion_lumepad_calculate(w_pixels, h_pixels, &fov, d->base.hmd);
 
-	struct u_cardboard_distortion_arguments args = {
-	    .distortion_k = {0.441f, 0.156f, 0.f, 0.f, 0.f},
-	    .screen =
-	        {
-	            .w_pixels = w_pixels,
-	            .h_pixels = h_pixels,
-	            .w_meters = w_meters,
-	            .h_meters = h_meters,
-	        },
-	    .inter_lens_distance_meters = 0.06f,
-	    .lens_y_center_on_screen_meters = h_meters / 2.0f,
-	    .screen_to_lens_distance_meters = 0.042f,
-	    .fov =
-	        {
-	            .angle_left = -angle,
-	            .angle_right = angle,
-	            .angle_up = angle,
-	            .angle_down = -angle,
-	        },
-	};
-
-	u_distortion_cardboard_calculate(&args, d->base.hmd, &d->cardboard);
-
-
-	u_var_add_root(d, "Android phone", true);
+	u_var_add_root(d, "Lumepad", true);
 	u_var_add_ro_vec3_f32(d, &d->fusion.last.accel, "last.accel");
 	u_var_add_ro_vec3_f32(d, &d->fusion.last.gyro, "last.gyro");
 

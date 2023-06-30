@@ -8,6 +8,13 @@ project(
 	LANGUAGES C CXX
 	)
 
+if(MSVC)
+    STRING(REPLACE "/O2" "/Od" CMAKE_CXX_FLAGS_RELWITHDEBINFO ${CMAKE_CXX_FLAGS_RELWITHDEBINFO})
+    SET(CMAKE_CXX_FLAGS_RELWITHDEBINFO ${CMAKE_CXX_FLAGS_RELWITHDEBINFO} CACHE STRING "compile flags" FORCE)
+
+    set(CMAKE_VS_INCLUDE_INSTALL_TO_DEFAULT_BUILD 1)
+endif()
+
 # CMake 3.11 introduced CMP0072 - Prefer GLVND
 if(POLICY CMP0072)
 	cmake_policy(SET CMP0072 NEW)
@@ -129,6 +136,8 @@ if(MSVC)
 	find_library(WINDOWSAPP_LIBRARY WindowsApp)
 endif()
 
+find_package(CNSDK CONFIG)
+
 #https://github.com/arsenm/sanitizers-cmake
 find_package(Sanitizers MODULE)
 
@@ -227,6 +236,8 @@ endif()
 # cmake-format: off
 option_with_deps(CMAKE_INTERPROCEDURAL_OPTIMIZATION "Enable inter-procedural (link-time) optimization" DEFAULT OFF DEPENDS HAS_IPO)
 option(XRT_HAVE_TRACY "Enable Tracy support for tracing, make sure to set XRT_FEATURE_TRACING as well." OFF)
+
+option_with_deps(XRT_HAVE_CNSDK "Enable CNSDK support" DEPENDS CNSDK_FOUND)
 
 # Graphics deps to use (sorted in each group, groups thematic and ordered to handle internal deps: e.g. EGL and SDL2 need OpenGL/GLES)
 option_with_deps(XRT_HAVE_OPENGL "Enable OpenGL Graphics API support" DEPENDS OPENGL_WITHOUT_GLX_FOUND)
@@ -512,6 +523,7 @@ endif()
 message(STATUS "#####----- Config -----#####")
 message(STATUS "#    GIT_DESC:        ${GIT_DESC}")
 message(STATUS "#")
+message(STATUS "#    CNSDK:           ${XRT_HAVE_CNSDK}")
 message(STATUS "#    BASALT:          ${XRT_HAVE_BASALT}")
 message(STATUS "#    BLUETOOTH:       ${XRT_HAVE_BLUETOOTH}")
 message(STATUS "#    D3D11:           ${XRT_HAVE_D3D11}")

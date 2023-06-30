@@ -104,3 +104,5 @@ container-build-report.xml
 
 # Ignore Vulkan validation layer settings
 vk_layer_settings.txt
+
+cnsdk

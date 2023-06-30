@@ -70,11 +70,11 @@ spotless {
 }
 
 ext {
-    ndk_version = '21.4.7075529'
+    ndk_version = '24.0.8215888'
     // If you update this, must also update .gitlab-ci/config.yml
     sharedCompileSdk = 32
     sharedTargetSdk = 31
-    sharedMinSdk = 26
+    sharedMinSdk = 29
 
     // If you are building on Windows, you will need to explicitly set eigenIncludeDir in your
     // local.properties file since the default value provided below only makes sense on *nix
@@ -83,4 +83,10 @@ ext {
     // If you're having trouble with a "can't find python" CMake error, you can specify the path to
     // Python 3 explicitly in local.properties with a property named "pythonBinary"
     pythonBinary = project.findProperty('pythonBinary')
+
+    // TODO: Download release
+    cnsdkDir = new File(project.projectDir, "cnsdk")
+    println "CNSDK directory: $cnsdkDir"
+
+    cnsdkVersion = rootProject.file(new File(rootProject.cnsdkDir, "VERSION.txt")).text
 }

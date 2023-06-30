@@ -291,6 +291,13 @@ if(XRT_MODULE_COMPOSITOR_MAIN)
 	endif()
 endif()
 
+if(XRT_HAVE_CNSDK)
+	target_compile_definitions(comp_main PUBLIC XRT_HAVE_CNSDK)
+	target_link_libraries(comp_main PUBLIC CNSDK::leiaSDK)
+else()
+	message(WARNING "Compiling without CNSDK")
+endif()
+
 ###
 # Null compositor
 #

@@ -1037,6 +1037,9 @@ render_resources_get_timestamps(struct render_resources *r, uint64_t *out_gpu_st
 		return false;
 	}
 
+	// the following vkGetQueryPoolResults call hangs indefinitely, so skip it
+	// TODO: find out why it hangs - most likely it's because we don't write needed timestamps using vkCmdWriteTimestamp, see render_gfx.c
+	return false;
 
 	/*
 	 * Query how long things took.
