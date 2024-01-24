@@ -4,7 +4,11 @@
 if(XRT_HAVE_OPENGL)
 	add_subdirectory(gui)
 endif()
-add_subdirectory(oxr)
+
+if(XRT_FEATURE_OPENXR)
+	add_subdirectory(oxr)
+endif()
+
 add_subdirectory(prober)
 
 if(XRT_FEATURE_STEAMVR_PLUGIN)
