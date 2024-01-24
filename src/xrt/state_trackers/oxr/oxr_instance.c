@@ -1,4 +1,5 @@
 // Copyright 2018-2024, Collabora, Ltd.
+// Copyright 2024-2025, NVIDIA CORPORATION.
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
@@ -250,7 +251,12 @@ oxr_instance_create(struct oxr_logger *log,
 	}
 
 #ifdef XRT_FEATURE_CLIENT_DEBUG_GUI
-	u_debug_gui_create(&inst->debug_ui);
+	struct u_debug_gui_create_info udgci = {
+	    .window_title = "Monado! ✨⚡🔥",
+	    .open = U_DEBUG_GUI_OPEN_AUTO,
+	};
+
+	u_debug_gui_create(&udgci, &inst->debug_ui);
 #endif
 
 	ret = oxr_path_init(log, inst);

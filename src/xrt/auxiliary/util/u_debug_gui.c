@@ -1,4 +1,5 @@
 // Copyright 2019-2024, Collabora, Ltd.
+// Copyright 2024-2025, NVIDIA CORPORATION.
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
@@ -16,7 +17,7 @@
 struct u_debug_gui;
 
 int
-u_debug_gui_create(struct u_debug_gui **out_debug_ui)
+u_debug_gui_create(const struct u_debug_gui_create_info *udgci, struct u_debug_gui **out_debug_ui)
 {
 	return 0;
 }
@@ -72,6 +73,9 @@ struct u_debug_gui
 {
 	struct gui_program base;
 
+	//! Information passed in at create.
+	struct u_debug_gui_create_info udgci;
+
 	SDL_GLContext ctx;
 	SDL_Window *win;
 
@@ -97,7 +101,6 @@ sdl2_window_init(struct u_debug_gui *p)
 {
 	XRT_TRACE_MARKER();
 
-	const char *title = "Monado! ✨⚡🔥";
 	int x = SDL_WINDOWPOS_UNDEFINED;
 	int y = SDL_WINDOWPOS_UNDEFINED;
 	int w = 1920;
@@ -121,7 +124,7 @@ sdl2_window_init(struct u_debug_gui *p)
 	window_flags |= SDL_WINDOW_MAXIMIZED;
 #endif
 
-	p->win = SDL_CreateWindow(title, x, y, w, h, window_flags);
+	p->win = SDL_CreateWindow(p->udgci.window_title, x, y, w, h, window_flags);
 	if (p->win == NULL) {
 		U_LOG_E("Failed to create window!");
 		return;
@@ -340,13 +343,18 @@ u_debug_gui_run_thread(void *ptr)
 }
 
 int
-u_debug_gui_create(struct u_debug_gui **out_debug_gui)
+u_debug_gui_create(const struct u_debug_gui_create_info *udgci, struct u_debug_gui **out_debug_gui)
 {
 	XRT_TRACE_MARKER();
 
-	// Enabled?
-	if (!debug_get_bool_option_gui()) {
-		return 0;
+	switch (udgci->open) {
+	case U_DEBUG_GUI_OPEN_AUTO:
+		if (!debug_get_bool_option_gui()) {
+			return 0;
+		}
+		break;
+	case U_DEBUG_GUI_OPEN_ALWAYS: break;
+	case U_DEBUG_GUI_OPEN_NEVER: return 0; // No-op
 	}
 
 	// Need to do this as early as possible.
@@ -356,6 +364,9 @@ u_debug_gui_create(struct u_debug_gui **out_debug_gui)
 	if (p == NULL) {
 		return -1;
 	}
+
+	// Copy the data.
+	p->udgci = *udgci;
 
 	os_thread_helper_init(&p->oth);
 

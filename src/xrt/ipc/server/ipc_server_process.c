@@ -1,4 +1,5 @@
 // Copyright 2020-2024, Collabora, Ltd.
+// Copyright 2024-2025, NVIDIA CORPORATION.
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
@@ -1018,12 +1019,18 @@ ipc_server_main(int argc, char **argv)
 	timeBeginPeriod(1);
 #endif
 
+	struct u_debug_gui_info udgci = {
+	    .window_title = "Monado! ✨⚡🔥",
+	    .open = U_DEBUG_GUI_OPEN_AUTO,
+	};
+
 	/*
 	 * Need to create early before any vars are added. Not created in
 	 * init_all since that function is shared with Android and the debug
 	 * GUI isn't supported on Android.
 	 */
-	u_debug_gui_create(&s->debug_gui);
+	u_debug_gui_create(&udgci, &s->debug_gui);
+
 
 	int ret = init_all(s, log_level);
 	if (ret < 0) {
