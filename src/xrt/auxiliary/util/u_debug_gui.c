@@ -289,9 +289,6 @@ sdl2_loop(struct u_debug_gui *p)
 		XRT_TRACE_BEGIN(swap);
 		SDL_GL_SwapWindow(p->win);
 		XRT_TRACE_END(swap);
-
-		// Update prober things.
-		gui_prober_update(&p->base);
 	}
 
 	// Cleanup
