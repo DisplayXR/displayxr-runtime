@@ -19,7 +19,7 @@ add_library(${RUNTIME_TARGET} MODULE target.c libopenxr.def)
 # Note: Order may matter in these lists!
 target_link_libraries(${RUNTIME_TARGET} PUBLIC aux_vk aux_os aux_util aux_math)
 
-if(XRT_FEATURE_SERVICE)
+if(XRT_MODULE_IPC)
 	target_link_libraries(${RUNTIME_TARGET} PUBLIC st_oxr ipc_client comp_client)
 else()
 	target_link_libraries(
