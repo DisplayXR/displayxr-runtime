@@ -126,6 +126,7 @@ struct vk_bundle
 	// end of GENERATED instance extension code - do not modify - used by scripts
 
 	// beginning of GENERATED device extension code - do not modify - used by scripts
+	bool has_KHR_8bit_storage;
 	bool has_KHR_external_fence_fd;
 	bool has_KHR_external_semaphore_fd;
 	bool has_KHR_format_feature_flags2;
