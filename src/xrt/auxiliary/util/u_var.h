@@ -237,6 +237,7 @@ enum u_var_kind
 	U_VAR_KIND_RO_I64,
 	U_VAR_KIND_RO_U64,
 	U_VAR_KIND_RO_F64,
+	U_VAR_KIND_RO_I64_NS,
 	U_VAR_KIND_RO_VEC3_I32,
 	U_VAR_KIND_RO_VEC3_F32,
 	U_VAR_KIND_RO_QUAT_F32,
@@ -395,6 +396,7 @@ u_var_force_on(void);
 	ADD_FUNC(ro_i64, int64_t, RO_I64)                                                                              \
 	ADD_FUNC(ro_u64, uint64_t, RO_U64)                                                                             \
 	ADD_FUNC(ro_f64, double, RO_F64)                                                                               \
+	ADD_FUNC(ro_i64_ns, int64_t, RO_I64_NS)                                                                        \
 	ADD_FUNC(ro_vec3_i32, struct xrt_vec3_i32, RO_VEC3_I32)                                                        \
 	ADD_FUNC(ro_vec3_f32, struct xrt_vec3, RO_VEC3_F32)                                                            \
 	ADD_FUNC(ro_quat_f32, struct xrt_quat, RO_QUAT_F32)                                                            \
