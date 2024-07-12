@@ -746,9 +746,9 @@ pa_create(int64_t session_id, struct u_pacing_app **out_upa)
 	u_var_add_root(pa, "App timing info", true);
 	u_var_add_draggable_f32(pa, &pa->min_margin_ms, "Minimum margin(ms)");
 	u_var_add_draggable_f32(pa, &pa->min_app_time_ms, "Minimum app time(ms)");
-	u_var_add_ro_i64(pa, &pa->app.cpu_time_ns, "CPU time(ns)");
-	u_var_add_ro_i64(pa, &pa->app.draw_time_ns, "Draw time(ns)");
-	u_var_add_ro_i64(pa, &pa->app.gpu_time_ns, "GPU time(ns)");
+	u_var_add_ro_i64_ns(pa, &pa->app.cpu_time_ns, "CPU time");
+	u_var_add_ro_i64_ns(pa, &pa->app.draw_time_ns, "Draw time");
+	u_var_add_ro_i64_ns(pa, &pa->app.gpu_time_ns, "GPU time");
 
 	*out_upa = &pa->base;
 
