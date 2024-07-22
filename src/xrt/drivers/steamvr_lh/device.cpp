@@ -253,8 +253,8 @@ ControllerDevice::set_input_class(const InputClass *input_class)
 		inputs_map.insert({path, &inputs_vec.back()});
 	}
 
-	has_index_hand_tracking = !input_class->finger_curls.empty();
-	if (debug_get_bool_option_lh_emulate_hand() && has_index_hand_tracking) {
+	has_index_hand_tracking = debug_get_bool_option_lh_emulate_hand() && !input_class->finger_curls.empty();
+	if (has_index_hand_tracking) {
 		finger_inputs_vec.reserve(input_class->finger_curls.size());
 		for (const auto &[path, finger] : input_class->finger_curls) {
 			assert(finger_inputs_vec.capacity() >= finger_inputs_vec.size() + 1);
