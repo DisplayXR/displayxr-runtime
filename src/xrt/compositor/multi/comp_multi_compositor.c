@@ -1,4 +1,5 @@
 // Copyright 2019-2021, Collabora, Ltd.
+// Copyright 2024-2025, NVIDIA CORPORATION.
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
@@ -123,7 +124,7 @@ is_pushed_or_waiting_locked(struct multi_compositor *mc)
 }
 
 static void
-wait_fence(struct xrt_compositor_fence **xcf_ptr)
+wait_fence(struct multi_compositor *mc, struct xrt_compositor_fence **xcf_ptr)
 {
 	COMP_TRACE_MARKER();
 	xrt_result_t ret = XRT_SUCCESS;
@@ -138,7 +139,7 @@ wait_fence(struct xrt_compositor_fence **xcf_ptr)
 		}
 
 		U_LOG_W("Waiting on client fence timed out > 100ms!");
-	} while (true);
+	} while (os_thread_helper_is_running(&mc->wait_thread.oth));
 
 	xrt_compositor_fence_destroy(xcf_ptr);
 
@@ -148,7 +149,7 @@ wait_fence(struct xrt_compositor_fence **xcf_ptr)
 }
 
 static void
-wait_semaphore(struct xrt_compositor_semaphore **xcsem_ptr, uint64_t value)
+wait_semaphore(struct multi_compositor *mc, struct xrt_compositor_semaphore **xcsem_ptr, uint64_t value)
 {
 	COMP_TRACE_MARKER();
 	xrt_result_t ret = XRT_SUCCESS;
@@ -163,7 +164,7 @@ wait_semaphore(struct xrt_compositor_semaphore **xcsem_ptr, uint64_t value)
 		}
 
 		U_LOG_W("Waiting on client semaphore value '%" PRIu64 "' timed out > 100ms!", value);
-	} while (true);
+	} while (os_thread_helper_is_running(&mc->wait_thread.oth));
 
 	xrt_compositor_semaphore_reference(xcsem_ptr, NULL);
 
@@ -288,10 +289,10 @@ run_func(void *ptr)
 		os_thread_helper_unlock(&mc->wait_thread.oth);
 
 		if (xcsem != NULL) {
-			wait_semaphore(&xcsem, value);
+			wait_semaphore(mc, &xcsem, value);
 		}
 		if (xcf != NULL) {
-			wait_fence(&xcf);
+			wait_fence(mc, &xcf);
 		}
 
 		// Sample time outside of lock.
