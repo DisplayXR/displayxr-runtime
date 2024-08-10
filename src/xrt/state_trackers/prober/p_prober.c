@@ -101,7 +101,7 @@ p_select_device(struct xrt_prober *xp, struct xrt_device **xdevs, size_t xdev_co
 static int
 p_open_hid_interface(struct xrt_prober *xp,
                      struct xrt_prober_device *xpdev,
-                     int interface,
+                     int hid_iface,
                      struct os_hid_device **out_hid_dev);
 
 static int
@@ -1185,7 +1185,7 @@ p_select_device(struct xrt_prober *xp, struct xrt_device **xdevs, size_t xdev_co
 static int
 p_open_hid_interface(struct xrt_prober *xp,
                      struct xrt_prober_device *xpdev,
-                     int interface,
+                     int hid_iface,
                      struct os_hid_device **out_hid_dev)
 {
 	XRT_TRACE_MARKER();
@@ -1197,7 +1197,7 @@ p_open_hid_interface(struct xrt_prober *xp,
 	for (size_t j = 0; j < pdev->num_hidraws; j++) {
 		struct prober_hidraw *hidraw = &pdev->hidraws[j];
 
-		if (hidraw->interface != interface) {
+		if (hidraw->hid_iface != hid_iface) {
 			continue;
 		}
 
@@ -1210,13 +1210,13 @@ p_open_hid_interface(struct xrt_prober *xp,
 		return 0;
 	}
 
-	U_LOG_E("Could not find the requested hid interface (%i) on the device!", interface);
+	U_LOG_E("Could not find the requested hid interface (%i) on the device!", hid_iface);
 	return -1;
 
 #elif defined(XRT_OS_WINDOWS)
 	(void)pdev;
 	(void)ret;
-	U_LOG_E("HID devices not yet supported on Windows, cannot open interface (%i)", interface);
+	U_LOG_E("HID devices not yet supported on Windows, cannot open interface (%i)", hid_iface);
 	return -1;
 #else
 #error "no port of hid code"

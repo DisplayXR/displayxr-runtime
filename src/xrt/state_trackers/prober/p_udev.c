@@ -493,14 +493,14 @@ p_udev_enumerate_hidraw(struct prober *p, struct udev *udev)
 }
 
 static void
-p_udev_add_hidraw(struct prober_device *pdev, uint32_t interface, const char *path)
+p_udev_add_hidraw(struct prober_device *pdev, uint32_t hid_iface, const char *path)
 {
 	U_ARRAY_REALLOC_OR_FREE(pdev->hidraws, struct prober_hidraw, (pdev->num_hidraws + 1));
 
 	struct prober_hidraw *hidraw = &pdev->hidraws[pdev->num_hidraws++];
 	U_ZERO(hidraw);
 
-	hidraw->interface = interface;
+	hidraw->hid_iface = hid_iface;
 	hidraw->path = strdup(path);
 }
 

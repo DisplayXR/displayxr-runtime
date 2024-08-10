@@ -155,7 +155,7 @@ p_dump_device(struct prober *p, struct prober_device *pdev, int id, bool use_std
 	for (size_t j = 0; j < pdev->num_hidraws; j++) {
 		struct prober_hidraw *hidraw = &pdev->hidraws[j];
 
-		PTT("hidraw.iface:     %i", (int)hidraw->interface);
+		PTT("hidraw.iface:     %i", (int)hidraw->hid_iface);
 		PTT("hidraw.path:      '%s'", hidraw->path);
 	}
 #endif
