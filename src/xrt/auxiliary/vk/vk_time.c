@@ -32,15 +32,7 @@ from_host_ticks_to_host_ns(uint64_t ticks)
 
 #elif defined(XRT_OS_WINDOWS)
 
-	static int64_t ns_per_qpc_tick = 0;
-	if (ns_per_qpc_tick == 0) {
-		// Fixed at startup, so we can cache this.
-		LARGE_INTEGER freq;
-		QueryPerformanceFrequency(&freq);
-		ns_per_qpc_tick = U_1_000_000_000 / freq.QuadPart;
-	}
-
-	return ticks * ns_per_qpc_tick;
+	return ticks * os_ns_per_qpc_tick_get();
 
 #else
 #error "Vulkan timestamp domain needs porting"
