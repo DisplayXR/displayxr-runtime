@@ -15,6 +15,7 @@
 #include <string.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <inttypes.h>
 
 
 /*
@@ -262,6 +263,49 @@ u_pp_xrt_reference_space_type(struct u_pp_delegate dg, enum xrt_reference_space_
 	case XRT_SPACE_REFERENCE_TYPE_INVALID: DG("XRT_SPACE_REFERENCE_TYPE_INVALID"); return;
 	default: u_pp(dg, "XRT_SPACE_REFERENCE_TYPE_0x%08x", type); return;
 	}
+}
+
+void
+u_pp_padded_pretty_ms(u_pp_delegate_t dg, uint64_t value_ns)
+{
+	uint64_t in_us = value_ns / 1000;
+	uint64_t in_ms = in_us / 1000;
+	uint64_t in_1_000_ms = in_ms / 1000;
+	uint64_t in_1_000_000_ms = in_1_000_ms / 1000;
+
+	// Prints " M'TTT'###.FFFms"
+
+	// " M'"
+	if (in_1_000_000_ms >= 1) {
+		u_pp(dg, " %" PRIu64 "'", in_1_000_000_ms);
+	} else {
+		//       " M'"
+		u_pp(dg, "   ");
+	}
+
+	// "TTT'"
+	if (in_1_000_ms >= 1000) {
+		// Need to pad with zeros
+		u_pp(dg, "%03" PRIu64 "'", in_1_000_ms % 1000);
+	} else if (in_1_000_ms >= 1) {
+		// Pad with spaces, we need to write a number.
+		u_pp(dg, "%3" PRIu64 "'", in_1_000_ms);
+	} else {
+		//       "TTT'"
+		u_pp(dg, "    ");
+	}
+
+	// "###"
+	if (in_ms >= 1000) {
+		// Need to pad with zeros
+		u_pp(dg, "%03" PRIu64, in_ms % 1000);
+	} else {
+		// Pad with spaces, always need a numbere here.
+		u_pp(dg, "%3" PRIu64, in_ms % 1000);
+	}
+
+	// ".FFFms"
+	u_pp(dg, ".%03" PRIu64 "ms", in_us % 1000);
 }
 
 
