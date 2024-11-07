@@ -251,7 +251,6 @@ option(XRT_MODULE_COMPOSITOR "Enable the compositor at all" ON)
 option_with_deps(XRT_MODULE_COMPOSITOR_MAIN "Build main compositor host functionality" DEPENDS
 	XRT_MODULE_COMPOSITOR
 	XRT_HAVE_VULKAN
-	"XRT_HAVE_WAYLAND OR XRT_HAVE_XCB OR ANDROID OR WIN32"
 	)
 option_with_deps(XRT_MODULE_COMPOSITOR_NULL "Build testing null compositor" DEPENDS XRT_MODULE_COMPOSITOR XRT_HAVE_VULKAN)
 option_with_deps(XRT_MODULE_MERCURY_HANDTRACKING "Enable Mercury hand tracking" DEPENDS XRT_HAVE_OPENCV XRT_HAVE_ONNXRUNTIME)
