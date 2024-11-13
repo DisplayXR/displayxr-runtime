@@ -1955,9 +1955,7 @@ ipc_handle_device_get_hand_tracking(volatile struct ipc_client_state *ics,
 	struct xrt_device *xdev = get_xdev(ics, device_id);
 
 	// Get the pose.
-	xrt_device_get_hand_tracking(xdev, name, at_timestamp, out_value, out_timestamp);
-
-	return XRT_SUCCESS;
+	return xrt_device_get_hand_tracking(xdev, name, at_timestamp, out_value, out_timestamp);
 }
 
 xrt_result_t
