@@ -86,7 +86,7 @@ opengloves_device(struct xrt_device *xdev)
 	return (struct opengloves_device *)xdev;
 }
 
-static void
+static xrt_result_t
 opengloves_device_get_hand_tracking(struct xrt_device *xdev,
                                     enum xrt_input_name name,
                                     int64_t requested_timestamp_ns,
@@ -134,6 +134,8 @@ opengloves_device_get_hand_tracking(struct xrt_device *xdev,
 
 	*out_timestamp_ns = requested_timestamp_ns;
 	out_joint_set->is_active = true;
+
+	return XRT_SUCCESS;
 }
 
 static xrt_result_t

@@ -167,16 +167,6 @@ simulated_device_get_tracked_pose(struct xrt_device *xdev,
 }
 
 static void
-simulated_device_get_hand_tracking(struct xrt_device *xdev,
-                                   enum xrt_input_name name,
-                                   int64_t requested_timestamp_ns,
-                                   struct xrt_hand_joint_set *out_value,
-                                   int64_t *out_timestamp_ns)
-{
-	assert(false);
-}
-
-static void
 simulated_device_get_view_poses(struct xrt_device *xdev,
                                 const struct xrt_vec3 *default_eye_relation,
                                 int64_t at_timestamp_ns,
@@ -378,7 +368,7 @@ simulated_create_controller(enum xrt_device_name name,
 	struct simulated_device *sd = U_DEVICE_ALLOCATE(struct simulated_device, flags, input_count, output_count);
 	sd->base.update_inputs = simulated_device_update_inputs;
 	sd->base.get_tracked_pose = simulated_device_get_tracked_pose;
-	sd->base.get_hand_tracking = simulated_device_get_hand_tracking;
+	sd->base.get_hand_tracking = u_device_ni_get_hand_tracking;
 	sd->base.get_view_poses = simulated_device_get_view_poses;
 	sd->base.set_output = simulated_device_set_output;
 	sd->base.destroy = simulated_device_destroy;

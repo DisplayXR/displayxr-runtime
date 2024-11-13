@@ -213,12 +213,12 @@ u_device_noop_update_inputs(struct xrt_device *xdev);
  *
  * @ingroup aux_util
  */
-void
+xrt_result_t
 u_device_ni_get_hand_tracking(struct xrt_device *xdev,
                               enum xrt_input_name name,
-                              uint64_t desired_timestamp_ns,
+                              int64_t desired_timestamp_ns,
                               struct xrt_hand_joint_set *out_value,
-                              uint64_t *out_timestamp_ns);
+                              int64_t *out_timestamp_ns);
 
 /*!
  * Not implemented function for @ref xrt_device::set_output.

@@ -87,7 +87,7 @@ ulv5_device(struct xrt_device *xdev)
 	return (struct ulv5_device *)xdev;
 }
 
-static void
+static xrt_result_t
 ulv5_device_get_hand_tracking(struct xrt_device *xdev,
                               enum xrt_input_name name,
                               int64_t at_timestamp_ns,
@@ -97,8 +97,8 @@ ulv5_device_get_hand_tracking(struct xrt_device *xdev,
 	struct ulv5_device *ulv5d = ulv5_device(xdev);
 
 	if (name != XRT_INPUT_GENERIC_HAND_TRACKING_LEFT && name != XRT_INPUT_GENERIC_HAND_TRACKING_RIGHT) {
-		ULV5_ERROR(ulv5d, "unknown input name for hand tracker");
-		return;
+		U_LOG_XDEV_UNSUPPORTED_INPUT(&ulv5d->base, ulv5d->log_level, name);
+		return XRT_ERROR_INPUT_UNSUPPORTED;
 	}
 
 	bool hand_index = (name == XRT_INPUT_GENERIC_HAND_TRACKING_RIGHT); // 0 if left, 1 if right.
@@ -119,6 +119,8 @@ ulv5_device_get_hand_tracking(struct xrt_device *xdev,
 	}
 	// still a lie...
 	*out_timestamp_ns = at_timestamp_ns;
+
+	return XRT_SUCCESS;
 }
 
 // todo: cleanly shutdown the LEAP_CONNECTION

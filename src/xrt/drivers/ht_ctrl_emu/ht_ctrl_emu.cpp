@@ -131,7 +131,7 @@ cemu_device_destroy(struct xrt_device *xdev)
 	}
 }
 
-static void
+static xrt_result_t
 cemu_device_get_hand_tracking(struct xrt_device *xdev,
                               enum xrt_input_name name,
                               int64_t requested_timestamp_ns,
@@ -144,13 +144,12 @@ cemu_device_get_hand_tracking(struct xrt_device *xdev,
 	struct cemu_system *system = dev->sys;
 
 	if (name != dev->ht_input_name) {
-		// I should be using xrt_input_name_string here - couldn't figure out how to link to it.
-		CEMU_ERROR(dev, "unexpected input name %d - expected %d", name, dev->ht_input_name);
-		return;
+		U_LOG_XDEV_UNSUPPORTED_INPUT(&dev->base, system->log_level, name);
+		return XRT_ERROR_INPUT_UNSUPPORTED;
 	}
 
-	xrt_device_get_hand_tracking(system->in_hand, dev->ht_input_name, requested_timestamp_ns, out_value,
-	                             out_timestamp_ns);
+	return xrt_device_get_hand_tracking(system->in_hand, dev->ht_input_name, requested_timestamp_ns, out_value,
+	                                    out_timestamp_ns);
 }
 
 static xrt_vec3
@@ -224,9 +223,10 @@ get_other_two(struct cemu_device *dev,
               xrt_pose *out_head,
               xrt_hand_joint_set *out_secondary)
 {
+	struct cemu_system *sys = dev->sys;
 	struct xrt_space_relation head_rel;
 	xrt_result_t xret =
-	    xrt_device_get_tracked_pose(dev->sys->in_head, XRT_INPUT_GENERIC_HEAD_POSE, head_timestamp_ns, &head_rel);
+	    xrt_device_get_tracked_pose(sys->in_head, XRT_INPUT_GENERIC_HEAD_POSE, head_timestamp_ns, &head_rel);
 	if (xret != XRT_SUCCESS) {
 		return xret;
 	}
@@ -240,10 +240,8 @@ get_other_two(struct cemu_device *dev,
 	}
 
 	int64_t noop;
-	xrt_device_get_hand_tracking(dev->sys->in_hand, dev->sys->out_hand[other]->ht_input_name, hand_timestamp_ns,
-	                             out_secondary, &noop);
-
-	return xret;
+	return xrt_device_get_hand_tracking(sys->in_hand, sys->out_hand[other]->ht_input_name, hand_timestamp_ns,
+	                                    out_secondary, &noop);
 }
 
 // Mostly stolen from
@@ -345,15 +343,18 @@ cemu_device_get_tracked_pose(struct xrt_device *xdev,
 	static int64_t hand_timestamp_ns;
 
 	struct xrt_hand_joint_set joint_set;
-	sys->in_hand->get_hand_tracking(sys->in_hand, dev->ht_input_name, at_timestamp_ns, &joint_set,
-	                                &hand_timestamp_ns);
+	xrt_result_t xret = xrt_device_get_hand_tracking(sys->in_hand, dev->ht_input_name, at_timestamp_ns, &joint_set,
+	                                                 &hand_timestamp_ns);
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
 
 	if (joint_set.is_active == false) {
 		out_relation->relation_flags = XRT_SPACE_RELATION_BITMASK_NONE;
 		return XRT_SUCCESS;
 	}
 
-	xrt_result_t xret = XRT_SUCCESS;
+	xret = XRT_SUCCESS;
 	switch (name) {
 	case XRT_INPUT_SIMPLE_GRIP_POSE: {
 		xret = do_grip_pose(&joint_set, out_relation, sys->grip_offset_from_palm, dev->hand_index);
@@ -400,7 +401,11 @@ cemu_device_update_inputs(struct xrt_device *xdev)
 	struct xrt_hand_joint_set joint_set;
 	int64_t noop;
 
-	xrt_device_get_hand_tracking(dev->sys->in_hand, dev->ht_input_name, os_monotonic_get_ns(), &joint_set, &noop);
+	xrt_result_t xret = xrt_device_get_hand_tracking(dev->sys->in_hand, dev->ht_input_name, os_monotonic_get_ns(),
+	                                                 &joint_set, &noop);
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
 
 	if (!joint_set.is_active) {
 		xdev->inputs[CEMU_INDEX_SELECT].value.boolean = false;

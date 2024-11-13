@@ -59,7 +59,7 @@ ipc_client_xdev_get_tracked_pose(struct xrt_device *xdev,
 	IPC_CHK_ALWAYS_RET(icx->ipc_c, xret, "ipc_call_device_get_tracked_pose");
 }
 
-static void
+static xrt_result_t
 ipc_client_xdev_get_hand_tracking(struct xrt_device *xdev,
                                   enum xrt_input_name name,
                                   int64_t at_timestamp_ns,
@@ -75,7 +75,7 @@ ipc_client_xdev_get_hand_tracking(struct xrt_device *xdev,
 	    at_timestamp_ns,                                   //
 	    out_value,                                         //
 	    out_timestamp_ns);                                 //
-	IPC_CHK_ONLY_PRINT(icx->ipc_c, xret, "ipc_call_device_get_hand_tracking");
+	IPC_CHK_ALWAYS_RET(icx->ipc_c, xret, "ipc_call_device_get_hand_tracking");
 }
 
 static xrt_result_t

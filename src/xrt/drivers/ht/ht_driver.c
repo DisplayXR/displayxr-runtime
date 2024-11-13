@@ -145,7 +145,7 @@ userConfigSetDefaults(struct ht_device *htd)
  * xrt_device function implementations
  */
 
-static void
+static xrt_result_t
 ht_device_get_hand_tracking(struct xrt_device *xdev,
                             enum xrt_input_name name,
                             int64_t at_timestamp_ns,
@@ -155,11 +155,12 @@ ht_device_get_hand_tracking(struct xrt_device *xdev,
 	struct ht_device *htd = ht_device(xdev);
 
 	if (name != XRT_INPUT_GENERIC_HAND_TRACKING_LEFT && name != XRT_INPUT_GENERIC_HAND_TRACKING_RIGHT) {
-		HT_ERROR(htd, "unknown input name for hand tracker");
-		return;
+		U_LOG_XDEV_UNSUPPORTED_INPUT(&htd->base, htd->log_level, name);
+		return XRT_ERROR_INPUT_UNSUPPORTED;
 	}
 
 	htd->async->get_hand(htd->async, name, at_timestamp_ns, out_value, out_timestamp_ns);
+	return XRT_SUCCESS;
 }
 
 static void

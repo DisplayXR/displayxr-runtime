@@ -504,14 +504,15 @@ u_device_noop_update_inputs(struct xrt_device *xdev)
 
 #define E(FN) U_LOG_E("Function " #FN " is not implemented for '%s'", xdev->str)
 
-void
+xrt_result_t
 u_device_ni_get_hand_tracking(struct xrt_device *xdev,
                               enum xrt_input_name name,
-                              uint64_t desired_timestamp_ns,
+                              int64_t desired_timestamp_ns,
                               struct xrt_hand_joint_set *out_value,
-                              uint64_t *out_timestamp_ns)
+                              int64_t *out_timestamp_ns)
 {
 	E(get_hand_tracking);
+	return XRT_ERROR_NOT_IMPLEMENTED;
 }
 
 void

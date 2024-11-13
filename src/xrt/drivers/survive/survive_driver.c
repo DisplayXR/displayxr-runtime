@@ -456,7 +456,7 @@ struct Button buttons[255] = {
     [SURVIVE_BUTTON_TRIGGER] = {.click = VIVE_CONTROLLER_TRIGGER_CLICK, .touch = VIVE_CONTROLLER_TRIGGER_TOUCH},
 };
 
-static void
+static xrt_result_t
 survive_controller_get_hand_tracking(struct xrt_device *xdev,
                                      enum xrt_input_name name,
                                      int64_t at_timestamp_ns,
@@ -466,8 +466,8 @@ survive_controller_get_hand_tracking(struct xrt_device *xdev,
 	struct survive_device *survive = (struct survive_device *)xdev;
 
 	if (name != XRT_INPUT_GENERIC_HAND_TRACKING_LEFT && name != XRT_INPUT_GENERIC_HAND_TRACKING_RIGHT) {
-		SURVIVE_ERROR(survive, "unknown input name for hand tracker");
-		return;
+		U_LOG_XDEV_UNSUPPORTED_INPUT(&survive->base, survive->sys->log_level, name);
+		return XRT_ERROR_INPUT_UNSUPPORTED;
 	}
 
 
@@ -519,6 +519,8 @@ survive_controller_get_hand_tracking(struct xrt_device *xdev,
 	// This is a lie - apparently libsurvive doesn't report controller tracked/untracked state, so just say that the
 	// hand is being tracked
 	out_value->is_active = true;
+
+	return XRT_SUCCESS;
 }
 
 static void

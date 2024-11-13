@@ -174,7 +174,7 @@ public:
 	IndexFingerInput *
 	get_finger_from_name(std::string_view name);
 
-	void
+	xrt_result_t
 	get_hand_tracking(enum xrt_input_name name,
 	                  int64_t desired_timestamp_ns,
 	                  struct xrt_hand_joint_set *out_value,

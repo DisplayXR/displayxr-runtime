@@ -185,9 +185,10 @@ ControllerDevice::ControllerDevice(vr::PropertyContainerHandle_t handle, const D
 	this->device_type = XRT_DEVICE_TYPE_UNKNOWN;
 	this->container_handle = handle;
 
+	this->xrt_device::get_hand_tracking =
+	    &device_bouncer<ControllerDevice, &ControllerDevice::get_hand_tracking, xrt_result_t>;
 #define SETUP_MEMBER_FUNC(name) this->xrt_device::name = &device_bouncer<ControllerDevice, &ControllerDevice::name>
 	SETUP_MEMBER_FUNC(set_output);
-	SETUP_MEMBER_FUNC(get_hand_tracking);
 #undef SETUP_MEMBER_FUNC
 }
 
@@ -397,18 +398,19 @@ ControllerDevice::get_finger_from_name(const std::string_view name)
 	return finger->second;
 }
 
-void
+xrt_result_t
 ControllerDevice::get_hand_tracking(enum xrt_input_name name,
                                     int64_t desired_timestamp_ns,
                                     struct xrt_hand_joint_set *out_value,
                                     int64_t *out_timestamp_ns)
 {
 	if (!has_index_hand_tracking)
-		return;
+		return XRT_ERROR_NOT_IMPLEMENTED;
 	update_hand_tracking(desired_timestamp_ns, out_value);
 	out_value->is_active = true;
 	hand_tracking_timestamp = desired_timestamp_ns;
 	*out_timestamp_ns = hand_tracking_timestamp;
+	return XRT_SUCCESS;
 }
 
 void
