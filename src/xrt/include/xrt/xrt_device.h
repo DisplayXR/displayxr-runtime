@@ -677,7 +677,7 @@ xrt_device_get_tracked_pose(struct xrt_device *xdev,
  *
  * @public @memberof xrt_device
  */
-static inline void
+static inline xrt_result_t
 xrt_device_get_hand_tracking(struct xrt_device *xdev,
                              enum xrt_input_name name,
                              int64_t desired_timestamp_ns,
@@ -685,6 +685,7 @@ xrt_device_get_hand_tracking(struct xrt_device *xdev,
                              int64_t *out_timestamp_ns)
 {
 	xdev->get_hand_tracking(xdev, name, desired_timestamp_ns, out_value, out_timestamp_ns);
+	return XRT_SUCCESS;
 }
 
 /*!
