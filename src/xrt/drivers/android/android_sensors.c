@@ -143,9 +143,9 @@ android_run_thread(void *ptr)
 		ASensorEventQueue_setEventRate(event_queue, gyroscope, gyroscope_poll_rate_usec);
 	}
 
-	while (d->oth.running) {
+	while (os_thread_helper_is_running(&d->oth)) {
 		int num_events = 0;
-		const int looper_id = ALooper_pollAll(max_wait_milliseconds, NULL, &num_events, NULL);
+		const int looper_id = ALooper_pollOnce(max_wait_milliseconds, NULL, &num_events, NULL);
 		// The device may have enabled a power-saving policy, causing the sensor to sleep and return
 		// ALOOPER_POLL_ERROR. However, we want to continue reading data when it wakes up.
 		if (looper_id != LOOPER_ID_USER) {
