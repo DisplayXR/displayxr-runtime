@@ -123,26 +123,6 @@ oxr_xdev_find_output(struct xrt_device *xdev, enum xrt_output_name name, struct 
 	return false;
 }
 
-void
-oxr_xdev_get_hand_tracking_at(struct oxr_logger *log,
-                              struct oxr_instance *inst,
-                              struct xrt_device *xdev,
-                              enum xrt_input_name name,
-                              XrTime at_time,
-                              struct xrt_hand_joint_set *out_value)
-{
-	//! Convert at_time to monotonic and give to device.
-	int64_t at_timestamp_ns = time_state_ts_to_monotonic_ns(inst->timekeeping, at_time);
-
-	struct xrt_hand_joint_set value;
-
-	int64_t ignored;
-
-	xrt_device_get_hand_tracking(xdev, name, at_timestamp_ns, &value, &ignored);
-
-	*out_value = value;
-}
-
 
 /*
  *

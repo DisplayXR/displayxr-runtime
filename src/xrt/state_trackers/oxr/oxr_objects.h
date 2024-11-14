@@ -1182,18 +1182,6 @@ oxr_xdev_find_input(struct xrt_device *xdev, enum xrt_input_name name, struct xr
 bool
 oxr_xdev_find_output(struct xrt_device *xdev, enum xrt_output_name name, struct xrt_output **out_output);
 
-/*!
- * Returns the hand tracking value of the named input from the device.
- * Does NOT apply tracking origin offset to each joint.
- */
-void
-oxr_xdev_get_hand_tracking_at(struct oxr_logger *log,
-                              struct oxr_instance *inst,
-                              struct xrt_device *xdev,
-                              enum xrt_input_name name,
-                              XrTime at_time,
-                              struct xrt_hand_joint_set *out_value);
-
 #ifdef OXR_HAVE_MNDX_xdev_space
 static inline XrXDevListMNDX
 oxr_xdev_list_to_openxr(struct oxr_xdev_list *sc)

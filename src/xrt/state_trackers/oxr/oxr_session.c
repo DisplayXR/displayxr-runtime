@@ -1289,6 +1289,7 @@ oxr_session_hand_joints(struct oxr_logger *log,
 	struct oxr_space *baseSpc = XRT_CAST_OXR_HANDLE_TO_PTR(struct oxr_space *, locateInfo->baseSpace);
 
 	struct oxr_session *sess = hand_tracker->sess;
+	struct oxr_instance *inst = sess->sys->inst;
 
 	XrHandJointVelocitiesEXT *vel =
 	    OXR_GET_OUTPUT_FROM_CHAIN(locations, XR_TYPE_HAND_JOINT_VELOCITIES_EXT, XrHandJointVelocitiesEXT);
@@ -1302,9 +1303,15 @@ oxr_session_hand_joints(struct oxr_logger *log,
 	enum xrt_input_name name = hand_tracker->input_name;
 
 	XrTime at_time = locateInfo->time;
-	struct xrt_hand_joint_set value;
 
-	oxr_xdev_get_hand_tracking_at(log, sess->sys->inst, xdev, name, at_time, &value);
+	//! Convert at_time to monotonic and give to device.
+	int64_t at_timestamp_ns = time_state_ts_to_monotonic_ns(inst->timekeeping, at_time);
+
+	struct xrt_hand_joint_set value;
+	int64_t ignored;
+
+	xrt_result_t xret = xrt_device_get_hand_tracking(xdev, name, at_timestamp_ns, &value, &ignored);
+	OXR_CHECK_XRET(log, sess, xret, xrt_device_get_hand_tracking);
 
 	// The hand pose is returned in the xdev's space.
 	struct xrt_space_relation T_xdev_hand = value.hand_pose;
