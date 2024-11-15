@@ -177,7 +177,7 @@ qwerty_update_inputs(struct xrt_device *xd)
 	return XRT_SUCCESS;
 }
 
-static void
+static xrt_result_t
 qwerty_set_output(struct xrt_device *xd, enum xrt_output_name name, const struct xrt_output_value *value)
 {
 	struct qwerty_device *qd = qwerty_device(xd);
@@ -190,6 +190,8 @@ qwerty_set_output(struct xrt_device *xd, enum xrt_output_name name, const struct
 		            "\tfrequency=%.2f amplitude=%.2f duration=%" PRId64,
 		            xd->str, frequency, amplitude, duration);
 	}
+
+	return XRT_SUCCESS;
 }
 
 static xrt_result_t

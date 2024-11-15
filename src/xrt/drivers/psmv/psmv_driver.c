@@ -921,13 +921,14 @@ amp_scale(struct psmv_device *psmv, float amp)
 	return amp * (max - min) + min;
 }
 
-static void
+static xrt_result_t
 psmv_device_set_output(struct xrt_device *xdev, enum xrt_output_name name, const struct xrt_output_value *value)
 {
 	struct psmv_device *psmv = psmv_device(xdev);
 
 	if (name != XRT_OUTPUT_NAME_PSMV_RUMBLE_VIBRATION) {
-		return;
+		U_LOG_XDEV_UNSUPPORTED_OUTPUT(&psmv->base, psmv->log_level, name);
+		return XRT_ERROR_OUTPUT_UNSUPPORTED;
 	}
 
 	os_mutex_lock(&psmv->lock);
@@ -944,6 +945,7 @@ psmv_device_set_output(struct xrt_device *xdev, enum xrt_output_name name, const
 	psmv_led_and_trigger_update_locked(psmv, now);
 
 	os_mutex_unlock(&psmv->lock);
+	return XRT_SUCCESS;
 }
 
 

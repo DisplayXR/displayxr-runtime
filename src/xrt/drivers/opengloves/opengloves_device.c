@@ -174,7 +174,7 @@ opengloves_ffb_location_convert(const struct xrt_output_force_feedback *xrt_ffb,
 	}
 }
 
-static void
+static xrt_result_t
 opengloves_device_set_output(struct xrt_device *xdev, enum xrt_output_name name, const struct xrt_output_value *value)
 {
 	struct opengloves_device *od = opengloves_device(xdev);
@@ -194,9 +194,16 @@ opengloves_device_set_output(struct xrt_device *xdev, enum xrt_output_name name,
 		char buff[64];
 		opengloves_alpha_encoding_encode(&out, buff);
 
-		opengloves_communication_device_write(od->ocd, buff, strlen(buff));
+		int ret = opengloves_communication_device_write(od->ocd, buff, strlen(buff));
+		if (ret == -1) {
+			return XRT_ERROR_OUTPUT_REQUEST_FAILURE;
+		}
+		return XRT_SUCCESS;
 	}
-	default: break;
+	default:
+		U_LOG_XDEV_UNSUPPORTED_OUTPUT(&od->base, od->log_level, name);
+		return XRT_ERROR_OUTPUT_UNSUPPORTED;
+		break;
 	}
 }
 

@@ -527,10 +527,11 @@ u_device_ni_get_hand_tracking(struct xrt_device *xdev,
 	return XRT_ERROR_NOT_IMPLEMENTED;
 }
 
-void
+xrt_result_t
 u_device_ni_set_output(struct xrt_device *xdev, enum xrt_output_name name, const struct xrt_output_value *value)
 {
-	E(get_hand_tracking);
+	E(set_output);
+	return XRT_ERROR_NOT_IMPLEMENTED;
 }
 
 xrt_result_t

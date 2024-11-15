@@ -108,12 +108,6 @@ r_hmd_get_view_poses(struct xrt_device *xdev,
 	return XRT_SUCCESS;
 }
 
-static void
-r_hmd_set_output(struct xrt_device *xdev, enum xrt_output_name name, const struct xrt_output_value *value)
-{
-	// Empty
-}
-
 /*!
  * @public @memberof r_hmd
  */
@@ -132,7 +126,7 @@ r_hmd_create(struct r_hub *r)
 	rh->base.get_tracked_pose = r_hmd_get_tracked_pose;
 	rh->base.get_hand_tracking = u_device_ni_get_hand_tracking;
 	rh->base.get_view_poses = r_hmd_get_view_poses;
-	rh->base.set_output = r_hmd_set_output;
+	rh->base.set_output = u_device_ni_set_output;
 	rh->base.destroy = r_hmd_destroy;
 	rh->base.tracking_origin = &r->origin;
 	rh->base.supported.orientation_tracking = true;

@@ -404,7 +404,7 @@ survive_controller_haptic_pulse(struct survive_device *survive, const struct xrt
 	                                    duration_seconds);
 }
 
-static void
+static xrt_result_t
 survive_controller_device_set_output(struct xrt_device *xdev,
                                      enum xrt_output_name name,
                                      const struct xrt_output_value *value)
@@ -412,20 +412,23 @@ survive_controller_device_set_output(struct xrt_device *xdev,
 	struct survive_device *survive = (struct survive_device *)xdev;
 
 	if (name != XRT_OUTPUT_NAME_VIVE_HAPTIC && name != XRT_OUTPUT_NAME_INDEX_HAPTIC) {
-		SURVIVE_ERROR(survive, "Unknown output");
-		return;
+		U_LOG_XDEV_UNSUPPORTED_OUTPUT(&survive->base, survive->sys->log_level, name);
+		return XRT_ERROR_OUTPUT_UNSUPPORTED;
 	}
 
 	bool pulse = value->vibration.amplitude > 0.01;
 	if (!pulse) {
-		return;
+		return XRT_SUCCESS;
 	}
 
 	int ret = survive_controller_haptic_pulse(survive, value);
 
 	if (ret != 0) {
 		SURVIVE_ERROR(survive, "haptic failed %d", ret);
+		return XRT_ERROR_OUTPUT_REQUEST_FAILURE;
 	}
+
+	return XRT_SUCCESS;
 }
 
 struct Button

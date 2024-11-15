@@ -487,7 +487,7 @@ vive_controller_haptic_pulse(struct vive_controller_device *d, const struct xrt_
 	return os_hid_set_feature(d->controller_hid, (uint8_t *)&report, sizeof(report));
 }
 
-static void
+static xrt_result_t
 vive_controller_device_set_output(struct xrt_device *xdev,
                                   enum xrt_output_name name,
                                   const struct xrt_output_value *value)
@@ -495,18 +495,17 @@ vive_controller_device_set_output(struct xrt_device *xdev,
 	struct vive_controller_device *d = vive_controller_device(xdev);
 
 	if (name != XRT_OUTPUT_NAME_VIVE_HAPTIC && name != XRT_OUTPUT_NAME_INDEX_HAPTIC) {
-		VIVE_ERROR(d, "Unknown output\n");
-		return;
+		U_LOG_XDEV_UNSUPPORTED_OUTPUT(&d->base, d->log_level, name);
+		return XRT_ERROR_OUTPUT_UNSUPPORTED;
 	}
 
-	bool pulse = value->vibration.amplitude > 0.01;
-	if (!pulse) {
-		return;
+	if (value->vibration.amplitude > 0.01) {
+		os_mutex_lock(&d->lock);
+		vive_controller_haptic_pulse(d, value);
+		os_mutex_unlock(&d->lock);
 	}
 
-	os_mutex_lock(&d->lock);
-	vive_controller_haptic_pulse(d, value);
-	os_mutex_unlock(&d->lock);
+	return XRT_SUCCESS;
 }
 
 

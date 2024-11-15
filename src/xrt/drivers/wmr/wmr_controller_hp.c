@@ -340,15 +340,6 @@ wmr_controller_hp_update_inputs(struct xrt_device *xdev)
 }
 
 static void
-wmr_controller_hp_set_output(struct xrt_device *xdev, enum xrt_output_name name, const struct xrt_output_value *value)
-{
-	DRV_TRACE_MARKER();
-
-	// struct wmr_controller_base *d = wmr_controller_base(xdev);
-	// Todo: implement
-}
-
-static void
 wmr_controller_hp_destroy(struct xrt_device *xdev)
 {
 	struct wmr_controller_base *wcb = (struct wmr_controller_base *)(xdev);
@@ -386,7 +377,7 @@ wmr_controller_hp_create(struct wmr_controller_connection *conn,
 
 	wcb->base.destroy = wmr_controller_hp_destroy;
 	wcb->base.update_inputs = wmr_controller_hp_update_inputs;
-	wcb->base.set_output = wmr_controller_hp_set_output;
+	wcb->base.set_output = u_device_ni_set_output;
 
 	SET_INPUT(wcb, MENU_CLICK, MENU_CLICK);
 	SET_INPUT(wcb, HOME_CLICK, HOME_CLICK);

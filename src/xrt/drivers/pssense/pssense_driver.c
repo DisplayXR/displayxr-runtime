@@ -676,7 +676,7 @@ pssense_device_update_inputs(struct xrt_device *xdev)
 	return XRT_SUCCESS;
 }
 
-static void
+static xrt_result_t
 pssense_set_output(struct xrt_device *xdev, enum xrt_output_name name, const struct xrt_output_value *value)
 {
 	struct pssense_device *pssense = (struct pssense_device *)xdev;
@@ -710,8 +710,8 @@ pssense_set_output(struct xrt_device *xdev, enum xrt_output_name name, const str
 			}
 		}
 	} else {
-		PSSENSE_ERROR(pssense, "Unknown output name requested %u", name);
-		return;
+		U_LOG_XDEV_UNSUPPORTED_OUTPUT(&pssense->base, pssense->log_level, name);
+		return XRT_ERROR_OUTPUT_UNSUPPORTED;
 	}
 
 	os_mutex_lock(&pssense->lock);
@@ -730,6 +730,8 @@ pssense_set_output(struct xrt_device *xdev, enum xrt_output_name name, const str
 		pssense_send_output_report_locked(pssense);
 	}
 	os_mutex_unlock(&pssense->lock);
+
+	return XRT_SUCCESS;
 }
 
 static void

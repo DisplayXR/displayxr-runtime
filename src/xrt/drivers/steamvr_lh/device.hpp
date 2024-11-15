@@ -162,7 +162,7 @@ class ControllerDevice : public Device
 public:
 	ControllerDevice(vr::PropertyContainerHandle_t container_handle, const DeviceBuilder &builder);
 
-	void
+	xrt_result_t
 	set_output(xrt_output_name name, const xrt_output_value *value);
 
 	void

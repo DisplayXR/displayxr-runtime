@@ -127,7 +127,7 @@ ipc_client_xdev_get_body_joints(struct xrt_device *xdev,
 	IPC_CHK_ALWAYS_RET(icx->ipc_c, xret, "ipc_call_device_get_body_joints");
 }
 
-static void
+static xrt_result_t
 ipc_client_xdev_set_output(struct xrt_device *xdev, enum xrt_output_name name, const struct xrt_output_value *value)
 {
 	struct ipc_client_xdev *icx = ipc_client_xdev(xdev);
@@ -146,7 +146,7 @@ ipc_client_xdev_set_output(struct xrt_device *xdev, enum xrt_output_name name, c
 		ipc_client_connection_lock(ipc_c);
 
 		xret = ipc_send_device_set_haptic_output_locked(ipc_c, icx->device_id, name, &samples);
-		IPC_CHK_WITH_RET(ipc_c, xret, "ipc_send_device_set_haptic_output_locked", );
+		IPC_CHK_WITH_GOTO(ipc_c, xret, "ipc_send_device_set_haptic_output_locked", send_haptic_output_end);
 
 		xrt_result_t alloc_xret;
 		xret = ipc_receive(&ipc_c->imc, &alloc_xret, sizeof alloc_xret);
@@ -171,6 +171,8 @@ ipc_client_xdev_set_output(struct xrt_device *xdev, enum xrt_output_name name, c
 		xret = ipc_call_device_set_output(ipc_c, icx->device_id, name, value);
 		IPC_CHK_ONLY_PRINT(ipc_c, xret, "ipc_call_device_set_output");
 	}
+
+	return xret;
 }
 
 xrt_result_t

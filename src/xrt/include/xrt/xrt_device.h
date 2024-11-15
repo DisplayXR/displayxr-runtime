@@ -441,7 +441,9 @@ struct xrt_device
 	 * @param[in] value          The value to set the output to.
 	 * @see xrt_output_name
 	 */
-	void (*set_output)(struct xrt_device *xdev, enum xrt_output_name name, const struct xrt_output_value *value);
+	xrt_result_t (*set_output)(struct xrt_device *xdev,
+	                           enum xrt_output_name name,
+	                           const struct xrt_output_value *value);
 
 	/*!
 	 * Gets limits of this devices outputs.

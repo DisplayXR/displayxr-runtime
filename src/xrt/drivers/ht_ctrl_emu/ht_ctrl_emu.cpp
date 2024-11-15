@@ -368,12 +368,6 @@ cemu_device_get_tracked_pose(struct xrt_device *xdev,
 	return xret;
 }
 
-static void
-cemu_device_set_output(struct xrt_device *xdev, enum xrt_output_name name, const struct xrt_output_value *value)
-{
-	// No-op, needed to avoid crash.
-}
-
 //! @todo This is flickery; investigate once we get better hand tracking
 static void
 decide(xrt_vec3 one, xrt_vec3 two, bool *out)
@@ -457,7 +451,7 @@ cemu_devices_create(struct xrt_device *head, struct xrt_device *hands, struct xr
 
 		cemud[i]->base.update_inputs = cemu_device_update_inputs;
 		cemud[i]->base.get_tracked_pose = cemu_device_get_tracked_pose;
-		cemud[i]->base.set_output = cemu_device_set_output;
+		cemud[i]->base.set_output = u_device_ni_set_output;
 		cemud[i]->base.get_hand_tracking = cemu_device_get_hand_tracking;
 		cemud[i]->base.destroy = cemu_device_destroy;
 

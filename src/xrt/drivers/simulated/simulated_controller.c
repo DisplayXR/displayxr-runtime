@@ -166,13 +166,6 @@ simulated_device_get_tracked_pose(struct xrt_device *xdev,
 	return XRT_SUCCESS;
 }
 
-static void
-simulated_device_set_output(struct xrt_device *xdev, enum xrt_output_name name, const struct xrt_output_value *value)
-{
-	struct simulated_device *sd = simulated_device(xdev);
-	(void)sd;
-}
-
 
 /*
  *
@@ -358,7 +351,7 @@ simulated_create_controller(enum xrt_device_name name,
 	sd->base.get_tracked_pose = simulated_device_get_tracked_pose;
 	sd->base.get_hand_tracking = u_device_ni_get_hand_tracking;
 	sd->base.get_view_poses = u_device_ni_get_view_poses;
-	sd->base.set_output = simulated_device_set_output;
+	sd->base.set_output = u_device_ni_set_output;
 	sd->base.destroy = simulated_device_destroy;
 	sd->base.tracking_origin = origin;
 	sd->base.supported.orientation_tracking = true;

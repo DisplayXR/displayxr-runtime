@@ -326,7 +326,7 @@ oh_device_update_inputs(struct xrt_device *xdev)
 	return XRT_SUCCESS;
 }
 
-static void
+static xrt_result_t
 oh_device_set_output(struct xrt_device *xdev, enum xrt_output_name name, const struct xrt_output_value *value)
 {
 	struct oh_device *ohd = oh_device(xdev);
@@ -342,12 +342,16 @@ oh_device_set_output(struct xrt_device *xdev, enum xrt_output_name name, const s
 		frequency = DEFAULT_HAPTIC_FREQ;
 	}
 
-	ohmd_device_set_haptics_on(ohd->dev, (float)value->vibration.duration_ns / 1e9f, frequency,
-	                           value->vibration.amplitude);
+	int result = ohmd_device_set_haptics_on(ohd->dev, (float)value->vibration.duration_ns / 1e9f, frequency,
+	                                        value->vibration.amplitude);
+	if (result == -1) {
+		return XRT_ERROR_OUTPUT_REQUEST_FAILURE;
+	}
 #else
 	// There is no official OpenHMD Haptic API.
 	(void)ohd;
 #endif
+	return XRT_SUCCESS;
 }
 
 static bool

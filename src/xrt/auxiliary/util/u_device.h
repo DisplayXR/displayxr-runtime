@@ -226,7 +226,7 @@ u_device_ni_get_hand_tracking(struct xrt_device *xdev,
  *
  * @ingroup aux_util
  */
-void
+xrt_result_t
 u_device_ni_set_output(struct xrt_device *xdev, enum xrt_output_name name, const struct xrt_output_value *value);
 
 /*!
