@@ -741,10 +741,11 @@ xrt_device_get_body_joints(struct xrt_device *xdev,
  *
  * @public @memberof xrt_device
  */
-static inline void
+static inline xrt_result_t
 xrt_device_set_output(struct xrt_device *xdev, enum xrt_output_name name, const struct xrt_output_value *value)
 {
 	xdev->set_output(xdev, name, value);
+	return XRT_SUCCESS;
 }
 
 static inline xrt_result_t
