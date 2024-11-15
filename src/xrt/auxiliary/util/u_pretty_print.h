@@ -78,6 +78,14 @@ void
 u_pp_xrt_input_name(struct u_pp_delegate dg, enum xrt_input_name name);
 
 /*!
+ * Pretty prints the @ref xrt_output_name.
+ *
+ * @ingroup aux_pretty
+ */
+void
+u_pp_xrt_output_name(struct u_pp_delegate dg, enum xrt_output_name name);
+
+/*!
  * Pretty prints the @ref xrt_result_t.
  *
  * @ingroup aux_pretty
