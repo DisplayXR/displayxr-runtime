@@ -2256,9 +2256,7 @@ ipc_handle_device_set_output(volatile struct ipc_client_state *ics,
 	struct xrt_device *xdev = get_xdev(ics, device_id);
 
 	// Set the output.
-	xrt_device_set_output(xdev, name, value);
-
-	return XRT_SUCCESS;
+	return xrt_device_set_output(xdev, name, value);
 }
 
 xrt_result_t
