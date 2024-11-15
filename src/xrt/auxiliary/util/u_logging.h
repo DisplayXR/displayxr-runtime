@@ -497,6 +497,14 @@ u_log_print_result(enum u_logging_level cond_level,
 		U_LOG_XDEV_IFL_E(xdev, cond_level, "Unsupported input: %s", sink.buffer);                              \
 	} while (false);
 
+#define U_LOG_XDEV_UNSUPPORTED_OUTPUT(xdev, cond_level, name)                                                          \
+	do {                                                                                                           \
+		struct u_pp_sink_stack_only sink;                                                                      \
+		u_pp_delegate_t dg = u_pp_sink_stack_only_init(&sink);                                                 \
+		u_pp_xrt_output_name(dg, name);                                                                        \
+		U_LOG_XDEV_IFL_E(xdev, cond_level, "Unsupported output: %s", sink.buffer);                             \
+	} while (false);
+
 /*!
  * @}
  */
