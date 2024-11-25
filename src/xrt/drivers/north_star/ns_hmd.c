@@ -418,12 +418,13 @@ ns_hmd_get_view_poses(struct xrt_device *xdev,
 	return XRT_SUCCESS;
 }
 
-bool
+static xrt_result_t
 ns_mesh_calc(struct xrt_device *xdev, uint32_t view, float u, float v, struct xrt_uv_triplet *result)
 {
 	struct ns_hmd *ns = ns_hmd(xdev);
 	NS_DEBUG(ns, "Called!");
 	// struct xrt_vec2 warped_uv;
+
 	switch (ns->config.distortion_type) {
 	case NS_DISTORTION_TYPE_GEOMETRIC_3D: {
 		struct xrt_vec2 uv = {u, v};
@@ -437,19 +438,20 @@ ns_mesh_calc(struct xrt_device *xdev, uint32_t view, float u, float v, struct xr
 		result->g.y = warped_uv.y;
 		result->b.x = warped_uv.x;
 		result->b.y = warped_uv.y;
-		return true;
+
+		res = true;
+		break;
 	}
-	case NS_DISTORTION_TYPE_POLYNOMIAL_2D: {
-		return u_compute_distortion_ns_p2d(&ns->config.dist_p2d, view, u, v, result);
+	case NS_DISTORTION_TYPE_POLYNOMIAL_2D:
+		u_compute_distortion_ns_p2d(&ns->config.dist_p2d, view, u, v, result);
+		break;
+	case NS_DISTORTION_TYPE_MOSHI_MESHGRID:
+		u_compute_distortion_ns_meshgrid(&ns->config.dist_meshgrid, view, u, v, result);
+		break;
+	default: assert(false); break;
 	}
-	case NS_DISTORTION_TYPE_MOSHI_MESHGRID: {
-		return u_compute_distortion_ns_meshgrid(&ns->config.dist_meshgrid, view, u, v, result);
-	}
-	default: {
-		assert(false);
-		return false;
-	}
-	}
+
+	return XRT_SUCCESS;
 }
 
 /*

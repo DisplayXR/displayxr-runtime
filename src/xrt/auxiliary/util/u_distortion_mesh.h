@@ -165,19 +165,11 @@ u_compute_distortion_ns_meshgrid(
  */
 
 /*!
- * Identity distortion correction sets all result coordinates to u,v.
- *
- * @ingroup aux_distortion
- */
-bool
-u_compute_distortion_none(float u, float v, struct xrt_uv_triplet *result);
-
-/*!
  * Helper function for none distortion devices.
  *
  * @ingroup aux_distortion
  */
-bool
+xrt_result_t
 u_distortion_mesh_none(struct xrt_device *xdev, uint32_t view, float u, float v, struct xrt_uv_triplet *result);
 
 

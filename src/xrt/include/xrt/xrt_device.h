@@ -567,7 +567,7 @@ struct xrt_device
 	 * @param v               vertical texture coordinate
 	 * @param[out] out_result corresponding u,v pairs for all three color channels.
 	 */
-	bool (*compute_distortion)(
+	xrt_result_t (*compute_distortion)(
 	    struct xrt_device *xdev, uint32_t view, float u, float v, struct xrt_uv_triplet *out_result);
 
 	/*!
@@ -887,8 +887,7 @@ static inline xrt_result_t
 xrt_device_compute_distortion(
     struct xrt_device *xdev, uint32_t view, float u, float v, struct xrt_uv_triplet *out_result)
 {
-	xdev->compute_distortion(xdev, view, u, v, out_result);
-	return XRT_SUCCESS;
+	return xdev->compute_distortion(xdev, view, u, v, out_result);
 }
 
 /*!

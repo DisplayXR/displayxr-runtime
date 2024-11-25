@@ -901,7 +901,7 @@ survive_device_update_inputs(struct xrt_device *xdev)
 	return XRT_SUCCESS;
 }
 
-static bool
+static xrt_result_t
 compute_distortion(struct xrt_device *xdev, uint32_t view, float u, float v, struct xrt_uv_triplet *result)
 {
 	struct survive_device *d = (struct survive_device *)xdev;
@@ -913,7 +913,7 @@ compute_distortion(struct xrt_device *xdev, uint32_t view, float u, float v, str
 		result->g.y = 1.0f - result->g.y;
 		result->b.y = 1.0f - result->b.y;
 	}
-	return true;
+	return XRT_SUCCESS;
 }
 
 static bool

@@ -390,7 +390,7 @@ rift_transform_tan_fov_space_to_screen_ndc(struct rift_distortion_render_info *d
 }
 #endif
 
-bool
+xrt_result_t
 rift_hmd_compute_distortion(struct xrt_device *dev, uint32_t view, float u, float v, struct xrt_uv_triplet *out_result)
 {
 #define TO_NDC(x) ((x * 2) - 1)
@@ -420,7 +420,7 @@ rift_hmd_compute_distortion(struct xrt_device *dev, uint32_t view, float u, floa
 
 	*out_result = sample_tex_coord;
 
-	return true;
+	return XRT_SUCCESS;
 
 #undef TO_NDC
 }

@@ -1006,13 +1006,13 @@ psvr_device_destroy(struct xrt_device *xdev)
 	u_device_free(&psvr->base);
 }
 
-static bool
+static xrt_result_t
 psvr_compute_distortion(struct xrt_device *xdev, uint32_t view, float u, float v, struct xrt_uv_triplet *result)
 {
 	struct psvr_device *psvr = psvr_device(xdev);
 
 	u_compute_distortion_panotools(&psvr->vals, u, v, result);
-	return true;
+	return XRT_SUCCESS;
 }
 
 

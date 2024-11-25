@@ -36,5 +36,5 @@ rift_calculate_uv_scale_and_offset_from_ndc_scale_and_offset(struct rift_scale_a
 void
 rift_fill_in_default_distortions(struct rift_hmd *hmd);
 
-bool
+xrt_result_t
 rift_hmd_compute_distortion(struct xrt_device *dev, uint32_t view, float u, float v, struct xrt_uv_triplet *out_result);

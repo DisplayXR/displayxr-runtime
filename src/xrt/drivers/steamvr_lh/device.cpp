@@ -218,8 +218,8 @@ HmdDevice::HmdDevice(const DeviceBuilder &builder) : Device(builder)
 	this->inputs = inputs_vec.data();
 	this->input_count = inputs_vec.size();
 
-	this->xrt_device::get_view_poses = &device_bouncer<HmdDevice, &HmdDevice::get_view_poses, xrt_result_t>;
-#define SETUP_MEMBER_FUNC(name) this->xrt_device::name = &device_bouncer<HmdDevice, &HmdDevice::name>
+#define SETUP_MEMBER_FUNC(name) this->xrt_device::name = &device_bouncer<HmdDevice, &HmdDevice::name, xrt_result_t>
+	SETUP_MEMBER_FUNC(get_view_poses);
 	SETUP_MEMBER_FUNC(compute_distortion);
 	SETUP_MEMBER_FUNC(set_brightness);
 	SETUP_MEMBER_FUNC(get_brightness);
@@ -620,7 +620,7 @@ HmdDevice::get_view_poses(const xrt_vec3 *default_eye_relation,
 	return XRT_SUCCESS;
 }
 
-bool
+xrt_result_t
 HmdDevice::compute_distortion(uint32_t view, float u, float v, xrt_uv_triplet *out_result)
 {
 	vr::EVREye eye = (view == 0) ? vr::Eye_Left : vr::Eye_Right;
@@ -628,7 +628,7 @@ HmdDevice::compute_distortion(uint32_t view, float u, float v, xrt_uv_triplet *o
 	out_result->r = {coords.rfRed[0], coords.rfRed[1]};
 	out_result->g = {coords.rfGreen[0], coords.rfGreen[1]};
 	out_result->b = {coords.rfBlue[0], coords.rfBlue[1]};
-	return true;
+	return XRT_SUCCESS;
 }
 
 void

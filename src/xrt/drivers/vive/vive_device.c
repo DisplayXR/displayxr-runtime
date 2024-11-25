@@ -974,7 +974,7 @@ vive_device_setup_ui(struct vive_device *d)
 	u_var_add_ro_text(d, d->gui.hand_status, "Tracker status");
 }
 
-static bool
+static xrt_result_t
 compute_distortion(struct xrt_device *xdev, uint32_t view, float u, float v, struct xrt_uv_triplet *result)
 {
 	XRT_TRACE_MARKER();
@@ -988,7 +988,7 @@ compute_distortion(struct xrt_device *xdev, uint32_t view, float u, float v, str
 		result->g.y = 1.0f - result->g.y;
 		result->b.y = 1.0f - result->b.y;
 	}
-	return true;
+	return XRT_SUCCESS;
 }
 
 void

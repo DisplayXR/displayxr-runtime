@@ -248,7 +248,7 @@ u_device_ni_get_view_poses(struct xrt_device *xdev,
  *
  * @ingroup aux_util
  */
-bool
+xrt_result_t
 u_device_ni_compute_distortion(
     struct xrt_device *xdev, uint32_t view, float u, float v, struct xrt_uv_triplet *out_result);
 

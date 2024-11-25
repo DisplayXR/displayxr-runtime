@@ -25,7 +25,8 @@
 DEBUG_GET_ONCE_NUM_OPTION(mesh_size, "XRT_MESH_SIZE", 64)
 
 
-typedef bool (*func_calc)(struct xrt_device *xdev, uint32_t view, float u, float v, struct xrt_uv_triplet *result);
+typedef xrt_result_t (*func_calc)(
+    struct xrt_device *xdev, uint32_t view, float u, float v, struct xrt_uv_triplet *result);
 
 static int
 index_for(int row, int col, uint32_t stride, uint32_t offset)
@@ -398,8 +399,14 @@ u_compute_distortion_ns_meshgrid(
 }
 
 
-bool
-u_compute_distortion_none(float u, float v, struct xrt_uv_triplet *result)
+/*
+ *
+ * No distortion.
+ *
+ */
+
+xrt_result_t
+u_distortion_mesh_none(struct xrt_device *xdev, uint32_t view, float u, float v, struct xrt_uv_triplet *result)
 {
 	result->r.x = u;
 	result->r.y = v;
@@ -407,21 +414,7 @@ u_compute_distortion_none(float u, float v, struct xrt_uv_triplet *result)
 	result->g.y = v;
 	result->b.x = u;
 	result->b.y = v;
-	return true;
-}
-
-
-
-/*
- *
- * No distortion.
- *
- */
-
-bool
-u_distortion_mesh_none(struct xrt_device *xdev, uint32_t view, float u, float v, struct xrt_uv_triplet *result)
-{
-	return u_compute_distortion_none(u, v, result);
+	return XRT_SUCCESS;
 }
 
 void

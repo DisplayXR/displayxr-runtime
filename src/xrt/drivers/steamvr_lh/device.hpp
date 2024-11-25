@@ -138,7 +138,7 @@ public:
 	               xrt_fov *out_fovs,
 	               xrt_pose *out_poses);
 
-	bool
+	xrt_result_t
 	compute_distortion(uint32_t view, float u, float v, xrt_uv_triplet *out_result);
 
 	void

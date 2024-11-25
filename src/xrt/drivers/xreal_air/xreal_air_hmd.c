@@ -1166,13 +1166,6 @@ xreal_air_hmd_destroy(struct xrt_device *xdev)
 	u_device_free(&hmd->base);
 }
 
-static bool
-xreal_air_hmd_compute_distortion(
-    struct xrt_device *xdev, uint32_t view, float u, float v, struct xrt_uv_triplet *result)
-{
-	return u_compute_distortion_none(u, v, result);
-}
-
 /*
  *
  * Exported functions.
@@ -1195,7 +1188,7 @@ xreal_air_hmd_create_device(struct os_hid_device *sensor_device,
 	hmd->base.update_inputs = xreal_air_hmd_update_inputs;
 	hmd->base.get_tracked_pose = xreal_air_hmd_get_tracked_pose;
 	hmd->base.get_view_poses = u_device_get_view_poses;
-	hmd->base.compute_distortion = xreal_air_hmd_compute_distortion;
+	hmd->base.compute_distortion = u_distortion_mesh_none;
 	hmd->base.destroy = xreal_air_hmd_destroy;
 	hmd->base.name = XRT_DEVICE_GENERIC_HMD;
 	hmd->base.device_type = XRT_DEVICE_TYPE_HMD;

@@ -16,7 +16,6 @@
 
 #include "multi.h"
 
-
 DEBUG_GET_ONCE_LOG_OPTION(multi_log, "MULTI_LOG", U_LOGGING_WARN)
 
 #define MULTI_TRACE(d, ...) U_LOG_XDEV_IFL_T(&d->base, d->log_level, __VA_ARGS__)
@@ -217,7 +216,7 @@ get_view_poses(struct xrt_device *xdev,
 	return xrt_device_get_tracked_pose(xdev, XRT_INPUT_GENERIC_HEAD_POSE, at_timestamp_ns, out_head_relation);
 }
 
-static bool
+static xrt_result_t
 compute_distortion(struct xrt_device *xdev, uint32_t view, float u, float v, struct xrt_uv_triplet *result)
 {
 	struct multi_device *d = (struct multi_device *)xdev;
