@@ -883,11 +883,12 @@ xrt_device_get_view_poses(struct xrt_device *xdev,
  *
  * @public @memberof xrt_device
  */
-static inline bool
+static inline xrt_result_t
 xrt_device_compute_distortion(
     struct xrt_device *xdev, uint32_t view, float u, float v, struct xrt_uv_triplet *out_result)
 {
-	return xdev->compute_distortion(xdev, view, u, v, out_result);
+	xdev->compute_distortion(xdev, view, u, v, out_result);
+	return XRT_SUCCESS;
 }
 
 /*!
