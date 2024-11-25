@@ -184,18 +184,16 @@ ipc_client_hmd_compute_distortion(
 	ipc_client_hmd_t *ich = ipc_client_hmd(xdev);
 	xrt_result_t xret;
 
-	bool ret;
 	xret = ipc_call_device_compute_distortion( //
 	    ich->ipc_c,                            //
 	    ich->device_id,                        //
 	    view,                                  //
 	    u,                                     //
 	    v,                                     //
-	    &ret,                                  //
 	    out_result);                           //
 	IPC_CHK_WITH_RET(ich->ipc_c, xret, "ipc_call_device_compute_distortion", false);
 
-	return ret;
+	return xret == XRT_SUCCESS;
 }
 
 static bool

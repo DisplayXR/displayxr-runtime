@@ -460,7 +460,6 @@
 			{"name": "v", "type": "float"}
 		],
 		"out": [
-			{"name": "ret", "type": "bool"},
 			{"name": "triplet", "type": "struct xrt_uv_triplet"}
 		]
 	},
