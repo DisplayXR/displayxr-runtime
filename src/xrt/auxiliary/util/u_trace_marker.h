@@ -206,7 +206,7 @@ u_trace_marker_init(void);
 
 #define U_TRACE_IDENT(CATEGORY, IDENT) ZoneScopedN(#IDENT)
 
-#elif !defined(XRT_OS_WINDOWS) // !__cplusplus
+#elif !defined(XRT_OS_WINDOWS) || defined(__clang__) // !__cplusplus
 
 static inline void
 u_trace_scope_cleanup(TracyCZoneCtx *ctx_ptr)
