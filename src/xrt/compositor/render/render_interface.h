@@ -62,7 +62,7 @@ extern "C" {
  * squasher in a single dispatch.
  */
 #define RENDER_MAX_IMAGES_SIZE (RENDER_MAX_LAYERS * XRT_MAX_VIEWS)
-#define RENDER_MAX_IMAGES_COUNT (RENDER_MAX_LAYERS * r->view_count)
+#define RENDER_MAX_IMAGES_COUNT(RENDER_RESOURCES) (RENDER_MAX_LAYERS * RENDER_RESOURCES->view_count)
 
 /*!
  * Maximum number of times that the layer squasher shader can run per
@@ -72,14 +72,14 @@ extern "C" {
  * composition (which is this number divided by number of composition).
  */
 #define RENDER_MAX_LAYER_RUNS_SIZE (XRT_MAX_VIEWS)
-#define RENDER_MAX_LAYER_RUNS_COUNT (r->view_count)
+#define RENDER_MAX_LAYER_RUNS_COUNT(RENDER_RESOURCES) (RENDER_RESOURCES->view_count)
 
 //! Distortion image dimension in pixels
 #define RENDER_DISTORTION_IMAGE_DIMENSIONS (128)
 
 //! How many distortion images we have, one for each channel (3 rgb) and per view.
 #define RENDER_DISTORTION_IMAGES_SIZE (3 * XRT_MAX_VIEWS)
-#define RENDER_DISTORTION_IMAGES_COUNT (3 * r->view_count)
+#define RENDER_DISTORTION_IMAGES_COUNT(RENDER_RESOURCES) (3 * RENDER_RESOURCES->view_count)
 
 //! The binding that the layer projection and quad shader have their UBO on.
 #define RENDER_BINDING_LAYER_SHARED_UBO 0

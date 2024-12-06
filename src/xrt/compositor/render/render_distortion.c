@@ -324,7 +324,7 @@ render_distortion_buffer_init(struct render_resources *r,
 	VK_CHK_WITH_GOTO(ret, "vk_cmd_pool_create_and_begin_cmd_buffer_locked", err_unlock);
 	VK_NAME_COMMAND_BUFFER(vk, upload_buffer, "render_resources distortion command buffer");
 
-	for (uint32_t i = 0; i < RENDER_DISTORTION_IMAGES_COUNT; i++) {
+	for (uint32_t i = 0; i < RENDER_DISTORTION_IMAGES_COUNT(r); i++) {
 		ret = create_and_queue_upload_locked( //
 		    vk,                               // vk_bundle
 		    pool,                             // pool
@@ -347,7 +347,7 @@ render_distortion_buffer_init(struct render_resources *r,
 
 	r->distortion.pre_rotated = pre_rotate;
 
-	for (uint32_t i = 0; i < RENDER_DISTORTION_IMAGES_COUNT; i++) {
+	for (uint32_t i = 0; i < RENDER_DISTORTION_IMAGES_COUNT(r); i++) {
 		r->distortion.device_memories[i] = device_memories[i];
 		r->distortion.images[i] = images[i];
 		r->distortion.image_views[i] = image_views[i];
@@ -358,7 +358,7 @@ render_distortion_buffer_init(struct render_resources *r,
 	 * Tidy
 	 */
 
-	for (uint32_t i = 0; i < RENDER_DISTORTION_IMAGES_COUNT; i++) {
+	for (uint32_t i = 0; i < RENDER_DISTORTION_IMAGES_COUNT(r); i++) {
 		render_buffer_fini(vk, &bufs[i]);
 	}
 
@@ -372,7 +372,7 @@ err_unlock:
 	vk_cmd_pool_unlock(pool);
 
 err_resources:
-	for (uint32_t i = 0; i < RENDER_DISTORTION_IMAGES_COUNT; i++) {
+	for (uint32_t i = 0; i < RENDER_DISTORTION_IMAGES_COUNT(r); i++) {
 		D(ImageView, image_views[i]);
 		D(Image, images[i]);
 		DF(Memory, device_memories[i]);
@@ -394,7 +394,7 @@ render_distortion_images_fini(struct render_resources *r)
 {
 	struct vk_bundle *vk = r->vk;
 
-	for (uint32_t i = 0; i < RENDER_DISTORTION_IMAGES_COUNT; i++) {
+	for (uint32_t i = 0; i < RENDER_DISTORTION_IMAGES_COUNT(r); i++) {
 		D(ImageView, r->distortion.image_views[i]);
 		D(Image, r->distortion.images[i]);
 		DF(Memory, r->distortion.device_memories[i]);

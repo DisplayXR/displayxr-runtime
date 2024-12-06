@@ -542,10 +542,8 @@ render_resources_init(struct render_resources *r,
 	r->compute.target_binding = 2;
 	r->compute.ubo_binding = 3;
 
-	r->compute.layer.image_array_size = vk->features.max_per_stage_descriptor_sampled_images;
-	if (r->compute.layer.image_array_size > RENDER_MAX_IMAGES_COUNT) {
-		r->compute.layer.image_array_size = RENDER_MAX_IMAGES_COUNT;
-	}
+	r->compute.layer.image_array_size =
+	    MAX(vk->features.max_per_stage_descriptor_sampled_images, RENDER_MAX_IMAGES_COUNT(r));
 
 
 	/*
@@ -697,10 +695,10 @@ render_resources_init(struct render_resources *r,
 
 	{
 		// Number of layer shader runs (views) times number of layers.
-		const uint32_t layer_shader_count = RENDER_MAX_LAYER_RUNS_COUNT * RENDER_MAX_LAYERS;
+		const uint32_t layer_shader_count = RENDER_MAX_LAYER_RUNS_COUNT(r) * RENDER_MAX_LAYERS;
 
 		// Two mesh distortion runs.
-		const uint32_t mesh_shader_count = RENDER_MAX_LAYER_RUNS_COUNT;
+		const uint32_t mesh_shader_count = RENDER_MAX_LAYER_RUNS_COUNT(r);
 
 		struct vk_descriptor_pool_info mesh_pool_info = {
 		    .uniform_per_descriptor_count = 1,
@@ -731,7 +729,7 @@ render_resources_init(struct render_resources *r,
 		buffer_count += layer_shader_count;
 
 		// One UBO per mesh shader.
-		buffer_count += RENDER_MAX_LAYER_RUNS_COUNT;
+		buffer_count += RENDER_MAX_LAYER_RUNS_COUNT(r);
 
 		// We currently use the aligmnent as max UBO size.
 		static_assert(sizeof(struct render_gfx_mesh_ubo_data) <= RENDER_ALWAYS_SAFE_UBO_ALIGNMENT, "MAX");
@@ -831,12 +829,12 @@ render_resources_init(struct render_resources *r,
 
 	const uint32_t compute_descriptor_count = //
 	    1 +                                   // Shared/distortion run(s).
-	    RENDER_MAX_LAYER_RUNS_COUNT;          // Layer shader run(s).
+	    RENDER_MAX_LAYER_RUNS_COUNT(r);       // Layer shader run(s).
 
 	struct vk_descriptor_pool_info compute_pool_info = {
 	    .uniform_per_descriptor_count = 1,
 	    // layer images
-	    .sampler_per_descriptor_count = r->compute.layer.image_array_size + RENDER_DISTORTION_IMAGES_COUNT,
+	    .sampler_per_descriptor_count = r->compute.layer.image_array_size + RENDER_DISTORTION_IMAGES_COUNT(r),
 	    .storage_image_per_descriptor_count = 1,
 	    .storage_buffer_per_descriptor_count = 0,
 	    .descriptor_count = compute_descriptor_count,
@@ -1041,13 +1039,13 @@ render_resources_init(struct render_resources *r,
 	 * Compute distortion textures, not created until later.
 	 */
 
-	for (uint32_t i = 0; i < RENDER_DISTORTION_IMAGES_COUNT; i++) {
+	for (uint32_t i = 0; i < RENDER_DISTORTION_IMAGES_COUNT(r); i++) {
 		r->distortion.image_views[i] = VK_NULL_HANDLE;
 	}
-	for (uint32_t i = 0; i < RENDER_DISTORTION_IMAGES_COUNT; i++) {
+	for (uint32_t i = 0; i < RENDER_DISTORTION_IMAGES_COUNT(r); i++) {
 		r->distortion.images[i] = VK_NULL_HANDLE;
 	}
-	for (uint32_t i = 0; i < RENDER_DISTORTION_IMAGES_COUNT; i++) {
+	for (uint32_t i = 0; i < RENDER_DISTORTION_IMAGES_COUNT(r); i++) {
 		r->distortion.device_memories[i] = VK_NULL_HANDLE;
 	}
 
