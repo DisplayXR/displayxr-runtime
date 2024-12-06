@@ -34,9 +34,9 @@ vk_from_rtr(struct render_gfx_target_resources *rtr)
  * Get the @ref vk_bundle from @ref render_gfx.
  */
 static inline struct vk_bundle *
-vk_from_rr(struct render_gfx *rr)
+vk_from_rr(struct render_gfx *render)
 {
-	return rr->r->vk;
+	return render->r->vk;
 }
 
 XRT_CHECK_RESULT static VkResult
@@ -235,7 +235,7 @@ update_ubo_and_src_descriptor_set(struct vk_bundle *vk,
 /// Sub-allocate a UBO for our layer-specific data,
 /// and create a descriptor set for it and the layer image to sample.
 XRT_CHECK_RESULT static VkResult
-do_ubo_and_src_alloc_and_write(struct render_gfx *rr,
+do_ubo_and_src_alloc_and_write(struct render_gfx *render,
                                uint32_t ubo_binding,
                                const void *ubo_ptr,
                                VkDeviceSize ubo_size,
@@ -248,7 +248,7 @@ do_ubo_and_src_alloc_and_write(struct render_gfx *rr,
 {
 	VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
 	struct render_sub_alloc ubo = XRT_STRUCT_INIT;
-	struct vk_bundle *vk = vk_from_rr(rr);
+	struct vk_bundle *vk = vk_from_rr(render);
 
 	VkResult ret;
 
@@ -258,7 +258,7 @@ do_ubo_and_src_alloc_and_write(struct render_gfx *rr,
 	 */
 	ret = render_sub_alloc_ubo_alloc_and_write( //
 	    vk,                                     // vk_bundle
-	    &rr->ubo_tracker,                       // rsat
+	    &render->ubo_tracker,                   // rsat
 	    ubo_ptr,                                // ptr
 	    ubo_size,                               // size
 	    &ubo);                                  // out_rsa
@@ -293,10 +293,10 @@ do_ubo_and_src_alloc_and_write(struct render_gfx *rr,
 }
 
 static inline void
-dispatch_no_vbo(struct render_gfx *rr, uint32_t vertex_count, VkPipeline pipeline, VkDescriptorSet descriptor_set)
+dispatch_no_vbo(struct render_gfx *render, uint32_t vertex_count, VkPipeline pipeline, VkDescriptorSet descriptor_set)
 {
-	struct vk_bundle *vk = vk_from_rr(rr);
-	struct render_resources *r = rr->r;
+	struct vk_bundle *vk = vk_from_rr(render);
+	struct render_resources *r = render->r;
 
 
 	VkDescriptorSet descriptor_sets[1] = {descriptor_set};
@@ -957,24 +957,24 @@ render_gfx_target_resources_fini(struct render_gfx_target_resources *rtr)
  */
 
 bool
-render_gfx_init(struct render_gfx *rr, struct render_resources *r)
+render_gfx_init(struct render_gfx *render, struct render_resources *r)
 {
 	// Init fields.
-	rr->r = r;
+	render->r = r;
 
 	// Used to sub-allocate UBOs from, restart from scratch each frame.
-	render_sub_alloc_tracker_init(&rr->ubo_tracker, &r->gfx.shared_ubo);
+	render_sub_alloc_tracker_init(&render->ubo_tracker, &r->gfx.shared_ubo);
 
 	return true;
 }
 
 bool
-render_gfx_begin(struct render_gfx *rr)
+render_gfx_begin(struct render_gfx *render)
 {
-	struct vk_bundle *vk = vk_from_rr(rr);
+	struct vk_bundle *vk = vk_from_rr(render);
 	VkResult ret;
 
-	ret = vk->vkResetCommandPool(vk->device, rr->r->cmd_pool, 0);
+	ret = vk->vkResetCommandPool(vk->device, render->r->cmd_pool, 0);
 	VK_CHK_WITH_RET(ret, "vkResetCommandPool", false);
 
 
@@ -984,48 +984,48 @@ render_gfx_begin(struct render_gfx *rr)
 	};
 
 	ret = vk->vkBeginCommandBuffer( //
-	    rr->r->cmd,                 // commandBuffer
+	    render->r->cmd,             // commandBuffer
 	    &begin_info);               // pBeginInfo
 	VK_CHK_WITH_RET(ret, "vkResetCommandPool", false);
 
-	vk->vkCmdResetQueryPool( //
-	    rr->r->cmd,          // commandBuffer
-	    rr->r->query_pool,   // queryPool
-	    0,                   // firstQuery
-	    2);                  // queryCount
+	vk->vkCmdResetQueryPool(   //
+	    render->r->cmd,        // commandBuffer
+	    render->r->query_pool, // queryPool
+	    0,                     // firstQuery
+	    2);                    // queryCount
 
 	vk->vkCmdWriteTimestamp(               //
-	    rr->r->cmd,                        // commandBuffer
+	    render->r->cmd,                    // commandBuffer
 	    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, // pipelineStage
-	    rr->r->query_pool,                 // queryPool
+	    render->r->query_pool,             // queryPool
 	    0);                                // query
 
 	return true;
 }
 
 bool
-render_gfx_end(struct render_gfx *rr)
+render_gfx_end(struct render_gfx *render)
 {
-	struct vk_bundle *vk = vk_from_rr(rr);
+	struct vk_bundle *vk = vk_from_rr(render);
 	VkResult ret;
 
 	vk->vkCmdWriteTimestamp(                  //
-	    rr->r->cmd,                           // commandBuffer
+	    render->r->cmd,                       // commandBuffer
 	    VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, // pipelineStage
-	    rr->r->query_pool,                    // queryPool
+	    render->r->query_pool,                // queryPool
 	    1);                                   // query
 
-	ret = vk->vkEndCommandBuffer(rr->r->cmd);
+	ret = vk->vkEndCommandBuffer(render->r->cmd);
 	VK_CHK_WITH_RET(ret, "vkEndCommandBuffer", false);
 
 	return true;
 }
 
 void
-render_gfx_fini(struct render_gfx *rr)
+render_gfx_fini(struct render_gfx *render)
 {
-	struct vk_bundle *vk = vk_from_rr(rr);
-	struct render_resources *r = rr->r;
+	struct vk_bundle *vk = vk_from_rr(render);
+	struct render_resources *r = render->r;
 
 	// Reclaim all descriptor sets.
 	vk->vkResetDescriptorPool(              //
@@ -1034,7 +1034,7 @@ render_gfx_fini(struct render_gfx *rr)
 	    0);                                 //
 
 	// This "reclaims" the allocated UBOs.
-	U_ZERO(rr);
+	U_ZERO(render);
 }
 
 
@@ -1045,49 +1045,51 @@ render_gfx_fini(struct render_gfx *rr)
  */
 
 bool
-render_gfx_begin_target(struct render_gfx *rr, struct render_gfx_target_resources *rtr, const VkClearColorValue *color)
+render_gfx_begin_target(struct render_gfx *render,
+                        struct render_gfx_target_resources *rtr,
+                        const VkClearColorValue *color)
 {
-	struct vk_bundle *vk = vk_from_rr(rr);
+	struct vk_bundle *vk = vk_from_rr(render);
 
-	assert(rr->rtr == NULL);
-	rr->rtr = rtr;
+	assert(render->rtr == NULL);
+	render->rtr = rtr;
 
 	VkRenderPass render_pass = rtr->rgrp->render_pass;
 	VkFramebuffer framebuffer = rtr->framebuffer;
 	VkExtent2D extent = rtr->extent;
 
-	begin_render_pass( //
-	    vk,            //
-	    rr->r->cmd,    //
-	    render_pass,   //
-	    framebuffer,   //
-	    extent.width,  //
-	    extent.height, //
-	    color);        //
+	begin_render_pass(  //
+	    vk,             //
+	    render->r->cmd, //
+	    render_pass,    //
+	    framebuffer,    //
+	    extent.width,   //
+	    extent.height,  //
+	    color);         //
 
 	return true;
 }
 
 void
-render_gfx_end_target(struct render_gfx *rr)
+render_gfx_end_target(struct render_gfx *render)
 {
-	struct vk_bundle *vk = vk_from_rr(rr);
+	struct vk_bundle *vk = vk_from_rr(render);
 
-	assert(rr->rtr != NULL);
-	rr->rtr = NULL;
+	assert(render->rtr != NULL);
+	render->rtr = NULL;
 
 	// Stop the [shared] render pass.
-	vk->vkCmdEndRenderPass(rr->r->cmd);
+	vk->vkCmdEndRenderPass(render->r->cmd);
 }
 
 void
-render_gfx_begin_view(struct render_gfx *rr, uint32_t view, const struct render_viewport_data *viewport_data)
+render_gfx_begin_view(struct render_gfx *render, uint32_t view, const struct render_viewport_data *viewport_data)
 {
-	struct vk_bundle *vk = vk_from_rr(rr);
+	struct vk_bundle *vk = vk_from_rr(render);
 
 	// We currently only support two views.
 	assert(view == 0 || view == 1);
-	assert(rr->rtr != NULL);
+	assert(render->rtr != NULL);
 
 
 	/*
@@ -1103,10 +1105,10 @@ render_gfx_begin_view(struct render_gfx *rr, uint32_t view, const struct render_
 	    .maxDepth = 1.0f,
 	};
 
-	vk->vkCmdSetViewport(rr->r->cmd, // commandBuffer
-	                     0,          // firstViewport
-	                     1,          // viewportCount
-	                     &viewport); // pViewports
+	vk->vkCmdSetViewport(render->r->cmd, // commandBuffer
+	                     0,              // firstViewport
+	                     1,              // viewportCount
+	                     &viewport);     // pViewports
 
 	/*
 	 * Scissor
@@ -1125,30 +1127,30 @@ render_gfx_begin_view(struct render_gfx *rr, uint32_t view, const struct render_
 	        },
 	};
 
-	vk->vkCmdSetScissor(rr->r->cmd, // commandBuffer
-	                    0,          // firstScissor
-	                    1,          // scissorCount
-	                    &scissor);  // pScissors
+	vk->vkCmdSetScissor(render->r->cmd, // commandBuffer
+	                    0,              // firstScissor
+	                    1,              // scissorCount
+	                    &scissor);      // pScissors
 }
 
 void
-render_gfx_end_view(struct render_gfx *rr)
+render_gfx_end_view(struct render_gfx *render)
 {
 	//! Must have a current target.
-	assert(rr->rtr != NULL);
+	assert(render->rtr != NULL);
 }
 
 XRT_CHECK_RESULT VkResult
-render_gfx_mesh_alloc_and_write(struct render_gfx *rr,
+render_gfx_mesh_alloc_and_write(struct render_gfx *render,
                                 const struct render_gfx_mesh_ubo_data *data,
                                 VkSampler src_sampler,
                                 VkImageView src_image_view,
                                 VkDescriptorSet *out_descriptor_set)
 {
-	struct render_resources *r = rr->r;
+	struct render_resources *r = render->r;
 
 	return do_ubo_and_src_alloc_and_write(  //
-	    rr,                                 // rr
+	    render,                             //
 	    r->mesh.ubo_binding,                // ubo_binding
 	    data,                               // ubo_ptr
 	    sizeof(*data),                      // ubo_size
@@ -1161,10 +1163,10 @@ render_gfx_mesh_alloc_and_write(struct render_gfx *rr,
 }
 
 void
-render_gfx_mesh_draw(struct render_gfx *rr, uint32_t mesh_index, VkDescriptorSet descriptor_set, bool do_timewarp)
+render_gfx_mesh_draw(struct render_gfx *render, uint32_t mesh_index, VkDescriptorSet descriptor_set, bool do_timewarp)
 {
-	struct vk_bundle *vk = vk_from_rr(rr);
-	struct render_resources *r = rr->r;
+	struct vk_bundle *vk = vk_from_rr(render);
+	struct render_resources *r = render->r;
 
 
 	/*
@@ -1183,7 +1185,8 @@ render_gfx_mesh_draw(struct render_gfx *rr, uint32_t mesh_index, VkDescriptorSet
 	    NULL);                           // pDynamicOffsets
 
 	// Select which pipeline we want.
-	VkPipeline pipeline = do_timewarp ? rr->rtr->rgrp->mesh.pipeline_timewarp : rr->rtr->rgrp->mesh.pipeline;
+	VkPipeline pipeline =
+	    do_timewarp ? render->rtr->rgrp->mesh.pipeline_timewarp : render->rtr->rgrp->mesh.pipeline;
 
 	vk->vkCmdBindPipeline(               //
 	    r->cmd,                          // commandBuffer
@@ -1243,100 +1246,100 @@ render_gfx_mesh_draw(struct render_gfx *rr, uint32_t mesh_index, VkDescriptorSet
  */
 
 XRT_CHECK_RESULT VkResult
-render_gfx_layer_cylinder_alloc_and_write(struct render_gfx *rr,
+render_gfx_layer_cylinder_alloc_and_write(struct render_gfx *render,
                                           const struct render_gfx_layer_cylinder_data *data,
                                           VkSampler src_sampler,
                                           VkImageView src_image_view,
                                           VkDescriptorSet *out_descriptor_set)
 {
-	struct render_resources *r = rr->r;
+	struct render_resources *r = render->r;
 
 	return do_ubo_and_src_alloc_and_write(         //
-	    rr,                                        // rr
+	    render,                                    //
 	    RENDER_BINDING_LAYER_SHARED_UBO,           // ubo_binding
-	    data,                                      // ubo_ptr
-	    sizeof(*data),                             // ubo_size
+	    data,                                      //
+	    sizeof(*data),                             //
 	    RENDER_BINDING_LAYER_SHARED_SRC,           // src_binding
-	    src_sampler,                               // src_sampler
-	    src_image_view,                            // src_image_view
+	    src_sampler,                               //
+	    src_image_view,                            //
 	    r->gfx.ubo_and_src_descriptor_pool,        // descriptor_pool
 	    r->gfx.layer.shared.descriptor_set_layout, // descriptor_set_layout
 	    out_descriptor_set);                       // out_descriptor_set
 }
 
 XRT_CHECK_RESULT VkResult
-render_gfx_layer_equirect2_alloc_and_write(struct render_gfx *rr,
+render_gfx_layer_equirect2_alloc_and_write(struct render_gfx *render,
                                            const struct render_gfx_layer_equirect2_data *data,
                                            VkSampler src_sampler,
                                            VkImageView src_image_view,
                                            VkDescriptorSet *out_descriptor_set)
 {
-	struct render_resources *r = rr->r;
+	struct render_resources *r = render->r;
 
 	return do_ubo_and_src_alloc_and_write(         //
-	    rr,                                        // rr
+	    render,                                    //
 	    RENDER_BINDING_LAYER_SHARED_UBO,           // ubo_binding
-	    data,                                      // ubo_ptr
-	    sizeof(*data),                             // ubo_size
+	    data,                                      //
+	    sizeof(*data),                             //
 	    RENDER_BINDING_LAYER_SHARED_SRC,           // src_binding
-	    src_sampler,                               // src_sampler
-	    src_image_view,                            // src_image_view
+	    src_sampler,                               //
+	    src_image_view,                            //
 	    r->gfx.ubo_and_src_descriptor_pool,        // descriptor_pool
 	    r->gfx.layer.shared.descriptor_set_layout, // descriptor_set_layout
 	    out_descriptor_set);                       // out_descriptor_set
 }
 
 XRT_CHECK_RESULT VkResult
-render_gfx_layer_projection_alloc_and_write(struct render_gfx *rr,
+render_gfx_layer_projection_alloc_and_write(struct render_gfx *render,
                                             const struct render_gfx_layer_projection_data *data,
                                             VkSampler src_sampler,
                                             VkImageView src_image_view,
                                             VkDescriptorSet *out_descriptor_set)
 {
-	struct render_resources *r = rr->r;
+	struct render_resources *r = render->r;
 
 	return do_ubo_and_src_alloc_and_write(         //
-	    rr,                                        // rr
+	    render,                                    //
 	    RENDER_BINDING_LAYER_SHARED_UBO,           // ubo_binding
-	    data,                                      // ubo_ptr
-	    sizeof(*data),                             // ubo_size
+	    data,                                      //
+	    sizeof(*data),                             //
 	    RENDER_BINDING_LAYER_SHARED_SRC,           // src_binding
-	    src_sampler,                               // src_sampler
-	    src_image_view,                            // src_image_view
+	    src_sampler,                               //
+	    src_image_view,                            //
 	    r->gfx.ubo_and_src_descriptor_pool,        // descriptor_pool
 	    r->gfx.layer.shared.descriptor_set_layout, // descriptor_set_layout
 	    out_descriptor_set);                       // out_descriptor_set
 }
 
 XRT_CHECK_RESULT VkResult
-render_gfx_layer_quad_alloc_and_write(struct render_gfx *rr,
+render_gfx_layer_quad_alloc_and_write(struct render_gfx *render,
                                       const struct render_gfx_layer_quad_data *data,
                                       VkSampler src_sampler,
                                       VkImageView src_image_view,
                                       VkDescriptorSet *out_descriptor_set)
 {
-	struct render_resources *r = rr->r;
+	struct render_resources *r = render->r;
 
 	return do_ubo_and_src_alloc_and_write(         //
-	    rr,                                        // rr
+	    render,                                    //
 	    RENDER_BINDING_LAYER_SHARED_UBO,           // ubo_binding
-	    data,                                      // ubo_ptr
-	    sizeof(*data),                             // ubo_size
+	    data,                                      //
+	    sizeof(*data),                             //
 	    RENDER_BINDING_LAYER_SHARED_SRC,           // src_binding
-	    src_sampler,                               // src_sampler
-	    src_image_view,                            // src_image_view
+	    src_sampler,                               //
+	    src_image_view,                            //
 	    r->gfx.ubo_and_src_descriptor_pool,        // descriptor_pool
 	    r->gfx.layer.shared.descriptor_set_layout, // descriptor_set_layout
 	    out_descriptor_set);                       // out_descriptor_set
 }
 
 void
-render_gfx_layer_cylinder(struct render_gfx *rr, bool premultiplied_alpha, VkDescriptorSet descriptor_set)
+render_gfx_layer_cylinder(struct render_gfx *render, bool premultiplied_alpha, VkDescriptorSet descriptor_set)
 {
-	VkPipeline pipeline =                                          //
-	    premultiplied_alpha                                        //
-	        ? rr->rtr->rgrp->layer.cylinder_premultiplied_alpha    //
-	        : rr->rtr->rgrp->layer.cylinder_unpremultiplied_alpha; //
+	VkPipeline pipeline =                                              //
+	    premultiplied_alpha                                            //
+	        ? render->rtr->rgrp->layer.cylinder_premultiplied_alpha    //
+	        : render->rtr->rgrp->layer.cylinder_unpremultiplied_alpha; //
 
 	// One per degree.
 	uint32_t subdivisions = 360;
@@ -1348,55 +1351,55 @@ render_gfx_layer_cylinder(struct render_gfx *rr, bool premultiplied_alpha, VkDes
 	uint32_t vertex_count = edges * 2;
 
 	dispatch_no_vbo(     //
-	    rr,              // rr
+	    render,          //
 	    vertex_count,    // vertex_count
 	    pipeline,        // pipeline
 	    descriptor_set); // descriptor_set
 }
 
 void
-render_gfx_layer_equirect2(struct render_gfx *rr, bool premultiplied_alpha, VkDescriptorSet descriptor_set)
+render_gfx_layer_equirect2(struct render_gfx *render, bool premultiplied_alpha, VkDescriptorSet descriptor_set)
 {
-	VkPipeline pipeline =                                           //
-	    premultiplied_alpha                                         //
-	        ? rr->rtr->rgrp->layer.equirect2_premultiplied_alpha    //
-	        : rr->rtr->rgrp->layer.equirect2_unpremultiplied_alpha; //
+	VkPipeline pipeline =                                               //
+	    premultiplied_alpha                                             //
+	        ? render->rtr->rgrp->layer.equirect2_premultiplied_alpha    //
+	        : render->rtr->rgrp->layer.equirect2_unpremultiplied_alpha; //
 
 	// Hardcoded to 4 vertices.
 	dispatch_no_vbo(     //
-	    rr,              // rr
+	    render,          //
 	    4,               // vertex_count
 	    pipeline,        // pipeline
 	    descriptor_set); // descriptor_set
 }
 
 void
-render_gfx_layer_projection(struct render_gfx *rr, bool premultiplied_alpha, VkDescriptorSet descriptor_set)
+render_gfx_layer_projection(struct render_gfx *render, bool premultiplied_alpha, VkDescriptorSet descriptor_set)
 {
-	VkPipeline pipeline =                                      //
-	    premultiplied_alpha                                    //
-	        ? rr->rtr->rgrp->layer.proj_premultiplied_alpha    //
-	        : rr->rtr->rgrp->layer.proj_unpremultiplied_alpha; //
+	VkPipeline pipeline =                                          //
+	    premultiplied_alpha                                        //
+	        ? render->rtr->rgrp->layer.proj_premultiplied_alpha    //
+	        : render->rtr->rgrp->layer.proj_unpremultiplied_alpha; //
 
 	// Hardcoded to 4 vertices.
 	dispatch_no_vbo(     //
-	    rr,              // rr
+	    render,          //
 	    4,               // vertex_count
 	    pipeline,        // pipeline
 	    descriptor_set); // descriptor_set
 }
 
 void
-render_gfx_layer_quad(struct render_gfx *rr, bool premultiplied_alpha, VkDescriptorSet descriptor_set)
+render_gfx_layer_quad(struct render_gfx *render, bool premultiplied_alpha, VkDescriptorSet descriptor_set)
 {
-	VkPipeline pipeline =                                      //
-	    premultiplied_alpha                                    //
-	        ? rr->rtr->rgrp->layer.quad_premultiplied_alpha    //
-	        : rr->rtr->rgrp->layer.quad_unpremultiplied_alpha; //
+	VkPipeline pipeline =                                          //
+	    premultiplied_alpha                                        //
+	        ? render->rtr->rgrp->layer.quad_premultiplied_alpha    //
+	        : render->rtr->rgrp->layer.quad_unpremultiplied_alpha; //
 
 	// Hardcoded to 4 vertices.
 	dispatch_no_vbo(     //
-	    rr,              // rr
+	    render,          //
 	    4,               // vertex_count
 	    pipeline,        // pipeline
 	    descriptor_set); // descriptor_set

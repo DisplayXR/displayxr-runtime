@@ -847,7 +847,7 @@ struct render_gfx
  * @public @memberof render_gfx
  */
 bool
-render_gfx_init(struct render_gfx *rr, struct render_resources *r);
+render_gfx_init(struct render_gfx *render, struct render_resources *r);
 
 /*!
  * Begins the rendering, takes the vk_bundle's pool lock and leaves it locked.
@@ -855,7 +855,7 @@ render_gfx_init(struct render_gfx *rr, struct render_resources *r);
  * @public @memberof render_gfx
  */
 bool
-render_gfx_begin(struct render_gfx *rr);
+render_gfx_begin(struct render_gfx *render);
 
 /*!
  * Frees any unneeded resources and ends the command buffer so it can be used,
@@ -864,7 +864,7 @@ render_gfx_begin(struct render_gfx *rr);
  * @public @memberof render_gfx
  */
 bool
-render_gfx_end(struct render_gfx *rr);
+render_gfx_end(struct render_gfx *render);
 
 /*!
  * Frees all resources held by the rendering, does not free the struct itself.
@@ -872,7 +872,7 @@ render_gfx_end(struct render_gfx *rr);
  * @public @memberof render_gfx
  */
 void
-render_gfx_fini(struct render_gfx *rr);
+render_gfx_fini(struct render_gfx *render);
 
 
 /*
@@ -957,25 +957,27 @@ struct render_gfx_layer_quad_data
  * @public @memberof render_gfx
  */
 bool
-render_gfx_begin_target(struct render_gfx *rr, struct render_gfx_target_resources *rtr, const VkClearColorValue *color);
+render_gfx_begin_target(struct render_gfx *render,
+                        struct render_gfx_target_resources *rtr,
+                        const VkClearColorValue *color);
 
 /*!
  * @public @memberof render_gfx
  */
 void
-render_gfx_end_target(struct render_gfx *rr);
+render_gfx_end_target(struct render_gfx *render);
 
 /*!
  * @public @memberof render_gfx
  */
 void
-render_gfx_begin_view(struct render_gfx *rr, uint32_t view, const struct render_viewport_data *viewport_data);
+render_gfx_begin_view(struct render_gfx *render, uint32_t view, const struct render_viewport_data *viewport_data);
 
 /*!
  * @public @memberof render_gfx
  */
 void
-render_gfx_end_view(struct render_gfx *rr);
+render_gfx_end_view(struct render_gfx *render);
 
 /*!
  * Allocate needed resources for one mesh shader dispatch, will also update the
@@ -988,7 +990,7 @@ render_gfx_end_view(struct render_gfx *rr);
  * @public @memberof render_gfx
  */
 XRT_CHECK_RESULT VkResult
-render_gfx_mesh_alloc_and_write(struct render_gfx *rr,
+render_gfx_mesh_alloc_and_write(struct render_gfx *render,
                                 const struct render_gfx_mesh_ubo_data *data,
                                 VkSampler src_sampler,
                                 VkImageView src_image_view,
@@ -1001,7 +1003,7 @@ render_gfx_mesh_alloc_and_write(struct render_gfx *rr,
  * @public @memberof render_gfx
  */
 void
-render_gfx_mesh_draw(struct render_gfx *rr, uint32_t mesh_index, VkDescriptorSet descriptor_set, bool do_timewarp);
+render_gfx_mesh_draw(struct render_gfx *render, uint32_t mesh_index, VkDescriptorSet descriptor_set, bool do_timewarp);
 
 /*!
  * Allocate and write a UBO and descriptor_set to be used for cylinder layer
@@ -1010,7 +1012,7 @@ render_gfx_mesh_draw(struct render_gfx *rr, uint32_t mesh_index, VkDescriptorSet
  * @public @memberof render_gfx
  */
 XRT_CHECK_RESULT VkResult
-render_gfx_layer_cylinder_alloc_and_write(struct render_gfx *rr,
+render_gfx_layer_cylinder_alloc_and_write(struct render_gfx *render,
                                           const struct render_gfx_layer_cylinder_data *data,
                                           VkSampler src_sampler,
                                           VkImageView src_image_view,
@@ -1023,7 +1025,7 @@ render_gfx_layer_cylinder_alloc_and_write(struct render_gfx *rr,
  * @public @memberof render_gfx
  */
 XRT_CHECK_RESULT VkResult
-render_gfx_layer_equirect2_alloc_and_write(struct render_gfx *rr,
+render_gfx_layer_equirect2_alloc_and_write(struct render_gfx *render,
                                            const struct render_gfx_layer_equirect2_data *data,
                                            VkSampler src_sampler,
                                            VkImageView src_image_view,
@@ -1036,7 +1038,7 @@ render_gfx_layer_equirect2_alloc_and_write(struct render_gfx *rr,
  * @public @memberof render_gfx
  */
 XRT_CHECK_RESULT VkResult
-render_gfx_layer_projection_alloc_and_write(struct render_gfx *rr,
+render_gfx_layer_projection_alloc_and_write(struct render_gfx *render,
                                             const struct render_gfx_layer_projection_data *data,
                                             VkSampler src_sampler,
                                             VkImageView src_image_view,
@@ -1049,7 +1051,7 @@ render_gfx_layer_projection_alloc_and_write(struct render_gfx *rr,
  * @public @memberof render_gfx
  */
 XRT_CHECK_RESULT VkResult
-render_gfx_layer_quad_alloc_and_write(struct render_gfx *rr,
+render_gfx_layer_quad_alloc_and_write(struct render_gfx *render,
                                       const struct render_gfx_layer_quad_data *data,
                                       VkSampler src_sampler,
                                       VkImageView src_image_view,
@@ -1063,7 +1065,7 @@ render_gfx_layer_quad_alloc_and_write(struct render_gfx *rr,
  * @public @memberof render_gfx
  */
 void
-render_gfx_layer_cylinder(struct render_gfx *rr, bool premultiplied_alpha, VkDescriptorSet descriptor_set);
+render_gfx_layer_cylinder(struct render_gfx *render, bool premultiplied_alpha, VkDescriptorSet descriptor_set);
 
 /*!
  * Dispatch a equirect2 layer shader into the current target and view,
@@ -1073,7 +1075,7 @@ render_gfx_layer_cylinder(struct render_gfx *rr, bool premultiplied_alpha, VkDes
  * @public @memberof render_gfx
  */
 void
-render_gfx_layer_equirect2(struct render_gfx *rr, bool premultiplied_alpha, VkDescriptorSet descriptor_set);
+render_gfx_layer_equirect2(struct render_gfx *render, bool premultiplied_alpha, VkDescriptorSet descriptor_set);
 
 /*!
  * Dispatch a projection layer shader into the current target and view,
@@ -1083,7 +1085,7 @@ render_gfx_layer_equirect2(struct render_gfx *rr, bool premultiplied_alpha, VkDe
  * @public @memberof render_gfx
  */
 void
-render_gfx_layer_projection(struct render_gfx *rr, bool premultiplied_alpha, VkDescriptorSet descriptor_set);
+render_gfx_layer_projection(struct render_gfx *render, bool premultiplied_alpha, VkDescriptorSet descriptor_set);
 
 /*!
  * Dispatch a quad layer shader into the current target and view, allocate
@@ -1092,7 +1094,7 @@ render_gfx_layer_projection(struct render_gfx *rr, bool premultiplied_alpha, VkD
  * @public @memberof render_gfx
  */
 void
-render_gfx_layer_quad(struct render_gfx *rr, bool premultiplied_alpha, VkDescriptorSet descriptor_set);
+render_gfx_layer_quad(struct render_gfx *render, bool premultiplied_alpha, VkDescriptorSet descriptor_set);
 
 /*!
  * @}
@@ -1251,7 +1253,7 @@ struct render_compute_distortion_ubo_data
  * @public @memberof render_compute
  */
 bool
-render_compute_init(struct render_compute *crc, struct render_resources *r);
+render_compute_init(struct render_compute *render, struct render_resources *r);
 
 /*!
  * Frees all resources held by the compute rendering, does not free the struct itself.
@@ -1259,7 +1261,7 @@ render_compute_init(struct render_compute *crc, struct render_resources *r);
  * @public @memberof render_compute
  */
 void
-render_compute_fini(struct render_compute *crc);
+render_compute_fini(struct render_compute *render);
 
 /*!
  * Begin the compute command buffer building, takes the vk_bundle's pool lock
@@ -1268,7 +1270,7 @@ render_compute_fini(struct render_compute *crc);
  * @public @memberof render_compute
  */
 bool
-render_compute_begin(struct render_compute *crc);
+render_compute_begin(struct render_compute *render);
 
 /*!
  * Frees any unneeded resources and ends the command buffer so it can be used,
@@ -1277,7 +1279,7 @@ render_compute_begin(struct render_compute *crc);
  * @public @memberof render_compute
  */
 bool
-render_compute_end(struct render_compute *crc);
+render_compute_end(struct render_compute *render);
 
 /*!
  * Updates the given @p descriptor_set and dispatches the layer shader. Unlike
@@ -1292,21 +1294,21 @@ render_compute_end(struct render_compute *crc);
  * @public @memberof render_compute
  */
 void
-render_compute_layers(struct render_compute *crc,                          //
-                      VkDescriptorSet descriptor_set,                      //
-                      VkBuffer ubo,                                        //
-                      VkSampler src_samplers[RENDER_MAX_IMAGES_SIZE],      //
-                      VkImageView src_image_views[RENDER_MAX_IMAGES_SIZE], //
-                      uint32_t num_srcs,                                   //
-                      VkImageView target_image_view,                       //
-                      const struct render_viewport_data *view,             //
-                      bool timewarp);                                      //
+render_compute_layers(struct render_compute *render,
+                      VkDescriptorSet descriptor_set,
+                      VkBuffer ubo,
+                      VkSampler src_samplers[RENDER_MAX_IMAGES_SIZE],
+                      VkImageView src_image_views[RENDER_MAX_IMAGES_SIZE],
+                      uint32_t num_srcs,
+                      VkImageView target_image_view,
+                      const struct render_viewport_data *view,
+                      bool timewarp);
 
 /*!
  * @public @memberof render_compute
  */
 void
-render_compute_projection_timewarp(struct render_compute *crc,
+render_compute_projection_timewarp(struct render_compute *render,
                                    VkSampler src_samplers[XRT_MAX_VIEWS],
                                    VkImageView src_image_views[XRT_MAX_VIEWS],
                                    const struct xrt_normalized_rect src_rects[XRT_MAX_VIEWS],
@@ -1321,22 +1323,22 @@ render_compute_projection_timewarp(struct render_compute *crc,
  * @public @memberof render_compute
  */
 void
-render_compute_projection(struct render_compute *crc,                                //
-                          VkSampler src_samplers[XRT_MAX_VIEWS],                     //
-                          VkImageView src_image_views[XRT_MAX_VIEWS],                //
-                          const struct xrt_normalized_rect src_rects[XRT_MAX_VIEWS], //
-                          VkImage target_image,                                      //
-                          VkImageView target_image_view,                             //
-                          const struct render_viewport_data views[XRT_MAX_VIEWS]);   //
+render_compute_projection(struct render_compute *render,
+                          VkSampler src_samplers[XRT_MAX_VIEWS],
+                          VkImageView src_image_views[XRT_MAX_VIEWS],
+                          const struct xrt_normalized_rect src_rects[XRT_MAX_VIEWS],
+                          VkImage target_image,
+                          VkImageView target_image_view,
+                          const struct render_viewport_data views[XRT_MAX_VIEWS]);
 
 /*!
  * @public @memberof render_compute
  */
 void
-render_compute_clear(struct render_compute *crc,                              //
-                     VkImage target_image,                                    //
-                     VkImageView target_image_view,                           //
-                     const struct render_viewport_data views[XRT_MAX_VIEWS]); //
+render_compute_clear(struct render_compute *render,
+                     VkImage target_image,
+                     VkImageView target_image_view,
+                     const struct render_viewport_data views[XRT_MAX_VIEWS]);
 
 
 
