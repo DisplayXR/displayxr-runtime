@@ -362,27 +362,28 @@ do_cs_distortion_from_scratch(struct render_compute *crc, const struct comp_rend
 	}
 	VkSampler clamp_to_border_black = crc->r->samplers.clamp_to_border_black;
 
-	struct render_viewport_data target_viewport_datas[XRT_MAX_VIEWS];
+	// Data to fill in.
 	VkImageView src_image_views[XRT_MAX_VIEWS];
 	VkSampler src_samplers[XRT_MAX_VIEWS];
+	struct render_viewport_data target_viewport_datas[XRT_MAX_VIEWS];
 	struct xrt_normalized_rect src_norm_rects[XRT_MAX_VIEWS];
 
 	for (uint32_t i = 0; i < d->view_count; i++) {
 		// Data to be filled in.
-		struct render_viewport_data viewport_data;
 		VkImageView src_image_view;
+		struct render_viewport_data viewport_data;
 		struct xrt_normalized_rect src_norm_rect;
 
 		// Gather data.
-		viewport_data = d->views[i].target_viewport_data,
 		src_image_view = d->views[i].srgb_view; // Read with gamma curve.
 		src_norm_rect = d->views[i].layer_norm_rect;
+		viewport_data = d->views[i].target_viewport_data;
 
 		// Fill in data.
-		target_viewport_datas[i] = viewport_data;
 		src_image_views[i] = src_image_view;
-		src_samplers[i] = clamp_to_border_black;
 		src_norm_rects[i] = src_norm_rect;
+		src_samplers[i] = clamp_to_border_black;
+		target_viewport_datas[i] = viewport_data;
 	}
 
 	render_compute_projection(   //
@@ -413,46 +414,47 @@ do_cs_distortion_for_layer(struct render_compute *crc,
 	VkSampler clamp_to_border_black = crc->r->samplers.clamp_to_border_black;
 
 	// Data to fill in.
-	struct xrt_pose world_poses[XRT_MAX_VIEWS];
+	VkImageView src_image_views[XRT_MAX_VIEWS];
+	VkSampler src_samplers[XRT_MAX_VIEWS];
 	struct render_viewport_data target_viewport_datas[XRT_MAX_VIEWS];
 	struct xrt_normalized_rect src_norm_rects[XRT_MAX_VIEWS];
-	struct xrt_pose src_poses[XRT_MAX_VIEWS];
 	struct xrt_fov src_fovs[XRT_MAX_VIEWS];
-	VkSampler src_samplers[XRT_MAX_VIEWS];
-	VkImageView src_image_views[XRT_MAX_VIEWS];
+	struct xrt_pose src_poses[XRT_MAX_VIEWS];
+	struct xrt_pose world_poses[XRT_MAX_VIEWS];
 
 	for (uint32_t i = 0; i < d->view_count; i++) {
-		struct xrt_pose world_pose;
-		struct render_viewport_data viewport_data;
-		struct xrt_pose src_pose;
-		struct xrt_fov src_fov;
-		struct xrt_normalized_rect src_norm_rect;
+		// Data to be filled in.
 		VkImageView src_image_view;
+		struct render_viewport_data viewport_data;
+		struct xrt_normalized_rect src_norm_rect;
+		struct xrt_fov src_fov;
+		struct xrt_pose src_pose;
+		struct xrt_pose world_pose;
 		uint32_t array_index = vds[i]->sub.array_index;
 		const struct comp_swapchain_image *image = get_layer_image(layer, i, vds[i]->sub.image_index);
 
 		// Gather data.
-		world_pose = d->views[i].world_pose;
-		viewport_data = d->views[i].target_viewport_data;
-
-		src_pose = vds[i]->pose;
-		src_fov = vds[i]->fov;
-		src_norm_rect = vds[i]->sub.norm_rect;
 		src_image_view = get_image_view(image, data->flags, array_index);
+		src_norm_rect = vds[i]->sub.norm_rect;
+		viewport_data = d->views[i].target_viewport_data;
+		src_fov = vds[i]->fov;
+		src_pose = vds[i]->pose;
+		world_pose = d->views[i].world_pose;
 
+		// No layer squasher has handled this for us already
 		if (data->flip_y) {
 			src_norm_rect.y += src_norm_rect.h;
 			src_norm_rect.h = -src_norm_rect.h;
 		}
 
 		// Fill in data.
-		world_poses[i] = world_pose;
-		target_viewport_datas[i] = viewport_data;
-		src_norm_rects[i] = src_norm_rect;
-		src_poses[i] = src_pose;
-		src_fovs[i] = src_fov;
-		src_samplers[i] = clamp_to_border_black;
 		src_image_views[i] = src_image_view;
+		src_norm_rects[i] = src_norm_rect;
+		src_samplers[i] = clamp_to_border_black;
+		target_viewport_datas[i] = viewport_data;
+		src_fovs[i] = src_fov;
+		src_poses[i] = src_pose;
+		world_poses[i] = world_pose;
 	}
 
 	if (!d->do_timewarp) {
