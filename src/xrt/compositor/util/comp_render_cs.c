@@ -54,6 +54,70 @@ get_layer_depth_image(const struct comp_layer *layer, uint32_t swapchain_index, 
 }
 
 static inline void
+do_cs_cylinder_layer(const struct comp_layer *layer,
+                     const struct xrt_matrix_4x4 *eye_view_mat,
+                     const struct xrt_matrix_4x4 *world_view_mat,
+                     uint32_t view_index,
+                     uint32_t cur_layer,
+                     uint32_t cur_image,
+                     VkSampler clamp_to_edge,
+                     VkSampler clamp_to_border_black,
+                     VkSampler src_samplers[RENDER_MAX_IMAGES_SIZE],
+                     VkImageView src_image_views[RENDER_MAX_IMAGES_SIZE],
+                     struct render_compute_layer_ubo_data *ubo_data,
+                     uint32_t *out_cur_image)
+{
+	const struct xrt_layer_data *layer_data = &layer->data;
+	const struct xrt_layer_cylinder_data *c = &layer_data->cylinder;
+	const uint32_t array_index = c->sub.array_index;
+	const struct comp_swapchain_image *image = get_layer_image(layer, 0, c->sub.image_index);
+
+	// Image to use.
+	src_samplers[cur_image] = clamp_to_edge;
+	src_image_views[cur_image] = get_image_view(image, layer_data->flags, array_index);
+
+	// Used for Subimage and OpenGL flip.
+	set_post_transform_rect(                    //
+	    layer_data,                             // data
+	    &c->sub.norm_rect,                      // src_norm_rect
+	    false,                                  // invert_flip
+	    &ubo_data->post_transforms[cur_layer]); // out_norm_rect
+
+	ubo_data->cylinder_data[cur_layer].central_angle = c->central_angle;
+	ubo_data->cylinder_data[cur_layer].aspect_ratio = c->aspect_ratio;
+
+	struct xrt_vec3 scale = {1.f, 1.f, 1.f};
+
+	struct xrt_matrix_4x4 model;
+	math_matrix_4x4_model(&c->pose, &scale, &model);
+
+	struct xrt_matrix_4x4 model_inv;
+	math_matrix_4x4_inverse(&model, &model_inv);
+
+	const struct xrt_matrix_4x4 *v = is_layer_view_space(layer_data) ? eye_view_mat : world_view_mat;
+
+	struct xrt_matrix_4x4 v_inv;
+	math_matrix_4x4_inverse(v, &v_inv);
+
+	math_matrix_4x4_multiply(&model_inv, &v_inv, &ubo_data->mv_inverse[cur_layer]);
+
+	// Simplifies the shader.
+	if (c->radius >= INFINITY) {
+		ubo_data->cylinder_data[cur_layer].radius = 0.f;
+	} else {
+		ubo_data->cylinder_data[cur_layer].radius = c->radius;
+	}
+
+	ubo_data->cylinder_data[cur_layer].central_angle = c->central_angle;
+	ubo_data->cylinder_data[cur_layer].aspect_ratio = c->aspect_ratio;
+
+	ubo_data->images_samplers[cur_layer].images[0] = cur_image;
+	cur_image++;
+
+	*out_cur_image = cur_image;
+}
+
+static inline void
 do_cs_equirect2_layer(const struct comp_layer *layer,
                       const struct xrt_matrix_4x4 *eye_view_mat,
                       const struct xrt_matrix_4x4 *world_view_mat,
@@ -258,70 +322,6 @@ do_cs_quad_layer(const struct comp_layer *layer,
 	*out_cur_image = cur_image;
 }
 
-
-static inline void
-do_cs_cylinder_layer(const struct comp_layer *layer,
-                     const struct xrt_matrix_4x4 *eye_view_mat,
-                     const struct xrt_matrix_4x4 *world_view_mat,
-                     uint32_t view_index,
-                     uint32_t cur_layer,
-                     uint32_t cur_image,
-                     VkSampler clamp_to_edge,
-                     VkSampler clamp_to_border_black,
-                     VkSampler src_samplers[RENDER_MAX_IMAGES_SIZE],
-                     VkImageView src_image_views[RENDER_MAX_IMAGES_SIZE],
-                     struct render_compute_layer_ubo_data *ubo_data,
-                     uint32_t *out_cur_image)
-{
-	const struct xrt_layer_data *layer_data = &layer->data;
-	const struct xrt_layer_cylinder_data *c = &layer_data->cylinder;
-	const uint32_t array_index = c->sub.array_index;
-	const struct comp_swapchain_image *image = get_layer_image(layer, 0, c->sub.image_index);
-
-	// Image to use.
-	src_samplers[cur_image] = clamp_to_edge;
-	src_image_views[cur_image] = get_image_view(image, layer_data->flags, array_index);
-
-	// Used for Subimage and OpenGL flip.
-	set_post_transform_rect(                    //
-	    layer_data,                             // data
-	    &c->sub.norm_rect,                      // src_norm_rect
-	    false,                                  // invert_flip
-	    &ubo_data->post_transforms[cur_layer]); // out_norm_rect
-
-	ubo_data->cylinder_data[cur_layer].central_angle = c->central_angle;
-	ubo_data->cylinder_data[cur_layer].aspect_ratio = c->aspect_ratio;
-
-	struct xrt_vec3 scale = {1.f, 1.f, 1.f};
-
-	struct xrt_matrix_4x4 model;
-	math_matrix_4x4_model(&c->pose, &scale, &model);
-
-	struct xrt_matrix_4x4 model_inv;
-	math_matrix_4x4_inverse(&model, &model_inv);
-
-	const struct xrt_matrix_4x4 *v = is_layer_view_space(layer_data) ? eye_view_mat : world_view_mat;
-
-	struct xrt_matrix_4x4 v_inv;
-	math_matrix_4x4_inverse(v, &v_inv);
-
-	math_matrix_4x4_multiply(&model_inv, &v_inv, &ubo_data->mv_inverse[cur_layer]);
-
-	// Simplifies the shader.
-	if (c->radius >= INFINITY) {
-		ubo_data->cylinder_data[cur_layer].radius = 0.f;
-	} else {
-		ubo_data->cylinder_data[cur_layer].radius = c->radius;
-	}
-
-	ubo_data->cylinder_data[cur_layer].central_angle = c->central_angle;
-	ubo_data->cylinder_data[cur_layer].aspect_ratio = c->aspect_ratio;
-
-	ubo_data->images_samplers[cur_layer].images[0] = cur_image;
-	cur_image++;
-
-	*out_cur_image = cur_image;
-}
 
 
 /*
