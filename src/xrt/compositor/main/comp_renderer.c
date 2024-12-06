@@ -437,11 +437,11 @@ renderer_close_renderings_and_fences(struct comp_renderer *r)
 	// Renderings
 	if (r->buffer_count > 0 && r->rtr_array != NULL) {
 		for (uint32_t i = 0; i < r->buffer_count; i++) {
-			render_gfx_target_resources_close(&r->rtr_array[i]);
+			render_gfx_target_resources_fini(&r->rtr_array[i]);
 		}
 
 		// Close the render pass used for rendering to the target.
-		render_gfx_render_pass_close(&r->target_render_pass);
+		render_gfx_render_pass_fini(&r->target_render_pass);
 
 		free(r->rtr_array);
 		r->rtr_array = NULL;
@@ -825,12 +825,12 @@ renderer_fini(struct comp_renderer *r)
 	// Do this after the layer renderer.
 	for (uint32_t i = 0; i < r->c->nr.view_count; i++) {
 		for (uint32_t k = 0; k < COMP_SCRATCH_NUM_IMAGES; k++) {
-			render_gfx_target_resources_close(&r->scratch.views[i].targets[k]);
+			render_gfx_target_resources_fini(&r->scratch.views[i].targets[k]);
 		}
 	}
 
 	// Do this after the layer renderer and targert resources.
-	render_gfx_render_pass_close(&r->scratch_render_pass);
+	render_gfx_render_pass_fini(&r->scratch_render_pass);
 }
 
 

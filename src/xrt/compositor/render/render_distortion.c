@@ -272,9 +272,9 @@ create_and_fill_in_distortion_buffer_for_view(struct vk_bundle *vk,
 	return VK_SUCCESS;
 
 err_buffers:
-	render_buffer_close(vk, r_buffer);
-	render_buffer_close(vk, g_buffer);
-	render_buffer_close(vk, b_buffer);
+	render_buffer_fini(vk, r_buffer);
+	render_buffer_fini(vk, g_buffer);
+	render_buffer_fini(vk, b_buffer);
 
 	return ret;
 }
@@ -359,7 +359,7 @@ render_distortion_buffer_init(struct render_resources *r,
 	 */
 
 	for (uint32_t i = 0; i < RENDER_DISTORTION_IMAGES_COUNT; i++) {
-		render_buffer_close(vk, &bufs[i]);
+		render_buffer_fini(vk, &bufs[i]);
 	}
 
 	return true;
@@ -376,7 +376,7 @@ err_resources:
 		D(ImageView, image_views[i]);
 		D(Image, images[i]);
 		DF(Memory, device_memories[i]);
-		render_buffer_close(vk, &bufs[i]);
+		render_buffer_fini(vk, &bufs[i]);
 	}
 
 	return false;
@@ -390,7 +390,7 @@ err_resources:
  */
 
 void
-render_distortion_images_close(struct render_resources *r)
+render_distortion_images_fini(struct render_resources *r)
 {
 	struct vk_bundle *vk = r->vk;
 
@@ -408,7 +408,7 @@ render_distortion_images_ensure(struct render_resources *r,
                                 bool pre_rotate)
 {
 	if (r->distortion.image_views[0] == VK_NULL_HANDLE || pre_rotate != r->distortion.pre_rotated) {
-		render_distortion_images_close(r);
+		render_distortion_images_fini(r);
 		return render_distortion_buffer_init(r, vk, xdev, pre_rotate);
 	}
 

@@ -178,7 +178,7 @@ render_buffer_init_exportable(struct vk_bundle *vk,
 }
 
 void
-render_buffer_close(struct vk_bundle *vk, struct render_buffer *buffer)
+render_buffer_fini(struct vk_bundle *vk, struct render_buffer *buffer)
 {
 	D(Buffer, buffer->buffer);
 	DF(Memory, buffer->memory);

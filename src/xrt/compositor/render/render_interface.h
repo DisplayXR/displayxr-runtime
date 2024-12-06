@@ -168,7 +168,7 @@ render_shaders_load(struct render_shaders *s, struct vk_bundle *vk);
  * Unload and cleanup shaders.
  */
 void
-render_shaders_close(struct render_shaders *s, struct vk_bundle *vk);
+render_shaders_fini(struct render_shaders *s, struct vk_bundle *vk);
 
 
 /*
@@ -224,7 +224,7 @@ render_buffer_init_exportable(struct vk_bundle *vk,
  * Frees all resources that this buffer has, but does not free the buffer itself.
  */
 void
-render_buffer_close(struct vk_bundle *vk, struct render_buffer *buffer);
+render_buffer_fini(struct vk_bundle *vk, struct render_buffer *buffer);
 
 /*!
  * Maps the memory, sets render_buffer::mapped to the memory.
@@ -575,11 +575,12 @@ render_resources_init(struct render_resources *r,
  * @public @memberof render_resources
  */
 void
-render_resources_close(struct render_resources *r);
+render_resources_fini(struct render_resources *r);
 
 /*!
  * Creates or recreates the compute distortion textures if necessary.
  *
+ * @see render_distortion_images_fini
  * @public @memberof render_resources
  */
 bool
@@ -595,7 +596,7 @@ render_distortion_images_ensure(struct render_resources *r,
  * @public @memberof render_resources
  */
 void
-render_distortion_images_close(struct render_resources *r);
+render_distortion_images_fini(struct render_resources *r);
 
 /*!
  * Returns the timestamps for when the latest GPU work started and stopped that
@@ -670,7 +671,7 @@ render_scratch_images_ensure(struct render_resources *r, struct render_scratch_i
  * @public @memberof render_scratch_images
  */
 void
-render_scratch_images_close(struct render_resources *r, struct render_scratch_images *rsi);
+render_scratch_images_fini(struct render_resources *r, struct render_scratch_images *rsi);
 
 
 /*
@@ -763,7 +764,7 @@ render_gfx_render_pass_init(struct render_gfx_render_pass *rgrp,
  * @public @memberof render_gfx_render_pass
  */
 void
-render_gfx_render_pass_close(struct render_gfx_render_pass *rgrp);
+render_gfx_render_pass_fini(struct render_gfx_render_pass *rgrp);
 
 
 /*
@@ -813,7 +814,7 @@ render_gfx_target_resources_init(struct render_gfx_target_resources *rtr,
  * @public @memberof render_gfx_target_resources
  */
 void
-render_gfx_target_resources_close(struct render_gfx_target_resources *rtr);
+render_gfx_target_resources_fini(struct render_gfx_target_resources *rtr);
 
 
 /*

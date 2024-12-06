@@ -1083,7 +1083,7 @@ render_resources_init(struct render_resources *r,
 }
 
 void
-render_resources_close(struct render_resources *r)
+render_resources_fini(struct render_resources *r)
 {
 	// We were never initialised or already closed, always safe to call this function.
 	if (r->vk == NULL) {
@@ -1101,7 +1101,7 @@ render_resources_close(struct render_resources *r)
 	D(Image, r->mock.color.image);
 	DF(Memory, r->mock.color.memory);
 
-	render_buffer_close(vk, &r->gfx.shared_ubo);
+	render_buffer_fini(vk, &r->gfx.shared_ubo);
 	D(DescriptorPool, r->gfx.ubo_and_src_descriptor_pool);
 
 	D(DescriptorSetLayout, r->gfx.layer.shared.descriptor_set_layout);
@@ -1111,10 +1111,10 @@ render_resources_close(struct render_resources *r)
 	D(PipelineLayout, r->mesh.pipeline_layout);
 	D(PipelineCache, r->pipeline_cache);
 	D(QueryPool, r->query_pool);
-	render_buffer_close(vk, &r->mesh.vbo);
-	render_buffer_close(vk, &r->mesh.ibo);
+	render_buffer_fini(vk, &r->mesh.vbo);
+	render_buffer_fini(vk, &r->mesh.ibo);
 	for (uint32_t i = 0; i < r->view_count; ++i) {
-		render_buffer_close(vk, &r->mesh.ubos[i]);
+		render_buffer_fini(vk, &r->mesh.ubos[i]);
 	}
 
 	D(DescriptorPool, r->compute.descriptor_pool);
@@ -1131,12 +1131,12 @@ render_resources_close(struct render_resources *r)
 
 	D(Pipeline, r->compute.clear.pipeline);
 
-	render_distortion_images_close(r);
-	render_buffer_close(vk, &r->compute.clear.ubo);
+	render_distortion_images_fini(r);
+	render_buffer_fini(vk, &r->compute.clear.ubo);
 	for (uint32_t i = 0; i < r->view_count; i++) {
-		render_buffer_close(vk, &r->compute.layer.ubos[i]);
+		render_buffer_fini(vk, &r->compute.layer.ubos[i]);
 	}
-	render_buffer_close(vk, &r->compute.distortion.ubo);
+	render_buffer_fini(vk, &r->compute.distortion.ubo);
 
 	vk_cmd_pool_destroy(vk, &r->distortion_pool);
 	D(CommandPool, r->cmd_pool);
@@ -1255,7 +1255,7 @@ render_scratch_images_ensure(struct render_resources *r, struct render_scratch_i
 		return true;
 	}
 
-	render_scratch_images_close(r, rsi);
+	render_scratch_images_fini(r, rsi);
 
 	for (uint32_t i = 0; i < r->view_count; i++) {
 		bret = create_scratch_image_and_view( //
@@ -1268,7 +1268,7 @@ render_scratch_images_ensure(struct render_resources *r, struct render_scratch_i
 	}
 
 	if (!bret) {
-		render_scratch_images_close(r, rsi);
+		render_scratch_images_fini(r, rsi);
 		return false;
 	}
 
@@ -1278,7 +1278,7 @@ render_scratch_images_ensure(struct render_resources *r, struct render_scratch_i
 }
 
 void
-render_scratch_images_close(struct render_resources *r, struct render_scratch_images *rsi)
+render_scratch_images_fini(struct render_resources *r, struct render_scratch_images *rsi)
 {
 	struct vk_bundle *vk = r->vk;
 

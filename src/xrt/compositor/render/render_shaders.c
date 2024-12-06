@@ -61,7 +61,7 @@
 		                           &s->SHADER); /* out       */                                                \
 		if (ret != VK_SUCCESS) {                                                                               \
 			VK_ERROR(vk, "Failed to load shader '" #SHADER "'");                                           \
-			render_shaders_close(s, vk);                                                                   \
+			render_shaders_fini(s, vk);                                                                    \
 			return false;                                                                                  \
 		}                                                                                                      \
 		VK_NAME_SHADER_MODULE(vk, s->SHADER, #SHADER);                                                         \
@@ -126,7 +126,7 @@ render_shaders_load(struct render_shaders *s, struct vk_bundle *vk)
 }
 
 void
-render_shaders_close(struct render_shaders *s, struct vk_bundle *vk)
+render_shaders_fini(struct render_shaders *s, struct vk_bundle *vk)
 {
 	D(ShaderModule, s->blit_comp);
 	D(ShaderModule, s->clear_comp);

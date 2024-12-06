@@ -884,7 +884,7 @@ render_gfx_render_pass_init(struct render_gfx_render_pass *rgrp,
 }
 
 void
-render_gfx_render_pass_close(struct render_gfx_render_pass *rgrp)
+render_gfx_render_pass_fini(struct render_gfx_render_pass *rgrp)
 {
 	struct vk_bundle *vk = rgrp->r->vk;
 
@@ -940,7 +940,7 @@ render_gfx_target_resources_init(struct render_gfx_target_resources *rtr,
 }
 
 void
-render_gfx_target_resources_close(struct render_gfx_target_resources *rtr)
+render_gfx_target_resources_fini(struct render_gfx_target_resources *rtr)
 {
 	struct vk_bundle *vk = vk_from_rtr(rtr);
 
