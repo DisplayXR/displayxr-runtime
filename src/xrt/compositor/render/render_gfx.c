@@ -257,10 +257,10 @@ do_ubo_and_src_alloc_and_write(struct render_gfx *render,
 	 * Allocate and upload data.
 	 */
 	ret = render_sub_alloc_ubo_alloc_and_write( //
-	    vk,                                     // vk_bundle
+	    vk,                                     //
 	    &render->ubo_tracker,                   // rsat
-	    ubo_ptr,                                // ptr
-	    ubo_size,                               // size
+	    ubo_ptr,                                //
+	    ubo_size,                               //
 	    &ubo);                                  // out_rsa
 	VK_CHK_AND_RET(ret, "render_sub_alloc_ubo_alloc_and_write");
 
@@ -270,22 +270,22 @@ do_ubo_and_src_alloc_and_write(struct render_gfx *render,
 	 */
 
 	ret = vk_create_descriptor_set( //
-	    vk,                         // vk_bundle
-	    descriptor_pool,            // descriptor_pool
-	    descriptor_set_layout,      // descriptor_set_layout
-	    &descriptor_set);           // descriptor_set
+	    vk,                         //
+	    descriptor_pool,            //
+	    descriptor_set_layout,      //
+	    &descriptor_set);           //
 	VK_CHK_AND_RET(ret, "vk_create_descriptor_set");
 
 	update_ubo_and_src_descriptor_set( //
-	    vk,                            // vk_bundle
-	    ubo_binding,                   // ubo_binding
-	    ubo.buffer,                    // buffer
-	    ubo.offset,                    // offset
-	    ubo.size,                      // size
-	    src_binding,                   // src_binding
-	    src_sampler,                   // sampler
-	    src_image_view,                // image_view
-	    descriptor_set);               // descriptor_set
+	    vk,                            //
+	    ubo_binding,                   //
+	    ubo.buffer,                    //
+	    ubo.offset,                    //
+	    ubo.size,                      //
+	    src_binding,                   //
+	    src_sampler,                   //
+	    src_image_view,                //
+	    descriptor_set);               //
 
 	*out_descriptor_set = descriptor_set;
 
@@ -301,7 +301,7 @@ dispatch_no_vbo(struct render_gfx *render, uint32_t vertex_count, VkPipeline pip
 
 	VkDescriptorSet descriptor_sets[1] = {descriptor_set};
 	vk->vkCmdBindDescriptorSets(             //
-	    r->cmd,                              // commandBuffer
+	    r->cmd,                              //
 	    VK_PIPELINE_BIND_POINT_GRAPHICS,     // pipelineBindPoint
 	    r->gfx.layer.shared.pipeline_layout, // layout
 	    0,                                   // firstSet
@@ -311,14 +311,14 @@ dispatch_no_vbo(struct render_gfx *render, uint32_t vertex_count, VkPipeline pip
 	    NULL);                               // pDynamicOffsets
 
 	vk->vkCmdBindPipeline(               //
-	    r->cmd,                          // commandBuffer
+	    r->cmd,                          //
 	    VK_PIPELINE_BIND_POINT_GRAPHICS, // pipelineBindPoint
-	    pipeline);                       // pipeline
+	    pipeline);                       //
 
 	// This pipeline doesn't have any VBO input or indices.
 
 	vk->vkCmdDraw(    //
-	    r->cmd,       // commandBuffer
+	    r->cmd,       //
 	    vertex_count, // vertexCount
 	    1,            // instanceCount
 	    0,            // firstVertex
@@ -717,10 +717,10 @@ render_gfx_render_pass_init(struct render_gfx_render_pass *rgrp,
 	VkResult ret;
 
 	ret = create_implicit_render_pass( //
-	    vk,                            // vk_bundle
+	    vk,                            //
 	    format,                        // target_format
-	    load_op,                       // load_op
-	    final_layout,                  // final_layout
+	    load_op,                       //
+	    final_layout,                  //
 	    &rgrp->render_pass);           // out_render_pass
 	VK_CHK_WITH_RET(ret, "create_implicit_render_pass", false);
 	VK_NAME_RENDER_PASS(vk, rgrp->render_pass, "render_gfx_render_pass render pass");
@@ -730,16 +730,16 @@ render_gfx_render_pass_init(struct render_gfx_render_pass *rgrp,
 	};
 
 	ret = create_mesh_pipeline(    //
-	    vk,                        // vk_bundle
-	    rgrp->render_pass,         // render_pass
-	    r->mesh.pipeline_layout,   // pipeline_layout
-	    r->pipeline_cache,         // pipeline_cache
-	    r->mesh.src_binding,       // src_binding
-	    r->mesh.index_count_total, // mesh_index_count_total
-	    r->mesh.stride,            // mesh_stride
-	    &simple_params,            // params
-	    r->shaders->mesh_vert,     // mesh_vert
-	    r->shaders->mesh_frag,     // mesh_frag
+	    vk,                        //
+	    rgrp->render_pass,         //
+	    r->mesh.pipeline_layout,   //
+	    r->pipeline_cache,         //
+	    r->mesh.src_binding,       //
+	    r->mesh.index_count_total, //
+	    r->mesh.stride,            //
+	    &simple_params,            //
+	    r->shaders->mesh_vert,     //
+	    r->shaders->mesh_frag,     //
 	    &rgrp->mesh.pipeline);     // out_mesh_pipeline
 	VK_CHK_WITH_RET(ret, "create_mesh_pipeline", false);
 	VK_NAME_PIPELINE(vk, rgrp->mesh.pipeline, "render_gfx_render_pass mesh pipeline");
@@ -749,16 +749,16 @@ render_gfx_render_pass_init(struct render_gfx_render_pass *rgrp,
 	};
 
 	ret = create_mesh_pipeline(         //
-	    vk,                             // vk_bundle
-	    rgrp->render_pass,              // render_pass
-	    r->mesh.pipeline_layout,        // pipeline_layout
-	    r->pipeline_cache,              // pipeline_cache
-	    r->mesh.src_binding,            // src_binding
-	    r->mesh.index_count_total,      // mesh_index_count_total
-	    r->mesh.stride,                 // mesh_stride
-	    &timewarp_params,               // params
-	    r->shaders->mesh_vert,          // mesh_vert
-	    r->shaders->mesh_frag,          // mesh_frag
+	    vk,                             //
+	    rgrp->render_pass,              //
+	    r->mesh.pipeline_layout,        //
+	    r->pipeline_cache,              //
+	    r->mesh.src_binding,            //
+	    r->mesh.index_count_total,      //
+	    r->mesh.stride,                 //
+	    &timewarp_params,               //
+	    r->shaders->mesh_vert,          //
+	    r->shaders->mesh_frag,          //
 	    &rgrp->mesh.pipeline_timewarp); // out_mesh_pipeline
 	VK_CHK_WITH_RET(ret, "create_mesh_pipeline", false);
 	VK_NAME_PIPELINE(vk, rgrp->mesh.pipeline_timewarp, "render_gfx_render_pass mesh pipeline timewarp");
@@ -768,23 +768,23 @@ render_gfx_render_pass_init(struct render_gfx_render_pass *rgrp,
 
 	// Cylinder
 	ret = create_layer_pipeline(                    //
-	    vk,                                         // vk
-	    rgrp->render_pass,                          // render_pass
-	    r->gfx.layer.shared.pipeline_layout,        // pipeline_layout
-	    r->pipeline_cache,                          // pipeline_cache
+	    vk,                                         //
+	    rgrp->render_pass,                          //
+	    r->gfx.layer.shared.pipeline_layout,        //
+	    r->pipeline_cache,                          //
 	    blend_factor_premultiplied_alpha,           // src_blend_factor
-	    r->shaders->layer_cylinder_vert,            // module_vert
-	    r->shaders->layer_cylinder_frag,            // module_frag
+	    r->shaders->layer_cylinder_vert,            //
+	    r->shaders->layer_cylinder_frag,            //
 	    &rgrp->layer.cylinder_premultiplied_alpha); // out_pipeline
 	VK_CHK_WITH_RET(ret, "create_layer_pipeline", false);
 	VK_NAME_PIPELINE(vk, rgrp->layer.cylinder_premultiplied_alpha,
 	                 "render_gfx_render_pass cylinder premultiplied alpha");
 
 	ret = create_layer_pipeline(                      //
-	    vk,                                           // vk
-	    rgrp->render_pass,                            // render_pass
-	    r->gfx.layer.shared.pipeline_layout,          // pipeline_layout
-	    r->pipeline_cache,                            // pipeline_cache
+	    vk,                                           //
+	    rgrp->render_pass,                            //
+	    r->gfx.layer.shared.pipeline_layout,          //
+	    r->pipeline_cache,                            //
 	    blend_factor_unpremultiplied_alpha,           // src_blend_factor
 	    r->shaders->layer_cylinder_vert,              // module_vert
 	    r->shaders->layer_cylinder_frag,              // module_frag
@@ -795,10 +795,10 @@ render_gfx_render_pass_init(struct render_gfx_render_pass *rgrp,
 
 	// Equirect2
 	ret = create_layer_pipeline(                     //
-	    vk,                                          // vk
-	    rgrp->render_pass,                           // render_pass
-	    r->gfx.layer.shared.pipeline_layout,         // pipeline_layout
-	    r->pipeline_cache,                           // pipeline_cache
+	    vk,                                          //
+	    rgrp->render_pass,                           //
+	    r->gfx.layer.shared.pipeline_layout,         //
+	    r->pipeline_cache,                           //
 	    blend_factor_premultiplied_alpha,            // src_blend_factor
 	    r->shaders->layer_equirect2_vert,            // module_vert
 	    r->shaders->layer_equirect2_frag,            // module_frag
@@ -808,10 +808,10 @@ render_gfx_render_pass_init(struct render_gfx_render_pass *rgrp,
 	                 "render_gfx_render_pass equirect2 premultiplied alpha");
 
 	ret = create_layer_pipeline(                       //
-	    vk,                                            // vk
-	    rgrp->render_pass,                             // render_pass
-	    r->gfx.layer.shared.pipeline_layout,           // pipeline_layout
-	    r->pipeline_cache,                             // pipeline_cache
+	    vk,                                            //
+	    rgrp->render_pass,                             //
+	    r->gfx.layer.shared.pipeline_layout,           //
+	    r->pipeline_cache,                             //
 	    blend_factor_unpremultiplied_alpha,            // src_blend_factor
 	    r->shaders->layer_equirect2_vert,              // module_vert
 	    r->shaders->layer_equirect2_frag,              // module_frag
@@ -822,10 +822,10 @@ render_gfx_render_pass_init(struct render_gfx_render_pass *rgrp,
 
 	// Projection.
 	ret = create_layer_pipeline(                //
-	    vk,                                     // vk
-	    rgrp->render_pass,                      // render_pass
-	    r->gfx.layer.shared.pipeline_layout,    // pipeline_layout
-	    r->pipeline_cache,                      // pipeline_cache
+	    vk,                                     //
+	    rgrp->render_pass,                      //
+	    r->gfx.layer.shared.pipeline_layout,    //
+	    r->pipeline_cache,                      //
 	    blend_factor_premultiplied_alpha,       // src_blend_factor
 	    r->shaders->layer_projection_vert,      // module_vert
 	    r->shaders->layer_shared_frag,          // module_frag
@@ -835,10 +835,10 @@ render_gfx_render_pass_init(struct render_gfx_render_pass *rgrp,
 	                 "render_gfx_render_pass projection premultiplied alpha");
 
 	ret = create_layer_pipeline(                  //
-	    vk,                                       // vk
-	    rgrp->render_pass,                        // render_pass
-	    r->gfx.layer.shared.pipeline_layout,      // pipeline_layout
-	    r->pipeline_cache,                        // pipeline_cache
+	    vk,                                       //
+	    rgrp->render_pass,                        //
+	    r->gfx.layer.shared.pipeline_layout,      //
+	    r->pipeline_cache,                        //
 	    blend_factor_unpremultiplied_alpha,       // src_blend_factor
 	    r->shaders->layer_projection_vert,        // module_vert
 	    r->shaders->layer_shared_frag,            // module_frag
@@ -849,10 +849,10 @@ render_gfx_render_pass_init(struct render_gfx_render_pass *rgrp,
 
 	// Quad
 	ret = create_layer_pipeline(                //
-	    vk,                                     // vk
-	    rgrp->render_pass,                      // render_pass
-	    r->gfx.layer.shared.pipeline_layout,    // pipeline_layout
-	    r->pipeline_cache,                      // pipeline_cache
+	    vk,                                     //
+	    rgrp->render_pass,                      //
+	    r->gfx.layer.shared.pipeline_layout,    //
+	    r->pipeline_cache,                      //
 	    blend_factor_premultiplied_alpha,       // src_blend_factor
 	    r->shaders->layer_quad_vert,            // module_vert
 	    r->shaders->layer_shared_frag,          // module_frag
@@ -861,10 +861,10 @@ render_gfx_render_pass_init(struct render_gfx_render_pass *rgrp,
 	VK_NAME_PIPELINE(vk, rgrp->layer.quad_premultiplied_alpha, "render_gfx_render_pass quad premultiplied alpha");
 
 	ret = create_layer_pipeline(                  //
-	    vk,                                       // vk
-	    rgrp->render_pass,                        // render_pass
-	    r->gfx.layer.shared.pipeline_layout,      // pipeline_layout
-	    r->pipeline_cache,                        // pipeline_cache
+	    vk,                                       //
+	    rgrp->render_pass,                        //
+	    r->gfx.layer.shared.pipeline_layout,      //
+	    r->pipeline_cache,                        //
 	    blend_factor_unpremultiplied_alpha,       // src_blend_factor
 	    r->shaders->layer_quad_vert,              // module_vert
 	    r->shaders->layer_shared_frag,            // module_frag
@@ -923,11 +923,11 @@ render_gfx_target_resources_init(struct render_gfx_target_resources *rtr,
 	rtr->r = r;
 
 	ret = create_framebuffer( //
-	    vk,                   // vk_bundle,
-	    target,               // image_view,
-	    rgrp->render_pass,    // render_pass,
-	    extent.width,         // width,
-	    extent.height,        // height,
+	    vk,                   //
+	    target,               // image_view
+	    rgrp->render_pass,    //
+	    extent.width,         //
+	    extent.height,        //
 	    &rtr->framebuffer);   // out_external_framebuffer
 	VK_CHK_WITH_RET(ret, "create_framebuffer", false);
 	VK_NAME_FRAMEBUFFER(vk, rtr->framebuffer, "render_gfx_target_resources framebuffer");
@@ -984,20 +984,20 @@ render_gfx_begin(struct render_gfx *render)
 	};
 
 	ret = vk->vkBeginCommandBuffer( //
-	    render->r->cmd,             // commandBuffer
-	    &begin_info);               // pBeginInfo
+	    render->r->cmd,             //
+	    &begin_info);               //
 	VK_CHK_WITH_RET(ret, "vkResetCommandPool", false);
 
 	vk->vkCmdResetQueryPool(   //
-	    render->r->cmd,        // commandBuffer
-	    render->r->query_pool, // queryPool
+	    render->r->cmd,        //
+	    render->r->query_pool, //
 	    0,                     // firstQuery
 	    2);                    // queryCount
 
 	vk->vkCmdWriteTimestamp(               //
-	    render->r->cmd,                    // commandBuffer
+	    render->r->cmd,                    //
 	    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, // pipelineStage
-	    render->r->query_pool,             // queryPool
+	    render->r->query_pool,             //
 	    0);                                // query
 
 	return true;
@@ -1010,9 +1010,9 @@ render_gfx_end(struct render_gfx *render)
 	VkResult ret;
 
 	vk->vkCmdWriteTimestamp(                  //
-	    render->r->cmd,                       // commandBuffer
+	    render->r->cmd,                       //
 	    VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, // pipelineStage
-	    render->r->query_pool,                // queryPool
+	    render->r->query_pool,                //
 	    1);                                   // query
 
 	ret = vk->vkEndCommandBuffer(render->r->cmd);
@@ -1105,10 +1105,10 @@ render_gfx_begin_view(struct render_gfx *render, uint32_t view, const struct ren
 	    .maxDepth = 1.0f,
 	};
 
-	vk->vkCmdSetViewport(render->r->cmd, // commandBuffer
+	vk->vkCmdSetViewport(render->r->cmd, //
 	                     0,              // firstViewport
 	                     1,              // viewportCount
-	                     &viewport);     // pViewports
+	                     &viewport);     //
 
 	/*
 	 * Scissor
@@ -1127,10 +1127,10 @@ render_gfx_begin_view(struct render_gfx *render, uint32_t view, const struct ren
 	        },
 	};
 
-	vk->vkCmdSetScissor(render->r->cmd, // commandBuffer
+	vk->vkCmdSetScissor(render->r->cmd, //
 	                    0,              // firstScissor
 	                    1,              // scissorCount
-	                    &scissor);      // pScissors
+	                    &scissor);      //
 }
 
 void
@@ -1151,15 +1151,15 @@ render_gfx_mesh_alloc_and_write(struct render_gfx *render,
 
 	return do_ubo_and_src_alloc_and_write(  //
 	    render,                             //
-	    r->mesh.ubo_binding,                // ubo_binding
+	    r->mesh.ubo_binding,                //
 	    data,                               // ubo_ptr
 	    sizeof(*data),                      // ubo_size
-	    r->mesh.src_binding,                // src_binding
-	    src_sampler,                        // src_sampler
-	    src_image_view,                     // src_image_view
-	    r->gfx.ubo_and_src_descriptor_pool, // descriptor_pool
-	    r->mesh.descriptor_set_layout,      // descriptor_set_layout
-	    out_descriptor_set);                // out_descriptor_set
+	    r->mesh.src_binding,                //
+	    src_sampler,                        //
+	    src_image_view,                     //
+	    r->gfx.ubo_and_src_descriptor_pool, //
+	    r->mesh.descriptor_set_layout,      //
+	    out_descriptor_set);                //
 }
 
 void
@@ -1175,7 +1175,7 @@ render_gfx_mesh_draw(struct render_gfx *render, uint32_t mesh_index, VkDescripto
 
 	VkDescriptorSet descriptor_sets[1] = {descriptor_set};
 	vk->vkCmdBindDescriptorSets(         //
-	    r->cmd,                          // commandBuffer
+	    r->cmd,                          //
 	    VK_PIPELINE_BIND_POINT_GRAPHICS, // pipelineBindPoint
 	    r->mesh.pipeline_layout,         // layout
 	    0,                               // firstSet
@@ -1189,7 +1189,7 @@ render_gfx_mesh_draw(struct render_gfx *render, uint32_t mesh_index, VkDescripto
 	    do_timewarp ? render->rtr->rgrp->mesh.pipeline_timewarp : render->rtr->rgrp->mesh.pipeline;
 
 	vk->vkCmdBindPipeline(               //
-	    r->cmd,                          // commandBuffer
+	    r->cmd,                          //
 	    VK_PIPELINE_BIND_POINT_GRAPHICS, // pipelineBindPoint
 	    pipeline);                       // pipeline
 
@@ -1203,7 +1203,7 @@ render_gfx_mesh_draw(struct render_gfx *render, uint32_t mesh_index, VkDescripto
 	assert(ARRAY_SIZE(buffers) == ARRAY_SIZE(offsets));
 
 	vk->vkCmdBindVertexBuffers( //
-	    r->cmd,                 // commandBuffer
+	    r->cmd,                 //
 	    0,                      // firstBinding
 	    ARRAY_SIZE(buffers),    // bindingCount
 	    buffers,                // pBuffers
@@ -1216,13 +1216,13 @@ render_gfx_mesh_draw(struct render_gfx *render, uint32_t mesh_index, VkDescripto
 
 	if (r->mesh.index_count_total > 0) {
 		vk->vkCmdBindIndexBuffer(  //
-		    r->cmd,                // commandBuffer
+		    r->cmd,                //
 		    r->mesh.ibo.buffer,    // buffer
 		    0,                     // offset
 		    VK_INDEX_TYPE_UINT32); // indexType
 
 		vk->vkCmdDrawIndexed(                  //
-		    r->cmd,                            // commandBuffer
+		    r->cmd,                            //
 		    r->mesh.index_counts[mesh_index],  // indexCount
 		    1,                                 // instanceCount
 		    r->mesh.index_offsets[mesh_index], // firstIndex
@@ -1230,7 +1230,7 @@ render_gfx_mesh_draw(struct render_gfx *render, uint32_t mesh_index, VkDescripto
 		    0);                                // firstInstance
 	} else {
 		vk->vkCmdDraw(            //
-		    r->cmd,               // commandBuffer
+		    r->cmd,               //
 		    r->mesh.vertex_count, // vertexCount
 		    1,                    // instanceCount
 		    0,                    // firstVertex
@@ -1257,14 +1257,14 @@ render_gfx_layer_cylinder_alloc_and_write(struct render_gfx *render,
 	return do_ubo_and_src_alloc_and_write(         //
 	    render,                                    //
 	    RENDER_BINDING_LAYER_SHARED_UBO,           // ubo_binding
-	    data,                                      //
-	    sizeof(*data),                             //
+	    data,                                      // ubo_ptr
+	    sizeof(*data),                             // ubo_size
 	    RENDER_BINDING_LAYER_SHARED_SRC,           // src_binding
 	    src_sampler,                               //
 	    src_image_view,                            //
-	    r->gfx.ubo_and_src_descriptor_pool,        // descriptor_pool
-	    r->gfx.layer.shared.descriptor_set_layout, // descriptor_set_layout
-	    out_descriptor_set);                       // out_descriptor_set
+	    r->gfx.ubo_and_src_descriptor_pool,        //
+	    r->gfx.layer.shared.descriptor_set_layout, //
+	    out_descriptor_set);                       //
 }
 
 XRT_CHECK_RESULT VkResult
@@ -1279,14 +1279,14 @@ render_gfx_layer_equirect2_alloc_and_write(struct render_gfx *render,
 	return do_ubo_and_src_alloc_and_write(         //
 	    render,                                    //
 	    RENDER_BINDING_LAYER_SHARED_UBO,           // ubo_binding
-	    data,                                      //
-	    sizeof(*data),                             //
+	    data,                                      // ubo_ptr
+	    sizeof(*data),                             // ubo_size
 	    RENDER_BINDING_LAYER_SHARED_SRC,           // src_binding
 	    src_sampler,                               //
 	    src_image_view,                            //
-	    r->gfx.ubo_and_src_descriptor_pool,        // descriptor_pool
-	    r->gfx.layer.shared.descriptor_set_layout, // descriptor_set_layout
-	    out_descriptor_set);                       // out_descriptor_set
+	    r->gfx.ubo_and_src_descriptor_pool,        //
+	    r->gfx.layer.shared.descriptor_set_layout, //
+	    out_descriptor_set);                       //
 }
 
 XRT_CHECK_RESULT VkResult
@@ -1301,14 +1301,14 @@ render_gfx_layer_projection_alloc_and_write(struct render_gfx *render,
 	return do_ubo_and_src_alloc_and_write(         //
 	    render,                                    //
 	    RENDER_BINDING_LAYER_SHARED_UBO,           // ubo_binding
-	    data,                                      //
-	    sizeof(*data),                             //
+	    data,                                      // ubo_ptr
+	    sizeof(*data),                             // ubo_size
 	    RENDER_BINDING_LAYER_SHARED_SRC,           // src_binding
 	    src_sampler,                               //
 	    src_image_view,                            //
-	    r->gfx.ubo_and_src_descriptor_pool,        // descriptor_pool
-	    r->gfx.layer.shared.descriptor_set_layout, // descriptor_set_layout
-	    out_descriptor_set);                       // out_descriptor_set
+	    r->gfx.ubo_and_src_descriptor_pool,        //
+	    r->gfx.layer.shared.descriptor_set_layout, //
+	    out_descriptor_set);                       //
 }
 
 XRT_CHECK_RESULT VkResult
@@ -1323,14 +1323,14 @@ render_gfx_layer_quad_alloc_and_write(struct render_gfx *render,
 	return do_ubo_and_src_alloc_and_write(         //
 	    render,                                    //
 	    RENDER_BINDING_LAYER_SHARED_UBO,           // ubo_binding
-	    data,                                      //
-	    sizeof(*data),                             //
+	    data,                                      // ubo_ptr
+	    sizeof(*data),                             // ubo_size
 	    RENDER_BINDING_LAYER_SHARED_SRC,           // src_binding
 	    src_sampler,                               //
 	    src_image_view,                            //
-	    r->gfx.ubo_and_src_descriptor_pool,        // descriptor_pool
-	    r->gfx.layer.shared.descriptor_set_layout, // descriptor_set_layout
-	    out_descriptor_set);                       // out_descriptor_set
+	    r->gfx.ubo_and_src_descriptor_pool,        //
+	    r->gfx.layer.shared.descriptor_set_layout, //
+	    out_descriptor_set);                       //
 }
 
 void
@@ -1353,8 +1353,8 @@ render_gfx_layer_cylinder(struct render_gfx *render, bool premultiplied_alpha, V
 	dispatch_no_vbo(     //
 	    render,          //
 	    vertex_count,    // vertex_count
-	    pipeline,        // pipeline
-	    descriptor_set); // descriptor_set
+	    pipeline,        //
+	    descriptor_set); //
 }
 
 void
@@ -1369,8 +1369,8 @@ render_gfx_layer_equirect2(struct render_gfx *render, bool premultiplied_alpha, 
 	dispatch_no_vbo(     //
 	    render,          //
 	    4,               // vertex_count
-	    pipeline,        // pipeline
-	    descriptor_set); // descriptor_set
+	    pipeline,        //
+	    descriptor_set); //
 }
 
 void
@@ -1385,8 +1385,8 @@ render_gfx_layer_projection(struct render_gfx *render, bool premultiplied_alpha,
 	dispatch_no_vbo(     //
 	    render,          //
 	    4,               // vertex_count
-	    pipeline,        // pipeline
-	    descriptor_set); // descriptor_set
+	    pipeline,        //
+	    descriptor_set); //
 }
 
 void
@@ -1401,6 +1401,6 @@ render_gfx_layer_quad(struct render_gfx *render, bool premultiplied_alpha, VkDes
 	dispatch_no_vbo(     //
 	    render,          //
 	    4,               // vertex_count
-	    pipeline,        // pipeline
-	    descriptor_set); // descriptor_set
+	    pipeline,        //
+	    descriptor_set); //
 }
