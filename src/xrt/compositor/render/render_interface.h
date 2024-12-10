@@ -697,7 +697,7 @@ struct render_viewport_data
  */
 
 /*!
- * A render pass while not depending on a @p VkFramebuffer does depend on the
+ * A render pass, while not depending on a @p VkFramebuffer, does depend on the
  * format of the target image(s), and other options for the render pass. These
  * are used to create a @p VkRenderPass, all @p VkFramebuffer(s) and
  * @p VkPipeline depends on the @p VkRenderPass so hang off this struct.
@@ -824,8 +824,23 @@ render_gfx_target_resources_fini(struct render_gfx_target_resources *rtr);
  */
 
 /*!
- * A rendering is used to create command buffers needed to do one frame of
- * compositor rendering, it holds onto resources used by the command buffer.
+ * The low-level resources and operations to perform layer squashing and/or
+ * mesh distortion for a single frame using graphics shaders.
+ *
+ * It uses a two-stage process to render a frame. This means
+ * consumers iterate layers (or other operations) **twice**, within each target and view.
+ * There is a preparation stage, where the uniform buffer is sub-allocated and written.
+ * This must be completed for all layers before the actual draw stage begins.
+ * The second stage is recording the draw commands into a command buffer.
+ *
+ * You must make equivalent calls in the same order between the two stages. The second stage
+ * additionally has @ref render_gfx_begin_target, @ref render_gfx_end_target,
+ * @ref render_gfx_begin_view, and @ref render_gfx_end_view lacked by the first stage,
+ * but if you exclude those functions, the others must line up.
+ *
+ * Furthermore, the struct needs to be kept alive until the work has been waited on,
+ * or you get validation warnings. Either wait on the `VkFence` for the submit, or call
+ * `vkDeviceWaitIdle`/`vkQueueWaitIdle` on the device/queue.
  *
  * @see comp_render_gfx
  */
@@ -837,7 +852,7 @@ struct render_gfx
 	//! Shared buffer that we sub-allocate UBOs from.
 	struct render_sub_alloc_tracker ubo_tracker;
 
-	//! The current target we are rendering too, can change during command building.
+	//! The current target we are rendering to, can change during command building.
 	struct render_gfx_target_resources *rtr;
 };
 
@@ -883,6 +898,8 @@ render_gfx_fini(struct render_gfx *render);
 
 /*!
  * UBO data that is sent to the mesh shaders.
+ *
+ * @relates render_gfx
  */
 struct render_gfx_mesh_ubo_data
 {
@@ -896,6 +913,8 @@ struct render_gfx_mesh_ubo_data
 
 /*!
  * UBO data that is sent to the layer cylinder shader.
+ *
+ * @relates render_gfx
  */
 struct render_gfx_layer_cylinder_data
 {
@@ -909,6 +928,8 @@ struct render_gfx_layer_cylinder_data
 
 /*!
  * UBO data that is sent to the layer equirect2 shader.
+ *
+ * @relates render_gfx
  */
 struct render_gfx_layer_equirect2_data
 {
@@ -926,6 +947,8 @@ struct render_gfx_layer_equirect2_data
 
 /*!
  * UBO data that is sent to the layer projection shader.
+ *
+ * @relates render_gfx
  */
 struct render_gfx_layer_projection_data
 {
@@ -936,6 +959,8 @@ struct render_gfx_layer_projection_data
 
 /*!
  * UBO data that is sent to the layer quad shader.
+ *
+ * @relates render_gfx
  */
 struct render_gfx_layer_quad_data
 {
@@ -943,41 +968,10 @@ struct render_gfx_layer_quad_data
 	struct xrt_matrix_4x4 mvp;
 };
 
-
 /*!
- * @name Drawing functions
+ * @name Preparation functions - first stage
  * @{
  */
-
-/*!
- * This function allocates everything to start a single rendering. This is the
- * first function you call when you start rendering, you follow up with a call
- * to render_gfx_begin_view.
- *
- * @public @memberof render_gfx
- */
-bool
-render_gfx_begin_target(struct render_gfx *render,
-                        struct render_gfx_target_resources *rtr,
-                        const VkClearColorValue *color);
-
-/*!
- * @public @memberof render_gfx
- */
-void
-render_gfx_end_target(struct render_gfx *render);
-
-/*!
- * @public @memberof render_gfx
- */
-void
-render_gfx_begin_view(struct render_gfx *render, uint32_t view, const struct render_viewport_data *viewport_data);
-
-/*!
- * @public @memberof render_gfx
- */
-void
-render_gfx_end_view(struct render_gfx *render);
 
 /*!
  * Allocate needed resources for one mesh shader dispatch, will also update the
@@ -995,15 +989,6 @@ render_gfx_mesh_alloc_and_write(struct render_gfx *render,
                                 VkSampler src_sampler,
                                 VkImageView src_image_view,
                                 VkDescriptorSet *out_descriptor_set);
-
-/*!
- * Dispatch one mesh shader instance, using the give @p mesh_index as source for
- * mesh geometry, timewarp selectable via @p do_timewarp.
- *
- * @public @memberof render_gfx
- */
-void
-render_gfx_mesh_draw(struct render_gfx *render, uint32_t mesh_index, VkDescriptorSet descriptor_set, bool do_timewarp);
 
 /*!
  * Allocate and write a UBO and descriptor_set to be used for cylinder layer
@@ -1057,10 +1042,68 @@ render_gfx_layer_quad_alloc_and_write(struct render_gfx *render,
                                       VkImageView src_image_view,
                                       VkDescriptorSet *out_descriptor_set);
 
+
 /*!
- * Dispatch a cylinder layer shader into the current target and view,
- * allocate @p descriptor_set and ubo with
- * @ref render_gfx_layer_cylinder_alloc_and_write.
+ * @}
+ */
+
+/*!
+ * @name Drawing functions - second stage
+ * @{
+ */
+
+/*!
+ * This function allocates everything to start a single rendering. This is the
+ * first function you call when you start the drawiing stage, you follow up with a call
+ * to @ref render_gfx_begin_view.
+ *
+ * @public @memberof render_gfx
+ */
+bool
+render_gfx_begin_target(struct render_gfx *render,
+                        struct render_gfx_target_resources *rtr,
+                        const VkClearColorValue *color);
+
+/*!
+ * @pre successful @ref render_gfx_begin_target call,
+ *   no @ref render_gfx_begin_view without matching @ref render_gfx_end_view
+ * @public @memberof render_gfx
+ */
+void
+render_gfx_end_target(struct render_gfx *render);
+
+/*!
+ * @pre successful @ref render_gfx_begin_target call
+ * @public @memberof render_gfx
+ */
+void
+render_gfx_begin_view(struct render_gfx *render, uint32_t view, const struct render_viewport_data *viewport_data);
+
+/*!
+ * @pre successful @ref render_gfx_begin_view call without a matching call to this function
+ * @public @memberof render_gfx
+ */
+void
+render_gfx_end_view(struct render_gfx *render);
+
+/*!
+ * Dispatch one mesh shader instance, using the give @p mesh_index as source for
+ * mesh geometry, timewarp selectable via @p do_timewarp.
+ *
+ * Must have successfully called @ref render_gfx_mesh_alloc_and_write
+ * before @ref render_gfx_begin_target to allocate @p descriptor_set and UBO.
+ *
+ * @pre successful @ref render_gfx_mesh_alloc_and_write call, successful @ref render_gfx_begin_view call
+ * @public @memberof render_gfx
+ */
+void
+render_gfx_mesh_draw(struct render_gfx *render, uint32_t mesh_index, VkDescriptorSet descriptor_set, bool do_timewarp);
+
+/*!
+ * Dispatch a cylinder layer shader into the current target and view.
+ *
+ * Must have successfully called @ref render_gfx_layer_cylinder_alloc_and_write
+ * before @ref render_gfx_begin_target to allocate @p descriptor_set and UBO.
  *
  * @public @memberof render_gfx
  */
@@ -1068,9 +1111,10 @@ void
 render_gfx_layer_cylinder(struct render_gfx *render, bool premultiplied_alpha, VkDescriptorSet descriptor_set);
 
 /*!
- * Dispatch a equirect2 layer shader into the current target and view,
- * allocate @p descriptor_set and ubo with
- * @ref render_gfx_layer_equirect2_alloc_and_write.
+ * Dispatch a equirect2 layer shader into the current target and view.
+ *
+ * Must have successfully called @ref render_gfx_layer_equirect2_alloc_and_write
+ * before @ref render_gfx_begin_target to allocate @p descriptor_set and UBO.
  *
  * @public @memberof render_gfx
  */
@@ -1078,9 +1122,10 @@ void
 render_gfx_layer_equirect2(struct render_gfx *render, bool premultiplied_alpha, VkDescriptorSet descriptor_set);
 
 /*!
- * Dispatch a projection layer shader into the current target and view,
- * allocate @p descriptor_set and ubo with
- * @ref render_gfx_layer_projection_alloc_and_write.
+ * Dispatch a projection layer shader into the current target and view.
+ *
+ * Must have successfully called @ref render_gfx_layer_projection_alloc_and_write
+ * before @ref render_gfx_begin_target to allocate @p descriptor_set and UBO.
  *
  * @public @memberof render_gfx
  */
@@ -1088,8 +1133,10 @@ void
 render_gfx_layer_projection(struct render_gfx *render, bool premultiplied_alpha, VkDescriptorSet descriptor_set);
 
 /*!
- * Dispatch a quad layer shader into the current target and view, allocate
- * @p descriptor_set and ubo with @ref render_gfx_layer_quad_alloc_and_write.
+ * Dispatch a quad layer shader into the current target and view.
+ *
+ * Must have successfully called @ref render_gfx_layer_quad_alloc_and_write
+ * before @ref render_gfx_begin_target to allocate @p descriptor_set and UBO.
  *
  * @public @memberof render_gfx
  */
@@ -1108,9 +1155,10 @@ render_gfx_layer_quad(struct render_gfx *render, bool premultiplied_alpha, VkDes
  */
 
 /*!
- * A compute rendering is used to create command buffers needed to do one frame
- * of compositor rendering using compute shaders, it holds onto resources used
- * by the command buffer.
+ * The semi-low level resources and operations required to squash layers and/or
+ * apply distortion for a single frame using compute shaders.
+ *
+ * Unlike @ref render_gfx, this is a single stage process, and you pass all layers at a single time.
  *
  * @see comp_render_cs
  */
@@ -1132,6 +1180,8 @@ struct render_compute
 
 /*!
  * Push data that is sent to the blit shader.
+ *
+ * @relates render_compute
  */
 struct render_compute_blit_push_data
 {
@@ -1142,7 +1192,7 @@ struct render_compute_blit_push_data
 /*!
  * UBO data that is sent to the compute layer shaders.
  *
- * Used in @ref render_compute
+ * @relates render_compute
  */
 struct render_compute_layer_ubo_data
 {
@@ -1237,7 +1287,7 @@ struct render_compute_layer_ubo_data
 /*!
  * UBO data that is sent to the compute distortion shaders.
  *
- * Used in @ref render_compute
+ * @relates render_compute
  */
 struct render_compute_distortion_ubo_data
 {
