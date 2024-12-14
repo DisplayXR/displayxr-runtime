@@ -191,9 +191,6 @@ compositor_predict_frame(struct xrt_compositor *xc,
 
 	COMP_SPEW(c, "PREDICT_FRAME");
 
-	// A little bit easier to read.
-	int64_t interval_ns = (int64_t)c->settings.nominal_frame_interval_ns;
-
 	comp_target_update_timings(c->target);
 
 	assert(comp_frame_is_invalid_locked(&c->frame.waited));
@@ -220,7 +217,7 @@ compositor_predict_frame(struct xrt_compositor *xc,
 	*out_wake_time_ns = wake_up_time_ns;
 	*out_predicted_gpu_time_ns = desired_present_time_ns; // Not quite right but close enough.
 	*out_predicted_display_time_ns = predicted_display_time_ns;
-	*out_predicted_display_period_ns = interval_ns;
+	*out_predicted_display_period_ns = c->frame_interval_ns;
 
 	return XRT_SUCCESS;
 }
@@ -335,8 +332,11 @@ compositor_get_display_refresh_rate(struct xrt_compositor *xc, float *out_displa
 #else
 	struct comp_compositor *c = comp_compositor(xc);
 
-	//! @todo: Implement the method to change display refresh rate.
-	*out_display_refresh_rate_hz = (float)(1. / time_ns_to_s(c->settings.nominal_frame_interval_ns));
+	if (c->target->get_current_refresh_rate) {
+		return comp_target_get_current_refresh_rate(c->target, out_display_refresh_rate_hz);
+	} else {
+		*out_display_refresh_rate_hz = (float)(1. / time_ns_to_s(c->frame_interval_ns));
+	}
 #endif
 
 	return XRT_SUCCESS;
@@ -363,7 +363,14 @@ compositor_request_display_refresh_rate(struct xrt_compositor *xc, float display
 	}
 	dlclose(android_handle);
 #else
-	// Currently not implemented on other platforms.
+	struct comp_compositor *c = comp_compositor(xc);
+	if (c->target->request_refresh_rate) {
+		xrt_result_t result = comp_target_request_refresh_rate(c->target, display_refresh_rate_hz);
+		// Assume refresh rate change is immediate
+		if (result == XRT_SUCCESS)
+			c->frame_interval_ns = U_TIME_1S_IN_NS / display_refresh_rate_hz;
+		return result;
+	}
 #endif
 	return XRT_SUCCESS;
 }
@@ -1018,6 +1025,8 @@ comp_main_create_system_compositor(struct xrt_device *xdev,
 		comp_scratch_single_images_init(&c->scratch.views[i]);
 	}
 
+	c->frame_interval_ns = c->settings.nominal_frame_interval_ns;
+
 	c->last_frame_time_ns = os_monotonic_get_ns();
 
 	double scale = c->settings.viewport_scale;
@@ -1126,7 +1135,7 @@ comp_main_create_system_compositor(struct xrt_device *xdev,
 
 	u_var_add_root(c, "Compositor", true);
 
-	float target_frame_time_ms = (float)ns_to_ms(c->settings.nominal_frame_interval_ns);
+	float target_frame_time_ms = (float)ns_to_ms(c->frame_interval_ns);
 	u_frame_times_widget_init(&c->compositor_frame_times, target_frame_time_ms, 10.f);
 
 	u_var_add_ro_f32(c, &c->compositor_frame_times.fps, "FPS (Compositor)");
@@ -1159,9 +1168,13 @@ comp_main_create_system_compositor(struct xrt_device *xdev,
 		sys_info->refresh_rates_hz[i] = metrics.refresh_rates[i];
 	}
 #else
-	//! @todo: Query all supported refresh rates of the current mode
-	sys_info->refresh_rate_count = 1;
-	sys_info->refresh_rates_hz[0] = (float)(1. / time_ns_to_s(c->settings.nominal_frame_interval_ns));
+	if (c->target->get_refresh_rates) {
+		comp_target_get_refresh_rates(c->target, &sys_info->refresh_rate_count, sys_info->refresh_rates_hz);
+	} else {
+		//! @todo: Query all supported refresh rates of the current mode
+		sys_info->refresh_rate_count = 1;
+		sys_info->refresh_rates_hz[0] = (float)(1. / time_ns_to_s(c->frame_interval_ns));
+	}
 #endif // XRT_OS_ANDROID
 
 	// Needs to be delayed until after compositor's u_var has been setup.

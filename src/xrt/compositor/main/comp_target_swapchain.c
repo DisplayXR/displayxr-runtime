@@ -623,10 +623,9 @@ comp_target_swapchain_create_images(struct comp_target *ct, const struct comp_ta
 	// Some platforms really don't like the pacing_compositor code.
 	bool use_display_timing_if_available = cts->timing_usage == COMP_TARGET_USE_DISPLAY_IF_AVAILABLE;
 	if (cts->upc == NULL && use_display_timing_if_available && vk->has_GOOGLE_display_timing) {
-		u_pc_display_timing_create(ct->c->settings.nominal_frame_interval_ns,
-		                           &U_PC_DISPLAY_TIMING_CONFIG_DEFAULT, &cts->upc);
+		u_pc_display_timing_create(ct->c->frame_interval_ns, &U_PC_DISPLAY_TIMING_CONFIG_DEFAULT, &cts->upc);
 	} else if (cts->upc == NULL) {
-		u_pc_fake_create(ct->c->settings.nominal_frame_interval_ns, now_ns, &cts->upc);
+		u_pc_fake_create(ct->c->frame_interval_ns, now_ns, &cts->upc);
 	}
 
 	// Free old image views.

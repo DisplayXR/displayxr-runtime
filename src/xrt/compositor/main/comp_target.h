@@ -293,6 +293,35 @@ struct comp_target
 	void (*set_title)(struct comp_target *ct, const char *title);
 
 	/*!
+	 * Get the available refresh rates for the compositor target
+	 *
+	 * @param ct               The compositor target.
+	 * @param count            The number or refresh rates.
+	 * @param refresh_rates_hz The refresh rates, in Hz. Must be allocated by caller, and have at least
+	 * XRT_MAX_SUPPORTED_REFRESH_RATES elements
+	 */
+	xrt_result_t (*get_refresh_rates)(struct comp_target *ct,
+	                                  uint32_t *out_count,
+	                                  float *out_display_refresh_rates_hz);
+
+	/*!
+	 * Get the current refresh rate for the compositor target
+	 *
+	 * @param ct                           The compositor target.
+	 * @param out_display_refresh_rate_hz  The current refresh rate, in Hz
+	 */
+	xrt_result_t (*get_current_refresh_rate)(struct comp_target *ct, float *out_display_refresh_rate_hz);
+
+	/*!
+	 * Get the current refresh rate for the compositor target
+	 *
+	 * @param ct                      The compositor target.
+	 * @param display_refresh_rate_hz The requested refresh rate, in Hz.
+	 */
+	xrt_result_t (*request_refresh_rate)(struct comp_target *ct, float display_refresh_rate_hz);
+
+
+	/*!
 	 * Destroys this target.
 	 */
 	void (*destroy)(struct comp_target *ct);
@@ -548,6 +577,48 @@ comp_target_set_title(struct comp_target *ct, const char *title)
 	COMP_TRACE_MARKER();
 
 	ct->set_title(ct, title);
+}
+
+/*!
+ * @copydoc comp_target::get_refresh_rates
+ *
+ * @public @memberof comp_target
+ * @ingroup comp_main
+ */
+static inline xrt_result_t
+comp_target_get_refresh_rates(struct comp_target *ct, uint32_t *count, float *rates)
+{
+	COMP_TRACE_MARKER();
+
+	return ct->get_refresh_rates(ct, count, rates);
+}
+
+/*!
+ * @copydoc comp_target::get_current_refresh_rate
+ *
+ * @public @memberof comp_target
+ * @ingroup comp_main
+ */
+static inline xrt_result_t
+comp_target_get_current_refresh_rate(struct comp_target *ct, float *out_display_refresh_rate_hz)
+{
+	COMP_TRACE_MARKER();
+
+	return ct->get_current_refresh_rate(ct, out_display_refresh_rate_hz);
+}
+
+/*!
+ * @copydoc comp_target::request_refresh_rate
+ *
+ * @public @memberof comp_target
+ * @ingroup comp_main
+ */
+static inline xrt_result_t
+comp_target_request_refresh_rate(struct comp_target *ct, float ratedisplay_refresh_rate_hz)
+{
+	COMP_TRACE_MARKER();
+
+	return ct->request_refresh_rate(ct, ratedisplay_refresh_rate_hz);
 }
 
 /*!

@@ -133,14 +133,11 @@ get_primary_display_mode(struct comp_target_swapchain *cts,
 
 	int64_t new_frame_interval = (int64_t)(1000. * 1000. * 1000. * 1000. / props.parameters.refreshRate);
 
-	COMP_DEBUG(ct->c,
-	           "Updating compositor settings nominal frame interval from %" PRIu64 " (%f Hz) to %" PRIu64
-	           " (%f Hz)",
-	           ct->c->settings.nominal_frame_interval_ns,
-	           1000. * 1000. * 1000. / (float)ct->c->settings.nominal_frame_interval_ns, new_frame_interval,
-	           (float)props.parameters.refreshRate / 1000.);
+	COMP_DEBUG(ct->c, "Updating compositor frame interval from %" PRIu64 " (%f Hz) to %" PRIu64 " (%f Hz)",
+	           ct->c->frame_interval_ns, 1000. * 1000. * 1000. / (float)ct->c->frame_interval_ns,
+	           new_frame_interval, (float)props.parameters.refreshRate / 1000.);
 
-	ct->c->settings.nominal_frame_interval_ns = new_frame_interval;
+	ct->c->frame_interval_ns = new_frame_interval;
 
 	free(mode_properties);
 

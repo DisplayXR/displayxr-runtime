@@ -110,6 +110,9 @@ struct comp_compositor
 	//! Renderer helper.
 	struct comp_renderer *r;
 
+	//! Duration of a frame at current refresh rate.
+	int64_t frame_interval_ns;
+
 	//! Timestamp of last-rendered (immersive) frame.
 	int64_t last_frame_time_ns;
 
