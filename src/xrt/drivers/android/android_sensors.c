@@ -263,11 +263,10 @@ android_device_create()
 
 	const uint32_t w_pixels = metrics.width_pixels;
 	const uint32_t h_pixels = metrics.height_pixels;
-	const uint32_t ppi = metrics.density_dpi;
 
 	const float angle = 45 * M_PI / 180.0; // 0.698132; // 40Deg in rads
-	const float w_meters = ((float)w_pixels / (float)ppi) * 0.0254f;
-	const float h_meters = ((float)h_pixels / (float)ppi) * 0.0254f;
+	const float w_meters = ((float)w_pixels / (float)metrics.xdpi) * 0.0254f;
+	const float h_meters = ((float)h_pixels / (float)metrics.ydpi) * 0.0254f;
 
 	struct u_cardboard_distortion_arguments args = {
 	    .distortion_k = {0.441f, 0.156f, 0.f, 0.f, 0.f},
@@ -279,8 +278,8 @@ android_device_create()
 	            .h_meters = h_meters,
 	        },
 	    .inter_lens_distance_meters = 0.06f,
-	    .lens_y_center_on_screen_meters = h_meters / 2.0f,
 	    .screen_to_lens_distance_meters = 0.042f,
+	    .tray_to_lens_distance_meters = 0.035f,
 	    .fov =
 	        {
 	            .angle_left = -angle,

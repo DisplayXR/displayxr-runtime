@@ -43,14 +43,16 @@ struct u_cardboard_distortion_arguments
 	//! Distances between the lenses in meters.
 	float inter_lens_distance_meters;
 
-	//! Where on the y axis the center of the lens is on the screen.
-	float lens_y_center_on_screen_meters;
-
 	/*!
 	 * The distance to the lens from the screen, used to calculate calculate
 	 * tanangle of various distances on the screen.
 	 */
 	float screen_to_lens_distance_meters;
+
+	/*!
+	 * The distance from the tray (the bottom of the screen) to the lens center on the Y axis.
+	 */
+	float tray_to_lens_distance_meters;
 
 	//! Fov values that the cardboard configuration has given us.
 	struct xrt_fov fov;
