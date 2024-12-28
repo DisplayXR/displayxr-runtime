@@ -30,7 +30,7 @@ class DisplayOverOtherAppsStatusFragment : Fragment() {
     override fun onCreateView(
         inflater: LayoutInflater,
         container: ViewGroup?,
-        savedInstanceState: Bundle?
+        savedInstanceState: Bundle?,
     ): View? {
         val view =
             inflater.inflate(R.layout.fragment_display_over_other_app_status, container, false)
@@ -50,7 +50,7 @@ class DisplayOverOtherAppsStatusFragment : Fragment() {
             getString(
                 R.string.msg_display_over_other_apps,
                 if (displayOverOtherAppsEnabled) getString(R.string.enabled)
-                else getString(R.string.disabled)
+                else getString(R.string.disabled),
             )
         tv.text = Html.fromHtml(msg, Html.FROM_HTML_MODE_LEGACY)
     }
@@ -62,7 +62,7 @@ class DisplayOverOtherAppsStatusFragment : Fragment() {
         val intent =
             Intent(
                 Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                Uri.parse("package:" + context!!.packageName)
+                Uri.parse("package:" + context!!.packageName),
             )
         startActivityForResult(intent, REQUEST_CODE_DISPLAY_OVER_OTHER_APPS)
     }
