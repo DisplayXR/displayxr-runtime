@@ -118,7 +118,7 @@ distributions:
               XRT_HAVE_OPENCV: "OFF"
 
       - codename: bullseye
-        tag: "2025-01-11"
+        tag: "2025-01-08"
         script: bullseye_backports.sh
         deb_version_suffix: bpo11
         packages:
@@ -133,9 +133,9 @@ distributions:
         distro_version: bookworm
         repo_suffix: ndk
         script: android_container_prep.sh
-        tag: "2025-01-11"
+        tag: "2025-01-17"
         # This must match ext.sharedCompileSdk in build.gradle
-        android_compile_sdk: 34
+        android_compile_sdk: 35
         # This must match buildscript.ext.buildToolsVersion in build.gradle
         android_build_tools: 34.0.0
         # This must match ext.ndk_version in build.gradle

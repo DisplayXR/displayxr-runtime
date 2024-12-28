@@ -73,7 +73,7 @@ ext {
     cmake_version = '3.22.1'
     ndk_version = '26.3.11579264'
     // If you update this, must also update .gitlab-ci/config.yml
-    sharedCompileSdk = 34
+    sharedCompileSdk = 35
     sharedTargetSdk = 31
     sharedMinSdk = 26
 

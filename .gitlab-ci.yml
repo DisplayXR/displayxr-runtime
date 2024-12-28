@@ -132,13 +132,13 @@ win:container_prep:
 .monado.variables.debian:bullseye:
   variables:
     FDO_DISTRIBUTION_VERSION: "bullseye"
-    FDO_DISTRIBUTION_TAG: "2025-01-11"
+    FDO_DISTRIBUTION_TAG: "2025-01-08"
 
 # Variables for build and usage of Debian bookworm-ndk image
 .monado.variables.debian:bookworm-ndk:
   variables:
     FDO_DISTRIBUTION_VERSION: "bookworm"
-    FDO_DISTRIBUTION_TAG: "2025-01-11"
+    FDO_DISTRIBUTION_TAG: "2025-01-17"
     FDO_REPO_SUFFIX: ndk
 
 # Variables for build and usage of Ubuntu jammy image
