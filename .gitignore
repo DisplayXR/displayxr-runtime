@@ -108,3 +108,6 @@ vk_layer_settings.txt
 
 # Ignore local pyenv version file
 .python-version
+
+# Kotlin
+.kotlin
