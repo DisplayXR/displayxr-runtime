@@ -132,7 +132,6 @@ steamvr_open_system(struct xrt_builder *xb,
 
 	if (result != XRT_SUCCESS) {
 		SVR_ERROR("Unable to create devices");
-		steamvr_destroy(xb);
 		return result;
 	}
 
@@ -141,7 +140,6 @@ steamvr_open_system(struct xrt_builder *xb,
 
 	if (xsysd->static_roles.head == NULL) {
 		SVR_ERROR("Unable to find HMD");
-		steamvr_destroy(xb);
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
 
