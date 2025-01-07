@@ -543,7 +543,7 @@ render_resources_init(struct render_resources *r,
 	r->compute.ubo_binding = 3;
 
 	r->compute.layer.image_array_size =
-	    MAX(vk->features.max_per_stage_descriptor_sampled_images, RENDER_MAX_IMAGES_COUNT(r));
+	    MIN(vk->features.max_per_stage_descriptor_sampled_images, RENDER_MAX_IMAGES_COUNT(r));
 
 
 	/*
