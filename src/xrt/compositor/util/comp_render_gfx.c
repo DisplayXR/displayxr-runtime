@@ -859,8 +859,6 @@ comp_render_gfx_layers(struct render_gfx *render,
 	}
 
 
-	VkImageLayout transition_from = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-
 	cmd_barrier_view_images(                           //
 	    render->r->vk,                                 //
 	    d,                                             //
