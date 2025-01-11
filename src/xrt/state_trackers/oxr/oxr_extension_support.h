@@ -418,6 +418,17 @@
 
 
 /*
+ * XR_EXT_plane_detection
+ */
+#if defined(XR_EXT_plane_detection) && defined(XRT_FEATURE_OPENXR_PLANE_DETECTION)
+#define OXR_HAVE_EXT_plane_detection
+#define OXR_EXTENSION_SUPPORT_EXT_plane_detection(_) _(EXT_plane_detection, EXT_PLANE_DETECTION)
+#else
+#define OXR_EXTENSION_SUPPORT_EXT_plane_detection(_)
+#endif
+
+
+/*
  * XR_EXT_samsung_odyssey_controller
  */
 #if defined(XR_EXT_samsung_odyssey_controller) && defined(XRT_FEATURE_OPENXR_INTERACTION_WINMR)
@@ -464,6 +475,18 @@
 
 
 /*
+ * XR_FB_composition_layer_depth_test
+ */
+#if defined(XR_FB_composition_layer_depth_test) && defined(XRT_FEATURE_OPENXR_LAYER_FB_DEPTH_TEST)
+#define OXR_HAVE_FB_composition_layer_depth_test
+#define OXR_EXTENSION_SUPPORT_FB_composition_layer_depth_test(_)                                                       \
+	_(FB_composition_layer_depth_test, FB_COMPOSITION_LAYER_DEPTH_TEST)
+#else
+#define OXR_EXTENSION_SUPPORT_FB_composition_layer_depth_test(_)
+#endif
+
+
+/*
  * XR_FB_composition_layer_image_layout
  */
 #if defined(XR_FB_composition_layer_image_layout) && defined(XRT_FEATURE_OPENXR_LAYER_FB_IMAGE_LAYOUT)
@@ -488,14 +511,13 @@
 
 
 /*
- * XR_FB_composition_layer_depth_test
+ * XR_FB_display_refresh_rate
  */
-#if defined(XR_FB_composition_layer_depth_test) && defined(XRT_FEATURE_OPENXR_LAYER_FB_DEPTH_TEST)
-#define OXR_HAVE_FB_composition_layer_depth_test
-#define OXR_EXTENSION_SUPPORT_FB_composition_layer_depth_test(_)                                                       \
-	_(FB_composition_layer_depth_test, FB_COMPOSITION_LAYER_DEPTH_TEST)
+#if defined(XR_FB_display_refresh_rate) && defined(XRT_FEATURE_OPENXR_DISPLAY_REFRESH_RATE)
+#define OXR_HAVE_FB_display_refresh_rate
+#define OXR_EXTENSION_SUPPORT_FB_display_refresh_rate(_) _(FB_display_refresh_rate, FB_DISPLAY_REFRESH_RATE)
 #else
-#define OXR_EXTENSION_SUPPORT_FB_composition_layer_depth_test(_)
+#define OXR_EXTENSION_SUPPORT_FB_display_refresh_rate(_)
 #endif
 
 
@@ -507,17 +529,6 @@
 #define OXR_EXTENSION_SUPPORT_FB_face_tracking2(_) _(FB_face_tracking2, FB_FACE_TRACKING2)
 #else
 #define OXR_EXTENSION_SUPPORT_FB_face_tracking2(_)
-#endif
-
-
-/*
- * XR_FB_display_refresh_rate
- */
-#if defined(XR_FB_display_refresh_rate) && defined(XRT_FEATURE_OPENXR_DISPLAY_REFRESH_RATE)
-#define OXR_HAVE_FB_display_refresh_rate
-#define OXR_EXTENSION_SUPPORT_FB_display_refresh_rate(_) _(FB_display_refresh_rate, FB_DISPLAY_REFRESH_RATE)
-#else
-#define OXR_EXTENSION_SUPPORT_FB_display_refresh_rate(_)
 #endif
 
 
@@ -578,6 +589,30 @@
 
 
 /*
+ * XR_HTC_vive_cosmos_controller_interaction
+ */
+#if defined(XR_HTC_vive_cosmos_controller_interaction) && defined(XRT_FEATURE_OPENXR_INTERACTION_VIVE_COSMOS)
+#define OXR_HAVE_HTC_vive_cosmos_controller_interaction
+#define OXR_EXTENSION_SUPPORT_HTC_vive_cosmos_controller_interaction(_)                                                \
+	_(HTC_vive_cosmos_controller_interaction, HTC_VIVE_COSMOS_CONTROLLER_INTERACTION)
+#else
+#define OXR_EXTENSION_SUPPORT_HTC_vive_cosmos_controller_interaction(_)
+#endif
+
+
+/*
+ * XR_HTC_vive_focus3_controller_interaction
+ */
+#if defined(XR_HTC_vive_focus3_controller_interaction) && defined(XRT_FEATURE_OPENXR_INTERACTION_VIVE_FOCUS3)
+#define OXR_HAVE_HTC_vive_focus3_controller_interaction
+#define OXR_EXTENSION_SUPPORT_HTC_vive_focus3_controller_interaction(_)                                                \
+	_(HTC_vive_focus3_controller_interaction, HTC_VIVE_FOCUS3_CONTROLLER_INTERACTION)
+#else
+#define OXR_EXTENSION_SUPPORT_HTC_vive_focus3_controller_interaction(_)
+#endif
+
+
+/*
  * XR_META_body_tracking_full_body
  */
 #if defined(XR_META_body_tracking_full_body) && defined(XRT_FEATURE_OPENXR_BODY_TRACKING_FULL_BODY_META)
@@ -609,17 +644,6 @@
 	_(ML_ml2_controller_interaction, ML_ML2_CONTROLLER_INTERACTION)
 #else
 #define OXR_EXTENSION_SUPPORT_ML_ml2_controller_interaction(_)
-#endif
-
-
-/*
- * XR_EXT_plane_detection
- */
-#if defined(XR_EXT_plane_detection) && defined(XRT_FEATURE_OPENXR_PLANE_DETECTION)
-#define OXR_HAVE_EXT_plane_detection
-#define OXR_EXTENSION_SUPPORT_EXT_plane_detection(_) _(EXT_plane_detection, EXT_PLANE_DETECTION)
-#else
-#define OXR_EXTENSION_SUPPORT_EXT_plane_detection(_)
 #endif
 
 
@@ -700,30 +724,6 @@
 	_(HTCX_vive_tracker_interaction, HTCX_VIVE_TRACKER_INTERACTION)
 #else
 #define OXR_EXTENSION_SUPPORT_HTCX_vive_tracker_interaction(_)
-#endif
-
-
-/*
- * XR_HTC_vive_cosmos_controller_interaction
- */
-#if defined(XR_HTC_vive_cosmos_controller_interaction) && defined(XRT_FEATURE_OPENXR_INTERACTION_VIVE_COSMOS)
-#define OXR_HAVE_HTC_vive_cosmos_controller_interaction
-#define OXR_EXTENSION_SUPPORT_HTC_vive_cosmos_controller_interaction(_)                                                \
-	_(HTC_vive_cosmos_controller_interaction, HTC_VIVE_COSMOS_CONTROLLER_INTERACTION)
-#else
-#define OXR_EXTENSION_SUPPORT_HTC_vive_cosmos_controller_interaction(_)
-#endif
-
-
-/*
- * XR_HTC_vive_focus3_controller_interaction
- */
-#if defined(XR_HTC_vive_focus3_controller_interaction) && defined(XRT_FEATURE_OPENXR_INTERACTION_VIVE_FOCUS3)
-#define OXR_HAVE_HTC_vive_focus3_controller_interaction
-#define OXR_EXTENSION_SUPPORT_HTC_vive_focus3_controller_interaction(_)                                                \
-	_(HTC_vive_focus3_controller_interaction, HTC_VIVE_FOCUS3_CONTROLLER_INTERACTION)
-#else
-#define OXR_EXTENSION_SUPPORT_HTC_vive_focus3_controller_interaction(_)
 #endif
 
 
@@ -863,24 +863,26 @@
     OXR_EXTENSION_SUPPORT_EXT_local_floor(_) \
     OXR_EXTENSION_SUPPORT_EXT_palm_pose(_) \
     OXR_EXTENSION_SUPPORT_EXT_performance_settings(_) \
+    OXR_EXTENSION_SUPPORT_EXT_plane_detection(_) \
     OXR_EXTENSION_SUPPORT_EXT_samsung_odyssey_controller(_) \
     OXR_EXTENSION_SUPPORT_BD_controller_interaction(_) \
     OXR_EXTENSION_SUPPORT_FB_body_tracking(_) \
     OXR_EXTENSION_SUPPORT_FB_composition_layer_alpha_blend(_) \
+    OXR_EXTENSION_SUPPORT_FB_composition_layer_depth_test(_) \
     OXR_EXTENSION_SUPPORT_FB_composition_layer_image_layout(_) \
     OXR_EXTENSION_SUPPORT_FB_composition_layer_settings(_) \
-    OXR_EXTENSION_SUPPORT_FB_composition_layer_depth_test(_) \
-    OXR_EXTENSION_SUPPORT_FB_face_tracking2(_) \
     OXR_EXTENSION_SUPPORT_FB_display_refresh_rate(_) \
+    OXR_EXTENSION_SUPPORT_FB_face_tracking2(_) \
     OXR_EXTENSION_SUPPORT_FB_haptic_pcm(_) \
     OXR_EXTENSION_SUPPORT_FB_passthrough(_) \
     OXR_EXTENSION_SUPPORT_FB_touch_controller_pro(_) \
     OXR_EXTENSION_SUPPORT_FB_touch_controller_proximity(_) \
     OXR_EXTENSION_SUPPORT_HTC_facial_tracking(_) \
+    OXR_EXTENSION_SUPPORT_HTC_vive_cosmos_controller_interaction(_) \
+    OXR_EXTENSION_SUPPORT_HTC_vive_focus3_controller_interaction(_) \
     OXR_EXTENSION_SUPPORT_META_body_tracking_full_body(_) \
     OXR_EXTENSION_SUPPORT_META_touch_controller_plus(_) \
     OXR_EXTENSION_SUPPORT_ML_ml2_controller_interaction(_) \
-    OXR_EXTENSION_SUPPORT_EXT_plane_detection(_) \
     OXR_EXTENSION_SUPPORT_MND_headless(_) \
     OXR_EXTENSION_SUPPORT_MND_swapchain_usage_input_attachment_bit(_) \
     OXR_EXTENSION_SUPPORT_MSFT_hand_interaction(_) \
@@ -888,8 +890,6 @@
     OXR_EXTENSION_SUPPORT_OPPO_controller_interaction(_) \
     OXR_EXTENSION_SUPPORT_EXTX_overlay(_) \
     OXR_EXTENSION_SUPPORT_HTCX_vive_tracker_interaction(_) \
-    OXR_EXTENSION_SUPPORT_HTC_vive_cosmos_controller_interaction(_) \
-    OXR_EXTENSION_SUPPORT_HTC_vive_focus3_controller_interaction(_) \
     OXR_EXTENSION_SUPPORT_MNDX_ball_on_a_stick_controller(_) \
     OXR_EXTENSION_SUPPORT_MNDX_oculus_remote(_) \
     OXR_EXTENSION_SUPPORT_MNDX_egl_enable(_) \
