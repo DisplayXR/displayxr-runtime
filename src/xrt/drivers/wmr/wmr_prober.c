@@ -85,6 +85,7 @@ check_and_get_interface(struct xrt_prober_device *device,
 		switch (device->product_id) {
 		case REVERB_G1_PID: *out_hmd_type = WMR_HEADSET_REVERB_G1; return true;
 		case REVERB_G2_PID: *out_hmd_type = WMR_HEADSET_REVERB_G2; return true;
+		case REVERB_G2_OMNICEPT_PID: *out_hmd_type = WMR_HEADSET_REVERB_G2; return true;
 		case VR1000_PID: *out_hmd_type = WMR_HEADSET_HP_VR1000; return true;
 		default: U_LOG_IFL_T(log_level, "No matching PID!"); return false;
 		}

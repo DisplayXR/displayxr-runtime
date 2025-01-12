@@ -59,6 +59,7 @@ enum wmr_headset_type
 #define VR1000_PID 0x0367
 #define REVERB_G1_PID 0x0c6a
 #define REVERB_G2_PID 0x0580
+#define REVERB_G2_OMNICEPT_PID 0x0680
 #define REVERB_G2_CONTROLLER_PID 0x066a /* On 0x045e Microsoft VID */
 
 #define LENOVO_VID 0x17ef
