@@ -20,6 +20,8 @@
 #include "xrt/xrt_config_have.h"
 #include "xrt/xrt_windows.h"
 
+#include <stdalign.h>
+
 #if defined(XRT_HAVE_D3D11)
 #include <d3d11.h>
 #elif defined(XRT_DOXYGEN)
@@ -408,7 +410,7 @@ struct xrt_layer_data
 	 * The layer may be displayed after this point, but must never be
 	 * displayed before.
 	 */
-	int64_t timestamp;
+	alignas(8) int64_t timestamp;
 
 	/*!
 	 * Composition flags
@@ -476,7 +478,7 @@ struct xrt_layer_data
  */
 struct xrt_layer_frame_data
 {
-	int64_t frame_id;
+	alignas(8) int64_t frame_id;
 	int64_t display_time_ns;
 	enum xrt_blend_mode env_blend_mode;
 };
@@ -929,7 +931,7 @@ struct xrt_swapchain_create_properties
 struct xrt_session_info
 {
 	bool is_overlay;
-	uint64_t flags;
+	alignas(8) uint64_t flags;
 	uint32_t z_order;
 };
 
@@ -944,7 +946,7 @@ struct xrt_compositor_info
 	uint32_t format_count;
 
 	//! Supported formats, never changes.
-	int64_t formats[XRT_MAX_SWAPCHAIN_FORMATS];
+	alignas(8) int64_t formats[XRT_MAX_SWAPCHAIN_FORMATS];
 
 	//! Max texture size that GPU supports (size of a single dimension), zero means any size.
 	uint32_t max_texture_size;

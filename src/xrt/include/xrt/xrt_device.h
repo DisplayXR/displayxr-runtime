@@ -15,6 +15,8 @@
 #include "xrt/xrt_visibility_mask.h"
 #include "xrt/xrt_limits.h"
 
+#include <stdalign.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -162,7 +164,7 @@ struct xrt_input
 	//! Is this input active.
 	bool active;
 
-	int64_t timestamp;
+	alignas(8) int64_t timestamp;
 
 	enum xrt_input_name name;
 

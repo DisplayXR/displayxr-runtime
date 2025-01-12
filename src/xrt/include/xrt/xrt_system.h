@@ -15,6 +15,7 @@
 #include "xrt/xrt_defines.h"
 #include "xrt/xrt_device.h"
 
+#include <stdalign.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -169,7 +170,7 @@ struct xrt_system_roles
 	 * make init easier where any cache can start at zero and be guaranteed
 	 * to be replaced with a new @ref xrt_system_roles.
 	 */
-	uint64_t generation_id;
+	alignas(8) uint64_t generation_id;
 
 	/*!
 	 * Index in @ref xrt_system_devices::xdevs for the user's left
