@@ -409,6 +409,8 @@ struct xrt_layer_data
 	 *
 	 * The layer may be displayed after this point, but must never be
 	 * displayed before.
+	 *
+	 * alignas for 32 bit client support,
 	 */
 	alignas(8) int64_t timestamp;
 
@@ -478,6 +480,7 @@ struct xrt_layer_data
  */
 struct xrt_layer_frame_data
 {
+	//! alignas for 32 bit client support, see @ref ipc-design
 	alignas(8) int64_t frame_id;
 	int64_t display_time_ns;
 	enum xrt_blend_mode env_blend_mode;
@@ -931,6 +934,7 @@ struct xrt_swapchain_create_properties
 struct xrt_session_info
 {
 	bool is_overlay;
+	//! alignas for 32 bit client support, see @ref ipc-design
 	alignas(8) uint64_t flags;
 	uint32_t z_order;
 };
@@ -945,7 +949,10 @@ struct xrt_compositor_info
 	//! Number of formats, never changes.
 	uint32_t format_count;
 
-	//! Supported formats, never changes.
+	/*!
+	 * Supported formats, never changes.
+	 * alignas for 32 bit client support, see @ref ipc-design
+	 */
 	alignas(8) int64_t formats[XRT_MAX_SWAPCHAIN_FORMATS];
 
 	//! Max texture size that GPU supports (size of a single dimension), zero means any size.

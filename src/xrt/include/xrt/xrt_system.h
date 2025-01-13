@@ -169,6 +169,8 @@ struct xrt_system_roles
 	 * All valid values are greater then zero; this is to
 	 * make init easier where any cache can start at zero and be guaranteed
 	 * to be replaced with a new @ref xrt_system_roles.
+	 *
+	 * alignas for 32 bit client support, see @ref ipc-design
 	 */
 	alignas(8) uint64_t generation_id;
 

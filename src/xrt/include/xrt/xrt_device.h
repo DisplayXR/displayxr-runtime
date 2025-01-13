@@ -164,6 +164,7 @@ struct xrt_input
 	//! Is this input active.
 	bool active;
 
+	//! alignas for 32 bit client support, see @ref ipc-design
 	alignas(8) int64_t timestamp;
 
 	enum xrt_input_name name;
