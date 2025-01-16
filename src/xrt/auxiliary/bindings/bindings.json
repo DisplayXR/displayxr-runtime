@@ -3310,7 +3310,7 @@
 			}
 		},
 
-		"/interaction_profiles/facebook/touch_controller_plus": {
+		"/interaction_profiles/meta/touch_controller_plus": {
 			"title": "Meta Quest Touch Plus Controller",
 			"type": "tracked_controller",
 			"extension": "META_touch_controller_plus",
