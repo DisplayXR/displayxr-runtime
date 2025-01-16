@@ -14,8 +14,9 @@
 
 #include "util/u_debug.h"
 #include "util/u_device.h"
-#include "util/u_var.h"
 #include "util/u_distortion_mesh.h"
+#include "util/u_var.h"
+#include "util/u_visibility_mask.h"
 
 #include "android/android_globals.h"
 #include "android/android_custom_surface.h"
@@ -220,6 +221,7 @@ android_device_create()
 	d->base.update_inputs = u_device_noop_update_inputs;
 	d->base.get_tracked_pose = android_device_get_tracked_pose;
 	d->base.get_view_poses = u_device_get_view_poses;
+	d->base.get_visibility_mask = u_device_get_visibility_mask;
 	d->base.compute_distortion = android_device_compute_distortion;
 	d->base.inputs[0].name = XRT_INPUT_GENERIC_HEAD_POSE;
 	d->base.device_type = XRT_DEVICE_TYPE_HMD;
