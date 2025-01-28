@@ -286,6 +286,18 @@ else()
 	# Enable the client debug gui by default for in-proc -
 	# In in-proc, the client debug gui is the same as the server debug gui, and we use it a lot in this configuration
 	option_with_deps(XRT_FEATURE_CLIENT_DEBUG_GUI "Allow clients to have their own instances of the debug gui" DEFAULT ON DEPENDS XRT_FEATURE_DEBUG_GUI)
+
+	# This is an advanced feature, for if you want the client module without the service.
+	# Typically only used in derived runtimes or to build the client and service with different build options
+	# (such as Android C++ standard library) that do not affect the IPC ABI.
+	option_with_deps(XRT_FEATURE_CLIENT_WITHOUT_SERVICE "Enable building OpenXR runtime as IPC client without simultaneously building the service" DEFAULT OFF DEPENDS XRT_MODULE_IPC XRT_FEATURE_OPENXR "NOT XRT_FEATURE_SERVICE")
+endif()
+
+# Do not manually set XRT_FEATURE_IPC_CLIENT, it is always computed
+if(XRT_FEATURE_SERVICE OR XRT_FEATURE_CLIENT_WITHOUT_SERVICE)
+	set(XRT_FEATURE_IPC_CLIENT ON)
+else()
+	set(XRT_FEATURE_IPC_CLIENT OFF)
 endif()
 
 # systemd detailed config
