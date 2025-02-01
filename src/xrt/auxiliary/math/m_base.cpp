@@ -5,7 +5,7 @@
  * @brief  Base implementations for math library.
  * @author Jakob Bornecrantz <jakob@collabora.com>
  * @author Rylie Pavlik <rylie.pavlik@collabora.com>
- * @author Moses Turner <mosesturner@protonmail.com>
+ * @author Moshi Turner <moshiturner@protonmail.com>
  * @author Nis Madsen <nima_zero_one@protonmail.com>
  * @ingroup aux_math
  */

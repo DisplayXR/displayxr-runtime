@@ -4,7 +4,7 @@
  * @file
  * @brief  C interface to math library.
  * @author Jakob Bornecrantz <jakob@collabora.com>
- * @author Moses Turner <mosesturner@protonmail.com>
+ * @author Moshi Turner <moshiturner@protonmail.com>
  * @author Nis Madsen <nima_zero_one@protonmail.com>
  *
  * @see xrt_vec3

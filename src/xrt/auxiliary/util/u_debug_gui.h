@@ -4,7 +4,7 @@
  * @file
  * @brief  SDL2 Debug UI implementation
  * @author Jakob Bornecrantz <jakob@collabora.com>
- * @author Moses Turner <moses@collabora.com>
+ * @author Moshi Turner <moshiturner@protonmail.com>
  */
 
 #pragma once

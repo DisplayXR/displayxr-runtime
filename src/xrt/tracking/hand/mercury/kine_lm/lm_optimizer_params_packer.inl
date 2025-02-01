@@ -3,7 +3,7 @@
 /*!
  * @file
  * @brief Util to reinterpret Ceres parameter vectors as hand model parameters
- * @author Moses Turner <moses@collabora.com>
+ * @author Moshi Turner <moshiturner@protonmail.com>
  * @author Charlton Rodda <charlton.rodda@collabora.com>
  * @ingroup tracking
  */

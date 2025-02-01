@@ -4,7 +4,7 @@
  * @file
  * @brief Pool to read back VkImages from the gpu
  *
- * @author Moses Turner <moses@collabora.com>
+ * @author Moshi Turner <moshiturner@protonmail.com>
  * @author Jakob Bornecrantz <jakob@collabora.com>
  * @ingroup aux_vk
  */

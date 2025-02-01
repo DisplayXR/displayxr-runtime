@@ -4,7 +4,7 @@
 /*!
  * @file
  * @brief  The "One Euro Filter" for filtering interaction data.
- * @author Moses Turner <moses@collabora.com>
+ * @author Moshi Turner <moshiturner@protonmail.com>
  * @author Jan Schmidt <jan@centricular.com>
  * @author Rylie Pavlik <rylie.pavlik@collabora.com>
  * @ingroup aux_math

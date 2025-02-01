@@ -3,7 +3,7 @@
 /*!
  * @file
  * @brief  Code to deal with bounding boxes for camera-based hand-tracking.
- * @author Moses Turner <moses@collabora.com>
+ * @author Moshi Turner <moshiturner@protonmail.com>
  * @author Marcus Edel <marcus.edel@collabora.com>
  * @ingroup aux_util
  */

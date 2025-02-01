@@ -5,7 +5,7 @@
  * @file
  * @brief  Holds session end frame functions.
  * @author Jakob Bornecrantz <jakob@collabora.com>
- * @author Moses Turner <mosesturner@protonmail.com>
+ * @author Moshi Turner <moshiturner@protonmail.com>
  * @ingroup oxr_main
  */
 

@@ -5,7 +5,7 @@
  * @brief  System builder for North Star headsets
  * @author Nova King <technobaboo@gmail.com>
  * @author Jakob Bornecrantz <jakob@collabora.com>
- * @author Moses Turner <moses@collabora.com>
+ * @author Moshi Turner <moshiturner@protonmail.com>
  * @ingroup xrt_iface
  */
 

@@ -3,7 +3,7 @@
 /*!
  * @file
  * @brief  Builder for SimulaVR devices
- * @author Moses Turner <moses@collabora.com>
+ * @author Moshi Turner <moshiturner@protonmail.com>
  * @ingroup xrt_iface
  */
 

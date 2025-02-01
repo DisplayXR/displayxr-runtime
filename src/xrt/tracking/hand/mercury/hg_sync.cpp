@@ -4,7 +4,7 @@
  * @file
  * @brief  Mercury hand tracking main file.
  * @author Jakob Bornecrantz <jakob@collabora.com>
- * @author Moses Turner <moses@collabora.com>
+ * @author Moshi Turner <moshiturner@protonmail.com>
  * @author Charlton Rodda <charlton.rodda@collabora.com>
  * @ingroup tracking
  */

@@ -1,13 +1,13 @@
 // Copyright 2020-2023, Collabora, Ltd.
 // Copyright 2020, Nova King.
-// Copyright 2020, Moses Turner.
+// Copyright 2020, Moshi Turner.
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
  * @brief  North Star HMD code.
  * @author Nova King <technobaboo@gmail.com>
  * @author Jakob Bornecrantz <jakob@collabora.com>
- * @author Moses Turner <mosesturner@protonmail.com>
+ * @author Moshi Turner <moshiturner@protonmail.com>
  * @author Nico Zobernig <nico.zobernig@gmail.com>
  * @ingroup drv_ns
  */
@@ -333,7 +333,7 @@ ns_optical_config_parse(struct ns_hmd *ns)
 		return true;
 	}
 	if (ns_mt_parse(ns, ns->config_json)) {
-		NS_INFO(ns, "Using Moses's meshgrid-based display distortion correction!");
+		NS_INFO(ns, "Using Moshi's meshgrid-based display distortion correction!");
 		return true;
 	}
 	U_LOG_E("Couldn't find a valid display distortion correction!");

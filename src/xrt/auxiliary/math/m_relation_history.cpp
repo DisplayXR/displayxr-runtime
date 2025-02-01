@@ -4,7 +4,7 @@
  * @file
  * @brief Small utility for keeping track of the history of an xrt_space_relation, ie. for knowing where a HMD or
  * controller was in the past.
- * @author Moses Turner <moses@collabora.com>
+ * @author Moshi Turner <moshiturner@protonmail.com>
  * @author Rylie Pavlik <rylie.pavlik@collabora.com>
  * @author Korcan Hussein <korcan.hussein@collabora.com>
  * @ingroup aux_math

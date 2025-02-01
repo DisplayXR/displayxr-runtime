@@ -4,7 +4,7 @@
  * @file
  * @brief  OpenGL helper functions for drawing GUI elements.
  * @author Jakob Bornecrantz <jakob@collabora.com>
- * @author Moses Turner <moses@collabora.com>
+ * @author Moshi Turner <moshiturner@protonmail.com>
  * @ingroup gui
  */
 

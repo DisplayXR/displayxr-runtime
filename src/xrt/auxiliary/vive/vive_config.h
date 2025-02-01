@@ -4,7 +4,7 @@
  * @file
  * @brief  vive json header
  * @author Lubosz Sarnecki <lubosz.sarnecki@collabora.com>
- * @author Moses Turner <moses@collabora.com>
+ * @author Moshi Turner <moshiturner@protonmail.com>
  * @ingroup aux_vive
  */
 
@@ -82,7 +82,7 @@ struct index_camera
 	// I have no idea why those sign flips were necessary - I suppose Valve/HTC just made some weird decisions when
 	// making the config file schemas. I figure it would be very confusing to try to "fix" these values as I'm
 	// parsing them, so if you're writing code downstream of this, beware and expect the values in here to be
-	// exactly the same as those in the compressed JSON. -Moses
+	// exactly the same as those in the compressed JSON. -Moshi
 	struct
 	{
 		struct xrt_vec3 plus_x;

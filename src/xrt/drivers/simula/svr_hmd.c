@@ -1,10 +1,10 @@
 // Copyright 2020-2023, Collabora, Ltd.
-// Copyright 2020, Moses Turner.
+// Copyright 2020, Moshi Turner.
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
  * @brief SimulaVR driver code.
- * @author Moses Turner <moses@collabora.com>
+ * @author Moshi Turner <moshiturner@protonmail.com>
  * @ingroup drv_svr
  */
 

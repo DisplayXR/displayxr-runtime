@@ -4,7 +4,7 @@
  * @file
  * @brief  An @ref xrt_frame_sink that combines two frames into a stereo frame.
  * @author Jakob Bornecrantz <jakob@collabora.com>
- * @author Moses Turner <moses@collabora.com>
+ * @author Moshi Turner <moshiturner@protonmail.com>
  * @ingroup aux_util
  */
 

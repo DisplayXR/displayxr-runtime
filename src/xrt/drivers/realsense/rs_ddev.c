@@ -4,7 +4,7 @@
 /*!
  * @file
  * @brief  RealSense helper driver for in-device SLAM 6DOF tracking.
- * @author Moses Turner <mosesturner@protonmail.com>
+ * @author Moshi Turner <moshiturner@protonmail.com>
  * @author Nova King <technobaboo@gmail.com>
  * @author Jakob Bornecrantz <jakob@collabora.com>
  * @ingroup drv_realsense

@@ -3,7 +3,7 @@
 /*!
  * @file
  * @brief  Camera based hand tracking driver code.
- * @author Moses Turner <moses@collabora.com>
+ * @author Moshi Turner <moshiturner@protonmail.com>
  * @ingroup drv_ht
  */
 

@@ -4,7 +4,7 @@
  * @file
  * @brief  Holds session related functions.
  * @author Jakob Bornecrantz <jakob@collabora.com>
- * @author Moses Turner <mosesturner@protonmail.com>
+ * @author Moshi Turner <moshiturner@protonmail.com>
  * @author Korcan Hussein <korcan.hussein@collabora.com>
  * @ingroup oxr_main
  */

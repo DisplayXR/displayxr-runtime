@@ -4,7 +4,7 @@
  * @file
  * @brief  Common defines and enums for XRT.
  * @author Jakob Bornecrantz <jakob@collabora.com>
- * @author Moses Turner <mosesturner@protonmail.com>
+ * @author Moshi Turner <moshiturner@protonmail.com>
  * @author Nis Madsen <nima_zero_one@protonmail.com>
  * @author Korcan Hussein <korcan.hussein@collabora.com>
  * @ingroup xrt_iface

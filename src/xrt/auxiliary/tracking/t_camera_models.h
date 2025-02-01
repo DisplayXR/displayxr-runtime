@@ -3,7 +3,7 @@
 /*!
  * @file
  * @brief  Simple, untemplated, C, float-only, camera (un)projection functions for various camera models.
- * @author Moses Turner <moses@collabora.com>
+ * @author Moshi Turner <moshiturner@protonmail.com>
  * @ingroup aux_tracking
  *
  * Some notes:

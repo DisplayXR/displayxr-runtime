@@ -3,7 +3,7 @@
 /*!
  * @file
  * @brief  DepthAI frameserver implementation.
- * @author Moses Turner <moses@collabora.com>
+ * @author Moshi Turner <moshiturner@protonmail.com>
  * @author Jakob Bornecrantz <jakob@collabora.com>
  * @ingroup drv_depthai
  */

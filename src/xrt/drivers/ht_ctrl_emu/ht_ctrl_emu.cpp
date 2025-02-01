@@ -3,7 +3,7 @@
 /*!
  * @file
  * @brief  Driver to emulate controllers from hand-tracking input
- * @author Moses Turner <moses@collabora.com>
+ * @author Moshi Turner <moshiturner@protonmail.com>
  * @author Nick Klingensmith <programmerpichu@gmail.com>
  *
  * @ingroup drv_cemu
@@ -262,7 +262,7 @@ do_aim_pose(struct cemu_device *dev,
 	// "Jakob way"
 	xrt_result_t xret = get_other_two(dev, hand_timestamp_ns, hand_timestamp_ns, &head, &joint_set_secondary);
 #else
-	// "Moses way"
+	// "Moshi way"
 	xrt_result_t xret = get_other_two(dev, head_timestamp_ns, hand_timestamp_ns, &head, &joint_set_secondary);
 #endif
 	if (xret != XRT_SUCCESS) {

@@ -4,7 +4,7 @@
  * @file
  * @brief  Header defining an xrt display or controller device.
  * @author Jakob Bornecrantz <jakob@collabora.com>
- * @author Moses Turner <mosesturner@protonmail.com>
+ * @author Moshi Turner <moshiturner@protonmail.com>
  * @author Korcan Hussein <korcan.hussein@collabora.com>
  * @ingroup xrt_iface
  */

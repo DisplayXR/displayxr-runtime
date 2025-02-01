@@ -3,7 +3,7 @@
 /*!
  * @file
  * @brief  Builder for Lighthouse-tracked devices (vive, index, tundra trackers, etc.)
- * @author Moses Turner <moses@collabora.com>
+ * @author Moshi Turner <moshiturner@protonmail.com>
  * @author Jakob Bornecrantz <jakob@collabora.com>
  * @ingroup xrt_iface
  */

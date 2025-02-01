@@ -1,10 +1,10 @@
 // Copyright 2020-2023, Collabora, Ltd.
-// Copyright 2020-2021, Moses Turner
+// Copyright 2020-2021, Moshi Turner
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
  * @brief   Driver for Ultraleap's V2 API for the Leap Motion Controller.
- * @author  Moses Turner <mosesturner@protonmail.com>
+ * @author  Moshi Turner <moshiturner@protonmail.com>
  * @author  Christoph Haag <christoph.haag@collabora.com>
  * @ingroup drv_ulv2
  */
@@ -39,7 +39,7 @@ enum xrt_space_relation_flags valid_flags = (enum xrt_space_relation_flags)(
     XRT_SPACE_RELATION_POSITION_VALID_BIT | XRT_SPACE_RELATION_POSITION_TRACKED_BIT);
 
 // Excuse my sketchy thread stuff, I'm sure this violates all kinds of best practices. It uusssuallyyy doesn't explode.
-// -Moses Turner
+// -Moshi Turner
 enum leap_thread_status
 {
 	THREAD_NOT_STARTED,
@@ -309,7 +309,7 @@ leap_input_loop(void *ptr_to_xdev)
 		}
 		os_thread_helper_lock(&ulv2d->leap_loop_oth);
 		memcpy(&ulv2d->joints_read_out, &ulv2d->joints_write_in, sizeof(struct xrt_hand_joint_set) * 2);
-		//! @todo (Moses Turner) Could be using LeapController.now() to try to emulate our own pose prediction,
+		//! @todo (Moshi Turner) Could be using LeapController.now() to try to emulate our own pose prediction,
 		//! but I ain't got time for that
 		ulv2d->hand_exists[0] = leftbeendone;
 		ulv2d->hand_exists[1] = rightbeendone;

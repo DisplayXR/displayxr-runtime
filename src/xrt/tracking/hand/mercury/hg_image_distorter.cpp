@@ -3,7 +3,7 @@
 /*!
  * @file
  * @brief Utility to do batch stereographic projections of images.
- * @author Moses Turner <moses@collabora.com>
+ * @author Moshi Turner <moshiturner@protonmail.com>
  * @ingroup tracking
  */
 
