@@ -126,6 +126,11 @@ target_link_libraries(
 # Only uses normal Windows libraries, doesn't add anything extra.
 if(WIN32)
 	target_sources(aux_util PRIVATE u_windows.c u_windows.h)
+endif()
+
+# WIL is lacking official support on MINGW.
+# If necessary, please refer to https://github.com/microsoft/wil/pull/467
+if(WIN32 AND NOT MINGW)
 	target_link_libraries(aux_util PRIVATE WIL::WIL)
 endif()
 
