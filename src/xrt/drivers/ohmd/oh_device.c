@@ -1324,5 +1324,10 @@ oh_device_create(ohmd_context *ctx, bool no_hmds, struct xrt_device **out_xdevs)
 		}
 	}
 
+	if (created == 0) {
+		u_var_remove_root(sys);
+		free(sys);
+	}
+
 	return created;
 }
