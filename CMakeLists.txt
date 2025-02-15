@@ -203,11 +203,6 @@ set(ILLIXR_PATH
 # This one is named differently because that's what CTest uses
 option(BUILD_TESTING "Enable building of the test suite?" ON)
 
-# Check if Steam's root folder exists
-if(EXISTS "$ENV{HOME}/.steam/root")
-	set(XRT_HAVE_STEAM YES)
-endif()
-
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 	set(XRT_HAVE_INTERNAL_HID ON)
 endif()
@@ -338,7 +333,7 @@ option_with_deps(XRT_BUILD_DRIVER_REALSENSE "Enable RealSense device driver" DEP
 option_with_deps(XRT_BUILD_DRIVER_REMOTE "Enable remote debugging driver" DEPENDS "XRT_HAVE_LINUX OR ANDROID OR WIN32")
 option_with_deps(XRT_BUILD_DRIVER_RIFT_S "Enable Oculus Rift S device driver" DEPENDS XRT_HAVE_V4L2)
 option_with_deps(XRT_BUILD_DRIVER_ROKID "Enable Rokid driver" DEPENDS "XRT_HAVE_LIBUSB")
-option_with_deps(XRT_BUILD_DRIVER_STEAMVR_LIGHTHOUSE "Enable SteamVR Lighthouse driver" DEPENDS XRT_HAVE_LINUX XRT_HAVE_STEAM XRT_MODULE_AUX_VIVE)
+option_with_deps(XRT_BUILD_DRIVER_STEAMVR_LIGHTHOUSE "Enable SteamVR Lighthouse driver" DEPENDS XRT_HAVE_LINUX XRT_MODULE_AUX_VIVE)
 option_with_deps(XRT_BUILD_DRIVER_SURVIVE "Enable libsurvive driver" DEPENDS SURVIVE_FOUND XRT_MODULE_AUX_VIVE)
 option_with_deps(XRT_BUILD_DRIVER_ULV2 "Enable Ultraleap v2 driver" DEPENDS LeapV2_FOUND)
 option_with_deps(XRT_BUILD_DRIVER_ULV5 "Enable Ultraleap v5 driver" DEPENDS LeapSDK_FOUND)
