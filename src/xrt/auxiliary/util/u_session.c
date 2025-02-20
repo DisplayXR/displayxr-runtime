@@ -55,6 +55,15 @@ destroy(struct xrt_session *xs)
 {
 	struct u_session *us = u_session(xs);
 
+	struct u_session_event *event = us->events.ptr;
+	while (event) {
+		struct u_session_event *tmp = event->next;
+		free(event);
+		event = tmp;
+	}
+
+	us->events.ptr = NULL;
+
 	if (us->usys != NULL) {
 		u_system_remove_session(us->usys, &us->base, &us->sink);
 	}
