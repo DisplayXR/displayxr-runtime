@@ -55,7 +55,10 @@ class Context final : public xrt_tracking_origin,
                       public std::enable_shared_from_this<Context>
 
 {
+public:
 	Settings settings;
+
+private:
 	Resources resources;
 	IOBuffer iobuf;
 	DriverManager man;

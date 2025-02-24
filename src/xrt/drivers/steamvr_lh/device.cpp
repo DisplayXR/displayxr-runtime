@@ -7,10 +7,12 @@
  * @ingroup drv_steamvr_lh
  */
 
+#include <cmath>
 #include <functional>
 #include <cstring>
 #include <thread>
 #include <algorithm>
+#include <map>
 
 #include "math/m_api.h"
 #include "math/m_relation_history.h"
@@ -27,6 +29,7 @@
 #include "xrt/xrt_device.h"
 
 #include "vive/vive_poses.h"
+#include "openvr_driver.h"
 
 #define DEV_ERR(...) U_LOG_IFL_E(ctx->log_level, __VA_ARGS__)
 #define DEV_WARN(...) U_LOG_IFL_W(ctx->log_level, __VA_ARGS__)
@@ -162,6 +165,47 @@ device_bouncer(struct xrt_device *xdev, Args... args)
 	auto *dev = static_cast<DeviceType *>(xdev);
 	return std::invoke(Func, dev, args...);
 }
+
+// Setting used for brightness in the steamvr section. This isn't defined by the openvr header.
+static const char *analog_gain_settings_key = "analogGain";
+
+/**
+ * Map a 0-1 (or > 1) brightness value into the analogGain value stored in SteamVR settings.
+ */
+float
+brightness_to_analog_gain(float brightness)
+{
+	// Lookup table from brightness to analog gain value
+	// Courtesy of OyasumiVR, MIT license, Copyright (c) 2022 Raphiiko
+	// https://github.com/Raphiiko/OyasumiVR/blob/c9e7fbcc2ea6caa07a8233a75218598087043171/src-ui/app/services/brightness-control/hardware-brightness-drivers/valve-index-hardware-brightness-control-driver.ts#L92
+	// TODO: We should support having a lookup table per headset model. If not present, fallback to lerp between the
+	// given min and max analog gain. Maybe we can assume 100% brightness = 1.0 analog gain, but we need info from
+	// more headsets.
+	static const auto lookup = std::map<float, float>{{
+	    {0.20, 0.03},  {0.23, 0.04},  {0.26, 0.05},  {0.27, 0.055}, {0.28, 0.06},  {0.30, 0.07},  {0.32, 0.08},
+	    {0.33, 0.09},  {0.34, 0.095}, {0.35, 0.1},   {0.36, 0.105}, {0.37, 0.11},  {0.37, 0.115}, {0.38, 0.12},
+	    {0.39, 0.125}, {0.40, 0.13},  {0.40, 0.135}, {0.41, 0.14},  {0.42, 0.145}, {0.42, 0.15},  {0.43, 0.155},
+	    {0.43, 0.16},  {0.44, 0.165}, {0.45, 0.17},  {0.45, 0.175}, {0.46, 0.18},  {0.46, 0.185}, {0.47, 0.19},
+	    {0.48, 0.195}, {0.48, 0.2},   {0.49, 0.21},  {0.53, 0.25},  {0.58, 0.3},   {0.59, 0.315}, {0.60, 0.32},
+	    {0.60, 0.33},  {0.61, 0.34},  {0.62, 0.35},  {0.66, 0.4},   {0.69, 0.445}, {0.70, 0.45},  {0.70, 0.46},
+	    {0.71, 0.465}, {0.71, 0.47},  {0.71, 0.475}, {0.72, 0.48},  {0.72, 0.49},  {0.73, 0.5},   {0.79, 0.6},
+	    {0.85, 0.7},   {0.90, 0.8},   {0.95, 0.9},   {1.00, 1},     {1.50, 1.50},
+	}};
+
+	if (const auto upper_it = lookup.upper_bound(brightness); upper_it == lookup.end()) {
+		return lookup.rbegin()->second;
+	} else if (upper_it == lookup.begin()) {
+		return upper_it->second;
+	} else {
+		// Linearly interpolate between the greater and lower points
+		const auto lower_it = std::prev(upper_it);
+		const auto brightness_range = (upper_it->first - lower_it->first);
+		const auto blend_amount = ((brightness - lower_it->first) / brightness_range);
+		return std::lerp(lower_it->second, upper_it->second, blend_amount);
+	}
+
+	return brightness;
+}
 } // namespace
 
 HmdDevice::HmdDevice(const DeviceBuilder &builder) : Device(builder)
@@ -177,6 +221,8 @@ HmdDevice::HmdDevice(const DeviceBuilder &builder) : Device(builder)
 	this->xrt_device::get_view_poses = &device_bouncer<HmdDevice, &HmdDevice::get_view_poses, xrt_result_t>;
 #define SETUP_MEMBER_FUNC(name) this->xrt_device::name = &device_bouncer<HmdDevice, &HmdDevice::name>
 	SETUP_MEMBER_FUNC(compute_distortion);
+	SETUP_MEMBER_FUNC(set_brightness);
+	SETUP_MEMBER_FUNC(get_brightness);
 #undef SETUP_MEMBER_FUNC
 }
 
@@ -207,6 +253,7 @@ Device::Device(const DeviceBuilder &builder) : xrt_device({}), ctx(builder.ctx),
 	this->supported.force_feedback = false;
 	this->supported.form_factor_check = false;
 	this->supported.battery_status = true;
+	this->supported.brightness_control = true;
 
 	this->xrt_device::update_inputs = &device_bouncer<Device, &Device::update_inputs, xrt_result_t>;
 #define SETUP_MEMBER_FUNC(name) this->xrt_device::name = &device_bouncer<Device, &Device::name>
@@ -423,6 +470,27 @@ Device::get_battery_status(bool *out_present, bool *out_charging, float *out_cha
 	*out_present = this->provides_battery_status;
 	*out_charging = this->charging;
 	*out_charge = this->charge;
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+HmdDevice::get_brightness(float *out_brightness)
+{
+	*out_brightness = this->brightness;
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+HmdDevice::set_brightness(float brightness, bool relative)
+{
+	constexpr auto min_brightness = 0.2f;
+	constexpr auto max_brightness = 1.5f;
+
+	const auto target_brightness = relative ? (this->brightness + brightness) : brightness;
+	this->brightness = std::clamp(target_brightness, min_brightness, max_brightness);
+	const auto analog_gain =
+	    std::clamp(brightness_to_analog_gain(this->brightness), analog_gain_range.min, analog_gain_range.max);
+	ctx->settings.SetFloat(vr::k_pch_SteamVR_Section, analog_gain_settings_key, analog_gain);
 	return XRT_SUCCESS;
 }
 
@@ -824,6 +892,18 @@ HmdDevice::handle_property_write(const vr::PropertyWrite_t &prop)
 		float bat = *static_cast<float *>(prop.pvBuffer);
 		this->charge = bat;
 		DEV_DEBUG("Battery: HMD: %f", bat);
+		break;
+	}
+	case vr::Prop_DisplaySupportsAnalogGain_Bool: {
+		this->supported.brightness_control = *static_cast<bool *>(prop.pvBuffer);
+		break;
+	}
+	case vr::Prop_DisplayMinAnalogGain_Float: {
+		this->analog_gain_range.min = *static_cast<float *>(prop.pvBuffer);
+		break;
+	}
+	case vr::Prop_DisplayMaxAnalogGain_Float: {
+		this->analog_gain_range.max = *static_cast<float *>(prop.pvBuffer);
 		break;
 	}
 	default: {

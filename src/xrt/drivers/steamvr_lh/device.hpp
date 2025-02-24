@@ -114,6 +114,12 @@ public:
 		vr::IVRDisplayComponent *display;
 	};
 
+	struct AnalogGainRange
+	{
+		float min{0.1f};
+		float max{1.0f};
+	};
+
 	HmdDevice(const DeviceBuilder &builder);
 
 	xrt_result_t
@@ -144,6 +150,11 @@ public:
 		return ipd;
 	}
 
+	xrt_result_t
+	get_brightness(float *out_brightness);
+	xrt_result_t
+	set_brightness(float brightness, bool relative);
+
 private:
 	std::unique_ptr<Parts> hmd_parts{nullptr};
 
@@ -155,6 +166,8 @@ private:
 
 	std::condition_variable hmd_parts_cv;
 	std::mutex hmd_parts_mut;
+	float brightness{1.0f};
+	AnalogGainRange analog_gain_range{};
 };
 
 class ControllerDevice : public Device
