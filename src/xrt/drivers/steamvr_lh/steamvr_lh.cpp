@@ -125,7 +125,7 @@ Context::create(const std::string &steam_install,
 }
 
 Context::Context(const std::string &steam_install, const std::string &steamvr_install, u_logging_level level)
-    : settings(steam_install, steamvr_install), resources(level, steamvr_install), log_level(level)
+    : settings(steam_install, steamvr_install, this), resources(level, steamvr_install), log_level(level)
 {}
 
 Context::~Context()
