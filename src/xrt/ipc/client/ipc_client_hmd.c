@@ -271,6 +271,40 @@ ipc_client_hmd_destroy(struct xrt_device *xdev)
 	u_device_free(&ich->base);
 }
 
+static xrt_result_t
+ipc_client_hmd_get_brightness(struct xrt_device *xdev, float *out_brightness)
+{
+	ipc_client_hmd_t *ich = ipc_client_hmd(xdev);
+	struct ipc_connection *ipc_c = ich->ipc_c;
+	xrt_result_t xret;
+
+	ipc_client_connection_lock(ipc_c);
+
+	xret = ipc_call_device_get_brightness(ipc_c, ich->device_id, out_brightness);
+	IPC_CHK_ONLY_PRINT(ipc_c, xret, "ipc_call_device_get_brightness");
+
+	ipc_client_connection_unlock(ipc_c);
+
+	return xret;
+}
+
+static xrt_result_t
+ipc_client_hmd_set_brightness(struct xrt_device *xdev, float brightness, bool relative)
+{
+	ipc_client_hmd_t *ich = ipc_client_hmd(xdev);
+	struct ipc_connection *ipc_c = ich->ipc_c;
+	xrt_result_t xret;
+
+	ipc_client_connection_lock(ipc_c);
+
+	xret = ipc_call_device_set_brightness(ipc_c, ich->device_id, brightness, relative);
+	IPC_CHK_ONLY_PRINT(ipc_c, xret, "ipc_call_device_set_brightness");
+
+	ipc_client_connection_unlock(ipc_c);
+
+	return xret;
+}
+
 /*!
  * @public @memberof ipc_client_hmd
  */
@@ -293,6 +327,8 @@ ipc_client_hmd_create(struct ipc_connection *ipc_c, struct xrt_tracking_origin *
 	ich->base.is_form_factor_available = ipc_client_hmd_is_form_factor_available;
 	ich->base.get_visibility_mask = ipc_client_hmd_get_visibility_mask;
 	ich->base.destroy = ipc_client_hmd_destroy;
+	ich->base.get_brightness = ipc_client_hmd_get_brightness;
+	ich->base.set_brightness = ipc_client_hmd_set_brightness;
 
 	// Setup blend-modes.
 	ich->base.hmd->blend_mode_count = ipc_c->ism->hmd.blend_mode_count;

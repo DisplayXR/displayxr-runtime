@@ -17,6 +17,8 @@
 
 #include "server/ipc_server.h"
 #include "ipc_server_generated.h"
+#include "xrt/xrt_device.h"
+#include "xrt/xrt_results.h"
 
 #ifdef XRT_GRAPHICS_SYNC_HANDLE_IS_FD
 #include <unistd.h>
@@ -2510,4 +2512,38 @@ ipc_handle_device_get_battery_status(
 {
 	struct xrt_device *xdev = get_xdev(ics, id);
 	return xrt_device_get_battery_status(xdev, out_present, out_charging, out_charge);
+}
+
+xrt_result_t
+ipc_handle_device_get_brightness(volatile struct ipc_client_state *ics, uint32_t id, float *out_brightness)
+{
+	struct xrt_device *xdev = NULL;
+	xrt_result_t xret = validate_device_id(ics, id, &xdev);
+	if (xret != XRT_SUCCESS) {
+		U_LOG_E("Invalid device_id!");
+		return xret;
+	}
+
+	if (!xdev->supported.brightness_control) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+
+	return xrt_device_get_brightness(xdev, out_brightness);
+}
+
+xrt_result_t
+ipc_handle_device_set_brightness(volatile struct ipc_client_state *ics, uint32_t id, float brightness, bool relative)
+{
+	struct xrt_device *xdev = NULL;
+	xrt_result_t xret = validate_device_id(ics, id, &xdev);
+	if (xret != XRT_SUCCESS) {
+		U_LOG_E("Invalid device_id!");
+		return xret;
+	}
+
+	if (!xdev->supported.brightness_control) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+
+	return xrt_device_set_brightness(xdev, brightness, relative);
 }

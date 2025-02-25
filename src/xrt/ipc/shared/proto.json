@@ -606,6 +606,22 @@
 			{"name": "charging", "type": "bool"},
 			{"name": "charge", "type": "float"}
 		]
-	}
+	},
 
+	"device_get_brightness": {
+		"in": [
+			{"name": "id", "type": "uint32_t"}
+		],
+		"out": [
+			{"name": "brightness", "type": "float"}
+		]
+	},
+
+	"device_set_brightness": {
+		"in": [
+			{"name": "id", "type": "uint32_t"},
+			{"name": "brightness", "type": "float"},
+			{"name": "relative", "type": "bool"}
+		]
+	}
 }
