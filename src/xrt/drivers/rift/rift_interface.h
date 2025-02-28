@@ -38,6 +38,7 @@ enum rift_feature_reports
 	FEATURE_REPORT_DK1_KEEP_ALIVE = 8, // get + set
 	FEATURE_REPORT_DISPLAY_INFO = 9,   // get + set
 	FEATURE_REPORT_SERIAL = 10,        // get + set
+
 	// DK2
 	FEATURE_REPORT_TRACKING = 12,        // get + set
 	FEATURE_REPORT_DISPLAY = 13,         // get + set
@@ -80,6 +81,25 @@ enum rift_distortion_type
 	RIFT_DISTORTION_TYPE_K = 2,
 };
 
+enum rift_lens_type
+{
+	// firmware indirectly states lens type A is 0
+	RIFT_LENS_TYPE_A = 0,
+	// firmware does not state what lens type B is, 1 is an educated guess
+	RIFT_LENS_TYPE_B = 1,
+};
+
+#define CATMULL_COEFFICIENTS 11
+#define CHROMATIC_ABBERATION_COEFFEICENT_COUNT 4
+
+enum rift_lens_distortion_version
+{
+	// no distortion data is stored
+	RIFT_LENS_DISTORTION_NONE = 0,
+	// standard distortion matrix
+	RIFT_LENS_DISTORTION_LCSV_CATMULL_ROM_10_VERSION_1 = 1,
+};
+
 /*
  *
  * Packed structs for USB communication (borrowed from Rokid driver)
@@ -101,7 +121,8 @@ struct rift_config_report
 	uint16_t command_id;
 	uint8_t config_flags;
 	uint8_t interval;
-	uint16_t sample_rate; // always 1000hz on DK1/DK2
+	// sample rate of the IMU, always 1000hz on DK1/DK2, read-only
+	uint16_t sample_rate;
 } RIFT_PACKED;
 
 struct rift_display_info_report
@@ -125,6 +146,37 @@ struct rift_display_info_report
 	float distortion[6];
 } RIFT_PACKED;
 
+struct rift_catmull_rom_distortion_report_data
+{
+	// eye relief setting, in micrometers from front surface of lens
+	uint16_t eye_relief;
+	// the k coeffecients of the distortion
+	uint16_t k[CATMULL_COEFFICIENTS];
+	uint16_t max_r;
+	uint16_t meters_per_tan_angle_at_center;
+	uint16_t chromatic_abberation[CHROMATIC_ABBERATION_COEFFEICENT_COUNT];
+	uint8_t unused[14];
+} RIFT_PACKED;
+
+struct rift_lens_distortion_report
+{
+	uint16_t command_id;
+	// the amount of distortions on this device
+	uint8_t num_distortions;
+	// the index of this distortion in the devices array
+	uint8_t distortion_idx;
+	// unused bitmask field
+	uint8_t bitmask;
+	// the type of the lenses
+	uint16_t lens_type;
+	// the version of the lens distortion data
+	uint16_t distortion_version;
+
+	union {
+		struct rift_catmull_rom_distortion_report_data lcsv_catmull_rom_10;
+	} RIFT_PACKED data;
+} RIFT_PACKED;
+
 #define IN_REPORT_DK2 11
 struct dk2_report_keepalive_mux
 {
@@ -136,6 +188,25 @@ struct dk2_report_keepalive_mux
 #if defined(_MSC_VER)
 #pragma pack(pop)
 #endif
+
+struct rift_catmull_rom_distortion_data
+{
+	// the k coeffecients of the distortion
+	float k[CATMULL_COEFFICIENTS];
+	float max_r;
+	float meters_per_tan_angle_at_center;
+	float chromatic_abberation[CHROMATIC_ABBERATION_COEFFEICENT_COUNT];
+};
+
+struct rift_lens_distortion
+{
+	// the version of the lens distortion data
+	uint16_t distortion_version;
+
+	union {
+		struct rift_catmull_rom_distortion_data lcsv_catmull_rom_10;
+	} RIFT_PACKED data;
+};
 
 enum rift_variant
 {
@@ -183,6 +254,9 @@ struct rift_hmd
 	enum rift_variant variant;
 	struct rift_config_report config;
 	struct rift_display_info_report display_info;
+
+	struct rift_lens_distortion *lens_distortions;
+	uint16_t num_lens_distortions;
 };
 
 struct rift_hmd *
