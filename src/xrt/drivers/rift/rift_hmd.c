@@ -30,6 +30,7 @@
 #include "util/u_time.h"
 #include "util/u_var.h"
 #include "util/u_visibility_mask.h"
+#include "util/u_trace_marker.h"
 #include "xrt/xrt_results.h"
 
 #include <stdio.h>
@@ -53,6 +54,7 @@ DEBUG_GET_ONCE_LOG_OPTION(rift_log, "RIFT_LOG", U_LOGGING_WARN)
 #define HMD_TRACE(hmd, ...) U_LOG_XDEV_IFL_T(&hmd->base, hmd->log_level, __VA_ARGS__)
 #define HMD_DEBUG(hmd, ...) U_LOG_XDEV_IFL_D(&hmd->base, hmd->log_level, __VA_ARGS__)
 #define HMD_INFO(hmd, ...) U_LOG_XDEV_IFL_I(&hmd->base, hmd->log_level, __VA_ARGS__)
+#define HMD_WARN(hmd, ...) U_LOG_XDEV_IFL_W(&hmd->base, hmd->log_level, __VA_ARGS__)
 #define HMD_ERROR(hmd, ...) U_LOG_XDEV_IFL_E(&hmd->base, hmd->log_level, __VA_ARGS__)
 
 /*
@@ -64,26 +66,17 @@ DEBUG_GET_ONCE_LOG_OPTION(rift_log, "RIFT_LOG", U_LOGGING_WARN)
 static int
 rift_send_report(struct rift_hmd *hmd, uint8_t report_id, void *data, size_t data_length)
 {
-#define REPORT_WRITE_DATA(ptr, ptr_len)                                                                                \
-	if (ptr_len > sizeof(buffer) - length) {                                                                       \
-		HMD_ERROR(hmd, "Tried to fit %ld bytes into buffer with only %ld bytes left", ptr_len,                 \
-		          sizeof(buffer) - length);                                                                    \
-		return -1;                                                                                             \
-	}                                                                                                              \
-	memcpy(buffer + length, ptr, ptr_len);                                                                         \
-	length += ptr_len;
-
-#define REPORT_WRITE_VALUE(value) REPORT_WRITE_DATA(&value, sizeof(value));
-
 	int result;
 
+	if (data_length > REPORT_MAX_SIZE - 1) {
+		return -1;
+	}
+
 	uint8_t buffer[REPORT_MAX_SIZE];
-	size_t length = 0;
+	buffer[0] = report_id;
+	memcpy(buffer + 1, data, data_length);
 
-	REPORT_WRITE_VALUE(report_id)
-	REPORT_WRITE_DATA(data, data_length)
-
-	result = os_hid_set_feature(hmd->hid_dev, buffer, length);
+	result = os_hid_set_feature(hmd->hid_dev, buffer, data_length + 1);
 	if (result < 0) {
 		return result;
 	}
@@ -100,16 +93,18 @@ rift_get_report(struct rift_hmd *hmd, uint8_t report_id, uint8_t *out, size_t ou
 static int
 rift_send_keepalive(struct rift_hmd *hmd)
 {
-	struct dk2_report_keepalive_mux report = {0, IN_REPORT_DK2, 10000};
+	struct dk2_report_keepalive_mux report = {0, IN_REPORT_DK2,
+	                                          KEEPALIVE_INTERVAL_NS / 1000000}; // convert ns to ms
 
 	int result =
-	    rift_send_report(hmd, FEATURE_REPORT_KEEPALIVE_MUX, &report, sizeof(struct dk2_report_keepalive_mux));
+	    rift_send_report(hmd, FEATURE_REPORT_KEEPALIVE_MUX, &report, sizeof(report));
 
 	if (result < 0) {
 		return result;
 	}
 
 	hmd->last_keepalive_time = os_monotonic_get_ns();
+	HMD_TRACE(hmd, "Sent keepalive at time %ld", hmd->last_keepalive_time);
 
 	return 0;
 }
@@ -128,9 +123,10 @@ rift_get_config(struct rift_hmd *hmd, struct rift_config_report *config)
 	memcpy(config, buf + 1, sizeof(*config));
 
 	// this value is hardcoded in the DK1 and DK2 firmware
-	if ((hmd->variant == RIFT_VARIANT_DK1 || hmd->variant == RIFT_VARIANT_DK2) && config->sample_rate != 1000) {
+	if ((hmd->variant == RIFT_VARIANT_DK1 || hmd->variant == RIFT_VARIANT_DK2) &&
+	    config->sample_rate != IMU_SAMPLE_RATE) {
 		HMD_ERROR(hmd, "Got invalid config from headset, got sample rate %d when expected %d",
-		          config->sample_rate, 1000);
+		          config->sample_rate, IMU_SAMPLE_RATE);
 		return -1;
 	}
 
@@ -171,7 +167,7 @@ rift_get_lens_distortion(struct rift_hmd *hmd, struct rift_lens_distortion_repor
 static int
 rift_set_config(struct rift_hmd *hmd, struct rift_config_report *config)
 {
-	return rift_send_report(hmd, FEATURE_REPORT_CONFIG, &config, sizeof(*config));
+	return rift_send_report(hmd, FEATURE_REPORT_CONFIG, config, sizeof(*config));
 }
 
 /*
@@ -187,6 +183,9 @@ rift_hmd_destroy(struct xrt_device *xdev)
 
 	// Remove the variable tracking.
 	u_var_remove_root(hmd);
+
+	if (hmd->sensor_thread.initialized)
+		os_thread_helper_stop_and_wait(&hmd->sensor_thread);
 
 	m_relation_history_destroy(&hmd->relation_hist);
 
@@ -422,6 +421,136 @@ rift_parse_distortion_report(struct rift_lens_distortion_report *report, struct 
 	}
 }
 
+/*
+ * Decode 3 tightly packed 21 bit values from 4 bytes.
+ * We unpack them in the higher 21 bit values first and then shift
+ * them down to the lower in order to get the sign bits correct.
+ *
+ * "Inspired" (code copied verbatim) from OpenHMD's rift driver
+ */
+static void
+rift_decode_sample(const uint8_t *in, int32_t *out)
+{
+	int x = (in[0] << 24) | (in[1] << 16) | ((in[2] & 0xF8) << 8);
+	int y = ((in[2] & 0x07) << 29) | (in[3] << 21) | (in[4] << 13) | ((in[5] & 0xC0) << 5);
+	int z = ((in[5] & 0x3F) << 26) | (in[6] << 18) | (in[7] << 10);
+
+	out[0] = x >> 11;
+	out[1] = y >> 11;
+	out[2] = z >> 11;
+}
+
+static void
+rift_sample_to_imu_space(const int32_t *in, struct xrt_vec3 *out)
+{
+	out->x = (float)in[0] * 0.0001f;
+	out->y = (float)in[1] * 0.0001f;
+	out->z = (float)in[2] * 0.0001f;
+}
+
+static int
+sensor_thread_tick(struct rift_hmd *hmd)
+{
+	uint8_t buf[REPORT_MAX_SIZE];
+	int result;
+
+	int64_t now = os_monotonic_get_ns();
+
+	if (now - hmd->last_keepalive_time > KEEPALIVE_SEND_RATE_NS) {
+		result = rift_send_keepalive(hmd);
+
+		if (result < 0) {
+			HMD_ERROR(hmd, "Got error sending keepalive, assuming fatal, reason %d", result);
+			return result;
+		}
+	}
+
+	result = os_hid_read(hmd->hid_dev, buf, sizeof(buf), IMU_SAMPLE_RATE);
+
+	if (result < 0) {
+		HMD_ERROR(hmd, "Got error reading from device, assuming fatal, reason %d", result);
+		return result;
+	}
+
+	if (result == 0) {
+		HMD_WARN(hmd, "Timed out waiting for packet from headset, packet should come in every %d milliseconds",
+		         IMU_SAMPLE_RATE);
+		return 0;
+	}
+
+	switch (hmd->variant) {
+	case RIFT_VARIANT_DK2: {
+		// skip unknown commands
+		if (buf[0] != IN_REPORT_DK2) {
+			HMD_WARN(hmd, "Skipping unknown IN command %d", buf[0]);
+			return 0;
+		}
+
+		struct dk2_in_report report;
+		assert(result >= (int)sizeof(report));
+
+		memcpy(&report, buf + 1, sizeof(report));
+
+		// if there's no samples, just do nothing.
+		if (report.num_samples == 0) {
+			return 0;
+		}
+
+		struct dk2_sample_pack sample_pack = report.samples[report.num_samples >= 2 ? 1 : 0];
+
+		int32_t accel_raw[3], gyro_raw[3];
+		rift_decode_sample(sample_pack.accel.data, accel_raw);
+		rift_decode_sample(sample_pack.gyro.data, gyro_raw);
+
+		struct xrt_vec3 accel, gyro;
+		rift_sample_to_imu_space(accel_raw, &accel);
+		rift_sample_to_imu_space(gyro_raw, &gyro);
+
+		uint64_t sample_timestamp_ns = (uint64_t)report.sample_timestamp * 1000;
+
+		HMD_INFO(hmd, "sample timestamp: %ld", sample_timestamp_ns);
+		m_imu_3dof_update(&hmd->fusion, sample_timestamp_ns, &accel, &gyro);
+
+		struct xrt_space_relation relation = XRT_SPACE_RELATION_ZERO;
+		relation.relation_flags = (enum xrt_space_relation_flags)(XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT |
+		                                                          XRT_SPACE_RELATION_ORIENTATION_VALID_BIT);
+		relation.pose.orientation = hmd->fusion.rot;
+		m_relation_history_push(hmd->relation_hist, &relation, os_monotonic_get_ns());
+
+		break;
+	}
+	case RIFT_VARIANT_DK1: return 0;
+	}
+
+	return 0;
+}
+
+static void *
+sensor_thread(void *ptr)
+{
+	U_TRACE_SET_THREAD_NAME("Rift sensor thread");
+
+	struct rift_hmd *hmd = (struct rift_hmd *)ptr;
+
+	os_thread_helper_lock(&hmd->sensor_thread);
+
+	int result = 0;
+	int ticks = 0;
+
+	while (os_thread_helper_is_running_locked(&hmd->sensor_thread) && result >= 0) {
+		os_thread_helper_unlock(&hmd->sensor_thread);
+
+		result = sensor_thread_tick(hmd);
+
+		os_thread_helper_lock(&hmd->sensor_thread);
+		ticks += 1;
+	}
+
+	os_thread_helper_unlock(&hmd->sensor_thread);
+
+	return NULL;
+}
+
 struct rift_hmd *
 rift_hmd_create(struct os_hid_device *dev, enum rift_variant variant, char *device_name, char *serial_number)
 {
@@ -439,26 +568,23 @@ rift_hmd_create(struct os_hid_device *dev, enum rift_variant variant, char *devi
 	result = rift_send_keepalive(hmd);
 	if (result < 0) {
 		HMD_ERROR(hmd, "Failed to send keepalive to spin up headset, reason %d", result);
-		u_device_free(&hmd->base);
-		return NULL;
+		goto error;
 	}
-
-	result = rift_get_config(hmd, &hmd->config);
-	if (result < 0) {
-		HMD_ERROR(hmd, "Failed to get device config, reason %d", result);
-		u_device_free(&hmd->base);
-		return NULL;
-	}
-	HMD_INFO(hmd, "Got config from hmd, config flags: %X", hmd->config.config_flags);
 
 	result = rift_get_display_info(hmd, &hmd->display_info);
 	if (result < 0) {
 		HMD_ERROR(hmd, "Failed to get device config, reason %d", result);
-		u_device_free(&hmd->base);
-		return NULL;
+		goto error;
 	}
 	HMD_INFO(hmd, "Got display info from hmd, res: %dx%d", hmd->display_info.resolution_x,
 	         hmd->display_info.resolution_y);
+
+	result = rift_get_config(hmd, &hmd->config);
+	if (result < 0) {
+		HMD_ERROR(hmd, "Failed to get device config, reason %d", result);
+		goto error;
+	}
+	HMD_INFO(hmd, "Got config from hmd, config flags: %X", hmd->config.config_flags);
 
 	if (getenv("RIFT_POWER_OVERRIDE") != NULL) {
 		hmd->config.config_flags |= RIFT_CONFIG_REPORT_OVERRIDE_POWER;
@@ -471,21 +597,29 @@ rift_hmd_create(struct os_hid_device *dev, enum rift_variant variant, char *devi
 	hmd->config.config_flags |= RIFT_CONFIG_REPORT_USE_CALIBRATION;
 	hmd->config.config_flags |= RIFT_CONFIG_REPORT_AUTO_CALIBRATION;
 
+	hmd->config.interval = 0;
+
 	// update the config
 	result = rift_set_config(hmd, &hmd->config);
 	if (result < 0) {
 		HMD_ERROR(hmd, "Failed to set the device config, reason %d", result);
-		u_device_free(&hmd->base);
-		return NULL;
+		goto error;
 	}
+
+	// read it back
+	result = rift_get_config(hmd, &hmd->config);
+	if (result < 0) {
+		HMD_ERROR(hmd, "Failed to set the device config, reason %d", result);
+		goto error;
+	}
+	HMD_INFO(hmd, "After writing, HMD has config flags: %X", hmd->config.config_flags);
 
 	// get the lens distortions
 	struct rift_lens_distortion_report lens_distortion;
 	result = rift_get_lens_distortion(hmd, &lens_distortion);
 	if (result < 0) {
 		HMD_ERROR(hmd, "Failed to get lens distortion, reason %d", result);
-		u_device_free(&hmd->base);
-		return NULL;
+		goto error;
 	}
 
 	hmd->num_lens_distortions = lens_distortion.num_distortions;
@@ -498,8 +632,7 @@ rift_hmd_create(struct os_hid_device *dev, enum rift_variant variant, char *devi
 		result = rift_get_lens_distortion(hmd, &lens_distortion);
 		if (result < 0) {
 			HMD_ERROR(hmd, "Failed to get lens distortion idx %d, reason %d", i, result);
-			u_device_free(&hmd->base);
-			return NULL;
+			goto error;
 		}
 
 		rift_parse_distortion_report(&lens_distortion, &hmd->lens_distortions[lens_distortion.distortion_idx]);
@@ -516,10 +649,6 @@ rift_hmd_create(struct os_hid_device *dev, enum rift_variant variant, char *devi
 	hmd->base.get_visibility_mask = rift_hmd_get_visibility_mask;
 	hmd->base.destroy = rift_hmd_destroy;
 
-	// Distortion information, fills in xdev->compute_distortion().
-	// u_distortion_mesh_set_none(&hmd->base);
-
-	// populate this with something more complex if required
 	hmd->base.compute_distortion = rift_hmd_compute_distortion;
 
 	hmd->pose = (struct xrt_pose)XRT_POSE_IDENTITY;
@@ -560,8 +689,7 @@ rift_hmd_create(struct os_hid_device *dev, enum rift_variant variant, char *devi
 
 	if (!u_device_setup_split_side_by_side(&hmd->base, &info)) {
 		HMD_ERROR(hmd, "Failed to setup basic device info");
-		rift_hmd_destroy(&hmd->base);
-		return NULL;
+		goto error;
 	}
 
 	// Just put an initial identity value in the tracker
@@ -571,9 +699,28 @@ rift_hmd_create(struct os_hid_device *dev, enum rift_variant variant, char *devi
 	uint64_t now = os_monotonic_get_ns();
 	m_relation_history_push(hmd->relation_hist, &identity, now);
 
+	result = os_thread_helper_init(&hmd->sensor_thread);
+
+	if (result < 0) {
+		HMD_ERROR(hmd, "Failed to init os thread helper");
+		goto error;
+	}
+
+	m_imu_3dof_init(&hmd->fusion, 0);
+
+	result = os_thread_helper_start(&hmd->sensor_thread, sensor_thread, hmd);
+
+	if (result < 0) {
+		HMD_ERROR(hmd, "Failed to start sensor thread");
+		goto error;
+	}
+
 	// Setup variable tracker: Optional but useful for debugging
 	u_var_add_root(hmd, "Rift HMD", true);
 	u_var_add_log_level(hmd, &hmd->log_level, "log_level");
 
 	return hmd;
+error:
+	rift_hmd_destroy(&hmd->base);
+	return NULL;
 }

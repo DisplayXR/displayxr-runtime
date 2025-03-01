@@ -14,9 +14,12 @@
 #include "xrt/xrt_prober.h"
 
 #include "os/os_hid.h"
+#include "os/os_threading.h"
 
 #include "util/u_device.h"
 #include "util/u_logging.h"
+
+#include "math/m_imu_3dof.h"
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -26,6 +29,9 @@ extern "C" {
 #endif
 
 #define REPORT_MAX_SIZE 69 // max size of a feature report (FEATURE_REPORT_CALIBRATE)
+#define KEEPALIVE_INTERVAL_NS 10000000000 // 10 seconds
+#define KEEPALIVE_SEND_RATE_NS (KEEPALIVE_INTERVAL_NS * 19) / 20 // give a 5% breathing room (at 10 seconds, this is 500 milliseconds of breathing room)
+#define IMU_SAMPLE_RATE 1000
 
 enum rift_feature_reports
 {
@@ -120,6 +126,7 @@ struct rift_config_report
 {
 	uint16_t command_id;
 	uint8_t config_flags;
+	// the IN report rate of the headset, rate is calculated as `sample_rate / (1 + interval)`
 	uint8_t interval;
 	// sample rate of the IMU, always 1000hz on DK1/DK2, read-only
 	uint16_t sample_rate;
@@ -183,6 +190,36 @@ struct dk2_report_keepalive_mux
 	uint16_t command;
 	uint8_t in_report;
 	uint16_t interval;
+} RIFT_PACKED;
+
+struct dk2_sensor_sample
+{
+	uint8_t data[8];
+} RIFT_PACKED;
+
+struct dk2_sample_pack
+{
+	struct dk2_sensor_sample accel;
+	struct dk2_sensor_sample gyro;
+} RIFT_PACKED;
+
+struct dk2_in_report
+{
+	uint16_t command_id;
+	uint8_t num_samples;
+	uint16_t sample_count;
+	uint16_t temperature;
+	uint32_t sample_timestamp;
+	struct dk2_sample_pack samples[2];
+	int16_t mag_x;
+	int16_t mag_y;
+	int16_t mag_z;
+	uint16_t frame_count;
+	uint32_t frame_timestamp;
+	uint8_t frame_id;
+	uint8_t tracking_pattern;
+	uint16_t tracking_count;
+	uint32_t tracking_timestamp;
 } RIFT_PACKED;
 
 #if defined(_MSC_VER)
@@ -249,6 +286,8 @@ struct rift_hmd
 	struct m_relation_history *relation_hist;
 
 	struct os_hid_device *hid_dev;
+	struct os_thread_helper sensor_thread;
+	struct m_imu_3dof fusion;
 
 	int64_t last_keepalive_time;
 	enum rift_variant variant;
