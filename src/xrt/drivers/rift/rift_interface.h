@@ -20,6 +20,8 @@
 #include "util/u_logging.h"
 
 #include "math/m_imu_3dof.h"
+#include "math/m_api.h"
+#include "math/m_mathinclude.h"
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -28,10 +30,18 @@
 extern "C" {
 #endif
 
-#define REPORT_MAX_SIZE 69 // max size of a feature report (FEATURE_REPORT_CALIBRATE)
+#define REPORT_MAX_SIZE 69                // max size of a feature report (FEATURE_REPORT_CALIBRATE)
 #define KEEPALIVE_INTERVAL_NS 10000000000 // 10 seconds
-#define KEEPALIVE_SEND_RATE_NS (KEEPALIVE_INTERVAL_NS * 19) / 20 // give a 5% breathing room (at 10 seconds, this is 500 milliseconds of breathing room)
+#define KEEPALIVE_SEND_RATE_NS                                                                                         \
+	(KEEPALIVE_INTERVAL_NS * 19) /                                                                                 \
+	    20 // give a 5% breathing room (at 10 seconds, this is 500 milliseconds of breathing room)
 #define IMU_SAMPLE_RATE 1000
+
+#define DEG_TO_RAD(DEG) (DEG * M_PI / 180.0)
+#define MICROMETERS_TO_METERS(microns) (float)microns / 1000000.0f
+
+// value taken from LibOVR 0.4.4
+#define DEFAULT_EXTRA_EYE_ROTATION DEG_TO_RAD(30.0f)
 
 enum rift_feature_reports
 {
@@ -148,8 +158,7 @@ struct rift_display_info_report
 	uint32_t center_v;
 	// the separation between the two lenses, in micrometers
 	uint32_t lens_separation;
-	uint32_t lens_distance_l;
-	uint32_t lens_distance_r;
+	uint32_t lens_distance[2];
 	float distortion[6];
 } RIFT_PACKED;
 
@@ -239,10 +248,42 @@ struct rift_lens_distortion
 {
 	// the version of the lens distortion data
 	uint16_t distortion_version;
+	// eye relief setting, in meters from surface of lens
+	float eye_relief;
 
 	union {
 		struct rift_catmull_rom_distortion_data lcsv_catmull_rom_10;
 	} RIFT_PACKED data;
+};
+
+struct rift_scale_and_offset
+{
+	struct xrt_vec2 scale;
+	struct xrt_vec2 offset;
+};
+
+struct rift_viewport_fov_tan
+{
+	float up_tan;
+	float down_tan;
+	float left_tan;
+	float right_tan;
+};
+
+struct rift_extra_display_info
+{
+	// gap left between the two eyes
+	float screen_gap_meters;
+	// the diameter of the lenses, may need to be extended to an array
+	float lens_diameter_meters;
+	// ipd of the headset
+	float icd;
+
+	// the fov of the headset
+	struct rift_viewport_fov_tan fov;
+	// mapping from tan-angle space to target NDC space
+	struct rift_scale_and_offset eye_to_source_ndc;
+	struct rift_scale_and_offset eye_to_source_uv;
 };
 
 enum rift_variant
@@ -296,7 +337,17 @@ struct rift_hmd
 
 	struct rift_lens_distortion *lens_distortions;
 	uint16_t num_lens_distortions;
+	uint16_t distortion_in_use;
+
+	struct rift_extra_display_info extra_display_info;
 };
+
+/// Casting helper function
+static inline struct rift_hmd *
+rift_hmd(struct xrt_device *xdev)
+{
+	return (struct rift_hmd *)xdev;
+}
 
 struct rift_hmd *
 rift_hmd_create(struct os_hid_device *dev, enum rift_variant variant, char *device_name, char *serial_number);

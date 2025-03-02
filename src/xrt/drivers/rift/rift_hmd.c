@@ -16,10 +16,13 @@
 #include "os/os_time.h"
 #include "xrt/xrt_defines.h"
 #include "xrt/xrt_device.h"
+
 #include "rift_interface.h"
+#include "rift_distortion.h"
 
 #include "math/m_relation_history.h"
 #include "math/m_api.h"
+#include "math/m_vec2.h"
 #include "math/m_mathinclude.h" // IWYU pragma: keep
 
 #include "util/u_debug.h"
@@ -41,13 +44,6 @@
  * Structs and defines.
  *
  */
-
-/// Casting helper function
-static inline struct rift_hmd *
-rift_hmd(struct xrt_device *xdev)
-{
-	return (struct rift_hmd *)xdev;
-}
 
 DEBUG_GET_ONCE_LOG_OPTION(rift_log, "RIFT_LOG", U_LOGGING_WARN)
 
@@ -96,8 +92,7 @@ rift_send_keepalive(struct rift_hmd *hmd)
 	struct dk2_report_keepalive_mux report = {0, IN_REPORT_DK2,
 	                                          KEEPALIVE_INTERVAL_NS / 1000000}; // convert ns to ms
 
-	int result =
-	    rift_send_report(hmd, FEATURE_REPORT_KEEPALIVE_MUX, &report, sizeof(report));
+	int result = rift_send_report(hmd, FEATURE_REPORT_KEEPALIVE_MUX, &report, sizeof(report));
 
 	if (result < 0) {
 		return result;
@@ -236,18 +231,15 @@ rift_hmd_get_view_poses(struct xrt_device *xdev,
                         struct xrt_fov *out_fovs,
                         struct xrt_pose *out_poses)
 {
-	/*
-	 * For HMDs you can call this function or directly set
-	 * the `get_view_poses` function on the device to it.
-	 */
-	return u_device_get_view_poses(  //
-	    xdev,                 //
-	    default_eye_relation, //
-	    at_timestamp_ns,      //
-	    view_count,           //
-	    out_head_relation,    //
-	    out_fovs,             //
-	    out_poses);           //
+	struct rift_hmd *hmd = rift_hmd(xdev);
+
+	return u_device_get_view_poses(xdev,                                                        //
+	                               &(struct xrt_vec3){hmd->extra_display_info.icd, 0.0f, 0.0f}, //
+	                               at_timestamp_ns,                                             //
+	                               view_count,                                                  //
+	                               out_head_relation,                                           //
+	                               out_fovs,                                                    //
+	                               out_poses);
 }
 
 static xrt_result_t
@@ -259,129 +251,6 @@ rift_hmd_get_visibility_mask(struct xrt_device *xdev,
 	struct xrt_fov fov = xdev->hmd->distortion.fov[view_index];
 	u_visibility_mask_get_default(type, &fov, out_mask);
 	return XRT_SUCCESS;
-}
-
-static float
-rift_catmull_rom_spline(struct rift_catmull_rom_distortion_data *catmull, float scaled_value)
-{
-	float scaled_value_floor = floorf(scaled_value);
-	scaled_value_floor = CLAMP(scaled_value_floor, 0, CATMULL_COEFFICIENTS - 1);
-
-	float t = scaled_value - scaled_value_floor;
-	int k = (int)scaled_value_floor;
-
-	float p0, p1, m0, m1;
-	switch (k) {
-	case 0:
-		p0 = 1.0f;
-		m0 = (catmull->k[1] - catmull->k[0]);
-		p1 = catmull->k[1];
-		m1 = 0.5f * (catmull->k[2] - catmull->k[0]);
-		break;
-	default:
-		p0 = catmull->k[k];
-		m0 = 0.5f * (catmull->k[k + 1] - catmull->k[k - 1]);
-		p1 = catmull->k[k + 1];
-		m1 = 0.5f * (catmull->k[k + 2] - catmull->k[k]);
-		break;
-	case CATMULL_COEFFICIENTS - 2:
-		p0 = catmull->k[CATMULL_COEFFICIENTS - 2];
-		m0 = 0.5f * (catmull->k[CATMULL_COEFFICIENTS - 1] - catmull->k[CATMULL_COEFFICIENTS - 2]);
-		p1 = catmull->k[CATMULL_COEFFICIENTS - 1];
-		m1 = catmull->k[CATMULL_COEFFICIENTS - 1] - catmull->k[CATMULL_COEFFICIENTS - 2];
-		break;
-	case CATMULL_COEFFICIENTS - 1:
-		p0 = catmull->k[CATMULL_COEFFICIENTS - 1];
-		m0 = catmull->k[CATMULL_COEFFICIENTS - 1] - catmull->k[CATMULL_COEFFICIENTS - 2];
-		p1 = p0 + m0;
-		m1 = m0;
-		break;
-	}
-
-	float omt = 1.0f - t;
-
-	float res = (p0 * (1.0f + 2.0f * t) + m0 * t) * omt * omt + (p1 * (1.0f + 2.0f * omt) - m1 * omt) * t * t;
-
-	return res;
-}
-
-static float
-rift_distortion_distance_squared(struct rift_lens_distortion *lens_distortion, float distance_squared)
-{
-	float scale = 1.0f;
-
-	switch (lens_distortion->distortion_version) {
-	case RIFT_LENS_DISTORTION_LCSV_CATMULL_ROM_10_VERSION_1: {
-		struct rift_catmull_rom_distortion_data data = lens_distortion->data.lcsv_catmull_rom_10;
-
-		float scaled_distance_squared =
-		    (float)(CATMULL_COEFFICIENTS - 1) * distance_squared / (data.max_r * data.max_r);
-
-		return rift_catmull_rom_spline(&data, scaled_distance_squared);
-	}
-	default: return scale;
-	}
-}
-
-static struct xrt_vec3
-rift_distortion_distance_squared_split_chroma(struct rift_lens_distortion *lens_distortion, float distance_squared)
-{
-	float scale = rift_distortion_distance_squared(lens_distortion, distance_squared);
-
-	struct xrt_vec3 scale_split;
-	scale_split.x = scale;
-	scale_split.y = scale;
-	scale_split.z = scale;
-
-	switch (lens_distortion->distortion_version) {
-	case RIFT_LENS_DISTORTION_LCSV_CATMULL_ROM_10_VERSION_1: {
-		struct rift_catmull_rom_distortion_data data = lens_distortion->data.lcsv_catmull_rom_10;
-
-		scale_split.x *= 1.0f + data.chromatic_abberation[0] + distance_squared * data.chromatic_abberation[1];
-		scale_split.z *= 1.0f + data.chromatic_abberation[2] + distance_squared * data.chromatic_abberation[3];
-		break;
-	}
-	}
-
-	return scale_split;
-}
-
-static bool
-rift_hmd_compute_distortion(struct xrt_device *dev, uint32_t view, float u, float v, struct xrt_uv_triplet *out_result)
-{
-#define ZERO_ONE_TO_N_ONE_ONE(x) ((x * 2) - 1)
-#define N_ONE_ONE_TO_ZERO_ONE(x) ((x + 1) / 2)
-
-	struct rift_hmd *hmd = rift_hmd(dev);
-
-	struct rift_lens_distortion *distortion = &hmd->lens_distortions[0];
-
-	float display_width_meters = (float)hmd->display_info.display_width / 1000000.0f;
-	float display_height_meters = (float)hmd->display_info.display_height / 1000000.0f;
-
-	float tan_eye_angle_scale_x =
-	    display_width_meters / distortion->data.lcsv_catmull_rom_10.meters_per_tan_angle_at_center * 0.25f;
-	float tan_eye_angle_scale_y =
-	    display_height_meters / distortion->data.lcsv_catmull_rom_10.meters_per_tan_angle_at_center * 0.5f;
-
-	u = ZERO_ONE_TO_N_ONE_ONE(u) * tan_eye_angle_scale_x;
-	v = ZERO_ONE_TO_N_ONE_ONE(v) * tan_eye_angle_scale_y;
-
-	float distance_squared = fabsf(u * u + v * v);
-
-	struct xrt_vec3 chroma_distortions =
-	    rift_distortion_distance_squared_split_chroma(distortion, distance_squared);
-
-	out_result->r = (struct xrt_vec2){N_ONE_ONE_TO_ZERO_ONE(u * chroma_distortions.x),
-	                                  N_ONE_ONE_TO_ZERO_ONE(v * chroma_distortions.x)};
-	out_result->g = (struct xrt_vec2){N_ONE_ONE_TO_ZERO_ONE(u * chroma_distortions.y),
-	                                  N_ONE_ONE_TO_ZERO_ONE(v * chroma_distortions.y)};
-	out_result->b = (struct xrt_vec2){N_ONE_ONE_TO_ZERO_ONE(u * chroma_distortions.z),
-	                                  N_ONE_ONE_TO_ZERO_ONE(v * chroma_distortions.z)};
-
-	return true;
-#undef ZERO_ONE_TO_N_ONE_ONE
-#undef N_ONE_ONE_TO_ZERO_ONE
 }
 
 static float
@@ -402,6 +271,8 @@ rift_parse_distortion_report(struct rift_lens_distortion_report *report, struct 
 	case RIFT_LENS_DISTORTION_LCSV_CATMULL_ROM_10_VERSION_1: {
 		struct rift_catmull_rom_distortion_report_data report_data = report->data.lcsv_catmull_rom_10;
 		struct rift_catmull_rom_distortion_data data;
+
+		out->eye_relief = MICROMETERS_TO_METERS(report_data.eye_relief);
 
 		for (uint16_t i = 0; i < CATMULL_COEFFICIENTS; i += 1) {
 			data.k[i] = rift_decode_fixed_point_uint16(report_data.k[i], 0, 14);
@@ -614,29 +485,55 @@ rift_hmd_create(struct os_hid_device *dev, enum rift_variant variant, char *devi
 	}
 	HMD_INFO(hmd, "After writing, HMD has config flags: %X", hmd->config.config_flags);
 
-	// get the lens distortions
-	struct rift_lens_distortion_report lens_distortion;
-	result = rift_get_lens_distortion(hmd, &lens_distortion);
-	if (result < 0) {
-		HMD_ERROR(hmd, "Failed to get lens distortion, reason %d", result);
-		goto error;
-	}
-
-	hmd->num_lens_distortions = lens_distortion.num_distortions;
-	hmd->lens_distortions = calloc(lens_distortion.num_distortions, sizeof(struct rift_lens_distortion));
-
-	rift_parse_distortion_report(&lens_distortion, &hmd->lens_distortions[lens_distortion.distortion_idx]);
-	// TODO: actually verify we initialize all the distortions. if the headset is working correctly, this should
-	// have happened, but you never know.
-	for (uint16_t i = 1; i < hmd->num_lens_distortions; i++) {
+	if (getenv("RIFT_USE_FIRMWARE_DISTORTION") != NULL) {
+		// get the lens distortions
+		struct rift_lens_distortion_report lens_distortion;
 		result = rift_get_lens_distortion(hmd, &lens_distortion);
 		if (result < 0) {
-			HMD_ERROR(hmd, "Failed to get lens distortion idx %d, reason %d", i, result);
+			HMD_ERROR(hmd, "Failed to get lens distortion, reason %d", result);
 			goto error;
 		}
 
+		hmd->num_lens_distortions = lens_distortion.num_distortions;
+		hmd->lens_distortions = calloc(lens_distortion.num_distortions, sizeof(struct rift_lens_distortion));
+
 		rift_parse_distortion_report(&lens_distortion, &hmd->lens_distortions[lens_distortion.distortion_idx]);
+		// TODO: actually verify we initialize all the distortions. if the headset is working correctly, this
+		// should have happened, but you never know.
+		for (uint16_t i = 1; i < hmd->num_lens_distortions; i++) {
+			result = rift_get_lens_distortion(hmd, &lens_distortion);
+			if (result < 0) {
+				HMD_ERROR(hmd, "Failed to get lens distortion idx %d, reason %d", i, result);
+				goto error;
+			}
+
+			rift_parse_distortion_report(&lens_distortion,
+			                             &hmd->lens_distortions[lens_distortion.distortion_idx]);
+		}
+
+		// TODO: pick the correct distortion for the eye relief setting the user has picked
+		hmd->distortion_in_use = 0;
+	} else {
+		rift_fill_in_default_distortions(hmd);
 	}
+
+	// fill in extra display info about the headset
+
+	switch (hmd->variant) {
+	case RIFT_VARIANT_DK2:
+		hmd->extra_display_info.screen_gap_meters = 0.0f;
+		hmd->extra_display_info.lens_diameter_meters = 0.04f;
+		break;
+	default: break;
+	}
+
+	// hardcode left eye, probably not ideal, but sure, why not
+	struct rift_distortion_render_info distortion_render_info = rift_get_distortion_render_info(hmd, 0);
+	hmd->extra_display_info.fov = rift_calculate_fov_from_hmd(hmd, &distortion_render_info, 0);
+	hmd->extra_display_info.eye_to_source_ndc =
+	    rift_calculate_ndc_scale_and_offset_from_fov(&hmd->extra_display_info.fov);
+	hmd->extra_display_info.eye_to_source_uv =
+	    rift_calculate_uv_scale_and_offset_from_ndc_scale_and_offset(hmd->extra_display_info.eye_to_source_ndc);
 
 	// This list should be ordered, most preferred first.
 	size_t idx = 0;
@@ -674,22 +571,38 @@ rift_hmd_create(struct os_hid_device *dev, enum rift_variant variant, char *devi
 	struct u_device_simple_info info;
 	info.display.w_pixels = hmd->display_info.resolution_x;
 	info.display.h_pixels = hmd->display_info.resolution_y;
-	info.display.w_meters = (float)hmd->display_info.display_width / 1000000.0f; // micrometers -> meters
-	info.display.h_meters = (float)hmd->display_info.display_height / 1000000.0f;
+	info.display.w_meters = MICROMETERS_TO_METERS(hmd->display_info.display_width);
+	info.display.h_meters = MICROMETERS_TO_METERS(hmd->display_info.display_height);
 
-	info.lens_horizontal_separation_meters = (float)hmd->display_info.lens_separation / 1000000.0f;
+	info.lens_horizontal_separation_meters = MICROMETERS_TO_METERS(hmd->display_info.lens_separation);
+	info.lens_vertical_position_meters = MICROMETERS_TO_METERS(hmd->display_info.center_v);
 
-	// TODO: this is per eye on the headset, but we're just taking the left eye for this, we should be using both
-	// eyes, ideally
-	info.lens_vertical_position_meters = (float)hmd->display_info.lens_distance_l / 1000000.0f;
+	hmd->extra_display_info.icd = info.lens_horizontal_separation_meters;
 
-	// TODO: calculate this
-	info.fov[0] = (float)(93.0 * (M_PI / 180.0));
-	info.fov[1] = (float)(99.0 * (M_PI / 180.0));
+	for (int i = 0; i < 2; i++) {
+		info.fov[i] = 93;
+	}
 
 	if (!u_device_setup_split_side_by_side(&hmd->base, &info)) {
 		HMD_ERROR(hmd, "Failed to setup basic device info");
 		goto error;
+	}
+
+	switch (hmd->variant) {
+	case RIFT_VARIANT_DK2:
+		// TODO: figure out how to calculate this programatically, right now this is hardcoded with data dumped
+		//       from oculus' OpenXR runtime
+		hmd->base.hmd->distortion.fov[0].angle_up = 0.92667186;
+		hmd->base.hmd->distortion.fov[0].angle_down = -0.92667186;
+		hmd->base.hmd->distortion.fov[0].angle_left = -0.8138836;
+		hmd->base.hmd->distortion.fov[0].angle_right = 0.82951474;
+
+		hmd->base.hmd->distortion.fov[1].angle_up = 0.92667186;
+		hmd->base.hmd->distortion.fov[1].angle_down = -0.92667186;
+		hmd->base.hmd->distortion.fov[1].angle_left = -0.82951474;
+		hmd->base.hmd->distortion.fov[1].angle_right = 0.8138836;
+		break;
+	default: break;
 	}
 
 	// Just put an initial identity value in the tracker
@@ -718,6 +631,7 @@ rift_hmd_create(struct os_hid_device *dev, enum rift_variant variant, char *devi
 	// Setup variable tracker: Optional but useful for debugging
 	u_var_add_root(hmd, "Rift HMD", true);
 	u_var_add_log_level(hmd, &hmd->log_level, "log_level");
+	m_imu_3dof_add_vars(&hmd->fusion, hmd, "3dof_");
 
 	return hmd;
 error:
