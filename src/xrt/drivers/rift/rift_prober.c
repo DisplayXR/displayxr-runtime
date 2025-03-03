@@ -45,7 +45,7 @@ rift_found(struct xrt_prober *xp,
 		return -1;
 	}
 
-	// Some non-oculus devices (VR-Tek HMDs) re-use the same USB IDs as the oculus headsets, so we should check the
+	// Some non-oculus devices (VR-Tek HMDs) reuse the same USB IDs as the oculus headsets, so we should check the
 	// manufacturer
 	if (strncmp((const char *)manufacturer, "Oculus VR, Inc.", sizeof(manufacturer)) != 0) {
 		return -1;

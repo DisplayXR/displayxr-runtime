@@ -241,12 +241,7 @@ if(XRT_BUILD_DRIVER_ROKID)
 endif()
 
 if(XRT_BUILD_DRIVER_RIFT)
-	add_library(
-		drv_rift STATIC
-		rift/rift_hmd.c
-		rift/rift_distortion.c
-		rift/rift_prober.c
-		)
+	add_library(drv_rift STATIC rift/rift_hmd.c rift/rift_distortion.c rift/rift_prober.c)
 	target_include_directories(drv_rift SYSTEM PRIVATE)
 	target_link_libraries(
 		drv_rift

@@ -406,7 +406,7 @@ rift_hmd_compute_distortion(struct xrt_device *dev, uint32_t view, float u, floa
 	struct xrt_uv_triplet tan_fov_chroma =
 	    rift_transform_screen_ndc_to_tan_fov_space_chroma(&distortion_render_info, source_ndc);
 
-#if 0 // no distortion
+#if 0 // no distortion (green channel doesn't have any chromatic aberration correction)
 	struct xrt_uv_triplet sample_tex_coord = {
 	    .r = m_vec2_add(m_vec2_mul(tan_fov_chroma.g, eye_to_source_uv->scale), eye_to_source_uv->offset),
 	    .g = m_vec2_add(m_vec2_mul(tan_fov_chroma.g, eye_to_source_uv->scale), eye_to_source_uv->offset),

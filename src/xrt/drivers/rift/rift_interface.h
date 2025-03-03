@@ -81,7 +81,7 @@ enum rift_config_report_flags
 	RIFT_CONFIG_REPORT_AUTO_CALIBRATION = 1 << 3,
 	// stop sending IN reports when the device has stopped moving for Interval milliseconds
 	RIFT_CONFIG_REPORT_MOTION_KEEP_ALIVE = 1 << 4,
-	// stop sending IN reports when the device has stopped recieving feature reports for Interval milliseconds
+	// stop sending IN reports when the device has stopped receiving feature reports for Interval milliseconds
 	RIFT_CONFIG_REPORT_COMMAND_KEEP_ALIVE = 1 << 5,
 	// output the IN report data in the coordinate system used by LibOVR relative to the tracker, otherwise, report
 	// in the coordinate system of the device
