@@ -21,6 +21,7 @@
 #include "rift_distortion.h"
 
 #include "math/m_relation_history.h"
+#include "math/m_clock_tracking.h"
 #include "math/m_api.h"
 #include "math/m_vec2.h"
 #include "math/m_mathinclude.h" // IWYU pragma: keep
@@ -182,6 +183,9 @@ rift_hmd_destroy(struct xrt_device *xdev)
 	if (hmd->sensor_thread.initialized)
 		os_thread_helper_stop_and_wait(&hmd->sensor_thread);
 
+	if (hmd->clock_tracker)
+		m_clock_windowed_skew_tracker_destroy(hmd->clock_tracker);
+
 	m_relation_history_destroy(&hmd->relation_hist);
 
 	if (hmd->lens_distortions)
@@ -297,7 +301,7 @@ rift_parse_distortion_report(struct rift_lens_distortion_report *report, struct 
  * We unpack them in the higher 21 bit values first and then shift
  * them down to the lower in order to get the sign bits correct.
  *
- * "Inspired" (code copied verbatim) from OpenHMD's rift driver
+ * Code taken/reformated from OpenHMD's rift driver
  */
 static void
 rift_decode_sample(const uint8_t *in, int32_t *out)
@@ -367,6 +371,25 @@ sensor_thread_tick(struct rift_hmd *hmd)
 			return 0;
 		}
 
+		int64_t remote_sample_timestamp_ns = (int64_t)report.sample_timestamp * 1000;
+
+		// ignore samples that are behind the latest current sample
+		if (remote_sample_timestamp_ns < hmd->last_sample_time_ns) {
+			return 0;
+		}
+
+		hmd->last_sample_time_ns = remote_sample_timestamp_ns;
+
+		m_clock_windowed_skew_tracker_push(hmd->clock_tracker, os_monotonic_get_ns(),
+		                                   remote_sample_timestamp_ns);
+
+		int64_t local_timestamp_ns;
+		// if we havent synchronized our clocks, just do nothing
+		if (!m_clock_windowed_skew_tracker_to_local(hmd->clock_tracker, remote_sample_timestamp_ns,
+		                                            &local_timestamp_ns)) {
+			return 0;
+		}
+
 		struct dk2_sample_pack sample_pack = report.samples[report.num_samples >= 2 ? 1 : 0];
 
 		int32_t accel_raw[3], gyro_raw[3];
@@ -377,16 +400,13 @@ sensor_thread_tick(struct rift_hmd *hmd)
 		rift_sample_to_imu_space(accel_raw, &accel);
 		rift_sample_to_imu_space(gyro_raw, &gyro);
 
-		uint64_t sample_timestamp_ns = (uint64_t)report.sample_timestamp * 1000;
-
-		HMD_INFO(hmd, "sample timestamp: %ld", sample_timestamp_ns);
-		m_imu_3dof_update(&hmd->fusion, sample_timestamp_ns, &accel, &gyro);
+		m_imu_3dof_update(&hmd->fusion, local_timestamp_ns, &accel, &gyro);
 
 		struct xrt_space_relation relation = XRT_SPACE_RELATION_ZERO;
 		relation.relation_flags = (enum xrt_space_relation_flags)(XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT |
 		                                                          XRT_SPACE_RELATION_ORIENTATION_VALID_BIT);
 		relation.pose.orientation = hmd->fusion.rot;
-		m_relation_history_push(hmd->relation_hist, &relation, os_monotonic_get_ns());
+		m_relation_history_push(hmd->relation_hist, &relation, local_timestamp_ns);
 
 		break;
 	}
@@ -579,9 +599,9 @@ rift_hmd_create(struct os_hid_device *dev, enum rift_variant variant, char *devi
 
 	hmd->extra_display_info.icd = info.lens_horizontal_separation_meters;
 
-	for (int i = 0; i < 2; i++) {
-		info.fov[i] = 93;
-	}
+	// hardcode some "okay" values
+	info.fov[0] = 93;
+	info.fov[1] = 93;
 
 	if (!u_device_setup_split_side_by_side(&hmd->base, &info)) {
 		HMD_ERROR(hmd, "Failed to setup basic device info");
@@ -619,7 +639,8 @@ rift_hmd_create(struct os_hid_device *dev, enum rift_variant variant, char *devi
 		goto error;
 	}
 
-	m_imu_3dof_init(&hmd->fusion, 0);
+	m_imu_3dof_init(&hmd->fusion, M_IMU_3DOF_USE_GRAVITY_DUR_300MS);
+	hmd->clock_tracker = m_clock_windowed_skew_tracker_alloc(64);
 
 	result = os_thread_helper_start(&hmd->sensor_thread, sensor_thread, hmd);
 

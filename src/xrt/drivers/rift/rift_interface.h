@@ -105,6 +105,8 @@ enum rift_lens_type
 	RIFT_LENS_TYPE_B = 1,
 };
 
+#define IN_REPORT_DK2 11
+
 #define CATMULL_COEFFICIENTS 11
 #define CHROMATIC_ABBERATION_COEFFEICENT_COUNT 4
 
@@ -193,12 +195,65 @@ struct rift_lens_distortion_report
 	} RIFT_PACKED data;
 } RIFT_PACKED;
 
-#define IN_REPORT_DK2 11
 struct dk2_report_keepalive_mux
 {
 	uint16_t command;
 	uint8_t in_report;
 	uint16_t interval;
+} RIFT_PACKED;
+
+enum rift_display_mode
+{
+	RIFT_DISPLAY_MODE_GLOBAL,
+	RIFT_DISPLAY_MODE_ROLLING_TOP_BOTTOM,
+	RIFT_DISPLAY_MODE_ROLLING_LEFT_RIGHT,
+	RIFT_DISPLAY_MODE_ROLLING_RIGHT_LEFT,
+};
+
+enum rift_display_limit
+{
+	RIFT_DISPLAY_LIMIT_ACL_OFF = 0,
+	RIFT_DISPLAY_LIMIT_ACL_30 = 1,
+	RIFT_DISPLAY_LIMIT_ACL_25 = 2,
+	RIFT_DISPLAY_LIMIT_ACL_50 = 3,
+};
+
+enum rift_display_flags
+{
+	RIFT_DISPLAY_USE_ROLLING = 1 << 6,
+	RIFT_DISPLAY_REVERSE_ROLLING = 1 << 7,
+	RIFT_DISPLAY_HIGH_BRIGHTNESS = 1 << 8,
+	RIFT_DISPLAY_SELF_REFRESH = 1 << 9,
+	RIFT_DISPLAY_READ_PIXEL = 1 << 10,
+	RIFT_DISPLAY_DIRECT_PENTILE = 1 << 11,
+};
+
+struct rift_display_report
+{
+	uint16_t command_id;
+	// relative brightness setting independent of pixel persistence, only effective when high brightness is disabled
+	uint8_t brightness;
+	// a set of flags, ordered from LSB -> MSB
+	// - panel mode/shutter type (4 bits), read only, see rift_display_mode
+	// - current limit (2 bits), see rift_display_limit
+	// - use rolling (1 bit)
+	// - reverse rolling (1 bit), unavailable on released DK2 firmware for unknown reason
+	// - high brightness (1 bit), unavailable on released DK2 firmware for unpublished reason
+	// - self refresh (1 bit)
+	// - read pixel (1 bit)
+	// - direct pentile (1 bit)
+	uint32_t flags;
+	// the length of time in rows that the display is lit each frame, defaults to the full size of the display, full
+	// persistence
+	uint16_t persistence;
+	// the offset in rows from vsync that the panel is lit when using global shutter, no effect in rolling shutter,
+	// disabled on released DK2 firmware for unknown reason
+	uint16_t lighting_offset;
+	// the time in microseconds it is estimated for a pixel to settle to one value after it is set, read only
+	uint16_t pixel_settle;
+	// the number of rows including active area and blanking period used with persistence and lightingoffset, read
+	// only
+	uint16_t total_rows;
 } RIFT_PACKED;
 
 struct dk2_sensor_sample
@@ -328,7 +383,10 @@ struct rift_hmd
 
 	struct os_hid_device *hid_dev;
 	struct os_thread_helper sensor_thread;
+	int64_t last_sample_time_ns;
+
 	struct m_imu_3dof fusion;
+	struct m_clock_windowed_skew_tracker *clock_tracker;
 
 	int64_t last_keepalive_time;
 	enum rift_variant variant;
