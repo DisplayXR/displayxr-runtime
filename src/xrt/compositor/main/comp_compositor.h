@@ -1,4 +1,5 @@
 // Copyright 2019-2024, Collabora, Ltd.
+// Copyright 2025, NVIDIA CORPORATION.
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
@@ -23,6 +24,7 @@
 #include "util/comp_sync.h"
 #include "util/comp_scratch.h"
 #include "util/comp_swapchain.h"
+#include "util/comp_high_level_scratch.h"
 
 #include "render/render_interface.h"
 
@@ -143,11 +145,8 @@ struct comp_compositor
 		struct comp_frame rendering;
 	} frame;
 
-	struct
-	{
-		// Per-view scratch images.
-		struct comp_scratch_single_images views[2];
-	} scratch;
+	// Scratch images for the renderer.
+	struct chl_scratch scratch;
 
 	struct
 	{

@@ -105,18 +105,6 @@ struct comp_renderer
 
 	struct comp_mirror_to_debug_gui mirror_to_debug_gui;
 
-	//! Render pass for graphics pipeline rendering to the scratch buffer.
-	struct render_gfx_render_pass scratch_render_pass;
-
-	struct
-	{
-		struct
-		{
-			//! Targets for rendering to the scratch buffer.
-			struct render_gfx_target_resources targets[COMP_SCRATCH_NUM_IMAGES];
-		} views[XRT_MAX_VIEWS];
-	} scratch;
-
 	//! @}
 
 	//! @name Image-dependent members
@@ -182,7 +170,7 @@ scratch_get_init(struct comp_render_scratch_state *crss, struct comp_renderer *r
 	U_ZERO(crss);
 
 	for (uint32_t i = 0; i < view_count; i++) {
-		comp_scratch_single_images_get(&c->scratch.views[i], &crss->views[i].index);
+		comp_scratch_single_images_get(&c->scratch.views[i].cssi, &crss->views[i].index);
 	}
 }
 
@@ -194,9 +182,9 @@ scratch_get_fini(struct comp_render_scratch_state *crss, struct comp_renderer *r
 
 	for (uint32_t i = 0; i < view_count; i++) {
 		if (crss->views[i].used) {
-			comp_scratch_single_images_done(&c->scratch.views[i]);
+			comp_scratch_single_images_done(&c->scratch.views[i].cssi);
 		} else {
-			comp_scratch_single_images_discard(&c->scratch.views[i]);
+			comp_scratch_single_images_discard(&c->scratch.views[i].cssi);
 		}
 	}
 }
@@ -564,7 +552,6 @@ static void
 renderer_init(struct comp_renderer *r, struct comp_compositor *c, VkExtent2D scratch_extent)
 {
 	COMP_TRACE_MARKER();
-	bool bret;
 
 	r->c = c;
 	r->settings = &c->settings;
@@ -573,32 +560,16 @@ renderer_init(struct comp_renderer *r, struct comp_compositor *c, VkExtent2D scr
 	r->fenced_buffer = -1;
 	r->rtr_array = NULL;
 
-	// Shared render pass between all scratch images.
-	render_gfx_render_pass_init(                   //
-	    &r->scratch_render_pass,                   // rgrp
-	    &r->c->nr,                                 // struct render_resources
-	    VK_FORMAT_R8G8B8A8_SRGB,                   // format
-	    VK_ATTACHMENT_LOAD_OP_CLEAR,               // load_op
-	    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL); // final_layout
-
-	for (uint32_t i = 0; i < c->nr.view_count; i++) {
-		bret =
-		    comp_scratch_single_images_ensure_mutable(&r->c->scratch.views[i], &r->c->base.vk, scratch_extent);
-		if (!bret) {
-			COMP_ERROR(c, "comp_scratch_single_images_ensure: false");
-			assert(false && "Whelp, can't return an error. But should never really fail.");
-		}
-
-		for (uint32_t k = 0; k < COMP_SCRATCH_NUM_IMAGES; k++) {
-			struct render_scratch_color_image *rsci = &c->scratch.views[i].images[k];
-
-			render_gfx_target_resources_init(    //
-			    &r->scratch.views[i].targets[k], //
-			    &r->c->nr,                       //
-			    &r->scratch_render_pass,         //
-			    rsci->srgb_view,                 //
-			    scratch_extent);                 //
-		}
+	// Setup the scratch images.
+	bool bret = chl_scratch_ensure( //
+	    &c->scratch,                // scratch
+	    &c->nr,                     // struct render_resources
+	    c->nr.view_count,           // view_count
+	    scratch_extent,             // extent
+	    VK_FORMAT_R8G8B8A8_SRGB);   // format
+	if (!bret) {
+		COMP_ERROR(c, "chl_scratch_ensure: false");
+		assert(bret && "Whelp, can't return a error. But should never really fail.");
 	}
 
 	// Try to early-allocate these, in case we can.
@@ -895,14 +866,7 @@ renderer_fini(struct comp_renderer *r)
 	comp_mirror_fini(&r->mirror_to_debug_gui, vk);
 
 	// Do this after the layer renderer.
-	for (uint32_t i = 0; i < r->c->nr.view_count; i++) {
-		for (uint32_t k = 0; k < COMP_SCRATCH_NUM_IMAGES; k++) {
-			render_gfx_target_resources_fini(&r->scratch.views[i].targets[k]);
-		}
-	}
-
-	// Do this after the layer renderer and targert resources.
-	render_gfx_render_pass_fini(&r->scratch_render_pass);
+	chl_scratch_free_resources(&r->c->scratch, &r->c->nr);
 }
 
 
@@ -972,10 +936,10 @@ dispatch_graphics(struct comp_renderer *r,
 		uint32_t scratch_index = crss->views[i].index;
 
 		// The set of scratch images we are using for this view.
-		struct comp_scratch_single_images *scratch_view = &c->scratch.views[i];
+		struct comp_scratch_single_images *scratch_view = &c->scratch.views[i].cssi;
 
 		// The render target resources for the scratch images.
-		struct render_gfx_target_resources *rsci_rtr = &r->scratch.views[i].targets[scratch_index];
+		struct render_gfx_target_resources *rsci_rtr = &c->scratch.views[i].targets[scratch_index];
 
 		// Scratch color image.
 		struct render_scratch_color_image *rsci = &scratch_view->images[scratch_index];
@@ -1099,7 +1063,7 @@ dispatch_compute(struct comp_renderer *r,
 		uint32_t scratch_index = crss->views[i].index;
 
 		// The set of scratch images we are using for this view.
-		struct comp_scratch_single_images *scratch_view = &c->scratch.views[i];
+		struct comp_scratch_single_images *scratch_view = &c->scratch.views[i].cssi;
 
 		// Scratch color image.
 		struct render_scratch_color_image *rsci = &scratch_view->images[scratch_index];
@@ -1242,7 +1206,7 @@ comp_renderer_draw(struct comp_renderer *r)
 	if (c->peek) {
 		switch (comp_window_peek_get_eye(c->peek)) {
 		case COMP_WINDOW_PEEK_EYE_LEFT: {
-			struct comp_scratch_single_images *view = &c->scratch.views[0];
+			struct comp_scratch_single_images *view = &c->scratch.views[0].cssi;
 			comp_window_peek_blit(                       //
 			    c->peek,                                 //
 			    view->images[crss.views[0].index].image, //
@@ -1250,7 +1214,7 @@ comp_renderer_draw(struct comp_renderer *r)
 			    view->info.height);                      //
 		} break;
 		case COMP_WINDOW_PEEK_EYE_RIGHT: {
-			struct comp_scratch_single_images *view = &c->scratch.views[1];
+			struct comp_scratch_single_images *view = &c->scratch.views[1].cssi;
 			comp_window_peek_blit(                       //
 			    c->peek,                                 //
 			    view->images[crss.views[1].index].image, //
@@ -1281,7 +1245,7 @@ comp_renderer_draw(struct comp_renderer *r)
 	comp_mirror_fixup_ui_state(&r->mirror_to_debug_gui, c);
 	if (comp_mirror_is_ready_and_active(&r->mirror_to_debug_gui, c, predicted_display_time_ns)) {
 
-		struct comp_scratch_single_images *view = &c->scratch.views[0];
+		struct comp_scratch_single_images *view = &c->scratch.views[0].cssi;
 		struct render_scratch_color_image *rsci = &view->images[crss.views[0].index];
 		VkExtent2D extent = {view->info.width, view->info.width};
 
