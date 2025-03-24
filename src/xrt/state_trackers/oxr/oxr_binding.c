@@ -398,13 +398,13 @@ oxr_find_profile_for_device(struct oxr_logger *log,
 
 void
 oxr_binding_find_bindings_from_key(struct oxr_logger *log,
-                                   struct oxr_interaction_profile *p,
+                                   struct oxr_interaction_profile *profile,
                                    uint32_t key,
                                    size_t max_bounding_count,
-                                   struct oxr_binding **bindings,
+                                   struct oxr_binding **out_bindings,
                                    size_t *out_binding_count)
 {
-	if (p == NULL) {
+	if (profile == NULL) {
 		*out_binding_count = 0;
 		return;
 	}
@@ -416,12 +416,12 @@ oxr_binding_find_bindings_from_key(struct oxr_logger *log,
 	 * Loop over all app provided bindings for this profile
 	 * and return those matching the action.
 	 */
-	for (size_t y = 0; y < p->binding_count; y++) {
-		struct oxr_binding *b = &p->bindings[y];
+	for (size_t binding_index = 0; binding_index < profile->binding_count; binding_index++) {
+		struct oxr_binding *profile_binding = &profile->bindings[binding_index];
 
-		for (size_t z = 0; z < b->key_count; z++) {
-			if (b->keys[z] == key) {
-				bindings[binding_count++] = b;
+		for (size_t key_index = 0; key_index < profile_binding->key_count; key_index++) {
+			if (profile_binding->keys[key_index] == key) {
+				out_bindings[binding_count++] = profile_binding;
 				break;
 			}
 		}

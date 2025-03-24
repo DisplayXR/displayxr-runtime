@@ -682,10 +682,10 @@ oxr_session_binding_destroy_all(struct oxr_logger *log, struct oxr_session *sess
  */
 void
 oxr_binding_find_bindings_from_key(struct oxr_logger *log,
-                                   struct oxr_interaction_profile *p,
+                                   struct oxr_interaction_profile *profile,
                                    uint32_t key,
                                    size_t max_bounding_count,
-                                   struct oxr_binding **bindings,
+                                   struct oxr_binding **out_bindings,
                                    size_t *out_binding_count);
 
 /*!
