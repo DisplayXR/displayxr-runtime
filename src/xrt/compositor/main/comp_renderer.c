@@ -945,12 +945,12 @@ dispatch_graphics(struct comp_renderer *r,
 		    &world_poses[i],      //
 		    &eye_poses[i],        //
 		    &fovs[i],             //
-		    rsci_rtr,             //
-		    &layer_viewport_data, //
-		    &layer_norm_rect,     //
-		    rsci->image,          //
-		    sample_view,          //
-		    &vertex_rots[i],      //
+		    rsci->image,          // squash_image
+		    rsci_rtr,             // squash_rtr
+		    &layer_viewport_data, // squash_viewport_data
+		    sample_view,          // squash_as_src_sample_view
+		    &layer_norm_rect,     // squash_as_src_norm_rect
+		    &vertex_rots[i],      // target_vertex_rot
 		    &viewport_datas[i]);  // target_viewport_data
 
 		if (layer_count == 0) {
@@ -1066,11 +1066,11 @@ dispatch_compute(struct comp_renderer *r,
 		    &world_poses[i],      //
 		    &eye_poses[i],        //
 		    &fovs[i],             //
-		    &layer_viewport_data, //
-		    &layer_norm_rect,     //
-		    rsci->image,          //
-		    sample_view,          //
-		    storage_view,         //
+		    rsci->image,          // squash_image
+		    storage_view,         // squash_storage_view
+		    &layer_viewport_data, // squash_viewport_data
+		    sample_view,          // squash_as_src_sample_view
+		    &layer_norm_rect,     // squash_as_src_norm_rect
 		    &views[i]);           // target_viewport_data
 
 		if (layer_count == 0) {

@@ -1,4 +1,5 @@
 // Copyright 2023-2024, Collabora, Ltd.
+// Copyright 2025, NVIDIA CORPORATION.
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
@@ -138,16 +139,20 @@ set_post_transform_rect(const struct xrt_layer_data *data,
  *
  */
 
+/*!
+ * This inserts a barrier operation that effects all views[X].squash.image
+ * fields (which are VkImages).
+ */
 static inline void
-cmd_barrier_view_images(struct vk_bundle *vk,
-                        const struct comp_render_dispatch_data *d,
-                        VkCommandBuffer cmd,
-                        VkAccessFlags src_access_mask,
-                        VkAccessFlags dst_access_mask,
-                        VkImageLayout transition_from,
-                        VkImageLayout transition_to,
-                        VkPipelineStageFlags src_stage_mask,
-                        VkPipelineStageFlags dst_stage_mask)
+cmd_barrier_view_squash_images(struct vk_bundle *vk,
+                               const struct comp_render_dispatch_data *d,
+                               VkCommandBuffer cmd,
+                               VkAccessFlags src_access_mask,
+                               VkAccessFlags dst_access_mask,
+                               VkImageLayout transition_from,
+                               VkImageLayout transition_to,
+                               VkPipelineStageFlags src_stage_mask,
+                               VkPipelineStageFlags dst_stage_mask)
 {
 	VkImageSubresourceRange first_color_level_subresource_range = {
 	    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
@@ -160,13 +165,13 @@ cmd_barrier_view_images(struct vk_bundle *vk,
 	for (uint32_t i = 0; i < d->view_count; i++) {
 		bool already_barriered = false;
 
-		VkImage image = d->views[i].image;
+		VkImage image = d->views[i].squash.image;
 
 		uint32_t k = i;
 		while (k > 0) {
 			k--; // k is always greater then zero.
 
-			if (d->views[k].image == image) {
+			if (d->views[k].squash.image == image) {
 				already_barriered = true;
 				break;
 			}

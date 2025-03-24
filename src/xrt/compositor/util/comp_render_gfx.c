@@ -1,4 +1,5 @@
 // Copyright 2023-2024, Collabora, Ltd.
+// Copyright 2025, NVIDIA CORPORATION.
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
@@ -489,7 +490,7 @@ crg_clear_output(struct render_gfx *render, const struct comp_render_dispatch_da
 {
 	render_gfx_begin_target(     //
 	    render,                  //
-	    d->gfx.rtr,              //
+	    d->target.gfx.rtr,       //
 	    &background_color_idle); //
 
 	render_gfx_end_target(render);
@@ -522,13 +523,13 @@ crg_distortion_common(struct render_gfx *render,
 	for (uint32_t i = 0; i < d->view_count; i++) {
 
 		struct render_gfx_mesh_ubo_data data = {
-		    .vertex_rot = d->views[i].gfx.vertex_rot,
+		    .vertex_rot = d->views[i].target.gfx.vertex_rot,
 		    .post_transform = md->views[i].src_norm_rect,
 		};
 
 		// Extra arguments for timewarp.
 		if (do_timewarp) {
-			data.pre_transform = d->views[i].target_pre_transform;
+			data.pre_transform = d->views[i].pre_transform;
 
 			render_calc_time_warp_matrix( //
 			    &md->views[i].src_pose,   //
@@ -555,12 +556,12 @@ crg_distortion_common(struct render_gfx *render,
 
 	render_gfx_begin_target(       //
 	    render,                    //
-	    d->gfx.rtr,                //
+	    d->target.gfx.rtr,         //
 	    &background_color_active); //
 
 	for (uint32_t i = 0; i < d->view_count; i++) {
 		// Convenience.
-		const struct render_viewport_data *viewport_data = &d->views[i].target_viewport_data;
+		const struct render_viewport_data *viewport_data = &d->views[i].target.viewport_data;
 
 		render_gfx_begin_view( //
 		    render,            //
@@ -597,8 +598,8 @@ crg_distortion_after_squash(struct render_gfx *render, const struct comp_render_
 	for (uint32_t i = 0; i < d->view_count; i++) {
 		struct xrt_pose src_pose = d->views[i].world_pose;
 		struct xrt_fov src_fov = d->views[i].fov;
-		VkImageView src_image_view = d->views[i].srgb_view;
-		struct xrt_normalized_rect src_norm_rect = d->views[i].layer_norm_rect;
+		VkImageView src_image_view = d->views[i].squash_as_src.sample_view;
+		struct xrt_normalized_rect src_norm_rect = d->views[i].squash_as_src.norm_rect;
 
 		gfx_mesh_add_view(         //
 		    &md,                   //
@@ -807,12 +808,12 @@ comp_render_gfx_layers(struct render_gfx *render,
 	for (uint32_t view = 0; view < d->view_count; view++) {
 
 		// Convenience.
-		const struct render_viewport_data *viewport_data = &d->views[view].layer_viewport_data;
+		const struct render_viewport_data *viewport_data = &d->views[view].squash.viewport_data;
 
-		render_gfx_begin_target(    //
-		    render,                 //
-		    d->views[view].gfx.rtr, //
-		    color);                 //
+		render_gfx_begin_target(           //
+		    render,                        //
+		    d->views[view].squash.gfx.rtr, //
+		    color);                        //
 
 		render_gfx_begin_view( //
 		    render,            //
@@ -859,7 +860,7 @@ comp_render_gfx_layers(struct render_gfx *render,
 	}
 
 
-	cmd_barrier_view_images(                           //
+	cmd_barrier_view_squash_images(                    //
 	    render->r->vk,                                 //
 	    d,                                             //
 	    render->r->cmd,                                // cmd
