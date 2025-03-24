@@ -195,11 +195,11 @@ interaction_profile_find_or_create_in_instance(struct oxr_logger *log,
 static void
 reset_binding_keys(struct oxr_binding *binding)
 {
-	free(binding->keys);
+	free(binding->act_keys);
 	free(binding->preferred_binding_path_index);
-	binding->keys = NULL;
+	binding->act_keys = NULL;
 	binding->preferred_binding_path_index = NULL;
-	binding->key_count = 0;
+	binding->act_key_count = 0;
 }
 
 static void
@@ -211,7 +211,7 @@ reset_all_keys(struct oxr_binding *bindings, size_t binding_count)
 }
 
 static void
-add_key_to_matching_bindings(struct oxr_binding *bindings, size_t binding_count, XrPath path, uint32_t key)
+add_act_key_to_matching_bindings(struct oxr_binding *bindings, size_t binding_count, XrPath path, uint32_t act_key)
 {
 	for (size_t x = 0; x < binding_count; x++) {
 		struct oxr_binding *b = &bindings[x];
@@ -230,10 +230,10 @@ add_key_to_matching_bindings(struct oxr_binding *bindings, size_t binding_count,
 			continue;
 		}
 
-		U_ARRAY_REALLOC_OR_FREE(b->keys, uint32_t, (b->key_count + 1));
-		U_ARRAY_REALLOC_OR_FREE(b->preferred_binding_path_index, uint32_t, (b->key_count + 1));
-		b->preferred_binding_path_index[b->key_count] = preferred_path_index;
-		b->keys[b->key_count++] = key;
+		U_ARRAY_REALLOC_OR_FREE(b->act_keys, uint32_t, (b->act_key_count + 1));
+		U_ARRAY_REALLOC_OR_FREE(b->preferred_binding_path_index, uint32_t, (b->act_key_count + 1));
+		b->preferred_binding_path_index[b->act_key_count] = preferred_path_index;
+		b->act_keys[b->act_key_count++] = act_key;
 	}
 }
 
@@ -397,12 +397,12 @@ oxr_find_profile_for_device(struct oxr_logger *log,
 }
 
 void
-oxr_binding_find_bindings_from_key(struct oxr_logger *log,
-                                   struct oxr_interaction_profile *profile,
-                                   uint32_t key,
-                                   size_t max_binding_count,
-                                   struct oxr_binding **out_bindings,
-                                   size_t *out_binding_count)
+oxr_binding_find_bindings_from_act_key(struct oxr_logger *log,
+                                       struct oxr_interaction_profile *profile,
+                                       uint32_t key,
+                                       size_t max_binding_count,
+                                       struct oxr_binding **out_bindings,
+                                       size_t *out_binding_count)
 {
 	if (profile == NULL) {
 		*out_binding_count = 0;
@@ -419,8 +419,8 @@ oxr_binding_find_bindings_from_key(struct oxr_logger *log,
 	for (size_t binding_index = 0; binding_index < profile->binding_count; binding_index++) {
 		struct oxr_binding *profile_binding = &profile->bindings[binding_index];
 
-		for (size_t key_index = 0; key_index < profile_binding->key_count; key_index++) {
-			if (profile_binding->keys[key_index] == key) {
+		for (size_t key_index = 0; key_index < profile_binding->act_key_count; key_index++) {
+			if (profile_binding->act_keys[key_index] == key) {
 				out_bindings[binding_count++] = profile_binding;
 				break;
 			}
@@ -470,21 +470,22 @@ oxr_clone_profile(const struct oxr_interaction_profile *src_profile)
 				       sizeof(XrPath) * src_binding->path_count);
 			}
 
-			dst_binding->key_count = 0;
-			dst_binding->keys = NULL;
+			dst_binding->act_key_count = 0;
+			dst_binding->act_keys = NULL;
 			dst_binding->preferred_binding_path_index = NULL;
-			if (src_binding->keys && src_binding->key_count > 0) {
-				dst_binding->key_count = src_binding->key_count;
-				dst_binding->keys = U_TYPED_ARRAY_CALLOC(uint32_t, src_binding->key_count);
-				memcpy(dst_binding->keys, src_binding->keys, sizeof(uint32_t) * src_binding->key_count);
+			if (src_binding->act_keys && src_binding->act_key_count > 0) {
+				dst_binding->act_key_count = src_binding->act_key_count;
+				dst_binding->act_keys = U_TYPED_ARRAY_CALLOC(uint32_t, src_binding->act_key_count);
+				memcpy(dst_binding->act_keys, src_binding->act_keys,
+				       sizeof(uint32_t) * src_binding->act_key_count);
 			}
-			if (src_binding->preferred_binding_path_index && src_binding->key_count > 0) {
-				assert(dst_binding->key_count == src_binding->key_count);
+			if (src_binding->preferred_binding_path_index && src_binding->act_key_count > 0) {
+				assert(dst_binding->act_key_count == src_binding->act_key_count);
 				dst_binding->preferred_binding_path_index =
-				    U_TYPED_ARRAY_CALLOC(uint32_t, src_binding->key_count);
+				    U_TYPED_ARRAY_CALLOC(uint32_t, src_binding->act_key_count);
 				memcpy(dst_binding->preferred_binding_path_index,
 				       src_binding->preferred_binding_path_index,
-				       sizeof(uint32_t) * src_binding->key_count);
+				       sizeof(uint32_t) * src_binding->act_key_count);
 			}
 		}
 	}
@@ -611,7 +612,7 @@ oxr_action_suggest_interaction_profile_bindings(struct oxr_logger *log,
 		const XrActionSuggestedBinding *s = &suggestedBindings->suggestedBindings[i];
 		struct oxr_action *act = XRT_CAST_OXR_HANDLE_TO_PTR(struct oxr_action *, s->action);
 
-		add_key_to_matching_bindings(bindings, binding_count, s->binding, act->act_key);
+		add_act_key_to_matching_bindings(bindings, binding_count, s->binding, act->act_key);
 	}
 
 out:

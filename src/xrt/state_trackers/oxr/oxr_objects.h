@@ -681,12 +681,12 @@ oxr_session_binding_destroy_all(struct oxr_logger *log, struct oxr_session *sess
  * @public @memberof oxr_interaction_profile
  */
 void
-oxr_binding_find_bindings_from_key(struct oxr_logger *log,
-                                   struct oxr_interaction_profile *profile,
-                                   uint32_t key,
-                                   size_t max_binding_count,
-                                   struct oxr_binding **out_bindings,
-                                   size_t *out_binding_count);
+oxr_binding_find_bindings_from_act_key(struct oxr_logger *log,
+                                       struct oxr_interaction_profile *profile,
+                                       uint32_t key,
+                                       size_t max_binding_count,
+                                       struct oxr_binding **out_bindings,
+                                       size_t *out_binding_count);
 
 /*!
  * @public @memberof oxr_instance
@@ -2046,8 +2046,8 @@ struct oxr_binding
 
 	enum oxr_subaction_path subaction_path;
 
-	uint32_t key_count;
-	uint32_t *keys;
+	uint32_t act_key_count;
+	uint32_t *act_keys;
 	//! store which entry in paths was suggested, for each action key
 	uint32_t *preferred_binding_path_index;
 

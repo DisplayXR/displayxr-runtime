@@ -650,8 +650,8 @@ static XrPath
 get_matched_xrpath(struct oxr_binding *b, const struct oxr_action_ref *act)
 {
 	XrPath preferred_path = XR_NULL_PATH;
-	for (uint32_t i = 0; i < b->key_count; i++) {
-		if (b->keys[i] == act->act_key) {
+	for (uint32_t i = 0; i < b->act_key_count; i++) {
+		if (b->act_keys[i] == act->act_key) {
 			uint32_t preferred_path_index = XR_NULL_PATH;
 			preferred_path_index = b->preferred_binding_path_index[i];
 			preferred_path = b->paths[preferred_path_index];
@@ -730,13 +730,13 @@ get_binding(struct oxr_logger *log,
 	}
 
 	size_t binding_count = 0;
-	oxr_binding_find_bindings_from_key( //
-	    log,                            // log
-	    profile,                        // p
-	    act_ref->act_key,               // key
-	    ARRAY_SIZE(binding_points),     // max_binding_count
-	    binding_points,                 // out_bindings
-	    &binding_count);                // out_binding_count
+	oxr_binding_find_bindings_from_act_key( //
+	    log,                                // log
+	    profile,                            // p
+	    act_ref->act_key,                   // key
+	    ARRAY_SIZE(binding_points),         // max_binding_count
+	    binding_points,                     // out_bindings
+	    &binding_count);                    // out_binding_count
 	if (binding_count == 0) {
 		oxr_slog(slog, "\t\t\tNo bindings!\n");
 		return;
