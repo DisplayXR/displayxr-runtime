@@ -6,6 +6,9 @@
 gitlab_url = "git@ssh.gitlab.freedesktop.org:rpavlik/monado.git"
 author = "Rylie Pavlik <rylie.pavlik@collabora.com>"
 
+# Helpful flag when working on these workflows:
+# --git-destination-non-fast-forward
+
 # update-stb: Update STB libraries
 core.workflow(
     name="update-stb",
@@ -65,7 +68,7 @@ core.workflow(
         ["src/external/nanopb/*.{h,c,txt}"],
         exclude=["src/external/nanopb/monado_metrics.pb.{c,h}"],
     ),
-    origin_files=glob(["*.{h,c,txt}"], exclude=["CMakeLists.txt", "CHANGELOG.txt"]),
+    origin_files=glob(["*.{h,c,txt}"], exclude=["CMakeLists.txt", "requirements.txt"]),
     authoring=authoring.pass_thru(author),
     transformations=[
         metadata.expose_label("GIT_DESCRIBE_CHANGE_VERSION"),
@@ -162,8 +165,9 @@ core.workflow(
     origin_files=glob(["renderdoc/api/app/*.h"]),
     authoring=authoring.pass_thru(author),
     transformations=[
+        metadata.expose_label("GIT_DESCRIBE_CHANGE_VERSION"),
         metadata.replace_message(
-            "external/renderdoc_api: Update RenderDoc API from upstream"
+            "external/renderdoc_api: Update RenderDoc API from upstream ${GIT_DESCRIBE_CHANGE_VERSION}"
         ),
         core.move("renderdoc/api/app/", "src/external/renderdoc_api/"),
     ],
