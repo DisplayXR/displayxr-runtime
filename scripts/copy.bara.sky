@@ -1,7 +1,7 @@
-# Copyright 2022, Collabora, Ltd.
+# Copyright 2022-2025, Collabora, Ltd.
 #
 # SPDX-License-Identifier: BSL-1.0
-"""Configuration for "copybara" <https://github.com/google/copybara> to update vendored source"""
+"""Configuration for "copybara" <https://github.com/google/copybara> to update vendored source."""
 
 gitlab_url = "git@ssh.gitlab.freedesktop.org:rpavlik/monado.git"
 author = "Rylie Pavlik <rylie.pavlik@collabora.com>"
@@ -9,6 +9,7 @@ author = "Rylie Pavlik <rylie.pavlik@collabora.com>"
 # update-stb: Update STB libraries
 core.workflow(
     name = "update-stb",
+    custom_rev_id="STB_REV_ID",
     origin = git.github_origin(
         url = "https://github.com/nothings/stb.git",
         ref = "master",
@@ -39,6 +40,7 @@ def write_nanopb_commit(ctx):
 # not currently done by this code!
 core.workflow(
     name = "update-nanopb",
+    custom_rev_id="NANOPB_REV_ID",
     origin = git.github_origin(
         url = "https://github.com/nanopb/nanopb.git",
         # ref = "master",
@@ -72,6 +74,7 @@ core.workflow(
 # update-cjson: Update cJSON library
 core.workflow(
     name = "update-cjson",
+    custom_rev_id="CJSON_REV_ID",
     origin = git.github_origin(
         url = "https://github.com/DaveGamble/cJSON.git",
         # ref = "master",
@@ -134,6 +137,7 @@ core.workflow(
 # update-renderdoc: Update RenderDoc API
 core.workflow(
     name = "update-renderdoc",
+    custom_rev_id="RENDERDOC_REV_ID",
     origin = git.github_origin(
         url = "https://github.com/baldurk/renderdoc.git",
         ref = "v1.x",
