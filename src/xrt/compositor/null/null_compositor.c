@@ -446,6 +446,8 @@ null_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle
 	 * frames to be displayed to devices or remote clients.
 	 */
 
+	// If you are using the system/multi-compositor (multiple client module), your native compositor
+	// can just unref the sync handle. Otherwise please use it.
 	u_graphics_sync_unref(&sync_handle);
 
 	/*
