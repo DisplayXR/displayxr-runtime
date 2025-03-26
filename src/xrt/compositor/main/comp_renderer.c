@@ -962,11 +962,11 @@ dispatch_graphics(struct comp_renderer *r,
 
 	// The arguments for the dispatch function.
 	struct comp_render_dispatch_data data;
-	comp_render_gfx_initial_init( //
-	    &data,                    // data
-	    rtr,                      // rtr
-	    fast_path,                // fast_path
-	    do_timewarp);             // do_timewarp
+	comp_render_initial_init( //
+	    &data,                // data
+	    fast_path,            // fast_path
+	    do_timewarp);         // do_timewarp
+
 	for (uint32_t i = 0; i < render->r->view_count; i++) {
 		// Which image of the scratch images for this view are we using.
 		uint32_t scratch_index = crss->views[i].index;
@@ -993,18 +993,21 @@ dispatch_graphics(struct comp_renderer *r,
 
 		VkImageView sample_view = comp_scratch_single_images_get_sample_view(scratch_view, scratch_index);
 
-		comp_render_gfx_add_view( //
-		    &data,                //
-		    &world_poses[i],      //
-		    &eye_poses[i],        //
-		    &fovs[i],             //
-		    rsci->image,          // squash_image
-		    rsci_rtr,             // squash_rtr
-		    &layer_viewport_data, // squash_viewport_data
-		    sample_view,          // squash_as_src_sample_view
-		    &layer_norm_rect,     // squash_as_src_norm_rect
-		    &vertex_rots[i],      // target_vertex_rot
-		    &viewport_datas[i]);  // target_viewport_data
+		comp_render_gfx_add_squash_view( //
+		    &data,                       //
+		    &world_poses[i],             //
+		    &eye_poses[i],               //
+		    &fovs[i],                    //
+		    rsci->image,                 // squash_image
+		    rsci_rtr,                    // squash_rtr
+		    &layer_viewport_data);       // squash_viewport_data
+
+		comp_render_gfx_add_target_view( //
+		    &data,                       //
+		    sample_view,                 // squash_as_src_sample_view
+		    &layer_norm_rect,            // squash_as_src_norm_rect
+		    &vertex_rots[i],             // target_vertex_rot
+		    &viewport_datas[i]);         // target_viewport_data
 
 		if (layer_count == 0) {
 			crss->views[i].used = false;
@@ -1012,6 +1015,9 @@ dispatch_graphics(struct comp_renderer *r,
 			crss->views[i].used = !fast_path;
 		}
 	}
+
+	// Add the target info.
+	comp_render_gfx_add_target(&data, rtr);
 
 	// Start the graphics pipeline.
 	render_gfx_begin(render);
@@ -1083,12 +1089,10 @@ dispatch_compute(struct comp_renderer *r,
 
 	// The arguments for the dispatch function.
 	struct comp_render_dispatch_data data;
-	comp_render_cs_initial_init( //
-	    &data,                   // data
-	    target_image,            // target_image
-	    target_image_view,       // target_unorm_view
-	    fast_path,               // fast_path
-	    do_timewarp);            // do_timewarp
+	comp_render_initial_init( //
+	    &data,                // data
+	    fast_path,            // fast_path
+	    do_timewarp);         // do_timewarp
 
 	for (uint32_t i = 0; i < render->r->view_count; i++) {
 		// Which image of the scratch images for this view are we using.
@@ -1114,17 +1118,20 @@ dispatch_compute(struct comp_renderer *r,
 		VkImageView sample_view = comp_scratch_single_images_get_sample_view(scratch_view, scratch_index);
 		VkImageView storage_view = comp_scratch_single_images_get_storage_view(scratch_view, scratch_index);
 
-		comp_render_cs_add_view(  //
-		    &data,                //
-		    &world_poses[i],      //
-		    &eye_poses[i],        //
-		    &fovs[i],             //
-		    rsci->image,          // squash_image
-		    storage_view,         // squash_storage_view
-		    &layer_viewport_data, // squash_viewport_data
-		    sample_view,          // squash_as_src_sample_view
-		    &layer_norm_rect,     // squash_as_src_norm_rect
-		    &views[i]);           // target_viewport_data
+		comp_render_cs_add_squash_view( //
+		    &data,                      //
+		    &world_poses[i],            //
+		    &eye_poses[i],              //
+		    &fovs[i],                   //
+		    rsci->image,                // squash_image
+		    storage_view,               // squash_storage_view
+		    &layer_viewport_data);      // squash_viewport_data
+
+		comp_render_cs_add_target_view( //
+		    &data,                      //
+		    sample_view,                // squash_as_src_sample_view
+		    &layer_norm_rect,           // squash_as_src_norm_rect
+		    &views[i]);                 // target_viewport_data
 
 		if (layer_count == 0) {
 			crss->views[i].used = false;
@@ -1132,6 +1139,12 @@ dispatch_compute(struct comp_renderer *r,
 			crss->views[i].used = !fast_path;
 		}
 	}
+
+	// Add the target info.
+	comp_render_cs_add_target( //
+	    &data,                 // data
+	    target_image,          // target_image
+	    target_image_view);    // target_unorm_view
 
 	// Start the compute pipeline.
 	render_compute_begin(render);

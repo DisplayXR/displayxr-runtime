@@ -332,14 +332,14 @@ do_cs_quad_layer(const struct comp_layer *layer,
 static void
 crc_clear_output(struct render_compute *render, const struct comp_render_dispatch_data *d)
 {
-	if (d->view_count > XRT_MAX_VIEWS) {
+	if (d->target.view_count > XRT_MAX_VIEWS) {
 		U_LOG_E("Only supports max %d views!", XRT_MAX_VIEWS);
-		assert(d->view_count < XRT_MAX_VIEWS);
+		assert(d->target.view_count <= XRT_MAX_VIEWS);
 		return;
 	}
 
 	struct render_viewport_data target_viewport_datas[XRT_MAX_VIEWS];
-	for (uint32_t i = 0; i < d->view_count; ++i) {
+	for (uint32_t i = 0; i < d->target.view_count; ++i) {
 		target_viewport_datas[i] = d->views[i].target.viewport_data;
 	}
 
@@ -361,9 +361,9 @@ crc_clear_output(struct render_compute *render, const struct comp_render_dispatc
 static void
 crc_distortion_after_squash(struct render_compute *render, const struct comp_render_dispatch_data *d)
 {
-	if (d->view_count > XRT_MAX_VIEWS) {
+	if (d->target.view_count > XRT_MAX_VIEWS) {
 		U_LOG_E("Only supports max %d views!", XRT_MAX_VIEWS);
-		assert(d->view_count < XRT_MAX_VIEWS);
+		assert(d->target.view_count <= XRT_MAX_VIEWS);
 		return;
 	}
 	VkSampler clamp_to_border_black = render->r->samplers.clamp_to_border_black;
@@ -374,7 +374,7 @@ crc_distortion_after_squash(struct render_compute *render, const struct comp_ren
 	struct render_viewport_data target_viewport_datas[XRT_MAX_VIEWS];
 	struct xrt_normalized_rect src_norm_rects[XRT_MAX_VIEWS];
 
-	for (uint32_t i = 0; i < d->view_count; i++) {
+	for (uint32_t i = 0; i < d->target.view_count; i++) {
 		// Data to be filled in.
 		VkImageView src_image_view;
 		struct render_viewport_data viewport_data;
@@ -409,9 +409,9 @@ crc_distortion_fast_path(struct render_compute *render,
                          const struct comp_layer *layer,
                          const struct xrt_layer_projection_view_data *vds[XRT_MAX_VIEWS])
 {
-	if (d->view_count > XRT_MAX_VIEWS) {
+	if (d->target.view_count > XRT_MAX_VIEWS) {
 		U_LOG_E("Only supports max %d views!", XRT_MAX_VIEWS);
-		assert(d->view_count < XRT_MAX_VIEWS);
+		assert(d->target.view_count <= XRT_MAX_VIEWS);
 		return;
 	}
 
@@ -429,7 +429,7 @@ crc_distortion_fast_path(struct render_compute *render,
 	struct xrt_pose src_poses[XRT_MAX_VIEWS];
 	struct xrt_pose world_poses[XRT_MAX_VIEWS];
 
-	for (uint32_t i = 0; i < d->view_count; i++) {
+	for (uint32_t i = 0; i < d->target.view_count; i++) {
 		// Data to be filled in.
 		VkImageView src_image_view;
 		struct render_viewport_data viewport_data;
@@ -684,7 +684,7 @@ comp_render_cs_layers(struct render_compute *render,
 	    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,    // src_stage_mask
 	    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT); // dst_stage_mask
 
-	for (uint32_t view_index = 0; view_index < d->view_count; view_index++) {
+	for (uint32_t view_index = 0; view_index < d->squash_view_count; view_index++) {
 		const struct comp_render_view_data *view = &d->views[view_index];
 
 		comp_render_cs_layer(             //
@@ -719,6 +719,12 @@ comp_render_cs_dispatch(struct render_compute *render,
                         const uint32_t layer_count,
                         const struct comp_render_dispatch_data *d)
 {
+	if (!d->target.initialized) {
+		VK_ERROR(render->r->vk, "Target hasn't been initialized, not rendering anything.");
+		assert(d->target.initialized);
+		return;
+	}
+
 	// Convenience.
 	bool fast_path = d->fast_path;
 
@@ -735,7 +741,7 @@ comp_render_cs_dispatch(struct render_compute *render,
 		// Fast path.
 		const struct xrt_layer_projection_data *proj = &layer->data.proj;
 		const struct xrt_layer_projection_view_data *vds[XRT_MAX_VIEWS];
-		for (uint32_t view = 0; view < d->view_count; ++view) {
+		for (uint32_t view = 0; view < d->target.view_count; ++view) {
 			vds[view] = &proj->v[view];
 		}
 		crc_distortion_fast_path( //
@@ -748,7 +754,7 @@ comp_render_cs_dispatch(struct render_compute *render,
 		// Fast path.
 		const struct xrt_layer_projection_depth_data *depth = &layer->data.depth;
 		const struct xrt_layer_projection_view_data *vds[XRT_MAX_VIEWS];
-		for (uint32_t view = 0; view < d->view_count; ++view) {
+		for (uint32_t view = 0; view < d->target.view_count; ++view) {
 			vds[view] = &depth->v[view];
 		}
 		crc_distortion_fast_path( //

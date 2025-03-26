@@ -162,7 +162,7 @@ cmd_barrier_view_squash_images(struct vk_bundle *vk,
 	    .layerCount = 1,
 	};
 
-	for (uint32_t i = 0; i < d->view_count; i++) {
+	for (uint32_t i = 0; i < d->squash_view_count; i++) {
 		bool already_barriered = false;
 
 		VkImage image = d->views[i].squash.image;
