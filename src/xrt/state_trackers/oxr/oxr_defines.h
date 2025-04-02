@@ -32,6 +32,8 @@
 // body tracker
 #define OXR_XR_DEBUG_BTRACKER  (*(uint64_t *)"oxrbtra\0")
 #define OXR_XR_DEBUG_XDEVLIST  (*(uint64_t *)"oxrxdli\0")
+// plane detection
+#define OXR_XR_DEBUG_PLANEDET  (*(uint64_t *)"oxrplan\0")
 // clang-format on
 
 /*!
