@@ -98,7 +98,7 @@ forward to keeping the momentum up!
   - New compute-shader based rendering backend in the compositor. Supports
     projection, quad, equirect2, cylinder layers. It is not enabled by default.
     It also supports ATW. On some hardware the use of a compute queue improves
-    latency when pre-empting other GPU work.
+    latency when preempting other GPU work.
     ([!873](https://gitlab.freedesktop.org/monado/monado/merge_requests/873),
     [!1517](https://gitlab.freedesktop.org/monado/monado/merge_requests/1517),
     [!841](https://gitlab.freedesktop.org/monado/monado/merge_requests/841),
