@@ -1,0 +1,4 @@
+---
+- mr.2406
+---
+- OpenXR Fix: Crash related to depth layer handling.

@@ -1,1 +1,1 @@
-cmake: bump minimum required version to 3.22
+Change: bump minimum required CMake version to 3.22.

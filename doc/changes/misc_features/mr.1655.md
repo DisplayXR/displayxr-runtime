@@ -1,4 +1,4 @@
 ---
 - mr.2392
 ---
-Handle Android activity lifecycle.
+Improvement: Handle Android activity lifecycle.

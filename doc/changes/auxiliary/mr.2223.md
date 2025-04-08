@@ -1,1 +1,1 @@
-u/system_helper: Add support for device feature usage
+Util Improvement: Add support for device feature usage in system helper.

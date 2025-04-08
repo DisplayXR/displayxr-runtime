@@ -1,1 +1,1 @@
-Change: Bump overlay limit from 16 to 128
+Change: Bump overlay limit from 16 to 128.

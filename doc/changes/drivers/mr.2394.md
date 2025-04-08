@@ -1,0 +1,4 @@
+---
+- mr.2394
+---
+- WMR: Improve camera transfer handling

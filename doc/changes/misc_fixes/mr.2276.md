@@ -1,0 +1,5 @@
+---
+- issue.398
+- mr.2276
+---
+- Fix: Build system support for D3D on Windows.

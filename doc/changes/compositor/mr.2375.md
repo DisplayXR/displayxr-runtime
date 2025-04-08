@@ -1,0 +1,5 @@
+---
+- mr.2375
+- mr.2391
+---
+- Add: Support for refresh rate functions pass through to targets.

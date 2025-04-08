@@ -1,5 +1,7 @@
 ---
+- mr.1934
 - mr.2344
+- mr.2162
 ---
-- Fix possible deadlock from unanswered `xrWaitFrame`.
-- Fix conformance issues related to session state and session running/non-running.
+- OpenXR Fix: possible deadlock from unanswered `xrWaitFrame`.
+- OpenXR Fix: conformance issues related to session state and session running/non-running.

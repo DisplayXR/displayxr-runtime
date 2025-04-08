@@ -11,7 +11,8 @@
             "directory": "big"
         },
         "XRT Interface": {
-            "directory": "xrt"
+            "directory": "xrt",
+            "sort_by_prefix": true
         },
         "State Trackers": {
             "directory": "state_trackers",

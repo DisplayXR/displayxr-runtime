@@ -1,1 +1,1 @@
-- st/oxr: Implement the EXT_active_action_set_priority extension.
+- OpenXR Add: Implement the `XR_EXT_active_action_set_priority` extension.

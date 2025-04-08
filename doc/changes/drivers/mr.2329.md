@@ -1,0 +1,4 @@
+---
+- mr.2329
+---
+- OpenHMD: Use unofficial OpenHMD Haptics API.

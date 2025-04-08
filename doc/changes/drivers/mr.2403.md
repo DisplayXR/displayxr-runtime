@@ -1,0 +1,4 @@
+---
+- mr.2403
+---
+- Simulated: Implement visibility mask.

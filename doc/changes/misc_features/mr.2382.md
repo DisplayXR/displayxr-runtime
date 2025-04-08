@@ -1,2 +1,2 @@
-- gradle: Update gradle and related tools
-- re-format Kotlin files
+- Improvement: Update Gradle wrapper and related tools.
+- Improvement: Re-format Kotlin files.

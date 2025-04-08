@@ -1,1 +1,1 @@
-fix: Fix for simulated hand lag and thumb openness affecting certain applications on valve index knuckles.
+Fix: Fix for simulated hand lag and thumb openness affecting certain applications on Valve Index Controller.

@@ -1,0 +1,4 @@
+---
+- mr.2377
+---
+- Fix: Rendering error when using the fast path.

@@ -1,1 +1,1 @@
-xrt: rename offset field of `xrt_tracking_origin` to `initial_offset`
+Change: Rename offset field of `xrt_tracking_origin` to `initial_offset`.

@@ -1,0 +1,4 @@
+---
+- mr.2395
+---
+- WMR: Add product ID for HP Reverb G2 Omnicept.

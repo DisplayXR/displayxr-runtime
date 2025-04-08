@@ -1,1 +1,1 @@
-OpenXR: Add support for device feature usage
+OpenXR Improvement: Add support for device feature usage

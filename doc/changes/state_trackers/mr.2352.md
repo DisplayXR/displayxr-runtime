@@ -1,0 +1,4 @@
+---
+- issue.411
+---
+- OpenXR Fix: `(oxr_)xrGetVulkanDeviceExtensionsKHR` not outputting `VK_KHR_image_format_list` to the list of extensions to enable for apps using `XR_KHR_vulkan_enable` when `KHR_vulkan_swapchain_format_list` is enabled & used.

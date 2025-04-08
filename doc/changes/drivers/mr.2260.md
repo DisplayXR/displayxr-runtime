@@ -1,2 +1,2 @@
-android: Replace ALooper_pollAll with ALooper_pollOnce.
-android: Reduce CPU usage
+- Android: Replace `ALooper_pollAll` with `ALooper_pollOnce`.
+- Android: Reduce CPU usage.
