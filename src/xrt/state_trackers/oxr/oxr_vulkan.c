@@ -358,10 +358,10 @@ vk_get_device_features(struct oxr_logger *log,
                        VkInstance instance,
                        PFN_vkGetInstanceProcAddr GetInstanceProcAddr,
                        VkPhysicalDevice physical_device,
-                       VkPhysicalDeviceFeatures2 *physical_device_features)
+                       VkPhysicalDeviceFeatures2KHR *physical_device_features)
 {
-	PFN_vkGetPhysicalDeviceFeatures2 GetPhysicalDeviceFeatures2 =
-	    (PFN_vkGetPhysicalDeviceFeatures2)GetInstanceProcAddr(instance, "vkGetPhysicalDeviceFeatures2");
+	PFN_vkGetPhysicalDeviceFeatures2KHR GetPhysicalDeviceFeatures2 =
+	    (PFN_vkGetPhysicalDeviceFeatures2KHR)GetInstanceProcAddr(instance, "vkGetPhysicalDeviceFeatures2KHR");
 
 	if (!GetPhysicalDeviceFeatures2) {
 		oxr_error(log, XR_ERROR_RUNTIME_FAILURE, "Failed to get vkGetPhysicalDeviceFeatures2 fp");
@@ -457,8 +457,8 @@ oxr_vk_create_vulkan_device(struct oxr_logger *log,
 	free(props);
 
 
-	VkPhysicalDeviceFeatures2 physical_device_features = {
-	    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+	VkPhysicalDeviceFeatures2KHR physical_device_features = {
+	    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2_KHR,
 	    .pNext = NULL,
 	};
 
