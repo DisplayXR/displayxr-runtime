@@ -198,3 +198,42 @@ core.workflow(
         core.move("", "src/external/jnipp/"),
     ],
 )
+
+
+# update-openxr: Update OpenXR headers
+core.workflow(
+    name="update-openxr",
+    custom_rev_id="OPENXR_REV_ID",
+    origin=git.github_origin(
+        url="https://github.com/KhronosGroup/OpenXR-SDK.git",
+        ref="main",
+        describe_version=True,
+        # version_selector=core.latest_version(
+        #     format="refs/tags/release-${n0}.${n1}.${n2}",
+        #     regex_groups={
+        #         "n0": "1",
+        #         "n1": "[0-9]+",
+        #         "n2": "[0-9]+",
+        #     },
+        # ),
+    ),
+    destination=git.destination(
+        url=gitlab_url,
+        fetch="main",
+        push="update-openxr",
+    ),
+    destination_files=glob(
+        ["src/external/openxr_includes/openxr/openxr*.h"],
+        exclude=["src/external/openxr_includes/openxr/openxr_extension_helpers.h"],
+    ),
+    origin_files=glob(["include/openxr/*.h"]),
+    mode="SQUASH",
+    authoring=authoring.pass_thru(author),
+    transformations=[
+        metadata.expose_label("GIT_DESCRIBE_CHANGE_VERSION"),
+        metadata.replace_message(
+            "external/openxr_includes: Update OpenXR headers from upstream ${GIT_DESCRIBE_CHANGE_VERSION}"
+        ),
+        core.move("include/openxr/", "src/external/openxr_includes/openxr/"),
+    ],
+)
