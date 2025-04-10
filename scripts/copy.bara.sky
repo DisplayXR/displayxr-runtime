@@ -41,7 +41,7 @@ def write_nanopb_commit(ctx):
 
 
 # update-nanopb: Update NanoPB library
-# WARNING: Also requires update of the generated .pb.h and .pb.c files,
+# WARNING: May also require update of the generated .pb.h and .pb.c files,
 # not currently done by this code!
 core.workflow(
     name="update-nanopb",
@@ -115,17 +115,17 @@ core.workflow(
     ],
 )
 
-# update-catch2: Update Catch2 library, in case there's another 2.x release
+# update-catch2: Update Catch2 library (amalgamated version)
 core.workflow(
     name="update-catch2",
+    custom_rev_id="CATCH2_REV_ID",
     origin=git.github_origin(
         url="https://github.com/catchorg/Catch2.git",
-        # ref = "master",
         describe_version=True,
         version_selector=core.latest_version(
             format="refs/tags/v${n0}.${n1}.${n2}",
             regex_groups={
-                "n0": "2",
+                "n0": "3",
                 "n1": "[0-9]+",
                 "n2": "[0-9]+",
             },
@@ -137,14 +137,15 @@ core.workflow(
         push="update-catch2",
     ),
     destination_files=glob(["src/external/Catch2/*"]),
-    origin_files=glob(["single_include/catch2/catch.hpp"]),
+    origin_files=glob(["extras/catch_amalgamated.*", "LICENSE.txt"]),
     authoring=authoring.pass_thru(author),
     transformations=[
         metadata.expose_label("GIT_DESCRIBE_CHANGE_VERSION"),
         metadata.replace_message(
             "external/Catch2: Update Catch2 from upstream ${GIT_DESCRIBE_CHANGE_VERSION}"
         ),
-        core.move("single_include/catch2/catch.hpp", "src/external/Catch2/catch/"),
+        core.move("extras/", "src/external/Catch2/"),
+        core.move("LICENSE.txt", "src/external/Catch2/LICENSE.txt"),
     ],
 )
 
