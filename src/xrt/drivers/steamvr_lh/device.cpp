@@ -471,8 +471,13 @@ ControllerDevice::set_output(xrt_output_name name, const xrt_output_value *value
 	event.componentHandle = haptic_handle;
 	event.fDurationSeconds = (float)vib.duration_ns / 1e9f;
 	// 0.0f in OpenXR means let the driver determine a frequency, but
-	// in OpenVR means no haptic.
-	event.fFrequency = std::max(vib.frequency, 1.0f);
+	// in OpenVR means no haptic, so let's set a reasonable default.
+	float frequency = vib.frequency;
+	if (frequency == 0.0) {
+		frequency = 200.0f;
+	}
+
+	event.fFrequency = frequency;
 	event.fAmplitude = vib.amplitude;
 
 	ctx->add_haptic_event(event);
