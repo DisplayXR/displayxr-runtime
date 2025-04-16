@@ -415,6 +415,14 @@ public:
 		case XRT_DEVICE_VIVE_TRACKER_GEN2:
 		case XRT_DEVICE_VIVE_TRACKER_GEN3:
 		case XRT_DEVICE_VIVE_TRACKER_TUNDRA: m_render_model = "{htc}vr_tracker_vive_1_0"; break;
+		case XRT_DEVICE_FLIPVR:
+			if (hand == XRT_HAND_LEFT) {
+				m_render_model = "{shiftall}flipvr_controller_vc1b_left";
+			}
+			if (hand == XRT_HAND_RIGHT) {
+				m_render_model = "{shiftall}flipvr_controller_vc1b_right";
+			}
+			break;
 		case XRT_DEVICE_PSMV:
 		case XRT_DEVICE_HYDRA:
 		case XRT_DEVICE_DAYDREAM:
@@ -622,6 +630,44 @@ public:
 
 			AddOutputControl(XRT_OUTPUT_NAME_PSMV_RUMBLE_VIBRATION, "/output/haptic");
 		} break;
+		case XRT_DEVICE_FLIPVR: {
+
+			AddControl("/input/trigger/value", XRT_INPUT_FLIPVR_TRIGGER_VALUE, NULL);
+
+			AddControl("/input/trigger/click", XRT_INPUT_FLIPVR_TRIGGER_CLICK, NULL);
+			AddControl("/input/trigger/touch", XRT_INPUT_FLIPVR_TRIGGER_TOUCH, NULL);
+
+			AddControl("/input/system/click", XRT_INPUT_FLIPVR_SYSTEM_CLICK, NULL);
+
+			AddControl("/input/a/click", XRT_INPUT_FLIPVR_A_CLICK, NULL);
+			AddControl("/input/a/touch", XRT_INPUT_FLIPVR_A_TOUCH, NULL);
+
+			AddControl("/input/b/click", XRT_INPUT_FLIPVR_B_CLICK, NULL);
+			AddControl("/input/b/touch", XRT_INPUT_FLIPVR_B_TOUCH, NULL);
+
+			AddControl("/input/a/click", XRT_INPUT_FLIPVR_X_CLICK, NULL);
+			AddControl("/input/a/touch", XRT_INPUT_FLIPVR_X_TOUCH, NULL);
+
+			AddControl("/input/b/click", XRT_INPUT_FLIPVR_Y_CLICK, NULL);
+			AddControl("/input/b/touch", XRT_INPUT_FLIPVR_Y_TOUCH, NULL);
+
+			AddControl("/input/grip/value", XRT_INPUT_FLIPVR_SQUEEZE_VALUE, NULL);
+
+			AddControl("/input/grip/click", XRT_INPUT_FLIPVR_SQUEEZE_CLICK, NULL);
+
+			struct MonadoInputComponent x = {true, true, false};
+			struct MonadoInputComponent y = {true, false, true};
+
+			AddControl("/input/thumbstick/click", XRT_INPUT_FLIPVR_THUMBSTICK_CLICK, NULL);
+
+			AddControl("/input/thumbstick/touch", XRT_INPUT_FLIPVR_THUMBSTICK_TOUCH, NULL);
+
+			AddControl("/input/thumbstick/x", XRT_INPUT_FLIPVR_THUMBSTICK, &x);
+
+			AddControl("/input/thumbstick/y", XRT_INPUT_FLIPVR_THUMBSTICK, &y);
+
+			AddOutputControl(XRT_OUTPUT_NAME_FLIPVR_HAPTIC, "/output/haptic");
+		}
 
 		case XRT_DEVICE_TOUCH_CONTROLLER: break;    // TODO
 		case XRT_DEVICE_WMR_CONTROLLER: break;      // TODO
@@ -863,6 +909,8 @@ public:
 			grip_name = XRT_INPUT_VIVE_GRIP_POSE;
 		} else if (m_xdev->name == XRT_DEVICE_INDEX_CONTROLLER) {
 			grip_name = XRT_INPUT_INDEX_GRIP_POSE;
+		} else if (m_xdev->name == XRT_DEVICE_FLIPVR) {
+			grip_name = XRT_INPUT_FLIPVR_GRIP_POSE;
 		} else if (m_xdev->name == XRT_DEVICE_PSMV) {
 			grip_name = XRT_INPUT_PSMV_GRIP_POSE;
 		} else if (m_xdev->name == XRT_DEVICE_DAYDREAM) {
