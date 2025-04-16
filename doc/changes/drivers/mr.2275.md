@@ -1,0 +1,4 @@
+---
+- mr.2275
+---
+- steamvr_lh: Allow setting brightness with env var

@@ -1,0 +1,4 @@
+---
+- mr.2250
+---
+- Fixed OpenGL flipping of subimage coordinates

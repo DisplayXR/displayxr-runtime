@@ -1,0 +1,4 @@
+---
+- mr.2243
+---
+- Improvement: Some cleanups and better Gradle project naming for Android

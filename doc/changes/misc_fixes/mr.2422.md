@@ -1,0 +1,4 @@
+---
+- mr.2422
+---
+- Fix: Fixed custom OpenXR target builds

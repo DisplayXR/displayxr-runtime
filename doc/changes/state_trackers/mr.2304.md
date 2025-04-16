@@ -1,0 +1,4 @@
+---
+- mr.2304
+---
+- OpenXR Fix: Fixed bug when XR_KHR_composition_layer_depth is disabled

@@ -1,0 +1,4 @@
+---
+- mr.2262
+---
+- OpenXR Improvement: Added verification for frameEndInfo->layerCount

@@ -1,0 +1,4 @@
+---
+- mr.2427
+---
+- Improvement: Initialize hmd data from static role.

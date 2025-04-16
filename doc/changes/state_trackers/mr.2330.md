@@ -1,0 +1,4 @@
+---
+- mr.2330
+---
+- OpenXR Add: Expose all current controller grip poses via MNDX_xdev_space.

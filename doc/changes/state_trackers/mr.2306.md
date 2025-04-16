@@ -1,0 +1,4 @@
+---
+- mr.2306
+---
+- OpenXR Fix: Fixed `XrFacialTrackerHTC` validation

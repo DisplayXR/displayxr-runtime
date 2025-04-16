@@ -1,0 +1,4 @@
+---
+- mr.2256
+---
+- OpenXR Fix: Fix `XR_TIMEOUT_EXPIRED` return value on timeout of Vulkan swapchain waiting.

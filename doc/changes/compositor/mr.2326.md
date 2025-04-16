@@ -1,0 +1,4 @@
+---
+- mr.2326
+---
+- Fix: Removed HP desktop monitor from NVIDIA allow-list.

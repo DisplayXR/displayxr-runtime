@@ -1,0 +1,4 @@
+---
+- mr.2265
+---
+- Improvement: Allow custom service library names for Android.
