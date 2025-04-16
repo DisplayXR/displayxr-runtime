@@ -351,8 +351,12 @@ _calculate_fov(struct vive_config *d)
 		h_meters = 0.07;
 		// eye relief knob adjusts this around [0.0255(near)-0.275(far)]
 		eye_to_screen_distance = 0.0255;
-	}
-	if (d->variant == VIVE_VARIANT_PRO2) {
+	} else if (d->variant == VIVE_VARIANT_PRO) {
+		lens_horizontal_separation = 0.055;
+		eye_to_screen_distance = 0.02544;
+		h_meters = 0.066755;
+		w_meters = 0.120000 / 2.0;
+	} else if (d->variant == VIVE_VARIANT_PRO2) {
 		lens_horizontal_separation = 0.055;
 		h_meters = 0.07;
 		// eye relief knob adjusts this around [0.0255(near)-0.275(far)]
