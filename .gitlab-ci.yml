@@ -156,7 +156,7 @@ win:container_prep:
 # Variables for build and usage of Arch image
 .monado.variables.arch:
   variables:
-    FDO_DISTRIBUTION_TAG: "2024-01-16"
+    FDO_DISTRIBUTION_TAG: "2025-04-18"
 
 # Variables for build and usage of Alpine image
 .monado.variables.alpine:

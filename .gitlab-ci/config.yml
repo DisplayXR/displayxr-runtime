@@ -213,7 +213,7 @@ distributions:
 
   - name: arch
     images:
-      - tag: "2024-01-16"
+      - tag: "2025-04-18"
         script: install-arch-additional-deps.sh
         # pipewire-jack wireplumber: Explicitly choose dependencies to avoid pacman asking interactively
         # python-setuptools glu: librealsense
