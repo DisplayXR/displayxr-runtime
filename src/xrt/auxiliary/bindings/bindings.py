@@ -262,7 +262,7 @@ class Identifier:
         self.components = component_list
         self.dpad = dpad
         return
-    
+
 
 class FeatureSet:
     """An AND of requirements (versions and/or extensions) under which a binding becomes available"""
@@ -317,7 +317,7 @@ class Availability:
         if not optimize:
             self.feature_sets = set(feature_sets)
             return
-            
+
         self.feature_sets = set()
         for feature_set in feature_sets:
             self.add_in_place(feature_set)
@@ -613,7 +613,7 @@ def write_verify_func_switch(f, dict_of_lists, profile, profile_name, availabili
             closing.append(f'{tab_char}}}\n#endif // {ext_defines}\n')
 
         write_verify_switch_body(f, dict_of_lists, profile, profile_name, tab_char)
-        
+
         for closer in reversed(closing):
             f.write(closer)
 

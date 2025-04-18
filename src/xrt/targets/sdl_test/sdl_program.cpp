@@ -1,4 +1,4 @@
-﻿// Copyright 2020-2022, Collabora, Ltd.
+// Copyright 2020-2022, Collabora, Ltd.
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
