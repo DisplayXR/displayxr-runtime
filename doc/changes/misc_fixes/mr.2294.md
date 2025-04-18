@@ -1,4 +1,0 @@
----
-- mr.2294
----
-- Add: Added `FEATURE_AHARDWARE_BUFFER` CMake option for Android

@@ -1,4 +1,0 @@
----
-- mr.2273
----
-- Fix: Handle environment blend modes more correctly.

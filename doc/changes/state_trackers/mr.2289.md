@@ -1,4 +1,0 @@
----
-- mr.2289
----
-- OpenXR Fix: Fixed `XR_SPACE_BOUNDS_UNAVAILABLE` return value for unimplemented functions.

@@ -1,4 +1,0 @@
----
-- mr.2354
----
-- OpenXR Fix: Fixed crash getting ref space bounds in headless mode

@@ -1,4 +1,0 @@
----
-- mr.2424
----
-- Ultraleap: Adapted driver to recent xrt_device interface changes

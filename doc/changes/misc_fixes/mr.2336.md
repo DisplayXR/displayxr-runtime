@@ -1,7 +1,0 @@
----
-- issue.388
-- issue.393
-- issue.489
-- mr.2336
----
-- Fix: Bluetooth device detection when `UserspaceHID=true` in `/etc/bluetooth/input.conf`

@@ -1,4 +1,0 @@
----
-- mr.2445
----
-- WMR: Add product ID for Acer AH100.

@@ -1,10 +1,432 @@
 # Changelog for Monado {#CHANGELOG}
 
-```txt
+<!--
 SPDX-License-Identifier: CC0-1.0
 
-SPDX-FileCopyrightText: 2020-2024 Collabora, Ltd. and the Monado contributors
-```
+SPDX-FileCopyrightText: 2020-2025 Collabora, Ltd. and the Monado contributors
+-->
+
+## Monado 25.0.0 (2025-04-18)
+
+This is the first stable Monado release of 2025. It contains a variety of
+features, fixes, and improvements over the previous release, and is a
+recommended upgrade for all users and downstream projects. Important fixes may
+be backported from "main" to a 25.0.x stable branch, depending on severity.
+
+A vibrant community, including a Discord chat with nearly 3000 members, as well
+as over 40 contributors to over 400 code commits in this release alone, helped
+make Monado 25.0 possible. This count certainly overlooks many valued
+contributors who share their experience and talents through documentation,
+blogs, social media, and spreading the word. Thank you to everyone who
+participates in the open source XR ecosystem in any way, contributing your
+diverse skills and perspectives. Let's keep making things we can be proud of,
+together.
+
+- "XRT" (Internal) Interface
+  - Add: New `xrt/xrt_android.h` header.
+    ([!1655](https://gitlab.freedesktop.org/monado/monado/merge_requests/1655))
+  - Add: `xrt_compositor::get_display_refresh_rate` so that the application can get
+    the current display refresh rate.
+    ([!1786](https://gitlab.freedesktop.org/monado/monado/merge_requests/1786))
+  - Add: `xrt_compositor::request_display_refresh_rate` so that the application can
+    trigger a display refresh rate change.
+    ([!1786](https://gitlab.freedesktop.org/monado/monado/merge_requests/1786))
+  - Add: `xrt_compositor_event_display_refresh_rate_change` so compositor can
+    notify applications that the display refresh rate has been changed.
+    ([!1786](https://gitlab.freedesktop.org/monado/monado/merge_requests/1786))
+  - Add: Support for device feature usage.
+    ([!2223](https://gitlab.freedesktop.org/monado/monado/merge_requests/2223))
+  - Add: Introduce `XRT_ERROR_NOT_IMPLEMENTED`, remove
+    `XRT_ERROR_DEVICE_FUNCTION_NOT_IMPLEMENTED` and
+    `XRT_ERROR_COMPOSITOR_FUNCTION_NOT_IMPLEMENTED`.
+    ([!2244](https://gitlab.freedesktop.org/monado/monado/merge_requests/2244))
+  - Add: Introduce `XRT_ERROR_INPUT_UNSUPPORTED`.
+    ([!2271](https://gitlab.freedesktop.org/monado/monado/merge_requests/2271))
+  - Add: Introduce `XRT_ERROR_UNSUPPORTED_SPACE_TYPE`, `XRT_ERROR_ANDROID`.
+    ([!2284](https://gitlab.freedesktop.org/monado/monado/merge_requests/2284),
+    [!1655](https://gitlab.freedesktop.org/monado/monado/merge_requests/1655))
+  - Add: New `get_battery_status` method to `xrt_device` for getting the device's
+    battery status info.
+    ([!2292](https://gitlab.freedesktop.org/monado/monado/merge_requests/2292))
+  - Add: Methods to support `XR_FB_face_tracking2` extension.
+    ([!2299](https://gitlab.freedesktop.org/monado/monado/merge_requests/2299))
+  - Change: Move `xrt_instance_info` members to nested `xrt_application_info`
+    struct, and add a parallel `xrt_platform_info`.
+    ([!1655](https://gitlab.freedesktop.org/monado/monado/merge_requests/1655))
+  - Change: Add `xrt_instance_android` interface, optional aspect of `xrt_instance`
+    when building on Android.
+    ([!1655](https://gitlab.freedesktop.org/monado/monado/merge_requests/1655))
+  - Change: `xrt_device_update_inputs` returns `xrt_result_t`
+    ([!2246](https://gitlab.freedesktop.org/monado/monado/merge_requests/2246))
+  - Change: Add `localfloorspace` and modify `create_local_space` to support multi-
+    local_floor space on server side.
+    ([!2252](https://gitlab.freedesktop.org/monado/monado/merge_requests/2252))
+  - Change: `xrt_device_get_tracked_pose` returns `xrt_result_t` to improve error
+    handling in the state tracker.
+    ([!2271](https://gitlab.freedesktop.org/monado/monado/merge_requests/2271))
+  - Change: Rename offset field of `xrt_tracking_origin` to `initial_offset`.
+    ([!2286](https://gitlab.freedesktop.org/monado/monado/merge_requests/2286))
+  - Change: Use `int64_t` (instead of `uint64_t`) for all timestamps.
+    ([!2298](https://gitlab.freedesktop.org/monado/monado/merge_requests/2298))
+  - Change: Add `at_timestamp_ns` argument to `get_face_tracking`.
+    ([!2310](https://gitlab.freedesktop.org/monado/monado/merge_requests/2310))
+  - Change: Bump overlay limit from 16 to 128.
+    ([!2341](https://gitlab.freedesktop.org/monado/monado/merge_requests/2341))
+  - Fix: Propagate the enabled state of `VK_KHR_image_format_list` to `vk_bundle`.
+    ([!2352](https://gitlab.freedesktop.org/monado/monado/merge_requests/2352),
+    [#411](https://gitlab.freedesktop.org/monado/monado/issues/411))
+- libmonado Interface
+  - Add: In libmonado, add get/set for reference space offsets & tracking origin
+    offsets.
+    ([!2284](https://gitlab.freedesktop.org/monado/monado/merge_requests/2284))
+  - Add: In libmonado, add getters for tracking origin count and name.
+    ([!2284](https://gitlab.freedesktop.org/monado/monado/merge_requests/2284))
+  - Add: Add a function to libmonado for getting a device's battery status
+    information.
+    ([!2292](https://gitlab.freedesktop.org/monado/monado/merge_requests/2292))
+  - Add: In libmonado, add tracking-related device properties
+    ([!2313](https://gitlab.freedesktop.org/monado/monado/merge_requests/2313))
+  - Change: Bump the libmonado API version from 1.2 to 1.3.
+    ([!2284](https://gitlab.freedesktop.org/monado/monado/merge_requests/2284))
+- State Trackers
+  - Debug GUI Change: disabled mono camera calibration
+    ([!2259](https://gitlab.freedesktop.org/monado/monado/merge_requests/2259))
+  - Debug GUI Improvement: draw `gui_widget_native_images` with header, scale
+    slider and rotation checkbox.
+    ([!2303](https://gitlab.freedesktop.org/monado/monado/merge_requests/2303))
+  - OpenXR Add: Add `MND_libmonado_path` in OpenXR runtime manifest.
+    ([!2285](https://gitlab.freedesktop.org/monado/monado/merge_requests/2285))
+  - OpenXR Add: Expose all current controller grip poses via MNDX_xdev_space.
+    ([!2330](https://gitlab.freedesktop.org/monado/monado/merge_requests/2330))
+  - OpenXR Add: Implement the `XR_EXT_active_action_set_priority` extension.
+    ([!2370](https://gitlab.freedesktop.org/monado/monado/merge_requests/2370))
+  - OpenXR Change: Allow disabling `XR_EXT_hand_tracking` through CMake
+    ([!2296](https://gitlab.freedesktop.org/monado/monado/merge_requests/2296))
+  - OpenXR Fix: possible deadlock from unanswered `xrWaitFrame`.
+    ([!1934](https://gitlab.freedesktop.org/monado/monado/merge_requests/1934),
+    [!2344](https://gitlab.freedesktop.org/monado/monado/merge_requests/2344),
+    [!2162](https://gitlab.freedesktop.org/monado/monado/merge_requests/2162))
+  - OpenXR Fix: conformance issues related to session state and session
+    running/non-running.
+    ([!1934](https://gitlab.freedesktop.org/monado/monado/merge_requests/1934),
+    [!2344](https://gitlab.freedesktop.org/monado/monado/merge_requests/2344),
+    [!2162](https://gitlab.freedesktop.org/monado/monado/merge_requests/2162))
+  - OpenXR Fix: Fix `XR_TIMEOUT_EXPIRED` return value on timeout of Vulkan
+    swapchain waiting.
+    ([!2256](https://gitlab.freedesktop.org/monado/monado/merge_requests/2256))
+  - OpenXR Fix: Fixed `XR_SPACE_BOUNDS_UNAVAILABLE` return value for unimplemented
+    functions.
+    ([!2289](https://gitlab.freedesktop.org/monado/monado/merge_requests/2289))
+  - OpenXR Fix: Fixed bug when XR_KHR_composition_layer_depth is disabled
+    ([!2304](https://gitlab.freedesktop.org/monado/monado/merge_requests/2304))
+  - OpenXR Fix: Fixed `XrFacialTrackerHTC` validation
+    ([!2306](https://gitlab.freedesktop.org/monado/monado/merge_requests/2306))
+  - OpenXR Fix: Miscellaneous conformance issues.
+    ([!2327](https://gitlab.freedesktop.org/monado/monado/merge_requests/2327),
+    [!2402](https://gitlab.freedesktop.org/monado/monado/merge_requests/2402),
+    [!2364](https://gitlab.freedesktop.org/monado/monado/merge_requests/2364))
+  - OpenXR Fix: `(oxr_)xrGetVulkanDeviceExtensionsKHR` not outputting
+    `VK_KHR_image_format_list` to the list of extensions to enable for apps using
+    `XR_KHR_vulkan_enable` when `KHR_vulkan_swapchain_format_list` is enabled &
+    used.
+    ([!2352](https://gitlab.freedesktop.org/monado/monado/merge_requests/2352),
+    [#411](https://gitlab.freedesktop.org/monado/monado/issues/411))
+  - OpenXR Fix: Fixed crash getting ref space bounds in headless mode
+    ([!2354](https://gitlab.freedesktop.org/monado/monado/merge_requests/2354))
+  - OpenXR Fix: Crash related to depth layer handling.
+    ([!2406](https://gitlab.freedesktop.org/monado/monado/merge_requests/2406))
+  - OpenXR Improvement: Add support for device feature usage
+    ([!2223](https://gitlab.freedesktop.org/monado/monado/merge_requests/2223))
+  - OpenXR Improvement: Added verification for frameEndInfo->layerCount
+    ([!2262](https://gitlab.freedesktop.org/monado/monado/merge_requests/2262))
+  - OpenXR Improvement: Add quirk to return parallel view poses with the
+    environment variable `OXR_PARALLEL_VIEWS`.
+    ([!2312](https://gitlab.freedesktop.org/monado/monado/merge_requests/2312))
+  - OpenXR Improvement: Update OpenXR headers to 1.1.47.
+    ([!2353](https://gitlab.freedesktop.org/monado/monado/merge_requests/2353),
+    [!2453](https://gitlab.freedesktop.org/monado/monado/merge_requests/2453))
+- Drivers
+  - Android: Replace `ALooper_pollAll` with `ALooper_pollOnce`.
+    ([!2260](https://gitlab.freedesktop.org/monado/monado/merge_requests/2260))
+  - Android: Reduce CPU usage.
+    ([!2260](https://gitlab.freedesktop.org/monado/monado/merge_requests/2260))
+  - Android: Fix distortion computation for Cardboard
+    ([!2412](https://gitlab.freedesktop.org/monado/monado/merge_requests/2412))
+  - OpenHMD: Use unofficial OpenHMD Haptics API.
+    ([!2329](https://gitlab.freedesktop.org/monado/monado/merge_requests/2329))
+  - PS Sense: Use IMU timestamp.
+    ([!2301](https://gitlab.freedesktop.org/monado/monado/merge_requests/2301))
+  - Qwerty: Switched qwerty simulated controllers to WMR controllers
+    ([!2355](https://gitlab.freedesktop.org/monado/monado/merge_requests/2355))
+  - Simulated: Implement visibility mask.
+    ([!2403](https://gitlab.freedesktop.org/monado/monado/merge_requests/2403))
+  - Ultraleap: Adapted driver to recent xrt_device interface changes
+    ([!2424](https://gitlab.freedesktop.org/monado/monado/merge_requests/2424))
+  - WMR: Fix controller status reporting.
+    ([!2188](https://gitlab.freedesktop.org/monado/monado/merge_requests/2188))
+  - WMR: Improve camera transfer handling
+    ([!2394](https://gitlab.freedesktop.org/monado/monado/merge_requests/2394))
+  - WMR: Add product ID for HP Reverb G2 Omnicept.
+    ([!2395](https://gitlab.freedesktop.org/monado/monado/merge_requests/2395))
+  - WMR: Add product ID for Acer AH100.
+    ([!2445](https://gitlab.freedesktop.org/monado/monado/merge_requests/2445))
+  - steamvr_lh: Use properties for device descriptions.
+    ([!2207](https://gitlab.freedesktop.org/monado/monado/merge_requests/2207))
+  - steamvr_lh: Support loading SlimeVR OpenVR driver alongside lighthouse.
+    ([!2251](https://gitlab.freedesktop.org/monado/monado/merge_requests/2251))
+  - steamvr_lh: Allow setting brightness with env var
+    ([!2275](https://gitlab.freedesktop.org/monado/monado/merge_requests/2275))
+  - steamvr_lh: fix disabling of hand simulation causing segfault.
+    ([!2290](https://gitlab.freedesktop.org/monado/monado/merge_requests/2290))
+  - steamvr_lh: Implement battery status query.
+    ([!2292](https://gitlab.freedesktop.org/monado/monado/merge_requests/2292))
+  - steamvr_lh: Refactor and cleanup.
+    ([!2297](https://gitlab.freedesktop.org/monado/monado/merge_requests/2297),
+    [!2282](https://gitlab.freedesktop.org/monado/monado/merge_requests/2282),
+    [!2140](https://gitlab.freedesktop.org/monado/monado/merge_requests/2140))
+  - steamvr_lh: Fix crash on shutdown.
+    ([!2324](https://gitlab.freedesktop.org/monado/monado/merge_requests/2324))
+  - steamvr_lh: Fix for simulated hand lag and thumb openness affecting certain
+    applications on Valve Index Controller.
+    ([!2340](https://gitlab.freedesktop.org/monado/monado/merge_requests/2340))
+  - steamvr_lh: Add new steamvr beta driver internal interface.
+    ([!2361](https://gitlab.freedesktop.org/monado/monado/merge_requests/2361))
+  - steamvr_lh: Fix teardown.
+    ([!2387](https://gitlab.freedesktop.org/monado/monado/merge_requests/2387),
+    [!2229](https://gitlab.freedesktop.org/monado/monado/merge_requests/2229))
+  - steamvr_lh: Allow building lighthouse driver without `XRT_HAVE_STEAM`
+    ([!2418](https://gitlab.freedesktop.org/monado/monado/merge_requests/2418))
+  - survive: Implement battery status query.
+    ([!2292](https://gitlab.freedesktop.org/monado/monado/merge_requests/2292))
+  - twrap: Fix conditional compilation.
+    ([!2140](https://gitlab.freedesktop.org/monado/monado/merge_requests/2140))
+- IPC
+  - Add: Support for device feature usage
+    ([!2223](https://gitlab.freedesktop.org/monado/monado/merge_requests/2223))
+  - Add: Support multi-local_floor space on server side.
+    ([!2252](https://gitlab.freedesktop.org/monado/monado/merge_requests/2252))
+  - Add: `get`/`set_tracking_origin_offset`, `get`/`set_reference_space_offset`
+    methods
+    ([!2284](https://gitlab.freedesktop.org/monado/monado/merge_requests/2284))
+  - Add: device battery status query.
+    ([!2292](https://gitlab.freedesktop.org/monado/monado/merge_requests/2292))
+  - Improvement: Allow custom service library names for Android.
+    ([!2265](https://gitlab.freedesktop.org/monado/monado/merge_requests/2265))
+  - Improvement: Initialize hmd data from static role.
+    ([!2427](https://gitlab.freedesktop.org/monado/monado/merge_requests/2427))
+- Compositor
+  - Add: Implement the dynamic display refresh rates support on Android platform.
+    ([!1786](https://gitlab.freedesktop.org/monado/monado/merge_requests/1786))
+  - Add: introduce the environment variable 'WAYLAND_CONNECTOR' to request a
+    specific connector on Wayland.
+    ([!2295](https://gitlab.freedesktop.org/monado/monado/merge_requests/2295),
+    [!2283](https://gitlab.freedesktop.org/monado/monado/merge_requests/2283),
+    [!2278](https://gitlab.freedesktop.org/monado/monado/merge_requests/2278))
+  - Add: New `comp_layer_accum` helper, factored out from `comp_base`, that
+    collects layers and swapchains for a frame.
+    ([!2317](https://gitlab.freedesktop.org/monado/monado/merge_requests/2317),
+    [!2377](https://gitlab.freedesktop.org/monado/monado/merge_requests/2377))
+  - Add: Expose a `comp_render_gfx_layers` (formerly called `do_layers`) to match
+    the `comp_render_cs_layers` function, which squashes layers.
+    ([!2323](https://gitlab.freedesktop.org/monado/monado/merge_requests/2323),
+    [!2380](https://gitlab.freedesktop.org/monado/monado/merge_requests/2380),
+    [!2388](https://gitlab.freedesktop.org/monado/monado/merge_requests/2388))
+  - Add: Support for refresh rate functions pass through to targets.
+    ([!2375](https://gitlab.freedesktop.org/monado/monado/merge_requests/2375),
+    [!2391](https://gitlab.freedesktop.org/monado/monado/merge_requests/2391))
+  - Change: Modify `comp_base` to use `comp_layer_accum` helper, instead of
+    inlining that code. Users of `comp_base` will need to update their code
+    accordingly.
+    ([!2317](https://gitlab.freedesktop.org/monado/monado/merge_requests/2317),
+    [!2377](https://gitlab.freedesktop.org/monado/monado/merge_requests/2377))
+  - Fix: General correctness and valid usage issues.
+    ([!2233](https://gitlab.freedesktop.org/monado/monado/merge_requests/2233))
+  - Fix: Handle environment blend modes more correctly.
+    ([!2273](https://gitlab.freedesktop.org/monado/monado/merge_requests/2273))
+  - Fix: Removed HP desktop monitor from NVIDIA allow-list.
+    ([!2326](https://gitlab.freedesktop.org/monado/monado/merge_requests/2326))
+  - Fix: propagate the enabled state of `VK_KHR_image_format_list` to `vk_bundle`
+    and fix `vk_bundle::has_KHR_image_format_list` not being set to enabled in the
+    client compositor.
+    ([!2352](https://gitlab.freedesktop.org/monado/monado/merge_requests/2352),
+    [#411](https://gitlab.freedesktop.org/monado/monado/issues/411))
+  - Fix: Use and set format lists for `VK_KHR_image_format_list` on client Vulkan
+    image creation when requested by Vulkan-based apps using mutable formats.
+    ([!2352](https://gitlab.freedesktop.org/monado/monado/merge_requests/2352),
+    [#411](https://gitlab.freedesktop.org/monado/monado/issues/411))
+  - Fix: Rendering error when using the fast path.
+    ([!2377](https://gitlab.freedesktop.org/monado/monado/merge_requests/2377))
+  - Fixed OpenGL flipping of subimage coordinates
+    ([!2250](https://gitlab.freedesktop.org/monado/monado/merge_requests/2250))
+  - Improvement: Code and comment cleanup of compositor utilities and modules
+    related to layer squashing and distortion, including renames in in
+    `comp/render/*` and `comp/util/comp_render_*` for consistency.
+    ([!2323](https://gitlab.freedesktop.org/monado/monado/merge_requests/2323),
+    [!2380](https://gitlab.freedesktop.org/monado/monado/merge_requests/2380),
+    [!2388](https://gitlab.freedesktop.org/monado/monado/merge_requests/2388))
+  - Improvement: Reverts the default compositor pipeline on Android from compute-
+    shader-based back to graphics-shader-based.
+    ([!2337](https://gitlab.freedesktop.org/monado/monado/merge_requests/2337))
+  - null: Don't crash on `XR_FB_display_refresh_rate` use
+    ([!2368](https://gitlab.freedesktop.org/monado/monado/merge_requests/2368))
+- Helper Libraries
+  - Android Add: Add APIs for getting supported/current display refresh rates/rate
+    on Android device.
+    ([!1786](https://gitlab.freedesktop.org/monado/monado/merge_requests/1786))
+  - Android Add: Add `ahardwarebuffer_is_supported` function for format checking.
+    ([!2407](https://gitlab.freedesktop.org/monado/monado/merge_requests/2407))
+  - Android Improvement: Change the implementation of `getRuntimeSourceDir`
+    function to support `useLegacyPackaging` set to `false`.
+    ([!2153](https://gitlab.freedesktop.org/monado/monado/merge_requests/2153))
+  - Bindings Fix: Fixed `META_touch_controller_plus` interaction profile name
+    ([!2405](https://gitlab.freedesktop.org/monado/monado/merge_requests/2405))
+  - Bindings Improvement: Improved reproducibility of bindings generation
+    ([!2338](https://gitlab.freedesktop.org/monado/monado/merge_requests/2338))
+  - Bindings Improvement: Added distinct device enums for Oculus/Meta Touch
+    controller variants.
+    ([!2356](https://gitlab.freedesktop.org/monado/monado/merge_requests/2356))
+  - Bluetooth LE Improvement: Made notifications for power management
+    characteristic optional
+    ([!2269](https://gitlab.freedesktop.org/monado/monado/merge_requests/2269))
+  - D3D Fix: Fixed swapchain with `UNORDERED_ACCESS` and `COLOR` usage
+    ([!2281](https://gitlab.freedesktop.org/monado/monado/merge_requests/2281))
+  - D3D Fix: Correct fallback state for D3D12
+    ([!2349](https://gitlab.freedesktop.org/monado/monado/merge_requests/2349),
+    [#440](https://gitlab.freedesktop.org/monado/monado/issues/440))
+  - Math Add: Introduce minimum skew clock tracker.
+    ([!2188](https://gitlab.freedesktop.org/monado/monado/merge_requests/2188))
+  - OpenGL Add: Add Win32 handle import.
+    ([!2302](https://gitlab.freedesktop.org/monado/monado/merge_requests/2302))
+  - Space Overseer Fix: Fixed destruction of the multi-localspace
+    ([!2249](https://gitlab.freedesktop.org/monado/monado/merge_requests/2249))
+  - Space Overseer Improvement: Modify `create_local_space` to support multi-
+    local_floor space on server side.
+    ([!2252](https://gitlab.freedesktop.org/monado/monado/merge_requests/2252))
+  - Space Overseer Improvement: STAGE now supported by default. `stage_supported`
+    remains for drivers requiring active polling for STAGE pose
+    ([!2280](https://gitlab.freedesktop.org/monado/monado/merge_requests/2280))
+  - Space Overseer Improvement: Add `get`/`set_tracking_origin_offset`,
+    `get`/`set_reference_space_offset`
+    ([!2284](https://gitlab.freedesktop.org/monado/monado/merge_requests/2284))
+  - Space Overseer Improvement: Enabled recentering local spaces
+    ([!2351](https://gitlab.freedesktop.org/monado/monado/merge_requests/2351))
+  - Util Add: Support multi-localspace on server side.
+    ([!2130](https://gitlab.freedesktop.org/monado/monado/merge_requests/2130))
+  - Util Add: Add not-implemented fallback function for
+    `xrt_device::get_battery_status`.
+    ([!2292](https://gitlab.freedesktop.org/monado/monado/merge_requests/2292))
+  - Util Add: Add `U_PACING_APP_IMMEDIATE_WAIT_FRAME_RETURN` option to pacing which
+    will wake the application as soon as possible to begin work on new frames.
+    ([!2293](https://gitlab.freedesktop.org/monado/monado/merge_requests/2293))
+  - Util Change: Change `u_device_noop_update_inputs` to return `xrt_result_t`.
+    ([!2246](https://gitlab.freedesktop.org/monado/monado/merge_requests/2246))
+  - Util Fix: Fixed headless local space creation
+    ([!2255](https://gitlab.freedesktop.org/monado/monado/merge_requests/2255))
+  - Util Fix: Overflow in JSON logging mode.
+    ([!2373](https://gitlab.freedesktop.org/monado/monado/merge_requests/2373))
+  - Util Improvement: Add support for device feature usage in system helper.
+    ([!2223](https://gitlab.freedesktop.org/monado/monado/merge_requests/2223))
+  - Vulkan Improvement: Handle `VK_KHR_image_format_list` and use it when
+    appropriate/requested.
+    ([!2352](https://gitlab.freedesktop.org/monado/monado/merge_requests/2352),
+    [#410](https://gitlab.freedesktop.org/monado/monado/issues/410))
+- Documentation
+  - Illustrate various control flows for swapchain image allocation, including
+    interaction with IPC.
+    ([!2300](https://gitlab.freedesktop.org/monado/monado/merge_requests/2300))
+  - Improvement: Doxygen code documentation improvements.
+    ([!2322](https://gitlab.freedesktop.org/monado/monado/merge_requests/2322),
+    [!2333](https://gitlab.freedesktop.org/monado/monado/merge_requests/2333),
+    [!2378](https://gitlab.freedesktop.org/monado/monado/merge_requests/2378),
+    [!2379](https://gitlab.freedesktop.org/monado/monado/merge_requests/2379))
+  - Windows docs: update `winget` sources for external dependencies
+    ([!2416](https://gitlab.freedesktop.org/monado/monado/merge_requests/2416))
+- Misc. Features
+  - Add: Lifecycle tests that launch and switch OpenXR applications on Android.
+    ([!2311](https://gitlab.freedesktop.org/monado/monado/merge_requests/2311))
+  - Improvement: Handle Android activity lifecycle.
+    ([!1655](https://gitlab.freedesktop.org/monado/monado/merge_requests/1655),
+    [!2392](https://gitlab.freedesktop.org/monado/monado/merge_requests/2392))
+  - Improvement: Update bundled dependencies.
+    ([!2267](https://gitlab.freedesktop.org/monado/monado/merge_requests/2267),
+    [!2266](https://gitlab.freedesktop.org/monado/monado/merge_requests/2266),
+    [!2268](https://gitlab.freedesktop.org/monado/monado/merge_requests/2268),
+    [!2254](https://gitlab.freedesktop.org/monado/monado/merge_requests/2254),
+    [!2437](https://gitlab.freedesktop.org/monado/monado/merge_requests/2437),
+    [!2447](https://gitlab.freedesktop.org/monado/monado/merge_requests/2447))
+  - Improvement: Miscellaneous code cleanups.
+    ([!2342](https://gitlab.freedesktop.org/monado/monado/merge_requests/2342),
+    [!2409](https://gitlab.freedesktop.org/monado/monado/merge_requests/2409))
+  - Improvement: Update Gradle wrapper and related tools.
+    ([!2382](https://gitlab.freedesktop.org/monado/monado/merge_requests/2382))
+  - Improvement: Re-format Kotlin files.
+    ([!2382](https://gitlab.freedesktop.org/monado/monado/merge_requests/2382))
+  - cmake: Changes project c++-lang-std to C++20
+    ([!2258](https://gitlab.freedesktop.org/monado/monado/merge_requests/2258))
+- Misc. Fixes
+  - Add: Added `FEATURE_AHARDWARE_BUFFER` CMake option for Android
+    ([!2294](https://gitlab.freedesktop.org/monado/monado/merge_requests/2294))
+  - Change: bump minimum required CMake version to 3.22.
+    ([!2261](https://gitlab.freedesktop.org/monado/monado/merge_requests/2261))
+  - Fix: Fixed missing resource string value for Android.
+    ([!2257](https://gitlab.freedesktop.org/monado/monado/merge_requests/2257))
+  - Fix: Build system support for D3D on Windows.
+    ([!2276](https://gitlab.freedesktop.org/monado/monado/merge_requests/2276),
+    [#398](https://gitlab.freedesktop.org/monado/monado/issues/398))
+  - Fix: Miscellaneous build errors and warnings.
+    ([!2307](https://gitlab.freedesktop.org/monado/monado/merge_requests/2307),
+    [!2272](https://gitlab.freedesktop.org/monado/monado/merge_requests/2272),
+    [!2415](https://gitlab.freedesktop.org/monado/monado/merge_requests/2415),
+    [!2438](https://gitlab.freedesktop.org/monado/monado/merge_requests/2438),
+    [!2454](https://gitlab.freedesktop.org/monado/monado/merge_requests/2454))
+  - Fix: Reliability and robustness improvements on Android.
+    ([!2308](https://gitlab.freedesktop.org/monado/monado/merge_requests/2308),
+    [!2307](https://gitlab.freedesktop.org/monado/monado/merge_requests/2307),
+    [!2407](https://gitlab.freedesktop.org/monado/monado/merge_requests/2407),
+    [!2411](https://gitlab.freedesktop.org/monado/monado/merge_requests/2411))
+  - Fix: Vulkan-related crashes, Vulkan validation errors, and other Vulkan API
+    usage issues.
+    ([!2316](https://gitlab.freedesktop.org/monado/monado/merge_requests/2316),
+    [#428](https://gitlab.freedesktop.org/monado/monado/issues/428),
+    [!2332](https://gitlab.freedesktop.org/monado/monado/merge_requests/2332),
+    [#381](https://gitlab.freedesktop.org/monado/monado/issues/381),
+    [!2337](https://gitlab.freedesktop.org/monado/monado/merge_requests/2337))
+  - Fix: Be able to build properly in directories with whitespace.
+    ([!2319](https://gitlab.freedesktop.org/monado/monado/merge_requests/2319))
+  - Fix: Bluetooth device detection when `UserspaceHID=true` in
+    `/etc/bluetooth/input.conf`
+    ([!2336](https://gitlab.freedesktop.org/monado/monado/merge_requests/2336),
+    [#388](https://gitlab.freedesktop.org/monado/monado/issues/388),
+    [#393](https://gitlab.freedesktop.org/monado/monado/issues/393),
+    [#489](https://gitlab.freedesktop.org/monado/monado/issues/489))
+  - Fix: Fixes the image memory size of imported D3D12 texture resources being set
+    to zero causing zero size error messages and D3D12 swapchain creation to fail.
+    ([!2347](https://gitlab.freedesktop.org/monado/monado/merge_requests/2347))
+  - Fix: Removes unneeded warning in swapchain creation about requested sizes being
+    larger than sizes reported by vkGetImageMemoryRequirements for imported images.
+    ([!2347](https://gitlab.freedesktop.org/monado/monado/merge_requests/2347))
+  - Fix: Adds new image memory size parameter to D3D12 texture import functions to
+    fix zero size error messages and D3D12 swapchain creation to fail.
+    ([!2347](https://gitlab.freedesktop.org/monado/monado/merge_requests/2347))
+  - Fix: 32/64 bit interoperability
+    ([!2396](https://gitlab.freedesktop.org/monado/monado/merge_requests/2396))
+  - Fix: Fixed custom OpenXR target builds
+    ([!2422](https://gitlab.freedesktop.org/monado/monado/merge_requests/2422))
+  - Fix: Miscellaneous memory leak fixes.
+    ([!2423](https://gitlab.freedesktop.org/monado/monado/merge_requests/2423),
+    [!2440](https://gitlab.freedesktop.org/monado/monado/merge_requests/2440),
+    [!2417](https://gitlab.freedesktop.org/monado/monado/merge_requests/2417))
+  - Fix: Altered improper usage of MSVC to WIN32 to unblock building with Clang on
+    Windows.
+    ([](https://gitlab.freedesktop.org/monado/monado//2335))
+  - Improvement: Some cleanups and better Gradle project naming for Android
+    ([!2243](https://gitlab.freedesktop.org/monado/monado/merge_requests/2243))
+  - Improvement: Adjust Gradle to make debug APK builds debuggable on Android.
+    ([!2320](https://gitlab.freedesktop.org/monado/monado/merge_requests/2320))
+  - Improvement: Added various build improvements
+    ([!2401](https://gitlab.freedesktop.org/monado/monado/merge_requests/2401))
+  - Improvement: Adjust how to do IPC builds of client without service
+    ([!2410](https://gitlab.freedesktop.org/monado/monado/merge_requests/2410))
 
 ## Monado 24.0.0 (2024-06-07)
 

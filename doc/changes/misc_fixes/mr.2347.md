@@ -1,3 +1,0 @@
-- Fix: Fixes the image memory size of imported D3D12 texture resources being set to zero causing zero size error messages and D3D12 swapchain creation to fail.
-- Fix: Removes unneeded warning in swapchain creation about requested sizes being larger than sizes reported by vkGetImageMemoryRequirements for imported images.
-- Fix: Adds new image memory size parameter to D3D12 texture import functions to fix zero size error messages and D3D12 swapchain creation to fail.

@@ -1,4 +1,0 @@
----
-- mr.2368
----
-- null: Don't crash on `XR_FB_display_refresh_rate` use

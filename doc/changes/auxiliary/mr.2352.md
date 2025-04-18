@@ -1,4 +1,0 @@
----
-- issue.410
----
-- Vulkan Improvement: Handle `VK_KHR_image_format_list` and use it when appropriate/requested.

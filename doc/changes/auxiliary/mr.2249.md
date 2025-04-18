@@ -1,4 +1,0 @@
----
-- mr.2249
----
-- Space Overseer Fix: Fixed destruction of the multi-localspace

@@ -1,6 +1,0 @@
----
-- mr.2297
-- mr.2282
-- mr.2140
----
-- steamvr_lh: Refactor and cleanup.

@@ -1,4 +1,0 @@
----
-- mr.2207
----
-- steamvr_lh: Use properties for device descriptions.

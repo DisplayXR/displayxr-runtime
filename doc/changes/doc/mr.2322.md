@@ -1,7 +1,0 @@
----
-- mr.2322
-- mr.2333
-- mr.2378
-- mr.2379
----
-- Improvement: Doxygen code documentation improvements.

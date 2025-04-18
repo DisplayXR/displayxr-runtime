@@ -1,5 +1,0 @@
----
-- issue.411
----
-- Fix: propagate the enabled state of `VK_KHR_image_format_list` to `vk_bundle` and fix `vk_bundle::has_KHR_image_format_list` not being set to enabled in the client compositor.
-- Fix: Use and set format lists for `VK_KHR_image_format_list` on client Vulkan image creation when requested by Vulkan-based apps using mutable formats.

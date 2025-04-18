@@ -1,4 +1,0 @@
----
-- mr.2188
----
-- WMR: Fix controller status reporting.

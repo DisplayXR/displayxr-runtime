@@ -1,4 +1,0 @@
----
-- mr.2269
----
-- Bluetooth LE Improvement: Made notifications for power management characteristic optional

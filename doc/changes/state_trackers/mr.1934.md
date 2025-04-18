@@ -1,7 +1,0 @@
----
-- mr.1934
-- mr.2344
-- mr.2162
----
-- OpenXR Fix: possible deadlock from unanswered `xrWaitFrame`.
-- OpenXR Fix: conformance issues related to session state and session running/non-running.

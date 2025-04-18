@@ -1,4 +1,0 @@
----
-- mr.2405
----
-- Bindings Fix: Fixed `META_touch_controller_plus` interaction profile name

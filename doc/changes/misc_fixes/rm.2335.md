@@ -1,4 +1,0 @@
----
-- rm.2335
----
-- Fix: Altered improper usage of MSVC to WIN32 to unblock building with Clang on Windows.

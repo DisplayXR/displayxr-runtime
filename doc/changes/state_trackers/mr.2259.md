@@ -1,4 +1,0 @@
----
-- mr.2259
----
-- Debug GUI Change: disabled mono camera calibration

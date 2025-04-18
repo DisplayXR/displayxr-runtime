@@ -1,4 +1,0 @@
----
-- mr.2257
----
-- Fix: Fixed missing resource string value for Android.

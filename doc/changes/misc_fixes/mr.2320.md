@@ -1,4 +1,0 @@
----
-- mr.2320
----
-- Improvement: Adjust Gradle to make debug APK builds debuggable on Android.

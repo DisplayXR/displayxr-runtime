@@ -1,4 +1,0 @@
----
-- mr.2356
----
-- Bindings Improvement: Added distinct device enums for Oculus/Meta Touch controller variants.

@@ -1,2 +1,0 @@
-- Improvement: Update Gradle wrapper and related tools.
-- Improvement: Re-format Kotlin files.

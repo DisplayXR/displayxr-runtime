@@ -1,4 +1,0 @@
----
-- mr.2351
----
-- Space Overseer Improvement: Enabled recentering local spaces

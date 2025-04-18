@@ -1,1 +1,0 @@
-steamvr_lh: fix disabling of hand simulation causing segfault.

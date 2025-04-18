@@ -1,5 +1,0 @@
----
-- issue.440
-- mr.2349
----
-- D3D Fix: Correct fallback state for D3D12

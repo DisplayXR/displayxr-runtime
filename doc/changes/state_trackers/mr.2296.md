@@ -1,4 +1,0 @@
----
-- mr.2296
----
-- OpenXR Change: Allow disabling `XR_EXT_hand_tracking` through CMake

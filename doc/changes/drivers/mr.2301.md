@@ -1,4 +1,0 @@
----
-- mr.2301
----
-- PS Sense: Use IMU timestamp.

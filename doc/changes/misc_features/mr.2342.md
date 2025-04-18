@@ -1,5 +1,0 @@
----
-- mr.2342
-- mr.2409
----
-- Improvement: Miscellaneous code cleanups.

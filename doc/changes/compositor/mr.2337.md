@@ -1,1 +1,0 @@
-- Improvement: Reverts the default compositor pipeline on Android from compute-shader-based back to graphics-shader-based.

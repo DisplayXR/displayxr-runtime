@@ -1,4 +1,0 @@
----
-- mr.2324
----
-- steamvr_lh: Fix crash on shutdown.

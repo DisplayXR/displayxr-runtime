@@ -1,4 +1,0 @@
----
-- mr.2281
----
-- D3D Fix: Fixed swapchain with `UNORDERED_ACCESS` and `COLOR` usage

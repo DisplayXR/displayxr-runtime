@@ -1,4 +1,0 @@
----
-- issue.411
----
-- Fix: Propagate the enabled state of `VK_KHR_image_format_list` to `vk_bundle`.

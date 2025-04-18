@@ -1,4 +1,0 @@
----
-- mr.2373
----
-- Util Fix: Overflow in JSON logging mode.

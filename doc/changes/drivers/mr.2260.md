@@ -1,2 +1,0 @@
-- Android: Replace `ALooper_pollAll` with `ALooper_pollOnce`.
-- Android: Reduce CPU usage.
