@@ -192,6 +192,8 @@ enum xrt_format
 	XRT_FORMAT_UYVY422,
 
 	XRT_FORMAT_MJPEG,
+
+	XRT_FORMAT_BC4,
 };
 
 /*!

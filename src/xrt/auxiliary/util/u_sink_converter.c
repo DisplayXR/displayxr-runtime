@@ -22,6 +22,9 @@
 #include "jpeglib.h"
 #endif
 
+#define BCDEC_IMPLEMENTATION
+#define BCDEC_BC4BC5_PRECISE
+#include "bcdec.h"
 
 /*
  *
@@ -390,6 +393,29 @@ from_MJPEG_to_YUV888(struct xrt_frame *dst_frame, size_t size, const uint8_t *da
 }
 #endif
 
+/*
+ *
+ * BC4
+ *
+ */
+
+static void
+from_BC4_to_L8(struct xrt_frame *dst_frame, uint32_t w, uint32_t h, size_t stride, const uint8_t *data)
+{
+	SINK_TRACE_MARKER();
+
+	assert(w % 4 == 0);
+	assert(h % 4 == 0);
+
+	const uint8_t *src = data;
+	for (uint32_t y = 0; y < h; y += 4) {
+		for (uint32_t x = 0; x < w; x += 4) {
+			bcdec_bc4(src, dst_frame->data + (y * dst_frame->stride) + x, dst_frame->stride, false);
+
+			src += BCDEC_BC4_BLOCK_SIZE;
+		}
+	}
+}
 
 /*
  *
@@ -485,6 +511,12 @@ convert_frame_l8(struct xrt_frame_sink *xs, struct xrt_frame *xf)
 	struct xrt_frame *converted = NULL;
 
 	switch (xf->format) {
+	case XRT_FORMAT_BC4:
+		if (!create_frame_with_format(xf, XRT_FORMAT_L8, &converted)) {
+			return;
+		}
+		from_BC4_to_L8(converted, xf->width, xf->height, xf->stride, xf->data);
+		break;
 	case XRT_FORMAT_L8: s->downstream->push_frame(s->downstream, xf); return;
 	case XRT_FORMAT_YUYV422:
 		if (!create_frame_with_format(xf, XRT_FORMAT_L8, &converted)) {
@@ -520,6 +552,12 @@ convert_frame_r8g8b8_or_l8(struct xrt_frame_sink *xs, struct xrt_frame *xf)
 			return;
 		}
 		from_BAYER_GR8_to_R8G8B8(converted, w, h, xf->stride, xf->data);
+		break;
+	case XRT_FORMAT_BC4:
+		if (!create_frame_with_format(xf, XRT_FORMAT_L8, &converted)) {
+			return;
+		}
+		from_BC4_to_L8(converted, xf->width, xf->height, xf->stride, xf->data);
 		break;
 	case XRT_FORMAT_YUYV422:
 		if (!create_frame_with_format(xf, XRT_FORMAT_R8G8B8, &converted)) {
