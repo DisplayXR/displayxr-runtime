@@ -84,6 +84,11 @@ u_sink_create_to_yuv_or_yuyv(struct xrt_frame_context *xfctx,
                              struct xrt_frame_sink *downstream,
                              struct xrt_frame_sink **out_xfs);
 
+void
+u_sink_create_half_scale(struct xrt_frame_context *xfctx,
+                         struct xrt_frame_sink *downstream,
+                         struct xrt_frame_sink **out_xfs);
+
 /*!
  * @public @memberof xrt_frame_sink
  * @see xrt_frame_context

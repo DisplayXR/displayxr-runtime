@@ -1023,3 +1023,52 @@ u_sink_create_to_yuv_or_yuyv(struct xrt_frame_context *xfctx,
 
 	*out_xfs = &s->base;
 }
+
+static void
+convert_half_scale(struct xrt_frame_sink *xs, struct xrt_frame *xf)
+{
+	struct u_sink_converter *s = (struct u_sink_converter *)xs;
+
+	uint32_t w = xf->width / 2;
+	uint32_t h = xf->height / 2;
+	struct xrt_frame *converted = NULL;
+
+	if (!create_frame_with_format_of_size(xf, w, h, XRT_FORMAT_L8, &converted)) {
+		return;
+	}
+
+	for (uint32_t x = 0; x < w; x++) {
+		for (uint32_t y = 0; y < h; y++) {
+			uint16_t sum = 0;
+			sum += xf->data[((y * 2) * xf->stride) + (x * 2)];
+			sum += xf->data[((y * 2) * xf->stride) + (x * 2) + 1];
+			sum += xf->data[(((y * 2) + 1) * xf->stride) + (x * 2)];
+			sum += xf->data[(((y * 2) + 1) * xf->stride) + (x * 2) + 1];
+
+			converted->data[(y * converted->stride) + x] = sum / 4;
+		}
+	}
+
+	s->downstream->push_frame(s->downstream, converted);
+
+	// Refcount in case it's being held downstream.
+	xrt_frame_reference(&converted, NULL);
+}
+
+void
+u_sink_create_half_scale(struct xrt_frame_context *xfctx,
+                         struct xrt_frame_sink *downstream,
+                         struct xrt_frame_sink **out_xfs)
+{
+	assert(downstream != NULL);
+
+	struct u_sink_converter *s = U_TYPED_CALLOC(struct u_sink_converter);
+	s->base.push_frame = convert_half_scale;
+	s->node.break_apart = break_apart;
+	s->node.destroy = destroy;
+	s->downstream = downstream;
+
+	xrt_frame_context_add(xfctx, &s->node);
+
+	*out_xfs = &s->base;
+}
