@@ -90,6 +90,11 @@ Copyright: 2017, Sean Barrett
 License: MIT OR Unlicense
 Comment: SPDX-License-Identifier missing.
 
+Files: src/external/bcdec/bcdec*
+Copyright: 2022, Sergii Kudlai
+License: MIT OR Unlicense
+Comment: SPDX-License-Identifier missing.
+
 Files: src/external/glad/include/EGL/eglplatform.h
 Copyright: 2007-2020, The Khronos Group Inc.
 License: Apache-2.0

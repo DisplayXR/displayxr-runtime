@@ -108,6 +108,10 @@ endif()
 add_library(xrt-external-stb INTERFACE)
 target_include_directories(xrt-external-stb SYSTEM INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/stb)
 
+# bcdec
+add_library(xrt-external-bcdec INTERFACE)
+target_include_directories(xrt-external-bcdec SYSTEM INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/bcdec)
+
 # renderdoc
 add_library(xrt-external-renderdoc INTERFACE)
 target_include_directories(
