@@ -56,6 +56,7 @@
  */
 
 DEBUG_GET_ONCE_BOOL_OPTION(exit_on_disconnect, "IPC_EXIT_ON_DISCONNECT", false)
+DEBUG_GET_ONCE_BOOL_OPTION(exit_when_idle, "IPC_EXIT_ON_IDLE", false)
 DEBUG_GET_ONCE_LOG_OPTION(ipc_log, "IPC_LOG", U_LOGGING_INFO)
 
 
@@ -453,6 +454,7 @@ init_server_state(struct ipc_server *s)
 
 	s->global_state.active_client_index = -1; // we start off with no active client.
 	s->global_state.last_active_client_index = -1;
+	s->global_state.connected_client_count = 0; // No clients connected initially
 	s->current_slot_index = 0;
 
 	for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
@@ -490,6 +492,7 @@ init_all(struct ipc_server *s, enum u_logging_level log_level)
 	// Yes we should be running.
 	s->running = true;
 	s->exit_on_disconnect = debug_get_bool_option_exit_on_disconnect();
+	s->exit_when_idle = debug_get_bool_option_exit_when_idle();
 
 	xret = xrt_instance_create(NULL, &s->xinst);
 	if (xret != XRT_SUCCESS) {
@@ -539,6 +542,7 @@ init_all(struct ipc_server *s, enum u_logging_level log_level)
 	u_var_add_root(s, "IPC Server", false);
 	u_var_add_log_level(s, &s->log_level, "Log level");
 	u_var_add_bool(s, &s->exit_on_disconnect, "exit_on_disconnect");
+	u_var_add_bool(s, &s->exit_when_idle, "exit_when_idle");
 	u_var_add_bool(s, (bool *)&s->running, "running");
 
 	return 0;
@@ -912,6 +916,9 @@ ipc_server_handle_client_connected(struct ipc_server *vs, xrt_ipc_handle_t ipc_h
 	int32_t cs_index = -1;
 
 	os_mutex_lock(&vs->global_state.lock);
+
+	// Increment the connected client counter
+	vs->global_state.connected_client_count++;
 
 	// find the next free thread in our array (server_thread_index is -1)
 	// and have it handle this connection

@@ -51,6 +51,9 @@ common_shutdown(volatile struct ipc_client_state *ics)
 	ics->server_thread_index = -1;
 	memset((void *)&ics->client_state, 0, sizeof(struct ipc_app_state));
 
+	// Decrement the connected client counter
+	ics->server->global_state.connected_client_count--;
+
 	os_mutex_unlock(&ics->server->global_state.lock);
 
 
@@ -114,6 +117,11 @@ common_shutdown(volatile struct ipc_client_state *ics)
 
 	// Should we stop the server when a client disconnects?
 	if (ics->server->exit_on_disconnect) {
+		ics->server->running = false;
+	}
+
+	// Should we stop the server when all clients disconnect?
+	if (ics->server->exit_when_idle && ics->server->global_state.connected_client_count == 0) {
 		ics->server->running = false;
 	}
 
