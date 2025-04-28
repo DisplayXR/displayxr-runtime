@@ -56,7 +56,8 @@
  */
 
 DEBUG_GET_ONCE_BOOL_OPTION(exit_on_disconnect, "IPC_EXIT_ON_DISCONNECT", false)
-DEBUG_GET_ONCE_BOOL_OPTION(exit_when_idle, "IPC_EXIT_ON_IDLE", false)
+DEBUG_GET_ONCE_BOOL_OPTION(exit_when_idle, "IPC_EXIT_WHEN_IDLE", false)
+DEBUG_GET_ONCE_NUM_OPTION(exit_when_idle_delay_ms, "IPC_EXIT_WHEN_IDLE_DELAY_MS", 5000)
 DEBUG_GET_ONCE_LOG_OPTION(ipc_log, "IPC_LOG", U_LOGGING_INFO)
 
 
@@ -493,6 +494,9 @@ init_all(struct ipc_server *s, enum u_logging_level log_level)
 	s->running = true;
 	s->exit_on_disconnect = debug_get_bool_option_exit_on_disconnect();
 	s->exit_when_idle = debug_get_bool_option_exit_when_idle();
+	s->last_client_disconnect_ns = 0;
+	uint64_t delay_ms = debug_get_num_option_exit_when_idle_delay_ms();
+	s->exit_when_idle_delay_ns = delay_ms * U_TIME_1MS_IN_NS;
 
 	xret = xrt_instance_create(NULL, &s->xinst);
 	if (xret != XRT_SUCCESS) {
@@ -543,6 +547,7 @@ init_all(struct ipc_server *s, enum u_logging_level log_level)
 	u_var_add_log_level(s, &s->log_level, "Log level");
 	u_var_add_bool(s, &s->exit_on_disconnect, "exit_on_disconnect");
 	u_var_add_bool(s, &s->exit_when_idle, "exit_when_idle");
+	u_var_add_u64(s, &s->exit_when_idle_delay_ns, "exit_when_idle_delay_ns");
 	u_var_add_bool(s, (bool *)&s->running, "running");
 
 	return 0;
@@ -919,6 +924,10 @@ ipc_server_handle_client_connected(struct ipc_server *vs, xrt_ipc_handle_t ipc_h
 
 	// Increment the connected client counter
 	vs->global_state.connected_client_count++;
+
+	// A client connected, so we're no longer in a delayed exit state
+	// (The delay thread will still check the client count before exiting)
+	vs->last_client_disconnect_ns = 0;
 
 	// find the next free thread in our array (server_thread_index is -1)
 	// and have it handle this connection
