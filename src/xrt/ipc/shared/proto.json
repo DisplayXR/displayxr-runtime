@@ -509,7 +509,28 @@
 		"in": [
 			{"name": "id", "type": "uint32_t"},
 			{"name": "name", "type": "enum xrt_output_name"},
-			{"name": "value", "type": "union xrt_output_value"}
+			{"name": "value", "type": "struct xrt_output_value"}
+		]
+	},
+
+	"device_set_haptic_output": {
+		"varlen": true,
+		"in": [
+			{"name": "id", "type": "uint32_t"},
+			{"name": "name", "type": "enum xrt_output_name"},
+			{"name": "samples", "type": "struct ipc_pcm_haptic_buffer"}
+		],
+		"out":[
+			{"name": "samples_consumed", "type": "uint32_t"}
+		]
+	},
+
+	"device_get_output_limits": {
+		"in": [
+			{"name": "id", "type": "uint32_t"}
+		],
+		"out":[
+			{"name": "limits", "type": "struct xrt_output_limits"}
 		]
 	},
 

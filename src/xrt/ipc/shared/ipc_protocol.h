@@ -373,3 +373,10 @@ struct ipc_info_get_view_poses_2
 
 static_assert(sizeof(struct ipc_info_get_view_poses_2) == 144,
               "invalid structure size, maybe different 32/64 bits sizes or padding");
+
+struct ipc_pcm_haptic_buffer
+{
+	uint32_t num_samples;
+	float sample_rate;
+	bool append;
+};

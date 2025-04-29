@@ -671,6 +671,94 @@ oxr_xrRequestDisplayRefreshRateFB(XrSession session, float displayRefreshRate)
 
 /*
  *
+ * XR_FB_haptic_pcm
+ *
+ */
+
+#ifdef OXR_HAVE_FB_haptic_pcm
+
+static bool
+get_action_output_pcm_sample_rate(struct oxr_session *sess, struct oxr_action_cache *cache, float *sample_rate)
+{
+	for (uint32_t i = 0; i < cache->output_count; i++) {
+		struct oxr_action_output *output = &cache->outputs[i];
+		struct xrt_device *xdev = output->xdev;
+
+		struct xrt_output_limits output_limits;
+		xrt_result_t result = xrt_device_get_output_limits(xdev, &output_limits);
+		if (result != XRT_SUCCESS) {
+			// default to something sane
+			output_limits = (struct xrt_output_limits){0};
+		}
+
+		(*sample_rate) = output_limits.haptic_pcm_sample_rate;
+		if (output_limits.haptic_pcm_sample_rate > 0) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrGetDeviceSampleRateFB(XrSession session,
+                            const XrHapticActionInfo *hapticActionInfo,
+                            XrDevicePcmSampleRateGetInfoFB *deviceSampleRate)
+{
+	OXR_TRACE_MARKER();
+
+	struct oxr_session *sess = NULL;
+	struct oxr_action *act = NULL;
+	struct oxr_subaction_paths subaction_paths = {0};
+	struct oxr_logger log;
+	XrResult ret;
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrGetDeviceSampleRateFB");
+	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
+	OXR_VERIFY_ARG_TYPE_AND_NOT_NULL(&log, hapticActionInfo, XR_TYPE_HAPTIC_ACTION_INFO);
+	OXR_VERIFY_ARG_TYPE_AND_NOT_NULL(&log, deviceSampleRate, XR_TYPE_DEVICE_PCM_SAMPLE_RATE_GET_INFO_FB);
+	OXR_VERIFY_ACTION_NOT_NULL(&log, hapticActionInfo->action, act);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, FB_haptic_pcm);
+
+	// get the subaction paths
+	ret = oxr_verify_subaction_path_get(&log, act->act_set->inst, hapticActionInfo->subactionPath,
+	                                    &act->data->subaction_paths, &subaction_paths, "getInfo->subactionPath");
+	if (ret != XR_SUCCESS) {
+		return ret;
+	}
+
+	// make sure it's a vibration action
+	if (act->data->action_type != XR_ACTION_TYPE_VIBRATION_OUTPUT) {
+		return oxr_error(&log, XR_ERROR_ACTION_TYPE_MISMATCH, "Not created with output vibration type");
+	}
+
+	// get the attached action
+	struct oxr_action_attachment *act_attached = NULL;
+
+	oxr_session_get_action_attachment(sess, act->act_key, &act_attached);
+	if (act_attached == NULL) {
+		return oxr_error(&log, XR_ERROR_ACTIONSET_NOT_ATTACHED, "Action has not been attached to this session");
+	}
+
+	// find any device with a valid sample rate, and return it
+#define GET_SAMPLE_RATE(X)                                                                                             \
+	if (subaction_paths.X || subaction_paths.any) {                                                                \
+		if (get_action_output_pcm_sample_rate(sess, &act_attached->X, &deviceSampleRate->sampleRate))          \
+			return oxr_session_success_focused_result(sess);                                               \
+	}
+
+	OXR_FOR_EACH_SUBACTION_PATH(GET_SAMPLE_RATE)
+#undef GET_SAMPLE_RATE
+
+	// no devices found
+	deviceSampleRate->sampleRate = 0;
+
+	return XR_SUCCESS;
+}
+
+#endif
+
+/*
+ *
  * XR_KHR_android_thread_settings
  *
  */

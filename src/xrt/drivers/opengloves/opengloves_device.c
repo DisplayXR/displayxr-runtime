@@ -173,7 +173,7 @@ opengloves_ffb_location_convert(const struct xrt_output_force_feedback *xrt_ffb,
 }
 
 static void
-opengloves_device_set_output(struct xrt_device *xdev, enum xrt_output_name name, const union xrt_output_value *value)
+opengloves_device_set_output(struct xrt_device *xdev, enum xrt_output_name name, const struct xrt_output_value *value)
 {
 	struct opengloves_device *od = opengloves_device(xdev);
 

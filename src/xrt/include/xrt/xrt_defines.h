@@ -1885,25 +1885,46 @@ struct xrt_output_force_feedback
 	enum xrt_force_feedback_location location;
 };
 
+enum xrt_output_value_type
+{
+	XRT_OUTPUT_VALUE_TYPE_VIBRATION,
+	XRT_OUTPUT_VALUE_TYPE_PCM_VIBRATION,
+	XRT_OUTPUT_VALUE_TYPE_FORCE_FEEDBACK,
+};
+
 /*!
  * A union of all output types.
  *
  * @see xrt_output_type
  * @ingroup xrt_iface math
  */
-union xrt_output_value {
-	struct
-	{
-		float frequency;
-		float amplitude;
-		int64_t duration_ns;
-	} vibration;
+struct xrt_output_value
+{
+	enum xrt_output_value_type type;
 
-	struct
-	{
-		struct xrt_output_force_feedback force_feedback[5];
-		uint64_t force_feedback_location_count;
-	} force_feedback;
+	union {
+		struct
+		{
+			float frequency;
+			float amplitude;
+			int64_t duration_ns;
+		} vibration;
+
+		struct
+		{
+			uint32_t buffer_size;
+			const float *buffer;
+			float sample_rate;
+			bool append;
+			uint32_t *samples_consumed;
+		} pcm_vibration;
+
+		struct
+		{
+			struct xrt_output_force_feedback force_feedback[5];
+			uint64_t force_feedback_location_count;
+		} force_feedback;
+	};
 };
 
 

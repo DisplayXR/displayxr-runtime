@@ -320,7 +320,7 @@ wmr_controller_og_update_inputs(struct xrt_device *xdev)
 }
 
 static void
-wmr_controller_og_set_output(struct xrt_device *xdev, enum xrt_output_name name, const union xrt_output_value *value)
+wmr_controller_og_set_output(struct xrt_device *xdev, enum xrt_output_name name, const struct xrt_output_value *value)
 {
 	DRV_TRACE_MARKER();
 

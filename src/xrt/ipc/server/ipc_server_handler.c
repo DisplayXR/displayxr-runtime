@@ -2254,7 +2254,7 @@ xrt_result_t
 ipc_handle_device_set_output(volatile struct ipc_client_state *ics,
                              uint32_t id,
                              enum xrt_output_name name,
-                             const union xrt_output_value *value)
+                             const struct xrt_output_value *value)
 {
 	// To make the code a bit more readable.
 	uint32_t device_id = id;
@@ -2264,6 +2264,91 @@ ipc_handle_device_set_output(volatile struct ipc_client_state *ics,
 	xrt_device_set_output(xdev, name, value);
 
 	return XRT_SUCCESS;
+}
+
+xrt_result_t
+ipc_handle_device_set_haptic_output(volatile struct ipc_client_state *ics,
+                                    uint32_t id,
+                                    enum xrt_output_name name,
+                                    const struct ipc_pcm_haptic_buffer *buffer)
+{
+	IPC_TRACE_MARKER();
+	struct ipc_message_channel *imc = (struct ipc_message_channel *)&ics->imc;
+	struct ipc_server *s = ics->server;
+
+	xrt_result_t xret;
+
+	// To make the code a bit more readable.
+	uint32_t device_id = id;
+	struct xrt_device *xdev = get_xdev(ics, device_id);
+
+	os_mutex_lock(&ics->server->global_state.lock);
+
+	float *samples = U_TYPED_ARRAY_CALLOC(float, buffer->num_samples);
+
+	// send the allocation result
+	xret = samples ? XRT_SUCCESS : XRT_ERROR_ALLOCATION;
+	xret = ipc_send(imc, &xret, sizeof xret);
+	if (xret != XRT_SUCCESS) {
+		IPC_ERROR(ics->server, "Failed to send samples allocate result");
+		goto set_haptic_output_end;
+	}
+
+	if (!samples) {
+		IPC_ERROR(s, "Failed to allocate samples for haptic output");
+		xret = XRT_ERROR_ALLOCATION;
+		goto set_haptic_output_end;
+	}
+
+	xret = ipc_receive(imc, samples, sizeof(float) * buffer->num_samples);
+	if (xret != XRT_SUCCESS) {
+		IPC_ERROR(s, "Failed to receive samples");
+		goto set_haptic_output_end;
+	}
+
+	uint32_t samples_consumed;
+	struct xrt_output_value value = {
+	    .type = XRT_OUTPUT_VALUE_TYPE_PCM_VIBRATION,
+	    .pcm_vibration =
+	        {
+	            .append = buffer->append,
+	            .buffer_size = buffer->num_samples,
+	            .sample_rate = buffer->sample_rate,
+	            .samples_consumed = &samples_consumed,
+	            .buffer = samples,
+	        },
+	};
+
+	// Set the output.
+	xrt_device_set_output(xdev, name, &value);
+
+	xret = ipc_send(imc, &samples_consumed, sizeof samples_consumed);
+	if (xret != XRT_SUCCESS) {
+		IPC_ERROR(ics->server, "Failed to send samples consumed");
+		goto set_haptic_output_end;
+	}
+
+	xret = XRT_SUCCESS;
+
+set_haptic_output_end:
+	os_mutex_unlock(&ics->server->global_state.lock);
+
+	free(samples);
+
+	return xret;
+}
+
+xrt_result_t
+ipc_handle_device_get_output_limits(volatile struct ipc_client_state *ics,
+                                    uint32_t id,
+                                    struct xrt_output_limits *limits)
+{
+	// To make the code a bit more readable.
+	uint32_t device_id = id;
+	struct xrt_device *xdev = get_xdev(ics, device_id);
+
+	// Set the output.
+	return xrt_device_get_output_limits(xdev, limits);
 }
 
 xrt_result_t

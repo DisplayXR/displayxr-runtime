@@ -510,6 +510,17 @@
 
 
 /*
+ * XR_FB_haptic_pcm
+ */
+#if defined(XR_FB_haptic_pcm) && defined(XRT_FEATURE_OPENXR_HAPTIC_PCM)
+#define OXR_HAVE_FB_haptic_pcm
+#define OXR_EXTENSION_SUPPORT_FB_haptic_pcm(_) _(FB_haptic_pcm, FB_HAPTIC_PCM)
+#else
+#define OXR_EXTENSION_SUPPORT_FB_haptic_pcm(_)
+#endif
+
+
+/*
  * XR_FB_passthrough
  */
 #if defined(XR_FB_passthrough) && defined(XRT_FEATURE_OPENXR_LAYER_FB_PASSTHROUGH)
@@ -825,6 +836,7 @@
     OXR_EXTENSION_SUPPORT_FB_composition_layer_depth_test(_) \
     OXR_EXTENSION_SUPPORT_FB_face_tracking2(_) \
     OXR_EXTENSION_SUPPORT_FB_display_refresh_rate(_) \
+    OXR_EXTENSION_SUPPORT_FB_haptic_pcm(_) \
     OXR_EXTENSION_SUPPORT_FB_passthrough(_) \
     OXR_EXTENSION_SUPPORT_FB_touch_controller_pro(_) \
     OXR_EXTENSION_SUPPORT_FB_touch_controller_proximity(_) \

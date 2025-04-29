@@ -571,6 +571,12 @@ oxr_xrGetDisplayRefreshRateFB(XrSession session, float *displayRefreshRate);
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrRequestDisplayRefreshRateFB(XrSession session, float displayRefreshRate);
 
+//! OpenXR API function @ep{xrGetDeviceSampleRateFB}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrGetDeviceSampleRateFB(XrSession session,
+                            const XrHapticActionInfo *hapticActionInfo,
+                            XrDevicePcmSampleRateGetInfoFB *deviceSampleRate);
+
 //! OpenXR API function @ep{xrLocateSpacesKHR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrLocateSpacesKHR(XrSession session, const XrSpacesLocateInfoKHR *locateInfo, XrSpaceLocationsKHR *spaceLocations);

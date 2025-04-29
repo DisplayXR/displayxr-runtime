@@ -70,14 +70,15 @@ u_resampler_read(struct u_resampler *resampler, sample_t *samples, size_t num_sa
 }
 
 // push without resampling
-size_t
-u_resampler_write_raw(struct u_resampler *resampler, const sample_t *samples, size_t num_samples)
+static size_t
+resampler_write_raw(struct u_resampler *resampler, const sample_t *samples, size_t num_samples)
 {
 	// the amount of bytes we can write until we start overwriting the play index
 	size_t can_write = BETWEEN(resampler, resampler->write_index, resampler->read_index) - 1;
 
-	if (can_write == 0)
+	if (can_write == 0) {
 		return 0;
+	}
 
 	size_t written = 0;
 
@@ -119,12 +120,13 @@ size_t
 u_resampler_write(struct u_resampler *resampler, const sample_t *source_samples, size_t num_samples, float sample_rate)
 {
 	// no writing needed
-	if (num_samples == 0)
+	if (num_samples == 0) {
 		return 0;
+	}
 
 	// short-circuit if the sample rate is already matching, no resampling needed
 	if (sample_rate == resampler->sample_rate) {
-		return u_resampler_write_raw(resampler, source_samples, num_samples);
+		return resampler_write_raw(resampler, source_samples, num_samples);
 	}
 
 	const float target_sample_rate = resampler->sample_rate;
@@ -139,12 +141,14 @@ u_resampler_write(struct u_resampler *resampler, const sample_t *source_samples,
 		size_t source_idx = TO_RATE(target_idx, target_sample_rate, sample_rate);
 
 		// can't read any more samples
-		if (source_idx >= num_samples)
+		if (source_idx >= num_samples) {
 			break;
+		}
 
 		// can't write any more samples
-		if (can_write == 0)
+		if (can_write == 0) {
 			break;
+		}
 
 		target_samples[target_idx] = source_samples[source_idx];
 
@@ -153,7 +157,7 @@ u_resampler_write(struct u_resampler *resampler, const sample_t *source_samples,
 	}
 
 	// note: ignoring return value since we should never resample more than we can write
-	u_resampler_write_raw(resampler, target_samples, target_idx);
+	resampler_write_raw(resampler, target_samples, target_idx);
 
 	return TO_RATE(target_idx - 1, target_sample_rate, sample_rate);
 }

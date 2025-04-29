@@ -20,6 +20,7 @@
 #include "util/u_device.h"
 
 #include "client/ipc_client.h"
+#include "client/ipc_client_connection.h"
 #include "ipc_client_generated.h"
 
 #include <math.h>
@@ -181,12 +182,60 @@ ipc_client_device_get_view_poses(struct xrt_device *xdev,
 }
 
 static void
-ipc_client_device_set_output(struct xrt_device *xdev, enum xrt_output_name name, const union xrt_output_value *value)
+ipc_client_device_set_output(struct xrt_device *xdev, enum xrt_output_name name, const struct xrt_output_value *value)
+{
+	ipc_client_device_t *icd = ipc_client_device(xdev);
+	struct ipc_connection *ipc_c = icd->ipc_c;
+
+	xrt_result_t xret;
+	if (value->type == XRT_OUTPUT_VALUE_TYPE_PCM_VIBRATION) {
+		uint32_t samples_sent = MIN(value->pcm_vibration.sample_rate, 4000);
+
+		struct ipc_pcm_haptic_buffer samples = {
+		    .append = value->pcm_vibration.append,
+		    .num_samples = samples_sent,
+		    .sample_rate = value->pcm_vibration.sample_rate,
+		};
+
+		ipc_client_connection_lock(ipc_c);
+
+		xret = ipc_send_device_set_haptic_output_locked(ipc_c, icd->device_id, name, &samples);
+		IPC_CHK_WITH_RET(ipc_c, xret, "ipc_send_device_set_haptic_output_locked", );
+
+		xrt_result_t alloc_xret;
+		xret = ipc_receive(&ipc_c->imc, &alloc_xret, sizeof alloc_xret);
+		if (xret != XRT_SUCCESS || alloc_xret != XRT_SUCCESS) {
+			goto send_haptic_output_end;
+		}
+
+		xret = ipc_send(&ipc_c->imc, value->pcm_vibration.buffer, sizeof(float) * samples_sent);
+		if (xret != XRT_SUCCESS) {
+			goto send_haptic_output_end;
+		}
+
+		xret = ipc_receive(&ipc_c->imc, value->pcm_vibration.samples_consumed,
+		                   sizeof(*value->pcm_vibration.samples_consumed));
+		if (xret != XRT_SUCCESS) {
+			goto send_haptic_output_end;
+		}
+
+	send_haptic_output_end:
+		ipc_client_connection_unlock(ipc_c);
+	} else {
+		xret = ipc_call_device_set_output(ipc_c, icd->device_id, name, value);
+		IPC_CHK_ONLY_PRINT(ipc_c, xret, "ipc_call_device_set_output");
+	}
+}
+
+xrt_result_t
+ipc_client_device_get_output_limits(struct xrt_device *xdev, struct xrt_output_limits *limits)
 {
 	ipc_client_device_t *icd = ipc_client_device(xdev);
 
-	xrt_result_t xret = ipc_call_device_set_output(icd->ipc_c, icd->device_id, name, value);
-	IPC_CHK_ONLY_PRINT(icd->ipc_c, xret, "ipc_call_device_set_output");
+	xrt_result_t xret = ipc_call_device_get_output_limits(icd->ipc_c, icd->device_id, limits);
+	IPC_CHK_ONLY_PRINT(icd->ipc_c, xret, "ipc_call_device_get_output_limits");
+
+	return xret;
 }
 
 static xrt_result_t
@@ -221,6 +270,7 @@ ipc_client_device_create(struct ipc_connection *ipc_c, struct xrt_tracking_origi
 	icd->base.get_body_joints = ipc_client_device_get_body_joints;
 	icd->base.get_view_poses = ipc_client_device_get_view_poses;
 	icd->base.set_output = ipc_client_device_set_output;
+	icd->base.get_output_limits = ipc_client_device_get_output_limits;
 	icd->base.get_visibility_mask = ipc_client_device_get_visibility_mask;
 	icd->base.destroy = ipc_client_device_destroy;
 

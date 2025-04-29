@@ -1578,7 +1578,7 @@ CServerDriver_Monado::HandleHapticEvent(vr::VREvent_t *event)
 		return;
 	}
 
-	union xrt_output_value out;
+	struct xrt_output_value out;
 	out.vibration.amplitude = amp;
 	if (duration > 0.00001) {
 		out.vibration.duration_ns = (time_duration_ns)(duration * 1000.f * 1000.f * 1000.f);

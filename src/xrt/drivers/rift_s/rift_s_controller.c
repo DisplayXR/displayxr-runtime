@@ -510,7 +510,7 @@ rift_s_controller_update_inputs(struct xrt_device *xdev)
 }
 
 static void
-rift_s_controller_set_output(struct xrt_device *xdev, enum xrt_output_name name, const union xrt_output_value *value)
+rift_s_controller_set_output(struct xrt_device *xdev, enum xrt_output_name name, const struct xrt_output_value *value)
 {
 	/* TODO: Implement haptic sending */
 }

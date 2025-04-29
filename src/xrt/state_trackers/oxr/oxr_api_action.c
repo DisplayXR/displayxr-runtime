@@ -792,8 +792,25 @@ oxr_xrApplyHapticFeedback(XrSession session,
 	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrApplyHapticFeedback");
 	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
 	OXR_VERIFY_ARG_TYPE_AND_NOT_NULL(&log, hapticActionInfo, XR_TYPE_HAPTIC_ACTION_INFO);
-	OXR_VERIFY_ARG_TYPE_AND_NOT_NULL(&log, hapticEvent, XR_TYPE_HAPTIC_VIBRATION);
+	OXR_VERIFY_ARG_NOT_NULL(&log, hapticEvent);
 	OXR_VERIFY_ACTION_NOT_NULL(&log, hapticActionInfo->action, act);
+
+#ifdef OXR_HAVE_FB_haptic_pcm
+	if (hapticEvent->type != XR_TYPE_HAPTIC_PCM_VIBRATION_FB && hapticEvent->type != XR_TYPE_HAPTIC_VIBRATION) {
+		return oxr_error(
+		    &log, XR_ERROR_VALIDATION_FAILURE,
+		    "Haptic event type was not XR_TYPE_HAPTIC_VIBRATION or XR_TYPE_HAPTIC_PCM_VIBRATION_FB, got %d",
+		    hapticEvent->type);
+	}
+
+	if (hapticEvent->type == XR_TYPE_HAPTIC_PCM_VIBRATION_FB) {
+		OXR_VERIFY_EXTENSION(&log, sess->sys->inst, FB_haptic_pcm);
+	} else {
+		OXR_VERIFY_ARG_TYPE_AND_NOT_NULL(&log, hapticEvent, XR_TYPE_HAPTIC_VIBRATION);
+	}
+#else
+	OXR_VERIFY_ARG_TYPE_AND_NOT_NULL(&log, hapticEvent, XR_TYPE_HAPTIC_VIBRATION);
+#endif
 
 	ret = oxr_verify_subaction_path_get(&log, act->act_set->inst, hapticActionInfo->subactionPath,
 	                                    &act->data->subaction_paths, &subaction_paths, "getInfo->subactionPath");

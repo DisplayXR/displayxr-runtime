@@ -1440,7 +1440,8 @@ oxr_session_apply_force_feedback(struct oxr_logger *log,
 {
 	struct xrt_device *xdev = hand_tracker->xdev;
 
-	union xrt_output_value result;
+	struct xrt_output_value result = {0};
+	result.type = XRT_OUTPUT_VALUE_TYPE_FORCE_FEEDBACK;
 	result.force_feedback.force_feedback_location_count = locations->locationCount;
 	for (uint32_t i = 0; i < locations->locationCount; i++) {
 		result.force_feedback.force_feedback[i].location =

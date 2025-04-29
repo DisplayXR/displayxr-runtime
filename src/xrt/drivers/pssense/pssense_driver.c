@@ -677,7 +677,7 @@ pssense_device_update_inputs(struct xrt_device *xdev)
 }
 
 static void
-pssense_set_output(struct xrt_device *xdev, enum xrt_output_name name, const union xrt_output_value *value)
+pssense_set_output(struct xrt_device *xdev, enum xrt_output_name name, const struct xrt_output_value *value)
 {
 	struct pssense_device *pssense = (struct pssense_device *)xdev;
 

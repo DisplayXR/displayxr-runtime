@@ -45,11 +45,6 @@ oxr_session_get_action_set_attachment(struct oxr_session *sess,
                                       struct oxr_action_set **act_set);
 
 static void
-oxr_session_get_action_attachment(struct oxr_session *sess,
-                                  uint32_t act_key,
-                                  struct oxr_action_attachment **out_act_attached);
-
-static void
 oxr_action_cache_update(struct oxr_logger *log,
                         struct oxr_session *sess,
                         uint32_t countActionSets,
@@ -890,7 +885,7 @@ oxr_action_cache_stop_output(struct oxr_logger *log, struct oxr_session *sess, s
 	// Set this as stopped.
 	cache->stop_output_time = 0;
 
-	union xrt_output_value value = {0};
+	struct xrt_output_value value = {.type = XRT_OUTPUT_VALUE_TYPE_VIBRATION, .vibration = {0}};
 
 	for (uint32_t i = 0; i < cache->output_count; i++) {
 		struct oxr_action_output *output = &cache->outputs[i];
@@ -1679,13 +1674,7 @@ oxr_session_get_action_set_attachment(struct oxr_session *sess,
 	}
 }
 
-/*!
- * Given an action act_key, look up the @ref oxr_action_attachment of
- * the associated action in the given Session.
- *
- * @private @memberof oxr_session
- */
-static void
+void
 oxr_session_get_action_attachment(struct oxr_session *sess,
                                   uint32_t act_key,
                                   struct oxr_action_attachment **out_act_attached)
@@ -2163,10 +2152,32 @@ set_action_output_vibration(struct oxr_session *sess,
 {
 	cache->stop_output_time = stop;
 
-	union xrt_output_value value = {0};
+	struct xrt_output_value value = {0};
 	value.vibration.frequency = data->frequency;
 	value.vibration.amplitude = data->amplitude;
 	value.vibration.duration_ns = data->duration;
+	value.type = XRT_OUTPUT_VALUE_TYPE_VIBRATION;
+
+	for (uint32_t i = 0; i < cache->output_count; i++) {
+		struct oxr_action_output *output = &cache->outputs[i];
+		struct xrt_device *xdev = output->xdev;
+
+		xrt_device_set_output(xdev, output->name, &value);
+	}
+}
+
+XRT_MAYBE_UNUSED static void
+set_action_output_vibration_pcm(struct oxr_session *sess,
+                                struct oxr_action_cache *cache,
+                                const XrHapticPcmVibrationFB *data)
+{
+	struct xrt_output_value value = {0};
+	value.pcm_vibration.append = data->append;
+	value.pcm_vibration.buffer = data->buffer;
+	value.pcm_vibration.buffer_size = data->bufferSize;
+	value.pcm_vibration.sample_rate = data->sampleRate;
+	value.pcm_vibration.samples_consumed = data->samplesConsumed;
+	value.type = XRT_OUTPUT_VALUE_TYPE_PCM_VIBRATION;
 
 	for (uint32_t i = 0; i < cache->output_count; i++) {
 		struct oxr_action_output *output = &cache->outputs[i];
@@ -2190,27 +2201,46 @@ oxr_action_apply_haptic_feedback(struct oxr_logger *log,
 		return oxr_error(log, XR_ERROR_ACTIONSET_NOT_ATTACHED, "Action has not been attached to this session");
 	}
 
-	const XrHapticVibration *data = (const XrHapticVibration *)hapticEvent;
-
-	// This should all be moved into the drivers.
-	const int64_t min_pulse_time_ns = time_s_to_ns(0.1);
-	int64_t now_ns = time_state_get_now(sess->sys->inst->timekeeping);
-	int64_t stop_ns = 0;
-	if (data->duration <= 0) {
-		stop_ns = now_ns + min_pulse_time_ns;
-	} else {
-		stop_ns = now_ns + data->duration;
+	if (sess->state != XR_SESSION_STATE_FOCUSED) {
+		return oxr_session_success_focused_result(sess);
 	}
 
-	bool is_focused = sess->state == XR_SESSION_STATE_FOCUSED;
+	if (hapticEvent->type == XR_TYPE_HAPTIC_VIBRATION) {
+		const XrHapticVibration *data = (const XrHapticVibration *)hapticEvent;
+
+		// This should all be moved into the drivers.
+		const int64_t min_pulse_time_ns = time_s_to_ns(0.1);
+		int64_t now_ns = time_state_get_now(sess->sys->inst->timekeeping);
+		int64_t stop_ns = 0;
+		if (data->duration <= 0) {
+			stop_ns = now_ns + min_pulse_time_ns;
+		} else {
+			stop_ns = now_ns + data->duration;
+		}
 
 #define SET_OUT_VIBRATION(X)                                                                                           \
-	if (is_focused && act_attached->X.current.active && (subaction_paths.X || subaction_paths.any)) {              \
+	if (act_attached->X.current.active && (subaction_paths.X || subaction_paths.any)) {                            \
 		set_action_output_vibration(sess, &act_attached->X, stop_ns, data);                                    \
 	}
 
-	OXR_FOR_EACH_SUBACTION_PATH(SET_OUT_VIBRATION)
+		OXR_FOR_EACH_SUBACTION_PATH(SET_OUT_VIBRATION)
 #undef SET_OUT_VIBRATION
+#ifdef OXR_HAVE_FB_haptic_pcm
+	} else if (hapticEvent->type == XR_TYPE_HAPTIC_PCM_VIBRATION_FB) {
+		const XrHapticPcmVibrationFB *data = (const XrHapticPcmVibrationFB *)hapticEvent;
+
+#define SET_OUT_VIBRATION(X)                                                                                           \
+	if (act_attached->X.current.active && (subaction_paths.X || subaction_paths.any)) {                            \
+		set_action_output_vibration_pcm(sess, &act_attached->X, data);                                         \
+	}
+
+		OXR_FOR_EACH_SUBACTION_PATH(SET_OUT_VIBRATION)
+#undef SET_OUT_VIBRATION
+#endif /* OXR_HAVE_FB_haptic_pcm */
+	} else {
+		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE, "Received haptic feedback of invalid type");
+	}
+
 	return oxr_session_success_focused_result(sess);
 }
 

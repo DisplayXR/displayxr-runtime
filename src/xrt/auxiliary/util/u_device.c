@@ -515,7 +515,7 @@ u_device_ni_get_hand_tracking(struct xrt_device *xdev,
 }
 
 void
-u_device_ni_set_output(struct xrt_device *xdev, enum xrt_output_name name, const union xrt_output_value *value)
+u_device_ni_set_output(struct xrt_device *xdev, enum xrt_output_name name, const struct xrt_output_value *value)
 {
 	E(get_hand_tracking);
 }

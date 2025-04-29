@@ -189,7 +189,7 @@ simulated_device_get_view_poses(struct xrt_device *xdev,
 }
 
 static void
-simulated_device_set_output(struct xrt_device *xdev, enum xrt_output_name name, const union xrt_output_value *value)
+simulated_device_set_output(struct xrt_device *xdev, enum xrt_output_name name, const struct xrt_output_value *value)
 {
 	struct simulated_device *sd = simulated_device(xdev);
 	(void)sd;

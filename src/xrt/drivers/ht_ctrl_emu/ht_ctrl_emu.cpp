@@ -372,7 +372,7 @@ cemu_device_get_tracked_pose(struct xrt_device *xdev,
 }
 
 static void
-cemu_device_set_output(struct xrt_device *xdev, enum xrt_output_name name, const union xrt_output_value *value)
+cemu_device_set_output(struct xrt_device *xdev, enum xrt_output_name name, const struct xrt_output_value *value)
 {
 	// No-op, needed to avoid crash.
 }

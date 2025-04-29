@@ -431,7 +431,7 @@ vive_controller_device_get_tracked_pose(struct xrt_device *xdev,
 }
 
 static int
-vive_controller_haptic_pulse(struct vive_controller_device *d, const union xrt_output_value *value)
+vive_controller_haptic_pulse(struct vive_controller_device *d, const struct xrt_output_value *value)
 {
 	float duration_seconds;
 	if (value->vibration.duration_ns == XRT_MIN_HAPTIC_DURATION) {
@@ -489,7 +489,7 @@ vive_controller_haptic_pulse(struct vive_controller_device *d, const union xrt_o
 static void
 vive_controller_device_set_output(struct xrt_device *xdev,
                                   enum xrt_output_name name,
-                                  const union xrt_output_value *value)
+                                  const struct xrt_output_value *value)
 {
 	struct vive_controller_device *d = vive_controller_device(xdev);
 
