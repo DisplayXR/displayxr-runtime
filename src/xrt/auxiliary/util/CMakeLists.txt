@@ -78,6 +78,8 @@ add_library(
 	u_pretty_print.h
 	u_prober.c
 	u_prober.h
+	u_resampler.c
+	u_resampler.h
 	u_session.c
 	u_session.h
 	u_space_overseer.c

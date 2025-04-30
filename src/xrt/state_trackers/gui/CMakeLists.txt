@@ -19,6 +19,7 @@ add_library(
 	gui_scene_record_euroc.c
 	gui_scene_main_menu.c
 	gui_scene_record.c
+	gui_scene_resampler_test.c
 	gui_scene_remote.c
 	gui_scene_video.c
 	gui_scene_tracking_overrides.c

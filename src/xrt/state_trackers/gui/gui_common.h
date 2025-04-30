@@ -269,6 +269,9 @@ gui_scene_calibrate(struct gui_program *p,
                     struct xrt_fs *xfs,
                     struct xrt_settings_tracking *s);
 
+void
+gui_scene_resampler_test(struct gui_program *p);
+
 /*!
  * @}
  */
