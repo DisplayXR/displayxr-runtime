@@ -222,7 +222,7 @@ vk_object_type_string(VkObjectType type)
 		ENUM_TO_STR(VK_OBJECT_TYPE_VIDEO_SESSION_KHR);
 		ENUM_TO_STR(VK_OBJECT_TYPE_VIDEO_SESSION_PARAMETERS_KHR);
 #endif
-#ifdef VK_NVX_binary_import
+#if defined(VK_ENABLE_BETA_EXTENSIONS) && defined(VK_NVX_binary_import)
 		ENUM_TO_STR(VK_OBJECT_TYPE_CU_MODULE_NVX);
 		ENUM_TO_STR(VK_OBJECT_TYPE_CU_FUNCTION_NVX);
 #endif
@@ -247,7 +247,7 @@ vk_object_type_string(VkObjectType type)
 #ifdef VK_NV_device_generated_commands
 		ENUM_TO_STR(VK_OBJECT_TYPE_INDIRECT_COMMANDS_LAYOUT_NV);
 #endif
-#ifdef VK_NV_cuda_kernel_launch
+#if defined(VK_ENABLE_BETA_EXTENSIONS) && defined(VK_NV_cuda_kernel_launch)
 		ENUM_TO_STR(VK_OBJECT_TYPE_CUDA_MODULE_NV);
 		ENUM_TO_STR(VK_OBJECT_TYPE_CUDA_FUNCTION_NV);
 #endif
