@@ -55,7 +55,7 @@ get_config_path()
 #endif
 }
 
-ssize_t
+int
 u_file_get_config_dir(char *out_path, size_t out_path_size)
 {
 	auto config_path = get_config_path();
@@ -66,7 +66,7 @@ u_file_get_config_dir(char *out_path, size_t out_path_size)
 	return snprintf(out_path, out_path_size, "%s", config_path_string.c_str());
 }
 
-ssize_t
+int
 u_file_get_path_in_config_dir(const char *filename, char *out_path, size_t out_path_size)
 {
 	auto config_path = get_config_path();

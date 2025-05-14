@@ -66,7 +66,7 @@ is_dir(const char *path)
 	}
 }
 
-ssize_t
+int
 u_file_get_config_dir(char *out_path, size_t out_path_size)
 {
 	const char *xdg_home = getenv("XDG_CONFIG_HOME");
@@ -80,13 +80,13 @@ u_file_get_config_dir(char *out_path, size_t out_path_size)
 	return -1;
 }
 
-ssize_t
+int
 u_file_get_path_in_config_dir(const char *suffix, char *out_path, size_t out_path_size)
 {
 	char tmp[PATH_MAX];
-	ssize_t i = u_file_get_config_dir(tmp, sizeof(tmp));
+	int i = u_file_get_config_dir(tmp, sizeof(tmp));
 	if (i <= 0) {
-		return -1;
+		return i;
 	}
 
 	return snprintf(out_path, out_path_size, "%s/%s", tmp, suffix);
@@ -96,7 +96,7 @@ FILE *
 u_file_open_file_in_config_dir(const char *filename, const char *mode)
 {
 	char tmp[PATH_MAX];
-	ssize_t i = u_file_get_config_dir(tmp, sizeof(tmp));
+	int i = u_file_get_config_dir(tmp, sizeof(tmp));
 	if (i <= 0) {
 		return NULL;
 	}
@@ -152,13 +152,13 @@ u_file_open_file_in_config_dir_subpath(const char *subpath, const char *filename
 	return fopen(file_str, mode);
 }
 
-ssize_t
+int
 u_file_get_hand_tracking_models_dir(char *out_path, size_t out_path_size)
 {
 	const char *suffix = "/monado/hand-tracking-models";
 	const char *xdg_data_home = getenv("XDG_DATA_HOME");
 	const char *home = getenv("HOME");
-	ssize_t ret = 0;
+	int ret = 0;
 
 	if (xdg_data_home != NULL) {
 		ret = snprintf(out_path, out_path_size, "%s%s", xdg_data_home, suffix);
@@ -188,12 +188,12 @@ u_file_get_hand_tracking_models_dir(char *out_path, size_t out_path_size)
 		out_path[0] = '\0';
 	}
 
-	return -1;
+	return ret;
 }
 
 #endif /* XRT_OS_LINUX */
 
-ssize_t
+int
 u_file_get_runtime_dir(char *out_path, size_t out_path_size)
 {
 	const char *xgd_rt = getenv("XDG_RUNTIME_DIR");
@@ -205,13 +205,13 @@ u_file_get_runtime_dir(char *out_path, size_t out_path_size)
 	return snprintf(out_path, out_path_size, "%s", tmp);
 }
 
-ssize_t
+int
 u_file_get_path_in_runtime_dir(const char *suffix, char *out_path, size_t out_path_size)
 {
 	char tmp[PATH_MAX];
-	ssize_t i = u_file_get_runtime_dir(tmp, sizeof(tmp));
+	int i = u_file_get_runtime_dir(tmp, sizeof(tmp));
 	if (i <= 0) {
-		return -1;
+		return i;
 	}
 
 	return snprintf(out_path, out_path_size, "%s/%s", tmp, suffix);
