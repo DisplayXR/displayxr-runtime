@@ -571,6 +571,46 @@ hydra_device_destroy(struct xrt_device *xdev)
 		(hd->base.inputs[HYDRA_INDEX_##NAME].name = XRT_INPUT_HYDRA_##NAME);                                   \
 	} while (0)
 
+static struct xrt_binding_input_pair touch_inputs[19] = {
+    {XRT_INPUT_TOUCH_X_CLICK, XRT_INPUT_HYDRA_2_CLICK},
+    {XRT_INPUT_TOUCH_X_TOUCH, XRT_INPUT_HYDRA_2_CLICK},
+    {XRT_INPUT_TOUCH_Y_CLICK, XRT_INPUT_HYDRA_4_CLICK},
+    {XRT_INPUT_TOUCH_Y_TOUCH, XRT_INPUT_HYDRA_4_CLICK},
+    {XRT_INPUT_TOUCH_MENU_CLICK, XRT_INPUT_HYDRA_MIDDLE_CLICK},
+    {XRT_INPUT_TOUCH_A_CLICK, XRT_INPUT_HYDRA_1_CLICK},
+    {XRT_INPUT_TOUCH_A_TOUCH, XRT_INPUT_HYDRA_1_CLICK},
+    {XRT_INPUT_TOUCH_B_CLICK, XRT_INPUT_HYDRA_3_CLICK},
+    {XRT_INPUT_TOUCH_B_TOUCH, XRT_INPUT_HYDRA_3_CLICK},
+    {XRT_INPUT_TOUCH_SYSTEM_CLICK, XRT_INPUT_HYDRA_MIDDLE_CLICK},
+    {XRT_INPUT_TOUCH_SQUEEZE_VALUE, XRT_INPUT_HYDRA_BUMPER_CLICK},
+    {XRT_INPUT_TOUCH_TRIGGER_TOUCH, XRT_INPUT_HYDRA_TRIGGER_VALUE},
+    {XRT_INPUT_TOUCH_TRIGGER_VALUE, XRT_INPUT_HYDRA_TRIGGER_VALUE},
+    {XRT_INPUT_TOUCH_THUMBSTICK_CLICK, XRT_INPUT_HYDRA_JOYSTICK_CLICK},
+    {XRT_INPUT_TOUCH_THUMBSTICK, XRT_INPUT_HYDRA_JOYSTICK_VALUE},
+    {XRT_INPUT_TOUCH_GRIP_POSE, XRT_INPUT_HYDRA_POSE},
+    {XRT_INPUT_TOUCH_AIM_POSE, XRT_INPUT_HYDRA_POSE},
+};
+
+static struct xrt_binding_input_pair simple_inputs[4] = {
+    {XRT_INPUT_SIMPLE_SELECT_CLICK, XRT_INPUT_HYDRA_TRIGGER_VALUE},
+    {XRT_INPUT_SIMPLE_MENU_CLICK, XRT_INPUT_HYDRA_MIDDLE_CLICK},
+    {XRT_INPUT_SIMPLE_GRIP_POSE, XRT_INPUT_HYDRA_POSE},
+    {XRT_INPUT_SIMPLE_AIM_POSE, XRT_INPUT_HYDRA_POSE},
+};
+
+static struct xrt_binding_profile binding_profiles[2] = {
+    {
+        .name = XRT_DEVICE_TOUCH_CONTROLLER,
+        .inputs = touch_inputs,
+        .input_count = ARRAY_SIZE(touch_inputs),
+    },
+    {
+        .name = XRT_DEVICE_SIMPLE_CONTROLLER,
+        .inputs = simple_inputs,
+        .input_count = ARRAY_SIZE(simple_inputs),
+    },
+};
+
 int
 hydra_found(struct xrt_prober *xp,
             struct xrt_prober_device **devices,
@@ -642,6 +682,9 @@ hydra_found(struct xrt_prober *xp,
 		SET_INPUT(POSE);
 		hd->index = i;
 		hd->sys = hs;
+
+		hd->base.binding_profiles = binding_profiles;
+		hd->base.binding_profile_count = ARRAY_SIZE(binding_profiles);
 
 		out_xdevs[i] = &(hd->base);
 	}
