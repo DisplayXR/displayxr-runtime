@@ -57,6 +57,7 @@ find_suitable_pose_name(struct xrt_device *xdev)
 		case XRT_INPUT_PICO_NEO3_GRIP_POSE: return name;
 		case XRT_INPUT_PICO4_GRIP_POSE: return name;
 		case XRT_INPUT_OPPO_MR_GRIP_POSE: return name;
+		case XRT_INPUT_HYDRA_POSE: return name;
 		default: break;
 		}
 	}
