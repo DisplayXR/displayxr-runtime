@@ -1305,7 +1305,6 @@ submit_projection_layer(struct oxr_session *sess,
 #ifdef OXR_HAVE_KHR_composition_layer_depth
 	// Number of depth layers must be 0 or proj->viewCount.
 	bool d_scs_valid = true;
-	struct oxr_swapchain *d_scs[XRT_MAX_VIEWS] = {0};
 	struct xrt_swapchain *d_swapchains[XRT_MAX_VIEWS] = {0};
 #else
 	const bool d_scs_valid = false;
@@ -1363,7 +1362,6 @@ submit_projection_layer(struct oxr_session *sess,
 		struct oxr_swapchain *sc =
 		    XRT_CAST_OXR_HANDLE_TO_PTR(struct oxr_swapchain *, d_info->subImage.swapchain);
 		fill_in_sub_image(sc, &d_info->subImage, &data.depth.d[i].sub);
-		d_scs[i] = sc;
 		d_swapchains[i] = sc->swapchain;
 	}
 #endif // OXR_HAVE_KHR_composition_layer_depth
