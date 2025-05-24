@@ -3,10 +3,10 @@
 # SPDX-License-Identifier: BSL-1.0
 
 ##
-#######################################################
-#                GENERATED - DO NOT EDIT              #
-# see .gitlab-ci/install-android-sdk.sh.jinja instead #
-#######################################################
+################################################################
+#                GENERATED - DO NOT EDIT                       #
+# see .gitlab-ci/template/install-android-sdk.sh.jinja instead #
+################################################################
 ##
 
 # Partially inspired by https://about.gitlab.com/blog/2018/10/24/setting-up-gitlab-ci-for-android-projects/
