@@ -275,10 +275,9 @@ os_ns_to_timespec(int64_t ns, struct timespec *spec)
 }
 #endif // XRT_HAVE_TIMESPEC
 
+#define OS_NS_PER_USEC (1000)
 
 #if defined(XRT_HAVE_TIMEVAL) && defined(XRT_OS_LINUX)
-
-#define OS_NS_PER_USEC (1000)
 
 static inline int64_t
 os_timeval_to_ns(struct timeval *val)
