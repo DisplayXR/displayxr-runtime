@@ -131,6 +131,13 @@ if(XRT_BUILD_DRIVER_XREAL_AIR)
 	list(APPEND ENABLED_HEADSET_DRIVERS xreal_air)
 endif()
 
+if(XRT_BUILD_DRIVER_UVC)
+	add_library(drv_uvc STATIC uvc/uvc_interface.h uvc/uvc_driver.c uvc/uvc_internal.h)
+	target_link_libraries(drv_uvc PRIVATE xrt-interfaces aux_os aux_util ${LIBUSB1_LIBRARIES})
+	target_include_directories(drv_uvc PUBLIC ${LIBUSB1_INCLUDE_DIRS})
+	list(APPEND ENABLED_DRIVERS uvc)
+endif()
+
 if(XRT_BUILD_DRIVER_ULV2)
 	add_library(drv_ulv2 STATIC ultraleap_v2/ulv2_driver.cpp ultraleap_v2/ulv2_interface.h)
 	target_link_libraries(drv_ulv2 PRIVATE xrt-interfaces aux_util aux_math LeapV2::LeapV2)

@@ -332,6 +332,7 @@ option_with_deps(XRT_HAVE_LIBUSB "Enable libusb (used for most drivers)" DEPENDS
 option_with_deps(XRT_HAVE_LIBUVC "Enable libuvc video driver" DEPENDS LIBUVC_FOUND XRT_HAVE_LIBUSB)
 option_with_deps(XRT_HAVE_REALSENSE "Enable RealSense support" DEPENDS realsense2_FOUND)
 option_with_deps(XRT_HAVE_OPENVR "Enable OpenVR support" DEPENDS OPENVR_FOUND)
+option_with_deps(XRT_BUILD_DRIVER_UVC "Enable userspace UVC driver" OFF DEPENDS XRT_HAVE_LIBUSB)
 
 # Drivers to build (sorted)
 option_with_deps(XRT_BUILD_DRIVER_ANDROID "Enable Android sensors driver" DEPENDS ANDROID)
@@ -468,6 +469,7 @@ list(
 	"ROKID"
 	"SURVIVE"
 	"V4L2"
+	"UVC"
 	"ULV2"
 	"ULV5"
 	"VF"
@@ -716,6 +718,7 @@ message(STATUS "#    DRIVER_SIMULATED:            ${XRT_BUILD_DRIVER_SIMULATED}"
 message(STATUS "#    DRIVER_SIMULAVR:             ${XRT_BUILD_DRIVER_SIMULAVR}")
 message(STATUS "#    DRIVER_SURVIVE:              ${XRT_BUILD_DRIVER_SURVIVE}")
 message(STATUS "#    DRIVER_TWRAP:                ${XRT_BUILD_DRIVER_TWRAP}")
+message(STATUS "#    DRIVER_UVC:                  ${XRT_BUILD_DRIVER_UVC}")
 message(STATUS "#    DRIVER_ULV2:                 ${XRT_BUILD_DRIVER_ULV2}")
 message(STATUS "#    DRIVER_ULV5:                 ${XRT_BUILD_DRIVER_ULV5}")
 message(STATUS "#    DRIVER_VF:                   ${XRT_BUILD_DRIVER_VF}")
