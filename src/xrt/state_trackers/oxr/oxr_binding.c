@@ -220,14 +220,14 @@ ends_with(const char *str, const char *suffix)
 }
 
 static bool
-add_by_component(struct oxr_logger *log,
-                 struct oxr_instance *inst,
-                 struct oxr_binding *bindings,
-                 size_t binding_count,
-                 XrPath path,
-                 struct oxr_action *act,
-                 const char **components,
-                 size_t component_count)
+try_add_by_component(struct oxr_logger *log,
+                     struct oxr_instance *inst,
+                     struct oxr_binding *bindings,
+                     size_t binding_count,
+                     XrPath path,
+                     struct oxr_action *act,
+                     const char **components,
+                     size_t component_count)
 {
 	for (uint32_t component_index = 0; component_index < component_count; component_index++) {
 		// once we found everything for a component like click we don't want to keep going to add to a component
@@ -275,7 +275,7 @@ add_by_component(struct oxr_logger *log,
 			return true;
 		}
 	}
-	return true;
+	return false;
 }
 
 static bool
@@ -326,15 +326,21 @@ add_act_key_to_matching_bindings(struct oxr_logger *log,
 	size_t len;
 	oxr_path_get_string(log, inst, path, &str, &len);
 
-	// check if we need to select a child
+	bool added = false;
+
+	// check if we need to select a child, e.g. suggested str is */trigger for a bool action, or */trigger for a
+	// float action
 	if (xr_act_type == XR_ACTION_TYPE_BOOLEAN_INPUT && !ends_with(str, "/click") && !ends_with(str, "/touch")) {
 		const char *components[2] = {"click", "value"};
-		add_by_component(log, inst, bindings, binding_count, path, act, components, 2);
+		added = try_add_by_component(log, inst, bindings, binding_count, path, act, components, 2);
 	} else if (xr_act_type == XR_ACTION_TYPE_FLOAT_INPUT && !ends_with(str, "/value") &&
 	           !ends_with(str, "/click")) {
 		const char *components[2] = {"value", "click"};
-		add_by_component(log, inst, bindings, binding_count, path, act, components, 2);
-	} else {
+		added = try_add_by_component(log, inst, bindings, binding_count, path, act, components, 2);
+	}
+
+	// if the suggested str was not one of the ones that require us to select a child, fall back to the default case
+	if (!added) {
 		add_direct(log, inst, bindings, binding_count, path, act);
 	}
 }
