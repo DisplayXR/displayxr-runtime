@@ -19,6 +19,8 @@
 extern "C" {
 #endif
 
+#define U_SINK_MAX_SPLIT_DOWNSTREAMS 5
+
 /*!
  * @see u_sink_quirk_create
  */
@@ -135,6 +137,17 @@ u_sink_quirk_create(struct xrt_frame_context *xfctx,
                     struct xrt_frame_sink *downstream,
                     struct u_sink_quirk_params *params,
                     struct xrt_frame_sink **out_xfs);
+
+/*!
+ * @public @memberof xrt_frame_sink
+ * @see xrt_frame_context
+ * Takes a frame and pushes it to a maximum of U_SINK_MAX_SPLIT_DOWNSTREAMS sinks
+ */
+void
+u_sink_split_multi_create(struct xrt_frame_context *xfctx,
+                          struct xrt_frame_sink **downstreams,
+                          size_t downstream_count,
+                          struct xrt_frame_sink **out_xfs);
 
 /*!
  * @public @memberof xrt_frame_sink
