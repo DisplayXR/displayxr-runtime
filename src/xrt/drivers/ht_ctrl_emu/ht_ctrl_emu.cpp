@@ -227,9 +227,7 @@ get_other_two(struct cemu_device *dev,
 	struct xrt_space_relation head_rel;
 	xrt_result_t xret =
 	    xrt_device_get_tracked_pose(sys->in_head, XRT_INPUT_GENERIC_HEAD_POSE, head_timestamp_ns, &head_rel);
-	if (xret != XRT_SUCCESS) {
-		return xret;
-	}
+	U_LOG_CHK_AND_RET(sys->log_level, xret, "xrt_device_get_tracked_pose");
 
 	*out_head = head_rel.pose;
 	int other;
@@ -253,6 +251,8 @@ do_aim_pose(struct cemu_device *dev,
             int64_t hand_timestamp_ns,
             struct xrt_space_relation *out_relation)
 {
+	struct cemu_system *sys = dev->sys;
+
 	struct xrt_vec3 vec3_up = {0, 1, 0};
 	struct xrt_pose head;
 	struct xrt_hand_joint_set joint_set_secondary;
@@ -263,9 +263,7 @@ do_aim_pose(struct cemu_device *dev,
 	// "Moshi way"
 	xrt_result_t xret = get_other_two(dev, head_timestamp_ns, hand_timestamp_ns, &head, &joint_set_secondary);
 #endif
-	if (xret != XRT_SUCCESS) {
-		return xret;
-	}
+	U_LOG_CHK_AND_RET(sys->log_level, xret, "get_other_two");
 
 	// Average shoulder width for women:37cm, men:41cm, center of shoulder
 	// joint is around 4cm inwards
@@ -345,9 +343,7 @@ cemu_device_get_tracked_pose(struct xrt_device *xdev,
 	struct xrt_hand_joint_set joint_set;
 	xrt_result_t xret = xrt_device_get_hand_tracking(sys->in_hand, dev->ht_input_name, at_timestamp_ns, &joint_set,
 	                                                 &hand_timestamp_ns);
-	if (xret != XRT_SUCCESS) {
-		return xret;
-	}
+	U_LOG_CHK_AND_RET(sys->log_level, xret, "xrt_device_get_hand_tracking");
 
 	if (joint_set.is_active == false) {
 		out_relation->relation_flags = XRT_SPACE_RELATION_BITMASK_NONE;
@@ -397,15 +393,14 @@ static xrt_result_t
 cemu_device_update_inputs(struct xrt_device *xdev)
 {
 	struct cemu_device *dev = cemu_device(xdev);
+	struct cemu_system *sys = dev->sys;
 
 	struct xrt_hand_joint_set joint_set;
 	int64_t noop;
 
 	xrt_result_t xret = xrt_device_get_hand_tracking(dev->sys->in_hand, dev->ht_input_name, os_monotonic_get_ns(),
 	                                                 &joint_set, &noop);
-	if (xret != XRT_SUCCESS) {
-		return xret;
-	}
+	U_LOG_CHK_AND_RET(sys->log_level, xret, "xrt_device_get_hand_tracking");
 
 	if (!joint_set.is_active) {
 		xdev->inputs[CEMU_INDEX_SELECT].value.boolean = false;

@@ -164,11 +164,9 @@ r_device_get_hand_tracking(struct xrt_device *xdev,
 
 	// Get the pose of the hand.
 	struct xrt_space_relation relation;
-	xrt_result_t ret =
+	xrt_result_t xret =
 	    xrt_device_get_tracked_pose(xdev, XRT_INPUT_INDEX_GRIP_POSE, requested_timestamp_ns, &relation);
-	if (ret != XRT_SUCCESS) {
-		return ret;
-	}
+	U_LOG_CHK_AND_RET(u_log_get_global_level(), xret, "xrt_device_get_tracked_pose");
 
 	// Simulate the hand.
 	enum xrt_hand hand = rd->is_left ? XRT_HAND_LEFT : XRT_HAND_RIGHT;

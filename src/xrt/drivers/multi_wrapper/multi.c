@@ -148,10 +148,8 @@ get_hand_tracking(struct xrt_device *xdev,
 {
 	struct multi_device *d = (struct multi_device *)xdev;
 	struct xrt_device *target = d->tracking_override.target;
-	xrt_result_t ret = xrt_device_get_hand_tracking(target, name, at_timestamp_ns, out_value, out_timestamp_ns);
-	if (ret != XRT_SUCCESS) {
-		return ret;
-	}
+	xrt_result_t xret = xrt_device_get_hand_tracking(target, name, at_timestamp_ns, out_value, out_timestamp_ns);
+	U_LOG_CHK_AND_RET(d->log_level, xret, "xrt_device_get_hand_tracking");
 
 	if (!out_value->is_active) {
 		return XRT_SUCCESS;
@@ -159,11 +157,9 @@ get_hand_tracking(struct xrt_device *xdev,
 
 	struct xrt_device *tracker = d->tracking_override.tracker;
 	struct xrt_space_relation tracker_relation;
-	ret =
+	xret =
 	    xrt_device_get_tracked_pose(tracker, d->tracking_override.input_name, *out_timestamp_ns, &tracker_relation);
-	if (ret != XRT_SUCCESS) {
-		return ret;
-	}
+	U_LOG_CHK_AND_RET(d->log_level, xret, "xrt_device_get_hand_tracking");
 
 	switch (d->override_type) {
 	case XRT_TRACKING_OVERRIDE_DIRECT: direct_override(d, &tracker_relation, &out_value->hand_pose); break;
