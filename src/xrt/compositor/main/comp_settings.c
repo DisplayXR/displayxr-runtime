@@ -67,19 +67,24 @@ comp_settings_init(struct comp_settings *s, struct xrt_device *xdev)
 	s->use_compute = debug_get_bool_option_compute();
 
 	if (s->use_compute) {
-		// This was the default before, keep it first.
+		// Tested working with a PSVR2 and a patched Mesa. Native format of the PSVR2. 10-bit formats should be
+		// preferred in all cases for lower colour banding.
+		add_format(s, VK_FORMAT_A2B10G10R10_UNORM_PACK32);
+
+		// Default 8-bit channel 32-bit pixel format, most commonly supported UNORM format across Windows and
+		// Linux.
 		add_format(s, VK_FORMAT_B8G8R8A8_UNORM);
 
-		// This is according to GPU info more supported.
-		add_format(s, VK_FORMAT_B8G8R8A8_UNORM);
+		// Next most common UNORM format.
+		add_format(s, VK_FORMAT_R8G8B8A8_UNORM);
 
 		// Seen on some NVIDIA cards.
 		add_format(s, VK_FORMAT_A8B8G8R8_UNORM_PACK32);
 
-		// Untested: 30 bit format, should we move this higher up?
-		add_format(s, VK_FORMAT_A2B10G10R10_UNORM_PACK32);
+		// 32-bit formats should be preferred over a 64-bit format, for performance/memory reasons.
+		add_format(s, VK_FORMAT_R16G16B16A16_SFLOAT);
 
-		// Untested: Super constrained platforms.
+		// Untested: Super constrained platforms. Absolute last resort.
 		add_format(s, VK_FORMAT_A1R5G5B5_UNORM_PACK16);
 	} else {
 #if defined(XRT_OS_ANDROID)
