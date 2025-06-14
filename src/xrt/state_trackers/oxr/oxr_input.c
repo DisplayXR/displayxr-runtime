@@ -1505,6 +1505,37 @@ oxr_action_populate_input_transform_dpad(struct oxr_logger *log,
 	    &action_input->transform_count);          //
 }
 
+static bool
+is_dpad_region_for_emulation(const char *start, const char *end)
+{
+	// go before the first slash
+	end--;
+
+	while (end > start) {
+		char curr = *end;
+
+		// once we find a slash,
+		if (curr == '/') {
+			const char *to_check[] = {"/thumbstick_", "/thumbstick/", "/trackpad_", "/trackpad/"};
+
+			// check if the passed path is a sub-path of "thumbstick[_|/]" or "trackpad[_|/]"
+			for (size_t i = 0; i < ARRAY_SIZE(to_check); i++) {
+				if (strncmp(end, to_check[i], strlen(to_check[i])) == 0) {
+					// this is for emulation
+					return true;
+				}
+			}
+
+			// it's not for emulation and is an actual dpad region
+			return false;
+		}
+
+		end--;
+	}
+
+	return false;
+}
+
 // based on get_subaction_path_from_path
 static bool
 get_dpad_region_from_path(struct oxr_logger *log,
@@ -1522,23 +1553,28 @@ get_dpad_region_from_path(struct oxr_logger *log,
 	}
 
 	// TODO: surely there's a better way to do this?
-	if (length >= 10 && strncmp("/dpad_left", str + (length - 10), 10) == 0) {
+	if (length >= 10 && strncmp("/dpad_left", str + (length - 10), 10) == 0 &&
+	    is_dpad_region_for_emulation(str, str + (length - 10))) {
 		*out_dpad_region = OXR_DPAD_REGION_LEFT;
 		return true;
 	}
-	if (length >= 11 && strncmp("/dpad_right", str + (length - 11), 11) == 0) {
+	if (length >= 11 && strncmp("/dpad_right", str + (length - 11), 11) == 0 &&
+	    is_dpad_region_for_emulation(str, str + (length - 11))) {
 		*out_dpad_region = OXR_DPAD_REGION_RIGHT;
 		return true;
 	}
-	if (length >= 8 && strncmp("/dpad_up", str + (length - 8), 8) == 0) {
+	if (length >= 8 && strncmp("/dpad_up", str + (length - 8), 8) == 0 &&
+	    is_dpad_region_for_emulation(str, str + (length - 8))) {
 		*out_dpad_region = OXR_DPAD_REGION_UP;
 		return true;
 	}
-	if (length >= 10 && strncmp("/dpad_down", str + (length - 10), 10) == 0) {
+	if (length >= 10 && strncmp("/dpad_down", str + (length - 10), 10) == 0 &&
+	    is_dpad_region_for_emulation(str, str + (length - 10))) {
 		*out_dpad_region = OXR_DPAD_REGION_DOWN;
 		return true;
 	}
-	if (length >= 12 && strncmp("/dpad_center", str + (length - 12), 12) == 0) {
+	if (length >= 12 && strncmp("/dpad_center", str + (length - 12), 12) == 0 &&
+	    is_dpad_region_for_emulation(str, str + (length - 12))) {
 		*out_dpad_region = OXR_DPAD_REGION_CENTER;
 		return true;
 	}
