@@ -709,11 +709,7 @@ get_roles(struct xrt_system_devices *xsysd, struct xrt_system_roles *out_roles)
 	bool update_gen = false;
 	int head, left, right, gamepad;
 
-	if (out_roles->generation_id == 0) {
-		gamepad = XRT_DEVICE_ROLE_UNASSIGNED; // No gamepads in steamvr_lh set this unassigned first run
-	}
-
-	u_device_assign_xdev_roles(xsysd->xdevs, xsysd->xdev_count, &head, &left, &right);
+	u_device_assign_xdev_roles(xsysd->xdevs, xsysd->xdev_count, &head, &left, &right, &gamepad);
 
 	if (left != out_roles->left || right != out_roles->right || gamepad != out_roles->gamepad) {
 		update_gen = true;

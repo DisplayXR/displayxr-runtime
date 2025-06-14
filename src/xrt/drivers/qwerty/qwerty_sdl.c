@@ -50,8 +50,9 @@ default_qwerty_device(struct xrt_device **xdevs, size_t xdev_count, struct qwert
 	int head;
 	int left;
 	int right;
-	head = left = right = XRT_DEVICE_ROLE_UNASSIGNED;
-	u_device_assign_xdev_roles(xdevs, xdev_count, &head, &left, &right);
+	int gamepad;
+	head = left = right = gamepad = XRT_DEVICE_ROLE_UNASSIGNED;
+	u_device_assign_xdev_roles(xdevs, xdev_count, &head, &left, &right, &gamepad);
 
 	struct xrt_device *xd_hmd = qsys->hmd ? &qsys->hmd->base.base : NULL;
 	struct xrt_device *xd_left = &qsys->lctrl->base.base;
@@ -78,8 +79,9 @@ default_qwerty_controller(struct xrt_device **xdevs, size_t xdev_count, struct q
 	int head;
 	int left;
 	int right;
-	head = left = right = XRT_DEVICE_ROLE_UNASSIGNED;
-	u_device_assign_xdev_roles(xdevs, xdev_count, &head, &left, &right);
+	int gamepad;
+	head = left = right = gamepad = XRT_DEVICE_ROLE_UNASSIGNED;
+	u_device_assign_xdev_roles(xdevs, xdev_count, &head, &left, &right, &gamepad);
 
 	struct xrt_device *xd_left = &qsys->lctrl->base.base;
 	struct xrt_device *xd_right = &qsys->rctrl->base.base;

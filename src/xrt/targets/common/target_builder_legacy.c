@@ -151,11 +151,11 @@ legacy_open_system_impl(struct xrt_builder *xb,
 	 * Setup the roles.
 	 */
 
-	int head_idx, left_idx, right_idx;
-	u_device_assign_xdev_roles(xsysd->xdevs, xsysd->xdev_count, &head_idx, &left_idx, &right_idx);
+	int head_idx, left_idx, right_idx, gamepad_idx;
+	u_device_assign_xdev_roles(xsysd->xdevs, xsysd->xdev_count, &head_idx, &left_idx, &right_idx, &gamepad_idx);
 
 	struct xrt_device *head = NULL;
-	struct xrt_device *left = NULL, *right = NULL;
+	struct xrt_device *left = NULL, *right = NULL, *gamepad = NULL;
 	struct xrt_device *left_ht = NULL, *right_ht = NULL;
 
 	if (head_idx >= 0) {
@@ -167,6 +167,9 @@ legacy_open_system_impl(struct xrt_builder *xb,
 	if (right_idx >= 0) {
 		right = xsysd->xdevs[right_idx];
 	}
+	if (gamepad_idx >= 0) {
+		gamepad = xsysd->xdevs[gamepad_idx];
+	}
 
 	// Find hand tracking devices.
 	left_ht = u_system_devices_get_ht_device_left(xsysd);
@@ -176,6 +179,7 @@ legacy_open_system_impl(struct xrt_builder *xb,
 	ubrh->head = head;
 	ubrh->left = left;
 	ubrh->right = right;
+	ubrh->gamepad = gamepad;
 	ubrh->hand_tracking.left = left_ht;
 	ubrh->hand_tracking.right = right_ht;
 

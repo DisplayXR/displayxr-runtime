@@ -106,11 +106,13 @@ void
 u_builder_setup_tracking_origins(struct xrt_device *head,
                                  struct xrt_device *left,
                                  struct xrt_device *right,
+                                 struct xrt_device *gamepad,
                                  struct xrt_vec3 *global_tracking_origin_offset)
 {
 	struct xrt_tracking_origin *head_origin = head ? head->tracking_origin : NULL;
 	struct xrt_tracking_origin *left_origin = left ? left->tracking_origin : NULL;
 	struct xrt_tracking_origin *right_origin = right ? right->tracking_origin : NULL;
+	struct xrt_tracking_origin *gamepad_origin = gamepad ? gamepad->tracking_origin : NULL;
 
 	if (left_origin != NULL && left_origin->type == XRT_TRACKING_TYPE_NONE) {
 		left_origin->initial_offset.position.x = -0.2f;
@@ -122,6 +124,12 @@ u_builder_setup_tracking_origins(struct xrt_device *head,
 		right_origin->initial_offset.position.x = 0.2f;
 		right_origin->initial_offset.position.y = 1.3f;
 		right_origin->initial_offset.position.z = -0.5f;
+	}
+
+	if (gamepad_origin != NULL && gamepad_origin->type == XRT_TRACKING_TYPE_NONE) {
+		gamepad_origin->initial_offset.position.x = 0.0f;
+		gamepad_origin->initial_offset.position.y = 1.3f;
+		gamepad_origin->initial_offset.position.z = -0.5f;
 	}
 
 	// Head comes last, because left and right may share tracking origin.
@@ -141,6 +149,10 @@ u_builder_setup_tracking_origins(struct xrt_device *head,
 	if (right_origin && right_origin != head_origin && right_origin != left_origin) {
 		apply_offset(&right->tracking_origin->initial_offset.position, global_tracking_origin_offset);
 	}
+	if (gamepad_origin && gamepad_origin != head_origin && gamepad_origin != right_origin &&
+	    gamepad_origin != left_origin) {
+		apply_offset(&right->tracking_origin->initial_offset.position, global_tracking_origin_offset);
+	}
 }
 
 void
@@ -148,6 +160,7 @@ u_builder_create_space_overseer_legacy(struct xrt_session_event_sink *broadcast,
                                        struct xrt_device *head,
                                        struct xrt_device *left,
                                        struct xrt_device *right,
+                                       struct xrt_device *gamepad,
                                        struct xrt_device **xdevs,
                                        uint32_t xdev_count,
                                        bool root_is_unbounded,
@@ -168,6 +181,7 @@ u_builder_create_space_overseer_legacy(struct xrt_session_event_sink *broadcast,
 	    head,                            //
 	    left,                            //
 	    right,                           //
+	    gamepad,                         //
 	    &global_tracking_origin_offset); //
 
 
@@ -235,7 +249,8 @@ u_builder_roles_helper_open_system(struct xrt_builder *xb,
 	u_system_devices_static_finalize( //
 	    usysds,                       // usysds
 	    ubrh.left,                    // left
-	    ubrh.right);                  // right
+	    ubrh.right,                   // right
+	    ubrh.gamepad);                // gamepad
 
 
 	/*
@@ -248,6 +263,7 @@ u_builder_roles_helper_open_system(struct xrt_builder *xb,
 	    ubrh.head,                          // head
 	    ubrh.left,                          // left
 	    ubrh.right,                         // right
+	    ubrh.gamepad,                       // gamepad
 	    xsysd->xdevs,                       // xdevs
 	    xsysd->xdev_count,                  // xdev_count
 	    false,                              // root_is_unbounded

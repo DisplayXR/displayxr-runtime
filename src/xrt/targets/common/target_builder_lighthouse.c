@@ -622,8 +622,9 @@ lighthouse_open_system_impl(struct xrt_builder *xb,
 	int head_idx = -1;
 	int left_idx = -1;
 	int right_idx = -1;
+	int gamepad_idx = -1;
 
-	u_device_assign_xdev_roles(xsysd->xdevs, xsysd->xdev_count, &head_idx, &left_idx, &right_idx);
+	u_device_assign_xdev_roles(xsysd->xdevs, xsysd->xdev_count, &head_idx, &left_idx, &right_idx, &gamepad_idx);
 
 	if (head_idx < 0) {
 		LH_ERROR("Unable to find HMD");

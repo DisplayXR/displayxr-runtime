@@ -131,12 +131,13 @@ u_device_free(struct xrt_device *xdev);
 #define XRT_DEVICE_ROLE_UNASSIGNED (-1)
 
 /*!
- * Helper function to assign head, left hand and right hand roles.
+ * Helper function to assign head, left hand, right hand, and gamepad roles.
  *
  * @ingroup aux_util
  */
 void
-u_device_assign_xdev_roles(struct xrt_device **xdevs, size_t xdev_count, int *head, int *left, int *right);
+u_device_assign_xdev_roles(
+    struct xrt_device **xdevs, size_t xdev_count, int *head, int *left, int *right, int *gamepad);
 
 /*!
  * Helper function for `get_view_pose` in an HMD driver.

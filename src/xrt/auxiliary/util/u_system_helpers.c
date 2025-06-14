@@ -192,18 +192,22 @@ u_system_devices_static_allocate(void)
 void
 u_system_devices_static_finalize(struct u_system_devices_static *usysds,
                                  struct xrt_device *left,
-                                 struct xrt_device *right)
+                                 struct xrt_device *right,
+                                 struct xrt_device *gamepad)
 {
 	struct xrt_system_devices *xsysd = &usysds->base.base;
 	int32_t left_index = get_index_for_device(xsysd, left);
 	int32_t right_index = get_index_for_device(xsysd, right);
+	int32_t gamepad_index = get_index_for_device(xsysd, gamepad);
 
 	U_LOG_D(
 	    "Devices:"
 	    "\n\t%i: %p"
+	    "\n\t%i: %p"
 	    "\n\t%i: %p",
-	    left_index, (void *)left,    //
-	    right_index, (void *)right); //
+	    left_index, (void *)left,        //
+	    right_index, (void *)right,      //
+	    gamepad_index, (void *)gamepad); //
 
 	// Consistency checking.
 	assert(usysds->cached.generation_id == 0);
@@ -211,12 +215,15 @@ u_system_devices_static_finalize(struct u_system_devices_static *usysds,
 	assert(left_index >= 0 || left == NULL);
 	assert(right_index < 0 || right != NULL);
 	assert(right_index >= 0 || right == NULL);
+	assert(gamepad_index < 0 || gamepad != NULL);
+	assert(gamepad_index >= 0 || gamepad == NULL);
 
 	// Completely clear the struct.
 	usysds->cached = (struct xrt_system_roles)XRT_SYSTEM_ROLES_INIT;
 	usysds->cached.generation_id = 1;
 	usysds->cached.left = left_index;
 	usysds->cached.right = right_index;
+	usysds->cached.gamepad = gamepad_index;
 }
 
 

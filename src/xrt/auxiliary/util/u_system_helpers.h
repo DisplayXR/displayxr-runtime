@@ -148,7 +148,8 @@ u_system_devices_static_allocate(void);
 void
 u_system_devices_static_finalize(struct u_system_devices_static *usysds,
                                  struct xrt_device *left,
-                                 struct xrt_device *right);
+                                 struct xrt_device *right,
+                                 struct xrt_device *gamepad);
 
 
 /*

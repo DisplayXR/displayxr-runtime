@@ -360,11 +360,12 @@ try_move_assignment(struct xrt_device **xdevs, int *hand, int *other_hand)
 }
 
 void
-u_device_assign_xdev_roles(struct xrt_device **xdevs, size_t xdev_count, int *head, int *left, int *right)
+u_device_assign_xdev_roles(struct xrt_device **xdevs, size_t xdev_count, int *head, int *left, int *right, int *gamepad)
 {
 	*head = XRT_DEVICE_ROLE_UNASSIGNED;
 	*left = XRT_DEVICE_ROLE_UNASSIGNED;
 	*right = XRT_DEVICE_ROLE_UNASSIGNED;
+	*gamepad = XRT_DEVICE_ROLE_UNASSIGNED;
 	assert(xdev_count < INT_MAX);
 
 	for (size_t i = 0; i < xdev_count; i++) {
@@ -388,6 +389,11 @@ u_device_assign_xdev_roles(struct xrt_device **xdevs, size_t xdev_count, int *he
 			try_move_assignment(xdevs, right, left);
 			if (*right == XRT_DEVICE_ROLE_UNASSIGNED) {
 				*right = (int)i;
+			}
+			break;
+		case XRT_DEVICE_TYPE_GAMEPAD:
+			if (*gamepad == XRT_DEVICE_ROLE_UNASSIGNED) {
+				*gamepad = (int)i;
 			}
 			break;
 		case XRT_DEVICE_TYPE_ANY_HAND_CONTROLLER:
