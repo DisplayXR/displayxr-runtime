@@ -3637,9 +3637,111 @@
 					}
 				}
 			}
+		},
+
+		"/interaction_profiles/mndx/oculus_remote": {
+			"title": "Oculus Rift Remote",
+			"type": "untracked_controller",
+			"steamvr_controllertype": "gamepad",
+			"extension": "MNDX_oculus_remote",
+			"monado_device": "XRT_DEVICE_RIFT_REMOTE",
+			"extended_by": [],
+			"subaction_paths": [
+				"/user/gamepad"
+			],
+			"subpaths": {
+				"/input/select": {
+					"type": "button",
+					"localized_name": "Select",
+					"components": [
+						"click"
+					],
+					"monado_bindings": {
+						"click": "XRT_INPUT_RIFT_REMOTE_SELECT_CLICK"
+					}
+				},
+				"/input/back": {
+					"type": "button",
+					"localized_name": "Back",
+					"components": [
+						"click"
+					],
+					"monado_bindings": {
+						"click": "XRT_INPUT_RIFT_REMOTE_BACK_CLICK"
+					}
+				},
+				"/input/volume_up": {
+					"type": "button",
+					"localized_name": "Volume up",
+					"components": [
+						"click"
+					],
+					"monado_bindings": {
+						"click": "XRT_INPUT_RIFT_REMOTE_VOLUME_UP_CLICK"
+					}
+				},
+				"/input/volume_down": {
+					"type": "button",
+					"localized_name": "Volume down",
+					"components": [
+						"click"
+					],
+					"monado_bindings": {
+						"click": "XRT_INPUT_RIFT_REMOTE_VOLUME_DOWN_CLICK"
+					}
+				},
+				"/input/system": {
+					"type": "button",
+					"localized_name": "Oculus",
+					"components": [
+						"click"
+					],
+					"monado_bindings": {
+						"click": "XRT_INPUT_RIFT_REMOTE_OCULUS_CLICK"
+					}
+				},
+				"/input/dpad_down": {
+					"type": "button",
+					"localized_name": "Navigation down",
+					"components": [
+						"click"
+					],
+					"monado_bindings": {
+						"click": "XRT_INPUT_RIFT_REMOTE_DPAD_DOWN_CLICK"
+					}
+				},
+				"/input/dpad_right": {
+					"type": "button",
+					"localized_name": "Navigation right",
+					"components": [
+						"click"
+					],
+					"monado_bindings": {
+						"click": "XRT_INPUT_RIFT_REMOTE_DPAD_RIGHT_CLICK"
+					}
+				},
+				"/input/dpad_up": {
+					"type": "button",
+					"localized_name": "Navigation up",
+					"components": [
+						"click"
+					],
+					"monado_bindings": {
+						"click": "XRT_INPUT_RIFT_REMOTE_DPAD_UP_CLICK"
+					}
+				},
+				"/input/dpad_left": {
+					"type": "button",
+					"localized_name": "Navigation left",
+					"components": [
+						"click"
+					],
+					"monado_bindings": {
+						"click": "XRT_INPUT_RIFT_REMOTE_DPAD_LEFT_CLICK"
+					}
+				}
+			}
 		}
-
-
 
 	}
 }

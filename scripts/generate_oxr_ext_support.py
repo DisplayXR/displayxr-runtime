@@ -96,6 +96,7 @@ EXTENSIONS = (
     ['XR_HTC_vive_cosmos_controller_interaction', 'XRT_FEATURE_OPENXR_INTERACTION_VIVE_COSMOS'],
     ['XR_HTC_vive_focus3_controller_interaction', 'XRT_FEATURE_OPENXR_INTERACTION_VIVE_FOCUS3'],
     ['XR_MNDX_ball_on_a_stick_controller', 'XRT_FEATURE_OPENXR_INTERACTION_MNDX'],
+    ['XR_MNDX_oculus_remote', 'XRT_FEATURE_OPENXR_INTERACTION_MNDX'],
     ['XR_MNDX_egl_enable', 'XR_USE_PLATFORM_EGL', 'XR_USE_GRAPHICS_API_OPENGL'],
     ['XR_MNDX_force_feedback_curl', 'XRT_FEATURE_OPENXR_FORCE_FEEDBACK_CURL'],
     ['XR_MNDX_hydra', 'XRT_FEATURE_OPENXR_INTERACTION_MNDX'],

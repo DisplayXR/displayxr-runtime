@@ -68,3 +68,4 @@ typedef __eglMustCastToProperFunctionPointerType (*PFNEGLGETPROCADDRESSPROC)(con
 #include "openxr/XR_MNDX_xdev_space.h"
 #include "openxr/XR_MNDX_system_buttons.h"
 #include "openxr/XR_MNDX_ball_on_a_stick_controller.h"
+#include "openxr/XR_MNDX_oculus_remote.h"
