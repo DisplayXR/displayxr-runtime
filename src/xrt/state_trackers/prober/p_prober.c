@@ -852,12 +852,15 @@ print_system_devices(u_pp_delegate_t dg, struct xrt_system_devices *xsysd)
 
 	u_pp(dg, "\n\tIn roles:");
 
+#define GET(IDENT, FIELD, DEFAULT) xsysd->static_roles.IDENT ? xsysd->static_roles.IDENT->FIELD : DEFAULT
+#define GET_XDEV(IDENT, FIELD, DEFAULT) roles.IDENT >= 0 ? xsysd->xdevs[roles.IDENT]->FIELD : DEFAULT
+
 #define PH(IDENT)                                                                                                      \
-	u_pp(dg, "\n\t\t%s: %s, view count: %zu", #IDENT,                                                              \
-	     xsysd->static_roles.IDENT ? xsysd->static_roles.IDENT->str : "<none>",                                    \
-	     xsysd->static_roles.IDENT ? xsysd->static_roles.IDENT->hmd->view_count : 0u);
-#define P(IDENT) u_pp(dg, "\n\t\t%s: %s", #IDENT, xsysd->static_roles.IDENT ? xsysd->static_roles.IDENT->str : "<none>")
-#define PD(IDENT) u_pp(dg, "\n\t\t%s: %s", #IDENT, roles.IDENT >= 0 ? xsysd->xdevs[roles.IDENT]->str : "<none>")
+	u_pp(dg, "\n\t\t%s: %s (%s), view count: %zu", #IDENT, GET(IDENT, str, "<none>"),                              \
+	     GET(IDENT, serial, "<none>"), GET(IDENT, hmd->view_count, 0u));
+#define P(IDENT) u_pp(dg, "\n\t\t%s: %s (%s)", #IDENT, GET(IDENT, str, "<none>"), GET(IDENT, serial, "<none>"))
+#define PD(IDENT)                                                                                                      \
+	u_pp(dg, "\n\t\t%s: %s (%s)", #IDENT, GET_XDEV(IDENT, str, "<none>"), GET_XDEV(IDENT, serial, "<none>"))
 
 	PH(head);
 	P(eyes);
@@ -870,6 +873,9 @@ print_system_devices(u_pp_delegate_t dg, struct xrt_system_devices *xsysd)
 
 #undef P
 #undef PD
+#undef PH
+#undef GET
+#undef GET_XDEV
 }
 
 
