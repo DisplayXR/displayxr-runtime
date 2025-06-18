@@ -61,8 +61,21 @@ std::string
 find_steamvr_install()
 {
 	using namespace tyti;
+	u_logging_level level = debug_get_log_option_lh_log();
 	std::ifstream file(STEAM_INSTALL_DIR + "/steamapps/libraryfolders.vdf");
-	auto root = vdf::read(file);
+	if (!file.is_open()) {
+		U_LOG_IFL_E(level, "Failed to open libraryfolders.vdf");
+		return std::string();
+	}
+
+	vdf::basic_object<char> root;
+	try {
+		root = vdf::read(file);
+	} catch (std::exception &ex) {
+		U_LOG_IFL_E(level, "Failed to read libraryfolders.vdf: %s", ex.what());
+		return std::string();
+	}
+
 	assert(root.name == "libraryfolders");
 	for (auto &[_, child] : root.childs) {
 		U_LOG_D("Found library folder %s", child->attribs["path"].c_str());
