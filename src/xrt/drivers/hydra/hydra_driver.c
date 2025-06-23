@@ -25,6 +25,7 @@
 #include "xrt/xrt_byte_order.h"
 
 #include "math/m_api.h"
+#include "math/m_filter_one_euro.h"
 #include "math/m_relation_history.h"
 #include "math/m_space.h"
 
@@ -110,8 +111,12 @@ static const uint8_t HYDRA_REPORT_START_GAMEPAD[] = {
 
 struct hydra_controller_state
 {
-	struct m_relation_history_filters motion_vector_filters;
 	struct m_relation_history *relation_history;
+	struct
+	{
+		struct m_filter_euro_vec3 position;
+		struct m_filter_euro_quat orientation;
+	} motion_vector_filters;
 
 	struct xrt_vec2 js;
 	float trigger;
@@ -331,7 +336,11 @@ hydra_device_parse_controller(struct hydra_device *hd, uint8_t *buf, int64_t now
 	pose.orientation = fixed;
 
 	struct xrt_space_relation space_relation = {0};
-	space_relation.pose = pose;
+	m_filter_euro_vec3_run(&state->motion_vector_filters.position, now, &pose.position,
+	                       &space_relation.pose.position);
+	m_filter_euro_quat_run(&state->motion_vector_filters.orientation, now, &pose.orientation,
+	                       &space_relation.pose.orientation);
+
 	space_relation.relation_flags =
 	    (XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT | XRT_SPACE_RELATION_ORIENTATION_VALID_BIT) |
 	    (XRT_SPACE_RELATION_POSITION_TRACKED_BIT | XRT_SPACE_RELATION_POSITION_VALID_BIT);
@@ -818,7 +827,7 @@ hydra_found(struct xrt_prober *xp,
 		m_filter_euro_vec3_init(&hd->state.motion_vector_filters.position, fc_min, fc_min_d, beta);
 		m_filter_euro_quat_init(&hd->state.motion_vector_filters.orientation, fc_min, fc_min_d, beta);
 
-		m_relation_history_create(&hd->state.relation_history, &hd->state.motion_vector_filters);
+		m_relation_history_create(&hd->state.relation_history);
 
 		hd->base.binding_profiles = binding_profiles;
 		hd->base.binding_profile_count = ARRAY_SIZE(binding_profiles);
