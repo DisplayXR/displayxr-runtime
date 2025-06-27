@@ -208,9 +208,21 @@ u_file_get_runtime_dir(char *out_path, size_t out_path_size)
 	}
 
 #ifdef XRT_OS_WINDOWS
+#ifndef UNICODE     // If Unicode support is disabled, use ANSI functions directly into out_path
+#ifdef GetTempPath2 // GetTempPath2 is only available on Windows 11 >= 22000, fallback to GetTempPath for older versions
+	return (int)GetTempPath2A(out_path_size, out_path);
+#else
+	return (int)GetTempPathA(out_path_size, out_path);
+#endif
+#else
 	WCHAR temp[MAX_PATH] = {0};
+#ifdef GetTempPath2 // GetTempPath2 is only available on Windows 11 >= 22000, fallback to GetTempPath for older versions
 	GetTempPath2W(sizeof(temp), temp);
+#else               // GetTempPath2
+	GetTempPathW(sizeof(temp), temp);
+#endif
 	return wcstombs(out_path, temp, out_path_size);
+#endif // UNICODE
 #else
 	const char *cache = "~/.cache";
 	return snprintf(out_path, out_path_size, "%s", cache);
