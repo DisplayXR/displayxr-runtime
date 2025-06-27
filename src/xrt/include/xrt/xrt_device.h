@@ -17,8 +17,6 @@
 #include "xrt/xrt_visibility_mask.h"
 #include "xrt/xrt_limits.h"
 
-#include <stdalign.h>
-
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -167,7 +165,7 @@ struct xrt_input
 	bool active;
 
 	//! alignas for 32 bit client support, see @ref ipc-design
-	alignas(8) int64_t timestamp;
+	XRT_ALIGNAS(8) int64_t timestamp;
 
 	enum xrt_input_name name;
 

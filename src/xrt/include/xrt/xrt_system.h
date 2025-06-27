@@ -15,8 +15,6 @@
 #include "xrt/xrt_defines.h"
 #include "xrt/xrt_device.h"
 
-#include <stdalign.h>
-
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -172,7 +170,7 @@ struct xrt_system_roles
 	 *
 	 * alignas for 32 bit client support, see @ref ipc-design
 	 */
-	alignas(8) uint64_t generation_id;
+	XRT_ALIGNAS(8) uint64_t generation_id;
 
 	/*!
 	 * Index in @ref xrt_system_devices::xdevs for the user's left
