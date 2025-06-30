@@ -343,6 +343,25 @@ oxr_event_push_XrEventDataVisibilityMaskChangedKHR(struct oxr_logger *log,
 }
 #endif // OXR_HAVE_KHR_visibility_mask
 
+#ifdef OXR_HAVE_EXT_user_presence
+XrResult
+oxr_event_push_XrEventDataUserPresenceChangedEXT(struct oxr_logger *log, struct oxr_session *sess, bool isUserPresent)
+{
+	struct oxr_instance *inst = sess->sys->inst;
+	XrEventDataUserPresenceChangedEXT *changed;
+	struct oxr_event *event = NULL;
+
+	ALLOC(log, inst, &event, &changed);
+	changed->type = XR_TYPE_EVENT_DATA_USER_PRESENCE_CHANGED_EXT;
+	changed->session = oxr_session_to_openxr(sess);
+	changed->isUserPresent = isUserPresent;
+	event->result = XR_SUCCESS;
+	lock(inst);
+	push(inst, event);
+	unlock(inst);
+}
+#endif // OXR_HAVE_EXT_user_presence
+
 XrResult
 oxr_event_remove_session_events(struct oxr_logger *log, struct oxr_session *sess)
 {

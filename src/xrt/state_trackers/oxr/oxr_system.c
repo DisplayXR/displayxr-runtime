@@ -521,6 +521,18 @@ oxr_system_get_properties(struct oxr_logger *log, struct oxr_system *sys, XrSyst
 	}
 #endif // OXR_HAVE_EXT_plane_detection
 
+#ifdef OXR_HAVE_EXT_user_presence
+	XrSystemUserPresencePropertiesEXT *user_presence_props = NULL;
+	if (sys->inst->extensions.EXT_user_presence) {
+		user_presence_props = OXR_GET_OUTPUT_FROM_CHAIN(properties, XR_TYPE_SYSTEM_USER_PRESENCE_PROPERTIES_EXT,
+		                                                XrSystemUserPresencePropertiesEXT);
+	}
+
+	if (user_presence_props) {
+		user_presence_props->supportsUserPresence = xdev->supported.presence;
+	}
+#endif // OXR_HAVE_EXT_user_presence
+
 #ifdef OXR_HAVE_META_body_tracking_full_body
 	XrSystemPropertiesBodyTrackingFullBodyMETA *full_body_tracking_meta_props = NULL;
 	if (sys->inst->extensions.META_body_tracking_full_body) {

@@ -256,6 +256,7 @@ struct xrt_device_supported
 	bool position_tracking;
 	bool hand_tracking;
 	bool eye_gaze;
+	bool presence;
 	bool force_feedback;
 	bool ref_space_usage;
 	bool form_factor_check;
@@ -450,6 +451,14 @@ struct xrt_device
 	 * @param[out] limits        The returned limits.
 	 */
 	xrt_result_t (*get_output_limits)(struct xrt_device *xdev, struct xrt_output_limits *limits);
+
+	/*!
+	 * @brief Get current presence status of the device.
+	 *
+	 * @param[in] xdev           The device.
+	 * @param[out] presence      The returned presence status.
+	 */
+	xrt_result_t (*get_presence)(struct xrt_device *xdev, bool *presence);
 
 	/*!
 	 * Begin a plane detection request
@@ -753,6 +762,23 @@ xrt_device_get_output_limits(struct xrt_device *xdev, struct xrt_output_limits *
 {
 	if (xdev->get_output_limits) {
 		return xdev->get_output_limits(xdev, limits);
+	} else {
+		return XRT_ERROR_NOT_IMPLEMENTED;
+	}
+}
+
+/*!
+ * Helper function for @ref xrt_device::get_presence.
+ *
+ * @copydoc xrt_device::get_presence
+ *
+ * @public @memberof xrt_device
+ */
+static inline xrt_result_t
+xrt_device_get_presence(struct xrt_device *xdev, bool *presence)
+{
+	if (xdev->get_presence) {
+		return xdev->get_presence(xdev, presence);
 	} else {
 		return XRT_ERROR_NOT_IMPLEMENTED;
 	}

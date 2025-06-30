@@ -128,6 +128,18 @@ ipc_client_xdev_get_body_joints(struct xrt_device *xdev,
 }
 
 static xrt_result_t
+ipc_client_xdev_get_presence(struct xrt_device *xdev, bool *presence)
+{
+	struct ipc_client_xdev *icx = ipc_client_xdev(xdev);
+
+	xrt_result_t xret = ipc_call_device_get_presence( //
+	    icx->ipc_c,                                   //
+	    icx->device_id,                               //
+	    presence);                                    //
+	IPC_CHK_ALWAYS_RET(icx->ipc_c, xret, "ipc_call_device_get_presence");
+}
+
+static xrt_result_t
 ipc_client_xdev_set_output(struct xrt_device *xdev, enum xrt_output_name name, const struct xrt_output_value *value)
 {
 	struct ipc_client_xdev *icx = ipc_client_xdev(xdev);
@@ -373,6 +385,7 @@ ipc_client_xdev_init(struct ipc_client_xdev *icx,
 	icx->base.get_face_tracking = ipc_client_xdev_get_face_tracking;
 	icx->base.get_body_skeleton = ipc_client_xdev_get_body_skeleton;
 	icx->base.get_body_joints = ipc_client_xdev_get_body_joints;
+	icx->base.get_presence = ipc_client_xdev_get_presence;
 	icx->base.set_output = ipc_client_xdev_set_output;
 	icx->base.get_output_limits = ipc_client_xdev_get_output_limits;
 

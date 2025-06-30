@@ -63,7 +63,10 @@ enum xrt_session_event_type
 	XRT_SESSION_EVENT_PASSTHRU_STATE_CHANGE = 8,
 
 	// ! The visibility mask of given view has changed
-	XRT_SESSION_EVENT_VISIBILITY_MASK_CHANGE = 9
+	XRT_SESSION_EVENT_VISIBILITY_MASK_CHANGE = 9,
+
+	//! User presence has changed (hmd may have been put on or removed)
+	XRT_SESSION_EVENT_USER_PRESENCE_CHANGE = 10,
 };
 
 /*!
@@ -177,6 +180,15 @@ struct xrt_session_event_visibility_mask_change
 };
 
 /*!
+ * User presence changed event
+ */
+struct xrt_session_event_user_presence_change
+{
+	enum xrt_session_event_type type;
+	bool is_user_present;
+};
+
+/*!
  * Union of all session events, used to return multiple events through one call.
  * Each event struct must start with a @ref xrt_session_event_type field.
  *
@@ -194,6 +206,7 @@ union xrt_session_event {
 	struct xrt_session_event_perf_change performance;
 	struct xrt_session_event_passthrough_state_change passthru;
 	struct xrt_session_event_visibility_mask_change mask_change;
+	struct xrt_session_event_user_presence_change presence_change;
 };
 
 /*!

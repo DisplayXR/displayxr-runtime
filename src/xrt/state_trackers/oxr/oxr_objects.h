@@ -2910,6 +2910,11 @@ struct oxr_plane_detector_ext
 };
 #endif // OXR_HAVE_EXT_plane_detection
 
+#ifdef OXR_HAVE_EXT_user_presence
+XrResult
+oxr_event_push_XrEventDataUserPresenceChangedEXT(struct oxr_logger *log, struct oxr_session *sess, bool isUserPresent);
+#endif // OXR_HAVE_EXT_user_presence
+
 /*!
  * @}
  */

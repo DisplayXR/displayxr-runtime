@@ -139,7 +139,7 @@ struct ipc_shared_device
 	struct xrt_device_supported supported;
 };
 
-static_assert(sizeof(struct ipc_shared_device) == 564,
+static_assert(sizeof(struct ipc_shared_device) == 568,
               "invalid structure size, maybe different 32/64 bits sizes or padding");
 
 /*!
@@ -291,7 +291,7 @@ struct ipc_shared_memory
 	struct xrt_plane_detector_begin_info_ext plane_begin_info_ext;
 };
 
-static_assert(sizeof(struct ipc_shared_memory) == 6499920,
+static_assert(sizeof(struct ipc_shared_memory) == 6500048,
               "invalid structure size, maybe different 32/64 bits sizes or padding");
 
 /*!

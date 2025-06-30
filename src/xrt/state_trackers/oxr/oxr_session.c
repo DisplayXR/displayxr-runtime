@@ -257,6 +257,16 @@ oxr_session_begin(struct oxr_logger *log, struct oxr_session *sess, const XrSess
 
 		xrt_result_t xret = xrt_comp_begin_session(xc, &begin_session_info);
 		OXR_CHECK_XRET(log, sess, xret, xrt_comp_begin_session);
+
+#ifdef OXR_HAVE_EXT_user_presence
+		struct xrt_device *xdev = GET_XDEV_BY_ROLE(sess->sys, head);
+		if (extensions->EXT_user_presence && xdev->supported.presence) {
+			bool presence = false;
+			xret = xrt_device_get_presence(xdev, &presence);
+			OXR_CHECK_XRET(log, sess, xret, xrt_device_get_presence);
+			oxr_event_push_XrEventDataUserPresenceChangedEXT(log, sess, presence);
+		}
+#endif
 	} else {
 		// Headless, pretend we got event from the compositor.
 		sess->compositor_visible = true;
@@ -480,7 +490,13 @@ oxr_session_poll(struct oxr_logger *log, struct oxr_session *sess)
 #ifdef OXR_HAVE_KHR_visibility_mask
 			oxr_event_push_XrEventDataVisibilityMaskChangedKHR(log, sess, sess->sys->view_config_type,
 			                                                   xse.mask_change.view_index);
+			break;
 #endif // OXR_HAVE_KHR_visibility_mask
+		case XRT_SESSION_EVENT_USER_PRESENCE_CHANGE:
+#ifdef OXR_HAVE_EXT_user_presence
+			oxr_event_push_XrEventDataUserPresenceChangedEXT(log, sess,
+			                                                 xse.presence_change.is_user_present);
+#endif // OXR_HAVE_EXT_user_presence
 			break;
 		default: U_LOG_W("unhandled event type! %d", xse.type); break;
 		}
