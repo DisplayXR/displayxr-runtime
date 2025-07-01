@@ -96,12 +96,12 @@ ulv5_device_get_hand_tracking(struct xrt_device *xdev,
 {
 	struct ulv5_device *ulv5d = ulv5_device(xdev);
 
-	if (name != XRT_INPUT_GENERIC_HAND_TRACKING_LEFT && name != XRT_INPUT_GENERIC_HAND_TRACKING_RIGHT) {
+	if (name != XRT_INPUT_HT_UNOBSTRUCTED_LEFT && name != XRT_INPUT_HT_UNOBSTRUCTED_RIGHT) {
 		U_LOG_XDEV_UNSUPPORTED_INPUT(&ulv5d->base, ulv5d->log_level, name);
 		return XRT_ERROR_INPUT_UNSUPPORTED;
 	}
 
-	bool hand_index = (name == XRT_INPUT_GENERIC_HAND_TRACKING_RIGHT); // 0 if left, 1 if right.
+	bool hand_index = (name == XRT_INPUT_HT_UNOBSTRUCTED_RIGHT); // 0 if left, 1 if right.
 
 	bool hand_valid = ulv5d->hand_exists[hand_index];
 
@@ -317,8 +317,8 @@ ulv5_create_device(struct xrt_device **out_xdev)
 	strncpy(ulv5d->base.str, "Leap Motion v5 driver", XRT_DEVICE_NAME_LEN);
 	strncpy(ulv5d->base.serial, "Leap Motion v5 driver", XRT_DEVICE_NAME_LEN);
 
-	ulv5d->base.inputs[0].name = XRT_INPUT_GENERIC_HAND_TRACKING_LEFT;
-	ulv5d->base.inputs[1].name = XRT_INPUT_GENERIC_HAND_TRACKING_RIGHT;
+	ulv5d->base.inputs[0].name = XRT_INPUT_HT_UNOBSTRUCTED_LEFT;
+	ulv5d->base.inputs[1].name = XRT_INPUT_HT_UNOBSTRUCTED_RIGHT;
 
 	ulv5d->base.name = XRT_DEVICE_HAND_TRACKER;
 

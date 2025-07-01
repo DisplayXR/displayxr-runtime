@@ -824,8 +824,8 @@ def generate_bindings_c(file, b):
     # special cased bindings that are never directly used in the input profiles
     inputs.add("XRT_INPUT_GENERIC_HEAD_POSE")
     inputs.add("XRT_INPUT_GENERIC_HEAD_DETECT")
-    inputs.add("XRT_INPUT_GENERIC_HAND_TRACKING_LEFT")
-    inputs.add("XRT_INPUT_GENERIC_HAND_TRACKING_RIGHT")
+    inputs.add("XRT_INPUT_HT_UNOBSTRUCTED_LEFT")
+    inputs.add("XRT_INPUT_HT_UNOBSTRUCTED_RIGHT")
     inputs.add("XRT_INPUT_GENERIC_TRACKER_POSE")
 
     f.write('const char *\n')

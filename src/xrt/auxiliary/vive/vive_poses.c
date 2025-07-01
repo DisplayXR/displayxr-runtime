@@ -138,10 +138,10 @@ vive_poses_get_index_offset_pose(const enum xrt_input_name input_name,
                                  struct xrt_pose *out_offset_pose)
 {
 	switch (input_name) {
-	case XRT_INPUT_GENERIC_HAND_TRACKING_RIGHT:
+	case XRT_INPUT_HT_UNOBSTRUCTED_RIGHT:
 		vive_poses_get_index_hand_offset_pose(XRT_HAND_RIGHT, out_offset_pose);
 		return;
-	case XRT_INPUT_GENERIC_HAND_TRACKING_LEFT:
+	case XRT_INPUT_HT_UNOBSTRUCTED_LEFT:
 		vive_poses_get_index_hand_offset_pose(XRT_HAND_LEFT, out_offset_pose);
 		return;
 	default: break; // Go to code below.

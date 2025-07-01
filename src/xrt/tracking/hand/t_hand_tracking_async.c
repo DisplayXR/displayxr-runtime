@@ -264,10 +264,10 @@ ht_async_get_hand(struct t_hand_tracking_async *ht_async,
                   int64_t *out_timestamp_ns)
 {
 	struct ht_async_impl *hta = ht_async_impl(ht_async);
-	assert(name == XRT_INPUT_GENERIC_HAND_TRACKING_LEFT || name == XRT_INPUT_GENERIC_HAND_TRACKING_RIGHT);
+	assert(name == XRT_INPUT_HT_UNOBSTRUCTED_LEFT || name == XRT_INPUT_HT_UNOBSTRUCTED_RIGHT);
 
 	int idx = 0;
-	if (name == XRT_INPUT_GENERIC_HAND_TRACKING_RIGHT) {
+	if (name == XRT_INPUT_HT_UNOBSTRUCTED_RIGHT) {
 		idx = 1;
 	}
 

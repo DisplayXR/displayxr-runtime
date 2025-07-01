@@ -193,7 +193,7 @@ u_system_devices_get_ht_device(struct xrt_system_devices *xsysd, enum xrt_input_
 static inline struct xrt_device *
 u_system_devices_get_ht_device_left(struct xrt_system_devices *xsysd)
 {
-	return u_system_devices_get_ht_device(xsysd, XRT_INPUT_GENERIC_HAND_TRACKING_LEFT);
+	return u_system_devices_get_ht_device(xsysd, XRT_INPUT_HT_UNOBSTRUCTED_LEFT);
 }
 
 /*!
@@ -205,7 +205,7 @@ u_system_devices_get_ht_device_left(struct xrt_system_devices *xsysd)
 static inline struct xrt_device *
 u_system_devices_get_ht_device_right(struct xrt_system_devices *xsysd)
 {
-	return u_system_devices_get_ht_device(xsysd, XRT_INPUT_GENERIC_HAND_TRACKING_RIGHT);
+	return u_system_devices_get_ht_device(xsysd, XRT_INPUT_HT_UNOBSTRUCTED_RIGHT);
 }
 
 

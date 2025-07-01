@@ -573,7 +573,7 @@ public:
 
 				AddSkeletonControl(("/input/skeleton/" + str_hand).c_str(),
 				                   ("/skeleton/hand/" + str_hand).c_str(),
-				                   XRT_INPUT_GENERIC_HAND_TRACKING_RIGHT);
+				                   XRT_INPUT_HT_UNOBSTRUCTED_RIGHT);
 				RunFrame();
 			} else
 				ovrd_log("Not enabling skeletal input as this device does not support it");
@@ -973,8 +973,8 @@ public:
 			int64_t out_timestamp_ns;
 
 			m_xdev->get_hand_tracking(m_xdev,
-			                          m_hand == XRT_HAND_LEFT ? XRT_INPUT_GENERIC_HAND_TRACKING_LEFT
-			                                                  : XRT_INPUT_GENERIC_HAND_TRACKING_RIGHT,
+			                          m_hand == XRT_HAND_LEFT ? XRT_INPUT_HT_UNOBSTRUCTED_LEFT
+			                                                  : XRT_INPUT_HT_UNOBSTRUCTED_RIGHT,
 			                          now_ns, &out_joint_set_value, &out_timestamp_ns);
 
 			hand_joint_set_to_bone_transform(out_joint_set_value, bone_transforms, m_hand);
@@ -1091,9 +1091,8 @@ public:
 		ovrd_log("Display Frequency: %f\n", m_flDisplayFrequency);
 		ovrd_log("IPD: %f\n", m_flIPD);
 	};
-	virtual ~CDeviceDriver_Monado(){};
-
 	// clang-format off
+	virtual ~CDeviceDriver_Monado() {};
 
 	// ITrackedDeviceServerDriver
 	virtual vr::EVRInitError Activate(vr::TrackedDeviceIndex_t unObjectId);

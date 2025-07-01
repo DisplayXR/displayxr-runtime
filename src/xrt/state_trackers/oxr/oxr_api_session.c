@@ -444,10 +444,8 @@ oxr_hand_tracker_create(struct oxr_logger *log,
 		for (uint32_t j = 0; j < xdev->input_count; j++) {
 			struct xrt_input *input = &xdev->inputs[j];
 
-			if ((input->name == XRT_INPUT_GENERIC_HAND_TRACKING_LEFT &&
-			     createInfo->hand == XR_HAND_LEFT_EXT) ||
-			    (input->name == XRT_INPUT_GENERIC_HAND_TRACKING_RIGHT &&
-			     createInfo->hand == XR_HAND_RIGHT_EXT)) {
+			if ((input->name == XRT_INPUT_HT_UNOBSTRUCTED_LEFT && createInfo->hand == XR_HAND_LEFT_EXT) ||
+			    (input->name == XRT_INPUT_HT_UNOBSTRUCTED_RIGHT && createInfo->hand == XR_HAND_RIGHT_EXT)) {
 				hand_tracker->xdev = xdev;
 				hand_tracker->input_name = input->name;
 				break;

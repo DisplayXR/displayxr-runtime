@@ -297,7 +297,7 @@ opengloves_device_create(struct opengloves_communication_device *ocd, enum xrt_h
 	// hand tracking
 	od->base.get_hand_tracking = opengloves_device_get_hand_tracking;
 	od->base.inputs[OPENGLOVES_INPUT_INDEX_HAND_TRACKING].name =
-	    od->hand == XRT_HAND_LEFT ? XRT_INPUT_GENERIC_HAND_TRACKING_LEFT : XRT_INPUT_GENERIC_HAND_TRACKING_RIGHT;
+	    od->hand == XRT_HAND_LEFT ? XRT_INPUT_HT_UNOBSTRUCTED_LEFT : XRT_INPUT_HT_UNOBSTRUCTED_RIGHT;
 
 	od->base.supported.hand_tracking = true;
 	od->base.supported.force_feedback = true;

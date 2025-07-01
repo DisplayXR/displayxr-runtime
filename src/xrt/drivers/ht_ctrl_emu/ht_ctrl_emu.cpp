@@ -443,7 +443,7 @@ cemu_devices_create(struct xrt_device *head, struct xrt_device *hands, struct xr
 
 
 		cemud[i]->base.inputs[CEMU_INDEX_HAND_TRACKING].name =
-		    i ? XRT_INPUT_GENERIC_HAND_TRACKING_RIGHT : XRT_INPUT_GENERIC_HAND_TRACKING_LEFT;
+		    i ? XRT_INPUT_HT_UNOBSTRUCTED_RIGHT : XRT_INPUT_HT_UNOBSTRUCTED_LEFT;
 		cemud[i]->base.inputs[CEMU_INDEX_SELECT].name = XRT_INPUT_SIMPLE_SELECT_CLICK;
 		cemud[i]->base.inputs[CEMU_INDEX_MENU].name = XRT_INPUT_SIMPLE_MENU_CLICK;
 		cemud[i]->base.inputs[CEMU_INDEX_GRIP].name = XRT_INPUT_SIMPLE_GRIP_POSE;
@@ -469,8 +469,7 @@ cemu_devices_create(struct xrt_device *head, struct xrt_device *hands, struct xr
 			CEMU_WARN(cemud[i], "serial truncated: %s", cemud[i]->base.str);
 		}
 
-		cemud[i]->ht_input_name =
-		    i ? XRT_INPUT_GENERIC_HAND_TRACKING_RIGHT : XRT_INPUT_GENERIC_HAND_TRACKING_LEFT;
+		cemud[i]->ht_input_name = i ? XRT_INPUT_HT_UNOBSTRUCTED_RIGHT : XRT_INPUT_HT_UNOBSTRUCTED_LEFT;
 
 		cemud[i]->hand_index = i;
 		system->out_hand[i] = cemud[i];

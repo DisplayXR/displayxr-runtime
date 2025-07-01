@@ -468,7 +468,7 @@ survive_controller_get_hand_tracking(struct xrt_device *xdev,
 {
 	struct survive_device *survive = (struct survive_device *)xdev;
 
-	if (name != XRT_INPUT_GENERIC_HAND_TRACKING_LEFT && name != XRT_INPUT_GENERIC_HAND_TRACKING_RIGHT) {
+	if (name != XRT_INPUT_HT_UNOBSTRUCTED_LEFT && name != XRT_INPUT_HT_UNOBSTRUCTED_RIGHT) {
 		U_LOG_XDEV_UNSUPPORTED_INPUT(&survive->base, survive->sys->log_level, name);
 		return XRT_ERROR_INPUT_UNSUPPORTED;
 	}
@@ -1136,12 +1136,11 @@ _create_controller_device(struct survive_system *sys,
 
 		if (variant == CONTROLLER_INDEX_LEFT) {
 			survive->base.device_type = XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER;
-			survive->base.inputs[VIVE_CONTROLLER_HAND_TRACKING].name = XRT_INPUT_GENERIC_HAND_TRACKING_LEFT;
+			survive->base.inputs[VIVE_CONTROLLER_HAND_TRACKING].name = XRT_INPUT_HT_UNOBSTRUCTED_LEFT;
 			snprintf(survive->base.str, XRT_DEVICE_NAME_LEN, "Valve Index Left Controller (libsurvive)");
 		} else if (variant == CONTROLLER_INDEX_RIGHT) {
 			survive->base.device_type = XRT_DEVICE_TYPE_RIGHT_HAND_CONTROLLER;
-			survive->base.inputs[VIVE_CONTROLLER_HAND_TRACKING].name =
-			    XRT_INPUT_GENERIC_HAND_TRACKING_RIGHT;
+			survive->base.inputs[VIVE_CONTROLLER_HAND_TRACKING].name = XRT_INPUT_HT_UNOBSTRUCTED_RIGHT;
 			snprintf(survive->base.str, XRT_DEVICE_NAME_LEN, "Valve Index Right Controller (libsurvive)");
 		}
 

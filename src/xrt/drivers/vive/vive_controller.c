@@ -375,7 +375,7 @@ vive_controller_get_hand_tracking(struct xrt_device *xdev,
 
 	struct vive_controller_device *d = vive_controller_device(xdev);
 
-	if (name != XRT_INPUT_GENERIC_HAND_TRACKING_LEFT && name != XRT_INPUT_GENERIC_HAND_TRACKING_RIGHT) {
+	if (name != XRT_INPUT_HT_UNOBSTRUCTED_LEFT && name != XRT_INPUT_HT_UNOBSTRUCTED_RIGHT) {
 		U_LOG_XDEV_UNSUPPORTED_INPUT(&d->base, d->log_level, name);
 		return XRT_ERROR_INPUT_UNSUPPORTED;
 	}
@@ -1181,11 +1181,11 @@ vive_controller_create(struct os_hid_device *controller_hid, enum watchman_gen w
 
 		if (d->config.variant == CONTROLLER_INDEX_LEFT) {
 			d->base.device_type = XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER;
-			d->base.inputs[VIVE_CONTROLLER_HAND_TRACKING].name = XRT_INPUT_GENERIC_HAND_TRACKING_LEFT;
+			d->base.inputs[VIVE_CONTROLLER_HAND_TRACKING].name = XRT_INPUT_HT_UNOBSTRUCTED_LEFT;
 			snprintf(d->base.str, XRT_DEVICE_NAME_LEN, "Valve Index Left Controller (vive)");
 		} else if (d->config.variant == CONTROLLER_INDEX_RIGHT) {
 			d->base.device_type = XRT_DEVICE_TYPE_RIGHT_HAND_CONTROLLER;
-			d->base.inputs[VIVE_CONTROLLER_HAND_TRACKING].name = XRT_INPUT_GENERIC_HAND_TRACKING_RIGHT;
+			d->base.inputs[VIVE_CONTROLLER_HAND_TRACKING].name = XRT_INPUT_HT_UNOBSTRUCTED_RIGHT;
 			snprintf(d->base.str, XRT_DEVICE_NAME_LEN, "Valve Index Right Controller (vive)");
 		}
 	} else if (d->config.variant == CONTROLLER_TRACKER_GEN1) {

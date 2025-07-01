@@ -331,12 +331,12 @@ ulv2_device_get_hand_tracking(struct xrt_device *xdev,
 {
 	struct ulv2_device *ulv2d = ulv2_device(xdev);
 
-	if (name != XRT_INPUT_GENERIC_HAND_TRACKING_LEFT && name != XRT_INPUT_GENERIC_HAND_TRACKING_RIGHT) {
+	if (name != XRT_INPUT_HT_UNOBSTRUCTED_LEFT && name != XRT_INPUT_HT_UNOBSTRUCTED_RIGHT) {
 		ULV2_ERROR(ulv2d, "unknown input name for hand tracker");
 		return;
 	}
 
-	bool hand_index = (name == XRT_INPUT_GENERIC_HAND_TRACKING_RIGHT); // 0 if left, 1 if right.
+	bool hand_index = (name == XRT_INPUT_HT_UNOBSTRUCTED_RIGHT); // 0 if left, 1 if right.
 
 	bool hand_valid = ulv2d->hand_exists[hand_index];
 
@@ -398,8 +398,8 @@ ulv2_create_device(struct xrt_device **out_xdev)
 	strncpy(ulv2d->base.str, "Leap Motion v2 driver", XRT_DEVICE_NAME_LEN);
 	strncpy(ulv2d->base.serial, "Leap Motion v2 driver", XRT_DEVICE_NAME_LEN);
 
-	ulv2d->base.inputs[0].name = XRT_INPUT_GENERIC_HAND_TRACKING_LEFT;
-	ulv2d->base.inputs[1].name = XRT_INPUT_GENERIC_HAND_TRACKING_RIGHT;
+	ulv2d->base.inputs[0].name = XRT_INPUT_HT_UNOBSTRUCTED_LEFT;
+	ulv2d->base.inputs[1].name = XRT_INPUT_HT_UNOBSTRUCTED_RIGHT;
 
 	ulv2d->base.name = XRT_DEVICE_HAND_TRACKER;
 

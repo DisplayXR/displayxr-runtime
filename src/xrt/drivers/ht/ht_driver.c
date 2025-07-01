@@ -154,7 +154,7 @@ ht_device_get_hand_tracking(struct xrt_device *xdev,
 {
 	struct ht_device *htd = ht_device(xdev);
 
-	if (name != XRT_INPUT_GENERIC_HAND_TRACKING_LEFT && name != XRT_INPUT_GENERIC_HAND_TRACKING_RIGHT) {
+	if (name != XRT_INPUT_HT_UNOBSTRUCTED_LEFT && name != XRT_INPUT_HT_UNOBSTRUCTED_RIGHT) {
 		U_LOG_XDEV_UNSUPPORTED_INPUT(&htd->base, htd->log_level, name);
 		return XRT_ERROR_INPUT_UNSUPPORTED;
 	}
@@ -212,8 +212,8 @@ ht_device_create_common(struct t_stereo_camera_calibration *calib,
 	snprintf(htd->base.str, XRT_DEVICE_NAME_LEN, "Camera based Hand Tracker");
 	snprintf(htd->base.serial, XRT_DEVICE_NAME_LEN, "Camera based Hand Tracker");
 
-	htd->base.inputs[0].name = XRT_INPUT_GENERIC_HAND_TRACKING_LEFT;
-	htd->base.inputs[1].name = XRT_INPUT_GENERIC_HAND_TRACKING_RIGHT;
+	htd->base.inputs[0].name = XRT_INPUT_HT_UNOBSTRUCTED_LEFT;
+	htd->base.inputs[1].name = XRT_INPUT_HT_UNOBSTRUCTED_RIGHT;
 
 	// Yes, you need all of these. Yes, I tried disabling them all one at a time. You need all of these.
 	htd->base.name = XRT_DEVICE_HAND_TRACKER;
