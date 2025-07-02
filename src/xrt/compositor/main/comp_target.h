@@ -154,8 +154,11 @@ struct comp_target
 	//! Transformation of the current surface, required for pre-rotation
 	VkSurfaceTransformFlagBitsKHR surface_transform;
 
-	// Holds semaphore information.
+	//! Holds semaphore information.
 	struct comp_target_semaphores semaphores;
+
+	//! Whether wait_for_present is supported by this comp_target.
+	bool wait_for_present_supported;
 
 	/*
 	 *
@@ -227,6 +230,14 @@ struct comp_target
 	                    uint64_t timeline_semaphore_value,
 	                    int64_t desired_present_time_ns,
 	                    int64_t present_slop_ns);
+
+	/*!
+	 * Wait for the latest presented image to be displayed to the user.
+	 *
+	 * @param ct self
+	 * @param timeout_ns The amount of time to wait for presentation to succeed.
+	 */
+	VkResult (*wait_for_present)(struct comp_target *ct, time_duration_ns timeout_ns);
 
 	/*!
 	 * Flush any WSI state before rendering.
@@ -439,6 +450,22 @@ comp_target_present(struct comp_target *ct,
 	    timeline_semaphore_value, //
 	    desired_present_time_ns,  //
 	    present_slop_ns);         //
+}
+
+/*!
+ * @copydoc comp_target::wait_for_present
+ *
+ * @public @memberof comp_target
+ * @ingroup comp_main
+ */
+static inline VkResult
+comp_target_wait_for_present(struct comp_target *ct, time_duration_ns timeout)
+{
+	COMP_TRACE_MARKER();
+
+	return ct->wait_for_present( //
+	    ct,                      //
+	    timeout);                //
 }
 
 /*!

@@ -212,6 +212,12 @@ target_present(struct comp_target *ct,
 	return VK_SUCCESS;
 }
 
+static VkResult
+target_wait_for_present(struct comp_target *ct, time_duration_ns timeout_ns)
+{
+	return VK_ERROR_EXTENSION_NOT_PRESENT;
+}
+
 static void
 target_flush(struct comp_target *ct)
 {
@@ -340,6 +346,7 @@ target_create(struct comp_compositor *c)
 	dit->base.has_images = target_has_images;
 	dit->base.acquire = target_acquire;
 	dit->base.present = target_present;
+	dit->base.wait_for_present = target_wait_for_present;
 	dit->base.flush = target_flush;
 	dit->base.calc_frame_pacing = target_calc_frame_pacing;
 	dit->base.mark_timing_point = target_mark_timing_point;
@@ -348,6 +355,8 @@ target_create(struct comp_compositor *c)
 	dit->base.set_title = target_set_title;
 	dit->base.destroy = target_destroy;
 	dit->base.c = c;
+
+	dit->base.wait_for_present_supported = false;
 
 	// Create the pacer.
 	uint64_t now_ns = os_monotonic_get_ns();
