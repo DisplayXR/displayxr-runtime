@@ -261,7 +261,7 @@ ControllerDevice::set_input_class(const InputClass *input_class)
 			finger_inputs_map.insert({path, &finger_inputs_vec.back()});
 		}
 		assert(inputs_vec.capacity() >= inputs_vec.size() + 1);
-		inputs_vec.push_back({true, 0, XRT_INPUT_HT_UNOBSTRUCTED_LEFT, {}});
+		inputs_vec.push_back({true, 0, XRT_INPUT_HT_CONFORMING_LEFT, {}});
 		inputs_map.insert({std::string_view("HAND"), &inputs_vec.back()});
 	}
 
@@ -875,12 +875,12 @@ ControllerDevice::handle_property_write(const vr::PropertyWrite_t &prop)
 		}
 		case vr::TrackedControllerRole_RightHand: {
 			this->device_type = XRT_DEVICE_TYPE_RIGHT_HAND_CONTROLLER;
-			set_hand_tracking_hand(XRT_INPUT_HT_UNOBSTRUCTED_RIGHT);
+			set_hand_tracking_hand(XRT_INPUT_HT_CONFORMING_RIGHT);
 			break;
 		}
 		case vr::TrackedControllerRole_LeftHand: {
 			this->device_type = XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER;
-			set_hand_tracking_hand(XRT_INPUT_HT_UNOBSTRUCTED_LEFT);
+			set_hand_tracking_hand(XRT_INPUT_HT_CONFORMING_LEFT);
 			break;
 		}
 		case vr::TrackedControllerRole_OptOut: {

@@ -193,7 +193,17 @@ u_system_devices_get_ht_device(struct xrt_system_devices *xsysd, enum xrt_input_
 static inline struct xrt_device *
 u_system_devices_get_ht_device_left(struct xrt_system_devices *xsysd)
 {
-	return u_system_devices_get_ht_device(xsysd, XRT_INPUT_HT_UNOBSTRUCTED_LEFT);
+	const enum xrt_input_name ht_input_names[2] = {
+	    XRT_INPUT_HT_UNOBSTRUCTED_LEFT,
+	    XRT_INPUT_HT_CONFORMING_LEFT,
+	};
+	for (uint32_t i = 0; i < ARRAY_SIZE(ht_input_names); ++i) {
+		struct xrt_device *xdev = u_system_devices_get_ht_device(xsysd, ht_input_names[i]);
+		if (xdev != NULL) {
+			return xdev;
+		}
+	}
+	return NULL;
 }
 
 /*!
@@ -205,7 +215,17 @@ u_system_devices_get_ht_device_left(struct xrt_system_devices *xsysd)
 static inline struct xrt_device *
 u_system_devices_get_ht_device_right(struct xrt_system_devices *xsysd)
 {
-	return u_system_devices_get_ht_device(xsysd, XRT_INPUT_HT_UNOBSTRUCTED_RIGHT);
+	const enum xrt_input_name ht_input_names[2] = {
+	    XRT_INPUT_HT_UNOBSTRUCTED_RIGHT,
+	    XRT_INPUT_HT_CONFORMING_RIGHT,
+	};
+	for (uint32_t i = 0; i < ARRAY_SIZE(ht_input_names); ++i) {
+		struct xrt_device *xdev = u_system_devices_get_ht_device(xsysd, ht_input_names[i]);
+		if (xdev != NULL) {
+			return xdev;
+		}
+	}
+	return NULL;
 }
 
 

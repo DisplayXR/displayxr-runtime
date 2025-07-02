@@ -106,6 +106,44 @@ wct_to_quat(float waggle, float curl, float twist)
 	return out;
 }
 
+static inline bool
+find_best_ht_input_names(const struct xrt_device *ht_device, enum xrt_input_name ht_input_names[2])
+{
+	assert(ht_device && ht_device->inputs);
+
+	if (!ht_device->supported.hand_tracking)
+		return false;
+
+	constexpr const enum xrt_input_name XRT_NULL_INPUT_NAME = (enum xrt_input_name)0;
+
+	ht_input_names[0] = ht_input_names[1] = XRT_NULL_INPUT_NAME;
+
+	for (uint32_t i = 0; i < ht_device->input_count; ++i) {
+		if (ht_device->inputs[i].name == XRT_INPUT_HT_UNOBSTRUCTED_LEFT) {
+			ht_input_names[0] = XRT_INPUT_HT_UNOBSTRUCTED_LEFT;
+		}
+
+		if (ht_device->inputs[i].name == XRT_INPUT_HT_UNOBSTRUCTED_RIGHT) {
+			ht_input_names[1] = XRT_INPUT_HT_UNOBSTRUCTED_RIGHT;
+		}
+	}
+
+	for (uint32_t i = 0; i < ht_device->input_count; ++i) {
+		if (ht_input_names[0] == XRT_NULL_INPUT_NAME &&
+		    ht_device->inputs[i].name == XRT_INPUT_HT_CONFORMING_LEFT) {
+			ht_input_names[0] = XRT_INPUT_HT_CONFORMING_LEFT;
+		}
+
+		if (ht_input_names[1] == XRT_NULL_INPUT_NAME &&
+		    ht_device->inputs[i].name == XRT_INPUT_HT_CONFORMING_RIGHT) {
+			ht_input_names[1] = XRT_INPUT_HT_CONFORMING_RIGHT;
+		}
+	}
+
+	return ht_input_names[0] != XRT_NULL_INPUT_NAME && //
+	       ht_input_names[1] != XRT_NULL_INPUT_NAME;
+}
+
 static inline struct cemu_device *
 cemu_device(struct xrt_device *xdev)
 {
@@ -417,6 +455,12 @@ cemu_device_update_inputs(struct xrt_device *xdev)
 extern "C" int
 cemu_devices_create(struct xrt_device *head, struct xrt_device *hands, struct xrt_device **out_xdevs)
 {
+	enum xrt_input_name ht_input_names[2];
+	if (!find_best_ht_input_names(hands, ht_input_names)) {
+		U_LOG_E("\"hands\" parameter is not a hand-tracking device or does have expected inputs.");
+		return 0;
+	}
+
 	enum u_device_alloc_flags flags = U_DEVICE_ALLOC_NO_FLAGS;
 
 	struct cemu_device *cemud[2];
@@ -442,8 +486,7 @@ cemu_devices_create(struct xrt_device *head, struct xrt_device *hands, struct xr
 		cemud[i]->base.supported.position_tracking = true;
 
 
-		cemud[i]->base.inputs[CEMU_INDEX_HAND_TRACKING].name =
-		    i ? XRT_INPUT_HT_UNOBSTRUCTED_RIGHT : XRT_INPUT_HT_UNOBSTRUCTED_LEFT;
+		cemud[i]->base.inputs[CEMU_INDEX_HAND_TRACKING].name = ht_input_names[i];
 		cemud[i]->base.inputs[CEMU_INDEX_SELECT].name = XRT_INPUT_SIMPLE_SELECT_CLICK;
 		cemud[i]->base.inputs[CEMU_INDEX_MENU].name = XRT_INPUT_SIMPLE_MENU_CLICK;
 		cemud[i]->base.inputs[CEMU_INDEX_GRIP].name = XRT_INPUT_SIMPLE_GRIP_POSE;
@@ -469,7 +512,7 @@ cemu_devices_create(struct xrt_device *head, struct xrt_device *hands, struct xr
 			CEMU_WARN(cemud[i], "serial truncated: %s", cemud[i]->base.str);
 		}
 
-		cemud[i]->ht_input_name = i ? XRT_INPUT_HT_UNOBSTRUCTED_RIGHT : XRT_INPUT_HT_UNOBSTRUCTED_LEFT;
+		cemud[i]->ht_input_name = ht_input_names[i];
 
 		cemud[i]->hand_index = i;
 		system->out_hand[i] = cemud[i];

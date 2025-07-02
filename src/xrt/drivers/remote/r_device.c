@@ -147,7 +147,7 @@ r_device_get_hand_tracking(struct xrt_device *xdev,
 	struct r_device *rd = r_device(xdev);
 	struct r_hub *r = rd->r;
 
-	if (name != XRT_INPUT_HT_UNOBSTRUCTED_LEFT && name != XRT_INPUT_HT_UNOBSTRUCTED_RIGHT) {
+	if (name != XRT_INPUT_HT_CONFORMING_LEFT && name != XRT_INPUT_HT_CONFORMING_RIGHT) {
 		U_LOG_XDEV_UNSUPPORTED_INPUT(&rd->base, u_log_get_global_level(), name);
 		return XRT_ERROR_INPUT_UNSUPPORTED;
 	}
@@ -236,9 +236,9 @@ r_device_create(struct r_hub *r, bool is_left)
 	rd->base.inputs[17].name = XRT_INPUT_INDEX_GRIP_POSE;
 	rd->base.inputs[18].name = XRT_INPUT_INDEX_AIM_POSE;
 	if (is_left) {
-		rd->base.inputs[19].name = XRT_INPUT_HT_UNOBSTRUCTED_LEFT;
+		rd->base.inputs[19].name = XRT_INPUT_HT_CONFORMING_LEFT;
 	} else {
-		rd->base.inputs[19].name = XRT_INPUT_HT_UNOBSTRUCTED_RIGHT;
+		rd->base.inputs[19].name = XRT_INPUT_HT_CONFORMING_RIGHT;
 	}
 	rd->base.inputs[20].name = XRT_INPUT_GENERIC_PALM_POSE;
 

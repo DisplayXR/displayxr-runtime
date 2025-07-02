@@ -826,6 +826,8 @@ def generate_bindings_c(file, b):
     inputs.add("XRT_INPUT_GENERIC_HEAD_DETECT")
     inputs.add("XRT_INPUT_HT_UNOBSTRUCTED_LEFT")
     inputs.add("XRT_INPUT_HT_UNOBSTRUCTED_RIGHT")
+    inputs.add("XRT_INPUT_HT_CONFORMING_LEFT")
+    inputs.add("XRT_INPUT_HT_CONFORMING_RIGHT")
     inputs.add("XRT_INPUT_GENERIC_TRACKER_POSE")
 
     f.write('const char *\n')

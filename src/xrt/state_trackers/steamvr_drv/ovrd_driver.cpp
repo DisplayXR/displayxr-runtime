@@ -12,6 +12,8 @@
  */
 
 #include <cstring>
+#include <cassert>
+#include <array>
 #include <thread>
 
 #include "math/m_api.h"
@@ -966,30 +968,56 @@ public:
 		}
 
 		if (m_xdev->supported.hand_tracking && m_skeletal_input_control.control_handle) {
-			vr::VRBoneTransform_t bone_transforms[OPENVR_BONE_COUNT];
+			constexpr const std::size_t sk_comp_size = 2;
 
-			timepoint_ns now_ns = os_monotonic_get_ns();
-			struct xrt_hand_joint_set out_joint_set_value;
-			int64_t out_timestamp_ns;
+			using ht_input_name_list = std::array<const enum xrt_input_name, sk_comp_size>;
+			constexpr const std::array<const ht_input_name_list, sk_comp_size> ht_input_name_map = {
+			    ht_input_name_list{
+			        XRT_INPUT_HT_UNOBSTRUCTED_LEFT,
+			        XRT_INPUT_HT_CONFORMING_LEFT,
+			    },
+			    ht_input_name_list{
+			        XRT_INPUT_HT_UNOBSTRUCTED_RIGHT,
+			        XRT_INPUT_HT_CONFORMING_RIGHT,
+			    },
+			};
+			using bone_transform_list = std::array<vr::VRBoneTransform_t, OPENVR_BONE_COUNT>;
+			using bone_transforms_list = std::vector<bone_transform_list>;
 
-			m_xdev->get_hand_tracking(m_xdev,
-			                          m_hand == XRT_HAND_LEFT ? XRT_INPUT_HT_UNOBSTRUCTED_LEFT
-			                                                  : XRT_INPUT_HT_UNOBSTRUCTED_RIGHT,
-			                          now_ns, &out_joint_set_value, &out_timestamp_ns);
+			bone_transforms_list bone_transforms;
+			bone_transforms.reserve(sk_comp_size);
+			const auto &ht_input_names = ht_input_name_map[m_hand];
+			const timepoint_ns now_ns = os_monotonic_get_ns();
 
-			hand_joint_set_to_bone_transform(out_joint_set_value, bone_transforms, m_hand);
-			// hand_joint_set_to_bone_transforms(out_joint_set_value, bone_transforms);
+			for (size_t i = 0; i < ht_input_names.size(); ++i) {
+				int64_t out_timestamp_ns;
+				struct xrt_hand_joint_set joint_set_value = {};
+				if (m_xdev->get_hand_tracking(m_xdev, ht_input_names[i], now_ns, &joint_set_value,
+				                              &out_timestamp_ns) != XRT_SUCCESS) {
+					continue;
+				}
+				auto &bts = bone_transforms.emplace_back();
+				hand_joint_set_to_bone_transform(joint_set_value, bts.data(), m_hand);
+				// hand_joint_set_to_bone_transforms(out_joint_set_value, bone_transforms);
+			}
+
+			if (bone_transforms.empty())
+				return;
+			if (bone_transforms.size() < sk_comp_size) {
+				bone_transforms.push_back(bone_transforms.back());
+			}
+			assert(bone_transforms.size() >= sk_comp_size);
 
 			vr::EVRInputError err = vr::VRDriverInput()->UpdateSkeletonComponent(
 			    m_skeletal_input_control.control_handle, vr::VRSkeletalMotionRange_WithoutController,
-			    bone_transforms, OPENVR_BONE_COUNT);
+			    bone_transforms[0].data(), OPENVR_BONE_COUNT);
 			if (err != vr::VRInputError_None) {
 				ovrd_log("error updating skeleton: %i ", err);
 			}
 
-			err = vr::VRDriverInput()->UpdateSkeletonComponent(m_skeletal_input_control.control_handle,
-			                                                   vr::VRSkeletalMotionRange_WithController,
-			                                                   bone_transforms, OPENVR_BONE_COUNT);
+			err = vr::VRDriverInput()->UpdateSkeletonComponent(
+			    m_skeletal_input_control.control_handle, vr::VRSkeletalMotionRange_WithController,
+			    bone_transforms[1].data(), OPENVR_BONE_COUNT);
 			if (err != vr::VRInputError_None) {
 				ovrd_log("error updating skeleton: %i ", err);
 			}
