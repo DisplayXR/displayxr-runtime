@@ -236,6 +236,9 @@ oxr_session_begin(struct oxr_logger *log, struct oxr_session *sess, const XrSess
 #ifdef OXR_HAVE_EXT_hand_tracking
 		    .ext_hand_tracking_enabled = extensions->EXT_hand_tracking,
 #endif
+#ifdef OXR_HAVE_EXT_hand_tracking_data_source
+		    .ext_hand_tracking_data_source_enabled = extensions->EXT_hand_tracking_data_source,
+#endif
 #ifdef OXR_HAVE_EXT_eye_gaze_interaction
 		    .ext_eye_gaze_interaction_enabled = extensions->EXT_eye_gaze_interaction,
 #endif
@@ -1320,11 +1323,11 @@ oxr_session_hand_joints(struct oxr_logger *log,
 	//! Convert at_time to monotonic and give to device.
 	const int64_t at_timestamp_ns = time_state_ts_to_monotonic_ns(inst->timekeeping, at_time);
 
-	const struct oxr_hand_tracking_data_source *data_sources[2] = {
-	    &hand_tracker->unobstructed,
-	    &hand_tracker->conforming,
-	};
-	if (debug_get_bool_option_hand_tracking_prioritize_conforming()) {
+	const struct oxr_hand_tracking_data_source *data_sources[ARRAY_SIZE(hand_tracker->requested_sources)] = {0};
+	memcpy(data_sources, hand_tracker->requested_sources, sizeof(data_sources));
+
+	if (debug_get_bool_option_hand_tracking_prioritize_conforming() && //
+	    hand_tracker->requested_sources_count > 1) {
 		const struct oxr_hand_tracking_data_source *tmp = data_sources[0];
 		data_sources[0] = data_sources[1];
 		data_sources[1] = tmp;
@@ -1332,9 +1335,9 @@ oxr_session_hand_joints(struct oxr_logger *log,
 
 	struct xrt_hand_joint_set value;
 	const struct oxr_hand_tracking_data_source *data_source = NULL;
-	for (uint32_t i = 0; i < ARRAY_SIZE(data_sources); ++i) {
+	for (uint32_t i = 0; i < hand_tracker->requested_sources_count; ++i) {
 		data_source = data_sources[i];
-		if (data_source->xdev == NULL)
+		if (data_source == NULL || data_source->xdev == NULL)
 			continue;
 		int64_t ignored;
 		value = (struct xrt_hand_joint_set){0};
@@ -1350,6 +1353,19 @@ oxr_session_hand_joints(struct oxr_logger *log,
 		locations->isActive = false;
 		return XR_SUCCESS;
 	}
+
+#ifdef OXR_HAVE_EXT_hand_tracking_data_source
+	XrHandTrackingDataSourceStateEXT *data_source_state = NULL;
+	if (hand_tracker->sess->sys->inst->extensions.EXT_hand_tracking_data_source) {
+		data_source_state = OXR_GET_OUTPUT_FROM_CHAIN(locations, XR_TYPE_HAND_TRACKING_DATA_SOURCE_STATE_EXT,
+		                                              XrHandTrackingDataSourceStateEXT);
+	}
+
+	if (data_source_state != NULL) {
+		data_source_state->isActive = XR_TRUE;
+		data_source_state->dataSource = xrt_hand_tracking_data_source_to_xr(data_source->input_name);
+	}
+#endif
 
 	// The hand pose is returned in the xdev's space.
 	struct xrt_space_relation T_xdev_hand = value.hand_pose;

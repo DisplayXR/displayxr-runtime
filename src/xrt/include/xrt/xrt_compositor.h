@@ -965,6 +965,7 @@ struct xrt_begin_session_info
 {
 	enum xrt_view_type view_type;
 	bool ext_hand_tracking_enabled;
+	bool ext_hand_tracking_data_source_enabled;
 	bool ext_eye_gaze_interaction_enabled;
 	bool ext_hand_interaction_enabled;
 	bool htc_facial_tracking_enabled;

@@ -265,3 +265,27 @@ xrt_perf_notify_level_to_xr(enum xrt_perf_notify_level level)
 	default: assert(false); return 0;
 	}
 }
+
+static inline enum xrt_input_name
+xr_hand_tracking_data_source_to_xrt(XrHandTrackingDataSourceEXT data_source, enum XrHandEXT hand)
+{
+	switch (data_source) {
+	case XR_HAND_TRACKING_DATA_SOURCE_UNOBSTRUCTED_EXT:
+		return (hand == XR_HAND_LEFT_EXT) ? XRT_INPUT_HT_UNOBSTRUCTED_LEFT : XRT_INPUT_HT_UNOBSTRUCTED_RIGHT;
+	case XR_HAND_TRACKING_DATA_SOURCE_CONTROLLER_EXT:
+		return (hand == XR_HAND_LEFT_EXT) ? XRT_INPUT_HT_CONFORMING_LEFT : XRT_INPUT_HT_CONFORMING_RIGHT;
+	default: assert(false); return (enum xrt_input_name)(-1);
+	}
+}
+
+static inline XrHandTrackingDataSourceEXT
+xrt_hand_tracking_data_source_to_xr(enum xrt_input_name ht_input_name)
+{
+	switch (ht_input_name) {
+	case XRT_INPUT_HT_UNOBSTRUCTED_LEFT:
+	case XRT_INPUT_HT_UNOBSTRUCTED_RIGHT: return XR_HAND_TRACKING_DATA_SOURCE_UNOBSTRUCTED_EXT;
+	case XRT_INPUT_HT_CONFORMING_LEFT:
+	case XRT_INPUT_HT_CONFORMING_RIGHT: return XR_HAND_TRACKING_DATA_SOURCE_CONTROLLER_EXT;
+	default: assert(false); return XR_HAND_TRACKING_DATA_SOURCE_MAX_ENUM_EXT;
+	}
+}

@@ -747,3 +747,25 @@ oxr_verify_XrInteractionProfileDpadBindingEXT(struct oxr_logger *log,
 	return XR_SUCCESS;
 }
 #endif // XR_EXT_dpad_binding
+
+#ifdef OXR_HAVE_EXT_hand_tracking_data_source
+XrResult
+oxr_verify_XrHandTrackingDataSourceInfoEXT(struct oxr_logger *log,
+                                           const XrHandTrackingDataSourceInfoEXT *data_source_info)
+{
+	OXR_VERIFY_ARG_TYPE_AND_NOT_NULL(log, data_source_info, XR_TYPE_HAND_TRACKING_DATA_SOURCE_INFO_EXT);
+	OXR_VERIFY_ARG_NOT_ZERO(log, data_source_info->requestedDataSourceCount);
+	OXR_VERIFY_ARG_NOT_NULL(log, data_source_info->requestedDataSources);
+	// verify unique / no duplicate entries in requestedDataSources
+	for (uint32_t i = 0; i < data_source_info->requestedDataSourceCount; ++i) {
+		for (uint32_t j = i + 1; j < data_source_info->requestedDataSourceCount; ++j) {
+			if (data_source_info->requestedDataSources[j] != data_source_info->requestedDataSources[i]) {
+				continue;
+			}
+			return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
+			                 "Duplicate value in requestedDataSources at indices: %u, %u\n", i, j);
+		}
+	}
+	return XR_SUCCESS;
+}
+#endif // XR_EXT_hand_tracking_data_source

@@ -2654,6 +2654,19 @@ struct oxr_hand_tracking_data_source
 	enum xrt_input_name input_name;
 };
 
+static inline int
+oxr_hand_tracking_data_source_cmp(const void *p1, const void *p2)
+{
+	const struct oxr_hand_tracking_data_source *lhs = (const struct oxr_hand_tracking_data_source *)p1;
+	const struct oxr_hand_tracking_data_source *rhs = (const struct oxr_hand_tracking_data_source *)p2;
+	assert(lhs && rhs);
+	if (lhs->input_name < rhs->input_name)
+		return -1;
+	if (lhs->input_name > rhs->input_name)
+		return 1;
+	return 0;
+}
+
 /*!
  * A hand tracker.
  *
@@ -2673,6 +2686,17 @@ struct oxr_hand_tracker
 
 	struct oxr_hand_tracking_data_source unobstructed;
 	struct oxr_hand_tracking_data_source conforming;
+
+	/*!
+	 * An ordered list of requested data-source from above options (@ref
+	 * oxr_hand_tracker::[unobstructed|conforming]), ordered by
+	 * @ref oxr_hand_tracker::input_name (see @ref oxr_hand_tracking_data_source_cmp)
+	 *
+	 * if OXR_HAVE_EXT_hand_tracking_data_source is not defined the list
+	 * will contain refs to all the above options.
+	 */
+	const struct oxr_hand_tracking_data_source *requested_sources[2];
+	uint32_t requested_sources_count;
 
 	XrHandEXT hand;
 	XrHandJointSetEXT hand_joint_set;

@@ -373,6 +373,18 @@
 
 
 /*
+ * XR_EXT_hand_tracking_data_source
+ */
+#if defined(XR_EXT_hand_tracking_data_source) && defined(XRT_FEATURE_OPENXR_HAND_TRACKING_DATA_SOURCE_EXT)
+#define OXR_HAVE_EXT_hand_tracking_data_source
+#define OXR_EXTENSION_SUPPORT_EXT_hand_tracking_data_source(_)                                                         \
+	_(EXT_hand_tracking_data_source, EXT_HAND_TRACKING_DATA_SOURCE)
+#else
+#define OXR_EXTENSION_SUPPORT_EXT_hand_tracking_data_source(_)
+#endif
+
+
+/*
  * XR_EXT_hp_mixed_reality_controller
  */
 #if defined(XR_EXT_hp_mixed_reality_controller) && defined(XRT_FEATURE_OPENXR_INTERACTION_WINMR)
@@ -870,6 +882,7 @@
     OXR_EXTENSION_SUPPORT_EXT_eye_gaze_interaction(_) \
     OXR_EXTENSION_SUPPORT_EXT_hand_interaction(_) \
     OXR_EXTENSION_SUPPORT_EXT_hand_tracking(_) \
+    OXR_EXTENSION_SUPPORT_EXT_hand_tracking_data_source(_) \
     OXR_EXTENSION_SUPPORT_EXT_hp_mixed_reality_controller(_) \
     OXR_EXTENSION_SUPPORT_EXT_local_floor(_) \
     OXR_EXTENSION_SUPPORT_EXT_palm_pose(_) \

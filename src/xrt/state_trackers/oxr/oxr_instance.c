@@ -304,6 +304,9 @@ oxr_instance_create(struct oxr_logger *log,
 #ifdef OXR_HAVE_EXT_hand_tracking
 	    .ext_hand_tracking_enabled = extensions->EXT_hand_tracking,
 #endif
+#ifdef OXR_HAVE_EXT_hand_tracking_data_source
+	    .ext_hand_tracking_data_source_enabled = extensions->EXT_hand_tracking_data_source,
+#endif
 #ifdef OXR_HAVE_EXT_eye_gaze_interaction
 	    .ext_eye_gaze_interaction_enabled = extensions->EXT_eye_gaze_interaction,
 #endif

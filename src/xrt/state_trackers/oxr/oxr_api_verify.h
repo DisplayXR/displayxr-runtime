@@ -315,6 +315,16 @@ struct oxr_subaction_paths;
 		}                                                                                                      \
 	} while (false)
 
+#define OXR_VERIFY_HAND_TRACKING_DATA_SOURCE_OR_NULL(log, data_source_info)                                            \
+	do {                                                                                                           \
+		if (data_source_info != NULL) {                                                                        \
+			XrResult verify_ret = oxr_verify_XrHandTrackingDataSourceInfoEXT(log, data_source_info);       \
+			if (verify_ret != XR_SUCCESS) {                                                                \
+				return verify_ret;                                                                     \
+			}                                                                                              \
+		}                                                                                                      \
+	} while (false)
+
 
 /*
  *
@@ -436,6 +446,11 @@ oxr_verify_XrInteractionProfileDpadBindingEXT(struct oxr_logger *,
                                               const XrInteractionProfileDpadBindingEXT *,
                                               const char *error_prefix);
 #endif // XR_EXT_dpad_binding
+
+#ifdef OXR_HAVE_EXT_hand_tracking_data_source
+XrResult
+oxr_verify_XrHandTrackingDataSourceInfoEXT(struct oxr_logger *, const XrHandTrackingDataSourceInfoEXT *);
+#endif // XR_EXT_hand_tracking_data_source
 
 /*!
  * @}

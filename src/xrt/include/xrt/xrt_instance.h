@@ -72,6 +72,7 @@ struct xrt_application_info
 {
 	char application_name[XRT_MAX_APPLICATION_NAME_SIZE];
 	bool ext_hand_tracking_enabled;
+	bool ext_hand_tracking_data_source_enabled;
 	bool ext_eye_gaze_interaction_enabled;
 	bool ext_hand_interaction_enabled;
 	bool htc_facial_tracking_enabled;
