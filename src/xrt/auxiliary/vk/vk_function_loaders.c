@@ -85,6 +85,11 @@ vk_get_instance_functions(struct vk_bundle *vk)
 	vk->vkEnumerateDeviceExtensionProperties              = GET_INS_PROC(vk, vkEnumerateDeviceExtensionProperties);
 	vk->vkEnumerateDeviceLayerProperties                  = GET_INS_PROC(vk, vkEnumerateDeviceLayerProperties);
 
+#if defined(VK_KHR_present_wait)
+	vk->vkWaitForPresentKHR                               = GET_INS_PROC(vk, vkWaitForPresentKHR);
+
+#endif // defined(VK_KHR_present_wait)
+
 #if defined(VK_EXT_calibrated_timestamps)
 	vk->vkGetPhysicalDeviceCalibrateableTimeDomainsEXT    = GET_INS_PROC(vk, vkGetPhysicalDeviceCalibrateableTimeDomainsEXT);
 

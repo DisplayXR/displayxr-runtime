@@ -148,6 +148,7 @@ struct vk_bundle
 	bool has_EXT_global_priority;
 	bool has_EXT_image_drm_format_modifier;
 	bool has_EXT_robustness2;
+	bool has_KHR_present_wait;
 	bool has_ANDROID_external_format_resolve;
 	bool has_GOOGLE_display_timing;
 	// end of GENERATED device extension code - do not modify - used by scripts
@@ -174,6 +175,9 @@ struct vk_bundle
 
 		//! Was synchronization2 requested, available, and enabled?
 		bool synchronization_2;
+
+		//! Was KHR_present_wait requested, available, and enabled?
+		bool present_wait;
 	} features;
 
 	//! Is the GPU a tegra device.
@@ -216,6 +220,11 @@ struct vk_bundle
 	PFN_vkGetPhysicalDeviceExternalSemaphorePropertiesKHR vkGetPhysicalDeviceExternalSemaphorePropertiesKHR;
 	PFN_vkEnumerateDeviceExtensionProperties vkEnumerateDeviceExtensionProperties;
 	PFN_vkEnumerateDeviceLayerProperties vkEnumerateDeviceLayerProperties;
+
+#if defined(VK_KHR_present_wait)
+	PFN_vkWaitForPresentKHR vkWaitForPresentKHR;
+
+#endif // defined(VK_KHR_present_wait)
 
 #if defined(VK_EXT_calibrated_timestamps)
 	PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsEXT vkGetPhysicalDeviceCalibrateableTimeDomainsEXT;
@@ -1019,6 +1028,7 @@ struct vk_device_features
 	bool synchronization_2;
 	bool ext_fmt_resolve;
 	bool storage_buffer_8bit_access;
+	bool present_wait;
 };
 
 /*!

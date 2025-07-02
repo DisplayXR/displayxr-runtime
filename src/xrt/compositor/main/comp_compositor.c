@@ -573,6 +573,12 @@ static const char *optional_device_extensions[] = {
 #error "Need port!"
 #endif
 
+#ifdef VK_KHR_present_id
+    VK_KHR_PRESENT_ID_EXTENSION_NAME,
+#endif
+#ifdef VK_KHR_present_wait
+    VK_KHR_PRESENT_WAIT_EXTENSION_NAME,
+#endif
 #ifdef VK_KHR_format_feature_flags2
     VK_KHR_FORMAT_FEATURE_FLAGS_2_EXTENSION_NAME,
 #endif

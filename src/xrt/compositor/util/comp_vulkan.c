@@ -281,6 +281,7 @@ create_device(struct vk_bundle *vk, const struct comp_vulkan_arguments *vk_args)
 	    .null_descriptor = only_compute_queue,
 	    .timeline_semaphore = vk_args->timeline_semaphore,
 	    .synchronization_2 = true,
+	    .present_wait = true,
 	};
 
 	ret = vk_init_mutex(vk);
