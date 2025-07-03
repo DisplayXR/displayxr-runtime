@@ -304,6 +304,18 @@ struct oxr_subaction_paths;
 		}                                                                                                      \
 	} while (false)
 
+#define OXR_VERIFY_FORM_FACTOR(log, form_factor)                                                                       \
+	do {                                                                                                           \
+		XrFormFactor _form_factor = (form_factor);                                                             \
+		if (_form_factor != XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY &&                                             \
+		    _form_factor != XR_FORM_FACTOR_HANDHELD_DISPLAY) {                                                 \
+                                                                                                                       \
+			return oxr_error(log, XR_ERROR_FORM_FACTOR_UNSUPPORTED,                                        \
+			                 "(" #form_factor " == 0x%08x) is not a valid form factor", _form_factor);     \
+		}                                                                                                      \
+	} while (false)
+
+
 /*
  *
  * Implementation in oxr_verify.cpp

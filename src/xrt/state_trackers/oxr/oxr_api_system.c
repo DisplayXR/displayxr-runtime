@@ -58,6 +58,7 @@ oxr_xrGetSystem(XrInstance instance, const XrSystemGetInfo *getInfo, XrSystemId 
 	OXR_VERIFY_INSTANCE_AND_INIT_LOG(&log, instance, inst, "xrGetSystem");
 	OXR_VERIFY_ARG_TYPE_AND_NOT_NULL(&log, getInfo, XR_TYPE_SYSTEM_GET_INFO);
 	OXR_VERIFY_ARG_NOT_NULL(&log, systemId);
+	OXR_VERIFY_FORM_FACTOR(&log, getInfo->formFactor);
 
 	struct oxr_system *selected = NULL;
 	struct oxr_system *systems[1] = {&inst->system};
