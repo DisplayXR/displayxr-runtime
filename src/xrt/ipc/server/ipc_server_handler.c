@@ -320,18 +320,10 @@ ipc_handle_instance_describe_client(volatile struct ipc_client_state *ics,
 	EXT(ext_hand_tracking_enabled);
 	EXT(ext_eye_gaze_interaction_enabled);
 	EXT(ext_hand_interaction_enabled);
-#ifdef OXR_HAVE_HTC_facial_tracking
 	EXT(htc_facial_tracking_enabled);
-#endif
-#ifdef OXR_HAVE_FB_body_tracking
 	EXT(fb_body_tracking_enabled);
-#endif
-#ifdef OXR_HAVE_META_body_tracking_full_body
 	EXT(meta_body_tracking_full_body_enabled);
-#endif
-#ifdef OXR_HAVE_FB_face_tracking2
 	EXT(fb_face_tracking2_enabled);
-#endif
 
 #undef EXT
 #undef PTT
