@@ -359,6 +359,8 @@ oxr_event_push_XrEventDataUserPresenceChangedEXT(struct oxr_logger *log, struct 
 	lock(inst);
 	push(inst, event);
 	unlock(inst);
+
+	return XR_SUCCESS;
 }
 #endif // OXR_HAVE_EXT_user_presence
 
