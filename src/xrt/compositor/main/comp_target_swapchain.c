@@ -877,7 +877,7 @@ comp_target_swapchain_present(struct comp_target *ct,
 	struct comp_target_swapchain *cts = (struct comp_target_swapchain *)ct;
 	struct vk_bundle *vk = get_vk(cts);
 
-	assert(cts->current_frame_id >= 0);
+	assert(cts->current_frame_id > 0);
 	assert(cts->current_frame_id <= UINT32_MAX);
 
 	VkPresentInfoKHR present_info = {
@@ -908,8 +908,7 @@ comp_target_swapchain_present(struct comp_target *ct,
 #endif
 
 #ifdef VK_KHR_present_id
-	// @note first present should be 1, not 0, as the swapchain starts at ID 0 and increments from that
-	uint64_t present_id = (uint64_t)cts->current_frame_id + 1;
+	uint64_t present_id = (uint64_t)cts->current_frame_id;
 
 	VkPresentIdKHR vk_present_id = {
 	    .sType = VK_STRUCTURE_TYPE_PRESENT_ID_KHR,
@@ -955,8 +954,7 @@ comp_target_swapchain_wait_for_present(struct comp_target *ct, time_duration_ns 
 	}
 
 	// @note current frame ID is incremented by 1 to match the ID given to Vulkan, see comp_target_swapchain_present
-	return vk->vkWaitForPresentKHR(vk->device, cts->swapchain.handle, (uint64_t)cts->current_frame_id + 1,
-	                               timeout_ns);
+	return vk->vkWaitForPresentKHR(vk->device, cts->swapchain.handle, (uint64_t)cts->current_frame_id, timeout_ns);
 #else
 	return VK_ERROR_EXTENSION_NOT_PRESENT;
 #endif

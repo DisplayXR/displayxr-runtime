@@ -221,7 +221,7 @@ get_frame(struct pacing_compositor *pc, int64_t frame_id)
 static struct frame *
 create_frame(struct pacing_compositor *pc, enum frame_state state)
 {
-	int64_t frame_id = pc->next_frame_id++;
+	int64_t frame_id = ++pc->next_frame_id;
 	struct frame *f = get_frame(pc, frame_id);
 
 	f->frame_id = frame_id;
