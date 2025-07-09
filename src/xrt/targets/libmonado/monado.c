@@ -436,6 +436,9 @@ mnd_root_get_device_from_role(mnd_root_t *root, const char *role_name, int32_t *
 	TO_ENUM("hand-tracking-unobstructed-right", ROLE_HAND_UNOBSTRUCTED_RIGHT)
 	TO_ENUM("hand-tracking-conforming-left", ROLE_HAND_CONFORMING_LEFT)
 	TO_ENUM("hand-tracking-conforming-right", ROLE_HAND_CONFORMING_RIGHT)
+	//! *DEPRECATED** following roles name are deprecated, to be removed in the next major version
+	TO_ENUM("hand-tracking-left", ROLE_HAND_UNOBSTRUCTED_LEFT)
+	TO_ENUM("hand-tracking-right", ROLE_HAND_UNOBSTRUCTED_RIGHT)
 	{
 		PE("Invalid role name (%s)", role_name);
 		return MND_ERROR_INVALID_VALUE;

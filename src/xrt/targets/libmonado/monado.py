@@ -210,7 +210,7 @@ class Monado:
     def get_device_roles(self):
         role_map = dict()
         device_int_id_ptr = self.ffi.new("int32_t *")
-        for role_name in ["head", "left", "right", "gamepad", "eyes", "hand-tracking-left", "hand-tracking-right"]:
+        for role_name in ["head", "left", "right", "gamepad", "eyes", "hand-tracking-unobstructed-left", "hand-tracking-unobstructed-right", "hand-tracking-conforming-left", "hand-tracking-conforming-right"]:
             crole_name = role_name.encode('utf-8')
             ret = self.lib.mnd_root_get_device_from_role(self.root, crole_name, device_int_id_ptr)
             if ret != 0:

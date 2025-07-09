@@ -25,7 +25,7 @@ extern "C" {
 //! Major version of the API.
 #define MND_API_VERSION_MAJOR 1
 //! Minor version of the API.
-#define MND_API_VERSION_MINOR 4
+#define MND_API_VERSION_MINOR 5
 //! Patch version of the API.
 #define MND_API_VERSION_PATCH 0
 
@@ -359,10 +359,22 @@ mnd_root_get_device_info(mnd_root_t *root, uint32_t device_index, uint32_t *out_
 /*!
  * Get the device index associated for a given role name.
  *
+ *
  * @param root           The libmonado state.
- * @param role_name      Name of the role, one-of: "head", "left", "right",
- *                       "gamepad", "eyes", "hand-tracking-left", and,
- *                       "hand-tracking-right":
+ * @param role_name      Name of the role. Possible values are:
+ *                       - "head"
+ *                       - "left"
+ *                       - "right"
+ *                       - "gamepad"
+ *                       - "eyes"
+ *                       - "hand-tracking-unobstructed-[left|right]"
+ *                       - "hand-tracking-conforming-[left|right]"
+ *
+ *                       **DEPRECATED**: The role names "hand-tracking-[left|right]"
+ *                       are deprecated as of v1.5. They now map to
+ *                       "hand-tracking-unobstructed-[left|right]" and are
+ *                       scheduled for removal in v2.0.
+ *
  * @param[out] out_index Pointer to value to populate with the device index
  *                       associated with given role name, -1 if not role is set.
  *
