@@ -1,6 +1,7 @@
 ---
 - mr.2521
 - mr.2522
+- mr.2523
 ---
 ### Added
 - Support for the `XR_EXT_hand_tracking_data_source` extension.
