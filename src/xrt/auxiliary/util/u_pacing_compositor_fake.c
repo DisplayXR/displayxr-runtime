@@ -506,7 +506,14 @@ u_pc_fake_create(int64_t estimated_frame_period_ns, int64_t now_ns, struct u_pac
 	// Return value.
 	*out_upc = &ft->base;
 
-	UPC_LOG_I("Created fake timing");
+	UPC_LOG_I(
+	    "Created pacer (non-feedback version aka \"fake\")"
+	    "\n\testimated_frame_period: %fms"
+	    "\n\tpercentage: %f%%"
+	    "\n\tmin_comp_time: %fms"
+	    "\n\tcomp_time: %fms",
+	    time_ns_to_ms_f(estimated_frame_period_ns), comp_time_fraction_percent, min_comp_time_ms_f,
+	    time_ns_to_ms_f(ft->comp_time_ns));
 
 	return XRT_SUCCESS;
 }
