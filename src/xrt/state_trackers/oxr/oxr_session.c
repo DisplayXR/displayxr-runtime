@@ -372,7 +372,7 @@ oxr_session_request_exit(struct oxr_logger *log, struct oxr_session *sess)
 	if (sess->state == XR_SESSION_STATE_VISIBLE) {
 		oxr_session_change_state(log, sess, XR_SESSION_STATE_SYNCHRONIZED, 0);
 	}
-	if (!sess->has_ended_once) {
+	if (!sess->has_ended_once && sess->state != XR_SESSION_STATE_SYNCHRONIZED) {
 		oxr_session_change_state(log, sess, XR_SESSION_STATE_SYNCHRONIZED, 0);
 		// Fake the synchronization.
 		sess->has_ended_once = true;
