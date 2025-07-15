@@ -16,9 +16,6 @@
 
 #include "comp_vk_client.h"
 
-//! We are not allowed to touch the queue in xrDestroySwapchain
-#define BREAK_OPENXR_SPEC_IN_DESTROY_SWAPCHAIN (true)
-
 // Prefixed with OXR since the only user right now is the OpenXR state tracker.
 DEBUG_GET_ONCE_LOG_OPTION(vulkan_log, "OXR_VULKAN_LOG", U_LOGGING_INFO)
 
@@ -272,13 +269,6 @@ client_vk_swapchain_destroy(struct xrt_swapchain *xsc)
 	struct client_vk_swapchain *sc = client_vk_swapchain(xsc);
 	struct client_vk_compositor *c = sc->c;
 	struct vk_bundle *vk = &c->vk;
-
-	// Make sure images are not used anymore.
-	if (BREAK_OPENXR_SPEC_IN_DESTROY_SWAPCHAIN) {
-		os_mutex_lock(&vk->queue_mutex);
-		vk->vkQueueWaitIdle(vk->main_queue.queue);
-		os_mutex_unlock(&vk->queue_mutex);
-	}
 
 	for (uint32_t i = 0; i < sc->base.base.image_count; i++) {
 		if (sc->base.images[i] != VK_NULL_HANDLE) {
