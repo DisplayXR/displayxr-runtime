@@ -776,7 +776,7 @@
 /*
  * XR_MNDX_egl_enable
  */
-#if defined(XR_MNDX_egl_enable) && defined(XR_USE_PLATFORM_EGL) && defined(XR_USE_GRAPHICS_API_OPENGL)
+#if defined(XR_MNDX_egl_enable) && defined(XR_USE_PLATFORM_EGL)
 #define OXR_HAVE_MNDX_egl_enable
 #define OXR_EXTENSION_SUPPORT_MNDX_egl_enable(_) _(MNDX_egl_enable, MNDX_EGL_ENABLE)
 #else
