@@ -98,7 +98,7 @@ function(generate_khr_manifest_buildtree)
             "${CMAKE_COMMAND}" "-DOUT_FILE=${_genmanifest_OUT_FILE}"
             "-DLIBMONADO=${_libmonado}"
             "-DTARGET_PATH=$<TARGET_FILE:${_genmanifest_TARGET}>" -P
-            "${_script}" DEPENDS "${_script}"
+            "${_script}"
         COMMENT
             "Generating ${_genmanifest_MANIFEST_DESCRIPTION} named ${_genmanifest_OUT_FILE} for build tree usage"
         VERBATIM
