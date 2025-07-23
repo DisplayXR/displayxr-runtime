@@ -751,6 +751,7 @@ fill_in_has_device_extensions(struct vk_bundle *vk, struct u_string_list *ext_li
 	vk->has_KHR_maintenance2 = false;
 	vk->has_KHR_maintenance3 = false;
 	vk->has_KHR_maintenance4 = false;
+	vk->has_KHR_present_wait = false;
 	vk->has_KHR_synchronization2 = false;
 	vk->has_KHR_timeline_semaphore = false;
 	vk->has_EXT_calibrated_timestamps = false;
@@ -846,12 +847,12 @@ fill_in_has_device_extensions(struct vk_bundle *vk, struct u_string_list *ext_li
 		}
 #endif // defined(VK_KHR_maintenance4)
 
-#if defined(VK_KHR_present_wait) && defined(VK_KHR_present_id)
+#if defined(VK_KHR_present_wait)
 		if (strcmp(ext, VK_KHR_PRESENT_WAIT_EXTENSION_NAME) == 0) {
 			vk->has_KHR_present_wait = true;
 			continue;
 		}
-#endif // defined(VK_KHR_present_wait) && defined(VK_KHR_present_id)
+#endif // defined(VK_KHR_present_wait)
 
 #if defined(VK_KHR_synchronization2)
 		if (strcmp(ext, VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME) == 0) {

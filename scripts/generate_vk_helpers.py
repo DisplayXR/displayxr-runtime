@@ -185,6 +185,8 @@ def get_device_cmds():
         Cmd("vkQueueInsertDebugUtilsLabelEXT", requires=("VK_EXT_debug_utils",)),
         Cmd("vkSetDebugUtilsObjectNameEXT", requires=("VK_EXT_debug_utils",)),
         Cmd("vkSetDebugUtilsObjectTagEXT", requires=("VK_EXT_debug_utils",)),
+        None,
+        Cmd("vkWaitForPresentKHR", requires=("VK_KHR_present_wait",)),
     ]
 
 
@@ -302,6 +304,7 @@ DEVICE_EXTENSIONS_TO_CHECK = [
     "VK_KHR_maintenance2",
     "VK_KHR_maintenance3",
     "VK_KHR_maintenance4",
+    "VK_KHR_present_wait",
     "VK_KHR_synchronization2",
     "VK_KHR_timeline_semaphore",
     "VK_EXT_calibrated_timestamps",

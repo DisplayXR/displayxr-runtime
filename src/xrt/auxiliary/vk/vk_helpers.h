@@ -139,6 +139,7 @@ struct vk_bundle
 	bool has_KHR_maintenance2;
 	bool has_KHR_maintenance3;
 	bool has_KHR_maintenance4;
+	bool has_KHR_present_wait;
 	bool has_KHR_synchronization2;
 	bool has_KHR_timeline_semaphore;
 	bool has_EXT_calibrated_timestamps;
@@ -148,7 +149,6 @@ struct vk_bundle
 	bool has_EXT_global_priority;
 	bool has_EXT_image_drm_format_modifier;
 	bool has_EXT_robustness2;
-	bool has_KHR_present_wait;
 	bool has_ANDROID_external_format_resolve;
 	bool has_GOOGLE_display_timing;
 	// end of GENERATED device extension code - do not modify - used by scripts
@@ -220,11 +220,6 @@ struct vk_bundle
 	PFN_vkGetPhysicalDeviceExternalSemaphorePropertiesKHR vkGetPhysicalDeviceExternalSemaphorePropertiesKHR;
 	PFN_vkEnumerateDeviceExtensionProperties vkEnumerateDeviceExtensionProperties;
 	PFN_vkEnumerateDeviceLayerProperties vkEnumerateDeviceLayerProperties;
-
-#if defined(VK_KHR_present_wait)
-	PFN_vkWaitForPresentKHR vkWaitForPresentKHR;
-
-#endif // defined(VK_KHR_present_wait)
 
 #if defined(VK_EXT_calibrated_timestamps)
 	PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsEXT vkGetPhysicalDeviceCalibrateableTimeDomainsEXT;
@@ -463,7 +458,12 @@ struct vk_bundle
 	PFN_vkQueueInsertDebugUtilsLabelEXT vkQueueInsertDebugUtilsLabelEXT;
 	PFN_vkSetDebugUtilsObjectNameEXT vkSetDebugUtilsObjectNameEXT;
 	PFN_vkSetDebugUtilsObjectTagEXT vkSetDebugUtilsObjectTagEXT;
+
 #endif // defined(VK_EXT_debug_utils)
+
+#if defined(VK_KHR_present_wait)
+	PFN_vkWaitForPresentKHR vkWaitForPresentKHR;
+#endif // defined(VK_KHR_present_wait)
 
 	// end of GENERATED device loader code - do not modify - used by scripts
 };

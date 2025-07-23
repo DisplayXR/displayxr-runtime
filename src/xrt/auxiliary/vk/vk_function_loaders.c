@@ -85,11 +85,6 @@ vk_get_instance_functions(struct vk_bundle *vk)
 	vk->vkEnumerateDeviceExtensionProperties              = GET_INS_PROC(vk, vkEnumerateDeviceExtensionProperties);
 	vk->vkEnumerateDeviceLayerProperties                  = GET_INS_PROC(vk, vkEnumerateDeviceLayerProperties);
 
-#if defined(VK_KHR_present_wait)
-	vk->vkWaitForPresentKHR                               = GET_INS_PROC(vk, vkWaitForPresentKHR);
-
-#endif // defined(VK_KHR_present_wait)
-
 #if defined(VK_EXT_calibrated_timestamps)
 	vk->vkGetPhysicalDeviceCalibrateableTimeDomainsEXT    = GET_INS_PROC(vk, vkGetPhysicalDeviceCalibrateableTimeDomainsEXT);
 
@@ -147,7 +142,6 @@ vk_get_instance_functions(struct vk_bundle *vk)
 	vk->vkSubmitDebugUtilsMessageEXT                      = GET_INS_PROC(vk, vkSubmitDebugUtilsMessageEXT);
 	vk->vkDestroyDebugUtilsMessengerEXT                   = GET_INS_PROC(vk, vkDestroyDebugUtilsMessengerEXT);
 #endif // defined(VK_EXT_debug_utils)
-
 	// end of GENERATED instance loader code - do not modify - used by scripts
 
 	// clang-format on
@@ -336,8 +330,12 @@ vk_get_device_functions(struct vk_bundle *vk)
 	vk->vkQueueInsertDebugUtilsLabelEXT             = GET_DEV_PROC(vk, vkQueueInsertDebugUtilsLabelEXT);
 	vk->vkSetDebugUtilsObjectNameEXT                = GET_DEV_PROC(vk, vkSetDebugUtilsObjectNameEXT);
 	vk->vkSetDebugUtilsObjectTagEXT                 = GET_DEV_PROC(vk, vkSetDebugUtilsObjectTagEXT);
+
 #endif // defined(VK_EXT_debug_utils)
 
+#if defined(VK_KHR_present_wait)
+	vk->vkWaitForPresentKHR                         = GET_DEV_PROC(vk, vkWaitForPresentKHR);
+#endif // defined(VK_KHR_present_wait)
 	// end of GENERATED device loader code - do not modify - used by scripts
 
 	// clang-format on
