@@ -754,6 +754,18 @@ convert_frame_rgb_yuv_yuyv_uyvy_or_l8(struct xrt_frame_sink *xs, struct xrt_fram
 	struct xrt_frame *converted = NULL;
 
 	switch (xf->format) {
+	case XRT_FORMAT_BAYER_GR8: {
+		uint32_t w = xf->width / 2;
+		uint32_t h = xf->height / 2;
+
+		if (!create_frame_with_format_of_size(xf, w, h, XRT_FORMAT_R8G8B8, &converted)) {
+			return;
+		}
+
+		from_BAYER_GR8_to_R8G8B8(converted, w, h, xf->stride, xf->data);
+
+		break;
+	}
 	case XRT_FORMAT_R8G8B8:
 	case XRT_FORMAT_L8:
 	case XRT_FORMAT_YUYV422:
