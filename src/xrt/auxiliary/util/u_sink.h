@@ -26,9 +26,17 @@ extern "C" {
  */
 struct u_sink_quirk_params
 {
+	//! Marks frames passing through as side-by-side stereo.
 	bool stereo_sbs;
+	/*!
+	 * Marks the frames passing through as side-by-side stereo, and fixes up the camera's data offset to be readable
+	 * as a standard side-by-side frame.
+	 */
 	bool ps4_cam;
+	//! Sets the stereo format to the correct one for the leap motion and fixes image width.
 	bool leap_motion;
+	//! Reinterprets a raw bayer image as a monochrome L8 image.
+	bool bayer_as_l8;
 };
 
 /*!
