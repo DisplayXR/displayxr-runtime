@@ -68,6 +68,7 @@ print_hmd(u_pp_delegate_t dg,
 	case WMR_HEADSET_SAMSUNG_800ZAA: u_pp(dg, "Samsung 800ZAA"); break;
 	case WMR_HEADSET_LENOVO_EXPLORER: u_pp(dg, "Lenovo Explorer"); break;
 	case WMR_HEADSET_MEDION_ERAZER_X1000: u_pp(dg, "Medion Erazer X1000"); break;
+	case WMR_HEADSET_FUJITSU_FMVHDS1: u_pp(dg, "Fujitsu FMVHDS1"); break;
 	default: u_pp(dg, "Unknown (VID: %04x, PID: 0x%04x)", c->vendor_id, c->product_id); break;
 	}
 }
