@@ -142,6 +142,7 @@ struct vk_bundle
 	bool has_KHR_present_wait;
 	bool has_KHR_synchronization2;
 	bool has_KHR_timeline_semaphore;
+	bool has_KHR_video_maintenance1;
 	bool has_EXT_calibrated_timestamps;
 	bool has_EXT_display_control;
 	bool has_EXT_external_memory_dma_buf;

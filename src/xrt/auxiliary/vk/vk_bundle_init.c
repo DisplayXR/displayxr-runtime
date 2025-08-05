@@ -754,6 +754,7 @@ fill_in_has_device_extensions(struct vk_bundle *vk, struct u_string_list *ext_li
 	vk->has_KHR_present_wait = false;
 	vk->has_KHR_synchronization2 = false;
 	vk->has_KHR_timeline_semaphore = false;
+	vk->has_KHR_video_maintenance1 = false;
 	vk->has_EXT_calibrated_timestamps = false;
 	vk->has_EXT_display_control = false;
 	vk->has_EXT_external_memory_dma_buf = false;
@@ -867,6 +868,13 @@ fill_in_has_device_extensions(struct vk_bundle *vk, struct u_string_list *ext_li
 			continue;
 		}
 #endif // defined(VK_KHR_timeline_semaphore)
+
+#if defined(VK_KHR_video_maintenance1)
+		if (strcmp(ext, VK_KHR_VIDEO_MAINTENANCE_1_EXTENSION_NAME) == 0) {
+			vk->has_KHR_video_maintenance1 = true;
+			continue;
+		}
+#endif // defined(VK_KHR_video_maintenance1)
 
 #if defined(VK_EXT_calibrated_timestamps)
 		if (strcmp(ext, VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) == 0) {

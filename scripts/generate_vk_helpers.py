@@ -307,6 +307,7 @@ DEVICE_EXTENSIONS_TO_CHECK = [
     "VK_KHR_present_wait",
     "VK_KHR_synchronization2",
     "VK_KHR_timeline_semaphore",
+    "VK_KHR_video_maintenance1",
     "VK_EXT_calibrated_timestamps",
     "VK_EXT_display_control",
     "VK_EXT_external_memory_dma_buf",
