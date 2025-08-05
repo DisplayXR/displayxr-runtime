@@ -282,6 +282,7 @@ create_device(struct vk_bundle *vk, const struct comp_vulkan_arguments *vk_args)
 	    .timeline_semaphore = vk_args->timeline_semaphore,
 	    .synchronization_2 = true,
 	    .present_wait = true,
+	    .video_maintenance_1 = true,
 	};
 
 	ret = vk_init_mutex(vk);
