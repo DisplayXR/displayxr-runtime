@@ -179,6 +179,9 @@ struct vk_bundle
 
 		//! Was KHR_present_wait requested, available, and enabled?
 		bool present_wait;
+
+		//! Was KHR_video_maintenance1 requested, available, and enabled?
+		bool video_maintenance_1;
 	} features;
 
 	//! Is the GPU a tegra device.
@@ -1030,6 +1033,7 @@ struct vk_device_features
 	bool ext_fmt_resolve;
 	bool storage_buffer_8bit_access;
 	bool present_wait;
+	bool video_maintenance_1;
 };
 
 /*!

@@ -1098,6 +1098,13 @@ filter_device_features(struct vk_bundle *vk,
 	};
 #endif
 
+#ifdef VK_KHR_video_maintenance1
+	VkPhysicalDeviceVideoMaintenance1FeaturesKHR video_maintenance_1_info = {
+	    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VIDEO_MAINTENANCE_1_FEATURES_KHR,
+	    .pNext = NULL,
+	};
+#endif
+
 #ifdef VK_ANDROID_external_format_resolve
 	VkPhysicalDeviceExternalFormatResolveFeaturesANDROID ext_fmt_resolve_info = {
 	    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_FORMAT_RESOLVE_FEATURES_ANDROID,
@@ -1148,6 +1155,13 @@ filter_device_features(struct vk_bundle *vk,
 	}
 #endif
 
+#ifdef VK_KHR_video_maintenance1
+	if (vk->has_KHR_video_maintenance1) {
+		vk_append_to_pnext_chain((VkBaseInStructure *)&physical_device_features,
+		                         (VkBaseInStructure *)&video_maintenance_1_info);
+	}
+#endif
+
 #ifdef VK_ANDROID_external_format_resolve
 	if (vk->has_ANDROID_external_format_resolve) {
 		vk_append_to_pnext_chain((VkBaseInStructure *)&physical_device_features,
@@ -1187,6 +1201,10 @@ filter_device_features(struct vk_bundle *vk,
 	CHECK(synchronization_2, synchronization_2_info.synchronization2);
 #endif
 
+#ifdef VK_KHR_video_maintenance1
+	CHECK(video_maintenance_1, video_maintenance_1_info.videoMaintenance1);
+#endif
+
 #ifdef VK_ANDROID_external_format_resolve
 	CHECK(ext_fmt_resolve, ext_fmt_resolve_info.externalFormatResolve);
 #endif
@@ -1207,14 +1225,16 @@ filter_device_features(struct vk_bundle *vk,
 	         "\n\tshader_storage_image_write_without_format: %i"
 	         "\n\tstorage_buffer_8bit_access: %i"
 	         "\n\tsynchronization_2: %i"
-	         "\n\ttimeline_semaphore: %i",                               //
+	         "\n\ttimeline_semaphore: %i"
+	         "\n\tvideo_maintenance_1: %i",                              //
 	         device_features->ext_fmt_resolve,                           //
 	         device_features->null_descriptor,                           //
 	         device_features->shader_image_gather_extended,              //
 	         device_features->shader_storage_image_write_without_format, //
 	         device_features->storage_buffer_8bit_access,                //
 	         device_features->synchronization_2,                         //
-	         device_features->timeline_semaphore);                       //
+	         device_features->timeline_semaphore,                        //
+	         device_features->video_maintenance_1);                      //
 }
 
 
@@ -1262,6 +1282,7 @@ vk_create_device(struct vk_bundle *vk,
 	vk->features.timeline_semaphore = device_features.timeline_semaphore;
 	vk->features.synchronization_2 = device_features.synchronization_2;
 	vk->features.present_wait = device_features.present_wait;
+	vk->features.video_maintenance_1 = device_features.video_maintenance_1;
 
 
 	/*
@@ -1384,6 +1405,14 @@ vk_create_device(struct vk_bundle *vk,
 	};
 #endif
 
+#ifdef VK_KHR_video_maintenance1
+	VkPhysicalDeviceVideoMaintenance1FeaturesKHR video_maintenance_1_info = {
+	    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VIDEO_MAINTENANCE_1_FEATURES_KHR,
+	    .pNext = NULL,
+	    .videoMaintenance1 = device_features.video_maintenance_1,
+	};
+#endif
+
 #ifdef VK_ANDROID_external_format_resolve
 	VkPhysicalDeviceExternalFormatResolveFeaturesANDROID ext_fmt_resolve_info = {
 	    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_FORMAT_RESOLVE_FEATURES_ANDROID,
@@ -1441,6 +1470,13 @@ vk_create_device(struct vk_bundle *vk,
 	if (vk->has_KHR_synchronization2) {
 		vk_append_to_pnext_chain((VkBaseInStructure *)&device_create_info,
 		                         (VkBaseInStructure *)&synchronization_2_info);
+	}
+#endif
+
+#ifdef VK_KHR_video_maintenance1
+	if (vk->has_KHR_video_maintenance1) {
+		vk_append_to_pnext_chain((VkBaseInStructure *)&device_create_info,
+		                         (VkBaseInStructure *)&video_maintenance_1_info);
 	}
 #endif
 
