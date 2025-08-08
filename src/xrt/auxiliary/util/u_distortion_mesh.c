@@ -75,7 +75,7 @@ run_func(struct xrt_device *xdev, func_calc calc, struct xrt_hmd_parts *target, 
 				verts[i + 0] = u * 2.0f - 1.0f;
 				verts[i + 1] = v * 2.0f - 1.0f;
 
-				if (!calc(xdev, view, u, v, (struct xrt_uv_triplet *)&verts[i + 2])) {
+				if (calc(xdev, view, u, v, (struct xrt_uv_triplet *)&verts[i + 2]) != XRT_SUCCESS) {
 					// bail on error, without updating
 					// distortion.preferred
 					return;
