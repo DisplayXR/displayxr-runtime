@@ -597,7 +597,7 @@ oxr_system_get_view_conf_properties(struct oxr_logger *log,
 	}
 
 	configurationProperties->viewConfigurationType = sys->view_config_type;
-	configurationProperties->fovMutable = XR_FALSE;
+	configurationProperties->fovMutable = sys->xsysc->info.supports_fov_mutable;
 
 	return XR_SUCCESS;
 }

@@ -1106,6 +1106,8 @@ comp_main_create_system_compositor(struct xrt_device *xdev,
 	sys_info->client_vk_deviceUUID = c->settings.client_gpu_deviceUUID;
 	sys_info->client_d3d_deviceLUID = c->settings.client_gpu_deviceLUID;
 	sys_info->client_d3d_deviceLUID_valid = c->settings.client_gpu_deviceLUID_valid;
+	// @note If timewarp is disabled this is not supported.
+	sys_info->supports_fov_mutable = true;
 
 	// clang-format off
 	uint32_t view_count = xdev->hmd->view_count;

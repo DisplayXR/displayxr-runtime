@@ -2348,6 +2348,9 @@ struct xrt_system_compositor_info
 
 	//! Whether @ref client_d3d_deviceLUID is valid
 	bool client_d3d_deviceLUID_valid;
+
+	//! Whether submitting projection layers of a differing FOV from the target FOV is supported.
+	bool supports_fov_mutable;
 };
 
 struct xrt_system_compositor;
