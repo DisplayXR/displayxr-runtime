@@ -201,3 +201,24 @@ typedef intptr_t ssize_t;
 // clang-format on
 
 #endif
+
+/*
+ * C11 style designated initializers (as compound literals) causes warning messages
+ * in C++ (even in C++20), usage:
+ *
+ * @code{.c}
+ *    static inline struct xrt_foo_bar
+ *    xrt_foo_bar_make()
+ *    {
+ *        return XRT_C11_COMPOUND(struct xrt_foo_bar){
+ *            .x = y,
+ *            // ...
+ *        };
+ *    }
+ * @endcode
+ */
+#ifdef __cplusplus
+#define XRT_C11_COMPOUND(X)
+#else
+#define XRT_C11_COMPOUND(X) (X)
+#endif
