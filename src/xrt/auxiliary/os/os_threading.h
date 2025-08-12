@@ -221,6 +221,18 @@ os_cond_signal(struct os_cond *oc)
 }
 
 /*!
+ * Broadcast (signal to multiple threads).
+ *
+ * @public @memberof os_cond
+ */
+static inline int
+os_cond_broadcast(struct os_cond *oc)
+{
+	assert(oc->initialized);
+	return pthread_cond_broadcast(&oc->cond);
+}
+
+/*!
  * Wait.
  *
  * Be sure to call this in a loop, testing some other condition that you
