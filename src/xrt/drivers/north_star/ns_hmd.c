@@ -439,7 +439,6 @@ ns_mesh_calc(struct xrt_device *xdev, uint32_t view, float u, float v, struct xr
 		result->b.x = warped_uv.x;
 		result->b.y = warped_uv.y;
 
-		res = true;
 		break;
 	}
 	case NS_DISTORTION_TYPE_POLYNOMIAL_2D:
