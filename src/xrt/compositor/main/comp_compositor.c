@@ -609,6 +609,18 @@ static const char *optional_device_extensions[] = {
 };
 
 static bool
+select_instances_extensions(struct comp_compositor *c, struct u_string_list *required, struct u_string_list *optional)
+{
+#ifdef XRT_FEATURE_WINDOW_PEEK
+	if (!comp_window_peek_get_vk_instance_exts(required)) {
+		COMP_ERROR(c, "Failed to get required vulkan instance extensions for peek window.");
+		return false;
+	}
+#endif
+	return true;
+}
+
+static bool
 compositor_init_vulkan(struct comp_compositor *c)
 {
 	COMP_TRACE_MARKER();
@@ -643,6 +655,12 @@ compositor_init_vulkan(struct comp_compositor *c)
 	    optional_instance_extensions,              //
 	    ARRAY_SIZE(optional_instance_extensions)); //
 
+	if (!select_instances_extensions(c, required_instance_ext_list, optional_instance_ext_list)) {
+		COMP_ERROR(c, "Failed to select additional instance extensions.");
+		u_string_list_destroy(&required_instance_ext_list);
+		u_string_list_destroy(&optional_instance_ext_list);
+		return false;
+	}
 
 	/*
 	 * Device extensions.

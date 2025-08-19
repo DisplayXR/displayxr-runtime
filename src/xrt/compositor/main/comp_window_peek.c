@@ -13,6 +13,7 @@
 #include "main/comp_window_peek.h"
 
 #include "util/u_debug.h"
+#include "util/u_string_list.h"
 
 #ifdef XRT_HAVE_SDL2
 #include <SDL2/SDL.h>
@@ -185,10 +186,14 @@ comp_window_peek_create(struct comp_compositor *c)
 	 * SDL
 	 */
 
-	if (SDL_Init(SDL_INIT_VIDEO) < 0) {
-		COMP_ERROR(c, "Failed to init SDL2");
-		goto err_pool;
+	// Only initialize SDL if it hasn't been initialized yet
+	if (SDL_WasInit(SDL_INIT_VIDEO) == 0) {
+		if (SDL_Init(SDL_INIT_VIDEO) < 0) {
+			COMP_ERROR(c, "Failed to init SDL2");
+			goto err_pool;
+		}
 	}
+
 
 	int x = SDL_WINDOWPOS_UNDEFINED;
 	int y = SDL_WINDOWPOS_UNDEFINED;
@@ -465,4 +470,78 @@ enum comp_window_peek_eye
 comp_window_peek_get_eye(struct comp_window_peek *w)
 {
 	return w->eye;
+}
+
+bool
+comp_window_peek_get_vk_instance_exts(struct u_string_list *out_required_list)
+{
+	if (out_required_list == NULL) {
+		U_LOG_E("comp_window_peek: out_required_list is null.");
+		return false;
+	}
+
+	// Only initialize SDL if it hasn't been initialized yet
+	if (SDL_WasInit(SDL_INIT_VIDEO) == 0) {
+		if (SDL_Init(SDL_INIT_VIDEO) < 0) {
+			U_LOG_E("comp_window_peek: Failed to init SDL2");
+			return false;
+		}
+	}
+
+	/*!
+	 * NOTE: The SDL2 function SDL_Vulkan_GetInstanceExtensions requires an SDL_Window
+	 *       but the compositor needs to know which vk (instance) extensions are required
+	 *       much earlier than when comp_window_peek is created.
+	 *
+	 *       API docs for SDL_Vulkan_GetInstanceExtensions states that in future versions
+	 *       this parameter will be removed so for now just create a temporary, tiny window.
+	 */
+
+	const char **instance_ext_names = NULL;
+	const int x = SDL_WINDOWPOS_UNDEFINED;
+	const int y = SDL_WINDOWPOS_UNDEFINED;
+	const int flags = SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_VULKAN;
+	SDL_Window *tmp_window = SDL_CreateWindow(__func__, x, y, 2, 2, flags);
+	if (tmp_window == NULL) {
+		U_LOG_E("comp_window_peek: Failed create temp SDL_Window for getting vk instance extensions.");
+		return false;
+	}
+
+	/*!
+	 * WARNING: The extension name strings will not be deeply copied, the docs for
+	 *          SDL_Vulkan_GetInstanceExtensions do not state the life time of these strings.
+	 *
+	 *          based on looking the current codebase these are copied from function-level static
+	 *          arrays containing string literals (expanded from vulkan header macros, e.g. VK_FOO_EXTENSION_NAME)
+	 * 			so we can assume it's safe to pass around but future versions this may change,
+	 *          they may get destroyed when deleting the SDL_Window (although check note comment above).
+	 */
+
+	uint32_t size = 0;
+	if (!SDL_Vulkan_GetInstanceExtensions(tmp_window, &size, NULL)) {
+		U_LOG_E("comp_window_peek: Failed Failed get vk instance extensions for SDL2.");
+		goto err_free;
+	}
+
+	if (size > 0) {
+		instance_ext_names = U_TYPED_ARRAY_CALLOC(const char *, size);
+		if (!SDL_Vulkan_GetInstanceExtensions(tmp_window, &size, instance_ext_names)) {
+			U_LOG_E("comp_window_peek: Failed Failed get vk instance extensions for SDL2.");
+			goto err_free;
+		}
+	}
+
+	for (uint32_t i = 0; i < size; ++i) {
+		if (u_string_list_append_unique(out_required_list, instance_ext_names[i]) == 0) {
+			U_LOG_T("comp_window_peek: required instance extension: %s already exits, ignored.",
+			        instance_ext_names[i]);
+		} else {
+			U_LOG_T("comp_window_peek: added required instance extension: %s", instance_ext_names[i]);
+		}
+	}
+
+err_free:
+	free(instance_ext_names);
+	SDL_DestroyWindow(tmp_window);
+	return true;
 }

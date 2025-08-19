@@ -53,6 +53,16 @@ comp_window_peek_blit(struct comp_window_peek *w, VkImage src, int32_t width, in
 enum comp_window_peek_eye
 comp_window_peek_get_eye(struct comp_window_peek *w);
 
+/*!
+ * Gets the required vulkan instance extensions for comp_window_peek support
+ *
+ * @param[inout] out_required_list  list of string containing the required instance extensions to enable,
+ *                                  the list may already contain some/all of the required, duplicates will
+ *                                  not be added.
+ */
+bool
+comp_window_peek_get_vk_instance_exts(struct u_string_list *out_required_list);
+
 #ifdef __cplusplus
 }
 #endif
