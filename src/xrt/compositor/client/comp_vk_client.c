@@ -178,11 +178,11 @@ submit_semaphore(struct client_vk_compositor *c, xrt_result_t *out_xret)
 	    .pSignalSemaphores = semaphores,
 	};
 
-	ret = vk->vkQueueSubmit(  //
-	    vk->main_queue.queue, // queue
-	    1,                    // submitCount
-	    &submit_info,         // pSubmits
-	    VK_NULL_HANDLE);      // fence
+	ret = vk->vkQueueSubmit(   //
+	    vk->main_queue->queue, // queue
+	    1,                     // submitCount
+	    &submit_info,          // pSubmits
+	    VK_NULL_HANDLE);       // fence
 	if (ret != VK_SUCCESS) {
 		VK_ERROR(vk, "vkQueueSubmit: %s", vk_result_string(ret));
 		*out_xret = XRT_ERROR_VULKAN;
@@ -245,9 +245,9 @@ submit_fallback(struct client_vk_compositor *c, xrt_result_t *out_xret)
 		COMP_TRACE_IDENT(device_wait_idle);
 
 		// Last course of action fallback.
-		os_mutex_lock(&vk->queue_mutex);
-		vk->vkQueueWaitIdle(vk->main_queue.queue);
-		os_mutex_unlock(&vk->queue_mutex);
+		vk_queue_lock(vk->main_queue);
+		vk->vkQueueWaitIdle(vk->main_queue->queue);
+		vk_queue_unlock(vk->main_queue);
 	}
 
 	*out_xret = xrt_comp_layer_commit(&c->xcn->base, XRT_GRAPHICS_SYNC_HANDLE_INVALID);
@@ -738,7 +738,7 @@ client_vk_swapchain_create(struct xrt_compositor *xc,
 		    .dstAccessMask = 0,
 		    .oldLayout = barrier_optimal_layout,
 		    .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-		    .srcQueueFamilyIndex = vk->main_queue.family_index,
+		    .srcQueueFamilyIndex = vk->main_queue->family_index,
 		    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL,
 		    .image = sc->base.images[i],
 		    .subresourceRange = subresource_range,

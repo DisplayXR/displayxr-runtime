@@ -595,7 +595,7 @@ render_resources_init(struct render_resources *r,
 	VkCommandPoolCreateInfo command_pool_info = {
 	    .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
 	    .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
-	    .queueFamilyIndex = vk->main_queue.family_index,
+	    .queueFamilyIndex = vk->main_queue->family_index,
 	};
 
 	ret = vk->vkCreateCommandPool(vk->device, &command_pool_info, NULL, &r->cmd_pool);
@@ -657,7 +657,7 @@ render_resources_init(struct render_resources *r,
 		    r->mock.color.image);        // dst
 		VK_CHK_WITH_RET(ret, "prepare_mock_image_locked", false);
 
-		ret = vk_cmd_end_submit_wait_and_free_cmd_buffer_locked(vk, &vk->main_queue, r->cmd_pool, cmd);
+		ret = vk_cmd_end_submit_wait_and_free_cmd_buffer_locked(vk, vk->main_queue, r->cmd_pool, cmd);
 		VK_CHK_WITH_RET(ret, "vk_cmd_end_submit_wait_and_free_cmd_buffer_locked", false);
 
 		// No need to wait, submit waits on the fence.

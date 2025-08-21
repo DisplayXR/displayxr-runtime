@@ -83,9 +83,9 @@ vk_cmd_submit_locked(
 {
 	VkResult ret;
 
-	os_mutex_lock(&vk->queue_mutex);
+	vk_queue_lock(queue);
 	ret = vk->vkQueueSubmit(queue->queue, count, infos, fence);
-	os_mutex_unlock(&vk->queue_mutex);
+	vk_queue_unlock(queue);
 
 	if (ret != VK_SUCCESS) {
 		VK_ERROR(vk, "vkQueueSubmit: %s", vk_result_string(ret));

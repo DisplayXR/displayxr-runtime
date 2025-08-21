@@ -283,9 +283,9 @@ image_cleanup(struct vk_bundle *vk, struct comp_swapchain_image *image)
 	 * validation doesn't complain. This is done during image destruction so
 	 * isn't time critical.
 	 */
-	os_mutex_lock(&vk->queue_mutex);
+	vk_queue_lock(vk->main_queue);
 	vk->vkDeviceWaitIdle(vk->device);
-	os_mutex_unlock(&vk->queue_mutex);
+	vk_queue_unlock(vk->main_queue);
 
 	// The field array_size is shared, only reset once both are freed.
 	image_view_array_cleanup(vk, image->array_size, &image->views.alpha);

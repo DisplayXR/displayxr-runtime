@@ -72,7 +72,7 @@ vk_cmd_pool_init_for_queue(struct vk_bundle *vk,
 static inline XRT_CHECK_RESULT VkResult
 vk_cmd_pool_init(struct vk_bundle *vk, struct vk_cmd_pool *pool, VkCommandPoolCreateFlags flags)
 {
-	return vk_cmd_pool_init_for_queue(vk, pool, flags, &vk->main_queue);
+	return vk_cmd_pool_init_for_queue(vk, pool, flags, vk->main_queue);
 }
 
 /*!

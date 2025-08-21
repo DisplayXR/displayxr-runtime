@@ -230,7 +230,7 @@ vk_fill_in_has_instance_extensions(struct vk_bundle *vk, struct u_string_list *e
  */
 
 static void
-fill_in_device_features(struct vk_bundle *vk)
+fill_in_device_features(struct vk_bundle *vk, const uint32_t queue_family_index)
 {
 	/*
 	 * Device properties.
@@ -252,12 +252,12 @@ fill_in_device_features(struct vk_bundle *vk)
 	uint32_t count = 0;
 	vk->vkGetPhysicalDeviceQueueFamilyProperties(vk->physical_device, &count, NULL);
 	assert(count != 0);
-	assert(count > vk->main_queue.family_index);
+	assert(count > queue_family_index);
 
 	VkQueueFamilyProperties *props = U_TYPED_ARRAY_CALLOC(VkQueueFamilyProperties, count);
 	vk->vkGetPhysicalDeviceQueueFamilyProperties(vk->physical_device, &count, props);
 
-	vk->features.timestamp_valid_bits = props[vk->main_queue.family_index].timestampValidBits;
+	vk->features.timestamp_valid_bits = props[queue_family_index].timestampValidBits;
 	free(props);
 }
 
@@ -1237,6 +1237,60 @@ filter_device_features(struct vk_bundle *vk,
 	         device_features->video_maintenance_1);                      //
 }
 
+static inline void
+vk_reset_queues(struct vk_bundle *vk)
+{
+	const struct vk_queue_pair null_queue_pair = VK_NULL_QUEUE_PAIR;
+
+	for (uint32_t i = 0; i < ARRAY_SIZE(vk->queues); ++i) {
+		struct vk_bundle_queue *q = &vk->queues[i];
+		q->queue = VK_NULL_HANDLE;
+		q->index = null_queue_pair.index;
+		q->family_index = null_queue_pair.family_index;
+	}
+}
+
+static struct vk_bundle_queue *
+vk_insert_get_queue(struct vk_bundle *vk, const struct vk_queue_pair *new_queue)
+{
+	if (vk == NULL ||                       //
+	    new_queue == NULL ||                //
+	    new_queue->index == (uint32_t)-1 || //
+	    new_queue->family_index == VK_QUEUE_FAMILY_IGNORED) {
+		return NULL;
+	}
+
+	/*
+	 * The same queue can be used for different uses, but we need to have
+	 * one mutex per queue, so look up if the queue has already been added.
+	 */
+	for (uint32_t i = 0; i < VK_BUNDLE_MAX_QUEUES; ++i) {
+		struct vk_bundle_queue *q = &vk->queues[i];
+		if (q->queue != VK_NULL_HANDLE &&   //
+		    new_queue->index == q->index && //
+		    new_queue->family_index == q->family_index) {
+			return q;
+		}
+	}
+
+	// Find the first unused queue bundle.
+	for (uint32_t i = 0; i < VK_BUNDLE_MAX_QUEUES; ++i) {
+		struct vk_bundle_queue *q = &vk->queues[i];
+		if (q->queue != VK_NULL_HANDLE) {
+			continue;
+		}
+
+		q->index = new_queue->index;
+		q->family_index = new_queue->family_index;
+
+		vk->vkGetDeviceQueue(vk->device, q->family_index, q->index, &q->queue);
+		return q;
+	}
+
+	VK_ERROR(vk, "failed to find a free queue, max queues reached");
+	return NULL;
+}
+
 
 /*
  *
@@ -1296,11 +1350,13 @@ vk_create_device(struct vk_bundle *vk,
 		return VK_ERROR_NOT_PERMITTED_EXT;
 	}
 
-	vk->main_queue = VK_BUNDLE_NULL_QUEUE;
+	vk_reset_queues(vk);
+
+	struct vk_queue_pair main_queue = VK_NULL_QUEUE_PAIR;
 	if (only_compute) {
-		ret = find_queue_family(vk, VK_QUEUE_COMPUTE_BIT, &vk->main_queue.family_index);
+		ret = find_queue_family(vk, VK_QUEUE_COMPUTE_BIT, &main_queue.family_index);
 	} else {
-		ret = find_graphics_queue_family(vk, &vk->main_queue.family_index);
+		ret = find_graphics_queue_family(vk, &main_queue.family_index);
 	}
 
 	if (ret != VK_SUCCESS) {
@@ -1318,27 +1374,27 @@ vk_create_device(struct vk_bundle *vk,
 	uint32_t queue_create_info_count = 1;
 
 	// Compute or Graphics queue
-	vk->main_queue.index = 0;
+	main_queue.index = 0;
 	queue_create_info[0].sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
 	queue_create_info[0].pNext = NULL;
 	queue_create_info[0].queueCount = 1;
-	queue_create_info[0].queueFamilyIndex = vk->main_queue.family_index;
+	queue_create_info[0].queueFamilyIndex = main_queue.family_index;
 	queue_create_info[0].pQueuePriorities = &queue_priority;
 
 #ifdef VK_KHR_video_encode_queue
 	// Video encode queue
-	vk->encode_queue = VK_BUNDLE_NULL_QUEUE;
+	struct vk_queue_pair encode_queue = VK_NULL_QUEUE_PAIR;
 	if (u_string_list_contains(device_ext_list, VK_KHR_VIDEO_ENCODE_QUEUE_EXTENSION_NAME)) {
-		ret = find_queue_family(vk, VK_QUEUE_VIDEO_ENCODE_BIT_KHR, &vk->encode_queue.family_index);
+		ret = find_queue_family(vk, VK_QUEUE_VIDEO_ENCODE_BIT_KHR, &encode_queue.family_index);
 		if (ret == VK_SUCCESS) {
-			vk->encode_queue.index = 0;
+			encode_queue.index = 0;
 			queue_create_info[queue_create_info_count].sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
 			queue_create_info[queue_create_info_count].pNext = NULL;
 			queue_create_info[queue_create_info_count].queueCount = 1;
-			queue_create_info[queue_create_info_count].queueFamilyIndex = vk->encode_queue.family_index;
+			queue_create_info[queue_create_info_count].queueFamilyIndex = encode_queue.family_index;
 			queue_create_info[queue_create_info_count].pQueuePriorities = &queue_priority;
 			queue_create_info_count++;
-			VK_DEBUG(vk, "Creating video encode queue, family index %d", vk->encode_queue.family_index);
+			VK_DEBUG(vk, "Creating video encode queue, family index %d", encode_queue.family_index);
 		}
 	}
 #endif
@@ -1503,7 +1559,7 @@ vk_create_device(struct vk_bundle *vk,
 	}
 
 	// Fill in the device features we are interested in.
-	fill_in_device_features(vk);
+	fill_in_device_features(vk, main_queue.family_index);
 
 	// We fill in these here as we want to be sure we have selected the physical device fully.
 	fill_in_external_object_properties(vk);
@@ -1513,12 +1569,11 @@ vk_create_device(struct vk_bundle *vk,
 	if (ret != VK_SUCCESS) {
 		goto err_destroy;
 	}
-	vk->vkGetDeviceQueue(vk->device, vk->main_queue.family_index, vk->main_queue.index, &vk->main_queue.queue);
+
+	vk->main_queue = vk_insert_get_queue(vk, &main_queue);
+	assert(vk->main_queue != NULL);
 #if defined(VK_KHR_video_encode_queue)
-	if (vk->encode_queue.family_index != VK_QUEUE_FAMILY_IGNORED) {
-		vk->vkGetDeviceQueue(vk->device, vk->encode_queue.family_index, vk->encode_queue.index,
-		                     &vk->encode_queue.queue);
-	}
+	vk->encode_queue = vk_insert_get_queue(vk, &encode_queue);
 #endif
 
 	// Need to do this after functions have been gotten.
@@ -1537,8 +1592,15 @@ err_destroy:
 VkResult
 vk_init_mutex(struct vk_bundle *vk)
 {
-	if (os_mutex_init(&vk->queue_mutex) < 0) {
-		return VK_ERROR_INITIALIZATION_FAILED;
+	assert(vk != NULL);
+
+	for (uint32_t i = 0; i < ARRAY_SIZE(vk->queues); ++i) {
+		struct vk_bundle_queue *q = &vk->queues[i];
+
+		if (os_mutex_init(&q->mutex) < 0) {
+			VK_ERROR(vk, "failed to initialize queue mutex");
+			return VK_ERROR_INITIALIZATION_FAILED;
+		}
 	}
 	return VK_SUCCESS;
 }
@@ -1546,10 +1608,15 @@ vk_init_mutex(struct vk_bundle *vk)
 VkResult
 vk_deinit_mutex(struct vk_bundle *vk)
 {
-	os_mutex_destroy(&vk->queue_mutex);
+	assert(vk != NULL);
+
+	for (uint32_t i = 0; i < ARRAY_SIZE(vk->queues); ++i) {
+		struct vk_bundle_queue *q = &vk->queues[i];
+		os_mutex_destroy(&q->mutex);
+		q->mutex = (struct os_mutex){0};
+	}
 	return VK_SUCCESS;
 }
-
 
 /*
  *
@@ -1578,6 +1645,8 @@ vk_init_from_given(struct vk_bundle *vk,
 	U_ZERO(vk);
 	vk->log_level = log_level;
 
+	vk_reset_queues(vk);
+
 	ret = vk_get_loader_functions(vk, vkGetInstanceProcAddr);
 	if (ret != VK_SUCCESS) {
 		goto err_memset;
@@ -1586,11 +1655,6 @@ vk_init_from_given(struct vk_bundle *vk,
 	vk->instance = instance;
 	vk->physical_device = physical_device;
 	vk->device = device;
-	vk->main_queue.family_index = queue_family_index;
-	vk->main_queue.index = queue_index;
-#ifdef VK_KHR_video_encode_queue
-	vk->encode_queue = VK_BUNDLE_NULL_QUEUE;
-#endif
 
 	// Fill in all instance functions.
 	ret = vk_get_instance_functions(vk);
@@ -1628,8 +1692,12 @@ vk_init_from_given(struct vk_bundle *vk,
 	}
 #endif
 
+	const struct vk_queue_pair main_queue = {
+	    .family_index = queue_family_index,
+	    .index = queue_index,
+	};
 	// Fill in the device features we are interested in.
-	fill_in_device_features(vk);
+	fill_in_device_features(vk, main_queue.family_index);
 
 	// Fill in external object properties.
 	fill_in_external_object_properties(vk);
@@ -1640,7 +1708,8 @@ vk_init_from_given(struct vk_bundle *vk,
 		goto err_memset;
 	}
 
-	vk->vkGetDeviceQueue(vk->device, vk->main_queue.family_index, vk->main_queue.index, &vk->main_queue.queue);
+	vk->main_queue = vk_insert_get_queue(vk, &main_queue);
+	assert(vk->main_queue != NULL);
 
 	vk->has_EXT_debug_utils = false;
 	if (debug_utils_enabled) {

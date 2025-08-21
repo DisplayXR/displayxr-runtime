@@ -33,12 +33,27 @@
 extern "C" {
 #endif
 
+#define VK_BUNDLE_MAX_QUEUES 2
 
 /*
  *
  * Structs
  *
  */
+
+struct vk_queue_pair
+{
+	//! The queue family index
+	uint32_t family_index;
+	//! The queue (instance) index
+	uint32_t index;
+};
+
+#define VK_NULL_QUEUE_PAIR                                                                                             \
+	XRT_C11_COMPOUND(struct vk_queue_pair)                                                                         \
+	{                                                                                                              \
+		.family_index = VK_QUEUE_FAMILY_IGNORED, .index = (uint32_t)-1,                                        \
+	}
 
 struct vk_bundle_queue
 {
@@ -48,13 +63,9 @@ struct vk_bundle_queue
 	uint32_t family_index;
 	//! The queue (instance) index
 	uint32_t index;
+	//! The queue mutex - @see vk_queue_lock, vk_queue_unlock
+	struct os_mutex mutex;
 };
-
-#define VK_BUNDLE_NULL_QUEUE                                                                                           \
-	XRT_C11_COMPOUND(struct vk_bundle_queue)                                                                       \
-	{                                                                                                              \
-		.queue = VK_NULL_HANDLE, .family_index = VK_QUEUE_FAMILY_IGNORED, .index = (uint32_t)-1,               \
-	}
 
 /*!
  * A bundle of Vulkan functions and objects, used by both @ref comp and @ref
@@ -72,12 +83,21 @@ struct vk_bundle
 	VkPhysicalDevice physical_device;
 	int physical_device_index;
 	VkDevice device;
-	struct vk_bundle_queue main_queue;
-#if defined(VK_KHR_video_encode_queue)
-	struct vk_bundle_queue encode_queue;
-#endif
 
-	struct os_mutex queue_mutex;
+	/*!
+	 * @brief queues - a free list of **unique** queues
+	 *
+	 * One per uniquely identifiable vk queue (family x instance index),
+	 * duplicate entries must not be stored.
+	 *
+	 * Should not be used directly, @see main_queue, encode_queue
+	 */
+	struct vk_bundle_queue queues[VK_BUNDLE_MAX_QUEUES];
+
+	struct vk_bundle_queue *main_queue;
+#if defined(VK_KHR_video_encode_queue)
+	struct vk_bundle_queue *encode_queue;
+#endif
 
 	struct
 	{
@@ -1086,6 +1106,27 @@ vk_init_mutex(struct vk_bundle *vk);
  */
 VkResult
 vk_deinit_mutex(struct vk_bundle *vk);
+
+static inline void
+vk_queue_lock(struct vk_bundle_queue *q)
+{
+	assert(q != NULL);
+	os_mutex_lock(&q->mutex);
+}
+
+static inline int
+vk_queue_trylock(struct vk_bundle_queue *q)
+{
+	assert(q != NULL);
+	return os_mutex_trylock(&q->mutex);
+}
+
+static inline void
+vk_queue_unlock(struct vk_bundle_queue *q)
+{
+	assert(q != NULL);
+	os_mutex_unlock(&q->mutex);
+}
 
 /*!
  * Initialize a bundle with objects given to us by client code,

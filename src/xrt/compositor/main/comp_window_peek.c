@@ -266,9 +266,9 @@ comp_window_peek_destroy(struct comp_window_peek **w_ptr)
 
 	struct vk_bundle *vk = get_vk(w);
 
-	os_mutex_lock(&vk->queue_mutex);
+	vk_queue_lock(vk->main_queue);
 	vk->vkDeviceWaitIdle(vk->device);
-	os_mutex_unlock(&vk->queue_mutex);
+	vk_queue_unlock(vk->main_queue);
 
 	vk_cmd_pool_lock(&w->pool);
 	vk->vkFreeCommandBuffers(vk->device, w->pool.pool, 1, &w->cmd);
@@ -434,7 +434,7 @@ comp_window_peek_blit(struct comp_window_peek *w, VkImage src, int32_t width, in
 	};
 
 	// Done writing commands, submit to queue.
-	ret = vk_cmd_submit_locked(vk, &vk->main_queue, 1, &submit, VK_NULL_HANDLE);
+	ret = vk_cmd_submit_locked(vk, vk->main_queue, 1, &submit, VK_NULL_HANDLE);
 
 	// Done submitting commands, unlock pool.
 	vk_cmd_pool_unlock(&w->pool);
@@ -456,9 +456,9 @@ comp_window_peek_blit(struct comp_window_peek *w, VkImage src, int32_t width, in
 	    .pResults = NULL,
 	};
 
-	os_mutex_lock(&vk->queue_mutex);
-	ret = vk->vkQueuePresentKHR(vk->main_queue.queue, &present);
-	os_mutex_unlock(&vk->queue_mutex);
+	vk_queue_lock(vk->main_queue);
+	ret = vk->vkQueuePresentKHR(vk->main_queue->queue, &present);
+	vk_queue_unlock(vk->main_queue);
 
 	if (ret != VK_SUCCESS) {
 		VK_ERROR(vk, "Error: could not present to queue.\n");

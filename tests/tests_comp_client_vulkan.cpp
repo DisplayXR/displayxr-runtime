@@ -152,8 +152,8 @@ TEST_CASE("client_compositor", "[.][needgpu]")
 	    vk->has_KHR_image_format_list, // image_format_list_enabled
 	    false,                         // debug_utils_enabled
 	    false,                         // renderdoc_enabled
-	    vk->main_queue.family_index,   //
-	    vk->main_queue.index);
+	    vk->main_queue->family_index,  //
+	    vk->main_queue->index);
 	struct xrt_compositor *xc = &xcvk->base;
 
 	SECTION("CreateSwapchain calls native create")

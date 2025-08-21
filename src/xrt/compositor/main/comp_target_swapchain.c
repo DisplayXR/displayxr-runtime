@@ -682,7 +682,7 @@ comp_target_swapchain_create_images(struct comp_target *ct, const struct comp_ta
 	// Can we create swapchains from the surface on this device and queue.
 	ret = vk->vkGetPhysicalDeviceSurfaceSupportKHR( //
 	    vk->physical_device,                        // physicalDevice
-	    vk->main_queue.family_index,                // queueFamilyIndex
+	    vk->main_queue->family_index,               // queueFamilyIndex
 	    cts->surface.handle,                        // surface
 	    &supported);                                // pSupported
 	if (ret != VK_SUCCESS) {
@@ -923,9 +923,9 @@ comp_target_swapchain_present(struct comp_target *ct,
 
 
 	// Need to take the queue lock for present.
-	os_mutex_lock(&vk->queue_mutex);
+	vk_queue_lock(vk->main_queue);
 	VkResult ret = vk->vkQueuePresentKHR(queue, &present_info);
-	os_mutex_unlock(&vk->queue_mutex);
+	vk_queue_unlock(vk->main_queue);
 
 
 #ifdef VK_EXT_display_control
