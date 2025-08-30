@@ -483,6 +483,11 @@ if(XRT_BUILD_DRIVER_SIMULAVR)
 endif()
 
 if(XRT_BUILD_DRIVER_STEAMVR_LIGHTHOUSE)
+	add_library(drv_vp2 STATIC vp2/vp2_hid.c vp2/vp2_hid.h)
+	target_link_libraries(drv_vp2 PRIVATE aux_os aux_util aux_math aux_vive)
+endif()
+
+if(XRT_BUILD_DRIVER_STEAMVR_LIGHTHOUSE)
 	add_library(
 		drv_steamvr_lh STATIC
 		steamvr_lh/steamvr_lh.cpp
@@ -500,6 +505,8 @@ if(XRT_BUILD_DRIVER_STEAMVR_LIGHTHOUSE)
 			aux_util
 			aux_math
 			aux_vive
+			drv_vp2
+			drv_includes
 			xrt-interfaces
 			xrt-external-openvr
 			xrt-external-cjson
