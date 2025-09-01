@@ -167,7 +167,8 @@ vk_cmd_create_and_begin_cmd_buffer_locked(struct vk_bundle *vk,
  * @ingroup aux_vk
  */
 XRT_CHECK_RESULT VkResult
-vk_cmd_submit_locked(struct vk_bundle *vk, uint32_t count, const VkSubmitInfo *infos, VkFence fence);
+vk_cmd_submit_locked(
+    struct vk_bundle *vk, struct vk_bundle_queue *queue, uint32_t count, const VkSubmitInfo *infos, VkFence fence);
 
 /*!
  * A do everything command buffer submission function, the `_locked` suffix
@@ -189,7 +190,10 @@ vk_cmd_submit_locked(struct vk_bundle *vk, uint32_t count, const VkSubmitInfo *i
  * @ingroup aux_vk
  */
 XRT_CHECK_RESULT VkResult
-vk_cmd_end_submit_wait_and_free_cmd_buffer_locked(struct vk_bundle *vk, VkCommandPool pool, VkCommandBuffer cmd_buffer);
+vk_cmd_end_submit_wait_and_free_cmd_buffer_locked(struct vk_bundle *vk,
+                                                  struct vk_bundle_queue *queue,
+                                                  VkCommandPool pool,
+                                                  VkCommandBuffer cmd_buffer);
 
 
 /*

@@ -434,7 +434,7 @@ comp_window_peek_blit(struct comp_window_peek *w, VkImage src, int32_t width, in
 	};
 
 	// Done writing commands, submit to queue.
-	ret = vk_cmd_submit_locked(vk, 1, &submit, VK_NULL_HANDLE);
+	ret = vk_cmd_submit_locked(vk, &vk->main_queue, 1, &submit, VK_NULL_HANDLE);
 
 	// Done submitting commands, unlock pool.
 	vk_cmd_pool_unlock(&w->pool);

@@ -78,12 +78,13 @@ err_buffer:
 }
 
 XRT_CHECK_RESULT VkResult
-vk_cmd_submit_locked(struct vk_bundle *vk, uint32_t count, const VkSubmitInfo *infos, VkFence fence)
+vk_cmd_submit_locked(
+    struct vk_bundle *vk, struct vk_bundle_queue *queue, uint32_t count, const VkSubmitInfo *infos, VkFence fence)
 {
 	VkResult ret;
 
 	os_mutex_lock(&vk->queue_mutex);
-	ret = vk->vkQueueSubmit(vk->main_queue.queue, count, infos, fence);
+	ret = vk->vkQueueSubmit(queue->queue, count, infos, fence);
 	os_mutex_unlock(&vk->queue_mutex);
 
 	if (ret != VK_SUCCESS) {
@@ -94,7 +95,10 @@ vk_cmd_submit_locked(struct vk_bundle *vk, uint32_t count, const VkSubmitInfo *i
 }
 
 XRT_CHECK_RESULT VkResult
-vk_cmd_end_submit_wait_and_free_cmd_buffer_locked(struct vk_bundle *vk, VkCommandPool pool, VkCommandBuffer cmd_buffer)
+vk_cmd_end_submit_wait_and_free_cmd_buffer_locked(struct vk_bundle *vk,
+                                                  struct vk_bundle_queue *queue,
+                                                  VkCommandPool pool,
+                                                  VkCommandBuffer cmd_buffer)
 {
 	VkFence fence;
 	VkResult ret;
@@ -129,7 +133,7 @@ vk_cmd_end_submit_wait_and_free_cmd_buffer_locked(struct vk_bundle *vk, VkComman
 	    .pCommandBuffers = &cmd_buffer,
 	};
 
-	ret = vk_cmd_submit_locked(vk, 1, &submitInfo, fence);
+	ret = vk_cmd_submit_locked(vk, queue, 1, &submitInfo, fence);
 	if (ret != VK_SUCCESS) {
 		VK_ERROR(vk, "vk_cmd_pool_submit_locked: %s", vk_result_string(ret));
 		goto out_fence;

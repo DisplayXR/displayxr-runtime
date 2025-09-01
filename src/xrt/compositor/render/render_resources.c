@@ -657,7 +657,7 @@ render_resources_init(struct render_resources *r,
 		    r->mock.color.image);        // dst
 		VK_CHK_WITH_RET(ret, "prepare_mock_image_locked", false);
 
-		ret = vk_cmd_end_submit_wait_and_free_cmd_buffer_locked(vk, r->cmd_pool, cmd);
+		ret = vk_cmd_end_submit_wait_and_free_cmd_buffer_locked(vk, &vk->main_queue, r->cmd_pool, cmd);
 		VK_CHK_WITH_RET(ret, "vk_cmd_end_submit_wait_and_free_cmd_buffer_locked", false);
 
 		// No need to wait, submit waits on the fence.
