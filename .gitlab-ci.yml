@@ -433,7 +433,7 @@ ndk:armeabi-v7a:
   script:
 
     - .gitlab-ci/prebuild.sh
-    - .gitlab-ci/ci-cmake-build.sh -DANDROID_ABI=armeabi-v7a -DANDROID_PLATFORM=26 -DCMAKE_TOOLCHAIN_FILE=/opt/android-ndk/build/cmake/android.toolchain.cmake -DEigen3_DIR=/usr/lib/cmake/eigen3/ -DEIGEN3_INCLUDE_DIR=/usr/include/eigen3
+    - .gitlab-ci/ci-cmake-build.sh -DANDROID_ABI=armeabi-v7a -DANDROID_PLATFORM=26 -DCMAKE_TOOLCHAIN_FILE=/opt/android-ndk/build/cmake/android.toolchain.cmake -DEigen3_DIR=/usr/share/eigen3/cmake/
 
 ndk:arm64-v8a:
   stage: build
@@ -443,7 +443,7 @@ ndk:arm64-v8a:
   script:
 
     - .gitlab-ci/prebuild.sh
-    - .gitlab-ci/ci-cmake-build.sh -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=26 -DCMAKE_TOOLCHAIN_FILE=/opt/android-ndk/build/cmake/android.toolchain.cmake -DEigen3_DIR=/usr/lib/cmake/eigen3/ -DEIGEN3_INCLUDE_DIR=/usr/include/eigen3
+    - .gitlab-ci/ci-cmake-build.sh -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=26 -DCMAKE_TOOLCHAIN_FILE=/opt/android-ndk/build/cmake/android.toolchain.cmake -DEigen3_DIR=/usr/share/eigen3/cmake/
 
 android:spotlessCheck:
   stage: build

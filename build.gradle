@@ -80,9 +80,9 @@ ext {
     sharedTargetSdk = 31
     sharedMinSdk = 26
 
-    // If you are building on Windows, you will need to explicitly set eigenIncludeDir in your
+    // If you are building on Windows, you will need to explicitly set eigenCMakeDir in your
     // local.properties file since the default value provided below only makes sense on *nix
-    eigenIncludeDir = project.findProperty('eigenIncludeDir') ?: '/usr/include/eigen3'
+    eigenCMakeDir = project.findProperty('eigenCMakeDir') ?: '/usr/share/eigen3/cmake'
 
     // If you're having trouble with a "can't find python" CMake error, you can specify the path to
     // Python 3 explicitly in local.properties with a property named "pythonBinary"

@@ -46,10 +46,9 @@ add_library(
 	)
 target_link_libraries(
 	aux_math
-	PUBLIC aux-includes aux_util
+	PUBLIC aux-includes aux_util Eigen3::Eigen
 	PRIVATE xrt-optimized-math
 	)
-target_include_directories(aux_math SYSTEM PRIVATE ${EIGEN3_INCLUDE_DIR})
 
 if(MSVC)
 	get_target_property(options aux_math COMPILE_OPTIONS)

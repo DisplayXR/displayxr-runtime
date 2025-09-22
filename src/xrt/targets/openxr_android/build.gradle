@@ -81,11 +81,11 @@ tasks.register('unpackEigen', Copy) {
     into eigenUnpackDir
 }
 
-if (!(new File(project.file(project.eigenIncludeDir), "Eigen/Core")).exists()) {
-    println "project.eigenIncludeDir not set or not valid, so downloading Eigen at build time"
-    project.ext.eigenIncludeDir = "${eigenUnpackDir}/eigen-${project.eigenFetchVersion}"
+if (!(new File(project.file(project.eigenCMakeDir), "Eigen3Config.cmake")).exists()) {
+    println "project.eigenCMakeDir not set or not valid, so downloading Eigen at build time"
+    project.ext.eigenCMakeDir = "${eigenUnpackDir}/eigen-${project.eigenFetchVersion}/cmake"
 } else {
-    println "Using Eigen as specified/detected in project.eigenIncludeDir: ${project.eigenIncludeDir}"
+    println "Using Eigen as specified/detected in project.eigenCMakeDir: ${project.eigenCMakeDir}"
     downloadEigen.enabled = false
     unpackEigen.enabled = false
 }
@@ -176,7 +176,7 @@ android {
 
         externalNativeBuild {
             cmake {
-                arguments "-DEIGEN3_INCLUDE_DIR=${project.eigenIncludeDir}",
+                arguments "-DEigen3_DIR=${project.eigenCMakeDir}",
                     "-DANDROID_PLATFORM=${project.sharedMinSdk}",
                     "-DANDROID_STL=${project.stl}",
                     "-DANDROID_ARM_NEON=TRUE"

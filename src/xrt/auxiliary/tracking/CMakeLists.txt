@@ -23,7 +23,6 @@ target_link_libraries(
 		xrt-external-hungarian
 		xrt-optimized-math
 	)
-target_include_directories(aux_tracking SYSTEM PRIVATE ${EIGEN3_INCLUDE_DIR})
 
 if(XRT_HAVE_OPENCV)
 	target_sources(

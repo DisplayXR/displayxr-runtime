@@ -83,9 +83,17 @@ else()
 	endif()
 endif()
 
-# Redundant mention of version is required because module defaults to looking for 2.91-compatible,
-# which the config file for a 3.x says it's not compatible with.
-find_package(Eigen3 3 REQUIRED)
+#
+# For backwards compatibility with both version schemes,
+# we find any Eigen3 package (in config mode) and check
+# the version manually rather than using find_package
+# version constraints.
+#
+find_package(Eigen3 REQUIRED NO_MODULE)
+if(Eigen3_VERSION VERSION_LESS "3.3")
+	message(FATAL_ERROR "Eigen3 version ${Eigen3_VERSION} is too old, need at least 3.3")
+endif()
+
 find_package(Vulkan MODULE)
 find_package(HIDAPI MODULE)
 find_package(bluetooth MODULE)

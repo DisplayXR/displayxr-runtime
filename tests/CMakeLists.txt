@@ -68,9 +68,6 @@ target_link_libraries(tests_quat_change_of_basis PRIVATE aux_math)
 target_link_libraries(tests_quat_swing_twist PRIVATE aux_math)
 target_link_libraries(tests_vec3_angle PRIVATE aux_math)
 
-target_include_directories(tests_quat_change_of_basis SYSTEM PRIVATE ${EIGEN3_INCLUDE_DIR})
-target_include_directories(tests_quat_swing_twist SYSTEM PRIVATE ${EIGEN3_INCLUDE_DIR})
-
 if(XRT_BUILD_DRIVER_HANDTRACKING)
 	target_link_libraries(
 		tests_levenbergmarquardt

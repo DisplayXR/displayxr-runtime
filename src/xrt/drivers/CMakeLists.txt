@@ -279,7 +279,6 @@ if(XRT_BUILD_DRIVER_RIFT_S)
 		rift_s/rift_s.c
 		rift_s/rift_s.h
 		)
-	target_include_directories(drv_rift_s SYSTEM PRIVATE ${EIGEN3_INCLUDE_DIR})
 	target_link_libraries(
 		drv_rift_s
 		PRIVATE
@@ -354,7 +353,7 @@ if(XRT_BUILD_DRIVER_HANDTRACKING)
 			hand_async
 		)
 
-	target_include_directories(drv_ht PRIVATE ${OpenCV_INCLUDE_DIRS} ${EIGEN3_INCLUDE_DIR})
+	target_include_directories(drv_ht PRIVATE ${OpenCV_INCLUDE_DIRS})
 	list(APPEND ENABLED_DRIVERS ht)
 endif()
 

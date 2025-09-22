@@ -166,9 +166,6 @@ if(ANDROID)
 	target_link_libraries(aux_util PUBLIC ${ANDROID_LOG_LIBRARY})
 endif()
 
-# Internal dependency and doesn't bring in any DSO.
-target_include_directories(aux_util PRIVATE ${EIGEN3_INCLUDE_DIR})
-
 ####
 # Debug UI library
 #

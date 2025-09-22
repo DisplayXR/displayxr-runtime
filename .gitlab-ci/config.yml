@@ -60,8 +60,8 @@ fdo_ci_templates_sha: 185ede0e9b9b1924b92306ab8b882a6294e92613
 .android_cmake_defines: &android_cmake_defines
   ANDROID_PLATFORM: 26
   CMAKE_TOOLCHAIN_FILE: /opt/android-ndk/build/cmake/android.toolchain.cmake
-  Eigen3_DIR: /usr/lib/cmake/eigen3/
-  EIGEN3_INCLUDE_DIR: /usr/include/eigen3
+  Eigen3_DIR: /usr/share/eigen3/cmake/
+
 
 # Which build job do we use to build the documentation.
 documentation_build: "debian:cmake"
