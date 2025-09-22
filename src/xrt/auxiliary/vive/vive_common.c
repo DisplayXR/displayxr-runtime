@@ -22,7 +22,7 @@ vive_determine_variant(const char *model_number)
 {
 	enum VIVE_VARIANT variant = VIVE_UNKNOWN;
 
-	if (strcmp(model_number, "Utah MP") == 0) {
+	if (strcmp(model_number, "Utah MP") == 0 || strcmp(model_number, "Index") == 0) {
 		variant = VIVE_VARIANT_INDEX;
 		U_LOG_D("Found Valve Index HMD");
 	} else if (strcmp(model_number, "Vive MV") == 0 || strcmp(model_number, "Vive MV.") == 0 ||
@@ -36,6 +36,9 @@ vive_determine_variant(const char *model_number)
 	           strcmp(model_number, "VIVE_Pro 2 PV") == 0 || strcmp(model_number, "Vive_Pro 2 PV") == 0) {
 		variant = VIVE_VARIANT_PRO2;
 		U_LOG_D("Found HTC Vive Pro 2 HMD");
+	} else if (strcmp(model_number, "Beyond") == 0) {
+		variant = VIVE_VARIANT_BEYOND;
+		U_LOG_D("Found Bigscreen Beyond HMD");
 	} else {
 		U_LOG_W("Failed to parse Vive HMD variant!\n\tfirmware.model_[number|name]: '%s'", model_number);
 	}
