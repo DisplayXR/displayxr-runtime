@@ -63,6 +63,8 @@ blubur_s1_hmd_destroy(struct xrt_device *xdev)
 		m_relation_history_destroy(&hmd->relation_history);
 	}
 
+	os_mutex_destroy(&hmd->input_mutex);
+
 	free(hmd);
 }
 
@@ -130,8 +132,11 @@ blubur_s1_hmd_get_tracked_pose(struct xrt_device *xdev,
 static xrt_result_t
 blubur_s1_hmd_get_presence(struct xrt_device *xdev, bool *presence)
 {
-	// TODO: read the presence sensor from the device
-	*presence = true;
+	struct blubur_s1_hmd *hmd = blubur_s1_hmd(xdev);
+
+	os_mutex_lock(&hmd->input_mutex);
+	*presence = hmd->input.status & BLUBUR_S1_STATUS_PRESENCE;
+	os_mutex_unlock(&hmd->input_mutex);
 
 	return XRT_SUCCESS;
 }
@@ -406,7 +411,6 @@ blubur_s1_hmd_tick(struct blubur_s1_hmd *hmd)
 
 	if (timestamp_delta_ms == 0) {
 		// duplicate packet?
-		S1_TRACE(hmd, "Got duplicate timestamp packet (0 delta)!");
 		return 0;
 	}
 
@@ -448,6 +452,10 @@ blubur_s1_hmd_tick(struct blubur_s1_hmd *hmd)
 	                      XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT,
 	};
 	m_relation_history_push(hmd->relation_history, &latest_3dof_relation, hmd->fusion_3dof.last.timestamp_ns);
+
+	os_mutex_lock(&hmd->input_mutex);
+	hmd->input.status = body.status;
+	os_mutex_unlock(&hmd->input_mutex);
 
 	// S1_DEBUG_HEX(hmd, data, result);
 
@@ -495,6 +503,13 @@ blubur_s1_hmd_create(struct os_hid_device *dev, const char *serial)
 
 	hmd->log_level = debug_get_log_option_blubur_s1_log();
 	hmd->dev = dev;
+
+	ret = os_mutex_init(&hmd->input_mutex);
+	if (ret < 0) {
+		S1_ERROR(hmd, "Failed to init mutex!");
+		free(hmd);
+		return NULL;
+	}
 
 	hmd->base.destroy = blubur_s1_hmd_destroy;
 	hmd->base.name = XRT_DEVICE_GENERIC_HMD;

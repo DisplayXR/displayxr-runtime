@@ -19,6 +19,7 @@
 #include "math/m_relation_history.h"
 
 #include "blubur_s1_interface.h"
+#include "blubur_s1_protocol.h"
 
 
 struct blubur_s1_hmd
@@ -41,4 +42,11 @@ struct blubur_s1_hmd
 	int hw2mono_samples;
 
 	struct m_relation_history *relation_history;
+
+	struct os_mutex input_mutex;
+
+	struct
+	{
+		enum blubur_s1_status_bits status;
+	} input;
 };
