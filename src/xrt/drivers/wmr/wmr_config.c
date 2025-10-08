@@ -105,6 +105,8 @@ wmr_config_parse_display(struct wmr_hmd_config *c, cJSON *display, enum u_loggin
 	    !JSON_FLOAT(display, "DisplayHeight", &eye->display_size.y))
 		return false;
 
+	const struct xrt_vec2_i32 display_size_px = {(int32_t)eye->display_size.x, (int32_t)eye->display_size.y};
+
 	cJSON *visible_area_center = cJSON_GetObjectItem(display, "VisibleAreaCenter");
 	if (visible_area_center == NULL || !JSON_FLOAT(visible_area_center, "X", &eye->visible_center.x) ||
 	    !JSON_FLOAT(visible_area_center, "Y", &eye->visible_center.y)) {
@@ -173,6 +175,8 @@ wmr_config_parse_display(struct wmr_hmd_config *c, cJSON *display, enum u_loggin
 
 		distortion3K->channels[channel].eye_center.x = parameters[0];
 		distortion3K->channels[channel].eye_center.y = parameters[1];
+
+		distortion3K->channels[channel].display_size = display_size_px;
 
 		distortion3K->channels[channel].k[0] = parameters[2];
 		distortion3K->channels[channel].k[1] = parameters[3];
