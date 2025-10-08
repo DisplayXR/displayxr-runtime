@@ -473,17 +473,18 @@ u_compute_distortion_bounds_poly_3k(const struct xrt_matrix_3x3 *inv_affine_xfor
 	for (int channel = 0; channel < 3; channel++) {
 		const struct xrt_vec2 eye_center = values[channel].eye_center;
 		const double *k = values[channel].k;
+		const struct xrt_vec2_i32 display_size = values[channel].display_size;
 
 		/* The X coords start at 0 for the left eye, and display_size.x / 2.0 for the right */
 		const struct xrt_vec2 pix_coords[4] = {
 		    /* -eye_center_x, 0 */
-		    {(1.0f * view) * (values->display_size.x / 2.0f) - eye_center.x, 0.0f},
+		    {(1.0f * view) * (display_size.x / 2.0f) - eye_center.x, 0.0f},
 		    /* 0, -eye_center_y */
 		    {0.0f, -eye_center.y},
 		    /* width-eye_center_x, 0 */
-		    {(1.0f + 1.0f * view) * (values->display_size.x / 2.0f) - eye_center.x, 0.0f},
+		    {(1.0f + 1.0f * view) * (display_size.x / 2.0f) - eye_center.x, 0.0f},
 		    /* 0, height-eye_center_y */
-		    {0.0f, values->display_size.y - eye_center.y},
+		    {0.0f, display_size.y - eye_center.y},
 		};
 
 		for (int c = 0; c < 4; c++) {
