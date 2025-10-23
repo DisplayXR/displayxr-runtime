@@ -152,6 +152,12 @@ if(WIN32 AND NOT MINGW)
 endif()
 
 find_package(CNSDK CONFIG)
+find_package(simulatedreality CONFIG GLOBAL)
+find_package(srDirectX CONFIG GLOBAL)
+
+if(simulatedreality_FOUND AND NOT TARGET simulatedreality::simulatedreality)
+	add_library(simulatedreality::simulatedreality ALIAS simulatedreality)
+endif()
 
 #https://github.com/arsenm/sanitizers-cmake
 find_package(Sanitizers MODULE)
@@ -229,6 +235,7 @@ option_with_deps(CMAKE_INTERPROCEDURAL_OPTIMIZATION "Enable inter-procedural (li
 option(XRT_HAVE_TRACY "Enable Tracy support for tracing, make sure to set XRT_FEATURE_TRACING as well." OFF)
 
 option_with_deps(XRT_HAVE_CNSDK "Enable CNSDK support" DEPENDS CNSDK_FOUND)
+option_with_deps(XRT_HAVE_LEIA_SR "Enable Leia SR support" DEPENDS simulatedreality_FOUND srDirectX_FOUND)
 
 # Graphics deps to use (sorted in each group, groups thematic and ordered to handle internal deps: e.g. EGL and SDL2 need OpenGL/GLES)
 option_with_deps(XRT_HAVE_OPENGL "Enable OpenGL Graphics API support" DEPENDS OPENGL_WITHOUT_GLX_FOUND)
@@ -575,6 +582,7 @@ message(STATUS "#####----- Config -----#####")
 message(STATUS "#    GIT_DESC:        ${GIT_DESC}")
 message(STATUS "#")
 message(STATUS "#    CNSDK:           ${XRT_HAVE_CNSDK}")
+message(STATUS "#    Leia SR:         ${XRT_HAVE_LEIA_SR}")
 message(STATUS "#    BLUETOOTH:       ${XRT_HAVE_BLUETOOTH}")
 message(STATUS "#    D3D11:           ${XRT_HAVE_D3D11}")
 message(STATUS "#    D3D12:           ${XRT_HAVE_D3D12}")

@@ -311,6 +311,15 @@ else()
 	message(WARNING "Compiling without CNSDK")
 endif()
 
+if(XRT_HAVE_LEIA_SR)
+	if(NOT TARGET drv_leiasr)
+		message(FATAL_ERROR "no drv_leiasr target")
+	endif()
+
+	target_compile_definitions(comp_main PUBLIC XRT_HAVE_LEIA_SR)
+	target_link_libraries(comp_main PUBLIC drv_leiasr)
+endif()
+
 ###
 # Null compositor
 #

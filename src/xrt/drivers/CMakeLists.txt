@@ -525,6 +525,16 @@ if(XRT_BUILD_DRIVER_STEAMVR_LIGHTHOUSE)
 	list(APPEND ENABLED_HEADSET_DRIVERS steamvr_lh)
 endif()
 
+if(XRT_HAVE_LEIA_SR)
+	add_library(drv_leiasr STATIC leiasr/leiasr.cpp leiasr/leiasr.h)
+	target_link_libraries(drv_leiasr PRIVATE
+		xrt-interfaces aux_util
+		simulatedreality::simulatedreality
+		srDirectX::srDirectX
+		PUBLIC drv_includes)
+	list(APPEND ENABLED_DRIVERS drv_leiasr)
+endif(XRT_HAVE_LEIA_SR)
+
 if(XRT_BUILD_SAMPLES)
 	# We build the sample driver to make sure it stays valid,
 	# but it never gets linked into a final target.

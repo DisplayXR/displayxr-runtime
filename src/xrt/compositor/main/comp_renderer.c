@@ -55,6 +55,10 @@
 #include <leia/common/version.h>
 #endif
 
+#ifdef XRT_HAVE_LEIA_SR
+#include "leiasr/leiasr.h"
+#endif
+
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -160,6 +164,10 @@ struct comp_renderer
 
 	struct leia_core* cnsdk;
     struct leia_interlacer* interlacer;
+
+#ifdef XRT_HAVE_LEIA_SR
+	struct leiasr* leiasr;
+#endif // XRT_HAVE_LEIA_SR
 };
 
 
@@ -567,6 +575,10 @@ renderer_init(struct comp_renderer *r, struct comp_compositor *c, VkExtent2D scr
 	leia_core_init_configuration_free(config);
 #endif
 
+#ifdef XRT_HAVE_LEIA_SR
+	leiasr_create(&r->leiasr);
+#endif // XRT_HAVE_LEIA_SR
+
 	struct vk_bundle *vk = &r->c->base.vk;
 
 	VkResult ret = comp_mirror_init( //
@@ -873,10 +885,14 @@ renderer_fini(struct comp_renderer *r)
 
 	leia_platform_on_library_unload();
 #endif // XRT_HAVE_CNSDK
+
+#ifdef XRT_HAVE_LEIA_SR
+	leiasr_destroy(r->leiasr);
+#endif // XRT_HAVE_LEIA_SR
 }
 
 static void
-do_cnsdk_interlacing(struct comp_renderer *r,
+do_weaving(struct comp_renderer *r,
                      struct render_gfx_target_resources *rtr,
                      const struct comp_layer *layer,
                      const struct xrt_layer_projection_view_data *lvd,
@@ -910,6 +926,10 @@ do_cnsdk_interlacing(struct comp_renderer *r,
 		    r->c->target->images[r->acquired_buffer].handle, NULL, NULL, NULL, 0);
 	}
 #endif
+
+#ifdef XRT_HAVE_LEIA_SR
+	// TODO: Weave using LeiaSR
+#endif // XRT_HAVE_LEIA_SR
 }
 
 
@@ -976,7 +996,7 @@ dispatch_graphics(struct comp_renderer *r,
 
 	// TODO: interlace here?
 	// TODO: find what do_gfx_mesh_and_proj was doing
-	// do_cnsdk_interlacing(r, rtr, layer, lvd, rvd);
+	// do_weaving(r, rtr, layer, lvd, rvd);
 
 	// Everything is ready, submit to the queue.
 	ret = renderer_submit_queue(r, render->r->cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
@@ -1044,7 +1064,7 @@ dispatch_compute(struct comp_renderer *r,
 	    target_viewport_datas);          //
 
 	// TODO: interlace here?
-	// do_cnsdk_interlacing(r, rtr, layer, lvd, rvd);
+	// do_weaving(r, rtr, layer, lvd, rvd);
 
 	// Everything is ready, submit to the queue.
 	ret = renderer_submit_queue(r, render->r->cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
