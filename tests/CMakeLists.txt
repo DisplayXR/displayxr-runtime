@@ -1,5 +1,5 @@
 # Copyright 2018-2024, Collabora, Ltd.
-# Copyright 2024-2025, NVIDIA CORPORATION.
+# Copyright 2024-2026, NVIDIA CORPORATION.
 #
 # SPDX-License-Identifier: BSL-1.0
 
@@ -7,6 +7,7 @@ set(tests
     tests_cxx_wrappers
     tests_deque
     tests_generic_callbacks
+    tests_glue_device
     tests_history_buf
     tests_id_ringbuffer
     tests_json
@@ -58,6 +59,7 @@ endforeach()
 # For tests that require more than just aux_util, link those other libs down here.
 
 target_link_libraries(tests_cxx_wrappers PRIVATE xrt-interfaces)
+target_link_libraries(tests_glue_device PRIVATE xrt-interfaces aux_glue)
 target_link_libraries(tests_history_buf PRIVATE aux_math)
 target_link_libraries(tests_lowpass_float PRIVATE aux_math)
 target_link_libraries(tests_lowpass_integer PRIVATE aux_math)

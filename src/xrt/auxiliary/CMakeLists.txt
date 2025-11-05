@@ -1,4 +1,5 @@
 # Copyright 2019-2022, Collabora, Ltd.
+# Copyright 2025-2026, NVIDIA CORPORATION.
 # SPDX-License-Identifier: BSL-1.0
 
 # Common includes
@@ -10,6 +11,9 @@ target_link_libraries(aux-includes INTERFACE xrt-interfaces)
 
 # Bindings library.
 add_subdirectory(bindings)
+
+# Glue library (C++ wrappers for C interfaces).
+add_subdirectory(glue)
 
 # OpenGL library.
 if(XRT_HAVE_OPENGL OR XRT_HAVE_OPENGLES)
