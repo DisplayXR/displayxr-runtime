@@ -1,5 +1,5 @@
 // Copyright 2020-2024, Collabora, Ltd.
-// Copyright 2025, NVIDIA CORPORATION.
+// Copyright 2025-2026, NVIDIA CORPORATION.
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
@@ -311,7 +311,9 @@ ipc_client_hmd_set_brightness(struct xrt_device *xdev, float brightness, bool re
  * @public @memberof ipc_client_hmd
  */
 struct xrt_device *
-ipc_client_hmd_create(struct ipc_connection *ipc_c, struct xrt_tracking_origin *xtrack, uint32_t device_id)
+ipc_client_hmd_create(struct ipc_connection *ipc_c,
+                      struct ipc_client_tracking_origin_manager *ictom,
+                      uint32_t device_id)
 {
 	// Convenience helper.
 	struct ipc_shared_memory *ism = ipc_c->ism;
@@ -321,9 +323,14 @@ ipc_client_hmd_create(struct ipc_connection *ipc_c, struct xrt_tracking_origin *
 	ipc_client_hmd_t *ich = U_DEVICE_ALLOCATE(ipc_client_hmd_t, flags, 0, 0);
 
 	// Fills in almost everything a regular device needs.
-	ipc_client_xdev_init(ich, ipc_c, xtrack, device_id, ipc_client_hmd_destroy);
+	xrt_result_t xret = ipc_client_xdev_init(ich, ipc_c, ictom, device_id, ipc_client_hmd_destroy);
+	if (xret != XRT_SUCCESS) {
+		IPC_ERROR(ipc_c, "Failed to initialize IPC client HMD: %d", xret);
+		u_device_free(&ich->base);
+		return NULL;
+	}
 
-	// Fill in needed HMD functions, and destroy.
+	// Fill in needed HMD functions.
 	ich->base.get_view_poses = ipc_client_hmd_get_view_poses;
 	ich->base.compute_distortion = ipc_client_hmd_compute_distortion;
 	ich->base.is_form_factor_available = ipc_client_hmd_is_form_factor_available;

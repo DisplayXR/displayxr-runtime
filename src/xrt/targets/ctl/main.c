@@ -1,5 +1,5 @@
 // Copyright 2020-2024, Collabora, Ltd.
-// Copyright 2025, NVIDIA CORPORATION
+// Copyright 2025-2026, NVIDIA CORPORATION.
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
@@ -18,6 +18,8 @@
 
 #include <getopt.h>
 #include <ctype.h>
+#include <stdlib.h>
+#include <string.h>
 
 
 #define P(...) fprintf(stdout, __VA_ARGS__)
@@ -34,6 +36,47 @@ typedef enum op_mode
 	MODE_SET_BRIGHTNESS,
 } op_mode_t;
 
+
+struct full_device_info
+{
+	struct ipc_device_list list;
+	struct ipc_device_info info[XRT_SYSTEM_MAX_DEVICES];
+};
+
+/*
+ *
+ * Helper functions.
+ *
+ */
+
+/*!
+ * Get the device list from a given connection.
+ *
+ * @param ipc_c The IPC connection.
+ * @param[out] out_full The full device info struct to fill out.
+ * @return XRT_SUCCESS on success, or an error code.
+ */
+static xrt_result_t
+get_device_list(struct ipc_connection *ipc_c, struct full_device_info *out_full)
+{
+	xrt_result_t xret = XRT_SUCCESS;
+	xret = ipc_call_system_devices_get_list(ipc_c, &out_full->list);
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+
+	for (uint32_t i = 0; i < out_full->list.device_count; i++) {
+		uint32_t device_id = out_full->list.devices[i].id;
+
+		xret = ipc_call_device_get_info_no_arrays(ipc_c, device_id, &out_full->info[i]);
+		if (xret != XRT_SUCCESS) {
+			PE("Failed to get device info for device %u.\n", device_id);
+			return xret;
+		}
+	}
+
+	return XRT_SUCCESS;
+}
 
 int
 get_mode(struct ipc_connection *ipc_c)
@@ -79,15 +122,21 @@ get_mode(struct ipc_connection *ipc_c)
 		  cs.info.application_name);
 	}
 
+	struct full_device_info full_device_info;
+	r = get_device_list(ipc_c, &full_device_info);
+	if (r != XRT_SUCCESS) {
+		PE("Failed to get device list.\n");
+		return 1;
+	}
+
 	P("\nDevices:\n");
-	for (uint32_t i = 0; i < ipc_c->ism->isdev_count; i++) {
-		struct ipc_shared_device *isdev = &ipc_c->ism->isdevs[i];
+	for (uint32_t i = 0; i < full_device_info.list.device_count; i++) {
 		P("\tid: %d"
 		  "\tname: %d"
 		  "\t\"%s\"\n",
-		  i,           //
-		  isdev->name, //
-		  isdev->str); //
+		  full_device_info.list.devices[i].id, //
+		  full_device_info.info[i].name,       //
+		  full_device_info.info[i].str);       //
 	}
 
 	return 0;
@@ -152,12 +201,25 @@ recenter_local_spaces(struct ipc_connection *ipc_c)
 int
 get_first_device_id(struct ipc_connection *ipc_c)
 {
-	for (size_t i = 0; i < ipc_c->ism->isdev_count; i++) {
-		struct ipc_shared_device *device = &ipc_c->ism->isdevs[i];
-		if (device && device->device_type == XRT_DEVICE_TYPE_HMD) {
+	struct full_device_info full_device_info;
+	xrt_result_t xret;
+
+	// Get device list using the new API
+	xret = get_device_list(ipc_c, &full_device_info);
+	if (xret != XRT_SUCCESS) {
+		PE("Failed to get device list.\n");
+		return -1;
+	}
+
+	// Look for the first HMD device
+	for (uint32_t i = 0; i < full_device_info.list.device_count; i++) {
+		if (full_device_info.list.devices[i].device_type == XRT_DEVICE_TYPE_HMD) {
+			uint32_t device_id = full_device_info.list.devices[i].id;
+
 			// Print to stderr to enable scripting
-			PE("Picked device %zu: %s\n", i, device->str);
-			return i;
+			PE("Picked device %u: %s\n", device_id, full_device_info.info[i].str);
+
+			return device_id;
 		}
 	}
 

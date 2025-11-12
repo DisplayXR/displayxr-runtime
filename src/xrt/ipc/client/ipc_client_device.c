@@ -1,5 +1,5 @@
 // Copyright 2020-2024, Collabora, Ltd.
-// Copyright 2025, NVIDIA CORPORATION.
+// Copyright 2025-2026, NVIDIA CORPORATION.
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
@@ -79,14 +79,21 @@ ipc_client_device_destroy(struct xrt_device *xdev)
  * @public @memberof ipc_client_device
  */
 struct xrt_device *
-ipc_client_device_create(struct ipc_connection *ipc_c, struct xrt_tracking_origin *xtrack, uint32_t device_id)
+ipc_client_device_create(struct ipc_connection *ipc_c,
+                         struct ipc_client_tracking_origin_manager *ictom,
+                         uint32_t device_id)
 {
 	// Allocate and setup the basics.
 	enum u_device_alloc_flags flags = (enum u_device_alloc_flags)(U_DEVICE_ALLOC_HMD);
 	ipc_client_device_t *icd = U_DEVICE_ALLOCATE(ipc_client_device_t, flags, 0, 0);
 
 	// Fills in almost everything a regular device needs.
-	ipc_client_xdev_init(icd, ipc_c, xtrack, device_id, ipc_client_device_destroy);
+	xrt_result_t xret = ipc_client_xdev_init(icd, ipc_c, ictom, device_id, ipc_client_device_destroy);
+	if (xret != XRT_SUCCESS) {
+		IPC_ERROR(ipc_c, "Failed to initialize IPC client device: %d", xret);
+		u_device_free(&icd->base);
+		return NULL;
+	}
 
 	// Setup variable tracker.
 	u_var_add_root(icd, icd->base.str, true);

@@ -84,6 +84,15 @@ struct ipc_swapchain_data
 	bool active;
 };
 
+struct ipc_client_device_state
+{
+	//! Offset to the inputs in the shared memory area.
+	uint32_t first_input_index;
+
+	//! Offset to the outputs in the shared memory area.
+	uint32_t first_output_index;
+};
+
 /*!
  * Holds the state for a single client.
  *
@@ -107,6 +116,30 @@ struct ipc_client_state
 		 * so we don't need to lock it.
 		 */
 		struct xrt_tracking_origin *xtracks[XRT_SYSTEM_MAX_DEVICES];
+
+		/*!
+		 * Array of devices.
+		 *
+		 * We don't control the lifetime of the devices,
+		 * and we only access it from the per client thread,
+		 * so we don't need to lock it.
+		 */
+		struct xrt_device *xdevs[XRT_SYSTEM_MAX_DEVICES];
+
+		/*!
+		 * Array of device state, keeps calculated information needed
+		 * to handle the devices, such as the offsets to inputs.
+		 */
+		struct ipc_client_device_state states[XRT_SYSTEM_MAX_DEVICES];
+
+		//! Number of devices added to shared memory.
+		uint32_t isdev_count;
+
+		//! Current index for inputs in shared memory.
+		uint32_t input_index;
+
+		//! Current index for outputs in shared memory.
+		uint32_t output_index;
 	} objects;
 
 	//! Session for this client.
@@ -197,16 +230,6 @@ struct ipc_thread
 	struct os_thread thread;
 	volatile enum ipc_thread_state state;
 	volatile struct ipc_client_state ics;
-};
-
-
-/*!
- *
- */
-struct ipc_device
-{
-	//! The actual device.
-	struct xrt_device *xdev;
 };
 
 /*!
@@ -382,8 +405,6 @@ struct ipc_server
 	//! System compositor.
 	struct xrt_system_compositor *xsysc;
 
-	struct ipc_device idevs[XRT_SYSTEM_MAX_DEVICES];
-
 	struct ipc_shared_memory *isms[IPC_MAX_CLIENTS];
 
 	struct ipc_server_mainloop ml;
@@ -553,24 +574,6 @@ ipc_server_get_system_properties(struct ipc_server *vs, struct xrt_system_proper
  * Helpers
  *
  */
-
-/*!
- * Get a xdev with the given device_id.
- */
-static inline struct xrt_device *
-get_xdev(volatile struct ipc_client_state *ics, uint32_t device_id)
-{
-	return ics->server->idevs[device_id].xdev;
-}
-
-/*!
- * Get a idev with the given device_id.
- */
-static inline struct ipc_device *
-get_idev(volatile struct ipc_client_state *ics, uint32_t device_id)
-{
-	return &ics->server->idevs[device_id];
-}
 
 /*!
  * Get the data in the shared memory of the given client.

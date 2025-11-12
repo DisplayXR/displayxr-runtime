@@ -42,6 +42,12 @@ struct mnd_root
 	//! Cached infos about tracking origins.
 	struct ipc_tracking_origin_info origin_infos[XRT_SYSTEM_MAX_DEVICES];
 
+	//! State of the device list.
+	struct ipc_device_list device_list;
+
+	//! Cached infos about devices.
+	struct ipc_device_info device_infos[XRT_SYSTEM_MAX_DEVICES];
+
 	/// State of most recent app asked about
 	struct ipc_app_state app_state;
 };
@@ -103,8 +109,8 @@ enum role_enum
 
 #define CHECK_DEVICE_INDEX(INDEX)                                                                                      \
 	do {                                                                                                           \
-		if (INDEX >= root->ipc_c.ism->isdev_count) {                                                           \
-			PE("Invalid device index (%u)", INDEX);                                                        \
+		if (INDEX >= root->device_list.device_count) {                                                         \
+			PE("Invalid device index (%u)\n", INDEX);                                                      \
 			return MND_ERROR_INVALID_VALUE;                                                                \
 		}                                                                                                      \
 	} while (false)
@@ -139,6 +145,28 @@ update_tracking_origin_list_and_infos(mnd_root_t *root)
 		xret = ipc_call_tracking_origin_get_info(&root->ipc_c, id, &root->origin_infos[i]);
 		if (xret != XRT_SUCCESS) {
 			PE("Failed ipc_call_tracking_origin_get_list '%i'", xret);
+			return MND_ERROR_OPERATION_FAILED;
+		}
+	}
+
+	return MND_SUCCESS;
+}
+
+static mnd_result_t
+update_device_list_and_infos(mnd_root_t *root)
+{
+	xrt_result_t xret = ipc_call_system_devices_get_list(&root->ipc_c, &root->device_list);
+	if (xret != XRT_SUCCESS) {
+		PE("Failed ipc_call_system_devices_get_list '%i'", xret);
+		return MND_ERROR_OPERATION_FAILED;
+	}
+
+	for (uint32_t i = 0; i < root->device_list.device_count; i++) {
+		uint32_t device_id = root->device_list.devices[i].id;
+
+		xret = ipc_call_device_get_info_no_arrays(&root->ipc_c, device_id, &root->device_infos[i]);
+		if (xret != XRT_SUCCESS) {
+			PE("Failed to get device info for device %u.\n", device_id);
 			return MND_ERROR_OPERATION_FAILED;
 		}
 	}
@@ -196,6 +224,12 @@ mnd_root_create(mnd_root_t **out_root)
 	}
 
 	mnd_result_t mret = update_tracking_origin_list_and_infos(r);
+	if (mret != MND_SUCCESS) {
+		mnd_root_destroy(&r);
+		return mret;
+	}
+
+	mret = update_device_list_and_infos(r);
 	if (mret != MND_SUCCESS) {
 		mnd_root_destroy(&r);
 		return mret;
@@ -354,7 +388,7 @@ mnd_root_get_device_count(mnd_root_t *root, uint32_t *out_device_count)
 	CHECK_NOT_NULL(root);
 	CHECK_NOT_NULL(out_device_count);
 
-	*out_device_count = root->ipc_c.ism->isdev_count;
+	*out_device_count = root->device_list.device_count;
 
 	return MND_SUCCESS;
 }
@@ -364,18 +398,14 @@ mnd_root_get_device_info_bool(mnd_root_t *root, uint32_t device_index, mnd_prope
 {
 	CHECK_NOT_NULL(root);
 	CHECK_NOT_NULL(out_bool);
+	CHECK_DEVICE_INDEX(device_index);
 
-	if (device_index >= root->ipc_c.ism->isdev_count) {
-		PE("Invalid device index (%u)", device_index);
-		return MND_ERROR_INVALID_VALUE;
-	}
-
-	const struct ipc_shared_device *shared_device = &root->ipc_c.ism->isdevs[device_index];
+	const struct ipc_device_info *device_info = &root->device_infos[device_index];
 
 	switch (prop) {
-	case MND_PROPERTY_SUPPORTS_POSITION_BOOL: *out_bool = shared_device->supported.position_tracking; break;
-	case MND_PROPERTY_SUPPORTS_ORIENTATION_BOOL: *out_bool = shared_device->supported.orientation_tracking; break;
-	case MND_PROPERTY_SUPPORTS_BRIGHTNESS_BOOL: *out_bool = shared_device->supported.brightness_control; break;
+	case MND_PROPERTY_SUPPORTS_POSITION_BOOL: *out_bool = device_info->supported.position_tracking; break;
+	case MND_PROPERTY_SUPPORTS_ORIENTATION_BOOL: *out_bool = device_info->supported.orientation_tracking; break;
+	case MND_PROPERTY_SUPPORTS_BRIGHTNESS_BOOL: *out_bool = device_info->supported.brightness_control; break;
 	default: PE("Is not a valid boolean property (%u)", prop); return MND_ERROR_INVALID_PROPERTY;
 	}
 
@@ -387,11 +417,7 @@ mnd_root_get_device_info_i32(mnd_root_t *root, uint32_t device_index, mnd_proper
 {
 	CHECK_NOT_NULL(root);
 	CHECK_NOT_NULL(out_i32);
-
-	if (device_index >= root->ipc_c.ism->isdev_count) {
-		PE("Invalid device index (%u)", device_index);
-		return MND_ERROR_INVALID_VALUE;
-	}
+	CHECK_DEVICE_INDEX(device_index);
 
 	PE("Is not a valid i32 property (%u)", prop);
 
@@ -403,23 +429,19 @@ mnd_root_get_device_info_u32(mnd_root_t *root, uint32_t device_index, mnd_proper
 {
 	CHECK_NOT_NULL(root);
 	CHECK_NOT_NULL(out_u32);
+	CHECK_DEVICE_INDEX(device_index);
 
-	if (device_index >= root->ipc_c.ism->isdev_count) {
-		PE("Invalid device index (%u)", device_index);
-		return MND_ERROR_INVALID_VALUE;
-	}
-
-	const struct ipc_shared_device *shared_device = &root->ipc_c.ism->isdevs[device_index];
+	const struct ipc_device_info *device_info = &root->device_infos[device_index];
 
 	switch (prop) {
 	case MND_PROPERTY_TRACKING_ORIGIN_U32:
 		for (uint32_t i = 0; i < root->tracking_origin_list.origin_count; i++) {
-			if (shared_device->tracking_origin_id == root->tracking_origin_list.origins[i].id) {
+			if (device_info->tracking_origin_id == root->tracking_origin_list.origins[i].id) {
 				*out_u32 = i;
 				return MND_SUCCESS;
 			}
 		}
-		PE("Could not find tracking origin id in origins list '%u'!\n", shared_device->tracking_origin_id);
+		PE("Could not find tracking origin id in origins list '%u'!\n", device_info->tracking_origin_id);
 		return MND_ERROR_INVALID_VALUE;
 	default: PE("Is not a valid u32 property (%u)", prop); return MND_ERROR_INVALID_PROPERTY;
 	}
@@ -432,11 +454,7 @@ mnd_root_get_device_info_float(mnd_root_t *root, uint32_t device_index, mnd_prop
 {
 	CHECK_NOT_NULL(root);
 	CHECK_NOT_NULL(out_float);
-
-	if (device_index >= root->ipc_c.ism->isdev_count) {
-		PE("Invalid device index (%u)", device_index);
-		return MND_ERROR_INVALID_VALUE;
-	}
+	CHECK_DEVICE_INDEX(device_index);
 
 	PE("Is not a valid float property (%u)", prop);
 
@@ -448,17 +466,13 @@ mnd_root_get_device_info_string(mnd_root_t *root, uint32_t device_index, mnd_pro
 {
 	CHECK_NOT_NULL(root);
 	CHECK_NOT_NULL(out_string);
+	CHECK_DEVICE_INDEX(device_index);
 
-	if (device_index >= root->ipc_c.ism->isdev_count) {
-		PE("Invalid device index (%u)", device_index);
-		return MND_ERROR_INVALID_VALUE;
-	}
-
-	const struct ipc_shared_device *shared_device = &root->ipc_c.ism->isdevs[device_index];
+	const struct ipc_device_info *device_info = &root->device_infos[device_index];
 
 	switch (prop) {
-	case MND_PROPERTY_NAME_STRING: *out_string = shared_device->str; break;
-	case MND_PROPERTY_SERIAL_STRING: *out_string = shared_device->serial; break;
+	case MND_PROPERTY_NAME_STRING: *out_string = device_info->str; break;
+	case MND_PROPERTY_SERIAL_STRING: *out_string = device_info->serial; break;
 	default: PE("Is not a valid string property (%u)", prop); return MND_ERROR_INVALID_PROPERTY;
 	}
 
@@ -471,15 +485,11 @@ mnd_root_get_device_info(mnd_root_t *root, uint32_t device_index, uint32_t *out_
 	CHECK_NOT_NULL(root);
 	CHECK_NOT_NULL(out_device_id);
 	CHECK_NOT_NULL(out_dev_name);
+	CHECK_DEVICE_INDEX(device_index);
 
-	if (device_index >= root->ipc_c.ism->isdev_count) {
-		PE("Invalid device index (%u)", device_index);
-		return MND_ERROR_INVALID_VALUE;
-	}
-
-	const struct ipc_shared_device *shared_device = &root->ipc_c.ism->isdevs[device_index];
-	*out_device_id = shared_device->name;
-	*out_dev_name = shared_device->str;
+	const struct ipc_device_info *device_info = &root->device_infos[device_index];
+	*out_device_id = device_info->name;
+	*out_dev_name = device_info->str;
 
 	return MND_SUCCESS;
 }
@@ -659,15 +669,11 @@ mnd_root_get_device_battery_status(
 	CHECK_NOT_NULL(out_present);
 	CHECK_NOT_NULL(out_charging);
 	CHECK_NOT_NULL(out_charge);
+	CHECK_DEVICE_INDEX(device_index);
 
-	if (device_index >= root->ipc_c.ism->isdev_count) {
-		PE("Invalid device index (%u)", device_index);
-		return MND_ERROR_INVALID_VALUE;
-	}
+	const struct ipc_device_info *device_info = &root->device_infos[device_index];
 
-	const struct ipc_shared_device *shared_device = &root->ipc_c.ism->isdevs[device_index];
-
-	if (!shared_device->supported.battery_status) {
+	if (!device_info->supported.battery_status) {
 		return MND_ERROR_OPERATION_FAILED;
 	}
 
@@ -687,9 +693,9 @@ mnd_root_get_device_brightness(mnd_root_t *root, uint32_t device_index, float *o
 	CHECK_DEVICE_INDEX(device_index);
 	CHECK_NOT_NULL(out_brightness);
 
-	const struct ipc_shared_device *shared_device = &root->ipc_c.ism->isdevs[device_index];
+	const struct ipc_device_info *device_info = &root->device_infos[device_index];
 
-	if (!shared_device->supported.brightness_control) {
+	if (!device_info->supported.brightness_control) {
 		PE("device_get_brightness unsupported\n");
 		return MND_ERROR_UNSUPPORTED_OPERATION;
 	}
@@ -708,9 +714,9 @@ mnd_root_set_device_brightness(mnd_root_t *root, uint32_t device_index, float br
 	CHECK_NOT_NULL(root);
 	CHECK_DEVICE_INDEX(device_index);
 
-	const struct ipc_shared_device *shared_device = &root->ipc_c.ism->isdevs[device_index];
+	const struct ipc_device_info *device_info = &root->device_infos[device_index];
 
-	if (!shared_device->supported.brightness_control) {
+	if (!device_info->supported.brightness_control) {
 		PE("device_set_brightness unsupported\n");
 		return MND_ERROR_UNSUPPORTED_OPERATION;
 	}

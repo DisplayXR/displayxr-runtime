@@ -1,5 +1,5 @@
 // Copyright 2020-2024, Collabora, Ltd.
-// Copyright 2025, NVIDIA CORPORATION.
+// Copyright 2025-2026, NVIDIA CORPORATION.
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
@@ -410,16 +410,19 @@ out:
  *
  */
 
-void
+xrt_result_t
 ipc_client_xdev_init(struct ipc_client_xdev *icx,
                      struct ipc_connection *ipc_c,
-                     struct xrt_tracking_origin *xtrack,
+                     struct ipc_client_tracking_origin_manager *ictom,
                      uint32_t device_id,
                      u_device_destroy_function_t destroy_fn)
 {
 	// Helpers.
 	struct ipc_shared_memory *ism = ipc_c->ism;
-	struct ipc_shared_device *isdev = &ism->isdevs[device_id];
+	xrt_result_t xret = XRT_SUCCESS;
+
+	// Queried later.
+	struct ipc_binding_profile_info *temp_ibpis = NULL;
 
 	// Important fields.
 	icx->ipc_c = ipc_c;
@@ -452,51 +455,139 @@ ipc_client_xdev_init(struct ipc_client_xdev *icx,
 	icx->base.get_plane_detection_state_ext = ipc_client_xdev_get_plane_detection_state_ext;
 	icx->base.get_plane_detections_ext = ipc_client_xdev_get_plane_detections_ext;
 
-	// Copying the information from the isdev.
-	icx->base.device_type = isdev->device_type;
-	icx->base.supported = isdev->supported;
-	icx->base.tracking_origin = xtrack;
-	icx->base.name = isdev->name;
+	// Lock the connection so we can do varlen IPC calls.
+	ipc_client_connection_lock(ipc_c);
+
+	// Call IPC to get device info with varlen data
+	xret = ipc_send_device_get_info_locked(ipc_c, device_id);
+	IPC_CHK_WITH_GOTO(ipc_c, xret, "ipc_send_device_get_info_locked", out_free_and_unlock);
+
+	struct ipc_device_info info = {0};
+	xret = ipc_receive_device_get_info_locked(ipc_c, &info);
+	IPC_CHK_WITH_GOTO(ipc_c, xret, "ipc_receive_device_get_info_locked", out_free_and_unlock);
+
+	// Copying the information from the info.
+	icx->base.device_type = info.device_type;
+	icx->base.supported = info.supported;
+	icx->base.name = info.name;
 
 	// Print name.
-	snprintf(icx->base.str, XRT_DEVICE_NAME_LEN, "%s", isdev->str);
-	snprintf(icx->base.serial, XRT_DEVICE_NAME_LEN, "%s", isdev->serial);
+	snprintf(icx->base.str, XRT_DEVICE_NAME_LEN, "%s", info.str);
+	snprintf(icx->base.serial, XRT_DEVICE_NAME_LEN, "%s", info.serial);
 
 	// Setup inputs, by pointing directly to the shared memory.
-	assert(isdev->input_count > 0);
-	icx->base.inputs = &ism->inputs[isdev->first_input_index];
-	icx->base.input_count = isdev->input_count;
+	icx->base.input_count = info.input_count;
+	if (info.input_count > 0) {
+		assert(info.first_input_index < IPC_SHARED_MAX_INPUTS);
+		icx->base.inputs = &ism->inputs[info.first_input_index];
+	} else {
+		icx->base.inputs = NULL;
+	}
 
 	// Setup outputs, if any point directly into the shared memory.
-	icx->base.output_count = isdev->output_count;
-	if (isdev->output_count > 0) {
-		icx->base.outputs = &ism->outputs[isdev->first_output_index];
+	icx->base.output_count = info.output_count;
+	if (info.output_count > 0) {
+		assert(info.first_output_index < IPC_SHARED_MAX_OUTPUTS);
+		icx->base.outputs = &ism->outputs[info.first_output_index];
 	} else {
 		icx->base.outputs = NULL;
 	}
 
+	// Receive binding profiles from varlen data.
+	if (info.binding_profile_count > 0) {
+		/*
+		 * This needs to live until after all of the bindings have
+		 * been setup as it contains the offsets into the input and
+		 * output pairs arrays.
+		 */
+		temp_ibpis = U_TYPED_ARRAY_CALLOC(struct ipc_binding_profile_info, info.binding_profile_count);
+		xret = ipc_receive(&ipc_c->imc, temp_ibpis,
+		                   sizeof(struct ipc_binding_profile_info) * info.binding_profile_count);
+		IPC_CHK_WITH_GOTO(ipc_c, xret, "ipc_receive(binding profiles)", out_free_and_unlock);
+	}
+
+	// Receive all input pairs from varlen data.
+	if (info.total_input_pair_count > 0) {
+		size_t size = sizeof(struct xrt_binding_input_pair) * info.total_input_pair_count;
+
+		// Is freed by ipc_client_xdev_fini.
+		icx->all_input_pairs = U_TYPED_ARRAY_CALLOC(struct xrt_binding_input_pair, info.total_input_pair_count);
+		xret = ipc_receive(&ipc_c->imc, icx->all_input_pairs, size);
+		IPC_CHK_WITH_GOTO(ipc_c, xret, "ipc_receive(input pairs)", out_free_and_unlock);
+	}
+
+	// Receive all output pairs from varlen data.
+	if (info.total_output_pair_count > 0) {
+		size_t size = sizeof(struct xrt_binding_output_pair) * info.total_output_pair_count;
+
+		// Is freed by ipc_client_xdev_fini.
+		icx->all_output_pairs =
+		    U_TYPED_ARRAY_CALLOC(struct xrt_binding_output_pair, info.total_output_pair_count);
+		xret = ipc_receive(&ipc_c->imc, icx->all_output_pairs, size);
+		IPC_CHK_WITH_GOTO(ipc_c, xret, "ipc_receive(output pairs)", out_free_and_unlock);
+	}
+
 	// Setup binding profiles.
-	icx->base.binding_profile_count = isdev->binding_profile_count;
-	if (isdev->binding_profile_count > 0) {
+	icx->base.binding_profile_count = info.binding_profile_count;
+	if (info.binding_profile_count > 0) {
+		// Is freed by ipc_client_xdev_fini.
 		icx->base.binding_profiles =
-		    U_TYPED_ARRAY_CALLOC(struct xrt_binding_profile, isdev->binding_profile_count);
+		    U_TYPED_ARRAY_CALLOC(struct xrt_binding_profile, info.binding_profile_count);
 	}
 
-	for (size_t i = 0; i < isdev->binding_profile_count; i++) {
+	// Wire up binding profiles with received pairs
+	uint32_t input_pair_offset = 0;
+	uint32_t output_pair_offset = 0;
+	for (size_t i = 0; i < info.binding_profile_count; i++) {
 		struct xrt_binding_profile *xbp = &icx->base.binding_profiles[i];
-		struct ipc_shared_binding_profile *isbp =
-		    &ism->binding_profiles[isdev->first_binding_profile_index + i];
+		struct ipc_binding_profile_info *ibpi = &temp_ibpis[i];
 
-		xbp->name = isbp->name;
-		if (isbp->input_count > 0) {
-			xbp->inputs = &ism->input_pairs[isbp->first_input_index];
-			xbp->input_count = isbp->input_count;
+		xbp->name = ibpi->name;
+		xbp->input_count = ibpi->input_count;
+		xbp->output_count = ibpi->output_count;
+
+		// Point to the appropriate section of the received arrays.
+		if (ibpi->input_count > 0) {
+			xbp->inputs = &icx->all_input_pairs[input_pair_offset];
+			input_pair_offset += ibpi->input_count;
+		} else {
+			xbp->inputs = NULL;
 		}
-		if (isbp->output_count > 0) {
-			xbp->outputs = &ism->output_pairs[isbp->first_output_index];
-			xbp->output_count = isbp->output_count;
+
+		// Ditto for outputs.
+		if (ibpi->output_count > 0) {
+			xbp->outputs = &icx->all_output_pairs[output_pair_offset];
+			output_pair_offset += ibpi->output_count;
+		} else {
+			xbp->outputs = NULL;
 		}
 	}
+
+out_free_and_unlock:
+	// Out of the critical section.
+	ipc_client_connection_unlock(ipc_c);
+
+	// Free temporary binding profile structures (we've copied the data).
+	free(temp_ibpis);
+
+	// Check if we failed during the critical section.
+	IPC_CHK_WITH_GOTO(ipc_c, xret, "ipc_client_xdev_init(failed during critical section)", err_fini);
+
+	// Get the tracking origin, can't do this with the critical section, so do it after.
+	struct xrt_tracking_origin *xtrack = NULL;
+	xret = ipc_client_tracking_origin_manager_get(ictom, info.tracking_origin_id, &xtrack);
+	IPC_CHK_WITH_GOTO(ipc_c, xret, "ipc_client_tracking_origin_manager_get", err_fini);
+
+	icx->base.tracking_origin = xtrack;
+
+	// Return success.
+	return XRT_SUCCESS;
+
+err_fini:
+	// Cleans up any allocations.
+	ipc_client_xdev_fini(icx);
+
+	return xret;
 }
 
 void
@@ -506,9 +597,19 @@ ipc_client_xdev_fini(struct ipc_client_xdev *icx)
 	icx->base.inputs = NULL;
 	icx->base.outputs = NULL;
 
-	// We allocated the bindings profiles.
+	// Free binding profiles.
 	if (icx->base.binding_profiles != NULL) {
 		free(icx->base.binding_profiles);
 		icx->base.binding_profiles = NULL;
+	}
+
+	if (icx->all_input_pairs != NULL) {
+		free(icx->all_input_pairs);
+		icx->all_input_pairs = NULL;
+	}
+
+	if (icx->all_output_pairs != NULL) {
+		free(icx->all_output_pairs);
+		icx->all_output_pairs = NULL;
 	}
 }

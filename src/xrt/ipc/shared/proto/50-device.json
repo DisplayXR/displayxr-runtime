@@ -1,6 +1,25 @@
 {
 	"$schema": "../proto.schema.json",
 
+	"device_get_info": {
+		"varlen": true,
+		"in": [
+			{"name": "device_id", "type": "uint32_t"}
+		],
+		"out": [
+			{"name": "info", "type": "struct ipc_device_info"}
+		]
+	},
+
+	"device_get_info_no_arrays": {
+		"in": [
+			{"name": "device_id", "type": "uint32_t"}
+		],
+		"out": [
+			{"name": "info", "type": "struct ipc_device_info"}
+		]
+	},
+
 	"device_update_input": {
 		"in": [
 			{"name": "id", "type": "uint32_t"}

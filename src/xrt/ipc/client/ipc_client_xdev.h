@@ -1,5 +1,5 @@
 // Copyright 2020-2023, Collabora, Ltd.
-// Copyright 2025, NVIDIA CORPORATION.
+// Copyright 2025-2026, NVIDIA CORPORATION.
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
@@ -22,6 +22,7 @@ extern "C" {
 
 
 struct ipc_connection;
+struct ipc_client_tracking_origin_manager;
 
 /*!
  * An IPC client proxy for an @ref xrt_device.
@@ -36,6 +37,9 @@ struct ipc_client_xdev
 	struct ipc_connection *ipc_c;
 
 	uint32_t device_id;
+
+	struct xrt_binding_input_pair *all_input_pairs;
+	struct xrt_binding_output_pair *all_output_pairs;
 };
 
 /*!
@@ -57,10 +61,10 @@ ipc_client_xdev(struct xrt_device *xdev)
  * @ingroup ipc_client
  * @public @memberof ipc_client_xdev
  */
-void
+xrt_result_t
 ipc_client_xdev_init(struct ipc_client_xdev *icx,
                      struct ipc_connection *ipc_c,
-                     struct xrt_tracking_origin *xtrack,
+                     struct ipc_client_tracking_origin_manager *itom,
                      uint32_t device_id,
                      u_device_destroy_function_t destroy_fn);
 

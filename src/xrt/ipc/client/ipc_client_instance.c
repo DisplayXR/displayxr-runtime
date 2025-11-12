@@ -164,32 +164,29 @@ ipc_client_instance_create_system(struct xrt_instance *xinst,
 
 	struct xrt_system_devices *xsysd = &icsd->base.base;
 
-	struct ipc_shared_memory *ism = ii->ipc_c.ism;
+	// Query the server for the list of devices
+	struct ipc_device_list device_list = {0};
+	xret = ipc_call_system_devices_get_list(&ii->ipc_c, &device_list);
+	IPC_CHK_AND_RET(&ii->ipc_c, xret, "ipc_call_system_devices_get_list");
 
-	// Query the server for how many devices it has and create them.
+	// Create client devices for each device in the list
 	uint32_t count = 0;
-	for (uint32_t i = 0; i < ism->isdev_count; i++) {
-		struct ipc_shared_device *isdev = &ism->isdevs[i];
+	struct ipc_client_tracking_origin_manager *ictom = &icsd->tracking_origin_manager;
+	for (uint32_t i = 0; i < device_list.device_count; i++) {
+		struct ipc_device_list_entry *entry = &device_list.devices[i];
 
-		// Get tracking origin from manager (fetches on-demand)
-		struct xrt_tracking_origin *xtrack = NULL;
-		xret = ipc_client_tracking_origin_manager_get(&icsd->tracking_origin_manager, isdev->tracking_origin_id,
-		                                              &xtrack);
-		if (xret != XRT_SUCCESS) {
-			IPC_ERROR(&ii->ipc_c, "Failed to get tracking origin for device %u (id %u)", i,
-			          isdev->tracking_origin_id);
-			continue;
-		}
-		if (xtrack == NULL) {
-			IPC_ERROR(&ii->ipc_c, "Tracking origin for device %u (id %u) is NULL", i,
-			          isdev->tracking_origin_id);
-			continue;
-		}
-
-		if (isdev->device_type == XRT_DEVICE_TYPE_HMD) {
-			xsysd->xdevs[count++] = ipc_client_hmd_create(&ii->ipc_c, xtrack, i);
+		// Create the appropriate device type
+		if (entry->device_type == XRT_DEVICE_TYPE_HMD) {
+			xsysd->xdevs[count] = ipc_client_hmd_create(&ii->ipc_c, ictom, entry->id);
 		} else {
-			xsysd->xdevs[count++] = ipc_client_device_create(&ii->ipc_c, xtrack, i);
+			xsysd->xdevs[count] = ipc_client_device_create(&ii->ipc_c, ictom, entry->id);
+		}
+
+		// Check if device creation succeeded
+		if (xsysd->xdevs[count] != NULL) {
+			count++;
+		} else {
+			IPC_ERROR(&ii->ipc_c, "Failed to create device %u", i);
 		}
 	}
 	xsysd->xdev_count = count;

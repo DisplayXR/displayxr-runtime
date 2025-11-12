@@ -96,39 +96,6 @@ find_xdev_index(struct ipc_server *s, struct xrt_device *xdev)
 	return -1;
 }
 
-static void
-init_idev(struct ipc_device *idev, struct xrt_device *xdev)
-{
-	idev->xdev = xdev;
-}
-
-static void
-teardown_idev(struct ipc_device *idev)
-{
-	idev->xdev = NULL;
-}
-
-static void
-init_idevs(struct ipc_server *s)
-{
-	// Copy the devices over into the idevs array.
-	for (size_t i = 0; i < XRT_SYSTEM_MAX_DEVICES; i++) {
-		if (s->xsysd->xdevs[i] == NULL) {
-			continue;
-		}
-
-		init_idev(&s->idevs[i], s->xsysd->xdevs[i]);
-	}
-}
-
-static void
-teardown_idevs(struct ipc_server *s)
-{
-	for (size_t i = 0; i < XRT_SYSTEM_MAX_DEVICES; i++) {
-		teardown_idev(&s->idevs[i]);
-	}
-}
-
 
 /*
  *
@@ -202,8 +169,6 @@ teardown_all(struct ipc_server *s)
 
 	xrt_syscomp_destroy(&s->xsysc);
 
-	teardown_idevs(s);
-
 	xrt_space_overseer_destroy(&s->xso);
 	xrt_system_devices_destroy(&s->xsysd);
 	xrt_system_destroy(&s->xsys);
@@ -216,70 +181,6 @@ teardown_all(struct ipc_server *s)
 
 	// Destroyed last.
 	os_mutex_destroy(&s->global_state.lock);
-}
-
-static void
-init_tracking_origins(volatile struct ipc_client_state *ics)
-{
-	struct ipc_server *s = ics->server;
-
-	for (size_t i = 0; i < XRT_SYSTEM_MAX_DEVICES; i++) {
-		struct xrt_device *xdev = s->idevs[i].xdev;
-		if (xdev == NULL) {
-			continue;
-		}
-
-		struct xrt_tracking_origin *xtrack = xdev->tracking_origin;
-		assert(xtrack != NULL);
-
-		// Get or add tracking origin ID
-		uint32_t tracking_origin_id = 0;
-		xrt_result_t xret = ipc_server_objects_get_xtrack_id_or_add(ics, xtrack, &tracking_origin_id);
-		if (xret != XRT_SUCCESS) {
-			IPC_ERROR(s, "Failed to get/add tracking origin ID for: '%s'", xtrack->name);
-			continue;
-		}
-	}
-}
-
-static void
-handle_binding(struct ipc_shared_memory *ism,
-               struct xrt_binding_profile *xbp,
-               struct ipc_shared_binding_profile *isbp,
-               uint32_t *input_pair_index_ptr,
-               uint32_t *output_pair_index_ptr)
-{
-	uint32_t input_pair_index = *input_pair_index_ptr;
-	uint32_t output_pair_index = *output_pair_index_ptr;
-
-	isbp->name = xbp->name;
-
-	// Copy the initial state and also count the number in input_pairs.
-	uint32_t input_pair_start = input_pair_index;
-	for (size_t k = 0; k < xbp->input_count; k++) {
-		ism->input_pairs[input_pair_index++] = xbp->inputs[k];
-	}
-
-	// Setup the 'offsets' and number of input_pairs.
-	if (input_pair_start != input_pair_index) {
-		isbp->input_count = input_pair_index - input_pair_start;
-		isbp->first_input_index = input_pair_start;
-	}
-
-	// Copy the initial state and also count the number in outputs.
-	uint32_t output_pair_start = output_pair_index;
-	for (size_t k = 0; k < xbp->output_count; k++) {
-		ism->output_pairs[output_pair_index++] = xbp->outputs[k];
-	}
-
-	// Setup the 'offsets' and number of output_pairs.
-	if (output_pair_start != output_pair_index) {
-		isbp->output_count = output_pair_index - output_pair_start;
-		isbp->first_output_index = output_pair_start;
-	}
-
-	*input_pair_index_ptr = input_pair_index;
-	*output_pair_index_ptr = output_pair_index;
 }
 
 XRT_CHECK_RESULT static xrt_result_t
@@ -307,89 +208,35 @@ init_shm_and_instance_state(struct ipc_server *s, volatile struct ipc_client_sta
 }
 
 static void
-init_system_shm_state(struct ipc_server *s, volatile struct ipc_client_state *cs)
+init_system_shm_state(struct ipc_server *s, volatile struct ipc_client_state *ics)
 {
+	struct ipc_shared_memory *ism = get_ism(ics);
+	xrt_result_t xret = XRT_SUCCESS;
+
 	/*
-	 *
-	 * Setup the shared memory state.
-	 *
+	 * Loop over all of the devices to pre-populate the device IDs,
+	 * this also populates the tracking origins.
 	 */
-
-	uint32_t count = 0;
-	struct ipc_shared_memory *ism = s->isms[cs->server_thread_index];
-
-	// Tracking origins are no longer copied to shared memory.
-	// They are fetched on-demand via IPC calls.
-
-	count = 0;
-	uint32_t input_index = 0;
-	uint32_t output_index = 0;
-	uint32_t binding_index = 0;
-	uint32_t input_pair_index = 0;
-	uint32_t output_pair_index = 0;
-
 	for (size_t i = 0; i < XRT_SYSTEM_MAX_DEVICES; i++) {
-		struct xrt_device *xdev = s->idevs[i].xdev;
+		struct xrt_device *xdev = s->xsysd->xdevs[i];
 		if (xdev == NULL) {
 			continue;
 		}
 
-		struct ipc_shared_device *isdev = &ism->isdevs[count++];
-
-		isdev->name = xdev->name;
-		memcpy(isdev->str, xdev->str, sizeof(isdev->str));
-		memcpy(isdev->serial, xdev->serial, sizeof(isdev->serial));
-
-		// Copy information.
-		isdev->device_type = xdev->device_type;
-		isdev->supported = xdev->supported;
-
-		// Setup the tracking origin ID.
-		uint32_t tracking_origin_id = UINT32_MAX;
-		xrt_result_t xret =
-		    ipc_server_objects_get_xtrack_id_or_add(cs, xdev->tracking_origin, &tracking_origin_id);
-		assert(xret == XRT_SUCCESS);
-
-		isdev->tracking_origin_id = tracking_origin_id;
-
-		// Initial update.
-		xrt_device_update_inputs(xdev);
-
-		// Bindings
-		uint32_t binding_start = binding_index;
-		for (size_t k = 0; k < xdev->binding_profile_count; k++) {
-			handle_binding(ism, &xdev->binding_profiles[k], &ism->binding_profiles[binding_index++],
-			               &input_pair_index, &output_pair_index);
+		// Populate the tracking origin.
+		uint32_t tracking_origin_id = 0;
+		xret = ipc_server_objects_get_xtrack_id_or_add(ics, xdev->tracking_origin, &tracking_origin_id);
+		if (xret != XRT_SUCCESS) {
+			IPC_ERROR(s, "Failed to get/add tracking origin ID for: '%s'", xdev->tracking_origin->name);
+			continue;
 		}
 
-		// Setup the 'offsets' and number of bindings.
-		if (binding_start != binding_index) {
-			isdev->binding_profile_count = binding_index - binding_start;
-			isdev->first_binding_profile_index = binding_start;
-		}
-
-		// Copy the initial state and also count the number in inputs.
-		uint32_t input_start = input_index;
-		for (size_t k = 0; k < xdev->input_count; k++) {
-			ism->inputs[input_index++] = xdev->inputs[k];
-		}
-
-		// Setup the 'offsets' and number of inputs.
-		if (input_start != input_index) {
-			isdev->input_count = input_index - input_start;
-			isdev->first_input_index = input_start;
-		}
-
-		// Copy the initial state and also count the number in outputs.
-		uint32_t output_start = output_index;
-		for (size_t k = 0; k < xdev->output_count; k++) {
-			ism->outputs[output_index++] = xdev->outputs[k];
-		}
-
-		// Setup the 'offsets' and number of outputs.
-		if (output_start != output_index) {
-			isdev->output_count = output_index - output_start;
-			isdev->first_output_index = output_start;
+		// Populate the device.
+		uint32_t device_id = 0;
+		xret = ipc_server_objects_get_xdev_id_or_add(ics, xdev, &device_id);
+		if (xret != XRT_SUCCESS) {
+			IPC_ERROR(s, "Failed to get/add device ID for: '%s'", xdev->str);
+			continue;
 		}
 	}
 
@@ -412,9 +259,6 @@ init_system_shm_state(struct ipc_server *s, volatile struct ipc_client_state *cs
 		}
 		ism->hmd.blend_mode_count = xhmd->blend_mode_count;
 	}
-
-	// Finally tell the client how many devices we have.
-	ism->isdev_count = count;
 
 	// Assign all of the roles.
 	ism->roles.head = find_xdev_index(s, s->xsysd->static_roles.head);
@@ -818,14 +662,10 @@ ipc_server_init_system_if_available_locked(struct ipc_server *s,
 		if (available) {
 			xret = xrt_instance_create_system(s->xinst, &s->xsys, &s->xsysd, &s->xso, &s->xsysc);
 			IPC_CHK_WITH_GOTO(s, xret, "xrt_instance_create_system", error);
-
-			// Always succeeds.
-			init_idevs(s);
 		}
 	}
 
 	if (available && ics != NULL && !ics->has_init_shm_system) {
-		init_tracking_origins(ics);
 		init_system_shm_state(s, ics);
 		ics->has_init_shm_system = true;
 	}

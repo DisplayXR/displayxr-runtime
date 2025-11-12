@@ -44,7 +44,6 @@
 
 #define IPC_SHARED_MAX_INPUTS 1024
 #define IPC_SHARED_MAX_OUTPUTS 128
-#define IPC_SHARED_MAX_BINDINGS 64
 
 // example: v21.0.0-560-g586d33b5
 #define IPC_VERSION_NAME_LEN 64
@@ -102,31 +101,44 @@ struct ipc_tracking_origin_info
 };
 
 /*!
- * A binding in the shared memory area.
+ * Information about a device in the device list.
  *
  * @ingroup ipc
  */
-struct ipc_shared_binding_profile
+struct ipc_device_list_entry
 {
-	enum xrt_device_name name;
+	//! Device ID
+	uint32_t id;
 
-	//! Offset into the array of pairs where this input bindings starts.
-	uint32_t first_input_index;
-	//! Number of inputs.
-	uint32_t input_count;
-
-	//! Offset into the array of pairs where this output bindings starts.
-	uint32_t first_output_index;
-	//! Number of outputs.
-	uint32_t output_count;
+	//! Device type
+	enum xrt_device_type device_type;
 };
 
 /*!
- * A device in the shared memory area.
+ * List of devices available on the server.
  *
  * @ingroup ipc
  */
-struct ipc_shared_device
+struct ipc_device_list
+{
+	//! Number of devices
+	uint32_t device_count;
+
+	//! Device entries
+	struct ipc_device_list_entry devices[XRT_SYSTEM_MAX_DEVICES];
+};
+
+/*!
+ * Device information sent over IPC.
+ *
+ * Followed by varlen data containing:
+ * - An array of binding_profile_count * struct ipc_binding_profile_info
+ * - An array of total_input_pair_count * struct xrt_binding_input_pair
+ * - An array of total_output_pair_count * struct xrt_binding_output_pair
+ *
+ * @ingroup ipc
+ */
+struct ipc_device_info
 {
 	//! Enum identifier of the device.
 	enum xrt_device_name name;
@@ -141,23 +153,47 @@ struct ipc_shared_device
 	//! A unique identifier. Persistent across configurations, if possible.
 	char serial[XRT_DEVICE_NAME_LEN];
 
-	//! Number of bindings.
+	//! Number of binding profiles in varlen data.
 	uint32_t binding_profile_count;
-	//! 'Offset' into the array of bindings where the bindings starts.
-	uint32_t first_binding_profile_index;
+
+	//! Total number of input pairs in varlen data (across all binding profiles).
+	uint32_t total_input_pair_count;
+
+	//! Total number of output pairs in varlen data (across all binding profiles).
+	uint32_t total_output_pair_count;
 
 	//! Number of inputs.
 	uint32_t input_count;
-	//! 'Offset' into the array of inputs where the inputs starts.
+	//! 'Offset' into the shared memory array of inputs where the inputs start.
 	uint32_t first_input_index;
 
 	//! Number of outputs.
 	uint32_t output_count;
-	//! 'Offset' into the array of outputs where the outputs starts.
+	//! 'Offset' into the shared memory array of outputs where the outputs start.
 	uint32_t first_output_index;
 
 	//! The supported fields.
 	struct xrt_device_supported supported;
+};
+
+/*!
+ * A binding in the shared memory area.
+ *
+ * @ingroup ipc
+ */
+struct ipc_binding_profile_info
+{
+	enum xrt_device_name name;
+
+	//! Offset into the array of pairs where this input bindings starts.
+	uint32_t first_input_index;
+	//! Number of inputs.
+	uint32_t input_count;
+
+	//! Offset into the array of pairs where this output bindings starts.
+	uint32_t first_output_index;
+	//! Number of outputs.
+	uint32_t output_count;
 };
 
 /*!
@@ -221,18 +257,6 @@ struct ipc_shared_memory
 	char u_git_tag[IPC_VERSION_NAME_LEN];
 
 	/*!
-	 * Number of elements in @ref isdevs that are populated/valid.
-	 */
-	uint32_t isdev_count;
-
-	/*!
-	 * @brief Array of shared data per device.
-	 *
-	 * Only @ref isdev_count elements are populated/valid.
-	 */
-	struct ipc_shared_device isdevs[XRT_SYSTEM_MAX_DEVICES];
-
-	/*!
 	 * Various roles for the devices.
 	 */
 	struct
@@ -289,10 +313,6 @@ struct ipc_shared_memory
 	struct xrt_input inputs[IPC_SHARED_MAX_INPUTS];
 
 	struct xrt_output outputs[IPC_SHARED_MAX_OUTPUTS];
-
-	struct ipc_shared_binding_profile binding_profiles[IPC_SHARED_MAX_BINDINGS];
-	struct xrt_binding_input_pair input_pairs[IPC_SHARED_MAX_INPUTS];
-	struct xrt_binding_output_pair output_pairs[IPC_SHARED_MAX_OUTPUTS];
 
 	struct ipc_layer_slot slots[IPC_MAX_SLOTS];
 

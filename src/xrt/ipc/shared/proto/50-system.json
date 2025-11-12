@@ -40,6 +40,12 @@
 		]
 	},
 
+	"system_devices_get_list": {
+		"out": [
+			{"name": "device_list", "type": "struct ipc_device_list"}
+		]
+	},
+
 	"system_devices_get_roles": {
 		"out": [
 			{"name": "system_roles", "type": "struct xrt_system_roles"}

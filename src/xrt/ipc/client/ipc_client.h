@@ -135,10 +135,14 @@ ipc_client_create_native_compositor(struct xrt_system_compositor *xsysc,
                                     struct xrt_compositor_native **out_xcn);
 
 struct xrt_device *
-ipc_client_hmd_create(struct ipc_connection *ipc_c, struct xrt_tracking_origin *xtrack, uint32_t device_id);
+ipc_client_hmd_create(struct ipc_connection *ipc_c,
+                      struct ipc_client_tracking_origin_manager *ictom,
+                      uint32_t device_id);
 
 struct xrt_device *
-ipc_client_device_create(struct ipc_connection *ipc_c, struct xrt_tracking_origin *xtrack, uint32_t device_id);
+ipc_client_device_create(struct ipc_connection *ipc_c,
+                         struct ipc_client_tracking_origin_manager *ictom,
+                         uint32_t device_id);
 
 struct xrt_system *
 ipc_client_system_create(struct ipc_connection *ipc_c, struct xrt_system_compositor *xsysc);
