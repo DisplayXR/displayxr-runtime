@@ -150,6 +150,7 @@ struct solarxr_data_feed_update
 enum solarxr_data_feed_message_type
 {
 	SOLARXR_DATA_FEED_MESSAGE_POLL_DATA_FEED = 1,
+	SOLARXR_DATA_FEED_MESSAGE_START_DATA_FEED = 2,
 	SOLARXR_DATA_FEED_MESSAGE_DATA_FEED_UPDATE = 3,
 };
 
