@@ -1,5 +1,5 @@
 // Copyright 2022, Collabora, Ltd.
-// Copyright 2024-2025, NVIDIA CORPORATION.
+// Copyright 2024-2026, NVIDIA CORPORATION.
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
@@ -60,6 +60,14 @@ u_str_xrt_output_name_or_null(enum xrt_output_name name);
 const char *
 u_str_xrt_device_name_or_null(enum xrt_device_name name);
 
+/*!
+ * Returns a string of the result, or NULL if invalid.
+ *
+ * @ingroup aux_pretty
+ */
+const char *
+u_str_xrt_result_or_null(xrt_result_t xret);
+
 #define U_STR_NO_NULL(NAME, TYPE)                                                                                      \
 	static inline const char *NAME(TYPE enumerate)                                                                 \
 	{                                                                                                              \
@@ -70,6 +78,7 @@ u_str_xrt_device_name_or_null(enum xrt_device_name name);
 U_STR_NO_NULL(u_str_xrt_input_name, enum xrt_input_name)
 U_STR_NO_NULL(u_str_xrt_output_name, enum xrt_output_name)
 U_STR_NO_NULL(u_str_xrt_device_name, enum xrt_device_name)
+U_STR_NO_NULL(u_str_xrt_result, xrt_result_t)
 
 #undef U_STR_NO_NULL
 

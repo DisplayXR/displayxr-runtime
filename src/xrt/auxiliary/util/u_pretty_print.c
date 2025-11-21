@@ -1,5 +1,5 @@
 // Copyright 2022-2024, Collabora, Ltd.
-// Copyright 2025, NVIDIA CORPORATION.
+// Copyright 2025-2026, NVIDIA CORPORATION.
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
@@ -9,6 +9,7 @@
  * @ingroup aux_pretty
  */
 
+#include "xrt/xrt_macro_lists.h"
 #include "util/u_misc.h"
 #include "util/u_pretty_print.h"
 
@@ -24,6 +25,10 @@
  * Internal helpers.
  *
  */
+
+// clang-format off
+#define X_MACRO_ENUM_CASE_RETURN_STRING(NAME) case NAME: return #NAME;
+// clang-format on
 
 #define DG(str) (dg.func(dg.ptr, str, strlen(str)))
 
@@ -135,6 +140,17 @@ u_str_xrt_device_name_or_null(enum xrt_device_name name)
 	return NULL;
 }
 
+const char *
+u_str_xrt_result_or_null(xrt_result_t xret)
+{
+	// No default case so we get warnings of missing entries.
+	switch (xret) {
+		XRT_RESULT_LIST(X_MACRO_ENUM_CASE_RETURN_STRING)
+	}
+
+	return NULL;
+}
+
 
 /*
  *
@@ -220,59 +236,13 @@ u_pp_xrt_output_name(struct u_pp_delegate dg, enum xrt_output_name name)
 void
 u_pp_xrt_result(struct u_pp_delegate dg, xrt_result_t xret)
 {
-	// clang-format off
-	switch (xret) {
-	case XRT_SUCCESS:                                    DG("XRT_SUCCESS"); return;
-	case XRT_TIMEOUT:                                    DG("XRT_TIMEOUT"); return;
-	case XRT_SPACE_BOUNDS_UNAVAILABLE:                   DG("XRT_SPACE_BOUNDS_UNAVAILABLE"); return;
-	case XRT_ERROR_IPC_FAILURE:                          DG("XRT_ERROR_IPC_FAILURE"); return;
-	case XRT_ERROR_NO_IMAGE_AVAILABLE:                   DG("XRT_ERROR_NO_IMAGE_AVAILABLE"); return;
-	case XRT_ERROR_VULKAN:                               DG("XRT_ERROR_VULKAN"); return;
-	case XRT_ERROR_OPENGL:                               DG("XRT_ERROR_OPENGL"); return;
-	case XRT_ERROR_FAILED_TO_SUBMIT_VULKAN_COMMANDS:     DG("XRT_ERROR_FAILED_TO_SUBMIT_VULKAN_COMMANDS"); return;
-	case XRT_ERROR_SWAPCHAIN_FLAG_VALID_BUT_UNSUPPORTED: DG("XRT_ERROR_SWAPCHAIN_FLAG_VALID_BUT_UNSUPPORTED"); return;
-	case XRT_ERROR_ALLOCATION:                           DG("XRT_ERROR_ALLOCATION"); return;
-	case XRT_ERROR_POSE_NOT_ACTIVE:                      DG("XRT_ERROR_POSE_NOT_ACTIVE"); return;
-	case XRT_ERROR_FENCE_CREATE_FAILED:                  DG("XRT_ERROR_FENCE_CREATE_FAILED"); return;
-	case XRT_ERROR_NATIVE_HANDLE_FENCE_ERROR:            DG("XRT_ERROR_NATIVE_HANDLE_FENCE_ERROR"); return;
-	case XRT_ERROR_MULTI_SESSION_NOT_IMPLEMENTED:        DG("XRT_ERROR_MULTI_SESSION_NOT_IMPLEMENTED"); return;
-	case XRT_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED:         DG("XRT_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED"); return;
-	case XRT_ERROR_EGL_CONFIG_MISSING:                   DG("XRT_ERROR_EGL_CONFIG_MISSING"); return;
-	case XRT_ERROR_THREADING_INIT_FAILURE:               DG("XRT_ERROR_THREADING_INIT_FAILURE"); return;
-	case XRT_ERROR_IPC_SESSION_NOT_CREATED:              DG("XRT_ERROR_IPC_SESSION_NOT_CREATED"); return;
-	case XRT_ERROR_IPC_SESSION_ALREADY_CREATED:          DG("XRT_ERROR_IPC_SESSION_ALREADY_CREATED"); return;
-	case XRT_ERROR_PROBER_NOT_SUPPORTED:                 DG("XRT_ERROR_PROBER_NOT_SUPPORTED"); return;
-	case XRT_ERROR_PROBER_CREATION_FAILED:               DG("XRT_ERROR_PROBER_CREATION_FAILED"); return;
-	case XRT_ERROR_PROBER_LIST_LOCKED:                   DG("XRT_ERROR_PROBER_LIST_LOCKED"); return;
-	case XRT_ERROR_PROBER_LIST_NOT_LOCKED:               DG("XRT_ERROR_PROBER_LIST_NOT_LOCKED"); return;
-	case XRT_ERROR_PROBING_FAILED:                       DG("XRT_ERROR_PROBING_FAILED"); return;
-	case XRT_ERROR_DEVICE_CREATION_FAILED:               DG("XRT_ERROR_DEVICE_CREATION_FAILED"); return;
-	case XRT_ERROR_D3D:                                  DG("XRT_ERROR_D3D"); return;
-	case XRT_ERROR_D3D11:                                DG("XRT_ERROR_D3D11"); return;
-	case XRT_ERROR_D3D12:                                DG("XRT_ERROR_D3D12"); return;
-	case XRT_ERROR_RECENTERING_NOT_SUPPORTED:            DG("XRT_ERROR_RECENTERING_NOT_SUPPORTED"); return;
-	case XRT_ERROR_COMPOSITOR_NOT_SUPPORTED:             DG("XRT_ERROR_COMPOSITOR_NOT_SUPPORTED"); return;
-	case XRT_ERROR_IPC_COMPOSITOR_NOT_CREATED:           DG("XRT_ERROR_IPC_COMPOSITOR_NOT_CREATED"); return;
-	case XRT_ERROR_NOT_IMPLEMENTED:                      DG("XRT_ERROR_NOT_IMPLEMENTED"); return;
-	case XRT_ERROR_UNSUPPORTED_SPACE_TYPE:               DG("XRT_ERROR_UNSUPPORTED_SPACE_TYPE"); return;
-	case XRT_ERROR_ANDROID:                              DG("XRT_ERROR_ANDROID"); return;
-	case XRT_ERROR_FEATURE_NOT_SUPPORTED:                DG("XRT_ERROR_FEATURE_NOT_SUPPORTED"); return;
-	case XRT_ERROR_INPUT_UNSUPPORTED:                    DG("XRT_ERROR_INPUT_UNSUPPORTED"); return;
-	case XRT_ERROR_OUTPUT_UNSUPPORTED:                   DG("XRT_ERROR_OUTPUT_UNSUPPORTED"); return;
-	case XRT_ERROR_OUTPUT_REQUEST_FAILURE:               DG("XRT_ERROR_OUTPUT_REQUEST_FAILURE"); return;
-	case XRT_ERROR_SYNC_PRIMITIVE_CREATION_FAILED:       DG("XRT_ERROR_SYNC_PRIMITIVE_CREATION_FAILED"); return;
-	case XRT_ERROR_IPC_SERVICE_ALREADY_RUNNING:          DG("XRT_ERROR_IPC_SERVICE_ALREADY_RUNNING"); return;
-	case XRT_ERROR_IPC_MAINLOOP_FAILED_TO_INIT:          DG("XRT_ERROR_IPC_MAINLOOP_FAILED_TO_INIT"); return;
-	case XRT_ERROR_INVALID_ARGUMENT:                     DG("XRT_ERROR_INVALID_ARGUMENT"); return;
-	case XRT_OPERATION_CANCELLED:                        DG("XRT_OPERATION_CANCELLED"); return;
-	case XRT_ERROR_FUTURE_RESULT_NOT_READY:              DG("XRT_ERROR_FUTURE_RESULT_NOT_READY"); return;
-	case XRT_ERROR_FUTURE_ALREADY_COMPLETE:              DG("XRT_ERROR_FUTURE_ALREADY_COMPLETE"); return;
-	case XRT_ERROR_DEVICE_NOT_ATTACHABLE:                DG("XRT_ERROR_DEVICE_NOT_ATTACHABLE"); return;
+	const char *might_be_null = u_str_xrt_result_or_null(xret);
+	if (might_be_null != NULL) {
+		DG(might_be_null);
+		return;
 	}
-	// clang-format on
 
 	/*
-	 * No default case so we get warnings of missing entries.
 	 * Invalid values handled below.
 	 */
 
