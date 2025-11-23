@@ -290,6 +290,7 @@ static xrt_result_t
 psvr2_hmd_get_view_poses(struct xrt_device *xdev,
                          const struct xrt_vec3 *default_eye_relation,
                          int64_t at_timestamp_ns,
+                         enum xrt_view_type view_type,
                          uint32_t view_count,
                          struct xrt_space_relation *out_head_relation,
                          struct xrt_fov *out_fovs,
@@ -308,8 +309,8 @@ psvr2_hmd_get_view_poses(struct xrt_device *xdev,
 	struct xrt_vec3 eye_relation = *default_eye_relation;
 	eye_relation.x = hmd->info.lens_horizontal_separation_meters;
 
-	return u_device_get_view_poses(xdev, &eye_relation, at_timestamp_ns, view_count, out_head_relation, out_fovs,
-	                               out_poses);
+	return u_device_get_view_poses(xdev, &eye_relation, at_timestamp_ns, view_type, view_count, out_head_relation,
+	                               out_fovs, out_poses);
 }
 
 void
