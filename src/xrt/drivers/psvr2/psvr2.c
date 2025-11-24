@@ -684,12 +684,14 @@ psvr2_usb_thread(void *ptr)
 	return NULL;
 }
 
-struct
+struct psvr2_interface_info
 {
 	int interface_no;
 	int altmode;
 	const char *name;
-} interface_list[] = {
+};
+
+struct psvr2_interface_info interface_list[] = {
     {.interface_no = PSVR2_STATUS_INTERFACE, .altmode = 1, .name = "status"},
     {.interface_no = PSVR2_SLAM_INTERFACE, .altmode = 0, .name = "SLAM"},
     {.interface_no = PSVR2_CAMERA_INTERFACE, .altmode = 0, .name = "Camera"},
@@ -1065,72 +1067,46 @@ update_brightness(struct psvr2_hmd *hmd)
 	(void)set_brightness(hmd, hmd->brightness);
 }
 
+#define TRANSFERS_LIST(_, hmd)                                                                                         \
+	for (int i = 0; i < NUM_CAM_XFERS; i++) {                                                                      \
+		_(hmd->camera_xfers[i])                                                                                \
+	}                                                                                                              \
+	_(hmd->status_xfer)                                                                                            \
+	_(hmd->slam_xfer)                                                                                              \
+	_(hmd->led_detector_xfer)                                                                                      \
+	_(hmd->relocalizer_xfer)                                                                                       \
+	_(hmd->vd_xfer)
+
 static void
 psvr2_usb_stop(struct psvr2_hmd *hmd)
 {
 	int ret;
 
-	os_mutex_lock(&hmd->data_lock);
-	if (hmd->vd_xfer) {
-		ret = libusb_cancel_transfer(hmd->vd_xfer);
-		assert(ret == 0 || ret == LIBUSB_ERROR_NOT_FOUND);
-	}
-	if (hmd->relocalizer_xfer) {
-		ret = libusb_cancel_transfer(hmd->relocalizer_xfer);
-		assert(ret == 0 || ret == LIBUSB_ERROR_NOT_FOUND);
-	}
-	if (hmd->led_detector_xfer) {
-		ret = libusb_cancel_transfer(hmd->led_detector_xfer);
-		assert(ret == 0 || ret == LIBUSB_ERROR_NOT_FOUND);
-	}
-	for (int i = 0; i < NUM_CAM_XFERS; i++) {
-		if (hmd->camera_xfers[i]) {
-			ret = libusb_cancel_transfer(hmd->camera_xfers[i]);
-			assert(ret == 0 || ret == LIBUSB_ERROR_NOT_FOUND);
-		}
-	}
-	if (hmd->slam_xfer) {
-		ret = libusb_cancel_transfer(hmd->slam_xfer);
-		assert(ret == 0 || ret == LIBUSB_ERROR_NOT_FOUND);
-	}
-	if (hmd->status_xfer) {
-		ret = libusb_cancel_transfer(hmd->status_xfer);
-		assert(ret == 0 || ret == LIBUSB_ERROR_NOT_FOUND);
+#define X(xfer)                                                                                                        \
+	if (xfer) {                                                                                                    \
+		ret = libusb_cancel_transfer(xfer);                                                                    \
+		assert(ret == 0 || ret == LIBUSB_ERROR_NOT_FOUND);                                                     \
 	}
 
+	os_mutex_lock(&hmd->data_lock);
+	TRANSFERS_LIST(X, hmd);
 	os_mutex_unlock(&hmd->data_lock);
+
+#undef X
 }
 
 void
 psvr2_usb_destroy(struct psvr2_hmd *hmd)
 {
-	// All transfers are stopped and can be freed now
-	if (hmd->status_xfer) {
-		libusb_free_transfer(hmd->status_xfer);
-		hmd->status_xfer = NULL;
+#define X(xfer)                                                                                                        \
+	if (xfer) {                                                                                                    \
+		libusb_free_transfer(xfer);                                                                            \
+		xfer = NULL;                                                                                           \
 	}
-	for (int i = 0; i < NUM_CAM_XFERS; i++) {
-		if (hmd->camera_xfers[i]) {
-			libusb_free_transfer(hmd->camera_xfers[i]);
-			hmd->camera_xfers[i] = NULL;
-		}
-	}
-	if (hmd->slam_xfer) {
-		libusb_free_transfer(hmd->slam_xfer);
-		hmd->slam_xfer = NULL;
-	}
-	if (hmd->led_detector_xfer) {
-		libusb_free_transfer(hmd->led_detector_xfer);
-		hmd->slam_xfer = NULL;
-	}
-	if (hmd->relocalizer_xfer) {
-		libusb_free_transfer(hmd->relocalizer_xfer);
-		hmd->slam_xfer = NULL;
-	}
-	if (hmd->vd_xfer) {
-		libusb_free_transfer(hmd->vd_xfer);
-		hmd->slam_xfer = NULL;
-	}
+
+	TRANSFERS_LIST(X, hmd);
+
+#undef X
 }
 
 struct distortion_calibration_block
