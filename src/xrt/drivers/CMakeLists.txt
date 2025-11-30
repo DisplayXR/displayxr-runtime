@@ -221,6 +221,7 @@ if(XRT_BUILD_DRIVER_PSVR2)
 		psvr2/psvr2_prober.c
 		psvr2/psvr2_protocol.h
 		psvr2/psvr2_distortion.c
+		psvr2/psvr2_eye.c
 		)
 	target_link_libraries(
 		drv_psvr2

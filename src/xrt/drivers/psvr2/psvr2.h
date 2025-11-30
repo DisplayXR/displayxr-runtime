@@ -68,6 +68,104 @@ extern "C" {
 
 #define TIMESTAMP_SAMPLES 100
 
+struct imu_record
+{
+	uint32_t vts_us;
+	int16_t accel[3];
+	int16_t gyro[3];
+	uint16_t dp_frame_cnt;
+	uint16_t dp_line_cnt;
+	uint16_t imu_ts_us;
+	uint16_t status;
+};
+
+struct psvr2_et_eye_data
+{
+	bool gaze_point_valid;
+	// gaze point in meters
+	struct xrt_vec3 gaze_point;
+
+	bool gaze_direction_valid;
+	// gaze direction (normalized vector)
+	struct xrt_vec3 gaze_direction;
+
+	struct m_filter_euro_vec3 gaze_direction_filter;
+	struct xrt_vec3 filtered_gaze_direction;
+
+	// whether the pupil diameter is valid
+	bool pupil_diameter_valid;
+	// pupil diameter in meters
+	float pupil_diameter;
+
+	bool unk_float_2_valid;
+	struct xrt_vec2 unk_float_2;
+
+	bool unk_float_4_valid;
+	struct xrt_vec2 unk_float_4;
+
+	// whether the blink state is valid
+	bool blink_valid;
+	// whether the user is blinking
+	bool blink;
+
+	float blink_interp;
+};
+
+struct psvr2_et_combined_data
+{
+	bool gaze_point_valid;
+	// gaze point in meters
+	struct xrt_vec3 gaze_point;
+
+	bool gaze_direction_valid;
+	// gaze direction (normalized vector)
+	struct xrt_vec3 gaze_direction;
+
+	struct m_filter_euro_vec3 gaze_direction_filter;
+	struct xrt_vec3 filtered_gaze_direction;
+
+	bool is_valid;
+
+	bool unk_float_8_valid;
+	float unk_float_8;
+
+	bool unk_float3_pair_valid;
+	struct xrt_vec3 unk_float_12;
+	struct xrt_vec3 unk_float_15;
+	struct xrt_vec3 unk_float_18;
+};
+
+struct psvr2_et_data
+{
+	struct os_thread_helper eye_tracking_thread;
+
+	//! Whether eye tracking is currently enabled
+	bool want_enabled;
+	bool force_enable;
+
+	//! Whether the eye tracking enable command has been sent
+	bool enabled;
+
+	struct m_relation_history *gaze_relation_history;
+
+	struct os_mutex data_mutex;
+	bool data_mutex_created;
+
+	struct psvr2_et_eye_data eyes[2];
+	struct psvr2_et_combined_data combined;
+
+	bool processed_sample_packet;
+
+	uint32_t last_remote_report_sample_time_us;
+	timepoint_ns last_remote_report_sample_time_ns;
+
+	bool unk_float_4_valid;
+	float unk_float_4;
+
+	bool unk_float_5_valid;
+	float unk_float_5;
+};
+
 /*!
  * PSVR2 HMD device
  *
@@ -163,6 +261,12 @@ struct psvr2_hmd
 	/* Tracking state */
 	struct m_relation_history *slam_relation_history;
 	struct m_ff_vec3_f32 *ff_gyro;
+
+	/* Eye State */
+	bool eye_feature_enabled;
+	bool face_feature_enabled;
+
+	struct psvr2_et_data et_data;
 };
 
 /// Casting helper function
@@ -176,6 +280,10 @@ enum psvr2_hmd_input_name
 {
 	PSVR2_HMD_INPUT_HEAD_POSE,
 	PSVR2_HMD_INPUT_FUNCTION_BUTTON,
+	PSVR2_HMD_INPUT_EYE_GAZE_POSE,
+	PSVR2_HMD_INPUT_FB_FACE_TRACKING2_VISUAL,
+	PSVR2_HMD_INPUT_HTC_EYE_FACE_TRACKING,
+	PSVR2_HMD_INPUT_ANDROID_FACE_TRACKING,
 	PSVR2_HMD_INPUT_COUNT,
 };
 
@@ -188,6 +296,18 @@ psvr2_usb_xfer_continue(struct libusb_transfer *xfer, const char *type);
 
 bool
 send_psvr2_control(struct psvr2_hmd *hmd, uint16_t report_id, uint8_t subcmd, uint8_t *pkt_data, uint32_t pkt_len);
+
+void
+psvr2_free_et_data(struct psvr2_hmd *hmd);
+
+int
+psvr2_start_gaze_tracking(struct psvr2_hmd *hmd);
+
+xrt_result_t
+psvr2_get_face_tracking(struct xrt_device *xdev,
+                        enum xrt_input_name facial_expression_type,
+                        int64_t at_timestamp_ns,
+                        struct xrt_facial_expression_set *out_value);
 
 #ifdef __cplusplus
 }

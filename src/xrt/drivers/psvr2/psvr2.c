@@ -77,6 +77,8 @@ psvr2_hmd_destroy(struct xrt_device *xdev)
 {
 	struct psvr2_hmd *hmd = psvr2_hmd(xdev);
 
+	psvr2_free_et_data(hmd);
+
 	os_thread_helper_lock(&hmd->usb_thread);
 	hmd->usb_complete = 1;
 	os_thread_helper_unlock(&hmd->usb_thread);
@@ -163,7 +165,8 @@ psvr2_hmd_get_tracked_pose(struct xrt_device *xdev,
 	struct psvr2_hmd *hmd = psvr2_hmd(xdev);
 
 	switch (name) {
-	case XRT_INPUT_GENERIC_HEAD_POSE: break;
+	case XRT_INPUT_GENERIC_HEAD_POSE:
+	case XRT_INPUT_GENERIC_EYE_GAZE_POSE: break;
 	default: PSVR2_ERROR(hmd, "unknown input name"); return XRT_ERROR_INPUT_UNSUPPORTED;
 	}
 
@@ -175,11 +178,15 @@ psvr2_hmd_get_tracked_pose(struct xrt_device *xdev,
 		return XRT_SUCCESS;
 	}
 
-	// Estimate pose at timestamp at_timestamp_ns
-	timepoint_ns prediction_ns_mono = at_timestamp_ns - hmd->system_zero_ns;
-	timepoint_ns prediction_ns_hw = prediction_ns_mono - hmd->hw2mono_vts;
+	timepoint_ns prediction_ns_hw = at_timestamp_ns - hmd->hw2mono_vts;
 
 	struct xrt_relation_chain chain = {0};
+
+	// Push the eye pose before the head pose if required, so that we're returning the gaze relative to the head
+	if (name == XRT_INPUT_GENERIC_EYE_GAZE_POSE) {
+		m_relation_history_get(hmd->et_data.gaze_relation_history, prediction_ns_hw,
+		                       m_relation_chain_reserve(&chain));
+	}
 
 	// Push the SLAM->head offset
 	m_relation_chain_push_pose(&chain, &hmd->T_imu_head);
@@ -959,6 +966,11 @@ psvr2_usb_start(struct psvr2_hmd *hmd)
 	}
 	hmd->usb_active_xfers++;
 
+	res = psvr2_start_gaze_tracking(hmd);
+	if (res < 0) {
+		PSVR2_ERROR(hmd, "Could not start gaze tracking");
+		goto out;
+	}
 
 	result = true;
 
@@ -1097,6 +1109,42 @@ psvr2_setup_distortion_and_fovs(struct psvr2_hmd *hmd)
 	fovs[1].angle_right = -fovs[0].angle_left;
 }
 
+static xrt_result_t
+psvr2_begin_feature(struct xrt_device *xdev, enum xrt_device_feature_type type)
+{
+	struct psvr2_hmd *hmd = psvr2_hmd(xdev);
+
+	switch (type) {
+	case XRT_DEVICE_FEATURE_EYE_TRACKING: hmd->eye_feature_enabled = true; break;
+	case XRT_DEVICE_FEATURE_FACE_TRACKING: hmd->face_feature_enabled = true; break;
+	default: return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+
+	if (hmd->eye_feature_enabled || hmd->face_feature_enabled) {
+		hmd->et_data.want_enabled = true;
+	}
+
+	return XRT_SUCCESS;
+}
+
+static xrt_result_t
+psvr2_end_feature(struct xrt_device *xdev, enum xrt_device_feature_type type)
+{
+	struct psvr2_hmd *hmd = psvr2_hmd(xdev);
+
+	switch (type) {
+	case XRT_DEVICE_FEATURE_EYE_TRACKING: hmd->eye_feature_enabled = false; break;
+	case XRT_DEVICE_FEATURE_FACE_TRACKING: hmd->face_feature_enabled = false; break;
+	default: return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+
+	if (!hmd->eye_feature_enabled && !hmd->face_feature_enabled) {
+		hmd->et_data.want_enabled = false;
+	}
+
+	return XRT_SUCCESS;
+}
+
 static struct xrt_binding_input_pair vive_pro_inputs_psvr2[] = {
     {XRT_INPUT_VIVEPRO_SYSTEM_CLICK, XRT_INPUT_PSVR2_SYSTEM_CLICK},
 };
@@ -1105,7 +1153,16 @@ static struct xrt_binding_input_pair blubur_s1_inputs_psvr2[] = {
     {XRT_INPUT_BLUBUR_S1_MENU_CLICK, XRT_INPUT_PSVR2_SYSTEM_CLICK},
 };
 
+static struct xrt_binding_input_pair eye_gaze_inputs_psvr2[] = {
+    {XRT_INPUT_GENERIC_EYE_GAZE_POSE, XRT_INPUT_GENERIC_EYE_GAZE_POSE},
+};
+
 static struct xrt_binding_profile psvr2_binding_profiles[] = {
+    {
+        .name = XRT_DEVICE_EYE_GAZE_INTERACTION,
+        .inputs = eye_gaze_inputs_psvr2,
+        .input_count = ARRAY_SIZE(eye_gaze_inputs_psvr2),
+    },
     {
         .name = XRT_DEVICE_VIVE_PRO,
         .inputs = vive_pro_inputs_psvr2,
@@ -1163,6 +1220,9 @@ psvr2_hmd_create(struct xrt_prober_device *xpdev)
 	hmd->base.set_brightness = psvr2_set_brightness;
 	hmd->base.set_output = psvr2_hmd_set_output;
 	hmd->base.get_compositor_info = psvr2_hmd_get_compositor_info;
+	hmd->base.begin_feature = psvr2_begin_feature;
+	hmd->base.end_feature = psvr2_end_feature;
+	hmd->base.get_face_tracking = psvr2_get_face_tracking;
 
 	hmd->pose = (struct xrt_pose)XRT_POSE_IDENTITY;
 	hmd->log_level = debug_get_log_option_psvr2_log();
@@ -1182,6 +1242,10 @@ psvr2_hmd_create(struct xrt_prober_device *xpdev)
 	hmd->base.device_type = XRT_DEVICE_TYPE_HMD;
 	hmd->base.inputs[PSVR2_HMD_INPUT_HEAD_POSE].name = XRT_INPUT_GENERIC_HEAD_POSE;
 	hmd->base.inputs[PSVR2_HMD_INPUT_FUNCTION_BUTTON].name = XRT_INPUT_PSVR2_SYSTEM_CLICK;
+	hmd->base.inputs[PSVR2_HMD_INPUT_EYE_GAZE_POSE].name = XRT_INPUT_GENERIC_EYE_GAZE_POSE;
+	hmd->base.inputs[PSVR2_HMD_INPUT_FB_FACE_TRACKING2_VISUAL].name = XRT_INPUT_FB_FACE_TRACKING2_VISUAL;
+	hmd->base.inputs[PSVR2_HMD_INPUT_HTC_EYE_FACE_TRACKING].name = XRT_INPUT_HTC_EYE_FACE_TRACKING;
+	hmd->base.inputs[PSVR2_HMD_INPUT_ANDROID_FACE_TRACKING].name = XRT_INPUT_ANDROID_FACE_TRACKING;
 
 	hmd->base.outputs[0].name = XRT_OUTPUT_NAME_PSVR2_HAPTIC;
 
@@ -1193,6 +1257,8 @@ psvr2_hmd_create(struct xrt_prober_device *xpdev)
 	hmd->base.supported.presence = true;
 	hmd->base.supported.brightness_control = true;
 	hmd->base.supported.compositor_info = true;
+	hmd->base.supported.eye_gaze = true;
+	hmd->base.supported.face_tracking = true;
 
 	// Set up display details
 	// refresh rate

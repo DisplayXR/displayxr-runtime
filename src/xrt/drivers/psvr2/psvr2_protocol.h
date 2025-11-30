@@ -72,59 +72,6 @@ enum psvr2_set_peripheral_subcommand
 	PSVR2_SET_PERIPHERAL_SUBCMD_MOTOR = 0x01,
 };
 
-struct imu_record
-{
-	uint32_t vts_us;
-	int16_t accel[3];
-	int16_t gyro[3];
-	uint16_t dp_frame_cnt;
-	uint16_t dp_line_cnt;
-	uint16_t imu_ts_us;
-	uint16_t status;
-};
-
-struct imu_usb_record
-{
-	__le32 vts_us;
-	__le16 accel[3];
-	__le16 gyro[3];
-	__le16 dp_frame_cnt;
-	__le16 dp_line_cnt;
-	__le16 imu_ts_us;
-	__le16 status;
-} __attribute__((packed));
-
-struct status_record_hdr
-{
-	uint8_t dprx_status;      //< 0 = not ready. 2 = cinematic? and 1 = unknown. HDCP? Other?
-	uint8_t prox_sensor_flag; //< 0 = not triggered. 1 = triggered?
-	uint8_t function_button;  //< 0 = not pressed, 1 = pressed
-	uint8_t empty0[2];
-	uint8_t ipd_dial_mm; //< 59 to 72mm
-
-	uint8_t remainder[26];
-} __attribute__((packed));
-
-struct slam_usb_record
-{
-	char SLAhdr[3];    //< "SLA"
-	uint8_t const1;    //< Constant 0x01?
-	__le32 pkt_size;   //< 0x0200 = 512 bytes;
-	__le32 vts_ts_us;  //< Timestamp
-	__le32 unknown1;   //< Unknown. Constant 3?
-	__lef32 pos[3];    //< 32-bit floats
-	__lef32 orient[4]; //< Orientation quaternion
-	uint8_t remainder[468];
-} __attribute__((packed));
-
-struct sie_ctrl_pkt
-{
-	__le16 report_id;
-	__le16 subcmd;
-	__le32 len;
-	uint8_t data[512 - 8];
-} __attribute__((packed));
-
 enum psvr2_camera_mode
 {
 	PSVR2_CAMERA_MODE_OFF = 0,
@@ -163,3 +110,136 @@ enum psvr2_camera_mode
 	// right/bottom)
 	PSVR2_CAMERA_MODE_BOTTOM_SBS_BC4 = 0x10,
 };
+
+#pragma pack(push, 1)
+
+struct imu_usb_record
+{
+	__le32 vts_us;
+	__le16 accel[3];
+	__le16 gyro[3];
+	__le16 dp_frame_cnt;
+	__le16 dp_line_cnt;
+	__le16 imu_ts_us;
+	__le16 status;
+};
+
+struct status_record_hdr
+{
+	uint8_t dprx_status;      //< 0 = not ready. 2 = cinematic? and 1 = unknown. HDCP? Other?
+	uint8_t prox_sensor_flag; //< 0 = not triggered. 1 = triggered?
+	uint8_t function_button;  //< 0 = not pressed, 1 = pressed
+	uint8_t empty0[2];
+	uint8_t ipd_dial_mm; //< 59 to 72mm
+
+	uint8_t remainder[26];
+};
+
+struct slam_usb_record
+{
+	char SLAhdr[3];    //< "SLA"
+	uint8_t const1;    //< Constant 0x01?
+	__le32 pkt_size;   //< 0x0200 = 512 bytes;
+	__le32 vts_ts_us;  //< Timestamp
+	__le32 unknown1;   //< Unknown. Constant 3?
+	__lef32 pos[3];    //< 32-bit floats
+	__lef32 orient[4]; //< Orientation quaternion
+	uint8_t remainder[468];
+};
+
+struct sie_ctrl_pkt
+{
+	__le16 report_id;
+	__le16 subcmd;
+	__le32 len;
+	uint8_t data[512 - 8];
+};
+
+typedef uint32_t psvr2_eye_bool;
+
+struct pkt_eye_gaze
+{
+	psvr2_eye_bool gaze_point_mm_valid;
+	struct __levec3 gaze_point_mm;
+
+	psvr2_eye_bool gaze_direction_valid;
+	struct __levec3 gaze_direction;
+
+	psvr2_eye_bool pupil_diameter_valid;
+	__lef32 pupil_diameter_mm;
+
+	psvr2_eye_bool unk_bool_2;
+	struct __levec2 unk_float_2;
+
+	psvr2_eye_bool unk_bool_3;
+	struct __levec2 unk_float_4;
+
+	psvr2_eye_bool blink_valid;
+	psvr2_eye_bool blink;
+};
+
+struct pkt_gaze_combined
+{
+	psvr2_eye_bool gaze_point_valid;
+	struct __levec3 gaze_point_3d; // unclear what this denotes precisely
+
+	psvr2_eye_bool normalized_gaze_valid;
+	struct __levec3 normalized_gaze;
+
+	psvr2_eye_bool is_valid;
+	__le32 timestamp;
+
+	psvr2_eye_bool unk_bool_7;
+	__lef32 unk_float_8;
+
+	psvr2_eye_bool unk_bool_9;
+	struct __levec3 unk_float_12;
+	struct __levec3 unk_float_15;
+	struct __levec3 unk_float_18;
+};
+
+struct pkt_gaze_packet_data
+{
+	__le32 size;
+	__le32 unk_1;
+	__le32 unk_2;
+	__le32 unk_3_const;
+
+	__le32 timestamp_1;
+	__le32 timestamp_2;
+	__le32 timestamp_3;
+
+	// unknown garbage
+	psvr2_eye_bool unk_bool_1;
+	__lef32 unk_float_1;
+	psvr2_eye_bool unk_bool_2;
+	psvr2_eye_bool unk_bool_3;
+	__lef32 unk_float_2;
+	psvr2_eye_bool unk_bool_4;
+	psvr2_eye_bool unk_bool_5;
+	psvr2_eye_bool unk_bool_6;
+	psvr2_eye_bool unk_bool_7;
+	psvr2_eye_bool unk_bool_8;
+	__lef32 unk_float_3;
+
+	// openness?
+	psvr2_eye_bool unk_bool_9;
+	__lef32 unk_float_4;
+
+	psvr2_eye_bool unk_bool_10;
+	__lef32 unk_float_5;
+
+	struct pkt_eye_gaze left;
+	struct pkt_eye_gaze right;
+	struct pkt_gaze_combined combined;
+};
+
+struct pkt_gaze_state
+{
+	uint8_t header[2]; // 0000
+	__le16 version;    // 0002
+
+	struct pkt_gaze_packet_data packet_data;
+};
+
+#pragma pack(pop)
