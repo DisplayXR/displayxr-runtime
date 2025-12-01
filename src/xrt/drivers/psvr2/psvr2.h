@@ -66,6 +66,8 @@ extern "C" {
 #define PSVR2_WARN(p, ...) U_LOG_XDEV_IFL_W(&p->base, p->log_level, __VA_ARGS__)
 #define PSVR2_ERROR(p, ...) U_LOG_XDEV_IFL_E(&p->base, p->log_level, __VA_ARGS__)
 
+#define TIMESTAMP_SAMPLES 100
+
 /*!
  * PSVR2 HMD device
  *
@@ -98,13 +100,13 @@ struct psvr2_hmd
 	float brightness;
 
 	/* IMU input data */
-	uint32_t last_vts_us;       //< Last VTS timestamp, in microseconds
+	uint32_t last_imu_vts_us;   //< Last VTS timestamp, in microseconds
 	uint16_t last_imu_ts;       //< Last IMU timestamp, in microseconds
 	struct xrt_vec3 last_gyro;  //< Last gyro reading, in rad/s
 	struct xrt_vec3 last_accel; //< Last accel reading, in m/s²
 
 	/* SLAM input data */
-	uint32_t last_slam_ts_us;       //< Last slam timestamp, in microseconds
+	uint32_t last_slam_vts_us;      //< Last slam timestamp, in microseconds
 	struct xrt_pose last_slam_pose; //< Last SLAM pose reading
 
 	struct xrt_pose slam_correction_pose;
@@ -148,14 +150,14 @@ struct psvr2_hmd
 	float distortion_calibration[8];
 
 	/* Timing data */
-	bool timestamp_initialized;
+	int timestamp_samples;
 
-	timepoint_ns last_vts_ns;
-	timepoint_ns last_slam_ns;
+	timepoint_ns last_imu_vts_ns;
+	timepoint_ns last_slam_vts_ns;
 	timepoint_ns system_zero_ns;
 	timepoint_ns last_imu_ns;
 
-	time_duration_ns hw2mono;
+	time_duration_ns hw2mono_vts;
 	time_duration_ns hw2mono_imu;
 
 	/* Tracking state */

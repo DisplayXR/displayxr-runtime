@@ -49,6 +49,9 @@
 #define GYRO_SCALE (2000.0 / 32767.0)
 #define ACCEL_SCALE (4.0 * MATH_GRAVITY_M_S2 / 32767.0)
 
+#define IMU_FREQ 2000.0f
+#define IMU_PERIOD_NS ((time_duration_ns)(1000000000.0f / IMU_FREQ))
+
 enum psvr2_report_id
 {
 	PSVR2_REPORT_ID_SET_PERIPHERAL = 0x8,
@@ -102,23 +105,15 @@ struct status_record_hdr
 	uint8_t remainder[26];
 } __attribute__((packed));
 
-struct slam_record
-{
-	uint32_t ts_us;   //< Timestamp of the SLAM, in microseconds
-	double pos[3];    //< 32-bit floats
-	double orient[4]; //< Orientation quaternion
-	uint8_t remainder[470];
-};
-
 struct slam_usb_record
 {
-	char SLAhdr[3];   //< "SLA"
-	uint8_t const1;   //< Constant 0x01?
-	__le32 pkt_size;  //< 0x0200 = 512 bytes;
-	__le32 ts;        //< Timestamp
-	__le32 unknown1;  //< Unknown. Constant 3?
-	__le32 pos[3];    //< 32-bit floats
-	__le32 orient[4]; //< Orientation quaternion
+	char SLAhdr[3];    //< "SLA"
+	uint8_t const1;    //< Constant 0x01?
+	__le32 pkt_size;   //< 0x0200 = 512 bytes;
+	__le32 vts_ts_us;  //< Timestamp
+	__le32 unknown1;   //< Unknown. Constant 3?
+	__lef32 pos[3];    //< 32-bit floats
+	__lef32 orient[4]; //< Orientation quaternion
 	uint8_t remainder[468];
 } __attribute__((packed));
 
