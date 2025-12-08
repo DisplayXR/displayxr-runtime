@@ -72,6 +72,7 @@ static void
 oxr_action_bind_io(struct oxr_logger *log,
                    struct oxr_sink_logger *slog,
                    struct oxr_session *sess,
+                   const struct oxr_roles *roles,
                    const struct oxr_action_ref *act_ref,
                    const uint32_t act_set_key,
                    struct oxr_action_cache *cache,
@@ -709,6 +710,7 @@ static void
 get_binding(struct oxr_logger *log,
             struct oxr_sink_logger *slog,
             struct oxr_session *sess,
+            const struct oxr_roles *roles,
             const struct oxr_action_ref *act_ref,
             struct oxr_interaction_profile *profile,
             enum oxr_subaction_path subaction_path,
@@ -729,7 +731,7 @@ get_binding(struct oxr_logger *log,
 #define PATH_CASE(NAME, NAMECAPS, PATH)                                                                                \
 	case OXR_SUB_ACTION_PATH_##NAMECAPS:                                                                           \
 		user_path_str = PATH;                                                                                  \
-		xdev = GET_XDEV_BY_ROLE(sess, NAME);                                                                   \
+		xdev = GET_XDEV_BY_ROLE(roles, NAME);                                                                  \
 		break;
 
 		OXR_FOR_EACH_VALID_SUBACTION_PATH_DETAILED(PATH_CASE)
@@ -840,11 +842,12 @@ struct oxr_profiles_per_subaction
 static void
 oxr_find_profiles_from_roles(struct oxr_logger *log,
                              struct oxr_session *sess,
+                             const struct oxr_roles *roles,
                              struct oxr_profiles_per_subaction *out_profiles)
 {
 #define FIND_PROFILE(X)                                                                                                \
-	if (!oxr_get_profile_for_device_name(log, sess, GET_PROFILE_NAME_BY_ROLE(sess, X), &out_profiles->X)) {        \
-		struct xrt_device *xdev = GET_XDEV_BY_ROLE(sess, X);                                                   \
+	if (!oxr_get_profile_for_device_name(log, sess, GET_PROFILE_NAME_BY_ROLE(roles, X), &out_profiles->X)) {       \
+		struct xrt_device *xdev = GET_XDEV_BY_ROLE(roles, X);                                                  \
 		if (xdev != NULL) {                                                                                    \
 			oxr_find_profile_for_device(log, sess, xdev, &out_profiles->X);                                \
 		}                                                                                                      \
@@ -859,6 +862,7 @@ oxr_find_profiles_from_roles(struct oxr_logger *log,
 static XrResult
 oxr_action_attachment_bind(struct oxr_logger *log,
                            struct oxr_action_attachment *act_attached,
+                           const struct oxr_roles *roles,
                            const struct oxr_profiles_per_subaction *profiles)
 {
 	struct oxr_sink_logger slog = {0};
@@ -871,14 +875,14 @@ oxr_action_attachment_bind(struct oxr_logger *log,
 
 	if (act_ref->subaction_paths.user || act_ref->subaction_paths.any) {
 #if 0
-		oxr_action_bind_io(log, &slog, sess, act_ref, &act_attached->user,
+		oxr_action_bind_io(log, &slog, sess, roles, act_ref, &act_attached->user,
 		                   user, OXR_SUB_ACTION_PATH_USER);
 #endif
 	}
 
 #define BIND_SUBACTION(NAME, NAME_CAPS, PATH)                                                                          \
 	if (act_ref->subaction_paths.NAME || act_ref->subaction_paths.any) {                                           \
-		oxr_action_bind_io(log, &slog, sess, act_ref, act_set_key, &act_attached->NAME, profiles->NAME,        \
+		oxr_action_bind_io(log, &slog, sess, roles, act_ref, act_set_key, &act_attached->NAME, profiles->NAME, \
 		                   OXR_SUB_ACTION_PATH_##NAME_CAPS);                                                   \
 	}
 	OXR_FOR_EACH_VALID_SUBACTION_PATH_DETAILED(BIND_SUBACTION)
@@ -1633,6 +1637,7 @@ static void
 oxr_action_bind_io(struct oxr_logger *log,
                    struct oxr_sink_logger *slog,
                    struct oxr_session *sess,
+                   const struct oxr_roles *roles,
                    const struct oxr_action_ref *act_ref,
                    const uint32_t act_set_key,
                    struct oxr_action_cache *cache,
@@ -1652,6 +1657,7 @@ oxr_action_bind_io(struct oxr_logger *log,
 	    log,            // log
 	    slog,           // slog
 	    sess,           // sess
+	    roles,          // roles
 	    act_ref,        // act_ref
 	    profile,        // profile
 	    subaction_path, // subaction_path
@@ -1818,8 +1824,14 @@ oxr_session_attach_action_sets(struct oxr_logger *log,
 	struct oxr_instance *inst = sess->sys->inst;
 	oxr_clone_profiles_to_session(log, inst, sess);
 
+	struct oxr_roles roles = XRT_STRUCT_INIT;
+	XrResult result = oxr_roles_init_on_stack(log, &roles, sess->sys);
+	if (result != XR_SUCCESS) {
+		return result;
+	}
+
 	struct oxr_profiles_per_subaction profiles = {0};
-#define FIND_PROFILE(X) oxr_find_profile_for_device(log, sess, GET_XDEV_BY_ROLE(sess, X), &profiles.X);
+#define FIND_PROFILE(X) oxr_find_profile_for_device(log, sess, GET_XDEV_BY_ROLE(&roles, X), &profiles.X);
 	OXR_FOR_EACH_VALID_SUBACTION_PATH(FIND_PROFILE)
 #undef FIND_PROFILE
 
@@ -1853,7 +1865,7 @@ oxr_session_attach_action_sets(struct oxr_logger *log,
 
 			struct oxr_action_attachment *act_attached = &act_set_attached->act_attachments[child_index];
 			oxr_action_attachment_init(log, act_set_attached, act_attached, act);
-			oxr_action_attachment_bind(log, act_attached, &profiles);
+			oxr_action_attachment_bind(log, act_attached, &roles, &profiles);
 			++child_index;
 		}
 	}
@@ -1866,20 +1878,26 @@ oxr_session_attach_action_sets(struct oxr_logger *log,
 	}
 	OXR_FOR_EACH_VALID_SUBACTION_PATH(POPULATE_PROFILE)
 #undef POPULATE_PROFILE
+
+	os_mutex_lock(&sess->sync_actions_mutex);
+	// Update the ID to not have to run bindings again on the next xrSyncActions.
+	sess->dynamic_roles_generation_id = roles.roles.generation_id;
+	os_mutex_unlock(&sess->sync_actions_mutex);
+
 	return oxr_session_success_result(sess);
 }
 
 XrResult
-oxr_session_update_action_bindings(struct oxr_logger *log, struct oxr_session *sess)
+oxr_session_update_action_bindings(struct oxr_logger *log, struct oxr_session *sess, const struct oxr_roles *roles)
 {
 	struct oxr_profiles_per_subaction profiles = {0};
-	oxr_find_profiles_from_roles(log, sess, &profiles);
+	oxr_find_profiles_from_roles(log, sess, roles, &profiles);
 
 	for (size_t i = 0; i < sess->action_set_attachment_count; i++) {
 		struct oxr_action_set_attachment *act_set_attached = &sess->act_set_attachments[i];
 		for (size_t k = 0; k < act_set_attached->action_attachment_count; k++) {
 			struct oxr_action_attachment *act_attached = &act_set_attached->act_attachments[k];
-			oxr_action_attachment_bind(log, act_attached, &profiles);
+			oxr_action_attachment_bind(log, act_attached, roles, &profiles);
 		}
 	}
 

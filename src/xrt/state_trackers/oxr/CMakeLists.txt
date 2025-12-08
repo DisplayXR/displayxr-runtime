@@ -38,6 +38,7 @@ add_library(
 	oxr_path.c
 	oxr_pretty_print.c
 	oxr_pretty_print.h
+	oxr_roles.c
 	oxr_roles.h
 	oxr_session.c
 	oxr_session_frame_end.c

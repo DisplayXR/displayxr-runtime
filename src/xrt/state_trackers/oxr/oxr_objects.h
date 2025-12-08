@@ -109,6 +109,7 @@ struct oxr_extension_status;
 struct oxr_instance;
 struct oxr_system;
 struct oxr_session;
+struct oxr_roles;
 struct oxr_event;
 struct oxr_swapchain;
 struct oxr_space;
@@ -549,7 +550,7 @@ oxr_session_attach_action_sets(struct oxr_logger *log,
 
 
 XrResult
-oxr_session_update_action_bindings(struct oxr_logger *log, struct oxr_session *sess);
+oxr_session_update_action_bindings(struct oxr_logger *log, struct oxr_session *sess, const struct oxr_roles *roles);
 
 /*!
  * Given an action act_key, look up the @ref oxr_action_attachment of
@@ -1856,10 +1857,10 @@ struct oxr_session
 	size_t profiles_on_attachment_size;
 	struct oxr_interaction_profile **profiles_on_attachment;
 
-	//! Cache of the last known system roles, see @ref xrt_system_roles::generation_id
-	struct xrt_system_roles dynamic_roles_cache;
+	//! Cache of the last known system roles generation_id
+	uint64_t dynamic_roles_generation_id;
 
-	//! Protects access to dynamic_roles_cache during sync actions
+	//! Protects access to dynamic_roles_generation_id during sync actions
 	struct os_mutex sync_actions_mutex;
 
 	/*!

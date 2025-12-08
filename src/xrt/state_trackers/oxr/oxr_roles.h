@@ -15,6 +15,35 @@
 extern "C" {
 #endif
 
+/*!
+ * Helper struct that wraps xrt_system_roles for OpenXR state tracker usage.
+ *
+ * Is intended to be used on the stack and have a short lifetime, so no
+ * references of it should be kept. Is mainly used in xrSyncActions and in
+ * xrAttachSessionActionSets, where it is used to get the current roles of the
+ * devices that the session is using.
+ *
+ * @see xrt_system_roles
+ * @ingroup oxr_main
+ */
+struct oxr_roles
+{
+	//! To access the @ref xrt_system_devices struct.
+	struct oxr_system *sys;
+
+	//! The roles of the devices that the session is using.
+	struct xrt_system_roles roles;
+};
+
+/*!
+ * Initialize an oxr_roles struct on the stack.
+ *
+ * @ingroup oxr_main
+ */
+XRT_CHECK_RESULT XrResult
+oxr_roles_init_on_stack(struct oxr_logger *log, struct oxr_roles *roles, struct oxr_system *sys);
+
+
 /*
  *
  * Static device roles.
@@ -43,9 +72,9 @@ static inline struct xrt_device *get_static_role_hand_tracking_conforming_right(
 
 // clang-format off
 #define STATIC_WRAP(ROLE)                                                                                              \
-	static inline struct xrt_device *get_role_##ROLE(struct oxr_session *sess)                                     \
+	static inline struct xrt_device *get_role_##ROLE(const struct oxr_roles *roles)                                \
 	{                                                                                                              \
-		return get_static_role_##ROLE(sess->sys);                                                              \
+		return get_static_role_##ROLE(roles->sys);                                                             \
 	}
 STATIC_WRAP(head)
 STATIC_WRAP(eyes)
@@ -59,14 +88,10 @@ STATIC_WRAP(hand_tracking_conforming_right)
 // clang-format on
 
 #define MAKE_GET_DYN_ROLES_FN(ROLE)                                                                                    \
-	static inline struct xrt_device *get_role_##ROLE(struct oxr_session *sess)                                     \
+	static inline struct xrt_device *get_role_##ROLE(const struct oxr_roles *roles)                                \
 	{                                                                                                              \
-		const bool is_locked = 0 == os_mutex_trylock(&sess->sync_actions_mutex);                               \
-		const int32_t xdev_idx = sess->dynamic_roles_cache.ROLE;                                               \
-		if (is_locked) {                                                                                       \
-			os_mutex_unlock(&sess->sync_actions_mutex);                                                    \
-		}                                                                                                      \
-		struct xrt_system_devices *xsysd = sess->sys->xsysd;                                                   \
+		const int32_t xdev_idx = roles->roles.ROLE;                                                            \
+		struct xrt_system_devices *xsysd = roles->sys->xsysd;                                                  \
 		if (xdev_idx < 0 || xdev_idx >= (int32_t)xsysd->xdev_count) {                                          \
 			return NULL;                                                                                   \
 		}                                                                                                      \
@@ -77,7 +102,7 @@ MAKE_GET_DYN_ROLES_FN(right)
 MAKE_GET_DYN_ROLES_FN(gamepad)
 #undef MAKE_GET_DYN_ROLES_FN
 
-#define GET_XDEV_BY_ROLE(SESS, ROLE) (get_role_##ROLE((SESS)))
+#define GET_XDEV_BY_ROLE(ROLES, ROLE) (get_role_##ROLE((ROLES)))
 
 
 /*
@@ -87,63 +112,58 @@ MAKE_GET_DYN_ROLES_FN(gamepad)
  */
 
 static inline enum xrt_device_name
-get_role_profile_head(struct oxr_session *sess)
+get_role_profile_head(const struct oxr_roles *roles)
 {
 	return XRT_DEVICE_INVALID;
 }
 static inline enum xrt_device_name
-get_role_profile_eyes(struct oxr_session *sess)
+get_role_profile_eyes(const struct oxr_roles *roles)
 {
 	return XRT_DEVICE_INVALID;
 }
 static inline enum xrt_device_name
-get_role_profile_face(struct oxr_session *sess)
+get_role_profile_face(const struct oxr_roles *roles)
 {
 	return XRT_DEVICE_INVALID;
 }
 static inline enum xrt_device_name
-get_role_profile_body(struct oxr_session *sess)
+get_role_profile_body(const struct oxr_roles *roles)
 {
 	return XRT_DEVICE_INVALID;
 }
 static inline enum xrt_device_name
-get_role_profile_hand_tracking_unobstructed_left(struct oxr_session *sess)
+get_role_profile_hand_tracking_unobstructed_left(const struct oxr_roles *roles)
 {
 	return XRT_DEVICE_INVALID;
 }
 static inline enum xrt_device_name
-get_role_profile_hand_tracking_unobstructed_right(struct oxr_session *sess)
+get_role_profile_hand_tracking_unobstructed_right(const struct oxr_roles *roles)
 {
 	return XRT_DEVICE_INVALID;
 }
 
 static inline enum xrt_device_name
-get_role_profile_hand_tracking_conforming_left(struct oxr_session *sess)
+get_role_profile_hand_tracking_conforming_left(const struct oxr_roles *roles)
 {
 	return XRT_DEVICE_INVALID;
 }
 static inline enum xrt_device_name
-get_role_profile_hand_tracking_conforming_right(struct oxr_session *sess)
+get_role_profile_hand_tracking_conforming_right(const struct oxr_roles *roles)
 {
 	return XRT_DEVICE_INVALID;
 }
 
 #define MAKE_GET_DYN_ROLE_PROFILE_FN(ROLE)                                                                             \
-	static inline enum xrt_device_name get_role_profile_##ROLE(struct oxr_session *sess)                           \
+	static inline enum xrt_device_name get_role_profile_##ROLE(const struct oxr_roles *roles)                      \
 	{                                                                                                              \
-		const bool is_locked = 0 == os_mutex_trylock(&sess->sync_actions_mutex);                               \
-		const enum xrt_device_name profile_name = sess->dynamic_roles_cache.ROLE##_profile;                    \
-		if (is_locked) {                                                                                       \
-			os_mutex_unlock(&sess->sync_actions_mutex);                                                    \
-		}                                                                                                      \
-		return profile_name;                                                                                   \
+		return roles->roles.ROLE##_profile;                                                                    \
 	}
 MAKE_GET_DYN_ROLE_PROFILE_FN(left)
 MAKE_GET_DYN_ROLE_PROFILE_FN(right)
 MAKE_GET_DYN_ROLE_PROFILE_FN(gamepad)
 #undef MAKE_GET_DYN_ROLES_FN
 
-#define GET_PROFILE_NAME_BY_ROLE(SYS, ROLE) (get_role_profile_##ROLE((SYS)))
+#define GET_PROFILE_NAME_BY_ROLE(ROLES, ROLE) (get_role_profile_##ROLE((ROLES)))
 
 
 #ifdef __cplusplus

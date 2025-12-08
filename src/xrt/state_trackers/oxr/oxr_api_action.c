@@ -20,6 +20,7 @@
 #include "oxr_api_verify.h"
 #include "oxr_chain.h"
 #include "oxr_subaction.h"
+#include "oxr_roles.h"
 
 #include <stdio.h>
 
@@ -145,13 +146,17 @@ oxr_xrSyncActions(XrSession session, const XrActionsSyncInfo *syncInfo)
 	}
 #endif
 
-	struct xrt_system_roles sys_roles = XRT_STRUCT_INIT;
-	xrt_system_devices_get_roles(sess->sys->xsysd, &sys_roles);
+	struct oxr_roles roles = XRT_STRUCT_INIT;
+	XrResult result = oxr_roles_init_on_stack(&log, &roles, sess->sys);
+	if (result != XR_SUCCESS) {
+		return result;
+	}
+
 	{
 		os_mutex_lock(&sess->sync_actions_mutex);
-		if (sess->dynamic_roles_cache.generation_id < sys_roles.generation_id) {
-			sess->dynamic_roles_cache = sys_roles;
-			oxr_session_update_action_bindings(&log, sess);
+		if (sess->dynamic_roles_generation_id < roles.roles.generation_id) {
+			sess->dynamic_roles_generation_id = roles.roles.generation_id;
+			oxr_session_update_action_bindings(&log, sess, &roles);
 		}
 		os_mutex_unlock(&sess->sync_actions_mutex);
 	}

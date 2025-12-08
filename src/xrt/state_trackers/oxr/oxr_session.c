@@ -1136,8 +1136,8 @@ oxr_session_allocate_and_init(struct oxr_logger *log,
 	sess->active_wait_frames = 0;
 	os_mutex_init(&sess->active_wait_frames_lock);
 
-	// Initialize dynamic roles cache and mutex
-	sess->dynamic_roles_cache = (struct xrt_system_roles)XRT_SYSTEM_ROLES_INIT;
+	// Initialize dynamic roles generation_id and mutex
+	sess->dynamic_roles_generation_id = 0;
 	os_mutex_init(&sess->sync_actions_mutex);
 
 	// Debug and user options.

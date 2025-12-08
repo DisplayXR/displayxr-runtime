@@ -143,24 +143,26 @@ starts_with(const char *with, const char *string)
 static void
 debug_print_devices(struct oxr_logger *log, struct oxr_system *sys)
 {
-#define D(INDEX) (roles.INDEX < 0 ? NULL : sys->xsysd->xdevs[roles.INDEX])
 #define P(XDEV) (XDEV != NULL ? XDEV->str : "<none>")
 
-	// Static roles.
+	// Get all roles using oxr_roles struct.
+	struct oxr_roles roles = XRT_STRUCT_INIT;
+	XrResult result = oxr_roles_init_on_stack(log, &roles, sys);
+	if (result != XR_SUCCESS) {
+		// Just log and continue, this is debug output
+		oxr_warn(log, "Failed to get device roles for debug printing");
+		return;
+	}
+
 	struct xrt_device *h = GET_STATIC_XDEV_BY_ROLE(sys, head);
 	struct xrt_device *e = GET_STATIC_XDEV_BY_ROLE(sys, eyes);
+	struct xrt_device *l = GET_XDEV_BY_ROLE(&roles, left);
+	struct xrt_device *r = GET_XDEV_BY_ROLE(&roles, right);
+	struct xrt_device *gp = GET_XDEV_BY_ROLE(&roles, gamepad);
 	struct xrt_device *uhl = GET_STATIC_XDEV_BY_ROLE(sys, hand_tracking_unobstructed_left);
 	struct xrt_device *uhr = GET_STATIC_XDEV_BY_ROLE(sys, hand_tracking_unobstructed_right);
 	struct xrt_device *chl = GET_STATIC_XDEV_BY_ROLE(sys, hand_tracking_conforming_left);
 	struct xrt_device *chr = GET_STATIC_XDEV_BY_ROLE(sys, hand_tracking_conforming_right);
-
-	// Dynamic roles, the system cache might not have been updated yet.
-	struct xrt_system_roles roles = XRT_SYSTEM_ROLES_INIT;
-	xrt_system_devices_get_roles(sys->xsysd, &roles);
-
-	struct xrt_device *l = D(left);
-	struct xrt_device *r = D(right);
-	struct xrt_device *gp = D(gamepad);
 
 	oxr_log(log,
 	        "Selected devices"
@@ -176,7 +178,6 @@ debug_print_devices(struct oxr_logger *log, struct oxr_system *sys)
 	        P(h), P(e), P(l), P(r), P(gp), P(uhl), P(uhr), P(chl), P(chr));
 
 #undef P
-#undef D
 }
 
 static void
