@@ -585,6 +585,7 @@ oxr_session_poll(struct oxr_logger *log, struct oxr_session *sess)
 			    time_state_monotonic_to_ts_ns(sess->sys->inst->timekeeping, xse.loss_pending.loss_time_ns));
 			break;
 		case XRT_SESSION_EVENT_LOST: sess->has_lost = true; break;
+		case XRT_SESSION_EVENT_REQUEST_EXIT: oxr_session_request_exit(log, sess); break;
 		case XRT_SESSION_EVENT_DISPLAY_REFRESH_RATE_CHANGE:
 #ifdef OXR_HAVE_FB_display_refresh_rate
 			oxr_event_push_XrEventDataDisplayRefreshRateChangedFB( //

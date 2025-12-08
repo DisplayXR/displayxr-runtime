@@ -50,6 +50,19 @@ poll_events(struct xrt_session *xs, union xrt_session_event *out_xse)
 	return XRT_SUCCESS;
 }
 
+static xrt_result_t
+request_exit(struct xrt_session *xs)
+{
+	struct u_session *us = u_session(xs);
+
+	union xrt_session_event xse = XRT_STRUCT_INIT;
+	xse.type = XRT_SESSION_EVENT_REQUEST_EXIT;
+
+	u_session_event_push(us, &xse);
+
+	return XRT_SUCCESS;
+}
+
 static void
 destroy(struct xrt_session *xs)
 {
@@ -85,6 +98,7 @@ u_session_create(struct u_system *usys)
 
 	// xrt_session fields.
 	us->base.poll_events = poll_events;
+	us->base.request_exit = request_exit;
 	us->base.destroy = destroy;
 
 	// xrt_session_event_sink fields.

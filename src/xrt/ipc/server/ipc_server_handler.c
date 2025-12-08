@@ -479,6 +479,17 @@ ipc_handle_session_poll_events(volatile struct ipc_client_state *ics, union xrt_
 }
 
 xrt_result_t
+ipc_handle_session_request_exit(volatile struct ipc_client_state *ics)
+{
+	// Have we created the session?
+	if (ics->xs == NULL) {
+		return XRT_ERROR_IPC_SESSION_NOT_CREATED;
+	}
+
+	return xrt_session_request_exit(ics->xs);
+}
+
+xrt_result_t
 ipc_handle_session_begin(volatile struct ipc_client_state *ics)
 {
 	IPC_TRACE_MARKER();
