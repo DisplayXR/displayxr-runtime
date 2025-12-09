@@ -1,5 +1,5 @@
 // Copyright 2020-2024, Collabora, Ltd.
-// Copyright 2023-2025, NVIDIA CORPORATION.
+// Copyright 2023-2026, NVIDIA CORPORATION.
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
@@ -14,6 +14,7 @@
 #include "xrt/xrt_compiler.h"
 #include "xrt/xrt_defines.h"
 #include "xrt/xrt_device.h"
+#include "xrt/xrt_limits.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -131,14 +132,6 @@ xrt_system_destroy(struct xrt_system **xsys_ptr)
  * System devices.
  *
  */
-
-/*!
- * Maximum number of devices simultaneously usable by an implementation of
- * @ref xrt_system_devices
- *
- * @ingroup xrt_iface
- */
-#define XRT_SYSTEM_MAX_DEVICES (32)
 
 /*!
  * Data associating a device index (in @ref xrt_system_devices::xdevs) with a

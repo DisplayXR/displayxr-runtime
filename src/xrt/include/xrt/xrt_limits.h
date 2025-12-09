@@ -1,5 +1,5 @@
 // Copyright 2019-2022, Collabora, Ltd.
-// Copyright 2025, NVIDIA CORPORATION.
+// Copyright 2025-2026, NVIDIA CORPORATION.
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
@@ -18,6 +18,13 @@
  * @addtogroup xrt_iface
  * @{
  */
+
+/*!
+ * Maximum number of devices simultaneously usable by an implementation of
+ * @ref xrt_system_devices.
+ */
+#define XRT_SYSTEM_MAX_DEVICES (32)
+
 /*
  * Max number of views supported by a compositor, artificial limit.
  */
