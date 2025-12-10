@@ -138,6 +138,15 @@ public class MonadoView extends SurfaceView
         DisplayMetrics displayMetrics = new DisplayMetrics();
         WindowManager wm = (WindowManager) context.getSystemService(Context.WINDOW_SERVICE);
         wm.getDefaultDisplay().getRealMetrics(displayMetrics);
+
+        // getRealMetrics returns the metrics dependent on screen rotation, but we expect them
+        // to be landscape; ensure that the returned metrics represent the landscape orientation.
+        if (displayMetrics.widthPixels < displayMetrics.heightPixels) {
+            int tmp = displayMetrics.widthPixels;
+            displayMetrics.widthPixels = displayMetrics.heightPixels;
+            displayMetrics.heightPixels = tmp;
+        }
+
         return displayMetrics;
     }
 
