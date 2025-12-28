@@ -6,6 +6,7 @@
 #
 
 add_subdirectory(oxr_bindings)
+add_subdirectory(oxr_extension_support)
 
 add_library(
 	st_oxr STATIC
@@ -23,7 +24,6 @@ add_library(
 	oxr_chain.h
 	oxr_dpad.c
 	oxr_event.c
-	oxr_extension_support.h
 	oxr_frame_sync.c
 	oxr_frame_sync.h
 	oxr_handle_base.c
@@ -47,11 +47,18 @@ add_library(
 	oxr_xdev.c
 	${CMAKE_CURRENT_BINARY_DIR}/oxr_bindings/b_oxr_generated_bindings.c
 	${CMAKE_CURRENT_BINARY_DIR}/oxr_bindings/b_oxr_generated_bindings.h
+	${CMAKE_CURRENT_BINARY_DIR}/oxr_extension_support/oxr_extension_support.h
 	)
 
+# To generate the b_oxr_generated_bindings.c and b_oxr_generated_bindings.h files.
 add_dependencies(st_oxr generate_oxr_bindings)
 # To enable finding oxr_objects.h in b_oxr_generated_bindings
 target_include_directories(st_oxr PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+
+# To generate the oxr_extension_support.h file.
+add_dependencies(st_oxr generate_oxr_extension_support)
+# For OpenXR unit tests to find the oxr_extension_support.h file.
+target_include_directories(st_oxr PUBLIC ${CMAKE_CURRENT_BINARY_DIR}/oxr_extension_support)
 
 if(XRT_HAVE_VULKAN)
 	target_sources(st_oxr PRIVATE oxr_session_gfx_vk.c oxr_swapchain_vk.c oxr_vulkan.c)

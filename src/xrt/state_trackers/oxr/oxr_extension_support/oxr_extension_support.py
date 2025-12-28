@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
 # Copyright 2019-2024, Collabora, Ltd.
+# Copyright 2025-2026, NVIDIA CORPORATION.
 # SPDX-License-Identifier: BSL-1.0
-"""Simple script to update oxr_extension_support.h."""
+"""Generate OpenXR extension support header file."""
 
-from pathlib import Path
+import argparse
+import os
+from string import Template
+from typing import List
+
 
 def _add_defined(s):
     if "defined" in s:
         return s
     return "defined({})".format(s)
+
 
 def or_(*args):
     """
@@ -26,6 +32,7 @@ def not_(s):
     Takes a single string, directly or through e.g. "or_".
     """
     return "(!{})".format(_add_defined(s))
+
 
 # Each extension that we implement gets an entry in this tuple.
 # Each entry should be a list of defines that are checked for an extension:
@@ -116,22 +123,15 @@ EXTENSIONS = (
     ['XR_MNDX_xdev_space', 'XRT_FEATURE_OPENXR_XDEV_SPACE'],
 )
 
-
-ROOT = Path(__file__).resolve().parent.parent
-FN = ROOT / 'src' / 'xrt'/'state_trackers' / 'oxr' / 'oxr_extension_support.h'
-
 INVOCATION_PREFIX = 'OXR_EXTENSION_SUPPORT'
-BEGIN_OF_PER_EXTENSION = '// beginning of GENERATED defines - do not modify - used by scripts'
-END_OF_PER_EXTENSION = '// end of GENERATED per-extension defines - do not modify - used by scripts'
-CLANG_FORMAT_OFF = '// clang-format off'
-CLANG_FORMAT_ON = '// clang-format on'
 
 
 def trim_ext_name(name):
     return name[3:]
 
 
-def generate_first_chunk():
+def generate_ext_defines() -> str:
+    """Generate per-extension define blocks."""
     parts = []
     for data in EXTENSIONS:
         ext_name = data[0]
@@ -151,10 +151,11 @@ def generate_first_chunk():
 #define {INVOCATION_PREFIX}_{trimmed_name}(_)
 #endif
 """)
-    return '\n'.join(parts)
+    return "\n".join(parts)
 
 
-def generate_second_chunk():
+def generate_generate_macro() -> str:
+    """Generate the OXR_EXTENSION_SUPPORT_GENERATE macro."""
     trimmed_names = [trim_ext_name(data[0]) for data in EXTENSIONS]
     invocations = ('{}_{}(_)'.format(INVOCATION_PREFIX, name)
                    for name in trimmed_names)
@@ -162,25 +163,44 @@ def generate_second_chunk():
     macro_lines = ['#define OXR_EXTENSION_SUPPORT_GENERATE(_)']
     macro_lines.extend(invocations)
 
-    lines = [CLANG_FORMAT_OFF]
+    lines = ['// clang-format off']
     lines.append(' \\\n    '.join(macro_lines))
-    lines.append(CLANG_FORMAT_ON)
-    return '\n'.join(lines)
+    lines.append('// clang-format on')
+    return "\n".join(lines)
+
+
+def generate_extension_support_h(output: str):
+    """Generate the oxr_extension_support.h file from template."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    template_file = os.path.join(script_dir, 'oxr_extension_support.h.template')
+
+    with open(template_file, 'r') as f:
+        src = Template(f.read())
+
+    ext_defines = generate_ext_defines()
+    generate_macro = generate_generate_macro()
+
+    with open(output, "w", encoding="utf-8") as fp:
+        fp.write(src.substitute(
+            ext_defines=ext_defines,
+            generate_macro=generate_macro
+        ))
+
+
+def main():
+    """Handle command line and generate file(s)."""
+    parser = argparse.ArgumentParser(description='OpenXR extension support generator.')
+    parser.add_argument(
+        'output', type=str, nargs='+',
+        help='Output file, uses the name to choose output type')
+    args = parser.parse_args()
+
+    for output in args.output:
+        if output.endswith("oxr_extension_support.h"):
+            generate_extension_support_h(output)
+        else:
+            raise ValueError(f"Unknown output file: {output}")
 
 
 if __name__ == "__main__":
-    with open(str(FN), 'r', encoding='utf-8') as fp:
-        orig = [line.rstrip() for line in fp.readlines()]
-    beginning = orig[:orig.index(BEGIN_OF_PER_EXTENSION)+1]
-    middle_start = orig.index(END_OF_PER_EXTENSION)
-    middle_end = orig.index(CLANG_FORMAT_OFF)
-    middle = orig[middle_start:middle_end]
-
-    new_contents = beginning
-    new_contents.append(generate_first_chunk())
-    new_contents.extend(middle)
-    new_contents.append(generate_second_chunk())
-
-    with open(str(FN), 'w', encoding='utf-8') as fp:
-        fp.write('\n'.join(new_contents))
-        fp.write('\n')
+    main()
