@@ -1,4 +1,5 @@
 // Copyright 2021, Collabora, Ltd.
+// Copyright 2025-2026, NVIDIA CORPORATION.
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
@@ -12,8 +13,14 @@
 #include "u_string_list.h"
 #include "u_string_list.hpp"
 
-using xrt::auxiliary::util::StringList;
 
+/*
+ *
+ * Defines and structs.
+ *
+ */
+
+using xrt::auxiliary::util::StringList;
 
 struct u_string_list
 {
@@ -22,6 +29,13 @@ struct u_string_list
 
 	StringList list;
 };
+
+
+/*
+ *
+ * 'Exported' functions.
+ *
+ */
 
 struct u_string_list *
 u_string_list_create()
@@ -33,7 +47,6 @@ u_string_list_create()
 		return nullptr;
 	}
 }
-
 
 struct u_string_list *
 u_string_list_create_with_capacity(uint32_t capacity)
@@ -78,13 +91,11 @@ u_string_list_create_from_array(const char *const *arr, uint32_t size)
 uint32_t
 u_string_list_get_size(const struct u_string_list *usl)
 {
-
 	if (usl == nullptr) {
 		return 0;
 	}
 	return usl->list.size();
 }
-
 
 const char *const *
 u_string_list_get_data(const struct u_string_list *usl)

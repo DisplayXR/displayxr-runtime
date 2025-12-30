@@ -1,4 +1,5 @@
 // Copyright 2021, Collabora, Ltd.
+// Copyright 2025-2026, NVIDIA CORPORATION.
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
@@ -10,7 +11,8 @@
  */
 #pragma once
 
-#include <stdint.h>
+#include "xrt/xrt_compiler.h"
+
 
 #ifdef __cplusplus
 extern "C" {
