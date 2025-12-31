@@ -91,8 +91,22 @@ struct vk_bundle
 	 */
 	struct vk_bundle_queue queues[VK_BUNDLE_MAX_QUEUES];
 
+	/*!
+	 * @brief Main queue for general work.
+	 *
+	 * In normal mode, this is a graphics queue.
+	 * In compute-only mode, this is a compute queue.
+	 *
+	 * May alias with graphics_queue.
+	 */
 	struct vk_bundle_queue *main_queue;
 #if defined(VK_KHR_video_encode_queue)
+	/*!
+	 * @brief Video encode queue.
+	 *
+	 * May be NULL if video encoding is not supported.
+	 * May alias with other queues.
+	 */
 	struct vk_bundle_queue *encode_queue;
 #endif
 

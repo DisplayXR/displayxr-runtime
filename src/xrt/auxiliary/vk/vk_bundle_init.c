@@ -19,6 +19,8 @@
 #include "util/u_pretty_print.h"
 #include "vk/vk_helpers.h"
 #include "vk/vk_extensions_helpers.h"
+#include "vk/vk_queue_builder.h"
+#include "vk/vk_queue_family.h"
 
 #include <stdio.h>
 
@@ -549,112 +551,6 @@ select_physical_device(struct vk_bundle *vk, int forced_index)
 	return VK_SUCCESS;
 }
 
-struct vk_queue_family
-{
-	VkQueueFamilyProperties queue_family;
-	uint32_t family_index;
-};
-
-static VkResult
-find_graphics_queue_family(struct vk_bundle *vk, struct vk_queue_family *out_graphics_queue_family)
-{
-	/* Find the first graphics queue */
-	VkQueueFamilyProperties *queue_family_props = NULL;
-	uint32_t queue_family_count = 0;
-	uint32_t i = 0;
-
-	vk_get_physical_device_queue_family_properties( //
-	    vk,                                         //
-	    vk->physical_device,                        //
-	    &queue_family_count,                        //
-	    &queue_family_props);                       //
-	if (queue_family_count == 0) {
-		VK_DEBUG(vk, "Failed to get queue properties");
-		goto err_free;
-	}
-
-	for (i = 0; i < queue_family_count; i++) {
-		if (queue_family_props[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
-			break;
-		}
-	}
-
-	if (i >= queue_family_count) {
-		VK_DEBUG(vk, "No graphics queue found");
-		goto err_free;
-	}
-
-	*out_graphics_queue_family = (struct vk_queue_family){
-	    .queue_family = queue_family_props[i],
-	    .family_index = i,
-	};
-
-	free(queue_family_props);
-
-	return VK_SUCCESS;
-
-err_free:
-	free(queue_family_props);
-	return VK_ERROR_INITIALIZATION_FAILED;
-}
-
-static VkResult
-find_queue_family(struct vk_bundle *vk, VkQueueFlags required_flags, struct vk_queue_family *out_queue_family)
-{
-	/* Find the "best" queue with the requested flags (prefer queues without graphics) */
-	VkQueueFamilyProperties *queue_family_props = NULL;
-	uint32_t queue_family_count = 0;
-	uint32_t i = 0;
-
-	vk_get_physical_device_queue_family_properties( //
-	    vk,                                         //
-	    vk->physical_device,                        //
-	    &queue_family_count,                        //
-	    &queue_family_props);                       //
-	if (queue_family_count == 0) {
-		VK_DEBUG(vk, "Failed to get queue properties");
-		goto err_free;
-	}
-
-	for (i = 0; i < queue_family_count; i++) {
-		if ((queue_family_props[i].queueFlags & required_flags) != required_flags) {
-			continue;
-		}
-
-		if (~queue_family_props[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
-			break;
-		}
-	}
-
-	if (i >= queue_family_count) {
-		/* If there's no suitable queue without graphics, just find any suitabable one*/
-		for (i = 0; i < queue_family_count; i++) {
-			if ((queue_family_props[i].queueFlags & required_flags) == required_flags) {
-				break;
-			}
-		}
-
-		if (i >= queue_family_count) {
-			VK_DEBUG(vk, "No compatible queue family found (flags: 0x%xd)", required_flags);
-			goto err_free;
-		}
-	}
-
-	*out_queue_family = (struct vk_queue_family){
-	    .queue_family = queue_family_props[i],
-	    .family_index = i,
-	};
-
-	free(queue_family_props);
-
-	return VK_SUCCESS;
-
-err_free:
-	free(queue_family_props);
-
-	return VK_ERROR_INITIALIZATION_FAILED;
-}
-
 static void
 fill_in_has_device_extensions(struct vk_bundle *vk, struct u_extension_list *ext_list)
 {
@@ -985,21 +881,27 @@ vk_create_device(struct vk_bundle *vk,
 
 	vk_reset_queues(vk);
 
-	struct vk_queue_family main_queue_family = {0};
+	// To builde the queue create
+	struct vk_queue_builder builder = {0};
+
+	struct vk_queue_pair main_queue = {0};
 	if (only_compute) {
-		ret = find_queue_family(vk, VK_QUEUE_COMPUTE_BIT, &main_queue_family);
-		VK_CHK_WITH_GOTO(ret, "find_queue_family", err_destroy);
+		struct vk_queue_family compute_queue_family = {0};
+		ret = vk_queue_family_find_and_avoid_graphics(vk, VK_QUEUE_COMPUTE_BIT, &compute_queue_family);
+		VK_CHK_WITH_GOTO(ret, "vk_queue_family_find_and_avoid_graphics", err_destroy);
+
+		assert(compute_queue_family.queue_family.queueCount > 0);
+
+		main_queue = vk_queue_builder_add(&builder, compute_queue_family.family_index);
 	} else {
-		ret = find_graphics_queue_family(vk, &main_queue_family);
-		VK_CHK_WITH_GOTO(ret, "find_graphics_queue_family", err_destroy);
+		struct vk_queue_family graphics_queue_family = {0};
+		ret = vk_queue_family_find_graphics(vk, &graphics_queue_family);
+		VK_CHK_WITH_GOTO(ret, "vk_queue_family_find_graphics", err_destroy);
+
+		assert(graphics_queue_family.queue_family.queueCount > 0);
+
+		main_queue = vk_queue_builder_add(&builder, graphics_queue_family.family_index);
 	}
-
-	assert(main_queue_family.queue_family.queueCount > 0);
-
-	const struct vk_queue_pair main_queue = {
-	    .family_index = main_queue_family.family_index,
-	    .index = 0,
-	};
 
 	VkDeviceQueueGlobalPriorityCreateInfoEXT priority_info = {
 	    .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_EXT,
@@ -1007,41 +909,14 @@ vk_create_device(struct vk_bundle *vk,
 	    .globalPriority = global_priority,
 	};
 
-	const float queue_priority[VK_BUNDLE_MAX_QUEUES] = {
-	    0.f,
-	    0.f,
-	};
-	VkDeviceQueueCreateInfo queue_create_info[VK_BUNDLE_MAX_QUEUES] = {0};
-	uint32_t queue_create_info_count = 1;
-
-	// Compute or Graphics queue
-	queue_create_info[0] = (VkDeviceQueueCreateInfo){
-	    .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
-	    .pNext = NULL,
-	    .queueCount = 1,
-	    .queueFamilyIndex = main_queue.family_index,
-	    .pQueuePriorities = queue_priority,
-	};
-
 #ifdef VK_KHR_video_encode_queue
 	// Video encode queue
 	struct vk_queue_pair encode_queue = VK_NULL_QUEUE_PAIR;
 	if (u_extension_list_contains(device_ext_list, VK_KHR_VIDEO_ENCODE_QUEUE_EXTENSION_NAME)) {
 		struct vk_queue_family encode_queue_family = {0};
-		ret = find_queue_family(vk, VK_QUEUE_VIDEO_ENCODE_BIT_KHR, &encode_queue_family);
+		ret = vk_queue_family_find_and_avoid_graphics(vk, VK_QUEUE_VIDEO_ENCODE_BIT_KHR, &encode_queue_family);
 		if (ret == VK_SUCCESS) {
-			encode_queue = (struct vk_queue_pair){
-			    .family_index = encode_queue_family.family_index,
-			    .index = 0,
-			};
-			queue_create_info[queue_create_info_count++] = (VkDeviceQueueCreateInfo){
-			    .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
-			    .pNext = NULL,
-			    .queueCount = 1,
-			    .queueFamilyIndex = encode_queue.family_index,
-			    .pQueuePriorities = queue_priority,
-			};
-			VK_DEBUG(vk, "Creating video encode queue, family index %d", encode_queue.family_index);
+			encode_queue = vk_queue_builder_add(&builder, encode_queue_family.family_index);
 		}
 	}
 #endif
@@ -1054,8 +929,8 @@ vk_create_device(struct vk_bundle *vk,
 
 	if (vk->has_EXT_global_priority || vk->has_KHR_global_priority) {
 		// This is okay, see static_assert above.
-		priority_info.pNext = queue_create_info[0].pNext;
-		queue_create_info[0].pNext = (void *)&priority_info;
+		priority_info.pNext = builder.create_infos[0].pNext;
+		builder.create_infos[0].pNext = (void *)&priority_info;
 	}
 
 
@@ -1134,8 +1009,8 @@ vk_create_device(struct vk_bundle *vk,
 
 	VkDeviceCreateInfo device_create_info = {
 	    .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-	    .queueCreateInfoCount = queue_create_info_count,
-	    .pQueueCreateInfos = queue_create_info,
+	    .queueCreateInfoCount = builder.create_info_count,
+	    .pQueueCreateInfos = builder.create_infos,
 	    .enabledExtensionCount = u_extension_list_get_size(device_ext_list),
 	    .ppEnabledExtensionNames = u_extension_list_get_data(device_ext_list),
 	    .pEnabledFeatures = &enabled_features,
