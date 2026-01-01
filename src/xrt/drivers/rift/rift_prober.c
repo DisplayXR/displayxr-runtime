@@ -32,12 +32,6 @@ rift_found(struct xrt_prober *xp,
 		return -1;
 	}
 
-	unsigned char product[128] = {0};
-	result = xrt_prober_get_string_descriptor(xp, dev, XRT_PROBER_STRING_PRODUCT, product, sizeof(product));
-	if (result < 0) {
-		return -1;
-	}
-
 	unsigned char serial_number[21] = {0};
 	result = xrt_prober_get_string_descriptor(xp, dev, XRT_PROBER_STRING_SERIAL_NUMBER, serial_number,
 	                                          sizeof(serial_number));
@@ -74,7 +68,7 @@ rift_found(struct xrt_prober *xp,
 	}
 
 	struct rift_hmd *hd = NULL;
-	int created_devices = rift_devices_create(hid, variant, (char *)product, (char *)serial_number, &hd, out_xdevs);
+	int created_devices = rift_devices_create(hid, variant, (char *)name, (char *)serial_number, &hd, out_xdevs);
 	if (created_devices < 0) {
 		return -1;
 	}

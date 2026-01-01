@@ -155,6 +155,48 @@ rift_parse_distortion_report(struct rift_lens_distortion_report *report, struct 
 	}
 }
 
+int
+rift_enable_components(struct rift_hmd *hmd, struct rift_enable_components_report *enable_components)
+{
+	return rift_send_report(hmd, FEATURE_REPORT_ENABLE_COMPONENTS, enable_components, sizeof(*enable_components));
+}
+
+int
+rift_get_imu_calibration(struct rift_hmd *hmd, struct rift_imu_calibration *imu_calibration)
+{
+	uint8_t buf[REPORT_MAX_SIZE] = {0};
+
+	int result = rift_get_report(hmd, FEATURE_REPORT_CALIBRATE, buf, sizeof buf);
+	if (result < 0) {
+		return result;
+	}
+
+	struct rift_imu_calibration_report report;
+	if ((size_t)result < sizeof report) {
+		HMD_ERROR(hmd, "Got invalid size for calibration report");
+		return -1;
+	}
+
+	memcpy(&report, buf + 1, sizeof report);
+
+	imu_calibration->temperature = report.temperature * 0.01f;
+	rift_unpack_float_sample(report.offset.gyro.data, 1e-4f, &imu_calibration->gyro_offset);
+	rift_unpack_float_sample(report.offset.accel.data, 1e-4f, &imu_calibration->accel_offset);
+	for (int i = 0; i < 3; i++) {
+		const float scale = 1.0f / ((1 << 20) - 1);
+
+		rift_unpack_float_sample(report.matrix_samples[i].gyro.data, scale,
+		                         (struct xrt_vec3 *)&imu_calibration->gyro_matrix.v[3 * i]);
+		imu_calibration->gyro_matrix.v[(3 * i) + (i)] += 1.0f;
+
+		rift_unpack_float_sample(report.matrix_samples[i].accel.data, scale,
+		                         (struct xrt_vec3 *)&imu_calibration->accel_matrix.v[3 * i]);
+		imu_calibration->accel_matrix.v[(3 * i) + (i)] += 1.0f;
+	}
+
+	return 0;
+}
+
 /*
  * Decode 3 tightly packed 21 bit values from 4 bytes.
  * We unpack them in the higher 21 bit values first and then shift
@@ -163,21 +205,25 @@ rift_parse_distortion_report(struct rift_lens_distortion_report *report, struct 
  * Code taken/reformatted from OpenHMD's rift driver
  */
 void
-rift_decode_sample(const uint8_t *in, int32_t *out)
+rift_unpack_int_sample(const uint8_t *in, struct xrt_vec3_i32 *out)
 {
 	int x = (in[0] << 24) | (in[1] << 16) | ((in[2] & 0xF8) << 8);
 	int y = ((in[2] & 0x07) << 29) | (in[3] << 21) | (in[4] << 13) | ((in[5] & 0xC0) << 5);
 	int z = ((in[5] & 0x3F) << 26) | (in[6] << 18) | (in[7] << 10);
 
-	out[0] = x >> 11;
-	out[1] = y >> 11;
-	out[2] = z >> 11;
+	out->x = x >> 11;
+	out->y = y >> 11;
+	out->z = z >> 11;
 }
 
 void
-rift_sample_to_imu_space(const int32_t *in, struct xrt_vec3 *out)
+rift_unpack_float_sample(const uint8_t *in, float scale, struct xrt_vec3 *out)
 {
-	out->x = (float)in[0] * 0.0001f;
-	out->y = (float)in[1] * 0.0001f;
-	out->z = (float)in[2] * 0.0001f;
+	int x = (in[0] << 24) | (in[1] << 16) | ((in[2] & 0xF8) << 8);
+	int y = ((in[2] & 0x07) << 29) | (in[3] << 21) | (in[4] << 13) | ((in[5] & 0xC0) << 5);
+	int z = ((in[5] & 0x3F) << 26) | (in[6] << 18) | (in[7] << 10);
+
+	out->x = scale * (float)(x >> 11);
+	out->y = scale * (float)(y >> 11);
+	out->z = scale * (float)(z >> 11);
 }

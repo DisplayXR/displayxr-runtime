@@ -53,8 +53,8 @@ rift_found(struct xrt_prober *xp,
 int
 rift_devices_create(struct os_hid_device *dev,
                     enum rift_variant variant,
-                    char *device_name,
-                    char *serial_number,
+                    const char *device_name,
+                    const char *serial_number,
                     struct rift_hmd **out_hmd,
                     struct xrt_device **out_xdevs);
 

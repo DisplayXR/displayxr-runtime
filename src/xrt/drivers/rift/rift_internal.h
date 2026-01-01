@@ -39,10 +39,12 @@
 #define IMU_SAMPLE_RATE (1000)      // 1000hz
 #define NS_PER_SAMPLE (1000 * 1000) // 1ms (1,000,000 ns) per sample
 
-#define MICROMETERS_TO_METERS(microns) (float)microns / 1000000.0f
+#define MICROMETERS_TO_METERS(microns) ((float)microns / 1000000.0f)
 
 // value taken from LibOVR 0.4.4
 #define DEFAULT_EXTRA_EYE_ROTATION DEG_TO_RAD(30.0f)
+
+#define IN_REPORT_DK2 11
 
 // asserts the size of a type is equal to the byte size provided
 #define SIZE_ASSERT(type, size) static_assert(sizeof(type) == (size))
@@ -114,11 +116,6 @@ enum rift_lens_type
 	RIFT_LENS_TYPE_B = 1,
 };
 
-#define IN_REPORT_DK2 11
-
-#define CATMULL_COEFFICIENTS 11
-#define CHROMATIC_ABBERATION_COEFFEICENT_COUNT 4
-
 enum rift_lens_distortion_version
 {
 	// no distortion data is stored
@@ -127,9 +124,16 @@ enum rift_lens_distortion_version
 	RIFT_LENS_DISTORTION_LCSV_CATMULL_ROM_10_VERSION_1 = 1,
 };
 
+enum rift_component_flags
+{
+	RIFT_COMPONENT_DISPLAY = 1 << 0,
+	RIFT_COMPONENT_AUDIO = 1 << 1,
+	RIFT_COMPONENT_LEDS = 1 << 2,
+};
+
 /*
  *
- * Packed structs for USB communication (borrowed from Rokid driver)
+ * Packed structs for USB communication
  *
  */
 
@@ -168,6 +172,9 @@ struct rift_display_info_report
 };
 
 SIZE_ASSERT(struct rift_display_info_report, 55);
+
+#define CATMULL_COEFFICIENTS 11
+#define CHROMATIC_ABBERATION_COEFFEICENT_COUNT 4
 
 struct rift_catmull_rom_distortion_report_data
 {
@@ -326,7 +333,32 @@ struct dk2_in_report
 
 SIZE_ASSERT(struct dk2_in_report, 63);
 
+struct rift_enable_components_report
+{
+	uint16_t command_id;
+	// which components to enable, see rift_component_flags
+	uint8_t flags;
+};
+
+SIZE_ASSERT(struct rift_enable_components_report, 3);
+
+struct rift_imu_calibration_report
+{
+	uint16_t command_id;
+	struct rift_dk2_sample_pack offset;
+	struct rift_dk2_sample_pack matrix_samples[3];
+	uint16_t temperature;
+};
+
+SIZE_ASSERT(struct rift_imu_calibration_report, sizeof(struct rift_dk2_sample_pack) * 4 + 4);
+
 #pragma pack(pop)
+
+/*
+ *
+ * Parsed structs for internal use
+ *
+ */
 
 struct rift_catmull_rom_distortion_data
 {
@@ -379,6 +411,15 @@ struct rift_extra_display_info
 	struct rift_scale_and_offset eye_to_source_uv;
 };
 
+struct rift_imu_calibration
+{
+	struct xrt_vec3 gyro_offset;
+	struct xrt_vec3 accel_offset;
+	struct xrt_matrix_3x3 gyro_matrix;
+	struct xrt_matrix_3x3 accel_matrix;
+	float temperature;
+};
+
 /*!
  * A rift HMD device.
  *
@@ -399,12 +440,13 @@ struct rift_hmd
 	struct os_thread_helper sensor_thread;
 	bool processed_sample_packet;
 	uint32_t last_remote_sample_time_us;
-	int64_t last_remote_sample_time_ns;
+	timepoint_ns last_remote_sample_time_ns;
+	timepoint_ns last_sample_local_timestamp_ns;
 
 	struct m_imu_3dof fusion;
 	struct m_clock_windowed_skew_tracker *clock_tracker;
 
-	int64_t last_keepalive_time;
+	timepoint_ns last_keepalive_time;
 	enum rift_variant variant;
 	struct rift_config_report config;
 	struct rift_display_info_report display_info;
@@ -414,6 +456,9 @@ struct rift_hmd
 	uint16_t distortion_in_use;
 
 	struct rift_extra_display_info extra_display_info;
+
+	bool imu_needs_calibration;
+	struct rift_imu_calibration imu_calibration;
 };
 
 /// Casting helper function

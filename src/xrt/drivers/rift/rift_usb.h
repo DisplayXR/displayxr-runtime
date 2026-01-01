@@ -28,8 +28,18 @@ rift_set_config(struct rift_hmd *hmd, struct rift_config_report *config);
 int
 rift_get_display_info(struct rift_hmd *hmd, struct rift_display_info_report *display_info);
 
+int
+rift_enable_components(struct rift_hmd *hmd, struct rift_enable_components_report *enable_components);
+
+int
+rift_get_imu_calibration(struct rift_hmd *hmd, struct rift_imu_calibration *imu_calibration);
+
 void
-rift_decode_sample(const uint8_t *in, int32_t *out);
+rift_unpack_int_sample(const uint8_t *in, struct xrt_vec3_i32 *out);
+
+void
+rift_unpack_float_sample(const uint8_t *in, float scale, struct xrt_vec3 *out);
+
 
 void
 rift_sample_to_imu_space(const int32_t *in, struct xrt_vec3 *out);
