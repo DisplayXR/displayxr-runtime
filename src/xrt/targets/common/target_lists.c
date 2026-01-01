@@ -193,7 +193,8 @@ struct xrt_prober_entry target_entry_list[] = {
 #endif // XRT_BUILD_DRIVER_PSSENSE
 
 #ifdef XRT_BUILD_DRIVER_RIFT
-    {OCULUS_VR_VID, OCULUS_DK2_PID, rift_found, "Rift (DK2)", "rift"},
+    {OCULUS_VR_VID, OCULUS_DK2_PID, rift_found, RIFT_DK2_PRODUCT_STRING, "rift"},
+    {OCULUS_VR_VID, OCULUS_CV1_PID, rift_found, RIFT_CV1_PRODUCT_STRING, "rift"},
 #endif // XRT_BUILD_DRIVER_RIFT
 
 #ifdef XRT_BUILD_DRIVER_BLUBUR_S1
