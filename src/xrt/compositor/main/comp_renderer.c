@@ -571,8 +571,8 @@ renderer_ensure_images_and_renderings(struct comp_renderer *r, bool force_recrea
 	comp_target_create_images(target, &info, r->c->base.vk.main_queue);
 
 	bool pre_rotate = false;
-	if (r->c->target->surface_transform & VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR ||
-	    r->c->target->surface_transform & VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR) {
+	if (target->surface_transform & VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR ||
+	    target->surface_transform & VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR) {
 		pre_rotate = true;
 	}
 
