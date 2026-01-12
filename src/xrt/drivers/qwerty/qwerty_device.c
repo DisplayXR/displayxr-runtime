@@ -70,13 +70,35 @@ static struct xrt_binding_output_pair simple_outputs[1] = {
     {XRT_OUTPUT_NAME_SIMPLE_VIBRATION, XRT_OUTPUT_NAME_WMR_HAPTIC},
 };
 
-static struct xrt_binding_profile binding_profiles[1] = {
+// https://registry.khronos.org/OpenXR/specs/1.1/html/xrspec.html#_designing_suggesting_bindings
+static struct xrt_binding_input_pair mx_ink_inputs[7] = {
+    {XRT_INPUT_MX_INK_FRONT_CLICK, XRT_INPUT_WMR_SQUEEZE_CLICK},
+    {XRT_INPUT_MX_INK_FRONT_DOUBLE_TAP, XRT_INPUT_WMR_HOME_CLICK},
+    {XRT_INPUT_MX_INK_MIDDLE_VALUE, XRT_INPUT_WMR_TRIGGER_VALUE},
+    {XRT_INPUT_MX_INK_BACK_CLICK, XRT_INPUT_WMR_TRACKPAD_CLICK},
+    {XRT_INPUT_MX_INK_BACK_DOUBLE_TAP, XRT_INPUT_WMR_MENU_CLICK},
+    {XRT_INPUT_MX_INK_GRIP_POSE, XRT_INPUT_WMR_GRIP_POSE},
+    {XRT_INPUT_MX_INK_AIM_POSE, XRT_INPUT_WMR_AIM_POSE},
+};
+
+static struct xrt_binding_output_pair mx_ink_outputs[1] = {
+    {XRT_OUTPUT_NAME_MX_INK_HAPTIC, XRT_OUTPUT_NAME_WMR_HAPTIC},
+};
+
+static struct xrt_binding_profile binding_profiles[2] = {
     {
         .name = XRT_DEVICE_SIMPLE_CONTROLLER,
         .inputs = simple_inputs,
         .input_count = ARRAY_SIZE(simple_inputs),
         .outputs = simple_outputs,
         .output_count = ARRAY_SIZE(simple_outputs),
+    },
+    {
+        .name = XRT_DEVICE_LOGITECH_MX_INK_CONTROLLER,
+        .inputs = mx_ink_inputs,
+        .input_count = ARRAY_SIZE(mx_ink_inputs),
+        .outputs = mx_ink_outputs,
+        .output_count = ARRAY_SIZE(mx_ink_outputs),
     },
 };
 

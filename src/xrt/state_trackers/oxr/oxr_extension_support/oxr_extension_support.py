@@ -99,6 +99,7 @@ EXTENSIONS = (
     ['XR_HTC_facial_tracking', 'XRT_FEATURE_OPENXR_FACIAL_TRACKING_HTC'],
     ['XR_HTC_vive_cosmos_controller_interaction', 'XRT_FEATURE_OPENXR_INTERACTION_VIVE_COSMOS'],
     ['XR_HTC_vive_focus3_controller_interaction', 'XRT_FEATURE_OPENXR_INTERACTION_VIVE_FOCUS3'],
+    ['XR_LOGITECH_mx_ink_stylus_interaction', 'XRT_FEATURE_OPENXR_INTERACTION_LOGITECH_MX_INK'],
     ['XR_META_body_tracking_calibration', 'XRT_FEATURE_OPENXR_BODY_TRACKING_CALIBRATION_META'],
     ['XR_META_body_tracking_full_body', 'XRT_FEATURE_OPENXR_BODY_TRACKING_FULL_BODY_META'],
     ['XR_META_touch_controller_plus', 'XRT_FEATURE_OPENXR_INTERACTION_TOUCH_PLUS'],

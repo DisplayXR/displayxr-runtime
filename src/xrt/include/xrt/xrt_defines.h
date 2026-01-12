@@ -746,6 +746,7 @@ enum xrt_device_name
 
 	XRT_DEVICE_HP_REVERB_G2_CONTROLLER,
 	XRT_DEVICE_SAMSUNG_ODYSSEY_CONTROLLER,
+	XRT_DEVICE_LOGITECH_MX_INK_CONTROLLER,
 	XRT_DEVICE_ML2_CONTROLLER,
 	XRT_DEVICE_OPPO_MR_CONTROLLER,
 
@@ -1363,6 +1364,18 @@ enum xrt_input_name
 	XRT_INPUT_FLIPVR_SQUEEZE_VALUE                              = XRT_INPUT_NAME(0X1310, VEC1_ZERO_TO_ONE),
 	XRT_INPUT_FLIPVR_GRIP_POSE                                  = XRT_INPUT_NAME(0X1311, POSE),
 	XRT_INPUT_FLIPVR_AIM_POSE                                   = XRT_INPUT_NAME(0X1312, POSE),
+
+	XRT_INPUT_MX_INK_GRIP_POSE                                  = XRT_INPUT_NAME(0x1400, POSE),
+	XRT_INPUT_MX_INK_AIM_POSE                                   = XRT_INPUT_NAME(0x1401, POSE),
+	XRT_INPUT_MX_INK_SYSTEM_CLICK                               = XRT_INPUT_NAME(0x1402, BOOLEAN),
+	XRT_INPUT_MX_INK_FRONT_CLICK                                = XRT_INPUT_NAME(0x1403, BOOLEAN),
+	XRT_INPUT_MX_INK_FRONT_DOUBLE_TAP                           = XRT_INPUT_NAME(0x1404, BOOLEAN),
+	XRT_INPUT_MX_INK_MIDDLE_VALUE                               = XRT_INPUT_NAME(0x1405, VEC1_ZERO_TO_ONE),
+	XRT_INPUT_MX_INK_BACK_CLICK                                 = XRT_INPUT_NAME(0x1406, BOOLEAN),
+	XRT_INPUT_MX_INK_BACK_DOUBLE_TAP                            = XRT_INPUT_NAME(0x1407, BOOLEAN),
+	XRT_INPUT_MX_INK_DOCKED                                     = XRT_INPUT_NAME(0x1408, BOOLEAN),
+	XRT_INPUT_MX_INK_TIP_FORCE                                  = XRT_INPUT_NAME(0x1409, VEC1_ZERO_TO_ONE),
+	XRT_INPUT_MX_INK_TIP_POSE                                   = XRT_INPUT_NAME(0x140A, POSE),
 	// clang-format on
 };
 
@@ -1593,6 +1606,8 @@ enum xrt_output_name
 	XRT_OUTPUT_NAME_PSVR2_HAPTIC                                = XRT_OUTPUT_NAME(0x0800, VIBRATION),
 
 	XRT_OUTPUT_NAME_FLIPVR_HAPTIC                               = XRT_OUTPUT_NAME(0x0900, VIBRATION),
+
+	XRT_OUTPUT_NAME_MX_INK_HAPTIC                               = XRT_OUTPUT_NAME(0x0A00, VIBRATION)
 	// clang-format on
 };
 
