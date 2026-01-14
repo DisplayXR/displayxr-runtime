@@ -398,6 +398,19 @@ struct ipc_server
 	// How long to wait after all clients disconnect before exiting (in nanoseconds)
 	uint64_t exit_when_idle_delay_ns;
 
+	/*!
+	 * Global start of time timestamp. XrTime that is returned to apps
+	 * start from this timestamps (with an per app offset applied). In order
+	 * to ensure that all timestamps for events and other data that is
+	 * tracked by the runtime within the valid range of XrTime it is offset
+	 * to be 42 minutes in the past from start of the runtime.
+	 *
+	 * Used to get all the client's xrt_instance::startup_timestamp, to be
+	 * close to each other but not exactly the same, which is then used to
+	 * be the base of that app's XrTime start of time.
+	 */
+	int64_t start_of_time_timestamp_ns;
+
 	enum u_logging_level log_level;
 
 	struct ipc_thread threads[IPC_MAX_CLIENTS];

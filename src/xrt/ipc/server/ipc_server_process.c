@@ -202,8 +202,15 @@ init_shm_and_instance_state(struct ipc_server *s, volatile struct ipc_client_sta
 	// Clients expect git version info and timestamp available upon connect.
 	snprintf(ism->u_git_tag, IPC_VERSION_NAME_LEN, "%s", u_git_tag);
 
-	// Used to synchronize all client's xrt_instance::startup_timestamp.
-	ism->startup_timestamp = os_monotonic_get_ns();
+	/*
+	 * Used to synchronize all client's xrt_instance::startup_timestamp.
+	 * Add random variation of ±5 minutes around the global runtime startup timestamp
+	 * so clients are close to each other but not exactly the same.
+	 */
+	const int64_t variation_range_ns = (int64_t)(10 * 60) * U_TIME_1S_IN_NS; // 10 minutes total range
+	const int64_t half_range_ns = (int64_t)(5 * 60) * U_TIME_1S_IN_NS;       // 5 minutes
+	int64_t random_offset_ns = ((int64_t)rand() % variation_range_ns) - half_range_ns;
+	ism->startup_timestamp = s->start_of_time_timestamp_ns + random_offset_ns;
 
 	return XRT_SUCCESS;
 }
@@ -331,6 +338,17 @@ init_all(struct ipc_server *s,
 	s->last_client_disconnect_ns = 0;
 	uint64_t delay_ms = debug_get_num_option_exit_when_idle_delay_ms();
 	s->exit_when_idle_delay_ns = delay_ms * U_TIME_1MS_IN_NS;
+
+	// See the comment in ipc_server.h for more details.
+	const int64_t offset = (int64_t)(42 * 60) * U_TIME_1S_IN_NS;
+	s->start_of_time_timestamp_ns = os_monotonic_get_ns() - offset;
+
+	/*
+	 * Initialize random number generator for startup timestamp variation.
+	 * This not used for any security critical purposes, just to ensure that
+	 * the startup timestamps are not exactly the same for all clients.
+	 */
+	srand((unsigned int)(os_monotonic_get_ns() / U_TIME_1MS_IN_NS));
 
 	xret = xrt_instance_create(NULL, &s->xinst);
 	IPC_CHK_WITH_GOTO(s, xret, "xrt_instance_create", error);
