@@ -3,7 +3,7 @@ name: Build Windows
 on:
   push:
     branches:
-      - master
+      - main
       - '*with-ci-build'
     tags:
       - 'v*'
