@@ -219,10 +219,10 @@ simulated_hmd_create(enum simulated_movement movement, const struct xrt_pose *ce
 	// Setup info.
 	bool ret = true;
 	struct u_device_simple_info info;
-	info.display.w_pixels = 1280 * 2;	// 2x desired view width
-	info.display.h_pixels = 720;		// Desired view height
-	info.display.w_meters = 0.294f;		// 15.6" width
-	info.display.h_meters = 0.121f;		// 15.6" height
+	info.display.w_pixels = 1280;
+	info.display.h_pixels = 720;
+	info.display.w_meters = 0.13f;
+	info.display.h_meters = 0.07f;
 	info.lens_horizontal_separation_meters = 0.13f / 2.0f;
 	info.lens_vertical_position_meters = 0.07f / 2.0f;
 

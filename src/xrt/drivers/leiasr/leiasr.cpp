@@ -1,15 +1,22 @@
 #include "leiasr.h"
 #include "util/u_misc.h"
 
-#include <sr/management/srcontext.h>
+#include <sr/weaver/vkweaver.h>
 #include <sr/world/display/display.h>
 #include <sr/utility/exception.h>
 
 #include <windows.h>
 #include <sysinfoapi.h>
 
-struct leiasr {
-    SR::SRContext* context = nullptr;
+struct leiasr
+{
+	VkDevice            device         = nullptr;
+	VkPhysicalDevice    physicalDevice = nullptr;
+	VkQueue             graphicsQueue  = nullptr;
+	VkCommandPool       commandPool    = nullptr;
+	VkCommandBuffer     commandBuffer  = nullptr;
+	SR::SRContext*      context        = nullptr;
+	SR::IVulkanWeaver1* weaver         = nullptr;
 };
 
 namespace {
@@ -78,20 +85,79 @@ bool CreateSRContext(double maxTime, leiasr& sr)
     return (sr.context != nullptr) && displayReady;
 }
 
+bool CreateSRWeaver(SR::SRContext* context, VkDevice device, VkPhysicalDevice physicalDevice, VkQueue graphicsQueue, VkCommandPool commandPool, HWND hWnd, leiasr* out)
+{
+	// Create weaver.
+	WeaverErrorCode createWeaverResult = SR::CreateVulkanWeaver(*context, device, physicalDevice, graphicsQueue, commandPool, hWnd, &out->weaver);
+	if (createWeaverResult != WeaverErrorCode::WeaverSuccess)
+	{
+		assert(false);
+		return false;
+	}
+
+	return true;
+}
+
 } // namespace anonymous
 
 extern "C" {
 
-xrt_result_t leiasr_create(struct leiasr** out)
+xrt_result_t leiasr_create(double maxTime, VkDevice device, VkPhysicalDevice physicalDevice, VkQueue graphicsQueue, VkCommandPool commandPool, struct leiasr **out)
 {
-    *out = new leiasr;
-    CreateSRContext(999.0, **out);
-    return XRT_SUCCESS;
+	leiasr* sr = new leiasr;
+
+	if (!CreateSRContext(maxTime, *sr))
+	{
+		assert(false);
+		return XRT_ERROR_VULKAN;
+	}
+
+	{
+		VkCommandBufferAllocateInfo allocInfo = {};
+		allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+		allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+		allocInfo.commandPool = commandPool;
+		allocInfo.commandBufferCount = 1;
+		vkAllocateCommandBuffers(device, &allocInfo, &sr->commandBuffer);
+	}
+
+	sr->physicalDevice = physicalDevice;
+	sr->commandPool = commandPool;
+	sr->graphicsQueue = graphicsQueue;
+	sr->device = device;
+
+	if (!CreateSRWeaver(sr->context, device, physicalDevice, graphicsQueue, commandPool, NULL, sr))
+	{
+		assert(false);
+		return XRT_ERROR_VULKAN;
+	}
+
+	sr->context->initialize();
+
+	*out = sr;
+
+	return XRT_SUCCESS;
 }
 
 void leiasr_destroy(struct leiasr* leiasr)
 {
     delete leiasr;
+}
+
+void leiasr_weave(struct leiasr* leiasr, VkCommandBuffer commandBuffer, VkImageView leftImageView, VkImageView rightImageView, VkRect2D viewport, int imageWidth, int imageHeight, VkFormat imageFormat, VkFramebuffer framebuffer, int framebufferWidth, int framebufferHeight, VkFormat framebufferFormat)
+{
+	RECT rect = {};
+	rect.left   = viewport.offset.x;
+	rect.top    = viewport.offset.y;
+	rect.right  = rect.left + viewport.extent.width;
+	rect.bottom = rect.top  + viewport.extent.height;
+
+	leiasr->weaver->setViewport(rect);
+	leiasr->weaver->setScissorRect(rect);
+	leiasr->weaver->setCommandBuffer(commandBuffer);
+	leiasr->weaver->setOutputFrameBuffer(framebuffer, framebufferWidth, framebufferHeight, framebufferFormat);
+	leiasr->weaver->setInputViewTexture(leftImageView, rightImageView, imageWidth, imageHeight, imageFormat);
+	leiasr->weaver->weave();
 }
 
 } // extern "C"

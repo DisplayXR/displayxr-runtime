@@ -30,8 +30,7 @@
 #include "util/u_var.h"
 #include "util/u_frame_times_widget.h"
 #include "util/u_debug.h"
-
-#include "util/comp_render.h"
+#include "util/comp_render_helpers.h"
 #include "util/comp_high_level_render.h"
 
 #include "main/comp_frame.h"
@@ -575,11 +574,11 @@ renderer_init(struct comp_renderer *r, struct comp_compositor *c, VkExtent2D scr
 	leia_core_init_configuration_free(config);
 #endif
 
-#ifdef XRT_HAVE_LEIA_SR
-	leiasr_create(&r->leiasr);
-#endif // XRT_HAVE_LEIA_SR
-
 	struct vk_bundle *vk = &r->c->base.vk;
+
+#ifdef XRT_HAVE_LEIA_SR
+	leiasr_create(1000.0, vk->device, vk->physical_device, vk->main_queue->queue, r->target_render_pass.r->cmd_pool, &r->leiasr);
+#endif // XRT_HAVE_LEIA_SR
 
 	VkResult ret = comp_mirror_init( //
 	    &r->mirror_to_debug_gui,     //
@@ -891,13 +890,42 @@ renderer_fini(struct comp_renderer *r)
 #endif // XRT_HAVE_LEIA_SR
 }
 
+static bool getLayerInfo(struct comp_renderer *r, int view_index, int* width, int* height, VkFormat* format, VkImageView* imageView)
+{
+	const int layerCount = r->c->base.layer_accum.layer_count;
+	if (layerCount < 1)
+		return false;
+
+	struct comp_layer *theLayer = &r->c->base.layer_accum.layers[0];
+
+	const struct xrt_layer_data *layer_data = &theLayer->data;
+	if (layer_data->type != XRT_LAYER_PROJECTION && layer_data->type != XRT_LAYER_PROJECTION_DEPTH)
+		return false;
+	
+	const struct xrt_layer_projection_view_data *vd = NULL;
+	view_index_to_projection_data(view_index, layer_data, &vd);
+
+	const uint32_t sc_array_index = is_view_index_right(view_index) ? 1 : 0;
+	const uint32_t array_index = vd->sub.array_index;
+	const struct comp_swapchain *sc = (struct comp_swapchain *)(comp_layer_get_swapchain(theLayer, sc_array_index));
+	const struct comp_swapchain_image *image = &sc->images[array_index];
+
+	*width = layer_data->proj.v[view_index].sub.rect.extent.w;
+	*height = layer_data->proj.v[view_index].sub.rect.extent.h;
+	*format = (VkFormat)sc->vkic.info.format;
+	*imageView = get_image_view(image, layer_data->flags, array_index);
+
+	return true;
+}
+
 static void
 do_weaving(struct comp_renderer *r,
-                     struct render_gfx_target_resources *rtr,
-                     const struct comp_layer *layer,
-                     const struct xrt_layer_projection_view_data *lvd,
-                     const struct xrt_layer_projection_view_data *rvd)
+           struct render_gfx *render,
+           struct render_gfx_target_resources *rtr,
+           const struct comp_layer *layer,
+           struct chl_frame_state *frame_state)
 {
+
 #ifdef XRT_HAVE_CNSDK
 	if (!r->interlacer && leia_core_is_initialized(r->cnsdk)) {
 		struct leia_interlacer_init_configuration *ic = leia_interlacer_init_configuration_alloc();
@@ -928,10 +956,46 @@ do_weaving(struct comp_renderer *r,
 #endif
 
 #ifdef XRT_HAVE_LEIA_SR
-	// TODO: Weave using LeiaSR
+
+	struct vk_bundle* vk = &r->c->base.vk;
+	struct comp_target* ct = r->c->target;
+	struct comp_compositor* c  = r->c;
+
+	// Get command-buffer
+	VkCommandBuffer commandBuffer = render->r->cmd;
+
+	// Get framebuffer.
+	VkFramebuffer framebuffer = rtr->framebuffer;
+	int framebufferWidth = rtr->extent.width;
+	int framebufferHeight = rtr->extent.height;
+	VkFormat framebufferFormat = rtr->rgrp->format;
+
+        // Get views.
+	int imageWidth = 0;
+	int imageHeight = 0;
+	VkFormat imageFormat = VK_FORMAT_UNDEFINED;
+	VkImageView leftImageView = VK_NULL_HANDLE;
+	VkImageView rightImageView = VK_NULL_HANDLE;
+	bool leftViewOk = getLayerInfo(r, 0, &imageWidth, &imageHeight, &imageFormat, &leftImageView);
+	bool rightViewOk = getLayerInfo(r, 1, &imageWidth, &imageHeight, &imageFormat, &rightImageView);
+
+	// Get viewport (fullscreen).
+	VkRect2D viewport = {0};
+	viewport.offset.x = 0;
+	viewport.offset.y = 0;
+	viewport.extent.width = framebufferWidth;
+	viewport.extent.height = framebufferHeight;
+
+	// Weave.
+	if (leftViewOk && rightViewOk)
+	{
+		render_gfx_begin(render);
+		leiasr_weave(r->leiasr, commandBuffer, leftImageView, rightImageView, viewport, imageWidth, imageHeight, imageFormat, framebuffer, framebufferWidth, framebufferHeight, framebufferFormat);
+		render_gfx_end(render);
+	}
+
 #endif // XRT_HAVE_LEIA_SR
 }
-
 
 /*
  *
@@ -994,9 +1058,8 @@ dispatch_graphics(struct comp_renderer *r,
 	    viewport_datas,                   //
 	    vertex_rots);                     //
 
-	// TODO: interlace here?
-	// TODO: find what do_gfx_mesh_and_proj was doing
-	// do_weaving(r, rtr, layer, lvd, rvd);
+	// Weave.
+	do_weaving(r, render, rtr, layers, frame_state);
 
 	// Everything is ready, submit to the queue.
 	ret = renderer_submit_queue(r, render->r->cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
@@ -1062,9 +1125,6 @@ dispatch_compute(struct comp_renderer *r,
 	    target_image,                    //
 	    target_storage_view,             //
 	    target_viewport_datas);          //
-
-	// TODO: interlace here?
-	// do_weaving(r, rtr, layer, lvd, rvd);
 
 	// Everything is ready, submit to the queue.
 	ret = renderer_submit_queue(r, render->r->cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);

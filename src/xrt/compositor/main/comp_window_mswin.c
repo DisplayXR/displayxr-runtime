@@ -260,7 +260,7 @@ static bool get_leia_display_top_left_coordinate(int* x, int* y)
 	return false;
 }
 
-void set_fullscreen(HWND hWnd, bool fullscreen)
+static void set_fullscreen(HWND hWnd, bool fullscreen)
 {
 	static int windowPrevX = 0;
 	static int windowPrevY = 0;

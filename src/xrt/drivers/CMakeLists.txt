@@ -526,11 +526,17 @@ if(XRT_BUILD_DRIVER_STEAMVR_LIGHTHOUSE)
 endif()
 
 if(XRT_HAVE_LEIA_SR)
+    set(LEIASR_SDKROOT "$ENV{LEIASR_SDKROOT}" CACHE PATH "Path to LEIASR SDK root")
 	add_library(drv_leiasr STATIC leiasr/leiasr.cpp leiasr/leiasr.h)
+    target_include_directories(drv_leiasr PRIVATE
+        ${LEIASR_SDKROOT}/include
+        ${LEIASR_SDKROOT}/third_party/OpenCV/include)
 	target_link_libraries(drv_leiasr PRIVATE
 		xrt-interfaces aux_util
-		simulatedreality::simulatedreality
-		srDirectX::srDirectX
+		${LEIASR_SDKROOT}/lib/SimulatedRealityCore.lib # should have been srCore::srCore but it's broken due to libfilter
+		${LEIASR_SDKROOT}/lib/SimulatedRealityDisplays.lib # should have been srDisplays::srDisplays but it requires srCore::srCore
+        ${LEIASR_SDKROOT}/lib/SimulatedRealityVulkanBeta.lib
+		${LEIASR_SDKROOT}/third_party/OpenCV/lib/x64/opencv_world343.lib
 		PUBLIC drv_includes)
 	list(APPEND ENABLED_DRIVERS drv_leiasr)
 endif(XRT_HAVE_LEIA_SR)

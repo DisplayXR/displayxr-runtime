@@ -151,6 +151,11 @@ if(WIN32 AND NOT MINGW)
 	set(WINDOWSAPP_LIBRARY WindowsApp)
 endif()
 
+if(WIN32)
+	set(LEIASR_SDKROOT "$ENV{LEIASR_SDKROOT}" CACHE PATH "Path to LEIASR SDK root")
+	list(APPEND CMAKE_PREFIX_PATH "${LEIASR_SDKROOT}/lib/cmake")
+endif()
+
 find_package(CNSDK CONFIG)
 find_package(simulatedreality CONFIG GLOBAL)
 find_package(srDirectX CONFIG GLOBAL)
