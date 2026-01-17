@@ -376,9 +376,22 @@ struct rift_radio_address_radio_report
 
 SIZE_ASSERT(struct rift_radio_address_radio_report, 7);
 
+enum rift_radio_report_remote_button_masks
+{
+	RIFT_REMOTE_BUTTON_MASK_DPAD_UP = 0x001,
+	RIFT_REMOTE_BUTTON_MASK_DPAD_DOWN = 0x002,
+	RIFT_REMOTE_BUTTON_MASK_DPAD_LEFT = 0x004,
+	RIFT_REMOTE_BUTTON_MASK_DPAD_RIGHT = 0x008,
+	RIFT_REMOTE_BUTTON_MASK_SELECT = 0x010,
+	RIFT_REMOTE_BUTTON_MASK_VOLUME_UP = 0x020,
+	RIFT_REMOTE_BUTTON_MASK_VOLUME_DOWN = 0x040,
+	RIFT_REMOTE_BUTTON_MASK_OCULUS = 0x080,
+	RIFT_REMOTE_BUTTON_MASK_BACK = 0x100,
+};
+
 struct rift_radio_report_remote_message
 {
-	// the button state of the controller, see rift_radio_report_remote_buttons
+	// the button state of the controller, see rift_radio_report_remote_button_masks
 	uint16_t buttons;
 };
 
@@ -562,6 +575,33 @@ struct rift_touch_controller
 	struct rift_touch_controller_input_state input_state;
 };
 
+enum rift_remote_inputs
+{
+	RIFT_REMOTE_INPUT_DPAD_UP,
+	RIFT_REMOTE_INPUT_DPAD_DOWN,
+	RIFT_REMOTE_INPUT_DPAD_LEFT,
+	RIFT_REMOTE_INPUT_DPAD_RIGHT,
+	RIFT_REMOTE_INPUT_SELECT,
+	RIFT_REMOTE_INPUT_VOLUME_UP,
+	RIFT_REMOTE_INPUT_VOLUME_DOWN,
+	RIFT_REMOTE_INPUT_BACK,
+	RIFT_REMOTE_INPUT_OCULUS,
+	RIFT_REMOTE_INPUT_COUNT,
+};
+
+/*!
+ * A Rift Remote device.
+ *
+ * @implements xrt_device
+ */
+struct rift_remote
+{
+	struct xrt_device base;
+
+	//! The button state of the remote, stored as an atomic to avoid needing a mutex.
+	xrt_atomic_s32_t buttons;
+};
+
 /*!
  * A rift HMD device.
  *
@@ -620,6 +660,7 @@ struct rift_hmd
 		struct os_thread_helper thread;
 
 		struct rift_touch_controller *touch_controllers[3];
+		struct rift_remote *remote;
 	} radio_state;
 };
 
@@ -634,6 +675,12 @@ static inline struct rift_touch_controller *
 rift_touch_controller(struct xrt_device *xdev)
 {
 	return (struct rift_touch_controller *)xdev;
+}
+
+static inline struct rift_remote *
+rift_remote(struct xrt_device *xdev)
+{
+	return (struct rift_remote *)xdev;
 }
 
 static inline size_t

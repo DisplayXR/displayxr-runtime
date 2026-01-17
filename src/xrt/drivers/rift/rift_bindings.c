@@ -92,3 +92,24 @@ struct xrt_binding_profile touch_profile_bindings[] = {
     },
 };
 uint32_t touch_profile_bindings_count = ARRAY_SIZE(touch_profile_bindings);
+
+static struct xrt_binding_input_pair xbox_inputs_remote[] = {
+    {XRT_INPUT_XBOX_A_CLICK, XRT_INPUT_RIFT_REMOTE_SELECT_CLICK},
+    {XRT_INPUT_XBOX_B_CLICK, XRT_INPUT_RIFT_REMOTE_VOLUME_DOWN_CLICK},
+    {XRT_INPUT_XBOX_X_CLICK, XRT_INPUT_RIFT_REMOTE_VOLUME_UP_CLICK},
+    {XRT_INPUT_XBOX_DPAD_UP_CLICK, XRT_INPUT_RIFT_REMOTE_DPAD_UP_CLICK},
+    {XRT_INPUT_XBOX_DPAD_DOWN_CLICK, XRT_INPUT_RIFT_REMOTE_DPAD_DOWN_CLICK},
+    {XRT_INPUT_XBOX_DPAD_LEFT_CLICK, XRT_INPUT_RIFT_REMOTE_DPAD_RIGHT_CLICK},
+    {XRT_INPUT_XBOX_DPAD_RIGHT_CLICK, XRT_INPUT_RIFT_REMOTE_DPAD_RIGHT_CLICK},
+    {XRT_INPUT_XBOX_VIEW_CLICK, XRT_INPUT_RIFT_REMOTE_BACK_CLICK},
+    {XRT_INPUT_XBOX_MENU_CLICK, XRT_INPUT_RIFT_REMOTE_OCULUS_CLICK},
+};
+
+struct xrt_binding_profile remote_profile_bindings[] = {
+    {
+        .name = XRT_DEVICE_XBOX_CONTROLLER,
+        .inputs = xbox_inputs_remote,
+        .input_count = ARRAY_SIZE(xbox_inputs_remote),
+    },
+};
+uint32_t remote_profile_bindings_count = ARRAY_SIZE(remote_profile_bindings);

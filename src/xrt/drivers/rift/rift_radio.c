@@ -15,13 +15,10 @@
 
 
 static void
-rift_touch_update_input(struct rift_touch_controller *controller,
-                        enum rift_touch_controller_input input,
-                        union xrt_input_value value,
-                        int64_t now)
+rift_update_input(struct xrt_device *device, size_t index, union xrt_input_value value, int64_t now)
 {
-	controller->base.inputs[input].value = value;
-	controller->base.inputs[input].timestamp = now;
+	device->inputs[index].value = value;
+	device->inputs[index].timestamp = now;
 }
 
 /*
@@ -71,40 +68,94 @@ rift_touch_controller_update_inputs(struct xrt_device *xdev)
 
 	uint64_t now = os_monotonic_get_ns();
 
-	rift_touch_update_input(
-	    controller, RIFT_TOUCH_CONTROLLER_INPUT_A_CLICK,
-	    (union xrt_input_value){.boolean = input_state.buttons & RIFT_TOUCH_CONTROLLER_BUTTON_A}, now);
-	rift_touch_update_input(
-	    controller, RIFT_TOUCH_CONTROLLER_INPUT_B_CLICK,
-	    (union xrt_input_value){.boolean = input_state.buttons & RIFT_TOUCH_CONTROLLER_BUTTON_B}, now);
-	rift_touch_update_input(
-	    controller, RIFT_TOUCH_CONTROLLER_INPUT_SYSTEM_CLICK,
-	    (union xrt_input_value){.boolean = input_state.buttons & RIFT_TOUCH_CONTROLLER_BUTTON_MENU}, now);
-	rift_touch_update_input(
-	    controller, RIFT_TOUCH_CONTROLLER_INPUT_THUMBSTICK_CLICK,
-	    (union xrt_input_value){.boolean = input_state.buttons & RIFT_TOUCH_CONTROLLER_BUTTON_STICK}, now);
+	rift_update_input(&controller->base, RIFT_TOUCH_CONTROLLER_INPUT_A_CLICK,
+	                  (union xrt_input_value){.boolean = input_state.buttons & RIFT_TOUCH_CONTROLLER_BUTTON_A},
+	                  now);
+	rift_update_input(&controller->base, RIFT_TOUCH_CONTROLLER_INPUT_B_CLICK,
+	                  (union xrt_input_value){.boolean = input_state.buttons & RIFT_TOUCH_CONTROLLER_BUTTON_B},
+	                  now);
+	rift_update_input(&controller->base, RIFT_TOUCH_CONTROLLER_INPUT_SYSTEM_CLICK,
+	                  (union xrt_input_value){.boolean = input_state.buttons & RIFT_TOUCH_CONTROLLER_BUTTON_MENU},
+	                  now);
+	rift_update_input(&controller->base, RIFT_TOUCH_CONTROLLER_INPUT_THUMBSTICK_CLICK,
+	                  (union xrt_input_value){.boolean = input_state.buttons & RIFT_TOUCH_CONTROLLER_BUTTON_STICK},
+	                  now);
 
-	rift_touch_update_input(controller, RIFT_TOUCH_CONTROLLER_INPUT_THUMBSTICK,
-	                        (union xrt_input_value){.vec2 = {CLAMP(input_state.stick[0], -1.0f, 1.0f),
-	                                                         CLAMP(input_state.stick[1], -1.0f, 1.0f)}},
-	                        now);
+	rift_update_input(&controller->base, RIFT_TOUCH_CONTROLLER_INPUT_THUMBSTICK,
+	                  (union xrt_input_value){.vec2 = {CLAMP(input_state.stick[0], -1.0f, 1.0f),
+	                                                   CLAMP(input_state.stick[1], -1.0f, 1.0f)}},
+	                  now);
 
-	rift_touch_update_input(controller, RIFT_TOUCH_CONTROLLER_INPUT_TRIGGER_VALUE,
-	                        (union xrt_input_value){.vec1 = {CLAMP(input_state.trigger, 0.0f, 1.0f)}}, now);
-	rift_touch_update_input(controller, RIFT_TOUCH_CONTROLLER_INPUT_SQUEEZE_VALUE,
-	                        (union xrt_input_value){.vec1 = {CLAMP(input_state.grip, 0.0f, 1.0f)}}, now);
+	rift_update_input(&controller->base, RIFT_TOUCH_CONTROLLER_INPUT_TRIGGER_VALUE,
+	                  (union xrt_input_value){.vec1 = {CLAMP(input_state.trigger, 0.0f, 1.0f)}}, now);
+	rift_update_input(&controller->base, RIFT_TOUCH_CONTROLLER_INPUT_SQUEEZE_VALUE,
+	                  (union xrt_input_value){.vec1 = {CLAMP(input_state.grip, 0.0f, 1.0f)}}, now);
 
-	rift_touch_update_input(controller, RIFT_TOUCH_CONTROLLER_INPUT_A_TOUCH,
-	                        (union xrt_input_value){.boolean = input_state.cap_a_x >= 1}, now);
-	rift_touch_update_input(controller, RIFT_TOUCH_CONTROLLER_INPUT_B_TOUCH,
-	                        (union xrt_input_value){.boolean = input_state.cap_b_y >= 1}, now);
-	rift_touch_update_input(controller, RIFT_TOUCH_CONTROLLER_INPUT_TRIGGER_TOUCH,
-	                        (union xrt_input_value){.boolean = input_state.cap_trigger >= 1}, now);
-	rift_touch_update_input(controller, RIFT_TOUCH_CONTROLLER_INPUT_THUMBSTICK_TOUCH,
-	                        (union xrt_input_value){.boolean = input_state.cap_stick >= 1}, now);
-	rift_touch_update_input(controller, RIFT_TOUCH_CONTROLLER_INPUT_THUMBREST_TOUCH,
-	                        (union xrt_input_value){.boolean = input_state.cap_thumbrest >= 1}, now);
+	rift_update_input(&controller->base, RIFT_TOUCH_CONTROLLER_INPUT_A_TOUCH,
+	                  (union xrt_input_value){.boolean = input_state.cap_a_x >= 1}, now);
+	rift_update_input(&controller->base, RIFT_TOUCH_CONTROLLER_INPUT_B_TOUCH,
+	                  (union xrt_input_value){.boolean = input_state.cap_b_y >= 1}, now);
+	rift_update_input(&controller->base, RIFT_TOUCH_CONTROLLER_INPUT_TRIGGER_TOUCH,
+	                  (union xrt_input_value){.boolean = input_state.cap_trigger >= 1}, now);
+	rift_update_input(&controller->base, RIFT_TOUCH_CONTROLLER_INPUT_THUMBSTICK_TOUCH,
+	                  (union xrt_input_value){.boolean = input_state.cap_stick >= 1}, now);
+	rift_update_input(&controller->base, RIFT_TOUCH_CONTROLLER_INPUT_THUMBREST_TOUCH,
+	                  (union xrt_input_value){.boolean = input_state.cap_thumbrest >= 1}, now);
 
+
+	return XRT_SUCCESS;
+}
+
+/*
+ * Rift Remote device functions
+ */
+static xrt_result_t
+rift_remote_get_tracked_pose(struct xrt_device *xdev,
+                             const enum xrt_input_name name,
+                             int64_t at_timestamp_ns,
+                             struct xrt_space_relation *out_relation)
+{
+	// The remote has no tracked poses
+	return XRT_ERROR_INPUT_UNSUPPORTED;
+}
+
+static void
+rift_remote_destroy(struct xrt_device *xdev)
+{
+	struct rift_remote *remote = (struct rift_remote *)xdev;
+
+	u_var_remove_root(remote);
+
+	u_device_free(&remote->base);
+}
+
+static xrt_result_t
+rift_remote_update_inputs(struct xrt_device *xdev)
+{
+	struct rift_remote *remote = rift_remote(xdev);
+
+	uint64_t now = os_monotonic_get_ns();
+
+	uint16_t buttons = xrt_atomic_s32_load(&remote->buttons);
+
+	rift_update_input(&remote->base, RIFT_REMOTE_INPUT_DPAD_UP,
+	                  (union xrt_input_value){.boolean = buttons & RIFT_REMOTE_BUTTON_MASK_DPAD_UP}, now);
+	rift_update_input(&remote->base, RIFT_REMOTE_INPUT_DPAD_DOWN,
+	                  (union xrt_input_value){.boolean = buttons & RIFT_REMOTE_BUTTON_MASK_DPAD_DOWN}, now);
+	rift_update_input(&remote->base, RIFT_REMOTE_INPUT_DPAD_LEFT,
+	                  (union xrt_input_value){.boolean = buttons & RIFT_REMOTE_BUTTON_MASK_DPAD_LEFT}, now);
+	rift_update_input(&remote->base, RIFT_REMOTE_INPUT_DPAD_RIGHT,
+	                  (union xrt_input_value){.boolean = buttons & RIFT_REMOTE_BUTTON_MASK_DPAD_RIGHT}, now);
+	rift_update_input(&remote->base, RIFT_REMOTE_INPUT_SELECT,
+	                  (union xrt_input_value){.boolean = buttons & RIFT_REMOTE_BUTTON_MASK_SELECT}, now);
+	rift_update_input(&remote->base, RIFT_REMOTE_INPUT_VOLUME_UP,
+	                  (union xrt_input_value){.boolean = buttons & RIFT_REMOTE_BUTTON_MASK_VOLUME_UP}, now);
+	rift_update_input(&remote->base, RIFT_REMOTE_INPUT_VOLUME_DOWN,
+	                  (union xrt_input_value){.boolean = buttons & RIFT_REMOTE_BUTTON_MASK_VOLUME_DOWN}, now);
+	rift_update_input(&remote->base, RIFT_REMOTE_INPUT_BACK,
+	                  (union xrt_input_value){.boolean = buttons & RIFT_REMOTE_BUTTON_MASK_BACK}, now);
+	rift_update_input(&remote->base, RIFT_REMOTE_INPUT_OCULUS,
+	                  (union xrt_input_value){.boolean = buttons & RIFT_REMOTE_BUTTON_MASK_OCULUS}, now);
 
 	return XRT_SUCCESS;
 }
@@ -112,6 +163,47 @@ rift_touch_controller_update_inputs(struct xrt_device *xdev)
 /*
  * Implementation functions
  */
+
+static struct rift_remote *
+rift_remote_create(struct rift_hmd *hmd)
+{
+	struct rift_remote *remote =
+	    U_DEVICE_ALLOCATE(struct rift_remote, U_DEVICE_ALLOC_TRACKING_NONE, RIFT_REMOTE_INPUT_COUNT, 1);
+	if (remote == NULL) {
+		HMD_ERROR(hmd, "Failed to allocate remote");
+		return NULL;
+	}
+
+	strcpy(remote->base.str, "Oculus Rift Remote");
+	remote->base.device_type = XRT_DEVICE_TYPE_GAMEPAD;
+	remote->base.name = XRT_DEVICE_RIFT_REMOTE;
+
+#define SET_INPUT(NAME)                                                                                                \
+	do {                                                                                                           \
+		remote->base.inputs[RIFT_REMOTE_INPUT_##NAME].name = XRT_INPUT_RIFT_REMOTE_##NAME##_CLICK;             \
+	} while (0)
+	SET_INPUT(DPAD_UP);
+	SET_INPUT(DPAD_DOWN);
+	SET_INPUT(DPAD_LEFT);
+	SET_INPUT(DPAD_RIGHT);
+	SET_INPUT(SELECT);
+	SET_INPUT(VOLUME_UP);
+	SET_INPUT(VOLUME_DOWN);
+	SET_INPUT(BACK);
+	SET_INPUT(OCULUS);
+#undef SET_INPUT
+
+	u_device_populate_function_pointers(&remote->base, rift_remote_get_tracked_pose, rift_remote_destroy);
+	remote->base.update_inputs = rift_remote_update_inputs;
+
+	remote->base.binding_profiles = remote_profile_bindings;
+	remote->base.binding_profile_count = remote_profile_bindings_count;
+
+	u_var_add_root(remote, "Rift Remote", true);
+	u_var_add_ro_u32(remote, (uint32_t *)&remote->buttons, "buttons");
+
+	return remote;
+}
 
 static struct rift_touch_controller *
 rift_touch_controller_create(struct rift_hmd *hmd, enum rift_radio_device_type device_type)
@@ -281,6 +373,30 @@ rift_radio_handle_read(struct rift_hmd *hmd)
 			os_mutex_lock(&controller->input_mutex);
 			controller->input_state.buttons = message.touch.buttons & 0x0F;
 			os_mutex_unlock(&controller->input_mutex);
+
+			break;
+		}
+		case RIFT_RADIO_DEVICE_REMOTE: {
+			struct rift_remote *remote = hmd->radio_state.remote;
+
+			if (remote == NULL) {
+				remote = hmd->radio_state.remote = rift_remote_create(hmd);
+
+				if (remote == NULL) {
+					HMD_ERROR(hmd, "Failed to create remote");
+					continue;
+				}
+
+				HMD_INFO(hmd, "Created remote");
+
+				os_mutex_lock(&hmd->device_mutex);
+				hmd->devices[hmd->device_count++] = &remote->base;
+				os_mutex_unlock(&hmd->device_mutex);
+			}
+
+			xrt_atomic_s32_store(&remote->buttons, message.remote.buttons);
+
+			break;
 		}
 		}
 	}

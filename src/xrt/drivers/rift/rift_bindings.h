@@ -12,3 +12,6 @@
 
 extern struct xrt_binding_profile touch_profile_bindings[];
 extern uint32_t touch_profile_bindings_count;
+
+extern struct xrt_binding_profile remote_profile_bindings[];
+extern uint32_t remote_profile_bindings_count;
