@@ -278,48 +278,123 @@ while (running) {
 }
 ```
 
-### Usage Example (WebXR)
+### WebXR Integration
+
+For WebXR, the architecture is straightforward:
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        Browser Window                                │
+│                     (Browser owns this)                              │
+│                                                                     │
+│  ┌───────────────────────────────────────────────────────────────┐  │
+│  │                                                               │  │
+│  │                      <canvas> element                         │  │
+│  │                                                               │  │
+│  │            OpenXR runtime renders HERE directly               │  │
+│  │                   (with CNSDK interlacing)                    │  │
+│  │                                                               │  │
+│  └───────────────────────────────────────────────────────────────┘  │
+│                                                                     │
+│  ✓ Input: Browser owns window → DOM events work normally           │
+│  ✓ Rendering: OpenXR writes to canvas via XR_EXT_session_target    │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**Two problems, two solutions:**
+
+| Problem | Solution | Status |
+|---------|----------|--------|
+| App needs keyboard/mouse/gamepad | Browser owns window → DOM events work | ✓ Automatic |
+| OpenXR renders to browser canvas | Browser passes canvas handle to OpenXR | Requires browser mod |
+
+### What Browser Vendors Need To Do
+
+The browser's WebXR backend needs to use `XR_EXT_session_target`:
+
+```c
+// Current browser WebXR implementation (simplified):
+requestSession() {
+    // Browser tells OpenXR to create its own window
+    xrCreateSession(instance, &sessionInfo, &session);
+    // Problem: OpenXR owns window, steals input focus
+}
+
+// Required modification:
+requestSession() {
+    // Browser gets native handle for its canvas
+    nativeHandle = canvas.getBackingSurface();  // Platform-specific
+
+    // Browser passes canvas to OpenXR via our extension
+    XrSessionTargetCreateInfoEXT targetInfo = {
+        .type = XR_TYPE_SESSION_TARGET_CREATE_INFO_EXT,
+        .windowHandle = nativeHandle,  // Render here!
+    };
+
+    XrSessionCreateInfo sessionInfo = {
+        .next = &targetInfo,  // Chain the extension
+        // ...
+    };
+
+    xrCreateSession(instance, &sessionInfo, &session);
+    // Now: OpenXR renders to browser's canvas, browser keeps input
+}
+```
+
+### WebXR Developer Experience
+
+Once browser support exists, WebXR apps work unchanged:
 
 ```javascript
-// Browser creates canvas/window
-const canvas = document.getElementById('xr-canvas');
-const gl = canvas.getContext('webgl2');
-
-// Browser passes window to OpenXR runtime internally
+// Standard WebXR code - no modifications needed
 const session = await navigator.xr.requestSession('immersive-vr');
 
-// Standard WebXR with layers
-const projectionLayer = new XRProjectionLayer(session, gl);
-const quadLayer = new XRQuadLayer(session, gl, {  // UI layer
-    width: 1.0,
-    height: 0.5,
-    space: localSpace,
-});
-
-session.updateRenderState({
-    layers: [projectionLayer, quadLayer]  // Runtime composites these
-});
-
-// Browser receives input normally (DOM events)
+// Input works via normal DOM events (browser owns window)
 document.addEventListener('keydown', (e) => {
     if (e.key === 'w') movePlayer(0, 0, -1);
+    if (e.key === 's') movePlayer(0, 0, 1);
 });
 
+// Standard WebXR frame loop
 function onXRFrame(time, frame) {
-    // Locomotion via standard OpenXR
+    // Locomotion via offset reference space
     const transform = new XRRigidTransform(playerPos, playerRot);
     const movedSpace = localSpace.getOffsetReferenceSpace(transform);
 
-    // Eye tracking + locomotion combined
+    // Eye tracking combined with locomotion
     const pose = frame.getViewerPose(movedSpace);
 
-    // Render scene and UI to layers
+    // Render scene and UI layers
     renderScene(projectionLayer, pose);
-    renderUI(quadLayer);
-
-    // Runtime composites, interlaces, outputs to browser's canvas
+    renderUI(quadLayer);  // Standard OpenXR quad layer for UI
 }
 ```
+
+### Prototype Option: Electron
+
+For prototyping before browser vendor support, use Electron:
+
+```javascript
+// main.js (Electron main process)
+const { app, BrowserWindow } = require('electron');
+const { initLeiaOpenXR } = require('leia-openxr-binding');
+
+app.whenReady().then(() => {
+    const win = new BrowserWindow({ width: 1920, height: 1080 });
+
+    // Pass window handle to OpenXR (we control this)
+    initLeiaOpenXR(win.getNativeWindowHandle());
+
+    win.loadFile('index.html');  // Load WebXR app
+});
+```
+
+**Electron trade-offs:**
+- ✓ Works today without browser vendor cooperation
+- ✓ Full native performance
+- ✗ Requires packaging app (not pure web)
+- ✗ ~100MB download (bundles Chromium)
 
 ---
 
@@ -457,12 +532,17 @@ void multi_system_compositor_render(struct multi_system_compositor *msc) {
 ### Phase 3: Platform Integration
 1. Windows: Win32 HWND support
 2. Linux: XCB and Wayland surface support
-3. WebXR: Browser provides target internally
+3. Test with native OpenXR apps (C++, Rust)
 
 ### Phase 4: Framework Integration
-1. Unity XR Plugin modifications
-2. WebXR browser integration
+1. Unity XR Plugin modifications (pass window handle from Unity)
+2. Electron wrapper for WebXR prototyping
 3. Documentation and samples
+
+### Phase 5: WebXR Browser Support
+1. Engage with browser vendors (Google, Mozilla)
+2. Propose `XR_EXT_session_target` for WebXR backend
+3. Browser passes canvas handle → OpenXR renders to it
 
 ---
 
@@ -481,11 +561,29 @@ The 3D light field display use case is well-served by extending Monado's existin
 | Multiple windows | **Per-session output targets (new)** |
 | Locomotion | ✓ Standard OpenXR offset spaces (exists) |
 
-**Only one extension needed:** `XR_EXT_session_target` to allow apps to specify their output window.
+**Primary extension needed:** `XR_EXT_session_target` to allow apps to specify their output window.
 
-Everything else uses standard OpenXR:
-- Apps submit Projection + Quad/Cylinder layers
-- Runtime composites layers with proper z-ordering
-- Runtime applies CNSDK interlacing
-- Runtime writes directly to app's window
-- App receives input and handles locomotion via standard OpenXR reference space APIs
+### Native Apps (Unity, Unreal, Custom)
+
+Works with the extension directly:
+- App creates window, passes handle via `XR_EXT_session_target`
+- App receives input from its window (keyboard/mouse/gamepad)
+- App submits Projection + Quad/Cylinder layers
+- Runtime composites, interlaces, writes to app's window
+
+### WebXR Apps
+
+Same architecture, browser passes canvas handle:
+- Browser owns window → input works via DOM events (automatic)
+- Browser passes canvas handle to OpenXR via `XR_EXT_session_target`
+- Runtime renders directly to browser's canvas
+- **Requires:** Browser vendor to modify WebXR backend
+
+**Prototype path:** Electron wrapper while waiting for browser support
+
+### Priority Order
+
+1. **Native app support first** - Direct path, proves architecture
+2. **Unity integration** - Large ecosystem
+3. **Electron WebXR** - Enables web content without browser changes
+4. **Browser WebXR** - Requires browser vendor cooperation (Google, Mozilla)
