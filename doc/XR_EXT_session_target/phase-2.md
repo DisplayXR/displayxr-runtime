@@ -2,56 +2,56 @@
 
 ## Overview
 
-Phase 2 adds the infrastructure for **per-session rendering**, enabling multiple OpenXR applications to run simultaneously, each with their own window and SR weaver.
+Phase 2 adds the **infrastructure** for per-session rendering, enabling tracking of multiple OpenXR applications that can run simultaneously with their own windows.
 
-## Status: Infrastructure Complete, Full Pipeline Pending
+## Status: Infrastructure Complete, Resource Creation Deferred
 
-The per-session render resources (comp_target + SR weaver) are now created per-session. However, the full multi-app rendering pipeline requires additional architectural changes to the compositor's render loop.
+The data structures for per-session rendering are in place. Actual per-session comp_target and SR weaver creation is deferred to Phase 3 due to architectural constraints (circular library dependencies between comp_multi and comp_main).
 
 ## What Was Implemented
 
-### 1. Per-Session Render Resources in multi_compositor
+### 1. Per-Session Render Data Structure in multi_compositor
 
-Added new fields to `struct multi_compositor` for per-session rendering:
+Added new fields to `struct multi_compositor` for per-session rendering tracking:
 
 ```c
 struct {
     void *external_window_handle;    // HWND from XR_EXT_session_target
-    struct comp_target *target;       // Per-session VkSwapchain
-    struct leiasr *weaver;           // Per-session SR weaver
-    bool initialized;                 // Lazy initialization flag
+    struct comp_target *target;       // Per-session VkSwapchain (Phase 3)
+    struct leiasr *weaver;           // Per-session SR weaver (Phase 3)
+    bool initialized;                 // Registration flag
 } session_render;
 ```
 
-### 2. Lazy Initialization of Per-Session Resources
+### 2. Session Registration for Per-Session Rendering
 
 Added `multi_compositor_init_session_render()` function that:
-- Creates a `comp_target` from the session's external HWND
-- Creates a per-session SR weaver bound to that window
-- Allocates necessary Vulkan resources (command pool)
+- Checks if session has external HWND
+- Marks session as registered for per-session rendering
+- Logs registration for debugging
 - Called lazily on first frame render
 
-### 3. Per-Session Cleanup
+### 3. Per-Session Cleanup Hooks
 
-Modified `multi_compositor_end_session()` to clean up:
-- Per-session SR weaver
-- Per-session comp_target
-- Associated Vulkan resources
+Modified `multi_compositor_end_session()` with cleanup hooks:
+- Resets initialization flag
+- Clears external window handle
+- Ready for Phase 3 resource cleanup
 
 ### 4. Render Loop Integration
 
 Modified `transfer_layers_locked()` to:
 - Check for sessions with external window handles
-- Lazily initialize per-session resources on first frame
-- Maintain backward compatibility with shared rendering
+- Call registration function on first frame
+- Maintain backward compatibility with shared rendering (Phase 1)
 
 ## Files Modified
 
 | File | Change |
 |------|--------|
 | `src/xrt/compositor/multi/comp_multi_private.h` | Added session_render struct, helper functions |
-| `src/xrt/compositor/multi/comp_multi_compositor.c` | Added init/cleanup for per-session resources |
-| `src/xrt/compositor/multi/comp_multi_system.c` | Lazy initialization in render loop |
+| `src/xrt/compositor/multi/comp_multi_compositor.c` | Added registration/cleanup for per-session |
+| `src/xrt/compositor/multi/comp_multi_system.c` | Lazy registration in render loop |
 
 ## Architecture
 
@@ -61,8 +61,8 @@ Modified `transfer_layers_locked()` to:
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │  Session 1 (with external HWND)                                             │
 │    - Layers submitted to multi_compositor                                   │
-│    - session_render.target created from HWND                                │
-│    - session_render.weaver created for windowed mode                        │
+│    - session_render.external_window_handle stored                           │
+│    - session_render.initialized = true (registered)                         │
 └─────────────────────────────────────┬───────────────────────────────────────┘
                                       │
                                       ▼
@@ -70,7 +70,7 @@ Modified `transfer_layers_locked()` to:
 │  Multi-System Compositor (render loop)                                      │
 │    - Collects layers from all sessions                                      │
 │    - Currently: all layers go to shared native compositor                   │
-│    - TODO: Route sessions with own target to per-session pipeline           │
+│    - Sessions tracked for future per-session pipeline (Phase 3)             │
 └─────────────────────────────────────┬───────────────────────────────────────┘
                                       │
                                       ▼
@@ -82,7 +82,7 @@ Modified `transfer_layers_locked()` to:
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Target Flow (Phase 2 Complete)
+### Target Flow (Phase 3)
 
 ```
 ┌──────────────────────────┐    ┌──────────────────────────┐
@@ -100,83 +100,71 @@ Modified `transfer_layers_locked()` to:
 └──────────────────────────┘    └──────────────────────────┘
 ```
 
-## Remaining Work for Full Multi-App Support
+## Architectural Constraint Discovered
 
-### 1. Per-Session Render Pipeline
+### Circular Library Dependency
 
-The main challenge is that `comp_renderer` is tightly coupled to `comp_compositor`. Options:
+During Phase 2 implementation, we discovered that `comp_multi` cannot directly call functions from `comp_main`:
 
-**Option A: Multiple Native Compositors**
-- Create a `comp_compositor` instance per session with external HWND
-- Each has its own renderer and weaver
-- Pro: Cleaner separation
-- Con: Resource duplication, significant refactoring
+- `comp_main` links to `comp_multi` (for multi-client support)
+- `comp_multi` cannot link to `comp_main` (would create circular dependency)
+- Functions like `comp_window_mswin_create_from_external()` and `comp_target_destroy()` are in `comp_main`
 
-**Option B: Shared Compositor, Per-Session Output**
-- Keep shared layer composition
-- After rendering, weave output to each session's window
-- Pro: Less duplication
-- Con: Requires exposing rendered views from comp_renderer
+### Resolution for Phase 3
 
-**Option C: Per-Session Render Pass**
-- Factor out render pass code from comp_renderer
-- Call it per-session with session's target
-- Pro: Most flexible
-- Con: Significant refactoring of render code
+Options to resolve this for Phase 3:
 
-### 2. Recommended Next Steps
+1. **Move target creation to comp_main** - Have the native compositor handle per-session target creation through a callback interface
+2. **Factor out shared code** - Create a `comp_target_factory` library that both can use
+3. **Interface abstraction** - Add target creation to xrt_compositor interface
 
-1. **Expose stereo views from comp_renderer** - Add accessor to get rendered left/right views
-2. **Add per-session weave pass** - After shared render, weave to each session's window
-3. **Handle frame timing** - Each session may have different present timing
+## Remaining Work for Full Multi-App Support (Phase 3)
 
-### 3. Code Location for Changes
+### 1. Per-Session Target Creation
 
-```c
-// In comp_multi_system.c, after xrt_comp_layer_commit():
+Implement one of the architectural solutions above to enable:
+- Per-session comp_target from HWND
+- Per-session SR weaver bound to window
 
-// For each session with per-session rendering:
-for (size_t k = 0; k < count; k++) {
-    struct multi_compositor *mc = array[k];
-    if (mc->session_render.initialized && mc->session_render.weaver) {
-        // Get rendered stereo views (need to expose from comp_renderer)
-        VkImageView left_view, right_view;
-        comp_renderer_get_stereo_views(renderer, &left_view, &right_view);
+### 2. Per-Session Render Pipeline
 
-        // Weave to this session's window
-        leiasr_weave(mc->session_render.weaver, ...);
+Refactor `comp_renderer` to support:
+- Stereo view extraction
+- Per-session weave pass
+- Per-session present
 
-        // Present to session's target
-        comp_target_present(mc->session_render.target, ...);
-    }
-}
-```
+### 3. Frame Timing
+
+Handle per-session timing:
+- Each session may have different present timing
+- Synchronize with app's window refresh
 
 ## Testing
 
 ### Current State (Phase 2 Infrastructure)
 - Single app with external HWND: Works (Phase 1 behavior)
-- Per-session resources created: Yes
+- Per-session registration: Yes (logged)
 - Multiple apps simultaneously: Not yet (renders to first app only)
 
 ### To Verify Phase 2 Infrastructure
 1. Run app with external HWND
-2. Check logs for "Initialized per-session render resources"
+2. Check logs for "Session registered for per-session rendering with HWND"
 3. On session end, check logs for "Cleaned up per-session render resources"
 
 ## Backward Compatibility
 
 - Sessions WITHOUT external HWND: Use shared native compositor (unchanged)
-- Sessions WITH external HWND: Per-session resources created, but currently still rendered through shared pipeline (Phase 1 behavior preserved)
+- Sessions WITH external HWND: Registered for per-session rendering, but currently still rendered through shared pipeline (Phase 1 behavior preserved)
 
 ## Summary
 
-Phase 2 establishes the infrastructure for per-session rendering:
-- ✅ Per-session comp_target creation
-- ✅ Per-session SR weaver creation
-- ✅ Lazy initialization on first frame
-- ✅ Proper cleanup on session end
-- ⏳ Per-session render pipeline (requires comp_renderer refactoring)
-- ⏳ Multiple simultaneous outputs (blocked on above)
+Phase 2 establishes the data structure infrastructure for per-session rendering:
+- ✅ Per-session data structure added to multi_compositor
+- ✅ Session registration on first frame
+- ✅ Cleanup hooks on session end
+- ✅ Helper functions for checking per-session capability
+- ⏳ Per-session comp_target creation (Phase 3 - requires architecture work)
+- ⏳ Per-session SR weaver creation (Phase 3 - requires architecture work)
+- ⏳ Per-session render pipeline (Phase 3 - requires comp_renderer refactoring)
 
-The groundwork is in place for true multi-app support. The next step is to refactor the rendering code to support per-session output.
+The tracking infrastructure is in place. Phase 3 will address the library architecture to enable actual per-session resource creation.
