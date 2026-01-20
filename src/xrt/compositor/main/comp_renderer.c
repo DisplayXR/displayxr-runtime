@@ -577,7 +577,10 @@ renderer_init(struct comp_renderer *r, struct comp_compositor *c, VkExtent2D scr
 	struct vk_bundle *vk = &r->c->base.vk;
 
 #ifdef XRT_HAVE_LEIA_SR
-	leiasr_create(1000.0, vk->device, vk->physical_device, vk->main_queue->queue, r->target_render_pass.r->cmd_pool, &r->leiasr);
+	// Get external window handle from compositor (if provided via XR_EXT_session_target)
+	// NULL = fullscreen mode, valid HWND = windowed mode
+	void *window_handle = r->c->external_window_handle;
+	leiasr_create(1000.0, vk->device, vk->physical_device, vk->main_queue->queue, r->target_render_pass.r->cmd_pool, window_handle, &r->leiasr);
 #endif // XRT_HAVE_LEIA_SR
 
 	VkResult ret = comp_mirror_init( //

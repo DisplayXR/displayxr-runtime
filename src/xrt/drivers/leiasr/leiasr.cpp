@@ -102,7 +102,7 @@ bool CreateSRWeaver(SR::SRContext* context, VkDevice device, VkPhysicalDevice ph
 
 extern "C" {
 
-xrt_result_t leiasr_create(double maxTime, VkDevice device, VkPhysicalDevice physicalDevice, VkQueue graphicsQueue, VkCommandPool commandPool, struct leiasr **out)
+xrt_result_t leiasr_create(double maxTime, VkDevice device, VkPhysicalDevice physicalDevice, VkQueue graphicsQueue, VkCommandPool commandPool, void *windowHandle, struct leiasr **out)
 {
 	leiasr* sr = new leiasr;
 
@@ -126,7 +126,8 @@ xrt_result_t leiasr_create(double maxTime, VkDevice device, VkPhysicalDevice phy
 	sr->graphicsQueue = graphicsQueue;
 	sr->device = device;
 
-	if (!CreateSRWeaver(sr->context, device, physicalDevice, graphicsQueue, commandPool, NULL, sr))
+	// Pass windowHandle to CreateSRWeaver: NULL = fullscreen mode, valid HWND = windowed mode
+	if (!CreateSRWeaver(sr->context, device, physicalDevice, graphicsQueue, commandPool, (HWND)windowHandle, sr))
 	{
 		assert(false);
 		return XRT_ERROR_VULKAN;

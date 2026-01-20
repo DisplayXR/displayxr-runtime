@@ -135,6 +135,24 @@ extern const struct comp_target_factory comp_target_factory_android;
 struct comp_target *
 comp_window_mswin_create(struct comp_compositor *c);
 
+/*!
+ * Create a comp_target wrapping an external HWND provided by the application.
+ * The compositor will not create its own window or window thread.
+ * The application is responsible for the window message pump and lifecycle.
+ *
+ * @param c The compositor
+ * @param external_hwnd The application's window handle (HWND)
+ * @param out_ct Output parameter for the created target
+ * @return true on success
+ *
+ * @ingroup comp_main
+ * @public @memberof comp_window_mswin
+ */
+bool
+comp_window_mswin_create_from_external(struct comp_compositor *c,
+                                       void *external_hwnd,
+                                       struct comp_target **out_ct);
+
 extern const struct comp_target_factory comp_target_factory_mswin;
 #endif // XRT_OS_WINDOWS
 

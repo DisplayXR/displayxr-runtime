@@ -11,6 +11,7 @@
 
 #include "util/u_logging.h"
 #include "xrt/xrt_session.h"
+#include "xrt/xrt_config_os.h"
 
 #include "os/os_time.h"
 
@@ -24,6 +25,7 @@
 #include "util/u_distortion_mesh.h"
 
 #include "multi/comp_multi_private.h"
+#include "main/comp_compositor.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -479,6 +481,21 @@ multi_compositor_begin_session(struct xrt_compositor *xc, const struct xrt_begin
 
 	assert(!mc->state.session_active);
 	if (!mc->state.session_active) {
+#ifdef XRT_OS_WINDOWS
+		// Pass external window handle to native compositor on first session with HWND
+		if (mc->xsi.external_window_handle != NULL &&
+		    mc->msc->external_window_handle == NULL) {
+			mc->msc->external_window_handle = mc->xsi.external_window_handle;
+
+			// If native compositor uses deferred surface, pass the HWND to it
+			struct comp_compositor *c = comp_compositor(&mc->msc->xcn->base);
+			if (c->deferred_surface) {
+				c->external_window_handle = mc->xsi.external_window_handle;
+				// The native compositor's begin_session will use this HWND
+				// when creating the window target
+			}
+		}
+#endif
 		multi_system_compositor_update_session_status(mc->msc, true);
 		mc->state.session_active = true;
 	}

@@ -135,6 +135,39 @@ compositor_init_swapchain(struct comp_compositor *c);
 static bool
 compositor_init_renderer(struct comp_compositor *c);
 
+#ifdef XRT_OS_WINDOWS
+/*!
+ * Initialize window target from an external HWND.
+ * Used when the application provides its own window via XR_EXT_session_target.
+ */
+static bool
+compositor_init_window_from_external(struct comp_compositor *c, void *hwnd)
+{
+	COMP_TRACE_MARKER();
+
+	if (c->target != NULL) {
+		return true;
+	}
+
+	struct comp_target *ct = NULL;
+	if (!comp_window_mswin_create_from_external(c, hwnd, &ct)) {
+		COMP_ERROR(c, "Failed to create target from external HWND");
+		return false;
+	}
+
+	c->target = ct;
+
+	// Initialize swapchain for external window
+	if (!comp_target_init_post_vulkan(c->target, c->settings.preferred.width, c->settings.preferred.height)) {
+		COMP_ERROR(c, "Failed to init post vulkan for external window");
+		return false;
+	}
+
+	COMP_INFO(c, "Created compositor target from external HWND");
+	return true;
+}
+#endif
+
 static xrt_result_t
 compositor_begin_session(struct xrt_compositor *xc, const struct xrt_begin_session_info *info)
 {
@@ -143,6 +176,22 @@ compositor_begin_session(struct xrt_compositor *xc, const struct xrt_begin_sessi
 
 	// clang-format off
 	if (c->deferred_surface) {
+#ifdef XRT_OS_WINDOWS
+		// Use external HWND if provided (XR_EXT_session_target)
+		if (c->external_window_handle != NULL) {
+			if (!compositor_init_window_from_external(c, c->external_window_handle) ||
+			    !compositor_init_swapchain(c) ||
+			    !compositor_init_renderer(c)) {
+				COMP_ERROR(c, "Failed to init compositor with external window %p", (void *)c);
+				c->base.base.base.destroy(&c->base.base.base);
+				return XRT_ERROR_VULKAN;
+			}
+			comp_target_set_title(c->target, WINDOW_TITLE);
+			comp_renderer_add_debug_vars(c->r);
+			return XRT_SUCCESS;
+		}
+#endif
+		// Fallback: create internal window
 		if (!compositor_init_window_post_vulkan(c) ||
 		    !compositor_init_swapchain(c) ||
 		    !compositor_init_renderer(c)) {

@@ -14,6 +14,7 @@
 #include "xrt/xrt_session.h"
 #include "xrt/xrt_config_build.h" // IWYU pragma: keep
 #include "xrt/xrt_config_have.h"  // IWYU pragma: keep
+#include "xrt/xrt_config_os.h"    // IWYU pragma: keep
 
 #ifdef XR_USE_PLATFORM_XLIB
 #include "xrt/xrt_gfx_xlib.h" // IWYU pragma: keep
@@ -1304,6 +1305,15 @@ oxr_session_create(struct oxr_logger *log,
 		xsi.flags = overlay_info->createFlags;
 		xsi.z_order = overlay_info->sessionLayersPlacement;
 	}
+
+#ifdef XRT_OS_WINDOWS
+	// Parse XR_EXT_session_target extension - allows app to provide its own window
+	const XrSessionTargetCreateInfoEXT *target_info = OXR_GET_INPUT_FROM_CHAIN(
+	    createInfo, XR_TYPE_SESSION_TARGET_CREATE_INFO_EXT, XrSessionTargetCreateInfoEXT);
+	if (target_info && target_info->windowHandle) {
+		xsi.external_window_handle = (void *)target_info->windowHandle;
+	}
+#endif
 
 	/* Try allocating and populating. */
 	XrResult ret = oxr_session_create_impl(log, sys, createInfo, &xsi, &sess);

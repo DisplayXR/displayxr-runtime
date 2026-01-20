@@ -44,6 +44,8 @@ struct comp_window_mswin
 	HINSTANCE instance;
 	HWND window;
 
+	//! True if we created the window (default), false if external window provided
+	bool owns_window;
 
 	bool fullscreen_requested;
 	bool should_exit;
@@ -126,8 +128,11 @@ comp_window_mswin_destroy(struct comp_target *ct)
 {
 	struct comp_window_mswin *cwm = (struct comp_window_mswin *)ct;
 
-	// Stop the Windows thread first, destroy also stops the thread.
-	os_thread_helper_destroy(&cwm->oth);
+	// Only cleanup window thread if we created the window ourselves
+	if (cwm->owns_window) {
+		// Stop the Windows thread first, destroy also stops the thread.
+		os_thread_helper_destroy(&cwm->oth);
+	}
 
 	comp_target_swapchain_cleanup(&cwm->base);
 
@@ -510,8 +515,62 @@ comp_window_mswin_create(struct comp_compositor *c)
 	w->base.base.check_ready = comp_window_mswin_configure_check_ready;
 #endif
 	w->base.base.c = c;
+	w->owns_window = true;  // We create and own the window
 
 	return &w->base.base;
+}
+
+bool
+comp_window_mswin_create_from_external(struct comp_compositor *c,
+                                       void *external_hwnd,
+                                       struct comp_target **out_ct)
+{
+	if (external_hwnd == NULL) {
+		COMP_ERROR(c, "External HWND is NULL");
+		return false;
+	}
+
+	struct comp_window_mswin *cwm = U_TYPED_CALLOC(struct comp_window_mswin);
+	if (cwm == NULL) {
+		return false;
+	}
+
+	// Store the external window handle
+	cwm->window = (HWND)external_hwnd;
+	cwm->instance = GetModuleHandle(NULL);
+	cwm->owns_window = false;  // Don't destroy on cleanup - app owns the window
+
+	// Initialize base target (skip window thread creation since window already exists)
+	// The display timing code hasn't been tested on Windows and may be broken.
+	comp_target_swapchain_init_and_set_fnptrs(&cwm->base, COMP_TARGET_FORCE_FAKE_DISPLAY_TIMING);
+
+	cwm->base.base.name = "MS Windows (External)";
+	cwm->base.display = VK_NULL_HANDLE;
+	cwm->base.base.c = c;
+
+	// Set up function pointers
+	cwm->base.base.destroy = comp_window_mswin_destroy;
+	cwm->base.base.flush = comp_window_mswin_flush;
+	cwm->base.base.init_pre_vulkan = NULL;  // Skip - window already exists
+	cwm->base.base.init_post_vulkan = comp_window_mswin_init_swapchain;
+	cwm->base.base.set_title = comp_window_mswin_update_window_title;
+
+	// Get window dimensions
+	RECT rect;
+	if (GetClientRect(cwm->window, &rect)) {
+		cwm->base.base.width = rect.right - rect.left;
+		cwm->base.base.height = rect.bottom - rect.top;
+	} else {
+		// Fallback to default size
+		cwm->base.base.width = 1280;
+		cwm->base.base.height = 720;
+	}
+
+	COMP_INFO(c, "Created comp_target from external HWND %p (%ux%u)",
+	          external_hwnd, cwm->base.base.width, cwm->base.base.height);
+
+	*out_ct = &cwm->base.base;
+	return true;
 }
 
 

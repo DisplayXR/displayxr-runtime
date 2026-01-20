@@ -598,59 +598,140 @@ bool comp_window_mswin_create_from_external(
 
 ## Implementation Roadmap
 
-### Phase 1: Single App with External Window (Windows)
+### Phase 1: Single App with External Window (Windows) - IMPLEMENTED
+
+**Status:** ✅ Complete
+
 **Goal:** Accept external HWND, SR weaver in windowed mode
 
-**Changes to leiasr driver:**
-```c
-// leiasr.h - Add HWND parameter
-xrt_result_t leiasr_create(
-    double maxTime,
-    VkDevice device, VkPhysicalDevice physicalDevice,
-    VkQueue graphicsQueue, VkCommandPool commandPool,
-    HWND windowHandle,        // NEW: for windowed mode
-    struct leiasr **out);
+#### Implementation Summary
 
-// leiasr.cpp - Pass to SR weaver
-CreateSRWeaver(sr->context, ..., windowHandle, sr);  // Not NULL anymore
+The following changes were made to implement XR_EXT_session_target support:
+
+**1. Extension Definition** (`src/external/openxr_includes/openxr/XR_EXT_session_target.h`):
+```c
+#define XR_EXT_session_target 1
+#define XR_TYPE_SESSION_TARGET_CREATE_INFO_EXT ((XrStructureType)1000999001)
+
+typedef struct XrSessionTargetCreateInfoEXT {
+    XrStructureType             type;
+    const void* XR_MAY_ALIAS    next;
+    void*                       windowHandle;  // HWND on Windows
+} XrSessionTargetCreateInfoEXT;
 ```
 
-**Changes to comp_window_mswin.c:**
+**2. Core Interface** (`src/xrt/include/xrt/xrt_compositor.h`):
 ```c
-// Accept external HWND instead of creating window
-static bool comp_window_mswin_create_from_external(
+struct xrt_session_info {
+    bool is_overlay;
+    uint64_t flags;
+    uint32_t z_order;
+    void *external_window_handle;  // NEW: External window from extension
+};
+```
+
+**3. Leiasr Driver** (`src/xrt/drivers/leiasr/leiasr.h`, `leiasr.cpp`):
+```c
+// Added windowHandle parameter - NULL = fullscreen, valid HWND = windowed
+xrt_result_t leiasr_create(..., void *windowHandle, struct leiasr **out);
+
+// In leiasr.cpp: passes windowHandle to CreateSRWeaver
+CreateSRWeaver(sr->context, ..., (HWND)windowHandle, sr);
+```
+
+**4. Compositor Window** (`src/xrt/compositor/main/comp_window_mswin.c`):
+```c
+// New function to create comp_target from external HWND
+bool comp_window_mswin_create_from_external(
     struct comp_compositor *c,
-    HWND external_hwnd,
-    struct comp_target **out_ct)
-{
-    struct comp_window_mswin *cwm = U_TYPED_CALLOC(...);
-    cwm->window = external_hwnd;
-    cwm->owns_window = false;  // Don't destroy on cleanup
-    // Create VkWin32SurfaceKHR from external_hwnd
-    // ... rest of setup
-}
+    void *external_hwnd,
+    struct comp_target **out_ct);
+
+// Added owns_window flag to struct - false prevents window destruction on cleanup
 ```
 
-**Changes to oxr_session.c:**
+**5. Compositor** (`src/xrt/compositor/main/comp_compositor.h`, `comp_compositor.c`):
+- Added `external_window_handle` field to `comp_compositor` struct
+- Modified `compositor_begin_session()` to use external HWND when available
+- Added `compositor_init_window_from_external()` helper function
+
+**6. Multi-Compositor Bridge** (`src/xrt/compositor/multi/comp_multi_private.h`, `comp_multi_compositor.c`):
+- Added `external_window_handle` to `multi_system_compositor` struct
+- Modified `multi_compositor_begin_session()` to pass HWND from session info to native compositor
+
+**7. Session Creation** (`src/xrt/state_trackers/oxr/oxr_session.c`):
 ```c
 // Parse XR_EXT_session_target extension
-const XrSessionTargetCreateInfoEXT *target_info =
-    find_in_chain(createInfo->next, XR_TYPE_SESSION_TARGET_CREATE_INFO_EXT);
-
+const XrSessionTargetCreateInfoEXT *target_info = OXR_GET_INPUT_FROM_CHAIN(
+    createInfo, XR_TYPE_SESSION_TARGET_CREATE_INFO_EXT, XrSessionTargetCreateInfoEXT);
 if (target_info && target_info->windowHandle) {
-    // Use external window path
-    comp_window_mswin_create_from_external(c, target_info->windowHandle, &target);
-    leiasr_create(..., target_info->windowHandle, &leiasr);  // Windowed mode
+    xsi.external_window_handle = (void *)target_info->windowHandle;
 }
 ```
 
-**Files to modify:**
+**8. Renderer** (`src/xrt/compositor/main/comp_renderer.c`):
+```c
+// Pass window handle to leiasr_create (NULL = fullscreen, HWND = windowed)
+void *window_handle = r->c->external_window_handle;
+leiasr_create(..., window_handle, &r->leiasr);
+```
+
+#### Internal Data Flow (Verified)
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  OpenXR App                                                          │
+│    xrCreateSession(XrSessionTargetCreateInfoEXT { hwnd })            │
+└───────────────────────────────────┬──────────────────────────────────┘
+                                    │
+                                    ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│  oxr_session.c:oxr_session_create()                                  │
+│    - Parses XrSessionTargetCreateInfoEXT from extension chain        │
+│    - Populates xrt_session_info.external_window_handle               │
+└───────────────────────────────────┬──────────────────────────────────┘
+                                    │
+                                    ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│  comp_multi_compositor.c:multi_compositor_create(xsi)                │
+│    - Creates per-session multi_compositor                            │
+│    - Stores mc->xsi = *xsi (including external_window_handle)        │
+└───────────────────────────────────┬──────────────────────────────────┘
+                                    │
+                                    ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│  App calls xrBeginSession()                                          │
+│    - multi_compositor_begin_session()                                │
+│    - Detects first session with external HWND                        │
+│    - Passes HWND to comp_compositor.external_window_handle           │
+└───────────────────────────────────┬──────────────────────────────────┘
+                                    │
+                                    ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│  comp_compositor.c:compositor_begin_session() (deferred surface)     │
+│    - If external_window_handle is set:                               │
+│      - compositor_init_window_from_external(HWND)                    │
+│      - Creates comp_target via comp_window_mswin_create_from_external│
+│      - compositor_init_renderer() → leiasr_create(HWND)              │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+**Files Modified:**
 | File | Change |
 |------|--------|
-| `src/xrt/drivers/leiasr/leiasr.h` | Add HWND parameter |
-| `src/xrt/drivers/leiasr/leiasr.cpp` | Pass HWND to CreateSRWeaver |
-| `src/xrt/compositor/main/comp_window_mswin.c` | Accept external HWND |
-| `src/xrt/state_trackers/oxr/oxr_session.c` | Parse extension, route HWND |
+| `src/external/openxr_includes/openxr/XR_EXT_session_target.h` | NEW: Extension header |
+| `src/xrt/include/xrt/xrt_openxr_includes.h` | Include new extension header |
+| `src/xrt/include/xrt/xrt_compositor.h` | Add external_window_handle to xrt_session_info |
+| `src/xrt/drivers/leiasr/leiasr.h` | Add windowHandle parameter |
+| `src/xrt/drivers/leiasr/leiasr.cpp` | Pass windowHandle to CreateSRWeaver |
+| `src/xrt/compositor/main/comp_window.h` | Declare create_from_external function |
+| `src/xrt/compositor/main/comp_window_mswin.c` | Add owns_window flag, external window creation |
+| `src/xrt/compositor/main/comp_compositor.h` | Add external_window_handle field |
+| `src/xrt/compositor/main/comp_compositor.c` | Handle external HWND in begin_session |
+| `src/xrt/compositor/main/comp_renderer.c` | Pass window handle to leiasr_create |
+| `src/xrt/compositor/multi/comp_multi_private.h` | Add external_window_handle to msc |
+| `src/xrt/compositor/multi/comp_multi_compositor.c` | Bridge HWND from session to native compositor |
+| `src/xrt/state_trackers/oxr/oxr_session.c` | Parse XR_EXT_session_target extension |
 
 **Test:** Native Win32 app creates window, passes to OpenXR, receives input, sees 3D
 

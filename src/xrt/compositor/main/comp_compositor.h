@@ -161,6 +161,9 @@ struct comp_compositor
 
 	//! If true, part of the compositor startup will be delayed until a session is started
 	bool deferred_surface;
+
+	//! External window handle from session (for windowed mode on Windows)
+	void *external_window_handle;
 };
 
 

@@ -368,6 +368,9 @@ struct multi_system_compositor
 
 	//! List of active clients.
 	struct multi_compositor *clients[MULTI_MAX_CLIENTS];
+
+	//! External window handle from first session with HWND (for windowed mode)
+	void *external_window_handle;
 };
 
 /*!

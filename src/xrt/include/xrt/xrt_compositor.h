@@ -935,6 +935,9 @@ struct xrt_session_info
 	//! alignas for 32 bit client support, see @ref ipc-design
 	XRT_ALIGNAS(8) uint64_t flags;
 	uint32_t z_order;
+
+	//! External window handle for session target extension (HWND on Windows)
+	void *external_window_handle;
 };
 
 /*!
