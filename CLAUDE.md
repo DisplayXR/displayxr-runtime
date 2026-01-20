@@ -81,3 +81,24 @@ For substantial changes, create a fragment in `doc/changes/<section>/mr.NUMBER.m
 - `XRT_FEATURE_SERVICE` - Enable out-of-process service mode
 - `XRT_BUILD_DRIVER_*` - Enable specific hardware drivers
 - `BUILD_TESTING` - Enable test suite
+
+## Claude Code Skills
+
+### /ci-monitor - Automated Build Workflow
+Automates the complete CI workflow: commit → push → monitor → auto-fix.
+
+**Usage:**
+```bash
+/ci-monitor "commit message"    # Commit with message and monitor build
+/ci-monitor                      # Auto-generate commit message from changes
+/ci-monitor --watch-only         # Just monitor current build without committing
+```
+
+**Features:**
+- Launches subagent to preserve main conversation context
+- Monitors GitHub Actions `build-windows.yml` workflow
+- Auto-diagnoses common build errors (missing includes, undeclared identifiers, linker errors)
+- Attempts up to 3 automatic fixes before reporting failure
+- Reports success with artifact URL or failure with diagnostics
+
+**Skill location:** `.claude/skills/ci-monitor/SKILL.md`
