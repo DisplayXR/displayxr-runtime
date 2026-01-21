@@ -13,14 +13,16 @@
 #include <string.h>
 #include "xrt/xrt_compiler.h"
 #include "main/comp_window.h"
+#include "util/u_debug.h"
 #include "util/u_misc.h"
 #include "os/os_threading.h"
 
 
 #undef ALLOW_CLOSING_WINDOW
 
+DEBUG_GET_ONCE_BOOL_OPTION(start_windowed, "XRT_COMPOSITOR_START_WINDOWED", false)
+
 static bool          g_use_secondary_monitor = true;
-static bool          g_use_fullscreen        = true;
 static int           g_monitor_info_count    = 0;
 static MONITORINFOEX g_monitor_info[16]      = { 0 };
 
@@ -51,6 +53,9 @@ struct comp_window_mswin
 	bool should_exit;
 	bool thread_started;
 	bool thread_exited;
+
+	//! Current fullscreen state (for F11 toggle)
+	bool is_fullscreen;
 };
 
 static WCHAR szWindowClass[] = L"Monado";
@@ -110,6 +115,23 @@ WndProc(HWND hWnd, unsigned int message, WPARAM wParam, LPARAM lParam)
 		// COMP_INFO(c, "WM_DESTROY");
 		// Post a quit message and return.
 		PostQuitMessage(0);
+		break;
+	case WM_KEYDOWN:
+		if (wParam == VK_F11) {
+			// Toggle fullscreen state
+			cwm->is_fullscreen = !cwm->is_fullscreen;
+			set_fullscreen(hWnd, cwm->is_fullscreen);
+			COMP_INFO(c, "F11: Toggled to %s mode", cwm->is_fullscreen ? "fullscreen" : "windowed");
+		}
+		break;
+	case WM_SIZE:
+		if (wParam != SIZE_MINIMIZED) {
+			uint32_t width = LOWORD(lParam);
+			uint32_t height = HIWORD(lParam);
+			if (width > 0 && height > 0) {
+				COMP_DEBUG(c, "Window resized to %ux%u", width, height);
+			}
+		}
 		break;
 	default: return DefWindowProcW(hWnd, message, wParam, lParam);
 	}
@@ -325,9 +347,12 @@ comp_window_mswin_window_loop(struct comp_window_mswin *cwm)
 		return;
 	}
 
-	// Set fullscreen if requested.
-	if (g_use_fullscreen)
+	// Set fullscreen if requested, and track the state for F11 toggle.
+	// Use XRT_COMPOSITOR_START_WINDOWED=1 to start in windowed mode.
+	cwm->is_fullscreen = !debug_get_bool_option_start_windowed();
+	if (cwm->is_fullscreen) {
 		set_fullscreen(cwm->window, true);
+	}
 
 	COMP_INFO(ct->c, "Setting window properties and showing window");
 	SetPropW(cwm->window, szWindowData, cwm);
