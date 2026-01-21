@@ -158,6 +158,8 @@ Phase 2 will implement **per-session SR Weaver** for true multi-app support:
 
 ## References
 
-- [app-control.md](app-control.md) - Full architectural design document
+- [phase-2.md](phase-2.md) - Per-session infrastructure and data structures
+- [phase-3.md](phase-3.md) - Target Provider Service Pattern for per-session resource creation
+- [app-control.md](../app-control.md) - Full architectural design document
 - SR Runtime documentation for windowed mode (runtime >= 1.34)
 

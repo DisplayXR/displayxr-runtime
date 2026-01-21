@@ -168,3 +168,9 @@ Phase 2 establishes the data structure infrastructure for per-session rendering:
 - ⏳ Per-session render pipeline (Phase 3 - requires comp_renderer refactoring)
 
 The tracking infrastructure is in place. Phase 3 will address the library architecture to enable actual per-session resource creation.
+
+## References
+
+- [phase-1.md](phase-1.md) - Single app external HWND implementation
+- [phase-3.md](phase-3.md) - Target Provider Service Pattern for per-session resource creation
+- [app-control.md](../app-control.md) - Full architectural design document
