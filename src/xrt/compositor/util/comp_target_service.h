@@ -80,7 +80,7 @@ comp_target_service_create(struct comp_target_service *service,
                            struct comp_target **out_target)
 {
 	if (service == NULL || service->create_from_window == NULL) {
-		return XRT_ERROR_DEVICE_NOT_FOUND;
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
 	return service->create_from_window(service, external_window_handle, out_target);
 }

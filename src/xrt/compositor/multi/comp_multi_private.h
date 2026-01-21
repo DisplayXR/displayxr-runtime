@@ -22,7 +22,8 @@
 #include "util/comp_target_service.h"
 
 #ifdef XRT_HAVE_LEIA_SR
-#include <vulkan/vulkan.h>
+// Use xrt_vulkan_includes.h instead of vulkan.h directly to ensure VK_NO_PROTOTYPES is defined
+#include "xrt/xrt_vulkan_includes.h"
 #endif
 
 // Forward declarations for per-session rendering
