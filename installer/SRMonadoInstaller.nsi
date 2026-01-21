@@ -68,15 +68,13 @@ Section "SRMonado Runtime" SecRuntime
 
 	SetOutPath "$INSTDIR"
 
-	; Stop any running watchdog/service before installing
-	nsExec::ExecToLog 'taskkill /F /IM SRMonadoWatchdog.exe'
+	; Stop any running service before installing
 	nsExec::ExecToLog 'taskkill /F /IM monado-service.exe'
 	Sleep 500
 
 	; Install runtime files
 	File "${BIN_DIR}\SRMonadoClient.dll"
 	File "${BIN_DIR}\monado-service.exe"
-	File "${BIN_DIR}\SRMonadoWatchdog.exe"
 
 	; Install manifest
 	File "${OUTPUT_DIR}\SRMonado_win64.json"
@@ -90,7 +88,6 @@ Section "SRMonado Runtime" SecRuntime
 	; Create AppData directories
 	CreateDirectory "$APPDATA\LeiaSR"
 	CreateDirectory "$APPDATA\LeiaSR\SRMonado"
-	CreateDirectory "$APPDATA\LeiaSR\SRMonado\Clients"
 
 	; Write registry keys
 	WriteRegStr HKLM "Software\LeiaSR\SRMonado" "InstallPath" "$INSTDIR"
@@ -98,9 +95,6 @@ Section "SRMonado Runtime" SecRuntime
 
 	; Set as active OpenXR runtime
 	WriteRegStr HKLM "Software\Khronos\OpenXR\1" "ActiveRuntime" "$INSTDIR\SRMonado_win64.json"
-
-	; Register watchdog for auto-start
-	WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Run" "SRMonadoWatchdog" '"$INSTDIR\SRMonadoWatchdog.exe"'
 
 	; Write uninstaller
 	WriteUninstaller "$INSTDIR\Uninstall.exe"
@@ -115,7 +109,7 @@ Section "SRMonado Runtime" SecRuntime
 	WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\SRMonado" \
 		"InstallLocation" "$INSTDIR"
 	WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\SRMonado" \
-		"DisplayIcon" "$INSTDIR\SRMonadoWatchdog.exe"
+		"DisplayIcon" "$INSTDIR\monado-service.exe"
 	WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\SRMonado" \
 		"Publisher" "Leia Inc."
 	WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\SRMonado" \
@@ -139,7 +133,6 @@ SectionEnd
 
 Section "Start Menu Shortcuts" SecShortcuts
 	CreateDirectory "$SMPROGRAMS\LeiaSR"
-	CreateShortCut "$SMPROGRAMS\LeiaSR\SRMonado Watchdog.lnk" "$INSTDIR\SRMonadoWatchdog.exe"
 
 	; Add switcher shortcut if installed
 	IfFileExists "$INSTDIR\LeiaXRSwitcher.exe" 0 +2
@@ -148,24 +141,17 @@ Section "Start Menu Shortcuts" SecShortcuts
 	CreateShortCut "$SMPROGRAMS\LeiaSR\Uninstall SRMonado.lnk" "$INSTDIR\Uninstall.exe"
 SectionEnd
 
-Section "Launch Watchdog on Install" SecLaunch
-	; Start the watchdog
-	Exec '"$INSTDIR\SRMonadoWatchdog.exe"'
-SectionEnd
-
 ;--------------------------------
 ; Uninstaller Section
 
 Section "Uninstall"
 	; Stop running processes
-	nsExec::ExecToLog 'taskkill /F /IM SRMonadoWatchdog.exe'
 	nsExec::ExecToLog 'taskkill /F /IM monado-service.exe'
 	Sleep 500
 
 	; Remove files
 	Delete "$INSTDIR\SRMonadoClient.dll"
 	Delete "$INSTDIR\monado-service.exe"
-	Delete "$INSTDIR\SRMonadoWatchdog.exe"
 	Delete "$INSTDIR\LeiaXRSwitcher.exe"
 	Delete "$INSTDIR\SRMonado_win64.json"
 	Delete "$INSTDIR\Uninstall.exe"
@@ -177,19 +163,14 @@ Section "Uninstall"
 	RMDir "$INSTDIR"
 	RMDir "$PROGRAMFILES64\LeiaSR"
 
-	; Remove client signal files
-	RMDir /r "$APPDATA\LeiaSR\SRMonado\Clients"
+	; Remove AppData directory
 	RMDir "$APPDATA\LeiaSR\SRMonado"
 	; Don't remove LeiaSR folder as it may be shared with SRHydra
 
 	; Remove Start Menu shortcuts
-	Delete "$SMPROGRAMS\LeiaSR\SRMonado Watchdog.lnk"
 	Delete "$SMPROGRAMS\LeiaSR\LeiaXR Runtime Switcher.lnk"
 	Delete "$SMPROGRAMS\LeiaSR\Uninstall SRMonado.lnk"
 	RMDir "$SMPROGRAMS\LeiaSR"
-
-	; Remove auto-start registry entry
-	DeleteRegValue HKLM "Software\Microsoft\Windows\CurrentVersion\Run" "SRMonadoWatchdog"
 
 	; Remove SRMonado registry keys
 	DeleteRegKey HKLM "Software\LeiaSR\SRMonado"
@@ -211,7 +192,6 @@ SectionEnd
 !insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
 	!insertmacro MUI_DESCRIPTION_TEXT ${SecRuntime} "SRMonado OpenXR runtime files (required)"
 	!insertmacro MUI_DESCRIPTION_TEXT ${SecShortcuts} "Create Start Menu shortcuts"
-	!insertmacro MUI_DESCRIPTION_TEXT ${SecLaunch} "Start the watchdog service after installation"
 !insertmacro MUI_FUNCTION_DESCRIPTION_END
 
 ;--------------------------------
