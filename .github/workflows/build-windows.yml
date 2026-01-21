@@ -60,8 +60,8 @@ jobs:
             -DXRT_HAVE_LEIA_SR=ON -DCMAKE_PREFIX_PATH="${{ github.workspace }}/LeiaSR-SDK-$env:SR_TAG-win64" `
             -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake" `
             -DX_VCPKG_APPLOCAL_DEPS_INSTALL=ON `
-            -DCMAKE_INSTALL_PREFIX=_package `                                                                                                                                                                                                                                                                     
-            -DXRT_BUILD_INSTALLER=ON      
+            -DCMAKE_INSTALL_PREFIX=_package `
+            -DXRT_BUILD_INSTALLER=ON
 
       - name: Build
         run: cmake --build build --config Release --target install
