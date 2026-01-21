@@ -212,7 +212,7 @@ static BOOL CALLBACK GetDefaultWindowStartPos_MonitorEnumProc(__in HMONITOR hMon
 	MONITORINFOEX info;
 	ZeroMemory(&info, sizeof(info));
 	info.cbSize = sizeof(info);
-	GetMonitorInfo(hMonitor, &info);
+	GetMonitorInfo(hMonitor, (LPMONITORINFO)&info);
 	g_monitor_info[g_monitor_info_count++] = info;
 	return TRUE;
 }
@@ -221,7 +221,7 @@ static bool get_leia_display_top_left_coordinate(int* x, int* y)
 {
 	// Get connected monitor info.
 	g_monitor_info_count = 0;
-	EnumDisplayMonitors(NULL, NULL, GetDefaultWindowStartPos_MonitorEnumProc, NULL);
+	EnumDisplayMonitors(NULL, NULL, GetDefaultWindowStartPos_MonitorEnumProc, (LPARAM)NULL);
 
 	const char kLeiaDisplayIDPrefix[] = "\\\\?\\DISPLAY#AUO2E9A";
 	for (int iMonitor = 0; iMonitor < g_monitor_info_count; ++iMonitor) {
