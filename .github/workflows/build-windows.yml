@@ -128,6 +128,42 @@ jobs:
 
       #     Write-Output "Upload complete."
 
+      - name: Setup rclone config
+        shell: powershell
+        run: |
+          $rcloneDir = "$env:USERPROFILE\.config\rclone"
+          if (-not (Test-Path $rcloneDir)) {
+            New-Item -ItemType Directory -Path $rcloneDir -Force
+          }
+          $configContent = @"
+          ${{ secrets.RCLONE_CONFIG }}
+          "@
+          Set-Content -Path "$rcloneDir\rclone.conf" -Value $configContent
+          Write-Host "rclone config written to $rcloneDir\rclone.conf"
+
+      - name: Install rclone (if not present)
+        shell: powershell
+        run: |
+          if (-not (Get-Command rclone -ErrorAction SilentlyContinue)) {
+            Write-Host "Installing rclone..."
+            Invoke-WebRequest -Uri "https://downloads.rclone.org/rclone-current-windows-amd64.zip" -OutFile "rclone.zip"
+            Expand-Archive -Path "rclone.zip" -DestinationPath "rclone_temp" -Force
+            $rcloneExe = Get-ChildItem -Path "rclone_temp" -Recurse -Filter "rclone.exe" | Select-Object -First 1
+            Copy-Item $rcloneExe.FullName -Destination "C:\Windows\System32\rclone.exe"
+            Write-Host "rclone installed successfully"
+          } else {
+            Write-Host "rclone already installed"
+          }
+
+      - name: Upload installer to OneDrive
+        shell: powershell
+        run: |
+          $installer = Get-ChildItem -Path "_package/SRMonadoSetup-*.exe" | Select-Object -First 1
+          $destPath = "SANDBOX/RUNTIMES + SDK + PLUGINS/OpenXR"
+          Write-Host "Uploading $($installer.Name) to OneDrive: $destPath"
+          rclone copy $installer.FullName "onedrive:$destPath" --progress
+          Write-Host "Upload complete!"
+
       - name: Post build to Slack
         if: success() && !contains(github.event.head_commit.message, '[skip slack]')
         uses: act10ns/slack@v2
