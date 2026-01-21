@@ -19,12 +19,15 @@
 !ifndef VERSION_PATCH
 	!define VERSION_PATCH "0"
 !endif
+!ifndef BUILD_NUM
+	!define BUILD_NUM "0"
+!endif
 
 ;--------------------------------
 ; General Attributes
 
 Name "SRMonado ${VERSION}"
-OutFile "${OUTPUT_DIR}\SRMonadoSetup-${VERSION}.exe"
+OutFile "${OUTPUT_DIR}\SRMonadoSetup-${VERSION}.${BUILD_NUM}.exe"
 InstallDir "$PROGRAMFILES64\LeiaSR\SRMonado"
 InstallDirRegKey HKLM "Software\LeiaSR\SRMonado" "InstallPath"
 RequestExecutionLevel admin
