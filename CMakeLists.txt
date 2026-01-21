@@ -382,6 +382,13 @@ set(XRT_IPC_MSG_SOCK_FILENAME monado_comp_ipc CACHE STRING "Service socket filen
 set(XRT_IPC_SERVICE_PID_FILENAME monado.pid CACHE STRING "Service pidfile filename")
 set(XRT_OXR_RUNTIME_SUFFIX monado CACHE STRING "OpenXR client library suffix")
 
+# SRMonado Windows installer options
+if(WIN32)
+	option(XRT_BUILD_WATCHDOG "Build SRMonado watchdog service (Windows only)" ON)
+	option(XRT_BUILD_INSTALLER "Build NSIS installer (Windows only)" OFF)
+	option(XRT_BUILD_SWITCHER "Build LeiaXR runtime switcher (Windows only)" ON)
+endif()
+
 # Most users won't touch these.
 mark_as_advanced(XRT_MODULE_COMPOSITOR_MAIN XRT_MODULE_COMPOSITOR_NULL XRT_FEATURE_OPENXR)
 
@@ -577,6 +584,11 @@ add_subdirectory(doc)
 if(BUILD_TESTING)
 	include(CTest)
 	add_subdirectory(tests)
+endif()
+
+# SRMonado Windows installer
+if(WIN32 AND XRT_BUILD_INSTALLER)
+	add_subdirectory(installer)
 endif()
 
 ###
