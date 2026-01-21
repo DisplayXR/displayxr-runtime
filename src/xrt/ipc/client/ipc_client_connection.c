@@ -56,6 +56,73 @@
 
 DEBUG_GET_ONCE_BOOL_OPTION(ipc_ignore_version, "IPC_IGNORE_VERSION", false)
 
+#ifdef XRT_OS_WINDOWS
+#include <shlobj.h>
+#include <shlwapi.h>
+
+/*!
+ * Get the path for a client signal file.
+ * Creates the directory structure if it doesn't exist.
+ */
+static bool
+ipc_client_get_signal_file_path(char *path, size_t path_size)
+{
+	char appdata[MAX_PATH];
+	if (FAILED(SHGetFolderPathA(NULL, CSIDL_APPDATA, NULL, 0, appdata))) {
+		return false;
+	}
+
+	// Create directory structure: %APPDATA%\LeiaSR\SRMonado\Clients
+	char dir_path[MAX_PATH];
+	snprintf(dir_path, sizeof(dir_path), "%s\\LeiaSR", appdata);
+	CreateDirectoryA(dir_path, NULL);
+
+	snprintf(dir_path, sizeof(dir_path), "%s\\LeiaSR\\SRMonado", appdata);
+	CreateDirectoryA(dir_path, NULL);
+
+	snprintf(dir_path, sizeof(dir_path), "%s\\LeiaSR\\SRMonado\\Clients", appdata);
+	CreateDirectoryA(dir_path, NULL);
+
+	// Create signal file path: <PID>.txt
+	DWORD pid = GetCurrentProcessId();
+	snprintf(path, path_size, "%s\\%lu.txt", dir_path, (unsigned long)pid);
+
+	return true;
+}
+
+/*!
+ * Create a client signal file to notify the watchdog.
+ */
+static void
+ipc_client_create_signal_file(void)
+{
+	char path[MAX_PATH];
+	if (!ipc_client_get_signal_file_path(path, sizeof(path))) {
+		return;
+	}
+
+	// Create empty signal file
+	HANDLE file = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (file != INVALID_HANDLE_VALUE) {
+		CloseHandle(file);
+	}
+}
+
+/*!
+ * Delete the client signal file on disconnect.
+ */
+static void
+ipc_client_delete_signal_file(void)
+{
+	char path[MAX_PATH];
+	if (!ipc_client_get_signal_file_path(path, sizeof(path))) {
+		return;
+	}
+
+	DeleteFileA(path);
+}
+#endif // XRT_OS_WINDOWS
+
 #ifdef XRT_OS_ANDROID
 
 static bool
@@ -404,6 +471,11 @@ ipc_client_connection_init(struct ipc_connection *ipc_c,
 		goto err_fini; // Already logged.
 	}
 
+#ifdef XRT_OS_WINDOWS
+	// Create signal file to notify watchdog of this client
+	ipc_client_create_signal_file();
+#endif
+
 	return XRT_SUCCESS;
 
 err_fini:
@@ -415,6 +487,11 @@ err_fini:
 void
 ipc_client_connection_fini(struct ipc_connection *ipc_c)
 {
+#ifdef XRT_OS_WINDOWS
+	// Delete signal file to notify watchdog this client is disconnecting
+	ipc_client_delete_signal_file();
+#endif
+
 	if (ipc_c->ism_handle != XRT_SHMEM_HANDLE_INVALID) {
 		/// @todo how to tear down the shared memory?
 	}

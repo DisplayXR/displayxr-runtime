@@ -46,3 +46,16 @@ if(XRT_FEATURE_SERVICE
 	)
 	add_subdirectory(sdl_test)
 endif()
+
+# SRMonado Windows components
+if(WIN32)
+	# Watchdog service launcher
+	if(XRT_BUILD_WATCHDOG AND XRT_FEATURE_SERVICE)
+		add_subdirectory(watchdog)
+	endif()
+
+	# LeiaXR runtime switcher
+	if(XRT_BUILD_SWITCHER)
+		add_subdirectory(switcher)
+	endif()
+endif()
