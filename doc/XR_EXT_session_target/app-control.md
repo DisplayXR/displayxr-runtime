@@ -735,6 +735,67 @@ leiasr_create(..., window_handle, &r->leiasr);
 
 **Test:** Native Win32 app creates window, passes to OpenXR, receives input, sees 3D
 
+#### Fallback Behavior (No HWND Provided)
+
+When an application does **not** provide a window handle via `XR_EXT_session_target`, Monado uses its pre-existing behavior:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         Session Creation Paths                               │
+│                                                                             │
+│  Path A: App provides HWND (XR_EXT_session_target)                          │
+│    xrCreateSession(HWND) → per-session comp_target + SR weaver              │
+│      → render_per_session_clients_locked()                                  │
+│      → Output to app's window (windowed mode)                               │
+│                                                                             │
+│  Path B: App provides NULL (legacy/default behavior)                        │
+│    xrCreateSession(NULL) → shared compositor path                           │
+│      → transfer_layers_locked() → xrt_comp_layer_commit()                   │
+│      → Output to Monado's own window (fullscreen mode)                      │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Implementation Details:**
+
+| Condition | `session_render.initialized` | Render Path |
+|-----------|------------------------------|-------------|
+| HWND provided | `true` | Per-session (`render_per_session_clients_locked()`) |
+| HWND is NULL | `false` | Shared compositor (`transfer_layers_locked()` → `xrt_comp_layer_commit()`) |
+
+**Code Location:** `src/xrt/compositor/multi/comp_multi_system.c`
+
+```c
+// In transfer_layers_locked() - sessions without HWND go through shared path
+for (size_t k = 0; k < count; k++) {
+    struct multi_compositor *mc = array[k];
+
+    // Skip sessions with per-session rendering - they render separately
+    if (mc->session_render.initialized) {
+        continue;  // Will be handled by render_per_session_clients_locked()
+    }
+
+    // Sessions without HWND: dispatch layers to shared compositor
+    // ... layer dispatch code ...
+}
+```
+
+**Benefits of this fallback:**
+
+1. **Backward compatibility** - Existing apps work without modification
+2. **Simple API** - Apps that don't need window control don't need to use the extension
+3. **Fullscreen support** - Legacy apps can still use SR Runtime in fullscreen mode
+4. **No code changes required** - The fallback is the original Monado behavior
+
+**When to use each path:**
+
+| Use Case | Recommended Path |
+|----------|------------------|
+| New desktop app needing input | Provide HWND (windowed mode) |
+| Multiple XR apps simultaneously | Each provides its own HWND |
+| Legacy VR app (no window needed) | NULL (shared compositor) |
+| HMD/fullscreen use case | NULL (shared compositor) |
+
 ---
 
 ### Phase 2: Per-Session SR Weaver
