@@ -87,7 +87,9 @@ Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>
 EOF
 )"
 ```
-Note the commit hash from output.
+**CRITICAL:** Extract and store the commit hash from the output (e.g., `[branch abc1234]`).
+Run: `git rev-parse HEAD`
+Store this as COMMIT_SHA - you will need it to verify the correct build is monitored.
 
 ### Step 1.5: Push to Remote
 Run: `git push origin HEAD`
@@ -98,20 +100,37 @@ Run: `git push origin HEAD`
 
 ## PHASE 2: MONITOR BUILD
 
-### Step 2.1: Wait for Workflow
-Run: `sleep 5`
+### Step 2.1: Wait for Workflow to Register
+Run: `sleep 10`
+(GitHub Actions needs time to register the new push)
 
-### Step 2.2: Get Run ID
-Run: `gh run list --limit 1 --json databaseId,status,headBranch,event --jq '.[0]'`
-- Verify the run is for our branch (check headBranch)
-- Store the databaseId as RUN_ID
+### Step 2.2: Get Run ID for OUR Commit (CRITICAL)
+**You MUST verify the run is for the exact commit you pushed, not a previous run.**
+
+Run this command to find runs and check their commit SHA:
+```bash
+gh run list --limit 5 --json databaseId,status,headBranch,headSha,displayTitle
+```
+
+**Verification loop:**
+1. Look for a run where `headSha` starts with your COMMIT_SHA (first 7+ chars match)
+2. If no matching run found, wait 10 seconds and retry (up to 6 retries = 1 minute)
+3. If still no matching run after retries, report error and STOP
+
+Example verification:
+- Your COMMIT_SHA: `f2286b75b...`
+- Run headSha must start with: `f2286b75b`
+
+Once you find the matching run, store its `databaseId` as RUN_ID.
 
 ### Step 2.3: Watch Build
 Run: `gh run watch RUN_ID --interval 15` (use timeout 600000ms = 10 min)
 
 ### Step 2.4: Check Result
-- If status is "success": Go to PHASE 4 (Report Success)
-- If status is "failure": Go to PHASE 3 (Diagnose and Fix)
+Run: `gh run view RUN_ID --json status,conclusion`
+- If conclusion is "success": Go to PHASE 4 (Report Success)
+- If conclusion is "failure": Go to PHASE 3 (Diagnose and Fix)
+- If status is still "in_progress": The watch command may have timed out, check again
 
 ---
 
@@ -154,6 +173,7 @@ error LNK2019: unresolved external symbol "function_name"
 ```
 error C2084: function 'X' already has a body
 error C2011: 'X': 'struct' type redefinition
+error C2371: 'X': redefinition; different basic types
 ```
 → Go to Fix E
 
@@ -232,12 +252,22 @@ warning: implicit declaration of function 'XYZ'
    ```bash
    grep -rn "SYMBOL_NAME" src/xrt/ --include="*.h" --include="*.c"
    ```
-2. Identify the duplicate
-3. Use Edit tool to:
+2. Identify the issue type:
+
+   **For C2371 "different basic types":** This usually means a function is called before it's declared.
+   In C, undeclared functions are assumed to return `int`, causing a conflict when the actual
+   definition is found. Fix by adding a forward declaration before the first call:
+   ```c
+   // Forward declaration
+   static void function_name(parameters);
+   ```
+
+   **For C2084/C2011 true duplicates:**
    - Remove the duplicate definition, OR
    - Add include guards if missing, OR
    - Use #pragma once
-5. Go to Step 3.5
+
+3. Go to Step 3.5
 
 ### FIX F: Implicit Function Declaration
 
@@ -272,7 +302,10 @@ Run: `git push origin HEAD`
 ### Step 3.7: Re-monitor
 - Increment fix_attempt
 - If fix_attempt > 3: Go to PHASE 5 (Report Fix Failure)
-- Otherwise: Return to Step 2.1 (wait for new workflow)
+- Otherwise:
+  1. Get the new COMMIT_SHA: `git rev-parse HEAD`
+  2. Return to Step 2.1 (wait for new workflow)
+  3. **CRITICAL:** Use the NEW commit SHA to verify the correct run in Step 2.2
 
 ---
 
