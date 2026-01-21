@@ -85,6 +85,9 @@ draw_window(HWND hWnd, struct comp_window_mswin *cwm)
 	ValidateRect(hWnd, NULL);
 }
 
+// Forward declaration for F11 toggle support
+static void set_fullscreen(HWND hWnd, bool fullscreen);
+
 static LRESULT CALLBACK
 WndProc(HWND hWnd, unsigned int message, WPARAM wParam, LPARAM lParam)
 {
