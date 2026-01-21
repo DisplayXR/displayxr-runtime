@@ -189,7 +189,7 @@ target_service_create_from_window(struct comp_target_service *service,
 #ifdef XRT_OS_WINDOWS
 	if (external_window_handle == NULL) {
 		COMP_ERROR(c, "Cannot create target from NULL window handle");
-		return XRT_ERROR_DEVICE_NOT_FOUND;
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
 
 	struct comp_target *ct = NULL;
@@ -212,7 +212,7 @@ target_service_create_from_window(struct comp_target_service *service,
 	(void)c;
 	(void)external_window_handle;
 	(void)out_target;
-	return XRT_ERROR_DEVICE_NOT_FOUND;
+	return XRT_ERROR_DEVICE_CREATION_FAILED;
 #endif
 }
 
