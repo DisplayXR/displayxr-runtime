@@ -8,6 +8,7 @@
 #include "d3d11_renderer.h"
 #include <d3dcompiler.h>
 #include <cmath>
+#include <vector>
 
 using namespace DirectX;
 

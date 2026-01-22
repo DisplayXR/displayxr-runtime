@@ -73,7 +73,7 @@ void RenderText(
     const std::wstring& text,
     float x, float y,
     float width, float height,
-    bool small
+    bool useSmallFont
 ) {
     if (!overlay.initialized || !texture) return;
 
@@ -114,7 +114,7 @@ void RenderText(
     d2dRenderTarget->DrawText(
         text.c_str(),
         (UINT32)text.length(),
-        small ? overlay.smallTextFormat.Get() : overlay.textFormat.Get(),
+        useSmallFont ? overlay.smallTextFormat.Get() : overlay.textFormat.Get(),
         textRect,
         textBrush.Get()
     );

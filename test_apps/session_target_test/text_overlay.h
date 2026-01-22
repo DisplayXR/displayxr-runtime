@@ -44,7 +44,7 @@ void RenderText(
     const std::wstring& text,
     float x, float y,
     float width, float height,
-    bool small = false
+    bool useSmallFont = false
 );
 
 // Helper to format various overlay texts
