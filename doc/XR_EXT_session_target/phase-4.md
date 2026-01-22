@@ -263,6 +263,7 @@ Phase 4 completes the per-session rendering implementation:
 | Phase 2 | Per-session infrastructure | ✅ Complete |
 | Phase 3 | Per-session target/weaver creation | ✅ Complete |
 | Phase 4 | Per-session render pipeline | ✅ Complete |
+| Phase 5 | SR EyeTracker integration | ✅ Complete |
 
 ## Future Improvements
 
@@ -276,4 +277,5 @@ Phase 4 completes the per-session rendering implementation:
 - [phase-1.md](phase-1.md) - Single app external HWND implementation
 - [phase-2.md](phase-2.md) - Per-session infrastructure and data structures
 - [phase-3.md](phase-3.md) - Per-session target/weaver creation with service pattern
+- [phase-5.md](phase-5.md) - SR EyeTracker integration for dynamic eye positions
 - [app-control.md](app-control.md) - Full architectural design document

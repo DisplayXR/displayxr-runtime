@@ -531,10 +531,11 @@ if(XRT_HAVE_LEIA_SR)
         ${SR_PATH}/include
         ${SR_PATH}/third_party/OpenCV/include)
 	target_link_libraries(drv_leiasr PRIVATE
-		xrt-interfaces aux_util
+		xrt-interfaces aux_util aux_os
 		${SR_PATH}/lib/SimulatedRealityCore.lib # should have been srCore::srCore but it's broken due to libfilter
 		${SR_PATH}/lib/SimulatedRealityDisplays.lib # should have been srDisplays::srDisplays but it requires srCore::srCore
         ${SR_PATH}/lib/SimulatedRealityVulkanBeta.lib
+		${SR_PATH}/lib/SimulatedRealitySense.lib # Phase 5: Eye tracking support
 		${SR_PATH}/third_party/OpenCV/lib/x64/opencv_world343.lib
 		PUBLIC drv_includes)
 	list(APPEND ENABLED_DRIVERS drv_leiasr)

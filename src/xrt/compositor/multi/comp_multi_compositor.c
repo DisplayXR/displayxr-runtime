@@ -1128,6 +1128,18 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 	return true;
 }
 
+#ifdef XRT_HAVE_LEIA_SR
+struct leiasr *
+multi_compositor_get_eye_tracker(struct multi_compositor *mc)
+{
+	if (mc == NULL || mc->msc == NULL) {
+		return NULL;
+	}
+
+	return mc->msc->eye_tracker;
+}
+#endif
+
 xrt_result_t
 multi_compositor_create(struct multi_system_compositor *msc,
                         const struct xrt_session_info *xsi,

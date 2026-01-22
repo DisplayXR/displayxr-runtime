@@ -52,6 +52,11 @@
 #include <stdlib.h>
 #include <assert.h>
 
+#ifdef XRT_HAVE_LEIA_SR
+#include "multi/comp_multi_private.h"
+#include "leiasr/leiasr.h"
+#endif
+
 
 DEBUG_GET_ONCE_NUM_OPTION(ipd, "OXR_DEBUG_IPD_MM", 63)
 DEBUG_GET_ONCE_NUM_OPTION(wait_frame_sleep, "OXR_DEBUG_WAIT_FRAME_EXTRA_SLEEP_MS", 0)
@@ -93,6 +98,24 @@ to_string(XrSessionState state)
 	default: return "";
 	}
 }
+
+#ifdef XRT_HAVE_LEIA_SR
+/*!
+ * Get the shared eye tracker from the session's compositor chain.
+ * Returns NULL if eye tracking is not available.
+ */
+static struct leiasr *
+oxr_session_get_eye_tracker(struct oxr_session *sess)
+{
+	if (sess == NULL || sess->xcn == NULL) {
+		return NULL;
+	}
+
+	// The session's xcn is a multi_compositor in the multi-client architecture
+	struct multi_compositor *mc = multi_compositor(&sess->xcn->base);
+	return multi_compositor_get_eye_tracker(mc);
+}
+#endif
 
 static XrResult
 emit_reference_space_change_pending(struct oxr_logger *log,
@@ -640,11 +663,27 @@ oxr_session_locate_views(struct oxr_logger *log,
 	 */
 
 	// To be passed down to the devices, some can override this.
-	const struct xrt_vec3 default_eye_relation = {
+	// Start with static IPD-based calculation.
+	struct xrt_vec3 default_eye_relation = {
 	    sess->ipd_meters,
 	    0.0f,
 	    0.0f,
 	};
+
+#ifdef XRT_HAVE_LEIA_SR
+	// Try to get dynamic eye positions from SR eye tracker (Phase 5)
+	struct leiasr *eye_tracker = oxr_session_get_eye_tracker(sess);
+	if (eye_tracker != NULL) {
+		struct leiasr_eye_pair eye_pair;
+		if (leiasr_get_eye_positions(eye_tracker, &eye_pair)) {
+			// Calculate eye relation as vector from left to right eye
+			// This replaces the static IPD with actual eye positions
+			default_eye_relation.x = eye_pair.right.x - eye_pair.left.x;
+			default_eye_relation.y = eye_pair.right.y - eye_pair.left.y;
+			default_eye_relation.z = eye_pair.right.z - eye_pair.left.z;
+		}
+	}
+#endif
 
 	const uint64_t xdisplay_time =
 	    time_state_ts_to_monotonic_ns(sess->sys->inst->timekeeping, viewLocateInfo->displayTime);

@@ -966,6 +966,16 @@ system_compositor_destroy(struct xrt_system_compositor *xsc)
 	// Destroy the render thread first, destroy also stops the thread.
 	os_thread_helper_destroy(&msc->oth);
 
+#ifdef XRT_HAVE_LEIA_SR
+	// Stop and destroy shared eye tracker (Phase 5)
+	if (msc->eye_tracker != NULL) {
+		leiasr_eye_tracker_stop(msc->eye_tracker);
+		leiasr_destroy(msc->eye_tracker);
+		msc->eye_tracker = NULL;
+		U_LOG_I("Destroyed shared eye tracker");
+	}
+#endif
+
 	u_paf_destroy(&msc->upaf);
 
 	xrt_comp_native_destroy(&msc->xcn);
@@ -1043,6 +1053,23 @@ comp_multi_create_system_compositor(struct xrt_compositor_native *xcn,
 	}
 
 	os_thread_helper_start(&msc->oth, thread_func, msc);
+
+#ifdef XRT_HAVE_LEIA_SR
+	// Create shared eye tracker for all sessions (Phase 5)
+	// Eye tracking data is shared since one user = one pair of eyes
+	xrt_result_t eye_ret = leiasr_create_eye_tracker_only(10.0, &msc->eye_tracker);
+	if (eye_ret == XRT_SUCCESS) {
+		xrt_result_t start_ret = leiasr_eye_tracker_start(msc->eye_tracker);
+		if (start_ret == XRT_SUCCESS) {
+			U_LOG_I("Created and started shared eye tracker");
+		} else {
+			U_LOG_W("Created eye tracker but failed to start: %d", start_ret);
+		}
+	} else {
+		U_LOG_W("Failed to create shared eye tracker: %d (will use static IPD)", eye_ret);
+		msc->eye_tracker = NULL;
+	}
+#endif
 
 	*out_xsysc = &msc->base;
 
