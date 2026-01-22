@@ -105,6 +105,8 @@ add_executable(session_target_test WIN32
     input_state.h
     text_overlay.cpp
     text_overlay.h
+    logging.cpp
+    logging.h
 )
 
 target_include_directories(session_target_test PRIVATE

@@ -6,6 +6,7 @@
  */
 
 #include "d3d11_renderer.h"
+#include "logging.h"
 #include <d3dcompiler.h>
 #include <cmath>
 #include <vector>
@@ -84,6 +85,7 @@ float4 PSMain(PSInput input) : SV_TARGET {
 )";
 
 static bool CompileShader(const char* source, const char* entryPoint, const char* target, ID3DBlob** blob) {
+    LOG_DEBUG("Compiling shader: %s (%s)", entryPoint, target);
     ComPtr<ID3DBlob> errorBlob;
     HRESULT hr = D3DCompile(
         source, strlen(source),
@@ -95,21 +97,30 @@ static bool CompileShader(const char* source, const char* entryPoint, const char
 
     if (FAILED(hr)) {
         if (errorBlob) {
-            OutputDebugStringA((char*)errorBlob->GetBufferPointer());
+            LOG_ERROR("Shader compilation failed: %s", (char*)errorBlob->GetBufferPointer());
+        } else {
+            LogHResult("Shader compilation", hr);
         }
         return false;
     }
+    LOG_DEBUG("Shader compiled successfully: %s", entryPoint);
     return true;
 }
 
 bool InitializeD3D11(D3D11Renderer& renderer) {
+    LOG_INFO("Initializing D3D11...");
+
     // Create DXGI factory
+    LOG_INFO("Creating DXGI factory...");
     HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&renderer.dxgiFactory));
     if (FAILED(hr)) {
+        LogHResult("CreateDXGIFactory1", hr);
         return false;
     }
+    LOG_INFO("DXGI factory created: 0x%p", renderer.dxgiFactory.Get());
 
     // Create D3D11 device
+    LOG_INFO("Creating D3D11 device...");
     D3D_FEATURE_LEVEL featureLevels[] = {
         D3D_FEATURE_LEVEL_11_1,
         D3D_FEATURE_LEVEL_11_0,
@@ -118,6 +129,7 @@ bool InitializeD3D11(D3D11Renderer& renderer) {
     UINT createFlags = 0;
 #ifdef _DEBUG
     createFlags |= D3D11_CREATE_DEVICE_DEBUG;
+    LOG_INFO("Debug layer enabled");
 #endif
 
     hr = D3D11CreateDevice(
@@ -134,6 +146,7 @@ bool InitializeD3D11(D3D11Renderer& renderer) {
     );
 
     if (FAILED(hr)) {
+        LOG_WARN("D3D11 device creation failed (might be debug layer), retrying without debug...");
         // Try without debug layer
         hr = D3D11CreateDevice(
             nullptr,
@@ -148,11 +161,21 @@ bool InitializeD3D11(D3D11Renderer& renderer) {
             &renderer.context
         );
         if (FAILED(hr)) {
+            LogHResult("D3D11CreateDevice", hr);
             return false;
         }
     }
+    LOG_INFO("D3D11 device created: 0x%p", renderer.device.Get());
+    LOG_INFO("D3D11 context created: 0x%p", renderer.context.Get());
 
-    return CreateResources(renderer);
+    LOG_INFO("Creating D3D11 resources...");
+    bool result = CreateResources(renderer);
+    if (result) {
+        LOG_INFO("D3D11 initialization complete");
+    } else {
+        LOG_ERROR("Failed to create D3D11 resources");
+    }
+    return result;
 }
 
 bool CreateResources(D3D11Renderer& renderer) {

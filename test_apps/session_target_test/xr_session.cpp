@@ -6,19 +6,27 @@
  */
 
 #include "xr_session.h"
+#include "logging.h"
 #include <cstring>
 #include <cmath>
 
 using namespace DirectX;
 
-// Helper macro for XR error checking
+// Helper macro for XR error checking with logging
 #define XR_CHECK(call) \
     do { \
         XrResult result = (call); \
         if (XR_FAILED(result)) { \
-            char msg[256]; \
-            sprintf_s(msg, "OpenXR call failed: %s = %d\n", #call, result); \
-            OutputDebugStringA(msg); \
+            LogXrResult(#call, result); \
+            return false; \
+        } \
+    } while (0)
+
+#define XR_CHECK_LOG(call) \
+    do { \
+        XrResult result = (call); \
+        LogXrResult(#call, result); \
+        if (XR_FAILED(result)) { \
             return false; \
         } \
     } while (0)
@@ -58,18 +66,23 @@ static XMMATRIX XrFovToProjectionMatrix(const XrFovf& fov, float nearZ, float fa
 }
 
 bool InitializeOpenXR(XrSessionManager& xr) {
+    LOG_INFO("Querying OpenXR instance extension properties...");
+
     // Query available extensions
     uint32_t extensionCount = 0;
-    XR_CHECK(xrEnumerateInstanceExtensionProperties(nullptr, 0, &extensionCount, nullptr));
+    XR_CHECK_LOG(xrEnumerateInstanceExtensionProperties(nullptr, 0, &extensionCount, nullptr));
+    LOG_INFO("Found %u extensions available", extensionCount);
 
     std::vector<XrExtensionProperties> extensions(extensionCount, {XR_TYPE_EXTENSION_PROPERTIES});
     XR_CHECK(xrEnumerateInstanceExtensionProperties(nullptr, extensionCount, &extensionCount, extensions.data()));
 
-    // Check for required extensions
+    // Log all extensions and check for required ones
+    LOG_INFO("Available extensions:");
     bool hasD3D11 = false;
     xr.hasSessionTargetExt = false;
 
     for (const auto& ext : extensions) {
+        LOG_DEBUG("  %s (v%u)", ext.extensionName, ext.extensionVersion);
         if (strcmp(ext.extensionName, XR_KHR_D3D11_ENABLE_EXTENSION_NAME) == 0) {
             hasD3D11 = true;
         }
@@ -78,13 +91,16 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         }
     }
 
+    LOG_INFO("XR_KHR_D3D11_enable: %s", hasD3D11 ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_EXT_session_target: %s", xr.hasSessionTargetExt ? "AVAILABLE" : "NOT FOUND");
+
     if (!hasD3D11) {
-        OutputDebugStringA("ERROR: XR_KHR_D3D11_enable extension not available\n");
+        LOG_ERROR("XR_KHR_D3D11_enable extension not available - cannot continue");
         return false;
     }
 
     if (!xr.hasSessionTargetExt) {
-        OutputDebugStringA("WARNING: XR_EXT_session_target extension not available\n");
+        LOG_WARN("XR_EXT_session_target extension not available - window targeting disabled");
         // Continue anyway - will work without windowed mode
     }
 
@@ -95,7 +111,13 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         enabledExtensions.push_back(XR_EXT_SESSION_TARGET_EXTENSION_NAME);
     }
 
+    LOG_INFO("Enabling %zu extensions", enabledExtensions.size());
+    for (const auto& ext : enabledExtensions) {
+        LOG_INFO("  %s", ext);
+    }
+
     // Create instance
+    LOG_INFO("Creating OpenXR instance...");
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
     strcpy_s(createInfo.applicationInfo.applicationName, "SessionTargetTest");
     createInfo.applicationInfo.applicationVersion = 1;
@@ -105,41 +127,66 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     createInfo.enabledExtensionCount = (uint32_t)enabledExtensions.size();
     createInfo.enabledExtensionNames = enabledExtensions.data();
 
-    XR_CHECK(xrCreateInstance(&createInfo, &xr.instance));
+    LOG_INFO("OpenXR API version: %d.%d.%d",
+        XR_VERSION_MAJOR(XR_CURRENT_API_VERSION),
+        XR_VERSION_MINOR(XR_CURRENT_API_VERSION),
+        XR_VERSION_PATCH(XR_CURRENT_API_VERSION));
+
+    XR_CHECK_LOG(xrCreateInstance(&createInfo, &xr.instance));
+    LOG_INFO("OpenXR instance created: 0x%p", (void*)xr.instance);
 
     // Get system for HMD
+    LOG_INFO("Getting system for HMD form factor...");
     XrSystemGetInfo systemInfo = {XR_TYPE_SYSTEM_GET_INFO};
     systemInfo.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
-    XR_CHECK(xrGetSystem(xr.instance, &systemInfo, &xr.systemId));
+    XR_CHECK_LOG(xrGetSystem(xr.instance, &systemInfo, &xr.systemId));
+    LOG_INFO("System ID: %llu", (unsigned long long)xr.systemId);
 
     // Get view configuration views
+    LOG_INFO("Enumerating view configuration views...");
     uint32_t viewCount = 0;
     XR_CHECK(xrEnumerateViewConfigurationViews(xr.instance, xr.systemId, xr.viewConfigType, 0, &viewCount, nullptr));
 
     xr.configViews.resize(viewCount, {XR_TYPE_VIEW_CONFIGURATION_VIEW});
     XR_CHECK(xrEnumerateViewConfigurationViews(xr.instance, xr.systemId, xr.viewConfigType, viewCount, &viewCount, xr.configViews.data()));
 
-    char msg[256];
-    sprintf_s(msg, "OpenXR initialized: %d views, session_target=%s\n",
-        viewCount, xr.hasSessionTargetExt ? "yes" : "no");
-    OutputDebugStringA(msg);
+    LOG_INFO("View configuration: %u views", viewCount);
+    for (uint32_t i = 0; i < viewCount; i++) {
+        const auto& view = xr.configViews[i];
+        LOG_INFO("  View %u: recommended %ux%u, max %ux%u, samples %u",
+            i, view.recommendedImageRectWidth, view.recommendedImageRectHeight,
+            view.maxImageRectWidth, view.maxImageRectHeight,
+            view.recommendedSwapchainSampleCount);
+    }
 
+    LOG_INFO("OpenXR initialization complete");
     return true;
 }
 
 bool CreateSession(XrSessionManager& xr, ID3D11Device* d3d11Device, HWND hwnd) {
+    LOG_INFO("Creating OpenXR session...");
+    LOG_INFO("  D3D11 Device: 0x%p", d3d11Device);
+    LOG_INFO("  Window handle (HWND): 0x%p", hwnd);
+
     xr.windowHandle = hwnd;
 
     // Get D3D11 graphics requirements
+    LOG_INFO("Getting D3D11 graphics requirements...");
     XrGraphicsRequirementsD3D11KHR graphicsReq = {XR_TYPE_GRAPHICS_REQUIREMENTS_D3D11_KHR};
 
     // Get the function pointer for xrGetD3D11GraphicsRequirementsKHR
     PFN_xrGetD3D11GraphicsRequirementsKHR xrGetD3D11GraphicsRequirementsKHR = nullptr;
-    XR_CHECK(xrGetInstanceProcAddr(xr.instance, "xrGetD3D11GraphicsRequirementsKHR",
+    XR_CHECK_LOG(xrGetInstanceProcAddr(xr.instance, "xrGetD3D11GraphicsRequirementsKHR",
         (PFN_xrVoidFunction*)&xrGetD3D11GraphicsRequirementsKHR));
-    XR_CHECK(xrGetD3D11GraphicsRequirementsKHR(xr.instance, xr.systemId, &graphicsReq));
+
+    XR_CHECK_LOG(xrGetD3D11GraphicsRequirementsKHR(xr.instance, xr.systemId, &graphicsReq));
+    LOG_INFO("D3D11 graphics requirements: adapter LUID 0x%08X%08X, minFeatureLevel %d",
+        graphicsReq.adapterLuid.HighPart, graphicsReq.adapterLuid.LowPart,
+        graphicsReq.minFeatureLevel);
 
     // Build the next chain for session creation
+    LOG_INFO("Building session create info chain...");
+
     // D3D11 binding is required
     XrGraphicsBindingD3D11KHR d3d11Binding = {XR_TYPE_GRAPHICS_BINDING_D3D11_KHR};
     d3d11Binding.device = d3d11Device;
@@ -151,45 +198,68 @@ bool CreateSession(XrSessionManager& xr, ID3D11Device* d3d11Device, HWND hwnd) {
     if (xr.hasSessionTargetExt && hwnd) {
         // Chain: sessionInfo -> d3d11Binding -> sessionTarget
         d3d11Binding.next = &sessionTarget;
-        OutputDebugStringA("Using XR_EXT_session_target with window handle\n");
+        LOG_INFO("Using XR_EXT_session_target with window handle");
+        LOG_INFO("  Chain: XrSessionCreateInfo -> XrGraphicsBindingD3D11KHR -> XrSessionTargetCreateInfoEXT");
+    } else {
+        LOG_INFO("NOT using XR_EXT_session_target (hasExt=%d, hwnd=%p)",
+            xr.hasSessionTargetExt, hwnd);
     }
 
     XrSessionCreateInfo sessionInfo = {XR_TYPE_SESSION_CREATE_INFO};
     sessionInfo.next = &d3d11Binding;
     sessionInfo.systemId = xr.systemId;
 
-    XR_CHECK(xrCreateSession(xr.instance, &sessionInfo, &xr.session));
+    LOG_INFO("Calling xrCreateSession...");
+    XR_CHECK_LOG(xrCreateSession(xr.instance, &sessionInfo, &xr.session));
+    LOG_INFO("Session created: 0x%p", (void*)xr.session);
 
     return true;
 }
 
 bool CreateSpaces(XrSessionManager& xr) {
+    LOG_INFO("Creating reference spaces...");
+
     // Create LOCAL reference space
+    LOG_INFO("Creating LOCAL reference space...");
     XrReferenceSpaceCreateInfo localSpaceInfo = {XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
     localSpaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
     localSpaceInfo.poseInReferenceSpace.orientation = {0, 0, 0, 1};
     localSpaceInfo.poseInReferenceSpace.position = {0, 0, 0};
 
-    XR_CHECK(xrCreateReferenceSpace(xr.session, &localSpaceInfo, &xr.localSpace));
+    XR_CHECK_LOG(xrCreateReferenceSpace(xr.session, &localSpaceInfo, &xr.localSpace));
+    LOG_INFO("LOCAL space created: 0x%p", (void*)xr.localSpace);
 
     // Create VIEW reference space
+    LOG_INFO("Creating VIEW reference space...");
     XrReferenceSpaceCreateInfo viewSpaceInfo = {XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
     viewSpaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
     viewSpaceInfo.poseInReferenceSpace.orientation = {0, 0, 0, 1};
     viewSpaceInfo.poseInReferenceSpace.position = {0, 0, 0};
 
-    XR_CHECK(xrCreateReferenceSpace(xr.session, &viewSpaceInfo, &xr.viewSpace));
+    XR_CHECK_LOG(xrCreateReferenceSpace(xr.session, &viewSpaceInfo, &xr.viewSpace));
+    LOG_INFO("VIEW space created: 0x%p", (void*)xr.viewSpace);
 
+    LOG_INFO("Reference spaces created successfully");
     return true;
 }
 
 bool CreateSwapchains(XrSessionManager& xr) {
+    LOG_INFO("Creating swapchains...");
+
     // Query supported swapchain formats
+    LOG_INFO("Enumerating swapchain formats...");
     uint32_t formatCount = 0;
-    XR_CHECK(xrEnumerateSwapchainFormats(xr.session, 0, &formatCount, nullptr));
+    XR_CHECK_LOG(xrEnumerateSwapchainFormats(xr.session, 0, &formatCount, nullptr));
+    LOG_INFO("Found %u swapchain formats", formatCount);
 
     std::vector<int64_t> formats(formatCount);
     XR_CHECK(xrEnumerateSwapchainFormats(xr.session, formatCount, &formatCount, formats.data()));
+
+    // Log available formats
+    LOG_INFO("Available swapchain formats:");
+    for (uint32_t i = 0; i < formatCount; i++) {
+        LOG_DEBUG("  Format[%u]: %lld (0x%llX)", i, formats[i], formats[i]);
+    }
 
     // Prefer SRGB format
     int64_t selectedFormat = formats[0];
@@ -200,9 +270,11 @@ bool CreateSwapchains(XrSessionManager& xr) {
             break;
         }
     }
+    LOG_INFO("Selected swapchain format: %lld (0x%llX)", selectedFormat, selectedFormat);
 
     // Create swapchain for each eye
     for (int eye = 0; eye < 2 && eye < (int)xr.configViews.size(); eye++) {
+        LOG_INFO("Creating swapchain for eye %d...", eye);
         const auto& view = xr.configViews[eye];
 
         XrSwapchainCreateInfo swapchainInfo = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
@@ -215,7 +287,10 @@ bool CreateSwapchains(XrSessionManager& xr) {
         swapchainInfo.arraySize = 1;
         swapchainInfo.mipCount = 1;
 
-        XR_CHECK(xrCreateSwapchain(xr.session, &swapchainInfo, &xr.swapchains[eye].swapchain));
+        LOG_INFO("  Size: %ux%u, samples: %u", swapchainInfo.width, swapchainInfo.height, swapchainInfo.sampleCount);
+
+        XR_CHECK_LOG(xrCreateSwapchain(xr.session, &swapchainInfo, &xr.swapchains[eye].swapchain));
+        LOG_INFO("  Swapchain created: 0x%p", (void*)xr.swapchains[eye].swapchain);
 
         xr.swapchains[eye].format = selectedFormat;
         xr.swapchains[eye].width = swapchainInfo.width;
@@ -229,12 +304,13 @@ bool CreateSwapchains(XrSessionManager& xr) {
         XR_CHECK(xrEnumerateSwapchainImages(xr.swapchains[eye].swapchain, imageCount, &imageCount,
             (XrSwapchainImageBaseHeader*)xr.swapchains[eye].images.data()));
 
-        char msg[256];
-        sprintf_s(msg, "Created swapchain %d: %dx%d, %d images\n",
-            eye, swapchainInfo.width, swapchainInfo.height, imageCount);
-        OutputDebugStringA(msg);
+        LOG_INFO("  Got %u swapchain images", imageCount);
+        for (uint32_t i = 0; i < imageCount; i++) {
+            LOG_DEBUG("    Image[%u]: texture 0x%p", i, xr.swapchains[eye].images[i].texture);
+        }
     }
 
+    LOG_INFO("Swapchains created successfully");
     return true;
 }
 
@@ -245,28 +321,39 @@ bool PollEvents(XrSessionManager& xr) {
         switch (event.type) {
         case XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED: {
             auto* stateEvent = (XrEventDataSessionStateChanged*)&event;
+            XrSessionState oldState = xr.sessionState;
             xr.sessionState = stateEvent->state;
 
-            char msg[256];
-            sprintf_s(msg, "Session state changed: %s\n", GetSessionStateString(xr.sessionState));
-            OutputDebugStringA(msg);
+            LOG_INFO("Session state changed: %s -> %s",
+                GetSessionStateString(oldState),
+                GetSessionStateString(xr.sessionState));
 
             switch (xr.sessionState) {
             case XR_SESSION_STATE_READY: {
                 // Begin session
+                LOG_INFO("Session READY - calling xrBeginSession...");
                 XrSessionBeginInfo beginInfo = {XR_TYPE_SESSION_BEGIN_INFO};
                 beginInfo.primaryViewConfigurationType = xr.viewConfigType;
-                if (XR_SUCCEEDED(xrBeginSession(xr.session, &beginInfo))) {
+                XrResult result = xrBeginSession(xr.session, &beginInfo);
+                LogXrResult("xrBeginSession", result);
+                if (XR_SUCCEEDED(result)) {
                     xr.sessionRunning = true;
+                    LOG_INFO("Session is now running");
                 }
                 break;
             }
             case XR_SESSION_STATE_STOPPING:
+                LOG_INFO("Session STOPPING - calling xrEndSession...");
                 xrEndSession(xr.session);
                 xr.sessionRunning = false;
+                LOG_INFO("Session stopped");
                 break;
             case XR_SESSION_STATE_EXITING:
+                LOG_INFO("Session EXITING - requesting exit");
+                xr.exitRequested = true;
+                break;
             case XR_SESSION_STATE_LOSS_PENDING:
+                LOG_WARN("Session LOSS_PENDING - requesting exit");
                 xr.exitRequested = true;
                 break;
             default:
@@ -275,9 +362,11 @@ bool PollEvents(XrSessionManager& xr) {
             break;
         }
         case XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING:
+            LOG_WARN("Instance loss pending - requesting exit");
             xr.exitRequested = true;
             break;
         default:
+            LOG_DEBUG("Received event type: %d", event.type);
             break;
         }
 
@@ -383,32 +472,41 @@ bool EndFrame(XrSessionManager& xr, XrTime displayTime, const XrCompositionLayer
 }
 
 void CleanupOpenXR(XrSessionManager& xr) {
+    LOG_INFO("Cleaning up OpenXR resources...");
+
     for (int eye = 0; eye < 2; eye++) {
         if (xr.swapchains[eye].swapchain != XR_NULL_HANDLE) {
+            LOG_INFO("Destroying swapchain %d...", eye);
             xrDestroySwapchain(xr.swapchains[eye].swapchain);
             xr.swapchains[eye].swapchain = XR_NULL_HANDLE;
         }
     }
 
     if (xr.viewSpace != XR_NULL_HANDLE) {
+        LOG_INFO("Destroying VIEW space...");
         xrDestroySpace(xr.viewSpace);
         xr.viewSpace = XR_NULL_HANDLE;
     }
 
     if (xr.localSpace != XR_NULL_HANDLE) {
+        LOG_INFO("Destroying LOCAL space...");
         xrDestroySpace(xr.localSpace);
         xr.localSpace = XR_NULL_HANDLE;
     }
 
     if (xr.session != XR_NULL_HANDLE) {
+        LOG_INFO("Destroying session...");
         xrDestroySession(xr.session);
         xr.session = XR_NULL_HANDLE;
     }
 
     if (xr.instance != XR_NULL_HANDLE) {
+        LOG_INFO("Destroying instance...");
         xrDestroyInstance(xr.instance);
         xr.instance = XR_NULL_HANDLE;
     }
+
+    LOG_INFO("OpenXR cleanup complete");
 }
 
 const char* GetSessionStateString(XrSessionState state) {

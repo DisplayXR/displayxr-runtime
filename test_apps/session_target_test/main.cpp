@@ -14,6 +14,7 @@
 #include <windows.h>
 #include <wrl/client.h>
 
+#include "logging.h"
 #include "xr_session.h"
 #include "d3d11_renderer.h"
 #include "text_overlay.h"
@@ -67,6 +68,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
 // Create the application window
 static HWND CreateAppWindow(HINSTANCE hInstance, int width, int height) {
+    LOG_INFO("Creating application window (%dx%d)", width, height);
+
     WNDCLASSEX wc = {};
     wc.cbSize = sizeof(WNDCLASSEX);
     wc.style = CS_HREDRAW | CS_VREDRAW;
@@ -77,9 +80,12 @@ static HWND CreateAppWindow(HINSTANCE hInstance, int width, int height) {
     wc.lpszClassName = WINDOW_CLASS;
 
     if (!RegisterClassEx(&wc)) {
+        DWORD err = GetLastError();
+        LOG_ERROR("Failed to register window class, error: %lu", err);
         MessageBox(nullptr, L"Failed to register window class", L"Error", MB_OK | MB_ICONERROR);
         return nullptr;
     }
+    LOG_INFO("Window class registered successfully");
 
     // Calculate window size to get desired client area
     RECT rect = { 0, 0, width, height };
@@ -100,10 +106,13 @@ static HWND CreateAppWindow(HINSTANCE hInstance, int width, int height) {
     );
 
     if (!hwnd) {
+        DWORD err = GetLastError();
+        LOG_ERROR("Failed to create window, error: %lu", err);
         MessageBox(nullptr, L"Failed to create window", L"Error", MB_OK | MB_ICONERROR);
         return nullptr;
     }
 
+    LOG_INFO("Window created successfully, HWND: 0x%p", hwnd);
     return hwnd;
 }
 
@@ -139,66 +148,103 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     (void)hPrevInstance;
     (void)lpCmdLine;
 
+    // Initialize logging first
+    if (!InitializeLogging()) {
+        MessageBox(nullptr, L"Failed to initialize logging", L"Warning", MB_OK | MB_ICONWARNING);
+        // Continue anyway - just won't have file logging
+    }
+
+    LOG_INFO("=== XR_EXT_session_target Test Application ===");
+    LOG_INFO("Starting initialization...");
+
     // Create window
     HWND hwnd = CreateAppWindow(hInstance, g_windowWidth, g_windowHeight);
     if (!hwnd) {
+        LOG_ERROR("Window creation failed, exiting");
+        ShutdownLogging();
         return 1;
     }
 
     // Initialize D3D11
+    LOG_INFO("Initializing D3D11...");
     D3D11Renderer renderer = {};
     if (!InitializeD3D11(renderer)) {
+        LOG_ERROR("D3D11 initialization failed");
         MessageBox(hwnd, L"Failed to initialize D3D11", L"Error", MB_OK | MB_ICONERROR);
+        ShutdownLogging();
         return 1;
     }
+    LOG_INFO("D3D11 initialized successfully");
 
     // Initialize text overlay
+    LOG_INFO("Initializing text overlay...");
     TextOverlay textOverlay = {};
     if (!InitializeTextOverlay(textOverlay)) {
+        LOG_ERROR("Text overlay initialization failed");
         MessageBox(hwnd, L"Failed to initialize text overlay", L"Error", MB_OK | MB_ICONERROR);
         CleanupD3D11(renderer);
+        ShutdownLogging();
         return 1;
     }
+    LOG_INFO("Text overlay initialized successfully");
 
     // Initialize OpenXR
+    LOG_INFO("Initializing OpenXR instance...");
     XrSessionManager xr = {};
     if (!InitializeOpenXR(xr)) {
+        LOG_ERROR("OpenXR initialization failed");
         MessageBox(hwnd, L"Failed to initialize OpenXR", L"Error", MB_OK | MB_ICONERROR);
         CleanupTextOverlay(textOverlay);
         CleanupD3D11(renderer);
+        ShutdownLogging();
         return 1;
     }
+    LOG_INFO("OpenXR instance initialized successfully");
 
     // Create OpenXR session with window handle (using XR_EXT_session_target)
+    LOG_INFO("Creating OpenXR session with XR_EXT_session_target (HWND: 0x%p)...", hwnd);
     if (!CreateSession(xr, renderer.device.Get(), hwnd)) {
+        LOG_ERROR("OpenXR session creation failed");
         MessageBox(hwnd, L"Failed to create OpenXR session", L"Error", MB_OK | MB_ICONERROR);
         CleanupOpenXR(xr);
         CleanupTextOverlay(textOverlay);
         CleanupD3D11(renderer);
+        ShutdownLogging();
         return 1;
     }
+    LOG_INFO("OpenXR session created successfully");
 
     // Create reference spaces
+    LOG_INFO("Creating reference spaces...");
     if (!CreateSpaces(xr)) {
+        LOG_ERROR("Reference space creation failed");
         MessageBox(hwnd, L"Failed to create reference spaces", L"Error", MB_OK | MB_ICONERROR);
         CleanupOpenXR(xr);
         CleanupTextOverlay(textOverlay);
         CleanupD3D11(renderer);
+        ShutdownLogging();
         return 1;
     }
+    LOG_INFO("Reference spaces created successfully");
 
     // Create swapchains
+    LOG_INFO("Creating swapchains...");
     if (!CreateSwapchains(xr)) {
+        LOG_ERROR("Swapchain creation failed");
         MessageBox(hwnd, L"Failed to create swapchains", L"Error", MB_OK | MB_ICONERROR);
         CleanupOpenXR(xr);
         CleanupTextOverlay(textOverlay);
         CleanupD3D11(renderer);
+        ShutdownLogging();
         return 1;
     }
+    LOG_INFO("Swapchains created successfully (width: %u, height: %u)",
+        xr.swapchains[0].width, xr.swapchains[0].height);
 
     // Show window
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
+    LOG_INFO("Window shown");
 
     // Per-eye render targets and depth buffers
     ComPtr<ID3D11RenderTargetView> eyeRTVs[2];
@@ -206,6 +252,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     ComPtr<ID3D11DepthStencilView> depthDSVs[2];
 
     // Create depth buffers for each eye
+    LOG_INFO("Creating depth buffers...");
     for (int eye = 0; eye < 2; eye++) {
         ID3D11Texture2D* depthTex = nullptr;
         ID3D11DepthStencilView* dsv = nullptr;
@@ -213,25 +260,34 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             xr.swapchains[eye].width,
             xr.swapchains[eye].height,
             &depthTex, &dsv)) {
+            LOG_ERROR("Failed to create depth buffer for eye %d", eye);
             MessageBox(hwnd, L"Failed to create depth buffer", L"Error", MB_OK | MB_ICONERROR);
             CleanupOpenXR(xr);
             CleanupTextOverlay(textOverlay);
             CleanupD3D11(renderer);
+            ShutdownLogging();
             return 1;
         }
         depthTextures[eye].Attach(depthTex);
         depthDSVs[eye].Attach(dsv);
     }
+    LOG_INFO("Depth buffers created successfully");
 
     // Performance tracking
     PerformanceStats perfStats = {};
     perfStats.lastTime = std::chrono::high_resolution_clock::now();
 
+    LOG_INFO("");
+    LOG_INFO("=== Initialization complete, entering main loop ===");
+    LOG_INFO("");
+
     // Main loop
     MSG msg = {};
     bool running = true;
+    int frameNumber = 0;
 
     while (running && !xr.exitRequested) {
+        frameNumber++;
         // Process Windows messages
         while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
             if (msg.message == WM_QUIT) {
@@ -376,17 +432,31 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     }
 
     // Cleanup
+    LOG_INFO("");
+    LOG_INFO("=== Shutting down ===");
+
+    LOG_INFO("Releasing depth buffers...");
     for (int eye = 0; eye < 2; eye++) {
         depthDSVs[eye].Reset();
         depthTextures[eye].Reset();
         eyeRTVs[eye].Reset();
     }
 
+    LOG_INFO("Cleaning up OpenXR...");
     CleanupOpenXR(xr);
+
+    LOG_INFO("Cleaning up text overlay...");
     CleanupTextOverlay(textOverlay);
+
+    LOG_INFO("Cleaning up D3D11...");
     CleanupD3D11(renderer);
+
+    LOG_INFO("Destroying window...");
     DestroyWindow(hwnd);
     UnregisterClass(WINDOW_CLASS, hInstance);
+
+    LOG_INFO("Application shutdown complete");
+    ShutdownLogging();
 
     return 0;
 }
