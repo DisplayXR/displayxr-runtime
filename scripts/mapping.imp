@@ -35,6 +35,7 @@
 { symbol: ["XRT_FEATURE_IPC_CLIENT", "public", "\"xrt/xrt_config_build.h\"", "public"] },
 { symbol: ["XRT_FEATURE_OPENXR", "public", "\"xrt/xrt_config_build.h\"", "public"] },
 { symbol: ["XRT_FEATURE_OPENXR_ACTIVE_ACTION_SET_PRIORITY", "public", "\"xrt/xrt_config_build.h\"", "public"] },
+{ symbol: ["XRT_FEATURE_OPENXR_BODY_TRACKING_BD", "public", "\"xrt/xrt_config_build.h\"", "public"] },
 { symbol: ["XRT_FEATURE_OPENXR_BODY_TRACKING_CALIBRATION_META", "public", "\"xrt/xrt_config_build.h\"", "public"] },
 { symbol: ["XRT_FEATURE_OPENXR_BODY_TRACKING_FB", "public", "\"xrt/xrt_config_build.h\"", "public"] },
 { symbol: ["XRT_FEATURE_OPENXR_BODY_TRACKING_FULL_BODY_META", "public", "\"xrt/xrt_config_build.h\"", "public"] },

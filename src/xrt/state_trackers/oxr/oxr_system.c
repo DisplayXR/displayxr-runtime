@@ -632,6 +632,18 @@ oxr_system_get_properties(struct oxr_logger *log, struct oxr_system *sys, XrSyst
 	}
 #endif // OXR_HAVE_FB_body_tracking
 
+#ifdef OXR_HAVE_BD_body_tracking
+	XrSystemBodyTrackingPropertiesBD *body_tracking_bd_props = NULL;
+	if (sys->inst->extensions.BD_body_tracking) {
+		body_tracking_bd_props = OXR_GET_OUTPUT_FROM_CHAIN(
+		    properties, XR_TYPE_SYSTEM_BODY_TRACKING_PROPERTIES_BD, XrSystemBodyTrackingPropertiesBD);
+	}
+
+	if (body_tracking_bd_props) {
+		body_tracking_bd_props->supportsBodyTracking = oxr_system_get_body_tracking_bd_support(log, sys->inst);
+	}
+#endif // OXR_HAVE_BD_body_tracking
+
 #ifdef OXR_HAVE_FB_face_tracking2
 	XrSystemFaceTrackingProperties2FB *face_tracking2_fb_props = NULL;
 	if (sys->inst->extensions.FB_face_tracking2) {

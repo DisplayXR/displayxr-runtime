@@ -132,6 +132,7 @@ struct oxr_face_tracker_android;
 struct oxr_facial_tracker_htc;
 struct oxr_face_tracker2_fb;
 struct oxr_body_tracker_fb;
+struct oxr_body_tracker_bd;
 struct oxr_xdev_list;
 struct oxr_plane_detector_ext;
 
@@ -454,6 +455,19 @@ static inline XrBodyTrackerFB
 oxr_body_tracker_fb_to_openxr(struct oxr_body_tracker_fb *body_tracker_fb)
 {
 	return XRT_CAST_PTR_TO_OXR_HANDLE(XrBodyTrackerFB, body_tracker_fb);
+}
+#endif
+
+#ifdef OXR_HAVE_BD_body_tracking
+/*!
+ * To go back to a OpenXR object.
+ *
+ * @relates oxr_body_tracker_bd
+ */
+static inline XrBodyTrackerBD
+oxr_body_tracker_bd_to_openxr(struct oxr_body_tracker_bd *body_tracker_bd)
+{
+	return XRT_CAST_PTR_TO_OXR_HANDLE(XrBodyTrackerBD, body_tracker_bd);
 }
 #endif
 
@@ -2779,6 +2793,47 @@ oxr_locate_body_joints_fb(struct oxr_logger *log,
                           struct oxr_space *base_spc,
                           const XrBodyJointsLocateInfoFB *locateInfo,
                           XrBodyJointLocationsFB *locations);
+#endif
+
+#ifdef OXR_HAVE_BD_body_tracking
+/*!
+ * BD (PICO) specific Body tracker.
+ *
+ * Parent type/handle is @ref oxr_session
+ *
+ * @obj{XrBodyTrackerBD}
+ * @extends oxr_handle_base
+ */
+struct oxr_body_tracker_bd
+{
+	//! Common structure for things referred to by OpenXR handles.
+	struct oxr_handle_base handle;
+
+	//! Owner of this body tracker.
+	struct oxr_session *sess;
+
+	//! xrt_device backing this body tracker
+	struct xrt_device *xdev;
+
+	//! Type of the body joint set (with or without arms)
+	enum xrt_body_joint_set_type_bd joint_set_type;
+};
+
+XrResult
+oxr_create_body_tracker_bd(struct oxr_logger *log,
+                           struct oxr_session *sess,
+                           const XrBodyTrackerCreateInfoBD *createInfo,
+                           struct oxr_body_tracker_bd **out_body_tracker_bd);
+
+XrResult
+oxr_locate_body_joints_bd(struct oxr_logger *log,
+                          struct oxr_body_tracker_bd *body_tracker_bd,
+                          struct oxr_space *base_spc,
+                          const XrBodyJointsLocateInfoBD *locateInfo,
+                          XrBodyJointLocationsBD *locations);
+
+bool
+oxr_system_get_body_tracking_bd_support(struct oxr_logger *log, struct oxr_instance *inst);
 #endif
 
 #ifdef OXR_HAVE_FB_face_tracking2

@@ -1,5 +1,5 @@
 // Copyright 2018-2024, Collabora, Ltd.
-// Copyright 2025, NVIDIA CORPORATION.
+// Copyright 2025-2026, NVIDIA CORPORATION.
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
@@ -90,6 +90,8 @@ struct oxr_subaction_paths;
 	OXR_VERIFY_AND_SET_AND_INIT(log, thing, new_thing, oxr_face_tracker2_fb, FTRACKER, name, new_thing->sess->sys->inst)
 #define OXR_VERIFY_BODY_TRACKER_FB_AND_INIT_LOG(log, thing, new_thing, name) \
 	OXR_VERIFY_AND_SET_AND_INIT(log, thing, new_thing, oxr_body_tracker_fb, BTRACKER, name, new_thing->sess->sys->inst)
+#define OXR_VERIFY_BODY_TRACKER_BD_AND_INIT_LOG(log, thing, new_thing, name) \
+	OXR_VERIFY_AND_SET_AND_INIT(log, thing, new_thing, oxr_body_tracker_bd, BTRACKER_BD, name, new_thing->sess->sys->inst)
 #define OXR_VERIFY_XDEVLIST_AND_INIT_LOG(log, thing, new_thing, name) \
 	OXR_VERIFY_AND_SET_AND_INIT(log, thing, new_thing, oxr_xdev_list, XDEVLIST, name, new_thing->sess->sys->inst)
 #define OXR_VERIFY_PLANE_DETECTOR_AND_INIT_LOG(log, thing, new_thing, name) \

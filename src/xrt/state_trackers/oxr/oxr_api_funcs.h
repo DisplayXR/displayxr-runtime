@@ -1,5 +1,5 @@
 // Copyright 2018-2024, Collabora, Ltd.
-// Copyright 2025, NVIDIA CORPORATION.
+// Copyright 2025-2026, NVIDIA CORPORATION.
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
@@ -694,6 +694,22 @@ XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrLocateBodyJointsFB(XrBodyTrackerFB bodyTracker,
                          const XrBodyJointsLocateInfoFB *locateInfo,
                          XrBodyJointLocationsFB *locations);
+#endif
+
+#ifdef OXR_HAVE_BD_body_tracking
+//! OpenXR API function @ep{xrCreateBodyTrackerBD}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrCreateBodyTrackerBD(XrSession session, const XrBodyTrackerCreateInfoBD *createInfo, XrBodyTrackerBD *bodyTracker);
+
+//! OpenXR API function @ep{xrDestroyBodyTrackerBD}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrDestroyBodyTrackerBD(XrBodyTrackerBD bodyTracker);
+
+//! OpenXR API function @ep{xrLocateBodyJointsBD}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrLocateBodyJointsBD(XrBodyTrackerBD bodyTracker,
+                         const XrBodyJointsLocateInfoBD *locateInfo,
+                         XrBodyJointLocationsBD *locations);
 #endif
 
 #ifdef OXR_HAVE_FB_face_tracking2

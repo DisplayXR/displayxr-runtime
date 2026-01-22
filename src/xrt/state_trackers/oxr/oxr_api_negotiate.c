@@ -1,5 +1,5 @@
 // Copyright 2018-2024, Collabora, Ltd.
-// Copyright 2025, NVIDIA CORPORATION.
+// Copyright 2025-2026, NVIDIA CORPORATION.
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
@@ -395,6 +395,12 @@ handle_non_null(struct oxr_instance *inst, struct oxr_logger *log, const char *n
 	ENTRY_IF_EXT(xrDestroyBodyTrackerFB, FB_body_tracking);
 	ENTRY_IF_EXT(xrGetBodySkeletonFB, FB_body_tracking);
 	ENTRY_IF_EXT(xrLocateBodyJointsFB, FB_body_tracking);
+#endif
+
+#ifdef OXR_HAVE_BD_body_tracking
+	ENTRY_IF_EXT(xrCreateBodyTrackerBD, BD_body_tracking);
+	ENTRY_IF_EXT(xrDestroyBodyTrackerBD, BD_body_tracking);
+	ENTRY_IF_EXT(xrLocateBodyJointsBD, BD_body_tracking);
 #endif
 
 #ifdef OXR_HAVE_FB_face_tracking2

@@ -1202,6 +1202,8 @@ enum xrt_input_name
 	XRT_INPUT_GENERIC_BODY_TRACKING                             = XRT_INPUT_NAME(0x0700, BODY_TRACKING),
 	XRT_INPUT_FB_BODY_TRACKING                                  = XRT_INPUT_NAME(0x0701, BODY_TRACKING),
 	XRT_INPUT_META_FULL_BODY_TRACKING                           = XRT_INPUT_NAME(0x0702, BODY_TRACKING),
+	XRT_INPUT_BD_BODY_TRACKING                                  = XRT_INPUT_NAME(0x0703, BODY_TRACKING),
+	XRT_INPUT_BD_BODY_TRACKING_WITHOUT_ARM                      = XRT_INPUT_NAME(0x0704, BODY_TRACKING),
 
 	XRT_INPUT_PICO_NEO3_X_CLICK                                 = XRT_INPUT_NAME(0x0800, BOOLEAN),
 	XRT_INPUT_PICO_NEO3_X_TOUCH                                 = XRT_INPUT_NAME(0x0801, BOOLEAN),
@@ -2204,6 +2206,63 @@ struct xrt_body_joint_set
 	};
 	// in driver global space, without tracking_origin offset
 	struct xrt_space_relation body_pose;
+};
+
+/*
+ *
+ * XR_BD_body_tracking (PICO body tracking)
+ *
+ */
+
+#define XRT_BODY_JOINT_COUNT_BD 24
+#define XRT_BODY_JOINT_WITHOUT_ARM_COUNT_BD 16
+
+enum xrt_body_joint_bd
+{
+	XRT_BODY_JOINT_PELVIS_BD = 0,
+	XRT_BODY_JOINT_LEFT_HIP_BD = 1,
+	XRT_BODY_JOINT_RIGHT_HIP_BD = 2,
+	XRT_BODY_JOINT_SPINE1_BD = 3,
+	XRT_BODY_JOINT_LEFT_KNEE_BD = 4,
+	XRT_BODY_JOINT_RIGHT_KNEE_BD = 5,
+	XRT_BODY_JOINT_SPINE2_BD = 6,
+	XRT_BODY_JOINT_LEFT_ANKLE_BD = 7,
+	XRT_BODY_JOINT_RIGHT_ANKLE_BD = 8,
+	XRT_BODY_JOINT_SPINE3_BD = 9,
+	XRT_BODY_JOINT_LEFT_FOOT_BD = 10,
+	XRT_BODY_JOINT_RIGHT_FOOT_BD = 11,
+	XRT_BODY_JOINT_NECK_BD = 12,
+	XRT_BODY_JOINT_LEFT_COLLAR_BD = 13,
+	XRT_BODY_JOINT_RIGHT_COLLAR_BD = 14,
+	XRT_BODY_JOINT_HEAD_BD = 15,
+	XRT_BODY_JOINT_LEFT_SHOULDER_BD = 16,
+	XRT_BODY_JOINT_RIGHT_SHOULDER_BD = 17,
+	XRT_BODY_JOINT_LEFT_ELBOW_BD = 18,
+	XRT_BODY_JOINT_RIGHT_ELBOW_BD = 19,
+	XRT_BODY_JOINT_LEFT_WRIST_BD = 20,
+	XRT_BODY_JOINT_RIGHT_WRIST_BD = 21,
+	XRT_BODY_JOINT_LEFT_HAND_BD = 22,
+	XRT_BODY_JOINT_RIGHT_HAND_BD = 23,
+};
+
+enum xrt_body_joint_set_type_bd
+{
+	XRT_BODY_JOINT_SET_UNKNOWN_BD = 0,
+	XRT_BODY_JOINT_SET_BODY_WITHOUT_ARM_BD = 1,
+	XRT_BODY_JOINT_SET_FULL_BODY_BD = 2,
+};
+
+struct xrt_body_joint_location_bd
+{
+	struct xrt_space_relation relation;
+};
+
+struct xrt_body_joint_set_bd
+{
+	int64_t sample_time_ns;
+	bool is_active;
+	bool all_joint_poses_tracked;
+	struct xrt_body_joint_location_bd joint_locations[XRT_BODY_JOINT_COUNT_BD];
 };
 
 /*!

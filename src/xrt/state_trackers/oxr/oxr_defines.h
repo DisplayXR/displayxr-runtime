@@ -1,4 +1,5 @@
 // Copyright 2018-2024, Collabora, Ltd.
+// Copyright 2026, NVIDIA CORPORATION.
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
@@ -29,8 +30,10 @@
 #define OXR_XR_DEBUG_PASSTHROUGH                      (*(uint64_t *)"oxrpass\0")
 #define OXR_XR_DEBUG_PASSTHROUGH_LAYER                (*(uint64_t *)"oxrptla\0")
 #define OXR_XR_DEBUG_FTRACKER                         (*(uint64_t *)"oxrftra\0")
-// body tracker
+// body tracker (FB)
 #define OXR_XR_DEBUG_BTRACKER                         (*(uint64_t *)"oxrbtra\0")
+// body tracker (BD/PICO)
+#define OXR_XR_DEBUG_BTRACKER_BD                      (*(uint64_t *)"oxrbtbd\0")
 #define OXR_XR_DEBUG_XDEVLIST                         (*(uint64_t *)"oxrxdli\0")
 // plane detection
 #define OXR_XR_DEBUG_PLANEDET                         (*(uint64_t *)"oxrplan\0")
