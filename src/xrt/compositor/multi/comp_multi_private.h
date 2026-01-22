@@ -410,7 +410,7 @@ struct multi_system_compositor
 	//! Service for creating per-session render targets (provided by comp_main)
 	struct comp_target_service *target_service;
 
-#ifdef XRT_HAVE_LEIA_SR
+#ifdef XRT_HAVE_LEIA_SR_SENSE
 	//! Shared eye tracker for all sessions (created once at system init).
 	//! One user = one pair of eyes, so all sessions share the same tracking data.
 	struct leiasr *eye_tracker;
@@ -467,7 +467,7 @@ multi_compositor_has_session_render(struct multi_compositor *mc)
 	return mc->session_render.external_window_handle != NULL;
 }
 
-#ifdef XRT_HAVE_LEIA_SR
+#ifdef XRT_HAVE_LEIA_SR_SENSE
 /*!
  * Get the shared eye tracker from a multi_compositor.
  * Returns the eye tracker stored at the system compositor level.

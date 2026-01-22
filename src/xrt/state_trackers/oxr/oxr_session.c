@@ -52,7 +52,7 @@
 #include <stdlib.h>
 #include <assert.h>
 
-#ifdef XRT_HAVE_LEIA_SR
+#ifdef XRT_HAVE_LEIA_SR_SENSE
 #include "multi/comp_multi_private.h"
 #include "leiasr/leiasr.h"
 #endif
@@ -99,7 +99,7 @@ to_string(XrSessionState state)
 	}
 }
 
-#ifdef XRT_HAVE_LEIA_SR
+#ifdef XRT_HAVE_LEIA_SR_SENSE
 /*!
  * Get the shared eye tracker from the session's compositor chain.
  * Returns NULL if eye tracking is not available.
@@ -670,7 +670,7 @@ oxr_session_locate_views(struct oxr_logger *log,
 	    0.0f,
 	};
 
-#ifdef XRT_HAVE_LEIA_SR
+#ifdef XRT_HAVE_LEIA_SR_SENSE
 	// Try to get dynamic eye positions from SR eye tracker (Phase 5)
 	struct leiasr *eye_tracker = oxr_session_get_eye_tracker(sess);
 	if (eye_tracker != NULL) {

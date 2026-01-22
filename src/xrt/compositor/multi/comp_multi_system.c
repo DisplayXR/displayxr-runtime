@@ -966,7 +966,7 @@ system_compositor_destroy(struct xrt_system_compositor *xsc)
 	// Destroy the render thread first, destroy also stops the thread.
 	os_thread_helper_destroy(&msc->oth);
 
-#ifdef XRT_HAVE_LEIA_SR
+#ifdef XRT_HAVE_LEIA_SR_SENSE
 	// Stop and destroy shared eye tracker (Phase 5)
 	if (msc->eye_tracker != NULL) {
 		leiasr_eye_tracker_stop(msc->eye_tracker);
@@ -1054,7 +1054,7 @@ comp_multi_create_system_compositor(struct xrt_compositor_native *xcn,
 
 	os_thread_helper_start(&msc->oth, thread_func, msc);
 
-#ifdef XRT_HAVE_LEIA_SR
+#ifdef XRT_HAVE_LEIA_SR_SENSE
 	// Create shared eye tracker for all sessions (Phase 5)
 	// Eye tracking data is shared since one user = one pair of eyes
 	xrt_result_t eye_ret = leiasr_create_eye_tracker_only(10.0, &msc->eye_tracker);
