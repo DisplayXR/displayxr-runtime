@@ -535,9 +535,18 @@ if(XRT_HAVE_LEIA_SR)
 		${SR_PATH}/lib/SimulatedRealityCore.lib # should have been srCore::srCore but it's broken due to libfilter
 		${SR_PATH}/lib/SimulatedRealityDisplays.lib # should have been srDisplays::srDisplays but it requires srCore::srCore
         ${SR_PATH}/lib/SimulatedRealityVulkanBeta.lib
-		${SR_PATH}/lib/SimulatedRealitySense.lib # Phase 5: Eye tracking support
 		${SR_PATH}/third_party/OpenCV/lib/x64/opencv_world343.lib
 		PUBLIC drv_includes)
+
+	# Phase 5: Eye tracking support (optional - only if Sense library exists)
+	if(EXISTS "${SR_PATH}/lib/SimulatedRealitySense.lib")
+		message(STATUS "Found SimulatedRealitySense.lib - enabling eye tracking")
+		target_link_libraries(drv_leiasr PRIVATE ${SR_PATH}/lib/SimulatedRealitySense.lib)
+		target_compile_definitions(drv_leiasr PUBLIC XRT_HAVE_LEIA_SR_SENSE)
+	else()
+		message(STATUS "SimulatedRealitySense.lib not found - eye tracking disabled")
+	endif()
+
 	list(APPEND ENABLED_DRIVERS drv_leiasr)
 endif(XRT_HAVE_LEIA_SR)
 

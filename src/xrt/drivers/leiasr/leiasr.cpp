@@ -14,8 +14,11 @@
 #include <sr/weaver/vkweaver.h>
 #include <sr/world/display/display.h>
 #include <sr/utility/exception.h>
+
+#ifdef XRT_HAVE_LEIA_SR_SENSE
 #include <sr/sense/eyetracker/eyetracker.h>
 #include <sr/sense/eyetracker/eyepairlistener.h>
+#endif
 
 #include <windows.h>
 #include <sysinfoapi.h>
@@ -27,6 +30,7 @@
 // Forward declaration
 struct leiasr;
 
+#ifdef XRT_HAVE_LEIA_SR_SENSE
 /*!
  * Listener class that receives eye pair updates from the SR SDK.
  * Converts positions from millimeters to meters and stores them thread-safely.
@@ -41,6 +45,7 @@ public:
 private:
 	struct leiasr *owner_;
 };
+#endif
 
 /*!
  * Main structure holding SR context, weaver, and eye tracking state.
@@ -58,10 +63,12 @@ struct leiasr
 	SR::SRContext *context = nullptr;
 	SR::IVulkanWeaver1 *weaver = nullptr;
 
+#ifdef XRT_HAVE_LEIA_SR_SENSE
 	// Eye tracking objects
 	SR::EyeTracker *eyeTracker = nullptr;
 	LeiaEyePairListener *eyeListener = nullptr;
 	SR::EyePairStream *eyeStream = nullptr;
+#endif
 
 	// Thread-safe eye position storage
 	std::mutex eyeMutex;
@@ -92,6 +99,7 @@ struct leiasr
 	}
 };
 
+#ifdef XRT_HAVE_LEIA_SR_SENSE
 // Implementation of LeiaEyePairListener::accept
 void
 LeiaEyePairListener::accept(const SR_eyePair &eyePair)
@@ -109,6 +117,7 @@ LeiaEyePairListener::accept(const SR_eyePair &eyePair)
 
 	owner_->updateEyePositions(pair);
 }
+#endif
 
 namespace {
 
@@ -248,6 +257,7 @@ leiasr_create(double maxTime,
 xrt_result_t
 leiasr_create_eye_tracker_only(double maxTime, struct leiasr **out)
 {
+#ifdef XRT_HAVE_LEIA_SR_SENSE
 	leiasr *sr = new leiasr;
 	sr->eyeTrackerOnly = true;
 
@@ -264,6 +274,12 @@ leiasr_create_eye_tracker_only(double maxTime, struct leiasr **out)
 	U_LOG_I("Created leiasr instance for eye tracking only");
 
 	return XRT_SUCCESS;
+#else
+	(void)maxTime;
+	*out = nullptr;
+	U_LOG_W("Eye tracking not available - SimulatedRealitySense library not found at build time");
+	return XRT_ERROR_DEVICE_CREATION_FAILED;
+#endif
 }
 
 void
@@ -329,6 +345,7 @@ leiasr_weave(struct leiasr *leiasr,
 xrt_result_t
 leiasr_eye_tracker_start(struct leiasr *leiasr)
 {
+#ifdef XRT_HAVE_LEIA_SR_SENSE
 	if (leiasr == nullptr) {
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
@@ -374,6 +391,11 @@ leiasr_eye_tracker_start(struct leiasr *leiasr)
 		U_LOG_E("Exception starting eye tracker: %s", e.what());
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
+#else
+	(void)leiasr;
+	U_LOG_W("Eye tracking not available - SimulatedRealitySense library not found at build time");
+	return XRT_ERROR_DEVICE_CREATION_FAILED;
+#endif
 }
 
 void
@@ -389,6 +411,7 @@ leiasr_eye_tracker_stop(struct leiasr *leiasr)
 
 	leiasr->eyeTrackingActive.store(false);
 
+#ifdef XRT_HAVE_LEIA_SR_SENSE
 	// Close the stream first
 	if (leiasr->eyeStream != nullptr) {
 		delete leiasr->eyeStream;
@@ -406,6 +429,7 @@ leiasr_eye_tracker_stop(struct leiasr *leiasr)
 		delete leiasr->eyeTracker;
 		leiasr->eyeTracker = nullptr;
 	}
+#endif
 
 	// Clear the latest eye pair
 	{
