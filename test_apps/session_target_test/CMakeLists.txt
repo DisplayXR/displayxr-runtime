@@ -32,11 +32,13 @@ if(NOT OPENXR_FOUND AND DEFINED OpenXR_ROOT)
 
     # Look for the loader library in various locations
     # Note: OpenXR loader may have versioned names like openxr_loader-1_0
+    # The Khronos SDK uses x64/lib and x64/bin structure
     find_library(OPENXR_LOADER_LIB
         NAMES openxr_loader openxr_loader-1_0
         PATHS
-            "${OpenXR_ROOT}/bin"
+            "${OpenXR_ROOT}/x64/lib"
             "${OpenXR_ROOT}/lib"
+            "${OpenXR_ROOT}/bin"
             "${OpenXR_ROOT}"
         NO_DEFAULT_PATH
     )
@@ -48,9 +50,11 @@ if(NOT OPENXR_FOUND AND DEFINED OpenXR_ROOT)
         add_library(OpenXR::openxr_loader SHARED IMPORTED)
 
         # Find the DLL for runtime
+        # The Khronos SDK uses x64/bin for DLLs
         find_file(OPENXR_LOADER_DLL
             NAMES openxr_loader.dll openxr_loader-1_0.dll
             PATHS
+                "${OpenXR_ROOT}/x64/bin"
                 "${OpenXR_ROOT}/bin"
                 "${OpenXR_ROOT}/lib"
                 "${OpenXR_ROOT}"
@@ -62,11 +66,13 @@ if(NOT OPENXR_FOUND AND DEFINED OpenXR_ROOT)
                 IMPORTED_LOCATION "${OPENXR_LOADER_DLL}"
                 IMPORTED_IMPLIB "${OPENXR_LOADER_LIB}"
             )
+            message(STATUS "Found OpenXR loader DLL at: ${OPENXR_LOADER_DLL}")
         else()
             # On Windows, .lib might be the import lib alongside .dll
             set_target_properties(OpenXR::openxr_loader PROPERTIES
                 IMPORTED_IMPLIB "${OPENXR_LOADER_LIB}"
             )
+            message(STATUS "OpenXR loader DLL not found, using .lib only")
         endif()
     endif()
 endif()

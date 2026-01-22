@@ -217,13 +217,35 @@ jobs:
 
       - uses: ilammy/msvc-dev-cmd@v1
 
+      - name: Install OpenXR loader
+        run: |
+          # Download and extract OpenXR SDK
+          $openxrVersion = "1.1.38"
+          $openxrUrl = "https://github.com/KhronosGroup/OpenXR-SDK-Source/releases/download/release-$openxrVersion/openxr_loader_windows-$openxrVersion.zip"
+          Write-Host "Downloading OpenXR loader from $openxrUrl"
+          Invoke-WebRequest -Uri $openxrUrl -OutFile openxr_loader.zip
+          Expand-Archive -Path openxr_loader.zip -DestinationPath openxr_sdk -Force
+          Write-Host "OpenXR SDK contents:"
+          Get-ChildItem -Recurse openxr_sdk | Select-Object FullName
+
       - name: Build test app
         run: |
           cd test_apps/session_target_test
           cmake -S . -B build -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
-            -DOpenXR_ROOT="${{ github.workspace }}/runtime"
+            -DOpenXR_ROOT="${{ github.workspace }}/openxr_sdk"
           cmake --build build
+
+      - name: Copy OpenXR loader to test app build
+        run: |
+          # Find and copy the OpenXR loader DLL
+          $loaderDll = Get-ChildItem -Path openxr_sdk -Recurse -Filter "openxr_loader.dll" | Select-Object -First 1
+          if ($loaderDll) {
+            Copy-Item $loaderDll.FullName -Destination test_apps/session_target_test/build/
+            Write-Host "Copied $($loaderDll.FullName) to test app build"
+          } else {
+            Write-Host "Warning: openxr_loader.dll not found"
+          }
 
       - name: Upload test app
         uses: actions/upload-artifact@v4
