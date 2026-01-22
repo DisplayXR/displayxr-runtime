@@ -190,7 +190,7 @@ jobs:
 
   # Test app build - toggle by changing 'if: false' to 'if: true'
   TestApp:
-    if: false  # <-- Change to 'true' to enable test app build
+    if: true  # <-- Change to 'false' to disable test app build
     runs-on: windows-2022
     needs: Runtime  # Wait for runtime build to get artifacts
 
