@@ -8,6 +8,8 @@
 #pragma once
 
 #define WIN32_LEAN_AND_MEAN
+#define UNICODE
+#define _UNICODE
 #include <windows.h>
 #include <d3d11.h>
 #include <d2d1.h>

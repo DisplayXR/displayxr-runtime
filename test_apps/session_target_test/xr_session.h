@@ -8,8 +8,14 @@
 #pragma once
 
 #define WIN32_LEAN_AND_MEAN
+#define UNICODE
+#define _UNICODE
 #include <windows.h>
 #include <d3d11.h>
+
+// Must define graphics API before including OpenXR platform header
+#define XR_USE_PLATFORM_WIN32
+#define XR_USE_GRAPHICS_API_D3D11
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 #include <openxr/XR_EXT_session_target.h>
