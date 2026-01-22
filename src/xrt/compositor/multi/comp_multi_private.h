@@ -29,6 +29,7 @@
 // Forward declarations for per-session rendering
 struct comp_target;
 struct leiasr;
+struct leiasr_eye_pair;
 
 #ifdef __cplusplus
 extern "C" {
@@ -480,6 +481,27 @@ multi_compositor_has_session_render(struct multi_compositor *mc)
  */
 struct leiasr *
 multi_compositor_get_eye_tracker(struct multi_compositor *mc);
+#endif
+
+#ifdef XRT_HAVE_LEIA_SR
+/*!
+ * Get predicted eye positions from the session's per-session weaver.
+ * This uses the weaver's LookaroundFilter which adapts to application-specific latency.
+ *
+ * This is the preferred method for LookAround functionality as it:
+ * - Uses the LookaroundFilter tuned for application update rate
+ * - Doesn't require the SimulatedRealitySense library
+ * - Works with any SR weaver instance
+ *
+ * @param mc The multi_compositor (must have per-session rendering initialized)
+ * @param[out] out_eye_pair Pointer to receive the eye positions (in meters)
+ * @return true if valid eye positions are available, false otherwise
+ *
+ * @ingroup comp_multi
+ * @private @memberof multi_compositor
+ */
+bool
+multi_compositor_get_predicted_eye_positions(struct multi_compositor *mc, struct leiasr_eye_pair *out_eye_pair);
 #endif
 
 

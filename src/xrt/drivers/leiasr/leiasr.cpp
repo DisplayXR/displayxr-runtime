@@ -466,4 +466,44 @@ leiasr_is_eye_tracking_active(struct leiasr *leiasr)
 	return leiasr->eyeTrackingActive.load();
 }
 
+bool
+leiasr_get_predicted_eye_positions(struct leiasr *leiasr, struct leiasr_eye_pair *out_eye_pair)
+{
+	if (leiasr == nullptr || out_eye_pair == nullptr) {
+		return false;
+	}
+
+	if (leiasr->weaver == nullptr) {
+		out_eye_pair->valid = false;
+		return false;
+	}
+
+	// Get predicted eye positions from weaver's LookaroundFilter
+	// The weaver returns positions in millimeters
+	float leftEye[3], rightEye[3];
+	leiasr->weaver->getPredictedEyePositions(leftEye, rightEye);
+
+	// Convert from millimeters to meters
+	out_eye_pair->left.x = leftEye[0] / 1000.0f;
+	out_eye_pair->left.y = leftEye[1] / 1000.0f;
+	out_eye_pair->left.z = leftEye[2] / 1000.0f;
+	out_eye_pair->right.x = rightEye[0] / 1000.0f;
+	out_eye_pair->right.y = rightEye[1] / 1000.0f;
+	out_eye_pair->right.z = rightEye[2] / 1000.0f;
+	out_eye_pair->timestamp_ns = os_monotonic_get_ns();
+	out_eye_pair->valid = true;
+
+	return true;
+}
+
+bool
+leiasr_has_weaver(struct leiasr *leiasr)
+{
+	if (leiasr == nullptr) {
+		return false;
+	}
+
+	return leiasr->weaver != nullptr;
+}
+
 } // extern "C"

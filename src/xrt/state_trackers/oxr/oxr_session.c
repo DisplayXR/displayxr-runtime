@@ -52,7 +52,7 @@
 #include <stdlib.h>
 #include <assert.h>
 
-#ifdef XRT_HAVE_LEIA_SR_SENSE
+#ifdef XRT_HAVE_LEIA_SR
 #include "multi/comp_multi_private.h"
 #include "leiasr/leiasr.h"
 #endif
@@ -99,21 +99,22 @@ to_string(XrSessionState state)
 	}
 }
 
-#ifdef XRT_HAVE_LEIA_SR_SENSE
+#ifdef XRT_HAVE_LEIA_SR
 /*!
- * Get the shared eye tracker from the session's compositor chain.
- * Returns NULL if eye tracking is not available.
+ * Get predicted eye positions from the session's per-session weaver.
+ * Uses the weaver's LookaroundFilter which adapts to application-specific latency.
+ * Returns false if eye positions are not available.
  */
-static struct leiasr *
-oxr_session_get_eye_tracker(struct oxr_session *sess)
+static bool
+oxr_session_get_predicted_eye_positions(struct oxr_session *sess, struct leiasr_eye_pair *out_eye_pair)
 {
-	if (sess == NULL || sess->xcn == NULL) {
-		return NULL;
+	if (sess == NULL || sess->xcn == NULL || out_eye_pair == NULL) {
+		return false;
 	}
 
 	// The session's xcn is a multi_compositor in the multi-client architecture
 	struct multi_compositor *mc = multi_compositor(&sess->xcn->base);
-	return multi_compositor_get_eye_tracker(mc);
+	return multi_compositor_get_predicted_eye_positions(mc, out_eye_pair);
 }
 #endif
 
@@ -670,14 +671,14 @@ oxr_session_locate_views(struct oxr_logger *log,
 	    0.0f,
 	};
 
-#ifdef XRT_HAVE_LEIA_SR_SENSE
-	// Try to get dynamic eye positions from SR eye tracker (Phase 5)
-	struct leiasr *eye_tracker = oxr_session_get_eye_tracker(sess);
-	if (eye_tracker != NULL) {
+#ifdef XRT_HAVE_LEIA_SR
+	// Try to get dynamic eye positions from the session's SR weaver (Phase 5)
+	// Uses the weaver's LookaroundFilter which adapts to application-specific latency
+	{
 		struct leiasr_eye_pair eye_pair;
-		if (leiasr_get_eye_positions(eye_tracker, &eye_pair)) {
+		if (oxr_session_get_predicted_eye_positions(sess, &eye_pair)) {
 			// Calculate eye relation as vector from left to right eye
-			// This replaces the static IPD with actual eye positions
+			// This replaces the static IPD with actual tracked eye positions
 			default_eye_relation.x = eye_pair.right.x - eye_pair.left.x;
 			default_eye_relation.y = eye_pair.right.y - eye_pair.left.y;
 			default_eye_relation.z = eye_pair.right.z - eye_pair.left.z;

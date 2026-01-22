@@ -1140,6 +1140,25 @@ multi_compositor_get_eye_tracker(struct multi_compositor *mc)
 }
 #endif
 
+#ifdef XRT_HAVE_LEIA_SR
+bool
+multi_compositor_get_predicted_eye_positions(struct multi_compositor *mc, struct leiasr_eye_pair *out_eye_pair)
+{
+	if (mc == NULL || out_eye_pair == NULL) {
+		return false;
+	}
+
+	// Check if session has per-session rendering with a weaver
+	if (!mc->session_render.initialized || mc->session_render.weaver == NULL) {
+		out_eye_pair->valid = false;
+		return false;
+	}
+
+	// Get predicted eye positions from the session's weaver
+	return leiasr_get_predicted_eye_positions(mc->session_render.weaver, out_eye_pair);
+}
+#endif
+
 xrt_result_t
 multi_compositor_create(struct multi_system_compositor *msc,
                         const struct xrt_session_info *xsi,

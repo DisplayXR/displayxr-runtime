@@ -145,6 +145,33 @@ leiasr_get_eye_positions(struct leiasr *leiasr, struct leiasr_eye_pair *out_eye_
 bool
 leiasr_is_eye_tracking_active(struct leiasr *leiasr);
 
+/*!
+ * Get predicted eye positions from the weaver's LookaroundFilter.
+ * This is the preferred method for LookAround functionality as it uses
+ * the weaver's internal prediction filter tuned for application-specific latency.
+ *
+ * Unlike leiasr_get_eye_positions() which uses the deprecated EyeTracker stream,
+ * this method:
+ * - Uses the LookaroundFilter which adapts to your application's update rate
+ * - Doesn't require the SimulatedRealitySense library
+ * - Works with any graphics API that has a weaver
+ *
+ * @param leiasr The leiasr instance (must have a weaver)
+ * @param[out] out_eye_pair Pointer to receive the eye positions (in meters)
+ * @return true if valid eye positions are available, false otherwise
+ */
+bool
+leiasr_get_predicted_eye_positions(struct leiasr *leiasr, struct leiasr_eye_pair *out_eye_pair);
+
+/*!
+ * Check if the leiasr instance has a weaver (and thus supports getPredictedEyePositions).
+ *
+ * @param leiasr The leiasr instance
+ * @return true if the instance has a weaver
+ */
+bool
+leiasr_has_weaver(struct leiasr *leiasr);
+
 #ifdef __cplusplus
 }
 #endif
