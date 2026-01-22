@@ -292,6 +292,28 @@ rift_get_radio_address(struct rift_hmd *hmd, uint8_t out_address[])
 	return 0;
 }
 
+int
+rift_radio_read_data(struct rift_hmd *hmd, uint8_t *data, uint16_t length)
+{
+	int result;
+	uint8_t buffer[REPORT_MAX_SIZE] = {0};
+
+	result = rift_get_report(hmd, true, FEATURE_REPORT_RADIO_READ_DATA_CMD, buffer, sizeof(buffer));
+	if (result < 0) {
+		HMD_ERROR(hmd, "Failed to read radio data, reason %d", result);
+		return result;
+	}
+
+	if ((result - 7) != length) {
+		HMD_ERROR(hmd, "Rift sent bad length, probably corrupted packet..");
+		return -1;
+	}
+
+	memcpy(data, buffer + 7, MIN(length, (size_t)(result - 7)));
+
+	return 0;
+}
+
 /*
  *
  * Parsing

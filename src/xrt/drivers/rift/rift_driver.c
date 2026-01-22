@@ -267,7 +267,9 @@ rift_usb_thread_radio_tick(struct rift_hmd *hmd)
 		return result;
 	}
 
+	os_thread_helper_lock(&hmd->radio_state.thread);
 	result = rift_radio_handle_command(hmd);
+	os_thread_helper_unlock(&hmd->radio_state.thread);
 	if (result < 0) {
 		return result;
 	}

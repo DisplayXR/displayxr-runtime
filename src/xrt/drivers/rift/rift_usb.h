@@ -35,7 +35,16 @@ int
 rift_get_imu_calibration(struct rift_hmd *hmd, struct rift_imu_calibration *imu_calibration);
 
 int
+rift_send_radio_cmd(struct rift_hmd *hmd, bool radio_hid, struct rift_radio_cmd_report *radio_cmd);
+
+int
+rift_get_radio_cmd_response(struct rift_hmd *hmd, bool wait, bool radio_hid);
+
+int
 rift_get_radio_address(struct rift_hmd *hmd, uint8_t out_address[]);
+
+int
+rift_radio_read_data(struct rift_hmd *hmd, uint8_t *data, uint16_t length);
 
 void
 rift_unpack_int_sample(const uint8_t *in, struct xrt_vec3_i32 *out);

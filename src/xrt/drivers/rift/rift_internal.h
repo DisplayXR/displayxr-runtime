@@ -38,6 +38,7 @@
 #define KEEPALIVE_SEND_RATE_NS ((KEEPALIVE_INTERVAL_NS * 19) / 20)
 #define IMU_SAMPLE_RATE (1000)      // 1000hz
 #define NS_PER_SAMPLE (1000 * 1000) // 1ms (1,000,000 ns) per sample
+#define SERIAL_NUMBER_LENGTH 14
 
 #define MICROMETERS_TO_METERS(microns) ((float)microns / 1000000.0f)
 
@@ -358,6 +359,12 @@ struct rift_imu_calibration_report
 
 SIZE_ASSERT(struct rift_imu_calibration_report, sizeof(struct rift_dk2_sample_pack) * 4 + 4);
 
+enum rift_radio_read_cmd
+{
+	RIFT_RADIO_READ_CMD_FLASH_CONTROL = 0x0a,
+	RIFT_RADIO_READ_CMD_SERIAL = 0x88,
+};
+
 struct rift_radio_cmd_report
 {
 	uint16_t command_id;
@@ -573,6 +580,9 @@ struct rift_touch_controller
 	struct os_mutex input_mutex;
 
 	struct rift_touch_controller_input_state input_state;
+
+	//! Locked by radio_state.thread
+	bool serial_valid;
 };
 
 enum rift_remote_inputs
@@ -600,6 +610,27 @@ struct rift_remote
 
 	//! The button state of the remote, stored as an atomic to avoid needing a mutex.
 	xrt_atomic_s32_t buttons;
+
+	//! Locked by radio_state.thread
+	bool serial_valid;
+};
+
+enum rift_radio_command
+{
+	RIFT_RADIO_COMMAND_NONE = 0,
+	RIFT_RADIO_COMMAND_READ_SERIAL,
+};
+
+struct rift_radio_command_data_read_serial
+{
+	//! A pointer to store the serial string. Must contain at least SERIAL_NUMBER_LENGTH bytes.
+	char *serial;
+	//! A pointer to store when reading the serial was successful.
+	bool *serial_valid;
+};
+
+union rift_radio_command_data {
+	struct rift_radio_command_data_read_serial read_serial;
 };
 
 /*!
@@ -661,6 +692,9 @@ struct rift_hmd
 
 		struct rift_touch_controller *touch_controllers[3];
 		struct rift_remote *remote;
+
+		enum rift_radio_command current_command;
+		union rift_radio_command_data command_data;
 	} radio_state;
 };
 

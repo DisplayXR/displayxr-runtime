@@ -12,6 +12,9 @@
 
 #include "rift_radio.h"
 #include "rift_bindings.h"
+#include "rift_usb.h"
+
+#include <errno.h>
 
 
 static void
@@ -292,6 +295,68 @@ rift_touch_controller_create(struct rift_hmd *hmd, enum rift_radio_device_type d
 	return controller;
 }
 
+static int
+rift_radio_read_device_serial_async_locked(struct rift_hmd *hmd,
+                                           enum rift_radio_device_type device_type,
+                                           char serial[SERIAL_NUMBER_LENGTH],
+                                           bool *serial_valid)
+{
+	// Radio is already busyk
+	if (hmd->radio_state.current_command != RIFT_RADIO_COMMAND_NONE) {
+		return -EBUSY;
+	}
+
+	HMD_TRACE(hmd, "Reading serial for device type %d", device_type);
+
+	int result = rift_send_radio_cmd(
+	    hmd, true,
+	    &(struct rift_radio_cmd_report){.a = 0x03, .b = RIFT_RADIO_READ_CMD_SERIAL, .c = (uint8_t)device_type});
+	if (result < 0) {
+		HMD_ERROR(hmd, "Failed to send read serial command");
+		return result;
+	}
+
+	hmd->radio_state.current_command = RIFT_RADIO_COMMAND_READ_SERIAL;
+	hmd->radio_state.command_data.read_serial = (struct rift_radio_command_data_read_serial){
+	    .serial = serial,
+	    .serial_valid = serial_valid,
+	};
+
+	return 0;
+}
+
+bool
+rift_radio_read_device_serial(struct rift_hmd *hmd,
+                              enum rift_radio_device_type device_type,
+                              char serial[SERIAL_NUMBER_LENGTH],
+                              bool *serial_valid)
+{
+	os_thread_helper_lock(&hmd->radio_state.thread);
+
+	// Early out if read.
+	if (*serial_valid) {
+		os_thread_helper_unlock(&hmd->radio_state.thread);
+		return true;
+	}
+
+	int result = rift_radio_read_device_serial_async_locked(hmd, device_type, serial, serial_valid);
+
+	// Can now unlock.
+	os_thread_helper_unlock(&hmd->radio_state.thread);
+
+	if (result == -EBUSY) {
+		// try again later
+		return false;
+	}
+
+	if (result < 0 && result != -EBUSY) {
+		HMD_ERROR(hmd, "Failed to start reading serial for device type %d, reason %d", device_type, result);
+		return false;
+	}
+
+	return true;
+}
+
 int
 rift_radio_handle_read(struct rift_hmd *hmd)
 {
@@ -370,6 +435,12 @@ rift_radio_handle_read(struct rift_hmd *hmd)
 				os_mutex_unlock(&hmd->device_mutex);
 			}
 
+			if (!rift_radio_read_device_serial(hmd, message.device_type, controller->base.serial,
+			                                   &controller->serial_valid)) {
+				// still waiting for serial
+				break;
+			}
+
 			os_mutex_lock(&controller->input_mutex);
 			controller->input_state.buttons = message.touch.buttons & 0x0F;
 			os_mutex_unlock(&controller->input_mutex);
@@ -394,6 +465,12 @@ rift_radio_handle_read(struct rift_hmd *hmd)
 				os_mutex_unlock(&hmd->device_mutex);
 			}
 
+			if (!rift_radio_read_device_serial(hmd, message.device_type, remote->base.serial,
+			                                   &remote->serial_valid)) {
+				// still waiting for serial
+				break;
+			}
+
 			xrt_atomic_s32_store(&remote->buttons, message.remote.buttons);
 
 			break;
@@ -407,5 +484,68 @@ rift_radio_handle_read(struct rift_hmd *hmd)
 int
 rift_radio_handle_command(struct rift_hmd *hmd)
 {
+	// No active command
+	if (hmd->radio_state.current_command == RIFT_RADIO_COMMAND_NONE) {
+		return 0;
+	}
+
+	int result = rift_get_radio_cmd_response(hmd, false, true);
+
+	if (result == -EINPROGRESS) {
+		// still waiting for response
+		return 0;
+	}
+
+	if (result == -ETIMEDOUT) {
+
+		switch (hmd->radio_state.current_command) {
+
+		case RIFT_RADIO_COMMAND_READ_SERIAL:
+			break; // @note this can be erroneous since the headset likes to send remote packets even when
+			       //       there's no remote sometimes
+		default:
+			HMD_WARN(hmd, "Timed out waiting for radio command response %d, cancelling request",
+			         hmd->radio_state.current_command);
+			break;
+		}
+
+		hmd->radio_state.current_command = RIFT_RADIO_COMMAND_NONE;
+
+		return 0;
+	}
+
+	// Unexpected error
+	if (result < 0) {
+		HMD_ERROR(hmd, "Unexpected error getting radio command response, reason %d", result);
+		return result;
+	}
+
+	HMD_TRACE(hmd, "Successfully received response for radio command %d", hmd->radio_state.current_command);
+
+	switch (hmd->radio_state.current_command) {
+	case RIFT_RADIO_COMMAND_READ_SERIAL: {
+		struct rift_radio_command_data_read_serial *data = &hmd->radio_state.command_data.read_serial;
+
+		uint8_t buf[24]; // size of data response
+		result = rift_radio_read_data(hmd, (uint8_t *)&buf, sizeof(buf));
+		if (result < 0) {
+			HMD_ERROR(hmd, "Failed to read serial data from radio, reason %d", result);
+			break;
+		}
+
+		const char *serial_ptr = (const char *)(buf + 5); // first 5 bytes are unknown
+
+		(*data->serial_valid) = true;
+
+		HMD_INFO(hmd, "Read radio serial: %s", serial_ptr);
+		strncpy(data->serial, (char *)serial_ptr, SERIAL_NUMBER_LENGTH);
+
+		break;
+	}
+	default: break;
+	}
+
+	hmd->radio_state.current_command = RIFT_RADIO_COMMAND_NONE;
+
 	return 0;
 }
