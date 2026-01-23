@@ -149,11 +149,11 @@ leiasr_d3d11_create(double max_time,
 	}
 
 	// Create D3D11 weaver
-	SR::WeaverErrorCode result = SR::CreateDX11Weaver(sr->context,
-	                                                   sr->d3d11_context,
-	                                                   static_cast<HWND>(hwnd),
-	                                                   &sr->weaver);
-	if (result != SR::WeaverErrorCode::WeaverSuccess) {
+	WeaverErrorCode result = SR::CreateDX11Weaver(sr->context,
+	                                               sr->d3d11_context,
+	                                               static_cast<HWND>(hwnd),
+	                                               &sr->weaver);
+	if (result != WeaverErrorCode::WeaverSuccess) {
 		U_LOG_E("Failed to create SR D3D11 weaver: %d", (int)result);
 		delete sr->context;
 		delete sr;
