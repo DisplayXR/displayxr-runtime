@@ -578,10 +578,14 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
 
-	// Initialize settings with defaults
-	comp_settings_init(&c->settings, xdev);
+	// Initialize settings with defaults (simplified for D3D11 native compositor)
+	memset(&c->settings, 0, sizeof(c->settings));
 	c->settings.preferred.width = 1920;  // Default resolution
 	c->settings.preferred.height = 1080;
+	c->settings.nominal_frame_interval_ns = xdev->hmd->screens[0].nominal_frame_interval_ns;
+	if (c->settings.nominal_frame_interval_ns == 0) {
+		c->settings.nominal_frame_interval_ns = (1000 * 1000 * 1000) / 60; // 60Hz default
+	}
 
 	// Get actual window size if we have a window
 	if (c->hwnd != nullptr) {
