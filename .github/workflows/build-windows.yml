@@ -238,7 +238,7 @@ jobs:
             -DOpenXR_ROOT="${{ github.workspace }}/openxr_sdk"
           cmake --build build
 
-      - name: Copy OpenXR loader to test app build
+      - name: Copy required DLLs to test app build
         run: |
           # Explicitly use the x64 OpenXR loader DLL
           $loaderDll = Get-ChildItem -Path openxr_sdk -Recurse -Filter "openxr_loader.dll" | Where-Object { $_.FullName -like "*x64*" } | Select-Object -First 1
@@ -251,6 +251,22 @@ jobs:
             Write-Host "Copied $($loaderDll.FullName) to test app build"
           } else {
             Write-Host "Warning: openxr_loader.dll not found"
+          }
+
+          # Copy D3DCOMPILER_47.dll (required but not always present on target systems)
+          $d3dCompiler = "C:\Windows\System32\D3DCompiler_47.dll"
+          if (Test-Path $d3dCompiler) {
+            Copy-Item $d3dCompiler -Destination test_apps/session_target_test/build/
+            Write-Host "Copied D3DCompiler_47.dll to test app build"
+          } else {
+            # Try Windows SDK location
+            $sdkPath = Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter "D3DCompiler_47.dll" | Where-Object { $_.FullName -like "*x64*" } | Select-Object -First 1
+            if ($sdkPath) {
+              Copy-Item $sdkPath.FullName -Destination test_apps/session_target_test/build/
+              Write-Host "Copied $($sdkPath.FullName) to test app build"
+            } else {
+              Write-Host "Warning: D3DCompiler_47.dll not found"
+            }
           }
 
       - name: Verify binary architectures
