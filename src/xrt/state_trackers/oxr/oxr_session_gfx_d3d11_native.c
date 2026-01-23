@@ -80,7 +80,7 @@ oxr_session_populate_d3d11_native(struct oxr_logger *log,
                                    void *window_handle,
                                    struct oxr_session *sess)
 {
-	struct xrt_device *xdev = sess->sys->xsysd->xdevs[sess->sys->xsysd->xdev_roles.head];
+	struct xrt_device *xdev = get_role_head(sess->sys);
 	struct xrt_compositor_native *xcn = NULL;
 
 	// Create the D3D11 native compositor
