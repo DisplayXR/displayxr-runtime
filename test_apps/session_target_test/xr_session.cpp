@@ -261,13 +261,25 @@ bool CreateSwapchains(XrSessionManager& xr) {
         LOG_DEBUG("  Format[%u]: %lld (0x%llX)", i, formats[i], formats[i]);
     }
 
-    // Prefer SRGB format
+    // Prefer UNORM formats for better Vulkan compatibility (especially on Intel Iris GPUs)
+    // SRGB formats can have format mapping issues in the D3D11->Vulkan compositor path
     int64_t selectedFormat = formats[0];
     for (int64_t format : formats) {
-        if (format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
-            format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) {
+        // First choice: non-SRGB UNORM formats (best compatibility)
+        if (format == DXGI_FORMAT_R8G8B8A8_UNORM ||
+            format == DXGI_FORMAT_B8G8R8A8_UNORM) {
             selectedFormat = format;
             break;
+        }
+    }
+    // If no UNORM found, try SRGB as fallback
+    if (selectedFormat == formats[0]) {
+        for (int64_t format : formats) {
+            if (format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
+                format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) {
+                selectedFormat = format;
+                break;
+            }
         }
     }
     LOG_INFO("Selected swapchain format: %lld (0x%llX)", selectedFormat, selectedFormat);
