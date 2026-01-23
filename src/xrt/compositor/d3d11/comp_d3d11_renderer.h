@@ -15,13 +15,14 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
+// Forward declarations (C++ structs)
 struct comp_d3d11_renderer;
 struct comp_d3d11_compositor;
 struct comp_layer_accum;
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 /*!
  * Create a D3D11 renderer.

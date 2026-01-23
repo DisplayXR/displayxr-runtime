@@ -15,12 +15,13 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+// Forward declarations (C++ structs)
+struct comp_d3d11_target;
+struct comp_d3d11_compositor;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-struct comp_d3d11_target;
-struct comp_d3d11_compositor;
 
 /*!
  * Create a D3D11 output target (DXGI swapchain).

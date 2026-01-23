@@ -11,11 +11,13 @@
 
 #include "xrt/xrt_compositor.h"
 
+// Forward declarations (C++ structs)
+struct comp_d3d11_compositor;
+struct comp_d3d11_swapchain;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-struct comp_d3d11_compositor;
 
 /*!
  * Create a D3D11 native swapchain.

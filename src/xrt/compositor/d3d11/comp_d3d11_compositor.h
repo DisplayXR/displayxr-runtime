@@ -14,11 +14,12 @@
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_results.h"
 
+// Forward declaration (C++ struct)
+struct comp_d3d11_compositor;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-struct comp_d3d11_compositor;
 
 /*!
  * Create a native D3D11 compositor.
