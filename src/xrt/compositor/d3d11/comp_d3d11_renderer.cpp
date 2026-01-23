@@ -425,20 +425,21 @@ render_projection_layer(struct comp_d3d11_renderer *r,
 
 	// Get UV transform from layer data
 	struct xrt_layer_projection_view_data *view_data = &layer->data.proj.v[view_index];
-	constants.post_transform[0] = view_data->sub.rect.offset.x / (float)view_data->sub.image_rect.extent.w;
-	constants.post_transform[1] = view_data->sub.rect.offset.y / (float)view_data->sub.image_rect.extent.h;
-	constants.post_transform[2] = view_data->sub.rect.extent.w / (float)view_data->sub.image_rect.extent.w;
-	constants.post_transform[3] = view_data->sub.rect.extent.h / (float)view_data->sub.image_rect.extent.h;
+	// Use normalized rect for UV transform
+	constants.post_transform[0] = view_data->sub.norm_rect.x;
+	constants.post_transform[1] = view_data->sub.norm_rect.y;
+	constants.post_transform[2] = view_data->sub.norm_rect.w;
+	constants.post_transform[3] = view_data->sub.norm_rect.h;
 
 	// Color scale and bias
-	constants.color_scale[0] = layer->data.color_scale.x;
-	constants.color_scale[1] = layer->data.color_scale.y;
-	constants.color_scale[2] = layer->data.color_scale.z;
-	constants.color_scale[3] = layer->data.color_scale.w;
-	constants.color_bias[0] = layer->data.color_bias.x;
-	constants.color_bias[1] = layer->data.color_bias.y;
-	constants.color_bias[2] = layer->data.color_bias.z;
-	constants.color_bias[3] = layer->data.color_bias.w;
+	constants.color_scale[0] = layer->data.color_scale.r;
+	constants.color_scale[1] = layer->data.color_scale.g;
+	constants.color_scale[2] = layer->data.color_scale.b;
+	constants.color_scale[3] = layer->data.color_scale.a;
+	constants.color_bias[0] = layer->data.color_bias.r;
+	constants.color_bias[1] = layer->data.color_bias.g;
+	constants.color_bias[2] = layer->data.color_bias.b;
+	constants.color_bias[3] = layer->data.color_bias.a;
 
 	// Map and update constant buffer
 	D3D11_MAPPED_SUBRESOURCE mapped;

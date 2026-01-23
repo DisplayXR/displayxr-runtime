@@ -17,6 +17,7 @@
 
 #include "xrt/xrt_handles.h"
 #include "xrt/xrt_config_have.h"
+#include "xrt/xrt_limits.h"
 
 #include "util/u_logging.h"
 #include "util/u_misc.h"
@@ -115,7 +116,7 @@ d3d11_compositor_get_swapchain_create_properties(struct xrt_compositor *xc,
 {
 	// D3D11 native compositor can handle all standard properties
 	xsccp->image_count = 3; // Triple buffering
-	xsccp->extra_bits = 0;
+	xsccp->extra_bits = (enum xrt_swapchain_usage_bits)0;
 
 	return XRT_SUCCESS;
 }
@@ -231,7 +232,7 @@ d3d11_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 	std::lock_guard<std::mutex> lock(c->mutex);
 
 	// Reset layer accumulator for this frame
-	comp_layer_accum_reset(&c->layer_accum);
+	c->layer_accum.layer_count = 0;
 
 	return XRT_SUCCESS;
 }
@@ -244,7 +245,7 @@ d3d11_compositor_discard_frame(struct xrt_compositor *xc, int64_t frame_id)
 	std::lock_guard<std::mutex> lock(c->mutex);
 
 	// Clear layers
-	comp_layer_accum_reset(&c->layer_accum);
+	c->layer_accum.layer_count = 0;
 
 	return XRT_SUCCESS;
 }
@@ -472,14 +473,6 @@ d3d11_compositor_layer_commit_with_semaphore(struct xrt_compositor *xc,
 	return d3d11_compositor_layer_commit(xc, XRT_GRAPHICS_SYNC_HANDLE_INVALID);
 }
 
-static xrt_result_t
-d3d11_compositor_poll_events(struct xrt_compositor *xc, union xrt_compositor_event *out_xce)
-{
-	// No events to poll
-	out_xce->type = XRT_COMPOSITOR_EVENT_NONE;
-	return XRT_SUCCESS;
-}
-
 static void
 d3d11_compositor_destroy(struct xrt_compositor *xc)
 {
@@ -517,7 +510,7 @@ d3d11_compositor_destroy(struct xrt_compositor *xc)
 		c->device->Release();
 	}
 
-	comp_layer_accum_fini(&c->layer_accum);
+	// layer_accum doesn't need special cleanup - it's just a struct
 
 	delete c;
 }
@@ -637,11 +630,11 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	}
 #endif
 
-	// Initialize layer accumulator
-	comp_layer_accum_init(&c->layer_accum);
+	// Initialize layer accumulator - just zero it
+	memset(&c->layer_accum, 0, sizeof(c->layer_accum));
 
 	// Create frame pacing
-	u_pc_display_timing_create(c->settings.nominal_frame_interval_ns, &c->upc);
+	u_pc_display_timing_create(c->settings.nominal_frame_interval_ns, &U_PC_DISPLAY_TIMING_CONFIG_DEFAULT, &c->upc);
 
 	// Set up compositor interface
 	c->base.base.get_swapchain_create_properties = d3d11_compositor_get_swapchain_create_properties;
@@ -666,11 +659,10 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	c->base.base.layer_passthrough = d3d11_compositor_layer_passthrough;
 	c->base.base.layer_commit = d3d11_compositor_layer_commit;
 	c->base.base.layer_commit_with_semaphore = d3d11_compositor_layer_commit_with_semaphore;
-	c->base.base.poll_events = d3d11_compositor_poll_events;
 	c->base.base.destroy = d3d11_compositor_destroy;
 
 	// Set compositor info
-	c->base.base.info.max_layers = COMP_MAX_LAYERS;
+	c->base.base.info.max_layers = XRT_MAX_LAYERS;
 
 	*out_xc = &c->base;
 
