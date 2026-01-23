@@ -240,14 +240,33 @@ jobs:
 
       - name: Copy OpenXR loader to test app build
         run: |
-          # Find and copy the OpenXR loader DLL
-          $loaderDll = Get-ChildItem -Path openxr_sdk -Recurse -Filter "openxr_loader.dll" | Select-Object -First 1
+          # Explicitly use the x64 OpenXR loader DLL
+          $loaderDll = Get-ChildItem -Path openxr_sdk -Recurse -Filter "openxr_loader.dll" | Where-Object { $_.FullName -like "*x64*" } | Select-Object -First 1
+          if (-not $loaderDll) {
+            # Fallback to any loader if x64 path not found
+            $loaderDll = Get-ChildItem -Path openxr_sdk -Recurse -Filter "openxr_loader.dll" | Select-Object -First 1
+          }
           if ($loaderDll) {
             Copy-Item $loaderDll.FullName -Destination test_apps/session_target_test/build/
             Write-Host "Copied $($loaderDll.FullName) to test app build"
           } else {
             Write-Host "Warning: openxr_loader.dll not found"
           }
+
+      - name: Verify binary architectures
+        run: |
+          Write-Host "=== Checking binary architectures ==="
+          $exe = "test_apps/session_target_test/build/session_target_test.exe"
+          $dll = "test_apps/session_target_test/build/openxr_loader.dll"
+
+          Write-Host "`nEXE architecture:"
+          dumpbin /headers $exe | Select-String -Pattern "machine \(|File Type:"
+
+          Write-Host "`nDLL architecture:"
+          dumpbin /headers $dll | Select-String -Pattern "machine \(|File Type:"
+
+          Write-Host "`nDependencies of EXE:"
+          dumpbin /dependents $exe
 
       - name: Upload test app
         uses: actions/upload-artifact@v4
