@@ -216,6 +216,8 @@ jobs:
           Get-ChildItem -Recurse runtime | Select-Object FullName
 
       - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
 
       - name: Install OpenXR loader
         run: |
