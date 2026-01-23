@@ -186,10 +186,10 @@ d3d11_compositor_end_session(struct xrt_compositor *xc)
 static xrt_result_t
 d3d11_compositor_predict_frame(struct xrt_compositor *xc,
                                 int64_t *out_frame_id,
-                                uint64_t *out_wake_time_ns,
-                                uint64_t *out_predicted_gpu_time_ns,
-                                uint64_t *out_predicted_display_time_ns,
-                                uint64_t *out_predicted_display_period_ns)
+                                int64_t *out_wake_time_ns,
+                                int64_t *out_predicted_gpu_time_ns,
+                                int64_t *out_predicted_display_time_ns,
+                                int64_t *out_predicted_display_period_ns)
 {
 	struct comp_d3d11_compositor *c = d3d11_comp(xc);
 
@@ -201,15 +201,15 @@ d3d11_compositor_predict_frame(struct xrt_compositor *xc,
 
 	// Simple timing - assume 60Hz for now
 	// TODO: Query actual display refresh rate
-	uint64_t now_ns = os_monotonic_get_ns();
-	uint64_t period_ns = U_TIME_1S_IN_NS / 60;
+	int64_t now_ns = static_cast<int64_t>(os_monotonic_get_ns());
+	int64_t period_ns = U_TIME_1S_IN_NS / 60;
 
 	*out_predicted_display_time_ns = now_ns + period_ns * 2;
 	*out_predicted_display_period_ns = period_ns;
 	*out_wake_time_ns = now_ns;
 	*out_predicted_gpu_time_ns = period_ns;
 
-	c->last_display_time_ns = *out_predicted_display_time_ns;
+	c->last_display_time_ns = static_cast<uint64_t>(*out_predicted_display_time_ns);
 
 	return XRT_SUCCESS;
 }
@@ -218,7 +218,7 @@ static xrt_result_t
 d3d11_compositor_mark_frame(struct xrt_compositor *xc,
                              int64_t frame_id,
                              enum xrt_compositor_frame_point point,
-                             uint64_t when_ns)
+                             int64_t when_ns)
 {
 	// Frame timing telemetry - optional
 	return XRT_SUCCESS;
@@ -660,9 +660,6 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	c->base.base.layer_commit = d3d11_compositor_layer_commit;
 	c->base.base.layer_commit_with_semaphore = d3d11_compositor_layer_commit_with_semaphore;
 	c->base.base.destroy = d3d11_compositor_destroy;
-
-	// Set compositor info
-	c->base.base.info.max_layers = XRT_MAX_LAYERS;
 
 	*out_xc = &c->base;
 
