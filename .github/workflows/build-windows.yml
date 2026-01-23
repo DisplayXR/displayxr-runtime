@@ -188,6 +188,40 @@ jobs:
 
             ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
 
+  # Simple D3D11 cube test - no OpenXR, no SR SDK
+  D3D11CubeTest:
+    if: true
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build D3D11 cube test
+        run: |
+          cd test_apps/d3d11_cube_test
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build
+
+      - name: Verify binary
+        run: |
+          $exe = "test_apps/d3d11_cube_test/build/d3d11_cube_test.exe"
+          Write-Host "EXE architecture:"
+          dumpbin /headers $exe | Select-String -Pattern "machine \(|File Type:"
+          Write-Host "`nDependencies:"
+          dumpbin /dependents $exe
+
+      - name: Upload D3D11 cube test
+        uses: actions/upload-artifact@v4
+        with:
+          name: D3D11CubeTest
+          if-no-files-found: error
+          path: test_apps/d3d11_cube_test/build/d3d11_cube_test.exe
+
   # Test app build - toggle by changing 'if: false' to 'if: true'
   TestApp:
     if: true  # <-- Change to 'false' to disable test app build
