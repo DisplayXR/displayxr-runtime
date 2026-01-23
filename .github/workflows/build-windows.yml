@@ -287,21 +287,10 @@ jobs:
             Write-Host "Warning: openxr_loader.dll not found"
           }
 
-          # Copy D3DCOMPILER_47.dll (required but not always present on target systems)
-          $d3dCompiler = "C:\Windows\System32\D3DCompiler_47.dll"
-          if (Test-Path $d3dCompiler) {
-            Copy-Item $d3dCompiler -Destination test_apps/session_target_test/build/
-            Write-Host "Copied D3DCompiler_47.dll to test app build"
-          } else {
-            # Try Windows SDK location
-            $sdkPath = Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter "D3DCompiler_47.dll" | Where-Object { $_.FullName -like "*x64*" } | Select-Object -First 1
-            if ($sdkPath) {
-              Copy-Item $sdkPath.FullName -Destination test_apps/session_target_test/build/
-              Write-Host "Copied $($sdkPath.FullName) to test app build"
-            } else {
-              Write-Host "Warning: D3DCompiler_47.dll not found"
-            }
-          }
+          # NOTE: D3DCompiler_47.dll is a Windows system component available since Win8.
+          # We do NOT bundle it - the app will use the system version.
+          # Bundling caused 0xc000007b errors on some systems.
+          Write-Host "Not bundling D3DCompiler_47.dll - will use system version"
 
       - name: Verify binary architectures
         run: |
