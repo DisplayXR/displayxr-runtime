@@ -26,7 +26,7 @@
 #include "oxr_handle.h"
 
 #ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
-#include "compositor/d3d11/comp_d3d11_compositor.h"
+#include "d3d11/comp_d3d11_compositor.h"
 #endif
 
 /*!
