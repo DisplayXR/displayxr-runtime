@@ -18,6 +18,7 @@
 #include <thread>
 
 #include "openvr_driver.h"
+#include "util/u_var.h"
 #include "vdf_parser.hpp"
 #include "steamvr_lh_interface.h"
 #include "interfaces/context.hpp"
@@ -237,6 +238,19 @@ Context::setup_hmd(const char *serial, vr::ITrackedDeviceServerDriver *driver)
 		fov.angle_up = atanf(tan_bottom);
 		fov.angle_down = atanf(tan_top);
 	}
+
+	u_var_add_root(this->hmd, "SteamVR HMD Device", true);
+	u_var_add_f32(this->hmd, &this->hmd->ipd, "IPD");
+
+	u_var_add_f32(this->hmd, &distortion.fov[0].angle_up, "View 0 FovAngleUp");
+	u_var_add_f32(this->hmd, &distortion.fov[0].angle_down, "View 0 FovAngleDown");
+	u_var_add_f32(this->hmd, &distortion.fov[0].angle_left, "View 0 FovAngleLeft");
+	u_var_add_f32(this->hmd, &distortion.fov[0].angle_right, "View 0 FovAngleRight");
+
+	u_var_add_f32(this->hmd, &distortion.fov[1].angle_up, "View 1 FovAngleUp");
+	u_var_add_f32(this->hmd, &distortion.fov[1].angle_down, "View 1 FovAngleDown");
+	u_var_add_f32(this->hmd, &distortion.fov[1].angle_left, "View 1 FovAngleLeft");
+	u_var_add_f32(this->hmd, &distortion.fov[1].angle_right, "View 1 FovAngleRight");
 
 	hmd_parts->display = display;
 	hmd->set_hmd_parts(std::move(hmd_parts));
