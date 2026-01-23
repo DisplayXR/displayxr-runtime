@@ -22,6 +22,7 @@ if(WIN32 AND XRT_HAVE_D3D11)
 		comp_d3d11
 		PUBLIC xrt-interfaces
 		PRIVATE
+			comp_util
 			aux_util
 			aux_os
 			aux_math
