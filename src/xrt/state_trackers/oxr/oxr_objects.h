@@ -1395,6 +1395,26 @@ oxr_swapchain_d3d11_create(struct oxr_logger *,
                            const XrSwapchainCreateInfo *,
                            struct oxr_swapchain **out_swapchain);
 
+/*!
+ * Check if D3D11 native compositor should be used.
+ * Returns true if we have a window handle and D3D11 native compositor is built.
+ */
+bool
+oxr_d3d11_native_compositor_supported(struct oxr_system *sys, void *window_handle);
+
+#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
+/*!
+ * Populate the session with the D3D11 native compositor.
+ * This bypasses Vulkan entirely for D3D11 apps.
+ */
+XrResult
+oxr_session_populate_d3d11_native(struct oxr_logger *log,
+                                   struct oxr_system *sys,
+                                   XrGraphicsBindingD3D11KHR const *next,
+                                   void *window_handle,
+                                   struct oxr_session *sess);
+#endif
+
 #endif
 
 /*

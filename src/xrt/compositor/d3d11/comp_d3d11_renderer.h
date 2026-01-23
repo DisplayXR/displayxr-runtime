@@ -1,0 +1,101 @@
+// Copyright 2024-2025, Leia Inc.
+// SPDX-License-Identifier: BSL-1.0
+/*!
+ * @file
+ * @brief  D3D11 renderer for layer compositing.
+ * @author David Fattal
+ * @ingroup comp_d3d11
+ */
+
+#pragma once
+
+#include "xrt/xrt_defines.h"
+#include "xrt/xrt_results.h"
+
+#include <stdint.h>
+#include <stdbool.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+struct comp_d3d11_renderer;
+struct comp_d3d11_compositor;
+struct comp_layer_accum;
+
+/*!
+ * Create a D3D11 renderer.
+ *
+ * @param c The D3D11 compositor.
+ * @param view_width Width of one view (half of stereo texture width).
+ * @param view_height Height of the views.
+ * @param out_renderer Pointer to receive the created renderer.
+ *
+ * @return XRT_SUCCESS on success, error code otherwise.
+ *
+ * @ingroup comp_d3d11
+ */
+xrt_result_t
+comp_d3d11_renderer_create(struct comp_d3d11_compositor *c,
+                           uint32_t view_width,
+                           uint32_t view_height,
+                           struct comp_d3d11_renderer **out_renderer);
+
+/*!
+ * Destroy a D3D11 renderer.
+ *
+ * @ingroup comp_d3d11
+ */
+void
+comp_d3d11_renderer_destroy(struct comp_d3d11_renderer **renderer_ptr);
+
+/*!
+ * Render all accumulated layers to the side-by-side stereo texture.
+ *
+ * @param renderer The renderer.
+ * @param layers The accumulated layers.
+ * @param left_eye Left eye position for projection (NULL for default).
+ * @param right_eye Right eye position for projection (NULL for default).
+ *
+ * @return XRT_SUCCESS on success, error code otherwise.
+ *
+ * @ingroup comp_d3d11
+ */
+xrt_result_t
+comp_d3d11_renderer_draw(struct comp_d3d11_renderer *renderer,
+                         struct comp_layer_accum *layers,
+                         struct xrt_vec3 *left_eye,
+                         struct xrt_vec3 *right_eye);
+
+/*!
+ * Get the stereo texture SRV for weaving.
+ *
+ * Returns the shader resource view of the side-by-side stereo texture
+ * that should be passed to the weaver.
+ *
+ * @param renderer The renderer.
+ *
+ * @return Pointer to the D3D11 shader resource view (ID3D11ShaderResourceView*).
+ *
+ * @ingroup comp_d3d11
+ */
+void *
+comp_d3d11_renderer_get_stereo_srv(struct comp_d3d11_renderer *renderer);
+
+/*!
+ * Get stereo texture dimensions.
+ *
+ * @param renderer The renderer.
+ * @param out_view_width Width of one view.
+ * @param out_view_height Height of views.
+ *
+ * @ingroup comp_d3d11
+ */
+void
+comp_d3d11_renderer_get_view_dimensions(struct comp_d3d11_renderer *renderer,
+                                        uint32_t *out_view_width,
+                                        uint32_t *out_view_height);
+
+#ifdef __cplusplus
+}
+#endif

@@ -78,6 +78,13 @@ endif()
 
 if(XRT_HAVE_D3D11)
 	target_sources(st_oxr PRIVATE oxr_session_gfx_d3d11.c oxr_swapchain_d3d11.c oxr_d3d11.cpp)
+
+	# D3D11 native compositor support (bypasses Vulkan)
+	if(WIN32 AND TARGET comp_d3d11)
+		target_sources(st_oxr PRIVATE oxr_session_gfx_d3d11_native.c)
+		target_link_libraries(st_oxr PRIVATE comp_d3d11)
+		target_compile_definitions(st_oxr PRIVATE XRT_HAVE_D3D11_NATIVE_COMPOSITOR)
+	endif()
 endif()
 
 if(XRT_HAVE_D3D12)

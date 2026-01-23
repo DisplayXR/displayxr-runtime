@@ -1268,8 +1268,24 @@ oxr_session_create_impl(struct oxr_logger *log,
 			return result;
 		}
 
-
 		OXR_SESSION_ALLOCATE_AND_INIT(log, sys, OXR_SESSION_GRAPHICS_EXT_D3D11, *out_session);
+
+#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
+		// Check if D3D11 native compositor should be used (bypasses Vulkan)
+		if (oxr_d3d11_native_compositor_supported(sys, xsi->external_window_handle)) {
+			// Create session without Vulkan compositor
+			xrt_result_t xret = xrt_system_create_session(sys->xsys, xsi, &(*out_session)->xs, NULL);
+			if (xret == XRT_ERROR_MULTI_SESSION_NOT_IMPLEMENTED) {
+				return oxr_error(log, XR_ERROR_LIMIT_REACHED, "Per instance multi-session not supported.");
+			}
+			if (xret != XRT_SUCCESS) {
+				return oxr_error(log, XR_ERROR_RUNTIME_FAILURE, "Failed to create xrt_session! '%i'", xret);
+			}
+			// Use D3D11 native compositor - no Vulkan involvement
+			return oxr_session_populate_d3d11_native(log, sys, d3d11, xsi->external_window_handle, *out_session);
+		}
+#endif
+		// Fall back to Vulkan-backed D3D11 compositor
 		OXR_CREATE_XRT_SESSION_AND_NATIVE_COMPOSITOR(log, xsi, *out_session);
 		return oxr_session_populate_d3d11(log, sys, d3d11, *out_session);
 	}
