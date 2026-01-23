@@ -12,7 +12,9 @@
 #define _UNICODE
 #include <windows.h>
 
+#ifndef VK_USE_PLATFORM_WIN32_KHR
 #define VK_USE_PLATFORM_WIN32_KHR
+#endif
 #include <vulkan/vulkan.h>
 
 #include <vector>

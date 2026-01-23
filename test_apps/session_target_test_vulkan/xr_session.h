@@ -11,8 +11,11 @@
 #define UNICODE
 #define _UNICODE
 #include <windows.h>
+#include <Unknwn.h>  // For IUnknown, needed by OpenXR MSFT extensions
 
+#ifndef VK_USE_PLATFORM_WIN32_KHR
 #define VK_USE_PLATFORM_WIN32_KHR
+#endif
 #include <vulkan/vulkan.h>
 
 // Must define graphics API before including OpenXR platform header
