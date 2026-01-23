@@ -526,7 +526,14 @@ if(XRT_BUILD_DRIVER_STEAMVR_LIGHTHOUSE)
 endif()
 
 if(XRT_HAVE_LEIA_SR)
-	add_library(drv_leiasr STATIC leiasr/leiasr.cpp leiasr/leiasr.h)
+	set(LEIASR_SOURCES leiasr/leiasr.cpp leiasr/leiasr.h)
+
+	# Add D3D11 weaver support on Windows
+	if(WIN32 AND XRT_HAVE_D3D11)
+		list(APPEND LEIASR_SOURCES leiasr/leiasr_d3d11.cpp leiasr/leiasr_d3d11.h)
+	endif()
+
+	add_library(drv_leiasr STATIC ${LEIASR_SOURCES})
     target_include_directories(drv_leiasr PRIVATE
         ${SR_PATH}/include
         ${SR_PATH}/third_party/OpenCV/include)
@@ -537,6 +544,20 @@ if(XRT_HAVE_LEIA_SR)
         ${SR_PATH}/lib/SimulatedRealityVulkanBeta.lib
 		${SR_PATH}/third_party/OpenCV/lib/x64/opencv_world343.lib
 		PUBLIC drv_includes)
+
+	# D3D11 weaver support requires SimulatedRealityDirectX library
+	if(WIN32 AND XRT_HAVE_D3D11)
+		if(EXISTS "${SR_PATH}/lib/SimulatedRealityDirectX.lib")
+			message(STATUS "Found SimulatedRealityDirectX.lib - enabling D3D11 weaver")
+			target_link_libraries(drv_leiasr PRIVATE
+				${SR_PATH}/lib/SimulatedRealityDirectX.lib
+				d3d11
+				dxgi)
+			target_compile_definitions(drv_leiasr PUBLIC XRT_HAVE_LEIA_SR_D3D11)
+		else()
+			message(STATUS "SimulatedRealityDirectX.lib not found - D3D11 weaver disabled")
+		endif()
+	endif()
 
 	# Phase 5: Eye tracking support (optional - only if Sense library exists)
 	if(EXISTS "${SR_PATH}/lib/SimulatedRealitySense.lib")

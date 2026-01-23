@@ -363,3 +363,10 @@ target_link_libraries(
 	PUBLIC xrt-interfaces
 	PRIVATE aux_util
 	)
+
+###
+# Native D3D11 compositor (bypasses Vulkan entirely)
+#
+if(WIN32 AND XRT_HAVE_D3D11)
+	add_subdirectory(d3d11)
+endif()
