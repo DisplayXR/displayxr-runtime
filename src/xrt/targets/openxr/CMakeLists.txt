@@ -86,11 +86,11 @@ generate_openxr_runtime_manifest_buildtree(
 # by a script we generate now.
 if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
 	# Windows: install manifest to top level with SRMonado naming
-	set(_extra_args)
+	# The installer copies everything to a flat directory, so use "." for the
+	# relative path (manifest and DLL will be in the same directory)
+	set(_extra_args RUNTIME_DIR_RELATIVE_TO_MANIFEST .)
 	if(XRT_OPENXR_INSTALL_ABSOLUTE_RUNTIME_PATH)
 		set(_extra_args ABSOLUTE_RUNTIME_PATH)
-	elseif(XRT_OPENXR_INSTALL_MANIFEST_RELATIVE_RUNTIME_PATH)
-		set(_extra_args RUNTIME_DIR_RELATIVE_TO_MANIFEST ${CMAKE_INSTALL_BINDIR})
 	endif()
 	generate_openxr_runtime_manifest_at_install(
 		${_extra_args}
