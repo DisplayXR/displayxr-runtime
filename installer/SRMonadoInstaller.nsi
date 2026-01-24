@@ -39,6 +39,15 @@ ShowUninstDetails show
 !include "FileFunc.nsh"
 !include "x64.nsh"
 !include "TextFunc.nsh"
+!include "WinMessages.nsh"
+
+; Windows constants for PATH modification
+!ifndef HWND_BROADCAST
+	!define HWND_BROADCAST 0xFFFF
+!endif
+!ifndef WM_SETTINGCHANGE
+	!define WM_SETTINGCHANGE 0x001A
+!endif
 
 ;--------------------------------
 ; Interface Settings
@@ -122,6 +131,207 @@ Function DumpLog
 		Pop $5
 FunctionEnd
 
+;--------------------------------
+; PATH manipulation functions
+; Based on NSIS Wiki and SR Platform installer
+
+; AddToPath - Adds a directory to the system PATH
+; Usage: Push "C:\path\to\add"
+;        Call AddToPath
+Function AddToPath
+	Exch $0  ; Path to add
+	Push $1  ; Current PATH
+	Push $2  ; Result
+	Push $3  ; Length
+
+	; Read current PATH
+	ReadRegStr $1 HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path"
+
+	; Check if already in PATH (case insensitive)
+	Push $1
+	Push $0
+	Call StrStr
+	Pop $2
+	StrCmp $2 "" 0 done  ; Already in PATH
+
+	; Append to PATH
+	StrLen $3 $1
+	StrCmp $3 0 fresh  ; PATH is empty
+	StrCpy $1 "$1;$0"
+	Goto update
+fresh:
+	StrCpy $1 $0
+
+update:
+	; Write new PATH
+	WriteRegExpandStr HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path" "$1"
+
+	; Broadcast WM_SETTINGCHANGE so running apps see the change
+	SendMessage ${HWND_BROADCAST} ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=5000
+
+	DetailPrint "Added $0 to system PATH"
+
+done:
+	Pop $3
+	Pop $2
+	Pop $1
+	Pop $0
+FunctionEnd
+
+; RemoveFromPath - Removes a directory from the system PATH
+; Usage: Push "C:\path\to\remove"
+;        Call un.RemoveFromPath
+Function un.RemoveFromPath
+	Exch $0  ; Path to remove
+	Push $1  ; Current PATH
+	Push $2  ; Temp
+	Push $3  ; New PATH
+	Push $4  ; Length
+
+	; Read current PATH
+	ReadRegStr $1 HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path"
+
+	; Initialize new PATH
+	StrCpy $3 ""
+
+	; Parse PATH and rebuild without our directory
+loop:
+	StrLen $4 $1
+	StrCmp $4 0 writepath
+
+	; Find next semicolon
+	Push $1
+	Push ";"
+	Call un.StrStr
+	Pop $2
+
+	StrCmp $2 "" lastpart
+
+	; Get length of current part
+	StrLen $4 $2
+	StrLen $2 $1
+	IntOp $2 $2 - $4
+	StrCpy $4 $1 $2  ; Current part
+	IntOp $2 $2 + 1
+	StrCpy $1 $1 "" $2  ; Rest of PATH
+
+	; Check if this part matches what we want to remove
+	StrCmp $4 $0 loop  ; Skip if matches
+
+	; Add to new PATH
+	StrLen $2 $3
+	StrCmp $2 0 0 +3
+	StrCpy $3 $4
+	Goto loop
+	StrCpy $3 "$3;$4"
+	Goto loop
+
+lastpart:
+	; Handle last part (no trailing semicolon)
+	StrCmp $1 $0 writepath  ; Skip if matches
+
+	StrLen $2 $3
+	StrCmp $2 0 0 +3
+	StrCpy $3 $1
+	Goto writepath
+	StrCpy $3 "$3;$1"
+
+writepath:
+	; Write new PATH
+	WriteRegExpandStr HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path" "$3"
+
+	; Broadcast WM_SETTINGCHANGE
+	SendMessage ${HWND_BROADCAST} ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=5000
+
+	DetailPrint "Removed $0 from system PATH"
+
+	Pop $4
+	Pop $3
+	Pop $2
+	Pop $1
+	Pop $0
+FunctionEnd
+
+; StrStr - Find substring in string
+; Usage: Push "haystack"
+;        Push "needle"
+;        Call StrStr
+;        Pop $0  ; Returns position or "" if not found
+Function StrStr
+	Exch $1  ; needle
+	Exch
+	Exch $2  ; haystack
+	Push $3
+	Push $4
+	Push $5
+
+	StrLen $3 $1
+	StrCmp $3 0 notfound
+	StrLen $4 $2
+	StrCmp $4 0 notfound
+
+	StrCpy $5 0
+searchloop:
+	IntCmp $5 $4 notfound notfound
+	StrCpy $0 $2 $3 $5
+	StrCmp $0 $1 found
+	IntOp $5 $5 + 1
+	Goto searchloop
+
+found:
+	StrCpy $0 $2 "" $5
+	Goto done
+
+notfound:
+	StrCpy $0 ""
+
+done:
+	Pop $5
+	Pop $4
+	Pop $3
+	Pop $2
+	Pop $1
+	Exch $0
+FunctionEnd
+
+; Uninstaller version of StrStr
+Function un.StrStr
+	Exch $1
+	Exch
+	Exch $2
+	Push $3
+	Push $4
+	Push $5
+
+	StrLen $3 $1
+	StrCmp $3 0 notfound
+	StrLen $4 $2
+	StrCmp $4 0 notfound
+
+	StrCpy $5 0
+searchloop:
+	IntCmp $5 $4 notfound notfound
+	StrCpy $0 $2 $3 $5
+	StrCmp $0 $1 found
+	IntOp $5 $5 + 1
+	Goto searchloop
+
+found:
+	StrCpy $0 $2 "" $5
+	Goto done
+
+notfound:
+	StrCpy $0 ""
+
+done:
+	Pop $5
+	Pop $4
+	Pop $3
+	Pop $2
+	Pop $1
+	Exch $0
+FunctionEnd
+
 ; Uninstaller version of DumpLog
 Function un.DumpLog
 	Exch $5
@@ -195,6 +405,12 @@ Section "SRMonado Runtime" SecRuntime
 
 	; Set as active OpenXR runtime
 	WriteRegStr HKLM "Software\Khronos\OpenXR\1" "ActiveRuntime" "$INSTDIR\SRMonado_win64.json"
+
+	; Add install directory to system PATH
+	; This is needed so OpenXR apps can find SRMonadoClient.dll's dependencies
+	; (vulkan-1.dll, SDL2.dll, etc.) when loading the runtime
+	Push $INSTDIR
+	Call AddToPath
 
 	; Write uninstaller
 	WriteUninstaller "$INSTDIR\Uninstall.exe"
@@ -296,6 +512,10 @@ Section "Uninstall"
 	ReadRegStr $0 HKLM "Software\Khronos\OpenXR\1" "ActiveRuntime"
 	StrCmp $0 "$INSTDIR\SRMonado_win64.json" 0 +2
 		DeleteRegValue HKLM "Software\Khronos\OpenXR\1" "ActiveRuntime"
+
+	; Remove install directory from system PATH
+	Push $INSTDIR
+	Call un.RemoveFromPath
 
 SectionEnd
 
