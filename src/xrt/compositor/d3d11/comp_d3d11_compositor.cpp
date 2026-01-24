@@ -640,6 +640,22 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	// Create frame pacing
 	u_pc_display_timing_create(c->settings.nominal_frame_interval_ns, &U_PC_DISPLAY_TIMING_CONFIG_DEFAULT, &c->upc);
 
+	// Populate supported swapchain formats (DXGI formats for D3D11)
+	// These are the common formats that D3D11 applications can use
+	uint32_t format_count = 0;
+	c->base.base.info.formats[format_count++] = DXGI_FORMAT_R8G8B8A8_UNORM;
+	c->base.base.info.formats[format_count++] = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+	c->base.base.info.formats[format_count++] = DXGI_FORMAT_B8G8R8A8_UNORM;
+	c->base.base.info.formats[format_count++] = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+	c->base.base.info.formats[format_count++] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+	c->base.base.info.formats[format_count++] = DXGI_FORMAT_R16G16B16A16_UNORM;
+	c->base.base.info.formats[format_count++] = DXGI_FORMAT_D24_UNORM_S8_UINT;
+	c->base.base.info.formats[format_count++] = DXGI_FORMAT_D32_FLOAT;
+	c->base.base.info.formats[format_count++] = DXGI_FORMAT_D16_UNORM;
+	c->base.base.info.format_count = format_count;
+
+	U_LOG_I("D3D11 native compositor supports %u swapchain formats", format_count);
+
 	// Set up compositor interface
 	c->base.base.get_swapchain_create_properties = d3d11_compositor_get_swapchain_create_properties;
 	c->base.base.create_swapchain = d3d11_compositor_create_swapchain;
