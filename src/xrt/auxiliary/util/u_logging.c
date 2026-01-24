@@ -8,6 +8,7 @@
  */
 
 #include "util/u_logging.h"
+#include "util/u_file_logging.h"
 #include "xrt/xrt_config_os.h"
 #include "xrt/xrt_config_build.h"
 
@@ -457,6 +458,9 @@ u_log_print_result(enum u_logging_level cond_level,
 void
 u_log(const char *file, int line, const char *func, enum u_logging_level level, const char *format, ...)
 {
+	// Initialize file logging on first log message (Windows only)
+	u_file_logging_init();
+
 	va_list args;
 	va_start(args, format);
 	DISPATCH_SINK(file, line, func, level, format, args);
