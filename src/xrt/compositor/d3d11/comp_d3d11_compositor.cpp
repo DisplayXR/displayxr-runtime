@@ -172,9 +172,9 @@ static xrt_result_t
 d3d11_compositor_begin_session(struct xrt_compositor *xc, const struct xrt_begin_session_info *info)
 {
 	struct comp_d3d11_compositor *c = d3d11_comp(xc);
-	(void)c;
 
-	U_LOG_I("D3D11 compositor session begin");
+	U_LOG_I("D3D11 compositor session begin - hwnd=%p, owns_window=%d, target=%p, renderer=%p",
+	        (void *)c->hwnd, c->owns_window, (void *)c->target, (void *)c->renderer);
 
 	return XRT_SUCCESS;
 }
@@ -199,6 +199,8 @@ d3d11_compositor_predict_frame(struct xrt_compositor *xc,
                                 int64_t *out_predicted_display_period_ns)
 {
 	struct comp_d3d11_compositor *c = d3d11_comp(xc);
+
+	U_LOG_D("D3D11 compositor: predict_frame called");
 
 	std::lock_guard<std::mutex> lock(c->mutex);
 
@@ -235,6 +237,8 @@ static xrt_result_t
 d3d11_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 {
 	struct comp_d3d11_compositor *c = d3d11_comp(xc);
+
+	U_LOG_D("D3D11 compositor: begin_frame called (frame_id=%lld)", (long long)frame_id);
 
 	std::lock_guard<std::mutex> lock(c->mutex);
 
@@ -390,6 +394,8 @@ static xrt_result_t
 d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
 {
 	struct comp_d3d11_compositor *c = d3d11_comp(xc);
+
+	U_LOG_D("D3D11 compositor: layer_commit called (layers=%u)", c->layer_accum.layer_count);
 
 	std::lock_guard<std::mutex> lock(c->mutex);
 
