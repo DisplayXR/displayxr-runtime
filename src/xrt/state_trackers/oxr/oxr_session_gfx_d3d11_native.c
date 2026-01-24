@@ -67,22 +67,29 @@ oxr_d3d11_native_compositor_supported(struct oxr_system *sys, void *window_handl
 	// Window handle is now OPTIONAL - compositor will create its own window if NULL
 	(void)window_handle;
 
+	// Always log the env var check result at INFO level for debugging
+	bool env_enabled = debug_get_bool_option_enable_d3d11_native_compositor();
+	U_LOG_I("D3D11 native compositor check: XRT_HAVE_D3D11_NATIVE_COMPOSITOR=defined, "
+	        "OXR_ENABLE_D3D11_NATIVE_COMPOSITOR=%s, window_handle=%p",
+	        env_enabled ? "1 (enabled)" : "0 (disabled)", window_handle);
+
 	// D3D11 native compositor is disabled by default because it only works
 	// in in-process mode. When using IPC/service mode (monado-service),
 	// the Vulkan compositor in the server process handles compositing.
 	// Enable explicitly for in-process testing.
-	if (!debug_get_bool_option_enable_d3d11_native_compositor()) {
-		U_LOG_D("D3D11 native compositor disabled (set OXR_ENABLE_D3D11_NATIVE_COMPOSITOR=1 to enable)");
+	if (!env_enabled) {
+		U_LOG_I("D3D11 native compositor DISABLED - falling back to Vulkan compositor");
 		return false;
 	}
 
 	if (window_handle != NULL) {
-		U_LOG_I("D3D11 native compositor enabled with app-provided window");
+		U_LOG_I("D3D11 native compositor ENABLED with app-provided window");
 	} else {
-		U_LOG_I("D3D11 native compositor enabled, will create own window");
+		U_LOG_I("D3D11 native compositor ENABLED, will create own window");
 	}
 	return true;
 #else
+	U_LOG_I("D3D11 native compositor check: XRT_HAVE_D3D11_NATIVE_COMPOSITOR=NOT defined (not compiled in)");
 	(void)sys;
 	(void)window_handle;
 	return false;
