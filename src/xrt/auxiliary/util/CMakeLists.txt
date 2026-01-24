@@ -66,6 +66,8 @@ add_library(
 	u_live_stats.h
 	u_logging.c
 	u_logging.h
+	u_file_logging.c
+	u_file_logging.h
 	u_metrics.c
 	u_metrics.h
 	u_misc.c
@@ -130,6 +132,8 @@ target_link_libraries(
 # Only uses normal Windows libraries, doesn't add anything extra.
 if(WIN32)
 	target_sources(aux_util PRIVATE u_windows.c u_windows.h)
+	# shell32 needed for SHGetFolderPathA in u_file_logging.c
+	target_link_libraries(aux_util PRIVATE shell32)
 endif()
 
 # WIL is lacking official support on MINGW.
