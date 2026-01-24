@@ -407,6 +407,14 @@ Section "SRMonado Runtime" SecRuntime
 	Push $INSTDIR
 	Call AddToPath
 
+	; Enable D3D11 native compositor by default
+	; This bypasses Vulkan and avoids D3D11<->Vulkan interop issues on Intel GPUs
+	WriteRegExpandStr HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" \
+		"OXR_ENABLE_D3D11_NATIVE_COMPOSITOR" "1"
+
+	; Broadcast environment change to running applications
+	SendMessage ${HWND_BROADCAST} ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=5000
+
 	; Write uninstaller
 	WriteUninstaller "$INSTDIR\Uninstall.exe"
 
@@ -420,7 +428,7 @@ Section "SRMonado Runtime" SecRuntime
 	WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\SRMonado" \
 		"InstallLocation" "$INSTDIR"
 	WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\SRMonado" \
-		"DisplayIcon" "$INSTDIR\monado-service.exe"
+		"DisplayIcon" "$INSTDIR\SRMonadoClient.dll"
 	WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\SRMonado" \
 		"Publisher" "Leia Inc."
 	WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\SRMonado" \
@@ -506,6 +514,13 @@ Section "Uninstall"
 	; Remove install directory from system PATH
 	Push $INSTDIR
 	Call un.RemoveFromPath
+
+	; Remove D3D11 native compositor environment variable
+	DeleteRegValue HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" \
+		"OXR_ENABLE_D3D11_NATIVE_COMPOSITOR"
+
+	; Broadcast environment change
+	SendMessage ${HWND_BROADCAST} ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=5000
 
 SectionEnd
 
