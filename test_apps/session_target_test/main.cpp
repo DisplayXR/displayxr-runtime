@@ -23,6 +23,190 @@
 #include <chrono>
 #include <string>
 #include <sstream>
+#include <fstream>
+
+// Diagnostic function to test loading the OpenXR runtime DLL directly
+// This helps identify missing dependencies that cause XR_ERROR_RUNTIME_UNAVAILABLE
+static void DiagnoseRuntimeLoading() {
+    LOG_INFO("=== Runtime Loading Diagnostics ===");
+
+    // 1. Read ActiveRuntime from registry
+    HKEY hKey;
+    char manifestPath[MAX_PATH] = {0};
+    DWORD pathSize = sizeof(manifestPath);
+
+    LONG result = RegOpenKeyExA(HKEY_LOCAL_MACHINE,
+        "Software\\Khronos\\OpenXR\\1", 0, KEY_READ, &hKey);
+
+    if (result != ERROR_SUCCESS) {
+        LOG_ERROR("Failed to open OpenXR registry key, error: %ld", result);
+        LOG_INFO("Trying HKEY_CURRENT_USER...");
+        result = RegOpenKeyExA(HKEY_CURRENT_USER,
+            "Software\\Khronos\\OpenXR\\1", 0, KEY_READ, &hKey);
+        if (result != ERROR_SUCCESS) {
+            LOG_ERROR("Failed to open OpenXR registry key in HKCU, error: %ld", result);
+            return;
+        }
+    }
+
+    result = RegQueryValueExA(hKey, "ActiveRuntime", nullptr, nullptr,
+        (LPBYTE)manifestPath, &pathSize);
+    RegCloseKey(hKey);
+
+    if (result != ERROR_SUCCESS) {
+        LOG_ERROR("Failed to read ActiveRuntime registry value, error: %ld", result);
+        return;
+    }
+
+    LOG_INFO("ActiveRuntime: %s", manifestPath);
+
+    // 2. Read the manifest file to get library_path
+    std::ifstream manifestFile(manifestPath);
+    if (!manifestFile.is_open()) {
+        LOG_ERROR("Failed to open manifest file: %s", manifestPath);
+        return;
+    }
+
+    std::string manifestContent((std::istreambuf_iterator<char>(manifestFile)),
+                                 std::istreambuf_iterator<char>());
+    manifestFile.close();
+
+    LOG_INFO("Manifest content:\n%s", manifestContent.c_str());
+
+    // Simple JSON parsing to extract library_path
+    size_t libPathPos = manifestContent.find("\"library_path\"");
+    if (libPathPos == std::string::npos) {
+        LOG_ERROR("library_path not found in manifest");
+        return;
+    }
+
+    size_t colonPos = manifestContent.find(":", libPathPos);
+    size_t quoteStart = manifestContent.find("\"", colonPos);
+    size_t quoteEnd = manifestContent.find("\"", quoteStart + 1);
+
+    if (quoteStart == std::string::npos || quoteEnd == std::string::npos) {
+        LOG_ERROR("Failed to parse library_path from manifest");
+        return;
+    }
+
+    std::string libraryPath = manifestContent.substr(quoteStart + 1, quoteEnd - quoteStart - 1);
+
+    // Unescape backslashes
+    std::string unescaped;
+    for (size_t i = 0; i < libraryPath.size(); i++) {
+        if (libraryPath[i] == '\\' && i + 1 < libraryPath.size() && libraryPath[i+1] == '\\') {
+            unescaped += '\\';
+            i++; // Skip next backslash
+        } else {
+            unescaped += libraryPath[i];
+        }
+    }
+    libraryPath = unescaped;
+
+    LOG_INFO("library_path (parsed): %s", libraryPath.c_str());
+
+    // 3. Determine full path to runtime DLL
+    std::string fullDllPath;
+    if (libraryPath[0] == '.' || libraryPath.find(":\\") == std::string::npos) {
+        // Relative path - resolve relative to manifest directory
+        std::string manifestDir(manifestPath);
+        size_t lastSlash = manifestDir.find_last_of("\\/");
+        if (lastSlash != std::string::npos) {
+            manifestDir = manifestDir.substr(0, lastSlash + 1);
+        }
+        // Handle ".\" prefix
+        if (libraryPath.substr(0, 2) == ".\\") {
+            libraryPath = libraryPath.substr(2);
+        }
+        fullDllPath = manifestDir + libraryPath;
+    } else {
+        fullDllPath = libraryPath;
+    }
+
+    LOG_INFO("Full DLL path: %s", fullDllPath.c_str());
+
+    // 4. Check if file exists
+    DWORD fileAttrs = GetFileAttributesA(fullDllPath.c_str());
+    if (fileAttrs == INVALID_FILE_ATTRIBUTES) {
+        DWORD err = GetLastError();
+        LOG_ERROR("Runtime DLL does not exist! Error: %lu", err);
+        return;
+    }
+    LOG_INFO("Runtime DLL exists (file attributes: 0x%08lX)", fileAttrs);
+
+    // 5. Get the DLL's directory and add it to the search path
+    std::string dllDir = fullDllPath;
+    size_t lastSlash = dllDir.find_last_of("\\/");
+    if (lastSlash != std::string::npos) {
+        dllDir = dllDir.substr(0, lastSlash);
+    }
+    LOG_INFO("Setting DLL directory to: %s", dllDir.c_str());
+    SetDllDirectoryA(dllDir.c_str());
+
+    // 6. Log current PATH for reference
+    char pathEnv[8192] = {0};
+    GetEnvironmentVariableA("PATH", pathEnv, sizeof(pathEnv));
+    LOG_INFO("Current PATH:\n%s", pathEnv);
+
+    // 7. Try to load the DLL
+    LOG_INFO("Attempting to load: %s", fullDllPath.c_str());
+
+    HMODULE hModule = LoadLibraryExA(fullDllPath.c_str(), nullptr, 0);
+
+    if (hModule == nullptr) {
+        DWORD err = GetLastError();
+
+        // Get detailed error message
+        char errorMsg[512] = {0};
+        FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+            nullptr, err, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+            errorMsg, sizeof(errorMsg), nullptr);
+
+        LOG_ERROR("LoadLibrary FAILED!");
+        LOG_ERROR("  Error code: %lu (0x%08lX)", err, err);
+        LOG_ERROR("  Error message: %s", errorMsg);
+
+        // Common error codes
+        if (err == 126) {
+            LOG_ERROR("  This usually means a dependency DLL is missing!");
+            LOG_ERROR("  Try running: dumpbin /dependents \"%s\"", fullDllPath.c_str());
+            LOG_ERROR("  Or use Dependency Walker / Dependencies tool");
+        } else if (err == 193) {
+            LOG_ERROR("  32-bit/64-bit architecture mismatch!");
+        } else if (err == 127) {
+            LOG_ERROR("  A required procedure/function could not be found in a DLL");
+        }
+
+        // Try LOAD_LIBRARY_AS_DATAFILE to see if the DLL itself is readable
+        HMODULE hDataFile = LoadLibraryExA(fullDllPath.c_str(), nullptr, LOAD_LIBRARY_AS_DATAFILE);
+        if (hDataFile) {
+            LOG_INFO("DLL is readable as data file - the DLL itself is OK");
+            LOG_ERROR("Problem is with loading its DEPENDENCIES");
+            FreeLibrary(hDataFile);
+        } else {
+            LOG_ERROR("DLL cannot even be read as data file - the DLL itself may be corrupt");
+        }
+    } else {
+        LOG_INFO("LoadLibrary SUCCEEDED! Handle: 0x%p", hModule);
+
+        // Check for the OpenXR negotiate function
+        void* negotiateFunc = GetProcAddress(hModule, "xrNegotiateLoaderRuntimeInterface");
+        if (negotiateFunc) {
+            LOG_INFO("Found xrNegotiateLoaderRuntimeInterface at 0x%p", negotiateFunc);
+        } else {
+            LOG_WARN("xrNegotiateLoaderRuntimeInterface not found - may not be a valid OpenXR runtime");
+        }
+
+        FreeLibrary(hModule);
+        LOG_INFO("DLL unloaded successfully");
+    }
+
+    // Reset DLL directory
+    SetDllDirectoryA(nullptr);
+
+    LOG_INFO("=== End Runtime Loading Diagnostics ===");
+    LOG_INFO("");
+}
 
 using Microsoft::WRL::ComPtr;
 using namespace DirectX;
@@ -187,6 +371,27 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return 1;
     }
     LOG_INFO("Text overlay initialized successfully");
+
+    // Run runtime loading diagnostics before OpenXR init
+    DiagnoseRuntimeLoading();
+
+    // WORKAROUND: Add SRMonado directory to DLL search path
+    // This is needed because Windows DLL loading uses the EXE's directory,
+    // not the loaded DLL's directory. When OpenXR loader loads SRMonadoClient.dll,
+    // its dependencies (vulkan-1.dll, SDL2.dll, etc.) won't be found unless
+    // the SRMonado directory is in the search path.
+    {
+        HKEY hKey;
+        char installPath[MAX_PATH] = {0};
+        DWORD pathSize = sizeof(installPath);
+        if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "Software\\LeiaSR\\SRMonado", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+            if (RegQueryValueExA(hKey, "InstallPath", nullptr, nullptr, (LPBYTE)installPath, &pathSize) == ERROR_SUCCESS) {
+                LOG_INFO("Adding SRMonado install path to DLL search: %s", installPath);
+                SetDllDirectoryA(installPath);
+            }
+            RegCloseKey(hKey);
+        }
+    }
 
     // Initialize OpenXR
     LOG_INFO("Initializing OpenXR instance...");
