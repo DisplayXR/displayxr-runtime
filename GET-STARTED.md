@@ -1,4 +1,4 @@
-# GET-ME-STARTED.md
+# GET-STARTED.md
 
 A quick-start guide for using the SRMonado OpenXR runtime on Leia SR devices.
 
@@ -15,11 +15,59 @@ Run the installer (`SRMonadoSetup-X.X.X.exe`). It will:
 
 ## Common Questions
 
-### Do I need to run the service?
+### Do I need to run the service (monado-service.exe)?
 
-**No.** SRMonado uses **in-process mode** by default. The runtime library (`SRMonadoClient.dll`) loads directly into your application. There's no separate service to start.
+**No.** SRMonado uses **in-process mode** by default. The runtime library (`SRMonadoClient.dll`) loads directly into your application's process. There's no separate service to start.
 
-The `monado-service.exe` is included for potential future multi-client scenarios but is **not required** for normal use.
+#### What is in-process mode?
+
+```
+┌─────────────────────────────────────────┐
+│           Your Application.exe          │
+│  ┌───────────────────────────────────┐  │
+│  │  Your app code                    │  │
+│  │         │                         │  │
+│  │         ▼                         │  │
+│  │  SRMonadoClient.dll               │  │
+│  │  ├── OpenXR state tracker         │  │
+│  │  ├── Compositor                   │  │
+│  │  ├── SR Weaver                    │  │
+│  │  └── Drivers                      │  │
+│  └───────────────────────────────────┘  │
+└─────────────────────────────────────────┘
+Everything runs in ONE process. No service needed.
+```
+
+#### What is monado-service for then?
+
+The `monado-service.exe` exists because SRMonado is built from Monado's codebase, which was designed for **VR headsets**. Service mode solves VR-specific problems:
+
+| VR Headset Need | Leia SR Reality |
+|-----------------|-----------------|
+| Exclusive HMD hardware access | It's just a monitor - no exclusive access needed |
+| Persistent head tracking state | Eye tracking is handled by SR Tracker Service (Leia's service) |
+| Single display output shared by apps | XR_EXT_session_target gives each app its own window |
+
+For Leia SR, tracking state is already shared via **Leia's SR Tracker Service** (part of CNSDK), not Monado:
+
+```
+┌──────────────┐  ┌──────────────┐
+│ App 1        │  │ App 2        │
+│ └─ SR Weaver │  │ └─ SR Weaver │
+└──────┬───────┘  └──────┬───────┘
+       │                 │
+       │ SR SDK API      │ SR SDK API
+       ▼                 ▼
+┌─────────────────────────────────┐
+│     SR Tracker Service          │  ← Leia's service (not Monado)
+│     (part of CNSDK/SR SDK)      │
+│     - Eye tracking              │
+│     - Face detection            │
+│     - Shared state              │
+└─────────────────────────────────┘
+```
+
+**Bottom line:** You don't need `monado-service.exe` for Leia SR workflows.
 
 ### Do I need to add SRMonado to PATH?
 
@@ -40,6 +88,71 @@ Should output:
 ```
 ActiveRuntime    REG_SZ    C:\Program Files\LeiaSR\SRMonado\SRMonado_win64.json
 ```
+
+## Compositor: Vulkan vs D3D11
+
+SRMonado has two compositor implementations:
+
+| Compositor | Default? | Requirements | SR Weaver |
+|------------|----------|--------------|-----------|
+| Vulkan | Yes | None | `leia_interlacer_vulkan` |
+| D3D11 Native | No | Opt-in + XR_EXT_session_target | `leiasr_d3d11` |
+
+### Default: Vulkan Compositor
+
+By default, even D3D11 applications use the Vulkan compositor with D3D11-to-Vulkan texture interop:
+
+```
+App (D3D11) → D3D11↔Vulkan interop → Vulkan Compositor → leia_interlacer_vulkan → Display
+```
+
+### Optional: D3D11 Native Compositor
+
+For a pure D3D11 pipeline (better Intel GPU compatibility), opt in with:
+
+```powershell
+$env:OXR_ENABLE_D3D11_NATIVE_COMPOSITOR = "1"
+./your_app.exe
+```
+
+This gives you:
+```
+App (D3D11) → D3D11 Compositor → leiasr_d3d11 weaver → Display
+```
+
+**Requirements for D3D11 native compositor:**
+- Must use `XR_EXT_session_target` (provide your own HWND)
+- Must be in-process mode (default)
+- Must set the environment variable
+
+## Using Existing OpenXR Apps (Blender, etc.)
+
+Existing OpenXR applications that don't know about `XR_EXT_session_target` will still work:
+
+```
+Blender.exe starts
+    │
+    ▼
+Blender calls xrCreateInstance()
+    │
+    ▼
+OpenXR Loader reads registry → finds SRMonado
+    │
+    ▼
+SRMonadoClient.dll loads into Blender's process (in-process mode)
+    │
+    ▼
+Runtime creates its own window for 3D output
+```
+
+However, without `XR_EXT_session_target`:
+
+| Aspect | With Extension | Without (Blender, etc.) |
+|--------|----------------|------------------------|
+| Window | App provides HWND | Runtime creates its own |
+| Input | App receives keyboard/mouse | Runtime window captures input |
+| Multi-app | Multiple apps can run | Typically one app at a time |
+| D3D11 native compositor | Available | Not available |
 
 ## Using the XR_EXT_session_target Extension
 
@@ -132,6 +245,11 @@ cmake --build . --target session_target_test
 ### Run it
 
 ```bash
+# Default (Vulkan compositor)
+./bin/session_target_test.exe
+
+# With D3D11 native compositor
+$env:OXR_ENABLE_D3D11_NATIVE_COMPOSITOR = "1"
 ./bin/session_target_test.exe
 ```
 
@@ -201,12 +319,17 @@ Ensure you're requesting `"XR_EXT_session_target"` in `enabledExtensionNames` wh
 │           SRMonadoClient.dll                │
 │  ┌─────────────────────────────────────┐   │
 │  │  OpenXR state tracker               │   │
-│  │  Compositor (layer compositing)     │   │
+│  │  Compositor (Vulkan or D3D11)       │   │
 │  │  SR Weaver (3D interlacing)         │   │
-│  │  Eye tracking integration           │   │
 │  └─────────────────────────────────────┘   │
 └──────────────────┬──────────────────────────┘
-                   │ Interlaced output
+                   │
+                   ▼
+┌─────────────────────────────────────────────┐
+│         SR Tracker Service (Leia)           │
+│         Eye tracking / face detection       │
+└─────────────────────────────────────────────┘
+                   │
                    ▼
 ┌─────────────────────────────────────────────┐
 │           Your Window (HWND)                │
