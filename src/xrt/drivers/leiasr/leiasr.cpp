@@ -289,19 +289,69 @@ leiasr_destroy(struct leiasr *leiasr)
 		return;
 	}
 
+	U_LOG_I("leiasr_destroy: beginning cleanup");
+
 	// Stop eye tracking first
 	leiasr_eye_tracker_stop(leiasr);
 
-	// Clean up weaver (if created)
-	if (leiasr->weaver != nullptr) {
-		// SR SDK handles weaver cleanup internally
-		leiasr->weaver = nullptr;
+	// WORKAROUND for SR SDK race condition in WndProcDispatcher:
+	// The SR SDK's WeaverBaseImpl has a use-after-free bug where it releases
+	// the lock before dereferencing the instance pointer in WndProcDispatcher.
+	// This can cause crashes when window messages (especially mouse movement)
+	// arrive during weaver destruction.
+	//
+	// Mitigation 1: Pump all pending window messages before destroying the weaver
+	// to reduce the race window. This gives in-flight message handlers time to
+	// complete before the weaver is destroyed.
+	{
+		U_LOG_I("leiasr_destroy: pumping window messages before cleanup");
+		MSG msg;
+		// Process all pending messages (non-blocking)
+		while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+			TranslateMessage(&msg);
+			DispatchMessage(&msg);
+		}
+		// Small delay to let any in-flight handlers complete
+		// The race window is very small, but mouse messages are high-frequency
+		Sleep(50);
+		// Pump again after the delay
+		while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+			TranslateMessage(&msg);
+			DispatchMessage(&msg);
+		}
+		U_LOG_I("leiasr_destroy: message pump complete");
 	}
 
-	// Clean up context
+	// Mitigation 2: Explicitly destroy the weaver before deleting the context.
+	// This ensures the window subclass is restored (via restoreOriginalWindowProc)
+	// before the object memory is freed, reducing the race window further.
+	if (leiasr->weaver != nullptr) {
+		U_LOG_I("leiasr_destroy: explicitly destroying weaver");
+		leiasr->weaver->destroy();
+		leiasr->weaver = nullptr;
+		U_LOG_I("leiasr_destroy: weaver destroyed");
+
+		// Pump messages again after weaver destroy, since restoreOriginalWindowProc
+		// was just called and there may be in-flight messages that got the old
+		// instance pointer before the map was updated
+		MSG msg;
+		while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+			TranslateMessage(&msg);
+			DispatchMessage(&msg);
+		}
+		Sleep(10);
+		while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+			TranslateMessage(&msg);
+			DispatchMessage(&msg);
+		}
+	}
+
+	// Clean up context (this triggers weaver destruction in SR SDK)
 	if (leiasr->context != nullptr) {
+		U_LOG_I("leiasr_destroy: deleting SR context");
 		delete leiasr->context;
 		leiasr->context = nullptr;
+		U_LOG_I("leiasr_destroy: SR context deleted");
 	}
 
 	delete leiasr;
