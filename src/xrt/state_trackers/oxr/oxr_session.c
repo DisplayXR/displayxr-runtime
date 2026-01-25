@@ -1139,7 +1139,8 @@ oxr_session_create_impl(struct oxr_logger *log,
                         const struct xrt_session_info *xsi,
                         struct oxr_session **out_session)
 {
-	U_LOG_I("oxr_session_create_impl called - window_handle=%p", xsi ? xsi->external_window_handle : NULL);
+	// Use U_LOG_IFL_I with U_LOGGING_INFO to always log (bypass global log level filter)
+	U_LOG_IFL_I(U_LOGGING_INFO, "oxr_session_create_impl called - window_handle=%p", xsi ? xsi->external_window_handle : NULL);
 
 #if defined(XR_USE_PLATFORM_XLIB) && defined(XR_USE_GRAPHICS_API_OPENGL)
 	XrGraphicsBindingOpenGLXlibKHR const *opengl_xlib = OXR_GET_INPUT_FROM_CHAIN(
@@ -1272,8 +1273,8 @@ oxr_session_create_impl(struct oxr_logger *log,
 
 		OXR_SESSION_ALLOCATE_AND_INIT(log, sys, OXR_SESSION_GRAPHICS_EXT_D3D11, *out_session);
 
-		// Log which compositor path we're taking
-		U_LOG_I("D3D11 session creation - checking compositor options...");
+		// Log which compositor path we're taking (use U_LOG_IFL_I to always log)
+		U_LOG_IFL_I(U_LOGGING_INFO, "D3D11 session creation - checking compositor options...");
 
 #ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
 		// Check if D3D11 native compositor should be used (bypasses Vulkan)
@@ -1290,10 +1291,10 @@ oxr_session_create_impl(struct oxr_logger *log,
 			return oxr_session_populate_d3d11_native(log, sys, d3d11, xsi->external_window_handle, *out_session);
 		}
 #else
-		U_LOG_I("D3D11 native compositor NOT compiled in (XRT_HAVE_D3D11_NATIVE_COMPOSITOR not defined)");
+		U_LOG_IFL_I(U_LOGGING_INFO, "D3D11 native compositor NOT compiled in (XRT_HAVE_D3D11_NATIVE_COMPOSITOR not defined)");
 #endif
 		// Fall back to Vulkan-backed D3D11 compositor
-		U_LOG_I("Using Vulkan-backed D3D11 compositor");
+		U_LOG_IFL_I(U_LOGGING_INFO, "Using Vulkan-backed D3D11 compositor");
 		OXR_CREATE_XRT_SESSION_AND_NATIVE_COMPOSITOR(log, xsi, *out_session);
 		return oxr_session_populate_d3d11(log, sys, d3d11, *out_session);
 	}

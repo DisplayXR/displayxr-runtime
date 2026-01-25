@@ -69,7 +69,7 @@ oxr_d3d11_native_compositor_supported(struct oxr_system *sys, void *window_handl
 
 	// Always log the env var check result at INFO level for debugging
 	bool env_enabled = debug_get_bool_option_enable_d3d11_native_compositor();
-	U_LOG_I("D3D11 native compositor check: XRT_HAVE_D3D11_NATIVE_COMPOSITOR=defined, "
+	U_LOG_IFL_I(U_LOGGING_INFO,"D3D11 native compositor check: XRT_HAVE_D3D11_NATIVE_COMPOSITOR=defined, "
 	        "OXR_ENABLE_D3D11_NATIVE_COMPOSITOR=%s, window_handle=%p",
 	        env_enabled ? "1 (enabled)" : "0 (disabled)", window_handle);
 
@@ -78,18 +78,18 @@ oxr_d3d11_native_compositor_supported(struct oxr_system *sys, void *window_handl
 	// the Vulkan compositor in the server process handles compositing.
 	// Enable explicitly for in-process testing.
 	if (!env_enabled) {
-		U_LOG_I("D3D11 native compositor DISABLED - falling back to Vulkan compositor");
+		U_LOG_IFL_I(U_LOGGING_INFO,"D3D11 native compositor DISABLED - falling back to Vulkan compositor");
 		return false;
 	}
 
 	if (window_handle != NULL) {
-		U_LOG_I("D3D11 native compositor ENABLED with app-provided window");
+		U_LOG_IFL_I(U_LOGGING_INFO,"D3D11 native compositor ENABLED with app-provided window");
 	} else {
-		U_LOG_I("D3D11 native compositor ENABLED, will create own window");
+		U_LOG_IFL_I(U_LOGGING_INFO,"D3D11 native compositor ENABLED, will create own window");
 	}
 	return true;
 #else
-	U_LOG_I("D3D11 native compositor check: XRT_HAVE_D3D11_NATIVE_COMPOSITOR=NOT defined (not compiled in)");
+	U_LOG_IFL_I(U_LOGGING_INFO,"D3D11 native compositor check: XRT_HAVE_D3D11_NATIVE_COMPOSITOR=NOT defined (not compiled in)");
 	(void)sys;
 	(void)window_handle;
 	return false;
@@ -129,7 +129,7 @@ oxr_session_populate_d3d11_native(struct oxr_logger *log,
 	// Use native swapchain create that handles xrt_swapchain_native layout
 	sess->create_swapchain = oxr_swapchain_d3d11_native_create;
 
-	U_LOG_I("Using D3D11 native compositor (bypassing Vulkan)");
+	U_LOG_IFL_I(U_LOGGING_INFO,"Using D3D11 native compositor (bypassing Vulkan)");
 
 	return XR_SUCCESS;
 }
