@@ -311,6 +311,13 @@ comp_d3d11_swapchain_create(struct comp_d3d11_compositor *c,
 		bind_flags |= D3D11_BIND_SHADER_RESOURCE;
 	}
 
+	U_LOG_W("[DEBUG] Swapchain creation: bits=0x%x, bind_flags=0x%x (RT=%d, SR=%d, DS=%d), device=%p",
+	        info->bits, bind_flags,
+	        (bind_flags & D3D11_BIND_RENDER_TARGET) ? 1 : 0,
+	        (bind_flags & D3D11_BIND_SHADER_RESOURCE) ? 1 : 0,
+	        (bind_flags & D3D11_BIND_DEPTH_STENCIL) ? 1 : 0,
+	        (void *)internals->device);
+
 	// Create textures
 	D3D11_TEXTURE2D_DESC texDesc = {};
 	texDesc.Width = info->width;
