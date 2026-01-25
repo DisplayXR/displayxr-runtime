@@ -67,7 +67,7 @@ struct leiasr
 	// Eye tracking objects
 	SR::EyeTracker *eyeTracker = nullptr;
 	LeiaEyePairListener *eyeListener = nullptr;
-	SR::EyePairStream *eyeStream = nullptr;
+	std::shared_ptr<SR::EyePairStream> eyeStream;
 #endif
 
 	// Thread-safe eye position storage
@@ -422,7 +422,7 @@ leiasr_eye_tracker_start(struct leiasr *leiasr)
 		leiasr->eyeListener = new LeiaEyePairListener(leiasr);
 
 		// Open eye pair stream with listener
-		leiasr->eyeStream = leiasr->eyeTracker->openEyePairStream(*leiasr->eyeListener);
+		leiasr->eyeStream = leiasr->eyeTracker->openEyePairStream(leiasr->eyeListener);
 		if (leiasr->eyeStream == nullptr) {
 			U_LOG_E("Failed to open SR eye pair stream");
 			delete leiasr->eyeListener;
@@ -462,10 +462,9 @@ leiasr_eye_tracker_stop(struct leiasr *leiasr)
 	leiasr->eyeTrackingActive.store(false);
 
 #ifdef XRT_HAVE_LEIA_SR_SENSE
-	// Close the stream first
+	// Close the stream first (shared_ptr handles cleanup)
 	if (leiasr->eyeStream != nullptr) {
-		delete leiasr->eyeStream;
-		leiasr->eyeStream = nullptr;
+		leiasr->eyeStream.reset();
 	}
 
 	// Delete listener
