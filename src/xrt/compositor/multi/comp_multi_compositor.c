@@ -1066,34 +1066,34 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 	}
 
 	// Create per-session comp_target using the target service
-	U_LOG_I("About to create per-session comp_target for HWND %p", mc->session_render.external_window_handle);
+	U_LOG_W("About to create per-session comp_target for HWND %p", mc->session_render.external_window_handle);
 	xrt_result_t ret = comp_target_service_create(mc->msc->target_service,
 	                                              mc->session_render.external_window_handle,
 	                                              &mc->session_render.target);
 
-	U_LOG_I("comp_target_service_create returned %d, target=%p", ret, (void *)mc->session_render.target);
+	U_LOG_W("comp_target_service_create returned %d, target=%p", ret, (void *)mc->session_render.target);
 
 	if (ret != XRT_SUCCESS) {
 		U_LOG_E("Failed to create per-session target: %d", ret);
 		return false;
 	}
 
-	U_LOG_I("Created per-session comp_target for HWND %p", mc->session_render.external_window_handle);
+	U_LOG_W("Created per-session comp_target for HWND %p", mc->session_render.external_window_handle);
 
 #ifdef XRT_HAVE_LEIA_SR
 	// Create per-session SR weaver
-	U_LOG_I("Getting Vulkan bundle for per-session weaver...");
+	U_LOG_W("Getting Vulkan bundle for per-session weaver...");
 	struct vk_bundle *vk = comp_target_service_get_vk(mc->msc->target_service);
 	if (vk == NULL) {
 		U_LOG_E("Failed to get Vulkan bundle for per-session weaver");
 		comp_target_service_destroy(mc->msc->target_service, &mc->session_render.target);
 		return false;
 	}
-	U_LOG_I("Got Vulkan bundle: device=%p, physical=%p, queue=%p",
+	U_LOG_W("Got Vulkan bundle: device=%p, physical=%p, queue=%p",
 	        (void *)vk->device, (void *)vk->physical_device, (void *)vk->main_queue->queue);
 
 	// Create command pool for weaver
-	U_LOG_I("Creating command pool for per-session weaver...");
+	U_LOG_W("Creating command pool for per-session weaver...");
 	VkCommandPoolCreateInfo pool_info = {
 	    .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
 	    .queueFamilyIndex = vk->main_queue->family_index,
@@ -1107,9 +1107,9 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 		comp_target_service_destroy(mc->msc->target_service, &mc->session_render.target);
 		return false;
 	}
-	U_LOG_I("Command pool created: %p", (void *)cmd_pool);
+	U_LOG_W("Command pool created: %p", (void *)cmd_pool);
 
-	U_LOG_I("Creating per-session SR weaver (leiasr_create)...");
+	U_LOG_W("Creating per-session SR weaver (leiasr_create)...");
 	ret = leiasr_create(1000.0,                                     // maxTime
 	                    vk->device,                                 // Vulkan device
 	                    vk->physical_device,                        // Physical device
@@ -1118,7 +1118,7 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 	                    mc->session_render.external_window_handle,  // Window handle
 	                    &mc->session_render.weaver);                // Output weaver
 
-	U_LOG_I("leiasr_create returned %d, weaver=%p", ret, (void *)mc->session_render.weaver);
+	U_LOG_W("leiasr_create returned %d, weaver=%p", ret, (void *)mc->session_render.weaver);
 
 	if (ret != XRT_SUCCESS) {
 		U_LOG_E("Failed to create per-session SR weaver: %d", ret);
