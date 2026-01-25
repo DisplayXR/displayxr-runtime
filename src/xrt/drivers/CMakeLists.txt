@@ -559,14 +559,7 @@ if(XRT_HAVE_LEIA_SR)
 		endif()
 	endif()
 
-	# Phase 5: Eye tracking support (optional - only if FaceTrackers library exists)
-	if(EXISTS "${SR_PATH}/lib/SimulatedRealityFaceTrackers.lib")
-		message(STATUS "Found SimulatedRealityFaceTrackers.lib - enabling eye tracking")
-		target_link_libraries(drv_leiasr PRIVATE ${SR_PATH}/lib/SimulatedRealityFaceTrackers.lib)
-		target_compile_definitions(drv_leiasr PUBLIC XRT_HAVE_LEIA_SR_SENSE)
-	else()
-		message(STATUS "SimulatedRealityFaceTrackers.lib not found - eye tracking disabled")
-	endif()
+	# Eye tracking is handled by the weaver's getPredictedEyePositions() - no separate library needed
 
 	list(APPEND ENABLED_DRIVERS drv_leiasr)
 endif(XRT_HAVE_LEIA_SR)

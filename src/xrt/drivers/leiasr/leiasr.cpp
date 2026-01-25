@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  Leia SR (Simulated Reality) SDK integration for eye tracking and weaving.
+ * @brief  Leia SR (Simulated Reality) SDK integration for weaving.
  * @ingroup drv_leiasr
  */
 
@@ -15,44 +15,18 @@
 #include <sr/world/display/display.h>
 #include <sr/utility/exception.h>
 
-#ifdef XRT_HAVE_LEIA_SR_SENSE
-#include <sr/sense/eyetracker/eyetracker.h>
-#include <sr/sense/eyetracker/eyepairlistener.h>
-#endif
-
 #include <windows.h>
 #include <sysinfoapi.h>
 
 #include <mutex>
-#include <atomic>
 #include <iostream>
 
-// Forward declaration
-struct leiasr;
-
-#ifdef XRT_HAVE_LEIA_SR_SENSE
 /*!
- * Listener class that receives eye pair updates from the SR SDK.
- * Converts positions from millimeters to meters and stores them thread-safely.
- */
-class LeiaEyePairListener : public SR::EyePairListener
-{
-public:
-	LeiaEyePairListener(struct leiasr *owner) : owner_(owner) {}
-
-	void accept(const SR_eyePair &eyePair) override;
-
-private:
-	struct leiasr *owner_;
-};
-#endif
-
-/*!
- * Main structure holding SR context, weaver, and eye tracking state.
+ * Main structure holding SR context and weaver state.
  */
 struct leiasr
 {
-	// Vulkan resources (only used when weaver is created)
+	// Vulkan resources
 	VkDevice device = nullptr;
 	VkPhysicalDevice physicalDevice = nullptr;
 	VkQueue graphicsQueue = nullptr;
@@ -63,61 +37,9 @@ struct leiasr
 	SR::SRContext *context = nullptr;
 	SR::IVulkanWeaver1 *weaver = nullptr;
 
-#ifdef XRT_HAVE_LEIA_SR_SENSE
-	// Eye tracking objects
-	SR::EyeTracker *eyeTracker = nullptr;
-	LeiaEyePairListener *eyeListener = nullptr;
-	std::shared_ptr<SR::EyePairStream> eyeStream;
-#endif
-
-	// Thread-safe eye position storage
+	// Thread-safe eye position storage (for getPredictedEyePositions)
 	std::mutex eyeMutex;
-	leiasr_eye_pair latestEyePair = {};
-	std::atomic<bool> eyeTrackingActive{false};
-
-	// True if this instance was created for eye tracking only (no Vulkan)
-	bool eyeTrackerOnly = false;
-
-	/*!
-	 * Update the latest eye positions (called from listener thread).
-	 */
-	void
-	updateEyePositions(const leiasr_eye_pair &pair)
-	{
-		std::lock_guard<std::mutex> lock(eyeMutex);
-		latestEyePair = pair;
-	}
-
-	/*!
-	 * Get the latest eye positions (thread-safe).
-	 */
-	leiasr_eye_pair
-	getEyePositions()
-	{
-		std::lock_guard<std::mutex> lock(eyeMutex);
-		return latestEyePair;
-	}
 };
-
-#ifdef XRT_HAVE_LEIA_SR_SENSE
-// Implementation of LeiaEyePairListener::accept
-void
-LeiaEyePairListener::accept(const SR_eyePair &eyePair)
-{
-	// Convert from millimeters to meters
-	leiasr_eye_pair pair;
-	pair.left.x = eyePair.left.x / 1000.0f;
-	pair.left.y = eyePair.left.y / 1000.0f;
-	pair.left.z = eyePair.left.z / 1000.0f;
-	pair.right.x = eyePair.right.x / 1000.0f;
-	pair.right.y = eyePair.right.y / 1000.0f;
-	pair.right.z = eyePair.right.z / 1000.0f;
-	pair.timestamp_ns = os_monotonic_get_ns();
-	pair.valid = true;
-
-	owner_->updateEyePositions(pair);
-}
-#endif
 
 namespace {
 
@@ -254,34 +176,6 @@ leiasr_create(double maxTime,
 	return XRT_SUCCESS;
 }
 
-xrt_result_t
-leiasr_create_eye_tracker_only(double maxTime, struct leiasr **out)
-{
-#ifdef XRT_HAVE_LEIA_SR_SENSE
-	leiasr *sr = new leiasr;
-	sr->eyeTrackerOnly = true;
-
-	if (!CreateSRContext(maxTime, *sr)) {
-		U_LOG_E("Failed to create SR context for eye tracking");
-		delete sr;
-		return XRT_ERROR_DEVICE_CREATION_FAILED;
-	}
-
-	sr->context->initialize();
-
-	*out = sr;
-
-	U_LOG_I("Created leiasr instance for eye tracking only");
-
-	return XRT_SUCCESS;
-#else
-	(void)maxTime;
-	*out = nullptr;
-	U_LOG_W("Eye tracking not available - SimulatedRealitySense library not found at build time");
-	return XRT_ERROR_DEVICE_CREATION_FAILED;
-#endif
-}
-
 void
 leiasr_destroy(struct leiasr *leiasr)
 {
@@ -290,9 +184,6 @@ leiasr_destroy(struct leiasr *leiasr)
 	}
 
 	U_LOG_I("leiasr_destroy: beginning cleanup");
-
-	// Stop eye tracking first
-	leiasr_eye_tracker_stop(leiasr);
 
 	// WORKAROUND for SR SDK race condition in WndProcDispatcher:
 	// The SR SDK's WeaverBaseImpl has a use-after-free bug where it releases
@@ -390,129 +281,6 @@ leiasr_weave(struct leiasr *leiasr,
 	leiasr->weaver->setOutputFrameBuffer(framebuffer, framebufferWidth, framebufferHeight, framebufferFormat);
 	leiasr->weaver->setInputViewTexture(leftImageView, rightImageView, imageWidth, imageHeight, imageFormat);
 	leiasr->weaver->weave();
-}
-
-xrt_result_t
-leiasr_eye_tracker_start(struct leiasr *leiasr)
-{
-#ifdef XRT_HAVE_LEIA_SR_SENSE
-	if (leiasr == nullptr) {
-		return XRT_ERROR_DEVICE_CREATION_FAILED;
-	}
-
-	if (leiasr->context == nullptr) {
-		U_LOG_E("Cannot start eye tracker: SR context is null");
-		return XRT_ERROR_DEVICE_CREATION_FAILED;
-	}
-
-	if (leiasr->eyeTrackingActive.load()) {
-		U_LOG_W("Eye tracker already active");
-		return XRT_SUCCESS;
-	}
-
-	try {
-		// Create eye tracker from context
-		leiasr->eyeTracker = SR::EyeTracker::create(*leiasr->context);
-		if (leiasr->eyeTracker == nullptr) {
-			U_LOG_E("Failed to create SR EyeTracker");
-			return XRT_ERROR_DEVICE_CREATION_FAILED;
-		}
-
-		// Create listener
-		leiasr->eyeListener = new LeiaEyePairListener(leiasr);
-
-		// Open eye pair stream with listener
-		leiasr->eyeStream = leiasr->eyeTracker->openEyePairStream(leiasr->eyeListener);
-		if (leiasr->eyeStream == nullptr) {
-			U_LOG_E("Failed to open SR eye pair stream");
-			delete leiasr->eyeListener;
-			leiasr->eyeListener = nullptr;
-			delete leiasr->eyeTracker;
-			leiasr->eyeTracker = nullptr;
-			return XRT_ERROR_DEVICE_CREATION_FAILED;
-		}
-
-		leiasr->eyeTrackingActive.store(true);
-
-		U_LOG_I("SR Eye tracking started successfully");
-
-		return XRT_SUCCESS;
-	} catch (const std::exception &e) {
-		U_LOG_E("Exception starting eye tracker: %s", e.what());
-		return XRT_ERROR_DEVICE_CREATION_FAILED;
-	}
-#else
-	(void)leiasr;
-	U_LOG_W("Eye tracking not available - SimulatedRealitySense library not found at build time");
-	return XRT_ERROR_DEVICE_CREATION_FAILED;
-#endif
-}
-
-void
-leiasr_eye_tracker_stop(struct leiasr *leiasr)
-{
-	if (leiasr == nullptr) {
-		return;
-	}
-
-	if (!leiasr->eyeTrackingActive.load()) {
-		return;
-	}
-
-	leiasr->eyeTrackingActive.store(false);
-
-#ifdef XRT_HAVE_LEIA_SR_SENSE
-	// Close the stream first (shared_ptr handles cleanup)
-	if (leiasr->eyeStream != nullptr) {
-		leiasr->eyeStream.reset();
-	}
-
-	// Delete listener
-	if (leiasr->eyeListener != nullptr) {
-		delete leiasr->eyeListener;
-		leiasr->eyeListener = nullptr;
-	}
-
-	// Delete eye tracker
-	if (leiasr->eyeTracker != nullptr) {
-		delete leiasr->eyeTracker;
-		leiasr->eyeTracker = nullptr;
-	}
-#endif
-
-	// Clear the latest eye pair
-	{
-		std::lock_guard<std::mutex> lock(leiasr->eyeMutex);
-		leiasr->latestEyePair = {};
-	}
-
-	U_LOG_I("SR Eye tracking stopped");
-}
-
-bool
-leiasr_get_eye_positions(struct leiasr *leiasr, struct leiasr_eye_pair *out_eye_pair)
-{
-	if (leiasr == nullptr || out_eye_pair == nullptr) {
-		return false;
-	}
-
-	if (!leiasr->eyeTrackingActive.load()) {
-		out_eye_pair->valid = false;
-		return false;
-	}
-
-	*out_eye_pair = leiasr->getEyePositions();
-	return out_eye_pair->valid;
-}
-
-bool
-leiasr_is_eye_tracking_active(struct leiasr *leiasr)
-{
-	if (leiasr == nullptr) {
-		return false;
-	}
-
-	return leiasr->eyeTrackingActive.load();
 }
 
 bool

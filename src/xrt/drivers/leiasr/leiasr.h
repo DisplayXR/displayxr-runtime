@@ -57,20 +57,8 @@ leiasr_create(double maxTime,
               struct leiasr **out);
 
 /*!
- * Create a leiasr instance for eye tracking only (no Vulkan/weaver).
- * This is used at the system compositor level to share eye tracking data
- * across all sessions.
- *
- * @param maxTime Maximum time in seconds to wait for SR to become ready
- * @param[out] out Pointer to receive the created leiasr instance
- * @return XRT_SUCCESS on success
- */
-xrt_result_t
-leiasr_create_eye_tracker_only(double maxTime, struct leiasr **out);
-
-/*!
  * Destroy a leiasr instance.
- * Stops eye tracking if active and frees all resources.
+ * Frees all resources.
  *
  * @param leiasr The instance to destroy (can be NULL)
  */
@@ -108,53 +96,9 @@ leiasr_weave(struct leiasr *leiasr,
              VkFormat framebufferFormat);
 
 /*!
- * Start the eye tracker and begin receiving eye position updates.
- * The eye tracker runs on its own thread and calls back with updates.
- *
- * @param leiasr The leiasr instance
- * @return XRT_SUCCESS if eye tracking started successfully
- */
-xrt_result_t
-leiasr_eye_tracker_start(struct leiasr *leiasr);
-
-/*!
- * Stop the eye tracker and stop receiving updates.
- *
- * @param leiasr The leiasr instance
- */
-void
-leiasr_eye_tracker_stop(struct leiasr *leiasr);
-
-/*!
- * Get the latest eye positions from the eye tracker.
- * This function is thread-safe and can be called from any thread.
- *
- * @param leiasr The leiasr instance
- * @param[out] out_eye_pair Pointer to receive the eye positions
- * @return true if valid eye positions are available, false otherwise
- */
-bool
-leiasr_get_eye_positions(struct leiasr *leiasr, struct leiasr_eye_pair *out_eye_pair);
-
-/*!
- * Check if eye tracking is currently active.
- *
- * @param leiasr The leiasr instance
- * @return true if eye tracking is active
- */
-bool
-leiasr_is_eye_tracking_active(struct leiasr *leiasr);
-
-/*!
  * Get predicted eye positions from the weaver's LookaroundFilter.
- * This is the preferred method for LookAround functionality as it uses
- * the weaver's internal prediction filter tuned for application-specific latency.
- *
- * Unlike leiasr_get_eye_positions() which uses the deprecated EyeTracker stream,
- * this method:
- * - Uses the LookaroundFilter which adapts to your application's update rate
- * - Doesn't require the SimulatedRealitySense library
- * - Works with any graphics API that has a weaver
+ * This uses the weaver's internal prediction filter tuned for
+ * application-specific latency.
  *
  * @param leiasr The leiasr instance (must have a weaver)
  * @param[out] out_eye_pair Pointer to receive the eye positions (in meters)
