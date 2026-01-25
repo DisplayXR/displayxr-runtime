@@ -31,11 +31,11 @@
 #endif
 
 /*
- * Environment variable to enable D3D11 native compositor.
- * Default is false because D3D11 native compositor only works in in-process mode.
- * Set OXR_ENABLE_D3D11_NATIVE_COMPOSITOR=1 for testing in in-process mode.
+ * Environment variable to enable/disable D3D11 native compositor.
+ * Default is TRUE - D3D11 native compositor is enabled by default for in-process mode.
+ * Set OXR_ENABLE_D3D11_NATIVE_COMPOSITOR=0 to force Vulkan compositor (for debugging).
  */
-DEBUG_GET_ONCE_BOOL_OPTION(enable_d3d11_native_compositor, "OXR_ENABLE_D3D11_NATIVE_COMPOSITOR", false)
+DEBUG_GET_ONCE_BOOL_OPTION(enable_d3d11_native_compositor, "OXR_ENABLE_D3D11_NATIVE_COMPOSITOR", true)
 
 /*!
  * Check if D3D11 native compositor should be used.
@@ -57,8 +57,8 @@ DEBUG_GET_ONCE_BOOL_OPTION(enable_d3d11_native_compositor, "OXR_ENABLE_D3D11_NAT
  * monado-service is running), the Vulkan compositor in the server process
  * handles compositing.
  *
- * Default is DISABLED because most setups use IPC/service mode.
- * Set OXR_ENABLE_D3D11_NATIVE_COMPOSITOR=1 for in-process testing.
+ * Default is ENABLED for in-process mode (Leia displays).
+ * Set OXR_ENABLE_D3D11_NATIVE_COMPOSITOR=0 to force Vulkan compositor.
  */
 bool
 oxr_d3d11_native_compositor_supported(struct oxr_system *sys, void *window_handle)
