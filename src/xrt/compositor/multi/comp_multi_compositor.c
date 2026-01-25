@@ -1127,14 +1127,17 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 		return false;
 	}
 
+	U_LOG_W("Storing command pool...");
 	// Store command pool for cleanup
 	mc->session_render.weaver_cmd_pool = cmd_pool;
+	U_LOG_W("Command pool stored, weaver init complete");
 
-	U_LOG_I("Created per-session SR weaver for HWND %p", mc->session_render.external_window_handle);
+	U_LOG_W("Created per-session SR weaver for HWND %p", mc->session_render.external_window_handle);
 #endif
 
+	U_LOG_W("Setting session_render.initialized = true...");
 	mc->session_render.initialized = true;
-	U_LOG_I("Initialized per-session render resources for HWND %p", mc->session_render.external_window_handle);
+	U_LOG_W("Per-session render resources initialized for HWND %p", mc->session_render.external_window_handle);
 
 	return true;
 }

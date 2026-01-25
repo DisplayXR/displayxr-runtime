@@ -518,11 +518,15 @@ transfer_layers_locked(struct multi_system_compositor *msc, int64_t display_time
 		// Lazily initialize per-session render resources if session has external HWND
 		// This creates the per-session comp_target and SR weaver for multi-app support
 		if (multi_compositor_has_session_render(mc) && !mc->session_render.initialized) {
-			multi_compositor_init_session_render(mc);
+			U_LOG_W("Calling multi_compositor_init_session_render...");
+			bool init_result = multi_compositor_init_session_render(mc);
+			U_LOG_W("multi_compositor_init_session_render returned %d", init_result);
 		}
 
+		U_LOG_W("About to call multi_compositor_deliver_any_frames...");
 		// Even if it's not shown, make sure that frames are delivered.
 		multi_compositor_deliver_any_frames(mc, display_time_ns);
+		U_LOG_W("multi_compositor_deliver_any_frames completed");
 
 		// None of the data in this slot is valid, don't check access it.
 		if (!mc->delivered.active) {
