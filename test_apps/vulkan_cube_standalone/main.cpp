@@ -8,10 +8,7 @@
  * correctly without any OpenXR involvement.
  */
 
-#define WIN32_LEAN_AND_MEAN
-#define UNICODE
-#define _UNICODE
-#include <windows.h>
+#include "logging.h"
 
 #ifndef VK_USE_PLATFORM_WIN32_KHR
 #define VK_USE_PLATFORM_WIN32_KHR
@@ -25,10 +22,6 @@
 #include <cstring>
 #include <cstdio>
 #include <chrono>
-
-// Simple logging
-#define LOG_INFO(fmt, ...) printf("[INFO] " fmt "\n", ##__VA_ARGS__)
-#define LOG_ERROR(fmt, ...) printf("[ERROR] " fmt "\n", ##__VA_ARGS__)
 
 // Window settings
 static const wchar_t* WINDOW_CLASS = L"VulkanCubeStandaloneClass";
@@ -767,38 +760,101 @@ static void Cleanup(VulkanApp& app) {
 
 // Main
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
-    LOG_INFO("=== Vulkan Cube Standalone ===");
+    // Initialize file logging first
+    if (!InitializeLogging()) {
+        MessageBox(nullptr, L"Failed to initialize logging", L"Warning", MB_OK | MB_ICONWARNING);
+        // Continue anyway - just won't have file logging
+    }
 
+    LOG_INFO("=== Vulkan Cube Standalone ===");
+    LOG_INFO("This is a pure Vulkan test app (no OpenXR)");
+
+    LOG_INFO("Creating application window...");
     HWND hwnd = CreateAppWindow(hInstance);
-    if (!hwnd) { LOG_ERROR("Failed to create window"); return 1; }
+    if (!hwnd) {
+        LOG_ERROR("Failed to create window");
+        ShutdownLogging();
+        return 1;
+    }
+    LOG_INFO("Window created: HWND=0x%p", hwnd);
 
     VulkanApp app = {};
 
     // Set shader directory
     #ifdef SHADER_DIR
     app.shaderDir = SHADER_DIR;
+    LOG_INFO("Shader directory (from CMake): %s", app.shaderDir.c_str());
     #else
     app.shaderDir = "shaders";
+    LOG_INFO("Shader directory (default): %s", app.shaderDir.c_str());
     #endif
 
-    if (!InitVulkan(app, hwnd, hInstance)) { Cleanup(app); return 1; }
-    if (!CreateRenderPass(app)) { Cleanup(app); return 1; }
-    if (!CreateSwapchain(app, g_windowWidth, g_windowHeight)) { Cleanup(app); return 1; }
-    if (!CreatePipeline(app)) { Cleanup(app); return 1; }
-    if (!CreateGeometry(app)) { Cleanup(app); return 1; }
-    if (!CreateSyncObjects(app)) { Cleanup(app); return 1; }
+    LOG_INFO("Initializing Vulkan...");
+    if (!InitVulkan(app, hwnd, hInstance)) {
+        LOG_ERROR("InitVulkan failed");
+        Cleanup(app);
+        ShutdownLogging();
+        return 1;
+    }
+
+    LOG_INFO("Creating render pass...");
+    if (!CreateRenderPass(app)) {
+        LOG_ERROR("CreateRenderPass failed");
+        Cleanup(app);
+        ShutdownLogging();
+        return 1;
+    }
+
+    LOG_INFO("Creating swapchain (%ux%u)...", g_windowWidth, g_windowHeight);
+    if (!CreateSwapchain(app, g_windowWidth, g_windowHeight)) {
+        LOG_ERROR("CreateSwapchain failed");
+        Cleanup(app);
+        ShutdownLogging();
+        return 1;
+    }
+
+    LOG_INFO("Creating graphics pipeline...");
+    if (!CreatePipeline(app)) {
+        LOG_ERROR("CreatePipeline failed");
+        Cleanup(app);
+        ShutdownLogging();
+        return 1;
+    }
+
+    LOG_INFO("Creating geometry buffers...");
+    if (!CreateGeometry(app)) {
+        LOG_ERROR("CreateGeometry failed");
+        Cleanup(app);
+        ShutdownLogging();
+        return 1;
+    }
+
+    LOG_INFO("Creating sync objects...");
+    if (!CreateSyncObjects(app)) {
+        LOG_ERROR("CreateSyncObjects failed");
+        Cleanup(app);
+        ShutdownLogging();
+        return 1;
+    }
 
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
-    LOG_INFO("Initialization complete, entering main loop");
+    LOG_INFO("");
+    LOG_INFO("=== Initialization complete, entering main loop ===");
+    LOG_INFO("");
 
     auto lastTime = std::chrono::high_resolution_clock::now();
     MSG msg = {};
     bool running = true;
+    int frameCount = 0;
+    float fpsTimer = 0.0f;
 
     while (running) {
         while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
-            if (msg.message == WM_QUIT) running = false;
+            if (msg.message == WM_QUIT) {
+                LOG_INFO("Received WM_QUIT");
+                running = false;
+            }
             TranslateMessage(&msg);
             DispatchMessage(&msg);
         }
@@ -812,12 +868,26 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         if (app.cubeRotation > 6.28318f) app.cubeRotation -= 6.28318f;
 
         RenderFrame(app);
+
+        // Log FPS periodically
+        frameCount++;
+        fpsTimer += dt;
+        if (fpsTimer >= 5.0f) {
+            float fps = frameCount / fpsTimer;
+            LOG_INFO("Render loop running: %.1f FPS", fps);
+            frameCount = 0;
+            fpsTimer = 0.0f;
+        }
     }
 
-    LOG_INFO("Shutting down");
+    LOG_INFO("");
+    LOG_INFO("=== Shutting down ===");
+    LOG_INFO("Cleaning up Vulkan resources...");
     Cleanup(app);
+    LOG_INFO("Destroying window...");
     DestroyWindow(hwnd);
     UnregisterClass(WINDOW_CLASS, hInstance);
     LOG_INFO("Done");
+    ShutdownLogging();
     return 0;
 }

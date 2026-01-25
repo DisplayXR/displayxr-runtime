@@ -55,6 +55,8 @@ add_custom_target(shaders_standalone DEPENDS ${SHADER_OUTPUTS})
 
 add_executable(vulkan_cube_standalone WIN32
     main.cpp
+    logging.cpp
+    logging.h
 )
 
 add_dependencies(vulkan_cube_standalone shaders_standalone)
