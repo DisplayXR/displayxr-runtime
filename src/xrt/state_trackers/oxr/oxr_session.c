@@ -331,6 +331,16 @@ oxr_session_begin(struct oxr_logger *log, struct oxr_session *sess, const XrSess
 			oxr_event_push_XrEventDataUserPresenceChangedEXT(log, sess, presence);
 		}
 #endif
+
+		// D3D11 native compositor (and similar simple compositors) may set
+		// visibility/focus flags during session creation because they don't
+		// use the multi-compositor event system. If flags are already set,
+		// trigger state transitions directly like headless mode.
+		if (sess->compositor_visible && sess->compositor_focused) {
+			oxr_session_change_state(log, sess, XR_SESSION_STATE_SYNCHRONIZED, 0);
+			oxr_session_change_state(log, sess, XR_SESSION_STATE_VISIBLE, 0);
+			oxr_session_change_state(log, sess, XR_SESSION_STATE_FOCUSED, 0);
+		}
 	} else {
 		// Headless, pretend we got event from the compositor.
 		sess->compositor_visible = true;
