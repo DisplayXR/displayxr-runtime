@@ -1270,6 +1270,9 @@ oxr_session_create_impl(struct oxr_logger *log,
 
 		OXR_SESSION_ALLOCATE_AND_INIT(log, sys, OXR_SESSION_GRAPHICS_EXT_D3D11, *out_session);
 
+		// Log which compositor path we're taking
+		U_LOG_I("D3D11 session creation - checking compositor options...");
+
 #ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
 		// Check if D3D11 native compositor should be used (bypasses Vulkan)
 		if (oxr_d3d11_native_compositor_supported(sys, xsi->external_window_handle)) {
@@ -1284,8 +1287,11 @@ oxr_session_create_impl(struct oxr_logger *log,
 			// Use D3D11 native compositor - no Vulkan involvement
 			return oxr_session_populate_d3d11_native(log, sys, d3d11, xsi->external_window_handle, *out_session);
 		}
+#else
+		U_LOG_I("D3D11 native compositor NOT compiled in (XRT_HAVE_D3D11_NATIVE_COMPOSITOR not defined)");
 #endif
 		// Fall back to Vulkan-backed D3D11 compositor
+		U_LOG_I("Using Vulkan-backed D3D11 compositor");
 		OXR_CREATE_XRT_SESSION_AND_NATIVE_COMPOSITOR(log, xsi, *out_session);
 		return oxr_session_populate_d3d11(log, sys, d3d11, *out_session);
 	}
