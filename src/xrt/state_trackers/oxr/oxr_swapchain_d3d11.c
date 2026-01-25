@@ -16,6 +16,7 @@
 #include "xrt/xrt_gfx_d3d11.h"
 #include "xrt/xrt_compositor.h"
 #include "util/u_debug.h"
+#include "util/u_logging.h"
 
 #include "oxr_objects.h"
 #include "oxr_logger.h"
@@ -60,9 +61,25 @@ d3d11_native_enumerate_images(struct oxr_logger *log,
 	struct xrt_swapchain_native *xscn = (struct xrt_swapchain_native *)sc->swapchain;
 	XrSwapchainImageD3D11KHR *d3d_imgs = (XrSwapchainImageD3D11KHR *)images;
 
+	// Debug logging
+	static int enum_count = 0;
+	if (enum_count < 5) {
+		U_LOG_W("[DEBUG] d3d11_native_enumerate_images: sc=%p, xscn=%p, count=%u",
+		        (void *)sc, (void *)xscn, count);
+	}
+
 	for (uint32_t i = 0; i < count; i++) {
 		// The D3D11 native compositor stores ID3D11Texture2D* in handle
 		d3d_imgs[i].texture = (ID3D11Texture2D *)xscn->images[i].handle;
+
+		if (enum_count < 5) {
+			U_LOG_W("[DEBUG] d3d11_native_enumerate_images: image[%u].handle=%p, texture=%p",
+			        i, (void *)xscn->images[i].handle, (void *)d3d_imgs[i].texture);
+		}
+	}
+
+	if (enum_count < 5) {
+		enum_count++;
 	}
 
 	return oxr_session_success_result(sc->sess);

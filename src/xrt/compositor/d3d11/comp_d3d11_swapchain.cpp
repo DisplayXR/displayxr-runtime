@@ -376,6 +376,9 @@ comp_d3d11_swapchain_create(struct comp_d3d11_compositor *c,
 		sc->base.images[i].size = 0; // Not applicable for D3D11
 		sc->base.images[i].use_dedicated_allocation = false;
 		sc->base.images[i].is_dxgi_handle = false;
+
+		U_LOG_W("[DEBUG] Swapchain image[%u]: texture=%p, handle=%p",
+		        i, (void *)sc->images[i], (void *)sc->base.images[i].handle);
 	}
 
 	// Set up swapchain interface
@@ -388,8 +391,8 @@ comp_d3d11_swapchain_create(struct comp_d3d11_compositor *c,
 
 	*out_xsc = &sc->base.base;
 
-	U_LOG_W("[DEBUG] Created D3D11 swapchain: %ux%u, %u images, format %d (DXGI), sc=%p",
-	        info->width, info->height, image_count, (int)dxgi_format, (void *)sc);
+	U_LOG_W("[DEBUG] Created D3D11 swapchain: %ux%u, %u images, format %d (DXGI), sc=%p, base=%p",
+	        info->width, info->height, image_count, (int)dxgi_format, (void *)sc, (void *)&sc->base);
 
 	return XRT_SUCCESS;
 }
