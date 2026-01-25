@@ -328,7 +328,7 @@ jobs:
             test_apps/vulkan_cube_standalone/build/vulkan_cube_standalone.exe
             test_apps/vulkan_cube_standalone/build/shaders/*.spv
 
-  # Vulkan test app build - toggle by changing 'if: false' to 'if: true'
+  # Vulkan test app build (WITH session_target) - toggle by changing 'if: false' to 'if: true'
   VulkanTestApp:
     if: true  # <-- Change to 'false' to disable Vulkan test app build
     runs-on: windows-2022
@@ -421,3 +421,70 @@ jobs:
             test_apps/session_target_test_vulkan/build/session_target_test_vulkan.exe
             test_apps/session_target_test_vulkan/build/*.dll
             test_apps/session_target_test_vulkan/build/shaders/*.spv
+
+  # Vulkan test app WITHOUT session_target extension - Monado creates its own window
+  VulkanTestNoSessionTarget:
+    if: true  # <-- Change to 'false' to disable
+    runs-on: windows-2022
+    needs: Runtime
+
+    env:
+      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
+          submodules: recursive
+
+      - name: Download runtime artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: SRMonado
+          path: runtime
+
+      - name: Install Vulkan SDK
+        uses: humbletim/install-vulkan-sdk@v1.2
+        with:
+          version: 1.3.283.0
+          cache: true
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install OpenXR loader
+        run: |
+          $openxrVersion = "1.1.38"
+          $openxrUrl = "https://github.com/KhronosGroup/OpenXR-SDK-Source/releases/download/release-$openxrVersion/openxr_loader_windows-$openxrVersion.zip"
+          Invoke-WebRequest -Uri $openxrUrl -OutFile openxr_loader.zip
+          Expand-Archive -Path openxr_loader.zip -DestinationPath openxr_sdk -Force
+
+      - name: Build Vulkan test app (no session_target)
+        run: |
+          cd test_apps/vulkan_test_no_session_target
+          cmake -S . -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DOpenXR_ROOT="${{ github.workspace }}/openxr_sdk"
+          cmake --build build
+
+      - name: Copy required DLLs
+        run: |
+          $loaderDll = Get-ChildItem -Path openxr_sdk -Recurse -Filter "openxr_loader.dll" | Where-Object { $_.FullName -like "*x64*" } | Select-Object -First 1
+          if (-not $loaderDll) {
+            $loaderDll = Get-ChildItem -Path openxr_sdk -Recurse -Filter "openxr_loader.dll" | Select-Object -First 1
+          }
+          if ($loaderDll) {
+            Copy-Item $loaderDll.FullName -Destination test_apps/vulkan_test_no_session_target/build/
+          }
+
+      - name: Upload Vulkan test app (no session_target)
+        uses: actions/upload-artifact@v4
+        with:
+          name: VulkanTestNoSessionTarget
+          if-no-files-found: error
+          path: |
+            test_apps/vulkan_test_no_session_target/build/vulkan_test_no_session_target.exe
+            test_apps/vulkan_test_no_session_target/build/*.dll
+            test_apps/vulkan_test_no_session_target/build/shaders/*.spv
