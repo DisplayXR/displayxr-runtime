@@ -200,7 +200,12 @@ d3d11_compositor_predict_frame(struct xrt_compositor *xc,
 {
 	struct comp_d3d11_compositor *c = d3d11_comp(xc);
 
-	U_LOG_D("D3D11 compositor: predict_frame called");
+	// Debug logging for first few frames
+	static int predict_count = 0;
+	if (predict_count < 5) {
+		U_LOG_W("[DEBUG] d3d11_compositor_predict_frame called (count=%d)", predict_count);
+		predict_count++;
+	}
 
 	std::lock_guard<std::mutex> lock(c->mutex);
 
@@ -238,7 +243,13 @@ d3d11_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 {
 	struct comp_d3d11_compositor *c = d3d11_comp(xc);
 
-	U_LOG_D("D3D11 compositor: begin_frame called (frame_id=%lld)", (long long)frame_id);
+	// Debug logging for first few frames
+	static int begin_count = 0;
+	if (begin_count < 5) {
+		U_LOG_W("[DEBUG] d3d11_compositor_begin_frame called (frame_id=%lld, count=%d)",
+		        (long long)frame_id, begin_count);
+		begin_count++;
+	}
 
 	std::lock_guard<std::mutex> lock(c->mutex);
 
@@ -280,6 +291,14 @@ d3d11_compositor_layer_projection(struct xrt_compositor *xc,
                                    const struct xrt_layer_data *data)
 {
 	struct comp_d3d11_compositor *c = d3d11_comp(xc);
+
+	// Debug logging for first few layers
+	static int layer_count = 0;
+	if (layer_count < 5) {
+		U_LOG_W("[DEBUG] d3d11_compositor_layer_projection called (xsc[0]=%p, xsc[1]=%p, count=%d)",
+		        (void *)xsc[0], (void *)xsc[1], layer_count);
+		layer_count++;
+	}
 
 	std::lock_guard<std::mutex> lock(c->mutex);
 
@@ -727,8 +746,8 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 
 	*out_xc = &c->base;
 
-	U_LOG_I("D3D11 native compositor created successfully (%ux%u)", c->settings.preferred.width,
-	        c->settings.preferred.height);
+	U_LOG_IFL_I(U_LOGGING_INFO, "D3D11 native compositor created successfully (%ux%u)",
+	            c->settings.preferred.width, c->settings.preferred.height);
 
 	return XRT_SUCCESS;
 }

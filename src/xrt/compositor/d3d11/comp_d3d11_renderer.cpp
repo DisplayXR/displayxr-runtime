@@ -425,8 +425,8 @@ render_projection_layer(struct comp_d3d11_renderer *r,
 	// Debug: Log successful SRV binding on first few draws
 	static int srv_log_count = 0;
 	if (srv_log_count < 5) {
-		U_LOG_IFL_I(U_LOGGING_INFO, "render_projection_layer: Drawing view %u with image_index %u, srv=%p",
-		            view_index, image_index, (void *)srv);
+		U_LOG_W("[DEBUG] render_projection_layer: Drawing view %u with image_index %u, srv=%p",
+		        view_index, image_index, (void *)srv);
 		srv_log_count++;
 	}
 
@@ -560,8 +560,8 @@ comp_d3d11_renderer_draw(struct comp_d3d11_renderer *renderer,
 	// Debug: Log layer count on first few frames
 	static int draw_count = 0;
 	if (draw_count < 10) {
-		U_LOG_IFL_I(U_LOGGING_INFO, "comp_d3d11_renderer_draw: layer_count=%u, view_size=%ux%u",
-		            layers->layer_count, renderer->view_width, renderer->view_height);
+		U_LOG_W("[DEBUG] comp_d3d11_renderer_draw: layer_count=%u, view_size=%ux%u",
+		        layers->layer_count, renderer->view_width, renderer->view_height);
 		draw_count++;
 	}
 
