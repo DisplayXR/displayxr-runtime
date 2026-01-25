@@ -129,6 +129,12 @@ oxr_session_populate_d3d11_native(struct oxr_logger *log,
 	// Use native swapchain create that handles xrt_swapchain_native layout
 	sess->create_swapchain = oxr_swapchain_d3d11_native_create;
 
+	// D3D11 native compositor doesn't use the multi-compositor event system,
+	// so we set visibility/focus flags directly like headless mode.
+	// This enables the session state to transition from READY -> FOCUSED.
+	sess->compositor_visible = true;
+	sess->compositor_focused = true;
+
 	U_LOG_IFL_I(U_LOGGING_INFO,"Using D3D11 native compositor (bypassing Vulkan)");
 
 	return XR_SUCCESS;
