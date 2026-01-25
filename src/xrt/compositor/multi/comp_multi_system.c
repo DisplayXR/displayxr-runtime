@@ -331,18 +331,23 @@ get_session_layer_view(struct multi_layer_entry *layer,
 static void
 render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, int64_t display_time_ns)
 {
+	U_LOG_W("[per-session] render_session_to_own_target: START");
+
 	struct comp_target *ct = mc->session_render.target;
 	struct leiasr *weaver = mc->session_render.weaver;
 
 	if (ct == NULL || weaver == NULL) {
-		U_LOG_E("Per-session target or weaver not initialized");
+		U_LOG_E("[per-session] Per-session target or weaver not initialized");
 		return;
 	}
 
 	// Must have at least one layer
 	if (mc->delivered.layer_count == 0) {
+		U_LOG_W("[per-session] No layers delivered, skipping");
 		return;
 	}
+
+	U_LOG_W("[per-session] Have %u layers, extracting stereo views...", mc->delivered.layer_count);
 
 	// Get the first projection layer (for SR we only use the first stereo layer)
 	struct multi_layer_entry *layer = &mc->delivered.layers[0];
@@ -357,17 +362,22 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 	bool rightOk = get_session_layer_view(layer, 1, &imageWidth, &imageHeight, &imageFormat, &rightImageView);
 
 	if (!leftOk || !rightOk) {
-		U_LOG_W("Could not extract stereo views for per-session rendering");
+		U_LOG_W("[per-session] Could not extract stereo views for per-session rendering");
 		return;
 	}
 
+	U_LOG_W("[per-session] Got stereo views: %dx%d, left=%p, right=%p",
+	        imageWidth, imageHeight, (void *)leftImageView, (void *)rightImageView);
+
 	// Acquire the next swapchain image from the per-session target
+	U_LOG_W("[per-session] Acquiring target swapchain image...");
 	uint32_t buffer_index = 0;
 	VkResult ret = comp_target_acquire(ct, &buffer_index);
 	if (ret != VK_SUCCESS) {
-		U_LOG_E("Failed to acquire per-session target image: %s", vk_result_string(ret));
+		U_LOG_E("[per-session] Failed to acquire per-session target image: %s", vk_result_string(ret));
 		return;
 	}
+	U_LOG_W("[per-session] Acquired buffer_index=%u", buffer_index);
 
 	// Get target framebuffer info
 	uint32_t framebufferWidth = ct->width;
@@ -404,29 +414,29 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 
 	ret = vk->vkBeginCommandBuffer(cmd, &begin_info);
 	if (ret != VK_SUCCESS) {
-		U_LOG_E("Failed to begin command buffer: %s", vk_result_string(ret));
+		U_LOG_E("[per-session] Failed to begin command buffer: %s", vk_result_string(ret));
 		vk->vkFreeCommandBuffers(vk->device, mc->session_render.weaver_cmd_pool, 1, &cmd);
 		return;
 	}
-
-	// Create a temporary framebuffer for the target image
-	// Note: leiasr_weave expects a VkFramebuffer, so we need to create one
-	// For now, we'll pass VK_NULL_HANDLE and let the weaver handle it internally
-	// if it supports direct image targets, or we create a framebuffer wrapper
+	U_LOG_W("[per-session] Command buffer started");
 
 	// Perform SR weaving directly to the target
-	// The weaver should render to ct->images[buffer_index]
+	U_LOG_W("[per-session] Calling leiasr_weave: weaver=%p, cmd=%p, fb=%ux%u",
+	        (void *)weaver, (void *)cmd, framebufferWidth, framebufferHeight);
 	leiasr_weave(weaver, cmd, leftImageView, rightImageView, viewport, imageWidth, imageHeight, imageFormat,
 	             VK_NULL_HANDLE, // framebuffer - SR Runtime handles this internally
 	             (int)framebufferWidth, (int)framebufferHeight, framebufferFormat);
+	U_LOG_W("[per-session] leiasr_weave returned");
 
 	// End command buffer
+	U_LOG_W("[per-session] Ending command buffer...");
 	ret = vk->vkEndCommandBuffer(cmd);
 	if (ret != VK_SUCCESS) {
-		U_LOG_E("Failed to end command buffer: %s", vk_result_string(ret));
+		U_LOG_E("[per-session] Failed to end command buffer: %s", vk_result_string(ret));
 		vk->vkFreeCommandBuffers(vk->device, mc->session_render.weaver_cmd_pool, 1, &cmd);
 		return;
 	}
+	U_LOG_W("[per-session] Command buffer ended");
 
 	// Submit command buffer
 	VkSubmitInfo submit_info = {
@@ -435,24 +445,31 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 	    .pCommandBuffers = &cmd,
 	};
 
+	U_LOG_W("[per-session] Submitting command buffer to queue...");
 	ret = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, VK_NULL_HANDLE);
 	if (ret != VK_SUCCESS) {
-		U_LOG_E("Failed to submit per-session render: %s", vk_result_string(ret));
+		U_LOG_E("[per-session] Failed to submit per-session render: %s", vk_result_string(ret));
 		vk->vkFreeCommandBuffers(vk->device, mc->session_render.weaver_cmd_pool, 1, &cmd);
 		return;
 	}
+	U_LOG_W("[per-session] Queue submit succeeded");
 
 	// Wait for completion (simple synchronous path for now)
+	U_LOG_W("[per-session] Waiting for queue idle...");
 	vk->vkQueueWaitIdle(vk->main_queue->queue);
+	U_LOG_W("[per-session] Queue is idle");
 
 	// Free command buffer
 	vk->vkFreeCommandBuffers(vk->device, mc->session_render.weaver_cmd_pool, 1, &cmd);
+	U_LOG_W("[per-session] Command buffer freed");
 
 	// Present the image
+	U_LOG_W("[per-session] Presenting image (buffer_index=%u)...", buffer_index);
 	ret = comp_target_present(ct, vk->main_queue->queue, buffer_index, 0, display_time_ns, 0);
 	if (ret != VK_SUCCESS && ret != VK_SUBOPTIMAL_KHR) {
-		U_LOG_E("Failed to present per-session target: %s", vk_result_string(ret));
+		U_LOG_E("[per-session] Failed to present per-session target: %s", vk_result_string(ret));
 	}
+	U_LOG_W("[per-session] render_session_to_own_target: END (present result=%d)", ret);
 }
 
 /*!
@@ -467,9 +484,12 @@ render_per_session_clients_locked(struct multi_system_compositor *msc, int64_t d
 {
 	COMP_TRACE_MARKER();
 
+	U_LOG_W("[per-session] render_per_session_clients_locked: START");
+
 	struct comp_compositor *c = comp_compositor(&msc->xcn->base);
 	struct vk_bundle *vk = &c->base.vk;
 
+	int session_count = 0;
 	for (size_t k = 0; k < ARRAY_SIZE(msc->clients); k++) {
 		struct multi_compositor *mc = msc->clients[k];
 
@@ -479,16 +499,24 @@ render_per_session_clients_locked(struct multi_system_compositor *msc, int64_t d
 
 		// Skip if no active/delivered frame
 		if (!mc->delivered.active || mc->delivered.layer_count == 0) {
+			U_LOG_W("[per-session] Client %zu: skipping (no active frame)", k);
 			continue;
 		}
+
+		U_LOG_W("[per-session] Client %zu: rendering session to own target...", k);
+		session_count++;
 
 		// Render this session to its own target
 		render_session_to_own_target(mc, vk, display_time_ns);
 
+		U_LOG_W("[per-session] Client %zu: retiring delivered frame...", k);
 		// Retire the delivered frame for this session
 		int64_t now_ns = os_monotonic_get_ns();
 		multi_compositor_retire_delivered_locked(mc, now_ns);
+		U_LOG_W("[per-session] Client %zu: done", k);
 	}
+
+	U_LOG_W("[per-session] render_per_session_clients_locked: END (processed %d sessions)", session_count);
 }
 
 #endif // XRT_HAVE_LEIA_SR
@@ -970,16 +998,6 @@ system_compositor_destroy(struct xrt_system_compositor *xsc)
 	// Destroy the render thread first, destroy also stops the thread.
 	os_thread_helper_destroy(&msc->oth);
 
-#ifdef XRT_HAVE_LEIA_SR_SENSE
-	// Stop and destroy shared eye tracker (Phase 5)
-	if (msc->eye_tracker != NULL) {
-		leiasr_eye_tracker_stop(msc->eye_tracker);
-		leiasr_destroy(msc->eye_tracker);
-		msc->eye_tracker = NULL;
-		U_LOG_I("Destroyed shared eye tracker");
-	}
-#endif
-
 	u_paf_destroy(&msc->upaf);
 
 	xrt_comp_native_destroy(&msc->xcn);
@@ -1057,23 +1075,6 @@ comp_multi_create_system_compositor(struct xrt_compositor_native *xcn,
 	}
 
 	os_thread_helper_start(&msc->oth, thread_func, msc);
-
-#ifdef XRT_HAVE_LEIA_SR_SENSE
-	// Create shared eye tracker for all sessions (Phase 5)
-	// Eye tracking data is shared since one user = one pair of eyes
-	xrt_result_t eye_ret = leiasr_create_eye_tracker_only(10.0, &msc->eye_tracker);
-	if (eye_ret == XRT_SUCCESS) {
-		xrt_result_t start_ret = leiasr_eye_tracker_start(msc->eye_tracker);
-		if (start_ret == XRT_SUCCESS) {
-			U_LOG_I("Created and started shared eye tracker");
-		} else {
-			U_LOG_W("Created eye tracker but failed to start: %d", start_ret);
-		}
-	} else {
-		U_LOG_W("Failed to create shared eye tracker: %d (will use static IPD)", eye_ret);
-		msc->eye_tracker = NULL;
-	}
-#endif
 
 	*out_xsysc = &msc->base;
 
