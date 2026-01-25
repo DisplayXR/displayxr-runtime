@@ -229,6 +229,40 @@ d3d11_compositor_predict_frame(struct xrt_compositor *xc,
 }
 
 static xrt_result_t
+d3d11_compositor_wait_frame(struct xrt_compositor *xc,
+                             int64_t *out_frame_id,
+                             int64_t *out_predicted_display_time_ns,
+                             int64_t *out_predicted_display_period_ns)
+{
+	struct comp_d3d11_compositor *c = d3d11_comp(xc);
+
+	// Debug logging for first few frames
+	static int wait_count = 0;
+	if (wait_count < 5) {
+		U_LOG_W("[DEBUG] d3d11_compositor_wait_frame called (count=%d)", wait_count);
+		wait_count++;
+	}
+
+	std::lock_guard<std::mutex> lock(c->mutex);
+
+	c->frame_id++;
+
+	*out_frame_id = c->frame_id;
+
+	// Simple timing - assume 60Hz for now
+	// TODO: Query actual display refresh rate
+	int64_t now_ns = static_cast<int64_t>(os_monotonic_get_ns());
+	int64_t period_ns = U_TIME_1S_IN_NS / 60;
+
+	*out_predicted_display_time_ns = now_ns + period_ns * 2;
+	*out_predicted_display_period_ns = period_ns;
+
+	c->last_display_time_ns = static_cast<uint64_t>(*out_predicted_display_time_ns);
+
+	return XRT_SUCCESS;
+}
+
+static xrt_result_t
 d3d11_compositor_mark_frame(struct xrt_compositor *xc,
                              int64_t frame_id,
                              enum xrt_compositor_frame_point point,
@@ -727,6 +761,7 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	c->base.base.create_semaphore = d3d11_compositor_create_semaphore;
 	c->base.base.begin_session = d3d11_compositor_begin_session;
 	c->base.base.end_session = d3d11_compositor_end_session;
+	c->base.base.wait_frame = d3d11_compositor_wait_frame;
 	c->base.base.predict_frame = d3d11_compositor_predict_frame;
 	c->base.base.mark_frame = d3d11_compositor_mark_frame;
 	c->base.base.begin_frame = d3d11_compositor_begin_frame;
