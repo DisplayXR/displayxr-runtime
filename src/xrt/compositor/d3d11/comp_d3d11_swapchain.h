@@ -50,6 +50,30 @@ comp_d3d11_swapchain_create(struct comp_d3d11_compositor *c,
 void *
 comp_d3d11_swapchain_get_srv(struct xrt_swapchain *xsc, uint32_t index);
 
+/*!
+ * Get the render target view for a swapchain image.
+ *
+ * @param xsc The swapchain.
+ * @param index Image index.
+ * @return The RTV as void pointer, or NULL if not available.
+ *
+ * @ingroup comp_d3d11
+ */
+void *
+comp_d3d11_swapchain_get_rtv(struct xrt_swapchain *xsc, uint32_t index);
+
+/*!
+ * Get the D3D11 texture for a swapchain image.
+ *
+ * @param xsc The swapchain.
+ * @param index Image index.
+ * @return The texture as void pointer, or NULL if not available.
+ *
+ * @ingroup comp_d3d11
+ */
+void *
+comp_d3d11_swapchain_get_texture(struct xrt_swapchain *xsc, uint32_t index);
+
 #ifdef __cplusplus
 }
 #endif
