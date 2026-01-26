@@ -416,6 +416,8 @@ if(XRT_BUILD_DRIVER_SURVIVE)
 		survive/survive_driver.c
 		survive/survive_interface.h
 		survive/survive_internal.h
+		survive/survive_vp2.c
+		survive/survive_vp2.h
 		)
 	target_link_libraries(
 		drv_survive
@@ -425,6 +427,8 @@ if(XRT_BUILD_DRIVER_SURVIVE)
 			aux_util
 			aux_math
 			aux_vive
+			drv_includes
+			drv_vp2
 			PkgConfig::SURVIVE
 		)
 	list(APPEND ENABLED_HEADSET_DRIVERS survive)
@@ -541,7 +545,7 @@ if(XRT_BUILD_DRIVER_SIMULAVR)
 	list(APPEND ENABLED_HEADSET_DRIVERS svr)
 endif()
 
-if(XRT_BUILD_DRIVER_STEAMVR_LIGHTHOUSE)
+if(XRT_BUILD_DRIVER_STEAMVR_LIGHTHOUSE OR XRT_BUILD_DRIVER_SURVIVE)
 	add_library(drv_vp2 STATIC vp2/vp2_hid.c vp2/vp2_hid.h vp2/vp2_config.cpp vp2/vp2_config.h)
 	target_link_libraries(
 		drv_vp2

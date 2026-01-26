@@ -37,6 +37,7 @@
 #include "vive/vive_poses.h"
 
 #include "survive_internal.h"
+#include "survive_vp2.h"
 
 
 #include <math.h>
@@ -72,6 +73,7 @@ survive_device_destroy(struct xrt_device *xdev)
 	struct survive_device *survive = (struct survive_device *)xdev;
 
 	if (survive == survive->sys->hmd) {
+		survive_vp2_teardown(survive);
 		vive_config_teardown(&survive->hmd.config);
 		survive->sys->hmd = NULL;
 	}
@@ -796,6 +798,11 @@ static xrt_result_t
 compute_distortion(struct xrt_device *xdev, uint32_t view, float u, float v, struct xrt_uv_triplet *result)
 {
 	struct survive_device *d = (struct survive_device *)xdev;
+
+	if (d->hmd.vp2_hid != NULL && survive_vp2_compute_distortion(d, view, u, v, result) == XRT_SUCCESS) {
+		return XRT_SUCCESS;
+	}
+
 	u_compute_distortion_vive(&d->hmd.config.distortion.values[view], u, v, result);
 
 	if (d->hmd.config.variant == VIVE_VARIANT_PRO2) {
@@ -827,6 +834,30 @@ survive_get_compositor_info(struct xrt_device *xdev,
 	return XRT_SUCCESS;
 }
 
+xrt_result_t
+survive_device_get_brightness(struct xrt_device *xdev, float *out_brightness)
+{
+	struct survive_device *d = (struct survive_device *)xdev;
+
+	if (!d->hmd.vp2_hid) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+
+	return vp2_get_brightness(d->hmd.vp2_hid);
+}
+
+xrt_result_t
+survive_device_set_brightness(struct xrt_device *xdev, float brightness, bool relative)
+{
+	struct survive_device *d = (struct survive_device *)xdev;
+
+	if (!d->hmd.vp2_hid) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+
+	return survive_vp2_set_brightness(d, brightness, relative);
+}
+
 static bool
 _create_hmd_device(struct survive_system *sys, const struct SurviveSimpleObject *sso, char *conf_str)
 {
@@ -853,6 +884,10 @@ _create_hmd_device(struct survive_system *sys, const struct SurviveSimpleObject 
 	survive->base.get_tracked_pose = survive_device_get_tracked_pose;
 	survive->base.get_view_poses = survive_device_get_view_poses;
 	survive->base.tracking_origin = &sys->base;
+
+	if (survive->hmd.config.variant == VIVE_VARIANT_PRO2 && !survive_vp2_init(survive, sys)) {
+		SURVIVE_ERROR(survive, "Failed to initialize Valve Pro 2 specific features. Some things may not work.");
+	}
 
 	SURVIVE_INFO(survive, "survive HMD present");
 	m_relation_history_create(&survive->relation_hist);
@@ -905,6 +940,10 @@ _create_hmd_device(struct survive_system *sys, const struct SurviveSimpleObject 
 	survive->base.hmd->distortion.fov[0] = survive->hmd.config.distortion.fov[0];
 	survive->base.hmd->distortion.fov[1] = survive->hmd.config.distortion.fov[1];
 
+	if (survive->hmd.vp2_hid != NULL) {
+		survive_vp2_setup_hmd(survive);
+	}
+
 	survive->hmd.ipd_override_mm = debug_get_float_option_survive_override_ipd();
 
 	// Distortion params.
@@ -913,6 +952,8 @@ _create_hmd_device(struct survive_system *sys, const struct SurviveSimpleObject 
 	survive->base.compute_distortion = compute_distortion;
 	survive->base.get_battery_status = survive_device_get_battery_status;
 	survive->base.get_compositor_info = survive_get_compositor_info;
+	survive->base.set_brightness = survive_device_set_brightness;
+	survive->base.get_brightness = survive_device_get_brightness;
 
 	survive->base.supported.orientation_tracking = true;
 	survive->base.supported.position_tracking = true;

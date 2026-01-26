@@ -20,6 +20,9 @@
 
 #include "os/os_threading.h"
 
+#include "vp2/vp2_config.h"
+#include "vp2/vp2_hid.h"
+
 #include "survive_interface.h"
 #include "survive_api.h"
 
@@ -108,6 +111,8 @@ struct survive_device
 			bool use_default_ipd;
 
 			struct vive_config config;
+
+			struct vp2_hid *vp2_hid;
 		} hmd;
 
 		struct
