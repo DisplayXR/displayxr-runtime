@@ -289,6 +289,24 @@ swapchain_release_image(struct xrt_swapchain *xsc, uint32_t index)
 	return XRT_SUCCESS;
 }
 
+static xrt_result_t
+swapchain_barrier_image(struct xrt_swapchain *xsc, enum xrt_barrier_direction direction, uint32_t index)
+{
+	struct d3d11_service_swapchain *sc = d3d11_service_swapchain(xsc);
+
+	if (index >= sc->image_count) {
+		return XRT_ERROR_NO_IMAGE_AVAILABLE;
+	}
+
+	// D3D11 service compositor: KeyedMutex handles synchronization
+	// No additional barrier needed since AcquireSync/ReleaseSync on
+	// the KeyedMutex already provides the necessary synchronization
+	// between client and service processes.
+	(void)direction;
+
+	return XRT_SUCCESS;
+}
+
 
 /*
  *
@@ -340,6 +358,7 @@ compositor_import_swapchain(struct xrt_compositor *xc,
 	sc->base.inc_image_use = swapchain_inc_image_use;
 	sc->base.dec_image_use = swapchain_dec_image_use;
 	sc->base.wait_image = swapchain_wait_image;
+	sc->base.barrier_image = swapchain_barrier_image;
 	sc->base.release_image = swapchain_release_image;
 	sc->base.reference.count = 1;
 
@@ -347,9 +366,18 @@ compositor_import_swapchain(struct xrt_compositor *xc,
 	sc->image_count = image_count;
 	sc->info = *info;
 
+	U_LOG_D("Importing swapchain: %u images, %ux%u, format=%u, usage=0x%x",
+	        image_count, info->width, info->height, info->format, info->bits);
+
 	// Import each image from the client
 	for (uint32_t i = 0; i < image_count; i++) {
 		HANDLE handle = native_images[i].handle;
+
+		if (handle == nullptr || handle == INVALID_HANDLE_VALUE) {
+			U_LOG_E("Invalid handle for image [%u]: %p", i, handle);
+			swapchain_destroy(&sc->base);
+			return XRT_ERROR_SWAPCHAIN_FLAG_VALID_BUT_UNSUPPORTED;
+		}
 
 		// Check for DXGI handle encoding (bit 0 set)
 		bool is_dxgi = native_images[i].is_dxgi_handle;
@@ -358,18 +386,29 @@ compositor_import_swapchain(struct xrt_compositor *xc,
 			is_dxgi = true;
 		}
 
+		U_LOG_D("Image [%u]: handle=%p, is_dxgi=%d", i, handle, is_dxgi);
+
 		// Open shared resource
 		HRESULT hr;
 		if (is_dxgi) {
 			// DXGI shared handle (can work cross-process with AppContainer)
 			hr = sys->device->OpenSharedResource1(handle, IID_PPV_ARGS(sc->images[i].texture.put()));
+			if (FAILED(hr)) {
+				U_LOG_E("OpenSharedResource1 failed for image [%u]: 0x%08lx (handle=%p)",
+				        i, hr, handle);
+			}
 		} else {
 			// Legacy NT handle
 			hr = sys->device->OpenSharedResource(handle, IID_PPV_ARGS(sc->images[i].texture.put()));
+			if (FAILED(hr)) {
+				U_LOG_E("OpenSharedResource failed for image [%u]: 0x%08lx (handle=%p)",
+				        i, hr, handle);
+			}
 		}
 
 		if (FAILED(hr)) {
-			U_LOG_E("Failed to open shared resource [%u]: 0x%08lx", i, hr);
+			// Log additional diagnostic information
+			U_LOG_E("  Swapchain info: %ux%u, format=%u", info->width, info->height, info->format);
 			swapchain_destroy(&sc->base);
 			return XRT_ERROR_SWAPCHAIN_FLAG_VALID_BUT_UNSUPPORTED;
 		}
@@ -640,17 +679,123 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 
 	std::lock_guard<std::mutex> lock(c->mutex);
 
-	// TODO: Implement actual rendering:
-	// 1. Compose layers into stereo texture
-	// 2. Weave for light field display (if available)
-	// 3. Present to display
-
-	// For now, just clear and present to show something is happening
-	if (sys->back_buffer_rtv) {
-		float clear_color[4] = {0.1f, 0.1f, 0.2f, 1.0f};
-		sys->context->ClearRenderTargetView(sys->back_buffer_rtv.get(), clear_color);
+	// Clear stereo render target
+	if (sys->stereo_rtv) {
+		float clear_color[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+		sys->context->ClearRenderTargetView(sys->stereo_rtv.get(), clear_color);
 	}
 
+	// Render projection layers to stereo texture
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		struct comp_layer *layer = &c->layer_accum.layers[i];
+
+		if (layer->data.type != XRT_LAYER_PROJECTION &&
+		    layer->data.type != XRT_LAYER_PROJECTION_DEPTH) {
+			continue;
+		}
+
+		// Get left and right swapchains
+		struct xrt_swapchain *xsc_left = layer->sc_array[0];
+		struct xrt_swapchain *xsc_right = layer->sc_array[1];
+
+		if (xsc_left == nullptr || xsc_right == nullptr) {
+			U_LOG_W("Projection layer missing swapchain");
+			continue;
+		}
+
+		struct d3d11_service_swapchain *sc_left = d3d11_service_swapchain(xsc_left);
+		struct d3d11_service_swapchain *sc_right = d3d11_service_swapchain(xsc_right);
+
+		// Get image indices from layer data
+		uint32_t left_index = layer->data.proj.v[0].sub.image_index;
+		uint32_t right_index = layer->data.proj.v[1].sub.image_index;
+
+		if (left_index >= sc_left->image_count || right_index >= sc_right->image_count) {
+			U_LOG_W("Invalid image index in projection layer");
+			continue;
+		}
+
+		ID3D11Texture2D *left_tex = sc_left->images[left_index].texture.get();
+		ID3D11Texture2D *right_tex = sc_right->images[right_index].texture.get();
+
+		if (left_tex == nullptr || right_tex == nullptr) {
+			U_LOG_W("Missing texture in projection layer");
+			continue;
+		}
+
+		// Copy left view to left half of stereo texture
+		D3D11_BOX left_box = {};
+		left_box.left = layer->data.proj.v[0].sub.rect.offset.x;
+		left_box.top = layer->data.proj.v[0].sub.rect.offset.y;
+		left_box.right = left_box.left + layer->data.proj.v[0].sub.rect.extent.w;
+		left_box.bottom = left_box.top + layer->data.proj.v[0].sub.rect.extent.h;
+		left_box.front = 0;
+		left_box.back = 1;
+
+		sys->context->CopySubresourceRegion(
+		    sys->stereo_texture.get(),
+		    0,             // dst subresource
+		    0, 0, 0,       // dst x, y, z (left half)
+		    left_tex,
+		    layer->data.proj.v[0].sub.array_index,  // src subresource
+		    &left_box);
+
+		// Copy right view to right half of stereo texture
+		D3D11_BOX right_box = {};
+		right_box.left = layer->data.proj.v[1].sub.rect.offset.x;
+		right_box.top = layer->data.proj.v[1].sub.rect.offset.y;
+		right_box.right = right_box.left + layer->data.proj.v[1].sub.rect.extent.w;
+		right_box.bottom = right_box.top + layer->data.proj.v[1].sub.rect.extent.h;
+		right_box.front = 0;
+		right_box.back = 1;
+
+		sys->context->CopySubresourceRegion(
+		    sys->stereo_texture.get(),
+		    0,                            // dst subresource
+		    sys->view_width, 0, 0,        // dst x, y, z (right half)
+		    right_tex,
+		    layer->data.proj.v[1].sub.array_index,  // src subresource
+		    &right_box);
+
+		U_LOG_T("Rendered projection layer %u", i);
+	}
+
+#ifdef XRT_HAVE_LEIA_SR
+	// Weave stereo texture through SR weaver for light field display
+	if (sys->weaver != nullptr && sys->stereo_srv) {
+		// Set input stereo texture
+		leiasr_d3d11_set_input_texture(
+		    sys->weaver,
+		    sys->stereo_srv.get(),
+		    sys->view_width,
+		    sys->view_height,
+		    DXGI_FORMAT_R8G8B8A8_UNORM);
+
+		// Bind back buffer as output
+		ID3D11RenderTargetView *rtvs[] = {sys->back_buffer_rtv.get()};
+		sys->context->OMSetRenderTargets(1, rtvs, nullptr);
+
+		// Set viewport
+		D3D11_VIEWPORT viewport = {};
+		viewport.Width = static_cast<float>(sys->display_width);
+		viewport.Height = static_cast<float>(sys->display_height);
+		viewport.MaxDepth = 1.0f;
+		sys->context->RSSetViewports(1, &viewport);
+
+		// Perform weaving
+		leiasr_d3d11_weave(sys->weaver);
+	} else
+#endif
+	{
+		// No weaver - copy stereo texture to back buffer directly
+		if (sys->stereo_texture && sys->back_buffer_rtv) {
+			wil::com_ptr<ID3D11Resource> back_buffer;
+			sys->back_buffer_rtv->GetResource(back_buffer.put());
+			sys->context->CopyResource(back_buffer.get(), sys->stereo_texture.get());
+		}
+	}
+
+	// Present to display
 	if (sys->swap_chain) {
 		sys->swap_chain->Present(1, 0);  // VSync
 	}
@@ -945,6 +1090,42 @@ comp_d3d11_service_create_system(struct xrt_device *xdev,
 	wil::com_ptr<ID3D11Texture2D> back_buffer;
 	sys->swap_chain->GetBuffer(0, IID_PPV_ARGS(back_buffer.put()));
 	sys->device->CreateRenderTargetView(back_buffer.get(), nullptr, sys->back_buffer_rtv.put());
+
+	// Create stereo render target texture (side-by-side views)
+	D3D11_TEXTURE2D_DESC stereo_desc = {};
+	stereo_desc.Width = sys->display_width;
+	stereo_desc.Height = sys->display_height;
+	stereo_desc.MipLevels = 1;
+	stereo_desc.ArraySize = 1;
+	stereo_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	stereo_desc.SampleDesc.Count = 1;
+	stereo_desc.Usage = D3D11_USAGE_DEFAULT;
+	stereo_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+
+	hr = sys->device->CreateTexture2D(&stereo_desc, nullptr, sys->stereo_texture.put());
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to create stereo texture: 0x%08lx", hr);
+		system_destroy(&sys->base);
+		return XRT_ERROR_VULKAN;
+	}
+
+	// Create SRV for stereo texture
+	hr = sys->device->CreateShaderResourceView(sys->stereo_texture.get(), nullptr, sys->stereo_srv.put());
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to create stereo SRV: 0x%08lx", hr);
+		system_destroy(&sys->base);
+		return XRT_ERROR_VULKAN;
+	}
+
+	// Create RTV for stereo texture
+	hr = sys->device->CreateRenderTargetView(sys->stereo_texture.get(), nullptr, sys->stereo_rtv.put());
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to create stereo RTV: 0x%08lx", hr);
+		system_destroy(&sys->base);
+		return XRT_ERROR_VULKAN;
+	}
+
+	U_LOG_I("Created stereo render target (%ux%u)", sys->display_width, sys->display_height);
 
 #ifdef XRT_HAVE_LEIA_SR
 	// Create SR weaver
