@@ -169,30 +169,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return 1;
     }
 
-    // Initialize D3D11
-    LOG_INFO("Initializing D3D11...");
-    D3D11Renderer renderer = {};
-    if (!InitializeD3D11(renderer)) {
-        LOG_ERROR("D3D11 initialization failed");
-        MessageBox(hwnd, L"Failed to initialize D3D11", L"Error", MB_OK | MB_ICONERROR);
-        ShutdownLogging();
-        return 1;
-    }
-    LOG_INFO("D3D11 initialized successfully");
-
-    // Initialize text overlay
-    LOG_INFO("Initializing text overlay...");
-    TextOverlay textOverlay = {};
-    if (!InitializeTextOverlay(textOverlay)) {
-        LOG_ERROR("Text overlay initialization failed");
-        MessageBox(hwnd, L"Failed to initialize text overlay", L"Error", MB_OK | MB_ICONERROR);
-        CleanupD3D11(renderer);
-        ShutdownLogging();
-        return 1;
-    }
-    LOG_INFO("Text overlay initialized successfully");
-
     // WORKAROUND: Add SRMonado directory to DLL search path
+    // Must do this BEFORE loading OpenXR runtime
     {
         HKEY hKey;
         char installPath[MAX_PATH] = {0};
@@ -206,28 +184,63 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         }
     }
 
-    // Initialize OpenXR (D3D11 only, NO session_target)
+    // IMPORTANT: Initialize OpenXR FIRST to get the required GPU adapter LUID
+    // Then create D3D11 device on that specific adapter
     LOG_INFO("Initializing OpenXR instance (D3D11 only, NO session_target)...");
     XrSessionManager xr = {};
     if (!InitializeOpenXR(xr)) {
         LOG_ERROR("OpenXR initialization failed");
         MessageBox(hwnd, L"Failed to initialize OpenXR", L"Error", MB_OK | MB_ICONERROR);
-        CleanupTextOverlay(textOverlay);
-        CleanupD3D11(renderer);
         ShutdownLogging();
         return 1;
     }
     LOG_INFO("OpenXR instance initialized successfully");
 
-    // Create OpenXR session with D3D11 device only - NO window handle
+    // Get the required GPU adapter LUID from OpenXR
+    // The D3D11 device MUST be created on this specific adapter
+    LUID adapterLuid;
+    if (!GetD3D11GraphicsRequirements(xr, &adapterLuid)) {
+        LOG_ERROR("Failed to get D3D11 graphics requirements");
+        MessageBox(hwnd, L"Failed to get D3D11 graphics requirements", L"Error", MB_OK | MB_ICONERROR);
+        CleanupOpenXR(xr);
+        ShutdownLogging();
+        return 1;
+    }
+
+    // Initialize D3D11 on the CORRECT adapter (specified by OpenXR)
+    LOG_INFO("Initializing D3D11 on OpenXR-specified adapter...");
+    D3D11Renderer renderer = {};
+    if (!InitializeD3D11WithLUID(renderer, adapterLuid)) {
+        LOG_ERROR("D3D11 initialization failed");
+        MessageBox(hwnd, L"Failed to initialize D3D11", L"Error", MB_OK | MB_ICONERROR);
+        CleanupOpenXR(xr);
+        ShutdownLogging();
+        return 1;
+    }
+    LOG_INFO("D3D11 initialized successfully on correct adapter");
+
+    // Initialize text overlay (needs D3D11 device)
+    LOG_INFO("Initializing text overlay...");
+    TextOverlay textOverlay = {};
+    if (!InitializeTextOverlay(textOverlay)) {
+        LOG_ERROR("Text overlay initialization failed");
+        MessageBox(hwnd, L"Failed to initialize text overlay", L"Error", MB_OK | MB_ICONERROR);
+        CleanupD3D11(renderer);
+        CleanupOpenXR(xr);
+        ShutdownLogging();
+        return 1;
+    }
+    LOG_INFO("Text overlay initialized successfully");
+
+    // Create OpenXR session with D3D11 device - NO window handle
     // OpenXR/Monado will create its own window
     LOG_INFO("Creating OpenXR session WITHOUT XR_EXT_session_target (Monado creates window)...");
     if (!CreateSession(xr, renderer.device.Get())) {
         LOG_ERROR("OpenXR session creation failed");
         MessageBox(hwnd, L"Failed to create OpenXR session", L"Error", MB_OK | MB_ICONERROR);
-        CleanupOpenXR(xr);
         CleanupTextOverlay(textOverlay);
         CleanupD3D11(renderer);
+        CleanupOpenXR(xr);
         ShutdownLogging();
         return 1;
     }

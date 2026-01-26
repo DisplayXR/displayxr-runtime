@@ -67,7 +67,12 @@ struct XrSessionManager {
 // Initialize OpenXR instance (D3D11 only, no session_target extension)
 bool InitializeOpenXR(XrSessionManager& xr);
 
+// Get the D3D11 graphics requirements (call AFTER InitializeOpenXR, BEFORE CreateSession)
+// Returns the adapter LUID that the D3D11 device must be created on
+bool GetD3D11GraphicsRequirements(XrSessionManager& xr, LUID* outAdapterLuid);
+
 // Create session with D3D11 device only (no window handle - Monado creates window)
+// The device MUST be created on the adapter specified by GetD3D11GraphicsRequirements
 bool CreateSession(XrSessionManager& xr, ID3D11Device* d3d11Device);
 
 // Create reference spaces

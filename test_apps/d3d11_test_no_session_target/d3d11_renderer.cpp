@@ -8,6 +8,7 @@
 #include "d3d11_renderer.h"
 #include "logging.h"
 #include <d3dcompiler.h>
+#include <dxgi1_4.h>
 #include <cmath>
 #include <vector>
 
@@ -172,6 +173,106 @@ bool InitializeD3D11(D3D11Renderer& renderer) {
     bool result = CreateResources(renderer);
     if (result) {
         LOG_INFO("D3D11 initialization complete");
+    } else {
+        LOG_ERROR("Failed to create D3D11 resources");
+    }
+    return result;
+}
+
+bool InitializeD3D11WithLUID(D3D11Renderer& renderer, LUID adapterLuid) {
+    LOG_INFO("Initializing D3D11 with specific adapter LUID: 0x%08X%08X",
+             adapterLuid.HighPart, adapterLuid.LowPart);
+
+    // Create DXGI factory
+    LOG_INFO("Creating DXGI factory...");
+    ComPtr<IDXGIFactory4> factory4;
+    HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory4));
+    if (FAILED(hr)) {
+        LogHResult("CreateDXGIFactory1", hr);
+        return false;
+    }
+
+    // Also get IDXGIFactory2 for renderer
+    hr = factory4.As(&renderer.dxgiFactory);
+    if (FAILED(hr)) {
+        LogHResult("QueryInterface IDXGIFactory2", hr);
+        return false;
+    }
+    LOG_INFO("DXGI factory created: 0x%p", renderer.dxgiFactory.Get());
+
+    // Find adapter by LUID
+    LOG_INFO("Searching for adapter with LUID 0x%08X%08X...",
+             adapterLuid.HighPart, adapterLuid.LowPart);
+    ComPtr<IDXGIAdapter1> adapter;
+    hr = factory4->EnumAdapterByLuid(adapterLuid, IID_PPV_ARGS(&adapter));
+    if (FAILED(hr)) {
+        LOG_ERROR("Failed to find adapter with specified LUID");
+        LogHResult("EnumAdapterByLuid", hr);
+        return false;
+    }
+
+    // Log adapter info
+    DXGI_ADAPTER_DESC1 adapterDesc;
+    adapter->GetDesc1(&adapterDesc);
+    char adapterName[256];
+    WideCharToMultiByte(CP_UTF8, 0, adapterDesc.Description, -1, adapterName, sizeof(adapterName), nullptr, nullptr);
+    LOG_INFO("Found adapter: %s", adapterName);
+    LOG_INFO("  Vendor ID: 0x%04X, Device ID: 0x%04X", adapterDesc.VendorId, adapterDesc.DeviceId);
+    LOG_INFO("  LUID: 0x%08X%08X", adapterDesc.AdapterLuid.HighPart, adapterDesc.AdapterLuid.LowPart);
+
+    // Create D3D11 device on this specific adapter
+    LOG_INFO("Creating D3D11 device on adapter...");
+    D3D_FEATURE_LEVEL featureLevels[] = {
+        D3D_FEATURE_LEVEL_11_1,
+        D3D_FEATURE_LEVEL_11_0,
+    };
+
+    UINT createFlags = 0;
+#ifdef _DEBUG
+    createFlags |= D3D11_CREATE_DEVICE_DEBUG;
+    LOG_INFO("Debug layer enabled");
+#endif
+
+    hr = D3D11CreateDevice(
+        adapter.Get(),  // Use specific adapter
+        D3D_DRIVER_TYPE_UNKNOWN,  // Must use UNKNOWN when specifying adapter
+        nullptr,
+        createFlags,
+        featureLevels,
+        ARRAYSIZE(featureLevels),
+        D3D11_SDK_VERSION,
+        &renderer.device,
+        nullptr,
+        &renderer.context
+    );
+
+    if (FAILED(hr)) {
+        LOG_WARN("D3D11 device creation failed (might be debug layer), retrying without debug...");
+        // Try without debug layer
+        hr = D3D11CreateDevice(
+            adapter.Get(),
+            D3D_DRIVER_TYPE_UNKNOWN,
+            nullptr,
+            0,
+            featureLevels,
+            ARRAYSIZE(featureLevels),
+            D3D11_SDK_VERSION,
+            &renderer.device,
+            nullptr,
+            &renderer.context
+        );
+        if (FAILED(hr)) {
+            LogHResult("D3D11CreateDevice", hr);
+            return false;
+        }
+    }
+    LOG_INFO("D3D11 device created: 0x%p", renderer.device.Get());
+    LOG_INFO("D3D11 context created: 0x%p", renderer.context.Get());
+
+    LOG_INFO("Creating D3D11 resources...");
+    bool result = CreateResources(renderer);
+    if (result) {
+        LOG_INFO("D3D11 initialization complete (using adapter: %s)", adapterName);
     } else {
         LOG_ERROR("Failed to create D3D11 resources");
     }
