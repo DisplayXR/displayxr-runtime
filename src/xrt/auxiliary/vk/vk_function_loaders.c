@@ -193,6 +193,7 @@ vk_get_device_functions(struct vk_bundle *vk)
 	vk->vkResetCommandPool                          = GET_DEV_PROC(vk, vkResetCommandPool);
 
 	vk->vkAllocateCommandBuffers                    = GET_DEV_PROC(vk, vkAllocateCommandBuffers);
+	vk->vkResetCommandBuffer                        = GET_DEV_PROC(vk, vkResetCommandBuffer);
 	vk->vkBeginCommandBuffer                        = GET_DEV_PROC(vk, vkBeginCommandBuffer);
 	vk->vkCmdBeginQuery                             = GET_DEV_PROC(vk, vkCmdBeginQuery);
 	vk->vkCmdCopyQueryPoolResults                   = GET_DEV_PROC(vk, vkCmdCopyQueryPoolResults);

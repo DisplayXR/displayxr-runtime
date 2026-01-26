@@ -357,6 +357,7 @@ struct vk_bundle
 	PFN_vkResetCommandPool vkResetCommandPool;
 
 	PFN_vkAllocateCommandBuffers vkAllocateCommandBuffers;
+	PFN_vkResetCommandBuffer vkResetCommandBuffer;
 	PFN_vkBeginCommandBuffer vkBeginCommandBuffer;
 	PFN_vkCmdBeginQuery vkCmdBeginQuery;
 	PFN_vkCmdCopyQueryPoolResults vkCmdCopyQueryPoolResults;
