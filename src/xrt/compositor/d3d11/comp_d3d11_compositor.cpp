@@ -51,10 +51,10 @@ struct comp_d3d11_compositor
 	struct xrt_device *xdev;
 
 	//! D3D11 device (from app's graphics binding, we add a reference).
-	ID3D11Device5 *device;
+	ID3D11Device *device;
 
 	//! D3D11 immediate context.
-	ID3D11DeviceContext4 *context;
+	ID3D11DeviceContext *context;
 
 	//! DXGI factory for swapchain creation.
 	IDXGIFactory4 *dxgi_factory;
@@ -90,6 +90,9 @@ struct comp_d3d11_compositor
 
 	//! Current frame ID.
 	int64_t frame_id;
+
+	//! Display refresh rate in Hz.
+	float display_refresh_rate;
 
 	//! Time of the last predicted display time.
 	uint64_t last_display_time_ns;
@@ -213,10 +216,9 @@ d3d11_compositor_predict_frame(struct xrt_compositor *xc,
 
 	*out_frame_id = c->frame_id;
 
-	// Simple timing - assume 60Hz for now
-	// TODO: Query actual display refresh rate
+	// Use queried display refresh rate
 	int64_t now_ns = static_cast<int64_t>(os_monotonic_get_ns());
-	int64_t period_ns = U_TIME_1S_IN_NS / 60;
+	int64_t period_ns = static_cast<int64_t>(U_TIME_1S_IN_NS / c->display_refresh_rate);
 
 	*out_predicted_display_time_ns = now_ns + period_ns * 2;
 	*out_predicted_display_period_ns = period_ns;
@@ -249,10 +251,9 @@ d3d11_compositor_wait_frame(struct xrt_compositor *xc,
 
 	*out_frame_id = c->frame_id;
 
-	// Simple timing - assume 60Hz for now
-	// TODO: Query actual display refresh rate
+	// Use queried display refresh rate
 	int64_t now_ns = static_cast<int64_t>(os_monotonic_get_ns());
-	int64_t period_ns = U_TIME_1S_IN_NS / 60;
+	int64_t period_ns = static_cast<int64_t>(U_TIME_1S_IN_NS / c->display_refresh_rate);
 
 	*out_predicted_display_time_ns = now_ns + period_ns * 2;
 	*out_predicted_display_period_ns = period_ns;
@@ -286,6 +287,36 @@ d3d11_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 	}
 
 	std::lock_guard<std::mutex> lock(c->mutex);
+
+	// Check for window resize and handle it
+	if (c->hwnd != nullptr) {
+		RECT rect;
+		if (GetClientRect(c->hwnd, &rect)) {
+			uint32_t new_width = static_cast<uint32_t>(rect.right - rect.left);
+			uint32_t new_height = static_cast<uint32_t>(rect.bottom - rect.top);
+
+			// Only resize if dimensions actually changed and are valid
+			if (new_width > 0 && new_height > 0) {
+				uint32_t current_width, current_height;
+				comp_d3d11_target_get_dimensions(c->target, &current_width, &current_height);
+
+				if (new_width != current_width || new_height != current_height) {
+					U_LOG_I("Window resized: %ux%u -> %ux%u",
+					        current_width, current_height, new_width, new_height);
+
+					xrt_result_t xret = comp_d3d11_target_resize(c->target, new_width, new_height);
+					if (xret != XRT_SUCCESS) {
+						U_LOG_E("Failed to resize target");
+						// Continue anyway, rendering will just be wrong size
+					} else {
+						// Update settings to reflect new size
+						c->settings.preferred.width = new_width;
+						c->settings.preferred.height = new_height;
+					}
+				}
+			}
+		}
+	}
 
 	// Reset layer accumulator for this frame
 	c->layer_accum.layer_count = 0;
@@ -685,28 +716,16 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 		U_LOG_I("Created self-owned window: %p", (void *)c->hwnd);
 	}
 
-	// Get D3D11.5 device interface
-	ID3D11Device *device = static_cast<ID3D11Device *>(d3d11_device);
-	HRESULT hr = device->QueryInterface(__uuidof(ID3D11Device5), reinterpret_cast<void **>(&c->device));
-	if (FAILED(hr)) {
-		// Fall back to base device
-		c->device = reinterpret_cast<ID3D11Device5 *>(device);
-		device->AddRef();
-	}
+	// Get D3D11 device - just use the base interface, we don't need Device5 features
+	c->device = static_cast<ID3D11Device *>(d3d11_device);
+	c->device->AddRef();
 
 	// Get immediate context
-	ID3D11DeviceContext *context;
-	c->device->GetImmediateContext(&context);
-	hr = context->QueryInterface(__uuidof(ID3D11DeviceContext4), reinterpret_cast<void **>(&c->context));
-	if (FAILED(hr)) {
-		c->context = reinterpret_cast<ID3D11DeviceContext4 *>(context);
-		context->AddRef();
-	}
-	context->Release();
+	c->device->GetImmediateContext(&c->context);
 
 	// Get DXGI factory
 	IDXGIDevice *dxgi_device;
-	hr = c->device->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void **>(&dxgi_device));
+	HRESULT hr = c->device->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void **>(&dxgi_device));
 	if (SUCCEEDED(hr)) {
 		IDXGIAdapter *adapter;
 		dxgi_device->GetAdapter(&adapter);
@@ -750,6 +769,50 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 		d3d11_compositor_destroy(&c->base.base);
 		return xret;
 	}
+
+	// Query display refresh rate from DXGI output
+	c->display_refresh_rate = 60.0f; // Default to 60Hz
+	IDXGIDevice *refresh_dxgi_device = nullptr;
+	hr = c->device->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void **>(&refresh_dxgi_device));
+	if (SUCCEEDED(hr) && refresh_dxgi_device != nullptr) {
+		IDXGIAdapter *refresh_adapter = nullptr;
+		refresh_dxgi_device->GetAdapter(&refresh_adapter);
+		if (refresh_adapter != nullptr) {
+			IDXGIOutput *output = nullptr;
+			// Try to get the output containing the window
+			if (SUCCEEDED(refresh_adapter->EnumOutputs(0, &output)) && output != nullptr) {
+				DXGI_OUTPUT_DESC outputDesc;
+				if (SUCCEEDED(output->GetDesc(&outputDesc))) {
+					// Query the display mode list for the output
+					UINT numModes = 0;
+					output->GetDisplayModeList(DXGI_FORMAT_R8G8B8A8_UNORM, 0, &numModes, nullptr);
+					if (numModes > 0) {
+						DXGI_MODE_DESC *modes = new DXGI_MODE_DESC[numModes];
+						if (SUCCEEDED(output->GetDisplayModeList(DXGI_FORMAT_R8G8B8A8_UNORM, 0,
+						                                          &numModes, modes))) {
+							// Find the highest refresh rate mode that matches our resolution
+							float best_rate = 0.0f;
+							for (UINT m = 0; m < numModes; m++) {
+								float rate = static_cast<float>(modes[m].RefreshRate.Numerator) /
+								             static_cast<float>(modes[m].RefreshRate.Denominator);
+								if (rate > best_rate) {
+									best_rate = rate;
+								}
+							}
+							if (best_rate > 0.0f) {
+								c->display_refresh_rate = best_rate;
+							}
+						}
+						delete[] modes;
+					}
+				}
+				output->Release();
+			}
+			refresh_adapter->Release();
+		}
+		refresh_dxgi_device->Release();
+	}
+	U_LOG_I("Display refresh rate: %.2f Hz", c->display_refresh_rate);
 
 	// Create renderer
 	// View size is half of target width for side-by-side stereo

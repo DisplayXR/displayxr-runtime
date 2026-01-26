@@ -51,8 +51,8 @@ struct comp_d3d11_compositor_internals
 {
 	struct xrt_compositor_native base;
 	struct xrt_device *xdev;
-	ID3D11Device5 *device;
-	ID3D11DeviceContext4 *context;
+	ID3D11Device *device;
+	ID3D11DeviceContext *context;
 	IDXGIFactory4 *dxgi_factory;
 };
 }

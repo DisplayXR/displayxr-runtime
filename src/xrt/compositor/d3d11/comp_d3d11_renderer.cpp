@@ -97,8 +97,8 @@ struct comp_d3d11_compositor_internals
 {
 	struct xrt_compositor_native base;
 	struct xrt_device *xdev;
-	ID3D11Device5 *device;
-	ID3D11DeviceContext4 *context;
+	ID3D11Device *device;
+	ID3D11DeviceContext *context;
 	IDXGIFactory4 *dxgi_factory;
 };
 }
@@ -607,17 +607,42 @@ comp_d3d11_renderer_draw(struct comp_d3d11_renderer *renderer,
 				render_projection_layer(renderer, layer, view_index, eye);
 				break;
 
-			case XRT_LAYER_QUAD:
-				// TODO: Implement quad layer rendering
+			case XRT_LAYER_QUAD: {
+				static bool quad_warned = false;
+				if (!quad_warned) {
+					U_LOG_W("Quad layers not yet implemented in D3D11 compositor");
+					quad_warned = true;
+				}
 				break;
+			}
 
-			case XRT_LAYER_CYLINDER:
-				// TODO: Implement cylinder layer rendering
+			case XRT_LAYER_CYLINDER: {
+				static bool cylinder_warned = false;
+				if (!cylinder_warned) {
+					U_LOG_W("Cylinder layers not yet implemented in D3D11 compositor");
+					cylinder_warned = true;
+				}
 				break;
+			}
 
-			case XRT_LAYER_EQUIRECT2:
-				// TODO: Implement equirect2 layer rendering
+			case XRT_LAYER_EQUIRECT1:
+			case XRT_LAYER_EQUIRECT2: {
+				static bool equirect_warned = false;
+				if (!equirect_warned) {
+					U_LOG_W("Equirect layers not yet implemented in D3D11 compositor");
+					equirect_warned = true;
+				}
 				break;
+			}
+
+			case XRT_LAYER_CUBE: {
+				static bool cube_warned = false;
+				if (!cube_warned) {
+					U_LOG_W("Cube layers not yet implemented in D3D11 compositor");
+					cube_warned = true;
+				}
+				break;
+			}
 
 			default:
 				// Unsupported layer type

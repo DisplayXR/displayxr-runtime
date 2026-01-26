@@ -69,8 +69,8 @@ struct comp_d3d11_compositor_internals
 {
 	struct xrt_compositor_native base;
 	struct xrt_device *xdev;
-	ID3D11Device5 *device;
-	ID3D11DeviceContext4 *context;
+	ID3D11Device *device;
+	ID3D11DeviceContext *context;
 	IDXGIFactory4 *dxgi_factory;
 };
 }
@@ -322,6 +322,37 @@ comp_d3d11_swapchain_create(struct comp_d3d11_compositor *c,
 		bind_flags |= D3D11_BIND_SHADER_RESOURCE;
 	}
 
+	// For depth formats that need both DSV and SRV, use typeless format for texture creation
+	// This allows creating views with different typed formats
+	DXGI_FORMAT texture_format = dxgi_format;
+	DXGI_FORMAT dsv_format = dxgi_format;
+	DXGI_FORMAT srv_format = dxgi_format;
+	bool is_depth = false;
+
+	if (bind_flags & D3D11_BIND_DEPTH_STENCIL) {
+		is_depth = true;
+		switch (dxgi_format) {
+		case DXGI_FORMAT_D24_UNORM_S8_UINT:
+			texture_format = DXGI_FORMAT_R24G8_TYPELESS;
+			dsv_format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+			srv_format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+			break;
+		case DXGI_FORMAT_D32_FLOAT:
+			texture_format = DXGI_FORMAT_R32_TYPELESS;
+			dsv_format = DXGI_FORMAT_D32_FLOAT;
+			srv_format = DXGI_FORMAT_R32_FLOAT;
+			break;
+		case DXGI_FORMAT_D16_UNORM:
+			texture_format = DXGI_FORMAT_R16_TYPELESS;
+			dsv_format = DXGI_FORMAT_D16_UNORM;
+			srv_format = DXGI_FORMAT_R16_UNORM;
+			break;
+		default:
+			// Use format as-is for other depth formats
+			break;
+		}
+	}
+
 	U_LOG_W("[DEBUG] Swapchain creation: bits=0x%x, bind_flags=0x%x (RT=%d, SR=%d, DS=%d), device=%p",
 	        info->bits, bind_flags,
 	        (bind_flags & D3D11_BIND_RENDER_TARGET) ? 1 : 0,
@@ -335,7 +366,7 @@ comp_d3d11_swapchain_create(struct comp_d3d11_compositor *c,
 	texDesc.Height = info->height;
 	texDesc.MipLevels = info->mip_count > 0 ? info->mip_count : 1;
 	texDesc.ArraySize = info->array_size > 0 ? info->array_size : 1;
-	texDesc.Format = dxgi_format;
+	texDesc.Format = texture_format; // Use typeless format for depth textures
 	texDesc.SampleDesc.Count = info->sample_count > 0 ? info->sample_count : 1;
 	texDesc.SampleDesc.Quality = 0;
 	texDesc.Usage = D3D11_USAGE_DEFAULT;
@@ -354,15 +385,7 @@ comp_d3d11_swapchain_create(struct comp_d3d11_compositor *c,
 		// Create SRV if it's a shader resource
 		if (bind_flags & D3D11_BIND_SHADER_RESOURCE) {
 			D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-
-			// For depth formats, use a compatible format for SRV
-			if (dxgi_format == DXGI_FORMAT_D24_UNORM_S8_UINT) {
-				srvDesc.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
-			} else if (dxgi_format == DXGI_FORMAT_D32_FLOAT) {
-				srvDesc.Format = DXGI_FORMAT_R32_FLOAT;
-			} else {
-				srvDesc.Format = dxgi_format;
-			}
+			srvDesc.Format = srv_format; // Use pre-computed SRV format (handles depth formats)
 
 			if (texDesc.ArraySize > 1) {
 				srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
