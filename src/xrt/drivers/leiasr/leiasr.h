@@ -31,6 +31,16 @@ struct leiasr_eye_pair
 	bool valid;                        //!< True if the eye positions are valid
 };
 
+/*!
+ * Display dimensions in meters for Kooima FOV calculation.
+ */
+struct leiasr_display_dimensions
+{
+	float width_m;   //!< Screen width in meters
+	float height_m;  //!< Screen height in meters
+	bool valid;      //!< True if the dimensions are valid
+};
+
 //! Forward declaration for the SR context holder
 struct leiasr;
 
@@ -115,6 +125,17 @@ leiasr_get_predicted_eye_positions(struct leiasr *leiasr, struct leiasr_eye_pair
  */
 bool
 leiasr_has_weaver(struct leiasr *leiasr);
+
+/*!
+ * Get the display dimensions for Kooima FOV calculation.
+ * The dimensions are cached from SR::Display during initialization.
+ *
+ * @param leiasr The leiasr instance
+ * @param[out] out_dims Pointer to receive the display dimensions (in meters)
+ * @return true if valid display dimensions are available, false otherwise
+ */
+bool
+leiasr_get_display_dimensions(struct leiasr *leiasr, struct leiasr_display_dimensions *out_dims);
 
 #ifdef __cplusplus
 }

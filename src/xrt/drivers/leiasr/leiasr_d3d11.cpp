@@ -41,6 +41,11 @@ struct leiasr_d3d11
 	uint32_t view_height = 0;
 	DXGI_FORMAT input_format = DXGI_FORMAT_R8G8B8A8_UNORM;
 
+	// Display dimensions in meters (for Kooima FOV calculation)
+	float display_width_m = 0.0f;
+	float display_height_m = 0.0f;
+	bool display_dims_valid = false;
+
 	// Configuration
 	bool srgb_read = false;
 	bool srgb_write = false;
@@ -96,6 +101,22 @@ create_sr_context(double max_time, leiasr_d3d11 &sr)
 			int64_t height = display_location.bottom - display_location.top;
 			if ((width != 0) && (height != 0)) {
 				display_ready = true;
+
+				// Cache display dimensions in meters for Kooima FOV calculation
+				// Get DPI from Windows and convert pixels to meters: meters = pixels * 25.4 / dpi / 1000
+				HDC hdc = GetDC(NULL);
+				float dpiX = (float)GetDeviceCaps(hdc, LOGPIXELSX);
+				float dpiY = (float)GetDeviceCaps(hdc, LOGPIXELSY);
+				ReleaseDC(NULL, hdc);
+
+				sr.display_width_m = (float)width * 25.4f / dpiX / 1000.0f;
+				sr.display_height_m = (float)height * 25.4f / dpiY / 1000.0f;
+				sr.display_dims_valid = true;
+
+				U_LOG_I("SR D3D11 display dimensions: %ldx%ld px, DPI %.1fx%.1f, %.3fx%.3f m",
+				        (long)width, (long)height, dpiX, dpiY,
+				        sr.display_width_m, sr.display_height_m);
+
 				break;
 			}
 		}
@@ -303,6 +324,30 @@ leiasr_d3d11_is_ready(struct leiasr_d3d11 *leiasr)
 	}
 
 	return leiasr->weaver != nullptr && leiasr->context != nullptr;
+}
+
+bool
+leiasr_d3d11_get_display_dimensions(struct leiasr_d3d11 *leiasr, struct leiasr_d3d11_display_dimensions *out_dims)
+{
+	if (leiasr == nullptr || out_dims == nullptr) {
+		if (out_dims != nullptr) {
+			out_dims->valid = false;
+		}
+		return false;
+	}
+
+	std::lock_guard<std::mutex> lock(leiasr->mutex);
+
+	if (!leiasr->display_dims_valid) {
+		out_dims->valid = false;
+		return false;
+	}
+
+	out_dims->width_m = leiasr->display_width_m;
+	out_dims->height_m = leiasr->display_height_m;
+	out_dims->valid = true;
+
+	return true;
 }
 
 } // extern "C"

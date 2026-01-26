@@ -1283,6 +1283,30 @@ multi_compositor_get_predicted_eye_positions(struct multi_compositor *mc, struct
 	// Get predicted eye positions from the session's weaver
 	return leiasr_get_predicted_eye_positions(mc->session_render.weaver, out_eye_pair);
 }
+
+bool
+multi_compositor_get_display_dimensions(struct multi_compositor *mc, float *out_width_m, float *out_height_m)
+{
+	if (mc == NULL || out_width_m == NULL || out_height_m == NULL) {
+		return false;
+	}
+
+	// Check if session has per-session rendering with a weaver
+	if (!mc->session_render.initialized || mc->session_render.weaver == NULL) {
+		return false;
+	}
+
+	// Get display dimensions from the session's weaver
+	struct leiasr_display_dimensions dims = {0};
+	if (!leiasr_get_display_dimensions(mc->session_render.weaver, &dims) || !dims.valid) {
+		return false;
+	}
+
+	*out_width_m = dims.width_m;
+	*out_height_m = dims.height_m;
+
+	return true;
+}
 #endif
 
 xrt_result_t

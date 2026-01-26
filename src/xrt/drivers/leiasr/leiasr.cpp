@@ -37,6 +37,11 @@ struct leiasr
 	SR::SRContext *context = nullptr;
 	SR::IVulkanWeaver1 *weaver = nullptr;
 
+	// Display dimensions in meters (for Kooima FOV calculation)
+	float display_width_m = 0.0f;
+	float display_height_m = 0.0f;
+	bool display_dims_valid = false;
+
 	// Thread-safe eye position storage (for getPredictedEyePositions)
 	std::mutex eyeMutex;
 };
@@ -83,6 +88,22 @@ CreateSRContext(double maxTime, leiasr &sr)
 			int64_t height = displayLocation.bottom - displayLocation.top;
 			if ((width != 0) && (height != 0)) {
 				displayReady = true;
+
+				// Cache display dimensions in meters for Kooima FOV calculation
+				// Get DPI from Windows and convert pixels to meters: meters = pixels * 25.4 / dpi / 1000
+				HDC hdc = GetDC(NULL);
+				float dpiX = (float)GetDeviceCaps(hdc, LOGPIXELSX);
+				float dpiY = (float)GetDeviceCaps(hdc, LOGPIXELSY);
+				ReleaseDC(NULL, hdc);
+
+				sr.display_width_m = (float)width * 25.4f / dpiX / 1000.0f;
+				sr.display_height_m = (float)height * 25.4f / dpiY / 1000.0f;
+				sr.display_dims_valid = true;
+
+				U_LOG_I("SR display dimensions: %ldx%ld px, DPI %.1fx%.1f, %.3fx%.3f m",
+				        (long)width, (long)height, dpiX, dpiY,
+				        sr.display_width_m, sr.display_height_m);
+
 				break;
 			}
 		}
@@ -321,6 +342,28 @@ leiasr_has_weaver(struct leiasr *leiasr)
 	}
 
 	return leiasr->weaver != nullptr;
+}
+
+bool
+leiasr_get_display_dimensions(struct leiasr *leiasr, struct leiasr_display_dimensions *out_dims)
+{
+	if (leiasr == nullptr || out_dims == nullptr) {
+		if (out_dims != nullptr) {
+			out_dims->valid = false;
+		}
+		return false;
+	}
+
+	if (!leiasr->display_dims_valid) {
+		out_dims->valid = false;
+		return false;
+	}
+
+	out_dims->width_m = leiasr->display_width_m;
+	out_dims->height_m = leiasr->display_height_m;
+	out_dims->valid = true;
+
+	return true;
 }
 
 } // extern "C"

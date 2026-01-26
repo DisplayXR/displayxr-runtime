@@ -146,6 +146,33 @@ leiasr_d3d11_set_latency_in_frames(struct leiasr_d3d11 *leiasr,
 bool
 leiasr_d3d11_is_ready(struct leiasr_d3d11 *leiasr);
 
+/*!
+ * Display dimensions in meters for Kooima FOV calculation (D3D11 version).
+ * Note: This struct is identical to leiasr_display_dimensions but defined
+ * here to avoid header dependencies.
+ *
+ * @ingroup drv_leiasr
+ */
+struct leiasr_d3d11_display_dimensions
+{
+	float width_m;   //!< Screen width in meters
+	float height_m;  //!< Screen height in meters
+	bool valid;      //!< True if the dimensions are valid
+};
+
+/*!
+ * Get the display dimensions for Kooima FOV calculation.
+ * The dimensions are cached from SR::Display during initialization.
+ *
+ * @param leiasr The D3D11 weaver instance.
+ * @param[out] out_dims Pointer to receive the display dimensions (in meters).
+ * @return true if valid display dimensions are available, false otherwise.
+ *
+ * @ingroup drv_leiasr
+ */
+bool
+leiasr_d3d11_get_display_dimensions(struct leiasr_d3d11 *leiasr, struct leiasr_d3d11_display_dimensions *out_dims);
+
 #ifdef __cplusplus
 }
 #endif

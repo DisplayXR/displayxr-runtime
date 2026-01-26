@@ -116,6 +116,73 @@ oxr_session_get_predicted_eye_positions(struct oxr_session *sess, struct leiasr_
 	struct multi_compositor *mc = multi_compositor(&sess->xcn->base);
 	return multi_compositor_get_predicted_eye_positions(mc, out_eye_pair);
 }
+
+/*!
+ * Get display dimensions from the session's per-session weaver.
+ * Used for Kooima asymmetric FOV calculation.
+ */
+static bool
+oxr_session_get_display_dimensions(struct oxr_session *sess, float *out_width_m, float *out_height_m)
+{
+	if (sess == NULL || sess->xcn == NULL || out_width_m == NULL || out_height_m == NULL) {
+		return false;
+	}
+
+	struct multi_compositor *mc = multi_compositor(&sess->xcn->base);
+	return multi_compositor_get_display_dimensions(mc, out_width_m, out_height_m);
+}
+
+/*!
+ * Compute Kooima asymmetric FOV based on eye position relative to screen.
+ *
+ * The Kooima algorithm (from "Generalized Perspective Projection") computes
+ * a perspective frustum where the eye is not centered on the screen. This is
+ * essential for SR displays where the user's head moves relative to the screen.
+ *
+ * @param eye Eye position in meters (x=right, y=up, z=toward viewer from screen center)
+ * @param screen_width_m Screen width in meters
+ * @param screen_height_m Screen height in meters
+ * @param[out] out_fov FOV angles in radians
+ */
+static void
+compute_kooima_fov(const struct leiasr_eye_position *eye,
+                   float screen_width_m,
+                   float screen_height_m,
+                   struct xrt_fov *out_fov)
+{
+	const float half_w = screen_width_m / 2.0f;
+	const float half_h = screen_height_m / 2.0f;
+	const float distance = eye->z;
+
+	// Fallback if eye too close to screen to avoid division issues
+	if (distance <= 0.001f) {
+		out_fov->angle_left = -0.785398f;   // -45 degrees
+		out_fov->angle_right = 0.785398f;   //  45 degrees
+		out_fov->angle_up = 0.523599f;      //  30 degrees
+		out_fov->angle_down = -0.523599f;   // -30 degrees
+		return;
+	}
+
+	// Screen corners relative to screen center (at z=0):
+	// pa (top-left):     (-half_w,  half_h, 0)
+	// pb (top-right):    ( half_w,  half_h, 0)
+	// pc (bottom-left):  (-half_w, -half_h, 0)
+	//
+	// Eye position: (eye->x, eye->y, eye->z) where z is distance toward viewer
+	//
+	// For each edge, compute the tangent of the angle from eye to that edge,
+	// then convert to angle. Since screen normal is (0,0,1) and eye is at z=distance:
+	//
+	// tan(angle_left)  = (left_edge_x - eye_x) / distance  = (-half_w - eye->x) / distance
+	// tan(angle_right) = (right_edge_x - eye_x) / distance = (half_w - eye->x) / distance
+	// tan(angle_up)    = (top_edge_y - eye_y) / distance   = (half_h - eye->y) / distance
+	// tan(angle_down)  = (bottom_edge_y - eye_y) / distance = (-half_h - eye->y) / distance
+
+	out_fov->angle_left = atanf((-half_w - eye->x) / distance);
+	out_fov->angle_right = atanf((half_w - eye->x) / distance);
+	out_fov->angle_up = atanf((half_h - eye->y) / distance);
+	out_fov->angle_down = atanf((-half_h - eye->y) / distance);
+}
 #endif
 
 static XrResult
@@ -804,15 +871,22 @@ oxr_session_locate_views(struct oxr_logger *log,
 		}
 
 #ifdef XRT_HAVE_LEIA_SR
-		// Override FOV with symmetric values for Leia SR display
-		// Default: ~90° horizontal, ~60° vertical (typical for 3:2 aspect ratio)
-		// TODO: Compute FOV dynamically based on eye position and virtual display plane
+		// Compute asymmetric FOV using Kooima algorithm based on eye position
+		// relative to the display screen. This gives proper perspective for
+		// off-axis viewing on SR displays.
 		if (have_eye_tracking) {
-			// Symmetric FOV: ±45° horizontal (0.785 rad), ±30° vertical (0.524 rad)
-			fov.angle_left = -0.785398f;   // -45 degrees
-			fov.angle_right = 0.785398f;   //  45 degrees
-			fov.angle_up = 0.523599f;      //  30 degrees
-			fov.angle_down = -0.523599f;   // -30 degrees
+			float screen_width_m = 0.0f;
+			float screen_height_m = 0.0f;
+
+			if (oxr_session_get_display_dimensions(sess, &screen_width_m, &screen_height_m) &&
+			    screen_width_m > 0.0f && screen_height_m > 0.0f) {
+				// Select eye position based on view index
+				const struct leiasr_eye_position *eye = (i == 0) ? &eye_pair.left : &eye_pair.right;
+
+				// Compute Kooima asymmetric FOV
+				compute_kooima_fov(eye, screen_width_m, screen_height_m, &fov);
+			}
+			// else: fallback to device FOV if display dimensions unavailable
 		}
 #endif
 
