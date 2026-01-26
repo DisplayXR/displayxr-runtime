@@ -8,6 +8,7 @@
  */
 
 #include "comp_d3d11_service.h"
+#include "d3d11_service_shaders.h"
 
 #include "xrt/xrt_handles.h"
 #include "xrt/xrt_config_have.h"
@@ -21,6 +22,9 @@
 #include "util/comp_layer_accum.h"
 #include "multi/comp_multi_interface.h"
 
+#include "math/m_api.h"
+#include "math/m_vec3.h"
+
 #ifdef XRT_HAVE_LEIA_SR
 #include "leiasr/leiasr_d3d11.h"
 #endif
@@ -29,12 +33,14 @@
 #include <windows.h>
 #include <d3d11_4.h>
 #include <dxgi1_6.h>
+#include <d3dcompiler.h>
 
 #include <wil/com.h>
 #include <wil/result.h>
 
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
 #include <mutex>
 
 
@@ -138,6 +144,43 @@ struct d3d11_service_system
 	wil::com_ptr<ID3D11ShaderResourceView> stereo_srv;
 	wil::com_ptr<ID3D11RenderTargetView> stereo_rtv;
 
+	//! Quad layer shaders
+	wil::com_ptr<ID3D11VertexShader> quad_vs;
+	wil::com_ptr<ID3D11PixelShader> quad_ps;
+
+	//! Cylinder layer shaders
+	wil::com_ptr<ID3D11VertexShader> cylinder_vs;
+	wil::com_ptr<ID3D11PixelShader> cylinder_ps;
+
+	//! Equirect2 layer shaders
+	wil::com_ptr<ID3D11VertexShader> equirect2_vs;
+	wil::com_ptr<ID3D11PixelShader> equirect2_ps;
+
+	//! Cube layer shaders
+	wil::com_ptr<ID3D11VertexShader> cube_vs;
+	wil::com_ptr<ID3D11PixelShader> cube_ps;
+
+	//! Constant buffer for layer rendering
+	wil::com_ptr<ID3D11Buffer> layer_constant_buffer;
+
+	//! Linear sampler for layer textures
+	wil::com_ptr<ID3D11SamplerState> sampler_linear;
+
+	//! Blend state for alpha blending
+	wil::com_ptr<ID3D11BlendState> blend_alpha;
+
+	//! Blend state for premultiplied alpha
+	wil::com_ptr<ID3D11BlendState> blend_premul;
+
+	//! Blend state for opaque
+	wil::com_ptr<ID3D11BlendState> blend_opaque;
+
+	//! Rasterizer state for layer rendering
+	wil::com_ptr<ID3D11RasterizerState> rasterizer_state;
+
+	//! Depth stencil state (disabled)
+	wil::com_ptr<ID3D11DepthStencilState> depth_disabled;
+
 	//! Self-created window for display output
 	HWND hwnd;
 
@@ -187,6 +230,618 @@ static inline struct d3d11_service_system *
 d3d11_service_system(struct xrt_system_compositor *xsysc)
 {
 	return reinterpret_cast<struct d3d11_service_system *>(xsysc);
+}
+
+
+/*
+ *
+ * Shader compilation helpers
+ *
+ */
+
+static HRESULT
+compile_shader(const char *source, const char *entry, const char *target, ID3DBlob **out_blob)
+{
+	ID3DBlob *errors = nullptr;
+	HRESULT hr = D3DCompile(source, strlen(source), nullptr, nullptr, nullptr, entry, target, 0, 0, out_blob,
+	                        &errors);
+	if (FAILED(hr)) {
+		if (errors != nullptr) {
+			U_LOG_E("Shader compile error: %s", (char *)errors->GetBufferPointer());
+			errors->Release();
+		}
+	}
+	if (errors != nullptr) {
+		errors->Release();
+	}
+	return hr;
+}
+
+static bool
+create_layer_shaders(struct d3d11_service_system *sys)
+{
+	ID3DBlob *blob = nullptr;
+	HRESULT hr;
+
+	// Quad vertex shader
+	hr = compile_shader(quad_vs_hlsl, "VSMain", "vs_5_0", &blob);
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to compile quad vertex shader");
+		return false;
+	}
+	hr = sys->device->CreateVertexShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+	                                      sys->quad_vs.put());
+	blob->Release();
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to create quad vertex shader: 0x%08lx", hr);
+		return false;
+	}
+
+	// Quad pixel shader
+	hr = compile_shader(quad_ps_hlsl, "PSMain", "ps_5_0", &blob);
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to compile quad pixel shader");
+		return false;
+	}
+	hr = sys->device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+	                                     sys->quad_ps.put());
+	blob->Release();
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to create quad pixel shader: 0x%08lx", hr);
+		return false;
+	}
+
+	// Cylinder vertex shader
+	hr = compile_shader(cylinder_vs_hlsl, "VSMain", "vs_5_0", &blob);
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to compile cylinder vertex shader");
+		return false;
+	}
+	hr = sys->device->CreateVertexShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+	                                      sys->cylinder_vs.put());
+	blob->Release();
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to create cylinder vertex shader: 0x%08lx", hr);
+		return false;
+	}
+
+	// Cylinder pixel shader
+	hr = compile_shader(cylinder_ps_hlsl, "PSMain", "ps_5_0", &blob);
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to compile cylinder pixel shader");
+		return false;
+	}
+	hr = sys->device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+	                                     sys->cylinder_ps.put());
+	blob->Release();
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to create cylinder pixel shader: 0x%08lx", hr);
+		return false;
+	}
+
+	// Equirect2 vertex shader
+	hr = compile_shader(equirect2_vs_hlsl, "VSMain", "vs_5_0", &blob);
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to compile equirect2 vertex shader");
+		return false;
+	}
+	hr = sys->device->CreateVertexShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+	                                      sys->equirect2_vs.put());
+	blob->Release();
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to create equirect2 vertex shader: 0x%08lx", hr);
+		return false;
+	}
+
+	// Equirect2 pixel shader
+	hr = compile_shader(equirect2_ps_hlsl, "PSMain", "ps_5_0", &blob);
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to compile equirect2 pixel shader");
+		return false;
+	}
+	hr = sys->device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+	                                     sys->equirect2_ps.put());
+	blob->Release();
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to create equirect2 pixel shader: 0x%08lx", hr);
+		return false;
+	}
+
+	// Cube vertex shader
+	hr = compile_shader(cube_vs_hlsl, "VSMain", "vs_5_0", &blob);
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to compile cube vertex shader");
+		return false;
+	}
+	hr = sys->device->CreateVertexShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+	                                      sys->cube_vs.put());
+	blob->Release();
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to create cube vertex shader: 0x%08lx", hr);
+		return false;
+	}
+
+	// Cube pixel shader
+	hr = compile_shader(cube_ps_hlsl, "PSMain", "ps_5_0", &blob);
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to compile cube pixel shader");
+		return false;
+	}
+	hr = sys->device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+	                                     sys->cube_ps.put());
+	blob->Release();
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to create cube pixel shader: 0x%08lx", hr);
+		return false;
+	}
+
+	U_LOG_I("Created all layer shaders");
+	return true;
+}
+
+static bool
+create_layer_resources(struct d3d11_service_system *sys)
+{
+	HRESULT hr;
+
+	// Create constant buffer (largest of all layer constant structs)
+	size_t cb_size = sizeof(Equirect2LayerConstants);  // Largest
+	D3D11_BUFFER_DESC cb_desc = {};
+	cb_desc.ByteWidth = static_cast<UINT>((cb_size + 15) & ~15);  // 16-byte aligned
+	cb_desc.Usage = D3D11_USAGE_DYNAMIC;
+	cb_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+	cb_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+
+	hr = sys->device->CreateBuffer(&cb_desc, nullptr, sys->layer_constant_buffer.put());
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to create layer constant buffer: 0x%08lx", hr);
+		return false;
+	}
+
+	// Create linear sampler
+	D3D11_SAMPLER_DESC samp_desc = {};
+	samp_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+	samp_desc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+	samp_desc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+	samp_desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+
+	hr = sys->device->CreateSamplerState(&samp_desc, sys->sampler_linear.put());
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to create linear sampler: 0x%08lx", hr);
+		return false;
+	}
+
+	// Create blend state for alpha blending
+	D3D11_BLEND_DESC blend_desc = {};
+	blend_desc.RenderTarget[0].BlendEnable = TRUE;
+	blend_desc.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
+	blend_desc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+	blend_desc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+	blend_desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+	blend_desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+	blend_desc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+	blend_desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+
+	hr = sys->device->CreateBlendState(&blend_desc, sys->blend_alpha.put());
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to create alpha blend state: 0x%08lx", hr);
+		return false;
+	}
+
+	// Premultiplied alpha blend state
+	blend_desc.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
+	blend_desc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+
+	hr = sys->device->CreateBlendState(&blend_desc, sys->blend_premul.put());
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to create premul blend state: 0x%08lx", hr);
+		return false;
+	}
+
+	// Opaque blend state
+	blend_desc.RenderTarget[0].BlendEnable = FALSE;
+
+	hr = sys->device->CreateBlendState(&blend_desc, sys->blend_opaque.put());
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to create opaque blend state: 0x%08lx", hr);
+		return false;
+	}
+
+	// Create rasterizer state
+	D3D11_RASTERIZER_DESC raster_desc = {};
+	raster_desc.FillMode = D3D11_FILL_SOLID;
+	raster_desc.CullMode = D3D11_CULL_NONE;
+	raster_desc.FrontCounterClockwise = FALSE;
+	raster_desc.DepthClipEnable = TRUE;
+
+	hr = sys->device->CreateRasterizerState(&raster_desc, sys->rasterizer_state.put());
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to create rasterizer state: 0x%08lx", hr);
+		return false;
+	}
+
+	// Create depth stencil state (disabled)
+	D3D11_DEPTH_STENCIL_DESC ds_desc = {};
+	ds_desc.DepthEnable = FALSE;
+	ds_desc.StencilEnable = FALSE;
+
+	hr = sys->device->CreateDepthStencilState(&ds_desc, sys->depth_disabled.put());
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to create depth stencil state: 0x%08lx", hr);
+		return false;
+	}
+
+	U_LOG_I("Created all layer rendering resources");
+	return true;
+}
+
+
+/*
+ *
+ * Layer visibility check
+ *
+ */
+
+static bool
+is_layer_view_visible(const struct xrt_layer_data *data, uint32_t view_index)
+{
+	enum xrt_layer_eye_visibility visibility;
+
+	switch (data->type) {
+	case XRT_LAYER_QUAD: visibility = data->quad.visibility; break;
+	case XRT_LAYER_CYLINDER: visibility = data->cylinder.visibility; break;
+	case XRT_LAYER_EQUIRECT1: visibility = data->equirect1.visibility; break;
+	case XRT_LAYER_EQUIRECT2: visibility = data->equirect2.visibility; break;
+	case XRT_LAYER_CUBE: visibility = data->cube.visibility; break;
+	default: return true;  // Projection layers visible in both
+	}
+
+	switch (visibility) {
+	case XRT_LAYER_EYE_VISIBILITY_NONE: return false;
+	case XRT_LAYER_EYE_VISIBILITY_LEFT_BIT: return view_index == 0;
+	case XRT_LAYER_EYE_VISIBILITY_RIGHT_BIT: return view_index == 1;
+	case XRT_LAYER_EYE_VISIBILITY_BOTH: return true;
+	default: return true;
+	}
+}
+
+
+/*
+ *
+ * Layer rendering helpers
+ *
+ */
+
+static void
+get_color_scale_bias(const struct xrt_layer_data *data, float color_scale[4], float color_bias[4])
+{
+	bool has_color_scale_bias = (data->flags & XRT_LAYER_COMPOSITION_COLOR_BIAS_SCALE) != 0;
+
+	if (has_color_scale_bias) {
+		color_scale[0] = data->color_scale.r;
+		color_scale[1] = data->color_scale.g;
+		color_scale[2] = data->color_scale.b;
+		color_scale[3] = data->color_scale.a;
+		color_bias[0] = data->color_bias.r;
+		color_bias[1] = data->color_bias.g;
+		color_bias[2] = data->color_bias.b;
+		color_bias[3] = data->color_bias.a;
+	} else {
+		color_scale[0] = 1.0f;
+		color_scale[1] = 1.0f;
+		color_scale[2] = 1.0f;
+		color_scale[3] = 1.0f;
+		color_bias[0] = 0.0f;
+		color_bias[1] = 0.0f;
+		color_bias[2] = 0.0f;
+		color_bias[3] = 0.0f;
+	}
+}
+
+static void
+set_blend_state(struct d3d11_service_system *sys, const struct xrt_layer_data *data)
+{
+	bool use_premul = (data->flags & XRT_LAYER_COMPOSITION_BLEND_TEXTURE_SOURCE_ALPHA) == 0;
+
+	if (use_premul) {
+		sys->context->OMSetBlendState(sys->blend_premul.get(), nullptr, 0xFFFFFFFF);
+	} else {
+		sys->context->OMSetBlendState(sys->blend_alpha.get(), nullptr, 0xFFFFFFFF);
+	}
+}
+
+static void
+render_quad_layer(struct d3d11_service_system *sys,
+                  const struct comp_layer *layer,
+                  uint32_t view_index,
+                  const struct xrt_pose *view_pose,
+                  const struct xrt_fov *fov)
+{
+	const struct xrt_layer_data *data = &layer->data;
+	const struct xrt_layer_quad_data *q = &data->quad;
+
+	// Get swapchain
+	struct xrt_swapchain *xsc = layer->sc_array[0];
+	if (xsc == nullptr) {
+		return;
+	}
+	struct d3d11_service_swapchain *sc = d3d11_service_swapchain(xsc);
+
+	uint32_t image_index = q->sub.image_index;
+	if (image_index >= sc->image_count) {
+		return;
+	}
+
+	ID3D11ShaderResourceView *srv = sc->images[image_index].srv.get();
+	if (srv == nullptr) {
+		return;
+	}
+
+	// Build MVP matrix
+	struct xrt_matrix_4x4 model, view, proj, mv, mvp;
+
+	// Model: translate + rotate + scale by quad size
+	struct xrt_vec3 scale = {q->size.x, q->size.y, 1.0f};
+	math_matrix_4x4_model(&q->pose, &scale, &model);
+
+	// View matrix
+	math_matrix_4x4_view_from_pose(view_pose, &view);
+
+	// Projection matrix (Vulkan-style infinite reverse)
+	math_matrix_4x4_projection_vulkan_infinite_reverse(fov, 0.1f, &proj);
+
+	// MVP
+	math_matrix_4x4_multiply(&view, &model, &mv);
+	math_matrix_4x4_multiply(&proj, &mv, &mvp);
+
+	// Fill constant buffer
+	QuadLayerConstants constants = {};
+	memcpy(constants.mvp, &mvp, sizeof(constants.mvp));
+
+	// UV transform for sub-image
+	constants.post_transform[0] = q->sub.norm_rect.x;
+	constants.post_transform[1] = q->sub.norm_rect.y;
+	constants.post_transform[2] = q->sub.norm_rect.w;
+	constants.post_transform[3] = q->sub.norm_rect.h;
+
+	// Handle Y-flip
+	if (data->flip_y) {
+		constants.post_transform[1] += constants.post_transform[3];
+		constants.post_transform[3] = -constants.post_transform[3];
+	}
+
+	get_color_scale_bias(data, constants.color_scale, constants.color_bias);
+
+	// Update constant buffer
+	D3D11_MAPPED_SUBRESOURCE mapped;
+	HRESULT hr = sys->context->Map(sys->layer_constant_buffer.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+	if (SUCCEEDED(hr)) {
+		memcpy(mapped.pData, &constants, sizeof(constants));
+		sys->context->Unmap(sys->layer_constant_buffer.get(), 0);
+	}
+
+	// Set shaders
+	sys->context->VSSetShader(sys->quad_vs.get(), nullptr, 0);
+	sys->context->PSSetShader(sys->quad_ps.get(), nullptr, 0);
+
+	// Bind resources
+	ID3D11Buffer *cbs[] = {sys->layer_constant_buffer.get()};
+	sys->context->VSSetConstantBuffers(0, 1, cbs);
+	sys->context->PSSetConstantBuffers(0, 1, cbs);
+	sys->context->PSSetShaderResources(0, 1, &srv);
+	ID3D11SamplerState *samplers[] = {sys->sampler_linear.get()};
+	sys->context->PSSetSamplers(0, 1, samplers);
+
+	// Set blend state
+	set_blend_state(sys, data);
+
+	// Draw quad (triangle strip, 4 vertices)
+	sys->context->Draw(4, 0);
+
+	// Unbind SRV
+	ID3D11ShaderResourceView *null_srv = nullptr;
+	sys->context->PSSetShaderResources(0, 1, &null_srv);
+}
+
+static void
+render_cylinder_layer(struct d3d11_service_system *sys,
+                      const struct comp_layer *layer,
+                      uint32_t view_index,
+                      const struct xrt_pose *view_pose,
+                      const struct xrt_fov *fov)
+{
+	const struct xrt_layer_data *data = &layer->data;
+	const struct xrt_layer_cylinder_data *cyl = &data->cylinder;
+
+	// Get swapchain
+	struct xrt_swapchain *xsc = layer->sc_array[0];
+	if (xsc == nullptr) {
+		return;
+	}
+	struct d3d11_service_swapchain *sc = d3d11_service_swapchain(xsc);
+
+	uint32_t image_index = cyl->sub.image_index;
+	if (image_index >= sc->image_count) {
+		return;
+	}
+
+	ID3D11ShaderResourceView *srv = sc->images[image_index].srv.get();
+	if (srv == nullptr) {
+		return;
+	}
+
+	// Build MVP matrix (cylinder is in layer pose space)
+	struct xrt_matrix_4x4 model, view, proj, mv, mvp;
+
+	// Model: just the layer pose (cylinder geometry generated in shader)
+	struct xrt_vec3 scale = {1.0f, 1.0f, 1.0f};
+	math_matrix_4x4_model(&cyl->pose, &scale, &model);
+
+	// View matrix
+	math_matrix_4x4_view_from_pose(view_pose, &view);
+
+	// Projection matrix
+	math_matrix_4x4_projection_vulkan_infinite_reverse(fov, 0.1f, &proj);
+
+	// MVP
+	math_matrix_4x4_multiply(&view, &model, &mv);
+	math_matrix_4x4_multiply(&proj, &mv, &mvp);
+
+	// Fill constant buffer
+	CylinderLayerConstants constants = {};
+	memcpy(constants.mvp, &mvp, sizeof(constants.mvp));
+
+	// UV transform
+	constants.post_transform[0] = cyl->sub.norm_rect.x;
+	constants.post_transform[1] = cyl->sub.norm_rect.y;
+	constants.post_transform[2] = cyl->sub.norm_rect.w;
+	constants.post_transform[3] = cyl->sub.norm_rect.h;
+
+	if (data->flip_y) {
+		constants.post_transform[1] += constants.post_transform[3];
+		constants.post_transform[3] = -constants.post_transform[3];
+	}
+
+	get_color_scale_bias(data, constants.color_scale, constants.color_bias);
+
+	constants.radius = cyl->radius;
+	constants.central_angle = cyl->central_angle;
+	constants.aspect_ratio = cyl->aspect_ratio;
+
+	// Update constant buffer
+	D3D11_MAPPED_SUBRESOURCE mapped;
+	HRESULT hr = sys->context->Map(sys->layer_constant_buffer.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+	if (SUCCEEDED(hr)) {
+		memcpy(mapped.pData, &constants, sizeof(constants));
+		sys->context->Unmap(sys->layer_constant_buffer.get(), 0);
+	}
+
+	// Set shaders
+	sys->context->VSSetShader(sys->cylinder_vs.get(), nullptr, 0);
+	sys->context->PSSetShader(sys->cylinder_ps.get(), nullptr, 0);
+
+	// Bind resources
+	ID3D11Buffer *cbs[] = {sys->layer_constant_buffer.get()};
+	sys->context->VSSetConstantBuffers(0, 1, cbs);
+	sys->context->PSSetConstantBuffers(0, 1, cbs);
+	sys->context->PSSetShaderResources(0, 1, &srv);
+	ID3D11SamplerState *samplers[] = {sys->sampler_linear.get()};
+	sys->context->PSSetSamplers(0, 1, samplers);
+
+	// Set blend state
+	set_blend_state(sys, data);
+
+	// Draw cylinder (triangle strip, 2 * (subdivision + 2) vertices)
+	// Subdivision count of 64, so 132 vertices
+	sys->context->Draw(132, 0);
+
+	// Unbind SRV
+	ID3D11ShaderResourceView *null_srv = nullptr;
+	sys->context->PSSetShaderResources(0, 1, &null_srv);
+}
+
+static void
+render_equirect2_layer(struct d3d11_service_system *sys,
+                       const struct comp_layer *layer,
+                       uint32_t view_index,
+                       const struct xrt_pose *view_pose,
+                       const struct xrt_fov *fov)
+{
+	const struct xrt_layer_data *data = &layer->data;
+	const struct xrt_layer_equirect2_data *eq = &data->equirect2;
+
+	// Get swapchain
+	struct xrt_swapchain *xsc = layer->sc_array[0];
+	if (xsc == nullptr) {
+		return;
+	}
+	struct d3d11_service_swapchain *sc = d3d11_service_swapchain(xsc);
+
+	uint32_t image_index = eq->sub.image_index;
+	if (image_index >= sc->image_count) {
+		return;
+	}
+
+	ID3D11ShaderResourceView *srv = sc->images[image_index].srv.get();
+	if (srv == nullptr) {
+		return;
+	}
+
+	// Build inverse model-view matrix (for ray casting)
+	struct xrt_matrix_4x4 model, view, mv, mv_inv;
+
+	// Model: layer pose
+	struct xrt_vec3 scale = {1.0f, 1.0f, 1.0f};
+	math_matrix_4x4_model(&eq->pose, &scale, &model);
+
+	// View matrix
+	math_matrix_4x4_view_from_pose(view_pose, &view);
+
+	// MV and inverse
+	math_matrix_4x4_multiply(&view, &model, &mv);
+	math_matrix_4x4_inverse(&mv, &mv_inv);
+
+	// Calculate UV to tangent transform
+	float to_tangent[4];
+	to_tangent[0] = tanf(fov->angle_left);
+	to_tangent[1] = tanf(fov->angle_down);
+	to_tangent[2] = tanf(fov->angle_right) - tanf(fov->angle_left);
+	to_tangent[3] = tanf(fov->angle_up) - tanf(fov->angle_down);
+
+	// Fill constant buffer
+	Equirect2LayerConstants constants = {};
+	memcpy(constants.mv_inverse, &mv_inv, sizeof(constants.mv_inverse));
+
+	// UV transform
+	constants.post_transform[0] = eq->sub.norm_rect.x;
+	constants.post_transform[1] = eq->sub.norm_rect.y;
+	constants.post_transform[2] = eq->sub.norm_rect.w;
+	constants.post_transform[3] = eq->sub.norm_rect.h;
+
+	if (data->flip_y) {
+		constants.post_transform[1] += constants.post_transform[3];
+		constants.post_transform[3] = -constants.post_transform[3];
+	}
+
+	get_color_scale_bias(data, constants.color_scale, constants.color_bias);
+
+	memcpy(constants.to_tangent, to_tangent, sizeof(constants.to_tangent));
+
+	// Handle infinite radius (spec says +INFINITY)
+	constants.radius = std::isinf(eq->radius) ? 0.0f : eq->radius;
+	constants.central_horizontal_angle = eq->central_horizontal_angle;
+	constants.upper_vertical_angle = eq->upper_vertical_angle;
+	constants.lower_vertical_angle = eq->lower_vertical_angle;
+
+	// Update constant buffer
+	D3D11_MAPPED_SUBRESOURCE mapped;
+	HRESULT hr = sys->context->Map(sys->layer_constant_buffer.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+	if (SUCCEEDED(hr)) {
+		memcpy(mapped.pData, &constants, sizeof(constants));
+		sys->context->Unmap(sys->layer_constant_buffer.get(), 0);
+	}
+
+	// Set shaders
+	sys->context->VSSetShader(sys->equirect2_vs.get(), nullptr, 0);
+	sys->context->PSSetShader(sys->equirect2_ps.get(), nullptr, 0);
+
+	// Bind resources
+	ID3D11Buffer *cbs[] = {sys->layer_constant_buffer.get()};
+	sys->context->VSSetConstantBuffers(0, 1, cbs);
+	sys->context->PSSetConstantBuffers(0, 1, cbs);
+	sys->context->PSSetShaderResources(0, 1, &srv);
+	ID3D11SamplerState *samplers[] = {sys->sampler_linear.get()};
+	sys->context->PSSetSamplers(0, 1, samplers);
+
+	// Set blend state
+	set_blend_state(sys, data);
+
+	// Draw fullscreen quad
+	sys->context->Draw(4, 0);
+
+	// Unbind SRV
+	ID3D11ShaderResourceView *null_srv = nullptr;
+	sys->context->PSSetShaderResources(0, 1, &null_srv);
 }
 
 
@@ -685,7 +1340,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		sys->context->ClearRenderTargetView(sys->stereo_rtv.get(), clear_color);
 	}
 
-	// Render projection layers to stereo texture
+	// Render projection layers to stereo texture (via copy)
 	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
 		struct comp_layer *layer = &c->layer_accum.layers[i];
 
@@ -758,6 +1413,117 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		    &right_box);
 
 		U_LOG_T("Rendered projection layer %u", i);
+	}
+
+	// Check if there are any UI layers to render
+	bool has_ui_layers = false;
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		struct comp_layer *layer = &c->layer_accum.layers[i];
+		switch (layer->data.type) {
+		case XRT_LAYER_QUAD:
+		case XRT_LAYER_CYLINDER:
+		case XRT_LAYER_EQUIRECT2:
+		case XRT_LAYER_EQUIRECT1:
+		case XRT_LAYER_CUBE:
+			has_ui_layers = true;
+			break;
+		default:
+			break;
+		}
+		if (has_ui_layers) break;
+	}
+
+	// Render UI layers if any exist and shaders are ready
+	if (has_ui_layers && sys->quad_vs) {
+		// Bind stereo render target
+		ID3D11RenderTargetView *rtvs[] = {sys->stereo_rtv.get()};
+		sys->context->OMSetRenderTargets(1, rtvs, nullptr);
+
+		// Set common rendering state
+		sys->context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+		sys->context->IASetInputLayout(nullptr);  // Using SV_VertexID
+		sys->context->RSSetState(sys->rasterizer_state.get());
+		sys->context->OMSetDepthStencilState(sys->depth_disabled.get(), 0);
+
+		// Create default view poses and FOVs for each eye
+		// Note: In a full implementation, these would come from tracking
+		struct xrt_pose view_poses[2];
+		struct xrt_fov fovs[2];
+
+		// Default identity poses
+		view_poses[0].orientation.x = 0.0f;
+		view_poses[0].orientation.y = 0.0f;
+		view_poses[0].orientation.z = 0.0f;
+		view_poses[0].orientation.w = 1.0f;
+		view_poses[0].position.x = -0.032f;  // IPD/2
+		view_poses[0].position.y = 0.0f;
+		view_poses[0].position.z = 0.0f;
+
+		view_poses[1].orientation.x = 0.0f;
+		view_poses[1].orientation.y = 0.0f;
+		view_poses[1].orientation.z = 0.0f;
+		view_poses[1].orientation.w = 1.0f;
+		view_poses[1].position.x = 0.032f;  // IPD/2
+		view_poses[1].position.y = 0.0f;
+		view_poses[1].position.z = 0.0f;
+
+		// Default symmetric FOV (roughly 90 degrees)
+		const float fov_angle = 0.785f;  // ~45 degrees
+		for (uint32_t view = 0; view < 2; view++) {
+			fovs[view].angle_left = -fov_angle;
+			fovs[view].angle_right = fov_angle;
+			fovs[view].angle_up = fov_angle;
+			fovs[view].angle_down = -fov_angle;
+		}
+
+		// Render UI layers for each eye
+		for (uint32_t view_index = 0; view_index < 2; view_index++) {
+			// Set viewport for this eye
+			D3D11_VIEWPORT viewport = {};
+			viewport.TopLeftX = static_cast<float>(view_index * sys->view_width);
+			viewport.TopLeftY = 0.0f;
+			viewport.Width = static_cast<float>(sys->view_width);
+			viewport.Height = static_cast<float>(sys->view_height);
+			viewport.MinDepth = 0.0f;
+			viewport.MaxDepth = 1.0f;
+			sys->context->RSSetViewports(1, &viewport);
+
+			// Render equirect2 layers first (background/skybox)
+			for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+				struct comp_layer *layer = &c->layer_accum.layers[i];
+				if (layer->data.type == XRT_LAYER_EQUIRECT2) {
+					if (is_layer_view_visible(&layer->data, view_index)) {
+						render_equirect2_layer(sys, layer, view_index,
+						                       &view_poses[view_index],
+						                       &fovs[view_index]);
+					}
+				}
+			}
+
+			// Render cylinder layers
+			for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+				struct comp_layer *layer = &c->layer_accum.layers[i];
+				if (layer->data.type == XRT_LAYER_CYLINDER) {
+					if (is_layer_view_visible(&layer->data, view_index)) {
+						render_cylinder_layer(sys, layer, view_index,
+						                      &view_poses[view_index],
+						                      &fovs[view_index]);
+					}
+				}
+			}
+
+			// Render quad layers last (on top)
+			for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+				struct comp_layer *layer = &c->layer_accum.layers[i];
+				if (layer->data.type == XRT_LAYER_QUAD) {
+					if (is_layer_view_visible(&layer->data, view_index)) {
+						render_quad_layer(sys, layer, view_index,
+						                  &view_poses[view_index],
+						                  &fovs[view_index]);
+					}
+				}
+			}
+		}
 	}
 
 #ifdef XRT_HAVE_LEIA_SR
@@ -901,6 +1667,25 @@ system_destroy(struct xrt_system_compositor *xsysc)
 	if (sys->msc != nullptr) {
 		comp_multi_destroy(&sys->msc);
 	}
+
+	// Clean up layer rendering resources
+	sys->depth_disabled.reset();
+	sys->rasterizer_state.reset();
+	sys->blend_opaque.reset();
+	sys->blend_premul.reset();
+	sys->blend_alpha.reset();
+	sys->sampler_linear.reset();
+	sys->layer_constant_buffer.reset();
+
+	// Clean up layer shaders
+	sys->cube_ps.reset();
+	sys->cube_vs.reset();
+	sys->equirect2_ps.reset();
+	sys->equirect2_vs.reset();
+	sys->cylinder_ps.reset();
+	sys->cylinder_vs.reset();
+	sys->quad_ps.reset();
+	sys->quad_vs.reset();
 
 	sys->back_buffer_rtv.reset();
 	sys->stereo_rtv.reset();
@@ -1127,20 +1912,31 @@ comp_d3d11_service_create_system(struct xrt_device *xdev,
 
 	U_LOG_I("Created stereo render target (%ux%u)", sys->display_width, sys->display_height);
 
+	// Create layer shaders and resources for UI layer rendering
+	if (!create_layer_shaders(sys)) {
+		U_LOG_W("Failed to create layer shaders, UI layers will not render");
+		// Don't fail - projection layers will still work
+	} else if (!create_layer_resources(sys)) {
+		U_LOG_W("Failed to create layer resources, UI layers will not render");
+		// Don't fail - projection layers will still work
+	}
+
 #ifdef XRT_HAVE_LEIA_SR
 	// Create SR weaver
-	xrt_result_t xret = leiasr_d3d11_create(
-	    5.0,  // 5 second timeout
-	    sys->device.get(),
-	    sys->context.get(),
-	    sys->hwnd,
-	    sys->view_width,
-	    sys->view_height,
-	    &sys->weaver);
+	{
+		xrt_result_t weaver_ret = leiasr_d3d11_create(
+		    5.0,  // 5 second timeout
+		    sys->device.get(),
+		    sys->context.get(),
+		    sys->hwnd,
+		    sys->view_width,
+		    sys->view_height,
+		    &sys->weaver);
 
-	if (xret != XRT_SUCCESS) {
-		U_LOG_W("Failed to create SR weaver, continuing without interlacing");
-		sys->weaver = nullptr;
+		if (weaver_ret != XRT_SUCCESS) {
+			U_LOG_W("Failed to create SR weaver, continuing without interlacing");
+			sys->weaver = nullptr;
+		}
 	}
 #endif
 
