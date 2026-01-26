@@ -70,6 +70,10 @@ struct XrSessionManager {
 // Initialize OpenXR instance and check for XR_EXT_session_target support
 bool InitializeOpenXR(XrSessionManager& xr);
 
+// Get the D3D11 graphics requirements (call AFTER InitializeOpenXR, BEFORE CreateSession)
+// Returns the adapter LUID that the D3D11 device must be created on
+bool GetD3D11GraphicsRequirements(XrSessionManager& xr, LUID* outAdapterLuid);
+
 // Create session with D3D11 device and window handle (using XR_EXT_session_target)
 bool CreateSession(XrSessionManager& xr, ID3D11Device* d3d11Device, HWND hwnd);
 

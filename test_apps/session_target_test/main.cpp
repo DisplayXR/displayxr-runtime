@@ -349,29 +349,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return 1;
     }
 
-    // Initialize D3D11
-    LOG_INFO("Initializing D3D11...");
-    D3D11Renderer renderer = {};
-    if (!InitializeD3D11(renderer)) {
-        LOG_ERROR("D3D11 initialization failed");
-        MessageBox(hwnd, L"Failed to initialize D3D11", L"Error", MB_OK | MB_ICONERROR);
-        ShutdownLogging();
-        return 1;
-    }
-    LOG_INFO("D3D11 initialized successfully");
-
-    // Initialize text overlay
-    LOG_INFO("Initializing text overlay...");
-    TextOverlay textOverlay = {};
-    if (!InitializeTextOverlay(textOverlay)) {
-        LOG_ERROR("Text overlay initialization failed");
-        MessageBox(hwnd, L"Failed to initialize text overlay", L"Error", MB_OK | MB_ICONERROR);
-        CleanupD3D11(renderer);
-        ShutdownLogging();
-        return 1;
-    }
-    LOG_INFO("Text overlay initialized successfully");
-
     // Run runtime loading diagnostics before OpenXR init
     DiagnoseRuntimeLoading();
 
@@ -393,27 +370,61 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         }
     }
 
-    // Initialize OpenXR
+    // Initialize OpenXR FIRST to get required GPU adapter LUID
     LOG_INFO("Initializing OpenXR instance...");
     XrSessionManager xr = {};
     if (!InitializeOpenXR(xr)) {
         LOG_ERROR("OpenXR initialization failed");
         MessageBox(hwnd, L"Failed to initialize OpenXR", L"Error", MB_OK | MB_ICONERROR);
-        CleanupTextOverlay(textOverlay);
-        CleanupD3D11(renderer);
         ShutdownLogging();
         return 1;
     }
     LOG_INFO("OpenXR instance initialized successfully");
+
+    // Get the required GPU adapter LUID from OpenXR
+    // This tells us which GPU to create the D3D11 device on
+    LUID adapterLuid;
+    if (!GetD3D11GraphicsRequirements(xr, &adapterLuid)) {
+        LOG_ERROR("Failed to get D3D11 graphics requirements");
+        MessageBox(hwnd, L"Failed to get D3D11 graphics requirements", L"Error", MB_OK | MB_ICONERROR);
+        CleanupOpenXR(xr);
+        ShutdownLogging();
+        return 1;
+    }
+
+    // Initialize D3D11 on the CORRECT adapter (specified by OpenXR)
+    LOG_INFO("Initializing D3D11 on OpenXR-specified adapter...");
+    D3D11Renderer renderer = {};
+    if (!InitializeD3D11WithLUID(renderer, adapterLuid)) {
+        LOG_ERROR("D3D11 initialization failed");
+        MessageBox(hwnd, L"Failed to initialize D3D11", L"Error", MB_OK | MB_ICONERROR);
+        CleanupOpenXR(xr);
+        ShutdownLogging();
+        return 1;
+    }
+    LOG_INFO("D3D11 initialized successfully on correct adapter");
+
+    // Initialize text overlay (needs D3D11 device)
+    LOG_INFO("Initializing text overlay...");
+    TextOverlay textOverlay = {};
+    if (!InitializeTextOverlay(textOverlay)) {
+        LOG_ERROR("Text overlay initialization failed");
+        MessageBox(hwnd, L"Failed to initialize text overlay", L"Error", MB_OK | MB_ICONERROR);
+        CleanupD3D11(renderer);
+        CleanupOpenXR(xr);
+        ShutdownLogging();
+        return 1;
+    }
+    LOG_INFO("Text overlay initialized successfully");
 
     // Create OpenXR session with window handle (using XR_EXT_session_target)
     LOG_INFO("Creating OpenXR session with XR_EXT_session_target (HWND: 0x%p)...", hwnd);
     if (!CreateSession(xr, renderer.device.Get(), hwnd)) {
         LOG_ERROR("OpenXR session creation failed");
         MessageBox(hwnd, L"Failed to create OpenXR session", L"Error", MB_OK | MB_ICONERROR);
-        CleanupOpenXR(xr);
         CleanupTextOverlay(textOverlay);
         CleanupD3D11(renderer);
+        CleanupOpenXR(xr);
         ShutdownLogging();
         return 1;
     }

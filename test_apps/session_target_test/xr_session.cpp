@@ -163,6 +163,33 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     return true;
 }
 
+bool GetD3D11GraphicsRequirements(XrSessionManager& xr, LUID* outAdapterLuid) {
+    LOG_INFO("Getting D3D11 graphics requirements...");
+
+    // Get the function pointer for xrGetD3D11GraphicsRequirementsKHR
+    PFN_xrGetD3D11GraphicsRequirementsKHR xrGetD3D11GraphicsRequirementsKHR = nullptr;
+    XrResult result = xrGetInstanceProcAddr(xr.instance, "xrGetD3D11GraphicsRequirementsKHR",
+        (PFN_xrVoidFunction*)&xrGetD3D11GraphicsRequirementsKHR);
+    if (XR_FAILED(result) || !xrGetD3D11GraphicsRequirementsKHR) {
+        LOG_ERROR("Failed to get xrGetD3D11GraphicsRequirementsKHR function pointer");
+        return false;
+    }
+
+    XrGraphicsRequirementsD3D11KHR graphicsReq = {XR_TYPE_GRAPHICS_REQUIREMENTS_D3D11_KHR};
+    result = xrGetD3D11GraphicsRequirementsKHR(xr.instance, xr.systemId, &graphicsReq);
+    if (XR_FAILED(result)) {
+        LogXrResult("xrGetD3D11GraphicsRequirementsKHR", result);
+        return false;
+    }
+
+    LOG_INFO("D3D11 graphics requirements:");
+    LOG_INFO("  Adapter LUID: 0x%08X%08X", graphicsReq.adapterLuid.HighPart, graphicsReq.adapterLuid.LowPart);
+    LOG_INFO("  Min Feature Level: %d", graphicsReq.minFeatureLevel);
+
+    *outAdapterLuid = graphicsReq.adapterLuid;
+    return true;
+}
+
 bool CreateSession(XrSessionManager& xr, ID3D11Device* d3d11Device, HWND hwnd) {
     LOG_INFO("Creating OpenXR session...");
     LOG_INFO("  D3D11 Device: 0x%p", d3d11Device);
