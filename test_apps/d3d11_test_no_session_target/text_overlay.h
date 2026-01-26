@@ -1,0 +1,54 @@
+// Copyright 2025, Leia Inc.
+// SPDX-License-Identifier: BSL-1.0
+/*!
+ * @file
+ * @brief  On-screen text rendering using DirectWrite
+ */
+
+#pragma once
+
+#define WIN32_LEAN_AND_MEAN
+#define UNICODE
+#define _UNICODE
+#include <windows.h>
+#include <d3d11.h>
+#include <d2d1.h>
+#include <dwrite.h>
+#include <wrl/client.h>
+#include <string>
+
+using Microsoft::WRL::ComPtr;
+
+struct TextOverlay {
+    ComPtr<ID2D1Factory> d2dFactory;
+    ComPtr<IDWriteFactory> dwriteFactory;
+    ComPtr<IDWriteTextFormat> textFormat;
+    ComPtr<IDWriteTextFormat> smallTextFormat;
+
+    bool initialized = false;
+};
+
+// Initialize DirectWrite resources
+bool InitializeTextOverlay(TextOverlay& overlay);
+
+// Clean up resources
+void CleanupTextOverlay(TextOverlay& overlay);
+
+// Render text to a D3D11 render target
+// Note: This creates temporary D2D resources per-frame for simplicity
+// A production implementation would cache these
+void RenderText(
+    TextOverlay& overlay,
+    ID3D11Device* device,
+    ID3D11Texture2D* texture,
+    const std::wstring& text,
+    float x, float y,
+    float width, float height,
+    bool useSmallFont = false
+);
+
+// Helper to format various overlay texts
+std::wstring FormatSessionState(int state);
+std::wstring FormatPerformanceInfo(float fps, float frameTimeMs, uint32_t width, uint32_t height);
+std::wstring FormatInputInfo(const std::string& lastKey, int mouseX, int mouseY, const std::string& mouseButtons);
+std::wstring FormatEyeTrackingInfo(float posX, float posY, bool active);
