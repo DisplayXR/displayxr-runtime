@@ -80,12 +80,48 @@ ipc_shmem_create(size_t size, xrt_shmem_handle_t *out_handle, void **out_map)
 
 #elif defined(XRT_OS_WINDOWS)
 
+#include "util/u_windows.h"
+
+#include <sddl.h>
+
+static BOOL
+create_appcontainer_security_attributes(SECURITY_ATTRIBUTES *sa)
+{
+	sa->nLength = sizeof(SECURITY_ATTRIBUTES);
+	sa->bInheritHandle = FALSE;
+	sa->lpSecurityDescriptor = NULL;
+
+	// Same SDDL as named pipes - allows AppContainer access for Chrome WebXR
+	const char *sddl =                   //
+	    "D:"                             // Discretionary ACL
+	    "(D;OICI;GA;;;BG)"               // Guest: deny
+	    "(D;OICI;GA;;;AN)"               // Anonymous: deny
+	    "(A;OICI;GRGWGX;;;AC)"           // UWP/AppContainer: read/write/execute
+	    "(A;OICI;GRGWGX;;;AU)"           // Authenticated user: read/write/execute
+	    "(A;OICI;GA;;;BA)";              // Administrator: full control
+
+	return ConvertStringSecurityDescriptorToSecurityDescriptorA(
+	    sddl, SDDL_REVISION_1, &sa->lpSecurityDescriptor, NULL);
+}
+
 xrt_result_t
 ipc_shmem_create(size_t size, xrt_shmem_handle_t *out_handle, void **out_map)
 {
 	*out_handle = NULL;
+
+	SECURITY_ATTRIBUTES sa;
+	LPSECURITY_ATTRIBUTES lpsa = NULL;
+	if (create_appcontainer_security_attributes(&sa)) {
+		lpsa = &sa;
+	}
+
 	LARGE_INTEGER sz = {.QuadPart = size};
-	HANDLE handle = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, sz.HighPart, sz.LowPart, NULL);
+	HANDLE handle = CreateFileMappingA(INVALID_HANDLE_VALUE, lpsa, PAGE_READWRITE, sz.HighPart, sz.LowPart, NULL);
+
+	if (sa.lpSecurityDescriptor != NULL) {
+		LocalFree(sa.lpSecurityDescriptor);
+	}
+
 	if (handle == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
 	}

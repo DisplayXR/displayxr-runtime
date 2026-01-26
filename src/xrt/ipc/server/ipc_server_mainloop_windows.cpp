@@ -118,10 +118,12 @@ create_pipe_instance(struct ipc_server_mainloop *ml, bool first)
 		U_LOG_E("ConvertStringSecurityDescriptorToSecurityDescriptor: %u %s", err, ERROR_STR(buffer, err));
 	}
 
-	LPSECURITY_ATTRIBUTES lpsa = nullptr;
+	// AppContainer-compatible security is the default (required for Chrome WebXR)
+	// Set IPC_RELAXED_CONNECTION_SECURITY=1 to disable for debugging
+	LPSECURITY_ATTRIBUTES lpsa = &sa;
 	if (debug_get_bool_option_relaxed()) {
-		U_LOG_W("Using relax security permissions on pipe");
-		lpsa = &sa;
+		U_LOG_W("IPC_RELAXED_CONNECTION_SECURITY set - disabling AppContainer security");
+		lpsa = nullptr;
 	}
 
 	DWORD dwOpenMode = PIPE_ACCESS_DUPLEX;

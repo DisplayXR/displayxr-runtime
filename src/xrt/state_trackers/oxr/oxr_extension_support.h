@@ -26,7 +26,8 @@
  */
 #if defined(XR_KHR_android_create_instance) && defined(XR_USE_PLATFORM_ANDROID)
 #define OXR_HAVE_KHR_android_create_instance
-#define OXR_EXTENSION_SUPPORT_KHR_android_create_instance(_) _(KHR_android_create_instance, KHR_ANDROID_CREATE_INSTANCE)
+#define OXR_EXTENSION_SUPPORT_KHR_android_create_instance(_) \
+    _(KHR_android_create_instance, KHR_ANDROID_CREATE_INSTANCE)
 #else
 #define OXR_EXTENSION_SUPPORT_KHR_android_create_instance(_)
 #endif
@@ -37,7 +38,8 @@
  */
 #if defined(XR_KHR_android_thread_settings) && defined(XR_USE_PLATFORM_ANDROID)
 #define OXR_HAVE_KHR_android_thread_settings
-#define OXR_EXTENSION_SUPPORT_KHR_android_thread_settings(_) _(KHR_android_thread_settings, KHR_ANDROID_THREAD_SETTINGS)
+#define OXR_EXTENSION_SUPPORT_KHR_android_thread_settings(_) \
+    _(KHR_android_thread_settings, KHR_ANDROID_THREAD_SETTINGS)
 #else
 #define OXR_EXTENSION_SUPPORT_KHR_android_thread_settings(_)
 #endif
@@ -48,7 +50,8 @@
  */
 #if defined(XR_KHR_binding_modification)
 #define OXR_HAVE_KHR_binding_modification
-#define OXR_EXTENSION_SUPPORT_KHR_binding_modification(_) _(KHR_binding_modification, KHR_BINDING_MODIFICATION)
+#define OXR_EXTENSION_SUPPORT_KHR_binding_modification(_) \
+    _(KHR_binding_modification, KHR_BINDING_MODIFICATION)
 #else
 #define OXR_EXTENSION_SUPPORT_KHR_binding_modification(_)
 #endif
@@ -59,8 +62,8 @@
  */
 #if defined(XR_KHR_composition_layer_color_scale_bias) && defined(XRT_FEATURE_OPENXR_LAYER_COLOR_SCALE_BIAS)
 #define OXR_HAVE_KHR_composition_layer_color_scale_bias
-#define OXR_EXTENSION_SUPPORT_KHR_composition_layer_color_scale_bias(_)                                                \
-	_(KHR_composition_layer_color_scale_bias, KHR_COMPOSITION_LAYER_COLOR_SCALE_BIAS)
+#define OXR_EXTENSION_SUPPORT_KHR_composition_layer_color_scale_bias(_) \
+    _(KHR_composition_layer_color_scale_bias, KHR_COMPOSITION_LAYER_COLOR_SCALE_BIAS)
 #else
 #define OXR_EXTENSION_SUPPORT_KHR_composition_layer_color_scale_bias(_)
 #endif
@@ -71,7 +74,8 @@
  */
 #if defined(XR_KHR_composition_layer_cube) && defined(XRT_FEATURE_OPENXR_LAYER_CUBE)
 #define OXR_HAVE_KHR_composition_layer_cube
-#define OXR_EXTENSION_SUPPORT_KHR_composition_layer_cube(_) _(KHR_composition_layer_cube, KHR_COMPOSITION_LAYER_CUBE)
+#define OXR_EXTENSION_SUPPORT_KHR_composition_layer_cube(_) \
+    _(KHR_composition_layer_cube, KHR_COMPOSITION_LAYER_CUBE)
 #else
 #define OXR_EXTENSION_SUPPORT_KHR_composition_layer_cube(_)
 #endif
@@ -82,8 +86,8 @@
  */
 #if defined(XR_KHR_composition_layer_cylinder) && defined(XRT_FEATURE_OPENXR_LAYER_CYLINDER)
 #define OXR_HAVE_KHR_composition_layer_cylinder
-#define OXR_EXTENSION_SUPPORT_KHR_composition_layer_cylinder(_)                                                        \
-	_(KHR_composition_layer_cylinder, KHR_COMPOSITION_LAYER_CYLINDER)
+#define OXR_EXTENSION_SUPPORT_KHR_composition_layer_cylinder(_) \
+    _(KHR_composition_layer_cylinder, KHR_COMPOSITION_LAYER_CYLINDER)
 #else
 #define OXR_EXTENSION_SUPPORT_KHR_composition_layer_cylinder(_)
 #endif
@@ -94,7 +98,8 @@
  */
 #if defined(XR_KHR_composition_layer_depth) && defined(XRT_FEATURE_OPENXR_LAYER_DEPTH)
 #define OXR_HAVE_KHR_composition_layer_depth
-#define OXR_EXTENSION_SUPPORT_KHR_composition_layer_depth(_) _(KHR_composition_layer_depth, KHR_COMPOSITION_LAYER_DEPTH)
+#define OXR_EXTENSION_SUPPORT_KHR_composition_layer_depth(_) \
+    _(KHR_composition_layer_depth, KHR_COMPOSITION_LAYER_DEPTH)
 #else
 #define OXR_EXTENSION_SUPPORT_KHR_composition_layer_depth(_)
 #endif
@@ -105,8 +110,8 @@
  */
 #if defined(XR_KHR_composition_layer_equirect) && defined(XRT_FEATURE_OPENXR_LAYER_EQUIRECT1)
 #define OXR_HAVE_KHR_composition_layer_equirect
-#define OXR_EXTENSION_SUPPORT_KHR_composition_layer_equirect(_)                                                        \
-	_(KHR_composition_layer_equirect, KHR_COMPOSITION_LAYER_EQUIRECT)
+#define OXR_EXTENSION_SUPPORT_KHR_composition_layer_equirect(_) \
+    _(KHR_composition_layer_equirect, KHR_COMPOSITION_LAYER_EQUIRECT)
 #else
 #define OXR_EXTENSION_SUPPORT_KHR_composition_layer_equirect(_)
 #endif
@@ -117,8 +122,8 @@
  */
 #if defined(XR_KHR_composition_layer_equirect2) && defined(XRT_FEATURE_OPENXR_LAYER_EQUIRECT2)
 #define OXR_HAVE_KHR_composition_layer_equirect2
-#define OXR_EXTENSION_SUPPORT_KHR_composition_layer_equirect2(_)                                                       \
-	_(KHR_composition_layer_equirect2, KHR_COMPOSITION_LAYER_EQUIRECT2)
+#define OXR_EXTENSION_SUPPORT_KHR_composition_layer_equirect2(_) \
+    _(KHR_composition_layer_equirect2, KHR_COMPOSITION_LAYER_EQUIRECT2)
 #else
 #define OXR_EXTENSION_SUPPORT_KHR_composition_layer_equirect2(_)
 #endif
@@ -129,7 +134,8 @@
  */
 #if defined(XR_KHR_convert_timespec_time) && defined(XR_USE_TIMESPEC) && (!defined(XR_USE_PLATFORM_WIN32))
 #define OXR_HAVE_KHR_convert_timespec_time
-#define OXR_EXTENSION_SUPPORT_KHR_convert_timespec_time(_) _(KHR_convert_timespec_time, KHR_CONVERT_TIMESPEC_TIME)
+#define OXR_EXTENSION_SUPPORT_KHR_convert_timespec_time(_) \
+    _(KHR_convert_timespec_time, KHR_CONVERT_TIMESPEC_TIME)
 #else
 #define OXR_EXTENSION_SUPPORT_KHR_convert_timespec_time(_)
 #endif
@@ -140,7 +146,8 @@
  */
 #if defined(XR_KHR_D3D11_enable) && defined(XR_USE_GRAPHICS_API_D3D11)
 #define OXR_HAVE_KHR_D3D11_enable
-#define OXR_EXTENSION_SUPPORT_KHR_D3D11_enable(_) _(KHR_D3D11_enable, KHR_D3D11_ENABLE)
+#define OXR_EXTENSION_SUPPORT_KHR_D3D11_enable(_) \
+    _(KHR_D3D11_enable, KHR_D3D11_ENABLE)
 #else
 #define OXR_EXTENSION_SUPPORT_KHR_D3D11_enable(_)
 #endif
@@ -151,7 +158,8 @@
  */
 #if defined(XR_KHR_D3D12_enable) && defined(XR_USE_GRAPHICS_API_D3D12)
 #define OXR_HAVE_KHR_D3D12_enable
-#define OXR_EXTENSION_SUPPORT_KHR_D3D12_enable(_) _(KHR_D3D12_enable, KHR_D3D12_ENABLE)
+#define OXR_EXTENSION_SUPPORT_KHR_D3D12_enable(_) \
+    _(KHR_D3D12_enable, KHR_D3D12_ENABLE)
 #else
 #define OXR_EXTENSION_SUPPORT_KHR_D3D12_enable(_)
 #endif
@@ -162,8 +170,8 @@
  */
 #if defined(XR_KHR_extended_struct_name_lengths)
 #define OXR_HAVE_KHR_extended_struct_name_lengths
-#define OXR_EXTENSION_SUPPORT_KHR_extended_struct_name_lengths(_)                                                      \
-	_(KHR_extended_struct_name_lengths, KHR_EXTENDED_STRUCT_NAME_LENGTHS)
+#define OXR_EXTENSION_SUPPORT_KHR_extended_struct_name_lengths(_) \
+    _(KHR_extended_struct_name_lengths, KHR_EXTENDED_STRUCT_NAME_LENGTHS)
 #else
 #define OXR_EXTENSION_SUPPORT_KHR_extended_struct_name_lengths(_)
 #endif
@@ -174,7 +182,8 @@
  */
 #if defined(XR_KHR_loader_init) && defined(XR_USE_PLATFORM_ANDROID)
 #define OXR_HAVE_KHR_loader_init
-#define OXR_EXTENSION_SUPPORT_KHR_loader_init(_) _(KHR_loader_init, KHR_LOADER_INIT)
+#define OXR_EXTENSION_SUPPORT_KHR_loader_init(_) \
+    _(KHR_loader_init, KHR_LOADER_INIT)
 #else
 #define OXR_EXTENSION_SUPPORT_KHR_loader_init(_)
 #endif
@@ -185,7 +194,8 @@
  */
 #if defined(XR_KHR_loader_init_android) && defined(OXR_HAVE_KHR_loader_init) && defined(XR_USE_PLATFORM_ANDROID)
 #define OXR_HAVE_KHR_loader_init_android
-#define OXR_EXTENSION_SUPPORT_KHR_loader_init_android(_) _(KHR_loader_init_android, KHR_LOADER_INIT_ANDROID)
+#define OXR_EXTENSION_SUPPORT_KHR_loader_init_android(_) \
+    _(KHR_loader_init_android, KHR_LOADER_INIT_ANDROID)
 #else
 #define OXR_EXTENSION_SUPPORT_KHR_loader_init_android(_)
 #endif
@@ -196,7 +206,8 @@
  */
 #if defined(XR_KHR_locate_spaces)
 #define OXR_HAVE_KHR_locate_spaces
-#define OXR_EXTENSION_SUPPORT_KHR_locate_spaces(_) _(KHR_locate_spaces, KHR_LOCATE_SPACES)
+#define OXR_EXTENSION_SUPPORT_KHR_locate_spaces(_) \
+    _(KHR_locate_spaces, KHR_LOCATE_SPACES)
 #else
 #define OXR_EXTENSION_SUPPORT_KHR_locate_spaces(_)
 #endif
@@ -207,7 +218,8 @@
  */
 #if defined(XR_KHR_maintenance1)
 #define OXR_HAVE_KHR_maintenance1
-#define OXR_EXTENSION_SUPPORT_KHR_maintenance1(_) _(KHR_maintenance1, KHR_MAINTENANCE1)
+#define OXR_EXTENSION_SUPPORT_KHR_maintenance1(_) \
+    _(KHR_maintenance1, KHR_MAINTENANCE1)
 #else
 #define OXR_EXTENSION_SUPPORT_KHR_maintenance1(_)
 #endif
@@ -218,7 +230,8 @@
  */
 #if defined(XR_KHR_opengl_enable) && defined(XR_USE_GRAPHICS_API_OPENGL)
 #define OXR_HAVE_KHR_opengl_enable
-#define OXR_EXTENSION_SUPPORT_KHR_opengl_enable(_) _(KHR_opengl_enable, KHR_OPENGL_ENABLE)
+#define OXR_EXTENSION_SUPPORT_KHR_opengl_enable(_) \
+    _(KHR_opengl_enable, KHR_OPENGL_ENABLE)
 #else
 #define OXR_EXTENSION_SUPPORT_KHR_opengl_enable(_)
 #endif
@@ -229,7 +242,8 @@
  */
 #if defined(XR_KHR_opengl_es_enable) && defined(XR_USE_GRAPHICS_API_OPENGL_ES)
 #define OXR_HAVE_KHR_opengl_es_enable
-#define OXR_EXTENSION_SUPPORT_KHR_opengl_es_enable(_) _(KHR_opengl_es_enable, KHR_OPENGL_ES_ENABLE)
+#define OXR_EXTENSION_SUPPORT_KHR_opengl_es_enable(_) \
+    _(KHR_opengl_es_enable, KHR_OPENGL_ES_ENABLE)
 #else
 #define OXR_EXTENSION_SUPPORT_KHR_opengl_es_enable(_)
 #endif
@@ -240,8 +254,8 @@
  */
 #if defined(XR_KHR_swapchain_usage_input_attachment_bit)
 #define OXR_HAVE_KHR_swapchain_usage_input_attachment_bit
-#define OXR_EXTENSION_SUPPORT_KHR_swapchain_usage_input_attachment_bit(_)                                              \
-	_(KHR_swapchain_usage_input_attachment_bit, KHR_SWAPCHAIN_USAGE_INPUT_ATTACHMENT_BIT)
+#define OXR_EXTENSION_SUPPORT_KHR_swapchain_usage_input_attachment_bit(_) \
+    _(KHR_swapchain_usage_input_attachment_bit, KHR_SWAPCHAIN_USAGE_INPUT_ATTACHMENT_BIT)
 #else
 #define OXR_EXTENSION_SUPPORT_KHR_swapchain_usage_input_attachment_bit(_)
 #endif
@@ -252,7 +266,8 @@
  */
 #if defined(XR_KHR_visibility_mask) && defined(XRT_FEATURE_OPENXR_VISIBILITY_MASK)
 #define OXR_HAVE_KHR_visibility_mask
-#define OXR_EXTENSION_SUPPORT_KHR_visibility_mask(_) _(KHR_visibility_mask, KHR_VISIBILITY_MASK)
+#define OXR_EXTENSION_SUPPORT_KHR_visibility_mask(_) \
+    _(KHR_visibility_mask, KHR_VISIBILITY_MASK)
 #else
 #define OXR_EXTENSION_SUPPORT_KHR_visibility_mask(_)
 #endif
@@ -263,7 +278,8 @@
  */
 #if defined(XR_KHR_vulkan_enable) && defined(XR_USE_GRAPHICS_API_VULKAN)
 #define OXR_HAVE_KHR_vulkan_enable
-#define OXR_EXTENSION_SUPPORT_KHR_vulkan_enable(_) _(KHR_vulkan_enable, KHR_VULKAN_ENABLE)
+#define OXR_EXTENSION_SUPPORT_KHR_vulkan_enable(_) \
+    _(KHR_vulkan_enable, KHR_VULKAN_ENABLE)
 #else
 #define OXR_EXTENSION_SUPPORT_KHR_vulkan_enable(_)
 #endif
@@ -274,7 +290,8 @@
  */
 #if defined(XR_KHR_vulkan_enable2) && defined(XR_USE_GRAPHICS_API_VULKAN)
 #define OXR_HAVE_KHR_vulkan_enable2
-#define OXR_EXTENSION_SUPPORT_KHR_vulkan_enable2(_) _(KHR_vulkan_enable2, KHR_VULKAN_ENABLE2)
+#define OXR_EXTENSION_SUPPORT_KHR_vulkan_enable2(_) \
+    _(KHR_vulkan_enable2, KHR_VULKAN_ENABLE2)
 #else
 #define OXR_EXTENSION_SUPPORT_KHR_vulkan_enable2(_)
 #endif
@@ -283,11 +300,10 @@
 /*
  * XR_KHR_vulkan_swapchain_format_list
  */
-#if defined(XR_KHR_vulkan_swapchain_format_list) && defined(XR_USE_GRAPHICS_API_VULKAN) &&                             \
-    defined(XRT_FEATURE_OPENXR_VULKAN_SWAPCHAIN_FORMAT_LIST)
+#if defined(XR_KHR_vulkan_swapchain_format_list) && defined(XR_USE_GRAPHICS_API_VULKAN) && defined(XRT_FEATURE_OPENXR_VULKAN_SWAPCHAIN_FORMAT_LIST)
 #define OXR_HAVE_KHR_vulkan_swapchain_format_list
-#define OXR_EXTENSION_SUPPORT_KHR_vulkan_swapchain_format_list(_)                                                      \
-	_(KHR_vulkan_swapchain_format_list, KHR_VULKAN_SWAPCHAIN_FORMAT_LIST)
+#define OXR_EXTENSION_SUPPORT_KHR_vulkan_swapchain_format_list(_) \
+    _(KHR_vulkan_swapchain_format_list, KHR_VULKAN_SWAPCHAIN_FORMAT_LIST)
 #else
 #define OXR_EXTENSION_SUPPORT_KHR_vulkan_swapchain_format_list(_)
 #endif
@@ -298,8 +314,8 @@
  */
 #if defined(XR_KHR_win32_convert_performance_counter_time) && defined(XR_USE_PLATFORM_WIN32)
 #define OXR_HAVE_KHR_win32_convert_performance_counter_time
-#define OXR_EXTENSION_SUPPORT_KHR_win32_convert_performance_counter_time(_)                                            \
-	_(KHR_win32_convert_performance_counter_time, KHR_WIN32_CONVERT_PERFORMANCE_COUNTER_TIME)
+#define OXR_EXTENSION_SUPPORT_KHR_win32_convert_performance_counter_time(_) \
+    _(KHR_win32_convert_performance_counter_time, KHR_WIN32_CONVERT_PERFORMANCE_COUNTER_TIME)
 #else
 #define OXR_EXTENSION_SUPPORT_KHR_win32_convert_performance_counter_time(_)
 #endif
@@ -310,8 +326,8 @@
  */
 #if defined(XR_EXT_active_action_set_priority) && defined(XRT_FEATURE_OPENXR_ACTIVE_ACTION_SET_PRIORITY)
 #define OXR_HAVE_EXT_active_action_set_priority
-#define OXR_EXTENSION_SUPPORT_EXT_active_action_set_priority(_)                                                        \
-	_(EXT_active_action_set_priority, EXT_ACTIVE_ACTION_SET_PRIORITY)
+#define OXR_EXTENSION_SUPPORT_EXT_active_action_set_priority(_) \
+    _(EXT_active_action_set_priority, EXT_ACTIVE_ACTION_SET_PRIORITY)
 #else
 #define OXR_EXTENSION_SUPPORT_EXT_active_action_set_priority(_)
 #endif
@@ -322,7 +338,8 @@
  */
 #if defined(XR_EXT_debug_utils) && defined(XRT_FEATURE_OPENXR_DEBUG_UTILS)
 #define OXR_HAVE_EXT_debug_utils
-#define OXR_EXTENSION_SUPPORT_EXT_debug_utils(_) _(EXT_debug_utils, EXT_DEBUG_UTILS)
+#define OXR_EXTENSION_SUPPORT_EXT_debug_utils(_) \
+    _(EXT_debug_utils, EXT_DEBUG_UTILS)
 #else
 #define OXR_EXTENSION_SUPPORT_EXT_debug_utils(_)
 #endif
@@ -333,7 +350,8 @@
  */
 #if defined(XR_EXT_dpad_binding)
 #define OXR_HAVE_EXT_dpad_binding
-#define OXR_EXTENSION_SUPPORT_EXT_dpad_binding(_) _(EXT_dpad_binding, EXT_DPAD_BINDING)
+#define OXR_EXTENSION_SUPPORT_EXT_dpad_binding(_) \
+    _(EXT_dpad_binding, EXT_DPAD_BINDING)
 #else
 #define OXR_EXTENSION_SUPPORT_EXT_dpad_binding(_)
 #endif
@@ -344,7 +362,8 @@
  */
 #if defined(XR_EXT_eye_gaze_interaction) && defined(XRT_FEATURE_OPENXR_INTERACTION_EXT_EYE_GAZE)
 #define OXR_HAVE_EXT_eye_gaze_interaction
-#define OXR_EXTENSION_SUPPORT_EXT_eye_gaze_interaction(_) _(EXT_eye_gaze_interaction, EXT_EYE_GAZE_INTERACTION)
+#define OXR_EXTENSION_SUPPORT_EXT_eye_gaze_interaction(_) \
+    _(EXT_eye_gaze_interaction, EXT_EYE_GAZE_INTERACTION)
 #else
 #define OXR_EXTENSION_SUPPORT_EXT_eye_gaze_interaction(_)
 #endif
@@ -355,7 +374,8 @@
  */
 #if defined(XR_EXT_hand_interaction) && defined(XRT_FEATURE_OPENXR_INTERACTION_EXT_HAND)
 #define OXR_HAVE_EXT_hand_interaction
-#define OXR_EXTENSION_SUPPORT_EXT_hand_interaction(_) _(EXT_hand_interaction, EXT_HAND_INTERACTION)
+#define OXR_EXTENSION_SUPPORT_EXT_hand_interaction(_) \
+    _(EXT_hand_interaction, EXT_HAND_INTERACTION)
 #else
 #define OXR_EXTENSION_SUPPORT_EXT_hand_interaction(_)
 #endif
@@ -366,7 +386,8 @@
  */
 #if defined(XR_EXT_hand_tracking) && defined(XRT_FEATURE_OPENXR_HAND_TRACKING_EXT)
 #define OXR_HAVE_EXT_hand_tracking
-#define OXR_EXTENSION_SUPPORT_EXT_hand_tracking(_) _(EXT_hand_tracking, EXT_HAND_TRACKING)
+#define OXR_EXTENSION_SUPPORT_EXT_hand_tracking(_) \
+    _(EXT_hand_tracking, EXT_HAND_TRACKING)
 #else
 #define OXR_EXTENSION_SUPPORT_EXT_hand_tracking(_)
 #endif
@@ -377,8 +398,8 @@
  */
 #if defined(XR_EXT_hand_tracking_data_source) && defined(XRT_FEATURE_OPENXR_HAND_TRACKING_DATA_SOURCE_EXT)
 #define OXR_HAVE_EXT_hand_tracking_data_source
-#define OXR_EXTENSION_SUPPORT_EXT_hand_tracking_data_source(_)                                                         \
-	_(EXT_hand_tracking_data_source, EXT_HAND_TRACKING_DATA_SOURCE)
+#define OXR_EXTENSION_SUPPORT_EXT_hand_tracking_data_source(_) \
+    _(EXT_hand_tracking_data_source, EXT_HAND_TRACKING_DATA_SOURCE)
 #else
 #define OXR_EXTENSION_SUPPORT_EXT_hand_tracking_data_source(_)
 #endif
@@ -389,8 +410,8 @@
  */
 #if defined(XR_EXT_hp_mixed_reality_controller) && defined(XRT_FEATURE_OPENXR_INTERACTION_WINMR)
 #define OXR_HAVE_EXT_hp_mixed_reality_controller
-#define OXR_EXTENSION_SUPPORT_EXT_hp_mixed_reality_controller(_)                                                       \
-	_(EXT_hp_mixed_reality_controller, EXT_HP_MIXED_REALITY_CONTROLLER)
+#define OXR_EXTENSION_SUPPORT_EXT_hp_mixed_reality_controller(_) \
+    _(EXT_hp_mixed_reality_controller, EXT_HP_MIXED_REALITY_CONTROLLER)
 #else
 #define OXR_EXTENSION_SUPPORT_EXT_hp_mixed_reality_controller(_)
 #endif
@@ -401,7 +422,8 @@
  */
 #if defined(XR_EXT_local_floor) && defined(XRT_FEATURE_OPENXR_SPACE_LOCAL_FLOOR)
 #define OXR_HAVE_EXT_local_floor
-#define OXR_EXTENSION_SUPPORT_EXT_local_floor(_) _(EXT_local_floor, EXT_LOCAL_FLOOR)
+#define OXR_EXTENSION_SUPPORT_EXT_local_floor(_) \
+    _(EXT_local_floor, EXT_LOCAL_FLOOR)
 #else
 #define OXR_EXTENSION_SUPPORT_EXT_local_floor(_)
 #endif
@@ -412,7 +434,8 @@
  */
 #if defined(XR_EXT_palm_pose) && defined(XRT_FEATURE_OPENXR_INTERACTION_EXT_PALM_POSE)
 #define OXR_HAVE_EXT_palm_pose
-#define OXR_EXTENSION_SUPPORT_EXT_palm_pose(_) _(EXT_palm_pose, EXT_PALM_POSE)
+#define OXR_EXTENSION_SUPPORT_EXT_palm_pose(_) \
+    _(EXT_palm_pose, EXT_PALM_POSE)
 #else
 #define OXR_EXTENSION_SUPPORT_EXT_palm_pose(_)
 #endif
@@ -423,7 +446,8 @@
  */
 #if defined(XR_EXT_performance_settings) && defined(XRT_FEATURE_OPENXR_PERFORMANCE_SETTINGS)
 #define OXR_HAVE_EXT_performance_settings
-#define OXR_EXTENSION_SUPPORT_EXT_performance_settings(_) _(EXT_performance_settings, EXT_PERFORMANCE_SETTINGS)
+#define OXR_EXTENSION_SUPPORT_EXT_performance_settings(_) \
+    _(EXT_performance_settings, EXT_PERFORMANCE_SETTINGS)
 #else
 #define OXR_EXTENSION_SUPPORT_EXT_performance_settings(_)
 #endif
@@ -434,7 +458,8 @@
  */
 #if defined(XR_EXT_plane_detection) && defined(XRT_FEATURE_OPENXR_PLANE_DETECTION)
 #define OXR_HAVE_EXT_plane_detection
-#define OXR_EXTENSION_SUPPORT_EXT_plane_detection(_) _(EXT_plane_detection, EXT_PLANE_DETECTION)
+#define OXR_EXTENSION_SUPPORT_EXT_plane_detection(_) \
+    _(EXT_plane_detection, EXT_PLANE_DETECTION)
 #else
 #define OXR_EXTENSION_SUPPORT_EXT_plane_detection(_)
 #endif
@@ -445,21 +470,10 @@
  */
 #if defined(XR_EXT_samsung_odyssey_controller) && defined(XRT_FEATURE_OPENXR_INTERACTION_WINMR)
 #define OXR_HAVE_EXT_samsung_odyssey_controller
-#define OXR_EXTENSION_SUPPORT_EXT_samsung_odyssey_controller(_)                                                        \
-	_(EXT_samsung_odyssey_controller, EXT_SAMSUNG_ODYSSEY_CONTROLLER)
+#define OXR_EXTENSION_SUPPORT_EXT_samsung_odyssey_controller(_) \
+    _(EXT_samsung_odyssey_controller, EXT_SAMSUNG_ODYSSEY_CONTROLLER)
 #else
 #define OXR_EXTENSION_SUPPORT_EXT_samsung_odyssey_controller(_)
-#endif
-
-
-/*
- * XR_EXT_session_target
- */
-#if defined(XR_EXT_session_target) && defined(XR_USE_PLATFORM_WIN32)
-#define OXR_HAVE_EXT_session_target
-#define OXR_EXTENSION_SUPPORT_EXT_session_target(_) _(EXT_session_target, EXT_SESSION_TARGET)
-#else
-#define OXR_EXTENSION_SUPPORT_EXT_session_target(_)
 #endif
 
 
@@ -468,9 +482,22 @@
  */
 #if defined(XR_EXT_user_presence) && defined(XRT_FEATURE_OPENXR_USER_PRESENCE)
 #define OXR_HAVE_EXT_user_presence
-#define OXR_EXTENSION_SUPPORT_EXT_user_presence(_) _(EXT_user_presence, EXT_USER_PRESENCE)
+#define OXR_EXTENSION_SUPPORT_EXT_user_presence(_) \
+    _(EXT_user_presence, EXT_USER_PRESENCE)
 #else
 #define OXR_EXTENSION_SUPPORT_EXT_user_presence(_)
+#endif
+
+
+/*
+ * XR_EXT_win32_appcontainer_compatible
+ */
+#if defined(XR_EXT_win32_appcontainer_compatible) && defined(XR_USE_PLATFORM_WIN32)
+#define OXR_HAVE_EXT_win32_appcontainer_compatible
+#define OXR_EXTENSION_SUPPORT_EXT_win32_appcontainer_compatible(_) \
+    _(EXT_win32_appcontainer_compatible, EXT_WIN32_APPCONTAINER_COMPATIBLE)
+#else
+#define OXR_EXTENSION_SUPPORT_EXT_win32_appcontainer_compatible(_)
 #endif
 
 
@@ -479,7 +506,8 @@
  */
 #if defined(XR_BD_controller_interaction) && defined(XRT_FEATURE_OPENXR_INTERACTION_BYTEDANCE)
 #define OXR_HAVE_BD_controller_interaction
-#define OXR_EXTENSION_SUPPORT_BD_controller_interaction(_) _(BD_controller_interaction, BD_CONTROLLER_INTERACTION)
+#define OXR_EXTENSION_SUPPORT_BD_controller_interaction(_) \
+    _(BD_controller_interaction, BD_CONTROLLER_INTERACTION)
 #else
 #define OXR_EXTENSION_SUPPORT_BD_controller_interaction(_)
 #endif
@@ -490,7 +518,8 @@
  */
 #if defined(XR_FB_body_tracking) && defined(XRT_FEATURE_OPENXR_BODY_TRACKING_FB)
 #define OXR_HAVE_FB_body_tracking
-#define OXR_EXTENSION_SUPPORT_FB_body_tracking(_) _(FB_body_tracking, FB_BODY_TRACKING)
+#define OXR_EXTENSION_SUPPORT_FB_body_tracking(_) \
+    _(FB_body_tracking, FB_BODY_TRACKING)
 #else
 #define OXR_EXTENSION_SUPPORT_FB_body_tracking(_)
 #endif
@@ -501,8 +530,8 @@
  */
 #if defined(XR_FB_composition_layer_alpha_blend) && defined(XRT_FEATURE_OPENXR_LAYER_FB_ALPHA_BLEND)
 #define OXR_HAVE_FB_composition_layer_alpha_blend
-#define OXR_EXTENSION_SUPPORT_FB_composition_layer_alpha_blend(_)                                                      \
-	_(FB_composition_layer_alpha_blend, FB_COMPOSITION_LAYER_ALPHA_BLEND)
+#define OXR_EXTENSION_SUPPORT_FB_composition_layer_alpha_blend(_) \
+    _(FB_composition_layer_alpha_blend, FB_COMPOSITION_LAYER_ALPHA_BLEND)
 #else
 #define OXR_EXTENSION_SUPPORT_FB_composition_layer_alpha_blend(_)
 #endif
@@ -513,8 +542,8 @@
  */
 #if defined(XR_FB_composition_layer_depth_test) && defined(XRT_FEATURE_OPENXR_LAYER_FB_DEPTH_TEST)
 #define OXR_HAVE_FB_composition_layer_depth_test
-#define OXR_EXTENSION_SUPPORT_FB_composition_layer_depth_test(_)                                                       \
-	_(FB_composition_layer_depth_test, FB_COMPOSITION_LAYER_DEPTH_TEST)
+#define OXR_EXTENSION_SUPPORT_FB_composition_layer_depth_test(_) \
+    _(FB_composition_layer_depth_test, FB_COMPOSITION_LAYER_DEPTH_TEST)
 #else
 #define OXR_EXTENSION_SUPPORT_FB_composition_layer_depth_test(_)
 #endif
@@ -525,8 +554,8 @@
  */
 #if defined(XR_FB_composition_layer_image_layout) && defined(XRT_FEATURE_OPENXR_LAYER_FB_IMAGE_LAYOUT)
 #define OXR_HAVE_FB_composition_layer_image_layout
-#define OXR_EXTENSION_SUPPORT_FB_composition_layer_image_layout(_)                                                     \
-	_(FB_composition_layer_image_layout, FB_COMPOSITION_LAYER_IMAGE_LAYOUT)
+#define OXR_EXTENSION_SUPPORT_FB_composition_layer_image_layout(_) \
+    _(FB_composition_layer_image_layout, FB_COMPOSITION_LAYER_IMAGE_LAYOUT)
 #else
 #define OXR_EXTENSION_SUPPORT_FB_composition_layer_image_layout(_)
 #endif
@@ -537,8 +566,8 @@
  */
 #if defined(XR_FB_composition_layer_settings) && defined(XRT_FEATURE_OPENXR_LAYER_FB_SETTINGS)
 #define OXR_HAVE_FB_composition_layer_settings
-#define OXR_EXTENSION_SUPPORT_FB_composition_layer_settings(_)                                                         \
-	_(FB_composition_layer_settings, FB_COMPOSITION_LAYER_SETTINGS)
+#define OXR_EXTENSION_SUPPORT_FB_composition_layer_settings(_) \
+    _(FB_composition_layer_settings, FB_COMPOSITION_LAYER_SETTINGS)
 #else
 #define OXR_EXTENSION_SUPPORT_FB_composition_layer_settings(_)
 #endif
@@ -549,7 +578,8 @@
  */
 #if defined(XR_FB_display_refresh_rate) && defined(XRT_FEATURE_OPENXR_DISPLAY_REFRESH_RATE)
 #define OXR_HAVE_FB_display_refresh_rate
-#define OXR_EXTENSION_SUPPORT_FB_display_refresh_rate(_) _(FB_display_refresh_rate, FB_DISPLAY_REFRESH_RATE)
+#define OXR_EXTENSION_SUPPORT_FB_display_refresh_rate(_) \
+    _(FB_display_refresh_rate, FB_DISPLAY_REFRESH_RATE)
 #else
 #define OXR_EXTENSION_SUPPORT_FB_display_refresh_rate(_)
 #endif
@@ -560,7 +590,8 @@
  */
 #if defined(XR_FB_face_tracking2) && defined(XRT_FEATURE_OPENXR_FACE_TRACKING2_FB)
 #define OXR_HAVE_FB_face_tracking2
-#define OXR_EXTENSION_SUPPORT_FB_face_tracking2(_) _(FB_face_tracking2, FB_FACE_TRACKING2)
+#define OXR_EXTENSION_SUPPORT_FB_face_tracking2(_) \
+    _(FB_face_tracking2, FB_FACE_TRACKING2)
 #else
 #define OXR_EXTENSION_SUPPORT_FB_face_tracking2(_)
 #endif
@@ -571,7 +602,8 @@
  */
 #if defined(XR_FB_haptic_pcm) && defined(XRT_FEATURE_OPENXR_HAPTIC_PCM)
 #define OXR_HAVE_FB_haptic_pcm
-#define OXR_EXTENSION_SUPPORT_FB_haptic_pcm(_) _(FB_haptic_pcm, FB_HAPTIC_PCM)
+#define OXR_EXTENSION_SUPPORT_FB_haptic_pcm(_) \
+    _(FB_haptic_pcm, FB_HAPTIC_PCM)
 #else
 #define OXR_EXTENSION_SUPPORT_FB_haptic_pcm(_)
 #endif
@@ -582,7 +614,8 @@
  */
 #if defined(XR_FB_passthrough) && defined(XRT_FEATURE_OPENXR_LAYER_FB_PASSTHROUGH)
 #define OXR_HAVE_FB_passthrough
-#define OXR_EXTENSION_SUPPORT_FB_passthrough(_) _(FB_passthrough, FB_PASSTHROUGH)
+#define OXR_EXTENSION_SUPPORT_FB_passthrough(_) \
+    _(FB_passthrough, FB_PASSTHROUGH)
 #else
 #define OXR_EXTENSION_SUPPORT_FB_passthrough(_)
 #endif
@@ -593,7 +626,8 @@
  */
 #if defined(XR_FB_touch_controller_pro) && defined(XRT_FEATURE_OPENXR_INTERACTION_TOUCH_PRO)
 #define OXR_HAVE_FB_touch_controller_pro
-#define OXR_EXTENSION_SUPPORT_FB_touch_controller_pro(_) _(FB_touch_controller_pro, FB_TOUCH_CONTROLLER_PRO)
+#define OXR_EXTENSION_SUPPORT_FB_touch_controller_pro(_) \
+    _(FB_touch_controller_pro, FB_TOUCH_CONTROLLER_PRO)
 #else
 #define OXR_EXTENSION_SUPPORT_FB_touch_controller_pro(_)
 #endif
@@ -604,8 +638,8 @@
  */
 #if defined(XR_FB_touch_controller_proximity) && defined(XRT_FEATURE_OPENXR_INTERACTION_FB_PROXIMITY)
 #define OXR_HAVE_FB_touch_controller_proximity
-#define OXR_EXTENSION_SUPPORT_FB_touch_controller_proximity(_)                                                         \
-	_(FB_touch_controller_proximity, FB_TOUCH_CONTROLLER_PROXIMITY)
+#define OXR_EXTENSION_SUPPORT_FB_touch_controller_proximity(_) \
+    _(FB_touch_controller_proximity, FB_TOUCH_CONTROLLER_PROXIMITY)
 #else
 #define OXR_EXTENSION_SUPPORT_FB_touch_controller_proximity(_)
 #endif
@@ -616,7 +650,8 @@
  */
 #if defined(XR_HTC_facial_tracking) && defined(XRT_FEATURE_OPENXR_FACIAL_TRACKING_HTC)
 #define OXR_HAVE_HTC_facial_tracking
-#define OXR_EXTENSION_SUPPORT_HTC_facial_tracking(_) _(HTC_facial_tracking, HTC_FACIAL_TRACKING)
+#define OXR_EXTENSION_SUPPORT_HTC_facial_tracking(_) \
+    _(HTC_facial_tracking, HTC_FACIAL_TRACKING)
 #else
 #define OXR_EXTENSION_SUPPORT_HTC_facial_tracking(_)
 #endif
@@ -627,8 +662,8 @@
  */
 #if defined(XR_HTC_vive_cosmos_controller_interaction) && defined(XRT_FEATURE_OPENXR_INTERACTION_VIVE_COSMOS)
 #define OXR_HAVE_HTC_vive_cosmos_controller_interaction
-#define OXR_EXTENSION_SUPPORT_HTC_vive_cosmos_controller_interaction(_)                                                \
-	_(HTC_vive_cosmos_controller_interaction, HTC_VIVE_COSMOS_CONTROLLER_INTERACTION)
+#define OXR_EXTENSION_SUPPORT_HTC_vive_cosmos_controller_interaction(_) \
+    _(HTC_vive_cosmos_controller_interaction, HTC_VIVE_COSMOS_CONTROLLER_INTERACTION)
 #else
 #define OXR_EXTENSION_SUPPORT_HTC_vive_cosmos_controller_interaction(_)
 #endif
@@ -639,8 +674,8 @@
  */
 #if defined(XR_HTC_vive_focus3_controller_interaction) && defined(XRT_FEATURE_OPENXR_INTERACTION_VIVE_FOCUS3)
 #define OXR_HAVE_HTC_vive_focus3_controller_interaction
-#define OXR_EXTENSION_SUPPORT_HTC_vive_focus3_controller_interaction(_)                                                \
-	_(HTC_vive_focus3_controller_interaction, HTC_VIVE_FOCUS3_CONTROLLER_INTERACTION)
+#define OXR_EXTENSION_SUPPORT_HTC_vive_focus3_controller_interaction(_) \
+    _(HTC_vive_focus3_controller_interaction, HTC_VIVE_FOCUS3_CONTROLLER_INTERACTION)
 #else
 #define OXR_EXTENSION_SUPPORT_HTC_vive_focus3_controller_interaction(_)
 #endif
@@ -651,8 +686,8 @@
  */
 #if defined(XR_META_body_tracking_calibration) && defined(XRT_FEATURE_OPENXR_BODY_TRACKING_CALIBRATION_META)
 #define OXR_HAVE_META_body_tracking_calibration
-#define OXR_EXTENSION_SUPPORT_META_body_tracking_calibration(_)                                                        \
-	_(META_body_tracking_calibration, META_BODY_TRACKING_CALIBRATION)
+#define OXR_EXTENSION_SUPPORT_META_body_tracking_calibration(_) \
+    _(META_body_tracking_calibration, META_BODY_TRACKING_CALIBRATION)
 #else
 #define OXR_EXTENSION_SUPPORT_META_body_tracking_calibration(_)
 #endif
@@ -663,8 +698,8 @@
  */
 #if defined(XR_META_body_tracking_full_body) && defined(XRT_FEATURE_OPENXR_BODY_TRACKING_FULL_BODY_META)
 #define OXR_HAVE_META_body_tracking_full_body
-#define OXR_EXTENSION_SUPPORT_META_body_tracking_full_body(_)                                                          \
-	_(META_body_tracking_full_body, META_BODY_TRACKING_FULL_BODY)
+#define OXR_EXTENSION_SUPPORT_META_body_tracking_full_body(_) \
+    _(META_body_tracking_full_body, META_BODY_TRACKING_FULL_BODY)
 #else
 #define OXR_EXTENSION_SUPPORT_META_body_tracking_full_body(_)
 #endif
@@ -675,7 +710,8 @@
  */
 #if defined(XR_META_touch_controller_plus) && defined(XRT_FEATURE_OPENXR_INTERACTION_TOUCH_PLUS)
 #define OXR_HAVE_META_touch_controller_plus
-#define OXR_EXTENSION_SUPPORT_META_touch_controller_plus(_) _(META_touch_controller_plus, META_TOUCH_CONTROLLER_PLUS)
+#define OXR_EXTENSION_SUPPORT_META_touch_controller_plus(_) \
+    _(META_touch_controller_plus, META_TOUCH_CONTROLLER_PLUS)
 #else
 #define OXR_EXTENSION_SUPPORT_META_touch_controller_plus(_)
 #endif
@@ -686,8 +722,8 @@
  */
 #if defined(XR_ML_ml2_controller_interaction) && defined(XRT_FEATURE_OPENXR_INTERACTION_ML2)
 #define OXR_HAVE_ML_ml2_controller_interaction
-#define OXR_EXTENSION_SUPPORT_ML_ml2_controller_interaction(_)                                                         \
-	_(ML_ml2_controller_interaction, ML_ML2_CONTROLLER_INTERACTION)
+#define OXR_EXTENSION_SUPPORT_ML_ml2_controller_interaction(_) \
+    _(ML_ml2_controller_interaction, ML_ML2_CONTROLLER_INTERACTION)
 #else
 #define OXR_EXTENSION_SUPPORT_ML_ml2_controller_interaction(_)
 #endif
@@ -698,7 +734,8 @@
  */
 #if defined(XR_MND_headless) && defined(XRT_FEATURE_OPENXR_HEADLESS)
 #define OXR_HAVE_MND_headless
-#define OXR_EXTENSION_SUPPORT_MND_headless(_) _(MND_headless, MND_HEADLESS)
+#define OXR_EXTENSION_SUPPORT_MND_headless(_) \
+    _(MND_headless, MND_HEADLESS)
 #else
 #define OXR_EXTENSION_SUPPORT_MND_headless(_)
 #endif
@@ -709,8 +746,8 @@
  */
 #if defined(XR_MND_swapchain_usage_input_attachment_bit)
 #define OXR_HAVE_MND_swapchain_usage_input_attachment_bit
-#define OXR_EXTENSION_SUPPORT_MND_swapchain_usage_input_attachment_bit(_)                                              \
-	_(MND_swapchain_usage_input_attachment_bit, MND_SWAPCHAIN_USAGE_INPUT_ATTACHMENT_BIT)
+#define OXR_EXTENSION_SUPPORT_MND_swapchain_usage_input_attachment_bit(_) \
+    _(MND_swapchain_usage_input_attachment_bit, MND_SWAPCHAIN_USAGE_INPUT_ATTACHMENT_BIT)
 #else
 #define OXR_EXTENSION_SUPPORT_MND_swapchain_usage_input_attachment_bit(_)
 #endif
@@ -721,7 +758,8 @@
  */
 #if defined(XR_MSFT_hand_interaction) && defined(XRT_FEATURE_OPENXR_INTERACTION_MSFT_HAND)
 #define OXR_HAVE_MSFT_hand_interaction
-#define OXR_EXTENSION_SUPPORT_MSFT_hand_interaction(_) _(MSFT_hand_interaction, MSFT_HAND_INTERACTION)
+#define OXR_EXTENSION_SUPPORT_MSFT_hand_interaction(_) \
+    _(MSFT_hand_interaction, MSFT_HAND_INTERACTION)
 #else
 #define OXR_EXTENSION_SUPPORT_MSFT_hand_interaction(_)
 #endif
@@ -732,8 +770,8 @@
  */
 #if defined(XR_MSFT_unbounded_reference_space) && defined(XRT_FEATURE_OPENXR_SPACE_UNBOUNDED)
 #define OXR_HAVE_MSFT_unbounded_reference_space
-#define OXR_EXTENSION_SUPPORT_MSFT_unbounded_reference_space(_)                                                        \
-	_(MSFT_unbounded_reference_space, MSFT_UNBOUNDED_REFERENCE_SPACE)
+#define OXR_EXTENSION_SUPPORT_MSFT_unbounded_reference_space(_) \
+    _(MSFT_unbounded_reference_space, MSFT_UNBOUNDED_REFERENCE_SPACE)
 #else
 #define OXR_EXTENSION_SUPPORT_MSFT_unbounded_reference_space(_)
 #endif
@@ -744,7 +782,8 @@
  */
 #if defined(XR_OPPO_controller_interaction) && defined(XRT_FEATURE_OPENXR_INTERACTION_OPPO)
 #define OXR_HAVE_OPPO_controller_interaction
-#define OXR_EXTENSION_SUPPORT_OPPO_controller_interaction(_) _(OPPO_controller_interaction, OPPO_CONTROLLER_INTERACTION)
+#define OXR_EXTENSION_SUPPORT_OPPO_controller_interaction(_) \
+    _(OPPO_controller_interaction, OPPO_CONTROLLER_INTERACTION)
 #else
 #define OXR_EXTENSION_SUPPORT_OPPO_controller_interaction(_)
 #endif
@@ -755,7 +794,8 @@
  */
 #if defined(XR_EXTX_overlay) && defined(XRT_FEATURE_OPENXR_OVERLAY)
 #define OXR_HAVE_EXTX_overlay
-#define OXR_EXTENSION_SUPPORT_EXTX_overlay(_) _(EXTX_overlay, EXTX_OVERLAY)
+#define OXR_EXTENSION_SUPPORT_EXTX_overlay(_) \
+    _(EXTX_overlay, EXTX_OVERLAY)
 #else
 #define OXR_EXTENSION_SUPPORT_EXTX_overlay(_)
 #endif
@@ -766,8 +806,8 @@
  */
 #if defined(XR_HTCX_vive_tracker_interaction) && defined(ALWAYS_DISABLED)
 #define OXR_HAVE_HTCX_vive_tracker_interaction
-#define OXR_EXTENSION_SUPPORT_HTCX_vive_tracker_interaction(_)                                                         \
-	_(HTCX_vive_tracker_interaction, HTCX_VIVE_TRACKER_INTERACTION)
+#define OXR_EXTENSION_SUPPORT_HTCX_vive_tracker_interaction(_) \
+    _(HTCX_vive_tracker_interaction, HTCX_VIVE_TRACKER_INTERACTION)
 #else
 #define OXR_EXTENSION_SUPPORT_HTCX_vive_tracker_interaction(_)
 #endif
@@ -778,8 +818,8 @@
  */
 #if defined(XR_MNDX_ball_on_a_stick_controller) && defined(XRT_FEATURE_OPENXR_INTERACTION_MNDX)
 #define OXR_HAVE_MNDX_ball_on_a_stick_controller
-#define OXR_EXTENSION_SUPPORT_MNDX_ball_on_a_stick_controller(_)                                                       \
-	_(MNDX_ball_on_a_stick_controller, MNDX_BALL_ON_A_STICK_CONTROLLER)
+#define OXR_EXTENSION_SUPPORT_MNDX_ball_on_a_stick_controller(_) \
+    _(MNDX_ball_on_a_stick_controller, MNDX_BALL_ON_A_STICK_CONTROLLER)
 #else
 #define OXR_EXTENSION_SUPPORT_MNDX_ball_on_a_stick_controller(_)
 #endif
@@ -790,7 +830,8 @@
  */
 #if defined(XR_MNDX_blubur_s1) && defined(XRT_FEATURE_OPENXR_INTERACTION_MNDX)
 #define OXR_HAVE_MNDX_blubur_s1
-#define OXR_EXTENSION_SUPPORT_MNDX_blubur_s1(_) _(MNDX_blubur_s1, MNDX_BLUBUR_S1)
+#define OXR_EXTENSION_SUPPORT_MNDX_blubur_s1(_) \
+    _(MNDX_blubur_s1, MNDX_BLUBUR_S1)
 #else
 #define OXR_EXTENSION_SUPPORT_MNDX_blubur_s1(_)
 #endif
@@ -801,7 +842,8 @@
  */
 #if defined(XR_MNDX_oculus_remote) && defined(XRT_FEATURE_OPENXR_INTERACTION_MNDX)
 #define OXR_HAVE_MNDX_oculus_remote
-#define OXR_EXTENSION_SUPPORT_MNDX_oculus_remote(_) _(MNDX_oculus_remote, MNDX_OCULUS_REMOTE)
+#define OXR_EXTENSION_SUPPORT_MNDX_oculus_remote(_) \
+    _(MNDX_oculus_remote, MNDX_OCULUS_REMOTE)
 #else
 #define OXR_EXTENSION_SUPPORT_MNDX_oculus_remote(_)
 #endif
@@ -812,7 +854,8 @@
  */
 #if defined(XR_MNDX_egl_enable) && defined(XR_USE_PLATFORM_EGL)
 #define OXR_HAVE_MNDX_egl_enable
-#define OXR_EXTENSION_SUPPORT_MNDX_egl_enable(_) _(MNDX_egl_enable, MNDX_EGL_ENABLE)
+#define OXR_EXTENSION_SUPPORT_MNDX_egl_enable(_) \
+    _(MNDX_egl_enable, MNDX_EGL_ENABLE)
 #else
 #define OXR_EXTENSION_SUPPORT_MNDX_egl_enable(_)
 #endif
@@ -823,7 +866,8 @@
  */
 #if defined(XR_MNDX_force_feedback_curl) && defined(XRT_FEATURE_OPENXR_FORCE_FEEDBACK_CURL)
 #define OXR_HAVE_MNDX_force_feedback_curl
-#define OXR_EXTENSION_SUPPORT_MNDX_force_feedback_curl(_) _(MNDX_force_feedback_curl, MNDX_FORCE_FEEDBACK_CURL)
+#define OXR_EXTENSION_SUPPORT_MNDX_force_feedback_curl(_) \
+    _(MNDX_force_feedback_curl, MNDX_FORCE_FEEDBACK_CURL)
 #else
 #define OXR_EXTENSION_SUPPORT_MNDX_force_feedback_curl(_)
 #endif
@@ -834,7 +878,8 @@
  */
 #if defined(XR_MNDX_hydra) && defined(XRT_FEATURE_OPENXR_INTERACTION_MNDX)
 #define OXR_HAVE_MNDX_hydra
-#define OXR_EXTENSION_SUPPORT_MNDX_hydra(_) _(MNDX_hydra, MNDX_HYDRA)
+#define OXR_EXTENSION_SUPPORT_MNDX_hydra(_) \
+    _(MNDX_hydra, MNDX_HYDRA)
 #else
 #define OXR_EXTENSION_SUPPORT_MNDX_hydra(_)
 #endif
@@ -845,7 +890,8 @@
  */
 #if defined(XR_MNDX_system_buttons) && defined(XRT_FEATURE_OPENXR_INTERACTION_MNDX)
 #define OXR_HAVE_MNDX_system_buttons
-#define OXR_EXTENSION_SUPPORT_MNDX_system_buttons(_) _(MNDX_system_buttons, MNDX_SYSTEM_BUTTONS)
+#define OXR_EXTENSION_SUPPORT_MNDX_system_buttons(_) \
+    _(MNDX_system_buttons, MNDX_SYSTEM_BUTTONS)
 #else
 #define OXR_EXTENSION_SUPPORT_MNDX_system_buttons(_)
 #endif
@@ -856,7 +902,8 @@
  */
 #if defined(XR_MNDX_xdev_space) && defined(XRT_FEATURE_OPENXR_XDEV_SPACE)
 #define OXR_HAVE_MNDX_xdev_space
-#define OXR_EXTENSION_SUPPORT_MNDX_xdev_space(_) _(MNDX_xdev_space, MNDX_XDEV_SPACE)
+#define OXR_EXTENSION_SUPPORT_MNDX_xdev_space(_) \
+    _(MNDX_xdev_space, MNDX_XDEV_SPACE)
 #else
 #define OXR_EXTENSION_SUPPORT_MNDX_xdev_space(_)
 #endif
@@ -923,8 +970,8 @@
     OXR_EXTENSION_SUPPORT_EXT_performance_settings(_) \
     OXR_EXTENSION_SUPPORT_EXT_plane_detection(_) \
     OXR_EXTENSION_SUPPORT_EXT_samsung_odyssey_controller(_) \
-    OXR_EXTENSION_SUPPORT_EXT_session_target(_) \
     OXR_EXTENSION_SUPPORT_EXT_user_presence(_) \
+    OXR_EXTENSION_SUPPORT_EXT_win32_appcontainer_compatible(_) \
     OXR_EXTENSION_SUPPORT_BD_controller_interaction(_) \
     OXR_EXTENSION_SUPPORT_FB_body_tracking(_) \
     OXR_EXTENSION_SUPPORT_FB_composition_layer_alpha_blend(_) \
