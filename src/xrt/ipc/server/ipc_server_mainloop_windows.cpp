@@ -258,15 +258,10 @@ ipc_server_mainloop_init(struct ipc_server_mainloop *ml)
 	ml->pipe_handle = INVALID_HANDLE_VALUE;
 	ml->pipe_name = nullptr;
 
-	constexpr char pipe_prefix[] = "\\\\.\\pipe\\";
-	constexpr int prefix_len = sizeof(pipe_prefix) - 1;
-	char pipe_name[MAX_PATH + prefix_len];
-	strcpy(pipe_name, pipe_prefix);
-
-	if (u_file_get_path_in_runtime_dir(XRT_IPC_MSG_SOCK_FILENAME, pipe_name + prefix_len, MAX_PATH) == -1) {
-		U_LOG_E("u_file_get_path_in_runtime_dir failed!");
-		return -1;
-	}
+	// Use a fixed global pipe name for Windows.
+	// This is required for AppContainer apps (like Chrome WebXR) which have virtualized
+	// temp directories - using temp path would cause client and server to use different pipe names.
+	const char *pipe_name = "\\\\.\\pipe\\monado\\monado_comp_ipc";
 
 	ml->pipe_name = _strdup(pipe_name);
 	if (ml->pipe_name == nullptr) {
