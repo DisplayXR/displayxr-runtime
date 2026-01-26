@@ -447,14 +447,29 @@ render_projection_layer(struct comp_d3d11_renderer *r,
 	constants.post_transform[3] = view_data->sub.norm_rect.h;
 
 	// Color scale and bias
-	constants.color_scale[0] = layer->data.color_scale.r;
-	constants.color_scale[1] = layer->data.color_scale.g;
-	constants.color_scale[2] = layer->data.color_scale.b;
-	constants.color_scale[3] = layer->data.color_scale.a;
-	constants.color_bias[0] = layer->data.color_bias.r;
-	constants.color_bias[1] = layer->data.color_bias.g;
-	constants.color_bias[2] = layer->data.color_bias.b;
-	constants.color_bias[3] = layer->data.color_bias.a;
+	// Default to identity (scale=1, bias=0) if not explicitly set via
+	// XR_KHR_composition_layer_color_scale_bias extension
+	bool has_color_scale_bias = (layer->data.flags & XRT_LAYER_COMPOSITION_COLOR_BIAS_SCALE) != 0;
+	if (has_color_scale_bias) {
+		constants.color_scale[0] = layer->data.color_scale.r;
+		constants.color_scale[1] = layer->data.color_scale.g;
+		constants.color_scale[2] = layer->data.color_scale.b;
+		constants.color_scale[3] = layer->data.color_scale.a;
+		constants.color_bias[0] = layer->data.color_bias.r;
+		constants.color_bias[1] = layer->data.color_bias.g;
+		constants.color_bias[2] = layer->data.color_bias.b;
+		constants.color_bias[3] = layer->data.color_bias.a;
+	} else {
+		// Default: no color modification
+		constants.color_scale[0] = 1.0f;
+		constants.color_scale[1] = 1.0f;
+		constants.color_scale[2] = 1.0f;
+		constants.color_scale[3] = 1.0f;
+		constants.color_bias[0] = 0.0f;
+		constants.color_bias[1] = 0.0f;
+		constants.color_bias[2] = 0.0f;
+		constants.color_bias[3] = 0.0f;
+	}
 
 	// Map and update constant buffer
 	D3D11_MAPPED_SUBRESOURCE mapped;
