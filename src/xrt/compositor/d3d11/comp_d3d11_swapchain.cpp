@@ -209,6 +209,17 @@ d3d11_swapchain_wait_image(struct xrt_swapchain *xsc, int64_t timeout_ns, uint32
 }
 
 static xrt_result_t
+d3d11_swapchain_barrier_image(struct xrt_swapchain *xsc, enum xrt_barrier_direction direction, uint32_t index)
+{
+	// D3D11 native compositor: app and compositor share the same D3D11 device and textures
+	// No explicit barrier/synchronization is needed - D3D11 handles this internally
+	(void)xsc;
+	(void)direction;
+	(void)index;
+	return XRT_SUCCESS;
+}
+
+static xrt_result_t
 d3d11_swapchain_release_image(struct xrt_swapchain *xsc, uint32_t index)
 {
 	struct comp_d3d11_swapchain *sc = d3d11_sc(xsc);
@@ -392,6 +403,7 @@ comp_d3d11_swapchain_create(struct comp_d3d11_compositor *c,
 	sc->base.base.image_count = image_count;
 	sc->base.base.wait_image = d3d11_swapchain_wait_image;
 	sc->base.base.acquire_image = d3d11_swapchain_acquire_image;
+	sc->base.base.barrier_image = d3d11_swapchain_barrier_image;
 	sc->base.base.release_image = d3d11_swapchain_release_image;
 	sc->base.base.destroy = d3d11_swapchain_destroy;
 	sc->base.base.reference.count = 1;
