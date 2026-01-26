@@ -58,8 +58,12 @@ struct ConstantBufferData {
     DirectX::XMFLOAT4 color;
 };
 
-// Initialize D3D11 device and create resources
+// Initialize D3D11 device and create resources (uses default adapter)
 bool InitializeD3D11(D3D11Renderer& renderer);
+
+// Initialize D3D11 device on a specific adapter (by LUID)
+// This is required for OpenXR - must create device on the GPU that OpenXR specifies
+bool InitializeD3D11WithLUID(D3D11Renderer& renderer, LUID adapterLuid);
 
 // Create rendering resources (shaders, buffers)
 bool CreateResources(D3D11Renderer& renderer);
