@@ -142,12 +142,20 @@ FunctionEnd
 Function AddToPath
 	Exch $0  ; Path to add
 	Push $1  ; Current PATH
+	Push $2  ; Temp for search result
 
 	; Read current PATH
 	ReadRegStr $1 HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path"
 
 	; Check if PATH is empty
 	StrCmp $1 "" empty_path
+
+	; Check if path already exists in PATH (avoid duplicates)
+	Push $1
+	Push $0
+	Call StrStr
+	Pop $2
+	StrCmp $2 "" 0 already_exists
 
 	; Append to existing PATH
 	StrCpy $0 "$1;$0"
@@ -160,7 +168,13 @@ write_path:
 	; Write new PATH
 	WriteRegExpandStr HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path" "$0"
 	DetailPrint "Added to system PATH"
+	Goto done
 
+already_exists:
+	DetailPrint "Path already exists in system PATH, skipping"
+
+done:
+	Pop $2
 	Pop $1
 	Pop $0
 FunctionEnd
