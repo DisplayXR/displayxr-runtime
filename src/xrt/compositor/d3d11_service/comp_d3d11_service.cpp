@@ -211,19 +211,19 @@ struct d3d11_service_system
  */
 
 static inline struct d3d11_service_swapchain *
-d3d11_service_swapchain(struct xrt_swapchain *xsc)
+d3d11_service_swapchain_from_xrt(struct xrt_swapchain *xsc)
 {
 	return reinterpret_cast<struct d3d11_service_swapchain *>(xsc);
 }
 
 static inline struct d3d11_service_compositor *
-d3d11_service_compositor(struct xrt_compositor *xc)
+d3d11_service_compositor_from_xrt(struct xrt_compositor *xc)
 {
 	return reinterpret_cast<struct d3d11_service_compositor *>(xc);
 }
 
 static inline struct d3d11_service_system *
-d3d11_service_system(struct xrt_system_compositor *xsysc)
+d3d11_service_system_from_xrt(struct xrt_system_compositor *xsysc)
 {
 	return reinterpret_cast<struct d3d11_service_system *>(xsysc);
 }
@@ -561,7 +561,7 @@ render_quad_layer(struct d3d11_service_system *sys,
 	if (xsc == nullptr) {
 		return;
 	}
-	struct d3d11_service_swapchain *sc = d3d11_service_swapchain(xsc);
+	struct d3d11_service_swapchain *sc = d3d11_service_swapchain_from_xrt(xsc);
 
 	uint32_t image_index = q->sub.image_index;
 	if (image_index >= sc->image_count) {
@@ -654,7 +654,7 @@ render_cylinder_layer(struct d3d11_service_system *sys,
 	if (xsc == nullptr) {
 		return;
 	}
-	struct d3d11_service_swapchain *sc = d3d11_service_swapchain(xsc);
+	struct d3d11_service_swapchain *sc = d3d11_service_swapchain_from_xrt(xsc);
 
 	uint32_t image_index = cyl->sub.image_index;
 	if (image_index >= sc->image_count) {
@@ -751,7 +751,7 @@ render_equirect2_layer(struct d3d11_service_system *sys,
 	if (xsc == nullptr) {
 		return;
 	}
-	struct d3d11_service_swapchain *sc = d3d11_service_swapchain(xsc);
+	struct d3d11_service_swapchain *sc = d3d11_service_swapchain_from_xrt(xsc);
 
 	uint32_t image_index = eq->sub.image_index;
 	if (image_index >= sc->image_count) {
@@ -850,7 +850,7 @@ render_equirect2_layer(struct d3d11_service_system *sys,
 static void
 swapchain_destroy(struct xrt_swapchain *xsc)
 {
-	struct d3d11_service_swapchain *sc = d3d11_service_swapchain(xsc);
+	struct d3d11_service_swapchain *sc = d3d11_service_swapchain_from_xrt(xsc);
 
 	// Release all images
 	for (uint32_t i = 0; i < sc->image_count; i++) {
@@ -868,7 +868,7 @@ swapchain_destroy(struct xrt_swapchain *xsc)
 static xrt_result_t
 swapchain_acquire_image(struct xrt_swapchain *xsc, uint32_t *out_index)
 {
-	struct d3d11_service_swapchain *sc = d3d11_service_swapchain(xsc);
+	struct d3d11_service_swapchain *sc = d3d11_service_swapchain_from_xrt(xsc);
 
 	// Simple round-robin for now
 	static uint32_t next_index = 0;
@@ -895,7 +895,7 @@ swapchain_dec_image_use(struct xrt_swapchain *xsc, uint32_t index)
 static xrt_result_t
 swapchain_wait_image(struct xrt_swapchain *xsc, int64_t timeout_ns, uint32_t index)
 {
-	struct d3d11_service_swapchain *sc = d3d11_service_swapchain(xsc);
+	struct d3d11_service_swapchain *sc = d3d11_service_swapchain_from_xrt(xsc);
 
 	if (index >= sc->image_count) {
 		return XRT_ERROR_NO_IMAGE_AVAILABLE;
@@ -924,7 +924,7 @@ swapchain_wait_image(struct xrt_swapchain *xsc, int64_t timeout_ns, uint32_t ind
 static xrt_result_t
 swapchain_release_image(struct xrt_swapchain *xsc, uint32_t index)
 {
-	struct d3d11_service_swapchain *sc = d3d11_service_swapchain(xsc);
+	struct d3d11_service_swapchain *sc = d3d11_service_swapchain_from_xrt(xsc);
 
 	if (index >= sc->image_count) {
 		return XRT_ERROR_NO_IMAGE_AVAILABLE;
@@ -943,7 +943,7 @@ swapchain_release_image(struct xrt_swapchain *xsc, uint32_t index)
 static xrt_result_t
 swapchain_barrier_image(struct xrt_swapchain *xsc, enum xrt_barrier_direction direction, uint32_t index)
 {
-	struct d3d11_service_swapchain *sc = d3d11_service_swapchain(xsc);
+	struct d3d11_service_swapchain *sc = d3d11_service_swapchain_from_xrt(xsc);
 
 	if (index >= sc->image_count) {
 		return XRT_ERROR_NO_IMAGE_AVAILABLE;
@@ -992,7 +992,7 @@ compositor_import_swapchain(struct xrt_compositor *xc,
                              uint32_t image_count,
                              struct xrt_swapchain **out_xsc)
 {
-	struct d3d11_service_compositor *c = d3d11_service_compositor(xc);
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
 	struct d3d11_service_system *sys = c->sys;
 
 	if (image_count > XRT_MAX_SWAPCHAIN_IMAGES) {
@@ -1133,7 +1133,7 @@ compositor_predict_frame(struct xrt_compositor *xc,
                           int64_t *out_predicted_display_time_ns,
                           int64_t *out_predicted_display_period_ns)
 {
-	struct d3d11_service_compositor *c = d3d11_service_compositor(xc);
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
 
 	std::lock_guard<std::mutex> lock(c->mutex);
 
@@ -1157,7 +1157,7 @@ compositor_wait_frame(struct xrt_compositor *xc,
                        int64_t *out_predicted_display_time_ns,
                        int64_t *out_predicted_display_period_ns)
 {
-	struct d3d11_service_compositor *c = d3d11_service_compositor(xc);
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
 
 	std::lock_guard<std::mutex> lock(c->mutex);
 
@@ -1185,7 +1185,7 @@ compositor_mark_frame(struct xrt_compositor *xc,
 static xrt_result_t
 compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 {
-	struct d3d11_service_compositor *c = d3d11_service_compositor(xc);
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
 
 	std::lock_guard<std::mutex> lock(c->mutex);
 	c->layer_accum.layer_count = 0;
@@ -1196,7 +1196,7 @@ compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 static xrt_result_t
 compositor_discard_frame(struct xrt_compositor *xc, int64_t frame_id)
 {
-	struct d3d11_service_compositor *c = d3d11_service_compositor(xc);
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
 
 	std::lock_guard<std::mutex> lock(c->mutex);
 	c->layer_accum.layer_count = 0;
@@ -1207,7 +1207,7 @@ compositor_discard_frame(struct xrt_compositor *xc, int64_t frame_id)
 static xrt_result_t
 compositor_layer_begin(struct xrt_compositor *xc, const struct xrt_layer_frame_data *data)
 {
-	struct d3d11_service_compositor *c = d3d11_service_compositor(xc);
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
 
 	std::lock_guard<std::mutex> lock(c->mutex);
 	comp_layer_accum_begin(&c->layer_accum, data);
@@ -1221,7 +1221,7 @@ compositor_layer_projection(struct xrt_compositor *xc,
                              struct xrt_swapchain *xsc[XRT_MAX_VIEWS],
                              const struct xrt_layer_data *data)
 {
-	struct d3d11_service_compositor *c = d3d11_service_compositor(xc);
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
 
 	std::lock_guard<std::mutex> lock(c->mutex);
 	comp_layer_accum_projection(&c->layer_accum, xsc, data);
@@ -1236,7 +1236,7 @@ compositor_layer_projection_depth(struct xrt_compositor *xc,
                                    struct xrt_swapchain *d_xsc[XRT_MAX_VIEWS],
                                    const struct xrt_layer_data *data)
 {
-	struct d3d11_service_compositor *c = d3d11_service_compositor(xc);
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
 
 	std::lock_guard<std::mutex> lock(c->mutex);
 	comp_layer_accum_projection_depth(&c->layer_accum, xsc, d_xsc, data);
@@ -1250,7 +1250,7 @@ compositor_layer_quad(struct xrt_compositor *xc,
                        struct xrt_swapchain *xsc,
                        const struct xrt_layer_data *data)
 {
-	struct d3d11_service_compositor *c = d3d11_service_compositor(xc);
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
 
 	std::lock_guard<std::mutex> lock(c->mutex);
 	comp_layer_accum_quad(&c->layer_accum, xsc, data);
@@ -1264,7 +1264,7 @@ compositor_layer_cube(struct xrt_compositor *xc,
                        struct xrt_swapchain *xsc,
                        const struct xrt_layer_data *data)
 {
-	struct d3d11_service_compositor *c = d3d11_service_compositor(xc);
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
 
 	std::lock_guard<std::mutex> lock(c->mutex);
 	comp_layer_accum_cube(&c->layer_accum, xsc, data);
@@ -1278,7 +1278,7 @@ compositor_layer_cylinder(struct xrt_compositor *xc,
                            struct xrt_swapchain *xsc,
                            const struct xrt_layer_data *data)
 {
-	struct d3d11_service_compositor *c = d3d11_service_compositor(xc);
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
 
 	std::lock_guard<std::mutex> lock(c->mutex);
 	comp_layer_accum_cylinder(&c->layer_accum, xsc, data);
@@ -1292,7 +1292,7 @@ compositor_layer_equirect1(struct xrt_compositor *xc,
                             struct xrt_swapchain *xsc,
                             const struct xrt_layer_data *data)
 {
-	struct d3d11_service_compositor *c = d3d11_service_compositor(xc);
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
 
 	std::lock_guard<std::mutex> lock(c->mutex);
 	comp_layer_accum_equirect1(&c->layer_accum, xsc, data);
@@ -1306,7 +1306,7 @@ compositor_layer_equirect2(struct xrt_compositor *xc,
                             struct xrt_swapchain *xsc,
                             const struct xrt_layer_data *data)
 {
-	struct d3d11_service_compositor *c = d3d11_service_compositor(xc);
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
 
 	std::lock_guard<std::mutex> lock(c->mutex);
 	comp_layer_accum_equirect2(&c->layer_accum, xsc, data);
@@ -1325,7 +1325,7 @@ compositor_layer_passthrough(struct xrt_compositor *xc,
 static xrt_result_t
 compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
 {
-	struct d3d11_service_compositor *c = d3d11_service_compositor(xc);
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
 	struct d3d11_service_system *sys = c->sys;
 
 	std::lock_guard<std::mutex> lock(c->mutex);
@@ -1354,8 +1354,8 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			continue;
 		}
 
-		struct d3d11_service_swapchain *sc_left = d3d11_service_swapchain(xsc_left);
-		struct d3d11_service_swapchain *sc_right = d3d11_service_swapchain(xsc_right);
+		struct d3d11_service_swapchain *sc_left = d3d11_service_swapchain_from_xrt(xsc_left);
+		struct d3d11_service_swapchain *sc_right = d3d11_service_swapchain_from_xrt(xsc_right);
 
 		// Get image indices from layer data
 		uint32_t left_index = layer->data.proj.v[0].sub.image_index;
@@ -1576,7 +1576,7 @@ compositor_layer_commit_with_semaphore(struct xrt_compositor *xc,
 static void
 compositor_destroy(struct xrt_compositor *xc)
 {
-	struct d3d11_service_compositor *c = d3d11_service_compositor(xc);
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
 	delete c;
 }
 
@@ -1593,7 +1593,7 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
                                 struct xrt_session_event_sink *xses,
                                 struct xrt_compositor_native **out_xcn)
 {
-	struct d3d11_service_system *sys = d3d11_service_system(xsysc);
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
 
 	// Create per-client native compositor
 	struct d3d11_service_compositor *c = new d3d11_service_compositor();
@@ -1650,7 +1650,7 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 static void
 system_destroy(struct xrt_system_compositor *xsysc)
 {
-	struct d3d11_service_system *sys = d3d11_service_system(xsysc);
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
 
 	U_LOG_I("Destroying D3D11 service system compositor");
 
