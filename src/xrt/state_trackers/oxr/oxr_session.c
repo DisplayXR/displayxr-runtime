@@ -788,23 +788,6 @@ oxr_session_locate_views(struct oxr_logger *log,
 	    0.0f,
 	};
 
-#ifdef XRT_HAVE_LEIA_SR
-	// Try to get dynamic eye positions from the session's SR weaver (Phase 5)
-	// Uses the weaver's LookaroundFilter which adapts to application-specific latency
-	struct leiasr_eye_pair eye_pair = {0};
-	bool have_eye_tracking = false;
-	{
-		if (oxr_session_get_predicted_eye_positions(sess, &eye_pair)) {
-			have_eye_tracking = true;
-			// Calculate eye relation as vector from left to right eye
-			// This replaces the static IPD with actual tracked eye positions
-			default_eye_relation.x = eye_pair.right.x - eye_pair.left.x;
-			default_eye_relation.y = eye_pair.right.y - eye_pair.left.y;
-			default_eye_relation.z = eye_pair.right.z - eye_pair.left.z;
-		}
-	}
-#endif
-
 	const uint64_t xdisplay_time =
 	    time_state_ts_to_monotonic_ns(sess->sys->inst->timekeeping, viewLocateInfo->displayTime);
 
@@ -813,15 +796,71 @@ oxr_session_locate_views(struct oxr_logger *log,
 	struct xrt_fov fovs[XRT_MAX_VIEWS] = {0};
 	struct xrt_pose poses[XRT_MAX_VIEWS] = {0};
 
-	xrt_result_t xret = xrt_device_get_view_poses( //
-	    xdev,                                      //
-	    &default_eye_relation,                     //
-	    xdisplay_time,                             //
-	    view_count,                                //
-	    &T_xdev_head,                              //
-	    fovs,                                      //
-	    poses);
-	OXR_CHECK_XRET(log, sess, xret, xrt_device_get_view_poses);
+#ifdef XRT_HAVE_LEIA_SR
+	// For SR displays with eye tracking, compute view poses directly from tracked eyes
+	// instead of using the simulated device's wobbling head pose.
+	// The eye positions from face tracking ARE the ground truth for SR displays.
+	struct leiasr_eye_pair eye_pair = {0};
+	bool have_sr_eye_tracking = false;
+
+	if (oxr_session_get_predicted_eye_positions(sess, &eye_pair) && eye_pair.valid) {
+		have_sr_eye_tracking = true;
+
+		// Compute head position as midpoint between eyes
+		struct xrt_vec3 head_pos = {
+		    (eye_pair.left.x + eye_pair.right.x) / 2.0f,
+		    (eye_pair.left.y + eye_pair.right.y) / 2.0f,
+		    (eye_pair.left.z + eye_pair.right.z) / 2.0f,
+		};
+
+		// Head relation: position at eye midpoint, identity orientation (facing screen)
+		T_xdev_head.pose.position = head_pos;
+		T_xdev_head.pose.orientation = (struct xrt_quat)XRT_QUAT_IDENTITY;
+		T_xdev_head.relation_flags = XRT_SPACE_RELATION_POSITION_VALID_BIT |
+		                             XRT_SPACE_RELATION_ORIENTATION_VALID_BIT |
+		                             XRT_SPACE_RELATION_POSITION_TRACKED_BIT |
+		                             XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT;
+
+		// View poses: at actual eye positions relative to head
+		poses[0].position.x = eye_pair.left.x - head_pos.x;
+		poses[0].position.y = eye_pair.left.y - head_pos.y;
+		poses[0].position.z = eye_pair.left.z - head_pos.z;
+		poses[0].orientation = (struct xrt_quat)XRT_QUAT_IDENTITY;
+
+		poses[1].position.x = eye_pair.right.x - head_pos.x;
+		poses[1].position.y = eye_pair.right.y - head_pos.y;
+		poses[1].position.z = eye_pair.right.z - head_pos.z;
+		poses[1].orientation = (struct xrt_quat)XRT_QUAT_IDENTITY;
+
+		// Compute Kooima FOV from SR eye positions
+		float screen_width_m = 0.0f;
+		float screen_height_m = 0.0f;
+
+		if (oxr_session_get_display_dimensions(sess, &screen_width_m, &screen_height_m) &&
+		    screen_width_m > 0.0f && screen_height_m > 0.0f) {
+			compute_kooima_fov(&eye_pair.left, screen_width_m, screen_height_m, &fovs[0]);
+			compute_kooima_fov(&eye_pair.right, screen_width_m, screen_height_m, &fovs[1]);
+		} else {
+			// Fallback to device FOV if display dimensions unavailable
+			fovs[0] = xdev->hmd->distortion.fov[0];
+			fovs[1] = xdev->hmd->distortion.fov[1];
+		}
+	}
+
+	if (!have_sr_eye_tracking)
+#endif
+	{
+		// Normal path: get view poses from device (for non-SR or when SR eye tracking unavailable)
+		xrt_result_t xret = xrt_device_get_view_poses( //
+		    xdev,                                      //
+		    &default_eye_relation,                     //
+		    xdisplay_time,                             //
+		    view_count,                                //
+		    &T_xdev_head,                              //
+		    fovs,                                      //
+		    poses);
+		OXR_CHECK_XRET(log, sess, xret, xrt_device_get_view_poses);
+	}
 
 	// The xdev pose in the base space.
 	struct xrt_space_relation T_base_xdev = XRT_SPACE_RELATION_ZERO;
@@ -878,21 +917,21 @@ oxr_session_locate_views(struct oxr_logger *log,
 		OXR_XRT_POSE_TO_XRPOSEF(result.pose, views[i].pose);
 
 #ifdef XRT_HAVE_LEIA_SR
-		// Override view positions with tracked eye positions from Leia SR
-		// eye_pair contains positions in meters (driver converts from mm)
-		if (have_eye_tracking && view_count == 2) {
+		// For SR eye tracking, override with absolute eye positions
+		// (The space relation chain above is for the normal HMD path)
+		if (have_sr_eye_tracking && view_count == 2) {
 			if (i == 0) {
-				// Left eye
+				// Left eye - absolute position
 				views[i].pose.position.x = eye_pair.left.x;
 				views[i].pose.position.y = eye_pair.left.y;
 				views[i].pose.position.z = eye_pair.left.z;
 			} else {
-				// Right eye
+				// Right eye - absolute position
 				views[i].pose.position.x = eye_pair.right.x;
 				views[i].pose.position.y = eye_pair.right.y;
 				views[i].pose.position.z = eye_pair.right.z;
 			}
-			// Keep orientation at identity for now (looking straight ahead)
+			// Identity orientation (looking straight at screen)
 			views[i].pose.orientation.x = 0.0f;
 			views[i].pose.orientation.y = 0.0f;
 			views[i].pose.orientation.z = 0.0f;
@@ -911,23 +950,9 @@ oxr_session_locate_views(struct oxr_logger *log,
 		}
 
 #ifdef XRT_HAVE_LEIA_SR
-		// Compute asymmetric FOV using Kooima algorithm based on eye position
-		// relative to the display screen. This gives proper perspective for
-		// off-axis viewing on SR displays.
-		if (have_eye_tracking) {
-			float screen_width_m = 0.0f;
-			float screen_height_m = 0.0f;
-
-			if (oxr_session_get_display_dimensions(sess, &screen_width_m, &screen_height_m) &&
-			    screen_width_m > 0.0f && screen_height_m > 0.0f) {
-				// Select eye position based on view index
-				const struct leiasr_eye_position *eye = (i == 0) ? &eye_pair.left : &eye_pair.right;
-
-				// Compute Kooima asymmetric FOV
-				compute_kooima_fov(eye, screen_width_m, screen_height_m, &fov);
-			}
-			// else: fallback to device FOV if display dimensions unavailable
-		}
+		// For SR path, FOV was already computed via Kooima above.
+		// This block only runs for the normal (non-SR) path.
+		// (SR FOVs are already in fovs[] array from the early computation)
 #endif
 
 		OXR_XRT_FOV_TO_XRFOVF(fov, views[i].fov);
