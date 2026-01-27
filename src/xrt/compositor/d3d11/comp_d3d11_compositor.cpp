@@ -939,7 +939,7 @@ comp_d3d11_compositor_get_display_dimensions(struct xrt_compositor *xc,
 
 #ifdef XRT_HAVE_LEIA_SR_D3D11
 	if (c->weaver != nullptr) {
-		struct leiasr_d3d11_display_dimensions dims;
+		struct leiasr_display_dimensions dims;
 		if (leiasr_d3d11_get_display_dimensions(c->weaver, &dims) && dims.valid) {
 			*out_width_m = dims.width_m;
 			*out_height_m = dims.height_m;
