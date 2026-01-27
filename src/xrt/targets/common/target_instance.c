@@ -53,6 +53,12 @@ DEBUG_GET_ONCE_BOOL_OPTION(use_null, "XRT_COMPOSITOR_NULL", USE_NULL_DEFAULT)
 DEBUG_GET_ONCE_BOOL_OPTION(use_d3d11_service, "XRT_SERVICE_USE_D3D11", true)
 #endif
 
+// For hybrid mode native apps: D3D11 native compositor is created during session,
+// so skip system compositor creation here to avoid creating an unused Vulkan window
+#ifdef XRT_SKIP_SYSTEM_COMPOSITOR_FOR_D3D11_NATIVE
+DEBUG_GET_ONCE_BOOL_OPTION(skip_system_compositor, "XRT_SKIP_SYSTEM_COMPOSITOR", true)
+#endif
+
 xrt_result_t
 null_compositor_create_system(struct xrt_device *xdev, struct xrt_system_compositor **out_xsysc);
 
@@ -108,6 +114,17 @@ t_instance_create_system(struct xrt_instance *xinst,
 	u_system_fill_properties(usys, head->str);
 
 	bool use_null = debug_get_bool_option_use_null();
+
+#ifdef XRT_SKIP_SYSTEM_COMPOSITOR_FOR_D3D11_NATIVE
+	// In hybrid mode for native apps, D3D11 native compositor is created during session
+	// creation (not here). Skip system compositor creation to avoid creating an unused
+	// Vulkan window. The compositor will be created when xrCreateSession is called.
+	if (debug_get_bool_option_skip_system_compositor()) {
+		U_LOG_I("Skipping system compositor creation (D3D11 native compositor will be used)");
+		xsysc = NULL;
+		goto out;
+	}
+#endif
 
 #ifdef XRT_MODULE_COMPOSITOR_NULL
 	if (use_null) {

@@ -266,8 +266,16 @@ if(XRT_MODULE_COMPOSITOR_MAIN OR XRT_MODULE_COMPOSITOR_NULL)
 		target_include_directories(target_instance_hybrid PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../compositor)
 		# XRT_FEATURE_HYBRID_MODE renames xrt_instance_create to native_instance_create
 		# XRT_USE_D3D11_SERVICE_COMPOSITOR enables D3D11 compositor selection
-		target_compile_definitions(target_instance_hybrid PRIVATE XRT_FEATURE_HYBRID_MODE XRT_USE_D3D11_SERVICE_COMPOSITOR)
+		# XRT_SKIP_SYSTEM_COMPOSITOR_FOR_D3D11_NATIVE skips Vulkan compositor creation
+		#   because D3D11 native compositor is created during session (not system) creation
+		target_compile_definitions(target_instance_hybrid PRIVATE
+			XRT_FEATURE_HYBRID_MODE
+			XRT_USE_D3D11_SERVICE_COMPOSITOR
+			XRT_SKIP_SYSTEM_COMPOSITOR_FOR_D3D11_NATIVE
+		)
 
+		# Note: comp_main is still linked but won't create a window because
+		# XRT_SKIP_SYSTEM_COMPOSITOR_FOR_D3D11_NATIVE causes early return
 		if(XRT_MODULE_COMPOSITOR_MAIN)
 			target_link_libraries(target_instance_hybrid PRIVATE comp_main)
 		endif()
