@@ -63,11 +63,11 @@ if(MSVC)
     )
 endif()
 
-# Copy runtime DLLs to output directory
+# Copy runtime DLLs to output directory (only if there are DLLs to copy)
 if(HAVE_LEIA_SR)
-    add_custom_command(TARGET sr_cube_native POST_BUILD COMMAND
-        ${CMAKE_COMMAND} -E copy_if_different
-        $<TARGET_RUNTIME_DLLS:sr_cube_native>
-        $<TARGET_FILE_DIR:sr_cube_native>
+    add_custom_command(TARGET sr_cube_native POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E
+            "$<IF:$<BOOL:$<TARGET_RUNTIME_DLLS:sr_cube_native>>,copy_if_different;$<TARGET_RUNTIME_DLLS:sr_cube_native>;$<TARGET_FILE_DIR:sr_cube_native>,true>"
+        COMMAND_EXPAND_LISTS
     )
 endif()

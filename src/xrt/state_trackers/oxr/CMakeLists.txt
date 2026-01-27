@@ -90,8 +90,20 @@ endif()
 # Leia SR eye tracking support for computing view poses from face tracking
 # drv_leiasr exports XRT_HAVE_LEIA_SR_VULKAN and/or XRT_HAVE_LEIA_SR_D3D11
 # as PUBLIC compile definitions based on available SR libraries
-if(XRT_HAVE_LEIA_SR)
+if(XRT_HAVE_LEIA_SR AND TARGET drv_leiasr)
 	target_link_libraries(st_oxr PRIVATE drv_leiasr)
+
+	# Explicitly propagate compile definitions from drv_leiasr
+	# CMake's PUBLIC compile definitions should propagate automatically, but we ensure it here
+	get_target_property(DRIVEIASR_DEFS drv_leiasr INTERFACE_COMPILE_DEFINITIONS)
+	if(DRIVEIASR_DEFS)
+		foreach(DEF IN LISTS DRIVEIASR_DEFS)
+			if(DEF MATCHES "^XRT_HAVE_LEIA_SR_(VULKAN|D3D11)$")
+				target_compile_definitions(st_oxr PRIVATE ${DEF})
+				message(STATUS "st_oxr: Added compile definition ${DEF} from drv_leiasr")
+			endif()
+		endforeach()
+	endif()
 endif()
 
 if(XRT_HAVE_D3D12)
