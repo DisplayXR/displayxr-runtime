@@ -803,7 +803,23 @@ oxr_session_locate_views(struct oxr_logger *log,
 	struct leiasr_eye_pair eye_pair = {0};
 	bool have_sr_eye_tracking = false;
 
-	if (oxr_session_get_predicted_eye_positions(sess, &eye_pair) && eye_pair.valid) {
+	// Throttled logging for SR eye tracking diagnostics
+	static int sr_log_counter = 0;
+	bool sr_should_log = (++sr_log_counter % 120) == 1; // Log every ~2 seconds at 60fps
+
+	bool got_eye_positions = oxr_session_get_predicted_eye_positions(sess, &eye_pair);
+
+	if (sr_should_log) {
+		U_LOG_I("SR eye tracking: got_positions=%d, valid=%d, is_d3d11=%d",
+		        got_eye_positions, eye_pair.valid, sess->is_d3d11_native_compositor);
+		if (got_eye_positions) {
+			U_LOG_I("  left=(%.3f,%.3f,%.3f) right=(%.3f,%.3f,%.3f)",
+			        eye_pair.left.x, eye_pair.left.y, eye_pair.left.z,
+			        eye_pair.right.x, eye_pair.right.y, eye_pair.right.z);
+		}
+	}
+
+	if (got_eye_positions && eye_pair.valid) {
 		have_sr_eye_tracking = true;
 
 		// Compute head position as midpoint between eyes
@@ -844,6 +860,12 @@ oxr_session_locate_views(struct oxr_logger *log,
 			// Fallback to device FOV if display dimensions unavailable
 			fovs[0] = xdev->hmd->distortion.fov[0];
 			fovs[1] = xdev->hmd->distortion.fov[1];
+		}
+	}
+
+	if (!have_sr_eye_tracking) {
+		if (sr_should_log) {
+			U_LOG_I("SR eye tracking NOT available - using simulated device path");
 		}
 	}
 
