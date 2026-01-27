@@ -58,7 +58,7 @@
 #include "leiasr/leiasr_types.h"
 #endif
 
-#ifdef XRT_HAVE_LEIA_SR_EYE_TRACKING_VULKAN
+#ifdef XRT_HAVE_LEIA_SR_VULKAN
 #include "multi/comp_multi_private.h"
 #include "leiasr/leiasr.h"
 #endif
@@ -109,7 +109,7 @@ to_string(XrSessionState state)
 	}
 }
 
-#ifdef XRT_HAVE_LEIA_SR_EYE_TRACKING_EYE_TRACKING
+#ifdef XRT_HAVE_LEIA_SR_EYE_TRACKING
 /*!
  * Get predicted eye positions from the session's per-session weaver.
  * Uses the weaver's LookaroundFilter which adapts to application-specific latency.
@@ -152,7 +152,7 @@ oxr_session_get_predicted_eye_positions(struct oxr_session *sess, struct leiasr_
 	}
 #endif
 
-#ifdef XRT_HAVE_LEIA_SR_EYE_TRACKING_VULKAN
+#ifdef XRT_HAVE_LEIA_SR_VULKAN
 	// The session's xcn is a multi_compositor in the multi-client architecture
 	struct multi_compositor *mc = multi_compositor(&sess->xcn->base);
 	return multi_compositor_get_predicted_eye_positions(mc, out_eye_pair);
@@ -179,7 +179,7 @@ oxr_session_get_display_dimensions(struct oxr_session *sess, float *out_width_m,
 	}
 #endif
 
-#ifdef XRT_HAVE_LEIA_SR_EYE_TRACKING_VULKAN
+#ifdef XRT_HAVE_LEIA_SR_VULKAN
 	struct multi_compositor *mc = multi_compositor(&sess->xcn->base);
 	return multi_compositor_get_display_dimensions(mc, out_width_m, out_height_m);
 #else
