@@ -87,6 +87,12 @@ if(XRT_HAVE_D3D11)
 	endif()
 endif()
 
+# Leia SR eye tracking support for computing view poses from face tracking
+if(XRT_HAVE_LEIA_SR)
+	target_compile_definitions(st_oxr PRIVATE XRT_HAVE_LEIA_SR)
+	target_link_libraries(st_oxr PRIVATE drv_leiasr)
+endif()
+
 if(XRT_HAVE_D3D12)
 	target_sources(st_oxr PRIVATE oxr_session_gfx_d3d12.c oxr_swapchain_d3d12.c oxr_d3d12.cpp)
 	target_link_libraries(st_oxr PRIVATE aux_d3d)
