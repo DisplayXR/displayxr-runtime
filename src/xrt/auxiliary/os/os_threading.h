@@ -19,10 +19,12 @@
 #include "os/os_time.h"
 
 #if defined(XRT_OS_OSX)
+#include <unistd.h>
 #include <pthread.h>
 #include <assert.h>
 
 #elif defined(XRT_OS_LINUX) || defined(XRT_ENV_MINGW)
+#include <unistd.h>
 #include <pthread.h>
 #include <semaphore.h>
 #include <assert.h>
@@ -30,6 +32,7 @@
 #define OS_THREAD_HAVE_SEMAPHORE
 
 #elif defined(XRT_OS_WINDOWS)
+#include "xrt/xrt_windows.h"
 #include <pthread.h>
 #include <sched.h>
 #include <semaphore.h>
@@ -347,6 +350,24 @@ os_thread_join(struct os_thread *ost)
 static inline void
 os_thread_destroy(struct os_thread *ost)
 {}
+
+/*!
+ * Gets the number of hardware threads available.
+ */
+static inline int64_t
+os_hardware_thread_count(void)
+{
+#if defined(XRT_OS_LINUX) || defined(XRT_OS_OSX)
+	return (int64_t)sysconf(_SC_NPROCESSORS_ONLN);
+#elif defined(XRT_OS_WINDOWS)
+	SYSTEM_INFO sysinfo = {0};
+	GetSystemInfo(&sysinfo);
+	return (int64_t)sysinfo.dwNumberOfProcessors;
+#else
+#error "OS not supported"
+	return -1;
+#endif
+}
 
 /*!
  * Make a best effort to name our thread.
