@@ -26,7 +26,6 @@ target_link_libraries(
 		aux_util
 		aux_os
 		aux_math
-		comp_multi
 		WIL::WIL
 		${D3D11_LIBRARY}
 		${DXGI_LIBRARY}
