@@ -261,6 +261,9 @@ if(XRT_MODULE_COMPOSITOR_MAIN OR XRT_MODULE_COMPOSITOR_NULL)
 				drv_includes
 			)
 		target_include_directories(target_instance_hybrid PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+		# Add compositor directory for main/comp_main_interface.h include
+		# (needed because XRT_MODULE_COMPOSITOR_MAIN is defined globally)
+		target_include_directories(target_instance_hybrid PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../compositor)
 		# XRT_FEATURE_HYBRID_MODE renames xrt_instance_create to native_instance_create
 		# XRT_HYBRID_USE_NULL_COMPOSITOR forces null compositor during instance creation
 		#   (no window created - the D3D11 native compositor handles rendering during session)
