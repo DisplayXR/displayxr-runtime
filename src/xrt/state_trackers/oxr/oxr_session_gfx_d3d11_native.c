@@ -141,6 +141,8 @@ oxr_session_populate_d3d11_native(struct oxr_logger *log,
 	sess->compositor = &xcn->base;
 	// Use native swapchain create that handles xrt_swapchain_native layout
 	sess->create_swapchain = oxr_swapchain_d3d11_native_create;
+	// Mark that we're using D3D11 native compositor (not multi_compositor)
+	sess->is_d3d11_native_compositor = true;
 
 	// D3D11 native compositor doesn't use the multi-compositor event system,
 	// so we set visibility/focus flags directly like headless mode.

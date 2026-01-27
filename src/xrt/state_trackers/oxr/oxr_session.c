@@ -55,6 +55,9 @@
 #ifdef XRT_HAVE_LEIA_SR
 #include "multi/comp_multi_private.h"
 #include "leiasr/leiasr.h"
+#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
+#include "d3d11/comp_d3d11_compositor.h"
+#endif
 #endif
 
 
@@ -112,6 +115,25 @@ oxr_session_get_predicted_eye_positions(struct oxr_session *sess, struct leiasr_
 		return false;
 	}
 
+#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
+	// Check if using D3D11 native compositor (not multi_compositor)
+	if (sess->is_d3d11_native_compositor) {
+		struct xrt_vec3 left_eye, right_eye;
+		if (comp_d3d11_compositor_get_predicted_eye_positions(&sess->xcn->base, &left_eye, &right_eye)) {
+			out_eye_pair->left.x = left_eye.x;
+			out_eye_pair->left.y = left_eye.y;
+			out_eye_pair->left.z = left_eye.z;
+			out_eye_pair->right.x = right_eye.x;
+			out_eye_pair->right.y = right_eye.y;
+			out_eye_pair->right.z = right_eye.z;
+			out_eye_pair->timestamp_ns = os_monotonic_get_ns();
+			out_eye_pair->valid = true;
+			return true;
+		}
+		return false;
+	}
+#endif
+
 	// The session's xcn is a multi_compositor in the multi-client architecture
 	struct multi_compositor *mc = multi_compositor(&sess->xcn->base);
 	return multi_compositor_get_predicted_eye_positions(mc, out_eye_pair);
@@ -127,6 +149,13 @@ oxr_session_get_display_dimensions(struct oxr_session *sess, float *out_width_m,
 	if (sess == NULL || sess->xcn == NULL || out_width_m == NULL || out_height_m == NULL) {
 		return false;
 	}
+
+#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
+	// Check if using D3D11 native compositor (not multi_compositor)
+	if (sess->is_d3d11_native_compositor) {
+		return comp_d3d11_compositor_get_display_dimensions(&sess->xcn->base, out_width_m, out_height_m);
+	}
+#endif
 
 	struct multi_compositor *mc = multi_compositor(&sess->xcn->base);
 	return multi_compositor_get_display_dimensions(mc, out_width_m, out_height_m);

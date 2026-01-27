@@ -59,6 +59,22 @@ comp_d3d11_compositor_get_predicted_eye_positions(struct xrt_compositor *xc,
                                                   struct xrt_vec3 *out_left_eye,
                                                   struct xrt_vec3 *out_right_eye);
 
+/*!
+ * Get the display dimensions from the SR SDK.
+ *
+ * @param xc The compositor.
+ * @param out_width_m Pointer to receive display width in meters.
+ * @param out_height_m Pointer to receive display height in meters.
+ *
+ * @return true if dimensions are available.
+ *
+ * @ingroup comp_d3d11
+ */
+bool
+comp_d3d11_compositor_get_display_dimensions(struct xrt_compositor *xc,
+                                              float *out_width_m,
+                                              float *out_height_m);
+
 #ifdef __cplusplus
 }
 #endif

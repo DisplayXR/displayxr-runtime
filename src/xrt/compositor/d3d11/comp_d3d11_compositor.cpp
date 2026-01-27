@@ -929,3 +929,28 @@ comp_d3d11_compositor_get_predicted_eye_positions(struct xrt_compositor *xc,
 
 	return false;
 }
+
+extern "C" bool
+comp_d3d11_compositor_get_display_dimensions(struct xrt_compositor *xc,
+                                              float *out_width_m,
+                                              float *out_height_m)
+{
+	struct comp_d3d11_compositor *c = d3d11_comp(xc);
+
+#ifdef XRT_HAVE_LEIA_SR
+	if (c->weaver != nullptr) {
+		struct leiasr_d3d11_display_dimensions dims;
+		if (leiasr_d3d11_get_display_dimensions(c->weaver, &dims) && dims.valid) {
+			*out_width_m = dims.width_m;
+			*out_height_m = dims.height_m;
+			return true;
+		}
+	}
+#endif
+
+	// Default display dimensions (typical laptop display size)
+	*out_width_m = 0.3f;
+	*out_height_m = 0.2f;
+
+	return false;
+}
