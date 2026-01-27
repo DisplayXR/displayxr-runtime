@@ -66,22 +66,22 @@ try {
 	    __uuidof(ID3D11Fence),          // ReturnedInterface
 	    fence.put_void()));             // ppFence
 
-	wil::com_ptr<IDXGIResource1> dxgiRes;
-	fence.query_to(dxgiRes.put());
-
 
 	/*
 	 * Create the handle to be shared.
+	 *
+	 * Note: ID3D11Fence has its own CreateSharedHandle method - it does NOT
+	 * implement IDXGIResource1, so we call the fence's method directly.
 	 */
 
-	DWORD access_flags = DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE;
+	DWORD access_flags = GENERIC_ALL;
 
 	wil::unique_handle handle;
-	THROW_IF_FAILED(dxgiRes->CreateSharedHandle( //
-	    nullptr,                                 // pAttributes
-	    access_flags,                            // dwAccess
-	    nullptr,                                 // lpName
-	    handle.put()));                          // pHandle
+	THROW_IF_FAILED(fence->CreateSharedHandle( //
+	    nullptr,                               // pAttributes
+	    access_flags,                          // dwAccess
+	    nullptr,                               // lpName
+	    handle.put()));                        // pHandle
 
 
 	/*
