@@ -20,7 +20,6 @@
 #include "os/os_time.h"
 
 #include "util/comp_layer_accum.h"
-#include "multi/comp_multi_interface.h"
 
 #include "math/m_api.h"
 #include "math/m_vec3.h"
@@ -183,9 +182,6 @@ struct d3d11_service_system
 
 	//! Self-created window for display output
 	HWND hwnd;
-
-	//! Multi-compositor control for managing multiple clients
-	struct comp_multi_system_compositor *msc;
 
 #ifdef XRT_HAVE_LEIA_SR
 	//! SR weaver for light field display
@@ -541,7 +537,7 @@ get_color_scale_bias(const struct xrt_layer_data *data, float color_scale[4], fl
 static void
 set_blend_state(struct d3d11_service_system *sys, const struct xrt_layer_data *data)
 {
-	bool use_premul = (data->flags & XRT_LAYER_COMPOSITION_BLEND_TEXTURE_SOURCE_ALPHA) == 0;
+	bool use_premul = (data->flags & XRT_LAYER_COMPOSITION_BLEND_TEXTURE_SOURCE_ALPHA_BIT) == 0;
 
 	if (use_premul) {
 		sys->context->OMSetBlendState(sys->blend_premul.get(), nullptr, 0xFFFFFFFF);
@@ -1380,8 +1376,8 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 
 		// Copy left view to left half of stereo texture
 		D3D11_BOX left_box = {};
-		left_box.left = layer->data.proj.v[0].sub.rect.offset.x;
-		left_box.top = layer->data.proj.v[0].sub.rect.offset.y;
+		left_box.left = layer->data.proj.v[0].sub.rect.offset.w;
+		left_box.top = layer->data.proj.v[0].sub.rect.offset.h;
 		left_box.right = left_box.left + layer->data.proj.v[0].sub.rect.extent.w;
 		left_box.bottom = left_box.top + layer->data.proj.v[0].sub.rect.extent.h;
 		left_box.front = 0;
@@ -1397,8 +1393,8 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 
 		// Copy right view to right half of stereo texture
 		D3D11_BOX right_box = {};
-		right_box.left = layer->data.proj.v[1].sub.rect.offset.x;
-		right_box.top = layer->data.proj.v[1].sub.rect.offset.y;
+		right_box.left = layer->data.proj.v[1].sub.rect.offset.w;
+		right_box.top = layer->data.proj.v[1].sub.rect.offset.h;
 		right_box.right = right_box.left + layer->data.proj.v[1].sub.rect.extent.w;
 		right_box.bottom = right_box.top + layer->data.proj.v[1].sub.rect.extent.h;
 		right_box.front = 0;
@@ -1664,10 +1660,6 @@ system_destroy(struct xrt_system_compositor *xsysc)
 	}
 #endif
 
-	if (sys->msc != nullptr) {
-		comp_multi_destroy(&sys->msc);
-	}
-
 	// Clean up layer rendering resources
 	sys->depth_disabled.reset();
 	sys->rasterizer_state.reset();
@@ -1811,23 +1803,21 @@ comp_d3d11_service_create_system(struct xrt_device *xdev,
 	}
 
 	// Get ID3D11Device5 and ID3D11DeviceContext4 for shared resource support
-	hr = device_base.query_to(sys->device.put());
-	if (FAILED(hr)) {
-		U_LOG_E("Device doesn't support ID3D11Device5: 0x%08lx", hr);
+	if (!device_base.try_query_to(sys->device.put())) {
+		U_LOG_E("Device doesn't support ID3D11Device5");
 		delete sys;
 		return XRT_ERROR_VULKAN;
 	}
 
-	hr = context_base.query_to(sys->context.put());
-	if (FAILED(hr)) {
-		U_LOG_E("Context doesn't support ID3D11DeviceContext4: 0x%08lx", hr);
+	if (!context_base.try_query_to(sys->context.put())) {
+		U_LOG_E("Context doesn't support ID3D11DeviceContext4");
 		delete sys;
 		return XRT_ERROR_VULKAN;
 	}
 
 	// Get DXGI factory
 	wil::com_ptr<IDXGIDevice> dxgi_device;
-	sys->device.query_to(dxgi_device.put());
+	sys->device.try_query_to(dxgi_device.put());
 
 	wil::com_ptr<IDXGIAdapter> adapter;
 	dxgi_device->GetAdapter(adapter.put());
@@ -1951,25 +1941,10 @@ comp_d3d11_service_create_system(struct xrt_device *xdev,
 	sys->base.info.views[0].max.width_pixels = sys->view_width;
 	sys->base.info.views[0].max.height_pixels = sys->view_height;
 	sys->base.info.views[1] = sys->base.info.views[0];
-	sys->base.info.compositor_vk_deviceUUID_valid = false;  // No Vulkan
-	sys->base.info.is_service_mode = true;
-
-	// Create multi-compositor for managing multiple clients
-	xrt_result_t xret = comp_multi_create_system_compositor(
-	    &sys->base,
-	    nullptr,  // No special settings
-	    0, false, // Don't use scratch images
-	    &sys->msc);
-
-	if (xret != XRT_SUCCESS) {
-		U_LOG_E("Failed to create multi-compositor: %d", xret);
-		system_destroy(&sys->base);
-		return xret;
-	}
 
 	U_LOG_I("D3D11 service system compositor created (%ux%u @ %.0fHz)",
 	        sys->display_width, sys->display_height, sys->refresh_rate);
 
-	*out_xsysc = comp_multi_system_compositor(&sys->msc);
+	*out_xsysc = &sys->base;
 	return XRT_SUCCESS;
 }
