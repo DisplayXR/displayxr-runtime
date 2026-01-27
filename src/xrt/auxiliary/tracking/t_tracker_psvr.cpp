@@ -1740,11 +1740,9 @@ process(TrackerPSVR &t, struct xrt_frame *xf)
 			PSVR_INFO("TOO MANY BAD CORRECTIONS. DRIFTED?");
 		}
 
-		std::vector<match_data_t> resolved;
-		for (uint32_t i = 0; i < solved.size(); i++) {
-			resolved.push_back(solved[i]);
-		}
+		std::vector<match_data_t> resolved = solved;
 		solved.clear();
+
 		model_center_transform = solve_with_imu(t, &resolved, &predicted_pose, &solved, PSVR_SEARCH_RADIUS);
 	}
 
