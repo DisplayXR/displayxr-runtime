@@ -1827,6 +1827,9 @@ struct oxr_session
 
 	struct xrt_compositor *compositor;
 
+	//! True if using D3D11 native compositor (not multi_compositor).
+	bool is_d3d11_native_compositor;
+
 	struct oxr_session *next;
 
 	XrSessionState state;
