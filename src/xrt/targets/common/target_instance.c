@@ -22,7 +22,9 @@
 #include "util/u_trace_marker.h"
 #include "util/u_system_helpers.h"
 
-#ifdef XRT_MODULE_COMPOSITOR_MAIN
+// Only include main compositor header when we actually need it
+// (not in hybrid mode native apps which use null compositor during instance creation)
+#if defined(XRT_MODULE_COMPOSITOR_MAIN) && !defined(XRT_HYBRID_USE_NULL_COMPOSITOR)
 #include "main/comp_main_interface.h"
 #endif
 
@@ -150,14 +152,14 @@ t_instance_create_system(struct xrt_instance *xinst,
 #endif
 #endif
 
-#ifdef XRT_MODULE_COMPOSITOR_MAIN
-#ifndef XRT_D3D11_SERVICE_ONLY
-	// Vulkan compositor fallback (not available in D3D11-only service mode)
+// Vulkan compositor fallback (not available in D3D11-only service mode or hybrid native apps)
+#if defined(XRT_MODULE_COMPOSITOR_MAIN) && !defined(XRT_D3D11_SERVICE_ONLY) && !defined(XRT_HYBRID_USE_NULL_COMPOSITOR)
 	if (xret == XRT_SUCCESS && xsysc == NULL) {
 		xret = comp_main_create_system_compositor(head, NULL, NULL, &xsysc);
 	}
 #endif
-#else
+
+#if !defined(XRT_MODULE_COMPOSITOR_MAIN) || defined(XRT_HYBRID_USE_NULL_COMPOSITOR)
 	if (!use_null && xsysc == NULL) {
 		U_LOG_E("Explicitly didn't request the null compositor, but no compositor is available!");
 		xret = XRT_ERROR_VULKAN;
