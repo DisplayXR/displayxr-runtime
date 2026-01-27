@@ -28,7 +28,7 @@
 #include "multi/comp_multi_private.h"
 #include "main/comp_compositor.h"
 
-#ifdef XRT_HAVE_LEIA_SR
+#ifdef XRT_HAVE_LEIA_SR_VULKAN
 #include "leiasr/leiasr.h"
 #endif
 
@@ -524,7 +524,7 @@ multi_compositor_end_session(struct xrt_compositor *xc)
 	if (mc->state.session_active) {
 		// Clean up per-session render resources (Phase 3)
 		if (mc->session_render.initialized) {
-#ifdef XRT_HAVE_LEIA_SR
+#ifdef XRT_HAVE_LEIA_SR_VULKAN
 			struct vk_bundle *vk = comp_target_service_get_vk(mc->msc->target_service);
 
 			// Wait for any pending GPU work to complete before cleanup
@@ -973,7 +973,7 @@ multi_compositor_destroy(struct xrt_compositor *xc)
 
 	// Clean up per-session render resources if still initialized
 	if (mc->session_render.initialized) {
-#ifdef XRT_HAVE_LEIA_SR
+#ifdef XRT_HAVE_LEIA_SR_VULKAN
 		struct vk_bundle *vk = comp_target_service_get_vk(mc->msc->target_service);
 
 		// Wait for any pending GPU work to complete before cleanup
@@ -1130,7 +1130,7 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 
 	U_LOG_W("Created per-session comp_target for HWND %p", mc->session_render.external_window_handle);
 
-#ifdef XRT_HAVE_LEIA_SR
+#ifdef XRT_HAVE_LEIA_SR_VULKAN
 	// Create per-session SR weaver
 	U_LOG_W("Getting Vulkan bundle for per-session weaver...");
 	struct vk_bundle *vk = comp_target_service_get_vk(mc->msc->target_service);
@@ -1266,7 +1266,7 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 	return true;
 }
 
-#ifdef XRT_HAVE_LEIA_SR
+#ifdef XRT_HAVE_LEIA_SR_VULKAN
 bool
 multi_compositor_get_predicted_eye_positions(struct multi_compositor *mc, struct leiasr_eye_pair *out_eye_pair)
 {

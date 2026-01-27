@@ -1,45 +1,12 @@
 #pragma once
 
 #include "xrt/xrt_results.h"
+#include "leiasr_types.h"
 #include <vulkan/vulkan.h>
-#include <stdbool.h>
-#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-/*!
- * Eye position in meters (converted from SR's millimeters).
- * Position is relative to the display center.
- */
-struct leiasr_eye_position
-{
-	float x;  //!< Horizontal position (positive = right)
-	float y;  //!< Vertical position (positive = up)
-	float z;  //!< Depth position (positive = toward viewer)
-};
-
-/*!
- * Eye pair containing both left and right eye positions.
- */
-struct leiasr_eye_pair
-{
-	struct leiasr_eye_position left;   //!< Left eye position in meters
-	struct leiasr_eye_position right;  //!< Right eye position in meters
-	int64_t timestamp_ns;              //!< Monotonic timestamp when the eye positions were sampled
-	bool valid;                        //!< True if the eye positions are valid
-};
-
-/*!
- * Display dimensions in meters for Kooima FOV calculation.
- */
-struct leiasr_display_dimensions
-{
-	float width_m;   //!< Screen width in meters
-	float height_m;  //!< Screen height in meters
-	bool valid;      //!< True if the dimensions are valid
-};
 
 //! Forward declaration for the SR context holder
 struct leiasr;

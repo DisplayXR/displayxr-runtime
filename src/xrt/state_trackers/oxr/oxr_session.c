@@ -52,12 +52,19 @@
 #include <stdlib.h>
 #include <assert.h>
 
-#ifdef XRT_HAVE_LEIA_SR
+// SR eye tracking support - either Vulkan or D3D11 path
+#if defined(XRT_HAVE_LEIA_SR_VULKAN) || defined(XRT_HAVE_LEIA_SR_D3D11)
+#define XRT_HAVE_LEIA_SR_EYE_TRACKING
+#include "leiasr/leiasr_types.h"
+#endif
+
+#ifdef XRT_HAVE_LEIA_SR_EYE_TRACKING_VULKAN
 #include "multi/comp_multi_private.h"
 #include "leiasr/leiasr.h"
-#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
-#include "d3d11/comp_d3d11_compositor.h"
 #endif
+
+#if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_NATIVE_COMPOSITOR)
+#include "d3d11/comp_d3d11_compositor.h"
 #endif
 
 
@@ -102,7 +109,7 @@ to_string(XrSessionState state)
 	}
 }
 
-#ifdef XRT_HAVE_LEIA_SR
+#ifdef XRT_HAVE_LEIA_SR_EYE_TRACKING_EYE_TRACKING
 /*!
  * Get predicted eye positions from the session's per-session weaver.
  * Uses the weaver's LookaroundFilter which adapts to application-specific latency.
@@ -115,7 +122,7 @@ oxr_session_get_predicted_eye_positions(struct oxr_session *sess, struct leiasr_
 		return false;
 	}
 
-#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
+#if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_NATIVE_COMPOSITOR)
 	// Check if using D3D11 native compositor (not multi_compositor)
 	if (sess->is_d3d11_native_compositor) {
 		struct xrt_vec3 left_eye, right_eye;
@@ -145,9 +152,13 @@ oxr_session_get_predicted_eye_positions(struct oxr_session *sess, struct leiasr_
 	}
 #endif
 
+#ifdef XRT_HAVE_LEIA_SR_EYE_TRACKING_VULKAN
 	// The session's xcn is a multi_compositor in the multi-client architecture
 	struct multi_compositor *mc = multi_compositor(&sess->xcn->base);
 	return multi_compositor_get_predicted_eye_positions(mc, out_eye_pair);
+#else
+	return false;
+#endif
 }
 
 /*!
@@ -161,15 +172,19 @@ oxr_session_get_display_dimensions(struct oxr_session *sess, float *out_width_m,
 		return false;
 	}
 
-#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
+#if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_NATIVE_COMPOSITOR)
 	// Check if using D3D11 native compositor (not multi_compositor)
 	if (sess->is_d3d11_native_compositor) {
 		return comp_d3d11_compositor_get_display_dimensions(&sess->xcn->base, out_width_m, out_height_m);
 	}
 #endif
 
+#ifdef XRT_HAVE_LEIA_SR_EYE_TRACKING_VULKAN
 	struct multi_compositor *mc = multi_compositor(&sess->xcn->base);
 	return multi_compositor_get_display_dimensions(mc, out_width_m, out_height_m);
+#else
+	return false;
+#endif
 }
 
 /*!
@@ -811,7 +826,7 @@ oxr_session_locate_views(struct oxr_logger *log,
 	struct xrt_fov fovs[XRT_MAX_VIEWS] = {0};
 	struct xrt_pose poses[XRT_MAX_VIEWS] = {0};
 
-#ifdef XRT_HAVE_LEIA_SR
+#ifdef XRT_HAVE_LEIA_SR_EYE_TRACKING
 	// For SR displays with eye tracking, compute view poses directly from tracked eyes
 	// instead of using the simulated device's wobbling head pose.
 	// The eye positions from face tracking ARE the ground truth for SR displays.
@@ -973,7 +988,7 @@ oxr_session_locate_views(struct oxr_logger *log,
 		m_relation_chain_resolve(&xrc, &result);
 		OXR_XRT_POSE_TO_XRPOSEF(result.pose, views[i].pose);
 
-#ifdef XRT_HAVE_LEIA_SR
+#ifdef XRT_HAVE_LEIA_SR_EYE_TRACKING
 		// For SR eye tracking, override with absolute eye positions
 		// (The space relation chain above is for the normal HMD path)
 		if (have_sr_eye_tracking && view_count == 2) {
@@ -1006,7 +1021,7 @@ oxr_session_locate_views(struct oxr_logger *log,
 			adjust_fov(&fovs[i], &poses[i].orientation, &fov);
 		}
 
-#ifdef XRT_HAVE_LEIA_SR
+#ifdef XRT_HAVE_LEIA_SR_EYE_TRACKING
 		// For SR path, FOV was already computed via Kooima above.
 		// This block only runs for the normal (non-SR) path.
 		// (SR FOVs are already in fovs[] array from the early computation)

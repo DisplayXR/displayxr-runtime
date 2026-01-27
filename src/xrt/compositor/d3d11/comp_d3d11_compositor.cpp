@@ -32,7 +32,7 @@
 #include "comp_d3d11_debug.h"
 #endif
 
-#ifdef XRT_HAVE_LEIA_SR
+#ifdef XRT_HAVE_LEIA_SR_D3D11
 #include "leiasr/leiasr_d3d11.h"
 #endif
 
@@ -87,7 +87,7 @@ struct comp_d3d11_compositor
 	//! True if we created the window ourselves.
 	bool owns_window;
 
-#ifdef XRT_HAVE_LEIA_SR
+#ifdef XRT_HAVE_LEIA_SR_D3D11
 	//! SR weaver for light field display.
 	struct leiasr_d3d11 *weaver;
 #endif
@@ -478,7 +478,7 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	struct xrt_vec3 left_eye = {-0.032f, 0.0f, 0.6f};   // Default: 64mm IPD, 60cm from screen
 	struct xrt_vec3 right_eye = {0.032f, 0.0f, 0.6f};
 
-#ifdef XRT_HAVE_LEIA_SR
+#ifdef XRT_HAVE_LEIA_SR_D3D11
 	if (c->weaver != nullptr) {
 		float left[3], right[3];
 		if (leiasr_d3d11_get_predicted_eye_positions(c->weaver, left, right)) {
@@ -516,7 +516,7 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		return xret;
 	}
 
-#ifdef XRT_HAVE_LEIA_SR
+#ifdef XRT_HAVE_LEIA_SR_D3D11
 	if (c->weaver != nullptr && leiasr_d3d11_is_ready(c->weaver)) {
 		// Get stereo texture SRV from renderer
 		void *stereo_srv = comp_d3d11_renderer_get_stereo_srv(c->renderer);
@@ -584,7 +584,7 @@ d3d11_compositor_destroy(struct xrt_compositor *xc)
 	}
 #endif
 
-#ifdef XRT_HAVE_LEIA_SR
+#ifdef XRT_HAVE_LEIA_SR_D3D11
 	if (c->weaver != nullptr) {
 		leiasr_d3d11_destroy(&c->weaver);
 	}
@@ -805,7 +805,7 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	}
 #endif
 
-#ifdef XRT_HAVE_LEIA_SR
+#ifdef XRT_HAVE_LEIA_SR_D3D11
 	// Create SR weaver if available
 	xret = leiasr_d3d11_create(5.0, // 5 second timeout
 	                           c->device,
@@ -887,7 +887,7 @@ comp_d3d11_compositor_get_predicted_eye_positions(struct xrt_compositor *xc,
 	static int call_count = 0;
 	bool should_log = (++call_count % 60) == 1;
 
-#ifdef XRT_HAVE_LEIA_SR
+#ifdef XRT_HAVE_LEIA_SR_D3D11
 	if (should_log) {
 		U_LOG_D("D3D11 get_predicted_eye_positions: weaver=%p", (void *)c->weaver);
 	}
@@ -911,7 +911,7 @@ comp_d3d11_compositor_get_predicted_eye_positions(struct xrt_compositor *xc,
 	}
 #else
 	if (should_log) {
-		U_LOG_D("D3D11 get_predicted_eye_positions: XRT_HAVE_LEIA_SR not defined");
+		U_LOG_D("D3D11 get_predicted_eye_positions: XRT_HAVE_LEIA_SR_D3D11 not defined");
 	}
 #endif
 
@@ -937,7 +937,7 @@ comp_d3d11_compositor_get_display_dimensions(struct xrt_compositor *xc,
 {
 	struct comp_d3d11_compositor *c = d3d11_comp(xc);
 
-#ifdef XRT_HAVE_LEIA_SR
+#ifdef XRT_HAVE_LEIA_SR_D3D11
 	if (c->weaver != nullptr) {
 		struct leiasr_d3d11_display_dimensions dims;
 		if (leiasr_d3d11_get_display_dimensions(c->weaver, &dims) && dims.valid) {

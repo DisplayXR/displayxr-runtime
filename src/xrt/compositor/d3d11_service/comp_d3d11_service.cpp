@@ -26,7 +26,7 @@
 
 #include "d3d/d3d_d3d11_fence.hpp"
 
-#ifdef XRT_HAVE_LEIA_SR
+#ifdef XRT_HAVE_LEIA_SR_D3D11
 #include "leiasr/leiasr_d3d11.h"
 #endif
 
@@ -205,7 +205,7 @@ struct d3d11_service_system
 	//! Self-created window for display output
 	HWND hwnd;
 
-#ifdef XRT_HAVE_LEIA_SR
+#ifdef XRT_HAVE_LEIA_SR_D3D11
 	//! SR weaver for light field display
 	struct leiasr_d3d11 *weaver;
 #endif
@@ -1618,7 +1618,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		}
 	}
 
-#ifdef XRT_HAVE_LEIA_SR
+#ifdef XRT_HAVE_LEIA_SR_D3D11
 	// Weave stereo texture through SR weaver for light field display
 	if (sys->weaver != nullptr && sys->stereo_srv) {
 		// Set input stereo texture
@@ -1750,7 +1750,7 @@ system_destroy(struct xrt_system_compositor *xsysc)
 
 	U_LOG_I("Destroying D3D11 service system compositor");
 
-#ifdef XRT_HAVE_LEIA_SR
+#ifdef XRT_HAVE_LEIA_SR_D3D11
 	if (sys->weaver != nullptr) {
 		leiasr_d3d11_destroy(&sys->weaver);
 	}
@@ -2007,7 +2007,7 @@ comp_d3d11_service_create_system(struct xrt_device *xdev,
 		// Don't fail - projection layers will still work
 	}
 
-#ifdef XRT_HAVE_LEIA_SR
+#ifdef XRT_HAVE_LEIA_SR_D3D11
 	// Create SR weaver
 	{
 		xrt_result_t weaver_ret = leiasr_d3d11_create(

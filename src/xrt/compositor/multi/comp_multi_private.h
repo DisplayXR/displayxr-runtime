@@ -21,7 +21,7 @@
 #include "util/u_pacing.h"
 #include "util/comp_target_service.h"
 
-#ifdef XRT_HAVE_LEIA_SR
+#ifdef XRT_HAVE_LEIA_SR_VULKAN
 // Use xrt_vulkan_includes.h instead of vulkan.h directly to ensure VK_NO_PROTOTYPES is defined
 #include "xrt/xrt_vulkan_includes.h"
 #endif
@@ -211,7 +211,7 @@ struct multi_compositor
 		//! Per-session render target (VkSwapchain from external HWND)
 		struct comp_target *target;
 
-#ifdef XRT_HAVE_LEIA_SR
+#ifdef XRT_HAVE_LEIA_SR_VULKAN
 		//! Per-session SR weaver for this session's window
 		struct leiasr *weaver;
 
@@ -474,7 +474,7 @@ multi_compositor_has_session_render(struct multi_compositor *mc)
 	return mc->session_render.external_window_handle != NULL;
 }
 
-#ifdef XRT_HAVE_LEIA_SR
+#ifdef XRT_HAVE_LEIA_SR_VULKAN
 /*!
  * Get predicted eye positions from the session's per-session weaver.
  * This uses the weaver's LookaroundFilter which adapts to application-specific latency.

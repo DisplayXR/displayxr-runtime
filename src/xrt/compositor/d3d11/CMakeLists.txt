@@ -36,8 +36,8 @@ if(WIN32 AND XRT_HAVE_D3D11)
 	target_include_directories(comp_d3d11 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
 	# Link to SR SDK D3D11 weaver if available
+	# drv_leiasr exports XRT_HAVE_LEIA_SR_D3D11 as PUBLIC when D3D11 weaver is available
 	if(XRT_HAVE_LEIA_SR)
-		target_compile_definitions(comp_d3d11 PRIVATE XRT_HAVE_LEIA_SR)
 		target_link_libraries(comp_d3d11 PRIVATE drv_leiasr)
 	endif()
 

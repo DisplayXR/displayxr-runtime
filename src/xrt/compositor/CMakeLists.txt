@@ -317,7 +317,8 @@ if(XRT_HAVE_LEIA_SR)
 		message(FATAL_ERROR "no drv_leiasr target")
 	endif()
 
-	target_compile_definitions(comp_main PUBLIC XRT_HAVE_LEIA_SR)
+	# drv_leiasr exports XRT_HAVE_LEIA_SR_VULKAN and/or XRT_HAVE_LEIA_SR_D3D11
+	# as PUBLIC compile definitions based on available SR libraries
 	target_link_libraries(comp_main PUBLIC drv_leiasr)
 endif()
 
@@ -345,8 +346,8 @@ target_link_libraries(
 target_include_directories(comp_multi PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 # Link comp_multi to leiasr driver for per-session SR weaver creation
+# drv_leiasr exports XRT_HAVE_LEIA_SR_VULKAN as PUBLIC when Vulkan SR is available
 if(XRT_HAVE_LEIA_SR)
-	target_compile_definitions(comp_multi PRIVATE XRT_HAVE_LEIA_SR)
 	target_link_libraries(comp_multi PRIVATE drv_leiasr)
 endif()
 

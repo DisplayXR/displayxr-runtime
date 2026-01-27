@@ -88,8 +88,9 @@ if(XRT_HAVE_D3D11)
 endif()
 
 # Leia SR eye tracking support for computing view poses from face tracking
+# drv_leiasr exports XRT_HAVE_LEIA_SR_VULKAN and/or XRT_HAVE_LEIA_SR_D3D11
+# as PUBLIC compile definitions based on available SR libraries
 if(XRT_HAVE_LEIA_SR)
-	target_compile_definitions(st_oxr PRIVATE XRT_HAVE_LEIA_SR)
 	target_link_libraries(st_oxr PRIVATE drv_leiasr)
 endif()
 

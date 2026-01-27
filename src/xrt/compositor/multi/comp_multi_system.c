@@ -37,7 +37,7 @@
 #include "util/comp_swapchain.h"
 #include "util/comp_render_helpers.h"
 
-#ifdef XRT_HAVE_LEIA_SR
+#ifdef XRT_HAVE_LEIA_SR_VULKAN
 #include "leiasr/leiasr.h"
 #endif
 
@@ -268,7 +268,7 @@ find_active_blend_mode(struct multi_compositor **overlay_sorted_clients, size_t 
  *
  */
 
-#ifdef XRT_HAVE_LEIA_SR
+#ifdef XRT_HAVE_LEIA_SR_VULKAN
 
 /*!
  * Extract VkImageView and dimensions from a multi_layer_entry for a specific view.
@@ -526,7 +526,7 @@ render_per_session_clients_locked(struct multi_system_compositor *msc, int64_t d
 	U_LOG_W("[per-session] render_per_session_clients_locked: END (processed %d sessions)", session_count);
 }
 
-#endif // XRT_HAVE_LEIA_SR
+#endif // XRT_HAVE_LEIA_SR_VULKAN
 
 
 static void
@@ -839,7 +839,7 @@ multi_main_loop(struct multi_system_compositor *msc)
 
 		xrt_comp_layer_commit(xc, XRT_GRAPHICS_SYNC_HANDLE_INVALID);
 
-#ifdef XRT_HAVE_LEIA_SR
+#ifdef XRT_HAVE_LEIA_SR_VULKAN
 		// Render per-session clients to their own targets (Phase 4)
 		// These sessions were skipped in transfer_layers_locked and render separately
 		os_mutex_lock(&msc->list_and_timing_lock);

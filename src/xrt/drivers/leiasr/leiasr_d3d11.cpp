@@ -352,7 +352,7 @@ leiasr_d3d11_is_ready(struct leiasr_d3d11 *leiasr)
 }
 
 bool
-leiasr_d3d11_get_display_dimensions(struct leiasr_d3d11 *leiasr, struct leiasr_d3d11_display_dimensions *out_dims)
+leiasr_d3d11_get_display_dimensions(struct leiasr_d3d11 *leiasr, struct leiasr_display_dimensions *out_dims)
 {
 	if (leiasr == nullptr || out_dims == nullptr) {
 		if (out_dims != nullptr) {

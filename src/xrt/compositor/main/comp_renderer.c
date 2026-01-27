@@ -54,7 +54,7 @@
 #include <leia/common/version.h>
 #endif
 
-#ifdef XRT_HAVE_LEIA_SR
+#ifdef XRT_HAVE_LEIA_SR_VULKAN
 #include "leiasr/leiasr.h"
 #endif
 
@@ -164,9 +164,9 @@ struct comp_renderer
 	struct leia_core* cnsdk;
     struct leia_interlacer* interlacer;
 
-#ifdef XRT_HAVE_LEIA_SR
+#ifdef XRT_HAVE_LEIA_SR_VULKAN
 	struct leiasr* leiasr;
-#endif // XRT_HAVE_LEIA_SR
+#endif // XRT_HAVE_LEIA_SR_VULKAN
 };
 
 
@@ -576,12 +576,16 @@ renderer_init(struct comp_renderer *r, struct comp_compositor *c, VkExtent2D scr
 
 	struct vk_bundle *vk = &r->c->base.vk;
 
-#ifdef XRT_HAVE_LEIA_SR
+#ifdef XRT_HAVE_LEIA_SR_VULKAN
 	// Get external window handle from compositor (if provided via XR_EXT_session_target)
 	// NULL = fullscreen mode, valid HWND = windowed mode
 	void *window_handle = r->c->external_window_handle;
-	leiasr_create(1000.0, vk->device, vk->physical_device, vk->main_queue->queue, r->target_render_pass.r->cmd_pool, window_handle, &r->leiasr);
-#endif // XRT_HAVE_LEIA_SR
+	xrt_result_t sr_ret = leiasr_create(1000.0, vk->device, vk->physical_device, vk->main_queue->queue, r->target_render_pass.r->cmd_pool, window_handle, &r->leiasr);
+	if (sr_ret != XRT_SUCCESS) {
+		COMP_WARN(c, "Failed to create SR Vulkan weaver, continuing without interlacing");
+		r->leiasr = NULL;
+	}
+#endif // XRT_HAVE_LEIA_SR_VULKAN
 
 	VkResult ret = comp_mirror_init( //
 	    &r->mirror_to_debug_gui,     //
@@ -888,9 +892,9 @@ renderer_fini(struct comp_renderer *r)
 	leia_platform_on_library_unload();
 #endif // XRT_HAVE_CNSDK
 
-#ifdef XRT_HAVE_LEIA_SR
+#ifdef XRT_HAVE_LEIA_SR_VULKAN
 	leiasr_destroy(r->leiasr);
-#endif // XRT_HAVE_LEIA_SR
+#endif // XRT_HAVE_LEIA_SR_VULKAN
 }
 
 static bool getLayerInfo(struct comp_renderer *r, int view_index, int* width, int* height, VkFormat* format, VkImageView* imageView)
@@ -958,46 +962,49 @@ do_weaving(struct comp_renderer *r,
 	}
 #endif
 
-#ifdef XRT_HAVE_LEIA_SR
+#ifdef XRT_HAVE_LEIA_SR_VULKAN
 
-	struct vk_bundle* vk = &r->c->base.vk;
-	struct comp_target* ct = r->c->target;
-	struct comp_compositor* c  = r->c;
+	// Only weave if SR Vulkan weaver was successfully created
+	if (r->leiasr != NULL) {
+		struct vk_bundle* vk = &r->c->base.vk;
+		struct comp_target* ct = r->c->target;
+		struct comp_compositor* c  = r->c;
 
-	// Get command-buffer
-	VkCommandBuffer commandBuffer = render->r->cmd;
+		// Get command-buffer
+		VkCommandBuffer commandBuffer = render->r->cmd;
 
-	// Get framebuffer.
-	VkFramebuffer framebuffer = rtr->framebuffer;
-	int framebufferWidth = rtr->extent.width;
-	int framebufferHeight = rtr->extent.height;
-	VkFormat framebufferFormat = rtr->rgrp->format;
+		// Get framebuffer.
+		VkFramebuffer framebuffer = rtr->framebuffer;
+		int framebufferWidth = rtr->extent.width;
+		int framebufferHeight = rtr->extent.height;
+		VkFormat framebufferFormat = rtr->rgrp->format;
 
-        // Get views.
-	int imageWidth = 0;
-	int imageHeight = 0;
-	VkFormat imageFormat = VK_FORMAT_UNDEFINED;
-	VkImageView leftImageView = VK_NULL_HANDLE;
-	VkImageView rightImageView = VK_NULL_HANDLE;
-	bool leftViewOk = getLayerInfo(r, 0, &imageWidth, &imageHeight, &imageFormat, &leftImageView);
-	bool rightViewOk = getLayerInfo(r, 1, &imageWidth, &imageHeight, &imageFormat, &rightImageView);
+		// Get views.
+		int imageWidth = 0;
+		int imageHeight = 0;
+		VkFormat imageFormat = VK_FORMAT_UNDEFINED;
+		VkImageView leftImageView = VK_NULL_HANDLE;
+		VkImageView rightImageView = VK_NULL_HANDLE;
+		bool leftViewOk = getLayerInfo(r, 0, &imageWidth, &imageHeight, &imageFormat, &leftImageView);
+		bool rightViewOk = getLayerInfo(r, 1, &imageWidth, &imageHeight, &imageFormat, &rightImageView);
 
-	// Get viewport (fullscreen).
-	VkRect2D viewport = {0};
-	viewport.offset.x = 0;
-	viewport.offset.y = 0;
-	viewport.extent.width = framebufferWidth;
-	viewport.extent.height = framebufferHeight;
+		// Get viewport (fullscreen).
+		VkRect2D viewport = {0};
+		viewport.offset.x = 0;
+		viewport.offset.y = 0;
+		viewport.extent.width = framebufferWidth;
+		viewport.extent.height = framebufferHeight;
 
-	// Weave.
-	if (leftViewOk && rightViewOk)
-	{
-		render_gfx_begin(render);
-		leiasr_weave(r->leiasr, commandBuffer, leftImageView, rightImageView, viewport, imageWidth, imageHeight, imageFormat, framebuffer, framebufferWidth, framebufferHeight, framebufferFormat);
-		render_gfx_end(render);
+		// Weave.
+		if (leftViewOk && rightViewOk)
+		{
+			render_gfx_begin(render);
+			leiasr_weave(r->leiasr, commandBuffer, leftImageView, rightImageView, viewport, imageWidth, imageHeight, imageFormat, framebuffer, framebufferWidth, framebufferHeight, framebufferFormat);
+			render_gfx_end(render);
+		}
 	}
 
-#endif // XRT_HAVE_LEIA_SR
+#endif // XRT_HAVE_LEIA_SR_VULKAN
 }
 
 /*
