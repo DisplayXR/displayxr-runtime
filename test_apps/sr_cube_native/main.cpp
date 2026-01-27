@@ -13,8 +13,9 @@
 #define _UNICODE
 #include <windows.h>
 #include <wrl/client.h>
-#include <d3d11.h>
+#include <d3d11_1.h>
 #include <dxgi1_4.h>
+#include <shellscalingapi.h>
 
 #include "logging.h"
 #include "input_handler.h"
@@ -26,11 +27,19 @@
 #include <chrono>
 #include <string>
 #include <sstream>
+#include <mutex>
+
+// Library for SetProcessDpiAwareness
+#pragma comment(lib, "shcore.lib")
 
 // SR SDK headers (CNSDK)
 #ifdef XRT_HAVE_CNSDK
-#include <SR/SR.h>
-#include <SR/dx11weaver.h>
+#include "sr/utility/exception.h"
+#include "sr/sense/core/inputstream.h"
+#include "sr/sense/system/systemsense.h"
+#include "sr/sense/eyetracker/eyetracker.h"
+#include "sr/world/display/display.h"
+#include "sr/weaver/dx11weaver.h"
 #endif
 
 using Microsoft::WRL::ComPtr;
@@ -50,6 +59,22 @@ static bool g_running = true;
 static UINT g_windowWidth = 2560;   // Stereo width
 static UINT g_windowHeight = 1600;  // SR display height
 static bool g_windowResized = false;
+static std::recursive_mutex g_mutex;
+
+#ifdef XRT_HAVE_CNSDK
+// SR SDK global state
+static SR::SRContext*        g_srContext = nullptr;
+static SR::IDisplayManager*  g_displayManager = nullptr;
+static SR::IDisplay*         g_display = nullptr;
+static SR::IDX11Weaver1*     g_srWeaver = nullptr;
+
+// Display properties
+static float g_screenWidthMM = 0.0f;
+static float g_screenHeightMM = 0.0f;
+static leia::vec3f g_defaultViewingPosition = leia::vec3f(0.0f, 0.0f, 600.0f);
+static int g_viewTextureWidth = 0;
+static int g_viewTextureHeight = 0;
+#endif
 
 // Window procedure
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -76,6 +101,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
         break;
+
+    case WM_GETMINMAXINFO:
+    {
+        MINMAXINFO* mmi = reinterpret_cast<MINMAXINFO*>(lParam);
+        mmi->ptMinTrackSize.x = 100;
+        mmi->ptMinTrackSize.y = 100;
+        return 0;
+    }
     }
 
     return DefWindowProc(hwnd, msg, wParam, lParam);
@@ -110,72 +143,147 @@ static void UpdatePerformanceStats(PerformanceStats& stats) {
 
 #ifdef XRT_HAVE_CNSDK
 
-// SR SDK context
-struct SRContext {
-    SR::SRContext* context = nullptr;
-    SR::DisplayManager* displayManager = nullptr;
-    SR::DX11Weaver* weaver = nullptr;
+static bool CreateSRContext(double maxTimeSeconds) {
+    LOG_INFO("Creating SR context (timeout: %.1fs)...", maxTimeSeconds);
 
-    float displayWidthM = 0.355f;   // Default ~14" display
-    float displayHeightM = 0.222f;
-    float defaultViewingDistance = 0.6f;  // 60cm
+    const double startTime = (double)GetTickCount64() / 1000.0;
 
-    bool ready = false;
-};
+    // Create SR context with retry loop
+    while (g_srContext == nullptr) {
+        try {
+            g_srContext = SR::SRContext::create();
+            break;
+        }
+        catch (SR::ServerNotAvailableException& e) {
+            // SR Service may be starting up, ignore and retry
+            (void)e;
+        }
+        catch (...) {
+            LOG_ERROR("Unknown exception while creating SR context");
+        }
 
-static bool InitializeSR(SRContext& sr, ID3D11Device* device, ID3D11DeviceContext* context,
-                         HWND hwnd, uint32_t viewWidth, uint32_t viewHeight) {
-    LOG_INFO("Initializing SR SDK...");
+        LOG_INFO("Waiting for SR context...");
+        Sleep(100);
 
-    // Create SR context
-    sr.context = SR::SRContext::create("sr_cube_native");
-    if (!sr.context) {
-        LOG_ERROR("Failed to create SR context");
+        double curTime = (double)GetTickCount64() / 1000.0;
+        if ((curTime - startTime) > maxTimeSeconds) {
+            LOG_ERROR("Timeout waiting for SR context");
+            break;
+        }
+    }
+
+    if (g_srContext == nullptr) {
         return false;
     }
-    LOG_INFO("SR context created");
+    LOG_INFO("SR context created: 0x%p", g_srContext);
 
-    // Get display manager
-    sr.displayManager = sr.context->getDisplayManager();
-    if (!sr.displayManager) {
-        LOG_ERROR("Failed to get display manager");
+    // Get display manager using modern API
+    try {
+        g_displayManager = SR::GetDisplayManagerInstance(*g_srContext);
+        if (g_displayManager != nullptr) {
+            g_display = g_displayManager->getPrimaryActiveSRDisplay();
+        }
+    }
+    catch (...) {
+        LOG_ERROR("Failed to get DisplayManager - requires runtime version 1.34.8 or later");
+        return false;
+    }
+
+    if (g_display == nullptr) {
+        LOG_ERROR("No SR display found");
+        return false;
+    }
+
+    // Wait for display to be ready
+    bool displayReady = false;
+    while (!displayReady) {
+        if (g_display->isValid()) {
+            SR_recti displayLocation = g_display->getLocation();
+            int64_t width = displayLocation.right - displayLocation.left;
+            int64_t height = displayLocation.bottom - displayLocation.top;
+            if (width > 0 && height > 0) {
+                displayReady = true;
+                LOG_INFO("SR display ready: %lldx%lld at (%lld,%lld)",
+                    width, height, displayLocation.left, displayLocation.top);
+                break;
+            }
+        }
+
+        LOG_INFO("Waiting for display to be ready...");
+        Sleep(100);
+
+        double curTime = (double)GetTickCount64() / 1000.0;
+        if ((curTime - startTime) > maxTimeSeconds) {
+            LOG_ERROR("Timeout waiting for display");
+            break;
+        }
+    }
+
+    return displayReady;
+}
+
+static bool InitializeLeiaSR(ID3D11DeviceContext* d3dContext, HWND hwnd, double maxTimeSeconds) {
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
+
+    LOG_INFO("Initializing LeiaSR...");
+
+    // Create SR context
+    if (!CreateSRContext(maxTimeSeconds)) {
+        LOG_ERROR("Failed to create SR context");
         return false;
     }
 
     // Get display properties
-    auto displays = sr.displayManager->getDisplays();
-    if (!displays.empty()) {
-        auto& display = displays[0];
-        sr.displayWidthM = display.getPhysicalWidth() / 1000.0f;  // mm to m
-        sr.displayHeightM = display.getPhysicalHeight() / 1000.0f;
-        LOG_INFO("SR display: %.3fm x %.3fm", sr.displayWidthM, sr.displayHeightM);
-    }
+    g_viewTextureWidth = g_display->getRecommendedViewsTextureWidth();
+    g_viewTextureHeight = g_display->getRecommendedViewsTextureHeight();
+    LOG_INFO("Recommended view texture size: %dx%d", g_viewTextureWidth, g_viewTextureHeight);
+
+    // Get physical screen dimensions (cm to mm)
+    g_screenWidthMM = g_display->getPhysicalSizeWidth() * 10.0f;
+    g_screenHeightMM = g_display->getPhysicalSizeHeight() * 10.0f;
+    LOG_INFO("Screen physical size: %.1fmm x %.1fmm", g_screenWidthMM, g_screenHeightMM);
+
+    // Get default viewing position
+    float x_mm, y_mm, z_mm;
+    g_display->getDefaultViewingPosition(x_mm, y_mm, z_mm);
+    g_defaultViewingPosition = leia::vec3f(x_mm, y_mm, z_mm);
+    LOG_INFO("Default viewing position: (%.1f, %.1f, %.1f) mm", x_mm, y_mm, z_mm);
 
     // Create D3D11 weaver
-    sr.weaver = SR::DX11Weaver::create(sr.context, device, context, hwnd,
-                                        viewWidth, viewHeight);
-    if (!sr.weaver) {
-        LOG_ERROR("Failed to create D3D11 weaver");
+    LOG_INFO("Creating D3D11 weaver...");
+    WeaverErrorCode createWeaverResult = SR::CreateDX11Weaver(g_srContext, d3dContext, hwnd, &g_srWeaver);
+    if (createWeaverResult != WeaverErrorCode::WeaverSuccess) {
+        LOG_ERROR("Failed to create D3D11 weaver, error: %d", (int)createWeaverResult);
         return false;
     }
-    LOG_INFO("D3D11 weaver created");
+    LOG_INFO("D3D11 weaver created: 0x%p", g_srWeaver);
 
-    sr.ready = true;
-    LOG_INFO("SR SDK initialization complete");
+    // Initialize context after creating weaver
+    g_srContext->initialize();
+    LOG_INFO("SR context initialized");
+
     return true;
 }
 
-static void CleanupSR(SRContext& sr) {
-    if (sr.weaver) {
-        delete sr.weaver;
-        sr.weaver = nullptr;
+static void CleanupLeiaSR() {
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
+
+    LOG_INFO("Cleaning up LeiaSR...");
+
+    if (g_srWeaver) {
+        g_srWeaver->destroy();
+        g_srWeaver = nullptr;
     }
-    if (sr.context) {
-        sr.context->destroy();
-        sr.context = nullptr;
+
+    if (g_srContext) {
+        SR::SRContext::deleteSRContext(g_srContext);
+        g_srContext = nullptr;
     }
-    sr.displayManager = nullptr;
-    sr.ready = false;
+
+    g_displayManager = nullptr;
+    g_display = nullptr;
+
+    LOG_INFO("LeiaSR cleanup complete");
 }
 
 #endif // XRT_HAVE_CNSDK
@@ -184,6 +292,9 @@ static void CleanupSR(SRContext& sr) {
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
     (void)hPrevInstance;
     (void)lpCmdLine;
+
+    // Ensure DPI awareness
+    SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE);
 
     // Initialize logging
     if (!InitializeLogging(APP_NAME)) {
@@ -203,25 +314,79 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     return 1;
 #else
 
-    // Find SR display
-    int srMonitor = FindSRDisplayMonitor();
-    LOG_INFO("Using monitor %d for SR display", srMonitor);
-
-    // Create window on SR display
-    if (!CreateAppWindow(g_windowInfo, hInstance, WINDOW_CLASS, WINDOW_TITLE,
-                         g_windowWidth, g_windowHeight, WindowProc, srMonitor)) {
-        LOG_ERROR("Failed to create window");
+    // Create SR context first to get display location
+    LOG_INFO("Creating SR context to find display...");
+    if (!CreateSRContext(10.0)) {
+        LOG_ERROR("Failed to create SR context");
+        MessageBox(nullptr,
+            L"Failed to connect to SR Service.\n\n"
+            L"Please ensure SR Service is running.",
+            L"SR Service Required", MB_OK | MB_ICONERROR);
         ShutdownLogging();
         return 1;
     }
+
+    // Get display location for window positioning
+    SR_recti displayLocation = g_display->getLocation();
+    int displayX = (int)displayLocation.left;
+    int displayY = (int)displayLocation.top;
+    int displayWidth = (int)(displayLocation.right - displayLocation.left);
+    int displayHeight = (int)(displayLocation.bottom - displayLocation.top);
+    LOG_INFO("SR display at (%d,%d) size %dx%d", displayX, displayY, displayWidth, displayHeight);
+
+    // Use display size for window
+    g_windowWidth = displayWidth;
+    g_windowHeight = displayHeight;
+
+    // Register window class
+    WNDCLASSEX wc = {};
+    wc.cbSize = sizeof(WNDCLASSEX);
+    wc.style = CS_HREDRAW | CS_VREDRAW;
+    wc.lpfnWndProc = WindowProc;
+    wc.hInstance = hInstance;
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+    wc.lpszClassName = WINDOW_CLASS;
+
+    if (!RegisterClassEx(&wc)) {
+        DWORD err = GetLastError();
+        if (err != ERROR_CLASS_ALREADY_EXISTS) {
+            LOG_ERROR("Failed to register window class, error: %lu", err);
+            CleanupLeiaSR();
+            ShutdownLogging();
+            return 1;
+        }
+    }
+
+    // Create window on SR display
+    LOG_INFO("Creating window on SR display...");
+    HWND hwnd = CreateWindowEx(
+        WS_EX_APPWINDOW,
+        WINDOW_CLASS,
+        WINDOW_TITLE,
+        WS_POPUP,  // Borderless for fullscreen
+        displayX, displayY,
+        displayWidth, displayHeight,
+        nullptr, nullptr, hInstance, nullptr
+    );
+
+    if (!hwnd) {
+        LOG_ERROR("Failed to create window, error: %lu", GetLastError());
+        CleanupLeiaSR();
+        ShutdownLogging();
+        return 1;
+    }
+    LOG_INFO("Window created: 0x%p", hwnd);
+    g_windowInfo.hwnd = hwnd;
 
     // Initialize D3D11
     LOG_INFO("Initializing D3D11...");
     D3D11Renderer renderer = {};
     if (!InitializeD3D11(renderer)) {
         LOG_ERROR("D3D11 initialization failed");
-        MessageBox(g_windowInfo.hwnd, L"Failed to initialize D3D11", L"Error", MB_OK | MB_ICONERROR);
-        DestroyAppWindow(g_windowInfo);
+        MessageBox(hwnd, L"Failed to initialize D3D11", L"Error", MB_OK | MB_ICONERROR);
+        DestroyWindow(hwnd);
+        CleanupLeiaSR();
         ShutdownLogging();
         return 1;
     }
@@ -233,39 +398,55 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     if (!InitializeTextOverlay(textOverlay)) {
         LOG_ERROR("Text overlay initialization failed");
         CleanupD3D11(renderer);
-        DestroyAppWindow(g_windowInfo);
+        DestroyWindow(hwnd);
+        CleanupLeiaSR();
         ShutdownLogging();
         return 1;
     }
 
-    // Initialize SR SDK
-    uint32_t viewWidth = g_windowWidth / 2;  // Half width for each eye
-    uint32_t viewHeight = g_windowHeight;
-
-    SRContext sr = {};
-    if (!InitializeSR(sr, renderer.device.Get(), renderer.context.Get(),
-                      g_windowInfo.hwnd, viewWidth, viewHeight)) {
-        LOG_ERROR("SR SDK initialization failed");
-        MessageBox(g_windowInfo.hwnd, L"Failed to initialize SR SDK", L"Error", MB_OK | MB_ICONERROR);
+    // Initialize weaver (context already created)
+    LOG_INFO("Creating D3D11 weaver...");
+    WeaverErrorCode createWeaverResult = SR::CreateDX11Weaver(g_srContext, renderer.context.Get(), hwnd, &g_srWeaver);
+    if (createWeaverResult != WeaverErrorCode::WeaverSuccess) {
+        LOG_ERROR("Failed to create D3D11 weaver, error: %d", (int)createWeaverResult);
+        MessageBox(hwnd, L"Failed to create SR weaver", L"Error", MB_OK | MB_ICONERROR);
         CleanupTextOverlay(textOverlay);
         CleanupD3D11(renderer);
-        DestroyAppWindow(g_windowInfo);
+        DestroyWindow(hwnd);
+        CleanupLeiaSR();
         ShutdownLogging();
         return 1;
     }
+    LOG_INFO("D3D11 weaver created");
 
-    // Create stereo render target (side-by-side: 2x view width)
-    ComPtr<ID3D11Texture2D> stereoTexture;
-    ComPtr<ID3D11RenderTargetView> stereoRTV;
-    ComPtr<ID3D11ShaderResourceView> stereoSRV;
-    ComPtr<ID3D11Texture2D> depthTexture;
-    ComPtr<ID3D11DepthStencilView> depthDSV;
+    // Get recommended view texture size
+    g_viewTextureWidth = g_display->getRecommendedViewsTextureWidth();
+    g_viewTextureHeight = g_display->getRecommendedViewsTextureHeight();
+    LOG_INFO("View texture size: %dx%d", g_viewTextureWidth, g_viewTextureHeight);
 
-    LOG_INFO("Creating stereo render target (%ux%u per eye)...", viewWidth, viewHeight);
+    // Get physical screen dimensions (cm to mm)
+    g_screenWidthMM = g_display->getPhysicalSizeWidth() * 10.0f;
+    g_screenHeightMM = g_display->getPhysicalSizeHeight() * 10.0f;
+    LOG_INFO("Screen physical size: %.1fmm x %.1fmm", g_screenWidthMM, g_screenHeightMM);
+
+    // Get default viewing position
+    float x_mm, y_mm, z_mm;
+    g_display->getDefaultViewingPosition(x_mm, y_mm, z_mm);
+    g_defaultViewingPosition = leia::vec3f(x_mm, y_mm, z_mm);
+    LOG_INFO("Default viewing position: (%.1f, %.1f, %.1f) mm", x_mm, y_mm, z_mm);
+
+    // Create stereo view texture (side-by-side)
+    LOG_INFO("Creating stereo view texture (%dx%d)...", g_viewTextureWidth * 2, g_viewTextureHeight);
+    ComPtr<ID3D11Texture2D> viewTexture;
+    ComPtr<ID3D11ShaderResourceView> viewTextureSRV;
+    ComPtr<ID3D11RenderTargetView> viewTextureRTV;
+    ComPtr<ID3D11Texture2D> viewDepthTexture;
+    ComPtr<ID3D11DepthStencilView> viewDepthDSV;
+
     {
         D3D11_TEXTURE2D_DESC texDesc = {};
-        texDesc.Width = viewWidth * 2;  // Side-by-side
-        texDesc.Height = viewHeight;
+        texDesc.Width = g_viewTextureWidth * 2;  // Side-by-side stereo
+        texDesc.Height = g_viewTextureHeight;
         texDesc.MipLevels = 1;
         texDesc.ArraySize = 1;
         texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -273,59 +454,50 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         texDesc.Usage = D3D11_USAGE_DEFAULT;
         texDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
 
-        HRESULT hr = renderer.device->CreateTexture2D(&texDesc, nullptr, &stereoTexture);
+        HRESULT hr = renderer.device->CreateTexture2D(&texDesc, nullptr, &viewTexture);
         if (FAILED(hr)) {
-            LOG_ERROR("Failed to create stereo texture");
-            CleanupSR(sr);
-            CleanupTextOverlay(textOverlay);
-            CleanupD3D11(renderer);
-            DestroyAppWindow(g_windowInfo);
-            ShutdownLogging();
-            return 1;
+            LOG_ERROR("Failed to create view texture");
+            goto cleanup;
         }
 
-        hr = renderer.device->CreateRenderTargetView(stereoTexture.Get(), nullptr, &stereoRTV);
+        hr = renderer.device->CreateShaderResourceView(viewTexture.Get(), nullptr, &viewTextureSRV);
         if (FAILED(hr)) {
-            LOG_ERROR("Failed to create stereo RTV");
-            CleanupSR(sr);
-            CleanupTextOverlay(textOverlay);
-            CleanupD3D11(renderer);
-            DestroyAppWindow(g_windowInfo);
-            ShutdownLogging();
-            return 1;
+            LOG_ERROR("Failed to create view texture SRV");
+            goto cleanup;
         }
 
-        hr = renderer.device->CreateShaderResourceView(stereoTexture.Get(), nullptr, &stereoSRV);
+        hr = renderer.device->CreateRenderTargetView(viewTexture.Get(), nullptr, &viewTextureRTV);
         if (FAILED(hr)) {
-            LOG_ERROR("Failed to create stereo SRV");
-            CleanupSR(sr);
-            CleanupTextOverlay(textOverlay);
-            CleanupD3D11(renderer);
-            DestroyAppWindow(g_windowInfo);
-            ShutdownLogging();
-            return 1;
+            LOG_ERROR("Failed to create view texture RTV");
+            goto cleanup;
         }
 
-        // Create depth buffer
-        ID3D11Texture2D* depthTex = nullptr;
-        ID3D11DepthStencilView* dsv = nullptr;
-        if (!CreateDepthStencilView(renderer, viewWidth * 2, viewHeight, &depthTex, &dsv)) {
-            LOG_ERROR("Failed to create depth buffer");
-            CleanupSR(sr);
-            CleanupTextOverlay(textOverlay);
-            CleanupD3D11(renderer);
-            DestroyAppWindow(g_windowInfo);
-            ShutdownLogging();
-            return 1;
+        // Create depth texture
+        texDesc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+        texDesc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+        hr = renderer.device->CreateTexture2D(&texDesc, nullptr, &viewDepthTexture);
+        if (FAILED(hr)) {
+            LOG_ERROR("Failed to create depth texture");
+            goto cleanup;
         }
-        depthTexture.Attach(depthTex);
-        depthDSV.Attach(dsv);
+
+        hr = renderer.device->CreateDepthStencilView(viewDepthTexture.Get(), nullptr, &viewDepthDSV);
+        if (FAILED(hr)) {
+            LOG_ERROR("Failed to create depth DSV");
+            goto cleanup;
+        }
     }
-    LOG_INFO("Stereo render target created");
+    LOG_INFO("Stereo view texture created");
+
+    // Set input texture for weaver
+    g_srWeaver->setInputViewTexture(viewTextureSRV.Get(), g_viewTextureWidth, g_viewTextureHeight, DXGI_FORMAT_R8G8B8A8_UNORM);
+
+    // Initialize context
+    g_srContext->initialize();
 
     // Show window
-    ShowWindow(g_windowInfo.hwnd, nCmdShow);
-    UpdateWindow(g_windowInfo.hwnd);
+    ShowWindow(hwnd, nCmdShow);
+    UpdateWindow(hwnd);
 
     // Performance tracking
     PerformanceStats perfStats = {};
@@ -334,10 +506,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     // Eye tracking state
     float eyePosX = 0.0f;
     float eyePosY = 0.0f;
+    bool eyeTrackingActive = false;
 
     LOG_INFO("");
     LOG_INFO("=== Entering main loop ===");
-    LOG_INFO("Controls: WASD=Move, Mouse=Look, P=Toggle Parallax, F11=Fullscreen, ESC=Quit");
+    LOG_INFO("Controls: WASD=Move, Mouse=Look, P=Toggle Parallax, ESC=Quit");
     LOG_INFO("");
 
     // Main loop
@@ -354,130 +527,145 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
         if (!g_running) break;
 
+        // Skip rendering when minimized
+        if (IsIconic(hwnd)) {
+            Sleep(10);
+            continue;
+        }
+
         // Update performance stats
         UpdatePerformanceStats(perfStats);
 
         // Update input-based camera movement
         UpdateCameraMovement(g_inputState, perfStats.deltaTime);
 
-        // Handle fullscreen toggle
-        if (g_inputState.fullscreenToggleRequested) {
-            g_inputState.fullscreenToggleRequested = false;
-            ToggleFullscreen(g_windowInfo);
-        }
-
         // Update scene (cube rotation)
         UpdateScene(renderer, perfStats.deltaTime);
 
-        // Get eye tracking data from weaver
-        if (g_inputState.parallaxEnabled && sr.weaver) {
-            float leftEye[3], rightEye[3];
-            if (sr.weaver->getPredictedEyePosition(leftEye, rightEye)) {
-                // Average of both eyes for display
-                eyePosX = (leftEye[0] + rightEye[0]) / 2.0f;
-                eyePosY = (leftEye[1] + rightEye[1]) / 2.0f;
-            }
-        }
-
-        // Compute eye positions for Kooima projection
-        leia::vec3f leftEyePos, rightEyePos;
-        if (g_inputState.parallaxEnabled && sr.weaver) {
-            float leftEye[3], rightEye[3];
-            if (sr.weaver->getPredictedEyePosition(leftEye, rightEye)) {
-                leftEyePos = leia::vec3f(leftEye[0], leftEye[1], leftEye[2]);
-                rightEyePos = leia::vec3f(rightEye[0], rightEye[1], rightEye[2]);
-            } else {
-                // Default eye positions if tracking not available
-                leftEyePos = leia::vec3f(-0.032f, 0.0f, sr.defaultViewingDistance);
-                rightEyePos = leia::vec3f(0.032f, 0.0f, sr.defaultViewingDistance);
-            }
-        } else {
-            // Fixed eye positions (no parallax)
-            leftEyePos = leia::vec3f(-0.032f, 0.0f, sr.defaultViewingDistance);
-            rightEyePos = leia::vec3f(0.032f, 0.0f, sr.defaultViewingDistance);
-        }
-
-        // Compute Kooima projection matrices
-        leia::mat4f leftProj = leia::kooimaProjectionSimple(leftEyePos, sr.displayWidthM, sr.displayHeightM, 0.01f, 100.0f);
-        leia::mat4f rightProj = leia::kooimaProjectionSimple(rightEyePos, sr.displayWidthM, sr.displayHeightM, 0.01f, 100.0f);
-
-        // View matrices are identity for head-tracked display (camera is at eye position)
-        XMMATRIX leftViewMatrix = XMMatrixIdentity();
-        XMMATRIX rightViewMatrix = XMMatrixIdentity();
-        XMMATRIX leftProjMatrix = leftProj.toXMMATRIX();
-        XMMATRIX rightProjMatrix = rightProj.toXMMATRIX();
-
-        // Clear stereo render target
-        float clearColor[] = { 0.1f, 0.1f, 0.15f, 1.0f };
-        renderer.context->ClearRenderTargetView(stereoRTV.Get(), clearColor);
-        renderer.context->ClearDepthStencilView(depthDSV.Get(), D3D11_CLEAR_DEPTH, 1.0f, 0);
-
-        // Render left eye (left half of stereo texture)
+        // Get predicted eye positions from weaver
+        leia::vec3f leftEye, rightEye;
         {
-            D3D11_VIEWPORT vp = { 0, 0, (float)viewWidth, (float)viewHeight, 0, 1 };
-            renderer.context->RSSetViewports(1, &vp);
-            renderer.context->OMSetRenderTargets(1, stereoRTV.GetAddressOf(), depthDSV.Get());
+            float leftPos[3], rightPos[3];
+            g_srWeaver->getPredictedEyePositions(leftPos, rightPos);
+            leftEye = leia::vec3f(leftPos[0], leftPos[1], leftPos[2]);
+            rightEye = leia::vec3f(rightPos[0], rightPos[1], rightPos[2]);
+            eyeTrackingActive = true;
 
-            RenderScene(renderer, stereoRTV.Get(), depthDSV.Get(),
-                viewWidth, viewHeight,
-                leftViewMatrix, leftProjMatrix,
+            // Average for display
+            eyePosX = (leftPos[0] + rightPos[0]) / 2.0f;
+            eyePosY = (leftPos[1] + rightPos[1]) / 2.0f;
+        }
+
+        // Apply parallax toggle
+        if (!g_inputState.parallaxEnabled) {
+            // Calculate mid-eye point
+            leia::vec3f midEye = (leftEye + rightEye) * 0.5f;
+
+            // Translation to move mid-eye to default viewing position
+            leia::vec3f translation = g_defaultViewingPosition - midEye;
+
+            // Apply to both eyes
+            leftEye = leftEye + translation;
+            rightEye = rightEye + translation;
+        }
+
+        // Clear view texture
+        float clearColor[] = { 0.05f, 0.05f, 0.15f, 1.0f };
+        renderer.context->ClearRenderTargetView(viewTextureRTV.Get(), clearColor);
+        renderer.context->ClearDepthStencilView(viewDepthDSV.Get(), D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
+
+        // Set view texture as render target
+        ID3D11RenderTargetView* rtvs[] = { viewTextureRTV.Get() };
+        renderer.context->OMSetRenderTargets(1, rtvs, viewDepthDSV.Get());
+
+        // Render stereo views (left and right)
+        for (int eye = 0; eye < 2; eye++) {
+            // Set viewport for this eye
+            D3D11_VIEWPORT vp = {};
+            vp.TopLeftX = (float)(eye * g_viewTextureWidth);
+            vp.TopLeftY = 0.0f;
+            vp.Width = (float)g_viewTextureWidth;
+            vp.Height = (float)g_viewTextureHeight;
+            vp.MinDepth = 0.0f;
+            vp.MaxDepth = 1.0f;
+            renderer.context->RSSetViewports(1, &vp);
+
+            // Get eye position for this eye
+            leia::vec3f eyePos = (eye == 0) ? leftEye : rightEye;
+
+            // Compute Kooima projection matrix
+            leia::mat4f projection = leia::kooimaProjection(
+                eyePos,
+                g_screenWidthMM, g_screenHeightMM,
+                0.1f, 10000.0f
+            );
+
+            // Convert to XMMATRIX (view is identity since camera is at eye position)
+            XMMATRIX viewMatrix = XMMatrixIdentity();
+            XMMATRIX projMatrix = projection.toXMMATRIX();
+
+            // Render scene
+            RenderScene(renderer, viewTextureRTV.Get(), viewDepthDSV.Get(),
+                g_viewTextureWidth, g_viewTextureHeight,
+                viewMatrix, projMatrix,
                 g_inputState.cameraPosX, g_inputState.cameraPosY, g_inputState.cameraPosZ,
                 g_inputState.yaw, g_inputState.pitch);
         }
 
-        // Render right eye (right half of stereo texture)
-        {
-            D3D11_VIEWPORT vp = { (float)viewWidth, 0, (float)viewWidth, (float)viewHeight, 0, 1 };
-            renderer.context->RSSetViewports(1, &vp);
-
-            // Clear depth for right eye (viewport offset means we need to clear this region)
-            // Actually the depth was already cleared, but we need to re-render
-            RenderScene(renderer, stereoRTV.Get(), depthDSV.Get(),
-                viewWidth, viewHeight,
-                rightViewMatrix, rightProjMatrix,
-                g_inputState.cameraPosX, g_inputState.cameraPosY, g_inputState.cameraPosZ,
-                g_inputState.yaw, g_inputState.pitch);
-        }
-
-        // Render text overlay on left eye (visible to user)
+        // Render text overlay (on left eye view only)
         {
             // Performance info
-            std::wstring perfText = FormatPerformanceInfo(perfStats.fps, perfStats.frameTimeMs, viewWidth, viewHeight);
-            RenderText(textOverlay, renderer.device.Get(), stereoTexture.Get(),
+            std::wstring perfText = FormatPerformanceInfo(perfStats.fps, perfStats.frameTimeMs,
+                g_viewTextureWidth, g_viewTextureHeight);
+            RenderText(textOverlay, renderer.device.Get(), viewTexture.Get(),
                 perfText, 10, 10, 200, 60, true);
 
-            // Parallax info
-            std::wstring parallaxText = FormatParallaxInfo(g_inputState.parallaxEnabled, eyePosX, eyePosY);
-            RenderText(textOverlay, renderer.device.Get(), stereoTexture.Get(),
-                parallaxText, 10, 80, 200, 60, true);
+            // Eye tracking info
+            std::wstring eyeText = FormatEyeTrackingInfo(eyePosX, eyePosY, eyeTrackingActive);
+            RenderText(textOverlay, renderer.device.Get(), viewTexture.Get(),
+                eyeText, 10, 80, 200, 60, true);
+
+            // Parallax state
+            std::wstring parallaxText = g_inputState.parallaxEnabled ?
+                L"Parallax: ON (tracking)" : L"Parallax: OFF (fixed)";
+            RenderText(textOverlay, renderer.device.Get(), viewTexture.Get(),
+                parallaxText, 10, 150, 200, 25, true);
 
             // Help text
-            std::wstring helpText = L"WASD: Move | Mouse: Look | P: Parallax | F11: Fullscreen | ESC: Quit";
-            RenderText(textOverlay, renderer.device.Get(), stereoTexture.Get(),
-                helpText, 10, viewHeight - 30.0f, 500, 25, true);
+            std::wstring helpText = L"WASD: Move | Mouse: Look | P: Parallax | ESC: Quit";
+            RenderText(textOverlay, renderer.device.Get(), viewTexture.Get(),
+                helpText, 10, g_viewTextureHeight - 30.0f, 450, 25, true);
         }
 
-        // Set input texture for weaver
-        sr.weaver->setInputTexture(stereoSRV.Get());
-
         // Weave and present
-        sr.weaver->weave();
+        g_srWeaver->weave();
     }
 
-    // Cleanup
+cleanup:
     LOG_INFO("");
     LOG_INFO("=== Shutting down ===");
 
-    stereoSRV.Reset();
-    stereoRTV.Reset();
-    stereoTexture.Reset();
-    depthDSV.Reset();
-    depthTexture.Reset();
+    viewDepthDSV.Reset();
+    viewDepthTexture.Reset();
+    viewTextureRTV.Reset();
+    viewTextureSRV.Reset();
+    viewTexture.Reset();
 
-    CleanupSR(sr);
+    if (g_srWeaver) {
+        g_srWeaver->destroy();
+        g_srWeaver = nullptr;
+    }
+
     CleanupTextOverlay(textOverlay);
     CleanupD3D11(renderer);
-    DestroyAppWindow(g_windowInfo);
+
+    DestroyWindow(hwnd);
+    UnregisterClass(WINDOW_CLASS, hInstance);
+
+    if (g_srContext) {
+        SR::SRContext::deleteSRContext(g_srContext);
+        g_srContext = nullptr;
+    }
 
     LOG_INFO("Application shutdown complete");
     ShutdownLogging();
