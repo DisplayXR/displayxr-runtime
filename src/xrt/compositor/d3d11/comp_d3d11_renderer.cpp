@@ -369,6 +369,9 @@ create_resources(struct comp_d3d11_renderer *r)
 		return XRT_ERROR_D3D;
 	}
 
+	U_LOG_W("Created stereo texture: %ux%u (view=%ux%u per eye, side-by-side)",
+	        texDesc.Width, texDesc.Height, r->view_width, r->view_height);
+
 	// Create SRV for stereo texture
 	D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
 	srvDesc.Format = texDesc.Format;
@@ -529,6 +532,30 @@ render_projection_layer(struct comp_d3d11_renderer *r,
 	if (srv == nullptr) {
 		U_LOG_W("render_projection_layer: SRV is null for swapchain image %u", image_index);
 		return;
+	}
+
+	// Diagnostic: Log per-eye rendering info (throttled)
+	static int render_log_counter = 0;
+	if (++render_log_counter % 600 == 1) { // Log every ~10 seconds at 60fps
+		// Get swapchain texture dimensions from SRV
+		ID3D11Resource *resource = nullptr;
+		srv->GetResource(&resource);
+		if (resource) {
+			ID3D11Texture2D *tex = nullptr;
+			if (SUCCEEDED(resource->QueryInterface(__uuidof(ID3D11Texture2D), (void **)&tex))) {
+				D3D11_TEXTURE2D_DESC desc;
+				tex->GetDesc(&desc);
+				U_LOG_W("render_projection_layer [%s eye]: swapchain=%ux%u, norm_rect=(%.2f,%.2f,%.2f,%.2f), "
+				        "viewport=(%u,%u)+%ux%u",
+				        view_index == 0 ? "Left" : "Right",
+				        desc.Width, desc.Height,
+				        view_data->sub.norm_rect.x, view_data->sub.norm_rect.y,
+				        view_data->sub.norm_rect.w, view_data->sub.norm_rect.h,
+				        view_index * r->view_width, 0, r->view_width, r->view_height);
+				tex->Release();
+			}
+			resource->Release();
+		}
 	}
 
 	// Update constant buffer
