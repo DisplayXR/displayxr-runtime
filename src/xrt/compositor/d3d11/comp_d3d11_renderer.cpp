@@ -535,9 +535,39 @@ render_projection_layer(struct comp_d3d11_renderer *r,
 	}
 
 	// Diagnostic: Log per-eye rendering info (throttled)
+	// Only log when rendering right eye (view_index == 1) to capture both eyes per log entry
 	static int render_log_counter = 0;
-	if (++render_log_counter % 600 == 1) { // Log every ~10 seconds at 60fps
-		// Get swapchain texture dimensions from SRV
+	if (view_index == 1 && ++render_log_counter % 300 == 1) { // Log every ~5 seconds at 60fps
+		// Get both eyes' view data for comparison
+		struct xrt_layer_projection_view_data *left_data = &layer->data.proj.v[0];
+		struct xrt_layer_projection_view_data *right_data = &layer->data.proj.v[1];
+
+		// Get left eye swapchain dimensions
+		uint32_t left_sw_w = 0, left_sw_h = 0;
+		struct xrt_swapchain *left_xsc = layer->sc_array[0];
+		if (left_xsc != nullptr) {
+			uint32_t left_img_idx = left_data->sub.image_index;
+			ID3D11ShaderResourceView *left_srv = static_cast<ID3D11ShaderResourceView *>(
+			    comp_d3d11_swapchain_get_srv(left_xsc, left_img_idx));
+			if (left_srv != nullptr) {
+				ID3D11Resource *left_res = nullptr;
+				left_srv->GetResource(&left_res);
+				if (left_res) {
+					ID3D11Texture2D *left_tex = nullptr;
+					if (SUCCEEDED(left_res->QueryInterface(__uuidof(ID3D11Texture2D), (void **)&left_tex))) {
+						D3D11_TEXTURE2D_DESC left_desc;
+						left_tex->GetDesc(&left_desc);
+						left_sw_w = left_desc.Width;
+						left_sw_h = left_desc.Height;
+						left_tex->Release();
+					}
+					left_res->Release();
+				}
+			}
+		}
+
+		// Get right eye swapchain dimensions (current srv)
+		uint32_t right_sw_w = 0, right_sw_h = 0;
 		ID3D11Resource *resource = nullptr;
 		srv->GetResource(&resource);
 		if (resource) {
@@ -545,17 +575,24 @@ render_projection_layer(struct comp_d3d11_renderer *r,
 			if (SUCCEEDED(resource->QueryInterface(__uuidof(ID3D11Texture2D), (void **)&tex))) {
 				D3D11_TEXTURE2D_DESC desc;
 				tex->GetDesc(&desc);
-				U_LOG_W("render_projection_layer [%s eye]: swapchain=%ux%u, norm_rect=(%.2f,%.2f,%.2f,%.2f), "
-				        "viewport=(%u,%u)+%ux%u",
-				        view_index == 0 ? "Left" : "Right",
-				        desc.Width, desc.Height,
-				        view_data->sub.norm_rect.x, view_data->sub.norm_rect.y,
-				        view_data->sub.norm_rect.w, view_data->sub.norm_rect.h,
-				        view_index * r->view_width, 0, r->view_width, r->view_height);
+				right_sw_w = desc.Width;
+				right_sw_h = desc.Height;
 				tex->Release();
 			}
 			resource->Release();
 		}
+
+		U_LOG_W("render_projection_layer BOTH EYES comparison:");
+		U_LOG_W("  Left:  swapchain=%ux%u, norm_rect=(%.2f,%.2f,%.2f,%.2f), viewport=(0,0)+%ux%u",
+		        left_sw_w, left_sw_h,
+		        left_data->sub.norm_rect.x, left_data->sub.norm_rect.y,
+		        left_data->sub.norm_rect.w, left_data->sub.norm_rect.h,
+		        r->view_width, r->view_height);
+		U_LOG_W("  Right: swapchain=%ux%u, norm_rect=(%.2f,%.2f,%.2f,%.2f), viewport=(%u,0)+%ux%u",
+		        right_sw_w, right_sw_h,
+		        right_data->sub.norm_rect.x, right_data->sub.norm_rect.y,
+		        right_data->sub.norm_rect.w, right_data->sub.norm_rect.h,
+		        r->view_width, r->view_width, r->view_height);
 	}
 
 	// Update constant buffer
