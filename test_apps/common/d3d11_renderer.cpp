@@ -502,21 +502,11 @@ void RenderScene(
     float cameraYaw,
     float cameraPitch
 ) {
-    // Set render targets
+    // Set render targets (don't set viewport here - caller handles it for stereo rendering)
     renderer.context->OMSetRenderTargets(1, &rtv, dsv);
 
-    // Set viewport
-    D3D11_VIEWPORT viewport = {};
-    viewport.Width = (float)width;
-    viewport.Height = (float)height;
-    viewport.MinDepth = 0.0f;
-    viewport.MaxDepth = 1.0f;
-    renderer.context->RSSetViewports(1, &viewport);
-
-    // Clear
-    float clearColor[] = { 0.1f, 0.1f, 0.15f, 1.0f };
-    renderer.context->ClearRenderTargetView(rtv, clearColor);
-    renderer.context->ClearDepthStencilView(dsv, D3D11_CLEAR_DEPTH, 1.0f, 0);
+    // NOTE: Do NOT clear here - for stereo rendering, the caller clears once before
+    // rendering both eyes. Clearing here would wipe out the first eye when rendering the second.
 
     // Set states
     renderer.context->OMSetDepthStencilState(renderer.depthStencilState.Get(), 0);
