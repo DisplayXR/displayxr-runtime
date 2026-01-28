@@ -685,29 +685,38 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             RenderCubeWithMVP(renderer, viewTextureRTV.Get(), viewDepthDSV.Get(), mvp.m);
         }
 
-        // Render text overlay (on left eye view only)
+        // Render text overlay to BOTH eyes (so it's visible from all viewing angles)
         {
             // Performance info
             std::wstring perfText = FormatPerformanceInfo(perfStats.fps, perfStats.frameTimeMs,
                 g_viewTextureWidth, g_viewTextureHeight);
-            RenderText(textOverlay, renderer.device.Get(), viewTexture.Get(),
-                perfText, 10, 10, 200, 60, true);
 
             // Eye tracking info
             std::wstring eyeText = FormatEyeTrackingInfo(eyePosX, eyePosY, eyeTrackingActive);
-            RenderText(textOverlay, renderer.device.Get(), viewTexture.Get(),
-                eyeText, 10, 80, 200, 60, true);
 
             // Parallax state
             std::wstring parallaxText = g_inputState.parallaxEnabled ?
                 L"Parallax: ON (tracking)" : L"Parallax: OFF (fixed)";
-            RenderText(textOverlay, renderer.device.Get(), viewTexture.Get(),
-                parallaxText, 10, 150, 200, 25, true);
 
             // Help text
-            std::wstring helpText = L"WASD: Move | Mouse: Look | P: Parallax | ESC: Quit";
-            RenderText(textOverlay, renderer.device.Get(), viewTexture.Get(),
-                helpText, 10, g_viewTextureHeight - 30.0f, 450, 25, true);
+            std::wstring helpText = L"P: Parallax | ESC: Quit";
+
+            // Render to both eyes
+            for (int eye = 0; eye < 2; eye++) {
+                float xOffset = (float)(eye * g_viewTextureWidth);
+
+                RenderText(textOverlay, renderer.device.Get(), viewTexture.Get(),
+                    perfText, xOffset + 10, 10, 200, 60, true);
+
+                RenderText(textOverlay, renderer.device.Get(), viewTexture.Get(),
+                    eyeText, xOffset + 10, 80, 200, 60, true);
+
+                RenderText(textOverlay, renderer.device.Get(), viewTexture.Get(),
+                    parallaxText, xOffset + 10, 150, 200, 25, true);
+
+                RenderText(textOverlay, renderer.device.Get(), viewTexture.Get(),
+                    helpText, xOffset + 10, g_viewTextureHeight - 30.0f, 300, 25, true);
+            }
         }
 
         // Set swapchain as render target for weaver output
