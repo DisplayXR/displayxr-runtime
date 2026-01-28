@@ -66,6 +66,9 @@ void CleanupTextOverlay(TextOverlay& overlay) {
     overlay.initialized = false;
 }
 
+// Track if we've logged D2D errors already (to avoid spam)
+static bool g_d2dErrorLogged = false;
+
 void RenderText(
     TextOverlay& overlay,
     ID3D11Device* device,
@@ -75,12 +78,33 @@ void RenderText(
     float width, float height,
     bool useSmallFont
 ) {
-    if (!overlay.initialized || !texture) return;
+    if (!overlay.initialized || !texture || !device) {
+        if (!g_d2dErrorLogged) {
+            OutputDebugStringA("RenderText: overlay not initialized or texture/device null\n");
+            g_d2dErrorLogged = true;
+        }
+        return;
+    }
+
+    // Flush D3D11 context before D2D access (required for interop)
+    ComPtr<ID3D11DeviceContext> context;
+    device->GetImmediateContext(&context);
+    if (context) {
+        context->Flush();
+    }
 
     // Get DXGI surface from texture
     ComPtr<IDXGISurface> surface;
     HRESULT hr = texture->QueryInterface(IID_PPV_ARGS(&surface));
-    if (FAILED(hr)) return;
+    if (FAILED(hr)) {
+        if (!g_d2dErrorLogged) {
+            char buf[256];
+            sprintf_s(buf, "RenderText: QueryInterface for IDXGISurface failed: 0x%08X\n", hr);
+            OutputDebugStringA(buf);
+            g_d2dErrorLogged = true;
+        }
+        return;
+    }
 
     // Create D2D render target for this surface
     D2D1_RENDER_TARGET_PROPERTIES rtProps = D2D1::RenderTargetProperties(
@@ -90,7 +114,15 @@ void RenderText(
 
     ComPtr<ID2D1RenderTarget> d2dRenderTarget;
     hr = overlay.d2dFactory->CreateDxgiSurfaceRenderTarget(surface.Get(), &rtProps, &d2dRenderTarget);
-    if (FAILED(hr)) return;
+    if (FAILED(hr)) {
+        if (!g_d2dErrorLogged) {
+            char buf[256];
+            sprintf_s(buf, "RenderText: CreateDxgiSurfaceRenderTarget failed: 0x%08X\n", hr);
+            OutputDebugStringA(buf);
+            g_d2dErrorLogged = true;
+        }
+        return;
+    }
 
     // Create brush for text
     ComPtr<ID2D1SolidColorBrush> textBrush;
