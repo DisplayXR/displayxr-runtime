@@ -137,5 +137,28 @@ Automates the complete CI workflow: commit → push → monitor → auto-fix.
 
 **Skill location:** `.claude/skills/ci-monitor/SKILL.md`
 
+### /ask-gemini - Code Analysis with Gemini
+Ask Gemini to analyze code and produce a read-only report. Automatically gathers relevant context based on your request.
+
+**Usage:**
+```bash
+/ask-gemini <your request>
+```
+
+**Examples:**
+```bash
+/ask-gemini review the latest commit and flag potential issues
+/ask-gemini explain the architecture of comp_renderer.c
+/ask-gemini analyze the error handling patterns in oxr_session.c
+```
+
+**Features:**
+- Smart context detection based on keywords (commit, diff, file paths, etc.)
+- Automatically gathers relevant git history, diffs, or file contents
+- Constructs detailed prompts with READ-ONLY instructions
+- Displays Gemini's analysis report directly
+
+**Skill location:** `.claude/skills/ask-gemini/SKILL.md`
+
 ## Debug Logs
 use U_LOG_W (WARN) instead of U_LOG_I (INFO) for logs to make sure they are not filtered 
