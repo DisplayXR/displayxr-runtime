@@ -149,7 +149,7 @@ bool InitializeD3D11WithLUID(D3D11Renderer& renderer, LUID adapterLuid) {
         D3D_FEATURE_LEVEL_11_0,
     };
 
-    UINT createFlags = 0;
+    UINT createFlags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;  // Required for D2D interop
 #ifdef _DEBUG
     createFlags |= D3D11_CREATE_DEVICE_DEBUG;
     LOG_INFO("Debug layer enabled");
@@ -220,7 +220,7 @@ bool InitializeD3D11(D3D11Renderer& renderer) {
         D3D_FEATURE_LEVEL_11_0,
     };
 
-    UINT createFlags = 0;
+    UINT createFlags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;  // Required for D2D interop
 #ifdef _DEBUG
     createFlags |= D3D11_CREATE_DEVICE_DEBUG;
     LOG_INFO("Debug layer enabled");
