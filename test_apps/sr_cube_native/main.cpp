@@ -32,8 +32,8 @@
 // Library for SetProcessDpiAwareness
 #pragma comment(lib, "shcore.lib")
 
-// SR SDK headers (CNSDK)
-#ifdef XRT_HAVE_CNSDK
+// LeiaSR SDK headers
+#ifdef HAVE_LEIA_SR
 #include "sr/utility/exception.h"
 #include "sr/sense/core/inputstream.h"
 #include "sr/sense/system/systemsense.h"
@@ -65,7 +65,7 @@ static std::recursive_mutex g_mutex;
 static ComPtr<IDXGISwapChain1> g_swapChain;
 static ComPtr<ID3D11RenderTargetView> g_swapChainRTV;
 
-#ifdef XRT_HAVE_CNSDK
+#ifdef HAVE_LEIA_SR
 // SR SDK global state
 static SR::SRContext*        g_srContext = nullptr;
 static SR::IDisplayManager*  g_displayManager = nullptr;
@@ -145,7 +145,7 @@ static void UpdatePerformanceStats(PerformanceStats& stats) {
     }
 }
 
-#ifdef XRT_HAVE_CNSDK
+#ifdef HAVE_LEIA_SR
 
 static bool CreateSRContext(double maxTimeSeconds) {
     LOG_INFO("Creating SR context (timeout: %.1fs)...", maxTimeSeconds);
@@ -290,7 +290,7 @@ static void CleanupLeiaSR() {
     LOG_INFO("LeiaSR cleanup complete");
 }
 
-#endif // XRT_HAVE_CNSDK
+#endif // HAVE_LEIA_SR
 
 // Main entry point
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
@@ -308,12 +308,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     LOG_INFO("=== SR Cube Native Application ===");
     LOG_INFO("Direct SR SDK rendering without OpenXR");
 
-#ifndef XRT_HAVE_CNSDK
-    LOG_ERROR("CNSDK not available - this application requires the SR SDK");
+#ifndef HAVE_LEIA_SR
+    LOG_ERROR("LeiaSR SDK not available - this application requires the LeiaSR SDK");
     MessageBox(nullptr,
-        L"This application requires the Leia SR SDK (CNSDK).\n\n"
-        L"Please ensure CNSDK is installed and the project was built with XRT_HAVE_CNSDK=ON.",
-        L"SR SDK Required", MB_OK | MB_ICONERROR);
+        L"This application requires the LeiaSR SDK.\n\n"
+        L"Please ensure LeiaSR SDK is installed and LEIASR_SDKROOT is set.",
+        L"LeiaSR SDK Required", MB_OK | MB_ICONERROR);
     ShutdownLogging();
     return 1;
 #else
@@ -762,5 +762,5 @@ cleanup:
     ShutdownLogging();
 
     return 0;
-#endif // XRT_HAVE_CNSDK
+#endif // HAVE_LEIA_SR
 }

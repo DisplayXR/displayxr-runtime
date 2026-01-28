@@ -49,7 +49,7 @@ target_link_libraries(sr_cube_native PRIVATE
 
 # Add LeiaSR SDK if available
 if(HAVE_LEIA_SR)
-    target_compile_definitions(sr_cube_native PRIVATE XRT_HAVE_CNSDK)
+    target_compile_definitions(sr_cube_native PRIVATE HAVE_LEIA_SR)
     target_link_libraries(sr_cube_native PRIVATE
         simulatedreality
         srDirectX::srDirectX
