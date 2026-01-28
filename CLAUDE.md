@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is a fork of **Monado**, an open source OpenXR runtime for VR/AR devices. This fork integrates **CNSDK (Leia SDK)** for light field display support. The project implements the OpenXR API standard from Khronos and runs on Linux, Android, and Windows.
+This is a fork of **Monado**, an open source OpenXR runtime for VR/AR devices. This fork integrates **Leia SR SDK** for eye tracked 3D Display support. The project implements the OpenXR API standard from Khronos and runs on Linux, Android, and Windows.
 
 ## Build Commands
 
@@ -102,3 +102,6 @@ Automates the complete CI workflow: commit → push → monitor → auto-fix.
 - Reports success with artifact URL or failure with diagnostics
 
 **Skill location:** `.claude/skills/ci-monitor/SKILL.md`
+
+## Debug Logs
+use U_LOG_W (WARN) instead of U_LOG_I (INFO) for logs to make sure they are not filtered 

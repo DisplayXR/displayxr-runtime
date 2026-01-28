@@ -110,7 +110,7 @@ CreateSRContext(double maxTime, leiasr &sr)
 				sr.display_height_m = raw_height_cm / 100.0f;
 				sr.display_dims_valid = true;
 
-				U_LOG_I("SR display (modern API): %ldx%ld px, physical %.2fcm x %.2fcm = %.4fm x %.4fm",
+				U_LOG_W("SR display (modern API): %ldx%ld px, physical %.2fcm x %.2fcm = %.4fm x %.4fm",
 				        (long)width, (long)height,
 				        raw_width_cm, raw_height_cm,
 				        sr.display_width_m, sr.display_height_m);

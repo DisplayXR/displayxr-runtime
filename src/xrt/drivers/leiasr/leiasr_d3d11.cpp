@@ -125,7 +125,7 @@ create_sr_context(double max_time, leiasr_d3d11 &sr)
 				sr.display_height_m = raw_height_cm / 100.0f;
 				sr.display_dims_valid = true;
 
-				U_LOG_I("SR D3D11 display (modern API): %ldx%ld px, physical %.2fcm x %.2fcm = %.4fm x %.4fm",
+				U_LOG_W("SR D3D11 display (modern API): %ldx%ld px, physical %.2fcm x %.2fcm = %.4fm x %.4fm",
 				        (long)width, (long)height,
 				        raw_width_cm, raw_height_cm,
 				        sr.display_width_m, sr.display_height_m);
@@ -303,7 +303,7 @@ leiasr_d3d11_get_predicted_eye_positions(struct leiasr_d3d11 *leiasr,
 		float ipd_mm = sqrtf(powf(right_mm[0] - left_mm[0], 2) +
 		                     powf(right_mm[1] - left_mm[1], 2) +
 		                     powf(right_mm[2] - left_mm[2], 2));
-		U_LOG_I("SR eye positions (raw mm): L=(%.1f,%.1f,%.1f) R=(%.1f,%.1f,%.1f) IPD=%.1fmm",
+		U_LOG_W("SR eye positions (raw mm): L=(%.1f,%.1f,%.1f) R=(%.1f,%.1f,%.1f) IPD=%.1fmm",
 		        left_mm[0], left_mm[1], left_mm[2],
 		        right_mm[0], right_mm[1], right_mm[2],
 		        ipd_mm);
