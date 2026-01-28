@@ -148,7 +148,6 @@ Checks:       |
     -modernize-use-trailing-return-type,
     -modernize-use-transparent-functors,
     -modernize-use-using,
-    -performance-enum-size,
     -performance-inefficient-string-concatenation,
     -performance-no-int-to-ptr,
     -performance-readability-avoid-const-params-in-decls,
