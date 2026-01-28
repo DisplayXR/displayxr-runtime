@@ -104,6 +104,11 @@ For substantial changes, create a fragment in `doc/changes/<section>/mr.NUMBER.m
 - `XRT_BUILD_DRIVER_*` - Enable specific hardware drivers
 - `BUILD_TESTING` - Enable test suite
 
+### CMake Variable Notes
+- `LEIASR_SDKROOT` - Set from environment variable, points to LeiaSR SDK install path
+- `SR_PATH` - Internal variable in `src/xrt/drivers/CMakeLists.txt`, automatically set from `LEIASR_SDKROOT`
+- The drivers CMakeLists.txt uses `SR_PATH` to locate SDK libraries (SimulatedRealityCore.lib, SimulatedRealityDirectX.lib, etc.)
+
 ## Claude Code Skills
 
 ### /ci-monitor - Automated Build Workflow
