@@ -64,9 +64,19 @@ Based on keywords in the user request, gather relevant context:
 - Run: `git log --oneline -10`
 - Run: `git branch -v`
 
-**If request mentions a specific file (contains `.c`, `.h`, `.cpp`, `.py`, or path with `/src/`, `/include/`):**
+**If request mentions a specific file (contains `.c`, `.h`, `.cpp`, `.py`, `.log`, or path with `/src/`, `/include/`):**
 - Read the mentioned file using the Read tool
 - If file is very large (>500 lines), read first 300 lines
+
+**If request references an EXTERNAL file (absolute path outside the project workspace):**
+- Gemini CLI can only use its `read_file` tool on files inside the workspace directory.
+- To ensure Gemini can reliably access the file, copy it into the project temporarily:
+  ```bash
+  mkdir -p /tmp/gemini-context
+  cp "EXTERNAL_FILE_PATH" /tmp/gemini-context/
+  ```
+- Then in the Gemini prompt, tell it: "The file has been copied to /tmp/gemini-context/FILENAME for your access. You can also read it via shell commands."
+- After Gemini finishes, clean up: `rm -rf /tmp/gemini-context`
 
 **If no specific context detected:**
 - Run: `git status --short`
@@ -170,6 +180,7 @@ For request "review the latest commit and flag potential issues":
 - Use heredoc with quoted delimiter ('GEMINI_EOF') to prevent variable expansion
 - Keep context focused - don't read more files than necessary
 - If gemini command times out, use timeout of 120000ms (2 min)
+- **External files:** Gemini's `read_file` tool is sandboxed to the workspace. For files outside the project, copy them to `/tmp/gemini-context/` before invoking Gemini, and clean up after. Alternatively, include the file contents directly in the prompt context (from Step 1.1) so Gemini doesn't need to read it at all.
 ```
 
 ---
