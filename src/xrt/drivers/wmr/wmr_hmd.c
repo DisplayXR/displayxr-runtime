@@ -1429,14 +1429,14 @@ wmr_hmd_get_imu_calib(struct wmr_hmd *wh)
 	        {
 	            .transform = {{at[0], at[1], at[2]}, {at[3], at[4], at[5]}, {at[6], at[7], at[8]}},
 	            .offset = {-ao.x, -ao.y, -ao.z}, // negative because slam system will add, not subtract
-	            .bias_std = {sqrt(ab.x), sqrt(ab.y), sqrt(ab.z)}, // sqrt because we want stdev not variance
+	            .bias_std = {sqrtf(ab.x), sqrtf(ab.y), sqrtf(ab.z)}, // sqrt because we want stdev not variance
 	            .noise_std = {an.x, an.y, an.z},
 	        },
 	    .gyro =
 	        {
 	            .transform = {{gt[0], gt[1], gt[2]}, {gt[3], gt[4], gt[5]}, {gt[6], gt[7], gt[8]}},
 	            .offset = {-go.x, -go.y, -go.z},
-	            .bias_std = {sqrt(gb.x), sqrt(gb.y), sqrt(gb.z)},
+	            .bias_std = {sqrtf(gb.x), sqrtf(gb.y), sqrtf(gb.z)},
 	            .noise_std = {gn.x, gn.y, gn.z},
 	        },
 	};
