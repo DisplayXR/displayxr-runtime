@@ -830,11 +830,47 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	}
 	U_LOG_I("Display refresh rate: %.2f Hz", c->display_refresh_rate);
 
-	// Create renderer
-	// View size is half of target width for side-by-side stereo
+	// Determine view dimensions for the stereo texture.
+	// Default: derive from window size (half width for side-by-side)
 	uint32_t view_width = c->settings.preferred.width / 2;
 	uint32_t view_height = c->settings.preferred.height;
 
+#ifdef XRT_HAVE_LEIA_SR_D3D11
+	// Create SR weaver FIRST so we can query recommended dimensions.
+	// The sr_cube_native app uses getRecommendedViewsTextureWidth/Height from the
+	// SR display to size the stereo texture - we must do the same for correct weaving.
+	U_LOG_W("Attempting to create SR D3D11 weaver (XRT_HAVE_LEIA_SR_D3D11 is defined)");
+	xret = leiasr_d3d11_create(5.0, // 5 second timeout
+	                           c->device,
+	                           c->context,
+	                           c->hwnd,
+	                           view_width,
+	                           view_height,
+	                           &c->weaver);
+	if (xret != XRT_SUCCESS) {
+		U_LOG_W("Failed to create SR weaver (error %d), continuing without interlacing", (int)xret);
+		c->weaver = nullptr;
+	} else {
+		U_LOG_W("SR D3D11 weaver created successfully");
+
+		// Query SR recommended view dimensions - these must be used for the stereo
+		// texture to match what the weaver expects (same as sr_cube_native app)
+		uint32_t sr_width = 0, sr_height = 0;
+		if (leiasr_d3d11_get_recommended_view_dimensions(c->weaver, &sr_width, &sr_height)) {
+			U_LOG_W("Using SR recommended view dimensions: %ux%u per eye (was %ux%u from window)",
+			        sr_width, sr_height, view_width, view_height);
+			view_width = sr_width;
+			view_height = sr_height;
+		} else {
+			U_LOG_W("Could not get SR recommended dimensions, using window-derived: %ux%u",
+			        view_width, view_height);
+		}
+	}
+#else
+	U_LOG_W("XRT_HAVE_LEIA_SR_D3D11 is NOT defined - SR weaving disabled at compile time");
+#endif
+
+	// Create renderer with the correct view dimensions
 	xret = comp_d3d11_renderer_create(c, view_width, view_height, &c->renderer);
 	if (xret != XRT_SUCCESS) {
 		U_LOG_E("Failed to create D3D11 renderer");
@@ -865,26 +901,6 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 		// For now, we just create the resources
 		U_LOG_I("D3D11 debug GUI created (set XRT_DEBUG_GUI=1 to enable window)");
 	}
-#endif
-
-#ifdef XRT_HAVE_LEIA_SR_D3D11
-	// Create SR weaver if available
-	U_LOG_W("Attempting to create SR D3D11 weaver (XRT_HAVE_LEIA_SR_D3D11 is defined)");
-	xret = leiasr_d3d11_create(5.0, // 5 second timeout
-	                           c->device,
-	                           c->context,
-	                           c->hwnd,
-	                           view_width,
-	                           view_height,
-	                           &c->weaver);
-	if (xret != XRT_SUCCESS) {
-		U_LOG_W("Failed to create SR weaver (error %d), continuing without interlacing", (int)xret);
-		c->weaver = nullptr;
-	} else {
-		U_LOG_W("SR D3D11 weaver created successfully");
-	}
-#else
-	U_LOG_W("XRT_HAVE_LEIA_SR_D3D11 is NOT defined - SR weaving disabled at compile time");
 #endif
 
 	// Initialize layer accumulator - just zero it
