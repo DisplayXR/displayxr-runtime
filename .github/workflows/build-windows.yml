@@ -55,9 +55,12 @@ jobs:
       - uses: ilammy/msvc-dev-cmd@v1
 
       - name: Generate
+        env:
+          LEIASR_SDKROOT: ${{ github.workspace }}/LeiaSR-SDK-${{ env.SR_TAG }}-win64
         run: |
           cmake -S . -B build -G "Ninja Multi-Config" `
-            -DXRT_HAVE_LEIA_SR=ON -DCMAKE_PREFIX_PATH="${{ github.workspace }}/LeiaSR-SDK-$env:SR_TAG-win64" `
+            -DXRT_HAVE_LEIA_SR=ON `
+            -DCMAKE_PREFIX_PATH="${{ github.workspace }}/LeiaSR-SDK-$env:SR_TAG-win64" `
             -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake" `
             -DX_VCPKG_APPLOCAL_DEPS_INSTALL=ON `
             -DCMAKE_INSTALL_PREFIX=_package `

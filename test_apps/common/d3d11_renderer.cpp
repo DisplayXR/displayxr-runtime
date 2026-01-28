@@ -25,9 +25,10 @@ struct GridVertex {
 };
 
 // HLSL shader source for cube (colored faces)
+// NOTE: Uses mul(matrix, position) convention like reference example
 static const char* g_cubeShaderSource = R"(
 cbuffer Constants : register(b0) {
-    float4x4 worldViewProj;
+    float4x4 transform;
     float4 color;
 };
 
@@ -43,7 +44,7 @@ struct PSInput {
 
 PSInput VSMain(VSInput input) {
     PSInput output;
-    output.position = mul(float4(input.position, 1.0), worldViewProj);
+    output.position = mul(transform, float4(input.position, 1.0));
     output.color = input.color;
     return output;
 }

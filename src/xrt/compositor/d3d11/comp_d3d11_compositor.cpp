@@ -516,6 +516,8 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		return xret;
 	}
 
+	bool weaving_done = false;
+
 #ifdef XRT_HAVE_LEIA_SR_D3D11
 	if (c->weaver != nullptr && leiasr_d3d11_is_ready(c->weaver)) {
 		// Get stereo texture SRV from renderer
@@ -545,8 +547,59 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 
 		// Perform weaving
 		leiasr_d3d11_weave(c->weaver);
+		weaving_done = true;
 	}
 #endif
+
+	// Fallback: if SR weaving is not available, blit the stereo texture directly to the target
+	if (!weaving_done) {
+		// Log once at startup that we're using fallback path
+		static bool fallback_warned = false;
+		if (!fallback_warned) {
+			U_LOG_W("SR weaving not available, using fallback stereo blit");
+			fallback_warned = true;
+		}
+
+		// Get stereo texture from renderer
+		ID3D11Texture2D *stereo_texture =
+		    static_cast<ID3D11Texture2D *>(comp_d3d11_renderer_get_stereo_texture(c->renderer));
+
+		// Get target back buffer
+		ID3D11Texture2D *back_buffer = nullptr;
+		ID3D11RenderTargetView *rtv = nullptr;
+		c->context->OMGetRenderTargets(1, &rtv, nullptr);
+		if (rtv != nullptr) {
+			ID3D11Resource *resource = nullptr;
+			rtv->GetResource(&resource);
+			if (resource != nullptr) {
+				resource->QueryInterface(__uuidof(ID3D11Texture2D),
+				                          reinterpret_cast<void **>(&back_buffer));
+				resource->Release();
+			}
+			rtv->Release();
+		}
+
+		if (back_buffer != nullptr && stereo_texture != nullptr) {
+			// Get texture descriptions to check sizes
+			D3D11_TEXTURE2D_DESC src_desc, dst_desc;
+			stereo_texture->GetDesc(&src_desc);
+			back_buffer->GetDesc(&dst_desc);
+
+			if (src_desc.Width == dst_desc.Width && src_desc.Height == dst_desc.Height) {
+				// Sizes match - use fast CopyResource
+				c->context->CopyResource(back_buffer, stereo_texture);
+			} else {
+				// Sizes don't match - use CopySubresourceRegion to copy what fits
+				UINT copy_width = (src_desc.Width < dst_desc.Width) ? src_desc.Width : dst_desc.Width;
+				UINT copy_height =
+				    (src_desc.Height < dst_desc.Height) ? src_desc.Height : dst_desc.Height;
+				D3D11_BOX src_box = {0, 0, 0, copy_width, copy_height, 1};
+				c->context->CopySubresourceRegion(back_buffer, 0, 0, 0, 0, stereo_texture, 0,
+				                                   &src_box);
+			}
+			back_buffer->Release();
+		}
+	}
 
 	// Present
 	xret = comp_d3d11_target_present(c->target, 1); // VSync enabled
@@ -807,6 +860,7 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 
 #ifdef XRT_HAVE_LEIA_SR_D3D11
 	// Create SR weaver if available
+	U_LOG_W("Attempting to create SR D3D11 weaver (XRT_HAVE_LEIA_SR_D3D11 is defined)");
 	xret = leiasr_d3d11_create(5.0, // 5 second timeout
 	                           c->device,
 	                           c->context,
@@ -815,9 +869,13 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	                           view_height,
 	                           &c->weaver);
 	if (xret != XRT_SUCCESS) {
-		U_LOG_W("Failed to create SR weaver, continuing without interlacing");
+		U_LOG_W("Failed to create SR weaver (error %d), continuing without interlacing", (int)xret);
 		c->weaver = nullptr;
+	} else {
+		U_LOG_W("SR D3D11 weaver created successfully");
 	}
+#else
+	U_LOG_W("XRT_HAVE_LEIA_SR_D3D11 is NOT defined - SR weaving disabled at compile time");
 #endif
 
 	// Initialize layer accumulator - just zero it

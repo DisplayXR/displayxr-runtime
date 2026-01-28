@@ -528,7 +528,13 @@ endif()
 if(XRT_HAVE_LEIA_SR)
 	# Set SR_PATH from LEIASR_SDKROOT (defined in root CMakeLists.txt from environment)
 	set(SR_PATH "${LEIASR_SDKROOT}")
-	message(STATUS "Leia SR SDK path: ${SR_PATH}")
+
+	if(NOT SR_PATH OR SR_PATH STREQUAL "")
+		message(WARNING "LEIASR_SDKROOT environment variable is not set! SR weaver will not be available.")
+		message(WARNING "Please set LEIASR_SDKROOT to point to your Simulated Reality SDK installation.")
+	else()
+		message(STATUS "Leia SR SDK path: ${SR_PATH}")
+	endif()
 
 	# Start with empty source list - weavers are added conditionally based on available SR libraries
 	set(LEIASR_SOURCES)

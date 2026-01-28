@@ -105,9 +105,16 @@ For substantial changes, create a fragment in `doc/changes/<section>/mr.NUMBER.m
 - `BUILD_TESTING` - Enable test suite
 
 ### CMake Variable Notes
-- `LEIASR_SDKROOT` - Set from environment variable, points to LeiaSR SDK install path
+- `LEIASR_SDKROOT` - **Required environment variable** pointing to LeiaSR SDK install path
 - `SR_PATH` - Internal variable in `src/xrt/drivers/CMakeLists.txt`, automatically set from `LEIASR_SDKROOT`
 - The drivers CMakeLists.txt uses `SR_PATH` to locate SDK libraries (SimulatedRealityCore.lib, SimulatedRealityDirectX.lib, etc.)
+- If `LEIASR_SDKROOT` is not set, a CMake warning is shown and SR weaver support is disabled
+
+### GitHub Actions Build
+The CI build in `.github/workflows/build-windows.yml` requires:
+- `LEIASR_SDKROOT` env var set in the Generate step pointing to the downloaded SR SDK
+- `CMAKE_PREFIX_PATH` pointing to the SR SDK for find_package to work
+- Both are needed: PREFIX_PATH for find_package detection, LEIASR_SDKROOT for library paths
 
 ## Claude Code Skills
 
