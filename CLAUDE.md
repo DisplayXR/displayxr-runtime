@@ -153,10 +153,11 @@ Ask Gemini to analyze code and produce a read-only report. Automatically gathers
 ```
 
 **Features:**
+- Launches subagent to preserve main conversation context
 - Smart context detection based on keywords (commit, diff, file paths, etc.)
 - Automatically gathers relevant git history, diffs, or file contents
 - Constructs detailed prompts with READ-ONLY instructions
-- Displays Gemini's analysis report directly
+- Displays Gemini's analysis report
 
 **Skill location:** `.claude/skills/ask-gemini/SKILL.md`
 

@@ -7,61 +7,109 @@ description: |
     /ask-gemini review the latest commit and flag potential issues
     /ask-gemini explain the architecture of comp_renderer.c
     /ask-gemini analyze the error handling patterns in oxr_session.c
-allowed-tools: Read, Grep, Glob, Bash
+allowed-tools: Task
 ---
 
 # Ask Gemini Skill
 
 This skill sends a request to Gemini CLI with automatically gathered context and displays the resulting analysis report.
 
-## Instructions
+## CRITICAL: Launch Subagent to Save Context
 
-### Step 1: Parse User Request
+**You MUST use the Task tool with `subagent_type="general-purpose"` to execute this workflow.**
 
-Extract the user's request from the skill invocation arguments. The request follows `/ask-gemini `.
+The subagent handles all heavy work (context gathering, prompt construction, gemini execution) in its own context.
 
-### Step 2: Smart Context Gathering
+### How to Invoke
 
-Based on keywords detected in the user's request, gather relevant context:
+When this skill is triggered, immediately call:
 
-**Commit-related keywords** ("commit", "latest commit", "last commit", "recent commit"):
+```
+Task(
+  subagent_type="general-purpose",
+  description="Ask Gemini analysis",
+  prompt="[Full workflow prompt below, with USER_REQUEST replaced]"
+)
+```
+
+---
+
+## Subagent Prompt Template
+
+Pass this complete prompt to the subagent (replace `[USER_REQUEST]` with the user's actual request):
+
+```
+Execute the ask-gemini workflow to analyze code and produce a report.
+
+## User Request
+[USER_REQUEST]
+
+---
+
+## PHASE 1: GATHER CONTEXT
+
+Based on keywords in the user request, gather relevant context:
+
+### Step 1.1: Detect Keywords and Gather Context
+
+**If request contains "commit", "latest", "last", "recent":**
 - Run: `git show HEAD --stat`
 - Run: `git diff HEAD~1`
 
-**Diff/changes keywords** ("diff", "changes", "staged", "modified"):
-- Run: `git diff` (for unstaged changes)
-- Run: `git diff --staged` (if "staged" is mentioned)
+**If request contains "diff", "changes", "staged", "modified":**
+- Run: `git diff` (for unstaged)
+- Run: `git diff --staged` (if "staged" mentioned)
 
-**Branch/history keywords** ("branch", "history", "log", "commits"):
+**If request contains "branch", "history", "log":**
 - Run: `git log --oneline -10`
 - Run: `git branch -v`
 
-**Specific file mentioned** (detect paths with extensions like `.c`, `.h`, `.cpp`, `.py` or paths containing `/src/`, `/include/`):
-- Read the mentioned file(s) using the Read tool
-- If file is large, read first 200 lines
+**If request mentions a specific file (contains `.c`, `.h`, `.cpp`, `.py`, or path with `/src/`, `/include/`):**
+- Read the mentioned file using the Read tool
+- If file is very large (>500 lines), read first 300 lines
 
-**No specific context detected**:
+**If no specific context detected:**
 - Run: `git status --short`
-- Run: `ls -la` to show working directory structure
+- Run: `ls src/xrt/` to show project structure
 
-### Step 3: Construct and Execute Gemini Prompt
+Store all gathered context as CONTEXT_OUTPUT.
 
-Construct a detailed prompt and execute it using the Gemini CLI with a heredoc to handle special characters:
+### Step 1.2: Truncate if Needed
+
+If CONTEXT_OUTPUT exceeds 15000 characters, truncate it and add a note:
+"[Context truncated to 15000 chars]"
+
+---
+
+## PHASE 2: CONSTRUCT AND EXECUTE GEMINI PROMPT
+
+### Step 2.1: Build the Prompt
+
+Construct a prompt that includes:
+1. Project context (CNSDK-OpenXR / Monado with LeiaSR SDK)
+2. READ-ONLY instruction
+3. The user's request
+4. The gathered context
+5. Response format instructions
+
+### Step 2.2: Execute Gemini
+
+Run the following bash command (use the actual values, not placeholders):
 
 ```bash
-gemini -y "$(cat <<'GEMINI_PROMPT_EOF'
+gemini -y "$(cat <<'GEMINI_EOF'
 You are analyzing code for the CNSDK-OpenXR project, an OpenXR runtime fork of Monado with LeiaSR SDK integration for eye-tracked 3D displays.
 
-IMPORTANT: This is a READ-ONLY analysis. DO NOT suggest code modifications or produce patches. Your task is to analyze and report only.
+IMPORTANT: This is a READ-ONLY analysis. DO NOT suggest code modifications, patches, or diffs. Your task is to analyze and report only.
 
 ## User Request
-[INSERT_USER_REQUEST_HERE]
+[INSERT THE ACTUAL USER REQUEST HERE]
 
 ## Context
-[INSERT_GATHERED_CONTEXT_HERE]
+[INSERT THE GATHERED CONTEXT HERE]
 
 ## Response Format
-Please provide a detailed analysis addressing the user's request. Structure your response with:
+Provide a detailed analysis addressing the user's request. Structure your response:
 
 ### Summary
 Brief overview of your findings.
@@ -71,33 +119,74 @@ Detailed analysis points, organized by relevance.
 
 ### Recommendations
 If applicable, suggestions for the user to consider (describe conceptually, do not write code).
-GEMINI_PROMPT_EOF
+GEMINI_EOF
 )"
 ```
 
-**Important:** Replace `[INSERT_USER_REQUEST_HERE]` with the actual user request and `[INSERT_GATHERED_CONTEXT_HERE]` with the gathered context from Step 2.
+**CRITICAL:** Replace the placeholder text with actual values before executing.
 
-### Step 4: Display the Report
+---
 
-The output from the `gemini -y` command is the report. Display it to the user without modification.
+## PHASE 3: REPORT RESULTS
 
-If the Gemini CLI fails or is not installed, inform the user:
-- Check that Gemini CLI is installed (`which gemini`)
-- Suggest installing it if not available
+### Step 3.1: Check Execution
 
-## Example Execution Flow
+If Gemini CLI fails or is not installed:
+- Report: "Gemini CLI not available. Install with: npm install -g @anthropic-ai/gemini-cli or check https://github.com/anthropics/gemini-cli"
 
-For `/ask-gemini review the latest commit and flag potential issues`:
+### Step 3.2: Display Report
 
-1. **Parse**: User wants to review the latest commit
-2. **Context**: Detect "latest commit" → run `git show HEAD --stat` and `git diff HEAD~1`
-3. **Construct prompt**: Include the diff output and user request
-4. **Execute**: Run `gemini -y "..."` with the constructed prompt
-5. **Display**: Show Gemini's analysis report to the user
+Show the complete output from Gemini to the user.
+
+Format your final message as:
+```
+## Gemini Analysis Report
+
+[Gemini's output here]
+
+---
+Context gathered: [brief description of what context was included]
+```
+
+STOP.
+
+---
+
+## Example Execution
+
+For request "review the latest commit and flag potential issues":
+
+1. **Detect**: "latest commit" → gather git show HEAD and git diff HEAD~1
+2. **Context**: Collect the diff output
+3. **Prompt**: Include diff in Gemini prompt with READ-ONLY instruction
+4. **Execute**: Run `gemini -y "..."`
+5. **Report**: Display Gemini's analysis
+
+---
 
 ## Notes
 
-- Always use the `-y` flag with gemini to auto-confirm
-- Use heredoc with `'EOF'` (quoted) to prevent variable expansion issues
-- Context gathering should be quick - avoid reading too many files
-- If context is very large (>10000 chars), truncate with a note
+- Always use `-y` flag with gemini to auto-confirm
+- Use heredoc with quoted delimiter ('GEMINI_EOF') to prevent variable expansion
+- Keep context focused - don't read more files than necessary
+- If gemini command times out, use timeout of 120000ms (2 min)
+```
+
+---
+
+## Usage Examples
+
+### Review latest commit:
+```
+/ask-gemini review the latest commit and flag potential issues
+```
+
+### Analyze a specific file:
+```
+/ask-gemini explain the architecture of comp_renderer.c
+```
+
+### General code analysis:
+```
+/ask-gemini analyze the error handling patterns in oxr_session.c
+```
