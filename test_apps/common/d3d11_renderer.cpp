@@ -443,7 +443,7 @@ bool CreateResources(D3D11Renderer& renderer) {
     D3D11_RASTERIZER_DESC rsDesc = {};
     rsDesc.FillMode = D3D11_FILL_SOLID;
     rsDesc.CullMode = D3D11_CULL_BACK;
-    rsDesc.FrontCounterClockwise = FALSE;
+    rsDesc.FrontCounterClockwise = TRUE;  // Cube vertices are counter-clockwise when viewed from outside
     rsDesc.DepthClipEnable = TRUE;
 
     hr = renderer.device->CreateRasterizerState(&rsDesc, &renderer.rasterizerState);
