@@ -19,6 +19,7 @@
 #define UNICODE
 #define _UNICODE
 #include <windows.h>
+#include <unknwn.h>  // IUnknown - needed by openxr_platform.h MSFT extensions
 
 // Only define platform — no graphics API here (apps define their own)
 #define XR_USE_PLATFORM_WIN32
