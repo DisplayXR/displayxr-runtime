@@ -20,9 +20,12 @@
 #include "text_overlay.h"
 #include "xr_session.h"
 
+#include <atomic>
 #include <chrono>
+#include <mutex>
 #include <string>
 #include <sstream>
+#include <thread>
 
 using Microsoft::WRL::ComPtr;
 using namespace DirectX;
@@ -34,32 +37,37 @@ static const char* APP_NAME = "sr_cube_openxr_ext";
 static const wchar_t* WINDOW_CLASS = L"SRCubeOpenXRExtClass";
 static const wchar_t* WINDOW_TITLE = L"SR Cube OpenXR Ext - XR_EXT_session_target (Press ESC to exit)";
 
-// Global state
-static InputState g_inputState;
-static bool g_running = true;
-static UINT g_windowWidth = 1280;
-static UINT g_windowHeight = 720;
+// Global state (shared between main thread and render thread)
+static InputState g_inputState;            // Protected by g_inputMutex
+static std::mutex g_inputMutex;            // Guards g_inputState + window dimensions
+static std::atomic<bool> g_running{true};  // Atomic: main thread writes, render thread reads
+static UINT g_windowWidth = 1280;          // Protected by g_inputMutex
+static UINT g_windowHeight = 720;          // Protected by g_inputMutex
 
-// Window procedure
+// Window procedure (runs on main thread)
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    UpdateInputState(g_inputState, msg, wParam, lParam);
+    {
+        std::lock_guard<std::mutex> lock(g_inputMutex);
+        UpdateInputState(g_inputState, msg, wParam, lParam);
+    }
 
     switch (msg) {
     case WM_SIZE:
         if (wParam != SIZE_MINIMIZED) {
+            std::lock_guard<std::mutex> lock(g_inputMutex);
             g_windowWidth = LOWORD(lParam);
             g_windowHeight = HIWORD(lParam);
         }
         return 0;
 
     case WM_CLOSE:
-        g_running = false;
+        g_running.store(false);
         PostQuitMessage(0);
         return 0;
 
     case WM_KEYDOWN:
         if (wParam == VK_ESCAPE) {
-            g_running = false;
+            g_running.store(false);
             PostQuitMessage(0);
             return 0;
         }
@@ -141,6 +149,223 @@ static void UpdatePerformanceStats(PerformanceStats& stats) {
         stats.frameCount = 0;
         stats.fpsAccumulator = 0.0f;
     }
+}
+
+// Render thread function — runs the OpenXR frame loop independently of the
+// Win32 message pump so that rendering continues even when the user drags or
+// resizes the window (DefWindowProc enters a modal loop that blocks the main
+// thread during those operations).
+static void RenderThreadFunc(
+    HWND hwnd,
+    XrSessionManager* xr,
+    D3D11Renderer* renderer,
+    TextOverlay* textOverlay,
+    ComPtr<ID3D11Texture2D> quadStagingTexture,
+    ComPtr<ID3D11Texture2D>* depthTextures,
+    ComPtr<ID3D11DepthStencilView>* depthDSVs)
+{
+    LOG_INFO("[RenderThread] Started");
+
+    PerformanceStats perfStats = {};
+    perfStats.lastTime = std::chrono::high_resolution_clock::now();
+
+    while (g_running.load() && !xr->exitRequested) {
+        // Snapshot input state under lock — hold the lock as briefly as possible
+        InputState inputSnapshot;
+        bool resetRequested = false;
+        {
+            std::lock_guard<std::mutex> lock(g_inputMutex);
+            inputSnapshot = g_inputState;
+            resetRequested = g_inputState.resetViewRequested;
+            // Clear one-shot flags so they don't fire again
+            g_inputState.resetViewRequested = false;
+            g_inputState.fullscreenToggleRequested = false;
+        }
+
+        // Update performance stats
+        UpdatePerformanceStats(perfStats);
+
+        // Update input-based camera movement (operates on local snapshot)
+        UpdateCameraMovement(inputSnapshot, perfStats.deltaTime);
+
+        // Write back camera position (only the render thread updates these via
+        // WASD/QE movement). yaw/pitch/zoomScale are NOT written back because
+        // they are modified by the main thread's WindowProc (mouse drag/scroll)
+        // and writing them back would stomp on concurrent input.
+        // Exception: on view reset, UpdateCameraMovement zeroes everything, so
+        // we must also write back yaw/pitch/zoomScale in that case.
+        {
+            std::lock_guard<std::mutex> lock(g_inputMutex);
+            g_inputState.cameraPosX = inputSnapshot.cameraPosX;
+            g_inputState.cameraPosY = inputSnapshot.cameraPosY;
+            g_inputState.cameraPosZ = inputSnapshot.cameraPosZ;
+            if (resetRequested) {
+                g_inputState.yaw = inputSnapshot.yaw;
+                g_inputState.pitch = inputSnapshot.pitch;
+                g_inputState.zoomScale = inputSnapshot.zoomScale;
+            }
+        }
+
+        // Update scene (cube rotation)
+        UpdateScene(*renderer, perfStats.deltaTime);
+
+        // Poll OpenXR events
+        PollEvents(*xr);
+
+        // Only render if session is running
+        if (xr->sessionRunning) {
+            XrFrameState frameState;
+            if (BeginFrame(*xr, frameState)) {
+                XrCompositionLayerProjectionView projectionViews[2] = {};
+                ConvergencePlane convPlane = {};
+
+                if (frameState.shouldRender) {
+                    XMMATRIX leftViewMatrix, leftProjMatrix;
+                    XMMATRIX rightViewMatrix, rightProjMatrix;
+
+                    if (LocateViews(*xr, frameState.predictedDisplayTime,
+                        leftViewMatrix, leftProjMatrix,
+                        rightViewMatrix, rightProjMatrix,
+                        inputSnapshot.cameraPosX, inputSnapshot.cameraPosY, inputSnapshot.cameraPosZ,
+                        inputSnapshot.yaw, inputSnapshot.pitch)) {
+
+                        // Get raw view poses (pre-player-transform) for projection views
+                        // and convergence plane computation
+                        XrViewLocateInfo locateInfo = {XR_TYPE_VIEW_LOCATE_INFO};
+                        locateInfo.viewConfigurationType = xr->viewConfigType;
+                        locateInfo.displayTime = frameState.predictedDisplayTime;
+                        locateInfo.space = xr->localSpace;
+
+                        XrViewState viewState = {XR_TYPE_VIEW_STATE};
+                        uint32_t viewCount = 2;
+                        XrView rawViews[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+                        xrLocateViews(xr->session, &locateInfo, &viewState, 2, &viewCount, rawViews);
+
+                        // Compute convergence plane from raw views (physical display surface)
+                        convPlane = LocateConvergencePlane(rawViews);
+
+                        // Render each eye (3D scene only - no UI)
+                        for (int eye = 0; eye < 2; eye++) {
+                            uint32_t imageIndex;
+                            if (AcquireSwapchainImage(*xr, eye, imageIndex)) {
+                                ID3D11Texture2D* swapchainTexture = xr->swapchains[eye].images[imageIndex].texture;
+
+                                ID3D11RenderTargetView* rtv = nullptr;
+                                CreateRenderTargetView(*renderer, swapchainTexture, &rtv);
+
+                                // Set viewport to match swapchain dimensions.
+                                D3D11_VIEWPORT vp = {};
+                                vp.Width = (FLOAT)xr->swapchains[eye].width;
+                                vp.Height = (FLOAT)xr->swapchains[eye].height;
+                                vp.MaxDepth = 1.0f;
+                                renderer->context->RSSetViewports(1, &vp);
+
+                                // Clear render target and depth buffer for this eye.
+                                float clearColor[4] = {0.05f, 0.05f, 0.25f, 1.0f};
+                                renderer->context->ClearRenderTargetView(rtv, clearColor);
+                                renderer->context->ClearDepthStencilView(depthDSVs[eye].Get(),
+                                    D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
+
+                                XMMATRIX viewMatrix = (eye == 0) ? leftViewMatrix : rightViewMatrix;
+                                XMMATRIX projMatrix = (eye == 0) ? leftProjMatrix : rightProjMatrix;
+
+                                RenderScene(*renderer, rtv, depthDSVs[eye].Get(),
+                                    xr->swapchains[eye].width, xr->swapchains[eye].height,
+                                    viewMatrix, projMatrix,
+                                    inputSnapshot.zoomScale);
+
+                                if (rtv) rtv->Release();
+
+                                ReleaseSwapchainImage(*xr, eye);
+
+                                // Set up projection view for this eye
+                                projectionViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
+                                projectionViews[eye].subImage.swapchain = xr->swapchains[eye].swapchain;
+                                projectionViews[eye].subImage.imageRect.offset = {0, 0};
+                                projectionViews[eye].subImage.imageRect.extent = {
+                                    (int32_t)xr->swapchains[eye].width,
+                                    (int32_t)xr->swapchains[eye].height
+                                };
+                                projectionViews[eye].subImage.imageArrayIndex = 0;
+
+                                projectionViews[eye].pose = rawViews[eye].pose;
+                                projectionViews[eye].fov = rawViews[eye].fov;
+                            }
+                        }
+
+                        // Render UI to quad layer (if available)
+                        if (xr->hasQuadLayer) {
+                            uint32_t quadImageIndex;
+                            if (AcquireQuadSwapchainImage(*xr, quadImageIndex)) {
+                                ID3D11Texture2D* quadTexture = xr->quadSwapchain.images[quadImageIndex].texture;
+
+                                // Use staging texture for D2D rendering
+                                ID3D11Texture2D* textTarget = quadStagingTexture ? quadStagingTexture.Get() : quadTexture;
+
+                                // Clear with semi-transparent black background
+                                ID3D11RenderTargetView* quadRtv = nullptr;
+                                CreateRenderTargetView(*renderer, textTarget, &quadRtv);
+                                if (quadRtv) {
+                                    float clearColor[4] = {0.0f, 0.0f, 0.0f, 0.7f};
+                                    renderer->context->ClearRenderTargetView(quadRtv, clearColor);
+                                    quadRtv->Release();
+                                }
+
+                                // Render text to staging texture
+                                std::wstring stateText = L"Session: ";
+                                stateText += FormatSessionState((int)xr->sessionState);
+                                RenderText(*textOverlay, renderer->device.Get(), textTarget,
+                                    stateText, 10, 10, 300, 30);
+
+                                std::wstring extText = xr->hasSessionTargetExt ?
+                                    L"XR_EXT_session_target: ACTIVE" :
+                                    L"XR_EXT_session_target: NOT AVAILABLE";
+                                RenderText(*textOverlay, renderer->device.Get(), textTarget,
+                                    extText, 10, 45, 350, 30, true);
+
+                                std::wstring perfText = FormatPerformanceInfo(perfStats.fps, perfStats.frameTimeMs,
+                                    xr->swapchains[0].width, xr->swapchains[0].height);
+                                RenderText(*textOverlay, renderer->device.Get(), textTarget,
+                                    perfText, 10, 85, 300, 70, true);
+
+                                std::wstring eyeText = FormatEyeTrackingInfo(xr->eyePosX, xr->eyePosY, xr->eyePosZ, xr->eyeTrackingActive);
+                                RenderText(*textOverlay, renderer->device.Get(), textTarget,
+                                    eyeText, 10, 165, 300, 70, true);
+
+                                // Copy staging texture to swapchain
+                                if (quadStagingTexture) {
+                                    renderer->context->CopyResource(quadTexture, quadStagingTexture.Get());
+                                }
+
+                                ReleaseQuadSwapchainImage(*xr);
+                            }
+                        }
+                    }
+                }
+
+                // Submit frame with quad layer for UI (anchored to convergence plane)
+                if (convPlane.valid) {
+                    float hudW, hudH;
+                    XrPosef hudPose = ComputeHUDPose(convPlane, 0.2f, hudW, hudH);
+                    EndFrameWithQuadLayer(*xr, frameState.predictedDisplayTime, projectionViews,
+                        hudPose, hudW, hudH);
+                } else {
+                    // Fallback: skip quad layer, submit projection only
+                    EndFrame(*xr, frameState.predictedDisplayTime, projectionViews);
+                }
+            }
+        } else {
+            Sleep(100);
+        }
+    }
+
+    // If XR requested exit while the window is still open, post WM_CLOSE to
+    // unblock GetMessage on the main thread.
+    if (xr->exitRequested && g_running.load()) {
+        PostMessage(hwnd, WM_CLOSE, 0, 0);
+    }
+
+    LOG_INFO("[RenderThread] Exiting");
 }
 
 // Main entry point
@@ -316,195 +541,34 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         depthDSVs[eye].Attach(dsv);
     }
 
-    // Performance tracking
-    PerformanceStats perfStats = {};
-    perfStats.lastTime = std::chrono::high_resolution_clock::now();
-
     LOG_INFO("");
     LOG_INFO("=== Entering main loop ===");
     LOG_INFO("XR rendering happens in the application window (XR_EXT_session_target)");
+    LOG_INFO("Render thread handles OpenXR frame loop; main thread handles Win32 messages");
     LOG_INFO("Controls: WASD=Fly, QE=Up/Down, Mouse=Look, Space/DblClick=Reset, P=Parallax, ESC=Quit");
     LOG_INFO("");
 
-    // Main loop
+    // Launch render thread — the frame loop runs independently of the message pump
+    // so that rendering continues even when DefWindowProc blocks during window drag/resize.
+    std::thread renderThread(RenderThreadFunc, hwnd, &xr, &renderer, &textOverlay,
+        quadStagingTexture, depthTextures, depthDSVs);
+
+    // Main thread: blocking Win32 message pump.
+    // GetMessage blocks efficiently (no CPU spin) until a message arrives.
+    // When the window is being dragged/resized, DefWindowProc runs a modal loop
+    // here on the main thread — but the render thread keeps submitting frames.
     MSG msg = {};
-    while (g_running && !xr.exitRequested) {
-        // Process Windows messages
-        while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
-            if (msg.message == WM_QUIT) {
-                g_running = false;
-                RequestExit(xr);
-            }
-            TranslateMessage(&msg);
-            DispatchMessage(&msg);
-        }
-
-        if (!g_running) break;
-
-        // Update performance stats
-        UpdatePerformanceStats(perfStats);
-
-        // Update input-based camera movement
-        UpdateCameraMovement(g_inputState, perfStats.deltaTime);
-
-        // Update scene (cube rotation)
-        UpdateScene(renderer, perfStats.deltaTime);
-
-        // Poll OpenXR events
-        PollEvents(xr);
-
-        // Only render if session is running
-        if (xr.sessionRunning) {
-            XrFrameState frameState;
-            if (BeginFrame(xr, frameState)) {
-                XrCompositionLayerProjectionView projectionViews[2] = {};
-                ConvergencePlane convPlane = {};
-
-                if (frameState.shouldRender) {
-                    XMMATRIX leftViewMatrix, leftProjMatrix;
-                    XMMATRIX rightViewMatrix, rightProjMatrix;
-
-                    if (LocateViews(xr, frameState.predictedDisplayTime,
-                        leftViewMatrix, leftProjMatrix,
-                        rightViewMatrix, rightProjMatrix,
-                        g_inputState.cameraPosX, g_inputState.cameraPosY, g_inputState.cameraPosZ,
-                        g_inputState.yaw, g_inputState.pitch)) {
-
-                        // Get raw view poses (pre-player-transform) for projection views
-                        // and convergence plane computation
-                        XrViewLocateInfo locateInfo = {XR_TYPE_VIEW_LOCATE_INFO};
-                        locateInfo.viewConfigurationType = xr.viewConfigType;
-                        locateInfo.displayTime = frameState.predictedDisplayTime;
-                        locateInfo.space = xr.localSpace;
-
-                        XrViewState viewState = {XR_TYPE_VIEW_STATE};
-                        uint32_t viewCount = 2;
-                        XrView rawViews[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
-                        xrLocateViews(xr.session, &locateInfo, &viewState, 2, &viewCount, rawViews);
-
-                        // Compute convergence plane from raw views (physical display surface)
-                        convPlane = LocateConvergencePlane(rawViews);
-
-                        // Render each eye (3D scene only - no UI)
-                        for (int eye = 0; eye < 2; eye++) {
-                            uint32_t imageIndex;
-                            if (AcquireSwapchainImage(xr, eye, imageIndex)) {
-                                ID3D11Texture2D* swapchainTexture = xr.swapchains[eye].images[imageIndex].texture;
-
-                                ID3D11RenderTargetView* rtv = nullptr;
-                                CreateRenderTargetView(renderer, swapchainTexture, &rtv);
-
-                                // Set viewport to match swapchain dimensions.
-                                // Each eye has its own swapchain so we must set the viewport
-                                // explicitly (the D3D11 context is shared with the compositor
-                                // which sets its own viewports during layer_commit).
-                                D3D11_VIEWPORT vp = {};
-                                vp.Width = (FLOAT)xr.swapchains[eye].width;
-                                vp.Height = (FLOAT)xr.swapchains[eye].height;
-                                vp.MaxDepth = 1.0f;
-                                renderer.context->RSSetViewports(1, &vp);
-
-                                // Clear render target and depth buffer for this eye.
-                                // Each eye renders to its own swapchain so both must be cleared.
-                                float clearColor[4] = {0.05f, 0.05f, 0.25f, 1.0f};
-                                renderer.context->ClearRenderTargetView(rtv, clearColor);
-                                renderer.context->ClearDepthStencilView(depthDSVs[eye].Get(),
-                                    D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
-
-                                XMMATRIX viewMatrix = (eye == 0) ? leftViewMatrix : rightViewMatrix;
-                                XMMATRIX projMatrix = (eye == 0) ? leftProjMatrix : rightProjMatrix;
-
-                                RenderScene(renderer, rtv, depthDSVs[eye].Get(),
-                                    xr.swapchains[eye].width, xr.swapchains[eye].height,
-                                    viewMatrix, projMatrix,
-                                    g_inputState.zoomScale);
-
-                                if (rtv) rtv->Release();
-
-                                ReleaseSwapchainImage(xr, eye);
-
-                                // Set up projection view for this eye
-                                projectionViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
-                                projectionViews[eye].subImage.swapchain = xr.swapchains[eye].swapchain;
-                                projectionViews[eye].subImage.imageRect.offset = {0, 0};
-                                projectionViews[eye].subImage.imageRect.extent = {
-                                    (int32_t)xr.swapchains[eye].width,
-                                    (int32_t)xr.swapchains[eye].height
-                                };
-                                projectionViews[eye].subImage.imageArrayIndex = 0;
-
-                                projectionViews[eye].pose = rawViews[eye].pose;
-                                projectionViews[eye].fov = rawViews[eye].fov;
-                            }
-                        }
-
-                        // Render UI to quad layer (if available)
-                        if (xr.hasQuadLayer) {
-                            uint32_t quadImageIndex;
-                            if (AcquireQuadSwapchainImage(xr, quadImageIndex)) {
-                                ID3D11Texture2D* quadTexture = xr.quadSwapchain.images[quadImageIndex].texture;
-
-                                // Use staging texture for D2D rendering (D2D cannot render
-                                // to OpenXR swapchain textures which are shared resources).
-                                // Fall back to direct rendering if staging wasn't created.
-                                ID3D11Texture2D* textTarget = quadStagingTexture ? quadStagingTexture.Get() : quadTexture;
-
-                                // Clear with semi-transparent black background
-                                ID3D11RenderTargetView* quadRtv = nullptr;
-                                CreateRenderTargetView(renderer, textTarget, &quadRtv);
-                                if (quadRtv) {
-                                    float clearColor[4] = {0.0f, 0.0f, 0.0f, 0.7f};
-                                    renderer.context->ClearRenderTargetView(quadRtv, clearColor);
-                                    quadRtv->Release();
-                                }
-
-                                // Render text to staging texture
-                                std::wstring stateText = L"Session: ";
-                                stateText += FormatSessionState((int)xr.sessionState);
-                                RenderText(textOverlay, renderer.device.Get(), textTarget,
-                                    stateText, 10, 10, 300, 30);
-
-                                std::wstring extText = xr.hasSessionTargetExt ?
-                                    L"XR_EXT_session_target: ACTIVE" :
-                                    L"XR_EXT_session_target: NOT AVAILABLE";
-                                RenderText(textOverlay, renderer.device.Get(), textTarget,
-                                    extText, 10, 45, 350, 30, true);
-
-                                std::wstring perfText = FormatPerformanceInfo(perfStats.fps, perfStats.frameTimeMs,
-                                    xr.swapchains[0].width, xr.swapchains[0].height);
-                                RenderText(textOverlay, renderer.device.Get(), textTarget,
-                                    perfText, 10, 85, 300, 70, true);
-
-                                std::wstring eyeText = FormatEyeTrackingInfo(xr.eyePosX, xr.eyePosY, xr.eyePosZ, xr.eyeTrackingActive);
-                                RenderText(textOverlay, renderer.device.Get(), textTarget,
-                                    eyeText, 10, 165, 300, 70, true);
-
-                                // Copy staging texture to swapchain
-                                if (quadStagingTexture) {
-                                    renderer.context->CopyResource(quadTexture, quadStagingTexture.Get());
-                                }
-
-                                ReleaseQuadSwapchainImage(xr);
-                            }
-                        }
-                    }
-                }
-
-                // Submit frame with quad layer for UI (anchored to convergence plane)
-                if (convPlane.valid) {
-                    float hudW, hudH;
-                    XrPosef hudPose = ComputeHUDPose(convPlane, 0.2f, hudW, hudH);
-                    EndFrameWithQuadLayer(xr, frameState.predictedDisplayTime, projectionViews,
-                        hudPose, hudW, hudH);
-                } else {
-                    // Fallback: skip quad layer, submit projection only
-                    EndFrame(xr, frameState.predictedDisplayTime, projectionViews);
-                }
-            }
-        } else {
-            Sleep(100);
-        }
+    while (GetMessage(&msg, nullptr, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
     }
+
+    // GetMessage returned 0 (WM_QUIT) or -1 (error) — signal render thread to stop
+    g_running.store(false);
+
+    LOG_INFO("Main thread: waiting for render thread to finish...");
+    renderThread.join();
+    LOG_INFO("Main thread: render thread joined");
 
     // Cleanup
     LOG_INFO("");
