@@ -136,7 +136,7 @@ bool UpdateInputState(InputState& state, UINT msg, WPARAM wParam, LPARAM lParam)
 }
 
 void UpdateCameraMovement(InputState& state, float deltaTime) {
-    const float moveSpeed = 2.0f; // Units per second
+    const float moveSpeed = 0.1f; // Meters per second (scene is in meters)
 
     // Calculate forward and right vectors based on yaw
     float forwardX = sinf(state.yaw);

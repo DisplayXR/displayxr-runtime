@@ -44,7 +44,7 @@ struct InputState {
     // Camera position (updated by movement)
     float cameraPosX = 0.0f;
     float cameraPosY = 0.0f;
-    float cameraPosZ = 3.0f;  // Start 3 units back from origin
+    float cameraPosZ = 0.0f;  // Start at origin (OpenXR view matrix provides eye offset)
 
     // Parallax toggle state
     bool parallaxEnabled = true;
