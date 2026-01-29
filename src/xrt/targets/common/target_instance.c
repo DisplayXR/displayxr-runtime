@@ -71,6 +71,7 @@ xrt_result_t
 null_compositor_create_system_with_dims(struct xrt_device *xdev,
                                          uint32_t recommended_width,
                                          uint32_t recommended_height,
+                                         float refresh_rate_hz,
                                          struct xrt_system_compositor **out_xsysc);
 
 
