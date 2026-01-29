@@ -25,10 +25,13 @@ add_library(sr_common STATIC
     window_manager.cpp
     window_manager.h
     leia_math.h
+    xr_session_common.cpp
+    xr_session_common.h
 )
 
 target_include_directories(sr_common PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../src/external/openxr_includes
 )
 
 target_link_libraries(sr_common PUBLIC

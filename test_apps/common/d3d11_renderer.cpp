@@ -504,11 +504,7 @@ void RenderScene(
     uint32_t height,
     const XMMATRIX& viewMatrix,
     const XMMATRIX& projMatrix,
-    float cameraPosX,
-    float cameraPosY,
-    float cameraPosZ,
-    float cameraYaw,
-    float cameraPitch
+    float zoomScale
 ) {
     // Set render targets (don't set viewport here - caller handles it for stereo rendering)
     renderer.context->OMSetRenderTargets(1, &rtv, dsv);
@@ -520,12 +516,9 @@ void RenderScene(
     renderer.context->OMSetDepthStencilState(renderer.depthStencilState.Get(), 0);
     renderer.context->RSSetState(renderer.rasterizerState.Get());
 
-    // Build camera view matrix from input state
-    // Note: For OpenXR stereo rendering, we use the viewMatrix from OpenXR
-    // The cameraPosX/Y/Z and yaw/pitch are used to offset the LOCAL reference space
-    XMMATRIX cameraOffset = XMMatrixTranslation(-cameraPosX, -cameraPosY, -cameraPosZ);
-    XMMATRIX cameraRotation = XMMatrixRotationRollPitchYaw(cameraPitch, cameraYaw, 0);
-    XMMATRIX view = cameraRotation * cameraOffset * viewMatrix;
+    // viewMatrix already includes player locomotion via OpenXR reference space offset
+    // (see UpdateLocalSpace in xr_session). No manual camera transform needed.
+    XMMATRIX zoom = XMMatrixScaling(zoomScale, zoomScale, zoomScale);
 
     // Render cube
     // Scale cube to 0.06m (60mm, matching reference SR example) - unit cube is -0.5 to 0.5
@@ -534,7 +527,7 @@ void RenderScene(
     XMMATRIX cubeScale = XMMatrixScaling(cubeSize, cubeSize, cubeSize);
     XMMATRIX cubeRotation = XMMatrixRotationY(renderer.cubeRotation);
     XMMATRIX cubeWorld = cubeRotation * cubeScale;
-    XMMATRIX cubeWVP = cubeWorld * view * projMatrix;
+    XMMATRIX cubeWVP = cubeWorld * zoom * viewMatrix * projMatrix;
 
     renderer.context->IASetInputLayout(renderer.cubeInputLayout.Get());
     renderer.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -555,7 +548,7 @@ void RenderScene(
     // Scale to 0.5m range, positioned at y=-0.03m (below the cube)
     const float gridScale = 0.05f;  // Each unit becomes 0.05m (50mm)
     XMMATRIX gridWorld = XMMatrixScaling(gridScale, gridScale, gridScale) * XMMatrixTranslation(0, -0.03f + gridScale, 0);
-    XMMATRIX gridWVP = gridWorld * view * projMatrix;
+    XMMATRIX gridWVP = gridWorld * zoom * viewMatrix * projMatrix;
 
     renderer.context->IASetInputLayout(renderer.gridInputLayout.Get());
     renderer.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_LINELIST);

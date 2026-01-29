@@ -365,7 +365,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
                     if (LocateViews(xr, frameState.predictedDisplayTime,
                         leftViewMatrix, leftProjMatrix,
-                        rightViewMatrix, rightProjMatrix)) {
+                        rightViewMatrix, rightProjMatrix,
+                        g_inputState.cameraPosX, g_inputState.cameraPosY, g_inputState.cameraPosZ,
+                        g_inputState.yaw, g_inputState.pitch)) {
 
                         // Render each eye (3D scene only - no UI)
                         for (int eye = 0; eye < 2; eye++) {
@@ -399,8 +401,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                                 RenderScene(renderer, rtv, depthDSVs[eye].Get(),
                                     xr.swapchains[eye].width, xr.swapchains[eye].height,
                                     viewMatrix, projMatrix,
-                                    g_inputState.cameraPosX, g_inputState.cameraPosY, g_inputState.cameraPosZ,
-                                    g_inputState.yaw, g_inputState.pitch);
+                                    g_inputState.zoomScale);
 
                                 if (rtv) rtv->Release();
 

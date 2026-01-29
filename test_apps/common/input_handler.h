@@ -52,6 +52,9 @@ struct InputState {
     // Fullscreen state
     bool fullscreen = false;
     bool fullscreenToggleRequested = false;
+
+    // Mouse scroll zoom
+    float zoomScale = 1.0f;
 };
 
 // Process a Win32 message and update input state
