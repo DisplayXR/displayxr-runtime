@@ -75,7 +75,8 @@ void CleanupD3D11(D3D11Renderer& renderer);
 void UpdateScene(D3D11Renderer& renderer, float deltaTime);
 
 // Render the scene to a render target view
-// viewMatrix and projMatrix come from OpenXR views or Kooima projection
+// viewMatrix and projMatrix come from OpenXR views (already includes player locomotion
+// via reference space offset — see UpdateLocalSpace in xr_session)
 void RenderScene(
     D3D11Renderer& renderer,
     ID3D11RenderTargetView* rtv,
@@ -84,11 +85,7 @@ void RenderScene(
     uint32_t height,
     const DirectX::XMMATRIX& viewMatrix,
     const DirectX::XMMATRIX& projMatrix,
-    float cameraPosX,
-    float cameraPosY,
-    float cameraPosZ,
-    float cameraYaw,
-    float cameraPitch
+    float zoomScale = 1.0f
 );
 
 // Create a render target view for an OpenXR swapchain image

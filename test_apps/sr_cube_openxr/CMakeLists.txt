@@ -87,9 +87,7 @@ add_executable(sr_cube_openxr WIN32
     resource.rc
 )
 
-target_include_directories(sr_cube_openxr PRIVATE
-    ${OPENXR_INCLUDE_DIR}
-)
+# OpenXR include dir is provided by sr_common PUBLIC include directories
 
 target_link_libraries(sr_cube_openxr PRIVATE
     sr_common

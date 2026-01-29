@@ -98,6 +98,15 @@ bool UpdateInputState(InputState& state, UINT msg, WPARAM wParam, LPARAM lParam)
         state.middleButton = false;
         return true;
 
+    case WM_MOUSEWHEEL: {
+        int zDelta = GET_WHEEL_DELTA_WPARAM(wParam);
+        float factor = (zDelta > 0) ? 1.1f : (1.0f / 1.1f);
+        state.zoomScale *= factor;
+        if (state.zoomScale < 0.1f) state.zoomScale = 0.1f;
+        if (state.zoomScale > 10.0f) state.zoomScale = 10.0f;
+        return true;
+    }
+
     case WM_KEYDOWN:
         state.lastKey = GetKeyName(wParam);
         switch (wParam) {
