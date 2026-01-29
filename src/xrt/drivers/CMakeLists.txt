@@ -594,6 +594,10 @@ if(XRT_HAVE_LEIA_SR)
 
 		# Eye tracking is handled by the weaver's getPredictedEyePositions() - no separate library needed
 
+		# Export availability for other CMake components (targets/common needs this)
+		set(LEIA_SR_VULKAN_AVAILABLE ${LEIA_SR_VULKAN_AVAILABLE} CACHE INTERNAL "LeiaSR Vulkan weaver available")
+		set(LEIA_SR_D3D11_AVAILABLE ${LEIA_SR_D3D11_AVAILABLE} CACHE INTERNAL "LeiaSR D3D11 weaver available")
+
 		list(APPEND ENABLED_DRIVERS drv_leiasr)
 	else()
 		message(WARNING "XRT_HAVE_LEIA_SR is set but no SR weaver libraries found - disabling Leia SR support")

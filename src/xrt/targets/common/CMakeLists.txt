@@ -293,6 +293,17 @@ if(XRT_MODULE_COMPOSITOR_MAIN OR XRT_MODULE_COMPOSITOR_NULL)
 			target_include_directories(target_instance_hybrid PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../drivers)
 			target_compile_definitions(target_instance_hybrid PRIVATE XRT_HAVE_LEIA_SR)
 		endif()
+
+		# D3D11-only SR mode: hybrid apps need D3D11 service compositor at system level
+		# because the null compositor requires Vulkan (which we don't have)
+		if(LEIA_SR_D3D11_AVAILABLE AND NOT LEIA_SR_VULKAN_AVAILABLE)
+			target_link_libraries(target_instance_hybrid PRIVATE comp_d3d11_service)
+			target_compile_definitions(target_instance_hybrid PRIVATE
+				XRT_USE_D3D11_SERVICE_COMPOSITOR
+				XRT_SR_D3D11_ONLY
+			)
+			message(STATUS "Hybrid mode: D3D11-only SR detected, using D3D11 service compositor instead of null")
+		endif()
 	endif()
 endif()
 

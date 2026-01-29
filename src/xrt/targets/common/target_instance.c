@@ -127,6 +127,19 @@ t_instance_create_system(struct xrt_instance *xinst,
 
 	bool use_null = debug_get_bool_option_use_null();
 
+#if defined(XRT_SR_D3D11_ONLY) && defined(XRT_USE_D3D11_SERVICE_COMPOSITOR)
+	// D3D11-only SR mode: null compositor requires Vulkan which is unavailable.
+	// Use D3D11 service compositor at system level instead.
+	if (use_null) {
+		U_LOG_I("D3D11-only SR mode: using D3D11 service compositor (null compositor requires Vulkan)");
+		xret = comp_d3d11_service_create_system(head, &xsysc);
+		if (xret != XRT_SUCCESS) {
+			U_LOG_E("D3D11 service compositor creation failed in D3D11-only SR mode");
+		}
+		use_null = false; // Skip null compositor path
+	}
+#endif
+
 #ifdef XRT_MODULE_COMPOSITOR_NULL
 	if (use_null) {
 		uint32_t sr_rec_width = 0;
