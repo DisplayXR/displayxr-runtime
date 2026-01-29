@@ -10,10 +10,15 @@
 
 #pragma once
 
+#include <d3d11.h>
+#define XR_USE_GRAPHICS_API_D3D11
 #include "xr_session_common.h"
 
 // Initialize OpenXR instance and check for XR_EXT_session_target support
 bool InitializeOpenXR(XrSessionManager& xr);
+
+// Get the D3D11 graphics requirements (adapter LUID)
+bool GetD3D11GraphicsRequirements(XrSessionManager& xr, LUID* outAdapterLuid);
 
 // Create session with D3D11 device and window handle (using XR_EXT_session_target)
 bool CreateSession(XrSessionManager& xr, ID3D11Device* d3d11Device, HWND hwnd);

@@ -1,0 +1,152 @@
+// Copyright 2025, Leia Inc.
+// SPDX-License-Identifier: BSL-1.0
+/*!
+ * @file
+ * @brief  OpenXR session management for OpenGL with XR_EXT_session_target
+ */
+
+#include "xr_session.h"
+#include "logging.h"
+#include <cstring>
+
+#define XR_CHECK(call) \
+    do { \
+        XrResult result = (call); \
+        if (XR_FAILED(result)) { \
+            LogXrResult(#call, result); \
+            return false; \
+        } \
+    } while (0)
+
+#define XR_CHECK_LOG(call) \
+    do { \
+        XrResult result = (call); \
+        LogXrResult(#call, result); \
+        if (XR_FAILED(result)) { \
+            return false; \
+        } \
+    } while (0)
+
+bool GetOpenGLGraphicsRequirements(XrSessionManager& xr) {
+    LOG_INFO("Getting OpenGL graphics requirements...");
+
+    PFN_xrGetOpenGLGraphicsRequirementsKHR xrGetOpenGLGraphicsRequirementsKHR = nullptr;
+    XrResult result = xrGetInstanceProcAddr(xr.instance, "xrGetOpenGLGraphicsRequirementsKHR",
+        (PFN_xrVoidFunction*)&xrGetOpenGLGraphicsRequirementsKHR);
+    if (XR_FAILED(result) || !xrGetOpenGLGraphicsRequirementsKHR) {
+        LOG_ERROR("Failed to get xrGetOpenGLGraphicsRequirementsKHR function pointer");
+        return false;
+    }
+
+    XrGraphicsRequirementsOpenGLKHR graphicsReq = {XR_TYPE_GRAPHICS_REQUIREMENTS_OPENGL_KHR};
+    result = xrGetOpenGLGraphicsRequirementsKHR(xr.instance, xr.systemId, &graphicsReq);
+    if (XR_FAILED(result)) {
+        LogXrResult("xrGetOpenGLGraphicsRequirementsKHR", result);
+        return false;
+    }
+
+    LOG_INFO("OpenGL graphics requirements:");
+    LOG_INFO("  Min API version: %d.%d.%d",
+        XR_VERSION_MAJOR(graphicsReq.minApiVersionSupported),
+        XR_VERSION_MINOR(graphicsReq.minApiVersionSupported),
+        XR_VERSION_PATCH(graphicsReq.minApiVersionSupported));
+    LOG_INFO("  Max API version: %d.%d.%d",
+        XR_VERSION_MAJOR(graphicsReq.maxApiVersionSupported),
+        XR_VERSION_MINOR(graphicsReq.maxApiVersionSupported),
+        XR_VERSION_PATCH(graphicsReq.maxApiVersionSupported));
+
+    return true;
+}
+
+bool InitializeOpenXR(XrSessionManager& xr) {
+    LOG_INFO("Querying OpenXR instance extension properties...");
+
+    uint32_t extensionCount = 0;
+    XR_CHECK_LOG(xrEnumerateInstanceExtensionProperties(nullptr, 0, &extensionCount, nullptr));
+
+    std::vector<XrExtensionProperties> extensions(extensionCount, {XR_TYPE_EXTENSION_PROPERTIES});
+    XR_CHECK(xrEnumerateInstanceExtensionProperties(nullptr, extensionCount, &extensionCount, extensions.data()));
+
+    bool hasOpenGL = false;
+    xr.hasSessionTargetExt = false;
+
+    for (const auto& ext : extensions) {
+        LOG_DEBUG("  %s (v%u)", ext.extensionName, ext.extensionVersion);
+        if (strcmp(ext.extensionName, XR_KHR_OPENGL_ENABLE_EXTENSION_NAME) == 0) {
+            hasOpenGL = true;
+        }
+        if (strcmp(ext.extensionName, XR_EXT_SESSION_TARGET_EXTENSION_NAME) == 0) {
+            xr.hasSessionTargetExt = true;
+        }
+    }
+
+    LOG_INFO("XR_KHR_opengl_enable: %s", hasOpenGL ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_EXT_session_target: %s", xr.hasSessionTargetExt ? "AVAILABLE" : "NOT FOUND");
+
+    if (!hasOpenGL) {
+        LOG_ERROR("XR_KHR_opengl_enable extension not available");
+        return false;
+    }
+
+    std::vector<const char*> enabledExtensions;
+    enabledExtensions.push_back(XR_KHR_OPENGL_ENABLE_EXTENSION_NAME);
+    if (xr.hasSessionTargetExt) {
+        enabledExtensions.push_back(XR_EXT_SESSION_TARGET_EXTENSION_NAME);
+    }
+
+    XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
+    strcpy_s(createInfo.applicationInfo.applicationName, "SRCubeOpenXRExtGL");
+    createInfo.applicationInfo.applicationVersion = 1;
+    strcpy_s(createInfo.applicationInfo.engineName, "None");
+    createInfo.applicationInfo.engineVersion = 0;
+    createInfo.applicationInfo.apiVersion = XR_CURRENT_API_VERSION;
+    createInfo.enabledExtensionCount = (uint32_t)enabledExtensions.size();
+    createInfo.enabledExtensionNames = enabledExtensions.data();
+
+    XR_CHECK_LOG(xrCreateInstance(&createInfo, &xr.instance));
+    LOG_INFO("OpenXR instance created");
+
+    XrSystemGetInfo systemInfo = {XR_TYPE_SYSTEM_GET_INFO};
+    systemInfo.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
+    XR_CHECK_LOG(xrGetSystem(xr.instance, &systemInfo, &xr.systemId));
+
+    uint32_t viewCount = 0;
+    XR_CHECK(xrEnumerateViewConfigurationViews(xr.instance, xr.systemId, xr.viewConfigType, 0, &viewCount, nullptr));
+    xr.configViews.resize(viewCount, {XR_TYPE_VIEW_CONFIGURATION_VIEW});
+    XR_CHECK(xrEnumerateViewConfigurationViews(xr.instance, xr.systemId, xr.viewConfigType, viewCount, &viewCount, xr.configViews.data()));
+
+    for (uint32_t i = 0; i < viewCount; i++) {
+        LOG_INFO("  View %u: %ux%u", i,
+            xr.configViews[i].recommendedImageRectWidth,
+            xr.configViews[i].recommendedImageRectHeight);
+    }
+
+    return true;
+}
+
+bool CreateSession(XrSessionManager& xr, HDC hDC, HGLRC hGLRC, HWND hwnd) {
+    LOG_INFO("Creating OpenXR session with OpenGL + XR_EXT_session_target...");
+
+    xr.windowHandle = hwnd;
+
+    XrGraphicsBindingOpenGLWin32KHR glBinding = {XR_TYPE_GRAPHICS_BINDING_OPENGL_WIN32_KHR};
+    glBinding.hDC = hDC;
+    glBinding.hGLRC = hGLRC;
+
+    XrSessionTargetCreateInfoEXT sessionTarget = {XR_TYPE_SESSION_TARGET_CREATE_INFO_EXT};
+    sessionTarget.windowHandle = hwnd;
+
+    if (xr.hasSessionTargetExt && hwnd) {
+        glBinding.next = &sessionTarget;
+        LOG_INFO("Using XR_EXT_session_target with window handle");
+    }
+
+    XrSessionCreateInfo sessionInfo = {XR_TYPE_SESSION_CREATE_INFO};
+    sessionInfo.next = &glBinding;
+    sessionInfo.systemId = xr.systemId;
+
+    XR_CHECK_LOG(xrCreateSession(xr.instance, &sessionInfo, &xr.session));
+    LOG_INFO("Session created: 0x%p", (void*)xr.session);
+
+    return true;
+}

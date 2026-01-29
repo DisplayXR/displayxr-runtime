@@ -28,6 +28,32 @@
         } \
     } while (0)
 
+bool GetD3D11GraphicsRequirements(XrSessionManager& xr, LUID* outAdapterLuid) {
+    LOG_INFO("Getting D3D11 graphics requirements...");
+
+    PFN_xrGetD3D11GraphicsRequirementsKHR xrGetD3D11GraphicsRequirementsKHR = nullptr;
+    XrResult result = xrGetInstanceProcAddr(xr.instance, "xrGetD3D11GraphicsRequirementsKHR",
+        (PFN_xrVoidFunction*)&xrGetD3D11GraphicsRequirementsKHR);
+    if (XR_FAILED(result) || !xrGetD3D11GraphicsRequirementsKHR) {
+        LOG_ERROR("Failed to get xrGetD3D11GraphicsRequirementsKHR function pointer");
+        return false;
+    }
+
+    XrGraphicsRequirementsD3D11KHR graphicsReq = {XR_TYPE_GRAPHICS_REQUIREMENTS_D3D11_KHR};
+    result = xrGetD3D11GraphicsRequirementsKHR(xr.instance, xr.systemId, &graphicsReq);
+    if (XR_FAILED(result)) {
+        LogXrResult("xrGetD3D11GraphicsRequirementsKHR", result);
+        return false;
+    }
+
+    LOG_INFO("D3D11 graphics requirements:");
+    LOG_INFO("  Adapter LUID: 0x%08X%08X", graphicsReq.adapterLuid.HighPart, graphicsReq.adapterLuid.LowPart);
+    LOG_INFO("  Min Feature Level: %d", graphicsReq.minFeatureLevel);
+
+    *outAdapterLuid = graphicsReq.adapterLuid;
+    return true;
+}
+
 bool InitializeOpenXR(XrSessionManager& xr) {
     LOG_INFO("Querying OpenXR instance extension properties...");
 
@@ -105,13 +131,6 @@ bool InitializeOpenXR(XrSessionManager& xr) {
 bool CreateSession(XrSessionManager& xr, ID3D11Device* d3d11Device) {
     LOG_INFO("Creating OpenXR session (Monado creates window)...");
     LOG_INFO("  D3D11 Device: 0x%p", d3d11Device);
-
-    PFN_xrGetD3D11GraphicsRequirementsKHR xrGetD3D11GraphicsRequirementsKHR = nullptr;
-    XR_CHECK_LOG(xrGetInstanceProcAddr(xr.instance, "xrGetD3D11GraphicsRequirementsKHR",
-        (PFN_xrVoidFunction*)&xrGetD3D11GraphicsRequirementsKHR));
-
-    XrGraphicsRequirementsD3D11KHR graphicsReq = {XR_TYPE_GRAPHICS_REQUIREMENTS_D3D11_KHR};
-    XR_CHECK_LOG(xrGetD3D11GraphicsRequirementsKHR(xr.instance, xr.systemId, &graphicsReq));
 
     XrGraphicsBindingD3D11KHR d3d11Binding = {XR_TYPE_GRAPHICS_BINDING_D3D11_KHR};
     d3d11Binding.device = d3d11Device;

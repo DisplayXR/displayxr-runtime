@@ -5,9 +5,12 @@
 # Build from this directory to build all test apps at once
 #
 # Apps:
-#   sr_cube_native     - Native SR SDK (no OpenXR) - requires LeiaSR SDK
-#   sr_cube_openxr     - OpenXR standard mode (Monado creates window)
-#   sr_cube_openxr_ext - OpenXR with XR_EXT_session_target (app creates window)
+#   sr_cube_native         - Native SR SDK (no OpenXR) - requires LeiaSR SDK
+#   sr_cube_openxr         - OpenXR standard mode (Monado creates window)
+#   sr_cube_openxr_ext     - OpenXR with XR_EXT_session_target (app creates window, D3D11)
+#   sr_cube_openxr_ext_d3d12 - D3D12 port of sr_cube_openxr_ext
+#   sr_cube_openxr_ext_gl  - OpenGL port of sr_cube_openxr_ext
+#   sr_cube_openxr_ext_vk  - Vulkan port of sr_cube_openxr_ext (requires Vulkan SDK)
 
 cmake_minimum_required(VERSION 3.21)
 project(test_apps LANGUAGES CXX)
@@ -25,7 +28,10 @@ add_subdirectory(sr_cube_native)
 if(OpenXR_FOUND OR DEFINED OpenXR_ROOT)
     add_subdirectory(sr_cube_openxr)
     add_subdirectory(sr_cube_openxr_ext)
+    add_subdirectory(sr_cube_openxr_ext_d3d12)
+    add_subdirectory(sr_cube_openxr_ext_gl)
+    add_subdirectory(sr_cube_openxr_ext_vk)
 else()
-    message(STATUS "OpenXR not found, skipping sr_cube_openxr and sr_cube_openxr_ext")
+    message(STATUS "OpenXR not found, skipping OpenXR test apps")
     message(STATUS "To build them, set OpenXR_ROOT or install OpenXR SDK")
 endif()

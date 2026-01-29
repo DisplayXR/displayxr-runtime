@@ -162,7 +162,9 @@ static void RenderThreadFunc(
     TextOverlay* textOverlay,
     ComPtr<ID3D11Texture2D> quadStagingTexture,
     ComPtr<ID3D11Texture2D>* depthTextures,
-    ComPtr<ID3D11DepthStencilView>* depthDSVs)
+    ComPtr<ID3D11DepthStencilView>* depthDSVs,
+    std::vector<XrSwapchainImageD3D11KHR>* swapchainImages,
+    std::vector<XrSwapchainImageD3D11KHR>* quadSwapchainImages)
 {
     LOG_INFO("[RenderThread] Started");
 
@@ -218,6 +220,7 @@ static void RenderThreadFunc(
             if (BeginFrame(*xr, frameState)) {
                 XrCompositionLayerProjectionView projectionViews[2] = {};
                 ConvergencePlane convPlane = {};
+                XrView rawViews[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
 
                 if (frameState.shouldRender) {
                     XMMATRIX leftViewMatrix, leftProjMatrix;
@@ -238,7 +241,7 @@ static void RenderThreadFunc(
 
                         XrViewState viewState = {XR_TYPE_VIEW_STATE};
                         uint32_t viewCount = 2;
-                        XrView rawViews[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+                        rawViews[0] = {XR_TYPE_VIEW}; rawViews[1] = {XR_TYPE_VIEW};
                         xrLocateViews(xr->session, &locateInfo, &viewState, 2, &viewCount, rawViews);
 
                         // Compute convergence plane from raw views (physical display surface)
@@ -248,7 +251,7 @@ static void RenderThreadFunc(
                         for (int eye = 0; eye < 2; eye++) {
                             uint32_t imageIndex;
                             if (AcquireSwapchainImage(*xr, eye, imageIndex)) {
-                                ID3D11Texture2D* swapchainTexture = xr->swapchains[eye].images[imageIndex].texture;
+                                ID3D11Texture2D* swapchainTexture = (*swapchainImages)[eye][imageIndex].texture;
 
                                 ID3D11RenderTargetView* rtv = nullptr;
                                 CreateRenderTargetView(*renderer, swapchainTexture, &rtv);
@@ -297,7 +300,7 @@ static void RenderThreadFunc(
                         if (xr->hasQuadLayer) {
                             uint32_t quadImageIndex;
                             if (AcquireQuadSwapchainImage(*xr, quadImageIndex)) {
-                                ID3D11Texture2D* quadTexture = xr->quadSwapchain.images[quadImageIndex].texture;
+                                ID3D11Texture2D* quadTexture = (*quadSwapchainImages)[quadImageIndex].texture;
 
                                 // Use staging texture for D2D rendering
                                 ID3D11Texture2D* textTarget = quadStagingTexture ? quadStagingTexture.Get() : quadTexture;
@@ -346,7 +349,7 @@ static void RenderThreadFunc(
                 // Submit frame with quad layer for UI (anchored to convergence plane)
                 if (convPlane.valid) {
                     float hudW, hudH;
-                    XrPosef hudPose = ComputeHUDPose(convPlane, 0.2f, hudW, hudH);
+                    XrPosef hudPose = ComputeHUDPose(convPlane, 0.2f, rawViews, hudW, hudH);
                     EndFrameWithQuadLayer(*xr, frameState.predictedDisplayTime, projectionViews,
                         hudPose, hudW, hudH);
                 } else {
@@ -494,6 +497,25 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         LOG_INFO("Quad layer created for UI overlay (%ux%u)", QUAD_UI_WIDTH, QUAD_UI_HEIGHT);
     }
 
+    // Enumerate D3D11 swapchain images (now done per-app since common is API-agnostic)
+    std::vector<XrSwapchainImageD3D11KHR> swapchainImages[2];
+    for (int eye = 0; eye < 2; eye++) {
+        uint32_t count = xr.swapchains[eye].imageCount;
+        swapchainImages[eye].resize(count, {XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR});
+        xrEnumerateSwapchainImages(xr.swapchains[eye].swapchain, count, &count,
+            (XrSwapchainImageBaseHeader*)swapchainImages[eye].data());
+        LOG_INFO("Eye %d: enumerated %u D3D11 swapchain images", eye, count);
+    }
+
+    std::vector<XrSwapchainImageD3D11KHR> quadSwapchainImages;
+    if (xr.hasQuadLayer) {
+        uint32_t count = xr.quadSwapchain.imageCount;
+        quadSwapchainImages.resize(count, {XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR});
+        xrEnumerateSwapchainImages(xr.quadSwapchain.swapchain, count, &count,
+            (XrSwapchainImageBaseHeader*)quadSwapchainImages.data());
+        LOG_INFO("Quad layer: enumerated %u D3D11 swapchain images", count);
+    }
+
     // Create staging texture for D2D text rendering.
     // OpenXR swapchain textures are shared resources created by the runtime and
     // Direct2D cannot create a render target on them. We render text to this
@@ -551,7 +573,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     // Launch render thread — the frame loop runs independently of the message pump
     // so that rendering continues even when DefWindowProc blocks during window drag/resize.
     std::thread renderThread(RenderThreadFunc, hwnd, &xr, &renderer, &textOverlay,
-        quadStagingTexture, depthTextures, depthDSVs);
+        quadStagingTexture, depthTextures, depthDSVs, swapchainImages, &quadSwapchainImages);
 
     // Main thread: blocking Win32 message pump.
     // GetMessage blocks efficiently (no CPU spin) until a message arrives.

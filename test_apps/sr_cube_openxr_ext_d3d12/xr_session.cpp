@@ -2,14 +2,13 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  OpenXR session management with XR_EXT_session_target extension
+ * @brief  OpenXR session management for D3D12 with XR_EXT_session_target
  */
 
 #include "xr_session.h"
 #include "logging.h"
 #include <cstring>
 
-// Helper macro for XR error checking with logging
 #define XR_CHECK(call) \
     do { \
         XrResult result = (call); \
@@ -28,27 +27,27 @@
         } \
     } while (0)
 
-bool GetD3D11GraphicsRequirements(XrSessionManager& xr, LUID* outAdapterLuid) {
-    LOG_INFO("Getting D3D11 graphics requirements...");
+bool GetD3D12GraphicsRequirements(XrSessionManager& xr, LUID* outAdapterLuid) {
+    LOG_INFO("Getting D3D12 graphics requirements...");
 
-    PFN_xrGetD3D11GraphicsRequirementsKHR xrGetD3D11GraphicsRequirementsKHR = nullptr;
-    XrResult result = xrGetInstanceProcAddr(xr.instance, "xrGetD3D11GraphicsRequirementsKHR",
-        (PFN_xrVoidFunction*)&xrGetD3D11GraphicsRequirementsKHR);
-    if (XR_FAILED(result) || !xrGetD3D11GraphicsRequirementsKHR) {
-        LOG_ERROR("Failed to get xrGetD3D11GraphicsRequirementsKHR function pointer");
+    PFN_xrGetD3D12GraphicsRequirementsKHR xrGetD3D12GraphicsRequirementsKHR = nullptr;
+    XrResult result = xrGetInstanceProcAddr(xr.instance, "xrGetD3D12GraphicsRequirementsKHR",
+        (PFN_xrVoidFunction*)&xrGetD3D12GraphicsRequirementsKHR);
+    if (XR_FAILED(result) || !xrGetD3D12GraphicsRequirementsKHR) {
+        LOG_ERROR("Failed to get xrGetD3D12GraphicsRequirementsKHR function pointer");
         return false;
     }
 
-    XrGraphicsRequirementsD3D11KHR graphicsReq = {XR_TYPE_GRAPHICS_REQUIREMENTS_D3D11_KHR};
-    result = xrGetD3D11GraphicsRequirementsKHR(xr.instance, xr.systemId, &graphicsReq);
+    XrGraphicsRequirementsD3D12KHR graphicsReq = {XR_TYPE_GRAPHICS_REQUIREMENTS_D3D12_KHR};
+    result = xrGetD3D12GraphicsRequirementsKHR(xr.instance, xr.systemId, &graphicsReq);
     if (XR_FAILED(result)) {
-        LogXrResult("xrGetD3D11GraphicsRequirementsKHR", result);
+        LogXrResult("xrGetD3D12GraphicsRequirementsKHR", result);
         return false;
     }
 
-    LOG_INFO("D3D11 graphics requirements:");
+    LOG_INFO("D3D12 graphics requirements:");
     LOG_INFO("  Adapter LUID: 0x%08X%08X", graphicsReq.adapterLuid.HighPart, graphicsReq.adapterLuid.LowPart);
-    LOG_INFO("  Min Feature Level: %d", graphicsReq.minFeatureLevel);
+    LOG_INFO("  Min Feature Level: 0x%X", graphicsReq.minFeatureLevel);
 
     *outAdapterLuid = graphicsReq.adapterLuid;
     return true;
@@ -57,7 +56,6 @@ bool GetD3D11GraphicsRequirements(XrSessionManager& xr, LUID* outAdapterLuid) {
 bool InitializeOpenXR(XrSessionManager& xr) {
     LOG_INFO("Querying OpenXR instance extension properties...");
 
-    // Query available extensions
     uint32_t extensionCount = 0;
     XR_CHECK_LOG(xrEnumerateInstanceExtensionProperties(nullptr, 0, &extensionCount, nullptr));
     LOG_INFO("Found %u extensions available", extensionCount);
@@ -65,37 +63,30 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     std::vector<XrExtensionProperties> extensions(extensionCount, {XR_TYPE_EXTENSION_PROPERTIES});
     XR_CHECK(xrEnumerateInstanceExtensionProperties(nullptr, extensionCount, &extensionCount, extensions.data()));
 
-    // Log all extensions and check for required ones
     LOG_INFO("Available extensions:");
-    bool hasD3D11 = false;
+    bool hasD3D12 = false;
     xr.hasSessionTargetExt = false;
 
     for (const auto& ext : extensions) {
         LOG_DEBUG("  %s (v%u)", ext.extensionName, ext.extensionVersion);
-        if (strcmp(ext.extensionName, XR_KHR_D3D11_ENABLE_EXTENSION_NAME) == 0) {
-            hasD3D11 = true;
+        if (strcmp(ext.extensionName, XR_KHR_D3D12_ENABLE_EXTENSION_NAME) == 0) {
+            hasD3D12 = true;
         }
         if (strcmp(ext.extensionName, XR_EXT_SESSION_TARGET_EXTENSION_NAME) == 0) {
             xr.hasSessionTargetExt = true;
         }
     }
 
-    LOG_INFO("XR_KHR_D3D11_enable: %s", hasD3D11 ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_KHR_D3D12_enable: %s", hasD3D12 ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_EXT_session_target: %s", xr.hasSessionTargetExt ? "AVAILABLE" : "NOT FOUND");
 
-    if (!hasD3D11) {
-        LOG_ERROR("XR_KHR_D3D11_enable extension not available - cannot continue");
+    if (!hasD3D12) {
+        LOG_ERROR("XR_KHR_D3D12_enable extension not available - cannot continue");
         return false;
     }
 
-    if (!xr.hasSessionTargetExt) {
-        LOG_WARN("XR_EXT_session_target extension not available - window targeting disabled");
-        LOG_WARN("The runtime will create its own window instead of using the app window");
-    }
-
-    // Build list of extensions to enable
     std::vector<const char*> enabledExtensions;
-    enabledExtensions.push_back(XR_KHR_D3D11_ENABLE_EXTENSION_NAME);
+    enabledExtensions.push_back(XR_KHR_D3D12_ENABLE_EXTENSION_NAME);
     if (xr.hasSessionTargetExt) {
         enabledExtensions.push_back(XR_EXT_SESSION_TARGET_EXTENSION_NAME);
     }
@@ -105,10 +96,9 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         LOG_INFO("  %s", ext);
     }
 
-    // Create instance
     LOG_INFO("Creating OpenXR instance...");
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
-    strcpy_s(createInfo.applicationInfo.applicationName, "SRCubeOpenXRExt");
+    strcpy_s(createInfo.applicationInfo.applicationName, "SRCubeOpenXRExtD3D12");
     createInfo.applicationInfo.applicationVersion = 1;
     strcpy_s(createInfo.applicationInfo.engineName, "None");
     createInfo.applicationInfo.engineVersion = 0;
@@ -116,22 +106,15 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     createInfo.enabledExtensionCount = (uint32_t)enabledExtensions.size();
     createInfo.enabledExtensionNames = enabledExtensions.data();
 
-    LOG_INFO("OpenXR API version: %d.%d.%d",
-        XR_VERSION_MAJOR(XR_CURRENT_API_VERSION),
-        XR_VERSION_MINOR(XR_CURRENT_API_VERSION),
-        XR_VERSION_PATCH(XR_CURRENT_API_VERSION));
-
     XR_CHECK_LOG(xrCreateInstance(&createInfo, &xr.instance));
     LOG_INFO("OpenXR instance created: 0x%p", (void*)xr.instance);
 
-    // Get system for HMD
     LOG_INFO("Getting system for HMD form factor...");
     XrSystemGetInfo systemInfo = {XR_TYPE_SYSTEM_GET_INFO};
     systemInfo.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
     XR_CHECK_LOG(xrGetSystem(xr.instance, &systemInfo, &xr.systemId));
     LOG_INFO("System ID: %llu", (unsigned long long)xr.systemId);
 
-    // Get view configuration views
     LOG_INFO("Enumerating view configuration views...");
     uint32_t viewCount = 0;
     XR_CHECK(xrEnumerateViewConfigurationViews(xr.instance, xr.systemId, xr.viewConfigType, 0, &viewCount, nullptr));
@@ -152,34 +135,31 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     return true;
 }
 
-bool CreateSession(XrSessionManager& xr, ID3D11Device* d3d11Device, HWND hwnd) {
-    LOG_INFO("Creating OpenXR session with XR_EXT_session_target...");
-    LOG_INFO("  D3D11 Device: 0x%p", d3d11Device);
+bool CreateSession(XrSessionManager& xr, ID3D12Device* device, ID3D12CommandQueue* queue, HWND hwnd) {
+    LOG_INFO("Creating OpenXR session with D3D12 + XR_EXT_session_target...");
+    LOG_INFO("  D3D12 Device: 0x%p", device);
+    LOG_INFO("  Command Queue: 0x%p", queue);
     LOG_INFO("  Window handle (HWND): 0x%p", hwnd);
 
     xr.windowHandle = hwnd;
 
-    // D3D11 binding is required
-    XrGraphicsBindingD3D11KHR d3d11Binding = {XR_TYPE_GRAPHICS_BINDING_D3D11_KHR};
-    d3d11Binding.device = d3d11Device;
+    XrGraphicsBindingD3D12KHR d3d12Binding = {XR_TYPE_GRAPHICS_BINDING_D3D12_KHR};
+    d3d12Binding.device = device;
+    d3d12Binding.queue = queue;
 
-    // Session target extension - chain it to the D3D11 binding
     XrSessionTargetCreateInfoEXT sessionTarget = {XR_TYPE_SESSION_TARGET_CREATE_INFO_EXT};
     sessionTarget.windowHandle = hwnd;
 
     if (xr.hasSessionTargetExt && hwnd) {
-        // Chain: sessionInfo -> d3d11Binding -> sessionTarget
-        d3d11Binding.next = &sessionTarget;
+        d3d12Binding.next = &sessionTarget;
         LOG_INFO("Using XR_EXT_session_target with window handle");
-        LOG_INFO("  Chain: XrSessionCreateInfo -> XrGraphicsBindingD3D11KHR -> XrSessionTargetCreateInfoEXT");
     } else {
         LOG_WARN("NOT using XR_EXT_session_target (hasExt=%d, hwnd=%p)",
             xr.hasSessionTargetExt, hwnd);
-        LOG_WARN("Runtime will create its own window for rendering");
     }
 
     XrSessionCreateInfo sessionInfo = {XR_TYPE_SESSION_CREATE_INFO};
-    sessionInfo.next = &d3d11Binding;
+    sessionInfo.next = &d3d12Binding;
     sessionInfo.systemId = xr.systemId;
 
     LOG_INFO("Calling xrCreateSession...");
