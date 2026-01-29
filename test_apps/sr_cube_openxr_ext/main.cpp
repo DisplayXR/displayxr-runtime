@@ -269,6 +269,30 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         LOG_INFO("Quad layer created for UI overlay (%ux%u)", QUAD_UI_WIDTH, QUAD_UI_HEIGHT);
     }
 
+    // Create staging texture for D2D text rendering.
+    // OpenXR swapchain textures are shared resources created by the runtime and
+    // Direct2D cannot create a render target on them. We render text to this
+    // app-owned staging texture, then CopyResource to the swapchain texture.
+    ComPtr<ID3D11Texture2D> quadStagingTexture;
+    if (xr.hasQuadLayer) {
+        D3D11_TEXTURE2D_DESC stagingDesc = {};
+        stagingDesc.Width = QUAD_UI_WIDTH;
+        stagingDesc.Height = QUAD_UI_HEIGHT;
+        stagingDesc.MipLevels = 1;
+        stagingDesc.ArraySize = 1;
+        stagingDesc.Format = (DXGI_FORMAT)xr.quadSwapchain.format;
+        stagingDesc.SampleDesc.Count = 1;
+        stagingDesc.Usage = D3D11_USAGE_DEFAULT;
+        stagingDesc.BindFlags = D3D11_BIND_RENDER_TARGET;
+
+        HRESULT hr = renderer.device->CreateTexture2D(&stagingDesc, nullptr, &quadStagingTexture);
+        if (FAILED(hr)) {
+            LOG_WARN("Failed to create quad staging texture: 0x%08X", hr);
+        } else {
+            LOG_INFO("Quad staging texture created for D2D text rendering");
+        }
+    }
+
     // Show window
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
@@ -414,35 +438,45 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                             if (AcquireQuadSwapchainImage(xr, quadImageIndex)) {
                                 ID3D11Texture2D* quadTexture = xr.quadSwapchain.images[quadImageIndex].texture;
 
-                                // Clear the quad texture with transparent background
+                                // Use staging texture for D2D rendering (D2D cannot render
+                                // to OpenXR swapchain textures which are shared resources).
+                                // Fall back to direct rendering if staging wasn't created.
+                                ID3D11Texture2D* textTarget = quadStagingTexture ? quadStagingTexture.Get() : quadTexture;
+
+                                // Clear with semi-transparent black background
                                 ID3D11RenderTargetView* quadRtv = nullptr;
-                                CreateRenderTargetView(renderer, quadTexture, &quadRtv);
+                                CreateRenderTargetView(renderer, textTarget, &quadRtv);
                                 if (quadRtv) {
-                                    float clearColor[4] = {0.0f, 0.0f, 0.0f, 0.7f};  // Semi-transparent black
+                                    float clearColor[4] = {0.0f, 0.0f, 0.0f, 0.7f};
                                     renderer.context->ClearRenderTargetView(quadRtv, clearColor);
                                     quadRtv->Release();
                                 }
 
-                                // Render text to quad
+                                // Render text to staging texture
                                 std::wstring stateText = L"Session: ";
                                 stateText += FormatSessionState((int)xr.sessionState);
-                                RenderText(textOverlay, renderer.device.Get(), quadTexture,
+                                RenderText(textOverlay, renderer.device.Get(), textTarget,
                                     stateText, 10, 10, 300, 30);
 
                                 std::wstring extText = xr.hasSessionTargetExt ?
                                     L"XR_EXT_session_target: ACTIVE" :
                                     L"XR_EXT_session_target: NOT AVAILABLE";
-                                RenderText(textOverlay, renderer.device.Get(), quadTexture,
+                                RenderText(textOverlay, renderer.device.Get(), textTarget,
                                     extText, 10, 45, 350, 30, true);
 
                                 std::wstring perfText = FormatPerformanceInfo(perfStats.fps, perfStats.frameTimeMs,
                                     xr.swapchains[0].width, xr.swapchains[0].height);
-                                RenderText(textOverlay, renderer.device.Get(), quadTexture,
+                                RenderText(textOverlay, renderer.device.Get(), textTarget,
                                     perfText, 10, 85, 300, 70, true);
 
                                 std::wstring eyeText = FormatEyeTrackingInfo(xr.eyePosX, xr.eyePosY, xr.eyePosZ, xr.eyeTrackingActive);
-                                RenderText(textOverlay, renderer.device.Get(), quadTexture,
+                                RenderText(textOverlay, renderer.device.Get(), textTarget,
                                     eyeText, 10, 165, 300, 70, true);
+
+                                // Copy staging texture to swapchain
+                                if (quadStagingTexture) {
+                                    renderer.context->CopyResource(quadTexture, quadStagingTexture.Get());
+                                }
 
                                 ReleaseQuadSwapchainImage(xr);
                             }
@@ -450,12 +484,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                     }
                 }
 
-                // Submit frame with quad layer for UI
-                // Quad positioned at: X=left side (-0.15m), Y=bottom (-0.08m), Z=0.5m in front
+                // Submit frame with quad layer for UI (HUD in VIEW space)
+                // Quad positioned at: X=left side (-0.15m), Y=top (+0.08m), Z=0.5m in front
                 // Size: 0.3m wide x 0.15m tall
                 EndFrameWithQuadLayer(xr, frameState.predictedDisplayTime, projectionViews,
-                    -0.15f, -0.08f, -0.5f,  // position (left, down, forward)
-                    0.3f, 0.15f);           // size (width, height in meters)
+                    -0.15f, 0.08f, -0.65f,  // position (left, up, forward) - top-left HUD
+                    0.3f, 0.15f);            // size (width, height in meters)
             }
         } else {
             Sleep(100);

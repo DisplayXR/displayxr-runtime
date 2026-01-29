@@ -159,7 +159,7 @@ Ask Gemini to analyze code and produce a read-only report. Automatically gathers
 - Constructs detailed prompts with READ-ONLY instructions
 - Displays Gemini's analysis report
 
-**Skill location:** `.claude/skills/ask-gemini/SKILL.md`
+**Skill location:** `~/.claude/skills/ask-gemini/SKILL.md` (user-level, available across all projects)
 
 ## Debug Logs
 use U_LOG_W (WARN) instead of U_LOG_I (INFO) for logs to make sure they are not filtered 

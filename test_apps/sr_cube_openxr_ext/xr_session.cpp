@@ -345,16 +345,26 @@ bool CreateQuadLayerSwapchain(XrSessionManager& xr, uint32_t width, uint32_t hei
     std::vector<int64_t> formats(formatCount);
     XR_CHECK(xrEnumerateSwapchainFormats(xr.session, formatCount, &formatCount, formats.data()));
 
-    // Prefer RGBA format with alpha for UI overlay
+    // Prefer B8G8R8A8 for Direct2D text rendering compatibility (D2D 1.0 requires B8G8R8A8)
     int64_t selectedFormat = formats[0];
+    bool foundPreferred = false;
     for (int64_t format : formats) {
-        if (format == DXGI_FORMAT_R8G8B8A8_UNORM ||
-            format == DXGI_FORMAT_B8G8R8A8_UNORM) {
+        if (format == DXGI_FORMAT_B8G8R8A8_UNORM) {
             selectedFormat = format;
+            foundPreferred = true;
             break;
         }
     }
-    LOG_INFO("Selected quad swapchain format: %lld (0x%llX)", selectedFormat, selectedFormat);
+    if (!foundPreferred) {
+        for (int64_t format : formats) {
+            if (format == DXGI_FORMAT_R8G8B8A8_UNORM) {
+                selectedFormat = format;
+                break;
+            }
+        }
+    }
+    LOG_INFO("Selected quad swapchain format: %lld (0x%llX)%s", selectedFormat, selectedFormat,
+             foundPreferred ? " (B8G8R8A8 - D2D compatible)" : " (fallback)");
 
     XrSwapchainCreateInfo swapchainInfo = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
     swapchainInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
@@ -594,7 +604,9 @@ bool EndFrameWithQuadLayer(
 
     // Position the quad in front of the viewer (in VIEW space)
     quadLayer.pose.position = {quadPosX, quadPosY, quadPosZ};
-    quadLayer.pose.orientation = {0.0f, 0.0f, 0.0f, 1.0f};  // Identity quaternion
+    // Rotate 180° around Y axis so the quad's front face (-Z) points toward the viewer (+Z).
+    // Without this, the front face points away from the viewer and text appears mirror-flipped.
+    quadLayer.pose.orientation = {0.0f, 1.0f, 0.0f, 0.0f};
 
     // Size of the quad in meters
     quadLayer.size = {quadWidth, quadHeight};
