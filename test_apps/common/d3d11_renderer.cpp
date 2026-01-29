@@ -484,9 +484,12 @@ static void UpdateConstantBuffer(D3D11Renderer& renderer, const XMMATRIX& wvp, c
     HRESULT hr = renderer.context->Map(renderer.constantBuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
     if (SUCCEEDED(hr)) {
         ConstantBufferData* cb = (ConstantBufferData*)mapped.pData;
-        // NOTE: No transpose! Shader uses mul(matrix, vector) which expects column-major.
-        // XMMATRIX is row-major but HLSL interprets cbuffer as column-major, so this works correctly.
-        XMStoreFloat4x4(&cb->worldViewProj, wvp);
+        // Transpose: XMMATRIX is row-major, but shader uses mul(matrix, vector) which
+        // expects column-major. HLSL interprets cbuffer as column-major by default,
+        // so transposing converts row-major XMMATRIX to column-major for HLSL.
+        // NOTE: RenderCubeWithMVP (used by native SR app) does NOT transpose because
+        // mat4f is already column-major.
+        XMStoreFloat4x4(&cb->worldViewProj, XMMatrixTranspose(wvp));
         cb->color = color;
         renderer.context->Unmap(renderer.constantBuffer.Get(), 0);
     }
