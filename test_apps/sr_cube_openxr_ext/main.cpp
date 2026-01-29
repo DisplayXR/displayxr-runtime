@@ -358,6 +358,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             XrFrameState frameState;
             if (BeginFrame(xr, frameState)) {
                 XrCompositionLayerProjectionView projectionViews[2] = {};
+                ConvergencePlane convPlane = {};
 
                 if (frameState.shouldRender) {
                     XMMATRIX leftViewMatrix, leftProjMatrix;
@@ -368,6 +369,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                         rightViewMatrix, rightProjMatrix,
                         g_inputState.cameraPosX, g_inputState.cameraPosY, g_inputState.cameraPosZ,
                         g_inputState.yaw, g_inputState.pitch)) {
+
+                        // Get raw view poses (pre-player-transform) for projection views
+                        // and convergence plane computation
+                        XrViewLocateInfo locateInfo = {XR_TYPE_VIEW_LOCATE_INFO};
+                        locateInfo.viewConfigurationType = xr.viewConfigType;
+                        locateInfo.displayTime = frameState.predictedDisplayTime;
+                        locateInfo.space = xr.localSpace;
+
+                        XrViewState viewState = {XR_TYPE_VIEW_STATE};
+                        uint32_t viewCount = 2;
+                        XrView rawViews[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+                        xrLocateViews(xr.session, &locateInfo, &viewState, 2, &viewCount, rawViews);
+
+                        // Compute convergence plane from raw views (physical display surface)
+                        convPlane = LocateConvergencePlane(rawViews);
 
                         // Render each eye (3D scene only - no UI)
                         for (int eye = 0; eye < 2; eye++) {
@@ -417,19 +433,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                                 };
                                 projectionViews[eye].subImage.imageArrayIndex = 0;
 
-                                // Get pose from views
-                                XrViewLocateInfo locateInfo = {XR_TYPE_VIEW_LOCATE_INFO};
-                                locateInfo.viewConfigurationType = xr.viewConfigType;
-                                locateInfo.displayTime = frameState.predictedDisplayTime;
-                                locateInfo.space = xr.localSpace;
-
-                                XrViewState viewState = {XR_TYPE_VIEW_STATE};
-                                uint32_t viewCount = 2;
-                                XrView views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
-                                xrLocateViews(xr.session, &locateInfo, &viewState, 2, &viewCount, views);
-
-                                projectionViews[eye].pose = views[eye].pose;
-                                projectionViews[eye].fov = views[eye].fov;
+                                projectionViews[eye].pose = rawViews[eye].pose;
+                                projectionViews[eye].fov = rawViews[eye].fov;
                             }
                         }
 
@@ -485,12 +490,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                     }
                 }
 
-                // Submit frame with quad layer for UI (HUD in VIEW space)
-                // Quad positioned at: X=left side (-0.15m), Y=top (+0.08m), Z=0.5m in front
-                // Size: 0.3m wide x 0.15m tall
-                EndFrameWithQuadLayer(xr, frameState.predictedDisplayTime, projectionViews,
-                    -0.15f, 0.08f, -0.65f,  // position (left, up, forward) - top-left HUD
-                    0.3f, 0.15f);            // size (width, height in meters)
+                // Submit frame with quad layer for UI (anchored to convergence plane)
+                if (convPlane.valid) {
+                    float hudW, hudH;
+                    XrPosef hudPose = ComputeHUDPose(convPlane, 0.2f, hudW, hudH);
+                    EndFrameWithQuadLayer(xr, frameState.predictedDisplayTime, projectionViews,
+                        hudPose, hudW, hudH);
+                } else {
+                    // Fallback: skip quad layer, submit projection only
+                    EndFrame(xr, frameState.predictedDisplayTime, projectionViews);
+                }
             }
         } else {
             Sleep(100);

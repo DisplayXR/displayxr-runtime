@@ -477,11 +477,132 @@ bool EndFrame(XrSessionManager& xr, XrTime displayTime, const XrCompositionLayer
     return XR_SUCCEEDED(xrEndFrame(xr.session, &endInfo));
 }
 
+ConvergencePlane LocateConvergencePlane(const XrView views[2]) {
+    ConvergencePlane result = {};
+    result.valid = false;
+
+    // FOV tan angles (positive magnitudes) for each eye
+    // Left eye = views[0], Right eye = views[1]
+    float u0 = tanf(views[0].fov.angleUp);
+    float d0 = -tanf(views[0].fov.angleDown);   // positive magnitude
+    float r0 = tanf(views[0].fov.angleRight);
+    float l0 = -tanf(views[0].fov.angleLeft);    // positive magnitude
+
+    float u1 = tanf(views[1].fov.angleUp);
+    float d1 = -tanf(views[1].fov.angleDown);
+    float r1 = tanf(views[1].fov.angleRight);
+    float l1 = -tanf(views[1].fov.angleLeft);
+
+    // Camera-local frame: use the left eye orientation as the reference frame.
+    // Transform both eye positions into this frame via inverse left eye quaternion.
+    XMVECTOR leftQuat = XMVectorSet(
+        views[0].pose.orientation.x, views[0].pose.orientation.y,
+        views[0].pose.orientation.z, views[0].pose.orientation.w);
+    XMVECTOR invLeftQuat = XMQuaternionInverse(leftQuat);
+
+    // Eye midpoint in world space
+    XMVECTOR leftPos = XMVectorSet(
+        views[0].pose.position.x, views[0].pose.position.y,
+        views[0].pose.position.z, 0.0f);
+    XMVECTOR rightPos = XMVectorSet(
+        views[1].pose.position.x, views[1].pose.position.y,
+        views[1].pose.position.z, 0.0f);
+    XMVECTOR midpoint = XMVectorScale(XMVectorAdd(leftPos, rightPos), 0.5f);
+
+    // Transform eye positions into the left-eye-aligned local frame
+    XMVECTOR localLeft = XMVector3Rotate(XMVectorSubtract(leftPos, midpoint), invLeftQuat);
+    XMVECTOR localRight = XMVector3Rotate(XMVectorSubtract(rightPos, midpoint), invLeftQuat);
+
+    XMFLOAT3 lp, rp;
+    XMStoreFloat3(&lp, localLeft);
+    XMStoreFloat3(&rp, localRight);
+
+    float x0 = lp.x, y0 = lp.y, z0 = lp.z;
+    float x1 = rp.x, y1 = rp.y, z1 = rp.z;
+
+    // Compute display center Z from frustum intersection
+    // denomX = (r1 - l1) - (r0 - l0)  (difference in horizontal FOV widths)
+    float denomX = (r1 - l1) - (r0 - l0);
+    if (fabsf(denomX) < 0.0001f) {
+        // Symmetric or degenerate FOVs - cannot compute convergence plane
+        return result;
+    }
+
+    float zd = (2.0f * (x1 - x0) + z1 * (r1 - l1) - z0 * (r0 - l0)) / denomX;
+    float xd = x0 - (r0 - l0) * (zd - z0) / 2.0f;
+    float yd = y0 - (u0 - d0) * (zd - z0) / 2.0f;
+
+    // Display size
+    float W = fabsf((z0 - zd) * (l0 + r0));
+    float H = fabsf((z0 - zd) * (u0 + d0));
+
+    if (W < 0.001f || H < 0.001f) {
+        return result;
+    }
+
+    // Transform display center back to LOCAL (world) space
+    XMVECTOR localCenter = XMVectorSet(xd, yd, zd, 0.0f);
+    XMVECTOR worldCenter = XMVectorAdd(XMVector3Rotate(localCenter, leftQuat), midpoint);
+
+    XMFLOAT3 wc;
+    XMStoreFloat3(&wc, worldCenter);
+
+    result.pose.position = {wc.x, wc.y, wc.z};
+    // Orientation matches the left eye orientation (camera-aligned)
+    result.pose.orientation = views[0].pose.orientation;
+    result.width = W;
+    result.height = H;
+    result.valid = true;
+
+    return result;
+}
+
+XrPosef ComputeHUDPose(
+    const ConvergencePlane& plane,
+    float coverageFraction,
+    float& outWidth, float& outHeight
+) {
+    outWidth = coverageFraction * plane.width;
+    outHeight = coverageFraction * plane.height;
+
+    // HUD center in plane-local coords (plane center is origin):
+    // Left edge of plane: -W/2, right edge: +W/2
+    // Top edge of plane:  +H/2, bottom edge: -H/2
+    // HUD is at top-left, so:
+    //   x = -W/2 + hudWidth/2  = -0.5*W + 0.5*coverageFraction*W = W*(-0.5 + 0.5*cf)
+    //   y = +H/2 - hudHeight/2 = +0.5*H - 0.5*coverageFraction*H = H*(+0.5 - 0.5*cf)
+    //   z = 0 (on the plane)
+    float localX = plane.width * (-0.5f + 0.5f * coverageFraction);
+    float localY = plane.height * (0.5f - 0.5f * coverageFraction);
+    float localZ = 0.0f;
+
+    // Rotate local offset by the plane's orientation to get world offset
+    XMVECTOR planeQuat = XMVectorSet(
+        plane.pose.orientation.x, plane.pose.orientation.y,
+        plane.pose.orientation.z, plane.pose.orientation.w);
+    XMVECTOR localOffset = XMVectorSet(localX, localY, localZ, 0.0f);
+    XMVECTOR worldOffset = XMVector3Rotate(localOffset, planeQuat);
+
+    XMVECTOR planeCenter = XMVectorSet(
+        plane.pose.position.x, plane.pose.position.y,
+        plane.pose.position.z, 0.0f);
+    XMVECTOR hudCenter = XMVectorAdd(planeCenter, worldOffset);
+
+    XMFLOAT3 hc;
+    XMStoreFloat3(&hc, hudCenter);
+
+    XrPosef hudPose;
+    hudPose.position = {hc.x, hc.y, hc.z};
+    hudPose.orientation = plane.pose.orientation;  // Same orientation as convergence plane
+
+    return hudPose;
+}
+
 bool EndFrameWithQuadLayer(
     XrSessionManager& xr,
     XrTime displayTime,
     const XrCompositionLayerProjectionView* projViews,
-    float quadPosX, float quadPosY, float quadPosZ,
+    const XrPosef& quadPose,
     float quadWidth, float quadHeight
 ) {
     // Projection layer for the 3D scene
@@ -490,10 +611,10 @@ bool EndFrameWithQuadLayer(
     projectionLayer.viewCount = 2;
     projectionLayer.views = projViews;
 
-    // Quad layer for UI overlay - positioned in VIEW space (head-locked)
+    // Quad layer for UI overlay - positioned in LOCAL space (convergence plane anchored)
     XrCompositionLayerQuad quadLayer = {XR_TYPE_COMPOSITION_LAYER_QUAD};
     quadLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
-    quadLayer.space = xr.viewSpace;  // VIEW space = head-locked
+    quadLayer.space = xr.localSpace;  // LOCAL space = anchored to physical display
     quadLayer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
     quadLayer.subImage.swapchain = xr.quadSwapchain.swapchain;
     quadLayer.subImage.imageRect.offset = {0, 0};
@@ -503,9 +624,8 @@ bool EndFrameWithQuadLayer(
     };
     quadLayer.subImage.imageArrayIndex = 0;
 
-    // Position the quad in front of the viewer (in VIEW space)
-    quadLayer.pose.position = {quadPosX, quadPosY, quadPosZ};
-    quadLayer.pose.orientation = {0.0f, 0.0f, 0.0f, 1.0f};  // Identity
+    // Position the quad at the computed pose (in LOCAL space)
+    quadLayer.pose = quadPose;
 
     // Size of the quad in meters
     quadLayer.size = {quadWidth, quadHeight};

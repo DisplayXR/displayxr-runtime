@@ -27,6 +27,13 @@
 #include <vector>
 #include <string>
 
+struct ConvergencePlane {
+    XrPosef pose;    // center position + orientation in LOCAL space
+    float width;     // meters
+    float height;    // meters
+    bool valid;
+};
+
 struct SwapchainInfo {
     XrSwapchain swapchain = XR_NULL_HANDLE;
     int64_t format = 0;
@@ -128,12 +135,25 @@ bool ReleaseSwapchainImage(XrSessionManager& xr, int eye);
 // End frame and submit layers (projection layer only)
 bool EndFrame(XrSessionManager& xr, XrTime displayTime, const XrCompositionLayerProjectionView* views);
 
+// Compute the convergence plane (virtual display surface) from two stereo XrViews.
+// The convergence plane is derived from the intersection of the asymmetric frustums
+// of the two eyes, representing the physical display surface in LOCAL space.
+ConvergencePlane LocateConvergencePlane(const XrView views[2]);
+
+// Compute the HUD quad pose anchored to the top-left region of the convergence plane.
+// coverageFraction controls how much of the display the HUD covers (0.2 = 20%).
+// Returns the pose and writes the HUD dimensions to outWidth/outHeight.
+XrPosef ComputeHUDPose(
+    const ConvergencePlane& plane,
+    float coverageFraction,
+    float& outWidth, float& outHeight);
+
 // End frame with projection layer and quad layer for UI
 bool EndFrameWithQuadLayer(
     XrSessionManager& xr,
     XrTime displayTime,
     const XrCompositionLayerProjectionView* projViews,
-    float quadPosX, float quadPosY, float quadPosZ,
+    const XrPosef& quadPose,
     float quadWidth, float quadHeight
 );
 
