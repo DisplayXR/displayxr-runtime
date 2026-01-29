@@ -32,6 +32,7 @@
 #include "xrt/xrt_device.h"
 
 
+#include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
 
@@ -555,14 +556,15 @@ null_compositor_request_display_refresh_rate(struct xrt_compositor *xc, float di
 xrt_result_t
 null_compositor_create_system(struct xrt_device *xdev, struct xrt_system_compositor **out_xsysc)
 {
-	// Use default dimensions (0, 0)
-	return null_compositor_create_system_with_dims(xdev, 0, 0, out_xsysc);
+	// Use default dimensions (0, 0) and default refresh rate (0 = 20 FPS)
+	return null_compositor_create_system_with_dims(xdev, 0, 0, 0.0f, out_xsysc);
 }
 
 xrt_result_t
 null_compositor_create_system_with_dims(struct xrt_device *xdev,
                                          uint32_t recommended_width,
                                          uint32_t recommended_height,
+                                         float refresh_rate_hz,
                                          struct xrt_system_compositor **out_xsysc)
 {
 	struct null_compositor *c = U_TYPED_CALLOC(struct null_compositor);
@@ -581,7 +583,15 @@ null_compositor_create_system_with_dims(struct xrt_device *xdev,
 	c->settings.log_level = debug_get_log_option_log();
 	c->frame.waited.id = -1;
 	c->frame.rendering.id = -1;
-	c->settings.frame_interval_ns = U_TIME_1S_IN_NS / 20; // 20 FPS
+
+	// Use provided refresh rate or fall back to 20 FPS default
+	if (refresh_rate_hz > 0.0f) {
+		c->settings.frame_interval_ns = (uint64_t)(U_TIME_1S_IN_NS / (double)refresh_rate_hz);
+		NULL_INFO(c, "Using display refresh rate: %.0f Hz (interval: %" PRIu64 " ns)",
+		          refresh_rate_hz, c->settings.frame_interval_ns);
+	} else {
+		c->settings.frame_interval_ns = U_TIME_1S_IN_NS / 20; // 20 FPS default
+	}
 	c->xdev = xdev;
 
 	// Store custom recommended dimensions (0 = use defaults)

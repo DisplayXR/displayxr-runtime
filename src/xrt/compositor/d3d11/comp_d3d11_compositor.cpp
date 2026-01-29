@@ -24,7 +24,6 @@
 #include "util/u_logging.h"
 #include "util/u_misc.h"
 #include "util/u_time.h"
-#include "util/u_pacing.h"
 #include "os/os_time.h"
 
 #ifdef XRT_FEATURE_DEBUG_GUI
@@ -99,9 +98,6 @@ struct comp_d3d11_compositor
 	//! Debug readback module.
 	struct comp_d3d11_debug *debug;
 #endif
-
-	//! Frame pacing helper.
-	struct u_pacing_compositor *upc;
 
 	//! Current frame ID.
 	int64_t frame_id;
@@ -660,10 +656,6 @@ d3d11_compositor_destroy(struct xrt_compositor *xc)
 		comp_d3d11_target_destroy(&c->target);
 	}
 
-	if (c->upc != nullptr) {
-		u_pc_destroy(&c->upc);
-	}
-
 	if (c->dxgi_factory != nullptr) {
 		c->dxgi_factory->Release();
 	}
@@ -905,9 +897,6 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 
 	// Initialize layer accumulator - just zero it
 	memset(&c->layer_accum, 0, sizeof(c->layer_accum));
-
-	// Create frame pacing
-	u_pc_display_timing_create(c->settings.nominal_frame_interval_ns, &U_PC_DISPLAY_TIMING_CONFIG_DEFAULT, &c->upc);
 
 	// Populate supported swapchain formats (DXGI formats for D3D11)
 	// These are the common formats that D3D11 applications can use

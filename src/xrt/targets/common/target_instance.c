@@ -130,18 +130,22 @@ t_instance_create_system(struct xrt_instance *xinst,
 	if (use_null) {
 		uint32_t sr_rec_width = 0;
 		uint32_t sr_rec_height = 0;
+		float sr_refresh_rate_hz = 0.0f;
 
 #ifdef XRT_HAVE_LEIA_SR
-		// Query SR display for recommended view dimensions
-		// This ensures apps create properly-sized swapchains for SR displays
-		if (leiasr_query_recommended_view_dimensions(5.0, &sr_rec_width, &sr_rec_height)) {
-			U_LOG_I("Using SR recommended view dimensions: %ux%u per eye", sr_rec_width, sr_rec_height);
+		// Query SR display for recommended view dimensions and refresh rate
+		// This ensures apps create properly-sized swapchains and correct frame pacing
+		if (leiasr_query_recommended_view_dimensions(5.0, &sr_rec_width, &sr_rec_height,
+		                                             &sr_refresh_rate_hz)) {
+			U_LOG_I("Using SR recommended view dimensions: %ux%u per eye, %.0f Hz", sr_rec_width,
+			        sr_rec_height, sr_refresh_rate_hz);
 		} else {
 			U_LOG_W("Could not query SR display dimensions, using defaults");
 		}
 #endif
 
-		xret = null_compositor_create_system_with_dims(head, sr_rec_width, sr_rec_height, &xsysc);
+		xret = null_compositor_create_system_with_dims(head, sr_rec_width, sr_rec_height,
+		                                               sr_refresh_rate_hz, &xsysc);
 	}
 #else
 	if (use_null) {

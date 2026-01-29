@@ -421,7 +421,8 @@ leiasr_d3d11_get_recommended_view_dimensions(struct leiasr_d3d11 *leiasr,
 bool
 leiasr_query_recommended_view_dimensions(double max_time,
                                           uint32_t *out_width,
-                                          uint32_t *out_height)
+                                          uint32_t *out_height,
+                                          float *out_refresh_rate_hz)
 {
 	if (out_width == nullptr || out_height == nullptr) {
 		return false;
@@ -472,6 +473,21 @@ leiasr_query_recommended_view_dimensions(double max_time,
 						if (success) {
 							U_LOG_I("SR query: recommended view dimensions %ux%u per eye",
 							        *out_width, *out_height);
+
+							// Query monitor refresh rate via Win32
+							if (out_refresh_rate_hz != nullptr) {
+								DEVMODEW dm = {};
+								dm.dmSize = sizeof(dm);
+								if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm) &&
+								    dm.dmDisplayFrequency > 1) {
+									*out_refresh_rate_hz = (float)dm.dmDisplayFrequency;
+									U_LOG_I("SR query: display refresh rate %.0f Hz",
+									        *out_refresh_rate_hz);
+								} else {
+									*out_refresh_rate_hz = 60.0f;
+									U_LOG_W("Could not query display refresh rate, defaulting to 60 Hz");
+								}
+							}
 						}
 						break;
 					}

@@ -176,7 +176,8 @@ leiasr_d3d11_get_recommended_view_dimensions(struct leiasr_d3d11 *leiasr,
                                               uint32_t *out_height);
 
 /*!
- * Query recommended view texture dimensions from SR display without creating a weaver.
+ * Query recommended view texture dimensions and display refresh rate from SR
+ * display without creating a weaver.
  *
  * This is a standalone function that can be called early during initialization
  * to get the recommended dimensions before creating swapchains. It creates a
@@ -185,6 +186,7 @@ leiasr_d3d11_get_recommended_view_dimensions(struct leiasr_d3d11 *leiasr,
  * @param max_time Maximum time in seconds to wait for SR to become ready.
  * @param[out] out_width Recommended width per view (single eye).
  * @param[out] out_height Recommended height per view.
+ * @param[out] out_refresh_rate_hz Display refresh rate in Hz (NULL to skip).
  * @return true if valid dimensions were obtained, false otherwise.
  *
  * @ingroup drv_leiasr
@@ -192,7 +194,8 @@ leiasr_d3d11_get_recommended_view_dimensions(struct leiasr_d3d11 *leiasr,
 bool
 leiasr_query_recommended_view_dimensions(double max_time,
                                           uint32_t *out_width,
-                                          uint32_t *out_height);
+                                          uint32_t *out_height,
+                                          float *out_refresh_rate_hz);
 
 #ifdef __cplusplus
 }
