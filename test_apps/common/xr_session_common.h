@@ -5,8 +5,12 @@
  * @brief  Common OpenXR session management - shared struct and functions
  *
  * This header defines the XrSessionManager struct (superset of all fields)
- * and declares all shared OpenXR session functions used by both test apps.
+ * and declares all shared OpenXR session functions used by all test apps.
  * Each app provides its own InitializeOpenXR() and CreateSession().
+ *
+ * This header is graphics-API-agnostic: it does NOT include any D3D11/D3D12/GL/VK
+ * headers. Each app enumerates API-specific swapchain images in its own code
+ * after calling CreateSwapchains().
  */
 
 #pragma once
@@ -15,11 +19,9 @@
 #define UNICODE
 #define _UNICODE
 #include <windows.h>
-#include <d3d11.h>
 
-// Must define graphics API before including OpenXR platform header
+// Only define platform — no graphics API here (apps define their own)
 #define XR_USE_PLATFORM_WIN32
-#define XR_USE_GRAPHICS_API_D3D11
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 #include <openxr/XR_EXT_session_target.h>
@@ -39,7 +41,7 @@ struct SwapchainInfo {
     int64_t format = 0;
     uint32_t width = 0;
     uint32_t height = 0;
-    std::vector<XrSwapchainImageD3D11KHR> images;
+    uint32_t imageCount = 0;
 };
 
 struct XrSessionManager {
@@ -82,10 +84,6 @@ struct XrSessionManager {
     XrTime predictedDisplayTime = 0;
     XrDuration predictedDisplayPeriod = 0;
 };
-
-// Get the D3D11 graphics requirements (call AFTER InitializeOpenXR, BEFORE CreateSession)
-// Returns the adapter LUID that the D3D11 device must be created on
-bool GetD3D11GraphicsRequirements(XrSessionManager& xr, LUID* outAdapterLuid);
 
 // Create reference spaces
 bool CreateSpaces(XrSessionManager& xr);
@@ -142,10 +140,12 @@ ConvergencePlane LocateConvergencePlane(const XrView views[2]);
 
 // Compute the HUD quad pose anchored to the top-left region of the convergence plane.
 // coverageFraction controls how much of the display the HUD covers (0.2 = 20%).
-// Returns the pose and writes the HUD dimensions to outWidth/outHeight.
+// viewMidpoint is the eye midpoint pose used to transform the result into VIEW space.
+// Returns the pose in VIEW space and writes the HUD dimensions to outWidth/outHeight.
 XrPosef ComputeHUDPose(
     const ConvergencePlane& plane,
     float coverageFraction,
+    const XrView views[2],
     float& outWidth, float& outHeight);
 
 // End frame with projection layer and quad layer for UI

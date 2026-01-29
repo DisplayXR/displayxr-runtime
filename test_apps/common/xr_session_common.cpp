@@ -66,33 +66,6 @@ static XMMATRIX XrFovToProjectionMatrix(const XrFovf& fov, float nearZ, float fa
     return proj;
 }
 
-bool GetD3D11GraphicsRequirements(XrSessionManager& xr, LUID* outAdapterLuid) {
-    LOG_INFO("Getting D3D11 graphics requirements...");
-
-    // Get the function pointer for xrGetD3D11GraphicsRequirementsKHR
-    PFN_xrGetD3D11GraphicsRequirementsKHR xrGetD3D11GraphicsRequirementsKHR = nullptr;
-    XrResult result = xrGetInstanceProcAddr(xr.instance, "xrGetD3D11GraphicsRequirementsKHR",
-        (PFN_xrVoidFunction*)&xrGetD3D11GraphicsRequirementsKHR);
-    if (XR_FAILED(result) || !xrGetD3D11GraphicsRequirementsKHR) {
-        LOG_ERROR("Failed to get xrGetD3D11GraphicsRequirementsKHR function pointer");
-        return false;
-    }
-
-    XrGraphicsRequirementsD3D11KHR graphicsReq = {XR_TYPE_GRAPHICS_REQUIREMENTS_D3D11_KHR};
-    result = xrGetD3D11GraphicsRequirementsKHR(xr.instance, xr.systemId, &graphicsReq);
-    if (XR_FAILED(result)) {
-        LogXrResult("xrGetD3D11GraphicsRequirementsKHR", result);
-        return false;
-    }
-
-    LOG_INFO("D3D11 graphics requirements:");
-    LOG_INFO("  Adapter LUID: 0x%08X%08X", graphicsReq.adapterLuid.HighPart, graphicsReq.adapterLuid.LowPart);
-    LOG_INFO("  Min Feature Level: %d", graphicsReq.minFeatureLevel);
-
-    *outAdapterLuid = graphicsReq.adapterLuid;
-    return true;
-}
-
 bool CreateSpaces(XrSessionManager& xr) {
     LOG_INFO("Creating reference spaces...");
 
@@ -138,25 +111,8 @@ bool CreateSwapchains(XrSessionManager& xr) {
         LOG_DEBUG("  Format[%u]: %lld (0x%llX)", i, formats[i], formats[i]);
     }
 
-    // Prefer UNORM formats for better compatibility
+    // Use runtime's preferred format (first in the list per OpenXR spec)
     int64_t selectedFormat = formats[0];
-    for (int64_t format : formats) {
-        if (format == DXGI_FORMAT_R8G8B8A8_UNORM ||
-            format == DXGI_FORMAT_B8G8R8A8_UNORM) {
-            selectedFormat = format;
-            break;
-        }
-    }
-    // If no UNORM found, try SRGB as fallback
-    if (selectedFormat == formats[0]) {
-        for (int64_t format : formats) {
-            if (format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
-                format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) {
-                selectedFormat = format;
-                break;
-            }
-        }
-    }
     LOG_INFO("Selected swapchain format: %lld (0x%llX)", selectedFormat, selectedFormat);
 
     // Create swapchain for each eye
@@ -183,18 +139,12 @@ bool CreateSwapchains(XrSessionManager& xr) {
         xr.swapchains[eye].width = swapchainInfo.width;
         xr.swapchains[eye].height = swapchainInfo.height;
 
-        // Get swapchain images
+        // Count swapchain images (API-specific enumeration is done by each app)
         uint32_t imageCount = 0;
         XR_CHECK(xrEnumerateSwapchainImages(xr.swapchains[eye].swapchain, 0, &imageCount, nullptr));
-
-        xr.swapchains[eye].images.resize(imageCount, {XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR});
-        XR_CHECK(xrEnumerateSwapchainImages(xr.swapchains[eye].swapchain, imageCount, &imageCount,
-            (XrSwapchainImageBaseHeader*)xr.swapchains[eye].images.data()));
+        xr.swapchains[eye].imageCount = imageCount;
 
         LOG_INFO("  Got %u swapchain images", imageCount);
-        for (uint32_t i = 0; i < imageCount; i++) {
-            LOG_DEBUG("    Image[%u]: texture 0x%p", i, xr.swapchains[eye].images[i].texture);
-        }
     }
 
     LOG_INFO("Swapchains created successfully");
@@ -211,26 +161,9 @@ bool CreateQuadLayerSwapchain(XrSessionManager& xr, uint32_t width, uint32_t hei
     std::vector<int64_t> formats(formatCount);
     XR_CHECK(xrEnumerateSwapchainFormats(xr.session, formatCount, &formatCount, formats.data()));
 
-    // Prefer B8G8R8A8 for Direct2D text rendering compatibility (D2D 1.0 requires B8G8R8A8)
+    // Use runtime's preferred format (first in the list per OpenXR spec)
     int64_t selectedFormat = formats[0];
-    bool foundPreferred = false;
-    for (int64_t format : formats) {
-        if (format == DXGI_FORMAT_B8G8R8A8_UNORM) {
-            selectedFormat = format;
-            foundPreferred = true;
-            break;
-        }
-    }
-    if (!foundPreferred) {
-        for (int64_t format : formats) {
-            if (format == DXGI_FORMAT_R8G8B8A8_UNORM) {
-                selectedFormat = format;
-                break;
-            }
-        }
-    }
-    LOG_INFO("Selected quad swapchain format: %lld (0x%llX)%s", selectedFormat, selectedFormat,
-             foundPreferred ? " (B8G8R8A8 - D2D compatible)" : " (fallback)");
+    LOG_INFO("Selected quad swapchain format: %lld (0x%llX)", selectedFormat, selectedFormat);
 
     XrSwapchainCreateInfo swapchainInfo = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
     swapchainInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
@@ -249,13 +182,10 @@ bool CreateQuadLayerSwapchain(XrSessionManager& xr, uint32_t width, uint32_t hei
     xr.quadSwapchain.width = width;
     xr.quadSwapchain.height = height;
 
-    // Get swapchain images
+    // Count swapchain images (API-specific enumeration is done by each app)
     uint32_t imageCount = 0;
     XR_CHECK(xrEnumerateSwapchainImages(xr.quadSwapchain.swapchain, 0, &imageCount, nullptr));
-
-    xr.quadSwapchain.images.resize(imageCount, {XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR});
-    XR_CHECK(xrEnumerateSwapchainImages(xr.quadSwapchain.swapchain, imageCount, &imageCount,
-        (XrSwapchainImageBaseHeader*)xr.quadSwapchain.images.data()));
+    xr.quadSwapchain.imageCount = imageCount;
 
     LOG_INFO("Got %u quad swapchain images", imageCount);
     xr.hasQuadLayer = true;
@@ -605,6 +535,7 @@ ConvergencePlane LocateConvergencePlane(const XrView views[2]) {
 XrPosef ComputeHUDPose(
     const ConvergencePlane& plane,
     float coverageFraction,
+    const XrView views[2],
     float& outWidth, float& outHeight
 ) {
     outWidth = coverageFraction * plane.width;
@@ -631,14 +562,36 @@ XrPosef ComputeHUDPose(
     XMVECTOR planeCenter = XMVectorSet(
         plane.pose.position.x, plane.pose.position.y,
         plane.pose.position.z, 0.0f);
-    XMVECTOR hudCenter = XMVectorAdd(planeCenter, worldOffset);
+    XMVECTOR hudWorldCenter = XMVectorAdd(planeCenter, worldOffset);
 
-    XMFLOAT3 hc;
-    XMStoreFloat3(&hc, hudCenter);
+    // Transform from LOCAL (world) space to VIEW space.
+    // The Monado state tracker silently drops LOCAL-space quad layers when
+    // handle_space() fails to locate the head device. VIEW space always works
+    // because it bypasses device locating. We compute the view-relative pose here.
+    //
+    // VIEW space origin = eye midpoint, orientation = left eye orientation.
+    // viewRelativePos = invViewQuat * (worldPos - viewOrigin)
+    XMVECTOR leftPos = XMVectorSet(
+        views[0].pose.position.x, views[0].pose.position.y,
+        views[0].pose.position.z, 0.0f);
+    XMVECTOR rightPos = XMVectorSet(
+        views[1].pose.position.x, views[1].pose.position.y,
+        views[1].pose.position.z, 0.0f);
+    XMVECTOR viewOrigin = XMVectorScale(XMVectorAdd(leftPos, rightPos), 0.5f);
+
+    XMVECTOR viewQuat = XMVectorSet(
+        views[0].pose.orientation.x, views[0].pose.orientation.y,
+        views[0].pose.orientation.z, views[0].pose.orientation.w);
+    XMVECTOR invViewQuat = XMQuaternionInverse(viewQuat);
+
+    XMVECTOR viewRelPos = XMVector3Rotate(XMVectorSubtract(hudWorldCenter, viewOrigin), invViewQuat);
+
+    XMFLOAT3 vr;
+    XMStoreFloat3(&vr, viewRelPos);
 
     XrPosef hudPose;
-    hudPose.position = {hc.x, hc.y, hc.z};
-    hudPose.orientation = plane.pose.orientation;  // Same orientation as convergence plane
+    hudPose.position = {vr.x, vr.y, vr.z};
+    hudPose.orientation = {0.0f, 0.0f, 0.0f, 1.0f};  // Identity in VIEW space
 
     return hudPose;
 }
@@ -656,10 +609,13 @@ bool EndFrameWithQuadLayer(
     projectionLayer.viewCount = 2;
     projectionLayer.views = projViews;
 
-    // Quad layer for UI overlay - positioned in LOCAL space (convergence plane anchored)
+    // Quad layer for UI overlay - positioned in VIEW space (pose is view-relative)
+    // We use VIEW space because Monado's handle_space() silently drops LOCAL-space
+    // quad layers when the head device relation flags are zero. The caller computes
+    // the view-relative pose from the convergence plane each frame.
     XrCompositionLayerQuad quadLayer = {XR_TYPE_COMPOSITION_LAYER_QUAD};
     quadLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
-    quadLayer.space = xr.localSpace;  // LOCAL space = anchored to physical display
+    quadLayer.space = xr.viewSpace;  // VIEW space = always works in handle_space()
     quadLayer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
     quadLayer.subImage.swapchain = xr.quadSwapchain.swapchain;
     quadLayer.subImage.imageRect.offset = {0, 0};
@@ -669,7 +625,7 @@ bool EndFrameWithQuadLayer(
     };
     quadLayer.subImage.imageArrayIndex = 0;
 
-    // Position the quad at the computed pose (in LOCAL space)
+    // Position the quad at the computed pose (view-relative, in VIEW space)
     quadLayer.pose = quadPose;
 
     // Size of the quad in meters
