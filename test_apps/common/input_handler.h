@@ -28,13 +28,13 @@ struct InputState {
     float yaw = 0.0f;    // Camera yaw (radians)
     float pitch = 0.0f;  // Camera pitch (radians)
 
-    // Keyboard state for WASD movement
+    // Keyboard state for WASDQE movement
     bool keyW = false;
     bool keyA = false;
     bool keyS = false;
     bool keyD = false;
-    bool keySpace = false;  // Up
-    bool keyShift = false;  // Down
+    bool keyE = false;      // Up
+    bool keyQ = false;      // Down
     bool keyP = false;      // Parallax toggle (press)
     bool keyF11 = false;    // Fullscreen toggle (press)
 
@@ -45,6 +45,9 @@ struct InputState {
     float cameraPosX = 0.0f;
     float cameraPosY = 0.0f;
     float cameraPosZ = 0.0f;  // Start at origin (OpenXR view matrix provides eye offset)
+
+    // View reset (spacebar or double-click)
+    bool resetViewRequested = false;
 
     // Parallax toggle state
     bool parallaxEnabled = true;

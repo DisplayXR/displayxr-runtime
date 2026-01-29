@@ -68,6 +68,10 @@ bool UpdateInputState(InputState& state, UINT msg, WPARAM wParam, LPARAM lParam)
         }
         return true;
 
+    case WM_LBUTTONDBLCLK:
+        state.resetViewRequested = true;
+        return true;
+
     case WM_LBUTTONDOWN:
         state.leftButton = true;
         state.dragging = true;
@@ -114,8 +118,11 @@ bool UpdateInputState(InputState& state, UINT msg, WPARAM wParam, LPARAM lParam)
         case 'A': state.keyA = true; break;
         case 'S': state.keyS = true; break;
         case 'D': state.keyD = true; break;
-        case VK_SPACE: state.keySpace = true; break;
-        case VK_SHIFT: state.keyShift = true; break;
+        case 'E': state.keyE = true; break;
+        case 'Q': state.keyQ = true; break;
+        case VK_SPACE:
+            state.resetViewRequested = true;
+            break;
         case 'P':
             state.keyP = true;
             state.parallaxEnabled = !state.parallaxEnabled;
@@ -133,8 +140,8 @@ bool UpdateInputState(InputState& state, UINT msg, WPARAM wParam, LPARAM lParam)
         case 'A': state.keyA = false; break;
         case 'S': state.keyS = false; break;
         case 'D': state.keyD = false; break;
-        case VK_SPACE: state.keySpace = false; break;
-        case VK_SHIFT: state.keyShift = false; break;
+        case 'E': state.keyE = false; break;
+        case 'Q': state.keyQ = false; break;
         case 'P': state.keyP = false; break;
         case VK_F11: state.keyF11 = false; break;
         }
@@ -145,23 +152,47 @@ bool UpdateInputState(InputState& state, UINT msg, WPARAM wParam, LPARAM lParam)
 }
 
 void UpdateCameraMovement(InputState& state, float deltaTime) {
+    // Handle view reset (spacebar or double-click)
+    if (state.resetViewRequested) {
+        state.cameraPosX = 0.0f;
+        state.cameraPosY = 0.0f;
+        state.cameraPosZ = 0.0f;
+        state.yaw = 0.0f;
+        state.pitch = 0.0f;
+        state.zoomScale = 1.0f;
+        state.resetViewRequested = false;
+        return;
+    }
+
     const float moveSpeed = 0.1f; // Meters per second (scene is in meters)
 
-    // Calculate forward and right vectors based on yaw
-    float forwardX = sinf(state.yaw);
-    float forwardZ = -cosf(state.yaw);
+    // Fly-mode forward vector: incorporates both yaw and pitch
+    float cosPitch = cosf(state.pitch);
+    float forwardX = sinf(state.yaw) * cosPitch;
+    float forwardY = -sinf(state.pitch);
+    float forwardZ = -cosf(state.yaw) * cosPitch;
+
+    // Right vector: always horizontal (perpendicular to world-up and forward)
     float rightX = cosf(state.yaw);
     float rightZ = sinf(state.yaw);
 
-    // Apply movement
+    // Up vector: display-local up (perpendicular to forward and right)
+    float upX = -sinf(state.yaw) * sinf(state.pitch);
+    float upY = cosf(state.pitch);
+    float upZ = cosf(state.yaw) * sinf(state.pitch);
+
+    // W/S: move along display forward (fly mode)
     if (state.keyW) {
         state.cameraPosX += forwardX * moveSpeed * deltaTime;
+        state.cameraPosY += forwardY * moveSpeed * deltaTime;
         state.cameraPosZ += forwardZ * moveSpeed * deltaTime;
     }
     if (state.keyS) {
         state.cameraPosX -= forwardX * moveSpeed * deltaTime;
+        state.cameraPosY -= forwardY * moveSpeed * deltaTime;
         state.cameraPosZ -= forwardZ * moveSpeed * deltaTime;
     }
+    // A/D: strafe along display right
     if (state.keyA) {
         state.cameraPosX -= rightX * moveSpeed * deltaTime;
         state.cameraPosZ -= rightZ * moveSpeed * deltaTime;
@@ -170,11 +201,16 @@ void UpdateCameraMovement(InputState& state, float deltaTime) {
         state.cameraPosX += rightX * moveSpeed * deltaTime;
         state.cameraPosZ += rightZ * moveSpeed * deltaTime;
     }
-    if (state.keySpace) {
-        state.cameraPosY += moveSpeed * deltaTime;
+    // E/Q: move along display up/down
+    if (state.keyE) {
+        state.cameraPosX += upX * moveSpeed * deltaTime;
+        state.cameraPosY += upY * moveSpeed * deltaTime;
+        state.cameraPosZ += upZ * moveSpeed * deltaTime;
     }
-    if (state.keyShift) {
-        state.cameraPosY -= moveSpeed * deltaTime;
+    if (state.keyQ) {
+        state.cameraPosX -= upX * moveSpeed * deltaTime;
+        state.cameraPosY -= upY * moveSpeed * deltaTime;
+        state.cameraPosZ -= upZ * moveSpeed * deltaTime;
     }
 }
 
