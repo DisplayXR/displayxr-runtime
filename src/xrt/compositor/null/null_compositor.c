@@ -619,13 +619,28 @@ null_compositor_create_system_with_dims(struct xrt_device *xdev,
 	 * Main init sequence.
 	 */
 
-	if (!compositor_init_pacing(c) ||         //
-	    !compositor_init_vulkan(c) ||         //
-	    !compositor_init_sys_info(c, xdev) || //
-	    !compositor_init_info(c)) {           //
-		NULL_DEBUG(c, "Failed to init compositor %p", (void *)c);
+	if (!compositor_init_pacing(c)) {
+		NULL_DEBUG(c, "Failed to init pacing %p", (void *)c);
 		c->base.base.base.destroy(&c->base.base.base);
+		return XRT_ERROR_VULKAN;
+	}
 
+	bool vulkan_ok = compositor_init_vulkan(c);
+	if (!vulkan_ok) {
+		NULL_WARN(c, "Vulkan init failed, continuing without Vulkan "
+		             "(D3D11 native compositor will be used at session level)");
+	}
+
+	if (!compositor_init_sys_info(c, xdev)) {
+		NULL_DEBUG(c, "Failed to init sys_info %p", (void *)c);
+		c->base.base.base.destroy(&c->base.base.base);
+		return XRT_ERROR_VULKAN;
+	}
+
+	// compositor_init_info needs Vulkan for format enumeration — skip if Vulkan failed
+	if (vulkan_ok && !compositor_init_info(c)) {
+		NULL_DEBUG(c, "Failed to init info %p", (void *)c);
+		c->base.base.base.destroy(&c->base.base.base);
 		return XRT_ERROR_VULKAN;
 	}
 

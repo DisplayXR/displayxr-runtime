@@ -20,6 +20,7 @@
 #include "util/u_pacing.h"
 
 #include "util/comp_base.h"
+#include "util/comp_target_service.h"
 
 #include <stdint.h>
 
@@ -109,6 +110,10 @@ struct null_compositor
 		struct null_comp_frame waited;
 		struct null_comp_frame rendering;
 	} frame;
+
+	//! Target service stub (zeroed — null compositor doesn't support per-session rendering).
+	//! Required for safe cast to comp_compositor in comp_multi_system.c.
+	struct comp_target_service target_service;
 };
 
 
