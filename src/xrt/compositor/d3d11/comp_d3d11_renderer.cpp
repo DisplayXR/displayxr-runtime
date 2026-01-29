@@ -1034,3 +1034,109 @@ comp_d3d11_renderer_get_stereo_texture(struct comp_d3d11_renderer *renderer)
 {
 	return renderer->stereo_texture;
 }
+
+extern "C" xrt_result_t
+comp_d3d11_renderer_resize(struct comp_d3d11_renderer *renderer,
+                           uint32_t new_view_width,
+                           uint32_t new_view_height)
+{
+	if (renderer == nullptr) {
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+
+	// Clamp minimum
+	if (new_view_width < 64) {
+		new_view_width = 64;
+	}
+	if (new_view_height < 64) {
+		new_view_height = 64;
+	}
+
+	// Skip if unchanged
+	if (new_view_width == renderer->view_width && new_view_height == renderer->view_height) {
+		return XRT_SUCCESS;
+	}
+
+	auto internals = get_internals(renderer->c);
+
+	U_LOG_W("Renderer resize: %ux%u -> %ux%u per eye",
+	        renderer->view_width, renderer->view_height,
+	        new_view_width, new_view_height);
+
+	// Release existing resources
+#define SAFE_RELEASE(x)                                                                                                \
+	if (x != nullptr) {                                                                                            \
+		x->Release();                                                                                          \
+		x = nullptr;                                                                                           \
+	}
+
+	SAFE_RELEASE(renderer->depth_dsv);
+	SAFE_RELEASE(renderer->depth_texture);
+	SAFE_RELEASE(renderer->stereo_rtv);
+	SAFE_RELEASE(renderer->stereo_srv);
+	SAFE_RELEASE(renderer->stereo_texture);
+
+#undef SAFE_RELEASE
+
+	// Update dimensions
+	renderer->view_width = new_view_width;
+	renderer->view_height = new_view_height;
+
+	// Recreate stereo texture (2x width for side-by-side)
+	D3D11_TEXTURE2D_DESC texDesc = {};
+	texDesc.Width = new_view_width * 2;
+	texDesc.Height = new_view_height;
+	texDesc.MipLevels = 1;
+	texDesc.ArraySize = 1;
+	texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	texDesc.SampleDesc.Count = 1;
+	texDesc.Usage = D3D11_USAGE_DEFAULT;
+	texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+
+	HRESULT hr = internals->device->CreateTexture2D(&texDesc, nullptr, &renderer->stereo_texture);
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to recreate stereo texture: 0x%08x", hr);
+		return XRT_ERROR_D3D;
+	}
+
+	// Recreate SRV
+	D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+	srvDesc.Format = texDesc.Format;
+	srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+	srvDesc.Texture2D.MipLevels = 1;
+
+	hr = internals->device->CreateShaderResourceView(renderer->stereo_texture, &srvDesc, &renderer->stereo_srv);
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to recreate stereo SRV: 0x%08x", hr);
+		return XRT_ERROR_D3D;
+	}
+
+	// Recreate RTV
+	hr = internals->device->CreateRenderTargetView(renderer->stereo_texture, nullptr, &renderer->stereo_rtv);
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to recreate stereo RTV: 0x%08x", hr);
+		return XRT_ERROR_D3D;
+	}
+
+	// Recreate depth texture
+	texDesc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+	texDesc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+
+	hr = internals->device->CreateTexture2D(&texDesc, nullptr, &renderer->depth_texture);
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to recreate depth texture: 0x%08x", hr);
+		return XRT_ERROR_D3D;
+	}
+
+	// Recreate DSV
+	hr = internals->device->CreateDepthStencilView(renderer->depth_texture, nullptr, &renderer->depth_dsv);
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to recreate depth DSV: 0x%08x", hr);
+		return XRT_ERROR_D3D;
+	}
+
+	U_LOG_W("Renderer resized: stereo texture now %ux%u (view=%ux%u per eye)",
+	        new_view_width * 2, new_view_height, new_view_width, new_view_height);
+
+	return XRT_SUCCESS;
+}

@@ -47,6 +47,13 @@ struct leiasr_d3d11
 	float display_height_m = 0.0f;
 	bool display_dims_valid = false;
 
+	// Display pixel resolution and screen position (for window metrics)
+	uint32_t display_pixel_width = 0;
+	uint32_t display_pixel_height = 0;
+	int32_t display_screen_left = 0;
+	int32_t display_screen_top = 0;
+	bool display_pixel_dims_valid = false;
+
 	// Recommended view texture dimensions from SR display
 	uint32_t recommended_view_width = 0;
 	uint32_t recommended_view_height = 0;
@@ -129,6 +136,13 @@ create_sr_context(double max_time, leiasr_d3d11 &sr)
 				sr.display_width_m = raw_width_cm / 100.0f;
 				sr.display_height_m = raw_height_cm / 100.0f;
 				sr.display_dims_valid = true;
+
+				// Cache display pixel resolution and screen position
+				sr.display_pixel_width = static_cast<uint32_t>(width);
+				sr.display_pixel_height = static_cast<uint32_t>(height);
+				sr.display_screen_left = static_cast<int32_t>(display_location.left);
+				sr.display_screen_top = static_cast<int32_t>(display_location.top);
+				sr.display_pixel_dims_valid = true;
 
 				// Cache recommended view texture dimensions from SR display
 				sr.recommended_view_width = display->getRecommendedViewsTextureWidth();
@@ -393,6 +407,38 @@ leiasr_d3d11_get_display_dimensions(struct leiasr_d3d11 *leiasr, struct leiasr_d
 	out_dims->width_m = leiasr->display_width_m;
 	out_dims->height_m = leiasr->display_height_m;
 	out_dims->valid = true;
+
+	return true;
+}
+
+bool
+leiasr_d3d11_get_display_pixel_info(struct leiasr_d3d11 *leiasr,
+                                     uint32_t *out_display_pixel_width,
+                                     uint32_t *out_display_pixel_height,
+                                     int32_t *out_display_screen_left,
+                                     int32_t *out_display_screen_top,
+                                     float *out_display_width_m,
+                                     float *out_display_height_m)
+{
+	if (leiasr == nullptr || out_display_pixel_width == nullptr ||
+	    out_display_pixel_height == nullptr || out_display_screen_left == nullptr ||
+	    out_display_screen_top == nullptr || out_display_width_m == nullptr ||
+	    out_display_height_m == nullptr) {
+		return false;
+	}
+
+	std::lock_guard<std::mutex> lock(leiasr->mutex);
+
+	if (!leiasr->display_pixel_dims_valid || !leiasr->display_dims_valid) {
+		return false;
+	}
+
+	*out_display_pixel_width = leiasr->display_pixel_width;
+	*out_display_pixel_height = leiasr->display_pixel_height;
+	*out_display_screen_left = leiasr->display_screen_left;
+	*out_display_screen_top = leiasr->display_screen_top;
+	*out_display_width_m = leiasr->display_width_m;
+	*out_display_height_m = leiasr->display_height_m;
 
 	return true;
 }

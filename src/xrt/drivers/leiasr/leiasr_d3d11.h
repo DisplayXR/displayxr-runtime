@@ -159,6 +159,30 @@ bool
 leiasr_d3d11_get_display_dimensions(struct leiasr_d3d11 *leiasr, struct leiasr_display_dimensions *out_dims);
 
 /*!
+ * Get display pixel resolution, screen position, and physical size.
+ * Used for computing window metrics (adaptive FOV and eye offset).
+ *
+ * @param leiasr The D3D11 weaver instance.
+ * @param[out] out_display_pixel_width Display width in pixels.
+ * @param[out] out_display_pixel_height Display height in pixels.
+ * @param[out] out_display_screen_left Display left edge in screen coords.
+ * @param[out] out_display_screen_top Display top edge in screen coords.
+ * @param[out] out_display_width_m Display physical width in meters.
+ * @param[out] out_display_height_m Display physical height in meters.
+ * @return true if all values are valid.
+ *
+ * @ingroup drv_leiasr
+ */
+bool
+leiasr_d3d11_get_display_pixel_info(struct leiasr_d3d11 *leiasr,
+                                     uint32_t *out_display_pixel_width,
+                                     uint32_t *out_display_pixel_height,
+                                     int32_t *out_display_screen_left,
+                                     int32_t *out_display_screen_top,
+                                     float *out_display_width_m,
+                                     float *out_display_height_m);
+
+/*!
  * Get the recommended view texture dimensions from the SR display.
  * These dimensions are queried from the SR SDK during weaver creation and should
  * be used for creating swapchains and the compositor stereo texture.

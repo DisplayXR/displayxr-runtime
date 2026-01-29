@@ -188,6 +188,27 @@ oxr_session_get_display_dimensions(struct oxr_session *sess, float *out_width_m,
 }
 
 /*!
+ * Get window metrics for adaptive FOV and eye position adjustment.
+ * Only available on D3D11 native compositor path.
+ */
+static bool
+oxr_session_get_window_metrics(struct oxr_session *sess,
+                                struct leiasr_window_metrics *out_metrics)
+{
+	if (sess == NULL || sess->xcn == NULL || out_metrics == NULL) {
+		return false;
+	}
+
+#if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_NATIVE_COMPOSITOR)
+	if (sess->is_d3d11_native_compositor) {
+		return comp_d3d11_compositor_get_window_metrics(&sess->xcn->base, out_metrics);
+	}
+#endif
+
+	return false;
+}
+
+/*!
  * Compute Kooima asymmetric FOV based on eye position relative to screen.
  *
  * The Kooima algorithm (from "Generalized Perspective Projection") computes
@@ -885,41 +906,73 @@ oxr_session_locate_views(struct oxr_logger *log,
 		poses[1].position.z = eye_pair.right.z - head_pos.z;
 		poses[1].orientation = (struct xrt_quat)XRT_QUAT_IDENTITY;
 
-		// Compute Kooima FOV from SR eye positions
+		// Compute Kooima FOV from SR eye positions, with window-adaptive scaling
 		float screen_width_m = 0.0f;
 		float screen_height_m = 0.0f;
 
-		if (oxr_session_get_display_dimensions(sess, &screen_width_m, &screen_height_m) &&
-		    screen_width_m > 0.0f && screen_height_m > 0.0f) {
-			compute_kooima_fov(&eye_pair.left, screen_width_m, screen_height_m,
-			                   "Left", sr_should_log, &fovs[0]);
-			compute_kooima_fov(&eye_pair.right, screen_width_m, screen_height_m,
-			                   "Right", sr_should_log, &fovs[1]);
+		struct leiasr_window_metrics wm = {0};
+		bool have_wm = oxr_session_get_window_metrics(sess, &wm);
 
-			// Compare FOVs between eyes (throttled logging)
+		struct leiasr_eye_position adj_left = eye_pair.left;
+		struct leiasr_eye_position adj_right = eye_pair.right;
+
+		if (have_wm && wm.valid && wm.window_width_m > 0.0f && wm.window_height_m > 0.0f) {
+			// SRHydra viewport scale formula
+			float min_disp = fminf(wm.display_width_m, wm.display_height_m);
+			float min_win  = fminf(wm.window_width_m, wm.window_height_m);
+			float vs = min_disp / min_win;
+
+			screen_width_m  = wm.window_width_m * vs;
+			screen_height_m = wm.window_height_m * vs;
+
+			// Shift eye positions for window center offset
+			adj_left.x  -= wm.window_center_offset_x_m;
+			adj_left.y  -= wm.window_center_offset_y_m;
+			adj_right.x -= wm.window_center_offset_x_m;
+			adj_right.y -= wm.window_center_offset_y_m;
+
 			if (sr_should_log) {
-				float left_h_fov = (fovs[0].angle_right - fovs[0].angle_left) * 180.0f / 3.14159265f;
-				float right_h_fov = (fovs[1].angle_right - fovs[1].angle_left) * 180.0f / 3.14159265f;
-				float left_v_fov = (fovs[0].angle_up - fovs[0].angle_down) * 180.0f / 3.14159265f;
-				float right_v_fov = (fovs[1].angle_up - fovs[1].angle_down) * 180.0f / 3.14159265f;
-				U_LOG_W("SR FOV comparison: Left eye H=%.2f° V=%.2f°, Right eye H=%.2f° V=%.2f°",
-				        left_h_fov, left_v_fov, right_h_fov, right_v_fov);
-				U_LOG_W("  Left  FOV: L=%.2f° R=%.2f° U=%.2f° D=%.2f°",
-				        fovs[0].angle_left * 180.0f / 3.14159265f,
-				        fovs[0].angle_right * 180.0f / 3.14159265f,
-				        fovs[0].angle_up * 180.0f / 3.14159265f,
-				        fovs[0].angle_down * 180.0f / 3.14159265f);
-				U_LOG_W("  Right FOV: L=%.2f° R=%.2f° U=%.2f° D=%.2f°",
-				        fovs[1].angle_left * 180.0f / 3.14159265f,
-				        fovs[1].angle_right * 180.0f / 3.14159265f,
-				        fovs[1].angle_up * 180.0f / 3.14159265f,
-				        fovs[1].angle_down * 180.0f / 3.14159265f);
+				U_LOG_W("Window-adaptive FOV: vs=%.3f, screen=%.4fx%.4fm, "
+				        "eye_offset=(%.4f,%.4f)m",
+				        vs, screen_width_m, screen_height_m,
+				        wm.window_center_offset_x_m, wm.window_center_offset_y_m);
 			}
+		} else if (oxr_session_get_display_dimensions(sess, &screen_width_m, &screen_height_m) &&
+		           screen_width_m > 0.0f && screen_height_m > 0.0f) {
+			// Fallback: full display dimensions (fullscreen or no window metrics)
 		} else {
 			// Fallback to device FOV if display dimensions unavailable
 			fovs[0] = xdev->hmd->distortion.fov[0];
 			fovs[1] = xdev->hmd->distortion.fov[1];
+			goto skip_kooima;
 		}
+
+		compute_kooima_fov(&adj_left, screen_width_m, screen_height_m,
+		                   "Left", sr_should_log, &fovs[0]);
+		compute_kooima_fov(&adj_right, screen_width_m, screen_height_m,
+		                   "Right", sr_should_log, &fovs[1]);
+
+		// Compare FOVs between eyes (throttled logging)
+		if (sr_should_log) {
+			float left_h_fov = (fovs[0].angle_right - fovs[0].angle_left) * 180.0f / 3.14159265f;
+			float right_h_fov = (fovs[1].angle_right - fovs[1].angle_left) * 180.0f / 3.14159265f;
+			float left_v_fov = (fovs[0].angle_up - fovs[0].angle_down) * 180.0f / 3.14159265f;
+			float right_v_fov = (fovs[1].angle_up - fovs[1].angle_down) * 180.0f / 3.14159265f;
+			U_LOG_W("SR FOV comparison: Left eye H=%.2f° V=%.2f°, Right eye H=%.2f° V=%.2f°",
+			        left_h_fov, left_v_fov, right_h_fov, right_v_fov);
+			U_LOG_W("  Left  FOV: L=%.2f° R=%.2f° U=%.2f° D=%.2f°",
+			        fovs[0].angle_left * 180.0f / 3.14159265f,
+			        fovs[0].angle_right * 180.0f / 3.14159265f,
+			        fovs[0].angle_up * 180.0f / 3.14159265f,
+			        fovs[0].angle_down * 180.0f / 3.14159265f);
+			U_LOG_W("  Right FOV: L=%.2f° R=%.2f° U=%.2f° D=%.2f°",
+			        fovs[1].angle_left * 180.0f / 3.14159265f,
+			        fovs[1].angle_right * 180.0f / 3.14159265f,
+			        fovs[1].angle_up * 180.0f / 3.14159265f,
+			        fovs[1].angle_down * 180.0f / 3.14159265f);
+		}
+	skip_kooima:
+		(void)0;
 	}
 
 	if (!have_sr_eye_tracking) {

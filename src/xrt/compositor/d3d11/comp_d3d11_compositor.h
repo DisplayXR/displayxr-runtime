@@ -13,6 +13,7 @@
 #include "xrt/xrt_defines.h"
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_results.h"
+#include "leiasr/leiasr_types.h"
 
 // Forward declaration (C++ struct)
 struct comp_d3d11_compositor;
@@ -74,6 +75,23 @@ bool
 comp_d3d11_compositor_get_display_dimensions(struct xrt_compositor *xc,
                                               float *out_width_m,
                                               float *out_height_m);
+
+/*!
+ * Get window metrics for adaptive FOV and eye position adjustment.
+ *
+ * Computes display pixel info, window client area geometry, and derived
+ * physical sizes / center offsets needed for Kooima FOV correction.
+ *
+ * @param xc The compositor.
+ * @param[out] out_metrics Pointer to receive the computed window metrics.
+ *
+ * @return true if valid window metrics are available.
+ *
+ * @ingroup comp_d3d11
+ */
+bool
+comp_d3d11_compositor_get_window_metrics(struct xrt_compositor *xc,
+                                          struct leiasr_window_metrics *out_metrics);
 
 #ifdef __cplusplus
 }

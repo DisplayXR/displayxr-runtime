@@ -111,6 +111,26 @@ comp_d3d11_renderer_get_view_dimensions(struct comp_d3d11_renderer *renderer,
 void *
 comp_d3d11_renderer_get_stereo_texture(struct comp_d3d11_renderer *renderer);
 
+/*!
+ * Resize the renderer's stereo texture to match a new view size.
+ *
+ * Recreates the stereo texture, SRV, RTV, depth texture, and DSV at the
+ * new dimensions. Shaders, samplers, and pipeline state objects are NOT
+ * recreated. Does nothing if the dimensions are unchanged.
+ *
+ * @param renderer The renderer.
+ * @param new_view_width New width per view (clamped to minimum 64).
+ * @param new_view_height New height per view (clamped to minimum 64).
+ *
+ * @return XRT_SUCCESS on success, error code otherwise.
+ *
+ * @ingroup comp_d3d11
+ */
+xrt_result_t
+comp_d3d11_renderer_resize(struct comp_d3d11_renderer *renderer,
+                           uint32_t new_view_width,
+                           uint32_t new_view_height);
+
 #ifdef __cplusplus
 }
 #endif

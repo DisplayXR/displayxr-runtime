@@ -44,6 +44,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <mutex>
+#include <cmath>
 
 /*!
  * The D3D11 native compositor structure.
@@ -309,6 +310,36 @@ d3d11_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 						// Update settings to reflect new size
 						c->settings.preferred.width = new_width;
 						c->settings.preferred.height = new_height;
+
+#ifdef XRT_HAVE_LEIA_SR_D3D11
+						// Scale renderer stereo texture proportionally to window/display ratio
+						if (c->weaver != nullptr) {
+							uint32_t sr_w, sr_h, disp_px_w, disp_px_h;
+							int32_t disp_left, disp_top;
+							float disp_w_m, disp_h_m;
+
+							if (leiasr_d3d11_get_recommended_view_dimensions(
+							        c->weaver, &sr_w, &sr_h) &&
+							    leiasr_d3d11_get_display_pixel_info(
+							        c->weaver, &disp_px_w, &disp_px_h,
+							        &disp_left, &disp_top, &disp_w_m, &disp_h_m) &&
+							    disp_px_w > 0 && disp_px_h > 0) {
+
+								// Scale recommended view dims by window/display ratio
+								float ratio = fminf(
+								    (float)new_width / (float)disp_px_w,
+								    (float)new_height / (float)disp_px_h);
+								if (ratio > 1.0f) {
+									ratio = 1.0f;
+								}
+
+								uint32_t new_vw = (uint32_t)((float)sr_w * ratio);
+								uint32_t new_vh = (uint32_t)((float)sr_h * ratio);
+
+								comp_d3d11_renderer_resize(c->renderer, new_vw, new_vh);
+							}
+						}
+#endif
 					}
 				}
 			}
@@ -1025,4 +1056,109 @@ comp_d3d11_compositor_get_display_dimensions(struct xrt_compositor *xc,
 	*out_height_m = 0.2f;
 
 	return false;
+}
+
+extern "C" bool
+comp_d3d11_compositor_get_window_metrics(struct xrt_compositor *xc,
+                                          struct leiasr_window_metrics *out_metrics)
+{
+	if (xc == nullptr || out_metrics == nullptr) {
+		if (out_metrics != nullptr) {
+			out_metrics->valid = false;
+		}
+		return false;
+	}
+
+	struct comp_d3d11_compositor *c = d3d11_comp(xc);
+	memset(out_metrics, 0, sizeof(*out_metrics));
+
+#ifdef XRT_HAVE_LEIA_SR_D3D11
+	if (c->weaver == nullptr || c->hwnd == nullptr) {
+		return false;
+	}
+
+	// Get display pixel info from weaver
+	uint32_t disp_px_w, disp_px_h;
+	int32_t disp_left, disp_top;
+	float disp_w_m, disp_h_m;
+	if (!leiasr_d3d11_get_display_pixel_info(c->weaver, &disp_px_w, &disp_px_h,
+	                                          &disp_left, &disp_top, &disp_w_m, &disp_h_m)) {
+		return false;
+	}
+
+	if (disp_px_w == 0 || disp_px_h == 0) {
+		return false;
+	}
+
+	// Get window client rect
+	RECT rect;
+	if (!GetClientRect(c->hwnd, &rect)) {
+		return false;
+	}
+	uint32_t win_px_w = static_cast<uint32_t>(rect.right - rect.left);
+	uint32_t win_px_h = static_cast<uint32_t>(rect.bottom - rect.top);
+	if (win_px_w == 0 || win_px_h == 0) {
+		return false;
+	}
+
+	// Get window screen position
+	POINT client_origin = {0, 0};
+	ClientToScreen(c->hwnd, &client_origin);
+
+	// Compute pixel size (meters per pixel)
+	float pixel_size_x = disp_w_m / (float)disp_px_w;
+	float pixel_size_y = disp_h_m / (float)disp_px_h;
+
+	// Window physical size
+	float win_w_m = (float)win_px_w * pixel_size_x;
+	float win_h_m = (float)win_px_h * pixel_size_y;
+
+	// Window center in pixels (relative to display origin in screen coords)
+	float win_center_px_x = (float)(client_origin.x - disp_left) + (float)win_px_w / 2.0f;
+	float win_center_px_y = (float)(client_origin.y - disp_top) + (float)win_px_h / 2.0f;
+
+	// Display center in pixels
+	float disp_center_px_x = (float)disp_px_w / 2.0f;
+	float disp_center_px_y = (float)disp_px_h / 2.0f;
+
+	// Window center offset in meters
+	// X: +right (screen coords and eye coords both +right)
+	// Y: negated because screen coords Y-down, eye coords Y-up
+	float offset_x_m = (win_center_px_x - disp_center_px_x) * pixel_size_x;
+	float offset_y_m = -((win_center_px_y - disp_center_px_y) * pixel_size_y);
+
+	// Fill output
+	out_metrics->display_width_m = disp_w_m;
+	out_metrics->display_height_m = disp_h_m;
+	out_metrics->display_pixel_width = disp_px_w;
+	out_metrics->display_pixel_height = disp_px_h;
+	out_metrics->display_screen_left = disp_left;
+	out_metrics->display_screen_top = disp_top;
+
+	out_metrics->window_pixel_width = win_px_w;
+	out_metrics->window_pixel_height = win_px_h;
+	out_metrics->window_screen_left = static_cast<int32_t>(client_origin.x);
+	out_metrics->window_screen_top = static_cast<int32_t>(client_origin.y);
+
+	out_metrics->window_width_m = win_w_m;
+	out_metrics->window_height_m = win_h_m;
+	out_metrics->window_center_offset_x_m = offset_x_m;
+	out_metrics->window_center_offset_y_m = offset_y_m;
+
+	out_metrics->valid = true;
+
+	// Throttled diagnostic logging
+	static int wm_log_counter = 0;
+	if (++wm_log_counter % 300 == 1) {
+		U_LOG_W("Window metrics: disp=%ux%u (%.4fx%.4fm), win=%ux%u (%.4fx%.4fm), "
+		        "offset=(%.4f,%.4f)m",
+		        disp_px_w, disp_px_h, disp_w_m, disp_h_m,
+		        win_px_w, win_px_h, win_w_m, win_h_m,
+		        offset_x_m, offset_y_m);
+	}
+
+	return true;
+#else
+	return false;
+#endif
 }
