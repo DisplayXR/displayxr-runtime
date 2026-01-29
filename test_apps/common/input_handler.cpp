@@ -6,7 +6,7 @@
  */
 
 #include "input_handler.h"
-#include <cmath>
+#include <DirectXMath.h>
 #include <sstream>
 
 // Helper to get key name from virtual key code
@@ -166,51 +166,49 @@ void UpdateCameraMovement(InputState& state, float deltaTime) {
 
     const float moveSpeed = 0.1f; // Meters per second (scene is in meters)
 
-    // Fly-mode forward vector: incorporates both yaw and pitch
-    float cosPitch = cosf(state.pitch);
-    float forwardX = sinf(state.yaw) * cosPitch;
-    float forwardY = -sinf(state.pitch);
-    float forwardZ = -cosf(state.yaw) * cosPitch;
+    // Build orientation quaternion using the same function as LocateViews,
+    // guaranteeing movement vectors match the view rotation exactly.
+    using namespace DirectX;
+    XMVECTOR ori = XMQuaternionRotationRollPitchYaw(state.pitch, state.yaw, 0.0f);
 
-    // Right vector: always horizontal (perpendicular to world-up and forward)
-    float rightX = cosf(state.yaw);
-    float rightZ = sinf(state.yaw);
-
-    // Up vector: display-local up (perpendicular to forward and right)
-    float upX = -sinf(state.yaw) * sinf(state.pitch);
-    float upY = cosf(state.pitch);
-    float upZ = cosf(state.yaw) * sinf(state.pitch);
+    // Derive direction vectors by rotating basis vectors with the quaternion
+    XMFLOAT3 fwd, rt, up;
+    XMStoreFloat3(&fwd, XMVector3Rotate(XMVectorSet(0, 0, -1, 0), ori));  // forward = -Z
+    XMStoreFloat3(&rt,  XMVector3Rotate(XMVectorSet(1, 0, 0, 0), ori));   // right = +X
+    XMStoreFloat3(&up,  XMVector3Rotate(XMVectorSet(0, 1, 0, 0), ori));   // up = +Y
 
     // W/S: move along display forward (fly mode)
     if (state.keyW) {
-        state.cameraPosX += forwardX * moveSpeed * deltaTime;
-        state.cameraPosY += forwardY * moveSpeed * deltaTime;
-        state.cameraPosZ += forwardZ * moveSpeed * deltaTime;
+        state.cameraPosX += fwd.x * moveSpeed * deltaTime;
+        state.cameraPosY += fwd.y * moveSpeed * deltaTime;
+        state.cameraPosZ += fwd.z * moveSpeed * deltaTime;
     }
     if (state.keyS) {
-        state.cameraPosX -= forwardX * moveSpeed * deltaTime;
-        state.cameraPosY -= forwardY * moveSpeed * deltaTime;
-        state.cameraPosZ -= forwardZ * moveSpeed * deltaTime;
+        state.cameraPosX -= fwd.x * moveSpeed * deltaTime;
+        state.cameraPosY -= fwd.y * moveSpeed * deltaTime;
+        state.cameraPosZ -= fwd.z * moveSpeed * deltaTime;
     }
     // A/D: strafe along display right
     if (state.keyA) {
-        state.cameraPosX -= rightX * moveSpeed * deltaTime;
-        state.cameraPosZ -= rightZ * moveSpeed * deltaTime;
+        state.cameraPosX -= rt.x * moveSpeed * deltaTime;
+        state.cameraPosY -= rt.y * moveSpeed * deltaTime;
+        state.cameraPosZ -= rt.z * moveSpeed * deltaTime;
     }
     if (state.keyD) {
-        state.cameraPosX += rightX * moveSpeed * deltaTime;
-        state.cameraPosZ += rightZ * moveSpeed * deltaTime;
+        state.cameraPosX += rt.x * moveSpeed * deltaTime;
+        state.cameraPosY += rt.y * moveSpeed * deltaTime;
+        state.cameraPosZ += rt.z * moveSpeed * deltaTime;
     }
     // E/Q: move along display up/down
     if (state.keyE) {
-        state.cameraPosX += upX * moveSpeed * deltaTime;
-        state.cameraPosY += upY * moveSpeed * deltaTime;
-        state.cameraPosZ += upZ * moveSpeed * deltaTime;
+        state.cameraPosX += up.x * moveSpeed * deltaTime;
+        state.cameraPosY += up.y * moveSpeed * deltaTime;
+        state.cameraPosZ += up.z * moveSpeed * deltaTime;
     }
     if (state.keyQ) {
-        state.cameraPosX -= upX * moveSpeed * deltaTime;
-        state.cameraPosY -= upY * moveSpeed * deltaTime;
-        state.cameraPosZ -= upZ * moveSpeed * deltaTime;
+        state.cameraPosX -= up.x * moveSpeed * deltaTime;
+        state.cameraPosY -= up.y * moveSpeed * deltaTime;
+        state.cameraPosZ -= up.z * moveSpeed * deltaTime;
     }
 }
 
