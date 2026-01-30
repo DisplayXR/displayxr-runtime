@@ -242,16 +242,66 @@ leiasr_d3d11_destroy(struct leiasr_d3d11 **leiasr_ptr)
 
 	leiasr_d3d11 *sr = *leiasr_ptr;
 
-	// Destroy weaver first
+	U_LOG_I("leiasr_d3d11_destroy: beginning cleanup");
+
+	// WORKAROUND for SR SDK race condition in WndProcDispatcher:
+	// The SR SDK's WeaverBaseImpl has a use-after-free bug where it releases
+	// the lock before dereferencing the instance pointer in WndProcDispatcher.
+	// This can cause crashes when window messages (especially mouse movement)
+	// arrive during weaver destruction.
+	//
+	// Mitigation 1: Pump all pending window messages before destroying the weaver
+	// to reduce the race window. This gives in-flight message handlers time to
+	// complete before the weaver is destroyed.
+	{
+		U_LOG_I("leiasr_d3d11_destroy: pumping window messages before cleanup");
+		MSG msg;
+		// Process all pending messages (non-blocking)
+		while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+			TranslateMessage(&msg);
+			DispatchMessage(&msg);
+		}
+		// Small delay to let any in-flight handlers complete
+		// The race window is very small, but mouse messages are high-frequency
+		Sleep(50);
+		// Pump again after the delay
+		while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+			TranslateMessage(&msg);
+			DispatchMessage(&msg);
+		}
+		U_LOG_I("leiasr_d3d11_destroy: message pump complete");
+	}
+
+	// Mitigation 2: Explicitly destroy the weaver before deleting the context.
+	// This ensures the window subclass is restored (via restoreOriginalWindowProc)
+	// before the object memory is freed, reducing the race window further.
 	if (sr->weaver != nullptr) {
+		U_LOG_I("leiasr_d3d11_destroy: explicitly destroying weaver");
 		sr->weaver->destroy();
 		sr->weaver = nullptr;
+		U_LOG_I("leiasr_d3d11_destroy: weaver destroyed");
+
+		// Pump messages again after weaver destroy, since restoreOriginalWindowProc
+		// was just called and there may be in-flight messages that got the old
+		// instance pointer before the map was updated
+		MSG msg;
+		while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+			TranslateMessage(&msg);
+			DispatchMessage(&msg);
+		}
+		Sleep(10);
+		while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+			TranslateMessage(&msg);
+			DispatchMessage(&msg);
+		}
 	}
 
 	// Destroy context
 	if (sr->context != nullptr) {
+		U_LOG_I("leiasr_d3d11_destroy: deleting SR context");
 		SR::SRContext::deleteSRContext(sr->context);
 		sr->context = nullptr;
+		U_LOG_I("leiasr_d3d11_destroy: SR context deleted");
 	}
 
 	delete sr;

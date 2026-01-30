@@ -220,6 +220,7 @@ static void RenderThreadFunc(
             XrFrameState frameState;
             if (BeginFrame(*xr, frameState)) {
                 XrCompositionLayerProjectionView projectionViews[2] = {};
+                bool hudSubmitted = false;
 
                 if (frameState.shouldRender) {
                     XMMATRIX leftViewMatrix, leftProjMatrix;
@@ -246,7 +247,6 @@ static void RenderThreadFunc(
                         // ConvergencePlane convPlane = LocateConvergencePlane(rawViews);
 
                         // Render HUD to window-space layer swapchain (once per frame, before eye loop)
-                        bool hudSubmitted = false;
                         if (inputSnapshot.hudVisible && xr->hasHudSwapchain && hudSwapchainImages && !hudSwapchainImages->empty()) {
                             uint32_t hudImageIndex;
                             if (AcquireHudSwapchainImage(*xr, hudImageIndex)) {
