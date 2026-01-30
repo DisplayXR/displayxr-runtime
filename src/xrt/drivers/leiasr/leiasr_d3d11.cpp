@@ -264,20 +264,32 @@ leiasr_d3d11_create(double max_time,
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
 
-	// Install thread-safety wrapper around SR SDK's WndProc.
-	// The SR SDK's weaverWndProc and weave() share internal state without
-	// synchronization, so we serialize them with leiasr_d3d11::mutex.
-	// See doc/XR_EXT_session_target/mouse-race-condition.md
-	sr->sr_wndproc = (WNDPROC)GetWindowLongPtr(sr->hwnd, GWLP_WNDPROC);
-	g_leiasr_d3d11_instance = sr;
-	SetWindowLongPtr(sr->hwnd, GWLP_WNDPROC, (LONG_PTR)leiasr_d3d11_wndproc_wrapper);
-	U_LOG_I("Installed SR WndProc thread-safety wrapper on HWND %p", hwnd);
-
-	// Initialize the context after creating the weaver
+	// Initialize the context after creating the weaver.
+	// NOTE: initialize() may also install/reinstall the SR SDK's WndProc
+	// subclass, so we must capture sr_wndproc AFTER this call.
 	sr->context->initialize();
 
 	// Set default latency (1 frame)
 	sr->weaver->setLatencyInFrames(1);
+
+	// Install thread-safety wrapper around SR SDK's WndProc.
+	// Must be done AFTER context->initialize() because the SDK may install
+	// or reinstall its WndProc subclass during initialization.
+	// The SR SDK's weaverWndProc and weave() share internal state without
+	// synchronization, so we serialize them with leiasr_d3d11::mutex.
+	// See doc/XR_EXT_session_target/mouse-race-condition.md
+	sr->sr_wndproc = (WNDPROC)GetWindowLongPtr(sr->hwnd, GWLP_WNDPROC);
+	if (sr->sr_wndproc != sr->app_wndproc) {
+		g_leiasr_d3d11_instance = sr;
+		SetWindowLongPtr(sr->hwnd, GWLP_WNDPROC, (LONG_PTR)leiasr_d3d11_wndproc_wrapper);
+		U_LOG_W("Installed SR WndProc thread-safety wrapper on HWND %p "
+		         "(app_wndproc=%p, sr_wndproc=%p, wrapper=%p)",
+		         hwnd, (void *)sr->app_wndproc, (void *)sr->sr_wndproc,
+		         (void *)leiasr_d3d11_wndproc_wrapper);
+	} else {
+		U_LOG_W("SR SDK did not subclass the window — WndProc unchanged (%p). "
+		         "Thread-safety wrapper NOT installed.", (void *)sr->sr_wndproc);
+	}
 
 	*out = sr;
 
