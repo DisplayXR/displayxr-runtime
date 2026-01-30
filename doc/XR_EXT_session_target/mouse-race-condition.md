@@ -76,45 +76,58 @@ A shared (reader-writer) lock is preferred over a plain mutex because `weave()` 
 
 ## Workaround in Monado
 
-Since we cannot modify the SR SDK, the runtime implements a **WndProc sub-subclass wrapper** that serializes the SR SDK's `weaverWndProc` with all weaver API calls using the existing `leiasr_d3d11::mutex`.
+Since we cannot modify the SR SDK, the runtime applies two complementary fixes.
+
+### Fix 1: D3D11 Multithread Protection (Primary)
+
+**File:** `src/xrt/compositor/d3d11/comp_d3d11_compositor.cpp`
+
+The root cause is that the D3D11 **immediate device context** (`ID3D11DeviceContext`) is shared between the render thread and the main thread, but `ID3D11DeviceContext` is **not thread-safe** by default. The render thread makes 20+ unprotected context calls per frame (clear, draw, set viewport, map/unmap) that race with the main thread's `DefWindowProc` → DXGI housekeeping path, which also touches the immediate context.
+
+The fix is to enable D3D11's built-in multithread protection immediately after obtaining the context:
+
+```cpp
+c->device->GetImmediateContext(&c->context);
+
+ID3D11Multithread *mt = nullptr;
+if (SUCCEEDED(c->context->QueryInterface(__uuidof(ID3D11Multithread),
+                                         reinterpret_cast<void **>(&mt))) &&
+    mt != nullptr) {
+    mt->SetMultithreadProtected(TRUE);
+    mt->Release();
+}
+```
+
+`SetMultithreadProtected(TRUE)` tells the D3D11 runtime to internally serialize **all** immediate context calls via a critical section. This covers every D3D11 call on both threads — rendering, weaving, DXGI housekeeping, swap chain operations — without requiring the application or runtime to hold any explicit mutex.
+
+**Why the WndProc wrapper alone was insufficient:** The wrapper's `recursive_mutex` only serializes the SR SDK's `weaverWndProc` with `leiasr_d3d11_weave()`. But the render thread makes many D3D11 calls *outside* of `weave()` (the entire rendering pass: clear, draw, set viewport, etc.), and those are not covered by the leiasr mutex. The main thread's `DefWindowProc` can trigger DXGI operations that touch the immediate context during any of those unprotected calls.
+
+### Fix 2: WndProc Sub-Subclass Wrapper (Defense-in-Depth)
 
 **File:** `src/xrt/drivers/leiasr/leiasr_d3d11.cpp`
 
-### How It Works
+As additional protection for the SR SDK's internal state, the runtime installs a WndProc wrapper that serializes `weaverWndProc` with all weaver API calls using `leiasr_d3d11::mutex` (a `std::recursive_mutex`).
 
-After `CreateDX11Weaver` installs the SR SDK's WndProc, the runtime installs its own wrapper on top:
+After `CreateDX11Weaver` and `context->initialize()` install the SR SDK's WndProc, the runtime installs its own wrapper on top:
 
 ```
 WndProc chain (outermost → innermost):
 
-  leiasr_d3d11_wndproc_wrapper    ← our wrapper (serializes with mutex)
+  leiasr_d3d11_wndproc_wrapper    ← our wrapper (serializes with recursive_mutex)
     → SR SDK WndProcDispatcher    ← SR SDK's subclass
       → weaverWndProc             ← SR SDK's message handler
         → CallWindowProc          ← chains to app's original WndProc
-    → app's original WndProc      ← fallback when try_lock fails
 ```
 
-The wrapper uses `std::mutex::try_lock()` — the same mutex held by `leiasr_d3d11_weave()`, `leiasr_d3d11_set_input_texture()`, and all other render-thread weaver calls:
+The wrapper uses a **blocking `lock_guard<std::recursive_mutex>`** — the same mutex held by `leiasr_d3d11_weave()`, `leiasr_d3d11_set_input_texture()`, and all other render-thread weaver calls. The mutex is recursive because `weaverWndProc` is reentrant (`ReleaseCapture()` inside `WM_LBUTTONUP` sends `WM_CAPTURECHANGED` synchronously back to the same WndProc on the same thread).
 
-- **Lock acquired:** The render thread is idle. Call through to the SR SDK's WndProc normally (which chains to the app's WndProc).
-- **Lock unavailable:** The render thread is inside `weave()` or another weaver call. Skip the SR WndProc entirely and forward directly to the app's original WndProc.
-
-### Why try_lock Instead of lock
-
-A blocking `lock()` in the WndProc would stall the Win32 message pump for the duration of a `weave()` frame (up to 16 ms at 60 fps). This causes:
-
-- Input lag and missed `WM_TIMER` callbacks
-- System "Not Responding" detection on prolonged stalls
-- Potential deadlock if D3D11/DXGI sends a synchronous window message during `weave()` (e.g. `WM_WINDOWPOSCHANGING` during a fullscreen transition)
-
-`try_lock()` avoids all of these. When it fails, the SR SDK misses one message. At 100+ Hz mouse messages, this is invisible. Even for lower-frequency messages like `WM_SIZE`, subsequent messages will update the SR SDK's state correctly.
-
-### Setup and Teardown
+#### Setup and Teardown
 
 **Create** (`leiasr_d3d11_create`):
 1. Save the app's WndProc **before** `CreateDX11Weaver` (the SDK overwrites it)
-2. Save the SR SDK's WndProc **after** `CreateDX11Weaver`
-3. Install `leiasr_d3d11_wndproc_wrapper` via `SetWindowLongPtr`
+2. Call `context->initialize()` (may reinstall the SDK's WndProc)
+3. Save the SR SDK's WndProc **after** `context->initialize()`
+4. Install `leiasr_d3d11_wndproc_wrapper` via `SetWindowLongPtr`
 
 **Destroy** (`leiasr_d3d11_destroy`):
 1. Restore the SR SDK's WndProc (removing our wrapper)
