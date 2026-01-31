@@ -20,10 +20,13 @@ add_library(${RUNTIME_TARGET} MODULE target.c libopenxr.def)
 if(WIN32)
 	set_target_properties(${RUNTIME_TARGET} PROPERTIES OUTPUT_NAME "SRMonadoClient")
 
-	# Delay-load vulkan-1.dll so the runtime DLL can load on systems without
-	# Vulkan installed. The null compositor probes for Vulkan availability at
-	# runtime and falls back to D3D11 native compositor if unavailable.
-	target_link_options(${RUNTIME_TARGET} PRIVATE "/DELAYLOAD:vulkan-1.dll")
+	# Delay-load Vulkan and SR Vulkan DLLs so the runtime can load on systems
+	# where these are absent. The D3D11 native compositor path never calls into
+	# Vulkan weaver functions, so the delay-loaded DLLs are never triggered.
+	target_link_options(${RUNTIME_TARGET} PRIVATE
+		"/DELAYLOAD:vulkan-1.dll"
+		"/DELAYLOAD:SimulatedRealityVulkanBeta.dll"
+	)
 	target_link_libraries(${RUNTIME_TARGET} PRIVATE delayimp)
 endif()
 
