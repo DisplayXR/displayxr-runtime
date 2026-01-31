@@ -20,7 +20,6 @@
 #include <windows.h>
 #include <sysinfoapi.h>
 
-#include <mutex>
 #include <cmath>
 
 /*!
@@ -62,45 +61,7 @@ struct leiasr_d3d11
 	// Configuration
 	bool srgb_read = false;
 	bool srgb_write = false;
-
-	// Window subclass for thread-safe SR WndProc serialization
-	HWND hwnd = nullptr;
-	WNDPROC sr_wndproc = nullptr;  // SR SDK's WndProc (saved after weaver creation)
-	WNDPROC app_wndproc = nullptr; // App's original WndProc (saved before weaver creation)
-
-	// Thread safety — recursive because WndProc is reentrant
-	// (e.g. ReleaseCapture() sends WM_CAPTURECHANGED synchronously)
-	std::recursive_mutex mutex;
 };
-
-// Global pointer for the WndProc wrapper. Only one D3D11 SR weaver exists at a time.
-static leiasr_d3d11 *g_leiasr_d3d11_instance = nullptr;
-
-/*!
- * Window procedure wrapper that serializes SR SDK's weaverWndProc with
- * weaver API calls (weave, setInputViewTexture, etc.) on the render thread.
- *
- * The D3D11 immediate context is NOT thread-safe. Both weave() (render thread)
- * and DefWindowProc (main thread, via DXGI housekeeping) can touch it. This
- * wrapper ensures they never overlap by holding the same recursive_mutex that
- * all leiasr_d3d11 API calls hold.
- *
- * Uses a blocking lock (not try_lock) because the fallback path (calling the
- * app's WndProc without the lock) still races on the D3D11 device context via
- * DefWindowProc/DXGI. The mutex is recursive because WndProc is reentrant:
- * ReleaseCapture() inside WM_LBUTTONUP sends WM_CAPTURECHANGED synchronously
- * back to this same WndProc on the same thread.
- */
-static LRESULT CALLBACK
-leiasr_d3d11_wndproc_wrapper(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
-{
-	leiasr_d3d11 *sr = g_leiasr_d3d11_instance;
-	if (sr != nullptr && sr->sr_wndproc != nullptr) {
-		std::lock_guard<std::recursive_mutex> lock(sr->mutex);
-		return CallWindowProc(sr->sr_wndproc, hwnd, msg, wParam, lParam);
-	}
-	return DefWindowProc(hwnd, msg, wParam, lParam);
-}
 
 namespace {
 
@@ -243,14 +204,10 @@ leiasr_d3d11_create(double max_time,
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
 
-	// Save the app's original WndProc before the SR SDK subclasses the window
-	sr->hwnd = static_cast<HWND>(hwnd);
-	sr->app_wndproc = (WNDPROC)GetWindowLongPtr(sr->hwnd, GWLP_WNDPROC);
-
 	// Create D3D11 weaver (SR SDK installs its WndProc via SetWindowLongPtr)
 	WeaverErrorCode result = SR::CreateDX11Weaver(sr->context,
 	                                               sr->d3d11_context,
-	                                               sr->hwnd,
+	                                               static_cast<HWND>(hwnd),
 	                                               &sr->weaver);
 	if (result != WeaverErrorCode::WeaverSuccess) {
 		U_LOG_E("Failed to create SR D3D11 weaver: %d", (int)result);
@@ -260,31 +217,10 @@ leiasr_d3d11_create(double max_time,
 	}
 
 	// Initialize the context after creating the weaver.
-	// NOTE: initialize() may also install/reinstall the SR SDK's WndProc
-	// subclass, so we must capture sr_wndproc AFTER this call.
 	sr->context->initialize();
 
 	// Set default latency (1 frame)
 	sr->weaver->setLatencyInFrames(1);
-
-	// Install thread-safety wrapper around SR SDK's WndProc.
-	// Must be done AFTER context->initialize() because the SDK may install
-	// or reinstall its WndProc subclass during initialization.
-	// The SR SDK's weaverWndProc and weave() share internal state without
-	// synchronization, so we serialize them with leiasr_d3d11::mutex.
-	// See doc/XR_EXT_session_target/mouse-race-condition.md
-	sr->sr_wndproc = (WNDPROC)GetWindowLongPtr(sr->hwnd, GWLP_WNDPROC);
-	if (sr->sr_wndproc != sr->app_wndproc) {
-		g_leiasr_d3d11_instance = sr;
-		SetWindowLongPtr(sr->hwnd, GWLP_WNDPROC, (LONG_PTR)leiasr_d3d11_wndproc_wrapper);
-		U_LOG_W("Installed SR WndProc thread-safety wrapper on HWND %p "
-		         "(app_wndproc=%p, sr_wndproc=%p, wrapper=%p)",
-		         hwnd, (void *)sr->app_wndproc, (void *)sr->sr_wndproc,
-		         (void *)leiasr_d3d11_wndproc_wrapper);
-	} else {
-		U_LOG_W("SR SDK did not subclass the window — WndProc unchanged (%p). "
-		         "Thread-safety wrapper NOT installed.", (void *)sr->sr_wndproc);
-	}
 
 	*out = sr;
 
@@ -301,15 +237,6 @@ leiasr_d3d11_destroy(struct leiasr_d3d11 **leiasr_ptr)
 	}
 
 	leiasr_d3d11 *sr = *leiasr_ptr;
-
-	// Remove our WndProc wrapper before destroying the weaver.
-	// Restore the SR SDK's WndProc so that weaver->destroy() can cleanly
-	// call restoreOriginalWindowProc (which restores the app's WndProc).
-	if (sr->hwnd != nullptr && sr->sr_wndproc != nullptr) {
-		SetWindowLongPtr(sr->hwnd, GWLP_WNDPROC, (LONG_PTR)sr->sr_wndproc);
-		U_LOG_I("Removed SR WndProc thread-safety wrapper from HWND %p", (void *)sr->hwnd);
-	}
-	g_leiasr_d3d11_instance = nullptr;
 
 	// Destroy weaver (SR SDK restores the app's original WndProc)
 	if (sr->weaver != nullptr) {
@@ -339,8 +266,6 @@ leiasr_d3d11_set_input_texture(struct leiasr_d3d11 *leiasr,
 	if (leiasr == nullptr || leiasr->weaver == nullptr) {
 		return;
 	}
-
-	std::lock_guard<std::recursive_mutex> lock(leiasr->mutex);
 
 	// Log dimension changes (first time or when dimensions change)
 	static uint32_t last_logged_width = 0, last_logged_height = 0;
@@ -372,8 +297,6 @@ leiasr_d3d11_weave(struct leiasr_d3d11 *leiasr)
 		return;
 	}
 
-	std::lock_guard<std::recursive_mutex> lock(leiasr->mutex);
-
 	// The weaver writes to the currently bound render target
 	// Make sure OMSetRenderTargets and RSSetViewports have been called
 	leiasr->weaver->weave();
@@ -387,8 +310,6 @@ leiasr_d3d11_get_predicted_eye_positions(struct leiasr_d3d11 *leiasr,
 	if (leiasr == nullptr || leiasr->weaver == nullptr) {
 		return false;
 	}
-
-	std::lock_guard<std::recursive_mutex> lock(leiasr->mutex);
 
 	// Get positions in millimeters from weaver
 	float left_mm[3], right_mm[3];
@@ -426,8 +347,6 @@ leiasr_d3d11_set_srgb_conversion(struct leiasr_d3d11 *leiasr,
 		return;
 	}
 
-	std::lock_guard<std::recursive_mutex> lock(leiasr->mutex);
-
 	leiasr->srgb_read = read_srgb;
 	leiasr->srgb_write = write_srgb;
 	leiasr->weaver->setShaderSRGBConversion(read_srgb, write_srgb);
@@ -440,8 +359,6 @@ leiasr_d3d11_set_latency_in_frames(struct leiasr_d3d11 *leiasr,
 	if (leiasr == nullptr || leiasr->weaver == nullptr) {
 		return;
 	}
-
-	std::lock_guard<std::recursive_mutex> lock(leiasr->mutex);
 
 	leiasr->weaver->setLatencyInFrames(latency_frames);
 }
@@ -465,8 +382,6 @@ leiasr_d3d11_get_display_dimensions(struct leiasr_d3d11 *leiasr, struct leiasr_d
 		}
 		return false;
 	}
-
-	std::lock_guard<std::recursive_mutex> lock(leiasr->mutex);
 
 	if (!leiasr->display_dims_valid) {
 		out_dims->valid = false;
@@ -496,8 +411,6 @@ leiasr_d3d11_get_display_pixel_info(struct leiasr_d3d11 *leiasr,
 		return false;
 	}
 
-	std::lock_guard<std::recursive_mutex> lock(leiasr->mutex);
-
 	if (!leiasr->display_pixel_dims_valid || !leiasr->display_dims_valid) {
 		return false;
 	}
@@ -520,8 +433,6 @@ leiasr_d3d11_get_recommended_view_dimensions(struct leiasr_d3d11 *leiasr,
 	if (leiasr == nullptr || out_width == nullptr || out_height == nullptr) {
 		return false;
 	}
-
-	std::lock_guard<std::recursive_mutex> lock(leiasr->mutex);
 
 	if (!leiasr->recommended_dims_valid) {
 		return false;

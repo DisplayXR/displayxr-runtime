@@ -6,7 +6,7 @@ When the OpenXR runtime renders into an **app-provided window** (via `XR_EXT_ses
 
 | Problem | Symptom | Solution |
 |---------|---------|----------|
-| **Window drag freezes rendering** | App hangs while user drags title bar | Dedicated render thread |
+| **Window drag freezes rendering** | App hangs while user drags title bar | Single-threaded WM_PAINT trick |
 | **FOV is wrong for small windows** | Image appears stretched/distorted | Window-adaptive Kooima FOV |
 | **GPU wastes work on small windows** | Full SR-resolution stereo texture for a 400px window | Proportional render texture resize |
 | **Window drag breaks 3D phase alignment** | Crosstalk jittering when window lands on non-aligned pixel position | Weaver auto-snaps window to phase-aligned positions |
@@ -78,52 +78,44 @@ case WM_PAINT:
 - Couples rendering to the Windows message loop
 - Frame rate depends on how often Windows dispatches `WM_PAINT` during drag
 - Fragile — any path that validates the window (even by accident) breaks the loop
-- Not suitable for an OpenXR runtime where the app owns the message pump
+- The app must implement the trick — the runtime cannot inject it into the app's `WndProc`
 
-### Our Solution: Dedicated Render Thread
+### Our Solution: Single-Threaded WM_PAINT Approach
 
-The runtime uses a **dedicated render thread** (`comp_d3d11_compositor`) that is completely independent of the window's message pump. The app's thread handles messages, and the render thread runs the OpenXR frame loop:
+We initially implemented a **dedicated render thread** to decouple rendering from the message pump. However, the D3D11 immediate device context is **not thread-safe** — both the render thread (calling `weave()`) and the main thread (via `DefWindowProc` → DXGI housekeeping) touch the same context concurrently. This caused crashes on mouse-up events and required increasingly complex synchronization (recursive mutexes, WndProc wrappers) that still couldn't guarantee safety. See `mouse-race-condition.md` in git history for the full analysis.
+
+The runtime now uses the **same WM_PAINT trick** as the SR SDK's native examples. The test app (`sr_cube_openxr_ext`) renders inside `WM_PAINT` during drag/resize, keeping frames flowing without requiring a separate thread:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                        App Thread                                     │
+│                    Single-Threaded App                                 │
 │                                                                     │
 │   while (running) {                                                  │
-│       PeekMessage → DispatchMessage  // handles WM_SIZE, WM_PAINT   │
-│       xrWaitFrame / xrBeginFrame / xrEndFrame  // OpenXR calls      │
+│       PeekMessage → DispatchMessage  // handles all messages         │
+│       xrWaitFrame / xrBeginFrame / xrEndFrame  // normal frames     │
 │   }                                                                  │
 │                                                                     │
-│   NOTE: Even if DefWindowProc blocks this thread during drag,        │
-│   the render thread keeps running.                                   │
-└─────────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────────┐
-│                       Render Thread                                   │
-│                                                                     │
-│   while (running) {                                                  │
-│       // Independent of message pump — runs during window drag       │
-│       compose_layers();                                              │
-│       weave();                                                       │
-│       present();                                                     │
-│   }                                                                  │
+│   WndProc:                                                           │
+│     WM_ENTERSIZEMOVE → set isMoving, InvalidateRect                  │
+│     WM_EXITSIZEMOVE  → clear isMoving                                │
+│     WM_PAINT (if isMoving) → run one OpenXR frame, don't validate   │
+│              (Windows keeps sending WM_PAINT → continuous rendering) │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-**Why a dedicated render thread is better than the WM_PAINT trick:**
+**Why single-threaded WM_PAINT is the right choice:**
 
-The WM_PAINT trick works for a **native SR app** like `parallax_toggle` because the app owns both the message pump and the render function — it can call `Render()` from anywhere. An OpenXR runtime cannot do this because:
+1. **D3D11 thread safety.** The D3D11 immediate context cannot be safely shared between threads without `ID3D11Multithread::SetMultithreadProtected(TRUE)`, and even then the SR SDK's internal weaver state has no synchronization. A single thread eliminates all data races by design.
 
-1. **The runtime doesn't own the message pump.** With `XR_EXT_session_target`, the *app* creates the window and pumps its messages. The runtime has no access to the app's `WndProc` to inject `WM_PAINT` handling. The render thread solves this by making rendering independent of whichever thread owns the window.
+2. **The app owns the message pump.** With `XR_EXT_session_target`, the app creates the window and controls the message loop. The app is the natural place to implement the WM_PAINT trick — it already owns the `WndProc` and the render call.
 
-2. **The WM_PAINT trick has fragile frame pacing.** The rate at which Windows dispatches `WM_PAINT` during a modal drag loop is unspecified and varies by OS version, DPI settings, and system load. A render thread runs at consistent cadence controlled by VSync / `xrWaitFrame`, giving smooth eye-tracked 3D regardless of user interaction.
+3. **Simplicity.** No mutexes, no WndProc wrapper chains, no global instance pointers. The entire solution is ~15 lines of code in the app's `WndProc`.
 
-3. **The WM_PAINT trick breaks if anything validates the window.** A single `BeginPaint`/`EndPaint` call — from the app, a UI framework, or a default handler — stops the `WM_PAINT` loop. The dedicated render thread has no such fragility; it runs unconditionally.
+**Limitations:**
 
-4. **OpenXR frame calls must not re-enter.** If the app calls `xrWaitFrame` from its main thread, and the runtime tried to run a frame from inside `WM_PAINT` on that same thread, the OpenXR state machine would re-enter (or deadlock on its own mutex). A separate thread avoids this entirely.
-
-5. **Multi-app scenarios.** Multiple OpenXR sessions can each have their own window. The render thread handles all of them in a single loop. The WM_PAINT approach would require hooking each app's individual `WndProc`, which is not feasible for a runtime.
-
-**Implementation:** See commit `d733f3a00` — "Move OpenXR frame loop to dedicated render thread".
+- Frame rate during drag depends on how often Windows dispatches `WM_PAINT` (typically tied to the display refresh rate, which is adequate for smooth 3D).
+- Any path that validates the window (e.g., `BeginPaint`/`EndPaint`) would break the loop. Apps must be careful not to validate during `isMoving`.
+- The app must implement the WM_PAINT trick itself — the runtime cannot do it on the app's behalf.
 
 ---
 
@@ -367,7 +359,7 @@ The effect is that the window moves in small discrete steps rather than pixel-by
 Since the SR weaver performs this subclassing internally during initialization, the OpenXR runtime's compositor — which creates and owns the weaver instance — automatically benefits from phase-aligned window snapping. No additional code is needed in the runtime or the application.
 
 This is complementary to the other window-handling solutions in this document:
-- **Problem 1** (render thread) keeps frames flowing during drag
+- **Problem 1** (WM_PAINT trick) keeps frames flowing during drag
 - **Problem 2** (viewport scale) keeps the FOV correct for the window size
 - **Problem 3** (texture resize) keeps GPU usage proportional
 - **Problem 4** (phase snapping) keeps the 3D stereo alignment correct at every position
@@ -378,8 +370,8 @@ This is complementary to the other window-handling solutions in this document:
 
 | Aspect | `parallax_toggle` (native) | OpenXR Runtime |
 |--------|---------------------------|----------------|
-| **Threading** | Single thread, WM_PAINT trick | Dedicated render thread |
-| **Drag handling** | Renders inside WM_PAINT during drag | Render thread unaffected by drag |
+| **Threading** | Single thread, WM_PAINT trick | Single thread, WM_PAINT trick |
+| **Drag handling** | Renders inside WM_PAINT during drag | Renders inside WM_PAINT during drag |
 | **FOV adjustment** | None — uses full display size always | Viewport scale + eye offset |
 | **Render texture** | Fixed at SR recommended size | Scaled proportionally to window |
 | **Off-center correction** | None | Eye position offset applied |
@@ -397,34 +389,13 @@ This is complementary to the other window-handling solutions in this document:
 
 The runtime handles all FOV, eye position, and render texture adjustments automatically. Your app just submits layers as normal via `xrEndFrame`. The swapchain dimensions reported by `xrEnumerateSwapchainImages` are the app-side textures and do not change with the window.
 
-**2. Use a separate thread for your message pump if needed.**
+**2. Do NOT use a separate render thread with D3D11.**
 
-If your app's OpenXR frame loop runs on the same thread as the message pump, window drag will block `xrWaitFrame`. Consider running the OpenXR frame loop on a separate thread:
+The D3D11 immediate device context is not thread-safe. If your app runs the OpenXR frame loop on a separate thread while the main thread handles window messages, `DefWindowProc` and DXGI housekeeping on the main thread will race with `weave()` and `Present()` on the render thread. This causes crashes — particularly on mouse-up events where `ReleaseCapture()` triggers synchronous `WM_CAPTURECHANGED` messages that re-enter the D3D11 context. Even with `ID3D11Multithread::SetMultithreadProtected(TRUE)`, the SR SDK's internal weaver state is not synchronized. Keep everything on one thread.
 
-```cpp
-// Recommended: separate threads
-std::thread render_thread([&]() {
-    while (running) {
-        xrWaitFrame(session, &waitInfo, &frameState);
-        xrBeginFrame(session, &beginInfo);
-        // ... render and submit layers ...
-        xrEndFrame(session, &endInfo);
-    }
-});
+**3. Use the WM_PAINT trick to keep rendering during window drag (recommended).**
 
-// Main thread: message pump
-while (running) {
-    MSG msg;
-    while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
-    }
-}
-```
-
-**3. If you must stay single-threaded, use the WM_PAINT trick.**
-
-For simple apps that cannot use a render thread:
+The WM_PAINT trick is the proven approach used by the SR SDK's own examples and by the OpenXR runtime:
 
 ```cpp
 static bool g_isMoving = false;
