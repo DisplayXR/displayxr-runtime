@@ -379,7 +379,12 @@ bool AcquireSwapchainImage(XrSessionManager& xr, int eye, uint32_t& imageIndex) 
     XrSwapchainImageWaitInfo waitInfo = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
     waitInfo.timeout = XR_INFINITE_DURATION;
     result = xrWaitSwapchainImage(xr.swapchains[eye].swapchain, &waitInfo);
-    if (XR_FAILED(result)) return false;
+    if (XR_FAILED(result)) {
+        // Release the acquired image to avoid deadlocking the swapchain
+        XrSwapchainImageReleaseInfo releaseInfo = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+        xrReleaseSwapchainImage(xr.swapchains[eye].swapchain, &releaseInfo);
+        return false;
+    }
 
     return true;
 }

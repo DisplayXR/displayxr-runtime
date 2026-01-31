@@ -330,7 +330,7 @@ bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysicalDevic
         colorAttach.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         colorAttach.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
         colorAttach.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-        colorAttach.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        colorAttach.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         colorAttach.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 
         VkAttachmentDescription depthAttach = {};
@@ -340,7 +340,7 @@ bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysicalDevic
         depthAttach.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
         depthAttach.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
         depthAttach.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-        depthAttach.initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        depthAttach.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         depthAttach.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
         VkAttachmentDescription attachments[] = {colorAttach, depthAttach};

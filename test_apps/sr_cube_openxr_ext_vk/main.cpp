@@ -34,6 +34,10 @@ static const char* APP_NAME = "sr_cube_openxr_ext_vk";
 static const wchar_t* WINDOW_CLASS = L"SRCubeOpenXRExtVKClass";
 static const wchar_t* WINDOW_TITLE = L"SR Cube OpenXR Ext Vulkan (Press ESC to exit)";
 
+// HUD overlay size as fraction of window dimensions (for window-space layer)
+static const float HUD_WIDTH_FRACTION = 0.30f;
+static const float HUD_HEIGHT_FRACTION = 0.35f;
+
 // Global state (shared between main thread and render thread)
 static InputState g_inputState;
 static std::mutex g_inputMutex;
@@ -144,7 +148,8 @@ static void RenderThreadFunc(
     uint32_t hudHeight,
     VkBuffer hudStagingBuffer,
     void* hudStagingMapped,
-    VkCommandPool hudCmdPool)
+    VkCommandPool hudCmdPool,
+    std::vector<XrSwapchainImageVulkanKHR>* hudSwapchainImages)
 {
     LOG_INFO("[RenderThread] Started");
 
@@ -184,6 +189,8 @@ static void RenderThreadFunc(
             XrFrameState frameState;
             if (BeginFrame(*xr, frameState)) {
                 XrCompositionLayerProjectionView projectionViews[2] = {};
+                bool rendered = false;
+                bool hudSubmitted = false;
 
                 if (frameState.shouldRender) {
                     XMMATRIX leftViewMatrix, leftProjMatrix;
@@ -206,6 +213,7 @@ static void RenderThreadFunc(
                         XrView rawViews[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
                         xrLocateViews(xr->session, &locateInfo, &viewState, 2, &viewCount, rawViews);
 
+                        rendered = true;
                         for (int eye = 0; eye < 2; eye++) {
                             uint32_t imageIndex;
                             if (AcquireSwapchainImage(*xr, eye, imageIndex)) {
@@ -216,91 +224,6 @@ static void RenderThreadFunc(
                                     xr->swapchains[eye].width, xr->swapchains[eye].height,
                                     viewMatrix, projMatrix,
                                     inputSnapshot.zoomScale);
-
-                                // Screen-space HUD: render text on eye 0, copy to both eyes
-                                if (inputSnapshot.hudVisible && hud) {
-                                    if (eye == 0) {
-                                        std::wstring sessionText = L"Session: ";
-                                        sessionText += FormatSessionState((int)xr->sessionState);
-                                        std::wstring modeText = xr->hasSessionTargetExt ?
-                                            L"XR_EXT_session_target: ACTIVE (Vulkan)" :
-                                            L"XR_EXT_session_target: NOT AVAILABLE (Vulkan)";
-                                        std::wstring perfText = FormatPerformanceInfo(perfStats.fps, perfStats.frameTimeMs,
-                                            xr->swapchains[0].width, xr->swapchains[0].height);
-                                        std::wstring eyeText = FormatEyeTrackingInfo(xr->eyePosX, xr->eyePosY, xr->eyePosZ, xr->eyeTrackingActive);
-
-                                        uint32_t srcRowPitch = 0;
-                                        const void* pixels = RenderHudAndMap(*hud, &srcRowPitch, sessionText, modeText, perfText, eyeText);
-                                        if (pixels) {
-                                            // Copy pixels to staging buffer
-                                            const uint8_t* src = (const uint8_t*)pixels;
-                                            uint8_t* dst = (uint8_t*)hudStagingMapped;
-                                            for (uint32_t row = 0; row < hudHeight; row++) {
-                                                memcpy(dst + row * hudWidth * 4, src + row * srcRowPitch, hudWidth * 4);
-                                            }
-                                            UnmapHud(*hud);
-                                        }
-                                    }
-
-                                    // Record and execute a command buffer to copy HUD to swapchain
-                                    VkCommandBufferAllocateInfo allocInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-                                    allocInfo.commandPool = hudCmdPool;
-                                    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-                                    allocInfo.commandBufferCount = 1;
-
-                                    VkCommandBuffer cmdBuf;
-                                    vkAllocateCommandBuffers(renderer->device, &allocInfo, &cmdBuf);
-
-                                    VkCommandBufferBeginInfo beginInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-                                    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-                                    vkBeginCommandBuffer(cmdBuf, &beginInfo);
-
-                                    VkImage swapImg = swapchainImages[eye][imageIndex].image;
-
-                                    // Barrier: swapchain COLOR_ATTACHMENT -> TRANSFER_DST
-                                    VkImageMemoryBarrier barrier = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-                                    barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-                                    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-                                    barrier.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-                                    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-                                    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                                    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                                    barrier.image = swapImg;
-                                    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-                                    vkCmdPipelineBarrier(cmdBuf,
-                                        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                                        VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                        0, 0, nullptr, 0, nullptr, 1, &barrier);
-
-                                    // Copy buffer to image (top-left region)
-                                    VkBufferImageCopy region = {};
-                                    region.bufferRowLength = hudWidth;
-                                    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-                                    region.imageOffset = {0, 0, 0};
-                                    region.imageExtent = {hudWidth, hudHeight, 1};
-                                    vkCmdCopyBufferToImage(cmdBuf, hudStagingBuffer, swapImg,
-                                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-
-                                    // Barrier: TRANSFER_DST -> COLOR_ATTACHMENT
-                                    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-                                    barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-                                    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-                                    barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-                                    vkCmdPipelineBarrier(cmdBuf,
-                                        VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                                        0, 0, nullptr, 0, nullptr, 1, &barrier);
-
-                                    vkEndCommandBuffer(cmdBuf);
-
-                                    VkSubmitInfo submitInfo = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
-                                    submitInfo.commandBufferCount = 1;
-                                    submitInfo.pCommandBuffers = &cmdBuf;
-                                    vkQueueSubmit(renderer->graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
-                                    vkQueueWaitIdle(renderer->graphicsQueue);
-
-                                    vkFreeCommandBuffers(renderer->device, hudCmdPool, 1, &cmdBuf);
-                                }
 
                                 ReleaseSwapchainImage(*xr, eye);
 
@@ -314,12 +237,116 @@ static void RenderThreadFunc(
                                 projectionViews[eye].subImage.imageArrayIndex = 0;
                                 projectionViews[eye].pose = rawViews[eye].pose;
                                 projectionViews[eye].fov = rawViews[eye].fov;
+                            } else {
+                                rendered = false;
+                            }
+                        }
+
+                        // Render HUD to window-space layer swapchain
+                        if (rendered && inputSnapshot.hudVisible && hud && xr->hasHudSwapchain && hudSwapchainImages) {
+                            uint32_t hudImageIndex;
+                            if (AcquireHudSwapchainImage(*xr, hudImageIndex)) {
+                                std::wstring sessionText = L"Session: ";
+                                sessionText += FormatSessionState((int)xr->sessionState);
+                                std::wstring modeText = xr->hasSessionTargetExt ?
+                                    L"XR_EXT_session_target: ACTIVE (Vulkan)" :
+                                    L"XR_EXT_session_target: NOT AVAILABLE (Vulkan)";
+                                std::wstring perfText = FormatPerformanceInfo(perfStats.fps, perfStats.frameTimeMs,
+                                    xr->swapchains[0].width, xr->swapchains[0].height);
+                                std::wstring eyeText = FormatEyeTrackingInfo(xr->eyePosX, xr->eyePosY, xr->eyePosZ, xr->eyeTrackingActive);
+
+                                uint32_t srcRowPitch = 0;
+                                const void* pixels = RenderHudAndMap(*hud, &srcRowPitch, sessionText, modeText, perfText, eyeText);
+                                if (pixels) {
+                                    const uint8_t* src = (const uint8_t*)pixels;
+                                    uint8_t* dst = (uint8_t*)hudStagingMapped;
+                                    for (uint32_t row = 0; row < hudHeight; row++) {
+                                        memcpy(dst + row * hudWidth * 4, src + row * srcRowPitch, hudWidth * 4);
+                                    }
+                                    UnmapHud(*hud);
+                                }
+
+                                // Copy staging buffer to HUD swapchain image
+                                VkCommandBufferAllocateInfo allocInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+                                allocInfo.commandPool = hudCmdPool;
+                                allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+                                allocInfo.commandBufferCount = 1;
+
+                                VkCommandBuffer cmdBuf;
+                                vkAllocateCommandBuffers(renderer->device, &allocInfo, &cmdBuf);
+
+                                VkCommandBufferBeginInfo beginInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+                                beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                                vkBeginCommandBuffer(cmdBuf, &beginInfo);
+
+                                VkImage hudImg = (*hudSwapchainImages)[hudImageIndex].image;
+
+                                // Barrier: UNDEFINED -> TRANSFER_DST
+                                VkImageMemoryBarrier barrier = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                                barrier.srcAccessMask = 0;
+                                barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                                barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                                barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                                barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                                barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                                barrier.image = hudImg;
+                                barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                                vkCmdPipelineBarrier(cmdBuf,
+                                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                    0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+                                // Copy buffer to image
+                                VkBufferImageCopy region = {};
+                                region.bufferRowLength = hudWidth;
+                                region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                                region.imageOffset = {0, 0, 0};
+                                region.imageExtent = {hudWidth, hudHeight, 1};
+                                vkCmdCopyBufferToImage(cmdBuf, hudStagingBuffer, hudImg,
+                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+                                // Barrier: TRANSFER_DST -> COLOR_ATTACHMENT
+                                barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                                barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                                barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                                barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                                vkCmdPipelineBarrier(cmdBuf,
+                                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                    0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+                                vkEndCommandBuffer(cmdBuf);
+
+                                VkSubmitInfo submitInfo = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+                                submitInfo.commandBufferCount = 1;
+                                submitInfo.pCommandBuffers = &cmdBuf;
+                                vkQueueSubmit(renderer->graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
+                                vkQueueWaitIdle(renderer->graphicsQueue);
+
+                                vkFreeCommandBuffers(renderer->device, hudCmdPool, 1, &cmdBuf);
+
+                                ReleaseHudSwapchainImage(*xr);
+                                hudSubmitted = true;
                             }
                         }
                     }
                 }
 
-                EndFrame(*xr, frameState.predictedDisplayTime, projectionViews);
+                // End frame: use window-space HUD layer if available, or 0 layers if not rendered
+                if (rendered && hudSubmitted) {
+                    EndFrameWithWindowSpaceHud(*xr, frameState.predictedDisplayTime, projectionViews,
+                        0.0f, 0.0f, HUD_WIDTH_FRACTION, HUD_HEIGHT_FRACTION, 0.0f);
+                } else if (rendered) {
+                    EndFrame(*xr, frameState.predictedDisplayTime, projectionViews);
+                } else {
+                    // shouldRender was false or rendering failed - submit empty frame
+                    XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
+                    endInfo.displayTime = frameState.predictedDisplayTime;
+                    endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+                    endInfo.layerCount = 0;
+                    endInfo.layers = nullptr;
+                    xrEndFrame(xr->session, &endInfo);
+                }
             }
         } else {
             Sleep(100);
@@ -501,16 +528,29 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         }
     }
 
-    // Initialize HUD renderer for screen-space text overlay
-    const float HUD_WIDTH_PERCENT = 0.30f;
-    const float HUD_HEIGHT_PERCENT = 0.35f;
-    uint32_t hudWidth = (uint32_t)(xr.swapchains[0].width * HUD_WIDTH_PERCENT);
-    uint32_t hudHeight = (uint32_t)(xr.swapchains[0].height * HUD_HEIGHT_PERCENT);
+    // Initialize HUD renderer for window-space layer overlay
+    uint32_t hudWidth = (uint32_t)(xr.swapchains[0].width * HUD_WIDTH_FRACTION);
+    uint32_t hudHeight = (uint32_t)(xr.swapchains[0].height * HUD_HEIGHT_FRACTION);
 
     HudRenderer hudRenderer = {};
     bool hudOk = InitializeHudRenderer(hudRenderer, hudWidth, hudHeight);
     if (!hudOk) {
         LOG_WARN("HUD renderer init failed - HUD will not be displayed");
+    }
+
+    // Create HUD swapchain for window-space layer submission
+    std::vector<XrSwapchainImageVulkanKHR> hudSwapImages;
+    if (hudOk) {
+        if (CreateHudSwapchain(xr, hudWidth, hudHeight)) {
+            uint32_t count = xr.hudSwapchain.imageCount;
+            hudSwapImages.resize(count, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
+            xrEnumerateSwapchainImages(xr.hudSwapchain.swapchain, count, &count,
+                (XrSwapchainImageBaseHeader*)hudSwapImages.data());
+            LOG_INFO("HUD swapchain: enumerated %u Vulkan images", count);
+        } else {
+            LOG_WARN("HUD swapchain creation failed - HUD will not be displayed");
+            hudOk = false;
+        }
     }
 
     // Create Vulkan staging buffer (host-visible, persistently mapped) for HUD pixel upload
@@ -588,7 +628,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     std::thread renderThread(RenderThreadFunc, hwnd, &xr, &vkRenderer, swapchainImages,
         hudOk ? &hudRenderer : nullptr, hudWidth, hudHeight,
-        hudStagingBuffer, hudStagingMapped, hudCmdPool);
+        hudStagingBuffer, hudStagingMapped, hudCmdPool,
+        hudOk ? &hudSwapImages : nullptr);
 
     MSG msg = {};
     while (GetMessage(&msg, nullptr, 0, 0) > 0) {
