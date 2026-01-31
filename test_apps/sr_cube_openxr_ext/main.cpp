@@ -20,12 +20,9 @@
 #include "text_overlay.h"
 #include "xr_session.h"
 
-#include <atomic>
 #include <chrono>
-#include <mutex>
 #include <string>
 #include <sstream>
-#include <thread>
 
 using Microsoft::WRL::ComPtr;
 using namespace DirectX;
@@ -37,39 +34,61 @@ static const char* APP_NAME = "sr_cube_openxr_ext";
 static const wchar_t* WINDOW_CLASS = L"SRCubeOpenXRExtClass";
 static const wchar_t* WINDOW_TITLE = L"SR Cube OpenXR Ext - XR_EXT_session_target (Press ESC to exit)";
 
-// Global state (shared between main thread and render thread)
-static InputState g_inputState;            // Protected by g_inputMutex
-static std::mutex g_inputMutex;            // Guards g_inputState + window dimensions
-static std::atomic<bool> g_running{true};  // Atomic: main thread writes, render thread reads
-static UINT g_windowWidth = 1280;          // Protected by g_inputMutex
-static UINT g_windowHeight = 720;          // Protected by g_inputMutex
+// Global state (single-threaded — all accessed from the main thread only)
+static InputState g_inputState;
+static bool g_running = true;
+static UINT g_windowWidth = 1280;
+static UINT g_windowHeight = 720;
+static bool g_inSizeMove = false;  // True while user is dragging/resizing the window
 static const float HUD_WIDTH_PERCENT = 0.30f;
 static const float HUD_HEIGHT_PERCENT = 0.35f;
 
-// Window procedure (runs on main thread)
+// Forward declaration — defined after PerformanceStats
+struct RenderState;
+static RenderState* g_renderState = nullptr;
+static void RenderOneFrame(RenderState& rs);
+
+// Window procedure (runs on main thread — single-threaded, no locking needed)
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    {
-        std::lock_guard<std::mutex> lock(g_inputMutex);
-        UpdateInputState(g_inputState, msg, wParam, lParam);
-    }
+    UpdateInputState(g_inputState, msg, wParam, lParam);
 
     switch (msg) {
     case WM_SIZE:
         if (wParam != SIZE_MINIMIZED) {
-            std::lock_guard<std::mutex> lock(g_inputMutex);
             g_windowWidth = LOWORD(lParam);
             g_windowHeight = HIWORD(lParam);
         }
         return 0;
 
+    case WM_ENTERSIZEMOVE:
+        g_inSizeMove = true;
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+
+    case WM_EXITSIZEMOVE:
+        g_inSizeMove = false;
+        return 0;
+
+    case WM_PAINT:
+        // During drag/resize, DefWindowProc runs a modal loop that blocks our
+        // main message pump.  By leaving the window invalidated (no
+        // BeginPaint/EndPaint), Windows keeps sending WM_PAINT inside that
+        // modal loop, giving us a chance to keep rendering frames.
+        if (g_inSizeMove && g_renderState != nullptr) {
+            RenderOneFrame(*g_renderState);
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
+        break;
+
     case WM_CLOSE:
-        g_running.store(false);
+        g_running = false;
         PostQuitMessage(0);
         return 0;
 
     case WM_KEYDOWN:
         if (wParam == VK_ESCAPE) {
-            g_running.store(false);
+            g_running = false;
             PostQuitMessage(0);
             return 0;
         }
@@ -153,209 +172,172 @@ static void UpdatePerformanceStats(PerformanceStats& stats) {
     }
 }
 
-// Render thread function — runs the OpenXR frame loop independently of the
-// Win32 message pump so that rendering continues even when the user drags or
-// resizes the window (DefWindowProc enters a modal loop that blocks the main
-// thread during those operations).
-static void RenderThreadFunc(
-    HWND hwnd,
-    XrSessionManager* xr,
-    D3D11Renderer* renderer,
-    TextOverlay* textOverlay,
-    std::vector<XrSwapchainImageD3D11KHR>* hudSwapchainImages,
-    ComPtr<ID3D11Texture2D>* depthTextures,
-    ComPtr<ID3D11DepthStencilView>* depthDSVs,
-    std::vector<XrSwapchainImageD3D11KHR>* swapchainImages)
-{
-    LOG_INFO("[RenderThread] Started");
+// State passed to RenderOneFrame (and accessible from WM_PAINT via g_renderState)
+struct RenderState {
+    HWND hwnd;
+    XrSessionManager* xr;
+    D3D11Renderer* renderer;
+    TextOverlay* textOverlay;
+    std::vector<XrSwapchainImageD3D11KHR>* hudSwapchainImages;
+    ComPtr<ID3D11Texture2D>* depthTextures;
+    ComPtr<ID3D11DepthStencilView>* depthDSVs;
+    std::vector<XrSwapchainImageD3D11KHR>* swapchainImages;
+    PerformanceStats* perfStats;
+};
 
-    PerformanceStats perfStats = {};
-    perfStats.lastTime = std::chrono::high_resolution_clock::now();
+// Render a single frame — called from the main loop and from WM_PAINT during
+// drag/resize so that rendering never stalls.
+static void RenderOneFrame(RenderState& rs) {
+    XrSessionManager& xr = *rs.xr;
+    D3D11Renderer& renderer = *rs.renderer;
 
-    while (g_running.load() && !xr->exitRequested) {
-        // Snapshot input state under lock — hold the lock as briefly as possible
-        InputState inputSnapshot;
-        bool resetRequested = false;
-        {
-            std::lock_guard<std::mutex> lock(g_inputMutex);
-            inputSnapshot = g_inputState;
-            resetRequested = g_inputState.resetViewRequested;
-            // Clear one-shot flags so they don't fire again
-            g_inputState.resetViewRequested = false;
-            g_inputState.fullscreenToggleRequested = false;
-        }
+    // Update performance stats
+    UpdatePerformanceStats(*rs.perfStats);
 
-        // Update performance stats
-        UpdatePerformanceStats(perfStats);
+    // Update input-based camera movement (clears resetViewRequested internally)
+    UpdateCameraMovement(g_inputState, rs.perfStats->deltaTime);
 
-        // Update input-based camera movement (operates on local snapshot)
-        UpdateCameraMovement(inputSnapshot, perfStats.deltaTime);
+    // Clear remaining one-shot flags
+    g_inputState.fullscreenToggleRequested = false;
 
-        // Write back camera position (only the render thread updates these via
-        // WASD/QE movement). yaw/pitch/zoomScale are NOT written back because
-        // they are modified by the main thread's WindowProc (mouse drag/scroll)
-        // and writing them back would stomp on concurrent input.
-        // Exception: on view reset, UpdateCameraMovement zeroes everything, so
-        // we must also write back yaw/pitch/zoomScale in that case.
-        {
-            std::lock_guard<std::mutex> lock(g_inputMutex);
-            g_inputState.cameraPosX = inputSnapshot.cameraPosX;
-            g_inputState.cameraPosY = inputSnapshot.cameraPosY;
-            g_inputState.cameraPosZ = inputSnapshot.cameraPosZ;
-            if (resetRequested) {
-                g_inputState.yaw = inputSnapshot.yaw;
-                g_inputState.pitch = inputSnapshot.pitch;
-                g_inputState.zoomScale = inputSnapshot.zoomScale;
-            }
-        }
+    // Update scene (cube rotation)
+    UpdateScene(renderer, rs.perfStats->deltaTime);
 
-        // Update scene (cube rotation)
-        UpdateScene(*renderer, perfStats.deltaTime);
+    // Poll OpenXR events
+    PollEvents(xr);
 
-        // Poll OpenXR events
-        PollEvents(*xr);
+    // Only render if session is running
+    if (xr.sessionRunning) {
+        XrFrameState frameState;
+        if (BeginFrame(xr, frameState)) {
+            XrCompositionLayerProjectionView projectionViews[2] = {};
+            bool hudSubmitted = false;
 
-        // Only render if session is running
-        if (xr->sessionRunning) {
-            XrFrameState frameState;
-            if (BeginFrame(*xr, frameState)) {
-                XrCompositionLayerProjectionView projectionViews[2] = {};
-                bool hudSubmitted = false;
+            if (frameState.shouldRender) {
+                XMMATRIX leftViewMatrix, leftProjMatrix;
+                XMMATRIX rightViewMatrix, rightProjMatrix;
 
-                if (frameState.shouldRender) {
-                    XMMATRIX leftViewMatrix, leftProjMatrix;
-                    XMMATRIX rightViewMatrix, rightProjMatrix;
+                if (LocateViews(xr, frameState.predictedDisplayTime,
+                    leftViewMatrix, leftProjMatrix,
+                    rightViewMatrix, rightProjMatrix,
+                    g_inputState.cameraPosX, g_inputState.cameraPosY, g_inputState.cameraPosZ,
+                    g_inputState.yaw, g_inputState.pitch)) {
 
-                    if (LocateViews(*xr, frameState.predictedDisplayTime,
-                        leftViewMatrix, leftProjMatrix,
-                        rightViewMatrix, rightProjMatrix,
-                        inputSnapshot.cameraPosX, inputSnapshot.cameraPosY, inputSnapshot.cameraPosZ,
-                        inputSnapshot.yaw, inputSnapshot.pitch)) {
+                    // Get raw view poses (pre-player-transform) for projection views
+                    XrViewLocateInfo locateInfo = {XR_TYPE_VIEW_LOCATE_INFO};
+                    locateInfo.viewConfigurationType = xr.viewConfigType;
+                    locateInfo.displayTime = frameState.predictedDisplayTime;
+                    locateInfo.space = xr.localSpace;
 
-                        // Get raw view poses (pre-player-transform) for projection views
-                        XrViewLocateInfo locateInfo = {XR_TYPE_VIEW_LOCATE_INFO};
-                        locateInfo.viewConfigurationType = xr->viewConfigType;
-                        locateInfo.displayTime = frameState.predictedDisplayTime;
-                        locateInfo.space = xr->localSpace;
+                    XrViewState viewState = {XR_TYPE_VIEW_STATE};
+                    uint32_t viewCount = 2;
+                    XrView rawViews[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+                    xrLocateViews(xr.session, &locateInfo, &viewState, 2, &viewCount, rawViews);
 
-                        XrViewState viewState = {XR_TYPE_VIEW_STATE};
-                        uint32_t viewCount = 2;
-                        XrView rawViews[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
-                        xrLocateViews(xr->session, &locateInfo, &viewState, 2, &viewCount, rawViews);
+                    // [Commented out — will be reused for 3D-positioned HUD later]
+                    // ConvergencePlane convPlane = LocateConvergencePlane(rawViews);
 
-                        // [Commented out — will be reused for 3D-positioned HUD later]
-                        // ConvergencePlane convPlane = LocateConvergencePlane(rawViews);
+                    // Render HUD to window-space layer swapchain (once per frame, before eye loop)
+                    if (g_inputState.hudVisible && xr.hasHudSwapchain && rs.hudSwapchainImages && !rs.hudSwapchainImages->empty()) {
+                        uint32_t hudImageIndex;
+                        if (AcquireHudSwapchainImage(xr, hudImageIndex)) {
+                            ID3D11Texture2D* hudTexture = (*rs.hudSwapchainImages)[hudImageIndex].texture;
 
-                        // Render HUD to window-space layer swapchain (once per frame, before eye loop)
-                        if (inputSnapshot.hudVisible && xr->hasHudSwapchain && hudSwapchainImages && !hudSwapchainImages->empty()) {
-                            uint32_t hudImageIndex;
-                            if (AcquireHudSwapchainImage(*xr, hudImageIndex)) {
-                                ID3D11Texture2D* hudTexture = (*hudSwapchainImages)[hudImageIndex].texture;
-
-                                ID3D11RenderTargetView* hudRtv = nullptr;
-                                CreateRenderTargetView(*renderer, hudTexture, &hudRtv);
-                                if (hudRtv) {
-                                    float hudClear[4] = {0.0f, 0.0f, 0.0f, 0.7f};
-                                    renderer->context->ClearRenderTargetView(hudRtv, hudClear);
-                                    hudRtv->Release();
-                                }
-
-                                float sx = xr->hudSwapchain.width / 512.0f;
-                                float sy = xr->hudSwapchain.height / 256.0f;
-
-                                std::wstring stateText = L"Session: ";
-                                stateText += FormatSessionState((int)xr->sessionState);
-                                RenderText(*textOverlay, renderer->device.Get(), hudTexture,
-                                    stateText, 10*sx, 10*sy, 300*sx, 30*sy);
-
-                                std::wstring extText = xr->hasSessionTargetExt ?
-                                    L"XR_EXT_session_target: ACTIVE" :
-                                    L"XR_EXT_session_target: NOT AVAILABLE";
-                                RenderText(*textOverlay, renderer->device.Get(), hudTexture,
-                                    extText, 10*sx, 45*sy, 350*sx, 30*sy, true);
-
-                                std::wstring perfText = FormatPerformanceInfo(perfStats.fps, perfStats.frameTimeMs,
-                                    xr->swapchains[0].width, xr->swapchains[0].height);
-                                RenderText(*textOverlay, renderer->device.Get(), hudTexture,
-                                    perfText, 10*sx, 85*sy, 300*sx, 70*sy, true);
-
-                                std::wstring eyeText = FormatEyeTrackingInfo(xr->eyePosX, xr->eyePosY, xr->eyePosZ, xr->eyeTrackingActive);
-                                RenderText(*textOverlay, renderer->device.Get(), hudTexture,
-                                    eyeText, 10*sx, 165*sy, 300*sx, 70*sy, true);
-
-                                ReleaseHudSwapchainImage(*xr);
-                                hudSubmitted = true;
+                            ID3D11RenderTargetView* hudRtv = nullptr;
+                            CreateRenderTargetView(renderer, hudTexture, &hudRtv);
+                            if (hudRtv) {
+                                float hudClear[4] = {0.0f, 0.0f, 0.0f, 0.7f};
+                                renderer.context->ClearRenderTargetView(hudRtv, hudClear);
+                                hudRtv->Release();
                             }
+
+                            float sx = xr.hudSwapchain.width / 512.0f;
+                            float sy = xr.hudSwapchain.height / 256.0f;
+
+                            std::wstring stateText = L"Session: ";
+                            stateText += FormatSessionState((int)xr.sessionState);
+                            RenderText(*rs.textOverlay, renderer.device.Get(), hudTexture,
+                                stateText, 10*sx, 10*sy, 300*sx, 30*sy);
+
+                            std::wstring extText = xr.hasSessionTargetExt ?
+                                L"XR_EXT_session_target: ACTIVE" :
+                                L"XR_EXT_session_target: NOT AVAILABLE";
+                            RenderText(*rs.textOverlay, renderer.device.Get(), hudTexture,
+                                extText, 10*sx, 45*sy, 350*sx, 30*sy, true);
+
+                            std::wstring perfText = FormatPerformanceInfo(rs.perfStats->fps, rs.perfStats->frameTimeMs,
+                                xr.swapchains[0].width, xr.swapchains[0].height);
+                            RenderText(*rs.textOverlay, renderer.device.Get(), hudTexture,
+                                perfText, 10*sx, 85*sy, 300*sx, 70*sy, true);
+
+                            std::wstring eyeText = FormatEyeTrackingInfo(xr.eyePosX, xr.eyePosY, xr.eyePosZ, xr.eyeTrackingActive);
+                            RenderText(*rs.textOverlay, renderer.device.Get(), hudTexture,
+                                eyeText, 10*sx, 165*sy, 300*sx, 70*sy, true);
+
+                            ReleaseHudSwapchainImage(xr);
+                            hudSubmitted = true;
                         }
+                    }
 
-                        // Render each eye
-                        for (int eye = 0; eye < 2; eye++) {
-                            uint32_t imageIndex;
-                            if (AcquireSwapchainImage(*xr, eye, imageIndex)) {
-                                ID3D11Texture2D* swapchainTexture = swapchainImages[eye][imageIndex].texture;
+                    // Render each eye
+                    for (int eye = 0; eye < 2; eye++) {
+                        uint32_t imageIndex;
+                        if (AcquireSwapchainImage(xr, eye, imageIndex)) {
+                            ID3D11Texture2D* swapchainTexture = rs.swapchainImages[eye][imageIndex].texture;
 
-                                ID3D11RenderTargetView* rtv = nullptr;
-                                CreateRenderTargetView(*renderer, swapchainTexture, &rtv);
+                            ID3D11RenderTargetView* rtv = nullptr;
+                            CreateRenderTargetView(renderer, swapchainTexture, &rtv);
 
-                                D3D11_VIEWPORT vp = {};
-                                vp.Width = (FLOAT)xr->swapchains[eye].width;
-                                vp.Height = (FLOAT)xr->swapchains[eye].height;
-                                vp.MaxDepth = 1.0f;
-                                renderer->context->RSSetViewports(1, &vp);
+                            D3D11_VIEWPORT vp = {};
+                            vp.Width = (FLOAT)xr.swapchains[eye].width;
+                            vp.Height = (FLOAT)xr.swapchains[eye].height;
+                            vp.MaxDepth = 1.0f;
+                            renderer.context->RSSetViewports(1, &vp);
 
-                                float clearColor[4] = {0.05f, 0.05f, 0.25f, 1.0f};
-                                renderer->context->ClearRenderTargetView(rtv, clearColor);
-                                renderer->context->ClearDepthStencilView(depthDSVs[eye].Get(),
-                                    D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
+                            float clearColor[4] = {0.05f, 0.05f, 0.25f, 1.0f};
+                            renderer.context->ClearRenderTargetView(rtv, clearColor);
+                            renderer.context->ClearDepthStencilView(rs.depthDSVs[eye].Get(),
+                                D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
 
-                                XMMATRIX viewMatrix = (eye == 0) ? leftViewMatrix : rightViewMatrix;
-                                XMMATRIX projMatrix = (eye == 0) ? leftProjMatrix : rightProjMatrix;
+                            XMMATRIX viewMatrix = (eye == 0) ? leftViewMatrix : rightViewMatrix;
+                            XMMATRIX projMatrix = (eye == 0) ? leftProjMatrix : rightProjMatrix;
 
-                                RenderScene(*renderer, rtv, depthDSVs[eye].Get(),
-                                    xr->swapchains[eye].width, xr->swapchains[eye].height,
-                                    viewMatrix, projMatrix,
-                                    inputSnapshot.zoomScale);
+                            RenderScene(renderer, rtv, rs.depthDSVs[eye].Get(),
+                                xr.swapchains[eye].width, xr.swapchains[eye].height,
+                                viewMatrix, projMatrix,
+                                g_inputState.zoomScale);
 
-                                if (rtv) rtv->Release();
+                            if (rtv) rtv->Release();
 
-                                ReleaseSwapchainImage(*xr, eye);
+                            ReleaseSwapchainImage(xr, eye);
 
-                                projectionViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
-                                projectionViews[eye].subImage.swapchain = xr->swapchains[eye].swapchain;
-                                projectionViews[eye].subImage.imageRect.offset = {0, 0};
-                                projectionViews[eye].subImage.imageRect.extent = {
-                                    (int32_t)xr->swapchains[eye].width,
-                                    (int32_t)xr->swapchains[eye].height
-                                };
-                                projectionViews[eye].subImage.imageArrayIndex = 0;
+                            projectionViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
+                            projectionViews[eye].subImage.swapchain = xr.swapchains[eye].swapchain;
+                            projectionViews[eye].subImage.imageRect.offset = {0, 0};
+                            projectionViews[eye].subImage.imageRect.extent = {
+                                (int32_t)xr.swapchains[eye].width,
+                                (int32_t)xr.swapchains[eye].height
+                            };
+                            projectionViews[eye].subImage.imageArrayIndex = 0;
 
-                                projectionViews[eye].pose = rawViews[eye].pose;
-                                projectionViews[eye].fov = rawViews[eye].fov;
-                            }
+                            projectionViews[eye].pose = rawViews[eye].pose;
+                            projectionViews[eye].fov = rawViews[eye].fov;
                         }
                     }
                 }
-
-                // Submit frame with window-space HUD layer if visible
-                if (hudSubmitted) {
-                    EndFrameWithWindowSpaceHud(*xr, frameState.predictedDisplayTime, projectionViews,
-                        0.0f, 0.0f, HUD_WIDTH_PERCENT, HUD_HEIGHT_PERCENT, 0.0f);
-                } else {
-                    EndFrame(*xr, frameState.predictedDisplayTime, projectionViews);
-                }
             }
-        } else {
-            Sleep(100);
+
+            // Submit frame with window-space HUD layer if visible
+            if (hudSubmitted) {
+                EndFrameWithWindowSpaceHud(xr, frameState.predictedDisplayTime, projectionViews,
+                    0.0f, 0.0f, HUD_WIDTH_PERCENT, HUD_HEIGHT_PERCENT, 0.0f);
+            } else {
+                EndFrame(xr, frameState.predictedDisplayTime, projectionViews);
+            }
         }
+    } else {
+        Sleep(100);
     }
-
-    // If XR requested exit while the window is still open, post WM_CLOSE to
-    // unblock GetMessage on the main thread.
-    if (xr->exitRequested && g_running.load()) {
-        PostMessage(hwnd, WM_CLOSE, 0, 0);
-    }
-
-    LOG_INFO("[RenderThread] Exiting");
 }
 
 // Main entry point
@@ -529,31 +511,44 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     LOG_INFO("");
     LOG_INFO("=== Entering main loop ===");
     LOG_INFO("XR rendering happens in the application window (XR_EXT_session_target)");
-    LOG_INFO("Render thread handles OpenXR frame loop; main thread handles Win32 messages");
+    LOG_INFO("Single-threaded: message pump + render on the main thread (WM_PAINT during drag/resize)");
     LOG_INFO("Controls: WASD=Fly, QE=Up/Down, Mouse=Look, Space/DblClick=Reset, P=Parallax, TAB=HUD, ESC=Quit");
     LOG_INFO("");
 
-    // Launch render thread — the frame loop runs independently of the message pump
-    // so that rendering continues even when DefWindowProc blocks during window drag/resize.
-    std::thread renderThread(RenderThreadFunc, hwnd, &xr, &renderer, &textOverlay,
-        &hudSwapchainImages, depthTextures, depthDSVs, swapchainImages);
+    PerformanceStats perfStats = {};
+    perfStats.lastTime = std::chrono::high_resolution_clock::now();
 
-    // Main thread: blocking Win32 message pump.
-    // GetMessage blocks efficiently (no CPU spin) until a message arrives.
-    // When the window is being dragged/resized, DefWindowProc runs a modal loop
-    // here on the main thread — but the render thread keeps submitting frames.
+    RenderState rs = {};
+    rs.hwnd = hwnd;
+    rs.xr = &xr;
+    rs.renderer = &renderer;
+    rs.textOverlay = &textOverlay;
+    rs.hudSwapchainImages = &hudSwapchainImages;
+    rs.depthTextures = depthTextures;
+    rs.depthDSVs = depthDSVs;
+    rs.swapchainImages = swapchainImages;
+    rs.perfStats = &perfStats;
+    g_renderState = &rs;
+
+    // Single-threaded main loop: pump messages, then render one frame.
+    // During drag/resize, DefWindowProc enters a modal loop that blocks
+    // PeekMessage — WM_PAINT fires inside that modal loop to keep rendering.
     MSG msg = {};
-    while (GetMessage(&msg, nullptr, 0, 0) > 0) {
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
+    while (g_running && !xr.exitRequested) {
+        while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) {
+                g_running = false;
+                break;
+            }
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
+        if (!g_running) break;
+
+        RenderOneFrame(rs);
     }
 
-    // GetMessage returned 0 (WM_QUIT) or -1 (error) — signal render thread to stop
-    g_running.store(false);
-
-    LOG_INFO("Main thread: waiting for render thread to finish...");
-    renderThread.join();
-    LOG_INFO("Main thread: render thread joined");
+    g_renderState = nullptr;
 
     // Cleanup
     LOG_INFO("");

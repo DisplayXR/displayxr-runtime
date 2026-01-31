@@ -777,24 +777,6 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	// Get immediate context
 	c->device->GetImmediateContext(&c->context);
 
-	// Enable D3D11 multithread protection. The immediate context is shared between
-	// the render thread (frame loop / weave) and the main thread (Win32 message
-	// pump / DXGI housekeeping). Without this, concurrent access crashes — particularly
-	// on mouse-up when DefWindowProc triggers DXGI operations while weave() runs on
-	// the render thread. See doc/XR_EXT_session_target/mouse-race-condition.md
-	{
-		ID3D11Multithread *mt = nullptr;
-		if (SUCCEEDED(c->context->QueryInterface(__uuidof(ID3D11Multithread),
-		                                         reinterpret_cast<void **>(&mt))) &&
-		    mt != nullptr) {
-			mt->SetMultithreadProtected(TRUE);
-			mt->Release();
-			U_LOG_W("D3D11 multithread protection enabled on immediate context");
-		} else {
-			U_LOG_W("Failed to enable D3D11 multithread protection");
-		}
-	}
-
 	// Get DXGI factory
 	IDXGIDevice *dxgi_device;
 	HRESULT hr = c->device->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void **>(&dxgi_device));
