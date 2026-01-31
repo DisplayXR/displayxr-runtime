@@ -240,7 +240,8 @@ jobs:
           cd test_apps/sr_cube_openxr_ext
           cmake -S . -B build -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
-            -DOpenXR_ROOT="${{ github.workspace }}/openxr_sdk"
+            -DOpenXR_ROOT="${{ github.workspace }}/openxr_sdk" `
+            -DBUILD_NUM="${{ github.run_number }}"
           cmake --build build
 
       - name: Copy required DLLs to test app build
@@ -266,17 +267,17 @@ jobs:
       - name: Verify binary architectures
         run: |
           Write-Host "=== Checking binary architectures ==="
-          $exe = "test_apps/sr_cube_openxr_ext/build/sr_cube_openxr_ext.exe"
+          $exe = Get-ChildItem -Path "test_apps/sr_cube_openxr_ext/build/sr_cube_openxr_ext.*.exe" | Select-Object -First 1
           $dll = "test_apps/sr_cube_openxr_ext/build/openxr_loader.dll"
 
-          Write-Host "`nEXE architecture:"
-          dumpbin /headers $exe | Select-String -Pattern "machine \(|File Type:"
+          Write-Host "`nEXE architecture ($($exe.Name)):"
+          dumpbin /headers $exe.FullName | Select-String -Pattern "machine \(|File Type:"
 
           Write-Host "`nDLL architecture:"
           dumpbin /headers $dll | Select-String -Pattern "machine \(|File Type:"
 
           Write-Host "`nDependencies of EXE:"
-          dumpbin /dependents $exe
+          dumpbin /dependents $exe.FullName
 
           Write-Host "`nDependencies of openxr_loader.dll:"
           dumpbin /dependents $dll
@@ -290,7 +291,7 @@ jobs:
           name: SRCubeOpenXRExt
           if-no-files-found: error
           path: |
-            test_apps/sr_cube_openxr_ext/build/sr_cube_openxr_ext.exe
+            test_apps/sr_cube_openxr_ext/build/sr_cube_openxr_ext.*.exe
             test_apps/sr_cube_openxr_ext/build/*.dll
 
   # Standalone Vulkan cube test (no OpenXR) - DISABLED: removed in test_apps refactor
@@ -351,7 +352,8 @@ jobs:
           cd test_apps/sr_cube_native
           cmake -S . -B build -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
-            -DCMAKE_PREFIX_PATH="${{ github.workspace }}/LeiaSR-SDK-$env:SR_TAG-win64"
+            -DCMAKE_PREFIX_PATH="${{ github.workspace }}/LeiaSR-SDK-$env:SR_TAG-win64" `
+            -DBUILD_NUM="${{ github.run_number }}"
           cmake --build build
 
       - name: Copy required DLLs
@@ -371,7 +373,7 @@ jobs:
           name: SRCubeNative
           if-no-files-found: error
           path: |
-            test_apps/sr_cube_native/build/sr_cube_native.exe
+            test_apps/sr_cube_native/build/sr_cube_native.*.exe
             test_apps/sr_cube_native/build/*.dll
 
   # D3D11 test app WITHOUT session_target extension - Standard OpenXR app
@@ -412,7 +414,8 @@ jobs:
           cd test_apps/sr_cube_openxr
           cmake -S . -B build -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
-            -DOpenXR_ROOT="${{ github.workspace }}/openxr_sdk"
+            -DOpenXR_ROOT="${{ github.workspace }}/openxr_sdk" `
+            -DBUILD_NUM="${{ github.run_number }}"
           cmake --build build
 
       - name: Copy required DLLs
@@ -431,7 +434,7 @@ jobs:
           name: SRCubeOpenXR
           if-no-files-found: error
           path: |
-            test_apps/sr_cube_openxr/build/sr_cube_openxr.exe
+            test_apps/sr_cube_openxr/build/sr_cube_openxr.*.exe
             test_apps/sr_cube_openxr/build/*.dll
 
   # D3D12 test app with XR_EXT_session_target
@@ -472,7 +475,8 @@ jobs:
           cd test_apps/sr_cube_openxr_ext_d3d12
           cmake -S . -B build -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
-            -DOpenXR_ROOT="${{ github.workspace }}/openxr_sdk"
+            -DOpenXR_ROOT="${{ github.workspace }}/openxr_sdk" `
+            -DBUILD_NUM="${{ github.run_number }}"
           cmake --build build
 
       - name: Copy required DLLs
@@ -491,7 +495,7 @@ jobs:
           name: SRCubeOpenXRExtD3D12
           if-no-files-found: error
           path: |
-            test_apps/sr_cube_openxr_ext_d3d12/build/sr_cube_openxr_ext_d3d12.exe
+            test_apps/sr_cube_openxr_ext_d3d12/build/sr_cube_openxr_ext_d3d12.*.exe
             test_apps/sr_cube_openxr_ext_d3d12/build/*.dll
 
   # OpenGL test app with XR_EXT_session_target
@@ -532,7 +536,8 @@ jobs:
           cd test_apps/sr_cube_openxr_ext_gl
           cmake -S . -B build -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
-            -DOpenXR_ROOT="${{ github.workspace }}/openxr_sdk"
+            -DOpenXR_ROOT="${{ github.workspace }}/openxr_sdk" `
+            -DBUILD_NUM="${{ github.run_number }}"
           cmake --build build
 
       - name: Copy required DLLs
@@ -551,7 +556,7 @@ jobs:
           name: SRCubeOpenXRExtGL
           if-no-files-found: error
           path: |
-            test_apps/sr_cube_openxr_ext_gl/build/sr_cube_openxr_ext_gl.exe
+            test_apps/sr_cube_openxr_ext_gl/build/sr_cube_openxr_ext_gl.*.exe
             test_apps/sr_cube_openxr_ext_gl/build/*.dll
 
   # Vulkan test app with XR_EXT_session_target (requires Vulkan SDK)
@@ -598,7 +603,8 @@ jobs:
           cd test_apps/sr_cube_openxr_ext_vk
           cmake -S . -B build -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
-            -DOpenXR_ROOT="${{ github.workspace }}/openxr_sdk"
+            -DOpenXR_ROOT="${{ github.workspace }}/openxr_sdk" `
+            -DBUILD_NUM="${{ github.run_number }}"
           cmake --build build
 
       - name: Copy required DLLs
@@ -617,5 +623,5 @@ jobs:
           name: SRCubeOpenXRExtVK
           if-no-files-found: error
           path: |
-            test_apps/sr_cube_openxr_ext_vk/build/sr_cube_openxr_ext_vk.exe
+            test_apps/sr_cube_openxr_ext_vk/build/sr_cube_openxr_ext_vk.*.exe
             test_apps/sr_cube_openxr_ext_vk/build/*.dll

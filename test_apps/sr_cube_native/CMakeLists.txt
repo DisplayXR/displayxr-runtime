@@ -12,6 +12,11 @@ if(MSVC)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
+# Build number (from CI or default to 0)
+if(NOT DEFINED BUILD_NUM)
+    set(BUILD_NUM "0")
+endif()
+
 # Find LeiaSR SDK
 set(LEIASR_SDKROOT "$ENV{LEIASR_SDKROOT}" CACHE PATH "Path to LeiaSR SDK root")
 
@@ -41,6 +46,10 @@ add_executable(sr_cube_native WIN32
     main.cpp
     sr_cube_native.manifest
     resource.rc
+)
+
+set_target_properties(sr_cube_native PROPERTIES
+    OUTPUT_NAME "sr_cube_native.${BUILD_NUM}"
 )
 
 target_link_libraries(sr_cube_native PRIVATE

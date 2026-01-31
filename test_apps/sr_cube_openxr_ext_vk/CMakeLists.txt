@@ -11,6 +11,11 @@ if(MSVC)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
+# Build number (from CI or default to 0)
+if(NOT DEFINED BUILD_NUM)
+    set(BUILD_NUM "0")
+endif()
+
 # Find Vulkan SDK
 find_package(Vulkan QUIET)
 if(NOT Vulkan_FOUND)
@@ -86,6 +91,10 @@ add_executable(sr_cube_openxr_ext_vk WIN32
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/text_overlay.h
     sr_cube_openxr_ext_vk.manifest
     resource.rc
+)
+
+set_target_properties(sr_cube_openxr_ext_vk PROPERTIES
+    OUTPUT_NAME "sr_cube_openxr_ext_vk.${BUILD_NUM}"
 )
 
 target_link_libraries(sr_cube_openxr_ext_vk PRIVATE
