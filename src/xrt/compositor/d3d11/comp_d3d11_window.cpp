@@ -4,8 +4,10 @@
  * @file
  * @brief  D3D11 compositor self-created window implementation.
  *
- * This module creates a window on a separate thread for the D3D11 native
+ * This module creates a window on the calling thread for the D3D11 native
  * compositor when no window handle is provided by the application.
+ * The caller is responsible for pumping Win32 messages (either via
+ * @ref comp_d3d11_window_pump_messages or its own PeekMessage loop).
  *
  * Based on comp_window_mswin.c but simplified for D3D11 compositor use.
  *
@@ -18,7 +20,6 @@
 #include "util/u_debug.h"
 #include "util/u_logging.h"
 #include "util/u_misc.h"
-#include "os/os_threading.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -43,9 +44,6 @@ static MONITORINFOEX g_monitor_info[16] = {};
  */
 struct comp_d3d11_window
 {
-	//! Thread helper for window message loop
-	struct os_thread_helper oth;
-
 	//! Module instance
 	HINSTANCE instance;
 
@@ -67,11 +65,14 @@ struct comp_d3d11_window
 	//! True if user closed the window
 	bool should_exit;
 
-	//! True when thread has started and window is ready
-	bool thread_started;
+	//! True while inside a modal move/size loop (WM_ENTERSIZEMOVE..WM_EXITSIZEMOVE)
+	bool in_size_move;
 
-	//! True when thread has exited
-	bool thread_exited;
+	//! Callback invoked from WM_PAINT during drag/resize
+	void (*repaint_callback)(void *userdata);
+
+	//! Opaque pointer forwarded to @ref repaint_callback
+	void *repaint_userdata;
 };
 
 // Forward declarations
@@ -192,7 +193,21 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	}
 
 	switch (message) {
+	case WM_ENTERSIZEMOVE:
+		w->in_size_move = true;
+		InvalidateRect(hWnd, NULL, FALSE);
+		return 0;
+
+	case WM_EXITSIZEMOVE:
+		w->in_size_move = false;
+		return 0;
+
 	case WM_PAINT:
+		if (w->in_size_move && w->repaint_callback != NULL) {
+			w->repaint_callback(w->repaint_userdata);
+			InvalidateRect(hWnd, NULL, FALSE); // keep WM_PAINT firing
+			return 0;
+		}
 		ValidateRect(hWnd, NULL);
 		break;
 
@@ -233,130 +248,6 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	return 0;
 }
 
-/*!
- * Create and run the window.
- */
-static void
-window_loop(struct comp_d3d11_window *w)
-{
-	RECT rc = {0, 0, (LONG)w->width, (LONG)w->height};
-
-	// Position on Leia/secondary monitor if available
-	int monitor_x = 0;
-	int monitor_y = 0;
-	if (get_leia_display_top_left(&monitor_x, &monitor_y)) {
-		rc.left = monitor_x;
-		rc.top = monitor_y;
-		rc.right = monitor_x + w->width;
-		rc.bottom = monitor_y + w->height;
-	}
-
-	U_LOG_I("D3D11 window: Creating window at (%d, %d) size %ux%u", rc.left, rc.top, w->width, w->height);
-
-	w->hwnd = CreateWindowExW(0, szWindowClass, L"Monado D3D11", WS_OVERLAPPEDWINDOW, rc.left, rc.top,
-	                          rc.right - rc.left, rc.bottom - rc.top, NULL, NULL, w->instance, NULL);
-
-	if (w->hwnd == NULL) {
-		DWORD err = GetLastError();
-		U_LOG_E("D3D11 window: CreateWindowExW failed with error %lu", err);
-		return;
-	}
-
-	// Set fullscreen by default unless XRT_COMPOSITOR_START_WINDOWED=1
-	w->is_fullscreen = !debug_get_bool_option_start_windowed();
-	if (w->is_fullscreen) {
-		set_fullscreen(w->hwnd, true);
-	}
-
-	// Associate window data
-	SetPropW(w->hwnd, szWindowData, w);
-	SetWindowLongPtr(w->hwnd, GWLP_USERDATA, (LONG_PTR)w);
-	ShowWindow(w->hwnd, SW_SHOWDEFAULT);
-	UpdateWindow(w->hwnd);
-
-	U_LOG_I("D3D11 window: Window created successfully, signaling parent thread");
-
-	// Signal parent thread that window is ready
-	os_thread_helper_lock(&w->oth);
-	w->thread_started = true;
-	os_thread_helper_signal_locked(&w->oth);
-	os_thread_helper_unlock(&w->oth);
-
-	U_LOG_I("D3D11 window: Starting message loop");
-
-	// Message loop
-	while (os_thread_helper_is_running(&w->oth)) {
-		MSG msg;
-		while (PeekMessageW(&msg, w->hwnd, 0, 0, PM_REMOVE)) {
-			TranslateMessage(&msg);
-			DispatchMessageW(&msg);
-		}
-		// Small sleep to avoid busy-waiting
-		Sleep(1);
-	}
-
-	// Clean up window if still valid
-	if (w->hwnd != NULL) {
-		DestroyWindow(w->hwnd);
-		w->hwnd = NULL;
-	}
-}
-
-/*!
- * Mark thread as exited and signal parent.
- */
-static void
-mark_thread_exited(struct comp_d3d11_window *w)
-{
-	os_thread_helper_lock(&w->oth);
-	w->thread_exited = true;
-	os_thread_helper_signal_locked(&w->oth);
-	os_thread_helper_unlock(&w->oth);
-}
-
-/*!
- * Window thread entry point.
- */
-static void *
-window_thread_func(void *ptr)
-{
-	struct comp_d3d11_window *w = (struct comp_d3d11_window *)ptr;
-	os_thread_helper_name(&w->oth, "D3D11 Compositor Window Thread");
-
-	// Register window class
-	WNDCLASSEXW wcex = {};
-	wcex.cbSize = sizeof(WNDCLASSEXW);
-	wcex.style = CS_HREDRAW | CS_VREDRAW;
-	wcex.lpfnWndProc = wnd_proc;
-	wcex.cbClsExtra = 0;
-	wcex.cbWndExtra = 0;
-	wcex.hInstance = w->instance;
-	wcex.lpszClassName = szWindowClass;
-	wcex.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
-
-	U_LOG_I("D3D11 window: Registering window class");
-	w->window_class = RegisterClassExW(&wcex);
-	if (!w->window_class) {
-		DWORD err = GetLastError();
-		U_LOG_E("D3D11 window: RegisterClassExW failed with error %lu", err);
-		mark_thread_exited(w);
-		return NULL;
-	}
-
-	// Run window loop
-	window_loop(w);
-
-	// Unregister window class
-	U_LOG_I("D3D11 window: Unregistering window class");
-	UnregisterClassW((LPCWSTR)(uintptr_t)w->window_class, NULL);
-
-	mark_thread_exited(w);
-	os_thread_helper_signal_stop(&w->oth);
-
-	U_LOG_I("D3D11 window: Thread exiting");
-	return NULL;
-}
-
 /*
  *
  * Public API
@@ -371,38 +262,79 @@ comp_d3d11_window_create(uint32_t width, uint32_t height, struct comp_d3d11_wind
 		return XRT_ERROR_ALLOCATION;
 	}
 
-	if (os_thread_helper_init(&w->oth) != 0) {
-		U_LOG_E("D3D11 window: Failed to init thread helper");
-		free(w);
-		return XRT_ERROR_THREADING_INIT_FAILURE;
-	}
-
 	w->instance = GetModuleHandle(NULL);
 	w->width = width > 0 ? width : 1920;
 	w->height = height > 0 ? height : 1080;
 
-	U_LOG_I("D3D11 window: Starting window thread (%ux%u)", w->width, w->height);
+	U_LOG_I("D3D11 window: Creating window on calling thread (%ux%u)", w->width, w->height);
 
-	if (os_thread_helper_start(&w->oth, window_thread_func, w) != 0) {
-		U_LOG_E("D3D11 window: Failed to start window thread");
-		os_thread_helper_destroy(&w->oth);
-		free(w);
-		return XRT_ERROR_THREADING_INIT_FAILURE;
+	// Register window class
+	WNDCLASSEXW wcex = {};
+	wcex.cbSize = sizeof(WNDCLASSEXW);
+	wcex.style = CS_HREDRAW | CS_VREDRAW;
+	wcex.lpfnWndProc = wnd_proc;
+	wcex.cbClsExtra = 0;
+	wcex.cbWndExtra = 0;
+	wcex.hInstance = w->instance;
+	wcex.lpszClassName = szWindowClass;
+	wcex.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+
+	w->window_class = RegisterClassExW(&wcex);
+	if (!w->window_class) {
+		DWORD err = GetLastError();
+		if (err == ERROR_CLASS_ALREADY_EXISTS) {
+			// Another session already registered the class - reuse it
+			U_LOG_I("D3D11 window: Window class already registered, reusing");
+		} else {
+			U_LOG_E("D3D11 window: RegisterClassExW failed with error %lu", err);
+			free(w);
+			return XRT_ERROR_DEVICE_CREATION_FAILED;
+		}
 	}
 
-	// Wait for thread to create window
-	os_thread_helper_lock(&w->oth);
-	while (!w->thread_started && !w->thread_exited) {
-		os_thread_helper_wait_locked(&w->oth);
+	// Position on Leia/secondary monitor if available
+	RECT rc = {0, 0, (LONG)w->width, (LONG)w->height};
+	int monitor_x = 0;
+	int monitor_y = 0;
+	if (get_leia_display_top_left(&monitor_x, &monitor_y)) {
+		rc.left = monitor_x;
+		rc.top = monitor_y;
+		rc.right = monitor_x + w->width;
+		rc.bottom = monitor_y + w->height;
 	}
-	bool success = w->thread_started && !w->thread_exited && w->hwnd != NULL;
-	os_thread_helper_unlock(&w->oth);
 
-	if (!success) {
-		U_LOG_E("D3D11 window: Window creation failed");
-		os_thread_helper_destroy(&w->oth);
+	U_LOG_I("D3D11 window: Creating window at (%d, %d) size %ux%u", (int)rc.left, (int)rc.top, w->width, w->height);
+
+	w->hwnd = CreateWindowExW(0, szWindowClass, L"Monado D3D11", WS_OVERLAPPEDWINDOW, rc.left, rc.top,
+	                          rc.right - rc.left, rc.bottom - rc.top, NULL, NULL, w->instance, NULL);
+
+	if (w->hwnd == NULL) {
+		DWORD err = GetLastError();
+		U_LOG_E("D3D11 window: CreateWindowExW failed with error %lu", err);
+		if (w->window_class) {
+			UnregisterClassW((LPCWSTR)(uintptr_t)w->window_class, w->instance);
+		}
 		free(w);
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+
+	// Set fullscreen by default unless XRT_COMPOSITOR_START_WINDOWED=1
+	w->is_fullscreen = !debug_get_bool_option_start_windowed();
+	if (w->is_fullscreen) {
+		set_fullscreen(w->hwnd, true);
+	}
+
+	// Associate window data
+	SetPropW(w->hwnd, szWindowData, w);
+	SetWindowLongPtr(w->hwnd, GWLP_USERDATA, (LONG_PTR)w);
+	ShowWindow(w->hwnd, SW_SHOWDEFAULT);
+	UpdateWindow(w->hwnd);
+
+	// Pump initial messages so the window is fully visible before we return
+	MSG msg;
+	while (PeekMessageW(&msg, w->hwnd, 0, 0, PM_REMOVE)) {
+		TranslateMessage(&msg);
+		DispatchMessageW(&msg);
 	}
 
 	U_LOG_I("D3D11 window: Window created successfully, HWND=%p", (void *)w->hwnd);
@@ -421,8 +353,14 @@ comp_d3d11_window_destroy(struct comp_d3d11_window **window)
 
 	U_LOG_I("D3D11 window: Destroying window");
 
-	// Stop the thread (this will destroy the window)
-	os_thread_helper_destroy(&w->oth);
+	if (w->hwnd != NULL) {
+		DestroyWindow(w->hwnd);
+		w->hwnd = NULL;
+	}
+
+	if (w->window_class) {
+		UnregisterClassW((LPCWSTR)(uintptr_t)w->window_class, w->instance);
+	}
 
 	free(w);
 	*window = NULL;
@@ -443,7 +381,7 @@ comp_d3d11_window_is_valid(struct comp_d3d11_window *window)
 	if (window == NULL) {
 		return false;
 	}
-	return window->hwnd != NULL && !window->should_exit && !window->thread_exited;
+	return window->hwnd != NULL && !window->should_exit;
 }
 
 extern "C" void
@@ -456,4 +394,30 @@ comp_d3d11_window_get_dimensions(struct comp_d3d11_window *window, uint32_t *out
 	}
 	*out_width = window->width;
 	*out_height = window->height;
+}
+
+extern "C" void
+comp_d3d11_window_pump_messages(struct comp_d3d11_window *window)
+{
+	if (window == NULL || window->hwnd == NULL) {
+		return;
+	}
+
+	MSG msg;
+	while (PeekMessageW(&msg, window->hwnd, 0, 0, PM_REMOVE)) {
+		TranslateMessage(&msg);
+		DispatchMessageW(&msg);
+	}
+}
+
+extern "C" void
+comp_d3d11_window_set_repaint_callback(struct comp_d3d11_window *window,
+                                        void (*callback)(void *userdata),
+                                        void *userdata)
+{
+	if (window == NULL) {
+		return;
+	}
+	window->repaint_callback = callback;
+	window->repaint_userdata = userdata;
 }

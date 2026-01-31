@@ -29,9 +29,11 @@ struct comp_d3d11_window;
 /*!
  * Create a self-owned window for the D3D11 compositor.
  *
- * This creates a window on a separate thread with a Win32 message pump.
- * The window is automatically positioned on the Leia display if found,
- * or on a secondary monitor, or on the primary display as fallback.
+ * This creates a window on the calling thread. The caller must pump
+ * messages via @ref comp_d3d11_window_pump_messages or its own
+ * PeekMessage loop. The window is automatically positioned on the Leia
+ * display if found, or on a secondary monitor, or on the primary display
+ * as fallback.
  *
  * By default, the window starts in fullscreen mode unless the environment
  * variable XRT_COMPOSITOR_START_WINDOWED=1 is set.
@@ -48,7 +50,7 @@ comp_d3d11_window_create(uint32_t width, uint32_t height, struct comp_d3d11_wind
 /*!
  * Destroy the self-owned window.
  *
- * This stops the window thread and destroys the window.
+ * Must be called from the thread that created the window.
  *
  * @param window Pointer to window handle (set to NULL after destruction)
  */
@@ -86,6 +88,34 @@ void
 comp_d3d11_window_get_dimensions(struct comp_d3d11_window *window,
                                   uint32_t *out_width,
                                   uint32_t *out_height);
+
+/*!
+ * Pump Win32 messages for the window (non-blocking).
+ *
+ * This dispatches pending messages for the window. The caller may also
+ * use its own PeekMessage(NULL, ...) loop which will dispatch messages
+ * for all windows on the thread, including this one.
+ *
+ * @param window The window object
+ */
+void
+comp_d3d11_window_pump_messages(struct comp_d3d11_window *window);
+
+/*!
+ * Set a callback invoked from WM_PAINT during drag/resize.
+ *
+ * During a modal move/size loop the normal render loop cannot run.
+ * This callback allows the compositor to re-present the last frame
+ * so the window contents stay up-to-date.
+ *
+ * @param window    The window object
+ * @param callback  Function to call (NULL to clear)
+ * @param userdata  Opaque pointer forwarded to @p callback
+ */
+void
+comp_d3d11_window_set_repaint_callback(struct comp_d3d11_window *window,
+                                        void (*callback)(void *userdata),
+                                        void *userdata);
 
 #ifdef __cplusplus
 }

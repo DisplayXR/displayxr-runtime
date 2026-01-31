@@ -671,12 +671,62 @@ d3d11_compositor_layer_commit_with_semaphore(struct xrt_compositor *xc,
 	return d3d11_compositor_layer_commit(xc, XRT_GRAPHICS_SYNC_HANDLE_INVALID);
 }
 
+/*!
+ * Repaint callback invoked from WM_PAINT during modal drag/resize.
+ *
+ * Re-weaves the last stereo frame and presents it so the window
+ * contents stay up-to-date while the normal render loop is blocked.
+ */
+static void
+d3d11_compositor_repaint(void *userdata)
+{
+	comp_d3d11_compositor *c = (comp_d3d11_compositor *)userdata;
+	std::unique_lock<std::mutex> lock(c->mutex, std::try_to_lock);
+	if (!lock.owns_lock()) {
+		return; // skip if mutex is held
+	}
+
+	uint32_t target_index;
+	if (comp_d3d11_target_acquire(c->target, &target_index) != XRT_SUCCESS) {
+		return;
+	}
+
+#ifdef XRT_HAVE_LEIA_SR_D3D11
+	if (c->weaver != nullptr && leiasr_d3d11_is_ready(c->weaver)) {
+		void *stereo_srv = comp_d3d11_renderer_get_stereo_srv(c->renderer);
+		uint32_t view_width, view_height;
+		comp_d3d11_renderer_get_view_dimensions(c->renderer, &view_width, &view_height);
+
+		uint32_t target_width, target_height;
+		comp_d3d11_target_get_dimensions(c->target, &target_width, &target_height);
+
+		leiasr_d3d11_set_input_texture(c->weaver, stereo_srv, view_width, view_height,
+		                                DXGI_FORMAT_R8G8B8A8_UNORM);
+
+		D3D11_VIEWPORT vp = {};
+		vp.Width = (float)target_width;
+		vp.Height = (float)target_height;
+		vp.MaxDepth = 1.0f;
+		c->context->RSSetViewports(1, &vp);
+
+		leiasr_d3d11_weave(c->weaver);
+	}
+#endif
+
+	comp_d3d11_target_present(c->target, 1);
+}
+
 static void
 d3d11_compositor_destroy(struct xrt_compositor *xc)
 {
 	struct comp_d3d11_compositor *c = d3d11_comp(xc);
 
 	U_LOG_I("Destroying D3D11 compositor");
+
+	// Clear repaint callback before destroying resources it references
+	if (c->owns_window && c->own_window != nullptr) {
+		comp_d3d11_window_set_repaint_callback(c->own_window, NULL, NULL);
+	}
 
 #ifdef XRT_FEATURE_DEBUG_GUI
 	// Stop debug GUI first (before destroying resources it may reference)
@@ -914,6 +964,11 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 		U_LOG_E("Failed to create D3D11 renderer");
 		d3d11_compositor_destroy(&c->base.base);
 		return xret;
+	}
+
+	// Register WM_PAINT repaint callback so the window stays up-to-date during drag/resize
+	if (c->owns_window && c->own_window != nullptr) {
+		comp_d3d11_window_set_repaint_callback(c->own_window, d3d11_compositor_repaint, c);
 	}
 
 #ifdef XRT_FEATURE_DEBUG_GUI
