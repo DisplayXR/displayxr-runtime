@@ -670,9 +670,16 @@ jobs:
           mkdir -p ~/.config/rclone
           echo "$RCLONE_CONFIG_CONTENTS" > ~/.config/rclone/rclone.conf
 
-      - name: Upload test apps to OneDrive
+      - name: Zip test apps
         run: |
-          destPath="SANDBOX/RUNTIMES + SDK + PLUGINS/OpenXR/SRTestApps-${{ github.run_number }}"
-          echo "Uploading TestApps to OneDrive: $destPath"
-          rclone copy TestApps "onedrive:$destPath" --progress
+          cd TestApps
+          zip -r ../SRTestApps-${{ github.run_number }}.zip .
+          cd ..
+          ls -lh SRTestApps-${{ github.run_number }}.zip
+
+      - name: Upload test apps zip to OneDrive
+        run: |
+          destPath="SANDBOX/RUNTIMES + SDK + PLUGINS/OpenXR"
+          echo "Uploading SRTestApps-${{ github.run_number }}.zip to OneDrive: $destPath"
+          rclone copy SRTestApps-${{ github.run_number }}.zip "onedrive:$destPath" --progress
           echo "Upload complete!"
