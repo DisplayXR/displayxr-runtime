@@ -292,14 +292,15 @@ d3d11_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 	std::lock_guard<std::mutex> lock(c->mutex);
 
 	// Check for window resize and handle it.
-	// Skip during modal drag/resize to avoid per-pixel texture reallocation stutter.
-	// DXGI stretches the swapchain output during drag; we resize once after it ends.
+	// During a modal drag/resize (in_size_move), we still resize the swapchain target
+	// to keep DXGI in sync, but defer the expensive stereo texture reallocation until
+	// the drag ends. This avoids per-pixel texture churn that causes stutter.
 	bool in_size_move = false;
 	if (c->owns_window && c->own_window != nullptr) {
 		in_size_move = comp_d3d11_window_is_in_size_move(c->own_window);
 	}
 
-	if (c->hwnd != nullptr && !in_size_move) {
+	if (c->hwnd != nullptr) {
 		RECT rect;
 		if (GetClientRect(c->hwnd, &rect)) {
 			uint32_t new_width = static_cast<uint32_t>(rect.right - rect.left);
@@ -324,8 +325,10 @@ d3d11_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 						c->settings.preferred.height = new_height;
 
 #ifdef XRT_HAVE_LEIA_SR_D3D11
-						// Scale renderer stereo texture proportionally to window/display ratio
-						if (c->weaver != nullptr) {
+						// Scale renderer stereo texture proportionally to window/display ratio.
+						// Skip during drag to avoid expensive texture reallocation every pixel.
+						// The weaver handles mismatched stereo/target sizes via stretching.
+						if (c->weaver != nullptr && !in_size_move) {
 							uint32_t sr_w, sr_h, disp_px_w, disp_px_h;
 							int32_t disp_left, disp_top;
 							float disp_w_m, disp_h_m;
