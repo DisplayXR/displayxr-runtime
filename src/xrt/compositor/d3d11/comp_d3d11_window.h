@@ -90,6 +90,20 @@ comp_d3d11_window_get_dimensions(struct comp_d3d11_window *window,
                                   uint32_t *out_height);
 
 /*!
+ * Check if the window is currently inside a modal move/size loop.
+ *
+ * Returns true between WM_ENTERSIZEMOVE and WM_EXITSIZEMOVE. Callers
+ * should defer expensive operations (swapchain resize, texture
+ * reallocation) until the drag finishes.
+ *
+ * @param window The window object
+ *
+ * @return true if the user is currently dragging/resizing the window
+ */
+bool
+comp_d3d11_window_is_in_size_move(struct comp_d3d11_window *window);
+
+/*!
  * Pump Win32 messages for the window (non-blocking).
  *
  * This dispatches pending messages for the window. The caller may also

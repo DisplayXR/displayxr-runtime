@@ -286,8 +286,15 @@ d3d11_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 
 	std::lock_guard<std::mutex> lock(c->mutex);
 
-	// Check for window resize and handle it
-	if (c->hwnd != nullptr) {
+	// Check for window resize and handle it.
+	// Skip during modal drag/resize to avoid per-pixel texture reallocation stutter.
+	// DXGI stretches the swapchain output during drag; we resize once after it ends.
+	bool in_size_move = false;
+	if (c->owns_window && c->own_window != nullptr) {
+		in_size_move = comp_d3d11_window_is_in_size_move(c->own_window);
+	}
+
+	if (c->hwnd != nullptr && !in_size_move) {
 		RECT rect;
 		if (GetClientRect(c->hwnd, &rect)) {
 			uint32_t new_width = static_cast<uint32_t>(rect.right - rect.left);

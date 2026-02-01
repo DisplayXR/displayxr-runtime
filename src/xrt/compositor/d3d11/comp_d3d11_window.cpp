@@ -396,6 +396,15 @@ comp_d3d11_window_get_dimensions(struct comp_d3d11_window *window, uint32_t *out
 	*out_height = window->height;
 }
 
+extern "C" bool
+comp_d3d11_window_is_in_size_move(struct comp_d3d11_window *window)
+{
+	if (window == NULL) {
+		return false;
+	}
+	return window->in_size_move;
+}
+
 extern "C" void
 comp_d3d11_window_pump_messages(struct comp_d3d11_window *window)
 {
