@@ -380,9 +380,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                                 ID3D11RenderTargetView* rtv = nullptr;
                                 CreateRenderTargetView(renderer, swapchainTexture, &rtv);
 
+                                // Use recommended render dims (may be smaller than swapchain after resize)
+                                uint32_t renderW = xr.recommendedRenderWidth;
+                                uint32_t renderH = xr.recommendedRenderHeight;
+
                                 D3D11_VIEWPORT vp = {};
-                                vp.Width = (FLOAT)xr.swapchains[eye].width;
-                                vp.Height = (FLOAT)xr.swapchains[eye].height;
+                                vp.Width = (FLOAT)renderW;
+                                vp.Height = (FLOAT)renderH;
                                 vp.MaxDepth = 1.0f;
                                 renderer.context->RSSetViewports(1, &vp);
 
@@ -395,7 +399,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                                 XMMATRIX projMatrix = (eye == 0) ? leftProjMatrix : rightProjMatrix;
 
                                 RenderScene(renderer, rtv, depthDSVs[eye].Get(),
-                                    xr.swapchains[eye].width, xr.swapchains[eye].height,
+                                    renderW, renderH,
                                     viewMatrix, projMatrix,
                                     g_inputState.zoomScale);
 
@@ -424,7 +428,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                                             modeText, 10*sx, 45*sy, 350*sx, 30*sy, true);
 
                                         std::wstring perfText = FormatPerformanceInfo(perfStats.fps, perfStats.frameTimeMs,
-                                            xr.swapchains[0].width, xr.swapchains[0].height);
+                                            xr.recommendedRenderWidth, xr.recommendedRenderHeight);
                                         RenderText(textOverlay, renderer.device.Get(), hudStagingTexture.Get(),
                                             perfText, 10*sx, 85*sy, 300*sx, 70*sy, true);
 
@@ -449,8 +453,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                                 projectionViews[eye].subImage.swapchain = xr.swapchains[eye].swapchain;
                                 projectionViews[eye].subImage.imageRect.offset = {0, 0};
                                 projectionViews[eye].subImage.imageRect.extent = {
-                                    (int32_t)xr.swapchains[eye].width,
-                                    (int32_t)xr.swapchains[eye].height
+                                    (int32_t)renderW,
+                                    (int32_t)renderH
                                 };
                                 projectionViews[eye].subImage.imageArrayIndex = 0;
 

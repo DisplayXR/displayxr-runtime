@@ -67,6 +67,9 @@ enum xrt_session_event_type
 
 	//! User presence has changed (hmd may have been put on or removed)
 	XRT_SESSION_EVENT_USER_PRESENCE_CHANGE = 10,
+
+	//! The recommended render resolution has changed (window resize, etc.)
+	XRT_SESSION_EVENT_RENDER_RESOLUTION_CHANGE = 11,
 };
 
 /*!
@@ -189,6 +192,20 @@ struct xrt_session_event_user_presence_change
 };
 
 /*!
+ * Recommended render resolution changed event,
+ * type @ref XRT_SESSION_EVENT_RENDER_RESOLUTION_CHANGE.
+ *
+ * @see xrt_session_event
+ * @ingroup xrt_iface
+ */
+struct xrt_session_event_render_resolution_change
+{
+	enum xrt_session_event_type type;
+	uint32_t width;
+	uint32_t height;
+};
+
+/*!
  * Union of all session events, used to return multiple events through one call.
  * Each event struct must start with a @ref xrt_session_event_type field.
  *
@@ -207,6 +224,7 @@ union xrt_session_event {
 	struct xrt_session_event_passthrough_state_change passthru;
 	struct xrt_session_event_visibility_mask_change mask_change;
 	struct xrt_session_event_user_presence_change presence_change;
+	struct xrt_session_event_render_resolution_change render_resolution;
 };
 
 /*!

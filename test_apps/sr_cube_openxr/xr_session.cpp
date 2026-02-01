@@ -72,18 +72,25 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         if (strcmp(ext.extensionName, XR_KHR_D3D11_ENABLE_EXTENSION_NAME) == 0) {
             hasD3D11 = true;
         }
+        if (strcmp(ext.extensionName, XR_EXT_DYNAMIC_RENDER_RESOLUTION_EXTENSION_NAME) == 0) {
+            xr.hasDynamicRenderResolutionExt = true;
+        }
     }
 
     LOG_INFO("XR_KHR_D3D11_enable: %s", hasD3D11 ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_EXT_dynamic_render_resolution: %s", xr.hasDynamicRenderResolutionExt ? "AVAILABLE" : "NOT FOUND");
 
     if (!hasD3D11) {
         LOG_ERROR("XR_KHR_D3D11_enable extension not available - cannot continue");
         return false;
     }
 
-    // Only enable D3D11, NOT session_target
+    // Enable D3D11 and dynamic render resolution (NOT session_target)
     std::vector<const char*> enabledExtensions;
     enabledExtensions.push_back(XR_KHR_D3D11_ENABLE_EXTENSION_NAME);
+    if (xr.hasDynamicRenderResolutionExt) {
+        enabledExtensions.push_back(XR_EXT_DYNAMIC_RENDER_RESOLUTION_EXTENSION_NAME);
+    }
 
     LOG_INFO("Enabling %zu extensions:", enabledExtensions.size());
     for (const auto& ext : enabledExtensions) {

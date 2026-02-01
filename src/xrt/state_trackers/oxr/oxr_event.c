@@ -343,6 +343,34 @@ oxr_event_push_XrEventDataVisibilityMaskChangedKHR(struct oxr_logger *log,
 }
 #endif // OXR_HAVE_KHR_visibility_mask
 
+#ifdef OXR_HAVE_EXT_dynamic_render_resolution
+XrResult
+oxr_event_push_XrEventDataRenderResolutionChangedEXT(struct oxr_logger *log,
+                                                      struct oxr_session *sess,
+                                                      uint32_t width,
+                                                      uint32_t height)
+{
+	struct oxr_instance *inst = sess->sys->inst;
+	XrEventDataRenderResolutionChangedEXT *changed;
+	struct oxr_event *event = NULL;
+
+	ALLOC(log, inst, &event, &changed);
+
+	changed->type = XR_TYPE_EVENT_DATA_RENDER_RESOLUTION_CHANGED_EXT;
+	changed->next = NULL;
+	changed->recommendedImageRectWidth = width;
+	changed->recommendedImageRectHeight = height;
+
+	event->result = XR_SUCCESS;
+
+	lock(inst);
+	push(inst, event);
+	unlock(inst);
+
+	return XR_SUCCESS;
+}
+#endif // OXR_HAVE_EXT_dynamic_render_resolution
+
 #ifdef OXR_HAVE_EXT_user_presence
 XrResult
 oxr_event_push_XrEventDataUserPresenceChangedEXT(struct oxr_logger *log, struct oxr_session *sess, bool isUserPresent)
