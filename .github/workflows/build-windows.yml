@@ -625,3 +625,39 @@ jobs:
           path: |
             test_apps/sr_cube_openxr_ext_vk/build/sr_cube_openxr_ext_vk.*.exe
             test_apps/sr_cube_openxr_ext_vk/build/*.dll
+
+  # Bundle all test apps into a single artifact with per-app subfolders
+  BundleTestApps:
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    needs: [TestAppSessionTarget, TestAppNative, TestAppStandard, TestAppD3D12, TestAppOpenGL, TestAppVulkan]
+
+    steps:
+      - name: Download all test app artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: TestApps
+          pattern: SRCube*
+
+      - name: List bundled contents
+        run: |
+          echo "Bundled test apps:"
+          find TestApps -type f | sort
+
+      - name: Upload bundled test apps
+        uses: actions/upload-artifact@v4
+        with:
+          name: SRTestApps
+          if-no-files-found: error
+          path: TestApps
+
+      - name: Delete individual test app artifacts
+        uses: geekyeggo/delete-artifact@v5
+        with:
+          name: |
+            SRCubeOpenXRExt
+            SRCubeNative
+            SRCubeOpenXR
+            SRCubeOpenXRExtD3D12
+            SRCubeOpenXRExtGL
+            SRCubeOpenXRExtVK

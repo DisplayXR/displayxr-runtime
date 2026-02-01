@@ -13,3 +13,9 @@ target_link_libraries(
 		comp_multi
 	)
 target_include_directories(comp_null PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
+
+# On Windows, null compositor's target service needs comp_main for
+# comp_window_mswin_create_from_external (per-session Vulkan surface creation).
+if(WIN32 AND XRT_MODULE_COMPOSITOR_MAIN)
+	target_link_libraries(comp_null PRIVATE comp_main)
+endif()

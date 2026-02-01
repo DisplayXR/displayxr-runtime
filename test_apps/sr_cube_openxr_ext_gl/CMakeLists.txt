@@ -79,10 +79,6 @@ add_executable(sr_cube_openxr_ext_gl WIN32
     gl_renderer.h
     gl_functions.cpp
     gl_functions.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/../common/hud_renderer.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../common/hud_renderer.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/../common/text_overlay.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../common/text_overlay.h
     sr_cube_openxr_ext_gl.manifest
     resource.rc
 )
@@ -95,9 +91,6 @@ target_link_libraries(sr_cube_openxr_ext_gl PRIVATE
     sr_common_base
     OpenXR::openxr_loader
     opengl32
-    d3d11
-    d2d1
-    dwrite
 )
 
 if(MSVC)

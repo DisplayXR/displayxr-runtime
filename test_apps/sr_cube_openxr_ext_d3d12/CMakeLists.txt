@@ -77,10 +77,6 @@ add_executable(sr_cube_openxr_ext_d3d12 WIN32
     xr_session.h
     d3d12_renderer.cpp
     d3d12_renderer.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/../common/hud_renderer.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../common/hud_renderer.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/../common/text_overlay.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../common/text_overlay.h
     sr_cube_openxr_ext_d3d12.manifest
     resource.rc
 )
@@ -95,9 +91,6 @@ target_link_libraries(sr_cube_openxr_ext_d3d12 PRIVATE
     d3d12
     dxgi
     d3dcompiler
-    d3d11
-    d2d1
-    dwrite
 )
 
 if(MSVC)

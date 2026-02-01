@@ -17,12 +17,9 @@
 #include "logging.h"
 #include "input_handler.h"
 #include "d3d11_renderer.h"
-#include "text_overlay.h"
 #include "xr_session.h"
 
 #include <chrono>
-#include <string>
-#include <sstream>
 
 using Microsoft::WRL::ComPtr;
 using namespace DirectX;
@@ -201,22 +198,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return 1;
     }
 
-    // Initialize text overlay
-    TextOverlay textOverlay = {};
-    if (!InitializeTextOverlay(textOverlay)) {
-        LOG_ERROR("Text overlay initialization failed");
-        CleanupD3D11(renderer);
-        CleanupOpenXR(xr);
-        ShutdownLogging();
-        return 1;
-    }
-
     // Create OpenXR session (Monado creates window)
     LOG_INFO("Creating OpenXR session...");
     if (!CreateSession(xr, renderer.device.Get())) {
         LOG_ERROR("OpenXR session creation failed");
         MessageBox(hwnd, L"Failed to create OpenXR session", L"Error", MB_OK | MB_ICONERROR);
-        CleanupTextOverlay(textOverlay);
         CleanupD3D11(renderer);
         CleanupOpenXR(xr);
         ShutdownLogging();
@@ -227,7 +213,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     if (!CreateSpaces(xr)) {
         LOG_ERROR("Reference space creation failed");
         CleanupOpenXR(xr);
-        CleanupTextOverlay(textOverlay);
         CleanupD3D11(renderer);
         ShutdownLogging();
         return 1;
@@ -237,7 +222,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     if (!CreateSwapchains(xr)) {
         LOG_ERROR("Swapchain creation failed");
         CleanupOpenXR(xr);
-        CleanupTextOverlay(textOverlay);
         CleanupD3D11(renderer);
         ShutdownLogging();
         return 1;
@@ -267,41 +251,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         if (!CreateDepthStencilView(renderer, xr.swapchains[eye].width, xr.swapchains[eye].height, &depthTex, &dsv)) {
             LOG_ERROR("Failed to create depth buffer for eye %d", eye);
             CleanupOpenXR(xr);
-            CleanupTextOverlay(textOverlay);
             CleanupD3D11(renderer);
             ShutdownLogging();
             return 1;
         }
         depthTextures[eye].Attach(depthTex);
         depthDSVs[eye].Attach(dsv);
-    }
-
-    // Create HUD staging texture for screen-space text rendering.
-    // We render text to this app-owned D2D-compatible texture, then
-    // CopySubresourceRegion onto each eye's swapchain texture (top-left corner).
-    const float HUD_WIDTH_PERCENT = 0.30f;
-    const float HUD_HEIGHT_PERCENT = 0.35f;
-    uint32_t hudWidth = (uint32_t)(xr.swapchains[0].width * HUD_WIDTH_PERCENT);
-    uint32_t hudHeight = (uint32_t)(xr.swapchains[0].height * HUD_HEIGHT_PERCENT);
-
-    ComPtr<ID3D11Texture2D> hudStagingTexture;
-    {
-        D3D11_TEXTURE2D_DESC desc = {};
-        desc.Width = hudWidth;
-        desc.Height = hudHeight;
-        desc.MipLevels = 1;
-        desc.ArraySize = 1;
-        desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;  // D2D-compatible
-        desc.SampleDesc.Count = 1;
-        desc.Usage = D3D11_USAGE_DEFAULT;
-        desc.BindFlags = D3D11_BIND_RENDER_TARGET;
-
-        HRESULT hr = renderer.device->CreateTexture2D(&desc, nullptr, &hudStagingTexture);
-        if (FAILED(hr)) {
-            LOG_WARN("Failed to create HUD staging texture: 0x%08X", hr);
-        } else {
-            LOG_INFO("HUD staging texture created (%ux%u, R8G8B8A8_UNORM)", hudWidth, hudHeight);
-        }
     }
 
     // Performance tracking
@@ -403,47 +358,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                                     viewMatrix, projMatrix,
                                     g_inputState.zoomScale);
 
-                                // Screen-space HUD: render text on eye 0, copy to both eyes
-                                if (g_inputState.hudVisible && hudStagingTexture) {
-                                    if (eye == 0) {
-                                        // Clear and render text to staging texture
-                                        ID3D11RenderTargetView* hudRtv = nullptr;
-                                        CreateRenderTargetView(renderer, hudStagingTexture.Get(), &hudRtv);
-                                        if (hudRtv) {
-                                            float hudClear[4] = {0.0f, 0.0f, 0.0f, 0.7f};
-                                            renderer.context->ClearRenderTargetView(hudRtv, hudClear);
-                                            hudRtv->Release();
-                                        }
-
-                                        float sx = hudWidth / 512.0f;
-                                        float sy = hudHeight / 256.0f;
-
-                                        std::wstring stateText = L"Session: ";
-                                        stateText += FormatSessionState((int)xr.sessionState);
-                                        RenderText(textOverlay, renderer.device.Get(), hudStagingTexture.Get(),
-                                            stateText, 10*sx, 10*sy, 300*sx, 30*sy);
-
-                                        std::wstring modeText = L"Mode: Standard OpenXR (Monado window)";
-                                        RenderText(textOverlay, renderer.device.Get(), hudStagingTexture.Get(),
-                                            modeText, 10*sx, 45*sy, 350*sx, 30*sy, true);
-
-                                        std::wstring perfText = FormatPerformanceInfo(perfStats.fps, perfStats.frameTimeMs,
-                                            xr.recommendedRenderWidth, xr.recommendedRenderHeight);
-                                        RenderText(textOverlay, renderer.device.Get(), hudStagingTexture.Get(),
-                                            perfText, 10*sx, 85*sy, 300*sx, 70*sy, true);
-
-                                        std::wstring eyeText = FormatEyeTrackingInfo(xr.eyePosX, xr.eyePosY, xr.eyePosZ, xr.eyeTrackingActive);
-                                        RenderText(textOverlay, renderer.device.Get(), hudStagingTexture.Get(),
-                                            eyeText, 10*sx, 165*sy, 300*sx, 70*sy, true);
-                                    }
-
-                                    // Copy HUD staging texture to swapchain top-left corner
-                                    D3D11_BOX srcBox = {0, 0, 0, hudWidth, hudHeight, 1};
-                                    renderer.context->CopySubresourceRegion(
-                                        swapchainTexture, 0, 0, 0, 0,
-                                        hudStagingTexture.Get(), 0, &srcBox);
-                                }
-
                                 if (rtv) rtv->Release();
 
                                 ReleaseSwapchainImage(xr, eye);
@@ -483,7 +397,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     }
 
     CleanupOpenXR(xr);
-    CleanupTextOverlay(textOverlay);
     CleanupD3D11(renderer);
 
     DestroyWindow(hwnd);

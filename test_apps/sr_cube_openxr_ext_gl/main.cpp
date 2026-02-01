@@ -16,8 +16,6 @@
 #include "input_handler.h"
 #include "xr_session.h"
 #include "gl_renderer.h"
-#include "hud_renderer.h"
-#include "text_overlay.h"
 
 #include <atomic>
 #include <string>
@@ -228,12 +226,7 @@ static void RenderThreadFunc(
     HGLRC hGLRC,
     XrSessionManager* xr,
     GLRenderer* renderer,
-    std::vector<XrSwapchainImageOpenGLKHR>* swapchainImages,
-    HudRenderer* hud,
-    uint32_t hudWidth,
-    uint32_t hudHeight,
-    GLuint hudTexture,
-    GLuint hudFBO)
+    std::vector<XrSwapchainImageOpenGLKHR>* swapchainImages)
 {
     LOG_INFO("[RenderThread] Started");
 
@@ -311,40 +304,6 @@ static void RenderThreadFunc(
                                     xr->swapchains[eye].width, xr->swapchains[eye].height,
                                     viewMatrix, projMatrix,
                                     inputSnapshot.zoomScale);
-
-                                // Screen-space HUD: render text on eye 0, blit to both eyes
-                                if (inputSnapshot.hudVisible && hud) {
-                                    if (eye == 0) {
-                                        std::wstring sessionText = L"Session: ";
-                                        sessionText += FormatSessionState((int)xr->sessionState);
-                                        std::wstring modeText = xr->hasSessionTargetExt ?
-                                            L"XR_EXT_session_target: ACTIVE (OpenGL)" :
-                                            L"XR_EXT_session_target: NOT AVAILABLE (OpenGL)";
-                                        std::wstring perfText = FormatPerformanceInfo(perfStats.fps, perfStats.frameTimeMs,
-                                            xr->swapchains[0].width, xr->swapchains[0].height);
-                                        std::wstring eyeText = FormatEyeTrackingInfo(xr->eyePosX, xr->eyePosY, xr->eyePosZ, xr->eyeTrackingActive);
-
-                                        uint32_t srcRowPitch = 0;
-                                        const void* pixels = RenderHudAndMap(*hud, &srcRowPitch, sessionText, modeText, perfText, eyeText);
-                                        if (pixels) {
-                                            glBindTexture(GL_TEXTURE_2D, hudTexture);
-                                            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, hudWidth, hudHeight,
-                                                GL_RGBA, GL_UNSIGNED_BYTE, pixels);
-                                            glBindTexture(GL_TEXTURE_2D, 0);
-                                            UnmapHud(*hud);
-                                        }
-                                    }
-
-                                    // Blit HUD texture to swapchain FBO top-left corner
-                                    GLuint swapchainFBO = renderer->fbos[eye][imageIndex];
-                                    glBindFramebuffer_(GL_READ_FRAMEBUFFER, hudFBO);
-                                    glBindFramebuffer_(GL_DRAW_FRAMEBUFFER, swapchainFBO);
-                                    glBlitFramebuffer_(
-                                        0, 0, hudWidth, hudHeight,  // src rect
-                                        0, hudHeight, hudWidth, 0,  // dst rect (flipped Y: OpenGL origin is bottom-left)
-                                        GL_COLOR_BUFFER_BIT, GL_NEAREST);
-                                    glBindFramebuffer_(GL_FRAMEBUFFER, 0);
-                                }
 
                                 ReleaseSwapchainImage(*xr, eye);
 
@@ -518,40 +477,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         }
     }
 
-    // Initialize HUD renderer for screen-space text overlay
-    const float HUD_WIDTH_PERCENT = 0.30f;
-    const float HUD_HEIGHT_PERCENT = 0.35f;
-    uint32_t hudWidth = (uint32_t)(xr.swapchains[0].width * HUD_WIDTH_PERCENT);
-    uint32_t hudHeight = (uint32_t)(xr.swapchains[0].height * HUD_HEIGHT_PERCENT);
-
-    HudRenderer hudRenderer = {};
-    bool hudOk = InitializeHudRenderer(hudRenderer, hudWidth, hudHeight);
-    if (!hudOk) {
-        LOG_WARN("HUD renderer init failed - HUD will not be displayed");
-    }
-
-    // Create GL texture and FBO for HUD
-    GLuint hudTexture = 0, hudFBO = 0;
-    if (hudOk) {
-        glGenTextures(1, &hudTexture);
-        glBindTexture(GL_TEXTURE_2D, hudTexture);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, hudWidth, hudHeight, 0,
-            GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        glBindTexture(GL_TEXTURE_2D, 0);
-
-        glGenFramebuffers_(1, &hudFBO);
-        glBindFramebuffer_(GL_FRAMEBUFFER, hudFBO);
-        glFramebufferTexture2D_(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, hudTexture, 0);
-        if (glCheckFramebufferStatus_(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
-            LOG_WARN("HUD FBO incomplete");
-            hudOk = false;
-        }
-        glBindFramebuffer_(GL_FRAMEBUFFER, 0);
-        LOG_INFO("HUD GL texture and FBO created (%ux%u)", hudWidth, hudHeight);
-    }
-
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
 
@@ -564,8 +489,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     wglMakeCurrent(nullptr, nullptr);
 
     std::thread renderThread(RenderThreadFunc, hwnd, hDC, hGLRC, &xr, &glRenderer,
-        swapchainImages,
-        hudOk ? &hudRenderer : nullptr, hudWidth, hudHeight, hudTexture, hudFBO);
+        swapchainImages);
 
     MSG msg = {};
     while (GetMessage(&msg, nullptr, 0, 0) > 0) {
@@ -583,10 +507,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     // Re-acquire GL context for cleanup
     wglMakeCurrent(hDC, hGLRC);
-
-    if (hudFBO) glDeleteFramebuffers_(1, &hudFBO);
-    if (hudTexture) glDeleteTextures(1, &hudTexture);
-    if (hudOk) CleanupHudRenderer(hudRenderer);
 
     CleanupGLRenderer(glRenderer);
     CleanupOpenXR(xr);

@@ -16,7 +16,6 @@
 #include "input_handler.h"
 #include "xr_session.h"
 #include "d3d12_renderer.h"
-#include "hud_renderer.h"
 
 #include <atomic>
 #include <chrono>
@@ -139,12 +138,7 @@ static void RenderThreadFunc(
     XrSessionManager* xr,
     D3D12Renderer* renderer,
     std::vector<XrSwapchainImageD3D12KHR>* swapchainImages,
-    int* rtvBaseIndex,
-    HudRenderer* hud,
-    uint32_t hudWidth,
-    uint32_t hudHeight,
-    ID3D12Resource* hudUploadBuffer,
-    uint32_t hudUploadRowPitch)
+    int* rtvBaseIndex)
 {
     LOG_INFO("[RenderThread] Started");
 
@@ -220,83 +214,6 @@ static void RenderThreadFunc(
                                     xr->swapchains[eye].width, xr->swapchains[eye].height,
                                     viewMatrix, projMatrix,
                                     inputSnapshot.zoomScale);
-
-                                // Screen-space HUD: render text on eye 0, copy to both eyes
-                                if (inputSnapshot.hudVisible && hud) {
-                                    if (eye == 0) {
-                                        std::wstring sessionText = L"Session: ";
-                                        sessionText += FormatSessionState((int)xr->sessionState);
-                                        std::wstring modeText = xr->hasSessionTargetExt ?
-                                            L"XR_EXT_session_target: ACTIVE (D3D12)" :
-                                            L"XR_EXT_session_target: NOT AVAILABLE (D3D12)";
-                                        std::wstring perfText = FormatPerformanceInfo(perfStats.fps, perfStats.frameTimeMs,
-                                            xr->swapchains[0].width, xr->swapchains[0].height);
-                                        std::wstring eyeText = FormatEyeTrackingInfo(xr->eyePosX, xr->eyePosY, xr->eyePosZ, xr->eyeTrackingActive);
-
-                                        uint32_t srcRowPitch = 0;
-                                        const void* pixels = RenderHudAndMap(*hud, &srcRowPitch, sessionText, modeText, perfText, eyeText);
-                                        if (pixels) {
-                                            // Copy row-by-row to upload buffer (respect D3D12 alignment)
-                                            uint8_t* dst = nullptr;
-                                            D3D12_RANGE readRange = {0, 0};
-                                            hudUploadBuffer->Map(0, &readRange, (void**)&dst);
-                                            if (dst) {
-                                                const uint8_t* src = (const uint8_t*)pixels;
-                                                for (uint32_t row = 0; row < hudHeight; row++) {
-                                                    memcpy(dst + row * hudUploadRowPitch, src + row * srcRowPitch, hudWidth * 4);
-                                                }
-                                                D3D12_RANGE writeRange = {0, (SIZE_T)(hudUploadRowPitch * hudHeight)};
-                                                hudUploadBuffer->Unmap(0, &writeRange);
-                                            }
-                                            UnmapHud(*hud);
-                                        }
-                                    }
-
-                                    // Copy upload buffer to swapchain texture top-left region
-                                    // We need a separate command list for this copy
-                                    renderer->commandAllocator->Reset();
-                                    renderer->commandList->Reset(renderer->commandAllocator.Get(), nullptr);
-
-                                    // Barrier: swapchain COMMON -> COPY_DEST
-                                    D3D12_RESOURCE_BARRIER barrier = {};
-                                    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-                                    barrier.Transition.pResource = swapchainTexture;
-                                    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-                                    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-                                    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-                                    renderer->commandList->ResourceBarrier(1, &barrier);
-
-                                    // CopyTextureRegion from upload buffer to swapchain
-                                    D3D12_TEXTURE_COPY_LOCATION srcLoc = {};
-                                    srcLoc.pResource = hudUploadBuffer;
-                                    srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-                                    srcLoc.PlacedFootprint.Offset = 0;
-                                    srcLoc.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-                                    srcLoc.PlacedFootprint.Footprint.Width = hudWidth;
-                                    srcLoc.PlacedFootprint.Footprint.Height = hudHeight;
-                                    srcLoc.PlacedFootprint.Footprint.Depth = 1;
-                                    srcLoc.PlacedFootprint.Footprint.RowPitch = hudUploadRowPitch;
-
-                                    D3D12_TEXTURE_COPY_LOCATION dstLoc = {};
-                                    dstLoc.pResource = swapchainTexture;
-                                    dstLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-                                    dstLoc.SubresourceIndex = 0;
-
-                                    D3D12_BOX srcBox = {0, 0, 0, hudWidth, hudHeight, 1};
-                                    renderer->commandList->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, &srcBox);
-
-                                    // Barrier: COPY_DEST -> COMMON
-                                    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-                                    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
-                                    renderer->commandList->ResourceBarrier(1, &barrier);
-
-                                    renderer->commandList->Close();
-                                    ID3D12CommandList* cmdLists[] = {renderer->commandList.Get()};
-                                    renderer->commandQueue->ExecuteCommandLists(1, cmdLists);
-
-                                    // Wait for GPU
-                                    WaitForGpu(*renderer);
-                                }
 
                                 ReleaseSwapchainImage(*xr, eye);
 
@@ -441,53 +358,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
 
-    // Initialize HUD renderer for screen-space text overlay
-    const float HUD_WIDTH_PERCENT = 0.30f;
-    const float HUD_HEIGHT_PERCENT = 0.35f;
-    uint32_t hudWidth = (uint32_t)(xr.swapchains[0].width * HUD_WIDTH_PERCENT);
-    uint32_t hudHeight = (uint32_t)(xr.swapchains[0].height * HUD_HEIGHT_PERCENT);
-
-    HudRenderer hudRenderer = {};
-    bool hudOk = InitializeHudRenderer(hudRenderer, hudWidth, hudHeight);
-    if (!hudOk) {
-        LOG_WARN("HUD renderer init failed - HUD will not be displayed");
-    }
-
-    // D3D12 upload buffer for HUD pixels (aligned row pitch)
-    ComPtr<ID3D12Resource> hudUploadBuffer;
-    uint32_t hudUploadRowPitch = ((hudWidth * 4 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1)
-        / D3D12_TEXTURE_DATA_PITCH_ALIGNMENT) * D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
-    if (hudOk) {
-        D3D12_HEAP_PROPERTIES heapProps = {};
-        heapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
-        D3D12_RESOURCE_DESC bufDesc = {};
-        bufDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        bufDesc.Width = (UINT64)hudUploadRowPitch * hudHeight;
-        bufDesc.Height = 1;
-        bufDesc.DepthOrArraySize = 1;
-        bufDesc.MipLevels = 1;
-        bufDesc.SampleDesc.Count = 1;
-        bufDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-
-        HRESULT hr = renderer.device->CreateCommittedResource(
-            &heapProps, D3D12_HEAP_FLAG_NONE, &bufDesc,
-            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-            IID_PPV_ARGS(&hudUploadBuffer));
-        if (FAILED(hr)) {
-            LOG_WARN("Failed to create HUD upload buffer: 0x%08X", hr);
-            hudOk = false;
-        }
-    }
-
     LOG_INFO("");
     LOG_INFO("=== Entering main loop ===");
     LOG_INFO("Controls: WASD=Fly, QE=Up/Down, Mouse=Look, Space/DblClick=Reset, TAB=HUD, ESC=Quit");
     LOG_INFO("");
 
     std::thread renderThread(RenderThreadFunc, hwnd, &xr, &renderer,
-        swapchainImages, rtvBaseIndex,
-        hudOk ? &hudRenderer : nullptr, hudWidth, hudHeight,
-        hudUploadBuffer.Get(), hudUploadRowPitch);
+        swapchainImages, rtvBaseIndex);
 
     MSG msg = {};
     while (GetMessage(&msg, nullptr, 0, 0) > 0) {
@@ -502,8 +379,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     LOG_INFO("");
     LOG_INFO("=== Shutting down ===");
-
-    if (hudOk) CleanupHudRenderer(hudRenderer);
 
     CleanupOpenXR(xr);
     CleanupD3D12(renderer);
