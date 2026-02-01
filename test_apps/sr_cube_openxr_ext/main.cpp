@@ -334,8 +334,8 @@ static void RenderOneFrame(RenderState& rs) {
 
             // Submit frame with window-space HUD layer if visible
             if (hudSubmitted) {
-                float hudWidthFrac = (float)HUD_PIXEL_WIDTH / xr.recommendedRenderWidth;
-                float hudHeightFrac = (float)HUD_PIXEL_HEIGHT / xr.recommendedRenderHeight;
+                float hudWidthFrac = (float)HUD_PIXEL_WIDTH / xr.swapchains[0].width;
+                float hudHeightFrac = (float)HUD_PIXEL_HEIGHT / xr.swapchains[0].height;
                 EndFrameWithWindowSpaceHud(xr, frameState.predictedDisplayTime, projectionViews,
                     0.0f, 0.0f, hudWidthFrac, hudHeightFrac, 0.0f);
             } else {
