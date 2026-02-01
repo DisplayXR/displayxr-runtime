@@ -195,15 +195,22 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	switch (message) {
 	case WM_ENTERSIZEMOVE:
 		w->in_size_move = true;
+		U_LOG_W("D3D11 window: WM_ENTERSIZEMOVE — entering modal drag/resize loop");
+		InvalidateRect(hWnd, NULL, FALSE); // Kick off the first WM_PAINT (essential for MOVE drags where WM_SIZE never fires)
 		return 0;
 
 	case WM_EXITSIZEMOVE:
 		w->in_size_move = false;
+		U_LOG_W("D3D11 window: WM_EXITSIZEMOVE — left modal drag/resize loop");
 		return 0;
 
 	case WM_PAINT:
 		if (w->in_size_move && w->repaint_callback != NULL) {
+			U_LOG_W("D3D11 window: WM_PAINT during drag — invoking repaint callback");
 			w->repaint_callback(w->repaint_userdata);
+			// Self-invalidate to keep WM_PAINT firing continuously during the modal loop.
+			// Without this, WM_PAINT fires only once and the window goes dark.
+			InvalidateRect(hWnd, NULL, FALSE);
 			return 0;
 		}
 		ValidateRect(hWnd, NULL);

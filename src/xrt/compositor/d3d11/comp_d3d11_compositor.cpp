@@ -705,7 +705,16 @@ d3d11_compositor_repaint(void *userdata)
 	comp_d3d11_compositor *c = (comp_d3d11_compositor *)userdata;
 	std::unique_lock<std::mutex> lock(c->mutex, std::try_to_lock);
 	if (!lock.owns_lock()) {
+		static int lock_fail_log_counter = 0;
+		if (++lock_fail_log_counter % 60 == 1) {
+			U_LOG_W("D3D11 repaint: Mutex locked, skipping repaint");
+		}
 		return; // skip if mutex is held
+	}
+
+	static int repaint_log_counter = 0;
+	if (++repaint_log_counter % 60 == 1) {
+		U_LOG_I("D3D11 repaint: Executing repaint");
 	}
 
 	// Resize swapchain target to match current window size.
