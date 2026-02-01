@@ -1264,7 +1264,7 @@ comp_d3d11_compositor_get_pending_render_resolution(struct xrt_compositor *xc,
 
 	std::lock_guard<std::mutex> lock(c->mutex);
 
-	if (\!c->render_resize_pending) {
+	if (!c->render_resize_pending) {
 		return false;
 	}
 
