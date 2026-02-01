@@ -195,7 +195,6 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	switch (message) {
 	case WM_ENTERSIZEMOVE:
 		w->in_size_move = true;
-		InvalidateRect(hWnd, NULL, FALSE);
 		return 0;
 
 	case WM_EXITSIZEMOVE:
@@ -205,7 +204,6 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	case WM_PAINT:
 		if (w->in_size_move && w->repaint_callback != NULL) {
 			w->repaint_callback(w->repaint_userdata);
-			InvalidateRect(hWnd, NULL, FALSE); // keep WM_PAINT firing
 			return 0;
 		}
 		ValidateRect(hWnd, NULL);
@@ -237,6 +235,11 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			w->height = HIWORD(lParam);
 			if (w->width > 0 && w->height > 0) {
 				U_LOG_D("D3D11 window: resized to %ux%u", w->width, w->height);
+			}
+			// During drag, trigger a repaint so the swapchain resizes
+			// and the weaver re-presents with correct phase alignment.
+			if (w->in_size_move) {
+				InvalidateRect(hWnd, NULL, FALSE);
 			}
 		}
 		break;

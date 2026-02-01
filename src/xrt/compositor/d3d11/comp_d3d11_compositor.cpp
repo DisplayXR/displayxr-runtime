@@ -694,8 +694,10 @@ d3d11_compositor_layer_commit_with_semaphore(struct xrt_compositor *xc,
 /*!
  * Repaint callback invoked from WM_PAINT during modal drag/resize.
  *
- * Re-weaves the last stereo frame and presents it so the window
- * contents stay up-to-date while the normal render loop is blocked.
+ * Resizes the swapchain target to match the current window size (preserving
+ * 1:1 pixel mapping for phase snapping), re-weaves the last stereo frame,
+ * and presents. The renderer stereo texture is NOT resized here to avoid
+ * expensive texture reallocation every pixel of drag.
  */
 static void
 d3d11_compositor_repaint(void *userdata)
@@ -704,6 +706,27 @@ d3d11_compositor_repaint(void *userdata)
 	std::unique_lock<std::mutex> lock(c->mutex, std::try_to_lock);
 	if (!lock.owns_lock()) {
 		return; // skip if mutex is held
+	}
+
+	// Resize swapchain target to match current window size.
+	// This is critical for phase snapping: the weaver needs 1:1 pixel output.
+	if (c->hwnd != nullptr) {
+		RECT rect;
+		if (GetClientRect(c->hwnd, &rect)) {
+			uint32_t new_width = static_cast<uint32_t>(rect.right - rect.left);
+			uint32_t new_height = static_cast<uint32_t>(rect.bottom - rect.top);
+
+			if (new_width > 0 && new_height > 0) {
+				uint32_t cur_width, cur_height;
+				comp_d3d11_target_get_dimensions(c->target, &cur_width, &cur_height);
+
+				if (new_width != cur_width || new_height != cur_height) {
+					comp_d3d11_target_resize(c->target, new_width, new_height);
+					c->settings.preferred.width = new_width;
+					c->settings.preferred.height = new_height;
+				}
+			}
+		}
 	}
 
 	uint32_t target_index;
