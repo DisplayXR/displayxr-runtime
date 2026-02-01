@@ -626,9 +626,6 @@ jobs:
     runs-on: ubuntu-latest
     needs: [TestAppSessionTarget, TestAppNative, TestAppStandard, TestAppD3D12, TestAppOpenGL, TestAppVulkan]
 
-    env:
-      RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
-
     steps:
       - name: Download all test app artifacts
         uses: actions/download-artifact@v4
@@ -667,9 +664,11 @@ jobs:
           rclone --version
 
       - name: Setup rclone config
+        env:
+          RCLONE_CONFIG_CONTENTS: ${{ secrets.RCLONE_CONFIG }}
         run: |
           mkdir -p ~/.config/rclone
-          echo "$RCLONE_CONFIG" > ~/.config/rclone/rclone.conf
+          echo "$RCLONE_CONFIG_CONTENTS" > ~/.config/rclone/rclone.conf
 
       - name: Upload test apps to OneDrive
         run: |
