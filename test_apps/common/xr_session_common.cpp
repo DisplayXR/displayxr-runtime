@@ -296,15 +296,27 @@ bool BeginFrame(XrSessionManager& xr, XrFrameState& frameState) {
     frameState = {XR_TYPE_FRAME_STATE};
 
     XrFrameWaitInfo waitInfo = {XR_TYPE_FRAME_WAIT_INFO};
+    LOG_INFO("[BeginFrame] xrWaitFrame...");
     XrResult result = xrWaitFrame(xr.session, &waitInfo, &frameState);
-    if (XR_FAILED(result)) return false;
+    if (XR_FAILED(result)) {
+        LOG_WARN("[BeginFrame] xrWaitFrame FAILED: %d", result);
+        return false;
+    }
+    LOG_INFO("[BeginFrame] xrWaitFrame OK, displayTime=%lld, period=%lld, shouldRender=%d",
+        (long long)frameState.predictedDisplayTime, (long long)frameState.predictedDisplayPeriod,
+        frameState.shouldRender);
 
     xr.predictedDisplayTime = frameState.predictedDisplayTime;
     xr.predictedDisplayPeriod = frameState.predictedDisplayPeriod;
 
     XrFrameBeginInfo beginInfo = {XR_TYPE_FRAME_BEGIN_INFO};
+    LOG_INFO("[BeginFrame] xrBeginFrame...");
     result = xrBeginFrame(xr.session, &beginInfo);
-    if (XR_FAILED(result)) return false;
+    if (XR_FAILED(result)) {
+        LOG_WARN("[BeginFrame] xrBeginFrame FAILED: %d", result);
+        return false;
+    }
+    LOG_INFO("[BeginFrame] xrBeginFrame OK");
 
     return true;
 }
@@ -388,18 +400,25 @@ bool LocateViews(
 
 bool AcquireSwapchainImage(XrSessionManager& xr, int eye, uint32_t& imageIndex) {
     XrSwapchainImageAcquireInfo acquireInfo = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    LOG_INFO("[Swapchain] Eye %d: xrAcquireSwapchainImage...", eye);
     XrResult result = xrAcquireSwapchainImage(xr.swapchains[eye].swapchain, &acquireInfo, &imageIndex);
-    if (XR_FAILED(result)) return false;
+    if (XR_FAILED(result)) {
+        LOG_WARN("[Swapchain] Eye %d: xrAcquireSwapchainImage FAILED: %d", eye, result);
+        return false;
+    }
+    LOG_INFO("[Swapchain] Eye %d: Acquired index=%u, calling xrWaitSwapchainImage...", eye, imageIndex);
 
     XrSwapchainImageWaitInfo waitInfo = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
     waitInfo.timeout = XR_INFINITE_DURATION;
     result = xrWaitSwapchainImage(xr.swapchains[eye].swapchain, &waitInfo);
     if (XR_FAILED(result)) {
+        LOG_WARN("[Swapchain] Eye %d: xrWaitSwapchainImage FAILED: %d", eye, result);
         // Release the acquired image to avoid deadlocking the swapchain
         XrSwapchainImageReleaseInfo releaseInfo = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
         xrReleaseSwapchainImage(xr.swapchains[eye].swapchain, &releaseInfo);
         return false;
     }
+    LOG_INFO("[Swapchain] Eye %d: xrWaitSwapchainImage OK", eye);
 
     return true;
 }
