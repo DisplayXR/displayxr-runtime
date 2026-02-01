@@ -71,3 +71,4 @@ typedef __eglMustCastToProperFunctionPointerType (*PFNEGLGETPROCADDRESSPROC)(con
 #include "openxr/XR_MNDX_oculus_remote.h"
 #include "openxr/XR_MNDX_blubur_s1.h"
 #include "openxr/XR_EXT_session_target.h"
+#include "openxr/XR_EXT_dynamic_render_resolution.h"

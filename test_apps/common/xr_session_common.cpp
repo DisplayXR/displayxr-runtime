@@ -147,6 +147,12 @@ bool CreateSwapchains(XrSessionManager& xr) {
         LOG_INFO("  Got %u swapchain images", imageCount);
     }
 
+    // Initialize recommended render dims from swapchain dims (updated by dynamic resolution events)
+    if (xr.recommendedRenderWidth == 0 || xr.recommendedRenderHeight == 0) {
+        xr.recommendedRenderWidth = xr.swapchains[0].width;
+        xr.recommendedRenderHeight = xr.swapchains[0].height;
+    }
+
     LOG_INFO("Swapchains created successfully");
     return true;
 }
@@ -266,6 +272,15 @@ bool PollEvents(XrSessionManager& xr) {
             LOG_WARN("Instance loss pending - requesting exit");
             xr.exitRequested = true;
             break;
+        case (XrStructureType)XR_TYPE_EVENT_DATA_RENDER_RESOLUTION_CHANGED_EXT: {
+            auto* resEvent = (XrEventDataRenderResolutionChangedEXT*)&event;
+            xr.recommendedRenderWidth = resEvent->recommendedImageRectWidth;
+            xr.recommendedRenderHeight = resEvent->recommendedImageRectHeight;
+            LOG_INFO("Render resolution changed: %ux%u",
+                resEvent->recommendedImageRectWidth,
+                resEvent->recommendedImageRectHeight);
+            break;
+        }
         default:
             LOG_DEBUG("Received event type: %d", event.type);
             break;

@@ -93,6 +93,26 @@ bool
 comp_d3d11_compositor_get_window_metrics(struct xrt_compositor *xc,
                                           struct leiasr_window_metrics *out_metrics);
 
+/*!
+ * Check for a pending render resolution change event.
+ *
+ * Returns true if a resize occurred since the last call, writing the new
+ * recommended per-eye render dimensions to @p out_width / @p out_height.
+ * The pending flag is cleared after a successful read.
+ *
+ * @param xc         The compositor.
+ * @param out_width  Pointer to receive the new recommended width per eye.
+ * @param out_height Pointer to receive the new recommended height per eye.
+ *
+ * @return true if a resolution change was pending, false otherwise.
+ *
+ * @ingroup comp_d3d11
+ */
+bool
+comp_d3d11_compositor_get_pending_render_resolution(struct xrt_compositor *xc,
+                                                     uint32_t *out_width,
+                                                     uint32_t *out_height);
+
 #ifdef __cplusplus
 }
 #endif

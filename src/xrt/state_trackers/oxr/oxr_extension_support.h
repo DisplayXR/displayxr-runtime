@@ -514,6 +514,18 @@
 
 
 /*
+ * XR_EXT_dynamic_render_resolution
+ */
+#if defined(XR_EXT_dynamic_render_resolution)
+#define OXR_HAVE_EXT_dynamic_render_resolution
+#define OXR_EXTENSION_SUPPORT_EXT_dynamic_render_resolution(_) \
+    _(EXT_dynamic_render_resolution, EXT_DYNAMIC_RENDER_RESOLUTION)
+#else
+#define OXR_EXTENSION_SUPPORT_EXT_dynamic_render_resolution(_)
+#endif
+
+
+/*
  * XR_BD_controller_interaction
  */
 #if defined(XR_BD_controller_interaction) && defined(XRT_FEATURE_OPENXR_INTERACTION_BYTEDANCE)
@@ -985,6 +997,7 @@
     OXR_EXTENSION_SUPPORT_EXT_user_presence(_) \
     OXR_EXTENSION_SUPPORT_EXT_win32_appcontainer_compatible(_) \
     OXR_EXTENSION_SUPPORT_EXT_session_target(_) \
+    OXR_EXTENSION_SUPPORT_EXT_dynamic_render_resolution(_) \
     OXR_EXTENSION_SUPPORT_BD_controller_interaction(_) \
     OXR_EXTENSION_SUPPORT_FB_body_tracking(_) \
     OXR_EXTENSION_SUPPORT_FB_composition_layer_alpha_blend(_) \

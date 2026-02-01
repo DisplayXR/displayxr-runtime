@@ -266,7 +266,7 @@ static void RenderOneFrame(RenderState& rs) {
                                 extText, px, 42, tw, 22, true);
 
                             std::wstring perfText = FormatPerformanceInfo(rs.perfStats->fps, rs.perfStats->frameTimeMs,
-                                xr.swapchains[0].width, xr.swapchains[0].height,
+                                xr.recommendedRenderWidth, xr.recommendedRenderHeight,
                                 g_windowWidth, g_windowHeight);
                             RenderText(*rs.textOverlay, renderer.device.Get(), hudTexture,
                                 perfText, px, 74, tw, 88, true);
@@ -289,9 +289,13 @@ static void RenderOneFrame(RenderState& rs) {
                             ID3D11RenderTargetView* rtv = nullptr;
                             CreateRenderTargetView(renderer, swapchainTexture, &rtv);
 
+                            // Use recommended render dims (may be smaller than swapchain after resize)
+                            uint32_t renderW = xr.recommendedRenderWidth;
+                            uint32_t renderH = xr.recommendedRenderHeight;
+
                             D3D11_VIEWPORT vp = {};
-                            vp.Width = (FLOAT)xr.swapchains[eye].width;
-                            vp.Height = (FLOAT)xr.swapchains[eye].height;
+                            vp.Width = (FLOAT)renderW;
+                            vp.Height = (FLOAT)renderH;
                             vp.MaxDepth = 1.0f;
                             renderer.context->RSSetViewports(1, &vp);
 
@@ -304,7 +308,7 @@ static void RenderOneFrame(RenderState& rs) {
                             XMMATRIX projMatrix = (eye == 0) ? leftProjMatrix : rightProjMatrix;
 
                             RenderScene(renderer, rtv, rs.depthDSVs[eye].Get(),
-                                xr.swapchains[eye].width, xr.swapchains[eye].height,
+                                renderW, renderH,
                                 viewMatrix, projMatrix,
                                 g_inputState.zoomScale);
 
@@ -316,8 +320,8 @@ static void RenderOneFrame(RenderState& rs) {
                             projectionViews[eye].subImage.swapchain = xr.swapchains[eye].swapchain;
                             projectionViews[eye].subImage.imageRect.offset = {0, 0};
                             projectionViews[eye].subImage.imageRect.extent = {
-                                (int32_t)xr.swapchains[eye].width,
-                                (int32_t)xr.swapchains[eye].height
+                                (int32_t)renderW,
+                                (int32_t)renderH
                             };
                             projectionViews[eye].subImage.imageArrayIndex = 0;
 
@@ -330,8 +334,8 @@ static void RenderOneFrame(RenderState& rs) {
 
             // Submit frame with window-space HUD layer if visible
             if (hudSubmitted) {
-                float hudWidthFrac = (float)HUD_PIXEL_WIDTH / xr.swapchains[0].width;
-                float hudHeightFrac = (float)HUD_PIXEL_HEIGHT / xr.swapchains[0].height;
+                float hudWidthFrac = (float)HUD_PIXEL_WIDTH / xr.recommendedRenderWidth;
+                float hudHeightFrac = (float)HUD_PIXEL_HEIGHT / xr.recommendedRenderHeight;
                 EndFrameWithWindowSpaceHud(xr, frameState.predictedDisplayTime, projectionViews,
                     0.0f, 0.0f, hudWidthFrac, hudHeightFrac, 0.0f);
             } else {

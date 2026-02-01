@@ -2990,6 +2990,14 @@ struct oxr_plane_detector_ext
 };
 #endif // OXR_HAVE_EXT_plane_detection
 
+#ifdef OXR_HAVE_EXT_dynamic_render_resolution
+XrResult
+oxr_event_push_XrEventDataRenderResolutionChangedEXT(struct oxr_logger *log,
+                                                      struct oxr_session *sess,
+                                                      uint32_t width,
+                                                      uint32_t height);
+#endif // OXR_HAVE_EXT_dynamic_render_resolution
+
 #ifdef OXR_HAVE_EXT_user_presence
 XrResult
 oxr_event_push_XrEventDataUserPresenceChangedEXT(struct oxr_logger *log, struct oxr_session *sess, bool isUserPresent);
