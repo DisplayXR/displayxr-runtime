@@ -15,6 +15,8 @@
 #include "null_compositor.h"
 #include "null_interfaces.h"
 
+#include "xrt/xrt_config_build.h"
+
 #include "os/os_time.h"
 
 #include "util/u_misc.h"
@@ -32,7 +34,7 @@
 #include "xrt/xrt_compositor.h"
 #include "xrt/xrt_device.h"
 
-#ifdef XRT_OS_WINDOWS
+#if defined(XRT_OS_WINDOWS) && defined(XRT_MODULE_COMPOSITOR_MAIN)
 #include "main/comp_window.h"
 #endif
 
@@ -584,11 +586,12 @@ null_compositor_request_display_refresh_rate(struct xrt_compositor *xc, float di
  *
  */
 
-#ifdef XRT_OS_WINDOWS
+#if defined(XRT_OS_WINDOWS) && defined(XRT_MODULE_COMPOSITOR_MAIN)
 
 /*!
  * Service callback: create a comp_target from an external window handle.
  * This is called by comp_multi when a session needs its own render target.
+ * Only available when comp_main is linked (provides comp_window_mswin_create_from_external).
  */
 static xrt_result_t
 null_target_service_create_from_window(struct comp_target_service *service,
@@ -680,7 +683,7 @@ null_target_service_get_vk(struct comp_target_service *service)
 	return get_vk(nc);
 }
 
-#endif // XRT_OS_WINDOWS
+#endif // XRT_OS_WINDOWS && XRT_MODULE_COMPOSITOR_MAIN
 
 /*!
  * Initialize the target service on a null compositor.
@@ -689,7 +692,7 @@ null_target_service_get_vk(struct comp_target_service *service)
 static void
 null_compositor_init_target_service(struct null_compositor *nc)
 {
-#ifdef XRT_OS_WINDOWS
+#if defined(XRT_OS_WINDOWS) && defined(XRT_MODULE_COMPOSITOR_MAIN)
 	nc->target_service.create_from_window = null_target_service_create_from_window;
 	nc->target_service.destroy_target = null_target_service_destroy_target;
 	nc->target_service.get_vk = null_target_service_get_vk;
