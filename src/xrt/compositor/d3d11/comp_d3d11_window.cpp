@@ -198,15 +198,31 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		return DefWindowProcW(hWnd, message, wParam, lParam);
 	}
 
+	// Diagnostic: log ALL messages received during drag to understand
+	// which messages the SR SDK's WndProc subclass forwards to us.
+	if (w->in_size_move) {
+		static int drag_msg_counter = 0;
+		if (++drag_msg_counter <= 200) { // Cap to avoid log flooding
+			U_LOG_W("D3D11 wnd_proc during drag: msg=0x%04X (WM_PAINT=0x%04X WM_TIMER=0x%04X)",
+			         message, (unsigned)WM_PAINT, (unsigned)WM_TIMER);
+		}
+	}
+
 	switch (message) {
-	case WM_ENTERSIZEMOVE:
+	case WM_ENTERSIZEMOVE: {
 		w->in_size_move = true;
+		// Log the WndProc subclass chain to see who is above us
+		WNDPROC current = (WNDPROC)GetWindowLongPtrW(hWnd, GWLP_WNDPROC);
 		U_LOG_W("D3D11 window: WM_ENTERSIZEMOVE — starting repaint timer");
+		U_LOG_W("  Current WndProc=%p, our wnd_proc=%p (subclassed=%s)",
+		         (void *)current, (void *)wnd_proc,
+		         current != wnd_proc ? "YES" : "no");
 		// Use WM_TIMER instead of WM_PAINT for repaint during drag.
 		// The SR SDK subclasses our WndProc and its internal WM_PAINT
 		// handling consumes the dirty region, so WM_PAINT never reaches us.
 		SetTimer(hWnd, REPAINT_TIMER_ID, USER_TIMER_MINIMUM, NULL);
 		return 0;
+	}
 
 	case WM_EXITSIZEMOVE:
 		w->in_size_move = false;
@@ -216,6 +232,7 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
 	case WM_TIMER:
 		if (wParam == REPAINT_TIMER_ID && w->repaint_callback != NULL) {
+			U_LOG_W("D3D11 window: WM_TIMER fired — invoking repaint callback");
 			w->repaint_callback(w->repaint_userdata);
 		}
 		return 0;
