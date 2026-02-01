@@ -161,7 +161,15 @@ case WM_TIMER:
 
 **Analysis:** Both Claude and Gemini analysis confirmed WM_TIMER is reliable during DefWindowProc modal loops and can't be consumed by WndProc subclasses. `USER_TIMER_MINIMUM` (~10-15ms) fires fast enough for VSync-paced rendering.
 
-**Result:** Pending full testing. The repaint callback includes swapchain target resize + SR weaver re-interlace + present.
+**Result:** FAILED. Tested in build containing commit `1ad830cd2` (which includes `abf860a`). Animation still freezes during drag. No "WM_TIMER fired" or "repaint timer" messages appear in logs. This means WM_TIMER is also NOT reaching our `wnd_proc` during the modal loop — the SR SDK or DXGI WndProc subclass chain consumes or blocks ALL messages except WM_ENTERSIZEMOVE and WM_EXITSIZEMOVE.
+
+### Attempt 7: Diagnostic Logging of ALL Messages During Drag (pending)
+
+**Hypothesis:** We need to determine exactly which messages reach our `wnd_proc` during drag, and confirm the WndProc subclass chain.
+
+**Change:** Added logging before the switch statement that logs every message received during `in_size_move`, plus logging the current WndProc address vs our `wnd_proc` address in WM_ENTERSIZEMOVE to confirm subclassing.
+
+**Result:** Pending test. This will reveal whether ANY messages reach us during drag, or only WM_ENTERSIZEMOVE/WM_EXITSIZEMOVE (which the SR SDK explicitly forwards).
 
 ---
 
