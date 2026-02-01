@@ -828,10 +828,13 @@ void RenderScene(
     VkDevice device = renderer.device;
 
     // Wait for previous frame's fence
-    vkWaitForFences(device, 1, &renderer.frameFence, VK_TRUE, UINT64_MAX);
+    LOG_INFO("[RenderScene] eye=%d imageIndex=%u: vkWaitForFences (pre-render)...", eye, imageIndex);
+    VkResult fenceResult = vkWaitForFences(device, 1, &renderer.frameFence, VK_TRUE, UINT64_MAX);
+    LOG_INFO("[RenderScene] eye=%d: vkWaitForFences returned %d", eye, (int)fenceResult);
     vkResetFences(device, 1, &renderer.frameFence);
 
     // Begin command buffer
+    LOG_INFO("[RenderScene] eye=%d: vkResetCommandBuffer + vkBeginCommandBuffer...", eye);
     vkResetCommandBuffer(renderer.commandBuffer, 0);
     VkCommandBufferBeginInfo beginInfo = {};
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -851,6 +854,9 @@ void RenderScene(
     rpBegin.clearValueCount = 2;
     rpBegin.pClearValues = clearValues;
 
+    LOG_INFO("[RenderScene] eye=%d: framebuffer=%p, renderPass=%p, extent=%ux%u",
+             eye, (void*)renderer.framebuffers[eye][imageIndex], (void*)renderer.renderPass, width, height);
+    LOG_INFO("[RenderScene] eye=%d: vkCmdBeginRenderPass...", eye);
     vkCmdBeginRenderPass(renderer.commandBuffer, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
 
     // Set viewport with Y-flip (negative height) for correct NDC convention
@@ -910,7 +916,9 @@ void RenderScene(
         vkCmdDraw(renderer.commandBuffer, renderer.gridVertexCount, 1, 0, 0);
     }
 
+    LOG_INFO("[RenderScene] eye=%d: vkCmdEndRenderPass...", eye);
     vkCmdEndRenderPass(renderer.commandBuffer);
+    LOG_INFO("[RenderScene] eye=%d: vkEndCommandBuffer...", eye);
     vkEndCommandBuffer(renderer.commandBuffer);
 
     // Submit
@@ -919,10 +927,14 @@ void RenderScene(
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &renderer.commandBuffer;
 
-    vkQueueSubmit(renderer.graphicsQueue, 1, &submitInfo, renderer.frameFence);
+    LOG_INFO("[RenderScene] eye=%d: vkQueueSubmit...", eye);
+    VkResult submitResult = vkQueueSubmit(renderer.graphicsQueue, 1, &submitInfo, renderer.frameFence);
+    LOG_INFO("[RenderScene] eye=%d: vkQueueSubmit returned %d", eye, (int)submitResult);
 
     // Wait for completion before returning (runtime needs the image ready)
-    vkWaitForFences(device, 1, &renderer.frameFence, VK_TRUE, UINT64_MAX);
+    LOG_INFO("[RenderScene] eye=%d: vkWaitForFences (post-submit)...", eye);
+    VkResult waitResult = vkWaitForFences(device, 1, &renderer.frameFence, VK_TRUE, UINT64_MAX);
+    LOG_INFO("[RenderScene] eye=%d: vkWaitForFences returned %d - DONE", eye, (int)waitResult);
 }
 
 void CleanupVkRenderer(VkRenderer& renderer) {

@@ -238,23 +238,97 @@ Normal rendering resumes immediately after WM_EXITSIZEMOVE (Kooima FOV calculati
 
 ---
 
-## 8. Possible Next Steps
+## 8. How SRHydra Solves This (Reference Implementation)
 
-### A. Confirm WM_TIMER Fires (Priority: High)
+SRHydra is another OpenXR runtime that creates its own window and integrates with the SR SDK. It does **not** suffer from the drag freeze problem. Analysis of its architecture reveals a fundamentally different approach.
 
-The WM_TIMER approach (Attempt 6) has not been tested with the latest build. Test and check logs for:
-- `WM_ENTERSIZEMOVE — starting repaint timer`
-- `D3D11 repaint: Executing repaint` (from the callback)
-- `WM_EXITSIZEMOVE — killed repaint timer`
+### Architecture: Dedicated Window Thread + Message Deferral
 
-### B. Debug WndProc Subclass Chain (Priority: Medium)
+SRHydra uses a **dedicated window thread** that owns the Win32 window and message pump, while the **main/render thread** runs the OpenXR render loop independently.
 
-Add logging **before** the `GetPropW` / switch statement in `wnd_proc` to trace ALL messages received during drag:
-```cpp
-if (message == WM_PAINT || message == WM_TIMER)
-    U_LOG_W("wnd_proc received message %u (WM_PAINT=%u WM_TIMER=%u)", message, WM_PAINT, WM_TIMER);
 ```
-This would confirm whether the messages reach our wnd_proc at all.
+┌─────────────────────────┐     ┌──────────────────────────┐
+│     Window Thread        │     │     Main/Render Thread    │
+│                          │     │                           │
+│  CreateWindowEx()        │     │  while (running) {        │
+│  while (running) {       │     │    compositor->Update()   │
+│    PeekMessageA(...)     │     │      → process deferred   │
+│    if (msg) {            │     │        messages from queue │
+│      TranslateMessage()  │     │    xrWaitFrame()          │
+│      DispatchMessage()   │     │    xrBeginFrame()         │
+│    }                     │     │    render(...)            │
+│  }                       │     │    xrEndFrame()           │
+│                          │     │  }                        │
+│  ┌─ WndProc ──────────┐ │     │                           │
+│  │ WM_SIZE, WM_MOVE...│─┼──→ thread-safe queue ──→ deferred processing
+│  │ → defer to queue    │ │     │                           │
+│  └─────────────────────┘ │     │                           │
+└─────────────────────────┘     └──────────────────────────┘
+```
+
+### Key Design Points
+
+1. **Non-blocking message pump**: The window thread uses `PeekMessageA` (non-blocking), not `GetMessage` (blocking). When `DefWindowProc` enters a modal drag loop, it blocks only the window thread — the render thread continues unaffected.
+
+2. **Message deferral**: Size-sensitive messages (like `WM_SIZE`) are captured in the WndProc and queued to a thread-safe structure. The render thread processes these deferred messages in its `Update()` call, allowing it to react to window changes without being blocked.
+
+3. **Independent render loop**: The main thread's render loop (`xrWaitFrame` → `xrBeginFrame` → render → `xrEndFrame`) runs continuously and independently of the window thread. It never calls `DispatchMessage` and is never blocked by a modal loop.
+
+4. **No WM_PAINT/WM_TIMER tricks**: Because rendering happens on a separate thread, there is no need to render from inside WM_PAINT or use timer callbacks. The render thread simply keeps rendering.
+
+5. **D3D11 immediate context (no deferred context)**: SRHydra does NOT use a D3D11 deferred context. It uses the immediate context from the render thread, with fence-based synchronization where needed.
+
+### Why It Works During Drag
+
+When the user drags the SRHydra window:
+1. `DefWindowProc` enters a modal loop on the **window thread**
+2. The window thread is blocked — but this only affects message processing
+3. The **render thread** keeps running its `xrWaitFrame`/`BeginFrame`/`EndFrame` loop
+4. The 3D animation continues with fresh frames
+5. SR SDK phase snapping events (`WM_WINDOWPOSCHANGING`) are handled on the window thread, which can still dispatch messages within the modal loop
+
+### Why This Differs From Our Approach
+
+We eliminated our separate window thread (Attempt 1) because cross-thread WndProc subclassing broke SR SDK phase snapping. The SR SDK calls `SetWindowLongPtr` from the app thread, but the window was on a different thread.
+
+SRHydra avoids this problem because:
+- Its window thread is a well-defined, long-lived thread
+- The SR SDK subclassing likely happens from the window thread itself (or the SR SDK handles cross-thread subclassing correctly in SRHydra's initialization order)
+- The render thread never touches the WndProc chain
+
+### Applicability to Our Case
+
+Adopting the SRHydra approach would require:
+
+1. **Re-introduce a dedicated window thread** — but this time, ensure the SR SDK subclasses the WndProc **from the window thread** (or after the window is fully created and visible on that thread).
+
+2. **Add a message deferral queue** — thread-safe queue for `WM_SIZE`, `WM_MOVE`, and other size-sensitive messages that the render thread needs to act on.
+
+3. **Enable D3D11 multithread protection** — since two threads would access D3D11 resources (render thread for drawing, window thread for SR SDK weave during phase snap). Use `ID3D10Multithread::SetMultithreadProtected(TRUE)`.
+
+4. **Ensure SR SDK phase snapping works cross-thread** — this was the original reason for eliminating the window thread. Would need to verify that creating the SR weaver on the render thread while the window lives on a different thread doesn't break `SetWindowLongPtr` subclassing.
+
+This is a significant architectural change but is the proven approach used by a shipping OpenXR runtime with SR SDK integration.
+
+---
+
+## 9. Possible Next Steps
+
+### A. Dedicated Window Thread with Message Deferral (Priority: High — Recommended)
+
+Adopt the SRHydra architecture: re-introduce a dedicated window thread with a thread-safe message deferral queue. The render thread runs independently and processes deferred messages each frame.
+
+Key challenges:
+- Ensuring SR SDK `SetWindowLongPtr` subclassing works when the window is on a different thread
+- Thread-safe D3D11 access (multithread protection)
+- Message deferral design for `WM_SIZE`, `WM_MOVE`, `WM_ENTERSIZEMOVE`, `WM_EXITSIZEMOVE`
+
+### B. Test Diagnostic Logging Build (Priority: High)
+
+Attempt 7 added logging that traces ALL messages reaching `wnd_proc` during drag, plus WndProc subclass chain detection. Test and check logs to understand:
+- Whether ANY messages reach our handler during drag (or only WM_ENTERSIZEMOVE/WM_EXITSIZEMOVE)
+- The WndProc address chain (our address vs current outermost address)
+- This data informs whether a WndProc-based fix is even possible
 
 ### C. Investigate DXGI/SR SDK Subclass Order (Priority: Medium)
 
@@ -263,11 +337,11 @@ Use `GetWindowLongPtr(hWnd, GWLP_WNDPROC)` at various points to trace the subcla
 - After `CreateDXGISwapChain` (may be DXGI's handler)
 - After `leiasr_d3d11_create` (should be SR SDK's handler)
 
-This reveals the full subclass chain and helps identify who consumes `WM_PAINT`.
+This reveals the full subclass chain and helps identify who consumes messages.
 
 ### D. App-Side WM_PAINT Approach (Priority: Low)
 
-Modify `sr_cube_openxr/main.cpp` to subclass the Monado window from the app side and handle WM_PAINT directly (like `sr_cube_openxr_ext` does). This would bypass the runtime-side WndProc subclass issue entirely.
+Modify `sr_cube_openxr/main.cpp` to subclass the Monado window from the app side and handle WM_PAINT directly (like `sr_cube_openxr_ext` does). This would bypass the runtime-side WndProc subclass issue but requires app-side knowledge of the Monado window.
 
 ### E. Accept Limitation and Document (Priority: Fallback)
 
@@ -275,7 +349,7 @@ If the modal-loop rendering cannot be made to work for the Monado-owned window, 
 
 ---
 
-## 9. Files Reference
+## 10. Files Reference
 
 | File | Role |
 |------|------|
@@ -285,3 +359,5 @@ If the modal-loop rendering cannot be made to work for the Monado-owned window, 
 | `test_apps/sr_cube_openxr_ext/main.cpp` | Working reference: app-owned window with WM_PAINT rendering |
 | `test_apps/sr_cube_openxr/main.cpp` | Non-extension app (message pump, control window) |
 | `src/xrt/drivers/leiasr/leiasr_d3d11.cpp` | SR SDK D3D11 weaver (subclasses WndProc for phase snapping) |
+| SRHydra `WindowWindows.cpp` | Reference: dedicated window thread with PeekMessageA + message deferral |
+| SRHydra `App.cpp` | Reference: independent render loop with deferred message processing |
