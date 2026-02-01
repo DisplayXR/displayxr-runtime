@@ -389,9 +389,34 @@ static void RenderThreadFunc(
     LOG_INFO("[RenderThread] Exiting");
 }
 
+// Global crash handler to log unhandled exceptions before process dies
+static LONG WINAPI CrashHandler(EXCEPTION_POINTERS* exInfo) {
+    const char* excName = "UNKNOWN";
+    switch (exInfo->ExceptionRecord->ExceptionCode) {
+        case EXCEPTION_ACCESS_VIOLATION:      excName = "ACCESS_VIOLATION"; break;
+        case EXCEPTION_STACK_OVERFLOW:        excName = "STACK_OVERFLOW"; break;
+        case EXCEPTION_INT_DIVIDE_BY_ZERO:    excName = "INT_DIVIDE_BY_ZERO"; break;
+        case EXCEPTION_ILLEGAL_INSTRUCTION:   excName = "ILLEGAL_INSTRUCTION"; break;
+        case EXCEPTION_IN_PAGE_ERROR:         excName = "IN_PAGE_ERROR"; break;
+        case EXCEPTION_GUARD_PAGE:            excName = "GUARD_PAGE"; break;
+    }
+    LOG_ERROR("!!! UNHANDLED EXCEPTION: %s (0x%08X) at address 0x%p !!!",
+        excName, exInfo->ExceptionRecord->ExceptionCode,
+        exInfo->ExceptionRecord->ExceptionAddress);
+    if (exInfo->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
+        exInfo->ExceptionRecord->NumberParameters >= 2) {
+        LOG_ERROR("    %s address 0x%p",
+            exInfo->ExceptionRecord->ExceptionInformation[0] == 0 ? "Reading" : "Writing",
+            (void*)exInfo->ExceptionRecord->ExceptionInformation[1]);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
     (void)hPrevInstance;
     (void)lpCmdLine;
+
+    SetUnhandledExceptionFilter(CrashHandler);
 
     if (!InitializeLogging(APP_NAME)) {
         MessageBox(nullptr, L"Failed to initialize logging", L"Warning", MB_OK | MB_ICONWARNING);
