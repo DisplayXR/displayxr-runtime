@@ -68,12 +68,18 @@ struct comp_d3d11_window
 	//! True while inside a modal move/size loop (WM_ENTERSIZEMOVE..WM_EXITSIZEMOVE)
 	bool in_size_move;
 
-	//! Callback invoked from WM_PAINT during drag/resize
+	//! Callback invoked from WM_TIMER during drag/resize
 	void (*repaint_callback)(void *userdata);
 
 	//! Opaque pointer forwarded to @ref repaint_callback
 	void *repaint_userdata;
 };
+
+// Timer ID for repaint during modal drag/resize loop.
+// WM_TIMER is used instead of WM_PAINT because the SR SDK subclasses
+// our WndProc and its internal WM_PAINT handling consumes the dirty
+// region before our handler ever sees WM_PAINT.
+#define REPAINT_TIMER_ID 1
 
 // Forward declarations
 static void set_fullscreen(HWND hWnd, bool fullscreen);
@@ -195,30 +201,26 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	switch (message) {
 	case WM_ENTERSIZEMOVE:
 		w->in_size_move = true;
-		U_LOG_E("D3D11 window: WM_ENTERSIZEMOVE — entering modal drag/resize loop");
-		InvalidateRect(hWnd, NULL, FALSE); // Kick off the first WM_PAINT (essential for MOVE drags where WM_SIZE never fires)
+		U_LOG_W("D3D11 window: WM_ENTERSIZEMOVE — starting repaint timer");
+		// Use WM_TIMER instead of WM_PAINT for repaint during drag.
+		// The SR SDK subclasses our WndProc and its internal WM_PAINT
+		// handling consumes the dirty region, so WM_PAINT never reaches us.
+		SetTimer(hWnd, REPAINT_TIMER_ID, USER_TIMER_MINIMUM, NULL);
 		return 0;
 
 	case WM_EXITSIZEMOVE:
 		w->in_size_move = false;
-		U_LOG_E("D3D11 window: WM_EXITSIZEMOVE — left modal drag/resize loop");
+		KillTimer(hWnd, REPAINT_TIMER_ID);
+		U_LOG_W("D3D11 window: WM_EXITSIZEMOVE — killed repaint timer");
+		return 0;
+
+	case WM_TIMER:
+		if (wParam == REPAINT_TIMER_ID && w->repaint_callback != NULL) {
+			w->repaint_callback(w->repaint_userdata);
+		}
 		return 0;
 
 	case WM_PAINT:
-		if (w->in_size_move && w->repaint_callback != NULL) {
-			static int paint_log_counter = 0;
-			if (++paint_log_counter % 60 == 1) {
-				U_LOG_I("D3D11 window: WM_PAINT during drag — invoking repaint callback");
-			}
-			w->repaint_callback(w->repaint_userdata);
-			
-			// Validate the rect to satisfy Windows (prevents "ghost" paints or system throttling)
-			ValidateRect(hWnd, NULL);
-			
-			// Immediately invalidate again to force the NEXT frame (keep the loop going)
-			InvalidateRect(hWnd, NULL, FALSE);
-			return 0;
-		}
 		ValidateRect(hWnd, NULL);
 		break;
 
@@ -248,11 +250,6 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			w->height = HIWORD(lParam);
 			if (w->width > 0 && w->height > 0) {
 				U_LOG_D("D3D11 window: resized to %ux%u", w->width, w->height);
-			}
-			// During drag, trigger a repaint so the swapchain resizes
-			// and the weaver re-presents with correct phase alignment.
-			if (w->in_size_move) {
-				InvalidateRect(hWnd, NULL, FALSE);
 			}
 		}
 		break;

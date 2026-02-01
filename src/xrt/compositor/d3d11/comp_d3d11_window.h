@@ -116,11 +116,13 @@ void
 comp_d3d11_window_pump_messages(struct comp_d3d11_window *window);
 
 /*!
- * Set a callback invoked from WM_PAINT during drag/resize.
+ * Set a callback invoked from WM_TIMER during drag/resize.
  *
  * During a modal move/size loop the normal render loop cannot run.
- * This callback allows the compositor to re-present the last frame
- * so the window contents stay up-to-date.
+ * A periodic timer fires to invoke this callback, allowing the
+ * compositor to re-present the last frame so the window contents
+ * stay up-to-date. WM_TIMER is used instead of WM_PAINT because
+ * the SR SDK subclasses the WndProc and consumes WM_PAINT internally.
  *
  * @param window    The window object
  * @param callback  Function to call (NULL to clear)

@@ -12,11 +12,6 @@ if(MSVC)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
-# Build number (from CI or default to 0)
-if(NOT DEFINED BUILD_NUM)
-    set(BUILD_NUM "0")
-endif()
-
 # OpenXR headers location
 set(OPENXR_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/../../src/external/openxr_includes")
 
@@ -93,10 +88,6 @@ add_executable(sr_cube_openxr_ext WIN32
 )
 
 # OpenXR include dir is provided by sr_common PUBLIC include directories
-
-set_target_properties(sr_cube_openxr_ext PROPERTIES
-    OUTPUT_NAME "sr_cube_openxr_ext.${BUILD_NUM}"
-)
 
 target_link_libraries(sr_cube_openxr_ext PRIVATE
     sr_common
