@@ -715,28 +715,14 @@ d3d11_compositor_repaint(void *userdata)
 	static int repaint_count = 0;
 	repaint_count++;
 
-	// Resize swapchain target to match current window size.
-	// This is critical for phase snapping: the weaver needs 1:1 pixel output.
-	if (c->hwnd != nullptr) {
-		RECT rect;
-		if (GetClientRect(c->hwnd, &rect)) {
-			uint32_t new_width = static_cast<uint32_t>(rect.right - rect.left);
-			uint32_t new_height = static_cast<uint32_t>(rect.bottom - rect.top);
-
-			if (new_width > 0 && new_height > 0) {
-				uint32_t cur_width, cur_height;
-				comp_d3d11_target_get_dimensions(c->target, &cur_width, &cur_height);
-
-				if (new_width != cur_width || new_height != cur_height) {
-					U_LOG_W("D3D11 repaint[%d]: resizing target %ux%u -> %ux%u",
-					         repaint_count, cur_width, cur_height, new_width, new_height);
-					comp_d3d11_target_resize(c->target, new_width, new_height);
-					c->settings.preferred.width = new_width;
-					c->settings.preferred.height = new_height;
-				}
-			}
-		}
-	}
+	// Do NOT resize the swapchain target during drag repaint.
+	// Phase snapping jitters the window by 1-4 pixels each frame, which would
+	// trigger ResizeBuffers on every callback (~30Hz). ResizeBuffers releases
+	// all backbuffer references and reallocates them, which is extremely expensive
+	// and likely invalidates the SR weaver's internal render target state.
+	// Let DXGI stretch the 1-4 pixel difference — it's imperceptible.
+	// The target will be resized to the correct size on the first normal
+	// begin_frame after the drag ends.
 
 	uint32_t target_index;
 	xrt_result_t acquire_ret = comp_d3d11_target_acquire(c->target, &target_index);

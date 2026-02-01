@@ -163,13 +163,40 @@ case WM_TIMER:
 
 **Result:** FAILED. Tested in build containing commit `1ad830cd2` (which includes `abf860a`). Animation still freezes during drag. No "WM_TIMER fired" or "repaint timer" messages appear in logs. This means WM_TIMER is also NOT reaching our `wnd_proc` during the modal loop — the SR SDK or DXGI WndProc subclass chain consumes or blocks ALL messages except WM_ENTERSIZEMOVE and WM_EXITSIZEMOVE.
 
-### Attempt 7: Diagnostic Logging of ALL Messages During Drag (pending)
+### Attempt 7: Diagnostic Logging of ALL Messages During Drag (commit cbda410)
 
 **Hypothesis:** We need to determine exactly which messages reach our `wnd_proc` during drag, and confirm the WndProc subclass chain.
 
 **Change:** Added logging before the switch statement that logs every message received during `in_size_move`, plus logging the current WndProc address vs our `wnd_proc` address in WM_ENTERSIZEMOVE to confirm subclassing.
 
-**Result:** Pending test. This will reveal whether ANY messages reach us during drag, or only WM_ENTERSIZEMOVE/WM_EXITSIZEMOVE (which the SR SDK explicitly forwards).
+**Result: BREAKTHROUGH** — proved the earlier diagnosis was wrong. Logs from build `cbda410` show:
+
+1. **WndProc IS subclassed**: `Current WndProc=00000000FFFF095D, our wnd_proc=00007FFE75471740 (subclassed=YES)`
+2. **Both WM_PAINT (0x000F) AND WM_TIMER (0x0113) DO reach our wnd_proc during drag**
+3. **The repaint callback IS being invoked** — ~150+ times over a 5.5-second drag
+4. **No "Mutex locked" messages** — the mutex lock succeeds every time
+
+Messages decoded during drag:
+- `0x0216` = WM_MOVING, `0x0046` = WM_WINDOWPOSCHANGING, `0x0024` = WM_GETMINMAXINFO
+- `0x0083` = WM_NCCALCSIZE, `0x0085` = WM_NCPAINT
+- `0x0047` = WM_WINDOWPOSCHANGED, `0x0003` = WM_MOVE, `0x0005` = WM_SIZE
+- `0x000F` = **WM_PAINT**, `0x0113` = **WM_TIMER**
+
+**The earlier conclusion that "WM_PAINT/WM_TIMER never reach us" was wrong.** The previous builds lacked diagnostic logging; the "Executing repaint" log was at `U_LOG_I` (INFO) which was filtered out by log level. The repaint callback has been running all along since Attempt 6, but its output is not producing visible results.
+
+**New diagnosis:** The problem is NOT message delivery — it's that `d3d11_compositor_repaint()` runs but doesn't produce visible output. Either `comp_d3d11_target_acquire` fails silently, the weave doesn't draw to the backbuffer, or `Present` doesn't flip.
+
+### Attempt 8: WARN-Level Repaint Callback Diagnostics (pending)
+
+**Hypothesis:** The repaint callback runs but one of its internal steps fails silently (acquire, weave, or present).
+
+**Change:** Added `U_LOG_W` logging after each step in `d3d11_compositor_repaint()`:
+- After `comp_d3d11_target_resize` (if triggered)
+- After `comp_d3d11_target_acquire` (log failure with return code)
+- Before `leiasr_d3d11_weave` (log dimensions)
+- Before `comp_d3d11_target_present` (log target_index)
+
+**Result:** Pending test.
 
 ---
 
