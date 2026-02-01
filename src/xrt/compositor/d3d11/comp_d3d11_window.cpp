@@ -198,11 +198,10 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		return DefWindowProcW(hWnd, message, wParam, lParam);
 	}
 
-	// Diagnostic: log ALL messages received during drag to understand
-	// which messages the SR SDK's WndProc subclass forwards to us.
-	if (w->in_size_move) {
+	// Diagnostic: log select messages during drag (WM_PAINT, WM_TIMER confirmed delivered).
+	if (w->in_size_move && (message == WM_PAINT || message == WM_TIMER)) {
 		static int drag_msg_counter = 0;
-		if (++drag_msg_counter <= 200) { // Cap to avoid log flooding
+		if (++drag_msg_counter <= 10) {
 			U_LOG_W("D3D11 wnd_proc during drag: msg=0x%04X (WM_PAINT=0x%04X WM_TIMER=0x%04X)",
 			         message, (unsigned)WM_PAINT, (unsigned)WM_TIMER);
 		}

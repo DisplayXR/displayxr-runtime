@@ -712,10 +712,8 @@ d3d11_compositor_repaint(void *userdata)
 		return; // skip if mutex is held
 	}
 
-	static int repaint_log_counter = 0;
-	if (++repaint_log_counter % 60 == 1) {
-		U_LOG_I("D3D11 repaint: Executing repaint");
-	}
+	static int repaint_count = 0;
+	repaint_count++;
 
 	// Resize swapchain target to match current window size.
 	// This is critical for phase snapping: the weaver needs 1:1 pixel output.
@@ -730,6 +728,8 @@ d3d11_compositor_repaint(void *userdata)
 				comp_d3d11_target_get_dimensions(c->target, &cur_width, &cur_height);
 
 				if (new_width != cur_width || new_height != cur_height) {
+					U_LOG_W("D3D11 repaint[%d]: resizing target %ux%u -> %ux%u",
+					         repaint_count, cur_width, cur_height, new_width, new_height);
 					comp_d3d11_target_resize(c->target, new_width, new_height);
 					c->settings.preferred.width = new_width;
 					c->settings.preferred.height = new_height;
@@ -739,7 +739,11 @@ d3d11_compositor_repaint(void *userdata)
 	}
 
 	uint32_t target_index;
-	if (comp_d3d11_target_acquire(c->target, &target_index) != XRT_SUCCESS) {
+	xrt_result_t acquire_ret = comp_d3d11_target_acquire(c->target, &target_index);
+	if (acquire_ret != XRT_SUCCESS) {
+		if (repaint_count <= 5 || repaint_count % 60 == 0) {
+			U_LOG_W("D3D11 repaint[%d]: target_acquire FAILED (ret=%d)", repaint_count, acquire_ret);
+		}
 		return;
 	}
 
@@ -761,10 +765,23 @@ d3d11_compositor_repaint(void *userdata)
 		vp.MaxDepth = 1.0f;
 		c->context->RSSetViewports(1, &vp);
 
+		if (repaint_count <= 5 || repaint_count % 60 == 0) {
+			U_LOG_W("D3D11 repaint[%d]: weaving view=%ux%u target=%ux%u",
+			         repaint_count, view_width, view_height, target_width, target_height);
+		}
 		leiasr_d3d11_weave(c->weaver);
+	} else {
+		if (repaint_count <= 5) {
+			U_LOG_W("D3D11 repaint[%d]: weaver not ready (weaver=%p, ready=%d)",
+			         repaint_count, (void *)c->weaver,
+			         c->weaver ? leiasr_d3d11_is_ready(c->weaver) : 0);
+		}
 	}
 #endif
 
+	if (repaint_count <= 5 || repaint_count % 60 == 0) {
+		U_LOG_W("D3D11 repaint[%d]: presenting (target_index=%u)", repaint_count, target_index);
+	}
 	comp_d3d11_target_present(c->target, 1);
 }
 
