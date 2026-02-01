@@ -857,7 +857,13 @@ void RenderScene(
     LOG_INFO("[RenderScene] eye=%d: framebuffer=%p, renderPass=%p, extent=%ux%u",
              eye, (void*)renderer.framebuffers[eye][imageIndex], (void*)renderer.renderPass, width, height);
     LOG_INFO("[RenderScene] eye=%d: vkCmdBeginRenderPass...", eye);
-    vkCmdBeginRenderPass(renderer.commandBuffer, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
+    __try {
+        vkCmdBeginRenderPass(renderer.commandBuffer, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        LOG_ERROR("[RenderScene] eye=%d: CRASH in vkCmdBeginRenderPass! exception=0x%08X", eye, GetExceptionCode());
+        return;
+    }
+    LOG_INFO("[RenderScene] eye=%d: vkCmdBeginRenderPass OK", eye);
 
     // Set viewport with Y-flip (negative height) for correct NDC convention
     VkViewport viewport = {};
@@ -872,6 +878,7 @@ void RenderScene(
     VkRect2D scissor = {};
     scissor.extent = {width, height};
     vkCmdSetScissor(renderer.commandBuffer, 0, 1, &scissor);
+    LOG_INFO("[RenderScene] eye=%d: viewport+scissor set", eye);
 
     XMMATRIX zoom = XMMatrixScaling(zoomScale, zoomScale, zoomScale);
 
@@ -894,6 +901,7 @@ void RenderScene(
         vkCmdBindVertexBuffers(renderer.commandBuffer, 0, 1, &renderer.cubeVertexBuffer, &offset);
         vkCmdBindIndexBuffer(renderer.commandBuffer, renderer.cubeIndexBuffer, 0, VK_INDEX_TYPE_UINT16);
         vkCmdDrawIndexed(renderer.commandBuffer, 36, 1, 0, 0, 0);
+        LOG_INFO("[RenderScene] eye=%d: cube draw recorded", eye);
     }
 
     // Draw grid
@@ -914,6 +922,7 @@ void RenderScene(
         VkDeviceSize offset = 0;
         vkCmdBindVertexBuffers(renderer.commandBuffer, 0, 1, &renderer.gridVertexBuffer, &offset);
         vkCmdDraw(renderer.commandBuffer, renderer.gridVertexCount, 1, 0, 0);
+        LOG_INFO("[RenderScene] eye=%d: grid draw recorded", eye);
     }
 
     LOG_INFO("[RenderScene] eye=%d: vkCmdEndRenderPass...", eye);
