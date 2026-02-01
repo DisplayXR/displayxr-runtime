@@ -115,8 +115,7 @@ struct null_compositor
 		struct null_comp_frame rendering;
 	} frame;
 
-	//! Target service stub (zeroed — null compositor doesn't support per-session rendering).
-	//! Required for safe cast to comp_compositor in comp_multi_system.c.
+	//! Target service for per-session rendering (initialized when Vulkan is available).
 	struct comp_target_service target_service;
 };
 

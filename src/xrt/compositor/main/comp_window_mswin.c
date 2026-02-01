@@ -198,7 +198,7 @@ comp_window_mswin_create_surface(struct comp_window_mswin *w, VkSurfaceKHR *out_
 	    NULL,                          //
 	    &surface);                     //
 	if (ret != VK_SUCCESS) {
-		COMP_ERROR(w->base.base.c, "vkCreateWin32SurfaceKHR: %s", vk_result_string(ret));
+		U_LOG_E("vkCreateWin32SurfaceKHR: %s", vk_result_string(ret));
 		return ret;
 	}
 
@@ -216,7 +216,7 @@ comp_window_mswin_init_swapchain(struct comp_target *ct, uint32_t width, uint32_
 
 	ret = comp_window_mswin_create_surface(cwm, &cwm->base.surface.handle);
 	if (ret != VK_SUCCESS) {
-		COMP_ERROR(ct->c, "Failed to create surface '%s'!", vk_result_string(ret));
+		U_LOG_E("Failed to create surface '%s'!", vk_result_string(ret));
 		return false;
 	}
 
@@ -554,7 +554,7 @@ comp_window_mswin_create_from_external(struct comp_compositor *c,
                                        struct comp_target **out_ct)
 {
 	if (external_hwnd == NULL) {
-		COMP_ERROR(c, "External HWND is NULL");
+		U_LOG_E("External HWND is NULL");
 		return false;
 	}
 
@@ -594,8 +594,8 @@ comp_window_mswin_create_from_external(struct comp_compositor *c,
 		cwm->base.base.height = 720;
 	}
 
-	COMP_INFO(c, "Created comp_target from external HWND %p (%ux%u)",
-	          external_hwnd, cwm->base.base.width, cwm->base.base.height);
+	U_LOG_I("Created comp_target from external HWND %p (%ux%u)",
+	        external_hwnd, cwm->base.base.width, cwm->base.base.height);
 
 	*out_ct = &cwm->base.base;
 	return true;

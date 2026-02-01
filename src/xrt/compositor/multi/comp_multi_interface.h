@@ -17,6 +17,7 @@ extern "C" {
 #endif
 
 struct u_pacing_app_factory;
+struct comp_target_service;
 
 
 /*!
@@ -25,11 +26,12 @@ struct u_pacing_app_factory;
  * Both the native compositor and the pacing factory is owned by the system
  * compositor and destroyed by it.
  *
- * @param xcn           Native compositor that client are multi-plexed to.
- * @param upaf          App pacing factory, one pacer created per client.
- * @param xsci          Information to be exposed.
- * @param do_warm_start Should we always submit a frame at startup.
- * @param out_xsysc     Created @ref xrt_system_compositor.
+ * @param xcn            Native compositor that client are multi-plexed to.
+ * @param upaf           App pacing factory, one pacer created per client.
+ * @param xsci           Information to be exposed.
+ * @param do_warm_start  Should we always submit a frame at startup.
+ * @param target_service Target service for per-session rendering (may be NULL).
+ * @param out_xsysc      Created @ref xrt_system_compositor.
  *
  * @public @memberof multi_system_compositor
  */
@@ -38,6 +40,7 @@ comp_multi_create_system_compositor(struct xrt_compositor_native *xcn,
                                     struct u_pacing_app_factory *upaf,
                                     const struct xrt_system_compositor_info *xsci,
                                     bool do_warm_start,
+                                    struct comp_target_service *target_service,
                                     struct xrt_system_compositor **out_xsysc);
 
 

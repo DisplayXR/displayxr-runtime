@@ -1352,8 +1352,11 @@ render_per_session_clients_locked(struct multi_system_compositor *msc, int64_t d
 
 	U_LOG_W("[per-session] render_per_session_clients_locked: START");
 
-	struct comp_compositor *c = comp_compositor(&msc->xcn->base);
-	struct vk_bundle *vk = &c->base.vk;
+	struct vk_bundle *vk = comp_target_service_get_vk(msc->target_service);
+	if (vk == NULL) {
+		U_LOG_E("[per-session] No Vulkan bundle available from target service");
+		return;
+	}
 
 	int session_count = 0;
 	for (size_t k = 0; k < ARRAY_SIZE(msc->clients); k++) {
@@ -1904,6 +1907,7 @@ comp_multi_create_system_compositor(struct xrt_compositor_native *xcn,
                                     struct u_pacing_app_factory *upaf,
                                     const struct xrt_system_compositor_info *xsci,
                                     bool do_warm_start,
+                                    struct comp_target_service *target_service,
                                     struct xrt_system_compositor **out_xsysc)
 {
 	struct multi_system_compositor *msc = U_TYPED_CALLOC(struct multi_system_compositor);
@@ -1920,9 +1924,8 @@ comp_multi_create_system_compositor(struct xrt_compositor_native *xcn,
 	msc->upaf = upaf;
 	msc->xcn = xcn;
 
-	// Get the target service from the native compositor for per-session rendering (Phase 3)
-	struct comp_compositor *c = comp_compositor(&xcn->base);
-	msc->target_service = &c->target_service;
+	// Store the target service for per-session rendering (Phase 3)
+	msc->target_service = target_service;
 
 	msc->sessions.active_count = 0;
 	msc->sessions.state = do_warm_start ? MULTI_SYSTEM_STATE_INIT_WARM_START : MULTI_SYSTEM_STATE_STOPPED;

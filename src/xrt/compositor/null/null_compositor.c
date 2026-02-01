@@ -28,8 +28,13 @@
 #include "util/comp_vulkan.h"
 
 #include "multi/comp_multi_interface.h"
+#include "main/comp_target_swapchain.h"
 #include "xrt/xrt_compositor.h"
 #include "xrt/xrt_device.h"
+
+#ifdef XRT_OS_WINDOWS
+#include "main/comp_window.h"
+#endif
 
 
 #include <inttypes.h>
@@ -73,6 +78,10 @@ static const char *instance_extensions_common[] = {
     VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME,     //
     VK_KHR_EXTERNAL_SEMAPHORE_CAPABILITIES_EXTENSION_NAME,  //
     VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME, //
+    VK_KHR_SURFACE_EXTENSION_NAME,                          //
+#ifdef XRT_OS_WINDOWS
+    VK_KHR_WIN32_SURFACE_EXTENSION_NAME,                    //
+#endif
 };
 
 static const char *required_device_extensions[] = {
@@ -81,6 +90,7 @@ static const char *required_device_extensions[] = {
     VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,           //
     VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME,        //
     VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME, //
+    VK_KHR_SWAPCHAIN_EXTENSION_NAME,                 //
 
 // Platform version of "external_memory"
 #if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_FD)
@@ -570,6 +580,126 @@ null_compositor_request_display_refresh_rate(struct xrt_compositor *xc, float di
 
 /*
  *
+ * Target service implementation for per-session rendering.
+ *
+ */
+
+#ifdef XRT_OS_WINDOWS
+
+/*!
+ * Service callback: create a comp_target from an external window handle.
+ * This is called by comp_multi when a session needs its own render target.
+ */
+static xrt_result_t
+null_target_service_create_from_window(struct comp_target_service *service,
+                                       void *external_window_handle,
+                                       struct comp_target **out_target)
+{
+	struct null_compositor *nc = (struct null_compositor *)service->context;
+
+	if (external_window_handle == NULL) {
+		NULL_ERROR(nc, "Cannot create target from NULL window handle");
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+
+	// Cast null_compositor as comp_compositor for comp_window_mswin_create_from_external.
+	// This is safe because both structs start with comp_base at offset 0, so
+	// ct->c->base.vk is at the same offset in both layouts.
+	struct comp_compositor *c_alias = (struct comp_compositor *)nc;
+
+	struct comp_target *ct = NULL;
+	if (!comp_window_mswin_create_from_external(c_alias, external_window_handle, &ct)) {
+		NULL_ERROR(nc, "Failed to create per-session target from HWND %p", external_window_handle);
+		return XRT_ERROR_VULKAN;
+	}
+
+	// Initialize post-Vulkan (creates Vulkan surface from the HWND)
+	if (!comp_target_init_post_vulkan(ct, ct->width, ct->height)) {
+		NULL_ERROR(nc, "Failed to init post vulkan for per-session target");
+		comp_target_destroy(&ct);
+		return XRT_ERROR_VULKAN;
+	}
+
+	// Pre-create fake pacing on the comp_target_swapchain BEFORE calling
+	// comp_target_create_images. This prevents comp_target_swapchain_create_images
+	// from accessing ct->c->frame_interval_ns, which would read at the wrong
+	// offset since ct->c is actually a null_compositor, not a comp_compositor.
+	{
+		struct comp_target_swapchain *cts = (struct comp_target_swapchain *)ct;
+		if (cts->upc == NULL) {
+			int64_t now_ns = os_monotonic_get_ns();
+			u_pc_fake_create(nc->settings.frame_interval_ns, now_ns, &cts->upc);
+		}
+	}
+
+	// Create swapchain images
+	struct comp_target_create_images_info info = {
+	    .extent =
+	        {
+	            .width = ct->width,
+	            .height = ct->height,
+	        },
+	    .image_usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+	    .color_space = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
+	    .present_mode = VK_PRESENT_MODE_FIFO_KHR,
+	    .format_count = 1,
+	    .formats = {VK_FORMAT_B8G8R8A8_SRGB},
+	};
+
+	comp_target_create_images(ct, &info);
+
+	if (!comp_target_has_images(ct)) {
+		NULL_ERROR(nc, "Failed to create swapchain images for per-session target");
+		comp_target_destroy(&ct);
+		return XRT_ERROR_VULKAN;
+	}
+
+	NULL_INFO(nc, "Created per-session target from HWND %p (%ux%u)", external_window_handle, ct->width,
+	          ct->height);
+	*out_target = ct;
+	return XRT_SUCCESS;
+}
+
+/*!
+ * Service callback: destroy a comp_target created by this service.
+ */
+static void
+null_target_service_destroy_target(struct comp_target_service *service, struct comp_target **target)
+{
+	(void)service;
+	comp_target_destroy(target);
+}
+
+/*!
+ * Service callback: get the Vulkan bundle from the compositor.
+ */
+static struct vk_bundle *
+null_target_service_get_vk(struct comp_target_service *service)
+{
+	struct null_compositor *nc = (struct null_compositor *)service->context;
+	return get_vk(nc);
+}
+
+#endif // XRT_OS_WINDOWS
+
+/*!
+ * Initialize the target service on a null compositor.
+ * Called during compositor creation after Vulkan init.
+ */
+static void
+null_compositor_init_target_service(struct null_compositor *nc)
+{
+#ifdef XRT_OS_WINDOWS
+	nc->target_service.create_from_window = null_target_service_create_from_window;
+	nc->target_service.destroy_target = null_target_service_destroy_target;
+	nc->target_service.get_vk = null_target_service_get_vk;
+	nc->target_service.context = nc;
+#endif
+}
+
+
+/*
+ *
  * 'Exported' functions.
  *
  */
@@ -665,6 +795,10 @@ null_compositor_create_system_with_dims(struct xrt_device *xdev,
 		return XRT_ERROR_VULKAN;
 	}
 
+	// Initialize target service for per-session rendering (only if Vulkan is available)
+	if (c->vulkan_inited) {
+		null_compositor_init_target_service(c);
+	}
 
 	NULL_DEBUG(c, "Done %p", (void *)c);
 
@@ -673,5 +807,6 @@ null_compositor_create_system_with_dims(struct xrt_device *xdev,
 	XRT_MAYBE_UNUSED xrt_result_t xret = u_pa_factory_create(&upaf);
 	assert(xret == XRT_SUCCESS && upaf != NULL);
 
-	return comp_multi_create_system_compositor(&c->base.base, upaf, &c->sys_info, false, out_xsysc);
+	return comp_multi_create_system_compositor(&c->base.base, upaf, &c->sys_info, false, &c->target_service,
+	                                           out_xsysc);
 }
