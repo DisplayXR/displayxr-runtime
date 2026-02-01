@@ -187,7 +187,10 @@ static void RenderThreadFunc(
 
         if (xr->sessionRunning) {
             XrFrameState frameState;
+            LOG_INFO("[FRAME] Calling BeginFrame (xrWaitFrame + xrBeginFrame)...");
             if (BeginFrame(*xr, frameState)) {
+                LOG_INFO("[FRAME] BeginFrame OK, shouldRender=%d, displayTime=%lld",
+                    frameState.shouldRender, (long long)frameState.predictedDisplayTime);
                 XrCompositionLayerProjectionView projectionViews[2] = {};
                 bool rendered = false;
                 bool hudSubmitted = false;
@@ -196,11 +199,13 @@ static void RenderThreadFunc(
                     XMMATRIX leftViewMatrix, leftProjMatrix;
                     XMMATRIX rightViewMatrix, rightProjMatrix;
 
+                    LOG_INFO("[FRAME] Calling LocateViews...");
                     if (LocateViews(*xr, frameState.predictedDisplayTime,
                         leftViewMatrix, leftProjMatrix,
                         rightViewMatrix, rightProjMatrix,
                         inputSnapshot.cameraPosX, inputSnapshot.cameraPosY, inputSnapshot.cameraPosZ,
                         inputSnapshot.yaw, inputSnapshot.pitch)) {
+                        LOG_INFO("[FRAME] LocateViews OK");
 
                         // Get raw view poses for projection views
                         XrViewLocateInfo locateInfo = {XR_TYPE_VIEW_LOCATE_INFO};
@@ -212,20 +217,27 @@ static void RenderThreadFunc(
                         uint32_t viewCount = 2;
                         XrView rawViews[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
                         xrLocateViews(xr->session, &locateInfo, &viewState, 2, &viewCount, rawViews);
+                        LOG_INFO("[FRAME] Raw LocateViews done");
 
                         rendered = true;
                         for (int eye = 0; eye < 2; eye++) {
                             uint32_t imageIndex;
+                            LOG_INFO("[FRAME] Eye %d: AcquireSwapchainImage...", eye);
                             if (AcquireSwapchainImage(*xr, eye, imageIndex)) {
+                                LOG_INFO("[FRAME] Eye %d: Acquired image %u", eye, imageIndex);
                                 XMMATRIX viewMatrix = (eye == 0) ? leftViewMatrix : rightViewMatrix;
                                 XMMATRIX projMatrix = (eye == 0) ? leftProjMatrix : rightProjMatrix;
 
+                                LOG_INFO("[FRAME] Eye %d: RenderScene...", eye);
                                 RenderScene(*renderer, eye, imageIndex,
                                     xr->swapchains[eye].width, xr->swapchains[eye].height,
                                     viewMatrix, projMatrix,
                                     inputSnapshot.zoomScale);
+                                LOG_INFO("[FRAME] Eye %d: RenderScene done", eye);
 
+                                LOG_INFO("[FRAME] Eye %d: ReleaseSwapchainImage...", eye);
                                 ReleaseSwapchainImage(*xr, eye);
+                                LOG_INFO("[FRAME] Eye %d: Released", eye);
 
                                 projectionViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
                                 projectionViews[eye].subImage.swapchain = xr->swapchains[eye].swapchain;
@@ -238,14 +250,17 @@ static void RenderThreadFunc(
                                 projectionViews[eye].pose = rawViews[eye].pose;
                                 projectionViews[eye].fov = rawViews[eye].fov;
                             } else {
+                                LOG_WARN("[FRAME] Eye %d: AcquireSwapchainImage FAILED", eye);
                                 rendered = false;
                             }
                         }
 
                         // Render HUD to window-space layer swapchain
                         if (rendered && inputSnapshot.hudVisible && hud && xr->hasHudSwapchain && hudSwapchainImages) {
+                            LOG_INFO("[FRAME] HUD: Acquiring swapchain image...");
                             uint32_t hudImageIndex;
                             if (AcquireHudSwapchainImage(*xr, hudImageIndex)) {
+                                LOG_INFO("[FRAME] HUD: Acquired image %u", hudImageIndex);
                                 std::wstring sessionText = L"Session: ";
                                 sessionText += FormatSessionState((int)xr->sessionState);
                                 std::wstring modeText = xr->hasSessionTargetExt ?
@@ -320,12 +335,17 @@ static void RenderThreadFunc(
                                 VkSubmitInfo submitInfo = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
                                 submitInfo.commandBufferCount = 1;
                                 submitInfo.pCommandBuffers = &cmdBuf;
+                                LOG_INFO("[FRAME] HUD: Submitting GPU commands...");
                                 vkQueueSubmit(renderer->graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
+                                LOG_INFO("[FRAME] HUD: vkQueueWaitIdle...");
                                 vkQueueWaitIdle(renderer->graphicsQueue);
+                                LOG_INFO("[FRAME] HUD: GPU done");
 
                                 vkFreeCommandBuffers(renderer->device, hudCmdPool, 1, &cmdBuf);
 
+                                LOG_INFO("[FRAME] HUD: Releasing swapchain image...");
                                 ReleaseHudSwapchainImage(*xr);
+                                LOG_INFO("[FRAME] HUD: Released");
                                 hudSubmitted = true;
                             }
                         }
@@ -334,11 +354,17 @@ static void RenderThreadFunc(
 
                 // End frame: use window-space HUD layer if available, or 0 layers if not rendered
                 if (rendered && hudSubmitted) {
+                    LOG_INFO("[FRAME] EndFrameWithWindowSpaceHud (rendered+hud)...");
                     EndFrameWithWindowSpaceHud(*xr, frameState.predictedDisplayTime, projectionViews,
                         0.0f, 0.0f, HUD_WIDTH_FRACTION, HUD_HEIGHT_FRACTION, 0.0f);
+                    LOG_INFO("[FRAME] EndFrameWithWindowSpaceHud done");
                 } else if (rendered) {
+                    LOG_INFO("[FRAME] EndFrame (rendered, no hud)...");
                     EndFrame(*xr, frameState.predictedDisplayTime, projectionViews);
+                    LOG_INFO("[FRAME] EndFrame done");
                 } else {
+                    LOG_INFO("[FRAME] EndFrame (empty frame, rendered=%d shouldRender=%d)...",
+                        rendered, frameState.shouldRender);
                     // shouldRender was false or rendering failed - submit empty frame
                     XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
                     endInfo.displayTime = frameState.predictedDisplayTime;
@@ -346,7 +372,10 @@ static void RenderThreadFunc(
                     endInfo.layerCount = 0;
                     endInfo.layers = nullptr;
                     xrEndFrame(xr->session, &endInfo);
+                    LOG_INFO("[FRAME] EndFrame (empty) done");
                 }
+            } else {
+                LOG_WARN("[FRAME] BeginFrame FAILED");
             }
         } else {
             Sleep(100);
