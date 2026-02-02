@@ -273,6 +273,10 @@ can_do_one_projection_layer_fast_path(struct comp_compositor *c)
 	}
 
 	struct comp_layer *layer = &c->base.layer_accum.layers[0];
+	if (layer->data.flags & XRT_LAYER_COMPOSITION_COLOR_BIAS_SCALE) {
+		return false;
+	}
+
 	enum xrt_layer_type type = layer->data.type;
 
 	// Handled by the distortion shader.
