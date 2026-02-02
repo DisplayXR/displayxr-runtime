@@ -329,6 +329,21 @@ client_vk_swapchain_barrier_image(struct xrt_swapchain *xsc, enum xrt_barrier_di
 	COMP_TRACE_MARKER();
 
 	struct client_vk_swapchain *sc = client_vk_swapchain(xsc);
+
+	// When disable_fence_sync is true (null compositor with separate VkDevice),
+	// skip the release barrier entirely. It serves no purpose because:
+	// 1. Queue family transfer is already disabled (VK_QUEUE_FAMILY_IGNORED)
+	// 2. Layout transitions on the app's VkDevice don't affect the compositor's
+	//    separate VkDevice (each has independent layout tracking)
+	// 3. The oldLayout in the release barrier may not match the image's actual
+	//    layout (e.g. HUD uses TRANSFER_DST via D3D11 copy, not COLOR_ATTACHMENT)
+	//    causing VK_ERROR_DEVICE_LOST on some drivers
+	// 4. CPU sync (vkQueueWaitIdle) in submit_fallback handles memory visibility
+	// 5. The next acquire barrier uses oldLayout=UNDEFINED which resets layout state
+	if (direction == XRT_BARRIER_TO_COMP && sc->c->xcn->base.info.disable_fence_sync) {
+		return XRT_SUCCESS;
+	}
+
 	VkCommandBuffer cmd_buffer = VK_NULL_HANDLE;
 
 	switch (direction) {
