@@ -978,6 +978,9 @@ struct xrt_compositor_info
 
 	//! Max texture size that GPU supports (size of a single dimension), zero means any size.
 	uint32_t max_texture_size;
+
+	//! If true, the client compositor should not use external fence sync (use CPU fallback instead).
+	bool disable_fence_sync;
 };
 
 /*!

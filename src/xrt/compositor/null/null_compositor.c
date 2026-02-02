@@ -289,6 +289,11 @@ compositor_init_info(struct null_compositor *c)
 	comp_vulkan_formats_copy_to_info(&formats, info);
 	comp_vulkan_formats_log(c->settings.log_level, &formats);
 
+	// Null compositor uses a separate VkDevice from the app, so external fence
+	// sync is not needed. Disable it to avoid VK_ERROR_DEVICE_LOST on Intel iGPUs
+	// where the driver reports fence export support but crashes when actually used.
+	info->disable_fence_sync = true;
+
 	return true;
 }
 

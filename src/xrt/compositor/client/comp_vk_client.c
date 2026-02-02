@@ -881,6 +881,17 @@ client_vk_compositor_create(struct xrt_compositor_native *xcn,
 		goto err_free;
 	}
 
+	// If the native compositor says no external fence sync, clear the flag
+	// so submit_fence is skipped and submit_fallback (vkQueueWaitIdle) is used.
+	if (xcn->base.info.disable_fence_sync) {
+#if defined(XRT_GRAPHICS_SYNC_HANDLE_IS_FD)
+		c->vk.external.fence_sync_fd = false;
+		c->vk.external.fence_opaque_fd = false;
+#elif defined(XRT_GRAPHICS_SYNC_HANDLE_IS_WIN32_HANDLE)
+		c->vk.external.fence_win32_handle = false;
+#endif
+	}
+
 	ret = vk_init_mutex(&c->vk);
 	if (ret != VK_SUCCESS) {
 		goto err_free;
@@ -894,7 +905,7 @@ client_vk_compositor_create(struct xrt_compositor_native *xcn,
 	VK_NAME_COMMAND_POOL(&c->vk, c->pool.pool, "client_vk_compositor command pool");
 
 #ifdef VK_KHR_timeline_semaphore
-	if (vk_can_import_and_export_timeline_semaphore(&c->vk)) {
+	if (!xcn->base.info.disable_fence_sync && vk_can_import_and_export_timeline_semaphore(&c->vk)) {
 		xret = setup_semaphore(c);
 		if (xret != XRT_SUCCESS) {
 			goto err_pool;
