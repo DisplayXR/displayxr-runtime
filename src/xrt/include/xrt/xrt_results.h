@@ -1,5 +1,5 @@
 // Copyright 2020-2023, Collabora, Ltd.
-// Copyright 2024-2025, NVIDIA CORPORATION.
+// Copyright 2024-2026, NVIDIA CORPORATION.
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
@@ -257,4 +257,9 @@ typedef enum xrt_result
 	 * XRT_TRACKING_TYPE_ATTACHABLE.
 	 */
 	XRT_ERROR_DEVICE_NOT_ATTACHABLE = -42,
+
+	/*!
+	 * C++ code threw an exception that wasn't caught.
+	 */
+	XRT_ERROR_UNCAUGHT_EXCEPTION = -43,
 } xrt_result_t;
