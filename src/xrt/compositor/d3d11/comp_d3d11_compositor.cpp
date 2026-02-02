@@ -109,6 +109,9 @@ struct comp_d3d11_compositor
 	//! Time of the last predicted display time.
 	uint64_t last_display_time_ns;
 
+	//! Timestamp of the last wait_frame return (for frame pacing).
+	uint64_t last_wait_frame_return_ns;
+
 	//! Pending render resolution change (set on resize, cleared when queried).
 	bool render_resize_pending;
 	uint32_t pending_render_width;
@@ -256,15 +259,32 @@ d3d11_compositor_wait_frame(struct xrt_compositor *xc,
 {
 	struct comp_d3d11_compositor *c = d3d11_comp(xc);
 
+	// Use queried display refresh rate
+	int64_t period_ns = static_cast<int64_t>(U_TIME_1S_IN_NS / c->display_refresh_rate);
+
+	// Frame pacing: sleep until the next frame period.
+	// Without this, xrWaitFrame returns instantly in windowed mode and the
+	// app bursts through frames faster than the display can present them,
+	// causing visible micro-stutter (burst/stall pattern from DXGI queuing).
+	if (c->last_wait_frame_return_ns > 0) {
+		int64_t now = static_cast<int64_t>(os_monotonic_get_ns());
+		int64_t elapsed = now - static_cast<int64_t>(c->last_wait_frame_return_ns);
+		int64_t remaining = period_ns - elapsed;
+		// Only sleep if there's meaningful time remaining (> 2ms).
+		// Shorter sleeps are unreliable on Windows and add overhead.
+		if (remaining > 2000000) {
+			os_nanosleep(remaining);
+		}
+	}
+	c->last_wait_frame_return_ns = os_monotonic_get_ns();
+
 	std::lock_guard<std::mutex> lock(c->mutex);
 
 	c->frame_id++;
 
 	*out_frame_id = c->frame_id;
 
-	// Use queried display refresh rate
 	int64_t now_ns = static_cast<int64_t>(os_monotonic_get_ns());
-	int64_t period_ns = static_cast<int64_t>(U_TIME_1S_IN_NS / c->display_refresh_rate);
 
 	*out_predicted_display_time_ns = now_ns + period_ns * 2;
 	*out_predicted_display_period_ns = period_ns;
@@ -807,6 +827,19 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 			mt->SetMultithreadProtected(TRUE);
 			mt->Release();
 			U_LOG_W("D3D11 multithread protection enabled");
+		}
+	}
+
+	// Limit DXGI frame queue to 1 to prevent burst/stall frame pacing.
+	// The default is 3, which lets the app submit multiple frames before
+	// Present(1) blocks, causing micro-stutter in windowed mode.
+	{
+		IDXGIDevice1 *dxgi_dev1 = nullptr;
+		hr = c->device->QueryInterface(__uuidof(IDXGIDevice1), (void **)&dxgi_dev1);
+		if (SUCCEEDED(hr) && dxgi_dev1 != nullptr) {
+			dxgi_dev1->SetMaximumFrameLatency(1);
+			dxgi_dev1->Release();
+			U_LOG_W("DXGI maximum frame latency set to 1");
 		}
 	}
 

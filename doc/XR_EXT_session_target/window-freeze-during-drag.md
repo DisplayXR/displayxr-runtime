@@ -339,40 +339,66 @@ This is a significant architectural change but is the proven approach used by a 
 
 ---
 
-## 9. Possible Next Steps
+## 9. Resolution: Dedicated Window Thread
 
-### A. Dedicated Window Thread with Message Deferral (Priority: High — Recommended)
+### Root Cause (Proven)
 
-Adopt the SRHydra architecture: re-introduce a dedicated window thread with a thread-safe message deferral queue. The render thread runs independently and processes deferred messages each frame.
+DWM stalls the DXGI presentation pipeline when the window-owning thread is blocked in a modal loop. `Present(S_OK)` succeeds but DWM refuses to flip buffers. No single-threaded approach (WM_TIMER, WM_PAINT, `Present(0)`) can fix this. The window's owning thread must NOT be the thread calling `Present`.
 
-Key challenges:
-- Ensuring SR SDK `SetWindowLongPtr` subclassing works when the window is on a different thread
-- Thread-safe D3D11 access (multithread protection)
-- Message deferral design for `WM_SIZE`, `WM_MOVE`, `WM_ENTERSIZEMOVE`, `WM_EXITSIZEMOVE`
+### Solution Implemented
 
-### B. Test Diagnostic Logging Build (Priority: High)
+Moved the window to a **dedicated thread** that owns the HWND and message pump. The compositor/app thread continues rendering independently — `Present` is called from a non-blocked thread, so DWM flips buffers normally.
 
-Attempt 7 added logging that traces ALL messages reaching `wnd_proc` during drag, plus WndProc subclass chain detection. Test and check logs to understand:
-- Whether ANY messages reach our handler during drag (or only WM_ENTERSIZEMOVE/WM_EXITSIZEMOVE)
-- The WndProc address chain (our address vs current outermost address)
-- This data informs whether a WndProc-based fix is even possible
+```
+Window Thread                      Compositor Thread (= App Thread)
+─────────────                      ────────────────────────────────
+CreateWindowEx(HWND)               ID3D11Device + IDXGISwapChain
+GetMessage / DispatchMessage       while (running) {
+                                     read window dims (atomic)
+┌─ WndProc ─────────────────┐       xrWaitFrame / BeginFrame
+│ WM_WINDOWPOSCHANGING       │       render stereo
+│   → phase snap (SR SDK)    │       xrEndFrame → weave → Present
+│ WM_SIZE → update atomics  ─┼──→  }
+│ WM_ENTERSIZEMOVE           │     (never blocked by modal loop)
+│   → modal loop (BLOCKS     │
+│     only THIS thread)      │
+└────────────────────────────┘
+```
 
-### C. Investigate DXGI/SR SDK Subclass Order (Priority: Medium)
+### Why Single-Threaded Approaches Failed
 
-Use `GetWindowLongPtr(hWnd, GWLP_WNDPROC)` at various points to trace the subclass chain:
-- After `CreateWindowExW` (should be our `wnd_proc`)
-- After `CreateDXGISwapChain` (may be DXGI's handler)
-- After `leiasr_d3d11_create` (should be SR SDK's handler)
+All single-threaded approaches (Attempts 1–8) failed for the same fundamental reason: even though the repaint callback ran successfully during drag (Attempt 7 proved WM_TIMER fires and the callback executes), **DWM will not flip DXGI buffers when the window-owning thread is in a modal state**. `Present` returns `S_OK` but produces no visible output.
 
-This reveals the full subclass chain and helps identify who consumes messages.
+### Changes Made
 
-### D. App-Side WM_PAINT Approach (Priority: Low)
+1. **`comp_d3d11_window.cpp`** — Rewrote to use a dedicated window thread:
+   - Window created via `CreateThread` → `window_thread_func`
+   - Thread runs its own `GetMessage` loop
+   - State communicated via `volatile LONG` + `InterlockedExchange`
+   - `pump_messages` and `set_repaint_callback` are now no-ops
+   - Removed WM_TIMER repaint mechanism entirely
 
-Modify `sr_cube_openxr/main.cpp` to subclass the Monado window from the app side and handle WM_PAINT directly (like `sr_cube_openxr_ext` does). This would bypass the runtime-side WndProc subclass issue but requires app-side knowledge of the Monado window.
+2. **`comp_d3d11_compositor.cpp`** — Simplified:
+   - Removed `d3d11_compositor_repaint` function entirely
+   - Removed repaint callback registration/clearing
+   - Added `ID3D10Multithread::SetMultithreadProtected(TRUE)` for cross-thread safety
 
-### E. Accept Limitation and Document (Priority: Fallback)
+### Thread Safety
 
-If the modal-loop rendering cannot be made to work for the Monado-owned window, document the limitation: apps that need smooth drag/resize behavior should use `XR_EXT_session_target` to own their window. This is already the recommended path for desktop 3D display applications.
+| Resource | Accessed By | Protection |
+|----------|-------------|------------|
+| HWND | Both threads | Created on window thread, read-only after creation |
+| Window dimensions | Window thread writes, compositor reads | `volatile LONG` + `InterlockedExchange` |
+| `should_exit`, `in_size_move` | Window thread writes, compositor reads | `volatile LONG` + `InterlockedExchange` |
+| D3D11 device/context | Compositor thread primarily | `ID3D10Multithread::SetMultithreadProtected(TRUE)` |
+| SR weaver | Compositor thread (weave) | Not accessed from window thread |
+| SR WndProc data | Window thread only | No protection needed |
+
+### SR SDK Threading (Confirmed Safe)
+
+- `weaverWndProc` handles `WM_WINDOWPOSCHANGING` (SnapToPhase), `WM_ENTERSIZEMOVE`, `WM_EXITSIZEMOVE` — **no D3D11 ops** in WndProc
+- `SetWindowLongPtr` (called during `CreateDX11Weaver` on compositor thread) works cross-thread — Windows processes it via `SendMessage` to the window thread
+- Phase snapping runs on the window thread where messages are dispatched — correct behavior
 
 ---
 
@@ -380,11 +406,9 @@ If the modal-loop rendering cannot be made to work for the Monado-owned window, 
 
 | File | Role |
 |------|------|
-| `src/xrt/compositor/d3d11/comp_d3d11_window.cpp` | Monado window creation, WndProc, WM_TIMER repaint |
-| `src/xrt/compositor/d3d11/comp_d3d11_window.h` | Window API (create, destroy, pump_messages, set_repaint_callback) |
-| `src/xrt/compositor/d3d11/comp_d3d11_compositor.cpp` | `d3d11_compositor_repaint` callback, `begin_frame` resize logic |
+| `src/xrt/compositor/d3d11/comp_d3d11_window.cpp` | Dedicated window thread, WndProc, atomic state |
+| `src/xrt/compositor/d3d11/comp_d3d11_window.h` | Window API (create, destroy, get_dimensions, etc.) |
+| `src/xrt/compositor/d3d11/comp_d3d11_compositor.cpp` | D3D11 compositor, multithread protection, `begin_frame` resize |
 | `test_apps/sr_cube_openxr_ext/main.cpp` | Working reference: app-owned window with WM_PAINT rendering |
 | `test_apps/sr_cube_openxr/main.cpp` | Non-extension app (message pump, control window) |
 | `src/xrt/drivers/leiasr/leiasr_d3d11.cpp` | SR SDK D3D11 weaver (subclasses WndProc for phase snapping) |
-| SRHydra `WindowWindows.cpp` | Reference: dedicated window thread with PeekMessageA + message deferral |
-| SRHydra `App.cpp` | Reference: independent render loop with deferred message processing |
