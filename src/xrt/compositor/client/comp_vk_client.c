@@ -765,14 +765,24 @@ client_vk_swapchain_create(struct xrt_compositor *xc,
 		    .subresourceRange = subresource_range,
 		};
 
+		// When disable_fence_sync is true (null compositor with separate VkDevice),
+		// skip VK_QUEUE_FAMILY_EXTERNAL transfer — it causes VK_ERROR_DEVICE_LOST
+		// on some drivers (NVIDIA, Intel). CPU sync via vkQueueWaitIdle is used instead.
+		uint32_t release_src_queue = c->xcn->base.info.disable_fence_sync
+		                                 ? VK_QUEUE_FAMILY_IGNORED
+		                                 : vk->main_queue->family_index;
+		uint32_t release_dst_queue = c->xcn->base.info.disable_fence_sync
+		                                 ? VK_QUEUE_FAMILY_IGNORED
+		                                 : VK_QUEUE_FAMILY_EXTERNAL;
+
 		VkImageMemoryBarrier release = {
 		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
 		    .srcAccessMask = barrier_access_mask,
 		    .dstAccessMask = 0,
 		    .oldLayout = barrier_optimal_layout,
 		    .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-		    .srcQueueFamilyIndex = vk->main_queue->family_index,
-		    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL,
+		    .srcQueueFamilyIndex = release_src_queue,
+		    .dstQueueFamilyIndex = release_dst_queue,
 		    .image = sc->base.images[i],
 		    .subresourceRange = subresource_range,
 		};
