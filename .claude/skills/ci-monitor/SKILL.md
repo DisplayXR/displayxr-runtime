@@ -41,11 +41,22 @@ Task(
 )
 ```
 
+### Gathering Files to Commit
+
+Before launching the subagent, you MUST determine which files to include in the commit:
+
+1. **Review your conversation history** for every file you modified via Edit or Write tools during this session. Collect these paths into a list.
+2. **Cross-reference with `git status --short`** to confirm each file is actually dirty (modified/untracked). Drop any that are clean.
+3. **Build the `[FILES_TO_COMMIT]` value:**
+   - If you found session-modified files: use a newline-separated list of paths (e.g., `src/xrt/compositor/main/comp_renderer.c\nsrc/xrt/drivers/leiasr/leiasr.cpp`)
+   - If you have no tracked session files (e.g., user invoked `/ci-monitor` directly without prior edits): use the literal string `AUTO`
+4. **Substitute `[FILES_TO_COMMIT]`** in the subagent prompt template below.
+
 ---
 
 ## Subagent Prompt Template
 
-Pass this complete prompt to the subagent (replace `[USER_MESSAGE]` with the user's commit message or "auto-generate"):
+Pass this complete prompt to the subagent (replace `[USER_MESSAGE]` with the user's commit message or "auto-generate", and `[FILES_TO_COMMIT]` with the file list or "AUTO"):
 
 ```
 Execute the LeiaSR-OpenXR ci-monitor workflow. You have access to Edit and Write tools to fix build errors.
@@ -60,6 +71,13 @@ Execute the LeiaSR-OpenXR ci-monitor workflow. You have access to Edit and Write
 ## Commit Message
 [USER_MESSAGE]
 
+## Files to Commit
+[FILES_TO_COMMIT]
+
+If the above is a list of file paths, stage ONLY those files in Phase 1.
+If the above is "AUTO" or empty/missing, snapshot the dirty files at invocation time (see Phase 1 instructions).
+NEVER use `git add -A` or `git add .` under any circumstances.
+
 ---
 
 ## PHASE 1: COMMIT AND PUSH
@@ -69,8 +87,25 @@ Run: `git status`
 - If no changes to commit, report "Nothing to commit" and STOP.
 - Otherwise, continue to Step 1.2.
 
-### Step 1.2: Stage Changes
-Run: `git add -A`
+### Step 1.2: Stage Changes (Selective)
+
+**If the "Files to Commit" section above contains a file list (not "AUTO"):**
+- Stage ONLY those specific files:
+  ```bash
+  git add path/to/file1 path/to/file2 ...
+  ```
+
+**If "Files to Commit" is "AUTO" or empty/missing (fallback):**
+- Snapshot the currently dirty files RIGHT NOW to prevent drift during build monitoring:
+  ```bash
+  git status --short | awk '{print $NF}'
+  ```
+- Store this list, then stage ONLY those files:
+  ```bash
+  git add <each file from snapshot>
+  ```
+
+**NEVER use `git add -A` or `git add .`** — this prevents unrelated dirty files from being swept into the commit.
 
 ### Step 1.3: Generate Commit Message (if needed)
 If commit message is "auto-generate":
@@ -137,6 +172,7 @@ Run: `gh run view RUN_ID --json status,conclusion`
 ## PHASE 3: DIAGNOSE AND FIX (Loop up to 3 times)
 
 Track: fix_attempt = 1
+Track: fix_files_modified = [] (append every file path you modify with Edit/Write during this phase)
 
 ### Step 3.1: Get Error Logs
 Run: `gh run view RUN_ID --log-failed | tail -200`
@@ -281,11 +317,16 @@ warning: implicit declaration of function 'XYZ'
 
 ---
 
-### Step 3.5: Commit the Fix
+### Step 3.5: Commit the Fix (Selective Staging)
 
-Run:
+Stage ONLY the files you modified during this fix attempt (from your `fix_files_modified` list):
 ```bash
-git add -A
+git add path/to/fixed_file1 path/to/fixed_file2 ...
+```
+**NEVER use `git add -A` or `git add .`** — only stage files you directly edited with Edit/Write tools.
+
+Then commit:
+```bash
 git commit -m "$(cat <<'EOF'
 Fix: [brief description of what was fixed]
 
