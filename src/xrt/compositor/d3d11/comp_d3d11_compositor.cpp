@@ -692,8 +692,17 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 	}
 
-	// Present
-	xret = comp_d3d11_target_present(c->target, 1); // VSync enabled
+	// Present — use sync_interval=0 during drag to avoid 2-vsync stall.
+	// DWM recomposition during window moves delays the swapchain flip,
+	// causing Present(1) to miss its vsync deadline and block for 31ms
+	// instead of 17ms. The sleep-based frame pacing in wait_frame still
+	// provides ~60Hz timing, so Present(0) won't cause burst-rendering.
+	uint32_t sync_interval = 1;
+	if (c->owns_window && c->own_window != nullptr &&
+	    comp_d3d11_window_is_in_size_move(c->own_window)) {
+		sync_interval = 0;
+	}
+	xret = comp_d3d11_target_present(c->target, sync_interval);
 	if (xret != XRT_SUCCESS) {
 		U_LOG_E("Failed to present");
 		return xret;
