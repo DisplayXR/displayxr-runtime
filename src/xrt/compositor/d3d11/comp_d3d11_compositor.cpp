@@ -109,8 +109,7 @@ struct comp_d3d11_compositor
 	//! Time of the last predicted display time.
 	uint64_t last_display_time_ns;
 
-	//! Timestamp of the last wait_frame return (for frame pacing).
-	uint64_t last_wait_frame_return_ns;
+
 
 	//! Pending render resolution change (set on resize, cleared when queried).
 	bool render_resize_pending;
@@ -262,21 +261,11 @@ d3d11_compositor_wait_frame(struct xrt_compositor *xc,
 	// Use queried display refresh rate
 	int64_t period_ns = static_cast<int64_t>(U_TIME_1S_IN_NS / c->display_refresh_rate);
 
-	// Frame pacing: sleep until the next frame period.
-	// Without this, xrWaitFrame returns instantly in windowed mode and the
-	// app bursts through frames faster than the display can present them,
-	// causing visible micro-stutter (burst/stall pattern from DXGI queuing).
-	if (c->last_wait_frame_return_ns > 0) {
-		int64_t now = static_cast<int64_t>(os_monotonic_get_ns());
-		int64_t elapsed = now - static_cast<int64_t>(c->last_wait_frame_return_ns);
-		int64_t remaining = period_ns - elapsed;
-		// Only sleep if there's meaningful time remaining (> 2ms).
-		// Shorter sleeps are unreliable on Windows and add overhead.
-		if (remaining > 2000000) {
-			os_nanosleep(remaining);
-		}
-	}
-	c->last_wait_frame_return_ns = os_monotonic_get_ns();
+	// Frame pacing is handled by Present(1) + SetMaximumFrameLatency(1).
+	// Present(1) blocks until vsync, and the frame latency limit of 1
+	// prevents burst/stall queuing. No additional sleep is needed here —
+	// adding one would eat into the vsync margin and cause the pipeline
+	// to miss vsync deadlines during window drag (dropping from 60→30Hz).
 
 	std::lock_guard<std::mutex> lock(c->mutex);
 
@@ -692,17 +681,13 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 	}
 
-	// Present — use sync_interval=0 during drag to avoid 2-vsync stall.
-	// DWM recomposition during window moves delays the swapchain flip,
-	// causing Present(1) to miss its vsync deadline and block for 31ms
-	// instead of 17ms. The sleep-based frame pacing in wait_frame still
-	// provides ~60Hz timing, so Present(0) won't cause burst-rendering.
-	uint32_t sync_interval = 1;
-	if (c->owns_window && c->own_window != nullptr &&
-	    comp_d3d11_window_is_in_size_move(c->own_window)) {
-		sync_interval = 0;
-	}
-	xret = comp_d3d11_target_present(c->target, sync_interval);
+	// Present with VSync. sync_interval=1 ensures DWM composites the frame
+	// at the same vsync boundary the weaver targeted, keeping the interlacing
+	// pattern aligned with the lenticular display's phase-snapped position.
+	// Present(0) was tried during drag but broke 3D: without vsync sync,
+	// DWM composites the frame at a window position that differs from where
+	// the weaver computed the interlacing, destroying the 3D effect.
+	xret = comp_d3d11_target_present(c->target, 1);
 	if (xret != XRT_SUCCESS) {
 		U_LOG_E("Failed to present");
 		return xret;
