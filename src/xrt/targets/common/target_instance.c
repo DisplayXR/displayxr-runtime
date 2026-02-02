@@ -160,6 +160,9 @@ t_instance_create_system(struct xrt_instance *xinst,
 	if (xret == XRT_SUCCESS && xsysc == NULL && debug_get_bool_option_use_d3d11_service()) {
 		U_LOG_I("Using D3D11 service compositor");
 		xret = comp_d3d11_service_create_system(head, &xsysc);
+		if (xret == XRT_SUCCESS && xsysc != NULL) {
+			U_LOG_I("Service compositor ready: D3D11 service compositor (pure D3D11, no Vulkan)");
+		}
 		if (xret != XRT_SUCCESS) {
 #ifdef XRT_D3D11_SERVICE_ONLY
 			// D3D11-only mode (service): no Vulkan fallback available

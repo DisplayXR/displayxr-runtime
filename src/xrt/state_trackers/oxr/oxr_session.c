@@ -1635,7 +1635,7 @@ oxr_session_create_impl(struct oxr_logger *log,
 		U_LOG_IFL_I(U_LOGGING_INFO, "D3D11 native compositor NOT compiled in (XRT_HAVE_D3D11_NATIVE_COMPOSITOR not defined)");
 #endif
 		// Fall back to Vulkan-backed D3D11 compositor
-		U_LOG_IFL_I(U_LOGGING_INFO, "Using Vulkan-backed D3D11 compositor");
+		U_LOG_IFL_I(U_LOGGING_INFO, "Using IPC D3D11 client compositor (server-side rendering)");
 		OXR_CREATE_XRT_SESSION_AND_NATIVE_COMPOSITOR(log, xsi, *out_session);
 		return oxr_session_populate_d3d11(log, sys, d3d11, *out_session);
 	}

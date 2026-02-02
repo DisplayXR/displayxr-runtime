@@ -43,6 +43,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
+#else
+#include <shellapi.h> // For ShellExecuteExA fallback in service auto-launch
 #endif
 #include <limits.h>
 
@@ -135,6 +137,8 @@ ipc_connect_pipe(struct ipc_connection *ipc_c, const char *pipe_name)
 	STARTUPINFOA si = {.cb = sizeof(si)};
 	PROCESS_INFORMATION pi;
 	if (!CreateProcessA(NULL, service_path, NULL, NULL, false, 0, NULL, NULL, &si, &pi)) {
+		char first_path[MAX_PATH];
+		strcpy(first_path, service_path);
 		*p = 0;
 		p = strrchr(service_path, '\\');
 		if (!p) {
@@ -146,13 +150,41 @@ ipc_connect_pipe(struct ipc_connection *ipc_c, const char *pipe_name)
 		strcpy(p + 1, "service\\" XRT_SERVICE_EXECUTABLE);
 		if (!CreateProcessA(NULL, service_path, NULL, NULL, false, 0, NULL, NULL, &si, &pi)) {
 			err = GetLastError();
-			IPC_INFO(ipc_c, XRT_SERVICE_EXECUTABLE " not found at %s: %d %s", service_path, err,
-			         ipc_winerror(err));
-			return INVALID_HANDLE_VALUE;
+			IPC_INFO(ipc_c,
+			         "CreateProcessA failed for both %s and %s: %d %s. "
+			         "Trying ShellExecuteEx fallback (for AppContainer/sandboxed processes)...",
+			         first_path, service_path, err, ipc_winerror(err));
+
+			// Fallback: ShellExecuteEx works from more sandbox levels than CreateProcessA.
+			// AppContainer processes (e.g. Chrome WebXR) may not have permission to
+			// create child processes directly, but ShellExecuteEx can delegate to the shell.
+			SHELLEXECUTEINFOA sei = {0};
+			sei.cbSize = sizeof(sei);
+			sei.lpFile = first_path;
+			sei.nShow = SW_HIDE;
+			sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI;
+			if (!ShellExecuteExA(&sei)) {
+				// Also try the service\ subdirectory path
+				sei.lpFile = service_path;
+				if (!ShellExecuteExA(&sei)) {
+					err = GetLastError();
+					IPC_ERROR(ipc_c,
+					          "All service launch methods failed (CreateProcessA and ShellExecuteEx). "
+					          "Please start monado-service.exe manually or install it as a startup task. "
+					          "Last error: %d %s",
+					          err, ipc_winerror(err));
+					return INVALID_HANDLE_VALUE;
+				}
+			}
+			// ShellExecuteEx succeeded — fill in pi.hProcess for the wait loop below
+			pi.hProcess = sei.hProcess;
+			pi.hThread = NULL;
 		}
 	}
 	IPC_INFO(ipc_c, "Launched %s (pid %d)... Waiting for %s...", service_path, pi.dwProcessId, pipe_name);
-	CloseHandle(pi.hThread);
+	if (pi.hThread) {
+		CloseHandle(pi.hThread);
+	}
 	for (int i = 0;; i++) {
 		pipe_inst = CreateFileA(pipe_name, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
 		if (pipe_inst != INVALID_HANDLE_VALUE) {

@@ -1097,19 +1097,23 @@ compositor_import_swapchain(struct xrt_compositor *xc,
 		U_LOG_D("Image [%u]: handle=%p, is_dxgi=%d", i, handle, is_dxgi);
 
 		// Open shared resource
+		// is_dxgi = true means a legacy DXGI global handle (from IDXGIResource::GetSharedHandle,
+		// created without NTHANDLE flag). These are system-wide and don't need DuplicateHandle.
+		// is_dxgi = false means an NT handle (from IDXGIResource1::CreateSharedHandle,
+		// created with NTHANDLE flag). These require DuplicateHandle across processes.
 		HRESULT hr;
 		if (is_dxgi) {
-			// DXGI shared handle (can work cross-process with AppContainer)
-			hr = sys->device->OpenSharedResource1(handle, IID_PPV_ARGS(sc->images[i].texture.put()));
+			// Legacy DXGI global handle → use OpenSharedResource (ID3D11Device)
+			hr = sys->device->OpenSharedResource(handle, IID_PPV_ARGS(sc->images[i].texture.put()));
 			if (FAILED(hr)) {
-				U_LOG_E("OpenSharedResource1 failed for image [%u]: 0x%08lx (handle=%p)",
+				U_LOG_E("OpenSharedResource (DXGI global handle) failed for image [%u]: 0x%08lx (handle=%p)",
 				        i, hr, handle);
 			}
 		} else {
-			// Legacy NT handle
-			hr = sys->device->OpenSharedResource(handle, IID_PPV_ARGS(sc->images[i].texture.put()));
+			// NT handle → use OpenSharedResource1 (ID3D11Device1)
+			hr = sys->device->OpenSharedResource1(handle, IID_PPV_ARGS(sc->images[i].texture.put()));
 			if (FAILED(hr)) {
-				U_LOG_E("OpenSharedResource failed for image [%u]: 0x%08lx (handle=%p)",
+				U_LOG_E("OpenSharedResource1 (NT handle) failed for image [%u]: 0x%08lx (handle=%p)",
 				        i, hr, handle);
 			}
 		}

@@ -82,7 +82,9 @@ oxr_d3d11_native_compositor_supported(struct oxr_system *sys, void *window_handl
 	// D3D11 native compositor cannot work in service/IPC mode
 	// because it needs direct access to the app's D3D11 device
 	if (is_service_mode) {
-		U_LOG_IFL_I(U_LOGGING_INFO,"D3D11 native compositor DISABLED - running in service mode (WebXR/IPC), using Vulkan compositor");
+		U_LOG_IFL_I(U_LOGGING_INFO,
+		    "D3D11 native compositor DISABLED - running in service mode (IPC). "
+		    "Server-side compositor handles rendering (D3D11 service or Vulkan depending on server config)");
 		return false;
 	}
 
