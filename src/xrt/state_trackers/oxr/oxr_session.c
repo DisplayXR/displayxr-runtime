@@ -639,7 +639,11 @@ oxr_session_poll(struct oxr_logger *log, struct oxr_session *sess)
 	struct xrt_session *xs = sess->xs;
 	xrt_result_t xret;
 
+	// Debug: Log session poll entry to trace event polling issues
+	U_LOG_W("OXR SESSION POLL: sess=%p, xs=%p, state=%d", (void*)sess, (void*)xs, (int)sess->state);
+
 	if (xs == NULL) {
+		U_LOG_E("OXR SESSION POLL: xrt_session is NULL! Cannot poll events.");
 		return oxr_error(log, XR_ERROR_RUNTIME_FAILURE, "xrt_session is null");
 	}
 
