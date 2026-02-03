@@ -234,10 +234,9 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			// The modal loop is paused while we wait, so the window position
 			// is stable between weave() and Present().
 			SetEvent(w->paint_requested_event);
-			WaitForSingleObject(w->paint_done_event, 500);
-			ValidateRect(hWnd, NULL);          // Mark this paint cycle complete
+			WaitForSingleObject(w->paint_done_event, 100);
 			InvalidateRect(hWnd, NULL, FALSE); // Request next WM_PAINT
-			return 0;
+			return 0;                          // Don't ValidateRect — keep region invalid
 		}
 		ValidateRect(hWnd, NULL);
 		break;
