@@ -137,7 +137,7 @@ t_instance_create_system(struct xrt_instance *xinst,
 		// Query SR display for recommended view dimensions and refresh rate
 		// This ensures apps create properly-sized swapchains and correct frame pacing
 		if (leiasr_query_recommended_view_dimensions(5.0, &sr_rec_width, &sr_rec_height,
-		                                             &sr_refresh_rate_hz)) {
+		                                             &sr_refresh_rate_hz, NULL, NULL)) {
 			U_LOG_I("Using SR recommended view dimensions: %ux%u per eye, %.0f Hz", sr_rec_width,
 			        sr_rec_height, sr_refresh_rate_hz);
 		} else {

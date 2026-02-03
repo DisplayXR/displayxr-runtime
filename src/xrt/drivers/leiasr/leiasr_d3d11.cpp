@@ -448,7 +448,9 @@ bool
 leiasr_query_recommended_view_dimensions(double max_time,
                                           uint32_t *out_width,
                                           uint32_t *out_height,
-                                          float *out_refresh_rate_hz)
+                                          float *out_refresh_rate_hz,
+                                          uint32_t *out_native_width,
+                                          uint32_t *out_native_height)
 {
 	if (out_width == nullptr || out_height == nullptr) {
 		return false;
@@ -490,15 +492,25 @@ leiasr_query_recommended_view_dimensions(double max_time,
 				SR::IDisplay *display = displayManager->getPrimaryActiveSRDisplay();
 				if (display != nullptr && display->isValid()) {
 					SR_recti display_location = display->getLocation();
-					int64_t width = display_location.right - display_location.left;
-					int64_t height = display_location.bottom - display_location.top;
-					if ((width != 0) && (height != 0)) {
+					int64_t native_width = display_location.right - display_location.left;
+					int64_t native_height = display_location.bottom - display_location.top;
+					if ((native_width != 0) && (native_height != 0)) {
 						*out_width = display->getRecommendedViewsTextureWidth();
 						*out_height = display->getRecommendedViewsTextureHeight();
 						success = (*out_width > 0 && *out_height > 0);
 						if (success) {
 							U_LOG_I("SR query: recommended view dimensions %ux%u per eye",
 							        *out_width, *out_height);
+
+							// Return native display dimensions if requested
+							if (out_native_width != nullptr) {
+								*out_native_width = static_cast<uint32_t>(native_width);
+							}
+							if (out_native_height != nullptr) {
+								*out_native_height = static_cast<uint32_t>(native_height);
+							}
+							U_LOG_I("SR query: native display dimensions %ux%u",
+							        (uint32_t)native_width, (uint32_t)native_height);
 
 							// Query monitor refresh rate via Win32
 							if (out_refresh_rate_hz != nullptr) {

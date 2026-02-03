@@ -211,6 +211,8 @@ leiasr_d3d11_get_recommended_view_dimensions(struct leiasr_d3d11 *leiasr,
  * @param[out] out_width Recommended width per view (single eye).
  * @param[out] out_height Recommended height per view.
  * @param[out] out_refresh_rate_hz Display refresh rate in Hz (NULL to skip).
+ * @param[out] out_native_width Native display width in pixels (NULL to skip).
+ * @param[out] out_native_height Native display height in pixels (NULL to skip).
  * @return true if valid dimensions were obtained, false otherwise.
  *
  * @ingroup drv_leiasr
@@ -219,7 +221,9 @@ bool
 leiasr_query_recommended_view_dimensions(double max_time,
                                           uint32_t *out_width,
                                           uint32_t *out_height,
-                                          float *out_refresh_rate_hz);
+                                          float *out_refresh_rate_hz,
+                                          uint32_t *out_native_width,
+                                          uint32_t *out_native_height);
 
 #ifdef __cplusplus
 }
