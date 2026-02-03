@@ -10,6 +10,7 @@
 #include "os/os_threading.h"
 
 #include "util/u_misc.h"
+#include "util/u_logging.h"
 
 #include "oxr_objects.h"
 #include "oxr_logger.h"
@@ -164,6 +165,9 @@ oxr_event_push_XrEventDataSessionStateChanged(struct oxr_logger *log,
 	changed->time = time;
 
 	event->result = XR_SUCCESS;
+
+	U_LOG_W("OXR EVENT: Pushing session state change - state=%d (IDLE=1, READY=2, SYNC=3, VIS=4, FOCUS=5)",
+	        (int)state);
 
 	lock(inst);
 	push(inst, event);
@@ -449,6 +453,13 @@ oxr_poll_event(struct oxr_logger *log, struct oxr_instance *inst, XrEventDataBuf
 
 	ret = event->result;
 	memcpy(eventData, oxr_event_extra(event), event->length);
+
+	// Log session state events being polled
+	if (eventData->type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
+		XrEventDataSessionStateChanged *changed = (XrEventDataSessionStateChanged *)eventData;
+		U_LOG_W("OXR EVENT: Polled session state change - state=%d", (int)changed->state);
+	}
+
 	free(event);
 
 	return ret;
