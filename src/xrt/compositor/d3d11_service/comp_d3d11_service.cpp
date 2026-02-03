@@ -74,16 +74,20 @@ struct d3d11_service_image
 
 /*!
  * D3D11 service swapchain.
+ *
+ * For service-created swapchains (WebXR), we use xrt_swapchain_native as base
+ * so the IPC layer can access the shared handles to send to the client.
  */
 struct d3d11_service_swapchain
 {
-	//! Base swapchain - must be first!
-	struct xrt_swapchain base;
+	//! Base native swapchain - must be first!
+	//! Contains xrt_swapchain + images[] with shared handles for IPC
+	struct xrt_swapchain_native base;
 
 	//! Parent compositor
 	struct d3d11_service_compositor *comp;
 
-	//! Swapchain images
+	//! Swapchain images (compositor's view of the textures)
 	struct d3d11_service_image images[XRT_MAX_SWAPCHAIN_IMAGES];
 
 	//! Image count
@@ -91,6 +95,9 @@ struct d3d11_service_swapchain
 
 	//! Creation info
 	struct xrt_swapchain_create_info info;
+
+	//! Whether this swapchain was created by the service (vs imported from client)
+	bool service_created;
 };
 
 /*!
@@ -1041,14 +1048,180 @@ compositor_get_swapchain_create_properties(struct xrt_compositor *xc,
 	return XRT_SUCCESS;
 }
 
+/*!
+ * Convert XRT format to DXGI format.
+ */
+static DXGI_FORMAT
+xrt_format_to_dxgi(int64_t format)
+{
+	// Check if this is already a DXGI format (common D3D11 formats are < 130)
+	switch (format) {
+	// Pass through DXGI formats directly
+	case DXGI_FORMAT_R8G8B8A8_UNORM:        // 28
+	case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:   // 29
+	case DXGI_FORMAT_B8G8R8A8_UNORM:        // 87
+	case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:   // 91
+	case DXGI_FORMAT_R16G16B16A16_FLOAT:    // 10
+	case DXGI_FORMAT_R16G16B16A16_UNORM:    // 11
+	case DXGI_FORMAT_D24_UNORM_S8_UINT:     // 45
+	case DXGI_FORMAT_D32_FLOAT:             // 40
+	case DXGI_FORMAT_D16_UNORM:             // 55
+	case DXGI_FORMAT_R10G10B10A2_UNORM:     // 24
+		return static_cast<DXGI_FORMAT>(format);
+
+	// Convert VK_FORMAT values to DXGI (for Vulkan compositor interop)
+	case 37: // VK_FORMAT_R8G8B8A8_UNORM
+		return DXGI_FORMAT_R8G8B8A8_UNORM;
+	case 43: // VK_FORMAT_R8G8B8A8_SRGB
+		return DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+	case 44: // VK_FORMAT_B8G8R8A8_UNORM
+		return DXGI_FORMAT_B8G8R8A8_UNORM;
+	case 50: // VK_FORMAT_B8G8R8A8_SRGB
+		return DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+	case 64: // VK_FORMAT_A2B10G10R10_UNORM_PACK32
+		return DXGI_FORMAT_R10G10B10A2_UNORM;
+	case 97: // VK_FORMAT_R16G16B16A16_SFLOAT
+		return DXGI_FORMAT_R16G16B16A16_FLOAT;
+	case 129: // VK_FORMAT_D24_UNORM_S8_UINT
+		return DXGI_FORMAT_D24_UNORM_S8_UINT;
+	case 130: // VK_FORMAT_D32_SFLOAT
+		return DXGI_FORMAT_D32_FLOAT;
+
+	default:
+		U_LOG_W("Unknown format %ld, using RGBA8", format);
+		return DXGI_FORMAT_R8G8B8A8_UNORM;
+	}
+}
+
 static xrt_result_t
 compositor_create_swapchain(struct xrt_compositor *xc,
                              const struct xrt_swapchain_create_info *info,
                              struct xrt_swapchain **out_xsc)
 {
-	// Service compositor doesn't create swapchains directly
-	// Clients create and share them via import_swapchain
-	return XRT_ERROR_SWAPCHAIN_FLAG_VALID_BUT_UNSUPPORTED;
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	struct d3d11_service_system *sys = c->sys;
+
+	// Use triple buffering
+	uint32_t image_count = 3;
+	if (image_count > XRT_MAX_SWAPCHAIN_IMAGES) {
+		image_count = XRT_MAX_SWAPCHAIN_IMAGES;
+	}
+
+	U_LOG_W("Creating swapchain: %u images, %ux%u, format=%u, usage=0x%x",
+	        image_count, info->width, info->height, info->format, info->bits);
+
+	// Allocate swapchain
+	struct d3d11_service_swapchain *sc = new d3d11_service_swapchain();
+	std::memset(sc, 0, sizeof(*sc));
+
+	sc->base.base.destroy = swapchain_destroy;
+	sc->base.base.acquire_image = swapchain_acquire_image;
+	sc->base.base.inc_image_use = swapchain_inc_image_use;
+	sc->base.base.dec_image_use = swapchain_dec_image_use;
+	sc->base.base.wait_image = swapchain_wait_image;
+	sc->base.base.barrier_image = swapchain_barrier_image;
+	sc->base.base.release_image = swapchain_release_image;
+	sc->base.base.reference.count = 1;
+	sc->base.base.image_count = image_count;
+
+	sc->comp = c;
+	sc->image_count = image_count;
+	sc->info = *info;
+	sc->service_created = true; // Created by service for client
+
+	// Convert format
+	DXGI_FORMAT dxgi_format = xrt_format_to_dxgi(info->format);
+
+	// Determine bind flags
+	UINT bind_flags = D3D11_BIND_SHADER_RESOURCE; // Always need SRV for compositor
+	if (info->bits & XRT_SWAPCHAIN_USAGE_COLOR) {
+		bind_flags |= D3D11_BIND_RENDER_TARGET;
+	}
+	if (info->bits & XRT_SWAPCHAIN_USAGE_DEPTH_STENCIL) {
+		bind_flags |= D3D11_BIND_DEPTH_STENCIL;
+	}
+	if (info->bits & XRT_SWAPCHAIN_USAGE_UNORDERED_ACCESS) {
+		bind_flags |= D3D11_BIND_UNORDERED_ACCESS;
+	}
+
+	// Create texture descriptor with SHARED_KEYEDMUTEX for cross-process sharing
+	D3D11_TEXTURE2D_DESC tex_desc = {};
+	tex_desc.Width = info->width;
+	tex_desc.Height = info->height;
+	tex_desc.MipLevels = info->mip_count > 0 ? info->mip_count : 1;
+	tex_desc.ArraySize = info->array_size > 0 ? info->array_size : 1;
+	tex_desc.Format = dxgi_format;
+	tex_desc.SampleDesc.Count = info->sample_count > 0 ? info->sample_count : 1;
+	tex_desc.SampleDesc.Quality = 0;
+	tex_desc.Usage = D3D11_USAGE_DEFAULT;
+	tex_desc.BindFlags = bind_flags;
+	tex_desc.CPUAccessFlags = 0;
+	// SHARED_KEYEDMUTEX enables cross-process sharing with synchronization
+	tex_desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+
+	// Create textures and get shared handles
+	for (uint32_t i = 0; i < image_count; i++) {
+		HRESULT hr = sys->device->CreateTexture2D(&tex_desc, nullptr, sc->images[i].texture.put());
+		if (FAILED(hr)) {
+			U_LOG_E("Failed to create shared texture [%u]: 0x%08lx", i, hr);
+			swapchain_destroy(&sc->base.base);
+			return XRT_ERROR_SWAPCHAIN_FLAG_VALID_BUT_UNSUPPORTED;
+		}
+
+		// Get KeyedMutex for synchronization
+		hr = sc->images[i].texture->QueryInterface(IID_PPV_ARGS(sc->images[i].keyed_mutex.put()));
+		if (FAILED(hr)) {
+			U_LOG_E("Texture has no KeyedMutex [%u]: 0x%08lx", i, hr);
+			swapchain_destroy(&sc->base.base);
+			return XRT_ERROR_SWAPCHAIN_FLAG_VALID_BUT_UNSUPPORTED;
+		}
+
+		// Get DXGI shared handle for IPC transfer to client
+		wil::com_ptr<IDXGIResource> dxgi_resource;
+		hr = sc->images[i].texture->QueryInterface(IID_PPV_ARGS(dxgi_resource.put()));
+		if (FAILED(hr)) {
+			U_LOG_E("Failed to get IDXGIResource [%u]: 0x%08lx", i, hr);
+			swapchain_destroy(&sc->base.base);
+			return XRT_ERROR_SWAPCHAIN_FLAG_VALID_BUT_UNSUPPORTED;
+		}
+
+		HANDLE shared_handle = nullptr;
+		hr = dxgi_resource->GetSharedHandle(&shared_handle);
+		if (FAILED(hr) || shared_handle == nullptr) {
+			U_LOG_E("Failed to get shared handle [%u]: 0x%08lx", i, hr);
+			swapchain_destroy(&sc->base.base);
+			return XRT_ERROR_SWAPCHAIN_FLAG_VALID_BUT_UNSUPPORTED;
+		}
+
+		// Store shared handle for IPC layer
+		// Mark as DXGI handle by setting bit 0 (IPC layer will clear it on receive)
+		sc->base.images[i].handle = (xrt_graphics_buffer_handle_t)((size_t)shared_handle | 1);
+		sc->base.images[i].size = 0; // Unknown for D3D11
+		sc->base.images[i].use_dedicated_allocation = false;
+		sc->base.images[i].is_dxgi_handle = true;
+
+		U_LOG_W("Created shared texture [%u]: handle=%p (DXGI)", i, shared_handle);
+
+		// Create SRV for compositor
+		D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+		srv_desc.Format = dxgi_format;
+		srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+		srv_desc.Texture2D.MipLevels = tex_desc.MipLevels;
+
+		hr = sys->device->CreateShaderResourceView(
+		    sc->images[i].texture.get(), &srv_desc, sc->images[i].srv.put());
+		if (FAILED(hr)) {
+			U_LOG_E("Failed to create SRV [%u]: 0x%08lx", i, hr);
+			swapchain_destroy(&sc->base.base);
+			return XRT_ERROR_SWAPCHAIN_FLAG_VALID_BUT_UNSUPPORTED;
+		}
+	}
+
+	U_LOG_W("Created swapchain with %u shared images (%ux%u, format=%d)",
+	        image_count, info->width, info->height, (int)dxgi_format);
+
+	*out_xsc = &sc->base.base;
+	return XRT_SUCCESS;
 }
 
 static xrt_result_t
@@ -1070,18 +1243,19 @@ compositor_import_swapchain(struct xrt_compositor *xc,
 	struct d3d11_service_swapchain *sc = new d3d11_service_swapchain();
 	std::memset(sc, 0, sizeof(*sc));
 
-	sc->base.destroy = swapchain_destroy;
-	sc->base.acquire_image = swapchain_acquire_image;
-	sc->base.inc_image_use = swapchain_inc_image_use;
-	sc->base.dec_image_use = swapchain_dec_image_use;
-	sc->base.wait_image = swapchain_wait_image;
-	sc->base.barrier_image = swapchain_barrier_image;
-	sc->base.release_image = swapchain_release_image;
-	sc->base.reference.count = 1;
+	sc->base.base.destroy = swapchain_destroy;
+	sc->base.base.acquire_image = swapchain_acquire_image;
+	sc->base.base.inc_image_use = swapchain_inc_image_use;
+	sc->base.base.dec_image_use = swapchain_dec_image_use;
+	sc->base.base.wait_image = swapchain_wait_image;
+	sc->base.base.barrier_image = swapchain_barrier_image;
+	sc->base.base.release_image = swapchain_release_image;
+	sc->base.base.reference.count = 1;
 
 	sc->comp = c;
 	sc->image_count = image_count;
 	sc->info = *info;
+	sc->service_created = false; // Imported from client
 
 	U_LOG_W("Importing swapchain: %u images, %ux%u, format=%u, usage=0x%x",
 	        image_count, info->width, info->height, info->format, info->bits);
@@ -1092,7 +1266,7 @@ compositor_import_swapchain(struct xrt_compositor *xc,
 
 		if (handle == nullptr || handle == INVALID_HANDLE_VALUE) {
 			U_LOG_E("Invalid handle for image [%u]: %p", i, handle);
-			swapchain_destroy(&sc->base);
+			swapchain_destroy(&sc->base.base);
 			return XRT_ERROR_SWAPCHAIN_FLAG_VALID_BUT_UNSUPPORTED;
 		}
 
@@ -1130,7 +1304,7 @@ compositor_import_swapchain(struct xrt_compositor *xc,
 		if (FAILED(hr)) {
 			// Log additional diagnostic information
 			U_LOG_E("  Swapchain info: %ux%u, format=%u", info->width, info->height, info->format);
-			swapchain_destroy(&sc->base);
+			swapchain_destroy(&sc->base.base);
 			return XRT_ERROR_SWAPCHAIN_FLAG_VALID_BUT_UNSUPPORTED;
 		}
 
@@ -1156,14 +1330,15 @@ compositor_import_swapchain(struct xrt_compositor *xc,
 
 		if (FAILED(hr)) {
 			U_LOG_E("Failed to create SRV [%u]: 0x%08lx", i, hr);
-			swapchain_destroy(&sc->base);
+			swapchain_destroy(&sc->base.base);
 			return XRT_ERROR_SWAPCHAIN_FLAG_VALID_BUT_UNSUPPORTED;
 		}
 	}
 
 	U_LOG_W("Imported swapchain with %u images (%ux%u)", image_count, info->width, info->height);
 
-	*out_xsc = &sc->base;
+	sc->base.base.image_count = image_count;
+	*out_xsc = &sc->base.base;
 	return XRT_SUCCESS;
 }
 
