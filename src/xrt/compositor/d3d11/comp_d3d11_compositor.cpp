@@ -37,6 +37,8 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <dwmapi.h>
+#pragma comment(lib, "dwmapi")
 #include <d3d11_4.h>
 #include <dxgi1_6.h>
 
@@ -697,8 +699,15 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	// the weaver computed the interlacing, destroying the 3D effect.
 	xret = comp_d3d11_target_present(c->target, 1);
 
-	// Signal WM_PAINT that the frame is done (unblocks modal drag loop)
+	// During drag, flush DWM to composite our frame immediately rather than
+	// waiting for DWM's own cycle. This reduces the gap between Present and
+	// screen update, minimizing visual jitter from stale-frame stretching.
+	// DwmFlush before signal_paint_done ensures DWM has composited our frame
+	// before the modal drag loop continues moving the window.
 	if (c->owns_window && c->own_window != nullptr) {
+		if (comp_d3d11_window_is_in_size_move(c->own_window)) {
+			DwmFlush();
+		}
 		comp_d3d11_window_signal_paint_done(c->own_window);
 	}
 
