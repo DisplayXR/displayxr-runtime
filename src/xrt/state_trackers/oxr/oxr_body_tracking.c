@@ -21,6 +21,7 @@
 #include "oxr_handle.h"
 #include "oxr_conversions.h"
 #include "oxr_chain.h"
+#include "oxr_roles.h"
 
 static enum xrt_body_joint_set_type_fb
 oxr_to_xrt_body_joint_set_type_fb(XrBodyJointSetFB joint_set_type)

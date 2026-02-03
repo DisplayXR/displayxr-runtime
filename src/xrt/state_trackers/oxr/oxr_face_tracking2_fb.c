@@ -16,6 +16,7 @@
 #include "oxr_objects.h"
 #include "oxr_logger.h"
 #include "oxr_handle.h"
+#include "oxr_roles.h"
 #include "xrt/xrt_defines.h"
 
 static XrResult

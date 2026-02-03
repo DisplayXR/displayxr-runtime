@@ -17,6 +17,7 @@
 #include "oxr_handle.h"
 #include "oxr_xret.h"
 #include "oxr_two_call.h"
+#include "oxr_roles.h"
 
 static XrResult
 oxr_face_tracker_android_destroy_cb(struct oxr_logger *log, struct oxr_handle_base *hb)

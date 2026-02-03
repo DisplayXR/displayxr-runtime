@@ -15,6 +15,7 @@
 #include "oxr_objects.h"
 #include "oxr_logger.h"
 #include "oxr_handle.h"
+#include "oxr_roles.h"
 
 static enum xrt_facial_tracking_type_htc
 oxr_to_xrt_facial_tracking_type_htc(enum XrFacialTrackingTypeHTC ft_type)
