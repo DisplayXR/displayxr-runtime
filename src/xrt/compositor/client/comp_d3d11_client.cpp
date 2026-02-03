@@ -843,15 +843,25 @@ client_d3d11_compositor_init_try_internal_blocking(struct client_d3d11_composito
 struct xrt_compositor_d3d11 *
 client_d3d11_compositor_create(struct xrt_compositor_native *xcn, ID3D11Device *device)
 try {
+	U_LOG_W("client_d3d11_compositor_create: xcn=%p, device=%p", (void*)xcn, (void*)device);
+
 	std::unique_ptr<struct client_d3d11_compositor> c = std::make_unique<struct client_d3d11_compositor>();
 	c->log_level = debug_get_log_option_log();
 	c->xcn = xcn;
 
+	// Log incoming format info from IPC compositor
+	U_LOG_W("client_d3d11_compositor_create: IPC compositor format_count=%u", xcn->base.info.format_count);
+	for (uint32_t i = 0; i < xcn->base.info.format_count && i < 8; i++) {
+		U_LOG_W("  format[%u] = 0x%llx (VkFormat)", i, (unsigned long long)xcn->base.info.formats[i]);
+	}
+
 	wil::com_ptr<ID3D11Device> app_dev{device};
 	if (!app_dev.try_query_to(c->app_device.put())) {
-		U_LOG_E("Could not get d3d11 device!");
+		U_LOG_E("client_d3d11_compositor_create: Could not query ID3D11Device5 from app device!");
+		U_LOG_E("  This usually means the D3D11 feature level is too low (need 11_1 or higher)");
 		return nullptr;
 	}
+	U_LOG_W("client_d3d11_compositor_create: Got ID3D11Device5 from app device");
 	c->app_device->GetImmediateContext3(c->app_context.put());
 
 	wil::com_ptr<IDXGIAdapter> adapter;
@@ -908,28 +918,40 @@ try {
 
 
 	// Passthrough our formats from the native compositor to the client.
+	U_LOG_W("client_d3d11_compositor_create: Converting %u formats from IPC compositor", xcn->base.info.format_count);
 	uint32_t count = 0;
 	for (uint32_t i = 0; i < xcn->base.info.format_count; i++) {
 		// Can we turn this format into DXGI?
 		DXGI_FORMAT f = d3d_vk_format_to_dxgi(xcn->base.info.formats[i]);
 		if (f == 0) {
+			U_LOG_D("  format[%u]: VkFormat 0x%llx -> no DXGI equivalent, skipping", i, (unsigned long long)xcn->base.info.formats[i]);
 			continue;
 		}
 		// And back to Vulkan?
 		auto v = d3d_dxgi_format_to_vk(f);
 		if (v == 0) {
+			U_LOG_D("  format[%u]: DXGI %u -> no VkFormat equivalent, skipping", i, (unsigned)f);
 			continue;
 		}
 		// Do we have a typeless version of it?
 		DXGI_FORMAT typeless = d3d_dxgi_format_to_typeless_dxgi(f);
 		if (typeless == f) {
+			U_LOG_D("  format[%u]: DXGI %u -> no typeless version, skipping", i, (unsigned)f);
 			continue;
 		}
 
 		c->base.base.info.formats[count++] = f;
 	}
 	c->base.base.info.format_count = count;
+	U_LOG_W("client_d3d11_compositor_create: Final format_count=%u", count);
 
+	if (count == 0) {
+		U_LOG_E("client_d3d11_compositor_create: No compatible DXGI formats found!");
+		U_LOG_E("  IPC compositor reported %u formats but none are usable for D3D11", xcn->base.info.format_count);
+		// Don't return nullptr here - let the caller handle zero formats
+	}
+
+	U_LOG_W("client_d3d11_compositor_create: SUCCESS - D3D11 client compositor ready");
 	return &(c.release()->base);
 } catch (wil::ResultException const &e) {
 	U_LOG_E("Error creating D3D11 client compositor: %s", e.what());

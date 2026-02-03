@@ -27,6 +27,7 @@
 #include "math/m_vec3.h"
 
 #include "d3d/d3d_d3d11_fence.hpp"
+#include "d3d/d3d_dxgi_formats.h"
 
 #ifdef XRT_HAVE_LEIA_SR_D3D11
 #include "leiasr/leiasr_d3d11.h"
@@ -1926,13 +1927,22 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 	c->base.base.destroy = compositor_destroy;
 
 	// Set up supported formats
+	// IMPORTANT: Store as VkFormat values, not DXGI! The IPC protocol and D3D11 client
+	// compositor expect VkFormat values which they then convert to DXGI.
+	// The d3d_dxgi_format_to_vk() function converts DXGI -> VkFormat.
 	uint32_t format_count = 0;
-	c->base.base.info.formats[format_count++] = DXGI_FORMAT_R8G8B8A8_UNORM;
-	c->base.base.info.formats[format_count++] = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
-	c->base.base.info.formats[format_count++] = DXGI_FORMAT_B8G8R8A8_UNORM;
-	c->base.base.info.formats[format_count++] = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
-	c->base.base.info.formats[format_count++] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+	c->base.base.info.formats[format_count++] = d3d_dxgi_format_to_vk(DXGI_FORMAT_R8G8B8A8_UNORM);
+	c->base.base.info.formats[format_count++] = d3d_dxgi_format_to_vk(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB);
+	c->base.base.info.formats[format_count++] = d3d_dxgi_format_to_vk(DXGI_FORMAT_B8G8R8A8_UNORM);
+	c->base.base.info.formats[format_count++] = d3d_dxgi_format_to_vk(DXGI_FORMAT_B8G8R8A8_UNORM_SRGB);
+	c->base.base.info.formats[format_count++] = d3d_dxgi_format_to_vk(DXGI_FORMAT_R16G16B16A16_FLOAT);
 	c->base.base.info.format_count = format_count;
+
+	// Log the formats being reported
+	U_LOG_W("D3D11 service compositor: reporting %u VkFormat values to IPC client:", format_count);
+	for (uint32_t i = 0; i < format_count; i++) {
+		U_LOG_W("  format[%u] = %lld (VkFormat)", i, (long long)c->base.base.info.formats[i]);
+	}
 
 	U_LOG_W("D3D11 service: created native compositor for client");
 
