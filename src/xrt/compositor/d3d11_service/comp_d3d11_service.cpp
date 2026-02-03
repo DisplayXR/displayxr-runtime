@@ -21,6 +21,8 @@
 
 #include "util/comp_layer_accum.h"
 
+#include "comp_d3d11_window.h"
+
 #include "math/m_api.h"
 #include "math/m_vec3.h"
 
@@ -202,7 +204,10 @@ struct d3d11_service_system
 	//! Depth stencil state (disabled)
 	wil::com_ptr<ID3D11DepthStencilState> depth_disabled;
 
-	//! Self-created window for display output
+	//! Dedicated-thread window (owns HWND and message pump)
+	struct comp_d3d11_window *window;
+
+	//! Cached HWND from window (for swap chain, weaver)
 	HWND hwnd;
 
 #ifdef XRT_HAVE_LEIA_SR_D3D11
@@ -1125,6 +1130,8 @@ compositor_import_swapchain(struct xrt_compositor *xc,
 			return XRT_ERROR_SWAPCHAIN_FLAG_VALID_BUT_UNSUPPORTED;
 		}
 
+		U_LOG_W("Image [%u] imported successfully (%s handle)", i, is_dxgi ? "DXGI global" : "NT");
+
 		// Get KeyedMutex for synchronization
 		hr = sc->images[i].texture->QueryInterface(IID_PPV_ARGS(sc->images[i].keyed_mutex.put()));
 		if (FAILED(hr)) {
@@ -1788,64 +1795,12 @@ system_destroy(struct xrt_system_compositor *xsysc)
 	sys->context.reset();
 	sys->device.reset();
 
-	if (sys->hwnd != nullptr) {
-		DestroyWindow(sys->hwnd);
+	if (sys->window != nullptr) {
+		comp_d3d11_window_destroy(&sys->window);
 	}
+	sys->hwnd = nullptr;
 
 	delete sys;
-}
-
-
-/*
- *
- * Window creation helper
- *
- */
-
-static LRESULT CALLBACK
-service_window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
-{
-	switch (msg) {
-	case WM_CLOSE:
-		// Don't close - service manages this
-		return 0;
-	default:
-		return DefWindowProc(hwnd, msg, wparam, lparam);
-	}
-}
-
-static HWND
-create_service_window(uint32_t width, uint32_t height)
-{
-	const wchar_t *class_name = L"MonadoD3D11ServiceWindow";
-
-	WNDCLASSEXW wc = {};
-	wc.cbSize = sizeof(wc);
-	wc.style = CS_HREDRAW | CS_VREDRAW;
-	wc.lpfnWndProc = service_window_proc;
-	wc.hInstance = GetModuleHandle(nullptr);
-	wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-	wc.lpszClassName = class_name;
-
-	RegisterClassExW(&wc);
-
-	// Use WS_EX_NOACTIVATE so service window doesn't steal focus
-	HWND hwnd = CreateWindowExW(WS_EX_NOACTIVATE,
-	                            class_name,
-	                            L"Monado D3D11 Service",
-	                            WS_OVERLAPPEDWINDOW,
-	                            CW_USEDEFAULT, CW_USEDEFAULT,
-	                            static_cast<int>(width), static_cast<int>(height),
-	                            nullptr, nullptr,
-	                            GetModuleHandle(nullptr),
-	                            nullptr);
-
-	if (hwnd != nullptr) {
-		ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-		UpdateWindow(hwnd);
-	}
-
-	return hwnd;
 }
 
 
@@ -1859,7 +1814,7 @@ extern "C" xrt_result_t
 comp_d3d11_service_create_system(struct xrt_device *xdev,
                                  struct xrt_system_compositor **out_xsysc)
 {
-	U_LOG_I("Creating D3D11 service system compositor");
+	U_LOG_W("Creating D3D11 service system compositor");
 
 	// Allocate system compositor
 	struct d3d11_service_system *sys = new d3d11_service_system();
@@ -1929,13 +1884,14 @@ comp_d3d11_service_create_system(struct xrt_device *xdev,
 		return XRT_ERROR_VULKAN;
 	}
 
-	// Create service window for display output
-	sys->hwnd = create_service_window(sys->display_width, sys->display_height);
-	if (sys->hwnd == nullptr) {
-		U_LOG_E("Failed to create service window");
+	// Create service window on dedicated thread (handles message pump)
+	xrt_result_t wret = comp_d3d11_window_create(sys->display_width, sys->display_height, &sys->window);
+	if (wret != XRT_SUCCESS || sys->window == NULL) {
+		U_LOG_E("Failed to create service window on dedicated thread");
 		delete sys;
 		return XRT_ERROR_VULKAN;
 	}
+	sys->hwnd = (HWND)comp_d3d11_window_get_hwnd(sys->window);
 
 	// Create swap chain
 	DXGI_SWAP_CHAIN_DESC1 sc_desc = {};
@@ -2000,7 +1956,7 @@ comp_d3d11_service_create_system(struct xrt_device *xdev,
 		return XRT_ERROR_VULKAN;
 	}
 
-	U_LOG_I("Created stereo render target (%ux%u)", sys->display_width, sys->display_height);
+	U_LOG_W("Created stereo render target (%ux%u)", sys->display_width, sys->display_height);
 
 	// Create layer shaders and resources for UI layer rendering
 	if (!create_layer_shaders(sys)) {
@@ -2042,7 +1998,7 @@ comp_d3d11_service_create_system(struct xrt_device *xdev,
 	sys->base.info.views[0].max.height_pixels = sys->view_height;
 	sys->base.info.views[1] = sys->base.info.views[0];
 
-	U_LOG_I("D3D11 service system compositor created (%ux%u @ %.0fHz)",
+	U_LOG_W("D3D11 service system compositor created (%ux%u @ %.0fHz)",
 	        sys->display_width, sys->display_height, sys->refresh_rate);
 
 	*out_xsysc = &sys->base;

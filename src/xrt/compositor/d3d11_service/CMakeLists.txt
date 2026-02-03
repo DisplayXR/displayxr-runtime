@@ -17,6 +17,9 @@ add_library(
 	# Include layer accumulator directly (it has no Vulkan dependencies)
 	../util/comp_layer_accum.c
 	../util/comp_layer_accum.h
+	# Include window module for dedicated-thread message pump
+	../d3d11/comp_d3d11_window.cpp
+	../d3d11/comp_d3d11_window.h
 	)
 
 target_link_libraries(
@@ -33,7 +36,7 @@ target_link_libraries(
 		d3dcompiler
 	)
 
-target_include_directories(comp_d3d11_service PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
+target_include_directories(comp_d3d11_service PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_CURRENT_SOURCE_DIR}/../d3d11)
 
 if(XRT_HAVE_LEIA_SR)
 	target_link_libraries(comp_d3d11_service PRIVATE drv_leiasr)
