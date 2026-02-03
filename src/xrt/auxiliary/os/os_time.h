@@ -237,7 +237,9 @@ os_precise_sleeper_nanosleep(struct os_precise_sleeper *ops, int32_t nsec)
 {
 #if defined(XRT_OS_WINDOWS)
 	timeBeginPeriod(1);
-	if (ops->timer) {
+	// Check for valid handle (not NULL and not INVALID_HANDLE_VALUE)
+	// INVALID_HANDLE_VALUE (-1) can occur from memory corruption
+	if (ops->timer && ops->timer != INVALID_HANDLE_VALUE) {
 		LARGE_INTEGER timeperiod;
 		timeperiod.QuadPart = -(nsec / 100);
 		if (SetWaitableTimer(ops->timer, &timeperiod, 0, NULL, NULL, FALSE)) {
