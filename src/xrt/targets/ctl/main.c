@@ -106,19 +106,25 @@ get_mode(struct ipc_connection *ipc_c)
 		  "\tact: %d"
 		  "\tdisp: %d"
 		  "\tfoc: %d"
-		  "\tio: %d"
+		  "\tposes: %d"
+		  "\thands: %d"
+		  "\tinputs: %d"
+		  "\toutputs: %d"
 		  "\tovly: %d"
 		  "\tz: %d"
 		  "\tpid: %d"
 		  "\t%s\n",
-		  clients.ids[i],     //
-		  cs.session_active,  //
-		  cs.session_visible, //
-		  cs.session_focused, //
-		  cs.io_active,       //
-		  cs.session_overlay, //
-		  cs.z_order,         //
-		  cs.pid,             //
+		  clients.ids[i],                    //
+		  cs.session_active,                 //
+		  cs.session_visible,                //
+		  cs.session_focused,                //
+		  !cs.io_blocks.block_poses,         //
+		  !cs.io_blocks.block_hand_tracking, //
+		  !cs.io_blocks.block_inputs,        //
+		  !cs.io_blocks.block_outputs,       //
+		  cs.session_overlay,                //
+		  cs.z_order,                        //
+		  cs.pid,                            //
 		  cs.info.application_name);
 	}
 

@@ -12,6 +12,7 @@
  */
 
 #include "xrt/xrt_device.h"
+#include "xrt/xrt_results.h"
 #include "xrt/xrt_system.h"
 #include "xrt/xrt_instance.h"
 #include "xrt/xrt_compositor.h"
@@ -561,7 +562,6 @@ get_client_app_state_locked(struct ipc_server *s, uint32_t client_id, struct ipc
 	}
 
 	struct ipc_app_state ias = ics->client_state;
-	ias.io_active = ics->io_active;
 
 	// @todo: track this data in the ipc_client_state struct
 	ias.primary_application = false;
@@ -604,7 +604,23 @@ toggle_io_client_locked(struct ipc_server *s, uint32_t client_id)
 		return XRT_ERROR_IPC_FAILURE;
 	}
 
-	ics->io_active = !ics->io_active;
+	volatile struct ipc_client_io_blocks *iob = &ics->client_state.io_blocks;
+	bool io_active = iob->block_poses && iob->block_hand_tracking && iob->block_inputs && iob->block_outputs;
+	iob->block_poses = iob->block_hand_tracking = iob->block_inputs = iob->block_outputs = !io_active;
+
+	return XRT_SUCCESS;
+}
+
+static xrt_result_t
+set_client_io_blocks_locked(struct ipc_server *s, uint32_t client_id, const struct ipc_client_io_blocks *blocks)
+{
+	volatile struct ipc_client_state *ics = find_client_locked(s, client_id);
+	if (ics == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	volatile struct ipc_client_io_blocks *iob = &ics->client_state.io_blocks;
+	*iob = *blocks;
 
 	return XRT_SUCCESS;
 }
@@ -705,6 +721,16 @@ ipc_server_toggle_io_client(struct ipc_server *s, uint32_t client_id)
 {
 	os_mutex_lock(&s->global_state.lock);
 	xrt_result_t xret = toggle_io_client_locked(s, client_id);
+	os_mutex_unlock(&s->global_state.lock);
+
+	return xret;
+}
+
+xrt_result_t
+ipc_server_set_client_io_blocks(struct ipc_server *s, uint32_t client_id, const struct ipc_client_io_blocks *blocks)
+{
+	os_mutex_lock(&s->global_state.lock);
+	xrt_result_t xret = set_client_io_blocks_locked(s, client_id, blocks);
 	os_mutex_unlock(&s->global_state.lock);
 
 	return xret;
@@ -850,7 +876,6 @@ ipc_server_handle_client_connected(struct ipc_server *vs, xrt_ipc_handle_t ipc_h
 	ics->imc.ipc_handle = ipc_handle;
 	ics->server = vs;
 	ics->server_thread_index = cs_index;
-	ics->io_active = true;
 
 	ics->plane_detection_size = 0;
 	ics->plane_detection_count = 0;

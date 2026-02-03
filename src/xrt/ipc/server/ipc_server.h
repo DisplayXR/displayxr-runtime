@@ -125,9 +125,6 @@ struct ipc_client_state
 	//! Compositor for this client.
 	struct xrt_compositor *xc;
 
-	//! Is the inputs and outputs active.
-	bool io_active;
-
 	//! Number of swapchains in use by client
 	uint32_t swapchain_count;
 
@@ -468,6 +465,14 @@ ipc_server_set_active_client(struct ipc_server *s, uint32_t client_id);
  */
 xrt_result_t
 ipc_server_toggle_io_client(struct ipc_server *s, uint32_t client_id);
+
+/*!
+ * Block certain types of IO for this client.
+ *
+ * @ingroup ipc_server
+ */
+xrt_result_t
+ipc_server_set_client_io_blocks(struct ipc_server *s, uint32_t client_id, const struct ipc_client_io_blocks *blocks);
 
 /*!
  * Called by client threads to set a session to active.

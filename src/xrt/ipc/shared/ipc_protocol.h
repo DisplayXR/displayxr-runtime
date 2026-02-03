@@ -328,6 +328,19 @@ struct ipc_client_list
 };
 
 /*!
+ * Which types of IO to block for a client.
+ *
+ * @ingroup ipc
+ */
+struct ipc_client_io_blocks
+{
+	bool block_poses;
+	bool block_hand_tracking;
+	bool block_inputs;
+	bool block_outputs;
+};
+
+/*!
  * State for a connected application.
  *
  * @ingroup ipc
@@ -342,7 +355,7 @@ struct ipc_app_state
 	bool session_visible;
 	bool session_focused;
 	bool session_overlay;
-	bool io_active;
+	struct ipc_client_io_blocks io_blocks;
 	uint32_t z_order;
 	pid_t pid;
 	struct xrt_application_info info;

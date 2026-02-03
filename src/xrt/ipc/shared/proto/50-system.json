@@ -40,6 +40,13 @@
 		]
 	},
 
+	"system_set_client_io_blocks": {
+		"in": [
+			{"name": "id", "type": "uint32_t"},
+			{"name": "blocks", "type": "struct ipc_client_io_blocks"}
+		]
+	},
+
 	"system_devices_get_list": {
 		"out": [
 			{"name": "device_list", "type": "struct ipc_device_list"}

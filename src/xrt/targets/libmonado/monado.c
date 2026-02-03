@@ -325,13 +325,16 @@ mnd_root_get_client_state(mnd_root_t *root, uint32_t client_id, uint32_t *out_fl
 		return mret; // Prints error.
 	}
 
+	const struct ipc_client_io_blocks *iob = &root->app_state.io_blocks;
 	uint32_t flags = 0;
 	flags |= (root->app_state.primary_application) ? MND_CLIENT_PRIMARY_APP : 0u;
 	flags |= (root->app_state.session_active) ? MND_CLIENT_SESSION_ACTIVE : 0u;
 	flags |= (root->app_state.session_visible) ? MND_CLIENT_SESSION_VISIBLE : 0u;
 	flags |= (root->app_state.session_focused) ? MND_CLIENT_SESSION_FOCUSED : 0u;
 	flags |= (root->app_state.session_overlay) ? MND_CLIENT_SESSION_OVERLAY : 0u;
-	flags |= (root->app_state.io_active) ? MND_CLIENT_IO_ACTIVE : 0u;
+	flags |= (!iob->block_poses && !iob->block_hand_tracking && !iob->block_inputs && !iob->block_outputs)
+	             ? MND_CLIENT_IO_ACTIVE
+	             : 0u;
 	*out_flags = flags;
 
 	return MND_SUCCESS;

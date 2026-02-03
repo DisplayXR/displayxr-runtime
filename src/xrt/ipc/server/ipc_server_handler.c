@@ -19,6 +19,7 @@
 #include "server/ipc_server.h"
 #include "server/ipc_server_objects.h"
 #include "ipc_server_generated.h"
+#include "xrt/xrt_defines.h"
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_results.h"
 
@@ -300,6 +301,104 @@ release_future(volatile struct ipc_client_state *ics, uint32_t future_id)
 	xrt_future_reference(&xft, NULL);
 	ics->xfts[future_id] = NULL;
 	return XRT_SUCCESS;
+}
+
+static xrt_result_t
+send_device_inputs(volatile struct ipc_client_state *ics, struct xrt_device *xdev)
+{
+	struct ipc_message_channel *imc = (struct ipc_message_channel *)&ics->imc;
+	xrt_result_t xret;
+
+	const size_t input_size = xdev->input_count * sizeof(struct xrt_input);
+	if (input_size == 0) {
+		return XRT_SUCCESS;
+	}
+
+	volatile struct ipc_client_io_blocks *iob = &ics->client_state.io_blocks;
+	// Send inputs as varlen data
+	// We don't need to do any filtering, send the inputs as-is.
+	if (!iob->block_poses && !iob->block_hand_tracking && !iob->block_inputs) {
+		// Send the full input state
+		xret = ipc_send(imc, xdev->inputs, input_size);
+		IPC_CHK_ALWAYS_RET(ics->server, xret, "ipc_send(inputs)");
+	}
+
+	struct xrt_input filtered[1024];
+	if (ARRAY_SIZE(filtered) < xdev->input_count) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	for (uint32_t i = 0; i < xdev->input_count; i++) {
+		struct xrt_input *src = &xdev->inputs[i];
+		struct xrt_input *dst = &filtered[i];
+
+		bool blocked = false;
+		switch (XRT_GET_INPUT_TYPE(src->name)) {
+		case XRT_INPUT_TYPE_POSE: //
+			blocked = iob->block_poses && dst->name != XRT_INPUT_GENERIC_HEAD_POSE;
+			break;
+		case XRT_INPUT_TYPE_HAND_TRACKING: //
+			blocked = iob->block_hand_tracking;
+			break;
+		case XRT_INPUT_TYPE_VEC1_ZERO_TO_ONE:
+		case XRT_INPUT_TYPE_VEC1_MINUS_ONE_TO_ONE:
+		case XRT_INPUT_TYPE_VEC2_MINUS_ONE_TO_ONE:
+		case XRT_INPUT_TYPE_VEC3_MINUS_ONE_TO_ONE:
+		case XRT_INPUT_TYPE_BOOLEAN: //
+			blocked = iob->block_inputs;
+			break;
+		// Don't block face or body tracking.
+		case XRT_INPUT_TYPE_BODY_TRACKING:
+		case XRT_INPUT_TYPE_FACE_TRACKING: break;
+		}
+
+		if (blocked) {
+			// Make sure it's zeroed out, and we only zero out what we send.
+			U_ZERO(dst);
+			dst->name = src->name;
+		} else {
+			memcpy(dst, src, sizeof(*dst));
+		}
+	}
+
+	xret = ipc_send(imc, filtered, input_size);
+	IPC_CHK_ALWAYS_RET(ics->server, xret, "ipc_send(filtered inputs)");
+}
+
+static xrt_result_t
+send_device_outputs(volatile struct ipc_client_state *ics, struct xrt_device *xdev)
+{
+	struct ipc_message_channel *imc = (struct ipc_message_channel *)&ics->imc;
+	xrt_result_t xret;
+
+	const size_t output_size = xdev->output_count * sizeof(struct xrt_output);
+	if (output_size == 0) {
+		return XRT_SUCCESS;
+	}
+
+	volatile struct ipc_client_io_blocks *iob = &ics->client_state.io_blocks;
+	// Send outputs as varlen data
+	// We don't need to do any filtering, send the outputs as is.
+	if (!iob->block_outputs) {
+		// Send the full output state
+		xret = ipc_send(imc, xdev->outputs, output_size);
+		IPC_CHK_ALWAYS_RET(ics->server, xret, "ipc_send(outputs)");
+	}
+
+	struct xrt_output filtered[1024];
+	if (ARRAY_SIZE(filtered) < xdev->output_count) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	for (uint32_t i = 0; i < xdev->output_count; i++) {
+		struct xrt_output *dst = &filtered[i];
+		// Make sure it's zeroed out, and we only zero out what we send.
+		U_ZERO(dst);
+		dst->name = xdev->outputs[i].name;
+	}
+
+	xret = ipc_send(imc, filtered, output_size);
+	IPC_CHK_ALWAYS_RET(ics->server, xret, "ipc_send(filtered outputs)");
 }
 
 /*
@@ -1615,6 +1714,25 @@ ipc_handle_system_toggle_io_client(volatile struct ipc_client_state *_ics, uint3
 }
 
 xrt_result_t
+ipc_handle_system_set_client_io_blocks(volatile struct ipc_client_state *_ics,
+                                       uint32_t client_id,
+                                       const struct ipc_client_io_blocks *blocks)
+{
+	struct ipc_server *s = _ics->server;
+
+	IPC_INFO(s,
+	         "System setting io blocks for client %u. (block_poses=%s block_hand_tracking=%s block_inputs=%s "
+	         "block_outputs=%s)",
+	         client_id,                                      //
+	         blocks->block_poses ? "true" : "false",         //
+	         blocks->block_hand_tracking ? "true" : "false", //
+	         blocks->block_inputs ? "true" : "false",        //
+	         blocks->block_outputs ? "true" : "false");
+
+	return ipc_server_set_client_io_blocks(s, client_id, blocks);
+}
+
+xrt_result_t
 ipc_handle_swapchain_get_properties(volatile struct ipc_client_state *ics,
                                     const struct xrt_swapchain_create_info *info,
                                     struct xrt_swapchain_create_properties *xsccp)
@@ -2214,62 +2332,11 @@ ipc_handle_device_update_input(volatile struct ipc_client_state *ics, uint32_t i
 	xret = ipc_send(imc, &reply, sizeof(reply));
 	IPC_CHK_AND_RET(ics->server, xret, "ipc_send(result reply)");
 
-	// Used on both branches.
-	const size_t input_size = xdev->input_count * sizeof(struct xrt_input);
-	const size_t output_size = xdev->output_count * sizeof(struct xrt_output);
+	xret = send_device_inputs(ics, xdev);
+	IPC_CHK_AND_RET(ics->server, xret, "send_device_inputs");
 
-	// Send inputs as varlen data
-	bool io_active = ics->io_active;
-	if (io_active) {
-		if (input_size > 0) {
-			// Send the full input state
-			xret = ipc_send(imc, xdev->inputs, input_size);
-			IPC_CHK_AND_RET(ics->server, xret, "ipc_send(inputs)");
-		}
-		if (output_size > 0) {
-			// Send the full output state
-			xret = ipc_send(imc, xdev->outputs, output_size);
-			IPC_CHK_AND_RET(ics->server, xret, "ipc_send(outputs)");
-		}
-	} else {
-		if (input_size > 0) {
-			struct xrt_input filtered[1024];
-			if (ARRAY_SIZE(filtered) < xdev->input_count) {
-				return XRT_ERROR_IPC_FAILURE;
-			}
-
-			for (uint32_t i = 0; i < xdev->input_count; i++) {
-				struct xrt_input *dst = &filtered[i];
-				// Make sure it's zeroed out, and we only zero out what we send.
-				U_ZERO(dst);
-				dst->name = xdev->inputs[i].name;
-
-				// Special case the rotation of the head.
-				if (dst->name == XRT_INPUT_GENERIC_HEAD_POSE) {
-					dst->active = xdev->inputs[i].active;
-				}
-			}
-
-			xret = ipc_send(imc, filtered, input_size);
-			IPC_CHK_AND_RET(ics->server, xret, "ipc_send(filtered inputs)");
-		}
-		if (output_size > 0) {
-			struct xrt_output filtered[1024];
-			if (ARRAY_SIZE(filtered) < xdev->output_count) {
-				return XRT_ERROR_IPC_FAILURE;
-			}
-
-			for (uint32_t i = 0; i < xdev->output_count; i++) {
-				struct xrt_output *dst = &filtered[i];
-				// Make sure it's zeroed out, and we only zero out what we send.
-				U_ZERO(dst);
-				dst->name = xdev->outputs[i].name;
-			}
-
-			xret = ipc_send(imc, filtered, output_size);
-			IPC_CHK_AND_RET(ics->server, xret, "ipc_send(filtered outputs)");
-		}
-	}
+	xret = send_device_outputs(ics, xdev);
+	IPC_CHK_AND_RET(ics->server, xret, "send_device_outputs");
 
 	return XRT_SUCCESS;
 }
@@ -2306,7 +2373,7 @@ ipc_handle_device_get_tracked_pose(volatile struct ipc_client_state *ics,
 	}
 
 	// Special case the headpose.
-	bool disabled = !ics->io_active && name != XRT_INPUT_GENERIC_HEAD_POSE;
+	bool disabled = ics->client_state.io_blocks.block_poses && name != XRT_INPUT_GENERIC_HEAD_POSE;
 	bool active_on_client = input->active;
 
 	// We have been disabled but the client hasn't called update.
@@ -2331,6 +2398,10 @@ ipc_handle_device_get_hand_tracking(volatile struct ipc_client_state *ics,
                                     struct xrt_hand_joint_set *out_value,
                                     int64_t *out_timestamp)
 {
+	if (ics->client_state.io_blocks.block_hand_tracking) {
+		out_value->is_active = false;
+		return XRT_SUCCESS;
+	}
 
 	// To make the code a bit more readable.
 	uint32_t device_id = id;
@@ -2646,6 +2717,10 @@ ipc_handle_device_set_output(volatile struct ipc_client_state *ics,
                              enum xrt_output_name name,
                              const struct xrt_output_value *value)
 {
+	if (ics->client_state.io_blocks.block_outputs) {
+		return XRT_SUCCESS;
+	}
+
 	// To make the code a bit more readable.
 	uint32_t device_id = id;
 	struct xrt_device *xdev = NULL;
@@ -2662,6 +2737,11 @@ ipc_handle_device_set_haptic_output(volatile struct ipc_client_state *ics,
                                     const struct ipc_pcm_haptic_buffer *buffer)
 {
 	IPC_TRACE_MARKER();
+
+	if (ics->client_state.io_blocks.block_outputs) {
+		return XRT_SUCCESS;
+	}
+
 	struct ipc_message_channel *imc = (struct ipc_message_channel *)&ics->imc;
 	struct ipc_server *s = ics->server;
 
