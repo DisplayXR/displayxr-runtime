@@ -340,11 +340,10 @@ client_vk_swapchain_barrier_image(struct xrt_swapchain *xsc, enum xrt_barrier_di
 	// on NVIDIA and Intel drivers — even acquire barriers with VK_QUEUE_FAMILY_IGNORED
 	// and oldLayout=UNDEFINED trigger deferred GPU faults detected by vkQueueWaitIdle.
 	//
-	// This is safe because:
-	// - The compositor's VkDevice has independent image layout tracking
-	// - CPU sync (vkQueueWaitIdle) in submit_fallback handles memory visibility
-	// - Apps handle their own layout transitions via render pass initialLayout/finalLayout
-	// - The app's render pass loadOp=CLEAR discards content regardless of layout
+	// This is safe because the null compositor does not read the swapchain images
+	// directly — it acts as a sync/timing bridge only. No GPU-side synchronization
+	// is needed between app and compositor. The app handles its own layout
+	// transitions via render pass initialLayout/finalLayout.
 	if (sc->c->xcn->base.info.disable_fence_sync) {
 		return XRT_SUCCESS;
 	}
