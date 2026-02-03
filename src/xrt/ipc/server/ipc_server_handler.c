@@ -367,21 +367,26 @@ ipc_handle_session_create(volatile struct ipc_client_state *ics,
 {
 	IPC_TRACE_MARKER();
 
+	IPC_WARN(ics->server, "IPC session_create called (create_native_compositor=%d)", create_native_compositor);
+
 	struct xrt_session *xs = NULL;
 	struct xrt_compositor_native *xcn = NULL;
 
 	if (ics->xs != NULL) {
+		IPC_WARN(ics->server, "IPC session_create: session already exists");
 		return XRT_ERROR_IPC_SESSION_ALREADY_CREATED;
 	}
 
 	if (!create_native_compositor) {
-		IPC_INFO(ics->server, "App asked for headless session, creating native compositor anyways");
+		IPC_WARN(ics->server, "App asked for headless session, creating native compositor anyways");
 	}
 
 	xrt_result_t xret = xrt_system_create_session(ics->server->xsys, xsi, &xs, &xcn);
 	if (xret != XRT_SUCCESS) {
+		IPC_WARN(ics->server, "IPC session_create: xrt_system_create_session failed with %d", xret);
 		return xret;
 	}
+	IPC_WARN(ics->server, "IPC session_create: session created successfully");
 
 	ics->client_state.session_overlay = xsi->is_overlay;
 	ics->client_state.z_order = xsi->z_order;
@@ -412,13 +417,17 @@ ipc_handle_session_begin(volatile struct ipc_client_state *ics)
 {
 	IPC_TRACE_MARKER();
 
+	IPC_WARN(ics->server, "IPC session_begin called");
+
 	// Have we created the session?
 	if (ics->xs == NULL) {
+		IPC_WARN(ics->server, "IPC session_begin: session not created");
 		return XRT_ERROR_IPC_SESSION_NOT_CREATED;
 	}
 
 	// Need to check both because begin session is handled by compositor.
 	if (ics->xc == NULL) {
+		IPC_WARN(ics->server, "IPC session_begin: compositor not created");
 		return XRT_ERROR_IPC_COMPOSITOR_NOT_CREATED;
 	}
 
