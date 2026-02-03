@@ -1314,14 +1314,18 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 	U_LOG_W("[per-session] Command buffer ended");
 
 	// Submit command buffer with fence for async completion
+	// Signal the render_complete semaphore so comp_target_present can wait on it
+	VkSemaphore signal_sem = ct->semaphores.render_complete;
 	VkSubmitInfo submit_info = {
 	    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
 	    .commandBufferCount = 1,
 	    .pCommandBuffers = &cmd,
+	    .signalSemaphoreCount = (signal_sem != VK_NULL_HANDLE) ? 1 : 0,
+	    .pSignalSemaphores = (signal_sem != VK_NULL_HANDLE) ? &signal_sem : NULL,
 	};
 
-	U_LOG_W("[per-session] Submitting command buffer with fence...");
-	ret = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, mc->session_render.fences[buffer_index]);
+	U_LOG_W("[per-session] Submitting command buffer with fence (signal_sem=%p)...", (void *)signal_sem);
+	ret = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, mc->session_render.fences[buffer_index])
 	if (ret != VK_SUCCESS) {
 		U_LOG_E("[per-session] Failed to submit per-session render: %s", vk_result_string(ret));
 		return;
