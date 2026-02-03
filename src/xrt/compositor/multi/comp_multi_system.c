@@ -11,6 +11,7 @@
 
 #include "xrt/xrt_config_os.h"
 #include "xrt/xrt_config_have.h"
+#include "xrt/xrt_handles.h"
 #include "xrt/xrt_session.h"
 
 #include "os/os_time.h"
