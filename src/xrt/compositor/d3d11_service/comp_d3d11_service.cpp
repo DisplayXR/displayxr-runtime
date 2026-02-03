@@ -1083,7 +1083,7 @@ compositor_import_swapchain(struct xrt_compositor *xc,
 	sc->image_count = image_count;
 	sc->info = *info;
 
-	U_LOG_D("Importing swapchain: %u images, %ux%u, format=%u, usage=0x%x",
+	U_LOG_W("Importing swapchain: %u images, %ux%u, format=%u, usage=0x%x",
 	        image_count, info->width, info->height, info->format, info->bits);
 
 	// Import each image from the client
@@ -1161,7 +1161,7 @@ compositor_import_swapchain(struct xrt_compositor *xc,
 		}
 	}
 
-	U_LOG_I("Imported swapchain with %u images (%ux%u)", image_count, info->width, info->height);
+	U_LOG_W("Imported swapchain with %u images (%ux%u)", image_count, info->width, info->height);
 
 	*out_xsc = &sc->base;
 	return XRT_SUCCESS;
@@ -1225,14 +1225,14 @@ compositor_create_semaphore(struct xrt_compositor *xc,
 static xrt_result_t
 compositor_begin_session(struct xrt_compositor *xc, const struct xrt_begin_session_info *info)
 {
-	U_LOG_I("D3D11 service compositor: session begin");
+	U_LOG_W("D3D11 service compositor: session begin");
 	return XRT_SUCCESS;
 }
 
 static xrt_result_t
 compositor_end_session(struct xrt_compositor *xc)
 {
-	U_LOG_I("D3D11 service compositor: session end");
+	U_LOG_W("D3D11 service compositor: session end");
 	return XRT_SUCCESS;
 }
 
@@ -1440,6 +1440,13 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	struct d3d11_service_system *sys = c->sys;
 
 	std::lock_guard<std::mutex> lock(c->mutex);
+
+	// Log frame submission (first frame and every 60 frames)
+	static uint32_t frame_count = 0;
+	if (frame_count == 0 || frame_count % 60 == 0) {
+		U_LOG_W("layer_commit: frame %u, layers=%u", frame_count, c->layer_accum.layer_count);
+	}
+	frame_count++;
 
 	// Clear stereo render target
 	if (sys->stereo_rtv) {
@@ -1752,7 +1759,7 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 	c->base.base.info.formats[format_count++] = DXGI_FORMAT_R16G16B16A16_FLOAT;
 	c->base.base.info.format_count = format_count;
 
-	U_LOG_I("D3D11 service: created native compositor for client");
+	U_LOG_W("D3D11 service: created native compositor for client");
 
 	*out_xcn = &c->base;
 	return XRT_SUCCESS;
