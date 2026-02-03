@@ -215,11 +215,15 @@ struct d3d11_service_system
 	struct leiasr_d3d11 *weaver;
 #endif
 
-	//! Display dimensions
+	//! Stereo texture dimensions (side-by-side views, input to weaver)
 	uint32_t display_width;
 	uint32_t display_height;
 
-	//! View dimensions (stereo)
+	//! Output dimensions (window/swap chain, native display resolution)
+	uint32_t output_width;
+	uint32_t output_height;
+
+	//! View dimensions (per eye, reported to apps)
 	uint32_t view_width;
 	uint32_t view_height;
 
@@ -1644,10 +1648,10 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		ID3D11RenderTargetView *rtvs[] = {sys->back_buffer_rtv.get()};
 		sys->context->OMSetRenderTargets(1, rtvs, nullptr);
 
-		// Set viewport
+		// Set viewport (native display resolution for weaver output)
 		D3D11_VIEWPORT viewport = {};
-		viewport.Width = static_cast<float>(sys->display_width);
-		viewport.Height = static_cast<float>(sys->display_height);
+		viewport.Width = static_cast<float>(sys->output_width);
+		viewport.Height = static_cast<float>(sys->output_height);
 		viewport.MaxDepth = 1.0f;
 		sys->context->RSSetViewports(1, &viewport);
 
@@ -1822,11 +1826,56 @@ comp_d3d11_service_create_system(struct xrt_device *xdev,
 
 	sys->xdev = xdev;
 	sys->log_level = U_LOGGING_INFO;
+
+	// Query SR display for recommended view dimensions, native resolution, and refresh rate
+	// - View dimensions: per-eye texture size for quality rendering (reported to apps)
+	// - Native dimensions: physical display resolution (for window/swap chain output)
+	uint32_t sr_view_width = 0;
+	uint32_t sr_view_height = 0;
+	uint32_t sr_native_width = 0;
+	uint32_t sr_native_height = 0;
+	float sr_refresh_rate = 0.0f;
+
+#ifdef XRT_HAVE_LEIA_SR_D3D11
+	if (leiasr_query_recommended_view_dimensions(5.0, &sr_view_width, &sr_view_height, &sr_refresh_rate,
+	                                              &sr_native_width, &sr_native_height)) {
+		U_LOG_W("Using SR recommended view dimensions: %ux%u per eye, %.0f Hz",
+		        sr_view_width, sr_view_height, sr_refresh_rate);
+		U_LOG_W("Using SR native display dimensions: %ux%u for window/swap chain",
+		        sr_native_width, sr_native_height);
+
+		// Per-eye view dimensions (reported to apps for swapchain creation)
+		sys->view_width = sr_view_width;
+		sys->view_height = sr_view_height;
+
+		// Stereo texture dimensions (side-by-side input to weaver)
+		sys->display_width = sys->view_width * 2;
+		sys->display_height = sys->view_height;
+
+		// Output dimensions (window/swap chain at native display resolution)
+		sys->output_width = sr_native_width;
+		sys->output_height = sr_native_height;
+
+		sys->refresh_rate = sr_refresh_rate > 0.0f ? sr_refresh_rate : 60.0f;
+	} else {
+		U_LOG_W("Could not query SR display dimensions, using defaults");
+		sys->display_width = 1920;
+		sys->display_height = 1080;
+		sys->output_width = 2560;   // Default Leia display native resolution
+		sys->output_height = 1440;
+		sys->view_width = sys->display_width / 2;
+		sys->view_height = sys->display_height;
+		sys->refresh_rate = 60.0f;
+	}
+#else
 	sys->display_width = 1920;
 	sys->display_height = 1080;
+	sys->output_width = sys->display_width;
+	sys->output_height = sys->display_height;
 	sys->view_width = sys->display_width / 2;
 	sys->view_height = sys->display_height;
 	sys->refresh_rate = 60.0f;
+#endif
 
 	// Create D3D11 device (service owns this, independent of clients)
 	UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
@@ -1885,7 +1934,8 @@ comp_d3d11_service_create_system(struct xrt_device *xdev,
 	}
 
 	// Create service window on dedicated thread (handles message pump)
-	xrt_result_t wret = comp_d3d11_window_create(sys->display_width, sys->display_height, &sys->window);
+	// Window is created at native display resolution for proper fullscreen
+	xrt_result_t wret = comp_d3d11_window_create(sys->output_width, sys->output_height, &sys->window);
 	if (wret != XRT_SUCCESS || sys->window == NULL) {
 		U_LOG_E("Failed to create service window on dedicated thread");
 		delete sys;
@@ -1893,10 +1943,10 @@ comp_d3d11_service_create_system(struct xrt_device *xdev,
 	}
 	sys->hwnd = (HWND)comp_d3d11_window_get_hwnd(sys->window);
 
-	// Create swap chain
+	// Create swap chain at native display resolution (output of weaver)
 	DXGI_SWAP_CHAIN_DESC1 sc_desc = {};
-	sc_desc.Width = sys->display_width;
-	sc_desc.Height = sys->display_height;
+	sc_desc.Width = sys->output_width;
+	sc_desc.Height = sys->output_height;
 	sc_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
 	sc_desc.SampleDesc.Count = 1;
 	sc_desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -1998,8 +2048,10 @@ comp_d3d11_service_create_system(struct xrt_device *xdev,
 	sys->base.info.views[0].max.height_pixels = sys->view_height;
 	sys->base.info.views[1] = sys->base.info.views[0];
 
-	U_LOG_W("D3D11 service system compositor created (%ux%u @ %.0fHz)",
-	        sys->display_width, sys->display_height, sys->refresh_rate);
+	U_LOG_W("D3D11 service system compositor created: view=%ux%u/eye, stereo=%ux%u, output=%ux%u @ %.0fHz",
+	        sys->view_width, sys->view_height,
+	        sys->display_width, sys->display_height,
+	        sys->output_width, sys->output_height, sys->refresh_rate);
 
 	*out_xsysc = &sys->base;
 	return XRT_SUCCESS;
