@@ -19,6 +19,8 @@
 #include "math/m_mathinclude.h"
 #include "math/m_clock_tracking.h"
 
+#include "tracking/t_imu.h"
+
 #include "os/os_hid.h"
 #include "os/os_threading.h"
 
@@ -676,6 +678,9 @@ struct rift_touch_controller
 		uint32_t last_device_remote_us;
 		timepoint_ns device_remote_ns;
 		timepoint_ns device_local_ns;
+
+		struct imu_fusion *imu_fusion;
+		struct xrt_imu_sample last_imu_sample;
 
 		struct m_clock_windowed_skew_tracker *clock_tracker;
 

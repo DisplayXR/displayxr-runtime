@@ -37,12 +37,23 @@ rift_touch_controller_get_tracked_pose(struct xrt_device *xdev,
                                        int64_t at_timestamp_ns,
                                        struct xrt_space_relation *out_relation)
 {
+	struct rift_touch_controller *controller = (struct rift_touch_controller *)xdev;
+
 	switch (name) {
 	case XRT_INPUT_TOUCH_GRIP_POSE:
-	case XRT_INPUT_TOUCH_AIM_POSE:
-		// @todo
-		(*out_relation) = (struct xrt_space_relation)XRT_SPACE_RELATION_ZERO;
+	case XRT_INPUT_TOUCH_AIM_POSE: {
+		struct xrt_space_relation relation = XRT_SPACE_RELATION_ZERO;
+
+		if (imu_fusion_get_prediction(controller->input.imu_fusion, (uint64_t)at_timestamp_ns,
+		                              &relation.pose.orientation, &relation.angular_velocity) == 0) {
+			relation.relation_flags = XRT_SPACE_RELATION_ORIENTATION_VALID_BIT |
+			                          XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT |
+			                          XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT;
+
+			(*out_relation) = relation;
+		}
 		break;
+	}
 	default: return XRT_ERROR_INPUT_UNSUPPORTED;
 	}
 
@@ -70,6 +81,10 @@ rift_touch_controller_destroy(struct xrt_device *xdev)
 
 	if (controller->input.clock_tracker) {
 		m_clock_windowed_skew_tracker_destroy(controller->input.clock_tracker);
+	}
+
+	if (controller->input.imu_fusion) {
+		imu_fusion_destroy(controller->input.imu_fusion);
 	}
 
 	u_device_free(&controller->base);
@@ -320,6 +335,7 @@ rift_touch_controller_create(struct rift_hmd *hmd, enum rift_radio_device_type d
 	controller->base.get_battery_status = rift_touch_controller_get_battery_status;
 
 	controller->base.supported.battery_status = true;
+	controller->base.supported.orientation_tracking = true;
 
 	controller->base.binding_profile_count = touch_profile_bindings_count;
 	controller->base.binding_profiles = touch_profile_bindings;
@@ -339,6 +355,13 @@ rift_touch_controller_create(struct rift_hmd *hmd, enum rift_radio_device_type d
 		return NULL;
 	}
 
+	controller->input.imu_fusion = imu_fusion_create();
+	if (controller->input.imu_fusion == NULL) {
+		HMD_ERROR(hmd, "Failed to create touch controller IMU fusion");
+		rift_touch_controller_destroy(&controller->base);
+		return NULL;
+	}
+
 	// -1 means unknown battery level/no data
 	xrt_atomic_s32_store(&controller->input.battery_status, -1);
 
@@ -349,6 +372,9 @@ rift_touch_controller_create(struct rift_hmd *hmd, enum rift_radio_device_type d
 
 	{
 		u_var_add_gui_header(controller, NULL, "Input State");
+		u_var_add_ro_vec3_f64(controller, &controller->input.last_imu_sample.accel_m_s2, "Last Accel (m/s²)");
+		u_var_add_ro_vec3_f64(controller, &controller->input.last_imu_sample.gyro_rad_secs,
+		                      "Last Gyro (rad/s)");
 		u_var_add_ro_i32(controller, (int32_t *)&controller->input.battery_status, "battery_status");
 		u_var_add_u8(controller, &controller->input.state.buttons, "buttons");
 		u_var_add_f32(controller, &controller->input.state.trigger, "trigger");
@@ -697,6 +723,122 @@ rift_radio_read_controller_calibration(struct rift_hmd *hmd, struct rift_touch_c
 	return true;
 }
 
+static void
+rift_touch_controller_handle_radio_input_report(struct rift_hmd *hmd,
+                                                struct rift_touch_controller *controller,
+                                                struct rift_radio_report_message message,
+                                                int64_t receive_ns)
+{
+	struct rift_touch_controller_calibration *c = &controller->input.calibration;
+
+	uint8_t tgs[5];
+	memcpy(tgs, message.touch.touch_grip_stick_state, sizeof tgs);
+	uint16_t raw_trigger = tgs[0] | ((tgs[1] & 0x03) << 8);
+	uint16_t raw_grip = ((tgs[1] & 0xfc) >> 2) | ((tgs[2] & 0xf) << 6);
+	uint16_t raw_stick_x = ((tgs[2] & 0xf0) >> 4) | ((tgs[3] & 0x3f) << 4);
+	uint16_t raw_stick_y = ((tgs[3] & 0xc0) >> 6) | ((tgs[4] & 0xff) << 2);
+
+	float trigger = rift_min_mid_max_range_to_float(c->trigger_range, (float)raw_trigger);
+	float grip = rift_min_mid_max_range_to_float(c->middle_range, (float)raw_grip);
+
+	struct xrt_vec2 joy;
+	if (raw_stick_x >= c->joy_x_dead[0] && raw_stick_x <= c->joy_x_dead[1] && raw_stick_y >= c->joy_y_dead[0] &&
+	    raw_stick_y <= c->joy_y_dead[1]) {
+		joy.x = 0.0f;
+		joy.y = 0.0f;
+	} else {
+		joy.x =
+		    ((float)raw_stick_x - c->joy_x_range[0]) / (c->joy_x_range[1] - c->joy_x_range[0]) * 2.0f - 1.0f;
+		joy.y =
+		    ((float)raw_stick_y - c->joy_y_range[0]) / (c->joy_y_range[1] - c->joy_y_range[0]) * 2.0f - 1.0f;
+	}
+
+	struct xrt_vec3 raw_accel = {
+	    MATH_GRAVITY_M_S2 / 2048.0 * (float)message.touch.accel[0],
+	    MATH_GRAVITY_M_S2 / 2048.0 * (float)message.touch.accel[1],
+	    MATH_GRAVITY_M_S2 / 2048.0 * (float)message.touch.accel[2],
+	};
+
+	// Gyro is MPU 6500, configured for 2000°/s.
+	// The datasheet has 16.4 LSB/°/s, but I'm using
+	// 32768 / 2000 = 16.384 here because that actually
+	// yields a 2000°/s full range, then converting to
+	// radians for the fusion.
+	struct xrt_vec3 raw_gyro = {
+	    message.touch.gyro[0] / (16.384 * 180.0) * M_PI,
+	    message.touch.gyro[1] / (16.384 * 180.0) * M_PI,
+	    message.touch.gyro[2] / (16.384 * 180.0) * M_PI,
+	};
+	struct xrt_vec3 gyro;
+	struct xrt_vec3 accel;
+
+	// For controllers, we apply the rotation matrix first,
+	// and then add the provided factory offsets
+	math_matrix_3x3_transform_vec3((struct xrt_matrix_3x3 *)&c->gyro_calibration, &raw_gyro, &gyro);
+	math_vec3_accum(&c->gyro_offset, &gyro);
+
+	math_matrix_3x3_transform_vec3((struct xrt_matrix_3x3 *)&c->accel_calibration, &raw_accel, &accel);
+	math_vec3_accum(&c->accel_offset, &accel);
+
+	controller->input.device_remote_ns +=
+	    (timepoint_ns)(message.touch.timestamp - controller->input.last_device_remote_us) * U_TIME_1US_IN_NS;
+	controller->input.last_device_remote_us = message.touch.timestamp;
+
+	os_mutex_lock(&controller->input.mutex);
+	m_clock_windowed_skew_tracker_push(controller->input.clock_tracker, receive_ns,
+	                                   controller->input.device_remote_ns);
+
+	if (!m_clock_windowed_skew_tracker_to_local(controller->input.clock_tracker, controller->input.device_remote_ns,
+	                                            &controller->input.device_local_ns)) {
+		HMD_WARN(hmd, "Failed to convert device remote time to local time");
+		os_mutex_unlock(&controller->input.mutex);
+		return;
+	}
+
+	controller->input.state.buttons = message.touch.buttons & 0x0F;
+	controller->input.state.trigger = trigger;
+	controller->input.state.grip = grip;
+	controller->input.state.stick = joy;
+
+	switch (message.touch.adc_channel) {
+	case RIFT_TOUCH_CONTROLLER_ADC_STICK:
+		controller->input.state.cap_stick = rift_min_mid_max_cap(c, 0, (float)message.touch.adc_value);
+		break;
+	case RIFT_TOUCH_CONTROLLER_ADC_A_X:
+		controller->input.state.cap_a_x = rift_min_mid_max_cap(c, 3, (float)message.touch.adc_value);
+		break;
+	case RIFT_TOUCH_CONTROLLER_ADC_B_Y:
+		controller->input.state.cap_b_y = rift_min_mid_max_cap(c, 1, (float)message.touch.adc_value);
+		break;
+	case RIFT_TOUCH_CONTROLLER_ADC_TRIGGER:
+		controller->input.state.cap_trigger = rift_min_mid_max_cap(c, 2, (float)message.touch.adc_value);
+		break;
+	case RIFT_TOUCH_CONTROLLER_ADC_THUMBREST:
+		controller->input.state.cap_thumbrest = rift_min_mid_max_cap(c, 7, (float)message.touch.adc_value);
+		break;
+	case RIFT_TOUCH_CONTROLLER_ADC_HAPTIC_COUNTER:
+		controller->input.state.haptic_counter = (uint8_t)message.touch.adc_value;
+		break;
+	case RIFT_TOUCH_CONTROLLER_ADC_BATTERY:
+		xrt_atomic_s32_store(&controller->input.battery_status, message.touch.adc_value);
+		break;
+	}
+
+	struct xrt_imu_sample imu_sample = {
+	    .timestamp_ns = controller->input.device_local_ns,
+	    .gyro_rad_secs = {gyro.x, gyro.y, gyro.z},
+	    .accel_m_s2 = {accel.x, accel.y, accel.z},
+	};
+	controller->input.last_imu_sample = imu_sample;
+
+	struct xrt_vec3 accel_variance = {0.01, 0.01, 0.01};
+	struct xrt_vec3 gyro_variance = {0.01, 0.01, 0.01};
+	imu_fusion_incorporate_gyros_and_accelerometer(controller->input.imu_fusion, imu_sample.timestamp_ns, &gyro,
+	                                               &gyro_variance, &accel, &accel_variance, NULL);
+
+	os_mutex_unlock(&controller->input.mutex);
+}
+
 int
 rift_radio_handle_read(struct rift_hmd *hmd)
 {
@@ -786,84 +928,7 @@ rift_radio_handle_read(struct rift_hmd *hmd)
 				break;
 			}
 
-			struct rift_touch_controller_calibration *c = &controller->input.calibration;
-
-			uint8_t tgs[5];
-			memcpy(tgs, message.touch.touch_grip_stick_state, sizeof tgs);
-			uint16_t raw_trigger = tgs[0] | ((tgs[1] & 0x03) << 8);
-			uint16_t raw_grip = ((tgs[1] & 0xfc) >> 2) | ((tgs[2] & 0xf) << 6);
-			uint16_t raw_stick_x = ((tgs[2] & 0xf0) >> 4) | ((tgs[3] & 0x3f) << 4);
-			uint16_t raw_stick_y = ((tgs[3] & 0xc0) >> 6) | ((tgs[4] & 0xff) << 2);
-
-			float trigger = rift_min_mid_max_range_to_float(c->trigger_range, (float)raw_trigger);
-			float grip = rift_min_mid_max_range_to_float(c->middle_range, (float)raw_grip);
-
-			struct xrt_vec2 joy;
-			if (raw_stick_x >= c->joy_x_dead[0] && raw_stick_x <= c->joy_x_dead[1] &&
-			    raw_stick_y >= c->joy_y_dead[0] && raw_stick_y <= c->joy_y_dead[1]) {
-				joy.x = 0.0f;
-				joy.y = 0.0f;
-			} else {
-				joy.x = ((float)raw_stick_x - c->joy_x_range[0]) /
-				            (c->joy_x_range[1] - c->joy_x_range[0]) * 2.0f -
-				        1.0f;
-				joy.y = ((float)raw_stick_y - c->joy_y_range[0]) /
-				            (c->joy_y_range[1] - c->joy_y_range[0]) * 2.0f -
-				        1.0f;
-			}
-
-			controller->input.device_remote_ns +=
-			    (timepoint_ns)(message.touch.timestamp - controller->input.last_device_remote_us) *
-			    U_TIME_1US_IN_NS;
-			controller->input.last_device_remote_us = message.touch.timestamp;
-
-			os_mutex_lock(&controller->input.mutex);
-			m_clock_windowed_skew_tracker_push(controller->input.clock_tracker, receive_ns,
-			                                   controller->input.device_remote_ns);
-
-			if (!m_clock_windowed_skew_tracker_to_local(controller->input.clock_tracker,
-			                                            controller->input.device_remote_ns,
-			                                            &controller->input.device_local_ns)) {
-				HMD_WARN(hmd, "Failed to convert device remote time to local time");
-				os_mutex_unlock(&controller->input.mutex);
-				break;
-			}
-
-			controller->input.state.buttons = message.touch.buttons & 0x0F;
-			controller->input.state.trigger = trigger;
-			controller->input.state.grip = grip;
-			controller->input.state.stick = joy;
-
-			switch (message.touch.adc_channel) {
-			case RIFT_TOUCH_CONTROLLER_ADC_STICK:
-				controller->input.state.cap_stick =
-				    rift_min_mid_max_cap(c, 0, (float)message.touch.adc_value);
-				break;
-			case RIFT_TOUCH_CONTROLLER_ADC_A_X:
-				controller->input.state.cap_a_x =
-				    rift_min_mid_max_cap(c, 3, (float)message.touch.adc_value);
-				break;
-			case RIFT_TOUCH_CONTROLLER_ADC_B_Y:
-				controller->input.state.cap_b_y =
-				    rift_min_mid_max_cap(c, 1, (float)message.touch.adc_value);
-				break;
-			case RIFT_TOUCH_CONTROLLER_ADC_TRIGGER:
-				controller->input.state.cap_trigger =
-				    rift_min_mid_max_cap(c, 2, (float)message.touch.adc_value);
-				break;
-			case RIFT_TOUCH_CONTROLLER_ADC_THUMBREST:
-				controller->input.state.cap_thumbrest =
-				    rift_min_mid_max_cap(c, 7, (float)message.touch.adc_value);
-				break;
-			case RIFT_TOUCH_CONTROLLER_ADC_HAPTIC_COUNTER:
-				controller->input.state.haptic_counter = (uint8_t)message.touch.adc_value;
-				break;
-			case RIFT_TOUCH_CONTROLLER_ADC_BATTERY:
-				xrt_atomic_s32_store(&controller->input.battery_status, message.touch.adc_value);
-				break;
-			}
-
-			os_mutex_unlock(&controller->input.mutex);
+			rift_touch_controller_handle_radio_input_report(hmd, controller, message, receive_ns);
 
 			break;
 		}
