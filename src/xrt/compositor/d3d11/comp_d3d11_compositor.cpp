@@ -258,6 +258,14 @@ d3d11_compositor_wait_frame(struct xrt_compositor *xc,
 {
 	struct comp_d3d11_compositor *c = d3d11_comp(xc);
 
+	// During drag, synchronize with the window thread's WM_PAINT cycle.
+	// This ensures the window position is stable between weave() and Present(),
+	// so the interlacing pattern matches the actual displayed position.
+	if (c->owns_window && c->own_window != nullptr &&
+	    comp_d3d11_window_is_in_size_move(c->own_window)) {
+		comp_d3d11_window_wait_for_paint(c->own_window);
+	}
+
 	// Use queried display refresh rate
 	int64_t period_ns = static_cast<int64_t>(U_TIME_1S_IN_NS / c->display_refresh_rate);
 
@@ -688,6 +696,12 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	// DWM composites the frame at a window position that differs from where
 	// the weaver computed the interlacing, destroying the 3D effect.
 	xret = comp_d3d11_target_present(c->target, 1);
+
+	// Signal WM_PAINT that the frame is done (unblocks modal drag loop)
+	if (c->owns_window && c->own_window != nullptr) {
+		comp_d3d11_window_signal_paint_done(c->own_window);
+	}
+
 	if (xret != XRT_SUCCESS) {
 		U_LOG_E("Failed to present");
 		return xret;

@@ -89,6 +89,12 @@ struct comp_d3d11_window
 
 	//! Manual-reset event signaled after HWND is created on the window thread
 	HANDLE window_ready_event;
+
+	//! Auto-reset event: WM_PAINT signals compositor to render during drag
+	HANDLE paint_requested_event;
+
+	//! Auto-reset event: compositor signals WM_PAINT that frame is done
+	HANDLE paint_done_event;
 };
 
 // Forward declarations
@@ -214,14 +220,24 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	switch (message) {
 	case WM_ENTERSIZEMOVE:
 		InterlockedExchange(&w->in_size_move, TRUE);
+		InvalidateRect(hWnd, NULL, FALSE); // Kick off first WM_PAINT
 		return 0;
 
 	case WM_EXITSIZEMOVE:
 		InterlockedExchange(&w->in_size_move, FALSE);
+		SetEvent(w->paint_requested_event); // Unblock compositor if waiting
 		return 0;
 
 	case WM_PAINT:
-		// Validate to prevent continuous WM_PAINT messages
+		if (InterlockedCompareExchange(&w->in_size_move, 0, 0)) {
+			// During drag: trigger compositor render, wait for completion.
+			// The modal loop is paused while we wait, so the window position
+			// is stable between weave() and Present().
+			SetEvent(w->paint_requested_event);
+			WaitForSingleObject(w->paint_done_event, 100);
+			InvalidateRect(hWnd, NULL, FALSE); // Request next WM_PAINT
+			return 0;                          // Don't ValidateRect — keep region invalid
+		}
 		ValidateRect(hWnd, NULL);
 		break;
 
@@ -405,6 +421,18 @@ comp_d3d11_window_create(uint32_t width, uint32_t height, struct comp_d3d11_wind
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
 
+	// Create auto-reset events for WM_PAINT-synchronized rendering during drag
+	w->paint_requested_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+	w->paint_done_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+	if (w->paint_requested_event == NULL || w->paint_done_event == NULL) {
+		U_LOG_E("D3D11 window: Failed to create paint sync events");
+		if (w->paint_requested_event != NULL) CloseHandle(w->paint_requested_event);
+		if (w->paint_done_event != NULL) CloseHandle(w->paint_done_event);
+		CloseHandle(w->window_ready_event);
+		free(w);
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+
 	// Start window thread
 	w->thread_handle = CreateThread(NULL, 0, window_thread_func, w, 0, &w->thread_id);
 	if (w->thread_handle == NULL) {
@@ -470,6 +498,14 @@ comp_d3d11_window_destroy(struct comp_d3d11_window **window)
 		CloseHandle(w->window_ready_event);
 	}
 
+	if (w->paint_requested_event != NULL) {
+		CloseHandle(w->paint_requested_event);
+	}
+
+	if (w->paint_done_event != NULL) {
+		CloseHandle(w->paint_done_event);
+	}
+
 	free(w);
 	*window = NULL;
 }
@@ -530,4 +566,30 @@ comp_d3d11_window_set_repaint_callback(struct comp_d3d11_window *window,
 	(void)window;
 	(void)callback;
 	(void)userdata;
+}
+
+extern "C" bool
+comp_d3d11_window_wait_for_paint(struct comp_d3d11_window *window)
+{
+	if (window == NULL) {
+		return false;
+	}
+	if (!InterlockedCompareExchange(&window->in_size_move, 0, 0)) {
+		return false;
+	}
+
+	// Block until WM_PAINT fires (or drag ends via WM_EXITSIZEMOVE signal)
+	WaitForSingleObject(window->paint_requested_event, 50);
+
+	// Return true if we should render (still in drag), false if drag ended
+	return InterlockedCompareExchange(&window->in_size_move, 0, 0) != 0;
+}
+
+extern "C" void
+comp_d3d11_window_signal_paint_done(struct comp_d3d11_window *window)
+{
+	if (window == NULL) {
+		return;
+	}
+	SetEvent(window->paint_done_event);
 }

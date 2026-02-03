@@ -107,6 +107,27 @@ bool
 comp_d3d11_window_is_in_size_move(struct comp_d3d11_window *window);
 
 /*!
+ * Wait for a WM_PAINT request during drag. Returns true if compositor
+ * should render (drag in progress), false if drag ended.
+ * Only blocks during modal size-move. Returns false immediately otherwise.
+ *
+ * @param window The window object
+ *
+ * @return true if drag is in progress and compositor should render
+ */
+bool
+comp_d3d11_window_wait_for_paint(struct comp_d3d11_window *window);
+
+/*!
+ * Signal that the compositor has finished rendering and presenting.
+ * Unblocks the WM_PAINT handler so the modal drag loop can continue.
+ *
+ * @param window The window object
+ */
+void
+comp_d3d11_window_signal_paint_done(struct comp_d3d11_window *window);
+
+/*!
  * No-op. The dedicated window thread handles its own messages.
  *
  * Retained for API compatibility. Callers do not need to pump messages
