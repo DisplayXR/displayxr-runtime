@@ -151,8 +151,139 @@ The WM_PAINT trick is the correct approach: one thread, one D3D11 context, no ra
 
 ---
 
+## Monado's Dedicated Window Thread: Cross-Thread Paint Synchronization
+
+When apps use Monado without `XR_EXT_session_target` (no app-provided HWND), Monado creates its own window on a **dedicated thread**. This separates the window thread from the compositor thread, which introduces a different challenge.
+
+### The Architecture
+
+```
+Window Thread                          Compositor Thread
+────────────────                       ──────────────────
+HWND owner                             D3D11 rendering
+GetMessage loop                        xrWaitFrame/xrEndFrame
+WM_PAINT handler                       SR weaver + Present(1)
+```
+
+The window thread runs its own message loop, so the compositor thread is **not blocked** during drag — it continues calling `Present(1)`. However, this creates a **3D phase sync problem**.
+
+### The Phase Sync Problem
+
+The SR SDK weaver reads the window position **at weave time** via `GetClientRect()` + `ClientToScreen()`. During drag, the window position changes rapidly. If the compositor renders at position P₁ but DWM composites the frame when the window has moved to P₂, the interlacing pattern is wrong — the 3D effect breaks.
+
+```
+Timeline during drag (async rendering — BROKEN 3D):
+───────────────────────────────────────────────────
+Window:     P₁ ──────→ P₂ ──────→ P₃ ──────→ P₄
+Weaver:     weave(P₁)      weave(P₂)      weave(P₃)
+DWM shows:        ↓              ↓              ↓
+              frame@P₁       frame@P₂       frame@P₃
+              shown@P₂       shown@P₃       shown@P₄
+                 ↑              ↑              ↑
+              WRONG 3D       WRONG 3D       WRONG 3D
+```
+
+### The Solution: WM_PAINT-Synchronized Rendering
+
+We replicate the WM_PAINT trick's key property — **the window position is stable during render** — using cross-thread event synchronization:
+
+```
+Window Thread (modal drag loop)          Compositor Thread
+────────────────────────────────         ──────────────────
+WM_WINDOWPOSCHANGING → phase snap
+WM_PAINT fires:
+  SetEvent(paint_requested) ──────────→ xrWaitFrame unblocks
+  WaitForSingleObject(paint_done)        render → weave → Present(1)
+    (modal loop PAUSED — no             SetEvent(paint_done) ──────→
+     position changes!)
+  ←────────────────────────────────────
+  InvalidateRect (request next paint)
+  return 0
+WM_WINDOWPOSCHANGING → phase snap
+WM_PAINT fires again...
+```
+
+The key insight: **WM_PAINT blocks the modal drag loop**. While `WaitForSingleObject(paint_done)` waits, no `WM_WINDOWPOSCHANGING` or `WM_MOVE` messages are processed. The window position is frozen until the compositor signals completion.
+
+### Implementation
+
+**Window thread (comp_d3d11_window.cpp):**
+
+```cpp
+// Events for cross-thread synchronization
+HANDLE paint_requested_event;  // Auto-reset
+HANDLE paint_done_event;       // Auto-reset
+
+case WM_ENTERSIZEMOVE:
+    InterlockedExchange(&w->in_size_move, TRUE);
+    InvalidateRect(hWnd, NULL, FALSE);  // Kick off first WM_PAINT
+    return 0;
+
+case WM_EXITSIZEMOVE:
+    InterlockedExchange(&w->in_size_move, FALSE);
+    SetEvent(w->paint_requested_event);  // Unblock compositor if waiting
+    return 0;
+
+case WM_PAINT:
+    if (InterlockedCompareExchange(&w->in_size_move, 0, 0)) {
+        // During drag: trigger compositor render, wait for completion.
+        // The modal loop is paused while we wait, so the window position
+        // is stable between weave() and Present().
+        SetEvent(w->paint_requested_event);
+        WaitForSingleObject(w->paint_done_event, 100);
+        InvalidateRect(hWnd, NULL, FALSE);  // Request next WM_PAINT
+        return 0;
+    }
+    ValidateRect(hWnd, NULL);
+    break;
+```
+
+**Compositor thread (comp_d3d11_compositor.cpp):**
+
+```cpp
+// In wait_frame, before rendering:
+if (c->owns_window && comp_d3d11_window_is_in_size_move(c->own_window)) {
+    comp_d3d11_window_wait_for_paint(c->own_window);
+}
+
+// In layer_commit, after Present(1):
+if (c->owns_window && c->own_window != nullptr) {
+    comp_d3d11_window_signal_paint_done(c->own_window);
+}
+```
+
+### Result
+
+| Aspect | Before (async) | After (WM_PAINT sync) |
+|--------|---------------|----------------------|
+| During drag | Compositor renders freely, position races | Compositor waits for WM_PAINT |
+| Weave position | May differ from DWM composition position | Guaranteed to match |
+| 3D effect | Broken during drag | Correct during drag |
+| Frame rate | 60Hz | ~60Hz (paced by WM_PAINT + vsync) |
+
+### Known Limitation: Minor Resize Jitter
+
+The cross-thread architecture introduces a small visual artifact: **resize jitter** during drag. DWM may briefly stretch the previous frame to fit the new window bounds during the cross-thread round-trip. This is inherent to the architecture — the WM_PAINT trick on a same-thread app (like sr_cube_openxr_ext) does not have this artifact because render is inline with the modal loop.
+
+Attempts to reduce jitter with `DwmFlush()`, `ValidateRect` cycling, and longer timeouts were tested but made the 3D phase sync worse. The current implementation prioritizes correct 3D over perfectly smooth resize visuals.
+
+---
+
+## Summary: When to Use Each Technique
+
+| Scenario | Architecture | Technique |
+|----------|-------------|-----------|
+| App owns window (XR_EXT_session_target) | Single thread | WM_PAINT trick — render inline |
+| Monado owns window (no extension) | Cross-thread | WM_PAINT sync via events |
+
+Both achieve the same goal: **stable window position during weave + Present**. The cross-thread version uses synchronization primitives to achieve what the single-thread version gets for free.
+
+---
+
 ## References
 
 - Test app implementation: `test_apps/sr_cube_openxr_ext/` (D3D11 with WM_PAINT handling)
+- Monado window management: `src/xrt/compositor/d3d11/comp_d3d11_window.cpp`
+- Monado compositor integration: `src/xrt/compositor/d3d11/comp_d3d11_compositor.cpp`
 - Extension spec: `doc/XR_EXT_session_target/XR_EXT_session_target.md` (Section 4.3)
 - D3D11 renderer: `src/xrt/compositor/d3d11/comp_d3d11_renderer.cpp`
