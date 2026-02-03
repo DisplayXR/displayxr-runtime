@@ -843,6 +843,12 @@ client_d3d11_compositor_init_try_internal_blocking(struct client_d3d11_composito
 struct xrt_compositor_d3d11 *
 client_d3d11_compositor_create(struct xrt_compositor_native *xcn, ID3D11Device *device)
 try {
+	// Use OutputDebugString for diagnostics - visible in DebugView even in sandboxed processes
+	OutputDebugStringA("[SRMonado] client_d3d11_compositor_create: ENTER\n");
+
+	char dbg_buf[256];
+	snprintf(dbg_buf, sizeof(dbg_buf), "[SRMonado] client_d3d11_compositor_create: xcn=%p, device=%p\n", (void*)xcn, (void*)device);
+	OutputDebugStringA(dbg_buf);
 	U_LOG_W("client_d3d11_compositor_create: xcn=%p, device=%p", (void*)xcn, (void*)device);
 
 	std::unique_ptr<struct client_d3d11_compositor> c = std::make_unique<struct client_d3d11_compositor>();
@@ -850,17 +856,23 @@ try {
 	c->xcn = xcn;
 
 	// Log incoming format info from IPC compositor
+	snprintf(dbg_buf, sizeof(dbg_buf), "[SRMonado] IPC compositor format_count=%u\n", xcn->base.info.format_count);
+	OutputDebugStringA(dbg_buf);
 	U_LOG_W("client_d3d11_compositor_create: IPC compositor format_count=%u", xcn->base.info.format_count);
 	for (uint32_t i = 0; i < xcn->base.info.format_count && i < 8; i++) {
+		snprintf(dbg_buf, sizeof(dbg_buf), "[SRMonado]   format[%u] = %lld (VkFormat)\n", i, (long long)xcn->base.info.formats[i]);
+		OutputDebugStringA(dbg_buf);
 		U_LOG_W("  format[%u] = 0x%llx (VkFormat)", i, (unsigned long long)xcn->base.info.formats[i]);
 	}
 
 	wil::com_ptr<ID3D11Device> app_dev{device};
 	if (!app_dev.try_query_to(c->app_device.put())) {
+		OutputDebugStringA("[SRMonado] ERROR: Could not query ID3D11Device5 from app device!\n");
 		U_LOG_E("client_d3d11_compositor_create: Could not query ID3D11Device5 from app device!");
 		U_LOG_E("  This usually means the D3D11 feature level is too low (need 11_1 or higher)");
 		return nullptr;
 	}
+	OutputDebugStringA("[SRMonado] Got ID3D11Device5 from app device\n");
 	U_LOG_W("client_d3d11_compositor_create: Got ID3D11Device5 from app device");
 	c->app_device->GetImmediateContext3(c->app_context.put());
 
@@ -946,20 +958,29 @@ try {
 	U_LOG_W("client_d3d11_compositor_create: Final format_count=%u", count);
 
 	if (count == 0) {
+		OutputDebugStringA("[SRMonado] ERROR: No compatible DXGI formats found!\n");
 		U_LOG_E("client_d3d11_compositor_create: No compatible DXGI formats found!");
 		U_LOG_E("  IPC compositor reported %u formats but none are usable for D3D11", xcn->base.info.format_count);
 		// Don't return nullptr here - let the caller handle zero formats
 	}
 
+	OutputDebugStringA("[SRMonado] client_d3d11_compositor_create: SUCCESS\n");
 	U_LOG_W("client_d3d11_compositor_create: SUCCESS - D3D11 client compositor ready");
 	return &(c.release()->base);
 } catch (wil::ResultException const &e) {
+	char dbg_buf[512];
+	snprintf(dbg_buf, sizeof(dbg_buf), "[SRMonado] WIL EXCEPTION: %s\n", e.what());
+	OutputDebugStringA(dbg_buf);
 	U_LOG_E("Error creating D3D11 client compositor: %s", e.what());
 	return nullptr;
 } catch (std::exception const &e) {
+	char dbg_buf[512];
+	snprintf(dbg_buf, sizeof(dbg_buf), "[SRMonado] STD EXCEPTION: %s\n", e.what());
+	OutputDebugStringA(dbg_buf);
 	U_LOG_E("Error creating D3D11 client compositor: %s", e.what());
 	return nullptr;
 } catch (...) {
+	OutputDebugStringA("[SRMonado] UNKNOWN EXCEPTION in client_d3d11_compositor_create!\n");
 	U_LOG_E("Error creating D3D11 client compositor");
 	return nullptr;
 }
