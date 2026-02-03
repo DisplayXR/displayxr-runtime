@@ -335,6 +335,10 @@ mnd_root_get_client_state(mnd_root_t *root, uint32_t client_id, uint32_t *out_fl
 	flags |= (!iob->block_poses && !iob->block_hand_tracking && !iob->block_inputs && !iob->block_outputs)
 	             ? MND_CLIENT_IO_ACTIVE
 	             : 0u;
+	flags |= (iob->block_poses) ? MND_CLIENT_POSES_BLOCKED : 0u;
+	flags |= (iob->block_hand_tracking) ? MND_CLIENT_HT_BLOCKED : 0u;
+	flags |= (iob->block_inputs) ? MND_CLIENT_INPUTS_BLOCKED : 0u;
+	flags |= (iob->block_outputs) ? MND_CLIENT_OUTPUTS_BLOCKED : 0u;
 	*out_flags = flags;
 
 	return MND_SUCCESS;
@@ -379,6 +383,26 @@ mnd_root_toggle_client_io_active(mnd_root_t *root, uint32_t client_id)
 	xrt_result_t r = ipc_call_system_toggle_io_client(&root->ipc_c, client_id);
 	if (r != XRT_SUCCESS) {
 		PE("Failed to toggle io for client id: %u.\n", client_id);
+		return MND_ERROR_OPERATION_FAILED;
+	}
+
+	return MND_SUCCESS;
+}
+
+mnd_result_t
+mnd_root_set_client_io_blocks(mnd_root_t *root, uint32_t client_id, mnd_io_block_flags_t block_flags)
+{
+	CHECK_NOT_NULL(root);
+	CHECK_CLIENT_ID(client_id);
+
+	struct ipc_client_io_blocks blocks = {0};
+	blocks.block_poses = block_flags & MND_IO_BLOCK_POSES;
+	blocks.block_hand_tracking = block_flags & MND_IO_BLOCK_HT;
+	blocks.block_inputs = block_flags & MND_IO_BLOCK_INPUTS;
+	blocks.block_outputs = block_flags & MND_IO_BLOCK_OUTPUTS;
+	xrt_result_t r = ipc_call_system_set_client_io_blocks(&root->ipc_c, client_id, &blocks);
+	if (r != XRT_SUCCESS) {
+		PE("Failed to set io blocks for client id: %u.\n", client_id);
 		return MND_ERROR_OPERATION_FAILED;
 	}
 
