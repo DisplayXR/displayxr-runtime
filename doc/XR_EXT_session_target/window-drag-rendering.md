@@ -1,5 +1,20 @@
 # Rendering During Window Drag: WM_PAINT Trick vs. Render Thread
 
+## Two Scenarios: App-Owned vs. Runtime-Owned Window
+
+This document covers **window drag handling** for the D3D11 native compositor. There are two distinct scenarios depending on who owns the window:
+
+| Scenario | Window Owner | Extension | Example App | Section |
+|----------|-------------|-----------|-------------|---------|
+| **App-owned window** | Application creates HWND, passes to runtime | `XR_EXT_session_target` | `sr_cube_openxr_ext` | [WM_PAINT Trick](#solution-the-wm_paint-trick) |
+| **Runtime-owned window** | Monado creates HWND on dedicated thread | None (standard OpenXR) | `sr_cube_openxr`, Blender | [Cross-Thread Sync](#monados-dedicated-window-thread-cross-thread-paint-synchronization) |
+
+**Key difference:**
+- **App-owned**: App controls the message pump. Rendering and window messages are on the **same thread**. The app can render inside `WM_PAINT` directly.
+- **Runtime-owned**: Monado's window thread is **separate** from the compositor thread. Cross-thread synchronization is required to keep the window position stable during render.
+
+---
+
 ## The Problem
 
 When a user drags or resizes a Win32 window, Windows enters a **modal message loop** inside `DefWindowProc`. The application's normal frame loop stops executing entirely — Windows does not return control until the user releases the mouse button.
@@ -47,7 +62,9 @@ The application's game loop is **blocked** at `DefWindowProc()`, waiting for it 
 
 ---
 
-## Solution: The WM_PAINT Trick
+## App-Owned Window: The WM_PAINT Trick
+
+> **Applies to:** Apps using `XR_EXT_session_target` that create their own HWND and pass it to the runtime (e.g., `sr_cube_openxr_ext`).
 
 Even though Windows hijacked the message loop, it still **dispatches `WM_PAINT` messages** to the application's `WndProc`. The trick exploits this to sneak render frames into the modal loop:
 
@@ -151,7 +168,9 @@ The WM_PAINT trick is the correct approach: one thread, one D3D11 context, no ra
 
 ---
 
-## Monado's Dedicated Window Thread: Cross-Thread Paint Synchronization
+## Runtime-Owned Window: Cross-Thread Paint Synchronization
+
+> **Applies to:** Apps that do NOT use `XR_EXT_session_target`. Monado creates and owns the window (e.g., `sr_cube_openxr`, Blender).
 
 When apps use Monado without `XR_EXT_session_target` (no app-provided HWND), Monado creates its own window on a **dedicated thread**. This separates the window thread from the compositor thread, which introduces a different challenge.
 
