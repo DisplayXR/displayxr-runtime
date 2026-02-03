@@ -1325,7 +1325,7 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 	};
 
 	U_LOG_W("[per-session] Submitting command buffer with fence (signal_sem=%p)...", (void *)signal_sem);
-	ret = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, mc->session_render.fences[buffer_index])
+	ret = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, mc->session_render.fences[buffer_index]);
 	if (ret != VK_SUCCESS) {
 		U_LOG_E("[per-session] Failed to submit per-session render: %s", vk_result_string(ret));
 		return;
