@@ -12,6 +12,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "xrt/xrt_config_os.h"
+#ifdef XRT_OS_WINDOWS
+#include "xrt/xrt_windows.h"
+#endif
+
 #include "math/m_space.h"
 #include "xrt/xrt_compiler.h"
 
@@ -128,6 +133,10 @@ oxr_xrWaitFrame(XrSession session, const XrFrameWaitInfo *frameWaitInfo, XrFrame
 {
 	OXR_TRACE_MARKER();
 
+#ifdef XRT_OS_WINDOWS
+	OutputDebugStringA("[SRMonado] oxr_xrWaitFrame: API ENTRY\n");
+#endif
+
 	struct oxr_session *sess;
 	struct oxr_logger log;
 	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrWaitFrame");
@@ -137,13 +146,31 @@ oxr_xrWaitFrame(XrSession session, const XrFrameWaitInfo *frameWaitInfo, XrFrame
 	OXR_VERIFY_ARG_TYPE_AND_NOT_NULL(&log, frameState, XR_TYPE_FRAME_STATE);
 	OXR_VERIFY_ARG_NOT_NULL(&log, frameState);
 
-	return oxr_session_frame_wait(&log, sess, frameState);
+#ifdef XRT_OS_WINDOWS
+	OutputDebugStringA("[SRMonado] oxr_xrWaitFrame: Calling oxr_session_frame_wait\n");
+#endif
+
+	XrResult res = oxr_session_frame_wait(&log, sess, frameState);
+
+#ifdef XRT_OS_WINDOWS
+	{
+		char buf[128];
+		snprintf(buf, sizeof(buf), "[SRMonado] oxr_xrWaitFrame: result=%d\n", (int)res);
+		OutputDebugStringA(buf);
+	}
+#endif
+
+	return res;
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrBeginFrame(XrSession session, const XrFrameBeginInfo *frameBeginInfo)
 {
 	OXR_TRACE_MARKER();
+
+#ifdef XRT_OS_WINDOWS
+	OutputDebugStringA("[SRMonado] oxr_xrBeginFrame: API ENTRY\n");
+#endif
 
 	struct oxr_session *sess;
 	struct oxr_logger log;
@@ -154,6 +181,14 @@ oxr_xrBeginFrame(XrSession session, const XrFrameBeginInfo *frameBeginInfo)
 	OXR_VERIFY_ARG_TYPE_CAN_BE_NULL(&log, frameBeginInfo, XR_TYPE_FRAME_BEGIN_INFO);
 
 	XrResult res = oxr_session_frame_begin(&log, sess);
+
+#ifdef XRT_OS_WINDOWS
+	{
+		char buf[128];
+		snprintf(buf, sizeof(buf), "[SRMonado] oxr_xrBeginFrame: result=%d\n", (int)res);
+		OutputDebugStringA(buf);
+	}
+#endif
 
 #ifdef XRT_FEATURE_RENDERDOC
 	if (sess->sys->inst->rdoc_api) {
@@ -170,6 +205,10 @@ XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrEndFrame(XrSession session, const XrFrameEndInfo *frameEndInfo)
 {
 	OXR_TRACE_MARKER();
+
+#ifdef XRT_OS_WINDOWS
+	OutputDebugStringA("[SRMonado] oxr_xrEndFrame: API ENTRY\n");
+#endif
 
 	struct oxr_session *sess;
 	struct oxr_logger log;
