@@ -1625,16 +1625,6 @@ do_synchronize_state_change(struct oxr_logger *log, struct oxr_session *sess)
 	if (!sess->has_ended_once && sess->state < XR_SESSION_STATE_VISIBLE) {
 		oxr_session_change_state(log, sess, XR_SESSION_STATE_SYNCHRONIZED, 0);
 		sess->has_ended_once = true;
-
-		// For D3D11 native compositor (and similar simple compositors) that
-		// set visibility/focus flags during session creation, we delay the
-		// VISIBLE/FOCUSED transitions until here (first xrEndFrame) rather
-		// than doing them immediately in xrBeginSession. This matches SRHydra
-		// behavior and is required for Chrome WebXR compatibility.
-		if (sess->compositor_visible && sess->compositor_focused) {
-			oxr_session_change_state(log, sess, XR_SESSION_STATE_VISIBLE, 0);
-			oxr_session_change_state(log, sess, XR_SESSION_STATE_FOCUSED, 0);
-		}
 	}
 }
 
