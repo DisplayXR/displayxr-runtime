@@ -270,8 +270,17 @@ client_d3d11_swapchain_acquire_image(struct xrt_swapchain *xsc, uint32_t *out_in
 {
 	struct client_d3d11_swapchain *sc = as_client_d3d11_swapchain(xsc);
 
+	OutputDebugStringA("[SRMonado] xrAcquireSwapchainImage: ENTER\n");
+
 	// Pipe down call into imported swapchain in native compositor.
-	return xrt_swapchain_acquire_image(sc->xsc.get(), out_index);
+	xrt_result_t xret = xrt_swapchain_acquire_image(sc->xsc.get(), out_index);
+
+	char buf[128];
+	snprintf(buf, sizeof(buf), "[SRMonado] xrAcquireSwapchainImage: result=%d, index=%u\n",
+	         (int)xret, out_index ? *out_index : 0xFFFFFFFF);
+	OutputDebugStringA(buf);
+
+	return xret;
 }
 
 static xrt_result_t
@@ -279,12 +288,23 @@ client_d3d11_swapchain_wait_image(struct xrt_swapchain *xsc, int64_t timeout_ns,
 {
 	struct client_d3d11_swapchain *sc = as_client_d3d11_swapchain(xsc);
 
+	char buf[256];
+	snprintf(buf, sizeof(buf), "[SRMonado] xrWaitSwapchainImage: ENTER index=%u, timeout=%lld ns\n",
+	         index, (long long)timeout_ns);
+	OutputDebugStringA(buf);
+
 	// Pipe down call into imported swapchain in native compositor.
 	xrt_result_t xret = xrt_swapchain_wait_image(sc->xsc.get(), timeout_ns, index);
 
+	snprintf(buf, sizeof(buf), "[SRMonado] xrWaitSwapchainImage: IPC wait result=%d\n", (int)xret);
+	OutputDebugStringA(buf);
+
 	if (xret == XRT_SUCCESS) {
 		// OK, we got the image in the native compositor, now need the keyed mutex in d3d11.
+		OutputDebugStringA("[SRMonado] xrWaitSwapchainImage: Acquiring KeyedMutex...\n");
 		xret = sc->data->keyed_mutex_collection.waitKeyedMutex(index, timeout_ns);
+		snprintf(buf, sizeof(buf), "[SRMonado] xrWaitSwapchainImage: KeyedMutex acquire result=%d\n", (int)xret);
+		OutputDebugStringA(buf);
 	}
 
 	//! @todo discard old contents?
@@ -302,12 +322,22 @@ client_d3d11_swapchain_release_image(struct xrt_swapchain *xsc, uint32_t index)
 {
 	struct client_d3d11_swapchain *sc = as_client_d3d11_swapchain(xsc);
 
+	char buf[128];
+	snprintf(buf, sizeof(buf), "[SRMonado] xrReleaseSwapchainImage: ENTER index=%u\n", index);
+	OutputDebugStringA(buf);
+
 	// Pipe down call into imported swapchain in native compositor.
 	xrt_result_t xret = xrt_swapchain_release_image(sc->xsc.get(), index);
 
+	snprintf(buf, sizeof(buf), "[SRMonado] xrReleaseSwapchainImage: IPC release result=%d\n", (int)xret);
+	OutputDebugStringA(buf);
+
 	if (xret == XRT_SUCCESS) {
 		// Release the keyed mutex
+		OutputDebugStringA("[SRMonado] xrReleaseSwapchainImage: Releasing KeyedMutex...\n");
 		xret = sc->data->keyed_mutex_collection.releaseKeyedMutex(index);
+		snprintf(buf, sizeof(buf), "[SRMonado] xrReleaseSwapchainImage: KeyedMutex release result=%d\n", (int)xret);
+		OutputDebugStringA(buf);
 	}
 	return xret;
 }
@@ -619,8 +649,17 @@ client_d3d11_compositor_wait_frame(struct xrt_compositor *xc,
 {
 	struct client_d3d11_compositor *c = as_client_d3d11_compositor(xc);
 
+	OutputDebugStringA("[SRMonado] xrWaitFrame: ENTER\n");
+
 	// Pipe down call into native compositor.
-	return xrt_comp_wait_frame(&c->xcn->base, out_frame_id, predicted_display_time, predicted_display_period);
+	xrt_result_t xret = xrt_comp_wait_frame(&c->xcn->base, out_frame_id, predicted_display_time, predicted_display_period);
+
+	char buf[256];
+	snprintf(buf, sizeof(buf), "[SRMonado] xrWaitFrame: result=%d, frame_id=%lld\n",
+	         (int)xret, out_frame_id ? (long long)*out_frame_id : -1);
+	OutputDebugStringA(buf);
+
+	return xret;
 }
 
 static xrt_result_t
@@ -628,8 +667,17 @@ client_d3d11_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 {
 	struct client_d3d11_compositor *c = as_client_d3d11_compositor(xc);
 
+	char buf[128];
+	snprintf(buf, sizeof(buf), "[SRMonado] xrBeginFrame: ENTER frame_id=%lld\n", (long long)frame_id);
+	OutputDebugStringA(buf);
+
 	// Pipe down call into native compositor.
-	return xrt_comp_begin_frame(&c->xcn->base, frame_id);
+	xrt_result_t xret = xrt_comp_begin_frame(&c->xcn->base, frame_id);
+
+	snprintf(buf, sizeof(buf), "[SRMonado] xrBeginFrame: result=%d\n", (int)xret);
+	OutputDebugStringA(buf);
+
+	return xret;
 }
 
 static xrt_result_t
@@ -804,31 +852,46 @@ client_d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_syn
 {
 	struct client_d3d11_compositor *c = as_client_d3d11_compositor(xc);
 
+	OutputDebugStringA("[SRMonado] xrEndFrame (layer_commit): ENTER\n");
+
 	// We make the sync object, not st/oxr which is our user.
 	assert(!xrt_graphics_sync_handle_is_valid(sync_handle));
 
 	xrt_result_t xret = XRT_SUCCESS;
 	if (c->fence) {
 		c->timeline_semaphore_value++;
+		char buf[128];
+		snprintf(buf, sizeof(buf), "[SRMonado] xrEndFrame: Signaling fence value=%llu\n",
+		         (unsigned long long)c->timeline_semaphore_value);
+		OutputDebugStringA(buf);
+
 		HRESULT hr = c->fence_context->Signal(c->fence.get(), c->timeline_semaphore_value);
 		if (!SUCCEEDED(hr)) {
 			char buf[kErrorBufSize];
 			formatMessage(hr, buf);
 			D3D_ERROR(c, "Error signaling fence: %s", buf);
+			OutputDebugStringA("[SRMonado] xrEndFrame: FENCE SIGNAL FAILED!\n");
 			return xrt_comp_layer_commit(&c->xcn->base, XRT_GRAPHICS_SYNC_HANDLE_INVALID);
 		}
+		OutputDebugStringA("[SRMonado] xrEndFrame: Fence signaled OK\n");
 	}
 
 	if (c->timeline_semaphore) {
 		// We got this from the native compositor, so we can pass it back
-		return xrt_comp_layer_commit_with_semaphore( //
+		OutputDebugStringA("[SRMonado] xrEndFrame: Using timeline semaphore commit\n");
+		xret = xrt_comp_layer_commit_with_semaphore( //
 		    &c->xcn->base,                           //
 		    c->timeline_semaphore.get(),             //
 		    c->timeline_semaphore_value);            //
+		char buf[128];
+		snprintf(buf, sizeof(buf), "[SRMonado] xrEndFrame: commit_with_semaphore result=%d\n", (int)xret);
+		OutputDebugStringA(buf);
+		return xret;
 	}
 
 	if (c->fence) {
 		// Wait on it ourselves, if we have it and didn't tell the native compositor to wait on it.
+		OutputDebugStringA("[SRMonado] xrEndFrame: Waiting on fence locally...\n");
 		xret = xrt::auxiliary::d3d::d3d11::waitOnFenceWithTimeout( //
 		    c->fence,                                              //
 		    c->local_wait_event,                                   //
@@ -840,12 +903,21 @@ client_d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_syn
 			u_pp(dg, "Problem waiting on fence: ");
 			u_pp_xrt_result(dg, xret);
 			D3D_ERROR(c, "%s", sink.buffer);
+			OutputDebugStringA("[SRMonado] xrEndFrame: FENCE WAIT FAILED!\n");
 
 			return xret;
 		}
+		OutputDebugStringA("[SRMonado] xrEndFrame: Fence wait completed\n");
 	}
 
-	return xrt_comp_layer_commit(&c->xcn->base, XRT_GRAPHICS_SYNC_HANDLE_INVALID);
+	OutputDebugStringA("[SRMonado] xrEndFrame: Calling IPC layer_commit...\n");
+	xret = xrt_comp_layer_commit(&c->xcn->base, XRT_GRAPHICS_SYNC_HANDLE_INVALID);
+	{
+		char buf[128];
+		snprintf(buf, sizeof(buf), "[SRMonado] xrEndFrame: IPC layer_commit result=%d\n", (int)xret);
+		OutputDebugStringA(buf);
+	}
+	return xret;
 }
 
 
