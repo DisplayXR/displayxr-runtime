@@ -23,8 +23,9 @@
 extern "C" {
 #endif
 
-// Forward declaration - opaque handle to window management
+// Forward declarations
 struct comp_d3d11_window;
+struct xrt_system_devices;
 
 /*!
  * Create a self-owned window for the D3D11 compositor.
@@ -152,6 +153,20 @@ void
 comp_d3d11_window_set_repaint_callback(struct comp_d3d11_window *window,
                                         void (*callback)(void *userdata),
                                         void *userdata);
+
+/*!
+ * Set the system devices for qwerty input handling.
+ *
+ * When set, the window will forward keyboard/mouse input to the qwerty driver
+ * if QWERTY_ENABLE=true is set. This allows direct input from the D3D11 window
+ * without requiring the SDL debug GUI.
+ *
+ * @param window The window object
+ * @param xsysd  The system devices (can be NULL to disable input handling)
+ */
+void
+comp_d3d11_window_set_system_devices(struct comp_d3d11_window *window,
+                                      struct xrt_system_devices *xsysd);
 
 #ifdef __cplusplus
 }

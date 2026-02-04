@@ -1285,19 +1285,23 @@ extern "C" void
 comp_d3d11_compositor_set_system_devices(struct xrt_compositor *xc,
                                           struct xrt_system_devices *xsysd)
 {
-#ifdef XRT_FEATURE_DEBUG_GUI
 	if (xc == nullptr) {
 		return;
 	}
 
 	struct comp_d3d11_compositor *c = d3d11_comp(xc);
+
+#ifdef XRT_FEATURE_DEBUG_GUI
 	c->xsysd = xsysd;
 
 	if (xsysd != nullptr) {
 		U_LOG_I("D3D11 compositor: system devices set for debug GUI qwerty support");
 	}
-#else
-	(void)xc;
-	(void)xsysd;
 #endif
+
+	// Pass xsysd to self-owned window for direct qwerty input from main window
+	// This enables WASDQE controls without requiring the SDL debug window
+	if (c->owns_window && c->own_window != nullptr) {
+		comp_d3d11_window_set_system_devices(c->own_window, xsysd);
+	}
 }

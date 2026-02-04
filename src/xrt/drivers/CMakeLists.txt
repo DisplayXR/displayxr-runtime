@@ -71,14 +71,20 @@ if(XRT_BUILD_DRIVER_TWRAP)
 endif()
 
 if(XRT_BUILD_DRIVER_QWERTY)
-	add_library(
-		drv_qwerty STATIC
+	set(QWERTY_SOURCES
 		qwerty/qwerty_device.c
 		qwerty/qwerty_device.h
 		qwerty/qwerty_interface.h
 		qwerty/qwerty_prober.c
 		qwerty/qwerty_sdl.c
-		)
+	)
+
+	# On Windows, add Win32 input handler for D3D11 compositor direct input
+	if(WIN32)
+		list(APPEND QWERTY_SOURCES qwerty/qwerty_win32.c)
+	endif()
+
+	add_library(drv_qwerty STATIC ${QWERTY_SOURCES})
 	target_link_libraries(drv_qwerty PRIVATE xrt-interfaces aux_util SDL2::SDL2)
 	list(APPEND ENABLED_DRIVERS qwerty)
 
