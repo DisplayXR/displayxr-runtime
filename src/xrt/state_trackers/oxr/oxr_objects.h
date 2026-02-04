@@ -34,6 +34,7 @@
 #include "oxr_subaction.h"
 #include "oxr_defines.h"
 #include "oxr_frame_sync.h"
+#include "oxr_forward_declarations.h"
 
 #if defined(XRT_HAVE_D3D11) || defined(XRT_HAVE_D3D12)
 #include <dxgi.h>
@@ -97,49 +98,8 @@ extern "C" {
  */
 
 
-/*
- *
- * Forward declare structs.
- *
- */
-
-struct xrt_instance;
-struct oxr_logger;
-struct oxr_extension_status;
-struct oxr_instance;
-struct oxr_system;
-struct oxr_session;
-struct oxr_roles;
-struct oxr_event;
-struct oxr_swapchain;
-struct oxr_space;
-struct oxr_action_set;
-struct oxr_action;
-struct oxr_debug_messenger;
-struct oxr_handle_base;
-struct oxr_subaction_paths;
-struct oxr_action_attachment;
-struct oxr_action_set_attachment;
-struct oxr_action_input;
-struct oxr_action_output;
-struct oxr_dpad_state;
-struct oxr_binding;
-struct oxr_interaction_profile;
-struct oxr_action_set_ref;
-struct oxr_action_ref;
-struct oxr_hand_tracker;
-struct oxr_face_tracker_android;
-struct oxr_facial_tracker_htc;
-struct oxr_face_tracker2_fb;
-struct oxr_body_tracker_fb;
-struct oxr_body_tracker_bd;
-struct oxr_xdev_list;
-struct oxr_plane_detector_ext;
-
 #define XRT_MAX_HANDLE_CHILDREN 256
 #define OXR_MAX_BINDINGS_PER_ACTION 32
-
-struct time_state;
 
 /*!
  * Function pointer type for a handle destruction function.

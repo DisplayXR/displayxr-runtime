@@ -11,6 +11,8 @@ add_subdirectory(extension_support)
 
 add_library(
 	st_oxr STATIC
+	common/oxr_defines.h
+	common/oxr_forward_declarations.h
 	oxr_api_action.c
 	oxr_api_funcs.h
 	oxr_api_instance.c
@@ -54,6 +56,9 @@ add_library(
 	${CMAKE_CURRENT_BINARY_DIR}/bindings/oxr_generated_bindings.h
 	${CMAKE_CURRENT_BINARY_DIR}/extension_support/oxr_extension_support.h
 	)
+
+# For OpenXR unit tests to find common files like oxr_defines.h file.
+target_include_directories(st_oxr PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/common)
 
 # To generate the oxr_generated_bindings.c and oxr_generated_bindings.h files.
 add_dependencies(st_oxr generate_oxr_bindings)

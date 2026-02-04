@@ -14,6 +14,10 @@
 #include "xrt/xrt_compiler.h"
 
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // For corruption and layer checking.
 // clang-format off
 #define OXR_XR_DEBUG_INSTANCE                         (*(uint64_t *)"oxrinst\0")
@@ -136,3 +140,7 @@ enum oxr_session_graphics_ext
 	OXR_SESSION_GRAPHICS_EXT_ANDROID_GLES,
 	OXR_SESSION_GRAPHICS_EXT_EGL,
 };
+
+#ifdef __cplusplus
+}
+#endif
