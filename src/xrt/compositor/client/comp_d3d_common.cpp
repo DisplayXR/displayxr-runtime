@@ -13,6 +13,9 @@
 #include "util/u_logging.h"
 #include "util/u_time.h"
 
+#include "xrt/xrt_windows.h"  // For OutputDebugStringA
+#include <stdio.h>
+
 
 
 #define D3D_COMMON_SPEW(log_level, ...) U_LOG_IFL_T(log_level, __VA_ARGS__);
@@ -38,14 +41,35 @@ KeyedMutexCollection::KeyedMutexCollection(u_logging_level log_level) noexcept :
 xrt_result_t
 KeyedMutexCollection::init(const std::vector<wil::com_ptr<ID3D11Texture2D1>> &images) noexcept
 try {
+	char dbg_buf[256];
+	snprintf(dbg_buf, sizeof(dbg_buf), "[SRMonado] KeyedMutexCollection::init: %zu images\n", images.size());
+	OutputDebugStringA(dbg_buf);
+
 	keyed_mutex_collection.clear();
 	keyed_mutex_collection.reserve(images.size());
-	for (const auto &image : images) {
-		keyed_mutex_collection.emplace_back(image.query<IDXGIKeyedMutex>());
+	for (size_t i = 0; i < images.size(); ++i) {
+		const auto &image = images[i];
+		try {
+			keyed_mutex_collection.emplace_back(image.query<IDXGIKeyedMutex>());
+			snprintf(dbg_buf, sizeof(dbg_buf),
+			         "[SRMonado] KeyedMutex[%zu]: acquired from texture %p\n",
+			         i, (void*)image.get());
+			OutputDebugStringA(dbg_buf);
+		} catch (wil::ResultException const &e) {
+			snprintf(dbg_buf, sizeof(dbg_buf),
+			         "[SRMonado] KeyedMutex[%zu] FAILED: %s\n", i, e.what());
+			OutputDebugStringA(dbg_buf);
+			throw;
+		}
 	}
 
 	keyed_mutex_acquired.clear();
 	keyed_mutex_acquired.resize(keyed_mutex_collection.size());
+
+	snprintf(dbg_buf, sizeof(dbg_buf),
+	         "[SRMonado] KeyedMutexCollection::init SUCCESS: %zu mutexes\n",
+	         keyed_mutex_collection.size());
+	OutputDebugStringA(dbg_buf);
 	return XRT_SUCCESS;
 } catch (wil::ResultException const &e) {
 	U_LOG_E("Error getting keyed mutex collection for swapchain: %s", e.what());

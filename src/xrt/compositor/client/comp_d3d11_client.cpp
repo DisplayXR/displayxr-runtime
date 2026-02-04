@@ -436,17 +436,49 @@ try {
 		data->dxgi_handles.push_back(handle);
 
 		D3D_DEBUG(c, "Importing server texture [%u]: handle=%p, is_dxgi=%d", i, handle, is_dxgi);
+		{
+			char dbg_buf[256];
+			snprintf(dbg_buf, sizeof(dbg_buf),
+			         "[SRMonado] Importing texture [%u]: handle=%p, is_dxgi=%d\n",
+			         i, handle, is_dxgi);
+			OutputDebugStringA(dbg_buf);
+		}
+
 		wil::com_ptr<ID3D11Texture2D1> image;
-		if (is_dxgi) {
-			// Legacy DXGI global handle - use OpenSharedResource
-			image = import_image_dxgi(*(c->app_device), handle);
-		} else {
-			// NT handle - use OpenSharedResource1
-			image = import_image(*(c->app_device), handle);
+		try {
+			if (is_dxgi) {
+				// Legacy DXGI global handle - use OpenSharedResource
+				image = import_image_dxgi(*(c->app_device), handle);
+			} else {
+				// NT handle - use OpenSharedResource1
+				image = import_image(*(c->app_device), handle);
+			}
+		} catch (wil::ResultException const &e) {
+			// Extract HRESULT and log detailed error
+			char dbg_buf[512];
+			snprintf(dbg_buf, sizeof(dbg_buf),
+			         "[SRMonado] IMPORT FAILED [%u]: handle=%p, is_dxgi=%d, error=%s\n",
+			         i, handle, is_dxgi, e.what());
+			OutputDebugStringA(dbg_buf);
+			D3D_ERROR(c, "Failed to import texture [%u]: %s", i, e.what());
+			D3D_ERROR(c, "  Handle=%p, is_dxgi=%d", handle, is_dxgi);
+			D3D_ERROR(c, "  Common causes: adapter LUID mismatch, invalid handle, security descriptor");
+			return XRT_ERROR_SWAPCHAIN_FLAG_VALID_BUT_UNSUPPORTED;
 		}
 		if (!image) {
+			char dbg_buf[256];
+			snprintf(dbg_buf, sizeof(dbg_buf),
+			         "[SRMonado] IMPORT RETURNED NULL [%u]: handle=%p, is_dxgi=%d\n",
+			         i, handle, is_dxgi);
+			OutputDebugStringA(dbg_buf);
 			D3D_ERROR(c, "Failed to import server texture [%u] with handle %p (is_dxgi=%d)", i, handle, is_dxgi);
 			return XRT_ERROR_SWAPCHAIN_FLAG_VALID_BUT_UNSUPPORTED;
+		}
+		{
+			char dbg_buf[256];
+			snprintf(dbg_buf, sizeof(dbg_buf),
+			         "[SRMonado] Import SUCCESS [%u]: texture=%p\n", i, (void*)image.get());
+			OutputDebugStringA(dbg_buf);
 		}
 
 		// Put the image where the OpenXR state tracker can get it
@@ -904,6 +936,31 @@ try {
 	wil::com_ptr<IDXGIAdapter> adapter;
 
 	THROW_IF_FAILED(app_dev.query<IDXGIDevice>()->GetAdapter(adapter.put()));
+
+	// Log the adapter LUID - this MUST match the service compositor's LUID for cross-process texture sharing
+	{
+		DXGI_ADAPTER_DESC adapter_desc = {};
+		HRESULT hr = adapter->GetDesc(&adapter_desc);
+		if (SUCCEEDED(hr)) {
+			snprintf(dbg_buf, sizeof(dbg_buf),
+			         "[SRMonado] Client D3D11 adapter LUID: %08lx-%08lx (MUST match service LUID)\n",
+			         adapter_desc.AdapterLuid.HighPart, adapter_desc.AdapterLuid.LowPart);
+			OutputDebugStringA(dbg_buf);
+			U_LOG_W("Client D3D11 adapter LUID: %08lx-%08lx (must match service for texture sharing)",
+			        adapter_desc.AdapterLuid.HighPart, adapter_desc.AdapterLuid.LowPart);
+
+			// Also log adapter name for debugging multi-GPU systems
+			char adapter_name[128];
+			wcstombs(adapter_name, adapter_desc.Description, sizeof(adapter_name) - 1);
+			adapter_name[sizeof(adapter_name) - 1] = '\0';
+			snprintf(dbg_buf, sizeof(dbg_buf), "[SRMonado] Client adapter: %s\n", adapter_name);
+			OutputDebugStringA(dbg_buf);
+			U_LOG_W("Client adapter: %s", adapter_name);
+		} else {
+			OutputDebugStringA("[SRMonado] WARNING: Could not get adapter LUID!\n");
+			U_LOG_W("Could not get adapter LUID - HRESULT=0x%08lx", (unsigned long)hr);
+		}
+	}
 
 	{
 		// Now, try to get an equivalent device of our own
