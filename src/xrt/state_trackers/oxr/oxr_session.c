@@ -499,13 +499,13 @@ oxr_session_begin(struct oxr_logger *log, struct oxr_session *sess, const XrSess
 
 		// D3D11 native compositor (and similar simple compositors) may set
 		// visibility/focus flags during session creation because they don't
-		// use the multi-compositor event system. If flags are already set,
-		// trigger state transitions directly like headless mode.
-		if (sess->compositor_visible && sess->compositor_focused) {
-			oxr_session_change_state(log, sess, XR_SESSION_STATE_SYNCHRONIZED, 0);
-			oxr_session_change_state(log, sess, XR_SESSION_STATE_VISIBLE, 0);
-			oxr_session_change_state(log, sess, XR_SESSION_STATE_FOCUSED, 0);
-		}
+		// use the multi-compositor event system. The flags are preserved but
+		// state transitions are delayed until the first xrEndFrame call.
+		// This matches SRHydra behavior and is required for Chrome WebXR
+		// compatibility - Chrome expects to remain in READY state while
+		// initializing its frame loop before the first frame is submitted.
+		// The actual SYNCHRONIZED/VISIBLE/FOCUSED transitions happen in
+		// do_synchronize_state_change() called from oxr_session_frame_end().
 	} else {
 		// Headless, pretend we got event from the compositor.
 		sess->compositor_visible = true;
