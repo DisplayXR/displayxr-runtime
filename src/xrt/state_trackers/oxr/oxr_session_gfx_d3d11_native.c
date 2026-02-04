@@ -138,6 +138,9 @@ oxr_session_populate_d3d11_native(struct oxr_logger *log,
 		                 "Failed to create D3D11 native compositor: %d", xret);
 	}
 
+	// Set system devices for debug GUI qwerty driver support
+	comp_d3d11_compositor_set_system_devices(&xcn->base, sess->sys->xsysd);
+
 	// Set the compositor directly - no client wrapper needed
 	sess->xcn = xcn;
 	sess->compositor = &xcn->base;

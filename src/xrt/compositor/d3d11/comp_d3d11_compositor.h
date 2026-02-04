@@ -15,8 +15,9 @@
 #include "xrt/xrt_results.h"
 #include "leiasr/leiasr_types.h"
 
-// Forward declaration (C++ struct)
+// Forward declarations
 struct comp_d3d11_compositor;
+struct xrt_system_devices;
 
 #ifdef __cplusplus
 extern "C" {
@@ -112,6 +113,21 @@ bool
 comp_d3d11_compositor_get_pending_render_resolution(struct xrt_compositor *xc,
                                                      uint32_t *out_width,
                                                      uint32_t *out_height);
+
+/*!
+ * Set the system devices for the debug GUI (needed for qwerty driver support).
+ *
+ * This should be called after creating the compositor when xsysd is available.
+ * The debug GUI needs xsysd to route keyboard events to qwerty devices.
+ *
+ * @param xc The compositor.
+ * @param xsysd The system devices (may be NULL to disable qwerty support).
+ *
+ * @ingroup comp_d3d11
+ */
+void
+comp_d3d11_compositor_set_system_devices(struct xrt_compositor *xc,
+                                          struct xrt_system_devices *xsysd);
 
 #ifdef __cplusplus
 }

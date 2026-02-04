@@ -29,6 +29,7 @@
 #ifdef XRT_FEATURE_DEBUG_GUI
 #include "util/u_debug_gui.h"
 #include "comp_d3d11_debug.h"
+#include "xrt/xrt_system.h"
 #endif
 
 #ifdef XRT_HAVE_LEIA_SR_D3D11
@@ -98,6 +99,9 @@ struct comp_d3d11_compositor
 
 	//! Debug readback module.
 	struct comp_d3d11_debug *debug;
+
+	//! System devices (for qwerty driver keyboard input).
+	struct xrt_system_devices *xsysd;
 #endif
 
 	//! Current frame ID.
@@ -200,9 +204,9 @@ d3d11_compositor_begin_session(struct xrt_compositor *xc, const struct xrt_begin
 
 #ifdef XRT_FEATURE_DEBUG_GUI
 	// Start the debug GUI thread now that session is beginning
-	// Pass NULL for xinst and xsysd since the D3D11 compositor doesn't track them
+	// xsysd should have been set via comp_d3d11_compositor_set_system_devices
 	if (c->debug_gui != nullptr) {
-		u_debug_gui_start(c->debug_gui, NULL, NULL);
+		u_debug_gui_start(c->debug_gui, NULL, c->xsysd);
 	}
 #endif
 
@@ -1275,4 +1279,25 @@ comp_d3d11_compositor_get_pending_render_resolution(struct xrt_compositor *xc,
 	c->render_resize_pending = false;
 
 	return true;
+}
+
+extern "C" void
+comp_d3d11_compositor_set_system_devices(struct xrt_compositor *xc,
+                                          struct xrt_system_devices *xsysd)
+{
+#ifdef XRT_FEATURE_DEBUG_GUI
+	if (xc == nullptr) {
+		return;
+	}
+
+	struct comp_d3d11_compositor *c = d3d11_comp(xc);
+	c->xsysd = xsysd;
+
+	if (xsysd != nullptr) {
+		U_LOG_I("D3D11 compositor: system devices set for debug GUI qwerty support");
+	}
+#else
+	(void)xc;
+	(void)xsysd;
+#endif
 }

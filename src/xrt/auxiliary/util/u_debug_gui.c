@@ -179,7 +179,7 @@ sdl2_loop_events(struct u_debug_gui *p)
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
 		// Caution here, qwerty driver is being accessed by the main thread as well
-		if (p->qwerty_enabled) {
+		if (p->qwerty_enabled && p->base.xsysd != NULL) {
 			qwerty_process_event(p->base.xsysd->xdevs, p->base.xsysd->xdev_count, event);
 		}
 #endif
