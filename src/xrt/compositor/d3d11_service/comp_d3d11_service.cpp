@@ -2233,13 +2233,13 @@ comp_d3d11_service_create_system(struct xrt_device *xdev,
 	if (SUCCEEDED(hr)) {
 		// Copy LUID to system info (LUID is 8 bytes: LowPart + HighPart)
 		static_assert(sizeof(adapter_desc.AdapterLuid) == XRT_LUID_SIZE, "LUID size mismatch");
-		std::memcpy(sys->info.client_d3d_deviceLUID.data, &adapter_desc.AdapterLuid, XRT_LUID_SIZE);
-		sys->info.client_d3d_deviceLUID_valid = true;
+		std::memcpy(sys->base.info.client_d3d_deviceLUID.data, &adapter_desc.AdapterLuid, XRT_LUID_SIZE);
+		sys->base.info.client_d3d_deviceLUID_valid = true;
 		U_LOG_W("D3D11 service compositor using adapter LUID: %08lx-%08lx",
 		        adapter_desc.AdapterLuid.HighPart, adapter_desc.AdapterLuid.LowPart);
 	} else {
 		U_LOG_W("Failed to get adapter LUID, D3D clients may use wrong GPU");
-		sys->info.client_d3d_deviceLUID_valid = false;
+		sys->base.info.client_d3d_deviceLUID_valid = false;
 	}
 
 	hr = adapter->GetParent(IID_PPV_ARGS(sys->dxgi_factory.put()));
