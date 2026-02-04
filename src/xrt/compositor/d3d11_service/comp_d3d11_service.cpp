@@ -905,6 +905,13 @@ swapchain_destroy(struct xrt_swapchain *xsc)
 		sc->images[i].srv.reset();
 		sc->images[i].keyed_mutex.reset();
 		sc->images[i].texture.reset();
+
+		// Close NT handles for service-created swapchains
+		// NT handles from CreateSharedHandle must be explicitly closed
+		if (sc->service_created && sc->base.images[i].handle != nullptr) {
+			CloseHandle((HANDLE)sc->base.images[i].handle);
+			sc->base.images[i].handle = nullptr;
+		}
 	}
 
 	delete sc;
@@ -1158,7 +1165,8 @@ compositor_create_swapchain(struct xrt_compositor *xc,
 	tex_desc.BindFlags = bind_flags;
 	tex_desc.CPUAccessFlags = 0;
 	// SHARED_KEYEDMUTEX enables cross-process sharing with synchronization
-	tex_desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+	// SHARED_NTHANDLE creates NT handles that can be properly duplicated to sandboxed processes (Chrome)
+	tex_desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
 
 	// Create textures and get shared handles
 	for (uint32_t i = 0; i < image_count; i++) {
@@ -1177,31 +1185,36 @@ compositor_create_swapchain(struct xrt_compositor *xc,
 			return XRT_ERROR_SWAPCHAIN_FLAG_VALID_BUT_UNSUPPORTED;
 		}
 
-		// Get DXGI shared handle for IPC transfer to client
-		wil::com_ptr<IDXGIResource> dxgi_resource;
-		hr = sc->images[i].texture->QueryInterface(IID_PPV_ARGS(dxgi_resource.put()));
+		// Get NT handle via IDXGIResource1::CreateSharedHandle for cross-process sharing
+		// NT handles can be properly duplicated to sandboxed processes like Chrome
+		wil::com_ptr<IDXGIResource1> dxgi_resource1;
+		hr = sc->images[i].texture->QueryInterface(IID_PPV_ARGS(dxgi_resource1.put()));
 		if (FAILED(hr)) {
-			U_LOG_E("Failed to get IDXGIResource [%u]: 0x%08lx", i, hr);
+			U_LOG_E("Failed to get IDXGIResource1 [%u]: 0x%08lx", i, hr);
 			swapchain_destroy(&sc->base.base);
 			return XRT_ERROR_SWAPCHAIN_FLAG_VALID_BUT_UNSUPPORTED;
 		}
 
 		HANDLE shared_handle = nullptr;
-		hr = dxgi_resource->GetSharedHandle(&shared_handle);
+		hr = dxgi_resource1->CreateSharedHandle(
+		    nullptr, // no security attributes
+		    DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
+		    nullptr, // no name
+		    &shared_handle);
 		if (FAILED(hr) || shared_handle == nullptr) {
-			U_LOG_E("Failed to get shared handle [%u]: 0x%08lx", i, hr);
+			U_LOG_E("Failed to create NT shared handle [%u]: 0x%08lx", i, hr);
 			swapchain_destroy(&sc->base.base);
 			return XRT_ERROR_SWAPCHAIN_FLAG_VALID_BUT_UNSUPPORTED;
 		}
 
-		// Store shared handle for IPC layer
-		// Mark as DXGI handle by setting bit 0 (IPC layer will clear it on receive)
-		sc->base.images[i].handle = (xrt_graphics_buffer_handle_t)((size_t)shared_handle | 1);
+		// Store NT handle for IPC layer - DO NOT set bit 0
+		// This allows IPC to properly DuplicateHandle to the client process
+		sc->base.images[i].handle = (xrt_graphics_buffer_handle_t)shared_handle;
 		sc->base.images[i].size = 0; // Unknown for D3D11
 		sc->base.images[i].use_dedicated_allocation = false;
-		sc->base.images[i].is_dxgi_handle = true;
+		sc->base.images[i].is_dxgi_handle = false; // NT handle, not legacy DXGI global handle
 
-		U_LOG_W("Created shared texture [%u]: handle=%p (DXGI)", i, shared_handle);
+		U_LOG_W("Created shared texture [%u]: handle=%p (NT handle)", i, shared_handle);
 
 		// Create SRV for compositor
 		D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
