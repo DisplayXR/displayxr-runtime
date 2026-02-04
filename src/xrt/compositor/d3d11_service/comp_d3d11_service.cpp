@@ -13,6 +13,7 @@
 #include "xrt/xrt_handles.h"
 #include "xrt/xrt_config_have.h"
 #include "xrt/xrt_limits.h"
+#include "xrt/xrt_session.h"
 
 #include "util/u_logging.h"
 #include "util/u_misc.h"
@@ -112,6 +113,15 @@ struct d3d11_service_compositor
 	//! Parent system compositor
 	struct d3d11_service_system *sys;
 
+	//! Session event sink for pushing state change events
+	struct xrt_session_event_sink *xses;
+
+	//! Current visibility state
+	bool state_visible;
+
+	//! Current focus state
+	bool state_focused;
+
 	//! Accumulated layers for the current frame
 	struct comp_layer_accum layer_accum;
 
@@ -151,6 +161,9 @@ struct d3d11_service_system
 {
 	//! Base system compositor - must be first!
 	struct xrt_system_compositor base;
+
+	//! Multi-compositor control interface for session state management
+	struct xrt_multi_compositor_control xmcc;
 
 	//! The device we are rendering for
 	struct xrt_device *xdev;
@@ -1893,6 +1906,38 @@ compositor_destroy(struct xrt_compositor *xc)
  */
 
 static xrt_result_t
+system_set_state(struct xrt_system_compositor *xsc, struct xrt_compositor *xc, bool visible, bool focused)
+{
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+
+	// Only push event if state actually changed
+	if (c->state_visible != visible || c->state_focused != focused) {
+		c->state_visible = visible;
+		c->state_focused = focused;
+
+		union xrt_session_event xse = XRT_STRUCT_INIT;
+		xse.type = XRT_SESSION_EVENT_STATE_CHANGE;
+		xse.state.visible = visible;
+		xse.state.focused = focused;
+
+		U_LOG_W("D3D11 service: pushing state change event (visible=%d, focused=%d)", visible, focused);
+		return xrt_session_event_sink_push(c->xses, &xse);
+	}
+
+	return XRT_SUCCESS;
+}
+
+static xrt_result_t
+system_set_z_order(struct xrt_system_compositor *xsc, struct xrt_compositor *xc, int64_t z_order)
+{
+	// D3D11 service doesn't need z_order handling for single-client case
+	(void)xsc;
+	(void)xc;
+	(void)z_order;
+	return XRT_SUCCESS;
+}
+
+static xrt_result_t
 system_create_native_compositor(struct xrt_system_compositor *xsysc,
                                 const struct xrt_session_info *xsi,
                                 struct xrt_session_event_sink *xses,
@@ -1907,6 +1952,11 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 	c->sys = sys;
 	c->log_level = sys->log_level;
 	c->frame_id = 0;
+
+	// Store session event sink for pushing state change events
+	c->xses = xses;
+	c->state_visible = false;
+	c->state_focused = false;
 
 	// Initialize layer accumulator
 	std::memset(&c->layer_accum, 0, sizeof(c->layer_accum));
@@ -2242,6 +2292,15 @@ comp_d3d11_service_create_system(struct xrt_device *xdev,
 	// Set up system compositor vtable
 	sys->base.create_native_compositor = system_create_native_compositor;
 	sys->base.destroy = system_destroy;
+
+	// Set up multi-compositor control for session state management
+	sys->xmcc.set_state = system_set_state;
+	sys->xmcc.set_z_order = system_set_z_order;
+	sys->xmcc.set_main_app_visibility = NULL;  // Not needed for single client
+	sys->xmcc.notify_loss_pending = NULL;
+	sys->xmcc.notify_lost = NULL;
+	sys->xmcc.notify_display_refresh_changed = NULL;
+	sys->base.xmcc = &sys->xmcc;
 
 	// Fill system compositor info
 	sys->base.info.max_layers = XRT_MAX_LAYERS;
