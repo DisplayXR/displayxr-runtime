@@ -284,16 +284,27 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	case WM_KEYUP:
 	case WM_SYSKEYDOWN:
 	case WM_SYSKEYUP:
+		// Diagnostic: log all key events
+		U_LOG_W("D3D11 window: KEY event msg=%u vk=%llu qwerty_enabled=%d xsysd=%p",
+		        message, (unsigned long long)wParam, w->qwerty_enabled, (void *)w->xsysd);
 #ifdef XRT_BUILD_DRIVER_QWERTY
 		// Forward keyboard input to qwerty driver
 		if (w->qwerty_enabled && w->xsysd != NULL) {
+			U_LOG_W("D3D11 window: Forwarding key to qwerty driver (xdev_count=%u)",
+			        (unsigned)w->xsysd->xdev_count);
 			bool handled = false;
 			qwerty_process_win32(w->xsysd->xdevs, w->xsysd->xdev_count,
 			                     message, wParam, lParam, &handled);
+			U_LOG_W("D3D11 window: qwerty_process_win32 returned handled=%d", handled);
 			if (handled) {
 				return 0;
 			}
+		} else {
+			U_LOG_W("D3D11 window: NOT forwarding key - qwerty_enabled=%d xsysd=%p",
+			        w->qwerty_enabled, (void *)w->xsysd);
 		}
+#else
+		U_LOG_W("D3D11 window: XRT_BUILD_DRIVER_QWERTY not defined!");
 #endif
 		break;
 
@@ -468,7 +479,9 @@ comp_d3d11_window_create(uint32_t width, uint32_t height, struct comp_d3d11_wind
 	w->qwerty_enabled = debug_get_bool_option_qwerty_enable();
 
 	if (w->qwerty_enabled) {
-		U_LOG_W("D3D11 window: QWERTY input enabled (QWERTY_ENABLE=true)");
+		U_LOG_W("D3D11 window: QWERTY input ENABLED (QWERTY_ENABLE=true)");
+	} else {
+		U_LOG_W("D3D11 window: QWERTY input DISABLED (set QWERTY_ENABLE=true to enable)");
 	}
 
 	U_LOG_W("D3D11 window: Creating window on dedicated thread (%ux%u)", w->requested_width, w->requested_height);
@@ -664,8 +677,16 @@ comp_d3d11_window_set_system_devices(struct comp_d3d11_window *window,
 
 	window->xsysd = xsysd;
 
-	if (xsysd != NULL && window->qwerty_enabled) {
-		U_LOG_W("D3D11 window: System devices set - QWERTY input active");
-		U_LOG_W("D3D11 window: Controls: WASDQE=move, Arrows=rotate, RightClick+Drag=look, Shift=sprint");
+	U_LOG_W("D3D11 window: set_system_devices called - xsysd=%p qwerty_enabled=%d",
+	        (void *)xsysd, window->qwerty_enabled);
+
+	if (xsysd != NULL) {
+		U_LOG_W("D3D11 window: xsysd has %u devices", (unsigned)xsysd->xdev_count);
+		if (window->qwerty_enabled) {
+			U_LOG_W("D3D11 window: System devices set - QWERTY input active");
+			U_LOG_W("D3D11 window: Controls: WASDQE=move, Arrows=rotate, RightClick+Drag=look, Shift=sprint");
+		} else {
+			U_LOG_W("D3D11 window: xsysd set but QWERTY input disabled (set QWERTY_ENABLE=true)");
+		}
 	}
 }

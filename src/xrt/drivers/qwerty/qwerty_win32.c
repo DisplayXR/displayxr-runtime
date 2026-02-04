@@ -142,17 +142,29 @@ qwerty_process_win32(struct xrt_device **xdevs,
 
 	// Initialize cache on first call
 	if (!cached) {
+		U_LOG_W("QWERTY Win32: First call - searching for qwerty system in %zu devices", xdev_count);
+		for (size_t i = 0; i < xdev_count; i++) {
+			if (xdevs[i] != NULL) {
+				U_LOG_W("QWERTY Win32: Device[%zu] name='%s' tracker='%s'",
+				        i, xdevs[i]->str, xdevs[i]->tracking_origin->name);
+			}
+		}
 		qsys = find_qwerty_system(xdevs, xdev_count);
 		if (qsys == NULL) {
+			U_LOG_W("QWERTY Win32: No qwerty devices found in device list!");
 			return; // No qwerty devices found
 		}
 		default_qdev = default_qwerty_device(xdevs, xdev_count, qsys);
 		default_qctrl = default_qwerty_controller(xdevs, xdev_count, qsys);
 		cached = true;
 		U_LOG_W("QWERTY Win32 input initialized - WASDQE to move, arrows to rotate, right-click+drag to look");
+		U_LOG_W("QWERTY Win32: qsys=%p hmd=%p lctrl=%p rctrl=%p process_keys=%d",
+		        (void *)qsys, (void *)qsys->hmd, (void *)qsys->lctrl, (void *)qsys->rctrl, qsys->process_keys);
 	}
 
 	if (qsys == NULL || !qsys->process_keys) {
+		U_LOG_W("QWERTY Win32: Ignoring input - qsys=%p process_keys=%d",
+		        (void *)qsys, qsys ? qsys->process_keys : -1);
 		return;
 	}
 
@@ -217,27 +229,37 @@ qwerty_process_win32(struct xrt_device **xdevs,
 	if (is_keydown || is_keyup) {
 		bool handled = true;
 
+		// Log which device is being controlled
+		const char *dev_name = "unknown";
+		if (qdev == qd_hmd) dev_name = "HMD";
+		else if (qdev == qd_left) dev_name = "Left";
+		else if (qdev == qd_right) dev_name = "Right";
+
 		// WASDQE Movement
 		switch (wParam) {
 		case 'W':
+			U_LOG_W("QWERTY Win32: W key %s -> %s", is_keydown ? "DOWN" : "UP", dev_name);
 			if (is_keydown)
 				qwerty_press_forward(qdev);
 			else
 				qwerty_release_forward(qdev);
 			break;
 		case 'A':
+			U_LOG_W("QWERTY Win32: A key %s -> %s", is_keydown ? "DOWN" : "UP", dev_name);
 			if (is_keydown)
 				qwerty_press_left(qdev);
 			else
 				qwerty_release_left(qdev);
 			break;
 		case 'S':
+			U_LOG_W("QWERTY Win32: S key %s -> %s", is_keydown ? "DOWN" : "UP", dev_name);
 			if (is_keydown)
 				qwerty_press_backward(qdev);
 			else
 				qwerty_release_backward(qdev);
 			break;
 		case 'D':
+			U_LOG_W("QWERTY Win32: D key %s -> %s", is_keydown ? "DOWN" : "UP", dev_name);
 			if (is_keydown)
 				qwerty_press_right(qdev);
 			else
