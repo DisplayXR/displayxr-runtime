@@ -502,14 +502,19 @@ oxr_session_begin(struct oxr_logger *log, struct oxr_session *sess, const XrSess
 		// use the multi-compositor event system. If flags are already set,
 		// trigger state transitions directly like headless mode.
 		//
-		// EXCEPTION: AppContainer apps (Chrome WebXR) need to stay in READY
-		// state while initializing their frame loop. For these apps, we delay
-		// the transitions to the first xrEndFrame call. This matches SRHydra
-		// behavior and prevents Chrome from crashing during initialization.
-		if (sess->compositor_visible && sess->compositor_focused && !sess->is_appcontainer) {
+		// EXCEPTION: AppContainer apps (Chrome WebXR) crash if they receive
+		// FOCUSED before their frame loop is ready. For these apps:
+		// - Transition to SYNCHRONIZED immediately (Chrome needs this to proceed)
+		// - Delay VISIBLE/FOCUSED until first xrEndFrame
+		// This matches SRHydra behavior.
+		if (sess->compositor_visible && sess->compositor_focused) {
 			oxr_session_change_state(log, sess, XR_SESSION_STATE_SYNCHRONIZED, 0);
-			oxr_session_change_state(log, sess, XR_SESSION_STATE_VISIBLE, 0);
-			oxr_session_change_state(log, sess, XR_SESSION_STATE_FOCUSED, 0);
+			if (!sess->is_appcontainer) {
+				// Native apps: immediate transition to FOCUSED
+				oxr_session_change_state(log, sess, XR_SESSION_STATE_VISIBLE, 0);
+				oxr_session_change_state(log, sess, XR_SESSION_STATE_FOCUSED, 0);
+			}
+			// AppContainer apps: VISIBLE/FOCUSED delayed to first xrEndFrame
 		}
 	} else {
 		// Headless, pretend we got event from the compositor.
