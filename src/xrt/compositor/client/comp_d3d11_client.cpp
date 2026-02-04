@@ -392,28 +392,50 @@ try {
 		return XRT_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED;
 	}
 
-	struct xrt_swapchain_create_info xinfo = *info;
 	struct xrt_swapchain_create_info vkinfo = *info;
 
-	// Update the create info.
-	xinfo.bits = (enum xrt_swapchain_usage_bits)(xsccp.extra_bits | xinfo.bits);
+	// Update the create info with Vulkan format for IPC to the service.
 	vkinfo.format = vk_format;
 	vkinfo.bits = (enum xrt_swapchain_usage_bits)(xsccp.extra_bits | vkinfo.bits);
 
 	std::unique_ptr<struct client_d3d11_swapchain> sc = std::make_unique<struct client_d3d11_swapchain>();
 	sc->data = std::make_unique<client_d3d11_swapchain_data>(c->log_level);
 	auto &data = sc->data;
-	xret = xrt::auxiliary::d3d::d3d11::allocateSharedImages(*(c->comp_device), xinfo, image_count, true,
-	                                                        data->comp_images, data->dxgi_handles);
+
+	// Ask the service to create the swapchain (server-creates-swapchain model).
+	// This is required for WebXR support because Chrome's sandboxed GPU process
+	// cannot export D3D11 shared handles.
+	D3D_INFO(c, "Requesting server to create swapchain (server-creates-swapchain model)");
+	xret = xrt_comp_create_swapchain(&c->xcn->base, &vkinfo, &sc->xsc.get_underlying_ptr());
 	if (xret != XRT_SUCCESS) {
+		D3D_ERROR(c, "Service failed to create swapchain: %d", xret);
 		return xret;
 	}
 
+	// Get handles from service-created swapchain
+	struct xrt_swapchain_native *xscn = (struct xrt_swapchain_native *)sc->xsc.get();
+	image_count = xscn->base.image_count;
+	D3D_INFO(c, "Service created swapchain with %u images", image_count);
+
 	data->app_images.reserve(image_count);
 
-	// Import from the handle for the app.
+	// Import server-provided handles into app_device
 	for (uint32_t i = 0; i < image_count; ++i) {
-		wil::com_ptr<ID3D11Texture2D1> image = import_image_dxgi(*(c->app_device), data->dxgi_handles[i]);
+		HANDLE handle = (HANDLE)xscn->images[i].handle;
+
+		// Clear DXGI marker bit if set (handles are marked with bit 0 during IPC transfer)
+		if ((size_t)handle & 1) {
+			handle = (HANDLE)((size_t)handle & ~1);
+		}
+
+		data->dxgi_handles.push_back(handle);
+
+		D3D_DEBUG(c, "Importing server texture [%u]: handle=%p", i, handle);
+		wil::com_ptr<ID3D11Texture2D1> image = import_image_dxgi(*(c->app_device), handle);
+		if (!image) {
+			D3D_ERROR(c, "Failed to import server texture [%u] with handle %p", i, handle);
+			return XRT_ERROR_SWAPCHAIN_FLAG_VALID_BUT_UNSUPPORTED;
+		}
 
 		// Put the image where the OpenXR state tracker can get it
 		sc->base.images[i] = image.get();
@@ -425,16 +447,7 @@ try {
 	// Cache the keyed mutex interface
 	xret = data->keyed_mutex_collection.init(data->app_images);
 	if (xret != XRT_SUCCESS) {
-		D3D_ERROR(c, "Error retrieving keyex mutex interfaces");
-		return xret;
-	}
-
-	// Import into the native compositor, to create the corresponding swapchain which we wrap.
-	xret = xrt::compositor::client::importFromDxgiHandles(
-	    *(c->xcn), data->dxgi_handles, vkinfo, false /** @todo not sure - dedicated allocation */, sc->xsc);
-
-	if (xret != XRT_SUCCESS) {
-		D3D_ERROR(c, "Error importing D3D11 swapchain into native compositor");
+		D3D_ERROR(c, "Error retrieving keyed mutex interfaces");
 		return xret;
 	}
 
