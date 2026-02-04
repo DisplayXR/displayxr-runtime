@@ -337,8 +337,76 @@ Ensure you're requesting `"XR_EXT_session_target"` in `enabledExtensionNames` wh
 └─────────────────────────────────────────────┘
 ```
 
+## D3D11 Service Compositor (WebXR/Chrome Support)
+
+For applications that require service mode (separate runtime process), such as Chrome WebXR, SRMonado includes a D3D11 service compositor. This is enabled automatically when the Monado service is running.
+
+### Architecture: Server-Created Swapchains
+
+The service compositor uses a "server-creates-swapchain" model:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Monado Service Process                    │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │  D3D11 Service Compositor                            │    │
+│  │  ├── Creates D3D11 device on specific GPU (LUID)    │    │
+│  │  ├── Creates swapchain textures (server-owned)      │    │
+│  │  ├── Shares textures via NT handles + KeyedMutex    │    │
+│  │  ├── Composites layers from clients                 │    │
+│  │  └── Outputs to SR Weaver → Display                 │    │
+│  └─────────────────────────────────────────────────────┘    │
+└────────────────────────┬────────────────────────────────────┘
+                         │ IPC (Named Pipes)
+                         │ Shared texture handles (DuplicateHandle)
+                         ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    Client Process (Chrome)                   │
+│  ├── Receives GPU LUID from xrGetD3D11GraphicsRequirementsKHR│
+│  ├── Creates D3D11 device on SAME GPU adapter               │
+│  ├── Opens shared textures via OpenSharedResource1()        │
+│  ├── Renders stereoscopic content to shared textures        │
+│  └── Uses KeyedMutex for GPU synchronization                │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Critical Requirements for Cross-Process Texture Sharing
+
+1. **Same GPU Adapter**: Client and server MUST use the same physical GPU. The service reports its adapter LUID via `xrGetD3D11GraphicsRequirementsKHR`, and clients must create their D3D11 device on that adapter.
+
+2. **NT Handles with KeyedMutex**: Textures are created with `D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX` flags.
+
+3. **Handle Duplication**: NT handles are duplicated into the client process via `DuplicateHandle()` during IPC.
+
+4. **AppContainer Security**: For sandboxed processes (Chrome), shared handles use security descriptors that grant access to AppContainer processes.
+
+### Comparison with SRHydra
+
+SRHydra (Leia's other OpenXR runtime) uses a similar architecture:
+
+| Aspect | SRMonado | SRHydra |
+|--------|----------|---------|
+| Architecture | Client-Server (Monado IPC) | Client-Server (WyvernEngine IPC) |
+| Swapchain Model | Server-created | Server-created |
+| Handle Sharing | NT handles + DuplicateHandle | NT handles + DuplicateHandle |
+| Sync Mechanism | KeyedMutex | KeyedMutex |
+| GPU Selection | LUID via xrGetD3D11GraphicsRequirementsKHR | LUID via IPC_GetD3DAdapterID |
+
+### Troubleshooting WebXR/Chrome
+
+If Chrome WebXR shows a blank screen or crashes:
+
+1. **Check adapter LUID**: Ensure logs show "D3D11 service compositor using adapter LUID: XXXXXXXX-XXXXXXXX"
+
+2. **Verify session events**: Look for "pushing state change event (visible=1, focused=1)"
+
+3. **Check swapchain creation**: Look for "Created shared texture [N]: handle=XXXX (NT handle)"
+
+4. **Chrome crash after session_begin**: Usually indicates GPU adapter mismatch or handle import failure
+
 ## Further Reading
 
 - `doc/XR_EXT_session_target/` - Detailed extension documentation
 - `test_apps/session_target_test/` - Example source code
 - `src/xrt/state_trackers/oxr/oxr_session.c` - Extension implementation
+- `src/xrt/compositor/d3d11_service/` - D3D11 service compositor implementation

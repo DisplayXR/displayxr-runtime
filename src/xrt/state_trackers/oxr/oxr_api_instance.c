@@ -8,6 +8,11 @@
  */
 
 #include "xrt/xrt_compiler.h"
+#include "xrt/xrt_config_os.h"
+#ifdef XRT_OS_WINDOWS
+#include "xrt/xrt_windows.h"
+#include <stdio.h>
+#endif
 
 #include "util/u_debug.h"
 #include "util/u_trace_marker.h"
@@ -239,12 +244,42 @@ oxr_xrPollEvent(XrInstance instance, XrEventDataBuffer *eventData)
 {
 	OXR_TRACE_MARKER();
 
+#ifdef XRT_OS_WINDOWS
+	OutputDebugStringA("[SRMonado] oxr_xrPollEvent: API ENTRY\n");
+#endif
+
 	struct oxr_instance *inst;
 	struct oxr_logger log;
 	OXR_VERIFY_INSTANCE_AND_INIT_LOG(&log, instance, inst, "xrPollEvent");
 	OXR_VERIFY_ARG_NOT_NULL(&log, eventData);
 
-	return oxr_poll_event(&log, inst, eventData);
+	XrResult res = oxr_poll_event(&log, inst, eventData);
+
+#ifdef XRT_OS_WINDOWS
+	{
+		char buf[256];
+		if (res == XR_SUCCESS) {
+			// Event was returned - log the event type
+			XrEventDataSessionStateChanged *state_change = (XrEventDataSessionStateChanged *)eventData;
+			if (eventData->type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
+				snprintf(buf, sizeof(buf),
+				         "[SRMonado] oxr_xrPollEvent: SESSION_STATE_CHANGED state=%d\n",
+				         (int)state_change->state);
+			} else {
+				snprintf(buf, sizeof(buf),
+				         "[SRMonado] oxr_xrPollEvent: event type=%d\n",
+				         (int)eventData->type);
+			}
+		} else if (res == XR_EVENT_UNAVAILABLE) {
+			snprintf(buf, sizeof(buf), "[SRMonado] oxr_xrPollEvent: no event available\n");
+		} else {
+			snprintf(buf, sizeof(buf), "[SRMonado] oxr_xrPollEvent: ERROR result=%d\n", (int)res);
+		}
+		OutputDebugStringA(buf);
+	}
+#endif
+
+	return res;
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
