@@ -71,10 +71,10 @@ distributions:
   - name: debian
     images:
       # This image does some extra work.
-      - codename: bookworm
+      - codename: trixie
         script: i386_and_proclamation_container_prep.sh
-        tag: "2025-10-01"
-        deb_version_suffix: bpo12
+        tag: "2026-02-04"
+        deb_version_suffix: bpo13
         packages:
           <<: *default_debian_packages
           clang-format:
@@ -82,7 +82,6 @@ distributions:
           codespell:
           doxygen:
           graphviz:
-          pahole:
           pipx:
           python3-click:
           python3-pip:
@@ -103,9 +102,7 @@ distributions:
               CMAKE_EXPORT_COMPILE_COMMANDS: "ON"
 
           - name: "debian:cmake-no-opencv"
-            pahole: true
             cmake_defines:
-              CMAKE_BUILD_TYPE: Debug
               XRT_HAVE_OPENCV: "OFF"
 
           - name: "debian:cmake-no-sdl2"
@@ -117,12 +114,29 @@ distributions:
               XRT_FEATURE_SERVICE: "OFF"
 
           - name: "debian:cmake:32bit"
+            cmake_defines:
+              CMAKE_TOOLCHAIN_FILE: .gitlab-ci/i386.cmake
+              # OpenCV doesn't play nicely with us in multi-arch.
+              XRT_HAVE_OPENCV: "OFF"
+
+      - codename: bookworm
+        script: i386_and_proclamation_container_prep.sh
+        tag: "2026-02-04"
+        deb_version_suffix: bpo12
+        packages:
+          <<: *default_debian_packages
+          pahole:
+          python3-pip:
+        build_jobs:
+          - name: "debian:bookworm:cmake"
+            pahole: true
+            cmake_defines:
+              CMAKE_BUILD_TYPE: Debug
+          - name: "debian:bookworm:cmake:32bit"
             pahole: true
             cmake_defines:
               CMAKE_BUILD_TYPE: Debug
               CMAKE_TOOLCHAIN_FILE: .gitlab-ci/i386.cmake
-              # OpenCV doesn't play nicely with us in multi-arch.
-              XRT_HAVE_OPENCV: "OFF"
 
       - codename: bullseye
         tag: "2025-01-08"

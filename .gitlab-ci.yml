@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: CC0-1.0
-# SPDX-FileCopyrightText: 2018-2025 Collabora, Ltd. and the Monado contributors
+# SPDX-FileCopyrightText: 2018-2026 Collabora, Ltd. and the Monado contributors
 
 ###############################################
 # GENERATED - DO NOT EDIT
@@ -127,11 +127,17 @@ win:container_prep:
 
 
 
+# Variables for build and usage of Debian trixie image
+.monado.variables.debian:trixie:
+  variables:
+    FDO_DISTRIBUTION_VERSION: "trixie"
+    FDO_DISTRIBUTION_TAG: "2026-02-04"
+
 # Variables for build and usage of Debian bookworm image
 .monado.variables.debian:bookworm:
   variables:
     FDO_DISTRIBUTION_VERSION: "bookworm"
-    FDO_DISTRIBUTION_TAG: "2025-10-01"
+    FDO_DISTRIBUTION_TAG: "2026-02-04"
 
 # Variables for build and usage of Debian bullseye image
 .monado.variables.debian:bullseye:
@@ -171,6 +177,18 @@ win:container_prep:
 
 ###
 # Container prep jobs
+# Make Debian trixie image
+debian:trixie:container_prep:
+  stage: container_prep
+  extends:
+    - .container-rules
+    - .monado.variables.debian:trixie
+    - .fdo.container-build@debian # from ci-templates
+
+  variables:
+    FDO_DISTRIBUTION_PACKAGES: 'build-essential ca-certificates clang-format clang-tidy cmake codespell curl debhelper devscripts doxygen dput-ng gettext-base git glslang-tools graphviz libbluetooth-dev libbsd-dev libcjson-dev libdbus-1-dev libdistro-info-perl libegl1-mesa-dev libeigen3-dev libgl1-mesa-dev libglvnd-dev libgstreamer-plugins-base1.0-dev libgstreamer1.0-dev libhidapi-dev libopencv-dev libsdl2-dev libsystemd-dev libudev-dev libusb-1.0-0-dev libuvc-dev libv4l-dev libvulkan-dev libwayland-dev libx11-dev libx11-xcb-dev libxcb-randr0-dev libxrandr-dev libxxf86vm-dev ninja-build pandoc patch pipx pkg-config python3 python3-click python3-pip reprepro unzip wayland-protocols wget'
+    FDO_DISTRIBUTION_EXEC: 'env FDO_CI_CONCURRENT=${FDO_CI_CONCURRENT} bash .gitlab-ci/i386_and_proclamation_container_prep.sh'
+
 # Make Debian bookworm image
 debian:bookworm:container_prep:
   stage: container_prep
@@ -180,7 +198,7 @@ debian:bookworm:container_prep:
     - .fdo.container-build@debian # from ci-templates
 
   variables:
-    FDO_DISTRIBUTION_PACKAGES: 'build-essential ca-certificates clang-format clang-tidy cmake codespell curl debhelper devscripts doxygen dput-ng gettext-base git glslang-tools graphviz libbluetooth-dev libbsd-dev libcjson-dev libdbus-1-dev libdistro-info-perl libegl1-mesa-dev libeigen3-dev libgl1-mesa-dev libglvnd-dev libgstreamer-plugins-base1.0-dev libgstreamer1.0-dev libhidapi-dev libopencv-dev libsdl2-dev libsystemd-dev libudev-dev libusb-1.0-0-dev libuvc-dev libv4l-dev libvulkan-dev libwayland-dev libx11-dev libx11-xcb-dev libxcb-randr0-dev libxrandr-dev libxxf86vm-dev ninja-build pahole pandoc patch pipx pkg-config python3 python3-click python3-pip reprepro unzip wayland-protocols wget'
+    FDO_DISTRIBUTION_PACKAGES: 'build-essential ca-certificates cmake curl debhelper devscripts dput-ng gettext-base git glslang-tools libbluetooth-dev libbsd-dev libcjson-dev libdbus-1-dev libdistro-info-perl libegl1-mesa-dev libeigen3-dev libgl1-mesa-dev libglvnd-dev libgstreamer-plugins-base1.0-dev libgstreamer1.0-dev libhidapi-dev libopencv-dev libsdl2-dev libsystemd-dev libudev-dev libusb-1.0-0-dev libuvc-dev libv4l-dev libvulkan-dev libwayland-dev libx11-dev libx11-xcb-dev libxcb-randr0-dev libxrandr-dev libxxf86vm-dev ninja-build pahole pandoc patch pkg-config python3 python3-pip unzip wayland-protocols wget'
     FDO_DISTRIBUTION_EXEC: 'env FDO_CI_CONCURRENT=${FDO_CI_CONCURRENT} bash .gitlab-ci/i386_and_proclamation_container_prep.sh'
 
 # Make Debian bullseye image
@@ -256,6 +274,14 @@ alpine:container_prep:
 ###
 # Container usage base jobs
 
+# Base for using Debian trixie image
+.monado.image.debian:trixie:
+  extends:
+    - .monado.variables.debian:trixie
+    - .fdo.distribution-image@debian # from ci-templates
+    - .build-rules
+
+
 # Base for using Debian bookworm image
 .monado.image.debian:bookworm:
   extends:
@@ -316,7 +342,7 @@ alpine:container_prep:
 # Style check job
 format-and-spellcheck:
   extends:
-    - .monado.image.debian:bookworm
+    - .monado.image.debian:trixie
 
   stage: verify
   script:
@@ -343,7 +369,7 @@ debian:cmake:
   stage: build
   extends:
     - .monado.packaging.conditions
-    - .monado.image.debian:bookworm
+    - .monado.image.debian:trixie
 
   before_script:
     - pushd doc/changes
@@ -363,23 +389,18 @@ debian:cmake:
 debian:cmake-no-opencv:
   stage: build
   extends:
-    - .monado.image.debian:bookworm
+    - .monado.image.debian:trixie
 
   script:
 
     - .gitlab-ci/prebuild.sh
-    - .gitlab-ci/ci-cmake-build.sh -DCMAKE_BUILD_TYPE=Debug -DXRT_HAVE_OPENCV=OFF
-    - mkdir -p "debian:cmake-no-opencv"
-    - pahole --sizes --class_name file://build/ipc-structs.txt build/src/xrt/targets/openxr/libopenxr_monado.so > "debian:cmake-no-opencv/ipc-sizes.txt"
+    - .gitlab-ci/ci-cmake-build.sh -DXRT_HAVE_OPENCV=OFF
     - cd build && ctest --output-on-failure
-  artifacts:
-    paths:
-      - debian:cmake-no-opencv/ipc-sizes.txt
 
 debian:cmake-no-sdl2:
   stage: build
   extends:
-    - .monado.image.debian:bookworm
+    - .monado.image.debian:trixie
 
   script:
 
@@ -390,7 +411,7 @@ debian:cmake-no-sdl2:
 debian:cmake-no-service:
   stage: build
   extends:
-    - .monado.image.debian:bookworm
+    - .monado.image.debian:trixie
 
   script:
 
@@ -401,18 +422,45 @@ debian:cmake-no-service:
 debian:cmake:32bit:
   stage: build
   extends:
+    - .monado.image.debian:trixie
+
+  script:
+
+    - .gitlab-ci/prebuild.sh
+    - .gitlab-ci/ci-cmake-build.sh -DCMAKE_TOOLCHAIN_FILE=.gitlab-ci/i386.cmake -DXRT_HAVE_OPENCV=OFF
+    - cd build && ctest --output-on-failure
+
+debian:bookworm:cmake:
+  stage: build
+  extends:
     - .monado.image.debian:bookworm
 
   script:
 
     - .gitlab-ci/prebuild.sh
-    - .gitlab-ci/ci-cmake-build.sh -DCMAKE_BUILD_TYPE=Debug -DCMAKE_TOOLCHAIN_FILE=.gitlab-ci/i386.cmake -DXRT_HAVE_OPENCV=OFF
-    - mkdir -p "debian:cmake:32bit"
-    - pahole --sizes --class_name file://build/ipc-structs.txt build/src/xrt/targets/openxr/libopenxr_monado.so > "debian:cmake:32bit/ipc-sizes.txt"
+    - .gitlab-ci/ci-cmake-build.sh -DCMAKE_BUILD_TYPE=Debug
+    - mkdir -p "debian:bookworm:cmake"
+    - pahole --sizes --class_name file://build/ipc-structs.txt build/src/xrt/targets/openxr/libopenxr_monado.so > "debian:bookworm:cmake/ipc-sizes.txt"
     - cd build && ctest --output-on-failure
   artifacts:
     paths:
-      - debian:cmake:32bit/ipc-sizes.txt
+      - debian:bookworm:cmake/ipc-sizes.txt
+
+debian:bookworm:cmake:32bit:
+  stage: build
+  extends:
+    - .monado.image.debian:bookworm
+
+  script:
+
+    - .gitlab-ci/prebuild.sh
+    - .gitlab-ci/ci-cmake-build.sh -DCMAKE_BUILD_TYPE=Debug -DCMAKE_TOOLCHAIN_FILE=.gitlab-ci/i386.cmake
+    - mkdir -p "debian:bookworm:cmake:32bit"
+    - pahole --sizes --class_name file://build/ipc-structs.txt build/src/xrt/targets/openxr/libopenxr_monado.so > "debian:bookworm:cmake:32bit/ipc-sizes.txt"
+    - cd build && ctest --output-on-failure
+  artifacts:
+    paths:
+      - debian:bookworm:cmake:32bit/ipc-sizes.txt
 
 debian:bullseye:cmake:
   stage: build
@@ -649,16 +697,42 @@ ipc-32-64-compatibility:
 clang-tidy:
   extends:
     - .build-rules
-    - .monado.image.debian:bookworm
+    - .monado.image.debian:trixie
   stage: check
   dependencies:
     - debian:cmake
   needs:
     - debian:cmake
   script:
-    - file $(which run-clang-tidy)
-    - run-clang-tidy -quiet -p build
+    - run-clang-tidy -quiet -allow-no-checks -p build
 
+
+debian:trixie:package:
+  extends:
+    - .monado.image.debian:trixie
+    - .monado.packaging.conditions
+  variables:
+    GIT_STRATEGY: clone
+    DEBFULLNAME: "Monado CI"
+    DEBEMAIL: "rylie.pavlik@collabora.com"
+    DISTRO: debian
+    CODENAME: trixie
+    DEB_VERSION_SUFFIX: bpo13
+  stage: package
+  before_script:
+    - git config --global user.name Monado CI
+    - git config --global user.email rylie.pavlik@collabora.com
+  script:
+    - .gitlab-ci/prebuild.sh
+    # Prep the source tree
+    - git clean -dfx
+    # Call this script to build binary and source packages.
+    # Can try locally by exporting the right variables and passing -B to get only a binary package to avoid complaints.
+    - .gitlab-ci/build-and-submit-package.sh
+  artifacts:
+    paths:
+      - "incoming/"
+    expire_in: 2 days
 
 debian:bookworm:package:
   extends:
@@ -771,10 +845,11 @@ ubuntu:noble:package:
 reprepro:package:
   stage: reprepro
   extends:
-    - .monado.image.debian:bookworm
+    - .monado.image.debian:trixie
 
     - .monado.packaging.conditions
   needs:
+    - debian:trixie:package
     - debian:bookworm:package
     - debian:bullseye:package
     - ubuntu:jammy:package

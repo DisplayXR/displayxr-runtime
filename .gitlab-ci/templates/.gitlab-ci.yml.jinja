@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: CC0-1.0
-# SPDX-FileCopyrightText: 2018-2025 Collabora, Ltd. and the Monado contributors
+# SPDX-FileCopyrightText: 2018-2026 Collabora, Ltd. and the Monado contributors
 
 {# ignore the warning, this is actually the template to edit. #}
 ###############################################
@@ -217,16 +217,14 @@ ipc-32-64-compatibility:
 clang-tidy:
   extends:
     - .build-rules
-    - .monado.image.debian:bookworm
+    - .monado.image.debian:trixie
   stage: check
   dependencies:
     - debian:cmake
   needs:
     - debian:cmake
   script:
-    - file $(which run-clang-tidy)
-    - run-clang-tidy -quiet -p build
-    {# TODO -allow-no-checks when we have debian trixie #}
+    - run-clang-tidy -quiet -allow-no-checks -p build
 
 {% for distro in distributions -%} {%- for image in distro.images if "deb_version_suffix" in image %}
 
