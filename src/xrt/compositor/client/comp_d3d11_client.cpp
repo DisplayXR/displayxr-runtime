@@ -425,18 +425,27 @@ try {
 	// Import server-provided handles into app_device
 	for (uint32_t i = 0; i < image_count; ++i) {
 		HANDLE handle = (HANDLE)xscn->images[i].handle;
+		bool is_dxgi = xscn->images[i].is_dxgi_handle;
 
 		// Clear DXGI marker bit if set (handles are marked with bit 0 during IPC transfer)
 		if ((size_t)handle & 1) {
 			handle = (HANDLE)((size_t)handle & ~1);
+			is_dxgi = true;
 		}
 
 		data->dxgi_handles.push_back(handle);
 
-		D3D_DEBUG(c, "Importing server texture [%u]: handle=%p", i, handle);
-		wil::com_ptr<ID3D11Texture2D1> image = import_image_dxgi(*(c->app_device), handle);
+		D3D_DEBUG(c, "Importing server texture [%u]: handle=%p, is_dxgi=%d", i, handle, is_dxgi);
+		wil::com_ptr<ID3D11Texture2D1> image;
+		if (is_dxgi) {
+			// Legacy DXGI global handle - use OpenSharedResource
+			image = import_image_dxgi(*(c->app_device), handle);
+		} else {
+			// NT handle - use OpenSharedResource1
+			image = import_image(*(c->app_device), handle);
+		}
 		if (!image) {
-			D3D_ERROR(c, "Failed to import server texture [%u] with handle %p", i, handle);
+			D3D_ERROR(c, "Failed to import server texture [%u] with handle %p (is_dxgi=%d)", i, handle, is_dxgi);
 			return XRT_ERROR_SWAPCHAIN_FLAG_VALID_BUT_UNSUPPORTED;
 		}
 
