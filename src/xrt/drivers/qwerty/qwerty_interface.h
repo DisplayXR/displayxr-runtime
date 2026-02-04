@@ -20,6 +20,11 @@ extern "C" {
 
 typedef union SDL_Event SDL_Event;
 
+// Forward declaration for Win32 types (used in qwerty_process_win32)
+#ifdef _WIN32
+#include <stdbool.h>
+#endif
+
 /*!
  * @defgroup drv_qwerty Qwerty driver
  * @ingroup drv
@@ -46,6 +51,32 @@ typedef union SDL_Event SDL_Event;
  */
 void
 qwerty_process_event(struct xrt_device **xdevs, size_t xdev_count, SDL_Event event);
+
+#ifdef _WIN32
+/*!
+ * Process a Win32 message (like a key press or mouse event) and dispatches
+ * a suitable action to the appropriate qwerty_device.
+ *
+ * This allows keyboard/mouse input from the main D3D11 window to control
+ * qwerty devices without requiring the SDL debug GUI window.
+ *
+ * @param xdevs Array of devices to search for qwerty devices
+ * @param xdev_count Number of devices in the array
+ * @param message The Win32 message (WM_KEYDOWN, WM_MOUSEMOVE, etc.)
+ * @param wParam The wParam from the Win32 message
+ * @param lParam The lParam from the Win32 message
+ * @param out_handled Optional output: set to true if the message was handled
+ *
+ * @ingroup drv_qwerty
+ */
+void
+qwerty_process_win32(struct xrt_device **xdevs,
+                     size_t xdev_count,
+                     unsigned int message,
+                     unsigned long long wParam,
+                     long long lParam,
+                     bool *out_handled);
+#endif
 
 /*!
  * Create all qwerty devices.

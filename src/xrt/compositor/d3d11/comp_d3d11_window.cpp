@@ -24,6 +24,13 @@
 #include "util/u_debug.h"
 #include "util/u_logging.h"
 #include "util/u_misc.h"
+#include "xrt/xrt_system.h"
+#include "xrt/xrt_config_build.h"
+
+// Include qwerty interface for Win32 input handling (conditional on qwerty driver being built)
+#ifdef XRT_BUILD_DRIVER_QWERTY
+#include "qwerty/qwerty_interface.h"
+#endif
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -33,6 +40,9 @@
 
 // Environment variable to start in windowed mode
 DEBUG_GET_ONCE_BOOL_OPTION(start_windowed, "XRT_COMPOSITOR_START_WINDOWED", false)
+
+// Environment variable to enable qwerty input from the main window
+DEBUG_GET_ONCE_BOOL_OPTION(qwerty_enable, "QWERTY_ENABLE", false)
 
 // Window class name
 static WCHAR szWindowClass[] = L"MonadoD3D11";
@@ -95,6 +105,13 @@ struct comp_d3d11_window
 
 	//! Auto-reset event: compositor signals WM_PAINT that frame is done
 	HANDLE paint_done_event;
+
+	//! System devices for qwerty input (set via comp_d3d11_window_set_system_devices)
+	//! Can be NULL if not set or qwerty disabled
+	struct xrt_system_devices *xsysd;
+
+	//! True if qwerty input is enabled (checked once at startup from QWERTY_ENABLE env var)
+	bool qwerty_enabled;
 };
 
 // Forward declarations
@@ -252,6 +269,7 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		break;
 
 	case WM_KEYDOWN:
+		// F11 toggle fullscreen (always handled)
 		if (wParam == VK_F11) {
 			// Toggle fullscreen state (pure Win32, runs on window thread — safe)
 			LONG fs = InterlockedCompareExchange(&w->is_fullscreen, 0, 0);
@@ -259,7 +277,43 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			InterlockedExchange(&w->is_fullscreen, fs);
 			set_fullscreen(hWnd, fs != 0);
 			U_LOG_W("D3D11 window: F11 toggled to %s mode", fs ? "fullscreen" : "windowed");
+			return 0;
 		}
+		// Forward to qwerty driver if enabled (fall through to WM_KEYUP case)
+		// FALLTHROUGH
+	case WM_KEYUP:
+	case WM_SYSKEYDOWN:
+	case WM_SYSKEYUP:
+#ifdef XRT_BUILD_DRIVER_QWERTY
+		// Forward keyboard input to qwerty driver
+		if (w->qwerty_enabled && w->xsysd != NULL) {
+			bool handled = false;
+			qwerty_process_win32(w->xsysd->xdevs, w->xsysd->xdev_count,
+			                     message, wParam, lParam, &handled);
+			if (handled) {
+				return 0;
+			}
+		}
+#endif
+		break;
+
+	// Mouse input for qwerty driver
+	case WM_LBUTTONDOWN:
+	case WM_LBUTTONUP:
+	case WM_RBUTTONDOWN:
+	case WM_RBUTTONUP:
+	case WM_MBUTTONDOWN:
+	case WM_MBUTTONUP:
+	case WM_MOUSEMOVE:
+	case WM_MOUSEWHEEL:
+#ifdef XRT_BUILD_DRIVER_QWERTY
+		if (w->qwerty_enabled && w->xsysd != NULL) {
+			bool handled = false;
+			qwerty_process_win32(w->xsysd->xdevs, w->xsysd->xdev_count,
+			                     message, wParam, lParam, &handled);
+			// Don't consume mouse events - let them propagate for other uses
+		}
+#endif
 		break;
 
 	case WM_SIZE:
@@ -410,6 +464,12 @@ comp_d3d11_window_create(uint32_t width, uint32_t height, struct comp_d3d11_wind
 	w->instance = GetModuleHandle(NULL);
 	w->requested_width = width > 0 ? width : 1920;
 	w->requested_height = height > 0 ? height : 1080;
+	w->xsysd = NULL;
+	w->qwerty_enabled = debug_get_bool_option_qwerty_enable();
+
+	if (w->qwerty_enabled) {
+		U_LOG_W("D3D11 window: QWERTY input enabled (QWERTY_ENABLE=true)");
+	}
 
 	U_LOG_W("D3D11 window: Creating window on dedicated thread (%ux%u)", w->requested_width, w->requested_height);
 
@@ -592,4 +652,20 @@ comp_d3d11_window_signal_paint_done(struct comp_d3d11_window *window)
 		return;
 	}
 	SetEvent(window->paint_done_event);
+}
+
+extern "C" void
+comp_d3d11_window_set_system_devices(struct comp_d3d11_window *window,
+                                      struct xrt_system_devices *xsysd)
+{
+	if (window == NULL) {
+		return;
+	}
+
+	window->xsysd = xsysd;
+
+	if (xsysd != NULL && window->qwerty_enabled) {
+		U_LOG_W("D3D11 window: System devices set - QWERTY input active");
+		U_LOG_W("D3D11 window: Controls: WASDQE=move, Arrows=rotate, RightClick+Drag=look, Shift=sprint");
+	}
 }

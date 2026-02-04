@@ -35,6 +35,11 @@ if(WIN32 AND XRT_HAVE_D3D11)
 
 	target_include_directories(comp_d3d11 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
+	# Link to qwerty driver for Win32 input from main window
+	if(XRT_BUILD_DRIVER_QWERTY)
+		target_link_libraries(comp_d3d11 PRIVATE drv_qwerty drv_qwerty_includes)
+	endif()
+
 	# Link to SR SDK D3D11 weaver if available
 	# drv_leiasr exports XRT_HAVE_LEIA_SR_D3D11 as PUBLIC when D3D11 weaver is available
 	if(XRT_HAVE_LEIA_SR)
