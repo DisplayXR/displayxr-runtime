@@ -262,6 +262,13 @@ d3d11_compositor_wait_frame(struct xrt_compositor *xc,
 {
 	struct comp_d3d11_compositor *c = d3d11_comp(xc);
 
+	// Check if window was closed (user pressed ESC or closed window)
+	if (c->owns_window && c->own_window != nullptr &&
+	    !comp_d3d11_window_is_valid(c->own_window)) {
+		U_LOG_I("Window closed - signaling session exit");
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
 	// During drag, synchronize with the window thread's WM_PAINT cycle.
 	// This ensures the window position is stable between weave() and Present(),
 	// so the interlacing pattern matches the actual displayed position.

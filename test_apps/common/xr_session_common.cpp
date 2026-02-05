@@ -299,7 +299,8 @@ bool BeginFrame(XrSessionManager& xr, XrFrameState& frameState) {
     LOG_INFO("[BeginFrame] xrWaitFrame...");
     XrResult result = xrWaitFrame(xr.session, &waitInfo, &frameState);
     if (XR_FAILED(result)) {
-        LOG_WARN("[BeginFrame] xrWaitFrame FAILED: %d", result);
+        LOG_WARN("[BeginFrame] xrWaitFrame FAILED: %d - requesting exit", result);
+        xr.exitRequested = true;
         return false;
     }
     LOG_INFO("[BeginFrame] xrWaitFrame OK, displayTime=%lld, period=%lld, shouldRender=%d",
