@@ -1045,6 +1045,11 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 
 	U_LOG_I("D3D11 native compositor supports %u swapchain formats", format_count);
 
+	// Set initial visibility/focus state for session state machine
+	// Native in-process compositor is always visible and focused
+	c->base.base.info.initial_visible = true;
+	c->base.base.info.initial_focused = true;
+
 	// Set up compositor interface
 	c->base.base.get_swapchain_create_properties = d3d11_compositor_get_swapchain_create_properties;
 	c->base.base.create_swapchain = d3d11_compositor_create_swapchain;
