@@ -1304,20 +1304,10 @@ compositor_create_swapchain(struct xrt_compositor *xc,
 	U_LOG_W("Created swapchain with %u shared images (%ux%u, format=%d)",
 	        image_count, info->width, info->height, (int)dxgi_format);
 
-	// CRITICAL: Release KeyedMutex for all images so client can acquire them
-	// When a texture is created with D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX,
-	// the mutex starts in an "acquired" state (key 0). The creator must
-	// release it before another process (the client) can acquire it.
+	// Note: KeyedMutex starts in released state (key 0), so client can acquire immediately.
+	// No initial release needed.
 	for (uint32_t i = 0; i < image_count; i++) {
-		if (sc->images[i].keyed_mutex) {
-			HRESULT hr = sc->images[i].keyed_mutex->ReleaseSync(0);
-			if (FAILED(hr)) {
-				U_LOG_W("Failed to release initial KeyedMutex [%u]: 0x%08lx", i, hr);
-			} else {
-				U_LOG_D("Released initial KeyedMutex [%u] for client", i);
-			}
-			sc->images[i].mutex_acquired = false;
-		}
+		sc->images[i].mutex_acquired = false;
 	}
 
 	*out_xsc = &sc->base.base;
@@ -1775,6 +1765,32 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			continue;
 		}
 
+		// For service-created swapchains (WebXR), acquire KeyedMutex before reading
+		// This ensures cross-process GPU synchronization - client's writes are complete
+		bool left_mutex_acquired = false;
+		bool right_mutex_acquired = false;
+		const DWORD mutex_timeout_ms = 100; // 100ms timeout for mutex acquisition
+		if (sc_left->service_created && sc_left->images[left_index].keyed_mutex) {
+			HRESULT hr = sc_left->images[left_index].keyed_mutex->AcquireSync(0, mutex_timeout_ms);
+			if (SUCCEEDED(hr)) {
+				left_mutex_acquired = true;
+			} else if (hr == static_cast<HRESULT>(WAIT_TIMEOUT)) {
+				U_LOG_W("layer_commit: Left mutex timeout (client still holding?)");
+			} else {
+				U_LOG_W("layer_commit: Failed to acquire left mutex: 0x%08lx", hr);
+			}
+		}
+		if (sc_right != sc_left && sc_right->service_created && sc_right->images[right_index].keyed_mutex) {
+			HRESULT hr = sc_right->images[right_index].keyed_mutex->AcquireSync(0, mutex_timeout_ms);
+			if (SUCCEEDED(hr)) {
+				right_mutex_acquired = true;
+			} else if (hr == static_cast<HRESULT>(WAIT_TIMEOUT)) {
+				U_LOG_W("layer_commit: Right mutex timeout (client still holding?)");
+			} else {
+				U_LOG_W("layer_commit: Failed to acquire right mutex: 0x%08lx", hr);
+			}
+		}
+
 		// Copy left view to left half of stereo texture
 		D3D11_BOX left_box = {};
 		left_box.left = layer->data.proj.v[0].sub.rect.offset.w;
@@ -1808,6 +1824,14 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		    right_tex,
 		    layer->data.proj.v[1].sub.array_index,  // src subresource
 		    &right_box);
+
+		// Release KeyedMutex after reading
+		if (left_mutex_acquired) {
+			sc_left->images[left_index].keyed_mutex->ReleaseSync(0);
+		}
+		if (right_mutex_acquired) {
+			sc_right->images[right_index].keyed_mutex->ReleaseSync(0);
+		}
 
 		U_LOG_T("Rendered projection layer %u", i);
 	}
