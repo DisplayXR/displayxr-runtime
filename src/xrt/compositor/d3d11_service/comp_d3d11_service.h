@@ -18,6 +18,7 @@
 
 #include "xrt/xrt_compositor.h"
 #include "xrt/xrt_device.h"
+#include "xrt/xrt_system.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -41,6 +42,7 @@ extern "C" {
  * via DXGI shared handles.
  *
  * @param xdev The head device to render for.
+ * @param xsysd System devices for qwerty input support (may be NULL).
  * @param[out] out_xsysc Pointer to receive the system compositor.
  * @return XRT_SUCCESS on success.
  *
@@ -48,6 +50,7 @@ extern "C" {
  */
 xrt_result_t
 comp_d3d11_service_create_system(struct xrt_device *xdev,
+                                 struct xrt_system_devices *xsysd,
                                  struct xrt_system_compositor **out_xsysc);
 
 

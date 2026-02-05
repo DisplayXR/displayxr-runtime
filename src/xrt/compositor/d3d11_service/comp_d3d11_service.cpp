@@ -1791,6 +1791,22 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			}
 		}
 
+		// Log projection layer rect values for debugging SR weaving
+		// Log first frame and every 60 frames
+		static uint32_t proj_log_count = 0;
+		if (proj_log_count == 0 || proj_log_count % 60 == 0) {
+			U_LOG_W("Projection layer %u: left rect=(%d,%d %dx%d) right rect=(%d,%d %dx%d) array=[%u,%u]",
+			        i,
+			        layer->data.proj.v[0].sub.rect.offset.w, layer->data.proj.v[0].sub.rect.offset.h,
+			        layer->data.proj.v[0].sub.rect.extent.w, layer->data.proj.v[0].sub.rect.extent.h,
+			        layer->data.proj.v[1].sub.rect.offset.w, layer->data.proj.v[1].sub.rect.offset.h,
+			        layer->data.proj.v[1].sub.rect.extent.w, layer->data.proj.v[1].sub.rect.extent.h,
+			        layer->data.proj.v[0].sub.array_index, layer->data.proj.v[1].sub.array_index);
+			U_LOG_W("  stereo_texture=%ux%u, view_width=%u, view_height=%u",
+			        sys->display_width, sys->display_height, sys->view_width, sys->view_height);
+		}
+		proj_log_count++;
+
 		// Copy left view to left half of stereo texture
 		D3D11_BOX left_box = {};
 		left_box.left = layer->data.proj.v[0].sub.rect.offset.w;
@@ -2181,9 +2197,10 @@ system_destroy(struct xrt_system_compositor *xsysc)
 
 extern "C" xrt_result_t
 comp_d3d11_service_create_system(struct xrt_device *xdev,
+                                 struct xrt_system_devices *xsysd,
                                  struct xrt_system_compositor **out_xsysc)
 {
-	U_LOG_W("Creating D3D11 service system compositor");
+	U_LOG_W("Creating D3D11 service system compositor (xsysd=%p)", (void *)xsysd);
 
 	// Allocate system compositor
 	struct d3d11_service_system *sys = new d3d11_service_system();
@@ -2322,6 +2339,12 @@ comp_d3d11_service_create_system(struct xrt_device *xdev,
 		return XRT_ERROR_VULKAN;
 	}
 	sys->hwnd = (HWND)comp_d3d11_window_get_hwnd(sys->window);
+
+	// Pass system devices to window for qwerty input support
+	if (xsysd != NULL) {
+		comp_d3d11_window_set_system_devices(sys->window, xsysd);
+		U_LOG_W("Passed xsysd to service window for qwerty input");
+	}
 
 	// Create swap chain at native display resolution (output of weaver)
 	DXGI_SWAP_CHAIN_DESC1 sc_desc = {};

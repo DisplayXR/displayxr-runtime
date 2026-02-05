@@ -41,3 +41,9 @@ target_include_directories(comp_d3d11_service PRIVATE ${CMAKE_CURRENT_SOURCE_DIR
 if(XRT_HAVE_LEIA_SR)
 	target_link_libraries(comp_d3d11_service PRIVATE drv_leiasr)
 endif()
+
+# Link to qwerty driver for Win32 input from service window
+if(XRT_BUILD_DRIVER_QWERTY)
+	target_link_libraries(comp_d3d11_service PRIVATE drv_qwerty drv_qwerty_includes)
+	target_compile_definitions(comp_d3d11_service PRIVATE XRT_BUILD_DRIVER_QWERTY)
+endif()
