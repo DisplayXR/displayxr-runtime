@@ -51,10 +51,14 @@ create_headless(struct ipc_client_system *icsys, const struct xrt_session_info *
 	xrt_result_t xret = XRT_SUCCESS;
 
 	// We create the session ourselves.
+	bool initial_visible = false;  // Unused for headless
+	bool initial_focused = false;  // Unused for headless
 	xret = ipc_call_session_create( //
 	    icsys->ipc_c,               // ipc_c
 	    xsi,                        // xsi
-	    false);                     // create_native_compositor
+	    false,                      // create_native_compositor
+	    &initial_visible,           // out_initial_visible
+	    &initial_focused);          // out_initial_focused
 	IPC_CHK_AND_RET(icsys->ipc_c, xret, "ipc_call_session_create");
 
 	struct xrt_session *xs = ipc_client_session_create(icsys->ipc_c);

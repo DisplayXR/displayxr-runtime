@@ -497,6 +497,19 @@ oxr_session_begin(struct oxr_logger *log, struct oxr_session *sess, const XrSess
 		}
 #endif
 
+		// SHORT-TERM FIX: For AppContainer apps (Chrome WebXR), force visibility/focus
+		// flags to true. This avoids a race condition where:
+		// 1. Server sets visible/focused during session_create (pushes event)
+		// 2. Client calls xrBeginSession before polling that event
+		// 3. compositor_visible/compositor_focused are still false
+		// 4. State machine doesn't progress, shouldRender=false
+		// Long-term fix: Return initial state in IPC session_create response.
+		if (sess->is_appcontainer && (!sess->compositor_visible || !sess->compositor_focused)) {
+			U_LOG_W("oxr_session_begin: AppContainer race fix - forcing visible/focused=true");
+			sess->compositor_visible = true;
+			sess->compositor_focused = true;
+		}
+
 		// D3D11 native compositor (and similar simple compositors) may set
 		// visibility/focus flags during session creation because they don't
 		// use the multi-compositor event system. If flags are already set,
@@ -777,18 +790,24 @@ oxr_session_poll(struct oxr_logger *log, struct oxr_session *sess)
 	// For AppContainer apps (Chrome WebXR), delay VISIBLE/FOCUSED transitions
 	// until the poll AFTER SYNCHRONIZED has been delivered. This gives Chrome
 	// time to process SYNCHRONIZED before receiving VISIBLE/FOCUSED.
+	U_LOG_W("oxr_session_poll: is_appcontainer=%d state=%d sync_polled=%d vis=%d foc=%d",
+	        sess->is_appcontainer, (int)sess->state, sess->appcontainer_synchronized_polled,
+	        sess->compositor_visible, sess->compositor_focused);
 	if (sess->is_appcontainer && sess->state == XR_SESSION_STATE_SYNCHRONIZED) {
 		if (sess->appcontainer_synchronized_polled) {
 			// Second poll after SYNCHRONIZED - now deliver VISIBLE/FOCUSED
+			U_LOG_W("oxr_session_poll: AppContainer second poll, delivering VISIBLE");
 			if (sess->compositor_visible) {
 				oxr_session_change_state(log, sess, XR_SESSION_STATE_VISIBLE, 0);
 			}
 		} else {
 			// First poll in SYNCHRONIZED state - mark it and wait for next poll
+			U_LOG_W("oxr_session_poll: AppContainer first poll in SYNCHRONIZED, deferring VISIBLE/FOCUSED");
 			sess->appcontainer_synchronized_polled = true;
 		}
 	} else if (!sess->is_appcontainer && sess->state == XR_SESSION_STATE_SYNCHRONIZED && sess->compositor_visible) {
 		// Non-AppContainer apps: immediate transition
+		U_LOG_W("oxr_session_poll: Non-AppContainer, immediate VISIBLE transition");
 		oxr_session_change_state(log, sess, XR_SESSION_STATE_VISIBLE, 0);
 	}
 
@@ -1874,9 +1893,21 @@ oxr_session_create(struct oxr_logger *log,
 	// Used to delay session state transitions for sandbox compatibility
 #ifdef OXR_HAVE_EXT_win32_appcontainer_compatible
 	sess->is_appcontainer = sys->inst->extensions.EXT_win32_appcontainer_compatible;
+	U_LOG_W("oxr_session_create: EXT_win32_appcontainer_compatible=%d -> is_appcontainer=%d",
+	        sys->inst->extensions.EXT_win32_appcontainer_compatible, sess->is_appcontainer);
 #else
 	sess->is_appcontainer = false;
+	U_LOG_W("oxr_session_create: OXR_HAVE_EXT_win32_appcontainer_compatible not defined, is_appcontainer=false");
 #endif
+
+	// Initialize compositor visibility/focus from compositor info (IPC long-term fix)
+	// This eliminates the race condition where events must be polled before flags are set
+	if (sess->compositor != NULL) {
+		sess->compositor_visible = sess->compositor->info.initial_visible;
+		sess->compositor_focused = sess->compositor->info.initial_focused;
+		U_LOG_W("oxr_session_create: initialized compositor_visible=%d compositor_focused=%d from compositor info",
+		        sess->compositor_visible, sess->compositor_focused);
+	}
 
 	// Everything is in order, start the state changes.
 	oxr_session_change_state(log, sess, XR_SESSION_STATE_IDLE, 0);

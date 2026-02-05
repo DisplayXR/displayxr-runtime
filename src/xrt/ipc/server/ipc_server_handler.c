@@ -364,7 +364,9 @@ ipc_handle_system_compositor_get_info(volatile struct ipc_client_state *ics,
 xrt_result_t
 ipc_handle_session_create(volatile struct ipc_client_state *ics,
                           const struct xrt_session_info *xsi,
-                          bool create_native_compositor)
+                          bool create_native_compositor,
+                          bool *out_initial_visible,
+                          bool *out_initial_focused)
 {
 	IPC_TRACE_MARKER();
 
@@ -396,6 +398,11 @@ ipc_handle_session_create(volatile struct ipc_client_state *ics,
 	                      ics->client_state.session_focused);
 
 	xrt_syscomp_set_z_order(ics->server->xsysc, ics->xc, ics->client_state.z_order);
+
+	// Return initial visibility/focus state to client (avoids race condition
+	// where client polls events after session_create but before begin_session)
+	*out_initial_visible = ics->client_state.session_visible;
+	*out_initial_focused = ics->client_state.session_focused;
 
 	return XRT_SUCCESS;
 }

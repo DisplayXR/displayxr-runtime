@@ -77,6 +77,11 @@ struct ipc_client_compositor
 	//! Has the native compositor been created, only supports one for now.
 	bool compositor_created;
 
+	//! Initial visibility state returned from server (avoids race condition)
+	bool initial_visible;
+	//! Initial focus state returned from server (avoids race condition)
+	bool initial_focused;
+
 	//! To get better wake up in wait frame.
 	struct os_precise_sleeper sleeper;
 
@@ -1087,14 +1092,27 @@ ipc_client_create_native_compositor(struct xrt_system_compositor *xsysc,
 	 * the session does. But we create it here in case any extra arguments
 	 * that only the compositor knows about needs to be sent.
 	 */
+	bool initial_visible = false;
+	bool initial_focused = false;
 	xret = ipc_call_session_create( //
 	    icc->ipc_c,                 // ipc_c
 	    xsi,                        // xsi
-	    true);                      // create_native_compositor
+	    true,                       // create_native_compositor
+	    &initial_visible,           // out_initial_visible
+	    &initial_focused);          // out_initial_focused
 	IPC_CHK_AND_RET(icc->ipc_c, xret, "ipc_call_session_create");
+
+	// Store initial state for the OpenXR layer to query (avoids race condition)
+	icc->initial_visible = initial_visible;
+	icc->initial_focused = initial_focused;
 
 	// Needs to be done after session create call.
 	ipc_compositor_init(icc, out_xcn);
+
+	// Set initial visibility/focus in compositor info (for OpenXR layer to read)
+	// This avoids the race condition where events must be polled before these are set
+	icc->base.base.info.initial_visible = initial_visible;
+	icc->base.base.info.initial_focused = initial_focused;
 
 	icc->compositor_created = true;
 
