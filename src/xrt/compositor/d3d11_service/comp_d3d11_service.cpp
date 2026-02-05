@@ -1899,6 +1899,52 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	}
 	frame_count++;
 
+	// Handle window resize - check if swap chain needs to be resized
+	// This is critical for SR weaving which requires viewport to match window
+	if (sys->hwnd != nullptr && sys->swap_chain) {
+		RECT client_rect;
+		if (GetClientRect(sys->hwnd, &client_rect)) {
+			uint32_t client_width = static_cast<uint32_t>(client_rect.right - client_rect.left);
+			uint32_t client_height = static_cast<uint32_t>(client_rect.bottom - client_rect.top);
+
+			// Check if swap chain size matches window client area
+			DXGI_SWAP_CHAIN_DESC1 sc_desc = {};
+			sys->swap_chain->GetDesc1(&sc_desc);
+
+			if (client_width > 0 && client_height > 0 &&
+			    (sc_desc.Width != client_width || sc_desc.Height != client_height)) {
+				U_LOG_W("Window resize detected: swap_chain=%ux%u, client=%ux%u - resizing",
+				        sc_desc.Width, sc_desc.Height, client_width, client_height);
+
+				// Release back buffer RTV before resize
+				sys->back_buffer_rtv.reset();
+
+				// Resize swap chain buffers
+				HRESULT hr = sys->swap_chain->ResizeBuffers(
+				    0,  // Keep buffer count
+				    client_width,
+				    client_height,
+				    DXGI_FORMAT_UNKNOWN,  // Keep format
+				    0);
+
+				if (SUCCEEDED(hr)) {
+					// Recreate back buffer RTV
+					wil::com_ptr<ID3D11Texture2D> back_buffer;
+					sys->swap_chain->GetBuffer(0, IID_PPV_ARGS(back_buffer.put()));
+					sys->device->CreateRenderTargetView(back_buffer.get(), nullptr, sys->back_buffer_rtv.put());
+
+					// Update output dimensions to match new swap chain size
+					sys->output_width = client_width;
+					sys->output_height = client_height;
+
+					U_LOG_W("Swap chain resized successfully to %ux%u", client_width, client_height);
+				} else {
+					U_LOG_E("Failed to resize swap chain: 0x%08lx", hr);
+				}
+			}
+		}
+	}
+
 	// Clear stereo render target
 	if (sys->stereo_rtv) {
 		float clear_color[4] = {0.0f, 0.0f, 0.0f, 1.0f};
@@ -2240,10 +2286,48 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		ID3D11RenderTargetView *rtvs[] = {sys->back_buffer_rtv.get()};
 		sys->context->OMSetRenderTargets(1, rtvs, nullptr);
 
-		// Set viewport (native display resolution for weaver output)
+		// Get actual back buffer dimensions for viewport (must match window client rect)
+		// This is critical for correct SR interlacing - viewport must match display output
+		uint32_t back_buffer_width = sys->output_width;
+		uint32_t back_buffer_height = sys->output_height;
+		if (sys->back_buffer_rtv) {
+			wil::com_ptr<ID3D11Resource> bb_resource;
+			sys->back_buffer_rtv->GetResource(bb_resource.put());
+			wil::com_ptr<ID3D11Texture2D> bb_texture;
+			if (SUCCEEDED(bb_resource->QueryInterface(IID_PPV_ARGS(bb_texture.put())))) {
+				D3D11_TEXTURE2D_DESC bb_desc = {};
+				bb_texture->GetDesc(&bb_desc);
+				back_buffer_width = bb_desc.Width;
+				back_buffer_height = bb_desc.Height;
+			}
+		}
+
+		// Also check window client rect for diagnostic purposes
+		uint32_t window_width = 0, window_height = 0;
+		if (sys->hwnd != nullptr) {
+			RECT client_rect;
+			if (GetClientRect(sys->hwnd, &client_rect)) {
+				window_width = static_cast<uint32_t>(client_rect.right - client_rect.left);
+				window_height = static_cast<uint32_t>(client_rect.bottom - client_rect.top);
+			}
+		}
+
+		// Log weaver dimensions periodically for debugging interlacing issues
+		static uint32_t weave_log_count = 0;
+		if (weave_log_count == 0 || weave_log_count % 300 == 0) {
+			U_LOG_W("SR weave: input view=%ux%u (stereo=%ux%u), back_buffer=%ux%u, window_client=%ux%u, output_dims=%ux%u",
+			        sys->view_width, sys->view_height,
+			        sys->view_width * 2, sys->view_height,
+			        back_buffer_width, back_buffer_height,
+			        window_width, window_height,
+			        sys->output_width, sys->output_height);
+		}
+		weave_log_count++;
+
+		// Set viewport to actual back buffer dimensions for correct weaving
 		D3D11_VIEWPORT viewport = {};
-		viewport.Width = static_cast<float>(sys->output_width);
-		viewport.Height = static_cast<float>(sys->output_height);
+		viewport.Width = static_cast<float>(back_buffer_width);
+		viewport.Height = static_cast<float>(back_buffer_height);
 		viewport.MaxDepth = 1.0f;
 		sys->context->RSSetViewports(1, &viewport);
 
