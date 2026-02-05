@@ -291,6 +291,15 @@ oxr_xrLocateViews(XrSession session,
 {
 	OXR_TRACE_MARKER();
 
+#ifdef XRT_OS_WINDOWS
+	{
+		char buf[256];
+		snprintf(buf, sizeof(buf), "[SRMonado] xrLocateViews: API ENTRY viewConfig=%d cap=%u\n",
+		         viewLocateInfo ? (int)viewLocateInfo->viewConfigurationType : -1, viewCapacityInput);
+		OutputDebugStringA(buf);
+	}
+#endif
+
 	struct oxr_session *sess;
 	struct oxr_space *spc;
 	struct oxr_logger log;

@@ -79,13 +79,36 @@ oxr_xrGetSystemProperties(XrInstance instance, XrSystemId systemId, XrSystemProp
 {
 	OXR_TRACE_MARKER();
 
+#ifdef XRT_OS_WINDOWS
+	OutputDebugStringA("[SRMonado] xrGetSystemProperties: API ENTRY\n");
+#endif
+
 	struct oxr_instance *inst;
 	struct oxr_logger log;
 	OXR_VERIFY_INSTANCE_AND_INIT_LOG(&log, instance, inst, "xrGetSystemProperties");
 	OXR_VERIFY_ARG_TYPE_AND_NOT_NULL(&log, properties, XR_TYPE_SYSTEM_PROPERTIES);
 	OXR_VERIFY_SYSTEM_AND_GET(&log, inst, systemId, sys);
 
-	return oxr_system_get_properties(&log, sys, properties);
+	XrResult ret = oxr_system_get_properties(&log, sys, properties);
+
+#ifdef XRT_OS_WINDOWS
+	if (ret == XR_SUCCESS) {
+		char buf[512];
+		snprintf(buf, sizeof(buf),
+		         "[SRMonado] xrGetSystemProperties: name='%s' vendorId=%u "
+		         "gfx.maxSwapchainW=%u gfx.maxSwapchainH=%u gfx.maxLayers=%u "
+		         "tracking.orientationTracking=%d tracking.positionTracking=%d\n",
+		         properties->systemName, properties->vendorId,
+		         properties->graphicsProperties.maxSwapchainImageWidth,
+		         properties->graphicsProperties.maxSwapchainImageHeight,
+		         properties->graphicsProperties.maxLayerCount,
+		         properties->trackingProperties.orientationTracking,
+		         properties->trackingProperties.positionTracking);
+		OutputDebugStringA(buf);
+	}
+#endif
+
+	return ret;
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
@@ -116,6 +139,16 @@ oxr_xrEnumerateEnvironmentBlendModes(XrInstance instance,
 {
 	OXR_TRACE_MARKER();
 
+#ifdef XRT_OS_WINDOWS
+	{
+		char buf[256];
+		snprintf(buf, sizeof(buf),
+		         "[SRMonado] xrEnumerateEnvironmentBlendModes: API ENTRY viewConfig=%d cap=%u\n",
+		         (int)viewConfigurationType, environmentBlendModeCapacityInput);
+		OutputDebugStringA(buf);
+	}
+#endif
+
 	struct oxr_instance *inst;
 	struct oxr_logger log;
 	OXR_VERIFY_INSTANCE_AND_INIT_LOG(&log, instance, inst, "xrEnumerateEnvironmentBlendModes");
@@ -123,14 +156,37 @@ oxr_xrEnumerateEnvironmentBlendModes(XrInstance instance,
 	OXR_VERIFY_VIEW_CONFIG_TYPE(&log, inst, viewConfigurationType);
 
 	if (viewConfigurationType != sys->view_config_type) {
+#ifdef XRT_OS_WINDOWS
+		OutputDebugStringA("[SRMonado] xrEnumerateEnvironmentBlendModes: UNSUPPORTED view config\n");
+#endif
 		return oxr_error(&log, XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED,
 		                 "(viewConfigurationType == 0x%08x) "
 		                 "unsupported view configuration type",
 		                 viewConfigurationType);
 	}
 
-	return oxr_system_enumerate_blend_modes(&log, sys, viewConfigurationType, environmentBlendModeCapacityInput,
-	                                        environmentBlendModeCountOutput, environmentBlendModes);
+	XrResult ret = oxr_system_enumerate_blend_modes(&log, sys, viewConfigurationType,
+	                                                environmentBlendModeCapacityInput,
+	                                                environmentBlendModeCountOutput, environmentBlendModes);
+
+#ifdef XRT_OS_WINDOWS
+	{
+		char buf[256];
+		snprintf(buf, sizeof(buf),
+		         "[SRMonado] xrEnumerateEnvironmentBlendModes: ret=%d count=%u\n", (int)ret,
+		         environmentBlendModeCountOutput ? *environmentBlendModeCountOutput : 0);
+		OutputDebugStringA(buf);
+		if (ret == XR_SUCCESS && environmentBlendModes && environmentBlendModeCountOutput) {
+			for (uint32_t i = 0; i < *environmentBlendModeCountOutput; i++) {
+				snprintf(buf, sizeof(buf), "[SRMonado]   blendMode[%u] = %d\n", i,
+				         (int)environmentBlendModes[i]);
+				OutputDebugStringA(buf);
+			}
+		}
+	}
+#endif
+
+	return ret;
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
@@ -160,6 +216,16 @@ oxr_xrEnumerateViewConfigurationViews(XrInstance instance,
 {
 	OXR_TRACE_MARKER();
 
+#ifdef XRT_OS_WINDOWS
+	{
+		char buf[256];
+		snprintf(buf, sizeof(buf),
+		         "[SRMonado] xrEnumerateViewConfigurationViews: API ENTRY viewConfig=%d cap=%u\n",
+		         (int)viewConfigurationType, viewCapacityInput);
+		OutputDebugStringA(buf);
+	}
+#endif
+
 	struct oxr_instance *inst;
 	struct oxr_logger log;
 	OXR_VERIFY_INSTANCE_AND_INIT_LOG(&log, instance, inst, "xrEnumerateViewConfigurationViews");
@@ -169,8 +235,29 @@ oxr_xrEnumerateViewConfigurationViews(XrInstance instance,
 		OXR_VERIFY_ARG_ARRAY_ELEMENT_TYPE(&log, views, i, XR_TYPE_VIEW_CONFIGURATION_VIEW);
 	}
 
-	return oxr_system_enumerate_view_conf_views(&log, sys, viewConfigurationType, viewCapacityInput,
-	                                            viewCountOutput, views);
+	XrResult ret = oxr_system_enumerate_view_conf_views(&log, sys, viewConfigurationType, viewCapacityInput,
+	                                                    viewCountOutput, views);
+
+#ifdef XRT_OS_WINDOWS
+	{
+		char buf[512];
+		snprintf(buf, sizeof(buf), "[SRMonado] xrEnumerateViewConfigurationViews: ret=%d count=%u\n",
+		         (int)ret, viewCountOutput ? *viewCountOutput : 0);
+		OutputDebugStringA(buf);
+		if (ret == XR_SUCCESS && views && viewCountOutput) {
+			for (uint32_t i = 0; i < *viewCountOutput; i++) {
+				snprintf(buf, sizeof(buf),
+				         "[SRMonado]   view[%u]: recommended=%ux%u max=%ux%u samples=%u/%u\n", i,
+				         views[i].recommendedImageRectWidth, views[i].recommendedImageRectHeight,
+				         views[i].maxImageRectWidth, views[i].maxImageRectHeight,
+				         views[i].recommendedSwapchainSampleCount, views[i].maxSwapchainSampleCount);
+				OutputDebugStringA(buf);
+			}
+		}
+	}
+#endif
+
+	return ret;
 }
 
 
