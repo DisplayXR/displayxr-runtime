@@ -903,20 +903,12 @@ client_d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_syn
 			u_pp(dg, "Problem waiting on fence: ");
 			u_pp_xrt_result(dg, xret);
 			D3D_ERROR(c, "%s", sink.buffer);
-			OutputDebugStringA("[SRMonado] xrEndFrame: FENCE WAIT FAILED!\n");
 
 			return xret;
 		}
-		OutputDebugStringA("[SRMonado] xrEndFrame: Fence wait completed\n");
 	}
 
-	OutputDebugStringA("[SRMonado] xrEndFrame: Calling IPC layer_commit...\n");
 	xret = xrt_comp_layer_commit(&c->xcn->base, XRT_GRAPHICS_SYNC_HANDLE_INVALID);
-	{
-		char buf[128];
-		snprintf(buf, sizeof(buf), "[SRMonado] xrEndFrame: IPC layer_commit result=%d\n", (int)xret);
-		OutputDebugStringA(buf);
-	}
 	return xret;
 }
 

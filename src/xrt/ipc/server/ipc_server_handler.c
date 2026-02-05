@@ -367,26 +367,17 @@ ipc_handle_session_create(volatile struct ipc_client_state *ics,
 {
 	IPC_TRACE_MARKER();
 
-	IPC_WARN(ics->server, "IPC session_create called (create_native_compositor=%d)", create_native_compositor);
-
 	struct xrt_session *xs = NULL;
 	struct xrt_compositor_native *xcn = NULL;
 
 	if (ics->xs != NULL) {
-		IPC_WARN(ics->server, "IPC session_create: session already exists");
 		return XRT_ERROR_IPC_SESSION_ALREADY_CREATED;
-	}
-
-	if (!create_native_compositor) {
-		IPC_WARN(ics->server, "App asked for headless session, creating native compositor anyways");
 	}
 
 	xrt_result_t xret = xrt_system_create_session(ics->server->xsys, xsi, &xs, &xcn);
 	if (xret != XRT_SUCCESS) {
-		IPC_WARN(ics->server, "IPC session_create: xrt_system_create_session failed with %d", xret);
 		return xret;
 	}
-	IPC_WARN(ics->server, "IPC session_create: session created successfully");
 
 	ics->client_state.session_overlay = xsi->is_overlay;
 	ics->client_state.z_order = xsi->z_order;
@@ -405,8 +396,6 @@ ipc_handle_session_create(volatile struct ipc_client_state *ics,
 	bool is_appcontainer = ics->client_state.info.ext_win32_appcontainer_compatible_enabled;
 	ics->client_state.session_visible = true;
 	ics->client_state.session_focused = true;
-	IPC_WARN(ics->server, "IPC session_create: setting initial state visible=%d, focused=%d, appcontainer=%d",
-	         ics->client_state.session_visible, ics->client_state.session_focused, is_appcontainer);
 
 	if (!is_appcontainer) {
 		// Native apps: push state immediately
@@ -423,26 +412,11 @@ ipc_handle_session_create(volatile struct ipc_client_state *ics,
 xrt_result_t
 ipc_handle_session_poll_events(volatile struct ipc_client_state *ics, union xrt_session_event *out_xse)
 {
-	static int poll_count = 0;
-
-	// Have we created the session?
 	if (ics->xs == NULL) {
-		IPC_WARN(ics->server, "IPC session_poll_events: session not created");
 		return XRT_ERROR_IPC_SESSION_NOT_CREATED;
 	}
 
-	xrt_result_t xret = xrt_session_poll_events(ics->xs, out_xse);
-
-	// Log first few polls and any events (to confirm client is polling)
-	poll_count++;
-	if (poll_count <= 3) {
-		IPC_WARN(ics->server, "IPC session_poll_events: poll #%d, event_type=%d", poll_count, (int)out_xse->type);
-	}
-	if (out_xse->type != XRT_SESSION_EVENT_NONE) {
-		IPC_WARN(ics->server, "IPC session_poll_events: returning event type=%d", (int)out_xse->type);
-	}
-
-	return xret;
+	return xrt_session_poll_events(ics->xs, out_xse);
 }
 
 xrt_result_t
@@ -450,17 +424,11 @@ ipc_handle_session_begin(volatile struct ipc_client_state *ics)
 {
 	IPC_TRACE_MARKER();
 
-	IPC_WARN(ics->server, "IPC session_begin called");
-
-	// Have we created the session?
 	if (ics->xs == NULL) {
-		IPC_WARN(ics->server, "IPC session_begin: session not created");
 		return XRT_ERROR_IPC_SESSION_NOT_CREATED;
 	}
 
-	// Need to check both because begin session is handled by compositor.
 	if (ics->xc == NULL) {
-		IPC_WARN(ics->server, "IPC session_begin: compositor not created");
 		return XRT_ERROR_IPC_COMPOSITOR_NOT_CREATED;
 	}
 
@@ -1406,8 +1374,6 @@ ipc_handle_compositor_layer_sync(volatile struct ipc_client_state *ics,
 		                      ics->client_state.session_visible,
 		                      ics->client_state.session_focused);
 		ics->client_state.initial_state_pushed = true;
-		IPC_WARN(ics->server, "IPC layer_commit: pushed initial state for AppContainer (visible=%d, focused=%d)",
-		         ics->client_state.session_visible, ics->client_state.session_focused);
 	}
 
 	/*
@@ -1473,8 +1439,6 @@ ipc_handle_compositor_layer_sync_with_semaphore(volatile struct ipc_client_state
 		                      ics->client_state.session_visible,
 		                      ics->client_state.session_focused);
 		ics->client_state.initial_state_pushed = true;
-		IPC_WARN(ics->server, "IPC layer_commit_semaphore: pushed initial state for AppContainer (visible=%d, focused=%d)",
-		         ics->client_state.session_visible, ics->client_state.session_focused);
 	}
 
 	/*
