@@ -1096,7 +1096,7 @@ compositor_get_swapchain_create_properties(struct xrt_compositor *xc,
                                             const struct xrt_swapchain_create_info *info,
                                             struct xrt_swapchain_create_properties *xsccp)
 {
-	xsccp->image_count = 3;  // Triple buffering
+	xsccp->image_count = 1;  // Single buffer like SR Hydra for WebXR compatibility
 	xsccp->extra_bits = (enum xrt_swapchain_usage_bits)0;
 	return XRT_SUCCESS;
 }
@@ -1154,8 +1154,8 @@ compositor_create_swapchain(struct xrt_compositor *xc,
 	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
 	struct d3d11_service_system *sys = c->sys;
 
-	// Use triple buffering
-	uint32_t image_count = 3;
+	// Use single buffer like SR Hydra for WebXR compatibility
+	uint32_t image_count = 1;
 	if (image_count > XRT_MAX_SWAPCHAIN_IMAGES) {
 		image_count = XRT_MAX_SWAPCHAIN_IMAGES;
 	}
