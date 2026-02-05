@@ -464,3 +464,113 @@ float4 PSMain(VS_OUTPUT input) : SV_Target
     return color * color_scale + color_bias;
 }
 )";
+
+//! Constant buffer layout for projection blit (SRGB conversion)
+struct BlitConstants
+{
+	float src_rect[4];      // x, y, width, height in pixels
+	float dst_offset[2];    // x, y destination offset in pixels
+	float src_size[2];      // source texture size
+	float dst_size[2];      // destination texture size
+	float convert_srgb;     // 1.0 if source is SRGB, 0.0 otherwise
+	float padding;
+};
+
+//! Vertex shader for projection blit - draws a quad at specified destination
+static const char *blit_vs_hlsl = R"(
+cbuffer BlitCB : register(b0)
+{
+    float4 src_rect;      // x, y, width, height in pixels
+    float2 dst_offset;    // x, y destination offset in pixels
+    float2 src_size;      // source texture size
+    float2 dst_size;      // destination texture size
+    float convert_srgb;   // 1.0 if source is SRGB
+    float padding;
+};
+
+struct VS_OUTPUT
+{
+    float4 position : SV_Position;
+    float2 uv : TEXCOORD0;
+};
+
+// Fullscreen quad positions
+static const float2 positions[4] = {
+    float2(0, 0),
+    float2(0, 1),
+    float2(1, 0),
+    float2(1, 1),
+};
+
+VS_OUTPUT VSMain(uint vertex_id : SV_VertexID)
+{
+    VS_OUTPUT output;
+
+    float2 uv = positions[vertex_id % 4];
+
+    // Calculate destination position in NDC
+    // dst_offset is where to place the quad, src_rect.zw is the size
+    float2 dst_pos = dst_offset + uv * src_rect.zw;
+
+    // Convert to NDC [-1, 1]
+    float2 ndc = (dst_pos / dst_size) * 2.0 - 1.0;
+    ndc.y = -ndc.y;  // Flip Y for D3D
+
+    output.position = float4(ndc, 0.0, 1.0);
+
+    // Calculate source UV
+    // src_rect.xy is offset, src_rect.zw is extent
+    float2 src_pos = src_rect.xy + uv * src_rect.zw;
+    output.uv = src_pos / src_size;
+
+    return output;
+}
+)";
+
+//! Pixel shader for projection blit with SRGB conversion
+static const char *blit_ps_hlsl = R"(
+cbuffer BlitCB : register(b0)
+{
+    float4 src_rect;
+    float2 dst_offset;
+    float2 src_size;
+    float2 dst_size;
+    float convert_srgb;
+    float padding;
+};
+
+Texture2D src_tex : register(t0);
+SamplerState src_samp : register(s0);
+
+struct VS_OUTPUT
+{
+    float4 position : SV_Position;
+    float2 uv : TEXCOORD0;
+};
+
+// Linear to sRGB encode (gamma compression)
+// When sampling from an SRGB SRV, the GPU auto-linearizes the values.
+// We need to re-encode to sRGB before writing to the non-SRGB stereo texture
+// so the weaver receives sRGB-encoded values (matching SR Hydra's behavior).
+float3 linear_to_srgb(float3 linear_color)
+{
+    // Standard sRGB encode: pow(x, 1/2.2) approximation
+    // SR Hydra uses pow(Color, 1/2.333) which is similar
+    return pow(abs(linear_color), 1.0 / 2.2);
+}
+
+float4 PSMain(VS_OUTPUT input) : SV_Target
+{
+    float4 color = src_tex.Sample(src_samp, input.uv);
+
+    // If source was SRGB, the SRV samples as linear (GPU auto-converts).
+    // We need to encode back to sRGB for the non-SRGB stereo texture
+    // so the weaver interprets the values correctly.
+    if (convert_srgb > 0.5)
+    {
+        color.rgb = linear_to_srgb(color.rgb);
+    }
+
+    return color;
+}
+)";

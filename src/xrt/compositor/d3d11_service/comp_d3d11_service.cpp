@@ -237,6 +237,11 @@ struct d3d11_service_system
 	wil::com_ptr<ID3D11VertexShader> cube_vs;
 	wil::com_ptr<ID3D11PixelShader> cube_ps;
 
+	//! Blit shaders for projection layer copy with SRGB conversion
+	wil::com_ptr<ID3D11VertexShader> blit_vs;
+	wil::com_ptr<ID3D11PixelShader> blit_ps;
+	wil::com_ptr<ID3D11Buffer> blit_constant_buffer;
+
 	//! Constant buffer for layer rendering
 	wil::com_ptr<ID3D11Buffer> layer_constant_buffer;
 
@@ -317,6 +322,45 @@ static inline struct d3d11_service_semaphore *
 d3d11_service_semaphore_from_xrt(struct xrt_compositor_semaphore *xcsem)
 {
 	return reinterpret_cast<struct d3d11_service_semaphore *>(xcsem);
+}
+
+/*!
+ * Check if a DXGI format is an SRGB format.
+ */
+static inline bool
+is_srgb_format(DXGI_FORMAT format)
+{
+	switch (format) {
+	case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+	case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+	case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+	case DXGI_FORMAT_BC1_UNORM_SRGB:
+	case DXGI_FORMAT_BC2_UNORM_SRGB:
+	case DXGI_FORMAT_BC3_UNORM_SRGB:
+	case DXGI_FORMAT_BC7_UNORM_SRGB:
+		return true;
+	default:
+		return false;
+	}
+}
+
+/*!
+ * Get the SRGB variant of a format for SRV creation.
+ * Returns the same format if already SRGB or no SRGB variant exists.
+ */
+static inline DXGI_FORMAT
+get_srgb_format(DXGI_FORMAT format)
+{
+	switch (format) {
+	case DXGI_FORMAT_R8G8B8A8_UNORM:
+		return DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+	case DXGI_FORMAT_B8G8R8A8_UNORM:
+		return DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+	case DXGI_FORMAT_B8G8R8X8_UNORM:
+		return DXGI_FORMAT_B8G8R8X8_UNORM_SRGB;
+	default:
+		return format;  // Return as-is
+	}
 }
 
 
@@ -462,7 +506,35 @@ create_layer_shaders(struct d3d11_service_system *sys)
 		return false;
 	}
 
-	U_LOG_I("Created all layer shaders");
+	// Blit vertex shader (for projection layer copy with SRGB conversion)
+	hr = compile_shader(blit_vs_hlsl, "VSMain", "vs_5_0", &blob);
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to compile blit vertex shader");
+		return false;
+	}
+	hr = sys->device->CreateVertexShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+	                                      sys->blit_vs.put());
+	blob->Release();
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to create blit vertex shader: 0x%08lx", hr);
+		return false;
+	}
+
+	// Blit pixel shader
+	hr = compile_shader(blit_ps_hlsl, "PSMain", "ps_5_0", &blob);
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to compile blit pixel shader");
+		return false;
+	}
+	hr = sys->device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+	                                     sys->blit_ps.put());
+	blob->Release();
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to create blit pixel shader: 0x%08lx", hr);
+		return false;
+	}
+
+	U_LOG_I("Created all layer shaders (including blit)");
 	return true;
 }
 
@@ -482,6 +554,19 @@ create_layer_resources(struct d3d11_service_system *sys)
 	hr = sys->device->CreateBuffer(&cb_desc, nullptr, sys->layer_constant_buffer.put());
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create layer constant buffer: 0x%08lx", hr);
+		return false;
+	}
+
+	// Create blit constant buffer
+	D3D11_BUFFER_DESC blit_cb_desc = {};
+	blit_cb_desc.ByteWidth = static_cast<UINT>((sizeof(BlitConstants) + 15) & ~15);
+	blit_cb_desc.Usage = D3D11_USAGE_DYNAMIC;
+	blit_cb_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+	blit_cb_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+
+	hr = sys->device->CreateBuffer(&blit_cb_desc, nullptr, sys->blit_constant_buffer.put());
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to create blit constant buffer: 0x%08lx", hr);
 		return false;
 	}
 
@@ -560,6 +645,99 @@ create_layer_resources(struct d3d11_service_system *sys)
 
 	U_LOG_I("Created all layer rendering resources");
 	return true;
+}
+
+
+/*
+ *
+ * Projection layer blit with SRGB conversion
+ *
+ */
+
+/*!
+ * Blit a region from source texture to stereo texture with optional SRGB conversion.
+ *
+ * This replaces CopySubresourceRegion when the source is SRGB, ensuring proper
+ * gamma handling. When source is SRGB, the GPU linearizes on sample and we
+ * re-encode to sRGB for the weaver.
+ *
+ * @param sys The system compositor
+ * @param src_tex Source texture to blit from
+ * @param src_srv SRV for the source texture (should be SRGB format if source is SRGB)
+ * @param src_rect Source rectangle (x, y, width, height) in pixels
+ * @param src_size Source texture size (width, height)
+ * @param dst_x Destination X offset in stereo texture
+ * @param dst_y Destination Y offset in stereo texture
+ * @param is_srgb Whether source is SRGB format (triggers gamma conversion)
+ */
+static void
+blit_to_stereo_texture(struct d3d11_service_system *sys,
+                       ID3D11ShaderResourceView *src_srv,
+                       float src_x, float src_y, float src_w, float src_h,
+                       float src_tex_w, float src_tex_h,
+                       float dst_x, float dst_y,
+                       bool is_srgb)
+{
+	// Update blit constant buffer
+	D3D11_MAPPED_SUBRESOURCE mapped;
+	HRESULT hr = sys->context->Map(sys->blit_constant_buffer.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to map blit constant buffer: 0x%08lx", hr);
+		return;
+	}
+
+	BlitConstants *cb = static_cast<BlitConstants *>(mapped.pData);
+	cb->src_rect[0] = src_x;
+	cb->src_rect[1] = src_y;
+	cb->src_rect[2] = src_w;
+	cb->src_rect[3] = src_h;
+	cb->dst_offset[0] = dst_x;
+	cb->dst_offset[1] = dst_y;
+	cb->src_size[0] = src_tex_w;
+	cb->src_size[1] = src_tex_h;
+	cb->dst_size[0] = static_cast<float>(sys->display_width);
+	cb->dst_size[1] = static_cast<float>(sys->display_height);
+	cb->convert_srgb = is_srgb ? 1.0f : 0.0f;
+	cb->padding = 0.0f;
+
+	sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
+
+	// Set up pipeline for blit
+	sys->context->VSSetShader(sys->blit_vs.get(), nullptr, 0);
+	sys->context->PSSetShader(sys->blit_ps.get(), nullptr, 0);
+	sys->context->VSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
+	sys->context->PSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
+	sys->context->PSSetShaderResources(0, 1, &src_srv);
+	sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
+
+	// Set render target to stereo texture
+	ID3D11RenderTargetView *rtvs[] = {sys->stereo_rtv.get()};
+	sys->context->OMSetRenderTargets(1, rtvs, nullptr);
+
+	// Set viewport to cover destination region
+	D3D11_VIEWPORT vp = {};
+	vp.TopLeftX = 0;
+	vp.TopLeftY = 0;
+	vp.Width = static_cast<float>(sys->display_width);
+	vp.Height = static_cast<float>(sys->display_height);
+	vp.MinDepth = 0.0f;
+	vp.MaxDepth = 1.0f;
+	sys->context->RSSetViewports(1, &vp);
+
+	// Set blend state to opaque (overwrite)
+	float blend_factor[4] = {0, 0, 0, 0};
+	sys->context->OMSetBlendState(sys->blend_opaque.get(), blend_factor, 0xFFFFFFFF);
+	sys->context->OMSetDepthStencilState(sys->depth_disabled.get(), 0);
+	sys->context->RSSetState(sys->rasterizer_state.get());
+
+	// Draw fullscreen quad (4 vertices, triangle strip)
+	sys->context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+	sys->context->IASetInputLayout(nullptr);
+	sys->context->Draw(4, 0);
+
+	// Clear shader resources to avoid hazards
+	ID3D11ShaderResourceView *null_srv = nullptr;
+	sys->context->PSSetShaderResources(0, 1, &null_srv);
 }
 
 
@@ -1791,6 +1969,15 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			}
 		}
 
+		// Get texture format to check for SRGB
+		D3D11_TEXTURE2D_DESC left_desc = {};
+		left_tex->GetDesc(&left_desc);
+		bool left_is_srgb = is_srgb_format(left_desc.Format);
+
+		D3D11_TEXTURE2D_DESC right_desc = {};
+		right_tex->GetDesc(&right_desc);
+		bool right_is_srgb = is_srgb_format(right_desc.Format);
+
 		// Log projection layer rect values for debugging SR weaving
 		// Log first frame and every 60 frames
 		static uint32_t proj_log_count = 0;
@@ -1802,44 +1989,119 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			        layer->data.proj.v[1].sub.rect.offset.w, layer->data.proj.v[1].sub.rect.offset.h,
 			        layer->data.proj.v[1].sub.rect.extent.w, layer->data.proj.v[1].sub.rect.extent.h,
 			        layer->data.proj.v[0].sub.array_index, layer->data.proj.v[1].sub.array_index);
-			U_LOG_W("  stereo_texture=%ux%u, view_width=%u, view_height=%u",
-			        sys->display_width, sys->display_height, sys->view_width, sys->view_height);
+			U_LOG_W("  stereo_texture=%ux%u, view_width=%u, view_height=%u, left_fmt=%u(srgb=%d), right_fmt=%u(srgb=%d)",
+			        sys->display_width, sys->display_height, sys->view_width, sys->view_height,
+			        left_desc.Format, left_is_srgb, right_desc.Format, right_is_srgb);
 		}
 		proj_log_count++;
 
-		// Copy left view to left half of stereo texture
-		D3D11_BOX left_box = {};
-		left_box.left = layer->data.proj.v[0].sub.rect.offset.w;
-		left_box.top = layer->data.proj.v[0].sub.rect.offset.h;
-		left_box.right = left_box.left + layer->data.proj.v[0].sub.rect.extent.w;
-		left_box.bottom = left_box.top + layer->data.proj.v[0].sub.rect.extent.h;
-		left_box.front = 0;
-		left_box.back = 1;
+		// Source rect values
+		float left_src_x = static_cast<float>(layer->data.proj.v[0].sub.rect.offset.w);
+		float left_src_y = static_cast<float>(layer->data.proj.v[0].sub.rect.offset.h);
+		float left_src_w = static_cast<float>(layer->data.proj.v[0].sub.rect.extent.w);
+		float left_src_h = static_cast<float>(layer->data.proj.v[0].sub.rect.extent.h);
 
-		sys->context->CopySubresourceRegion(
-		    sys->stereo_texture.get(),
-		    0,             // dst subresource
-		    0, 0, 0,       // dst x, y, z (left half)
-		    left_tex,
-		    layer->data.proj.v[0].sub.array_index,  // src subresource
-		    &left_box);
+		float right_src_x = static_cast<float>(layer->data.proj.v[1].sub.rect.offset.w);
+		float right_src_y = static_cast<float>(layer->data.proj.v[1].sub.rect.offset.h);
+		float right_src_w = static_cast<float>(layer->data.proj.v[1].sub.rect.extent.w);
+		float right_src_h = static_cast<float>(layer->data.proj.v[1].sub.rect.extent.h);
 
-		// Copy right view to right half of stereo texture
-		D3D11_BOX right_box = {};
-		right_box.left = layer->data.proj.v[1].sub.rect.offset.w;
-		right_box.top = layer->data.proj.v[1].sub.rect.offset.h;
-		right_box.right = right_box.left + layer->data.proj.v[1].sub.rect.extent.w;
-		right_box.bottom = right_box.top + layer->data.proj.v[1].sub.rect.extent.h;
-		right_box.front = 0;
-		right_box.back = 1;
+		// Use shader-based blit for SRGB textures, CopySubresourceRegion for non-SRGB
+		if (left_is_srgb && sys->blit_vs && sc_left->images[left_index].srv) {
+			// Create SRGB SRV if needed for proper gamma handling
+			// The existing SRV might not be SRGB format, so we create a temp one
+			wil::com_ptr<ID3D11ShaderResourceView> srgb_srv;
+			D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+			srv_desc.Format = get_srgb_format(left_desc.Format);
+			srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+			srv_desc.Texture2D.MipLevels = 1;
+			srv_desc.Texture2D.MostDetailedMip = 0;
 
-		sys->context->CopySubresourceRegion(
-		    sys->stereo_texture.get(),
-		    0,                            // dst subresource
-		    sys->view_width, 0, 0,        // dst x, y, z (right half)
-		    right_tex,
-		    layer->data.proj.v[1].sub.array_index,  // src subresource
-		    &right_box);
+			HRESULT hr = sys->device->CreateShaderResourceView(left_tex, &srv_desc, srgb_srv.put());
+			if (SUCCEEDED(hr)) {
+				blit_to_stereo_texture(sys, srgb_srv.get(),
+				                       left_src_x, left_src_y, left_src_w, left_src_h,
+				                       static_cast<float>(left_desc.Width), static_cast<float>(left_desc.Height),
+				                       0.0f, 0.0f,
+				                       true);  // is_srgb = true
+			} else {
+				U_LOG_W("Failed to create SRGB SRV for left eye, falling back to copy");
+				// Fall back to copy
+				D3D11_BOX left_box = {};
+				left_box.left = static_cast<UINT>(left_src_x);
+				left_box.top = static_cast<UINT>(left_src_y);
+				left_box.right = static_cast<UINT>(left_src_x + left_src_w);
+				left_box.bottom = static_cast<UINT>(left_src_y + left_src_h);
+				left_box.front = 0;
+				left_box.back = 1;
+				sys->context->CopySubresourceRegion(sys->stereo_texture.get(), 0, 0, 0, 0,
+				                                     left_tex, layer->data.proj.v[0].sub.array_index, &left_box);
+			}
+		} else {
+			// Non-SRGB: use fast CopySubresourceRegion
+			D3D11_BOX left_box = {};
+			left_box.left = static_cast<UINT>(left_src_x);
+			left_box.top = static_cast<UINT>(left_src_y);
+			left_box.right = static_cast<UINT>(left_src_x + left_src_w);
+			left_box.bottom = static_cast<UINT>(left_src_y + left_src_h);
+			left_box.front = 0;
+			left_box.back = 1;
+
+			sys->context->CopySubresourceRegion(
+			    sys->stereo_texture.get(),
+			    0,             // dst subresource
+			    0, 0, 0,       // dst x, y, z (left half)
+			    left_tex,
+			    layer->data.proj.v[0].sub.array_index,  // src subresource
+			    &left_box);
+		}
+
+		// Handle right eye similarly
+		if (right_is_srgb && sys->blit_vs && sc_right->images[right_index].srv) {
+			wil::com_ptr<ID3D11ShaderResourceView> srgb_srv;
+			D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+			srv_desc.Format = get_srgb_format(right_desc.Format);
+			srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+			srv_desc.Texture2D.MipLevels = 1;
+			srv_desc.Texture2D.MostDetailedMip = 0;
+
+			HRESULT hr = sys->device->CreateShaderResourceView(right_tex, &srv_desc, srgb_srv.put());
+			if (SUCCEEDED(hr)) {
+				blit_to_stereo_texture(sys, srgb_srv.get(),
+				                       right_src_x, right_src_y, right_src_w, right_src_h,
+				                       static_cast<float>(right_desc.Width), static_cast<float>(right_desc.Height),
+				                       static_cast<float>(sys->view_width), 0.0f,
+				                       true);  // is_srgb = true
+			} else {
+				U_LOG_W("Failed to create SRGB SRV for right eye, falling back to copy");
+				D3D11_BOX right_box = {};
+				right_box.left = static_cast<UINT>(right_src_x);
+				right_box.top = static_cast<UINT>(right_src_y);
+				right_box.right = static_cast<UINT>(right_src_x + right_src_w);
+				right_box.bottom = static_cast<UINT>(right_src_y + right_src_h);
+				right_box.front = 0;
+				right_box.back = 1;
+				sys->context->CopySubresourceRegion(sys->stereo_texture.get(), 0, sys->view_width, 0, 0,
+				                                     right_tex, layer->data.proj.v[1].sub.array_index, &right_box);
+			}
+		} else {
+			// Non-SRGB: use fast CopySubresourceRegion
+			D3D11_BOX right_box = {};
+			right_box.left = static_cast<UINT>(right_src_x);
+			right_box.top = static_cast<UINT>(right_src_y);
+			right_box.right = static_cast<UINT>(right_src_x + right_src_w);
+			right_box.bottom = static_cast<UINT>(right_src_y + right_src_h);
+			right_box.front = 0;
+			right_box.back = 1;
+
+			sys->context->CopySubresourceRegion(
+			    sys->stereo_texture.get(),
+			    0,                            // dst subresource
+			    sys->view_width, 0, 0,        // dst x, y, z (right half)
+			    right_tex,
+			    layer->data.proj.v[1].sub.array_index,  // src subresource
+			    &right_box);
+		}
 
 		// Release KeyedMutex after reading
 		if (left_mutex_acquired) {
