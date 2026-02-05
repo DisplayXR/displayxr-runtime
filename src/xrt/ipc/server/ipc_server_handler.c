@@ -396,13 +396,25 @@ ipc_handle_session_create(volatile struct ipc_client_state *ics,
 
 	// Set initial state to visible and focused (matching in-process behavior)
 	// The client_state fields may be false initially, but we want the session
-	// to start as visible/focused so the OXR state machine can progress
+	// to start as visible/focused so the OXR state machine can progress.
+	//
+	// EXCEPTION: AppContainer apps (Chrome WebXR) crash if they receive FOCUSED
+	// before their frame loop is ready. For these apps, we set visible/focused
+	// but DON'T push the state change event yet - it will be pushed on first
+	// layer_commit (xrEndFrame) instead.
+	bool is_appcontainer = ics->client_state.info.ext_win32_appcontainer_compatible_enabled;
 	ics->client_state.session_visible = true;
 	ics->client_state.session_focused = true;
-	IPC_WARN(ics->server, "IPC session_create: setting initial state visible=%d, focused=%d",
-	         ics->client_state.session_visible, ics->client_state.session_focused);
-	xrt_syscomp_set_state(ics->server->xsysc, ics->xc, ics->client_state.session_visible,
-	                      ics->client_state.session_focused);
+	IPC_WARN(ics->server, "IPC session_create: setting initial state visible=%d, focused=%d, appcontainer=%d",
+	         ics->client_state.session_visible, ics->client_state.session_focused, is_appcontainer);
+
+	if (!is_appcontainer) {
+		// Native apps: push state immediately
+		xrt_syscomp_set_state(ics->server->xsysc, ics->xc, ics->client_state.session_visible,
+		                      ics->client_state.session_focused);
+	}
+	// AppContainer apps: state will be pushed on first layer_commit
+
 	xrt_syscomp_set_z_order(ics->server->xsysc, ics->xc, ics->client_state.z_order);
 
 	return XRT_SUCCESS;
@@ -1386,6 +1398,17 @@ ipc_handle_compositor_layer_sync(volatile struct ipc_client_state *ics,
 
 	xrt_comp_layer_commit(ics->xc, sync_handle);
 
+	// For AppContainer apps (Chrome WebXR), push visible/focused state on first layer_commit
+	// This is deferred from session_create to give the app time to set up its frame loop
+	if (!ics->client_state.initial_state_pushed &&
+	    ics->client_state.info.ext_win32_appcontainer_compatible_enabled) {
+		xrt_syscomp_set_state(ics->server->xsysc, ics->xc,
+		                      ics->client_state.session_visible,
+		                      ics->client_state.session_focused);
+		ics->client_state.initial_state_pushed = true;
+		IPC_WARN(ics->server, "IPC layer_commit: pushed initial state for AppContainer (visible=%d, focused=%d)",
+		         ics->client_state.session_visible, ics->client_state.session_focused);
+	}
 
 	/*
 	 * Manage shared state.
@@ -1442,6 +1465,17 @@ ipc_handle_compositor_layer_sync_with_semaphore(volatile struct ipc_client_state
 
 	xrt_comp_layer_commit_with_semaphore(ics->xc, xcsem, semaphore_value);
 
+	// For AppContainer apps (Chrome WebXR), push visible/focused state on first layer_commit
+	// This is deferred from session_create to give the app time to set up its frame loop
+	if (!ics->client_state.initial_state_pushed &&
+	    ics->client_state.info.ext_win32_appcontainer_compatible_enabled) {
+		xrt_syscomp_set_state(ics->server->xsysc, ics->xc,
+		                      ics->client_state.session_visible,
+		                      ics->client_state.session_focused);
+		ics->client_state.initial_state_pushed = true;
+		IPC_WARN(ics->server, "IPC layer_commit_semaphore: pushed initial state for AppContainer (visible=%d, focused=%d)",
+		         ics->client_state.session_visible, ics->client_state.session_focused);
+	}
 
 	/*
 	 * Manage shared state.
