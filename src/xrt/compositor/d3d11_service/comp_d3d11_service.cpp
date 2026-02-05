@@ -2053,6 +2053,11 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 		U_LOG_W("  format[%u] = %lld (VkFormat)", i, (long long)c->base.base.info.formats[i]);
 	}
 
+	// Set initial visibility/focus state (will be returned to client via IPC)
+	// This avoids race condition where client must poll events before these are set
+	c->base.base.info.initial_visible = true;
+	c->base.base.info.initial_focused = true;
+
 	U_LOG_W("D3D11 service: created native compositor for client");
 
 	*out_xcn = &c->base;

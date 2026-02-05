@@ -981,6 +981,12 @@ struct xrt_compositor_info
 
 	//! If true, the client compositor should not use external fence sync (use CPU fallback instead).
 	bool disable_fence_sync;
+
+	//! Initial visibility state (returned from server to avoid race condition in IPC mode)
+	bool initial_visible;
+
+	//! Initial focus state (returned from server to avoid race condition in IPC mode)
+	bool initial_focused;
 };
 
 /*!
