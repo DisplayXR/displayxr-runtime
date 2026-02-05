@@ -1339,6 +1339,16 @@ oxr_session_frame_wait(struct oxr_logger *log, struct oxr_session *sess, XrFrame
 		return oxr_session_success_result(sess);
 	}
 
+	// For AppContainer apps (Chrome WebXR), deliver the deferred VISIBLE/FOCUSED
+	// state transitions at the start of xrWaitFrame. This is earlier than xrEndFrame
+	// and allows Chrome to proceed with its frame loop.
+	if (sess->is_appcontainer &&
+	    sess->state == XR_SESSION_STATE_SYNCHRONIZED &&
+	    sess->compositor_visible && sess->compositor_focused) {
+		oxr_session_change_state(log, sess, XR_SESSION_STATE_VISIBLE, 0);
+		oxr_session_change_state(log, sess, XR_SESSION_STATE_FOCUSED, 0);
+	}
+
 	if (sess->frame_timing_spew) {
 		oxr_log(log, "Called at %8.3fms", ts_ms(sess));
 	}
