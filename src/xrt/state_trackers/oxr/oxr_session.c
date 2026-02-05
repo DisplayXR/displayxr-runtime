@@ -1156,28 +1156,10 @@ oxr_session_locate_views(struct oxr_logger *log,
 		m_relation_chain_resolve(&xrc, &result);
 		OXR_XRT_POSE_TO_XRPOSEF(result.pose, views[i].pose);
 
-#ifdef XRT_HAVE_LEIA_SR_EYE_TRACKING
-		// For SR eye tracking, override with absolute eye positions
-		// (The space relation chain above is for the normal HMD path)
-		if (have_sr_eye_tracking && view_count == 2) {
-			if (i == 0) {
-				// Left eye - absolute position
-				views[i].pose.position.x = eye_pair.left.x;
-				views[i].pose.position.y = eye_pair.left.y;
-				views[i].pose.position.z = eye_pair.left.z;
-			} else {
-				// Right eye - absolute position
-				views[i].pose.position.x = eye_pair.right.x;
-				views[i].pose.position.y = eye_pair.right.y;
-				views[i].pose.position.z = eye_pair.right.z;
-			}
-			// Identity orientation (looking straight at screen)
-			views[i].pose.orientation.x = 0.0f;
-			views[i].pose.orientation.y = 0.0f;
-			views[i].pose.orientation.z = 0.0f;
-			views[i].pose.orientation.w = 1.0f;
-		}
-#endif
+		// NOTE: For SR eye tracking, the view poses are already computed earlier
+		// in this function with the player transform applied (world_head_pos +
+		// rotated eye offsets). We do NOT override them here - the relation chain
+		// above correctly combines the transformed poses with the base space.
 
 		/*
 		 * Fov
