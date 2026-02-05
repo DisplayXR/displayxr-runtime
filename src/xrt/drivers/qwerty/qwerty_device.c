@@ -218,6 +218,21 @@ qwerty_get_tracked_pose(struct xrt_device *xd,
 	};
 	math_quat_rotate_vec3(&qd->pose.orientation, &pos_delta, &pos_delta);
 	pos_delta.y += mov_speed * (qd->up_pressed - qd->down_pressed);
+
+	// Debug: log movement when keys pressed
+	bool any_movement = qd->forward_pressed || qd->backward_pressed || qd->left_pressed ||
+	                    qd->right_pressed || qd->up_pressed || qd->down_pressed;
+	if (any_movement) {
+		static int log_counter = 0;
+		if (log_counter++ % 60 == 0) { // Log once per ~60 calls to avoid spam
+			U_LOG_W("QWERTY pose: F=%d B=%d L=%d R=%d U=%d D=%d delta=(%.4f,%.4f,%.4f) pos=(%.3f,%.3f,%.3f)",
+			        qd->forward_pressed, qd->backward_pressed, qd->left_pressed,
+			        qd->right_pressed, qd->up_pressed, qd->down_pressed,
+			        pos_delta.x, pos_delta.y, pos_delta.z,
+			        qd->pose.position.x, qd->pose.position.y, qd->pose.position.z);
+		}
+	}
+
 	math_vec3_accum(&pos_delta, &qd->pose.position);
 
 	// Orientation
