@@ -1158,10 +1158,48 @@ oxr_session_locate_views(struct oxr_logger *log,
 		m_relation_chain_resolve(&xrc, &result);
 		OXR_XRT_POSE_TO_XRPOSEF(result.pose, views[i].pose);
 
-		// NOTE: For SR eye tracking, the view poses are already computed earlier
-		// in this function with the player transform applied (world_head_pos +
-		// rotated eye offsets). We do NOT override them here - the relation chain
-		// above correctly combines the transformed poses with the base space.
+#ifdef XRT_HAVE_LEIA_SR_EYE_TRACKING
+		// For SR eye tracking, bypass the relation chain and set view poses directly.
+		// The eye positions from SR SDK are in display space; we apply the player
+		// transform (from qwerty device) to move the virtual world.
+		if (have_sr_eye_tracking && view_count == 2) {
+			// Get the raw eye position for this view
+			struct xrt_vec3 eye_pos;
+			if (i == 0) {
+				eye_pos.x = eye_pair.left.x;
+				eye_pos.y = eye_pair.left.y;
+				eye_pos.z = eye_pair.left.z;
+			} else {
+				eye_pos.x = eye_pair.right.x;
+				eye_pos.y = eye_pair.right.y;
+				eye_pos.z = eye_pair.right.z;
+			}
+
+			// Apply player transform: worldPos = playerOri * localPos + playerPos
+			if (have_player_transform) {
+				struct xrt_vec3 rotated_pos;
+				math_quat_rotate_vec3(&player_pose.orientation, &eye_pos, &rotated_pos);
+				views[i].pose.position.x = rotated_pos.x + player_pose.position.x;
+				views[i].pose.position.y = rotated_pos.y + player_pose.position.y;
+				views[i].pose.position.z = rotated_pos.z + player_pose.position.z;
+				// Apply player orientation to view
+				views[i].pose.orientation.x = player_pose.orientation.x;
+				views[i].pose.orientation.y = player_pose.orientation.y;
+				views[i].pose.orientation.z = player_pose.orientation.z;
+				views[i].pose.orientation.w = player_pose.orientation.w;
+			} else {
+				// No player transform - use raw eye positions
+				views[i].pose.position.x = eye_pos.x;
+				views[i].pose.position.y = eye_pos.y;
+				views[i].pose.position.z = eye_pos.z;
+				// Identity orientation (looking straight at screen)
+				views[i].pose.orientation.x = 0.0f;
+				views[i].pose.orientation.y = 0.0f;
+				views[i].pose.orientation.z = 0.0f;
+				views[i].pose.orientation.w = 1.0f;
+			}
+		}
+#endif
 
 		/*
 		 * Fov
