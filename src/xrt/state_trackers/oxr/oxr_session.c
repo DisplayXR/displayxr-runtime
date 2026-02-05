@@ -896,6 +896,29 @@ oxr_session_locate_views(struct oxr_logger *log,
 	static int sr_log_counter = 0;
 	bool sr_should_log = (++sr_log_counter % 120) == 1; // Log every ~2 seconds at 60fps
 
+	// Get qwerty device offset (allows WASD movement to work with SR eye tracking)
+	// The qwerty device provides a "virtual world offset" that gets added to eye positions
+	struct xrt_vec3 qwerty_offset = {0.0f, 0.0f, 0.0f};
+	{
+		struct xrt_space_relation qwerty_relation = XRT_SPACE_RELATION_ZERO;
+		xrt_result_t qret = xrt_device_get_tracked_pose(
+		    xdev, XRT_INPUT_GENERIC_HEAD_POSE, xdisplay_time, &qwerty_relation);
+		if (qret == XRT_SUCCESS &&
+		    (qwerty_relation.relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT)) {
+			// Subtract initial position (1.6m height) to get the offset
+			// The qwerty device starts at (0, 1.6, 0), so offset = pose - initial
+			qwerty_offset.x = qwerty_relation.pose.position.x;
+			qwerty_offset.y = qwerty_relation.pose.position.y - 1.6f; // subtract initial height
+			qwerty_offset.z = qwerty_relation.pose.position.z;
+
+			if (sr_should_log && (qwerty_offset.x != 0.0f || qwerty_offset.y != 0.0f ||
+			                      qwerty_offset.z != 0.0f)) {
+				U_LOG_W("QWERTY offset applied: (%.3f, %.3f, %.3f)",
+				        qwerty_offset.x, qwerty_offset.y, qwerty_offset.z);
+			}
+		}
+	}
+
 	bool got_eye_positions = oxr_session_get_predicted_eye_positions(sess, &eye_pair);
 
 	if (sr_should_log) {
@@ -918,7 +941,13 @@ oxr_session_locate_views(struct oxr_logger *log,
 		    (eye_pair.left.z + eye_pair.right.z) / 2.0f,
 		};
 
-		// Head relation: position at eye midpoint, identity orientation (facing screen)
+		// Apply qwerty offset to head position (allows WASD movement with SR eye tracking)
+		// This moves the virtual world while keeping the Kooima perspective correct
+		head_pos.x += qwerty_offset.x;
+		head_pos.y += qwerty_offset.y;
+		head_pos.z += qwerty_offset.z;
+
+		// Head relation: position at eye midpoint + qwerty offset, identity orientation
 		T_xdev_head.pose.position = head_pos;
 		T_xdev_head.pose.orientation = (struct xrt_quat)XRT_QUAT_IDENTITY;
 		T_xdev_head.relation_flags = XRT_SPACE_RELATION_POSITION_VALID_BIT |
