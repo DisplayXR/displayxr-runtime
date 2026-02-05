@@ -80,6 +80,7 @@ struct xrt_application_info
 	bool fb_face_tracking2_enabled;
 	bool meta_body_tracking_full_body_enabled;
 	bool meta_body_tracking_calibration_enabled;
+	bool ext_win32_appcontainer_compatible_enabled;  //!< Chrome WebXR uses this
 };
 
 /*!

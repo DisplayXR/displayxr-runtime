@@ -328,6 +328,9 @@ oxr_instance_create(struct oxr_logger *log,
 #ifdef OXR_HAVE_META_body_tracking_calibration
 	    .meta_body_tracking_calibration_enabled = extensions->META_body_tracking_calibration,
 #endif
+#ifdef OXR_HAVE_EXT_win32_appcontainer_compatible
+	    .ext_win32_appcontainer_compatible_enabled = extensions->EXT_win32_appcontainer_compatible,
+#endif
 	};
 	snprintf(i_info.app_info.application_name, sizeof(i_info.app_info.application_name), "%s",
 	         createInfo->applicationInfo.applicationName);

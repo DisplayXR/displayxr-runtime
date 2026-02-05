@@ -316,6 +316,7 @@ struct ipc_app_state
 	bool session_focused;
 	bool session_overlay;
 	bool io_active;
+	bool initial_state_pushed;  //!< For AppContainer apps, track if we've pushed visible/focused
 	uint32_t z_order;
 	pid_t pid;
 	struct xrt_application_info info;
