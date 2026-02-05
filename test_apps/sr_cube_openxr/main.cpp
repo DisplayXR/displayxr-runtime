@@ -6,6 +6,11 @@
  *
  * This application demonstrates OpenXR without the XR_EXT_session_target extension.
  * Monado will create its own window for rendering.
+ *
+ * Input is handled by Monado's qwerty driver (QWERTY_ENABLE=true):
+ * - WASD: Move camera
+ * - Mouse drag: Look around
+ * - ESC: Close window and exit
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -15,7 +20,6 @@
 #include <wrl/client.h>
 
 #include "logging.h"
-#include "input_handler.h"
 #include "d3d11_renderer.h"
 #include "xr_session.h"
 
@@ -27,84 +31,8 @@ using namespace DirectX;
 // Application name for logging
 static const char* APP_NAME = "sr_cube_openxr";
 
-// Window settings (control window only - not for XR rendering)
-static const wchar_t* WINDOW_CLASS = L"SRCubeOpenXRClass";
-static const wchar_t* WINDOW_TITLE = L"SR Cube OpenXR - Control Window (Press ESC to exit)";
-
 // Global state
-static InputState g_inputState;
 static bool g_running = true;
-static UINT g_windowWidth = 640;
-static UINT g_windowHeight = 480;
-
-// Window procedure (control window only)
-LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    UpdateInputState(g_inputState, msg, wParam, lParam);
-
-    switch (msg) {
-    case WM_CLOSE:
-        g_running = false;
-        PostQuitMessage(0);
-        return 0;
-
-    case WM_KEYDOWN:
-        if (wParam == VK_ESCAPE) {
-            g_running = false;
-            PostQuitMessage(0);
-            return 0;
-        }
-        break;
-    }
-
-    return DefWindowProc(hwnd, msg, wParam, lParam);
-}
-
-// Create a small control window (not for XR rendering)
-static HWND CreateControlWindow(HINSTANCE hInstance, int width, int height) {
-    LOG_INFO("Creating control window (%dx%d) - NOT used for XR rendering", width, height);
-
-    WNDCLASSEX wc = {};
-    wc.cbSize = sizeof(WNDCLASSEX);
-    wc.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
-    wc.lpfnWndProc = WindowProc;
-    wc.hInstance = hInstance;
-    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)GetStockObject(GRAY_BRUSH);
-    wc.lpszClassName = WINDOW_CLASS;
-
-    if (!RegisterClassEx(&wc)) {
-        DWORD err = GetLastError();
-        if (err != ERROR_CLASS_ALREADY_EXISTS) {
-            LOG_ERROR("Failed to register window class, error: %lu", err);
-            return nullptr;
-        }
-    }
-
-    RECT rect = { 0, 0, width, height };
-    AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
-
-    HWND hwnd = CreateWindowEx(
-        0,
-        WINDOW_CLASS,
-        WINDOW_TITLE,
-        WS_OVERLAPPEDWINDOW,
-        100, 100,
-        rect.right - rect.left,
-        rect.bottom - rect.top,
-        nullptr,
-        nullptr,
-        hInstance,
-        nullptr
-    );
-
-    if (!hwnd) {
-        LOG_ERROR("Failed to create control window, error: %lu", GetLastError());
-        return nullptr;
-    }
-
-    LOG_INFO("Control window created: 0x%p", hwnd);
-    return hwnd;
-}
 
 // Performance tracking
 struct PerformanceStats {
@@ -135,8 +63,10 @@ static void UpdatePerformanceStats(PerformanceStats& stats) {
 
 // Main entry point
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+    (void)hInstance;
     (void)hPrevInstance;
     (void)lpCmdLine;
+    (void)nCmdShow;
 
     // Initialize logging
     if (!InitializeLogging(APP_NAME)) {
@@ -145,14 +75,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     LOG_INFO("=== SR Cube OpenXR Application ===");
     LOG_INFO("OpenXR standard mode (Monado creates window)");
-
-    // Create control window
-    HWND hwnd = CreateControlWindow(hInstance, g_windowWidth, g_windowHeight);
-    if (!hwnd) {
-        LOG_ERROR("Failed to create control window");
-        ShutdownLogging();
-        return 1;
-    }
+    LOG_INFO("Input handled by Monado's qwerty driver (set QWERTY_ENABLE=true)");
 
     // Add SRMonado to DLL search path
     {
@@ -173,7 +96,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     XrSessionManager xr = {};
     if (!InitializeOpenXR(xr)) {
         LOG_ERROR("OpenXR initialization failed");
-        MessageBox(hwnd, L"Failed to initialize OpenXR", L"Error", MB_OK | MB_ICONERROR);
+        MessageBox(nullptr, L"Failed to initialize OpenXR", L"Error", MB_OK | MB_ICONERROR);
         ShutdownLogging();
         return 1;
     }
@@ -192,7 +115,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     D3D11Renderer renderer = {};
     if (!InitializeD3D11WithLUID(renderer, adapterLuid)) {
         LOG_ERROR("D3D11 initialization failed");
-        MessageBox(hwnd, L"Failed to initialize D3D11", L"Error", MB_OK | MB_ICONERROR);
+        MessageBox(nullptr, L"Failed to initialize D3D11", L"Error", MB_OK | MB_ICONERROR);
         CleanupOpenXR(xr);
         ShutdownLogging();
         return 1;
@@ -202,7 +125,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     LOG_INFO("Creating OpenXR session...");
     if (!CreateSession(xr, renderer.device.Get())) {
         LOG_ERROR("OpenXR session creation failed");
-        MessageBox(hwnd, L"Failed to create OpenXR session", L"Error", MB_OK | MB_ICONERROR);
+        MessageBox(nullptr, L"Failed to create OpenXR session", L"Error", MB_OK | MB_ICONERROR);
         CleanupD3D11(renderer);
         CleanupOpenXR(xr);
         ShutdownLogging();
@@ -237,10 +160,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         LOG_INFO("Eye %d: enumerated %u D3D11 swapchain images", eye, count);
     }
 
-    // Show control window
-    ShowWindow(hwnd, nCmdShow);
-    UpdateWindow(hwnd);
-
     // Create depth buffers for each eye
     ComPtr<ID3D11Texture2D> depthTextures[2];
     ComPtr<ID3D11DepthStencilView> depthDSVs[2];
@@ -265,30 +184,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     LOG_INFO("");
     LOG_INFO("=== Entering main loop ===");
-    LOG_INFO("XR rendering happens in Monado's window, not the control window");
-    LOG_INFO("Controls: WASD=Fly, QE=Up/Down, Mouse=Look, Space/DblClick=Reset, P=Parallax, TAB=HUD, ESC=Quit");
+    LOG_INFO("Rendering in Monado's window (input via qwerty driver)");
+    LOG_INFO("Controls: WASD=Move, QE=Up/Down, Mouse=Look, ESC=Quit");
     LOG_INFO("");
 
-    // Main loop
-    MSG msg = {};
+    // Main loop - no window, just process OpenXR frames
+    // Exit when OpenXR session ends (user closes Monado window or presses ESC)
     while (g_running && !xr.exitRequested) {
-        // Process Windows messages
-        while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
-            if (msg.message == WM_QUIT) {
-                g_running = false;
-                RequestExit(xr);
-            }
-            TranslateMessage(&msg);
-            DispatchMessage(&msg);
-        }
-
-        if (!g_running) break;
-
         // Update performance stats
         UpdatePerformanceStats(perfStats);
-
-        // Update input-based camera movement
-        UpdateCameraMovement(g_inputState, perfStats.deltaTime);
 
         // Update scene (cube rotation)
         UpdateScene(renderer, perfStats.deltaTime);
@@ -306,11 +210,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                     XMMATRIX leftViewMatrix, leftProjMatrix;
                     XMMATRIX rightViewMatrix, rightProjMatrix;
 
+                    // Camera movement is handled by Monado's qwerty driver
+                    // Pass zeros for player transform - XR poses already include qwerty input
                     if (LocateViews(xr, frameState.predictedDisplayTime,
                         leftViewMatrix, leftProjMatrix,
                         rightViewMatrix, rightProjMatrix,
-                        g_inputState.cameraPosX, g_inputState.cameraPosY, g_inputState.cameraPosZ,
-                        g_inputState.yaw, g_inputState.pitch)) {
+                        0.0f, 0.0f, 0.0f,  // playerPos (handled by qwerty)
+                        0.0f, 0.0f)) {     // playerYaw/Pitch (handled by qwerty)
 
                         // Get raw view poses (pre-player-transform) for projection views
                         XrViewLocateInfo locateInfo = {XR_TYPE_VIEW_LOCATE_INFO};
@@ -323,10 +229,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                         XrView rawViews[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
                         xrLocateViews(xr.session, &locateInfo, &viewState, 2, &viewCount, rawViews);
 
-                        // [Commented out — will be reused for 3D-positioned HUD later]
-                        // ConvergencePlane convPlane = LocateConvergencePlane(rawViews);
-
-                        // Render each eye with screen-space HUD overlay
+                        // Render each eye
                         for (int eye = 0; eye < 2; eye++) {
                             uint32_t imageIndex;
                             if (AcquireSwapchainImage(xr, eye, imageIndex)) {
@@ -353,10 +256,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                                 XMMATRIX viewMatrix = (eye == 0) ? leftViewMatrix : rightViewMatrix;
                                 XMMATRIX projMatrix = (eye == 0) ? leftProjMatrix : rightProjMatrix;
 
+                                // zoomScale = 1.0 (no zoom control without input handler)
                                 RenderScene(renderer, rtv, depthDSVs[eye].Get(),
                                     renderW, renderH,
                                     viewMatrix, projMatrix,
-                                    g_inputState.zoomScale);
+                                    1.0f);
 
                                 if (rtv) rtv->Release();
 
@@ -398,9 +302,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     CleanupOpenXR(xr);
     CleanupD3D11(renderer);
-
-    DestroyWindow(hwnd);
-    UnregisterClass(WINDOW_CLASS, hInstance);
 
     LOG_INFO("Application shutdown complete");
     ShutdownLogging();

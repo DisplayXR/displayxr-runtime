@@ -163,7 +163,7 @@ qwerty_process_win32(struct xrt_device **xdevs,
 		default_qdev = default_qwerty_device(xdevs, xdev_count, qsys);
 		default_qctrl = default_qwerty_controller(xdevs, xdev_count, qsys);
 		cached = true;
-		U_LOG_W("QWERTY Win32 input initialized - WASDQE to move, arrows to rotate, left-click+drag to look");
+		U_LOG_W("QWERTY Win32 input initialized - WASDQE move, left-click+drag look, ESC quit");
 		U_LOG_W("QWERTY Win32: qsys=%p hmd=%p lctrl=%p rctrl=%p process_keys=%d",
 		        (void *)qsys, (void *)qsys->hmd, (void *)qsys->lctrl, (void *)qsys->rctrl, qsys->process_keys);
 	}
@@ -430,6 +430,17 @@ qwerty_process_win32(struct xrt_device **xdevs,
 					// Reset both controllers
 					qwerty_reset_controller_pose(qleft);
 					qwerty_reset_controller_pose(qright);
+				}
+			}
+			break;
+
+		// ESC key to close window
+		case VK_ESCAPE:
+			if (is_keydown) {
+				U_LOG_W("QWERTY Win32: ESC pressed - closing window");
+				HWND hwnd = GetActiveWindow();
+				if (hwnd != NULL) {
+					PostMessageW(hwnd, WM_CLOSE, 0, 0);
 				}
 			}
 			break;
