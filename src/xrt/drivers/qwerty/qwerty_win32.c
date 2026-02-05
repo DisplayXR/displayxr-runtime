@@ -7,6 +7,10 @@
  * This allows keyboard/mouse input from the main D3D11 window to control
  * qwerty devices without requiring the SDL debug GUI window.
  *
+ * NOTE: This is only used when Monado creates its own window (no HWND
+ * provided via XR_EXT_session_target). When an app provides its own window,
+ * the app handles input directly and this code is never called.
+ *
  * @author David Fattal
  * @ingroup drv_qwerty
  */
@@ -23,9 +27,10 @@
 #include <string.h>
 #include <stdbool.h>
 
-// Amount of look_speed units a mouse delta of 1px in screen space will rotate the device
-// Match sr_cube_openxr_ext sensitivity (0.005f) for consistent feel
-#define SENSITIVITY 0.005f
+// Amount of look_speed units a mouse delta of 1px in screen space will rotate the device.
+// This value is multiplied by look_speed (0.02 for HMD) in qwerty_add_look_delta().
+// To match sr_cube_openxr_ext (0.005 rad/px): 0.25 * 0.02 = 0.005
+#define SENSITIVITY 0.25f
 
 /*!
  * Find the qwerty_system from the device list.
