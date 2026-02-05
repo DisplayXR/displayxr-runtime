@@ -1837,6 +1837,10 @@ struct oxr_session
 	//! Used to delay session state transitions for AppContainer sandbox compatibility.
 	bool is_appcontainer;
 
+	//! For AppContainer apps: true after SYNCHRONIZED state has been polled by app.
+	//! Used to delay VISIBLE/FOCUSED until the poll AFTER SYNCHRONIZED is delivered.
+	bool appcontainer_synchronized_polled;
+
 	struct oxr_session *next;
 
 	XrSessionState state;

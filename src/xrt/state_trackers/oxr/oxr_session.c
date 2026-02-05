@@ -775,14 +775,27 @@ oxr_session_poll(struct oxr_logger *log, struct oxr_session *sess)
 	}
 
 	// For AppContainer apps (Chrome WebXR), delay VISIBLE/FOCUSED transitions
-	// until first xrEndFrame. This matches SRHydra behavior and prevents Chrome
-	// from crashing due to receiving these states before it's ready.
-	// The transitions will happen in oxr_session_frame_end.c instead.
-	if (sess->state == XR_SESSION_STATE_SYNCHRONIZED && sess->compositor_visible && !sess->is_appcontainer) {
+	// until the poll AFTER SYNCHRONIZED has been delivered. This gives Chrome
+	// time to process SYNCHRONIZED before receiving VISIBLE/FOCUSED.
+	if (sess->is_appcontainer && sess->state == XR_SESSION_STATE_SYNCHRONIZED) {
+		if (sess->appcontainer_synchronized_polled) {
+			// Second poll after SYNCHRONIZED - now deliver VISIBLE/FOCUSED
+			if (sess->compositor_visible) {
+				oxr_session_change_state(log, sess, XR_SESSION_STATE_VISIBLE, 0);
+			}
+		} else {
+			// First poll in SYNCHRONIZED state - mark it and wait for next poll
+			sess->appcontainer_synchronized_polled = true;
+		}
+	} else if (!sess->is_appcontainer && sess->state == XR_SESSION_STATE_SYNCHRONIZED && sess->compositor_visible) {
+		// Non-AppContainer apps: immediate transition
 		oxr_session_change_state(log, sess, XR_SESSION_STATE_VISIBLE, 0);
 	}
 
 	if (sess->state == XR_SESSION_STATE_VISIBLE && sess->compositor_focused && !sess->is_appcontainer) {
+		oxr_session_change_state(log, sess, XR_SESSION_STATE_FOCUSED, 0);
+	} else if (sess->is_appcontainer && sess->state == XR_SESSION_STATE_VISIBLE && sess->compositor_focused) {
+		// AppContainer: deliver FOCUSED right after VISIBLE
 		oxr_session_change_state(log, sess, XR_SESSION_STATE_FOCUSED, 0);
 	}
 
