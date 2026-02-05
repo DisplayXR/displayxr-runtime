@@ -32,6 +32,27 @@ int
 main(int argc, char *argv[])
 {
 #ifdef XRT_OS_WINDOWS
+	// Enable per-monitor DPI awareness FIRST, before any window/display operations.
+	// This is critical for high-DPI displays like Leia (7680x4320 at 300% scaling).
+	// Without this, Windows reports scaled logical resolution (2560x1440) instead of
+	// physical resolution, breaking SR weaver which needs true pixel dimensions.
+	//
+	// SetProcessDpiAwarenessContext is Win10 1607+ (SDK 10.0.14393+)
+	{
+		// DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = ((DPI_AWARENESS_CONTEXT)-4)
+		// Define locally to avoid SDK version issues
+		typedef BOOL(WINAPI * PFN_SetProcessDpiAwarenessContext)(HANDLE);
+		HMODULE user32 = GetModuleHandleA("user32.dll");
+		if (user32) {
+			PFN_SetProcessDpiAwarenessContext fn =
+			    (PFN_SetProcessDpiAwarenessContext)GetProcAddress(user32, "SetProcessDpiAwarenessContext");
+			if (fn) {
+				// DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
+				fn((HANDLE)(intptr_t)-4);
+			}
+		}
+	}
+
 	u_win_try_privilege_or_priority_from_args(U_LOGGING_INFO, argc, argv);
 #endif
 
