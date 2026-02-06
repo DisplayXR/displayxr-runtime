@@ -118,8 +118,11 @@ target_link_libraries(ipc_server PRIVATE aux_util aux_util_process aux_util_debu
 
 # Link D3D11 service compositor for SR-aware view poses in IPC
 if(XRT_HAVE_LEIA_SR AND WIN32)
-	target_link_libraries(ipc_server PRIVATE comp_d3d11_service)
-	target_compile_definitions(ipc_server PRIVATE XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	target_link_libraries(ipc_server PRIVATE comp_d3d11_service drv_leiasr)
+	# Need both defines for the SR view poses code to compile:
+	# - XRT_HAVE_LEIA_SR_D3D11: from drv_leiasr, enables SR weaver calls
+	# - XRT_HAVE_D3D11_SERVICE_COMPOSITOR: enables service compositor functions
+	target_compile_definitions(ipc_server PRIVATE XRT_HAVE_D3D11_SERVICE_COMPOSITOR XRT_HAVE_LEIA_SR_D3D11)
 endif()
 
 if(XRT_HAVE_SYSTEMD)
