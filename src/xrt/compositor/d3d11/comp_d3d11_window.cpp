@@ -29,7 +29,7 @@
 
 // Include qwerty interface for Win32 input handling (conditional on qwerty driver being built)
 #ifdef XRT_BUILD_DRIVER_QWERTY
-#include "qwerty/qwerty_interface.h"
+#include "qwerty_interface.h"
 #endif
 
 #define WIN32_LEAN_AND_MEAN
