@@ -1,0 +1,112 @@
+SR Hydra Texture Handling Summary                                                                                                                    
+                                                                                                                                                       
+  1. Stereo Texture Format (Weaver Input)                                                                                                              
+  ┌──────────────────────┬──────────────────────────────────────────┬────────────────────┐                                                             
+  │        Aspect        │                 SR Hydra                 │ Our Implementation │                                                             
+  ├──────────────────────┼──────────────────────────────────────────┼────────────────────┤                                                             
+  │ Weaver input format  │ DXGI_FORMAT_R8G8B8A8_UNORM               │ Need to check      │                                                             
+  ├──────────────────────┼──────────────────────────────────────────┼────────────────────┤                                                             
+  │ Internal framebuffer │ RHI::RHIFormat::F_Byte4 (R8G8B8A8_UNORM) │ Need to check      │
+  └──────────────────────┴──────────────────────────────────────────┴────────────────────┘
+  2. Chrome's Submission Pattern
+
+  SR Hydra handles flexibly:
+  - Two separate swapchains (left/right) - typical for WebXR
+  - OR one texture array with imageArrayIndex for each eye
+  - The imageRect values are converted to normalized UV coordinates:
+
+  // SR Hydra converts rect to UVs:
+  OutputView.ImageArea.Top = View.subImage.imageRect.offset.y / SwapchainResolution.y;
+  OutputView.ImageArea.Left = View.subImage.imageRect.offset.x / SwapchainResolution.x;
+  OutputView.ImageArea.Bottom = (extent.height + offset.y) / SwapchainResolution.y;
+  OutputView.ImageArea.Right = (extent.width + offset.x) / SwapchainResolution.x;
+
+  3. Copy Region Handling
+
+  SR Hydra uses NULL box - copies the entire subresource:
+  CopySubresourceRegion(OutTex, OutSubResource, 0, 0, 0, InTex, InSubResource, NULL);
+
+  Region selection happens in the shader via UV coordinates, not at copy time!
+
+  4. Weaver Input Dimensions
+
+  FUInt2 DisplayResolution = GApp.GetDisplayPhysicalResolution();
+  ViewSize = DisplayResolution / 2;  // e.g., 3840x2160 → 1920x1080 per eye
+
+  Each eye's framebuffer is half the display resolution.
+
+  5. SRGB Conversion - CRITICAL!
+
+  SR Hydra does color space conversion in the composition shader:
+
+  // XrCompose.hlsl
+  if (ConvertToLinear > 0.5f) {
+      Color = pow(abs(Color), 1.0f / 2.333f);  // Convert sRGB to linear
+  }
+
+  The decision:
+  CompositionData->Data.ConvertToLinear = Resource->GetFormat().SRGB;
+
+  Chrome submits DXGI_FORMAT_R8G8B8A8_UNORM_SRGB → SR Hydra detects this and applies gamma correction!
+
+  ---
+  Potential Issues in Our Implementation
+
+  1. SRGB handling: If Chrome submits SRGB textures and we don't apply gamma correction, colors will be wrong (too dark or washed out)
+  2. Rect handling: We might be using rects as pixel coordinates instead of converting to UVs
+  3. Copy vs shader: If we're doing a box-copy instead of full-copy + shader UV selection, we might have misaligned regions
+                                                                                                 
+  
+⏺ Critical Comparison: Texture Handling                                                                                                                
+                                                                                                                                                     
+  Stereo Texture Format                                                                                                                                
+  ┌────────┬────────────────────────────┬────────────────────────────┐
+  │ Aspect │          SR Hydra          │          Our Code          │                                                                                 
+  ├────────┼────────────────────────────┼────────────────────────────┤                                                                               
+  │ Format │ DXGI_FORMAT_R8G8B8A8_UNORM │ DXGI_FORMAT_R8G8B8A8_UNORM │
+  ├────────┼────────────────────────────┼────────────────────────────┤
+  │ Status │ ✓ MATCH                    │                            │
+  └────────┴────────────────────────────┴────────────────────────────┘
+  SRGB Conversion
+  ┌────────────────┬───────────────────────────────────┬──────────┐
+  │     Aspect     │             SR Hydra              │ Our Code │
+  ├────────────────┼───────────────────────────────────┼──────────┤
+  │ SRGB detection │ Checks Resource->GetFormat().SRGB │ NONE     │
+  ├────────────────┼───────────────────────────────────┼──────────┤
+  │ Conversion     │ pow(Color, 1/2.333) in shader     │ NONE     │
+  ├────────────────┼───────────────────────────────────┼──────────┤
+  │ Status         │ ❌ MISSING                        │          │
+  └────────────────┴───────────────────────────────────┴──────────┘
+  This is a potential issue! When Chrome submits DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+  - SR Hydra applies gamma correction in shader
+  - Our code just copies raw values
+  - Colors will be wrong (too dark or washed out)
+
+  Copy Approach
+  ┌──────────────────┬────────────────────────────┬──────────────────────┐
+  │      Aspect      │          SR Hydra          │       Our Code       │
+  ├──────────────────┼────────────────────────────┼──────────────────────┤
+  │ Box parameter    │ NULL (copies full texture) │ Box with rect coords │
+  ├──────────────────┼────────────────────────────┼──────────────────────┤
+  │ Region selection │ Shader UVs                 │ Copy box             │
+  └──────────────────┴────────────────────────────┴──────────────────────┘
+  Our approach is valid but different. The key question: does Chrome provide correct rect values?
+
+  Rect Values Analysis
+
+  Our code uses rect directly:
+  left_box.left = layer->data.proj.v[0].sub.rect.offset.w;
+  left_box.top = layer->data.proj.v[0].sub.rect.offset.h;
+  left_box.right = left_box.left + layer->data.proj.v[0].sub.rect.extent.w;
+  left_box.bottom = left_box.top + layer->data.proj.v[0].sub.rect.extent.h;
+
+  SR Hydra converts to UVs:
+  ImageArea.Left = offset.x / SwapchainResolution.x;
+  ImageArea.Right = (extent.width + offset.x) / SwapchainResolution.x;
+
+  ---
+  Summary: Issues to Fix
+
+  1. SRGB Conversion (HIGH): Add gamma correction when copying from SRGB swapchains to non-SRGB stereo texture
+  2. Session State (HIGH): The shouldRender=false issue if events aren't polled before xrBeginSession
+  3. Verify Rect Values: Log what Chrome actually provides to ensure our box copy is correct
