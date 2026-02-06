@@ -94,6 +94,22 @@ comp_d3d11_service_get_display_dimensions(struct xrt_system_compositor *xsysc,
                                            float *out_width_m,
                                            float *out_height_m);
 
+/*!
+ * Check if the compositor owns its window (not using session_target).
+ *
+ * When using XR_EXT_session_target, the app provides its own window and
+ * the compositor doesn't create one. This affects head position handling:
+ * - Session target (app window): App controls head position, no offset applied
+ * - Own window (Monado window): Apply standing height offset for VR apps
+ *
+ * @param xsysc The system compositor (must be D3D11 service compositor).
+ * @return true if compositor owns the window, false if using app's window.
+ *
+ * @ingroup comp_d3d11_service
+ */
+bool
+comp_d3d11_service_owns_window(struct xrt_system_compositor *xsysc);
+
 
 #ifdef __cplusplus
 }

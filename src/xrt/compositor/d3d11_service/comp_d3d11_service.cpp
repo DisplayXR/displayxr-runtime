@@ -2972,3 +2972,17 @@ comp_d3d11_service_get_display_dimensions(struct xrt_system_compositor *xsysc,
 	(void)sys;  // Suppress unused warning when SR not available
 	return false;
 }
+
+bool
+comp_d3d11_service_owns_window(struct xrt_system_compositor *xsysc)
+{
+	if (!comp_d3d11_service_is_d3d11_service(xsysc)) {
+		return false;
+	}
+
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+
+	// If sys->window is non-NULL, Monado created and owns the window.
+	// If sys->window is NULL, the app provided its own window (session_target).
+	return sys->window != nullptr;
+}
