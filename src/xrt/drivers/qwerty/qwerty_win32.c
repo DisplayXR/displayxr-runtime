@@ -161,11 +161,11 @@ qwerty_process_win32(struct xrt_device **xdevs,
 
 	// Initialize cache on first call
 	if (!cached) {
-		U_LOG_W("QWERTY Win32: First call - searching for qwerty system in %zu devices", xdev_count);
+		U_LOG_W("QWERTY Win32: First call - xdevs=%p xdev_count=%zu", (void *)xdevs, xdev_count);
 		for (size_t i = 0; i < xdev_count; i++) {
 			if (xdevs[i] != NULL) {
-				U_LOG_W("QWERTY Win32: Device[%zu] name='%s' tracker='%s'",
-				        i, xdevs[i]->str, xdevs[i]->tracking_origin->name);
+				U_LOG_W("QWERTY Win32: Device[%zu]=%p name='%s' tracker='%s'",
+				        i, (void *)xdevs[i], xdevs[i]->str, xdevs[i]->tracking_origin->name);
 			}
 		}
 		qsys = find_qwerty_system(xdevs, xdev_count);
@@ -179,6 +179,8 @@ qwerty_process_win32(struct xrt_device **xdevs,
 		U_LOG_W("QWERTY Win32 input initialized - WASDQE move, left-click+drag look, ESC quit");
 		U_LOG_W("QWERTY Win32: qsys=%p hmd=%p lctrl=%p rctrl=%p process_keys=%d",
 		        (void *)qsys, (void *)qsys->hmd, (void *)qsys->lctrl, (void *)qsys->rctrl, qsys->process_keys);
+		U_LOG_W("QWERTY Win32: default_qdev=%p (HMD base=%p)", (void *)default_qdev,
+		        (void *)(qsys->hmd ? &qsys->hmd->base : NULL));
 	}
 
 	if (qsys == NULL || !qsys->process_keys) {

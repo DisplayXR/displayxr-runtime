@@ -117,8 +117,9 @@ ipc_try_get_sr_view_poses(struct ipc_server *s,
 	static bool first_call = true;
 	if (first_call) {
 		first_call = false;
-		IPC_WARN(s, "ipc_try_get_sr_view_poses: FIRST CALL - view_count=%u xsysc=%p",
-		         view_count, (void*)s->xsysc);
+		IPC_WARN(s, "ipc_try_get_sr_view_poses: FIRST CALL - view_count=%u xsysc=%p xsysd=%p",
+		         view_count, (void*)s->xsysc, (void*)s->xsysd);
+		IPC_WARN(s, "  IPC server xdev=%p (%s)", (void*)xdev, xdev ? xdev->str : "NULL");
 	}
 
 	if (view_count != 2) {
@@ -2328,6 +2329,15 @@ ipc_handle_device_get_view_poses_2(volatile struct ipc_client_state *ics,
 	uint32_t device_id = id;
 	struct xrt_device *xdev = NULL;
 	GET_XDEV_OR_RETURN(ics, device_id, xdev);
+
+	// Log device lookup (first call only)
+	static bool first_view_poses_log = true;
+	if (first_view_poses_log) {
+		first_view_poses_log = false;
+		IPC_WARN(ics->server, "ipc_handle_device_get_view_poses_2: device_id=%u xdev=%p (%s) xsysd->xdevs=%p",
+		         device_id, (void*)xdev, xdev ? xdev->str : "NULL",
+		         (void*)ics->server->xsysd->xdevs);
+	}
 
 #if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	// Try SR-aware view poses first
