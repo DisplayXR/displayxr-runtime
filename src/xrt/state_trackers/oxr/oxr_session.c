@@ -945,26 +945,68 @@ oxr_session_locate_views(struct oxr_logger *log,
 				        world_head_pos.x, world_head_pos.y, world_head_pos.z);
 			}
 		} else {
-			// Monado window: Use qwerty device pose for world head position
-			// This gives 1.6m standing height by default, with WASD/mouse control
-			struct xrt_space_relation qwerty_relation = XRT_SPACE_RELATION_ZERO;
-			xrt_result_t qret = xrt_device_get_tracked_pose(
-			    xdev, XRT_INPUT_GENERIC_HEAD_POSE, xdisplay_time, &qwerty_relation);
+			// Monado window mode: DISPLAY CENTRIC rotation
+			// Rotation happens around the virtual display at standing height (0, 1.6, 0)
+			// Eye positions are defined relative to that display plane
+			// Same pattern as sr_cube_openxr_ext but with 1.6m standing height offset
 
-			if (qret == XRT_SUCCESS &&
-			    (qwerty_relation.relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT)) {
-				world_head_pos = qwerty_relation.pose.position;
-				world_head_ori = qwerty_relation.pose.orientation;
-			} else {
-				// Fallback: standing height at origin
-				world_head_pos = (struct xrt_vec3){0.0f, 1.6f, 0.0f};
-				world_head_ori = (struct xrt_quat)XRT_QUAT_IDENTITY;
+			// Get player transform from qwerty device
+			struct xrt_pose player_pose = XRT_POSE_IDENTITY;
+			{
+				struct xrt_space_relation qwerty_relation = XRT_SPACE_RELATION_ZERO;
+				xrt_result_t qret = xrt_device_get_tracked_pose(
+				    xdev, XRT_INPUT_GENERIC_HEAD_POSE, xdisplay_time, &qwerty_relation);
+
+				if (qret == XRT_SUCCESS &&
+				    (qwerty_relation.relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT)) {
+					// Position offset from standing height origin
+					player_pose.position.x = qwerty_relation.pose.position.x;
+					player_pose.position.y = qwerty_relation.pose.position.y - 1.6f;
+					player_pose.position.z = qwerty_relation.pose.position.z;
+					player_pose.orientation = qwerty_relation.pose.orientation;
+				}
 			}
+
+			// Virtual display origin at standing height
+			const struct xrt_vec3 display_origin = {0.0f, 1.6f, 0.0f};
+
+			// World head = display_origin + player_offset + rotate(sr_eye_midpoint)
+			// This makes rotation happen around the display, not around the eyes
+			struct xrt_vec3 rotated_eye_pos;
+			math_quat_rotate_vec3(&player_pose.orientation, &sr_eye_midpoint, &rotated_eye_pos);
+
+			world_head_pos.x = display_origin.x + player_pose.position.x + rotated_eye_pos.x;
+			world_head_pos.y = display_origin.y + player_pose.position.y + rotated_eye_pos.y;
+			world_head_pos.z = display_origin.z + player_pose.position.z + rotated_eye_pos.z;
+			world_head_ori = player_pose.orientation;
 
 			if (sr_should_log) {
-				U_LOG_W("Monado window mode: Using qwerty device pose pos=(%.3f,%.3f,%.3f)",
+				U_LOG_W("Display centric mode: display=(%.1f,%.1f,%.1f) player_off=(%.3f,%.3f,%.3f) "
+				        "sr_eye=(%.3f,%.3f,%.3f) -> world_head=(%.3f,%.3f,%.3f)",
+				        display_origin.x, display_origin.y, display_origin.z,
+				        player_pose.position.x, player_pose.position.y, player_pose.position.z,
+				        sr_eye_midpoint.x, sr_eye_midpoint.y, sr_eye_midpoint.z,
 				        world_head_pos.x, world_head_pos.y, world_head_pos.z);
 			}
+
+			/*
+			 * CAMERA CENTRIC (commented out - rotation around eyes):
+			 * In this mode, qwerty device pose directly becomes head position.
+			 * Rotation happens around the eye position.
+			 *
+			 * struct xrt_space_relation qwerty_relation = XRT_SPACE_RELATION_ZERO;
+			 * xrt_result_t qret = xrt_device_get_tracked_pose(
+			 *     xdev, XRT_INPUT_GENERIC_HEAD_POSE, xdisplay_time, &qwerty_relation);
+			 *
+			 * if (qret == XRT_SUCCESS &&
+			 *     (qwerty_relation.relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT)) {
+			 *     world_head_pos = qwerty_relation.pose.position;
+			 *     world_head_ori = qwerty_relation.pose.orientation;
+			 * } else {
+			 *     world_head_pos = (struct xrt_vec3){0.0f, 1.6f, 0.0f};
+			 *     world_head_ori = (struct xrt_quat)XRT_QUAT_IDENTITY;
+			 * }
+			 */
 		}
 
 		// Head relation: position and orientation in world space
