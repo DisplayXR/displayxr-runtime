@@ -79,16 +79,29 @@ default_qwerty_device(struct xrt_device **xdevs, size_t xdev_count, struct qwert
 	struct xrt_device *xd_left = &qsys->lctrl->base.base;
 	struct xrt_device *xd_right = &qsys->rctrl->base.base;
 
+	// Log role assignments for debugging
+	U_LOG_W("QWERTY default_device: head=%d left=%d right=%d (count=%zu)", head, left, right, xdev_count);
+	U_LOG_W("  xd_hmd=%p, xd_left=%p, xd_right=%p", (void*)xd_hmd, (void*)xd_left, (void*)xd_right);
+	if (head >= 0 && head < (int)xdev_count) {
+		U_LOG_W("  xdevs[head=%d]=%p (%s)", head, (void*)xdevs[head], xdevs[head] ? xdevs[head]->str : "NULL");
+	} else {
+		U_LOG_W("  head=%d is UNASSIGNED or out of range", head);
+	}
+
 	struct qwerty_device *default_qdev = NULL;
-	if (xdevs[head] == xd_hmd) {
+	if (head >= 0 && head < (int)xdev_count && xdevs[head] == xd_hmd) {
 		default_qdev = qwerty_device(xd_hmd);
-	} else if (xdevs[right] == xd_right) {
+		U_LOG_W("  -> Selected HMD as default device");
+	} else if (right >= 0 && right < (int)xdev_count && xdevs[right] == xd_right) {
 		default_qdev = qwerty_device(xd_right);
-	} else if (xdevs[left] == xd_left) {
+		U_LOG_W("  -> Selected Right Controller as default device (HMD check failed)");
+	} else if (left >= 0 && left < (int)xdev_count && xdevs[left] == xd_left) {
 		default_qdev = qwerty_device(xd_left);
+		U_LOG_W("  -> Selected Left Controller as default device");
 	} else {
 		// Fallback to right controller
 		default_qdev = qwerty_device(xd_right);
+		U_LOG_W("  -> Fallback to Right Controller (no role matches)");
 	}
 
 	return default_qdev;
