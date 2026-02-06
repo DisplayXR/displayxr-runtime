@@ -186,6 +186,18 @@ ipc_try_get_sr_view_poses(struct ipc_server *s,
 	xrt_result_t xret = xrt_device_get_tracked_pose(xdev, XRT_INPUT_GENERIC_HEAD_POSE,
 	                                                 at_timestamp_ns, &qwerty_relation);
 
+	// Log qwerty pose retrieval (first call only)
+	static bool first_qwerty_log = true;
+	if (first_qwerty_log) {
+		first_qwerty_log = false;
+		IPC_WARN(s, "ipc_try_get_sr_view_poses: Qwerty xdev=%p (%s) xret=%d flags=0x%x",
+		         (void*)xdev, xdev ? xdev->str : "NULL", xret, qwerty_relation.relation_flags);
+		IPC_WARN(s, "  qwerty pose: pos=(%.3f,%.3f,%.3f) ori=(%.3f,%.3f,%.3f,%.3f)",
+		         qwerty_relation.pose.position.x, qwerty_relation.pose.position.y, qwerty_relation.pose.position.z,
+		         qwerty_relation.pose.orientation.x, qwerty_relation.pose.orientation.y,
+		         qwerty_relation.pose.orientation.z, qwerty_relation.pose.orientation.w);
+	}
+
 	struct xrt_pose player_pose = XRT_POSE_IDENTITY;
 	bool have_player_transform = false;
 	if (xret == XRT_SUCCESS &&
