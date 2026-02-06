@@ -199,6 +199,31 @@ ipc_try_get_sr_view_poses(struct ipc_server *s,
 		         qwerty_relation.pose.orientation.z, qwerty_relation.pose.orientation.w);
 	}
 
+	// Rate-limited logging to detect pose changes
+	static int pose_log_counter = 0;
+	static bool pose_changed_logged = false;
+	bool ori_non_identity = qwerty_relation.pose.orientation.x != 0.0f ||
+	                        qwerty_relation.pose.orientation.y != 0.0f ||
+	                        qwerty_relation.pose.orientation.z != 0.0f ||
+	                        qwerty_relation.pose.orientation.w != 1.0f;
+	bool pos_non_default = qwerty_relation.pose.position.x != 0.0f ||
+	                       qwerty_relation.pose.position.y != 1.6f ||
+	                       qwerty_relation.pose.position.z != 0.0f;
+	if ((ori_non_identity || pos_non_default) && !pose_changed_logged) {
+		pose_changed_logged = true;
+		IPC_WARN(s, "ipc_try_get_sr_view_poses: POSE CHANGED! pos=(%.3f,%.3f,%.3f) ori=(%.3f,%.3f,%.3f,%.3f)",
+		         qwerty_relation.pose.position.x, qwerty_relation.pose.position.y, qwerty_relation.pose.position.z,
+		         qwerty_relation.pose.orientation.x, qwerty_relation.pose.orientation.y,
+		         qwerty_relation.pose.orientation.z, qwerty_relation.pose.orientation.w);
+	}
+	// Also log periodically (every 300 frames = ~5 sec at 60fps) if pose is still identity
+	if (++pose_log_counter >= 300) {
+		pose_log_counter = 0;
+		if (!pose_changed_logged) {
+			IPC_WARN(s, "ipc_try_get_sr_view_poses: pose still identity after input");
+		}
+	}
+
 	struct xrt_pose player_pose = XRT_POSE_IDENTITY;
 	bool have_player_transform = false;
 	if (xret == XRT_SUCCESS &&
