@@ -19,9 +19,18 @@
 #include "ipc_server_generated.h"
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_results.h"
+#include "xrt/xrt_config_have.h"
+
+#include "math/m_api.h"
 
 #ifdef XRT_GRAPHICS_SYNC_HANDLE_IS_FD
 #include <unistd.h>
+#endif
+
+#include <math.h>
+
+#if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+#include "d3d11_service/comp_d3d11_service.h"
 #endif
 
 
@@ -57,6 +66,180 @@ validate_device_id(volatile struct ipc_client_state *ics, int64_t device_id, str
 			return res;                                                                                    \
 		}                                                                                                      \
 	} while (0)
+
+
+#if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+/*!
+ * Compute Kooima asymmetric FOV from eye position and screen dimensions.
+ * This mirrors the computation in oxr_session.c but for IPC server use.
+ */
+static void
+ipc_compute_kooima_fov(const struct xrt_vec3 *eye,
+                       float screen_width_m,
+                       float screen_height_m,
+                       struct xrt_fov *out_fov)
+{
+	const float half_w = screen_width_m / 2.0f;
+	const float half_h = screen_height_m / 2.0f;
+	const float distance = eye->z;
+
+	// Fallback if eye too close to screen
+	if (distance <= 0.001f) {
+		out_fov->angle_left = -0.785398f;   // -45 degrees
+		out_fov->angle_right = 0.785398f;
+		out_fov->angle_up = 0.523599f;      //  30 degrees
+		out_fov->angle_down = -0.523599f;
+		return;
+	}
+
+	// Kooima projection: compute angle from eye to each screen edge
+	out_fov->angle_left = atanf((-half_w - eye->x) / distance);
+	out_fov->angle_right = atanf((half_w - eye->x) / distance);
+	out_fov->angle_up = atanf((half_h - eye->y) / distance);
+	out_fov->angle_down = atanf((-half_h - eye->y) / distance);
+}
+
+/*!
+ * Try to get SR-aware view poses for IPC clients.
+ * Returns true if SR view poses were computed, false to fall back to device poses.
+ */
+static bool
+ipc_try_get_sr_view_poses(struct ipc_server *s,
+                          struct xrt_device *xdev,
+                          const struct xrt_vec3 *fallback_eye_relation,
+                          int64_t at_timestamp_ns,
+                          uint32_t view_count,
+                          struct xrt_space_relation *out_head_relation,
+                          struct xrt_fov *out_fovs,
+                          struct xrt_pose *out_poses)
+{
+	if (view_count != 2 || s->xsysc == NULL) {
+		return false;
+	}
+
+	// Check if we have D3D11 service compositor with SR
+	if (!comp_d3d11_service_is_d3d11_service(s->xsysc)) {
+		return false;
+	}
+
+	// Get eye positions from SR weaver
+	struct xrt_vec3 left_eye, right_eye;
+	if (!comp_d3d11_service_get_predicted_eye_positions(s->xsysc, &left_eye, &right_eye)) {
+		return false;
+	}
+
+	// Get display dimensions for Kooima FOV
+	float screen_width_m, screen_height_m;
+	if (!comp_d3d11_service_get_display_dimensions(s->xsysc, &screen_width_m, &screen_height_m)) {
+		return false;
+	}
+
+	// Get qwerty device pose as "player transform"
+	struct xrt_space_relation qwerty_relation = XRT_SPACE_RELATION_ZERO;
+	xrt_result_t xret = xrt_device_get_tracked_pose(xdev, XRT_INPUT_GENERIC_HEAD_POSE,
+	                                                 at_timestamp_ns, &qwerty_relation);
+
+	struct xrt_pose player_pose = XRT_POSE_IDENTITY;
+	bool have_player_transform = false;
+	if (xret == XRT_SUCCESS &&
+	    (qwerty_relation.relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT)) {
+		// Subtract initial position (1.6m height) to get offset
+		player_pose.position.x = qwerty_relation.pose.position.x;
+		player_pose.position.y = qwerty_relation.pose.position.y - 1.6f;
+		player_pose.position.z = qwerty_relation.pose.position.z;
+		player_pose.orientation = qwerty_relation.pose.orientation;
+
+		bool pos_changed = player_pose.position.x != 0.0f ||
+		                   player_pose.position.y != 0.0f ||
+		                   player_pose.position.z != 0.0f;
+		bool ori_changed = player_pose.orientation.x != 0.0f ||
+		                   player_pose.orientation.y != 0.0f ||
+		                   player_pose.orientation.z != 0.0f ||
+		                   player_pose.orientation.w != 1.0f;
+		have_player_transform = pos_changed || ori_changed;
+	}
+
+	// Compute head position as midpoint between eyes
+	struct xrt_vec3 local_head_pos = {
+	    (left_eye.x + right_eye.x) / 2.0f,
+	    (left_eye.y + right_eye.y) / 2.0f,
+	    (left_eye.z + right_eye.z) / 2.0f,
+	};
+
+	// Apply player transform
+	struct xrt_vec3 world_head_pos;
+	struct xrt_quat world_head_ori;
+	if (have_player_transform) {
+		math_quat_rotate_vec3(&player_pose.orientation, &local_head_pos, &world_head_pos);
+		world_head_pos.x += player_pose.position.x;
+		world_head_pos.y += player_pose.position.y;
+		world_head_pos.z += player_pose.position.z;
+		world_head_ori = player_pose.orientation;
+	} else {
+		world_head_pos = local_head_pos;
+		world_head_ori = (struct xrt_quat)XRT_QUAT_IDENTITY;
+	}
+
+	// Set head relation
+	out_head_relation->pose.position = world_head_pos;
+	out_head_relation->pose.orientation = world_head_ori;
+	out_head_relation->relation_flags = XRT_SPACE_RELATION_POSITION_VALID_BIT |
+	                                    XRT_SPACE_RELATION_ORIENTATION_VALID_BIT |
+	                                    XRT_SPACE_RELATION_POSITION_TRACKED_BIT |
+	                                    XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT;
+
+	// Compute view poses (eye positions relative to head)
+	struct xrt_vec3 local_left_offset = {
+	    left_eye.x - local_head_pos.x,
+	    left_eye.y - local_head_pos.y,
+	    left_eye.z - local_head_pos.z,
+	};
+	struct xrt_vec3 local_right_offset = {
+	    right_eye.x - local_head_pos.x,
+	    right_eye.y - local_head_pos.y,
+	    right_eye.z - local_head_pos.z,
+	};
+
+	if (have_player_transform) {
+		struct xrt_vec3 rotated_left, rotated_right;
+		math_quat_rotate_vec3(&player_pose.orientation, &local_left_offset, &rotated_left);
+		math_quat_rotate_vec3(&player_pose.orientation, &local_right_offset, &rotated_right);
+		out_poses[0].position = rotated_left;
+		out_poses[1].position = rotated_right;
+		out_poses[0].orientation = player_pose.orientation;
+		out_poses[1].orientation = player_pose.orientation;
+	} else {
+		out_poses[0].position = local_left_offset;
+		out_poses[1].position = local_right_offset;
+		out_poses[0].orientation = (struct xrt_quat)XRT_QUAT_IDENTITY;
+		out_poses[1].orientation = (struct xrt_quat)XRT_QUAT_IDENTITY;
+	}
+
+	// Compute Kooima FOV
+	ipc_compute_kooima_fov(&left_eye, screen_width_m, screen_height_m, &out_fovs[0]);
+	ipc_compute_kooima_fov(&right_eye, screen_width_m, screen_height_m, &out_fovs[1]);
+
+	// Log periodically
+	static int log_counter = 0;
+	if (++log_counter >= 60) {
+		log_counter = 0;
+		float left_h = (out_fovs[0].angle_right - out_fovs[0].angle_left) * 180.0f / 3.14159265f;
+		float left_v = (out_fovs[0].angle_up - out_fovs[0].angle_down) * 180.0f / 3.14159265f;
+		IPC_WARN(s, "IPC SR view poses: eye L=(%.3f,%.3f,%.3f) R=(%.3f,%.3f,%.3f), FOV H=%.1f° V=%.1f°",
+		         left_eye.x, left_eye.y, left_eye.z,
+		         right_eye.x, right_eye.y, right_eye.z,
+		         left_h, left_v);
+		if (have_player_transform) {
+			IPC_WARN(s, "  Player transform: pos=(%.3f,%.3f,%.3f) ori=(%.3f,%.3f,%.3f,%.3f)",
+			         player_pose.position.x, player_pose.position.y, player_pose.position.z,
+			         player_pose.orientation.x, player_pose.orientation.y,
+			         player_pose.orientation.z, player_pose.orientation.w);
+		}
+	}
+
+	return true;
+}
+#endif // XRT_HAVE_LEIA_SR_D3D11 && XRT_HAVE_D3D11_SERVICE_COMPOSITOR
 
 
 static xrt_result_t
@@ -2020,14 +2203,24 @@ ipc_handle_device_get_view_poses(volatile struct ipc_client_state *ics,
 	struct xrt_fov fovs[IPC_MAX_RAW_VIEWS];
 	struct xrt_pose poses[IPC_MAX_RAW_VIEWS];
 
-	reply.result = xrt_device_get_view_poses( //
-	    xdev,                                 //
-	    fallback_eye_relation,                //
-	    at_timestamp_ns,                      //
-	    view_count,                           //
-	    &reply.head_relation,                 //
-	    fovs,                                 //
-	    poses);                               //
+#if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	// Try SR-aware view poses first
+	if (ipc_try_get_sr_view_poses(s, xdev, fallback_eye_relation, at_timestamp_ns,
+	                               view_count, &reply.head_relation, fovs, poses)) {
+		reply.result = XRT_SUCCESS;
+	} else
+#endif
+	{
+		// Fall back to device view poses
+		reply.result = xrt_device_get_view_poses( //
+		    xdev,                                 //
+		    fallback_eye_relation,                //
+		    at_timestamp_ns,                      //
+		    view_count,                           //
+		    &reply.head_relation,                 //
+		    fovs,                                 //
+		    poses);                               //
+	}
 
 	/*
 	 * This isn't really needed, but demonstrates the server sending the
@@ -2076,6 +2269,16 @@ ipc_handle_device_get_view_poses_2(volatile struct ipc_client_state *ics,
 	uint32_t device_id = id;
 	struct xrt_device *xdev = NULL;
 	GET_XDEV_OR_RETURN(ics, device_id, xdev);
+
+#if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	// Try SR-aware view poses first
+	if (ipc_try_get_sr_view_poses(ics->server, xdev, default_eye_relation, at_timestamp_ns,
+	                               view_count, &out_info->head_relation, out_info->fovs, out_info->poses)) {
+		return XRT_SUCCESS;
+	}
+#endif
+
+	// Fall back to device view poses
 	return xrt_device_get_view_poses( //
 	    xdev,                         //
 	    default_eye_relation,         //

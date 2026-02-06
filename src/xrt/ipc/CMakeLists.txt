@@ -112,8 +112,15 @@ target_include_directories(
 	ipc_server
 	PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
 	PRIVATE ${CMAKE_CURRENT_BINARY_DIR}
+	PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../compositor  # For d3d11_service headers
 	)
-target_link_libraries(ipc_server PRIVATE aux_util aux_util_process aux_util_debug_gui ipc_shared)
+target_link_libraries(ipc_server PRIVATE aux_util aux_util_process aux_util_debug_gui ipc_shared aux_math)
+
+# Link D3D11 service compositor for SR-aware view poses in IPC
+if(XRT_HAVE_LEIA_SR AND WIN32)
+	target_link_libraries(ipc_server PRIVATE comp_d3d11_service)
+	target_compile_definitions(ipc_server PRIVATE XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+endif()
 
 if(XRT_HAVE_SYSTEMD)
 	target_include_directories(ipc_server PRIVATE ${SYSTEMD_INCLUDE_DIRS})

@@ -2879,3 +2879,85 @@ comp_d3d11_service_create_system(struct xrt_device *xdev,
 	*out_xsysc = &sys->base;
 	return XRT_SUCCESS;
 }
+
+/*
+ *
+ * Helper functions for IPC server to get SR data
+ *
+ */
+
+bool
+comp_d3d11_service_is_d3d11_service(struct xrt_system_compositor *xsysc)
+{
+	if (xsysc == NULL) {
+		return false;
+	}
+	// Check by comparing function pointers - this identifies our compositor type
+	return xsysc->create_native_compositor == system_create_native_compositor;
+}
+
+bool
+comp_d3d11_service_get_predicted_eye_positions(struct xrt_system_compositor *xsysc,
+                                                struct xrt_vec3 *out_left,
+                                                struct xrt_vec3 *out_right)
+{
+	if (!comp_d3d11_service_is_d3d11_service(xsysc) || out_left == NULL || out_right == NULL) {
+		return false;
+	}
+
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+
+#ifdef XRT_HAVE_LEIA_SR_D3D11
+	if (sys->weaver != nullptr) {
+		float left[3], right[3];
+		if (leiasr_d3d11_get_predicted_eye_positions(sys->weaver, left, right)) {
+			out_left->x = left[0];
+			out_left->y = left[1];
+			out_left->z = left[2];
+			out_right->x = right[0];
+			out_right->y = right[1];
+			out_right->z = right[2];
+
+			// Log periodically for debugging
+			static int log_counter = 0;
+			if (++log_counter >= 60) {
+				log_counter = 0;
+				U_LOG_W("IPC SR eye positions: L=(%.3f,%.3f,%.3f) R=(%.3f,%.3f,%.3f)",
+				        out_left->x, out_left->y, out_left->z,
+				        out_right->x, out_right->y, out_right->z);
+			}
+			return true;
+		}
+	}
+#endif
+
+	(void)sys;  // Suppress unused warning when SR not available
+	return false;
+}
+
+bool
+comp_d3d11_service_get_display_dimensions(struct xrt_system_compositor *xsysc,
+                                           float *out_width_m,
+                                           float *out_height_m)
+{
+	if (!comp_d3d11_service_is_d3d11_service(xsysc) || out_width_m == NULL || out_height_m == NULL) {
+		return false;
+	}
+
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+
+#ifdef XRT_HAVE_LEIA_SR_D3D11
+	if (sys->weaver != nullptr) {
+		uint32_t width_px, height_px;
+		float width_m, height_m;
+		if (leiasr_d3d11_get_display_dimensions(sys->weaver, &width_px, &height_px, &width_m, &height_m)) {
+			*out_width_m = width_m;
+			*out_height_m = height_m;
+			return true;
+		}
+	}
+#endif
+
+	(void)sys;  // Suppress unused warning when SR not available
+	return false;
+}

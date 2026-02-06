@@ -53,6 +53,47 @@ comp_d3d11_service_create_system(struct xrt_device *xdev,
                                  struct xrt_system_devices *xsysd,
                                  struct xrt_system_compositor **out_xsysc);
 
+/*!
+ * Check if the given system compositor is a D3D11 service compositor.
+ *
+ * @param xsysc The system compositor to check.
+ * @return true if this is a D3D11 service compositor.
+ *
+ * @ingroup comp_d3d11_service
+ */
+bool
+comp_d3d11_service_is_d3d11_service(struct xrt_system_compositor *xsysc);
+
+/*!
+ * Get predicted eye positions from the D3D11 service compositor's SR weaver.
+ *
+ * @param xsysc The system compositor (must be D3D11 service compositor).
+ * @param[out] out_left Left eye position in meters (x, y, z).
+ * @param[out] out_right Right eye position in meters (x, y, z).
+ * @return true if eye positions were obtained, false otherwise.
+ *
+ * @ingroup comp_d3d11_service
+ */
+bool
+comp_d3d11_service_get_predicted_eye_positions(struct xrt_system_compositor *xsysc,
+                                                struct xrt_vec3 *out_left,
+                                                struct xrt_vec3 *out_right);
+
+/*!
+ * Get display dimensions from the D3D11 service compositor's SR weaver.
+ *
+ * @param xsysc The system compositor (must be D3D11 service compositor).
+ * @param[out] out_width_m Display width in meters.
+ * @param[out] out_height_m Display height in meters.
+ * @return true if dimensions were obtained, false otherwise.
+ *
+ * @ingroup comp_d3d11_service
+ */
+bool
+comp_d3d11_service_get_display_dimensions(struct xrt_system_compositor *xsysc,
+                                           float *out_width_m,
+                                           float *out_height_m);
+
 
 #ifdef __cplusplus
 }
