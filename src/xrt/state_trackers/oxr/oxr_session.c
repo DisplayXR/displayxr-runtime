@@ -905,6 +905,10 @@ oxr_session_locate_views(struct oxr_logger *log,
 	static int sr_log_counter = 0;
 	bool sr_should_log = (++sr_log_counter % 120) == 1; // Log every ~2 seconds at 60fps
 
+	// World head pose - declared here so it's accessible in the view loop later
+	struct xrt_vec3 world_head_pos = {0.0f, 1.6f, 0.0f};  // Default: standing height
+	struct xrt_quat world_head_ori = XRT_QUAT_IDENTITY;
+
 	bool got_eye_positions = oxr_session_get_predicted_eye_positions(sess, &eye_pair);
 
 	if (sr_should_log) {
@@ -930,9 +934,7 @@ oxr_session_locate_views(struct oxr_logger *log,
 
 		// Head position depends on whether we're using session_target or Monado's window:
 		// - Session target (app window): App controls scene, use SR coords directly (no offset)
-		// - Monado window (VR apps): Use qwerty device pose (1.6m default standing height)
-		struct xrt_vec3 world_head_pos;
-		struct xrt_quat world_head_ori;
+		// - Monado window (VR apps): Display centric rotation around standing height
 
 		if (sess->has_external_window) {
 			// Session target: App provides window, controls scene positioning

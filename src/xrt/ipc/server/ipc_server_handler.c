@@ -233,23 +233,53 @@ ipc_try_get_sr_view_poses(struct ipc_server *s,
 
 	// Head position depends on whether we're using session_target or Monado's window:
 	// - Session target (app window): App controls scene, use SR coords directly (no offset)
-	// - Monado window (VR apps): Apply standing height from qwerty device (1.6m default)
+	// - Monado window (VR apps): Display centric rotation around standing height
 	bool compositor_owns_window = comp_d3d11_service_owns_window(s->xsysc);
 
 	struct xrt_vec3 world_head_pos;
 	struct xrt_quat world_head_ori;
 
 	if (compositor_owns_window) {
-		// Monado window: Use qwerty device pose (default y=1.6m for standing)
-		// VR apps expect human standing height
+		// Monado window: DISPLAY CENTRIC rotation
+		// Rotation happens around the virtual display at standing height (0, 1.6, 0)
+		// Eye positions are defined relative to that display plane
+		// Same pattern as sr_cube_openxr_ext but with 1.6m standing height offset
+
+		// Get player transform from qwerty device
+		struct xrt_pose player_pose = XRT_POSE_IDENTITY;
 		if (xret == XRT_SUCCESS &&
 		    (qwerty_relation.relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT)) {
-			world_head_pos = qwerty_relation.pose.position;
-			world_head_ori = qwerty_relation.pose.orientation;
-		} else {
-			world_head_pos = (struct xrt_vec3){0.0f, 1.6f, 0.0f};
-			world_head_ori = (struct xrt_quat)XRT_QUAT_IDENTITY;
+			// Position offset from standing height origin
+			player_pose.position.x = qwerty_relation.pose.position.x;
+			player_pose.position.y = qwerty_relation.pose.position.y - 1.6f;
+			player_pose.position.z = qwerty_relation.pose.position.z;
+			player_pose.orientation = qwerty_relation.pose.orientation;
 		}
+
+		// Virtual display origin at standing height
+		const struct xrt_vec3 display_origin = {0.0f, 1.6f, 0.0f};
+
+		// World head = display_origin + player_offset + rotate(sr_eye_midpoint)
+		// This makes rotation happen around the display, not around the eyes
+		struct xrt_vec3 rotated_eye_pos;
+		math_quat_rotate_vec3(&player_pose.orientation, &sr_head_midpoint, &rotated_eye_pos);
+
+		world_head_pos.x = display_origin.x + player_pose.position.x + rotated_eye_pos.x;
+		world_head_pos.y = display_origin.y + player_pose.position.y + rotated_eye_pos.y;
+		world_head_pos.z = display_origin.z + player_pose.position.z + rotated_eye_pos.z;
+		world_head_ori = player_pose.orientation;
+
+		/*
+		 * CAMERA CENTRIC (commented out - rotation around eyes):
+		 * if (xret == XRT_SUCCESS &&
+		 *     (qwerty_relation.relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT)) {
+		 *     world_head_pos = qwerty_relation.pose.position;
+		 *     world_head_ori = qwerty_relation.pose.orientation;
+		 * } else {
+		 *     world_head_pos = (struct xrt_vec3){0.0f, 1.6f, 0.0f};
+		 *     world_head_ori = (struct xrt_quat)XRT_QUAT_IDENTITY;
+		 * }
+		 */
 	} else {
 		// Session target: App provides window, controls scene positioning
 		// Use SR eye midpoint directly (app expects SR coordinate system)
