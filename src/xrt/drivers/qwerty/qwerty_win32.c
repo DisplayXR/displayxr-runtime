@@ -227,6 +227,20 @@ qwerty_process_win32(struct xrt_device **xdevs,
 	}
 
 	// Determine focused device
+	// Use GetAsyncKeyState for reliable modifier detection (avoids stuck keys from missed key-up events)
+	bool alt_actual = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+	bool ctrl_actual = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+
+	// Sync our tracked state with actual state (in case we missed key-up events)
+	if (alt_pressed != alt_actual) {
+		U_LOG_W("QWERTY Win32: alt_pressed sync %d -> %d (GetAsyncKeyState)", alt_pressed, alt_actual);
+		alt_pressed = alt_actual;
+	}
+	if (ctrl_pressed != ctrl_actual) {
+		U_LOG_W("QWERTY Win32: ctrl_pressed sync %d -> %d (GetAsyncKeyState)", ctrl_pressed, ctrl_actual);
+		ctrl_pressed = ctrl_actual;
+	}
+
 	struct qwerty_device *qdev;
 	if (ctrl_pressed) {
 		qdev = qd_left;
@@ -253,6 +267,15 @@ qwerty_process_win32(struct xrt_device **xdevs,
 		if (qdev == qd_hmd) dev_name = "HMD";
 		else if (qdev == qd_left) dev_name = "Left";
 		else if (qdev == qd_right) dev_name = "Right";
+
+		// Diagnostic: log focus determination details on first WASD key
+		static bool first_wasd_log = true;
+		if (first_wasd_log && (wParam == 'W' || wParam == 'A' || wParam == 'S' || wParam == 'D')) {
+			first_wasd_log = false;
+			U_LOG_W("QWERTY Win32: Focus debug: alt=%d ctrl=%d qdev=%p qd_hmd=%p qd_left=%p qd_right=%p default=%p",
+			        alt_pressed, ctrl_pressed, (void *)qdev, (void *)qd_hmd, (void *)qd_left, (void *)qd_right,
+			        (void *)default_qdev);
+		}
 
 		// WASDQE Movement
 		switch (wParam) {
