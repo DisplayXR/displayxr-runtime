@@ -947,13 +947,17 @@ oxr_session_locate_views(struct oxr_logger *log,
 				        world_head_pos.x, world_head_pos.y, world_head_pos.z);
 			}
 		} else {
-			// Monado window mode: DISPLAY CENTRIC rotation
-			// Rotation happens around the virtual display at standing height (0, 1.6, 0)
-			// Eye positions are defined relative to that display plane
-			// Same pattern as sr_cube_openxr_ext but with 1.6m standing height offset
+			// Monado window mode: DISPLAY CENTRIC
+			// - Cube is at (0, 1.6, 0) in world space
+			// - SR provides eye positions relative to display, e.g., (0, 0, 0.6)
+			// - We add 1.6m standing height: world_eye = sr_eye + (0, 1.6, 0)
+			// - Mouse rotation orbits eyes around (0, 1.6, 0), cube stays in focus
+			// - WASD movement shifts the display origin
+			// - Orientation stays identity (Kooima projection handles off-center viewing)
 
-			// Get player transform from qwerty device
-			struct xrt_pose player_pose = XRT_POSE_IDENTITY;
+			// Get movement (WASD) and rotation (mouse) from qwerty device
+			struct xrt_vec3 wasd_offset = {0.0f, 0.0f, 0.0f};
+			struct xrt_quat orbit_rotation = XRT_QUAT_IDENTITY;
 			{
 				struct xrt_space_relation qwerty_relation = XRT_SPACE_RELATION_ZERO;
 				xrt_result_t qret = xrt_device_get_tracked_pose(
@@ -961,54 +965,40 @@ oxr_session_locate_views(struct oxr_logger *log,
 
 				if (qret == XRT_SUCCESS &&
 				    (qwerty_relation.relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT)) {
-					// Position offset from standing height origin
-					player_pose.position.x = qwerty_relation.pose.position.x;
-					player_pose.position.y = qwerty_relation.pose.position.y - 1.6f;
-					player_pose.position.z = qwerty_relation.pose.position.z;
-					player_pose.orientation = qwerty_relation.pose.orientation;
+					// WASD movement = position offset from initial (0, 1.6, 0)
+					wasd_offset.x = qwerty_relation.pose.position.x;
+					wasd_offset.y = qwerty_relation.pose.position.y - 1.6f;
+					wasd_offset.z = qwerty_relation.pose.position.z;
+					// Mouse rotation for orbiting
+					orbit_rotation = qwerty_relation.pose.orientation;
 				}
 			}
 
-			// Virtual display origin at standing height
-			const struct xrt_vec3 display_origin = {0.0f, 1.6f, 0.0f};
+			// Standing height offset (display/cube position)
+			const struct xrt_vec3 standing_offset = {0.0f, 1.6f, 0.0f};
 
-			// World head = display_origin + player_offset + rotate(sr_eye_midpoint)
-			// This makes rotation happen around the display, not around the eyes
-			struct xrt_vec3 rotated_eye_pos;
-			math_quat_rotate_vec3(&player_pose.orientation, &sr_eye_midpoint, &rotated_eye_pos);
+			// Rotate SR eye position around the display center
+			struct xrt_vec3 rotated_sr_eye;
+			math_quat_rotate_vec3(&orbit_rotation, &sr_eye_midpoint, &rotated_sr_eye);
 
-			world_head_pos.x = display_origin.x + player_pose.position.x + rotated_eye_pos.x;
-			world_head_pos.y = display_origin.y + player_pose.position.y + rotated_eye_pos.y;
-			world_head_pos.z = display_origin.z + player_pose.position.z + rotated_eye_pos.z;
-			world_head_ori = player_pose.orientation;
+			// World eye = standing_offset + wasd_movement + rotate(sr_eye)
+			world_head_pos.x = standing_offset.x + wasd_offset.x + rotated_sr_eye.x;
+			world_head_pos.y = standing_offset.y + wasd_offset.y + rotated_sr_eye.y;
+			world_head_pos.z = standing_offset.z + wasd_offset.z + rotated_sr_eye.z;
+
+			// Orientation stays identity - Kooima projection handles off-center viewing
+			// The asymmetric frustum makes the cube appear correctly from any eye position
+			world_head_ori = (struct xrt_quat)XRT_QUAT_IDENTITY;
 
 			if (sr_should_log) {
-				U_LOG_W("Display centric mode: display=(%.1f,%.1f,%.1f) player_off=(%.3f,%.3f,%.3f) "
-				        "sr_eye=(%.3f,%.3f,%.3f) -> world_head=(%.3f,%.3f,%.3f)",
-				        display_origin.x, display_origin.y, display_origin.z,
-				        player_pose.position.x, player_pose.position.y, player_pose.position.z,
+				U_LOG_W("Display centric: standing=(%.1f,%.1f,%.1f) wasd=(%.3f,%.3f,%.3f) "
+				        "sr_eye=(%.3f,%.3f,%.3f) rotated=(%.3f,%.3f,%.3f) -> world=(%.3f,%.3f,%.3f)",
+				        standing_offset.x, standing_offset.y, standing_offset.z,
+				        wasd_offset.x, wasd_offset.y, wasd_offset.z,
 				        sr_eye_midpoint.x, sr_eye_midpoint.y, sr_eye_midpoint.z,
+				        rotated_sr_eye.x, rotated_sr_eye.y, rotated_sr_eye.z,
 				        world_head_pos.x, world_head_pos.y, world_head_pos.z);
 			}
-
-			/*
-			 * CAMERA CENTRIC (commented out - rotation around eyes):
-			 * In this mode, qwerty device pose directly becomes head position.
-			 * Rotation happens around the eye position.
-			 *
-			 * struct xrt_space_relation qwerty_relation = XRT_SPACE_RELATION_ZERO;
-			 * xrt_result_t qret = xrt_device_get_tracked_pose(
-			 *     xdev, XRT_INPUT_GENERIC_HEAD_POSE, xdisplay_time, &qwerty_relation);
-			 *
-			 * if (qret == XRT_SUCCESS &&
-			 *     (qwerty_relation.relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT)) {
-			 *     world_head_pos = qwerty_relation.pose.position;
-			 *     world_head_ori = qwerty_relation.pose.orientation;
-			 * } else {
-			 *     world_head_pos = (struct xrt_vec3){0.0f, 1.6f, 0.0f};
-			 *     world_head_ori = (struct xrt_quat)XRT_QUAT_IDENTITY;
-			 * }
-			 */
 		}
 
 		// Head relation: position and orientation in world space
