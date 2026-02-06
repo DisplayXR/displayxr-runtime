@@ -224,28 +224,38 @@ ipc_try_get_sr_view_poses(struct ipc_server *s,
 		}
 	}
 
-	// World head position comes from qwerty device (default y=1.6m for standing)
-	// SR eye positions are in SCREEN-RELATIVE coordinates, not world coordinates!
-	// They should only be used for Kooima FOV calculation and IPD, not head position.
-	struct xrt_vec3 world_head_pos;
-	struct xrt_quat world_head_ori;
-	if (xret == XRT_SUCCESS &&
-	    (qwerty_relation.relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT)) {
-		// Use qwerty device pose directly as head position in world
-		world_head_pos = qwerty_relation.pose.position;
-		world_head_ori = qwerty_relation.pose.orientation;
-	} else {
-		// Fallback: standing eye height
-		world_head_pos = (struct xrt_vec3){0.0f, 1.6f, 0.0f};
-		world_head_ori = (struct xrt_quat)XRT_QUAT_IDENTITY;
-	}
-
-	// SR eye midpoint is used for computing eye offsets (IPD), not world position
+	// SR eye midpoint (used for IPD calculation)
 	struct xrt_vec3 sr_head_midpoint = {
 	    (left_eye.x + right_eye.x) / 2.0f,
 	    (left_eye.y + right_eye.y) / 2.0f,
 	    (left_eye.z + right_eye.z) / 2.0f,
 	};
+
+	// Head position depends on whether we're using session_target or Monado's window:
+	// - Session target (app window): App controls scene, use SR coords directly (no offset)
+	// - Monado window (VR apps): Apply standing height from qwerty device (1.6m default)
+	bool compositor_owns_window = comp_d3d11_service_owns_window(s->xsysc);
+
+	struct xrt_vec3 world_head_pos;
+	struct xrt_quat world_head_ori;
+
+	if (compositor_owns_window) {
+		// Monado window: Use qwerty device pose (default y=1.6m for standing)
+		// VR apps expect human standing height
+		if (xret == XRT_SUCCESS &&
+		    (qwerty_relation.relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT)) {
+			world_head_pos = qwerty_relation.pose.position;
+			world_head_ori = qwerty_relation.pose.orientation;
+		} else {
+			world_head_pos = (struct xrt_vec3){0.0f, 1.6f, 0.0f};
+			world_head_ori = (struct xrt_quat)XRT_QUAT_IDENTITY;
+		}
+	} else {
+		// Session target: App provides window, controls scene positioning
+		// Use SR eye midpoint directly (app expects SR coordinate system)
+		world_head_pos = sr_head_midpoint;
+		world_head_ori = (struct xrt_quat)XRT_QUAT_IDENTITY;
+	}
 
 	// Set head relation
 	out_head_relation->pose.position = world_head_pos;
