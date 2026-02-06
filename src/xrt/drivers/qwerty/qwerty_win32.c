@@ -557,6 +557,12 @@ qwerty_process_win32(struct xrt_device **xdevs,
 			if (dx != 0 || dy != 0) {
 				float yaw = (float)(-dx) * SENSITIVITY;
 				float pitch = (float)(-dy) * SENSITIVITY;
+				// Log qdev pointer on first mouse look (for device identity debugging)
+				static bool first_mouse_log = true;
+				if (first_mouse_log) {
+					first_mouse_log = false;
+					U_LOG_W("QWERTY Win32: Mouse look qdev=%p (updating this device)", (void *)qdev);
+				}
 				U_LOG_W("QWERTY Win32: Mouse look delta dx=%d dy=%d yaw=%.3f pitch=%.3f", dx, dy, yaw, pitch);
 				qwerty_add_look_delta(qdev, yaw, pitch);
 			}

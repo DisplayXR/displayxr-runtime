@@ -202,6 +202,14 @@ qwerty_get_tracked_pose(struct xrt_device *xd,
 {
 	struct qwerty_device *qd = qwerty_device(xd);
 
+	// Log device pointer and pending deltas (first call only)
+	static bool first_pose_log = true;
+	if (first_pose_log) {
+		first_pose_log = false;
+		U_LOG_W("qwerty_get_tracked_pose: qd=%p yaw_delta=%.4f pitch_delta=%.4f (before consume)",
+		        (void *)qd, qd->yaw_delta, qd->pitch_delta);
+	}
+
 	if (name != XRT_INPUT_GENERIC_HEAD_POSE && name != XRT_INPUT_WMR_GRIP_POSE && name != XRT_INPUT_WMR_AIM_POSE) {
 		U_LOG_XDEV_UNSUPPORTED_INPUT(&qd->base, qd->sys->log_level, name);
 		return XRT_ERROR_INPUT_UNSUPPORTED;
@@ -551,6 +559,14 @@ qwerty_add_look_delta(struct qwerty_device *qd, float yaw, float pitch)
 {
 	qd->yaw_delta += yaw * qd->look_speed;
 	qd->pitch_delta += pitch * qd->look_speed;
+
+	// Log device pointer and accumulated deltas (first call only)
+	static bool first_log = true;
+	if (first_log) {
+		first_log = false;
+		U_LOG_W("qwerty_add_look_delta: qd=%p yaw_delta=%.4f pitch_delta=%.4f",
+		        (void *)qd, qd->yaw_delta, qd->pitch_delta);
+	}
 }
 
 void
