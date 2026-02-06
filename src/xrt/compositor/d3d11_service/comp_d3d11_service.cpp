@@ -2948,11 +2948,10 @@ comp_d3d11_service_get_display_dimensions(struct xrt_system_compositor *xsysc,
 
 #ifdef XRT_HAVE_LEIA_SR_D3D11
 	if (sys->weaver != nullptr) {
-		uint32_t width_px, height_px;
-		float width_m, height_m;
-		if (leiasr_d3d11_get_display_dimensions(sys->weaver, &width_px, &height_px, &width_m, &height_m)) {
-			*out_width_m = width_m;
-			*out_height_m = height_m;
+		struct leiasr_display_dimensions dims = {0};
+		if (leiasr_d3d11_get_display_dimensions(sys->weaver, &dims) && dims.valid) {
+			*out_width_m = dims.width_m;
+			*out_height_m = dims.height_m;
 			return true;
 		}
 	}
