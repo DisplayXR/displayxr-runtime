@@ -523,10 +523,13 @@ void RenderScene(
     // Render cube
     // Scale cube to 0.06m (60mm, matching reference SR example) - unit cube is -0.5 to 0.5
     // OpenXR coordinate system uses meters, so all scene geometry must be in meters.
+    // Position cube at y=1.6m (standing eye level) facing the user
     const float cubeSize = 0.06f;  // 60mm in meters
+    const float cubeHeight = 1.6f; // Standing eye level in meters
     XMMATRIX cubeScale = XMMatrixScaling(cubeSize, cubeSize, cubeSize);
     XMMATRIX cubeRotation = XMMatrixRotationY(renderer.cubeRotation);
-    XMMATRIX cubeWorld = cubeRotation * cubeScale;
+    XMMATRIX cubeTranslation = XMMatrixTranslation(0.0f, cubeHeight, 0.0f);
+    XMMATRIX cubeWorld = cubeRotation * cubeScale * cubeTranslation;
     XMMATRIX cubeWVP = cubeWorld * zoom * viewMatrix * projMatrix;
 
     renderer.context->IASetInputLayout(renderer.cubeInputLayout.Get());
@@ -545,9 +548,10 @@ void RenderScene(
 
     // Render grid
     // Scale grid to be visible in meter scale (original grid is -10 to +10 units at y=-1)
-    // Scale to 0.5m range, positioned at y=-0.03m (below the cube)
+    // Grid at floor level (y=0) - user's eye level is at 1.6m above
     const float gridScale = 0.05f;  // Each unit becomes 0.05m (50mm)
-    XMMATRIX gridWorld = XMMatrixScaling(gridScale, gridScale, gridScale) * XMMatrixTranslation(0, -0.03f + gridScale, 0);
+    // Grid vertices have y=-1, after scaling y = -gridScale, translate by +gridScale to get y=0
+    XMMATRIX gridWorld = XMMatrixScaling(gridScale, gridScale, gridScale) * XMMatrixTranslation(0, gridScale, 0);
     XMMATRIX gridWVP = gridWorld * zoom * viewMatrix * projMatrix;
 
     renderer.context->IASetInputLayout(renderer.gridInputLayout.Get());
