@@ -113,25 +113,72 @@ ipc_try_get_sr_view_poses(struct ipc_server *s,
                           struct xrt_fov *out_fovs,
                           struct xrt_pose *out_poses)
 {
-	if (view_count != 2 || s->xsysc == NULL) {
+	// Log that we're being called (first call only)
+	static bool first_call = true;
+	if (first_call) {
+		first_call = false;
+		IPC_WARN(s, "ipc_try_get_sr_view_poses: FIRST CALL - view_count=%u xsysc=%p",
+		         view_count, (void*)s->xsysc);
+	}
+
+	if (view_count != 2) {
+		static bool logged_view_count = false;
+		if (!logged_view_count) {
+			logged_view_count = true;
+			IPC_WARN(s, "ipc_try_get_sr_view_poses: view_count=%u (expected 2), skipping SR poses", view_count);
+		}
+		return false;
+	}
+
+	if (s->xsysc == NULL) {
+		static bool logged_null_xsysc = false;
+		if (!logged_null_xsysc) {
+			logged_null_xsysc = true;
+			IPC_WARN(s, "ipc_try_get_sr_view_poses: xsysc is NULL, skipping SR poses");
+		}
 		return false;
 	}
 
 	// Check if we have D3D11 service compositor with SR
 	if (!comp_d3d11_service_is_d3d11_service(s->xsysc)) {
+		static bool logged_not_d3d11_service = false;
+		if (!logged_not_d3d11_service) {
+			logged_not_d3d11_service = true;
+			IPC_WARN(s, "ipc_try_get_sr_view_poses: NOT d3d11_service compositor, skipping SR poses");
+		}
 		return false;
 	}
 
 	// Get eye positions from SR weaver
 	struct xrt_vec3 left_eye, right_eye;
 	if (!comp_d3d11_service_get_predicted_eye_positions(s->xsysc, &left_eye, &right_eye)) {
+		static bool logged_no_eye_pos = false;
+		if (!logged_no_eye_pos) {
+			logged_no_eye_pos = true;
+			IPC_WARN(s, "ipc_try_get_sr_view_poses: get_predicted_eye_positions FAILED, skipping SR poses");
+		}
 		return false;
 	}
 
 	// Get display dimensions for Kooima FOV
 	float screen_width_m, screen_height_m;
 	if (!comp_d3d11_service_get_display_dimensions(s->xsysc, &screen_width_m, &screen_height_m)) {
+		static bool logged_no_dims = false;
+		if (!logged_no_dims) {
+			logged_no_dims = true;
+			IPC_WARN(s, "ipc_try_get_sr_view_poses: get_display_dimensions FAILED, skipping SR poses");
+		}
 		return false;
+	}
+
+	// Log success on first successful call
+	static bool first_success = true;
+	if (first_success) {
+		first_success = false;
+		IPC_WARN(s, "ipc_try_get_sr_view_poses: SUCCESS! eye L=(%.3f,%.3f,%.3f) R=(%.3f,%.3f,%.3f) screen=%.3fx%.3fm",
+		         left_eye.x, left_eye.y, left_eye.z,
+		         right_eye.x, right_eye.y, right_eye.z,
+		         screen_width_m, screen_height_m);
 	}
 
 	// Get qwerty device pose as "player transform"

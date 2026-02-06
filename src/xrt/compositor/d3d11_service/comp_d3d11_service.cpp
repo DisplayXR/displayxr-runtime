@@ -2893,7 +2893,19 @@ comp_d3d11_service_is_d3d11_service(struct xrt_system_compositor *xsysc)
 		return false;
 	}
 	// Check by comparing function pointers - this identifies our compositor type
-	return xsysc->create_native_compositor == system_create_native_compositor;
+	bool is_d3d11_service = (xsysc->create_native_compositor == system_create_native_compositor);
+
+	// Log first call for debugging
+	static bool first_call = true;
+	if (first_call) {
+		first_call = false;
+		U_LOG_W("comp_d3d11_service_is_d3d11_service: xsysc=%p, create_native_compositor=%p, expected=%p, match=%s",
+		        (void*)xsysc,
+		        (void*)xsysc->create_native_compositor,
+		        (void*)system_create_native_compositor,
+		        is_d3d11_service ? "YES" : "NO");
+	}
+	return is_d3d11_service;
 }
 
 bool
