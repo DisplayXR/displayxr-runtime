@@ -1167,20 +1167,23 @@ oxr_session_locate_views(struct oxr_logger *log,
 				eye_pos.z = eye_pair.right.z;
 			}
 
-			// Apply player transform: worldPos = playerOri * localPos + playerPos
-			if (have_player_transform) {
+			// Apply world transform based on session type:
+			// - Session target (app window): Use SR eye coords directly (no transform)
+			// - Monado window: Apply head pose from qwerty device
+			if (!sess->has_external_window) {
+				// Monado window: transform eye pos by world head pose
 				struct xrt_vec3 rotated_pos;
-				math_quat_rotate_vec3(&player_pose.orientation, &eye_pos, &rotated_pos);
-				views[i].pose.position.x = rotated_pos.x + player_pose.position.x;
-				views[i].pose.position.y = rotated_pos.y + player_pose.position.y;
-				views[i].pose.position.z = rotated_pos.z + player_pose.position.z;
-				// Apply player orientation to view
-				views[i].pose.orientation.x = player_pose.orientation.x;
-				views[i].pose.orientation.y = player_pose.orientation.y;
-				views[i].pose.orientation.z = player_pose.orientation.z;
-				views[i].pose.orientation.w = player_pose.orientation.w;
+				math_quat_rotate_vec3(&world_head_ori, &eye_pos, &rotated_pos);
+				views[i].pose.position.x = rotated_pos.x + world_head_pos.x;
+				views[i].pose.position.y = rotated_pos.y + world_head_pos.y;
+				views[i].pose.position.z = rotated_pos.z + world_head_pos.z;
+				// Apply head orientation to view
+				views[i].pose.orientation.x = world_head_ori.x;
+				views[i].pose.orientation.y = world_head_ori.y;
+				views[i].pose.orientation.z = world_head_ori.z;
+				views[i].pose.orientation.w = world_head_ori.w;
 			} else {
-				// No player transform - use raw eye positions
+				// Session target: use raw SR eye positions (app controls scene)
 				views[i].pose.position.x = eye_pos.x;
 				views[i].pose.position.y = eye_pos.y;
 				views[i].pose.position.z = eye_pos.z;
