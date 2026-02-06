@@ -125,7 +125,7 @@ oxr_locate_body_joints_bd(struct oxr_logger *log,
 	}
 
 	// Access BD-specific joint data
-	const struct xrt_body_joint_set_bd *bd_joint_set = (const struct xrt_body_joint_set_bd *)&body_joint_set_result;
+	const struct xrt_body_joint_set_bd *bd_joint_set = &body_joint_set_result.body_joint_set_bd;
 
 	locations->allJointPosesTracked = bd_joint_set->all_joint_poses_tracked ? XR_TRUE : XR_FALSE;
 

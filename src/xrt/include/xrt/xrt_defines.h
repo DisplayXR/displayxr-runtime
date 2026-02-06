@@ -2197,17 +2197,6 @@ struct xrt_full_body_joint_set_meta
 	struct xrt_body_joint_location_fb joint_locations[XRT_FULL_BODY_JOINT_COUNT_META];
 };
 
-struct xrt_body_joint_set
-{
-	union {
-		struct xrt_base_body_joint_set_meta base_body_joint_set_meta;
-		struct xrt_body_joint_set_fb body_joint_set_fb;
-		struct xrt_full_body_joint_set_meta full_body_joint_set_meta;
-	};
-	// in driver global space, without tracking_origin offset
-	struct xrt_space_relation body_pose;
-};
-
 /*
  *
  * XR_BD_body_tracking (PICO body tracking)
@@ -2260,9 +2249,21 @@ struct xrt_body_joint_location_bd
 struct xrt_body_joint_set_bd
 {
 	int64_t sample_time_ns;
-	bool is_active;
-	bool all_joint_poses_tracked;
 	struct xrt_body_joint_location_bd joint_locations[XRT_BODY_JOINT_COUNT_BD];
+	XRT_ALIGNAS(8) bool is_active;
+	bool all_joint_poses_tracked;
+};
+
+struct xrt_body_joint_set
+{
+	union {
+		struct xrt_base_body_joint_set_meta base_body_joint_set_meta;
+		struct xrt_body_joint_set_fb body_joint_set_fb;
+		struct xrt_full_body_joint_set_meta full_body_joint_set_meta;
+		struct xrt_body_joint_set_bd body_joint_set_bd;
+	};
+	// in driver global space, without tracking_origin offset
+	struct xrt_space_relation body_pose;
 };
 
 /*!
