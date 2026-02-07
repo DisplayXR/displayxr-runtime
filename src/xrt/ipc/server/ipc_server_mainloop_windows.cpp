@@ -33,7 +33,7 @@
 #include "server/ipc_server.h"
 
 #ifdef XRT_HAVE_D3D11_SERVICE_COMPOSITOR
-#include "compositor/d3d11_service/comp_d3d11_service.h"
+#include "d3d11_service/comp_d3d11_service.h"
 #endif
 
 #include <conio.h>
