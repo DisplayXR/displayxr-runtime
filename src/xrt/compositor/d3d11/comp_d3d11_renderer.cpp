@@ -618,6 +618,12 @@ render_projection_layer(struct comp_d3d11_renderer *r,
 	constants.post_transform[2] = view_data->sub.norm_rect.w;
 	constants.post_transform[3] = view_data->sub.norm_rect.h;
 
+	// Handle Y-flip (e.g. OpenGL textures have bottom-left origin)
+	if (layer->data.flip_y) {
+		constants.post_transform[1] += constants.post_transform[3];
+		constants.post_transform[3] = -constants.post_transform[3];
+	}
+
 	// Color scale and bias
 	// Default to identity (scale=1, bias=0) if not explicitly set via
 	// XR_KHR_composition_layer_color_scale_bias extension
