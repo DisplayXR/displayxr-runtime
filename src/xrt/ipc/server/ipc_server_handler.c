@@ -224,78 +224,51 @@ ipc_try_get_sr_view_poses(struct ipc_server *s,
 		}
 	}
 
-	// SR eye midpoint (used for IPD calculation)
-	struct xrt_vec3 sr_head_midpoint = {
-	    (left_eye.x + right_eye.x) / 2.0f,
-	    (left_eye.y + right_eye.y) / 2.0f,
-	    (left_eye.z + right_eye.z) / 2.0f,
-	};
+	// DISPLAY-CENTRIC MODEL:
+	// - qwerty_device = virtual display pose (starts at 0, 1.6, 0)
+	// - SR eye positions are in display-local coords
+	// - View pose = display_pos + rotate(sr_eye, display_ori)
+	//
+	// For session_target: SR eye positions used directly (no transform)
 
-	// Head position depends on whether we're using session_target or Monado's window:
-	// - Session target (app window): App controls scene, use SR coords directly (no offset)
-	// - Monado window (VR apps): Display centric rotation around standing height
 	bool compositor_owns_window = comp_d3d11_service_owns_window(s->xsysc);
 
-	struct xrt_vec3 world_head_pos;
-	struct xrt_quat world_head_ori;
+	struct xrt_vec3 display_pos = qwerty_relation.pose.position;
+	struct xrt_quat display_ori = qwerty_relation.pose.orientation;
+
+	// For IPC, we return head_relation and view poses relative to head.
+	// To get view = display + rotate(sr_eye, display_ori), we set:
+	//   head = display pose
+	//   view_pose = rotate(sr_eye, display_ori)  [relative to display origin]
 
 	if (compositor_owns_window) {
-		// DISPLAY-CENTRIC MODE (Monado window)
-		//
-		// Philosophy: qwerty_device tracks the pose of a "virtual display"
-		// initially at (0, 1.6, 0) in world space.
-		//
-		// SR eyes are in display-local coords, transform to world:
-		//   worldPos = display_pos + rotate(sr_eye, display_ori)
-		//   worldOri = display_ori
-
-		struct xrt_vec3 display_pos = qwerty_relation.pose.position;
-		struct xrt_quat display_ori = qwerty_relation.pose.orientation;
-
-		struct xrt_vec3 rotated_sr_eye;
-		math_quat_rotate_vec3(&display_ori, &sr_head_midpoint, &rotated_sr_eye);
-
-		world_head_pos.x = display_pos.x + rotated_sr_eye.x;
-		world_head_pos.y = display_pos.y + rotated_sr_eye.y;
-		world_head_pos.z = display_pos.z + rotated_sr_eye.z;
-
-		world_head_ori = display_ori;
+		// Monado window: head = display pose
+		out_head_relation->pose.position = display_pos;
+		out_head_relation->pose.orientation = display_ori;
 	} else {
-		// Session target: App provides window, controls scene positioning
-		// Use SR eye midpoint directly (app expects SR coordinate system)
-		world_head_pos = sr_head_midpoint;
-		world_head_ori = (struct xrt_quat)XRT_QUAT_IDENTITY;
+		// Session target: head at origin, identity orientation
+		out_head_relation->pose.position = (struct xrt_vec3){0, 0, 0};
+		out_head_relation->pose.orientation = (struct xrt_quat)XRT_QUAT_IDENTITY;
 	}
-
-	// Set head relation
-	out_head_relation->pose.position = world_head_pos;
-	out_head_relation->pose.orientation = world_head_ori;
 	out_head_relation->relation_flags = XRT_SPACE_RELATION_POSITION_VALID_BIT |
 	                                    XRT_SPACE_RELATION_ORIENTATION_VALID_BIT |
 	                                    XRT_SPACE_RELATION_POSITION_TRACKED_BIT |
 	                                    XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT;
 
 	// Compute view poses (eye positions relative to head)
-	// Eye offsets come from SR tracking (provides IPD and vertical offset)
-	struct xrt_vec3 local_left_offset = {
-	    left_eye.x - sr_head_midpoint.x,
-	    left_eye.y - sr_head_midpoint.y,
-	    0.0f,  // z offset is 0 (eyes are at same depth as head center)
-	};
-	struct xrt_vec3 local_right_offset = {
-	    right_eye.x - sr_head_midpoint.x,
-	    right_eye.y - sr_head_midpoint.y,
-	    0.0f,
-	};
+	// Since head = display pose, and we want:
+	//   view_world = head_pos + rotate(view_local, head_ori)
+	//   view_world = display_pos + rotate(sr_eye, display_ori)
+	// We set view_local = sr_eye (raw, not pre-rotated)
+	struct xrt_vec3 sr_left = {left_eye.x, left_eye.y, left_eye.z};
+	struct xrt_vec3 sr_right = {right_eye.x, right_eye.y, right_eye.z};
 
-	// Apply head orientation to eye offsets
-	struct xrt_vec3 rotated_left, rotated_right;
-	math_quat_rotate_vec3(&world_head_ori, &local_left_offset, &rotated_left);
-	math_quat_rotate_vec3(&world_head_ori, &local_right_offset, &rotated_right);
-	out_poses[0].position = rotated_left;
-	out_poses[1].position = rotated_right;
-	out_poses[0].orientation = world_head_ori;
-	out_poses[1].orientation = world_head_ori;
+	// View poses are in head-local space (not pre-rotated)
+	// The head orientation will rotate them when combined
+	out_poses[0].position = sr_left;
+	out_poses[1].position = sr_right;
+	out_poses[0].orientation = (struct xrt_quat)XRT_QUAT_IDENTITY;
+	out_poses[1].orientation = (struct xrt_quat)XRT_QUAT_IDENTITY;
 
 	// Compute Kooima FOV
 	ipc_compute_kooima_fov(&left_eye, screen_width_m, screen_height_m, &out_fovs[0]);
@@ -307,8 +280,8 @@ ipc_try_get_sr_view_poses(struct ipc_server *s,
 		log_counter = 0;
 		float left_h = (out_fovs[0].angle_right - out_fovs[0].angle_left) * 180.0f / 3.14159265f;
 		float left_v = (out_fovs[0].angle_up - out_fovs[0].angle_down) * 180.0f / 3.14159265f;
-		IPC_WARN(s, "IPC SR: head=(%.2f,%.2f,%.2f) SR eye L=(%.3f,%.3f,%.3f) FOV H=%.1f° V=%.1f°",
-		         world_head_pos.x, world_head_pos.y, world_head_pos.z,
+		IPC_WARN(s, "IPC SR: display=(%.2f,%.2f,%.2f) SR eye L=(%.3f,%.3f,%.3f) FOV H=%.1f° V=%.1f°",
+		         display_pos.x, display_pos.y, display_pos.z,
 		         left_eye.x, left_eye.y, left_eye.z,
 		         left_h, left_v);
 	}
