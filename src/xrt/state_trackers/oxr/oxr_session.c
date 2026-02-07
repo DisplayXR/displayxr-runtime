@@ -921,78 +921,45 @@ oxr_session_locate_views(struct oxr_logger *log,
 		}
 	}
 
+	// SR eye midpoint - used for Kooima FOV calculation
+	struct xrt_vec3 sr_eye_midpoint = {0};
+
 	if (got_eye_positions && eye_pair.valid) {
 		have_sr_eye_tracking = true;
 
-		// SR eye coords are screen-relative (e.g., 0, 0, 0.6 = centered, 60cm from screen)
-		// Compute midpoint for IPD calculation
-		struct xrt_vec3 sr_eye_midpoint = {
-		    (eye_pair.left.x + eye_pair.right.x) / 2.0f,
-		    (eye_pair.left.y + eye_pair.right.y) / 2.0f,
-		    (eye_pair.left.z + eye_pair.right.z) / 2.0f,
-		};
+		// Compute midpoint (only needed for Kooima FOV calculation below)
+		sr_eye_midpoint.x = (eye_pair.left.x + eye_pair.right.x) / 2.0f;
+		sr_eye_midpoint.y = (eye_pair.left.y + eye_pair.right.y) / 2.0f;
+		sr_eye_midpoint.z = (eye_pair.left.z + eye_pair.right.z) / 2.0f;
 
-		// Head position depends on whether we're using session_target or Monado's window:
-		// - Session target (app window): App controls scene, use SR coords directly (no offset)
-		// - Monado window (VR apps): Display centric rotation around standing height
+		// DISPLAY-CENTRIC MODEL (Monado window mode):
+		// - qwerty_device = virtual display pose (starts at 0, 1.6, 0)
+		// - SR eye positions are in display-local coords (e.g., 0.03, 0, 0.6)
+		// - View pose = display_pos + rotate(sr_eye, display_ori)
+		//
+		// For session_target mode: SR eye positions used directly (no transform)
 
-		if (sess->has_external_window) {
-			// Session target: App provides window, controls scene positioning
-			// Use SR eye coords directly (app's scene is relative to display)
-			world_head_pos = sr_eye_midpoint;
-			world_head_ori = (struct xrt_quat)XRT_QUAT_IDENTITY;
-
-			if (sr_should_log) {
-				U_LOG_W("Session target mode: Using SR eye coords directly pos=(%.3f,%.3f,%.3f)",
-				        world_head_pos.x, world_head_pos.y, world_head_pos.z);
-			}
-		} else {
-			// DISPLAY-CENTRIC MODE (Monado window, no session_target extension)
-			//
-			// Philosophy: qwerty_device tracks the pose of a "virtual display"
-			// initially at (0, 1.6, 0) in world space.
-			//
-			// SR/Kooima eye positions are defined in the display's LOCAL frame:
-			//   - SR returns (0.03, 0, 0.6) = 3cm right of display center, 60cm in front
-			//   - These are display-relative coordinates
-			//
-			// To get world coordinates, transform from display-local to world:
-			//   worldPos = display_pos + rotate(sr_eye_local, display_ori)
-			//   worldOri = display_ori
-			//
-			// WASD/mouse controls the display pose. Eyes move/rotate automatically
-			// because they're defined relative to the display.
-
-			// qwerty_device.pose = virtual display pose in world space
+		if (!sess->has_external_window) {
+			// Get display pose from qwerty_device
 			struct xrt_space_relation display_relation = XRT_SPACE_RELATION_ZERO;
 			xrt_device_get_tracked_pose(xdev, XRT_INPUT_GENERIC_HEAD_POSE, xdisplay_time, &display_relation);
 
 			struct xrt_vec3 display_pos = display_relation.pose.position;
 			struct xrt_quat display_ori = display_relation.pose.orientation;
 
-			// Transform SR eye from display-local to world coordinates
-			struct xrt_vec3 rotated_sr_eye;
-			math_quat_rotate_vec3(&display_ori, &sr_eye_midpoint, &rotated_sr_eye);
-
-			world_head_pos.x = display_pos.x + rotated_sr_eye.x;
-			world_head_pos.y = display_pos.y + rotated_sr_eye.y;
-			world_head_pos.z = display_pos.z + rotated_sr_eye.z;
-
-			// View orientation = display orientation (controlled by mouse)
+			// Store for use in view loop below
+			world_head_pos = display_pos;
 			world_head_ori = display_ori;
 
 			if (sr_should_log) {
-				U_LOG_W("Display centric: display_pos=(%.3f,%.3f,%.3f) display_ori=(%.3f,%.3f,%.3f,%.3f) "
-				        "sr_eye=(%.3f,%.3f,%.3f) rotated=(%.3f,%.3f,%.3f) -> world=(%.3f,%.3f,%.3f)",
+				U_LOG_W("Display pose: pos=(%.3f,%.3f,%.3f) ori=(%.3f,%.3f,%.3f,%.3f)",
 				        display_pos.x, display_pos.y, display_pos.z,
-				        display_ori.x, display_ori.y, display_ori.z, display_ori.w,
-				        sr_eye_midpoint.x, sr_eye_midpoint.y, sr_eye_midpoint.z,
-				        rotated_sr_eye.x, rotated_sr_eye.y, rotated_sr_eye.z,
-				        world_head_pos.x, world_head_pos.y, world_head_pos.z);
+				        display_ori.x, display_ori.y, display_ori.z, display_ori.w);
 			}
 		}
+		// For session_target: world_head_pos/ori stay at defaults (not used)
 
-		// Head relation: position and orientation in world space
+		// Set head relation (used by some internal calculations)
 		T_xdev_head.pose.position = world_head_pos;
 		T_xdev_head.pose.orientation = world_head_ori;
 		T_xdev_head.relation_flags = XRT_SPACE_RELATION_POSITION_VALID_BIT |
@@ -1000,36 +967,7 @@ oxr_session_locate_views(struct oxr_logger *log,
 		                             XRT_SPACE_RELATION_POSITION_TRACKED_BIT |
 		                             XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT;
 
-		// View poses: eye positions relative to head
-		// IPD comes from SR eye tracking (distance between eyes)
-		struct xrt_vec3 local_left_offset = {
-		    eye_pair.left.x - sr_eye_midpoint.x,
-		    eye_pair.left.y - sr_eye_midpoint.y,
-		    eye_pair.left.z - sr_eye_midpoint.z,
-		};
-		struct xrt_vec3 local_right_offset = {
-		    eye_pair.right.x - sr_eye_midpoint.x,
-		    eye_pair.right.y - sr_eye_midpoint.y,
-		    eye_pair.right.z - sr_eye_midpoint.z,
-		};
-
-		// Transform eye offsets by head orientation
-		// For session_target: identity orientation, offsets unchanged
-		// For Monado window: rotate offsets by head orientation (from qwerty device)
-		bool has_rotation = world_head_ori.x != 0.0f || world_head_ori.y != 0.0f ||
-		                    world_head_ori.z != 0.0f || world_head_ori.w != 1.0f;
-		if (has_rotation) {
-			struct xrt_vec3 rotated_left, rotated_right;
-			math_quat_rotate_vec3(&world_head_ori, &local_left_offset, &rotated_left);
-			math_quat_rotate_vec3(&world_head_ori, &local_right_offset, &rotated_right);
-			poses[0].position = rotated_left;
-			poses[1].position = rotated_right;
-		} else {
-			poses[0].position = local_left_offset;
-			poses[1].position = local_right_offset;
-		}
-		poses[0].orientation = world_head_ori;
-		poses[1].orientation = world_head_ori;
+		// poses[] not used for SR path - we set views directly in the loop below
 
 		// Compute Kooima FOV from SR eye positions, with window-adaptive scaling
 		float screen_width_m = 0.0f;
@@ -1180,43 +1118,38 @@ oxr_session_locate_views(struct oxr_logger *log,
 		// The eye positions from SR SDK are in display space; we apply the player
 		// transform (from qwerty device) to move the virtual world.
 		if (have_sr_eye_tracking && view_count == 2) {
-			// Get the raw eye position for this view
-			struct xrt_vec3 eye_pos;
-			if (i == 0) {
-				eye_pos.x = eye_pair.left.x;
-				eye_pos.y = eye_pair.left.y;
-				eye_pos.z = eye_pair.left.z;
-			} else {
-				eye_pos.x = eye_pair.right.x;
-				eye_pos.y = eye_pair.right.y;
-				eye_pos.z = eye_pair.right.z;
-			}
+			// Get SR eye position for this view (in display-local coords)
+			struct xrt_vec3 sr_eye = (i == 0)
+			    ? (struct xrt_vec3){eye_pair.left.x, eye_pair.left.y, eye_pair.left.z}
+			    : (struct xrt_vec3){eye_pair.right.x, eye_pair.right.y, eye_pair.right.z};
 
-			// Apply world transform based on session type:
-			// - Session target (app window): Use SR eye coords directly (no transform)
-			// - Monado window: Apply head pose from qwerty device
 			if (!sess->has_external_window) {
-				// Monado window: transform eye pos by world head pose
-				struct xrt_vec3 rotated_pos;
-				math_quat_rotate_vec3(&world_head_ori, &eye_pos, &rotated_pos);
-				views[i].pose.position.x = rotated_pos.x + world_head_pos.x;
-				views[i].pose.position.y = rotated_pos.y + world_head_pos.y;
-				views[i].pose.position.z = rotated_pos.z + world_head_pos.z;
-				// Apply head orientation to view
-				views[i].pose.orientation.x = world_head_ori.x;
-				views[i].pose.orientation.y = world_head_ori.y;
-				views[i].pose.orientation.z = world_head_ori.z;
-				views[i].pose.orientation.w = world_head_ori.w;
+				// MONADO WINDOW: Transform SR eye from display-local to world
+				// view_pos = display_pos + rotate(sr_eye, display_ori)
+				// view_ori = display_ori
+				struct xrt_vec3 rotated_eye;
+				math_quat_rotate_vec3(&world_head_ori, &sr_eye, &rotated_eye);
+
+				views[i].pose.position.x = world_head_pos.x + rotated_eye.x;
+				views[i].pose.position.y = world_head_pos.y + rotated_eye.y;
+				views[i].pose.position.z = world_head_pos.z + rotated_eye.z;
+				views[i].pose.orientation = (XrQuaternionf){
+				    world_head_ori.x, world_head_ori.y, world_head_ori.z, world_head_ori.w};
+
+				if (sr_should_log) {
+					U_LOG_W("Eye %d: sr_eye=(%.3f,%.3f,%.3f) display=(%.3f,%.3f,%.3f) "
+					        "-> view=(%.3f,%.3f,%.3f)",
+					        i, sr_eye.x, sr_eye.y, sr_eye.z,
+					        world_head_pos.x, world_head_pos.y, world_head_pos.z,
+					        views[i].pose.position.x, views[i].pose.position.y,
+					        views[i].pose.position.z);
+				}
 			} else {
-				// Session target: use raw SR eye positions (app controls scene)
-				views[i].pose.position.x = eye_pos.x;
-				views[i].pose.position.y = eye_pos.y;
-				views[i].pose.position.z = eye_pos.z;
-				// Identity orientation (looking straight at screen)
-				views[i].pose.orientation.x = 0.0f;
-				views[i].pose.orientation.y = 0.0f;
-				views[i].pose.orientation.z = 0.0f;
-				views[i].pose.orientation.w = 1.0f;
+				// SESSION TARGET: Use SR eye positions directly (app controls scene)
+				views[i].pose.position.x = sr_eye.x;
+				views[i].pose.position.y = sr_eye.y;
+				views[i].pose.position.z = sr_eye.z;
+				views[i].pose.orientation = (XrQuaternionf){0.0f, 0.0f, 0.0f, 1.0f};
 			}
 		}
 #endif
