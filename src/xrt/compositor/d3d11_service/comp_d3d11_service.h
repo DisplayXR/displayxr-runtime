@@ -110,6 +110,21 @@ comp_d3d11_service_get_display_dimensions(struct xrt_system_compositor *xsysc,
 bool
 comp_d3d11_service_owns_window(struct xrt_system_compositor *xsysc);
 
+/*!
+ * Check if the compositor's window is still valid (not closed by user).
+ *
+ * This should be checked periodically by the IPC server to detect when
+ * the user closes the Monado window (ESC, close button, etc.) so the
+ * service can be shut down gracefully.
+ *
+ * @param xsysc The system compositor (must be D3D11 service compositor).
+ * @return true if window is valid, false if closed or no window exists.
+ *
+ * @ingroup comp_d3d11_service
+ */
+bool
+comp_d3d11_service_window_is_valid(struct xrt_system_compositor *xsysc);
+
 
 #ifdef __cplusplus
 }

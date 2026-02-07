@@ -32,6 +32,10 @@
 #include "shared/ipc_shmem.h"
 #include "server/ipc_server.h"
 
+#ifdef XRT_HAVE_D3D11_SERVICE_COMPOSITOR
+#include "compositor/d3d11_service/comp_d3d11_service.h"
+#endif
+
 #include <conio.h>
 #include <sddl.h>
 
@@ -225,6 +229,16 @@ ipc_server_mainloop_poll(struct ipc_server *vs, struct ipc_server_mainloop *ml)
 		ipc_server_handle_shutdown_signal(vs);
 		return;
 	}
+
+#ifdef XRT_HAVE_D3D11_SERVICE_COMPOSITOR
+	// Check if the Monado window was closed by the user (ESC, close button, etc.)
+	// If so, shut down the service gracefully to avoid broken state.
+	if (vs->xsysc != nullptr && !comp_d3d11_service_window_is_valid(vs->xsysc)) {
+		U_LOG_W("Monado window closed - shutting down service");
+		ipc_server_handle_shutdown_signal(vs);
+		return;
+	}
+#endif
 
 	if (!ml->pipe_handle) {
 		create_another_pipe_instance(vs, ml);

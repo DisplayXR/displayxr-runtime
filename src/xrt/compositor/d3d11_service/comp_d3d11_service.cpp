@@ -2986,3 +2986,22 @@ comp_d3d11_service_owns_window(struct xrt_system_compositor *xsysc)
 	// If sys->window is NULL, the app provided its own window (session_target).
 	return sys->window != nullptr;
 }
+
+bool
+comp_d3d11_service_window_is_valid(struct xrt_system_compositor *xsysc)
+{
+	if (!comp_d3d11_service_is_d3d11_service(xsysc)) {
+		return true;  // Not a D3D11 service, assume valid
+	}
+
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+
+	// If we don't own a window (session_target mode), it's always "valid"
+	// from our perspective - the app controls its own window lifecycle.
+	if (sys->window == nullptr) {
+		return true;
+	}
+
+	// Check if our owned window is still valid (not closed by user)
+	return comp_d3d11_window_is_valid(sys->window);
+}
