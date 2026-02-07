@@ -44,6 +44,10 @@
 #include "vk/vk_helpers.h"
 #endif
 
+#ifdef XRT_OS_WINDOWS
+#include "comp_d3d11_window.h"
+#endif
+
 #include <math.h>
 #include <stdio.h>
 #include <assert.h>
@@ -1381,6 +1385,17 @@ render_per_session_clients_locked(struct multi_system_compositor *msc, int64_t d
 			U_LOG_W("[per-session] Client %zu: skipping (no active frame)", k);
 			continue;
 		}
+
+#ifdef XRT_OS_WINDOWS
+		// Skip rendering if self-owned window was closed
+		if (mc->session_render.owns_window && mc->session_render.own_window != NULL &&
+		    !comp_d3d11_window_is_valid(mc->session_render.own_window)) {
+			U_LOG_W("[per-session] Client %zu: skipping (window closed)", k);
+			int64_t now_ns = os_monotonic_get_ns();
+			multi_compositor_retire_delivered_locked(mc, now_ns);
+			continue;
+		}
+#endif
 
 		U_LOG_W("[per-session] Client %zu: rendering session to own target...", k);
 		session_count++;

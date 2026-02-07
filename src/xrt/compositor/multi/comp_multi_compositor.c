@@ -703,6 +703,15 @@ multi_compositor_wait_frame(struct xrt_compositor *xc,
 
 	struct multi_compositor *mc = multi_compositor(xc);
 
+#ifdef XRT_OS_WINDOWS
+	// Check if self-owned window was closed (ESC, close button, ALT+F4)
+	if (mc->session_render.owns_window && mc->session_render.own_window != NULL &&
+	    !comp_d3d11_window_is_valid(mc->session_render.own_window)) {
+		U_LOG_W("Self-owned window closed - signaling session loss");
+		return XRT_ERROR_IPC_FAILURE;
+	}
+#endif
+
 	int64_t frame_id = -1;
 	int64_t wake_up_time_ns = 0;
 	int64_t predicted_gpu_time_ns = 0;
