@@ -580,6 +580,26 @@ multi_compositor_end_session(struct xrt_compositor *xc)
 				        mc->session_render.external_window_handle);
 			}
 
+			// Destroy weaver framebuffers and render pass
+			if (vk != NULL && mc->session_render.framebuffers != NULL) {
+				for (uint32_t i = 0; i < mc->session_render.buffer_count; i++) {
+					if (mc->session_render.framebuffers[i] != VK_NULL_HANDLE) {
+						vk->vkDestroyFramebuffer(vk->device, mc->session_render.framebuffers[i],
+						                         NULL);
+					}
+				}
+			}
+			free(mc->session_render.framebuffers);
+			mc->session_render.framebuffers = NULL;
+
+			if (mc->session_render.weaver_render_pass != VK_NULL_HANDLE) {
+				if (vk != NULL) {
+					vk->vkDestroyRenderPass(vk->device, mc->session_render.weaver_render_pass,
+					                        NULL);
+				}
+				mc->session_render.weaver_render_pass = VK_NULL_HANDLE;
+			}
+
 			// Destroy the command pool used by the weaver
 			if (mc->session_render.weaver_cmd_pool != VK_NULL_HANDLE) {
 				if (vk != NULL) {
@@ -1096,6 +1116,25 @@ multi_compositor_destroy(struct xrt_compositor *xc)
 			leiasr_destroy(mc->session_render.weaver);
 			mc->session_render.weaver = NULL;
 		}
+
+		// Destroy weaver framebuffers and render pass
+		if (vk != NULL && mc->session_render.framebuffers != NULL) {
+			for (uint32_t i = 0; i < mc->session_render.buffer_count; i++) {
+				if (mc->session_render.framebuffers[i] != VK_NULL_HANDLE) {
+					vk->vkDestroyFramebuffer(vk->device, mc->session_render.framebuffers[i], NULL);
+				}
+			}
+		}
+		free(mc->session_render.framebuffers);
+		mc->session_render.framebuffers = NULL;
+
+		if (mc->session_render.weaver_render_pass != VK_NULL_HANDLE) {
+			if (vk != NULL) {
+				vk->vkDestroyRenderPass(vk->device, mc->session_render.weaver_render_pass, NULL);
+			}
+			mc->session_render.weaver_render_pass = VK_NULL_HANDLE;
+		}
+
 		if (mc->session_render.weaver_cmd_pool != VK_NULL_HANDLE) {
 			if (vk != NULL) {
 				vk->vkDestroyCommandPool(vk->device, mc->session_render.weaver_cmd_pool, NULL);
@@ -1369,6 +1408,72 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 	mc->session_render.buffer_count = image_count;
 	mc->session_render.fenced_buffer = -1;
 	U_LOG_W("Created %u command buffers and fences for per-session rendering", image_count);
+
+	// Create render pass for weaver output (single color attachment, no depth)
+	// Must be compatible with SR SDK's internal render pass expectations
+	struct comp_target *ct = mc->session_render.target;
+	VkAttachmentDescription color_attachment = {
+	    .format = ct->format,
+	    .samples = VK_SAMPLE_COUNT_1_BIT,
+	    .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
+	    .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+	    .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+	    .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+	    .initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	    .finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	};
+
+	VkAttachmentReference color_ref = {
+	    .attachment = 0,
+	    .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	};
+
+	VkSubpassDescription subpass = {
+	    .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
+	    .colorAttachmentCount = 1,
+	    .pColorAttachments = &color_ref,
+	};
+
+	VkRenderPassCreateInfo rp_info = {
+	    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+	    .attachmentCount = 1,
+	    .pAttachments = &color_attachment,
+	    .subpassCount = 1,
+	    .pSubpasses = &subpass,
+	};
+
+	vk_ret = vk->vkCreateRenderPass(vk->device, &rp_info, NULL, &mc->session_render.weaver_render_pass);
+	if (vk_ret != VK_SUCCESS) {
+		U_LOG_E("Failed to create weaver render pass: %d", vk_ret);
+		// Continue without framebuffers - weaving will fail but won't crash init
+	} else {
+		U_LOG_W("Created weaver render pass: %p (format=%d)", (void *)mc->session_render.weaver_render_pass,
+		        ct->format);
+
+		// Create framebuffers for each swapchain image
+		mc->session_render.framebuffers = U_TYPED_ARRAY_CALLOC(VkFramebuffer, image_count);
+		if (mc->session_render.framebuffers != NULL) {
+			for (uint32_t i = 0; i < image_count; i++) {
+				VkFramebufferCreateInfo fb_info = {
+				    .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+				    .renderPass = mc->session_render.weaver_render_pass,
+				    .attachmentCount = 1,
+				    .pAttachments = &ct->images[i].view,
+				    .width = ct->width,
+				    .height = ct->height,
+				    .layers = 1,
+				};
+
+				vk_ret = vk->vkCreateFramebuffer(vk->device, &fb_info, NULL,
+				                                  &mc->session_render.framebuffers[i]);
+				if (vk_ret != VK_SUCCESS) {
+					U_LOG_E("Failed to create weaver framebuffer %u: %d", i, vk_ret);
+					mc->session_render.framebuffers[i] = VK_NULL_HANDLE;
+				}
+			}
+			U_LOG_W("Created %u weaver framebuffers (%ux%u)", image_count, ct->width, ct->height);
+		}
+	}
 #endif
 
 	U_LOG_W("Setting session_render.initialized = true...");

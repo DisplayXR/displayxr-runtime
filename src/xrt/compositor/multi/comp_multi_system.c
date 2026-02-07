@@ -1297,12 +1297,17 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 		}
 	}
 
+	// Get the framebuffer for the current swapchain image
+	VkFramebuffer framebuffer = VK_NULL_HANDLE;
+	if (mc->session_render.framebuffers != NULL) {
+		framebuffer = mc->session_render.framebuffers[buffer_index];
+	}
+
 	// Perform SR weaving
-	U_LOG_W("[per-session] Calling leiasr_weave: weaver=%p, cmd=%p, fb=%ux%u",
-	        (void *)weaver, (void *)cmd, framebufferWidth, framebufferHeight);
+	U_LOG_W("[per-session] Calling leiasr_weave: weaver=%p, cmd=%p, fb=%ux%u, framebuffer=%p",
+	        (void *)weaver, (void *)cmd, framebufferWidth, framebufferHeight, (void *)framebuffer);
 	leiasr_weave(weaver, cmd, weaveLeft, weaveRight, viewport, weaveWidth, weaveHeight, imageFormat,
-	             VK_NULL_HANDLE, // framebuffer - SR Runtime handles this internally
-	             (int)framebufferWidth, (int)framebufferHeight, framebufferFormat);
+	             framebuffer, (int)framebufferWidth, (int)framebufferHeight, framebufferFormat);
 	U_LOG_W("[per-session] leiasr_weave returned");
 
 	// End command buffer

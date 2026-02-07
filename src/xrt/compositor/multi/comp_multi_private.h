@@ -234,6 +234,12 @@ struct multi_compositor
 		//! Index of buffer with pending fence (-1 = none)
 		int32_t fenced_buffer;
 
+		//! Render pass for weaver output (single color attachment, no depth)
+		VkRenderPass weaver_render_pass;
+
+		//! Framebuffers for weaver output (one per swapchain image)
+		VkFramebuffer *framebuffers;
+
 		//! @name Intermediate composite targets for pre-weaving layer compositing
 		//! @{
 
