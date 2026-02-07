@@ -238,6 +238,38 @@ leiasr_query_recommended_view_dimensions(double max_time,
                                           uint32_t *out_native_width,
                                           uint32_t *out_native_height);
 
+/*!
+ * Get predicted eye positions using the shared SR LookaroundFilter.
+ *
+ * This is a static query that uses the SR SDK's shared face tracking resources.
+ * It can be called without a weaver instance for getting eye positions for
+ * multiple clients that share the same face tracker.
+ *
+ * @param[out] out_left_eye Left eye position in meters (x, y, z).
+ * @param[out] out_right_eye Right eye position in meters (x, y, z).
+ *
+ * @return true if valid eye positions are available.
+ *
+ * @ingroup drv_leiasr
+ */
+bool
+leiasr_static_get_predicted_eye_positions(float out_left_eye[3],
+                                          float out_right_eye[3]);
+
+/*!
+ * Get display dimensions using the SR SDK's static display info.
+ *
+ * This is a static query that can be called without a weaver instance.
+ * Uses cached display dimensions from SR SDK initialization.
+ *
+ * @param[out] out_dims Pointer to receive the display dimensions (in meters).
+ * @return true if valid display dimensions are available, false otherwise.
+ *
+ * @ingroup drv_leiasr
+ */
+bool
+leiasr_static_get_display_dimensions(struct leiasr_display_dimensions *out_dims);
+
 #ifdef __cplusplus
 }
 #endif

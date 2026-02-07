@@ -136,6 +136,43 @@ struct d3d11_service_swapchain
 };
 
 /*!
+ * Per-client render resources.
+ *
+ * These resources are created when a client connects and destroyed when the
+ * client disconnects. This allows multiple clients to have their own windows
+ * and SR weavers, and allows the IPC service to start without creating a
+ * window until a client actually connects.
+ */
+struct d3d11_client_render_resources
+{
+	//! Dedicated-thread window (NULL if using external HWND)
+	struct comp_d3d11_window *window;
+
+	//! HWND for swap chain and weaver (owned or external)
+	HWND hwnd;
+
+	//! Whether we own the window (created it) or it's external
+	bool owns_window;
+
+	//! DXGI swap chain for display output
+	wil::com_ptr<IDXGISwapChain1> swap_chain;
+
+	//! Back buffer render target view
+	wil::com_ptr<ID3D11RenderTargetView> back_buffer_rtv;
+
+	//! Stereo render target (side-by-side views)
+	wil::com_ptr<ID3D11Texture2D> stereo_texture;
+	wil::com_ptr<ID3D11ShaderResourceView> stereo_srv;
+	wil::com_ptr<ID3D11RenderTargetView> stereo_rtv;
+
+#ifdef XRT_HAVE_LEIA_SR_D3D11
+	//! SR weaver for light field display
+	struct leiasr_d3d11 *weaver;
+#endif
+};
+
+
+/*!
  * D3D11 service native compositor.
  */
 struct d3d11_service_compositor
@@ -154,6 +191,9 @@ struct d3d11_service_compositor
 
 	//! Current focus state
 	bool state_focused;
+
+	//! Per-client render resources (window, swap chain, weaver)
+	struct d3d11_client_render_resources render;
 
 	//! Accumulated layers for the current frame
 	struct comp_layer_accum layer_accum;
@@ -189,6 +229,9 @@ struct d3d11_service_semaphore
 
 /*!
  * D3D11 service system compositor.
+ *
+ * Contains shared resources used by all clients (D3D11 device, shaders, etc.)
+ * Per-client resources (window, swap chain, weaver) are in d3d11_client_render_resources.
  */
 struct d3d11_service_system
 {
@@ -201,6 +244,9 @@ struct d3d11_service_system
 	//! The device we are rendering for
 	struct xrt_device *xdev;
 
+	//! System devices for qwerty input support (passed to per-client windows)
+	struct xrt_system_devices *xsysd;
+
 	//! D3D11 device (owned by service, not the app)
 	wil::com_ptr<ID3D11Device5> device;
 
@@ -209,17 +255,6 @@ struct d3d11_service_system
 
 	//! DXGI factory
 	wil::com_ptr<IDXGIFactory4> dxgi_factory;
-
-	//! DXGI swap chain for display output
-	wil::com_ptr<IDXGISwapChain1> swap_chain;
-
-	//! Back buffer render target view
-	wil::com_ptr<ID3D11RenderTargetView> back_buffer_rtv;
-
-	//! Stereo render target (side-by-side views)
-	wil::com_ptr<ID3D11Texture2D> stereo_texture;
-	wil::com_ptr<ID3D11ShaderResourceView> stereo_srv;
-	wil::com_ptr<ID3D11RenderTargetView> stereo_rtv;
 
 	//! Quad layer shaders
 	wil::com_ptr<ID3D11VertexShader> quad_vs;
@@ -262,17 +297,6 @@ struct d3d11_service_system
 
 	//! Depth stencil state (disabled)
 	wil::com_ptr<ID3D11DepthStencilState> depth_disabled;
-
-	//! Dedicated-thread window (owns HWND and message pump)
-	struct comp_d3d11_window *window;
-
-	//! Cached HWND from window (for swap chain, weaver)
-	HWND hwnd;
-
-#ifdef XRT_HAVE_LEIA_SR_D3D11
-	//! SR weaver for light field display
-	struct leiasr_d3d11 *weaver;
-#endif
 
 	//! Stereo texture dimensions (side-by-side views, input to weaver)
 	uint32_t display_width;
@@ -672,6 +696,7 @@ create_layer_resources(struct d3d11_service_system *sys)
  */
 static void
 blit_to_stereo_texture(struct d3d11_service_system *sys,
+                       struct d3d11_client_render_resources *res,
                        ID3D11ShaderResourceView *src_srv,
                        float src_x, float src_y, float src_w, float src_h,
                        float src_tex_w, float src_tex_h,
@@ -710,8 +735,8 @@ blit_to_stereo_texture(struct d3d11_service_system *sys,
 	sys->context->PSSetShaderResources(0, 1, &src_srv);
 	sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
 
-	// Set render target to stereo texture
-	ID3D11RenderTargetView *rtvs[] = {sys->stereo_rtv.get()};
+	// Set render target to per-client stereo texture
+	ID3D11RenderTargetView *rtvs[] = {res->stereo_rtv.get()};
 	sys->context->OMSetRenderTargets(1, rtvs, nullptr);
 
 	// Set viewport to cover destination region
@@ -1107,6 +1132,216 @@ render_equirect2_layer(struct d3d11_service_system *sys,
 	// Unbind SRV
 	ID3D11ShaderResourceView *null_srv = nullptr;
 	sys->context->PSSetShaderResources(0, 1, &null_srv);
+}
+
+
+/*
+ *
+ * Per-client render resource management
+ *
+ */
+
+/*!
+ * Clean up per-client render resources.
+ */
+static void
+fini_client_render_resources(struct d3d11_client_render_resources *res)
+{
+	if (res == nullptr) {
+		return;
+	}
+
+#ifdef XRT_HAVE_LEIA_SR_D3D11
+	if (res->weaver != nullptr) {
+		leiasr_d3d11_destroy(&res->weaver);
+	}
+#endif
+
+	res->back_buffer_rtv.reset();
+	res->stereo_rtv.reset();
+	res->stereo_srv.reset();
+	res->stereo_texture.reset();
+	res->swap_chain.reset();
+
+	if (res->owns_window && res->window != nullptr) {
+		comp_d3d11_window_destroy(&res->window);
+	}
+	res->window = nullptr;
+	res->hwnd = nullptr;
+	res->owns_window = false;
+}
+
+/*!
+ * Initialize per-client render resources.
+ *
+ * @param sys The system compositor (provides device, dimensions)
+ * @param external_hwnd External window handle from XR_EXT_session_target, or NULL
+ * @param xsysd System devices for qwerty input (may be NULL)
+ * @param res Output render resources struct
+ * @return XRT_SUCCESS on success
+ */
+static xrt_result_t
+init_client_render_resources(struct d3d11_service_system *sys,
+                              void *external_hwnd,
+                              struct xrt_system_devices *xsysd,
+                              struct d3d11_client_render_resources *res)
+{
+	std::memset(res, 0, sizeof(*res));
+
+	HRESULT hr;
+
+	// Get or create window
+	if (external_hwnd != nullptr) {
+		// Use app-provided window (XR_EXT_session_target)
+		res->hwnd = (HWND)external_hwnd;
+		res->owns_window = false;
+		res->window = nullptr;
+		U_LOG_W("Using external window handle: %p", external_hwnd);
+	} else {
+		// Create our own window (IPC/WebXR path)
+		xrt_result_t wret = comp_d3d11_window_create(sys->output_width, sys->output_height, &res->window);
+		if (wret != XRT_SUCCESS || res->window == nullptr) {
+			U_LOG_E("Failed to create window for client");
+			return XRT_ERROR_VULKAN;
+		}
+		res->hwnd = (HWND)comp_d3d11_window_get_hwnd(res->window);
+		res->owns_window = true;
+
+		// Pass system devices to window for qwerty input support
+		if (xsysd != nullptr) {
+			comp_d3d11_window_set_system_devices(res->window, xsysd);
+			U_LOG_W("Passed xsysd to client window for qwerty input");
+		}
+
+		U_LOG_W("Created window for client: hwnd=%p (%ux%u)", res->hwnd, sys->output_width, sys->output_height);
+	}
+
+	// Create swap chain at native display resolution
+	DXGI_SWAP_CHAIN_DESC1 sc_desc = {};
+	sc_desc.Width = sys->output_width;
+	sc_desc.Height = sys->output_height;
+	sc_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	sc_desc.SampleDesc.Count = 1;
+	sc_desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+	sc_desc.BufferCount = 2;
+	sc_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+
+	hr = sys->dxgi_factory->CreateSwapChainForHwnd(
+	    sys->device.get(),
+	    res->hwnd,
+	    &sc_desc,
+	    nullptr,
+	    nullptr,
+	    res->swap_chain.put());
+
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to create swap chain for client: 0x%08lx", hr);
+		fini_client_render_resources(res);
+		return XRT_ERROR_VULKAN;
+	}
+
+	// Get back buffer RTV
+	wil::com_ptr<ID3D11Texture2D> back_buffer;
+	res->swap_chain->GetBuffer(0, IID_PPV_ARGS(back_buffer.put()));
+	sys->device->CreateRenderTargetView(back_buffer.get(), nullptr, res->back_buffer_rtv.put());
+
+	// Create stereo render target texture (side-by-side views)
+	D3D11_TEXTURE2D_DESC stereo_desc = {};
+	stereo_desc.Width = sys->display_width;
+	stereo_desc.Height = sys->display_height;
+	stereo_desc.MipLevels = 1;
+	stereo_desc.ArraySize = 1;
+	stereo_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	stereo_desc.SampleDesc.Count = 1;
+	stereo_desc.Usage = D3D11_USAGE_DEFAULT;
+	stereo_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+
+	hr = sys->device->CreateTexture2D(&stereo_desc, nullptr, res->stereo_texture.put());
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to create stereo texture for client: 0x%08lx", hr);
+		fini_client_render_resources(res);
+		return XRT_ERROR_VULKAN;
+	}
+
+	// Create SRV for stereo texture
+	hr = sys->device->CreateShaderResourceView(res->stereo_texture.get(), nullptr, res->stereo_srv.put());
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to create stereo SRV for client: 0x%08lx", hr);
+		fini_client_render_resources(res);
+		return XRT_ERROR_VULKAN;
+	}
+
+	// Create RTV for stereo texture
+	hr = sys->device->CreateRenderTargetView(res->stereo_texture.get(), nullptr, res->stereo_rtv.put());
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to create stereo RTV for client: 0x%08lx", hr);
+		fini_client_render_resources(res);
+		return XRT_ERROR_VULKAN;
+	}
+
+	U_LOG_W("Created stereo render target for client (%ux%u)", sys->display_width, sys->display_height);
+
+#ifdef XRT_HAVE_LEIA_SR_D3D11
+	// Create SR weaver for this client
+	{
+		// Log HWND details before weaver creation
+		U_LOG_W("Creating SR weaver for client with HWND=%p", res->hwnd);
+		if (res->hwnd != nullptr) {
+			if (IsWindow(res->hwnd)) {
+				RECT window_rect;
+				if (GetWindowRect(res->hwnd, &window_rect)) {
+					U_LOG_W("  Window rect: (%ld,%ld)-(%ld,%ld) = %ldx%ld",
+					        window_rect.left, window_rect.top, window_rect.right, window_rect.bottom,
+					        window_rect.right - window_rect.left, window_rect.bottom - window_rect.top);
+				}
+				RECT client_rect;
+				if (GetClientRect(res->hwnd, &client_rect)) {
+					U_LOG_W("  Client rect: %ldx%ld",
+					        client_rect.right - client_rect.left, client_rect.bottom - client_rect.top);
+				}
+				// Check which monitor the window is on
+				HMONITOR monitor = MonitorFromWindow(res->hwnd, MONITOR_DEFAULTTONULL);
+				if (monitor != nullptr) {
+					MONITORINFO mi = {sizeof(mi)};
+					if (GetMonitorInfo(monitor, &mi)) {
+						U_LOG_W("  On monitor: (%ld,%ld)-(%ld,%ld), primary=%d",
+						        mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right, mi.rcMonitor.bottom,
+						        (mi.dwFlags & MONITORINFOF_PRIMARY) ? 1 : 0);
+					}
+				} else {
+					U_LOG_W("  WARNING: Window is not on any monitor!");
+				}
+			} else {
+				U_LOG_E("  ERROR: HWND %p is NOT a valid window!", res->hwnd);
+			}
+		} else {
+			U_LOG_E("  ERROR: HWND is NULL!");
+		}
+
+		xrt_result_t weaver_ret = leiasr_d3d11_create(
+		    5.0,  // 5 second timeout
+		    sys->device.get(),
+		    sys->context.get(),
+		    res->hwnd,
+		    sys->view_width,
+		    sys->view_height,
+		    &res->weaver);
+
+		if (weaver_ret != XRT_SUCCESS) {
+			U_LOG_W("Failed to create SR weaver for client, continuing without interlacing");
+			res->weaver = nullptr;
+		} else {
+			U_LOG_W("SR weaver created successfully for client");
+		}
+	}
+#endif
+
+	U_LOG_W("Client render resources initialized: view=%ux%u/eye, stereo=%ux%u, output=%ux%u",
+	        sys->view_width, sys->view_height,
+	        sys->display_width, sys->display_height,
+	        sys->output_width, sys->output_height);
+
+	return XRT_SUCCESS;
 }
 
 
@@ -1901,15 +2136,15 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 
 	// Handle window resize - check if swap chain needs to be resized
 	// This is critical for SR weaving which requires viewport to match window
-	if (sys->hwnd != nullptr && sys->swap_chain) {
+	if (c->render.hwnd != nullptr && c->render.swap_chain) {
 		RECT client_rect;
-		if (GetClientRect(sys->hwnd, &client_rect)) {
+		if (GetClientRect(c->render.hwnd, &client_rect)) {
 			uint32_t client_width = static_cast<uint32_t>(client_rect.right - client_rect.left);
 			uint32_t client_height = static_cast<uint32_t>(client_rect.bottom - client_rect.top);
 
 			// Check if swap chain size matches window client area
 			DXGI_SWAP_CHAIN_DESC1 sc_desc = {};
-			sys->swap_chain->GetDesc1(&sc_desc);
+			c->render.swap_chain->GetDesc1(&sc_desc);
 
 			if (client_width > 0 && client_height > 0 &&
 			    (sc_desc.Width != client_width || sc_desc.Height != client_height)) {
@@ -1917,10 +2152,10 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				        sc_desc.Width, sc_desc.Height, client_width, client_height);
 
 				// Release back buffer RTV before resize
-				sys->back_buffer_rtv.reset();
+				c->render.back_buffer_rtv.reset();
 
 				// Resize swap chain buffers
-				HRESULT hr = sys->swap_chain->ResizeBuffers(
+				HRESULT hr = c->render.swap_chain->ResizeBuffers(
 				    0,  // Keep buffer count
 				    client_width,
 				    client_height,
@@ -1930,12 +2165,8 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				if (SUCCEEDED(hr)) {
 					// Recreate back buffer RTV
 					wil::com_ptr<ID3D11Texture2D> back_buffer;
-					sys->swap_chain->GetBuffer(0, IID_PPV_ARGS(back_buffer.put()));
-					sys->device->CreateRenderTargetView(back_buffer.get(), nullptr, sys->back_buffer_rtv.put());
-
-					// Update output dimensions to match new swap chain size
-					sys->output_width = client_width;
-					sys->output_height = client_height;
+					c->render.swap_chain->GetBuffer(0, IID_PPV_ARGS(back_buffer.put()));
+					sys->device->CreateRenderTargetView(back_buffer.get(), nullptr, c->render.back_buffer_rtv.put());
 
 					U_LOG_W("Swap chain resized successfully to %ux%u", client_width, client_height);
 				} else {
@@ -1946,9 +2177,9 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	}
 
 	// Clear stereo render target
-	if (sys->stereo_rtv) {
+	if (c->render.stereo_rtv) {
 		float clear_color[4] = {0.0f, 0.0f, 0.0f, 1.0f};
-		sys->context->ClearRenderTargetView(sys->stereo_rtv.get(), clear_color);
+		sys->context->ClearRenderTargetView(c->render.stereo_rtv.get(), clear_color);
 	}
 
 	// Render projection layers to stereo texture (via copy)
@@ -2065,7 +2296,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 
 			HRESULT hr = sys->device->CreateShaderResourceView(left_tex, &srv_desc, srgb_srv.put());
 			if (SUCCEEDED(hr)) {
-				blit_to_stereo_texture(sys, srgb_srv.get(),
+				blit_to_stereo_texture(sys, &c->render, srgb_srv.get(),
 				                       left_src_x, left_src_y, left_src_w, left_src_h,
 				                       static_cast<float>(left_desc.Width), static_cast<float>(left_desc.Height),
 				                       0.0f, 0.0f,
@@ -2080,7 +2311,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				left_box.bottom = static_cast<UINT>(left_src_y + left_src_h);
 				left_box.front = 0;
 				left_box.back = 1;
-				sys->context->CopySubresourceRegion(sys->stereo_texture.get(), 0, 0, 0, 0,
+				sys->context->CopySubresourceRegion(c->render.stereo_texture.get(), 0, 0, 0, 0,
 				                                     left_tex, layer->data.proj.v[0].sub.array_index, &left_box);
 			}
 		} else {
@@ -2094,7 +2325,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			left_box.back = 1;
 
 			sys->context->CopySubresourceRegion(
-			    sys->stereo_texture.get(),
+			    c->render.stereo_texture.get(),
 			    0,             // dst subresource
 			    0, 0, 0,       // dst x, y, z (left half)
 			    left_tex,
@@ -2113,7 +2344,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 
 			HRESULT hr = sys->device->CreateShaderResourceView(right_tex, &srv_desc, srgb_srv.put());
 			if (SUCCEEDED(hr)) {
-				blit_to_stereo_texture(sys, srgb_srv.get(),
+				blit_to_stereo_texture(sys, &c->render, srgb_srv.get(),
 				                       right_src_x, right_src_y, right_src_w, right_src_h,
 				                       static_cast<float>(right_desc.Width), static_cast<float>(right_desc.Height),
 				                       static_cast<float>(sys->view_width), 0.0f,
@@ -2127,7 +2358,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				right_box.bottom = static_cast<UINT>(right_src_y + right_src_h);
 				right_box.front = 0;
 				right_box.back = 1;
-				sys->context->CopySubresourceRegion(sys->stereo_texture.get(), 0, sys->view_width, 0, 0,
+				sys->context->CopySubresourceRegion(c->render.stereo_texture.get(), 0, sys->view_width, 0, 0,
 				                                     right_tex, layer->data.proj.v[1].sub.array_index, &right_box);
 			}
 		} else {
@@ -2141,7 +2372,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			right_box.back = 1;
 
 			sys->context->CopySubresourceRegion(
-			    sys->stereo_texture.get(),
+			    c->render.stereo_texture.get(),
 			    0,                            // dst subresource
 			    sys->view_width, 0, 0,        // dst x, y, z (right half)
 			    right_tex,
@@ -2180,8 +2411,8 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 
 	// Render UI layers if any exist and shaders are ready
 	if (has_ui_layers && sys->quad_vs) {
-		// Bind stereo render target
-		ID3D11RenderTargetView *rtvs[] = {sys->stereo_rtv.get()};
+		// Bind per-client stereo render target
+		ID3D11RenderTargetView *rtvs[] = {c->render.stereo_rtv.get()};
 		sys->context->OMSetRenderTargets(1, rtvs, nullptr);
 
 		// Set common rendering state
@@ -2200,9 +2431,9 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		struct xrt_vec3 right_eye = {0.032f, 0.0f, 0.6f};
 
 #ifdef XRT_HAVE_LEIA_SR_D3D11
-		if (sys->weaver != nullptr) {
+		if (c->render.weaver != nullptr) {
 			float left[3], right[3];
-			if (leiasr_d3d11_get_predicted_eye_positions(sys->weaver, left, right)) {
+			if (leiasr_d3d11_get_predicted_eye_positions(c->render.weaver, left, right)) {
 				left_eye.x = left[0];
 				left_eye.y = left[1];
 				left_eye.z = left[2];
@@ -2287,26 +2518,26 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 
 #ifdef XRT_HAVE_LEIA_SR_D3D11
 	// Weave stereo texture through SR weaver for light field display
-	if (sys->weaver != nullptr && sys->stereo_srv) {
+	if (c->render.weaver != nullptr && c->render.stereo_srv) {
 		// Set input stereo texture
 		leiasr_d3d11_set_input_texture(
-		    sys->weaver,
-		    sys->stereo_srv.get(),
+		    c->render.weaver,
+		    c->render.stereo_srv.get(),
 		    sys->view_width,
 		    sys->view_height,
 		    DXGI_FORMAT_R8G8B8A8_UNORM);
 
 		// Bind back buffer as output
-		ID3D11RenderTargetView *rtvs[] = {sys->back_buffer_rtv.get()};
+		ID3D11RenderTargetView *rtvs[] = {c->render.back_buffer_rtv.get()};
 		sys->context->OMSetRenderTargets(1, rtvs, nullptr);
 
 		// Get actual back buffer dimensions for viewport (must match window client rect)
 		// This is critical for correct SR interlacing - viewport must match display output
 		uint32_t back_buffer_width = sys->output_width;
 		uint32_t back_buffer_height = sys->output_height;
-		if (sys->back_buffer_rtv) {
+		if (c->render.back_buffer_rtv) {
 			wil::com_ptr<ID3D11Resource> bb_resource;
-			sys->back_buffer_rtv->GetResource(bb_resource.put());
+			c->render.back_buffer_rtv->GetResource(bb_resource.put());
 			wil::com_ptr<ID3D11Texture2D> bb_texture;
 			if (SUCCEEDED(bb_resource->QueryInterface(IID_PPV_ARGS(bb_texture.put())))) {
 				D3D11_TEXTURE2D_DESC bb_desc = {};
@@ -2318,9 +2549,9 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 
 		// Also check window client rect for diagnostic purposes
 		uint32_t window_width = 0, window_height = 0;
-		if (sys->hwnd != nullptr) {
+		if (c->render.hwnd != nullptr) {
 			RECT client_rect;
-			if (GetClientRect(sys->hwnd, &client_rect)) {
+			if (GetClientRect(c->render.hwnd, &client_rect)) {
 				window_width = static_cast<uint32_t>(client_rect.right - client_rect.left);
 				window_height = static_cast<uint32_t>(client_rect.bottom - client_rect.top);
 			}
@@ -2348,30 +2579,30 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		// Check window validity before weaving (helps diagnose "window handle is invalid" errors)
 		static bool window_check_done = false;
 		if (!window_check_done) {
-			if (!leiasr_d3d11_check_window_valid(sys->weaver, sys->hwnd)) {
+			if (!leiasr_d3d11_check_window_valid(c->render.weaver, c->render.hwnd)) {
 				U_LOG_W("SR weave: Window validity check failed - weaving may not work correctly");
 			} else {
-				U_LOG_W("SR weave: Window %p passed validity check", sys->hwnd);
+				U_LOG_W("SR weave: Window %p passed validity check", c->render.hwnd);
 			}
 			window_check_done = true;
 		}
 
 		// Perform weaving
-		leiasr_d3d11_weave(sys->weaver);
+		leiasr_d3d11_weave(c->render.weaver);
 	} else
 #endif
 	{
 		// No weaver - copy stereo texture to back buffer directly
-		if (sys->stereo_texture && sys->back_buffer_rtv) {
+		if (c->render.stereo_texture && c->render.back_buffer_rtv) {
 			wil::com_ptr<ID3D11Resource> back_buffer;
-			sys->back_buffer_rtv->GetResource(back_buffer.put());
-			sys->context->CopyResource(back_buffer.get(), sys->stereo_texture.get());
+			c->render.back_buffer_rtv->GetResource(back_buffer.put());
+			sys->context->CopyResource(back_buffer.get(), c->render.stereo_texture.get());
 		}
 	}
 
 	// Present to display
-	if (sys->swap_chain) {
-		sys->swap_chain->Present(1, 0);  // VSync
+	if (c->render.swap_chain) {
+		c->render.swap_chain->Present(1, 0);  // VSync
 	}
 
 	return XRT_SUCCESS;
@@ -2389,6 +2620,12 @@ static void
 compositor_destroy(struct xrt_compositor *xc)
 {
 	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+
+	U_LOG_W("Destroying D3D11 service compositor for client");
+
+	// Clean up per-client render resources (window, swap chain, weaver)
+	fini_client_render_resources(&c->render);
+
 	delete c;
 }
 
@@ -2455,6 +2692,20 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 	// Initialize layer accumulator
 	std::memset(&c->layer_accum, 0, sizeof(c->layer_accum));
 
+	// Initialize per-client render resources (window, swap chain, weaver)
+	// Get external window handle if app provided one via XR_EXT_session_target
+	void *external_hwnd = nullptr;
+	if (xsi != nullptr) {
+		external_hwnd = xsi->external_window_handle;
+	}
+
+	xrt_result_t res_ret = init_client_render_resources(sys, external_hwnd, sys->xsysd, &c->render);
+	if (res_ret != XRT_SUCCESS) {
+		U_LOG_E("Failed to initialize client render resources");
+		delete c;
+		return res_ret;
+	}
+
 	// Set up compositor vtable
 	c->base.base.get_swapchain_create_properties = compositor_get_swapchain_create_properties;
 	c->base.base.create_swapchain = compositor_create_swapchain;
@@ -2517,11 +2768,8 @@ system_destroy(struct xrt_system_compositor *xsysc)
 
 	U_LOG_I("Destroying D3D11 service system compositor");
 
-#ifdef XRT_HAVE_LEIA_SR_D3D11
-	if (sys->weaver != nullptr) {
-		leiasr_d3d11_destroy(&sys->weaver);
-	}
-#endif
+	// NOTE: Per-client weavers are cleaned up in fini_client_render_resources()
+	// when each client disconnects. System has no weaver anymore.
 
 	// Clean up layer rendering resources
 	sys->depth_disabled.reset();
@@ -2542,19 +2790,18 @@ system_destroy(struct xrt_system_compositor *xsysc)
 	sys->quad_ps.reset();
 	sys->quad_vs.reset();
 
-	sys->back_buffer_rtv.reset();
-	sys->stereo_rtv.reset();
-	sys->stereo_srv.reset();
-	sys->stereo_texture.reset();
-	sys->swap_chain.reset();
+	// Clean up blit shader resources
+	sys->blit_constant_buffer.reset();
+	sys->blit_ps.reset();
+	sys->blit_vs.reset();
+
+	// NOTE: Per-client resources (window, swap_chain, stereo_texture, weaver)
+	// are cleaned up in fini_client_render_resources() when each client disconnects.
+	// System only needs to clean up shared resources (device, shaders, etc.)
+
 	sys->dxgi_factory.reset();
 	sys->context.reset();
 	sys->device.reset();
-
-	if (sys->window != nullptr) {
-		comp_d3d11_window_destroy(&sys->window);
-	}
-	sys->hwnd = nullptr;
 
 	delete sys;
 }
@@ -2701,88 +2948,11 @@ comp_d3d11_service_create_system(struct xrt_device *xdev,
 		return XRT_ERROR_VULKAN;
 	}
 
-	// Create service window on dedicated thread (handles message pump)
-	// Window is created at native display resolution for proper fullscreen
-	xrt_result_t wret = comp_d3d11_window_create(sys->output_width, sys->output_height, &sys->window);
-	if (wret != XRT_SUCCESS || sys->window == NULL) {
-		U_LOG_E("Failed to create service window on dedicated thread");
-		delete sys;
-		return XRT_ERROR_VULKAN;
-	}
-	sys->hwnd = (HWND)comp_d3d11_window_get_hwnd(sys->window);
-
-	// Pass system devices to window for qwerty input support
-	if (xsysd != NULL) {
-		comp_d3d11_window_set_system_devices(sys->window, xsysd);
-		U_LOG_W("Passed xsysd to service window for qwerty input");
-	}
-
-	// Create swap chain at native display resolution (output of weaver)
-	DXGI_SWAP_CHAIN_DESC1 sc_desc = {};
-	sc_desc.Width = sys->output_width;
-	sc_desc.Height = sys->output_height;
-	sc_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-	sc_desc.SampleDesc.Count = 1;
-	sc_desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-	sc_desc.BufferCount = 2;
-	sc_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-
-	hr = sys->dxgi_factory->CreateSwapChainForHwnd(
-	    sys->device.get(),
-	    sys->hwnd,
-	    &sc_desc,
-	    nullptr,
-	    nullptr,
-	    sys->swap_chain.put());
-
-	if (FAILED(hr)) {
-		U_LOG_E("Failed to create swap chain: 0x%08lx", hr);
-		system_destroy(&sys->base);
-		return XRT_ERROR_VULKAN;
-	}
-
-	// Get back buffer RTV
-	wil::com_ptr<ID3D11Texture2D> back_buffer;
-	sys->swap_chain->GetBuffer(0, IID_PPV_ARGS(back_buffer.put()));
-	sys->device->CreateRenderTargetView(back_buffer.get(), nullptr, sys->back_buffer_rtv.put());
-
-	// Create stereo render target texture (side-by-side views)
-	D3D11_TEXTURE2D_DESC stereo_desc = {};
-	stereo_desc.Width = sys->display_width;
-	stereo_desc.Height = sys->display_height;
-	stereo_desc.MipLevels = 1;
-	stereo_desc.ArraySize = 1;
-	stereo_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-	stereo_desc.SampleDesc.Count = 1;
-	stereo_desc.Usage = D3D11_USAGE_DEFAULT;
-	stereo_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-
-	hr = sys->device->CreateTexture2D(&stereo_desc, nullptr, sys->stereo_texture.put());
-	if (FAILED(hr)) {
-		U_LOG_E("Failed to create stereo texture: 0x%08lx", hr);
-		system_destroy(&sys->base);
-		return XRT_ERROR_VULKAN;
-	}
-
-	// Create SRV for stereo texture
-	hr = sys->device->CreateShaderResourceView(sys->stereo_texture.get(), nullptr, sys->stereo_srv.put());
-	if (FAILED(hr)) {
-		U_LOG_E("Failed to create stereo SRV: 0x%08lx", hr);
-		system_destroy(&sys->base);
-		return XRT_ERROR_VULKAN;
-	}
-
-	// Create RTV for stereo texture
-	hr = sys->device->CreateRenderTargetView(sys->stereo_texture.get(), nullptr, sys->stereo_rtv.put());
-	if (FAILED(hr)) {
-		U_LOG_E("Failed to create stereo RTV: 0x%08lx", hr);
-		system_destroy(&sys->base);
-		return XRT_ERROR_VULKAN;
-	}
-
-	U_LOG_W("Created stereo render target (%ux%u)", sys->display_width, sys->display_height);
+	// Store system devices for passing to per-client windows
+	sys->xsysd = xsysd;
 
 	// Create layer shaders and resources for UI layer rendering
+	// These are shared across all clients
 	if (!create_layer_shaders(sys)) {
 		U_LOG_W("Failed to create layer shaders, UI layers will not render");
 		// Don't fail - projection layers will still work
@@ -2791,60 +2961,9 @@ comp_d3d11_service_create_system(struct xrt_device *xdev,
 		// Don't fail - projection layers will still work
 	}
 
-#ifdef XRT_HAVE_LEIA_SR_D3D11
-	// Create SR weaver
-	{
-		// Log HWND details before weaver creation
-		U_LOG_W("Creating SR weaver with HWND=%p", sys->hwnd);
-		if (sys->hwnd != nullptr) {
-			if (IsWindow(sys->hwnd)) {
-				RECT window_rect;
-				if (GetWindowRect(sys->hwnd, &window_rect)) {
-					U_LOG_W("  Window rect: (%ld,%ld)-(%ld,%ld) = %ldx%ld",
-					        window_rect.left, window_rect.top, window_rect.right, window_rect.bottom,
-					        window_rect.right - window_rect.left, window_rect.bottom - window_rect.top);
-				}
-				RECT client_rect;
-				if (GetClientRect(sys->hwnd, &client_rect)) {
-					U_LOG_W("  Client rect: %ldx%ld",
-					        client_rect.right - client_rect.left, client_rect.bottom - client_rect.top);
-				}
-				// Check which monitor the window is on
-				HMONITOR monitor = MonitorFromWindow(sys->hwnd, MONITOR_DEFAULTTONULL);
-				if (monitor != nullptr) {
-					MONITORINFO mi = {sizeof(mi)};
-					if (GetMonitorInfo(monitor, &mi)) {
-						U_LOG_W("  On monitor: (%ld,%ld)-(%ld,%ld), primary=%d",
-						        mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right, mi.rcMonitor.bottom,
-						        (mi.dwFlags & MONITORINFOF_PRIMARY) ? 1 : 0);
-					}
-				} else {
-					U_LOG_W("  WARNING: Window is not on any monitor!");
-				}
-			} else {
-				U_LOG_E("  ERROR: HWND %p is NOT a valid window!", sys->hwnd);
-			}
-		} else {
-			U_LOG_E("  ERROR: HWND is NULL!");
-		}
-
-		xrt_result_t weaver_ret = leiasr_d3d11_create(
-		    5.0,  // 5 second timeout
-		    sys->device.get(),
-		    sys->context.get(),
-		    sys->hwnd,
-		    sys->view_width,
-		    sys->view_height,
-		    &sys->weaver);
-
-		if (weaver_ret != XRT_SUCCESS) {
-			U_LOG_W("Failed to create SR weaver, continuing without interlacing");
-			sys->weaver = nullptr;
-		} else {
-			U_LOG_W("SR weaver created successfully");
-		}
-	}
-#endif
+	// NOTE: Window, swap chain, and SR weaver are now created per-client
+	// in system_create_native_compositor() -> init_client_render_resources()
+	// This allows the IPC service to start without a window until a client connects.
 
 	// Set up system compositor vtable
 	sys->base.create_native_compositor = system_create_native_compositor;
@@ -2913,37 +3032,36 @@ comp_d3d11_service_get_predicted_eye_positions(struct xrt_system_compositor *xsy
                                                 struct xrt_vec3 *out_left,
                                                 struct xrt_vec3 *out_right)
 {
-	if (!comp_d3d11_service_is_d3d11_service(xsysc) || out_left == NULL || out_right == NULL) {
+	// NOTE: With per-client weavers, we no longer have a system-level weaver.
+	// Use the static query which internally uses shared SR resources.
+	(void)xsysc;
+
+	if (out_left == NULL || out_right == NULL) {
 		return false;
 	}
 
-	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
-
 #ifdef XRT_HAVE_LEIA_SR_D3D11
-	if (sys->weaver != nullptr) {
-		float left[3], right[3];
-		if (leiasr_d3d11_get_predicted_eye_positions(sys->weaver, left, right)) {
-			out_left->x = left[0];
-			out_left->y = left[1];
-			out_left->z = left[2];
-			out_right->x = right[0];
-			out_right->y = right[1];
-			out_right->z = right[2];
+	float left[3], right[3];
+	if (leiasr_static_get_predicted_eye_positions(left, right)) {
+		out_left->x = left[0];
+		out_left->y = left[1];
+		out_left->z = left[2];
+		out_right->x = right[0];
+		out_right->y = right[1];
+		out_right->z = right[2];
 
-			// Log periodically for debugging
-			static int log_counter = 0;
-			if (++log_counter >= 60) {
-				log_counter = 0;
-				U_LOG_W("IPC SR eye positions: L=(%.3f,%.3f,%.3f) R=(%.3f,%.3f,%.3f)",
-				        out_left->x, out_left->y, out_left->z,
-				        out_right->x, out_right->y, out_right->z);
-			}
-			return true;
+		// Log periodically for debugging
+		static int log_counter = 0;
+		if (++log_counter >= 60) {
+			log_counter = 0;
+			U_LOG_W("IPC SR eye positions: L=(%.3f,%.3f,%.3f) R=(%.3f,%.3f,%.3f)",
+			        out_left->x, out_left->y, out_left->z,
+			        out_right->x, out_right->y, out_right->z);
 		}
+		return true;
 	}
 #endif
 
-	(void)sys;  // Suppress unused warning when SR not available
 	return false;
 }
 
@@ -2952,56 +3070,44 @@ comp_d3d11_service_get_display_dimensions(struct xrt_system_compositor *xsysc,
                                            float *out_width_m,
                                            float *out_height_m)
 {
-	if (!comp_d3d11_service_is_d3d11_service(xsysc) || out_width_m == NULL || out_height_m == NULL) {
+	// NOTE: Display dimensions are static and don't require a weaver instance.
+	// Use the static query which reads from SR SDK config.
+	(void)xsysc;
+
+	if (out_width_m == NULL || out_height_m == NULL) {
 		return false;
 	}
 
-	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
-
 #ifdef XRT_HAVE_LEIA_SR_D3D11
-	if (sys->weaver != nullptr) {
-		struct leiasr_display_dimensions dims = {0};
-		if (leiasr_d3d11_get_display_dimensions(sys->weaver, &dims) && dims.valid) {
-			*out_width_m = dims.width_m;
-			*out_height_m = dims.height_m;
-			return true;
-		}
+	struct leiasr_display_dimensions dims = {0};
+	if (leiasr_static_get_display_dimensions(&dims) && dims.valid) {
+		*out_width_m = dims.width_m;
+		*out_height_m = dims.height_m;
+		return true;
 	}
 #endif
 
-	(void)sys;  // Suppress unused warning when SR not available
 	return false;
 }
 
 bool
 comp_d3d11_service_owns_window(struct xrt_system_compositor *xsysc)
 {
-	if (!comp_d3d11_service_is_d3d11_service(xsysc)) {
-		return false;
-	}
-
-	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
-
-	// If sys->window is non-NULL, Monado created and owns the window.
-	// If sys->window is NULL, the app provided its own window (session_target).
-	return sys->window != nullptr;
+	// NOTE: With per-client windows, this function now applies to the default
+	// behavior. IPC clients (no external_window_handle) always get Monado windows.
+	// Native compositor clients can provide their own via XR_EXT_session_target.
+	// For IPC path (which calls this), we always create windows, so return true.
+	(void)xsysc;
+	return true;
 }
 
 bool
 comp_d3d11_service_window_is_valid(struct xrt_system_compositor *xsysc)
 {
-	if (!comp_d3d11_service_is_d3d11_service(xsysc)) {
-		return true;  // Not a D3D11 service, assume valid
-	}
-
-	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
-
-	// If we don't own a window (session_target mode), it's always "valid"
-	// from our perspective - the app controls its own window lifecycle.
-	if (sys->window == nullptr) {
-		return true;
-	}
-
-	// Check if our owned window is still valid (not closed by user)
-	return comp_d3d11_window_is_valid(sys->window);
+	// NOTE: With per-client windows, window validity is now per-client.
+	// The IPC server no longer needs a single window validity check.
+	// Each client's window lifecycle is handled when the client disconnects.
+	// Always return true - the service doesn't maintain a global window anymore.
+	(void)xsysc;
+	return true;
 }
