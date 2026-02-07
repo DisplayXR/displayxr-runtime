@@ -899,12 +899,16 @@ composite_layers_to_intermediate(struct multi_compositor *mc,
 		                         0, 0, NULL, 0, NULL, 1, &src_barrier);
 
 		// Blit from source to per-eye composite target
+		// When flip_y is set (e.g. OpenGL textures), swap source Y offsets to flip vertically
+		bool flip_y = proj_layer->data.flip_y;
+		int32_t src_y0 = (int32_t)vd->sub.rect.offset.h;
+		int32_t src_y1 = (int32_t)(vd->sub.rect.offset.h + vd->sub.rect.extent.h);
 		VkImageBlit blit = {
 		    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, vd->sub.array_index, 1},
 		    .srcOffsets = {
-		        {vd->sub.rect.offset.w, vd->sub.rect.offset.h, 0},
+		        {vd->sub.rect.offset.w, flip_y ? src_y1 : src_y0, 0},
 		        {vd->sub.rect.offset.w + (int32_t)vd->sub.rect.extent.w,
-		         vd->sub.rect.offset.h + (int32_t)vd->sub.rect.extent.h, 1},
+		         flip_y ? src_y0 : src_y1, 1},
 		    },
 		    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
 		    .dstOffsets = {
@@ -1178,9 +1182,6 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 
 	U_LOG_W("[per-session] Have %u layers, extracting stereo views...", mc->delivered.layer_count);
 
-	// Check if we need compositing (window-space layers present)
-	bool needs_compositing = has_window_space_layers(mc);
-
 	// Get the first projection layer
 	struct multi_layer_entry *layer = NULL;
 	for (uint32_t i = 0; i < mc->delivered.layer_count; i++) {
@@ -1195,6 +1196,9 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 		U_LOG_W("[per-session] No projection layer found, skipping");
 		return;
 	}
+
+	// Check if we need compositing (window-space layers present, or flip_y requires blit)
+	bool needs_compositing = has_window_space_layers(mc) || layer->data.flip_y;
 
 	// Extract left and right view info
 	int imageWidth = 0, imageHeight = 0;
