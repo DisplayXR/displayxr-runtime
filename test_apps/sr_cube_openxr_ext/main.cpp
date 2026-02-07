@@ -307,10 +307,12 @@ static void RenderOneFrame(RenderState& rs) {
                             XMMATRIX viewMatrix = (eye == 0) ? leftViewMatrix : rightViewMatrix;
                             XMMATRIX projMatrix = (eye == 0) ? leftProjMatrix : rightProjMatrix;
 
+                            // Extension apps: cube at origin (0,0,0) since app controls scene
                             RenderScene(renderer, rtv, rs.depthDSVs[eye].Get(),
                                 renderW, renderH,
                                 viewMatrix, projMatrix,
-                                g_inputState.zoomScale);
+                                g_inputState.zoomScale,
+                                0.0f);  // cubeHeight = 0 for extension apps
 
                             if (rtv) rtv->Release();
 

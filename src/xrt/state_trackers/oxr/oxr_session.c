@@ -947,54 +947,45 @@ oxr_session_locate_views(struct oxr_logger *log,
 				        world_head_pos.x, world_head_pos.y, world_head_pos.z);
 			}
 		} else {
-			// Monado window mode: DISPLAY CENTRIC
-			// - Cube is at (0, 1.6, 0) in world space
-			// - SR provides eye positions relative to display, e.g., (0, 0, 0.6)
-			// - We add 1.6m standing height: world_eye = sr_eye + (0, 1.6, 0)
-			// - Mouse rotation orbits eyes around (0, 1.6, 0), cube stays in focus
-			// - WASD movement shifts the display origin
-			// - Orientation stays identity (Kooima projection handles off-center viewing)
+			// DISPLAY-CENTRIC MODE (Monado window, no session_target extension)
+			//
+			// Philosophy: qwerty_device tracks the pose of a "virtual display"
+			// initially at (0, 1.6, 0) in world space.
+			//
+			// SR/Kooima eye positions are defined in the display's LOCAL frame:
+			//   - SR returns (0.03, 0, 0.6) = 3cm right of display center, 60cm in front
+			//   - These are display-relative coordinates
+			//
+			// To get world coordinates, transform from display-local to world:
+			//   worldPos = display_pos + rotate(sr_eye_local, display_ori)
+			//   worldOri = display_ori
+			//
+			// WASD/mouse controls the display pose. Eyes move/rotate automatically
+			// because they're defined relative to the display.
 
-			// Get movement (WASD) and rotation (mouse) from qwerty device
-			struct xrt_vec3 wasd_offset = {0.0f, 0.0f, 0.0f};
-			struct xrt_quat orbit_rotation = XRT_QUAT_IDENTITY;
-			{
-				struct xrt_space_relation qwerty_relation = XRT_SPACE_RELATION_ZERO;
-				xrt_result_t qret = xrt_device_get_tracked_pose(
-				    xdev, XRT_INPUT_GENERIC_HEAD_POSE, xdisplay_time, &qwerty_relation);
+			// qwerty_device.pose = virtual display pose in world space
+			struct xrt_space_relation display_relation = XRT_SPACE_RELATION_ZERO;
+			xrt_device_get_tracked_pose(xdev, XRT_INPUT_GENERIC_HEAD_POSE, xdisplay_time, &display_relation);
 
-				if (qret == XRT_SUCCESS &&
-				    (qwerty_relation.relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT)) {
-					// WASD movement = position offset from initial (0, 1.6, 0)
-					wasd_offset.x = qwerty_relation.pose.position.x;
-					wasd_offset.y = qwerty_relation.pose.position.y - 1.6f;
-					wasd_offset.z = qwerty_relation.pose.position.z;
-					// Mouse rotation for orbiting
-					orbit_rotation = qwerty_relation.pose.orientation;
-				}
-			}
+			struct xrt_vec3 display_pos = display_relation.pose.position;
+			struct xrt_quat display_ori = display_relation.pose.orientation;
 
-			// Standing height offset (display/cube position)
-			const struct xrt_vec3 standing_offset = {0.0f, 1.6f, 0.0f};
-
-			// Rotate SR eye position around the display center
+			// Transform SR eye from display-local to world coordinates
 			struct xrt_vec3 rotated_sr_eye;
-			math_quat_rotate_vec3(&orbit_rotation, &sr_eye_midpoint, &rotated_sr_eye);
+			math_quat_rotate_vec3(&display_ori, &sr_eye_midpoint, &rotated_sr_eye);
 
-			// World eye = standing_offset + wasd_movement + rotate(sr_eye)
-			world_head_pos.x = standing_offset.x + wasd_offset.x + rotated_sr_eye.x;
-			world_head_pos.y = standing_offset.y + wasd_offset.y + rotated_sr_eye.y;
-			world_head_pos.z = standing_offset.z + wasd_offset.z + rotated_sr_eye.z;
+			world_head_pos.x = display_pos.x + rotated_sr_eye.x;
+			world_head_pos.y = display_pos.y + rotated_sr_eye.y;
+			world_head_pos.z = display_pos.z + rotated_sr_eye.z;
 
-			// Orientation stays identity - Kooima projection handles off-center viewing
-			// The asymmetric frustum makes the cube appear correctly from any eye position
-			world_head_ori = (struct xrt_quat)XRT_QUAT_IDENTITY;
+			// View orientation = display orientation (controlled by mouse)
+			world_head_ori = display_ori;
 
 			if (sr_should_log) {
-				U_LOG_W("Display centric: standing=(%.1f,%.1f,%.1f) wasd=(%.3f,%.3f,%.3f) "
+				U_LOG_W("Display centric: display_pos=(%.3f,%.3f,%.3f) display_ori=(%.3f,%.3f,%.3f,%.3f) "
 				        "sr_eye=(%.3f,%.3f,%.3f) rotated=(%.3f,%.3f,%.3f) -> world=(%.3f,%.3f,%.3f)",
-				        standing_offset.x, standing_offset.y, standing_offset.z,
-				        wasd_offset.x, wasd_offset.y, wasd_offset.z,
+				        display_pos.x, display_pos.y, display_pos.z,
+				        display_ori.x, display_ori.y, display_ori.z, display_ori.w,
 				        sr_eye_midpoint.x, sr_eye_midpoint.y, sr_eye_midpoint.z,
 				        rotated_sr_eye.x, rotated_sr_eye.y, rotated_sr_eye.z,
 				        world_head_pos.x, world_head_pos.y, world_head_pos.z);
