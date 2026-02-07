@@ -1110,6 +1110,22 @@ multi_compositor_destroy(struct xrt_compositor *xc)
 			mc->session_render.composite_initialized = false;
 		}
 
+		// Destroy lightweight flip images (used for GL texture Y-flip before weaving)
+		if (vk != NULL && mc->session_render.flip_initialized) {
+			for (int i = 0; i < 2; i++) {
+				if (mc->session_render.flip_views[i] != VK_NULL_HANDLE) {
+					vk->vkDestroyImageView(vk->device, mc->session_render.flip_views[i], NULL);
+				}
+				if (mc->session_render.flip_images[i] != VK_NULL_HANDLE) {
+					vk->vkDestroyImage(vk->device, mc->session_render.flip_images[i], NULL);
+				}
+				if (mc->session_render.flip_memories[i] != VK_NULL_HANDLE) {
+					vk->vkFreeMemory(vk->device, mc->session_render.flip_memories[i], NULL);
+				}
+			}
+			mc->session_render.flip_initialized = false;
+		}
+
 		// Destroy fences
 		if (vk != NULL && mc->session_render.fences != NULL) {
 			for (uint32_t i = 0; i < mc->session_render.buffer_count; i++) {

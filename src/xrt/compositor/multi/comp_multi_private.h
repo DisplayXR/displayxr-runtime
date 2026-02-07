@@ -267,6 +267,17 @@ struct multi_compositor
 		bool composite_initialized;              //!< True if composite resources are ready
 
 		//! @}
+
+		//! @name Lightweight Y-flip images for GL textures (no full compositing pipeline)
+		//! @{
+		VkImage flip_images[2];
+		VkDeviceMemory flip_memories[2];
+		VkImageView flip_views[2];
+		int flip_width;
+		int flip_height;
+		VkFormat flip_format;
+		bool flip_initialized;
+		//! @}
 #endif
 
 #ifdef XRT_OS_WINDOWS

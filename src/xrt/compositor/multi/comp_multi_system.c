@@ -1155,6 +1155,139 @@ composite_layers_to_intermediate(struct multi_compositor *mc,
 }
 
 /*!
+ * Lazily create lightweight intermediate images for Y-flipping GL textures.
+ * Much lighter than init_composite_resources (no render pass, pipeline, etc).
+ */
+static bool
+ensure_flip_images(struct multi_compositor *mc, struct vk_bundle *vk, int width, int height, VkFormat format)
+{
+	if (mc->session_render.flip_initialized &&
+	    mc->session_render.flip_width == width &&
+	    mc->session_render.flip_height == height &&
+	    mc->session_render.flip_format == format) {
+		return true;
+	}
+
+	// Destroy old if size changed
+	if (mc->session_render.flip_initialized) {
+		for (int i = 0; i < 2; i++) {
+			if (mc->session_render.flip_views[i] != VK_NULL_HANDLE)
+				vk->vkDestroyImageView(vk->device, mc->session_render.flip_views[i], NULL);
+			if (mc->session_render.flip_images[i] != VK_NULL_HANDLE)
+				vk->vkDestroyImage(vk->device, mc->session_render.flip_images[i], NULL);
+			if (mc->session_render.flip_memories[i] != VK_NULL_HANDLE)
+				vk->vkFreeMemory(vk->device, mc->session_render.flip_memories[i], NULL);
+		}
+		mc->session_render.flip_initialized = false;
+	}
+
+	VkExtent2D extent = {.width = (uint32_t)width, .height = (uint32_t)height};
+	VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+	VkImageSubresourceRange range = {
+	    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+	    .baseMipLevel = 0,
+	    .levelCount = 1,
+	    .baseArrayLayer = 0,
+	    .layerCount = 1,
+	};
+
+	for (int i = 0; i < 2; i++) {
+		VkResult ret = vk_create_image_simple(vk, extent, format, usage,
+		                                      &mc->session_render.flip_memories[i],
+		                                      &mc->session_render.flip_images[i]);
+		if (ret != VK_SUCCESS) {
+			U_LOG_E("[per-session] Failed to create flip image %d: %s", i, vk_result_string(ret));
+			return false;
+		}
+
+		ret = vk_create_view(vk, mc->session_render.flip_images[i],
+		                     VK_IMAGE_VIEW_TYPE_2D, format, range,
+		                     &mc->session_render.flip_views[i]);
+		if (ret != VK_SUCCESS) {
+			U_LOG_E("[per-session] Failed to create flip view %d: %s", i, vk_result_string(ret));
+			return false;
+		}
+	}
+
+	mc->session_render.flip_width = width;
+	mc->session_render.flip_height = height;
+	mc->session_render.flip_format = format;
+	mc->session_render.flip_initialized = true;
+	U_LOG_W("[per-session] Created flip images: %dx%d format=%d", width, height, format);
+	return true;
+}
+
+/*!
+ * Blit a source swapchain eye into a flip image with Y-flipped coordinates.
+ */
+static void
+blit_flip_eye(struct vk_bundle *vk, VkCommandBuffer cmd,
+              VkImage src_image, VkImage dst_image,
+              int width, int height, uint32_t array_index)
+{
+	VkImageMemoryBarrier pre_barriers[2] = {
+	    {
+	        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	        .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
+	        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+	        .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	        .image = src_image,
+	        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	    },
+	    {
+	        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	        .srcAccessMask = 0,
+	        .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+	        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+	        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	        .image = dst_image,
+	        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	    },
+	};
+	vk->vkCmdPipelineBarrier(cmd,
+	                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+	                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                         0, 0, NULL, 0, NULL, 2, pre_barriers);
+
+	VkImageBlit blit = {
+	    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, array_index, 1},
+	    .srcOffsets = {{0, height, 0}, {width, 0, 1}},
+	    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .dstOffsets = {{0, 0, 0}, {width, height, 1}},
+	};
+	vk->vkCmdBlitImage(cmd,
+	                    src_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	                    dst_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	                    1, &blit, VK_FILTER_LINEAR);
+
+	VkImageMemoryBarrier post_barriers[2] = {
+	    {
+	        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	        .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+	        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+	        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	        .image = src_image,
+	        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	    },
+	    {
+	        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+	        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+	        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	        .image = dst_image,
+	        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	    },
+	};
+	vk->vkCmdPipelineBarrier(cmd,
+	                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+	                         0, 0, NULL, 0, NULL, 2, post_barriers);
+}
+
+/*!
  * Render a single per-session client to its own comp_target using SR weaving.
  *
  * @param mc The multi_compositor with per-session rendering
@@ -1197,8 +1330,8 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 		return;
 	}
 
-	// Check if we need compositing (window-space layers present, or flip_y requires blit)
-	bool needs_compositing = has_window_space_layers(mc) || layer->data.flip_y;
+	// Check if we need compositing (window-space layers present)
+	bool needs_compositing = has_window_space_layers(mc);
 
 	// Extract left and right view info
 	int imageWidth = 0, imageHeight = 0;
@@ -1302,6 +1435,32 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 			U_LOG_W("[per-session] Using composited per-eye views: %dx%d", weaveWidth, weaveHeight);
 		} else {
 			U_LOG_W("[per-session] Compositing failed, falling back to direct projection views");
+		}
+	}
+
+	// If flip_y is set (e.g. OpenGL textures), blit into intermediate images with flipped Y.
+	// This is a lightweight path - just creates images + blits, no full compositing pipeline.
+	if (layer->data.flip_y && !needs_compositing) {
+		if (ensure_flip_images(mc, vk, imageWidth, imageHeight, imageFormat)) {
+			struct xrt_swapchain *xsc_left = layer->xscs[0];
+			struct xrt_swapchain *xsc_right = layer->xscs[1];
+			if (xsc_left != NULL && xsc_right != NULL) {
+				struct comp_swapchain *sc_left = comp_swapchain(xsc_left);
+				struct comp_swapchain *sc_right = comp_swapchain(xsc_right);
+				const struct xrt_layer_projection_view_data *vd_left = &layer->data.proj.v[0];
+				const struct xrt_layer_projection_view_data *vd_right = &layer->data.proj.v[1];
+				VkImage src_left = sc_left->vkic.images[vd_left->sub.image_index].handle;
+				VkImage src_right = sc_right->vkic.images[vd_right->sub.image_index].handle;
+
+				blit_flip_eye(vk, cmd, src_left, mc->session_render.flip_images[0],
+				              imageWidth, imageHeight, vd_left->sub.array_index);
+				blit_flip_eye(vk, cmd, src_right, mc->session_render.flip_images[1],
+				              imageWidth, imageHeight, vd_right->sub.array_index);
+
+				weaveLeft = mc->session_render.flip_views[0];
+				weaveRight = mc->session_render.flip_views[1];
+				U_LOG_W("[per-session] Applied Y-flip blit for GL textures");
+			}
 		}
 	}
 
