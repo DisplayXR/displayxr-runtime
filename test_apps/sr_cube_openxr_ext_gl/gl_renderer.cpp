@@ -249,12 +249,14 @@ void RenderScene(
 
     XMMATRIX zoom = XMMatrixScaling(zoomScale, zoomScale, zoomScale);
 
-    // Draw cube
+    // Draw cube - base rests on grid at y=0
     {
         const float cubeSize = 0.06f;
+        const float cubeHeight = cubeSize / 2.0f;  // Raise by half size so base is at y=0
         XMMATRIX cubeScale = XMMatrixScaling(cubeSize, cubeSize, cubeSize);
         XMMATRIX cubeRot = XMMatrixRotationY(renderer.cubeRotation);
-        XMMATRIX cubeWVP = cubeRot * cubeScale * zoom * viewMatrix * projMatrix;
+        XMMATRIX cubeTrans = XMMatrixTranslation(0.0f, cubeHeight, 0.0f);
+        XMMATRIX cubeWVP = cubeRot * cubeScale * cubeTrans * zoom * viewMatrix * projMatrix;
 
         glUseProgram_(renderer.cubeProgram);
         SetMatrix(renderer.cubeProgram, "uTransform", cubeWVP);
