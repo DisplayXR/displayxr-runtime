@@ -597,8 +597,7 @@ leiasr_query_recommended_view_dimensions(double max_time,
 	return success;
 }
 
-// Static SR context for shared eye tracking
-static SR::SRContext *g_static_sr_context = nullptr;
+// Cached display dimensions for static queries
 static float g_cached_display_width_m = 0.0f;
 static float g_cached_display_height_m = 0.0f;
 static bool g_display_dims_cached = false;
@@ -611,48 +610,25 @@ leiasr_static_get_predicted_eye_positions(float out_left_eye[3],
 		return false;
 	}
 
-	// Create static context on first call (lazy initialization)
-	if (g_static_sr_context == nullptr) {
-		try {
-			g_static_sr_context = SR::SRContext::create();
-			U_LOG_W("Created static SR context for shared eye tracking");
-		} catch (SR::ServerNotAvailableException &e) {
-			U_LOG_E("Failed to create static SR context: %s", e.what());
-			return false;
-		} catch (...) {
-			U_LOG_E("Exception creating static SR context");
-			return false;
-		}
-	}
+	// Eye position prediction requires an active weaver instance because:
+	// 1. The weaver owns the LookaroundFilter that provides prediction
+	// 2. Prediction is tuned to each application's update rate
+	// Without a weaver, we cannot provide accurate predicted eye positions.
+	// Callers should use leiasr_d3d11_get_predicted_eye_positions() with
+	// their per-session weaver instance instead.
 
-	if (g_static_sr_context == nullptr) {
-		return false;
-	}
+	// Return default center position for graceful fallback
+	// This allows apps to start rendering before eye tracking is ready
+	out_left_eye[0] = -0.032f;  // -32mm left of center
+	out_left_eye[1] = 0.0f;
+	out_left_eye[2] = 0.6f;     // 600mm from display
 
-	try {
-		// Get predicted eyes from the shared context
-		SR_eyes predicted = g_static_sr_context->getPredictedEyes();
+	out_right_eye[0] = 0.032f;  // +32mm right of center
+	out_right_eye[1] = 0.0f;
+	out_right_eye[2] = 0.6f;    // 600mm from display
 
-		// Convert from SR to meters (SR uses mm internally I think)
-		// The weaver uses these directly so they should already be in right units
-		out_left_eye[0] = static_cast<float>(predicted.leftEye.x);
-		out_left_eye[1] = static_cast<float>(predicted.leftEye.y);
-		out_left_eye[2] = static_cast<float>(predicted.leftEye.z);
-
-		out_right_eye[0] = static_cast<float>(predicted.rightEye.x);
-		out_right_eye[1] = static_cast<float>(predicted.rightEye.y);
-		out_right_eye[2] = static_cast<float>(predicted.rightEye.z);
-
-		// Validate: check if z position is reasonable (should be positive and not too far)
-		if (out_left_eye[2] <= 0.0f || out_left_eye[2] > 5.0f ||
-		    out_right_eye[2] <= 0.0f || out_right_eye[2] > 5.0f) {
-			return false;
-		}
-
-		return true;
-	} catch (...) {
-		return false;
-	}
+	// Return false to indicate these are fallback values, not tracked
+	return false;
 }
 
 bool
@@ -671,17 +647,13 @@ leiasr_static_get_display_dimensions(struct leiasr_display_dimensions *out_dims)
 	}
 
 	// Need to query from SR SDK
-	// Create temporary context if no static one exists
-	SR::SRContext *context = g_static_sr_context;
-	bool created_temp = false;
+	// Create temporary context
+	SR::SRContext *context = nullptr;
 
-	if (context == nullptr) {
-		try {
-			context = SR::SRContext::create();
-			created_temp = true;
-		} catch (...) {
-			return false;
-		}
+	try {
+		context = SR::SRContext::create();
+	} catch (...) {
+		return false;
 	}
 
 	if (context == nullptr) {
@@ -694,18 +666,14 @@ leiasr_static_get_display_dimensions(struct leiasr_display_dimensions *out_dims)
 		if (displayManager != nullptr) {
 			SR::IDisplay *display = displayManager->getPrimaryActiveSRDisplay();
 			if (display != nullptr && display->isValid()) {
-				// Get physical dimensions in meters
-				SR_vec2i dots_per_unit = display->getDotsPerUnit();
-				SR_recti display_location = display->getLocation();
+				// Get physical dimensions using SR SDK's physical size API
+				// Returns centimeters, convert to meters
+				float raw_width_cm = display->getPhysicalSizeWidth();
+				float raw_height_cm = display->getPhysicalSizeHeight();
 
-				if (dots_per_unit.x > 0 && dots_per_unit.y > 0) {
-					int64_t native_width = display_location.right - display_location.left;
-					int64_t native_height = display_location.bottom - display_location.top;
-
-					// Calculate physical size in meters
-					// dots_per_unit is dots per meter
-					g_cached_display_width_m = static_cast<float>(native_width) / static_cast<float>(dots_per_unit.x);
-					g_cached_display_height_m = static_cast<float>(native_height) / static_cast<float>(dots_per_unit.y);
+				if (raw_width_cm > 0.0f && raw_height_cm > 0.0f) {
+					g_cached_display_width_m = raw_width_cm / 100.0f;
+					g_cached_display_height_m = raw_height_cm / 100.0f;
 					g_display_dims_cached = true;
 
 					out_dims->width_m = g_cached_display_width_m;
@@ -713,7 +681,8 @@ leiasr_static_get_display_dimensions(struct leiasr_display_dimensions *out_dims)
 					out_dims->valid = true;
 					success = true;
 
-					U_LOG_W("Static display dimensions: %.3f x %.3f meters",
+					U_LOG_W("Static display dimensions: %.2fcm x %.2fcm = %.4fm x %.4fm",
+					        raw_width_cm, raw_height_cm,
 					        g_cached_display_width_m, g_cached_display_height_m);
 				}
 			}
@@ -723,7 +692,7 @@ leiasr_static_get_display_dimensions(struct leiasr_display_dimensions *out_dims)
 	}
 
 	// Clean up temporary context
-	if (created_temp && context != nullptr) {
+	if (context != nullptr) {
 		SR::SRContext::deleteSRContext(context);
 	}
 
