@@ -240,41 +240,26 @@ ipc_try_get_sr_view_poses(struct ipc_server *s,
 	struct xrt_quat world_head_ori;
 
 	if (compositor_owns_window) {
-		// Monado window mode: DISPLAY CENTRIC
-		// - Cube is at (0, 1.6, 0) in world space
-		// - SR provides eye positions relative to display, e.g., (0, 0, 0.6)
-		// - We add 1.6m standing height: world_eye = sr_eye + (0, 1.6, 0)
-		// - Mouse rotation orbits eyes around (0, 1.6, 0), cube stays in focus
-		// - WASD movement shifts the display origin
-		// - Orientation stays identity (Kooima projection handles off-center viewing)
+		// DISPLAY-CENTRIC MODE (Monado window)
+		//
+		// Philosophy: qwerty_device tracks the pose of a "virtual display"
+		// initially at (0, 1.6, 0) in world space.
+		//
+		// SR eyes are in display-local coords, transform to world:
+		//   worldPos = display_pos + rotate(sr_eye, display_ori)
+		//   worldOri = display_ori
 
-		// Get movement (WASD) and rotation (mouse) from qwerty device
-		struct xrt_vec3 wasd_offset = {0.0f, 0.0f, 0.0f};
-		struct xrt_quat orbit_rotation = XRT_QUAT_IDENTITY;
-		if (xret == XRT_SUCCESS &&
-		    (qwerty_relation.relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT)) {
-			// WASD movement = position offset from initial (0, 1.6, 0)
-			wasd_offset.x = qwerty_relation.pose.position.x;
-			wasd_offset.y = qwerty_relation.pose.position.y - 1.6f;
-			wasd_offset.z = qwerty_relation.pose.position.z;
-			// Mouse rotation for orbiting
-			orbit_rotation = qwerty_relation.pose.orientation;
-		}
+		struct xrt_vec3 display_pos = qwerty_relation.pose.position;
+		struct xrt_quat display_ori = qwerty_relation.pose.orientation;
 
-		// Standing height offset (display/cube position)
-		const struct xrt_vec3 standing_offset = {0.0f, 1.6f, 0.0f};
-
-		// Rotate SR eye position around the display center
 		struct xrt_vec3 rotated_sr_eye;
-		math_quat_rotate_vec3(&orbit_rotation, &sr_head_midpoint, &rotated_sr_eye);
+		math_quat_rotate_vec3(&display_ori, &sr_head_midpoint, &rotated_sr_eye);
 
-		// World eye = standing_offset + wasd_movement + rotate(sr_eye)
-		world_head_pos.x = standing_offset.x + wasd_offset.x + rotated_sr_eye.x;
-		world_head_pos.y = standing_offset.y + wasd_offset.y + rotated_sr_eye.y;
-		world_head_pos.z = standing_offset.z + wasd_offset.z + rotated_sr_eye.z;
+		world_head_pos.x = display_pos.x + rotated_sr_eye.x;
+		world_head_pos.y = display_pos.y + rotated_sr_eye.y;
+		world_head_pos.z = display_pos.z + rotated_sr_eye.z;
 
-		// Orientation stays identity - Kooima projection handles off-center viewing
-		world_head_ori = (struct xrt_quat)XRT_QUAT_IDENTITY;
+		world_head_ori = display_ori;
 	} else {
 		// Session target: App provides window, controls scene positioning
 		// Use SR eye midpoint directly (app expects SR coordinate system)

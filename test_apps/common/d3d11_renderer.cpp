@@ -504,7 +504,8 @@ void RenderScene(
     uint32_t height,
     const XMMATRIX& viewMatrix,
     const XMMATRIX& projMatrix,
-    float zoomScale
+    float zoomScale,
+    float cubeHeight
 ) {
     // Set render targets (don't set viewport here - caller handles it for stereo rendering)
     renderer.context->OMSetRenderTargets(1, &rtv, dsv);
@@ -523,9 +524,10 @@ void RenderScene(
     // Render cube
     // Scale cube to 0.06m (60mm, matching reference SR example) - unit cube is -0.5 to 0.5
     // OpenXR coordinate system uses meters, so all scene geometry must be in meters.
-    // Position cube at y=1.6m (standing eye level) facing the user
+    // cubeHeight parameter controls Y position:
+    //   - 1.6f for Monado window apps (runtime adds standing height offset)
+    //   - 0.0f for extension apps (app controls scene, no runtime offset)
     const float cubeSize = 0.06f;  // 60mm in meters
-    const float cubeHeight = 1.6f; // Standing eye level in meters
     XMMATRIX cubeScale = XMMatrixScaling(cubeSize, cubeSize, cubeSize);
     XMMATRIX cubeRotation = XMMatrixRotationY(renderer.cubeRotation);
     XMMATRIX cubeTranslation = XMMatrixTranslation(0.0f, cubeHeight, 0.0f);

@@ -77,6 +77,7 @@ void UpdateScene(D3D11Renderer& renderer, float deltaTime);
 // Render the scene to a render target view
 // viewMatrix and projMatrix come from OpenXR views (already includes player locomotion
 // via reference space offset — see UpdateLocalSpace in xr_session)
+// cubeHeight: Y position of cube in world space (1.6 for Monado window, 0 for extension apps)
 void RenderScene(
     D3D11Renderer& renderer,
     ID3D11RenderTargetView* rtv,
@@ -85,7 +86,8 @@ void RenderScene(
     uint32_t height,
     const DirectX::XMMATRIX& viewMatrix,
     const DirectX::XMMATRIX& projMatrix,
-    float zoomScale = 1.0f
+    float zoomScale = 1.0f,
+    float cubeHeight = 1.6f
 );
 
 // Create a render target view for an OpenXR swapchain image
