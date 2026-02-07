@@ -244,10 +244,14 @@ void RenderScene(
     glDepthFunc(GL_LESS);
     glEnable(GL_CULL_FACE);
     glCullFace(GL_BACK);
-    glFrontFace(GL_CCW);
+    glFrontFace(GL_CW);  // Y-flip reverses winding
 
     glClearColor(0.05f, 0.05f, 0.25f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    // OpenGL texture origin is bottom-left; compositor expects top-left (D3D11 convention).
+    // Flip Y in projection so the compositor reads the texture correctly.
+    XMMATRIX glProj = projMatrix * XMMatrixScaling(1.0f, -1.0f, 1.0f);
 
     XMMATRIX zoom = XMMatrixScaling(zoomScale, zoomScale, zoomScale);
 
@@ -258,7 +262,7 @@ void RenderScene(
         XMMATRIX cubeScale = XMMatrixScaling(cubeSize, cubeSize, cubeSize);
         XMMATRIX cubeRot = XMMatrixRotationY(renderer.cubeRotation);
         XMMATRIX cubeTrans = XMMatrixTranslation(0.0f, cubeHeight, 0.0f);
-        XMMATRIX cubeWVP = cubeRot * cubeScale * cubeTrans * zoom * viewMatrix * projMatrix;
+        XMMATRIX cubeWVP = cubeRot * cubeScale * cubeTrans * zoom * viewMatrix * glProj;
 
         glUseProgram_(renderer.cubeProgram);
         SetMatrix(renderer.cubeProgram, "uTransform", cubeWVP);
@@ -272,7 +276,7 @@ void RenderScene(
         const float gridScale = 0.05f;
         XMMATRIX gridWorld = XMMatrixScaling(gridScale, gridScale, gridScale) *
                              XMMatrixTranslation(0, -0.03f + gridScale, 0);
-        XMMATRIX gridWVP = gridWorld * zoom * viewMatrix * projMatrix;
+        XMMATRIX gridWVP = gridWorld * zoom * viewMatrix * glProj;
 
         glUseProgram_(renderer.gridProgram);
         SetMatrix(renderer.gridProgram, "uTransform", gridWVP);
