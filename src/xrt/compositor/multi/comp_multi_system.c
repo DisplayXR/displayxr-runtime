@@ -481,8 +481,23 @@ init_composite_resources(struct multi_compositor *mc, struct vk_bundle *vk, uint
 		goto err_desc_layout;
 	}
 
-	// Create pipeline using quad shaders from comp_compositor
-	struct comp_compositor *c = comp_compositor(&mc->msc->xcn->base);
+	// Load per-session shaders on demand (avoids invalid comp_compositor cast)
+	if (!mc->session_render.shaders_loaded) {
+		if (!render_shaders_load(&mc->session_render.shaders, vk)) {
+			U_LOG_E("[composite] Failed to load shaders");
+			goto err_pipe_layout;
+		}
+		mc->session_render.shaders_loaded = true;
+	}
+
+	// Create per-session pipeline cache on demand
+	if (mc->session_render.pipeline_cache == VK_NULL_HANDLE) {
+		ret = vk_create_pipeline_cache(vk, &mc->session_render.pipeline_cache);
+		if (ret != VK_SUCCESS) {
+			U_LOG_E("[composite] Failed to create pipeline cache: %d", ret);
+			goto err_pipe_layout;
+		}
+	}
 
 	// Build a pipeline compatible with our render pass
 	// Triangle strip, no vertex input, dynamic viewport/scissor, alpha blending
@@ -547,13 +562,13 @@ init_composite_resources(struct multi_compositor *mc, struct vk_bundle *vk, uint
 	    {
 	        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
 	        .stage = VK_SHADER_STAGE_VERTEX_BIT,
-	        .module = c->shaders.layer_quad_vert,
+	        .module = mc->session_render.shaders.layer_quad_vert,
 	        .pName = "main",
 	    },
 	    {
 	        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
 	        .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
-	        .module = c->shaders.layer_shared_frag,
+	        .module = mc->session_render.shaders.layer_shared_frag,
 	        .pName = "main",
 	    },
 	};
@@ -575,7 +590,7 @@ init_composite_resources(struct multi_compositor *mc, struct vk_bundle *vk, uint
 	    .subpass = 0,
 	};
 
-	ret = vk->vkCreateGraphicsPipelines(vk->device, c->nr.pipeline_cache, 1,
+	ret = vk->vkCreateGraphicsPipelines(vk->device, mc->session_render.pipeline_cache, 1,
 	                                    &pipe_info, NULL,
 	                                    &mc->session_render.composite_pipeline);
 	if (ret != VK_SUCCESS) {
@@ -782,6 +797,16 @@ fini_composite_resources(struct multi_compositor *mc, struct vk_bundle *vk)
 			vk->vkFreeMemory(vk->device, mc->session_render.composite_memories[i], NULL);
 			mc->session_render.composite_memories[i] = VK_NULL_HANDLE;
 		}
+	}
+
+	// Destroy per-session shaders and pipeline cache
+	if (mc->session_render.shaders_loaded) {
+		render_shaders_fini(&mc->session_render.shaders, vk);
+		mc->session_render.shaders_loaded = false;
+	}
+	if (mc->session_render.pipeline_cache != VK_NULL_HANDLE) {
+		vk->vkDestroyPipelineCache(vk->device, mc->session_render.pipeline_cache, NULL);
+		mc->session_render.pipeline_cache = VK_NULL_HANDLE;
 	}
 
 	mc->session_render.composite_initialized = false;
@@ -2134,6 +2159,7 @@ comp_multi_create_system_compositor(struct xrt_compositor_native *xcn,
                                     const struct xrt_system_compositor_info *xsci,
                                     bool do_warm_start,
                                     struct comp_target_service *target_service,
+                                    bool xcn_is_comp_compositor,
                                     struct xrt_system_compositor **out_xsysc)
 {
 	struct multi_system_compositor *msc = U_TYPED_CALLOC(struct multi_system_compositor);
@@ -2149,6 +2175,7 @@ comp_multi_create_system_compositor(struct xrt_compositor_native *xcn,
 	msc->base.info = *xsci;
 	msc->upaf = upaf;
 	msc->xcn = xcn;
+	msc->xcn_is_comp_compositor = xcn_is_comp_compositor;
 
 	// Store the target service for per-session rendering (Phase 3)
 	msc->target_service = target_service;

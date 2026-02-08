@@ -24,6 +24,7 @@
 #ifdef XRT_HAVE_LEIA_SR_VULKAN
 // Use xrt_vulkan_includes.h instead of vulkan.h directly to ensure VK_NO_PROTOTYPES is defined
 #include "xrt/xrt_vulkan_includes.h"
+#include "render/render_interface.h"
 #endif
 
 // Forward declarations for per-session rendering
@@ -266,6 +267,11 @@ struct multi_compositor
 		uint32_t composite_height;               //!< Eye height
 		bool composite_initialized;              //!< True if composite resources are ready
 
+		//! Per-session shaders (loaded on demand, avoids invalid comp_compositor cast)
+		struct render_shaders shaders;
+		bool shaders_loaded;
+		VkPipelineCache pipeline_cache;
+
 		//! @}
 
 		//! @name Lightweight Y-flip images for GL textures (no full compositing pipeline)
@@ -473,6 +479,9 @@ struct multi_system_compositor
 
 	//! List of active clients.
 	struct multi_compositor *clients[MULTI_MAX_CLIENTS];
+
+	//! True if xcn is actually a comp_compositor (not null_compositor or other)
+	bool xcn_is_comp_compositor;
 
 	//! External window handle from first session with HWND (for windowed mode)
 	void *external_window_handle;

@@ -30,6 +30,7 @@
 
 #ifdef XRT_HAVE_LEIA_SR_VULKAN
 #include "leiasr/leiasr.h"
+#include "render/render_interface.h"
 #endif
 
 #ifdef XRT_OS_WINDOWS
@@ -506,9 +507,11 @@ multi_compositor_begin_session(struct xrt_compositor *xc, const struct xrt_begin
 			if (mc->msc->external_window_handle == NULL) {
 				mc->msc->external_window_handle = mc->xsi.external_window_handle;
 
-				struct comp_compositor *c = comp_compositor(&mc->msc->xcn->base);
-				if (c->deferred_surface) {
-					c->external_window_handle = mc->xsi.external_window_handle;
+				if (mc->msc->xcn_is_comp_compositor) {
+					struct comp_compositor *c = comp_compositor(&mc->msc->xcn->base);
+					if (c->deferred_surface) {
+						c->external_window_handle = mc->xsi.external_window_handle;
+					}
 				}
 			}
 		} else {
@@ -611,6 +614,16 @@ multi_compositor_end_session(struct xrt_compositor *xc)
 					vk->vkDestroyCommandPool(vk->device, mc->session_render.weaver_cmd_pool, NULL);
 				}
 				mc->session_render.weaver_cmd_pool = VK_NULL_HANDLE;
+			}
+
+			// Destroy per-session shaders and pipeline cache
+			if (vk != NULL && mc->session_render.shaders_loaded) {
+				render_shaders_fini(&mc->session_render.shaders, vk);
+				mc->session_render.shaders_loaded = false;
+			}
+			if (vk != NULL && mc->session_render.pipeline_cache != VK_NULL_HANDLE) {
+				vk->vkDestroyPipelineCache(vk->device, mc->session_render.pipeline_cache, NULL);
+				mc->session_render.pipeline_cache = VK_NULL_HANDLE;
 			}
 #endif
 			// Destroy per-session target using the service
@@ -1106,6 +1119,15 @@ multi_compositor_destroy(struct xrt_compositor *xc)
 				if (mc->session_render.composite_memories[i] != VK_NULL_HANDLE) {
 					vk->vkFreeMemory(vk->device, mc->session_render.composite_memories[i], NULL);
 				}
+			}
+			// Destroy per-session shaders and pipeline cache
+			if (mc->session_render.shaders_loaded) {
+				render_shaders_fini(&mc->session_render.shaders, vk);
+				mc->session_render.shaders_loaded = false;
+			}
+			if (mc->session_render.pipeline_cache != VK_NULL_HANDLE) {
+				vk->vkDestroyPipelineCache(vk->device, mc->session_render.pipeline_cache, NULL);
+				mc->session_render.pipeline_cache = VK_NULL_HANDLE;
 			}
 			mc->session_render.composite_initialized = false;
 		}
