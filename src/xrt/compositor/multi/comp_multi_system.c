@@ -1470,12 +1470,48 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 		framebuffer = mc->session_render.framebuffers[buffer_index];
 	}
 
+	// Transition swapchain image to COLOR_ATTACHMENT_OPTIMAL before weaving
+	// (matches Vulkan weaving example: weaver expects this layout)
+	{
+		VkImageMemoryBarrier pre_weave_barrier = {
+		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		    .srcAccessMask = 0,
+		    .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+		    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+		    .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		    .image = ct->images[buffer_index].handle,
+		    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+		};
+		vk->vkCmdPipelineBarrier(cmd,
+		                         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+		                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		                         0, 0, NULL, 0, NULL, 1, &pre_weave_barrier);
+	}
+
 	// Perform SR weaving
 	U_LOG_W("[per-session] Calling leiasr_weave: weaver=%p, cmd=%p, fb=%ux%u, framebuffer=%p",
 	        (void *)weaver, (void *)cmd, framebufferWidth, framebufferHeight, (void *)framebuffer);
 	leiasr_weave(weaver, cmd, weaveLeft, weaveRight, viewport, weaveWidth, weaveHeight, imageFormat,
 	             framebuffer, (int)framebufferWidth, (int)framebufferHeight, framebufferFormat);
 	U_LOG_W("[per-session] leiasr_weave returned");
+
+	// Transition swapchain image to PRESENT_SRC_KHR after weaving
+	// (matches Vulkan weaving example: image must be presentable)
+	{
+		VkImageMemoryBarrier post_weave_barrier = {
+		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		    .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+		    .dstAccessMask = 0,
+		    .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		    .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+		    .image = ct->images[buffer_index].handle,
+		    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+		};
+		vk->vkCmdPipelineBarrier(cmd,
+		                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		                         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+		                         0, 0, NULL, 0, NULL, 1, &post_weave_barrier);
+	}
 
 	// End command buffer
 	U_LOG_W("[per-session] Ending command buffer...");

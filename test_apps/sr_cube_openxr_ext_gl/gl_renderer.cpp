@@ -271,7 +271,7 @@ void RenderScene(
     {
         const float gridScale = 0.05f;
         XMMATRIX gridWorld = XMMatrixScaling(gridScale, gridScale, gridScale) *
-                             XMMatrixTranslation(0, -0.03f + gridScale, 0);
+                             XMMatrixTranslation(0, gridScale, 0);
         XMMATRIX gridWVP = gridWorld * zoom * viewMatrix * projMatrix;
 
         glUseProgram_(renderer.gridProgram);

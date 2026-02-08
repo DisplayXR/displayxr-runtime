@@ -310,8 +310,8 @@ leiasr_weave(struct leiasr *leiasr,
 	leiasr->weaver->setViewport(rect);
 	leiasr->weaver->setScissorRect(rect);
 	leiasr->weaver->setCommandBuffer(commandBuffer);
-	leiasr->weaver->setOutputFrameBuffer(framebuffer, framebufferWidth, framebufferHeight, framebufferFormat);
 	leiasr->weaver->setInputViewTexture(leftImageView, rightImageView, imageWidth, imageHeight, imageFormat);
+	leiasr->weaver->setOutputFrameBuffer(framebuffer, framebufferWidth, framebufferHeight, framebufferFormat);
 	leiasr->weaver->weave();
 }
 
