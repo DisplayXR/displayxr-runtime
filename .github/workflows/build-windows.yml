@@ -648,6 +648,7 @@ jobs:
       - name: Delete individual test app artifacts
         uses: geekyeggo/delete-artifact@v5
         with:
+          failOnError: false
           name: |
             SRCubeOpenXRExt
             SRCubeNative
