@@ -914,7 +914,7 @@ composite_layers_to_intermediate(struct multi_compositor *mc,
 			struct xrt_matrix_4x4 mvp;
 			// clang-format off
 			mvp.v[0]  = 2.0f; mvp.v[1]  = 0.0f; mvp.v[2]  = 0.0f; mvp.v[3]  = 0.0f;
-			mvp.v[4]  = 0.0f; mvp.v[5]  = 2.0f; mvp.v[6]  = 0.0f; mvp.v[7]  = 0.0f;
+			mvp.v[4]  = 0.0f; mvp.v[5]  = -2.0f; mvp.v[6]  = 0.0f; mvp.v[7]  = 0.0f;
 			mvp.v[8]  = 0.0f; mvp.v[9]  = 0.0f; mvp.v[10] = 1.0f; mvp.v[11] = 0.0f;
 			mvp.v[12] = 0.0f; mvp.v[13] = 0.0f; mvp.v[14] = 0.5f; mvp.v[15] = 1.0f;
 			// clang-format on
@@ -945,8 +945,8 @@ composite_layers_to_intermediate(struct multi_compositor *mc,
 			memcpy((uint8_t *)mc->session_render.composite_ubo_mapped + ubo_offset,
 			       &ubo_data, sizeof(ubo_data));
 
-			// Update descriptor set 0 with projection image
-			VkDescriptorSet ds_set = mc->session_render.composite_desc_sets[0];
+			// Update descriptor set for this eye with projection image
+			VkDescriptorSet ds_set = mc->session_render.composite_desc_sets[eye];
 
 			VkDescriptorBufferInfo buf_desc = {
 			    .buffer = mc->session_render.composite_ubo_buffer,
@@ -1014,7 +1014,7 @@ composite_layers_to_intermediate(struct multi_compositor *mc,
 		vk->vkCmdSetScissor(cmd, 0, 1, &scissor);
 
 		// Draw projection as fullscreen opaque quad
-		VkDescriptorSet proj_ds = mc->session_render.composite_desc_sets[0];
+		VkDescriptorSet proj_ds = mc->session_render.composite_desc_sets[eye];
 		vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
 		                      mc->session_render.composite_pipeline);
 		vk->vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -1457,17 +1457,15 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 	}
 	U_LOG_W("[per-session] Command buffer started");
 
-	// Composite layers into intermediate targets when needed:
-	// - Window-space overlay layers require compositing with projection layer
-	// - flip_y (OpenGL textures) requires Y-flip via texture sampling
-	// Both paths use texture sampling instead of vkCmdBlitImage to avoid
-	// layout transitions on imported images (causes VK_ERROR_DEVICE_LOST on Intel Iris Xe).
+	// TODO: Window-space overlay compositing disabled while investigating
+	// VK_IMAGE_LAYOUT_GENERAL sampling issue on Intel Iris Xe (images read as black).
+	// Raw imported views go directly to the weaver for now.
 	VkImageView weaveLeft = leftImageView;
 	VkImageView weaveRight = rightImageView;
 	int weaveWidth = imageWidth;
 	int weaveHeight = imageHeight;
 
-	if (needs_compositing || layer->data.flip_y) {
+	if (false && (needs_compositing || layer->data.flip_y)) {
 		U_LOG_W("[per-session] Compositing layers to intermediate targets (overlays=%d, flip_y=%d)...",
 		        needs_compositing, layer->data.flip_y);
 		VkImageView compLeft = VK_NULL_HANDLE, compRight = VK_NULL_HANDLE;
