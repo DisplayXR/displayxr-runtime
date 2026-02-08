@@ -412,6 +412,13 @@ do_post_create_vulkan_setup(struct vk_bundle *vk,
 	};
 
 	for (uint32_t i = 0; i < image_count; i++) {
+		// Initialize images to GENERAL layout instead of SHADER_READ_ONLY_OPTIMAL.
+		// This is critical for cross-device external memory sharing (null compositor):
+		// on Intel Iris Xe (Gen12), images use CCS (Color Control Surface) compression
+		// whose metadata lives in shared GPU memory. We must initialize the CCS metadata
+		// once at creation (before sharing), then NEVER transition again on the
+		// compositor's VkDevice. GENERAL is valid for all usages and allows the
+		// compositor to sample without further layout transitions.
 		vk_cmd_image_barrier_gpu_locked(              //
 		    vk,                                       //
 		    cmd_buffer,                               //
@@ -419,7 +426,7 @@ do_post_create_vulkan_setup(struct vk_bundle *vk,
 		    0,                                        //
 		    VK_ACCESS_SHADER_READ_BIT,                //
 		    VK_IMAGE_LAYOUT_UNDEFINED,                //
-		    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, //
+		    VK_IMAGE_LAYOUT_GENERAL,                  //
 		    subresource_range);                       //
 	}
 

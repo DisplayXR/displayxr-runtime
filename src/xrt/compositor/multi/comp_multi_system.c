@@ -906,48 +906,13 @@ composite_layers_to_intermediate(struct multi_compositor *mc,
 	                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 	                         0, 0, NULL, 0, NULL, 2, barriers_to_attach);
 
-	// Step 1b: Transition swapchain (app) images UNDEFINED → SHADER_READ_ONLY
-	// These images were created by the null compositor on THIS VkDevice but are shared
-	// with the app via external memory. The app writes to its imported copies; the data
-	// is in GPU memory but the compositor-side layout was never set (still UNDEFINED).
-	// Using oldLayout=UNDEFINED is safe here: it's a metadata-only update on our own
-	// VkImages, not a transfer or blit that would cause VK_ERROR_DEVICE_LOST on Intel.
-	{
-		VkImage proj_images[2] = {leftProjImage, rightProjImage};
-		VkImageMemoryBarrier sc_barriers[2];
-		int sc_barrier_count = 0;
-		for (int eye = 0; eye < 2; eye++) {
-			if (proj_images[eye] == VK_NULL_HANDLE) {
-				continue;
-			}
-			// Check for duplicate (left and right may use same VkImage with different array layers)
-			bool duplicate = false;
-			for (int j = 0; j < sc_barrier_count; j++) {
-				if (sc_barriers[j].image == proj_images[eye]) {
-					duplicate = true;
-					break;
-				}
-			}
-			if (duplicate) {
-				continue;
-			}
-			sc_barriers[sc_barrier_count++] = (VkImageMemoryBarrier){
-			    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-			    .srcAccessMask = 0,
-			    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-			    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-			    .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-			    .image = proj_images[eye],
-			    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, VK_REMAINING_ARRAY_LAYERS},
-			};
-		}
-		if (sc_barrier_count > 0) {
-			vk->vkCmdPipelineBarrier(cmd,
-			                         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-			                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-			                         0, 0, NULL, 0, NULL, (uint32_t)sc_barrier_count, sc_barriers);
-		}
-	}
+	// NOTE: No layout transitions on shared (app) swapchain images!
+	// These images are shared between two VkDevices via external memory.
+	// On Intel Iris Xe (Gen12), layout transitions modify CCS (Color Control
+	// Surface) compression metadata in shared GPU memory, corrupting data
+	// written by the app's VkDevice and causing VK_ERROR_DEVICE_LOST.
+	// The images were initialized to GENERAL at creation time (before sharing),
+	// and we sample them using VK_IMAGE_LAYOUT_GENERAL in descriptors.
 
 	// UBO stride for sub-allocation from the persistent UBO buffer
 	VkDeviceSize ubo_stride = sizeof(struct xrt_normalized_rect) + sizeof(struct xrt_matrix_4x4);
@@ -1008,7 +973,7 @@ composite_layers_to_intermediate(struct multi_compositor *mc,
 			VkDescriptorImageInfo img_desc = {
 			    .sampler = mc->session_render.composite_sampler,
 			    .imageView = proj_views[eye],
-			    .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			    .imageLayout = VK_IMAGE_LAYOUT_GENERAL, // No transitions on shared images (Intel CCS)
 			};
 
 			VkWriteDescriptorSet writes[2] = {
@@ -1155,7 +1120,7 @@ composite_layers_to_intermediate(struct multi_compositor *mc,
 			VkDescriptorImageInfo img_desc = {
 			    .sampler = mc->session_render.composite_sampler,
 			    .imageView = ws_view,
-			    .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			    .imageLayout = VK_IMAGE_LAYOUT_GENERAL, // No transitions on shared images (Intel CCS)
 			};
 
 			VkWriteDescriptorSet writes[2] = {
@@ -1670,31 +1635,12 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 			U_LOG_W("[per-session] Failed to create flip images, using raw views (will be upside-down)");
 		}
 	} else {
-		// Non-GL path: transition imported images GENERAL -> SHADER_READ_ONLY for weaver sampling
-		VkImageMemoryBarrier input_barriers[2] = {
-		    {
-		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		        .srcAccessMask = 0,
-		        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-		        .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
-		        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-		        .image = leftImage,
-		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-		    },
-		    {
-		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		        .srcAccessMask = 0,
-		        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-		        .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
-		        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-		        .image = rightImage,
-		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-		    },
-		};
-		uint32_t barrier_count = (leftImage == rightImage) ? 1 : 2;
-		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-		                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, barrier_count,
-		                         input_barriers);
+		// Non-GL path: NO layout transitions on shared images.
+		// On Intel Iris Xe (Gen12), layout transitions modify CCS (Color Control
+		// Surface) compression metadata in shared GPU memory, corrupting data
+		// written by the app's VkDevice and causing VK_ERROR_DEVICE_LOST.
+		// Images were initialized to GENERAL at creation time; the weaver
+		// samples them using VK_IMAGE_LAYOUT_GENERAL.
 	}
 
 	// Get the framebuffer for the current swapchain image
