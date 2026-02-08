@@ -357,8 +357,7 @@ init_composite_resources(struct multi_compositor *mc, struct vk_bundle *vk, uint
 	// Create per-eye composite images (separate images for clean weaver input)
 	VkExtent2D eye_extent = {.width = width, .height = height};
 	VkImageUsageFlags usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-	                          VK_IMAGE_USAGE_SAMPLED_BIT |
-	                          VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+	                          VK_IMAGE_USAGE_SAMPLED_BIT;
 
 	VkImageSubresourceRange eye_range = {
 	    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
@@ -386,11 +385,11 @@ init_composite_resources(struct multi_compositor *mc, struct vk_bundle *vk, uint
 		}
 	}
 
-	// Create render pass with LOAD_OP_LOAD for overlay compositing
+	// Create render pass with LOAD_OP_CLEAR - projection layer is drawn first as fullscreen quad
 	VkAttachmentDescription attachment = {
 	    .format = format,
 	    .samples = VK_SAMPLE_COUNT_1_BIT,
-	    .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
+	    .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
 	    .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
 	    .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
 	    .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
@@ -880,155 +879,176 @@ composite_layers_to_intermediate(struct multi_compositor *mc,
 	uint32_t cw = mc->session_render.composite_width;
 	uint32_t ch = mc->session_render.composite_height;
 
-	// Step 1: Transition both composite images to TRANSFER_DST
-	VkImageMemoryBarrier barriers_to_dst[2];
-	for (int eye = 0; eye < 2; eye++) {
-		barriers_to_dst[eye] = (VkImageMemoryBarrier){
-		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		    .srcAccessMask = 0,
-		    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-		    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-		    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-		    .image = mc->session_render.composite_images[eye],
-		    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-		};
-	}
-	vk->vkCmdPipelineBarrier(cmd,
-	                         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-	                         VK_PIPELINE_STAGE_TRANSFER_BIT,
-	                         0, 0, NULL, 0, NULL, 2, barriers_to_dst);
-
-	// Step 2: Blit projection layer into per-eye composite images
-	for (int eye = 0; eye < 2; eye++) {
-		struct xrt_swapchain *xsc = proj_layer->xscs[eye];
-		if (xsc == NULL)
-			continue;
-
-		struct comp_swapchain *sc = comp_swapchain(xsc);
-		const struct xrt_layer_projection_view_data *vd = &proj_layer->data.proj.v[eye];
-		VkImage src_vk_image = sc->vkic.images[vd->sub.image_index].handle;
-
-		// Transition source image to TRANSFER_SRC
-		VkImageMemoryBarrier src_barrier = {
-		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		    .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-		    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-		    .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-		    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-		    .image = src_vk_image,
-		    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-		};
-		vk->vkCmdPipelineBarrier(cmd,
-		                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-		                         VK_PIPELINE_STAGE_TRANSFER_BIT,
-		                         0, 0, NULL, 0, NULL, 1, &src_barrier);
-
-		// Blit from source to per-eye composite target
-		// When flip_y is set (e.g. OpenGL textures), swap source Y offsets to flip vertically
-		bool flip_y = proj_layer->data.flip_y;
-		int32_t src_y0 = (int32_t)vd->sub.rect.offset.h;
-		int32_t src_y1 = (int32_t)(vd->sub.rect.offset.h + vd->sub.rect.extent.h);
-		VkImageBlit blit = {
-		    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, vd->sub.array_index, 1},
-		    .srcOffsets = {
-		        {vd->sub.rect.offset.w, flip_y ? src_y1 : src_y0, 0},
-		        {vd->sub.rect.offset.w + (int32_t)vd->sub.rect.extent.w,
-		         flip_y ? src_y0 : src_y1, 1},
-		    },
-		    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-		    .dstOffsets = {
-		        {0, 0, 0},
-		        {(int32_t)cw, (int32_t)ch, 1},
-		    },
-		};
-		vk->vkCmdBlitImage(cmd,
-		                   src_vk_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-		                   mc->session_render.composite_images[eye], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-		                   1, &blit, VK_FILTER_NEAREST);
-
-		// Transition source back to SHADER_READ_ONLY
-		VkImageMemoryBarrier src_restore = {
-		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		    .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-		    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-		    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-		    .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-		    .image = src_vk_image,
-		    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-		};
-		vk->vkCmdPipelineBarrier(cmd,
-		                         VK_PIPELINE_STAGE_TRANSFER_BIT,
-		                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-		                         0, 0, NULL, 0, NULL, 1, &src_restore);
-	}
-
-	// Step 3: Transition both composite images to COLOR_ATTACHMENT_OPTIMAL
+	// Step 1: Transition both composite images UNDEFINED → COLOR_ATTACHMENT
+	// (compositor-owned images, safe to transition; LOAD_OP_CLEAR will initialize them)
 	VkImageMemoryBarrier barriers_to_attach[2];
 	for (int eye = 0; eye < 2; eye++) {
 		barriers_to_attach[eye] = (VkImageMemoryBarrier){
 		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+		    .srcAccessMask = 0,
 		    .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-		    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
 		    .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
 		    .image = mc->session_render.composite_images[eye],
 		    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
 		};
 	}
 	vk->vkCmdPipelineBarrier(cmd,
-	                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
 	                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 	                         0, 0, NULL, 0, NULL, 2, barriers_to_attach);
 
-	// Step 4: Render window-space layers as alpha-blended quads
-	uint32_t ws_desc_index = 0;
-	for (uint32_t li = 0; li < mc->delivered.layer_count; li++) {
-		struct multi_layer_entry *layer = &mc->delivered.layers[li];
-		if (layer->data.type != XRT_LAYER_WINDOW_SPACE) {
-			continue;
-		}
-		if (ws_desc_index >= XRT_MAX_LAYERS) {
-			break;
+	// UBO stride for sub-allocation from the persistent UBO buffer
+	VkDeviceSize ubo_stride = sizeof(struct xrt_normalized_rect) + sizeof(struct xrt_matrix_4x4);
+
+	// Projection layer image views (per eye)
+	VkImageView proj_views[2] = {leftProjView, rightProjView};
+
+	// Step 2: For each eye — begin render pass, draw projection quad, draw overlays, end render pass.
+	// NO layout transitions on imported (app) images — avoids VK_ERROR_DEVICE_LOST on Intel Iris Xe.
+	// Imported images are sampled as textures using VK_IMAGE_LAYOUT_GENERAL.
+	for (int eye = 0; eye < 2; eye++) {
+		// --- Projection layer: fullscreen opaque quad (descriptor set 0) ---
+		{
+			// Fullscreen MVP: scale the [-0.5, 0.5] unit quad to [-1, 1] NDC
+			struct xrt_matrix_4x4 mvp;
+			// clang-format off
+			mvp.v[0]  = 2.0f; mvp.v[1]  = 0.0f; mvp.v[2]  = 0.0f; mvp.v[3]  = 0.0f;
+			mvp.v[4]  = 0.0f; mvp.v[5]  = 2.0f; mvp.v[6]  = 0.0f; mvp.v[7]  = 0.0f;
+			mvp.v[8]  = 0.0f; mvp.v[9]  = 0.0f; mvp.v[10] = 1.0f; mvp.v[11] = 0.0f;
+			mvp.v[12] = 0.0f; mvp.v[13] = 0.0f; mvp.v[14] = 0.5f; mvp.v[15] = 1.0f;
+			// clang-format on
+
+			struct
+			{
+				struct xrt_normalized_rect post_transform;
+				struct xrt_matrix_4x4 mvp;
+			} ubo_data;
+
+			// UV post_transform: identity or flip_y
+			if (proj_layer->data.flip_y) {
+				ubo_data.post_transform.x = 0.0f;
+				ubo_data.post_transform.y = 1.0f;
+				ubo_data.post_transform.w = 1.0f;
+				ubo_data.post_transform.h = -1.0f;
+			} else {
+				ubo_data.post_transform.x = 0.0f;
+				ubo_data.post_transform.y = 0.0f;
+				ubo_data.post_transform.w = 1.0f;
+				ubo_data.post_transform.h = 1.0f;
+			}
+			ubo_data.mvp = mvp;
+
+			// Write UBO data — projection uses first slot per eye
+			uint32_t ubo_index = eye;
+			VkDeviceSize ubo_offset = ubo_index * ubo_stride;
+			memcpy((uint8_t *)mc->session_render.composite_ubo_mapped + ubo_offset,
+			       &ubo_data, sizeof(ubo_data));
+
+			// Update descriptor set 0 with projection image
+			VkDescriptorSet ds_set = mc->session_render.composite_desc_sets[0];
+
+			VkDescriptorBufferInfo buf_desc = {
+			    .buffer = mc->session_render.composite_ubo_buffer,
+			    .offset = ubo_offset,
+			    .range = sizeof(ubo_data),
+			};
+
+			VkDescriptorImageInfo img_desc = {
+			    .sampler = mc->session_render.composite_sampler,
+			    .imageView = proj_views[eye],
+			    .imageLayout = VK_IMAGE_LAYOUT_GENERAL, // imported image — no layout transitions
+			};
+
+			VkWriteDescriptorSet writes[2] = {
+			    {
+			        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+			        .dstSet = ds_set,
+			        .dstBinding = 0,
+			        .descriptorCount = 1,
+			        .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+			        .pBufferInfo = &buf_desc,
+			    },
+			    {
+			        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+			        .dstSet = ds_set,
+			        .dstBinding = 1,
+			        .descriptorCount = 1,
+			        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+			        .pImageInfo = &img_desc,
+			    },
+			};
+			vk->vkUpdateDescriptorSets(vk->device, 2, writes, 0, NULL);
 		}
 
-		const struct xrt_layer_window_space_data *ws = &layer->data.window_space;
-		struct xrt_swapchain *xsc = layer->xscs[0];
-		if (xsc == NULL) {
-			continue;
-		}
-
-		struct comp_swapchain *sc = comp_swapchain(xsc);
-		uint32_t img_idx = ws->sub.image_index;
-		const struct comp_swapchain_image *ws_image = &sc->images[img_idx];
-		VkImageView ws_view = get_image_view(ws_image, layer->data.flags, ws->sub.array_index);
-		if (ws_view == VK_NULL_HANDLE) {
-			continue;
-		}
-		VkImage ws_vk_image = sc->vkic.images[img_idx].handle;
-
-		// Transition window-space swapchain image to SHADER_READ_ONLY
-		VkImageMemoryBarrier ws_barrier = {
-		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		    .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-		    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-		    .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-		    .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-		    .image = ws_vk_image,
-		    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+		// Begin render pass (LOAD_OP_CLEAR clears to transparent black)
+		VkClearValue clear_value = {.color = {{0.0f, 0.0f, 0.0f, 0.0f}}};
+		VkRenderPassBeginInfo rp_begin = {
+		    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+		    .renderPass = mc->session_render.composite_render_pass,
+		    .framebuffer = mc->session_render.composite_framebuffers[eye],
+		    .renderArea = {
+		        .offset = {0, 0},
+		        .extent = {cw, ch},
+		    },
+		    .clearValueCount = 1,
+		    .pClearValues = &clear_value,
 		};
-		vk->vkCmdPipelineBarrier(cmd,
-		                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-		                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-		                         0, 0, NULL, 0, NULL, 1, &ws_barrier);
+		vk->vkCmdBeginRenderPass(cmd, &rp_begin, VK_SUBPASS_CONTENTS_INLINE);
 
-		// Compute per-eye disparity offset
-		float half_disp = ws->disparity / 2.0f;
+		// Set viewport and scissor
+		VkViewport eye_viewport = {
+		    .x = 0.0f,
+		    .y = 0.0f,
+		    .width = (float)cw,
+		    .height = (float)ch,
+		    .minDepth = 0.0f,
+		    .maxDepth = 1.0f,
+		};
+		vk->vkCmdSetViewport(cmd, 0, 1, &eye_viewport);
 
-		// UBO stride for sub-allocation from the persistent UBO buffer
-		VkDeviceSize ubo_stride = sizeof(struct xrt_normalized_rect) + sizeof(struct xrt_matrix_4x4);
+		VkRect2D scissor = {
+		    .offset = {0, 0},
+		    .extent = {cw, ch},
+		};
+		vk->vkCmdSetScissor(cmd, 0, 1, &scissor);
 
-		// Render to both eyes
-		for (int eye = 0; eye < 2; eye++) {
+		// Draw projection as fullscreen opaque quad
+		VkDescriptorSet proj_ds = mc->session_render.composite_desc_sets[0];
+		vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+		                      mc->session_render.composite_pipeline);
+		vk->vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+		                            mc->session_render.composite_pipe_layout,
+		                            0, 1, &proj_ds, 0, NULL);
+		vk->vkCmdDraw(cmd, 4, 1, 0, 0);
+
+		// --- Overlay layers: alpha-blended quads (descriptor sets 1+) ---
+		uint32_t ws_desc_index = 1; // start after projection descriptor set
+		for (uint32_t li = 0; li < mc->delivered.layer_count; li++) {
+			struct multi_layer_entry *layer = &mc->delivered.layers[li];
+			if (layer->data.type != XRT_LAYER_WINDOW_SPACE) {
+				continue;
+			}
+			if (ws_desc_index >= XRT_MAX_LAYERS) {
+				break;
+			}
+
+			const struct xrt_layer_window_space_data *ws = &layer->data.window_space;
+			struct xrt_swapchain *xsc = layer->xscs[0];
+			if (xsc == NULL) {
+				continue;
+			}
+
+			struct comp_swapchain *sc = comp_swapchain(xsc);
+			uint32_t img_idx = ws->sub.image_index;
+			const struct comp_swapchain_image *ws_image = &sc->images[img_idx];
+			VkImageView ws_view = get_image_view(ws_image, layer->data.flags, ws->sub.array_index);
+			if (ws_view == VK_NULL_HANDLE) {
+				continue;
+			}
+
+			// Compute per-eye disparity offset
+			float half_disp = ws->disparity / 2.0f;
 			float eye_shift = (eye == 0) ? -half_disp : half_disp;
 
 			// Window-space fractional coords → NDC [-1, 1]
@@ -1048,7 +1068,6 @@ composite_layers_to_intermediate(struct multi_compositor *mc,
 			mvp.v[12] = ndc_cx; mvp.v[13] = ndc_cy;  mvp.v[14] = 0.5f; mvp.v[15] = 1.0f;
 			// clang-format on
 
-			// UBO data: post_transform (xrt_normalized_rect) + mvp (xrt_matrix_4x4)
 			struct
 			{
 				struct xrt_normalized_rect post_transform;
@@ -1067,9 +1086,8 @@ composite_layers_to_intermediate(struct multi_compositor *mc,
 
 			ubo_data.mvp = mvp;
 
-			// Write UBO data to persistent buffer at the right offset
-			// Layout: [layer0_eye0, layer0_eye1, layer1_eye0, layer1_eye1, ...]
-			uint32_t ubo_index = ws_desc_index * 2 + eye;
+			// Write UBO data — overlays use slots after projection (2 slots for projection eyes)
+			uint32_t ubo_index = 2 + (ws_desc_index - 1) * 2 + eye;
 			VkDeviceSize ubo_offset = ubo_index * ubo_stride;
 			memcpy((uint8_t *)mc->session_render.composite_ubo_mapped + ubo_offset,
 			       &ubo_data, sizeof(ubo_data));
@@ -1086,7 +1104,7 @@ composite_layers_to_intermediate(struct multi_compositor *mc,
 			VkDescriptorImageInfo img_desc = {
 			    .sampler = mc->session_render.composite_sampler,
 			    .imageView = ws_view,
-			    .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			    .imageLayout = VK_IMAGE_LAYOUT_GENERAL, // imported image — no layout transitions
 			};
 
 			VkWriteDescriptorSet writes[2] = {
@@ -1109,52 +1127,19 @@ composite_layers_to_intermediate(struct multi_compositor *mc,
 			};
 			vk->vkUpdateDescriptorSets(vk->device, 2, writes, 0, NULL);
 
-			// Begin render pass on the eye's framebuffer (per-eye image)
-			VkRenderPassBeginInfo rp_begin = {
-			    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
-			    .renderPass = mc->session_render.composite_render_pass,
-			    .framebuffer = mc->session_render.composite_framebuffers[eye],
-			    .renderArea = {
-			        .offset = {0, 0},
-			        .extent = {cw, ch},
-			    },
-			    .clearValueCount = 0,
-			    .pClearValues = NULL,
-			};
-			vk->vkCmdBeginRenderPass(cmd, &rp_begin, VK_SUBPASS_CONTENTS_INLINE);
-
-			// Set viewport and scissor for the full per-eye image
-			VkViewport eye_viewport = {
-			    .x = 0.0f,
-			    .y = 0.0f,
-			    .width = (float)cw,
-			    .height = (float)ch,
-			    .minDepth = 0.0f,
-			    .maxDepth = 1.0f,
-			};
-			vk->vkCmdSetViewport(cmd, 0, 1, &eye_viewport);
-
-			VkRect2D scissor = {
-			    .offset = {0, 0},
-			    .extent = {cw, ch},
-			};
-			vk->vkCmdSetScissor(cmd, 0, 1, &scissor);
-
-			// Bind pipeline and descriptor set, draw quad
-			vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-			                      mc->session_render.composite_pipeline);
+			// Draw overlay quad (pipeline already bound)
 			vk->vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
 			                            mc->session_render.composite_pipe_layout,
 			                            0, 1, &ds_set, 0, NULL);
 			vk->vkCmdDraw(cmd, 4, 1, 0, 0);
 
-			vk->vkCmdEndRenderPass(cmd);
+			ws_desc_index++;
 		}
 
-		ws_desc_index++;
+		vk->vkCmdEndRenderPass(cmd);
 	}
 
-	// Step 5: Transition both composite images to SHADER_READ_ONLY for weaver input
+	// Step 3: Transition both composite images to SHADER_READ_ONLY for weaver input
 	VkImageMemoryBarrier barriers_to_read[2];
 	for (int eye = 0; eye < 2; eye++) {
 		barriers_to_read[eye] = (VkImageMemoryBarrier){
@@ -1180,136 +1165,155 @@ composite_layers_to_intermediate(struct multi_compositor *mc,
 }
 
 /*!
- * Lazily create lightweight intermediate images for Y-flipping GL textures.
- * Much lighter than init_composite_resources (no render pass, pipeline, etc).
- */
-static bool
-ensure_flip_images(struct multi_compositor *mc, struct vk_bundle *vk, int width, int height, VkFormat format)
-{
-	if (mc->session_render.flip_initialized &&
-	    mc->session_render.flip_width == width &&
-	    mc->session_render.flip_height == height &&
-	    mc->session_render.flip_format == format) {
-		return true;
-	}
-
-	// Destroy old if size changed
-	if (mc->session_render.flip_initialized) {
-		for (int i = 0; i < 2; i++) {
-			if (mc->session_render.flip_views[i] != VK_NULL_HANDLE)
-				vk->vkDestroyImageView(vk->device, mc->session_render.flip_views[i], NULL);
-			if (mc->session_render.flip_images[i] != VK_NULL_HANDLE)
-				vk->vkDestroyImage(vk->device, mc->session_render.flip_images[i], NULL);
-			if (mc->session_render.flip_memories[i] != VK_NULL_HANDLE)
-				vk->vkFreeMemory(vk->device, mc->session_render.flip_memories[i], NULL);
-		}
-		mc->session_render.flip_initialized = false;
-	}
-
-	VkExtent2D extent = {.width = (uint32_t)width, .height = (uint32_t)height};
-	VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-	VkImageSubresourceRange range = {
-	    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-	    .baseMipLevel = 0,
-	    .levelCount = 1,
-	    .baseArrayLayer = 0,
-	    .layerCount = 1,
-	};
-
-	for (int i = 0; i < 2; i++) {
-		VkResult ret = vk_create_image_simple(vk, extent, format, usage,
-		                                      &mc->session_render.flip_memories[i],
-		                                      &mc->session_render.flip_images[i]);
-		if (ret != VK_SUCCESS) {
-			U_LOG_E("[per-session] Failed to create flip image %d: %s", i, vk_result_string(ret));
-			return false;
-		}
-
-		ret = vk_create_view(vk, mc->session_render.flip_images[i],
-		                     VK_IMAGE_VIEW_TYPE_2D, format, range,
-		                     &mc->session_render.flip_views[i]);
-		if (ret != VK_SUCCESS) {
-			U_LOG_E("[per-session] Failed to create flip view %d: %s", i, vk_result_string(ret));
-			return false;
-		}
-	}
-
-	mc->session_render.flip_width = width;
-	mc->session_render.flip_height = height;
-	mc->session_render.flip_format = format;
-	mc->session_render.flip_initialized = true;
-	U_LOG_W("[per-session] Created flip images: %dx%d format=%d", width, height, format);
-	return true;
-}
-
-/*!
- * Blit a source swapchain eye into a flip image with Y-flipped coordinates.
+ * Recreate the per-session swapchain after a window resize.
+ * Waits for all GPU work, recreates swapchain images, destroys old framebuffers,
+ * creates new framebuffers, and reallocates command buffers/fences if image count changed.
+ *
+ * @param mc The multi_compositor with per-session rendering
+ * @param vk The Vulkan bundle
  */
 static void
-blit_flip_eye(struct vk_bundle *vk, VkCommandBuffer cmd,
-              VkImage src_image, VkImage dst_image,
-              int width, int height, uint32_t array_index)
+recreate_session_swapchain(struct multi_compositor *mc, struct vk_bundle *vk)
 {
-	VkImageMemoryBarrier pre_barriers[2] = {
-	    {
-	        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-	        .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
-	        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-	        .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-	        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-	        .image = src_image,
-	        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-	    },
-	    {
-	        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-	        .srcAccessMask = 0,
-	        .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-	        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-	        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-	        .image = dst_image,
-	        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-	    },
-	};
-	vk->vkCmdPipelineBarrier(cmd,
-	                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-	                         VK_PIPELINE_STAGE_TRANSFER_BIT,
-	                         0, 0, NULL, 0, NULL, 2, pre_barriers);
+	struct comp_target *ct = mc->session_render.target;
+	if (ct == NULL) {
+		return;
+	}
 
-	VkImageBlit blit = {
-	    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, array_index, 1},
-	    .srcOffsets = {{0, height, 0}, {width, 0, 1}},
-	    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-	    .dstOffsets = {{0, 0, 0}, {width, height, 1}},
-	};
-	vk->vkCmdBlitImage(cmd,
-	                    src_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-	                    dst_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-	                    1, &blit, VK_FILTER_NEAREST);
+	U_LOG_W("[per-session] Recreating swapchain (window resized)...");
 
-	VkImageMemoryBarrier post_barriers[2] = {
-	    {
-	        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-	        .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-	        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-	        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-	        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-	        .image = src_image,
-	        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-	    },
-	    {
-	        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-	        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-	        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-	        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-	        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-	        .image = dst_image,
-	        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-	    },
+	// 1. Wait for ALL pending GPU work to complete
+	if (mc->session_render.fenced_buffer >= 0) {
+		vk->vkWaitForFences(vk->device, 1,
+		                    &mc->session_render.fences[mc->session_render.fenced_buffer],
+		                    VK_TRUE, UINT64_MAX);
+		mc->session_render.fenced_buffer = -1;
+	}
+	// Also wait for all fences to ensure no in-flight commands reference old swapchain
+	for (uint32_t i = 0; i < mc->session_render.buffer_count; i++) {
+		if (mc->session_render.fences[i] != VK_NULL_HANDLE) {
+			vk->vkWaitForFences(vk->device, 1, &mc->session_render.fences[i], VK_TRUE, UINT64_MAX);
+		}
+	}
+
+	uint32_t old_image_count = mc->session_render.buffer_count;
+
+	// 2. Recreate swapchain images (queries new surface extent internally)
+	struct comp_target_create_images_info info = {
+	    .image_usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+	    .format_count = 1,
+	    .formats = {VK_FORMAT_R8G8B8A8_SRGB},
+	    .extent = {ct->width, ct->height}, // Will be overridden by surface caps
+	    .color_space = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
+	    .present_mode = VK_PRESENT_MODE_FIFO_KHR,
 	};
-	vk->vkCmdPipelineBarrier(cmd,
-	                         VK_PIPELINE_STAGE_TRANSFER_BIT,
-	                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-	                         0, 0, NULL, 0, NULL, 2, post_barriers);
+	comp_target_create_images(ct, &info);
+
+	if (!comp_target_has_images(ct)) {
+		U_LOG_E("[per-session] Failed to recreate swapchain images");
+		mc->session_render.swapchain_needs_recreate = false;
+		return;
+	}
+
+	uint32_t new_image_count = ct->image_count;
+
+	// 3. Destroy old framebuffers
+	if (mc->session_render.framebuffers != NULL) {
+		for (uint32_t i = 0; i < old_image_count; i++) {
+			if (mc->session_render.framebuffers[i] != VK_NULL_HANDLE) {
+				vk->vkDestroyFramebuffer(vk->device, mc->session_render.framebuffers[i], NULL);
+			}
+		}
+	}
+
+	// 4. Handle image_count change - reallocate arrays if needed
+	if (new_image_count != old_image_count) {
+		U_LOG_W("[per-session] Image count changed: %u -> %u", old_image_count, new_image_count);
+
+		// Free old command buffers from the pool
+		vk->vkFreeCommandBuffers(vk->device, mc->session_render.weaver_cmd_pool,
+		                         old_image_count, mc->session_render.cmd_buffers);
+
+		// Destroy old fences
+		for (uint32_t i = 0; i < old_image_count; i++) {
+			if (mc->session_render.fences[i] != VK_NULL_HANDLE) {
+				vk->vkDestroyFence(vk->device, mc->session_render.fences[i], NULL);
+			}
+		}
+
+		// Reallocate arrays
+		free(mc->session_render.cmd_buffers);
+		free(mc->session_render.fences);
+		free(mc->session_render.framebuffers);
+
+		mc->session_render.cmd_buffers = U_TYPED_ARRAY_CALLOC(VkCommandBuffer, new_image_count);
+		mc->session_render.fences = U_TYPED_ARRAY_CALLOC(VkFence, new_image_count);
+		mc->session_render.framebuffers = U_TYPED_ARRAY_CALLOC(VkFramebuffer, new_image_count);
+
+		if (!mc->session_render.cmd_buffers || !mc->session_render.fences || !mc->session_render.framebuffers) {
+			U_LOG_E("[per-session] Failed to allocate new arrays after resize");
+			mc->session_render.swapchain_needs_recreate = false;
+			return;
+		}
+
+		// Allocate new command buffers
+		VkCommandBufferAllocateInfo cb_alloc = {
+		    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+		    .commandPool = mc->session_render.weaver_cmd_pool,
+		    .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+		    .commandBufferCount = new_image_count,
+		};
+		VkResult vk_ret = vk->vkAllocateCommandBuffers(vk->device, &cb_alloc, mc->session_render.cmd_buffers);
+		if (vk_ret != VK_SUCCESS) {
+			U_LOG_E("[per-session] Failed to allocate new command buffers: %s", vk_result_string(vk_ret));
+			mc->session_render.swapchain_needs_recreate = false;
+			return;
+		}
+
+		// Create new fences (signaled)
+		VkFenceCreateInfo fence_info = {
+		    .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+		    .flags = VK_FENCE_CREATE_SIGNALED_BIT,
+		};
+		for (uint32_t i = 0; i < new_image_count; i++) {
+			vk_ret = vk->vkCreateFence(vk->device, &fence_info, NULL, &mc->session_render.fences[i]);
+			if (vk_ret != VK_SUCCESS) {
+				U_LOG_E("[per-session] Failed to create fence %u: %s", i, vk_result_string(vk_ret));
+			}
+		}
+	} else {
+		// Same image count - just reallocate framebuffer array for new images
+		free(mc->session_render.framebuffers);
+		mc->session_render.framebuffers = U_TYPED_ARRAY_CALLOC(VkFramebuffer, new_image_count);
+	}
+
+	// 5. Create new framebuffers bound to new swapchain images
+	if (mc->session_render.framebuffers != NULL && mc->session_render.weaver_render_pass != VK_NULL_HANDLE) {
+		for (uint32_t i = 0; i < new_image_count; i++) {
+			VkFramebufferCreateInfo fb_info = {
+			    .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+			    .renderPass = mc->session_render.weaver_render_pass,
+			    .attachmentCount = 1,
+			    .pAttachments = &ct->images[i].view,
+			    .width = ct->width,
+			    .height = ct->height,
+			    .layers = 1,
+			};
+			VkResult vk_ret = vk->vkCreateFramebuffer(vk->device, &fb_info, NULL,
+			                                           &mc->session_render.framebuffers[i]);
+			if (vk_ret != VK_SUCCESS) {
+				U_LOG_E("[per-session] Failed to create framebuffer %u: %s", i, vk_result_string(vk_ret));
+				mc->session_render.framebuffers[i] = VK_NULL_HANDLE;
+			}
+		}
+	}
+
+	// 6. Update state
+	mc->session_render.buffer_count = new_image_count;
+	mc->session_render.fenced_buffer = -1;
+	mc->session_render.swapchain_needs_recreate = false;
+
+	U_LOG_W("[per-session] Swapchain recreated: %ux%u, %u images", ct->width, ct->height, new_image_count);
 }
 
 /*!
@@ -1330,6 +1334,13 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 	if (ct == NULL || weaver == NULL) {
 		U_LOG_E("[per-session] Per-session target or weaver not initialized");
 		return;
+	}
+
+	// Recreate swapchain if flagged (from previous frame's VK_SUBOPTIMAL_KHR)
+	if (mc->session_render.swapchain_needs_recreate) {
+		recreate_session_swapchain(mc, vk);
+		// Re-read ct since create_images updates it in place
+		ct = mc->session_render.target;
 	}
 
 	// Must have at least one layer
@@ -1392,7 +1403,8 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 	uint32_t buffer_index = 0;
 	VkResult ret = comp_target_acquire(ct, &buffer_index);
 	if (ret == VK_SUBOPTIMAL_KHR) {
-		U_LOG_W("[per-session] Swapchain suboptimal (window resized?), continuing");
+		U_LOG_W("[per-session] Swapchain suboptimal (window resized?), flagging for recreation");
+		mc->session_render.swapchain_needs_recreate = true;
 	} else if (ret != VK_SUCCESS) {
 		U_LOG_E("[per-session] Failed to acquire per-session target image: %s", vk_result_string(ret));
 		return;
@@ -1445,14 +1457,19 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 	}
 	U_LOG_W("[per-session] Command buffer started");
 
-	// If we have window-space layers, composite all layers into intermediate targets first
+	// Composite layers into intermediate targets when needed:
+	// - Window-space overlay layers require compositing with projection layer
+	// - flip_y (OpenGL textures) requires Y-flip via texture sampling
+	// Both paths use texture sampling instead of vkCmdBlitImage to avoid
+	// layout transitions on imported images (causes VK_ERROR_DEVICE_LOST on Intel Iris Xe).
 	VkImageView weaveLeft = leftImageView;
 	VkImageView weaveRight = rightImageView;
 	int weaveWidth = imageWidth;
 	int weaveHeight = imageHeight;
 
-	if (needs_compositing) {
-		U_LOG_W("[per-session] Compositing layers to intermediate targets...");
+	if (needs_compositing || layer->data.flip_y) {
+		U_LOG_W("[per-session] Compositing layers to intermediate targets (overlays=%d, flip_y=%d)...",
+		        needs_compositing, layer->data.flip_y);
 		VkImageView compLeft = VK_NULL_HANDLE, compRight = VK_NULL_HANDLE;
 		if (composite_layers_to_intermediate(mc, vk, cmd, &compLeft, &compRight)) {
 			weaveLeft = compLeft;
@@ -1462,32 +1479,6 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 			U_LOG_W("[per-session] Using composited per-eye views: %dx%d", weaveWidth, weaveHeight);
 		} else {
 			U_LOG_W("[per-session] Compositing failed, falling back to direct projection views");
-		}
-	}
-
-	// If flip_y is set (e.g. OpenGL textures), blit into intermediate images with flipped Y.
-	// This is a lightweight path - just creates images + blits, no full compositing pipeline.
-	if (layer->data.flip_y && !needs_compositing) {
-		if (ensure_flip_images(mc, vk, imageWidth, imageHeight, imageFormat)) {
-			struct xrt_swapchain *xsc_left = layer->xscs[0];
-			struct xrt_swapchain *xsc_right = layer->xscs[1];
-			if (xsc_left != NULL && xsc_right != NULL) {
-				struct comp_swapchain *sc_left = comp_swapchain(xsc_left);
-				struct comp_swapchain *sc_right = comp_swapchain(xsc_right);
-				const struct xrt_layer_projection_view_data *vd_left = &layer->data.proj.v[0];
-				const struct xrt_layer_projection_view_data *vd_right = &layer->data.proj.v[1];
-				VkImage src_left = sc_left->vkic.images[vd_left->sub.image_index].handle;
-				VkImage src_right = sc_right->vkic.images[vd_right->sub.image_index].handle;
-
-				blit_flip_eye(vk, cmd, src_left, mc->session_render.flip_images[0],
-				              imageWidth, imageHeight, vd_left->sub.array_index);
-				blit_flip_eye(vk, cmd, src_right, mc->session_render.flip_images[1],
-				              imageWidth, imageHeight, vd_right->sub.array_index);
-
-				weaveLeft = mc->session_render.flip_views[0];
-				weaveRight = mc->session_render.flip_views[1];
-				U_LOG_W("[per-session] Applied Y-flip blit for GL textures");
-			}
 		}
 	}
 
@@ -1572,7 +1563,10 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 	// Present the image (fence handles GPU sync - no vkQueueWaitIdle needed)
 	U_LOG_W("[per-session] Presenting image (buffer_index=%u)...", buffer_index);
 	ret = comp_target_present(ct, vk->main_queue->queue, buffer_index, 0, display_time_ns, 0);
-	if (ret != VK_SUCCESS && ret != VK_SUBOPTIMAL_KHR) {
+	if (ret == VK_SUBOPTIMAL_KHR) {
+		U_LOG_W("[per-session] Present returned suboptimal, flagging for recreation");
+		mc->session_render.swapchain_needs_recreate = true;
+	} else if (ret != VK_SUCCESS) {
 		U_LOG_E("[per-session] Failed to present per-session target: %s", vk_result_string(ret));
 	}
 	U_LOG_W("[per-session] render_session_to_own_target: END (present result=%d)", ret);

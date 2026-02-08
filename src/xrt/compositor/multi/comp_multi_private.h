@@ -239,6 +239,9 @@ struct multi_compositor
 		//! Index of buffer with pending fence (-1 = none)
 		int32_t fenced_buffer;
 
+		//! True if swapchain needs recreation (set on VK_SUBOPTIMAL_KHR)
+		bool swapchain_needs_recreate;
+
 		//! Render pass for weaver output (single color attachment, no depth)
 		VkRenderPass weaver_render_pass;
 
