@@ -363,47 +363,43 @@ static void RenderThreadFunc(HWND hwnd, VulkanState* vk) {
         beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         vkBeginCommandBuffer(cmd, &beginInfo);
 
-        // Transition view texture to color attachment
-        TransitionImageLayout(cmd, vk->viewImage,
-            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-
-        // Transition depth to depth attachment
-        TransitionImageLayout(cmd, vk->depthImage,
-            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-            VK_IMAGE_ASPECT_DEPTH_BIT);
-
         // Cube parameters
         const float cubeSize = 60.0f;
         const float znear = 0.1f;
         const float zfar = 10000.0f;
 
-        // Begin scene render pass (clears color + depth)
         VkClearValue clearValues[2] = {};
         clearValues[0].color = {{0.05f, 0.05f, 0.15f, 1.0f}};
         clearValues[1].depthStencil = {1.0f, 0};
 
-        VkRenderPassBeginInfo rpBegin = {};
-        rpBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-        rpBegin.renderPass = vk->sceneRenderPass;
-        rpBegin.framebuffer = vk->sceneFramebuffer;
-        rpBegin.renderArea.extent = {vk->viewWidth * 2, vk->viewHeight};
-        rpBegin.clearValueCount = 2;
-        rpBegin.pClearValues = clearValues;
-
-        vkCmdBeginRenderPass(cmd, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
-
-        // Bind cube pipeline
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk->cubePipeline);
-
-        VkDeviceSize offset = 0;
-        vkCmdBindVertexBuffers(cmd, 0, 1, &vk->cubeVertexBuffer, &offset);
-        vkCmdBindIndexBuffer(cmd, vk->cubeIndexBuffer, 0, VK_INDEX_TYPE_UINT16);
-
-        // Render stereo views (left and right)
+        // Render each eye to its own framebuffer (separate images for weaver)
         for (int eye = 0; eye < 2; eye++) {
-            // Set viewport for this eye (Y-flip via negative height)
+            // Transition per-eye color + depth to attachment layouts
+            TransitionImageLayout(cmd, vk->viewImages[eye],
+                VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+            TransitionImageLayout(cmd, vk->depthImages[eye],
+                VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                VK_IMAGE_ASPECT_DEPTH_BIT);
+
+            VkRenderPassBeginInfo rpBegin = {};
+            rpBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+            rpBegin.renderPass = vk->sceneRenderPass;
+            rpBegin.framebuffer = vk->sceneFramebuffers[eye];
+            rpBegin.renderArea.extent = {vk->viewWidth, vk->viewHeight};
+            rpBegin.clearValueCount = 2;
+            rpBegin.pClearValues = clearValues;
+
+            vkCmdBeginRenderPass(cmd, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
+
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk->cubePipeline);
+
+            VkDeviceSize offset = 0;
+            vkCmdBindVertexBuffers(cmd, 0, 1, &vk->cubeVertexBuffer, &offset);
+            vkCmdBindIndexBuffer(cmd, vk->cubeIndexBuffer, 0, VK_INDEX_TYPE_UINT16);
+
+            // Full viewport per eye (Y-flip via negative height)
             VkViewport viewport = {};
-            viewport.x = (float)(eye * (int)vk->viewWidth);
+            viewport.x = 0.0f;
             viewport.y = (float)vk->viewHeight;
             viewport.width = (float)vk->viewWidth;
             viewport.height = -(float)vk->viewHeight;
@@ -412,7 +408,7 @@ static void RenderThreadFunc(HWND hwnd, VulkanState* vk) {
             vkCmdSetViewport(cmd, 0, 1, &viewport);
 
             VkRect2D scissor = {};
-            scissor.offset = {(int32_t)(eye * vk->viewWidth), 0};
+            scissor.offset = {0, 0};
             scissor.extent = {vk->viewWidth, vk->viewHeight};
             vkCmdSetScissor(cmd, 0, 1, &scissor);
 
@@ -434,19 +430,19 @@ static void RenderThreadFunc(HWND hwnd, VulkanState* vk) {
                 VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
 
             vkCmdDrawIndexed(cmd, 36, 1, 0, 0, 0);
+
+            vkCmdEndRenderPass(cmd);
+
+            // Transition per-eye image to shader read for weaver
+            TransitionImageLayout(cmd, vk->viewImages[eye],
+                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         }
-
-        vkCmdEndRenderPass(cmd);
-
-        // Transition view texture to shader read for weaver
-        TransitionImageLayout(cmd, vk->viewImage,
-            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 
         // Transition swapchain image to color attachment for weaver output
         TransitionImageLayout(cmd, vk->swapchainImages[imageIndex],
             VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 
-        // Call the SR Vulkan weaver
+        // Call the SR Vulkan weaver with separate left/right image views
         RECT weaverRect = {};
         weaverRect.left = 0;
         weaverRect.top = 0;
@@ -456,7 +452,7 @@ static void RenderThreadFunc(HWND hwnd, VulkanState* vk) {
         g_srWeaver->setViewport(weaverRect);
         g_srWeaver->setScissorRect(weaverRect);
         g_srWeaver->setCommandBuffer(cmd);
-        g_srWeaver->setInputViewTexture(vk->viewImageView, vk->viewImageView,
+        g_srWeaver->setInputViewTexture(vk->viewImageViews[0], vk->viewImageViews[1],
             (int)(vk->viewWidth), (int)(vk->viewHeight), vk->swapchainFormat);
         g_srWeaver->setOutputFrameBuffer(vk->swapchainFramebuffers[imageIndex],
             (int)vk->swapchainExtent.width, (int)vk->swapchainExtent.height,
