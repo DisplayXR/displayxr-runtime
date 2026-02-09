@@ -51,21 +51,21 @@ struct VulkanState {
     VkRenderPass swapchainRenderPass = VK_NULL_HANDLE;
     std::vector<VkFramebuffer> swapchainFramebuffers;
 
-    // Stereo view texture (side-by-side)
-    VkImage viewImage = VK_NULL_HANDLE;
-    VkDeviceMemory viewImageMemory = VK_NULL_HANDLE;
-    VkImageView viewImageView = VK_NULL_HANDLE;
+    // Per-eye view textures (separate images for left/right)
+    VkImage viewImages[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkDeviceMemory viewImageMemory[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkImageView viewImageViews[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
     uint32_t viewWidth = 0;   // single-eye width
     uint32_t viewHeight = 0;
 
-    // Depth for view texture
-    VkImage depthImage = VK_NULL_HANDLE;
-    VkDeviceMemory depthImageMemory = VK_NULL_HANDLE;
-    VkImageView depthImageView = VK_NULL_HANDLE;
+    // Per-eye depth
+    VkImage depthImages[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkDeviceMemory depthImageMemory[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkImageView depthImageViews[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
 
-    // Scene render pass (color + depth)
+    // Scene render pass (color + depth) and per-eye framebuffers
     VkRenderPass sceneRenderPass = VK_NULL_HANDLE;
-    VkFramebuffer sceneFramebuffer = VK_NULL_HANDLE;
+    VkFramebuffer sceneFramebuffers[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
 
     // Pipeline
     VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
