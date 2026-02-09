@@ -241,17 +241,15 @@ submit_fallback(struct client_vk_compositor *c, xrt_result_t *out_xret)
 {
 	struct vk_bundle *vk = &c->vk;
 
-	// When disable_fence_sync is true, skip vkQueueWaitIdle. The app already
-	// waits for its own GPU work (vkWaitForFences per render, vkQueueWaitIdle
-	// for HUD). No barrier command buffers are submitted (all skipped), so the
-	// queue has no runtime-submitted work to wait for. Calling vkQueueWaitIdle
-	// here triggers spurious VK_ERROR_DEVICE_LOST on NVIDIA drivers when the
-	// null compositor's separate VkDevice is concurrently initializing resources
-	// on the same physical GPU.
-	if (!c->xcn->base.info.disable_fence_sync) {
+	// Wait for the app's GPU work to complete before notifying the compositor.
+	// With cross-device external memory sharing (null compositor on Device A,
+	// VK app on Device B), the compositor will read the shared images on Device A.
+	// Without this wait, Device B's GPU writes may still be in-flight when
+	// Device A reads, causing VK_ERROR_DEVICE_LOST on Intel Iris Xe (Gen12).
+	// GL apps don't need this because GL has implicit driver-level sync.
+	{
 		COMP_TRACE_IDENT(device_wait_idle);
 
-		// Last course of action fallback.
 		vk_queue_lock(vk->main_queue);
 		vk->vkQueueWaitIdle(vk->main_queue->queue);
 		vk_queue_unlock(vk->main_queue);

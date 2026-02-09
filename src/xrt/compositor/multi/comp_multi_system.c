@@ -1662,12 +1662,39 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 			U_LOG_W("[per-session] Failed to create SBS flip image, using raw views (will be upside-down)");
 		}
 	} else {
-		// Non-GL path: NO layout transitions on shared images.
-		// On Intel Iris Xe (Gen12), layout transitions modify CCS (Color Control
-		// Surface) compression metadata in shared GPU memory, corrupting data
-		// written by the app's VkDevice and causing VK_ERROR_DEVICE_LOST.
-		// Images were initialized to GENERAL at creation time; the weaver
-		// samples them using VK_IMAGE_LAYOUT_GENERAL.
+		// VK path: transition shared images GENERAL -> SHADER_READ_ONLY_OPTIMAL.
+		// This is critical for Intel Iris Xe (Gen12) which uses CCS (Color Control
+		// Surface) compression. When the app (Device B) writes to shared images,
+		// CCS metadata is updated on Device B. The compositor (Device A) must do
+		// a layout transition to reconcile the CCS state before reading.
+		// The GL path does equivalent transitions in session_blit_sbs_flip
+		// (GENERAL -> TRANSFER_SRC -> GENERAL), which is why GL works on Intel.
+		// The weaver's internal descriptors use SHADER_READ_ONLY_OPTIMAL layout
+		// (vkweaver.cpp:1230), so this also fixes the layout mismatch.
+		VkImageMemoryBarrier shared_barriers[2] = {
+		    {
+		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		        .srcAccessMask = 0,
+		        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+		        .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+		        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		        .image = leftImage,
+		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, leftArrayIndex, 1},
+		    },
+		    {
+		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		        .srcAccessMask = 0,
+		        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+		        .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+		        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		        .image = rightImage,
+		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, rightArrayIndex, 1},
+		    },
+		};
+		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+		                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 2,
+		                         shared_barriers);
+		U_LOG_W("[per-session] VK path: transitioned shared images GENERAL -> SHADER_READ_ONLY_OPTIMAL");
 	}
 
 	// Get the framebuffer for the current swapchain image
@@ -1700,6 +1727,34 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 	leiasr_weave(weaver, cmd, weaveLeft, weaveRight, viewport, weaveWidth, weaveHeight, imageFormat,
 	             framebuffer, (int)framebufferWidth, (int)framebufferHeight, framebufferFormat);
 	U_LOG_W("[per-session] leiasr_weave returned");
+
+	// VK path: restore shared images back to GENERAL for next frame's transition.
+	// GL path doesn't need this — session_blit_sbs_flip already restores to GENERAL.
+	if (!layer->data.flip_y) {
+		VkImageMemoryBarrier restore_barriers[2] = {
+		    {
+		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		        .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
+		        .dstAccessMask = 0,
+		        .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+		        .image = leftImage,
+		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, leftArrayIndex, 1},
+		    },
+		    {
+		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		        .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
+		        .dstAccessMask = 0,
+		        .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+		        .image = rightImage,
+		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, rightArrayIndex, 1},
+		    },
+		};
+		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+		                         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL, 0, NULL, 2,
+		                         restore_barriers);
+	}
 
 	// Transition swapchain image to PRESENT_SRC_KHR after weaving
 	// (matches Vulkan weaving example: image must be presentable)
