@@ -43,10 +43,47 @@ static bool g_inSizeMove = false;  // True while user is dragging/resizing the w
 static const uint32_t HUD_PIXEL_WIDTH = 380;
 static const uint32_t HUD_PIXEL_HEIGHT = 280;
 
+// Fullscreen state
+static bool g_fullscreen = false;
+static RECT g_savedWindowRect = {};
+static DWORD g_savedWindowStyle = 0;
+
 // Forward declaration — defined after PerformanceStats
 struct RenderState;
 static RenderState* g_renderState = nullptr;
 static void RenderOneFrame(RenderState& rs);
+
+// Toggle fullscreen mode for the app window
+static void ToggleFullscreen(HWND hwnd) {
+    if (g_fullscreen) {
+        // Exit fullscreen - restore window style and position
+        SetWindowLong(hwnd, GWL_STYLE, g_savedWindowStyle);
+        SetWindowPos(hwnd, HWND_TOP,
+            g_savedWindowRect.left, g_savedWindowRect.top,
+            g_savedWindowRect.right - g_savedWindowRect.left,
+            g_savedWindowRect.bottom - g_savedWindowRect.top,
+            SWP_FRAMECHANGED);
+        g_fullscreen = false;
+        LOG_INFO("Exited fullscreen mode");
+    } else {
+        // Enter fullscreen - save state and go borderless
+        g_savedWindowStyle = GetWindowLong(hwnd, GWL_STYLE);
+        GetWindowRect(hwnd, &g_savedWindowRect);
+
+        HMONITOR hMonitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi = { sizeof(mi) };
+        GetMonitorInfo(hMonitor, &mi);
+
+        SetWindowLong(hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+        SetWindowPos(hwnd, HWND_TOP,
+            mi.rcMonitor.left, mi.rcMonitor.top,
+            mi.rcMonitor.right - mi.rcMonitor.left,
+            mi.rcMonitor.bottom - mi.rcMonitor.top,
+            SWP_FRAMECHANGED);
+        g_fullscreen = true;
+        LOG_INFO("Entered fullscreen mode");
+    }
+}
 
 // Window procedure (runs on main thread — single-threaded, no locking needed)
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -197,8 +234,11 @@ static void RenderOneFrame(RenderState& rs) {
     // Update input-based camera movement (clears resetViewRequested internally)
     UpdateCameraMovement(g_inputState, rs.perfStats->deltaTime);
 
-    // Clear remaining one-shot flags
-    g_inputState.fullscreenToggleRequested = false;
+    // Handle fullscreen toggle (F11)
+    if (g_inputState.fullscreenToggleRequested) {
+        ToggleFullscreen(rs.hwnd);
+        g_inputState.fullscreenToggleRequested = false;
+    }
 
     // Update scene (cube rotation)
     UpdateScene(renderer, rs.perfStats->deltaTime);
@@ -519,7 +559,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     LOG_INFO("=== Entering main loop ===");
     LOG_INFO("XR rendering happens in the application window (XR_EXT_session_target)");
     LOG_INFO("Single-threaded: message pump + render on the main thread (WM_PAINT during drag/resize)");
-    LOG_INFO("Controls: WASD=Fly, QE=Up/Down, Mouse=Look, Space/DblClick=Reset, P=Parallax, TAB=HUD, ESC=Quit");
+    LOG_INFO("Controls: WASD=Fly, QE=Up/Down, Mouse=Look, Space/DblClick=Reset, P=Parallax, TAB=HUD, F11=Fullscreen, ESC=Quit");
     LOG_INFO("");
 
     PerformanceStats perfStats = {};
