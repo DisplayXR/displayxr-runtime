@@ -562,58 +562,60 @@ bool CreateSwapchainFramebuffers(VulkanState& vk) {
 bool CreateViewTexture(VulkanState& vk, uint32_t singleEyeWidth, uint32_t singleEyeHeight) {
     vk.viewWidth = singleEyeWidth;
     vk.viewHeight = singleEyeHeight;
-    uint32_t totalWidth = singleEyeWidth * 2;  // Side-by-side
 
-    // Color image
-    if (!CreateImageHelper(vk.device, vk.physicalDevice,
-        totalWidth, singleEyeHeight, vk.swapchainFormat,
-        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-        vk.viewImage, vk.viewImageMemory)) {
-        LOG_ERROR("Failed to create view image");
-        return false;
+    // Create separate per-eye color + depth images (weaver needs individual left/right VkImageViews)
+    for (int eye = 0; eye < 2; eye++) {
+        // Color image
+        if (!CreateImageHelper(vk.device, vk.physicalDevice,
+            singleEyeWidth, singleEyeHeight, vk.swapchainFormat,
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+            vk.viewImages[eye], vk.viewImageMemory[eye])) {
+            LOG_ERROR("Failed to create view image for eye %d", eye);
+            return false;
+        }
+
+        VkImageViewCreateInfo viewInfo = {};
+        viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        viewInfo.image = vk.viewImages[eye];
+        viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        viewInfo.format = vk.swapchainFormat;
+        viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        viewInfo.subresourceRange.levelCount = 1;
+        viewInfo.subresourceRange.layerCount = 1;
+
+        if (vkCreateImageView(vk.device, &viewInfo, nullptr, &vk.viewImageViews[eye]) != VK_SUCCESS) {
+            LOG_ERROR("Failed to create view image view for eye %d", eye);
+            return false;
+        }
+
+        // Depth image
+        if (!CreateImageHelper(vk.device, vk.physicalDevice,
+            singleEyeWidth, singleEyeHeight, VK_FORMAT_D32_SFLOAT,
+            VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+            vk.depthImages[eye], vk.depthImageMemory[eye])) {
+            LOG_ERROR("Failed to create depth image for eye %d", eye);
+            return false;
+        }
+
+        VkImageViewCreateInfo depthViewInfo = {};
+        depthViewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        depthViewInfo.image = vk.depthImages[eye];
+        depthViewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        depthViewInfo.format = VK_FORMAT_D32_SFLOAT;
+        depthViewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        depthViewInfo.subresourceRange.levelCount = 1;
+        depthViewInfo.subresourceRange.layerCount = 1;
+
+        if (vkCreateImageView(vk.device, &depthViewInfo, nullptr, &vk.depthImageViews[eye]) != VK_SUCCESS) {
+            LOG_ERROR("Failed to create depth image view for eye %d", eye);
+            return false;
+        }
     }
 
-    VkImageViewCreateInfo viewInfo = {};
-    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    viewInfo.image = vk.viewImage;
-    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    viewInfo.format = vk.swapchainFormat;
-    viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    viewInfo.subresourceRange.levelCount = 1;
-    viewInfo.subresourceRange.layerCount = 1;
-
-    if (vkCreateImageView(vk.device, &viewInfo, nullptr, &vk.viewImageView) != VK_SUCCESS) {
-        LOG_ERROR("Failed to create view image view");
-        return false;
-    }
-
-    // Depth image
-    if (!CreateImageHelper(vk.device, vk.physicalDevice,
-        totalWidth, singleEyeHeight, VK_FORMAT_D32_SFLOAT,
-        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-        vk.depthImage, vk.depthImageMemory)) {
-        LOG_ERROR("Failed to create depth image");
-        return false;
-    }
-
-    VkImageViewCreateInfo depthViewInfo = {};
-    depthViewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    depthViewInfo.image = vk.depthImage;
-    depthViewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    depthViewInfo.format = VK_FORMAT_D32_SFLOAT;
-    depthViewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
-    depthViewInfo.subresourceRange.levelCount = 1;
-    depthViewInfo.subresourceRange.layerCount = 1;
-
-    if (vkCreateImageView(vk.device, &depthViewInfo, nullptr, &vk.depthImageView) != VK_SUCCESS) {
-        LOG_ERROR("Failed to create depth image view");
-        return false;
-    }
-
-    LOG_INFO("View texture created: %ux%u (SBS: %ux%u), depth D32_SFLOAT",
-        singleEyeWidth, singleEyeHeight, totalWidth, singleEyeHeight);
+    LOG_INFO("View texture created: %ux%u per eye (2 separate images), depth D32_SFLOAT",
+        singleEyeWidth, singleEyeHeight);
     return true;
 }
 
@@ -670,24 +672,26 @@ bool CreateSceneRenderPass(VulkanState& vk) {
         return false;
     }
 
-    // Create framebuffer for the view texture
-    VkImageView fbAttachments[] = {vk.viewImageView, vk.depthImageView};
+    // Create per-eye framebuffers
+    for (int eye = 0; eye < 2; eye++) {
+        VkImageView fbAttachments[] = {vk.viewImageViews[eye], vk.depthImageViews[eye]};
 
-    VkFramebufferCreateInfo fbInfo = {};
-    fbInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-    fbInfo.renderPass = vk.sceneRenderPass;
-    fbInfo.attachmentCount = 2;
-    fbInfo.pAttachments = fbAttachments;
-    fbInfo.width = vk.viewWidth * 2;  // SBS
-    fbInfo.height = vk.viewHeight;
-    fbInfo.layers = 1;
+        VkFramebufferCreateInfo fbInfo = {};
+        fbInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+        fbInfo.renderPass = vk.sceneRenderPass;
+        fbInfo.attachmentCount = 2;
+        fbInfo.pAttachments = fbAttachments;
+        fbInfo.width = vk.viewWidth;
+        fbInfo.height = vk.viewHeight;
+        fbInfo.layers = 1;
 
-    if (vkCreateFramebuffer(vk.device, &fbInfo, nullptr, &vk.sceneFramebuffer) != VK_SUCCESS) {
-        LOG_ERROR("Failed to create scene framebuffer");
-        return false;
+        if (vkCreateFramebuffer(vk.device, &fbInfo, nullptr, &vk.sceneFramebuffers[eye]) != VK_SUCCESS) {
+            LOG_ERROR("Failed to create scene framebuffer for eye %d", eye);
+            return false;
+        }
     }
 
-    LOG_INFO("Scene render pass + framebuffer created");
+    LOG_INFO("Scene render pass + 2 per-eye framebuffers created");
     return true;
 }
 
@@ -1037,19 +1041,21 @@ void CleanupVulkan(VulkanState& vk) {
     if (vk.cubePipeline) vkDestroyPipeline(vk.device, vk.cubePipeline, nullptr);
     if (vk.pipelineLayout) vkDestroyPipelineLayout(vk.device, vk.pipelineLayout, nullptr);
 
-    // Scene framebuffer + render pass
-    if (vk.sceneFramebuffer) vkDestroyFramebuffer(vk.device, vk.sceneFramebuffer, nullptr);
+    // Scene framebuffers + render pass
+    for (int eye = 0; eye < 2; eye++) {
+        if (vk.sceneFramebuffers[eye]) vkDestroyFramebuffer(vk.device, vk.sceneFramebuffers[eye], nullptr);
+    }
     if (vk.sceneRenderPass) vkDestroyRenderPass(vk.device, vk.sceneRenderPass, nullptr);
 
-    // View texture
-    if (vk.viewImageView) vkDestroyImageView(vk.device, vk.viewImageView, nullptr);
-    if (vk.viewImage) vkDestroyImage(vk.device, vk.viewImage, nullptr);
-    if (vk.viewImageMemory) vkFreeMemory(vk.device, vk.viewImageMemory, nullptr);
-
-    // Depth
-    if (vk.depthImageView) vkDestroyImageView(vk.device, vk.depthImageView, nullptr);
-    if (vk.depthImage) vkDestroyImage(vk.device, vk.depthImage, nullptr);
-    if (vk.depthImageMemory) vkFreeMemory(vk.device, vk.depthImageMemory, nullptr);
+    // Per-eye view textures + depth
+    for (int eye = 0; eye < 2; eye++) {
+        if (vk.viewImageViews[eye]) vkDestroyImageView(vk.device, vk.viewImageViews[eye], nullptr);
+        if (vk.viewImages[eye]) vkDestroyImage(vk.device, vk.viewImages[eye], nullptr);
+        if (vk.viewImageMemory[eye]) vkFreeMemory(vk.device, vk.viewImageMemory[eye], nullptr);
+        if (vk.depthImageViews[eye]) vkDestroyImageView(vk.device, vk.depthImageViews[eye], nullptr);
+        if (vk.depthImages[eye]) vkDestroyImage(vk.device, vk.depthImages[eye], nullptr);
+        if (vk.depthImageMemory[eye]) vkFreeMemory(vk.device, vk.depthImageMemory[eye], nullptr);
+    }
 
     // Swapchain framebuffers
     for (auto fb : vk.swapchainFramebuffers) vkDestroyFramebuffer(vk.device, fb, nullptr);
