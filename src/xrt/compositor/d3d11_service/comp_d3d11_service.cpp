@@ -192,6 +192,9 @@ struct d3d11_service_compositor
 	//! Current focus state
 	bool state_focused;
 
+	//! Whether the window has been closed (triggers session loss)
+	bool window_closed;
+
 	//! Per-client render resources (window, swap chain, weaver)
 	struct d3d11_client_render_resources render;
 
@@ -1971,6 +1974,11 @@ compositor_wait_frame(struct xrt_compositor *xc,
 
 	std::lock_guard<std::mutex> lock(c->mutex);
 
+	// If window was closed, fail immediately to break the frame loop
+	if (c->window_closed) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
 	c->frame_id++;
 	*out_frame_id = c->frame_id;
 
@@ -2139,6 +2147,38 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	struct d3d11_service_system *sys = c->sys;
 
 	std::lock_guard<std::mutex> lock(c->mutex);
+
+	// Check window validity - detect window close to end session
+	if (!c->window_closed) {
+		bool window_valid = true;
+		if (c->render.owns_window && c->render.window != nullptr) {
+			window_valid = comp_d3d11_window_is_valid(c->render.window);
+		} else if (c->render.hwnd != nullptr) {
+			window_valid = IsWindow(c->render.hwnd) != FALSE;
+		}
+		if (!window_valid) {
+			U_LOG_W("Window closed - signaling session loss");
+			c->window_closed = true;
+			// Push LOSS_PENDING event to start orderly shutdown
+			if (c->xses != nullptr) {
+				union xrt_session_event xse = XRT_STRUCT_INIT;
+				xse.type = XRT_SESSION_EVENT_LOSS_PENDING;
+				xse.loss_pending.loss_time_ns = (int64_t)os_monotonic_get_ns();
+				xrt_session_event_sink_push(c->xses, &xse);
+			}
+			return XRT_SUCCESS; // Give app one frame to notice LOSS_PENDING
+		}
+	}
+
+	if (c->window_closed) {
+		// Window already closed on previous frame - push LOST and return error
+		if (c->xses != nullptr) {
+			union xrt_session_event xse = XRT_STRUCT_INIT;
+			xse.type = XRT_SESSION_EVENT_LOST;
+			xrt_session_event_sink_push(c->xses, &xse);
+		}
+		return XRT_ERROR_IPC_FAILURE;
+	}
 
 	// Track this as the active compositor for eye position queries
 	{
@@ -2701,35 +2741,6 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		viewport.MaxDepth = 1.0f;
 		sys->context->RSSetViewports(1, &viewport);
 
-		// Check window validity every frame before weaving
-		// If window was closed, skip weaving and signal session loss
-		bool window_valid = true;
-		if (c->render.owns_window && c->render.window != nullptr) {
-			// For owned windows, check via the window object
-			window_valid = comp_d3d11_window_is_valid(c->render.window);
-		} else if (c->render.hwnd != nullptr) {
-			// For external windows, check if HWND is still valid
-			window_valid = IsWindow(c->render.hwnd) != FALSE;
-		}
-
-		if (!window_valid) {
-			static bool logged_window_closed = false;
-			if (!logged_window_closed) {
-				logged_window_closed = true;
-				U_LOG_W("SR weave: Window closed, skipping weave and signaling session loss");
-			}
-
-			// Signal session loss via session event sink
-			if (c->xses != nullptr) {
-				union xrt_session_event xse = XRT_STRUCT_INIT;
-				xse.type = XRT_SESSION_EVENT_LOSS_PENDING;
-				xrt_session_event_sink_push(c->xses, &xse);
-			}
-
-			// Skip weaving and present - return early
-			return XRT_SUCCESS;
-		}
-
 		// Perform weaving
 		leiasr_d3d11_weave(c->render.weaver);
 	} else
@@ -2845,6 +2856,7 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 	c->xses = xses;
 	c->state_visible = false;
 	c->state_focused = false;
+	c->window_closed = false;
 
 	// Initialize layer accumulator
 	std::memset(&c->layer_accum, 0, sizeof(c->layer_accum));
