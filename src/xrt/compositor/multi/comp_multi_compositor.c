@@ -35,6 +35,7 @@
 
 #ifdef XRT_OS_WINDOWS
 #include "comp_d3d11_window.h"
+#include <windows.h>
 #endif
 
 #include <math.h>
@@ -1315,6 +1316,27 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 		U_LOG_E("No target service available for per-session rendering");
 		return false;
 	}
+
+#ifdef XRT_OS_WINDOWS
+	// Make this thread DPI-aware so Win32 APIs (GetClientRect, ClientToScreen)
+	// return physical pixel coordinates. Without this, DPI-virtualized coordinates
+	// are mixed with the SR SDK's physical display resolution, causing the
+	// interlacing pattern to drift across the screen.
+	{
+		typedef void *(WINAPI *PFN_SetThreadDpiAwarenessContext)(void *);
+		HMODULE user32 = GetModuleHandleA("user32.dll");
+		if (user32 != NULL) {
+			PFN_SetThreadDpiAwarenessContext pfn =
+			    (PFN_SetThreadDpiAwarenessContext)GetProcAddress(
+			        user32, "SetThreadDpiAwarenessContext");
+			if (pfn != NULL) {
+				// DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = ((void*)-4)
+				pfn((void *)(intptr_t)-4);
+				U_LOG_W("Set compositor thread DPI awareness to per-monitor aware v2");
+			}
+		}
+	}
+#endif
 
 	// Create per-session comp_target using the target service
 	U_LOG_W("About to create per-session comp_target for HWND %p", mc->session_render.external_window_handle);
