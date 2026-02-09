@@ -212,12 +212,13 @@ std::wstring FormatInputInfo(const std::string& lastKey, int mouseX, int mouseY,
 
 std::wstring FormatEyeTrackingInfo(float posX, float posY, float posZ, bool active) {
     std::wostringstream oss;
-    oss << std::fixed << std::setprecision(1);
+    oss << std::fixed << std::setprecision(0);
     oss << L"Eye Tracking:\n";
     if (active) {
-        oss << L"  X: " << posX << L" mm\n";
-        oss << L"  Y: " << posY << L" mm\n";
-        oss << L"  Z: " << posZ << L" mm";
+        // Convert from meters to millimeters
+        oss << L"  X: " << (posX * 1000.0f) << L" mm\n";
+        oss << L"  Y: " << (posY * 1000.0f) << L" mm\n";
+        oss << L"  Z: " << (posZ * 1000.0f) << L" mm";
     } else {
         oss << L"  Active: No";
     }
