@@ -988,11 +988,11 @@ oxr_session_locate_views(struct oxr_logger *log,
 			screen_width_m  = wm.window_width_m * vs;
 			screen_height_m = wm.window_height_m * vs;
 
-			// Shift eye positions for window center offset
-			adj_left.x  -= wm.window_center_offset_x_m;
-			adj_left.y  -= wm.window_center_offset_y_m;
-			adj_right.x -= wm.window_center_offset_x_m;
-			adj_right.y -= wm.window_center_offset_y_m;
+			// // Shift eye positions for window center offset
+			// adj_left.x  -= wm.window_center_offset_x_m;
+			// adj_left.y  -= wm.window_center_offset_y_m;
+			// adj_right.x -= wm.window_center_offset_x_m;
+			// adj_right.y -= wm.window_center_offset_y_m;
 
 			if (sr_should_log) {
 				U_LOG_W("Window-adaptive FOV: vs=%.3f, screen=%.4fx%.4fm, "
