@@ -2155,6 +2155,12 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 
 	// Handle window resize - check if swap chain needs to be resized
 	// This is critical for SR weaving which requires viewport to match window
+	// Check if in drag mode - defer expensive stereo texture reallocation during drag
+	bool in_size_move = false;
+	if (c->render.owns_window && c->render.window != nullptr) {
+		in_size_move = comp_d3d11_window_is_in_size_move(c->render.window);
+	}
+
 	if (c->render.hwnd != nullptr && c->render.swap_chain) {
 		RECT client_rect;
 		if (GetClientRect(c->render.hwnd, &client_rect)) {
@@ -2167,13 +2173,14 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 
 			if (client_width > 0 && client_height > 0 &&
 			    (sc_desc.Width != client_width || sc_desc.Height != client_height)) {
-				U_LOG_W("Window resize detected: swap_chain=%ux%u, client=%ux%u - resizing",
-				        sc_desc.Width, sc_desc.Height, client_width, client_height);
+				U_LOG_W("Window resize detected: swap_chain=%ux%u, client=%ux%u - resizing%s",
+				        sc_desc.Width, sc_desc.Height, client_width, client_height,
+				        in_size_move ? " (drag in progress, deferring stereo resize)" : "");
 
 				// Release back buffer RTV before resize
 				c->render.back_buffer_rtv.reset();
 
-				// Resize swap chain buffers
+				// Resize swap chain buffers - always do this immediately (DXGI requirement)
 				HRESULT hr = c->render.swap_chain->ResizeBuffers(
 				    0,  // Keep buffer count
 				    client_width,
@@ -2188,6 +2195,86 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 					sys->device->CreateRenderTargetView(back_buffer.get(), nullptr, c->render.back_buffer_rtv.put());
 
 					U_LOG_W("Swap chain resized successfully to %ux%u", client_width, client_height);
+
+#ifdef XRT_HAVE_LEIA_SR_D3D11
+					// Scale stereo texture proportionally to window/display ratio.
+					// Skip during drag to avoid expensive texture reallocation every pixel.
+					// The weaver handles mismatched stereo/target sizes via stretching.
+					if (c->render.weaver != nullptr && !in_size_move) {
+						uint32_t sr_w, sr_h, disp_px_w, disp_px_h;
+						int32_t disp_left, disp_top;
+						float disp_w_m, disp_h_m;
+
+						if (leiasr_d3d11_get_recommended_view_dimensions(
+						        c->render.weaver, &sr_w, &sr_h) &&
+						    leiasr_d3d11_get_display_pixel_info(
+						        c->render.weaver, &disp_px_w, &disp_px_h,
+						        &disp_left, &disp_top, &disp_w_m, &disp_h_m) &&
+						    disp_px_w > 0 && disp_px_h > 0) {
+
+							// Scale recommended view dims by window/display ratio
+							// This preserves aspect ratio during resize
+							float ratio = fminf(
+							    (float)client_width / (float)disp_px_w,
+							    (float)client_height / (float)disp_px_h);
+							if (ratio > 1.0f) {
+								ratio = 1.0f;  // Don't upscale beyond recommended
+							}
+
+							uint32_t new_view_w = (uint32_t)((float)sr_w * ratio);
+							uint32_t new_view_h = (uint32_t)((float)sr_h * ratio);
+							uint32_t new_stereo_w = new_view_w * 2;
+
+							// Only resize if significantly different (avoid churn)
+							D3D11_TEXTURE2D_DESC current_desc = {};
+							if (c->render.stereo_texture) {
+								c->render.stereo_texture->GetDesc(&current_desc);
+							}
+
+							if (current_desc.Width != new_stereo_w || current_desc.Height != new_view_h) {
+								U_LOG_W("Resizing stereo texture: %ux%u -> %ux%u (ratio=%.3f)",
+								        current_desc.Width, current_desc.Height,
+								        new_stereo_w, new_view_h, ratio);
+
+								// Release old stereo texture resources
+								c->render.stereo_rtv.reset();
+								c->render.stereo_srv.reset();
+								c->render.stereo_texture.reset();
+
+								// Create new stereo texture
+								D3D11_TEXTURE2D_DESC stereo_desc = {};
+								stereo_desc.Width = new_stereo_w;
+								stereo_desc.Height = new_view_h;
+								stereo_desc.MipLevels = 1;
+								stereo_desc.ArraySize = 1;
+								stereo_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+								stereo_desc.SampleDesc.Count = 1;
+								stereo_desc.Usage = D3D11_USAGE_DEFAULT;
+								stereo_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+
+								HRESULT stereo_hr = sys->device->CreateTexture2D(
+								    &stereo_desc, nullptr, c->render.stereo_texture.put());
+								if (SUCCEEDED(stereo_hr)) {
+									sys->device->CreateShaderResourceView(
+									    c->render.stereo_texture.get(), nullptr, c->render.stereo_srv.put());
+									sys->device->CreateRenderTargetView(
+									    c->render.stereo_texture.get(), nullptr, c->render.stereo_rtv.put());
+
+									// Update system view dimensions for rendering
+									sys->view_width = new_view_w;
+									sys->view_height = new_view_h;
+									sys->display_width = new_stereo_w;
+									sys->display_height = new_view_h;
+
+									U_LOG_W("Stereo texture resized: view=%ux%u, stereo=%ux%u",
+									        new_view_w, new_view_h, new_stereo_w, new_view_h);
+								} else {
+									U_LOG_E("Failed to resize stereo texture: 0x%08lx", stereo_hr);
+								}
+							}
+						}
+					}
+#endif
 				} else {
 					U_LOG_E("Failed to resize swap chain: 0x%08lx", hr);
 				}
@@ -2546,6 +2633,14 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		}
 	}
 
+	// During drag, synchronize with the window thread's WM_PAINT cycle.
+	// This ensures the window position is stable between weave() and Present(),
+	// so the interlacing pattern matches the actual displayed position.
+	if (c->render.owns_window && c->render.window != nullptr &&
+	    comp_d3d11_window_is_in_size_move(c->render.window)) {
+		comp_d3d11_window_wait_for_paint(c->render.window);
+	}
+
 #ifdef XRT_HAVE_LEIA_SR_D3D11
 	// Weave stereo texture through SR weaver for light field display
 	if (c->render.weaver != nullptr && c->render.stereo_srv) {
@@ -2651,6 +2746,11 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	// Present to display
 	if (c->render.swap_chain) {
 		c->render.swap_chain->Present(1, 0);  // VSync
+	}
+
+	// Signal WM_PAINT that the frame is done (unblocks modal drag loop)
+	if (c->render.owns_window && c->render.window != nullptr) {
+		comp_d3d11_window_signal_paint_done(c->render.window);
 	}
 
 	return XRT_SUCCESS;
