@@ -104,6 +104,17 @@ leiasr_has_weaver(struct leiasr *leiasr);
 bool
 leiasr_get_display_dimensions(struct leiasr *leiasr, struct leiasr_display_dimensions *out_dims);
 
+/*!
+ * Log diagnostic info about the window position relative to the SR display.
+ * Queries the window's actual screen position via Win32 and compares with
+ * the SR display location. Useful for diagnosing interlacing alignment issues.
+ *
+ * @param leiasr The leiasr instance
+ * @param windowHandle Window handle (HWND) to query position for
+ */
+void
+leiasr_log_window_diagnostics(struct leiasr *leiasr, void *windowHandle);
+
 #ifdef __cplusplus
 }
 #endif

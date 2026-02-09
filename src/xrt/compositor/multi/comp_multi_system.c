@@ -1697,6 +1697,20 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 		                         0, 0, NULL, 0, NULL, 1, &pre_weave_barrier);
 	}
 
+	// Log window position diagnostics (once, on first weave call)
+	{
+		static bool diag_logged = false;
+		if (!diag_logged) {
+			leiasr_log_window_diagnostics(weaver, mc->session_render.external_window_handle);
+			U_LOG_W("[per-session] Weave params: viewport=(%d,%d,%u,%u), input=%dx%d fmt=%d, fb=%ux%u fmt=%d",
+			        viewport.offset.x, viewport.offset.y,
+			        viewport.extent.width, viewport.extent.height,
+			        weaveWidth, weaveHeight, imageFormat,
+			        framebufferWidth, framebufferHeight, framebufferFormat);
+			diag_logged = true;
+		}
+	}
+
 	// Perform SR weaving
 	U_LOG_W("[per-session] Calling leiasr_weave: weaver=%p, cmd=%p, fb=%ux%u, framebuffer=%p",
 	        (void *)weaver, (void *)cmd, framebufferWidth, framebufferHeight, (void *)framebuffer);
