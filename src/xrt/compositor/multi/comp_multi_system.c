@@ -1333,8 +1333,9 @@ recreate_session_swapchain(struct multi_compositor *mc, struct vk_bundle *vk)
 }
 
 /*!
- * Ensure intermediate flip images exist for Y-flipping GL textures before weaving.
- * Allocates two single-eye images with TRANSFER_DST + SAMPLED usage.
+ * Ensure the SBS (side-by-side) flip image exists for Y-flipping GL textures before weaving.
+ * Allocates a single image of (eye_width*2, eye_height) with TRANSFER_DST + SAMPLED usage.
+ * Both eyes are blitted side-by-side into this image, matching the SR weaver's SBS stereo mode.
  * Recreates if size or format changed.
  */
 static bool
@@ -1346,18 +1347,17 @@ ensure_session_flip_images(struct multi_compositor *mc, struct vk_bundle *vk, in
 	}
 
 	if (mc->session_render.flip_initialized) {
-		for (int i = 0; i < 2; i++) {
-			if (mc->session_render.flip_views[i] != VK_NULL_HANDLE)
-				vk->vkDestroyImageView(vk->device, mc->session_render.flip_views[i], NULL);
-			if (mc->session_render.flip_images[i] != VK_NULL_HANDLE)
-				vk->vkDestroyImage(vk->device, mc->session_render.flip_images[i], NULL);
-			if (mc->session_render.flip_memories[i] != VK_NULL_HANDLE)
-				vk->vkFreeMemory(vk->device, mc->session_render.flip_memories[i], NULL);
-		}
+		if (mc->session_render.flip_sbs_view != VK_NULL_HANDLE)
+			vk->vkDestroyImageView(vk->device, mc->session_render.flip_sbs_view, NULL);
+		if (mc->session_render.flip_sbs_image != VK_NULL_HANDLE)
+			vk->vkDestroyImage(vk->device, mc->session_render.flip_sbs_image, NULL);
+		if (mc->session_render.flip_sbs_memory != VK_NULL_HANDLE)
+			vk->vkFreeMemory(vk->device, mc->session_render.flip_sbs_memory, NULL);
 		mc->session_render.flip_initialized = false;
 	}
 
-	VkExtent2D extent = {(uint32_t)width, (uint32_t)height};
+	// SBS image: double-wide (left eye in [0,w], right eye in [w,2w])
+	VkExtent2D extent = {(uint32_t)(width * 2), (uint32_t)height};
 	VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
 	VkImageSubresourceRange range = {
 	    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
@@ -1365,21 +1365,19 @@ ensure_session_flip_images(struct multi_compositor *mc, struct vk_bundle *vk, in
 	    .layerCount = 1,
 	};
 
-	for (int i = 0; i < 2; i++) {
-		VkResult ret = vk_create_image_simple(vk, extent, format, usage,
-		                                      &mc->session_render.flip_memories[i],
-		                                      &mc->session_render.flip_images[i]);
-		if (ret != VK_SUCCESS) {
-			U_LOG_E("[per-session] Failed to create flip image %d: %s", i, vk_result_string(ret));
-			return false;
-		}
+	VkResult ret = vk_create_image_simple(vk, extent, format, usage,
+	                                      &mc->session_render.flip_sbs_memory,
+	                                      &mc->session_render.flip_sbs_image);
+	if (ret != VK_SUCCESS) {
+		U_LOG_E("[per-session] Failed to create SBS flip image: %s", vk_result_string(ret));
+		return false;
+	}
 
-		ret = vk_create_view(vk, mc->session_render.flip_images[i], VK_IMAGE_VIEW_TYPE_2D, format, range,
-		                     &mc->session_render.flip_views[i]);
-		if (ret != VK_SUCCESS) {
-			U_LOG_E("[per-session] Failed to create flip image view %d: %s", i, vk_result_string(ret));
-			return false;
-		}
+	ret = vk_create_view(vk, mc->session_render.flip_sbs_image, VK_IMAGE_VIEW_TYPE_2D, format, range,
+	                     &mc->session_render.flip_sbs_view);
+	if (ret != VK_SUCCESS) {
+		U_LOG_E("[per-session] Failed to create SBS flip image view: %s", vk_result_string(ret));
+		return false;
 	}
 
 	mc->session_render.flip_width = width;
@@ -1387,33 +1385,47 @@ ensure_session_flip_images(struct multi_compositor *mc, struct vk_bundle *vk, in
 	mc->session_render.flip_format = format;
 	mc->session_render.flip_initialized = true;
 
-	U_LOG_W("[per-session] Created flip images: %dx%d format=%d", width, height, format);
+	U_LOG_W("[per-session] Created SBS flip image: %dx%d (per-eye %dx%d) format=%d",
+	        width * 2, height, width, height, format);
 	return true;
 }
 
 /*!
- * Blit a source imported image into a flip intermediate image with Y-flipped coordinates.
- * Source: GENERAL -> TRANSFER_SRC -> GENERAL (imported image, must return to GENERAL)
- * Dest:   UNDEFINED -> TRANSFER_DST -> SHADER_READ_ONLY (flip image, ready for weaver sampling)
+ * Blit both eyes with Y-flip into a single SBS (side-by-side) image.
+ * Left eye goes to [0, eye_width], right eye to [eye_width, 2*eye_width].
+ * Sources: GENERAL -> TRANSFER_SRC -> GENERAL (imported images, must return to GENERAL)
+ * Dest:    UNDEFINED -> TRANSFER_DST -> SHADER_READ_ONLY (SBS image, ready for weaver sampling)
  */
 static void
-session_blit_flip_eye(struct vk_bundle *vk,
+session_blit_sbs_flip(struct vk_bundle *vk,
                       VkCommandBuffer cmd,
-                      VkImage src_image,
-                      VkImage dst_image,
-                      int width,
-                      int height,
-                      uint32_t array_index)
+                      VkImage left_src,
+                      uint32_t left_array_index,
+                      VkImage right_src,
+                      uint32_t right_array_index,
+                      VkImage sbs_dst,
+                      int eye_width,
+                      int eye_height)
 {
-	VkImageMemoryBarrier pre_barriers[2] = {
+	// Pre-barriers: sources GENERAL->TRANSFER_SRC, SBS dest UNDEFINED->TRANSFER_DST
+	VkImageMemoryBarrier pre_barriers[3] = {
 	    {
 	        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
 	        .srcAccessMask = 0,
 	        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
 	        .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
 	        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-	        .image = src_image,
-	        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	        .image = left_src,
+	        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, left_array_index, 1},
+	    },
+	    {
+	        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	        .srcAccessMask = 0,
+	        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+	        .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+	        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	        .image = right_src,
+	        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, right_array_index, 1},
 	    },
 	    {
 	        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -1421,39 +1433,52 @@ session_blit_flip_eye(struct vk_bundle *vk,
 	        .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
 	        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
 	        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-	        .image = dst_image,
+	        .image = sbs_dst,
 	        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
 	    },
 	};
 	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL,
-	                         0, NULL, 2, pre_barriers);
+	                         0, NULL, 3, pre_barriers);
 
-	VkImageBlit blit = {
-	    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, array_index, 1},
-	    .srcOffsets =
-	        {
-	            {0, height, 0},
-	            {width, 0, 1},
-	        },
+	// Blit left eye with Y-flip into left half of SBS image [0, eye_width]
+	VkImageBlit left_blit = {
+	    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, left_array_index, 1},
+	    .srcOffsets = {{0, eye_height, 0}, {eye_width, 0, 1}},
 	    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-	    .dstOffsets =
-	        {
-	            {0, 0, 0},
-	            {width, height, 1},
-	        },
+	    .dstOffsets = {{0, 0, 0}, {eye_width, eye_height, 1}},
 	};
-	vk->vkCmdBlitImage(cmd, src_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst_image,
-	                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+	vk->vkCmdBlitImage(cmd, left_src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sbs_dst,
+	                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &left_blit, VK_FILTER_NEAREST);
 
-	VkImageMemoryBarrier post_barriers[2] = {
+	// Blit right eye with Y-flip into right half of SBS image [eye_width, 2*eye_width]
+	VkImageBlit right_blit = {
+	    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, right_array_index, 1},
+	    .srcOffsets = {{0, eye_height, 0}, {eye_width, 0, 1}},
+	    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .dstOffsets = {{eye_width, 0, 0}, {eye_width * 2, eye_height, 1}},
+	};
+	vk->vkCmdBlitImage(cmd, right_src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sbs_dst,
+	                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &right_blit, VK_FILTER_NEAREST);
+
+	// Post-barriers: sources TRANSFER_SRC->GENERAL, SBS dest TRANSFER_DST->SHADER_READ_ONLY
+	VkImageMemoryBarrier post_barriers[3] = {
 	    {
 	        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
 	        .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
 	        .dstAccessMask = 0,
 	        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
 	        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-	        .image = src_image,
-	        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	        .image = left_src,
+	        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, left_array_index, 1},
+	    },
+	    {
+	        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	        .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+	        .dstAccessMask = 0,
+	        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+	        .image = right_src,
+	        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, right_array_index, 1},
 	    },
 	    {
 	        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -1461,12 +1486,12 @@ session_blit_flip_eye(struct vk_bundle *vk,
 	        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
 	        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 	        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-	        .image = dst_image,
+	        .image = sbs_dst,
 	        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
 	    },
 	};
 	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
-	                         NULL, 0, NULL, 2, post_barriers);
+	                         NULL, 0, NULL, 3, post_barriers);
 }
 
 /*!
@@ -1620,19 +1645,21 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 	int weaveHeight = imageHeight;
 
 	if (layer->data.flip_y) {
-		// GL textures need Y-flip: blit into intermediate images with flipped Y.
-		// This also transitions the flip images to SHADER_READ_ONLY_OPTIMAL
-		// (proper barrier for weaver sampling) and returns source to GENERAL.
+		// GL textures need Y-flip: blit both eyes into a single SBS (side-by-side)
+		// image with flipped Y. Left eye at [0,w], right eye at [w,2w].
+		// The SR weaver's SBS mode (stereoViews=1) is triggered by passing
+		// VK_NULL_HANDLE as the right view — this is the default mode used by
+		// the native SR Vulkan example and avoids the separate-texture shader path.
 		if (ensure_session_flip_images(mc, vk, imageWidth, imageHeight, imageFormat)) {
-			session_blit_flip_eye(vk, cmd, leftImage, mc->session_render.flip_images[0], imageWidth,
-			                     imageHeight, leftArrayIndex);
-			session_blit_flip_eye(vk, cmd, rightImage, mc->session_render.flip_images[1], imageWidth,
-			                     imageHeight, rightArrayIndex);
-			weaveLeft = mc->session_render.flip_views[0];
-			weaveRight = mc->session_render.flip_views[1];
-			U_LOG_W("[per-session] Y-flip blit done, using flip views for weaving");
+			session_blit_sbs_flip(vk, cmd, leftImage, leftArrayIndex, rightImage, rightArrayIndex,
+			                     mc->session_render.flip_sbs_image, imageWidth, imageHeight);
+			weaveLeft = mc->session_render.flip_sbs_view;
+			weaveRight = VK_NULL_HANDLE;
+			weaveWidth = imageWidth * 2;
+			U_LOG_W("[per-session] SBS Y-flip blit done, using SBS view (%dx%d) for weaving",
+			        weaveWidth, weaveHeight);
 		} else {
-			U_LOG_W("[per-session] Failed to create flip images, using raw views (will be upside-down)");
+			U_LOG_W("[per-session] Failed to create SBS flip image, using raw views (will be upside-down)");
 		}
 	} else {
 		// Non-GL path: NO layout transitions on shared images.
@@ -1718,10 +1745,22 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 		U_LOG_E("[per-session] Failed to submit per-session render: %s", vk_result_string(ret));
 		return;
 	}
-	mc->session_render.fenced_buffer = (int32_t)buffer_index;
-	U_LOG_W("[per-session] Queue submit succeeded, fenced_buffer=%d", mc->session_render.fenced_buffer);
+	U_LOG_W("[per-session] Queue submit succeeded");
 
-	// Present the image (fence handles GPU sync - no vkQueueWaitIdle needed)
+	// CRITICAL: Wait for GPU work to complete before returning.
+	// With cross-device external memory sharing (null compositor + VK app),
+	// there is no GPU-level synchronization between Device A (compositor) and
+	// Device B (app). Without this wait, the compositor's GPU read of shared
+	// images may still be in-flight when the app starts writing to the same
+	// images for the next frame, causing VK_ERROR_DEVICE_LOST on Intel.
+	// GL apps don't hit this because GL has implicit driver-level sync.
+	ret = vk->vkWaitForFences(vk->device, 1, &mc->session_render.fences[buffer_index], VK_TRUE, UINT64_MAX);
+	if (ret != VK_SUCCESS) {
+		U_LOG_E("[per-session] Failed to wait for render fence: %s", vk_result_string(ret));
+	}
+	mc->session_render.fenced_buffer = -1; // Fence already waited, no deferred wait needed
+
+	// Present the image (GPU work is complete, semaphore already signaled)
 	U_LOG_W("[per-session] Presenting image (buffer_index=%u)...", buffer_index);
 	ret = comp_target_present(ct, vk->main_queue->queue, buffer_index, 0, display_time_ns, 0);
 	if (ret == VK_SUBOPTIMAL_KHR) {

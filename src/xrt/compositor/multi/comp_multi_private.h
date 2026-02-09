@@ -277,12 +277,12 @@ struct multi_compositor
 
 		//! @}
 
-		//! @name Lightweight Y-flip images for GL textures (no full compositing pipeline)
+		//! @name SBS (side-by-side) flip image for GL textures (Y-flip + stereo packing)
 		//! @{
-		VkImage flip_images[2];
-		VkDeviceMemory flip_memories[2];
-		VkImageView flip_views[2];
-		int flip_width;
+		VkImage flip_sbs_image;          //!< Single SBS image (2*eye_width x eye_height)
+		VkDeviceMemory flip_sbs_memory;
+		VkImageView flip_sbs_view;       //!< Full-image view covering both L/R halves
+		int flip_width;                  //!< Per-eye width
 		int flip_height;
 		VkFormat flip_format;
 		bool flip_initialized;

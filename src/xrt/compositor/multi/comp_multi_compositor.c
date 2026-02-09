@@ -1132,18 +1132,16 @@ multi_compositor_destroy(struct xrt_compositor *xc)
 			mc->session_render.composite_initialized = false;
 		}
 
-		// Destroy lightweight flip images (used for GL texture Y-flip before weaving)
+		// Destroy SBS flip image (used for GL texture Y-flip + SBS packing before weaving)
 		if (vk != NULL && mc->session_render.flip_initialized) {
-			for (int i = 0; i < 2; i++) {
-				if (mc->session_render.flip_views[i] != VK_NULL_HANDLE) {
-					vk->vkDestroyImageView(vk->device, mc->session_render.flip_views[i], NULL);
-				}
-				if (mc->session_render.flip_images[i] != VK_NULL_HANDLE) {
-					vk->vkDestroyImage(vk->device, mc->session_render.flip_images[i], NULL);
-				}
-				if (mc->session_render.flip_memories[i] != VK_NULL_HANDLE) {
-					vk->vkFreeMemory(vk->device, mc->session_render.flip_memories[i], NULL);
-				}
+			if (mc->session_render.flip_sbs_view != VK_NULL_HANDLE) {
+				vk->vkDestroyImageView(vk->device, mc->session_render.flip_sbs_view, NULL);
+			}
+			if (mc->session_render.flip_sbs_image != VK_NULL_HANDLE) {
+				vk->vkDestroyImage(vk->device, mc->session_render.flip_sbs_image, NULL);
+			}
+			if (mc->session_render.flip_sbs_memory != VK_NULL_HANDLE) {
+				vk->vkFreeMemory(vk->device, mc->session_render.flip_sbs_memory, NULL);
 			}
 			mc->session_render.flip_initialized = false;
 		}
