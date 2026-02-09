@@ -1340,6 +1340,10 @@ init_client_render_resources(struct d3d11_service_system *sys,
 			res->weaver = nullptr;
 		} else {
 			U_LOG_W("SR weaver created successfully for client");
+			// Configure sRGB conversion: stereo texture contains sRGB-encoded data
+			// (from blit shader gamma encoding), back buffer is UNORM
+			leiasr_d3d11_set_srgb_conversion(res->weaver, true, true);
+			U_LOG_W("SR weaver: configured sRGB conversion (read=true, write=true)");
 		}
 	}
 #endif
