@@ -1340,11 +1340,11 @@ init_client_render_resources(struct d3d11_service_system *sys,
 			res->weaver = nullptr;
 		} else {
 			U_LOG_W("SR weaver created successfully for client");
-			// Don't enable weaver sRGB conversion - the blit shader already handles
-			// gamma encoding with pow(1/2.333) to match SR Hydra's expected input.
-			// Enabling weaver sRGB would cause double conversion.
-			leiasr_d3d11_set_srgb_conversion(res->weaver, false, false);
-			U_LOG_W("SR weaver: sRGB conversion disabled (shader handles gamma)");
+			// Stereo texture contains LINEAR values (SRGB SRV auto-linearizes,
+			// shader passes through without gamma encoding).
+			// Weaver should: read as linear, encode to sRGB on output.
+			leiasr_d3d11_set_srgb_conversion(res->weaver, false, true);
+			U_LOG_W("SR weaver: sRGB conversion (read=false/linear, write=true/encode)");
 		}
 	}
 #endif
@@ -2310,7 +2310,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			        left_is_srgb, (void*)sys->blit_vs.get(),
 			        (void*)sc_left->images[left_index].srv.get(),
 			        (left_is_srgb && sys->blit_vs && sc_left->images[left_index].srv)
-			            ? "SHADER BLIT (gamma encode)" : "COPY (no conversion)");
+			            ? "SHADER BLIT (linear output)" : "COPY (no conversion)");
 			logged_blit_path = true;
 		}
 

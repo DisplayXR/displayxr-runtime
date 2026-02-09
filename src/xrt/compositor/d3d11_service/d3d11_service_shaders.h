@@ -562,13 +562,9 @@ float4 PSMain(VS_OUTPUT input) : SV_Target
 {
     float4 color = src_tex.Sample(src_samp, input.uv);
 
-    // If source was SRGB, the SRV samples as linear (GPU auto-converts).
-    // We need to encode back to sRGB for the non-SRGB stereo texture
-    // so the weaver interprets the values correctly.
-    if (convert_srgb > 0.5)
-    {
-        color.rgb = linear_to_srgb(color.rgb);
-    }
+    // When source is SRGB, the SRV samples as linear (GPU auto-converts).
+    // We pass through linear values - the SR weaver handles sRGB encoding.
+    // (The convert_srgb flag is kept for potential future use but not applied here)
 
     return color;
 }
