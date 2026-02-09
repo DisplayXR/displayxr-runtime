@@ -11,6 +11,7 @@
 #   sr_cube_openxr_ext_d3d12 - D3D12 port of sr_cube_openxr_ext
 #   sr_cube_openxr_ext_gl  - OpenGL port of sr_cube_openxr_ext
 #   sr_cube_openxr_ext_vk  - Vulkan port of sr_cube_openxr_ext (requires Vulkan SDK)
+#   sr_cube_native_vk      - Native SR SDK Vulkan (no OpenXR) - requires LeiaSR SDK + Vulkan SDK
 
 cmake_minimum_required(VERSION 3.21)
 project(test_apps LANGUAGES CXX)
@@ -23,6 +24,9 @@ endif()
 
 # Build sr_cube_native (requires LeiaSR SDK for full functionality)
 add_subdirectory(sr_cube_native)
+
+# Build sr_cube_native_vk (requires LeiaSR SDK + Vulkan SDK)
+add_subdirectory(sr_cube_native_vk)
 
 # Build OpenXR test apps (require OpenXR loader)
 if(OpenXR_FOUND OR DEFINED OpenXR_ROOT)

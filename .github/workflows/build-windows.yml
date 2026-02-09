@@ -374,6 +374,71 @@ jobs:
             test_apps/sr_cube_native/build/sr_cube_native.exe
             test_apps/sr_cube_native/build/*.dll
 
+  # Native SR SDK Vulkan app (no OpenXR) - Direct LeiaSR SDK + Vulkan weaver
+  TestAppNativeVulkan:
+    if: true  # <-- Change to 'false' to disable
+    runs-on: windows-2022
+
+    env:
+      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
+      SR_TAG: 1.35.0.2011
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
+          submodules: recursive
+
+      - name: Download Simulated Reality SDK
+        run: |
+          gh release download -R LeiaInc/SR-SDK-Windows-Releases-Internal-Public $env:SR_TAG -p LeiaSR-SDK-$env:SR_TAG-win64.zip -D .
+          tar -xf LeiaSR-SDK-$env:SR_TAG-win64.zip -C .
+          gh release download -R LeiaInc/SR-SDK-Windows-Releases-Internal-Public $env:SR_TAG -p SimulatedRealityVulkanBeta.lib -D LeiaSR-SDK-$env:SR_TAG-win64/lib
+          gh release download -R LeiaInc/SR-SDK-Windows-Releases-Internal-Public $env:SR_TAG -p vkweaver.h -D LeiaSR-SDK-$env:SR_TAG-win64/include/sr/weaver
+          Write-Host "SR SDK contents:"
+          Get-ChildItem -Recurse LeiaSR-SDK-$env:SR_TAG-win64 | Select-Object FullName
+
+      - name: Install Vulkan SDK
+        uses: humbletim/install-vulkan-sdk@v1.2
+        with:
+          version: 1.3.283.0
+          cache: true
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build native Vulkan SR test app (sr_cube_native_vk)
+        env:
+          LEIASR_SDKROOT: ${{ github.workspace }}/LeiaSR-SDK-${{ env.SR_TAG }}-win64
+        run: |
+          cd test_apps/sr_cube_native_vk
+          cmake -S . -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_PREFIX_PATH="${{ github.workspace }}/LeiaSR-SDK-$env:SR_TAG-win64"
+          cmake --build build
+
+      - name: Copy required DLLs
+        run: |
+          # Copy SR SDK DLLs
+          $srSdkBin = "${{ github.workspace }}/LeiaSR-SDK-$env:SR_TAG-win64/bin"
+          if (Test-Path $srSdkBin) {
+            Get-ChildItem -Path $srSdkBin -Filter "*.dll" | ForEach-Object {
+              Copy-Item $_.FullName -Destination test_apps/sr_cube_native_vk/build/
+              Write-Host "Copied $($_.Name)"
+            }
+          }
+
+      - name: Upload native Vulkan SR test app
+        uses: actions/upload-artifact@v4
+        with:
+          name: SRCubeNativeVK
+          if-no-files-found: error
+          path: |
+            test_apps/sr_cube_native_vk/build/sr_cube_native_vk.exe
+            test_apps/sr_cube_native_vk/build/*.dll
+
   # D3D11 test app WITHOUT session_target extension - Standard OpenXR app
   TestAppStandard:
     if: true  # <-- Change to 'false' to disable
@@ -624,7 +689,7 @@ jobs:
   BundleTestApps:
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
-    needs: [TestAppSessionTarget, TestAppNative, TestAppStandard, TestAppD3D12, TestAppOpenGL, TestAppVulkan]
+    needs: [TestAppSessionTarget, TestAppNative, TestAppNativeVulkan, TestAppStandard, TestAppD3D12, TestAppOpenGL, TestAppVulkan]
 
     steps:
       - name: Download all test app artifacts
@@ -652,6 +717,7 @@ jobs:
           name: |
             SRCubeOpenXRExt
             SRCubeNative
+            SRCubeNativeVK
             SRCubeOpenXR
             SRCubeOpenXRExtD3D12
             SRCubeOpenXRExtGL
