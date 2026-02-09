@@ -18,6 +18,7 @@
 #include <windows.h>
 #include <sysinfoapi.h>
 
+#include <cstdlib>
 #include <mutex>
 #include <iostream>
 
@@ -41,6 +42,15 @@ struct leiasr
 	float display_width_m = 0.0f;
 	float display_height_m = 0.0f;
 	bool display_dims_valid = false;
+
+	// Display screen position (for diagnostic logging)
+	int32_t display_screen_left = 0;
+	int32_t display_screen_top = 0;
+	int32_t display_screen_right = 0;
+	int32_t display_screen_bottom = 0;
+
+	// Window handle (stored for diagnostic position queries)
+	HWND windowHandle = nullptr;
 
 	// Thread-safe eye position storage (for getPredictedEyePositions)
 	std::mutex eyeMutex;
@@ -110,10 +120,19 @@ CreateSRContext(double maxTime, leiasr &sr)
 				sr.display_height_m = raw_height_cm / 100.0f;
 				sr.display_dims_valid = true;
 
+				// Cache display screen position for diagnostic logging
+				sr.display_screen_left = (int32_t)displayLocation.left;
+				sr.display_screen_top = (int32_t)displayLocation.top;
+				sr.display_screen_right = (int32_t)displayLocation.right;
+				sr.display_screen_bottom = (int32_t)displayLocation.bottom;
+
 				U_LOG_W("SR display (modern API): %ldx%ld px, physical %.2fcm x %.2fcm = %.4fm x %.4fm",
 				        (long)width, (long)height,
 				        raw_width_cm, raw_height_cm,
 				        sr.display_width_m, sr.display_height_m);
+				U_LOG_W("SR display screen position: left=%d top=%d right=%d bottom=%d",
+				        sr.display_screen_left, sr.display_screen_top,
+				        sr.display_screen_right, sr.display_screen_bottom);
 
 				break;
 			}
@@ -191,9 +210,18 @@ leiasr_create(double maxTime,
 	sr->commandPool = commandPool;
 	sr->graphicsQueue = graphicsQueue;
 	sr->device = device;
+	sr->windowHandle = (HWND)windowHandle;
+
+	// Check for fullscreen weaver override (diagnostic: bypass windowed mode)
+	HWND weaverHwnd = (HWND)windowHandle;
+	const char *fullscreen_env = getenv("SR_VK_FULLSCREEN_WEAVER");
+	if (fullscreen_env != nullptr && fullscreen_env[0] == '1') {
+		U_LOG_W("SR_VK_FULLSCREEN_WEAVER=1: forcing NULL HWND (fullscreen weaver mode)");
+		weaverHwnd = NULL;
+	}
 
 	// Pass windowHandle to CreateSRWeaver: NULL = fullscreen mode, valid HWND = windowed mode
-	if (!CreateSRWeaver(sr->context, device, physicalDevice, graphicsQueue, commandPool, (HWND)windowHandle, sr)) {
+	if (!CreateSRWeaver(sr->context, device, physicalDevice, graphicsQueue, commandPool, weaverHwnd, sr)) {
 		U_LOG_E("Failed to create SR weaver");
 		delete sr;
 		return XRT_ERROR_VULKAN;
@@ -203,7 +231,7 @@ leiasr_create(double maxTime,
 
 	*out = sr;
 
-	U_LOG_I("Created leiasr instance with weaver for HWND %p", windowHandle);
+	U_LOG_W("Created leiasr instance with weaver for HWND %p (weaver HWND %p)", windowHandle, (void *)weaverHwnd);
 
 	return XRT_SUCCESS;
 }
@@ -375,6 +403,60 @@ leiasr_get_display_dimensions(struct leiasr *leiasr, struct leiasr_display_dimen
 	out_dims->valid = true;
 
 	return true;
+}
+
+void
+leiasr_log_window_diagnostics(struct leiasr *leiasr, void *windowHandle)
+{
+	if (leiasr == nullptr || windowHandle == nullptr) {
+		return;
+	}
+
+	HWND hwnd = (HWND)windowHandle;
+
+	// Get window client area in screen coordinates
+	RECT clientRect;
+	GetClientRect(hwnd, &clientRect);
+	POINT clientTopLeft = {clientRect.left, clientRect.top};
+	POINT clientBottomRight = {clientRect.right, clientRect.bottom};
+	ClientToScreen(hwnd, &clientTopLeft);
+	ClientToScreen(hwnd, &clientBottomRight);
+
+	int clientW = clientBottomRight.x - clientTopLeft.x;
+	int clientH = clientBottomRight.y - clientTopLeft.y;
+
+	// Compute window position relative to SR display
+	int winOnDisplayX = clientTopLeft.x - leiasr->display_screen_left;
+	int winOnDisplayY = clientTopLeft.y - leiasr->display_screen_top;
+
+	// Get window rect (includes non-client area for comparison)
+	RECT windowRect;
+	GetWindowRect(hwnd, &windowRect);
+
+	// Check DPI awareness
+	UINT dpiX = 96, dpiY = 96;
+	HDC hdc = GetDC(hwnd);
+	if (hdc) {
+		dpiX = GetDeviceCaps(hdc, LOGPIXELSX);
+		dpiY = GetDeviceCaps(hdc, LOGPIXELSY);
+		ReleaseDC(hwnd, hdc);
+	}
+
+	U_LOG_W("[diag] Window HWND=%p", windowHandle);
+	U_LOG_W("[diag] Client area screen pos: (%d, %d) to (%d, %d) = %dx%d",
+	        (int)clientTopLeft.x, (int)clientTopLeft.y,
+	        (int)clientBottomRight.x, (int)clientBottomRight.y,
+	        clientW, clientH);
+	U_LOG_W("[diag] Window rect (incl borders): (%d, %d) to (%d, %d) = %dx%d",
+	        (int)windowRect.left, (int)windowRect.top,
+	        (int)windowRect.right, (int)windowRect.bottom,
+	        (int)(windowRect.right - windowRect.left),
+	        (int)(windowRect.bottom - windowRect.top));
+	U_LOG_W("[diag] SR display rect: (%d, %d) to (%d, %d)",
+	        leiasr->display_screen_left, leiasr->display_screen_top,
+	        leiasr->display_screen_right, leiasr->display_screen_bottom);
+	U_LOG_W("[diag] Window on SR display: (%d, %d), DPI: %ux%u (scale=%.1f%%)",
+	        winOnDisplayX, winOnDisplayY, dpiX, dpiY, dpiX * 100.0f / 96.0f);
 }
 
 } // extern "C"
