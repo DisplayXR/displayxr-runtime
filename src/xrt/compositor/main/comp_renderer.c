@@ -35,6 +35,7 @@
 
 #include "main/comp_frame.h"
 #include "main/comp_mirror_to_debug_gui.h"
+#include "main/comp_window.h"
 
 #ifdef XRT_OS_ANDROID
 #include "android/android_globals.h"
@@ -478,6 +479,14 @@ renderer_ensure_images_and_renderings(struct comp_renderer *r, bool force_recrea
 	if (!create) {
 		return true;
 	}
+
+#ifdef XRT_OS_WINDOWS
+	// Don't force-recreate swapchain during drag — causes stutter from
+	// per-pixel texture reallocation. The existing swapchain stretches fine.
+	if (force_recreate && comp_window_mswin_is_in_size_move(c->target)) {
+		return comp_target_has_images(target) && (r->buffer_count > 0);
+	}
+#endif
 
 	COMP_DEBUG(c, "Creating images and renderings (force_recreate: %s).", force_recreate ? "true" : "false");
 
@@ -1364,6 +1373,15 @@ comp_renderer_draw(struct comp_renderer *r)
 	// Tell the target we are starting to render, for frame timing.
 	comp_target_mark_begin(ct, c->frame.rendering.id, os_monotonic_get_ns());
 
+#ifdef XRT_OS_WINDOWS
+	// During window drag, synchronize with the window thread's WM_PAINT cycle.
+	// This ensures the window position is stable between weave() and Present(),
+	// keeping the SR interlacing pattern aligned with the display position.
+	if (comp_window_mswin_is_in_size_move(ct)) {
+		comp_window_mswin_wait_for_paint(ct);
+	}
+#endif
+
 	// Are we ready to render? No - skip rendering.
 	if (!comp_target_check_ready(r->c->target)) {
 		// Need to emulate rendering for the timing.
@@ -1457,6 +1475,11 @@ comp_renderer_draw(struct comp_renderer *r)
 
 	renderer_present_swapchain_image(r, c->frame.rendering.desired_present_time_ns,
 	                                 c->frame.rendering.present_slop_ns);
+
+#ifdef XRT_OS_WINDOWS
+	// Signal the WM_PAINT handler that rendering is done, unblocking the modal drag loop.
+	comp_window_mswin_signal_paint_done(ct);
+#endif
 
 	// Save for timestamps below.
 	uint64_t frame_id = c->frame.rendering.id;

@@ -56,6 +56,13 @@ struct comp_window_mswin
 
 	//! Current fullscreen state (for F11 toggle)
 	bool is_fullscreen;
+
+	//! TRUE between WM_ENTERSIZEMOVE and WM_EXITSIZEMOVE (drag/resize modal loop)
+	volatile LONG in_size_move;
+	//! Auto-reset event: window thread signals when WM_PAINT fires during drag
+	HANDLE paint_requested_event;
+	//! Auto-reset event: compositor signals when rendering is done during drag
+	HANDLE paint_done_event;
 };
 
 static WCHAR szWindowClass[] = L"Monado";
@@ -100,10 +107,29 @@ WndProc(HWND hWnd, unsigned int message, WPARAM wParam, LPARAM lParam)
 	}
 	struct comp_compositor *c = cwm->base.base.c;
 	switch (message) {
+	case WM_ENTERSIZEMOVE:
+		InterlockedExchange(&cwm->in_size_move, TRUE);
+		InvalidateRect(hWnd, NULL, FALSE);  // Kick off first WM_PAINT
+		return 0;
+
+	case WM_EXITSIZEMOVE:
+		InterlockedExchange(&cwm->in_size_move, FALSE);
+		if (cwm->paint_requested_event)
+			SetEvent(cwm->paint_requested_event);  // Unblock compositor if waiting
+		return 0;
+
 	case WM_PAINT:
-		// COMP_INFO(c, "WM_PAINT");
+		if (cwm->owns_window && InterlockedCompareExchange(&cwm->in_size_move, 0, 0)) {
+			// During drag: signal compositor to render, wait for completion.
+			// The modal loop is paused while we wait, so window position is stable.
+			SetEvent(cwm->paint_requested_event);
+			WaitForSingleObject(cwm->paint_done_event, 100);  // 100ms timeout prevents deadlock
+			InvalidateRect(hWnd, NULL, FALSE);  // Request next WM_PAINT
+			return 0;  // Don't validate — keeps window "dirty" for continuous paint
+		}
 		draw_window(hWnd, cwm);
 		break;
+
 	case WM_QUIT:
 		// COMP_INFO(c, "WM_QUIT");
 		PostQuitMessage(0);
@@ -158,6 +184,12 @@ comp_window_mswin_destroy(struct comp_target *ct)
 		// Stop the Windows thread first, destroy also stops the thread.
 		os_thread_helper_destroy(&cwm->oth);
 	}
+
+	// Cleanup drag/resize sync events
+	if (cwm->paint_requested_event)
+		CloseHandle(cwm->paint_requested_event);
+	if (cwm->paint_done_event)
+		CloseHandle(cwm->paint_done_event);
 
 	comp_target_swapchain_cleanup(&cwm->base);
 
@@ -545,6 +577,10 @@ comp_window_mswin_create(struct comp_compositor *c)
 	w->base.base.c = c;
 	w->owns_window = true;  // We create and own the window
 
+	// Create synchronization events for drag/resize rendering
+	w->paint_requested_event = CreateEvent(NULL, FALSE, FALSE, NULL);  // Auto-reset
+	w->paint_done_event = CreateEvent(NULL, FALSE, FALSE, NULL);       // Auto-reset
+
 	return &w->base.base;
 }
 
@@ -599,6 +635,49 @@ comp_window_mswin_create_from_external(struct comp_compositor *c,
 
 	*out_ct = &cwm->base.base;
 	return true;
+}
+
+
+/*
+ *
+ * Drag/resize synchronization functions.
+ *
+ */
+
+bool
+comp_window_mswin_is_in_size_move(struct comp_target *ct)
+{
+	// Safety: check name prefix to verify this is a mswin target
+	if (ct == NULL || ct->name == NULL || strncmp(ct->name, "MS Windows", 10) != 0)
+		return false;
+	struct comp_window_mswin *cwm = (struct comp_window_mswin *)ct;
+	if (!cwm->owns_window)
+		return false;  // App-owned windows don't use runtime sync
+	return InterlockedCompareExchange(&cwm->in_size_move, 0, 0) != 0;
+}
+
+bool
+comp_window_mswin_wait_for_paint(struct comp_target *ct)
+{
+	if (ct == NULL || ct->name == NULL || strncmp(ct->name, "MS Windows", 10) != 0)
+		return false;
+	struct comp_window_mswin *cwm = (struct comp_window_mswin *)ct;
+	if (!cwm->owns_window || !cwm->paint_requested_event)
+		return false;
+	if (!InterlockedCompareExchange(&cwm->in_size_move, 0, 0))
+		return false;  // Not in drag
+	WaitForSingleObject(cwm->paint_requested_event, 50);  // 50ms timeout
+	return InterlockedCompareExchange(&cwm->in_size_move, 0, 0) != 0;
+}
+
+void
+comp_window_mswin_signal_paint_done(struct comp_target *ct)
+{
+	if (ct == NULL || ct->name == NULL || strncmp(ct->name, "MS Windows", 10) != 0)
+		return;
+	struct comp_window_mswin *cwm = (struct comp_window_mswin *)ct;
+	if (cwm->paint_done_event)
+		SetEvent(cwm->paint_done_event);
 }
 
 

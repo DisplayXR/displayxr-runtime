@@ -154,6 +154,27 @@ comp_window_mswin_create_from_external(struct comp_compositor *c,
                                        struct comp_target **out_ct);
 
 extern const struct comp_target_factory comp_target_factory_mswin;
+
+/*!
+ * Check if the Vulkan window is in a modal drag/resize loop.
+ * Returns false for non-mswin targets or app-owned windows.
+ */
+bool
+comp_window_mswin_is_in_size_move(struct comp_target *ct);
+
+/*!
+ * Wait for WM_PAINT during drag (blocks up to 50ms).
+ * Returns true if drag is active and compositor should render.
+ */
+bool
+comp_window_mswin_wait_for_paint(struct comp_target *ct);
+
+/*!
+ * Signal that rendering is complete, unblocking the WM_PAINT handler.
+ */
+void
+comp_window_mswin_signal_paint_done(struct comp_target *ct);
+
 #endif // XRT_OS_WINDOWS
 
 #ifdef __cplusplus

@@ -1523,6 +1523,13 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 	}
 
 	// Recreate swapchain if flagged (from previous frame's VK_SUBOPTIMAL_KHR)
+#ifdef XRT_OS_WINDOWS
+	if (mc->session_render.swapchain_needs_recreate &&
+	    mc->session_render.owns_window && mc->session_render.own_window != NULL &&
+	    comp_d3d11_window_is_in_size_move(mc->session_render.own_window)) {
+		// Defer recreation until drag ends — avoids stutter from texture reallocation
+	} else
+#endif
 	if (mc->session_render.swapchain_needs_recreate) {
 		recreate_session_swapchain(mc, vk);
 		// Re-read ct since create_images updates it in place
@@ -1587,6 +1594,14 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 		}
 		mc->session_render.fenced_buffer = -1;
 	}
+
+#ifdef XRT_OS_WINDOWS
+	// During drag of self-owned window, synchronize with WM_PAINT cycle.
+	if (mc->session_render.owns_window && mc->session_render.own_window != NULL &&
+	    comp_d3d11_window_is_in_size_move(mc->session_render.own_window)) {
+		comp_d3d11_window_wait_for_paint(mc->session_render.own_window);
+	}
+#endif
 
 	// Acquire the next swapchain image from the per-session target
 	U_LOG_W("[per-session] Acquiring target swapchain image...");
@@ -1786,6 +1801,13 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 	} else if (ret != VK_SUCCESS) {
 		U_LOG_E("[per-session] Failed to present per-session target: %s", vk_result_string(ret));
 	}
+#ifdef XRT_OS_WINDOWS
+	// Signal WM_PAINT handler that frame is done
+	if (mc->session_render.owns_window && mc->session_render.own_window != NULL) {
+		comp_d3d11_window_signal_paint_done(mc->session_render.own_window);
+	}
+#endif
+
 	U_LOG_W("[per-session] render_session_to_own_target: END (present result=%d)", ret);
 }
 
