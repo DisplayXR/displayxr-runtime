@@ -1607,9 +1607,20 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 	U_LOG_W("[per-session] Acquiring target swapchain image...");
 	uint32_t buffer_index = 0;
 	VkResult ret = comp_target_acquire(ct, &buffer_index);
-	if (ret == VK_SUBOPTIMAL_KHR) {
-		U_LOG_W("[per-session] Swapchain suboptimal (window resized?), flagging for recreation");
-		mc->session_render.swapchain_needs_recreate = true;
+	if (ret == VK_ERROR_OUT_OF_DATE_KHR || ret == VK_SUBOPTIMAL_KHR) {
+		U_LOG_W("[per-session] Swapchain out of date/suboptimal (%s), recreating now",
+		        vk_result_string(ret));
+		recreate_session_swapchain(mc, vk);
+		ct = mc->session_render.target;
+		mc->session_render.swapchain_needs_recreate = false;
+
+		// Retry acquire after recreation
+		ret = comp_target_acquire(ct, &buffer_index);
+		if (ret != VK_SUCCESS) {
+			U_LOG_E("[per-session] Failed to acquire after swapchain recreation: %s",
+			        vk_result_string(ret));
+			return;
+		}
 	} else if (ret != VK_SUCCESS) {
 		U_LOG_E("[per-session] Failed to acquire per-session target image: %s", vk_result_string(ret));
 		return;
@@ -1795,8 +1806,9 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 	// Present the image (GPU work is complete, semaphore already signaled)
 	U_LOG_W("[per-session] Presenting image (buffer_index=%u)...", buffer_index);
 	ret = comp_target_present(ct, vk->main_queue->queue, buffer_index, 0, display_time_ns, 0);
-	if (ret == VK_SUBOPTIMAL_KHR) {
-		U_LOG_W("[per-session] Present returned suboptimal, flagging for recreation");
+	if (ret == VK_ERROR_OUT_OF_DATE_KHR || ret == VK_SUBOPTIMAL_KHR) {
+		U_LOG_W("[per-session] Present returned %s, flagging for recreation",
+		        vk_result_string(ret));
 		mc->session_render.swapchain_needs_recreate = true;
 	} else if (ret != VK_SUCCESS) {
 		U_LOG_E("[per-session] Failed to present per-session target: %s", vk_result_string(ret));
