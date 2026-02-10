@@ -374,7 +374,11 @@ static void RenderThreadFunc(
                                 uint32_t srcRowPitch = 0;
                                 const void* pixels = RenderHudAndMap(*hud, &srcRowPitch,
                                     sessionText, modeText, perfText, eyeText);
+                                bool uploadOk = false;
                                 if (pixels) {
+                                    // Clear any prior GL errors
+                                    while (glGetError() != GL_NO_ERROR) {}
+
                                     GLuint hudTexId = (*hudSwapchainImages)[hudImageIndex].image;
                                     glBindTexture(GL_TEXTURE_2D, hudTexId);
                                     if (srcRowPitch == hudWidth * 4) {
@@ -387,20 +391,38 @@ static void RenderThreadFunc(
                                                 GL_RGBA, GL_UNSIGNED_BYTE, src + row * srcRowPitch);
                                         }
                                     }
+                                    // Force GL to flush and check for errors
+                                    glFlush();
+                                    GLenum glErr = glGetError();
                                     glBindTexture(GL_TEXTURE_2D, 0);
                                     UnmapHud(*hud);
+
+                                    if (glErr != GL_NO_ERROR) {
+                                        LOG_WARN("[HUD] glTexSubImage2D error 0x%X on HUD swapchain texture %u — skipping HUD layer",
+                                            glErr, hudTexId);
+                                    } else {
+                                        uploadOk = true;
+                                    }
                                 }
 
-                                ReleaseHudSwapchainImage(*xr);
-                                hudSubmitted = true;
+                                bool releaseOk = ReleaseHudSwapchainImage(*xr);
+                                if (!releaseOk) {
+                                    LOG_WARN("[HUD] ReleaseHudSwapchainImage failed — skipping HUD layer");
+                                }
+                                hudSubmitted = uploadOk && releaseOk;
                             }
                         }
                     }
                 }
 
                 if (hudSubmitted) {
-                    EndFrameWithWindowSpaceHud(*xr, frameState.predictedDisplayTime, projectionViews,
-                        0.0f, 0.0f, HUD_WIDTH_FRACTION, HUD_HEIGHT_FRACTION, 0.0f);
+                    LOG_DEBUG("[Frame] Submitting EndFrame with HUD (layerCount=2)");
+                    if (!EndFrameWithWindowSpaceHud(*xr, frameState.predictedDisplayTime, projectionViews,
+                        0.0f, 0.0f, HUD_WIDTH_FRACTION, HUD_HEIGHT_FRACTION, 0.0f)) {
+                        LOG_WARN("[Frame] EndFrameWithWindowSpaceHud FAILED — disabling HUD for this session");
+                        hud = nullptr;  // Disable HUD for subsequent frames
+                    }
+                    LOG_DEBUG("[Frame] EndFrame with HUD returned");
                 } else {
                     EndFrame(*xr, frameState.predictedDisplayTime, projectionViews);
                 }
