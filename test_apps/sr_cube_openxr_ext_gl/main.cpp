@@ -4,7 +4,7 @@
  * @file
  * @brief  SR Cube OpenXR Ext GL - OpenXR with XR_EXT_session_target (OpenGL)
  *
- * OpenGL port of sr_cube_openxr_ext. Projection layer only, no HUD/quad layer.
+ * OpenGL port of sr_cube_openxr_ext. Projection layer + window-space HUD overlay.
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -16,6 +16,8 @@
 #include "input_handler.h"
 #include "xr_session.h"
 #include "gl_renderer.h"
+#include "hud_renderer.h"
+#include "text_overlay.h"
 
 #include <atomic>
 #include <string>
@@ -27,6 +29,10 @@
 using namespace DirectX;
 
 static const char* APP_NAME = "sr_cube_openxr_ext_gl";
+
+// HUD overlay size as fraction of window dimensions (for window-space layer)
+static const float HUD_WIDTH_FRACTION = 0.30f;
+static const float HUD_HEIGHT_FRACTION = 0.35f;
 
 static const wchar_t* WINDOW_CLASS = L"SRCubeOpenXRExtGLClass";
 static const wchar_t* WINDOW_TITLE = L"SR Cube OpenXR Ext OpenGL (Press ESC to exit)";
@@ -234,7 +240,11 @@ static void RenderThreadFunc(
     HGLRC hGLRC,
     XrSessionManager* xr,
     GLRenderer* renderer,
-    std::vector<XrSwapchainImageOpenGLKHR>* swapchainImages)
+    std::vector<XrSwapchainImageOpenGLKHR>* swapchainImages,
+    HudRenderer* hud,
+    uint32_t hudWidth,
+    uint32_t hudHeight,
+    std::vector<XrSwapchainImageOpenGLKHR>* hudSwapchainImages)
 {
     LOG_INFO("[RenderThread] Started");
 
@@ -250,12 +260,15 @@ static void RenderThreadFunc(
     while (g_running.load() && !xr->exitRequested) {
         InputState inputSnapshot;
         bool resetRequested = false;
+        uint32_t windowW, windowH;
         {
             std::lock_guard<std::mutex> lock(g_inputMutex);
             inputSnapshot = g_inputState;
             resetRequested = g_inputState.resetViewRequested;
             g_inputState.resetViewRequested = false;
             g_inputState.fullscreenToggleRequested = false;
+            windowW = g_windowWidth;
+            windowH = g_windowHeight;
         }
 
         UpdatePerformanceStats(perfStats);
@@ -280,6 +293,8 @@ static void RenderThreadFunc(
             XrFrameState frameState;
             if (BeginFrame(*xr, frameState)) {
                 XrCompositionLayerProjectionView projectionViews[2] = {};
+                bool rendered = false;
+                bool hudSubmitted = false;
 
                 if (frameState.shouldRender) {
                     XMMATRIX leftViewMatrix, leftProjMatrix;
@@ -302,6 +317,11 @@ static void RenderThreadFunc(
                         XrView rawViews[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
                         xrLocateViews(xr->session, &locateInfo, &viewState, 2, &viewCount, rawViews);
 
+                        // Use recommended render dimensions (updated by dynamic resolution events)
+                        uint32_t renderW = xr->recommendedRenderWidth;
+                        uint32_t renderH = xr->recommendedRenderHeight;
+
+                        rendered = true;
                         for (int eye = 0; eye < 2; eye++) {
                             uint32_t imageIndex;
                             if (AcquireSwapchainImage(*xr, eye, imageIndex)) {
@@ -309,7 +329,7 @@ static void RenderThreadFunc(
                                 XMMATRIX projMatrix = (eye == 0) ? leftProjMatrix : rightProjMatrix;
 
                                 RenderScene(*renderer, eye, imageIndex,
-                                    xr->swapchains[eye].width, xr->swapchains[eye].height,
+                                    renderW, renderH,
                                     viewMatrix, projMatrix,
                                     inputSnapshot.zoomScale);
 
@@ -319,18 +339,65 @@ static void RenderThreadFunc(
                                 projectionViews[eye].subImage.swapchain = xr->swapchains[eye].swapchain;
                                 projectionViews[eye].subImage.imageRect.offset = {0, 0};
                                 projectionViews[eye].subImage.imageRect.extent = {
-                                    (int32_t)xr->swapchains[eye].width,
-                                    (int32_t)xr->swapchains[eye].height
+                                    (int32_t)renderW,
+                                    (int32_t)renderH
                                 };
                                 projectionViews[eye].subImage.imageArrayIndex = 0;
                                 projectionViews[eye].pose = rawViews[eye].pose;
                                 projectionViews[eye].fov = rawViews[eye].fov;
+                            } else {
+                                rendered = false;
+                            }
+                        }
+
+                        // Render HUD to window-space layer swapchain
+                        if (rendered && inputSnapshot.hudVisible && hud && xr->hasHudSwapchain && hudSwapchainImages) {
+                            uint32_t hudImageIndex;
+                            if (AcquireHudSwapchainImage(*xr, hudImageIndex)) {
+                                std::wstring sessionText = L"Session: ";
+                                sessionText += FormatSessionState((int)xr->sessionState);
+                                std::wstring modeText = xr->hasSessionTargetExt ?
+                                    L"XR_EXT_session_target: ACTIVE (OpenGL)" :
+                                    L"XR_EXT_session_target: NOT AVAILABLE (OpenGL)";
+                                std::wstring perfText = FormatPerformanceInfo(perfStats.fps, perfStats.frameTimeMs,
+                                    xr->recommendedRenderWidth, xr->recommendedRenderHeight,
+                                    windowW, windowH);
+                                std::wstring eyeText = FormatEyeTrackingInfo(
+                                    xr->eyePosX, xr->eyePosY, xr->eyePosZ, xr->eyeTrackingActive);
+
+                                uint32_t srcRowPitch = 0;
+                                const void* pixels = RenderHudAndMap(*hud, &srcRowPitch,
+                                    sessionText, modeText, perfText, eyeText);
+                                if (pixels) {
+                                    GLuint hudTexId = (*hudSwapchainImages)[hudImageIndex].image;
+                                    glBindTexture(GL_TEXTURE_2D, hudTexId);
+                                    if (srcRowPitch == hudWidth * 4) {
+                                        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, hudWidth, hudHeight,
+                                            GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+                                    } else {
+                                        const uint8_t* src = (const uint8_t*)pixels;
+                                        for (uint32_t row = 0; row < hudHeight; row++) {
+                                            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, row, hudWidth, 1,
+                                                GL_RGBA, GL_UNSIGNED_BYTE, src + row * srcRowPitch);
+                                        }
+                                    }
+                                    glBindTexture(GL_TEXTURE_2D, 0);
+                                    UnmapHud(*hud);
+                                }
+
+                                ReleaseHudSwapchainImage(*xr);
+                                hudSubmitted = true;
                             }
                         }
                     }
                 }
 
-                EndFrame(*xr, frameState.predictedDisplayTime, projectionViews);
+                if (hudSubmitted) {
+                    EndFrameWithWindowSpaceHud(*xr, frameState.predictedDisplayTime, projectionViews,
+                        0.0f, 0.0f, HUD_WIDTH_FRACTION, HUD_HEIGHT_FRACTION, 0.0f);
+                } else {
+                    EndFrame(*xr, frameState.predictedDisplayTime, projectionViews);
+                }
             }
         } else {
             Sleep(100);
@@ -485,6 +552,31 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         }
     }
 
+    // Initialize HUD renderer for window-space layer overlay
+    uint32_t hudWidth = (uint32_t)(xr.swapchains[0].width * HUD_WIDTH_FRACTION);
+    uint32_t hudHeight = (uint32_t)(xr.swapchains[0].height * HUD_HEIGHT_FRACTION);
+
+    HudRenderer hudRenderer = {};
+    bool hudOk = InitializeHudRenderer(hudRenderer, hudWidth, hudHeight);
+    if (!hudOk) {
+        LOG_WARN("HUD renderer init failed - HUD will not be displayed");
+    }
+
+    // Create HUD swapchain for window-space layer submission
+    std::vector<XrSwapchainImageOpenGLKHR> hudSwapImages;
+    if (hudOk) {
+        if (CreateHudSwapchain(xr, hudWidth, hudHeight)) {
+            uint32_t count = xr.hudSwapchain.imageCount;
+            hudSwapImages.resize(count, {XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_KHR});
+            xrEnumerateSwapchainImages(xr.hudSwapchain.swapchain, count, &count,
+                (XrSwapchainImageBaseHeader*)hudSwapImages.data());
+            LOG_INFO("HUD swapchain: enumerated %u OpenGL images", count);
+        } else {
+            LOG_WARN("HUD swapchain creation failed - HUD will not be displayed");
+            hudOk = false;
+        }
+    }
+
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
 
@@ -497,7 +589,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     wglMakeCurrent(nullptr, nullptr);
 
     std::thread renderThread(RenderThreadFunc, hwnd, hDC, hGLRC, &xr, &glRenderer,
-        swapchainImages);
+        swapchainImages,
+        hudOk ? &hudRenderer : nullptr, hudWidth, hudHeight,
+        hudOk ? &hudSwapImages : nullptr);
 
     MSG msg = {};
     while (GetMessage(&msg, nullptr, 0, 0) > 0) {
@@ -516,6 +610,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     // Re-acquire GL context for cleanup
     wglMakeCurrent(hDC, hGLRC);
 
+    if (hudOk) CleanupHudRenderer(hudRenderer);
     CleanupGLRenderer(glRenderer);
     CleanupOpenXR(xr);
 
