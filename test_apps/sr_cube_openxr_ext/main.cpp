@@ -90,6 +90,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     UpdateInputState(g_inputState, msg, wParam, lParam);
 
     switch (msg) {
+    case WM_LBUTTONDOWN:
+        SetCapture(hwnd);
+        return 0;
+
+    case WM_LBUTTONUP:
+        ReleaseCapture();
+        return 0;
+
     case WM_SIZE:
         if (wParam != SIZE_MINIMIZED) {
             g_windowWidth = LOWORD(lParam);

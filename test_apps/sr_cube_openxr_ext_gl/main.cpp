@@ -45,6 +45,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
 
     switch (msg) {
+    case WM_LBUTTONDOWN:
+        SetCapture(hwnd);  // Outside mutex — safe from reentrant deadlock
+        return 0;
+
+    case WM_LBUTTONUP:
+        ReleaseCapture();  // Outside mutex — WM_CAPTURECHANGED can safely re-enter
+        return 0;
+
     case WM_SIZE:
         if (wParam != SIZE_MINIMIZED) {
             std::lock_guard<std::mutex> lock(g_inputMutex);

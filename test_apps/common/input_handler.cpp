@@ -77,13 +77,14 @@ bool UpdateInputState(InputState& state, UINT msg, WPARAM wParam, LPARAM lParam)
         state.dragging = true;
         state.dragStartX = state.mouseX;
         state.dragStartY = state.mouseY;
-        SetCapture(GetActiveWindow());
+        // SetCapture moved to app WndProc — calling it here causes reentrant
+        // deadlock in multi-threaded apps that protect UpdateInputState with a mutex
         return true;
 
     case WM_LBUTTONUP:
         state.leftButton = false;
         state.dragging = false;
-        ReleaseCapture();
+        // ReleaseCapture moved to app WndProc — same reason as above
         return true;
 
     case WM_RBUTTONDOWN:
