@@ -189,7 +189,7 @@ oxr_session_get_display_dimensions(struct oxr_session *sess, float *out_width_m,
 
 /*!
  * Get window metrics for adaptive FOV and eye position adjustment.
- * Only available on D3D11 native compositor path.
+ * Supports both D3D11 native compositor and Vulkan multi compositor paths.
  */
 static bool
 oxr_session_get_window_metrics(struct oxr_session *sess,
@@ -203,6 +203,11 @@ oxr_session_get_window_metrics(struct oxr_session *sess,
 	if (sess->is_d3d11_native_compositor) {
 		return comp_d3d11_compositor_get_window_metrics(&sess->xcn->base, out_metrics);
 	}
+#endif
+
+#ifdef XRT_HAVE_LEIA_SR_VULKAN
+	struct multi_compositor *mc = multi_compositor(&sess->xcn->base);
+	return multi_compositor_get_window_metrics(mc, out_metrics);
 #endif
 
 	return false;

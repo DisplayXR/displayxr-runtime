@@ -31,6 +31,7 @@
 struct comp_target;
 struct leiasr;
 struct leiasr_eye_pair;
+struct leiasr_window_metrics;
 struct xrt_system_devices;
 
 #ifdef XRT_OS_WINDOWS
@@ -287,6 +288,10 @@ struct multi_compositor
 		VkFormat flip_format;
 		bool flip_initialized;
 		//! @}
+
+		//! Last render resolution sent to app (to avoid duplicate events)
+		uint32_t last_notified_render_width;
+		uint32_t last_notified_render_height;
 #endif
 
 #ifdef XRT_OS_WINDOWS
@@ -577,6 +582,20 @@ multi_compositor_get_predicted_eye_positions(struct multi_compositor *mc, struct
  */
 bool
 multi_compositor_get_display_dimensions(struct multi_compositor *mc, float *out_width_m, float *out_height_m);
+
+/*!
+ * Get window metrics for adaptive FOV and eye position adjustment.
+ * Delegates to the session's per-session SR weaver.
+ *
+ * @param mc The multi_compositor (must have per-session rendering initialized)
+ * @param[out] out_metrics Pointer to receive the window metrics.
+ * @return true if valid metrics are available, false otherwise.
+ *
+ * @ingroup comp_multi
+ * @private @memberof multi_compositor
+ */
+bool
+multi_compositor_get_window_metrics(struct multi_compositor *mc, struct leiasr_window_metrics *out_metrics);
 #endif
 
 

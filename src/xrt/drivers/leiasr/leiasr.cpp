@@ -19,6 +19,7 @@
 #include <sysinfoapi.h>
 
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <iostream>
 
@@ -43,13 +44,23 @@ struct leiasr
 	float display_height_m = 0.0f;
 	bool display_dims_valid = false;
 
-	// Display screen position (for diagnostic logging)
+	// Display pixel resolution (for window metrics computation)
+	uint32_t display_pixel_width = 0;
+	uint32_t display_pixel_height = 0;
+	bool display_pixel_dims_valid = false;
+
+	// Display screen position (for diagnostic logging and window metrics)
 	int32_t display_screen_left = 0;
 	int32_t display_screen_top = 0;
 	int32_t display_screen_right = 0;
 	int32_t display_screen_bottom = 0;
 
-	// Window handle (stored for diagnostic position queries)
+	// Recommended view texture dimensions from SR display
+	uint32_t recommended_view_width = 0;
+	uint32_t recommended_view_height = 0;
+	bool recommended_dims_valid = false;
+
+	// Window handle (stored for window metrics queries)
 	HWND windowHandle = nullptr;
 
 	// Thread-safe eye position storage (for getPredictedEyePositions)
@@ -126,6 +137,16 @@ CreateSRContext(double maxTime, leiasr &sr)
 				sr.display_screen_right = (int32_t)displayLocation.right;
 				sr.display_screen_bottom = (int32_t)displayLocation.bottom;
 
+				// Cache display pixel resolution
+				sr.display_pixel_width = static_cast<uint32_t>(width);
+				sr.display_pixel_height = static_cast<uint32_t>(height);
+				sr.display_pixel_dims_valid = true;
+
+				// Cache recommended view texture dimensions
+				sr.recommended_view_width = display->getRecommendedViewsTextureWidth();
+				sr.recommended_view_height = display->getRecommendedViewsTextureHeight();
+				sr.recommended_dims_valid = (sr.recommended_view_width > 0 && sr.recommended_view_height > 0);
+
 				U_LOG_W("SR display (modern API): %ldx%ld px, physical %.2fcm x %.2fcm = %.4fm x %.4fm",
 				        (long)width, (long)height,
 				        raw_width_cm, raw_height_cm,
@@ -133,6 +154,8 @@ CreateSRContext(double maxTime, leiasr &sr)
 				U_LOG_W("SR display screen position: left=%d top=%d right=%d bottom=%d",
 				        sr.display_screen_left, sr.display_screen_top,
 				        sr.display_screen_right, sr.display_screen_bottom);
+				U_LOG_W("SR recommended view texture: %ux%u per eye",
+				        sr.recommended_view_width, sr.recommended_view_height);
 
 				break;
 			}
@@ -457,6 +480,145 @@ leiasr_log_window_diagnostics(struct leiasr *leiasr, void *windowHandle)
 	        leiasr->display_screen_right, leiasr->display_screen_bottom);
 	U_LOG_W("[diag] Window on SR display: (%d, %d), DPI: %ux%u (scale=%.1f%%)",
 	        winOnDisplayX, winOnDisplayY, dpiX, dpiY, dpiX * 100.0f / 96.0f);
+}
+
+bool
+leiasr_get_display_pixel_info(struct leiasr *leiasr,
+                               uint32_t *out_display_pixel_width,
+                               uint32_t *out_display_pixel_height,
+                               int32_t *out_display_screen_left,
+                               int32_t *out_display_screen_top,
+                               float *out_display_width_m,
+                               float *out_display_height_m)
+{
+	if (leiasr == nullptr || out_display_pixel_width == nullptr ||
+	    out_display_pixel_height == nullptr || out_display_screen_left == nullptr ||
+	    out_display_screen_top == nullptr || out_display_width_m == nullptr ||
+	    out_display_height_m == nullptr) {
+		return false;
+	}
+
+	if (!leiasr->display_pixel_dims_valid || !leiasr->display_dims_valid) {
+		return false;
+	}
+
+	*out_display_pixel_width = leiasr->display_pixel_width;
+	*out_display_pixel_height = leiasr->display_pixel_height;
+	*out_display_screen_left = leiasr->display_screen_left;
+	*out_display_screen_top = leiasr->display_screen_top;
+	*out_display_width_m = leiasr->display_width_m;
+	*out_display_height_m = leiasr->display_height_m;
+
+	return true;
+}
+
+bool
+leiasr_get_recommended_view_dimensions(struct leiasr *leiasr,
+                                        uint32_t *out_width,
+                                        uint32_t *out_height)
+{
+	if (leiasr == nullptr || out_width == nullptr || out_height == nullptr) {
+		return false;
+	}
+
+	if (!leiasr->recommended_dims_valid) {
+		return false;
+	}
+
+	*out_width = leiasr->recommended_view_width;
+	*out_height = leiasr->recommended_view_height;
+
+	return true;
+}
+
+bool
+leiasr_get_window_metrics(struct leiasr *leiasr,
+                           struct leiasr_window_metrics *out_metrics)
+{
+	if (leiasr == nullptr || out_metrics == nullptr) {
+		if (out_metrics != nullptr) {
+			out_metrics->valid = false;
+		}
+		return false;
+	}
+
+	memset(out_metrics, 0, sizeof(*out_metrics));
+
+	if (leiasr->windowHandle == nullptr ||
+	    !leiasr->display_pixel_dims_valid ||
+	    !leiasr->display_dims_valid) {
+		return false;
+	}
+
+	uint32_t disp_px_w = leiasr->display_pixel_width;
+	uint32_t disp_px_h = leiasr->display_pixel_height;
+	int32_t disp_left = leiasr->display_screen_left;
+	int32_t disp_top = leiasr->display_screen_top;
+	float disp_w_m = leiasr->display_width_m;
+	float disp_h_m = leiasr->display_height_m;
+
+	if (disp_px_w == 0 || disp_px_h == 0) {
+		return false;
+	}
+
+	// Get window client rect
+	RECT rect;
+	if (!GetClientRect(leiasr->windowHandle, &rect)) {
+		return false;
+	}
+	uint32_t win_px_w = static_cast<uint32_t>(rect.right - rect.left);
+	uint32_t win_px_h = static_cast<uint32_t>(rect.bottom - rect.top);
+	if (win_px_w == 0 || win_px_h == 0) {
+		return false;
+	}
+
+	// Get window screen position
+	POINT client_origin = {0, 0};
+	ClientToScreen(leiasr->windowHandle, &client_origin);
+
+	// Compute pixel size (meters per pixel)
+	float pixel_size_x = disp_w_m / (float)disp_px_w;
+	float pixel_size_y = disp_h_m / (float)disp_px_h;
+
+	// Window physical size
+	float win_w_m = (float)win_px_w * pixel_size_x;
+	float win_h_m = (float)win_px_h * pixel_size_y;
+
+	// Window center in pixels (relative to display origin in screen coords)
+	float win_center_px_x = (float)(client_origin.x - disp_left) + (float)win_px_w / 2.0f;
+	float win_center_px_y = (float)(client_origin.y - disp_top) + (float)win_px_h / 2.0f;
+
+	// Display center in pixels
+	float disp_center_px_x = (float)disp_px_w / 2.0f;
+	float disp_center_px_y = (float)disp_px_h / 2.0f;
+
+	// Window center offset in meters
+	// X: +right (screen coords and eye coords both +right)
+	// Y: negated because screen coords Y-down, eye coords Y-up
+	float offset_x_m = (win_center_px_x - disp_center_px_x) * pixel_size_x;
+	float offset_y_m = -((win_center_px_y - disp_center_px_y) * pixel_size_y);
+
+	// Fill output
+	out_metrics->display_width_m = disp_w_m;
+	out_metrics->display_height_m = disp_h_m;
+	out_metrics->display_pixel_width = disp_px_w;
+	out_metrics->display_pixel_height = disp_px_h;
+	out_metrics->display_screen_left = disp_left;
+	out_metrics->display_screen_top = disp_top;
+
+	out_metrics->window_pixel_width = win_px_w;
+	out_metrics->window_pixel_height = win_px_h;
+	out_metrics->window_screen_left = static_cast<int32_t>(client_origin.x);
+	out_metrics->window_screen_top = static_cast<int32_t>(client_origin.y);
+
+	out_metrics->window_width_m = win_w_m;
+	out_metrics->window_height_m = win_h_m;
+	out_metrics->window_center_offset_x_m = offset_x_m;
+	out_metrics->window_center_offset_y_m = offset_y_m;
+
+	out_metrics->valid = true;
+
+	return true;
 }
 
 } // extern "C"

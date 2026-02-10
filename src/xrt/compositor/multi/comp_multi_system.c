@@ -1330,6 +1330,42 @@ recreate_session_swapchain(struct multi_compositor *mc, struct vk_bundle *vk)
 	mc->session_render.swapchain_needs_recreate = false;
 
 	U_LOG_W("[per-session] Swapchain recreated: %ux%u, %u images", ct->width, ct->height, new_image_count);
+
+	// Compute and push render resolution change event (matching D3D11 ratio formula)
+	if (mc->session_render.weaver != NULL) {
+		uint32_t sr_w, sr_h, disp_px_w, disp_px_h;
+		int32_t disp_left, disp_top;
+		float disp_w_m, disp_h_m;
+
+		if (leiasr_get_recommended_view_dimensions(mc->session_render.weaver, &sr_w, &sr_h) &&
+		    leiasr_get_display_pixel_info(mc->session_render.weaver, &disp_px_w, &disp_px_h,
+		                                   &disp_left, &disp_top, &disp_w_m, &disp_h_m) &&
+		    disp_px_w > 0 && disp_px_h > 0) {
+
+			float ratio = fminf((float)ct->width / (float)disp_px_w,
+			                    (float)ct->height / (float)disp_px_h);
+			if (ratio > 1.0f) ratio = 1.0f;
+
+			uint32_t new_w = (uint32_t)((float)sr_w * ratio);
+			uint32_t new_h = (uint32_t)((float)sr_h * ratio);
+
+			if (new_w != mc->session_render.last_notified_render_width ||
+			    new_h != mc->session_render.last_notified_render_height) {
+
+				mc->session_render.last_notified_render_width = new_w;
+				mc->session_render.last_notified_render_height = new_h;
+
+				union xrt_session_event xse = {0};
+				xse.render_resolution.type = XRT_SESSION_EVENT_RENDER_RESOLUTION_CHANGE;
+				xse.render_resolution.width = new_w;
+				xse.render_resolution.height = new_h;
+				multi_compositor_push_event(mc, &xse);
+
+				U_LOG_W("[per-session] Pushed render resolution change: %ux%u (ratio=%.3f)",
+				        new_w, new_h, ratio);
+			}
+		}
+	}
 }
 
 /*!

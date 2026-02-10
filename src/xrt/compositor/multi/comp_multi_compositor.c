@@ -1407,6 +1407,15 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 
 	U_LOG_W("Created per-session SR weaver for HWND %p", mc->session_render.external_window_handle);
 
+	// Initialize render resolution tracking to SR recommended dims (prevents spurious event on first frame)
+	{
+		uint32_t sr_w, sr_h;
+		if (leiasr_get_recommended_view_dimensions(mc->session_render.weaver, &sr_w, &sr_h)) {
+			mc->session_render.last_notified_render_width = sr_w;
+			mc->session_render.last_notified_render_height = sr_h;
+		}
+	}
+
 	// Allocate command buffer ring and fences (one per swapchain image)
 	uint32_t image_count = mc->session_render.target->image_count;
 	U_LOG_W("Allocating command buffer ring: %u buffers", image_count);
@@ -1595,6 +1604,21 @@ multi_compositor_get_display_dimensions(struct multi_compositor *mc, float *out_
 	*out_height_m = dims.height_m;
 
 	return true;
+}
+
+bool
+multi_compositor_get_window_metrics(struct multi_compositor *mc, struct leiasr_window_metrics *out_metrics)
+{
+	if (mc == NULL || out_metrics == NULL) {
+		return false;
+	}
+
+	// Check if session has per-session rendering with a weaver
+	if (!mc->session_render.initialized || mc->session_render.weaver == NULL) {
+		return false;
+	}
+
+	return leiasr_get_window_metrics(mc->session_render.weaver, out_metrics);
 }
 #endif
 

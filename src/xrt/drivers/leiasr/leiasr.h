@@ -115,6 +115,56 @@ leiasr_get_display_dimensions(struct leiasr *leiasr, struct leiasr_display_dimen
 void
 leiasr_log_window_diagnostics(struct leiasr *leiasr, void *windowHandle);
 
+/*!
+ * Get display pixel resolution, screen position, and physical size.
+ * Used for computing window metrics (adaptive FOV and eye offset).
+ *
+ * @param leiasr The leiasr instance
+ * @param[out] out_display_pixel_width Display width in pixels.
+ * @param[out] out_display_pixel_height Display height in pixels.
+ * @param[out] out_display_screen_left Display left edge in screen coords.
+ * @param[out] out_display_screen_top Display top edge in screen coords.
+ * @param[out] out_display_width_m Display physical width in meters.
+ * @param[out] out_display_height_m Display physical height in meters.
+ * @return true if all values are valid.
+ */
+bool
+leiasr_get_display_pixel_info(struct leiasr *leiasr,
+                               uint32_t *out_display_pixel_width,
+                               uint32_t *out_display_pixel_height,
+                               int32_t *out_display_screen_left,
+                               int32_t *out_display_screen_top,
+                               float *out_display_width_m,
+                               float *out_display_height_m);
+
+/*!
+ * Get the recommended view texture dimensions from the SR display.
+ * These dimensions are queried from the SR SDK during initialization and should
+ * be used for creating swapchains and the compositor stereo texture.
+ *
+ * @param leiasr The leiasr instance.
+ * @param[out] out_width Recommended width per view (single eye).
+ * @param[out] out_height Recommended height per view.
+ * @return true if valid dimensions are available, false otherwise.
+ */
+bool
+leiasr_get_recommended_view_dimensions(struct leiasr *leiasr,
+                                        uint32_t *out_width,
+                                        uint32_t *out_height);
+
+/*!
+ * Get window metrics for adaptive FOV and eye position adjustment.
+ * Combines cached display info with live GetClientRect/ClientToScreen
+ * on the stored window handle to compute window geometry in meters.
+ *
+ * @param leiasr The leiasr instance (must have valid windowHandle).
+ * @param[out] out_metrics Pointer to receive the window metrics.
+ * @return true if valid metrics are available, false otherwise.
+ */
+bool
+leiasr_get_window_metrics(struct leiasr *leiasr,
+                           struct leiasr_window_metrics *out_metrics);
+
 #ifdef __cplusplus
 }
 #endif
