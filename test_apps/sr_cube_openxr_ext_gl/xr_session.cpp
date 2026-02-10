@@ -78,10 +78,14 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         if (strcmp(ext.extensionName, XR_EXT_SESSION_TARGET_EXTENSION_NAME) == 0) {
             xr.hasSessionTargetExt = true;
         }
+        if (strcmp(ext.extensionName, XR_EXT_DYNAMIC_RENDER_RESOLUTION_EXTENSION_NAME) == 0) {
+            xr.hasDynamicRenderResolutionExt = true;
+        }
     }
 
     LOG_INFO("XR_KHR_opengl_enable: %s", hasOpenGL ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_EXT_session_target: %s", xr.hasSessionTargetExt ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_EXT_dynamic_render_resolution: %s", xr.hasDynamicRenderResolutionExt ? "AVAILABLE" : "NOT FOUND");
 
     if (!hasOpenGL) {
         LOG_ERROR("XR_KHR_opengl_enable extension not available");
@@ -92,6 +96,9 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     enabledExtensions.push_back(XR_KHR_OPENGL_ENABLE_EXTENSION_NAME);
     if (xr.hasSessionTargetExt) {
         enabledExtensions.push_back(XR_EXT_SESSION_TARGET_EXTENSION_NAME);
+    }
+    if (xr.hasDynamicRenderResolutionExt) {
+        enabledExtensions.push_back(XR_EXT_DYNAMIC_RENDER_RESOLUTION_EXTENSION_NAME);
     }
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
