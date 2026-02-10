@@ -847,11 +847,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     }
     LOG_INFO("Stereo view texture created");
 
-    // Set input texture for weaver
-    g_srWeaver->setInputViewTexture(g_viewTextureSRV.Get(), g_viewTextureWidth, g_viewTextureHeight, DXGI_FORMAT_R8G8B8A8_UNORM);
-
-    // Initialize context
+    // Initialize context (must be called BEFORE setInputViewTexture,
+    // otherwise initialize() resets the weaver's input texture binding)
     g_srContext->initialize();
+
+    // Set input texture for weaver (after initialize)
+    g_srWeaver->setInputViewTexture(g_viewTextureSRV.Get(), g_viewTextureWidth, g_viewTextureHeight, DXGI_FORMAT_R8G8B8A8_UNORM);
 
     // Show window
     ShowWindow(hwnd, nCmdShow);
