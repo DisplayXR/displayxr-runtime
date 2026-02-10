@@ -366,45 +366,98 @@ static void RenderThreadFunc(HWND hwnd, VulkanState* vk) {
         beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         vkBeginCommandBuffer(cmd, &beginInfo);
 
-        // Transition SBS view texture to color attachment
-        TransitionImageLayout(cmd, vk->viewImage,
-            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-
-        // Transition depth to depth attachment
-        TransitionImageLayout(cmd, vk->depthImage,
-            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-            VK_IMAGE_ASPECT_DEPTH_BIT);
-
         // Cube parameters
         const float cubeSize = 60.0f;
         const float znear = 0.1f;
         const float zfar = 10000.0f;
 
-        // Begin scene render pass (clears color + depth)
-        VkClearValue clearValues[2] = {};
-        clearValues[0].color = {{0.05f, 0.05f, 0.15f, 1.0f}};
-        clearValues[1].depthStencil = {1.0f, 0};
+        // --- Explicit clear (matching reference app pattern) ---
+        // Clear color image
+        {
+            VkClearColorValue clearColorValue = {};
+            clearColorValue.float32[0] = 0.05f;
+            clearColorValue.float32[1] = 0.05f;
+            clearColorValue.float32[2] = 0.15f;
+            clearColorValue.float32[3] = 1.0f;
 
-        VkRenderPassBeginInfo rpBegin = {};
-        rpBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-        rpBegin.renderPass = vk->sceneRenderPass;
-        rpBegin.framebuffer = vk->sceneFramebuffer;
-        rpBegin.renderArea.extent = {vk->viewWidth * 2, vk->viewHeight};
-        rpBegin.clearValueCount = 2;
-        rpBegin.pClearValues = clearValues;
+            VkImageSubresourceRange colorRange = {};
+            colorRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            colorRange.baseMipLevel = 0;
+            colorRange.levelCount = 1;
+            colorRange.baseArrayLayer = 0;
+            colorRange.layerCount = 1;
 
-        vkCmdBeginRenderPass(cmd, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
+            TransitionImageLayout(cmd, vk->viewImage,
+                vk->viewImageLayout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            vk->viewImageLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
 
-        // Bind cube pipeline
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk->cubePipeline);
+            vkCmdClearColorImage(cmd, vk->viewImage,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearColorValue, 1, &colorRange);
+        }
 
-        VkDeviceSize offset = 0;
-        vkCmdBindVertexBuffers(cmd, 0, 1, &vk->cubeVertexBuffer, &offset);
-        vkCmdBindIndexBuffer(cmd, vk->cubeIndexBuffer, 0, VK_INDEX_TYPE_UINT16);
+        // Clear depth image
+        {
+            VkClearDepthStencilValue clearDepthValue = {};
+            clearDepthValue.depth = 1.0f;
 
-        // Render stereo views (left eye = left half, right eye = right half of SBS texture)
+            VkImageSubresourceRange depthRange = {};
+            depthRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+            depthRange.baseMipLevel = 0;
+            depthRange.levelCount = 1;
+            depthRange.baseArrayLayer = 0;
+            depthRange.layerCount = 1;
+
+            TransitionImageLayout(cmd, vk->depthImage,
+                vk->depthImageLayout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_IMAGE_ASPECT_DEPTH_BIT);
+            vk->depthImageLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+
+            vkCmdClearDepthStencilImage(cmd, vk->depthImage,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearDepthValue, 1, &depthRange);
+        }
+
+        // Transition view + depth to attachment optimal before rendering
+        TransitionImageLayout(cmd, vk->viewImage,
+            vk->viewImageLayout, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        vk->viewImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+        TransitionImageLayout(cmd, vk->depthImage,
+            vk->depthImageLayout, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            VK_IMAGE_ASPECT_DEPTH_BIT);
+        vk->depthImageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+        // --- Diagnostic logging (first 3 frames only) ---
+        static int s_diagFrameCount = 0;
+        if (s_diagFrameCount < 3) {
+            LOG_INFO("[DIAG frame %d] eyeL=(%.1f,%.1f,%.1f) eyeR=(%.1f,%.1f,%.1f)",
+                s_diagFrameCount,
+                adjLeftEye.x, adjLeftEye.y, adjLeftEye.z,
+                adjRightEye.x, adjRightEye.y, adjRightEye.z);
+            LOG_INFO("[DIAG frame %d] screen=%.1fx%.1f mm, viewport=%ux%u, swapFmt=%d",
+                s_diagFrameCount,
+                effectiveWidthMM, effectiveHeightMM,
+                vk->viewWidth, vk->viewHeight,
+                (int)vk->swapchainFormat);
+        }
+
+        // --- Render each eye in its own render pass (matching reference) ---
         for (int eye = 0; eye < 2; eye++) {
-            // Set viewport for this eye (no Y-flip, matching SR Vulkan reference app)
+            // Begin render pass (LOAD_OP_LOAD, renderArea = full SBS width)
+            VkClearValue clearValues[2] = {};
+            clearValues[0].color = {{0.0f, 0.0f, 0.0f, 1.0f}};
+            clearValues[1].depthStencil = {1.0f, 0};
+
+            VkRenderPassBeginInfo rpBegin = {};
+            rpBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+            rpBegin.renderPass = vk->sceneRenderPass;
+            rpBegin.framebuffer = vk->sceneFramebuffer;
+            rpBegin.renderArea.extent = {vk->viewWidth * 2, vk->viewHeight};
+            rpBegin.clearValueCount = 2;
+            rpBegin.pClearValues = clearValues;
+
+            vkCmdBeginRenderPass(cmd, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
+
+            // Set viewport for this eye
             VkViewport viewport = {};
             viewport.x = (float)(eye * (int)vk->viewWidth);
             viewport.y = 0.0f;
@@ -419,6 +472,12 @@ static void RenderThreadFunc(HWND hwnd, VulkanState* vk) {
             scissor.extent = {vk->viewWidth, vk->viewHeight};
             vkCmdSetScissor(cmd, 0, 1, &scissor);
 
+            // Bind pipeline and geometry
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk->cubePipeline);
+            VkDeviceSize offset = 0;
+            vkCmdBindVertexBuffers(cmd, 0, 1, &vk->cubeVertexBuffer, &offset);
+            vkCmdBindIndexBuffer(cmd, vk->cubeIndexBuffer, 0, VK_INDEX_TYPE_UINT32);
+
             leia::vec3f eyePos = (eye == 0) ? adjLeftEye : adjRightEye;
 
             leia::mat4f mvp = leia::CalculateMVP(
@@ -429,6 +488,12 @@ static void RenderThreadFunc(HWND hwnd, VulkanState* vk) {
                 znear, zfar
             );
 
+            // Diagnostic: log MVP first row
+            if (s_diagFrameCount < 3 && eye == 0) {
+                LOG_INFO("[DIAG frame %d] MVP row0: %.4f %.4f %.4f %.4f",
+                    s_diagFrameCount, mvp.m[0], mvp.m[1], mvp.m[2], mvp.m[3]);
+            }
+
             VkPushConstants pc = {};
             memcpy(pc.transform, mvp.m, sizeof(float) * 16);
             pc.color[0] = 1.0f; pc.color[1] = 1.0f; pc.color[2] = 1.0f; pc.color[3] = 1.0f;
@@ -437,20 +502,24 @@ static void RenderThreadFunc(HWND hwnd, VulkanState* vk) {
                 VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
 
             vkCmdDrawIndexed(cmd, 36, 1, 0, 0, 0);
+
+            vkCmdEndRenderPass(cmd);
         }
 
-        vkCmdEndRenderPass(cmd);
+        if (s_diagFrameCount < 3) {
+            s_diagFrameCount++;
+        }
 
         // Transition SBS view texture to shader read for weaver
         TransitionImageLayout(cmd, vk->viewImage,
-            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            vk->viewImageLayout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        vk->viewImageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
         // Transition swapchain image to color attachment for weaver output
         TransitionImageLayout(cmd, vk->swapchainImages[imageIndex],
             VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 
-        // Call the SR Vulkan weaver in SBS mode (right=NULL, width=2x per-eye)
-        // This matches the proven compositor pattern in comp_multi_system.c
+        // Call the SR Vulkan weaver in SBS mode
         RECT weaverRect = {};
         weaverRect.left = 0;
         weaverRect.top = 0;

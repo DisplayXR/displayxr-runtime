@@ -81,6 +81,10 @@ struct VulkanState {
     std::vector<FrameSync> frames;
     uint32_t currentFrame = 0;
 
+    // Layout tracking (matches reference app pattern)
+    VkImageLayout viewImageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout depthImageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
     // Scene state
     float cubeRotation = 0.0f;
 };

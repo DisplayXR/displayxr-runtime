@@ -598,7 +598,7 @@ bool CreateViewTexture(VulkanState& vk, uint32_t singleEyeWidth, uint32_t single
     // Depth image (same SBS dimensions)
     if (!CreateImageHelper(vk.device, vk.physicalDevice,
         totalWidth, singleEyeHeight, VK_FORMAT_D32_SFLOAT,
-        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
         vk.depthImage, vk.depthImageMemory)) {
         LOG_ERROR("Failed to create depth image");
@@ -632,7 +632,7 @@ bool CreateSceneRenderPass(VulkanState& vk) {
     VkAttachmentDescription colorAttach = {};
     colorAttach.format = vk.swapchainFormat;
     colorAttach.samples = VK_SAMPLE_COUNT_1_BIT;
-    colorAttach.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    colorAttach.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
     colorAttach.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     colorAttach.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     colorAttach.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
@@ -642,8 +642,8 @@ bool CreateSceneRenderPass(VulkanState& vk) {
     VkAttachmentDescription depthAttach = {};
     depthAttach.format = VK_FORMAT_D32_SFLOAT;
     depthAttach.samples = VK_SAMPLE_COUNT_1_BIT;
-    depthAttach.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    depthAttach.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    depthAttach.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    depthAttach.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     depthAttach.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     depthAttach.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     depthAttach.initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
@@ -776,7 +776,7 @@ bool CreateCubePipeline(VulkanState& vk) {
     rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
     rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
     rasterizer.lineWidth = 1.0f;
-    rasterizer.cullMode = VK_CULL_MODE_NONE;
+    rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
     rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
 
     VkPipelineMultisampleStateCreateInfo multisampling = {};
@@ -862,7 +862,7 @@ bool CreateCubeGeometry(VulkanState& vk) {
         {{0.5f,0.5f,0.5f},{0,1,1,1}},    {{0.5f,-0.5f,0.5f},{0,1,1,1}},
     };
 
-    uint16_t cubeIndices[] = {
+    uint32_t cubeIndices[] = {
         0,1,2, 0,2,3,  4,5,6, 4,6,7,  8,9,10, 8,10,11,
         12,13,14, 12,14,15,  16,17,18, 16,18,19,  20,21,22, 20,22,23,
     };
