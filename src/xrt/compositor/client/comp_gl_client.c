@@ -388,6 +388,24 @@ client_gl_compositor_layer_passthrough(struct xrt_compositor *xc,
 }
 
 static xrt_result_t
+client_gl_compositor_layer_window_space(struct xrt_compositor *xc,
+                                        struct xrt_device *xdev,
+                                        struct xrt_swapchain *xsc,
+                                        const struct xrt_layer_data *data)
+{
+	struct client_gl_compositor *c = client_gl_compositor(xc);
+	struct xrt_compositor *xcn = &c->xcn->base;
+	struct xrt_swapchain *xscfb;
+
+	xscfb = to_native_swapchain(xsc);
+
+	struct xrt_layer_data d = *data;
+	d.flip_y = !d.flip_y;
+
+	return xrt_comp_layer_window_space(xcn, xdev, xscfb, &d);
+}
+
+static xrt_result_t
 client_gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
 {
 	COMP_TRACE_MARKER();
@@ -613,6 +631,7 @@ client_gl_compositor_init(struct client_gl_compositor *c,
 	c->base.base.layer_equirect1 = client_gl_compositor_layer_equirect1;
 	c->base.base.layer_equirect2 = client_gl_compositor_layer_equirect2;
 	c->base.base.layer_passthrough = client_gl_compositor_layer_passthrough;
+	c->base.base.layer_window_space = client_gl_compositor_layer_window_space;
 	c->base.base.layer_commit = client_gl_compositor_layer_commit;
 	c->base.base.destroy = client_gl_compositor_destroy;
 	c->context_begin_locked = context_begin_locked;
