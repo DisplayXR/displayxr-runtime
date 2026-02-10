@@ -267,6 +267,11 @@ oxr_xrSuggestInteractionProfileBindings(XrInstance instance,
 		oxr_error(&log, ret, "(suggestedBindings->countSuggestedBindings == 0x%08" PRIx64 ") invalid path", ip);
 	}
 
+	oxr_warn(&log,
+	         " [DIAG] xrSuggestInteractionProfileBindings: profile='%s' bindings=%u",
+	         ip_str ? ip_str : "<null>",
+	         suggestedBindings->countSuggestedBindings);
+
 	// Used in the loop that verifies the suggested bindings paths.
 	path_verify_fn_t subpath_fn = NULL;
 	path_verify_fn_t dpad_path_fn = NULL;
@@ -287,11 +292,17 @@ oxr_xrSuggestInteractionProfileBindings(XrInstance instance,
 	}
 
 	if (interaction_profile_template == NULL) {
+		oxr_warn(&log,
+		         " [DIAG] xrSuggestInteractionProfileBindings: REJECTED profile='%s' (not in profile_templates)",
+		         ip_str ? ip_str : "<null>");
 		return oxr_error(&log, XR_ERROR_PATH_UNSUPPORTED,
 		                 "(suggestedBindings->interactionProfile == \"%s\") is not "
 		                 "a supported interaction profile",
 		                 ip_str);
 	}
+	oxr_warn(&log,
+	         " [DIAG] xrSuggestInteractionProfileBindings: ACCEPTED profile='%s'",
+	         ip_str ? ip_str : "<null>");
 
 	bool ext_supported;
 	bool ext_enabled;
