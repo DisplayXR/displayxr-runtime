@@ -59,6 +59,24 @@
 #define QWERTY_WARN(qd, ...) U_LOG_XDEV_IFL_W(&qd->base, qd->sys->log_level, __VA_ARGS__)
 #define QWERTY_ERROR(qd, ...) U_LOG_XDEV_IFL_E(&qd->base, qd->sys->log_level, __VA_ARGS__)
 
+static struct xrt_binding_input_pair wmr_inputs[11] = {
+    {XRT_INPUT_WMR_MENU_CLICK, XRT_INPUT_WMR_MENU_CLICK},
+    {XRT_INPUT_WMR_SQUEEZE_CLICK, XRT_INPUT_WMR_SQUEEZE_CLICK},
+    {XRT_INPUT_WMR_TRIGGER_VALUE, XRT_INPUT_WMR_TRIGGER_VALUE},
+    {XRT_INPUT_WMR_THUMBSTICK_CLICK, XRT_INPUT_WMR_THUMBSTICK_CLICK},
+    {XRT_INPUT_WMR_THUMBSTICK, XRT_INPUT_WMR_THUMBSTICK},
+    {XRT_INPUT_WMR_TRACKPAD_CLICK, XRT_INPUT_WMR_TRACKPAD_CLICK},
+    {XRT_INPUT_WMR_TRACKPAD_TOUCH, XRT_INPUT_WMR_TRACKPAD_TOUCH},
+    {XRT_INPUT_WMR_TRACKPAD, XRT_INPUT_WMR_TRACKPAD},
+    {XRT_INPUT_WMR_GRIP_POSE, XRT_INPUT_WMR_GRIP_POSE},
+    {XRT_INPUT_WMR_AIM_POSE, XRT_INPUT_WMR_AIM_POSE},
+    {XRT_INPUT_WMR_HOME_CLICK, XRT_INPUT_WMR_HOME_CLICK},
+};
+
+static struct xrt_binding_output_pair wmr_outputs[1] = {
+    {XRT_OUTPUT_NAME_WMR_HAPTIC, XRT_OUTPUT_NAME_WMR_HAPTIC},
+};
+
 static struct xrt_binding_input_pair simple_inputs[4] = {
     {XRT_INPUT_SIMPLE_SELECT_CLICK, XRT_INPUT_WMR_TRIGGER_VALUE},
     {XRT_INPUT_SIMPLE_MENU_CLICK, XRT_INPUT_WMR_MENU_CLICK},
@@ -70,7 +88,14 @@ static struct xrt_binding_output_pair simple_outputs[1] = {
     {XRT_OUTPUT_NAME_SIMPLE_VIBRATION, XRT_OUTPUT_NAME_WMR_HAPTIC},
 };
 
-static struct xrt_binding_profile binding_profiles[1] = {
+static struct xrt_binding_profile binding_profiles[2] = {
+    {
+        .name = XRT_DEVICE_WMR_CONTROLLER,
+        .inputs = wmr_inputs,
+        .input_count = ARRAY_SIZE(wmr_inputs),
+        .outputs = wmr_outputs,
+        .output_count = ARRAY_SIZE(wmr_outputs),
+    },
     {
         .name = XRT_DEVICE_SIMPLE_CONTROLLER,
         .inputs = simple_inputs,
