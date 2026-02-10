@@ -210,12 +210,18 @@ qwerty_process_win32(struct xrt_device **xdevs,
 		bool ctrl_change = false;
 
 		if (wParam == VK_LMENU || wParam == VK_MENU) {
-			alt_change = true;
-			alt_pressed = is_keydown;
+			bool new_state = is_keydown;
+			if (alt_pressed != new_state) {
+				alt_change = true;
+				alt_pressed = new_state;
+			}
 		}
 		if (wParam == VK_LCONTROL || wParam == VK_CONTROL) {
-			ctrl_change = true;
-			ctrl_pressed = is_keydown;
+			bool new_state = is_keydown;
+			if (ctrl_pressed != new_state) {
+				ctrl_change = true;
+				ctrl_pressed = new_state;
+			}
 		}
 
 		// Release all on focus change
