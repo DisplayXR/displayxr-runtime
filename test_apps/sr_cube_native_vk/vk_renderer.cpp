@@ -242,11 +242,30 @@ bool CreateVulkanInstance(VulkanState& vk) {
         VK_KHR_WIN32_SURFACE_EXTENSION_NAME,
     };
 
+    // Enable validation layers if available
+    const char* layers[] = { "VK_LAYER_KHRONOS_validation" };
+    uint32_t layerCount = 0;
+    vkEnumerateInstanceLayerProperties(&layerCount, nullptr);
+    std::vector<VkLayerProperties> availableLayers(layerCount);
+    vkEnumerateInstanceLayerProperties(&layerCount, availableLayers.data());
+    bool validationAvailable = false;
+    for (auto& layer : availableLayers) {
+        if (strcmp(layer.layerName, "VK_LAYER_KHRONOS_validation") == 0) {
+            validationAvailable = true;
+            break;
+        }
+    }
+
     VkInstanceCreateInfo createInfo = {};
     createInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     createInfo.pApplicationInfo = &appInfo;
     createInfo.enabledExtensionCount = 2;
     createInfo.ppEnabledExtensionNames = extensions;
+    if (validationAvailable) {
+        createInfo.enabledLayerCount = 1;
+        createInfo.ppEnabledLayerNames = layers;
+        LOG_INFO("Vulkan validation layers enabled");
+    }
 
     if (vkCreateInstance(&createInfo, nullptr, &vk.instance) != VK_SUCCESS) {
         LOG_ERROR("Failed to create Vulkan instance");

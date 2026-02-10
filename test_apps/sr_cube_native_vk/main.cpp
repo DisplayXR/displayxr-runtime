@@ -460,9 +460,9 @@ static void RenderThreadFunc(HWND hwnd, VulkanState* vk) {
             // Set viewport for this eye
             VkViewport viewport = {};
             viewport.x = (float)(eye * (int)vk->viewWidth);
-            viewport.y = 0.0f;
+            viewport.y = (float)vk->viewHeight;
             viewport.width = (float)vk->viewWidth;
-            viewport.height = (float)vk->viewHeight;
+            viewport.height = -(float)vk->viewHeight; // Negative height to flip Y (match GL projection)
             viewport.minDepth = 0.0f;
             viewport.maxDepth = 1.0f;
             vkCmdSetViewport(cmd, 0, 1, &viewport);
