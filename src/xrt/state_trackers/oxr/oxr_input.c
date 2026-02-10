@@ -1773,7 +1773,16 @@ oxr_session_attach_action_sets(struct oxr_logger *log,
                                const XrSessionActionSetsAttachInfo *bindInfo)
 {
 	struct oxr_instance *inst = sess->sys->inst;
+
+	oxr_warn(log,
+	         " [DIAG] xrAttachSessionActionSets: %u action sets, %zu profiles suggested to instance",
+	         bindInfo->countActionSets, inst->profile_count);
+
 	oxr_clone_profiles_to_session(log, inst, sess);
+
+	oxr_warn(log,
+	         " [DIAG] xrAttachSessionActionSets: %zu profiles cloned to session",
+	         sess->profiles_on_attachment_size);
 
 	struct oxr_profiles_per_subaction profiles = {0};
 #define FIND_PROFILE(X) oxr_find_profile_for_device(log, sess, GET_XDEV_BY_ROLE(sess->sys, X), &profiles.X);
@@ -1823,6 +1832,23 @@ oxr_session_attach_action_sets(struct oxr_logger *log,
 	}
 	OXR_FOR_EACH_VALID_SUBACTION_PATH(POPULATE_PROFILE)
 #undef POPULATE_PROFILE
+
+	{
+		const char *left_str = NULL;
+		const char *right_str = NULL;
+		size_t len = 0;
+		if (sess->left != XR_NULL_PATH) {
+			oxr_path_get_string(log, inst, sess->left, &left_str, &len);
+		}
+		if (sess->right != XR_NULL_PATH) {
+			oxr_path_get_string(log, inst, sess->right, &right_str, &len);
+		}
+		oxr_warn(log,
+		         " [DIAG] xrAttachSessionActionSets RESULT: left='%s' right='%s'",
+		         left_str ? left_str : "XR_NULL_PATH",
+		         right_str ? right_str : "XR_NULL_PATH");
+	}
+
 	return oxr_session_success_result(sess);
 }
 

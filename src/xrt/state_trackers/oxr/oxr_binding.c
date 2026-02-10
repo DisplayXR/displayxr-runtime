@@ -19,6 +19,7 @@
 #include "oxr_subaction.h"
 
 #include <stdio.h>
+#include <inttypes.h>
 
 
 static void
@@ -490,23 +491,43 @@ oxr_find_profile_for_device(struct oxr_logger *log,
                             struct oxr_interaction_profile **out_p)
 {
 	if (xdev == NULL) {
+		oxr_warn(log, " [DIAG] oxr_find_profile_for_device: xdev is NULL");
 		return;
 	}
+
+	oxr_warn(log,
+	         " [DIAG] oxr_find_profile_for_device: device='%s' name=%d binding_profile_count=%zu",
+	         xdev->str, (int)xdev->name, xdev->binding_profile_count);
 
 	// Have bindings for this device's interaction profile been suggested?
 	oxr_get_profile_for_device_name(log, sess, xdev->name, out_p);
 	if (*out_p != NULL) {
+		oxr_warn(log,
+		         " [DIAG] oxr_find_profile_for_device: MATCHED primary name=%d -> profile path=0x%" PRIx64,
+		         (int)xdev->name, (uint64_t)(*out_p)->path);
 		return;
 	}
+
+	oxr_warn(log,
+	         " [DIAG] oxr_find_profile_for_device: primary name=%d not matched, trying %zu alternates",
+	         (int)xdev->name, xdev->binding_profile_count);
 
 	// Check if bindings for any of this device's alternative interaction profiles have been suggested.
 	for (size_t i = 0; i < xdev->binding_profile_count; i++) {
 		struct xrt_binding_profile *xbp = &xdev->binding_profiles[i];
 		oxr_get_profile_for_device_name(log, sess, xbp->name, out_p);
 		if (*out_p != NULL) {
+			oxr_warn(log,
+			         " [DIAG] oxr_find_profile_for_device: MATCHED alternate[%zu] name=%d -> profile path=0x%" PRIx64,
+			         i, (int)xbp->name, (uint64_t)(*out_p)->path);
 			return;
 		}
+		oxr_warn(log,
+		         " [DIAG] oxr_find_profile_for_device: alternate[%zu] name=%d not matched",
+		         i, (int)xbp->name);
 	}
+
+	oxr_warn(log, " [DIAG] oxr_find_profile_for_device: NO MATCH for device='%s'", xdev->str);
 }
 
 void
@@ -758,6 +779,23 @@ oxr_action_get_current_interaction_profile(struct oxr_logger *log,
 		return oxr_error(log, XR_ERROR_RUNTIME_FAILURE, "Top level path not handled?!");
 	}
 #undef IDENTIFY_TOP_LEVEL_PATH
+
+	{
+		const char *top_str = NULL;
+		size_t top_len = 0;
+		oxr_path_get_string(log, inst, topLevelUserPath, &top_str, &top_len);
+		const char *profile_str = NULL;
+		size_t profile_len = 0;
+		if (interactionProfile->interactionProfile != XR_NULL_PATH) {
+			oxr_path_get_string(log, inst, interactionProfile->interactionProfile, &profile_str, &profile_len);
+		}
+		oxr_warn(log,
+		         " [DIAG] xrGetCurrentInteractionProfile: topLevel='%s' -> profile='%s' (path=0x%" PRIx64 ")",
+		         top_str ? top_str : "<null>",
+		         profile_str ? profile_str : "XR_NULL_PATH",
+		         (uint64_t)interactionProfile->interactionProfile);
+	}
+
 	return XR_SUCCESS;
 }
 
