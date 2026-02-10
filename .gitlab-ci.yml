@@ -137,7 +137,7 @@ win:container_prep:
 .monado.variables.debian:bookworm:
   variables:
     FDO_DISTRIBUTION_VERSION: "bookworm"
-    FDO_DISTRIBUTION_TAG: "2026-02-04"
+    FDO_DISTRIBUTION_TAG: "2026-02-05"
 
 # Variables for build and usage of Debian bookworm-ndk image
 .monado.variables.debian:bookworm-ndk:
@@ -339,7 +339,7 @@ reuse:
     - reuse lint
 
 
-debian:cmake:
+debian:trixie:
   stage: build
   extends:
     - .monado.packaging.conditions
@@ -351,90 +351,90 @@ debian:cmake:
     - popd
 
   script:
-
     - .gitlab-ci/prebuild.sh
     - .gitlab-ci/ci-cmake-build.sh -DBUILD_DOC=ON -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
     - cd build && ctest --output-on-failure
+
   artifacts:
     untracked: true
     paths:
       - build/doc/html/
 
-debian:cmake-no-opencv:
+debian:trixie:opencv-off:
   stage: build
   extends:
     - .monado.image.debian:trixie
 
   script:
-
     - .gitlab-ci/prebuild.sh
     - .gitlab-ci/ci-cmake-build.sh -DXRT_HAVE_OPENCV=OFF
     - cd build && ctest --output-on-failure
 
-debian:cmake-no-sdl2:
+
+debian:trixie:sdl2-off:
   stage: build
   extends:
     - .monado.image.debian:trixie
 
   script:
-
     - .gitlab-ci/prebuild.sh
     - .gitlab-ci/ci-cmake-build.sh -DXRT_HAVE_SDL2=OFF
     - cd build && ctest --output-on-failure
 
-debian:cmake-no-service:
+
+debian:trixie:feature-service-off:
   stage: build
   extends:
     - .monado.image.debian:trixie
 
   script:
-
     - .gitlab-ci/prebuild.sh
     - .gitlab-ci/ci-cmake-build.sh -DXRT_FEATURE_SERVICE=OFF
     - cd build && ctest --output-on-failure
 
-debian:cmake:32bit:
+
+debian:trixie:32bit:
   stage: build
   extends:
     - .monado.image.debian:trixie
 
   script:
-
     - .gitlab-ci/prebuild.sh
     - .gitlab-ci/ci-cmake-build.sh -DCMAKE_TOOLCHAIN_FILE=.gitlab-ci/i386.cmake -DXRT_HAVE_OPENCV=OFF
     - cd build && ctest --output-on-failure
 
-debian:bookworm:cmake:
+
+debian:bookworm:
   stage: build
   extends:
     - .monado.image.debian:bookworm
 
   script:
-
     - .gitlab-ci/prebuild.sh
     - .gitlab-ci/ci-cmake-build.sh -DCMAKE_BUILD_TYPE=Debug
-    - mkdir -p "debian:bookworm:cmake"
-    - pahole --sizes --class_name file://build/ipc-structs.txt build/src/xrt/targets/openxr/libopenxr_monado.so > "debian:bookworm:cmake/ipc-sizes.txt"
+    - mkdir -p "debian:bookworm"
+    - pahole --sizes --class_name file://build/ipc-structs.txt build/src/xrt/targets/openxr/libopenxr_monado.so > "debian:bookworm/ipc-sizes.txt"
     - cd build && ctest --output-on-failure
+
   artifacts:
     paths:
-      - debian:bookworm:cmake/ipc-sizes.txt
+      - debian:bookworm/ipc-sizes.txt
 
-debian:bookworm:cmake:32bit:
+debian:bookworm:32bit:
   stage: build
   extends:
     - .monado.image.debian:bookworm
 
   script:
-
     - .gitlab-ci/prebuild.sh
     - .gitlab-ci/ci-cmake-build.sh -DCMAKE_BUILD_TYPE=Debug -DCMAKE_TOOLCHAIN_FILE=.gitlab-ci/i386.cmake
-    - mkdir -p "debian:bookworm:cmake:32bit"
-    - pahole --sizes --class_name file://build/ipc-structs.txt build/src/xrt/targets/openxr/libopenxr_monado.so > "debian:bookworm:cmake:32bit/ipc-sizes.txt"
+    - mkdir -p "debian:bookworm:32bit"
+    - pahole --sizes --class_name file://build/ipc-structs.txt build/src/xrt/targets/openxr/libopenxr_monado.so > "debian:bookworm:32bit/ipc-sizes.txt"
     - cd build && ctest --output-on-failure
+
   artifacts:
     paths:
-      - debian:bookworm:cmake:32bit/ipc-sizes.txt
+      - debian:bookworm:32bit/ipc-sizes.txt
 
 ndk:armeabi-v7a:
   stage: build
@@ -442,7 +442,6 @@ ndk:armeabi-v7a:
     - .monado.image.debian:bookworm-ndk
 
   script:
-
     - .gitlab-ci/prebuild.sh
     - .gitlab-ci/ci-cmake-build.sh -DANDROID_ABI=armeabi-v7a -DANDROID_PLATFORM=26 -DCMAKE_TOOLCHAIN_FILE=/opt/android-ndk/build/cmake/android.toolchain.cmake -DEigen3_DIR=/usr/share/eigen3/cmake/
 
@@ -452,7 +451,6 @@ ndk:arm64-v8a:
     - .monado.image.debian:bookworm-ndk
 
   script:
-
     - .gitlab-ci/prebuild.sh
     - .gitlab-ci/ci-cmake-build.sh -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=26 -DCMAKE_TOOLCHAIN_FILE=/opt/android-ndk/build/cmake/android.toolchain.cmake -DEigen3_DIR=/usr/share/eigen3/cmake/
 
@@ -473,7 +471,6 @@ android:spotlessCheck:
       - .gradlehome/caches
 
   script:
-
     - .gitlab-ci/prebuild.sh
     - .gitlab-ci/ci-gradle-build.sh spotlessCheck
 
@@ -494,7 +491,6 @@ android:outOfProcessDebug:
       - .gradlehome/caches
 
   script:
-
     - .gitlab-ci/prebuild.sh
     - .gitlab-ci/ci-gradle-build.sh assembleOutOfProcessDebug
   artifacts:
@@ -518,7 +514,6 @@ android:inProcessDebug:
       - .gradlehome/caches
 
   script:
-
     - .gitlab-ci/prebuild.sh
     - .gitlab-ci/ci-gradle-build.sh assembleInProcessDebug
   artifacts:
@@ -543,7 +538,6 @@ android:outOfProcessRelease:
       - .gradlehome/caches
 
   script:
-
     - .gitlab-ci/prebuild.sh
     - base64 --decode ${MONADO_ANDROID_KEYSTORE} > monado-release.jks
     - .gitlab-ci/ci-gradle-build.sh assembleOutOfProcessRelease
@@ -569,7 +563,6 @@ android:inProcessRelease:
       - .gradlehome/caches
 
   script:
-
     - .gitlab-ci/prebuild.sh
     - base64 --decode ${MONADO_ANDROID_KEYSTORE} > monado-release.jks
     - .gitlab-ci/ci-gradle-build.sh assembleInProcessRelease
@@ -577,60 +570,60 @@ android:inProcessRelease:
     paths:
       - src/xrt/targets/openxr_android/build/outputs/apk/inProcess
 
-ubuntu:jammy:cmake:
+ubuntu:jammy:
   stage: build
   extends:
     - .monado.image.ubuntu:jammy
 
   script:
-
     - .gitlab-ci/prebuild.sh
     - .gitlab-ci/ci-cmake-build.sh
     - cd build && ctest --output-on-failure
 
-ubuntu:noble:cmake:
+
+ubuntu:noble:
   stage: build
   extends:
     - .monado.image.ubuntu:noble
 
   script:
-
     - .gitlab-ci/prebuild.sh
     - .gitlab-ci/ci-cmake-build.sh
     - cd build && ctest --output-on-failure
 
-arch:cmake:
+
+arch:
   stage: build
   extends:
     - .monado.image.arch
 
   script:
-
     - .gitlab-ci/prebuild.sh
     - .gitlab-ci/ci-cmake-build.sh
     - cd build && ctest --output-on-failure
 
-arch:cmake:clang:
+
+arch:clang:
   stage: build
   extends:
     - .monado.image.arch
 
   script:
-
     - .gitlab-ci/prebuild.sh
     - .gitlab-ci/ci-cmake-build.sh -DCMAKE_C_COMPILER=/usr/bin/clang -DCMAKE_CXX_COMPILER=/usr/bin/clang++
     - cd build && ctest --output-on-failure
 
-alpine:cmake:
+
+alpine:
   stage: build
   extends:
     - .monado.image.alpine
 
   script:
-
     - .gitlab-ci/prebuild.sh
     - .gitlab-ci/ci-cmake-build.sh
     - cd build && ctest --output-on-failure
+
 
 # Windows build
 windows:
@@ -651,11 +644,11 @@ ipc-32-64-compatibility:
   stage: check
   extends:
     - .build-rules
-  dependencies: ["debian:cmake-no-opencv", "debian:cmake:32bit"]
-  needs: ["debian:cmake-no-opencv", "debian:cmake:32bit"]
+  dependencies: ["debian:bookworm", "debian:bookworm:32bit"]
+  needs: ["debian:bookworm", "debian:bookworm:32bit"]
   script:
-    - diff -du "debian:cmake-no-opencv/ipc-sizes.txt" "debian:cmake:32bit/ipc-sizes.txt"
-    - cmp "debian:cmake-no-opencv/ipc-sizes.txt" "debian:cmake:32bit/ipc-sizes.txt"
+    - diff -du "debian:bookworm/ipc-sizes.txt" "debian:bookworm:32bit/ipc-sizes.txt"
+    - cmp "debian:bookworm/ipc-sizes.txt" "debian:bookworm:32bit/ipc-sizes.txt"
 
 clang-tidy:
   extends:
@@ -663,9 +656,9 @@ clang-tidy:
     - .monado.image.debian:trixie
   stage: check
   dependencies:
-    - debian:cmake
+    - debian:trixie
   needs:
-    - debian:cmake
+    - debian:trixie
   script:
     - run-clang-tidy -quiet -allow-no-checks -p build
 
@@ -804,7 +797,7 @@ pages:
   extends:
     - .monado.packaging.conditions
   needs:
-    - debian:cmake
+    - debian:trixie
     - reprepro:package
   script:
     - mkdir -p public
