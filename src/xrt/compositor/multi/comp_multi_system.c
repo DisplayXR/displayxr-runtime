@@ -879,6 +879,16 @@ composite_layers_to_intermediate(struct multi_compositor *mc,
 		return false;
 	}
 
+	// Recreate composite resources if projection size changed (window resize)
+	if (mc->session_render.composite_initialized &&
+	    ((uint32_t)imgW != mc->session_render.composite_width ||
+	     (uint32_t)imgH != mc->session_render.composite_height)) {
+		U_LOG_W("[composite] Projection size changed %ux%u -> %ux%u, recreating",
+		        mc->session_render.composite_width, mc->session_render.composite_height,
+		        (uint32_t)imgW, (uint32_t)imgH);
+		fini_composite_resources(mc, vk);
+	}
+
 	// Lazily init composite resources if needed
 	if (!mc->session_render.composite_initialized) {
 		if (!init_composite_resources(mc, vk, (uint32_t)imgW, (uint32_t)imgH, imgFmt)) {
@@ -1069,13 +1079,16 @@ composite_layers_to_intermediate(struct multi_compositor *mc,
 			float half_disp = ws->disparity / 2.0f;
 			float eye_shift = (eye == 0) ? -half_disp : half_disp;
 
-			// Window-space fractional coords → NDC [-1, 1]
+			// Window-space fractional coords → Vulkan NDC [-1, 1]
+			// Vulkan NDC: Y=-1 is top, Y=+1 is bottom.
+			// Shader flips Y (pos.y = -pos.y), so ndc_sy must be negative
+			// to map shader top (+0.5) to Vulkan top (NDC -1).
 			float frac_cx = ws->x + ws->width / 2.0f + eye_shift;
 			float frac_cy = ws->y + ws->height / 2.0f;
 			float ndc_cx = frac_cx * 2.0f - 1.0f;
-			float ndc_cy = 1.0f - frac_cy * 2.0f;
+			float ndc_cy = frac_cy * 2.0f - 1.0f;
 			float ndc_sx = ws->width * 2.0f;
-			float ndc_sy = ws->height * 2.0f;
+			float ndc_sy = -(ws->height * 2.0f);
 
 			// Build orthographic MVP (quad vert shader uses [-0.5, 0.5] unit quad)
 			struct xrt_matrix_4x4 mvp;
