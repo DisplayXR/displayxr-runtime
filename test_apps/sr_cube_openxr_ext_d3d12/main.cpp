@@ -37,6 +37,7 @@ static const wchar_t* WINDOW_TITLE = L"SR Cube OpenXR Ext D3D12 (Press ESC to ex
 static InputState g_inputState;
 static std::mutex g_inputMutex;
 static std::atomic<bool> g_running{true};
+static XrSessionManager* g_xr = nullptr;
 static UINT g_windowWidth = 1280;
 static UINT g_windowHeight = 720;
 
@@ -64,14 +65,19 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
 
     case WM_CLOSE:
+        // Graceful shutdown: ask OpenXR to end the session so the state machine
+        // runs STOPPING -> xrEndSession -> EXITING -> exitRequested before cleanup.
+        if (g_xr && g_xr->session != XR_NULL_HANDLE && g_xr->sessionRunning) {
+            xrRequestExitSession(g_xr->session);
+            return 0;
+        }
         g_running.store(false);
         PostQuitMessage(0);
         return 0;
 
     case WM_KEYDOWN:
         if (wParam == VK_ESCAPE) {
-            g_running.store(false);
-            PostQuitMessage(0);
+            PostMessage(hwnd, WM_CLOSE, 0, 0);
             return 0;
         }
         break;
@@ -291,8 +297,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     // Initialize OpenXR
     XrSessionManager xr = {};
+    g_xr = &xr;
     if (!InitializeOpenXR(xr)) {
         LOG_ERROR("OpenXR initialization failed");
+        g_xr = nullptr;
         ShutdownLogging();
         return 1;
     }
@@ -392,6 +400,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     LOG_INFO("");
     LOG_INFO("=== Shutting down ===");
 
+    g_xr = nullptr;
     CleanupOpenXR(xr);
     CleanupD3D12(renderer);
 

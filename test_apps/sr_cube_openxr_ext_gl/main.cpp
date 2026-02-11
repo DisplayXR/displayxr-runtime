@@ -41,6 +41,7 @@ static const wchar_t* WINDOW_TITLE = L"SR Cube OpenXR Ext OpenGL (Press ESC to e
 static InputState g_inputState;
 static std::mutex g_inputMutex;
 static std::atomic<bool> g_running{true};
+static XrSessionManager* g_xr = nullptr;
 static UINT g_windowWidth = 1280;
 static UINT g_windowHeight = 720;
 
@@ -68,14 +69,19 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
 
     case WM_CLOSE:
+        // Graceful shutdown: ask OpenXR to end the session so the state machine
+        // runs STOPPING -> xrEndSession -> EXITING -> exitRequested before cleanup.
+        if (g_xr && g_xr->session != XR_NULL_HANDLE && g_xr->sessionRunning) {
+            xrRequestExitSession(g_xr->session);
+            return 0;
+        }
         g_running.store(false);
         PostQuitMessage(0);
         return 0;
 
     case WM_KEYDOWN:
         if (wParam == VK_ESCAPE) {
-            g_running.store(false);
-            PostQuitMessage(0);
+            PostMessage(hwnd, WM_CLOSE, 0, 0);
             return 0;
         }
         break;
@@ -498,8 +504,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     // Initialize OpenXR (must happen after GL context is current for requirements query)
     XrSessionManager xr = {};
+    g_xr = &xr;
     if (!InitializeOpenXR(xr)) {
         LOG_ERROR("OpenXR initialization failed");
+        g_xr = nullptr;
         wglMakeCurrent(nullptr, nullptr);
         wglDeleteContext(hGLRC);
         ShutdownLogging();
@@ -645,6 +653,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     if (hudOk) CleanupHudRenderer(hudRenderer);
     CleanupGLRenderer(glRenderer);
+    g_xr = nullptr;
     CleanupOpenXR(xr);
 
     wglMakeCurrent(nullptr, nullptr);

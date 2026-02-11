@@ -37,6 +37,7 @@ static const wchar_t* WINDOW_TITLE = L"SR Cube OpenXR Ext - XR_EXT_win32_window_
 // Global state (single-threaded — all accessed from the main thread only)
 static InputState g_inputState;
 static bool g_running = true;
+static XrSessionManager* g_xr = nullptr;
 static UINT g_windowWidth = 1280;
 static UINT g_windowHeight = 720;
 static bool g_inSizeMove = false;  // True while user is dragging/resizing the window
@@ -127,14 +128,19 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         break;
 
     case WM_CLOSE:
+        // Graceful shutdown: ask OpenXR to end the session so the state machine
+        // runs STOPPING -> xrEndSession -> EXITING -> exitRequested before cleanup.
+        if (g_xr && g_xr->session != XR_NULL_HANDLE && g_xr->sessionRunning) {
+            xrRequestExitSession(g_xr->session);
+            return 0;
+        }
         g_running = false;
         PostQuitMessage(0);
         return 0;
 
     case WM_KEYDOWN:
         if (wParam == VK_ESCAPE) {
-            g_running = false;
-            PostQuitMessage(0);
+            PostMessage(hwnd, WM_CLOSE, 0, 0);
             return 0;
         }
         break;
@@ -447,9 +453,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     // Initialize OpenXR
     LOG_INFO("Initializing OpenXR...");
     XrSessionManager xr = {};
+    g_xr = &xr;
     if (!InitializeOpenXR(xr)) {
         LOG_ERROR("OpenXR initialization failed");
         MessageBox(hwnd, L"Failed to initialize OpenXR", L"Error", MB_OK | MB_ICONERROR);
+        g_xr = nullptr;
         ShutdownLogging();
         return 1;
     }
@@ -624,6 +632,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         depthTextures[eye].Reset();
     }
 
+    g_xr = nullptr;
     CleanupOpenXR(xr);
     CleanupTextOverlay(textOverlay);
     CleanupD3D11(renderer);
