@@ -89,6 +89,19 @@ bool CreateSpaces(XrSessionManager& xr) {
     XR_CHECK_LOG(xrCreateReferenceSpace(xr.session, &viewSpaceInfo, &xr.viewSpace));
     LOG_INFO("VIEW space created: 0x%p", (void*)xr.viewSpace);
 
+    // Create DISPLAY reference space (if available)
+    XrReferenceSpaceCreateInfo displaySpaceInfo = {XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+    displaySpaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_DISPLAY_EXT;
+    displaySpaceInfo.poseInReferenceSpace.orientation = {0, 0, 0, 1};
+    displaySpaceInfo.poseInReferenceSpace.position = {0, 0, 0};
+    XrResult displayResult = xrCreateReferenceSpace(xr.session, &displaySpaceInfo, &xr.displaySpace);
+    if (XR_SUCCEEDED(displayResult)) {
+        LOG_INFO("DISPLAY space created: 0x%p", (void*)xr.displaySpace);
+    } else {
+        LOG_INFO("DISPLAY space not available (expected if extension disabled)");
+        xr.displaySpace = XR_NULL_HANDLE;
+    }
+
     LOG_INFO("Reference spaces created successfully");
     return true;
 }
@@ -323,7 +336,7 @@ bool LocateViews(
     XrViewLocateInfo locateInfo = {XR_TYPE_VIEW_LOCATE_INFO};
     locateInfo.viewConfigurationType = xr.viewConfigType;
     locateInfo.displayTime = displayTime;
-    locateInfo.space = xr.localSpace;
+    locateInfo.space = (xr.displaySpace != XR_NULL_HANDLE) ? xr.displaySpace : xr.localSpace;
 
     XrViewState viewState = {XR_TYPE_VIEW_STATE};
     uint32_t viewCount = 2;
@@ -416,7 +429,7 @@ bool ReleaseSwapchainImage(XrSessionManager& xr, int eye) {
 
 bool EndFrame(XrSessionManager& xr, XrTime displayTime, const XrCompositionLayerProjectionView* views) {
     XrCompositionLayerProjection projectionLayer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
-    projectionLayer.space = xr.localSpace;
+    projectionLayer.space = (xr.displaySpace != XR_NULL_HANDLE) ? xr.displaySpace : xr.localSpace;
     projectionLayer.viewCount = 2;
     projectionLayer.views = views;
 
@@ -507,7 +520,7 @@ bool EndFrameWithWindowSpaceHud(
 ) {
     // Projection layer for the 3D scene
     XrCompositionLayerProjection projectionLayer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
-    projectionLayer.space = xr.localSpace;
+    projectionLayer.space = (xr.displaySpace != XR_NULL_HANDLE) ? xr.displaySpace : xr.localSpace;
     projectionLayer.viewCount = 2;
     projectionLayer.views = projViews;
 
@@ -743,7 +756,7 @@ bool EndFrameWithQuadLayer(
 ) {
     // Projection layer for the 3D scene
     XrCompositionLayerProjection projectionLayer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
-    projectionLayer.space = xr.localSpace;
+    projectionLayer.space = (xr.displaySpace != XR_NULL_HANDLE) ? xr.displaySpace : xr.localSpace;
     projectionLayer.viewCount = 2;
     projectionLayer.views = projViews;
 
@@ -810,6 +823,12 @@ void CleanupOpenXR(XrSessionManager& xr) {
             xrDestroySwapchain(xr.swapchains[eye].swapchain);
             xr.swapchains[eye].swapchain = XR_NULL_HANDLE;
         }
+    }
+
+    if (xr.displaySpace != XR_NULL_HANDLE) {
+        LOG_INFO("Destroying DISPLAY space...");
+        xrDestroySpace(xr.displaySpace);
+        xr.displaySpace = XR_NULL_HANDLE;
     }
 
     if (xr.viewSpace != XR_NULL_HANDLE) {

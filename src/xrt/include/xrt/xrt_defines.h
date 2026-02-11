@@ -600,6 +600,7 @@ enum xrt_reference_space_type
 	XRT_SPACE_REFERENCE_TYPE_LOCAL_FLOOR,
 	XRT_SPACE_REFERENCE_TYPE_STAGE,
 	XRT_SPACE_REFERENCE_TYPE_UNBOUNDED,
+	XRT_SPACE_REFERENCE_TYPE_DISPLAY,
 };
 
 /*!
@@ -607,7 +608,7 @@ enum xrt_reference_space_type
  *
  * @ingroup xrt_iface
  */
-#define XRT_SPACE_REFERENCE_TYPE_COUNT (XRT_SPACE_REFERENCE_TYPE_UNBOUNDED + 1)
+#define XRT_SPACE_REFERENCE_TYPE_COUNT (XRT_SPACE_REFERENCE_TYPE_DISPLAY + 1)
 
 /*!
  * An invalid @ref xrt_reference_space_type, since it's invalid it's not listed

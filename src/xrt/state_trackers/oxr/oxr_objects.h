@@ -1529,7 +1529,7 @@ struct oxr_system
 	uint32_t blend_mode_count;
 	XrEnvironmentBlendMode blend_modes[3];
 
-	XrReferenceSpaceType reference_spaces[5];
+	XrReferenceSpaceType reference_spaces[6];
 	uint32_t reference_space_count;
 
 	//! Cache of the last known system roles, see @ref xrt_system_roles::generation_id
@@ -2353,6 +2353,7 @@ oxr_space_type_is_reference(enum oxr_space_type space_type)
 	case OXR_SPACE_TYPE_REFERENCE_UNBOUNDED_MSFT:
 	case OXR_SPACE_TYPE_REFERENCE_COMBINED_EYE_VARJO:
 	case OXR_SPACE_TYPE_REFERENCE_LOCALIZATION_MAP_ML:
+	case OXR_SPACE_TYPE_REFERENCE_DISPLAY_EXT:
 		// These are reference spaces.
 		return true;
 
