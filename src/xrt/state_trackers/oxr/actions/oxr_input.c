@@ -889,6 +889,18 @@ get_binding(struct oxr_logger *log,
 	}
 }
 
+static bool
+get_by_name(struct oxr_session *sess, enum xrt_device_name name, struct oxr_interaction_profile **out_p)
+{
+	return oxr_interaction_profile_array_find_by_device_name(&sess->profiles_on_attachment, name, out_p);
+}
+
+static bool
+get_by_device(struct oxr_session *sess, struct xrt_device *xdev, struct oxr_interaction_profile **out_p)
+{
+	return oxr_interaction_profile_array_find_by_device(&sess->profiles_on_attachment, xdev, out_p);
+}
+
 static void
 oxr_find_profiles_from_roles(struct oxr_logger *log,
                              struct oxr_session *sess,
@@ -896,12 +908,13 @@ oxr_find_profiles_from_roles(struct oxr_logger *log,
                              struct oxr_profiles_per_subaction *out_profiles)
 {
 #define FIND_PROFILE(X)                                                                                                \
-	if (!oxr_get_profile_for_device_name(log, sess, GET_PROFILE_NAME_BY_ROLE(roles, X), &out_profiles->X)) {       \
+	if (!get_by_name(sess, GET_PROFILE_NAME_BY_ROLE(roles, X), &out_profiles->X)) {                                \
 		struct xrt_device *xdev = GET_XDEV_BY_ROLE(roles, X);                                                  \
 		if (xdev != NULL) {                                                                                    \
-			oxr_find_profile_for_device(log, sess, xdev, &out_profiles->X);                                \
+			get_by_device(sess, xdev, &out_profiles->X);                                                   \
 		}                                                                                                      \
 	}
+
 	OXR_FOR_EACH_VALID_SUBACTION_PATH(FIND_PROFILE)
 #undef FIND_PROFILE
 }
@@ -1846,33 +1859,14 @@ oxr_handle_base_get_num_children(struct oxr_handle_base *hb)
 	return ret;
 }
 
-static void
-oxr_clone_profiles_to_session(struct oxr_logger *log, struct oxr_instance *inst, struct oxr_session *sess)
-{
-
-	if (inst == NULL || sess == NULL)
-		return;
-
-	oxr_session_binding_destroy_all(log, sess);
-
-	if (inst->profiles == NULL || inst->profile_count == 0)
-		return;
-
-	sess->profiles_on_attachment_size = inst->profile_count;
-	sess->profiles_on_attachment = U_TYPED_ARRAY_CALLOC(struct oxr_interaction_profile *, inst->profile_count);
-
-	for (size_t profile_idx = 0; profile_idx < inst->profile_count; ++profile_idx) {
-		sess->profiles_on_attachment[profile_idx] = oxr_interaction_profile_clone(inst->profiles[profile_idx]);
-	}
-}
-
 XrResult
 oxr_session_attach_action_sets(struct oxr_logger *log,
                                struct oxr_session *sess,
                                const XrSessionActionSetsAttachInfo *bindInfo)
 {
 	struct oxr_instance *inst = sess->sys->inst;
-	oxr_clone_profiles_to_session(log, inst, sess);
+
+	oxr_interaction_profile_array_clone(&inst->profiles, &sess->profiles_on_attachment);
 
 	// Allocate room for list. No need to check if anything has been
 	// attached the API function does that.

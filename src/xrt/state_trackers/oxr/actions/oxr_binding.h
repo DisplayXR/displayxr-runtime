@@ -24,31 +24,6 @@ extern "C" {
 
 /*
  *
- * Destroy functions.
- *
- */
-
-/*!
- * Destroy all interaction profiles associated with the instance.
- *
- * @param log Logger
- * @param inst Instance
- * @public @memberof oxr_instance
- */
-void
-oxr_binding_destroy_all(struct oxr_logger *log, struct oxr_instance *inst);
-
-/*!
- * Free all memory allocated by the binding system.
- *
- * @public @memberof oxr_instance
- */
-void
-oxr_session_binding_destroy_all(struct oxr_logger *log, struct oxr_session *sess);
-
-
-/*
- *
  * Binding functions
  *
  */
@@ -71,28 +46,6 @@ oxr_interaction_profile_destroy(struct oxr_interaction_profile *profile);
  */
 struct oxr_interaction_profile *
 oxr_interaction_profile_clone(const struct oxr_interaction_profile *src_profile);
-
-/*!
- * Find the best matching profile for the given @ref xrt_device.
- *
- * @param      log   Logger.
- * @param      sess  Session.
- * @param      xdev  Can be null.
- * @param[out] out_p Returned interaction profile.
- *
- * @public @memberof oxr_session
- */
-void
-oxr_find_profile_for_device(struct oxr_logger *log,
-                            struct oxr_session *sess,
-                            struct xrt_device *xdev,
-                            struct oxr_interaction_profile **out_p);
-
-bool
-oxr_get_profile_for_device_name(struct oxr_logger *log,
-                                struct oxr_session *sess,
-                                enum xrt_device_name name,
-                                struct oxr_interaction_profile **out_p);
 
 /*!
  * Find bindings from action key in a profile.

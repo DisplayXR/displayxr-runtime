@@ -25,6 +25,8 @@ add_library(
 	actions/oxr_input.h
 	actions/oxr_input_transform.c
 	actions/oxr_input_transform.h
+	actions/oxr_interaction_profile_array.c
+	actions/oxr_interaction_profile_array.h
 	actions/oxr_set_haptic.c
 	actions/oxr_set_haptic.h
 	common/oxr_defines.h

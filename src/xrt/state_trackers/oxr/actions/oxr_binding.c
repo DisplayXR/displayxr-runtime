@@ -15,6 +15,7 @@
 #include "oxr_subaction.h"
 #include "oxr_generated_bindings.h"
 #include "oxr_dpad_state.h"
+#include "oxr_interaction_profile_array.h"
 
 #include "../oxr_objects.h"
 #include "../oxr_logger.h"
@@ -48,59 +49,6 @@ setup_paths(struct oxr_logger *log,
 }
 
 static bool
-interaction_profile_find_in_array(struct oxr_logger *log,
-                                  const size_t profile_count,
-                                  struct oxr_interaction_profile **profiles,
-                                  XrPath path,
-                                  struct oxr_interaction_profile **out_p)
-{
-	if (profiles == NULL)
-		return false;
-	for (size_t x = 0; x < profile_count; x++) {
-		struct oxr_interaction_profile *p = profiles[x];
-		if (p->path != path) {
-			continue;
-		}
-
-		*out_p = p;
-		return true;
-	}
-
-	return false;
-}
-
-static inline bool
-interaction_profile_find_in_instance(struct oxr_logger *log,
-                                     struct oxr_instance *inst,
-                                     XrPath path,
-                                     struct oxr_interaction_profile **out_p)
-{
-	if (interaction_profile_find_in_array( //
-	        log,                           //
-	        inst->profile_count,           //
-	        inst->profiles,                //
-	        path,                          //
-	        out_p)) {
-		return true;
-	}
-	return false;
-}
-
-static inline bool
-interaction_profile_find_in_session(struct oxr_logger *log,
-                                    struct oxr_session *sess,
-                                    XrPath path,
-                                    struct oxr_interaction_profile **out_p)
-{
-	return interaction_profile_find_in_array( //
-	    log,                                  //
-	    sess->profiles_on_attachment_size,    //
-	    sess->profiles_on_attachment,         //
-	    path,                                 //
-	    out_p);                               //
-}
-
-static bool
 get_subaction_path_from_path(struct oxr_logger *log,
                              struct oxr_instance *inst,
                              XrPath path,
@@ -112,7 +60,7 @@ interaction_profile_find_or_create_in_instance(struct oxr_logger *log,
                                                XrPath path,
                                                struct oxr_interaction_profile **out_p)
 {
-	if (interaction_profile_find_in_instance(log, inst, path, out_p)) {
+	if (oxr_interaction_profile_array_find_by_path(&inst->profiles, path, out_p)) {
 		return true;
 	}
 
@@ -187,8 +135,7 @@ interaction_profile_find_or_create_in_instance(struct oxr_logger *log,
 	}
 
 	// Add to the list of currently created interaction profiles.
-	U_ARRAY_REALLOC_OR_FREE(inst->profiles, struct oxr_interaction_profile *, (inst->profile_count + 1));
-	inst->profiles[inst->profile_count++] = p;
+	oxr_interaction_profile_array_add(&inst->profiles, p);
 
 	*out_p = p;
 
@@ -456,48 +403,6 @@ get_identifier_str_in_profile(struct oxr_logger *log,
 	return str;
 }
 
-bool
-oxr_get_profile_for_device_name(struct oxr_logger *log,
-                                struct oxr_session *sess,
-                                enum xrt_device_name name,
-                                struct oxr_interaction_profile **out_p)
-{
-	if (name == XRT_DEVICE_INVALID) {
-		return false;
-	}
-
-	/*
-	 * Map xrt_device_name to an interaction profile XrPath.
-	 *
-	 * There might be multiple OpenXR interaction profiles that maps to a
-	 * a single @ref xrt_device_name, so we can't just grab the first one
-	 * that we find and assume that wasn't bound then there isn't an OpenXR
-	 * interaction profile bound for that device name. So we will need to
-	 * keep looping until we find an OpenXR interaction profile, or we run
-	 * out of interaction profiles that the app has suggested.
-	 *
-	 * For XRT_DEVICE_HAND_INTERACTION both the OpenXR hand-interaction
-	 * profiles maps to it, but the app might only provide binding for one.
-	 *
-	 * Set *out_p to an oxr_interaction_profile if bindings for that
-	 * interaction profile XrPath have been suggested.
-	 */
-	for (uint32_t i = 0; i < ARRAY_SIZE(profile_templates); i++) {
-		if (name == profile_templates[i].name) {
-			interaction_profile_find_in_session(log, sess, profile_templates[i].path_cache, out_p);
-
-			/*
-			 * Keep looping even if the current matching OpenXR
-			 * interaction profile wasn't suggested by the app.
-			 * See comment above.
-			 */
-			if (*out_p != NULL) {
-				return true;
-			}
-		}
-	}
-	return false;
-}
 
 
 /*
@@ -623,32 +528,6 @@ oxr_interaction_profile_clone(const struct oxr_interaction_profile *src_profile)
 }
 
 void
-oxr_find_profile_for_device(struct oxr_logger *log,
-                            struct oxr_session *sess,
-                            struct xrt_device *xdev,
-                            struct oxr_interaction_profile **out_p)
-{
-	if (xdev == NULL) {
-		return;
-	}
-
-	// Have bindings for this device's interaction profile been suggested?
-	oxr_get_profile_for_device_name(log, sess, xdev->name, out_p);
-	if (*out_p != NULL) {
-		return;
-	}
-
-	// Check if bindings for any of this device's alternative interaction profiles have been suggested.
-	for (size_t i = 0; i < xdev->binding_profile_count; i++) {
-		struct xrt_binding_profile *xbp = &xdev->binding_profiles[i];
-		oxr_get_profile_for_device_name(log, sess, xbp->name, out_p);
-		if (*out_p != NULL) {
-			return;
-		}
-	}
-}
-
-void
 oxr_binding_find_bindings_from_act_key(struct oxr_logger *log,
                                        struct oxr_interaction_profile *profile,
                                        uint32_t key,
@@ -690,35 +569,6 @@ oxr_binding_find_bindings_from_act_key(struct oxr_logger *log,
 	*out_binding_count = binding_count;
 }
 
-static void
-oxr_destroy_profiles(struct oxr_interaction_profile **profiles, const size_t profile_count)
-{
-	if (profiles == NULL)
-		return;
-
-	for (size_t x = 0; x < profile_count; x++) {
-		struct oxr_interaction_profile *p = profiles[x];
-		oxr_interaction_profile_destroy(p);
-	}
-
-	free(profiles);
-}
-
-void
-oxr_binding_destroy_all(struct oxr_logger *log, struct oxr_instance *inst)
-{
-	oxr_destroy_profiles(inst->profiles, inst->profile_count);
-	inst->profiles = NULL;
-	inst->profile_count = 0;
-}
-
-void
-oxr_session_binding_destroy_all(struct oxr_logger *log, struct oxr_session *sess)
-{
-	oxr_destroy_profiles(sess->profiles_on_attachment, sess->profiles_on_attachment_size);
-	sess->profiles_on_attachment = NULL;
-	sess->profiles_on_attachment_size = 0;
-}
 
 /*
  *
@@ -822,7 +672,7 @@ oxr_action_get_input_source_localized_name(struct oxr_logger *log,
 	// Find the interaction profile.
 	struct oxr_interaction_profile *oip = NULL;
 	//! @todo: If we ever rebind a profile that has not been suggested by the client, it will not be found.
-	interaction_profile_find_in_session(log, sess, path, &oip);
+	oxr_interaction_profile_array_find_by_path(&sess->profiles_on_attachment, path, &oip);
 	if (oip == NULL) {
 		return oxr_error(log, XR_ERROR_RUNTIME_FAILURE, "no interaction profile found");
 	}

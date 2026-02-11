@@ -39,6 +39,8 @@
 
 #include "actions/oxr_subaction.h"
 #include "actions/oxr_dpad_state.h"
+#include "actions/oxr_interaction_profile_array.h"
+
 
 #if defined(XRT_HAVE_D3D11) || defined(XRT_HAVE_D3D12)
 #include <dxgi.h>
@@ -1251,8 +1253,7 @@ struct oxr_instance
 	} event;
 
 	//! Interaction profile bindings that have been suggested by the client.
-	struct oxr_interaction_profile **profiles;
-	size_t profile_count;
+	struct oxr_interaction_profile_array profiles;
 
 	struct oxr_session *sessions;
 
@@ -1455,8 +1456,7 @@ struct oxr_session
 	 * Clone of all suggested binding profiles at the point of action set/session attachment.
 	 * @ref oxr_session_attach_action_sets
 	 */
-	size_t profiles_on_attachment_size;
-	struct oxr_interaction_profile **profiles_on_attachment;
+	struct oxr_interaction_profile_array profiles_on_attachment;
 
 	//! Cache of the last known system roles generation_id
 	uint64_t dynamic_roles_generation_id;
