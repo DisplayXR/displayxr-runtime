@@ -1780,9 +1780,6 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 
 	struct xrt_compositor *xc = sess->compositor;
 
-	U_LOG_W("[frame_end] xc=%p layerCount=%u frame_id=%" PRId64, (void *)xc,
-	        frameEndInfo->layerCount, sess->frame_id.begun);
-
 	/*
 	 * Early out for headless sessions.
 	 */

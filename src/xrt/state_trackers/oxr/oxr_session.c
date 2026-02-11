@@ -275,9 +275,9 @@ compute_kooima_fov(const struct leiasr_eye_position *eye,
 	if (should_log) {
 		float h_fov_deg = (out_fov->angle_right - out_fov->angle_left) * 180.0f / 3.14159265f;
 		float v_fov_deg = (out_fov->angle_up - out_fov->angle_down) * 180.0f / 3.14159265f;
-		U_LOG_W("Kooima FOV [%s]: eye=(%.4f,%.4f,%.4f)m, screen=%.4fx%.4fm",
+		U_LOG_I("Kooima FOV [%s]: eye=(%.4f,%.4f,%.4f)m, screen=%.4fx%.4fm",
 		        eye_name, eye->x, eye->y, eye->z, screen_width_m, screen_height_m);
-		U_LOG_W("  [%s] angles: L=%.2f° R=%.2f° U=%.2f° D=%.2f° (H=%.2f° V=%.2f°)",
+		U_LOG_I("  [%s] angles: L=%.2f° R=%.2f° U=%.2f° D=%.2f° (H=%.2f° V=%.2f°)",
 		        eye_name,
 		        out_fov->angle_left * 180.0f / 3.14159265f,
 		        out_fov->angle_right * 180.0f / 3.14159265f,
@@ -940,7 +940,7 @@ oxr_session_locate_views(struct oxr_logger *log,
 			world_head_ori = display_ori;
 
 			if (sr_should_log) {
-				U_LOG_W("Display pose: pos=(%.3f,%.3f,%.3f) ori=(%.3f,%.3f,%.3f,%.3f)",
+				U_LOG_I("Display pose: pos=(%.3f,%.3f,%.3f) ori=(%.3f,%.3f,%.3f,%.3f)",
 				        display_pos.x, display_pos.y, display_pos.z,
 				        display_ori.x, display_ori.y, display_ori.z, display_ori.w);
 			}
@@ -983,7 +983,7 @@ oxr_session_locate_views(struct oxr_logger *log,
 			// adj_right.y -= wm.window_center_offset_y_m;
 
 			if (sr_should_log) {
-				U_LOG_W("Window-adaptive FOV: vs=%.3f, screen=%.4fx%.4fm, "
+				U_LOG_I("Window-adaptive FOV: vs=%.3f, screen=%.4fx%.4fm, "
 				        "eye_offset=(%.4f,%.4f)m",
 				        vs, screen_width_m, screen_height_m,
 				        wm.window_center_offset_x_m, wm.window_center_offset_y_m);
@@ -1009,14 +1009,14 @@ oxr_session_locate_views(struct oxr_logger *log,
 			float right_h_fov = (fovs[1].angle_right - fovs[1].angle_left) * 180.0f / 3.14159265f;
 			float left_v_fov = (fovs[0].angle_up - fovs[0].angle_down) * 180.0f / 3.14159265f;
 			float right_v_fov = (fovs[1].angle_up - fovs[1].angle_down) * 180.0f / 3.14159265f;
-			U_LOG_W("SR FOV comparison: Left eye H=%.2f° V=%.2f°, Right eye H=%.2f° V=%.2f°",
+			U_LOG_I("SR FOV comparison: Left eye H=%.2f° V=%.2f°, Right eye H=%.2f° V=%.2f°",
 			        left_h_fov, left_v_fov, right_h_fov, right_v_fov);
-			U_LOG_W("  Left  FOV: L=%.2f° R=%.2f° U=%.2f° D=%.2f°",
+			U_LOG_I("  Left  FOV: L=%.2f° R=%.2f° U=%.2f° D=%.2f°",
 			        fovs[0].angle_left * 180.0f / 3.14159265f,
 			        fovs[0].angle_right * 180.0f / 3.14159265f,
 			        fovs[0].angle_up * 180.0f / 3.14159265f,
 			        fovs[0].angle_down * 180.0f / 3.14159265f);
-			U_LOG_W("  Right FOV: L=%.2f° R=%.2f° U=%.2f° D=%.2f°",
+			U_LOG_I("  Right FOV: L=%.2f° R=%.2f° U=%.2f° D=%.2f°",
 			        fovs[1].angle_left * 180.0f / 3.14159265f,
 			        fovs[1].angle_right * 180.0f / 3.14159265f,
 			        fovs[1].angle_up * 180.0f / 3.14159265f,
@@ -1125,7 +1125,7 @@ oxr_session_locate_views(struct oxr_logger *log,
 				    world_head_ori.x, world_head_ori.y, world_head_ori.z, world_head_ori.w};
 
 				if (sr_should_log) {
-					U_LOG_W("Eye %d: sr_eye=(%.3f,%.3f,%.3f) display=(%.3f,%.3f,%.3f) "
+					U_LOG_I("Eye %d: sr_eye=(%.3f,%.3f,%.3f) display=(%.3f,%.3f,%.3f) "
 					        "-> view=(%.3f,%.3f,%.3f)",
 					        i, sr_eye.x, sr_eye.y, sr_eye.z,
 					        world_head_pos.x, world_head_pos.y, world_head_pos.z,

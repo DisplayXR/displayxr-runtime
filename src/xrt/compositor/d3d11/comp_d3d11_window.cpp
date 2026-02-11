@@ -284,24 +284,15 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	case WM_KEYUP:
 	case WM_SYSKEYDOWN:
 	case WM_SYSKEYUP:
-		// Diagnostic: log all key events
-		U_LOG_W("D3D11 window: KEY event msg=%u vk=%llu qwerty_enabled=%d xsysd=%p",
-		        message, (unsigned long long)wParam, w->qwerty_enabled, (void *)w->xsysd);
 #ifdef XRT_BUILD_DRIVER_QWERTY
 		// Forward keyboard input to qwerty driver
 		if (w->qwerty_enabled && w->xsysd != NULL) {
-			U_LOG_W("D3D11 window: Forwarding key to qwerty driver (xdev_count=%u)",
-			        (unsigned)w->xsysd->xdev_count);
 			bool handled = false;
 			qwerty_process_win32(w->xsysd->xdevs, w->xsysd->xdev_count,
 			                     message, wParam, lParam, &handled);
-			U_LOG_W("D3D11 window: qwerty_process_win32 returned handled=%d", handled);
 			if (handled) {
 				return 0;
 			}
-		} else {
-			U_LOG_W("D3D11 window: NOT forwarding key - qwerty_enabled=%d xsysd=%p",
-			        w->qwerty_enabled, (void *)w->xsysd);
 		}
 #else
 		U_LOG_W("D3D11 window: XRT_BUILD_DRIVER_QWERTY not defined!");

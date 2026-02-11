@@ -321,7 +321,7 @@ qwerty_get_tracked_pose(struct xrt_device *xd,
 	static bool first_pose_log = true;
 	if (first_pose_log) {
 		first_pose_log = false;
-		U_LOG_W("qwerty_get_tracked_pose: qd=%p yaw_delta=%.4f pitch_delta=%.4f (before consume)",
+		U_LOG_I("qwerty_get_tracked_pose: qd=%p yaw_delta=%.4f pitch_delta=%.4f (before consume)",
 		        (void *)qd, qd->yaw_delta, qd->pitch_delta);
 	}
 
@@ -348,7 +348,7 @@ qwerty_get_tracked_pose(struct xrt_device *xd,
 	if (any_movement) {
 		static int log_counter = 0;
 		if (log_counter++ % 60 == 0) { // Log once per ~60 calls to avoid spam
-			U_LOG_W("QWERTY pose: F=%d B=%d L=%d R=%d U=%d D=%d delta=(%.4f,%.4f,%.4f) pos=(%.3f,%.3f,%.3f)",
+			U_LOG_I("QWERTY pose: F=%d B=%d L=%d R=%d U=%d D=%d delta=(%.4f,%.4f,%.4f) pos=(%.3f,%.3f,%.3f)",
 			        qd->forward_pressed, qd->backward_pressed, qd->left_pressed,
 			        qd->right_pressed, qd->up_pressed, qd->down_pressed,
 			        pos_delta.x, pos_delta.y, pos_delta.z,
@@ -679,7 +679,7 @@ qwerty_add_look_delta(struct qwerty_device *qd, float yaw, float pitch)
 	static bool first_log = true;
 	if (first_log) {
 		first_log = false;
-		U_LOG_W("qwerty_add_look_delta: qd=%p yaw_delta=%.4f pitch_delta=%.4f",
+		U_LOG_I("qwerty_add_look_delta: qd=%p yaw_delta=%.4f pitch_delta=%.4f",
 		        (void *)qd, qd->yaw_delta, qd->pitch_delta);
 	}
 }
