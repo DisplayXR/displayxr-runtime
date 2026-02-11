@@ -197,11 +197,15 @@ static void RenderThreadFunc(
                         inputSnapshot.cameraPosX, inputSnapshot.cameraPosY, inputSnapshot.cameraPosZ,
                         inputSnapshot.yaw, inputSnapshot.pitch)) {
 
-                        // Get raw view poses for projection views
+                        // Get raw view poses for projection views.
+                        // Use DISPLAY space when available: it is physically anchored to the
+                        // display center and unaffected by recentering, which is the correct
+                        // reference for compositing on tracked 3D displays.
+                        // Falls back to LOCAL space if XR_EXT_display_info is not enabled.
                         XrViewLocateInfo locateInfo = {XR_TYPE_VIEW_LOCATE_INFO};
                         locateInfo.viewConfigurationType = xr->viewConfigType;
                         locateInfo.displayTime = frameState.predictedDisplayTime;
-                        locateInfo.space = xr->localSpace;
+                        locateInfo.space = (xr->displaySpace != XR_NULL_HANDLE) ? xr->displaySpace : xr->localSpace;
 
                         XrViewState viewState = {XR_TYPE_VIEW_STATE};
                         uint32_t viewCount = 2;

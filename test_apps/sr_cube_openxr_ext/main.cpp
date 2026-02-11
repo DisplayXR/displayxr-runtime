@@ -271,11 +271,15 @@ static void RenderOneFrame(RenderState& rs) {
                     g_inputState.cameraPosX, g_inputState.cameraPosY, g_inputState.cameraPosZ,
                     g_inputState.yaw, g_inputState.pitch)) {
 
-                    // Get raw view poses (pre-player-transform) for projection views
+                    // Get raw view poses (pre-player-transform) for projection views.
+                    // Use DISPLAY space when available: it is physically anchored to the
+                    // display center and unaffected by recentering, which is the correct
+                    // reference for compositing on tracked 3D displays.
+                    // Falls back to LOCAL space if XR_EXT_display_info is not enabled.
                     XrViewLocateInfo locateInfo = {XR_TYPE_VIEW_LOCATE_INFO};
                     locateInfo.viewConfigurationType = xr.viewConfigType;
                     locateInfo.displayTime = frameState.predictedDisplayTime;
-                    locateInfo.space = xr.localSpace;
+                    locateInfo.space = (xr.displaySpace != XR_NULL_HANDLE) ? xr.displaySpace : xr.localSpace;
 
                     XrViewState viewState = {XR_TYPE_VIEW_STATE};
                     uint32_t viewCount = 2;
