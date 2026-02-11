@@ -89,7 +89,14 @@ bool CreateSpaces(XrSessionManager& xr) {
     XR_CHECK_LOG(xrCreateReferenceSpace(xr.session, &viewSpaceInfo, &xr.viewSpace));
     LOG_INFO("VIEW space created: 0x%p", (void*)xr.viewSpace);
 
-    // Create DISPLAY reference space (if available)
+    // Create DISPLAY reference space (XR_EXT_display_info v2).
+    // DISPLAY space is physically anchored to the display center and is NOT affected
+    // by xrRecenterSpace or any recentering of LOCAL space. For tracked 3D displays
+    // the origin is at display center with +X right, +Y up, +Z toward the viewer —
+    // identical to LOCAL at startup, but semantically distinct.
+    // Apps should prefer DISPLAY space for view location and layer submission so that
+    // content stays locked to the physical display regardless of recentering.
+    // Falls back to LOCAL space if the extension is not enabled.
     XrReferenceSpaceCreateInfo displaySpaceInfo = {XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
     displaySpaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_DISPLAY_EXT;
     displaySpaceInfo.poseInReferenceSpace.orientation = {0, 0, 0, 1};
@@ -336,6 +343,8 @@ bool LocateViews(
     XrViewLocateInfo locateInfo = {XR_TYPE_VIEW_LOCATE_INFO};
     locateInfo.viewConfigurationType = xr.viewConfigType;
     locateInfo.displayTime = displayTime;
+    // Use DISPLAY space if available — it is physically anchored to the display
+    // and unaffected by recentering. Fall back to LOCAL space otherwise.
     locateInfo.space = (xr.displaySpace != XR_NULL_HANDLE) ? xr.displaySpace : xr.localSpace;
 
     XrViewState viewState = {XR_TYPE_VIEW_STATE};
@@ -429,6 +438,7 @@ bool ReleaseSwapchainImage(XrSessionManager& xr, int eye) {
 
 bool EndFrame(XrSessionManager& xr, XrTime displayTime, const XrCompositionLayerProjectionView* views) {
     XrCompositionLayerProjection projectionLayer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+    // Submit layers in DISPLAY space (physically anchored) when available, LOCAL otherwise.
     projectionLayer.space = (xr.displaySpace != XR_NULL_HANDLE) ? xr.displaySpace : xr.localSpace;
     projectionLayer.viewCount = 2;
     projectionLayer.views = views;
@@ -518,7 +528,7 @@ bool EndFrameWithWindowSpaceHud(
     float hudX, float hudY, float hudWidth, float hudHeight,
     float hudDisparity
 ) {
-    // Projection layer for the 3D scene
+    // Projection layer — use DISPLAY space (physically anchored) when available
     XrCompositionLayerProjection projectionLayer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
     projectionLayer.space = (xr.displaySpace != XR_NULL_HANDLE) ? xr.displaySpace : xr.localSpace;
     projectionLayer.viewCount = 2;
@@ -754,7 +764,7 @@ bool EndFrameWithQuadLayer(
     const XrPosef& quadPose,
     float quadWidth, float quadHeight
 ) {
-    // Projection layer for the 3D scene
+    // Projection layer — use DISPLAY space (physically anchored) when available
     XrCompositionLayerProjection projectionLayer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
     projectionLayer.space = (xr.displaySpace != XR_NULL_HANDLE) ? xr.displaySpace : xr.localSpace;
     projectionLayer.viewCount = 2;

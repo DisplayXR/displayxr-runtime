@@ -218,7 +218,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                         0.0f, 0.0f, 0.0f,  // playerPos (handled by qwerty)
                         0.0f, 0.0f)) {     // playerYaw/Pitch (handled by qwerty)
 
-                        // Get raw view poses (pre-player-transform) for projection views
+                        // Get raw view poses (pre-player-transform) for projection views.
+                        // Use DISPLAY space when available: it is physically anchored to the
+                        // display center and unaffected by recentering, which is the correct
+                        // reference for compositing on tracked 3D displays.
+                        // Falls back to LOCAL space if XR_EXT_display_info is not enabled.
                         XrViewLocateInfo locateInfo = {XR_TYPE_VIEW_LOCATE_INFO};
                         locateInfo.viewConfigurationType = xr.viewConfigType;
                         locateInfo.displayTime = frameState.predictedDisplayTime;
