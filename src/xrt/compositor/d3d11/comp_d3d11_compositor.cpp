@@ -611,15 +611,6 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		uint32_t target_width, target_height;
 		comp_d3d11_target_get_dimensions(c->target, &target_width, &target_height);
 
-		// Diagnostic logging for texture dimensions (throttled)
-		static int dim_log_counter = 0;
-		if (++dim_log_counter % 300 == 1) {
-			U_LOG_W("SR weaver input: view=%ux%u (stereo=%ux%u), target=%ux%u",
-			        view_width, view_height,
-			        view_width * 2, view_height,
-			        target_width, target_height);
-		}
-
 		// Set input texture for weaving (view_width is single eye, weaver handles side-by-side)
 		leiasr_d3d11_set_input_texture(c->weaver, stereo_srv, view_width, view_height,
 		                                DXGI_FORMAT_R8G8B8A8_UNORM);
@@ -1242,16 +1233,6 @@ comp_d3d11_compositor_get_window_metrics(struct xrt_compositor *xc,
 	out_metrics->window_center_offset_y_m = offset_y_m;
 
 	out_metrics->valid = true;
-
-	// Throttled diagnostic logging
-	static int wm_log_counter = 0;
-	if (++wm_log_counter % 300 == 1) {
-		U_LOG_W("Window metrics: disp=%ux%u (%.4fx%.4fm), win=%ux%u (%.4fx%.4fm), "
-		        "offset=(%.4f,%.4f)m",
-		        disp_px_w, disp_px_h, disp_w_m, disp_h_m,
-		        win_px_w, win_px_h, win_w_m, win_h_m,
-		        offset_x_m, offset_y_m);
-	}
 
 	return true;
 #else

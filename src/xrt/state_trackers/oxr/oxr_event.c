@@ -166,7 +166,7 @@ oxr_event_push_XrEventDataSessionStateChanged(struct oxr_logger *log,
 
 	event->result = XR_SUCCESS;
 
-	U_LOG_W("OXR EVENT: Pushing session state change - state=%d (IDLE=1, READY=2, SYNC=3, VIS=4, FOCUS=5)",
+	U_LOG_I("OXR EVENT: Pushing session state change - state=%d (IDLE=1, READY=2, SYNC=3, VIS=4, FOCUS=5)",
 	        (int)state);
 
 	lock(inst);
@@ -430,7 +430,7 @@ oxr_poll_event(struct oxr_logger *log, struct oxr_instance *inst, XrEventDataBuf
 	// Log session state events being polled
 	if (eventData->type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
 		XrEventDataSessionStateChanged *changed = (XrEventDataSessionStateChanged *)eventData;
-		U_LOG_W("OXR EVENT: Polled session state change - state=%d", (int)changed->state);
+		U_LOG_I("OXR EVENT: Polled session state change - state=%d", (int)changed->state);
 	}
 
 	free(event);

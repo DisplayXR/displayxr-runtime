@@ -270,7 +270,7 @@ leiasr_d3d11_set_input_texture(struct leiasr_d3d11 *leiasr,
 	// Log dimension changes (first time or when dimensions change)
 	static uint32_t last_logged_width = 0, last_logged_height = 0;
 	if (view_width != last_logged_width || view_height != last_logged_height) {
-		U_LOG_W("SR weaver setInputViewTexture: view=%ux%u (expects side-by-side stereo SRV)",
+		U_LOG_I("SR weaver setInputViewTexture: view=%ux%u (expects side-by-side stereo SRV)",
 		        view_width, view_height);
 		last_logged_width = view_width;
 		last_logged_height = view_height;
@@ -366,18 +366,6 @@ leiasr_d3d11_get_predicted_eye_positions(struct leiasr_d3d11 *leiasr,
 	out_right_eye[0] = right_mm[0] / 1000.0f;
 	out_right_eye[1] = right_mm[1] / 1000.0f;
 	out_right_eye[2] = right_mm[2] / 1000.0f;
-
-	// Throttled diagnostic logging
-	static int eye_log_counter = 0;
-	if (++eye_log_counter % 300 == 1) { // Log every ~5 seconds at 60fps
-		float ipd_mm = sqrtf(powf(right_mm[0] - left_mm[0], 2) +
-		                     powf(right_mm[1] - left_mm[1], 2) +
-		                     powf(right_mm[2] - left_mm[2], 2));
-		U_LOG_W("SR eye positions (raw mm): L=(%.1f,%.1f,%.1f) R=(%.1f,%.1f,%.1f) IPD=%.1fmm",
-		        left_mm[0], left_mm[1], left_mm[2],
-		        right_mm[0], right_mm[1], right_mm[2],
-		        ipd_mm);
-	}
 
 	return true;
 }

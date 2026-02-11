@@ -247,10 +247,7 @@ wait_for_scheduled_free(struct multi_compositor *mc)
 	 */
 	os_mutex_lock(&mc->msc->list_and_timing_lock);
 	os_mutex_lock(&mc->slot_lock);
-	U_LOG_W("[wait_for_scheduled_free] Moving progress -> scheduled (progress.active=%d, layers=%u)",
-	        mc->progress.active, mc->progress.layer_count);
 	slot_move_and_clear_locked(mc, &mc->scheduled, &mc->progress);
-	U_LOG_W("[wait_for_scheduled_free] Done. scheduled.active=%d", mc->scheduled.active);
 	os_mutex_unlock(&mc->slot_lock);
 	os_mutex_unlock(&mc->msc->list_and_timing_lock);
 }
@@ -738,17 +735,10 @@ multi_compositor_wait_frame(struct xrt_compositor *xc,
 	    out_predicted_display_time_ns,    //
 	    out_predicted_display_period_ns); //
 
-	U_LOG_W("[wait_frame] frame_id=%" PRId64 " wake_up=%" PRId64 " predicted_display=%" PRId64
-	        " period=%" PRId64,
-	        frame_id, wake_up_time_ns, *out_predicted_display_time_ns, *out_predicted_display_period_ns);
-
 	// Wait until the given wake up time.
 	u_wait_until(&mc->frame_sleeper, wake_up_time_ns);
 
 	int64_t now_ns = os_monotonic_get_ns();
-
-	U_LOG_W("[wait_frame] Woke up, now=%" PRId64 " (slept %.2fms)",
-	        now_ns, (double)(now_ns - wake_up_time_ns) / 1000000.0);
 
 	// Signal that we woke up.
 	xrt_comp_mark_frame(xc, frame_id, XRT_COMPOSITOR_FRAME_POINT_WOKE, now_ns);
@@ -816,9 +806,6 @@ multi_compositor_layer_begin(struct xrt_compositor *xc, const struct xrt_layer_f
 
 	mc->progress.active = true;
 	mc->progress.data = *data;
-
-	U_LOG_W("[layer_begin] frame_id=%" PRId64 " display_time=%" PRId64,
-	        data->frame_id, data->display_time_ns);
 
 	return XRT_SUCCESS;
 }
@@ -967,10 +954,6 @@ multi_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	struct multi_compositor *mc = multi_compositor(xc);
 	struct xrt_compositor_fence *xcf = NULL;
 	int64_t frame_id = mc->progress.data.frame_id;
-
-	U_LOG_W("[layer_commit] frame_id=%" PRId64 " layer_count=%u progress.active=%d display_time=%" PRId64,
-	        frame_id, mc->progress.layer_count, mc->progress.active,
-	        mc->progress.data.display_time_ns);
 
 	do {
 		if (!xrt_graphics_sync_handle_is_valid(sync_handle)) {
@@ -1259,28 +1242,17 @@ multi_compositor_deliver_any_frames(struct multi_compositor *mc, int64_t display
 	os_mutex_lock(&mc->slot_lock);
 
 	if (!mc->scheduled.active) {
-		// Log progress/scheduled/delivered state for debugging frame delivery
-		U_LOG_W("[deliver] scheduled.active=false, progress.active=%d, delivered.active=%d",
-		        mc->progress.active, mc->delivered.active);
 		os_mutex_unlock(&mc->slot_lock);
 		return;
 	}
 
-	U_LOG_W("[deliver] scheduled.active=true! display_time=%" PRId64 " scheduled_time=%" PRId64
-	        " diff=%.2fms",
-	        display_time_ns, mc->scheduled.data.display_time_ns,
-	        (double)(display_time_ns - mc->scheduled.data.display_time_ns) / 1000000.0);
-
 	if (time_is_greater_then_or_within_half_ms(display_time_ns, mc->scheduled.data.display_time_ns)) {
 		slot_move_and_clear_locked(mc, &mc->delivered, &mc->scheduled);
-		U_LOG_W("[deliver] Moved scheduled -> delivered!");
 
 		int64_t frame_time_ns = mc->delivered.data.display_time_ns;
 		if (!time_is_within_half_ms(frame_time_ns, display_time_ns)) {
 			log_frame_time_diff(frame_time_ns, display_time_ns);
 		}
-	} else {
-		U_LOG_W("[deliver] Timing check FAILED - frame not delivered yet");
 	}
 
 	os_mutex_unlock(&mc->slot_lock);

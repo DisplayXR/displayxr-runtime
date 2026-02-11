@@ -177,4 +177,6 @@ Ask Gemini to analyze code and produce a read-only report. Automatically gathers
 **Skill location:** `~/.claude/skills/ask-gemini/SKILL.md` (user-level, available across all projects)
 
 ## Debug Logs
-use U_LOG_W (WARN) instead of U_LOG_I (INFO) for logs to make sure they are not filtered 
+- Use U_LOG_W (WARN) only for one-off init, error, and lifecycle events
+- Use U_LOG_I (INFO) for recurring/throttled diagnostic logs (per-frame, per-keystroke, etc.)
+- Never add per-frame U_LOG_W calls - they cause massive log bloat (~10K WARN lines per 6-min session)

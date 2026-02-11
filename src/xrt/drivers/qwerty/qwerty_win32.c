@@ -288,28 +288,24 @@ qwerty_process_win32(struct xrt_device **xdevs,
 		// WASDQE Movement
 		switch (wParam) {
 		case 'W':
-			U_LOG_W("QWERTY Win32: W key %s -> %s", is_keydown ? "DOWN" : "UP", dev_name);
 			if (is_keydown)
 				qwerty_press_forward(qdev);
 			else
 				qwerty_release_forward(qdev);
 			break;
 		case 'A':
-			U_LOG_W("QWERTY Win32: A key %s -> %s", is_keydown ? "DOWN" : "UP", dev_name);
 			if (is_keydown)
 				qwerty_press_left(qdev);
 			else
 				qwerty_release_left(qdev);
 			break;
 		case 'S':
-			U_LOG_W("QWERTY Win32: S key %s -> %s", is_keydown ? "DOWN" : "UP", dev_name);
 			if (is_keydown)
 				qwerty_press_backward(qdev);
 			else
 				qwerty_release_backward(qdev);
 			break;
 		case 'D':
-			U_LOG_W("QWERTY Win32: D key %s -> %s", is_keydown ? "DOWN" : "UP", dev_name);
 			if (is_keydown)
 				qwerty_press_right(qdev);
 			else
@@ -506,7 +502,7 @@ qwerty_process_win32(struct xrt_device **xdevs,
 	switch (message) {
 	case WM_LBUTTONDOWN:
 		// Start mouse look mode
-		U_LOG_W("QWERTY Win32: LMB DOWN - starting mouse look");
+		U_LOG_I("QWERTY Win32: LMB DOWN - starting mouse look");
 		mouse_look_active = true;
 		GetCursorPos(&last_mouse_pos);
 		SetCapture(GetActiveWindow()); // Capture mouse to receive events outside window
@@ -517,7 +513,7 @@ qwerty_process_win32(struct xrt_device **xdevs,
 
 	case WM_LBUTTONUP:
 		// End mouse look mode
-		U_LOG_W("QWERTY Win32: LMB UP - ending mouse look");
+		U_LOG_I("QWERTY Win32: LMB UP - ending mouse look");
 		mouse_look_active = false;
 		ReleaseCapture();
 		if (out_handled != NULL) {
@@ -571,7 +567,6 @@ qwerty_process_win32(struct xrt_device **xdevs,
 					first_mouse_log = false;
 					U_LOG_W("QWERTY Win32: Mouse look qdev=%p (updating this device)", (void *)qdev);
 				}
-				U_LOG_W("QWERTY Win32: Mouse look delta dx=%d dy=%d yaw=%.3f pitch=%.3f", dx, dy, yaw, pitch);
 				qwerty_add_look_delta(qdev, yaw, pitch);
 			}
 

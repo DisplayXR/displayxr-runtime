@@ -1515,8 +1515,6 @@ session_blit_sbs(struct vk_bundle *vk,
 static void
 render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, int64_t display_time_ns)
 {
-	U_LOG_W("[per-session] render_session_to_own_target: START");
-
 	struct comp_target *ct = mc->session_render.target;
 	struct leiasr *weaver = mc->session_render.weaver;
 
@@ -1544,8 +1542,6 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 		U_LOG_W("[per-session] No layers delivered, skipping");
 		return;
 	}
-
-	U_LOG_W("[per-session] Have %u layers, extracting stereo views...", mc->delivered.layer_count);
 
 	// Get the first projection layer
 	struct multi_layer_entry *layer = NULL;
@@ -1583,12 +1579,8 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 		return;
 	}
 
-	U_LOG_W("[per-session] Got stereo views: %dx%d, left=%p, right=%p, needs_compositing=%d",
-	        imageWidth, imageHeight, (void *)leftImageView, (void *)rightImageView, needs_compositing);
-
 	// Wait for pending fence if exists (from previous frame using same buffer)
 	if (mc->session_render.fenced_buffer >= 0) {
-		U_LOG_W("[per-session] Waiting for pending fence (buffer %d)...", mc->session_render.fenced_buffer);
 		VkResult fence_ret = vk->vkWaitForFences(vk->device, 1,
 		                                         &mc->session_render.fences[mc->session_render.fenced_buffer],
 		                                         VK_TRUE, UINT64_MAX);
@@ -1607,7 +1599,6 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 #endif
 
 	// Acquire the next swapchain image from the per-session target
-	U_LOG_W("[per-session] Acquiring target swapchain image...");
 	uint32_t buffer_index = 0;
 	VkResult ret = comp_target_acquire(ct, &buffer_index);
 	if (ret == VK_ERROR_OUT_OF_DATE_KHR || ret == VK_SUBOPTIMAL_KHR) {
@@ -1628,7 +1619,6 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 		U_LOG_E("[per-session] Failed to acquire per-session target image: %s", vk_result_string(ret));
 		return;
 	}
-	U_LOG_W("[per-session] Acquired buffer_index=%u", buffer_index);
 
 	// Validate buffer_index is in range
 	if (buffer_index >= mc->session_render.buffer_count) {
@@ -1674,7 +1664,6 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 		U_LOG_E("[per-session] Failed to begin command buffer: %s", vk_result_string(ret));
 		return;
 	}
-	U_LOG_W("[per-session] Command buffer started");
 
 	VkImageView weaveLeft = leftImageView;
 	VkImageView weaveRight = rightImageView;
@@ -1716,7 +1705,6 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 			                         VK_PIPELINE_STAGE_TRANSFER_BIT,
 			                         0, 0, NULL, 0, NULL, 2, readToGeneral);
 
-			U_LOG_W("[per-session] Composited %u layers into intermediate images", mc->delivered.layer_count);
 		}
 	}
 
@@ -1736,8 +1724,6 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 		weaveLeft = mc->session_render.flip_sbs_view;
 		weaveRight = VK_NULL_HANDLE;
 		weaveWidth = imageWidth * 2;
-		U_LOG_W("[per-session] SBS blit done (flip_y=%d, composited=%d), using SBS view (%dx%d) for weaving",
-		        blit_flip_y, composited, weaveWidth, weaveHeight);
 	} else {
 		U_LOG_W("[per-session] Failed to create SBS image, using raw views");
 	}
@@ -1781,11 +1767,8 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 	}
 
 	// Perform SR weaving
-	U_LOG_W("[per-session] Calling leiasr_weave: weaver=%p, cmd=%p, fb=%ux%u, framebuffer=%p",
-	        (void *)weaver, (void *)cmd, framebufferWidth, framebufferHeight, (void *)framebuffer);
 	leiasr_weave(weaver, cmd, weaveLeft, weaveRight, viewport, weaveWidth, weaveHeight, imageFormat,
 	             framebuffer, (int)framebufferWidth, (int)framebufferHeight, framebufferFormat);
-	U_LOG_W("[per-session] leiasr_weave returned");
 
 	// Transition swapchain image to PRESENT_SRC_KHR after weaving
 	// (matches Vulkan weaving example: image must be presentable)
@@ -1806,13 +1789,11 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 	}
 
 	// End command buffer
-	U_LOG_W("[per-session] Ending command buffer...");
 	ret = vk->vkEndCommandBuffer(cmd);
 	if (ret != VK_SUCCESS) {
 		U_LOG_E("[per-session] Failed to end command buffer: %s", vk_result_string(ret));
 		return;
 	}
-	U_LOG_W("[per-session] Command buffer ended");
 
 	// Submit command buffer with fence for async completion.
 	// Wait on present_complete (signaled by vkAcquireNextImageKHR) before writing
@@ -1831,13 +1812,11 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 	    .pSignalSemaphores = (signal_sem != VK_NULL_HANDLE) ? &signal_sem : NULL,
 	};
 
-	U_LOG_W("[per-session] Submitting command buffer with fence (signal_sem=%p)...", (void *)signal_sem);
 	ret = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, mc->session_render.fences[buffer_index]);
 	if (ret != VK_SUCCESS) {
 		U_LOG_E("[per-session] Failed to submit per-session render: %s", vk_result_string(ret));
 		return;
 	}
-	U_LOG_W("[per-session] Queue submit succeeded");
 
 	// CRITICAL: Wait for GPU work to complete before returning.
 	// With cross-device external memory sharing (null compositor + VK app),
@@ -1853,7 +1832,6 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 	mc->session_render.fenced_buffer = -1; // Fence already waited, no deferred wait needed
 
 	// Present the image (GPU work is complete, semaphore already signaled)
-	U_LOG_W("[per-session] Presenting image (buffer_index=%u)...", buffer_index);
 	ret = comp_target_present(ct, vk->main_queue->queue, buffer_index, 0, display_time_ns, 0);
 	if (ret == VK_ERROR_OUT_OF_DATE_KHR || ret == VK_SUBOPTIMAL_KHR) {
 		U_LOG_W("[per-session] Present returned %s, flagging for recreation",
@@ -1869,7 +1847,6 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 	}
 #endif
 
-	U_LOG_W("[per-session] render_session_to_own_target: END (present result=%d)", ret);
 }
 
 /*!
@@ -1883,8 +1860,6 @@ static void
 render_per_session_clients_locked(struct multi_system_compositor *msc, int64_t display_time_ns)
 {
 	COMP_TRACE_MARKER();
-
-	U_LOG_W("[per-session] render_per_session_clients_locked: START");
 
 	struct vk_bundle *vk = comp_target_service_get_vk(msc->target_service);
 	if (vk == NULL) {
@@ -1902,7 +1877,6 @@ render_per_session_clients_locked(struct multi_system_compositor *msc, int64_t d
 
 		// Skip if no active/delivered frame
 		if (!mc->delivered.active || mc->delivered.layer_count == 0) {
-			U_LOG_W("[per-session] Client %zu: skipping (no active frame)", k);
 			continue;
 		}
 
@@ -1917,20 +1891,15 @@ render_per_session_clients_locked(struct multi_system_compositor *msc, int64_t d
 		}
 #endif
 
-		U_LOG_W("[per-session] Client %zu: rendering session to own target...", k);
 		session_count++;
 
 		// Render this session to its own target
 		render_session_to_own_target(mc, vk, display_time_ns);
 
-		U_LOG_W("[per-session] Client %zu: retiring delivered frame...", k);
 		// Retire the delivered frame for this session
 		int64_t now_ns = os_monotonic_get_ns();
 		multi_compositor_retire_delivered_locked(mc, now_ns);
-		U_LOG_W("[per-session] Client %zu: done", k);
 	}
-
-	U_LOG_W("[per-session] render_per_session_clients_locked: END (processed %d sessions)", session_count);
 }
 
 #endif // XRT_HAVE_LEIA_SR_VULKAN
@@ -1965,10 +1934,8 @@ transfer_layers_locked(struct multi_system_compositor *msc, int64_t display_time
 			U_LOG_W("multi_compositor_init_session_render returned %d", init_result);
 		}
 
-		U_LOG_W("About to call multi_compositor_deliver_any_frames...");
 		// Even if it's not shown, make sure that frames are delivered.
 		multi_compositor_deliver_any_frames(mc, display_time_ns);
-		U_LOG_W("multi_compositor_deliver_any_frames completed");
 
 		// None of the data in this slot is valid, don't check access it.
 		if (!mc->delivered.active) {
