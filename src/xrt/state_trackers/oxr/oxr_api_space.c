@@ -70,6 +70,16 @@ is_reference_space_type_valid(struct oxr_logger *log,
 		                 "(%s == XR_REFERENCE_SPACE_TYPE_UNBOUNDED_MSFT) is only valid if "
 		                 "XR_MSFT_unbounded_reference_space is enabled",
 		                 field_name);
+	case XR_REFERENCE_SPACE_TYPE_DISPLAY_EXT:
+#ifdef OXR_HAVE_EXT_display_info
+		if (sys->inst->extensions.EXT_display_info) {
+			return XR_SUCCESS;
+		}
+#endif
+		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
+		                 "(%s == XR_REFERENCE_SPACE_TYPE_DISPLAY_EXT) is only valid if "
+		                 "XR_EXT_display_info is enabled",
+		                 field_name);
 	default: break;
 	}
 

@@ -363,6 +363,9 @@ handle_reference_space_change_pending(struct oxr_logger *log,
 		// Silently ignored, not compiled with this extension supported.
 		return XR_SUCCESS;
 #endif
+	case XRT_SPACE_REFERENCE_TYPE_DISPLAY:
+		// Display space is physically anchored, not affected by recentering.
+		return XR_SUCCESS;
 	}
 
 	if (type == XR_REFERENCE_SPACE_TYPE_MAX_ENUM) {

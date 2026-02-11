@@ -102,6 +102,7 @@ struct xrt_space_overseer
 		struct xrt_space *local_floor; //!< Local floor space, may be null.
 		struct xrt_space *stage;       //!< Stage space, may be null.
 		struct xrt_space *unbounded;   //!< Unbounded space, only here for slam trackers.
+		struct xrt_space *display;     //!< Display space, physically anchored to display center.
 
 		/*!
 		 * Semantic spaces to be mapped to OpenXR spaces.

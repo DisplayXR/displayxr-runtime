@@ -253,6 +253,7 @@ u_pp_xrt_reference_space_type(struct u_pp_delegate dg, enum xrt_reference_space_
 	case XRT_SPACE_REFERENCE_TYPE_LOCAL_FLOOR:           DG("XRT_SPACE_REFERENCE_TYPE_LOCAL_FLOOR"); return;
 	case XRT_SPACE_REFERENCE_TYPE_STAGE:                 DG("XRT_SPACE_REFERENCE_TYPE_STAGE"); return;
 	case XRT_SPACE_REFERENCE_TYPE_UNBOUNDED:             DG("XRT_SPACE_REFERENCE_TYPE_UNBOUNDED"); return;
+	case XRT_SPACE_REFERENCE_TYPE_DISPLAY:               DG("XRT_SPACE_REFERENCE_TYPE_DISPLAY"); return;
 	}
 	// clang-format on
 

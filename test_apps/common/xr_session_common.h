@@ -54,6 +54,7 @@ struct XrSessionManager {
     XrSession session = XR_NULL_HANDLE;
     XrSpace localSpace = XR_NULL_HANDLE;
     XrSpace viewSpace = XR_NULL_HANDLE;
+    XrSpace displaySpace = XR_NULL_HANDLE;
 
     // Swapchains (one per eye for stereo)
     SwapchainInfo swapchains[2];

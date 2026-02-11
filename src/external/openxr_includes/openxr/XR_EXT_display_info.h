@@ -22,11 +22,12 @@ extern "C" {
 #endif
 
 #define XR_EXT_display_info 1
-#define XR_EXT_display_info_SPEC_VERSION 1
+#define XR_EXT_display_info_SPEC_VERSION 2
 #define XR_EXT_DISPLAY_INFO_EXTENSION_NAME "XR_EXT_display_info"
 
 // Reuse the type value from the deleted XR_EXT_dynamic_render_resolution
 #define XR_TYPE_DISPLAY_INFO_EXT ((XrStructureType)1000999003)
+#define XR_REFERENCE_SPACE_TYPE_DISPLAY_EXT ((XrReferenceSpaceType)1000999004)
 
 /*!
  * @brief Display information returned by xrGetSystemProperties.

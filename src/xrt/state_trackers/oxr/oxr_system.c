@@ -181,7 +181,7 @@ oxr_system_fill_in(
 	 * Reference space support.
 	 */
 
-	static_assert(5 <= ARRAY_SIZE(sys->reference_spaces), "Not enough space in array");
+	static_assert(6 <= ARRAY_SIZE(sys->reference_spaces), "Not enough space in array");
 
 	if (sys->xso->semantic.view != NULL) {
 		sys->reference_spaces[sys->reference_space_count++] = XR_REFERENCE_SPACE_TYPE_VIEW;
@@ -225,6 +225,12 @@ oxr_system_fill_in(
 #ifdef OXR_HAVE_MSFT_unbounded_reference_space
 	if (sys->inst->extensions.MSFT_unbounded_reference_space && sys->xso->semantic.unbounded != NULL) {
 		sys->reference_spaces[sys->reference_space_count++] = XR_REFERENCE_SPACE_TYPE_UNBOUNDED_MSFT;
+	}
+#endif
+
+#ifdef OXR_HAVE_EXT_display_info
+	if (sys->inst->extensions.EXT_display_info && sys->xso->semantic.display != NULL) {
+		sys->reference_spaces[sys->reference_space_count++] = XR_REFERENCE_SPACE_TYPE_DISPLAY_EXT;
 	}
 #endif
 
