@@ -453,6 +453,13 @@ qwerty_hmd_create(void)
 	xd->tracking_origin->type = XRT_TRACKING_TYPE_OTHER;
 	snprintf(xd->tracking_origin->name, XRT_TRACKING_NAME_LEN, QWERTY_HMD_TRACKER_STR);
 
+	// Report orientation and position tracking as supported.
+	// Required for Chrome WebXR to expose controllers as positionally-tracked
+	// (without this, xrGetSystemProperties reports orientationTracking=0
+	// positionTracking=0, causing some WebXR sites to hide controllers).
+	xd->supported.orientation_tracking = true;
+	xd->supported.position_tracking = true;
+
 	xd->inputs[0].name = XRT_INPUT_GENERIC_HEAD_POSE;
 
 	xd->update_inputs = u_device_noop_update_inputs;
