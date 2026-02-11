@@ -366,8 +366,80 @@ bool InitializeD3D12WithLUID(D3D12Renderer& renderer, LUID adapterLuid) {
 
 bool CreateSwapchainRTVs(D3D12Renderer& renderer,
     ID3D12Resource** textures, uint32_t count, int eye,
-    uint32_t width, uint32_t height)
+    uint32_t width, uint32_t height,
+    DXGI_FORMAT format)
 {
+    // Store swapchain format and recreate PSOs to match on first call.
+    // The underlying D3D12 resources are typeless (for Vulkan interop), so
+    // both RTVs and PSOs need an explicit typed format.
+    if (eye == 0 && renderer.swapchainFormat != format) {
+        renderer.swapchainFormat = format;
+
+        // Recreate PSOs with the actual swapchain format
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc = {};
+        psoDesc.pRootSignature = renderer.rootSignature.Get();
+        psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        psoDesc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        psoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
+        psoDesc.RasterizerState.FrontCounterClockwise = TRUE;
+        psoDesc.RasterizerState.DepthClipEnable = TRUE;
+        psoDesc.DepthStencilState.DepthEnable = TRUE;
+        psoDesc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+        psoDesc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+        psoDesc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        psoDesc.SampleMask = UINT_MAX;
+        psoDesc.NumRenderTargets = 1;
+        psoDesc.RTVFormats[0] = format;
+        psoDesc.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
+        psoDesc.SampleDesc.Count = 1;
+
+        // Recompile shaders for PSO recreation
+        ComPtr<ID3DBlob> cubeVS, cubePS, gridVS, gridPS;
+        if (!CompileShader(g_cubeShaderSource, "VSMain", "vs_5_0", &cubeVS) ||
+            !CompileShader(g_cubeShaderSource, "PSMain", "ps_5_0", &cubePS) ||
+            !CompileShader(g_gridShaderSource, "VSMain", "vs_5_0", &gridVS) ||
+            !CompileShader(g_gridShaderSource, "PSMain", "ps_5_0", &gridPS)) {
+            LOG_ERROR("Failed to recompile shaders for format 0x%X", format);
+            return false;
+        }
+
+        // Cube input layout
+        D3D12_INPUT_ELEMENT_DESC cubeInputElements[] = {
+            { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+            { "COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        };
+
+        psoDesc.VS = { cubeVS->GetBufferPointer(), cubeVS->GetBufferSize() };
+        psoDesc.PS = { cubePS->GetBufferPointer(), cubePS->GetBufferSize() };
+        psoDesc.InputLayout = { cubeInputElements, _countof(cubeInputElements) };
+
+        renderer.cubePSO.Reset();
+        HRESULT hr = renderer.device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&renderer.cubePSO));
+        if (FAILED(hr)) {
+            LOG_ERROR("Failed to recreate cube PSO with format 0x%X: 0x%08X", format, hr);
+            return false;
+        }
+
+        // Grid input layout
+        D3D12_INPUT_ELEMENT_DESC gridInputElements[] = {
+            { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        };
+
+        psoDesc.VS = { gridVS->GetBufferPointer(), gridVS->GetBufferSize() };
+        psoDesc.PS = { gridPS->GetBufferPointer(), gridPS->GetBufferSize() };
+        psoDesc.InputLayout = { gridInputElements, _countof(gridInputElements) };
+        psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
+        psoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+
+        renderer.gridPSO.Reset();
+        hr = renderer.device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&renderer.gridPSO));
+        if (FAILED(hr)) {
+            LOG_ERROR("Failed to recreate grid PSO with format 0x%X: 0x%08X", format, hr);
+            return false;
+        }
+        LOG_INFO("Recreated PSOs with swapchain format 0x%X", format);
+    }
+
     // Create RTV descriptor heap (accumulates for both eyes)
     uint32_t totalRTVs = renderer.rtvCount + count;
     if (!renderer.rtvHeap || totalRTVs > renderer.rtvCount) {
@@ -384,12 +456,19 @@ bool CreateSwapchainRTVs(D3D12Renderer& renderer,
         }
     }
 
-    // Create RTVs for this eye's swapchain images
+    // Create RTVs for this eye's swapchain images.
+    // Explicit format is required because resources are typeless (for Vulkan interop).
+    D3D12_RENDER_TARGET_VIEW_DESC rtvDesc = {};
+    rtvDesc.Format = format;
+    rtvDesc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+    rtvDesc.Texture2D.MipSlice = 0;
+    rtvDesc.Texture2D.PlaneSlice = 0;
+
     D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = renderer.rtvHeap->GetCPUDescriptorHandleForHeapStart();
     rtvHandle.ptr += renderer.rtvCount * renderer.rtvDescriptorSize;
 
     for (uint32_t i = 0; i < count; i++) {
-        renderer.device->CreateRenderTargetView(textures[i], nullptr, rtvHandle);
+        renderer.device->CreateRenderTargetView(textures[i], &rtvDesc, rtvHandle);
         rtvHandle.ptr += renderer.rtvDescriptorSize;
     }
     renderer.rtvCount += count;

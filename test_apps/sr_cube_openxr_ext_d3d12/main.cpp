@@ -366,7 +366,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
         rtvBaseIndex[eye] = (int)renderer.rtvCount;
         if (!CreateSwapchainRTVs(renderer, textures.data(), count, eye,
-            xr.swapchains[eye].width, xr.swapchains[eye].height)) {
+            xr.swapchains[eye].width, xr.swapchains[eye].height,
+            (DXGI_FORMAT)xr.swapchains[eye].format)) {
             LOG_ERROR("Failed to create RTVs for eye %d", eye);
             CleanupOpenXR(xr);
             CleanupD3D12(renderer);

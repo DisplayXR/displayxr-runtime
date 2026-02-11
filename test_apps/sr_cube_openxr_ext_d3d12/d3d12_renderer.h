@@ -61,6 +61,9 @@ struct D3D12Renderer {
 
     // Scene state
     float cubeRotation = 0.0f;
+
+    // Swapchain format (typed, e.g. DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)
+    DXGI_FORMAT swapchainFormat = DXGI_FORMAT_UNKNOWN;
 };
 
 struct D3D12ConstantBuffer {
@@ -71,10 +74,12 @@ struct D3D12ConstantBuffer {
 // Initialize D3D12 device on a specific adapter
 bool InitializeD3D12WithLUID(D3D12Renderer& renderer, LUID adapterLuid);
 
-// Create render target views for swapchain images
+// Create render target views for swapchain images.
+// format: the typed DXGI format for RTVs (resources may be typeless).
 bool CreateSwapchainRTVs(D3D12Renderer& renderer,
     ID3D12Resource** textures, uint32_t count, int eye,
-    uint32_t width, uint32_t height);
+    uint32_t width, uint32_t height,
+    DXGI_FORMAT format);
 
 // Update scene state
 void UpdateScene(D3D12Renderer& renderer, float deltaTime);
