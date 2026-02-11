@@ -43,6 +43,7 @@ static UINT g_windowHeight = 720;
 static bool g_inSizeMove = false;  // True while user is dragging/resizing the window
 static const uint32_t HUD_PIXEL_WIDTH = 380;
 static const uint32_t HUD_PIXEL_HEIGHT = 280;
+static const float HUD_WIDTH_FRACTION = 0.30f;
 
 // Fullscreen state
 static bool g_fullscreen = false;
@@ -292,6 +293,31 @@ static void RenderOneFrame(RenderState& rs) {
                     XrView rawViews[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
                     xrLocateViews(xr.session, &locateInfo, &viewState, 2, &viewCount, rawViews);
 
+                    // --- App-side Kooima projection (RAW mode, app-owned camera model) ---
+                    // Compute the physical screen extents (meters) of the rendered area.
+                    // renderW/renderH is the view texture size; swapchain dims correspond to the
+                    // full display pixel resolution. The ratio maps display physical size to the
+                    // rendered region's physical extent.
+                    uint32_t renderW_pre = (uint32_t)(g_windowWidth * xr.recommendedViewScaleX);
+                    uint32_t renderH_pre = (uint32_t)(g_windowHeight * xr.recommendedViewScaleY);
+                    if (renderW_pre > xr.swapchains[0].width) renderW_pre = xr.swapchains[0].width;
+                    if (renderH_pre > xr.swapchains[0].height) renderH_pre = xr.swapchains[0].height;
+
+                    XrFovf appFov[2];
+                    bool useAppProjection = (xr.hasDisplayInfoExt && xr.displayWidthM > 0.0f);
+                    if (useAppProjection) {
+                        float screenWidthM = xr.displayWidthM * (float)renderW_pre / (float)xr.swapchains[0].width;
+                        float screenHeightM = xr.displayHeightM * (float)renderH_pre / (float)xr.swapchains[0].height;
+
+                        leftProjMatrix = ComputeKooimaProjection(
+                            rawViews[0].pose.position, screenWidthM, screenHeightM, 0.01f, 100.0f);
+                        rightProjMatrix = ComputeKooimaProjection(
+                            rawViews[1].pose.position, screenWidthM, screenHeightM, 0.01f, 100.0f);
+                        for (int e = 0; e < 2; e++)
+                            appFov[e] = ComputeKooimaFov(
+                                rawViews[e].pose.position, screenWidthM, screenHeightM);
+                    }
+
                     // [Commented out — will be reused for 3D-positioned HUD later]
                     // ConvergencePlane convPlane = LocateConvergencePlane(rawViews);
 
@@ -393,7 +419,7 @@ static void RenderOneFrame(RenderState& rs) {
                             projectionViews[eye].subImage.imageArrayIndex = 0;
 
                             projectionViews[eye].pose = rawViews[eye].pose;
-                            projectionViews[eye].fov = rawViews[eye].fov;
+                            projectionViews[eye].fov = useAppProjection ? appFov[eye] : rawViews[eye].fov;
                         }
                     }
                 }
@@ -401,10 +427,13 @@ static void RenderOneFrame(RenderState& rs) {
 
             // Submit frame with window-space HUD layer if visible
             if (hudSubmitted) {
-                float hudWidthFrac = (float)HUD_PIXEL_WIDTH / xr.swapchains[0].width;
-                float hudHeightFrac = (float)HUD_PIXEL_HEIGHT / xr.swapchains[0].height;
+                float hudAR = (float)HUD_PIXEL_WIDTH / (float)HUD_PIXEL_HEIGHT;
+                float windowAR = (g_windowWidth > 0 && g_windowHeight > 0) ? (float)g_windowWidth / (float)g_windowHeight : 1.0f;
+                float fracW = HUD_WIDTH_FRACTION;
+                float fracH = fracW * windowAR / hudAR;
+                if (fracH > 1.0f) { fracH = 1.0f; fracW = hudAR / windowAR; }
                 EndFrameWithWindowSpaceHud(xr, frameState.predictedDisplayTime, projectionViews,
-                    0.0f, 0.0f, hudWidthFrac, hudHeightFrac, 0.0f);
+                    0.0f, 0.0f, fracW, fracH, 0.0f);
             } else {
                 EndFrame(xr, frameState.predictedDisplayTime, projectionViews);
             }

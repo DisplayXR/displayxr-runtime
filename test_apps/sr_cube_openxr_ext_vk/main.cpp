@@ -34,9 +34,8 @@ static const char* APP_NAME = "sr_cube_openxr_ext_vk";
 static const wchar_t* WINDOW_CLASS = L"SRCubeOpenXRExtVKClass";
 static const wchar_t* WINDOW_TITLE = L"SR Cube OpenXR Ext Vulkan (Press ESC to exit)";
 
-// HUD overlay size as fraction of window dimensions (for window-space layer)
+// HUD overlay width as fraction of window width (height computed to preserve HUD aspect ratio)
 static const float HUD_WIDTH_FRACTION = 0.30f;
-static const float HUD_HEIGHT_FRACTION = 0.35f;
 
 // Global state (shared between main thread and render thread)
 static InputState g_inputState;
@@ -173,12 +172,15 @@ static void RenderThreadFunc(
     while (g_running.load() && !xr->exitRequested) {
         InputState inputSnapshot;
         bool resetRequested = false;
+        uint32_t windowW, windowH;
         {
             std::lock_guard<std::mutex> lock(g_inputMutex);
             inputSnapshot = g_inputState;
             resetRequested = g_inputState.resetViewRequested;
             g_inputState.resetViewRequested = false;
             g_inputState.fullscreenToggleRequested = false;
+            windowW = g_windowWidth;
+            windowH = g_windowHeight;
         }
 
         UpdatePerformanceStats(perfStats);
@@ -237,6 +239,28 @@ static void RenderThreadFunc(
                         xrLocateViews(xr->session, &locateInfo, &viewState, 2, &viewCount, rawViews);
                         LOG_INFO("[FRAME] Raw LocateViews done");
 
+                        // Compute render dims from window size and display scale factors
+                        uint32_t renderW = (uint32_t)(windowW * xr->recommendedViewScaleX);
+                        uint32_t renderH = (uint32_t)(windowH * xr->recommendedViewScaleY);
+                        if (renderW > xr->swapchains[0].width) renderW = xr->swapchains[0].width;
+                        if (renderH > xr->swapchains[0].height) renderH = xr->swapchains[0].height;
+
+                        // --- App-side Kooima projection (RAW mode, app-owned camera model) ---
+                        XrFovf appFov[2];
+                        bool useAppProjection = (xr->hasDisplayInfoExt && xr->displayWidthM > 0.0f);
+                        if (useAppProjection) {
+                            float screenWidthM = xr->displayWidthM * (float)renderW / (float)xr->swapchains[0].width;
+                            float screenHeightM = xr->displayHeightM * (float)renderH / (float)xr->swapchains[0].height;
+
+                            leftProjMatrix = ComputeKooimaProjection(
+                                rawViews[0].pose.position, screenWidthM, screenHeightM, 0.01f, 100.0f);
+                            rightProjMatrix = ComputeKooimaProjection(
+                                rawViews[1].pose.position, screenWidthM, screenHeightM, 0.01f, 100.0f);
+                            for (int e = 0; e < 2; e++)
+                                appFov[e] = ComputeKooimaFov(
+                                    rawViews[e].pose.position, screenWidthM, screenHeightM);
+                        }
+
                         rendered = true;
                         for (int eye = 0; eye < 2; eye++) {
                             uint32_t imageIndex;
@@ -248,7 +272,7 @@ static void RenderThreadFunc(
 
                                 LOG_INFO("[FRAME] Eye %d: RenderScene...", eye);
                                 RenderScene(*renderer, eye, imageIndex,
-                                    xr->swapchains[eye].width, xr->swapchains[eye].height,
+                                    renderW, renderH,
                                     viewMatrix, projMatrix,
                                     inputSnapshot.zoomScale);
                                 LOG_INFO("[FRAME] Eye %d: RenderScene done", eye);
@@ -261,12 +285,12 @@ static void RenderThreadFunc(
                                 projectionViews[eye].subImage.swapchain = xr->swapchains[eye].swapchain;
                                 projectionViews[eye].subImage.imageRect.offset = {0, 0};
                                 projectionViews[eye].subImage.imageRect.extent = {
-                                    (int32_t)xr->swapchains[eye].width,
-                                    (int32_t)xr->swapchains[eye].height
+                                    (int32_t)renderW,
+                                    (int32_t)renderH
                                 };
                                 projectionViews[eye].subImage.imageArrayIndex = 0;
                                 projectionViews[eye].pose = rawViews[eye].pose;
-                                projectionViews[eye].fov = rawViews[eye].fov;
+                                projectionViews[eye].fov = useAppProjection ? appFov[eye] : rawViews[eye].fov;
                             } else {
                                 LOG_WARN("[FRAME] Eye %d: AcquireSwapchainImage FAILED", eye);
                                 rendered = false;
@@ -285,7 +309,8 @@ static void RenderThreadFunc(
                                     L"XR_EXT_win32_window_binding: ACTIVE (Vulkan)" :
                                     L"XR_EXT_win32_window_binding: NOT AVAILABLE (Vulkan)";
                                 std::wstring perfText = FormatPerformanceInfo(perfStats.fps, perfStats.frameTimeMs,
-                                    xr->swapchains[0].width, xr->swapchains[0].height);
+                                    renderW, renderH,
+                                    windowW, windowH);
                                 std::wstring eyeText = FormatEyeTrackingInfo(xr->eyePosX, xr->eyePosY, xr->eyePosZ, xr->eyeTrackingActive);
 
                                 uint32_t srcRowPitch = 0;
@@ -373,8 +398,13 @@ static void RenderThreadFunc(
                 // End frame: use window-space HUD layer if available, or 0 layers if not rendered
                 if (rendered && hudSubmitted) {
                     LOG_INFO("[FRAME] EndFrameWithWindowSpaceHud (rendered+hud)...");
+                    float hudAR = (float)hudWidth / (float)hudHeight;
+                    float windowAR = (windowW > 0 && windowH > 0) ? (float)windowW / (float)windowH : 1.0f;
+                    float fracW = HUD_WIDTH_FRACTION;
+                    float fracH = fracW * windowAR / hudAR;
+                    if (fracH > 1.0f) { fracH = 1.0f; fracW = hudAR / windowAR; }
                     EndFrameWithWindowSpaceHud(*xr, frameState.predictedDisplayTime, projectionViews,
-                        0.0f, 0.0f, HUD_WIDTH_FRACTION, HUD_HEIGHT_FRACTION, 0.0f);
+                        0.0f, 0.0f, fracW, fracH, 0.0f);
                     LOG_INFO("[FRAME] EndFrameWithWindowSpaceHud done");
                 } else if (rendered) {
                     LOG_INFO("[FRAME] EndFrame (rendered, no hud)...");

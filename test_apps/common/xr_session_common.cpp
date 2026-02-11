@@ -66,6 +66,62 @@ static XMMATRIX XrFovToProjectionMatrix(const XrFovf& fov, float nearZ, float fa
     return proj;
 }
 
+XMMATRIX ComputeKooimaProjection(
+    const XrVector3f& eyePos,
+    float screenWidthM, float screenHeightM,
+    float nearZ, float farZ)
+{
+    // Kooima asymmetric frustum: the screen is centered at the origin in DISPLAY space,
+    // with half-extents defining the physical edges. The eye position (from xrLocateViews
+    // in DISPLAY space) gives the viewer's offset from screen center.
+    float ez = eyePos.z;
+    if (ez <= 0.001f) ez = 0.65f; // Fallback: ~arm's length, matches runtime default
+
+    float halfW = screenWidthM / 2.0f;
+    float halfH = screenHeightM / 2.0f;
+    float ex = eyePos.x;
+    float ey = eyePos.y;
+
+    // Near-plane edge distances (similar triangles: project screen edges through eye)
+    float left   = nearZ * (-halfW - ex) / ez;
+    float right  = nearZ * ( halfW - ex) / ez;
+    float bottom = nearZ * (-halfH - ey) / ez;
+    float top    = nearZ * ( halfH - ey) / ez;
+
+    float width  = right - left;
+    float height = top - bottom;
+
+    // Same matrix layout as XrFovToProjectionMatrix (OpenGL-style, row-major DirectXMath)
+    XMMATRIX proj = XMMatrixIdentity();
+    proj.r[0] = XMVectorSet(2.0f * nearZ / width, 0, 0, 0);
+    proj.r[1] = XMVectorSet(0, 2.0f * nearZ / height, 0, 0);
+    proj.r[2] = XMVectorSet((right + left) / width, (top + bottom) / height, -(farZ + nearZ) / (farZ - nearZ), -1);
+    proj.r[3] = XMVectorSet(0, 0, -2.0f * farZ * nearZ / (farZ - nearZ), 0);
+
+    return proj;
+}
+
+XrFovf ComputeKooimaFov(
+    const XrVector3f& eyePos,
+    float screenWidthM, float screenHeightM)
+{
+    float ez = eyePos.z;
+    if (ez <= 0.001f) ez = 0.65f; // Fallback matches runtime
+
+    float halfW = screenWidthM / 2.0f;
+    float halfH = screenHeightM / 2.0f;
+    float ex = eyePos.x;
+    float ey = eyePos.y;
+
+    XrFovf fov;
+    fov.angleLeft  = atanf((-halfW - ex) / ez);
+    fov.angleRight = atanf(( halfW - ex) / ez);
+    fov.angleDown  = atanf((-halfH - ey) / ez);
+    fov.angleUp    = atanf(( halfH - ey) / ez);
+
+    return fov;
+}
+
 bool CreateSpaces(XrSessionManager& xr) {
     LOG_INFO("Creating reference spaces...");
 

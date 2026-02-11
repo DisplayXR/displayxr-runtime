@@ -30,9 +30,8 @@ using namespace DirectX;
 
 static const char* APP_NAME = "sr_cube_openxr_ext_gl";
 
-// HUD overlay size as fraction of window dimensions (for window-space layer)
+// HUD overlay width as fraction of window width (height computed to preserve HUD aspect ratio)
 static const float HUD_WIDTH_FRACTION = 0.30f;
-static const float HUD_HEIGHT_FRACTION = 0.35f;
 
 static const wchar_t* WINDOW_CLASS = L"SRCubeOpenXRExtGLClass";
 static const wchar_t* WINDOW_TITLE = L"SR Cube OpenXR Ext OpenGL (Press ESC to exit)";
@@ -333,6 +332,22 @@ static void RenderThreadFunc(
                         if (renderW > xr->swapchains[0].width) renderW = xr->swapchains[0].width;
                         if (renderH > xr->swapchains[0].height) renderH = xr->swapchains[0].height;
 
+                        // --- App-side Kooima projection (RAW mode, app-owned camera model) ---
+                        XrFovf appFov[2];
+                        bool useAppProjection = (xr->hasDisplayInfoExt && xr->displayWidthM > 0.0f);
+                        if (useAppProjection) {
+                            float screenWidthM = xr->displayWidthM * (float)renderW / (float)xr->swapchains[0].width;
+                            float screenHeightM = xr->displayHeightM * (float)renderH / (float)xr->swapchains[0].height;
+
+                            leftProjMatrix = ComputeKooimaProjection(
+                                rawViews[0].pose.position, screenWidthM, screenHeightM, 0.01f, 100.0f);
+                            rightProjMatrix = ComputeKooimaProjection(
+                                rawViews[1].pose.position, screenWidthM, screenHeightM, 0.01f, 100.0f);
+                            for (int e = 0; e < 2; e++)
+                                appFov[e] = ComputeKooimaFov(
+                                    rawViews[e].pose.position, screenWidthM, screenHeightM);
+                        }
+
                         rendered = true;
                         for (int eye = 0; eye < 2; eye++) {
                             uint32_t imageIndex;
@@ -356,7 +371,7 @@ static void RenderThreadFunc(
                                 };
                                 projectionViews[eye].subImage.imageArrayIndex = 0;
                                 projectionViews[eye].pose = rawViews[eye].pose;
-                                projectionViews[eye].fov = rawViews[eye].fov;
+                                projectionViews[eye].fov = useAppProjection ? appFov[eye] : rawViews[eye].fov;
                             } else {
                                 rendered = false;
                             }
@@ -428,8 +443,13 @@ static void RenderThreadFunc(
 
                 if (hudSubmitted) {
                     LOG_DEBUG("[Frame] Submitting EndFrame with HUD (layerCount=2)");
+                    float hudAR = (float)hudWidth / (float)hudHeight;
+                    float windowAR = (windowW > 0 && windowH > 0) ? (float)windowW / (float)windowH : 1.0f;
+                    float fracW = HUD_WIDTH_FRACTION;
+                    float fracH = fracW * windowAR / hudAR;
+                    if (fracH > 1.0f) { fracH = 1.0f; fracW = hudAR / windowAR; }
                     if (!EndFrameWithWindowSpaceHud(*xr, frameState.predictedDisplayTime, projectionViews,
-                        0.0f, 0.0f, HUD_WIDTH_FRACTION, HUD_HEIGHT_FRACTION, 0.0f)) {
+                        0.0f, 0.0f, fracW, fracH, 0.0f)) {
                         LOG_WARN("[Frame] EndFrameWithWindowSpaceHud FAILED — disabling HUD for this session");
                         hud = nullptr;  // Disable HUD for subsequent frames
                     }

@@ -162,12 +162,15 @@ static void RenderThreadFunc(
     while (g_running.load() && !xr->exitRequested) {
         InputState inputSnapshot;
         bool resetRequested = false;
+        uint32_t windowW, windowH;
         {
             std::lock_guard<std::mutex> lock(g_inputMutex);
             inputSnapshot = g_inputState;
             resetRequested = g_inputState.resetViewRequested;
             g_inputState.resetViewRequested = false;
             g_inputState.fullscreenToggleRequested = false;
+            windowW = g_windowWidth;
+            windowH = g_windowHeight;
         }
 
         UpdatePerformanceStats(perfStats);
@@ -218,6 +221,28 @@ static void RenderThreadFunc(
                         XrView rawViews[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
                         xrLocateViews(xr->session, &locateInfo, &viewState, 2, &viewCount, rawViews);
 
+                        // Compute render dims from window size and display scale factors
+                        uint32_t renderW = (uint32_t)(windowW * xr->recommendedViewScaleX);
+                        uint32_t renderH = (uint32_t)(windowH * xr->recommendedViewScaleY);
+                        if (renderW > xr->swapchains[0].width) renderW = xr->swapchains[0].width;
+                        if (renderH > xr->swapchains[0].height) renderH = xr->swapchains[0].height;
+
+                        // --- App-side Kooima projection (RAW mode, app-owned camera model) ---
+                        XrFovf appFov[2];
+                        bool useAppProjection = (xr->hasDisplayInfoExt && xr->displayWidthM > 0.0f);
+                        if (useAppProjection) {
+                            float screenWidthM = xr->displayWidthM * (float)renderW / (float)xr->swapchains[0].width;
+                            float screenHeightM = xr->displayHeightM * (float)renderH / (float)xr->swapchains[0].height;
+
+                            leftProjMatrix = ComputeKooimaProjection(
+                                rawViews[0].pose.position, screenWidthM, screenHeightM, 0.01f, 100.0f);
+                            rightProjMatrix = ComputeKooimaProjection(
+                                rawViews[1].pose.position, screenWidthM, screenHeightM, 0.01f, 100.0f);
+                            for (int e = 0; e < 2; e++)
+                                appFov[e] = ComputeKooimaFov(
+                                    rawViews[e].pose.position, screenWidthM, screenHeightM);
+                        }
+
                         for (int eye = 0; eye < 2; eye++) {
                             uint32_t imageIndex;
                             if (AcquireSwapchainImage(*xr, eye, imageIndex)) {
@@ -229,7 +254,7 @@ static void RenderThreadFunc(
                                 int rtvIdx = rtvBaseIndex[eye] + (int)imageIndex;
 
                                 RenderScene(*renderer, swapchainTexture, rtvIdx, eye,
-                                    xr->swapchains[eye].width, xr->swapchains[eye].height,
+                                    renderW, renderH,
                                     viewMatrix, projMatrix,
                                     inputSnapshot.zoomScale);
 
@@ -239,12 +264,12 @@ static void RenderThreadFunc(
                                 projectionViews[eye].subImage.swapchain = xr->swapchains[eye].swapchain;
                                 projectionViews[eye].subImage.imageRect.offset = {0, 0};
                                 projectionViews[eye].subImage.imageRect.extent = {
-                                    (int32_t)xr->swapchains[eye].width,
-                                    (int32_t)xr->swapchains[eye].height
+                                    (int32_t)renderW,
+                                    (int32_t)renderH
                                 };
                                 projectionViews[eye].subImage.imageArrayIndex = 0;
                                 projectionViews[eye].pose = rawViews[eye].pose;
-                                projectionViews[eye].fov = rawViews[eye].fov;
+                                projectionViews[eye].fov = useAppProjection ? appFov[eye] : rawViews[eye].fov;
                             }
                         }
                     }
