@@ -892,7 +892,11 @@ void RenderScene(
         XMMATRIX cubeWVP = cubeRot * cubeScale * cubeTrans * zoom * viewMatrix * projMatrix;
 
         VkPushConstants pc = {};
-        XMStoreFloat4x4(&pc.transform, XMMatrixTranspose(cubeWVP));
+        // Store WITHOUT transpose: SPIR-V ColMajor reads row-major data as columns,
+        // naturally producing M^T. Shader then computes M^T * v which is the correct
+        // column-vector equivalent of DirectXMath's row-vector v * M convention.
+        // (Same implicit transpose that GL gets from glUniformMatrix4fv with GL_FALSE.)
+        XMStoreFloat4x4(&pc.transform, cubeWVP);
         pc.color[0] = 1.0f; pc.color[1] = 1.0f; pc.color[2] = 1.0f; pc.color[3] = 1.0f;
 
         vkCmdBindPipeline(renderer.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, renderer.cubePipeline);
