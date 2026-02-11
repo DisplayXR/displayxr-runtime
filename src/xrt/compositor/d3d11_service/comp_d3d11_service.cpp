@@ -195,6 +195,12 @@ struct d3d11_service_compositor
 	//! Whether the window has been closed (triggers session loss)
 	bool window_closed;
 
+	//! Whether the LOST event has already been sent (prevent duplicates)
+	bool loss_sent;
+
+	//! Number of frames since window close was detected
+	uint32_t window_closed_frame_count;
+
 	//! Per-client render resources (window, swap chain, weaver)
 	struct d3d11_client_render_resources render;
 
@@ -1950,6 +1956,14 @@ compositor_predict_frame(struct xrt_compositor *xc,
 
 	std::lock_guard<std::mutex> lock(c->mutex);
 
+	// Failsafe: if window closed and client keeps calling predict_frame
+	// without layer_commit, force session end after a few frames
+	if (c->window_closed && c->window_closed_frame_count >= 3) {
+		U_LOG_W("Window closed failsafe: %u frames since close, forcing session end",
+		        c->window_closed_frame_count);
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
 	c->frame_id++;
 	*out_frame_id = c->frame_id;
 
@@ -2159,6 +2173,8 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		if (!window_valid) {
 			U_LOG_W("Window closed - signaling session loss");
 			c->window_closed = true;
+			c->loss_sent = false;
+			c->window_closed_frame_count = 0;
 			// Push LOSS_PENDING event to start orderly shutdown
 			if (c->xses != nullptr) {
 				union xrt_session_event xse = XRT_STRUCT_INIT;
@@ -2171,11 +2187,13 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	}
 
 	if (c->window_closed) {
-		// Window already closed on previous frame - push LOST and return error
-		if (c->xses != nullptr) {
+		c->window_closed_frame_count++;
+		// Push LOST event only once to avoid duplicate events
+		if (!c->loss_sent && c->xses != nullptr) {
 			union xrt_session_event xse = XRT_STRUCT_INIT;
 			xse.type = XRT_SESSION_EVENT_LOST;
 			xrt_session_event_sink_push(c->xses, &xse);
+			c->loss_sent = true;
 		}
 		return XRT_ERROR_IPC_FAILURE;
 	}
@@ -2857,6 +2875,8 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 	c->state_visible = false;
 	c->state_focused = false;
 	c->window_closed = false;
+	c->loss_sent = false;
+	c->window_closed_frame_count = 0;
 
 	// Initialize layer accumulator
 	std::memset(&c->layer_accum, 0, sizeof(c->layer_accum));

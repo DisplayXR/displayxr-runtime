@@ -1608,7 +1608,7 @@ ipc_handle_compositor_layer_sync(volatile struct ipc_client_state *ics,
 
 	_update_layers(ics, ics->xc, &copy);
 
-	xrt_comp_layer_commit(ics->xc, sync_handle);
+	xrt_result_t commit_ret = xrt_comp_layer_commit(ics->xc, sync_handle);
 
 	/*
 	 * Manage shared state.
@@ -1621,7 +1621,7 @@ ipc_handle_compositor_layer_sync(volatile struct ipc_client_state *ics,
 
 	os_mutex_unlock(&ics->server->global_state.lock);
 
-	return XRT_SUCCESS;
+	return commit_ret;
 }
 
 xrt_result_t
@@ -1663,7 +1663,7 @@ ipc_handle_compositor_layer_sync_with_semaphore(volatile struct ipc_client_state
 
 	_update_layers(ics, ics->xc, &copy);
 
-	xrt_comp_layer_commit_with_semaphore(ics->xc, xcsem, semaphore_value);
+	xrt_result_t commit_ret = xrt_comp_layer_commit_with_semaphore(ics->xc, xcsem, semaphore_value);
 
 	/*
 	 * Manage shared state.
@@ -1676,7 +1676,7 @@ ipc_handle_compositor_layer_sync_with_semaphore(volatile struct ipc_client_state
 
 	os_mutex_unlock(&ics->server->global_state.lock);
 
-	return XRT_SUCCESS;
+	return commit_ret;
 }
 
 xrt_result_t
