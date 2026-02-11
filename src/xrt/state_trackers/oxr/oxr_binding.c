@@ -794,6 +794,17 @@ oxr_action_get_current_interaction_profile(struct oxr_logger *log,
 		         top_str ? top_str : "<null>",
 		         profile_str ? profile_str : "XR_NULL_PATH",
 		         (uint64_t)interactionProfile->interactionProfile);
+#ifdef XRT_OS_WINDOWS
+		{
+			char buf[512];
+			snprintf(buf, sizeof(buf),
+			         "[SRMonado] xrGetCurrentInteractionProfile: topLevel='%s' -> profile='%s'\n",
+			         top_str ? top_str : "<null>",
+			         profile_str ? profile_str : "XR_NULL_PATH");
+			OutputDebugStringA(buf);
+			fprintf(stderr, "%s", buf);
+		}
+#endif
 	}
 
 	return XR_SUCCESS;

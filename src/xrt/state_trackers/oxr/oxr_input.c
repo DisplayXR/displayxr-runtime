@@ -1847,6 +1847,17 @@ oxr_session_attach_action_sets(struct oxr_logger *log,
 		         " [DIAG] xrAttachSessionActionSets RESULT: left='%s' right='%s'",
 		         left_str ? left_str : "XR_NULL_PATH",
 		         right_str ? right_str : "XR_NULL_PATH");
+#ifdef XRT_OS_WINDOWS
+		{
+			char buf[512];
+			snprintf(buf, sizeof(buf),
+			         "[SRMonado] xrAttachSessionActionSets RESULT: left='%s' right='%s'\n",
+			         left_str ? left_str : "XR_NULL_PATH",
+			         right_str ? right_str : "XR_NULL_PATH");
+			OutputDebugStringA(buf);
+			fprintf(stderr, "%s", buf);
+		}
+#endif
 	}
 
 	return oxr_session_success_result(sess);
