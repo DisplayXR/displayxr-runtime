@@ -457,10 +457,6 @@ bool LocateViews(
     rightViewMatrix = XrPoseToViewMatrix(views[1].pose);
     rightProjMatrix = XrFovToProjectionMatrix(views[1].fov, 0.01f, 100.0f);
 
-    // Extract eye tracking info from transformed view poses (now in world space)
-    xr.eyePosX = (views[0].pose.position.x + views[1].pose.position.x) / 2.0f;
-    xr.eyePosY = (views[0].pose.position.y + views[1].pose.position.y) / 2.0f;
-    xr.eyePosZ = (views[0].pose.position.z + views[1].pose.position.z) / 2.0f;
     xr.eyeTrackingActive = (viewState.viewStateFlags & XR_VIEW_STATE_POSITION_TRACKED_BIT) != 0;
 
     return true;

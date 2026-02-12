@@ -294,6 +294,14 @@ static void RenderOneFrame(RenderState& rs) {
                     XrView rawViews[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
                     xrLocateViews(xr.session, &locateInfo, &viewState, 2, &viewCount, rawViews);
 
+                    // Store raw per-eye positions in display space for HUD
+                    xr.leftEyeX = rawViews[0].pose.position.x;
+                    xr.leftEyeY = rawViews[0].pose.position.y;
+                    xr.leftEyeZ = rawViews[0].pose.position.z;
+                    xr.rightEyeX = rawViews[1].pose.position.x;
+                    xr.rightEyeY = rawViews[1].pose.position.y;
+                    xr.rightEyeZ = rawViews[1].pose.position.z;
+
                     // --- App-side Kooima projection (RAW mode, app-owned camera model) ---
                     uint32_t renderW_pre = (uint32_t)(g_windowWidth * xr.recommendedViewScaleX);
                     uint32_t renderH_pre = (uint32_t)(g_windowHeight * xr.recommendedViewScaleY);
@@ -387,7 +395,10 @@ static void RenderOneFrame(RenderState& rs) {
                             RenderText(*rs.textOverlay, renderer.device.Get(), hudTexture,
                                 dispText, px, 172, tw, 44, true);
 
-                            std::wstring eyeText = FormatEyeTrackingInfo(xr.eyePosX, xr.eyePosY, xr.eyePosZ, xr.eyeTrackingActive);
+                            std::wstring eyeText = FormatEyeTrackingInfo(
+                                xr.leftEyeX, xr.leftEyeY, xr.leftEyeZ,
+                                xr.rightEyeX, xr.rightEyeY, xr.rightEyeZ,
+                                xr.eyeTrackingActive);
                             RenderText(*rs.textOverlay, renderer.device.Get(), hudTexture,
                                 eyeText, px, 222, tw, 44, true);
 

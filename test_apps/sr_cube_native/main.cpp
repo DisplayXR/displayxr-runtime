@@ -377,9 +377,8 @@ static void RenderThreadFunc(HWND hwnd, D3D11Renderer* renderer, TextOverlay* te
     PerformanceStats perfStats = {};
     perfStats.lastTime = std::chrono::high_resolution_clock::now();
 
-    float eyePosX = 0.0f;
-    float eyePosY = 0.0f;
-    float eyePosZ = 0.0f;
+    float leftEyePosX = 0.0f, leftEyePosY = 0.0f, leftEyePosZ = 0.0f;
+    float rightEyePosX = 0.0f, rightEyePosY = 0.0f, rightEyePosZ = 0.0f;
     bool eyeTrackingActive = false;
 
     // Track current swapchain/view texture dimensions for resize detection
@@ -513,10 +512,8 @@ static void RenderThreadFunc(HWND hwnd, D3D11Renderer* renderer, TextOverlay* te
             rightEye = leia::vec3f(rightPos[0], rightPos[1], rightPos[2]);
             eyeTrackingActive = true;
 
-            // Average for display
-            eyePosX = (leftPos[0] + rightPos[0]) / 2.0f;
-            eyePosY = (leftPos[1] + rightPos[1]) / 2.0f;
-            eyePosZ = (leftPos[2] + rightPos[2]) / 2.0f;
+            leftEyePosX = leftPos[0]; leftEyePosY = leftPos[1]; leftEyePosZ = leftPos[2];
+            rightEyePosX = rightPos[0]; rightEyePosY = rightPos[1]; rightEyePosZ = rightPos[2];
         }
 
         // Apply parallax toggle
@@ -570,7 +567,10 @@ static void RenderThreadFunc(HWND hwnd, D3D11Renderer* renderer, TextOverlay* te
         {
             std::wstring perfText = FormatPerformanceInfo(perfStats.fps, perfStats.frameTimeMs,
                 g_viewTextureWidth, g_viewTextureHeight);
-            std::wstring eyeText = FormatEyeTrackingInfo(eyePosX, eyePosY, eyePosZ, eyeTrackingActive);
+            std::wstring eyeText = FormatEyeTrackingInfo(
+                leftEyePosX, leftEyePosY, leftEyePosZ,
+                rightEyePosX, rightEyePosY, rightEyePosZ,
+                eyeTrackingActive);
             std::wstring parallaxText = inputSnapshot.parallaxEnabled ?
                 L"Parallax: ON (tracking)" : L"Parallax: OFF (fixed)";
             std::wstring helpText = L"P: Parallax | ESC: Quit";

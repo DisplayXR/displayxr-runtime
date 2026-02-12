@@ -244,6 +244,14 @@ static void RenderThreadFunc(
                         XrView rawViews[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
                         xrLocateViews(xr->session, &locateInfo, &viewState, 2, &viewCount, rawViews);
 
+                        // Store raw per-eye positions in display space for HUD
+                        xr->leftEyeX = rawViews[0].pose.position.x;
+                        xr->leftEyeY = rawViews[0].pose.position.y;
+                        xr->leftEyeZ = rawViews[0].pose.position.z;
+                        xr->rightEyeX = rawViews[1].pose.position.x;
+                        xr->rightEyeY = rawViews[1].pose.position.y;
+                        xr->rightEyeZ = rawViews[1].pose.position.z;
+
                         // Compute render dims from window size and display scale factors
                         uint32_t renderW = (uint32_t)(windowW * xr->recommendedViewScaleX);
                         uint32_t renderH = (uint32_t)(windowH * xr->recommendedViewScaleY);
@@ -338,7 +346,10 @@ static void RenderThreadFunc(
                                     renderW, renderH, windowW, windowH);
                                 std::wstring dispText = FormatDisplayInfo(xr->displayWidthM, xr->displayHeightM,
                                     xr->nominalViewerX, xr->nominalViewerY, xr->nominalViewerZ);
-                                std::wstring eyeText = FormatEyeTrackingInfo(xr->eyePosX, xr->eyePosY, xr->eyePosZ, xr->eyeTrackingActive);
+                                std::wstring eyeText = FormatEyeTrackingInfo(
+                                    xr->leftEyeX, xr->leftEyeY, xr->leftEyeZ,
+                                    xr->rightEyeX, xr->rightEyeY, xr->rightEyeZ,
+                                    xr->eyeTrackingActive);
 
                                 uint32_t srcRowPitch = 0;
                                 const void* pixels = RenderHudAndMap(*hud, &srcRowPitch, sessionText, modeText, perfText, dispText, eyeText);

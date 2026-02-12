@@ -94,10 +94,9 @@ struct XrSessionManager {
     SwapchainInfo hudSwapchain;
     bool hasHudSwapchain = false;
 
-    // Eye tracking data (from views)
-    float eyePosX = 0.0f;
-    float eyePosY = 0.0f;
-    float eyePosZ = 0.0f;
+    // Eye tracking data — raw per-eye positions in display space
+    float leftEyeX = 0.0f, leftEyeY = 0.0f, leftEyeZ = 0.0f;
+    float rightEyeX = 0.0f, rightEyeY = 0.0f, rightEyeZ = 0.0f;
     bool eyeTrackingActive = false;
 
     // Frame timing
