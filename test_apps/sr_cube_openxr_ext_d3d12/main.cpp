@@ -4,7 +4,7 @@
  * @file
  * @brief  SR Cube OpenXR Ext D3D12 - OpenXR with XR_EXT_win32_window_binding (D3D12)
  *
- * D3D12 port of sr_cube_openxr_ext. Projection layer only, no HUD/quad layer.
+ * D3D12 port of sr_cube_openxr_ext with window-space HUD overlay.
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -16,6 +16,8 @@
 #include "input_handler.h"
 #include "xr_session.h"
 #include "d3d12_renderer.h"
+#include "hud_renderer.h"
+#include "text_overlay.h"
 
 #include <atomic>
 #include <chrono>
@@ -29,6 +31,11 @@ using namespace DirectX;
 using Microsoft::WRL::ComPtr;
 
 static const char* APP_NAME = "sr_cube_openxr_ext_d3d12";
+
+// HUD overlay: WIDTH_FRACTION anchors how wide the HUD appears on screen.
+static const uint32_t HUD_PIXEL_WIDTH = 380;
+static const uint32_t HUD_PIXEL_HEIGHT = 280;
+static const float HUD_WIDTH_FRACTION = 0.30f;
 
 static const wchar_t* WINDOW_CLASS = L"SRCubeOpenXRExtD3D12Class";
 static const wchar_t* WINDOW_TITLE = L"SR Cube OpenXR Ext D3D12 (Press ESC to exit)";
@@ -152,12 +159,22 @@ static void RenderThreadFunc(
     XrSessionManager* xr,
     D3D12Renderer* renderer,
     std::vector<XrSwapchainImageD3D12KHR>* swapchainImages,
-    int* rtvBaseIndex)
+    int* rtvBaseIndex,
+    HudRenderer* hud,
+    std::vector<XrSwapchainImageD3D12KHR>* hudSwapchainImages,
+    ID3D12Resource* hudUploadBuffer,
+    uint8_t* hudUploadMapped,
+    uint32_t hudUploadRowPitch,
+    ID3D12CommandAllocator* hudCmdAllocator,
+    ID3D12GraphicsCommandList* hudCmdList,
+    ID3D12Fence* hudFence,
+    HANDLE hudFenceEvent)
 {
     LOG_INFO("[RenderThread] Started");
 
     PerformanceStats perfStats = {};
     perfStats.lastTime = std::chrono::high_resolution_clock::now();
+    UINT64 hudFenceValue = 0;
 
     while (g_running.load() && !xr->exitRequested) {
         InputState inputSnapshot;
@@ -195,6 +212,8 @@ static void RenderThreadFunc(
             XrFrameState frameState;
             if (BeginFrame(*xr, frameState)) {
                 XrCompositionLayerProjectionView projectionViews[2] = {};
+                bool rendered = false;
+                bool hudSubmitted = false;
 
                 if (frameState.shouldRender) {
                     XMMATRIX leftViewMatrix, leftProjMatrix;
@@ -243,6 +262,7 @@ static void RenderThreadFunc(
                                     rawViews[e].pose.position, screenWidthM, screenHeightM);
                         }
 
+                        rendered = true;
                         for (int eye = 0; eye < 2; eye++) {
                             uint32_t imageIndex;
                             if (AcquireSwapchainImage(*xr, eye, imageIndex)) {
@@ -270,12 +290,114 @@ static void RenderThreadFunc(
                                 projectionViews[eye].subImage.imageArrayIndex = 0;
                                 projectionViews[eye].pose = rawViews[eye].pose;
                                 projectionViews[eye].fov = useAppProjection ? appFov[eye] : rawViews[eye].fov;
+                            } else {
+                                rendered = false;
+                            }
+                        }
+
+                        // Render HUD to window-space layer swapchain
+                        if (rendered && inputSnapshot.hudVisible && hud && xr->hasHudSwapchain && hudSwapchainImages) {
+                            uint32_t hudImageIndex;
+                            if (AcquireHudSwapchainImage(*xr, hudImageIndex)) {
+                                std::wstring sessionText = L"Session: ";
+                                sessionText += FormatSessionState((int)xr->sessionState);
+                                std::wstring modeText = xr->hasWin32WindowBindingExt ?
+                                    L"XR_EXT_win32_window_binding: ACTIVE (D3D12)" :
+                                    L"XR_EXT_win32_window_binding: NOT AVAILABLE (D3D12)";
+                                std::wstring perfText = FormatPerformanceInfo(perfStats.fps, perfStats.frameTimeMs,
+                                    renderW, renderH, windowW, windowH);
+                                std::wstring eyeText = FormatEyeTrackingInfo(xr->eyePosX, xr->eyePosY, xr->eyePosZ, xr->eyeTrackingActive);
+
+                                uint32_t srcRowPitch = 0;
+                                const void* pixels = RenderHudAndMap(*hud, &srcRowPitch, sessionText, modeText, perfText, eyeText);
+                                if (pixels) {
+                                    // Copy pixels row-by-row to D3D12 upload buffer (256-byte aligned rows)
+                                    const uint8_t* src = (const uint8_t*)pixels;
+                                    for (uint32_t row = 0; row < HUD_PIXEL_HEIGHT; row++) {
+                                        memcpy(hudUploadMapped + row * hudUploadRowPitch,
+                                            src + row * srcRowPitch,
+                                            HUD_PIXEL_WIDTH * 4);
+                                    }
+                                    UnmapHud(*hud);
+
+                                    // Record D3D12 commands: copy upload buffer to HUD swapchain texture
+                                    ID3D12Resource* hudTex = (*hudSwapchainImages)[hudImageIndex].texture;
+
+                                    hudCmdAllocator->Reset();
+                                    hudCmdList->Reset(hudCmdAllocator, nullptr);
+
+                                    // Barrier: COMMON -> COPY_DEST
+                                    D3D12_RESOURCE_BARRIER barrier = {};
+                                    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                                    barrier.Transition.pResource = hudTex;
+                                    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+                                    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+                                    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                                    hudCmdList->ResourceBarrier(1, &barrier);
+
+                                    // CopyTextureRegion from upload buffer
+                                    D3D12_TEXTURE_COPY_LOCATION srcLoc = {};
+                                    srcLoc.pResource = hudUploadBuffer;
+                                    srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                                    srcLoc.PlacedFootprint.Offset = 0;
+                                    srcLoc.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                                    srcLoc.PlacedFootprint.Footprint.Width = HUD_PIXEL_WIDTH;
+                                    srcLoc.PlacedFootprint.Footprint.Height = HUD_PIXEL_HEIGHT;
+                                    srcLoc.PlacedFootprint.Footprint.Depth = 1;
+                                    srcLoc.PlacedFootprint.Footprint.RowPitch = hudUploadRowPitch;
+
+                                    D3D12_TEXTURE_COPY_LOCATION dstLoc = {};
+                                    dstLoc.pResource = hudTex;
+                                    dstLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                                    dstLoc.SubresourceIndex = 0;
+
+                                    hudCmdList->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, nullptr);
+
+                                    // Barrier: COPY_DEST -> COMMON
+                                    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+                                    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+                                    hudCmdList->ResourceBarrier(1, &barrier);
+
+                                    hudCmdList->Close();
+
+                                    // Execute and wait
+                                    ID3D12CommandList* lists[] = { hudCmdList };
+                                    renderer->commandQueue->ExecuteCommandLists(1, lists);
+                                    hudFenceValue++;
+                                    renderer->commandQueue->Signal(hudFence, hudFenceValue);
+                                    if (hudFence->GetCompletedValue() < hudFenceValue) {
+                                        hudFence->SetEventOnCompletion(hudFenceValue, hudFenceEvent);
+                                        WaitForSingleObject(hudFenceEvent, INFINITE);
+                                    }
+
+                                    hudSubmitted = true;
+                                }
+
+                                ReleaseHudSwapchainImage(*xr);
                             }
                         }
                     }
                 }
 
-                EndFrame(*xr, frameState.predictedDisplayTime, projectionViews);
+                // End frame: use window-space HUD layer if available
+                if (rendered && hudSubmitted) {
+                    float hudAR = (float)HUD_PIXEL_WIDTH / (float)HUD_PIXEL_HEIGHT;
+                    float windowAR = (windowW > 0 && windowH > 0) ? (float)windowW / (float)windowH : 1.0f;
+                    float fracW = HUD_WIDTH_FRACTION;
+                    float fracH = fracW * windowAR / hudAR;
+                    if (fracH > 1.0f) { fracH = 1.0f; fracW = hudAR / windowAR; }
+                    EndFrameWithWindowSpaceHud(*xr, frameState.predictedDisplayTime, projectionViews,
+                        0.0f, 0.0f, fracW, fracH, 0.0f);
+                } else if (rendered) {
+                    EndFrame(*xr, frameState.predictedDisplayTime, projectionViews);
+                } else {
+                    XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
+                    endInfo.displayTime = frameState.predictedDisplayTime;
+                    endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+                    endInfo.layerCount = 0;
+                    endInfo.layers = nullptr;
+                    xrEndFrame(xr->session, &endInfo);
+                }
             }
         } else {
             Sleep(100);
@@ -401,6 +523,106 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         }
     }
 
+    // Initialize HUD renderer (standalone D3D11 device for text rendering)
+    HudRenderer hudRenderer = {};
+    bool hudOk = InitializeHudRenderer(hudRenderer, HUD_PIXEL_WIDTH, HUD_PIXEL_HEIGHT);
+    if (!hudOk) {
+        LOG_WARN("HUD renderer init failed - HUD will not be displayed");
+    }
+
+    // Create HUD swapchain for window-space layer submission
+    std::vector<XrSwapchainImageD3D12KHR> hudSwapImages;
+    if (hudOk) {
+        if (CreateHudSwapchain(xr, HUD_PIXEL_WIDTH, HUD_PIXEL_HEIGHT)) {
+            uint32_t count = xr.hudSwapchain.imageCount;
+            hudSwapImages.resize(count, {XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR});
+            xrEnumerateSwapchainImages(xr.hudSwapchain.swapchain, count, &count,
+                (XrSwapchainImageBaseHeader*)hudSwapImages.data());
+            LOG_INFO("HUD swapchain: enumerated %u D3D12 images", count);
+        } else {
+            LOG_WARN("HUD swapchain creation failed - HUD will not be displayed");
+            hudOk = false;
+        }
+    }
+
+    // Create D3D12 upload resources for HUD pixel transfer
+    ComPtr<ID3D12Resource> hudUploadBuffer;
+    uint8_t* hudUploadMapped = nullptr;
+    ComPtr<ID3D12CommandAllocator> hudCmdAllocator;
+    ComPtr<ID3D12GraphicsCommandList> hudCmdList;
+    ComPtr<ID3D12Fence> hudFence;
+    HANDLE hudFenceEvent = nullptr;
+    // Row pitch must be aligned to D3D12_TEXTURE_DATA_PITCH_ALIGNMENT (256 bytes)
+    uint32_t hudUploadRowPitch = (HUD_PIXEL_WIDTH * 4 + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1)
+        & ~(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+
+    if (hudOk) {
+        // Upload buffer (UPLOAD heap, persistently mapped)
+        D3D12_HEAP_PROPERTIES heapProps = {};
+        heapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC bufDesc = {};
+        bufDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bufDesc.Width = (UINT64)hudUploadRowPitch * HUD_PIXEL_HEIGHT;
+        bufDesc.Height = 1;
+        bufDesc.DepthOrArraySize = 1;
+        bufDesc.MipLevels = 1;
+        bufDesc.SampleDesc.Count = 1;
+        bufDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+        HRESULT hr = renderer.device->CreateCommittedResource(
+            &heapProps, D3D12_HEAP_FLAG_NONE, &bufDesc,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+            IID_PPV_ARGS(&hudUploadBuffer));
+        if (FAILED(hr)) {
+            LOG_WARN("Failed to create HUD upload buffer: 0x%08X", hr);
+            hudOk = false;
+        }
+
+        if (hudOk) {
+            D3D12_RANGE readRange = {0, 0}; // no CPU reads
+            hr = hudUploadBuffer->Map(0, &readRange, (void**)&hudUploadMapped);
+            if (FAILED(hr)) {
+                LOG_WARN("Failed to map HUD upload buffer: 0x%08X", hr);
+                hudOk = false;
+            }
+        }
+
+        if (hudOk) {
+            hr = renderer.device->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&hudCmdAllocator));
+            if (FAILED(hr)) {
+                LOG_WARN("Failed to create HUD command allocator: 0x%08X", hr);
+                hudOk = false;
+            }
+        }
+
+        if (hudOk) {
+            hr = renderer.device->CreateCommandList(
+                0, D3D12_COMMAND_LIST_TYPE_DIRECT, hudCmdAllocator.Get(), nullptr,
+                IID_PPV_ARGS(&hudCmdList));
+            if (FAILED(hr)) {
+                LOG_WARN("Failed to create HUD command list: 0x%08X", hr);
+                hudOk = false;
+            } else {
+                hudCmdList->Close(); // start in closed state
+            }
+        }
+
+        if (hudOk) {
+            hr = renderer.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&hudFence));
+            if (FAILED(hr)) {
+                LOG_WARN("Failed to create HUD fence: 0x%08X", hr);
+                hudOk = false;
+            } else {
+                hudFenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+            }
+        }
+
+        if (hudOk) {
+            LOG_INFO("HUD D3D12 resources created (%ux%u, row pitch %u)", HUD_PIXEL_WIDTH, HUD_PIXEL_HEIGHT, hudUploadRowPitch);
+        }
+    }
+
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
 
@@ -410,7 +632,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     LOG_INFO("");
 
     std::thread renderThread(RenderThreadFunc, hwnd, &xr, &renderer,
-        swapchainImages, rtvBaseIndex);
+        swapchainImages, rtvBaseIndex,
+        hudOk ? &hudRenderer : nullptr,
+        hudOk ? &hudSwapImages : nullptr,
+        hudUploadBuffer.Get(), hudUploadMapped, hudUploadRowPitch,
+        hudCmdAllocator.Get(), hudCmdList.Get(), hudFence.Get(), hudFenceEvent);
 
     MSG msg = {};
     while (GetMessage(&msg, nullptr, 0, 0) > 0) {
@@ -425,6 +651,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     LOG_INFO("");
     LOG_INFO("=== Shutting down ===");
+
+    // Clean up HUD resources
+    if (hudFenceEvent) CloseHandle(hudFenceEvent);
+    hudFence.Reset();
+    hudCmdList.Reset();
+    hudCmdAllocator.Reset();
+    if (hudUploadMapped && hudUploadBuffer) {
+        hudUploadBuffer->Unmap(0, nullptr);
+        hudUploadMapped = nullptr;
+    }
+    hudUploadBuffer.Reset();
+    if (hudOk) CleanupHudRenderer(hudRenderer);
 
     g_xr = nullptr;
     CleanupOpenXR(xr);
