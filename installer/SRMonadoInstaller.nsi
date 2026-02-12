@@ -136,20 +136,64 @@ FunctionEnd
 ; Based on NSIS Wiki and SR Platform installer
 
 ; AddToPath - Adds a directory to the system PATH
-; Based on LeiaSR runtime installer approach (simple and reliable)
+; Uses System::Call to read REG_EXPAND_SZ properly (ReadRegStr can fail on
+; REG_EXPAND_SZ values, returning empty and causing PATH to be overwritten).
 ; Usage: Push "C:\path\to\add"
 ;        Call AddToPath
 Function AddToPath
 	Exch $0  ; Path to add
 	Push $1  ; Current PATH
 	Push $2  ; Temp for search result
+	Push $3  ; Registry handle
+	Push $4  ; Data type / buffer pointer
+	Push $5  ; Data length
 
-	; Read current PATH
+	; Open the Environment registry key
+	; 0x80000002 = HKEY_LOCAL_MACHINE, 0x20019 = KEY_READ
+	System::Call 'Advapi32::RegOpenKeyExW(i 0x80000002, w "SYSTEM\CurrentControlSet\Control\Session Manager\Environment", i 0, i 0x20019, *i .r3) i .r2'
+	StrCmp $2 0 0 reg_failed
+
+	; Query the size of the Path value first (pass null buffer to get size)
+	System::Call 'Advapi32::RegQueryValueExW(i r3, w "Path", i 0, i 0, i 0, *i .r5) i .r2'
+	StrCmp $2 0 0 reg_close_failed
+
+	; Allocate buffer and read the value
+	System::Alloc $5
+	Pop $4  ; $4 = buffer pointer
+	System::Call 'Advapi32::RegQueryValueExW(i r3, w "Path", i 0, i 0, i r4, *i r5) i .r2'
+	StrCmp $2 0 0 reg_free_failed
+
+	; Copy the buffer contents to $1 as a string
+	System::Call '*$4(&w${NSIS_MAX_STRLEN} .r1)'
+
+	; Free buffer and close key
+	System::Free $4
+	System::Call 'Advapi32::RegCloseKey(i r3)'
+
+	Goto got_path
+
+reg_free_failed:
+	System::Free $4
+reg_close_failed:
+	System::Call 'Advapi32::RegCloseKey(i r3)'
+reg_failed:
+	; Fall back to ReadRegStr if the System::Call approach fails
 	ReadRegStr $1 HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path"
 
-	; Check if PATH is empty
+got_path:
+	; Check if PATH is empty - if so, this is suspicious on a normal Windows system.
+	; Read from the expanded environment as a safety fallback to avoid wiping PATH.
+	StrCmp $1 "" try_expanded
+
+	Goto check_exists
+
+try_expanded:
+	; Last resort: read the current PATH from the process environment
+	; This won't have unexpanded %vars% but is better than losing PATH entirely
+	ReadEnvStr $1 PATH
 	StrCmp $1 "" empty_path
 
+check_exists:
 	; Check if path already exists in PATH (avoid duplicates)
 	Push $1
 	Push $0
@@ -162,7 +206,7 @@ Function AddToPath
 	Goto write_path
 
 empty_path:
-	; PATH is empty, just use our path (already in $0)
+	; PATH is truly empty (fresh system?), just use our path (already in $0)
 
 write_path:
 	; Write new PATH
@@ -174,6 +218,9 @@ already_exists:
 	DetailPrint "Path already exists in system PATH, skipping"
 
 done:
+	Pop $5
+	Pop $4
+	Pop $3
 	Pop $2
 	Pop $1
 	Pop $0
