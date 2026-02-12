@@ -519,6 +519,8 @@ void RenderScene(
 
     // viewMatrix already includes player locomotion via OpenXR reference space offset
     // (see UpdateLocalSpace in xr_session). No manual camera transform needed.
+    // Zoom in eye space: scales about the viewer's position, keeping the viewport
+    // center (= display center in Kooima projection) fixed on screen.
     XMMATRIX zoom = XMMatrixScaling(zoomScale, zoomScale, zoomScale);
 
     // Render cube
@@ -532,7 +534,7 @@ void RenderScene(
     XMMATRIX cubeRotation = XMMatrixRotationY(renderer.cubeRotation);
     XMMATRIX cubeTranslation = XMMatrixTranslation(0.0f, cubeHeight, 0.0f);
     XMMATRIX cubeWorld = cubeRotation * cubeScale * cubeTranslation;
-    XMMATRIX cubeWVP = cubeWorld * zoom * viewMatrix * projMatrix;
+    XMMATRIX cubeWVP = cubeWorld * viewMatrix * zoom * projMatrix;
 
     renderer.context->IASetInputLayout(renderer.cubeInputLayout.Get());
     renderer.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -554,7 +556,7 @@ void RenderScene(
     const float gridScale = 0.05f;  // Each unit becomes 0.05m (50mm)
     // Grid vertices have y=-1, after scaling y = -gridScale, translate by +gridScale to get y=0
     XMMATRIX gridWorld = XMMatrixScaling(gridScale, gridScale, gridScale) * XMMatrixTranslation(0, gridScale, 0);
-    XMMATRIX gridWVP = gridWorld * zoom * viewMatrix * projMatrix;
+    XMMATRIX gridWVP = gridWorld * viewMatrix * zoom * projMatrix;
 
     renderer.context->IASetInputLayout(renderer.gridInputLayout.Get());
     renderer.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_LINELIST);

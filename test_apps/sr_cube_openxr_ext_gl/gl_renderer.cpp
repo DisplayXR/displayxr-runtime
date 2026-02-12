@@ -249,6 +249,8 @@ void RenderScene(
     glClearColor(0.05f, 0.05f, 0.25f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
+    // Zoom in eye space: scales about the viewer's position, keeping the viewport
+    // center (= display center in Kooima projection) fixed on screen.
     XMMATRIX zoom = XMMatrixScaling(zoomScale, zoomScale, zoomScale);
 
     // Draw cube - base rests on grid at y=0
@@ -258,7 +260,7 @@ void RenderScene(
         XMMATRIX cubeScale = XMMatrixScaling(cubeSize, cubeSize, cubeSize);
         XMMATRIX cubeRot = XMMatrixRotationY(renderer.cubeRotation);
         XMMATRIX cubeTrans = XMMatrixTranslation(0.0f, cubeHeight, 0.0f);
-        XMMATRIX cubeWVP = cubeRot * cubeScale * cubeTrans * zoom * viewMatrix * projMatrix;
+        XMMATRIX cubeWVP = cubeRot * cubeScale * cubeTrans * viewMatrix * zoom * projMatrix;
 
         glUseProgram_(renderer.cubeProgram);
         SetMatrix(renderer.cubeProgram, "uTransform", cubeWVP);
@@ -272,7 +274,7 @@ void RenderScene(
         const float gridScale = 0.05f;
         XMMATRIX gridWorld = XMMatrixScaling(gridScale, gridScale, gridScale) *
                              XMMatrixTranslation(0, gridScale, 0);
-        XMMATRIX gridWVP = gridWorld * zoom * viewMatrix * projMatrix;
+        XMMATRIX gridWVP = gridWorld * viewMatrix * zoom * projMatrix;
 
         glUseProgram_(renderer.gridProgram);
         SetMatrix(renderer.gridProgram, "uTransform", gridWVP);

@@ -880,6 +880,8 @@ void RenderScene(
     vkCmdSetScissor(renderer.commandBuffer, 0, 1, &scissor);
     LOG_INFO("[RenderScene] eye=%d: viewport+scissor set", eye);
 
+    // Zoom in eye space: scales about the viewer's position, keeping the viewport
+    // center (= display center in Kooima projection) fixed on screen.
     XMMATRIX zoom = XMMatrixScaling(zoomScale, zoomScale, zoomScale);
 
     // Draw cube - base rests on grid at y=0
@@ -889,7 +891,7 @@ void RenderScene(
         XMMATRIX cubeScale = XMMatrixScaling(cubeSize, cubeSize, cubeSize);
         XMMATRIX cubeRot = XMMatrixRotationY(renderer.cubeRotation);
         XMMATRIX cubeTrans = XMMatrixTranslation(0.0f, cubeHeight, 0.0f);
-        XMMATRIX cubeWVP = cubeRot * cubeScale * cubeTrans * zoom * viewMatrix * projMatrix;
+        XMMATRIX cubeWVP = cubeRot * cubeScale * cubeTrans * viewMatrix * zoom * projMatrix;
 
         VkPushConstants pc = {};
         // Store WITHOUT transpose: SPIR-V ColMajor reads row-major data as columns,
