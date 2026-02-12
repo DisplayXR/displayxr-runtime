@@ -133,8 +133,11 @@ static const uint32_t g_cubeFragSpv[] = {
 //   layout(push_constant) uniform PC { mat4 transform; vec4 color; } pc;
 //   layout(location=0) in vec3 aPos;
 //   void main() { gl_Position = pc.transform * vec4(aPos, 1.0); }
+// Note: Original hand-written SPIR-V had ID collision (0x1e used for both
+// OpTypePointer and OpCompositeConstruct). Fixed by using ID 0x22 for the
+// composite result and bumping the bound from 0x22 to 0x23.
 static const uint32_t g_gridVertSpv[] = {
-    0x07230203, 0x00010000, 0x000d000a, 0x00000022,
+    0x07230203, 0x00010000, 0x000d000a, 0x00000023,
     0x00000000, 0x00020011, 0x00000001, 0x0006000b,
     0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e,
     0x00000000, 0x0003000e, 0x00000000, 0x00000001,
@@ -186,11 +189,10 @@ static const uint32_t g_gridVertSpv[] = {
     0x00000000, 0x00050051, 0x00000006, 0x0000001d,
     0x0000001b, 0x00000001, 0x00050051, 0x00000006,
     0x0000001f, 0x0000001b, 0x00000002, 0x00070050,
-    0x00000007, 0x0000001e, 0x0000001c, 0x0000001d,
+    0x00000007, 0x00000022, 0x0000001c, 0x0000001d,
     0x0000001f, 0x0000001a, 0x00050091, 0x00000007,
-    0x00000020, 0x00000019, 0x0000001e, 0x00050041,
+    0x00000020, 0x00000019, 0x00000022, 0x00050041,
     0x0000001e, 0x00000021, 0x0000000d, 0x00000013,
-    // Fix: use correct ID for output pointer
     0x0003003e, 0x00000021, 0x00000020, 0x000100fd,
     0x00010038,
 };
@@ -912,9 +914,26 @@ void RenderScene(
         LOG_INFO("[RenderScene] eye=%d: cube draw recorded", eye);
     }
 
-    // Grid drawing disabled - grid shader SPIR-V causes ACCESS_VIOLATION on Intel Iris Xe.
-    // TODO: Replace hand-written SPIR-V with compiler-generated shaders to fix grid rendering.
-    LOG_INFO("[RenderScene] eye=%d: grid skipped (disabled for Intel compatibility)", eye);
+    // Draw grid floor
+    {
+        const float gridScale = 0.05f;
+        XMMATRIX gridWorld = XMMatrixScaling(gridScale, gridScale, gridScale)
+                           * XMMatrixTranslation(0, gridScale, 0);
+        XMMATRIX gridWVP = gridWorld * viewMatrix * zoom * projMatrix;
+
+        VkPushConstants pc = {};
+        XMStoreFloat4x4(&pc.transform, gridWVP);
+        pc.color[0] = 0.3f; pc.color[1] = 0.3f; pc.color[2] = 0.35f; pc.color[3] = 1.0f;
+
+        vkCmdBindPipeline(renderer.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, renderer.gridPipeline);
+        vkCmdPushConstants(renderer.commandBuffer, renderer.pipelineLayout,
+            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
+
+        VkDeviceSize offset = 0;
+        vkCmdBindVertexBuffers(renderer.commandBuffer, 0, 1, &renderer.gridVertexBuffer, &offset);
+        vkCmdDraw(renderer.commandBuffer, renderer.gridVertexCount, 1, 0, 0);
+        LOG_INFO("[RenderScene] eye=%d: grid draw recorded", eye);
+    }
 
     LOG_INFO("[RenderScene] eye=%d: vkCmdEndRenderPass...", eye);
     vkCmdEndRenderPass(renderer.commandBuffer);
