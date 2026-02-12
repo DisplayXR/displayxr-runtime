@@ -128,6 +128,10 @@ xrt_builder_create_func_t target_builder_list[] = {
     t_builder_simulated_create,
 #endif // T_BUILDER_SIMULATED
 
+#ifdef XRT_BUILD_DRIVER_RIFT
+    rift_builder_create,
+#endif // XRT_BUILD_DRIVER_RIFT
+
 #ifdef XRT_BUILD_DRIVER_RIFT_S
     rift_s_builder_create,
 #endif // XRT_BUILD_DRIVER_RIFT_S
