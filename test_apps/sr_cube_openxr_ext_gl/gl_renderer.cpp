@@ -249,9 +249,9 @@ void RenderScene(
     glClearColor(0.05f, 0.05f, 0.25f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-    // Zoom in eye space: scales about the viewer's position, keeping the viewport
-    // center (= display center in Kooima projection) fixed on screen.
-    XMMATRIX zoom = XMMatrixScaling(zoomScale, zoomScale, zoomScale);
+    // Zoom in eye space: scale only x,y (not z) so perspective division doesn't
+    // cancel the effect. Keeps the viewport center fixed on screen.
+    XMMATRIX zoom = XMMatrixScaling(zoomScale, zoomScale, 1.0f);
 
     // Draw cube - base rests on grid at y=0
     {

@@ -519,9 +519,9 @@ void RenderScene(
 
     // viewMatrix already includes player locomotion via OpenXR reference space offset
     // (see UpdateLocalSpace in xr_session). No manual camera transform needed.
-    // Zoom in eye space: scales about the viewer's position, keeping the viewport
-    // center (= display center in Kooima projection) fixed on screen.
-    XMMATRIX zoom = XMMatrixScaling(zoomScale, zoomScale, zoomScale);
+    // Zoom in eye space: scale only x,y (not z) so perspective division doesn't
+    // cancel the effect. Keeps the viewport center fixed on screen.
+    XMMATRIX zoom = XMMatrixScaling(zoomScale, zoomScale, 1.0f);
 
     // Render cube
     // Scale cube to 0.06m (60mm, matching reference SR example) - unit cube is -0.5 to 0.5
