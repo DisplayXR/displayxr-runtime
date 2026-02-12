@@ -297,22 +297,18 @@ static void RenderThreadFunc(
                             uint32_t imageIndex;
                             if (AcquireSwapchainImage(*xr, eye, imageIndex)) {
                                 ID3D12Resource* swapchainTexture = swapchainImages[eye][imageIndex].texture;
-                                LOG_INFO("[FRAME] Eye %d: acquired idx=%u, tex=%p", eye, imageIndex, swapchainTexture);
 
                                 XMMATRIX viewMatrix = (eye == 0) ? leftViewMatrix : rightViewMatrix;
                                 XMMATRIX projMatrix = (eye == 0) ? leftProjMatrix : rightProjMatrix;
 
                                 int rtvIdx = rtvBaseIndex[eye] + (int)imageIndex;
 
-                                LOG_INFO("[FRAME] Eye %d: RenderScene (rtvIdx=%d, %ux%u)...", eye, rtvIdx, renderW, renderH);
                                 RenderScene(*renderer, swapchainTexture, rtvIdx, eye,
                                     renderW, renderH,
                                     viewMatrix, projMatrix,
                                     useAppProjection ? 1.0f : inputSnapshot.zoomScale);
-                                LOG_INFO("[FRAME] Eye %d: RenderScene done", eye);
 
                                 ReleaseSwapchainImage(*xr, eye);
-                                LOG_INFO("[FRAME] Eye %d: Released", eye);
 
                                 projectionViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
                                 projectionViews[eye].subImage.swapchain = xr->swapchains[eye].swapchain;
@@ -330,13 +326,9 @@ static void RenderThreadFunc(
                         }
 
                         // Render HUD to window-space layer swapchain
-                        LOG_INFO("[FRAME] HUD check: rendered=%d hud=%p hasHud=%d hudImages=%p hudVisible=%d",
-                            rendered, hud, xr->hasHudSwapchain, hudSwapchainImages, inputSnapshot.hudVisible);
                         if (rendered && inputSnapshot.hudVisible && hud && xr->hasHudSwapchain && hudSwapchainImages) {
-                            LOG_INFO("[FRAME] HUD: Acquiring swapchain image...");
                             uint32_t hudImageIndex;
                             if (AcquireHudSwapchainImage(*xr, hudImageIndex)) {
-                                LOG_INFO("[FRAME] HUD: Acquired image %u", hudImageIndex);
                                 std::wstring sessionText = L"Session: ";
                                 sessionText += FormatSessionState((int)xr->sessionState);
                                 std::wstring modeText = xr->hasWin32WindowBindingExt ?
@@ -346,10 +338,8 @@ static void RenderThreadFunc(
                                     renderW, renderH, windowW, windowH);
                                 std::wstring eyeText = FormatEyeTrackingInfo(xr->eyePosX, xr->eyePosY, xr->eyePosZ, xr->eyeTrackingActive);
 
-                                LOG_INFO("[FRAME] HUD: RenderHudAndMap...");
                                 uint32_t srcRowPitch = 0;
                                 const void* pixels = RenderHudAndMap(*hud, &srcRowPitch, sessionText, modeText, perfText, eyeText);
-                                LOG_INFO("[FRAME] HUD: RenderHudAndMap returned pixels=%p srcRowPitch=%u", pixels, srcRowPitch);
                                 if (pixels) {
                                     // Copy pixels row-by-row to D3D12 upload buffer (256-byte aligned rows)
                                     const uint8_t* src = (const uint8_t*)pixels;
@@ -359,11 +349,9 @@ static void RenderThreadFunc(
                                             HUD_PIXEL_WIDTH * 4);
                                     }
                                     UnmapHud(*hud);
-                                    LOG_INFO("[FRAME] HUD: memcpy done, recording D3D12 commands...");
 
                                     // Record D3D12 commands: copy upload buffer to HUD swapchain texture
                                     ID3D12Resource* hudTex = (*hudSwapchainImages)[hudImageIndex].texture;
-                                    LOG_INFO("[FRAME] HUD: tex=%p, allocator=%p, cmdList=%p", hudTex, hudCmdAllocator, hudCmdList);
 
                                     hudCmdAllocator->Reset();
                                     hudCmdList->Reset(hudCmdAllocator, nullptr);
@@ -401,7 +389,6 @@ static void RenderThreadFunc(
                                     hudCmdList->ResourceBarrier(1, &barrier);
 
                                     hudCmdList->Close();
-                                    LOG_INFO("[FRAME] HUD: Executing copy commands...");
 
                                     // Execute and wait
                                     ID3D12CommandList* lists[] = { hudCmdList };
@@ -414,12 +401,9 @@ static void RenderThreadFunc(
                                     }
 
                                     hudSubmitted = true;
-                                    LOG_INFO("[FRAME] HUD: GPU copy done, hudSubmitted=true");
                                 }
 
-                                LOG_INFO("[FRAME] HUD: Releasing swapchain image...");
                                 ReleaseHudSwapchainImage(*xr);
-                                LOG_INFO("[FRAME] HUD: Released");
                             }
                         }
                     }
