@@ -294,10 +294,6 @@ static void RenderOneFrame(RenderState& rs) {
                     xrLocateViews(xr.session, &locateInfo, &viewState, 2, &viewCount, rawViews);
 
                     // --- App-side Kooima projection (RAW mode, app-owned camera model) ---
-                    // Compute the physical screen extents (meters) of the rendered area.
-                    // renderW/renderH is the view texture size; swapchain dims correspond to the
-                    // full display pixel resolution. The ratio maps display physical size to the
-                    // rendered region's physical extent.
                     uint32_t renderW_pre = (uint32_t)(g_windowWidth * xr.recommendedViewScaleX);
                     uint32_t renderH_pre = (uint32_t)(g_windowHeight * xr.recommendedViewScaleY);
                     if (renderW_pre > xr.swapchains[0].width) renderW_pre = xr.swapchains[0].width;
@@ -306,8 +302,23 @@ static void RenderOneFrame(RenderState& rs) {
                     XrFovf appFov[2];
                     bool useAppProjection = (xr.hasDisplayInfoExt && xr.displayWidthM > 0.0f);
                     if (useAppProjection) {
-                        float screenWidthM = xr.displayWidthM * (float)renderW_pre / (float)xr.swapchains[0].width;
-                        float screenHeightM = xr.displayHeightM * (float)renderH_pre / (float)xr.swapchains[0].height;
+                        // Viewport-scale FOV (SRHydra): convert window pixels to meters,
+                        // then apply isotropic scale so FOV stays consistent across window
+                        // sizes on the 3D display. Matches the non-extension runtime path.
+                        float pxSizeX = xr.displayWidthM / (float)xr.swapchains[0].width;
+                        float pxSizeY = xr.displayHeightM / (float)xr.swapchains[0].height;
+                        float winW_m = (float)g_windowWidth * pxSizeX;
+                        float winH_m = (float)g_windowHeight * pxSizeY;
+                        float minDisp = fminf(xr.displayWidthM, xr.displayHeightM);
+                        float minWin  = fminf(winW_m, winH_m);
+                        float vs = minDisp / minWin;
+                        float screenWidthM  = winW_m * vs;
+                        float screenHeightM = winH_m * vs;
+
+                        // Alternative: content-preserving FOV — keeps rendered content at
+                        // constant physical size on display regardless of window size.
+                        // float screenWidthM = xr.displayWidthM * (float)renderW_pre / (float)xr.swapchains[0].width;
+                        // float screenHeightM = xr.displayHeightM * (float)renderH_pre / (float)xr.swapchains[0].height;
 
                         leftProjMatrix = ComputeKooimaProjection(
                             rawViews[0].pose.position, screenWidthM, screenHeightM, 0.01f, 100.0f);

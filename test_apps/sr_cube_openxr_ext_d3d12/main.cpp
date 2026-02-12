@@ -250,8 +250,23 @@ static void RenderThreadFunc(
                         XrFovf appFov[2];
                         bool useAppProjection = (xr->hasDisplayInfoExt && xr->displayWidthM > 0.0f);
                         if (useAppProjection) {
-                            float screenWidthM = xr->displayWidthM * (float)renderW / (float)xr->swapchains[0].width;
-                            float screenHeightM = xr->displayHeightM * (float)renderH / (float)xr->swapchains[0].height;
+                            // Viewport-scale FOV (SRHydra): convert window pixels to meters,
+                            // then apply isotropic scale so FOV stays consistent across window
+                            // sizes on the 3D display. Matches the non-extension runtime path.
+                            float pxSizeX = xr->displayWidthM / (float)xr->swapchains[0].width;
+                            float pxSizeY = xr->displayHeightM / (float)xr->swapchains[0].height;
+                            float winW_m = (float)windowW * pxSizeX;
+                            float winH_m = (float)windowH * pxSizeY;
+                            float minDisp = fminf(xr->displayWidthM, xr->displayHeightM);
+                            float minWin  = fminf(winW_m, winH_m);
+                            float vs = minDisp / minWin;
+                            float screenWidthM  = winW_m * vs;
+                            float screenHeightM = winH_m * vs;
+
+                            // Alternative: content-preserving FOV — keeps rendered content at
+                            // constant physical size on display regardless of window size.
+                            // float screenWidthM = xr->displayWidthM * (float)renderW / (float)xr->swapchains[0].width;
+                            // float screenHeightM = xr->displayHeightM * (float)renderH / (float)xr->swapchains[0].height;
 
                             leftProjMatrix = ComputeKooimaProjection(
                                 rawViews[0].pose.position, screenWidthM, screenHeightM, 0.01f, 100.0f);
