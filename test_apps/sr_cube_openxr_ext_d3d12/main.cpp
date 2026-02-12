@@ -336,10 +336,12 @@ static void RenderThreadFunc(
                                     L"XR_EXT_win32_window_binding: NOT AVAILABLE (D3D12)";
                                 std::wstring perfText = FormatPerformanceInfo(perfStats.fps, perfStats.frameTimeMs,
                                     renderW, renderH, windowW, windowH);
+                                std::wstring dispText = FormatDisplayInfo(xr->displayWidthM, xr->displayHeightM,
+                                    xr->nominalViewerX, xr->nominalViewerY, xr->nominalViewerZ);
                                 std::wstring eyeText = FormatEyeTrackingInfo(xr->eyePosX, xr->eyePosY, xr->eyePosZ, xr->eyeTrackingActive);
 
                                 uint32_t srcRowPitch = 0;
-                                const void* pixels = RenderHudAndMap(*hud, &srcRowPitch, sessionText, modeText, perfText, eyeText);
+                                const void* pixels = RenderHudAndMap(*hud, &srcRowPitch, sessionText, modeText, perfText, dispText, eyeText);
                                 if (pixels) {
                                     // Copy pixels row-by-row to D3D12 upload buffer (256-byte aligned rows)
                                     const uint8_t* src = (const uint8_t*)pixels;

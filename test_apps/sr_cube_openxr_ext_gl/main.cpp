@@ -422,12 +422,14 @@ static void RenderThreadFunc(
                                 std::wstring perfText = FormatPerformanceInfo(perfStats.fps, perfStats.frameTimeMs,
                                     dispRenderW, dispRenderH,
                                     windowW, windowH);
+                                std::wstring dispText = FormatDisplayInfo(xr->displayWidthM, xr->displayHeightM,
+                                    xr->nominalViewerX, xr->nominalViewerY, xr->nominalViewerZ);
                                 std::wstring eyeText = FormatEyeTrackingInfo(
                                     xr->eyePosX, xr->eyePosY, xr->eyePosZ, xr->eyeTrackingActive);
 
                                 uint32_t srcRowPitch = 0;
                                 const void* pixels = RenderHudAndMap(*hud, &srcRowPitch,
-                                    sessionText, modeText, perfText, eyeText);
+                                    sessionText, modeText, perfText, dispText, eyeText);
                                 bool uploadOk = false;
                                 if (pixels) {
                                     // Clear any prior GL errors

@@ -382,9 +382,14 @@ static void RenderOneFrame(RenderState& rs) {
                             RenderText(*rs.textOverlay, renderer.device.Get(), hudTexture,
                                 perfText, px, 74, tw, 88, true);
 
+                            std::wstring dispText = FormatDisplayInfo(xr.displayWidthM, xr.displayHeightM,
+                                xr.nominalViewerX, xr.nominalViewerY, xr.nominalViewerZ);
+                            RenderText(*rs.textOverlay, renderer.device.Get(), hudTexture,
+                                dispText, px, 172, tw, 44, true);
+
                             std::wstring eyeText = FormatEyeTrackingInfo(xr.eyePosX, xr.eyePosY, xr.eyePosZ, xr.eyeTrackingActive);
                             RenderText(*rs.textOverlay, renderer.device.Get(), hudTexture,
-                                eyeText, px, 172, tw, 88, true);
+                                eyeText, px, 222, tw, 44, true);
 
                             ReleaseHudSwapchainImage(xr);
                             hudSubmitted = true;
