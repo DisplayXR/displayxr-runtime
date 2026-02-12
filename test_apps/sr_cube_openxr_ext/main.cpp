@@ -327,6 +327,27 @@ static void RenderOneFrame(RenderState& rs) {
                         for (int e = 0; e < 2; e++)
                             appFov[e] = ComputeKooimaFov(
                                 rawViews[e].pose.position, screenWidthM, screenHeightM);
+
+                        // Display-center zoom: scale raw eye positions in the view
+                        // matrix to move the camera toward the display center.
+                        float zs = g_inputState.zoomScale;
+                        if (zs != 1.0f) {
+                            XMVECTOR playerOri = XMQuaternionRotationRollPitchYaw(
+                                g_inputState.pitch, g_inputState.yaw, 0);
+                            float zoomShift = 1.0f / zs - 1.0f;
+                            for (int e = 0; e < 2; e++) {
+                                XMVECTOR rawPos = XMVectorSet(
+                                    rawViews[e].pose.position.x,
+                                    rawViews[e].pose.position.y,
+                                    rawViews[e].pose.position.z, 0);
+                                XMVECTOR deltaWorld = XMVector3Rotate(rawPos, playerOri) * zoomShift;
+                                XMMATRIX& vm = (e == 0) ? leftViewMatrix : rightViewMatrix;
+                                XMVECTOR deltaEye = XMVector3TransformNormal(deltaWorld, vm);
+                                XMFLOAT3 d;
+                                XMStoreFloat3(&d, deltaEye);
+                                vm = vm * XMMatrixTranslation(-d.x, -d.y, -d.z);
+                            }
+                        }
                     }
 
                     // [Commented out — will be reused for 3D-positioned HUD later]
@@ -413,7 +434,7 @@ static void RenderOneFrame(RenderState& rs) {
                             RenderScene(renderer, rtv, rs.depthDSVs[eye].Get(),
                                 renderW, renderH,
                                 viewMatrix, projMatrix,
-                                g_inputState.zoomScale,
+                                useAppProjection ? 1.0f : g_inputState.zoomScale,
                                 0.03f);  // cubeHeight = 0.03 (half cube size)
 
                             if (rtv) rtv->Release();

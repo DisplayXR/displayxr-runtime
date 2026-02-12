@@ -363,6 +363,27 @@ static void RenderThreadFunc(
                             for (int e = 0; e < 2; e++)
                                 appFov[e] = ComputeKooimaFov(
                                     rawViews[e].pose.position, screenWidthM, screenHeightM);
+
+                            // Display-center zoom: scale raw eye positions in the view
+                            // matrix to move the camera toward the display center.
+                            float zs = inputSnapshot.zoomScale;
+                            if (zs != 1.0f) {
+                                XMVECTOR playerOri = XMQuaternionRotationRollPitchYaw(
+                                    inputSnapshot.pitch, inputSnapshot.yaw, 0);
+                                float zoomShift = 1.0f / zs - 1.0f;
+                                for (int e = 0; e < 2; e++) {
+                                    XMVECTOR rawPos = XMVectorSet(
+                                        rawViews[e].pose.position.x,
+                                        rawViews[e].pose.position.y,
+                                        rawViews[e].pose.position.z, 0);
+                                    XMVECTOR deltaWorld = XMVector3Rotate(rawPos, playerOri) * zoomShift;
+                                    XMMATRIX& vm = (e == 0) ? leftViewMatrix : rightViewMatrix;
+                                    XMVECTOR deltaEye = XMVector3TransformNormal(deltaWorld, vm);
+                                    XMFLOAT3 d;
+                                    XMStoreFloat3(&d, deltaEye);
+                                    vm = vm * XMMatrixTranslation(-d.x, -d.y, -d.z);
+                                }
+                            }
                         }
 
                         rendered = true;
@@ -375,7 +396,7 @@ static void RenderThreadFunc(
                                 RenderScene(*renderer, eye, imageIndex,
                                     renderW, renderH,
                                     viewMatrix, projMatrix,
-                                    inputSnapshot.zoomScale);
+                                    useAppProjection ? 1.0f : inputSnapshot.zoomScale);
 
                                 ReleaseSwapchainImage(*xr, eye);
 
