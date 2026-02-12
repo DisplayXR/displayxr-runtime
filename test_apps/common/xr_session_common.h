@@ -83,6 +83,9 @@ struct XrSessionManager {
     float recommendedViewScaleY = 1.0f;
     float displayWidthM = 0.0f;
     float displayHeightM = 0.0f;
+    float nominalViewerX = 0.0f;
+    float nominalViewerY = 0.0f;
+    float nominalViewerZ = 0.5f;
 
     // Window handle for session target (used by ext app, ignored by non-ext app)
     HWND windowHandle = nullptr;

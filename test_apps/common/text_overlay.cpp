@@ -201,17 +201,21 @@ std::wstring FormatInputInfo(const std::string& lastKey, int mouseX, int mouseY,
     return oss.str();
 }
 
+std::wstring FormatDisplayInfo(float widthM, float heightM, float nomX, float nomY, float nomZ) {
+    std::wostringstream oss;
+    oss << std::fixed << std::setprecision(0);
+    oss << L"Display: (" << (widthM * 1000.0f) << L"x" << (heightM * 1000.0f) << L") mm\n";
+    oss << L"Nominal: (" << (nomX * 1000.0f) << L"," << (nomY * 1000.0f) << L"," << (nomZ * 1000.0f) << L") mm";
+    return oss.str();
+}
+
 std::wstring FormatEyeTrackingInfo(float posX, float posY, float posZ, bool active) {
     std::wostringstream oss;
     oss << std::fixed << std::setprecision(0);
-    oss << L"Eye Tracking:\n";
     if (active) {
-        // Convert from meters to millimeters
-        oss << L"  X: " << (posX * 1000.0f) << L" mm\n";
-        oss << L"  Y: " << (posY * 1000.0f) << L" mm\n";
-        oss << L"  Z: " << (posZ * 1000.0f) << L" mm";
+        oss << L"Eye: (" << (posX * 1000.0f) << L"," << (posY * 1000.0f) << L"," << (posZ * 1000.0f) << L") mm";
     } else {
-        oss << L"  Active: No";
+        oss << L"Eye: inactive";
     }
     return oss.str();
 }

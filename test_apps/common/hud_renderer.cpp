@@ -79,7 +79,8 @@ bool InitializeHudRenderer(HudRenderer& hud, uint32_t w, uint32_t h) {
 
 const void* RenderHudAndMap(HudRenderer& hud, uint32_t* rowPitch,
     const std::wstring& sessionText, const std::wstring& modeText,
-    const std::wstring& perfText, const std::wstring& eyeText)
+    const std::wstring& perfText, const std::wstring& displayInfoText,
+    const std::wstring& eyeText)
 {
     // Clear render texture with semi-transparent black
     ID3D11RenderTargetView* rtv = nullptr;
@@ -105,7 +106,10 @@ const void* RenderHudAndMap(HudRenderer& hud, uint32_t* rowPitch,
         perfText, px, 74*sy, tw, 88*sy, true);
 
     RenderText(hud.overlay, hud.device.Get(), hud.renderTex.Get(),
-        eyeText, px, 172*sy, tw, 88*sy, true);
+        displayInfoText, px, 172*sy, tw, 44*sy, true);
+
+    RenderText(hud.overlay, hud.device.Get(), hud.renderTex.Get(),
+        eyeText, px, 222*sy, tw, 44*sy, true);
 
     // Copy render texture to staging texture, then map for CPU read
     hud.context->CopyResource(hud.stagingTex.Get(), hud.renderTex.Get());

@@ -128,9 +128,13 @@ bool InitializeOpenXR(XrSessionManager& xr) {
             xr.recommendedViewScaleY = displayInfo.recommendedViewScaleY;
             xr.displayWidthM = displayInfo.displaySizeMeters.width;
             xr.displayHeightM = displayInfo.displaySizeMeters.height;
-            LOG_INFO("Display info: scale=%.3fx%.3f, size=%.3fx%.3fm",
+            xr.nominalViewerX = displayInfo.nominalViewerPositionInDisplaySpace.x;
+            xr.nominalViewerY = displayInfo.nominalViewerPositionInDisplaySpace.y;
+            xr.nominalViewerZ = displayInfo.nominalViewerPositionInDisplaySpace.z;
+            LOG_INFO("Display info: scale=%.3fx%.3f, size=%.3fx%.3fm, nominal=(%.0f,%.0f,%.0f)mm",
                 xr.recommendedViewScaleX, xr.recommendedViewScaleY,
-                xr.displayWidthM, xr.displayHeightM);
+                xr.displayWidthM, xr.displayHeightM,
+                xr.nominalViewerX * 1000.0f, xr.nominalViewerY * 1000.0f, xr.nominalViewerZ * 1000.0f);
         }
     }
 
