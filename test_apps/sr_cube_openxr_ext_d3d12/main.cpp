@@ -33,8 +33,11 @@ using Microsoft::WRL::ComPtr;
 static const char* APP_NAME = "sr_cube_openxr_ext_d3d12";
 
 // HUD overlay: WIDTH_FRACTION anchors how wide the HUD appears on screen.
-static const uint32_t HUD_PIXEL_WIDTH = 380;
-static const uint32_t HUD_PIXEL_HEIGHT = 280;
+// D3D12 swapchains are imported into the Vulkan native compositor via shared handles.
+// Non-power-of-2 dimensions cause a size mismatch between D3D12 and Vulkan memory layouts
+// (nvidia bug - see comp_d3d12_client.cpp). Use power-of-2 to avoid this.
+static const uint32_t HUD_PIXEL_WIDTH = 512;
+static const uint32_t HUD_PIXEL_HEIGHT = 256;
 static const float HUD_WIDTH_FRACTION = 0.30f;
 
 static const wchar_t* WINDOW_CLASS = L"SRCubeOpenXRExtD3D12Class";
