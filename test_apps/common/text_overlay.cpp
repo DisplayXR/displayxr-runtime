@@ -14,7 +14,7 @@
 #pragma comment(lib, "d2d1.lib")
 #pragma comment(lib, "dwrite.lib")
 
-bool InitializeTextOverlay(TextOverlay& overlay) {
+bool InitializeTextOverlay(TextOverlay& overlay, float normalFontSize, float smallFontSize) {
     HRESULT hr;
 
     // Create D2D factory
@@ -44,7 +44,7 @@ bool InitializeTextOverlay(TextOverlay& overlay) {
         DWRITE_FONT_WEIGHT_NORMAL,
         DWRITE_FONT_STYLE_NORMAL,
         DWRITE_FONT_STRETCH_NORMAL,
-        20.0f,
+        normalFontSize,
         L"en-us",
         &overlay.textFormat
     );
@@ -60,7 +60,7 @@ bool InitializeTextOverlay(TextOverlay& overlay) {
         DWRITE_FONT_WEIGHT_NORMAL,
         DWRITE_FONT_STYLE_NORMAL,
         DWRITE_FONT_STRETCH_NORMAL,
-        15.0f,
+        smallFontSize,
         L"en-us",
         &overlay.smallTextFormat
     );

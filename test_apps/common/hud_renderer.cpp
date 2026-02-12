@@ -62,8 +62,13 @@ bool InitializeHudRenderer(HudRenderer& hud, uint32_t w, uint32_t h) {
         return false;
     }
 
-    // Initialize DirectWrite/D2D text overlay
-    if (!InitializeTextOverlay(hud.overlay)) {
+    // Scale font sizes proportionally based on HUD dimensions.
+    // Base reference: 280px height with 20pt/15pt fonts (D3D11 ext app).
+    float fontScale = h / 280.0f;
+    float normalFontSize = 20.0f * fontScale;
+    float smallFontSize = 15.0f * fontScale;
+
+    if (!InitializeTextOverlay(hud.overlay, normalFontSize, smallFontSize)) {
         LOG_ERROR("HudRenderer: InitializeTextOverlay failed");
         return false;
     }
@@ -85,21 +90,22 @@ const void* RenderHudAndMap(HudRenderer& hud, uint32_t* rowPitch,
         rtv->Release();
     }
 
-    // Scale text coordinates proportionally
-    float sx = hud.width / 512.0f;
-    float sy = hud.height / 256.0f;
+    // Scale layout proportionally from 380x280 base (matching D3D11 ext app)
+    float sy = hud.height / 280.0f;
+    float px = 12.0f * (hud.width / 380.0f);   // left padding
+    float tw = (float)hud.width - 2.0f * px;    // text width
 
     RenderText(hud.overlay, hud.device.Get(), hud.renderTex.Get(),
-        sessionText, 10*sx, 10*sy, 300*sx, 30*sy);
+        sessionText, px, 12*sy, tw, 26*sy);
 
     RenderText(hud.overlay, hud.device.Get(), hud.renderTex.Get(),
-        modeText, 10*sx, 45*sy, 350*sx, 30*sy, true);
+        modeText, px, 42*sy, tw, 22*sy, true);
 
     RenderText(hud.overlay, hud.device.Get(), hud.renderTex.Get(),
-        perfText, 10*sx, 85*sy, 300*sx, 70*sy, true);
+        perfText, px, 74*sy, tw, 88*sy, true);
 
     RenderText(hud.overlay, hud.device.Get(), hud.renderTex.Get(),
-        eyeText, 10*sx, 165*sy, 300*sx, 70*sy, true);
+        eyeText, px, 172*sy, tw, 88*sy, true);
 
     // Copy render texture to staging texture, then map for CPU read
     hud.context->CopyResource(hud.stagingTex.Get(), hud.renderTex.Get());

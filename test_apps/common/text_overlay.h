@@ -28,8 +28,8 @@ struct TextOverlay {
     bool initialized = false;
 };
 
-// Initialize DirectWrite resources
-bool InitializeTextOverlay(TextOverlay& overlay);
+// Initialize DirectWrite resources (font sizes default to 20pt normal, 15pt small)
+bool InitializeTextOverlay(TextOverlay& overlay, float normalFontSize = 20.0f, float smallFontSize = 15.0f);
 
 // Clean up resources
 void CleanupTextOverlay(TextOverlay& overlay);
