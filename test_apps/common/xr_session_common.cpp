@@ -522,8 +522,22 @@ bool CreateHudSwapchain(XrSessionManager& xr, uint32_t width, uint32_t height) {
     std::vector<int64_t> formats(formatCount);
     XR_CHECK(xrEnumerateSwapchainFormats(xr.session, formatCount, &formatCount, formats.data()));
 
-    // Use runtime's preferred format (first in the list per OpenXR spec)
+    // Prefer R8G8B8A8_UNORM for the HUD swapchain because HudRenderer (standalone
+    // D3D11 device) always outputs R8G8B8A8_UNORM pixels. Using the runtime's
+    // default format (often B8G8R8A8 on Vulkan-backed compositors) would cause a
+    // format family mismatch in D3D12 CopyTextureRegion, silently failing the copy.
+    // Well-known R8G8B8A8_UNORM codes: DXGI=28, VK=37, GL_RGBA8=0x8058.
     int64_t selectedFormat = formats[0];
+    const int64_t preferredFormats[] = { 28, 37, 0x8058 };
+    for (int64_t pref : preferredFormats) {
+        for (uint32_t i = 0; i < formatCount; i++) {
+            if (formats[i] == pref) {
+                selectedFormat = pref;
+                goto found;
+            }
+        }
+    }
+    found:
     LOG_INFO("Selected HUD swapchain format: %lld (0x%llX)", selectedFormat, selectedFormat);
 
     XrSwapchainCreateInfo swapchainInfo = {XR_TYPE_SWAPCHAIN_CREATE_INFO};

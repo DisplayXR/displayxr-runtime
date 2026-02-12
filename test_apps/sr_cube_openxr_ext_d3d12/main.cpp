@@ -355,7 +355,7 @@ static void RenderThreadFunc(
                                     srcLoc.pResource = hudUploadBuffer;
                                     srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
                                     srcLoc.PlacedFootprint.Offset = 0;
-                                    srcLoc.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                                    srcLoc.PlacedFootprint.Footprint.Format = (DXGI_FORMAT)xr->hudSwapchain.format;
                                     srcLoc.PlacedFootprint.Footprint.Width = HUD_PIXEL_WIDTH;
                                     srcLoc.PlacedFootprint.Footprint.Height = HUD_PIXEL_HEIGHT;
                                     srcLoc.PlacedFootprint.Footprint.Depth = 1;
