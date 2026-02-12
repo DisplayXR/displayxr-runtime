@@ -40,7 +40,7 @@ XR_EXT_display_info
 Purpose:
 - Expose **physical display geometry**
 - Define the **canonical viewing pyramid**
-- Provide **nominal viewer pose**
+- Provide **nominal viewer position**
 - Provide **recommended render resolution scaling**
 - Enable **RAW vs RENDER_READY** view behavior
 
@@ -50,7 +50,7 @@ No vendor branding; suitable for future upstreaming.
 
 ## 1) Canonical Display Pyramid (Core Concept)
 
-The physical display and nominal viewer pose together define a **canonical display frustum**:
+The physical display and nominal viewer position together define a **canonical display frustum**:
 
 - **Base**: physical display rectangle (real-world size)
 - **Apex**: nominal viewer position
@@ -68,9 +68,9 @@ Stereo rendering is then:
 
 ---
 
-## 2) Nominal Viewer Pose (Clarified Semantics)
+## 2) Nominal Viewer Position (Clarified Semantics)
 
-`nominalViewerPoseInDisplaySpace` is:
+`nominalViewerPositionInDisplaySpace` is:
 
 - **not tracked**
 - **static**
@@ -83,7 +83,7 @@ Interpretation:
   - depth feels natural
   - the canonical pyramid is perfectly aligned
 
-The nominal viewer pose:
+The nominal viewer position:
 - anchors stereo geometry
 - anchors first-person camera alignment
 - defines the apex of the canonical pyramid
@@ -140,7 +140,7 @@ Replace **absolute recommended sizes** with **quality scales**.
 
 Minimum fields:
 - `XrExtent2Df displaySizeMeters`
-- `XrPosef nominalViewerPoseInDisplaySpace`
+- `XrVector3f nominalViewerPositionInDisplaySpace`
 - `float recommendedViewScaleX`
 - `float recommendedViewScaleY`
 
@@ -190,7 +190,7 @@ Used for:
 - Update display info API to return scaleX / scaleY
 - Update documentation to explain:
   - canonical display pyramid
-  - nominal viewer pose
+  - nominal viewer position
   - anisotropic quality scaling
 
 ---

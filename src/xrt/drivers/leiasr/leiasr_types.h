@@ -46,6 +46,9 @@ struct leiasr_display_dimensions
 {
 	float width_m;   //!< Screen width in meters
 	float height_m;  //!< Screen height in meters
+	float nominal_x_m;  //!< Nominal viewer X in meters (display space)
+	float nominal_y_m;  //!< Nominal viewer Y in meters (display space)
+	float nominal_z_m;  //!< Nominal viewer Z in meters (display space)
 	bool valid;      //!< True if the dimensions are valid
 };
 

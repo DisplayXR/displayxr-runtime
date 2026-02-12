@@ -235,8 +235,12 @@ out:
 			if (leiasr_static_get_display_dimensions(&dims) && dims.valid) {
 				xsysc->info.display_width_m = dims.width_m;
 				xsysc->info.display_height_m = dims.height_m;
-				U_LOG_W("XR_EXT_display_info: display=%.4f x %.4f m",
-				        dims.width_m, dims.height_m);
+				xsysc->info.nominal_viewer_x_m = dims.nominal_x_m;
+				xsysc->info.nominal_viewer_y_m = dims.nominal_y_m;
+				xsysc->info.nominal_viewer_z_m = dims.nominal_z_m;
+				U_LOG_W("XR_EXT_display_info: display=%.4f x %.4f m, nominal=(%.4f, %.4f, %.4f) m",
+				        dims.width_m, dims.height_m,
+				        dims.nominal_x_m, dims.nominal_y_m, dims.nominal_z_m);
 			}
 		}
 #endif

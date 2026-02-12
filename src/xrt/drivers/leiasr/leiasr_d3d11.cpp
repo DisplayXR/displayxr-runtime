@@ -588,6 +588,9 @@ leiasr_query_recommended_view_dimensions(double max_time,
 // Cached display dimensions for static queries
 static float g_cached_display_width_m = 0.0f;
 static float g_cached_display_height_m = 0.0f;
+static float g_cached_nominal_x_m = 0.0f;
+static float g_cached_nominal_y_m = 0.0f;
+static float g_cached_nominal_z_m = 0.5f;
 static bool g_display_dims_cached = false;
 
 bool
@@ -630,6 +633,9 @@ leiasr_static_get_display_dimensions(struct leiasr_display_dimensions *out_dims)
 	if (g_display_dims_cached) {
 		out_dims->width_m = g_cached_display_width_m;
 		out_dims->height_m = g_cached_display_height_m;
+		out_dims->nominal_x_m = g_cached_nominal_x_m;
+		out_dims->nominal_y_m = g_cached_nominal_y_m;
+		out_dims->nominal_z_m = g_cached_nominal_z_m;
 		out_dims->valid = true;
 		return true;
 	}
@@ -662,10 +668,31 @@ leiasr_static_get_display_dimensions(struct leiasr_display_dimensions *out_dims)
 				if (raw_width_cm > 0.0f && raw_height_cm > 0.0f) {
 					g_cached_display_width_m = raw_width_cm / 100.0f;
 					g_cached_display_height_m = raw_height_cm / 100.0f;
+
+					// Query nominal viewing position from SR SDK (returns mm)
+					float nom_x_mm = 0.0f, nom_y_mm = 0.0f, nom_z_mm = 0.0f;
+					try {
+						display->getDefaultViewingPosition(nom_x_mm, nom_y_mm, nom_z_mm);
+						g_cached_nominal_x_m = nom_x_mm / 1000.0f;
+						g_cached_nominal_y_m = nom_y_mm / 1000.0f;
+						g_cached_nominal_z_m = nom_z_mm / 1000.0f;
+						U_LOG_W("SR nominal viewing position: (%.1f, %.1f, %.1f) mm = (%.4f, %.4f, %.4f) m",
+						        nom_x_mm, nom_y_mm, nom_z_mm,
+						        g_cached_nominal_x_m, g_cached_nominal_y_m, g_cached_nominal_z_m);
+					} catch (...) {
+						g_cached_nominal_x_m = 0.0f;
+						g_cached_nominal_y_m = 0.0f;
+						g_cached_nominal_z_m = 0.5f;
+						U_LOG_W("SR getDefaultViewingPosition failed, using fallback (0, 0, 0.5) m");
+					}
+
 					g_display_dims_cached = true;
 
 					out_dims->width_m = g_cached_display_width_m;
 					out_dims->height_m = g_cached_display_height_m;
+					out_dims->nominal_x_m = g_cached_nominal_x_m;
+					out_dims->nominal_y_m = g_cached_nominal_y_m;
+					out_dims->nominal_z_m = g_cached_nominal_z_m;
 					out_dims->valid = true;
 					success = true;
 

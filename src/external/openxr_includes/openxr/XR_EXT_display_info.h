@@ -22,7 +22,7 @@ extern "C" {
 #endif
 
 #define XR_EXT_display_info 1
-#define XR_EXT_display_info_SPEC_VERSION 2
+#define XR_EXT_display_info_SPEC_VERSION 3
 #define XR_EXT_DISPLAY_INFO_EXTENSION_NAME "XR_EXT_display_info"
 
 // Reuse the type value from the deleted XR_EXT_dynamic_render_resolution
@@ -48,7 +48,7 @@ typedef struct XrDisplayInfoEXT {
     XrStructureType             type;       //!< Must be XR_TYPE_DISPLAY_INFO_EXT
     void* XR_MAY_ALIAS          next;       //!< Pointer to next structure in chain
     XrExtent2Df                 displaySizeMeters;          //!< Physical display size in meters
-    XrPosef                     nominalViewerPoseInDisplaySpace; //!< Nominal viewer position relative to display center
+    XrVector3f                  nominalViewerPositionInDisplaySpace; //!< Nominal viewer position in display space (meters)
     float                       recommendedViewScaleX;      //!< Horizontal scale: sr_recommended_w / display_pixel_w
     float                       recommendedViewScaleY;      //!< Vertical scale: sr_recommended_h / display_pixel_h
 } XrDisplayInfoEXT;

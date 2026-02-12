@@ -73,7 +73,7 @@ This proposal introduces two independent but complementary extensions:
 | Extension | Purpose |
 |---|---|
 | `XR_EXT_win32_window_binding` | App provides a Win32 HWND for runtime rendering; enables windowed mode, multi-app, app-controlled input, and window-space overlay layers. |
-| `XR_EXT_display_info` | Runtime exposes physical display geometry, nominal viewer pose, recommended render scale, and a DISPLAY reference space anchored to the physical screen. |
+| `XR_EXT_display_info` | Runtime exposes physical display geometry, nominal viewer position, recommended render scale, and a DISPLAY reference space anchored to the physical screen. |
 
 Together they form a minimal, complete interface for tracked 3D display rendering through
 OpenXR.
@@ -94,7 +94,7 @@ OpenXR.
         ├── xrGetSystemProperties()
         │       ◄── XrDisplayInfoEXT (chained)
         │           • displaySizeMeters
-        │           • nominalViewerPoseInDisplaySpace
+        │           • nominalViewerPositionInDisplaySpace
         │           • recommendedViewScaleX / Y
         │
         ├── xrCreateSession()
@@ -120,11 +120,11 @@ OpenXR.
 
 ### Canonical Display Pyramid
 
-The physical display and nominal viewer pose together define a **canonical display
+The physical display and nominal viewer position together define a **canonical display
 pyramid** (frustum):
 
 - **Base**: the physical display rectangle (known real-world size in meters).
-- **Apex**: the nominal viewer position (`nominalViewerPoseInDisplaySpace`).
+- **Apex**: the nominal viewer position (`nominalViewerPositionInDisplaySpace`).
 - **Edges**: rays from the apex through each corner of the display rectangle.
 
 This pyramid represents the *intended single-view camera* for the display. It anchors
@@ -412,13 +412,13 @@ No known IP claims.
 ### Name Strings
 
 - Extension name: `XR_EXT_display_info`
-- Spec version: 2
+- Spec version: 3
 - Extension name define: `XR_EXT_DISPLAY_INFO_EXTENSION_NAME`
 
 ### Overview
 
 This extension exposes the physical properties of a tracked 3D display to the application:
-the display's physical dimensions, its nominal viewer pose, and recommended render
+the display's physical dimensions, its nominal viewer position, and recommended render
 resolution scale factors. It also introduces a DISPLAY reference space anchored to the
 physical screen.
 
@@ -451,7 +451,7 @@ Chained to `XrSystemProperties` to return physical display information.
 | `type` | `XrStructureType` | Must be `XR_TYPE_DISPLAY_INFO_EXT`. |
 | `next` | `void*` | Pointer to next structure in the chain, or `NULL`. |
 | `displaySizeMeters` | `XrExtent2Df` | Physical display rectangle size in meters (`width`, `height`). |
-| `nominalViewerPoseInDisplaySpace` | `XrPosef` | Design-time expected viewer position relative to display center. Defines the apex of the canonical display pyramid. See [Nominal Viewer Pose](#nominal-viewer-pose). |
+| `nominalViewerPositionInDisplaySpace` | `XrVector3f` | Design-time expected viewer position relative to display center (meters). Defines the apex of the canonical display pyramid. See [Nominal Viewer Position](#nominal-viewer-position). |
 | `recommendedViewScaleX` | `float` | Horizontal render resolution scale factor. See [Recommended View Scale](#recommended-view-scale). |
 | `recommendedViewScaleY` | `float` | Vertical render resolution scale factor. See [Recommended View Scale](#recommended-view-scale). |
 
@@ -460,7 +460,7 @@ typedef struct XrDisplayInfoEXT {
     XrStructureType             type;
     void* XR_MAY_ALIAS          next;
     XrExtent2Df                 displaySizeMeters;
-    XrPosef                     nominalViewerPoseInDisplaySpace;
+    XrVector3f                  nominalViewerPositionInDisplaySpace;
     float                       recommendedViewScaleX;
     float                       recommendedViewScaleY;
 } XrDisplayInfoEXT;
@@ -534,30 +534,28 @@ The canonical display pyramid is a formal geometric concept central to this exte
 - The **base** is the physical display rectangle, with dimensions
   `displaySizeMeters.width` x `displaySizeMeters.height`.
 - The **apex** is the nominal viewer position
-  (`nominalViewerPoseInDisplaySpace.position`), typically 0.5–0.7 meters in front of the
+  (`nominalViewerPositionInDisplaySpace`), typically 0.5–0.7 meters in front of the
   display center along the +Z axis.
 - The **frustum edges** are the rays from the apex through each corner of the display.
 
 This pyramid defines the natural mono viewing frustum. Stereo rendering is then sampling
 this pyramid from two nearby eye positions (the tracked physical eyes).
 
-### Nominal Viewer Pose
+### Nominal Viewer Position
 
-`nominalViewerPoseInDisplaySpace` is a **static, non-tracked, design-time expectation** of
-where the viewer should be relative to the display. It is **not** the actual tracked
+`nominalViewerPositionInDisplaySpace` is a **static, non-tracked, design-time expectation**
+of where the viewer should be relative to the display. It is **not** the actual tracked
 viewer position.
 
 **Interpretation:**
-- Actual tracked eyes are expected to *vary around* this pose during use.
-- At the nominal pose: parallax is neutral, depth perception feels natural, and the
+- Actual tracked eyes are expected to *vary around* this position during use.
+- At the nominal position: parallax is neutral, depth perception feels natural, and the
   canonical display pyramid is perfectly aligned.
-- The nominal viewer pose anchors stereo geometry and first-person camera alignment.
+- The nominal viewer position anchors stereo geometry and first-person camera alignment.
 - It defines the apex of the canonical display pyramid.
 
 **Typical value:**
-- Position: `{0.0, 0.0, 0.65}` in display space (65 cm directly in front of screen
-  center).
-- Orientation: identity quaternion `{0, 0, 0, 1}` (facing the display).
+- `{0.0, 0.0, 0.65}` in display space (65 cm directly in front of screen center).
 
 ### Recommended View Scale
 
@@ -651,8 +649,8 @@ float displayWidthM  = displayInfo.displaySizeMeters.width;   // e.g. 0.344
 float displayHeightM = displayInfo.displaySizeMeters.height;  // e.g. 0.194
 float scaleX = displayInfo.recommendedViewScaleX;             // e.g. 0.5
 float scaleY = displayInfo.recommendedViewScaleY;             // e.g. 1.0
-XrPosef nominalPose = displayInfo.nominalViewerPoseInDisplaySpace;
-// nominalPose.position ~ {0.0, 0.0, 0.65}
+XrVector3f nominalPos = displayInfo.nominalViewerPositionInDisplaySpace;
+// nominalPos ~ {0.0, 0.0, 0.65}
 ```
 
 ### Example Code: Creating DISPLAY Reference Space
@@ -1061,6 +1059,7 @@ tracked displays coexist with HMDs.
 |---|---|---|---|
 | 1 | 2025-01-15 | David Fattal | Initial version with absolute recommended view sizes. |
 | 2 | 2025-03-01 | David Fattal | Replaced absolute sizes with `recommendedViewScaleX/Y` scale factors. Added `XR_REFERENCE_SPACE_TYPE_DISPLAY_EXT`. Added nominal viewer pose. |
+| 3 | 2025-06-01 | David Fattal | Changed `nominalViewerPoseInDisplaySpace` from `XrPosef` to `XrVector3f nominalViewerPositionInDisplaySpace`. Orientation was always identity; position is now populated from the SR SDK's `getDefaultViewingPosition()`. |
 
 ---
 
@@ -1093,5 +1092,5 @@ for eye tracking and light field interlacing.
 | **RENDER_READY mode** | View mode where the runtime returns view poses and FOV angles with convergence and comfort adjustments applied. The application still builds its own projection matrix from the FOV angles. |
 | **Window-space coordinates** | Fractional coordinates in `[0, 1]` relative to the target window's dimensions. Used by `XrCompositionLayerWindowSpaceEXT`. |
 | **DISPLAY space** | A reference space anchored to the physical display center, with +X right, +Y up, +Z toward the viewer. Not affected by recentering. |
-| **Nominal viewer pose** | A static, design-time expectation of the viewer's position relative to the display. Not tracked; defines the apex of the canonical display pyramid. |
+| **Nominal viewer position** | A static, design-time expectation of the viewer's position relative to the display. Not tracked; defines the apex of the canonical display pyramid. |
 | **Disparity** | Horizontal shift between left and right eye images, measured as a fraction of window width. Controls perceived depth of window-space layers. |

@@ -602,14 +602,10 @@ oxr_system_get_properties(struct oxr_logger *log, struct oxr_system *sys, XrSyst
 		display_info->displaySizeMeters.height = info ? info->display_height_m : 0.0f;
 		display_info->recommendedViewScaleX = info ? info->recommended_view_scale_x : 1.0f;
 		display_info->recommendedViewScaleY = info ? info->recommended_view_scale_y : 1.0f;
-		// Nominal viewer pose: 0.5m in front of display center, facing display
-		display_info->nominalViewerPoseInDisplaySpace.position.x = 0.0f;
-		display_info->nominalViewerPoseInDisplaySpace.position.y = 0.0f;
-		display_info->nominalViewerPoseInDisplaySpace.position.z = 0.5f;
-		display_info->nominalViewerPoseInDisplaySpace.orientation.x = 0.0f;
-		display_info->nominalViewerPoseInDisplaySpace.orientation.y = 0.0f;
-		display_info->nominalViewerPoseInDisplaySpace.orientation.z = 0.0f;
-		display_info->nominalViewerPoseInDisplaySpace.orientation.w = 1.0f;
+		// Nominal viewer position from SR SDK (or fallback defaults)
+		display_info->nominalViewerPositionInDisplaySpace.x = info ? info->nominal_viewer_x_m : 0.0f;
+		display_info->nominalViewerPositionInDisplaySpace.y = info ? info->nominal_viewer_y_m : 0.0f;
+		display_info->nominalViewerPositionInDisplaySpace.z = info ? info->nominal_viewer_z_m : 0.5f;
 	}
 #endif // OXR_HAVE_EXT_display_info
 

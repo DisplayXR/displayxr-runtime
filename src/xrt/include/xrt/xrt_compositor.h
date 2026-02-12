@@ -2432,6 +2432,15 @@ struct xrt_system_compositor_info
 
 	//! Recommended vertical view scale: sr_recommended_h / display_pixel_h. 0 if unknown.
 	float recommended_view_scale_y;
+
+	//! Nominal viewer X position in display space (meters). 0 if unknown.
+	float nominal_viewer_x_m;
+
+	//! Nominal viewer Y position in display space (meters). 0 if unknown.
+	float nominal_viewer_y_m;
+
+	//! Nominal viewer Z position in display space (meters). 0 if unknown.
+	float nominal_viewer_z_m;
 };
 
 struct xrt_system_compositor;
