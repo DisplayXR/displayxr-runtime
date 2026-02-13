@@ -918,13 +918,65 @@ composite_layers_to_intermediate(struct multi_compositor *mc,
 	                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 	                         0, 0, NULL, 0, NULL, 2, barriers_to_attach);
 
-	// NOTE: No layout transitions on shared (app) swapchain images!
-	// These images are shared between two VkDevices via external memory.
-	// On Intel Iris Xe (Gen12), layout transitions modify CCS (Color Control
-	// Surface) compression metadata in shared GPU memory, corrupting data
-	// written by the app's VkDevice and causing VK_ERROR_DEVICE_LOST.
-	// The images were initialized to GENERAL at creation time (before sharing),
-	// and we sample them using VK_IMAGE_LAYOUT_GENERAL in descriptors.
+	// NOTE: Shared (app) swapchain images use VK_IMAGE_LAYOUT_GENERAL for sampling.
+	// On Intel Iris Xe (Gen12), a round-trip GENERAL->TRANSFER_SRC->GENERAL transition
+	// is performed to reconcile CCS metadata on the compositor's device (see below).
+	// No permanent layout changes are made — images stay in GENERAL.
+
+	// Reconcile CCS metadata on shared (app) projection images before sampling.
+	// On Intel Iris Xe (Gen12), cross-device shared images use CCS compression
+	// whose metadata must be reconciled on the compositor's device. A round-trip
+	// GENERAL -> TRANSFER_SRC -> GENERAL transition triggers CCS resolution
+	// without permanently changing the layout. This matches the approach used
+	// by session_blit_sbs(). On NVIDIA this is a harmless no-op.
+	{
+		VkImageMemoryBarrier ccs_pre[2] = {
+		    {
+		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		        .srcAccessMask = 0,
+		        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+		        .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+		        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		        .image = leftProjImage,
+		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, leftProjArray, 1},
+		    },
+		    {
+		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		        .srcAccessMask = 0,
+		        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+		        .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+		        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		        .image = rightProjImage,
+		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, rightProjArray, 1},
+		    },
+		};
+		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
+		                         NULL, 0, NULL, 2, ccs_pre);
+
+		VkImageMemoryBarrier ccs_post[2] = {
+		    {
+		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		        .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+		        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+		        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+		        .image = leftProjImage,
+		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, leftProjArray, 1},
+		    },
+		    {
+		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		        .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+		        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+		        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+		        .image = rightProjImage,
+		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, rightProjArray, 1},
+		    },
+		};
+		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 2,
+		                         ccs_post);
+	}
 
 	// UBO stride for sub-allocation from the persistent UBO buffer
 	VkDeviceSize ubo_stride = sizeof(struct xrt_normalized_rect) + sizeof(struct xrt_matrix_4x4);
@@ -933,8 +985,7 @@ composite_layers_to_intermediate(struct multi_compositor *mc,
 	VkImageView proj_views[2] = {leftProjView, rightProjView};
 
 	// Step 2: For each eye — begin render pass, draw projection quad, draw overlays, end render pass.
-	// NO layout transitions on imported (app) images — avoids VK_ERROR_DEVICE_LOST on Intel Iris Xe.
-	// Imported images are sampled as textures using VK_IMAGE_LAYOUT_GENERAL.
+	// CCS reconciliation was already performed above. Imported images are sampled using GENERAL.
 	for (int eye = 0; eye < 2; eye++) {
 		// --- Projection layer: fullscreen opaque quad (descriptor set 0) ---
 		{
