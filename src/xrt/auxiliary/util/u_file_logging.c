@@ -171,6 +171,24 @@ u_file_logging_init(void)
 }
 
 void
+u_file_logging_write_raw(const char *msg)
+{
+	u_file_logging_init();
+	if (g_log_file == NULL || msg == NULL) {
+		return;
+	}
+
+	SYSTEMTIME st;
+	GetLocalTime(&st);
+
+	fprintf(g_log_file, "[%04d-%02d-%02d %02d:%02d:%02d.%03d] [OXR  ] %s",
+	        st.wYear, st.wMonth, st.wDay,
+	        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+	        msg);
+	fflush(g_log_file);
+}
+
+void
 u_file_logging_shutdown(void)
 {
 	if (g_log_file != NULL) {
@@ -188,6 +206,13 @@ u_file_logging_shutdown(void)
 void
 u_file_logging_init(void)
 {
+	// File logging only implemented on Windows
+}
+
+void
+u_file_logging_write_raw(const char *msg)
+{
+	(void)msg;
 	// File logging only implemented on Windows
 }
 

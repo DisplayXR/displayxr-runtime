@@ -15,13 +15,22 @@ extern "C" {
 
 /*!
  * Initialize file logging to %LOCALAPPDATA%/LeiaSR/SRMonado.
- * Creates a log file with timestamp: SRMonado_YYYY-MM-DD_HH-MM-SS.log
+ * Creates a log file with process name, PID, and timestamp:
+ * SRMonado_<exe>.<pid>_YYYY-MM-DD_HH-MM-SS.log
  *
  * Safe to call multiple times - only initializes once.
  * Automatically called by u_log on first log message on Windows.
  */
 void
 u_file_logging_init(void);
+
+/*!
+ * Write a pre-formatted message to the log file.
+ * Used by oxr_logger to route state tracker logs to the file.
+ * Safe to call before init or after shutdown (will be a no-op).
+ */
+void
+u_file_logging_write_raw(const char *msg);
 
 /*!
  * Close the log file and clean up resources.

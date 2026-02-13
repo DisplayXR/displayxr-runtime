@@ -11,6 +11,7 @@
 
 #include "util/u_misc.h"
 #include "util/u_debug.h"
+#include "util/u_file_logging.h"
 #include "util/u_truncate_printf.h"
 
 #include "oxr_objects.h"
@@ -97,6 +98,7 @@ do_output(const char *buf)
 {
 #if defined(XRT_OS_WINDOWS)
 	OutputDebugStringA(buf);
+	u_file_logging_write_raw(buf);
 
 	if (debug_get_bool_option_no_printing_stderr()) {
 		return;
