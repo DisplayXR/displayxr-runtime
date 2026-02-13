@@ -321,6 +321,9 @@ if(XRT_BUILD_DRIVER_RIFT_SENSOR)
 		rift_sensor/esp770u.h
 		rift_sensor/mt9v034.c
 		rift_sensor/mt9v034.h
+		rift_sensor/rift_sensor_interface.h
+		rift_sensor/rift_sensor_internal.h
+		rift_sensor/rift_sensor.c
 		)
 	target_include_directories(drv_rift_sensor SYSTEM PRIVATE)
 	target_link_libraries(
