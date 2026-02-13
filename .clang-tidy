@@ -18,6 +18,7 @@ Checks:       |
     portability-*,
     readability-*,
 
+    -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
     -performance-no-int-to-ptr,
 
     -android-cloexec-dup,
@@ -82,7 +83,6 @@ Checks:       |
     -clang-analyzer-security.ArrayBound,
     -clang-analyzer-security.FloatLoopCounter,
     -clang-analyzer-security.PointerSub,
-    -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
     -clang-analyzer-unix.Malloc,
     -clang-analyzer-unix.StdCLibraryFunctions,
     -clang-diagnostic-newline-eof,
