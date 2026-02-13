@@ -147,10 +147,30 @@ u_file_logging_init(void)
 	         st.wYear, st.wMonth, st.wDay,
 	         st.wHour, st.wMinute, st.wSecond);
 
-	// Open log file
+	// Open log file (try LOCALAPPDATA first, then fallback to TEMP for AppContainer processes)
 	g_log_file = fopen(log_path, "a");
 	if (g_log_file == NULL) {
+		// AppContainer sandbox (e.g. Chrome) blocks LOCALAPPDATA writes.
+		// Fall back to GetTempPath which works in sandboxed processes.
+		char tmp_dir[MAX_PATH];
+		if (GetTempPathA(MAX_PATH, tmp_dir) > 0) {
+			snprintf(log_path, sizeof(log_path),
+			         "%sSRMonado_%s.%u_%04d-%02d-%02d_%02d-%02d-%02d.log",
+			         tmp_dir, exe_name, (unsigned)pid,
+			         st.wYear, st.wMonth, st.wDay,
+			         st.wHour, st.wMinute, st.wSecond);
+			g_log_file = fopen(log_path, "a");
+		}
+	}
+	if (g_log_file == NULL) {
 		return;
+	}
+
+	// Announce log file location via OutputDebugString for discoverability
+	{
+		char dbg[512];
+		snprintf(dbg, sizeof(dbg), "[SRMonado] Log file: %s\n", log_path);
+		OutputDebugStringA(dbg);
 	}
 
 	// Register our sink
