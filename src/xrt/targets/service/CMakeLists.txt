@@ -15,6 +15,18 @@ target_link_libraries(
 		target_instance
 	)
 
+# Delay-load Vulkan and SR Vulkan DLLs so the service can start on systems
+# where these are absent. The D3D11 service compositor path never calls into
+# Vulkan or SR Vulkan weaver functions, so the delay-loaded DLLs are never triggered.
+# This mirrors the same pattern used by the in-process runtime (SRMonadoClient.dll).
+if(WIN32)
+	target_link_options(monado-service PRIVATE
+		"/DELAYLOAD:vulkan-1.dll"
+		"/DELAYLOAD:SimulatedRealityVulkanBeta.dll"
+	)
+	target_link_libraries(monado-service PRIVATE delayimp)
+endif()
+
 install(TARGETS monado-service RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 if(XRT_HAVE_SYSTEMD)
