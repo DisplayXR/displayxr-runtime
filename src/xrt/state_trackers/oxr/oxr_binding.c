@@ -725,12 +725,31 @@ oxr_action_suggest_interaction_profile_bindings(struct oxr_logger *log,
 
 	// Path already validated.
 	XrPath path = suggestedBindings->interactionProfile;
+
+	{
+		const char *profile_str = NULL;
+		size_t profile_len = 0;
+		oxr_path_get_string(log, inst, path, &profile_str, &profile_len);
+		oxr_warn(log,
+		         " [DIAG] xrSuggestInteractionProfileBindings: profile='%s' bindings=%u",
+		         profile_str ? profile_str : "<null>",
+		         suggestedBindings->countSuggestedBindings);
+	}
+
 	interaction_profile_find_or_create_in_instance(log, inst, path, &p);
 
 	// Valid path, but not used.
 	if (p == NULL) {
+		oxr_warn(log,
+		         " [DIAG] xrSuggestInteractionProfileBindings: profile path=0x%" PRIx64 " NOT recognized by runtime",
+		         (uint64_t)path);
 		goto out;
 	}
+
+	oxr_warn(log,
+	         " [DIAG] xrSuggestInteractionProfileBindings: profile matched -> '%s' (%zu template bindings)",
+	         p->localized_name ? p->localized_name : "<unknown>",
+	         p->binding_count);
 
 	struct oxr_binding *bindings = p->bindings;
 	size_t binding_count = p->binding_count;

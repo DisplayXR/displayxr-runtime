@@ -133,10 +133,17 @@ u_file_logging_init(void)
 	SYSTEMTIME st;
 	GetLocalTime(&st);
 
-	// Build log file path with timestamp
+	// Get process executable name and PID for log identification
+	char exe_path[MAX_PATH];
+	GetModuleFileNameA(NULL, exe_path, MAX_PATH);
+	char *exe_name = strrchr(exe_path, '\\');
+	exe_name = exe_name ? exe_name + 1 : exe_path;
+	DWORD pid = GetCurrentProcessId();
+
+	// Build log file path with process name, PID, and timestamp
 	char log_path[MAX_PATH];
-	snprintf(log_path, sizeof(log_path), "%s\\SRMonado_%04d-%02d-%02d_%02d-%02d-%02d.log",
-	         log_dir,
+	snprintf(log_path, sizeof(log_path), "%s\\SRMonado_%s.%u_%04d-%02d-%02d_%02d-%02d-%02d.log",
+	         log_dir, exe_name, (unsigned)pid,
 	         st.wYear, st.wMonth, st.wDay,
 	         st.wHour, st.wMinute, st.wSecond);
 
@@ -152,6 +159,7 @@ u_file_logging_init(void)
 	// Write header
 	fprintf(g_log_file, "=== SRMonado Log Started ===\n");
 	fprintf(g_log_file, "Log file: %s\n", log_path);
+	fprintf(g_log_file, "Process: %s (PID %u)\n", exe_name, (unsigned)pid);
 	fprintf(g_log_file, "Timestamp: %04d-%02d-%02d %02d:%02d:%02d\n",
 	        st.wYear, st.wMonth, st.wDay,
 	        st.wHour, st.wMinute, st.wSecond);
