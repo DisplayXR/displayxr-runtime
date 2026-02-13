@@ -31,12 +31,14 @@ target_include_directories(sr_common_base PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/../../src/external/openxr_includes
 )
 
-# D3D11-specific library: extends base with D3D11 renderer + text overlay
+# D3D11-specific library: extends base with D3D11 renderer + text overlay + HUD
 add_library(sr_common STATIC
     d3d11_renderer.cpp
     d3d11_renderer.h
     text_overlay.cpp
     text_overlay.h
+    hud_renderer.cpp
+    hud_renderer.h
 )
 
 target_link_libraries(sr_common PUBLIC
