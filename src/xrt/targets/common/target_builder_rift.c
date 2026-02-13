@@ -19,6 +19,10 @@
 
 #include "rift/rift_interface.h"
 
+#ifdef XRT_BUILD_DRIVER_RIFT_SENSOR
+#include "rift_sensor/rift_sensor_interface.h"
+#endif
+
 /*
  *
  * Internal structures
@@ -32,6 +36,10 @@ struct rift_builder
 	enum u_logging_level log_level;
 
 	struct rift_hmd *hmd;
+
+#ifdef XRT_BUILD_DRIVER_RIFT_SENSOR
+	struct rift_sensor_context *sensor_context;
+#endif
 };
 
 static struct rift_builder *
@@ -49,6 +57,7 @@ rift_builder(struct xrt_builder *xb)
 DEBUG_GET_ONCE_LOG_OPTION(rift_log, "RIFT_LOG", U_LOGGING_WARN)
 
 #define RIFT_ERROR(p, ...) U_LOG_IFL_E(p->log_level, __VA_ARGS__)
+#define RIFT_WARN(p, ...) U_LOG_IFL_W(p->log_level, __VA_ARGS__)
 #define RIFT_DEBUG(p, ...) U_LOG_IFL_D(p->log_level, __VA_ARGS__)
 
 static const char *driver_list[] = {
@@ -122,6 +131,8 @@ rift_open_system_impl(struct xrt_builder *xb,
 	struct xrt_prober_device **xpdevs = NULL;
 	size_t xpdev_count = 0;
 	xrt_result_t xret = XRT_SUCCESS;
+	int ret;
+	(void)ret; // Avoid unused variable warning when sensors are disabled.
 
 	DRV_TRACE_MARKER();
 
@@ -205,8 +216,14 @@ rift_open_system_impl(struct xrt_builder *xb,
 		goto fail;
 	}
 
-	return XRT_SUCCESS;
+#ifdef XRT_BUILD_DRIVER_RIFT_SENSOR
+	ret = rift_sensor_context_create(&rb->sensor_context, xfctx);
+	if (ret != 0) {
+		RIFT_WARN(rb, "Rift sensor context creation failed with code %d", ret);
+	}
+#endif
 
+	return XRT_SUCCESS;
 
 unlock_and_fail:
 	xret = xrt_prober_unlock_list(xp, &xpdevs);
@@ -222,6 +239,14 @@ fail:
 static void
 rift_destroy(struct xrt_builder *xb)
 {
+	struct rift_builder *rb = rift_builder(xb);
+
+#ifdef XRT_BUILD_DRIVER_RIFT_SENSOR
+	if (rb->sensor_context) {
+		rift_sensor_context_destroy(rb->sensor_context);
+	}
+#endif
+
 	free(xb);
 }
 

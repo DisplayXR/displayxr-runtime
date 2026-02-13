@@ -162,6 +162,10 @@ if(XRT_BUILD_DRIVER_RIFT)
 	target_link_libraries(target_lists PRIVATE drv_rift)
 endif()
 
+if(XRT_BUILD_DRIVER_RIFT_SENSOR)
+	target_link_libraries(target_lists PRIVATE drv_rift_sensor)
+endif()
+
 if(XRT_BUILD_DRIVER_RIFT_S)
 	target_link_libraries(target_lists PRIVATE drv_rift_s)
 endif()
