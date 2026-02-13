@@ -195,6 +195,10 @@ try_expanded:
 
 check_exists:
 	; Check if path already exists in PATH (avoid duplicates)
+	; Extra Push $0: StrStr returns via Exch $0 which clobbers $0 and
+	; consumes one stack item below the args. This extra push provides
+	; the item for Exch $0 to restore $0 to path_to_add.
+	Push $0
 	Push $1
 	Push $0
 	Call StrStr
@@ -227,6 +231,8 @@ done:
 FunctionEnd
 
 ; RemoveFromPath - Removes a directory from the system PATH
+; Uses System::Call to read REG_EXPAND_SZ properly (ReadRegStr can fail on
+; REG_EXPAND_SZ values, returning empty and causing PATH to be overwritten).
 ; Handles multiple occurrences, trailing backslashes, and case variations
 ; Usage: Push "C:\path\to\remove"
 ;        Call un.RemoveFromPath
@@ -239,8 +245,40 @@ Function un.RemoveFromPath
 	Push $5  ; Normalized path to remove
 	Push $6  ; Normalized current part
 
-	; Read current PATH
+	; Read current PATH using RegQueryValueExW (handles REG_EXPAND_SZ)
+	Push $R0  ; Registry handle
+	Push $R1  ; Buffer pointer
+	Push $R2  ; Data length
+
+	System::Call 'Advapi32::RegOpenKeyExW(i 0x80000002, w "SYSTEM\CurrentControlSet\Control\Session Manager\Environment", i 0, i 0x20019, *i .R0) i .r2'
+	StrCmp $2 0 0 un_reg_failed
+
+	System::Call 'Advapi32::RegQueryValueExW(i R0, w "Path", i 0, i 0, i 0, *i .R2) i .r2'
+	StrCmp $2 0 0 un_reg_close_failed
+
+	System::Alloc $R2
+	Pop $R1
+	System::Call 'Advapi32::RegQueryValueExW(i R0, w "Path", i 0, i 0, i R1, *i R2) i .r2'
+	StrCmp $2 0 0 un_reg_free_failed
+
+	System::Call '*$R1(&w${NSIS_MAX_STRLEN} .r1)'
+
+	System::Free $R1
+	System::Call 'Advapi32::RegCloseKey(i R0)'
+	Goto un_got_path
+
+un_reg_free_failed:
+	System::Free $R1
+un_reg_close_failed:
+	System::Call 'Advapi32::RegCloseKey(i R0)'
+un_reg_failed:
+	; Fall back to ReadRegStr if the System::Call approach fails
 	ReadRegStr $1 HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path"
+
+un_got_path:
+	Pop $R2
+	Pop $R1
+	Pop $R0
 
 	; Normalize path to remove (strip trailing backslash)
 	StrCpy $5 $0
@@ -257,6 +295,8 @@ loop:
 	StrCmp $2 0 writepath
 
 	; Find next semicolon
+	; Extra Push $0: un.StrStr returns via Exch $0 which consumes one stack item
+	Push $0
 	Push $1
 	Push ";"
 	Call un.StrStr
@@ -282,6 +322,7 @@ loop:
 	StrCmp $6 $5 loop  ; Skip if matches
 
 	; Also check if the path contains "SRMonado" as substring (catches any install path variations)
+	Push $0
 	Push $6
 	Push "SRMonado"
 	Call un.StrStr
@@ -307,6 +348,7 @@ lastpart:
 	StrCmp $6 $5 writepath  ; Skip if matches
 
 	; Also check for SRMonado substring
+	Push $0
 	Push $6
 	Push "SRMonado"
 	Call un.StrStr
