@@ -400,7 +400,7 @@ uvc_fs_stream_stop(struct xrt_fs *xfs)
 	free(stream->alloced_frames);
 	free(stream->free_frames);
 
-	return 0;
+	return true;
 }
 
 bool
@@ -426,7 +426,7 @@ uvc_fs_stream_start(struct xrt_fs *xfs,
 	ret = libusb_set_interface_alt_setting(stream->devh, 1, stream->alt_setting);
 	if (ret) {
 		UVC_ERROR(stream, "Failed to set interface alt setting %d", stream->alt_setting);
-		return ret;
+		return false;
 	}
 
 	stream->is_running = true;
@@ -459,12 +459,12 @@ uvc_fs_stream_start(struct xrt_fs *xfs,
 			stream->active_transfers = i;
 
 			uvc_fs_stream_stop((struct xrt_fs *)stream);
-			return ret;
+			return false;
 		}
 	}
 
 	stream->active_transfers = stream->num_transfers;
-	return 0;
+	return true;
 }
 
 static void
