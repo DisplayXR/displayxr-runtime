@@ -18,6 +18,7 @@
 #include "input_handler.h"
 #include "d3d11_renderer.h"
 #include "text_overlay.h"
+#include "hud_renderer.h"
 #include "xr_session.h"
 
 #include <chrono>
@@ -229,7 +230,8 @@ struct RenderState {
     HWND hwnd;
     XrSessionManager* xr;
     D3D11Renderer* renderer;
-    TextOverlay* textOverlay;
+    HudRenderer* hudRenderer;
+    bool hudOk;
     std::vector<XrSwapchainImageD3D11KHR>* hudSwapchainImages;
     ComPtr<ID3D11Texture2D>* depthTextures;
     ComPtr<ID3D11DepthStencilView>* depthDSVs;
@@ -353,32 +355,14 @@ static void RenderOneFrame(RenderState& rs) {
                     // ConvergencePlane convPlane = LocateConvergencePlane(rawViews);
 
                     // Render HUD to window-space layer swapchain (once per frame, before eye loop)
-                    if (g_inputState.hudVisible && xr.hasHudSwapchain && rs.hudSwapchainImages && !rs.hudSwapchainImages->empty()) {
+                    if (g_inputState.hudVisible && xr.hasHudSwapchain && rs.hudSwapchainImages && !rs.hudSwapchainImages->empty() && rs.hudOk) {
                         uint32_t hudImageIndex;
                         if (AcquireHudSwapchainImage(xr, hudImageIndex)) {
-                            ID3D11Texture2D* hudTexture = (*rs.hudSwapchainImages)[hudImageIndex].texture;
-
-                            ID3D11RenderTargetView* hudRtv = nullptr;
-                            CreateRenderTargetView(renderer, hudTexture, &hudRtv);
-                            if (hudRtv) {
-                                float hudClear[4] = {0.0f, 0.0f, 0.0f, 0.7f};
-                                renderer.context->ClearRenderTargetView(hudRtv, hudClear);
-                                hudRtv->Release();
-                            }
-
-                            float px = 12.0f; // left padding
-                            float tw = (float)xr.hudSwapchain.width - 2 * px; // text width
-
-                            std::wstring stateText = L"Session: ";
-                            stateText += FormatSessionState((int)xr.sessionState);
-                            RenderText(*rs.textOverlay, renderer.device.Get(), hudTexture,
-                                stateText, px, 12, tw, 26);
-
-                            std::wstring extText = xr.hasWin32WindowBindingExt ?
-                                L"XR_EXT_win32_window_binding: ACTIVE" :
-                                L"XR_EXT_win32_window_binding: NOT AVAILABLE";
-                            RenderText(*rs.textOverlay, renderer.device.Get(), hudTexture,
-                                extText, px, 42, tw, 22, true);
+                            std::wstring sessionText = L"Session: ";
+                            sessionText += FormatSessionState((int)xr.sessionState);
+                            std::wstring modeText = xr.hasWin32WindowBindingExt ?
+                                L"XR_EXT_win32_window_binding: ACTIVE (D3D11)" :
+                                L"XR_EXT_win32_window_binding: NOT AVAILABLE (D3D11)";
 
                             uint32_t dispRenderW = (uint32_t)(g_windowWidth * xr.recommendedViewScaleX);
                             uint32_t dispRenderH = (uint32_t)(g_windowHeight * xr.recommendedViewScaleY);
@@ -387,20 +371,22 @@ static void RenderOneFrame(RenderState& rs) {
                             std::wstring perfText = FormatPerformanceInfo(rs.perfStats->fps, rs.perfStats->frameTimeMs,
                                 dispRenderW, dispRenderH,
                                 g_windowWidth, g_windowHeight);
-                            RenderText(*rs.textOverlay, renderer.device.Get(), hudTexture,
-                                perfText, px, 74, tw, 88, true);
-
                             std::wstring dispText = FormatDisplayInfo(xr.displayWidthM, xr.displayHeightM,
                                 xr.nominalViewerX, xr.nominalViewerY, xr.nominalViewerZ);
-                            RenderText(*rs.textOverlay, renderer.device.Get(), hudTexture,
-                                dispText, px, 172, tw, 44, true);
-
                             std::wstring eyeText = FormatEyeTrackingInfo(
                                 xr.leftEyeX, xr.leftEyeY, xr.leftEyeZ,
                                 xr.rightEyeX, xr.rightEyeY, xr.rightEyeZ,
                                 xr.eyeTrackingActive);
-                            RenderText(*rs.textOverlay, renderer.device.Get(), hudTexture,
-                                eyeText, px, 222, tw, 44, true);
+
+                            uint32_t srcRowPitch = 0;
+                            const void* pixels = RenderHudAndMap(*rs.hudRenderer, &srcRowPitch,
+                                sessionText, modeText, perfText, dispText, eyeText);
+                            if (pixels) {
+                                ID3D11Texture2D* hudTexture = (*rs.hudSwapchainImages)[hudImageIndex].texture;
+                                D3D11_BOX box = {0, 0, 0, xr.hudSwapchain.width, xr.hudSwapchain.height, 1};
+                                renderer.context->UpdateSubresource(hudTexture, 0, &box, pixels, srcRowPitch, 0);
+                                UnmapHud(*rs.hudRenderer);
+                            }
 
                             ReleaseHudSwapchainImage(xr);
                             hudSubmitted = true;
@@ -559,14 +545,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return 1;
     }
 
-    // Initialize text overlay
-    TextOverlay textOverlay = {};
-    if (!InitializeTextOverlay(textOverlay)) {
-        LOG_ERROR("Text overlay initialization failed");
-        CleanupD3D11(renderer);
-        CleanupOpenXR(xr);
-        ShutdownLogging();
-        return 1;
+    // Initialize HUD renderer (standalone D3D11 device for text rendering)
+    HudRenderer hudRenderer = {};
+    bool hudOk = InitializeHudRenderer(hudRenderer, HUD_PIXEL_WIDTH, HUD_PIXEL_HEIGHT);
+    if (!hudOk) {
+        LOG_WARN("HUD renderer init failed - HUD will not be displayed");
     }
 
     // Create OpenXR session WITH window handle (XR_EXT_win32_window_binding)
@@ -574,7 +557,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     if (!CreateSession(xr, renderer.device.Get(), hwnd)) {
         LOG_ERROR("OpenXR session creation failed");
         MessageBox(hwnd, L"Failed to create OpenXR session", L"Error", MB_OK | MB_ICONERROR);
-        CleanupTextOverlay(textOverlay);
+        if (hudOk) CleanupHudRenderer(hudRenderer);
         CleanupD3D11(renderer);
         CleanupOpenXR(xr);
         ShutdownLogging();
@@ -585,7 +568,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     if (!CreateSpaces(xr)) {
         LOG_ERROR("Reference space creation failed");
         CleanupOpenXR(xr);
-        CleanupTextOverlay(textOverlay);
+        if (hudOk) CleanupHudRenderer(hudRenderer);
         CleanupD3D11(renderer);
         ShutdownLogging();
         return 1;
@@ -595,7 +578,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     if (!CreateSwapchains(xr)) {
         LOG_ERROR("Swapchain creation failed");
         CleanupOpenXR(xr);
-        CleanupTextOverlay(textOverlay);
+        if (hudOk) CleanupHudRenderer(hudRenderer);
         CleanupD3D11(renderer);
         ShutdownLogging();
         return 1;
@@ -640,7 +623,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         if (!CreateDepthStencilView(renderer, xr.swapchains[eye].width, xr.swapchains[eye].height, &depthTex, &dsv)) {
             LOG_ERROR("Failed to create depth buffer for eye %d", eye);
             CleanupOpenXR(xr);
-            CleanupTextOverlay(textOverlay);
+            if (hudOk) CleanupHudRenderer(hudRenderer);
             CleanupD3D11(renderer);
             ShutdownLogging();
             return 1;
@@ -663,7 +646,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     rs.hwnd = hwnd;
     rs.xr = &xr;
     rs.renderer = &renderer;
-    rs.textOverlay = &textOverlay;
+    rs.hudRenderer = &hudRenderer;
+    rs.hudOk = hudOk;
     rs.hudSwapchainImages = &hudSwapchainImages;
     rs.depthTextures = depthTextures;
     rs.depthDSVs = depthDSVs;
@@ -702,7 +686,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     g_xr = nullptr;
     CleanupOpenXR(xr);
-    CleanupTextOverlay(textOverlay);
+    if (hudOk) CleanupHudRenderer(hudRenderer);
     CleanupD3D11(renderer);
 
     DestroyWindow(hwnd);

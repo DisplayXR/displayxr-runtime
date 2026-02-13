@@ -46,6 +46,43 @@ static XrSessionManager* g_xr = nullptr;
 static UINT g_windowWidth = 1280;
 static UINT g_windowHeight = 720;
 
+// Fullscreen state
+static bool g_fullscreen = false;
+static RECT g_savedWindowRect = {};
+static DWORD g_savedWindowStyle = 0;
+
+// Toggle fullscreen mode for the app window
+static void ToggleFullscreen(HWND hwnd) {
+    if (g_fullscreen) {
+        // Exit fullscreen - restore window style and position
+        SetWindowLong(hwnd, GWL_STYLE, g_savedWindowStyle);
+        SetWindowPos(hwnd, HWND_TOP,
+            g_savedWindowRect.left, g_savedWindowRect.top,
+            g_savedWindowRect.right - g_savedWindowRect.left,
+            g_savedWindowRect.bottom - g_savedWindowRect.top,
+            SWP_FRAMECHANGED);
+        g_fullscreen = false;
+        LOG_INFO("Exited fullscreen mode");
+    } else {
+        // Enter fullscreen - save state and go borderless
+        g_savedWindowStyle = GetWindowLong(hwnd, GWL_STYLE);
+        GetWindowRect(hwnd, &g_savedWindowRect);
+
+        HMONITOR hMonitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi = { sizeof(mi) };
+        GetMonitorInfo(hMonitor, &mi);
+
+        SetWindowLong(hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+        SetWindowPos(hwnd, HWND_TOP,
+            mi.rcMonitor.left, mi.rcMonitor.top,
+            mi.rcMonitor.right - mi.rcMonitor.left,
+            mi.rcMonitor.bottom - mi.rcMonitor.top,
+            SWP_FRAMECHANGED);
+        g_fullscreen = true;
+        LOG_INFO("Entered fullscreen mode");
+    }
+}
+
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     {
         std::lock_guard<std::mutex> lock(g_inputMutex);
@@ -83,6 +120,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_KEYDOWN:
         if (wParam == VK_ESCAPE) {
             PostMessage(hwnd, WM_CLOSE, 0, 0);
+            return 0;
+        }
+        if (wParam == VK_F11) {
+            ToggleFullscreen(hwnd);
             return 0;
         }
         break;
@@ -684,7 +725,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     LOG_INFO("");
     LOG_INFO("=== Entering main loop ===");
-    LOG_INFO("Controls: WASD=Fly, QE=Up/Down, Mouse=Look, Space/DblClick=Reset, TAB=HUD, ESC=Quit");
+    LOG_INFO("Controls: WASD=Fly, QE=Up/Down, Mouse=Look, Space/DblClick=Reset, TAB=HUD, F11=Fullscreen, ESC=Quit");
     LOG_INFO("");
 
     // Release GL context from main thread before handing to render thread
