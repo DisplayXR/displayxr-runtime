@@ -135,7 +135,8 @@ target_link_libraries(
 if(WIN32)
 	target_sources(aux_util PRIVATE u_windows.c u_windows.h)
 	# shell32 needed for SHGetFolderPathA in u_file_logging.c
-	target_link_libraries(aux_util PRIVATE shell32)
+	# advapi32 needed for ACL/security APIs (AppContainer write access) in u_file_logging.c
+	target_link_libraries(aux_util PRIVATE shell32 advapi32)
 endif()
 
 # WIL is lacking official support on MINGW.

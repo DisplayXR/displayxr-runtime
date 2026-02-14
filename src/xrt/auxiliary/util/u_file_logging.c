@@ -24,6 +24,8 @@
 #include <windows.h>
 #include <shlobj.h>
 #include <direct.h>
+#include <sddl.h>
+#include <aclapi.h>
 
 // Log file handle
 static FILE *g_log_file = NULL;
@@ -108,6 +110,50 @@ create_directory_recursive(const char *path)
 	return _mkdir(tmp);
 }
 
+/*!
+ * Grant ALL APPLICATION PACKAGES (AppContainer processes like Chrome) write access
+ * to the log directory. Without this, Chrome's sandbox blocks fopen() to LOCALAPPDATA.
+ * Uses the same approach as SRHydra's SDDL: (A;;GA;;;AC) for the AC SID (S-1-15-2-1).
+ */
+static void
+grant_appcontainer_write_access(const char *dir_path)
+{
+	// S-1-15-2-1 = ALL APPLICATION PACKAGES
+	PSID pSid = NULL;
+	if (!ConvertStringSidToSidA("S-1-15-2-1", &pSid)) {
+		return;
+	}
+
+	// Get existing DACL
+	PACL pOldDacl = NULL;
+	PSECURITY_DESCRIPTOR pSD = NULL;
+	if (GetNamedSecurityInfoA(dir_path, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+	                          NULL, NULL, &pOldDacl, NULL, &pSD) != ERROR_SUCCESS) {
+		LocalFree(pSid);
+		return;
+	}
+
+	// Add an ACE granting read/write with inheritance to child files
+	EXPLICIT_ACCESS_A ea;
+	ZeroMemory(&ea, sizeof(ea));
+	ea.grfAccessPermissions = GENERIC_READ | GENERIC_WRITE;
+	ea.grfAccessMode = GRANT_ACCESS;
+	ea.grfInheritance = CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE;
+	ea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+	ea.Trustee.ptstrName = (char *)pSid;
+
+	PACL pNewDacl = NULL;
+	if (SetEntriesInAclA(1, &ea, pOldDacl, &pNewDacl) == ERROR_SUCCESS && pNewDacl != NULL) {
+		SetNamedSecurityInfoA((char *)dir_path, SE_FILE_OBJECT,
+		                      DACL_SECURITY_INFORMATION,
+		                      NULL, NULL, pNewDacl, NULL);
+		LocalFree(pNewDacl);
+	}
+
+	LocalFree(pSD);
+	LocalFree(pSid);
+}
+
 void
 u_file_logging_init(void)
 {
@@ -128,6 +174,10 @@ u_file_logging_init(void)
 
 	// Create directory if it doesn't exist
 	create_directory_recursive(log_dir);
+
+	// Allow AppContainer processes (Chrome, Edge) to write to this directory.
+	// The service creates the directory first; this ACL lets sandboxed clients log here too.
+	grant_appcontainer_write_access(log_dir);
 
 	// Get current timestamp for filename
 	SYSTEMTIME st;
