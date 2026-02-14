@@ -175,7 +175,7 @@ create_sr_context(double max_time, leiasr_d3d11 &sr)
 
 	// Create SwitchableLensHint for 2D/3D mode switching
 	try {
-		sr.lens_hint = new SR::SwitchableLensHint(*sr.context);
+		sr.lens_hint = SR::SwitchableLensHint::create(*sr.context);
 		U_LOG_W("SR D3D11 SwitchableLensHint created successfully");
 	} catch (...) {
 		sr.lens_hint = nullptr;
