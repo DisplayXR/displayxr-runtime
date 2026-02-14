@@ -141,6 +141,8 @@ qwerty_process_win32(struct xrt_device **xdevs,
 	static bool cached = false;
 	static bool mouse_look_active = false;
 	static POINT last_mouse_pos = {0, 0};
+	static bool lmb_was_down = false; // Tracks LMB state from wParam (touchpad fallback)
+	static bool mmb_was_down = false; // Tracks MMB state from wParam (touchpad fallback)
 
 	// Default: not handled
 	if (out_handled != NULL) {
@@ -546,6 +548,7 @@ qwerty_process_win32(struct xrt_device **xdevs,
 	case WM_LBUTTONDOWN:
 		for (int i = 0; i < target_count; i++)
 			qwerty_press_trigger(ctrl_targets[i]);
+		lmb_was_down = true;
 		if (out_handled != NULL) {
 			*out_handled = true;
 		}
@@ -554,6 +557,7 @@ qwerty_process_win32(struct xrt_device **xdevs,
 	case WM_LBUTTONUP:
 		for (int i = 0; i < target_count; i++)
 			qwerty_release_trigger(ctrl_targets[i]);
+		lmb_was_down = false;
 		if (out_handled != NULL) {
 			*out_handled = true;
 		}
@@ -562,6 +566,7 @@ qwerty_process_win32(struct xrt_device **xdevs,
 	case WM_MBUTTONDOWN:
 		for (int i = 0; i < target_count; i++)
 			qwerty_press_squeeze(ctrl_targets[i]);
+		mmb_was_down = true;
 		if (out_handled != NULL) {
 			*out_handled = true;
 		}
@@ -570,12 +575,39 @@ qwerty_process_win32(struct xrt_device **xdevs,
 	case WM_MBUTTONUP:
 		for (int i = 0; i < target_count; i++)
 			qwerty_release_squeeze(ctrl_targets[i]);
+		mmb_was_down = false;
 		if (out_handled != NULL) {
 			*out_handled = true;
 		}
 		break;
 
 	case WM_MOUSEMOVE: {
+		// Detect mouse button state from wParam flags as a fallback.
+		// Some Windows Precision Touchpad drivers suppress WM_LBUTTONDOWN/UP
+		// when system modifier keys (CTRL/ALT) are held (palm rejection).
+		// wParam contains MK_LBUTTON/MK_MBUTTON even when the event messages are lost.
+		bool lmb_down = (wParam & MK_LBUTTON) != 0;
+		bool mmb_down = (wParam & MK_MBUTTON) != 0;
+
+		if (lmb_down != lmb_was_down) {
+			for (int i = 0; i < target_count; i++) {
+				if (lmb_down)
+					qwerty_press_trigger(ctrl_targets[i]);
+				else
+					qwerty_release_trigger(ctrl_targets[i]);
+			}
+			lmb_was_down = lmb_down;
+		}
+		if (mmb_down != mmb_was_down) {
+			for (int i = 0; i < target_count; i++) {
+				if (mmb_down)
+					qwerty_press_squeeze(ctrl_targets[i]);
+				else
+					qwerty_release_squeeze(ctrl_targets[i]);
+			}
+			mmb_was_down = mmb_down;
+		}
+
 		POINT current_pos;
 		GetCursorPos(&current_pos);
 
