@@ -70,6 +70,8 @@ struct qwerty_device
 	bool sprint_pressed; //!< Movement speed boost
 	float yaw_delta;     //!< How much extra yaw to add for the next pose. Then reset to 0.
 	float pitch_delta;   //!< Similar to `yaw_delta`
+	float x_pos_delta;   //!< Mouse-driven position delta in world X. Reset to 0 each frame.
+	float y_pos_delta;   //!< Mouse-driven position delta in world Y. Reset to 0 each frame.
 };
 
 /*!
@@ -227,6 +229,13 @@ qwerty_release_sprint(struct qwerty_device *qd);
  */
 void
 qwerty_add_look_delta(struct qwerty_device *qd, float yaw, float pitch);
+
+/*!
+ * Add world-space XY position delta for the next frame (mouse-driven translation)
+ * @public @memberof qwerty_device
+ */
+void
+qwerty_add_position_delta(struct qwerty_device *qd, float dx, float dy);
 
 /*!
  * Change movement speed in exponential steps (usually integers, but any float allowed)

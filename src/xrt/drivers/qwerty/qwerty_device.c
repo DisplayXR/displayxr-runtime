@@ -358,6 +358,12 @@ qwerty_get_tracked_pose(struct xrt_device *xd,
 
 	math_vec3_accum(&pos_delta, &qd->pose.position);
 
+	// Mouse-driven position delta (world space XY, not rotated by device orientation)
+	qd->pose.position.x += qd->x_pos_delta;
+	qd->pose.position.y += qd->y_pos_delta;
+	qd->x_pos_delta = 0;
+	qd->y_pos_delta = 0;
+
 	// Orientation
 
 	// View rotation caused by keys
@@ -692,6 +698,13 @@ qwerty_add_look_delta(struct qwerty_device *qd, float yaw, float pitch)
 }
 
 void
+qwerty_add_position_delta(struct qwerty_device *qd, float dx, float dy)
+{
+	qd->x_pos_delta += dx * qd->movement_speed;
+	qd->y_pos_delta += dy * qd->movement_speed;
+}
+
+void
 qwerty_change_movement_speed(struct qwerty_device *qd, float steps)
 {
 	qd->movement_speed *= powf(MOVEMENT_SPEED_STEP, steps);
@@ -713,6 +726,8 @@ qwerty_release_all(struct qwerty_device *qd)
 	qd->sprint_pressed = false;
 	qd->yaw_delta = 0;
 	qd->pitch_delta = 0;
+	qd->x_pos_delta = 0;
+	qd->y_pos_delta = 0;
 }
 
 // Controller methods

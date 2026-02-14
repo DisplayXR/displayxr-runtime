@@ -29,8 +29,9 @@
 
 // Amount of look_speed units a mouse delta of 1px in screen space will rotate the device.
 // This value is multiplied by look_speed (0.02 for HMD) in qwerty_add_look_delta().
-// To match sr_cube_openxr_ext (0.005 rad/px): 0.25 * 0.02 = 0.005
-#define SENSITIVITY 0.25f
+#define SENSITIVITY 0.1f
+// movement_speed units per pixel for mouse-driven XY translation (0.2 * 0.005 = 0.001 m/px)
+#define POSITION_SENSITIVITY 0.2f
 
 /*!
  * Find the qwerty_system from the device list.
@@ -79,29 +80,16 @@ default_qwerty_device(struct xrt_device **xdevs, size_t xdev_count, struct qwert
 	struct xrt_device *xd_left = &qsys->lctrl->base.base;
 	struct xrt_device *xd_right = &qsys->rctrl->base.base;
 
-	// Log role assignments for debugging
-	U_LOG_W("QWERTY default_device: head=%d left=%d right=%d (count=%zu)", head, left, right, xdev_count);
-	U_LOG_W("  xd_hmd=%p, xd_left=%p, xd_right=%p", (void*)xd_hmd, (void*)xd_left, (void*)xd_right);
-	if (head >= 0 && head < (int)xdev_count) {
-		U_LOG_W("  xdevs[head=%d]=%p (%s)", head, (void*)xdevs[head], xdevs[head] ? xdevs[head]->str : "NULL");
-	} else {
-		U_LOG_W("  head=%d is UNASSIGNED or out of range", head);
-	}
-
 	struct qwerty_device *default_qdev = NULL;
 	if (head >= 0 && head < (int)xdev_count && xdevs[head] == xd_hmd) {
 		default_qdev = qwerty_device(xd_hmd);
-		U_LOG_W("  -> Selected HMD as default device");
 	} else if (right >= 0 && right < (int)xdev_count && xdevs[right] == xd_right) {
 		default_qdev = qwerty_device(xd_right);
-		U_LOG_W("  -> Selected Right Controller as default device (HMD check failed)");
 	} else if (left >= 0 && left < (int)xdev_count && xdevs[left] == xd_left) {
 		default_qdev = qwerty_device(xd_left);
-		U_LOG_W("  -> Selected Left Controller as default device");
 	} else {
 		// Fallback to right controller
 		default_qdev = qwerty_device(xd_right);
-		U_LOG_W("  -> Fallback to Right Controller (no role matches)");
 	}
 
 	return default_qdev;
@@ -161,31 +149,17 @@ qwerty_process_win32(struct xrt_device **xdevs,
 
 	// Initialize cache on first call
 	if (!cached) {
-		U_LOG_W("QWERTY Win32: First call - xdevs=%p xdev_count=%zu", (void *)xdevs, xdev_count);
-		for (size_t i = 0; i < xdev_count; i++) {
-			if (xdevs[i] != NULL) {
-				U_LOG_W("QWERTY Win32: Device[%zu]=%p name='%s' tracker='%s'",
-				        i, (void *)xdevs[i], xdevs[i]->str, xdevs[i]->tracking_origin->name);
-			}
-		}
 		qsys = find_qwerty_system(xdevs, xdev_count);
 		if (qsys == NULL) {
-			U_LOG_W("QWERTY Win32: No qwerty devices found in device list!");
 			return; // No qwerty devices found
 		}
 		default_qdev = default_qwerty_device(xdevs, xdev_count, qsys);
 		default_qctrl = default_qwerty_controller(xdevs, xdev_count, qsys);
 		cached = true;
-		U_LOG_W("QWERTY Win32 input initialized - WASDQE move, left-click+drag look, ESC quit");
-		U_LOG_W("QWERTY Win32: qsys=%p hmd=%p lctrl=%p rctrl=%p process_keys=%d",
-		        (void *)qsys, (void *)qsys->hmd, (void *)qsys->lctrl, (void *)qsys->rctrl, qsys->process_keys);
-		U_LOG_W("QWERTY Win32: default_qdev=%p (HMD base=%p)", (void *)default_qdev,
-		        (void *)(qsys->hmd ? &qsys->hmd->base : NULL));
+		U_LOG_W("QWERTY Win32 input initialized - WASDQE move, RMB+drag look, LMB trigger, ESC quit");
 	}
 
 	if (qsys == NULL || !qsys->process_keys) {
-		U_LOG_W("QWERTY Win32: Ignoring input - qsys=%p process_keys=%d",
-		        (void *)qsys, qsys ? qsys->process_keys : -1);
 		return;
 	}
 
@@ -224,13 +198,14 @@ qwerty_process_win32(struct xrt_device **xdevs,
 			}
 		}
 
-		// Release all on focus change
+		// Release all on focus change and reset mouse baseline to prevent jump
 		if (alt_change || ctrl_change) {
 			if (using_qhmd) {
 				qwerty_release_all(qd_hmd);
 			}
 			qwerty_release_all(qd_right);
 			qwerty_release_all(qd_left);
+			GetCursorPos(&last_mouse_pos);
 		}
 	}
 
@@ -241,217 +216,265 @@ qwerty_process_win32(struct xrt_device **xdevs,
 
 	// Sync our tracked state with actual state (in case we missed key-up events)
 	if (alt_pressed != alt_actual) {
-		U_LOG_W("QWERTY Win32: alt_pressed sync %d -> %d (GetAsyncKeyState)", alt_pressed, alt_actual);
 		alt_pressed = alt_actual;
 	}
 	if (ctrl_pressed != ctrl_actual) {
-		U_LOG_W("QWERTY Win32: ctrl_pressed sync %d -> %d (GetAsyncKeyState)", ctrl_pressed, ctrl_actual);
 		ctrl_pressed = ctrl_actual;
 	}
 
-	struct qwerty_device *qdev;
-	if (ctrl_pressed) {
-		qdev = qd_left;
+	// Build target arrays for dual controller support (CTRL+ALT = both)
+	struct qwerty_device *targets[2];
+	struct qwerty_controller *ctrl_targets[2];
+	int target_count;
+
+	if (ctrl_pressed && alt_pressed) {
+		targets[0] = qd_left;
+		targets[1] = qd_right;
+		ctrl_targets[0] = qleft;
+		ctrl_targets[1] = qright;
+		target_count = 2;
+	} else if (ctrl_pressed) {
+		targets[0] = qd_left;
+		ctrl_targets[0] = qleft;
+		target_count = 1;
 	} else if (alt_pressed) {
-		qdev = qd_right;
+		targets[0] = qd_right;
+		ctrl_targets[0] = qright;
+		target_count = 1;
 	} else {
-		qdev = default_qdev;
+		targets[0] = default_qdev;
+		ctrl_targets[0] = default_qctrl;
+		target_count = 1;
 	}
 
-	// Determine focused controller
-	struct qwerty_controller *qctrl = (qdev != qd_hmd) ? qwerty_controller(&qdev->base) : default_qctrl;
-
 	// Update GUI tracking vars
-	qsys->hmd_focused = (qdev == qd_hmd);
-	qsys->lctrl_focused = (qdev == qd_left);
-	qsys->rctrl_focused = (qdev == qd_right);
+	qsys->lctrl_focused = ctrl_pressed;
+	qsys->rctrl_focused = alt_pressed;
+	qsys->hmd_focused = (!ctrl_pressed && !alt_pressed && targets[0] == qd_hmd);
 
 	// Handle key events
 	if (is_keydown || is_keyup) {
 		bool handled = true;
 
-		// Log which device is being controlled
-		const char *dev_name = "unknown";
-		if (qdev == qd_hmd) dev_name = "HMD";
-		else if (qdev == qd_left) dev_name = "Left";
-		else if (qdev == qd_right) dev_name = "Right";
-
-		// Diagnostic: log focus determination details on first WASD key
-		static bool first_wasd_log = true;
-		if (first_wasd_log && (wParam == 'W' || wParam == 'A' || wParam == 'S' || wParam == 'D')) {
-			first_wasd_log = false;
-			U_LOG_W("QWERTY Win32: Focus debug: alt=%d ctrl=%d qdev=%p qd_hmd=%p qd_left=%p qd_right=%p default=%p",
-			        alt_pressed, ctrl_pressed, (void *)qdev, (void *)qd_hmd, (void *)qd_left, (void *)qd_right,
-			        (void *)default_qdev);
-		}
-
-		// WASDQE Movement
+		// WASDQE Movement (applied to all targets)
 		switch (wParam) {
 		case 'W':
-			if (is_keydown)
-				qwerty_press_forward(qdev);
-			else
-				qwerty_release_forward(qdev);
+			for (int i = 0; i < target_count; i++) {
+				if (is_keydown)
+					qwerty_press_forward(targets[i]);
+				else
+					qwerty_release_forward(targets[i]);
+			}
 			break;
 		case 'A':
-			if (is_keydown)
-				qwerty_press_left(qdev);
-			else
-				qwerty_release_left(qdev);
+			for (int i = 0; i < target_count; i++) {
+				if (is_keydown)
+					qwerty_press_left(targets[i]);
+				else
+					qwerty_release_left(targets[i]);
+			}
 			break;
 		case 'S':
-			if (is_keydown)
-				qwerty_press_backward(qdev);
-			else
-				qwerty_release_backward(qdev);
+			for (int i = 0; i < target_count; i++) {
+				if (is_keydown)
+					qwerty_press_backward(targets[i]);
+				else
+					qwerty_release_backward(targets[i]);
+			}
 			break;
 		case 'D':
-			if (is_keydown)
-				qwerty_press_right(qdev);
-			else
-				qwerty_release_right(qdev);
+			for (int i = 0; i < target_count; i++) {
+				if (is_keydown)
+					qwerty_press_right(targets[i]);
+				else
+					qwerty_release_right(targets[i]);
+			}
 			break;
 		case 'Q':
-			if (is_keydown)
-				qwerty_press_down(qdev);
-			else
-				qwerty_release_down(qdev);
+			for (int i = 0; i < target_count; i++) {
+				if (is_keydown)
+					qwerty_press_down(targets[i]);
+				else
+					qwerty_release_down(targets[i]);
+			}
 			break;
 		case 'E':
-			if (is_keydown)
-				qwerty_press_up(qdev);
-			else
-				qwerty_release_up(qdev);
+			for (int i = 0; i < target_count; i++) {
+				if (is_keydown)
+					qwerty_press_up(targets[i]);
+				else
+					qwerty_release_up(targets[i]);
+			}
 			break;
 
 		// Arrow keys rotation
 		case VK_LEFT:
-			if (is_keydown)
-				qwerty_press_look_left(qdev);
-			else
-				qwerty_release_look_left(qdev);
+			for (int i = 0; i < target_count; i++) {
+				if (is_keydown)
+					qwerty_press_look_left(targets[i]);
+				else
+					qwerty_release_look_left(targets[i]);
+			}
 			break;
 		case VK_RIGHT:
-			if (is_keydown)
-				qwerty_press_look_right(qdev);
-			else
-				qwerty_release_look_right(qdev);
+			for (int i = 0; i < target_count; i++) {
+				if (is_keydown)
+					qwerty_press_look_right(targets[i]);
+				else
+					qwerty_release_look_right(targets[i]);
+			}
 			break;
 		case VK_UP:
-			if (is_keydown)
-				qwerty_press_look_up(qdev);
-			else
-				qwerty_release_look_up(qdev);
+			for (int i = 0; i < target_count; i++) {
+				if (is_keydown)
+					qwerty_press_look_up(targets[i]);
+				else
+					qwerty_release_look_up(targets[i]);
+			}
 			break;
 		case VK_DOWN:
-			if (is_keydown)
-				qwerty_press_look_down(qdev);
-			else
-				qwerty_release_look_down(qdev);
+			for (int i = 0; i < target_count; i++) {
+				if (is_keydown)
+					qwerty_press_look_down(targets[i]);
+				else
+					qwerty_release_look_down(targets[i]);
+			}
 			break;
 
 		// Sprint
 		case VK_LSHIFT:
 		case VK_SHIFT:
-			if (is_keydown)
-				qwerty_press_sprint(qdev);
-			else
-				qwerty_release_sprint(qdev);
+			for (int i = 0; i < target_count; i++) {
+				if (is_keydown)
+					qwerty_press_sprint(targets[i]);
+				else
+					qwerty_release_sprint(targets[i]);
+			}
 			break;
 
 		// Movement speed
 		case VK_ADD:
-			if (is_keydown)
-				qwerty_change_movement_speed(qdev, 1);
+			if (is_keydown) {
+				for (int i = 0; i < target_count; i++)
+					qwerty_change_movement_speed(targets[i], 1);
+			}
 			break;
 		case VK_SUBTRACT:
-			if (is_keydown)
-				qwerty_change_movement_speed(qdev, -1);
+			if (is_keydown) {
+				for (int i = 0; i < target_count; i++)
+					qwerty_change_movement_speed(targets[i], -1);
+			}
 			break;
 
 		// Controller buttons
 		case 'N':
-			if (is_keydown)
-				qwerty_press_menu(qctrl);
-			else
-				qwerty_release_menu(qctrl);
+			for (int i = 0; i < target_count; i++) {
+				if (is_keydown)
+					qwerty_press_menu(ctrl_targets[i]);
+				else
+					qwerty_release_menu(ctrl_targets[i]);
+			}
 			break;
 		case 'B':
-			if (is_keydown)
-				qwerty_press_system(qctrl);
-			else
-				qwerty_release_system(qctrl);
+			for (int i = 0; i < target_count; i++) {
+				if (is_keydown)
+					qwerty_press_system(ctrl_targets[i]);
+				else
+					qwerty_release_system(ctrl_targets[i]);
+			}
 			break;
 
 		// Thumbstick
 		case 'F':
-			if (is_keydown)
-				qwerty_press_thumbstick_left(qctrl);
-			else
-				qwerty_release_thumbstick_left(qctrl);
+			for (int i = 0; i < target_count; i++) {
+				if (is_keydown)
+					qwerty_press_thumbstick_left(ctrl_targets[i]);
+				else
+					qwerty_release_thumbstick_left(ctrl_targets[i]);
+			}
 			break;
 		case 'H':
-			if (is_keydown)
-				qwerty_press_thumbstick_right(qctrl);
-			else
-				qwerty_release_thumbstick_right(qctrl);
+			for (int i = 0; i < target_count; i++) {
+				if (is_keydown)
+					qwerty_press_thumbstick_right(ctrl_targets[i]);
+				else
+					qwerty_release_thumbstick_right(ctrl_targets[i]);
+			}
 			break;
 		case 'T':
-			if (is_keydown)
-				qwerty_press_thumbstick_up(qctrl);
-			else
-				qwerty_release_thumbstick_up(qctrl);
+			for (int i = 0; i < target_count; i++) {
+				if (is_keydown)
+					qwerty_press_thumbstick_up(ctrl_targets[i]);
+				else
+					qwerty_release_thumbstick_up(ctrl_targets[i]);
+			}
 			break;
 		case 'G':
-			if (is_keydown)
-				qwerty_press_thumbstick_down(qctrl);
-			else
-				qwerty_release_thumbstick_down(qctrl);
+			for (int i = 0; i < target_count; i++) {
+				if (is_keydown)
+					qwerty_press_thumbstick_down(ctrl_targets[i]);
+				else
+					qwerty_release_thumbstick_down(ctrl_targets[i]);
+			}
 			break;
 		case 'V':
-			if (is_keydown)
-				qwerty_press_thumbstick_click(qctrl);
-			else
-				qwerty_release_thumbstick_click(qctrl);
+			for (int i = 0; i < target_count; i++) {
+				if (is_keydown)
+					qwerty_press_thumbstick_click(ctrl_targets[i]);
+				else
+					qwerty_release_thumbstick_click(ctrl_targets[i]);
+			}
 			break;
 
 		// Trackpad
 		case 'J':
-			if (is_keydown)
-				qwerty_press_trackpad_left(qctrl);
-			else
-				qwerty_release_trackpad_left(qctrl);
+			for (int i = 0; i < target_count; i++) {
+				if (is_keydown)
+					qwerty_press_trackpad_left(ctrl_targets[i]);
+				else
+					qwerty_release_trackpad_left(ctrl_targets[i]);
+			}
 			break;
 		case 'L':
-			if (is_keydown)
-				qwerty_press_trackpad_right(qctrl);
-			else
-				qwerty_release_trackpad_right(qctrl);
+			for (int i = 0; i < target_count; i++) {
+				if (is_keydown)
+					qwerty_press_trackpad_right(ctrl_targets[i]);
+				else
+					qwerty_release_trackpad_right(ctrl_targets[i]);
+			}
 			break;
 		case 'I':
-			if (is_keydown)
-				qwerty_press_trackpad_up(qctrl);
-			else
-				qwerty_release_trackpad_up(qctrl);
+			for (int i = 0; i < target_count; i++) {
+				if (is_keydown)
+					qwerty_press_trackpad_up(ctrl_targets[i]);
+				else
+					qwerty_release_trackpad_up(ctrl_targets[i]);
+			}
 			break;
 		case 'K':
-			if (is_keydown)
-				qwerty_press_trackpad_down(qctrl);
-			else
-				qwerty_release_trackpad_down(qctrl);
+			for (int i = 0; i < target_count; i++) {
+				if (is_keydown)
+					qwerty_press_trackpad_down(ctrl_targets[i]);
+				else
+					qwerty_release_trackpad_down(ctrl_targets[i]);
+			}
 			break;
 		case 'M':
-			if (is_keydown)
-				qwerty_press_trackpad_click(qctrl);
-			else
-				qwerty_release_trackpad_click(qctrl);
+			for (int i = 0; i < target_count; i++) {
+				if (is_keydown)
+					qwerty_press_trackpad_click(ctrl_targets[i]);
+				else
+					qwerty_release_trackpad_click(ctrl_targets[i]);
+			}
 			break;
 
 		// Controller follow HMD toggle
 		case 'C':
 			if (is_keydown) {
-				if (qdev != qd_hmd) {
-					qwerty_follow_hmd(qctrl, !qctrl->follow_hmd);
+				if (ctrl_pressed || alt_pressed) {
+					// Toggle focused controller(s)
+					for (int i = 0; i < target_count; i++)
+						qwerty_follow_hmd(ctrl_targets[i], !ctrl_targets[i]->follow_hmd);
 				} else {
 					// Toggle both controllers
 					bool both_not_following = !qleft->follow_hmd && !qright->follow_hmd;
@@ -464,8 +487,9 @@ qwerty_process_win32(struct xrt_device **xdevs,
 		// Reset controller pose
 		case 'R':
 			if (is_keydown) {
-				if (qdev != qd_hmd) {
-					qwerty_reset_controller_pose(qctrl);
+				if (ctrl_pressed || alt_pressed) {
+					for (int i = 0; i < target_count; i++)
+						qwerty_reset_controller_pose(ctrl_targets[i]);
 				} else {
 					// Reset both controllers
 					qwerty_reset_controller_pose(qleft);
@@ -496,13 +520,12 @@ qwerty_process_win32(struct xrt_device **xdevs,
 	}
 
 	// Mouse button events
-	// Left mouse button = mouse look (matches sr_cube_openxr_ext)
-	// Right mouse button = controller trigger
-	// Middle mouse button = controller squeeze/grip
+	// RMB = mouse look (hold and drag to rotate)
+	// LMB = controller trigger
+	// MMB = controller squeeze/grip
 	switch (message) {
-	case WM_LBUTTONDOWN:
+	case WM_RBUTTONDOWN:
 		// Start mouse look mode
-		U_LOG_I("QWERTY Win32: LMB DOWN - starting mouse look");
 		mouse_look_active = true;
 		GetCursorPos(&last_mouse_pos);
 		SetCapture(GetActiveWindow()); // Capture mouse to receive events outside window
@@ -511,9 +534,8 @@ qwerty_process_win32(struct xrt_device **xdevs,
 		}
 		break;
 
-	case WM_LBUTTONUP:
+	case WM_RBUTTONUP:
 		// End mouse look mode
-		U_LOG_I("QWERTY Win32: LMB UP - ending mouse look");
 		mouse_look_active = false;
 		ReleaseCapture();
 		if (out_handled != NULL) {
@@ -521,76 +543,80 @@ qwerty_process_win32(struct xrt_device **xdevs,
 		}
 		break;
 
-	case WM_RBUTTONDOWN:
-		qwerty_press_trigger(qctrl);
+	case WM_LBUTTONDOWN:
+		for (int i = 0; i < target_count; i++)
+			qwerty_press_trigger(ctrl_targets[i]);
 		if (out_handled != NULL) {
 			*out_handled = true;
 		}
 		break;
 
-	case WM_RBUTTONUP:
-		qwerty_release_trigger(qctrl);
+	case WM_LBUTTONUP:
+		for (int i = 0; i < target_count; i++)
+			qwerty_release_trigger(ctrl_targets[i]);
 		if (out_handled != NULL) {
 			*out_handled = true;
 		}
 		break;
 
 	case WM_MBUTTONDOWN:
-		qwerty_press_squeeze(qctrl);
+		for (int i = 0; i < target_count; i++)
+			qwerty_press_squeeze(ctrl_targets[i]);
 		if (out_handled != NULL) {
 			*out_handled = true;
 		}
 		break;
 
 	case WM_MBUTTONUP:
-		qwerty_release_squeeze(qctrl);
+		for (int i = 0; i < target_count; i++)
+			qwerty_release_squeeze(ctrl_targets[i]);
 		if (out_handled != NULL) {
 			*out_handled = true;
 		}
 		break;
 
-	case WM_MOUSEMOVE:
-		if (mouse_look_active) {
-			POINT current_pos;
-			GetCursorPos(&current_pos);
+	case WM_MOUSEMOVE: {
+		POINT current_pos;
+		GetCursorPos(&current_pos);
 
-			// Calculate delta
-			int dx = current_pos.x - last_mouse_pos.x;
-			int dy = current_pos.y - last_mouse_pos.y;
+		int dx = current_pos.x - last_mouse_pos.x;
+		int dy = current_pos.y - last_mouse_pos.y;
 
-			if (dx != 0 || dy != 0) {
+		if (dx != 0 || dy != 0) {
+			if (mouse_look_active) {
+				// RMB held: rotation via mouse look
 				float yaw = (float)(-dx) * SENSITIVITY;
 				float pitch = (float)(-dy) * SENSITIVITY;
-				// Log qdev pointer on first mouse look (for device identity debugging)
-				static bool first_mouse_log = true;
-				if (first_mouse_log) {
-					first_mouse_log = false;
-					U_LOG_W("QWERTY Win32: Mouse look qdev=%p (updating this device)", (void *)qdev);
-				}
-				qwerty_add_look_delta(qdev, yaw, pitch);
-			}
-
-			last_mouse_pos = current_pos;
-
-			if (out_handled != NULL) {
-				*out_handled = true;
+				for (int i = 0; i < target_count; i++)
+					qwerty_add_look_delta(targets[i], yaw, pitch);
+			} else if (ctrl_pressed || alt_pressed) {
+				// Controller focused (no RMB): XY translation
+				float pos_dx = (float)(dx) * POSITION_SENSITIVITY;
+				float pos_dy = (float)(-dy) * POSITION_SENSITIVITY;
+				for (int i = 0; i < target_count; i++)
+					qwerty_add_position_delta(targets[i], pos_dx, pos_dy);
 			}
 		}
-		break;
 
-	case WM_MOUSEWHEEL:
-		{
-			// HIWORD of wParam contains wheel delta
-			short delta = (short)HIWORD(wParam);
-			int steps = delta / WHEEL_DELTA;
-			if (steps != 0) {
-				qwerty_change_movement_speed(qdev, (float)steps);
-			}
-			if (out_handled != NULL) {
-				*out_handled = true;
-			}
+		last_mouse_pos = current_pos;
+
+		if (out_handled != NULL) {
+			*out_handled = true;
 		}
-		break;
+	} break;
+
+	case WM_MOUSEWHEEL: {
+		// HIWORD of wParam contains wheel delta
+		short delta = (short)HIWORD(wParam);
+		int steps = delta / WHEEL_DELTA;
+		if (steps != 0) {
+			for (int i = 0; i < target_count; i++)
+				qwerty_change_movement_speed(targets[i], (float)steps);
+		}
+		if (out_handled != NULL) {
+			*out_handled = true;
+		}
+	} break;
 
 	default:
 		break;
