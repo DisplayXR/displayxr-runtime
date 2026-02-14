@@ -835,11 +835,38 @@ has_window_space_layers(struct multi_compositor *mc)
  * Composite all layers (projection + window-space) into the intermediate stereo
  * targets before weaving. This is the pre-weaving compositing step.
  *
+ * KNOWN ISSUE (Intel Iris Xe / Gen12 iGPU):
+ * This function produces a black right eye on Intel Iris Xe when sampling
+ * cross-device shared (app) projection images via fragment shader. The root
+ * cause is believed to be an Intel driver limitation with CCS (Color Control
+ * Surface) metadata resolution for shader reads on externally-imported images.
+ *
+ * What works on Intel:
+ *   - vkCmdBlitImage (transfer read) from shared images → both eyes OK
+ *     (used by session_blit_sbs() in the non-compositing path)
+ *   - Sampling compositor-owned images → OK (not cross-device)
+ *
+ * What fails on Intel:
+ *   - Fragment shader sampling of cross-device shared images → right eye black
+ *     (this function, even with SHADER_READ_ONLY_OPTIMAL layout + CCS barriers)
+ *
+ * Attempted fixes that did NOT resolve the Intel issue:
+ *   1. CCS reconciliation barriers (GENERAL→TRANSFER_SRC→GENERAL round-trip)
+ *   2. Transitioning to SHADER_READ_ONLY_OPTIMAL for sampling (current approach)
+ *   3. Descriptor set aliasing fix (was a real bug, fixed, but unrelated to Intel)
+ *
+ * On NVIDIA, all paths work correctly — NVIDIA does not use CCS compression.
+ *
+ * Potential future fix: pre-blit shared images into compositor-owned local
+ * copies via vkCmdBlitImage (which works on Intel), then sample the local
+ * copies in the compositing render pass. This avoids shader reads of cross-
+ * device images entirely but adds GPU cost (2 extra blits per frame).
+ *
  * @param mc  The multi_compositor
  * @param vk  The Vulkan bundle
  * @param cmd The command buffer to record into
- * @param leftImageView  Output: left eye view of composited result
- * @param rightImageView Output: right eye view of composited result
+ * @param out_left_view  Output: left eye view of composited result
+ * @param out_right_view Output: right eye view of composited result
  * @return true if compositing was performed
  */
 static bool
@@ -1772,6 +1799,9 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 
 	// If window-space overlay layers are present, composite all layers into
 	// intermediate per-eye images first, then use those for the SBS blit.
+	// KNOWN ISSUE: On Intel Iris Xe (Gen12), compositing produces a black right
+	// eye due to shader sampling of cross-device shared images. The non-compositing
+	// path (no overlays) works fine. See composite_layers_to_intermediate() docs.
 	bool composited = false;
 	bool blit_flip_y = layer->data.flip_y;
 	if (needs_compositing) {
