@@ -918,17 +918,19 @@ composite_layers_to_intermediate(struct multi_compositor *mc,
 	                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 	                         0, 0, NULL, 0, NULL, 2, barriers_to_attach);
 
-	// NOTE: Shared (app) swapchain images use VK_IMAGE_LAYOUT_GENERAL for sampling.
-	// On Intel Iris Xe (Gen12), a round-trip GENERAL->TRANSFER_SRC->GENERAL transition
-	// is performed to reconcile CCS metadata on the compositor's device (see below).
-	// No permanent layout changes are made — images stay in GENERAL.
+	// NOTE: Shared (app) swapchain images are transitioned to SHADER_READ_ONLY_OPTIMAL
+	// for sampling in the compositing render pass, then restored to GENERAL afterward.
+	// On Intel Iris Xe (Gen12), GENERAL layout is insufficient for the 3D sampler to
+	// resolve CCS metadata on cross-device shared images — SHADER_READ_ONLY is required.
 
-	// Reconcile CCS metadata on shared (app) projection images before sampling.
-	// On Intel Iris Xe (Gen12), cross-device shared images use CCS compression
-	// whose metadata must be reconciled on the compositor's device. A round-trip
-	// GENERAL -> TRANSFER_SRC -> GENERAL transition triggers CCS resolution
-	// without permanently changing the layout. This matches the approach used
-	// by session_blit_sbs(). On NVIDIA this is a harmless no-op.
+	// Transition shared (app) projection images to SHADER_READ_ONLY_OPTIMAL
+	// for sampling in the compositing render pass.
+	// On Intel Iris Xe (Gen12), cross-device shared images use CCS compression.
+	// GENERAL layout is insufficient for the 3D sampler to resolve CCS metadata;
+	// Intel requires SHADER_READ_ONLY_OPTIMAL for correct sampling. We go via
+	// TRANSFER_SRC first (forces CCS resolve in the copy engine), then to
+	// SHADER_READ_ONLY (prepares for the sampler). Images are restored to
+	// GENERAL after the render pass. On NVIDIA this is a harmless no-op.
 	{
 		VkImageMemoryBarrier ccs_pre[2] = {
 		    {
@@ -959,7 +961,7 @@ composite_layers_to_intermediate(struct multi_compositor *mc,
 		        .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
 		        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
 		        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-		        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+		        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
 		        .image = leftProjImage,
 		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, leftProjArray, 1},
 		    },
@@ -968,7 +970,7 @@ composite_layers_to_intermediate(struct multi_compositor *mc,
 		        .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
 		        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
 		        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-		        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+		        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
 		        .image = rightProjImage,
 		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, rightProjArray, 1},
 		    },
@@ -985,7 +987,7 @@ composite_layers_to_intermediate(struct multi_compositor *mc,
 	VkImageView proj_views[2] = {leftProjView, rightProjView};
 
 	// Step 2: For each eye — begin render pass, draw projection quad, draw overlays, end render pass.
-	// CCS reconciliation was already performed above. Imported images are sampled using GENERAL.
+	// Shared projection images are now in SHADER_READ_ONLY_OPTIMAL (transitioned above).
 	//
 	// Descriptor set allocation: ds[0]=eye0 projection, ds[1]=eye1 projection,
 	// ds[2..N]=overlay draws (unique per eye×overlay to avoid aliasing, since
@@ -1043,7 +1045,7 @@ composite_layers_to_intermediate(struct multi_compositor *mc,
 			VkDescriptorImageInfo img_desc = {
 			    .sampler = mc->session_render.composite_sampler,
 			    .imageView = proj_views[eye],
-			    .imageLayout = VK_IMAGE_LAYOUT_GENERAL, // No transitions on shared images (Intel CCS)
+			    .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
 			};
 
 			VkWriteDescriptorSet writes[2] = {
@@ -1225,6 +1227,34 @@ composite_layers_to_intermediate(struct multi_compositor *mc,
 		}
 
 		vk->vkCmdEndRenderPass(cmd);
+	}
+
+	// Restore shared projection images to GENERAL for the next frame.
+	// session_blit_sbs (non-compositing path) and the app's device both
+	// expect these images in GENERAL layout.
+	{
+		VkImageMemoryBarrier restore[2] = {
+		    {
+		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		        .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
+		        .dstAccessMask = 0,
+		        .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+		        .image = leftProjImage,
+		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, leftProjArray, 1},
+		    },
+		    {
+		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		        .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
+		        .dstAccessMask = 0,
+		        .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+		        .image = rightProjImage,
+		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, rightProjArray, 1},
+		    },
+		};
+		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+		                         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL, 0, NULL, 2, restore);
 	}
 
 	// Step 3: Transition both composite images to SHADER_READ_ONLY for weaver input
