@@ -1,15 +1,15 @@
 # OpenXR Extensions for Tracked 3D Displays
 
-## Formal Proposal for XR_EXT_win32_window_binding and XR_EXT_display_info
+## Formal Proposal for XR_EXT_win32_window_binding, XR_EXT_android_surface_binding, and XR_EXT_display_info
 
 | Field | Value |
 |---|---|
 | **Proposal Title** | OpenXR Extensions for Tracked 3D (Autostereoscopic) Displays |
 | **Authors** | David Fattal (Leia Inc.) |
-| **Date** | 2025-06-01 |
-| **Revision** | 1.0 |
+| **Date** | 2026-02-13 |
+| **Revision** | 2.0 |
 | **Status** | Draft — proposed for Khronos OpenXR Working Group review |
-| **Extension Names** | `XR_EXT_win32_window_binding`, `XR_EXT_display_info` |
+| **Extension Names** | `XR_EXT_win32_window_binding`, `XR_EXT_android_surface_binding`, `XR_EXT_display_info` |
 | **OpenXR Version** | 1.0 |
 | **Extension Type** | Instance extensions |
 | **Dependencies** | OpenXR 1.0 core |
@@ -60,23 +60,27 @@ incompatible data types, coordinate conventions, and rendering models. Applicati
 developers must write separate codepaths for each vendor. This fragments the ecosystem and
 slows adoption.
 
-OpenXR can prevent this fragmentation — but only if it provides the two missing primitives:
+OpenXR can prevent this fragmentation — but only if it provides the missing primitives:
 
-- **Window binding**: let the application own the rendering surface.
+- **Window/surface binding**: let the application own the rendering surface.
 - **Display info**: let the application know the display's physical geometry, its nominal
-  viewing conditions, and the recommended render quality.
+  viewing conditions, the recommended render quality, and whether the display supports
+  switching between 2D and 3D modes.
+- **Display mode control**: let the application request 2D or 3D mode on displays that
+  support switchable optics or backlights.
 
 ### What These Extensions Solve
 
-This proposal introduces two independent but complementary extensions:
+This proposal introduces three independent but complementary extensions:
 
 | Extension | Purpose |
 |---|---|
 | `XR_EXT_win32_window_binding` | App provides a Win32 HWND for runtime rendering; enables windowed mode, multi-app, app-controlled input, and window-space overlay layers. |
-| `XR_EXT_display_info` | Runtime exposes physical display geometry, nominal viewer position, recommended render scale, and a DISPLAY reference space anchored to the physical screen. |
+| `XR_EXT_android_surface_binding` | App provides an Android `ANativeWindow` for runtime rendering; the Android counterpart to the Win32 window binding. |
+| `XR_EXT_display_info` | Runtime exposes physical display geometry, nominal viewer position, recommended render scale, display mode switching capability, and a DISPLAY reference space anchored to the physical screen. Provides `xrRequestDisplayModeEXT` for 2D/3D mode control. |
 
 Together they form a minimal, complete interface for tracked 3D display rendering through
-OpenXR.
+OpenXR across desktop and mobile platforms.
 
 ---
 
@@ -88,7 +92,8 @@ OpenXR.
     Application
         │
         ├── xrCreateInstance()
-        │       enable "XR_EXT_win32_window_binding"
+        │       enable "XR_EXT_win32_window_binding"   (Win32)
+        │         — or "XR_EXT_android_surface_binding" (Android)
         │       enable "XR_EXT_display_info"
         │
         ├── xrGetSystemProperties()
@@ -96,12 +101,21 @@ OpenXR.
         │           • displaySizeMeters
         │           • nominalViewerPositionInDisplaySpace
         │           • recommendedViewScaleX / Y
+        │           • supportsDisplayModeSwitch
         │
         ├── xrCreateSession()
         │       XrSessionCreateInfo
-        │        └── next: XrGraphicsBindingD3D11KHR
-        │                   └── next: XrWin32WindowBindingCreateInfoEXT
-        │                              • windowHandle = app HWND
+        │        └── next: XrGraphicsBindingD3D11KHR          (Win32)
+        │        │            └── next: XrWin32WindowBindingCreateInfoEXT
+        │        │                       • windowHandle = app HWND
+        │        └── next: XrGraphicsBindingVulkanKHR          (Android)
+        │                    └── next: XrAndroidSurfaceBindingCreateInfoEXT
+        │                               • nativeWindow = app ANativeWindow*
+        │
+        │   ┌── Session READY → runtime auto-requests 3D mode (if supported)
+        │
+        ├── xrRequestDisplayModeEXT(session, mode)     [optional override]
+        │       XR_DISPLAY_MODE_3D_EXT  /  XR_DISPLAY_MODE_2D_EXT
         │
         ├── xrCreateReferenceSpace(DISPLAY)
         │       origin = display center, +X right, +Y up, +Z toward viewer
@@ -114,6 +128,8 @@ OpenXR.
         ├── xrEndFrame()
         │       submit XrCompositionLayerProjection (in DISPLAY space)
         │       submit XrCompositionLayerWindowSpaceEXT (HUD overlay)
+        │
+        │   ┌── Session STOPPING → runtime auto-requests 2D mode (if supported)
         │
         └── Runtime interlaces stereo content onto tracked 3D display
 ```
@@ -155,13 +171,16 @@ This mode is suitable for legacy apps and WebXR.
 
 ### Relationship Between the Extensions
 
-The two extensions are **independent**:
+The three extensions are **independent**:
 
-- An application can use `XR_EXT_win32_window_binding` alone to render into its own
-  window with RENDER_READY views (no display geometry needed).
-- An application can use `XR_EXT_display_info` alone to get display geometry and RAW eye
-  positions while letting the runtime manage the window.
-- Using both together gives full control: app-owned window + app-owned camera model.
+- An application can use `XR_EXT_win32_window_binding` (or its Android counterpart) alone
+  to render into its own window/surface with RENDER_READY views (no display geometry needed).
+- An application can use `XR_EXT_display_info` alone to get display geometry, RAW eye
+  positions, and display mode control while letting the runtime manage the display surface.
+- Using a window/surface binding together with `XR_EXT_display_info` gives full control:
+  app-owned rendering surface + app-owned camera model + display mode switching.
+- `XR_EXT_win32_window_binding` and `XR_EXT_android_surface_binding` are **mutually
+  exclusive** platform variants — an application uses one or the other, never both.
 
 ---
 
@@ -403,7 +422,165 @@ xrEndFrame(session, &endInfo);
 
 ---
 
-## 4. Extension 2: XR_EXT_display_info
+## 4. Extension 2: XR_EXT_android_surface_binding
+
+### IP Status
+
+No known IP claims.
+
+### Name Strings
+
+- Extension name: `XR_EXT_android_surface_binding`
+- Spec version: 1
+- Extension name define: `XR_EXT_ANDROID_SURFACE_BINDING_EXTENSION_NAME`
+
+### Overview
+
+This extension is the Android counterpart to `XR_EXT_win32_window_binding`. It allows an
+OpenXR application to provide its own Android native window to the runtime via the session
+creation chain. When provided, the runtime renders into the application's surface instead
+of managing its own display output.
+
+On Android, applications inherently own their Activity and rendering surface. This
+extension formalizes the handoff: the application passes an `ANativeWindow*` (obtained
+from a `SurfaceView` or `SurfaceHolder` via the NDK) to the runtime, which uses it as the
+compositing and interlacing target.
+
+**Use cases:**
+- **Application-owned rendering surface**: the application controls the `SurfaceView`
+  lifecycle, visibility, and z-order within the Android view hierarchy.
+- **Hybrid 2D/3D UI**: 3D content composited alongside Android UI elements (toolbars,
+  overlays, system UI).
+- **Multi-surface scenarios**: the application may have multiple surfaces and dedicate one
+  to OpenXR stereo content.
+- **Window-space overlays**: HUD and status overlays positioned in fractional surface
+  coordinates, automatically adapting to surface resize (using
+  `XrCompositionLayerWindowSpaceEXT`).
+
+### New Enum Constants
+
+```c
+#define XR_TYPE_ANDROID_SURFACE_BINDING_CREATE_INFO_EXT  ((XrStructureType)1000999005)
+```
+
+> **Note**: This value uses the vendor extension range. It would be replaced with an
+> officially assigned value upon standardization.
+
+### New Structures
+
+#### XrAndroidSurfaceBindingCreateInfoEXT
+
+Chained to `XrSessionCreateInfo` (via the graphics binding's `next` pointer) to provide
+an external native window for session rendering.
+
+| Member | Type | Description |
+|---|---|---|
+| `type` | `XrStructureType` | Must be `XR_TYPE_ANDROID_SURFACE_BINDING_CREATE_INFO_EXT`. |
+| `next` | `const void*` | Pointer to next structure in the chain, or `NULL`. |
+| `nativeWindow` | `ANativeWindow*` | The Android native window to render into. Must be a valid, active native window. |
+
+```c
+typedef struct XrAndroidSurfaceBindingCreateInfoEXT {
+    XrStructureType             type;
+    const void* XR_MAY_ALIAS    next;
+    ANativeWindow*              nativeWindow;
+} XrAndroidSurfaceBindingCreateInfoEXT;
+```
+
+**Valid Usage:**
+- `type` **must** be `XR_TYPE_ANDROID_SURFACE_BINDING_CREATE_INFO_EXT`.
+- `nativeWindow` **must** be a valid `ANativeWindow*` obtained via
+  `ANativeWindow_fromSurface()` or `ASurfaceHolder_getNativeWindow()`.
+- The native window **must** remain valid for the lifetime of the `XrSession`.
+- The application **must not** release the native window (via `ANativeWindow_release()`)
+  before calling `xrDestroySession`.
+- The application **should** acquire a reference (via `ANativeWindow_acquire()`) to ensure
+  the window outlives the session.
+
+### New Functions
+
+None. This extension operates entirely through structure chaining:
+- `XrAndroidSurfaceBindingCreateInfoEXT` chains to `XrSessionCreateInfo`.
+- `XrCompositionLayerWindowSpaceEXT` (defined in `XR_EXT_win32_window_binding`) is
+  platform-independent and works with Android surface bindings as well.
+
+### Interactions
+
+- **Requires** an Android-compatible graphics binding extension (`XR_KHR_vulkan_enable` or
+  `XR_KHR_opengl_es_enable`) for the graphics binding in the session creation chain.
+- **Does not require** `XR_EXT_display_info`, but they are complementary.
+- **Mutually exclusive** with `XR_EXT_win32_window_binding` — an application uses one or
+  the other based on platform.
+- When the surface is resized (e.g., orientation change), the runtime **must** adjust its
+  rendering surface accordingly.
+
+### Example Code: Session Creation with Vulkan on Android
+
+```cpp
+// 1. Enable the extension at instance creation
+std::vector<const char*> extensions = {
+    XR_KHR_VULKAN_ENABLE_EXTENSION_NAME,
+    XR_EXT_ANDROID_SURFACE_BINDING_EXTENSION_NAME,
+};
+
+XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
+createInfo.enabledExtensionCount = (uint32_t)extensions.size();
+createInfo.enabledExtensionNames = extensions.data();
+// ... fill in applicationInfo ...
+xrCreateInstance(&createInfo, &instance);
+
+// 2. Obtain ANativeWindow from a SurfaceView
+ANativeWindow* nativeWindow = ANativeWindow_fromSurface(env, javaSurface);
+ANativeWindow_acquire(nativeWindow);  // ensure lifetime
+
+// 3. Create session with surface binding chained to graphics binding
+XrGraphicsBindingVulkanKHR vkBinding = {XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR};
+vkBinding.instance = vkInstance;
+vkBinding.physicalDevice = vkPhysicalDevice;
+vkBinding.device = vkDevice;
+vkBinding.queueFamilyIndex = graphicsQueueFamily;
+vkBinding.queueIndex = 0;
+
+XrAndroidSurfaceBindingCreateInfoEXT surfaceBinding = {
+    (XrStructureType)XR_TYPE_ANDROID_SURFACE_BINDING_CREATE_INFO_EXT};
+surfaceBinding.nativeWindow = nativeWindow;
+
+// Chain: sessionInfo -> vkBinding -> surfaceBinding
+vkBinding.next = &surfaceBinding;
+
+XrSessionCreateInfo sessionInfo = {XR_TYPE_SESSION_CREATE_INFO};
+sessionInfo.next = &vkBinding;
+sessionInfo.systemId = systemId;
+
+xrCreateSession(instance, &sessionInfo, &session);
+```
+
+### Example Code: Session Creation with OpenGL ES on Android
+
+```cpp
+XrGraphicsBindingOpenGLESAndroidKHR glesBinding = {
+    XR_TYPE_GRAPHICS_BINDING_OPENGL_ES_ANDROID_KHR};
+glesBinding.display = eglDisplay;
+glesBinding.config = eglConfig;
+glesBinding.context = eglContext;
+
+XrAndroidSurfaceBindingCreateInfoEXT surfaceBinding = {
+    (XrStructureType)XR_TYPE_ANDROID_SURFACE_BINDING_CREATE_INFO_EXT};
+surfaceBinding.nativeWindow = nativeWindow;
+
+// Chain: sessionInfo -> glesBinding -> surfaceBinding
+glesBinding.next = &surfaceBinding;
+
+XrSessionCreateInfo sessionInfo = {XR_TYPE_SESSION_CREATE_INFO};
+sessionInfo.next = &glesBinding;
+sessionInfo.systemId = systemId;
+
+xrCreateSession(instance, &sessionInfo, &session);
+```
+
+---
+
+## 5. Extension 3: XR_EXT_display_info
 
 ### IP Status
 
@@ -412,20 +589,22 @@ No known IP claims.
 ### Name Strings
 
 - Extension name: `XR_EXT_display_info`
-- Spec version: 3
+- Spec version: 4
 - Extension name define: `XR_EXT_DISPLAY_INFO_EXTENSION_NAME`
 
 ### Overview
 
 This extension exposes the physical properties of a tracked 3D display to the application:
-the display's physical dimensions, its nominal viewer position, and recommended render
-resolution scale factors. It also introduces a DISPLAY reference space anchored to the
-physical screen.
+the display's physical dimensions, its nominal viewer position, recommended render
+resolution scale factors, and whether the display supports switching between 2D and 3D
+modes. It also introduces a DISPLAY reference space anchored to the physical screen and
+a function to request display mode changes.
 
 With this information the application can:
 - Build its own camera model (Kooima off-axis projection) from raw tracked eye positions.
-- Compute render resolution dynamically as the window resizes.
+- Compute render resolution dynamically as the window/surface resizes.
 - Locate views and submit layers in display-anchored coordinates.
+- Query whether the display supports 2D/3D mode switching and request mode changes.
 
 This extension is **platform-independent**. It works on any platform that supports OpenXR,
 regardless of the graphics API or windowing system in use.
@@ -435,6 +614,8 @@ regardless of the graphics API or windowing system in use.
 ```c
 #define XR_TYPE_DISPLAY_INFO_EXT              ((XrStructureType)1000999003)
 #define XR_REFERENCE_SPACE_TYPE_DISPLAY_EXT   ((XrReferenceSpaceType)1000999004)
+#define XR_DISPLAY_MODE_2D_EXT                0
+#define XR_DISPLAY_MODE_3D_EXT                1
 ```
 
 > **Note**: These values use the vendor extension range. They would be replaced with
@@ -454,6 +635,7 @@ Chained to `XrSystemProperties` to return physical display information.
 | `nominalViewerPositionInDisplaySpace` | `XrVector3f` | Design-time expected viewer position relative to display center (meters). Defines the apex of the canonical display pyramid. See [Nominal Viewer Position](#nominal-viewer-position). |
 | `recommendedViewScaleX` | `float` | Horizontal render resolution scale factor. See [Recommended View Scale](#recommended-view-scale). |
 | `recommendedViewScaleY` | `float` | Vertical render resolution scale factor. See [Recommended View Scale](#recommended-view-scale). |
+| `supportsDisplayModeSwitch` | `XrBool32` | `XR_TRUE` if the display supports switching between 2D and 3D modes via `xrRequestDisplayModeEXT`. See [Display Mode Switching](#display-mode-switching). |
 
 ```c
 typedef struct XrDisplayInfoEXT {
@@ -463,6 +645,7 @@ typedef struct XrDisplayInfoEXT {
     XrVector3f                  nominalViewerPositionInDisplaySpace;
     float                       recommendedViewScaleX;
     float                       recommendedViewScaleY;
+    XrBool32                    supportsDisplayModeSwitch;
 } XrDisplayInfoEXT;
 ```
 
@@ -504,11 +687,121 @@ XrSpace displaySpace;
 xrCreateReferenceSpace(session, &displaySpaceInfo, &displaySpace);
 ```
 
+### New Enums
+
+#### XrDisplayModeEXT
+
+```c
+typedef enum XrDisplayModeEXT {
+    XR_DISPLAY_MODE_2D_EXT = 0,
+    XR_DISPLAY_MODE_3D_EXT = 1,
+} XrDisplayModeEXT;
+```
+
+| Value | Meaning |
+|---|---|
+| `XR_DISPLAY_MODE_2D_EXT` | Standard 2D display mode. Switchable optics or backlight are disabled; the display behaves as a conventional flat panel. |
+| `XR_DISPLAY_MODE_3D_EXT` | Tracked 3D display mode. Switchable optics or backlight are enabled; the display produces glasses-free 3D imagery via light field interlacing. |
+
 ### New Functions
 
-None. This extension operates entirely through:
+#### xrRequestDisplayModeEXT
+
+Requests that the runtime switch the display between 2D and 3D modes.
+
+```c
+XrResult xrRequestDisplayModeEXT(
+    XrSession           session,
+    XrDisplayModeEXT    mode);
+```
+
+**Parameters:**
+
+| Parameter | Description |
+|---|---|
+| `session` | A valid `XrSession` handle. |
+| `mode` | The requested display mode (`XR_DISPLAY_MODE_2D_EXT` or `XR_DISPLAY_MODE_3D_EXT`). |
+
+**Return Codes:**
+
+| Code | Meaning |
+|---|---|
+| `XR_SUCCESS` | The mode request was accepted by the runtime. |
+| `XR_ERROR_FEATURE_UNSUPPORTED` | The display does not support mode switching (`supportsDisplayModeSwitch` is `XR_FALSE`). |
+| `XR_ERROR_SESSION_NOT_RUNNING` | The session is not in a running state. |
+| `XR_ERROR_HANDLE_INVALID` | The session handle is invalid. |
+
+**Semantics:**
+
+- This function is a **request**, not a guarantee. The runtime forwards the request to the
+  underlying platform SDK (e.g., SR SDK's `SwitchableLensHint`, CNSDK's backlight control).
+  The platform may aggregate requests from multiple applications or defer the switch.
+- The function returns `XR_SUCCESS` when the request has been accepted, regardless of
+  whether the display has physically completed the mode change.
+- The application **may** call this function at any time while the session is running.
+- If `supportsDisplayModeSwitch` in `XrDisplayInfoEXT` is `XR_FALSE`, this function
+  returns `XR_ERROR_FEATURE_UNSUPPORTED` and has no effect.
+
+### Display Mode Switching
+
+#### Automatic Lifecycle Behavior
+
+The runtime manages display mode transitions automatically as part of the session
+lifecycle:
+
+- When the session transitions to the **READY** state, the runtime **automatically
+  requests** `XR_DISPLAY_MODE_3D_EXT` on displays that support mode switching.
+- When the session transitions to the **STOPPING** state (or is destroyed), the runtime
+  **automatically requests** `XR_DISPLAY_MODE_2D_EXT`.
+
+This ensures correct behavior for applications that never call `xrRequestDisplayModeEXT`:
+the display enters 3D mode when the XR session starts and returns to 2D mode when it ends.
+
+#### Explicit Override
+
+The application **may** call `xrRequestDisplayModeEXT` at any time during the session to
+override the automatic behavior. Use cases include:
+
+- Temporarily switching to 2D mode for a settings menu or 2D video playback.
+- Deferring 3D mode activation until the application has finished loading.
+- Implementing a user-facing 2D/3D toggle.
+
+#### Implementation Notes
+
+The runtime translates `xrRequestDisplayModeEXT` into the appropriate vendor SDK call:
+
+| Platform | Runtime Implementation |
+|---|---|
+| Windows (SR SDK) | `SwitchableLensHint::enable()` / `SwitchableLensHint::disable()` — preference-based, aggregated across applications. |
+| Android (CNSDK) | `leia_core_set_backlight(core, true)` / `leia_core_set_backlight(core, false)` — direct backlight control. |
+
+This abstraction also operates through:
 - `XrDisplayInfoEXT` chaining to `xrGetSystemProperties`.
 - `XR_REFERENCE_SPACE_TYPE_DISPLAY_EXT` via `xrCreateReferenceSpace`.
+- `xrRequestDisplayModeEXT` for explicit display mode control.
+
+### Example Code: Querying Display Mode Support and Requesting 2D
+
+```cpp
+// Query display capabilities
+XrSystemProperties sysProps = {XR_TYPE_SYSTEM_PROPERTIES};
+XrDisplayInfoEXT displayInfo = {(XrStructureType)XR_TYPE_DISPLAY_INFO_EXT};
+sysProps.next = &displayInfo;
+xrGetSystemProperties(instance, systemId, &sysProps);
+
+if (displayInfo.supportsDisplayModeSwitch) {
+    // Display supports 2D/3D switching.
+    // The runtime automatically requests 3D mode when the session becomes READY.
+
+    // Example: temporarily switch to 2D for a settings menu
+    xrRequestDisplayModeEXT(session, XR_DISPLAY_MODE_2D_EXT);
+
+    // ... user interacts with 2D menu ...
+
+    // Switch back to 3D when menu closes
+    xrRequestDisplayModeEXT(session, XR_DISPLAY_MODE_3D_EXT);
+}
+```
 
 ### Canonical Display Pyramid
 
@@ -651,6 +944,7 @@ float scaleX = displayInfo.recommendedViewScaleX;             // e.g. 0.5
 float scaleY = displayInfo.recommendedViewScaleY;             // e.g. 1.0
 XrVector3f nominalPos = displayInfo.nominalViewerPositionInDisplaySpace;
 // nominalPos ~ {0.0, 0.0, 0.65}
+XrBool32 canSwitch = displayInfo.supportsDisplayModeSwitch;   // XR_TRUE or XR_FALSE
 ```
 
 ### Example Code: Creating DISPLAY Reference Space
@@ -856,11 +1150,11 @@ if (frameState.shouldRender) {
 
 ---
 
-## 5. Interactions and External Dependencies
+## 6. Interactions and External Dependencies
 
 ### OpenXR 1.0 Core
 
-Both extensions require OpenXR 1.0 and depend on core concepts: `XrInstance`, `XrSession`,
+All extensions require OpenXR 1.0 and depend on core concepts: `XrInstance`, `XrSession`,
 `XrSpace`, `XrSwapchain`, `xrLocateViews`, `xrEndFrame`, `xrGetSystemProperties`,
 `xrCreateReferenceSpace`.
 
@@ -869,10 +1163,12 @@ Both extensions require OpenXR 1.0 and depend on core concepts: `XrInstance`, `X
 | Extension | Platform Requirement |
 |---|---|
 | `XR_EXT_win32_window_binding` | **Win32 only**. Requires a Win32 platform graphics binding (`XR_KHR_D3D11_enable` or `XR_KHR_opengl_enable`). |
+| `XR_EXT_android_surface_binding` | **Android only**. Requires an Android-compatible graphics binding (`XR_KHR_vulkan_enable` or `XR_KHR_opengl_es_enable`). |
 | `XR_EXT_display_info` | **Platform-independent**. Works on any platform with a tracked 3D display. |
 
 ### Graphics API Interactions
 
+**Win32:**
 - **`XR_KHR_D3D11_enable`**: `XrWin32WindowBindingCreateInfoEXT` chains to
   `XrGraphicsBindingD3D11KHR.next`. The runtime creates a D3D11 swap chain on the
   provided HWND.
@@ -880,30 +1176,42 @@ Both extensions require OpenXR 1.0 and depend on core concepts: `XrInstance`, `X
   `XrGraphicsBindingOpenGLWin32KHR.next`. The runtime renders using the provided OpenGL
   context and the window's device context.
 
+**Android:**
+- **`XR_KHR_vulkan_enable`**: `XrAndroidSurfaceBindingCreateInfoEXT` chains to
+  `XrGraphicsBindingVulkanKHR.next`. The runtime creates a Vulkan swap chain on the
+  provided `ANativeWindow`.
+- **`XR_KHR_opengl_es_enable`**: `XrAndroidSurfaceBindingCreateInfoEXT` chains to
+  `XrGraphicsBindingOpenGLESAndroidKHR.next`. The runtime renders using the provided
+  EGL context and the native window.
+
 ### Cross-Extension Interaction
 
-`XR_EXT_win32_window_binding` and `XR_EXT_display_info` are **independent**:
+The window/surface binding extensions and `XR_EXT_display_info` are **independent**:
 
-- Neither extension requires the other.
-- Enabling both gives the application full control: app-owned window + app-owned camera
-  model.
-- Enabling only `XR_EXT_win32_window_binding` allows app-owned window with runtime-owned
-  stereo views (RENDER_READY).
-- Enabling only `XR_EXT_display_info` allows display geometry queries and RAW eye
-  positions while the runtime manages the display surface.
+- No extension requires any other.
+- Enabling a window/surface binding together with `XR_EXT_display_info` gives the
+  application full control: app-owned rendering surface + app-owned camera model +
+  display mode switching.
+- Enabling only a window/surface binding allows app-owned rendering surface with
+  runtime-owned stereo views (RENDER_READY).
+- Enabling only `XR_EXT_display_info` allows display geometry queries, RAW eye
+  positions, and display mode control while the runtime manages the display surface.
+- `XR_EXT_win32_window_binding` and `XR_EXT_android_surface_binding` are **mutually
+  exclusive** platform variants.
 
 ### Interaction with XR_KHR_composition_layer_quad
 
 `XrCompositionLayerWindowSpaceEXT` and `XrCompositionLayerQuad` serve different purposes:
 
 - `XrCompositionLayerQuad` positions content in 3D space (meters, in an XrSpace).
-- `XrCompositionLayerWindowSpaceEXT` positions content in fractional window coordinates,
-  automatically adapting to window resize. It is the natural choice for HUD overlays on
-  windowed tracked 3D displays.
+- `XrCompositionLayerWindowSpaceEXT` positions content in fractional window/surface
+  coordinates, automatically adapting to resize. It is the natural choice for HUD overlays
+  on tracked 3D displays. This layer type works with both Win32 and Android surface
+  bindings.
 
 ---
 
-## 6. Issues (Design Decisions)
+## 7. Issues (Design Decisions)
 
 ### Resolved Issues
 
@@ -1008,23 +1316,57 @@ exactly the flexibility that motivated the RAW mode design.
 
 ---
 
-### Open Issues
+**RESOLVED 7: Android platform variant for window/surface binding.**
 
-**OPEN 1: Future platform variants for window binding.**
+*Problem*: `XR_EXT_win32_window_binding` is Win32-specific. How should Android (and other
+platforms) provide equivalent functionality?
 
-The current `XR_EXT_win32_window_binding` is Win32-specific. Future platforms (Wayland,
-X11, macOS/Cocoa) will need analogous extensions:
-- `XR_EXT_wayland_window_binding` (with `wl_surface*`)
+*Resolution*: **Per-platform surface binding extensions.** `XR_EXT_android_surface_binding`
+follows the same structural pattern — chain a platform-specific surface handle to the
+graphics binding at session creation — using `ANativeWindow*` instead of `HWND`. The
+`XrCompositionLayerWindowSpaceEXT` layer type is platform-independent and works with all
+surface binding variants. Future platforms (Wayland, X11, macOS/Cocoa) would follow the
+same pattern:
+- `XR_EXT_wayland_surface_binding` (with `wl_surface*`)
 - `XR_EXT_xlib_window_binding` (with X11 `Window`)
 - `XR_EXT_cocoa_window_binding` (with `NSWindow*`)
 
-These would follow the same pattern: chain a platform-specific window handle struct to the
-graphics binding at session creation. The `XrCompositionLayerWindowSpaceEXT` layer type is
-platform-independent and would work with all variants.
+---
+
+**RESOLVED 8: Display mode switching (2D/3D toggle) API design.**
+
+*Problem*: Many tracked 3D displays support switching between 2D and 3D modes (via
+switchable lenses, controllable backlights, or similar mechanisms). Should OpenXR expose
+this capability, and if so, how?
+
+*Resolution*: **Capability flag + request function with automatic lifecycle.**
+
+- `XrDisplayInfoEXT` includes `supportsDisplayModeSwitch` (`XrBool32`) so the application
+  can discover whether mode switching is available. Not all tracked 3D displays support
+  switching — some are always-3D — so the capability must be queryable.
+- `xrRequestDisplayModeEXT(session, mode)` allows explicit mode control. The function is
+  a **request** (not a hard set) because the underlying platform may aggregate preferences
+  across applications (e.g., SR SDK's `SwitchableLensHint`) or may defer the switch.
+- The runtime automatically requests 3D mode when the session becomes READY and 2D mode
+  when the session is destroyed, providing correct default behavior for applications that
+  never call the function explicitly.
+
+*Alternatives considered*:
+- **Struct-only (no function)**: rejected because mode switching is a dynamic action, not
+  a static property. A function call is the natural API shape.
+- **Event-based notification of mode changes**: deferred to a future revision. For v1,
+  the application requests and trusts the runtime. The runtime handles graceful
+  degradation (e.g., showing the left eye view) if forced to 2D by another application
+  or system policy.
+- **Vendor-specific weaver settings (contrast, anti-crosstalk)**: intentionally excluded.
+  These are implementation details that vary across vendors and do not belong in a
+  cross-vendor OpenXR extension.
 
 ---
 
-**OPEN 2: Multi-display scenarios.**
+### Open Issues
+
+**OPEN 1: Multi-display scenarios.**
 
 The current design assumes a single tracked 3D display per system. Multi-display scenarios
 (e.g., multiple tracked monitors in a workstation) would require:
@@ -1036,7 +1378,7 @@ This is out of scope for the initial extension but should be considered in futur
 
 ---
 
-**OPEN 3: Interaction with XR_EXT_local_floor and other space extensions.**
+**OPEN 2: Interaction with XR_EXT_local_floor and other space extensions.**
 
 DISPLAY space is semantically distinct from LOCAL, STAGE, and LOCAL_FLOOR. For tracked 3D
 displays, DISPLAY space is the primary coordinate frame. Future work should clarify how
@@ -1045,13 +1387,19 @@ tracked displays coexist with HMDs.
 
 ---
 
-## 7. Version History
+## 8. Version History
 
 ### XR_EXT_win32_window_binding
 
 | Revision | Date | Author | Description |
 |---|---|---|---|
 | 1 | 2025-01-15 | David Fattal | Initial version. Window handle binding and window-space composition layer. |
+
+### XR_EXT_android_surface_binding
+
+| Revision | Date | Author | Description |
+|---|---|---|---|
+| 1 | 2026-02-13 | David Fattal | Initial version. Android `ANativeWindow` surface binding as platform counterpart to Win32 window binding. |
 
 ### XR_EXT_display_info
 
@@ -1060,6 +1408,7 @@ tracked displays coexist with HMDs.
 | 1 | 2025-01-15 | David Fattal | Initial version with absolute recommended view sizes. |
 | 2 | 2025-03-01 | David Fattal | Replaced absolute sizes with `recommendedViewScaleX/Y` scale factors. Added `XR_REFERENCE_SPACE_TYPE_DISPLAY_EXT`. Added nominal viewer pose. |
 | 3 | 2025-06-01 | David Fattal | Changed `nominalViewerPoseInDisplaySpace` from `XrPosef` to `XrVector3f nominalViewerPositionInDisplaySpace`. Orientation was always identity; position is now populated from the SR SDK's `getDefaultViewingPosition()`. |
+| 4 | 2026-02-13 | David Fattal | Added `supportsDisplayModeSwitch` capability flag, `XrDisplayModeEXT` enum, and `xrRequestDisplayModeEXT` function for 2D/3D mode control. Added automatic lifecycle behavior (3D on session READY, 2D on session STOPPING). |
 
 ---
 
@@ -1073,12 +1422,18 @@ A complete reference implementation is available in the CNSDK-OpenXR repository:
 | | `src/external/openxr_includes/openxr/XR_EXT_display_info.h` |
 | Runtime: display info query | `src/xrt/state_trackers/oxr/oxr_system.c` |
 | Runtime: session creation | `src/xrt/state_trackers/oxr/oxr_session.c` |
-| D3D11 test application | `test_apps/sr_cube_openxr_ext/` |
-| OpenGL test application | `test_apps/sr_cube_openxr_ext_gl/` |
+| Runtime: CNSDK integration | `src/xrt/compositor/main/comp_renderer.c` |
+| Runtime: LeiaSR integration | `src/xrt/drivers/leiasr/` |
+| D3D11 test application (Win32) | `test_apps/sr_cube_openxr_ext/` |
+| OpenGL test application (Win32) | `test_apps/sr_cube_openxr_ext_gl/` |
 | Common Kooima projection | `test_apps/common/xr_session_common.cpp` |
 
-The runtime is based on Monado (open-source OpenXR runtime) with LeiaSR SDK integration
-for eye tracking and light field interlacing.
+The runtime is based on Monado (open-source OpenXR runtime) with platform-specific SDK
+integration:
+- **Windows**: LeiaSR (Simulated Reality) SDK for eye tracking, light field interlacing,
+  and switchable lens control.
+- **Android**: CNSDK (Leia SDK) for eye tracking, Vulkan interlacing, and backlight
+  control.
 
 ## Appendix B: Glossary
 
@@ -1090,7 +1445,9 @@ for eye tracking and light field interlacing.
 | **Canonical display pyramid** | The geometric frustum defined by the display rectangle (base) and nominal viewer position (apex). Anchors zero-parallax and stereo comfort. |
 | **RAW mode** | View mode where the runtime returns raw tracked eye positions and identity orientation, leaving camera model construction to the application. |
 | **RENDER_READY mode** | View mode where the runtime returns view poses and FOV angles with convergence and comfort adjustments applied. The application still builds its own projection matrix from the FOV angles. |
-| **Window-space coordinates** | Fractional coordinates in `[0, 1]` relative to the target window's dimensions. Used by `XrCompositionLayerWindowSpaceEXT`. |
+| **Window-space coordinates** | Fractional coordinates in `[0, 1]` relative to the target window/surface dimensions. Used by `XrCompositionLayerWindowSpaceEXT`. |
 | **DISPLAY space** | A reference space anchored to the physical display center, with +X right, +Y up, +Z toward the viewer. Not affected by recentering. |
 | **Nominal viewer position** | A static, design-time expectation of the viewer's position relative to the display. Not tracked; defines the apex of the canonical display pyramid. |
 | **Disparity** | Horizontal shift between left and right eye images, measured as a fraction of window width. Controls perceived depth of window-space layers. |
+| **Display mode** | The operational mode of a tracked 3D display: 2D (standard flat panel) or 3D (light field interlacing active). Controlled via `xrRequestDisplayModeEXT`. |
+| **Surface binding** | A platform-specific mechanism for the application to provide its own rendering surface to the runtime (`HWND` on Win32, `ANativeWindow*` on Android). |
