@@ -277,8 +277,6 @@ find_active_blend_mode(struct multi_compositor **overlay_sorted_clients, size_t 
  *
  */
 
-#ifdef XRT_HAVE_LEIA_SR_VULKAN
-
 /*!
  * Extract VkImageView and dimensions from a multi_layer_entry for a specific view.
  * Similar to getLayerInfo() in comp_renderer.c but adapted for multi_layer_entry.
@@ -333,6 +331,8 @@ get_session_layer_view(struct multi_layer_entry *layer,
 
 	return (*out_image_view != VK_NULL_HANDLE);
 }
+
+#ifdef XRT_HAVE_LEIA_SR_VULKAN
 
 /*!
  * Initialize intermediate composite resources for pre-weaving layer compositing.
@@ -390,6 +390,32 @@ init_composite_resources(struct multi_compositor *mc, struct vk_bundle *vk, uint
 		if (ret != VK_SUCCESS) {
 			U_LOG_E("[composite] Failed to create eye view %d: %d", eye, ret);
 			goto err_images;
+		}
+	}
+
+	// Create pre-blit local copies of shared projection images (Intel CCS workaround).
+	// vkCmdBlitImage works for cross-device shared images on Intel Iris Xe; fragment
+	// shader sampling does not. We blit shared images into these local copies, then
+	// sample the local copies in the compositing render pass.
+	{
+		VkImageUsageFlags preblit_usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+
+		for (int eye = 0; eye < 2; eye++) {
+			ret = vk_create_image_simple(vk, eye_extent, format, preblit_usage,
+			                             &mc->session_render.preblit_memories[eye],
+			                             &mc->session_render.preblit_images[eye]);
+			if (ret != VK_SUCCESS) {
+				U_LOG_E("[composite] Failed to create preblit image %d: %d", eye, ret);
+				goto err_images;
+			}
+
+			ret = vk_create_view(vk, mc->session_render.preblit_images[eye],
+			                     VK_IMAGE_VIEW_TYPE_2D, format, eye_range,
+			                     &mc->session_render.preblit_views[eye]);
+			if (ret != VK_SUCCESS) {
+				U_LOG_E("[composite] Failed to create preblit view %d: %d", eye, ret);
+				goto err_images;
+			}
 		}
 	}
 
@@ -729,6 +755,18 @@ err_framebuffers:
 	mc->session_render.composite_render_pass = VK_NULL_HANDLE;
 err_images:
 	for (int i = 0; i < 2; i++) {
+		if (mc->session_render.preblit_views[i] != VK_NULL_HANDLE) {
+			vk->vkDestroyImageView(vk->device, mc->session_render.preblit_views[i], NULL);
+			mc->session_render.preblit_views[i] = VK_NULL_HANDLE;
+		}
+		if (mc->session_render.preblit_images[i] != VK_NULL_HANDLE) {
+			vk->vkDestroyImage(vk->device, mc->session_render.preblit_images[i], NULL);
+			mc->session_render.preblit_images[i] = VK_NULL_HANDLE;
+		}
+		if (mc->session_render.preblit_memories[i] != VK_NULL_HANDLE) {
+			vk->vkFreeMemory(vk->device, mc->session_render.preblit_memories[i], NULL);
+			mc->session_render.preblit_memories[i] = VK_NULL_HANDLE;
+		}
 		if (mc->session_render.composite_eye_views[i] != VK_NULL_HANDLE) {
 			vk->vkDestroyImageView(vk->device, mc->session_render.composite_eye_views[i], NULL);
 			mc->session_render.composite_eye_views[i] = VK_NULL_HANDLE;
@@ -792,6 +830,18 @@ fini_composite_resources(struct multi_compositor *mc, struct vk_bundle *vk)
 	mc->session_render.composite_render_pass = VK_NULL_HANDLE;
 
 	for (int i = 0; i < 2; i++) {
+		if (mc->session_render.preblit_views[i] != VK_NULL_HANDLE) {
+			vk->vkDestroyImageView(vk->device, mc->session_render.preblit_views[i], NULL);
+			mc->session_render.preblit_views[i] = VK_NULL_HANDLE;
+		}
+		if (mc->session_render.preblit_images[i] != VK_NULL_HANDLE) {
+			vk->vkDestroyImage(vk->device, mc->session_render.preblit_images[i], NULL);
+			mc->session_render.preblit_images[i] = VK_NULL_HANDLE;
+		}
+		if (mc->session_render.preblit_memories[i] != VK_NULL_HANDLE) {
+			vk->vkFreeMemory(vk->device, mc->session_render.preblit_memories[i], NULL);
+			mc->session_render.preblit_memories[i] = VK_NULL_HANDLE;
+		}
 		if (mc->session_render.composite_eye_views[i] != VK_NULL_HANDLE) {
 			vk->vkDestroyImageView(vk->device, mc->session_render.composite_eye_views[i], NULL);
 			mc->session_render.composite_eye_views[i] = VK_NULL_HANDLE;
@@ -819,6 +869,8 @@ fini_composite_resources(struct multi_compositor *mc, struct vk_bundle *vk)
 	mc->session_render.composite_initialized = false;
 }
 
+#endif // XRT_HAVE_LEIA_SR_VULKAN (composite resources)
+
 /*!
  * Check if any window-space layers exist in the delivered frame.
  */
@@ -833,36 +885,20 @@ has_window_space_layers(struct multi_compositor *mc)
 	return false;
 }
 
+#ifdef XRT_HAVE_LEIA_SR_VULKAN
+
 /*!
  * Composite all layers (projection + window-space) into the intermediate stereo
  * targets before weaving. This is the pre-weaving compositing step.
  *
- * KNOWN ISSUE (Intel Iris Xe / Gen12 iGPU):
- * This function produces a black right eye on Intel Iris Xe when sampling
- * cross-device shared (app) projection images via fragment shader. The root
- * cause is believed to be an Intel driver limitation with CCS (Color Control
- * Surface) metadata resolution for shader reads on externally-imported images.
- *
- * What works on Intel:
- *   - vkCmdBlitImage (transfer read) from shared images → both eyes OK
- *     (used by session_blit_sbs() in the non-compositing path)
- *   - Sampling compositor-owned images → OK (not cross-device)
- *
- * What fails on Intel:
- *   - Fragment shader sampling of cross-device shared images → right eye black
- *     (this function, even with SHADER_READ_ONLY_OPTIMAL layout + CCS barriers)
- *
- * Attempted fixes that did NOT resolve the Intel issue:
- *   1. CCS reconciliation barriers (GENERAL→TRANSFER_SRC→GENERAL round-trip)
- *   2. Transitioning to SHADER_READ_ONLY_OPTIMAL for sampling (current approach)
- *   3. Descriptor set aliasing fix (was a real bug, fixed, but unrelated to Intel)
- *
- * On NVIDIA, all paths work correctly — NVIDIA does not use CCS compression.
- *
- * Potential future fix: pre-blit shared images into compositor-owned local
- * copies via vkCmdBlitImage (which works on Intel), then sample the local
- * copies in the compositing render pass. This avoids shader reads of cross-
- * device images entirely but adds GPU cost (2 extra blits per frame).
+ * Intel CCS workaround (Intel Iris Xe / Gen12 iGPU):
+ * On Intel, fragment shader sampling of cross-device shared images produces a
+ * black right eye due to CCS (Color Control Surface) metadata not being resolved.
+ * Fix: pre-blit shared projection images into compositor-owned local copies via
+ * vkCmdBlitImage (which works on Intel), then sample the local copies in the
+ * compositing render pass. This avoids shader reads of cross-device images entirely.
+ * Cost: 2 extra same-size blits per frame (~microseconds on modern GPUs).
+ * On NVIDIA this is a harmless no-op — NVIDIA does not use CCS compression.
  *
  * @param mc  The multi_compositor
  * @param vk  The Vulkan bundle
@@ -947,29 +983,27 @@ composite_layers_to_intermediate(struct multi_compositor *mc,
 	                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 	                         0, 0, NULL, 0, NULL, 2, barriers_to_attach);
 
-	// NOTE: Shared (app) swapchain images are transitioned to SHADER_READ_ONLY_OPTIMAL
-	// for sampling in the compositing render pass, then restored to GENERAL afterward.
-	// On Intel Iris Xe (Gen12), GENERAL layout is insufficient for the 3D sampler to
-	// resolve CCS metadata on cross-device shared images — SHADER_READ_ONLY is required.
+	// Pre-blit shared projection images into compositor-owned local copies (Intel CCS workaround).
+	// On Intel Iris Xe (Gen12), fragment shader sampling of cross-device shared images produces
+	// a black right eye due to CCS (Color Control Surface) metadata not being resolved for shader
+	// reads. vkCmdBlitImage (transfer read) works correctly on Intel, so we blit shared images
+	// into local preblit copies, then sample those in the compositing render pass.
+	// On NVIDIA this is a harmless extra copy (~microseconds for same-size same-format blit).
 
-	// Transition shared (app) projection images to SHADER_READ_ONLY_OPTIMAL
-	// for sampling in the compositing render pass.
-	// On Intel Iris Xe (Gen12), cross-device shared images use CCS compression.
-	// GENERAL layout is insufficient for the 3D sampler to resolve CCS metadata;
-	// Intel requires SHADER_READ_ONLY_OPTIMAL for correct sampling. We go via
-	// TRANSFER_SRC first (forces CCS resolve in the copy engine), then to
-	// SHADER_READ_ONLY (prepares for the sampler). Images are restored to
-	// GENERAL after the render pass. On NVIDIA this is a harmless no-op.
 	{
-		VkImageMemoryBarrier ccs_pre[2] = {
+		VkImage shared_imgs[2] = {leftProjImage, rightProjImage};
+		uint32_t shared_layers[2] = {leftProjArray, rightProjArray};
+
+		// Pre-barriers: shared images GENERAL->TRANSFER_SRC, preblit UNDEFINED->TRANSFER_DST
+		VkImageMemoryBarrier pre[4] = {
 		    {
 		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
 		        .srcAccessMask = 0,
 		        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
 		        .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
 		        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-		        .image = leftProjImage,
-		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, leftProjArray, 1},
+		        .image = shared_imgs[0],
+		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, shared_layers[0], 1},
 		    },
 		    {
 		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -977,46 +1011,101 @@ composite_layers_to_intermediate(struct multi_compositor *mc,
 		        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
 		        .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
 		        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-		        .image = rightProjImage,
-		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, rightProjArray, 1},
+		        .image = shared_imgs[1],
+		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, shared_layers[1], 1},
+		    },
+		    {
+		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		        .srcAccessMask = 0,
+		        .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+		        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+		        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		        .image = mc->session_render.preblit_images[0],
+		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+		    },
+		    {
+		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		        .srcAccessMask = 0,
+		        .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+		        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+		        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		        .image = mc->session_render.preblit_images[1],
+		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
 		    },
 		};
-		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
-		                         NULL, 0, NULL, 2, ccs_pre);
+		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+		                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 4, pre);
 
-		VkImageMemoryBarrier ccs_post[2] = {
+		// Blit shared images into preblit copies (same size, NEAREST filter, no Y-flip)
+		for (int eye = 0; eye < 2; eye++) {
+			VkImageBlit region = {
+			    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, shared_layers[eye], 1},
+			    .srcOffsets = {{0, 0, 0}, {(int32_t)cw, (int32_t)ch, 1}},
+			    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+			    .dstOffsets = {{0, 0, 0}, {(int32_t)cw, (int32_t)ch, 1}},
+			};
+			vk->vkCmdBlitImage(cmd, shared_imgs[eye], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+			                   mc->session_render.preblit_images[eye],
+			                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region,
+			                   VK_FILTER_NEAREST);
+		}
+
+		// Post-barriers: shared images TRANSFER_SRC->GENERAL (restore for next frame),
+		// preblit TRANSFER_DST->SHADER_READ_ONLY (ready for sampling in render pass)
+		VkImageMemoryBarrier post[4] = {
 		    {
 		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
 		        .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-		        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+		        .dstAccessMask = 0,
 		        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-		        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-		        .image = leftProjImage,
-		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, leftProjArray, 1},
+		        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+		        .image = shared_imgs[0],
+		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, shared_layers[0], 1},
 		    },
 		    {
 		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
 		        .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-		        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+		        .dstAccessMask = 0,
 		        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+		        .image = shared_imgs[1],
+		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, shared_layers[1], 1},
+		    },
+		    {
+		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+		        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+		        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 		        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-		        .image = rightProjImage,
-		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, rightProjArray, 1},
+		        .image = mc->session_render.preblit_images[0],
+		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+		    },
+		    {
+		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+		        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+		        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		        .image = mc->session_render.preblit_images[1],
+		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
 		    },
 		};
 		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-		                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 2,
-		                         ccs_post);
+		                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+		                         0, 0, NULL, 0, NULL, 4, post);
 	}
 
 	// UBO stride for sub-allocation from the persistent UBO buffer
 	VkDeviceSize ubo_stride = sizeof(struct xrt_normalized_rect) + sizeof(struct xrt_matrix_4x4);
 
-	// Projection layer image views (per eye)
-	VkImageView proj_views[2] = {leftProjView, rightProjView};
+	// Projection layer image views: use preblit copies (compositor-owned, safe for shader sampling)
+	VkImageView proj_views[2] = {
+	    mc->session_render.preblit_views[0],
+	    mc->session_render.preblit_views[1],
+	};
 
 	// Step 2: For each eye — begin render pass, draw projection quad, draw overlays, end render pass.
-	// Shared projection images are now in SHADER_READ_ONLY_OPTIMAL (transitioned above).
+	// Preblit copies are in SHADER_READ_ONLY_OPTIMAL (transitioned above).
 	//
 	// Descriptor set allocation: ds[0]=eye0 projection, ds[1]=eye1 projection,
 	// ds[2..N]=overlay draws (unique per eye×overlay to avoid aliasing, since
@@ -1223,7 +1312,7 @@ composite_layers_to_intermediate(struct multi_compositor *mc,
 			VkDescriptorImageInfo img_desc = {
 			    .sampler = mc->session_render.composite_sampler,
 			    .imageView = ws_view,
-			    .imageLayout = VK_IMAGE_LAYOUT_GENERAL, // No transitions on shared images (Intel CCS)
+			    .imageLayout = VK_IMAGE_LAYOUT_GENERAL, // Overlay shared images stay in GENERAL
 			};
 
 			VkWriteDescriptorSet writes[2] = {
@@ -1258,34 +1347,6 @@ composite_layers_to_intermediate(struct multi_compositor *mc,
 		vk->vkCmdEndRenderPass(cmd);
 	}
 
-	// Restore shared projection images to GENERAL for the next frame.
-	// session_blit_sbs (non-compositing path) and the app's device both
-	// expect these images in GENERAL layout.
-	{
-		VkImageMemoryBarrier restore[2] = {
-		    {
-		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		        .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
-		        .dstAccessMask = 0,
-		        .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-		        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-		        .image = leftProjImage,
-		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, leftProjArray, 1},
-		    },
-		    {
-		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		        .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
-		        .dstAccessMask = 0,
-		        .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-		        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-		        .image = rightProjImage,
-		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, rightProjArray, 1},
-		    },
-		};
-		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-		                         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL, 0, NULL, 2, restore);
-	}
-
 	// Step 3: Transition both composite images to SHADER_READ_ONLY for weaver input
 	VkImageMemoryBarrier barriers_to_read[2];
 	for (int eye = 0; eye < 2; eye++) {
@@ -1310,6 +1371,8 @@ composite_layers_to_intermediate(struct multi_compositor *mc,
 
 	return true;
 }
+
+#endif // XRT_HAVE_LEIA_SR_VULKAN (composite_layers_to_intermediate)
 
 /*!
  * Recreate the per-session swapchain after a window resize.
@@ -1378,7 +1441,7 @@ recreate_session_swapchain(struct multi_compositor *mc, struct vk_bundle *vk)
 		U_LOG_W("[per-session] Image count changed: %u -> %u", old_image_count, new_image_count);
 
 		// Free old command buffers from the pool
-		vk->vkFreeCommandBuffers(vk->device, mc->session_render.weaver_cmd_pool,
+		vk->vkFreeCommandBuffers(vk->device, mc->session_render.cmd_pool,
 		                         old_image_count, mc->session_render.cmd_buffers);
 
 		// Destroy old fences
@@ -1406,7 +1469,7 @@ recreate_session_swapchain(struct multi_compositor *mc, struct vk_bundle *vk)
 		// Allocate new command buffers
 		VkCommandBufferAllocateInfo cb_alloc = {
 		    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-		    .commandPool = mc->session_render.weaver_cmd_pool,
+		    .commandPool = mc->session_render.cmd_pool,
 		    .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
 		    .commandBufferCount = new_image_count,
 		};
@@ -1435,11 +1498,11 @@ recreate_session_swapchain(struct multi_compositor *mc, struct vk_bundle *vk)
 	}
 
 	// 5. Create new framebuffers bound to new swapchain images
-	if (mc->session_render.framebuffers != NULL && mc->session_render.weaver_render_pass != VK_NULL_HANDLE) {
+	if (mc->session_render.framebuffers != NULL && mc->session_render.render_pass != VK_NULL_HANDLE) {
 		for (uint32_t i = 0; i < new_image_count; i++) {
 			VkFramebufferCreateInfo fb_info = {
 			    .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
-			    .renderPass = mc->session_render.weaver_render_pass,
+			    .renderPass = mc->session_render.render_pass,
 			    .attachmentCount = 1,
 			    .pAttachments = &ct->images[i].view,
 			    .width = ct->width,
@@ -1463,8 +1526,6 @@ recreate_session_swapchain(struct multi_compositor *mc, struct vk_bundle *vk)
 	U_LOG_W("[per-session] Swapchain recreated: %ux%u, %u images", ct->width, ct->height, new_image_count);
 
 }
-
-#endif // XRT_HAVE_LEIA_SR_VULKAN (temporarily close for generic Y-flip functions)
 
 /*!
  * Ensure the SBS (side-by-side) flip image exists for Y-flipping GL textures before display processing.
@@ -1636,10 +1697,8 @@ session_blit_sbs(struct vk_bundle *vk,
 	                         NULL, 0, NULL, 3, post_barriers);
 }
 
-#ifdef XRT_HAVE_LEIA_SR_VULKAN // reopen for Leia-specific per-session rendering
-
 /*!
- * Render a single per-session client to its own comp_target using SR weaving.
+ * Render a single per-session client to its own comp_target using display processing.
  *
  * @param mc The multi_compositor with per-session rendering
  * @param vk The Vulkan bundle
@@ -1649,10 +1708,9 @@ static void
 render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, int64_t display_time_ns)
 {
 	struct comp_target *ct = mc->session_render.target;
-	struct leiasr *weaver = mc->session_render.weaver;
 
-	if (ct == NULL || weaver == NULL) {
-		U_LOG_E("[per-session] Per-session target or weaver not initialized");
+	if (ct == NULL) {
+		U_LOG_E("[per-session] Per-session target not initialized");
 		return;
 	}
 
@@ -1690,9 +1748,6 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 		U_LOG_W("[per-session] No projection layer found, skipping");
 		return;
 	}
-
-	// Check if we need compositing (window-space layers present)
-	bool needs_compositing = has_window_space_layers(mc);
 
 	// Extract left and right view info
 	int imageWidth = 0, imageHeight = 0;
@@ -1803,14 +1858,14 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 	int weaveWidth = imageWidth;
 	int weaveHeight = imageHeight;
 
+	bool blit_flip_y = layer->data.flip_y;
+
+#ifdef XRT_HAVE_LEIA_SR_VULKAN
 	// If window-space overlay layers are present, composite all layers into
 	// intermediate per-eye images first, then use those for the SBS blit.
-	// KNOWN ISSUE: On Intel Iris Xe (Gen12), compositing produces a black right
-	// eye due to shader sampling of cross-device shared images. The non-compositing
-	// path (no overlays) works fine. See composite_layers_to_intermediate() docs.
-	bool composited = false;
-	bool blit_flip_y = layer->data.flip_y;
-	if (needs_compositing) {
+	// Shared projection images are pre-blitted into compositor-owned local copies
+	// to work around Intel CCS issues. See composite_layers_to_intermediate() docs.
+	if (has_window_space_layers(mc)) {
 		VkImageView comp_left_view = VK_NULL_HANDLE, comp_right_view = VK_NULL_HANDLE;
 		if (composite_layers_to_intermediate(mc, vk, cmd, &comp_left_view, &comp_right_view)) {
 			// Use composited images as SBS blit sources instead of raw projection images.
@@ -1820,7 +1875,6 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 			leftArrayIndex = 0;
 			rightArrayIndex = 0;
 			blit_flip_y = false;
-			composited = true;
 
 			// Transition composited images SHADER_READ_ONLY → GENERAL
 			// so session_blit_sbs can transition them GENERAL → TRANSFER_SRC.
@@ -1843,13 +1897,10 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 
 		}
 	}
+#endif // XRT_HAVE_LEIA_SR_VULKAN
 
 	// Both GL and VK paths blit shared images into a local SBS (side-by-side) image.
-	// This serves two purposes:
-	// 1. Creates a compositor-owned local copy, avoiding cross-device CCS coherency
-	//    issues when the weaver reads from the image (Intel Iris Xe Gen12).
-	// 2. The blit's GENERAL->TRANSFER_SRC transition reconciles CCS metadata on
-	//    the compositor's device after the app's device wrote to the shared images.
+	// This creates a compositor-owned local copy for the weaver to read from.
 	// GL path flips Y (GL is Y-up, VK is Y-down). VK path copies without flip.
 	// When composited, flip_y is already applied so blit_flip_y is false.
 	// The weaver's SBS mode (right=VK_NULL_HANDLE) reads left half as left eye,
@@ -1888,11 +1939,10 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 		                         0, 0, NULL, 0, NULL, 1, &pre_weave_barrier);
 	}
 
-	// Log window position diagnostics (once, on first weave call)
+	// Log one-time diagnostic info
 	{
 		static bool diag_logged = false;
 		if (!diag_logged) {
-			leiasr_log_window_diagnostics(weaver, mc->session_render.external_window_handle);
 			U_LOG_W("[per-session] Weave params: viewport=(%d,%d,%u,%u), input=%dx%d fmt=%d, fb=%ux%u fmt=%d",
 			        viewport.offset.x, viewport.offset.y,
 			        viewport.extent.width, viewport.extent.height,
@@ -1902,11 +1952,23 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 		}
 	}
 
-	// Perform display processing (SR weaving via generic display processor interface)
+#ifdef XRT_HAVE_LEIA_SR_VULKAN
+	// Log SR window position diagnostics (once)
+	if (mc->session_render.weaver != NULL) {
+		static bool sr_diag_logged = false;
+		if (!sr_diag_logged) {
+			leiasr_log_window_diagnostics(mc->session_render.weaver,
+			                              mc->session_render.external_window_handle);
+			sr_diag_logged = true;
+		}
+	}
+#endif
+
+	// Perform display processing via generic display processor interface
 	if (mc->session_render.display_processor != NULL) {
 		static bool dp_logged = false;
 		if (!dp_logged) {
-			U_LOG_W("[per-session] Vulkan weaving via display processor interface");
+			U_LOG_W("[per-session] Vulkan rendering via display processor interface");
 			dp_logged = true;
 		}
 
@@ -1922,16 +1984,20 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 		    framebufferWidth,
 		    framebufferHeight,
 		    (VkFormat_XDP)framebufferFormat);
-	} else {
+	}
+#ifdef XRT_HAVE_LEIA_SR_VULKAN
+	else if (mc->session_render.weaver != NULL) {
 		static bool fallback_logged = false;
 		if (!fallback_logged) {
 			U_LOG_W("[per-session] Vulkan weaving via direct SR call (display processor unavailable)");
 			fallback_logged = true;
 		}
 
-		leiasr_weave(weaver, cmd, weaveLeft, weaveRight, viewport, weaveWidth, weaveHeight, imageFormat,
-		             framebuffer, (int)framebufferWidth, (int)framebufferHeight, framebufferFormat);
+		leiasr_weave(mc->session_render.weaver, cmd, weaveLeft, weaveRight, viewport, weaveWidth, weaveHeight,
+		             imageFormat, framebuffer, (int)framebufferWidth, (int)framebufferHeight,
+		             framebufferFormat);
 	}
+#endif
 
 	// Transition swapchain image to PRESENT_SRC_KHR after weaving
 	// (matches Vulkan weaving example: image must be presentable)
@@ -2065,7 +2131,6 @@ render_per_session_clients_locked(struct multi_system_compositor *msc, int64_t d
 	}
 }
 
-#endif // XRT_HAVE_LEIA_SR_VULKAN
 
 
 static void
@@ -2376,13 +2441,11 @@ multi_main_loop(struct multi_system_compositor *msc)
 
 		xrt_comp_layer_commit(xc, XRT_GRAPHICS_SYNC_HANDLE_INVALID);
 
-#ifdef XRT_HAVE_LEIA_SR_VULKAN
 		// Render per-session clients to their own targets (Phase 4)
 		// These sessions were skipped in transfer_layers_locked and render separately
 		os_mutex_lock(&msc->list_and_timing_lock);
 		render_per_session_clients_locked(msc, predicted_display_time_ns);
 		os_mutex_unlock(&msc->list_and_timing_lock);
-#endif
 
 		// Re-lock the thread for check in while statement.
 		os_thread_helper_lock(&msc->oth);

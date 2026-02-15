@@ -92,9 +92,13 @@ struct comp_d3d11_renderer
 	//! Depth stencil state.
 	ID3D11DepthStencilState *depth_stencil_state;
 
-	//! View dimensions.
+	//! View dimensions (per-eye stereo).
 	uint32_t view_width;
 	uint32_t view_height;
+
+	//! Texture height (may be > view_height to accommodate mono/2D mode).
+	//! The SBS texture is 2*view_width x texture_height.
+	uint32_t texture_height;
 };
 
 // Access compositor internals
@@ -354,10 +358,12 @@ create_resources(struct comp_d3d11_renderer *r)
 {
 	auto internals = get_internals(r->c);
 
-	// Create side-by-side stereo texture (2x width)
+	// Create side-by-side stereo texture (2x width).
+	// Height is texture_height which may be > view_height to accommodate
+	// mono (2D) rendering at full window resolution.
 	D3D11_TEXTURE2D_DESC texDesc = {};
 	texDesc.Width = r->view_width * 2;
-	texDesc.Height = r->view_height;
+	texDesc.Height = r->texture_height;
 	texDesc.MipLevels = 1;
 	texDesc.ArraySize = 1;
 	texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -371,8 +377,8 @@ create_resources(struct comp_d3d11_renderer *r)
 		return XRT_ERROR_D3D;
 	}
 
-	U_LOG_W("Created stereo texture: %ux%u (view=%ux%u per eye, side-by-side)",
-	        texDesc.Width, texDesc.Height, r->view_width, r->view_height);
+	U_LOG_W("Created stereo texture: %ux%u (view=%ux%u per eye, tex_h=%u)",
+	        texDesc.Width, texDesc.Height, r->view_width, r->view_height, r->texture_height);
 
 	// Create SRV for stereo texture
 	D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
@@ -880,6 +886,7 @@ extern "C" xrt_result_t
 comp_d3d11_renderer_create(struct comp_d3d11_compositor *c,
                            uint32_t view_width,
                            uint32_t view_height,
+                           uint32_t target_height,
                            struct comp_d3d11_renderer **out_renderer)
 {
 	comp_d3d11_renderer *r = new comp_d3d11_renderer();
@@ -888,6 +895,7 @@ comp_d3d11_renderer_create(struct comp_d3d11_compositor *c,
 	r->c = c;
 	r->view_width = view_width;
 	r->view_height = view_height;
+	r->texture_height = (target_height > view_height) ? target_height : view_height;
 
 	xrt_result_t xret = create_shaders(r);
 	if (xret != XRT_SUCCESS) {
@@ -903,7 +911,8 @@ comp_d3d11_renderer_create(struct comp_d3d11_compositor *c,
 
 	*out_renderer = r;
 
-	U_LOG_I("Created D3D11 renderer: view size %ux%u", view_width, view_height);
+	U_LOG_I("Created D3D11 renderer: view=%ux%u, tex_h=%u (target_h=%u)",
+	        view_width, view_height, r->texture_height, target_height);
 
 	return XRT_SUCCESS;
 }
@@ -951,7 +960,9 @@ extern "C" xrt_result_t
 comp_d3d11_renderer_draw(struct comp_d3d11_renderer *renderer,
                          struct comp_layer_accum *layers,
                          struct xrt_vec3 *left_eye,
-                         struct xrt_vec3 *right_eye)
+                         struct xrt_vec3 *right_eye,
+                         uint32_t target_width,
+                         uint32_t target_height)
 {
 	auto internals = get_internals(renderer->c);
 
@@ -1018,18 +1029,25 @@ comp_d3d11_renderer_draw(struct comp_d3d11_renderer *renderer,
 		// Set viewport for this view
 		D3D11_VIEWPORT viewport = {};
 		if (effective_views == 1) {
-			// MONO: single viewport at view_width (same as one eye).
-			// The app's swapchain is view_width wide; using 2*view_width
-			// would stretch the content horizontally.
+			// MONO: use target (window) dimensions so 2D content fills
+			// the full window. Width is capped to the SBS texture width
+			// (2*view_width); height is capped to texture_height.
+			uint32_t mono_w = (target_width < renderer->view_width * 2)
+			                      ? target_width
+			                      : renderer->view_width * 2;
+			uint32_t mono_h = (target_height < renderer->texture_height)
+			                      ? target_height
+			                      : renderer->texture_height;
 			viewport.TopLeftX = 0.0f;
-			viewport.Width = static_cast<float>(renderer->view_width);
+			viewport.Width = static_cast<float>(mono_w);
+			viewport.Height = static_cast<float>(mono_h);
 		} else {
 			// STEREO: side-by-side
 			viewport.TopLeftX = static_cast<float>(view_index * renderer->view_width);
 			viewport.Width = static_cast<float>(renderer->view_width);
+			viewport.Height = static_cast<float>(renderer->view_height);
 		}
 		viewport.TopLeftY = 0.0f;
-		viewport.Height = static_cast<float>(renderer->view_height);
 		viewport.MinDepth = 0.0f;
 		viewport.MaxDepth = 1.0f;
 		internals->context->RSSetViewports(1, &viewport);
@@ -1117,7 +1135,8 @@ comp_d3d11_renderer_get_stereo_texture(struct comp_d3d11_renderer *renderer)
 extern "C" xrt_result_t
 comp_d3d11_renderer_resize(struct comp_d3d11_renderer *renderer,
                            uint32_t new_view_width,
-                           uint32_t new_view_height)
+                           uint32_t new_view_height,
+                           uint32_t new_target_height)
 {
 	if (renderer == nullptr) {
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
@@ -1131,16 +1150,23 @@ comp_d3d11_renderer_resize(struct comp_d3d11_renderer *renderer,
 		new_view_height = 64;
 	}
 
+	uint32_t new_texture_height = (new_target_height > new_view_height)
+	                                  ? new_target_height
+	                                  : new_view_height;
+
 	// Skip if unchanged
-	if (new_view_width == renderer->view_width && new_view_height == renderer->view_height) {
+	if (new_view_width == renderer->view_width &&
+	    new_view_height == renderer->view_height &&
+	    new_texture_height == renderer->texture_height) {
 		return XRT_SUCCESS;
 	}
 
 	auto internals = get_internals(renderer->c);
 
-	U_LOG_W("Renderer resize: %ux%u -> %ux%u per eye",
+	U_LOG_W("Renderer resize: view %ux%u -> %ux%u, tex_h %u -> %u",
 	        renderer->view_width, renderer->view_height,
-	        new_view_width, new_view_height);
+	        new_view_width, new_view_height,
+	        renderer->texture_height, new_texture_height);
 
 	// Release existing resources
 #define SAFE_RELEASE(x)                                                                                                \
@@ -1160,11 +1186,12 @@ comp_d3d11_renderer_resize(struct comp_d3d11_renderer *renderer,
 	// Update dimensions
 	renderer->view_width = new_view_width;
 	renderer->view_height = new_view_height;
+	renderer->texture_height = new_texture_height;
 
 	// Recreate stereo texture (2x width for side-by-side)
 	D3D11_TEXTURE2D_DESC texDesc = {};
 	texDesc.Width = new_view_width * 2;
-	texDesc.Height = new_view_height;
+	texDesc.Height = new_texture_height;
 	texDesc.MipLevels = 1;
 	texDesc.ArraySize = 1;
 	texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -1214,8 +1241,9 @@ comp_d3d11_renderer_resize(struct comp_d3d11_renderer *renderer,
 		return XRT_ERROR_D3D;
 	}
 
-	U_LOG_W("Renderer resized: stereo texture now %ux%u (view=%ux%u per eye)",
-	        new_view_width * 2, new_view_height, new_view_width, new_view_height);
+	U_LOG_W("Renderer resized: stereo texture now %ux%u (view=%ux%u, tex_h=%u)",
+	        new_view_width * 2, new_texture_height, new_view_width, new_view_height,
+	        new_texture_height);
 
 	return XRT_SUCCESS;
 }

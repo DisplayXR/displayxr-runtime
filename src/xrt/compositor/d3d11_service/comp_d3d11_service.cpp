@@ -2679,17 +2679,22 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			// Set viewport for this view
 			D3D11_VIEWPORT viewport = {};
 			if (is_mono) {
-				// MONO: single viewport at view_width (same as one eye).
-				// Using 2*view_width would stretch content horizontally.
+				// MONO: use output (window) dimensions so 2D content
+				// fills the full window, capped to stereo texture size.
+				uint32_t mono_w = (sys->output_width < sys->display_width)
+				                      ? sys->output_width : sys->display_width;
+				uint32_t mono_h = (sys->output_height < sys->display_height)
+				                      ? sys->output_height : sys->display_height;
 				viewport.TopLeftX = 0.0f;
-				viewport.Width = static_cast<float>(sys->view_width);
+				viewport.Width = static_cast<float>(mono_w);
+				viewport.Height = static_cast<float>(mono_h);
 			} else {
 				// STEREO: side-by-side
 				viewport.TopLeftX = static_cast<float>(view_index * sys->view_width);
 				viewport.Width = static_cast<float>(sys->view_width);
+				viewport.Height = static_cast<float>(sys->view_height);
 			}
 			viewport.TopLeftY = 0.0f;
-			viewport.Height = static_cast<float>(sys->view_height);
 			viewport.MinDepth = 0.0f;
 			viewport.MaxDepth = 1.0f;
 			sys->context->RSSetViewports(1, &viewport);
@@ -2810,7 +2815,23 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		if (c->render.stereo_texture && c->render.back_buffer_rtv) {
 			wil::com_ptr<ID3D11Resource> back_buffer;
 			c->render.back_buffer_rtv->GetResource(back_buffer.put());
-			sys->context->CopyResource(back_buffer.get(), c->render.stereo_texture.get());
+
+			if (is_mono) {
+				// MONO: copy the rendered region (output dims, capped
+				// to stereo texture) to the back buffer.
+				D3D11_TEXTURE2D_DESC src_desc = {};
+				c->render.stereo_texture->GetDesc(&src_desc);
+				uint32_t copy_w = (sys->output_width < src_desc.Width)
+				                      ? sys->output_width : src_desc.Width;
+				uint32_t copy_h = (sys->output_height < src_desc.Height)
+				                      ? sys->output_height : src_desc.Height;
+				D3D11_BOX src_box = {0, 0, 0, copy_w, copy_h, 1};
+				sys->context->CopySubresourceRegion(
+				    back_buffer.get(), 0, 0, 0, 0,
+				    c->render.stereo_texture.get(), 0, &src_box);
+			} else {
+				sys->context->CopyResource(back_buffer.get(), c->render.stereo_texture.get());
+			}
 		}
 	}
 
@@ -3213,8 +3234,8 @@ comp_d3d11_service_create_system(struct xrt_device *xdev,
 	sys->base.info.max_layers = XRT_MAX_LAYERS;
 	sys->base.info.views[0].recommended.width_pixels = sys->view_width;
 	sys->base.info.views[0].recommended.height_pixels = sys->view_height;
-	sys->base.info.views[0].max.width_pixels = sys->view_width;
-	sys->base.info.views[0].max.height_pixels = sys->view_height;
+	sys->base.info.views[0].max.width_pixels = sys->view_width * 2;
+	sys->base.info.views[0].max.height_pixels = sys->view_height * 2;
 	sys->base.info.views[1] = sys->base.info.views[0];
 
 	// Set supported blend modes (Chrome WebXR requires at least OPAQUE)

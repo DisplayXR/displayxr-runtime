@@ -30,6 +30,9 @@ extern "C" {
  * @param c The D3D11 compositor.
  * @param view_width Width of one view (half of stereo texture width).
  * @param view_height Height of the views.
+ * @param target_height Height of the render target (window). The internal
+ *        stereo texture height is max(view_height, target_height) so that
+ *        mono (2D) rendering can fill the full window without cropping.
  * @param out_renderer Pointer to receive the created renderer.
  *
  * @return XRT_SUCCESS on success, error code otherwise.
@@ -40,6 +43,7 @@ xrt_result_t
 comp_d3d11_renderer_create(struct comp_d3d11_compositor *c,
                            uint32_t view_width,
                            uint32_t view_height,
+                           uint32_t target_height,
                            struct comp_d3d11_renderer **out_renderer);
 
 /*!
@@ -57,6 +61,9 @@ comp_d3d11_renderer_destroy(struct comp_d3d11_renderer **renderer_ptr);
  * @param layers The accumulated layers.
  * @param left_eye Left eye position for projection (NULL for default).
  * @param right_eye Right eye position for projection (NULL for default).
+ * @param target_width Width of the render target (window). Used for mono
+ *        viewport sizing so 2D content fills the full window.
+ * @param target_height Height of the render target (window).
  *
  * @return XRT_SUCCESS on success, error code otherwise.
  *
@@ -66,7 +73,9 @@ xrt_result_t
 comp_d3d11_renderer_draw(struct comp_d3d11_renderer *renderer,
                          struct comp_layer_accum *layers,
                          struct xrt_vec3 *left_eye,
-                         struct xrt_vec3 *right_eye);
+                         struct xrt_vec3 *right_eye,
+                         uint32_t target_width,
+                         uint32_t target_height);
 
 /*!
  * Get the stereo texture SRV for weaving.
@@ -121,6 +130,8 @@ comp_d3d11_renderer_get_stereo_texture(struct comp_d3d11_renderer *renderer);
  * @param renderer The renderer.
  * @param new_view_width New width per view (clamped to minimum 64).
  * @param new_view_height New height per view (clamped to minimum 64).
+ * @param new_target_height New render target (window) height. The texture
+ *        height is max(new_view_height, new_target_height).
  *
  * @return XRT_SUCCESS on success, error code otherwise.
  *
@@ -129,7 +140,8 @@ comp_d3d11_renderer_get_stereo_texture(struct comp_d3d11_renderer *renderer);
 xrt_result_t
 comp_d3d11_renderer_resize(struct comp_d3d11_renderer *renderer,
                            uint32_t new_view_width,
-                           uint32_t new_view_height);
+                           uint32_t new_view_height,
+                           uint32_t new_target_height);
 
 #ifdef __cplusplus
 }

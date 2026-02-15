@@ -228,12 +228,12 @@ struct multi_compositor
 		//! Wraps vendor-specific weaving (SR SDK, CNSDK, sim_display, etc.).
 		struct xrt_display_processor *display_processor;
 
-#ifdef XRT_HAVE_LEIA_SR_VULKAN
-		//! Per-session SR weaver for this session's window
-		struct leiasr *weaver;
+		//! @name Generic per-session Vulkan rendering resources
+		//! Used by any display processor path (sim_display, Leia SR, etc.)
+		//! @{
 
-		//! Command pool for the per-session weaver (must be destroyed on cleanup)
-		VkCommandPool weaver_cmd_pool;
+		//! Command pool for per-session rendering
+		VkCommandPool cmd_pool;
 
 		//! Pre-allocated command buffers (one per swapchain image)
 		VkCommandBuffer *cmd_buffers;
@@ -250,14 +250,20 @@ struct multi_compositor
 		//! True if swapchain needs recreation (set on VK_SUBOPTIMAL_KHR)
 		bool swapchain_needs_recreate;
 
-		//! Render pass for weaver output (single color attachment, no depth)
-		VkRenderPass weaver_render_pass;
+		//! Render pass for display processor output (single color attachment, no depth)
+		VkRenderPass render_pass;
 
-		//! Framebuffers for weaver output (one per swapchain image)
+		//! Framebuffers for display processor output (one per swapchain image)
 		VkFramebuffer *framebuffers;
 
-		//! @name Intermediate composite targets for pre-weaving layer compositing
+		//! @}
+
+#ifdef XRT_HAVE_LEIA_SR_VULKAN
+		//! @name Leia SR-specific resources
 		//! @{
+
+		//! Per-session SR weaver for this session's window
+		struct leiasr *weaver;
 
 		//! Per-eye composite images (one per eye, not side-by-side)
 		VkImage composite_images[2];
@@ -277,6 +283,13 @@ struct multi_compositor
 		uint32_t composite_width;                //!< Single eye width
 		uint32_t composite_height;               //!< Eye height
 		bool composite_initialized;              //!< True if composite resources are ready
+
+		//! Pre-blit local copies of shared projection images (Intel CCS workaround).
+		//! vkCmdBlitImage works for cross-device shared images on Intel; shader
+		//! sampling does not. These compositor-owned copies are sampled instead.
+		VkImage preblit_images[2];
+		VkDeviceMemory preblit_memories[2];
+		VkImageView preblit_views[2];
 
 		//! Per-session shaders (loaded on demand, avoids invalid comp_compositor cast)
 		struct render_shaders shaders;
