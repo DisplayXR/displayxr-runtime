@@ -628,19 +628,19 @@ multi_compositor_end_session(struct xrt_compositor *xc)
 			mc->session_render.framebuffers = NULL;
 			mc->session_render.buffer_count = 0;
 
-			if (mc->session_render.render_pass != VK_NULL_HANDLE) {
+			if (mc->session_render.weaver_render_pass != VK_NULL_HANDLE) {
 				if (vk != NULL) {
-					vk->vkDestroyRenderPass(vk->device, mc->session_render.render_pass, NULL);
+					vk->vkDestroyRenderPass(vk->device, mc->session_render.weaver_render_pass, NULL);
 				}
-				mc->session_render.render_pass = VK_NULL_HANDLE;
+				mc->session_render.weaver_render_pass = VK_NULL_HANDLE;
 			}
 
 			// Destroy command pool
-			if (mc->session_render.cmd_pool != VK_NULL_HANDLE) {
+			if (mc->session_render.weaver_cmd_pool != VK_NULL_HANDLE) {
 				if (vk != NULL) {
-					vk->vkDestroyCommandPool(vk->device, mc->session_render.cmd_pool, NULL);
+					vk->vkDestroyCommandPool(vk->device, mc->session_render.weaver_cmd_pool, NULL);
 				}
-				mc->session_render.cmd_pool = VK_NULL_HANDLE;
+				mc->session_render.weaver_cmd_pool = VK_NULL_HANDLE;
 			}
 
 			// Destroy per-session target using the service
@@ -1174,18 +1174,18 @@ multi_compositor_destroy(struct xrt_compositor *xc)
 		mc->session_render.framebuffers = NULL;
 		mc->session_render.buffer_count = 0;
 
-		if (mc->session_render.render_pass != VK_NULL_HANDLE) {
+		if (mc->session_render.weaver_render_pass != VK_NULL_HANDLE) {
 			if (vk != NULL) {
-				vk->vkDestroyRenderPass(vk->device, mc->session_render.render_pass, NULL);
+				vk->vkDestroyRenderPass(vk->device, mc->session_render.weaver_render_pass, NULL);
 			}
-			mc->session_render.render_pass = VK_NULL_HANDLE;
+			mc->session_render.weaver_render_pass = VK_NULL_HANDLE;
 		}
 
-		if (mc->session_render.cmd_pool != VK_NULL_HANDLE) {
+		if (mc->session_render.weaver_cmd_pool != VK_NULL_HANDLE) {
 			if (vk != NULL) {
-				vk->vkDestroyCommandPool(vk->device, mc->session_render.cmd_pool, NULL);
+				vk->vkDestroyCommandPool(vk->device, mc->session_render.weaver_cmd_pool, NULL);
 			}
-			mc->session_render.cmd_pool = VK_NULL_HANDLE;
+			mc->session_render.weaver_cmd_pool = VK_NULL_HANDLE;
 		}
 
 		// Destroy SBS flip image (Y-flip before display processing — not vendor-specific)
@@ -1368,7 +1368,7 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 	    .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
 	};
 
-	VkResult vk_ret = vk->vkCreateCommandPool(vk->device, &pool_info, NULL, &mc->session_render.cmd_pool);
+	VkResult vk_ret = vk->vkCreateCommandPool(vk->device, &pool_info, NULL, &mc->session_render.weaver_cmd_pool);
 	if (vk_ret != VK_SUCCESS) {
 		U_LOG_E("Failed to create command pool: %d", vk_ret);
 		comp_target_service_destroy(mc->msc->target_service, &mc->session_render.target);
@@ -1383,8 +1383,8 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 	mc->session_render.fences = U_TYPED_ARRAY_CALLOC(VkFence, image_count);
 	if (mc->session_render.cmd_buffers == NULL || mc->session_render.fences == NULL) {
 		U_LOG_E("Failed to allocate command buffer/fence arrays");
-		vk->vkDestroyCommandPool(vk->device, mc->session_render.cmd_pool, NULL);
-		mc->session_render.cmd_pool = VK_NULL_HANDLE;
+		vk->vkDestroyCommandPool(vk->device, mc->session_render.weaver_cmd_pool, NULL);
+		mc->session_render.weaver_cmd_pool = VK_NULL_HANDLE;
 		comp_target_service_destroy(mc->msc->target_service, &mc->session_render.target);
 		free(mc->session_render.cmd_buffers);
 		free(mc->session_render.fences);
@@ -1395,7 +1395,7 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 
 	VkCommandBufferAllocateInfo cb_alloc_info = {
 	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-	    .commandPool = mc->session_render.cmd_pool,
+	    .commandPool = mc->session_render.weaver_cmd_pool,
 	    .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
 	    .commandBufferCount = image_count,
 	};
@@ -1403,8 +1403,8 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 	vk_ret = vk->vkAllocateCommandBuffers(vk->device, &cb_alloc_info, mc->session_render.cmd_buffers);
 	if (vk_ret != VK_SUCCESS) {
 		U_LOG_E("Failed to allocate command buffers: %d", vk_ret);
-		vk->vkDestroyCommandPool(vk->device, mc->session_render.cmd_pool, NULL);
-		mc->session_render.cmd_pool = VK_NULL_HANDLE;
+		vk->vkDestroyCommandPool(vk->device, mc->session_render.weaver_cmd_pool, NULL);
+		mc->session_render.weaver_cmd_pool = VK_NULL_HANDLE;
 		comp_target_service_destroy(mc->msc->target_service, &mc->session_render.target);
 		free(mc->session_render.cmd_buffers);
 		free(mc->session_render.fences);
@@ -1426,8 +1426,8 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 			for (uint32_t j = 0; j < i; j++) {
 				vk->vkDestroyFence(vk->device, mc->session_render.fences[j], NULL);
 			}
-			vk->vkDestroyCommandPool(vk->device, mc->session_render.cmd_pool, NULL);
-			mc->session_render.cmd_pool = VK_NULL_HANDLE;
+			vk->vkDestroyCommandPool(vk->device, mc->session_render.weaver_cmd_pool, NULL);
+			mc->session_render.weaver_cmd_pool = VK_NULL_HANDLE;
 			comp_target_service_destroy(mc->msc->target_service, &mc->session_render.target);
 			free(mc->session_render.cmd_buffers);
 			free(mc->session_render.fences);
@@ -1473,12 +1473,12 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 	    .pSubpasses = &subpass,
 	};
 
-	vk_ret = vk->vkCreateRenderPass(vk->device, &rp_info, NULL, &mc->session_render.render_pass);
+	vk_ret = vk->vkCreateRenderPass(vk->device, &rp_info, NULL, &mc->session_render.weaver_render_pass);
 	if (vk_ret != VK_SUCCESS) {
 		U_LOG_E("Failed to create render pass: %d", vk_ret);
 		// Continue without framebuffers
 	} else {
-		U_LOG_W("Created render pass: %p (format=%d)", (void *)mc->session_render.render_pass, ct->format);
+		U_LOG_W("Created render pass: %p (format=%d)", (void *)mc->session_render.weaver_render_pass, ct->format);
 
 		// Create framebuffers for each swapchain image
 		mc->session_render.framebuffers = U_TYPED_ARRAY_CALLOC(VkFramebuffer, image_count);
@@ -1486,7 +1486,7 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 			for (uint32_t i = 0; i < image_count; i++) {
 				VkFramebufferCreateInfo fb_info = {
 				    .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
-				    .renderPass = mc->session_render.render_pass,
+				    .renderPass = mc->session_render.weaver_render_pass,
 				    .attachmentCount = 1,
 				    .pAttachments = &ct->images[i].view,
 				    .width = ct->width,
@@ -1516,7 +1516,7 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 		                                    vk->device,                                 // Vulkan device
 		                                    vk->physical_device,                        // Physical device
 		                                    vk->main_queue->queue,                      // Graphics queue
-		                                    mc->session_render.cmd_pool,                // Command pool
+		                                    mc->session_render.weaver_cmd_pool,                // Command pool
 		                                    mc->session_render.external_window_handle,  // Window handle
 		                                    &mc->session_render.weaver);                // Output weaver
 
@@ -1550,7 +1550,7 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 			}
 
 			xrt_result_t dp_ret = sim_display_processor_create(
-			    mode, vk, (int32_t)ct->format, &mc->session_render.display_processor);
+			    mode, &mc->session_render.display_processor);
 			if (dp_ret != XRT_SUCCESS) {
 				U_LOG_W("Failed to create sim display processor, continuing without");
 				mc->session_render.display_processor = NULL;
