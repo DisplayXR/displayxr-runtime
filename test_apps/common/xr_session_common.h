@@ -111,8 +111,12 @@ struct XrSessionManager {
 // Create reference spaces
 bool CreateSpaces(XrSessionManager& xr);
 
-// Create swapchains for rendering
-bool CreateSwapchains(XrSessionManager& xr);
+// Create swapchains for rendering.
+// Optional minWidth/minHeight ensure each swapchain is at least this large
+// (capped by maxImageRectWidth/Height). Use these for apps that need to
+// render at window resolution in mono (2D) mode, where the per-eye
+// recommended size may be smaller than the window.
+bool CreateSwapchains(XrSessionManager& xr, uint32_t minWidth = 0, uint32_t minHeight = 0);
 
 // Create quad layer swapchain for UI overlay
 bool CreateQuadLayerSwapchain(XrSessionManager& xr, uint32_t width, uint32_t height);

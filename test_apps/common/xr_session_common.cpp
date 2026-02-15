@@ -169,8 +169,8 @@ bool CreateSpaces(XrSessionManager& xr) {
     return true;
 }
 
-bool CreateSwapchains(XrSessionManager& xr) {
-    LOG_INFO("Creating swapchains...");
+bool CreateSwapchains(XrSessionManager& xr, uint32_t minWidth, uint32_t minHeight) {
+    LOG_INFO("Creating swapchains (minWidth=%u, minHeight=%u)...", minWidth, minHeight);
 
     // Query supported swapchain formats
     LOG_INFO("Enumerating swapchain formats...");
@@ -196,17 +196,33 @@ bool CreateSwapchains(XrSessionManager& xr) {
         LOG_INFO("Creating swapchain for eye %d...", eye);
         const auto& view = xr.configViews[eye];
 
+        // Start with recommended per-eye size, then enlarge to minWidth/minHeight
+        // (for mono/2D mode where the app needs to render at window resolution).
+        // Cap to maxImageRect to stay within runtime limits.
+        uint32_t width = view.recommendedImageRectWidth;
+        uint32_t height = view.recommendedImageRectHeight;
+        if (minWidth > width) {
+            width = (minWidth <= view.maxImageRectWidth) ? minWidth : view.maxImageRectWidth;
+        }
+        if (minHeight > height) {
+            height = (minHeight <= view.maxImageRectHeight) ? minHeight : view.maxImageRectHeight;
+        }
+
         XrSwapchainCreateInfo swapchainInfo = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
         swapchainInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
         swapchainInfo.format = selectedFormat;
         swapchainInfo.sampleCount = view.recommendedSwapchainSampleCount;
-        swapchainInfo.width = view.recommendedImageRectWidth;
-        swapchainInfo.height = view.recommendedImageRectHeight;
+        swapchainInfo.width = width;
+        swapchainInfo.height = height;
         swapchainInfo.faceCount = 1;
         swapchainInfo.arraySize = 1;
         swapchainInfo.mipCount = 1;
 
-        LOG_INFO("  Size: %ux%u, samples: %u", swapchainInfo.width, swapchainInfo.height, swapchainInfo.sampleCount);
+        LOG_INFO("  Size: %ux%u (recommended %ux%u, max %ux%u), samples: %u",
+                 swapchainInfo.width, swapchainInfo.height,
+                 view.recommendedImageRectWidth, view.recommendedImageRectHeight,
+                 view.maxImageRectWidth, view.maxImageRectHeight,
+                 swapchainInfo.sampleCount);
 
         XR_CHECK_LOG(xrCreateSwapchain(xr.session, &swapchainInfo, &xr.swapchains[eye].swapchain));
         LOG_INFO("  Swapchain created: 0x%p", (void*)xr.swapchains[eye].swapchain);

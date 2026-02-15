@@ -649,8 +649,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return 1;
     }
 
-    // Create swapchains
-    if (!CreateSwapchains(xr)) {
+    // Create swapchains — pass window dimensions as minimum so the swapchain
+    // is large enough for mono (2D) rendering at full window resolution.
+    if (!CreateSwapchains(xr, g_windowWidth, g_windowHeight)) {
         LOG_ERROR("Swapchain creation failed");
         CleanupOpenXR(xr);
         if (hudOk) CleanupHudRenderer(hudRenderer);
