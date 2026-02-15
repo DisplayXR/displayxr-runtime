@@ -480,7 +480,32 @@ static void RenderThreadFunc(
                                 monoProjMatrix = leftProjMatrix;
                                 monoFov = rawViews[0].fov;
                             }
-                            monoViewMatrix = leftViewMatrix;
+                            // Build center-eye view matrix from scratch (same transform as LocateViews):
+                            // 1. Start from center eye in display/local space (monoPose)
+                            // 2. Apply player locomotion transform (position + yaw/pitch + zoom)
+                            // 3. Invert to get view matrix
+                            {
+                                XMVECTOR centerLocalPos = XMVectorSet(
+                                    monoPose.position.x, monoPose.position.y, monoPose.position.z, 0.0f);
+                                XMVECTOR localOri = XMVectorSet(
+                                    rawViews[0].pose.orientation.x, rawViews[0].pose.orientation.y,
+                                    rawViews[0].pose.orientation.z, rawViews[0].pose.orientation.w);
+
+                                float zoomS = inputSnapshot.zoomScale;
+                                XMVECTOR playerOri = XMQuaternionRotationRollPitchYaw(
+                                    inputSnapshot.pitch, inputSnapshot.yaw, 0);
+                                XMVECTOR playerPos = XMVectorSet(
+                                    inputSnapshot.cameraPosX, inputSnapshot.cameraPosY,
+                                    inputSnapshot.cameraPosZ, 0.0f);
+
+                                XMVECTOR worldPos = XMVector3Rotate(centerLocalPos / zoomS, playerOri) + playerPos;
+                                XMVECTOR worldOri = XMQuaternionMultiply(localOri, playerOri);
+
+                                XMMATRIX rot = XMMatrixTranspose(XMMatrixRotationQuaternion(worldOri));
+                                XMFLOAT3 wp;
+                                XMStoreFloat3(&wp, worldPos);
+                                monoViewMatrix = XMMatrixTranslation(-wp.x, -wp.y, -wp.z) * rot;
+                            }
                         }
 
                         for (int eye = 0; eye < eyeCount; eye++) {
@@ -507,8 +532,16 @@ static void RenderThreadFunc(
                                 };
                                 projectionViews[eye].subImage.imageArrayIndex = 0;
                                 projectionViews[eye].pose = monoMode ? monoPose : rawViews[eye].pose;
-                                projectionViews[eye].fov = monoMode ? monoFov :
-                                    (useAppProjection ? appFov[eye] : rawViews[eye].fov);
+                                // Always submit the runtime's raw FOV for compositing,
+                                // NOT the app's Kooima FOV. The Vulkan compositor re-projects
+                                // layers from submitted FOV → display distortion FOV. Submitting
+                                // the runtime FOV (which matches the distortion target) makes this
+                                // a no-op, so the app's Kooima rendering directly controls output.
+                                // Without this, the compositor's re-projection normalizes object
+                                // sizes, making them fixed regardless of window size.
+                                // (The D3D11 compositor ignores submitted FOV entirely, so the
+                                // D3D11 test app doesn't need this distinction.)
+                                projectionViews[eye].fov = monoMode ? rawViews[0].fov : rawViews[eye].fov;
                             } else {
                                 rendered = false;
                             }

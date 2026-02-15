@@ -368,7 +368,12 @@ static void RenderThreadFunc(
                                 };
                                 projectionViews[eye].subImage.imageArrayIndex = 0;
                                 projectionViews[eye].pose = rawViews[eye].pose;
-                                projectionViews[eye].fov = useAppProjection ? appFov[eye] : rawViews[eye].fov;
+                                // Always submit runtime's raw FOV for compositing.
+                                // The Vulkan compositor re-projects layers from submitted FOV
+                                // → display distortion FOV. Submitting the runtime FOV (which
+                                // matches the distortion target) makes this a no-op, so the
+                                // app's Kooima rendering directly controls output size.
+                                projectionViews[eye].fov = rawViews[eye].fov;
                             } else {
                                 rendered = false;
                             }
