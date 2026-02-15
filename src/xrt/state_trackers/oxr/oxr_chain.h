@@ -83,7 +83,7 @@ oxr_find_output_in_chain(void *ptr, XrStructureType desired)
  * XrStructureType value) and TYPE (a type name) actually match!
  */
 #define OXR_GET_OUTPUT_FROM_CHAIN(PTR, STRUCTURE_TYPE_ENUM, TYPE)                                                      \
-	((TYPE *)oxr_find_output_in_chain(PTR, STRUCTURE_TYPE_ENUM))
+	((TYPE *)oxr_find_output_in_chain((void *)(uintptr_t)(PTR), STRUCTURE_TYPE_ENUM))
 
 /*!
  * @}
