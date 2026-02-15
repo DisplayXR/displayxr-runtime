@@ -14,6 +14,7 @@
 #include "xrt/xrt_limits.h"
 #include "xrt/xrt_compositor.h"
 #include "xrt/xrt_config_have.h"
+#include "xrt/xrt_display_processor.h"
 
 #include "os/os_time.h"
 #include "os/os_threading.h"
@@ -220,6 +221,10 @@ struct multi_compositor
 
 		//! Per-session render target (VkSwapchain from external HWND)
 		struct comp_target *target;
+
+		//! Generic display output processor for this session.
+		//! Wraps vendor-specific weaving (SR SDK, CNSDK, sim_display, etc.).
+		struct xrt_display_processor *display_processor;
 
 #ifdef XRT_HAVE_LEIA_SR_VULKAN
 		//! Per-session SR weaver for this session's window

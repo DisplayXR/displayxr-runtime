@@ -543,13 +543,15 @@ if(XRT_HAVE_LEIA_SR)
 	endif()
 
 	# Start with empty source list - weavers are added conditionally based on available SR libraries
-	set(LEIASR_SOURCES)
+	set(LEIA_SOURCES)
 
 	# Check for Vulkan weaver support (SimulatedRealityVulkanBeta.lib)
 	set(LEIA_SR_VULKAN_AVAILABLE FALSE)
 	if(EXISTS "${SR_PATH}/lib/SimulatedRealityVulkanBeta.lib")
 		message(STATUS "Found SimulatedRealityVulkanBeta.lib - enabling Vulkan weaver")
-		list(APPEND LEIASR_SOURCES leiasr/leiasr.cpp leiasr/leiasr.h)
+		list(APPEND LEIA_SOURCES
+			leia/leia_sr.cpp leia/leia_sr.h
+			leia/leia_display_processor.cpp leia/leia_display_processor.h)
 		set(LEIA_SR_VULKAN_AVAILABLE TRUE)
 	else()
 		message(STATUS "SimulatedRealityVulkanBeta.lib not found - Vulkan weaver disabled")
@@ -560,7 +562,7 @@ if(XRT_HAVE_LEIA_SR)
 	if(WIN32 AND XRT_HAVE_D3D11)
 		if(EXISTS "${SR_PATH}/lib/SimulatedRealityDirectX.lib")
 			message(STATUS "Found SimulatedRealityDirectX.lib - enabling D3D11 weaver")
-			list(APPEND LEIASR_SOURCES leiasr/leiasr_d3d11.cpp leiasr/leiasr_d3d11.h)
+			list(APPEND LEIA_SOURCES leia/leia_sr_d3d11.cpp leia/leia_sr_d3d11.h)
 			set(LEIA_SR_D3D11_AVAILABLE TRUE)
 		else()
 			message(STATUS "SimulatedRealityDirectX.lib not found - D3D11 weaver disabled")
@@ -568,14 +570,14 @@ if(XRT_HAVE_LEIA_SR)
 	endif()
 
 	# Only create the driver if at least one weaver is available
-	if(LEIASR_SOURCES)
-		add_library(drv_leiasr STATIC ${LEIASR_SOURCES})
-		target_include_directories(drv_leiasr PRIVATE
+	if(LEIA_SOURCES)
+		add_library(drv_leia STATIC ${LEIA_SOURCES})
+		target_include_directories(drv_leia PRIVATE
 			${SR_PATH}/include
 			${SR_PATH}/third_party/OpenCV/include)
 
 		# Core SR libraries (always needed)
-		target_link_libraries(drv_leiasr PRIVATE
+		target_link_libraries(drv_leia PRIVATE
 			xrt-interfaces aux_util aux_os
 			${SR_PATH}/lib/SimulatedRealityCore.lib
 			${SR_PATH}/lib/SimulatedRealityDisplays.lib
@@ -584,18 +586,18 @@ if(XRT_HAVE_LEIA_SR)
 
 		# Vulkan weaver library (conditional)
 		if(LEIA_SR_VULKAN_AVAILABLE)
-			target_link_libraries(drv_leiasr PRIVATE
+			target_link_libraries(drv_leia PRIVATE
 				${SR_PATH}/lib/SimulatedRealityVulkanBeta.lib)
-			target_compile_definitions(drv_leiasr PUBLIC XRT_HAVE_LEIA_SR_VULKAN)
+			target_compile_definitions(drv_leia PUBLIC XRT_HAVE_LEIA_SR_VULKAN)
 		endif()
 
 		# D3D11 weaver library (conditional)
 		if(LEIA_SR_D3D11_AVAILABLE)
-			target_link_libraries(drv_leiasr PRIVATE
+			target_link_libraries(drv_leia PRIVATE
 				${SR_PATH}/lib/SimulatedRealityDirectX.lib
 				d3d11
 				dxgi)
-			target_compile_definitions(drv_leiasr PUBLIC XRT_HAVE_LEIA_SR_D3D11)
+			target_compile_definitions(drv_leia PUBLIC XRT_HAVE_LEIA_SR_D3D11)
 		endif()
 
 		# Eye tracking is handled by the weaver's getPredictedEyePositions() - no separate library needed
@@ -604,12 +606,22 @@ if(XRT_HAVE_LEIA_SR)
 		set(LEIA_SR_VULKAN_AVAILABLE ${LEIA_SR_VULKAN_AVAILABLE} CACHE INTERNAL "LeiaSR Vulkan weaver available")
 		set(LEIA_SR_D3D11_AVAILABLE ${LEIA_SR_D3D11_AVAILABLE} CACHE INTERNAL "LeiaSR D3D11 weaver available")
 
-		list(APPEND ENABLED_DRIVERS drv_leiasr)
+		list(APPEND ENABLED_DRIVERS drv_leia)
 	else()
 		message(WARNING "XRT_HAVE_LEIA_SR is set but no SR weaver libraries found - disabling Leia SR support")
 		set(XRT_HAVE_LEIA_SR OFF PARENT_SCOPE)
 	endif()
 endif(XRT_HAVE_LEIA_SR)
+
+# Simulation 3D display driver (always available, enabled by SIM_DISPLAY_ENABLE=1)
+add_library(
+	drv_sim_display STATIC
+	sim_display/sim_display_device.c
+	sim_display/sim_display_processor.c
+	sim_display/sim_display_interface.h
+	)
+target_link_libraries(drv_sim_display PRIVATE xrt-interfaces aux_util aux_os PUBLIC drv_includes)
+list(APPEND ENABLED_DRIVERS drv_sim_display)
 
 if(XRT_BUILD_SAMPLES)
 	# We build the sample driver to make sure it stays valid,

@@ -5,7 +5,7 @@
  * @brief  Common type definitions for Leia SR SDK integration.
  *         This header can be included without Vulkan or D3D11 dependencies.
  * @author David Fattal
- * @ingroup drv_leiasr
+ * @ingroup drv_leia
  */
 
 #pragma once

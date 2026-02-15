@@ -39,7 +39,7 @@
 #include "util/comp_render_helpers.h"
 
 #ifdef XRT_HAVE_LEIA_SR_VULKAN
-#include "leiasr/leiasr.h"
+#include "leia/leia_sr.h"
 #include "render/render_interface.h"
 #include "vk/vk_helpers.h"
 #endif
@@ -1896,9 +1896,24 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 		}
 	}
 
-	// Perform SR weaving
-	leiasr_weave(weaver, cmd, weaveLeft, weaveRight, viewport, weaveWidth, weaveHeight, imageFormat,
-	             framebuffer, (int)framebufferWidth, (int)framebufferHeight, framebufferFormat);
+	// Perform display processing (SR weaving via generic display processor interface)
+	if (mc->session_render.display_processor != NULL) {
+		xrt_display_processor_process_views(
+		    mc->session_render.display_processor,
+		    cmd,
+		    weaveLeft,
+		    weaveRight,
+		    (uint32_t)weaveWidth,
+		    (uint32_t)weaveHeight,
+		    (VkFormat_XDP)imageFormat,
+		    framebuffer,
+		    framebufferWidth,
+		    framebufferHeight,
+		    (VkFormat_XDP)framebufferFormat);
+	} else {
+		leiasr_weave(weaver, cmd, weaveLeft, weaveRight, viewport, weaveWidth, weaveHeight, imageFormat,
+		             framebuffer, (int)framebufferWidth, (int)framebufferHeight, framebufferFormat);
+	}
 
 	// Transition swapchain image to PRESENT_SRC_KHR after weaving
 	// (matches Vulkan weaving example: image must be presentable)

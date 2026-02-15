@@ -3,10 +3,10 @@
 /*!
  * @file
  * @brief  Leia SR (Simulated Reality) SDK integration for weaving.
- * @ingroup drv_leiasr
+ * @ingroup drv_leia
  */
 
-#include "leiasr.h"
+#include "leia_sr.h"
 #include "util/u_misc.h"
 #include "util/u_logging.h"
 #include "os/os_time.h"

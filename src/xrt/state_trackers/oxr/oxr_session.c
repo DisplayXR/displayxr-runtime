@@ -55,12 +55,12 @@
 // SR eye tracking support - either Vulkan or D3D11 path
 #if defined(XRT_HAVE_LEIA_SR_VULKAN) || defined(XRT_HAVE_LEIA_SR_D3D11)
 #define XRT_HAVE_LEIA_SR_EYE_TRACKING
-#include "leiasr/leiasr_types.h"
+#include "leia/leia_types.h"
 #endif
 
 #ifdef XRT_HAVE_LEIA_SR_VULKAN
 #include "multi/comp_multi_private.h"
-#include "leiasr/leiasr.h"
+#include "leia/leia_sr.h"
 #endif
 
 #if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_NATIVE_COMPOSITOR)

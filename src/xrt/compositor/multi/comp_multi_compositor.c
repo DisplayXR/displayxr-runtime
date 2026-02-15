@@ -29,7 +29,8 @@
 #include "main/comp_compositor.h"
 
 #ifdef XRT_HAVE_LEIA_SR_VULKAN
-#include "leiasr/leiasr.h"
+#include "leia/leia_sr.h"
+#include "leia/leia_display_processor.h"
 #include "render/render_interface.h"
 #endif
 
@@ -577,6 +578,9 @@ multi_compositor_end_session(struct xrt_compositor *xc)
 			free(mc->session_render.cmd_buffers);
 			mc->session_render.cmd_buffers = NULL;
 			mc->session_render.buffer_count = 0;
+
+			// Destroy display processor before underlying weaver
+			xrt_display_processor_destroy(&mc->session_render.display_processor);
 
 			// Destroy per-session SR weaver
 			if (mc->session_render.weaver != NULL) {
@@ -1146,6 +1150,9 @@ multi_compositor_destroy(struct xrt_compositor *xc)
 		mc->session_render.cmd_buffers = NULL;
 		mc->session_render.buffer_count = 0;
 
+		// Destroy display processor before underlying weaver
+		xrt_display_processor_destroy(&mc->session_render.display_processor);
+
 		if (mc->session_render.weaver != NULL) {
 			leiasr_destroy(mc->session_render.weaver);
 			mc->session_render.weaver = NULL;
@@ -1377,6 +1384,16 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 	mc->session_render.weaver_cmd_pool = cmd_pool;
 	U_LOG_W("Command pool stored, weaver init complete");
 
+	// Wrap the SR weaver in a generic display processor
+	{
+		xrt_result_t dp_ret = leia_display_processor_create(
+		    mc->session_render.weaver, &mc->session_render.display_processor);
+		if (dp_ret != XRT_SUCCESS) {
+			U_LOG_W("Failed to create per-session display processor, continuing without");
+			mc->session_render.display_processor = NULL;
+		}
+	}
+
 	U_LOG_W("Created per-session SR weaver for HWND %p", mc->session_render.external_window_handle);
 
 	// Allocate command buffer ring and fences (one per swapchain image)
@@ -1387,6 +1404,7 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 	mc->session_render.fences = U_TYPED_ARRAY_CALLOC(VkFence, image_count);
 	if (mc->session_render.cmd_buffers == NULL || mc->session_render.fences == NULL) {
 		U_LOG_E("Failed to allocate command buffer/fence arrays");
+		xrt_display_processor_destroy(&mc->session_render.display_processor);
 		leiasr_destroy(mc->session_render.weaver);
 		mc->session_render.weaver = NULL;
 		vk->vkDestroyCommandPool(vk->device, cmd_pool, NULL);
@@ -1410,6 +1428,7 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 	vk_ret = vk->vkAllocateCommandBuffers(vk->device, &cb_alloc_info, mc->session_render.cmd_buffers);
 	if (vk_ret != VK_SUCCESS) {
 		U_LOG_E("Failed to allocate command buffers: %d", vk_ret);
+		xrt_display_processor_destroy(&mc->session_render.display_processor);
 		leiasr_destroy(mc->session_render.weaver);
 		mc->session_render.weaver = NULL;
 		vk->vkDestroyCommandPool(vk->device, cmd_pool, NULL);
@@ -1436,6 +1455,7 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 			for (uint32_t j = 0; j < i; j++) {
 				vk->vkDestroyFence(vk->device, mc->session_render.fences[j], NULL);
 			}
+			xrt_display_processor_destroy(&mc->session_render.display_processor);
 			leiasr_destroy(mc->session_render.weaver);
 			mc->session_render.weaver = NULL;
 			vk->vkDestroyCommandPool(vk->device, cmd_pool, NULL);

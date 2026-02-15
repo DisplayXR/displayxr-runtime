@@ -31,7 +31,7 @@
 #include "d3d/d3d_dxgi_formats.h"
 
 #ifdef XRT_HAVE_LEIA_SR_D3D11
-#include "leiasr/leiasr_d3d11.h"
+#include "leia/leia_sr_d3d11.h"
 #endif
 
 #define WIN32_LEAN_AND_MEAN
