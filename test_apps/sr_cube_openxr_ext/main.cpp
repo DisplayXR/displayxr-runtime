@@ -453,8 +453,33 @@ static void RenderOneFrame(RenderState& rs) {
                             monoProjMatrix = leftProjMatrix;  // Close enough for 2D
                             monoFov = rawViews[0].fov;
                         }
-                        // View matrix: use LocateViews result for center eye
-                        monoViewMatrix = leftViewMatrix;  // Recomputed from center position by LocateViews
+                        // Build center-eye view matrix from scratch (same transform as LocateViews):
+                        // 1. Start from center eye in display/local space (monoPose)
+                        // 2. Apply player locomotion transform (position + yaw/pitch + zoom)
+                        // 3. Invert to get view matrix
+                        {
+                            XMVECTOR centerLocalPos = XMVectorSet(
+                                monoPose.position.x, monoPose.position.y, monoPose.position.z, 0.0f);
+                            XMVECTOR localOri = XMVectorSet(
+                                rawViews[0].pose.orientation.x, rawViews[0].pose.orientation.y,
+                                rawViews[0].pose.orientation.z, rawViews[0].pose.orientation.w);
+
+                            float zoomS = g_inputState.zoomScale;
+                            XMVECTOR playerOri = XMQuaternionRotationRollPitchYaw(
+                                g_inputState.pitch, g_inputState.yaw, 0);
+                            XMVECTOR playerPos = XMVectorSet(
+                                g_inputState.cameraPosX, g_inputState.cameraPosY,
+                                g_inputState.cameraPosZ, 0.0f);
+
+                            XMVECTOR worldPos = XMVector3Rotate(centerLocalPos / zoomS, playerOri) + playerPos;
+                            XMVECTOR worldOri = XMQuaternionMultiply(localOri, playerOri);
+
+                            // View matrix = inverse pose: transposed rotation * negated translation
+                            XMMATRIX rot = XMMatrixTranspose(XMMatrixRotationQuaternion(worldOri));
+                            XMFLOAT3 wp;
+                            XMStoreFloat3(&wp, worldPos);
+                            monoViewMatrix = XMMatrixTranslation(-wp.x, -wp.y, -wp.z) * rot;
+                        }
                     }
 
                     // Render each view (1 for mono, 2 for stereo)
