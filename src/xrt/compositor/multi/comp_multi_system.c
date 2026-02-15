@@ -1904,6 +1904,12 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 
 	// Perform display processing (SR weaving via generic display processor interface)
 	if (mc->session_render.display_processor != NULL) {
+		static bool dp_logged = false;
+		if (!dp_logged) {
+			U_LOG_W("[per-session] Vulkan weaving via display processor interface");
+			dp_logged = true;
+		}
+
 		xrt_display_processor_process_views(
 		    mc->session_render.display_processor,
 		    cmd,
@@ -1917,6 +1923,12 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 		    framebufferHeight,
 		    (VkFormat_XDP)framebufferFormat);
 	} else {
+		static bool fallback_logged = false;
+		if (!fallback_logged) {
+			U_LOG_W("[per-session] Vulkan weaving via direct SR call (display processor unavailable)");
+			fallback_logged = true;
+		}
+
 		leiasr_weave(weaver, cmd, weaveLeft, weaveRight, viewport, weaveWidth, weaveHeight, imageFormat,
 		             framebuffer, (int)framebufferWidth, (int)framebufferHeight, framebufferFormat);
 	}

@@ -616,6 +616,12 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 
 	// Use generic display processor for weaving (vendor-agnostic path)
 	if (!is_mono && c->display_processor != NULL) {
+		static bool dp_logged = false;
+		if (!dp_logged) {
+			U_LOG_W("D3D11 weaving via display processor interface");
+			dp_logged = true;
+		}
+
 		void *stereo_srv = comp_d3d11_renderer_get_stereo_srv(c->renderer);
 
 		uint32_t view_width, view_height;
@@ -632,6 +638,11 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 #ifdef XRT_HAVE_LEIA_SR_D3D11
 	// Fallback: direct SR weaver call if display processor not available
 	else if (!is_mono && c->weaver != nullptr && leiasr_d3d11_is_ready(c->weaver)) {
+		static bool fallback_dp_logged = false;
+		if (!fallback_dp_logged) {
+			U_LOG_W("D3D11 weaving via direct SR call (display processor unavailable)");
+			fallback_dp_logged = true;
+		}
 		void *stereo_srv = comp_d3d11_renderer_get_stereo_srv(c->renderer);
 
 		uint32_t view_width, view_height;
