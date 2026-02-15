@@ -22,9 +22,11 @@
 #include "util/u_pacing.h"
 #include "util/comp_target_service.h"
 
-#ifdef XRT_HAVE_LEIA_SR_VULKAN
-// Use xrt_vulkan_includes.h instead of vulkan.h directly to ensure VK_NO_PROTOTYPES is defined
+// Vulkan types needed for Y-flip SBS image and display processor support
+// (comp_multi always links aux_vk, so Vulkan is always available)
 #include "xrt/xrt_vulkan_includes.h"
+
+#ifdef XRT_HAVE_LEIA_SR_VULKAN
 #include "render/render_interface.h"
 #endif
 
@@ -283,7 +285,10 @@ struct multi_compositor
 
 		//! @}
 
+#endif // XRT_HAVE_LEIA_SR_VULKAN
+
 		//! @name SBS (side-by-side) flip image for GL textures (Y-flip + stereo packing)
+		//! Used by any display processor, not Leia-specific.
 		//! @{
 		VkImage flip_sbs_image;          //!< Single SBS image (2*eye_width x eye_height)
 		VkDeviceMemory flip_sbs_memory;
@@ -293,8 +298,6 @@ struct multi_compositor
 		VkFormat flip_format;
 		bool flip_initialized;
 		//! @}
-
-#endif
 
 #ifdef XRT_OS_WINDOWS
 		//! Self-created window when no external HWND provided (Windows only)

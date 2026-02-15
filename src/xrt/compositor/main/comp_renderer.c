@@ -174,8 +174,9 @@ struct comp_renderer
 
 #ifdef XRT_HAVE_LEIA_SR_VULKAN
 	struct leiasr* leiasr;
+#endif // XRT_HAVE_LEIA_SR_VULKAN
 
-	//! Intermediate images for Y-flipping GL textures before SR weaving
+	//! Intermediate images for Y-flipping GL textures before display processing
 	struct
 	{
 		VkImage images[2];
@@ -186,7 +187,6 @@ struct comp_renderer
 		VkFormat format;
 		bool initialized;
 	} flip;
-#endif // XRT_HAVE_LEIA_SR_VULKAN
 };
 
 
@@ -932,7 +932,7 @@ renderer_fini(struct comp_renderer *r)
 	// Destroy generic display processor before vendor-specific resources
 	xrt_display_processor_destroy(&r->display_processor);
 
-#ifdef XRT_HAVE_LEIA_SR_VULKAN
+	// Destroy flip images (used for GL texture Y-flip before display processing)
 	if (r->flip.initialized) {
 		for (int i = 0; i < 2; i++) {
 			if (r->flip.views[i] != VK_NULL_HANDLE)
@@ -944,6 +944,8 @@ renderer_fini(struct comp_renderer *r)
 		}
 		r->flip.initialized = false;
 	}
+
+#ifdef XRT_HAVE_LEIA_SR_VULKAN
 	leiasr_destroy(r->leiasr);
 #endif // XRT_HAVE_LEIA_SR_VULKAN
 }
@@ -976,9 +978,8 @@ static bool getLayerInfo(struct comp_renderer *r, int view_index, int* width, in
 	return true;
 }
 
-#ifdef XRT_HAVE_LEIA_SR_VULKAN
 /*!
- * Lazily create intermediate images for Y-flipping GL textures before SR weaving.
+ * Lazily create intermediate images for Y-flipping GL textures before display processing.
  * Uses vkCmdBlitImage with swapped source Y offsets to produce correctly-oriented images.
  */
 static bool
@@ -1037,6 +1038,7 @@ ensure_flip_images(struct comp_renderer *r, struct vk_bundle *vk, int width, int
 
 /*!
  * Blit a source swapchain image into a flip intermediate image with Y-flipped coordinates.
+ * Used for GL textures (Y-up) before feeding to any display processor (expects Y-down).
  * The source image is transitioned SRC→TRANSFER_SRC→SRC and the dest is transitioned
  * UNDEFINED→TRANSFER_DST→SHADER_READ_ONLY.
  */
@@ -1119,7 +1121,6 @@ blit_flip_eye(struct vk_bundle *vk,
 	                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
 	                         0, 0, NULL, 0, NULL, 2, post_barriers);
 }
-#endif // XRT_HAVE_LEIA_SR_VULKAN
 
 static void
 do_weaving(struct comp_renderer *r,
@@ -1186,7 +1187,6 @@ do_weaving(struct comp_renderer *r,
 
 			render_gfx_begin(render);
 
-#ifdef XRT_HAVE_LEIA_SR_VULKAN
 			// If the projection layer has flip_y (e.g. OpenGL textures with bottom-left origin),
 			// blit into intermediate images with flipped Y before passing to display processor.
 			if (layer->data.flip_y) {
@@ -1210,7 +1210,6 @@ do_weaving(struct comp_renderer *r,
 					weaveRight = r->flip.views[1];
 				}
 			}
-#endif // XRT_HAVE_LEIA_SR_VULKAN
 
 			xrt_display_processor_process_views(
 			    r->display_processor,

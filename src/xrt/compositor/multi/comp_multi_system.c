@@ -38,10 +38,12 @@
 #include "util/comp_swapchain.h"
 #include "util/comp_render_helpers.h"
 
+// Vulkan helpers needed for Y-flip SBS blit (not Leia-specific)
+#include "vk/vk_helpers.h"
+
 #ifdef XRT_HAVE_LEIA_SR_VULKAN
 #include "leia/leia_sr.h"
 #include "render/render_interface.h"
-#include "vk/vk_helpers.h"
 #endif
 
 #ifdef XRT_OS_WINDOWS
@@ -1462,10 +1464,12 @@ recreate_session_swapchain(struct multi_compositor *mc, struct vk_bundle *vk)
 
 }
 
+#endif // XRT_HAVE_LEIA_SR_VULKAN (temporarily close for generic Y-flip functions)
+
 /*!
- * Ensure the SBS (side-by-side) flip image exists for Y-flipping GL textures before weaving.
+ * Ensure the SBS (side-by-side) flip image exists for Y-flipping GL textures before display processing.
  * Allocates a single image of (eye_width*2, eye_height) with TRANSFER_DST + SAMPLED usage.
- * Both eyes are blitted side-by-side into this image, matching the SR weaver's SBS stereo mode.
+ * Both eyes are blitted side-by-side into this image, matching the display processor's SBS stereo mode.
  * Recreates if size or format changed.
  */
 static bool
@@ -1631,6 +1635,8 @@ session_blit_sbs(struct vk_bundle *vk,
 	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
 	                         NULL, 0, NULL, 3, post_barriers);
 }
+
+#ifdef XRT_HAVE_LEIA_SR_VULKAN // reopen for Leia-specific per-session rendering
 
 /*!
  * Render a single per-session client to its own comp_target using SR weaving.

@@ -28,6 +28,9 @@
 #include "multi/comp_multi_private.h"
 #include "main/comp_compositor.h"
 
+// Vulkan helpers needed for Y-flip SBS cleanup (not Leia-specific)
+#include "vk/vk_helpers.h"
+
 #ifdef XRT_HAVE_LEIA_SR_VULKAN
 #include "leia/leia_sr.h"
 #include "leia/leia_display_processor.h"
@@ -1120,20 +1123,6 @@ multi_compositor_destroy(struct xrt_compositor *xc)
 			mc->session_render.composite_initialized = false;
 		}
 
-		// Destroy SBS flip image (used for GL texture Y-flip + SBS packing before weaving)
-		if (vk != NULL && mc->session_render.flip_initialized) {
-			if (mc->session_render.flip_sbs_view != VK_NULL_HANDLE) {
-				vk->vkDestroyImageView(vk->device, mc->session_render.flip_sbs_view, NULL);
-			}
-			if (mc->session_render.flip_sbs_image != VK_NULL_HANDLE) {
-				vk->vkDestroyImage(vk->device, mc->session_render.flip_sbs_image, NULL);
-			}
-			if (mc->session_render.flip_sbs_memory != VK_NULL_HANDLE) {
-				vk->vkFreeMemory(vk->device, mc->session_render.flip_sbs_memory, NULL);
-			}
-			mc->session_render.flip_initialized = false;
-		}
-
 		// Destroy fences
 		if (vk != NULL && mc->session_render.fences != NULL) {
 			for (uint32_t i = 0; i < mc->session_render.buffer_count; i++) {
@@ -1183,6 +1172,20 @@ multi_compositor_destroy(struct xrt_compositor *xc)
 			mc->session_render.weaver_cmd_pool = VK_NULL_HANDLE;
 		}
 #endif
+		// Destroy SBS flip image (Y-flip before display processing — not vendor-specific)
+		{
+			struct vk_bundle *flip_vk = comp_target_service_get_vk(mc->msc->target_service);
+			if (flip_vk != NULL && mc->session_render.flip_initialized) {
+				if (mc->session_render.flip_sbs_view != VK_NULL_HANDLE)
+					flip_vk->vkDestroyImageView(flip_vk->device, mc->session_render.flip_sbs_view, NULL);
+				if (mc->session_render.flip_sbs_image != VK_NULL_HANDLE)
+					flip_vk->vkDestroyImage(flip_vk->device, mc->session_render.flip_sbs_image, NULL);
+				if (mc->session_render.flip_sbs_memory != VK_NULL_HANDLE)
+					flip_vk->vkFreeMemory(flip_vk->device, mc->session_render.flip_sbs_memory, NULL);
+				mc->session_render.flip_initialized = false;
+			}
+		}
+
 		if (mc->session_render.target != NULL && mc->msc->target_service != NULL) {
 			comp_target_service_destroy(mc->msc->target_service, &mc->session_render.target);
 		}
