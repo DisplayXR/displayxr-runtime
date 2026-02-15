@@ -931,7 +931,11 @@ static bool getLayerInfo(struct comp_renderer *r, int view_index, int* width, in
 	const struct xrt_layer_data *layer_data = &theLayer->data;
 	if (layer_data->type != XRT_LAYER_PROJECTION && layer_data->type != XRT_LAYER_PROJECTION_DEPTH)
 		return false;
-	
+
+	// Bounds check: view_index must be within layer's view_count.
+	if ((uint32_t)view_index >= layer_data->view_count)
+		return false;
+
 	const struct xrt_layer_projection_view_data *vd = NULL;
 	view_index_to_projection_data(view_index, layer_data, &vd);
 
@@ -1217,25 +1221,54 @@ dispatch_graphics(struct comp_renderer *r,
 	// Resources for the distortion render target.
 	struct render_gfx_target_resources *rtr = &r->rtr_array[r->acquired_buffer];
 
+	// Detect mono from first projection layer's view_count.
+	// Mono submission (view_count == 1) means 2D display mode — single view,
+	// full-width viewport, no stereo interlacing/weaving.
+	bool is_mono = false;
+	for (uint32_t i = 0; i < layer_count; i++) {
+		if (layers[i].data.type == XRT_LAYER_PROJECTION ||
+		    layers[i].data.type == XRT_LAYER_PROJECTION_DEPTH) {
+			is_mono = (layers[i].data.view_count == 1);
+			break;
+		}
+	}
+
+	// For mono: override frame state to single view so all downstream
+	// loops (squash, distortion, target) iterate once for view 0 only.
+	uint32_t effective_view_count = is_mono ? 1 : render->r->view_count;
+	if (is_mono) {
+		frame_state->view_count = 1;
+	}
+
 	// Viewport information.
 	struct render_viewport_data viewport_datas[XRT_MAX_VIEWS];
-	calc_viewport_data(r, viewport_datas, render->r->view_count);
+	if (is_mono) {
+		// Mono: single viewport covering the full render target.
+		viewport_datas[0] = (struct render_viewport_data){
+		    .x = 0,
+		    .y = 0,
+		    .w = r->c->target->width,
+		    .h = r->c->target->height,
+		};
+	} else {
+		calc_viewport_data(r, viewport_datas, render->r->view_count);
+	}
 
 	// Vertex rotation information.
 	struct xrt_matrix_2x2 vertex_rots[XRT_MAX_VIEWS];
-	calc_vertex_rot_data(r, vertex_rots, render->r->view_count);
+	calc_vertex_rot_data(r, vertex_rots, effective_view_count);
 
 	// Device view information.
 	struct xrt_fov fovs[XRT_MAX_VIEWS];
 	struct xrt_pose world_poses[XRT_MAX_VIEWS];
 	struct xrt_pose eye_poses[XRT_MAX_VIEWS];
-	calc_pose_data(             //
-	    r,                      //
-	    fov_source,             //
-	    fovs,                   //
-	    world_poses,            //
-	    eye_poses,              //
-	    render->r->view_count); //
+	calc_pose_data(                //
+	    r,                         //
+	    fov_source,                //
+	    fovs,                      //
+	    world_poses,               //
+	    eye_poses,                 //
+	    effective_view_count);     //
 
 	// Does everything.
 	chl_frame_state_gfx_default_pipeline( //
@@ -1250,8 +1283,10 @@ dispatch_graphics(struct comp_renderer *r,
 	    viewport_datas,                   //
 	    vertex_rots);                     //
 
-	// Weave.
-	do_weaving(r, render, rtr, layers, frame_state);
+	// Weave — skip for mono (display is in 2D mode, no interlacing needed).
+	if (!is_mono) {
+		do_weaving(r, render, rtr, layers, frame_state);
+	}
 
 	// Everything is ready, submit to the queue.
 	ret = renderer_submit_queue(r, render->r->cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
@@ -1285,17 +1320,32 @@ dispatch_compute(struct comp_renderer *r,
 	const struct comp_layer *layers = c->base.layer_accum.layers;
 	uint32_t layer_count = c->base.layer_accum.layer_count;
 
+	// Detect mono from first projection layer's view_count.
+	bool is_mono = false;
+	for (uint32_t i = 0; i < layer_count; i++) {
+		if (layers[i].data.type == XRT_LAYER_PROJECTION ||
+		    layers[i].data.type == XRT_LAYER_PROJECTION_DEPTH) {
+			is_mono = (layers[i].data.view_count == 1);
+			break;
+		}
+	}
+
+	uint32_t effective_view_count = is_mono ? 1 : render->r->view_count;
+	if (is_mono) {
+		frame_state->view_count = 1;
+	}
+
 	// Device view information.
 	struct xrt_fov fovs[XRT_MAX_VIEWS];
 	struct xrt_pose world_poses[XRT_MAX_VIEWS];
 	struct xrt_pose eye_poses[XRT_MAX_VIEWS];
-	calc_pose_data(             //
-	    r,                      //
-	    fov_source,             //
-	    fovs,                   //
-	    world_poses,            //
-	    eye_poses,              //
-	    render->r->view_count); //
+	calc_pose_data(                //
+	    r,                         //
+	    fov_source,                //
+	    fovs,                      //
+	    world_poses,               //
+	    eye_poses,                 //
+	    effective_view_count);     //
 
 	// Target Vulkan resources..
 	VkImage target_image = r->c->target->images[r->acquired_buffer].handle;
@@ -1303,7 +1353,16 @@ dispatch_compute(struct comp_renderer *r,
 
 	// Target view information.
 	struct render_viewport_data target_viewport_datas[XRT_MAX_VIEWS];
-	calc_viewport_data(r, target_viewport_datas, render->r->view_count);
+	if (is_mono) {
+		target_viewport_datas[0] = (struct render_viewport_data){
+		    .x = 0,
+		    .y = 0,
+		    .w = r->c->target->width,
+		    .h = r->c->target->height,
+		};
+	} else {
+		calc_viewport_data(r, target_viewport_datas, render->r->view_count);
+	}
 
 	// Does everything.
 	chl_frame_state_cs_default_pipeline( //
