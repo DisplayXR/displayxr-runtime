@@ -311,13 +311,13 @@ if(XRT_HAVE_CNSDK)
 endif()
 
 if(XRT_HAVE_LEIA_SR)
-	if(NOT TARGET drv_leiasr)
-		message(FATAL_ERROR "no drv_leiasr target")
+	if(NOT TARGET drv_leia)
+		message(FATAL_ERROR "no drv_leia target")
 	endif()
 
-	# drv_leiasr exports XRT_HAVE_LEIA_SR_VULKAN and/or XRT_HAVE_LEIA_SR_D3D11
+	# drv_leia exports XRT_HAVE_LEIA_SR_VULKAN and/or XRT_HAVE_LEIA_SR_D3D11
 	# as PUBLIC compile definitions based on available SR libraries
-	target_link_libraries(comp_main PUBLIC drv_leiasr)
+	target_link_libraries(comp_main PUBLIC drv_leia)
 endif()
 
 ###
@@ -365,9 +365,9 @@ target_link_libraries(
 target_include_directories(comp_multi PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 # Link comp_multi to leiasr driver for per-session SR weaver creation
-# drv_leiasr exports XRT_HAVE_LEIA_SR_VULKAN as PUBLIC when Vulkan SR is available
+# drv_leia exports XRT_HAVE_LEIA_SR_VULKAN as PUBLIC when Vulkan SR is available
 if(XRT_HAVE_LEIA_SR)
-	target_link_libraries(comp_multi PRIVATE drv_leiasr)
+	target_link_libraries(comp_multi PRIVATE drv_leia)
 endif()
 
 # Link comp_multi to shared Win32 window for self-owned window creation

@@ -4,10 +4,10 @@
  * @file
  * @brief  Leia SR D3D11 weaver wrapper implementation.
  * @author David Fattal
- * @ingroup drv_leiasr
+ * @ingroup drv_leia
  */
 
-#include "leiasr_d3d11.h"
+#include "leia_sr_d3d11.h"
 #include "util/u_logging.h"
 #include "os/os_time.h"
 

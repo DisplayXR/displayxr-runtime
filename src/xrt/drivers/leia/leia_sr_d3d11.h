@@ -4,13 +4,13 @@
  * @file
  * @brief  Leia SR D3D11 weaver wrapper for native D3D11 compositor.
  * @author David Fattal
- * @ingroup drv_leiasr
+ * @ingroup drv_leia
  */
 
 #pragma once
 
 #include "xrt/xrt_results.h"
-#include "leiasr_types.h"
+#include "leia_types.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -38,7 +38,7 @@ struct leiasr_d3d11;
  *
  * @return XRT_SUCCESS on success.
  *
- * @ingroup drv_leiasr
+ * @ingroup drv_leia
  */
 xrt_result_t
 leiasr_d3d11_create(double max_time,
@@ -54,7 +54,7 @@ leiasr_d3d11_create(double max_time,
  *
  * @param leiasr The instance to destroy (can be NULL).
  *
- * @ingroup drv_leiasr
+ * @ingroup drv_leia
  */
 void
 leiasr_d3d11_destroy(struct leiasr_d3d11 **leiasr_ptr);
@@ -68,7 +68,7 @@ leiasr_d3d11_destroy(struct leiasr_d3d11 **leiasr_ptr);
  * @param view_height Height of the views.
  * @param format DXGI format of the texture.
  *
- * @ingroup drv_leiasr
+ * @ingroup drv_leia
  */
 void
 leiasr_d3d11_set_input_texture(struct leiasr_d3d11 *leiasr,
@@ -87,7 +87,7 @@ leiasr_d3d11_set_input_texture(struct leiasr_d3d11 *leiasr,
  *
  * @param leiasr The D3D11 weaver instance.
  *
- * @ingroup drv_leiasr
+ * @ingroup drv_leia
  */
 void
 leiasr_d3d11_weave(struct leiasr_d3d11 *leiasr);
@@ -101,7 +101,7 @@ leiasr_d3d11_weave(struct leiasr_d3d11 *leiasr);
  *
  * @return true if valid eye positions are available.
  *
- * @ingroup drv_leiasr
+ * @ingroup drv_leia
  */
 bool
 leiasr_d3d11_get_predicted_eye_positions(struct leiasr_d3d11 *leiasr,
@@ -115,7 +115,7 @@ leiasr_d3d11_get_predicted_eye_positions(struct leiasr_d3d11 *leiasr,
  * @param read_srgb Convert from sRGB to linear when reading input.
  * @param write_srgb Convert from linear to sRGB when writing output.
  *
- * @ingroup drv_leiasr
+ * @ingroup drv_leia
  */
 void
 leiasr_d3d11_set_srgb_conversion(struct leiasr_d3d11 *leiasr,
@@ -128,7 +128,7 @@ leiasr_d3d11_set_srgb_conversion(struct leiasr_d3d11 *leiasr,
  * @param leiasr The D3D11 weaver instance.
  * @param latency_frames Number of frames of latency to predict for.
  *
- * @ingroup drv_leiasr
+ * @ingroup drv_leia
  */
 void
 leiasr_d3d11_set_latency_in_frames(struct leiasr_d3d11 *leiasr,
@@ -140,7 +140,7 @@ leiasr_d3d11_set_latency_in_frames(struct leiasr_d3d11 *leiasr,
  * @param leiasr The D3D11 weaver instance.
  * @return true if the weaver is ready.
  *
- * @ingroup drv_leiasr
+ * @ingroup drv_leia
  */
 bool
 leiasr_d3d11_is_ready(struct leiasr_d3d11 *leiasr);
@@ -153,7 +153,7 @@ leiasr_d3d11_is_ready(struct leiasr_d3d11 *leiasr);
  * @param hwnd Window handle to check (HWND).
  * @return true if the window is valid and on a monitor.
  *
- * @ingroup drv_leiasr
+ * @ingroup drv_leia
  */
 bool
 leiasr_d3d11_check_window_valid(struct leiasr_d3d11 *leiasr, void *hwnd);
@@ -166,7 +166,7 @@ leiasr_d3d11_check_window_valid(struct leiasr_d3d11 *leiasr, void *hwnd);
  * @param[out] out_dims Pointer to receive the display dimensions (in meters).
  * @return true if valid display dimensions are available, false otherwise.
  *
- * @ingroup drv_leiasr
+ * @ingroup drv_leia
  */
 bool
 leiasr_d3d11_get_display_dimensions(struct leiasr_d3d11 *leiasr, struct leiasr_display_dimensions *out_dims);
@@ -184,7 +184,7 @@ leiasr_d3d11_get_display_dimensions(struct leiasr_d3d11 *leiasr, struct leiasr_d
  * @param[out] out_display_height_m Display physical height in meters.
  * @return true if all values are valid.
  *
- * @ingroup drv_leiasr
+ * @ingroup drv_leia
  */
 bool
 leiasr_d3d11_get_display_pixel_info(struct leiasr_d3d11 *leiasr,
@@ -205,7 +205,7 @@ leiasr_d3d11_get_display_pixel_info(struct leiasr_d3d11 *leiasr,
  * @param[out] out_height Recommended height per view.
  * @return true if valid dimensions are available, false otherwise.
  *
- * @ingroup drv_leiasr
+ * @ingroup drv_leia
  */
 bool
 leiasr_d3d11_get_recommended_view_dimensions(struct leiasr_d3d11 *leiasr,
@@ -228,7 +228,7 @@ leiasr_d3d11_get_recommended_view_dimensions(struct leiasr_d3d11 *leiasr,
  * @param[out] out_native_height Native display height in pixels (NULL to skip).
  * @return true if valid dimensions were obtained, false otherwise.
  *
- * @ingroup drv_leiasr
+ * @ingroup drv_leia
  */
 bool
 leiasr_query_recommended_view_dimensions(double max_time,
@@ -250,7 +250,7 @@ leiasr_query_recommended_view_dimensions(double max_time,
  *
  * @return true if valid eye positions are available.
  *
- * @ingroup drv_leiasr
+ * @ingroup drv_leia
  */
 bool
 leiasr_static_get_predicted_eye_positions(float out_left_eye[3],
@@ -265,7 +265,7 @@ leiasr_static_get_predicted_eye_positions(float out_left_eye[3],
  * @param[out] out_dims Pointer to receive the display dimensions (in meters).
  * @return true if valid display dimensions are available, false otherwise.
  *
- * @ingroup drv_leiasr
+ * @ingroup drv_leia
  */
 bool
 leiasr_static_get_display_dimensions(struct leiasr_display_dimensions *out_dims);
@@ -277,7 +277,7 @@ leiasr_static_get_display_dimensions(struct leiasr_display_dimensions *out_dims)
  * @param enable_3d true to switch to 3D mode, false for 2D mode.
  * @return true on success.
  *
- * @ingroup drv_leiasr
+ * @ingroup drv_leia
  */
 bool
 leiasr_d3d11_request_display_mode(struct leiasr_d3d11 *leiasr, bool enable_3d);
@@ -288,7 +288,7 @@ leiasr_d3d11_request_display_mode(struct leiasr_d3d11 *leiasr, bool enable_3d);
  * @param leiasr The D3D11 weaver instance.
  * @return true if SwitchableLensHint is available.
  *
- * @ingroup drv_leiasr
+ * @ingroup drv_leia
  */
 bool
 leiasr_d3d11_supports_display_mode_switch(struct leiasr_d3d11 *leiasr);

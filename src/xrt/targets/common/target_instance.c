@@ -36,7 +36,7 @@
 // SR display dimension query for proper swapchain dimensions
 #ifdef XRT_HAVE_LEIA_SR
 #include "xrt/xrt_compositor.h"
-#include "leiasr/leiasr_d3d11.h"
+#include "leia/leia_sr_d3d11.h"
 #endif
 
 #include "target_instance_parts.h"

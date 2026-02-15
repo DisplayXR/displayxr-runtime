@@ -56,8 +56,11 @@
 #endif
 
 #ifdef XRT_HAVE_LEIA_SR_VULKAN
-#include "leiasr/leiasr.h"
+#include "leia/leia_sr.h"
+#include "leia/leia_display_processor.h"
 #endif
+
+#include "xrt/xrt_display_processor.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -162,8 +165,12 @@ struct comp_renderer
 
 	//! @}
 
+	//! Generic display output processor (interlacing, SBS, etc.).
+	//! If NULL, standard Monado distortion is used.
+	struct xrt_display_processor *display_processor;
+
 	struct leia_core* cnsdk;
-    struct leia_interlacer* interlacer;
+	struct leia_interlacer* interlacer;
 
 #ifdef XRT_HAVE_LEIA_SR_VULKAN
 	struct leiasr* leiasr;
@@ -606,6 +613,15 @@ renderer_init(struct comp_renderer *r, struct comp_compositor *c, VkExtent2D scr
 		COMP_WARN(c, "Failed to create SR Vulkan weaver, continuing without interlacing");
 		r->leiasr = NULL;
 	}
+
+	// Wrap the SR weaver in a generic display processor
+	if (r->leiasr != NULL) {
+		xrt_result_t dp_ret = leia_display_processor_create(r->leiasr, &r->display_processor);
+		if (dp_ret != XRT_SUCCESS) {
+			COMP_WARN(c, "Failed to create SR display processor wrapper");
+			r->display_processor = NULL;
+		}
+	}
 #endif // XRT_HAVE_LEIA_SR_VULKAN
 
 	VkResult ret = comp_mirror_init( //
@@ -913,6 +929,9 @@ renderer_fini(struct comp_renderer *r)
 	leia_platform_on_library_unload();
 #endif // XRT_HAVE_CNSDK
 
+	// Destroy generic display processor before vendor-specific resources
+	xrt_display_processor_destroy(&r->display_processor);
+
 #ifdef XRT_HAVE_LEIA_SR_VULKAN
 	if (r->flip.initialized) {
 		for (int i = 0; i < 2; i++) {
@@ -1139,15 +1158,10 @@ do_weaving(struct comp_renderer *r,
 	}
 #endif
 
-#ifdef XRT_HAVE_LEIA_SR_VULKAN
-
-	// Only weave if SR Vulkan weaver was successfully created
-	if (r->leiasr != NULL) {
-		struct vk_bundle* vk = &r->c->base.vk;
-		struct comp_target* ct = r->c->target;
-		struct comp_compositor* c  = r->c;
-
-		// Get command-buffer
+	// Generic display processor path — routes through xrt_display_processor
+	// interface instead of calling vendor-specific weaving functions directly.
+	if (r->display_processor != NULL) {
+		// Get command buffer.
 		VkCommandBuffer commandBuffer = render->r->cmd;
 
 		// Get framebuffer.
@@ -1165,26 +1179,19 @@ do_weaving(struct comp_renderer *r,
 		bool leftViewOk = getLayerInfo(r, 0, &imageWidth, &imageHeight, &imageFormat, &leftImageView);
 		bool rightViewOk = getLayerInfo(r, 1, &imageWidth, &imageHeight, &imageFormat, &rightImageView);
 
-		// Get viewport (fullscreen).
-		VkRect2D viewport = {0};
-		viewport.offset.x = 0;
-		viewport.offset.y = 0;
-		viewport.extent.width = framebufferWidth;
-		viewport.extent.height = framebufferHeight;
-
-		// Weave.
-		if (leftViewOk && rightViewOk)
-		{
+		// Process views through the display processor.
+		if (leftViewOk && rightViewOk) {
 			VkImageView weaveLeft = leftImageView;
 			VkImageView weaveRight = rightImageView;
 
 			render_gfx_begin(render);
 
+#ifdef XRT_HAVE_LEIA_SR_VULKAN
 			// If the projection layer has flip_y (e.g. OpenGL textures with bottom-left origin),
-			// blit into intermediate images with flipped Y before passing to SR weaver.
+			// blit into intermediate images with flipped Y before passing to display processor.
 			if (layer->data.flip_y) {
+				struct vk_bundle *vk = &r->c->base.vk;
 				if (ensure_flip_images(r, vk, imageWidth, imageHeight, imageFormat)) {
-					// Get source VkImage handles for the blit
 					const struct xrt_layer_projection_view_data *vd_left = &layer->data.proj.v[0];
 					const struct xrt_layer_projection_view_data *vd_right = &layer->data.proj.v[1];
 					struct comp_swapchain *sc_left =
@@ -1203,13 +1210,23 @@ do_weaving(struct comp_renderer *r,
 					weaveRight = r->flip.views[1];
 				}
 			}
+#endif // XRT_HAVE_LEIA_SR_VULKAN
 
-			leiasr_weave(r->leiasr, commandBuffer, weaveLeft, weaveRight, viewport, imageWidth, imageHeight, imageFormat, framebuffer, framebufferWidth, framebufferHeight, framebufferFormat);
+			xrt_display_processor_process_views(
+			    r->display_processor,
+			    commandBuffer,
+			    weaveLeft,
+			    weaveRight,
+			    (uint32_t)imageWidth,
+			    (uint32_t)imageHeight,
+			    (VkFormat_XDP)imageFormat,
+			    framebuffer,
+			    (uint32_t)framebufferWidth,
+			    (uint32_t)framebufferHeight,
+			    (VkFormat_XDP)framebufferFormat);
 			render_gfx_end(render);
 		}
 	}
-
-#endif // XRT_HAVE_LEIA_SR_VULKAN
 }
 
 /*

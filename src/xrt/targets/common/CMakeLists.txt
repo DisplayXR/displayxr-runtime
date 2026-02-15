@@ -64,6 +64,10 @@ if(XRT_BUILD_DRIVER_XREAL_AIR)
 	target_link_libraries(target_lists PRIVATE drv_xreal_air)
 endif()
 
+# Sim display builder (always available, guards itself via env var)
+target_sources(target_lists PRIVATE target_builder_sim_display.c)
+target_link_libraries(target_lists PRIVATE drv_sim_display)
+
 ###
 # Drivers
 #
@@ -249,7 +253,7 @@ if(XRT_MODULE_COMPOSITOR_MAIN OR XRT_MODULE_COMPOSITOR_NULL)
 
 	# Link SR driver for dimension query when available
 	if(XRT_HAVE_LEIA_SR)
-		target_link_libraries(target_instance PRIVATE drv_leiasr)
+		target_link_libraries(target_instance PRIVATE drv_leia)
 		target_include_directories(target_instance PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../drivers)
 		target_compile_definitions(target_instance PRIVATE XRT_HAVE_LEIA_SR)
 	endif()
@@ -289,7 +293,7 @@ if(XRT_MODULE_COMPOSITOR_MAIN OR XRT_MODULE_COMPOSITOR_NULL)
 
 		# Link SR driver for dimension query when available (hybrid mode)
 		if(XRT_HAVE_LEIA_SR)
-			target_link_libraries(target_instance_hybrid PRIVATE drv_leiasr)
+			target_link_libraries(target_instance_hybrid PRIVATE drv_leia)
 			target_include_directories(target_instance_hybrid PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../drivers)
 			target_compile_definitions(target_instance_hybrid PRIVATE XRT_HAVE_LEIA_SR)
 		endif()

@@ -13,7 +13,7 @@
 #include "xrt/xrt_defines.h"
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_results.h"
-#include "leiasr/leiasr_types.h"
+#include "leia/leia_types.h"
 
 // Forward declarations
 struct comp_d3d11_compositor;

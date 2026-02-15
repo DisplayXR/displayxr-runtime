@@ -55,6 +55,9 @@
 #define T_BUILDER_WMR
 #endif
 
+// Always enabled — sim_display guards itself via SIM_DISPLAY_ENABLE env var
+#define T_BUILDER_SIM_DISPLAY
+
 
 /*
  *
@@ -141,4 +144,12 @@ t_builder_simula_create(void);
  */
 struct xrt_builder *
 t_builder_wmr_create(void);
+#endif
+
+#ifdef T_BUILDER_SIM_DISPLAY
+/*!
+ * Builder for simulated 3D display (SBS/anaglyph/blend output).
+ */
+struct xrt_builder *
+t_builder_sim_display_create(void);
 #endif

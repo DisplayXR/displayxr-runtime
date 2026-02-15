@@ -1,7 +1,7 @@
 #pragma once
 
 #include "xrt/xrt_results.h"
-#include "leiasr_types.h"
+#include "leia_types.h"
 #include <vulkan/vulkan.h>
 
 #ifdef __cplusplus
