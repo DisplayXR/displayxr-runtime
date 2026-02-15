@@ -562,7 +562,9 @@ if(XRT_HAVE_LEIA_SR)
 	if(WIN32 AND XRT_HAVE_D3D11)
 		if(EXISTS "${SR_PATH}/lib/SimulatedRealityDirectX.lib")
 			message(STATUS "Found SimulatedRealityDirectX.lib - enabling D3D11 weaver")
-			list(APPEND LEIA_SOURCES leia/leia_sr_d3d11.cpp leia/leia_sr_d3d11.h)
+			list(APPEND LEIA_SOURCES
+				leia/leia_sr_d3d11.cpp leia/leia_sr_d3d11.h
+				leia/leia_display_processor_d3d11.cpp leia/leia_display_processor_d3d11.h)
 			set(LEIA_SR_D3D11_AVAILABLE TRUE)
 		else()
 			message(STATUS "SimulatedRealityDirectX.lib not found - D3D11 weaver disabled")

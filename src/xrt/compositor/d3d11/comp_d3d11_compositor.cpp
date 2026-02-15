@@ -32,8 +32,11 @@
 #include "xrt/xrt_system.h"
 #endif
 
+#include "xrt/xrt_display_processor_d3d11.h"
+
 #ifdef XRT_HAVE_LEIA_SR_D3D11
 #include "leia/leia_sr_d3d11.h"
+#include "leia/leia_display_processor_d3d11.h"
 #endif
 
 #define WIN32_LEAN_AND_MEAN
@@ -92,6 +95,9 @@ struct comp_d3d11_compositor
 	//! SR weaver for light field display.
 	struct leiasr_d3d11 *weaver;
 #endif
+
+	//! Generic D3D11 display processor (vendor-agnostic weaving).
+	struct xrt_display_processor_d3d11 *display_processor;
 
 #ifdef XRT_FEATURE_DEBUG_GUI
 	//! Debug GUI window.
@@ -608,25 +614,35 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 
 	bool weaving_done = false;
 
-#ifdef XRT_HAVE_LEIA_SR_D3D11
-	// Skip weaving for mono — display is in 2D mode, no interlacing needed
-	if (!is_mono && c->weaver != nullptr && leiasr_d3d11_is_ready(c->weaver)) {
-		// Get stereo texture SRV from renderer
+	// Use generic display processor for weaving (vendor-agnostic path)
+	if (!is_mono && c->display_processor != NULL) {
 		void *stereo_srv = comp_d3d11_renderer_get_stereo_srv(c->renderer);
 
-		// Get view dimensions (single eye width - stereo texture is 2x this width)
 		uint32_t view_width, view_height;
 		comp_d3d11_renderer_get_view_dimensions(c->renderer, &view_width, &view_height);
 
-		// Get target dimensions for viewport
 		uint32_t target_width, target_height;
 		comp_d3d11_target_get_dimensions(c->target, &target_width, &target_height);
 
-		// Set input texture for weaving (view_width is single eye, weaver handles side-by-side)
+		xrt_display_processor_d3d11_process_stereo(
+		    c->display_processor, c->context, stereo_srv, view_width, view_height,
+		    DXGI_FORMAT_R8G8B8A8_UNORM, target_width, target_height);
+		weaving_done = true;
+	}
+#ifdef XRT_HAVE_LEIA_SR_D3D11
+	// Fallback: direct SR weaver call if display processor not available
+	else if (!is_mono && c->weaver != nullptr && leiasr_d3d11_is_ready(c->weaver)) {
+		void *stereo_srv = comp_d3d11_renderer_get_stereo_srv(c->renderer);
+
+		uint32_t view_width, view_height;
+		comp_d3d11_renderer_get_view_dimensions(c->renderer, &view_width, &view_height);
+
+		uint32_t target_width, target_height;
+		comp_d3d11_target_get_dimensions(c->target, &target_width, &target_height);
+
 		leiasr_d3d11_set_input_texture(c->weaver, stereo_srv, view_width, view_height,
 		                                DXGI_FORMAT_R8G8B8A8_UNORM);
 
-		// Set viewport for weaving
 		D3D11_VIEWPORT viewport = {};
 		viewport.TopLeftX = 0.0f;
 		viewport.TopLeftY = 0.0f;
@@ -636,7 +652,6 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		viewport.MaxDepth = 1.0f;
 		c->context->RSSetViewports(1, &viewport);
 
-		// Perform weaving
 		leiasr_d3d11_weave(c->weaver);
 		weaving_done = true;
 	}
@@ -738,6 +753,9 @@ d3d11_compositor_destroy(struct xrt_compositor *xc)
 		u_debug_gui_stop(&c->debug_gui);
 	}
 #endif
+
+	// Destroy display processor before underlying weaver
+	xrt_display_processor_d3d11_destroy(&c->display_processor);
 
 #ifdef XRT_HAVE_LEIA_SR_D3D11
 	if (c->weaver != nullptr) {
@@ -979,6 +997,16 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 		} else {
 			U_LOG_W("Could not get SR recommended dimensions, using window-derived: %ux%u",
 			        view_width, view_height);
+		}
+
+		// Wrap the SR D3D11 weaver in a generic display processor
+		{
+			xrt_result_t dp_ret = leia_display_processor_d3d11_create(
+			    c->weaver, &c->display_processor);
+			if (dp_ret != XRT_SUCCESS) {
+				U_LOG_W("Failed to create D3D11 display processor, continuing without");
+				c->display_processor = NULL;
+			}
 		}
 	}
 #else
