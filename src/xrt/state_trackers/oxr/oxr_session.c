@@ -214,42 +214,6 @@ oxr_session_get_window_metrics(struct oxr_session *sess,
 	return false;
 }
 
-#ifdef OXR_HAVE_EXT_display_info
-XrResult
-oxr_session_request_display_mode(struct oxr_logger *log, struct oxr_session *sess, bool enable_3d)
-{
-	if (sess == NULL || sess->xcn == NULL) {
-		return oxr_error(log, XR_ERROR_HANDLE_INVALID, "Invalid session");
-	}
-
-	bool success = false;
-
-#if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_NATIVE_COMPOSITOR)
-	if (sess->is_d3d11_native_compositor) {
-		success = comp_d3d11_compositor_request_display_mode(&sess->xcn->base, enable_3d);
-		if (success) {
-			sess->display_mode_3d = enable_3d;
-		}
-		return XR_SUCCESS;
-	}
-#endif
-
-#ifdef XRT_HAVE_LEIA_SR_VULKAN
-	{
-		struct multi_compositor *mc = multi_compositor(&sess->xcn->base);
-		success = multi_compositor_request_display_mode(mc, enable_3d);
-		if (success) {
-			sess->display_mode_3d = enable_3d;
-		}
-		return XR_SUCCESS;
-	}
-#endif
-
-	(void)success;
-	return XR_SUCCESS;
-}
-#endif // OXR_HAVE_EXT_display_info
-
 /*!
  * Compute Kooima asymmetric FOV based on eye position relative to screen.
  *
@@ -324,6 +288,42 @@ compute_kooima_fov(const struct leiasr_eye_position *eye,
 	}
 }
 #endif
+
+#ifdef OXR_HAVE_EXT_display_info
+XrResult
+oxr_session_request_display_mode(struct oxr_logger *log, struct oxr_session *sess, bool enable_3d)
+{
+	if (sess == NULL || sess->xcn == NULL) {
+		return oxr_error(log, XR_ERROR_HANDLE_INVALID, "Invalid session");
+	}
+
+	bool success = false;
+
+#if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_NATIVE_COMPOSITOR)
+	if (sess->is_d3d11_native_compositor) {
+		success = comp_d3d11_compositor_request_display_mode(&sess->xcn->base, enable_3d);
+		if (success) {
+			sess->display_mode_3d = enable_3d;
+		}
+		return XR_SUCCESS;
+	}
+#endif
+
+#ifdef XRT_HAVE_LEIA_SR_VULKAN
+	{
+		struct multi_compositor *mc = multi_compositor(&sess->xcn->base);
+		success = multi_compositor_request_display_mode(mc, enable_3d);
+		if (success) {
+			sess->display_mode_3d = enable_3d;
+		}
+		return XR_SUCCESS;
+	}
+#endif
+
+	(void)success;
+	return XR_SUCCESS;
+}
+#endif // OXR_HAVE_EXT_display_info
 
 static XrResult
 emit_reference_space_change_pending(struct oxr_logger *log,
