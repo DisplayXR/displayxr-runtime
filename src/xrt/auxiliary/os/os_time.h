@@ -22,7 +22,7 @@
 
 #include "util/u_time.h"
 
-#ifdef XRT_OS_LINUX
+#if defined(XRT_OS_LINUX) || defined(XRT_OS_MACOS)
 #include <time.h>
 #include <sys/time.h>
 #define XRT_HAVE_TIMESPEC
@@ -155,9 +155,9 @@ static inline int64_t
 os_timeval_to_ns(struct timeval *val);
 #endif
 
-#if defined(XRT_OS_LINUX) || defined(XRT_DOXYGEN)
+#if defined(XRT_OS_LINUX) || defined(XRT_OS_MACOS) || defined(XRT_DOXYGEN)
 /*!
- * Return a realtime clock in nanoseconds (Linux-only)
+ * Return a realtime clock in nanoseconds
  *
  * @ingroup aux_os_time_extra
  */
@@ -194,7 +194,7 @@ os_ns_per_qpc_tick_get(void);
 static inline void
 os_nanosleep(int64_t nsec)
 {
-#if defined(XRT_OS_LINUX)
+#if defined(XRT_OS_LINUX) || defined(XRT_OS_MACOS)
 	struct timespec spec;
 	spec.tv_sec = (nsec / U_1_000_000_000);
 	spec.tv_nsec = (nsec % U_1_000_000_000);
@@ -279,7 +279,7 @@ os_ns_to_timespec(int64_t ns, struct timespec *spec)
 
 #define OS_NS_PER_USEC (1000)
 
-#if defined(XRT_HAVE_TIMEVAL) && defined(XRT_OS_LINUX)
+#if defined(XRT_HAVE_TIMEVAL) && (defined(XRT_OS_LINUX) || defined(XRT_OS_MACOS))
 
 static inline int64_t
 os_timeval_to_ns(struct timeval *val)
@@ -289,7 +289,7 @@ os_timeval_to_ns(struct timeval *val)
 	ns += (int64_t)val->tv_usec * OS_NS_PER_USEC;
 	return ns;
 }
-#endif // defined(XRT_HAVE_TIMEVAL) && defined(XRT_OS_LINUX)
+#endif // defined(XRT_HAVE_TIMEVAL) && (defined(XRT_OS_LINUX) || defined(XRT_OS_MACOS))
 
 #if defined(XRT_OS_WINDOWS)
 static inline int64_t
@@ -309,7 +309,7 @@ os_ns_per_qpc_tick_get(void)
 static inline int64_t
 os_monotonic_get_ns(void)
 {
-#if defined(XRT_OS_LINUX)
+#if defined(XRT_OS_LINUX) || defined(XRT_OS_MACOS)
 	struct timespec ts;
 	int ret = clock_gettime(CLOCK_MONOTONIC, &ts);
 	if (ret != 0) {
@@ -326,7 +326,7 @@ os_monotonic_get_ns(void)
 #endif
 }
 
-#ifdef XRT_OS_LINUX
+#if defined(XRT_OS_LINUX) || defined(XRT_OS_MACOS)
 static inline int64_t
 os_realtime_get_ns(void)
 {

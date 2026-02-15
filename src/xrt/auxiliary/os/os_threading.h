@@ -22,6 +22,11 @@
 #include <semaphore.h>
 #include <assert.h>
 #define OS_THREAD_HAVE_SETNAME
+#elif defined(XRT_OS_MACOS)
+#include <pthread.h>
+#include <dispatch/dispatch.h>
+#include <assert.h>
+// macOS pthread_setname_np takes 1 arg (sets current thread name only), not 2
 #elif defined(XRT_OS_WINDOWS)
 #include <pthread.h>
 #include <sched.h>
@@ -359,6 +364,75 @@ os_thread_name(struct os_thread *ost, const char *name)
  *
  */
 
+#if defined(XRT_OS_MACOS)
+
+/*!
+ * A wrapper around a native semaphore.
+ * On macOS, uses dispatch_semaphore_t (POSIX semaphores are deprecated).
+ */
+struct os_semaphore
+{
+	dispatch_semaphore_t sem;
+};
+
+/*!
+ * Init.
+ *
+ * @public @memberof os_semaphore
+ */
+static inline int
+os_semaphore_init(struct os_semaphore *os, int count)
+{
+	os->sem = dispatch_semaphore_create(count);
+	return os->sem == NULL ? -1 : 0;
+}
+
+/*!
+ * Release.
+ *
+ * @public @memberof os_semaphore
+ */
+static inline void
+os_semaphore_release(struct os_semaphore *os)
+{
+	dispatch_semaphore_signal(os->sem);
+}
+
+/*!
+ * Wait, if @p timeout_ns is zero then waits forever.
+ *
+ * @public @memberof os_semaphore
+ */
+static inline void
+os_semaphore_wait(struct os_semaphore *os, uint64_t timeout_ns)
+{
+	dispatch_time_t timeout;
+	if (timeout_ns == 0) {
+		timeout = DISPATCH_TIME_FOREVER;
+	} else {
+		timeout = dispatch_time(DISPATCH_TIME_NOW, (int64_t)timeout_ns);
+	}
+	dispatch_semaphore_wait(os->sem, timeout);
+}
+
+/*!
+ * Clean up.
+ *
+ * @public @memberof os_semaphore
+ */
+static inline void
+os_semaphore_destroy(struct os_semaphore *os)
+{
+	// dispatch objects are reference-counted; release our reference.
+	// On macOS 10.8+ with ARC disabled, dispatch_release is still needed.
+	if (os->sem != NULL) {
+		dispatch_release(os->sem);
+		os->sem = NULL;
+	}
+}
+
+#else // !XRT_OS_MACOS
+
 /*!
  * A wrapper around a native semaphore.
  */
@@ -449,6 +523,8 @@ os_semaphore_destroy(struct os_semaphore *os)
 {
 	sem_destroy(&os->sem);
 }
+
+#endif // !XRT_OS_MACOS
 
 
 /*

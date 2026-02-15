@@ -16,7 +16,7 @@
 #include <vulkan/vulkan_core.h>
 #include <xrt/xrt_handles.h>
 
-#ifdef XRT_OS_LINUX
+#if defined(XRT_OS_LINUX) || defined(XRT_OS_MACOS)
 #include <unistd.h>
 #endif
 

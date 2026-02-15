@@ -9,6 +9,10 @@ project(
 	DESCRIPTION "Monado(XRT) by Collabora et al"
 	)
 
+if(APPLE)
+	enable_language(OBJC)
+endif()
+
 if(MSVC)
     STRING(REPLACE "/O2" "/Od" CMAKE_CXX_FLAGS_RELWITHDEBINFO ${CMAKE_CXX_FLAGS_RELWITHDEBINFO})
     SET(CMAKE_CXX_FLAGS_RELWITHDEBINFO ${CMAKE_CXX_FLAGS_RELWITHDEBINFO} CACHE STRING "compile flags" FORCE)
@@ -187,6 +191,12 @@ endif()
 
 find_package(OpenGL)
 set(OPENGL_WITHOUT_GLX_FOUND ${OPENGL_FOUND})
+if(APPLE)
+	set(XRT_HAVE_MACOS YES)
+	# Disable features not available on macOS (no epoll, no IPC service)
+	set(XRT_FEATURE_SERVICE OFF CACHE BOOL "Disabled on macOS" FORCE)
+endif()
+
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 	set(XRT_HAVE_LINUX YES)
 	# Compositor backend
@@ -295,7 +305,7 @@ option(XRT_MODULE_OPENXR_STATE_TRACKER "Build OpenXR State Tracker" ON)
 
 # Feature configuration (sorted)
 option_with_deps(XRT_FEATURE_AHARDWARE_BUFFER "Enable AHardwareBuffer for XrSwapchain images on Android (API-level 26+) platforms" DEPENDS ANDROID)
-option_with_deps(XRT_FEATURE_COLOR_LOG "Enable logging in color on supported platforms" DEPENDS XRT_HAVE_LINUX)
+option_with_deps(XRT_FEATURE_COLOR_LOG "Enable logging in color on supported platforms" DEPENDS "XRT_HAVE_LINUX OR XRT_HAVE_MACOS")
 option_with_deps(XRT_FEATURE_OPENXR "Build OpenXR runtime target" DEPENDS XRT_MODULE_OPENXR_STATE_TRACKER "XRT_MODULE_COMPOSITOR_MAIN OR XRT_MODULE_COMPOSITOR_NULL")
 set(XRT_FEATURE_OPENXR_DEBUG_UTILS OFF) # Has never been enabled
 option_with_deps(XRT_FEATURE_RENDERDOC "Enable RenderDoc API" DEPENDS "RT_LIBRARY OR WIN32 OR ANDROID")
@@ -365,7 +375,7 @@ option_with_deps(XRT_BUILD_DRIVER_PSSENSE "Enable PlayStation Sense driver" DEPE
 option_with_deps(XRT_BUILD_DRIVER_PSVR "Enable PSVR HMD driver" DEPENDS XRT_HAVE_HIDAPI)
 option_with_deps(XRT_BUILD_DRIVER_QWERTY "Enable Qwerty driver" DEPENDS XRT_HAVE_SDL2)
 option_with_deps(XRT_BUILD_DRIVER_REALSENSE "Enable RealSense device driver" DEPENDS XRT_HAVE_REALSENSE)
-option_with_deps(XRT_BUILD_DRIVER_REMOTE "Enable remote debugging driver" DEPENDS "XRT_HAVE_LINUX OR ANDROID OR WIN32")
+option_with_deps(XRT_BUILD_DRIVER_REMOTE "Enable remote debugging driver" DEPENDS "XRT_HAVE_LINUX OR ANDROID OR WIN32 OR XRT_HAVE_MACOS")
 option_with_deps(XRT_BUILD_DRIVER_RIFT "Enable Oculus Rift (DK2) device driver")
 option_with_deps(XRT_BUILD_DRIVER_RIFT_S "Enable Oculus Rift S device driver" DEPENDS XRT_HAVE_V4L2)
 option_with_deps(XRT_BUILD_DRIVER_ROKID "Enable Rokid driver" DEPENDS "XRT_HAVE_LIBUSB")
@@ -543,6 +553,9 @@ if(ANDROID)
 endif()
 if(WIN32)
 	set(VK_USE_PLATFORM_WIN32_KHR TRUE)
+endif()
+if(APPLE)
+	set(VK_USE_PLATFORM_METAL_EXT TRUE)
 endif()
 if(XRT_HAVE_VULKAN AND NOT ANDROID)
 	set(VK_USE_PLATFORM_DISPLAY_KHR TRUE)

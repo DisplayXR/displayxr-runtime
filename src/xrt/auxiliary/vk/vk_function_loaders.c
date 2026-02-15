@@ -132,6 +132,11 @@ vk_get_instance_functions(struct vk_bundle *vk)
 
 #endif // defined(VK_USE_PLATFORM_WIN32_KHR)
 
+#if defined(VK_USE_PLATFORM_METAL_EXT)
+	vk->vkCreateMetalSurfaceEXT                           = GET_INS_PROC(vk, vkCreateMetalSurfaceEXT);
+
+#endif // defined(VK_USE_PLATFORM_METAL_EXT)
+
 #if defined(VK_EXT_display_surface_counter)
 	vk->vkGetPhysicalDeviceSurfaceCapabilities2EXT        = GET_INS_PROC(vk, vkGetPhysicalDeviceSurfaceCapabilities2EXT);
 

@@ -63,7 +63,17 @@ else()
 		)
 endif()
 
-if(NOT WIN32)
+if(APPLE)
+	# macOS: export only the negotiate symbol using linker flags.
+	# GNU ld version scripts are not supported by the macOS linker.
+	set_property(
+		TARGET ${RUNTIME_TARGET}
+		APPEND_STRING
+		PROPERTY
+			LINK_FLAGS
+			" -Wl,-exported_symbol,_xrNegotiateLoaderRuntimeInterface"
+		)
+elseif(NOT WIN32)
 	# Force the main "negotiate" symbol's inclusion
 	# and use a version script to ensure that's the only one we expose.
 	set_property(

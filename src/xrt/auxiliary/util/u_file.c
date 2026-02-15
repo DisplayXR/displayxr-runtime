@@ -22,9 +22,13 @@
 #define PATH_MAX 4096
 #endif
 
-#ifdef XRT_OS_LINUX
+#if defined(XRT_OS_LINUX) || defined(XRT_OS_MACOS)
 #include <sys/stat.h>
+#ifdef XRT_OS_LINUX
 #include <linux/limits.h>
+#else
+#include <limits.h>
+#endif
 
 static int
 mkpath(const char *path)
@@ -192,7 +196,7 @@ u_file_get_hand_tracking_models_dir(char *out_path, size_t out_path_size)
 	return ret;
 }
 
-#endif /* XRT_OS_LINUX */
+#endif /* XRT_OS_LINUX || XRT_OS_MACOS */
 
 int
 u_file_get_runtime_dir(char *out_path, size_t out_path_size)

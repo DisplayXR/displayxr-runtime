@@ -177,6 +177,21 @@ comp_window_mswin_signal_paint_done(struct comp_target *ct);
 
 #endif // XRT_OS_WINDOWS
 
+#ifdef XRT_OS_MACOS
+
+/*!
+ * Create a rendering window on macOS using NSWindow + CAMetalLayer.
+ *
+ * @ingroup comp_main
+ * @public @memberof comp_window_macos
+ */
+struct comp_target *
+comp_window_macos_create(struct comp_compositor *c);
+
+extern const struct comp_target_factory comp_target_factory_macos;
+
+#endif // XRT_OS_MACOS
+
 #ifdef __cplusplus
 }
 #endif

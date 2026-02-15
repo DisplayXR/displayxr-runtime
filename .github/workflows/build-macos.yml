@@ -1,0 +1,32 @@
+name: Build macOS
+
+on:
+  push:
+    branches: [cnsdk, XR_EXT_session_target]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: brew install cmake ninja eigen
+
+      - name: Install Vulkan SDK
+        uses: humbletim/install-vulkan-sdk@v1.2
+        with:
+          version: latest
+          cache: true
+
+      - name: Configure
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DXRT_FEATURE_SERVICE=OFF
+
+      - name: Build
+        run: cmake --build build

@@ -304,6 +304,11 @@ struct vk_bundle
 
 #endif // defined(VK_USE_PLATFORM_WIN32_KHR)
 
+#if defined(VK_USE_PLATFORM_METAL_EXT)
+	PFN_vkCreateMetalSurfaceEXT vkCreateMetalSurfaceEXT;
+
+#endif // defined(VK_USE_PLATFORM_METAL_EXT)
+
 #if defined(VK_EXT_display_surface_counter)
 	PFN_vkGetPhysicalDeviceSurfaceCapabilities2EXT vkGetPhysicalDeviceSurfaceCapabilities2EXT;
 

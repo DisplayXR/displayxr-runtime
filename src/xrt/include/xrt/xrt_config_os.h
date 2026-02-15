@@ -38,6 +38,15 @@
 #define XRT_OS_WAS_AUTODETECTED
 #endif
 
+#if defined(__APPLE__) && !defined(XRT_OS_WAS_AUTODETECTED)
+#include <TargetConditionals.h>
+#if TARGET_OS_MAC && !TARGET_OS_IPHONE
+#define XRT_OS_MACOS
+#define XRT_OS_UNIX
+#define XRT_OS_WAS_AUTODETECTED
+#endif
+#endif
+
 #if defined(__MINGW32__)
 #define XRT_ENV_MINGW
 #endif
