@@ -1018,9 +1018,11 @@ comp_d3d11_renderer_draw(struct comp_d3d11_renderer *renderer,
 		// Set viewport for this view
 		D3D11_VIEWPORT viewport = {};
 		if (effective_views == 1) {
-			// MONO: single viewport spanning full stereo texture width
+			// MONO: single viewport at view_width (same as one eye).
+			// The app's swapchain is view_width wide; using 2*view_width
+			// would stretch the content horizontally.
 			viewport.TopLeftX = 0.0f;
-			viewport.Width = static_cast<float>(renderer->view_width * 2);
+			viewport.Width = static_cast<float>(renderer->view_width);
 		} else {
 			// STEREO: side-by-side
 			viewport.TopLeftX = static_cast<float>(view_index * renderer->view_width);

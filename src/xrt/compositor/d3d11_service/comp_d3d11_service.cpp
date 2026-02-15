@@ -2679,9 +2679,10 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			// Set viewport for this view
 			D3D11_VIEWPORT viewport = {};
 			if (is_mono) {
-				// MONO: single viewport spanning full stereo texture width
+				// MONO: single viewport at view_width (same as one eye).
+				// Using 2*view_width would stretch content horizontally.
 				viewport.TopLeftX = 0.0f;
-				viewport.Width = static_cast<float>(sys->view_width * 2);
+				viewport.Width = static_cast<float>(sys->view_width);
 			} else {
 				// STEREO: side-by-side
 				viewport.TopLeftX = static_cast<float>(view_index * sys->view_width);
