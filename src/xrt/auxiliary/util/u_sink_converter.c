@@ -353,7 +353,9 @@ from_MJPEG_to_frame(struct xrt_frame *dst_frame, size_t size, const uint8_t *dat
 		goto fail;
 	}
 
-	jpeg_mem_src(&cinfo, data, size);
+	// Cast away const: some libjpeg implementations (e.g. Mono framework on
+	// macOS) declare jpeg_mem_src with non-const inbuffer parameter.
+	jpeg_mem_src(&cinfo, (unsigned char *)(uintptr_t)data, size);
 
 	int ret = jpeg_read_header(&cinfo, TRUE);
 	if (ret != JPEG_HEADER_OK) {
