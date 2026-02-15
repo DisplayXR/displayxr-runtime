@@ -34,6 +34,8 @@
 
 #include "xrt/xrt_display_processor_d3d11.h"
 
+#include "sim_display/sim_display_interface.h"
+
 #ifdef XRT_HAVE_LEIA_SR_D3D11
 #include "leia/leia_sr_d3d11.h"
 #include "leia/leia_display_processor_d3d11.h"
@@ -380,7 +382,7 @@ d3d11_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 								uint32_t new_vw = (uint32_t)((float)sr_w * ratio);
 								uint32_t new_vh = (uint32_t)((float)sr_h * ratio);
 
-								comp_d3d11_renderer_resize(c->renderer, new_vw, new_vh);
+								comp_d3d11_renderer_resize(c->renderer, new_vw, new_vh, new_height);
 							}
 						}
 #endif
@@ -588,8 +590,16 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 	}
 
+	// Get target (window) dimensions for mono viewport sizing
+	uint32_t tgt_width = c->settings.preferred.width;
+	uint32_t tgt_height = c->settings.preferred.height;
+	if (c->target != nullptr) {
+		comp_d3d11_target_get_dimensions(c->target, &tgt_width, &tgt_height);
+	}
+
 	// Render layers to side-by-side stereo texture (or full-width mono)
-	xrt_result_t xret = comp_d3d11_renderer_draw(c->renderer, &c->layer_accum, &left_eye, &right_eye);
+	xrt_result_t xret = comp_d3d11_renderer_draw(
+	    c->renderer, &c->layer_accum, &left_eye, &right_eye, tgt_width, tgt_height);
 	if (xret != XRT_SUCCESS) {
 		U_LOG_E("Failed to render layers");
 		return xret;
@@ -673,7 +683,7 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		// Log once at startup that we're using fallback path
 		static bool fallback_warned = false;
 		if (!fallback_warned) {
-			U_LOG_W("SR weaving not available, using fallback stereo blit");
+			U_LOG_W("SR weaving not available, using fallback blit (mono=%d)", is_mono);
 			fallback_warned = true;
 		}
 
@@ -697,16 +707,26 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 
 		if (back_buffer != nullptr && stereo_texture != nullptr) {
-			// Get texture descriptions to check sizes
 			D3D11_TEXTURE2D_DESC src_desc, dst_desc;
 			stereo_texture->GetDesc(&src_desc);
 			back_buffer->GetDesc(&dst_desc);
 
-			if (src_desc.Width == dst_desc.Width && src_desc.Height == dst_desc.Height) {
-				// Sizes match - use fast CopyResource
+			if (is_mono) {
+				// MONO: the renderer drew at (tgt_width x tgt_height)
+				// into the top-left of the SBS texture. Copy exactly
+				// that region to the back buffer.
+				UINT copy_width = (tgt_width < src_desc.Width) ? tgt_width : src_desc.Width;
+				UINT copy_height = (tgt_height < src_desc.Height) ? tgt_height : src_desc.Height;
+				copy_width = (copy_width < dst_desc.Width) ? copy_width : dst_desc.Width;
+				copy_height = (copy_height < dst_desc.Height) ? copy_height : dst_desc.Height;
+				D3D11_BOX src_box = {0, 0, 0, copy_width, copy_height, 1};
+				c->context->CopySubresourceRegion(back_buffer, 0, 0, 0, 0,
+				                                   stereo_texture, 0, &src_box);
+			} else if (src_desc.Width == dst_desc.Width && src_desc.Height == dst_desc.Height) {
+				// Stereo, sizes match - use fast CopyResource
 				c->context->CopyResource(back_buffer, stereo_texture);
 			} else {
-				// Sizes don't match - use CopySubresourceRegion to copy what fits
+				// Stereo, sizes don't match - copy what fits
 				UINT copy_width = (src_desc.Width < dst_desc.Width) ? src_desc.Width : dst_desc.Width;
 				UINT copy_height =
 				    (src_desc.Height < dst_desc.Height) ? src_desc.Height : dst_desc.Height;
@@ -1024,8 +1044,36 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	U_LOG_W("XRT_HAVE_LEIA_SR_D3D11 is NOT defined - SR weaving disabled at compile time");
 #endif
 
-	// Create renderer with the correct view dimensions
-	xret = comp_d3d11_renderer_create(c, view_width, view_height, &c->renderer);
+	// sim_display takes priority over SR display processor (if enabled)
+	{
+		const char *sim_enable = getenv("SIM_DISPLAY_ENABLE");
+		if (sim_enable != NULL && strcmp(sim_enable, "1") == 0) {
+			// Parse SIM_DISPLAY_OUTPUT mode
+			enum sim_display_output_mode mode = SIM_DISPLAY_OUTPUT_SBS;
+			const char *mode_str = getenv("SIM_DISPLAY_OUTPUT");
+			if (mode_str != NULL) {
+				if (strcmp(mode_str, "anaglyph") == 0) {
+					mode = SIM_DISPLAY_OUTPUT_ANAGLYPH;
+				} else if (strcmp(mode_str, "blend") == 0) {
+					mode = SIM_DISPLAY_OUTPUT_BLEND;
+				}
+			}
+
+			// Replace any existing display processor with sim_display
+			xrt_display_processor_d3d11_destroy(&c->display_processor);
+			xrt_result_t dp_ret = sim_display_processor_d3d11_create(
+			    mode, c->device, &c->display_processor);
+			if (dp_ret != XRT_SUCCESS) {
+				U_LOG_W("Failed to create sim display D3D11 processor, continuing without");
+				c->display_processor = NULL;
+			}
+		}
+	}
+
+	// Create renderer with the correct view dimensions.
+	// Pass target (window) height so the SBS texture is tall enough for mono (2D) mode.
+	uint32_t target_height = c->settings.preferred.height;
+	xret = comp_d3d11_renderer_create(c, view_width, view_height, target_height, &c->renderer);
 	if (xret != XRT_SUCCESS) {
 		U_LOG_E("Failed to create D3D11 renderer");
 		d3d11_compositor_destroy(&c->base.base);

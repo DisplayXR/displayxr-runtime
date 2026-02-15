@@ -34,6 +34,9 @@ if(WIN32 AND XRT_HAVE_D3D11)
 
 	target_include_directories(comp_d3d11 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
+	# Link to sim_display driver for D3D11 display processor
+	target_link_libraries(comp_d3d11 PRIVATE drv_sim_display)
+
 	# Link to SR SDK D3D11 weaver if available
 	# drv_leia exports XRT_HAVE_LEIA_SR_D3D11 as PUBLIC when D3D11 weaver is available
 	if(XRT_HAVE_LEIA_SR)

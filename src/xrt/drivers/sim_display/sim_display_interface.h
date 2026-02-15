@@ -11,12 +11,16 @@
 
 #include "xrt/xrt_results.h"
 
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 struct xrt_device;
 struct xrt_display_processor;
+struct xrt_display_processor_d3d11;
+struct vk_bundle;
 
 /*!
  * @defgroup drv_sim_display Simulation 3D Display Driver
@@ -60,19 +64,40 @@ struct xrt_device *
 sim_display_hmd_create(void);
 
 /*!
- * Create a simulation display processor.
+ * Create a simulation Vulkan display processor.
  *
- * The processor implements side-by-side, anaglyph, or alpha-blend
- * output via simple Vulkan viewport blits (no custom shaders needed).
+ * For SBS mode, @p vk and @p target_format are ignored (no Vulkan resources needed).
+ * For anaglyph and blend modes, creates a full Vulkan pipeline with fragment shaders.
  *
- * @param mode  Output mode (SBS, anaglyph, or blend).
+ * @param mode          Output mode (SBS, anaglyph, or blend).
+ * @param vk            Vulkan bundle (ignored for SBS mode).
+ * @param target_format Swapchain target format (ignored for SBS mode).
  * @param[out] out_xdp  Receives the created display processor.
  * @return XRT_SUCCESS on success.
  * @ingroup drv_sim_display
  */
 xrt_result_t
 sim_display_processor_create(enum sim_display_output_mode mode,
+                             struct vk_bundle *vk,
+                             int32_t target_format,
                              struct xrt_display_processor **out_xdp);
+
+/*!
+ * Create a simulation D3D11 display processor.
+ *
+ * For SBS mode, @p d3d11_device is ignored (no shader compilation needed).
+ * For anaglyph and blend modes, compiles HLSL shaders for stereo compositing.
+ *
+ * @param mode          Output mode (SBS, anaglyph, or blend).
+ * @param d3d11_device  D3D11 device for shader compilation (ignored for SBS).
+ * @param[out] out_xdp  Receives the created display processor.
+ * @return XRT_SUCCESS on success.
+ * @ingroup drv_sim_display
+ */
+xrt_result_t
+sim_display_processor_d3d11_create(enum sim_display_output_mode mode,
+                                   void *d3d11_device,
+                                   struct xrt_display_processor_d3d11 **out_xdp);
 
 /*!
  * Create the simulation display system builder.

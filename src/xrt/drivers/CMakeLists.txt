@@ -645,13 +645,45 @@ if(XRT_HAVE_CNSDK AND NOT TARGET drv_leia)
 endif()
 
 # Simulation 3D display driver (always available, enabled by SIM_DISPLAY_ENABLE=1)
-add_library(
-	drv_sim_display STATIC
+set(SIM_DISPLAY_SOURCES
 	sim_display/sim_display_device.c
-	sim_display/sim_display_processor.c
 	sim_display/sim_display_interface.h
 	)
+
+# Vulkan display processor (anaglyph/blend shaders)
+if(XRT_HAVE_VULKAN)
+	spirv_shaders(
+		SIM_DISPLAY_SHADER_HEADERS
+		SPIRV_VERSION
+		1.0
+		SOURCES
+		sim_display/shaders/fullscreen.vert
+		sim_display/shaders/anaglyph.frag
+		sim_display/shaders/blend.frag
+		)
+	list(APPEND SIM_DISPLAY_SOURCES
+		${SIM_DISPLAY_SHADER_HEADERS}
+		sim_display/sim_display_processor.c)
+endif()
+
+# D3D11 display processor (HLSL shaders compiled at runtime)
+if(WIN32)
+	list(APPEND SIM_DISPLAY_SOURCES
+		sim_display/sim_display_processor_d3d11.cpp)
+endif()
+
+add_library(drv_sim_display STATIC ${SIM_DISPLAY_SOURCES})
 target_link_libraries(drv_sim_display PRIVATE xrt-interfaces aux_util aux_os PUBLIC drv_includes)
+
+if(XRT_HAVE_VULKAN)
+	target_link_libraries(drv_sim_display PRIVATE aux_vk)
+	target_include_directories(drv_sim_display PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+endif()
+
+if(WIN32)
+	target_link_libraries(drv_sim_display PRIVATE d3d11 d3dcompiler)
+endif()
+
 list(APPEND ENABLED_DRIVERS drv_sim_display)
 
 if(XRT_BUILD_SAMPLES)
