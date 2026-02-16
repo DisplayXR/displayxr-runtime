@@ -53,7 +53,8 @@ cat > "$RUNTIME_ROOT/share/vulkan/icd.d/MoltenVK_icd.json" <<EOF
     "file_format_version": "1.0.0",
     "ICD": {
         "library_path": "/Library/Application Support/SRMonado/lib/libMoltenVK.dylib",
-        "api_version": "1.2.0"
+        "api_version": "1.2.0",
+        "is_portability_driver": true
     }
 }
 EOF

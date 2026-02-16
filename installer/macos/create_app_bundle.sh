@@ -57,6 +57,7 @@ DIR="$(cd "$(dirname "$0")/../Resources" && pwd)"
 export XR_RUNTIME_JSON="$DIR/openxr_monado.json"
 export DYLD_LIBRARY_PATH="$DIR/lib:${DYLD_LIBRARY_PATH:-}"
 export VK_ICD_FILENAMES="$DIR/MoltenVK_icd.json"
+export VK_DRIVER_FILES="$DIR/MoltenVK_icd.json"
 export SIM_DISPLAY_ENABLE=1
 export SIM_DISPLAY_OUTPUT="${SIM_DISPLAY_OUTPUT:-anaglyph}"
 exec "$DIR/sim_cube_openxr"
@@ -86,7 +87,8 @@ cat > "$APP_BUNDLE/Contents/Resources/MoltenVK_icd.json" <<EOF
     "file_format_version": "1.0.0",
     "ICD": {
         "library_path": "lib/libMoltenVK.dylib",
-        "api_version": "1.2.0"
+        "api_version": "1.2.0",
+        "is_portability_driver": true
     }
 }
 EOF
