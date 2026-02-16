@@ -25,8 +25,13 @@
 #include <stdio.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <sys/epoll.h>
 #include <sys/socket.h>
+
+#ifdef XRT_OS_MACOS
+#include <sys/event.h>
+#else
+#include <sys/epoll.h>
+#endif
 
 #endif // XRT_OS_WINDOWS
 
@@ -167,7 +172,130 @@ common_shutdown(volatile struct ipc_client_state *ics)
  *
  */
 
-#ifndef XRT_OS_WINDOWS // Linux & Android
+#ifndef XRT_OS_WINDOWS // Unix (Linux, Android, macOS)
+
+/*!
+ * Common dispatch logic shared by all Unix client loops.
+ * Returns true if the loop should continue, false to break.
+ */
+static bool
+unix_dispatch_command(volatile struct ipc_client_state *ics)
+{
+	// Peek the first 4 bytes to get the command type
+	enum ipc_command cmd;
+	ssize_t len = recv(ics->imc.ipc_handle, &cmd, sizeof(cmd), MSG_PEEK);
+	if (len != sizeof(cmd)) {
+		IPC_ERROR(ics->server, "Invalid command received.");
+		return false;
+	}
+
+	size_t cmd_size = ipc_command_size(cmd);
+	if (cmd_size == 0) {
+		IPC_ERROR(ics->server, "Invalid command size.");
+		return false;
+	}
+
+	// Read the whole command now that we know its size
+	uint8_t buf[IPC_BUF_SIZE] = {0};
+
+	len = recv(ics->imc.ipc_handle, &buf, cmd_size, 0);
+	if (len != (ssize_t)cmd_size) {
+		IPC_ERROR(ics->server, "Invalid packet received, disconnecting client.");
+		return false;
+	}
+
+	// Check the first 4 bytes of the message and dispatch.
+	ipc_command_t *ipc_command = (ipc_command_t *)buf;
+
+	IPC_TRACE_BEGIN(ipc_dispatch);
+	xrt_result_t result = ipc_dispatch(ics, ipc_command);
+	IPC_TRACE_END(ipc_dispatch);
+
+	if (result != XRT_SUCCESS) {
+		IPC_ERROR(ics->server, "During packet handling, disconnecting client.");
+		return false;
+	}
+
+	return true;
+}
+
+#ifdef XRT_OS_MACOS // macOS: kqueue-based client loop
+
+static int
+setup_kqueue(volatile struct ipc_client_state *ics)
+{
+	int client_socket = ics->imc.ipc_handle;
+	assert(client_socket >= 0);
+
+	int kq = kqueue();
+	if (kq < 0) {
+		IPC_ERROR(ics->server, "kqueue() failed: '%s'.", strerror(errno));
+		return -1;
+	}
+
+	struct kevent change;
+	EV_SET(&change, client_socket, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, NULL);
+
+	int ret = kevent(kq, &change, 1, NULL, 0, NULL);
+	if (ret < 0) {
+		IPC_ERROR(ics->server, "kevent() registration failed: '%s'.", strerror(errno));
+		close(kq);
+		return -1;
+	}
+
+	return kq;
+}
+
+static void
+client_loop(volatile struct ipc_client_state *ics)
+{
+	U_TRACE_SET_THREAD_NAME("IPC Client");
+
+	IPC_INFO(ics->server, "Client %u connected", ics->client_state.id);
+
+	int kq = setup_kqueue(ics);
+	if (kq < 0) {
+		return;
+	}
+
+	while (ics->server->running) {
+		struct kevent event;
+		struct timespec timeout = {0, 500 * 1000 * 1000}; // 500ms
+		int ret = 0;
+
+		// On temporary failures retry.
+		do {
+			ret = kevent(kq, NULL, 0, &event, 1, &timeout);
+		} while (ret == -1 && errno == EINTR);
+
+		if (ret < 0) {
+			IPC_ERROR(ics->server, "kevent() poll failed: '%s', disconnecting client.", strerror(errno));
+			break;
+		}
+
+		// Timed out, loop again.
+		if (ret == 0) {
+			continue;
+		}
+
+		// Detect clients disconnecting gracefully (EOF).
+		if (event.flags & EV_EOF) {
+			IPC_INFO(ics->server, "Client disconnected.");
+			break;
+		}
+
+		if (!unix_dispatch_command(ics)) {
+			break;
+		}
+	}
+
+	close(kq);
+
+	// Following code is same for all platforms.
+	common_shutdown(ics);
+}
+
+#else // Linux & Android: epoll-based client loop
 
 static int
 setup_epoll(volatile struct ipc_client_state *ics)
@@ -235,38 +363,7 @@ client_loop(volatile struct ipc_client_state *ics)
 			break;
 		}
 
-		// Peek the first 4 bytes to get the command type
-		enum ipc_command cmd;
-		ssize_t len = recv(ics->imc.ipc_handle, &cmd, sizeof(cmd), MSG_PEEK);
-		if (len != sizeof(cmd)) {
-			IPC_ERROR(ics->server, "Invalid command received.");
-			break;
-		}
-
-		size_t cmd_size = ipc_command_size(cmd);
-		if (cmd_size == 0) {
-			IPC_ERROR(ics->server, "Invalid command size.");
-			break;
-		}
-
-		// Read the whole command now that we know its size
-		uint8_t buf[IPC_BUF_SIZE] = {0};
-
-		len = recv(ics->imc.ipc_handle, &buf, cmd_size, 0);
-		if (len != (ssize_t)cmd_size) {
-			IPC_ERROR(ics->server, "Invalid packet received, disconnecting client.");
-			break;
-		}
-
-		// Check the first 4 bytes of the message and dispatch.
-		ipc_command_t *ipc_command = (ipc_command_t *)buf;
-
-		IPC_TRACE_BEGIN(ipc_dispatch);
-		xrt_result_t result = ipc_dispatch(ics, ipc_command);
-		IPC_TRACE_END(ipc_dispatch);
-
-		if (result != XRT_SUCCESS) {
-			IPC_ERROR(ics->server, "During packet handling, disconnecting client.");
+		if (!unix_dispatch_command(ics)) {
 			break;
 		}
 	}
@@ -277,6 +374,8 @@ client_loop(volatile struct ipc_client_state *ics)
 	// Following code is same for all platforms.
 	common_shutdown(ics);
 }
+
+#endif // XRT_OS_MACOS
 
 #else // XRT_OS_WINDOWS
 

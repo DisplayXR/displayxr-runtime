@@ -97,9 +97,8 @@ if(ANDROID)
 endif()
 
 ###
-# Server (not built on macOS - no epoll or IPC service support)
+# Server
 
-if(NOT APPLE)
 add_library(
 	ipc_server STATIC
 	${CMAKE_CURRENT_BINARY_DIR}/ipc_server_generated.c
@@ -155,6 +154,10 @@ elseif(XRT_HAVE_LINUX)
 	target_sources(
 		ipc_server PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/server/ipc_server_mainloop_linux.c
 		)
+elseif(APPLE)
+	target_sources(
+		ipc_server PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/server/ipc_server_mainloop_macos.c
+		)
 elseif(WIN32)
 	target_sources(
 		ipc_server
@@ -163,4 +166,3 @@ elseif(WIN32)
 
 	target_link_libraries(ipc_server PRIVATE winmm)
 endif()
-endif() # NOT APPLE

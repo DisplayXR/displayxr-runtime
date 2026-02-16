@@ -289,6 +289,26 @@ struct ipc_server_mainloop
 #define XRT_IPC_GOT_IMPL
 #endif
 
+#if defined(XRT_OS_MACOS) || defined(XRT_DOXYGEN)
+	/*!
+	 * @name macOS Mainloop Members
+	 * @{
+	 */
+
+	//! kqueue file descriptor for event notification.
+	int kqueue_fd;
+
+	//! Socket that we accept connections on.
+	int listen_socket;
+
+	//! The socket filename we bound to, if any.
+	char *socket_filename;
+
+	/*! @} */
+
+#define XRT_IPC_GOT_IMPL
+#endif
+
 #if defined(XRT_OS_WINDOWS) || defined(XRT_DOXYGEN)
 	/*!
 	 * @name Desktop Windows Mainloop Members

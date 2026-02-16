@@ -150,6 +150,11 @@ if(XRT_HAVE_LINUX OR ANDROID)
 	target_sources(aux_util PRIVATE u_linux.c u_linux.h)
 endif()
 
+# CoreFoundation needed for CFRetain/CFRelease in u_handles.c (Metal handle ref counting).
+if(APPLE)
+	target_link_libraries(aux_util PRIVATE "-framework CoreFoundation")
+endif()
+
 # Is basically used everywhere, unavoidable.
 if(XRT_HAVE_SYSTEM_CJSON)
 	target_link_libraries(aux_util PUBLIC cJSON::cJSON)

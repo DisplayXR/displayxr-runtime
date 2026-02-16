@@ -430,6 +430,14 @@ fill_in_external_object_properties(struct vk_bundle *vk)
 	get_external_image_support(vk, true, VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT,
 	                           &vk->external.depth_image_import_d3d11, &vk->external.depth_image_export_d3d11);
 
+#elif defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_METAL)
+	get_external_image_support(vk, false, VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT,
+	                           &vk->external.color_image_import_metal_texture,
+	                           &vk->external.color_image_export_metal_texture);
+	get_external_image_support(vk, true, VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT,
+	                           &vk->external.depth_image_import_metal_texture,
+	                           &vk->external.depth_image_export_metal_texture);
+
 #elif defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_FD)
 	get_external_image_support(vk, false, VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT,
 	                           &vk->external.color_image_import_opaque_fd,
@@ -952,6 +960,17 @@ fill_in_has_device_extensions(struct vk_bundle *vk, struct u_string_list *ext_li
 #endif // defined(VK_GOOGLE_display_timing)
 	}
 	// end of GENERATED device extension code - do not modify - used by scripts
+
+	// Non-generated device extension detection
+	vk->has_EXT_external_memory_metal = false;
+#if defined(VK_EXT_external_memory_metal)
+	for (uint32_t i = 0; i < ext_count; i++) {
+		if (strcmp(exts[i], VK_EXT_EXTERNAL_MEMORY_METAL_EXTENSION_NAME) == 0) {
+			vk->has_EXT_external_memory_metal = true;
+			break;
+		}
+	}
+#endif // defined(VK_EXT_external_memory_metal)
 }
 
 static bool

@@ -49,6 +49,22 @@ ref_graphics_handle(xrt_graphics_buffer_handle_t handle)
 	return dup(handle);
 }
 
+#elif defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_METAL)
+#include <CoreFoundation/CoreFoundation.h>
+
+static inline void
+release_graphics_handle(xrt_graphics_buffer_handle_t handle)
+{
+	CFRelease(handle);
+}
+
+static inline xrt_graphics_buffer_handle_t
+ref_graphics_handle(xrt_graphics_buffer_handle_t handle)
+{
+	CFRetain(handle);
+	return handle;
+}
+
 #elif defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_WIN32_HANDLE)
 
 static inline void

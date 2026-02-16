@@ -1187,6 +1187,30 @@ vk_create_image_from_native(struct vk_bundle *vk,
 	};
 
 	// TODO memoryTypeBits from VkMemoryFdPropertiesKHR
+#elif defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_METAL)
+	VkImportMemoryMetalHandleInfoEXT import_memory_info = {
+	    .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_METAL_HANDLE_INFO_EXT,
+	    .pNext = NULL,
+	    .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT,
+	    .handle = image_native->handle,
+	};
+
+	VkMemoryMetalHandlePropertiesEXT metal_props = {
+	    .sType = VK_STRUCTURE_TYPE_MEMORY_METAL_HANDLE_PROPERTIES_EXT,
+	};
+
+	ret = vk->vkGetMemoryMetalHandlePropertiesEXT(                //
+	    vk->device,                                               // device
+	    VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT,        // handleType
+	    image_native->handle,                                     // pHandle
+	    &metal_props);                                            // pMemoryMetalHandleProperties
+	if (ret != VK_SUCCESS) {
+		VK_ERROR(vk, "vkGetMemoryMetalHandlePropertiesEXT: %s", vk_result_string(ret));
+		vk->vkDestroyImage(vk->device, image, NULL);
+		return ret;
+	}
+
+	requirements.memoryTypeBits = metal_props.memoryTypeBits;
 #elif defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_AHARDWAREBUFFER)
 	VkImportAndroidHardwareBufferInfoANDROID import_memory_info = {
 	    .sType = VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID,
@@ -1331,6 +1355,29 @@ get_device_memory_handle(struct vk_bundle *vk, VkDeviceMemory device_memory, xrt
 	}
 
 	*out_handle = buf;
+
+	return ret;
+}
+
+#elif defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_METAL)
+
+static VkResult
+get_device_memory_handle(struct vk_bundle *vk, VkDeviceMemory device_memory, xrt_graphics_buffer_handle_t *out_handle)
+{
+	VkMemoryGetMetalHandleInfoEXT metal_info = {
+	    .sType = VK_STRUCTURE_TYPE_MEMORY_GET_METAL_HANDLE_INFO_EXT,
+	    .pNext = NULL,
+	    .memory = device_memory,
+	    .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT,
+	};
+
+	void *handle = NULL;
+	VkResult ret = vk->vkGetMemoryMetalHandleEXT(vk->device, &metal_info, &handle);
+	if (ret != VK_SUCCESS) {
+		return ret;
+	}
+
+	*out_handle = handle;
 
 	return ret;
 }

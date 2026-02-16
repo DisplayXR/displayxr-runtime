@@ -227,6 +227,15 @@ u_file_get_runtime_dir(char *out_path, size_t out_path_size)
 #endif
 	return wcstombs(out_path, temp, out_path_size);
 #endif // UNICODE
+
+#elif defined(XRT_OS_MACOS)
+	// macOS: use $TMPDIR (always set by launchd, e.g. /var/folders/xx/.../T/)
+	const char *tmpdir = getenv("TMPDIR");
+	if (tmpdir != NULL) {
+		return snprintf(out_path, out_path_size, "%s", tmpdir);
+	}
+	return snprintf(out_path, out_path_size, "/tmp");
+
 #else
 	const char *cache = "~/.cache";
 	return snprintf(out_path, out_path_size, "%s", cache);

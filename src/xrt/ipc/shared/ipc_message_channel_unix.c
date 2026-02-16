@@ -29,6 +29,11 @@
 #include <stdint.h>
 #include <assert.h>
 
+// MSG_NOSIGNAL is Linux-only; on macOS we use SO_NOSIGPIPE on the socket instead.
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
+
 
 /*
  *
@@ -313,6 +318,35 @@ ipc_send_handles_graphics_buffer(struct ipc_message_channel *imc,
  * FD graphics buffer functions.
  *
  */
+
+#elif defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_METAL)
+
+// Metal texture handles (void*) cannot be sent over Unix sockets directly.
+// Cross-process Metal texture sharing requires IOSurface (Phase 3).
+// For now, return failure — single-process mode doesn't use IPC buffer transport.
+
+xrt_result_t
+ipc_receive_handles_graphics_buffer(struct ipc_message_channel *imc,
+                                    void *out_data,
+                                    size_t size,
+                                    xrt_graphics_buffer_handle_t *out_handles,
+                                    uint32_t handle_count)
+{
+	IPC_ERROR(imc, "Metal graphics buffer IPC transport not yet implemented (needs IOSurface)");
+	return XRT_ERROR_IPC_FAILURE;
+}
+
+xrt_result_t
+ipc_send_handles_graphics_buffer(struct ipc_message_channel *imc,
+                                 const void *data,
+                                 size_t size,
+                                 const xrt_graphics_buffer_handle_t *handles,
+                                 uint32_t handle_count)
+{
+	IPC_ERROR(imc, "Metal graphics buffer IPC transport not yet implemented (needs IOSurface)");
+	return XRT_ERROR_IPC_FAILURE;
+}
+
 
 #elif defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_FD)
 
