@@ -23,33 +23,44 @@ jobs:
       - name: Install Vulkan SDK
         run: |
           set -e
-          VULKAN_VERSION="1.4.304.0"
-          curl -sSL -o vulkan_sdk.dmg "https://sdk.lunarg.com/sdk/download/${VULKAN_VERSION}/mac/vulkansdk-macos-${VULKAN_VERSION}.dmg?Human=true"
-          hdiutil attach vulkan_sdk.dmg -mountpoint /Volumes/VulkanSDK
-          # The DMG contains an InstallVulkan app or a direct directory
-          if [ -d "/Volumes/VulkanSDK/InstallVulkan.app" ]; then
-            # Newer SDK format - run the installer silently
-            sudo /Volumes/VulkanSDK/InstallVulkan.app/Contents/MacOS/InstallVulkan \
-              --root "$HOME/VulkanSDK/${VULKAN_VERSION}" --accept-licenses --default-answer --confirm-command install
-          elif [ -d "/Volumes/VulkanSDK/macOS" ]; then
-            mkdir -p "$HOME/VulkanSDK/${VULKAN_VERSION}"
-            cp -R /Volumes/VulkanSDK/macOS/* "$HOME/VulkanSDK/${VULKAN_VERSION}/"
+          # Query the latest SDK version from LunarG API
+          VULKAN_VERSION=$(curl -s https://vulkan.lunarg.com/sdk/latest/mac.txt)
+          echo "Installing Vulkan SDK version: ${VULKAN_VERSION}"
+          # Download as zip (LunarG now distributes macOS SDK as zip)
+          curl -sSL -o vulkan_sdk.zip "https://sdk.lunarg.com/sdk/download/${VULKAN_VERSION}/mac/vulkan_sdk.zip?Human=true"
+          # Verify we got a real zip file
+          file vulkan_sdk.zip
+          mkdir -p "$HOME/VulkanSDK"
+          unzip -q vulkan_sdk.zip -d "$HOME/VulkanSDK"
+          # The zip extracts to a versioned directory structure
+          # Find the actual SDK root (contains macOS/ subdirectory or is the SDK itself)
+          if [ -d "$HOME/VulkanSDK/${VULKAN_VERSION}" ]; then
+            SDK_ROOT="$HOME/VulkanSDK/${VULKAN_VERSION}"
           else
-            # Fallback: copy whatever is in the DMG
-            mkdir -p "$HOME/VulkanSDK/${VULKAN_VERSION}"
-            cp -R /Volumes/VulkanSDK/* "$HOME/VulkanSDK/${VULKAN_VERSION}/" || true
+            # Find whatever directory was extracted
+            SDK_ROOT=$(find "$HOME/VulkanSDK" -maxdepth 2 -name "macOS" -type d | head -1 | xargs dirname)
+            if [ -z "$SDK_ROOT" ]; then
+              echo "SDK contents:"
+              ls -la "$HOME/VulkanSDK/"
+              SDK_ROOT="$HOME/VulkanSDK"
+            fi
           fi
-          hdiutil detach /Volumes/VulkanSDK || true
-          echo "VULKAN_SDK=$HOME/VulkanSDK/${VULKAN_VERSION}/macOS" >> $GITHUB_ENV
-          echo "$HOME/VulkanSDK/${VULKAN_VERSION}/macOS/bin" >> $GITHUB_PATH
-          echo "Vulkan SDK installed at $HOME/VulkanSDK/${VULKAN_VERSION}"
-          ls -la "$HOME/VulkanSDK/${VULKAN_VERSION}/" || echo "Warning: SDK dir listing failed"
+          # Set up environment - check if macOS subdir exists
+          if [ -d "$SDK_ROOT/macOS" ]; then
+            echo "VULKAN_SDK=$SDK_ROOT/macOS" >> $GITHUB_ENV
+            echo "$SDK_ROOT/macOS/bin" >> $GITHUB_PATH
+          else
+            echo "VULKAN_SDK=$SDK_ROOT" >> $GITHUB_ENV
+            echo "$SDK_ROOT/bin" >> $GITHUB_PATH
+          fi
+          echo "Vulkan SDK installed at $SDK_ROOT"
+          ls -la "$SDK_ROOT/" || echo "Warning: SDK dir listing failed"
 
       - name: Configure
         run: |
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-            -DXRT_FEATURE_SERVICE=OFF
+            -DXRT_FEATURE_SERVICE=ON
 
       - name: Build
         run: cmake --build build
