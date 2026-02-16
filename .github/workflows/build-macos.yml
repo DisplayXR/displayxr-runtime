@@ -57,10 +57,27 @@ jobs:
       - name: Package runtime
         run: |
           mkdir -p _package/SRMonado-macOS/lib
+          mkdir -p _package/SRMonado-macOS/share/vulkan/icd.d
           # Find and copy runtime module (.so on macOS for MODULE libraries)
           RUNTIME_LIB=$(find build/src/xrt/targets/openxr -name "libopenxr_monado*" -type f | head -1)
           cp "$RUNTIME_LIB" _package/SRMonado-macOS/lib/
           RUNTIME_BASENAME=$(basename "$RUNTIME_LIB")
+          # Bundle Vulkan loader and MoltenVK from SDK
+          cp "$VULKAN_SDK/lib/libvulkan.1.dylib" _package/SRMonado-macOS/lib/
+          cp "$VULKAN_SDK/lib/libMoltenVK.dylib" _package/SRMonado-macOS/lib/
+          # Create MoltenVK ICD manifest pointing to bundled lib
+          cat > _package/SRMonado-macOS/share/vulkan/icd.d/MoltenVK_icd.json <<EOF
+          {
+            "file_format_version": "1.0.0",
+            "ICD": {
+              "library_path": "../../../lib/libMoltenVK.dylib",
+              "api_version": "1.2.0"
+            }
+          }
+          EOF
+          # Fix rpaths on the runtime so it finds bundled libvulkan
+          install_name_tool -add_rpath @loader_path "$RUNTIME_LIB" 2>/dev/null || true
+          install_name_tool -add_rpath @loader_path _package/SRMonado-macOS/lib/"$RUNTIME_BASENAME" 2>/dev/null || true
           # Generate portable manifest with relative library path
           cat > _package/SRMonado-macOS/openxr_monado.json <<EOF
           {
@@ -100,12 +117,16 @@ jobs:
           cp test_apps/sim_cube_openxr/build/sim_cube_openxr _package/SRMonado-macOS/bin/
           # Bundle the OpenXR loader dylib so it works without system install
           cp /tmp/openxr-install/lib/libopenxr_loader*.dylib _package/SRMonado-macOS/lib/
+          # Fix rpaths so test app and loader find bundled libvulkan/MoltenVK
+          install_name_tool -add_rpath @executable_path/../lib _package/SRMonado-macOS/bin/sim_cube_openxr 2>/dev/null || true
+          install_name_tool -add_rpath @loader_path _package/SRMonado-macOS/lib/libopenxr_loader*.dylib 2>/dev/null || true
           # Create run script
           cat > _package/SRMonado-macOS/run_sim_cube.sh <<'SCRIPT'
           #!/bin/bash
           DIR="$(cd "$(dirname "$0")" && pwd)"
           export XR_RUNTIME_JSON="$DIR/openxr_monado.json"
           export DYLD_LIBRARY_PATH="$DIR/lib:${DYLD_LIBRARY_PATH:-}"
+          export VK_ICD_FILENAMES="$DIR/share/vulkan/icd.d/MoltenVK_icd.json"
           export SIM_DISPLAY_ENABLE=1
           export SIM_DISPLAY_OUTPUT="${SIM_DISPLAY_OUTPUT:-anaglyph}"
           echo "Starting sim_cube_openxr with $SIM_DISPLAY_OUTPUT output..."
