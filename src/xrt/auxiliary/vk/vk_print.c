@@ -171,6 +171,19 @@ vk_print_external_handles_info(struct vk_bundle *vk, enum u_logging_level log_le
 	          vk->external.depth_image_export_d3d11 ? "true" : "false"                //
 	);                                                                                //
 
+#elif defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_METAL)
+
+	U_LOG_IFL(log_level, vk->log_level,                                               //
+	          "Supported images:"                                                     //
+	          "\n\t%s:\n\t\tcolor import=%s export=%s\n\t\tdepth import=%s export=%s" //
+	          ,                                                                       //
+	          "VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT",                    //
+	          vk->external.color_image_import_metal_texture ? "true" : "false",       //
+	          vk->external.color_image_export_metal_texture ? "true" : "false",       //
+	          vk->external.depth_image_import_metal_texture ? "true" : "false",       //
+	          vk->external.depth_image_export_metal_texture ? "true" : "false"        //
+	);                                                                                //
+
 #elif defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_FD)
 
 	U_LOG_IFL(log_level, vk->log_level,                                               //

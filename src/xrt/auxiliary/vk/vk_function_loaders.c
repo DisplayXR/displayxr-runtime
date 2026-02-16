@@ -308,6 +308,12 @@ vk_get_device_functions(struct vk_bundle *vk)
 
 #endif // defined(VK_EXT_external_memory_host)
 
+#if defined(VK_EXT_external_memory_metal)
+	vk->vkGetMemoryMetalHandleEXT                   = GET_DEV_PROC(vk, vkGetMemoryMetalHandleEXT);
+	vk->vkGetMemoryMetalHandlePropertiesEXT         = GET_DEV_PROC(vk, vkGetMemoryMetalHandlePropertiesEXT);
+
+#endif // defined(VK_EXT_external_memory_metal)
+
 #if defined(VK_EXT_calibrated_timestamps)
 	vk->vkGetCalibratedTimestampsEXT                = GET_DEV_PROC(vk, vkGetCalibratedTimestampsEXT);
 

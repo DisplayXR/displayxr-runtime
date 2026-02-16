@@ -235,7 +235,7 @@ xrt_graphics_buffer_is_valid(xrt_graphics_buffer_handle_t handle)
  */
 #define XRT_GRAPHICS_BUFFER_HANDLE_INVALID NULL
 
-#elif defined(XRT_OS_ANDROID) && !defined(XRT_OS_ANDROID_USE_AHB) || defined(XRT_OS_LINUX) || defined(XRT_OS_MACOS)
+#elif defined(XRT_OS_ANDROID) && !defined(XRT_OS_ANDROID_USE_AHB) || defined(XRT_OS_LINUX)
 
 /*!
  * The type underlying buffers shared between compositor clients and the main
@@ -280,6 +280,54 @@ xrt_graphics_buffer_is_valid(xrt_graphics_buffer_handle_t handle)
  * @relates xrt_graphics_buffer_handle_t
  */
 #define XRT_GRAPHICS_BUFFER_HANDLE_INVALID (-1)
+
+#elif defined(XRT_OS_MACOS)
+
+/*!
+ * The type underlying buffers shared between compositor clients and the main
+ * compositor.
+ *
+ * On macOS, this is a retained id<MTLTexture> (as void*) used with
+ * VK_EXT_external_memory_metal.
+ */
+typedef void *xrt_graphics_buffer_handle_t;
+
+/*!
+ * Defined to allow detection of the underlying type.
+ *
+ * @relates xrt_graphics_buffer_handle_t
+ */
+#define XRT_GRAPHICS_BUFFER_HANDLE_IS_METAL 1
+
+/*!
+ * Defined to indicate that the graphics buffer has a reference added by the import into Vulkan,
+ * and is not consumed nor does it need to be kept alive until destruction of the imported image.
+ *
+ * @relates xrt_graphics_buffer_handle_t
+ * @see XRT_GRAPHICS_BUFFER_HANDLE_CONSUMED_BY_VULKAN_IMPORT
+ */
+#define XRT_GRAPHICS_BUFFER_HANDLE_REFERENCE_ADDED_BY_VULKAN_IMPORT 1
+
+/*!
+ * Check whether a graphics buffer handle is valid.
+ *
+ * @public @memberof xrt_graphics_buffer_handle_t
+ */
+static inline bool
+xrt_graphics_buffer_is_valid(xrt_graphics_buffer_handle_t handle)
+{
+	return handle != NULL;
+}
+
+/*!
+ * An invalid value for a graphics buffer.
+ *
+ * Note that there may be more than one value that's invalid - use
+ * xrt_graphics_buffer_is_valid() instead of comparing against this!
+ *
+ * @relates xrt_graphics_buffer_handle_t
+ */
+#define XRT_GRAPHICS_BUFFER_HANDLE_INVALID NULL
 
 #elif defined(XRT_OS_WINDOWS)
 

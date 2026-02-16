@@ -112,6 +112,12 @@ struct vk_bundle
 		bool depth_image_import_d3d11;
 		bool depth_image_export_d3d11;
 
+#elif defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_METAL)
+		bool color_image_import_metal_texture;
+		bool color_image_export_metal_texture;
+		bool depth_image_import_metal_texture;
+		bool depth_image_export_metal_texture;
+
 #elif defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_FD)
 		bool color_image_import_opaque_fd;
 		bool color_image_export_opaque_fd;
@@ -185,6 +191,9 @@ struct vk_bundle
 	bool has_ANDROID_external_format_resolve;
 	bool has_GOOGLE_display_timing;
 	// end of GENERATED device extension code - do not modify - used by scripts
+
+	// Non-generated device extension tracking
+	bool has_EXT_external_memory_metal;
 
 	struct
 	{
@@ -471,6 +480,12 @@ struct vk_bundle
 	PFN_vkGetMemoryHostPointerPropertiesEXT vkGetMemoryHostPointerPropertiesEXT;
 
 #endif // defined(VK_EXT_external_memory_host)
+
+#if defined(VK_EXT_external_memory_metal)
+	PFN_vkGetMemoryMetalHandleEXT vkGetMemoryMetalHandleEXT;
+	PFN_vkGetMemoryMetalHandlePropertiesEXT vkGetMemoryMetalHandlePropertiesEXT;
+
+#endif // defined(VK_EXT_external_memory_metal)
 
 #if defined(VK_EXT_calibrated_timestamps)
 	PFN_vkGetCalibratedTimestampsEXT vkGetCalibratedTimestampsEXT;

@@ -193,8 +193,6 @@ find_package(OpenGL)
 set(OPENGL_WITHOUT_GLX_FOUND ${OPENGL_FOUND})
 if(APPLE)
 	set(XRT_HAVE_MACOS YES)
-	# Disable features not available on macOS (no epoll, no IPC service)
-	set(XRT_FEATURE_SERVICE OFF CACHE BOOL "Disabled on macOS" FORCE)
 endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
