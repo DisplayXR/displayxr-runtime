@@ -73,13 +73,11 @@ distributions:
       # This image does some extra work.
       - codename: trixie
         script: i386_and_proclamation_container_prep.sh
-        tag: "2026-02-04"
+        tag: "2026-02-07"
         deb_version_suffix: bpo13
         packages:
           <<: *default_debian_packages
-          clang-format:
           clang-tidy:
-          codespell:
           doxygen:
           graphviz:
           pipx:
@@ -121,12 +119,14 @@ distributions:
 
       - codename: bookworm
         script: i386_and_proclamation_container_prep.sh
-        tag: "2026-02-05"
+        tag: "2026-02-07"
         deb_version_suffix: bpo12
         packages:
           <<: *default_debian_packages
           pahole:
           python3-pip:
+          codespell:
+          clang-format:
         build_jobs:
           - name: "debian:bookworm"
             pahole: true
