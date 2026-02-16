@@ -19,11 +19,17 @@ BUILD_DIR="$ROOT/build"
 OPENXR_DIR="/tmp/openxr-install"
 OPENXR_VERSION="1.1.43"
 
+# Detect macOS SDK (CMake may pick a stale sysroot otherwise)
+MACOS_SDK="$(xcrun --show-sdk-path 2>/dev/null)"
+
 # Step 1: Build the runtime
 echo "=== Building SRMonado runtime ==="
 cmake -B "$BUILD_DIR" -S "$ROOT" -G Ninja \
   -DCMAKE_BUILD_TYPE=Debug \
-  -DXRT_FEATURE_SERVICE=OFF
+  -DXRT_FEATURE_SERVICE=OFF \
+  -DXRT_BUILD_DRIVER_QWERTY=OFF \
+  -DXRT_FEATURE_DEBUG_GUI=OFF \
+  ${MACOS_SDK:+-DCMAKE_OSX_SYSROOT="$MACOS_SDK"}
 cmake --build "$BUILD_DIR"
 
 # Step 2: Build OpenXR loader (if not already cached)

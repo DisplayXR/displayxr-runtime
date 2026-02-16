@@ -8,20 +8,23 @@ This is a fork of **Monado**, an open source OpenXR runtime for VR/AR devices. T
 
 ## Build Commands
 
-### Important: Do Not Build Locally on macOS
-This project targets **Windows** with LeiaSR SDK and D3D11 support. Local builds on macOS will fail with platform-specific errors that are not relevant to the actual codebase.
+### Local macOS Build
+Local macOS builds work for the runtime and sim_display test app. Use the convenience script:
+```bash
+# Prerequisites: brew install cmake ninja eigen vulkan-sdk
+./scripts/build_macos.sh
+```
+This builds the runtime (with qwerty/debug GUI disabled), OpenXR loader, and sim_cube_openxr test app. Note: the Vulkan compositor will fail at runtime with `VK_ERROR_EXTENSION_NOT_PRESENT` because MoltenVK lacks `VK_KHR_external_memory_fd` — this is a known MoltenVK limitation, not a build issue.
 
-**Instead of building locally**, use the `/ci-monitor` skill to:
+### Windows CI Build (Primary)
+This project primarily targets **Windows** with LeiaSR SDK and D3D11 support. Use `/ci-monitor` to:
 - Commit and push changes
-- Monitor the GitHub Actions Windows build
-- Get actual build errors and auto-fix them
+- Monitor GitHub Actions builds (Windows + macOS)
+- Auto-diagnose and fix build errors
 
-Example:
 ```bash
 /ci-monitor "your commit message"
 ```
-
-See the `/ci-monitor` skill section below for full details.
 
 ### Standard CMake Build
 ```bash
@@ -126,10 +129,17 @@ For substantial changes, create a fragment in `doc/changes/<section>/mr.NUMBER.m
 - If `LEIASR_SDKROOT` is not set, a CMake warning is shown and SR weaver support is disabled
 
 ### GitHub Actions Build
-The CI build in `.github/workflows/build-windows.yml` requires:
+**Windows** (`.github/workflows/build-windows.yml`):
 - `LEIASR_SDKROOT` env var set in the Generate step pointing to the downloaded SR SDK
 - `CMAKE_PREFIX_PATH` pointing to the SR SDK for find_package to work
 - Both are needed: PREFIX_PATH for find_package detection, LEIASR_SDKROOT for library paths
+- Artifact: `SRMonado` (runtime + installer + test apps)
+
+**macOS** (`.github/workflows/build-macos.yml`):
+- Builds runtime with Vulkan SDK via MoltenVK, packages sim_cube_openxr test app
+- Bundles libvulkan, MoltenVK, and OpenXR loader for self-contained artifact
+- Toggle test app build with `BUILD_TEST_APP: true/false` env var
+- Artifact: `SRMonado-macOS` (runtime + test app + run script)
 
 ## Claude Code Skills
 
@@ -145,7 +155,7 @@ Automates the complete CI workflow: commit → push → monitor → auto-fix.
 
 **Features:**
 - Launches subagent to preserve main conversation context
-- Monitors GitHub Actions `build-windows.yml` workflow
+- Monitors GitHub Actions `build-windows.yml` and `build-macos.yml` workflows
 - Auto-diagnoses common build errors (missing includes, undeclared identifiers, linker errors)
 - Attempts up to 3 automatic fixes before reporting failure
 - Reports success with artifact URL or failure with diagnostics
