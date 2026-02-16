@@ -122,17 +122,19 @@ ipc_connect_pipe(struct ipc_connection *ipc_c, const char *pipe_name)
 		IPC_ERROR(ipc_c, "GetModuleHandleExA failed: %d %s", err, ipc_winerror(err));
 		return INVALID_HANDLE_VALUE;
 	}
-	char service_path[MAX_PATH];
-	if (!GetModuleFileNameA(hmod, service_path, sizeof(service_path))) {
+	char current_path[MAX_PATH] = {0};
+	if (!GetModuleFileNameA(hmod, current_path, sizeof(current_path))) {
 		IPC_ERROR(ipc_c, "GetModuleFileNameA failed: %d %s", err, ipc_winerror(err));
 		return INVALID_HANDLE_VALUE;
 	}
-	char *p = strrchr(service_path, '\\');
+	char *p = strrchr(current_path, '\\');
 	if (!p) {
-		IPC_ERROR(ipc_c, "failed to parse the path %s", service_path);
+		IPC_ERROR(ipc_c, "failed to parse the path %s", current_path);
 		return INVALID_HANDLE_VALUE;
 	}
-	strcpy(p + 1, XRT_SERVICE_EXECUTABLE);
+
+	char service_path[MAX_PATH] = {0};
+	snprintf(service_path, MAX_PATH, "%s\\%s", current_path, XRT_SERVICE_EXECUTABLE);
 	STARTUPINFOA si = {.cb = sizeof(si)};
 	PROCESS_INFORMATION pi;
 	if (!CreateProcessA(NULL, service_path, NULL, NULL, false, 0, NULL, NULL, &si, &pi)) {
@@ -144,7 +146,8 @@ ipc_connect_pipe(struct ipc_connection *ipc_c, const char *pipe_name)
 			         ipc_winerror(err));
 			return INVALID_HANDLE_VALUE;
 		}
-		strcpy(p + 1, "service\\" XRT_SERVICE_EXECUTABLE);
+
+		snprintf(service_path, MAX_PATH, "%s\\service\\%s", current_path, XRT_SERVICE_EXECUTABLE);
 		if (!CreateProcessA(NULL, service_path, NULL, NULL, false, 0, NULL, NULL, &si, &pi)) {
 			err = GetLastError();
 			IPC_INFO(ipc_c, XRT_SERVICE_EXECUTABLE " not found at %s: %d %s", service_path, err,
@@ -177,7 +180,7 @@ ipc_client_socket_connect(struct ipc_connection *ipc_c)
 	const char pipe_prefix[] = "\\\\.\\pipe\\";
 #define prefix_len sizeof(pipe_prefix) - 1
 	char pipe_name[MAX_PATH + prefix_len];
-	strcpy(pipe_name, pipe_prefix);
+	snprintf(pipe_name, sizeof(pipe_name), "%s", pipe_prefix);
 
 	if (u_file_get_path_in_runtime_dir(XRT_IPC_MSG_SOCK_FILENAME, pipe_name + prefix_len, MAX_PATH) == -1) {
 		U_LOG_E("u_file_get_path_in_runtime_dir failed!");
