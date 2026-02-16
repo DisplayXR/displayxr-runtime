@@ -113,3 +113,9 @@ vk_layer_settings.txt
 .kotlin
 
 cnsdk
+
+# Ignore macOS metadata
+.DS_Store
+
+# Ignore packaging artifacts
+_package/
