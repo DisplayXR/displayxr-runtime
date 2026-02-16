@@ -24,6 +24,11 @@
 #include "android/android_ahardwarebuffer_allocator.h"
 #endif
 
+#if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_METAL) && defined(VK_USE_PLATFORM_METAL_EXT)
+#include <IOSurface/IOSurface.h>
+#include <vulkan/vulkan_metal.h>
+#endif
+
 
 /*
  *
@@ -171,6 +176,18 @@ create_image(struct vk_bundle *vk, const struct xrt_swapchain_create_info *info,
 	    .pNext = next_chain,
 	};
 	CHAIN(external_memory_image_create_info);
+
+#if defined(VK_EXT_metal_objects)
+	// Request IOSurface-backed allocation so the Metal texture can be shared
+	// cross-process via IOSurfaceID for IPC/service mode.
+	VkExportMetalObjectCreateInfoEXT export_metal_info = {
+	    .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECT_CREATE_INFO_EXT,
+	    .exportObjectType = VK_EXPORT_METAL_OBJECT_TYPE_METAL_IOSURFACE_BIT_EXT,
+	};
+	if (vk->has_EXT_metal_objects) {
+		CHAIN(export_metal_info);
+	}
+#endif
 
 	// Format list helper needed for the below.
 	struct format_list_helper flh = XRT_STRUCT_INIT;
@@ -519,6 +536,29 @@ vk_ic_get_handles(struct vk_bundle *vk,
 
 	size_t i = 0;
 	for (; i < vkic->image_count && i < max_handles; i++) {
+#if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_METAL) && defined(VK_EXT_metal_objects)
+		// Export the IOSurface directly from the VkImage.
+		// This is the canonical handle type for macOS cross-process sharing.
+		if (vk->has_EXT_metal_objects) {
+			VkExportMetalIOSurfaceInfoEXT export_surface = {
+			    .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_IO_SURFACE_INFO_EXT,
+			    .image = vkic->images[i].handle,
+			    .ioSurface = NULL,
+			};
+			VkExportMetalObjectsInfoEXT export_info = {
+			    .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT,
+			    .pNext = &export_surface,
+			};
+			vk->vkExportMetalObjectsEXT(vk->device, &export_info);
+			if (export_surface.ioSurface == NULL) {
+				ret = VK_ERROR_FEATURE_NOT_PRESENT;
+				break;
+			}
+			CFRetain(export_surface.ioSurface);
+			out_handles[i] = (void *)export_surface.ioSurface;
+			continue;
+		}
+#endif
 		ret = vk_get_native_handle_from_device_memory(vk, vkic->images[i].memory, &out_handles[i]);
 		if (ret != VK_SUCCESS) {
 			break;

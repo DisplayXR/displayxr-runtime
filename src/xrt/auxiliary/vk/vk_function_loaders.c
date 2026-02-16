@@ -314,6 +314,11 @@ vk_get_device_functions(struct vk_bundle *vk)
 
 #endif // defined(VK_EXT_external_memory_metal)
 
+#if defined(VK_EXT_metal_objects)
+	vk->vkExportMetalObjectsEXT                    = GET_DEV_PROC(vk, vkExportMetalObjectsEXT);
+
+#endif // defined(VK_EXT_metal_objects)
+
 #if defined(VK_EXT_calibrated_timestamps)
 	vk->vkGetCalibratedTimestampsEXT                = GET_DEV_PROC(vk, vkGetCalibratedTimestampsEXT);
 

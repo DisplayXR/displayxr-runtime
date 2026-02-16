@@ -255,9 +255,7 @@ submit_fallback(struct client_vk_compositor *c, xrt_result_t *out_xret)
 		vk_queue_unlock(vk->main_queue);
 	}
 
-	U_LOG_W("[vk_client] submit_fallback: calling xrt_comp_layer_commit xcn=%p", (void *)&c->xcn->base);
 	*out_xret = xrt_comp_layer_commit(&c->xcn->base, XRT_GRAPHICS_SYNC_HANDLE_INVALID);
-	U_LOG_W("[vk_client] submit_fallback: layer_commit returned %d", *out_xret);
 	return true;
 }
 
@@ -476,10 +474,8 @@ client_vk_compositor_layer_begin(struct xrt_compositor *xc, const struct xrt_lay
 	COMP_TRACE_MARKER();
 
 	struct xrt_compositor *xcn = to_native_compositor(xc);
-	U_LOG_W("[vk_client] layer_begin: xc=%p xcn=%p frame_id=%" PRId64, (void *)xc, (void *)xcn, data->frame_id);
 
 	xrt_result_t xret = xrt_comp_layer_begin(xcn, data);
-	U_LOG_W("[vk_client] layer_begin returned %d", xret);
 	return xret;
 }
 
@@ -656,20 +652,14 @@ client_vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_h
 		}
 	}
 
-	U_LOG_W("[vk_client] layer_commit: xc=%p xcn=%p", (void *)xc, (void *)&c->xcn->base);
-
 	xrt_result_t xret = XRT_SUCCESS;
 	if (submit_handle(c, sync_handle, &xret)) {
-		U_LOG_W("[vk_client] layer_commit: submit_handle handled, xret=%d", xret);
 		return xret;
 	} else if (submit_semaphore(c, &xret)) {
-		U_LOG_W("[vk_client] layer_commit: submit_semaphore handled, xret=%d", xret);
 		return xret;
 	} else if (submit_fence(c, &xret)) {
-		U_LOG_W("[vk_client] layer_commit: submit_fence handled, xret=%d", xret);
 		return xret;
 	} else if (submit_fallback(c, &xret)) {
-		U_LOG_W("[vk_client] layer_commit: submit_fallback handled, xret=%d", xret);
 		return xret;
 	} else {
 		// Really bad state.
@@ -926,7 +916,6 @@ client_vk_compositor_create(struct xrt_compositor_native *xcn,
 
 	// If the native compositor says no external fence sync, clear the flag
 	// so submit_fence is skipped and submit_fallback (vkQueueWaitIdle) is used.
-	U_LOG_W("[vk_client] create: xcn=%p disable_fence_sync=%d", (void *)xcn, xcn->base.info.disable_fence_sync);
 	if (xcn->base.info.disable_fence_sync) {
 #if defined(XRT_GRAPHICS_SYNC_HANDLE_IS_FD)
 		c->vk.external.fence_sync_fd = false;

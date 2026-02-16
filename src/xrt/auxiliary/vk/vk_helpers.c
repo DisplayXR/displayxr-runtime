@@ -1168,6 +1168,27 @@ vk_create_image_from_native(struct vk_bundle *vk,
 	    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
 	};
 
+#if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_METAL) && defined(VK_EXT_metal_objects)
+	// Import the IOSurface into the VkImage at creation time.
+	// MoltenVK creates a correctly-configured MTLTexture from the IOSurface.
+	VkImportMetalIOSurfaceInfoEXT import_iosurface_info = {
+	    .sType = VK_STRUCTURE_TYPE_IMPORT_METAL_IO_SURFACE_INFO_EXT,
+	    .pNext = NULL,
+	    .ioSurface = (IOSurfaceRef)image_native->handle,
+	};
+	// Request MTLTexture exportability so we can extract it for memory import.
+	VkExportMetalObjectCreateInfoEXT export_metal_tex_info = {
+	    .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECT_CREATE_INFO_EXT,
+	    .pNext = NULL,
+	    .exportObjectType = VK_EXPORT_METAL_OBJECT_TYPE_METAL_TEXTURE_BIT_EXT,
+	};
+	if (vk->has_EXT_metal_objects) {
+		export_metal_tex_info.pNext = vk_info.pNext;
+		import_iosurface_info.pNext = &export_metal_tex_info;
+		vk_info.pNext = &import_iosurface_info;
+	}
+#endif
+
 	VkImage image = VK_NULL_HANDLE;
 	ret = vk->vkCreateImage(vk->device, &vk_info, NULL, &image);
 	if (ret != VK_SUCCESS) {
@@ -1188,11 +1209,37 @@ vk_create_image_from_native(struct vk_bundle *vk,
 
 	// TODO memoryTypeBits from VkMemoryFdPropertiesKHR
 #elif defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_METAL)
+	// The IOSurface was imported into the VkImage via VkImportMetalIOSurfaceInfoEXT.
+	// Export the correctly-configured MTLTexture that MoltenVK created internally,
+	// then use it for memory import via VkImportMemoryMetalHandleInfoEXT.
+	void *metal_texture_handle = image_native->handle;
+
+#if defined(VK_EXT_metal_objects)
+	if (vk->has_EXT_metal_objects) {
+		VkExportMetalTextureInfoEXT export_tex_info = {
+		    .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_TEXTURE_INFO_EXT,
+		    .image = image,
+		    .imageView = VK_NULL_HANDLE,
+		    .bufferView = VK_NULL_HANDLE,
+		    .plane = VK_IMAGE_ASPECT_COLOR_BIT,
+		    .mtlTexture = NULL,
+		};
+		VkExportMetalObjectsInfoEXT export_objects_info = {
+		    .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT,
+		    .pNext = &export_tex_info,
+		};
+		vk->vkExportMetalObjectsEXT(vk->device, &export_objects_info);
+		if (export_tex_info.mtlTexture != NULL) {
+			metal_texture_handle = (void *)export_tex_info.mtlTexture;
+		}
+	}
+#endif
+
 	VkImportMemoryMetalHandleInfoEXT import_memory_info = {
 	    .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_METAL_HANDLE_INFO_EXT,
 	    .pNext = NULL,
 	    .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT,
-	    .handle = image_native->handle,
+	    .handle = metal_texture_handle,
 	};
 
 	VkMemoryMetalHandlePropertiesEXT metal_props = {
@@ -1202,7 +1249,7 @@ vk_create_image_from_native(struct vk_bundle *vk,
 	ret = vk->vkGetMemoryMetalHandlePropertiesEXT(                //
 	    vk->device,                                               // device
 	    VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT,        // handleType
-	    image_native->handle,                                     // pHandle
+	    metal_texture_handle,                                     // pHandle
 	    &metal_props);                                            // pMemoryMetalHandleProperties
 	if (ret != VK_SUCCESS) {
 		VK_ERROR(vk, "vkGetMemoryMetalHandlePropertiesEXT: %s", vk_result_string(ret));
@@ -1259,6 +1306,13 @@ vk_create_image_from_native(struct vk_bundle *vk,
 		 * the size must be queried by the implementation (See VkMemoryAllocateInfo manual page)
 		 * so skip size check
 		 */
+#if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_METAL)
+	} else if (handle_type == VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT) {
+		/*
+		 * Metal textures imported via IOSurface may report different sizes
+		 * between the export and import sides. Skip size validation.
+		 */
+#endif
 	} else if (requirements.size == 0) {
 		/*
 		 * VUID-VkMemoryAllocateInfo-allocationSize-07899

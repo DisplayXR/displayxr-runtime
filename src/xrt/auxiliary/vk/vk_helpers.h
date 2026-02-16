@@ -195,6 +195,7 @@ struct vk_bundle
 
 	// Non-generated device extension tracking
 	bool has_EXT_external_memory_metal;
+	bool has_EXT_metal_objects;
 
 	struct
 	{
@@ -487,6 +488,11 @@ struct vk_bundle
 	PFN_vkGetMemoryMetalHandlePropertiesEXT vkGetMemoryMetalHandlePropertiesEXT;
 
 #endif // defined(VK_EXT_external_memory_metal)
+
+#if defined(VK_EXT_metal_objects)
+	PFN_vkExportMetalObjectsEXT vkExportMetalObjectsEXT;
+
+#endif // defined(VK_EXT_metal_objects)
 
 #if defined(VK_EXT_calibrated_timestamps)
 	PFN_vkGetCalibratedTimestampsEXT vkGetCalibratedTimestampsEXT;

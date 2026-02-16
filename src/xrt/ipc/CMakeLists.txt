@@ -49,6 +49,11 @@ endif()
 
 target_link_libraries(ipc_shared PRIVATE aux_util)
 
+if(APPLE)
+	target_sources(ipc_shared PRIVATE shared/ipc_metal_utils.m)
+	target_link_libraries(ipc_shared PRIVATE "-framework Metal" "-framework IOSurface" "-framework CoreFoundation")
+endif()
+
 if(RT_LIBRARY)
 	target_link_libraries(ipc_shared PUBLIC ${RT_LIBRARY})
 endif()

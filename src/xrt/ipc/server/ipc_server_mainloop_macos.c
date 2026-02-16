@@ -41,6 +41,12 @@
 #include <assert.h>
 #include <limits.h>
 
+/*
+ * "XRT_NO_STDIN" option disables stdin and prevents monado-service from terminating.
+ * This could be useful for situations where there is no proper or in a non-interactive shell.
+ */
+DEBUG_GET_ONCE_BOOL_OPTION(skip_stdin, "XRT_NO_STDIN", false)
+
 
 /*
  *
@@ -146,8 +152,11 @@ init_kqueue(struct ipc_server_mainloop *ml)
 	int nchanges = 0;
 
 	// Monitor stdin for shutdown (like the Linux epoll path).
-	EV_SET(&changes[nchanges], 0 /* stdin */, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, NULL);
-	nchanges++;
+	// Skip if stdin is not a TTY (background process) or XRT_NO_STDIN is set.
+	if (!debug_get_bool_option_skip_stdin() && isatty(0)) {
+		EV_SET(&changes[nchanges], 0 /* stdin */, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, NULL);
+		nchanges++;
+	}
 
 	// Monitor the listen socket for new connections.
 	EV_SET(&changes[nchanges], ml->listen_socket, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, NULL);

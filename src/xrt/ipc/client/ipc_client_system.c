@@ -79,8 +79,6 @@ create_with_comp(struct ipc_client_system *icsys,
 
 	assert(icsys->xsysc != NULL);
 
-	U_LOG_W("IPC CLIENT: create_with_comp called, creating native compositor...");
-
 	// The native compositor creates the session.
 	xret = ipc_client_create_native_compositor( //
 	    icsys->xsysc,                           //
@@ -88,12 +86,8 @@ create_with_comp(struct ipc_client_system *icsys,
 	    out_xcn);                               //
 	IPC_CHK_AND_RET(icsys->ipc_c, xret, "ipc_client_create_native_compositor");
 
-	U_LOG_W("IPC CLIENT: compositor created, creating xrt_session...");
-
 	struct xrt_session *xs = ipc_client_session_create(icsys->ipc_c);
 	assert(xs != NULL);
-
-	U_LOG_W("IPC CLIENT: xrt_session created at %p, assigning to out_xs", (void*)xs);
 
 	*out_xs = xs;
 

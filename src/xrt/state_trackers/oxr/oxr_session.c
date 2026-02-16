@@ -1590,9 +1590,6 @@ oxr_session_create_impl(struct oxr_logger *log,
                         const struct xrt_session_info *xsi,
                         struct oxr_session **out_session)
 {
-	// Use U_LOG_IFL_I with U_LOGGING_INFO to always log (bypass global log level filter)
-	U_LOG_IFL_I(U_LOGGING_INFO, "oxr_session_create_impl called - window_handle=%p", xsi ? xsi->external_window_handle : NULL);
-
 #if defined(XR_USE_PLATFORM_XLIB) && defined(XR_USE_GRAPHICS_API_OPENGL)
 	XrGraphicsBindingOpenGLXlibKHR const *opengl_xlib = OXR_GET_INPUT_FROM_CHAIN(
 	    createInfo, XR_TYPE_GRAPHICS_BINDING_OPENGL_XLIB_KHR, XrGraphicsBindingOpenGLXlibKHR);
@@ -1850,11 +1847,8 @@ oxr_session_create(struct oxr_logger *log,
 	// Used to delay session state transitions for sandbox compatibility
 #ifdef OXR_HAVE_EXT_win32_appcontainer_compatible
 	sess->is_appcontainer = sys->inst->extensions.EXT_win32_appcontainer_compatible;
-	U_LOG_W("oxr_session_create: EXT_win32_appcontainer_compatible=%d -> is_appcontainer=%d",
-	        sys->inst->extensions.EXT_win32_appcontainer_compatible, sess->is_appcontainer);
 #else
 	sess->is_appcontainer = false;
-	U_LOG_W("oxr_session_create: OXR_HAVE_EXT_win32_appcontainer_compatible not defined, is_appcontainer=false");
 #endif
 
 	// Initialize compositor visibility/focus from compositor info (IPC long-term fix)
@@ -1862,8 +1856,6 @@ oxr_session_create(struct oxr_logger *log,
 	if (sess->compositor != NULL) {
 		sess->compositor_visible = sess->compositor->info.initial_visible;
 		sess->compositor_focused = sess->compositor->info.initial_focused;
-		U_LOG_W("oxr_session_create: initialized compositor_visible=%d compositor_focused=%d from compositor info",
-		        sess->compositor_visible, sess->compositor_focused);
 	}
 
 	// Everything is in order, start the state changes.

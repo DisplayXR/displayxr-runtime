@@ -29,6 +29,10 @@
 #include <stdint.h>
 #include <assert.h>
 
+#ifdef XRT_OS_MACOS
+#include <CoreFoundation/CoreFoundation.h>
+#endif
+
 // MSG_NOSIGNAL is Linux-only; on macOS we use SO_NOSIGPIPE on the socket instead.
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
@@ -321,9 +325,12 @@ ipc_send_handles_graphics_buffer(struct ipc_message_channel *imc,
 
 #elif defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_METAL)
 
-// Metal texture handles (void*) cannot be sent over Unix sockets directly.
-// Cross-process Metal texture sharing requires IOSurface (Phase 3).
-// For now, return failure — single-process mode doesn't use IPC buffer transport.
+// Metal texture handles (void*) are process-local id<MTLTexture> pointers and
+// cannot be sent over Unix sockets directly.  We use IOSurface for cross-process
+// sharing: the server extracts the IOSurfaceID (a global 32-bit integer) from
+// each texture, sends it, and the client looks it up to reconstruct the texture.
+
+#include "shared/ipc_metal_utils.h"
 
 xrt_result_t
 ipc_receive_handles_graphics_buffer(struct ipc_message_channel *imc,
@@ -332,8 +339,53 @@ ipc_receive_handles_graphics_buffer(struct ipc_message_channel *imc,
                                     xrt_graphics_buffer_handle_t *out_handles,
                                     uint32_t handle_count)
 {
-	IPC_ERROR(imc, "Metal graphics buffer IPC transport not yet implemented (needs IOSurface)");
-	return XRT_ERROR_IPC_FAILURE;
+	// 1. Receive the message payload.
+	xrt_result_t result = ipc_receive(imc, out_data, size);
+	if (result != XRT_SUCCESS) {
+		return result;
+	}
+
+	// 2. Receive actual handle count (sender may have fewer than our max).
+	uint32_t actual_count = 0;
+	result = ipc_receive(imc, &actual_count, sizeof(actual_count));
+	if (result != XRT_SUCCESS) {
+		return result;
+	}
+
+	if (actual_count > XRT_MAX_SWAPCHAIN_IMAGES) {
+		IPC_ERROR(imc, "Received invalid IOSurface handle count %u", actual_count);
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	if (actual_count == 0) {
+		return XRT_SUCCESS;
+	}
+
+	// 3. Receive the array of IOSurfaceIDs.
+	uint32_t ids[XRT_MAX_SWAPCHAIN_IMAGES] = {0};
+	result = ipc_receive(imc, ids, sizeof(uint32_t) * actual_count);
+	if (result != XRT_SUCCESS) {
+		return result;
+	}
+
+	// 4. Look up each IOSurface by ID — returns retained IOSurfaceRef as void*.
+	for (uint32_t i = 0; i < actual_count; i++) {
+		void *surface = ipc_metal_iosurface_from_id(ids[i]);
+		if (!surface) {
+			IPC_ERROR(imc, "Failed to look up IOSurface from ID %u", ids[i]);
+			// Release any surfaces we already looked up.
+			for (uint32_t j = 0; j < i; j++) {
+				if (out_handles[j]) {
+					CFRelease(out_handles[j]);
+					out_handles[j] = NULL;
+				}
+			}
+			return XRT_ERROR_IPC_FAILURE;
+		}
+		out_handles[i] = surface;
+	}
+
+	return XRT_SUCCESS;
 }
 
 xrt_result_t
@@ -343,8 +395,37 @@ ipc_send_handles_graphics_buffer(struct ipc_message_channel *imc,
                                  const xrt_graphics_buffer_handle_t *handles,
                                  uint32_t handle_count)
 {
-	IPC_ERROR(imc, "Metal graphics buffer IPC transport not yet implemented (needs IOSurface)");
-	return XRT_ERROR_IPC_FAILURE;
+	// 1. Send the message payload.
+	xrt_result_t result = ipc_send(imc, data, size);
+	if (result != XRT_SUCCESS) {
+		return result;
+	}
+
+	// 2. Send actual handle count so receiver knows how many IDs follow.
+	result = ipc_send(imc, &handle_count, sizeof(handle_count));
+	if (result != XRT_SUCCESS) {
+		return result;
+	}
+
+	if (handle_count == 0) {
+		return XRT_SUCCESS;
+	}
+
+	// 3. Extract IOSurfaceID from each Metal texture handle.
+	uint32_t ids[XRT_MAX_SWAPCHAIN_IMAGES] = {0};
+	for (uint32_t i = 0; i < handle_count; i++) {
+		ids[i] = ipc_metal_handle_to_iosurface_id(handles[i]);
+		if (ids[i] == 0) {
+			IPC_ERROR(imc,
+			          "Metal texture at index %u has no IOSurface backing "
+			          "(MoltenVK may not support IOSurface-backed allocations)",
+			          i);
+			return XRT_ERROR_IPC_FAILURE;
+		}
+	}
+
+	// 4. Send the array of IOSurfaceIDs.
+	return ipc_send(imc, ids, sizeof(uint32_t) * handle_count);
 }
 
 

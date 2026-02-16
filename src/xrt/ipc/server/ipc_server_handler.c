@@ -725,11 +725,6 @@ ipc_handle_space_create_semantic_ids(volatile struct ipc_client_state *ics,
 
 	struct xrt_space_overseer *xso = ics->server->xso;
 
-	U_LOG_W("IPC space_create_semantic_ids: xso=%p", (void *)xso);
-	U_LOG_W("  semantic.root=%p view=%p stage=%p unbounded=%p",
-	        (void *)xso->semantic.root, (void *)xso->semantic.view,
-	        (void *)xso->semantic.stage, (void *)xso->semantic.unbounded);
-
 #define CREATE(NAME)                                                                                                   \
 	do {                                                                                                           \
 		*out_##NAME##_id = UINT32_MAX;                                                                         \
@@ -751,13 +746,7 @@ ipc_handle_space_create_semantic_ids(volatile struct ipc_client_state *ics,
 
 #undef CREATE
 
-	U_LOG_W("IPC space_create_semantic_ids: root_id=%u view_id=%u stage_id=%u unbounded_id=%u",
-	        *out_root_id, *out_view_id, *out_stage_id, *out_unbounded_id);
-
 	xrt_result_t xret = create_localspace(ics, out_local_id, out_local_floor_id);
-
-	U_LOG_W("IPC space_create_semantic_ids: local_id=%u local_floor_id=%u (ret=%d)",
-	        *out_local_id, *out_local_floor_id, xret);
 
 	return xret;
 }

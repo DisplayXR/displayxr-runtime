@@ -979,6 +979,16 @@ fill_in_has_device_extensions(struct vk_bundle *vk, struct u_string_list *ext_li
 		}
 	}
 #endif // defined(VK_EXT_external_memory_metal)
+
+	vk->has_EXT_metal_objects = false;
+#if defined(VK_EXT_metal_objects)
+	for (uint32_t i = 0; i < ext_count; i++) {
+		if (strcmp(exts[i], VK_EXT_METAL_OBJECTS_EXTENSION_NAME) == 0) {
+			vk->has_EXT_metal_objects = true;
+			break;
+		}
+	}
+#endif // defined(VK_EXT_metal_objects)
 }
 
 static bool
@@ -1778,6 +1788,19 @@ vk_init_from_given(struct vk_bundle *vk,
 		VK_WARN(vk, "EXT_debug_utils requested but extension was not available at compile time");
 #endif
 	}
+
+	// Detect Metal extensions from loaded function pointers.
+	// Vulkan does not let us read what extensions were enabled.
+#if defined(VK_EXT_metal_objects)
+	if (vk->vkExportMetalObjectsEXT != NULL) {
+		vk->has_EXT_metal_objects = true;
+	}
+#endif
+#if defined(VK_EXT_external_memory_metal)
+	if (vk->vkGetMemoryMetalHandleEXT != NULL) {
+		vk->has_EXT_external_memory_metal = true;
+	}
+#endif
 
 	return VK_SUCCESS;
 
