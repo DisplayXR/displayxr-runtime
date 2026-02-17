@@ -50,6 +50,10 @@
 #include <timeapi.h>
 #endif
 
+#if defined(XRT_OS_MACOS)
+#include <CoreFoundation/CoreFoundation.h>
+#endif
+
 
 /*
  *
@@ -524,7 +528,15 @@ static int
 main_loop(struct ipc_server *s)
 {
 	while (s->running) {
+#if defined(XRT_OS_MACOS)
+		// macOS: process the main dispatch queue so GCD dispatches
+		// (e.g. window creation from compositor threads) can execute.
+		// CFRunLoopRunInMode returns after the timeout or after
+		// processing sources, whichever comes first.
+		CFRunLoopRunInMode(kCFRunLoopDefaultMode, 1.0 / 20.0, false);
+#else
 		os_nanosleep(U_TIME_1S_IN_NS / 20);
+#endif
 
 		// Check polling.
 		ipc_server_mainloop_poll(s, &s->ml);

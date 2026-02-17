@@ -140,6 +140,13 @@ comp_window_macos_destroy(struct comp_target *ct)
 static void
 comp_window_macos_flush(struct comp_target *ct)
 {
+	// NSApp event processing must happen on the main thread.
+	// In IPC service mode the compositor renders on a background thread,
+	// so skip here — the main loop's CFRunLoopRunInMode handles it.
+	if (![NSThread isMainThread]) {
+		return;
+	}
+
 	@autoreleasepool {
 		// Pump the macOS event loop so the window remains responsive.
 		NSEvent *event;

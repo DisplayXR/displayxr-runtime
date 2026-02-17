@@ -4,7 +4,8 @@
 # Prerequisites: brew install cmake ninja eigen vulkan-sdk
 #
 # Usage:
-#   ./scripts/build_macos.sh
+#   ./scripts/build_macos.sh             # In-process mode (default)
+#   ./scripts/build_macos.sh --service   # IPC service mode (monado-service + client)
 #
 # Then run:
 #   XR_RUNTIME_JSON=./build/openxr_monado-dev.json \
@@ -19,14 +20,22 @@ BUILD_DIR="$ROOT/build"
 OPENXR_DIR="/tmp/openxr-install"
 OPENXR_VERSION="1.1.43"
 
+# Parse arguments
+SERVICE_MODE=OFF
+for arg in "$@"; do
+  case "$arg" in
+    --service) SERVICE_MODE=ON ;;
+  esac
+done
+
 # Detect macOS SDK (CMake may pick a stale sysroot otherwise)
 MACOS_SDK="$(xcrun --show-sdk-path 2>/dev/null)"
 
 # Step 1: Build the runtime
-echo "=== Building SRMonado runtime ==="
+echo "=== Building SRMonado runtime (SERVICE=$SERVICE_MODE) ==="
 cmake -B "$BUILD_DIR" -S "$ROOT" -G Ninja \
   -DCMAKE_BUILD_TYPE=Debug \
-  -DXRT_FEATURE_SERVICE=OFF \
+  -DXRT_FEATURE_SERVICE=$SERVICE_MODE \
   -DXRT_BUILD_DRIVER_QWERTY=OFF \
   -DXRT_FEATURE_DEBUG_GUI=OFF \
   -DXRT_FEATURE_WINDOW_PEEK=OFF \
