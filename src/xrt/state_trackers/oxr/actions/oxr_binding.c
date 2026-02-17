@@ -365,36 +365,20 @@ get_interaction_bound_to_sub_path(struct oxr_session *sess, enum oxr_subaction_p
 }
 
 static const char *
-get_identifier_str_in_profile(struct oxr_logger *log,
-                              struct oxr_instance *inst,
-                              XrPath path,
-                              struct oxr_interaction_profile *oip)
+get_identifier_localized_name(XrPath path, const struct oxr_interaction_profile *profile)
 {
-	const char *str = NULL;
-	size_t length = 0;
-	XrResult ret;
-
-	ret = oxr_path_get_string(log, inst, path, &str, &length);
-	if (ret != XR_SUCCESS) {
-		return NULL;
-	}
-
-	for (size_t i = 0; i < oip->binding_count; i++) {
-		struct oxr_binding *binding = &oip->bindings[i];
+	for (size_t i = 0; i < profile->binding_count; i++) {
+		const struct oxr_binding *binding = &profile->bindings[i];
 
 		for (size_t k = 0; k < binding->path_count; k++) {
-			if (binding->paths[k] != path) {
-				continue;
+			if (binding->paths[k] == path) {
+				return binding->localized_name;
 			}
-			str = binding->localized_name;
-			i = oip->binding_count; // Break the outer loop as well.
-			break;
 		}
 	}
 
-	return str;
+	return NULL;
 }
-
 
 
 /*
@@ -694,12 +678,16 @@ oxr_action_get_input_source_localized_name(struct oxr_logger *log,
 
 	//! @todo This implementation is very very very inelegant.
 	if ((getInfo->whichComponents & XR_INPUT_SOURCE_LOCALIZED_NAME_COMPONENT_BIT) != 0) {
+		const char *localized_name = get_identifier_localized_name(getInfo->sourcePath, oip);
+		if (localized_name == NULL) {
+			return oxr_error(log, XR_ERROR_RUNTIME_FAILURE, "couldn't get identifier localized name");
+		}
+
 		/*
 		 * The preceding enum is misnamed: it should be called identifier
 		 * instead of component. But, this is a spec bug.
 		 */
-		add_string(temp, sizeof(temp), &current,
-		           get_identifier_str_in_profile(log, sess->sys->inst, getInfo->sourcePath, oip));
+		add_string(temp, sizeof(temp), &current, localized_name);
 	}
 
 	// Include the null character.
