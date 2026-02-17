@@ -275,9 +275,17 @@ create_device(struct vk_bundle *vk, const struct comp_vulkan_arguments *vk_args)
 	};
 
 	VkQueueGlobalPriorityEXT prios[3] = {
+#ifdef XRT_OS_MACOS
+	    // MoltenVK doesn't support REALTIME. Skip it to avoid a failed
+	    // vkCreateDevice attempt that may corrupt internal state.
+	    VK_QUEUE_GLOBAL_PRIORITY_HIGH_EXT,
+	    VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_EXT,
+	    VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_EXT,   // Duplicate to fill array.
+#else
 	    VK_QUEUE_GLOBAL_PRIORITY_REALTIME_EXT, // This is the one we really want.
 	    VK_QUEUE_GLOBAL_PRIORITY_HIGH_EXT,     // Probably not as good but something.
 	    VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_EXT,   // Default fallback.
+#endif
 	};
 
 	const bool only_compute_queue = vk_args->only_compute_queue;
@@ -289,7 +297,13 @@ create_device(struct vk_bundle *vk, const struct comp_vulkan_arguments *vk_args)
 	    .null_descriptor = only_compute_queue,
 	    .timeline_semaphore = vk_args->timeline_semaphore,
 	    .synchronization_2 = true,
+#ifdef XRT_OS_MACOS
+	    // MoltenVK: present_wait alters the internal presentation path
+	    // and can cause blank window output. Disable on macOS.
+	    .present_wait = false,
+#else
 	    .present_wait = true,
+#endif
 	    .video_maintenance_1 = true,
 	};
 

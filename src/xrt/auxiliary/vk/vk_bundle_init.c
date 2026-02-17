@@ -1074,6 +1074,19 @@ build_device_extensions(struct vk_bundle *vk,
 		}
 	}
 
+	// Per Vulkan spec, VK_KHR_portability_subset MUST be enabled if the
+	// device advertises it. This is critical for MoltenVK on macOS.
+	// Use the string literal since vulkan_beta.h may not be included.
+	{
+		const char *portability = "VK_KHR_portability_subset";
+		if (check_extension(vk, props, prop_count, portability)) {
+			int added = u_string_list_append_unique(*out_device_ext_list, portability);
+			if (added == 1) {
+				VK_DEBUG(vk, "Auto-enabling required device ext %s", portability);
+			}
+		}
+	}
+
 	// Fill this out here.
 	fill_in_has_device_extensions(vk, *out_device_ext_list);
 

@@ -890,6 +890,9 @@ comp_target_swapchain_present(struct comp_target *ct,
 	    .pImageIndices = &index,
 	};
 
+	// macOS/MoltenVK: Skip present pNext extensions (GOOGLE_display_timing,
+	// KHR_present_id) — they cause blank window with MoltenVK 1.4.0.
+#ifndef XRT_OS_MACOS
 #ifdef VK_GOOGLE_display_timing
 	VkPresentTimeGOOGLE times = {
 	    .presentID = (uint32_t)cts->current_frame_id,
@@ -920,13 +923,13 @@ comp_target_swapchain_present(struct comp_target *ct,
 		vk_append_to_pnext_chain((VkBaseInStructure *)&present_info, (VkBaseInStructure *)&vk_present_id);
 	}
 #endif
+#endif // !XRT_OS_MACOS
 
 
 	// Need to take the queue lock for present.
 	vk_queue_lock(vk->main_queue);
 	VkResult ret = vk->vkQueuePresentKHR(queue, &present_info);
 	vk_queue_unlock(vk->main_queue);
-
 
 #ifdef VK_EXT_display_control
 	if (cts->vblank.has_started) {
