@@ -96,15 +96,24 @@ comp_settings_init(struct comp_settings *s, struct xrt_device *xdev)
 
 		// Fallback
 		add_format(s, VK_FORMAT_B8G8R8A8_SRGB);
-#elif defined(XRT_OS_LINUX) || defined(XRT_OS_WINDOWS) || defined(XRT_OS_MACOS)
+#elif defined(XRT_OS_MACOS)
+		/*
+		 * On macOS via MoltenVK, use UNORM as the preferred format.
+		 * SRGB formats have been observed to cause presentation issues
+		 * with MoltenVK's CAMetalLayer integration.
+		 */
+		add_format(s, VK_FORMAT_B8G8R8A8_UNORM);
+
+		// Fallback to SRGB
+		add_format(s, VK_FORMAT_B8G8R8A8_SRGB);
+		add_format(s, VK_FORMAT_R8G8B8A8_SRGB);
+#elif defined(XRT_OS_LINUX) || defined(XRT_OS_WINDOWS)
 		/*
 		 * On Linux the most ubiquitous sRGB format is B8G8R8A8_SRGB.
 		 * https://vulkan.gpuinfo.org/listsurfaceformats.php?platform=linux
 		 *
 		 * On Windows the most ubiquitous sRGB format is B8G8R8A8_SRGB.
 		 * https://vulkan.gpuinfo.org/listsurfaceformats.php?platform=windows
-		 *
-		 * On macOS via MoltenVK, B8G8R8A8_SRGB is well supported.
 		 */
 		add_format(s, VK_FORMAT_B8G8R8A8_SRGB);
 

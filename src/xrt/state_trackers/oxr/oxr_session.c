@@ -705,6 +705,15 @@ oxr_session_poll(struct oxr_logger *log, struct oxr_session *sess)
 		return oxr_error(log, XR_ERROR_RUNTIME_FAILURE, "xrt_session is null");
 	}
 
+#ifdef XRT_OS_MACOS
+	// Pump macOS events on the main thread. NSWindow and CAMetalLayer
+	// require periodic run loop processing for the Window Server to
+	// commit rendered content to the screen. This is the only place
+	// where the app's main thread calls into the runtime each frame.
+	extern void oxr_macos_pump_events(void);
+	oxr_macos_pump_events();
+#endif
+
 #ifdef XRT_OS_ANDROID
 	// Most recent Android activity lifecycle event was OnPause: move toward stopping
 	if (sess->sys->inst->activity_state == XRT_ANDROID_LIVECYCLE_EVENT_ON_PAUSE) {

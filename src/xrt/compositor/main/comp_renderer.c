@@ -509,6 +509,9 @@ renderer_ensure_images_and_renderings(struct comp_renderer *r, bool force_recrea
 		image_usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
 	}
 
+	// TRANSFER_DST for vkCmdClearColorImage (used by macOS diagnostic and future use).
+	image_usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+
 	if (c->peek) {
 		image_usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
 	}
@@ -1214,6 +1217,8 @@ dispatch_graphics(struct comp_renderer *r,
 	struct vk_bundle *vk = &c->base.vk;
 	VkResult ret;
 
+	// Diagnostic bypass removed — using normal rendering pipeline with green clear colors.
+
 	// Basics
 	const struct comp_layer *layers = c->base.layer_accum.layers;
 	uint32_t layer_count = c->base.layer_accum.layer_count;
@@ -1516,6 +1521,8 @@ comp_renderer_draw(struct comp_renderer *r)
 	// Signal the WM_PAINT handler that rendering is done, unblocking the modal drag loop.
 	comp_window_mswin_signal_paint_done(ct);
 #endif
+
+	// macOS: CA flushing is handled by oxr_macos_pump_events on the main thread.
 
 	// Save for timestamps below.
 	uint64_t frame_id = c->frame.rendering.id;

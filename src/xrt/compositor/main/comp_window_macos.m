@@ -8,7 +8,7 @@
  */
 
 #import <Cocoa/Cocoa.h>
-#import <QuartzCore/CAMetalLayer.h>
+#import <QuartzCore/QuartzCore.h>
 
 #include <stdlib.h>
 #include <string.h>
@@ -23,6 +23,27 @@
  * Private structs.
  *
  */
+
+/*!
+ * NSView subclass whose backing layer is a CAMetalLayer.
+ * This is the standard approach used by GLFW/SDL for Vulkan-on-macOS.
+ * AppKit calls makeBackingLayer when setWantsLayer:YES is set.
+ */
+@interface MonadoMetalView : NSView
+@end
+
+@implementation MonadoMetalView
+- (CALayer *)makeBackingLayer
+{
+	return [CAMetalLayer layer];
+}
+
+- (BOOL)wantsUpdateLayer
+{
+	return YES;
+}
+@end
+
 
 /*!
  * A macOS window using NSWindow + CAMetalLayer.
@@ -89,6 +110,56 @@ ensure_ns_app(void)
 
 /*
  *
+ * Main-thread event pump (called from oxr_session_poll).
+ *
+ */
+
+/*!
+ * Pump macOS events on the main thread. Called from the OpenXR state tracker
+ * during xrPollEvent, which the app calls on its main thread each frame.
+ *
+ * This performs three critical operations:
+ * 1. Drains NSApp events (mouse, keyboard, window state).
+ * 2. Flushes Core Animation transactions so the compositor's
+ *    background-thread Metal drawable presents are composited on-screen.
+ * 3. Runs the CFRunLoop briefly to process display-link and other
+ *    pending sources.
+ *
+ * Without this, NSWindow/CAMetalLayer content rendered on the compositor's
+ * background thread never reaches the display.
+ */
+void
+oxr_macos_pump_events(void)
+{
+	@autoreleasepool {
+		if (NSApp == nil) {
+			return;
+		}
+
+		// Drain NSApp events (mouse, keyboard, window lifecycle).
+		NSEvent *event;
+		while ((event = [NSApp nextEventMatchingMask:NSEventMaskAny
+		                                   untilDate:nil
+		                                      inMode:NSDefaultRunLoopMode
+		                                     dequeue:YES]) != nil) {
+			[NSApp sendEvent:event];
+		}
+
+		// Flush Core Animation on the main thread. This commits
+		// pending transactions from the compositor's background
+		// thread Metal drawable presents.
+		[CATransaction flush];
+
+		// Run the main CFRunLoop briefly to process display-link
+		// and other pending sources. The 1ms timeout gives Core
+		// Animation time to process the flushed transactions.
+		CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.001, false);
+	}
+}
+
+
+/*
+ *
  * Member functions.
  *
  */
@@ -120,14 +191,7 @@ comp_window_macos_destroy(struct comp_target *ct)
 	comp_target_swapchain_cleanup(&w->base);
 
 	if (w->window != nil) {
-		// Must close on main thread
-		if ([NSThread isMainThread]) {
-			[w->window close];
-		} else {
-			dispatch_sync(dispatch_get_main_queue(), ^{
-			    [w->window close];
-			});
-		}
+		[w->window close];
 		w->window = nil;
 	}
 
@@ -140,23 +204,10 @@ comp_window_macos_destroy(struct comp_target *ct)
 static void
 comp_window_macos_flush(struct comp_target *ct)
 {
-	// NSApp event processing must happen on the main thread.
-	// In IPC service mode the compositor renders on a background thread,
-	// so skip here — the main loop's CFRunLoopRunInMode handles it.
-	if (![NSThread isMainThread]) {
-		return;
-	}
-
-	@autoreleasepool {
-		// Pump the macOS event loop so the window remains responsive.
-		NSEvent *event;
-		while ((event = [NSApp nextEventMatchingMask:NSEventMaskAny
-		                                   untilDate:nil
-		                                      inMode:NSDefaultRunLoopMode
-		                                     dequeue:YES]) != nil) {
-			[NSApp sendEvent:event];
-		}
-	}
+	(void)ct;
+	// No-op on background thread. CA flushing happens on the main thread
+	// in oxr_macos_pump_events(). Background-thread CA flushes can
+	// interfere with main-thread CA transaction processing.
 }
 
 static bool
@@ -172,39 +223,47 @@ comp_window_macos_init(struct comp_target *ct)
 
 	NSRect frame = NSMakeRect(100, 100, width, height);
 
-	// Block that creates the window — must run on main thread.
-	void (^create_block)(void) = ^{
-	    @autoreleasepool {
-		    NSUInteger style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
-		                       NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable;
+	// With is_deferred=false, this runs on the main thread during
+	// comp_compositor_create (called from xrCreateSession). NSWindow
+	// requires the main thread, so deferred creation (which runs on the
+	// multi compositor background thread) must not be used on macOS.
+	@autoreleasepool {
+		NSUInteger style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
+		                   NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable;
 
-		    w->window = [[NSWindow alloc] initWithContentRect:frame
-		                                            styleMask:style
-		                                              backing:NSBackingStoreBuffered
-		                                                defer:NO];
+		w->window = [[NSWindow alloc] initWithContentRect:frame
+		                                        styleMask:style
+		                                          backing:NSBackingStoreBuffered
+		                                            defer:NO];
 
-		    [w->window setTitle:@"Monado"];
-		    [w->window setAcceptsMouseMovedEvents:YES];
+		[w->window setTitle:@"Monado"];
+		[w->window setAcceptsMouseMovedEvents:YES];
 
-		    // Create a view with a CAMetalLayer for Vulkan rendering.
-		    w->view = [[NSView alloc] initWithFrame:frame];
-		    [w->view setWantsLayer:YES];
+		// Layer-backed approach: use MonadoMetalView with
+		// makeBackingLayer to let AppKit manage the CAMetalLayer.
+		// Don't pre-configure device/drawableSize — let MoltenVK
+		// set everything during vkCreateSwapchainKHR.
+		w->view = [[MonadoMetalView alloc] initWithFrame:frame];
+		[w->view setWantsLayer:YES];
+		w->metal_layer = (CAMetalLayer *)[w->view layer];
 
-		    w->metal_layer = [CAMetalLayer layer];
-		    [w->view setLayer:w->metal_layer];
+		[w->window setContentView:w->view];
+		[w->window makeKeyAndOrderFront:nil];
 
-		    [w->window setContentView:w->view];
-		    [w->window makeKeyAndOrderFront:nil];
+		// Bring the app to the front.
+		[NSApp activateIgnoringOtherApps:YES];
 
-		    // Bring the app to the front.
-		    [NSApp activateIgnoringOtherApps:YES];
-	    }
-	};
-
-	if ([NSThread isMainThread]) {
-		create_block();
-	} else {
-		dispatch_sync(dispatch_get_main_queue(), create_block);
+		// Pump the event loop once so the window actually appears.
+		// Without this, makeKeyAndOrderFront is deferred until the
+		// next event loop iteration, which never happens because the
+		// compositor renders on a background thread.
+		NSEvent *event;
+		while ((event = [NSApp nextEventMatchingMask:NSEventMaskAny
+		                                   untilDate:nil
+		                                      inMode:NSDefaultRunLoopMode
+		                                     dequeue:YES]) != nil) {
+			[NSApp sendEvent:event];
+		}
 	}
 
 	if (w->window == nil || w->metal_layer == nil) {
@@ -264,13 +323,7 @@ comp_window_macos_update_window_title(struct comp_target *ct, const char *title)
 	}
 
 	NSString *ns_title = [NSString stringWithUTF8String:title];
-	if ([NSThread isMainThread]) {
-		[w->window setTitle:ns_title];
-	} else {
-		dispatch_async(dispatch_get_main_queue(), ^{
-		    [w->window setTitle:ns_title];
-		});
-	}
+	[w->window setTitle:ns_title];
 }
 
 
@@ -310,7 +363,7 @@ const struct comp_target_factory comp_target_factory_macos = {
     .name = "macOS Window",
     .identifier = "macos",
     .requires_vulkan_for_create = false,
-    .is_deferred = true,
+    .is_deferred = false,
     .required_instance_version = 0,
     .required_instance_extensions = instance_extensions,
     .required_instance_extension_count = ARRAY_SIZE(instance_extensions),
