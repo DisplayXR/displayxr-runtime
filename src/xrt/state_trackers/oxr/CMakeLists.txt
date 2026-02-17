@@ -120,6 +120,11 @@ if(WIN32)
 	target_link_libraries(st_oxr PRIVATE kernel32)
 endif()
 
+if(APPLE)
+	target_sources(st_oxr PRIVATE oxr_macos.m)
+	target_link_libraries(st_oxr PRIVATE "-framework Cocoa" "-framework QuartzCore")
+endif()
+
 if(WIN32 AND XRT_HAVE_OPENGL)
 	target_sources(st_oxr PRIVATE oxr_session_gfx_gl_win32.c)
 endif()
