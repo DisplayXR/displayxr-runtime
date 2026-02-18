@@ -123,14 +123,15 @@ endif()
 if(APPLE)
 	target_sources(st_oxr PRIVATE oxr_macos.m)
 	target_link_libraries(st_oxr PRIVATE "-framework Cocoa" "-framework QuartzCore")
-	# On macOS, link against the actual driver libraries (not just headers)
-	# because oxr_macos.m calls qwerty_process_macos() and sim_display_set_output_mode()
-	# and the macOS linker resolves symbols in a single left-to-right pass.
+	# On macOS, link against both the include targets (for header paths) and the
+	# actual driver libraries (for symbols). oxr_macos.m calls qwerty_process_macos()
+	# and sim_display_set_output_mode(), and the macOS linker resolves symbols in
+	# a single left-to-right pass so these must be direct dependencies.
 	if(XRT_BUILD_DRIVER_QWERTY AND TARGET drv_qwerty)
-		target_link_libraries(st_oxr PRIVATE drv_qwerty)
+		target_link_libraries(st_oxr PRIVATE drv_qwerty drv_qwerty_includes)
 	endif()
 	if(TARGET drv_sim_display)
-		target_link_libraries(st_oxr PRIVATE drv_sim_display)
+		target_link_libraries(st_oxr PRIVATE drv_sim_display drv_sim_display_includes)
 	endif()
 endif()
 
