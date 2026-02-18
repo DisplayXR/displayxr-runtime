@@ -540,6 +540,17 @@ multi_compositor_begin_session(struct xrt_compositor *xc, const struct xrt_begin
 			}
 		}
 #endif
+
+#ifdef XRT_OS_MACOS
+		// Store external NSView handle for per-session rendering
+		if (mc->xsi.external_window_handle != NULL) {
+			mc->session_render.external_window_handle = mc->xsi.external_window_handle;
+			U_LOG_I("Session has external NSView %p, will use per-session rendering",
+			        mc->session_render.external_window_handle);
+		}
+		// If no external view provided, the runtime creates its own window
+		// via the standard comp_target_factory_macos path (existing behavior)
+#endif
 		multi_system_compositor_update_session_status(mc->msc, true);
 		mc->state.session_active = true;
 	}

@@ -81,6 +81,9 @@ comp_window_macos_init_swapchain(struct comp_target *ct, uint32_t width, uint32_
 static void
 comp_window_macos_update_window_title(struct comp_target *ct, const char *title);
 
+static void
+comp_window_macos_destroy_external(struct comp_target *ct);
+
 
 /*
  *
@@ -274,6 +277,83 @@ comp_window_macos_update_window_title(struct comp_target *ct, const char *title)
 
 	NSString *ns_title = [NSString stringWithUTF8String:title];
 	[w->window setTitle:ns_title];
+}
+
+
+/*
+ *
+ * External window support (XR_EXT_macos_window_binding).
+ *
+ */
+
+/*!
+ * Destroy a comp_target that wraps an app-provided NSView.
+ * Does NOT close the window — the application owns it.
+ */
+static void
+comp_window_macos_destroy_external(struct comp_target *ct)
+{
+	struct comp_window_macos *w = (struct comp_window_macos *)ct;
+
+	comp_target_swapchain_cleanup(&w->base);
+
+	// Don't close window — app owns it
+	w->window = nil;
+	w->view = nil;
+	w->metal_layer = nil;
+
+	free(ct);
+}
+
+bool
+comp_window_macos_create_from_external(struct comp_compositor *c,
+                                       void *external_view,
+                                       struct comp_target **out_ct)
+{
+	if (external_view == NULL) {
+		COMP_ERROR(c, "External NSView is NULL");
+		return false;
+	}
+
+	struct comp_window_macos *w = U_TYPED_CALLOC(struct comp_window_macos);
+
+	comp_target_swapchain_init_and_set_fnptrs(&w->base, COMP_TARGET_FORCE_FAKE_DISPLAY_TIMING);
+
+	w->base.base.name = "macos (external)";
+	w->base.display = VK_NULL_HANDLE;
+	w->base.base.c = c;
+
+	// Use app's view — don't create our own window
+	@autoreleasepool {
+		NSView *view = (__bridge NSView *)external_view;
+		w->view = view;
+		w->window = [view window]; // May be nil if not yet attached
+		w->metal_layer = (CAMetalLayer *)[view layer];
+
+		// Get dimensions from view
+		NSRect bounds = [view bounds];
+		w->base.base.width = (uint32_t)bounds.size.width;
+		w->base.base.height = (uint32_t)bounds.size.height;
+	}
+
+	if (w->metal_layer == nil) {
+		COMP_ERROR(c, "External NSView has no CAMetalLayer backing");
+		free(w);
+		return false;
+	}
+
+	// Set function pointers — skip init_pre_vulkan (window already exists)
+	w->base.base.destroy = comp_window_macos_destroy_external;
+	w->base.base.flush = comp_window_macos_flush;
+	w->base.base.init_pre_vulkan = NULL;
+	w->base.base.init_post_vulkan = comp_window_macos_init_swapchain;
+	w->base.base.set_title = comp_window_macos_update_window_title;
+
+	COMP_INFO(c, "Created macOS target from external NSView %p (%ux%u)",
+	          external_view, w->base.base.width, w->base.base.height);
+
+	*out_ct = &w->base.base;
+	return true;
 }
 
 

@@ -1837,6 +1837,15 @@ oxr_session_create(struct oxr_logger *log,
 	}
 #endif
 
+#ifdef XRT_OS_MACOS
+	// Parse XR_EXT_macos_window_binding extension - allows app to provide its own NSView
+	const XrMacOSWindowBindingCreateInfoEXT *macos_target_info = OXR_GET_INPUT_FROM_CHAIN(
+	    createInfo, XR_TYPE_MACOS_WINDOW_BINDING_CREATE_INFO_EXT, XrMacOSWindowBindingCreateInfoEXT);
+	if (macos_target_info && macos_target_info->viewHandle) {
+		xsi.external_window_handle = (void *)macos_target_info->viewHandle;
+	}
+#endif
+
 	/* Try allocating and populating. */
 	XrResult ret = oxr_session_create_impl(log, sys, createInfo, &xsi, &sess);
 	if (ret != XR_SUCCESS) {

@@ -68,6 +68,10 @@ if(WIN32)
 	set(XR_USE_PLATFORM_WIN32 ON)
 endif()
 
+if(APPLE AND NOT ANDROID)
+	set(XR_USE_PLATFORM_MACOS ON)
+endif()
+
 configure_file(
 	${CMAKE_CURRENT_SOURCE_DIR}/xrt_openxr_config.h.cmake_in
 	${CMAKE_CURRENT_BINARY_DIR}/xrt_openxr_config.h @ONLY
