@@ -12,6 +12,7 @@
 #include "oxr_forward_declarations.h"
 #include "oxr_interaction_profile_array.h"
 #include "oxr_pair_hashset.h"
+#include "oxr_refcounted.h"
 
 
 #ifdef __cplusplus
@@ -23,6 +24,10 @@ extern "C" {
  * Holds all action-related state that lives at the instance level (shared
  * across sessions). Used for duplicate checking and storage of client-suggested
  * that are later applied when action sets are attached to a session.
+ *
+ * Reference-counted; use @ref oxr_refcounted_ref and @ref oxr_refcounted_unref
+ * on the @ref base member to manage references. Destroy is only called when
+ * the reference count reaches zero.
  *
  * - @ref action_sets: Registry of action set name and localized name pairs.
  *   Used to enforce uniqueness in xrCreateActionSet and to remove entries when
@@ -40,6 +45,8 @@ extern "C" {
  */
 struct oxr_instance_action_context
 {
+	struct oxr_refcounted base;
+
 	/*!
 	 * Action set name and localized name stores.
 	 */
@@ -59,25 +66,16 @@ struct oxr_instance_action_context
  */
 
 /*!
- * Initialize the action context for an instance.
+ * Create a new instance action context (reference count 1).
  *
  * @param log Logger
- * @param context Action context to initialize
+ * @param out_context On success, the new context (refcount 1). Caller must
+ *        call @ref oxr_refcounted_unref on context->base when done.
  * @public @memberof oxr_instance_action_context
  * @ingroup oxr_main
  */
 XRT_CHECK_RESULT XrResult
-oxr_instance_action_context_init(struct oxr_logger *log, struct oxr_instance_action_context *context);
-
-/*!
- * Finalize and cleanup the action context for an instance.
- *
- * @param context Action context to finalize
- * @public @memberof oxr_instance_action_context
- * @ingroup oxr_main
- */
-void
-oxr_instance_action_context_fini(struct oxr_instance_action_context *context);
+oxr_instance_action_context_create(struct oxr_logger *log, struct oxr_instance_action_context **out_context);
 
 
 #ifdef __cplusplus

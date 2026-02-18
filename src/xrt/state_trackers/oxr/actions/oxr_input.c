@@ -320,12 +320,16 @@ static XrResult
 oxr_action_set_destroy_cb(struct oxr_logger *log, struct oxr_handle_base *hb)
 {
 	struct oxr_action_set *act_set = (struct oxr_action_set *)hb;
-	struct oxr_instance_action_context *inst_context = &act_set->inst->action_context;
+	struct oxr_instance_action_context *inst_context = act_set->inst_context;
 
 	oxr_refcounted_unref(&act_set->data->base);
 	act_set->data = NULL;
 
-	oxr_pair_hashset_erase_and_free(&inst_context->action_sets, &act_set->name_item, &act_set->loc_item);
+	if (inst_context != NULL) {
+		oxr_pair_hashset_erase_and_free(&inst_context->action_sets, &act_set->name_item, &act_set->loc_item);
+		act_set->inst_context = NULL;
+		oxr_refcounted_unref(&inst_context->base);
+	}
 
 	free(act_set);
 
@@ -346,6 +350,8 @@ oxr_action_set_create(struct oxr_logger *log,
 
 	struct oxr_action_set *act_set = NULL;
 	OXR_ALLOCATE_HANDLE_OR_RETURN(log, act_set, OXR_XR_DEBUG_ACTIONSET, oxr_action_set_destroy_cb, &inst->handle);
+
+	act_set->inst_context = NULL;
 
 	struct oxr_action_set_ref *act_set_ref = U_TYPED_CALLOC(struct oxr_action_set_ref);
 	act_set_ref->permitted_subaction_paths.any = true;
@@ -378,6 +384,9 @@ oxr_action_set_create(struct oxr_logger *log,
 	}
 
 	act_set_ref->priority = createInfo->priority;
+
+	oxr_refcounted_ref(&inst_context->base);
+	act_set->inst_context = inst_context;
 
 	*out_act_set = act_set;
 
@@ -1865,7 +1874,7 @@ oxr_session_attach_action_sets(struct oxr_logger *log,
 {
 	struct oxr_instance *inst = sess->sys->inst;
 
-	const struct oxr_instance_action_context *inst_context = &inst->action_context;
+	const struct oxr_instance_action_context *inst_context = inst->action_context;
 
 	oxr_interaction_profile_array_clone(&inst_context->suggested_profiles, &sess->profiles_on_attachment);
 

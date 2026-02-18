@@ -81,7 +81,10 @@ oxr_instance_destroy(struct oxr_logger *log, struct oxr_handle_base *hb)
 
 	u_var_remove_root((void *)inst);
 
-	oxr_instance_action_context_fini(&inst->action_context);
+	if (inst->action_context != NULL) {
+		oxr_refcounted_unref(&inst->action_context->base);
+		inst->action_context = NULL;
+	}
 
 	// Maybe a no-op, needs to happen before path_store if not.
 	oxr_instance_path_cache_fini(&inst->path_cache);
@@ -293,9 +296,9 @@ oxr_instance_create(struct oxr_logger *log,
 	}
 
 	// Might use the path_store and path_cache, do after them.
-	ret = oxr_instance_action_context_init(log, &inst->action_context);
+	ret = oxr_instance_action_context_create(log, &inst->action_context);
 	if (ret != XR_SUCCESS) {
-		return oxr_error(log, ret, "Failed to init instance action context");
+		return oxr_error(log, ret, "Failed to create instance action context");
 	}
 
 

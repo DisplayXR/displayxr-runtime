@@ -1254,8 +1254,8 @@ struct oxr_instance
 	//! Path cache for actions, needs path_store to work.
 	struct oxr_instance_path_cache path_cache;
 
-	//! The default action context, holds things like suggested profiles.
-	struct oxr_instance_action_context action_context;
+	//! The default action context (reference-counted). Owned by instance; action sets also hold references.
+	struct oxr_instance_action_context *action_context;
 
 	struct
 	{
@@ -2021,6 +2021,9 @@ struct oxr_action_set
 
 	//! Owner of this action set.
 	struct oxr_instance *inst;
+
+	//! Reference to the instance action context (reference-counted).
+	struct oxr_instance_action_context *inst_context;
 
 	/*!
 	 * The data for this action set that must live as long as any session we

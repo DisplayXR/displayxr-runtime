@@ -371,7 +371,7 @@ oxr_xrSuggestInteractionProfileBindings(XrInstance instance,
 	    &log,                                               //
 	    &inst->path_store,                                  //
 	    &inst->path_cache,                                  //
-	    &inst->action_context,                              //
+	    inst->action_context,                               //
 	    suggestedBindings,                                  //
 	    &dpad_state);                                       //
 }
@@ -530,7 +530,7 @@ oxr_xrCreateActionSet(XrInstance instance, const XrActionSetCreateInfo *createIn
 	 * Action context.
 	 */
 
-	inst_context = &inst->action_context;
+	inst_context = inst->action_context;
 
 
 	/*
