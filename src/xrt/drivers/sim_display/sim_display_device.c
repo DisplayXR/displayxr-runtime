@@ -14,6 +14,7 @@
 
 #include "sim_display_interface.h"
 
+#include "xrt/xrt_compiler.h"
 #include "xrt/xrt_device.h"
 
 #include "os/os_time.h"
@@ -28,7 +29,6 @@
 #include "util/u_misc.h"
 #include "util/u_var.h"
 
-#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -44,18 +44,52 @@
  *
  */
 
-static atomic_int g_sim_display_output_mode = SIM_DISPLAY_OUTPUT_SBS;
+static xrt_atomic_s32_t g_sim_display_output_mode = SIM_DISPLAY_OUTPUT_SBS;
+
+/*!
+ * Cross-platform atomic load for xrt_atomic_s32_t.
+ */
+static inline int32_t
+xrt_atomic_s32_load(xrt_atomic_s32_t *p)
+{
+#if defined(__GNUC__)
+	return __sync_add_and_fetch(p, 0);
+#elif defined(_MSC_VER)
+	return InterlockedCompareExchange((volatile LONG *)p, 0, 0);
+#else
+#error "compiler not supported"
+#endif
+}
+
+/*!
+ * Cross-platform atomic exchange for xrt_atomic_s32_t.
+ */
+static inline int32_t
+xrt_atomic_s32_exchange(xrt_atomic_s32_t *p, int32_t val)
+{
+#if defined(__GNUC__)
+	int32_t old;
+	do {
+		old = *p;
+	} while (__sync_val_compare_and_swap(p, old, val) != old);
+	return old;
+#elif defined(_MSC_VER)
+	return InterlockedExchange((volatile LONG *)p, val);
+#else
+#error "compiler not supported"
+#endif
+}
 
 enum sim_display_output_mode
 sim_display_get_output_mode(void)
 {
-	return (enum sim_display_output_mode)atomic_load(&g_sim_display_output_mode);
+	return (enum sim_display_output_mode)xrt_atomic_s32_load(&g_sim_display_output_mode);
 }
 
 void
 sim_display_set_output_mode(enum sim_display_output_mode mode)
 {
-	enum sim_display_output_mode old = (enum sim_display_output_mode)atomic_exchange(&g_sim_display_output_mode, (int)mode);
+	enum sim_display_output_mode old = (enum sim_display_output_mode)xrt_atomic_s32_exchange(&g_sim_display_output_mode, (int)mode);
 	if (old != mode) {
 		U_LOG_W("Sim display mode changed: %s",
 		        mode == SIM_DISPLAY_OUTPUT_SBS ? "SBS" :
