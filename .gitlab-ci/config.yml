@@ -119,7 +119,7 @@ distributions:
 
       - codename: bookworm
         script: i386_and_proclamation_container_prep.sh
-        tag: "2026-02-07"
+        tag: "2026-02-16"
         deb_version_suffix: bpo12
         packages:
           <<: *default_debian_packages
@@ -141,11 +141,11 @@ distributions:
 
       # This one is pretty minimal, compared to the others.
       # Though, we now install the android SDK in it...
-      - codename: bookworm-ndk
-        distro_version: bookworm
+      - codename: trixie-ndk
+        distro_version: trixie
         repo_suffix: ndk
         script: android_container_prep.sh
-        tag: "2025-05-24"
+        tag: "2026-02-16"
         # This must match ext.sharedCompileSdk in build.gradle
         android_compile_sdk: 35
         # This must match buildscript.ext.buildToolsVersion in build.gradle

@@ -137,13 +137,13 @@ win:container_prep:
 .monado.variables.debian:bookworm:
   variables:
     FDO_DISTRIBUTION_VERSION: "bookworm"
-    FDO_DISTRIBUTION_TAG: "2026-02-07"
+    FDO_DISTRIBUTION_TAG: "2026-02-16"
 
-# Variables for build and usage of Debian bookworm-ndk image
-.monado.variables.debian:bookworm-ndk:
+# Variables for build and usage of Debian trixie-ndk image
+.monado.variables.debian:trixie-ndk:
   variables:
-    FDO_DISTRIBUTION_VERSION: "bookworm"
-    FDO_DISTRIBUTION_TAG: "2025-05-24"
+    FDO_DISTRIBUTION_VERSION: "trixie"
+    FDO_DISTRIBUTION_TAG: "2026-02-16"
     FDO_REPO_SUFFIX: ndk
 
 # Variables for build and usage of Ubuntu jammy image
@@ -195,12 +195,12 @@ debian:bookworm:container_prep:
     FDO_DISTRIBUTION_PACKAGES: 'build-essential ca-certificates clang-format cmake codespell curl debhelper devscripts dput-ng gettext-base git glslang-tools libbluetooth-dev libbsd-dev libcjson-dev libdbus-1-dev libdistro-info-perl libegl1-mesa-dev libeigen3-dev libgl1-mesa-dev libglvnd-dev libgstreamer-plugins-base1.0-dev libgstreamer1.0-dev libhidapi-dev libopencv-dev libsdl2-dev libsystemd-dev libudev-dev libusb-1.0-0-dev libuvc-dev libv4l-dev libvulkan-dev libwayland-dev libx11-dev libx11-xcb-dev libxcb-randr0-dev libxrandr-dev libxxf86vm-dev ninja-build pahole pandoc patch pkg-config python3 python3-pip unzip wayland-protocols wget'
     FDO_DISTRIBUTION_EXEC: 'env FDO_CI_CONCURRENT=${FDO_CI_CONCURRENT} bash .gitlab-ci/i386_and_proclamation_container_prep.sh'
 
-# Make Debian bookworm-ndk image
-debian:bookworm-ndk:container_prep:
+# Make Debian trixie-ndk image
+debian:trixie-ndk:container_prep:
   stage: container_prep
   extends:
     - .container-rules
-    - .monado.variables.debian:bookworm-ndk
+    - .monado.variables.debian:trixie-ndk
     - .fdo.container-build@debian # from ci-templates
 
   variables:
@@ -272,10 +272,10 @@ alpine:container_prep:
     - .build-rules
 
 
-# Base for using Debian bookworm-ndk image
-.monado.image.debian:bookworm-ndk:
+# Base for using Debian trixie-ndk image
+.monado.image.debian:trixie-ndk:
   extends:
-    - .monado.variables.debian:bookworm-ndk
+    - .monado.variables.debian:trixie-ndk
     - .fdo.suffixed-image@debian # from ci-templates
     - .build-rules
 
@@ -439,7 +439,7 @@ debian:bookworm:32bit:
 ndk:armeabi-v7a:
   stage: build
   extends:
-    - .monado.image.debian:bookworm-ndk
+    - .monado.image.debian:trixie-ndk
 
   script:
     - .gitlab-ci/prebuild.sh
@@ -448,7 +448,7 @@ ndk:armeabi-v7a:
 ndk:arm64-v8a:
   stage: build
   extends:
-    - .monado.image.debian:bookworm-ndk
+    - .monado.image.debian:trixie-ndk
 
   script:
     - .gitlab-ci/prebuild.sh
@@ -457,7 +457,7 @@ ndk:arm64-v8a:
 android:spotlessCheck:
   stage: build
   extends:
-    - .monado.image.debian:bookworm-ndk
+    - .monado.image.debian:trixie-ndk
 
   before_script:
     # For caching gradle stuff
@@ -477,7 +477,7 @@ android:spotlessCheck:
 android:outOfProcessDebug:
   stage: build
   extends:
-    - .monado.image.debian:bookworm-ndk
+    - .monado.image.debian:trixie-ndk
 
   before_script:
     # For caching gradle stuff
@@ -500,7 +500,7 @@ android:outOfProcessDebug:
 android:inProcessDebug:
   stage: build
   extends:
-    - .monado.image.debian:bookworm-ndk
+    - .monado.image.debian:trixie-ndk
 
   before_script:
     # For caching gradle stuff
@@ -523,7 +523,7 @@ android:inProcessDebug:
 android:outOfProcessRelease:
   stage: build
   extends:
-    - .monado.image.debian:bookworm-ndk
+    - .monado.image.debian:trixie-ndk
     - .monado.packaging.conditions
 
   before_script:
@@ -548,7 +548,7 @@ android:outOfProcessRelease:
 android:inProcessRelease:
   stage: build
   extends:
-    - .monado.image.debian:bookworm-ndk
+    - .monado.image.debian:trixie-ndk
     - .monado.packaging.conditions
 
   before_script:
