@@ -230,6 +230,51 @@ target_service_create_from_window(struct comp_target_service *service,
 	COMP_INFO(c, "Created per-session target from HWND %p (%ux%u)", external_window_handle, ct->width, ct->height);
 	*out_target = ct;
 	return XRT_SUCCESS;
+#elif defined(XRT_OS_MACOS)
+	if (external_window_handle == NULL) {
+		COMP_ERROR(c, "Cannot create target from NULL NSView");
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+
+	struct comp_target *ct = NULL;
+	if (!comp_window_macos_create_from_external(c, external_window_handle, &ct)) {
+		COMP_ERROR(c, "Failed to create per-session target from NSView %p", external_window_handle);
+		return XRT_ERROR_VULKAN;
+	}
+
+	// Initialize post-Vulkan (creates surface)
+	if (!comp_target_init_post_vulkan(ct, c->settings.preferred.width, c->settings.preferred.height)) {
+		COMP_ERROR(c, "Failed to init post vulkan for per-session target");
+		comp_target_destroy(&ct);
+		return XRT_ERROR_VULKAN;
+	}
+
+	// Create swapchain images
+	struct comp_target_create_images_info info = {
+	    .extent =
+	        {
+	            .width = ct->width,
+	            .height = ct->height,
+	        },
+	    .image_usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+	    .color_space = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
+	    .present_mode = VK_PRESENT_MODE_FIFO_KHR,
+	    .format_count = 1,
+	    .formats = {VK_FORMAT_R8G8B8A8_SRGB},
+	};
+
+	comp_target_create_images(ct, &info);
+
+	if (!comp_target_has_images(ct)) {
+		COMP_ERROR(c, "Failed to create swapchain images for per-session target");
+		comp_target_destroy(&ct);
+		return XRT_ERROR_VULKAN;
+	}
+
+	COMP_INFO(c, "Created per-session target from NSView %p (%ux%u)", external_window_handle, ct->width,
+	          ct->height);
+	*out_target = ct;
+	return XRT_SUCCESS;
 #else
 	(void)c;
 	(void)external_window_handle;

@@ -514,6 +514,18 @@
 
 
 /*
+ * XR_EXT_macos_window_binding
+ */
+#if defined(XR_EXT_macos_window_binding) && defined(XR_USE_PLATFORM_MACOS)
+#define OXR_HAVE_EXT_macos_window_binding
+#define OXR_EXTENSION_SUPPORT_EXT_macos_window_binding(_) \
+    _(EXT_macos_window_binding, EXT_MACOS_WINDOW_BINDING)
+#else
+#define OXR_EXTENSION_SUPPORT_EXT_macos_window_binding(_)
+#endif
+
+
+/*
  * XR_EXT_display_info
  */
 #if defined(XR_EXT_display_info)
@@ -997,6 +1009,7 @@
     OXR_EXTENSION_SUPPORT_EXT_user_presence(_) \
     OXR_EXTENSION_SUPPORT_EXT_win32_appcontainer_compatible(_) \
     OXR_EXTENSION_SUPPORT_EXT_win32_window_binding(_) \
+    OXR_EXTENSION_SUPPORT_EXT_macos_window_binding(_) \
     OXR_EXTENSION_SUPPORT_EXT_display_info(_) \
     OXR_EXTENSION_SUPPORT_BD_controller_interaction(_) \
     OXR_EXTENSION_SUPPORT_FB_body_tracking(_) \

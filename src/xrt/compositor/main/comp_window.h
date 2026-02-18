@@ -188,6 +188,25 @@ comp_window_mswin_signal_paint_done(struct comp_target *ct);
 struct comp_target *
 comp_window_macos_create(struct comp_compositor *c);
 
+/*!
+ * Create a comp_target wrapping an external NSView provided by the application.
+ * The NSView must have a CAMetalLayer backing (via -makeBackingLayer).
+ * The compositor will not create its own window.
+ * The application is responsible for the event loop and window lifecycle.
+ *
+ * @param c The compositor
+ * @param external_view The application's NSView* (with CAMetalLayer backing)
+ * @param out_ct Output parameter for the created target
+ * @return true on success
+ *
+ * @ingroup comp_main
+ * @public @memberof comp_window_macos
+ */
+bool
+comp_window_macos_create_from_external(struct comp_compositor *c,
+                                       void *external_view,
+                                       struct comp_target **out_ct);
+
 extern const struct comp_target_factory comp_target_factory_macos;
 
 #endif // XRT_OS_MACOS
