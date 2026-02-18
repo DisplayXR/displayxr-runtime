@@ -7,7 +7,7 @@
 | **Proposal Title** | OpenXR Extensions for Tracked 3D (Autostereoscopic) Displays |
 | **Authors** | David Fattal (Leia Inc.) |
 | **Date** | 2026-02-13 |
-| **Revision** | 2.0 |
+| **Revision** | 0.2 |
 | **Status** | Draft — proposed for Khronos OpenXR Working Group review |
 | **Extension Names** | `XR_EXT_win32_window_binding`, `XR_EXT_android_surface_binding`, `XR_EXT_display_info` |
 | **OpenXR Version** | 1.0 |
@@ -111,6 +111,8 @@ OpenXR across desktop and mobile platforms.
         │        └── next: XrGraphicsBindingVulkanKHR          (Android)
         │                    └── next: XrAndroidSurfaceBindingCreateInfoEXT
         │                               • nativeWindow = app ANativeWindow*
+        │                               • surface = Java Surface jobject
+        │                               • screenOffsetX/Y = position on display
         │
         │   ┌── Session READY → runtime auto-requests 3D mode (if supported)
         │
@@ -437,14 +439,19 @@ No known IP claims.
 ### Overview
 
 This extension is the Android counterpart to `XR_EXT_win32_window_binding`. It allows an
-OpenXR application to provide its own Android native window to the runtime via the session
-creation chain. When provided, the runtime renders into the application's surface instead
-of managing its own display output.
+OpenXR application to provide its own Android rendering surface to the runtime via the
+session creation chain. When provided, the runtime renders into the application's surface
+instead of managing its own display output.
 
 On Android, applications inherently own their Activity and rendering surface. This
 extension formalizes the handoff: the application passes an `ANativeWindow*` (obtained
 from a `SurfaceView` or `SurfaceHolder` via the NDK) to the runtime, which uses it as the
-compositing and interlacing target.
+compositing and interlacing target. The application also provides the Java `Surface`
+`jobject`, which the runtime may need for platform SDK integration (e.g., CNSDK requires
+the Java Surface for interlacer initialization). Additionally, the application must provide
+the surface's screen-space position, since neither `ANativeWindow` nor `Surface` exposes
+where the surface is located on the physical display — information the runtime needs for
+correct light field interlacing.
 
 **Use cases:**
 - **Application-owned rendering surface**: the application controls the `SurfaceView`
@@ -478,12 +485,18 @@ an external native window for session rendering.
 | `type` | `XrStructureType` | Must be `XR_TYPE_ANDROID_SURFACE_BINDING_CREATE_INFO_EXT`. |
 | `next` | `const void*` | Pointer to next structure in the chain, or `NULL`. |
 | `nativeWindow` | `ANativeWindow*` | The Android native window to render into. Must be a valid, active native window. |
+| `surface` | `jobject` | The Java `android.view.Surface` associated with the native window. The runtime may need this for platform SDK initialization (e.g., CNSDK interlacer). May be `NULL` if the runtime does not require it. |
+| `screenOffsetX` | `int32_t` | Horizontal offset of the surface's left edge on the physical display, in display pixels. |
+| `screenOffsetY` | `int32_t` | Vertical offset of the surface's top edge on the physical display, in display pixels. |
 
 ```c
 typedef struct XrAndroidSurfaceBindingCreateInfoEXT {
     XrStructureType             type;
     const void* XR_MAY_ALIAS    next;
     ANativeWindow*              nativeWindow;
+    jobject                     surface;
+    int32_t                     screenOffsetX;
+    int32_t                     screenOffsetY;
 } XrAndroidSurfaceBindingCreateInfoEXT;
 ```
 
@@ -491,11 +504,21 @@ typedef struct XrAndroidSurfaceBindingCreateInfoEXT {
 - `type` **must** be `XR_TYPE_ANDROID_SURFACE_BINDING_CREATE_INFO_EXT`.
 - `nativeWindow` **must** be a valid `ANativeWindow*` obtained via
   `ANativeWindow_fromSurface()` or `ASurfaceHolder_getNativeWindow()`.
+- `surface` **should** be a valid global reference to the Java `android.view.Surface`
+  associated with `nativeWindow`. It **may** be `NULL` if the runtime does not require it
+  for platform SDK integration, but runtimes **should** document whether they need it.
+- `screenOffsetX` and `screenOffsetY` **must** be the surface's top-left corner position
+  in physical display pixel coordinates. The application obtains these by calling
+  `View.getLocationOnScreen()` on the `SurfaceView`. For a fullscreen surface on the
+  primary display, both values are typically `0`.
 - The native window **must** remain valid for the lifetime of the `XrSession`.
 - The application **must not** release the native window (via `ANativeWindow_release()`)
   before calling `xrDestroySession`.
 - The application **should** acquire a reference (via `ANativeWindow_acquire()`) to ensure
   the window outlives the session.
+- If the surface moves or is resized (e.g., multi-window mode, orientation change), the
+  application **should** destroy and recreate the session with updated offsets, or the
+  runtime **may** provide a mechanism to update offsets dynamically in a future revision.
 
 ### New Functions
 
@@ -529,9 +552,15 @@ createInfo.enabledExtensionNames = extensions.data();
 // ... fill in applicationInfo ...
 xrCreateInstance(&createInfo, &instance);
 
-// 2. Obtain ANativeWindow from a SurfaceView
+// 2. Obtain ANativeWindow and screen position from a SurfaceView
 ANativeWindow* nativeWindow = ANativeWindow_fromSurface(env, javaSurface);
 ANativeWindow_acquire(nativeWindow);  // ensure lifetime
+
+// Get screen position: call SurfaceView.getLocationOnScreen() from Java
+jint location[2];
+// ... JNI call to getLocationOnScreen(location) ...
+int32_t screenX = location[0];
+int32_t screenY = location[1];
 
 // 3. Create session with surface binding chained to graphics binding
 XrGraphicsBindingVulkanKHR vkBinding = {XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR};
@@ -544,6 +573,9 @@ vkBinding.queueIndex = 0;
 XrAndroidSurfaceBindingCreateInfoEXT surfaceBinding = {
     (XrStructureType)XR_TYPE_ANDROID_SURFACE_BINDING_CREATE_INFO_EXT};
 surfaceBinding.nativeWindow = nativeWindow;
+surfaceBinding.surface = javaSurface;       // Java Surface jobject
+surfaceBinding.screenOffsetX = screenX;     // position on physical display
+surfaceBinding.screenOffsetY = screenY;
 
 // Chain: sessionInfo -> vkBinding -> surfaceBinding
 vkBinding.next = &surfaceBinding;
@@ -567,6 +599,9 @@ glesBinding.context = eglContext;
 XrAndroidSurfaceBindingCreateInfoEXT surfaceBinding = {
     (XrStructureType)XR_TYPE_ANDROID_SURFACE_BINDING_CREATE_INFO_EXT};
 surfaceBinding.nativeWindow = nativeWindow;
+surfaceBinding.surface = javaSurface;
+surfaceBinding.screenOffsetX = screenX;
+surfaceBinding.screenOffsetY = screenY;
 
 // Chain: sessionInfo -> glesBinding -> surfaceBinding
 glesBinding.next = &surfaceBinding;
@@ -1433,7 +1468,28 @@ This is out of scope for the initial extension but should be considered in futur
 
 ---
 
-**OPEN 2: Interaction with XR_EXT_local_floor and other space extensions.**
+**OPEN 2: Android surface screen position — static vs. dynamic.**
+
+The current design requires `screenOffsetX/Y` at session creation, making the surface
+position static. This works for fullscreen and fixed-layout scenarios but does not handle:
+- Android multi-window (split-screen) mode where the app window can be repositioned.
+- Freeform windowing on tablets/ChromeOS where the window is draggable.
+- Orientation changes that alter the surface's screen position.
+
+Possible solutions for dynamic position updates:
+- A new function `xrUpdateSurfaceOffsetEXT(session, offsetX, offsetY)` that the
+  application calls when its surface moves.
+- Having the runtime query position via JNI using the `surface` `jobject` (if the platform
+  SDK can resolve screen coordinates from a Surface).
+- Requiring session recreation on layout changes (simplest, but disruptive).
+
+For the initial version, static offsets at session creation are sufficient — most tracked
+3D display Android devices run apps fullscreen. Dynamic updates should be addressed in a
+future revision if windowed 3D display use cases emerge.
+
+---
+
+**OPEN 3: Interaction with XR_EXT_local_floor and other space extensions.**
 
 DISPLAY space is semantically distinct from LOCAL, STAGE, and LOCAL_FLOOR. For tracked 3D
 displays, DISPLAY space is the primary coordinate frame. Future work should clarify how
@@ -1505,4 +1561,4 @@ integration:
 | **Nominal viewer position** | A static, design-time expectation of the viewer's position relative to the display. Not tracked; defines the apex of the canonical display pyramid. |
 | **Disparity** | Horizontal shift between left and right eye images, measured as a fraction of window width. Controls perceived depth of window-space layers. |
 | **Display mode** | The operational mode of a tracked 3D display: 2D (standard flat panel) or 3D (light field interlacing active). Controlled via `xrRequestDisplayModeEXT`. |
-| **Surface binding** | A platform-specific mechanism for the application to provide its own rendering surface to the runtime (`HWND` on Win32, `ANativeWindow*` on Android). |
+| **Surface binding** | A platform-specific mechanism for the application to provide its own rendering surface to the runtime (`HWND` on Win32; `ANativeWindow*` + Java `Surface` + screen position on Android). |
