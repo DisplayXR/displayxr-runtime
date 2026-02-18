@@ -61,38 +61,6 @@
 #include <unistd.h>
 #endif
 
-#ifdef XRT_OS_MACOS
-#include <stdatomic.h>
-#include <stdbool.h>
-
-/*!
- * Global flag: set to true when the compositor window is closed or Escape
- * is pressed on macOS. Lives here in comp_multi so both monado-service and
- * libopenxr_monado can link it (st_oxr is not linked into monado-service).
- *
- * Written by oxr_macos_pump_events() on the main thread, read by
- * multi_compositor_wait_frame() and the render thread.
- */
-static atomic_bool g_macos_window_closed = false;
-
-bool
-oxr_macos_window_closed(void)
-{
-	return atomic_load(&g_macos_window_closed);
-}
-
-void
-oxr_macos_reset_window_closed(void)
-{
-	atomic_store(&g_macos_window_closed, false);
-}
-
-void
-oxr_macos_set_window_closed(void)
-{
-	atomic_store(&g_macos_window_closed, true);
-}
-#endif
 
 
 /*
@@ -2241,6 +2209,7 @@ render_per_session_clients_locked(struct multi_system_compositor *msc, int64_t d
 #ifdef XRT_OS_MACOS
 		// Skip rendering if macOS window was closed
 		{
+			extern bool oxr_macos_window_closed(void);
 			if (oxr_macos_window_closed()) {
 				int64_t now_ns = os_monotonic_get_ns();
 				multi_compositor_retire_delivered_locked(mc, now_ns);

@@ -24,6 +24,10 @@ if(WIN32)
 	target_link_libraries(aux_os PRIVATE winmm)
 endif()
 
+if(APPLE)
+	target_sources(aux_os PRIVATE os_macos.c)
+endif()
+
 ####
 # BLE library
 #
