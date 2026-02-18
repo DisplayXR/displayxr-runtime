@@ -1528,6 +1528,7 @@ recreate_session_swapchain(struct multi_compositor *mc, struct vk_bundle *vk)
 
 }
 
+#ifdef XRT_HAVE_LEIA_SR_VULKAN
 /*!
  * Ensure the SBS (side-by-side) flip image exists for Y-flipping GL textures before display processing.
  * Allocates a single image of (eye_width*2, eye_height) with TRANSFER_DST + SAMPLED usage.
@@ -1697,6 +1698,7 @@ session_blit_sbs(struct vk_bundle *vk,
 	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
 	                         NULL, 0, NULL, 3, post_barriers);
 }
+#endif // XRT_HAVE_LEIA_SR_VULKAN
 
 /*!
  * Render a single per-session client to its own comp_target using display processing.
@@ -1938,68 +1940,7 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 		goto submit_and_present;
 	}
 
-	// Stereo (3D) path: SBS blit + weaving/display processing
-	VkImageView weaveLeft = leftImageView;
-	VkImageView weaveRight = rightImageView;
-	int weaveWidth = imageWidth;
-	int weaveHeight = imageHeight;
-
-	bool blit_flip_y = layer->data.flip_y;
-
-#ifdef XRT_HAVE_LEIA_SR_VULKAN
-	// If window-space overlay layers are present, composite all layers into
-	// intermediate per-eye images first, then use those for the SBS blit.
-	// Shared projection images are pre-blitted into compositor-owned local copies
-	// to work around Intel CCS issues. See composite_layers_to_intermediate() docs.
-	if (has_window_space_layers(mc)) {
-		VkImageView comp_left_view = VK_NULL_HANDLE, comp_right_view = VK_NULL_HANDLE;
-		if (composite_layers_to_intermediate(mc, vk, cmd, &comp_left_view, &comp_right_view)) {
-			// Use composited images as SBS blit sources instead of raw projection images.
-			// Compositing already applied flip_y, so disable it for the blit.
-			leftImage = mc->session_render.composite_images[0];
-			rightImage = mc->session_render.composite_images[1];
-			leftArrayIndex = 0;
-			rightArrayIndex = 0;
-			blit_flip_y = false;
-
-			// Transition composited images SHADER_READ_ONLY → GENERAL
-			// so session_blit_sbs can transition them GENERAL → TRANSFER_SRC.
-			VkImageMemoryBarrier readToGeneral[2];
-			for (int e = 0; e < 2; e++) {
-				readToGeneral[e] = (VkImageMemoryBarrier){
-				    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-				    .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
-				    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-				    .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-				    .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-				    .image = mc->session_render.composite_images[e],
-				    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-				};
-			}
-			vk->vkCmdPipelineBarrier(cmd,
-			                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-			                         VK_PIPELINE_STAGE_TRANSFER_BIT,
-			                         0, 0, NULL, 0, NULL, 2, readToGeneral);
-
-		}
-	}
-#endif // XRT_HAVE_LEIA_SR_VULKAN
-
-	// Both GL and VK paths blit shared images into a local SBS (side-by-side) image.
-	// This creates a compositor-owned local copy for the weaver to read from.
-	// GL path flips Y (GL is Y-up, VK is Y-down). VK path copies without flip.
-	// When composited, flip_y is already applied so blit_flip_y is false.
-	// The weaver's SBS mode (right=VK_NULL_HANDLE) reads left half as left eye,
-	// right half as right eye.
-	if (ensure_session_flip_images(mc, vk, imageWidth, imageHeight, imageFormat)) {
-		session_blit_sbs(vk, cmd, leftImage, leftArrayIndex, rightImage, rightArrayIndex,
-		                 mc->session_render.flip_sbs_image, imageWidth, imageHeight, blit_flip_y);
-		weaveLeft = mc->session_render.flip_sbs_view;
-		weaveRight = VK_NULL_HANDLE;
-		weaveWidth = imageWidth * 2;
-	} else {
-		U_LOG_W("[per-session] Failed to create SBS image, using raw views");
-	}
+	// Stereo (3D) path: display processing or SR weaving
 
 	// Get the framebuffer for the current swapchain image
 	VkFramebuffer framebuffer = VK_NULL_HANDLE;
@@ -2007,101 +1948,187 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 		framebuffer = mc->session_render.framebuffers[buffer_index];
 	}
 
-	// Transition swapchain image to COLOR_ATTACHMENT_OPTIMAL before weaving
-	// (matches Vulkan weaving example: weaver expects this layout)
-	{
-		VkImageMemoryBarrier pre_weave_barrier = {
-		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		    .srcAccessMask = 0,
-		    .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-		    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-		    .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-		    .image = ct->images[buffer_index].handle,
-		    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-		};
-		vk->vkCmdPipelineBarrier(cmd,
-		                         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-		                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-		                         0, 0, NULL, 0, NULL, 1, &pre_weave_barrier);
-	}
-
-	// Log one-time diagnostic info
-	{
-		static bool diag_logged = false;
-		if (!diag_logged) {
-			U_LOG_W("[per-session] Weave params: viewport=(%d,%d,%u,%u), input=%dx%d fmt=%d, fb=%ux%u fmt=%d",
-			        viewport.offset.x, viewport.offset.y,
-			        viewport.extent.width, viewport.extent.height,
-			        weaveWidth, weaveHeight, imageFormat,
-			        framebufferWidth, framebufferHeight, framebufferFormat);
-			diag_logged = true;
-		}
-	}
-
-#ifdef XRT_HAVE_LEIA_SR_VULKAN
-	// Log SR window position diagnostics (once)
-	if (mc->session_render.weaver != NULL) {
-		static bool sr_diag_logged = false;
-		if (!sr_diag_logged) {
-			leiasr_log_window_diagnostics(mc->session_render.weaver,
-			                              mc->session_render.external_window_handle);
-			sr_diag_logged = true;
-		}
-	}
-#endif
-
-	// Perform display processing via generic display processor interface
+	// Display processor path: pass separate left/right views directly.
+	// The display processor expects individual eye image views, not SBS-packed.
+	// Its render pass handles target layout transitions (UNDEFINED → PRESENT_SRC_KHR).
 	if (mc->session_render.display_processor != NULL) {
 		static bool dp_logged = false;
 		if (!dp_logged) {
-			U_LOG_W("[per-session] Vulkan rendering via display processor interface");
+			U_LOG_W("[per-session] Vulkan rendering via display processor (separate views), "
+			        "input=%dx%d fmt=%d, fb=%ux%u fmt=%d",
+			        imageWidth, imageHeight, imageFormat,
+			        framebufferWidth, framebufferHeight, framebufferFormat);
 			dp_logged = true;
 		}
+
+		// Transition source images GENERAL → SHADER_READ_ONLY for display processor sampling
+		VkImageMemoryBarrier src_barriers[2] = {
+		    {
+		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		        .srcAccessMask = 0,
+		        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+		        .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+		        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		        .image = leftImage,
+		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, leftArrayIndex, 1},
+		    },
+		    {
+		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		        .srcAccessMask = 0,
+		        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+		        .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+		        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		        .image = rightImage,
+		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, rightArrayIndex, 1},
+		    },
+		};
+		vk->vkCmdPipelineBarrier(cmd,
+		                         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+		                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+		                         0, 0, NULL, 0, NULL, 2, src_barriers);
 
 		xrt_display_processor_process_views(
 		    mc->session_render.display_processor,
 		    cmd,
-		    weaveLeft,
-		    weaveRight,
-		    (uint32_t)weaveWidth,
-		    (uint32_t)weaveHeight,
+		    leftImageView,
+		    rightImageView,
+		    (uint32_t)imageWidth,
+		    (uint32_t)imageHeight,
 		    (VkFormat_XDP)imageFormat,
 		    framebuffer,
 		    framebufferWidth,
 		    framebufferHeight,
 		    (VkFormat_XDP)framebufferFormat);
-	}
-#ifdef XRT_HAVE_LEIA_SR_VULKAN
-	else if (mc->session_render.weaver != NULL) {
-		static bool fallback_logged = false;
-		if (!fallback_logged) {
-			U_LOG_W("[per-session] Vulkan weaving via direct SR call (display processor unavailable)");
-			fallback_logged = true;
-		}
 
-		leiasr_weave(mc->session_render.weaver, cmd, weaveLeft, weaveRight, viewport, weaveWidth, weaveHeight,
-		             imageFormat, framebuffer, (int)framebufferWidth, (int)framebufferHeight,
-		             framebufferFormat);
-	}
-#endif
-
-	// Transition swapchain image to PRESENT_SRC_KHR after weaving
-	// (matches Vulkan weaving example: image must be presentable)
-	{
-		VkImageMemoryBarrier post_weave_barrier = {
-		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		    .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-		    .dstAccessMask = 0,
-		    .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-		    .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-		    .image = ct->images[buffer_index].handle,
-		    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+		// Transition source images back to GENERAL for next frame
+		VkImageMemoryBarrier src_post[2] = {
+		    {
+		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		        .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
+		        .dstAccessMask = 0,
+		        .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+		        .image = leftImage,
+		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, leftArrayIndex, 1},
+		    },
+		    {
+		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		        .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
+		        .dstAccessMask = 0,
+		        .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+		        .image = rightImage,
+		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, rightArrayIndex, 1},
+		    },
 		};
 		vk->vkCmdPipelineBarrier(cmd,
-		                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
 		                         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-		                         0, 0, NULL, 0, NULL, 1, &post_weave_barrier);
+		                         0, 0, NULL, 0, NULL, 2, src_post);
+
+		// Display processor render pass already transitions target to PRESENT_SRC_KHR
+		goto submit_and_present;
 	}
+
+#ifdef XRT_HAVE_LEIA_SR_VULKAN
+	{
+		// SR weaver path: blit into SBS image, then weave
+		VkImageView weaveLeft = leftImageView;
+		VkImageView weaveRight = rightImageView;
+		int weaveWidth = imageWidth;
+		int weaveHeight = imageHeight;
+
+		bool blit_flip_y = layer->data.flip_y;
+		// If window-space overlay layers are present, composite all layers into
+		// intermediate per-eye images first, then use those for the SBS blit.
+		if (has_window_space_layers(mc)) {
+			VkImageView comp_left_view = VK_NULL_HANDLE, comp_right_view = VK_NULL_HANDLE;
+			if (composite_layers_to_intermediate(mc, vk, cmd, &comp_left_view, &comp_right_view)) {
+				leftImage = mc->session_render.composite_images[0];
+				rightImage = mc->session_render.composite_images[1];
+				leftArrayIndex = 0;
+				rightArrayIndex = 0;
+				blit_flip_y = false;
+
+				VkImageMemoryBarrier readToGeneral[2];
+				for (int e = 0; e < 2; e++) {
+					readToGeneral[e] = (VkImageMemoryBarrier){
+					    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+					    .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
+					    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+					    .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+					    .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+					    .image = mc->session_render.composite_images[e],
+					    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+					};
+				}
+				vk->vkCmdPipelineBarrier(cmd,
+				                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+				                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+				                         0, 0, NULL, 0, NULL, 2, readToGeneral);
+			}
+		}
+
+		// Blit into SBS image for the weaver
+		if (ensure_session_flip_images(mc, vk, imageWidth, imageHeight, imageFormat)) {
+			session_blit_sbs(vk, cmd, leftImage, leftArrayIndex, rightImage, rightArrayIndex,
+			                 mc->session_render.flip_sbs_image, imageWidth, imageHeight, blit_flip_y);
+			weaveLeft = mc->session_render.flip_sbs_view;
+			weaveRight = VK_NULL_HANDLE;
+			weaveWidth = imageWidth * 2;
+		}
+
+		// Transition swapchain image to COLOR_ATTACHMENT_OPTIMAL before weaving
+		{
+			VkImageMemoryBarrier pre_weave_barrier = {
+			    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+			    .srcAccessMask = 0,
+			    .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+			    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+			    .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+			    .image = ct->images[buffer_index].handle,
+			    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+			};
+			vk->vkCmdPipelineBarrier(cmd,
+			                         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+			                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+			                         0, 0, NULL, 0, NULL, 1, &pre_weave_barrier);
+		}
+
+		if (mc->session_render.weaver != NULL) {
+			static bool sr_logged = false;
+			if (!sr_logged) {
+				U_LOG_W("[per-session] SR weave: input=%dx%d fmt=%d, fb=%ux%u fmt=%d",
+				        weaveWidth, weaveHeight, imageFormat,
+				        framebufferWidth, framebufferHeight, framebufferFormat);
+				leiasr_log_window_diagnostics(mc->session_render.weaver,
+				                              mc->session_render.external_window_handle);
+				sr_logged = true;
+			}
+
+			leiasr_weave(mc->session_render.weaver, cmd, weaveLeft, weaveRight, viewport, weaveWidth,
+			             weaveHeight, imageFormat, framebuffer, (int)framebufferWidth,
+			             (int)framebufferHeight, framebufferFormat);
+		}
+
+		// Transition swapchain image to PRESENT_SRC_KHR after weaving
+		{
+			VkImageMemoryBarrier post_weave_barrier = {
+			    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+			    .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+			    .dstAccessMask = 0,
+			    .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+			    .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+			    .image = ct->images[buffer_index].handle,
+			    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+			};
+			vk->vkCmdPipelineBarrier(cmd,
+			                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+			                         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+			                         0, 0, NULL, 0, NULL, 1, &post_weave_barrier);
+		}
+	}
+#endif // XRT_HAVE_LEIA_SR_VULKAN
 
 submit_and_present:
 	// End command buffer
@@ -2183,7 +2210,6 @@ render_per_session_clients_locked(struct multi_system_compositor *msc, int64_t d
 		return;
 	}
 
-	int session_count = 0;
 	for (size_t k = 0; k < ARRAY_SIZE(msc->clients); k++) {
 		struct multi_compositor *mc = msc->clients[k];
 
@@ -2217,8 +2243,6 @@ render_per_session_clients_locked(struct multi_system_compositor *msc, int64_t d
 			}
 		}
 #endif
-
-		session_count++;
 
 		// Render this session to its own target
 		render_session_to_own_target(mc, vk, display_time_ns);
