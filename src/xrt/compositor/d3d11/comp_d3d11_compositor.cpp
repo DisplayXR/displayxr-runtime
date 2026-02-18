@@ -382,7 +382,8 @@ d3d11_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 								uint32_t new_vw = (uint32_t)((float)sr_w * ratio);
 								uint32_t new_vh = (uint32_t)((float)sr_h * ratio);
 
-								comp_d3d11_renderer_resize(c->renderer, new_vw, new_vh, new_height);
+								uint32_t resize_target_h = (c->display_processor != NULL) ? new_vh : new_height;
+							comp_d3d11_renderer_resize(c->renderer, new_vw, new_vh, resize_target_h);
 							}
 						}
 #endif
@@ -1071,8 +1072,9 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	}
 
 	// Create renderer with the correct view dimensions.
-	// Pass target (window) height so the SBS texture is tall enough for mono (2D) mode.
-	uint32_t target_height = c->settings.preferred.height;
+	// When a display processor (weaver) is present, the stereo texture must match the view height
+	// so the weaver samples only rendered content. Without a weaver, use the window height for mono/2D mode.
+	uint32_t target_height = (c->display_processor != NULL) ? view_height : c->settings.preferred.height;
 	xret = comp_d3d11_renderer_create(c, view_width, view_height, target_height, &c->renderer);
 	if (xret != XRT_SUCCESS) {
 		U_LOG_E("Failed to create D3D11 renderer");
