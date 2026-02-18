@@ -242,12 +242,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                                 ID3D11RenderTargetView* rtv = nullptr;
                                 CreateRenderTargetView(renderer, swapchainTexture, &rtv);
 
-                                // Compute render dims from swapchain size and display scale factors
-                                // (non-ext app is fullscreen, so swapchain size == display pixel size)
-                                uint32_t renderW = (uint32_t)(xr.swapchains[eye].width * xr.recommendedViewScaleX);
-                                uint32_t renderH = (uint32_t)(xr.swapchains[eye].height * xr.recommendedViewScaleY);
-                                if (renderW > xr.swapchains[eye].width) renderW = xr.swapchains[eye].width;
-                                if (renderH > xr.swapchains[eye].height) renderH = xr.swapchains[eye].height;
+                                // Render at full swapchain size — the system compositor already
+                                // sized swapchains to the SR recommended per-eye dimensions,
+                                // so no additional scale factor should be applied here.
+                                uint32_t renderW = xr.swapchains[eye].width;
+                                uint32_t renderH = xr.swapchains[eye].height;
 
                                 D3D11_VIEWPORT vp = {};
                                 vp.Width = (FLOAT)renderW;
