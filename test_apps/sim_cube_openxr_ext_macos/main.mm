@@ -364,6 +364,9 @@ static bool CreateDepthImage(VkDevice device, VkPhysicalDevice physDevice,
     return true;
 }
 
+// Store physDevice globally for depth image creation
+static VkPhysicalDevice g_physDevice = VK_NULL_HANDLE;
+
 static bool CreateSwapchainFramebuffers(VkRenderer& renderer, int eye,
     VkImage* images, uint32_t imageCount,
     uint32_t width, uint32_t height, VkFormat colorFormat)
@@ -373,11 +376,8 @@ static bool CreateSwapchainFramebuffers(VkRenderer& renderer, int eye,
     fb.depthViews.resize(imageCount);
     fb.framebuffers.resize(imageCount);
 
-    VkPhysicalDevice physDevice;
-    // We need physDevice for CreateDepthImage — store it in renderer
-    // For simplicity, use a static — this is a single-threaded test app
-    static VkPhysicalDevice s_physDevice = VK_NULL_HANDLE;
-    physDevice = s_physDevice;
+    // g_physDevice is set during GetVulkanPhysicalDevice
+    VkPhysicalDevice physDevice = g_physDevice;
 
     if (!CreateDepthImage(renderer.device, physDevice, width, height,
         fb.depthImage, fb.depthMemory)) {
@@ -417,9 +417,6 @@ static bool CreateSwapchainFramebuffers(VkRenderer& renderer, int eye,
     }
     return true;
 }
-
-// Store physDevice globally for depth image creation
-static VkPhysicalDevice g_physDevice = VK_NULL_HANDLE;
 
 static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysicalDevice physDevice,
     VkQueue graphicsQueue, uint32_t queueFamilyIndex, VkFormat colorFormat)
@@ -1093,27 +1090,52 @@ static bool GetVulkanDeviceExtensions(AppXrSession& xr,
     std::string extStr(bufferSize, '\0');
     pfn(xr.instance, xr.systemId, bufferSize, &bufferSize, extStr.data());
 
+    // Enumerate available device extensions
+    uint32_t availCount = 0;
+    vkEnumerateDeviceExtensionProperties(physDevice, nullptr, &availCount, nullptr);
+    std::vector<VkExtensionProperties> availExts(availCount);
+    vkEnumerateDeviceExtensionProperties(physDevice, nullptr, &availCount, availExts.data());
+
+    auto isAvailable = [&](const char *name) -> bool {
+        for (const auto& e : availExts) {
+            if (strcmp(e.extensionName, name) == 0) return true;
+        }
+        return false;
+    };
+
+    // Phase 1: Build extensionStorage (all strings) first to avoid
+    // dangling c_str() pointers from vector reallocation.
+    extensionStorage.clear();
     size_t start = 0;
     for (size_t i = 0; i <= extStr.size(); i++) {
         if (i == extStr.size() || extStr[i] == ' ' || extStr[i] == '\0') {
             if (i > start) {
-                extensionStorage.push_back(extStr.substr(start, i - start));
-                deviceExtensions.push_back(extensionStorage.back().c_str());
+                std::string ext = extStr.substr(start, i - start);
+                if (isAvailable(ext.c_str())) {
+                    extensionStorage.push_back(ext);
+                } else {
+                    LOG_WARN("  Device ext UNAVAILABLE (skipping): %s", ext.c_str());
+                }
             }
             start = i + 1;
         }
     }
 
-    // Add portability subset if available
-    uint32_t availCount = 0;
-    vkEnumerateDeviceExtensionProperties(physDevice, nullptr, &availCount, nullptr);
-    std::vector<VkExtensionProperties> availExts(availCount);
-    vkEnumerateDeviceExtensionProperties(physDevice, nullptr, &availCount, availExts.data());
+    // Add optional extensions if available
     for (const auto& e : availExts) {
         if (strcmp(e.extensionName, "VK_KHR_portability_subset") == 0) {
-            deviceExtensions.push_back("VK_KHR_portability_subset");
-            break;
+            extensionStorage.push_back("VK_KHR_portability_subset");
         }
+        if (strcmp(e.extensionName, VK_KHR_MAINTENANCE1_EXTENSION_NAME) == 0) {
+            extensionStorage.push_back(VK_KHR_MAINTENANCE1_EXTENSION_NAME);
+        }
+    }
+
+    // Phase 2: Build deviceExtensions pointers from final extensionStorage
+    // (safe now since extensionStorage won't be modified again)
+    for (const auto& name : extensionStorage) {
+        deviceExtensions.push_back(name.c_str());
+        LOG_INFO("  Device ext: %s", name.c_str());
     }
 
     return true;
@@ -1343,6 +1365,10 @@ static void SignalHandler(int sig) {
 }
 
 int main() {
+    // Ensure logs appear immediately even when piped
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+
     signal(SIGINT, SignalHandler);
     signal(SIGTERM, SignalHandler);
 
@@ -1387,8 +1413,6 @@ int main() {
         CleanupOpenXR(xr);
         return 1;
     }
-    deviceExtensions.push_back(VK_KHR_MAINTENANCE1_EXTENSION_NAME);
-
     uint32_t queueFamilyIndex = 0;
     if (!FindGraphicsQueueFamily(physDevice, queueFamilyIndex)) {
         vkDestroyInstance(vkInstance, nullptr);
@@ -1439,6 +1463,8 @@ int main() {
 
     for (int eye = 0; eye < 2; eye++) {
         uint32_t count = xr.swapchains[eye].imageCount;
+        LOG_INFO("Creating framebuffers for eye %d: %u images, %ux%u",
+                 eye, count, xr.swapchains[eye].width, xr.swapchains[eye].height);
         std::vector<VkImage> images(count);
         for (uint32_t i = 0; i < count; i++) {
             images[i] = swapchainImages[eye][i].image;
@@ -1451,6 +1477,7 @@ int main() {
             vkDestroyInstance(vkInstance, nullptr);
             return 1;
         }
+        LOG_INFO("  Eye %d framebuffers created OK", eye);
     }
 
     LOG_INFO("=== Entering main loop (ESC to quit, 1/2/3 for display modes) ===");

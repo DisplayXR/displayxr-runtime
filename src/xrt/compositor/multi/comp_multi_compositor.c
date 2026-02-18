@@ -542,14 +542,21 @@ multi_compositor_begin_session(struct xrt_compositor *xc, const struct xrt_begin
 #endif
 
 #ifdef XRT_OS_MACOS
-		// Store external NSView handle for per-session rendering
 		if (mc->xsi.external_window_handle != NULL) {
+			// External NSView provided — use per-session rendering.
+			// No runtime window needed (factory is deferred, skips creation).
 			mc->session_render.external_window_handle = mc->xsi.external_window_handle;
 			U_LOG_I("Session has external NSView %p, will use per-session rendering",
 			        mc->session_render.external_window_handle);
+		} else {
+			// No external view — create the runtime's window now.
+			// This runs on the main thread (xrBeginSession), which is
+			// required for NSWindow creation on macOS.
+			xrt_result_t xret = comp_target_service_init_main_target(mc->msc->target_service);
+			if (xret != XRT_SUCCESS) {
+				U_LOG_E("Failed to init macOS main target: %d", xret);
+			}
 		}
-		// If no external view provided, the runtime creates its own window
-		// via the standard comp_target_factory_macos path (existing behavior)
 #endif
 		multi_system_compositor_update_session_status(mc->msc, true);
 		mc->state.session_active = true;

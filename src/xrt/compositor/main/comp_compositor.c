@@ -65,6 +65,7 @@
 
 #include "util/comp_vulkan.h"
 #include "main/comp_compositor.h"
+#include "main/comp_target_swapchain.h"
 #include "main/comp_frame.h"
 
 #ifdef XRT_FEATURE_WINDOW_PEEK
@@ -168,6 +169,9 @@ compositor_init_window_from_external(struct comp_compositor *c, void *hwnd)
 }
 #endif
 
+// macOS external window is handled via per-session rendering in comp_multi_compositor.c
+// (comp_window_macos_create_from_external is called by target_service_create_from_window)
+
 
 /*
  *
@@ -249,7 +253,7 @@ target_service_create_from_window(struct comp_target_service *service,
 		return XRT_ERROR_VULKAN;
 	}
 
-	// Create swapchain images
+	// Create swapchain images — MoltenVK surfaces only support B8G8R8A8 formats
 	struct comp_target_create_images_info info = {
 	    .extent =
 	        {
@@ -259,8 +263,8 @@ target_service_create_from_window(struct comp_target_service *service,
 	    .image_usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
 	    .color_space = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
 	    .present_mode = VK_PRESENT_MODE_FIFO_KHR,
-	    .format_count = 1,
-	    .formats = {VK_FORMAT_R8G8B8A8_SRGB},
+	    .format_count = 2,
+	    .formats = {VK_FORMAT_B8G8R8A8_SRGB, VK_FORMAT_B8G8R8A8_UNORM},
 	};
 
 	comp_target_create_images(ct, &info);
@@ -270,6 +274,13 @@ target_service_create_from_window(struct comp_target_service *service,
 		comp_target_destroy(&ct);
 		return XRT_ERROR_VULKAN;
 	}
+
+	// Per-session targets skip frame pacing (calc_frame_pacing), so set a
+	// non-zero frame_id to satisfy the assert in comp_target_swapchain_present.
+	// The frame_id is only used for display timing extensions which are
+	// disabled on macOS.
+	struct comp_target_swapchain *cts = (struct comp_target_swapchain *)ct;
+	cts->current_frame_id = 1;
 
 	COMP_INFO(c, "Created per-session target from NSView %p (%ux%u)", external_window_handle, ct->width,
 	          ct->height);
@@ -304,6 +315,39 @@ target_service_get_vk(struct comp_target_service *service)
 }
 
 /*!
+ * Service callback: initialize the main compositor's window, swapchain, and renderer.
+ * Called from the main thread during xrBeginSession when the factory is deferred
+ * and no external window was provided.
+ */
+static xrt_result_t
+target_service_init_main_target(struct comp_target_service *service)
+{
+	struct comp_compositor *c = (struct comp_compositor *)service->context;
+
+	if (!c->deferred_surface) {
+		return XRT_SUCCESS; // Already initialized
+	}
+
+	if (c->target != NULL) {
+		return XRT_SUCCESS; // Already have a target
+	}
+
+	// Create window + swapchain + renderer (this runs on the main thread)
+	if (!compositor_init_window_post_vulkan(c) ||
+	    !compositor_init_swapchain(c) ||
+	    !compositor_init_renderer(c)) {
+		COMP_ERROR(c, "Failed to init deferred compositor target");
+		return XRT_ERROR_VULKAN;
+	}
+
+	comp_target_set_title(c->target, WINDOW_TITLE);
+	comp_renderer_add_debug_vars(c->r);
+
+	COMP_INFO(c, "Initialized deferred main target from main thread");
+	return XRT_SUCCESS;
+}
+
+/*!
  * Initialize the target service on a compositor.
  * Called during compositor creation.
  */
@@ -313,6 +357,7 @@ compositor_init_target_service(struct comp_compositor *c)
 	c->target_service.create_from_window = target_service_create_from_window;
 	c->target_service.destroy_target = target_service_destroy_target;
 	c->target_service.get_vk = target_service_get_vk;
+	c->target_service.init_main_target = target_service_init_main_target;
 	c->target_service.context = c;
 }
 
@@ -325,6 +370,11 @@ compositor_begin_session(struct xrt_compositor *xc, const struct xrt_begin_sessi
 
 	// clang-format off
 	if (c->deferred_surface) {
+		// Check if already initialized (macOS: init_main_target called from main thread)
+		if (c->target != NULL) {
+			return XRT_SUCCESS;
+		}
+
 #ifdef XRT_OS_WINDOWS
 		// Use external HWND if provided (XR_EXT_win32_window_binding)
 		if (c->external_window_handle != NULL) {
@@ -340,7 +390,15 @@ compositor_begin_session(struct xrt_compositor *xc, const struct xrt_begin_sessi
 			return XRT_SUCCESS;
 		}
 #endif
-		// Fallback: create internal window
+
+#ifdef XRT_OS_MACOS
+		// macOS: external NSView handled via per-session rendering.
+		// Non-extension case: init_main_target was called from main thread.
+		// If we get here with no target, per-session rendering will handle it.
+		return XRT_SUCCESS;
+#endif
+
+		// Fallback: create internal window (non-macOS)
 		if (!compositor_init_window_post_vulkan(c) ||
 		    !compositor_init_swapchain(c) ||
 		    !compositor_init_renderer(c)) {
@@ -390,6 +448,19 @@ compositor_predict_frame(struct xrt_compositor *xc,
 
 	COMP_SPEW(c, "PREDICT_FRAME");
 
+	// No target = deferred with per-session rendering only.
+	// Use simple time-based prediction.
+	if (c->target == NULL) {
+		static int64_t s_frame_counter = 1;
+		int64_t now_ns = os_monotonic_get_ns();
+		*out_frame_id = s_frame_counter++;
+		*out_wake_time_ns = now_ns;
+		*out_predicted_gpu_time_ns = now_ns + c->frame_interval_ns / 2;
+		*out_predicted_display_time_ns = now_ns + c->frame_interval_ns;
+		*out_predicted_display_period_ns = c->frame_interval_ns;
+		return XRT_SUCCESS;
+	}
+
 	comp_target_update_timings(c->target);
 
 	assert(comp_frame_is_invalid_locked(&c->frame.waited));
@@ -435,7 +506,9 @@ compositor_mark_frame(struct xrt_compositor *xc,
 
 	switch (point) {
 	case XRT_COMPOSITOR_FRAME_POINT_WOKE:
-		comp_target_mark_wake_up(c->target, frame_id, when_ns);
+		if (c->target != NULL) {
+			comp_target_mark_wake_up(c->target, frame_id, when_ns);
+		}
 		return XRT_SUCCESS;
 	default: assert(false);
 	}
@@ -500,6 +573,13 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 
 
 	u_graphics_sync_unref(&sync_handle);
+
+	// No renderer = deferred surface with per-session rendering only.
+	// The main compositor has no target; per-session handles rendering.
+	if (c->r == NULL) {
+		c->last_frame_time_ns = os_monotonic_get_ns();
+		return XRT_SUCCESS;
+	}
 
 	// Do the drawing
 	xrt_result_t xret = comp_renderer_draw(c->r);
