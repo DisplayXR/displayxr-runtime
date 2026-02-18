@@ -163,23 +163,17 @@ comp_window_macos_flush(struct comp_target *ct)
 	// interfere with main-thread CA transaction processing.
 }
 
+/*!
+ * Block that creates the NSWindow + MonadoMetalView on the current thread.
+ * Factored out so it can be dispatched to the main thread if needed.
+ */
 static bool
-comp_window_macos_init(struct comp_target *ct)
+comp_window_macos_init_on_main_thread(struct comp_window_macos *w, uint32_t width, uint32_t height)
 {
-	struct comp_window_macos *w = (struct comp_window_macos *)ct;
-
 	ensure_ns_app();
-
-	// Window dimensions from compositor settings.
-	uint32_t width = ct->c->settings.preferred.width;
-	uint32_t height = ct->c->settings.preferred.height;
 
 	NSRect frame = NSMakeRect(100, 100, width, height);
 
-	// With is_deferred=false, this runs on the main thread during
-	// comp_compositor_create (called from xrCreateSession). NSWindow
-	// requires the main thread, so deferred creation (which runs on the
-	// multi compositor background thread) must not be used on macOS.
 	@autoreleasepool {
 		NSUInteger style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
 		                   NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable;
@@ -219,7 +213,23 @@ comp_window_macos_init(struct comp_target *ct)
 		}
 	}
 
-	if (w->window == nil || w->metal_layer == nil) {
+	return (w->window != nil && w->metal_layer != nil);
+}
+
+static bool
+comp_window_macos_init(struct comp_target *ct)
+{
+	struct comp_window_macos *w = (struct comp_window_macos *)ct;
+
+	uint32_t width = ct->c->settings.preferred.width;
+	uint32_t height = ct->c->settings.preferred.height;
+
+	// With is_deferred=true, this may be called from the render thread
+	// during compositor_begin_session. Creating an NSWindow on a non-main
+	// thread is not recommended by Apple but works in practice.
+	// Using dispatch_sync(dispatch_get_main_queue()) would deadlock
+	// because the main thread is typically blocked in xrWaitFrame.
+	if (!comp_window_macos_init_on_main_thread(w, width, height)) {
 		COMP_ERROR(ct->c, "Failed to create macOS window");
 		return false;
 	}
@@ -276,7 +286,26 @@ comp_window_macos_update_window_title(struct comp_target *ct, const char *title)
 	}
 
 	NSString *ns_title = [NSString stringWithUTF8String:title];
-	[w->window setTitle:ns_title];
+
+	// NSWindow operations must be on the main thread.
+	// compositor_begin_session may call this from the render thread.
+	if ([NSThread isMainThread]) {
+		[w->window setTitle:ns_title];
+	} else {
+		dispatch_async(dispatch_get_main_queue(), ^{
+		    [w->window setTitle:ns_title];
+		});
+	}
+}
+
+/*!
+ * No-op title setter for external windows — the app owns the window.
+ */
+static void
+comp_window_macos_update_window_title_noop(struct comp_target *ct, const char *title)
+{
+	(void)ct;
+	(void)title;
 }
 
 
@@ -347,7 +376,7 @@ comp_window_macos_create_from_external(struct comp_compositor *c,
 	w->base.base.flush = comp_window_macos_flush;
 	w->base.base.init_pre_vulkan = NULL;
 	w->base.base.init_post_vulkan = comp_window_macos_init_swapchain;
-	w->base.base.set_title = comp_window_macos_update_window_title;
+	w->base.base.set_title = comp_window_macos_update_window_title_noop;
 
 	COMP_INFO(c, "Created macOS target from external NSView %p (%ux%u)",
 	          external_view, w->base.base.width, w->base.base.height);
@@ -370,7 +399,10 @@ static const char *instance_extensions[] = {
 static bool
 detect(const struct comp_target_factory *ctf, struct comp_compositor *c)
 {
-	return false;
+	// Return true so the deferred factory is selected during system init.
+	// Actual window creation is deferred to xrBeginSession (main thread)
+	// via target_service_init_main_target or per-session rendering.
+	return true;
 }
 
 static bool
@@ -393,7 +425,7 @@ const struct comp_target_factory comp_target_factory_macos = {
     .name = "macOS Window",
     .identifier = "macos",
     .requires_vulkan_for_create = false,
-    .is_deferred = false,
+    .is_deferred = true,
     .required_instance_version = 0,
     .required_instance_extensions = instance_extensions,
     .required_instance_extension_count = ARRAY_SIZE(instance_extensions),

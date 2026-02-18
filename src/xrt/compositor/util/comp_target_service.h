@@ -64,6 +64,17 @@ struct comp_target_service
 	 */
 	struct vk_bundle *(*get_vk)(struct comp_target_service *service);
 
+	/*!
+	 * Initialize the main compositor's window, swapchain, and renderer.
+	 * Called from the main thread during xrBeginSession (before xrWaitFrame
+	 * blocks). On macOS, NSWindow creation requires the main thread.
+	 * Only needed when is_deferred = true and no external window is provided.
+	 *
+	 * @param service The service instance
+	 * @return XRT_SUCCESS or error code
+	 */
+	xrt_result_t (*init_main_target)(struct comp_target_service *service);
+
 	//! Opaque context for implementation (typically comp_compositor*)
 	void *context;
 };
@@ -113,6 +124,21 @@ comp_target_service_get_vk(struct comp_target_service *service)
 		return NULL;
 	}
 	return service->get_vk(service);
+}
+
+/*!
+ * Convenience wrapper for initializing the main target from the main thread.
+ *
+ * @public @memberof comp_target_service
+ * @ingroup comp_util
+ */
+static inline xrt_result_t
+comp_target_service_init_main_target(struct comp_target_service *service)
+{
+	if (service == NULL || service->init_main_target == NULL) {
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+	return service->init_main_target(service);
 }
 
 
