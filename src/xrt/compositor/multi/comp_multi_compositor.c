@@ -740,6 +740,17 @@ multi_compositor_wait_frame(struct xrt_compositor *xc,
 		return XRT_ERROR_IPC_FAILURE;
 	}
 #endif
+#ifdef XRT_OS_MACOS
+	// Check if macOS window was closed (close button or Escape key).
+	// The flag is set by oxr_macos_pump_events() on the main thread.
+	{
+		extern bool oxr_macos_window_closed(void);
+		if (oxr_macos_window_closed()) {
+			U_LOG_W("macOS window closed - signaling session loss");
+			return XRT_ERROR_IPC_FAILURE;
+		}
+	}
+#endif
 
 	int64_t frame_id = -1;
 	int64_t wake_up_time_ns = 0;

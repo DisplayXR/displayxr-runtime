@@ -48,6 +48,30 @@ enum sim_display_output_mode
 };
 
 /*!
+ * Get the current runtime output mode.
+ *
+ * Thread-safe (atomic). The display processor reads this each frame
+ * to select which shader pipeline to use.
+ *
+ * @return Current output mode.
+ * @ingroup drv_sim_display
+ */
+enum sim_display_output_mode
+sim_display_get_output_mode(void);
+
+/*!
+ * Set the output mode at runtime.
+ *
+ * Thread-safe (atomic). Call from the event pump (main thread) when
+ * the user presses 1/2/3 to switch modes.
+ *
+ * @param mode The new output mode.
+ * @ingroup drv_sim_display
+ */
+void
+sim_display_set_output_mode(enum sim_display_output_mode mode);
+
+/*!
  * Create a simulated 3D display HMD device.
  *
  * Display properties are configurable via environment variables:
@@ -98,6 +122,19 @@ xrt_result_t
 sim_display_processor_d3d11_create(enum sim_display_output_mode mode,
                                    void *d3d11_device,
                                    struct xrt_display_processor_d3d11 **out_xdp);
+
+/*!
+ * Set an external device as the pose source for a sim_display HMD.
+ *
+ * When set, the sim_display HMD delegates get_tracked_pose to the
+ * source device (e.g. a qwerty HMD for WASD/mouse camera control).
+ *
+ * @param sim_hmd  The sim_display HMD device.
+ * @param source   The device providing pose data, or NULL to use static pose.
+ * @ingroup drv_sim_display
+ */
+void
+sim_display_hmd_set_pose_source(struct xrt_device *sim_hmd, struct xrt_device *source);
 
 /*!
  * Create the simulation display system builder.

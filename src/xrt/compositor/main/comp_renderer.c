@@ -59,6 +59,7 @@
 #endif
 
 #include "xrt/xrt_display_processor.h"
+#include "sim_display/sim_display_interface.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -607,6 +608,29 @@ renderer_init(struct comp_renderer *r, struct comp_compositor *c, VkExtent2D scr
 	}
 #endif // XRT_HAVE_LEIA_SR_VULKAN
 
+	// Create sim_display processor if SIM_DISPLAY_ENABLE=1 and no display processor yet
+	if (r->display_processor == NULL) {
+		const char *sim_enable = getenv("SIM_DISPLAY_ENABLE");
+		if (sim_enable != NULL && strcmp(sim_enable, "1") == 0) {
+			enum sim_display_output_mode mode = SIM_DISPLAY_OUTPUT_SBS;
+			const char *mode_str = getenv("SIM_DISPLAY_OUTPUT");
+			if (mode_str != NULL) {
+				if (strcmp(mode_str, "anaglyph") == 0) {
+					mode = SIM_DISPLAY_OUTPUT_ANAGLYPH;
+				} else if (strcmp(mode_str, "blend") == 0) {
+					mode = SIM_DISPLAY_OUTPUT_BLEND;
+				}
+			}
+
+			xrt_result_t dp_ret = sim_display_processor_create(
+			    mode, vk, (int32_t)r->c->target->format, &r->display_processor);
+			if (dp_ret != XRT_SUCCESS) {
+				COMP_WARN(c, "Failed to create sim display processor");
+				r->display_processor = NULL;
+			}
+		}
+	}
+
 	VkResult ret = comp_mirror_init( //
 	    &r->mirror_to_debug_gui,     //
 	    vk,                          //
@@ -945,7 +969,7 @@ static bool getLayerInfo(struct comp_renderer *r, int view_index, int* width, in
 	const uint32_t sc_array_index = is_view_index_right(view_index) ? 1 : 0;
 	const uint32_t array_index = vd->sub.array_index;
 	const struct comp_swapchain *sc = (struct comp_swapchain *)(comp_layer_get_swapchain(theLayer, sc_array_index));
-	const struct comp_swapchain_image *image = &sc->images[array_index];
+	const struct comp_swapchain_image *image = &sc->images[vd->sub.image_index];
 
 	*width = layer_data->proj.v[view_index].sub.rect.extent.w;
 	*height = layer_data->proj.v[view_index].sub.rect.extent.h;
@@ -1148,54 +1172,80 @@ do_weaving(struct comp_renderer *r,
 		bool leftViewOk = getLayerInfo(r, 0, &imageWidth, &imageHeight, &imageFormat, &leftImageView);
 		bool rightViewOk = getLayerInfo(r, 1, &imageWidth, &imageHeight, &imageFormat, &rightImageView);
 
+		{
+			static bool dp_dims_logged = false;
+			if (!dp_dims_logged && leftViewOk && rightViewOk) {
+				U_LOG_W("[dp] source=%dx%d target=%dx%d",
+				        imageWidth, imageHeight, framebufferWidth, framebufferHeight);
+				dp_dims_logged = true;
+			}
+		}
+
 		// Process views through the display processor.
 		if (leftViewOk && rightViewOk) {
 			VkImageView weaveLeft = leftImageView;
 			VkImageView weaveRight = rightImageView;
 
+			// Reset command pool (discards chl_frame_state commands) and start fresh recording.
 			render_gfx_begin(render);
 
-			// If the projection layer has flip_y (e.g. OpenGL textures with bottom-left origin),
-			// blit into intermediate images with flipped Y before passing to display processor.
-			if (layer->data.flip_y) {
+			// Transition source images to SHADER_READ_ONLY for display processor sampling.
+			// The command pool reset above discarded any earlier barriers, so we must
+			// re-record them here. Source images arrive in COLOR_ATTACHMENT_OPTIMAL
+			// from the client's rendering pass.
+			{
 				struct vk_bundle *vk = &r->c->base.vk;
-				if (ensure_flip_images(r, vk, imageWidth, imageHeight, imageFormat)) {
-					const struct xrt_layer_projection_view_data *vd_left = &layer->data.proj.v[0];
-					const struct xrt_layer_projection_view_data *vd_right = &layer->data.proj.v[1];
-					struct comp_swapchain *sc_left =
-					    (struct comp_swapchain *)comp_layer_get_swapchain(layer, 0);
-					struct comp_swapchain *sc_right =
-					    (struct comp_swapchain *)comp_layer_get_swapchain(layer, 1);
-					VkImage src_left = sc_left->vkic.images[vd_left->sub.image_index].handle;
-					VkImage src_right = sc_right->vkic.images[vd_right->sub.image_index].handle;
+				const struct xrt_layer_projection_view_data *vd_left = &layer->data.proj.v[0];
+				const struct xrt_layer_projection_view_data *vd_right = &layer->data.proj.v[1];
+				struct comp_swapchain *sc_left =
+				    (struct comp_swapchain *)comp_layer_get_swapchain(layer, 0);
+				struct comp_swapchain *sc_right =
+				    (struct comp_swapchain *)comp_layer_get_swapchain(layer, 1);
+				VkImage img_left = sc_left->vkic.images[vd_left->sub.image_index].handle;
+				VkImage img_right = sc_right->vkic.images[vd_right->sub.image_index].handle;
 
-					blit_flip_eye(vk, commandBuffer, src_left, r->flip.images[0],
-					              imageWidth, imageHeight, vd_left->sub.array_index);
-					blit_flip_eye(vk, commandBuffer, src_right, r->flip.images[1],
-					              imageWidth, imageHeight, vd_right->sub.array_index);
-
-					weaveLeft = r->flip.views[0];
-					weaveRight = r->flip.views[1];
-				}
+				VkImageMemoryBarrier barriers[2] = {
+				    {
+				        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+				        .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+				        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+				        .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+				        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+				        .image = img_left,
+				        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+				    },
+				    {
+				        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+				        .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+				        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+				        .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+				        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+				        .image = img_right,
+				        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+				    },
+				};
+				vk->vkCmdPipelineBarrier(commandBuffer,
+				                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+				                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+				                         0, 0, NULL, 0, NULL, 2, barriers);
 			}
 
+			// Display processor render pass handles target layout:
+			// initialLayout=UNDEFINED → finalLayout=PRESENT_SRC_KHR
 			xrt_display_processor_process_views(
 			    r->display_processor,
 			    commandBuffer,
-			    weaveLeft,
-			    weaveRight,
-			    (uint32_t)imageWidth,
-			    (uint32_t)imageHeight,
+			    weaveLeft, weaveRight,
+			    imageWidth, imageHeight,
 			    (VkFormat_XDP)imageFormat,
 			    framebuffer,
-			    (uint32_t)framebufferWidth,
-			    (uint32_t)framebufferHeight,
+			    framebufferWidth, framebufferHeight,
 			    (VkFormat_XDP)framebufferFormat);
+
 			render_gfx_end(render);
 		}
 	}
 }
-
 /*
  *
  * Graphics
@@ -1216,8 +1266,6 @@ dispatch_graphics(struct comp_renderer *r,
 	struct comp_compositor *c = r->c;
 	struct vk_bundle *vk = &c->base.vk;
 	VkResult ret;
-
-	// Diagnostic bypass removed — using normal rendering pipeline with green clear colors.
 
 	// Basics
 	const struct comp_layer *layers = c->base.layer_accum.layers;

@@ -710,8 +710,8 @@ oxr_session_poll(struct oxr_logger *log, struct oxr_session *sess)
 	// require periodic run loop processing for the Window Server to
 	// commit rendered content to the screen. This is the only place
 	// where the app's main thread calls into the runtime each frame.
-	extern void oxr_macos_pump_events(void);
-	oxr_macos_pump_events();
+	extern void oxr_macos_pump_events(struct xrt_device **xdevs, uint32_t xdev_count);
+	oxr_macos_pump_events(sess->sys->xsysd->xdevs, sess->sys->xsysd->xdev_count);
 #endif
 
 #ifdef XRT_OS_ANDROID

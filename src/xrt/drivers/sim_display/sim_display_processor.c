@@ -28,6 +28,7 @@
 #include "sim_display/shaders/fullscreen.vert.h"
 #include "sim_display/shaders/anaglyph.frag.h"
 #include "sim_display/shaders/blend.frag.h"
+#include "sim_display/shaders/sbs.frag.h"
 
 
 /*!
@@ -36,13 +37,13 @@
 struct sim_display_processor
 {
 	struct xrt_display_processor base;
-	enum sim_display_output_mode mode;
-	struct vk_bundle *vk;           //!< NULL for SBS mode
+	struct vk_bundle *vk;
 	VkRenderPass render_pass;
-	VkPipeline pipeline;
+	VkPipeline pipelines[3];        //!< One per output mode (SBS, anaglyph, blend)
 	VkPipelineLayout pipeline_layout;
 	VkDescriptorSetLayout desc_layout;
 	VkDescriptorPool desc_pool;
+	VkDescriptorSet desc_set;       //!< Persistent descriptor set (allocated once)
 	VkSampler sampler;
 };
 
@@ -50,39 +51,6 @@ static inline struct sim_display_processor *
 sim_display_processor(struct xrt_display_processor *xdp)
 {
 	return (struct sim_display_processor *)xdp;
-}
-
-
-/*
- *
- * SBS output: no-op. The compositor's viewport config handles side-by-side layout.
- *
- */
-
-static void
-sim_dp_process_views_sbs(struct xrt_display_processor *xdp,
-                         VkCommandBuffer cmd_buffer,
-                         VkImageView left_view,
-                         VkImageView right_view,
-                         uint32_t view_width,
-                         uint32_t view_height,
-                         VkFormat_XDP view_format,
-                         VkFramebuffer target_fb,
-                         uint32_t target_width,
-                         uint32_t target_height,
-                         VkFormat_XDP target_format)
-{
-	(void)xdp;
-	(void)cmd_buffer;
-	(void)left_view;
-	(void)right_view;
-	(void)view_width;
-	(void)view_height;
-	(void)view_format;
-	(void)target_fb;
-	(void)target_width;
-	(void)target_height;
-	(void)target_format;
 }
 
 
@@ -108,26 +76,15 @@ sim_dp_process_views_shader(struct xrt_display_processor *xdp,
 	struct sim_display_processor *sdp = sim_display_processor(xdp);
 	struct vk_bundle *vk = sdp->vk;
 
-	if (vk == NULL || sdp->pipeline == VK_NULL_HANDLE) {
+	// Read the current mode (may change at runtime via 1/2/3 keys)
+	enum sim_display_output_mode mode = sim_display_get_output_mode();
+	VkPipeline active_pipeline = sdp->pipelines[mode];
+
+	if (vk == NULL || active_pipeline == VK_NULL_HANDLE) {
 		return;
 	}
 
-	// Allocate a descriptor set from the pool
-	VkDescriptorSetAllocateInfo alloc_info = {
-	    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-	    .descriptorPool = sdp->desc_pool,
-	    .descriptorSetCount = 1,
-	    .pSetLayouts = &sdp->desc_layout,
-	};
-
-	VkDescriptorSet desc_set;
-	VkResult ret = vk->vkAllocateDescriptorSets(vk->device, &alloc_info, &desc_set);
-	if (ret != VK_SUCCESS) {
-		U_LOG_E("sim_display: Failed to allocate descriptor set: %d", ret);
-		return;
-	}
-
-	// Update descriptor set with left and right image views
+	// Update persistent descriptor set with current left and right image views
 	VkDescriptorImageInfo image_infos[2] = {
 	    {
 	        .sampler = sdp->sampler,
@@ -144,7 +101,7 @@ sim_dp_process_views_shader(struct xrt_display_processor *xdp,
 	VkWriteDescriptorSet writes[2] = {
 	    {
 	        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-	        .dstSet = desc_set,
+	        .dstSet = sdp->desc_set,
 	        .dstBinding = 0,
 	        .descriptorCount = 1,
 	        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
@@ -152,7 +109,7 @@ sim_dp_process_views_shader(struct xrt_display_processor *xdp,
 	    },
 	    {
 	        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-	        .dstSet = desc_set,
+	        .dstSet = sdp->desc_set,
 	        .dstBinding = 1,
 	        .descriptorCount = 1,
 	        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
@@ -180,9 +137,9 @@ sim_dp_process_views_shader(struct xrt_display_processor *xdp,
 	vk->vkCmdBeginRenderPass(cmd_buffer, &rp_begin, VK_SUBPASS_CONTENTS_INLINE);
 
 	// Bind pipeline and descriptor set
-	vk->vkCmdBindPipeline(cmd_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, sdp->pipeline);
+	vk->vkCmdBindPipeline(cmd_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, active_pipeline);
 	vk->vkCmdBindDescriptorSets(cmd_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, sdp->pipeline_layout, 0, 1,
-	                             &desc_set, 0, NULL);
+	                             &sdp->desc_set, 0, NULL);
 
 	// Set dynamic viewport and scissor
 	VkViewport viewport = {
@@ -205,9 +162,6 @@ sim_dp_process_views_shader(struct xrt_display_processor *xdp,
 	vk->vkCmdDraw(cmd_buffer, 3, 1, 0, 0);
 
 	vk->vkCmdEndRenderPass(cmd_buffer);
-
-	// Free descriptor set back to pool
-	vk->vkFreeDescriptorSets(vk->device, sdp->desc_pool, 1, &desc_set);
 }
 
 
@@ -235,16 +189,19 @@ create_pipeline_resources(struct sim_display_processor *sdp, int32_t target_form
 	struct vk_bundle *vk = sdp->vk;
 	VkResult ret;
 
-	// 1. Create render pass (single color attachment, LOAD_OP_DONT_CARE since we write every pixel)
+	// 1. Create render pass (single color attachment)
+	//    initialLayout = UNDEFINED: image may be in any layout (PRESENT_SRC after present, etc.)
+	//    finalLayout = PRESENT_SRC_KHR: image goes directly to presentation after display processing
+	//    Using LOAD_OP_CLEAR to ensure entire framebuffer is initialized (diagnostic: magenta background)
 	VkAttachmentDescription color_attachment = {
 	    .format = (VkFormat)target_format,
 	    .samples = VK_SAMPLE_COUNT_1_BIT,
-	    .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+	    .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
 	    .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
 	    .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
 	    .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-	    .initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-	    .finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+	    .finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
 	};
 
 	VkAttachmentReference color_ref = {
@@ -313,10 +270,8 @@ create_pipeline_resources(struct sim_display_processor *sdp, int32_t target_form
 		return false;
 	}
 
-	// 4. Create shader modules
+	// 4. Create vertex shader module (shared by all modes)
 	VkShaderModule vert_module = VK_NULL_HANDLE;
-	VkShaderModule frag_module = VK_NULL_HANDLE;
-
 	ret = create_shader_module(vk, sim_display_shaders_fullscreen_vert, sizeof(sim_display_shaders_fullscreen_vert),
 	                           &vert_module);
 	if (ret != VK_SUCCESS) {
@@ -324,37 +279,16 @@ create_pipeline_resources(struct sim_display_processor *sdp, int32_t target_form
 		return false;
 	}
 
-	const uint32_t *frag_code;
-	size_t frag_size;
-	if (sdp->mode == SIM_DISPLAY_OUTPUT_ANAGLYPH) {
-		frag_code = sim_display_shaders_anaglyph_frag;
-		frag_size = sizeof(sim_display_shaders_anaglyph_frag);
-	} else {
-		frag_code = sim_display_shaders_blend_frag;
-		frag_size = sizeof(sim_display_shaders_blend_frag);
-	}
-
-	ret = create_shader_module(vk, frag_code, frag_size, &frag_module);
-	if (ret != VK_SUCCESS) {
-		U_LOG_E("sim_display: Failed to create fragment shader module: %d", ret);
-		vk->vkDestroyShaderModule(vk->device, vert_module, NULL);
-		return false;
-	}
-
-	// 5. Create graphics pipeline
-	VkPipelineShaderStageCreateInfo stages[2] = {
-	    {
-	        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-	        .stage = VK_SHADER_STAGE_VERTEX_BIT,
-	        .module = vert_module,
-	        .pName = "main",
-	    },
-	    {
-	        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-	        .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
-	        .module = frag_module,
-	        .pName = "main",
-	    },
+	// 5. Create one graphics pipeline per output mode (SBS, anaglyph, blend)
+	//    so runtime switching is instant (no pipeline recreation).
+	struct {
+		const uint32_t *code;
+		size_t size;
+		const char *name;
+	} frag_shaders[3] = {
+	    {sim_display_shaders_sbs_frag, sizeof(sim_display_shaders_sbs_frag), "SBS"},
+	    {sim_display_shaders_anaglyph_frag, sizeof(sim_display_shaders_anaglyph_frag), "Anaglyph"},
+	    {sim_display_shaders_blend_frag, sizeof(sim_display_shaders_blend_frag), "Blend"},
 	};
 
 	VkPipelineVertexInputStateCreateInfo vertex_input = {
@@ -403,32 +337,58 @@ create_pipeline_resources(struct sim_display_processor *sdp, int32_t target_form
 	    .pDynamicStates = dynamic_states,
 	};
 
-	VkGraphicsPipelineCreateInfo pipeline_info = {
-	    .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-	    .stageCount = 2,
-	    .pStages = stages,
-	    .pVertexInputState = &vertex_input,
-	    .pInputAssemblyState = &input_assembly,
-	    .pViewportState = &viewport_state,
-	    .pRasterizationState = &rasterization,
-	    .pMultisampleState = &multisample,
-	    .pColorBlendState = &color_blend,
-	    .pDynamicState = &dynamic_state,
-	    .layout = sdp->pipeline_layout,
-	    .renderPass = sdp->render_pass,
-	    .subpass = 0,
-	};
+	for (int i = 0; i < 3; i++) {
+		VkShaderModule frag_module = VK_NULL_HANDLE;
+		ret = create_shader_module(vk, frag_shaders[i].code, frag_shaders[i].size, &frag_module);
+		if (ret != VK_SUCCESS) {
+			U_LOG_E("sim_display: Failed to create %s fragment shader: %d", frag_shaders[i].name, ret);
+			vk->vkDestroyShaderModule(vk->device, vert_module, NULL);
+			return false;
+		}
 
-	ret = vk->vkCreateGraphicsPipelines(vk->device, VK_NULL_HANDLE, 1, &pipeline_info, NULL, &sdp->pipeline);
+		VkPipelineShaderStageCreateInfo stages[2] = {
+		    {
+		        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+		        .stage = VK_SHADER_STAGE_VERTEX_BIT,
+		        .module = vert_module,
+		        .pName = "main",
+		    },
+		    {
+		        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+		        .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+		        .module = frag_module,
+		        .pName = "main",
+		    },
+		};
 
-	// Shader modules no longer needed after pipeline creation
-	vk->vkDestroyShaderModule(vk->device, vert_module, NULL);
-	vk->vkDestroyShaderModule(vk->device, frag_module, NULL);
+		VkGraphicsPipelineCreateInfo pipeline_info = {
+		    .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+		    .stageCount = 2,
+		    .pStages = stages,
+		    .pVertexInputState = &vertex_input,
+		    .pInputAssemblyState = &input_assembly,
+		    .pViewportState = &viewport_state,
+		    .pRasterizationState = &rasterization,
+		    .pMultisampleState = &multisample,
+		    .pColorBlendState = &color_blend,
+		    .pDynamicState = &dynamic_state,
+		    .layout = sdp->pipeline_layout,
+		    .renderPass = sdp->render_pass,
+		    .subpass = 0,
+		};
 
-	if (ret != VK_SUCCESS) {
-		U_LOG_E("sim_display: Failed to create graphics pipeline: %d", ret);
-		return false;
+		ret = vk->vkCreateGraphicsPipelines(vk->device, VK_NULL_HANDLE, 1, &pipeline_info, NULL,
+		                                     &sdp->pipelines[i]);
+		vk->vkDestroyShaderModule(vk->device, frag_module, NULL);
+
+		if (ret != VK_SUCCESS) {
+			U_LOG_E("sim_display: Failed to create %s pipeline: %d", frag_shaders[i].name, ret);
+			vk->vkDestroyShaderModule(vk->device, vert_module, NULL);
+			return false;
+		}
 	}
+
+	vk->vkDestroyShaderModule(vk->device, vert_module, NULL);
 
 	// 6. Create sampler (linear filtering, clamp to edge)
 	VkSamplerCreateInfo sampler_info = {
@@ -448,7 +408,7 @@ create_pipeline_resources(struct sim_display_processor *sdp, int32_t target_form
 		return false;
 	}
 
-	// 7. Create descriptor pool (allow per-frame alloc/free)
+	// 7. Create descriptor pool (persistent set, never freed individually)
 	VkDescriptorPoolSize pool_size = {
 	    .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
 	    .descriptorCount = 2, // One set with 2 samplers
@@ -456,7 +416,6 @@ create_pipeline_resources(struct sim_display_processor *sdp, int32_t target_form
 
 	VkDescriptorPoolCreateInfo pool_info = {
 	    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-	    .flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
 	    .maxSets = 1,
 	    .poolSizeCount = 1,
 	    .pPoolSizes = &pool_size,
@@ -465,6 +424,20 @@ create_pipeline_resources(struct sim_display_processor *sdp, int32_t target_form
 	ret = vk->vkCreateDescriptorPool(vk->device, &pool_info, NULL, &sdp->desc_pool);
 	if (ret != VK_SUCCESS) {
 		U_LOG_E("sim_display: Failed to create descriptor pool: %d", ret);
+		return false;
+	}
+
+	// 8. Allocate persistent descriptor set (updated each frame, never freed)
+	VkDescriptorSetAllocateInfo alloc_info = {
+	    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+	    .descriptorPool = sdp->desc_pool,
+	    .descriptorSetCount = 1,
+	    .pSetLayouts = &sdp->desc_layout,
+	};
+
+	ret = vk->vkAllocateDescriptorSets(vk->device, &alloc_info, &sdp->desc_set);
+	if (ret != VK_SUCCESS) {
+		U_LOG_E("sim_display: Failed to allocate descriptor set: %d", ret);
 		return false;
 	}
 
@@ -486,8 +459,10 @@ sim_dp_destroy(struct xrt_display_processor *xdp)
 		if (sdp->sampler != VK_NULL_HANDLE) {
 			vk->vkDestroySampler(vk->device, sdp->sampler, NULL);
 		}
-		if (sdp->pipeline != VK_NULL_HANDLE) {
-			vk->vkDestroyPipeline(vk->device, sdp->pipeline, NULL);
+		for (int i = 0; i < 3; i++) {
+			if (sdp->pipelines[i] != VK_NULL_HANDLE) {
+				vk->vkDestroyPipeline(vk->device, sdp->pipelines[i], NULL);
+			}
 		}
 		if (sdp->pipeline_layout != VK_NULL_HANDLE) {
 			vk->vkDestroyPipelineLayout(vk->device, sdp->pipeline_layout, NULL);
@@ -525,40 +500,29 @@ sim_display_processor_create(enum sim_display_output_mode mode,
 		return XRT_ERROR_ALLOCATION;
 	}
 
-	sdp->mode = mode;
 	sdp->base.destroy = sim_dp_destroy;
 
-	switch (mode) {
-	case SIM_DISPLAY_OUTPUT_SBS:
-		sdp->base.process_views = sim_dp_process_views_sbs;
-		U_LOG_W("Created sim display processor: SBS mode");
-		break;
-
-	case SIM_DISPLAY_OUTPUT_ANAGLYPH:
-	case SIM_DISPLAY_OUTPUT_BLEND:
-		if (vk == NULL) {
-			U_LOG_E("sim_display: Vulkan bundle required for anaglyph/blend modes");
-			free(sdp);
-			return XRT_ERROR_DEVICE_CREATION_FAILED;
-		}
-		sdp->vk = vk;
-		sdp->base.process_views = sim_dp_process_views_shader;
-
-		if (!create_pipeline_resources(sdp, target_format)) {
-			U_LOG_E("sim_display: Failed to create pipeline resources");
-			sim_dp_destroy(&sdp->base);
-			return XRT_ERROR_VULKAN;
-		}
-
-		U_LOG_W("Created sim display processor: %s mode",
-		        mode == SIM_DISPLAY_OUTPUT_ANAGLYPH ? "Anaglyph" : "Blend");
-		break;
-
-	default:
-		U_LOG_E("Unknown sim display output mode: %d", (int)mode);
+	if (vk == NULL) {
+		U_LOG_E("sim_display: Vulkan bundle required for display processor");
 		free(sdp);
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
+
+	sdp->vk = vk;
+	sdp->base.process_views = sim_dp_process_views_shader;
+
+	if (!create_pipeline_resources(sdp, target_format)) {
+		U_LOG_E("sim_display: Failed to create pipeline resources");
+		sim_dp_destroy(&sdp->base);
+		return XRT_ERROR_VULKAN;
+	}
+
+	// Set the initial output mode (atomic global read by process_views each frame)
+	sim_display_set_output_mode(mode);
+
+	U_LOG_W("Created sim display processor (all 3 pipelines), initial mode: %s",
+	        mode == SIM_DISPLAY_OUTPUT_SBS       ? "SBS" :
+	        mode == SIM_DISPLAY_OUTPUT_ANAGLYPH   ? "Anaglyph" : "Blend");
 
 	*out_xdp = &sdp->base;
 	return XRT_SUCCESS;

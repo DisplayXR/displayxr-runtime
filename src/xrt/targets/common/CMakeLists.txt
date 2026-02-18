@@ -73,6 +73,10 @@ endif()
 # Sim display builder (always available, guards itself via env var)
 target_sources(target_lists PRIVATE target_builder_sim_display.c)
 target_link_libraries(target_lists PRIVATE drv_sim_display)
+if(XRT_BUILD_DRIVER_QWERTY)
+	# sim_display builder creates qwerty controllers alongside its HMD
+	target_link_libraries(target_lists PRIVATE drv_qwerty drv_qwerty_includes)
+endif()
 
 ###
 # Drivers

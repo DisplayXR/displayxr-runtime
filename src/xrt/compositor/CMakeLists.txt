@@ -346,6 +346,7 @@ if(WIN32)
 		target_link_libraries(comp_win32_window PRIVATE drv_qwerty drv_qwerty_includes)
 		target_compile_definitions(comp_win32_window PRIVATE XRT_BUILD_DRIVER_QWERTY)
 	endif()
+	target_link_libraries(comp_win32_window PRIVATE drv_sim_display_includes)
 endif()
 
 ###
@@ -363,8 +364,9 @@ target_link_libraries(
 	)
 target_include_directories(comp_multi PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
-# Link comp_multi to sim_display driver for per-session display processor creation
+# Link comp_multi and comp_main to sim_display driver for display processor creation
 target_link_libraries(comp_multi PRIVATE drv_sim_display)
+target_link_libraries(comp_main PRIVATE drv_sim_display)
 
 # Link comp_multi to leiasr driver for per-session SR weaver creation
 # drv_leia exports XRT_HAVE_LEIA_SR_VULKAN as PUBLIC when Vulkan SR is available

@@ -1754,6 +1754,10 @@ int main() {
         return 1;
     }
 
+    // Enable VK_KHR_maintenance1 for negative viewport height (Y-flip).
+    // Without this extension, negative viewport height is undefined in Vulkan 1.0.
+    deviceExtensions.push_back(VK_KHR_MAINTENANCE1_EXTENSION_NAME);
+
     // Find graphics queue
     uint32_t queueFamilyIndex = 0;
     if (!FindGraphicsQueueFamily(physDevice, queueFamilyIndex)) {

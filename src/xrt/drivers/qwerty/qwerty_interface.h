@@ -78,6 +78,27 @@ qwerty_process_win32(struct xrt_device **xdevs,
                      bool *out_handled);
 #endif
 
+#ifdef __APPLE__
+/*!
+ * Process a macOS NSEvent and dispatch a suitable action to the appropriate
+ * qwerty_device.
+ *
+ * This allows keyboard/mouse input from the macOS compositor NSWindow to
+ * control qwerty devices without requiring the SDL debug GUI window.
+ * This is the macOS equivalent of qwerty_process_win32.
+ *
+ * @param xdevs Array of devices to search for qwerty devices
+ * @param xdev_count Number of devices in the array
+ * @param ns_event_ptr An NSEvent* cast to void* (avoids ObjC header deps)
+ *
+ * @ingroup drv_qwerty
+ */
+void
+qwerty_process_macos(struct xrt_device **xdevs,
+                     size_t xdev_count,
+                     void *ns_event_ptr);
+#endif
+
 /*!
  * Create all qwerty devices.
  *

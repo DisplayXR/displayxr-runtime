@@ -2205,6 +2205,17 @@ render_per_session_clients_locked(struct multi_system_compositor *msc, int64_t d
 			continue;
 		}
 #endif
+#ifdef XRT_OS_MACOS
+		// Skip rendering if macOS window was closed
+		{
+			extern bool oxr_macos_window_closed(void);
+			if (oxr_macos_window_closed()) {
+				int64_t now_ns = os_monotonic_get_ns();
+				multi_compositor_retire_delivered_locked(mc, now_ns);
+				continue;
+			}
+		}
+#endif
 
 		session_count++;
 

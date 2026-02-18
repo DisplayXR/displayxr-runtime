@@ -76,16 +76,31 @@ if(XRT_BUILD_DRIVER_QWERTY)
 		qwerty/qwerty_device.h
 		qwerty/qwerty_interface.h
 		qwerty/qwerty_prober.c
-		qwerty/qwerty_sdl.c
 	)
+
+	# SDL backend (cross-platform debug GUI input) — only when SDL2 is available
+	if(XRT_HAVE_SDL2)
+		list(APPEND QWERTY_SOURCES qwerty/qwerty_sdl.c)
+	endif()
 
 	# On Windows, add Win32 input handler for D3D11 compositor direct input
 	if(WIN32)
 		list(APPEND QWERTY_SOURCES qwerty/qwerty_win32.c)
 	endif()
 
+	# On macOS, add NSEvent input handler for Vulkan compositor window
+	if(APPLE)
+		list(APPEND QWERTY_SOURCES qwerty/qwerty_macos.m)
+	endif()
+
 	add_library(drv_qwerty STATIC ${QWERTY_SOURCES})
-	target_link_libraries(drv_qwerty PRIVATE xrt-interfaces aux_util SDL2::SDL2)
+	target_link_libraries(drv_qwerty PRIVATE xrt-interfaces aux_util)
+	if(XRT_HAVE_SDL2)
+		target_link_libraries(drv_qwerty PRIVATE SDL2::SDL2)
+	endif()
+	if(APPLE)
+		target_link_libraries(drv_qwerty PRIVATE "-framework Cocoa" "-framework Carbon")
+	endif()
 	list(APPEND ENABLED_DRIVERS qwerty)
 
 	add_library(drv_qwerty_includes INTERFACE)
@@ -644,6 +659,10 @@ if(XRT_HAVE_CNSDK AND NOT TARGET drv_leia)
 	list(APPEND ENABLED_DRIVERS drv_leia)
 endif()
 
+# Header-only interface for sim_display (used by st_oxr for mode switching)
+add_library(drv_sim_display_includes INTERFACE)
+target_include_directories(drv_sim_display_includes INTERFACE sim_display)
+
 # Simulation 3D display driver (always available, enabled by SIM_DISPLAY_ENABLE=1)
 set(SIM_DISPLAY_SOURCES
 	sim_display/sim_display_device.c
@@ -660,6 +679,7 @@ if(XRT_HAVE_VULKAN)
 		sim_display/shaders/fullscreen.vert
 		sim_display/shaders/anaglyph.frag
 		sim_display/shaders/blend.frag
+		sim_display/shaders/sbs.frag
 		)
 	list(APPEND SIM_DISPLAY_SOURCES
 		${SIM_DISPLAY_SHADER_HEADERS}
@@ -682,6 +702,10 @@ endif()
 
 if(WIN32)
 	target_link_libraries(drv_sim_display PRIVATE d3d11 d3dcompiler)
+endif()
+
+if(APPLE)
+	target_link_libraries(drv_sim_display PRIVATE "-framework CoreGraphics")
 endif()
 
 list(APPEND ENABLED_DRIVERS drv_sim_display)
