@@ -182,6 +182,19 @@ struct comp_renderer
 		VkFormat format;
 		bool initialized;
 	} flip;
+
+	//! Intermediate images for crop-blitting per-eye sub-rects before display processing.
+	//! Needed when both eyes reference the same swapchain image (single-swapchain SBS layout).
+	struct
+	{
+		VkImage images[2];
+		VkDeviceMemory memories[2];
+		VkImageView views[2];
+		int width;
+		int height;
+		VkFormat format;
+		bool initialized;
+	} crop;
 };
 
 
@@ -942,6 +955,19 @@ renderer_fini(struct comp_renderer *r)
 		r->flip.initialized = false;
 	}
 
+	// Destroy crop images (used for crop-blitting per-eye sub-rects before display processing)
+	if (r->crop.initialized) {
+		for (int i = 0; i < 2; i++) {
+			if (r->crop.views[i] != VK_NULL_HANDLE)
+				vk->vkDestroyImageView(vk->device, r->crop.views[i], NULL);
+			if (r->crop.images[i] != VK_NULL_HANDLE)
+				vk->vkDestroyImage(vk->device, r->crop.images[i], NULL);
+			if (r->crop.memories[i] != VK_NULL_HANDLE)
+				vk->vkFreeMemory(vk->device, r->crop.memories[i], NULL);
+		}
+		r->crop.initialized = false;
+	}
+
 #ifdef XRT_HAVE_LEIA_SR_VULKAN
 	leiasr_destroy(r->leiasr);
 #endif // XRT_HAVE_LEIA_SR_VULKAN
@@ -1034,6 +1060,65 @@ ensure_flip_images(struct comp_renderer *r, struct vk_bundle *vk, int width, int
 	r->flip.format = format;
 	r->flip.initialized = true;
 	U_LOG_W("Created flip images: %dx%d format=%d", width, height, format);
+	return true;
+}
+
+/*!
+ * Lazily create intermediate images for crop-blitting per-eye sub-rects before display processing.
+ * Needed when both eyes reference the same swapchain image (single-swapchain SBS layout),
+ * so the display processor sees UV 0..1 covering only valid per-eye content.
+ */
+static bool
+ensure_crop_images(struct comp_renderer *r, struct vk_bundle *vk, int width, int height, VkFormat format)
+{
+	// Already initialized with matching size?
+	if (r->crop.initialized && r->crop.width == width && r->crop.height == height && r->crop.format == format) {
+		return true;
+	}
+
+	// Destroy old if size changed
+	if (r->crop.initialized) {
+		for (int i = 0; i < 2; i++) {
+			if (r->crop.views[i] != VK_NULL_HANDLE)
+				vk->vkDestroyImageView(vk->device, r->crop.views[i], NULL);
+			if (r->crop.images[i] != VK_NULL_HANDLE)
+				vk->vkDestroyImage(vk->device, r->crop.images[i], NULL);
+			if (r->crop.memories[i] != VK_NULL_HANDLE)
+				vk->vkFreeMemory(vk->device, r->crop.memories[i], NULL);
+		}
+		r->crop.initialized = false;
+	}
+
+	VkExtent2D extent = {.width = (uint32_t)width, .height = (uint32_t)height};
+	VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+	VkImageSubresourceRange range = {
+	    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+	    .baseMipLevel = 0,
+	    .levelCount = 1,
+	    .baseArrayLayer = 0,
+	    .layerCount = 1,
+	};
+
+	for (int i = 0; i < 2; i++) {
+		VkResult ret = vk_create_image_simple(vk, extent, format, usage,
+		                                      &r->crop.memories[i], &r->crop.images[i]);
+		if (ret != VK_SUCCESS) {
+			U_LOG_E("Failed to create crop image %d: %s", i, vk_result_string(ret));
+			return false;
+		}
+
+		ret = vk_create_view(vk, r->crop.images[i], VK_IMAGE_VIEW_TYPE_2D, format, range, &r->crop.views[i]);
+		if (ret != VK_SUCCESS) {
+			U_LOG_E("Failed to create crop image view %d: %s", i, vk_result_string(ret));
+			return false;
+		}
+	}
+
+	r->crop.width = width;
+	r->crop.height = height;
+	r->crop.format = format;
+	r->crop.initialized = true;
+	U_LOG_W("[dp] Created crop images: %dx%d format=%d", width, height, format);
 	return true;
 }
 
@@ -1183,28 +1268,182 @@ do_weaving(struct comp_renderer *r,
 
 		// Process views through the display processor.
 		if (leftViewOk && rightViewOk) {
+			struct vk_bundle *vk = &r->c->base.vk;
+			const struct xrt_layer_projection_view_data *vd_left = &layer->data.proj.v[0];
+			const struct xrt_layer_projection_view_data *vd_right = &layer->data.proj.v[1];
+			struct comp_swapchain *sc_left =
+			    (struct comp_swapchain *)comp_layer_get_swapchain(layer, 0);
+			struct comp_swapchain *sc_right =
+			    (struct comp_swapchain *)comp_layer_get_swapchain(layer, 1);
+			VkImage img_left = sc_left->vkic.images[vd_left->sub.image_index].handle;
+			VkImage img_right = sc_right->vkic.images[vd_right->sub.image_index].handle;
+			bool same_image = (img_left == img_right);
+
+			// Extract sub-rect offsets for each eye
+			int leftOffsetX = layer->data.proj.v[0].sub.rect.offset.w;
+			int leftOffsetY = layer->data.proj.v[0].sub.rect.offset.h;
+			int rightOffsetX = layer->data.proj.v[1].sub.rect.offset.w;
+			int rightOffsetY = layer->data.proj.v[1].sub.rect.offset.h;
+
+			// Determine if crop-blit is needed: when eyes share the same image
+			// or have non-zero offsets (sub-rect addressing).
+			bool need_crop = same_image ||
+			                 leftOffsetX != 0 || leftOffsetY != 0 ||
+			                 rightOffsetX != 0 || rightOffsetY != 0;
+
 			VkImageView weaveLeft = leftImageView;
 			VkImageView weaveRight = rightImageView;
 
 			// Reset command pool (discards chl_frame_state commands) and start fresh recording.
 			render_gfx_begin(render);
 
-			// Transition source images to SHADER_READ_ONLY for display processor sampling.
-			// The command pool reset above discarded any earlier barriers, so we must
-			// re-record them here. Source images arrive in COLOR_ATTACHMENT_OPTIMAL
-			// from the client's rendering pass.
-			{
-				struct vk_bundle *vk = &r->c->base.vk;
-				const struct xrt_layer_projection_view_data *vd_left = &layer->data.proj.v[0];
-				const struct xrt_layer_projection_view_data *vd_right = &layer->data.proj.v[1];
-				struct comp_swapchain *sc_left =
-				    (struct comp_swapchain *)comp_layer_get_swapchain(layer, 0);
-				struct comp_swapchain *sc_right =
-				    (struct comp_swapchain *)comp_layer_get_swapchain(layer, 1);
-				VkImage img_left = sc_left->vkic.images[vd_left->sub.image_index].handle;
-				VkImage img_right = sc_right->vkic.images[vd_right->sub.image_index].handle;
-				bool same_image = (img_left == img_right);
+			if (need_crop) {
+				// Crop-blit: extract per-eye sub-rects into intermediate images
+				// so the display processor sees UV 0..1 covering only valid content.
+				if (!ensure_crop_images(r, vk, imageWidth, imageHeight, imageFormat)) {
+					U_LOG_E("[dp] Failed to ensure crop images");
+					render_gfx_end(render);
+					return;
+				}
 
+				bool flip_y = layer->data.flip_y;
+				int left_src_top = leftOffsetY + (flip_y ? imageHeight : 0);
+				int left_src_bot = leftOffsetY + (flip_y ? 0 : imageHeight);
+				int right_src_top = rightOffsetY + (flip_y ? imageHeight : 0);
+				int right_src_bot = rightOffsetY + (flip_y ? 0 : imageHeight);
+
+				// Pre-barriers: source COLOR_ATTACHMENT → TRANSFER_SRC,
+				// crop images UNDEFINED → TRANSFER_DST.
+				// When same_image, deduplicate source barrier (3 instead of 4).
+				uint32_t pre_barrier_count = same_image ? 3 : 4;
+				VkImageMemoryBarrier pre_barriers[4] = {
+				    {
+				        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+				        .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+				        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+				        .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+				        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+				        .image = img_left,
+				        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+				    },
+				    {
+				        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+				        .srcAccessMask = 0,
+				        .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+				        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+				        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+				        .image = r->crop.images[0],
+				        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+				    },
+				    {
+				        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+				        .srcAccessMask = 0,
+				        .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+				        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+				        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+				        .image = r->crop.images[1],
+				        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+				    },
+				};
+				if (!same_image) {
+					pre_barriers[3] = pre_barriers[2];
+					pre_barriers[2] = pre_barriers[1];
+					pre_barriers[1] = (VkImageMemoryBarrier){
+					    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+					    .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+					    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+					    .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+					    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+					    .image = img_right,
+					    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+					};
+				}
+				vk->vkCmdPipelineBarrier(commandBuffer,
+				                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+				                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+				                         0, 0, NULL, 0, NULL, pre_barrier_count, pre_barriers);
+
+				// Blit left eye sub-region into crop image 0
+				VkImageBlit left_blit = {
+				    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+				    .srcOffsets = {{leftOffsetX, left_src_top, 0},
+				                   {leftOffsetX + imageWidth, left_src_bot, 1}},
+				    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+				    .dstOffsets = {{0, 0, 0}, {imageWidth, imageHeight, 1}},
+				};
+				vk->vkCmdBlitImage(commandBuffer,
+				                   img_left, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+				                   r->crop.images[0], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+				                   1, &left_blit, VK_FILTER_NEAREST);
+
+				// Blit right eye sub-region into crop image 1
+				VkImageBlit right_blit = {
+				    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+				    .srcOffsets = {{rightOffsetX, right_src_top, 0},
+				                   {rightOffsetX + imageWidth, right_src_bot, 1}},
+				    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+				    .dstOffsets = {{0, 0, 0}, {imageWidth, imageHeight, 1}},
+				};
+				vk->vkCmdBlitImage(commandBuffer,
+				                   img_right, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+				                   r->crop.images[1], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+				                   1, &right_blit, VK_FILTER_NEAREST);
+
+				// Post-barriers: source → COLOR_ATTACHMENT (restore),
+				// crop images → SHADER_READ_ONLY (for display processor sampling).
+				uint32_t post_barrier_count = same_image ? 3 : 4;
+				VkImageMemoryBarrier post_barriers[4] = {
+				    {
+				        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+				        .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+				        .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+				        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+				        .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+				        .image = img_left,
+				        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+				    },
+				    {
+				        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+				        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+				        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+				        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+				        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+				        .image = r->crop.images[0],
+				        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+				    },
+				    {
+				        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+				        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+				        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+				        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+				        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+				        .image = r->crop.images[1],
+				        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+				    },
+				};
+				if (!same_image) {
+					post_barriers[3] = post_barriers[2];
+					post_barriers[2] = post_barriers[1];
+					post_barriers[1] = (VkImageMemoryBarrier){
+					    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+					    .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+					    .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+					    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+					    .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+					    .image = img_right,
+					    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+					};
+				}
+				vk->vkCmdPipelineBarrier(commandBuffer,
+				                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+				                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+				                         0, 0, NULL, 0, NULL, post_barrier_count, post_barriers);
+
+				weaveLeft = r->crop.views[0];
+				weaveRight = r->crop.views[1];
+			} else {
+				// No crop needed: separate swapchains with zero offsets.
+				// Just transition source images directly to SHADER_READ_ONLY.
 				VkImageMemoryBarrier barriers[2] = {
 				    {
 				        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -1225,11 +1464,10 @@ do_weaving(struct comp_renderer *r,
 				        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
 				    },
 				};
-				uint32_t barrier_count = same_image ? 1 : 2;
 				vk->vkCmdPipelineBarrier(commandBuffer,
 				                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 				                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-				                         0, 0, NULL, 0, NULL, barrier_count, barriers);
+				                         0, 0, NULL, 0, NULL, 2, barriers);
 			}
 
 			// Display processor render pass handles target layout:
