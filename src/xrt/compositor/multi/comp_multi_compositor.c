@@ -1787,6 +1787,58 @@ compute_window_metrics_generic(void *window_handle,
 }
 #endif // XRT_OS_WINDOWS
 
+/*!
+ * Compute window metrics from the main compositor's comp_target dimensions
+ * and the system compositor info. Platform-agnostic: works on any OS.
+ * Used for non-ext sessions where the runtime owns the window.
+ */
+static bool
+compute_window_metrics_from_comp_target(struct multi_system_compositor *msc,
+                                        struct xrt_window_metrics *out_metrics)
+{
+	if (!msc->xcn_is_comp_compositor) {
+		return false;
+	}
+
+	struct comp_compositor *cc = comp_compositor(&msc->xcn->base);
+	if (cc->target == NULL) {
+		return false;
+	}
+
+	const struct xrt_system_compositor_info *info = &msc->base.info;
+	if (info->display_width_m <= 0.0f || info->display_height_m <= 0.0f) {
+		return false;
+	}
+
+	uint32_t win_px_w = cc->target->width;
+	uint32_t win_px_h = cc->target->height;
+	if (win_px_w == 0 || win_px_h == 0) {
+		return false;
+	}
+
+	// Use display pixel dims from system info, fall back to window pixels (fullscreen assumed)
+	uint32_t disp_px_w = info->display_pixel_width > 0 ? info->display_pixel_width : win_px_w;
+	uint32_t disp_px_h = info->display_pixel_height > 0 ? info->display_pixel_height : win_px_h;
+
+	float pixel_size_x = info->display_width_m / (float)disp_px_w;
+	float pixel_size_y = info->display_height_m / (float)disp_px_h;
+
+	memset(out_metrics, 0, sizeof(*out_metrics));
+	out_metrics->display_width_m = info->display_width_m;
+	out_metrics->display_height_m = info->display_height_m;
+	out_metrics->display_pixel_width = disp_px_w;
+	out_metrics->display_pixel_height = disp_px_h;
+	out_metrics->window_pixel_width = win_px_w;
+	out_metrics->window_pixel_height = win_px_h;
+	out_metrics->window_width_m = (float)win_px_w * pixel_size_x;
+	out_metrics->window_height_m = (float)win_px_h * pixel_size_y;
+	// Center offset: assume window is centered on display (no screen coord info available)
+	out_metrics->window_center_offset_x_m = 0.0f;
+	out_metrics->window_center_offset_y_m = 0.0f;
+	out_metrics->valid = true;
+	return true;
+}
+
 bool
 multi_compositor_get_window_metrics(struct multi_compositor *mc, struct xrt_window_metrics *out_metrics)
 {
@@ -1794,28 +1846,29 @@ multi_compositor_get_window_metrics(struct multi_compositor *mc, struct xrt_wind
 		return false;
 	}
 
-	if (!mc->session_render.initialized) {
-		return false;
-	}
-
+	// Per-session rendering paths (ext apps with their own window)
+	if (mc->session_render.initialized) {
 #ifdef XRT_HAVE_LEIA_SR_VULKAN
-	// Prefer SR SDK path (has precise display screen position from SR::Display)
-	if (mc->session_render.weaver != NULL) {
-		return leiasr_get_window_metrics(mc->session_render.weaver,
-		                                 (struct leiasr_window_metrics *)out_metrics);
-	}
+		// Prefer SR SDK path (has precise display screen position from SR::Display)
+		if (mc->session_render.weaver != NULL) {
+			return leiasr_get_window_metrics(mc->session_render.weaver,
+			                                 (struct leiasr_window_metrics *)out_metrics);
+		}
 #endif
 
 #ifdef XRT_OS_WINDOWS
-	// Generic fallback: compute from HWND + system compositor info
-	if (mc->session_render.external_window_handle != NULL) {
-		const struct xrt_system_compositor_info *info = &mc->msc->base.info;
-		return compute_window_metrics_generic(
-		    mc->session_render.external_window_handle, info, out_metrics);
-	}
+		// Generic fallback: compute from HWND + system compositor info
+		if (mc->session_render.external_window_handle != NULL) {
+			const struct xrt_system_compositor_info *info = &mc->msc->base.info;
+			return compute_window_metrics_generic(
+			    mc->session_render.external_window_handle, info, out_metrics);
+		}
 #endif
+	}
 
-	return false;
+	// Non-ext path: runtime-owned window via main compositor's comp_target.
+	// Platform-agnostic: uses comp_target width/height + display physical dims.
+	return compute_window_metrics_from_comp_target(mc->msc, out_metrics);
 }
 
 bool

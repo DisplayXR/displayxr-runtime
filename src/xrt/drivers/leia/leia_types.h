@@ -26,10 +26,14 @@ extern "C" {
 /*!
  * Backward-compatible aliases — Leia driver code uses leiasr_* names,
  * which now resolve to the vendor-neutral xrt_* types.
+ *
+ * We use #define instead of typedef so that "struct leiasr_eye_pair"
+ * expands to "struct xrt_eye_pair" (typedef only creates a type alias,
+ * not a struct tag).
  */
-typedef struct xrt_eye_position leiasr_eye_position;
-typedef struct xrt_eye_pair leiasr_eye_pair;
-typedef struct xrt_window_metrics leiasr_window_metrics;
+#define leiasr_eye_position xrt_eye_position
+#define leiasr_eye_pair xrt_eye_pair
+#define leiasr_window_metrics xrt_window_metrics
 
 /*!
  * Display dimensions in meters for Kooima FOV calculation.
