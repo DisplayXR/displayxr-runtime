@@ -48,7 +48,9 @@
 
 #ifdef XRT_OS_WINDOWS
 #include "comp_d3d11_window.h"
+#ifdef XRT_HAVE_COMP_MAIN
 #include "main/comp_window.h"
+#endif
 #endif
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
@@ -2636,7 +2638,7 @@ transfer_layers_locked(struct multi_system_compositor *msc, int64_t display_time
 #endif
 
 	// One-time: pass xsysd to main compositor's Vulkan window for qwerty forwarding
-#if defined(XRT_OS_WINDOWS) && defined(XRT_BUILD_DRIVER_QWERTY)
+#if defined(XRT_OS_WINDOWS) && defined(XRT_BUILD_DRIVER_QWERTY) && defined(XRT_HAVE_COMP_MAIN)
 	static bool xsysd_forwarded = false;
 	if (!xsysd_forwarded && msc->xcn_is_comp_compositor) {
 		for (size_t k = 0; k < count; k++) {
