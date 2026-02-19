@@ -85,7 +85,7 @@ OpenXR across desktop and mobile platforms.
 **Future direction — multiview and passive displays**: while this proposal focuses on
 stereo (2-view) tracked displays, the architecture is designed to extend naturally to
 multiview displays with more than two views and to passive (non-tracked) autostereoscopic
-displays. See [OPEN 4](#open-issues) and [OPEN 5](#open-issues) in the Issues section.
+displays. See [OPEN 4](#open-issues) in the Issues section.
 
 ---
 
@@ -1503,56 +1503,52 @@ tracked displays coexist with HMDs.
 
 ---
 
-**OPEN 4: Multiview displays with more than 2 views.**
+**OPEN 4: Multiview displays and passive (non-tracked) displays.**
 
 The current design assumes stereo (2-view) rendering. However, the single-swapchain
-architecture — where both eye views are written as sub-regions of a single swapchain sized
-to the native display — naturally extends to N-view multiview displays (e.g., light field
-displays with 4, 8, or more views). The key mechanisms are already in place:
+architecture — where all views are written as sub-regions of a single swapchain sized to
+the native display — naturally extends to N-view multiview displays (e.g., light field
+displays with 4, 8, or more views) and to passive autostereoscopic displays without eye
+tracking.
 
-- `XrCompositionLayerProjectionView` already supports an arbitrary `viewCount`, each with a
-  `subImage.imageRect` defining its tile within the shared swapchain.
+**Multiview rendering.** The key enabler is a new `XrViewConfigurationType` (e.g.,
+`PRIMARY_MULTI_VIEW_EXT`). Most of the OpenXR machinery already supports arbitrary view
+counts:
+
+- `xrEnumerateViewConfigurationViews` would report N views with per-view recommended
+  dimensions.
+- `xrLocateViews` already uses the `viewCapacityInput` / `viewCountOutput` idiom and can
+  return N poses. For a tracked display, these would be N synthetic viewpoints spread across
+  the viewing zone. For a passive display, N fixed positions at the nominal viewing
+  distance.
+- `XrCompositionLayerProjection` already accepts an arbitrary `viewCount`, each
+  `projectionView` referencing a `subImage.imageRect` tile within the shared swapchain.
 - The compositor's same-swapchain optimization passes the raw texture directly to the
   display processor without interpreting the view layout.
 - The display processor (vendor-specific) is the only component that needs to understand the
   multiview tiling order and perform the appropriate interlacing.
 
-A future revision could introduce:
-- A new `XrViewConfigurationType` for multiview (e.g., `PRIMARY_MULTI_VIEW`) that reports
-  N views with appropriate `recommendedImageRectWidth/Height` per view.
-- A defined tiling convention (row-major, column-major, or vendor-specified) so applications
-  know where to render each view within the single swapchain.
-- An `XrDisplayInfoEXT` field indicating the number of views and their arrangement.
+A future revision would need to define:
+- The new view configuration type and how the runtime advertises the view count.
+- A tiling convention (row-major, column-major, or vendor-specified) so applications know
+  where to render each view within the single swapchain.
 
-The compositor and OpenXR state tracker layers would need essentially zero changes — they
-already pass through an arbitrary number of `projectionViews[]` referencing rects in the
-same swapchain.
+The compositor and OpenXR state tracker layers would need essentially zero changes.
 
----
+**Passive (non-tracked) displays.** Not all multiview 3D displays have eye tracking.
+Passive autostereoscopic displays (lenticular, parallax barrier) present fixed-viewpoint 3D
+without tracking the viewer. A dedicated `hasTracking` flag is **not needed** because the
+existing OpenXR contract already handles this transparently:
 
-**OPEN 5: Passive multiview displays without eye tracking.**
-
-Not all multiview 3D displays have eye tracking. Passive autostereoscopic displays (e.g.,
-lenticular or parallax barrier panels) present fixed-viewpoint 3D without tracking the
-viewer's position. These displays still benefit from the OpenXR extensions in this proposal
-(window binding, display geometry, display mode switching) but do not produce dynamic eye
-positions.
-
-A future revision could add a `hasTracking` flag (`XrBool32`) to `XrDisplayInfoEXT` to
-indicate whether the display provides real-time eye tracking:
-
-- `hasTracking == XR_TRUE` — current behavior. `xrLocateViews` returns dynamically tracked
-  eye positions that update each frame.
-- `hasTracking == XR_FALSE` — the display has no eye tracker. `xrLocateViews` returns
-  static view poses at a standard 63 mm IPD centered at the nominal viewer position
-  (`nominalViewerPositionInDisplaySpace`, already part of this extension). The left eye
-  would be at `{-0.0315, nomY, nomZ}` and the right at `{+0.0315, nomY, nomZ}` in DISPLAY
-  space.
-
-This would allow passive multiview displays to participate in the OpenXR ecosystem using the
-same application code: the app renders stereo (or N-view) content using the returned view
-poses, and the runtime/display processor handles interlacing. The only difference is that
-the view poses do not change with viewer motion.
+- `xrLocateViews` always returns poses regardless of whether tracking hardware is present.
+  For a non-tracked display, the runtime returns static default poses (e.g., standard 63 mm
+  IPD at the nominal viewer position, which is already part of `XrDisplayInfoEXT`).
+- `XrViewState` flags (`XR_VIEW_STATE_POSITION_TRACKED_BIT`,
+  `XR_VIEW_STATE_ORIENTATION_TRACKED_BIT`) already signal whether the returned poses are
+  actively tracked or fallback values. Applications that care can check these flags.
+- Application code is identical for tracked and non-tracked displays: call `xrLocateViews`,
+  render the returned views, submit. The only difference is that the poses don't change
+  with viewer motion on a passive display.
 
 ---
 
