@@ -2072,8 +2072,10 @@ int main() {
                             if (renderW > xr.swapchain.width) renderW = xr.swapchain.width;
                             if (renderH > xr.swapchain.height) renderH = xr.swapchain.height;
                         } else {
-                            renderW = eyeRenderW;
-                            renderH = eyeRenderH;
+                            renderW = (uint32_t)(g_windowW * xr.recommendedViewScaleX);
+                            renderH = (uint32_t)(g_windowH * xr.recommendedViewScaleY);
+                            if (renderW > eyeRenderW) renderW = eyeRenderW;
+                            if (renderH > eyeRenderH) renderH = eyeRenderH;
                         }
                         g_renderW = renderW;
                         g_renderH = renderH;

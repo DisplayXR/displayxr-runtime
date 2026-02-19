@@ -290,19 +290,29 @@ static void RenderThreadFunc(
                         xr->rightEyeY = rawViews[1].pose.position.y;
                         xr->rightEyeZ = rawViews[1].pose.position.z;
 
-                        // Fixed SBS dimensions: each eye gets half the swapchain width
+                        // Max per-eye capacity from swapchain
                         uint32_t eyeRenderW = xr->swapchain.width / 2;
                         uint32_t eyeRenderH = xr->swapchain.height;
 
+                        // Dynamic render dims based on window size, clamped to swapchain capacity
+                        uint32_t renderW = (uint32_t)(windowW * xr->recommendedViewScaleX);
+                        uint32_t renderH = (uint32_t)(windowH * xr->recommendedViewScaleY);
+                        if (renderW > eyeRenderW) renderW = eyeRenderW;
+                        if (renderH > eyeRenderH) renderH = eyeRenderH;
+
                         // --- App-side Kooima projection (RAW mode, app-owned camera model) ---
+                        // Full display pixel dimensions for pixel-to-meter conversion.
+                        float dispPxW = xr->displayPixelWidth > 0 ? (float)xr->displayPixelWidth : (float)xr->swapchain.width;
+                        float dispPxH = xr->displayPixelHeight > 0 ? (float)xr->displayPixelHeight : (float)xr->swapchain.height;
+
                         XrFovf appFov[2];
                         bool useAppProjection = (xr->hasDisplayInfoExt && xr->displayWidthM > 0.0f);
                         if (useAppProjection) {
                             // Viewport-scale FOV (SRHydra): convert window pixels to meters,
                             // then apply isotropic scale so FOV stays consistent across window
                             // sizes on the 3D display. Matches the non-extension runtime path.
-                            float pxSizeX = xr->displayWidthM / (float)xr->swapchain.width;
-                            float pxSizeY = xr->displayHeightM / (float)xr->swapchain.height;
+                            float pxSizeX = xr->displayWidthM / dispPxW;
+                            float pxSizeY = xr->displayHeightM / dispPxH;
                             float winW_m = (float)windowW * pxSizeX;
                             float winH_m = (float)windowH * pxSizeY;
                             float minDisp = fminf(xr->displayWidthM, xr->displayHeightM);
@@ -347,7 +357,7 @@ static void RenderThreadFunc(
 
                                 LOG_INFO("[FRAME] Eye %d: RenderScene...", eye);
                                 RenderScene(*renderer, 0, imageIndex,
-                                    eye * eyeRenderW, 0, eyeRenderW, eyeRenderH,
+                                    eye * renderW, 0, renderW, renderH,
                                     viewMatrix, projMatrix,
                                     useAppProjection ? 1.0f : inputSnapshot.zoomScale,
                                     eye == 0);
@@ -355,10 +365,10 @@ static void RenderThreadFunc(
 
                                 projectionViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
                                 projectionViews[eye].subImage.swapchain = xr->swapchain.swapchain;
-                                projectionViews[eye].subImage.imageRect.offset = {(int32_t)(eye * eyeRenderW), 0};
+                                projectionViews[eye].subImage.imageRect.offset = {(int32_t)(eye * renderW), 0};
                                 projectionViews[eye].subImage.imageRect.extent = {
-                                    (int32_t)eyeRenderW,
-                                    (int32_t)eyeRenderH
+                                    (int32_t)renderW,
+                                    (int32_t)renderH
                                 };
                                 projectionViews[eye].subImage.imageArrayIndex = 0;
                                 projectionViews[eye].pose = rawViews[eye].pose;
@@ -389,7 +399,7 @@ static void RenderThreadFunc(
                                     L"XR_EXT_win32_window_binding: ACTIVE (Vulkan)" :
                                     L"XR_EXT_win32_window_binding: NOT AVAILABLE (Vulkan)";
                                 std::wstring perfText = FormatPerformanceInfo(perfStats.fps, perfStats.frameTimeMs,
-                                    eyeRenderW, eyeRenderH,
+                                    renderW, renderH,
                                     windowW, windowH);
                                 std::wstring dispText = FormatDisplayInfo(xr->displayWidthM, xr->displayHeightM,
                                     xr->nominalViewerX, xr->nominalViewerY, xr->nominalViewerZ);
