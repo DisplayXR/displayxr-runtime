@@ -50,6 +50,11 @@
 #include "comp_d3d11_window.h"
 #endif
 
+#ifdef XRT_BUILD_DRIVER_QWERTY
+#include "qwerty/qwerty_interface.h"
+#include "xrt/xrt_system.h"
+#endif
+
 #include <math.h>
 #include <stdio.h>
 #include <assert.h>
@@ -1528,6 +1533,68 @@ recreate_session_swapchain(struct multi_compositor *mc, struct vk_bundle *vk)
 
 }
 
+/*!
+ * Ensure per-eye crop images exist for display processor sub-region extraction.
+ * When the app renders to a sub-region of the swapchain (imageRect.extent < swapchain size),
+ * we blit the valid region into these intermediates so the display processor can sample
+ * UVs 0..1 without reading uninitialized texels. Also handles GL Y-flip.
+ * Recreates if size or format changed.
+ */
+static bool
+ensure_session_dp_crop_images(struct multi_compositor *mc, struct vk_bundle *vk, int width, int height, VkFormat format)
+{
+	if (mc->session_render.dp_crop_initialized && mc->session_render.dp_crop_width == width &&
+	    mc->session_render.dp_crop_height == height && mc->session_render.dp_crop_format == format) {
+		return true;
+	}
+
+	// Destroy old if resizing
+	if (mc->session_render.dp_crop_initialized) {
+		for (int i = 0; i < 2; i++) {
+			if (mc->session_render.dp_crop_views[i] != VK_NULL_HANDLE)
+				vk->vkDestroyImageView(vk->device, mc->session_render.dp_crop_views[i], NULL);
+			if (mc->session_render.dp_crop_images[i] != VK_NULL_HANDLE)
+				vk->vkDestroyImage(vk->device, mc->session_render.dp_crop_images[i], NULL);
+			if (mc->session_render.dp_crop_memories[i] != VK_NULL_HANDLE)
+				vk->vkFreeMemory(vk->device, mc->session_render.dp_crop_memories[i], NULL);
+		}
+		mc->session_render.dp_crop_initialized = false;
+	}
+
+	VkExtent2D extent = {(uint32_t)width, (uint32_t)height};
+	VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+	VkImageSubresourceRange range = {
+	    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+	    .levelCount = 1,
+	    .layerCount = 1,
+	};
+
+	for (int i = 0; i < 2; i++) {
+		VkResult ret = vk_create_image_simple(vk, extent, format, usage,
+		                                      &mc->session_render.dp_crop_memories[i],
+		                                      &mc->session_render.dp_crop_images[i]);
+		if (ret != VK_SUCCESS) {
+			U_LOG_E("[per-session] Failed to create dp_crop image %d: %s", i, vk_result_string(ret));
+			return false;
+		}
+
+		ret = vk_create_view(vk, mc->session_render.dp_crop_images[i], VK_IMAGE_VIEW_TYPE_2D, format, range,
+		                     &mc->session_render.dp_crop_views[i]);
+		if (ret != VK_SUCCESS) {
+			U_LOG_E("[per-session] Failed to create dp_crop view %d: %s", i, vk_result_string(ret));
+			return false;
+		}
+	}
+
+	mc->session_render.dp_crop_width = width;
+	mc->session_render.dp_crop_height = height;
+	mc->session_render.dp_crop_format = format;
+	mc->session_render.dp_crop_initialized = true;
+
+	U_LOG_W("[per-session] Created dp_crop images: %dx%d format=%d", width, height, format);
+	return true;
+}
+
 #ifdef XRT_HAVE_LEIA_SR_VULKAN
 /*!
  * Ensure the SBS (side-by-side) flip image exists for Y-flipping GL textures before display processing.
@@ -1755,6 +1822,21 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 	// Detect mono (2D) vs stereo (3D) submission
 	bool is_mono = (layer->data.view_count == 1);
 
+	// Runtime-side 2D/3D toggle from qwerty V key
+#ifdef XRT_BUILD_DRIVER_QWERTY
+	if (mc->xsysd != NULL) {
+		bool force_2d = false;
+		bool toggled =
+		    qwerty_check_display_mode_toggle(mc->xsysd->xdevs, mc->xsysd->xdev_count, &force_2d);
+		if (toggled) {
+			multi_compositor_request_display_mode(mc, !force_2d);
+		}
+		if (force_2d) {
+			is_mono = true;
+		}
+	}
+#endif
+
 	// Extract left and right view info
 	int imageWidth = 0, imageHeight = 0;
 	VkFormat imageFormat = VK_FORMAT_UNDEFINED;
@@ -1948,50 +2030,150 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 		framebuffer = mc->session_render.framebuffers[buffer_index];
 	}
 
-	// Display processor path: pass separate left/right views directly.
-	// The display processor expects individual eye image views, not SBS-packed.
-	// Its render pass handles target layout transitions (UNDEFINED → PRESENT_SRC_KHR).
+	// Display processor path: crop-blit source sub-region into intermediates,
+	// then pass the cropped views to the display processor.
+	// This fixes the mismatch where the display processor samples UVs 0..1 on the
+	// full swapchain but the app only rendered to imageRect.extent (a sub-region).
+	// Also handles GL Y-flip during the blit.
+	//
+	// TODO: SBS mode works correctly but anaglyph/blend modes show 2x horizontal
+	// stretch. The crop-blit correctly extracts imageRect.extent, but something in
+	// the pipeline (crop aspect vs framebuffer aspect? shader UV mapping? Kooima
+	// FOV mismatch?) causes the stretch. Need to log actual dimensions at each
+	// stage: imageWidth/Height, crop size, framebuffer size, and compare.
 	if (mc->session_render.display_processor != NULL) {
 		static bool dp_logged = false;
 		if (!dp_logged) {
-			U_LOG_W("[per-session] Vulkan rendering via display processor (separate views), "
+			U_LOG_W("[per-session] Vulkan rendering via display processor (crop-blit), "
 			        "input=%dx%d fmt=%d, fb=%ux%u fmt=%d",
 			        imageWidth, imageHeight, imageFormat,
 			        framebufferWidth, framebufferHeight, framebufferFormat);
 			dp_logged = true;
 		}
 
-		// Transition source images GENERAL → SHADER_READ_ONLY for display processor sampling
-		VkImageMemoryBarrier src_barriers[2] = {
+		// Ensure crop images exist at the correct size
+		if (!ensure_session_dp_crop_images(mc, vk, imageWidth, imageHeight, imageFormat)) {
+			U_LOG_E("[per-session] Failed to ensure dp_crop images");
+			goto submit_and_present;
+		}
+
+		bool flip_y = layer->data.flip_y;
+		int src_top = flip_y ? imageHeight : 0;
+		int src_bot = flip_y ? 0 : imageHeight;
+
+		// Pre-barriers: sources GENERAL → TRANSFER_SRC, crop images UNDEFINED → TRANSFER_DST
+		VkImageMemoryBarrier pre_barriers[4] = {
 		    {
 		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
 		        .srcAccessMask = 0,
-		        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+		        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
 		        .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
-		        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
 		        .image = leftImage,
 		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, leftArrayIndex, 1},
 		    },
 		    {
 		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
 		        .srcAccessMask = 0,
-		        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+		        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
 		        .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
-		        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
 		        .image = rightImage,
 		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, rightArrayIndex, 1},
 		    },
+		    {
+		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		        .srcAccessMask = 0,
+		        .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+		        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+		        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		        .image = mc->session_render.dp_crop_images[0],
+		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+		    },
+		    {
+		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		        .srcAccessMask = 0,
+		        .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+		        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+		        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		        .image = mc->session_render.dp_crop_images[1],
+		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+		    },
 		};
-		vk->vkCmdPipelineBarrier(cmd,
-		                         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-		                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-		                         0, 0, NULL, 0, NULL, 2, src_barriers);
+		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+		                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 4, pre_barriers);
 
+		// Blit left eye: source sub-region → crop image (with optional Y-flip)
+		VkImageBlit left_blit = {
+		    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, leftArrayIndex, 1},
+		    .srcOffsets = {{0, src_top, 0}, {imageWidth, src_bot, 1}},
+		    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+		    .dstOffsets = {{0, 0, 0}, {imageWidth, imageHeight, 1}},
+		};
+		vk->vkCmdBlitImage(cmd, leftImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		                   mc->session_render.dp_crop_images[0], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		                   1, &left_blit, VK_FILTER_NEAREST);
+
+		// Blit right eye
+		VkImageBlit right_blit = {
+		    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, rightArrayIndex, 1},
+		    .srcOffsets = {{0, src_top, 0}, {imageWidth, src_bot, 1}},
+		    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+		    .dstOffsets = {{0, 0, 0}, {imageWidth, imageHeight, 1}},
+		};
+		vk->vkCmdBlitImage(cmd, rightImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		                   mc->session_render.dp_crop_images[1], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		                   1, &right_blit, VK_FILTER_NEAREST);
+
+		// Post-barriers: sources → GENERAL, crop images → SHADER_READ_ONLY
+		VkImageMemoryBarrier post_barriers[4] = {
+		    {
+		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		        .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+		        .dstAccessMask = 0,
+		        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+		        .image = leftImage,
+		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, leftArrayIndex, 1},
+		    },
+		    {
+		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		        .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+		        .dstAccessMask = 0,
+		        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+		        .image = rightImage,
+		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, rightArrayIndex, 1},
+		    },
+		    {
+		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+		        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+		        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		        .image = mc->session_render.dp_crop_images[0],
+		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+		    },
+		    {
+		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+		        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+		        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		        .image = mc->session_render.dp_crop_images[1],
+		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+		    },
+		};
+		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+		                         0, 0, NULL, 0, NULL, 4, post_barriers);
+
+		// Pass cropped views to display processor (UVs 0..1 now cover only valid content)
 		xrt_display_processor_process_views(
 		    mc->session_render.display_processor,
 		    cmd,
-		    leftImageView,
-		    rightImageView,
+		    mc->session_render.dp_crop_views[0],
+		    mc->session_render.dp_crop_views[1],
 		    (uint32_t)imageWidth,
 		    (uint32_t)imageHeight,
 		    (VkFormat_XDP)imageFormat,
@@ -1999,32 +2181,6 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 		    framebufferWidth,
 		    framebufferHeight,
 		    (VkFormat_XDP)framebufferFormat);
-
-		// Transition source images back to GENERAL for next frame
-		VkImageMemoryBarrier src_post[2] = {
-		    {
-		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		        .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
-		        .dstAccessMask = 0,
-		        .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-		        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-		        .image = leftImage,
-		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, leftArrayIndex, 1},
-		    },
-		    {
-		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		        .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
-		        .dstAccessMask = 0,
-		        .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-		        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-		        .image = rightImage,
-		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, rightArrayIndex, 1},
-		    },
-		};
-		vk->vkCmdPipelineBarrier(cmd,
-		                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-		                         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-		                         0, 0, NULL, 0, NULL, 2, src_post);
 
 		// Display processor render pass already transitions target to PRESENT_SRC_KHR
 		goto submit_and_present;

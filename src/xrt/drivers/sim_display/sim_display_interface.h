@@ -11,6 +11,7 @@
 
 #include "xrt/xrt_results.h"
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -70,6 +71,30 @@ sim_display_get_output_mode(void);
  */
 void
 sim_display_set_output_mode(enum sim_display_output_mode mode);
+
+/*!
+ * Display info for a sim_display device.
+ * Used by target_instance.c to populate xrt_system_compositor_info.
+ * @ingroup drv_sim_display
+ */
+struct sim_display_info
+{
+	float display_width_m;
+	float display_height_m;
+	float nominal_y_m;
+	float nominal_z_m;
+};
+
+/*!
+ * Query display info from a sim_display device.
+ *
+ * @param xdev     The device to query (must be a sim_display HMD).
+ * @param out_info Receives the display info.
+ * @return true on success, false if xdev is not a sim_display device.
+ * @ingroup drv_sim_display
+ */
+bool
+sim_display_get_display_info(struct xrt_device *xdev, struct sim_display_info *out_info);
 
 /*!
  * Create a simulated 3D display HMD device.

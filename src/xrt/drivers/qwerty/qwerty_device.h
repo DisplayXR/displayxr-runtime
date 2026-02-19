@@ -41,6 +41,8 @@ struct qwerty_system
 	bool hmd_focused;   //!< For gui var tracking only, true if hmd is the focused device
 	bool lctrl_focused; //!< Same as `hmd_focused` but for the left controller
 	bool rctrl_focused; //!< Same as `hmd_focused` but for the right controller
+	bool force_2d_mode;              //!< Runtime-side 2D/3D toggle (V key when HMD focused)
+	bool display_mode_toggle_pending; //!< Set by key handler, cleared by compositor
 };
 
 /*!
@@ -415,6 +417,14 @@ qwerty_follow_hmd(struct qwerty_controller *qc, bool follow);
  */
 void
 qwerty_reset_controller_pose(struct qwerty_controller *qc);
+
+/*!
+ * Toggle runtime-side 2D/3D display mode. Sets force_2d_mode and
+ * marks the toggle as pending for the compositor to pick up.
+ * @public @memberof qwerty_system
+ */
+void
+qwerty_toggle_display_mode(struct qwerty_system *qs);
 
 
 /*!

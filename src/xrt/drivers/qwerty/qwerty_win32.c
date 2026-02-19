@@ -420,11 +420,18 @@ qwerty_process_win32(struct xrt_device **xdevs,
 			}
 			break;
 		case 'V':
-			for (int i = 0; i < target_count; i++) {
+			if (qsys->hmd_focused) {
+				// HMD focused: toggle runtime-side 2D/3D display mode
 				if (is_keydown)
-					qwerty_press_thumbstick_click(ctrl_targets[i]);
-				else
-					qwerty_release_thumbstick_click(ctrl_targets[i]);
+					qwerty_toggle_display_mode(qsys);
+			} else {
+				// Controller focused: thumbstick click
+				for (int i = 0; i < target_count; i++) {
+					if (is_keydown)
+						qwerty_press_thumbstick_click(ctrl_targets[i]);
+					else
+						qwerty_release_thumbstick_click(ctrl_targets[i]);
+				}
 			}
 			break;
 

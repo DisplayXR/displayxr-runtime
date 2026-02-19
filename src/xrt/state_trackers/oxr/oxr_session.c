@@ -309,7 +309,6 @@ oxr_session_request_display_mode(struct oxr_logger *log, struct oxr_session *ses
 	}
 #endif
 
-#ifdef XRT_HAVE_LEIA_SR_VULKAN
 	{
 		struct multi_compositor *mc = multi_compositor(&sess->xcn->base);
 		success = multi_compositor_request_display_mode(mc, enable_3d);
@@ -318,7 +317,6 @@ oxr_session_request_display_mode(struct oxr_logger *log, struct oxr_session *ses
 		}
 		return XR_SUCCESS;
 	}
-#endif
 
 	(void)success;
 	return XR_SUCCESS;
