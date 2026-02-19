@@ -999,56 +999,68 @@ composite_layers_to_intermediate(struct multi_compositor *mc,
 	{
 		VkImage shared_imgs[2] = {leftProjImage, rightProjImage};
 		uint32_t shared_layers[2] = {leftProjArray, rightProjArray};
+		bool same_source = (shared_imgs[0] == shared_imgs[1] &&
+		                    shared_layers[0] == shared_layers[1]);
+
+		// Per-eye source offsets for single-swapchain SBS apps
+		int src_off_x[2], src_off_y[2];
+		src_off_x[0] = proj_layer->data.proj.v[0].sub.rect.offset.w;
+		src_off_y[0] = proj_layer->data.proj.v[0].sub.rect.offset.h;
+		src_off_x[1] = proj_layer->data.proj.v[1].sub.rect.offset.w;
+		src_off_y[1] = proj_layer->data.proj.v[1].sub.rect.offset.h;
 
 		// Pre-barriers: shared images GENERAL->TRANSFER_SRC, preblit UNDEFINED->TRANSFER_DST
-		VkImageMemoryBarrier pre[4] = {
-		    {
-		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		        .srcAccessMask = 0,
-		        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-		        .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
-		        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-		        .image = shared_imgs[0],
-		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, shared_layers[0], 1},
-		    },
-		    {
-		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		        .srcAccessMask = 0,
-		        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-		        .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
-		        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-		        .image = shared_imgs[1],
-		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, shared_layers[1], 1},
-		    },
-		    {
-		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		        .srcAccessMask = 0,
-		        .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-		        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-		        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-		        .image = mc->session_render.preblit_images[0],
-		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-		    },
-		    {
-		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		        .srcAccessMask = 0,
-		        .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-		        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-		        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-		        .image = mc->session_render.preblit_images[1],
-		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-		    },
+		// Deduplicate source barrier when both eyes share the same image.
+		VkImageMemoryBarrier pre[4];
+		uint32_t pre_count = 0;
+		pre[pre_count++] = (VkImageMemoryBarrier){
+		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		    .srcAccessMask = 0,
+		    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+		    .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+		    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		    .image = shared_imgs[0],
+		    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, shared_layers[0], 1},
+		};
+		if (!same_source) {
+			pre[pre_count++] = (VkImageMemoryBarrier){
+			    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+			    .srcAccessMask = 0,
+			    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+			    .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+			    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+			    .image = shared_imgs[1],
+			    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, shared_layers[1], 1},
+			};
+		}
+		pre[pre_count++] = (VkImageMemoryBarrier){
+		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		    .srcAccessMask = 0,
+		    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+		    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+		    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		    .image = mc->session_render.preblit_images[0],
+		    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+		};
+		pre[pre_count++] = (VkImageMemoryBarrier){
+		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		    .srcAccessMask = 0,
+		    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+		    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+		    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		    .image = mc->session_render.preblit_images[1],
+		    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
 		};
 		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-		                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 4, pre);
+		                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL,
+		                         pre_count, pre);
 
-		// Blit shared images into preblit copies (same size, NEAREST filter, no Y-flip)
-		// TODO: For single-swapchain SBS apps, per-eye source offsets should be used
-		// here (currently assumes offset 0 which is correct for two-swapchain apps).
+		// Blit shared images into preblit copies with per-eye source offsets
 		for (int eye = 0; eye < 2; eye++) {
 			VkImageBlit region = {
 			    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, shared_layers[eye], 1},
-			    .srcOffsets = {{0, 0, 0}, {(int32_t)cw, (int32_t)ch, 1}},
+			    .srcOffsets = {{src_off_x[eye], src_off_y[eye], 0},
+			                  {src_off_x[eye] + (int32_t)cw, src_off_y[eye] + (int32_t)ch, 1}},
 			    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
 			    .dstOffsets = {{0, 0, 0}, {(int32_t)cw, (int32_t)ch, 1}},
 			};
@@ -1060,47 +1072,50 @@ composite_layers_to_intermediate(struct multi_compositor *mc,
 
 		// Post-barriers: shared images TRANSFER_SRC->GENERAL (restore for next frame),
 		// preblit TRANSFER_DST->SHADER_READ_ONLY (ready for sampling in render pass)
-		VkImageMemoryBarrier post[4] = {
-		    {
-		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		        .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-		        .dstAccessMask = 0,
-		        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-		        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-		        .image = shared_imgs[0],
-		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, shared_layers[0], 1},
-		    },
-		    {
-		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		        .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-		        .dstAccessMask = 0,
-		        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-		        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-		        .image = shared_imgs[1],
-		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, shared_layers[1], 1},
-		    },
-		    {
-		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-		        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-		        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-		        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-		        .image = mc->session_render.preblit_images[0],
-		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-		    },
-		    {
-		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-		        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-		        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-		        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-		        .image = mc->session_render.preblit_images[1],
-		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-		    },
+		// Deduplicate source barrier when both eyes share the same image.
+		VkImageMemoryBarrier post[4];
+		uint32_t post_count = 0;
+		post[post_count++] = (VkImageMemoryBarrier){
+		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		    .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+		    .dstAccessMask = 0,
+		    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		    .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+		    .image = shared_imgs[0],
+		    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, shared_layers[0], 1},
+		};
+		if (!same_source) {
+			post[post_count++] = (VkImageMemoryBarrier){
+			    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+			    .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+			    .dstAccessMask = 0,
+			    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+			    .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+			    .image = shared_imgs[1],
+			    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, shared_layers[1], 1},
+			};
+		}
+		post[post_count++] = (VkImageMemoryBarrier){
+		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+		    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+		    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		    .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		    .image = mc->session_render.preblit_images[0],
+		    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+		};
+		post[post_count++] = (VkImageMemoryBarrier){
+		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+		    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+		    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		    .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		    .image = mc->session_render.preblit_images[1],
+		    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
 		};
 		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
 		                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-		                         0, 0, NULL, 0, NULL, 4, post);
+		                         0, 0, NULL, 0, NULL, post_count, post);
 	}
 
 	// UBO stride for sub-allocation from the persistent UBO buffer

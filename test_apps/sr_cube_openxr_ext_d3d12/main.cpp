@@ -293,21 +293,29 @@ static void RenderThreadFunc(
                         xr->rightEyeY = rawViews[1].pose.position.y;
                         xr->rightEyeZ = rawViews[1].pose.position.z;
 
-                        // Compute render dims for SBS: each eye is half the swapchain width
+                        // Max per-eye capacity from swapchain
                         uint32_t eyeRenderW = xr->swapchain.width / 2;
                         uint32_t eyeRenderH = xr->swapchain.height;
-                        uint32_t renderW = eyeRenderW;
-                        uint32_t renderH = eyeRenderH;
+
+                        // Dynamic render dims based on window size, clamped to swapchain capacity
+                        uint32_t renderW = (uint32_t)(windowW * xr->recommendedViewScaleX);
+                        uint32_t renderH = (uint32_t)(windowH * xr->recommendedViewScaleY);
+                        if (renderW > eyeRenderW) renderW = eyeRenderW;
+                        if (renderH > eyeRenderH) renderH = eyeRenderH;
 
                         // --- App-side Kooima projection (RAW mode, app-owned camera model) ---
+                        // Full display pixel dimensions for pixel-to-meter conversion.
+                        float dispPxW = xr->displayPixelWidth > 0 ? (float)xr->displayPixelWidth : (float)xr->swapchain.width;
+                        float dispPxH = xr->displayPixelHeight > 0 ? (float)xr->displayPixelHeight : (float)xr->swapchain.height;
+
                         XrFovf appFov[2];
                         bool useAppProjection = (xr->hasDisplayInfoExt && xr->displayWidthM > 0.0f);
                         if (useAppProjection) {
                             // Viewport-scale FOV (SRHydra): convert window pixels to meters,
                             // then apply isotropic scale so FOV stays consistent across window
                             // sizes on the 3D display. Matches the non-extension runtime path.
-                            float pxSizeX = xr->displayWidthM / (float)(xr->swapchain.width / 2);
-                            float pxSizeY = xr->displayHeightM / (float)xr->swapchain.height;
+                            float pxSizeX = xr->displayWidthM / dispPxW;
+                            float pxSizeY = xr->displayHeightM / dispPxH;
                             float winW_m = (float)windowW * pxSizeX;
                             float winH_m = (float)windowH * pxSizeY;
                             float minDisp = fminf(xr->displayWidthM, xr->displayHeightM);

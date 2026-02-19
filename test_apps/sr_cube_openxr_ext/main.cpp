@@ -315,7 +315,7 @@ static void RenderOneFrame(RenderState& rs) {
                     xr.rightEyeZ = rawViews[1].pose.position.z;
 
                     // --- App-side Kooima projection (RAW mode, app-owned camera model) ---
-                    // Per-eye render size = half the swapchain width (SBS layout)
+                    // Max per-eye capacity from swapchain
                     uint32_t eyeRenderW = xr.swapchain.width / 2;
                     uint32_t eyeRenderH = xr.swapchain.height;
 
@@ -378,15 +378,18 @@ static void RenderOneFrame(RenderState& rs) {
                                     L"\nDisplay Mode: 2D Mono [V=Toggle]";
                             }
 
+                            // Dynamic render dims matching the actual viewport computation
                             uint32_t dispRenderW, dispRenderH;
                             if (!g_inputState.displayMode3D) {
-                                // Mono: full swapchain resolution
-                                dispRenderW = xr.swapchain.width;
-                                dispRenderH = xr.swapchain.height;
+                                dispRenderW = g_windowWidth;
+                                dispRenderH = g_windowHeight;
+                                if (dispRenderW > xr.swapchain.width) dispRenderW = xr.swapchain.width;
+                                if (dispRenderH > xr.swapchain.height) dispRenderH = xr.swapchain.height;
                             } else {
-                                // Stereo: half width (per eye)
-                                dispRenderW = xr.swapchain.width / 2;
-                                dispRenderH = xr.swapchain.height;
+                                dispRenderW = (uint32_t)(g_windowWidth * xr.recommendedViewScaleX);
+                                dispRenderH = (uint32_t)(g_windowHeight * xr.recommendedViewScaleY);
+                                if (dispRenderW > xr.swapchain.width / 2) dispRenderW = xr.swapchain.width / 2;
+                                if (dispRenderH > xr.swapchain.height) dispRenderH = xr.swapchain.height;
                             }
                             std::wstring perfText = FormatPerformanceInfo(rs.perfStats->fps, rs.perfStats->frameTimeMs,
                                 dispRenderW, dispRenderH,
@@ -494,14 +497,18 @@ static void RenderOneFrame(RenderState& rs) {
                         renderer.context->ClearDepthStencilView(rs.depthDSV.Get(),
                             D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
 
-                        // Render dims: mono uses full swapchain, stereo uses half-width per eye
+                        // Dynamic render dims based on window size, clamped to swapchain capacity
                         uint32_t renderW, renderH;
                         if (monoMode) {
-                            renderW = xr.swapchain.width;
-                            renderH = xr.swapchain.height;
+                            renderW = g_windowWidth;
+                            renderH = g_windowHeight;
+                            if (renderW > xr.swapchain.width) renderW = xr.swapchain.width;
+                            if (renderH > xr.swapchain.height) renderH = xr.swapchain.height;
                         } else {
-                            renderW = eyeRenderW;
-                            renderH = eyeRenderH;
+                            renderW = (uint32_t)(g_windowWidth * xr.recommendedViewScaleX);
+                            renderH = (uint32_t)(g_windowHeight * xr.recommendedViewScaleY);
+                            if (renderW > eyeRenderW) renderW = eyeRenderW;
+                            if (renderH > eyeRenderH) renderH = eyeRenderH;
                         }
 
                         for (int eye = 0; eye < eyeCount; eye++) {
