@@ -141,8 +141,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return 1;
     }
 
-    // Create swapchains
-    if (!CreateSwapchains(xr)) {
+    // Create single swapchain at native display resolution
+    if (!CreateSwapchain(xr)) {
         LOG_ERROR("Swapchain creation failed");
         CleanupOpenXR(xr);
         CleanupD3D11(renderer);
@@ -151,31 +151,30 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     }
 
     // Enumerate D3D11 swapchain images (now done per-app since common is API-agnostic)
-    std::vector<XrSwapchainImageD3D11KHR> swapchainImages[2];
-    for (int eye = 0; eye < 2; eye++) {
-        uint32_t count = xr.swapchains[eye].imageCount;
-        swapchainImages[eye].resize(count, {XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR});
-        xrEnumerateSwapchainImages(xr.swapchains[eye].swapchain, count, &count,
-            (XrSwapchainImageBaseHeader*)swapchainImages[eye].data());
-        LOG_INFO("Eye %d: enumerated %u D3D11 swapchain images", eye, count);
+    std::vector<XrSwapchainImageD3D11KHR> swapchainImages;
+    {
+        uint32_t count = xr.swapchain.imageCount;
+        swapchainImages.resize(count, {XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR});
+        xrEnumerateSwapchainImages(xr.swapchain.swapchain, count, &count,
+            (XrSwapchainImageBaseHeader*)swapchainImages.data());
+        LOG_INFO("Enumerated %u D3D11 swapchain images", count);
     }
 
-    // Create depth buffers for each eye
-    ComPtr<ID3D11Texture2D> depthTextures[2];
-    ComPtr<ID3D11DepthStencilView> depthDSVs[2];
-
-    for (int eye = 0; eye < 2; eye++) {
+    // Create single depth buffer at full swapchain dimensions
+    ComPtr<ID3D11Texture2D> depthTexture;
+    ComPtr<ID3D11DepthStencilView> depthDSV;
+    {
         ID3D11Texture2D* depthTex = nullptr;
         ID3D11DepthStencilView* dsv = nullptr;
-        if (!CreateDepthStencilView(renderer, xr.swapchains[eye].width, xr.swapchains[eye].height, &depthTex, &dsv)) {
-            LOG_ERROR("Failed to create depth buffer for eye %d", eye);
+        if (!CreateDepthStencilView(renderer, xr.swapchain.width, xr.swapchain.height, &depthTex, &dsv)) {
+            LOG_ERROR("Failed to create depth buffer");
             CleanupOpenXR(xr);
             CleanupD3D11(renderer);
             ShutdownLogging();
             return 1;
         }
-        depthTextures[eye].Attach(depthTex);
-        depthDSVs[eye].Attach(dsv);
+        depthTexture.Attach(depthTex);
+        depthDSV.Attach(dsv);
     }
 
     // Performance tracking
@@ -233,58 +232,58 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                         XrView rawViews[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
                         xrLocateViews(xr.session, &locateInfo, &viewState, 2, &viewCount, rawViews);
 
-                        // Render each eye
-                        for (int eye = 0; eye < 2; eye++) {
-                            uint32_t imageIndex;
-                            if (AcquireSwapchainImage(xr, eye, imageIndex)) {
-                                ID3D11Texture2D* swapchainTexture = swapchainImages[eye][imageIndex].texture;
+                        // Single swapchain: acquire once, render both eyes with SBS viewports, release once
+                        uint32_t eyeRenderW = xr.swapchain.width / 2;
+                        uint32_t eyeRenderH = xr.swapchain.height;
 
-                                ID3D11RenderTargetView* rtv = nullptr;
-                                CreateRenderTargetView(renderer, swapchainTexture, &rtv);
+                        uint32_t imageIndex;
+                        if (AcquireSwapchainImage(xr, imageIndex)) {
+                            ID3D11Texture2D* swapchainTexture = swapchainImages[imageIndex].texture;
 
-                                // Render at full swapchain size — the system compositor already
-                                // sized swapchains to the SR recommended per-eye dimensions,
-                                // so no additional scale factor should be applied here.
-                                uint32_t renderW = xr.swapchains[eye].width;
-                                uint32_t renderH = xr.swapchains[eye].height;
+                            ID3D11RenderTargetView* rtv = nullptr;
+                            CreateRenderTargetView(renderer, swapchainTexture, &rtv);
 
+                            // Clear entire color+depth once before eye loop
+                            float clearColor[4] = {0.05f, 0.05f, 0.25f, 1.0f};
+                            renderer.context->ClearRenderTargetView(rtv, clearColor);
+                            renderer.context->ClearDepthStencilView(depthDSV.Get(),
+                                D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
+
+                            for (int eye = 0; eye < 2; eye++) {
                                 D3D11_VIEWPORT vp = {};
-                                vp.Width = (FLOAT)renderW;
-                                vp.Height = (FLOAT)renderH;
+                                vp.TopLeftX = (FLOAT)(eye * eyeRenderW);
+                                vp.Width = (FLOAT)eyeRenderW;
+                                vp.Height = (FLOAT)eyeRenderH;
                                 vp.MaxDepth = 1.0f;
                                 renderer.context->RSSetViewports(1, &vp);
-
-                                float clearColor[4] = {0.05f, 0.05f, 0.25f, 1.0f};
-                                renderer.context->ClearRenderTargetView(rtv, clearColor);
-                                renderer.context->ClearDepthStencilView(depthDSVs[eye].Get(),
-                                    D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
 
                                 XMMATRIX viewMatrix = (eye == 0) ? leftViewMatrix : rightViewMatrix;
                                 XMMATRIX projMatrix = (eye == 0) ? leftProjMatrix : rightProjMatrix;
 
                                 // zoomScale = 1.0 (no zoom control without input handler)
-                                RenderScene(renderer, rtv, depthDSVs[eye].Get(),
-                                    renderW, renderH,
+                                RenderScene(renderer, rtv, depthDSV.Get(),
+                                    eyeRenderW, eyeRenderH,
                                     viewMatrix, projMatrix,
                                     1.0f);
 
-                                if (rtv) rtv->Release();
-
-                                ReleaseSwapchainImage(xr, eye);
-
                                 // Set up projection view for this eye
                                 projectionViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
-                                projectionViews[eye].subImage.swapchain = xr.swapchains[eye].swapchain;
-                                projectionViews[eye].subImage.imageRect.offset = {0, 0};
+                                projectionViews[eye].subImage.swapchain = xr.swapchain.swapchain;
+                                projectionViews[eye].subImage.imageRect.offset = {
+                                    (int32_t)(eye * eyeRenderW), 0
+                                };
                                 projectionViews[eye].subImage.imageRect.extent = {
-                                    (int32_t)renderW,
-                                    (int32_t)renderH
+                                    (int32_t)eyeRenderW,
+                                    (int32_t)eyeRenderH
                                 };
                                 projectionViews[eye].subImage.imageArrayIndex = 0;
 
                                 projectionViews[eye].pose = rawViews[eye].pose;
                                 projectionViews[eye].fov = rawViews[eye].fov;
                             }
+
+                            if (rtv) rtv->Release();
+                            ReleaseSwapchainImage(xr);
                         }
                     }
                 }
@@ -301,10 +300,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     LOG_INFO("");
     LOG_INFO("=== Shutting down ===");
 
-    for (int eye = 0; eye < 2; eye++) {
-        depthDSVs[eye].Reset();
-        depthTextures[eye].Reset();
-    }
+    depthDSV.Reset();
+    depthTexture.Reset();
 
     CleanupOpenXR(xr);
     CleanupD3D11(renderer);
