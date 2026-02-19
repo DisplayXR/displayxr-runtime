@@ -455,7 +455,8 @@ struct VkRenderer {
     VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
     VkFence frameFence = VK_NULL_HANDLE;
     float cubeRotation = 0.0f;
-    SwapchainFramebuffers eyeFramebuffers[2];
+    SwapchainFramebuffers swapchainFBs;
+    VkRenderPass renderPassLoad = VK_NULL_HANDLE;
 };
 
 // ============================================================================
@@ -530,11 +531,11 @@ static bool CreateDepthImage(VkDevice device, VkPhysicalDevice physDevice,
 // Store physDevice globally for depth image creation
 static VkPhysicalDevice g_physDevice = VK_NULL_HANDLE;
 
-static bool CreateSwapchainFramebuffers(VkRenderer& renderer, int eye,
+static bool CreateSwapchainFramebuffers(VkRenderer& renderer,
     VkImage* images, uint32_t imageCount,
     uint32_t width, uint32_t height, VkFormat colorFormat)
 {
-    auto& fb = renderer.eyeFramebuffers[eye];
+    auto& fb = renderer.swapchainFBs;
     fb.colorViews.resize(imageCount);
     fb.depthViews.resize(imageCount);
     fb.framebuffers.resize(imageCount);
@@ -620,6 +621,13 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
     rpInfo.subpassCount = 1;
     rpInfo.pSubpasses = &subpass;
     VK_CHECK(vkCreateRenderPass(device, &rpInfo, nullptr, &renderer.renderPass));
+
+    // Create second render pass with LOAD instead of CLEAR (for second eye in SBS)
+    attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    attachments[0].initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    attachments[1].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    attachments[1].initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    VK_CHECK(vkCreateRenderPass(device, &rpInfo, nullptr, &renderer.renderPassLoad));
 
     // Pipeline layout (push constants for MVP)
     VkPushConstantRange pushRange = {};
@@ -863,14 +871,16 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
     return true;
 }
 
-static void RenderScene(VkRenderer& renderer, int eye, uint32_t imageIndex,
-    uint32_t width, uint32_t height, const float* viewMat, const float* projMat)
+static void RenderScene(VkRenderer& renderer, uint32_t imageIndex,
+    uint32_t viewportX, uint32_t viewportY,
+    uint32_t width, uint32_t height, const float* viewMat, const float* projMat,
+    bool clear = true)
 {
     VkDevice device = renderer.device;
     vkWaitForFences(device, 1, &renderer.frameFence, VK_TRUE, UINT64_MAX);
     vkResetFences(device, 1, &renderer.frameFence);
 
-    auto& fb = renderer.eyeFramebuffers[eye];
+    auto& fb = renderer.swapchainFBs;
     VkCommandBuffer cmd = renderer.commandBuffer;
     vkResetCommandBuffer(cmd, 0);
 
@@ -885,15 +895,15 @@ static void RenderScene(VkRenderer& renderer, int eye, uint32_t imageIndex,
 
     VkRenderPassBeginInfo rpBegin = {};
     rpBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-    rpBegin.renderPass = renderer.renderPass;
+    rpBegin.renderPass = clear ? renderer.renderPass : renderer.renderPassLoad;
     rpBegin.framebuffer = fb.framebuffers[imageIndex];
-    rpBegin.renderArea = {{0,0}, {width, height}};
+    rpBegin.renderArea = {{(int32_t)viewportX, (int32_t)viewportY}, {width, height}};
     rpBegin.clearValueCount = 2;
     rpBegin.pClearValues = clearValues;
     vkCmdBeginRenderPass(cmd, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
 
-    VkViewport viewport = {0, (float)height, (float)width, -(float)height, 0.0f, 1.0f};
-    VkRect2D scissor = {{0,0}, {width, height}};
+    VkViewport viewport = {(float)viewportX, (float)(viewportY + height), (float)width, -(float)height, 0.0f, 1.0f};
+    VkRect2D scissor = {{(int32_t)viewportX, (int32_t)viewportY}, {width, height}};
     vkCmdSetViewport(cmd, 0, 1, &viewport);
     vkCmdSetScissor(cmd, 0, 1, &scissor);
 
@@ -952,8 +962,8 @@ static void CleanupVkRenderer(VkRenderer& renderer) {
     if (renderer.device == VK_NULL_HANDLE) return;
     vkDeviceWaitIdle(renderer.device);
 
-    for (int eye = 0; eye < 2; eye++) {
-        auto& fb = renderer.eyeFramebuffers[eye];
+    {
+        auto& fb = renderer.swapchainFBs;
         for (auto f : fb.framebuffers) vkDestroyFramebuffer(renderer.device, f, nullptr);
         for (auto v : fb.colorViews) vkDestroyImageView(renderer.device, v, nullptr);
         for (auto v : fb.depthViews) vkDestroyImageView(renderer.device, v, nullptr);
@@ -972,6 +982,7 @@ static void CleanupVkRenderer(VkRenderer& renderer) {
     if (renderer.gridPipeline) vkDestroyPipeline(renderer.device, renderer.gridPipeline, nullptr);
     if (renderer.cubePipeline) vkDestroyPipeline(renderer.device, renderer.cubePipeline, nullptr);
     if (renderer.pipelineLayout) vkDestroyPipelineLayout(renderer.device, renderer.pipelineLayout, nullptr);
+    if (renderer.renderPassLoad) vkDestroyRenderPass(renderer.device, renderer.renderPassLoad, nullptr);
     if (renderer.renderPass) vkDestroyRenderPass(renderer.device, renderer.renderPass, nullptr);
 }
 
@@ -1259,7 +1270,10 @@ struct AppXrSession {
     XrSpace viewSpace = XR_NULL_HANDLE;
     XrSpace displaySpace = XR_NULL_HANDLE;
 
-    SwapchainInfo swapchains[2];
+    SwapchainInfo swapchain;
+
+    uint32_t displayPixelWidth = 0;
+    uint32_t displayPixelHeight = 0;
 
     XrViewConfigurationType viewConfigType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
     std::vector<XrViewConfigurationView> configViews;
@@ -1355,6 +1369,9 @@ static bool InitializeOpenXR(AppXrSession& xr) {
             xr.nominalViewerY = displayInfo.nominalViewerPositionInDisplaySpace.y;
             xr.nominalViewerZ = displayInfo.nominalViewerPositionInDisplaySpace.z;
             xr.supportsDisplayModeSwitch = displayInfo.supportsDisplayModeSwitch;
+            xr.displayPixelWidth = displayInfo.displayPixelWidth;
+            xr.displayPixelHeight = displayInfo.displayPixelHeight;
+            LOG_INFO("Display pixels: %ux%u", xr.displayPixelWidth, xr.displayPixelHeight);
             LOG_INFO("Display info: %.3fx%.3f m, scale=%.2fx%.2f, nominal=(%.3f,%.3f,%.3f)",
                 xr.displayWidthM, xr.displayHeightM,
                 xr.recommendedViewScaleX, xr.recommendedViewScaleY,
@@ -1642,27 +1659,36 @@ static bool CreateSwapchains(AppXrSession& xr) {
     int64_t selectedFormat = formats[0];
     LOG_INFO("Selected swapchain format: %lld", (long long)selectedFormat);
 
-    for (int eye = 0; eye < 2; eye++) {
-        XrSwapchainCreateInfo swapchainInfo = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
-        swapchainInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
-        swapchainInfo.format = selectedFormat;
-        swapchainInfo.sampleCount = 1;
-        swapchainInfo.width = xr.configViews[eye].recommendedImageRectWidth;
-        swapchainInfo.height = xr.configViews[eye].recommendedImageRectHeight;
-        swapchainInfo.faceCount = 1;
-        swapchainInfo.arraySize = 1;
-        swapchainInfo.mipCount = 1;
-
-        XR_CHECK(xrCreateSwapchain(xr.session, &swapchainInfo, &xr.swapchains[eye].swapchain));
-        xr.swapchains[eye].format = selectedFormat;
-        xr.swapchains[eye].width = swapchainInfo.width;
-        xr.swapchains[eye].height = swapchainInfo.height;
-
-        uint32_t imageCount = 0;
-        XR_CHECK(xrEnumerateSwapchainImages(xr.swapchains[eye].swapchain, 0, &imageCount, nullptr));
-        xr.swapchains[eye].imageCount = imageCount;
-        LOG_INFO("  Eye %d: %ux%u, %u images", eye, swapchainInfo.width, swapchainInfo.height, imageCount);
+    // Single SBS swapchain at native display resolution
+    uint32_t scWidth = xr.displayPixelWidth;
+    uint32_t scHeight = xr.displayPixelHeight;
+    if (scWidth == 0 || scHeight == 0) {
+        scWidth = xr.configViews[0].recommendedImageRectWidth * 2;
+        scHeight = xr.configViews[0].recommendedImageRectHeight;
     }
+    // Cap at max
+    if (scWidth > xr.configViews[0].maxImageRectWidth) scWidth = xr.configViews[0].maxImageRectWidth;
+    if (scHeight > xr.configViews[0].maxImageRectHeight) scHeight = xr.configViews[0].maxImageRectHeight;
+
+    XrSwapchainCreateInfo swapchainInfo = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    swapchainInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+    swapchainInfo.format = selectedFormat;
+    swapchainInfo.sampleCount = 1;
+    swapchainInfo.width = scWidth;
+    swapchainInfo.height = scHeight;
+    swapchainInfo.faceCount = 1;
+    swapchainInfo.arraySize = 1;
+    swapchainInfo.mipCount = 1;
+
+    XR_CHECK(xrCreateSwapchain(xr.session, &swapchainInfo, &xr.swapchain.swapchain));
+    xr.swapchain.format = selectedFormat;
+    xr.swapchain.width = scWidth;
+    xr.swapchain.height = scHeight;
+
+    uint32_t imageCount = 0;
+    XR_CHECK(xrEnumerateSwapchainImages(xr.swapchain.swapchain, 0, &imageCount, nullptr));
+    xr.swapchain.imageCount = imageCount;
+    LOG_INFO("Swapchain: %ux%u, %u images", scWidth, scHeight, imageCount);
 
     return true;
 }
@@ -1718,25 +1744,25 @@ static bool BeginFrame(AppXrSession& xr, XrFrameState& frameState) {
     return true;
 }
 
-static bool AcquireSwapchainImage(AppXrSession& xr, int eye, uint32_t& imageIndex) {
+static bool AcquireSwapchainImage(AppXrSession& xr, uint32_t& imageIndex) {
     XrSwapchainImageAcquireInfo acquireInfo = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-    XrResult result = xrAcquireSwapchainImage(xr.swapchains[eye].swapchain, &acquireInfo, &imageIndex);
+    XrResult result = xrAcquireSwapchainImage(xr.swapchain.swapchain, &acquireInfo, &imageIndex);
     if (XR_FAILED(result)) return false;
 
     XrSwapchainImageWaitInfo waitInfo = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
     waitInfo.timeout = XR_INFINITE_DURATION;
-    result = xrWaitSwapchainImage(xr.swapchains[eye].swapchain, &waitInfo);
+    result = xrWaitSwapchainImage(xr.swapchain.swapchain, &waitInfo);
     if (XR_FAILED(result)) {
         XrSwapchainImageReleaseInfo releaseInfo = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-        xrReleaseSwapchainImage(xr.swapchains[eye].swapchain, &releaseInfo);
+        xrReleaseSwapchainImage(xr.swapchain.swapchain, &releaseInfo);
         return false;
     }
     return true;
 }
 
-static bool ReleaseSwapchainImage(AppXrSession& xr, int eye) {
+static bool ReleaseSwapchainImage(AppXrSession& xr) {
     XrSwapchainImageReleaseInfo releaseInfo = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-    return XR_SUCCEEDED(xrReleaseSwapchainImage(xr.swapchains[eye].swapchain, &releaseInfo));
+    return XR_SUCCEEDED(xrReleaseSwapchainImage(xr.swapchain.swapchain, &releaseInfo));
 }
 
 static bool EndFrame(AppXrSession& xr, XrTime displayTime,
@@ -1760,10 +1786,8 @@ static bool EndFrame(AppXrSession& xr, XrTime displayTime,
 }
 
 static void CleanupOpenXR(AppXrSession& xr) {
-    for (int eye = 0; eye < 2; eye++) {
-        if (xr.swapchains[eye].swapchain != XR_NULL_HANDLE) {
-            xrDestroySwapchain(xr.swapchains[eye].swapchain);
-        }
+    if (xr.swapchain.swapchain != XR_NULL_HANDLE) {
+        xrDestroySwapchain(xr.swapchain.swapchain);
     }
     if (xr.displaySpace != XR_NULL_HANDLE) xrDestroySpace(xr.displaySpace);
     if (xr.viewSpace != XR_NULL_HANDLE) xrDestroySpace(xr.viewSpace);
@@ -1898,15 +1922,15 @@ int main() {
     }
 
     // Step 5: Enumerate swapchain images + init renderer
-    std::vector<XrSwapchainImageVulkanKHR> swapchainImages[2];
-    for (int eye = 0; eye < 2; eye++) {
-        uint32_t count = xr.swapchains[eye].imageCount;
-        swapchainImages[eye].resize(count, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
-        xrEnumerateSwapchainImages(xr.swapchains[eye].swapchain, count, &count,
-            (XrSwapchainImageBaseHeader*)swapchainImages[eye].data());
+    std::vector<XrSwapchainImageVulkanKHR> swapchainImages;
+    {
+        uint32_t count = xr.swapchain.imageCount;
+        swapchainImages.resize(count, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
+        xrEnumerateSwapchainImages(xr.swapchain.swapchain, count, &count,
+            (XrSwapchainImageBaseHeader*)swapchainImages.data());
     }
 
-    VkFormat colorFormat = (VkFormat)xr.swapchains[0].format;
+    VkFormat colorFormat = (VkFormat)xr.swapchain.format;
     VkRenderer vkRenderer = {};
     if (!InitializeVkRenderer(vkRenderer, vkDevice, physDevice, graphicsQueue, queueFamilyIndex, colorFormat)) {
         CleanupOpenXR(xr);
@@ -1915,23 +1939,22 @@ int main() {
         return 1;
     }
 
-    for (int eye = 0; eye < 2; eye++) {
-        uint32_t count = xr.swapchains[eye].imageCount;
-        LOG_INFO("Creating framebuffers for eye %d: %u images, %ux%u",
-                 eye, count, xr.swapchains[eye].width, xr.swapchains[eye].height);
+    {
+        uint32_t count = xr.swapchain.imageCount;
+        LOG_INFO("Creating framebuffers: %u images, %ux%u", count, xr.swapchain.width, xr.swapchain.height);
         std::vector<VkImage> images(count);
         for (uint32_t i = 0; i < count; i++) {
-            images[i] = swapchainImages[eye][i].image;
+            images[i] = swapchainImages[i].image;
         }
-        if (!CreateSwapchainFramebuffers(vkRenderer, eye, images.data(), count,
-            xr.swapchains[eye].width, xr.swapchains[eye].height, colorFormat)) {
+        if (!CreateSwapchainFramebuffers(vkRenderer, images.data(), count,
+            xr.swapchain.width, xr.swapchain.height, colorFormat)) {
             CleanupVkRenderer(vkRenderer);
             CleanupOpenXR(xr);
             vkDestroyDevice(vkDevice, nullptr);
             vkDestroyInstance(vkInstance, nullptr);
             return 1;
         }
-        LOG_INFO("  Eye %d framebuffers created OK", eye);
+        LOG_INFO("Framebuffers created OK");
     }
 
     LOG_INFO("=== Entering main loop ===");
@@ -2039,49 +2062,39 @@ int main() {
                                 (views[0].pose.position.z + views[1].pose.position.z) / 2.0f};
                         }
 
-                        // Compute render dims based on display mode and output mode.
-                        // SBS: each eye = half width (scaleX=0.5). Anaglyph/blend: each eye = full width.
-                        //
-                        // TODO: SBS mode renders correctly but anaglyph and blend modes are
-                        // stretched 2x horizontally. The effectiveScaleX=1.0 override for
-                        // non-SBS modes should fix the Kooima FOV and render dimensions,
-                        // but the stretch persists. Suspect the issue is in the compositor's
-                        // display processor path (crop-blit aspect ratio vs framebuffer) or
-                        // in how the sim_display shaders sample the crop images. Needs
-                        // further investigation with actual dimension logging at each stage.
-                        float effectiveScaleX = (g_currentOutputMode == 0) ? xr.recommendedViewScaleX : 1.0f;
-                        float effectiveScaleY = xr.recommendedViewScaleY;
+                        // Compute render dims for SBS single-swapchain
+                        uint32_t eyeRenderW = xr.swapchain.width / 2;
+                        uint32_t eyeRenderH = xr.swapchain.height;
                         uint32_t renderW, renderH;
                         if (!g_input.displayMode3D) {
                             renderW = g_windowW;
                             renderH = g_windowH;
+                            if (renderW > xr.swapchain.width) renderW = xr.swapchain.width;
+                            if (renderH > xr.swapchain.height) renderH = xr.swapchain.height;
                         } else {
-                            renderW = (uint32_t)(g_windowW * effectiveScaleX);
-                            renderH = (uint32_t)(g_windowH * effectiveScaleY);
+                            renderW = eyeRenderW;
+                            renderH = eyeRenderH;
                         }
-                        if (renderW > xr.swapchains[0].width) renderW = xr.swapchains[0].width;
-                        if (renderH > xr.swapchains[0].height) renderH = xr.swapchains[0].height;
                         g_renderW = renderW;
                         g_renderH = renderH;
 
                         rendered = true;
-                        for (int eye = 0; eye < eyeCount; eye++) {
-                            uint32_t imageIndex;
-                            if (AcquireSwapchainImage(xr, eye, imageIndex)) {
+                        uint32_t imageIndex;
+                        if (AcquireSwapchainImage(xr, imageIndex)) {
+                            for (int eye = 0; eye < eyeCount; eye++) {
                                 float viewMat[16], projMat[16];
                                 mat4_view_from_xr_pose(viewMat, views[eye].pose);
 
                                 // Kooima projection uses RAW display-space positions
-                                // screenW uses scale factor so frustum matches per-eye
-                                // viewport portion of the display
+                                // screenW = half display width for SBS per-eye frustum
                                 XrFovf submitFov = views[eye].fov;
                                 if (xr.displayWidthM > 0 && xr.displayHeightM > 0) {
                                     float zs = g_input.zoomScale;
                                     XrVector3f kooimaEye = {rawEyePos[eye].x / zs, rawEyePos[eye].y / zs, rawEyePos[eye].z / zs};
                                     float screenW = (g_input.displayMode3D
-                                        ? xr.displayWidthM * effectiveScaleX
+                                        ? xr.displayWidthM / 2.0f
                                         : xr.displayWidthM) / zs;
-                                    float screenH = (xr.displayHeightM * effectiveScaleY) / zs;
+                                    float screenH = xr.displayHeightM / zs;
                                     mat4_kooima_projection(projMat, kooimaEye,
                                         screenW, screenH, 0.01f, 100.0f);
                                     submitFov = compute_kooima_fov(kooimaEye,
@@ -2090,23 +2103,25 @@ int main() {
                                     mat4_from_xr_fov(projMat, views[eye].fov, 0.01f, 100.0f);
                                 }
 
-                                RenderScene(vkRenderer, eye, imageIndex,
-                                    renderW, renderH,
-                                    viewMat, projMat);
-                                ReleaseSwapchainImage(xr, eye);
+                                uint32_t vpX = g_input.displayMode3D ? (eye * renderW) : 0;
+                                RenderScene(vkRenderer, imageIndex,
+                                    vpX, 0, renderW, renderH,
+                                    viewMat, projMat,
+                                    eye == 0);  // clear on first eye only
 
                                 projectionViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
-                                projectionViews[eye].subImage.swapchain = xr.swapchains[eye].swapchain;
-                                projectionViews[eye].subImage.imageRect.offset = {0, 0};
+                                projectionViews[eye].subImage.swapchain = xr.swapchain.swapchain;
+                                projectionViews[eye].subImage.imageRect.offset = {(int32_t)vpX, 0};
                                 projectionViews[eye].subImage.imageRect.extent = {
                                     (int32_t)renderW,
                                     (int32_t)renderH};
                                 projectionViews[eye].subImage.imageArrayIndex = 0;
                                 projectionViews[eye].pose = views[eye].pose;
                                 projectionViews[eye].fov = submitFov;
-                            } else {
-                                rendered = false;
                             }
+                            ReleaseSwapchainImage(xr);
+                        } else {
+                            rendered = false;
                         }
                     }
                 }

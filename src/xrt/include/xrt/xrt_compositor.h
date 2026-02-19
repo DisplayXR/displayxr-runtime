@@ -2444,6 +2444,12 @@ struct xrt_system_compositor_info
 
 	//! True if display supports 2D/3D mode switching (SR SwitchableLensHint).
 	bool supports_display_mode_switch;
+
+	//! Native display panel width in pixels. 0 if unknown.
+	uint32_t display_pixel_width;
+
+	//! Native display panel height in pixels. 0 if unknown.
+	uint32_t display_pixel_height;
 };
 
 struct xrt_system_compositor;

@@ -365,14 +365,14 @@ bool InitializeD3D12WithLUID(D3D12Renderer& renderer, LUID adapterLuid) {
 }
 
 bool CreateSwapchainRTVs(D3D12Renderer& renderer,
-    ID3D12Resource** textures, uint32_t count, int eye,
+    ID3D12Resource** textures, uint32_t count,
     uint32_t width, uint32_t height,
     DXGI_FORMAT format)
 {
     // Store swapchain format and recreate PSOs to match on first call.
     // The underlying D3D12 resources are typeless (for Vulkan interop), so
     // both RTVs and PSOs need an explicit typed format.
-    if (eye == 0 && renderer.swapchainFormat != format) {
+    if (renderer.swapchainFormat != format) {
         renderer.swapchainFormat = format;
 
         // Recreate PSOs with the actual swapchain format
@@ -440,23 +440,18 @@ bool CreateSwapchainRTVs(D3D12Renderer& renderer,
         LOG_INFO("Recreated PSOs with swapchain format 0x%X", format);
     }
 
-    // Create RTV descriptor heap (accumulates for both eyes)
-    uint32_t totalRTVs = renderer.rtvCount + count;
-    if (!renderer.rtvHeap || totalRTVs > renderer.rtvCount) {
-        // Recreate heap if needed
-        if (eye == 0) {
-            // First eye: create fresh heap for both eyes
-            D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
-            heapDesc.NumDescriptors = count * 2; // Both eyes
-            heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-            HRESULT hr = renderer.device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&renderer.rtvHeap));
-            if (FAILED(hr)) return false;
-            renderer.rtvDescriptorSize = renderer.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-            renderer.rtvCount = 0;
-        }
+    // Create RTV descriptor heap
+    {
+        D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
+        heapDesc.NumDescriptors = count;
+        heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        HRESULT hr = renderer.device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&renderer.rtvHeap));
+        if (FAILED(hr)) return false;
+        renderer.rtvDescriptorSize = renderer.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+        renderer.rtvCount = 0;
     }
 
-    // Create RTVs for this eye's swapchain images.
+    // Create RTVs for swapchain images.
     // Explicit format is required because resources are typeless (for Vulkan interop).
     D3D12_RENDER_TARGET_VIEW_DESC rtvDesc = {};
     rtvDesc.Format = format;
@@ -473,16 +468,14 @@ bool CreateSwapchainRTVs(D3D12Renderer& renderer,
     }
     renderer.rtvCount += count;
 
-    // Create depth buffer for this eye (if not already created)
-    if (!renderer.depthBuffers[eye]) {
-        if (!renderer.dsvHeap) {
-            D3D12_DESCRIPTOR_HEAP_DESC dsvHeapDesc = {};
-            dsvHeapDesc.NumDescriptors = 2; // Both eyes
-            dsvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
-            HRESULT hr = renderer.device->CreateDescriptorHeap(&dsvHeapDesc, IID_PPV_ARGS(&renderer.dsvHeap));
-            if (FAILED(hr)) return false;
-            renderer.dsvDescriptorSize = renderer.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
-        }
+    // Create single depth buffer for SBS swapchain
+    if (!renderer.depthBuffer) {
+        D3D12_DESCRIPTOR_HEAP_DESC dsvHeapDesc = {};
+        dsvHeapDesc.NumDescriptors = 1;
+        dsvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+        HRESULT hr = renderer.device->CreateDescriptorHeap(&dsvHeapDesc, IID_PPV_ARGS(&renderer.dsvHeap));
+        if (FAILED(hr)) return false;
+        renderer.dsvDescriptorSize = renderer.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
 
         D3D12_HEAP_PROPERTIES heapProps = {};
         heapProps.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -502,18 +495,17 @@ bool CreateSwapchainRTVs(D3D12Renderer& renderer,
         clearValue.DepthStencil.Depth = 1.0f;
         clearValue.DepthStencil.Stencil = 0;
 
-        HRESULT hr = renderer.device->CreateCommittedResource(
+        hr = renderer.device->CreateCommittedResource(
             &heapProps, D3D12_HEAP_FLAG_NONE, &depthDesc,
             D3D12_RESOURCE_STATE_DEPTH_WRITE, &clearValue,
-            IID_PPV_ARGS(&renderer.depthBuffers[eye]));
+            IID_PPV_ARGS(&renderer.depthBuffer));
         if (FAILED(hr)) return false;
 
         D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle = renderer.dsvHeap->GetCPUDescriptorHandleForHeapStart();
-        dsvHandle.ptr += eye * renderer.dsvDescriptorSize;
-        renderer.device->CreateDepthStencilView(renderer.depthBuffers[eye].Get(), nullptr, dsvHandle);
+        renderer.device->CreateDepthStencilView(renderer.depthBuffer.Get(), nullptr, dsvHandle);
     }
 
-    LOG_INFO("Created %u RTVs + depth for eye %d (%ux%u)", count, eye, width, height);
+    LOG_INFO("Created %u RTVs + depth (%ux%u)", count, width, height);
     return true;
 }
 
@@ -528,11 +520,12 @@ void RenderScene(
     D3D12Renderer& renderer,
     ID3D12Resource* renderTarget,
     int rtvIndex,
-    int eye,
+    uint32_t viewportX, uint32_t viewportY,
     uint32_t width, uint32_t height,
     const XMMATRIX& viewMatrix,
     const XMMATRIX& projMatrix,
-    float zoomScale
+    float zoomScale,
+    bool clear
 ) {
     HRESULT hr;
 
@@ -558,25 +551,28 @@ void RenderScene(
     rtvHandle.ptr += rtvIndex * renderer.rtvDescriptorSize;
 
     D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle = renderer.dsvHeap->GetCPUDescriptorHandleForHeapStart();
-    dsvHandle.ptr += eye * renderer.dsvDescriptorSize;
 
     // Set render targets
     cmdList->OMSetRenderTargets(1, &rtvHandle, FALSE, &dsvHandle);
 
-    // Clear
-    float clearColor[4] = {0.05f, 0.05f, 0.25f, 1.0f};
-    cmdList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
-    cmdList->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
-        1.0f, 0, 0, nullptr);
+    // Clear only on first eye (clear==true)
+    if (clear) {
+        float clearColor[4] = {0.05f, 0.05f, 0.25f, 1.0f};
+        cmdList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
+        cmdList->ClearDepthStencilView(dsvHandle, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
+            1.0f, 0, 0, nullptr);
+    }
 
-    // Set viewport and scissor
+    // Set viewport and scissor with offset for SBS rendering
     D3D12_VIEWPORT viewport = {};
+    viewport.TopLeftX = (FLOAT)viewportX;
+    viewport.TopLeftY = (FLOAT)viewportY;
     viewport.Width = (FLOAT)width;
     viewport.Height = (FLOAT)height;
     viewport.MaxDepth = 1.0f;
     cmdList->RSSetViewports(1, &viewport);
 
-    D3D12_RECT scissor = { 0, 0, (LONG)width, (LONG)height };
+    D3D12_RECT scissor = { (LONG)viewportX, (LONG)viewportY, (LONG)(viewportX + width), (LONG)(viewportY + height) };
     cmdList->RSSetScissorRects(1, &scissor);
 
     cmdList->SetGraphicsRootSignature(renderer.rootSignature.Get());
@@ -662,8 +658,7 @@ void CleanupD3D12(D3D12Renderer& renderer) {
     }
 
     renderer.fence.Reset();
-    renderer.depthBuffers[0].Reset();
-    renderer.depthBuffers[1].Reset();
+    renderer.depthBuffer.Reset();
     renderer.dsvHeap.Reset();
     renderer.rtvHeap.Reset();
     renderer.gridVertexBuffer.Reset();

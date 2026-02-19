@@ -229,6 +229,8 @@ out:
 			    di_nat_w > 0 && di_nat_h > 0) {
 				xsysc->info.recommended_view_scale_x = (float)di_sr_w / (float)di_nat_w;
 				xsysc->info.recommended_view_scale_y = (float)di_sr_h / (float)di_nat_h;
+				xsysc->info.display_pixel_width = di_nat_w;
+				xsysc->info.display_pixel_height = di_nat_h;
 				U_LOG_W("XR_EXT_display_info: scale=%.4f x %.4f (sr=%ux%u, native=%ux%u)",
 				        xsysc->info.recommended_view_scale_x,
 				        xsysc->info.recommended_view_scale_y, di_sr_w, di_sr_h, di_nat_w, di_nat_h);
@@ -262,10 +264,13 @@ out:
 				xsysc->info.recommended_view_scale_x = 0.5f;
 				xsysc->info.recommended_view_scale_y = 1.0f;
 				xsysc->info.supports_display_mode_switch = true;
+				xsysc->info.display_pixel_width = sd_info.display_pixel_width;
+				xsysc->info.display_pixel_height = sd_info.display_pixel_height;
 				U_LOG_W("XR_EXT_display_info (sim_display): display=%.3fx%.3f m, "
-				        "nominal=(0, %.3f, %.3f) m, scale=0.5x1.0",
+				        "nominal=(0, %.3f, %.3f) m, scale=0.5x1.0, pixels=%ux%u",
 				        sd_info.display_width_m, sd_info.display_height_m,
-				        sd_info.nominal_y_m, sd_info.nominal_z_m);
+				        sd_info.nominal_y_m, sd_info.nominal_z_m,
+				        sd_info.display_pixel_width, sd_info.display_pixel_height);
 			}
 		}
 

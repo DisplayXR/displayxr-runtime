@@ -177,32 +177,32 @@ bool InitializeGLRenderer(GLRenderer& renderer) {
     return true;
 }
 
-bool CreateSwapchainFBOs(GLRenderer& renderer, int eye,
+bool CreateSwapchainFBOs(GLRenderer& renderer,
     const GLuint* images, uint32_t count,
     uint32_t width, uint32_t height)
 {
-    // Create depth renderbuffer for this eye
-    glGenRenderbuffers_(1, &renderer.depthRBOs[eye]);
-    glBindRenderbuffer_(GL_RENDERBUFFER, renderer.depthRBOs[eye]);
+    // Create depth renderbuffer (single SBS swapchain)
+    glGenRenderbuffers_(1, &renderer.depthRBO);
+    glBindRenderbuffer_(GL_RENDERBUFFER, renderer.depthRBO);
     glRenderbufferStorage_(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, width, height);
 
     // Create one FBO per swapchain image
-    renderer.fbos[eye].resize(count);
-    glGenFramebuffers_(count, renderer.fbos[eye].data());
+    renderer.fbos.resize(count);
+    glGenFramebuffers_(count, renderer.fbos.data());
 
     for (uint32_t i = 0; i < count; i++) {
-        glBindFramebuffer_(GL_FRAMEBUFFER, renderer.fbos[eye][i]);
+        glBindFramebuffer_(GL_FRAMEBUFFER, renderer.fbos[i]);
         glFramebufferTexture2D_(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, images[i], 0);
-        glFramebufferRenderbuffer_(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, renderer.depthRBOs[eye]);
+        glFramebufferRenderbuffer_(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, renderer.depthRBO);
 
         if (glCheckFramebufferStatus_(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
-            LOG_ERROR("FBO incomplete for eye %d image %u", eye, i);
+            LOG_ERROR("FBO incomplete for image %u", i);
             return false;
         }
     }
 
     glBindFramebuffer_(GL_FRAMEBUFFER, 0);
-    LOG_INFO("Created %u FBOs for eye %d (%ux%u)", count, eye, width, height);
+    LOG_INFO("Created %u FBOs (%ux%u)", count, width, height);
     return true;
 }
 
@@ -227,19 +227,22 @@ static void SetMatrix(GLuint program, const char* name, const XMMATRIX& m) {
 
 void RenderScene(
     GLRenderer& renderer,
-    int eye, uint32_t imageIndex,
+    uint32_t imageIndex,
+    uint32_t viewportX, uint32_t viewportY,
     uint32_t width, uint32_t height,
     const XMMATRIX& viewMatrix,
     const XMMATRIX& projMatrix,
     float zoomScale
 ) {
-    glBindFramebuffer_(GL_FRAMEBUFFER, renderer.fbos[eye][imageIndex]);
+    glBindFramebuffer_(GL_FRAMEBUFFER, renderer.fbos[imageIndex]);
 
     // TODO: If the swapchain format is GL_SRGB8_ALPHA8, we may need
     // glEnable(GL_FRAMEBUFFER_SRGB) here for correct linear-to-sRGB conversion.
     // Without it, output may appear too dark compared to the D3D11 version.
 
-    glViewport(0, 0, width, height);
+    glViewport(viewportX, viewportY, width, height);
+    glScissor(viewportX, viewportY, width, height);
+    glEnable(GL_SCISSOR_TEST);
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LESS);
     glEnable(GL_CULL_FACE);
@@ -287,19 +290,18 @@ void RenderScene(
 
     glBindVertexArray_(0);
     glUseProgram_(0);
+    glDisable(GL_SCISSOR_TEST);
     glBindFramebuffer_(GL_FRAMEBUFFER, 0);
 }
 
 void CleanupGLRenderer(GLRenderer& renderer) {
-    for (int eye = 0; eye < 2; eye++) {
-        if (!renderer.fbos[eye].empty()) {
-            glDeleteFramebuffers_((GLsizei)renderer.fbos[eye].size(), renderer.fbos[eye].data());
-            renderer.fbos[eye].clear();
-        }
-        if (renderer.depthRBOs[eye]) {
-            glDeleteRenderbuffers_(1, &renderer.depthRBOs[eye]);
-            renderer.depthRBOs[eye] = 0;
-        }
+    if (!renderer.fbos.empty()) {
+        glDeleteFramebuffers_((GLsizei)renderer.fbos.size(), renderer.fbos.data());
+        renderer.fbos.clear();
+    }
+    if (renderer.depthRBO) {
+        glDeleteRenderbuffers_(1, &renderer.depthRBO);
+        renderer.depthRBO = 0;
     }
 
     if (renderer.gridVBO) { glDeleteBuffers_(1, &renderer.gridVBO); renderer.gridVBO = 0; }

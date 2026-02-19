@@ -169,8 +169,8 @@ bool CreateSpaces(XrSessionManager& xr) {
     return true;
 }
 
-bool CreateSwapchains(XrSessionManager& xr, uint32_t minWidth, uint32_t minHeight) {
-    LOG_INFO("Creating swapchains (minWidth=%u, minHeight=%u)...", minWidth, minHeight);
+bool CreateSwapchain(XrSessionManager& xr) {
+    LOG_INFO("Creating single swapchain...");
 
     // Query supported swapchain formats
     LOG_INFO("Enumerating swapchain formats...");
@@ -191,55 +191,55 @@ bool CreateSwapchains(XrSessionManager& xr, uint32_t minWidth, uint32_t minHeigh
     int64_t selectedFormat = formats[0];
     LOG_INFO("Selected swapchain format: %lld (0x%llX)", selectedFormat, selectedFormat);
 
-    // Create swapchain for each eye
-    for (int eye = 0; eye < 2 && eye < (int)xr.configViews.size(); eye++) {
-        LOG_INFO("Creating swapchain for eye %d...", eye);
-        const auto& view = xr.configViews[eye];
+    const auto& view = xr.configViews[0];
 
-        // Start with recommended per-eye size, then enlarge to minWidth/minHeight
-        // (for mono/2D mode where the app needs to render at window resolution).
-        // Cap to maxImageRect to stay within runtime limits.
-        uint32_t width = view.recommendedImageRectWidth;
-        uint32_t height = view.recommendedImageRectHeight;
-        if (minWidth > width) {
-            width = (minWidth <= view.maxImageRectWidth) ? minWidth : view.maxImageRectWidth;
-        }
-        if (minHeight > height) {
-            height = (minHeight <= view.maxImageRectHeight) ? minHeight : view.maxImageRectHeight;
-        }
-
-        XrSwapchainCreateInfo swapchainInfo = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
-        swapchainInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
-        swapchainInfo.format = selectedFormat;
-        swapchainInfo.sampleCount = view.recommendedSwapchainSampleCount;
-        swapchainInfo.width = width;
-        swapchainInfo.height = height;
-        swapchainInfo.faceCount = 1;
-        swapchainInfo.arraySize = 1;
-        swapchainInfo.mipCount = 1;
-
-        LOG_INFO("  Size: %ux%u (recommended %ux%u, max %ux%u), samples: %u",
-                 swapchainInfo.width, swapchainInfo.height,
-                 view.recommendedImageRectWidth, view.recommendedImageRectHeight,
-                 view.maxImageRectWidth, view.maxImageRectHeight,
-                 swapchainInfo.sampleCount);
-
-        XR_CHECK_LOG(xrCreateSwapchain(xr.session, &swapchainInfo, &xr.swapchains[eye].swapchain));
-        LOG_INFO("  Swapchain created: 0x%p", (void*)xr.swapchains[eye].swapchain);
-
-        xr.swapchains[eye].format = selectedFormat;
-        xr.swapchains[eye].width = swapchainInfo.width;
-        xr.swapchains[eye].height = swapchainInfo.height;
-
-        // Count swapchain images (API-specific enumeration is done by each app)
-        uint32_t imageCount = 0;
-        XR_CHECK(xrEnumerateSwapchainImages(xr.swapchains[eye].swapchain, 0, &imageCount, nullptr));
-        xr.swapchains[eye].imageCount = imageCount;
-
-        LOG_INFO("  Got %u swapchain images", imageCount);
+    // Use native display pixel dimensions if available from XR_EXT_display_info.
+    // Fallback: recommendedImageRectWidth * 2 (SBS) x recommendedImageRectHeight.
+    // Cap to maxImageRectWidth x maxImageRectHeight.
+    uint32_t width = xr.displayPixelWidth;
+    uint32_t height = xr.displayPixelHeight;
+    if (width == 0 || height == 0) {
+        width = view.recommendedImageRectWidth * 2;
+        height = view.recommendedImageRectHeight;
+        LOG_INFO("No display pixel dims, using fallback: %ux%u", width, height);
+    }
+    if (width > view.maxImageRectWidth) {
+        width = view.maxImageRectWidth;
+    }
+    if (height > view.maxImageRectHeight) {
+        height = view.maxImageRectHeight;
     }
 
-    LOG_INFO("Swapchains created successfully");
+    XrSwapchainCreateInfo swapchainInfo = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    swapchainInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+    swapchainInfo.format = selectedFormat;
+    swapchainInfo.sampleCount = view.recommendedSwapchainSampleCount;
+    swapchainInfo.width = width;
+    swapchainInfo.height = height;
+    swapchainInfo.faceCount = 1;
+    swapchainInfo.arraySize = 1;
+    swapchainInfo.mipCount = 1;
+
+    LOG_INFO("  Size: %ux%u (max %ux%u), samples: %u",
+             swapchainInfo.width, swapchainInfo.height,
+             view.maxImageRectWidth, view.maxImageRectHeight,
+             swapchainInfo.sampleCount);
+
+    XR_CHECK_LOG(xrCreateSwapchain(xr.session, &swapchainInfo, &xr.swapchain.swapchain));
+    LOG_INFO("  Swapchain created: 0x%p", (void*)xr.swapchain.swapchain);
+
+    xr.swapchain.format = selectedFormat;
+    xr.swapchain.width = swapchainInfo.width;
+    xr.swapchain.height = swapchainInfo.height;
+
+    // Count swapchain images (API-specific enumeration is done by each app)
+    uint32_t imageCount = 0;
+    XR_CHECK(xrEnumerateSwapchainImages(xr.swapchain.swapchain, 0, &imageCount, nullptr));
+    xr.swapchain.imageCount = imageCount;
+
+    LOG_INFO("  Got %u swapchain images", imageCount);
+
+    LOG_INFO("Swapchain created successfully: %ux%u", width, height);
     return true;
 }
 
@@ -478,34 +478,34 @@ bool LocateViews(
     return true;
 }
 
-bool AcquireSwapchainImage(XrSessionManager& xr, int eye, uint32_t& imageIndex) {
+bool AcquireSwapchainImage(XrSessionManager& xr, uint32_t& imageIndex) {
     XrSwapchainImageAcquireInfo acquireInfo = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-    LOG_INFO("[Swapchain] Eye %d: xrAcquireSwapchainImage...", eye);
-    XrResult result = xrAcquireSwapchainImage(xr.swapchains[eye].swapchain, &acquireInfo, &imageIndex);
+    LOG_INFO("[Swapchain] xrAcquireSwapchainImage...");
+    XrResult result = xrAcquireSwapchainImage(xr.swapchain.swapchain, &acquireInfo, &imageIndex);
     if (XR_FAILED(result)) {
-        LOG_WARN("[Swapchain] Eye %d: xrAcquireSwapchainImage FAILED: %d", eye, result);
+        LOG_WARN("[Swapchain] xrAcquireSwapchainImage FAILED: %d", result);
         return false;
     }
-    LOG_INFO("[Swapchain] Eye %d: Acquired index=%u, calling xrWaitSwapchainImage...", eye, imageIndex);
+    LOG_INFO("[Swapchain] Acquired index=%u, calling xrWaitSwapchainImage...", imageIndex);
 
     XrSwapchainImageWaitInfo waitInfo = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
     waitInfo.timeout = XR_INFINITE_DURATION;
-    result = xrWaitSwapchainImage(xr.swapchains[eye].swapchain, &waitInfo);
+    result = xrWaitSwapchainImage(xr.swapchain.swapchain, &waitInfo);
     if (XR_FAILED(result)) {
-        LOG_WARN("[Swapchain] Eye %d: xrWaitSwapchainImage FAILED: %d", eye, result);
+        LOG_WARN("[Swapchain] xrWaitSwapchainImage FAILED: %d", result);
         // Release the acquired image to avoid deadlocking the swapchain
         XrSwapchainImageReleaseInfo releaseInfo = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-        xrReleaseSwapchainImage(xr.swapchains[eye].swapchain, &releaseInfo);
+        xrReleaseSwapchainImage(xr.swapchain.swapchain, &releaseInfo);
         return false;
     }
-    LOG_INFO("[Swapchain] Eye %d: xrWaitSwapchainImage OK", eye);
+    LOG_INFO("[Swapchain] xrWaitSwapchainImage OK");
 
     return true;
 }
 
-bool ReleaseSwapchainImage(XrSessionManager& xr, int eye) {
+bool ReleaseSwapchainImage(XrSessionManager& xr) {
     XrSwapchainImageReleaseInfo releaseInfo = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-    return XR_SUCCEEDED(xrReleaseSwapchainImage(xr.swapchains[eye].swapchain, &releaseInfo));
+    return XR_SUCCEEDED(xrReleaseSwapchainImage(xr.swapchain.swapchain, &releaseInfo));
 }
 
 bool EndFrame(XrSessionManager& xr, XrTime displayTime, const XrCompositionLayerProjectionView* views, uint32_t viewCount) {
@@ -914,12 +914,10 @@ void CleanupOpenXR(XrSessionManager& xr) {
         xr.hasQuadLayer = false;
     }
 
-    for (int eye = 0; eye < 2; eye++) {
-        if (xr.swapchains[eye].swapchain != XR_NULL_HANDLE) {
-            LOG_INFO("Destroying swapchain %d...", eye);
-            xrDestroySwapchain(xr.swapchains[eye].swapchain);
-            xr.swapchains[eye].swapchain = XR_NULL_HANDLE;
-        }
+    if (xr.swapchain.swapchain != XR_NULL_HANDLE) {
+        LOG_INFO("Destroying swapchain...");
+        xrDestroySwapchain(xr.swapchain.swapchain);
+        xr.swapchain.swapchain = XR_NULL_HANDLE;
     }
 
     if (xr.displaySpace != XR_NULL_HANDLE) {

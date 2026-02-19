@@ -203,7 +203,7 @@ static void RenderThreadFunc(
     XrSessionManager* xr,
     D3D12Renderer* renderer,
     std::vector<XrSwapchainImageD3D12KHR>* swapchainImages,
-    int* rtvBaseIndex,
+    int rtvBaseIndex,
     HudRenderer* hud,
     std::vector<XrSwapchainImageD3D12KHR>* hudSwapchainImages,
     ID3D12Resource* hudUploadBuffer,
@@ -293,11 +293,11 @@ static void RenderThreadFunc(
                         xr->rightEyeY = rawViews[1].pose.position.y;
                         xr->rightEyeZ = rawViews[1].pose.position.z;
 
-                        // Compute render dims from window size and display scale factors
-                        uint32_t renderW = (uint32_t)(windowW * xr->recommendedViewScaleX);
-                        uint32_t renderH = (uint32_t)(windowH * xr->recommendedViewScaleY);
-                        if (renderW > xr->swapchains[0].width) renderW = xr->swapchains[0].width;
-                        if (renderH > xr->swapchains[0].height) renderH = xr->swapchains[0].height;
+                        // Compute render dims for SBS: each eye is half the swapchain width
+                        uint32_t eyeRenderW = xr->swapchain.width / 2;
+                        uint32_t eyeRenderH = xr->swapchain.height;
+                        uint32_t renderW = eyeRenderW;
+                        uint32_t renderH = eyeRenderH;
 
                         // --- App-side Kooima projection (RAW mode, app-owned camera model) ---
                         XrFovf appFov[2];
@@ -306,8 +306,8 @@ static void RenderThreadFunc(
                             // Viewport-scale FOV (SRHydra): convert window pixels to meters,
                             // then apply isotropic scale so FOV stays consistent across window
                             // sizes on the 3D display. Matches the non-extension runtime path.
-                            float pxSizeX = xr->displayWidthM / (float)xr->swapchains[0].width;
-                            float pxSizeY = xr->displayHeightM / (float)xr->swapchains[0].height;
+                            float pxSizeX = xr->displayWidthM / (float)(xr->swapchain.width / 2);
+                            float pxSizeY = xr->displayHeightM / (float)xr->swapchain.height;
                             float winW_m = (float)windowW * pxSizeX;
                             float winH_m = (float)windowH * pxSizeY;
                             float minDisp = fminf(xr->displayWidthM, xr->displayHeightM);
@@ -318,8 +318,8 @@ static void RenderThreadFunc(
 
                             // Alternative: content-preserving FOV — keeps rendered content at
                             // constant physical size on display regardless of window size.
-                            // float screenWidthM = xr->displayWidthM * (float)renderW / (float)xr->swapchains[0].width;
-                            // float screenHeightM = xr->displayHeightM * (float)renderH / (float)xr->swapchains[0].height;
+                            // float screenWidthM = xr->displayWidthM * (float)renderW / (float)(xr->swapchain.width / 2);
+                            // float screenHeightM = xr->displayHeightM * (float)renderH / (float)xr->swapchain.height;
 
                             // Display-center zoom: scale eye positions and screen size by
                             // 1/zoomScale. These cancel in Kooima (same ratio), but are kept
@@ -342,41 +342,39 @@ static void RenderThreadFunc(
                         }
 
                         rendered = true;
-                        for (int eye = 0; eye < 2; eye++) {
-                            uint32_t imageIndex;
-                            if (AcquireSwapchainImage(*xr, eye, imageIndex)) {
-                                ID3D12Resource* swapchainTexture = swapchainImages[eye][imageIndex].texture;
+                        uint32_t imageIndex;
+                        if (AcquireSwapchainImage(*xr, imageIndex)) {
+                            ID3D12Resource* swapchainTexture = (*swapchainImages)[imageIndex].texture;
+                            int rtvIdx = rtvBaseIndex + (int)imageIndex;
 
+                            for (int eye = 0; eye < 2; eye++) {
                                 XMMATRIX viewMatrix = (eye == 0) ? leftViewMatrix : rightViewMatrix;
                                 XMMATRIX projMatrix = (eye == 0) ? leftProjMatrix : rightProjMatrix;
 
-                                int rtvIdx = rtvBaseIndex[eye] + (int)imageIndex;
-
-                                RenderScene(*renderer, swapchainTexture, rtvIdx, eye,
+                                RenderScene(*renderer, swapchainTexture, rtvIdx,
+                                    eye * renderW, 0,  // viewport offset
                                     renderW, renderH,
                                     viewMatrix, projMatrix,
-                                    useAppProjection ? 1.0f : inputSnapshot.zoomScale);
-
-                                ReleaseSwapchainImage(*xr, eye);
+                                    useAppProjection ? 1.0f : inputSnapshot.zoomScale,
+                                    eye == 0);  // clear only on first eye
 
                                 projectionViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
-                                projectionViews[eye].subImage.swapchain = xr->swapchains[eye].swapchain;
-                                projectionViews[eye].subImage.imageRect.offset = {0, 0};
+                                projectionViews[eye].subImage.swapchain = xr->swapchain.swapchain;
+                                projectionViews[eye].subImage.imageRect.offset = {(int32_t)(eye * renderW), 0};
                                 projectionViews[eye].subImage.imageRect.extent = {
-                                    (int32_t)renderW,
-                                    (int32_t)renderH
-                                };
+                                    (int32_t)renderW, (int32_t)renderH};
                                 projectionViews[eye].subImage.imageArrayIndex = 0;
                                 projectionViews[eye].pose = rawViews[eye].pose;
                                 // Always submit runtime's raw FOV for compositing.
                                 // The Vulkan compositor re-projects layers from submitted FOV
-                                // → display distortion FOV. Submitting the runtime FOV (which
+                                // -> display distortion FOV. Submitting the runtime FOV (which
                                 // matches the distortion target) makes this a no-op, so the
                                 // app's Kooima rendering directly controls output size.
                                 projectionViews[eye].fov = rawViews[eye].fov;
-                            } else {
-                                rendered = false;
                             }
+                            ReleaseSwapchainImage(*xr);
+                        } else {
+                            rendered = false;
                         }
 
                         // Render HUD to window-space layer swapchain
@@ -577,7 +575,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return 1;
     }
 
-    if (!CreateSwapchains(xr)) {
+    if (!CreateSwapchain(xr)) {
         LOG_ERROR("Swapchain creation failed");
         CleanupOpenXR(xr);
         CleanupD3D12(renderer);
@@ -585,27 +583,27 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return 1;
     }
 
-    // Enumerate D3D12 swapchain images
-    std::vector<XrSwapchainImageD3D12KHR> swapchainImages[2];
-    int rtvBaseIndex[2] = {0, 0};
-    for (int eye = 0; eye < 2; eye++) {
-        uint32_t count = xr.swapchains[eye].imageCount;
-        swapchainImages[eye].resize(count, {XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR});
-        xrEnumerateSwapchainImages(xr.swapchains[eye].swapchain, count, &count,
-            (XrSwapchainImageBaseHeader*)swapchainImages[eye].data());
-        LOG_INFO("Eye %d: enumerated %u D3D12 swapchain images", eye, count);
+    // Enumerate D3D12 swapchain images (single SBS swapchain)
+    std::vector<XrSwapchainImageD3D12KHR> swapchainImages;
+    int rtvBaseIndex = 0;
+    {
+        uint32_t count = xr.swapchain.imageCount;
+        swapchainImages.resize(count, {XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR});
+        xrEnumerateSwapchainImages(xr.swapchain.swapchain, count, &count,
+            (XrSwapchainImageBaseHeader*)swapchainImages.data());
+        LOG_INFO("Enumerated %u D3D12 swapchain images", count);
 
         // Collect ID3D12Resource pointers for RTV creation
         std::vector<ID3D12Resource*> textures(count);
         for (uint32_t i = 0; i < count; i++) {
-            textures[i] = swapchainImages[eye][i].texture;
+            textures[i] = swapchainImages[i].texture;
         }
 
-        rtvBaseIndex[eye] = (int)renderer.rtvCount;
-        if (!CreateSwapchainRTVs(renderer, textures.data(), count, eye,
-            xr.swapchains[eye].width, xr.swapchains[eye].height,
-            (DXGI_FORMAT)xr.swapchains[eye].format)) {
-            LOG_ERROR("Failed to create RTVs for eye %d", eye);
+        rtvBaseIndex = (int)renderer.rtvCount;
+        if (!CreateSwapchainRTVs(renderer, textures.data(), count,
+            xr.swapchain.width, xr.swapchain.height,
+            (DXGI_FORMAT)xr.swapchain.format)) {
+            LOG_ERROR("Failed to create RTVs");
             CleanupOpenXR(xr);
             CleanupD3D12(renderer);
             ShutdownLogging();
@@ -722,7 +720,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     LOG_INFO("");
 
     std::thread renderThread(RenderThreadFunc, hwnd, &xr, &renderer,
-        swapchainImages, rtvBaseIndex,
+        &swapchainImages, rtvBaseIndex,
         hudOk ? &hudRenderer : nullptr,
         hudOk ? &hudSwapImages : nullptr,
         hudUploadBuffer.Get(), hudUploadMapped, hudUploadRowPitch,

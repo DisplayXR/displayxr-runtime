@@ -22,7 +22,7 @@ extern "C" {
 #endif
 
 #define XR_EXT_display_info 1
-#define XR_EXT_display_info_SPEC_VERSION 4
+#define XR_EXT_display_info_SPEC_VERSION 5
 #define XR_EXT_DISPLAY_INFO_EXTENSION_NAME "XR_EXT_display_info"
 
 // Reuse the type value from the deleted XR_EXT_dynamic_render_resolution
@@ -52,6 +52,8 @@ typedef struct XrDisplayInfoEXT {
     float                       recommendedViewScaleX;      //!< Horizontal scale: sr_recommended_w / display_pixel_w
     float                       recommendedViewScaleY;      //!< Vertical scale: sr_recommended_h / display_pixel_h
     XrBool32                    supportsDisplayModeSwitch;  //!< XR_TRUE if display supports 2D/3D mode switching
+    uint32_t                    displayPixelWidth;          //!< Native display panel width in pixels (0 if unknown)
+    uint32_t                    displayPixelHeight;         //!< Native display panel height in pixels (0 if unknown)
 } XrDisplayInfoEXT;
 
 /*!

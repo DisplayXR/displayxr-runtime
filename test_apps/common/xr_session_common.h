@@ -58,8 +58,10 @@ struct XrSessionManager {
                                            //!< anchored to display center, unaffected by recentering.
                                            //!< XR_NULL_HANDLE if extension not enabled.
 
-    // Swapchains (one per eye for stereo)
-    SwapchainInfo swapchains[2];
+    // Single swapchain at native display resolution.
+    // Stereo: both eyes render SBS with viewport offsets.
+    // Mono: full window resolution.
+    SwapchainInfo swapchain;
 
     // Quad layer swapchain for UI overlay
     SwapchainInfo quadSwapchain;
@@ -87,6 +89,10 @@ struct XrSessionManager {
     float nominalViewerY = 0.0f;
     float nominalViewerZ = 0.5f;
 
+    // Native display pixel dimensions (XR_EXT_display_info v5)
+    uint32_t displayPixelWidth = 0;
+    uint32_t displayPixelHeight = 0;
+
     // Display mode switching (XR_EXT_display_info v4)
     bool supportsDisplayModeSwitch = false;
     PFN_xrRequestDisplayModeEXT pfnRequestDisplayModeEXT = nullptr;
@@ -111,12 +117,11 @@ struct XrSessionManager {
 // Create reference spaces
 bool CreateSpaces(XrSessionManager& xr);
 
-// Create swapchains for rendering.
-// Optional minWidth/minHeight ensure each swapchain is at least this large
-// (capped by maxImageRectWidth/Height). Use these for apps that need to
-// render at window resolution in mono (2D) mode, where the per-eye
-// recommended size may be smaller than the window.
-bool CreateSwapchains(XrSessionManager& xr, uint32_t minWidth = 0, uint32_t minHeight = 0);
+// Create a single swapchain at native display resolution.
+// Uses displayPixelWidth x displayPixelHeight from XR_EXT_display_info.
+// Fallback if 0: recommendedImageRectWidth*2 x recommendedImageRectHeight.
+// Capped at maxImageRectWidth x maxImageRectHeight.
+bool CreateSwapchain(XrSessionManager& xr);
 
 // Create quad layer swapchain for UI overlay
 bool CreateQuadLayerSwapchain(XrSessionManager& xr, uint32_t width, uint32_t height);
@@ -153,10 +158,10 @@ bool LocateViews(
 );
 
 // Acquire swapchain image for rendering
-bool AcquireSwapchainImage(XrSessionManager& xr, int eye, uint32_t& imageIndex);
+bool AcquireSwapchainImage(XrSessionManager& xr, uint32_t& imageIndex);
 
 // Release swapchain image after rendering
-bool ReleaseSwapchainImage(XrSessionManager& xr, int eye);
+bool ReleaseSwapchainImage(XrSessionManager& xr);
 
 // App-side Kooima asymmetric frustum projection (RAW mode, app-owned camera model).
 // Builds a projection matrix directly from eye position and physical screen extents,

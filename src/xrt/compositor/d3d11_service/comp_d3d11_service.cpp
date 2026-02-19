@@ -2356,6 +2356,32 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		}
 	}
 
+	// Pre-compute whether there are UI overlay layers (quad/cylinder/equirect/cube).
+	// Needed to decide if same-swapchain SBS can bypass the stereo texture entirely.
+	bool has_ui_layers = false;
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		switch (c->layer_accum.layers[i].data.type) {
+		case XRT_LAYER_QUAD:
+		case XRT_LAYER_CYLINDER:
+		case XRT_LAYER_EQUIRECT2:
+		case XRT_LAYER_EQUIRECT1:
+		case XRT_LAYER_CUBE:
+			has_ui_layers = true;
+			break;
+		default:
+			break;
+		}
+		if (has_ui_layers) break;
+	}
+
+	// Track same-swapchain direct SBS optimization: when both eyes are rendered
+	// into the same swapchain texture as an SBS pair, skip the blit and pass the
+	// app's texture directly to the weaver.
+	bool use_direct_sbs = false;
+	wil::com_ptr<ID3D11ShaderResourceView> direct_sbs_srv;
+	ID3D11Texture2D *direct_sbs_tex = nullptr;
+	uint32_t direct_view_w = 0, direct_view_h = 0;
+
 	// Render projection layers to stereo texture (via copy)
 	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
 		struct comp_layer *layer = &c->layer_accum.layers[i];
@@ -2477,6 +2503,45 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		float right_src_w = layer_is_mono ? 0.0f : static_cast<float>(layer->data.proj.v[1].sub.rect.extent.w);
 		float right_src_h = layer_is_mono ? 0.0f : static_cast<float>(layer->data.proj.v[1].sub.rect.extent.h);
 
+		// Same-swapchain SBS optimization: both eyes reference the same texture,
+		// so the app's swapchain already IS the SBS stereo pair. Skip the blit
+		// and pass the texture directly to the weaver (unless UI overlays need
+		// compositing on top of the stereo texture).
+		bool same_swapchain = (!layer_is_mono && sc_left == sc_right && left_index == right_index);
+		bool skip_this_blit = false;
+
+		if (same_swapchain && !has_ui_layers && !left_mutex_acquired && !right_mutex_acquired) {
+			uint32_t new_view_w = static_cast<uint32_t>(left_src_w);
+			uint32_t new_view_h = static_cast<uint32_t>(left_src_h);
+
+			// Create SRV on the app's texture for direct weaving
+			D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+			srv_desc.Format = left_is_srgb ? get_srgb_format(left_desc.Format) : left_desc.Format;
+			srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+			srv_desc.Texture2D.MipLevels = 1;
+			srv_desc.Texture2D.MostDetailedMip = 0;
+
+			wil::com_ptr<ID3D11ShaderResourceView> app_srv;
+			HRESULT hr = sys->device->CreateShaderResourceView(left_tex, &srv_desc, app_srv.put());
+			if (SUCCEEDED(hr)) {
+				skip_this_blit = true;
+				use_direct_sbs = true;
+				direct_sbs_srv = std::move(app_srv);
+				direct_sbs_tex = left_tex;
+				direct_view_w = new_view_w;
+				direct_view_h = new_view_h;
+
+				static bool logged_same_sc = false;
+				if (!logged_same_sc) {
+					U_LOG_W("Same-swapchain SBS: skipping stereo blit, view=%ux%u, fmt=0x%X",
+					        new_view_w, new_view_h, srv_desc.Format);
+					logged_same_sc = true;
+				}
+			}
+			// SRV creation failed — fall through to normal blit path
+		}
+
+		if (!skip_this_blit) {
 		// Use shader-based blit for SRGB textures, CopySubresourceRegion for non-SRGB
 		// Log which path is used (first frame only)
 		static bool logged_blit_path = false;
@@ -2586,6 +2651,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				    &right_box);
 			}
 		}
+		} // !skip_this_blit
 
 		// Release KeyedMutex after reading
 		if (left_mutex_acquired) {
@@ -2596,24 +2662,6 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		}
 
 		U_LOG_T("Rendered projection layer %u", i);
-	}
-
-	// Check if there are any UI layers to render
-	bool has_ui_layers = false;
-	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
-		struct comp_layer *layer = &c->layer_accum.layers[i];
-		switch (layer->data.type) {
-		case XRT_LAYER_QUAD:
-		case XRT_LAYER_CYLINDER:
-		case XRT_LAYER_EQUIRECT2:
-		case XRT_LAYER_EQUIRECT1:
-		case XRT_LAYER_CUBE:
-			has_ui_layers = true;
-			break;
-		default:
-			break;
-		}
-		if (has_ui_layers) break;
 	}
 
 	// Render UI layers if any exist and shaders are ready
@@ -2745,16 +2793,22 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		comp_d3d11_window_wait_for_paint(c->render.window);
 	}
 
+	// Select weaver input: direct SBS from app's swapchain, or intermediate stereo_texture
+	ID3D11ShaderResourceView *input_srv = use_direct_sbs
+	    ? direct_sbs_srv.get() : c->render.stereo_srv.get();
+	uint32_t input_view_w = use_direct_sbs ? direct_view_w : sys->view_width;
+	uint32_t input_view_h = use_direct_sbs ? direct_view_h : sys->view_height;
+
 #ifdef XRT_HAVE_LEIA_SR_D3D11
 	// Weave stereo texture through SR weaver for light field display
 	// Skip weaving for mono — display is in 2D mode, no interlacing needed
-	if (!is_mono && c->render.weaver != nullptr && c->render.stereo_srv) {
+	if (!is_mono && c->render.weaver != nullptr && input_srv) {
 		// Set input stereo texture
 		leiasr_d3d11_set_input_texture(
 		    c->render.weaver,
-		    c->render.stereo_srv.get(),
-		    sys->view_width,
-		    sys->view_height,
+		    input_srv,
+		    input_view_w,
+		    input_view_h,
 		    DXGI_FORMAT_R8G8B8A8_UNORM);
 
 		// Bind back buffer as output
@@ -2790,9 +2844,10 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		// Log weaver dimensions periodically for debugging interlacing issues
 		static uint32_t weave_log_count = 0;
 		if (weave_log_count == 0 || weave_log_count % 300 == 0) {
-			U_LOG_W("SR weave: input view=%ux%u (stereo=%ux%u), back_buffer=%ux%u, window_client=%ux%u, output_dims=%ux%u",
-			        sys->view_width, sys->view_height,
-			        sys->view_width * 2, sys->view_height,
+			U_LOG_W("SR weave: input view=%ux%u (stereo=%ux%u)%s, back_buffer=%ux%u, window_client=%ux%u, output_dims=%ux%u",
+			        input_view_w, input_view_h,
+			        input_view_w * 2, input_view_h,
+			        use_direct_sbs ? " [DIRECT SBS]" : "",
 			        back_buffer_width, back_buffer_height,
 			        window_width, window_height,
 			        sys->output_width, sys->output_height);
@@ -2811,26 +2866,34 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	} else
 #endif
 	{
-		// No weaver - copy stereo texture to back buffer directly
-		if (c->render.stereo_texture && c->render.back_buffer_rtv) {
+		// No weaver - copy stereo/direct texture to back buffer directly
+		if (c->render.back_buffer_rtv) {
 			wil::com_ptr<ID3D11Resource> back_buffer;
 			c->render.back_buffer_rtv->GetResource(back_buffer.put());
 
-			if (is_mono) {
-				// MONO: copy the rendered region (output dims, capped
-				// to stereo texture) to the back buffer.
-				D3D11_TEXTURE2D_DESC src_desc = {};
-				c->render.stereo_texture->GetDesc(&src_desc);
-				uint32_t copy_w = (sys->output_width < src_desc.Width)
-				                      ? sys->output_width : src_desc.Width;
-				uint32_t copy_h = (sys->output_height < src_desc.Height)
-				                      ? sys->output_height : src_desc.Height;
-				D3D11_BOX src_box = {0, 0, 0, copy_w, copy_h, 1};
+			if (use_direct_sbs && direct_sbs_tex) {
+				// Same-swapchain SBS: copy app's SBS region to back buffer
+				D3D11_BOX src_box = {0, 0, 0, input_view_w * 2, input_view_h, 1};
 				sys->context->CopySubresourceRegion(
 				    back_buffer.get(), 0, 0, 0, 0,
-				    c->render.stereo_texture.get(), 0, &src_box);
-			} else {
-				sys->context->CopyResource(back_buffer.get(), c->render.stereo_texture.get());
+				    direct_sbs_tex, 0, &src_box);
+			} else if (c->render.stereo_texture) {
+				if (is_mono) {
+					// MONO: copy the rendered region (output dims, capped
+					// to stereo texture) to the back buffer.
+					D3D11_TEXTURE2D_DESC src_desc = {};
+					c->render.stereo_texture->GetDesc(&src_desc);
+					uint32_t copy_w = (sys->output_width < src_desc.Width)
+					                      ? sys->output_width : src_desc.Width;
+					uint32_t copy_h = (sys->output_height < src_desc.Height)
+					                      ? sys->output_height : src_desc.Height;
+					D3D11_BOX src_box = {0, 0, 0, copy_w, copy_h, 1};
+					sys->context->CopySubresourceRegion(
+					    back_buffer.get(), 0, 0, 0, 0,
+					    c->render.stereo_texture.get(), 0, &src_box);
+				} else {
+					sys->context->CopyResource(back_buffer.get(), c->render.stereo_texture.get());
+				}
 			}
 		}
 	}
@@ -3247,6 +3310,8 @@ comp_d3d11_service_create_system(struct xrt_device *xdev,
 	if (sr_native_width > 0 && sr_native_height > 0) {
 		sys->base.info.recommended_view_scale_x = (float)sr_view_width / (float)sr_native_width;
 		sys->base.info.recommended_view_scale_y = (float)sr_view_height / (float)sr_native_height;
+		sys->base.info.display_pixel_width = sr_native_width;
+		sys->base.info.display_pixel_height = sr_native_height;
 	}
 	{
 		struct leiasr_display_dimensions dims = {0};

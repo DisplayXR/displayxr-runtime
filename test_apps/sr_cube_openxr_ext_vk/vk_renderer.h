@@ -18,8 +18,9 @@ struct VkRenderer {
     VkQueue graphicsQueue = VK_NULL_HANDLE;
     uint32_t queueFamilyIndex = 0;
 
-    // Render pass
+    // Render passes: renderPass clears attachments, renderPassLoad preserves them
     VkRenderPass renderPass = VK_NULL_HANDLE;
+    VkRenderPass renderPassLoad = VK_NULL_HANDLE;
 
     // Pipeline layout + pipelines
     VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
@@ -75,14 +76,18 @@ bool CreateSwapchainFramebuffers(VkRenderer& renderer, int eye,
 // Update scene
 void UpdateScene(VkRenderer& renderer, float deltaTime);
 
-// Render to a specific swapchain image
+// Render to a specific swapchain image with viewport offset.
+// Set clear=true on the first eye to clear the framebuffer (LOAD_OP_CLEAR),
+// clear=false on the second eye to preserve the first eye's content (LOAD_OP_LOAD).
 void RenderScene(
     VkRenderer& renderer,
     int eye, uint32_t imageIndex,
+    uint32_t viewportX, uint32_t viewportY,
     uint32_t width, uint32_t height,
     const DirectX::XMMATRIX& viewMatrix,
     const DirectX::XMMATRIX& projMatrix,
-    float zoomScale = 1.0f
+    float zoomScale = 1.0f,
+    bool clear = true
 );
 
 // Cleanup

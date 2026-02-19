@@ -233,8 +233,8 @@ struct RenderState {
     HudRenderer* hudRenderer;
     bool hudOk;
     std::vector<XrSwapchainImageD3D11KHR>* hudSwapchainImages;
-    ComPtr<ID3D11Texture2D>* depthTextures;
-    ComPtr<ID3D11DepthStencilView>* depthDSVs;
+    ComPtr<ID3D11Texture2D> depthTexture;
+    ComPtr<ID3D11DepthStencilView> depthDSV;
     std::vector<XrSwapchainImageD3D11KHR>* swapchainImages;
     PerformanceStats* perfStats;
 };
@@ -315,10 +315,9 @@ static void RenderOneFrame(RenderState& rs) {
                     xr.rightEyeZ = rawViews[1].pose.position.z;
 
                     // --- App-side Kooima projection (RAW mode, app-owned camera model) ---
-                    uint32_t renderW_pre = (uint32_t)(g_windowWidth * xr.recommendedViewScaleX);
-                    uint32_t renderH_pre = (uint32_t)(g_windowHeight * xr.recommendedViewScaleY);
-                    if (renderW_pre > xr.swapchains[0].width) renderW_pre = xr.swapchains[0].width;
-                    if (renderH_pre > xr.swapchains[0].height) renderH_pre = xr.swapchains[0].height;
+                    // Per-eye render size = half the swapchain width (SBS layout)
+                    uint32_t eyeRenderW = xr.swapchain.width / 2;
+                    uint32_t eyeRenderH = xr.swapchain.height;
 
                     XrFovf appFov[2];
                     bool useAppProjection = (xr.hasDisplayInfoExt && xr.displayWidthM > 0.0f);
@@ -326,8 +325,8 @@ static void RenderOneFrame(RenderState& rs) {
                         // Viewport-scale FOV (SRHydra): convert window pixels to meters,
                         // then apply isotropic scale so FOV stays consistent across window
                         // sizes on the 3D display. Matches the non-extension runtime path.
-                        float pxSizeX = xr.displayWidthM / (float)xr.swapchains[0].width;
-                        float pxSizeY = xr.displayHeightM / (float)xr.swapchains[0].height;
+                        float pxSizeX = xr.displayWidthM / (float)xr.swapchain.width;
+                        float pxSizeY = xr.displayHeightM / (float)xr.swapchain.height;
                         float winW_m = (float)g_windowWidth * pxSizeX;
                         float winH_m = (float)g_windowHeight * pxSizeY;
                         float minDisp = fminf(xr.displayWidthM, xr.displayHeightM);
@@ -338,8 +337,8 @@ static void RenderOneFrame(RenderState& rs) {
 
                         // Alternative: content-preserving FOV — keeps rendered content at
                         // constant physical size on display regardless of window size.
-                        // float screenWidthM = xr.displayWidthM * (float)renderW_pre / (float)xr.swapchains[0].width;
-                        // float screenHeightM = xr.displayHeightM * (float)renderH_pre / (float)xr.swapchains[0].height;
+                        // float screenWidthM = xr.displayWidthM * (float)eyeRenderW / (float)(xr.swapchain.width / 2);
+                        // float screenHeightM = xr.displayHeightM * (float)eyeRenderH / (float)xr.swapchain.height;
 
                         // Display-center zoom: scale eye positions and screen size by
                         // 1/zoomScale. These cancel in Kooima (same ratio), but are kept
@@ -381,15 +380,14 @@ static void RenderOneFrame(RenderState& rs) {
 
                             uint32_t dispRenderW, dispRenderH;
                             if (!g_inputState.displayMode3D) {
-                                // Mono: full window resolution
-                                dispRenderW = g_windowWidth;
-                                dispRenderH = g_windowHeight;
+                                // Mono: full swapchain resolution
+                                dispRenderW = xr.swapchain.width;
+                                dispRenderH = xr.swapchain.height;
                             } else {
-                                dispRenderW = (uint32_t)(g_windowWidth * xr.recommendedViewScaleX);
-                                dispRenderH = (uint32_t)(g_windowHeight * xr.recommendedViewScaleY);
+                                // Stereo: half width (per eye)
+                                dispRenderW = xr.swapchain.width / 2;
+                                dispRenderH = xr.swapchain.height;
                             }
-                            if (dispRenderW > xr.swapchains[0].width) dispRenderW = xr.swapchains[0].width;
-                            if (dispRenderH > xr.swapchains[0].height) dispRenderH = xr.swapchains[0].height;
                             std::wstring perfText = FormatPerformanceInfo(rs.perfStats->fps, rs.perfStats->frameTimeMs,
                                 dispRenderW, dispRenderH,
                                 g_windowWidth, g_windowHeight);
@@ -431,8 +429,8 @@ static void RenderOneFrame(RenderState& rs) {
 
                         if (useAppProjection) {
                             XrVector3f centerEye = monoPose.position;
-                            float pxSizeX = xr.displayWidthM / (float)xr.swapchains[0].width;
-                            float pxSizeY = xr.displayHeightM / (float)xr.swapchains[0].height;
+                            float pxSizeX = xr.displayWidthM / (float)xr.swapchain.width;
+                            float pxSizeY = xr.displayHeightM / (float)xr.swapchain.height;
                             float winW_m = (float)g_windowWidth * pxSizeX;
                             float winH_m = (float)g_windowHeight * pxSizeY;
                             float minDisp = fminf(xr.displayWidthM, xr.displayHeightM);
@@ -482,37 +480,37 @@ static void RenderOneFrame(RenderState& rs) {
                         }
                     }
 
-                    // Render each view (1 for mono, 2 for stereo)
-                    for (int eye = 0; eye < eyeCount; eye++) {
-                        uint32_t imageIndex;
-                        if (AcquireSwapchainImage(xr, eye, imageIndex)) {
-                            ID3D11Texture2D* swapchainTexture = rs.swapchainImages[eye][imageIndex].texture;
+                    // Single swapchain: acquire once, render all views, release once
+                    uint32_t imageIndex;
+                    if (AcquireSwapchainImage(xr, imageIndex)) {
+                        ID3D11Texture2D* swapchainTexture = (*rs.swapchainImages)[imageIndex].texture;
 
-                            ID3D11RenderTargetView* rtv = nullptr;
-                            CreateRenderTargetView(renderer, swapchainTexture, &rtv);
+                        ID3D11RenderTargetView* rtv = nullptr;
+                        CreateRenderTargetView(renderer, swapchainTexture, &rtv);
 
-                            // Compute render dims: mono uses full window res, stereo uses scaled
-                            uint32_t renderW, renderH;
-                            if (monoMode) {
-                                renderW = g_windowWidth;
-                                renderH = g_windowHeight;
-                            } else {
-                                renderW = (uint32_t)(g_windowWidth * xr.recommendedViewScaleX);
-                                renderH = (uint32_t)(g_windowHeight * xr.recommendedViewScaleY);
-                            }
-                            if (renderW > xr.swapchains[eye].width) renderW = xr.swapchains[eye].width;
-                            if (renderH > xr.swapchains[eye].height) renderH = xr.swapchains[eye].height;
+                        // Clear entire color+depth once before eye loop
+                        float clearColor[4] = {0.05f, 0.05f, 0.25f, 1.0f};
+                        renderer.context->ClearRenderTargetView(rtv, clearColor);
+                        renderer.context->ClearDepthStencilView(rs.depthDSV.Get(),
+                            D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
 
+                        // Render dims: mono uses full swapchain, stereo uses half-width per eye
+                        uint32_t renderW, renderH;
+                        if (monoMode) {
+                            renderW = xr.swapchain.width;
+                            renderH = xr.swapchain.height;
+                        } else {
+                            renderW = eyeRenderW;
+                            renderH = eyeRenderH;
+                        }
+
+                        for (int eye = 0; eye < eyeCount; eye++) {
                             D3D11_VIEWPORT vp = {};
+                            vp.TopLeftX = monoMode ? 0.0f : (FLOAT)(eye * renderW);
                             vp.Width = (FLOAT)renderW;
                             vp.Height = (FLOAT)renderH;
                             vp.MaxDepth = 1.0f;
                             renderer.context->RSSetViewports(1, &vp);
-
-                            float clearColor[4] = {0.05f, 0.05f, 0.25f, 1.0f};
-                            renderer.context->ClearRenderTargetView(rtv, clearColor);
-                            renderer.context->ClearDepthStencilView(rs.depthDSVs[eye].Get(),
-                                D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
 
                             XMMATRIX viewMatrix = monoMode ? monoViewMatrix :
                                 ((eye == 0) ? leftViewMatrix : rightViewMatrix);
@@ -521,19 +519,17 @@ static void RenderOneFrame(RenderState& rs) {
 
                             // Extension apps: cube base rests on grid at y=0
                             // Cube is 0.06m, so center at y=0.03 puts base at y=0
-                            RenderScene(renderer, rtv, rs.depthDSVs[eye].Get(),
+                            RenderScene(renderer, rtv, rs.depthDSV.Get(),
                                 renderW, renderH,
                                 viewMatrix, projMatrix,
                                 useAppProjection ? 1.0f : g_inputState.zoomScale,
                                 0.03f);  // cubeHeight = 0.03 (half cube size)
 
-                            if (rtv) rtv->Release();
-
-                            ReleaseSwapchainImage(xr, eye);
-
                             projectionViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
-                            projectionViews[eye].subImage.swapchain = xr.swapchains[eye].swapchain;
-                            projectionViews[eye].subImage.imageRect.offset = {0, 0};
+                            projectionViews[eye].subImage.swapchain = xr.swapchain.swapchain;
+                            projectionViews[eye].subImage.imageRect.offset = {
+                                (int32_t)(monoMode ? 0 : eye * renderW), 0
+                            };
                             projectionViews[eye].subImage.imageRect.extent = {
                                 (int32_t)renderW,
                                 (int32_t)renderH
@@ -544,6 +540,9 @@ static void RenderOneFrame(RenderState& rs) {
                             projectionViews[eye].fov = monoMode ? monoFov :
                                 (useAppProjection ? appFov[eye] : rawViews[eye].fov);
                         }
+
+                        if (rtv) rtv->Release();
+                        ReleaseSwapchainImage(xr);
                     }
                 }
             }
@@ -674,9 +673,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return 1;
     }
 
-    // Create swapchains — pass window dimensions as minimum so the swapchain
-    // is large enough for mono (2D) rendering at full window resolution.
-    if (!CreateSwapchains(xr, g_windowWidth, g_windowHeight)) {
+    // Create single swapchain at native display resolution
+    if (!CreateSwapchain(xr)) {
         LOG_ERROR("Swapchain creation failed");
         CleanupOpenXR(xr);
         if (hudOk) CleanupHudRenderer(hudRenderer);
@@ -685,14 +683,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return 1;
     }
 
-    // Enumerate D3D11 swapchain images (now done per-app since common is API-agnostic)
-    std::vector<XrSwapchainImageD3D11KHR> swapchainImages[2];
-    for (int eye = 0; eye < 2; eye++) {
-        uint32_t count = xr.swapchains[eye].imageCount;
-        swapchainImages[eye].resize(count, {XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR});
-        xrEnumerateSwapchainImages(xr.swapchains[eye].swapchain, count, &count,
-            (XrSwapchainImageBaseHeader*)swapchainImages[eye].data());
-        LOG_INFO("Eye %d: enumerated %u D3D11 swapchain images", eye, count);
+    // Enumerate D3D11 swapchain images
+    std::vector<XrSwapchainImageD3D11KHR> swapchainImages;
+    {
+        uint32_t count = xr.swapchain.imageCount;
+        swapchainImages.resize(count, {XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR});
+        xrEnumerateSwapchainImages(xr.swapchain.swapchain, count, &count,
+            (XrSwapchainImageBaseHeader*)swapchainImages.data());
+        LOG_INFO("Enumerated %u D3D11 swapchain images", count);
     }
 
     // Create HUD swapchain for window-space layer submission
@@ -714,23 +712,22 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
 
-    // Create depth buffers for each eye
-    ComPtr<ID3D11Texture2D> depthTextures[2];
-    ComPtr<ID3D11DepthStencilView> depthDSVs[2];
-
-    for (int eye = 0; eye < 2; eye++) {
+    // Create single depth buffer at full swapchain dimensions
+    ComPtr<ID3D11Texture2D> depthTexture;
+    ComPtr<ID3D11DepthStencilView> depthDSV;
+    {
         ID3D11Texture2D* depthTex = nullptr;
         ID3D11DepthStencilView* dsv = nullptr;
-        if (!CreateDepthStencilView(renderer, xr.swapchains[eye].width, xr.swapchains[eye].height, &depthTex, &dsv)) {
-            LOG_ERROR("Failed to create depth buffer for eye %d", eye);
+        if (!CreateDepthStencilView(renderer, xr.swapchain.width, xr.swapchain.height, &depthTex, &dsv)) {
+            LOG_ERROR("Failed to create depth buffer");
             CleanupOpenXR(xr);
             if (hudOk) CleanupHudRenderer(hudRenderer);
             CleanupD3D11(renderer);
             ShutdownLogging();
             return 1;
         }
-        depthTextures[eye].Attach(depthTex);
-        depthDSVs[eye].Attach(dsv);
+        depthTexture.Attach(depthTex);
+        depthDSV.Attach(dsv);
     }
 
     LOG_INFO("");
@@ -750,9 +747,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     rs.hudRenderer = &hudRenderer;
     rs.hudOk = hudOk;
     rs.hudSwapchainImages = &hudSwapchainImages;
-    rs.depthTextures = depthTextures;
-    rs.depthDSVs = depthDSVs;
-    rs.swapchainImages = swapchainImages;
+    rs.depthTexture = depthTexture;
+    rs.depthDSV = depthDSV;
+    rs.swapchainImages = &swapchainImages;
     rs.perfStats = &perfStats;
     g_renderState = &rs;
 
@@ -780,10 +777,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     LOG_INFO("");
     LOG_INFO("=== Shutting down ===");
 
-    for (int eye = 0; eye < 2; eye++) {
-        depthDSVs[eye].Reset();
-        depthTextures[eye].Reset();
-    }
+    depthDSV.Reset();
+    depthTexture.Reset();
 
     g_xr = nullptr;
     CleanupOpenXR(xr);

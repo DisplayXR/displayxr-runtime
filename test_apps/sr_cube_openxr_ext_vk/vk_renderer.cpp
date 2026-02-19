@@ -372,6 +372,20 @@ bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysicalDevic
             LOG_ERROR("Failed to create render pass");
             return false;
         }
+
+        // Create a second render pass with LOAD_OP_LOAD for SBS second-eye rendering.
+        // This preserves the first eye's content in the shared framebuffer.
+        colorAttach.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        colorAttach.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        depthAttach.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        depthAttach.initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        VkAttachmentDescription attachmentsLoad[] = {colorAttach, depthAttach};
+        rpInfo.pAttachments = attachmentsLoad;
+
+        if (vkCreateRenderPass(device, &rpInfo, nullptr, &renderer.renderPassLoad) != VK_SUCCESS) {
+            LOG_ERROR("Failed to create load render pass");
+            return false;
+        }
     }
 
     // Create pipeline layout with push constants
@@ -822,10 +836,12 @@ void UpdateScene(VkRenderer& renderer, float deltaTime) {
 void RenderScene(
     VkRenderer& renderer,
     int eye, uint32_t imageIndex,
+    uint32_t viewportX, uint32_t viewportY,
     uint32_t width, uint32_t height,
     const XMMATRIX& viewMatrix,
     const XMMATRIX& projMatrix,
-    float zoomScale)
+    float zoomScale,
+    bool clear)
 {
     VkDevice device = renderer.device;
 
@@ -850,8 +866,9 @@ void RenderScene(
 
     VkRenderPassBeginInfo rpBegin = {};
     rpBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-    rpBegin.renderPass = renderer.renderPass;
+    rpBegin.renderPass = clear ? renderer.renderPass : renderer.renderPassLoad;
     rpBegin.framebuffer = renderer.framebuffers[eye][imageIndex];
+    rpBegin.renderArea.offset = {(int32_t)viewportX, (int32_t)viewportY};
     rpBegin.renderArea.extent = {width, height};
     rpBegin.clearValueCount = 2;
     rpBegin.pClearValues = clearValues;
@@ -869,8 +886,8 @@ void RenderScene(
 
     // Set viewport with Y-flip (negative height) for correct NDC convention
     VkViewport viewport = {};
-    viewport.x = 0;
-    viewport.y = (float)height;
+    viewport.x = (float)viewportX;
+    viewport.y = (float)(viewportY + height);
     viewport.width = (float)width;
     viewport.height = -(float)height;
     viewport.minDepth = 0.0f;
@@ -878,6 +895,7 @@ void RenderScene(
     vkCmdSetViewport(renderer.commandBuffer, 0, 1, &viewport);
 
     VkRect2D scissor = {};
+    scissor.offset = {(int32_t)viewportX, (int32_t)viewportY};
     scissor.extent = {width, height};
     vkCmdSetScissor(renderer.commandBuffer, 0, 1, &scissor);
     LOG_INFO("[RenderScene] eye=%d: viewport+scissor set", eye);
@@ -1029,6 +1047,10 @@ void CleanupVkRenderer(VkRenderer& renderer) {
     if (renderer.pipelineLayout) {
         vkDestroyPipelineLayout(renderer.device, renderer.pipelineLayout, nullptr);
         renderer.pipelineLayout = VK_NULL_HANDLE;
+    }
+    if (renderer.renderPassLoad) {
+        vkDestroyRenderPass(renderer.device, renderer.renderPassLoad, nullptr);
+        renderer.renderPassLoad = VK_NULL_HANDLE;
     }
     if (renderer.renderPass) {
         vkDestroyRenderPass(renderer.device, renderer.renderPass, nullptr);

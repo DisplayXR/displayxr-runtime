@@ -153,9 +153,12 @@ bool InitializeOpenXR(XrSessionManager& xr) {
             xr.nominalViewerY = displayInfo.nominalViewerPositionInDisplaySpace.y;
             xr.nominalViewerZ = displayInfo.nominalViewerPositionInDisplaySpace.z;
             xr.supportsDisplayModeSwitch = (displayInfo.supportsDisplayModeSwitch == XR_TRUE);
-            LOG_INFO("Display info: scale=%.3fx%.3f, size=%.3fx%.3fm, nominal=(%.0f,%.0f,%.0f)mm, modeSwitch=%s",
+            xr.displayPixelWidth = displayInfo.displayPixelWidth;
+            xr.displayPixelHeight = displayInfo.displayPixelHeight;
+            LOG_INFO("Display info: scale=%.3fx%.3f, size=%.3fx%.3fm, pixels=%ux%u, nominal=(%.0f,%.0f,%.0f)mm, modeSwitch=%s",
                 xr.recommendedViewScaleX, xr.recommendedViewScaleY,
                 xr.displayWidthM, xr.displayHeightM,
+                xr.displayPixelWidth, xr.displayPixelHeight,
                 xr.nominalViewerX * 1000.0f, xr.nominalViewerY * 1000.0f, xr.nominalViewerZ * 1000.0f,
                 xr.supportsDisplayModeSwitch ? "YES" : "NO");
         }

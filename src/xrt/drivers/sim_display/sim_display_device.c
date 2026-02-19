@@ -137,6 +137,10 @@ struct sim_display_hmd
 	float display_width_m;
 	float display_height_m;
 
+	//! Native display panel resolution in pixels.
+	uint32_t display_pixel_width;
+	uint32_t display_pixel_height;
+
 	//! Nominal viewer distance in meters.
 	float nominal_z_m;
 
@@ -247,6 +251,8 @@ sim_display_get_display_info(struct xrt_device *xdev, struct sim_display_info *o
 	out_info->display_height_m = hmd->display_height_m;
 	out_info->nominal_y_m = hmd->pose.position.y;
 	out_info->nominal_z_m = hmd->nominal_z_m;
+	out_info->display_pixel_width = hmd->display_pixel_width;
+	out_info->display_pixel_height = hmd->display_pixel_height;
 	return true;
 }
 
@@ -299,6 +305,8 @@ sim_display_hmd_create(void)
 	// Store config.
 	hmd->display_width_m = display_w_m;
 	hmd->display_height_m = display_h_m;
+	hmd->display_pixel_width = (uint32_t)pixel_w;
+	hmd->display_pixel_height = (uint32_t)pixel_h;
 	hmd->nominal_z_m = nominal_z;
 	hmd->log_level = U_LOGGING_INFO;
 

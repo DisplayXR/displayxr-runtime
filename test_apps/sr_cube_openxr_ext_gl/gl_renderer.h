@@ -26,10 +26,10 @@ struct GLRenderer {
     GLuint gridVBO = 0;
     int gridVertexCount = 0;
 
-    // Per-eye FBOs and depth renderbuffers
-    // Indexed as: fbos[eye][imageIndex]
-    std::vector<GLuint> fbos[2];
-    GLuint depthRBOs[2] = {0, 0};
+    // Single set of FBOs and depth renderbuffer (SBS swapchain)
+    // Indexed as: fbos[imageIndex]
+    std::vector<GLuint> fbos;
+    GLuint depthRBO = 0;
 
     // Scene state
     float cubeRotation = 0.0f;
@@ -38,18 +38,19 @@ struct GLRenderer {
 // Initialize OpenGL renderer (create shaders, geometry)
 bool InitializeGLRenderer(GLRenderer& renderer);
 
-// Create FBOs for swapchain images
-bool CreateSwapchainFBOs(GLRenderer& renderer, int eye,
+// Create FBOs for swapchain images (single SBS swapchain)
+bool CreateSwapchainFBOs(GLRenderer& renderer,
     const GLuint* images, uint32_t count,
     uint32_t width, uint32_t height);
 
 // Update scene
 void UpdateScene(GLRenderer& renderer, float deltaTime);
 
-// Render to a specific FBO
+// Render to a specific FBO with viewport offset (SBS layout)
 void RenderScene(
     GLRenderer& renderer,
-    int eye, uint32_t imageIndex,
+    uint32_t imageIndex,
+    uint32_t viewportX, uint32_t viewportY,
     uint32_t width, uint32_t height,
     const DirectX::XMMATRIX& viewMatrix,
     const DirectX::XMMATRIX& projMatrix,

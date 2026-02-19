@@ -49,8 +49,8 @@ struct D3D12Renderer {
     UINT rtvDescriptorSize = 0;
     UINT rtvCount = 0;
 
-    // Depth buffers (one per eye)
-    ComPtr<ID3D12Resource> depthBuffers[2];
+    // Depth buffer (single for SBS swapchain)
+    ComPtr<ID3D12Resource> depthBuffer;
     ComPtr<ID3D12DescriptorHeap> dsvHeap;
     UINT dsvDescriptorSize = 0;
 
@@ -77,7 +77,7 @@ bool InitializeD3D12WithLUID(D3D12Renderer& renderer, LUID adapterLuid);
 // Create render target views for swapchain images.
 // format: the typed DXGI format for RTVs (resources may be typeless).
 bool CreateSwapchainRTVs(D3D12Renderer& renderer,
-    ID3D12Resource** textures, uint32_t count, int eye,
+    ID3D12Resource** textures, uint32_t count,
     uint32_t width, uint32_t height,
     DXGI_FORMAT format);
 
@@ -89,11 +89,12 @@ void RenderScene(
     D3D12Renderer& renderer,
     ID3D12Resource* renderTarget,
     int rtvIndex,
-    int eye,
+    uint32_t viewportX, uint32_t viewportY,
     uint32_t width, uint32_t height,
     const DirectX::XMMATRIX& viewMatrix,
     const DirectX::XMMATRIX& projMatrix,
-    float zoomScale = 1.0f
+    float zoomScale = 1.0f,
+    bool clear = true
 );
 
 // Wait for GPU to finish

@@ -1043,6 +1043,8 @@ composite_layers_to_intermediate(struct multi_compositor *mc,
 		                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 4, pre);
 
 		// Blit shared images into preblit copies (same size, NEAREST filter, no Y-flip)
+		// TODO: For single-swapchain SBS apps, per-eye source offsets should be used
+		// here (currently assumes offset 0 which is correct for two-swapchain apps).
 		for (int eye = 0; eye < 2; eye++) {
 			VkImageBlit region = {
 			    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, shared_layers[eye], 1},
@@ -1662,6 +1664,9 @@ ensure_session_flip_images(struct multi_compositor *mc, struct vk_bundle *vk, in
  *
  * @param flip_y If true, flip Y axis during blit (needed for GL textures which are Y-up).
  *               If false, copy without flip (for VK textures which are already Y-down).
+ * @param left_offset_x/y  Source pixel offset for left eye (imageRect.offset)
+ * @param right_offset_x/y Source pixel offset for right eye (imageRect.offset)
+ * @param same_image        True when left_src == right_src (single-swapchain SBS)
  */
 static void
 session_blit_sbs(struct vk_bundle *vk,
@@ -1673,9 +1678,16 @@ session_blit_sbs(struct vk_bundle *vk,
                  VkImage sbs_dst,
                  int eye_width,
                  int eye_height,
-                 bool flip_y)
+                 bool flip_y,
+                 int left_offset_x,
+                 int left_offset_y,
+                 int right_offset_x,
+                 int right_offset_y,
+                 bool same_image)
 {
 	// Pre-barriers: sources GENERAL->TRANSFER_SRC, SBS dest UNDEFINED->TRANSFER_DST
+	// When same_image, deduplicate source barrier (2 barriers instead of 3).
+	uint32_t pre_count = same_image ? 2 : 3;
 	VkImageMemoryBarrier pre_barriers[3] = {
 	    {
 	        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -1689,15 +1701,6 @@ session_blit_sbs(struct vk_bundle *vk,
 	    {
 	        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
 	        .srcAccessMask = 0,
-	        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-	        .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
-	        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-	        .image = right_src,
-	        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, right_array_index, 1},
-	    },
-	    {
-	        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-	        .srcAccessMask = 0,
 	        .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
 	        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
 	        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -1705,17 +1708,32 @@ session_blit_sbs(struct vk_bundle *vk,
 	        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
 	    },
 	};
+	if (!same_image) {
+		// Insert right source barrier at index 1, shift dst to index 2
+		pre_barriers[2] = pre_barriers[1];
+		pre_barriers[1] = (VkImageMemoryBarrier){
+		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		    .srcAccessMask = 0,
+		    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+		    .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+		    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		    .image = right_src,
+		    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, right_array_index, 1},
+		};
+	}
 	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL,
-	                         0, NULL, 3, pre_barriers);
+	                         0, NULL, pre_count, pre_barriers);
 
 	// Blit left eye into left half of SBS image [0, eye_width]
 	// When flip_y: src Y is inverted (GL Y-up -> VK Y-down)
-	int src_top = flip_y ? eye_height : 0;
-	int src_bot = flip_y ? 0 : eye_height;
+	int left_src_top = left_offset_y + (flip_y ? eye_height : 0);
+	int left_src_bot = left_offset_y + (flip_y ? 0 : eye_height);
+	int right_src_top = right_offset_y + (flip_y ? eye_height : 0);
+	int right_src_bot = right_offset_y + (flip_y ? 0 : eye_height);
 
 	VkImageBlit left_blit = {
 	    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, left_array_index, 1},
-	    .srcOffsets = {{0, src_top, 0}, {eye_width, src_bot, 1}},
+	    .srcOffsets = {{left_offset_x, left_src_top, 0}, {left_offset_x + eye_width, left_src_bot, 1}},
 	    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
 	    .dstOffsets = {{0, 0, 0}, {eye_width, eye_height, 1}},
 	};
@@ -1725,7 +1743,7 @@ session_blit_sbs(struct vk_bundle *vk,
 	// Blit right eye into right half of SBS image [eye_width, 2*eye_width]
 	VkImageBlit right_blit = {
 	    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, right_array_index, 1},
-	    .srcOffsets = {{0, src_top, 0}, {eye_width, src_bot, 1}},
+	    .srcOffsets = {{right_offset_x, right_src_top, 0}, {right_offset_x + eye_width, right_src_bot, 1}},
 	    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
 	    .dstOffsets = {{eye_width, 0, 0}, {eye_width * 2, eye_height, 1}},
 	};
@@ -1733,6 +1751,7 @@ session_blit_sbs(struct vk_bundle *vk,
 	                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &right_blit, VK_FILTER_NEAREST);
 
 	// Post-barriers: sources TRANSFER_SRC->GENERAL, SBS dest TRANSFER_DST->SHADER_READ_ONLY
+	uint32_t post_count = same_image ? 2 : 3;
 	VkImageMemoryBarrier post_barriers[3] = {
 	    {
 	        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -1745,15 +1764,6 @@ session_blit_sbs(struct vk_bundle *vk,
 	    },
 	    {
 	        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-	        .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-	        .dstAccessMask = 0,
-	        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-	        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-	        .image = right_src,
-	        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, right_array_index, 1},
-	    },
-	    {
-	        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
 	        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
 	        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
 	        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -1762,8 +1772,20 @@ session_blit_sbs(struct vk_bundle *vk,
 	        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
 	    },
 	};
+	if (!same_image) {
+		post_barriers[2] = post_barriers[1];
+		post_barriers[1] = (VkImageMemoryBarrier){
+		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		    .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+		    .dstAccessMask = 0,
+		    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		    .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+		    .image = right_src,
+		    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, right_array_index, 1},
+		};
+	}
 	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
-	                         NULL, 0, NULL, 3, post_barriers);
+	                         NULL, 0, NULL, post_count, post_barriers);
 }
 #endif // XRT_HAVE_LEIA_SR_VULKAN
 
@@ -1858,6 +1880,21 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 		return;
 	}
 
+	// Extract source sub-region offsets from projection views.
+	// For two-swapchain apps, offsets are (0,0). For single-swapchain SBS apps,
+	// the right eye has offset (renderW, 0) to select the right half.
+	int leftOffsetX = layer->data.proj.v[0].sub.rect.offset.w;
+	int leftOffsetY = layer->data.proj.v[0].sub.rect.offset.h;
+	int rightOffsetX = 0, rightOffsetY = 0;
+	if (!is_mono) {
+		rightOffsetX = layer->data.proj.v[1].sub.rect.offset.w;
+		rightOffsetY = layer->data.proj.v[1].sub.rect.offset.h;
+	}
+
+	// Detect single-swapchain SBS layout: both eyes reference the same VkImage
+	bool same_swapchain = (!is_mono && leftImage == rightImage &&
+	                       leftArrayIndex == rightArrayIndex);
+
 	// Wait for pending fence if exists (from previous frame using same buffer)
 	if (mc->session_render.fenced_buffer >= 0) {
 		VkResult fence_ret = vk->vkWaitForFences(vk->device, 1,
@@ -1950,8 +1987,8 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 	// light-field interlacing (weaving).
 	if (is_mono) {
 		bool flip_y = layer->data.flip_y;
-		int src_top = flip_y ? imageHeight : 0;
-		int src_bot = flip_y ? 0 : imageHeight;
+		int src_top = leftOffsetY + (flip_y ? imageHeight : 0);
+		int src_bot = leftOffsetY + (flip_y ? 0 : imageHeight);
 
 		// Pre-barriers: source GENERAL → TRANSFER_SRC, target UNDEFINED → TRANSFER_DST
 		VkImageMemoryBarrier mono_pre[2] = {
@@ -1980,7 +2017,7 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 		// Blit mono view to fill entire target
 		VkImageBlit mono_blit = {
 		    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, leftArrayIndex, 1},
-		    .srcOffsets = {{0, src_top, 0}, {imageWidth, src_bot, 1}},
+		    .srcOffsets = {{leftOffsetX, src_top, 0}, {leftOffsetX + imageWidth, src_bot, 1}},
 		    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
 		    .dstOffsets = {{0, 0, 0}, {(int32_t)framebufferWidth, (int32_t)framebufferHeight, 1}},
 		};
@@ -2058,10 +2095,14 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 		}
 
 		bool flip_y = layer->data.flip_y;
-		int src_top = flip_y ? imageHeight : 0;
-		int src_bot = flip_y ? 0 : imageHeight;
+		int left_src_top = leftOffsetY + (flip_y ? imageHeight : 0);
+		int left_src_bot = leftOffsetY + (flip_y ? 0 : imageHeight);
+		int right_src_top = rightOffsetY + (flip_y ? imageHeight : 0);
+		int right_src_bot = rightOffsetY + (flip_y ? 0 : imageHeight);
 
 		// Pre-barriers: sources GENERAL → TRANSFER_SRC, crop images UNDEFINED → TRANSFER_DST
+		// When same_swapchain, left and right are the same VkImage — use 3 barriers instead of 4.
+		uint32_t pre_barrier_count = same_swapchain ? 3 : 4;
 		VkImageMemoryBarrier pre_barriers[4] = {
 		    {
 		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -2075,15 +2116,6 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 		    {
 		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
 		        .srcAccessMask = 0,
-		        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-		        .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
-		        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-		        .image = rightImage,
-		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, rightArrayIndex, 1},
-		    },
-		    {
-		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		        .srcAccessMask = 0,
 		        .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
 		        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
 		        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -2100,13 +2132,28 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
 		    },
 		};
+		// When not same_swapchain, insert right-eye source barrier at index 1 and shift crop barriers
+		if (!same_swapchain) {
+			pre_barriers[3] = pre_barriers[2];
+			pre_barriers[2] = pre_barriers[1];
+			pre_barriers[1] = (VkImageMemoryBarrier){
+			    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+			    .srcAccessMask = 0,
+			    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+			    .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+			    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+			    .image = rightImage,
+			    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, rightArrayIndex, 1},
+			};
+		}
 		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-		                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 4, pre_barriers);
+		                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL,
+		                         pre_barrier_count, pre_barriers);
 
 		// Blit left eye: source sub-region → crop image (with optional Y-flip)
 		VkImageBlit left_blit = {
 		    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, leftArrayIndex, 1},
-		    .srcOffsets = {{0, src_top, 0}, {imageWidth, src_bot, 1}},
+		    .srcOffsets = {{leftOffsetX, left_src_top, 0}, {leftOffsetX + imageWidth, left_src_bot, 1}},
 		    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
 		    .dstOffsets = {{0, 0, 0}, {imageWidth, imageHeight, 1}},
 		};
@@ -2117,7 +2164,7 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 		// Blit right eye
 		VkImageBlit right_blit = {
 		    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, rightArrayIndex, 1},
-		    .srcOffsets = {{0, src_top, 0}, {imageWidth, src_bot, 1}},
+		    .srcOffsets = {{rightOffsetX, right_src_top, 0}, {rightOffsetX + imageWidth, right_src_bot, 1}},
 		    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
 		    .dstOffsets = {{0, 0, 0}, {imageWidth, imageHeight, 1}},
 		};
@@ -2126,6 +2173,8 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 		                   1, &right_blit, VK_FILTER_NEAREST);
 
 		// Post-barriers: sources → GENERAL, crop images → SHADER_READ_ONLY
+		// When same_swapchain, deduplicate the source barrier (3 instead of 4).
+		uint32_t post_barrier_count = same_swapchain ? 3 : 4;
 		VkImageMemoryBarrier post_barriers[4] = {
 		    {
 		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -2138,15 +2187,6 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 		    },
 		    {
 		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		        .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-		        .dstAccessMask = 0,
-		        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-		        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-		        .image = rightImage,
-		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, rightArrayIndex, 1},
-		    },
-		    {
-		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
 		        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
 		        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
 		        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -2164,9 +2204,23 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
 		    },
 		};
+		if (!same_swapchain) {
+			// Insert right-eye source restore barrier at index 1, shift crop barriers
+			post_barriers[3] = post_barriers[2];
+			post_barriers[2] = post_barriers[1];
+			post_barriers[1] = (VkImageMemoryBarrier){
+			    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+			    .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+			    .dstAccessMask = 0,
+			    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+			    .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+			    .image = rightImage,
+			    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, rightArrayIndex, 1},
+			};
+		}
 		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
 		                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-		                         0, 0, NULL, 0, NULL, 4, post_barriers);
+		                         0, 0, NULL, 0, NULL, post_barrier_count, post_barriers);
 
 		// Pass cropped views to display processor (UVs 0..1 now cover only valid content)
 		xrt_display_processor_process_views(
@@ -2195,6 +2249,10 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 		int weaveHeight = imageHeight;
 
 		bool blit_flip_y = layer->data.flip_y;
+		int blit_left_off_x = leftOffsetX, blit_left_off_y = leftOffsetY;
+		int blit_right_off_x = rightOffsetX, blit_right_off_y = rightOffsetY;
+		bool blit_same_image = same_swapchain;
+
 		// If window-space overlay layers are present, composite all layers into
 		// intermediate per-eye images first, then use those for the SBS blit.
 		if (has_window_space_layers(mc)) {
@@ -2205,6 +2263,10 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 				leftArrayIndex = 0;
 				rightArrayIndex = 0;
 				blit_flip_y = false;
+				// Composite images are always separate, offsets reset to 0
+				blit_left_off_x = blit_left_off_y = 0;
+				blit_right_off_x = blit_right_off_y = 0;
+				blit_same_image = false;
 
 				VkImageMemoryBarrier readToGeneral[2];
 				for (int e = 0; e < 2; e++) {
@@ -2225,10 +2287,28 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 			}
 		}
 
-		// Blit into SBS image for the weaver
-		if (ensure_session_flip_images(mc, vk, imageWidth, imageHeight, imageFormat)) {
+		// Same-swapchain direct SBS path: skip blit when the app's swapchain
+		// already contains SBS layout and no Y-flip is needed.
+		if (same_swapchain && !blit_flip_y && !has_window_space_layers(mc)) {
+			// The app's image is already SBS — pass directly to weaver.
+			// Image is in GENERAL layout which supports shader reads.
+			weaveLeft = leftImageView;
+			weaveRight = VK_NULL_HANDLE;
+			weaveWidth = rightOffsetX + imageWidth; // full SBS width
+			weaveHeight = imageHeight;
+
+			static bool direct_sbs_logged = false;
+			if (!direct_sbs_logged) {
+				U_LOG_W("[per-session] Direct SBS: skipping blit, weave input %dx%d",
+				        weaveWidth, weaveHeight);
+				direct_sbs_logged = true;
+			}
+		} else if (ensure_session_flip_images(mc, vk, imageWidth, imageHeight, imageFormat)) {
+			// Blit into SBS image for the weaver (handles Y-flip and separate sources)
 			session_blit_sbs(vk, cmd, leftImage, leftArrayIndex, rightImage, rightArrayIndex,
-			                 mc->session_render.flip_sbs_image, imageWidth, imageHeight, blit_flip_y);
+			                 mc->session_render.flip_sbs_image, imageWidth, imageHeight,
+			                 blit_flip_y, blit_left_off_x, blit_left_off_y,
+			                 blit_right_off_x, blit_right_off_y, blit_same_image);
 			weaveLeft = mc->session_render.flip_sbs_view;
 			weaveRight = VK_NULL_HANDLE;
 			weaveWidth = imageWidth * 2;

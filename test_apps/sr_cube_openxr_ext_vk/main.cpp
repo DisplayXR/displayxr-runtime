@@ -198,7 +198,6 @@ static void RenderThreadFunc(
     HWND hwnd,
     XrSessionManager* xr,
     VkRenderer* renderer,
-    std::vector<XrSwapchainImageVulkanKHR>* swapchainImages,
     HudRenderer* hud,
     uint32_t hudWidth,
     uint32_t hudHeight,
@@ -291,11 +290,9 @@ static void RenderThreadFunc(
                         xr->rightEyeY = rawViews[1].pose.position.y;
                         xr->rightEyeZ = rawViews[1].pose.position.z;
 
-                        // Compute render dims from window size and display scale factors
-                        uint32_t renderW = (uint32_t)(windowW * xr->recommendedViewScaleX);
-                        uint32_t renderH = (uint32_t)(windowH * xr->recommendedViewScaleY);
-                        if (renderW > xr->swapchains[0].width) renderW = xr->swapchains[0].width;
-                        if (renderH > xr->swapchains[0].height) renderH = xr->swapchains[0].height;
+                        // Fixed SBS dimensions: each eye gets half the swapchain width
+                        uint32_t eyeRenderW = xr->swapchain.width / 2;
+                        uint32_t eyeRenderH = xr->swapchain.height;
 
                         // --- App-side Kooima projection (RAW mode, app-owned camera model) ---
                         XrFovf appFov[2];
@@ -304,8 +301,8 @@ static void RenderThreadFunc(
                             // Viewport-scale FOV (SRHydra): convert window pixels to meters,
                             // then apply isotropic scale so FOV stays consistent across window
                             // sizes on the 3D display. Matches the non-extension runtime path.
-                            float pxSizeX = xr->displayWidthM / (float)xr->swapchains[0].width;
-                            float pxSizeY = xr->displayHeightM / (float)xr->swapchains[0].height;
+                            float pxSizeX = xr->displayWidthM / (float)xr->swapchain.width;
+                            float pxSizeY = xr->displayHeightM / (float)xr->swapchain.height;
                             float winW_m = (float)windowW * pxSizeX;
                             float winH_m = (float)windowH * pxSizeY;
                             float minDisp = fminf(xr->displayWidthM, xr->displayHeightM);
@@ -316,8 +313,8 @@ static void RenderThreadFunc(
 
                             // Alternative: content-preserving FOV — keeps rendered content at
                             // constant physical size on display regardless of window size.
-                            // float screenWidthM = xr->displayWidthM * (float)renderW / (float)xr->swapchains[0].width;
-                            // float screenHeightM = xr->displayHeightM * (float)renderH / (float)xr->swapchains[0].height;
+                            // float screenWidthM = xr->displayWidthM * (float)eyeRenderW / (float)(xr->swapchain.width / 2);
+                            // float screenHeightM = xr->displayHeightM * (float)eyeRenderH / (float)xr->swapchain.height;
 
                             // Display-center zoom: scale eye positions and screen size by
                             // 1/zoomScale. These cancel in Kooima (same ratio), but are kept
@@ -340,44 +337,44 @@ static void RenderThreadFunc(
                         }
 
                         rendered = true;
-                        for (int eye = 0; eye < 2; eye++) {
-                            uint32_t imageIndex;
-                            LOG_INFO("[FRAME] Eye %d: AcquireSwapchainImage...", eye);
-                            if (AcquireSwapchainImage(*xr, eye, imageIndex)) {
-                                LOG_INFO("[FRAME] Eye %d: Acquired image %u", eye, imageIndex);
+                        uint32_t imageIndex;
+                        LOG_INFO("[FRAME] AcquireSwapchainImage...");
+                        if (AcquireSwapchainImage(*xr, imageIndex)) {
+                            LOG_INFO("[FRAME] Acquired image %u", imageIndex);
+                            for (int eye = 0; eye < 2; eye++) {
                                 XMMATRIX viewMatrix = (eye == 0) ? leftViewMatrix : rightViewMatrix;
                                 XMMATRIX projMatrix = (eye == 0) ? leftProjMatrix : rightProjMatrix;
 
                                 LOG_INFO("[FRAME] Eye %d: RenderScene...", eye);
-                                RenderScene(*renderer, eye, imageIndex,
-                                    renderW, renderH,
+                                RenderScene(*renderer, 0, imageIndex,
+                                    eye * eyeRenderW, 0, eyeRenderW, eyeRenderH,
                                     viewMatrix, projMatrix,
-                                    useAppProjection ? 1.0f : inputSnapshot.zoomScale);
+                                    useAppProjection ? 1.0f : inputSnapshot.zoomScale,
+                                    eye == 0);
                                 LOG_INFO("[FRAME] Eye %d: RenderScene done", eye);
 
-                                LOG_INFO("[FRAME] Eye %d: ReleaseSwapchainImage...", eye);
-                                ReleaseSwapchainImage(*xr, eye);
-                                LOG_INFO("[FRAME] Eye %d: Released", eye);
-
                                 projectionViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
-                                projectionViews[eye].subImage.swapchain = xr->swapchains[eye].swapchain;
-                                projectionViews[eye].subImage.imageRect.offset = {0, 0};
+                                projectionViews[eye].subImage.swapchain = xr->swapchain.swapchain;
+                                projectionViews[eye].subImage.imageRect.offset = {(int32_t)(eye * eyeRenderW), 0};
                                 projectionViews[eye].subImage.imageRect.extent = {
-                                    (int32_t)renderW,
-                                    (int32_t)renderH
+                                    (int32_t)eyeRenderW,
+                                    (int32_t)eyeRenderH
                                 };
                                 projectionViews[eye].subImage.imageArrayIndex = 0;
                                 projectionViews[eye].pose = rawViews[eye].pose;
                                 // Always submit runtime's raw FOV for compositing.
                                 // The Vulkan compositor re-projects layers from submitted FOV
-                                // → display distortion FOV. Submitting the runtime FOV (which
+                                // -> display distortion FOV. Submitting the runtime FOV (which
                                 // matches the distortion target) makes this a no-op, so the
                                 // app's Kooima rendering directly controls output size.
                                 projectionViews[eye].fov = rawViews[eye].fov;
-                            } else {
-                                LOG_WARN("[FRAME] Eye %d: AcquireSwapchainImage FAILED", eye);
-                                rendered = false;
                             }
+                            LOG_INFO("[FRAME] ReleaseSwapchainImage...");
+                            ReleaseSwapchainImage(*xr);
+                            LOG_INFO("[FRAME] Released");
+                        } else {
+                            LOG_WARN("[FRAME] AcquireSwapchainImage FAILED");
+                            rendered = false;
                         }
 
                         // Render HUD to window-space layer swapchain
@@ -392,7 +389,7 @@ static void RenderThreadFunc(
                                     L"XR_EXT_win32_window_binding: ACTIVE (Vulkan)" :
                                     L"XR_EXT_win32_window_binding: NOT AVAILABLE (Vulkan)";
                                 std::wstring perfText = FormatPerformanceInfo(perfStats.fps, perfStats.frameTimeMs,
-                                    renderW, renderH,
+                                    eyeRenderW, eyeRenderH,
                                     windowW, windowH);
                                 std::wstring dispText = FormatDisplayInfo(xr->displayWidthM, xr->displayHeightM,
                                     xr->nominalViewerX, xr->nominalViewerY, xr->nominalViewerZ);
@@ -669,7 +666,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return 1;
     }
 
-    if (!CreateSwapchains(xr)) {
+    if (!CreateSwapchain(xr)) {
         LOG_ERROR("Swapchain creation failed");
         CleanupOpenXR(xr);
         vkDestroyDevice(vkDevice, nullptr);
@@ -678,18 +675,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return 1;
     }
 
-    // Enumerate Vulkan swapchain images
-    std::vector<XrSwapchainImageVulkanKHR> swapchainImages[2];
-    for (int eye = 0; eye < 2; eye++) {
-        uint32_t count = xr.swapchains[eye].imageCount;
-        swapchainImages[eye].resize(count, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
-        xrEnumerateSwapchainImages(xr.swapchains[eye].swapchain, count, &count,
-            (XrSwapchainImageBaseHeader*)swapchainImages[eye].data());
-        LOG_INFO("Eye %d: enumerated %u Vulkan swapchain images", eye, count);
+    // Enumerate Vulkan swapchain images (single SBS swapchain)
+    std::vector<XrSwapchainImageVulkanKHR> swapchainImages;
+    {
+        uint32_t count = xr.swapchain.imageCount;
+        swapchainImages.resize(count, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
+        xrEnumerateSwapchainImages(xr.swapchain.swapchain, count, &count,
+            (XrSwapchainImageBaseHeader*)swapchainImages.data());
+        LOG_INFO("Enumerated %u Vulkan swapchain images", count);
     }
 
     // Initialize Vulkan renderer
-    VkFormat colorFormat = (VkFormat)xr.swapchains[0].format;
+    VkFormat colorFormat = (VkFormat)xr.swapchain.format;
     VkRenderer vkRenderer = {};
     if (!InitializeVkRenderer(vkRenderer, vkDevice, physDevice, graphicsQueue, queueFamilyIndex, colorFormat)) {
         LOG_ERROR("Vulkan renderer initialization failed");
@@ -700,17 +697,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         return 1;
     }
 
-    // Create framebuffers for swapchain images
-    for (int eye = 0; eye < 2; eye++) {
-        uint32_t count = xr.swapchains[eye].imageCount;
+    // Create framebuffers for swapchain images (single SBS swapchain, eye=0 slot)
+    {
+        uint32_t count = xr.swapchain.imageCount;
         std::vector<VkImage> images(count);
         for (uint32_t i = 0; i < count; i++) {
-            images[i] = swapchainImages[eye][i].image;
+            images[i] = swapchainImages[i].image;
         }
 
-        if (!CreateSwapchainFramebuffers(vkRenderer, eye, images.data(), count,
-            xr.swapchains[eye].width, xr.swapchains[eye].height, colorFormat)) {
-            LOG_ERROR("Failed to create framebuffers for eye %d", eye);
+        if (!CreateSwapchainFramebuffers(vkRenderer, 0, images.data(), count,
+            xr.swapchain.width, xr.swapchain.height, colorFormat)) {
+            LOG_ERROR("Failed to create framebuffers");
             CleanupVkRenderer(vkRenderer);
             CleanupOpenXR(xr);
             vkDestroyDevice(vkDevice, nullptr);
@@ -721,8 +718,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     }
 
     // Initialize HUD renderer for window-space layer overlay
-    uint32_t hudWidth = (uint32_t)(xr.swapchains[0].width * HUD_WIDTH_FRACTION);
-    uint32_t hudHeight = (uint32_t)(xr.swapchains[0].height * HUD_HEIGHT_FRACTION);
+    uint32_t hudWidth = (uint32_t)(xr.swapchain.width * HUD_WIDTH_FRACTION);
+    uint32_t hudHeight = (uint32_t)(xr.swapchain.height * HUD_HEIGHT_FRACTION);
 
     HudRenderer hudRenderer = {};
     bool hudOk = InitializeHudRenderer(hudRenderer, hudWidth, hudHeight);
@@ -818,7 +815,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     LOG_INFO("Controls: WASD=Fly, QE=Up/Down, Mouse=Look, Space/DblClick=Reset, TAB=HUD, F11=Fullscreen, ESC=Quit");
     LOG_INFO("");
 
-    std::thread renderThread(RenderThreadFunc, hwnd, &xr, &vkRenderer, swapchainImages,
+    std::thread renderThread(RenderThreadFunc, hwnd, &xr, &vkRenderer,
         hudOk ? &hudRenderer : nullptr, hudWidth, hudHeight,
         hudStagingBuffer, hudStagingMapped, hudCmdPool,
         hudOk ? &hudSwapImages : nullptr);
