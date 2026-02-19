@@ -1953,12 +1953,12 @@ session_render_hud_overlay(struct multi_compositor *mc,
 	if (mc->session_render.weaver != NULL) {
 		struct leiasr_eye_pair eyes;
 		if (leiasr_get_predicted_eye_positions(mc->session_render.weaver, &eyes) && eyes.valid) {
-			left_x = eyes.left[0] * 1000.0f;
-			left_y = eyes.left[1] * 1000.0f;
-			left_z = eyes.left[2] * 1000.0f;
-			right_x = eyes.right[0] * 1000.0f;
-			right_y = eyes.right[1] * 1000.0f;
-			right_z = eyes.right[2] * 1000.0f;
+			left_x = eyes.left.x * 1000.0f;
+			left_y = eyes.left.y * 1000.0f;
+			left_z = eyes.left.z * 1000.0f;
+			right_x = eyes.right.x * 1000.0f;
+			right_y = eyes.right.y * 1000.0f;
+			right_z = eyes.right.z * 1000.0f;
 			tracking_active = true;
 		}
 
