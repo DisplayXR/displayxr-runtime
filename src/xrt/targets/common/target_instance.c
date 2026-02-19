@@ -261,15 +261,24 @@ out:
 				xsysc->info.nominal_viewer_x_m = 0.0f;
 				xsysc->info.nominal_viewer_y_m = sd_info.nominal_y_m;
 				xsysc->info.nominal_viewer_z_m = sd_info.nominal_z_m;
-				xsysc->info.recommended_view_scale_x = 0.5f;
-				xsysc->info.recommended_view_scale_y = 1.0f;
+				// Scale depends on output mode:
+				// SBS: 0.5x1.0 (half width, full height)
+				// Anaglyph/Blend: 0.5x0.5 (half resolution in both axes)
+				enum sim_display_output_mode sd_mode = sim_display_get_output_mode();
+				float sd_scale_x = 0.5f;
+				float sd_scale_y = (sd_mode == SIM_DISPLAY_OUTPUT_SBS) ? 1.0f : 0.5f;
+				xsysc->info.recommended_view_scale_x = sd_scale_x;
+				xsysc->info.recommended_view_scale_y = sd_scale_y;
 				xsysc->info.supports_display_mode_switch = true;
 				xsysc->info.display_pixel_width = sd_info.display_pixel_width;
 				xsysc->info.display_pixel_height = sd_info.display_pixel_height;
 				U_LOG_W("XR_EXT_display_info (sim_display): display=%.3fx%.3f m, "
-				        "nominal=(0, %.3f, %.3f) m, scale=0.5x1.0, pixels=%ux%u",
+				        "nominal=(0, %.3f, %.3f) m, scale=%.1fx%.1f (%s), pixels=%ux%u",
 				        sd_info.display_width_m, sd_info.display_height_m,
 				        sd_info.nominal_y_m, sd_info.nominal_z_m,
+				        sd_scale_x, sd_scale_y,
+				        sd_mode == SIM_DISPLAY_OUTPUT_SBS ? "SBS" :
+				        sd_mode == SIM_DISPLAY_OUTPUT_ANAGLYPH ? "Anaglyph" : "Blend",
 				        sd_info.display_pixel_width, sd_info.display_pixel_height);
 			}
 		}

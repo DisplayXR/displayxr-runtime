@@ -266,6 +266,20 @@ sim_display_get_display_info(struct xrt_device *xdev, struct sim_display_info *o
 struct xrt_device *
 sim_display_hmd_create(void)
 {
+	// Parse output mode from env var early so it's available when
+	// target_instance.c queries sim_display_get_output_mode() for scale values.
+	{
+		const char *mode_str = getenv("SIM_DISPLAY_OUTPUT");
+		if (mode_str) {
+			if (strcmp(mode_str, "anaglyph") == 0)
+				sim_display_set_output_mode(SIM_DISPLAY_OUTPUT_ANAGLYPH);
+			else if (strcmp(mode_str, "blend") == 0)
+				sim_display_set_output_mode(SIM_DISPLAY_OUTPUT_BLEND);
+			else
+				sim_display_set_output_mode(SIM_DISPLAY_OUTPUT_SBS);
+		}
+	}
+
 	// Read configuration from environment (used as defaults / overrides).
 	float display_w_m = debug_get_float_option_sim_display_width_m();
 	float display_h_m = debug_get_float_option_sim_display_height_m();
@@ -284,11 +298,17 @@ sim_display_hmd_create(void)
 			display_h_m = (float)screen_mm.height / 1000.0f;
 		}
 
-		uint32_t cg_w = CGDisplayPixelsWide(main_display);
-		uint32_t cg_h = CGDisplayPixelsHigh(main_display);
-		if (cg_w > 0 && cg_h > 0) {
-			pixel_w = (int)cg_w;
-			pixel_h = (int)cg_h;
+		// Use backing pixel dimensions (not logical points) so that
+		// swapchain size matches NSView backing pixels on Retina displays.
+		CGDisplayModeRef mode = CGDisplayCopyDisplayMode(main_display);
+		if (mode) {
+			uint32_t cg_w = (uint32_t)CGDisplayModeGetPixelWidth(mode);
+			uint32_t cg_h = (uint32_t)CGDisplayModeGetPixelHeight(mode);
+			CGDisplayModeRelease(mode);
+			if (cg_w > 0 && cg_h > 0) {
+				pixel_w = (int)cg_w;
+				pixel_h = (int)cg_h;
+			}
 		}
 	}
 #endif

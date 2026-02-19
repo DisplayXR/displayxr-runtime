@@ -648,24 +648,26 @@ bool CreateViewTexture(VulkanState& vk, uint32_t singleEyeWidth, uint32_t single
 // ============================================================================
 
 bool CreateSceneRenderPass(VulkanState& vk) {
+    // Single render pass with CLEAR — both eyes rendered via viewport/scissor changes.
+    // No need for separate explicit clears or per-eye render passes.
     VkAttachmentDescription colorAttach = {};
     colorAttach.format = vk.swapchainFormat;
     colorAttach.samples = VK_SAMPLE_COUNT_1_BIT;
-    colorAttach.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    colorAttach.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
     colorAttach.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     colorAttach.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     colorAttach.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    colorAttach.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    colorAttach.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     colorAttach.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 
     VkAttachmentDescription depthAttach = {};
     depthAttach.format = VK_FORMAT_D32_SFLOAT;
     depthAttach.samples = VK_SAMPLE_COUNT_1_BIT;
-    depthAttach.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-    depthAttach.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    depthAttach.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    depthAttach.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     depthAttach.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     depthAttach.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    depthAttach.initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    depthAttach.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     depthAttach.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
     VkAttachmentDescription attachments[] = {colorAttach, depthAttach};

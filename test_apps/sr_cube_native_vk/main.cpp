@@ -371,61 +371,6 @@ static void RenderThreadFunc(HWND hwnd, VulkanState* vk) {
         const float znear = 0.1f;
         const float zfar = 10000.0f;
 
-        // --- Explicit clear (matching reference app pattern) ---
-        // Clear color image
-        {
-            VkClearColorValue clearColorValue = {};
-            clearColorValue.float32[0] = 0.05f;
-            clearColorValue.float32[1] = 0.05f;
-            clearColorValue.float32[2] = 0.15f;
-            clearColorValue.float32[3] = 1.0f;
-
-            VkImageSubresourceRange colorRange = {};
-            colorRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            colorRange.baseMipLevel = 0;
-            colorRange.levelCount = 1;
-            colorRange.baseArrayLayer = 0;
-            colorRange.layerCount = 1;
-
-            TransitionImageLayout(cmd, vk->viewImage,
-                vk->viewImageLayout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-            vk->viewImageLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-
-            vkCmdClearColorImage(cmd, vk->viewImage,
-                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearColorValue, 1, &colorRange);
-        }
-
-        // Clear depth image
-        {
-            VkClearDepthStencilValue clearDepthValue = {};
-            clearDepthValue.depth = 1.0f;
-
-            VkImageSubresourceRange depthRange = {};
-            depthRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
-            depthRange.baseMipLevel = 0;
-            depthRange.levelCount = 1;
-            depthRange.baseArrayLayer = 0;
-            depthRange.layerCount = 1;
-
-            TransitionImageLayout(cmd, vk->depthImage,
-                vk->depthImageLayout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                VK_IMAGE_ASPECT_DEPTH_BIT);
-            vk->depthImageLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-
-            vkCmdClearDepthStencilImage(cmd, vk->depthImage,
-                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearDepthValue, 1, &depthRange);
-        }
-
-        // Transition view + depth to attachment optimal before rendering
-        TransitionImageLayout(cmd, vk->viewImage,
-            vk->viewImageLayout, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-        vk->viewImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-
-        TransitionImageLayout(cmd, vk->depthImage,
-            vk->depthImageLayout, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-            VK_IMAGE_ASPECT_DEPTH_BIT);
-        vk->depthImageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-
         // --- Diagnostic logging (first 3 frames only) ---
         static int s_diagFrameCount = 0;
         if (s_diagFrameCount < 3) {
@@ -440,11 +385,11 @@ static void RenderThreadFunc(HWND hwnd, VulkanState* vk) {
                 (int)vk->swapchainFormat);
         }
 
-        // --- Render each eye in its own render pass (matching reference) ---
-        for (int eye = 0; eye < 2; eye++) {
-            // Begin render pass (LOAD_OP_LOAD, renderArea = full SBS width)
+        // --- Render both eyes in a single render pass ---
+        // CLEAR loadOp handles clearing; viewport/scissor changes select each eye.
+        {
             VkClearValue clearValues[2] = {};
-            clearValues[0].color = {{0.0f, 0.0f, 0.0f, 1.0f}};
+            clearValues[0].color = {{0.05f, 0.05f, 0.15f, 1.0f}};
             clearValues[1].depthStencil = {1.0f, 0};
 
             VkRenderPassBeginInfo rpBegin = {};
@@ -457,54 +402,57 @@ static void RenderThreadFunc(HWND hwnd, VulkanState* vk) {
 
             vkCmdBeginRenderPass(cmd, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
 
-            // Set viewport for this eye
-            VkViewport viewport = {};
-            viewport.x = (float)(eye * (int)vk->viewWidth);
-            viewport.y = 0.0f;
-            viewport.width = (float)vk->viewWidth;
-            viewport.height = (float)vk->viewHeight;
-            viewport.minDepth = 0.0f;
-            viewport.maxDepth = 1.0f;
-            vkCmdSetViewport(cmd, 0, 1, &viewport);
+            for (int eye = 0; eye < 2; eye++) {
+                VkViewport viewport = {};
+                viewport.x = (float)(eye * (int)vk->viewWidth);
+                viewport.y = 0.0f;
+                viewport.width = (float)vk->viewWidth;
+                viewport.height = (float)vk->viewHeight;
+                viewport.minDepth = 0.0f;
+                viewport.maxDepth = 1.0f;
+                vkCmdSetViewport(cmd, 0, 1, &viewport);
 
-            VkRect2D scissor = {};
-            scissor.offset = {(int32_t)(eye * vk->viewWidth), 0};
-            scissor.extent = {vk->viewWidth, vk->viewHeight};
-            vkCmdSetScissor(cmd, 0, 1, &scissor);
+                VkRect2D scissor = {};
+                scissor.offset = {(int32_t)(eye * vk->viewWidth), 0};
+                scissor.extent = {vk->viewWidth, vk->viewHeight};
+                vkCmdSetScissor(cmd, 0, 1, &scissor);
 
-            // Bind pipeline and geometry
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk->cubePipeline);
-            VkDeviceSize offset = 0;
-            vkCmdBindVertexBuffers(cmd, 0, 1, &vk->cubeVertexBuffer, &offset);
-            vkCmdBindIndexBuffer(cmd, vk->cubeIndexBuffer, 0, VK_INDEX_TYPE_UINT32);
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk->cubePipeline);
+                VkDeviceSize offset = 0;
+                vkCmdBindVertexBuffers(cmd, 0, 1, &vk->cubeVertexBuffer, &offset);
+                vkCmdBindIndexBuffer(cmd, vk->cubeIndexBuffer, 0, VK_INDEX_TYPE_UINT32);
 
-            leia::vec3f eyePos = (eye == 0) ? adjLeftEye : adjRightEye;
+                leia::vec3f eyePos = (eye == 0) ? adjLeftEye : adjRightEye;
 
-            leia::mat4f mvp = leia::CalculateMVP(
-                eyePos,
-                effectiveWidthMM, effectiveHeightMM,
-                vk->cubeRotation,
-                cubeSize,
-                znear, zfar
-            );
+                leia::mat4f mvp = leia::CalculateMVP(
+                    eyePos,
+                    effectiveWidthMM, effectiveHeightMM,
+                    vk->cubeRotation,
+                    cubeSize,
+                    znear, zfar
+                );
 
-            // Diagnostic: log MVP first row
-            if (s_diagFrameCount < 3 && eye == 0) {
-                LOG_INFO("[DIAG frame %d] MVP row0: %.4f %.4f %.4f %.4f",
-                    s_diagFrameCount, mvp.m[0], mvp.m[1], mvp.m[2], mvp.m[3]);
+                if (s_diagFrameCount < 3 && eye == 0) {
+                    LOG_INFO("[DIAG frame %d] MVP row0: %.4f %.4f %.4f %.4f",
+                        s_diagFrameCount, mvp.m[0], mvp.m[1], mvp.m[2], mvp.m[3]);
+                }
+
+                VkPushConstants pc = {};
+                memcpy(pc.transform, mvp.m, sizeof(float) * 16);
+                pc.color[0] = 1.0f; pc.color[1] = 1.0f; pc.color[2] = 1.0f; pc.color[3] = 1.0f;
+
+                vkCmdPushConstants(cmd, vk->pipelineLayout,
+                    VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
+
+                vkCmdDrawIndexed(cmd, 36, 1, 0, 0, 0);
             }
-
-            VkPushConstants pc = {};
-            memcpy(pc.transform, mvp.m, sizeof(float) * 16);
-            pc.color[0] = 1.0f; pc.color[1] = 1.0f; pc.color[2] = 1.0f; pc.color[3] = 1.0f;
-
-            vkCmdPushConstants(cmd, vk->pipelineLayout,
-                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
-
-            vkCmdDrawIndexed(cmd, 36, 1, 0, 0, 0);
 
             vkCmdEndRenderPass(cmd);
         }
+
+        // Update layout tracking (render pass leaves image in COLOR_ATTACHMENT_OPTIMAL)
+        vk->viewImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        vk->depthImageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
         if (s_diagFrameCount < 3) {
             s_diagFrameCount++;

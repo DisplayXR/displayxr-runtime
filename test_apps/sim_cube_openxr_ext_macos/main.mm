@@ -435,6 +435,8 @@ struct SwapchainFramebuffers {
     std::vector<VkFramebuffer> framebuffers;
     VkImage depthImage = VK_NULL_HANDLE;
     VkDeviceMemory depthMemory = VK_NULL_HANDLE;
+    uint32_t width = 0;
+    uint32_t height = 0;
 };
 
 struct VkRenderer {
@@ -536,6 +538,8 @@ static bool CreateSwapchainFramebuffers(VkRenderer& renderer,
     uint32_t width, uint32_t height, VkFormat colorFormat)
 {
     auto& fb = renderer.swapchainFBs;
+    fb.width = width;
+    fb.height = height;
     fb.colorViews.resize(imageCount);
     fb.depthViews.resize(imageCount);
     fb.framebuffers.resize(imageCount);
@@ -871,10 +875,14 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
     return true;
 }
 
+struct EyeRenderParams {
+    uint32_t viewportX, viewportY, width, height;
+    float viewMat[16];
+    float projMat[16];
+};
+
 static void RenderScene(VkRenderer& renderer, uint32_t imageIndex,
-    uint32_t viewportX, uint32_t viewportY,
-    uint32_t width, uint32_t height, const float* viewMat, const float* projMat,
-    bool clear = true)
+    const EyeRenderParams* eyes, int eyeCount)
 {
     VkDevice device = renderer.device;
     vkWaitForFences(device, 1, &renderer.frameFence, VK_TRUE, UINT64_MAX);
@@ -895,57 +903,62 @@ static void RenderScene(VkRenderer& renderer, uint32_t imageIndex,
 
     VkRenderPassBeginInfo rpBegin = {};
     rpBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-    rpBegin.renderPass = clear ? renderer.renderPass : renderer.renderPassLoad;
+    rpBegin.renderPass = renderer.renderPass;
     rpBegin.framebuffer = fb.framebuffers[imageIndex];
-    rpBegin.renderArea = {{(int32_t)viewportX, (int32_t)viewportY}, {width, height}};
+    rpBegin.renderArea = {{0, 0}, {fb.width, fb.height}};
     rpBegin.clearValueCount = 2;
     rpBegin.pClearValues = clearValues;
     vkCmdBeginRenderPass(cmd, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
 
-    VkViewport viewport = {(float)viewportX, (float)(viewportY + height), (float)width, -(float)height, 0.0f, 1.0f};
-    VkRect2D scissor = {{(int32_t)viewportX, (int32_t)viewportY}, {width, height}};
-    vkCmdSetViewport(cmd, 0, 1, &viewport);
-    vkCmdSetScissor(cmd, 0, 1, &scissor);
+    // Render all eyes in a single render pass — just change viewport/scissor
+    for (int eye = 0; eye < eyeCount; eye++) {
+        const auto& e = eyes[eye];
 
-    // Compute VP matrix (zoom is handled by eye position division, not here)
-    float vp[16];
-    mat4_multiply(vp, projMat, viewMat);
+        VkViewport viewport = {(float)e.viewportX, (float)(e.viewportY + e.height),
+            (float)e.width, -(float)e.height, 0.0f, 1.0f};
+        VkRect2D scissor = {{(int32_t)e.viewportX, (int32_t)e.viewportY}, {e.width, e.height}};
+        vkCmdSetViewport(cmd, 0, 1, &viewport);
+        vkCmdSetScissor(cmd, 0, 1, &scissor);
 
-    // Draw grid — scale 5% so 10m grid becomes 0.5m, translate Y so it lands at Y=0
-    {
-        const float gridScale = 0.05f;
-        float gridWorld[16], gridScl[16], gridTrans[16];
-        mat4_scale(gridScl, gridScale, gridScale, gridScale);
-        mat4_translation(gridTrans, 0, gridScale, 0); // -1*0.05+0.05 = 0
-        mat4_multiply(gridWorld, gridTrans, gridScl);
-        float gridMvp[16];
-        mat4_multiply(gridMvp, vp, gridWorld);
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, renderer.gridPipeline);
-        vkCmdPushConstants(cmd, renderer.pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, 64, gridMvp);
-        VkDeviceSize offset = 0;
-        vkCmdBindVertexBuffers(cmd, 0, 1, &renderer.gridVertexBuffer, &offset);
-        vkCmdDraw(cmd, renderer.gridVertexCount, 1, 0, 0);
-    }
+        float vp[16];
+        mat4_multiply(vp, e.projMat, e.viewMat);
 
-    // Draw cube — 6cm cube centered at (0, 0.03, 0) on the display plane
-    {
-        const float cubeSize = 0.06f;
-        const float cubeHeight = cubeSize / 2.0f; // raise so base sits on grid at Y=0
-        float rot[16], scl[16], trans[16], model[16], tmp[16];
-        mat4_rotation_y(rot, renderer.cubeRotation);
-        mat4_scale(scl, cubeSize, cubeSize, cubeSize);
-        mat4_translation(trans, 0, cubeHeight, 0);
-        mat4_multiply(tmp, scl, rot);          // scale * rotate (column-major)
-        mat4_multiply(model, trans, tmp);       // translate * (scale * rotate)
-        float mvp[16];
-        mat4_multiply(mvp, vp, model);
+        // Draw grid
+        {
+            const float gridScale = 0.05f;
+            float gridWorld[16], gridScl[16], gridTrans[16];
+            mat4_scale(gridScl, gridScale, gridScale, gridScale);
+            mat4_translation(gridTrans, 0, gridScale, 0);
+            mat4_multiply(gridWorld, gridTrans, gridScl);
+            float gridMvp[16];
+            mat4_multiply(gridMvp, vp, gridWorld);
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, renderer.gridPipeline);
+            vkCmdPushConstants(cmd, renderer.pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, 64, gridMvp);
+            VkDeviceSize offset = 0;
+            vkCmdBindVertexBuffers(cmd, 0, 1, &renderer.gridVertexBuffer, &offset);
+            vkCmdDraw(cmd, renderer.gridVertexCount, 1, 0, 0);
+        }
 
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, renderer.cubePipeline);
-        vkCmdPushConstants(cmd, renderer.pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, 64, mvp);
-        VkDeviceSize offset = 0;
-        vkCmdBindVertexBuffers(cmd, 0, 1, &renderer.cubeVertexBuffer, &offset);
-        vkCmdBindIndexBuffer(cmd, renderer.cubeIndexBuffer, 0, VK_INDEX_TYPE_UINT16);
-        vkCmdDrawIndexed(cmd, 36, 1, 0, 0, 0);
+        // Draw cube
+        {
+            const float cubeSize = 0.06f;
+            const float cubeHeight = cubeSize / 2.0f;
+            float rot[16], scl[16], trans[16], model[16], tmp[16];
+            mat4_rotation_y(rot, renderer.cubeRotation);
+            mat4_scale(scl, cubeSize, cubeSize, cubeSize);
+            mat4_translation(trans, 0, cubeHeight, 0);
+            mat4_multiply(tmp, scl, rot);
+            mat4_multiply(model, trans, tmp);
+            float mvp[16];
+            mat4_multiply(mvp, vp, model);
+
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, renderer.cubePipeline);
+            vkCmdPushConstants(cmd, renderer.pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, 64, mvp);
+            VkDeviceSize offset = 0;
+            vkCmdBindVertexBuffers(cmd, 0, 1, &renderer.cubeVertexBuffer, &offset);
+            vkCmdBindIndexBuffer(cmd, renderer.cubeIndexBuffer, 0, VK_INDEX_TYPE_UINT16);
+            vkCmdDrawIndexed(cmd, 36, 1, 0, 0, 0);
+        }
     }
 
     vkCmdEndRenderPass(cmd);
@@ -1815,6 +1828,19 @@ int main() {
 
     LOG_INFO("=== Sim Cube OpenXR + External macOS Window ===");
 
+    // Initialize output mode from env var (matches runtime's parsing).
+    {
+        const char *mode_str = getenv("SIM_DISPLAY_OUTPUT");
+        if (mode_str) {
+            if (strcmp(mode_str, "anaglyph") == 0)
+                g_currentOutputMode = 1;
+            else if (strcmp(mode_str, "blend") == 0)
+                g_currentOutputMode = 2;
+            else
+                g_currentOutputMode = 0;
+        }
+    }
+
     // Step 1: Create the macOS window FIRST (app owns it)
     g_windowW = 1280;
     g_windowH = 720;
@@ -1961,78 +1987,85 @@ int main() {
     LOG_INFO("Controls: WASD=move, Mouse=look, Scroll=zoom, Space=reset, V=2D/3D, 1/2/3=SBS/anaglyph/blend, TAB=HUD, Cmd+Ctrl+F=fullscreen, ESC=quit");
     LOG_INFO("          V=2D/3D, Tab=HUD, 1/2/3=SBS/Ana/Blend, ESC=quit");
 
-    auto lastTime = std::chrono::high_resolution_clock::now();
+    // Store pointers for the timer callback (all rendering stays on the main thread).
+    static AppXrSession* s_xr = &xr;
+    static VkRenderer* s_vkRenderer = &vkRenderer;
+    static auto s_lastTime = std::chrono::high_resolution_clock::now();
 
-    while (g_running && !xr.exitRequested) {
+    // Drive rendering from a CFRunLoopTimer on kCFRunLoopCommonModes.
+    // This fires during window resize tracking (when a while-loop
+    // would be blocked inside [NSApp sendEvent:]).
+    CFRunLoopTimerRef renderTimer = CFRunLoopTimerCreateWithHandler(
+        NULL, CFAbsoluteTimeGetCurrent(), 1.0 / 120.0, 0, 0,
+        ^(CFRunLoopTimerRef timer) {
+        // Guard against re-entrancy: the timer can fire during [NSApp sendEvent:]
+        // which enters a nested run loop (e.g. window resize tracking).
+        static bool s_inFrame = false;
+        if (s_inFrame) return;
+        s_inFrame = true;
+
         PumpMacOSEvents();
 
         auto now = std::chrono::high_resolution_clock::now();
-        float deltaTime = std::chrono::duration<float>(now - lastTime).count();
-        lastTime = now;
+        float deltaTime = std::chrono::duration<float>(now - s_lastTime).count();
+        s_lastTime = now;
 
-        // Performance stats
         g_frameCount++;
         g_avgFrameTime = g_avgFrameTime * 0.95 + deltaTime * 0.05;
 
         UpdateCameraMovement(g_input, deltaTime);
 
-        vkRenderer.cubeRotation += deltaTime * 0.5f;
-        if (vkRenderer.cubeRotation > 2.0f * 3.14159265f)
-            vkRenderer.cubeRotation -= 2.0f * 3.14159265f;
+        s_vkRenderer->cubeRotation += deltaTime * 0.5f;
+        if (s_vkRenderer->cubeRotation > 2.0f * 3.14159265f)
+            s_vkRenderer->cubeRotation -= 2.0f * 3.14159265f;
 
-        // Handle display mode toggle (V key)
         if (g_input.displayModeToggleRequested) {
             g_input.displayModeToggleRequested = false;
-            if (xr.pfnRequestDisplayModeEXT && xr.session != XR_NULL_HANDLE) {
+            if (s_xr->pfnRequestDisplayModeEXT && s_xr->session != XR_NULL_HANDLE) {
                 XrDisplayModeEXT mode = g_input.displayMode3D
                     ? XR_DISPLAY_MODE_3D_EXT : XR_DISPLAY_MODE_2D_EXT;
-                XrResult modeResult = xr.pfnRequestDisplayModeEXT(xr.session, mode);
+                XrResult modeResult = s_xr->pfnRequestDisplayModeEXT(s_xr->session, mode);
                 LOG_INFO("Display mode → %s (%s)", g_input.displayMode3D ? "3D" : "2D",
                     XR_SUCCEEDED(modeResult) ? "OK" : "failed");
             }
         }
 
-        PollEvents(xr);
+        PollEvents(*s_xr);
 
-        if (xr.sessionRunning) {
+        if (s_xr->sessionRunning) {
             XrFrameState frameState;
-            if (BeginFrame(xr, frameState)) {
+            if (BeginFrame(*s_xr, frameState)) {
                 XrCompositionLayerProjectionView projectionViews[2] = {};
                 bool rendered = false;
 
                 if (frameState.shouldRender) {
-                    // Locate views in DISPLAY space (physically anchored) or LOCAL fallback
                     XrViewLocateInfo locateInfo = {XR_TYPE_VIEW_LOCATE_INFO};
-                    locateInfo.viewConfigurationType = xr.viewConfigType;
+                    locateInfo.viewConfigurationType = s_xr->viewConfigType;
                     locateInfo.displayTime = frameState.predictedDisplayTime;
-                    locateInfo.space = (xr.displaySpace != XR_NULL_HANDLE)
-                        ? xr.displaySpace : xr.localSpace;
+                    locateInfo.space = (s_xr->displaySpace != XR_NULL_HANDLE)
+                        ? s_xr->displaySpace : s_xr->localSpace;
 
                     XrViewState viewState = {XR_TYPE_VIEW_STATE};
                     uint32_t viewCount = 2;
                     XrView views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
 
-                    XrResult locResult = xrLocateViews(xr.session, &locateInfo,
+                    XrResult locResult = xrLocateViews(s_xr->session, &locateInfo,
                         &viewState, 2, &viewCount, views);
                     if (XR_SUCCEEDED(locResult) &&
                         (viewState.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) &&
                         (viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT))
                     {
-                        // Save raw display-space positions for Kooima + HUD
                         XrVector3f rawEyePos[2] = {views[0].pose.position, views[1].pose.position};
 
-                        // Store raw eye positions for HUD (pre-player-transform)
-                        xr.leftEyeX = rawEyePos[0].x; xr.leftEyeY = rawEyePos[0].y; xr.leftEyeZ = rawEyePos[0].z;
-                        xr.rightEyeX = rawEyePos[1].x; xr.rightEyeY = rawEyePos[1].y; xr.rightEyeZ = rawEyePos[1].z;
-                        xr.eyeTrackingActive = (viewState.viewStateFlags
+                        s_xr->leftEyeX = rawEyePos[0].x; s_xr->leftEyeY = rawEyePos[0].y; s_xr->leftEyeZ = rawEyePos[0].z;
+                        s_xr->rightEyeX = rawEyePos[1].x; s_xr->rightEyeY = rawEyePos[1].y; s_xr->rightEyeZ = rawEyePos[1].z;
+                        s_xr->eyeTrackingActive = (viewState.viewStateFlags
                             & XR_VIEW_STATE_POSITION_TRACKED_BIT) != 0;
 
-                        // Apply player transform (production-engine locomotion pattern)
                         XrQuaternionf playerOri;
                         quat_from_yaw_pitch(g_input.yaw, g_input.pitch, &playerOri);
 
                         for (int i = 0; i < 2; i++) {
-                            // Scale by zoom, rotate by player, translate
                             float lx = views[i].pose.position.x / g_input.zoomScale;
                             float ly = views[i].pose.position.y / g_input.zoomScale;
                             float lz = views[i].pose.position.z / g_input.zoomScale;
@@ -2042,15 +2075,12 @@ int main() {
                                 wx + g_input.cameraPosX,
                                 wy + g_input.cameraPosY,
                                 wz + g_input.cameraPosZ};
-                            // worldOri = playerOri * localOri (rotate local by player in world frame)
                             XrQuaternionf localOri = views[i].pose.orientation;
                             views[i].pose.orientation = quat_multiply(playerOri, localOri);
                         }
 
-                        // Determine eye count (mono in 2D, stereo in 3D)
                         int eyeCount = g_input.displayMode3D ? 2 : 1;
 
-                        // In mono mode, use center eye (average of L/R)
                         if (!g_input.displayMode3D) {
                             rawEyePos[0] = {
                                 (rawEyePos[0].x + rawEyePos[1].x) / 2.0f,
@@ -2062,18 +2092,17 @@ int main() {
                                 (views[0].pose.position.z + views[1].pose.position.z) / 2.0f};
                         }
 
-                        // Compute render dims for SBS single-swapchain
-                        uint32_t eyeRenderW = xr.swapchain.width / 2;
-                        uint32_t eyeRenderH = xr.swapchain.height;
+                        uint32_t eyeRenderW = s_xr->swapchain.width / 2;
+                        uint32_t eyeRenderH = s_xr->swapchain.height;
                         uint32_t renderW, renderH;
                         if (!g_input.displayMode3D) {
                             renderW = g_windowW;
                             renderH = g_windowH;
-                            if (renderW > xr.swapchain.width) renderW = xr.swapchain.width;
-                            if (renderH > xr.swapchain.height) renderH = xr.swapchain.height;
+                            if (renderW > s_xr->swapchain.width) renderW = s_xr->swapchain.width;
+                            if (renderH > s_xr->swapchain.height) renderH = s_xr->swapchain.height;
                         } else {
-                            renderW = (uint32_t)(g_windowW * xr.recommendedViewScaleX);
-                            renderH = (uint32_t)(g_windowH * xr.recommendedViewScaleY);
+                            renderW = (uint32_t)(g_windowW * s_xr->recommendedViewScaleX);
+                            renderH = (uint32_t)(g_windowH * s_xr->recommendedViewScaleY);
                             if (renderW > eyeRenderW) renderW = eyeRenderW;
                             if (renderH > eyeRenderH) renderH = eyeRenderH;
                         }
@@ -2082,37 +2111,47 @@ int main() {
 
                         rendered = true;
                         uint32_t imageIndex;
-                        if (AcquireSwapchainImage(xr, imageIndex)) {
+                        if (AcquireSwapchainImage(*s_xr, imageIndex)) {
+                            EyeRenderParams eyeParams[2];
                             for (int eye = 0; eye < eyeCount; eye++) {
-                                float viewMat[16], projMat[16];
-                                mat4_view_from_xr_pose(viewMat, views[eye].pose);
+                                mat4_view_from_xr_pose(eyeParams[eye].viewMat, views[eye].pose);
 
-                                // Kooima projection uses RAW display-space positions
-                                // screenW = half display width for SBS per-eye frustum
                                 XrFovf submitFov = views[eye].fov;
-                                if (xr.displayWidthM > 0 && xr.displayHeightM > 0) {
+                                if (s_xr->displayWidthM > 0 && s_xr->displayHeightM > 0) {
                                     float zs = g_input.zoomScale;
                                     XrVector3f kooimaEye = {rawEyePos[eye].x / zs, rawEyePos[eye].y / zs, rawEyePos[eye].z / zs};
-                                    float screenW = (g_input.displayMode3D
-                                        ? xr.displayWidthM / 2.0f
-                                        : xr.displayWidthM) / zs;
-                                    float screenH = xr.displayHeightM / zs;
-                                    mat4_kooima_projection(projMat, kooimaEye,
+                                    float dispPxW = s_xr->displayPixelWidth > 0 ? (float)s_xr->displayPixelWidth : (float)s_xr->swapchain.width;
+                                    float dispPxH = s_xr->displayPixelHeight > 0 ? (float)s_xr->displayPixelHeight : (float)s_xr->swapchain.height;
+                                    float pxSizeX = s_xr->displayWidthM / dispPxW;
+                                    float pxSizeY = s_xr->displayHeightM / dispPxH;
+                                    float winW_m = (float)g_windowW * pxSizeX;
+                                    float winH_m = (float)g_windowH * pxSizeY;
+                                    float minDisp = fminf(s_xr->displayWidthM, s_xr->displayHeightM);
+                                    float minWin  = fminf(winW_m, winH_m);
+                                    float vs = minDisp / minWin;
+                                    float screenWidthM  = winW_m * vs;
+                                    float screenHeightM = winH_m * vs;
+                                    bool sbsMode = g_input.displayMode3D && g_currentOutputMode == 0;
+                                    float screenW = (sbsMode
+                                        ? screenWidthM / 2.0f
+                                        : screenWidthM) / zs;
+                                    float screenH = screenHeightM / zs;
+                                    mat4_kooima_projection(eyeParams[eye].projMat, kooimaEye,
                                         screenW, screenH, 0.01f, 100.0f);
                                     submitFov = compute_kooima_fov(kooimaEye,
                                         screenW, screenH);
                                 } else {
-                                    mat4_from_xr_fov(projMat, views[eye].fov, 0.01f, 100.0f);
+                                    mat4_from_xr_fov(eyeParams[eye].projMat, views[eye].fov, 0.01f, 100.0f);
                                 }
 
                                 uint32_t vpX = g_input.displayMode3D ? (eye * renderW) : 0;
-                                RenderScene(vkRenderer, imageIndex,
-                                    vpX, 0, renderW, renderH,
-                                    viewMat, projMat,
-                                    eye == 0);  // clear on first eye only
+                                eyeParams[eye].viewportX = vpX;
+                                eyeParams[eye].viewportY = 0;
+                                eyeParams[eye].width = renderW;
+                                eyeParams[eye].height = renderH;
 
                                 projectionViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
-                                projectionViews[eye].subImage.swapchain = xr.swapchain.swapchain;
+                                projectionViews[eye].subImage.swapchain = s_xr->swapchain.swapchain;
                                 projectionViews[eye].subImage.imageRect.offset = {(int32_t)vpX, 0};
                                 projectionViews[eye].subImage.imageRect.extent = {
                                     (int32_t)renderW,
@@ -2121,7 +2160,8 @@ int main() {
                                 projectionViews[eye].pose = views[eye].pose;
                                 projectionViews[eye].fov = submitFov;
                             }
-                            ReleaseSwapchainImage(xr);
+                            RenderScene(*s_vkRenderer, imageIndex, eyeParams, eyeCount);
+                            ReleaseSwapchainImage(*s_xr);
                         } else {
                             rendered = false;
                         }
@@ -2130,18 +2170,16 @@ int main() {
 
                 if (rendered) {
                     uint32_t submitCount = g_input.displayMode3D ? 2u : 1u;
-                    EndFrame(xr, frameState.predictedDisplayTime, projectionViews, submitCount);
+                    EndFrame(*s_xr, frameState.predictedDisplayTime, projectionViews, submitCount);
                 } else {
                     XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
                     endInfo.displayTime = frameState.predictedDisplayTime;
                     endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
                     endInfo.layerCount = 0;
                     endInfo.layers = nullptr;
-                    xrEndFrame(xr.session, &endInfo);
+                    xrEndFrame(s_xr->session, &endInfo);
                 }
             }
-        } else {
-            usleep(100000);
         }
 
         // Update HUD overlay (throttled)
@@ -2172,20 +2210,20 @@ int main() {
                         "Space=Reset  V=2D/3D  Tab=HUD  ESC=Quit",
                         fps, g_avgFrameTime * 1000.0,
                         g_input.displayMode3D ? "3D (Stereo)" : "2D (Mono)",
-                        xr.supportsDisplayModeSwitch ? "" : " [no switch]",
+                        s_xr->supportsDisplayModeSwitch ? "" : " [no switch]",
                         outputModeName,
                         g_renderW, g_renderH,
                         g_windowW, g_windowH,
-                        xr.displayWidthM, xr.displayHeightM,
-                        xr.recommendedViewScaleX, xr.recommendedViewScaleY,
-                        xr.nominalViewerX, xr.nominalViewerY, xr.nominalViewerZ,
-                        xr.leftEyeX, xr.leftEyeY, xr.leftEyeZ,
-                        xr.rightEyeX, xr.rightEyeY, xr.rightEyeZ,
+                        s_xr->displayWidthM, s_xr->displayHeightM,
+                        s_xr->recommendedViewScaleX, s_xr->recommendedViewScaleY,
+                        s_xr->nominalViewerX, s_xr->nominalViewerY, s_xr->nominalViewerZ,
+                        s_xr->leftEyeX, s_xr->leftEyeY, s_xr->leftEyeZ,
+                        s_xr->rightEyeX, s_xr->rightEyeY, s_xr->rightEyeZ,
                         g_input.cameraPosX, g_input.cameraPosY, g_input.cameraPosZ,
                         g_input.yaw * 180.0f / 3.14159265f,
                         g_input.pitch * 180.0f / 3.14159265f,
                         g_input.zoomScale,
-                        xr.eyeTrackingActive ? "Active" : "None"];
+                        s_xr->eyeTrackingActive ? "Active" : "None"];
                     g_hudView.hudText = text;
                     [g_hudView setNeedsDisplay:YES];
                     [g_hudView setHidden:NO];
@@ -2194,7 +2232,16 @@ int main() {
                 }
             }
         }
-    }
+
+        if (!g_running || s_xr->exitRequested)
+            CFRunLoopStop(CFRunLoopGetMain());
+
+        s_inFrame = false;
+    });
+    CFRunLoopAddTimer(CFRunLoopGetMain(), renderTimer, kCFRunLoopCommonModes);
+    CFRunLoopRun();
+    CFRunLoopRemoveTimer(CFRunLoopGetMain(), renderTimer, kCFRunLoopCommonModes);
+    CFRelease(renderTimer);
 
     // Clean exit
     if (!xr.exitRequested && xr.session != XR_NULL_HANDLE && xr.sessionRunning) {
