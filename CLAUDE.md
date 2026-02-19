@@ -186,6 +186,17 @@ Ask Gemini to analyze code and produce a read-only report. Automatically gathers
 
 **Skill location:** `~/.claude/skills/ask-gemini/SKILL.md` (user-level, available across all projects)
 
+## macOS Test App Local Builds
+
+After building test apps locally, copy binaries to `_package/SRMonado-macOS/bin/` (NOT the parent directory). The run scripts (`run_*.sh`) exec from `$DIR/bin/`.
+
+| Test App | Build Output | Package Binary | Run Script |
+|----------|-------------|---------------|------------|
+| sim_cube_openxr | `test_apps/sim_cube_openxr/build/sim_cube_openxr` | `_package/SRMonado-macOS/bin/sim_cube_openxr` | `run_sim_cube.sh` |
+| sim_cube_openxr_ext_macos | `test_apps/sim_cube_openxr_ext_macos/build/sim_cube_openxr_ext_macos` | `_package/SRMonado-macOS/bin/sim_cube_openxr_ext_macos` | `run_sim_cube_ext.sh` |
+
+When adding new test apps, follow the same pattern: binary goes in `bin/`, run script in the package root.
+
 ## Debug Logs
 - Use U_LOG_W (WARN) only for one-off init, error, and lifecycle events
 - Use U_LOG_I (INFO) for recurring/throttled diagnostic logs (per-frame, per-keystroke, etc.)

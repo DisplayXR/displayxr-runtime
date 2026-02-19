@@ -101,15 +101,17 @@ oxr_macos_pump_events(struct xrt_device **xdevs, uint32_t xdev_count)
 			}
 		}
 
-		// Detect window close: after [NSApp sendEvent:] processes a
-		// windowWillClose notification, [NSApp keyWindow] becomes nil.
-		// Track whether we ever had a key window to avoid false
-		// positives during startup before the window is created.
+		// Detect window close: track the first window we see and
+		// check if it has been closed (no longer visible).  We must
+		// NOT use [NSApp keyWindow] — that returns nil whenever the
+		// window merely loses focus (user clicks outside), which is
+		// not the same as the window being closed.
 		{
-			static bool had_key_window = false;
-			if ([NSApp keyWindow] != nil) {
-				had_key_window = true;
-			} else if (had_key_window) {
+			static NSWindow *s_trackedWindow = nil;
+			if (s_trackedWindow == nil) {
+				s_trackedWindow = [NSApp mainWindow];
+			}
+			if (s_trackedWindow != nil && ![s_trackedWindow isVisible]) {
 				oxr_macos_set_window_closed();
 			}
 		}

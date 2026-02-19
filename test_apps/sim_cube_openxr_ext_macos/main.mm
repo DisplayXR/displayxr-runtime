@@ -1053,10 +1053,46 @@ static HudOverlayView *g_hudView = nil;
 }
 @end
 
+// NSApplicationDelegate: prevent termination when the window is closed or app
+// loses focus.  Without this, macOS terminates CLI-launched GUI apps as soon as
+// the last window closes (applicationShouldTerminateAfterLastWindowClosed
+// defaults to YES).
+@interface AppDelegate : NSObject <NSApplicationDelegate>
+@end
+@implementation AppDelegate
+- (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender {
+    (void)sender;
+    return NO;
+}
+- (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)sender {
+    (void)sender;
+    g_running = false;
+    return NSTerminateCancel; // let our loop handle cleanup
+}
+@end
+
+// NSWindowDelegate: translate window-close into g_running = false so the render
+// loop exits gracefully; also keeps the app alive on focus loss.
+@interface AppWindowDelegate : NSObject <NSWindowDelegate>
+@end
+@implementation AppWindowDelegate
+- (BOOL)windowShouldClose:(NSWindow *)sender {
+    (void)sender;
+    g_running = false;
+    return NO; // we handle teardown ourselves
+}
+@end
+
+static AppDelegate *g_appDelegate = nil;
+static AppWindowDelegate *g_windowDelegate = nil;
+
 static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
     @autoreleasepool {
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+
+        g_appDelegate = [[AppDelegate alloc] init];
+        [NSApp setDelegate:g_appDelegate];
 
         NSRect frame = NSMakeRect(100, 100, width, height);
         NSUInteger style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
@@ -1069,6 +1105,10 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
 
         [g_window setTitle:@"Sim Cube OpenXR (External Window)"];
         [g_window setAcceptsMouseMovedEvents:YES];
+        [g_window setReleasedWhenClosed:NO];
+
+        g_windowDelegate = [[AppWindowDelegate alloc] init];
+        [g_window setDelegate:g_windowDelegate];
 
         g_metalView = [[AppMetalView alloc] initWithFrame:frame];
         [g_metalView setWantsLayer:YES];
@@ -2087,7 +2127,15 @@ int main() {
                                 (views[0].pose.position.z + views[1].pose.position.z) / 2.0f};
                         }
 
-                        // Compute render dims for SBS single-swapchain
+                        // Compute render dims for SBS single-swapchain.
+                        // Scale depends on current output mode (may change at runtime):
+                        //   SBS (0):          scaleX=0.5, scaleY=1.0
+                        //   Anaglyph/Blend:   scaleX=0.5, scaleY=0.5
+                        float scaleX = 0.5f;
+                        float scaleY = (g_currentOutputMode == 0) ? 1.0f : 0.5f;
+                        xr.recommendedViewScaleX = scaleX;
+                        xr.recommendedViewScaleY = scaleY;
+
                         uint32_t eyeRenderW = xr.swapchain.width / 2;
                         uint32_t eyeRenderH = xr.swapchain.height;
                         uint32_t renderW, renderH;
@@ -2097,8 +2145,8 @@ int main() {
                             if (renderW > xr.swapchain.width) renderW = xr.swapchain.width;
                             if (renderH > xr.swapchain.height) renderH = xr.swapchain.height;
                         } else {
-                            renderW = (uint32_t)(g_windowW * xr.recommendedViewScaleX);
-                            renderH = (uint32_t)(g_windowH * xr.recommendedViewScaleY);
+                            renderW = (uint32_t)(g_windowW * scaleX);
+                            renderH = (uint32_t)(g_windowH * scaleY);
                             if (renderW > eyeRenderW) renderW = eyeRenderW;
                             if (renderH > eyeRenderH) renderH = eyeRenderH;
                         }
@@ -2206,8 +2254,8 @@ int main() {
                         "Nominal: (%.3f, %.3f, %.3f)\n"
                         "Eye L: (%.3f, %.3f, %.3f)\n"
                         "Eye R: (%.3f, %.3f, %.3f)\n"
-                        "Camera: (%.2f, %.2f, %.2f)\n"
-                        "Yaw: %.1f\u00b0  Pitch: %.1f\u00b0  Zoom: %.2fx\n"
+                        "Virtual Display: (%.2f, %.2f, %.2f)\n"
+                        "Forward: (%.2f, %.2f, %.2f)  Zoom: %.2fx\n"
                         "Track: %s\n"
                         "\n"
                         "WASD/QE=Move  Drag=Look  Scroll=Zoom\n"
@@ -2224,8 +2272,9 @@ int main() {
                         xr.leftEyeX, xr.leftEyeY, xr.leftEyeZ,
                         xr.rightEyeX, xr.rightEyeY, xr.rightEyeZ,
                         g_input.cameraPosX, g_input.cameraPosY, g_input.cameraPosZ,
-                        g_input.yaw * 180.0f / 3.14159265f,
-                        g_input.pitch * 180.0f / 3.14159265f,
+                        -sinf(g_input.yaw) * cosf(g_input.pitch),
+                         sinf(g_input.pitch),
+                        -cosf(g_input.yaw) * cosf(g_input.pitch),
                         g_input.zoomScale,
                         xr.eyeTrackingActive ? "Active" : "None"];
                     g_hudView.hudText = text;
