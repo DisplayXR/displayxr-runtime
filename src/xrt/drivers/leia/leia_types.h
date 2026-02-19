@@ -4,79 +4,47 @@
  * @file
  * @brief  Common type definitions for Leia SR SDK integration.
  *         This header can be included without Vulkan or D3D11 dependencies.
+ *
+ * Eye position, eye pair, and window metrics types are now vendor-neutral
+ * aliases defined in xrt/xrt_display_metrics.h. The leiasr_* names are
+ * kept for backward compatibility with existing Leia driver code.
+ *
  * @author David Fattal
  * @ingroup drv_leia
  */
 
 #pragma once
 
+#include "xrt/xrt_display_metrics.h"
+
 #include <stdbool.h>
-#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 /*!
- * Eye position in meters (converted from SR's millimeters).
- * Position is relative to the display center.
+ * Backward-compatible aliases — Leia driver code uses leiasr_* names,
+ * which now resolve to the vendor-neutral xrt_* types.
  */
-struct leiasr_eye_position
-{
-	float x;  //!< Horizontal position (positive = right)
-	float y;  //!< Vertical position (positive = up)
-	float z;  //!< Depth position (positive = toward viewer)
-};
-
-/*!
- * Eye pair containing both left and right eye positions.
- */
-struct leiasr_eye_pair
-{
-	struct leiasr_eye_position left;   //!< Left eye position in meters
-	struct leiasr_eye_position right;  //!< Right eye position in meters
-	int64_t timestamp_ns;              //!< Monotonic timestamp when the eye positions were sampled
-	bool valid;                        //!< True if the eye positions are valid
-};
+typedef struct xrt_eye_position leiasr_eye_position;
+typedef struct xrt_eye_pair leiasr_eye_pair;
+typedef struct xrt_window_metrics leiasr_window_metrics;
 
 /*!
  * Display dimensions in meters for Kooima FOV calculation.
+ *
+ * This remains Leia-specific because it includes nominal viewer position
+ * data that is only populated by the SR SDK init code.
  */
 struct leiasr_display_dimensions
 {
-	float width_m;   //!< Screen width in meters
-	float height_m;  //!< Screen height in meters
+	float width_m;      //!< Screen width in meters
+	float height_m;     //!< Screen height in meters
 	float nominal_x_m;  //!< Nominal viewer X in meters (display space)
 	float nominal_y_m;  //!< Nominal viewer Y in meters (display space)
 	float nominal_z_m;  //!< Nominal viewer Z in meters (display space)
-	bool valid;      //!< True if the dimensions are valid
-};
-
-/*!
- * Window metrics for adaptive resize.
- * Contains display and window geometry needed to compute
- * window-adaptive FOV and eye position adjustments.
- */
-struct leiasr_window_metrics
-{
-	float display_width_m;              //!< Display physical width (meters)
-	float display_height_m;             //!< Display physical height (meters)
-	uint32_t display_pixel_width;       //!< Display pixel width
-	uint32_t display_pixel_height;      //!< Display pixel height
-	int32_t display_screen_left;        //!< Display left edge (screen coords)
-	int32_t display_screen_top;         //!< Display top edge (screen coords)
-
-	uint32_t window_pixel_width;        //!< Window client area width (pixels)
-	uint32_t window_pixel_height;       //!< Window client area height (pixels)
-	int32_t window_screen_left;         //!< Window client area left (screen coords)
-	int32_t window_screen_top;          //!< Window client area top (screen coords)
-
-	float window_width_m;               //!< Window physical width (meters)
-	float window_height_m;              //!< Window physical height (meters)
-	float window_center_offset_x_m;     //!< Window center offset from display center (meters, +right)
-	float window_center_offset_y_m;     //!< Window center offset from display center (meters, +up)
-
-	bool valid;                         //!< True if all metrics are valid
+	bool valid;         //!< True if the dimensions are valid
 };
 
 #ifdef __cplusplus

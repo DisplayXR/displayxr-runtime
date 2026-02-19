@@ -52,7 +52,10 @@
 #include <stdlib.h>
 #include <assert.h>
 
-// SR eye tracking support - either Vulkan or D3D11 path
+// Vendor-neutral display metric types (eye positions, window metrics, Kooima FOV)
+#include "xrt/xrt_display_metrics.h"
+
+// SR eye tracking support (Leia-specific, requires SR SDK)
 #if defined(XRT_HAVE_LEIA_SR_VULKAN) || defined(XRT_HAVE_LEIA_SR_D3D11)
 #define XRT_HAVE_LEIA_SR_EYE_TRACKING
 #include "leia/leia_types.h"
@@ -161,40 +164,48 @@ oxr_session_get_predicted_eye_positions(struct oxr_session *sess, struct leiasr_
 	return false;
 #endif
 }
+#endif // XRT_HAVE_LEIA_SR_EYE_TRACKING
 
 /*!
- * Get display dimensions from the session's per-session weaver.
- * Used for Kooima asymmetric FOV calculation.
+ * Get display dimensions for Kooima asymmetric FOV calculation.
+ *
+ * Vendor-neutral: reads from xrt_system_compositor_info which is populated
+ * at init time by either SR SDK or sim_display. The D3D11 native compositor
+ * path is kept for backward compatibility.
  */
 static bool
 oxr_session_get_display_dimensions(struct oxr_session *sess, float *out_width_m, float *out_height_m)
 {
-	if (sess == NULL || sess->xcn == NULL || out_width_m == NULL || out_height_m == NULL) {
+	if (sess == NULL || out_width_m == NULL || out_height_m == NULL) {
 		return false;
 	}
 
 #if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_NATIVE_COMPOSITOR)
-	// Check if using D3D11 native compositor (not multi_compositor)
-	if (sess->is_d3d11_native_compositor) {
+	// D3D11 native compositor path (has its own display dimension query)
+	if (sess->xcn != NULL && sess->is_d3d11_native_compositor) {
 		return comp_d3d11_compositor_get_display_dimensions(&sess->xcn->base, out_width_m, out_height_m);
 	}
 #endif
 
-#ifdef XRT_HAVE_LEIA_SR_VULKAN
-	struct multi_compositor *mc = multi_compositor(&sess->xcn->base);
-	return multi_compositor_get_display_dimensions(mc, out_width_m, out_height_m);
-#else
-	return false;
-#endif
+	// Generic path: read from system compositor info (populated at init by SR or sim_display)
+	const struct xrt_system_compositor_info *info = &sess->sys->xsysc->info;
+	if (info->display_width_m <= 0.0f || info->display_height_m <= 0.0f) {
+		return false;
+	}
+	*out_width_m = info->display_width_m;
+	*out_height_m = info->display_height_m;
+	return true;
 }
 
 /*!
  * Get window metrics for adaptive FOV and eye position adjustment.
- * Supports both D3D11 native compositor and Vulkan multi compositor paths.
+ *
+ * Vendor-neutral: works with both SR SDK (via per-session weaver) and
+ * sim_display (via generic Win32 APIs in multi compositor).
  */
 static bool
 oxr_session_get_window_metrics(struct oxr_session *sess,
-                                struct leiasr_window_metrics *out_metrics)
+                                struct xrt_window_metrics *out_metrics)
 {
 	if (sess == NULL || sess->xcn == NULL || out_metrics == NULL) {
 		return false;
@@ -202,16 +213,14 @@ oxr_session_get_window_metrics(struct oxr_session *sess,
 
 #if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_NATIVE_COMPOSITOR)
 	if (sess->is_d3d11_native_compositor) {
-		return comp_d3d11_compositor_get_window_metrics(&sess->xcn->base, out_metrics);
+		return comp_d3d11_compositor_get_window_metrics(&sess->xcn->base,
+		    (struct leiasr_window_metrics *)out_metrics);
 	}
 #endif
 
-#ifdef XRT_HAVE_LEIA_SR_VULKAN
+	// Vendor-neutral path — works for both SR and sim_display
 	struct multi_compositor *mc = multi_compositor(&sess->xcn->base);
 	return multi_compositor_get_window_metrics(mc, out_metrics);
-#endif
-
-	return false;
 }
 
 /*!
@@ -229,7 +238,7 @@ oxr_session_get_window_metrics(struct oxr_session *sess,
  * @param[out] out_fov FOV angles in radians
  */
 static void
-compute_kooima_fov(const struct leiasr_eye_position *eye,
+compute_kooima_fov(const struct xrt_eye_position *eye,
                    float screen_width_m,
                    float screen_height_m,
                    const char *eye_name,
@@ -287,7 +296,6 @@ compute_kooima_fov(const struct leiasr_eye_position *eye,
 		        h_fov_deg, v_fov_deg);
 	}
 }
-#endif
 
 #ifdef OXR_HAVE_EXT_display_info
 XrResult
@@ -936,14 +944,12 @@ oxr_session_locate_views(struct oxr_logger *log,
 	struct xrt_fov fovs[XRT_MAX_VIEWS] = {0};
 	struct xrt_pose poses[XRT_MAX_VIEWS] = {0};
 
-#ifdef XRT_HAVE_LEIA_SR_EYE_TRACKING
-	// For SR displays with eye tracking, compute view poses directly from tracked eyes
-	// instead of using the simulated device's wobbling head pose.
-	// The eye positions from face tracking ARE the ground truth for SR displays.
-	struct leiasr_eye_pair eye_pair = {0};
+	// Eye pair and tracking state (vendor-neutral types)
+	struct xrt_eye_pair eye_pair = {0};
 	bool have_sr_eye_tracking = false;
+	bool have_kooima_fov = false;
 
-	// Throttled logging for SR eye tracking diagnostics
+	// Throttled logging for display/Kooima diagnostics
 	static int sr_log_counter = 0;
 	bool sr_should_log = (++sr_log_counter % 120) == 1; // Log every ~2 seconds at 60fps
 
@@ -951,10 +957,15 @@ oxr_session_locate_views(struct oxr_logger *log,
 	struct xrt_vec3 world_head_pos = {0.0f, 1.6f, 0.0f};  // Default: standing height
 	struct xrt_quat world_head_ori = XRT_QUAT_IDENTITY;
 
-	bool got_eye_positions = oxr_session_get_predicted_eye_positions(sess, &eye_pair);
+	// Query SR eye tracking (requires SR SDK)
+#ifdef XRT_HAVE_LEIA_SR_EYE_TRACKING
+	bool got_eye_positions = oxr_session_get_predicted_eye_positions(sess, (struct leiasr_eye_pair *)&eye_pair);
+#else
+	bool got_eye_positions = false;
+#endif
 
 	if (sr_should_log) {
-		U_LOG_I("SR eye tracking: got_positions=%d, valid=%d, is_d3d11=%d",
+		U_LOG_I("Eye tracking: got_positions=%d, valid=%d, is_d3d11=%d",
 		        got_eye_positions, eye_pair.valid, sess->is_d3d11_native_compositor);
 		if (got_eye_positions) {
 			U_LOG_I("  left=(%.3f,%.3f,%.3f) right=(%.3f,%.3f,%.3f)",
@@ -1010,74 +1021,104 @@ oxr_session_locate_views(struct oxr_logger *log,
 		                             XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT;
 
 		// poses[] not used for SR path - we set views directly in the loop below
+	}
 
-		// Compute Kooima FOV from SR eye positions, with window-adaptive scaling
-		float screen_width_m = 0.0f;
-		float screen_height_m = 0.0f;
+	// Kooima FOV computation (vendor-neutral)
+	// Works with either SR tracked eye positions or nominal viewer position
+	{
+		struct xrt_eye_position adj_left = {0};
+		struct xrt_eye_position adj_right = {0};
+		bool have_eye_positions = false;
 
-		struct leiasr_window_metrics wm = {0};
-		bool have_wm = oxr_session_get_window_metrics(sess, &wm);
-
-		struct leiasr_eye_position adj_left = eye_pair.left;
-		struct leiasr_eye_position adj_right = eye_pair.right;
-
-		if (have_wm && wm.valid && wm.window_width_m > 0.0f && wm.window_height_m > 0.0f) {
-			// SRHydra viewport scale formula
-			float min_disp = fminf(wm.display_width_m, wm.display_height_m);
-			float min_win  = fminf(wm.window_width_m, wm.window_height_m);
-			float vs = min_disp / min_win;
-
-			screen_width_m  = wm.window_width_m * vs;
-			screen_height_m = wm.window_height_m * vs;
-
-			// // Shift eye positions for window center offset
-			// adj_left.x  -= wm.window_center_offset_x_m;
-			// adj_left.y  -= wm.window_center_offset_y_m;
-			// adj_right.x -= wm.window_center_offset_x_m;
-			// adj_right.y -= wm.window_center_offset_y_m;
-
-			if (sr_should_log) {
-				U_LOG_I("Window-adaptive FOV: vs=%.3f, screen=%.4fx%.4fm, "
-				        "eye_offset=(%.4f,%.4f)m",
-				        vs, screen_width_m, screen_height_m,
-				        wm.window_center_offset_x_m, wm.window_center_offset_y_m);
-			}
-		} else if (oxr_session_get_display_dimensions(sess, &screen_width_m, &screen_height_m) &&
-		           screen_width_m > 0.0f && screen_height_m > 0.0f) {
-			// Fallback: full display dimensions (fullscreen or no window metrics)
+		if (have_sr_eye_tracking) {
+			// SR tracked eyes
+			adj_left = eye_pair.left;
+			adj_right = eye_pair.right;
+			have_eye_positions = true;
 		} else {
-			// Fallback to device FOV if display dimensions unavailable
-			fovs[0] = xdev->hmd->distortion.fov[0];
-			fovs[1] = xdev->hmd->distortion.fov[1];
-			goto skip_kooima;
+			// Nominal viewer from system compositor info (sim_display, etc.)
+			const struct xrt_system_compositor_info *sinfo = &sess->sys->xsysc->info;
+			if (sinfo->nominal_viewer_z_m > 0.0f) {
+				float ipd_m = sess->ipd_meters;
+				adj_left = (struct xrt_eye_position){
+				    -ipd_m / 2.0f, sinfo->nominal_viewer_y_m, sinfo->nominal_viewer_z_m};
+				adj_right = (struct xrt_eye_position){
+				    ipd_m / 2.0f, sinfo->nominal_viewer_y_m, sinfo->nominal_viewer_z_m};
+				have_eye_positions = true;
+				if (sr_should_log) {
+					U_LOG_I("Nominal eyes: L=(%.4f,%.4f,%.4f) R=(%.4f,%.4f,%.4f), IPD=%.1fmm",
+					        adj_left.x, adj_left.y, adj_left.z,
+					        adj_right.x, adj_right.y, adj_right.z,
+					        ipd_m * 1000.0f);
+				}
+			}
 		}
 
-		compute_kooima_fov(&adj_left, screen_width_m, screen_height_m,
-		                   "Left", sr_should_log, &fovs[0]);
-		compute_kooima_fov(&adj_right, screen_width_m, screen_height_m,
-		                   "Right", sr_should_log, &fovs[1]);
+		if (have_eye_positions) {
+			float screen_width_m = 0.0f;
+			float screen_height_m = 0.0f;
 
-		// Compare FOVs between eyes (throttled logging)
-		if (sr_should_log) {
-			float left_h_fov = (fovs[0].angle_right - fovs[0].angle_left) * 180.0f / 3.14159265f;
-			float right_h_fov = (fovs[1].angle_right - fovs[1].angle_left) * 180.0f / 3.14159265f;
-			float left_v_fov = (fovs[0].angle_up - fovs[0].angle_down) * 180.0f / 3.14159265f;
-			float right_v_fov = (fovs[1].angle_up - fovs[1].angle_down) * 180.0f / 3.14159265f;
-			U_LOG_I("SR FOV comparison: Left eye H=%.2f° V=%.2f°, Right eye H=%.2f° V=%.2f°",
-			        left_h_fov, left_v_fov, right_h_fov, right_v_fov);
-			U_LOG_I("  Left  FOV: L=%.2f° R=%.2f° U=%.2f° D=%.2f°",
-			        fovs[0].angle_left * 180.0f / 3.14159265f,
-			        fovs[0].angle_right * 180.0f / 3.14159265f,
-			        fovs[0].angle_up * 180.0f / 3.14159265f,
-			        fovs[0].angle_down * 180.0f / 3.14159265f);
-			U_LOG_I("  Right FOV: L=%.2f° R=%.2f° U=%.2f° D=%.2f°",
-			        fovs[1].angle_left * 180.0f / 3.14159265f,
-			        fovs[1].angle_right * 180.0f / 3.14159265f,
-			        fovs[1].angle_up * 180.0f / 3.14159265f,
-			        fovs[1].angle_down * 180.0f / 3.14159265f);
+			struct xrt_window_metrics wm = {0};
+			bool have_wm = oxr_session_get_window_metrics(sess, &wm);
+
+			if (have_wm && wm.valid && wm.window_width_m > 0.0f && wm.window_height_m > 0.0f) {
+				// SRHydra viewport scale formula
+				float min_disp = fminf(wm.display_width_m, wm.display_height_m);
+				float min_win  = fminf(wm.window_width_m, wm.window_height_m);
+				float vs = min_disp / min_win;
+
+				screen_width_m  = wm.window_width_m * vs;
+				screen_height_m = wm.window_height_m * vs;
+
+				// // Shift eye positions for window center offset
+				// adj_left.x  -= wm.window_center_offset_x_m;
+				// adj_left.y  -= wm.window_center_offset_y_m;
+				// adj_right.x -= wm.window_center_offset_x_m;
+				// adj_right.y -= wm.window_center_offset_y_m;
+
+				if (sr_should_log) {
+					U_LOG_I("Window-adaptive FOV: vs=%.3f, screen=%.4fx%.4fm, "
+					        "eye_offset=(%.4f,%.4f)m",
+					        vs, screen_width_m, screen_height_m,
+					        wm.window_center_offset_x_m, wm.window_center_offset_y_m);
+				}
+			} else if (oxr_session_get_display_dimensions(sess, &screen_width_m, &screen_height_m) &&
+			           screen_width_m > 0.0f && screen_height_m > 0.0f) {
+				// Fallback: full display dimensions (fullscreen or no window metrics)
+			}
+
+			if (screen_width_m > 0.0f && screen_height_m > 0.0f) {
+				compute_kooima_fov(&adj_left, screen_width_m, screen_height_m,
+				                   "Left", sr_should_log, &fovs[0]);
+				compute_kooima_fov(&adj_right, screen_width_m, screen_height_m,
+				                   "Right", sr_should_log, &fovs[1]);
+				have_kooima_fov = true;
+
+				// Compare FOVs between eyes (throttled logging)
+				if (sr_should_log) {
+					float left_h_fov = (fovs[0].angle_right - fovs[0].angle_left) * 180.0f / 3.14159265f;
+					float right_h_fov = (fovs[1].angle_right - fovs[1].angle_left) * 180.0f / 3.14159265f;
+					float left_v_fov = (fovs[0].angle_up - fovs[0].angle_down) * 180.0f / 3.14159265f;
+					float right_v_fov = (fovs[1].angle_up - fovs[1].angle_down) * 180.0f / 3.14159265f;
+					U_LOG_I("Kooima FOV: Left H=%.2f° V=%.2f°, Right H=%.2f° V=%.2f°",
+					        left_h_fov, left_v_fov, right_h_fov, right_v_fov);
+					U_LOG_I("  Left  FOV: L=%.2f° R=%.2f° U=%.2f° D=%.2f°",
+					        fovs[0].angle_left * 180.0f / 3.14159265f,
+					        fovs[0].angle_right * 180.0f / 3.14159265f,
+					        fovs[0].angle_up * 180.0f / 3.14159265f,
+					        fovs[0].angle_down * 180.0f / 3.14159265f);
+					U_LOG_I("  Right FOV: L=%.2f° R=%.2f° U=%.2f° D=%.2f°",
+					        fovs[1].angle_left * 180.0f / 3.14159265f,
+					        fovs[1].angle_right * 180.0f / 3.14159265f,
+					        fovs[1].angle_up * 180.0f / 3.14159265f,
+					        fovs[1].angle_down * 180.0f / 3.14159265f);
+				}
+			} else if (have_sr_eye_tracking) {
+				// SR eye tracking active but no display dims — fallback to device FOV
+				fovs[0] = xdev->hmd->distortion.fov[0];
+				fovs[1] = xdev->hmd->distortion.fov[1];
+			}
 		}
-	skip_kooima:
-		(void)0;
 	}
 
 	if (!have_sr_eye_tracking) {
@@ -1087,9 +1128,15 @@ oxr_session_locate_views(struct oxr_logger *log,
 	}
 
 	if (!have_sr_eye_tracking)
-#endif
 	{
 		// Normal path: get view poses from device (for non-SR or when SR eye tracking unavailable)
+		// Save Kooima fovs before xrt_device_get_view_poses overwrites them
+		struct xrt_fov kooima_fovs[2];
+		if (have_kooima_fov) {
+			kooima_fovs[0] = fovs[0];
+			kooima_fovs[1] = fovs[1];
+		}
+
 		xrt_result_t xret = xrt_device_get_view_poses( //
 		    xdev,                                      //
 		    &default_eye_relation,                     //
@@ -1099,6 +1146,12 @@ oxr_session_locate_views(struct oxr_logger *log,
 		    fovs,                                      //
 		    poses);
 		OXR_CHECK_XRET(log, sess, xret, xrt_device_get_view_poses);
+
+		// Restore Kooima FOV (xrt_device_get_view_poses overwrites fovs[])
+		if (have_kooima_fov) {
+			fovs[0] = kooima_fovs[0];
+			fovs[1] = kooima_fovs[1];
+		}
 	}
 
 	// The xdev pose in the base space.
@@ -1155,10 +1208,10 @@ oxr_session_locate_views(struct oxr_logger *log,
 		m_relation_chain_resolve(&xrc, &result);
 		OXR_XRT_POSE_TO_XRPOSEF(result.pose, views[i].pose);
 
-#ifdef XRT_HAVE_LEIA_SR_EYE_TRACKING
 		// For SR eye tracking, bypass the relation chain and set view poses directly.
 		// The eye positions from SR SDK are in display space; we apply the player
 		// transform (from qwerty device) to move the virtual world.
+		// (Runtime check — sim_display never enters this block since have_sr_eye_tracking == false)
 		if (have_sr_eye_tracking && view_count == 2) {
 			// Get SR eye position for this view (in display-local coords)
 			struct xrt_vec3 sr_eye = (i == 0)
@@ -1194,7 +1247,6 @@ oxr_session_locate_views(struct oxr_logger *log,
 				views[i].pose.orientation = (XrQuaternionf){0.0f, 0.0f, 0.0f, 1.0f};
 			}
 		}
-#endif
 
 		/*
 		 * Fov
@@ -1205,12 +1257,6 @@ oxr_session_locate_views(struct oxr_logger *log,
 		if (sess->sys->inst->quirks.parallel_views) {
 			adjust_fov(&fovs[i], &poses[i].orientation, &fov);
 		}
-
-#ifdef XRT_HAVE_LEIA_SR_EYE_TRACKING
-		// For SR path, FOV was already computed via Kooima above.
-		// This block only runs for the normal (non-SR) path.
-		// (SR FOVs are already in fovs[] array from the early computation)
-#endif
 
 		OXR_XRT_FOV_TO_XRFOVF(fov, views[i].fov);
 

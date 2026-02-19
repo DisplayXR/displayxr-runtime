@@ -2450,6 +2450,12 @@ struct xrt_system_compositor_info
 
 	//! Native display panel height in pixels. 0 if unknown.
 	uint32_t display_pixel_height;
+
+	//! Display left edge in OS screen coordinates. 0 if unknown.
+	int32_t display_screen_left;
+
+	//! Display top edge in OS screen coordinates. 0 if unknown.
+	int32_t display_screen_top;
 };
 
 struct xrt_system_compositor;

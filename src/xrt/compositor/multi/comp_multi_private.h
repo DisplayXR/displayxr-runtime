@@ -36,7 +36,8 @@
 struct comp_target;
 struct leiasr;
 struct leiasr_eye_pair;
-struct leiasr_window_metrics;
+struct xrt_eye_pair;
+struct xrt_window_metrics;
 struct xrt_system_devices;
 
 #ifdef XRT_OS_WINDOWS
@@ -619,25 +620,14 @@ multi_compositor_has_session_render(struct multi_compositor *mc)
  */
 bool
 multi_compositor_get_predicted_eye_positions(struct multi_compositor *mc, struct leiasr_eye_pair *out_eye_pair);
-
-/*!
- * Get display dimensions from the session's per-session weaver.
- * Used for computing Kooima asymmetric FOV based on eye position.
- *
- * @param mc The multi_compositor (must have per-session rendering initialized)
- * @param[out] out_width_m Pointer to receive screen width in meters
- * @param[out] out_height_m Pointer to receive screen height in meters
- * @return true if valid display dimensions are available, false otherwise
- *
- * @ingroup comp_multi
- * @private @memberof multi_compositor
- */
-bool
-multi_compositor_get_display_dimensions(struct multi_compositor *mc, float *out_width_m, float *out_height_m);
+#endif
 
 /*!
  * Get window metrics for adaptive FOV and eye position adjustment.
- * Delegates to the session's per-session SR weaver.
+ *
+ * Vendor-neutral: prefers SR SDK path when available (precise display
+ * screen position from SR::Display), falls back to generic Win32 path
+ * using MonitorFromWindow + xrt_system_compositor_info fields.
  *
  * @param mc The multi_compositor (must have per-session rendering initialized)
  * @param[out] out_metrics Pointer to receive the window metrics.
@@ -647,9 +637,7 @@ multi_compositor_get_display_dimensions(struct multi_compositor *mc, float *out_
  * @private @memberof multi_compositor
  */
 bool
-multi_compositor_get_window_metrics(struct multi_compositor *mc, struct leiasr_window_metrics *out_metrics);
-
-#endif
+multi_compositor_get_window_metrics(struct multi_compositor *mc, struct xrt_window_metrics *out_metrics);
 
 /*!
  * Request display mode switch (2D/3D).

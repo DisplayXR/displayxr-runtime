@@ -13,6 +13,7 @@
 #include "xrt/xrt_session.h"
 #include "xrt/xrt_config_os.h"
 #include "xrt/xrt_config_have.h"
+#include "xrt/xrt_display_metrics.h"
 
 #include "os/os_time.h"
 
@@ -1672,47 +1673,150 @@ multi_compositor_get_predicted_eye_positions(struct multi_compositor *mc, struct
 	// Get predicted eye positions from the session's weaver
 	return leiasr_get_predicted_eye_positions(mc->session_render.weaver, out_eye_pair);
 }
+#endif
 
-bool
-multi_compositor_get_display_dimensions(struct multi_compositor *mc, float *out_width_m, float *out_height_m)
+#ifdef XRT_OS_WINDOWS
+/*!
+ * Compute window metrics from Win32 APIs and system compositor info.
+ * This is the vendor-neutral fallback when no SR weaver is available.
+ * Same math as leiasr_get_window_metrics() but uses MonitorFromWindow
+ * and xrt_system_compositor_info instead of cached SR data.
+ */
+static bool
+compute_window_metrics_generic(void *window_handle,
+                               const struct xrt_system_compositor_info *info,
+                               struct xrt_window_metrics *out_metrics)
 {
-	if (mc == NULL || out_width_m == NULL || out_height_m == NULL) {
+	HWND hwnd = (HWND)window_handle;
+	if (hwnd == NULL || info == NULL || out_metrics == NULL) {
 		return false;
 	}
 
-	// Check if session has per-session rendering with a weaver
-	if (!mc->session_render.initialized || mc->session_render.weaver == NULL) {
+	memset(out_metrics, 0, sizeof(*out_metrics));
+
+	float disp_w_m = info->display_width_m;
+	float disp_h_m = info->display_height_m;
+	if (disp_w_m <= 0.0f || disp_h_m <= 0.0f) {
 		return false;
 	}
 
-	// Get display dimensions from the session's weaver
-	struct leiasr_display_dimensions dims = {0};
-	if (!leiasr_get_display_dimensions(mc->session_render.weaver, &dims) || !dims.valid) {
+	// Get display pixel dimensions and screen position from the monitor
+	HMONITOR hmon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+	MONITORINFO mi;
+	mi.cbSize = sizeof(mi);
+	if (!GetMonitorInfo(hmon, &mi)) {
 		return false;
 	}
 
-	*out_width_m = dims.width_m;
-	*out_height_m = dims.height_m;
+	uint32_t disp_px_w = (uint32_t)(mi.rcMonitor.right - mi.rcMonitor.left);
+	uint32_t disp_px_h = (uint32_t)(mi.rcMonitor.bottom - mi.rcMonitor.top);
+	int32_t disp_left = (int32_t)mi.rcMonitor.left;
+	int32_t disp_top = (int32_t)mi.rcMonitor.top;
 
+	if (disp_px_w == 0 || disp_px_h == 0) {
+		return false;
+	}
+
+	// Override with xsysc->info values if they were populated (e.g. by SR SDK)
+	if (info->display_pixel_width > 0 && info->display_pixel_height > 0) {
+		disp_px_w = info->display_pixel_width;
+		disp_px_h = info->display_pixel_height;
+	}
+	if (info->display_screen_left != 0 || info->display_screen_top != 0) {
+		disp_left = info->display_screen_left;
+		disp_top = info->display_screen_top;
+	}
+
+	// Get window client rect
+	RECT rect;
+	if (!GetClientRect(hwnd, &rect)) {
+		return false;
+	}
+	uint32_t win_px_w = (uint32_t)(rect.right - rect.left);
+	uint32_t win_px_h = (uint32_t)(rect.bottom - rect.top);
+	if (win_px_w == 0 || win_px_h == 0) {
+		return false;
+	}
+
+	// Get window screen position
+	POINT client_origin = {0, 0};
+	ClientToScreen(hwnd, &client_origin);
+
+	// Compute pixel size (meters per pixel)
+	float pixel_size_x = disp_w_m / (float)disp_px_w;
+	float pixel_size_y = disp_h_m / (float)disp_px_h;
+
+	// Window physical size
+	float win_w_m = (float)win_px_w * pixel_size_x;
+	float win_h_m = (float)win_px_h * pixel_size_y;
+
+	// Window center in pixels (relative to display origin in screen coords)
+	float win_center_px_x = (float)(client_origin.x - disp_left) + (float)win_px_w / 2.0f;
+	float win_center_px_y = (float)(client_origin.y - disp_top) + (float)win_px_h / 2.0f;
+
+	// Display center in pixels
+	float disp_center_px_x = (float)disp_px_w / 2.0f;
+	float disp_center_px_y = (float)disp_px_h / 2.0f;
+
+	// Window center offset in meters
+	// X: +right (screen coords and eye coords both +right)
+	// Y: negated because screen coords Y-down, eye coords Y-up
+	float offset_x_m = (win_center_px_x - disp_center_px_x) * pixel_size_x;
+	float offset_y_m = -((win_center_px_y - disp_center_px_y) * pixel_size_y);
+
+	// Fill output
+	out_metrics->display_width_m = disp_w_m;
+	out_metrics->display_height_m = disp_h_m;
+	out_metrics->display_pixel_width = disp_px_w;
+	out_metrics->display_pixel_height = disp_px_h;
+	out_metrics->display_screen_left = disp_left;
+	out_metrics->display_screen_top = disp_top;
+
+	out_metrics->window_pixel_width = win_px_w;
+	out_metrics->window_pixel_height = win_px_h;
+	out_metrics->window_screen_left = (int32_t)client_origin.x;
+	out_metrics->window_screen_top = (int32_t)client_origin.y;
+
+	out_metrics->window_width_m = win_w_m;
+	out_metrics->window_height_m = win_h_m;
+	out_metrics->window_center_offset_x_m = offset_x_m;
+	out_metrics->window_center_offset_y_m = offset_y_m;
+
+	out_metrics->valid = true;
 	return true;
 }
+#endif // XRT_OS_WINDOWS
 
 bool
-multi_compositor_get_window_metrics(struct multi_compositor *mc, struct leiasr_window_metrics *out_metrics)
+multi_compositor_get_window_metrics(struct multi_compositor *mc, struct xrt_window_metrics *out_metrics)
 {
 	if (mc == NULL || out_metrics == NULL) {
 		return false;
 	}
 
-	// Check if session has per-session rendering with a weaver
-	if (!mc->session_render.initialized || mc->session_render.weaver == NULL) {
+	if (!mc->session_render.initialized) {
 		return false;
 	}
 
-	return leiasr_get_window_metrics(mc->session_render.weaver, out_metrics);
-}
-
+#ifdef XRT_HAVE_LEIA_SR_VULKAN
+	// Prefer SR SDK path (has precise display screen position from SR::Display)
+	if (mc->session_render.weaver != NULL) {
+		return leiasr_get_window_metrics(mc->session_render.weaver,
+		                                 (struct leiasr_window_metrics *)out_metrics);
+	}
 #endif
+
+#ifdef XRT_OS_WINDOWS
+	// Generic fallback: compute from HWND + system compositor info
+	if (mc->session_render.external_window_handle != NULL) {
+		const struct xrt_system_compositor_info *info = &mc->msc->base.info;
+		return compute_window_metrics_generic(
+		    mc->session_render.external_window_handle, info, out_metrics);
+	}
+#endif
+
+	return false;
+}
 
 bool
 multi_compositor_request_display_mode(struct multi_compositor *mc, bool enable_3d)
