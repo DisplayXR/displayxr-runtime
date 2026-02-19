@@ -1674,7 +1674,6 @@ multi_compositor_get_window_metrics(struct multi_compositor *mc, struct leiasr_w
 	return leiasr_get_window_metrics(mc->session_render.weaver, out_metrics);
 }
 
-}
 #endif
 
 bool

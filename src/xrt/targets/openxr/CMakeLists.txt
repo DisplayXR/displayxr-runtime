@@ -49,7 +49,7 @@ if(XRT_FEATURE_HYBRID_MODE)
 		)
 	target_compile_definitions(${RUNTIME_TARGET} PRIVATE XRT_FEATURE_HYBRID_MODE)
 elseif(XRT_FEATURE_IPC_CLIENT)
-	target_link_libraries(${RUNTIME_TARGET} PUBLIC st_oxr ipc_client comp_client)
+	target_link_libraries(${RUNTIME_TARGET} PUBLIC st_oxr ipc_client comp_client comp_multi)
 else()
 	target_link_libraries(
 		${RUNTIME_TARGET}
