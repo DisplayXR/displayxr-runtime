@@ -351,18 +351,24 @@ static void RenderThreadFunc(
                         LOG_INFO("[FRAME] AcquireSwapchainImage...");
                         if (AcquireSwapchainImage(*xr, imageIndex)) {
                             LOG_INFO("[FRAME] Acquired image %u", imageIndex);
+
+                            // Build per-eye render params for single-pass rendering
+                            EyeRenderParams eyeParams[2];
                             for (int eye = 0; eye < 2; eye++) {
-                                XMMATRIX viewMatrix = (eye == 0) ? leftViewMatrix : rightViewMatrix;
-                                XMMATRIX projMatrix = (eye == 0) ? leftProjMatrix : rightProjMatrix;
+                                eyeParams[eye].viewportX = eye * renderW;
+                                eyeParams[eye].viewportY = 0;
+                                eyeParams[eye].width = renderW;
+                                eyeParams[eye].height = renderH;
+                                eyeParams[eye].viewMatrix = (eye == 0) ? leftViewMatrix : rightViewMatrix;
+                                eyeParams[eye].projMatrix = (eye == 0) ? leftProjMatrix : rightProjMatrix;
+                            }
 
-                                LOG_INFO("[FRAME] Eye %d: RenderScene...", eye);
-                                RenderScene(*renderer, 0, imageIndex,
-                                    eye * renderW, 0, renderW, renderH,
-                                    viewMatrix, projMatrix,
-                                    useAppProjection ? 1.0f : inputSnapshot.zoomScale,
-                                    eye == 0);
-                                LOG_INFO("[FRAME] Eye %d: RenderScene done", eye);
+                            RenderScene(*renderer, imageIndex,
+                                xr->swapchain.width, xr->swapchain.height,
+                                eyeParams, 2,
+                                useAppProjection ? 1.0f : inputSnapshot.zoomScale);
 
+                            for (int eye = 0; eye < 2; eye++) {
                                 projectionViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
                                 projectionViews[eye].subImage.swapchain = xr->swapchain.swapchain;
                                 projectionViews[eye].subImage.imageRect.offset = {(int32_t)(eye * renderW), 0};
@@ -372,11 +378,6 @@ static void RenderThreadFunc(
                                 };
                                 projectionViews[eye].subImage.imageArrayIndex = 0;
                                 projectionViews[eye].pose = rawViews[eye].pose;
-                                // Always submit runtime's raw FOV for compositing.
-                                // The Vulkan compositor re-projects layers from submitted FOV
-                                // -> display distortion FOV. Submitting the runtime FOV (which
-                                // matches the distortion target) makes this a no-op, so the
-                                // app's Kooima rendering directly controls output size.
                                 projectionViews[eye].fov = rawViews[eye].fov;
                             }
                             LOG_INFO("[FRAME] ReleaseSwapchainImage...");

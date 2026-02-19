@@ -373,19 +373,7 @@ bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysicalDevic
             return false;
         }
 
-        // Create a second render pass with LOAD_OP_LOAD for SBS second-eye rendering.
-        // This preserves the first eye's content in the shared framebuffer.
-        colorAttach.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-        colorAttach.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        depthAttach.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-        depthAttach.initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-        VkAttachmentDescription attachmentsLoad[] = {colorAttach, depthAttach};
-        rpInfo.pAttachments = attachmentsLoad;
-
-        if (vkCreateRenderPass(device, &rpInfo, nullptr, &renderer.renderPassLoad) != VK_SUCCESS) {
-            LOG_ERROR("Failed to create load render pass");
-            return false;
-        }
+        // Single render pass with CLEAR for all eyes (no LOAD_OP_LOAD needed)
     }
 
     // Create pipeline layout with push constants
@@ -835,127 +823,119 @@ void UpdateScene(VkRenderer& renderer, float deltaTime) {
 
 void RenderScene(
     VkRenderer& renderer,
-    int eye, uint32_t imageIndex,
-    uint32_t viewportX, uint32_t viewportY,
-    uint32_t width, uint32_t height,
-    const XMMATRIX& viewMatrix,
-    const XMMATRIX& projMatrix,
-    float zoomScale,
-    bool clear)
+    uint32_t imageIndex,
+    uint32_t framebufferWidth, uint32_t framebufferHeight,
+    const EyeRenderParams* eyes, int eyeCount,
+    float zoomScale)
 {
     VkDevice device = renderer.device;
 
     // Wait for previous frame's fence
-    LOG_INFO("[RenderScene] eye=%d imageIndex=%u: vkWaitForFences (pre-render)...", eye, imageIndex);
+    LOG_INFO("[RenderScene] imageIndex=%u: vkWaitForFences (pre-render)...", imageIndex);
     VkResult fenceResult = vkWaitForFences(device, 1, &renderer.frameFence, VK_TRUE, UINT64_MAX);
-    LOG_INFO("[RenderScene] eye=%d: vkWaitForFences returned %d", eye, (int)fenceResult);
+    LOG_INFO("[RenderScene] vkWaitForFences returned %d", (int)fenceResult);
     vkResetFences(device, 1, &renderer.frameFence);
 
     // Begin command buffer
-    LOG_INFO("[RenderScene] eye=%d: vkResetCommandBuffer + vkBeginCommandBuffer...", eye);
     vkResetCommandBuffer(renderer.commandBuffer, 0);
     VkCommandBufferBeginInfo beginInfo = {};
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(renderer.commandBuffer, &beginInfo);
 
-    // Begin render pass
+    // Single render pass with CLEAR covering full framebuffer
     VkClearValue clearValues[2] = {};
     clearValues[0].color = {{0.05f, 0.05f, 0.25f, 1.0f}};
     clearValues[1].depthStencil = {1.0f, 0};
 
     VkRenderPassBeginInfo rpBegin = {};
     rpBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-    rpBegin.renderPass = clear ? renderer.renderPass : renderer.renderPassLoad;
-    rpBegin.framebuffer = renderer.framebuffers[eye][imageIndex];
-    rpBegin.renderArea.offset = {(int32_t)viewportX, (int32_t)viewportY};
-    rpBegin.renderArea.extent = {width, height};
+    rpBegin.renderPass = renderer.renderPass;
+    rpBegin.framebuffer = renderer.framebuffers[0][imageIndex];
+    rpBegin.renderArea.offset = {0, 0};
+    rpBegin.renderArea.extent = {framebufferWidth, framebufferHeight};
     rpBegin.clearValueCount = 2;
     rpBegin.pClearValues = clearValues;
 
-    LOG_INFO("[RenderScene] eye=%d: framebuffer=%p, renderPass=%p, extent=%ux%u",
-             eye, (void*)renderer.framebuffers[eye][imageIndex], (void*)renderer.renderPass, width, height);
-    LOG_INFO("[RenderScene] eye=%d: vkCmdBeginRenderPass...", eye);
     __try {
         vkCmdBeginRenderPass(renderer.commandBuffer, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
     } __except(EXCEPTION_EXECUTE_HANDLER) {
-        LOG_ERROR("[RenderScene] eye=%d: CRASH in vkCmdBeginRenderPass! exception=0x%08X", eye, GetExceptionCode());
+        LOG_ERROR("[RenderScene] CRASH in vkCmdBeginRenderPass! exception=0x%08X", GetExceptionCode());
         return;
     }
-    LOG_INFO("[RenderScene] eye=%d: vkCmdBeginRenderPass OK", eye);
-
-    // Set viewport with Y-flip (negative height) for correct NDC convention
-    VkViewport viewport = {};
-    viewport.x = (float)viewportX;
-    viewport.y = (float)(viewportY + height);
-    viewport.width = (float)width;
-    viewport.height = -(float)height;
-    viewport.minDepth = 0.0f;
-    viewport.maxDepth = 1.0f;
-    vkCmdSetViewport(renderer.commandBuffer, 0, 1, &viewport);
-
-    VkRect2D scissor = {};
-    scissor.offset = {(int32_t)viewportX, (int32_t)viewportY};
-    scissor.extent = {width, height};
-    vkCmdSetScissor(renderer.commandBuffer, 0, 1, &scissor);
-    LOG_INFO("[RenderScene] eye=%d: viewport+scissor set", eye);
 
     // Zoom in eye space: scale only x,y (not z) so perspective division doesn't
     // cancel the effect. Keeps the viewport center fixed on screen.
     XMMATRIX zoom = XMMatrixScaling(zoomScale, zoomScale, 1.0f);
 
-    // Draw cube - base rests on grid at y=0
-    {
-        const float cubeSize = 0.06f;
-        const float cubeHeight = cubeSize / 2.0f;  // Raise by half size so base is at y=0
-        XMMATRIX cubeScale = XMMatrixScaling(cubeSize, cubeSize, cubeSize);
-        XMMATRIX cubeRot = XMMatrixRotationY(renderer.cubeRotation);
-        XMMATRIX cubeTrans = XMMatrixTranslation(0.0f, cubeHeight, 0.0f);
-        XMMATRIX cubeWVP = cubeRot * cubeScale * cubeTrans * viewMatrix * zoom * projMatrix;
+    for (int eye = 0; eye < eyeCount; eye++) {
+        uint32_t vpX = eyes[eye].viewportX;
+        uint32_t vpY = eyes[eye].viewportY;
+        uint32_t w = eyes[eye].width;
+        uint32_t h = eyes[eye].height;
+        XMMATRIX viewMatrix = eyes[eye].viewMatrix;
+        XMMATRIX projMatrix = eyes[eye].projMatrix;
 
-        VkPushConstants pc = {};
-        // Store WITHOUT transpose: SPIR-V ColMajor reads row-major data as columns,
-        // naturally producing M^T. Shader then computes M^T * v which is the correct
-        // column-vector equivalent of DirectXMath's row-vector v * M convention.
-        // (Same implicit transpose that GL gets from glUniformMatrix4fv with GL_FALSE.)
-        XMStoreFloat4x4(&pc.transform, cubeWVP);
-        pc.color[0] = 1.0f; pc.color[1] = 1.0f; pc.color[2] = 1.0f; pc.color[3] = 1.0f;
+        // Set viewport with Y-flip (negative height) for correct NDC convention
+        VkViewport viewport = {};
+        viewport.x = (float)vpX;
+        viewport.y = (float)(vpY + h);
+        viewport.width = (float)w;
+        viewport.height = -(float)h;
+        viewport.minDepth = 0.0f;
+        viewport.maxDepth = 1.0f;
+        vkCmdSetViewport(renderer.commandBuffer, 0, 1, &viewport);
 
-        vkCmdBindPipeline(renderer.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, renderer.cubePipeline);
-        vkCmdPushConstants(renderer.commandBuffer, renderer.pipelineLayout,
-            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
+        VkRect2D scissor = {};
+        scissor.offset = {(int32_t)vpX, (int32_t)vpY};
+        scissor.extent = {w, h};
+        vkCmdSetScissor(renderer.commandBuffer, 0, 1, &scissor);
 
-        VkDeviceSize offset = 0;
-        vkCmdBindVertexBuffers(renderer.commandBuffer, 0, 1, &renderer.cubeVertexBuffer, &offset);
-        vkCmdBindIndexBuffer(renderer.commandBuffer, renderer.cubeIndexBuffer, 0, VK_INDEX_TYPE_UINT16);
-        vkCmdDrawIndexed(renderer.commandBuffer, 36, 1, 0, 0, 0);
-        LOG_INFO("[RenderScene] eye=%d: cube draw recorded", eye);
+        // Draw cube - base rests on grid at y=0
+        {
+            const float cubeSize = 0.06f;
+            const float cubeHeight = cubeSize / 2.0f;
+            XMMATRIX cubeScale = XMMatrixScaling(cubeSize, cubeSize, cubeSize);
+            XMMATRIX cubeRot = XMMatrixRotationY(renderer.cubeRotation);
+            XMMATRIX cubeTrans = XMMatrixTranslation(0.0f, cubeHeight, 0.0f);
+            XMMATRIX cubeWVP = cubeRot * cubeScale * cubeTrans * viewMatrix * zoom * projMatrix;
+
+            VkPushConstants pc = {};
+            XMStoreFloat4x4(&pc.transform, cubeWVP);
+            pc.color[0] = 1.0f; pc.color[1] = 1.0f; pc.color[2] = 1.0f; pc.color[3] = 1.0f;
+
+            vkCmdBindPipeline(renderer.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, renderer.cubePipeline);
+            vkCmdPushConstants(renderer.commandBuffer, renderer.pipelineLayout,
+                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
+
+            VkDeviceSize offset = 0;
+            vkCmdBindVertexBuffers(renderer.commandBuffer, 0, 1, &renderer.cubeVertexBuffer, &offset);
+            vkCmdBindIndexBuffer(renderer.commandBuffer, renderer.cubeIndexBuffer, 0, VK_INDEX_TYPE_UINT16);
+            vkCmdDrawIndexed(renderer.commandBuffer, 36, 1, 0, 0, 0);
+        }
+
+        // Draw grid floor
+        {
+            const float gridScale = 0.05f;
+            XMMATRIX gridWorld = XMMatrixScaling(gridScale, gridScale, gridScale)
+                               * XMMatrixTranslation(0, gridScale, 0);
+            XMMATRIX gridWVP = gridWorld * viewMatrix * zoom * projMatrix;
+
+            VkPushConstants pc = {};
+            XMStoreFloat4x4(&pc.transform, gridWVP);
+            pc.color[0] = 0.3f; pc.color[1] = 0.3f; pc.color[2] = 0.35f; pc.color[3] = 1.0f;
+
+            vkCmdBindPipeline(renderer.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, renderer.gridPipeline);
+            vkCmdPushConstants(renderer.commandBuffer, renderer.pipelineLayout,
+                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
+
+            VkDeviceSize offset = 0;
+            vkCmdBindVertexBuffers(renderer.commandBuffer, 0, 1, &renderer.gridVertexBuffer, &offset);
+            vkCmdDraw(renderer.commandBuffer, renderer.gridVertexCount, 1, 0, 0);
+        }
     }
 
-    // Draw grid floor
-    {
-        const float gridScale = 0.05f;
-        XMMATRIX gridWorld = XMMatrixScaling(gridScale, gridScale, gridScale)
-                           * XMMatrixTranslation(0, gridScale, 0);
-        XMMATRIX gridWVP = gridWorld * viewMatrix * zoom * projMatrix;
-
-        VkPushConstants pc = {};
-        XMStoreFloat4x4(&pc.transform, gridWVP);
-        pc.color[0] = 0.3f; pc.color[1] = 0.3f; pc.color[2] = 0.35f; pc.color[3] = 1.0f;
-
-        vkCmdBindPipeline(renderer.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, renderer.gridPipeline);
-        vkCmdPushConstants(renderer.commandBuffer, renderer.pipelineLayout,
-            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
-
-        VkDeviceSize offset = 0;
-        vkCmdBindVertexBuffers(renderer.commandBuffer, 0, 1, &renderer.gridVertexBuffer, &offset);
-        vkCmdDraw(renderer.commandBuffer, renderer.gridVertexCount, 1, 0, 0);
-        LOG_INFO("[RenderScene] eye=%d: grid draw recorded", eye);
-    }
-
-    LOG_INFO("[RenderScene] eye=%d: vkCmdEndRenderPass...", eye);
     vkCmdEndRenderPass(renderer.commandBuffer);
-    LOG_INFO("[RenderScene] eye=%d: vkEndCommandBuffer...", eye);
     vkEndCommandBuffer(renderer.commandBuffer);
 
     // Submit
@@ -964,14 +944,12 @@ void RenderScene(
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &renderer.commandBuffer;
 
-    LOG_INFO("[RenderScene] eye=%d: vkQueueSubmit...", eye);
     VkResult submitResult = vkQueueSubmit(renderer.graphicsQueue, 1, &submitInfo, renderer.frameFence);
-    LOG_INFO("[RenderScene] eye=%d: vkQueueSubmit returned %d", eye, (int)submitResult);
+    LOG_INFO("[RenderScene] vkQueueSubmit returned %d", (int)submitResult);
 
     // Wait for completion before returning (runtime needs the image ready)
-    LOG_INFO("[RenderScene] eye=%d: vkWaitForFences (post-submit)...", eye);
     VkResult waitResult = vkWaitForFences(device, 1, &renderer.frameFence, VK_TRUE, UINT64_MAX);
-    LOG_INFO("[RenderScene] eye=%d: vkWaitForFences returned %d - DONE", eye, (int)waitResult);
+    LOG_INFO("[RenderScene] vkWaitForFences returned %d - DONE", (int)waitResult);
 }
 
 void CleanupVkRenderer(VkRenderer& renderer) {
@@ -1047,10 +1025,6 @@ void CleanupVkRenderer(VkRenderer& renderer) {
     if (renderer.pipelineLayout) {
         vkDestroyPipelineLayout(renderer.device, renderer.pipelineLayout, nullptr);
         renderer.pipelineLayout = VK_NULL_HANDLE;
-    }
-    if (renderer.renderPassLoad) {
-        vkDestroyRenderPass(renderer.device, renderer.renderPassLoad, nullptr);
-        renderer.renderPassLoad = VK_NULL_HANDLE;
     }
     if (renderer.renderPass) {
         vkDestroyRenderPass(renderer.device, renderer.renderPass, nullptr);

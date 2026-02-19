@@ -18,9 +18,8 @@ struct VkRenderer {
     VkQueue graphicsQueue = VK_NULL_HANDLE;
     uint32_t queueFamilyIndex = 0;
 
-    // Render passes: renderPass clears attachments, renderPassLoad preserves them
+    // Render pass (clears attachments, single pass renders all eyes)
     VkRenderPass renderPass = VK_NULL_HANDLE;
-    VkRenderPass renderPassLoad = VK_NULL_HANDLE;
 
     // Pipeline layout + pipelines
     VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
@@ -76,18 +75,21 @@ bool CreateSwapchainFramebuffers(VkRenderer& renderer, int eye,
 // Update scene
 void UpdateScene(VkRenderer& renderer, float deltaTime);
 
-// Render to a specific swapchain image with viewport offset.
-// Set clear=true on the first eye to clear the framebuffer (LOAD_OP_CLEAR),
-// clear=false on the second eye to preserve the first eye's content (LOAD_OP_LOAD).
+// Per-eye render parameters for single-pass SBS rendering
+struct EyeRenderParams {
+    uint32_t viewportX, viewportY, width, height;
+    DirectX::XMMATRIX viewMatrix;
+    DirectX::XMMATRIX projMatrix;
+};
+
+// Render all eyes in a single render pass (avoids LOAD_OP_LOAD issues).
+// eyes: array of per-eye viewport/matrix params, eyeCount: number of eyes.
 void RenderScene(
     VkRenderer& renderer,
-    int eye, uint32_t imageIndex,
-    uint32_t viewportX, uint32_t viewportY,
-    uint32_t width, uint32_t height,
-    const DirectX::XMMATRIX& viewMatrix,
-    const DirectX::XMMATRIX& projMatrix,
-    float zoomScale = 1.0f,
-    bool clear = true
+    uint32_t imageIndex,
+    uint32_t framebufferWidth, uint32_t framebufferHeight,
+    const EyeRenderParams* eyes, int eyeCount,
+    float zoomScale = 1.0f
 );
 
 // Cleanup
