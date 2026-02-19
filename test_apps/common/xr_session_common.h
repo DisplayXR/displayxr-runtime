@@ -117,10 +117,9 @@ struct XrSessionManager {
 // Create reference spaces
 bool CreateSpaces(XrSessionManager& xr);
 
-// Create a single swapchain at native display resolution.
-// Uses displayPixelWidth x displayPixelHeight from XR_EXT_display_info.
-// Fallback if 0: recommendedImageRectWidth*2 x recommendedImageRectHeight.
-// Capped at maxImageRectWidth x maxImageRectHeight.
+// Create a single SBS swapchain.
+// Ext apps (win32_window_binding): native display resolution from XR_EXT_display_info.
+// Non-ext / unmodified apps: recommendedImageRectWidth*2 x recommendedImageRectHeight.
 bool CreateSwapchain(XrSessionManager& xr);
 
 // Create quad layer swapchain for UI overlay
