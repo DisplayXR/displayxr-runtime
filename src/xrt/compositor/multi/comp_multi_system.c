@@ -1805,6 +1805,317 @@ session_blit_sbs(struct vk_bundle *vk,
 #endif // XRT_HAVE_LEIA_SR_VULKAN
 
 /*!
+ * Initialize Vulkan GPU resources for the HUD overlay (image + staging buffer).
+ * Called lazily on first HUD render.
+ */
+static bool
+session_render_hud_init_gpu(struct multi_compositor *mc, struct vk_bundle *vk)
+{
+	if (mc->session_render.hud_gpu_initialized) {
+		return true;
+	}
+
+	uint32_t hud_w = u_hud_get_width(mc->session_render.hud);
+	uint32_t hud_h = u_hud_get_height(mc->session_render.hud);
+	uint32_t pixel_size = hud_w * hud_h * 4;
+	VkResult ret;
+
+	// Create HUD image (TRANSFER_SRC for blit to swapchain)
+	VkImageCreateInfo image_info = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+	    .imageType = VK_IMAGE_TYPE_2D,
+	    .format = VK_FORMAT_R8G8B8A8_UNORM,
+	    .extent = {hud_w, hud_h, 1},
+	    .mipLevels = 1,
+	    .arrayLayers = 1,
+	    .samples = VK_SAMPLE_COUNT_1_BIT,
+	    .tiling = VK_IMAGE_TILING_OPTIMAL,
+	    .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+	    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+	};
+	ret = vk->vkCreateImage(vk->device, &image_info, NULL, &mc->session_render.hud_image);
+	if (ret != VK_SUCCESS) {
+		U_LOG_E("[HUD] Failed to create image: %s", vk_result_string(ret));
+		return false;
+	}
+
+	// Allocate image memory
+	VkMemoryRequirements mem_reqs;
+	vk->vkGetImageMemoryRequirements(vk->device, mc->session_render.hud_image, &mem_reqs);
+
+	VkMemoryAllocateInfo alloc_info = {
+	    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+	    .allocationSize = mem_reqs.size,
+	};
+	if (!vk_get_memory_type(vk, mem_reqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+	                        &alloc_info.memoryTypeIndex)) {
+		U_LOG_E("[HUD] Failed to find device-local memory type");
+		vk->vkDestroyImage(vk->device, mc->session_render.hud_image, NULL);
+		mc->session_render.hud_image = VK_NULL_HANDLE;
+		return false;
+	}
+
+	ret = vk->vkAllocateMemory(vk->device, &alloc_info, NULL, &mc->session_render.hud_memory);
+	if (ret != VK_SUCCESS) {
+		U_LOG_E("[HUD] Failed to allocate image memory");
+		vk->vkDestroyImage(vk->device, mc->session_render.hud_image, NULL);
+		mc->session_render.hud_image = VK_NULL_HANDLE;
+		return false;
+	}
+	vk->vkBindImageMemory(vk->device, mc->session_render.hud_image, mc->session_render.hud_memory, 0);
+
+	// Create staging buffer
+	VkBufferCreateInfo buf_info = {
+	    .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+	    .size = pixel_size,
+	    .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+	};
+	ret = vk->vkCreateBuffer(vk->device, &buf_info, NULL, &mc->session_render.hud_staging_buffer);
+	if (ret != VK_SUCCESS) {
+		U_LOG_E("[HUD] Failed to create staging buffer");
+		return false;
+	}
+
+	VkMemoryRequirements buf_reqs;
+	vk->vkGetBufferMemoryRequirements(vk->device, mc->session_render.hud_staging_buffer, &buf_reqs);
+
+	VkMemoryAllocateInfo buf_alloc = {
+	    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+	    .allocationSize = buf_reqs.size,
+	};
+	if (!vk_get_memory_type(vk, buf_reqs.memoryTypeBits,
+	                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+	                        &buf_alloc.memoryTypeIndex)) {
+		U_LOG_E("[HUD] Failed to find host-visible memory type");
+		return false;
+	}
+
+	ret = vk->vkAllocateMemory(vk->device, &buf_alloc, NULL, &mc->session_render.hud_staging_memory);
+	if (ret != VK_SUCCESS) {
+		U_LOG_E("[HUD] Failed to allocate staging memory");
+		return false;
+	}
+	vk->vkBindBufferMemory(vk->device, mc->session_render.hud_staging_buffer,
+	                       mc->session_render.hud_staging_memory, 0);
+
+	// Persistently map staging buffer
+	ret = vk->vkMapMemory(vk->device, mc->session_render.hud_staging_memory, 0, pixel_size, 0,
+	                      &mc->session_render.hud_staging_mapped);
+	if (ret != VK_SUCCESS) {
+		U_LOG_E("[HUD] Failed to map staging buffer");
+		return false;
+	}
+
+	mc->session_render.hud_gpu_initialized = true;
+	U_LOG_W("[HUD] Vulkan GPU resources initialized (%ux%u)", hud_w, hud_h);
+	return true;
+}
+
+/*!
+ * Render HUD overlay onto swapchain image (post-weave).
+ * Transitions: PRESENT_SRC -> TRANSFER_DST -> blit -> PRESENT_SRC
+ */
+static void
+session_render_hud_overlay(struct multi_compositor *mc,
+                           struct vk_bundle *vk,
+                           VkCommandBuffer cmd,
+                           VkImage swapchain_image,
+                           uint32_t fb_width,
+                           uint32_t fb_height,
+                           bool is_mono)
+{
+	if (mc->session_render.hud == NULL || !u_hud_is_visible()) {
+		return;
+	}
+
+	// Compute FPS
+	uint64_t now_ns = os_monotonic_get_ns();
+	if (mc->session_render.hud_last_frame_time_ns != 0) {
+		float dt_ms = (float)(now_ns - mc->session_render.hud_last_frame_time_ns) / 1e6f;
+		mc->session_render.hud_smoothed_frame_time_ms =
+		    mc->session_render.hud_smoothed_frame_time_ms * 0.9f + dt_ms * 0.1f;
+	}
+	mc->session_render.hud_last_frame_time_ns = now_ns;
+
+	float fps = 0.0f;
+	if (mc->session_render.hud_smoothed_frame_time_ms > 0.0f) {
+		fps = 1000.0f / mc->session_render.hud_smoothed_frame_time_ms;
+	}
+
+	// Get eye positions and display dims
+	float left_x = -32.0f, left_y = 0.0f, left_z = 600.0f;
+	float right_x = 32.0f, right_y = 0.0f, right_z = 600.0f;
+	bool tracking_active = false;
+	float disp_w_mm = 0.0f, disp_h_mm = 0.0f;
+	float nom_x = 0.0f, nom_y = 0.0f, nom_z = 600.0f;
+
+#ifdef XRT_HAVE_LEIA_SR_VULKAN
+	if (mc->session_render.weaver != NULL) {
+		struct leiasr_eye_pair eyes;
+		if (leiasr_get_predicted_eye_positions(mc->session_render.weaver, &eyes) && eyes.valid) {
+			left_x = eyes.left[0] * 1000.0f;
+			left_y = eyes.left[1] * 1000.0f;
+			left_z = eyes.left[2] * 1000.0f;
+			right_x = eyes.right[0] * 1000.0f;
+			right_y = eyes.right[1] * 1000.0f;
+			right_z = eyes.right[2] * 1000.0f;
+			tracking_active = true;
+		}
+
+		struct leiasr_display_dimensions dims;
+		if (leiasr_get_display_dimensions(mc->session_render.weaver, &dims) && dims.valid) {
+			disp_w_mm = dims.width_m * 1000.0f;
+			disp_h_mm = dims.height_m * 1000.0f;
+			nom_x = dims.nominal_x_m * 1000.0f;
+			nom_y = dims.nominal_y_m * 1000.0f;
+			nom_z = dims.nominal_z_m * 1000.0f;
+		}
+	}
+#endif
+
+	// Determine output mode
+	const char *output_mode = "Fallback";
+	if (is_mono) {
+		output_mode = "2D";
+	} else if (mc->session_render.display_processor != NULL) {
+		output_mode = "Weaved";
+	}
+#ifdef XRT_HAVE_LEIA_SR_VULKAN
+	else if (mc->session_render.weaver != NULL) {
+		output_mode = "Weaved (direct)";
+	}
+#endif
+
+	// Get render dimensions from last delivered layer
+	uint32_t render_w = 0, render_h = 0;
+	for (uint32_t i = 0; i < mc->delivered.layer_count; i++) {
+		enum xrt_layer_type type = mc->delivered.layers[i].data.type;
+		if (type == XRT_LAYER_PROJECTION || type == XRT_LAYER_PROJECTION_DEPTH) {
+			render_w = mc->delivered.layers[i].data.proj.v[0].sub.rect.extent.w;
+			render_h = mc->delivered.layers[i].data.proj.v[0].sub.rect.extent.h;
+			break;
+		}
+	}
+
+	// Fill HUD data
+	struct u_hud_data data = {0};
+	data.fps = fps;
+	data.frame_time_ms = mc->session_render.hud_smoothed_frame_time_ms;
+	data.mode_3d = !is_mono;
+	data.output_mode = output_mode;
+	data.render_width = render_w;
+	data.render_height = render_h;
+	data.window_width = fb_width;
+	data.window_height = fb_height;
+	data.display_width_mm = disp_w_mm;
+	data.display_height_mm = disp_h_mm;
+	data.nominal_x = nom_x;
+	data.nominal_y = nom_y;
+	data.nominal_z = nom_z;
+	data.left_eye_x = left_x;
+	data.left_eye_y = left_y;
+	data.left_eye_z = left_z;
+	data.right_eye_x = right_x;
+	data.right_eye_y = right_y;
+	data.right_eye_z = right_z;
+	data.eye_tracking_active = tracking_active;
+
+	bool dirty = u_hud_update(mc->session_render.hud, &data);
+
+	// Lazy-init GPU resources
+	if (!session_render_hud_init_gpu(mc, vk)) {
+		return;
+	}
+
+	uint32_t hud_w = u_hud_get_width(mc->session_render.hud);
+	uint32_t hud_h = u_hud_get_height(mc->session_render.hud);
+
+	// Upload pixels to staging buffer if changed
+	if (dirty) {
+		memcpy(mc->session_render.hud_staging_mapped,
+		       u_hud_get_pixels(mc->session_render.hud),
+		       hud_w * hud_h * 4);
+	}
+
+	// Transition HUD image: UNDEFINED -> TRANSFER_DST (for copy from staging)
+	VkImageMemoryBarrier hud_to_dst = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = 0,
+	    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+	    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+	    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	    .image = mc->session_render.hud_image,
+	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	};
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+	                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &hud_to_dst);
+
+	// Copy staging buffer -> HUD image
+	VkBufferImageCopy copy_region = {
+	    .bufferOffset = 0,
+	    .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .imageExtent = {hud_w, hud_h, 1},
+	};
+	vk->vkCmdCopyBufferToImage(cmd, mc->session_render.hud_staging_buffer,
+	                           mc->session_render.hud_image,
+	                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	                           1, &copy_region);
+
+	// Transition HUD image: TRANSFER_DST -> TRANSFER_SRC (for blit to swapchain)
+	VkImageMemoryBarrier hud_to_src = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+	    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+	    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	    .image = mc->session_render.hud_image,
+	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	};
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &hud_to_src);
+
+	// Transition swapchain: PRESENT_SRC -> TRANSFER_DST
+	VkImageMemoryBarrier sc_to_dst = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = 0,
+	    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+	    .oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+	    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	    .image = swapchain_image,
+	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	};
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+	                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &sc_to_dst);
+
+	// Blit HUD to bottom-left of swapchain (NEAREST for crisp pixel text)
+	uint32_t dst_x = 10;
+	uint32_t dst_y = (fb_height > hud_h + 10) ? (fb_height - hud_h - 10) : 0;
+	VkImageBlit blit = {
+	    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .srcOffsets = {{0, 0, 0}, {(int32_t)hud_w, (int32_t)hud_h, 1}},
+	    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .dstOffsets = {{(int32_t)dst_x, (int32_t)dst_y, 0},
+	                   {(int32_t)(dst_x + hud_w), (int32_t)(dst_y + hud_h), 1}},
+	};
+	vk->vkCmdBlitImage(cmd, mc->session_render.hud_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	                   swapchain_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	                   1, &blit, VK_FILTER_NEAREST);
+
+	// Transition swapchain: TRANSFER_DST -> PRESENT_SRC
+	VkImageMemoryBarrier sc_to_present = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+	    .dstAccessMask = 0,
+	    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	    .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+	    .image = swapchain_image,
+	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	};
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL, 0, NULL, 1, &sc_to_present);
+}
+
+/*!
  * Render a single per-session client to its own comp_target using display processing.
  *
  * @param mc The multi_compositor with per-session rendering
@@ -2416,6 +2727,14 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 #endif // XRT_HAVE_LEIA_SR_VULKAN
 
 submit_and_present:
+	// HUD overlay (post-weave, always readable)
+#ifdef XRT_OS_WINDOWS
+	if (mc->session_render.owns_window) {
+		session_render_hud_overlay(mc, vk, cmd, ct->images[buffer_index].handle,
+		                           framebufferWidth, framebufferHeight, is_mono);
+	}
+#endif
+
 	// End command buffer
 	ret = vk->vkEndCommandBuffer(cmd);
 	if (ret != VK_SUCCESS) {

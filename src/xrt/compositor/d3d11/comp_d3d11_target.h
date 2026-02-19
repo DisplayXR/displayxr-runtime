@@ -88,6 +88,14 @@ comp_d3d11_target_get_dimensions(struct comp_d3d11_target *target,
                                  uint32_t *out_height);
 
 /*!
+ * Get the back buffer texture (ID3D11Texture2D*) for direct pixel copy.
+ *
+ * @ingroup comp_d3d11
+ */
+void *
+comp_d3d11_target_get_back_buffer(struct comp_d3d11_target *target);
+
+/*!
  * Resize the target swapchain.
  *
  * @param target The target.

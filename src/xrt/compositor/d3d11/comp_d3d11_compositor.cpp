@@ -35,6 +35,8 @@
 
 #include "xrt/xrt_display_processor_d3d11.h"
 
+#include "util/u_hud.h"
+
 #include "sim_display/sim_display_interface.h"
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
@@ -127,6 +129,21 @@ struct comp_d3d11_compositor
 	uint64_t last_display_time_ns;
 
 
+
+	//! HUD overlay (runtime-owned windows only).
+	struct u_hud *hud;
+
+	//! D3D11 staging texture for HUD pixel upload.
+	ID3D11Texture2D *hud_texture;
+
+	//! True if HUD GPU resources are initialized.
+	bool hud_initialized;
+
+	//! Last frame timestamp for FPS calculation.
+	uint64_t last_frame_time_ns;
+
+	//! Smoothed frame time for display.
+	float smoothed_frame_time_ms;
 
 	//! Thread safety.
 	std::mutex mutex;
@@ -561,6 +578,131 @@ d3d11_compositor_layer_window_space(struct xrt_compositor *xc,
 	return XRT_SUCCESS;
 }
 
+/*!
+ * Render the HUD overlay onto the back buffer (post-weave).
+ * Uses CopySubresourceRegion for zero-shader simplicity.
+ */
+static void
+d3d11_render_hud_overlay(struct comp_d3d11_compositor *c, bool is_mono, bool weaving_done,
+                         const struct xrt_vec3 *left_eye, const struct xrt_vec3 *right_eye)
+{
+	if (!c->owns_window || c->hud == NULL || !u_hud_is_visible()) {
+		return;
+	}
+
+	// Compute FPS from frame timestamps
+	uint64_t now_ns = os_monotonic_get_ns();
+	if (c->last_frame_time_ns != 0) {
+		float dt_ms = (float)(now_ns - c->last_frame_time_ns) / 1e6f;
+		// Exponential moving average (alpha=0.1 for smooth display)
+		c->smoothed_frame_time_ms = c->smoothed_frame_time_ms * 0.9f + dt_ms * 0.1f;
+	}
+	c->last_frame_time_ns = now_ns;
+
+	float fps = (c->smoothed_frame_time_ms > 0.0f) ? (1000.0f / c->smoothed_frame_time_ms) : 0.0f;
+
+	// Determine output mode string
+	const char *output_mode = "Fallback";
+	if (!is_mono && weaving_done) {
+		output_mode = (c->display_processor != NULL) ? "Weaved" : "Weaved (direct)";
+	} else if (is_mono) {
+		output_mode = "2D";
+	}
+
+	// Get render and window dimensions
+	uint32_t render_w = 0, render_h = 0;
+	if (c->renderer != nullptr) {
+		comp_d3d11_renderer_get_view_dimensions(c->renderer, &render_w, &render_h);
+	}
+	uint32_t win_w = c->settings.preferred.width;
+	uint32_t win_h = c->settings.preferred.height;
+	if (c->target != nullptr) {
+		comp_d3d11_target_get_dimensions(c->target, &win_w, &win_h);
+	}
+
+	// Get display physical dimensions from SR SDK
+	float disp_w_m = 0.0f, disp_h_m = 0.0f;
+	float nom_x = 0.0f, nom_y = 0.0f, nom_z = 600.0f;
+	comp_d3d11_compositor_get_display_dimensions(&c->base.base, &disp_w_m, &disp_h_m);
+	float disp_w_mm = disp_w_m * 1000.0f;
+	float disp_h_mm = disp_h_m * 1000.0f;
+
+	// Fill HUD data
+	struct u_hud_data data = {0};
+	data.fps = fps;
+	data.frame_time_ms = c->smoothed_frame_time_ms;
+	data.mode_3d = !is_mono;
+	data.output_mode = output_mode;
+	data.render_width = render_w;
+	data.render_height = render_h;
+	data.window_width = win_w;
+	data.window_height = win_h;
+	data.display_width_mm = disp_w_mm;
+	data.display_height_mm = disp_h_mm;
+	data.nominal_x = nom_x;
+	data.nominal_y = nom_y;
+	data.nominal_z = nom_z;
+	data.left_eye_x = left_eye->x * 1000.0f;
+	data.left_eye_y = left_eye->y * 1000.0f;
+	data.left_eye_z = left_eye->z * 1000.0f;
+	data.right_eye_x = right_eye->x * 1000.0f;
+	data.right_eye_y = right_eye->y * 1000.0f;
+	data.right_eye_z = right_eye->z * 1000.0f;
+	data.eye_tracking_active = (left_eye->z != 0.6f || right_eye->z != 0.6f);
+
+	bool dirty = u_hud_update(c->hud, &data);
+
+	// Lazy-create the D3D11 staging texture
+	if (!c->hud_initialized) {
+		uint32_t hud_w = u_hud_get_width(c->hud);
+		uint32_t hud_h = u_hud_get_height(c->hud);
+
+		D3D11_TEXTURE2D_DESC desc = {};
+		desc.Width = hud_w;
+		desc.Height = hud_h;
+		desc.MipLevels = 1;
+		desc.ArraySize = 1;
+		desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		desc.SampleDesc.Count = 1;
+		desc.Usage = D3D11_USAGE_DEFAULT;
+		desc.BindFlags = 0; // No shader binding needed, just copy source
+
+		HRESULT hr = c->device->CreateTexture2D(&desc, nullptr, &c->hud_texture);
+		if (FAILED(hr)) {
+			U_LOG_E("Failed to create HUD texture: 0x%08x", hr);
+			return;
+		}
+		c->hud_initialized = true;
+		dirty = true; // Force initial upload
+	}
+
+	// Upload pixels to staging texture if changed
+	if (dirty && c->hud_texture != nullptr) {
+		uint32_t hud_w = u_hud_get_width(c->hud);
+		c->context->UpdateSubresource(c->hud_texture, 0, nullptr,
+		                               u_hud_get_pixels(c->hud),
+		                               hud_w * 4, 0);
+	}
+
+	// Blit HUD texture to bottom-left of back buffer
+	if (c->hud_texture != nullptr && c->target != nullptr) {
+		ID3D11Texture2D *back_buffer =
+		    static_cast<ID3D11Texture2D *>(comp_d3d11_target_get_back_buffer(c->target));
+		if (back_buffer != nullptr) {
+			uint32_t hud_w = u_hud_get_width(c->hud);
+			uint32_t hud_h = u_hud_get_height(c->hud);
+
+			// Position at bottom-left with 10px margin
+			uint32_t dst_x = 10;
+			uint32_t dst_y = (win_h > hud_h + 10) ? (win_h - hud_h - 10) : 0;
+
+			D3D11_BOX src_box = {0, 0, 0, hud_w, hud_h, 1};
+			c->context->CopySubresourceRegion(back_buffer, 0, dst_x, dst_y, 0,
+			                                   c->hud_texture, 0, &src_box);
+		}
+	}
+}
+
 static xrt_result_t
 d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
 {
@@ -764,6 +906,9 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 	}
 
+	// HUD overlay (post-weave, always readable)
+	d3d11_render_hud_overlay(c, is_mono, weaving_done, &left_eye, &right_eye);
+
 	// Present with VSync. sync_interval=1 ensures DWM composites the frame
 	// at the same vsync boundary the weaver targeted, keeping the interlacing
 	// pattern aligned with the lenticular display's phase-snapped position.
@@ -810,6 +955,13 @@ d3d11_compositor_destroy(struct xrt_compositor *xc)
 		u_debug_gui_stop(&c->debug_gui);
 	}
 #endif
+
+	// Destroy HUD
+	if (c->hud_texture != nullptr) {
+		c->hud_texture->Release();
+		c->hud_texture = nullptr;
+	}
+	u_hud_destroy(&c->hud);
 
 	// Destroy display processor before underlying weaver
 	xrt_display_processor_d3d11_destroy(&c->display_processor);
@@ -1134,6 +1286,16 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 
 	// Initialize layer accumulator - just zero it
 	memset(&c->layer_accum, 0, sizeof(c->layer_accum));
+
+	// Create HUD overlay for runtime-owned windows
+	c->hud = NULL;
+	c->hud_texture = nullptr;
+	c->hud_initialized = false;
+	c->last_frame_time_ns = 0;
+	c->smoothed_frame_time_ms = 16.67f;
+	if (c->owns_window) {
+		u_hud_create(&c->hud, 480, 256);
+	}
 
 	// Populate supported swapchain formats (DXGI formats for D3D11)
 	// These are the common formats that D3D11 applications can use

@@ -19,6 +19,7 @@
 #include "os/os_time.h"
 #include "os/os_threading.h"
 
+#include "util/u_hud.h"
 #include "util/u_pacing.h"
 #include "util/comp_target_service.h"
 #include "multi/comp_multi_interface.h"
@@ -334,6 +335,19 @@ struct multi_compositor
 		//! True if we created the window ourselves (must destroy on end_session)
 		bool owns_window;
 #endif
+
+		//! @name HUD overlay (runtime-owned windows only)
+		//! @{
+		struct u_hud *hud;
+		VkImage hud_image;
+		VkDeviceMemory hud_memory;
+		VkBuffer hud_staging_buffer;
+		VkDeviceMemory hud_staging_memory;
+		void *hud_staging_mapped;
+		bool hud_gpu_initialized;
+		uint64_t hud_last_frame_time_ns;
+		float hud_smoothed_frame_time_ms;
+		//! @}
 
 		//! True if per-session resources are initialized
 		bool initialized;

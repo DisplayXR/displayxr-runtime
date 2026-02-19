@@ -47,6 +47,9 @@ add_library(
 	u_hand_tracking.h
 	u_hand_simulation.c
 	u_hand_simulation.h
+	u_hud.c
+	u_hud.h
+	u_hud_font.h
 	u_handles.c
 	u_handles.h
 	u_hashmap.cpp

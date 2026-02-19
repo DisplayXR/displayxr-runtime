@@ -17,6 +17,7 @@
 
 #include "qwerty_device.h"
 #include "util/u_device.h"
+#include "util/u_hud.h"
 #include "util/u_logging.h"
 #include "xrt/xrt_device.h"
 
@@ -505,6 +506,12 @@ qwerty_process_win32(struct xrt_device **xdevs,
 					qwerty_reset_controller_pose(qright);
 				}
 			}
+			break;
+
+		// TAB key toggles runtime HUD overlay
+		case VK_TAB:
+			if (is_keydown)
+				u_hud_toggle();
 			break;
 
 		// ESC key to close window

@@ -1177,6 +1177,28 @@ multi_compositor_destroy(struct xrt_compositor *xc)
 		}
 #endif
 
+		// Destroy HUD resources
+		if (vk != NULL && mc->session_render.hud_gpu_initialized) {
+			if (mc->session_render.hud_staging_mapped != NULL && mc->session_render.hud_staging_memory != VK_NULL_HANDLE) {
+				vk->vkUnmapMemory(vk->device, mc->session_render.hud_staging_memory);
+				mc->session_render.hud_staging_mapped = NULL;
+			}
+			if (mc->session_render.hud_staging_buffer != VK_NULL_HANDLE) {
+				vk->vkDestroyBuffer(vk->device, mc->session_render.hud_staging_buffer, NULL);
+			}
+			if (mc->session_render.hud_staging_memory != VK_NULL_HANDLE) {
+				vk->vkFreeMemory(vk->device, mc->session_render.hud_staging_memory, NULL);
+			}
+			if (mc->session_render.hud_image != VK_NULL_HANDLE) {
+				vk->vkDestroyImage(vk->device, mc->session_render.hud_image, NULL);
+			}
+			if (mc->session_render.hud_memory != VK_NULL_HANDLE) {
+				vk->vkFreeMemory(vk->device, mc->session_render.hud_memory, NULL);
+			}
+			mc->session_render.hud_gpu_initialized = false;
+		}
+		u_hud_destroy(&mc->session_render.hud);
+
 		// Destroy fences (generic Vulkan)
 		if (vk != NULL && mc->session_render.fences != NULL) {
 			for (uint32_t i = 0; i < mc->session_render.buffer_count; i++) {
@@ -1609,6 +1631,22 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 		}
 #endif
 	}
+
+	// Create HUD overlay for runtime-owned windows
+	mc->session_render.hud = NULL;
+	mc->session_render.hud_image = VK_NULL_HANDLE;
+	mc->session_render.hud_memory = VK_NULL_HANDLE;
+	mc->session_render.hud_staging_buffer = VK_NULL_HANDLE;
+	mc->session_render.hud_staging_memory = VK_NULL_HANDLE;
+	mc->session_render.hud_staging_mapped = NULL;
+	mc->session_render.hud_gpu_initialized = false;
+	mc->session_render.hud_last_frame_time_ns = 0;
+	mc->session_render.hud_smoothed_frame_time_ms = 16.67f;
+#ifdef XRT_OS_WINDOWS
+	if (mc->session_render.owns_window) {
+		u_hud_create(&mc->session_render.hud, 480, 256);
+	}
+#endif
 
 	U_LOG_W("Setting session_render.initialized = true...");
 	mc->session_render.initialized = true;

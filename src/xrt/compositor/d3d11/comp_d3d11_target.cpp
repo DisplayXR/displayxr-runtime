@@ -232,6 +232,15 @@ comp_d3d11_target_get_dimensions(struct comp_d3d11_target *target,
 	*out_height = target->height;
 }
 
+extern "C" void *
+comp_d3d11_target_get_back_buffer(struct comp_d3d11_target *target)
+{
+	if (target == nullptr) {
+		return nullptr;
+	}
+	return target->back_buffer;
+}
+
 extern "C" xrt_result_t
 comp_d3d11_target_resize(struct comp_d3d11_target *target,
                          uint32_t width,

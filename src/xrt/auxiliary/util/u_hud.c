@@ -1,0 +1,265 @@
+// Copyright 2025, Leia Inc.
+// SPDX-License-Identifier: BSL-1.0
+/*!
+ * @file
+ * @brief  Runtime HUD overlay implementation.
+ * @author David Fattal
+ * @ingroup aux_util
+ */
+
+#include "u_hud.h"
+#include "u_hud_font.h"
+#include "os/os_time.h"
+
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdbool.h>
+
+/*
+ * Glyph dimensions from the embedded font.
+ */
+#define GLYPH_W 8
+#define GLYPH_H 16
+
+/*
+ * Minimum interval between HUD redraws (500ms = ~2Hz).
+ */
+#define HUD_UPDATE_INTERVAL_NS (500ULL * 1000ULL * 1000ULL)
+
+/*
+ * Margin in pixels around text content.
+ */
+#define HUD_MARGIN 6
+
+/*
+ * Global visibility flag. Single bool, safe for single-writer (TAB key thread)
+ * and single-reader (compositor render thread) without atomics.
+ */
+static bool g_hud_visible = false;
+
+void
+u_hud_toggle(void)
+{
+	g_hud_visible = !g_hud_visible;
+}
+
+bool
+u_hud_is_visible(void)
+{
+	return g_hud_visible;
+}
+
+struct u_hud
+{
+	uint8_t *pixels; //!< RGBA pixel buffer
+	uint32_t width;
+	uint32_t height;
+	uint64_t last_update_ns; //!< Timestamp of last redraw
+	bool dirty;              //!< True if pixels changed since last query
+};
+
+bool
+u_hud_create(struct u_hud **out_hud, uint32_t width, uint32_t height)
+{
+	if (out_hud == NULL || width == 0 || height == 0) {
+		return false;
+	}
+
+	struct u_hud *hud = (struct u_hud *)calloc(1, sizeof(struct u_hud));
+	if (hud == NULL) {
+		return false;
+	}
+
+	hud->pixels = (uint8_t *)calloc(width * height * 4, 1);
+	if (hud->pixels == NULL) {
+		free(hud);
+		return false;
+	}
+
+	hud->width = width;
+	hud->height = height;
+	hud->last_update_ns = 0;
+	hud->dirty = false;
+
+	*out_hud = hud;
+	return true;
+}
+
+void
+u_hud_destroy(struct u_hud **hud_ptr)
+{
+	if (hud_ptr == NULL || *hud_ptr == NULL) {
+		return;
+	}
+
+	struct u_hud *hud = *hud_ptr;
+	free(hud->pixels);
+	free(hud);
+	*hud_ptr = NULL;
+}
+
+/*!
+ * Draw a single character at (px, py) in the pixel buffer.
+ * White text (255,255,255,255) on whatever background is already there.
+ */
+static void
+draw_char(struct u_hud *hud, int px, int py, char ch)
+{
+	unsigned int c = (unsigned char)ch;
+	if (c >= 128) {
+		return;
+	}
+
+	for (int row = 0; row < GLYPH_H; row++) {
+		int y = py + row;
+		if (y < 0 || y >= (int)hud->height) {
+			continue;
+		}
+
+		unsigned char bits = u_hud_font_data[c][row];
+		for (int col = 0; col < GLYPH_W; col++) {
+			int x = px + col;
+			if (x < 0 || x >= (int)hud->width) {
+				continue;
+			}
+
+			if (bits & (0x80 >> col)) {
+				uint32_t offset = (y * hud->width + x) * 4;
+				hud->pixels[offset + 0] = 255; // R
+				hud->pixels[offset + 1] = 255; // G
+				hud->pixels[offset + 2] = 255; // B
+				hud->pixels[offset + 3] = 255; // A
+			}
+		}
+	}
+}
+
+/*!
+ * Draw a string at (px, py), advancing horizontally by GLYPH_W per character.
+ */
+static void
+draw_string(struct u_hud *hud, int px, int py, const char *str)
+{
+	int x = px;
+	while (*str != '\0') {
+		draw_char(hud, x, py, *str);
+		x += GLYPH_W;
+		str++;
+	}
+}
+
+bool
+u_hud_update(struct u_hud *hud, const struct u_hud_data *data)
+{
+	if (hud == NULL || data == NULL) {
+		return false;
+	}
+
+	// Rate limit to ~2Hz
+	uint64_t now_ns = os_monotonic_get_ns();
+	if (hud->last_update_ns != 0 && (now_ns - hud->last_update_ns) < HUD_UPDATE_INTERVAL_NS) {
+		return false;
+	}
+	hud->last_update_ns = now_ns;
+
+	// Clear to opaque black background
+	uint32_t total_pixels = hud->width * hud->height;
+	for (uint32_t i = 0; i < total_pixels; i++) {
+		hud->pixels[i * 4 + 0] = 0;   // R
+		hud->pixels[i * 4 + 1] = 0;   // G
+		hud->pixels[i * 4 + 2] = 0;   // B
+		hud->pixels[i * 4 + 3] = 255; // A (opaque)
+	}
+
+	// Format and draw text lines
+	char line[80];
+	int x = HUD_MARGIN;
+	int y = HUD_MARGIN;
+	int line_h = GLYPH_H + 2; // 2px spacing between lines
+
+	// Line 1: FPS
+	snprintf(line, sizeof(line), "FPS: %.0f  (%.1f ms)", data->fps, data->frame_time_ms);
+	draw_string(hud, x, y, line);
+	y += line_h;
+
+	// Line 2: Mode and output
+	snprintf(line, sizeof(line), "Mode: %s  Output: %s", data->mode_3d ? "3D" : "2D",
+	         data->output_mode ? data->output_mode : "N/A");
+	draw_string(hud, x, y, line);
+	y += line_h;
+
+	// Line 3: Render size
+	snprintf(line, sizeof(line), "Render: %ux%u", data->render_width, data->render_height);
+	draw_string(hud, x, y, line);
+	y += line_h;
+
+	// Line 4: Window size
+	snprintf(line, sizeof(line), "Window: %ux%u", data->window_width, data->window_height);
+	draw_string(hud, x, y, line);
+	y += line_h;
+
+	// Line 5: Display dimensions
+	snprintf(line, sizeof(line), "Display: (%.0fx%.0f) mm", data->display_width_mm, data->display_height_mm);
+	draw_string(hud, x, y, line);
+	y += line_h;
+
+	// Line 6: Nominal position
+	snprintf(line, sizeof(line), "Nominal: (%.0f, %.0f, %.0f) mm", data->nominal_x, data->nominal_y,
+	         data->nominal_z);
+	draw_string(hud, x, y, line);
+	y += line_h;
+
+	// Line 7: Left eye
+	snprintf(line, sizeof(line), "L eye: (%.0f, %.0f, %.0f) mm", data->left_eye_x, data->left_eye_y,
+	         data->left_eye_z);
+	draw_string(hud, x, y, line);
+	y += line_h;
+
+	// Line 8: Right eye
+	snprintf(line, sizeof(line), "R eye: (%.0f, %.0f, %.0f) mm", data->right_eye_x, data->right_eye_y,
+	         data->right_eye_z);
+	draw_string(hud, x, y, line);
+	y += line_h;
+
+	// Line 9: Tracking status
+	snprintf(line, sizeof(line), "Track: %s", data->eye_tracking_active ? "Active" : "Inactive");
+	draw_string(hud, x, y, line);
+	y += line_h;
+
+	// Line 10: Blank separator
+	y += line_h / 2;
+
+	// Line 11: Key hints
+	draw_string(hud, x, y, "TAB=HUD  V=2D/3D  ESC=Quit");
+
+	hud->dirty = true;
+	return true;
+}
+
+const uint8_t *
+u_hud_get_pixels(struct u_hud *hud)
+{
+	if (hud == NULL) {
+		return NULL;
+	}
+	return hud->pixels;
+}
+
+uint32_t
+u_hud_get_width(struct u_hud *hud)
+{
+	if (hud == NULL) {
+		return 0;
+	}
+	return hud->width;
+}
+
+uint32_t
+u_hud_get_height(struct u_hud *hud)
+{
+	if (hud == NULL) {
+		return 0;
+	}
+	return hud->height;
+}
