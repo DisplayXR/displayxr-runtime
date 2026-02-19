@@ -1203,6 +1203,7 @@ do_weaving(struct comp_renderer *r,
 				    (struct comp_swapchain *)comp_layer_get_swapchain(layer, 1);
 				VkImage img_left = sc_left->vkic.images[vd_left->sub.image_index].handle;
 				VkImage img_right = sc_right->vkic.images[vd_right->sub.image_index].handle;
+				bool same_image = (img_left == img_right);
 
 				VkImageMemoryBarrier barriers[2] = {
 				    {
@@ -1224,10 +1225,11 @@ do_weaving(struct comp_renderer *r,
 				        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
 				    },
 				};
+				uint32_t barrier_count = same_image ? 1 : 2;
 				vk->vkCmdPipelineBarrier(commandBuffer,
 				                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 				                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-				                         0, 0, NULL, 0, NULL, 2, barriers);
+				                         0, 0, NULL, 0, NULL, barrier_count, barriers);
 			}
 
 			// Display processor render pass handles target layout:
