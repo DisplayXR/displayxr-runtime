@@ -50,9 +50,6 @@
 static const uint64_t RECOMMENDED_VIEW_WIDTH = 320;
 static const uint64_t RECOMMENDED_VIEW_HEIGHT = 240;
 
-static const uint64_t MAX_VIEW_WIDTH = 1920;
-static const uint64_t MAX_VIEW_HEIGHT = 1080;
-
 DEBUG_GET_ONCE_LOG_OPTION(log, "XRT_COMPOSITOR_LOG", U_LOGGING_INFO)
 
 
@@ -318,35 +315,28 @@ compositor_init_sys_info(struct null_compositor *c, struct xrt_device *xdev)
 	(void)sys_info->client_d3d_deviceLUID;
 	(void)sys_info->client_d3d_deviceLUID_valid;
 
-	// Use custom dimensions if set, otherwise use defaults
-	uint64_t rec_width = (c->recommended_view_width > 0) ? c->recommended_view_width : RECOMMENDED_VIEW_WIDTH;
-	uint64_t rec_height = (c->recommended_view_height > 0) ? c->recommended_view_height : RECOMMENDED_VIEW_HEIGHT;
-
-	// Scale max dimensions proportionally if custom dimensions exceed defaults
-	uint64_t max_width = MAX_VIEW_WIDTH;
-	uint64_t max_height = MAX_VIEW_HEIGHT;
-	if (rec_width > max_width) {
-		max_width = rec_width;
-	}
-	if (rec_height > max_height) {
-		max_height = rec_height;
-	}
-
+	// Use device native display resolution per eye for recommended/max
 	uint32_t view_count = xdev->hmd->view_count;
+	uint64_t native_w = xdev->hmd->screens[0].w_pixels;
+	uint64_t native_h = xdev->hmd->screens[0].h_pixels;
+
+	uint64_t per_eye_w = (native_w > 0 && view_count > 0) ? (native_w / view_count) : RECOMMENDED_VIEW_WIDTH;
+	uint64_t per_eye_h = (native_h > 0) ? native_h : RECOMMENDED_VIEW_HEIGHT;
+
 	// clang-format off
 	for (uint32_t i = 0; i < view_count; ++i) {
-		sys_info->views[i].recommended.width_pixels  = rec_width;
-		sys_info->views[i].recommended.height_pixels = rec_height;
+		sys_info->views[i].recommended.width_pixels  = per_eye_w;
+		sys_info->views[i].recommended.height_pixels = per_eye_h;
 		sys_info->views[i].recommended.sample_count  = 1;
-		sys_info->views[i].max.width_pixels  = max_width;
-		sys_info->views[i].max.height_pixels = max_height;
+		sys_info->views[i].max.width_pixels  = per_eye_w;
+		sys_info->views[i].max.height_pixels = per_eye_h;
 		sys_info->views[i].max.sample_count  = 1;
 	}
 	// clang-format on
 
-	NULL_INFO(c, "Null compositor recommended view: %lux%lu (max: %lux%lu)",
-	          (unsigned long)rec_width, (unsigned long)rec_height,
-	          (unsigned long)max_width, (unsigned long)max_height);
+	NULL_INFO(c, "Null compositor view: %lux%lu per eye (native: %lux%lu)",
+	          (unsigned long)per_eye_w, (unsigned long)per_eye_h,
+	          (unsigned long)native_w, (unsigned long)native_h);
 
 	// Copy the list directly.
 	assert(xdev->hmd->blend_mode_count <= XRT_MAX_DEVICE_BLEND_MODES);
@@ -759,10 +749,6 @@ null_compositor_create_system_with_dims(struct xrt_device *xdev,
 		c->settings.frame_interval_ns = U_TIME_1S_IN_NS / 20; // 20 FPS default
 	}
 	c->xdev = xdev;
-
-	// Store custom recommended dimensions (0 = use defaults)
-	c->recommended_view_width = recommended_width;
-	c->recommended_view_height = recommended_height;
 
 	NULL_DEBUG(c, "Doing init %p", (void *)c);
 

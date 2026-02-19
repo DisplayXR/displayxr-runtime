@@ -463,6 +463,12 @@ struct PushConstants {
     float color[4];
 };
 
+struct EyeRenderParams {
+    uint32_t viewportX, viewportY, width, height;
+    float viewMat[16];
+    float projMat[16];
+};
+
 struct VkRenderer {
     VkDevice device = VK_NULL_HANDLE;
     VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
@@ -483,12 +489,15 @@ struct VkRenderer {
     VkDeviceMemory gridVertexMemory = VK_NULL_HANDLE;
     int gridVertexCount = 0;
 
-    VkImage depthImages[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
-    VkDeviceMemory depthMemory[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
-    VkImageView depthViews[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkImage depthImage = VK_NULL_HANDLE;
+    VkDeviceMemory depthMemory = VK_NULL_HANDLE;
+    VkImageView depthView = VK_NULL_HANDLE;
 
-    std::vector<VkImageView> swapchainImageViews[2];
-    std::vector<VkFramebuffer> framebuffers[2];
+    std::vector<VkImageView> swapchainImageViews;
+    std::vector<VkFramebuffer> framebuffers;
+
+    uint32_t fbWidth = 0;
+    uint32_t fbHeight = 0;
 
     VkCommandPool commandPool = VK_NULL_HANDLE;
     VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
@@ -897,13 +906,15 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
     return true;
 }
 
-static bool CreateSwapchainFramebuffers(VkRenderer& renderer, int eye,
+static bool CreateSwapchainFramebuffers(VkRenderer& renderer,
     const VkImage* images, uint32_t count,
     uint32_t width, uint32_t height, VkFormat colorFormat)
 {
     VkDevice device = renderer.device;
+    renderer.fbWidth = width;
+    renderer.fbHeight = height;
 
-    // Depth image for this eye
+    // Single depth image for the full SBS framebuffer
     {
         VkImageCreateInfo imageInfo = {};
         imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -916,13 +927,13 @@ static bool CreateSwapchainFramebuffers(VkRenderer& renderer, int eye,
         imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
         imageInfo.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
 
-        if (vkCreateImage(device, &imageInfo, nullptr, &renderer.depthImages[eye]) != VK_SUCCESS) {
-            LOG_ERROR("Failed to create depth image for eye %d", eye);
+        if (vkCreateImage(device, &imageInfo, nullptr, &renderer.depthImage) != VK_SUCCESS) {
+            LOG_ERROR("Failed to create depth image");
             return false;
         }
 
         VkMemoryRequirements memReqs;
-        vkGetImageMemoryRequirements(device, renderer.depthImages[eye], &memReqs);
+        vkGetImageMemoryRequirements(device, renderer.depthImage, &memReqs);
 
         VkMemoryAllocateInfo allocInfo = {};
         allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
@@ -930,31 +941,31 @@ static bool CreateSwapchainFramebuffers(VkRenderer& renderer, int eye,
         allocInfo.memoryTypeIndex = FindMemoryType(renderer.physicalDevice, memReqs.memoryTypeBits,
             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
-        if (vkAllocateMemory(device, &allocInfo, nullptr, &renderer.depthMemory[eye]) != VK_SUCCESS) {
-            LOG_ERROR("Failed to allocate depth memory for eye %d", eye);
+        if (vkAllocateMemory(device, &allocInfo, nullptr, &renderer.depthMemory) != VK_SUCCESS) {
+            LOG_ERROR("Failed to allocate depth memory");
             return false;
         }
 
-        vkBindImageMemory(device, renderer.depthImages[eye], renderer.depthMemory[eye], 0);
+        vkBindImageMemory(device, renderer.depthImage, renderer.depthMemory, 0);
 
         VkImageViewCreateInfo viewInfo = {};
         viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-        viewInfo.image = renderer.depthImages[eye];
+        viewInfo.image = renderer.depthImage;
         viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
         viewInfo.format = VK_FORMAT_D32_SFLOAT;
         viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
         viewInfo.subresourceRange.levelCount = 1;
         viewInfo.subresourceRange.layerCount = 1;
 
-        if (vkCreateImageView(device, &viewInfo, nullptr, &renderer.depthViews[eye]) != VK_SUCCESS) {
-            LOG_ERROR("Failed to create depth view for eye %d", eye);
+        if (vkCreateImageView(device, &viewInfo, nullptr, &renderer.depthView) != VK_SUCCESS) {
+            LOG_ERROR("Failed to create depth view");
             return false;
         }
     }
 
     // Image views and framebuffers for each swapchain image
-    renderer.swapchainImageViews[eye].resize(count);
-    renderer.framebuffers[eye].resize(count);
+    renderer.swapchainImageViews.resize(count);
+    renderer.framebuffers.resize(count);
 
     for (uint32_t i = 0; i < count; i++) {
         VkImageViewCreateInfo viewInfo = {};
@@ -966,14 +977,14 @@ static bool CreateSwapchainFramebuffers(VkRenderer& renderer, int eye,
         viewInfo.subresourceRange.levelCount = 1;
         viewInfo.subresourceRange.layerCount = 1;
 
-        if (vkCreateImageView(device, &viewInfo, nullptr, &renderer.swapchainImageViews[eye][i]) != VK_SUCCESS) {
-            LOG_ERROR("Failed to create image view for eye %d image %u", eye, i);
+        if (vkCreateImageView(device, &viewInfo, nullptr, &renderer.swapchainImageViews[i]) != VK_SUCCESS) {
+            LOG_ERROR("Failed to create image view for image %u", i);
             return false;
         }
 
         VkImageView attachments[] = {
-            renderer.swapchainImageViews[eye][i],
-            renderer.depthViews[eye]
+            renderer.swapchainImageViews[i],
+            renderer.depthView
         };
 
         VkFramebufferCreateInfo fbInfo = {};
@@ -985,22 +996,19 @@ static bool CreateSwapchainFramebuffers(VkRenderer& renderer, int eye,
         fbInfo.height = height;
         fbInfo.layers = 1;
 
-        if (vkCreateFramebuffer(device, &fbInfo, nullptr, &renderer.framebuffers[eye][i]) != VK_SUCCESS) {
-            LOG_ERROR("Failed to create framebuffer for eye %d image %u", eye, i);
+        if (vkCreateFramebuffer(device, &fbInfo, nullptr, &renderer.framebuffers[i]) != VK_SUCCESS) {
+            LOG_ERROR("Failed to create framebuffer for image %u", i);
             return false;
         }
     }
 
-    LOG_INFO("Created %u framebuffers for eye %d (%ux%u)", count, eye, width, height);
+    LOG_INFO("Created %u framebuffers (%ux%u)", count, width, height);
     return true;
 }
 
 static void RenderScene(
-    VkRenderer& renderer,
-    int eye, uint32_t imageIndex,
-    uint32_t width, uint32_t height,
-    const float* viewMatrix,
-    const float* projMatrix)
+    VkRenderer& renderer, uint32_t imageIndex,
+    const EyeRenderParams* eyes, int eyeCount)
 {
     VkDevice device = renderer.device;
 
@@ -1009,13 +1017,14 @@ static void RenderScene(
     vkResetFences(device, 1, &renderer.frameFence);
 
     // Begin command buffer
-    vkResetCommandBuffer(renderer.commandBuffer, 0);
+    VkCommandBuffer cmd = renderer.commandBuffer;
+    vkResetCommandBuffer(cmd, 0);
     VkCommandBufferBeginInfo beginInfo = {};
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(renderer.commandBuffer, &beginInfo);
+    vkBeginCommandBuffer(cmd, &beginInfo);
 
-    // Begin render pass
+    // Begin render pass with full SBS framebuffer
     VkClearValue clearValues[2] = {};
     clearValues[0].color = {{0.05f, 0.05f, 0.25f, 1.0f}};
     clearValues[1].depthStencil = {1.0f, 0};
@@ -1023,91 +1032,89 @@ static void RenderScene(
     VkRenderPassBeginInfo rpBegin = {};
     rpBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
     rpBegin.renderPass = renderer.renderPass;
-    rpBegin.framebuffer = renderer.framebuffers[eye][imageIndex];
-    rpBegin.renderArea.extent = {width, height};
+    rpBegin.framebuffer = renderer.framebuffers[imageIndex];
+    rpBegin.renderArea = {{0, 0}, {renderer.fbWidth, renderer.fbHeight}};
     rpBegin.clearValueCount = 2;
     rpBegin.pClearValues = clearValues;
 
-    vkCmdBeginRenderPass(renderer.commandBuffer, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBeginRenderPass(cmd, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
 
-    // Viewport with Y-flip for correct NDC convention
-    VkViewport viewport = {};
-    viewport.x = 0;
-    viewport.y = (float)height;
-    viewport.width = (float)width;
-    viewport.height = -(float)height;
-    viewport.minDepth = 0.0f;
-    viewport.maxDepth = 1.0f;
-    vkCmdSetViewport(renderer.commandBuffer, 0, 1, &viewport);
+    // Render all eyes in a single render pass — just change viewport/scissor
+    for (int eye = 0; eye < eyeCount; eye++) {
+        const auto& e = eyes[eye];
 
-    VkRect2D scissor = {};
-    scissor.extent = {width, height};
-    vkCmdSetScissor(renderer.commandBuffer, 0, 1, &scissor);
+        // Viewport with Y-flip for correct NDC convention
+        VkViewport viewport = {(float)e.viewportX, (float)(e.viewportY + e.height),
+            (float)e.width, -(float)e.height, 0.0f, 1.0f};
+        VkRect2D scissor = {{(int32_t)e.viewportX, (int32_t)e.viewportY}, {e.width, e.height}};
+        vkCmdSetViewport(cmd, 0, 1, &viewport);
+        vkCmdSetScissor(cmd, 0, 1, &scissor);
 
-    // Draw cube — base rests on grid at y=0
-    {
-        const float cubeSize = 0.06f;
-        const float cubeHeight = cubeSize / 2.0f;
+        float vp[16];
+        mat4_multiply(vp, e.projMat, e.viewMat);
 
-        float scale[16], rot[16], trans[16];
-        mat4_scaling(scale, cubeSize, cubeSize, cubeSize);
-        mat4_rotation_y(rot, renderer.cubeRotation);
-        mat4_translation(trans, 0.0f, cubeHeight, 0.0f);
+        // Draw cube — base rests on grid at y=0
+        {
+            const float cubeSize = 0.06f;
+            const float cubeHeight = cubeSize / 2.0f;
 
-        // Column-vector convention: MVP = proj * view * translate * scale * rotate
-        float tmp1[16], tmp2[16], tmp3[16], mvp[16];
-        mat4_multiply(tmp1, scale, rot);        // scale * rotate
-        mat4_multiply(tmp2, trans, tmp1);        // translate * scale * rotate
-        mat4_multiply(tmp3, viewMatrix, tmp2);   // view * model
-        mat4_multiply(mvp, projMatrix, tmp3);    // proj * view * model
+            float scale[16], rot[16], trans[16];
+            mat4_scaling(scale, cubeSize, cubeSize, cubeSize);
+            mat4_rotation_y(rot, renderer.cubeRotation);
+            mat4_translation(trans, 0.0f, cubeHeight, 0.0f);
 
-        PushConstants pc = {};
-        memcpy(pc.transform, mvp, sizeof(mvp));
-        pc.color[0] = 1.0f; pc.color[1] = 1.0f; pc.color[2] = 1.0f; pc.color[3] = 1.0f;
+            float tmp1[16], tmp2[16], mvp[16];
+            mat4_multiply(tmp1, scale, rot);
+            mat4_multiply(tmp2, trans, tmp1);
+            mat4_multiply(mvp, vp, tmp2);
 
-        vkCmdBindPipeline(renderer.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, renderer.cubePipeline);
-        vkCmdPushConstants(renderer.commandBuffer, renderer.pipelineLayout,
-            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
+            PushConstants pc = {};
+            memcpy(pc.transform, mvp, sizeof(mvp));
+            pc.color[0] = 1.0f; pc.color[1] = 1.0f; pc.color[2] = 1.0f; pc.color[3] = 1.0f;
 
-        VkDeviceSize offset = 0;
-        vkCmdBindVertexBuffers(renderer.commandBuffer, 0, 1, &renderer.cubeVertexBuffer, &offset);
-        vkCmdBindIndexBuffer(renderer.commandBuffer, renderer.cubeIndexBuffer, 0, VK_INDEX_TYPE_UINT16);
-        vkCmdDrawIndexed(renderer.commandBuffer, 36, 1, 0, 0, 0);
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, renderer.cubePipeline);
+            vkCmdPushConstants(cmd, renderer.pipelineLayout,
+                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
+
+            VkDeviceSize offset = 0;
+            vkCmdBindVertexBuffers(cmd, 0, 1, &renderer.cubeVertexBuffer, &offset);
+            vkCmdBindIndexBuffer(cmd, renderer.cubeIndexBuffer, 0, VK_INDEX_TYPE_UINT16);
+            vkCmdDrawIndexed(cmd, 36, 1, 0, 0, 0);
+        }
+
+        // Draw grid floor
+        {
+            const float gridScale = 0.05f;
+            float scale[16], trans[16];
+            mat4_scaling(scale, gridScale, gridScale, gridScale);
+            mat4_translation(trans, 0.0f, gridScale, 0.0f);
+
+            float tmp1[16], tmp2[16], mvp[16];
+            mat4_multiply(tmp1, trans, scale);
+            mat4_multiply(mvp, vp, tmp1);
+
+            PushConstants pc = {};
+            memcpy(pc.transform, mvp, sizeof(mvp));
+            pc.color[0] = 0.3f; pc.color[1] = 0.3f; pc.color[2] = 0.35f; pc.color[3] = 1.0f;
+
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, renderer.gridPipeline);
+            vkCmdPushConstants(cmd, renderer.pipelineLayout,
+                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
+
+            VkDeviceSize offset = 0;
+            vkCmdBindVertexBuffers(cmd, 0, 1, &renderer.gridVertexBuffer, &offset);
+            vkCmdDraw(cmd, renderer.gridVertexCount, 1, 0, 0);
+        }
     }
 
-    // Draw grid floor
-    {
-        const float gridScale = 0.05f;
-        float scale[16], trans[16];
-        mat4_scaling(scale, gridScale, gridScale, gridScale);
-        mat4_translation(trans, 0.0f, gridScale, 0.0f);
-
-        float tmp1[16], tmp2[16], mvp[16];
-        mat4_multiply(tmp1, trans, scale);          // translate * scale
-        mat4_multiply(tmp2, viewMatrix, tmp1);      // view * model
-        mat4_multiply(mvp, projMatrix, tmp2);       // proj * view * model
-
-        PushConstants pc = {};
-        memcpy(pc.transform, mvp, sizeof(mvp));
-        pc.color[0] = 0.3f; pc.color[1] = 0.3f; pc.color[2] = 0.35f; pc.color[3] = 1.0f;
-
-        vkCmdBindPipeline(renderer.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, renderer.gridPipeline);
-        vkCmdPushConstants(renderer.commandBuffer, renderer.pipelineLayout,
-            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
-
-        VkDeviceSize offset = 0;
-        vkCmdBindVertexBuffers(renderer.commandBuffer, 0, 1, &renderer.gridVertexBuffer, &offset);
-        vkCmdDraw(renderer.commandBuffer, renderer.gridVertexCount, 1, 0, 0);
-    }
-
-    vkCmdEndRenderPass(renderer.commandBuffer);
-    vkEndCommandBuffer(renderer.commandBuffer);
+    vkCmdEndRenderPass(cmd);
+    vkEndCommandBuffer(cmd);
 
     // Submit
     VkSubmitInfo submitInfo = {};
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &renderer.commandBuffer;
+    submitInfo.pCommandBuffers = &cmd;
 
     vkQueueSubmit(renderer.graphicsQueue, 1, &submitInfo, renderer.frameFence);
 
@@ -1120,27 +1127,25 @@ static void CleanupVkRenderer(VkRenderer& renderer) {
 
     vkDeviceWaitIdle(renderer.device);
 
-    for (int eye = 0; eye < 2; eye++) {
-        for (auto fb : renderer.framebuffers[eye])
-            vkDestroyFramebuffer(renderer.device, fb, nullptr);
-        renderer.framebuffers[eye].clear();
+    for (auto fb : renderer.framebuffers)
+        vkDestroyFramebuffer(renderer.device, fb, nullptr);
+    renderer.framebuffers.clear();
 
-        for (auto iv : renderer.swapchainImageViews[eye])
-            vkDestroyImageView(renderer.device, iv, nullptr);
-        renderer.swapchainImageViews[eye].clear();
+    for (auto iv : renderer.swapchainImageViews)
+        vkDestroyImageView(renderer.device, iv, nullptr);
+    renderer.swapchainImageViews.clear();
 
-        if (renderer.depthViews[eye]) {
-            vkDestroyImageView(renderer.device, renderer.depthViews[eye], nullptr);
-            renderer.depthViews[eye] = VK_NULL_HANDLE;
-        }
-        if (renderer.depthImages[eye]) {
-            vkDestroyImage(renderer.device, renderer.depthImages[eye], nullptr);
-            renderer.depthImages[eye] = VK_NULL_HANDLE;
-        }
-        if (renderer.depthMemory[eye]) {
-            vkFreeMemory(renderer.device, renderer.depthMemory[eye], nullptr);
-            renderer.depthMemory[eye] = VK_NULL_HANDLE;
-        }
+    if (renderer.depthView) {
+        vkDestroyImageView(renderer.device, renderer.depthView, nullptr);
+        renderer.depthView = VK_NULL_HANDLE;
+    }
+    if (renderer.depthImage) {
+        vkDestroyImage(renderer.device, renderer.depthImage, nullptr);
+        renderer.depthImage = VK_NULL_HANDLE;
+    }
+    if (renderer.depthMemory) {
+        vkFreeMemory(renderer.device, renderer.depthMemory, nullptr);
+        renderer.depthMemory = VK_NULL_HANDLE;
     }
 
     if (renderer.frameFence) {
@@ -1212,7 +1217,7 @@ struct AppXrSession {
     XrSpace localSpace = XR_NULL_HANDLE;
     XrSpace viewSpace = XR_NULL_HANDLE;
 
-    SwapchainInfo swapchains[2];
+    SwapchainInfo swapchain;
 
     XrViewConfigurationType viewConfigType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
     std::vector<XrViewConfigurationView> configViews;
@@ -1523,8 +1528,8 @@ static bool CreateSpaces(AppXrSession& xr) {
     return true;
 }
 
-static bool CreateSwapchains(AppXrSession& xr) {
-    LOG_INFO("Creating swapchains...");
+static bool CreateSwapchain(AppXrSession& xr) {
+    LOG_INFO("Creating single SBS swapchain...");
 
     uint32_t formatCount = 0;
     XR_CHECK(xrEnumerateSwapchainFormats(xr.session, 0, &formatCount, nullptr));
@@ -1535,35 +1540,33 @@ static bool CreateSwapchains(AppXrSession& xr) {
     int64_t selectedFormat = formats[0];
     LOG_INFO("Selected swapchain format: %lld (0x%llX)", (long long)selectedFormat, (long long)selectedFormat);
 
-    for (int eye = 0; eye < 2 && eye < (int)xr.configViews.size(); eye++) {
-        const auto& view = xr.configViews[eye];
+    const auto& view = xr.configViews[0];
 
-        XrSwapchainCreateInfo swapchainInfo = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
-        swapchainInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
-        swapchainInfo.format = selectedFormat;
-        swapchainInfo.sampleCount = view.recommendedSwapchainSampleCount;
-        swapchainInfo.width = view.recommendedImageRectWidth;
-        swapchainInfo.height = view.recommendedImageRectHeight;
-        swapchainInfo.faceCount = 1;
-        swapchainInfo.arraySize = 1;
-        swapchainInfo.mipCount = 1;
+    // Single SBS swapchain: 2x width for side-by-side stereo
+    XrSwapchainCreateInfo swapchainInfo = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    swapchainInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+    swapchainInfo.format = selectedFormat;
+    swapchainInfo.sampleCount = view.recommendedSwapchainSampleCount;
+    swapchainInfo.width = view.recommendedImageRectWidth * 2;
+    swapchainInfo.height = view.recommendedImageRectHeight;
+    swapchainInfo.faceCount = 1;
+    swapchainInfo.arraySize = 1;
+    swapchainInfo.mipCount = 1;
 
-        LOG_INFO("  Eye %d: %ux%u", eye, swapchainInfo.width, swapchainInfo.height);
+    LOG_INFO("  SBS swapchain: %ux%u", swapchainInfo.width, swapchainInfo.height);
 
-        XR_CHECK(xrCreateSwapchain(xr.session, &swapchainInfo, &xr.swapchains[eye].swapchain));
+    XR_CHECK(xrCreateSwapchain(xr.session, &swapchainInfo, &xr.swapchain.swapchain));
 
-        xr.swapchains[eye].format = selectedFormat;
-        xr.swapchains[eye].width = swapchainInfo.width;
-        xr.swapchains[eye].height = swapchainInfo.height;
+    xr.swapchain.format = selectedFormat;
+    xr.swapchain.width = swapchainInfo.width;
+    xr.swapchain.height = swapchainInfo.height;
 
-        uint32_t imageCount = 0;
-        XR_CHECK(xrEnumerateSwapchainImages(xr.swapchains[eye].swapchain, 0, &imageCount, nullptr));
-        xr.swapchains[eye].imageCount = imageCount;
+    uint32_t imageCount = 0;
+    XR_CHECK(xrEnumerateSwapchainImages(xr.swapchain.swapchain, 0, &imageCount, nullptr));
+    xr.swapchain.imageCount = imageCount;
 
-        LOG_INFO("  Eye %d: %u swapchain images", eye, imageCount);
-    }
-
-    LOG_INFO("Swapchains created");
+    LOG_INFO("  %u swapchain images", imageCount);
+    LOG_INFO("SBS swapchain created");
     return true;
 }
 
@@ -1630,26 +1633,26 @@ static bool BeginFrame(AppXrSession& xr, XrFrameState& frameState) {
     return true;
 }
 
-static bool AcquireSwapchainImage(AppXrSession& xr, int eye, uint32_t& imageIndex) {
+static bool AcquireSwapchainImage(AppXrSession& xr, uint32_t& imageIndex) {
     XrSwapchainImageAcquireInfo acquireInfo = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-    XrResult result = xrAcquireSwapchainImage(xr.swapchains[eye].swapchain, &acquireInfo, &imageIndex);
+    XrResult result = xrAcquireSwapchainImage(xr.swapchain.swapchain, &acquireInfo, &imageIndex);
     if (XR_FAILED(result)) return false;
 
     XrSwapchainImageWaitInfo waitInfo = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
     waitInfo.timeout = XR_INFINITE_DURATION;
-    result = xrWaitSwapchainImage(xr.swapchains[eye].swapchain, &waitInfo);
+    result = xrWaitSwapchainImage(xr.swapchain.swapchain, &waitInfo);
     if (XR_FAILED(result)) {
         XrSwapchainImageReleaseInfo releaseInfo = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-        xrReleaseSwapchainImage(xr.swapchains[eye].swapchain, &releaseInfo);
+        xrReleaseSwapchainImage(xr.swapchain.swapchain, &releaseInfo);
         return false;
     }
 
     return true;
 }
 
-static bool ReleaseSwapchainImage(AppXrSession& xr, int eye) {
+static bool ReleaseSwapchainImage(AppXrSession& xr) {
     XrSwapchainImageReleaseInfo releaseInfo = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-    return XR_SUCCEEDED(xrReleaseSwapchainImage(xr.swapchains[eye].swapchain, &releaseInfo));
+    return XR_SUCCEEDED(xrReleaseSwapchainImage(xr.swapchain.swapchain, &releaseInfo));
 }
 
 static bool EndFrame(AppXrSession& xr, XrTime displayTime, const XrCompositionLayerProjectionView* views) {
@@ -1672,11 +1675,9 @@ static bool EndFrame(AppXrSession& xr, XrTime displayTime, const XrCompositionLa
 }
 
 static void CleanupOpenXR(AppXrSession& xr) {
-    for (int eye = 0; eye < 2; eye++) {
-        if (xr.swapchains[eye].swapchain != XR_NULL_HANDLE) {
-            xrDestroySwapchain(xr.swapchains[eye].swapchain);
-            xr.swapchains[eye].swapchain = XR_NULL_HANDLE;
-        }
+    if (xr.swapchain.swapchain != XR_NULL_HANDLE) {
+        xrDestroySwapchain(xr.swapchain.swapchain);
+        xr.swapchain.swapchain = XR_NULL_HANDLE;
     }
     if (xr.viewSpace != XR_NULL_HANDLE) {
         xrDestroySpace(xr.viewSpace);
@@ -1792,7 +1793,7 @@ int main() {
         return 1;
     }
 
-    if (!CreateSwapchains(xr)) {
+    if (!CreateSwapchain(xr)) {
         LOG_ERROR("Swapchain creation failed");
         CleanupOpenXR(xr);
         vkDestroyDevice(vkDevice, nullptr);
@@ -1801,17 +1802,14 @@ int main() {
     }
 
     // Enumerate Vulkan swapchain images
-    std::vector<XrSwapchainImageVulkanKHR> swapchainImages[2];
-    for (int eye = 0; eye < 2; eye++) {
-        uint32_t count = xr.swapchains[eye].imageCount;
-        swapchainImages[eye].resize(count, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
-        xrEnumerateSwapchainImages(xr.swapchains[eye].swapchain, count, &count,
-            (XrSwapchainImageBaseHeader*)swapchainImages[eye].data());
-        LOG_INFO("Eye %d: enumerated %u Vulkan swapchain images", eye, count);
-    }
+    uint32_t scImageCount = xr.swapchain.imageCount;
+    std::vector<XrSwapchainImageVulkanKHR> swapchainImages(scImageCount, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
+    xrEnumerateSwapchainImages(xr.swapchain.swapchain, scImageCount, &scImageCount,
+        (XrSwapchainImageBaseHeader*)swapchainImages.data());
+    LOG_INFO("Enumerated %u Vulkan swapchain images", scImageCount);
 
     // Initialize Vulkan renderer
-    VkFormat colorFormat = (VkFormat)xr.swapchains[0].format;
+    VkFormat colorFormat = (VkFormat)xr.swapchain.format;
     VkRenderer vkRenderer = {};
     if (!InitializeVkRenderer(vkRenderer, vkDevice, physDevice, graphicsQueue, queueFamilyIndex, colorFormat)) {
         LOG_ERROR("Vulkan renderer initialization failed");
@@ -1821,17 +1819,16 @@ int main() {
         return 1;
     }
 
-    // Create framebuffers
-    for (int eye = 0; eye < 2; eye++) {
-        uint32_t count = xr.swapchains[eye].imageCount;
-        std::vector<VkImage> images(count);
-        for (uint32_t i = 0; i < count; i++) {
-            images[i] = swapchainImages[eye][i].image;
+    // Create framebuffers for the single SBS swapchain
+    {
+        std::vector<VkImage> images(scImageCount);
+        for (uint32_t i = 0; i < scImageCount; i++) {
+            images[i] = swapchainImages[i].image;
         }
 
-        if (!CreateSwapchainFramebuffers(vkRenderer, eye, images.data(), count,
-            xr.swapchains[eye].width, xr.swapchains[eye].height, colorFormat)) {
-            LOG_ERROR("Failed to create framebuffers for eye %d", eye);
+        if (!CreateSwapchainFramebuffers(vkRenderer, images.data(), scImageCount,
+            xr.swapchain.width, xr.swapchain.height, colorFormat)) {
+            LOG_ERROR("Failed to create framebuffers");
             CleanupVkRenderer(vkRenderer);
             CleanupOpenXR(xr);
             vkDestroyDevice(vkDevice, nullptr);
@@ -1881,33 +1878,35 @@ int main() {
                         (viewState.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) &&
                         (viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT))
                     {
-                        rendered = true;
-                        for (int eye = 0; eye < 2; eye++) {
-                            uint32_t imageIndex;
-                            if (AcquireSwapchainImage(xr, eye, imageIndex)) {
-                                float viewMat[16], projMat[16];
-                                mat4_view_from_xr_pose(viewMat, views[eye].pose);
-                                mat4_from_xr_fov(projMat, views[eye].fov, 0.01f, 100.0f);
+                        uint32_t imageIndex;
+                        if (AcquireSwapchainImage(xr, imageIndex)) {
+                            rendered = true;
 
-                                RenderScene(vkRenderer, eye, imageIndex,
-                                    xr.swapchains[eye].width, xr.swapchains[eye].height,
-                                    viewMat, projMat);
+                            uint32_t renderW = xr.swapchain.width / 2;
+                            uint32_t renderH = xr.swapchain.height;
 
-                                ReleaseSwapchainImage(xr, eye);
+                            EyeRenderParams eyeParams[2] = {};
+                            for (int eye = 0; eye < 2; eye++) {
+                                eyeParams[eye].viewportX = eye * renderW;
+                                eyeParams[eye].viewportY = 0;
+                                eyeParams[eye].width = renderW;
+                                eyeParams[eye].height = renderH;
+                                mat4_view_from_xr_pose(eyeParams[eye].viewMat, views[eye].pose);
+                                mat4_from_xr_fov(eyeParams[eye].projMat, views[eye].fov, 0.01f, 100.0f);
 
                                 projectionViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
-                                projectionViews[eye].subImage.swapchain = xr.swapchains[eye].swapchain;
-                                projectionViews[eye].subImage.imageRect.offset = {0, 0};
+                                projectionViews[eye].subImage.swapchain = xr.swapchain.swapchain;
+                                projectionViews[eye].subImage.imageRect.offset = {(int32_t)(eye * renderW), 0};
                                 projectionViews[eye].subImage.imageRect.extent = {
-                                    (int32_t)xr.swapchains[eye].width,
-                                    (int32_t)xr.swapchains[eye].height
+                                    (int32_t)renderW, (int32_t)renderH
                                 };
                                 projectionViews[eye].subImage.imageArrayIndex = 0;
                                 projectionViews[eye].pose = views[eye].pose;
                                 projectionViews[eye].fov = views[eye].fov;
-                            } else {
-                                rendered = false;
                             }
+
+                            RenderScene(vkRenderer, imageIndex, eyeParams, 2);
+                            ReleaseSwapchainImage(xr);
                         }
                     }
                 }
