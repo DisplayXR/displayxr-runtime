@@ -144,6 +144,14 @@ struct sim_display_hmd
 	//! Nominal viewer distance in meters.
 	float nominal_z_m;
 
+	//! Inter-pupillary distance in meters.
+	float ipd_m;
+
+	//! Zoom scale factor (1.0 = no zoom). Divides both eye position
+	//! and screen dimensions for Kooima projection. Ready for future
+	//! scroll-wheel zoom support.
+	float zoom_scale;
+
 	enum u_logging_level log_level;
 };
 
@@ -228,6 +236,69 @@ sim_display_hmd_destroy(struct xrt_device *xdev)
 
 	u_var_remove_root(hmd);
 	u_device_free(&hmd->base);
+}
+
+/*!
+ * Per-frame Kooima asymmetric frustum FOV.
+ *
+ * Matches the ext app's calculation: eye position and screen dimensions are
+ * both divided by zoom_scale, and screen width is halved in SBS mode.
+ * For fullscreen non-ext apps, the viewport-scaling step (vs = minDisp/minWin)
+ * reduces to 1.0 since window == display.
+ */
+static xrt_result_t
+sim_display_get_view_poses(struct xrt_device *xdev,
+                           const struct xrt_vec3 *default_eye_relation,
+                           int64_t at_timestamp_ns,
+                           uint32_t view_count,
+                           struct xrt_space_relation *out_head_relation,
+                           struct xrt_fov *out_fovs,
+                           struct xrt_pose *out_poses)
+{
+	struct sim_display_hmd *hmd = sim_display_hmd(xdev);
+
+	// Get head tracking pose (display-space: origin at display center).
+	xrt_result_t xret =
+	    xrt_device_get_tracked_pose(xdev, XRT_INPUT_GENERIC_HEAD_POSE, at_timestamp_ns, out_head_relation);
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+
+	// Per-eye head-relative offset poses.
+	for (uint32_t i = 0; i < view_count && i < ARRAY_SIZE(xdev->hmd->views); i++) {
+		u_device_get_view_pose(default_eye_relation, i, &out_poses[i]);
+	}
+
+	// Kooima projection: recompute FOV each frame from tracked eye position.
+	float zs = hmd->zoom_scale;
+	if (zs < 0.001f) {
+		zs = 1.0f;
+	}
+
+	// Screen dims depend on current output mode (atomic, can change mid-frame via 1/2/3 keys).
+	bool sbs_mode = (sim_display_get_output_mode() == SIM_DISPLAY_OUTPUT_SBS);
+	float screen_w = (sbs_mode ? hmd->display_width_m / 2.0f : hmd->display_width_m) / zs;
+	float screen_h = hmd->display_height_m / zs;
+	float half_w = screen_w / 2.0f;
+	float half_h = screen_h / 2.0f;
+
+	for (uint32_t i = 0; i < view_count && i < ARRAY_SIZE(xdev->hmd->views); i++) {
+		// Eye world position = head + per-eye offset, divided by zoom.
+		float eye_x = (out_head_relation->pose.position.x + out_poses[i].position.x) / zs;
+		float eye_y = (out_head_relation->pose.position.y + out_poses[i].position.y) / zs;
+		float eye_z = (out_head_relation->pose.position.z + out_poses[i].position.z) / zs;
+
+		if (eye_z <= 0.001f) {
+			eye_z = hmd->nominal_z_m / zs;
+		}
+
+		out_fovs[i].angle_left = atanf((-half_w - eye_x) / eye_z);
+		out_fovs[i].angle_right = atanf((half_w - eye_x) / eye_z);
+		out_fovs[i].angle_up = atanf((half_h - eye_y) / eye_z);
+		out_fovs[i].angle_down = atanf((-half_h - eye_y) / eye_z);
+	}
+
+	return XRT_SUCCESS;
 }
 
 void
@@ -327,13 +398,15 @@ sim_display_hmd_create(void)
 	hmd->display_height_m = display_h_m;
 	hmd->display_pixel_width = (uint32_t)pixel_w;
 	hmd->display_pixel_height = (uint32_t)pixel_h;
+	hmd->ipd_m = ipd;
+	hmd->zoom_scale = 1.0f;
 	hmd->nominal_z_m = nominal_z;
 	hmd->log_level = U_LOGGING_INFO;
 
 	// xrt_device methods.
 	hmd->base.update_inputs = u_device_noop_update_inputs;
 	hmd->base.get_tracked_pose = sim_display_hmd_get_tracked_pose;
-	hmd->base.get_view_poses = u_device_get_view_poses;
+	hmd->base.get_view_poses = sim_display_get_view_poses;
 	hmd->base.get_visibility_mask = u_device_get_visibility_mask;
 	hmd->base.destroy = sim_display_hmd_destroy;
 	hmd->base.name = XRT_DEVICE_GENERIC_HMD;
