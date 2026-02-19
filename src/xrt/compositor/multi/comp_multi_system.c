@@ -2103,6 +2103,40 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 			dp_logged = true;
 		}
 
+#ifdef XRT_HAVE_LEIA_SR_VULKAN
+		// Window-space overlay path: composite projection + HUD layers into
+		// intermediate per-eye images, then pass directly to display processor.
+		// composite_layers_to_intermediate() outputs SHADER_READ_ONLY_OPTIMAL
+		// views which is what the display processor expects as sampled input.
+		if (has_window_space_layers(mc)) {
+			VkImageView comp_left = VK_NULL_HANDLE, comp_right = VK_NULL_HANDLE;
+			if (composite_layers_to_intermediate(mc, vk, cmd, &comp_left, &comp_right)) {
+				static bool comp_dp_logged = false;
+				if (!comp_dp_logged) {
+					U_LOG_W("[per-session] Display processor with composited overlays, "
+					        "composite=%ux%u",
+					        mc->session_render.composite_width,
+					        mc->session_render.composite_height);
+					comp_dp_logged = true;
+				}
+
+				xrt_display_processor_process_views(
+				    mc->session_render.display_processor, cmd,
+				    comp_left, comp_right,
+				    mc->session_render.composite_width,
+				    mc->session_render.composite_height,
+				    (VkFormat_XDP)imageFormat,
+				    framebuffer, framebufferWidth, framebufferHeight,
+				    (VkFormat_XDP)framebufferFormat);
+
+				goto submit_and_present;
+			}
+		}
+#endif
+
+		// Crop-blit path (no window-space layers): blit source sub-region into
+		// intermediates, then pass the cropped views to the display processor.
+
 		// Ensure crop images exist at the correct size
 		if (!ensure_session_dp_crop_images(mc, vk, imageWidth, imageHeight, imageFormat)) {
 			U_LOG_E("[per-session] Failed to ensure dp_crop images");
@@ -2578,6 +2612,28 @@ transfer_layers_locked(struct multi_system_compositor *msc, int64_t display_time
 	};
 	xrt_comp_layer_begin(xc, &data);
 
+	// Runtime-side 2D/3D toggle from qwerty V key for shared compositor path.
+	// Per-session clients handle this in render_session_to_own_target().
+#ifdef XRT_BUILD_DRIVER_QWERTY
+	bool shared_force_2d = false;
+	for (size_t k = 0; k < count; k++) {
+		struct multi_compositor *mc = array[k];
+		if (mc->session_render.initialized) {
+			continue; // skip per-session clients
+		}
+		if (mc->xsysd != NULL) {
+			bool force_2d = false;
+			bool toggled =
+			    qwerty_check_display_mode_toggle(mc->xsysd->xdevs, mc->xsysd->xdev_count, &force_2d);
+			if (toggled) {
+				multi_compositor_request_display_mode(mc, !force_2d);
+			}
+			shared_force_2d = force_2d;
+			break; // one toggle check per frame is enough
+		}
+	}
+#endif
+
 	// Copy all active layers (skip sessions with per-session rendering - Phase 4).
 	for (size_t k = 0; k < count; k++) {
 		struct multi_compositor *mc = array[k];
@@ -2590,6 +2646,30 @@ transfer_layers_locked(struct multi_system_compositor *msc, int64_t display_time
 
 		for (uint32_t i = 0; i < mc->delivered.layer_count; i++) {
 			struct multi_layer_entry *layer = &mc->delivered.layers[i];
+
+			// When force_2d is active, override projection layers to mono (view_count=1)
+			// so the main compositor's dispatch_graphics() uses full-width viewport
+			// and skips weaving.
+#ifdef XRT_BUILD_DRIVER_QWERTY
+			bool override_mono = shared_force_2d &&
+			                     (layer->data.type == XRT_LAYER_PROJECTION ||
+			                      layer->data.type == XRT_LAYER_PROJECTION_DEPTH) &&
+			                     layer->data.view_count > 1;
+			if (override_mono) {
+				struct multi_layer_entry mono_layer = *layer;
+				mono_layer.data.view_count = 1;
+				switch (layer->data.type) {
+				case XRT_LAYER_PROJECTION:
+					do_projection_layer(xc, mc, &mono_layer, i);
+					break;
+				case XRT_LAYER_PROJECTION_DEPTH:
+					do_projection_layer_depth(xc, mc, &mono_layer, i);
+					break;
+				default: break;
+				}
+				continue;
+			}
+#endif
 
 			switch (layer->data.type) {
 			case XRT_LAYER_PROJECTION: do_projection_layer(xc, mc, layer, i); break;
