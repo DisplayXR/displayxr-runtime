@@ -21,6 +21,7 @@
 
 #include "util/u_pacing.h"
 #include "util/comp_target_service.h"
+#include "multi/comp_multi_interface.h"
 
 // Vulkan types needed for Y-flip SBS image and display processor support
 // (comp_multi always links aux_vk, so Vulkan is always available)
@@ -528,6 +529,11 @@ struct multi_system_compositor
 
 	//! Service for creating per-session render targets (provided by comp_main)
 	struct comp_target_service *target_service;
+
+	//! Optional callback to pass system devices to the Vulkan window for input forwarding.
+	//! Set by comp_main when the native compositor is a comp_compositor with a window target.
+	//! NULL when comp_main is not linked (e.g. sdl-test).
+	comp_window_set_system_devices_fn set_window_system_devices;
 };
 
 /*!

@@ -823,5 +823,5 @@ null_compositor_create_system_with_dims(struct xrt_device *xdev,
 	assert(xret == XRT_SUCCESS && upaf != NULL);
 
 	return comp_multi_create_system_compositor(&c->base.base, upaf, &c->sys_info, false, &c->target_service,
-	                                           false, out_xsysc);
+	                                           false, NULL, out_xsysc);
 }

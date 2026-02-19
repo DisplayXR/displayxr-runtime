@@ -387,7 +387,6 @@ endif()
 
 if(XRT_MODULE_COMPOSITOR_MAIN)
 	target_link_libraries(comp_main PRIVATE comp_multi)
-	target_compile_definitions(comp_multi PRIVATE XRT_HAVE_COMP_MAIN)
 endif()
 
 ###

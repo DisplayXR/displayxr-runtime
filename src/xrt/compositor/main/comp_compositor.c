@@ -72,6 +72,7 @@
 #include "main/comp_window_peek.h"
 #endif
 
+#include "main/comp_window.h"
 #include "multi/comp_multi_interface.h"
 
 #include <math.h>
@@ -1507,8 +1508,13 @@ comp_main_create_system_compositor(struct xrt_device *xdev,
 		}
 	}
 
+	// On Windows, pass the mswin window's set_system_devices for qwerty input forwarding.
+	comp_window_set_system_devices_fn set_window_sysdevs = NULL;
+#ifdef XRT_OS_WINDOWS
+	set_window_sysdevs = comp_window_mswin_set_system_devices;
+#endif
 	xret = comp_multi_create_system_compositor(&c->base.base, upaf, sys_info, !c->deferred_surface,
-	                                           &c->target_service, true, out_xsysc);
+	                                           &c->target_service, true, set_window_sysdevs, out_xsysc);
 	if (xret == XRT_SUCCESS) {
 		return xret;
 	}

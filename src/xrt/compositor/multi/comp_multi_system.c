@@ -48,9 +48,6 @@
 
 #ifdef XRT_OS_WINDOWS
 #include "comp_d3d11_window.h"
-#ifdef XRT_HAVE_COMP_MAIN
-#include "main/comp_window.h"
-#endif
 #endif
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
@@ -2638,9 +2635,9 @@ transfer_layers_locked(struct multi_system_compositor *msc, int64_t display_time
 #endif
 
 	// One-time: pass xsysd to main compositor's Vulkan window for qwerty forwarding
-#if defined(XRT_OS_WINDOWS) && defined(XRT_BUILD_DRIVER_QWERTY) && defined(XRT_HAVE_COMP_MAIN)
+#if defined(XRT_OS_WINDOWS) && defined(XRT_BUILD_DRIVER_QWERTY)
 	static bool xsysd_forwarded = false;
-	if (!xsysd_forwarded && msc->xcn_is_comp_compositor) {
+	if (!xsysd_forwarded && msc->set_window_system_devices != NULL && msc->xcn_is_comp_compositor) {
 		for (size_t k = 0; k < count; k++) {
 			struct multi_compositor *mc = array[k];
 			if (mc->session_render.initialized) {
@@ -2649,7 +2646,7 @@ transfer_layers_locked(struct multi_system_compositor *msc, int64_t display_time
 			if (mc->xsysd != NULL) {
 				struct comp_compositor *cc = comp_compositor(&msc->xcn->base);
 				if (cc->target != NULL) {
-					comp_window_mswin_set_system_devices(cc->target, mc->xsysd);
+					msc->set_window_system_devices(cc->target, mc->xsysd);
 					xsysd_forwarded = true;
 				}
 				break;
@@ -3124,6 +3121,7 @@ comp_multi_create_system_compositor(struct xrt_compositor_native *xcn,
                                     bool do_warm_start,
                                     struct comp_target_service *target_service,
                                     bool xcn_is_comp_compositor,
+                                    comp_window_set_system_devices_fn set_window_system_devices,
                                     struct xrt_system_compositor **out_xsysc)
 {
 	struct multi_system_compositor *msc = U_TYPED_CALLOC(struct multi_system_compositor);
@@ -3140,6 +3138,7 @@ comp_multi_create_system_compositor(struct xrt_compositor_native *xcn,
 	msc->upaf = upaf;
 	msc->xcn = xcn;
 	msc->xcn_is_comp_compositor = xcn_is_comp_compositor;
+	msc->set_window_system_devices = set_window_system_devices;
 
 	// Store the target service for per-session rendering (Phase 3)
 	msc->target_service = target_service;
