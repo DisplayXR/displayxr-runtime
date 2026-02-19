@@ -59,4 +59,7 @@ target_link_libraries(sim_cube_openxr_ext_macos PRIVATE
     Vulkan::Vulkan
     "-framework Cocoa"
     "-framework QuartzCore"
+    "-framework CoreGraphics"
+    "-framework CoreText"
+    "-framework CoreFoundation"
 )

@@ -233,6 +233,23 @@ sim_display_hmd_set_pose_source(struct xrt_device *sim_hmd, struct xrt_device *s
 	hmd->pose_source = source;
 }
 
+bool
+sim_display_get_display_info(struct xrt_device *xdev, struct sim_display_info *out_info)
+{
+	if (xdev == NULL || out_info == NULL) {
+		return false;
+	}
+	if (strcmp(xdev->serial, "sim_display_0") != 0) {
+		return false;
+	}
+	struct sim_display_hmd *hmd = sim_display_hmd(xdev);
+	out_info->display_width_m = hmd->display_width_m;
+	out_info->display_height_m = hmd->display_height_m;
+	out_info->nominal_y_m = hmd->pose.position.y;
+	out_info->nominal_z_m = hmd->nominal_z_m;
+	return true;
+}
+
 
 /*
  *

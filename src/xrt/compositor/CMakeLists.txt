@@ -366,6 +366,12 @@ target_include_directories(comp_multi PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 # Link comp_multi and comp_main to sim_display driver for display processor creation
 target_link_libraries(comp_multi PRIVATE drv_sim_display)
+
+# Qwerty include path for runtime-side 2D/3D toggle polling
+if(XRT_BUILD_DRIVER_QWERTY)
+	target_link_libraries(comp_multi PRIVATE drv_qwerty_includes)
+	target_compile_definitions(comp_multi PRIVATE XRT_BUILD_DRIVER_QWERTY)
+endif()
 target_link_libraries(comp_main PRIVATE drv_sim_display)
 
 # Link comp_multi to leiasr driver for per-session SR weaver creation

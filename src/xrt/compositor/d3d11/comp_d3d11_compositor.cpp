@@ -26,15 +26,20 @@
 #include "util/u_time.h"
 #include "os/os_time.h"
 
+#include "xrt/xrt_system.h"
+
 #ifdef XRT_FEATURE_DEBUG_GUI
 #include "util/u_debug_gui.h"
 #include "comp_d3d11_debug.h"
-#include "xrt/xrt_system.h"
 #endif
 
 #include "xrt/xrt_display_processor_d3d11.h"
 
 #include "sim_display/sim_display_interface.h"
+
+#ifdef XRT_BUILD_DRIVER_QWERTY
+#include "qwerty/qwerty_interface.h"
+#endif
 
 #ifdef XRT_HAVE_LEIA_SR_D3D11
 #include "leia/leia_sr_d3d11.h"
@@ -101,15 +106,15 @@ struct comp_d3d11_compositor
 	//! Generic D3D11 display processor (vendor-agnostic weaving).
 	struct xrt_display_processor_d3d11 *display_processor;
 
+	//! System devices (for qwerty driver keyboard input and display mode toggle).
+	struct xrt_system_devices *xsysd;
+
 #ifdef XRT_FEATURE_DEBUG_GUI
 	//! Debug GUI window.
 	struct u_debug_gui *debug_gui;
 
 	//! Debug readback module.
 	struct comp_d3d11_debug *debug;
-
-	//! System devices (for qwerty driver keyboard input).
-	struct xrt_system_devices *xsysd;
 #endif
 
 	//! Current frame ID.
@@ -591,6 +596,20 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 	}
 
+	// Runtime-side 2D/3D toggle from qwerty V key
+#ifdef XRT_BUILD_DRIVER_QWERTY
+	if (c->xsysd != nullptr) {
+		bool force_2d = false;
+		bool toggled = qwerty_check_display_mode_toggle(c->xsysd->xdevs, c->xsysd->xdev_count, &force_2d);
+		if (toggled) {
+			comp_d3d11_compositor_request_display_mode(&c->base.base, !force_2d);
+		}
+		if (force_2d) {
+			is_mono = true;
+		}
+	}
+#endif
+
 	// Get target (window) dimensions for mono viewport sizing
 	uint32_t tgt_width = c->settings.preferred.width;
 	uint32_t tgt_height = c->settings.preferred.height;
@@ -626,6 +645,12 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	bool weaving_done = false;
 
 	// Use generic display processor for weaving (vendor-agnostic path)
+	// TODO: Same crop-blit fix as Vulkan comp_multi (ensure_session_dp_crop_images).
+	// If the app renders to a sub-region of the swapchain (imageRect.extent < swapchain),
+	// the SRV here covers the full texture but view_width/view_height reflect the sub-region.
+	// The display processor samples UVs 0..1 on the full SRV, reading uninitialized texels.
+	// Fix: crop-copy into a correctly-sized intermediate D3D11 texture before passing to
+	// the display processor, matching the Vulkan dp_crop_images approach.
 	if (!is_mono && c->display_processor != NULL) {
 		static bool dp_logged = false;
 		if (!dp_logged) {
@@ -1368,13 +1393,11 @@ comp_d3d11_compositor_set_system_devices(struct xrt_compositor *xc,
 
 	struct comp_d3d11_compositor *c = d3d11_comp(xc);
 
-#ifdef XRT_FEATURE_DEBUG_GUI
 	c->xsysd = xsysd;
 
 	if (xsysd != nullptr) {
-		U_LOG_I("D3D11 compositor: system devices set for debug GUI qwerty support");
+		U_LOG_I("D3D11 compositor: system devices set for qwerty support");
 	}
-#endif
 
 	// Pass xsysd to self-owned window for direct qwerty input from main window
 	// This enables WASDQE controls without requiring the SDL debug window

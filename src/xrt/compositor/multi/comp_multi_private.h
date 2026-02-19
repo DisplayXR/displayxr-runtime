@@ -300,6 +300,20 @@ struct multi_compositor
 
 #endif // XRT_HAVE_LEIA_SR_VULKAN
 
+		//! @name Display processor crop images (imageRect sub-region extraction)
+		//! When the app renders to a sub-region of the swapchain (imageRect.extent
+		//! < swapchain size), we must crop-blit into these intermediates before
+		//! passing to the display processor, which samples UVs 0..1 on its input.
+		//! @{
+		VkImage dp_crop_images[2];          //!< Per-eye cropped images
+		VkDeviceMemory dp_crop_memories[2];
+		VkImageView dp_crop_views[2];       //!< Per-eye image views for display processor
+		int dp_crop_width;
+		int dp_crop_height;
+		VkFormat dp_crop_format;
+		bool dp_crop_initialized;
+		//! @}
+
 		//! @name SBS (side-by-side) flip image for GL textures (Y-flip + stereo packing)
 		//! Used by any display processor, not Leia-specific.
 		//! @{
@@ -615,8 +629,13 @@ multi_compositor_get_display_dimensions(struct multi_compositor *mc, float *out_
 bool
 multi_compositor_get_window_metrics(struct multi_compositor *mc, struct leiasr_window_metrics *out_metrics);
 
+#endif
+
 /*!
- * Request display mode switch (2D/3D) via SR SwitchableLensHint.
+ * Request display mode switch (2D/3D).
+ *
+ * Uses SR SwitchableLensHint when available, or sim_display output mode
+ * fallback (SBS for 3D, blend for 2D).
  *
  * @param mc The multi_compositor (must have per-session rendering initialized)
  * @param enable_3d true to switch to 3D mode, false for 2D mode.
@@ -627,7 +646,6 @@ multi_compositor_get_window_metrics(struct multi_compositor *mc, struct leiasr_w
  */
 bool
 multi_compositor_request_display_mode(struct multi_compositor *mc, bool enable_3d);
-#endif
 
 
 #ifdef __cplusplus

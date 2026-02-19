@@ -12,6 +12,8 @@
 
 #include "xrt/xrt_compiler.h"
 
+#include <stdbool.h>
+
 
 #ifdef __cplusplus
 extern "C" {
@@ -19,11 +21,6 @@ extern "C" {
 
 
 typedef union SDL_Event SDL_Event;
-
-// Forward declaration for Win32 types (used in qwerty_process_win32)
-#ifdef _WIN32
-#include <stdbool.h>
-#endif
 
 /*!
  * @defgroup drv_qwerty Qwerty driver
@@ -109,6 +106,23 @@ qwerty_create_devices(enum u_logging_level log_level,
                       struct xrt_device **out_hmd,
                       struct xrt_device **out_left,
                       struct xrt_device **out_right);
+
+/*!
+ * Check if a runtime-side display mode toggle is pending.
+ *
+ * Scans @p xdevs for a qwerty_system and checks its toggle state.
+ * If a toggle is pending, clears the pending flag and sets @p out_force_2d
+ * to the current force_2d_mode state.
+ *
+ * @param xdevs Array of devices to search for qwerty devices
+ * @param xdev_count Number of devices in the array
+ * @param[out] out_force_2d Receives the current force_2d_mode value
+ * @return true if a toggle was pending (and is now cleared), false otherwise
+ *
+ * @ingroup drv_qwerty
+ */
+bool
+qwerty_check_display_mode_toggle(struct xrt_device **xdevs, size_t xdev_count, bool *out_force_2d);
 
 
 #ifdef __cplusplus

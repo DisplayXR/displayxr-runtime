@@ -39,6 +39,9 @@
 #include "leia/leia_sr_d3d11.h"
 #endif
 
+// sim_display display info for XR_EXT_display_info fallback
+#include "sim_display/sim_display_interface.h"
+
 #include "target_instance_parts.h"
 
 #include <assert.h>
@@ -245,6 +248,26 @@ out:
 			}
 		}
 #endif
+
+		// sim_display fallback: populate display info if not already set by SR SDK
+		{
+			struct sim_display_info sd_info;
+			if (xsysc->info.display_width_m == 0.0f &&
+			    sim_display_get_display_info(head, &sd_info)) {
+				xsysc->info.display_width_m = sd_info.display_width_m;
+				xsysc->info.display_height_m = sd_info.display_height_m;
+				xsysc->info.nominal_viewer_x_m = 0.0f;
+				xsysc->info.nominal_viewer_y_m = sd_info.nominal_y_m;
+				xsysc->info.nominal_viewer_z_m = sd_info.nominal_z_m;
+				xsysc->info.recommended_view_scale_x = 0.5f;
+				xsysc->info.recommended_view_scale_y = 1.0f;
+				xsysc->info.supports_display_mode_switch = true;
+				U_LOG_W("XR_EXT_display_info (sim_display): display=%.3fx%.3f m, "
+				        "nominal=(0, %.3f, %.3f) m, scale=0.5x1.0",
+				        sd_info.display_width_m, sd_info.display_height_m,
+				        sd_info.nominal_y_m, sd_info.nominal_z_m);
+			}
+		}
 
 		assert(out_xsysc != NULL);
 		*out_xsysc = xsysc;

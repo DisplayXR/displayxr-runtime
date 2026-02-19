@@ -37,6 +37,12 @@ if(WIN32 AND XRT_HAVE_D3D11)
 	# Link to sim_display driver for D3D11 display processor
 	target_link_libraries(comp_d3d11 PRIVATE drv_sim_display)
 
+	# Qwerty include path for runtime-side 2D/3D toggle polling
+	if(XRT_BUILD_DRIVER_QWERTY)
+		target_link_libraries(comp_d3d11 PRIVATE drv_qwerty_includes)
+		target_compile_definitions(comp_d3d11 PRIVATE XRT_BUILD_DRIVER_QWERTY)
+	endif()
+
 	# Link to SR SDK D3D11 weaver if available
 	# drv_leia exports XRT_HAVE_LEIA_SR_D3D11 as PUBLIC when D3D11 weaver is available
 	if(XRT_HAVE_LEIA_SR)

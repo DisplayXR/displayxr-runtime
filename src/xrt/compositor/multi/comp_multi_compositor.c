@@ -1217,6 +1217,19 @@ multi_compositor_destroy(struct xrt_compositor *xc)
 			mc->session_render.cmd_pool = VK_NULL_HANDLE;
 		}
 
+		// Destroy display processor crop images (imageRect sub-region extraction)
+		if (vk != NULL && mc->session_render.dp_crop_initialized) {
+			for (int i = 0; i < 2; i++) {
+				if (mc->session_render.dp_crop_views[i] != VK_NULL_HANDLE)
+					vk->vkDestroyImageView(vk->device, mc->session_render.dp_crop_views[i], NULL);
+				if (mc->session_render.dp_crop_images[i] != VK_NULL_HANDLE)
+					vk->vkDestroyImage(vk->device, mc->session_render.dp_crop_images[i], NULL);
+				if (mc->session_render.dp_crop_memories[i] != VK_NULL_HANDLE)
+					vk->vkFreeMemory(vk->device, mc->session_render.dp_crop_memories[i], NULL);
+			}
+			mc->session_render.dp_crop_initialized = false;
+		}
+
 		// Destroy SBS flip image (Y-flip before display processing — not vendor-specific)
 		if (vk != NULL && mc->session_render.flip_initialized) {
 			if (mc->session_render.flip_sbs_view != VK_NULL_HANDLE)
@@ -1661,21 +1674,30 @@ multi_compositor_get_window_metrics(struct multi_compositor *mc, struct leiasr_w
 	return leiasr_get_window_metrics(mc->session_render.weaver, out_metrics);
 }
 
+}
+#endif
+
 bool
 multi_compositor_request_display_mode(struct multi_compositor *mc, bool enable_3d)
 {
-	if (mc == NULL) {
+	if (mc == NULL || !mc->session_render.initialized) {
 		return false;
 	}
 
-	// Check if session has per-session rendering with a weaver
-	if (!mc->session_render.initialized || mc->session_render.weaver == NULL) {
-		return false;
+#ifdef XRT_HAVE_LEIA_SR_VULKAN
+	if (mc->session_render.weaver != NULL) {
+		return leiasr_request_display_mode(mc->session_render.weaver, enable_3d);
 	}
-
-	return leiasr_request_display_mode(mc->session_render.weaver, enable_3d);
-}
 #endif
+
+	// sim_display fallback: 3D=SBS, 2D=BLEND
+	if (mc->session_render.display_processor != NULL) {
+		sim_display_set_output_mode(enable_3d ? SIM_DISPLAY_OUTPUT_SBS : SIM_DISPLAY_OUTPUT_BLEND);
+		return true;
+	}
+
+	return false;
+}
 
 xrt_result_t
 multi_compositor_create(struct multi_system_compositor *msc,

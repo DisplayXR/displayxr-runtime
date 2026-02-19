@@ -540,6 +540,7 @@ qwerty_setup_var_tracking(struct qwerty_system *qs)
 	u_var_add_root(qs, "Qwerty System", true);
 	u_var_add_log_level(qs, &qs->log_level, "Log level");
 	u_var_add_bool(qs, &qs->process_keys, "process_keys");
+	u_var_add_bool(qs, &qs->force_2d_mode, "force_2d_mode");
 
 	u_var_add_ro_text(qs, "", "Focused Device");
 	if (qd_hmd) {
@@ -582,7 +583,7 @@ qwerty_setup_var_tracking(struct qwerty_system *qs)
 	u_var_add_ro_text(qs, "FC Menu click", "N");
 	u_var_add_ro_text(qs, "FC System click", "B");
 	u_var_add_ro_text(qs, "FC Joystick direction", "TFGH");
-	u_var_add_ro_text(qs, "FC Joystick click", "V");
+	u_var_add_ro_text(qs, "HMD: 2D/3D toggle, FC: Joystick click", "V");
 	u_var_add_ro_text(qs, "FC Trackpad touch direction", "IJKL");
 	u_var_add_ro_text(qs, "FC Trackpad click", "M");
 }
@@ -856,6 +857,46 @@ qwerty_follow_hmd(struct qwerty_controller *qc, bool follow)
 
 	qd->pose = rel.pose;
 	qc->follow_hmd = follow;
+}
+
+bool
+qwerty_check_display_mode_toggle(struct xrt_device **xdevs, size_t xdev_count, bool *out_force_2d)
+{
+	// Find a qwerty device in the device list
+	struct qwerty_system *qs = NULL;
+	for (size_t i = 0; i < xdev_count; i++) {
+		if (xdevs[i] == NULL) {
+			continue;
+		}
+		const char *name = xdevs[i]->tracking_origin->name;
+		if (strcmp(name, QWERTY_HMD_TRACKER_STR) == 0 || strcmp(name, QWERTY_LEFT_TRACKER_STR) == 0 ||
+		    strcmp(name, QWERTY_RIGHT_TRACKER_STR) == 0) {
+			qs = qwerty_device(xdevs[i])->sys;
+			break;
+		}
+	}
+
+	if (qs == NULL) {
+		*out_force_2d = false;
+		return false;
+	}
+
+	*out_force_2d = qs->force_2d_mode;
+
+	if (qs->display_mode_toggle_pending) {
+		qs->display_mode_toggle_pending = false;
+		return true;
+	}
+
+	return false;
+}
+
+void
+qwerty_toggle_display_mode(struct qwerty_system *qs)
+{
+	qs->force_2d_mode = !qs->force_2d_mode;
+	qs->display_mode_toggle_pending = true;
+	U_LOG_W("Qwerty: display mode toggled to %s", qs->force_2d_mode ? "2D" : "3D");
 }
 
 void
