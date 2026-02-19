@@ -100,10 +100,6 @@ struct null_compositor
 	// Kept here for convenience.
 	struct xrt_system_compositor_info sys_info;
 
-	//! Custom recommended view dimensions (0 = use defaults)
-	uint32_t recommended_view_width;
-	uint32_t recommended_view_height;
-
 	//! Whether Vulkan was successfully initialized (false = D3D11-only fallback).
 	bool vulkan_inited;
 

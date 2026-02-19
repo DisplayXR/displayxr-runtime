@@ -133,26 +133,24 @@ t_instance_create_system(struct xrt_instance *xinst,
 
 #ifdef XRT_MODULE_COMPOSITOR_NULL
 	if (use_null) {
-		uint32_t sr_rec_width = 0;
-		uint32_t sr_rec_height = 0;
 		float sr_refresh_rate_hz = 0.0f;
 
 #ifdef XRT_HAVE_LEIA_SR
-		// Query SR display for recommended view dimensions and refresh rate
-		// This ensures apps create properly-sized swapchains and correct frame pacing
-		uint32_t sr_native_width = 0;
-		uint32_t sr_native_height = 0;
-		if (leiasr_query_recommended_view_dimensions(5.0, &sr_rec_width, &sr_rec_height,
-		                                             &sr_refresh_rate_hz, &sr_native_width,
-		                                             &sr_native_height)) {
-			U_LOG_I("Using SR recommended view dimensions: %ux%u per eye, %.0f Hz", sr_rec_width,
-			        sr_rec_height, sr_refresh_rate_hz);
-		} else {
-			U_LOG_W("Could not query SR display dimensions, using defaults");
+		// Query SR display for refresh rate only; dims come from device native resolution
+		{
+			uint32_t sr_rec_width = 0, sr_rec_height = 0;
+			uint32_t sr_native_width = 0, sr_native_height = 0;
+			if (leiasr_query_recommended_view_dimensions(5.0, &sr_rec_width, &sr_rec_height,
+			                                             &sr_refresh_rate_hz, &sr_native_width,
+			                                             &sr_native_height)) {
+				U_LOG_I("Using SR display refresh rate: %.0f Hz", sr_refresh_rate_hz);
+			} else {
+				U_LOG_W("Could not query SR display, using default refresh rate");
+			}
 		}
 #endif
 
-		xret = null_compositor_create_system_with_dims(head, sr_rec_width, sr_rec_height,
+		xret = null_compositor_create_system_with_dims(head, 0, 0,
 		                                               sr_refresh_rate_hz, &xsysc);
 	}
 #else
@@ -261,19 +259,21 @@ out:
 				xsysc->info.nominal_viewer_x_m = 0.0f;
 				xsysc->info.nominal_viewer_y_m = sd_info.nominal_y_m;
 				xsysc->info.nominal_viewer_z_m = sd_info.nominal_z_m;
-				// Scale depends on output mode:
-				// SBS: 0.5x1.0 (half width, full height)
-				// Anaglyph/Blend: 0.5x0.5 (half resolution in both axes)
-				enum sim_display_output_mode sd_mode = sim_display_get_output_mode();
+				// Use worst-case (largest) scale across all modes so that
+				// mode switching never degrades quality for unmodified apps
+				// whose swapchain size is frozen at init.
+				// SBS needs 0.5x1.0, anaglyph/blend need 0.5x0.5.
+				// max(0.5,0.5)=0.5 for X, max(1.0,0.5)=1.0 for Y.
 				float sd_scale_x = 0.5f;
-				float sd_scale_y = (sd_mode == SIM_DISPLAY_OUTPUT_SBS) ? 1.0f : 0.5f;
+				float sd_scale_y = 1.0f;
 				xsysc->info.recommended_view_scale_x = sd_scale_x;
 				xsysc->info.recommended_view_scale_y = sd_scale_y;
 				xsysc->info.supports_display_mode_switch = true;
 				xsysc->info.display_pixel_width = sd_info.display_pixel_width;
 				xsysc->info.display_pixel_height = sd_info.display_pixel_height;
+				enum sim_display_output_mode sd_mode = sim_display_get_output_mode();
 				U_LOG_W("XR_EXT_display_info (sim_display): display=%.3fx%.3f m, "
-				        "nominal=(0, %.3f, %.3f) m, scale=%.1fx%.1f (%s), pixels=%ux%u",
+				        "nominal=(0, %.3f, %.3f) m, scale=%.1fx%.1f (worst-case, init=%s), pixels=%ux%u",
 				        sd_info.display_width_m, sd_info.display_height_m,
 				        sd_info.nominal_y_m, sd_info.nominal_z_m,
 				        sd_scale_x, sd_scale_y,

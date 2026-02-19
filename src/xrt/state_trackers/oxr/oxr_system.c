@@ -143,19 +143,32 @@ oxr_system_fill_in(
 	struct xrt_system_compositor_info *info = &sys->xsysc->info;
 
 #define imin(a, b) (a < b ? a : b)
-	for (uint32_t i = 0; i < view_count; ++i) {
-		uint32_t w = (uint32_t)(info->views[i].recommended.width_pixels * scale);
-		uint32_t h = (uint32_t)(info->views[i].recommended.height_pixels * scale);
-		uint32_t w_2 = info->views[i].max.width_pixels;
-		uint32_t h_2 = info->views[i].max.height_pixels;
+	float view_scale_x = info->recommended_view_scale_x;
+	float view_scale_y = info->recommended_view_scale_y;
 
-		w = imin(w, w_2);
-		h = imin(h, h_2);
+	for (uint32_t i = 0; i < view_count; ++i) {
+		uint32_t w_max = info->views[i].max.width_pixels;
+		uint32_t h_max = info->views[i].max.height_pixels;
+
+		uint32_t w, h;
+		if (view_scale_x > 0.0f && view_scale_y > 0.0f &&
+		    info->display_pixel_width > 0 && info->display_pixel_height > 0) {
+			// Display processor present: scale is relative to full display size
+			w = (uint32_t)(info->display_pixel_width * view_scale_x * scale);
+			h = (uint32_t)(info->display_pixel_height * view_scale_y * scale);
+		} else {
+			// Legacy: no display processor, use compositor recommended directly
+			w = (uint32_t)(info->views[i].recommended.width_pixels * scale);
+			h = (uint32_t)(info->views[i].recommended.height_pixels * scale);
+		}
+
+		w = imin(w, w_max);
+		h = imin(h, h_max);
 
 		sys->views[i].recommendedImageRectWidth = w;
-		sys->views[i].maxImageRectWidth = w_2;
+		sys->views[i].maxImageRectWidth = w_max;
 		sys->views[i].recommendedImageRectHeight = h;
-		sys->views[i].maxImageRectHeight = h_2;
+		sys->views[i].maxImageRectHeight = h_max;
 		sys->views[i].recommendedSwapchainSampleCount = info->views[i].recommended.sample_count;
 		sys->views[i].maxSwapchainSampleCount = info->views[i].max.sample_count;
 	}
