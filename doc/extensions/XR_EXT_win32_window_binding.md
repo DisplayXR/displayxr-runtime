@@ -515,7 +515,7 @@ adjusted_eye.y -= offset_y
 
 ### 5.6 Proportional Render Texture Resize
 
-When the window is smaller than the full display, the stereo render texture is scaled proportionally to avoid wasting GPU on pixels that will be downscaled:
+**Two-swapchain path (legacy):** When an application submits two separate swapchains (one per eye), the runtime composites them into an internal SBS stereo texture. When the window is smaller than the full display, this stereo texture is scaled proportionally to avoid wasting GPU on pixels that will be downscaled:
 
 ```
 ratio = min(window_width / display_px_width, window_height / display_px_height)
@@ -533,6 +533,8 @@ Only size-dependent resources (stereo texture, SRV, RTV, depth texture, DSV) are
 | Half display | 0.5 | ~75% pixels |
 | Quarter display | 0.25 | ~94% pixels |
 | Minimum (64x64) | Clamped | Maximum |
+
+**Single-swapchain path (ext apps):** The ext test apps create one swapchain at native display pixel resolution (`displayPixelWidth` x `displayPixelHeight` from `XR_EXT_display_info`) and render both stereo views side-by-side into it using viewport offsets. Both `projectionViews[0]` and `projectionViews[1]` reference the same swapchain with different `imageRect` offsets. When the runtime detects that both views reference the same swapchain and image index, it skips the internal SBS blit and passes the application's texture directly to the weaver. This eliminates one full-resolution GPU copy per frame.
 
 ### 5.7 Lenticular Phase-Aligned Window Snapping
 

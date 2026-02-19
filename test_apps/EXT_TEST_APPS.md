@@ -23,6 +23,7 @@ Queries physical display properties by chaining `XrDisplayInfoEXT` into `xrGetSy
 - **Display size** (meters) -- used for Kooima projection
 - **Nominal viewer position** -- default eye position in display space
 - **Recommended view scale** (X, Y) -- per-eye viewport fraction of window size
+- **Native display pixel dimensions** -- panel resolution in pixels, used for swapchain sizing
 - **Display mode switch support** -- whether the runtime can toggle 2D/3D
 
 ### xrRequestDisplayModeEXT
