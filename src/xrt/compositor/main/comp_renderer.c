@@ -59,6 +59,7 @@
 #include "leia/leia_display_processor.h"
 #endif
 
+#include "xrt/xrt_config_drivers.h"
 #include "xrt/xrt_display_processor.h"
 #include "sim_display/sim_display_interface.h"
 
@@ -1054,64 +1055,6 @@ static bool getLayerInfo(struct comp_renderer *r, int view_index, int* width, in
 }
 
 /*!
- * Lazily create intermediate images for Y-flipping GL textures before display processing.
- * Uses vkCmdBlitImage with swapped source Y offsets to produce correctly-oriented images.
- */
-static bool
-ensure_flip_images(struct comp_renderer *r, struct vk_bundle *vk, int width, int height, VkFormat format)
-{
-	// Already initialized with matching size?
-	if (r->flip.initialized && r->flip.width == width && r->flip.height == height && r->flip.format == format) {
-		return true;
-	}
-
-	// Destroy old if size changed
-	if (r->flip.initialized) {
-		for (int i = 0; i < 2; i++) {
-			if (r->flip.views[i] != VK_NULL_HANDLE)
-				vk->vkDestroyImageView(vk->device, r->flip.views[i], NULL);
-			if (r->flip.images[i] != VK_NULL_HANDLE)
-				vk->vkDestroyImage(vk->device, r->flip.images[i], NULL);
-			if (r->flip.memories[i] != VK_NULL_HANDLE)
-				vk->vkFreeMemory(vk->device, r->flip.memories[i], NULL);
-		}
-		r->flip.initialized = false;
-	}
-
-	VkExtent2D extent = {.width = (uint32_t)width, .height = (uint32_t)height};
-	VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-	VkImageSubresourceRange range = {
-	    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-	    .baseMipLevel = 0,
-	    .levelCount = 1,
-	    .baseArrayLayer = 0,
-	    .layerCount = 1,
-	};
-
-	for (int i = 0; i < 2; i++) {
-		VkResult ret = vk_create_image_simple(vk, extent, format, usage,
-		                                      &r->flip.memories[i], &r->flip.images[i]);
-		if (ret != VK_SUCCESS) {
-			U_LOG_E("Failed to create flip image %d: %s", i, vk_result_string(ret));
-			return false;
-		}
-
-		ret = vk_create_view(vk, r->flip.images[i], VK_IMAGE_VIEW_TYPE_2D, format, range, &r->flip.views[i]);
-		if (ret != VK_SUCCESS) {
-			U_LOG_E("Failed to create flip image view %d: %s", i, vk_result_string(ret));
-			return false;
-		}
-	}
-
-	r->flip.width = width;
-	r->flip.height = height;
-	r->flip.format = format;
-	r->flip.initialized = true;
-	U_LOG_W("Created flip images: %dx%d format=%d", width, height, format);
-	return true;
-}
-
-/*!
  * Lazily create intermediate images for crop-blitting per-eye sub-rects before display processing.
  * Needed when both eyes reference the same swapchain image (single-swapchain SBS layout),
  * so the display processor sees UV 0..1 covering only valid per-eye content.
@@ -1168,92 +1111,6 @@ ensure_crop_images(struct comp_renderer *r, struct vk_bundle *vk, int width, int
 	r->crop.initialized = true;
 	U_LOG_W("[dp] Created crop images: %dx%d format=%d", width, height, format);
 	return true;
-}
-
-/*!
- * Blit a source swapchain image into a flip intermediate image with Y-flipped coordinates.
- * Used for GL textures (Y-up) before feeding to any display processor (expects Y-down).
- * The source image is transitioned SRC→TRANSFER_SRC→SRC and the dest is transitioned
- * UNDEFINED→TRANSFER_DST→SHADER_READ_ONLY.
- */
-static void
-blit_flip_eye(struct vk_bundle *vk,
-              VkCommandBuffer cmd,
-              VkImage src_image,
-              VkImage dst_image,
-              int width,
-              int height,
-              uint32_t array_index)
-{
-	// Transition source to TRANSFER_SRC
-	VkImageMemoryBarrier src_to_xfer = {
-	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-	    .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
-	    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-	    .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-	    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-	    .image = src_image,
-	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-	};
-	// Transition dest to TRANSFER_DST
-	VkImageMemoryBarrier dst_to_xfer = {
-	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-	    .srcAccessMask = 0,
-	    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-	    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-	    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-	    .image = dst_image,
-	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-	};
-	VkImageMemoryBarrier pre_barriers[2] = {src_to_xfer, dst_to_xfer};
-	vk->vkCmdPipelineBarrier(cmd,
-	                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-	                         VK_PIPELINE_STAGE_TRANSFER_BIT,
-	                         0, 0, NULL, 0, NULL, 2, pre_barriers);
-
-	// Blit with flipped source Y
-	VkImageBlit blit = {
-	    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, array_index, 1},
-	    .srcOffsets = {
-	        {0, height, 0},  // bottom-left (flipped)
-	        {width, 0, 1},   // top-right (flipped)
-	    },
-	    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-	    .dstOffsets = {
-	        {0, 0, 0},
-	        {width, height, 1},
-	    },
-	};
-	vk->vkCmdBlitImage(cmd,
-	                    src_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-	                    dst_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-	                    1, &blit, VK_FILTER_NEAREST);
-
-	// Transition source back to SHADER_READ_ONLY
-	VkImageMemoryBarrier src_restore = {
-	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-	    .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-	    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-	    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-	    .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-	    .image = src_image,
-	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-	};
-	// Transition dest to SHADER_READ_ONLY (for weaver sampling)
-	VkImageMemoryBarrier dst_restore = {
-	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-	    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-	    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-	    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-	    .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-	    .image = dst_image,
-	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-	};
-	VkImageMemoryBarrier post_barriers[2] = {src_restore, dst_restore};
-	vk->vkCmdPipelineBarrier(cmd,
-	                         VK_PIPELINE_STAGE_TRANSFER_BIT,
-	                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-	                         0, 0, NULL, 0, NULL, 2, post_barriers);
 }
 
 /*!

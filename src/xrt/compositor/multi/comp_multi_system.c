@@ -882,6 +882,8 @@ fini_composite_resources(struct multi_compositor *mc, struct vk_bundle *vk)
 
 #endif // XRT_HAVE_LEIA_SR_VULKAN (composite resources)
 
+#ifdef XRT_HAVE_LEIA_SR_VULKAN
+
 /*!
  * Check if any window-space layers exist in the delivered frame.
  */
@@ -895,8 +897,6 @@ has_window_space_layers(struct multi_compositor *mc)
 	}
 	return false;
 }
-
-#ifdef XRT_HAVE_LEIA_SR_VULKAN
 
 /*!
  * Composite all layers (projection + window-space) into the intermediate stereo
@@ -2985,23 +2985,25 @@ transfer_layers_locked(struct multi_system_compositor *msc, int64_t display_time
 	}
 #endif
 
-	// One-time: pass xsysd to main compositor for qwerty forwarding + HUD
+	// Forward xsysd to main compositor for qwerty HUD + window input.
+	// Uses msc->clients[] (not the filtered array) so this works even
+	// before the session has delivered its first visible frame.
 #ifdef XRT_BUILD_DRIVER_QWERTY
-	static bool xsysd_forwarded = false;
-	if (!xsysd_forwarded && msc->xcn_is_comp_compositor) {
-		for (size_t k = 0; k < count; k++) {
-			struct multi_compositor *mc = array[k];
-			if (mc->session_render.initialized) {
-				continue;
-			}
-			if (mc->xsysd != NULL) {
-				struct comp_compositor *cc = comp_compositor(&msc->xcn->base);
-				cc->xsysd = mc->xsysd;
-				if (msc->set_window_system_devices != NULL && cc->target != NULL) {
-					msc->set_window_system_devices(cc->target, mc->xsysd);
+	if (msc->xcn_is_comp_compositor) {
+		struct comp_compositor *cc = comp_compositor(&msc->xcn->base);
+		if (cc->xsysd == NULL) {
+			for (size_t k = 0; k < MULTI_MAX_CLIENTS; k++) {
+				struct multi_compositor *mc = msc->clients[k];
+				if (mc == NULL) {
+					continue;
 				}
-				xsysd_forwarded = true;
-				break;
+				if (mc->xsysd != NULL) {
+					cc->xsysd = mc->xsysd;
+					if (msc->set_window_system_devices != NULL && cc->target != NULL) {
+						msc->set_window_system_devices(cc->target, mc->xsysd);
+					}
+					break;
+				}
 			}
 		}
 	}
