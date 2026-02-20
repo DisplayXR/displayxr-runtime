@@ -16,24 +16,24 @@ OpenXR extensions, and build system registration.
 
 ```
  ┌──────────────────────────────────────────────────────────────┐
- │                     OpenXR Application                       │
+ │  APPLICATION          OpenXR Application                     │
  │  xrLocateViews  xrEndFrame  xrRequestDisplayModeEXT         │
  └──────────┬──────────┬─────────────────┬──────────────────────┘
-            │          │                 │
+ ═══════════╪══════════╪═════════════════╪═══  boundary: OpenXR API
  ┌──────────▼──────────▼─────────────────▼──────────────────────┐
- │              OpenXR State Tracker (oxr_session.c)            │
+ │  RUNTIME             OpenXR State Tracker (oxr_session.c)    │
  │   Eye tracking → Kooima FOV → view poses & projection       │
- │   2D/3D mode switch → vendor SDK                            │
+ │   Uses: xrt_eye_position, xrt_window_metrics (vendor-neutral)│
  └──────────┬──────────┬─────────────────┬──────────────────────┘
             │          │                 │
  ┌──────────▼──────────▼─────────────────▼──────────────────────┐
- │                       Compositor                             │
+ │  RUNTIME             Compositor                              │
  │  Vulkan path: multi_compositor → comp_renderer               │
  │  D3D11 path:  comp_d3d11_compositor                          │
  └────────────────────────┬─────────────────────────────────────┘
-                          │
+ ══════════════════════════╪════════  boundary: xrt_display_processor vtable
  ┌────────────────────────▼─────────────────────────────────────┐
- │                  Display Processor                           │
+ │  VENDOR DRIVER        Display Processor                      │
  │  YOUR CODE: vendor-specific stereo → display conversion      │
  │  (interlacing, SBS, anaglyph, etc.)                          │
  │                                                              │
@@ -51,6 +51,75 @@ The vendor plugs in at the **Display Processor** layer.  The compositor calls
 the display processor generically each frame; the vendor converts the rendered
 stereo pair into whatever format the display needs.  Zero changes to compositor
 code are required.
+
+### 1.1 Architectural Boundaries
+
+The codebase enforces strict boundaries between three layers.  Understanding
+these boundaries is essential — vendor-specific code must **never** leak into
+the runtime layer, and the runtime must **never** reference a specific vendor's
+SDK types.
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                      LAYER 1: APPLICATION                           │
+│                                                                     │
+│  Types used:  OpenXR API types only                                 │
+│  - XrView, XrFovf, XrPosef, XrDisplayInfoEXT                       │
+│  - XR_REFERENCE_SPACE_TYPE_DISPLAY_EXT                              │
+│  - XrWin32WindowBindingCreateInfoEXT / XrMacOSWindowBindingCreateInfoEXT │
+│                                                                     │
+│  The app never sees runtime or vendor internals.                    │
+├─────────────────────────────────────────────────────────────────────┤
+│                      LAYER 2: OPENXR RUNTIME                        │
+│                (state tracker + compositor core)                     │
+│                                                                     │
+│  Types used:  Vendor-NEUTRAL xrt_* types only                       │
+│  - struct xrt_eye_position, xrt_eye_pair   (xrt_display_metrics.h)  │
+│  - struct xrt_window_metrics               (xrt_display_metrics.h)  │
+│  - struct xrt_system_compositor_info       (xrt_compositor.h)       │
+│  - struct xrt_display_processor            (xrt_display_processor.h)│
+│  - struct xrt_display_processor_d3d11      (xrt_display_processor_d3d11.h) │
+│  - struct xrt_device, xrt_hmd_parts        (xrt_device.h)          │
+│                                                                     │
+│  Key runtime files (NO vendor #includes or #ifdefs for new vendors):│
+│  - oxr_session.c          — Kooima FOV, view pose computation       │
+│  - comp_multi_compositor.c — window metrics (vendor-neutral path)   │
+│  - comp_renderer.c        — display processor dispatch              │
+│                                                                     │
+│  The runtime reads display geometry from xrt_system_compositor_info │
+│  (populated at init by whatever driver is active).  Kooima FOV and  │
+│  window-adaptive rendering use xrt_eye_position / xrt_window_metrics│
+│  — no vendor-specific types.                                        │
+├─────────────────────────────────────────────────────────────────────┤
+│                      LAYER 3: VENDOR DRIVER                         │
+│                  (src/xrt/drivers/<vendor>/)                        │
+│                                                                     │
+│  Types used:  Both xrt_* types AND vendor SDK types                 │
+│  - Vendor SDK headers included ONLY in .cpp files                   │
+│  - Vendor-specific types (e.g. leiasr_eye_pair) are internal        │
+│  - Exports xrt_* types at the boundary (xrt_device, display        │
+│    processor vtables, xrt_system_compositor_info fields)             │
+│                                                                     │
+│  The driver is the ONLY place that:                                 │
+│  - #includes vendor SDK headers                                     │
+│  - Calls vendor SDK functions                                       │
+│  - Uses #ifdef XRT_HAVE_<VENDOR>_* guards                          │
+│  - Converts between vendor SDK types and xrt_* types                │
+│                                                                     │
+│  Vendor code populates xrt_system_compositor_info at device init    │
+│  (display_width_m, display_height_m, nominal_viewer_*_m, etc.)      │
+│  and implements xrt_display_processor / xrt_display_processor_d3d11 │
+│  vtables.                                                           │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**Why this matters for new vendors:**  A new vendor integration adds files
+**only** under `src/xrt/drivers/<vendor>/` and `src/xrt/targets/common/`.
+No modifications to `oxr_session.c`, `comp_multi_compositor.c`, or any
+compositor code are needed.  The runtime discovers your driver through the
+builder system, reads your display specs from `xrt_system_compositor_info`,
+calls your display processor through the generic vtable, and queries eye
+positions through vendor-neutral interfaces.
 
 ---
 
@@ -91,9 +160,16 @@ typedef struct XrDisplayInfoEXT {
 } XrDisplayInfoEXT;
 ```
 
-**Vendor data source:** `leiasr_get_display_dimensions()` → `displaySizeMeters`,
-`leiasr_get_recommended_view_dimensions()` → `recommendedViewScale*`,
-`leiasr_supports_display_mode_switch()` → `supportsDisplayModeSwitch`.
+**How vendor data reaches this extension:**  The vendor's device driver populates
+`xrt_system_compositor_info` fields at init time:
+- `info.display_width_m` / `info.display_height_m` → `displaySizeMeters`
+- `info.nominal_viewer_x_m` / `_y_m` / `_z_m` → `nominalViewerPositionInDisplaySpace`
+- `info.recommended_view_scale_x` / `_y` → `recommendedViewScale*`
+- `info.supports_display_mode_switch` → `supportsDisplayModeSwitch`
+
+The runtime reads from `xrt_system_compositor_info` — it never calls vendor SDK
+functions directly.  For example, the Leia driver queries SR SDK during device
+creation and stores the results; sim_display uses env vars and OS display queries.
 
 **2D/3D mode switching:**
 
@@ -504,38 +580,75 @@ actual head position.
 
 ### 6.1 Data Types
 
-**File:** `src/xrt/drivers/leia/leia_types.h`
+The runtime uses **vendor-neutral types** for all eye tracking and display
+geometry.  Vendor-specific types (e.g. `leiasr_eye_pair`) exist only inside
+the vendor driver and are converted to these types at the driver boundary.
+
+**Runtime interface types** — `src/xrt/include/xrt/xrt_display_metrics.h`:
 
 ```c
-struct leiasr_eye_position
+struct xrt_eye_position
 {
-    float x;  // Horizontal position (positive = right), meters
-    float y;  // Vertical position (positive = up), meters
-    float z;  // Depth (positive = toward viewer from display), meters
+    float x;  //!< Horizontal position (positive = right), meters
+    float y;  //!< Vertical position (positive = up), meters
+    float z;  //!< Depth position (positive = toward viewer), meters
 };
 
-struct leiasr_eye_pair
+struct xrt_eye_pair
 {
-    struct leiasr_eye_position left;
-    struct leiasr_eye_position right;
-    int64_t timestamp_ns;  // Monotonic timestamp
-    bool valid;
+    struct xrt_eye_position left;   //!< Left eye position in meters
+    struct xrt_eye_position right;  //!< Right eye position in meters
+    int64_t timestamp_ns;           //!< Monotonic timestamp when sampled
+    bool valid;                     //!< True if eye positions are valid
 };
 
-struct leiasr_display_dimensions
+struct xrt_window_metrics
 {
-    float width_m;       // Screen width (meters)
-    float height_m;      // Screen height (meters)
-    float nominal_x_m;   // Nominal viewer X (display space)
-    float nominal_y_m;   // Nominal viewer Y (display space)
-    float nominal_z_m;   // Nominal viewer Z (display space)
-    bool valid;
+    float display_width_m;           //!< Display physical width (meters)
+    float display_height_m;          //!< Display physical height (meters)
+    uint32_t display_pixel_width;    //!< Display pixel width
+    uint32_t display_pixel_height;   //!< Display pixel height
+    int32_t display_screen_left;     //!< Display left edge (screen coords)
+    int32_t display_screen_top;      //!< Display top edge (screen coords)
+
+    uint32_t window_pixel_width;     //!< Window client area width (pixels)
+    uint32_t window_pixel_height;    //!< Window client area height (pixels)
+    int32_t window_screen_left;      //!< Window client area left (screen coords)
+    int32_t window_screen_top;       //!< Window client area top (screen coords)
+
+    float window_width_m;            //!< Window physical width (meters)
+    float window_height_m;           //!< Window physical height (meters)
+    float window_center_offset_x_m;  //!< Offset from display center (meters, +right)
+    float window_center_offset_y_m;  //!< Offset from display center (meters, +up)
+
+    bool valid;                      //!< True if all metrics are valid
 };
+```
+
+**Display geometry** is stored in `xrt_system_compositor_info`
+(`src/xrt/include/xrt/xrt_compositor.h`), populated once at device init:
+
+```c
+// Inside struct xrt_system_compositor_info:
+float display_width_m;            // Physical display width (meters)
+float display_height_m;           // Physical display height (meters)
+float nominal_viewer_x_m;         // Nominal viewer X (display space, meters)
+float nominal_viewer_y_m;         // Nominal viewer Y (display space, meters)
+float nominal_viewer_z_m;         // Nominal viewer Z (display space, meters)
+float recommended_view_scale_x;   // Recommended render scale X
+float recommended_view_scale_y;   // Recommended render scale Y
+bool  supports_display_mode_switch; // 2D/3D mode switching
 ```
 
 **Coordinate system:** All positions are in display-local coordinates with
 origin at the display center.  X = right, Y = up, Z = toward viewer.  Units
 are meters.
+
+**Vendor-specific types** (e.g. `leiasr_eye_position`, `leiasr_eye_pair` in
+`leia_types.h`) are used only inside the driver's `.cpp` files.  At the
+boundary, the driver converts to/from `xrt_*` types.  New vendors should
+define their own internal types as needed but always expose `xrt_*` types
+to the runtime.
 
 ### 6.2 Data Flow
 
@@ -544,47 +657,64 @@ app uses the extension (RAW mode) or is a legacy app (RENDER_READY mode).
 The vendor only provides the raw eye positions; the runtime decides what to
 do with them.
 
+Note the **boundary between vendor driver and runtime**: vendor-specific types
+(`leiasr_eye_pair`, etc.) exist only inside the driver box.  At the boundary,
+data is converted to vendor-neutral `xrt_eye_pair`.
+
 ```
- ┌──────────────────────────────┐
- │     Vendor Eye Tracking SDK  │
- │  (face camera, IR tracker)   │
- └──────────────┬───────────────┘
-                │  predicted eye positions (meters)
-                ▼
- ┌──────────────────────────────┐
- │     SDK Wrapper              │
- │  vendor_get_predicted_eyes() │
- └──────────────┬───────────────┘
-                │  leiasr_eye_pair {L(x,y,z), R(x,y,z)}
-                ▼
- ┌──────────────────────────────┐
- │     Compositor               │
- │  (stores per-session weaver) │
- └──────────────┬───────────────┘
-                │  via compositor vtable
-                ▼
- ┌──────────────────────────────────────────────────────────────┐
- │  oxr_session_locate_views()                                  │
+ ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐
+ │  VENDOR DRIVER  (src/xrt/drivers/<vendor>/)                 │
  │                                                              │
- │  ┌─────────────────────────┐  ┌────────────────────────────┐│
- │  │  RAW mode               │  │  RENDER_READY mode         ││
- │  │  (has_external_window)  │  │  (!has_external_window)    ││
- │  │                         │  │                            ││
- │  │  pose = raw eye in      │  │  pose = qwerty_transform   ││
- │  │         DISPLAY space   │  │         × eye position     ││
- │  │  ori  = identity        │  │  ori  = qwerty orientation ││
- │  │  fov  = advisory only   │  │  fov  = runtime Kooima FOV ││
- │  └────────────┬────────────┘  └──────────────┬─────────────┘│
- └───────────────┼──────────────────────────────┼──────────────┘
-                 │                              │
-                 ▼                              ▼
- ┌──────────────────────────┐  ┌──────────────────────────────┐
- │  Extension-aware app     │  │  Legacy OpenXR / WebXR app   │
- │  • ignores XrView.fov    │  │  • uses XrView.fov directly  │
- │  • computes own Kooima   │  │  • uses XrView.pose directly │
- │    from eye pos + display │  │  • navigates via WASD/mouse  │
- │    geometry               │  │    (qwerty debug controller) │
- └──────────────────────────┘  └──────────────────────────────┘
+ │  ┌──────────────────────────────┐                            │
+ │  │     Vendor Eye Tracking SDK  │                            │
+ │  │  (face camera, IR tracker)   │                            │
+ │  └──────────────┬───────────────┘                            │
+ │                 │  vendor-specific types (internal)           │
+ │                 ▼                                             │
+ │  ┌──────────────────────────────┐                            │
+ │  │     SDK Wrapper              │                            │
+ │  │  vendor_get_predicted_eyes() │                            │
+ │  └──────────────┬───────────────┘                            │
+ └ ─ ─ ─ ─ ─ ─ ─ ─┼─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─┘
+     ══════════════╪══════════════════  BOUNDARY: xrt_eye_pair
+ ┌ ─ ─ ─ ─ ─ ─ ─ ─┼─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─┐
+ │  OPENXR RUNTIME │ (vendor-neutral types only)                │
+ │                 ▼                                             │
+ │  ┌──────────────────────────────┐                            │
+ │  │     Compositor               │                            │
+ │  │  get_predicted_eye_positions │                            │
+ │  │  → xrt_eye_pair             │                            │
+ │  └──────────────┬───────────────┘                            │
+ │                 │                                             │
+ │                 ▼                                             │
+ │  ┌──────────────────────────────────────────────────────────┐│
+ │  │  oxr_session_locate_views()                              ││
+ │  │  uses: xrt_eye_position, xrt_window_metrics,            ││
+ │  │        xrt_system_compositor_info                        ││
+ │  │                                                          ││
+ │  │  ┌─────────────────────────┐  ┌────────────────────────┐││
+ │  │  │  RAW mode               │  │  RENDER_READY mode     │││
+ │  │  │  (has_external_window)  │  │  (!has_external_window) │││
+ │  │  │                         │  │                         │││
+ │  │  │  pose = raw eye in      │  │  pose = qwerty_transform│││
+ │  │  │         DISPLAY space   │  │         × eye position  │││
+ │  │  │  ori  = identity        │  │  ori  = qwerty orient.  │││
+ │  │  │  fov  = advisory only   │  │  fov  = Kooima FOV     │││
+ │  │  └────────────┬────────────┘  └──────────────┬──────────┘││
+ │  └───────────────┼──────────────────────────────┼───────────┘│
+ └ ─ ─ ─ ─ ─ ─ ─ ─ ┼─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─┼─ ─ ─ ─ ─ ─┘
+     ════════════════╪══════════════════════════════╪═  BOUNDARY: XrView
+ ┌ ─ ─ ─ ─ ─ ─ ─ ─ ┼─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─┼─ ─ ─ ─ ─ ─┐
+ │  APPLICATION     │                              │            │
+ │                  ▼                              ▼            │
+ │  ┌──────────────────────────┐  ┌────────────────────────────┐│
+ │  │  Extension-aware app     │  │  Legacy OpenXR / WebXR app ││
+ │  │  • ignores XrView.fov    │  │  • uses XrView.fov directly││
+ │  │  • computes own Kooima   │  │  • uses XrView.pose as-is  ││
+ │  │    from eye pos + display │  │  • navigates via WASD/mouse││
+ │  │    geometry               │  │    (qwerty debug controller)│
+ │  └──────────────────────────┘  └────────────────────────────┘│
+ └ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─┘
 ```
 
 ### 6.3 Kooima Asymmetric Frustum Projection
@@ -617,11 +747,12 @@ Where `halfWidth = displaySizeMeters.width / 2`, `halfHeight = displaySizeMeters
 and `(eyeX, eyeY, eyeZ)` is the eye position in DISPLAY space.
 
 The runtime's internal implementation (used for RENDER_READY mode) is in
-`oxr_session.c:compute_kooima_fov()`:
+`oxr_session.c:compute_kooima_fov()`.  Note the **vendor-neutral type**
+`xrt_eye_position` — this function works with any vendor's eye data:
 
 ```c
 static void
-compute_kooima_fov(const struct leiasr_eye_position *eye,
+compute_kooima_fov(const struct xrt_eye_position *eye,   // vendor-neutral!
                    float screen_width_m,
                    float screen_height_m,
                    const char *eye_name,
@@ -640,8 +771,13 @@ compute_kooima_fov(const struct leiasr_eye_position *eye,
 }
 ```
 
-**Vendor takeaway:** The vendor only provides raw eye positions.  The runtime
-handles the RENDER_READY Kooima math; extension-aware apps handle their own.
+This function is **not** behind any vendor-specific `#ifdef`.  It operates on
+vendor-neutral types and works with both SR tracked eye positions (from Leia)
+and nominal viewer positions (from sim_display or any future vendor).
+
+**Vendor takeaway:** The vendor only provides raw eye positions (via
+`xrt_eye_pair`).  The runtime handles the RENDER_READY Kooima math;
+extension-aware apps handle their own.
 
 ### 6.4 Fallback Positions
 
@@ -661,15 +797,26 @@ return false;  // Indicates fallback, not tracked
 
 ### 6.5 Integration Points for Vendor Eye Tracking
 
-The vendor's eye tracking function is called from:
+Eye positions flow from the vendor driver to the runtime through compositor
+functions that return `xrt_eye_pair` (vendor-neutral):
 
 1. **D3D11 path:** `comp_d3d11_compositor_get_predicted_eye_positions()`
-   → vendor's `get_predicted_eye_positions()`
+   → internally calls vendor SDK → returns `xrt_vec3` left/right
 2. **Vulkan path:** `multi_compositor_get_predicted_eye_positions()`
-   → vendor's `get_predicted_eye_positions()` via the per-session weaver
+   → internally calls vendor SDK via per-session weaver → returns eye pair
 
-Both paths feed into `oxr_session_get_predicted_eye_positions()` which
-dispatches based on the compositor type.
+Both paths feed into the runtime's `oxr_session_get_predicted_eye_positions()`
+which dispatches based on the compositor type and converts to `xrt_eye_pair`.
+
+**Display dimensions** are read from `xrt_system_compositor_info` which is
+populated once at device init.  The runtime calls
+`oxr_session_get_display_dimensions()` which reads `info.display_width_m`
+and `info.display_height_m` — no vendor SDK call at runtime.
+
+**Window metrics** flow through `multi_compositor_get_window_metrics()` which
+returns `xrt_window_metrics`.  The Vulkan path computes window metrics from
+generic Win32/macOS APIs (no vendor SDK needed); the D3D11 path may query
+the vendor SDK if it manages the window.
 
 ---
 
@@ -1009,7 +1156,7 @@ src/xrt/drivers/my_vendor/
 ├── my_vendor_device.c                     xrt_device implementation
 ├── my_vendor_sdk.h                        Opaque SDK wrapper header
 ├── my_vendor_sdk.cpp                      SDK wrapper implementation
-├── my_vendor_types.h                      Shared data types (eye_pair, etc.)
+├── my_vendor_types.h                      Internal vendor types (optional)
 ├── my_vendor_display_processor.h          Vulkan display processor header
 ├── my_vendor_display_processor.cpp        Vulkan display processor impl
 ├── my_vendor_display_processor_d3d11.h    D3D11 display processor header (Windows)
@@ -1106,44 +1253,54 @@ src/xrt/drivers/leia/
 ### 10.3 Eye Tracking Pipeline
 
 ```
- ┌────────────────────┐
- │ Vendor Eye Tracker │
- │ (face camera, IR)  │
- └─────────┬──────────┘
-           │ raw L/R positions (vendor units)
-           ▼
- ┌────────────────────┐
- │ SDK Wrapper        │
- │ convert to meters  │
- │ prediction filter  │
- └─────────┬──────────┘
-           │ leiasr_eye_pair {L(x,y,z), R(x,y,z), timestamp, valid}
-           ▼
- ┌────────────────────┐
- │ Compositor         │
- │ get_predicted_     │
- │ eye_positions()    │
- └─────────┬──────────┘
-           │
-           ▼
- ┌──────────────────────────────────────────────────────────────┐
- │ oxr_session_locate_views()                                   │
- │                                                              │
- │  has_external_window?                                        │
- │  ┌────YES (RAW mode)───┐  ┌──────NO (RENDER_READY mode)──┐ │
- │  │ pose = raw eye pos   │  │ pose = qwerty × eye pos      │ │
- │  │ ori  = identity      │  │ fov  = runtime Kooima FOV    │ │
- │  │ fov  = advisory      │  │ ori  = qwerty orientation    │ │
- │  └──────────┬───────────┘  └──────────────┬───────────────┘ │
- └─────────────┼─────────────────────────────┼─────────────────┘
-               │                             │
-               ▼                             ▼
- ┌───────────────────────┐   ┌───────────────────────────────┐
- │ Extension-aware app   │   │ Legacy OpenXR / WebXR app     │
- │ reads raw eye pos     │   │ uses XrView.fov + pose as-is  │
- │ computes own Kooima   │   │ navigates via WASD/mouse      │
- │ ignores XrView.fov    │   │ (qwerty debug controller)     │
- └───────────────────────┘   └───────────────────────────────┘
+ ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐
+ │ VENDOR DRIVER                           │
+ │ ┌────────────────────┐                  │
+ │ │ Vendor Eye Tracker │                  │
+ │ │ (face camera, IR)  │                  │
+ │ └─────────┬──────────┘                  │
+ │           │ vendor-specific types       │
+ │           ▼                             │
+ │ ┌────────────────────┐                  │
+ │ │ SDK Wrapper        │                  │
+ │ │ convert to meters  │                  │
+ │ │ prediction filter  │                  │
+ │ └─────────┬──────────┘                  │
+ └ ─ ─ ─ ─ ─┼─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─┘
+    ═════════╪═══════  BOUNDARY: xrt_eye_pair
+ ┌ ─ ─ ─ ─ ─┼─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─┐
+ │ RUNTIME   │ (vendor-neutral types)      │
+ │           ▼                             │
+ │ ┌────────────────────┐                  │
+ │ │ Compositor         │                  │
+ │ │ → xrt_eye_pair     │                  │
+ │ └─────────┬──────────┘                  │
+ │           │                             │
+ │           ▼                             │
+ │ ┌────────────────────────────────────┐  │
+ │ │ oxr_session_locate_views()        │  │
+ │ │ uses: xrt_eye_position,           │  │
+ │ │       xrt_window_metrics,         │  │
+ │ │       xrt_system_compositor_info  │  │
+ │ │                                   │  │
+ │ │ has_external_window?              │  │
+ │ │ ┌──YES (RAW)────┐ ┌──NO (READY)─┐│  │
+ │ │ │pose = raw eye  │ │pose = qwerty││  │
+ │ │ │ori  = identity │ │fov  = Kooima││  │
+ │ │ │fov  = advisory │ │ori  = qwerty││  │
+ │ │ └──────┬─────────┘ └──────┬──────┘│  │
+ │ └────────┼──────────────────┼───────┘  │
+ └ ─ ─ ─ ─ ┼─ ─ ─ ─ ─ ─ ─ ─ ─┼─ ─ ─ ─ ─┘
+    ════════╪══════════════════╪═  BOUNDARY: XrView
+ ┌ ─ ─ ─ ─ ┼─ ─ ─ ─ ─ ─ ─ ─ ─┼─ ─ ─ ─ ─ ┐
+ │ APP      ▼                  ▼           │
+ │ ┌─────────────────┐ ┌─────────────────┐ │
+ │ │ Extension-aware │ │ Legacy OpenXR / │ │
+ │ │ reads raw eye   │ │ WebXR app       │ │
+ │ │ computes Kooima │ │ uses fov + pose │ │
+ │ │ ignores XrFov   │ │ WASD/mouse nav  │ │
+ │ └─────────────────┘ └─────────────────┘ │
+ └ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─┘
 ```
 
 ---
@@ -1248,6 +1405,31 @@ The sim_display driver is the minimal starting point:
 
 ## Appendix A: Key Type References
 
+### `xrt_eye_position` / `xrt_eye_pair` / `xrt_window_metrics`
+
+```c
+// From xrt_display_metrics.h — vendor-neutral runtime interface types
+// See Section 6.1 for full definitions
+```
+
+These types define the **boundary contract** between vendor drivers and the
+runtime.  Vendor code must produce data in these formats; the runtime
+consumes them without knowing which vendor produced them.
+
+### `xrt_system_compositor_info` (display geometry fields)
+
+```c
+// From xrt_compositor.h — populated by vendor device at init time
+float display_width_m;            // Physical display width (meters)
+float display_height_m;           // Physical display height (meters)
+float nominal_viewer_x_m;         // Default viewer X (meters, display space)
+float nominal_viewer_y_m;         // Default viewer Y
+float nominal_viewer_z_m;         // Default viewer Z (distance from display)
+```
+
+The runtime reads these at runtime for Kooima FOV, `XR_EXT_display_info`,
+and nominal eye positions when tracking is unavailable.
+
 ### `VkFormat_XDP`
 
 ```c
@@ -1292,10 +1474,15 @@ For a vendor starting from scratch, here is the recommended order:
 2. **Replace the device** with your display's actual specs
 3. **Replace the display processor** shaders with your interlacing algorithm
 4. **Add your SDK wrapper** (.h/.cpp pair with opaque struct)
-5. **Wire up eye tracking** through the compositor's get_predicted_eye_positions
-6. **Register the builder** in target_builder_interface.h and target_lists.c
-7. **Update CMakeLists.txt** files to build and link the new driver
-8. **Test with `SIM_DISPLAY_ENABLE=0`** and your actual hardware
+5. **Wire up eye tracking** — return `xrt_eye_pair` through the compositor interface
+6. **Populate `xrt_system_compositor_info`** with display geometry at device init
+7. **Register the builder** in target_builder_interface.h and target_lists.c
+8. **Update CMakeLists.txt** files to build and link the new driver
+9. **Test with `SIM_DISPLAY_ENABLE=0`** and your actual hardware
+
+**Remember:** vendor-specific code goes **only** in `src/xrt/drivers/<vendor>/`.
+No changes to runtime files (`oxr_session.c`, `comp_multi_compositor.c`, etc.)
+should be necessary.
 
 Total lines of code for a minimal integration (without eye tracking):
 approximately 300-500 lines across 4-5 files.
