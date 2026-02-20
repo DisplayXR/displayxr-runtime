@@ -1180,6 +1180,7 @@ multi_compositor_destroy(struct xrt_compositor *xc)
 
 		// Destroy HUD resources
 		if (vk != NULL && mc->session_render.hud_gpu_initialized) {
+			vk_hud_blend_fini(&mc->session_render.hud_blend, vk);
 			if (mc->session_render.hud_staging_mapped != NULL && mc->session_render.hud_staging_memory != VK_NULL_HANDLE) {
 				vk->vkUnmapMemory(vk->device, mc->session_render.hud_staging_memory);
 				mc->session_render.hud_staging_mapped = NULL;
@@ -1644,7 +1645,7 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 	mc->session_render.hud_last_frame_time_ns = 0;
 	mc->session_render.hud_smoothed_frame_time_ms = 16.67f;
 	if (mc->session_render.owns_window) {
-		u_hud_create(&mc->session_render.hud, 480, 256);
+		u_hud_create(&mc->session_render.hud, 480, 304);
 	}
 
 	U_LOG_W("Setting session_render.initialized = true...");
@@ -1821,14 +1822,20 @@ compute_window_metrics_from_comp_target(struct multi_system_compositor *msc,
 	float pixel_size_x = info->display_width_m / (float)disp_px_w;
 	float pixel_size_y = info->display_height_m / (float)disp_px_h;
 
+	// In SBS mode each eye sees half the display width.
+	// Check dynamically so Kooima FOV updates when mode switches at runtime.
+	bool sbs_mode = (sim_display_get_output_mode() == SIM_DISPLAY_OUTPUT_SBS);
+	float disp_w_m = sbs_mode ? info->display_width_m / 2.0f : info->display_width_m;
+
 	memset(out_metrics, 0, sizeof(*out_metrics));
-	out_metrics->display_width_m = info->display_width_m;
+	out_metrics->display_width_m = disp_w_m;
 	out_metrics->display_height_m = info->display_height_m;
 	out_metrics->display_pixel_width = disp_px_w;
 	out_metrics->display_pixel_height = disp_px_h;
 	out_metrics->window_pixel_width = win_px_w;
 	out_metrics->window_pixel_height = win_px_h;
-	out_metrics->window_width_m = (float)win_px_w * pixel_size_x;
+	out_metrics->window_width_m = sbs_mode ? (float)win_px_w * pixel_size_x / 2.0f
+	                                       : (float)win_px_w * pixel_size_x;
 	out_metrics->window_height_m = (float)win_px_h * pixel_size_y;
 	// Center offset: assume window is centered on display (no screen coord info available)
 	out_metrics->window_center_offset_x_m = 0.0f;

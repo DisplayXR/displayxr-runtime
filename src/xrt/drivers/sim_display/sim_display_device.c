@@ -324,6 +324,7 @@ sim_display_get_display_info(struct xrt_device *xdev, struct sim_display_info *o
 	out_info->nominal_z_m = hmd->nominal_z_m;
 	out_info->display_pixel_width = hmd->display_pixel_width;
 	out_info->display_pixel_height = hmd->display_pixel_height;
+	out_info->zoom_scale = hmd->zoom_scale;
 	return true;
 }
 
@@ -369,17 +370,14 @@ sim_display_hmd_create(void)
 			display_h_m = (float)screen_mm.height / 1000.0f;
 		}
 
-		// Use backing pixel dimensions (not logical points) so that
-		// swapchain size matches NSView backing pixels on Retina displays.
-		CGDisplayModeRef mode = CGDisplayCopyDisplayMode(main_display);
-		if (mode) {
-			uint32_t cg_w = (uint32_t)CGDisplayModeGetPixelWidth(mode);
-			uint32_t cg_h = (uint32_t)CGDisplayModeGetPixelHeight(mode);
-			CGDisplayModeRelease(mode);
-			if (cg_w > 0 && cg_h > 0) {
-				pixel_w = (int)cg_w;
-				pixel_h = (int)cg_h;
-			}
+		// Use visible frame (excluding menu bar, dock, title bar) so
+		// the recommended swapchain matches the actual window size.
+		extern void sim_display_macos_get_visible_frame(uint32_t *out_w, uint32_t *out_h);
+		uint32_t vis_w = 0, vis_h = 0;
+		sim_display_macos_get_visible_frame(&vis_w, &vis_h);
+		if (vis_w > 0 && vis_h > 0) {
+			pixel_w = (int)vis_w;
+			pixel_h = (int)vis_h;
 		}
 	}
 #endif
@@ -460,8 +458,10 @@ sim_display_hmd_create(void)
 	// Kooima off-axis asymmetric frustum per eye.
 	// Display plane at Z=0, centered at origin. Each eye computes frustum
 	// angles from its position to the display edges.
+	// In SBS mode each eye sees half the display width.
 	{
-		const float half_w = display_w_m / 2.0f;
+		bool sbs_mode = (sim_display_get_output_mode() == SIM_DISPLAY_OUTPUT_SBS);
+		const float half_w = (sbs_mode ? display_w_m / 2.0f : display_w_m) / 2.0f;
 		const float half_h = display_h_m / 2.0f;
 
 		for (uint32_t i = 0; i < hmd->base.hmd->view_count; i++) {
