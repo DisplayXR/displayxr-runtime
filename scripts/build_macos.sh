@@ -6,6 +6,7 @@
 # Usage:
 #   ./scripts/build_macos.sh             # In-process mode (default)
 #   ./scripts/build_macos.sh --service   # IPC service mode (monado-service + client)
+#   ./scripts/build_macos.sh --hybrid    # Hybrid mode (in-process + IPC auto-switching)
 #
 # Then run:
 #   XR_RUNTIME_JSON=./build/openxr_monado-dev.json \
@@ -22,9 +23,11 @@ OPENXR_VERSION="1.1.43"
 
 # Parse arguments
 SERVICE_MODE=OFF
+HYBRID_MODE=OFF
 for arg in "$@"; do
   case "$arg" in
     --service) SERVICE_MODE=ON ;;
+    --hybrid) SERVICE_MODE=ON; HYBRID_MODE=ON ;;
   esac
 done
 
@@ -32,10 +35,11 @@ done
 MACOS_SDK="$(xcrun --show-sdk-path 2>/dev/null)"
 
 # Step 1: Build the runtime
-echo "=== Building SRMonado runtime (SERVICE=$SERVICE_MODE) ==="
+echo "=== Building SRMonado runtime (SERVICE=$SERVICE_MODE, HYBRID=$HYBRID_MODE) ==="
 cmake -B "$BUILD_DIR" -S "$ROOT" -G Ninja \
   -DCMAKE_BUILD_TYPE=Debug \
   -DXRT_FEATURE_SERVICE=$SERVICE_MODE \
+  -DXRT_FEATURE_HYBRID_MODE=$HYBRID_MODE \
   -DXRT_BUILD_DRIVER_QWERTY=ON \
   -DXRT_FEATURE_DEBUG_GUI=OFF \
   -DXRT_FEATURE_WINDOW_PEEK=OFF \
@@ -79,7 +83,13 @@ cmake --build "$ROOT/test_apps/sim_cube_openxr_ext_macos/build"
 # Step 4: Package artifacts (mirrors CI workflow)
 echo "=== Packaging artifacts ==="
 PKG_DIR="$ROOT/_package/SRMonado-macOS"
-rm -rf "$ROOT/_package" 2>/dev/null || true
+if [ -d "$ROOT/_package" ]; then
+  rm -rf "$ROOT/_package" 2>/dev/null || {
+    echo "Warning: cannot remove _package (root-owned files from a previous sudo run?)"
+    echo "Retrying with sudo..."
+    sudo rm -rf "$ROOT/_package"
+  }
+fi
 mkdir -p "$PKG_DIR/lib"
 mkdir -p "$PKG_DIR/share/vulkan/icd.d"
 mkdir -p "$PKG_DIR/bin"
@@ -170,12 +180,15 @@ exec "$DIR/bin/sim_cube_openxr_ext_macos" "$@"
 SCRIPT
 chmod +x "$PKG_DIR/run_sim_cube_ext.sh"
 
-# Step 5: Build .app bundle and .pkg installer
-echo "=== Building .app bundle ==="
-"$ROOT/installer/macos/create_app_bundle.sh" "$PKG_DIR" "$ROOT/_package/SimCubeOpenXR.app"
-
-echo "=== Building .pkg installer ==="
-"$ROOT/installer/macos/build_installer.sh" "$PKG_DIR" "$ROOT/_package/SRMonado-Installer.pkg"
+# Step 5: Build .app bundles and .pkg installer (commented out for dev -- uncomment when ready)
+# NOTE: if _package has root-owned files from a previous sudo run, clean up first:
+#   sudo rm -rf /Users/david.fattal/Documents/GitHub/CNSDK-OpenXR/_package
+# echo "=== Building .app bundles ==="
+# "$ROOT/installer/macos/create_app_bundle.sh" "$PKG_DIR" "$ROOT/_package/SimCubeOpenXR.app" sim_cube_openxr
+# "$ROOT/installer/macos/create_app_bundle.sh" "$PKG_DIR" "$ROOT/_package/SimCubeOpenXRExt.app" sim_cube_openxr_ext_macos
+#
+# echo "=== Building .pkg installer ==="
+# "$ROOT/installer/macos/build_installer.sh" "$PKG_DIR" "$ROOT/_package/SRMonado-Installer.pkg"
 
 echo ""
 echo "=== Build complete! ==="
@@ -183,11 +196,9 @@ echo ""
 echo "Artifacts in _package/:"
 ls -lh "$ROOT/_package/" 2>/dev/null
 echo ""
-echo "Run the .app bundle:"
-echo "  open $ROOT/_package/SimCubeOpenXR.app"
-echo ""
-echo "Or run directly:"
+echo "Run directly:"
 echo "  $PKG_DIR/run_sim_cube.sh"
+echo "  $PKG_DIR/run_sim_cube_ext.sh"
 echo ""
 echo "Or run manually:"
 echo "  XR_RUNTIME_JSON=$BUILD_DIR/openxr_monado-dev.json \\"

@@ -33,7 +33,8 @@ jobs:
         run: |
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-            -DXRT_FEATURE_SERVICE=ON
+            -DXRT_FEATURE_SERVICE=ON \
+            -DXRT_FEATURE_HYBRID_MODE=ON
 
       - name: Build
         run: cmake --build build

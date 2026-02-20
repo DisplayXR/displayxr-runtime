@@ -52,22 +52,39 @@ u_sandbox_is_app_container(void)
 	return is_app_container != FALSE;
 }
 
-#else /* !XRT_OS_WINDOWS */
+#elif defined(XRT_OS_MACOS)
 
 /*
  *
- * Non-Windows stub implementation
+ * macOS implementation
+ *
+ */
+
+#include <sandbox.h>
+#include <unistd.h>
+
+bool
+u_sandbox_is_app_container(void)
+{
+	int result = sandbox_check(getpid(), NULL, SANDBOX_FILTER_NONE);
+	return result != 0;
+}
+
+#else /* stub for other platforms */
+
+/*
+ *
+ * Stub implementation
  *
  */
 
 bool
 u_sandbox_is_app_container(void)
 {
-	// AppContainer is Windows-specific
 	return false;
 }
 
-#endif /* XRT_OS_WINDOWS */
+#endif
 
 
 /*
@@ -97,7 +114,7 @@ u_sandbox_should_use_ipc(void)
 	// Automatic detection
 	bool is_sandboxed = u_sandbox_is_app_container();
 	if (is_sandboxed) {
-		U_LOG_I("AppContainer sandbox detected, using IPC/service mode");
+		U_LOG_I("Sandbox detected, using IPC/service mode");
 	}
 
 	return is_sandboxed;

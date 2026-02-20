@@ -21,20 +21,26 @@ extern "C" {
  * @ingroup aux_util
  *
  * Utilities for detecting sandboxed execution environments such as
- * Windows AppContainer (used by WebXR/Chrome, UWP apps, etc.).
+ * Windows AppContainer (used by WebXR/Chrome, UWP apps, etc.) and
+ * macOS App Sandbox (used by Safari WebXR, Mac App Store apps, Chrome Seatbelt).
  */
 
 /*!
- * Check if the current process is running in a Windows AppContainer sandbox.
+ * Check if the current process is running in a platform sandbox.
  *
- * AppContainer is used by:
+ * On Windows, detects AppContainer sandbox used by:
  * - Chrome/Edge for WebXR content
  * - Microsoft Store (UWP) applications
  * - Other sandboxed Windows applications
  *
- * @return true if running in an AppContainer, false otherwise.
+ * On macOS, detects App Sandbox used by:
+ * - Safari for WebXR content
+ * - Chrome Seatbelt sandbox
+ * - Mac App Store applications
  *
- * @note On non-Windows platforms, this always returns false.
+ * @return true if running in a sandbox, false otherwise.
+ *
+ * @note On unsupported platforms, this always returns false.
  *
  * @ingroup aux_sandbox
  */

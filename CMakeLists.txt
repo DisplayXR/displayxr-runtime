@@ -315,7 +315,7 @@ option_with_deps(XRT_FEATURE_STEAMVR_PLUGIN "Build SteamVR plugin" DEPENDS "NOT 
 option_with_deps(XRT_FEATURE_TRACING "Enable debug tracing on supported platforms" DEFAULT OFF DEPENDS "XRT_HAVE_PERCETTO OR XRT_HAVE_TRACY")
 option_with_deps(XRT_FEATURE_WINDOW_PEEK "Enable a window that displays the content of the HMD on screen" DEPENDS XRT_HAVE_SDL2)
 option_with_deps(XRT_FEATURE_DEBUG_GUI "Enable debug window to be used" DEPENDS XRT_HAVE_SDL2)
-option_with_deps(XRT_FEATURE_HYBRID_MODE "Enable hybrid in-process/IPC mode for Windows (native for D3D11, IPC for sandboxed apps)" DEFAULT OFF DEPENDS WIN32 XRT_MODULE_IPC XRT_FEATURE_OPENXR XRT_HAVE_D3D11)
+option_with_deps(XRT_FEATURE_HYBRID_MODE "Enable hybrid in-process/IPC mode (native compositor for normal apps, IPC for sandboxed apps)" DEFAULT OFF DEPENDS "WIN32 OR APPLE" XRT_MODULE_IPC XRT_FEATURE_OPENXR "XRT_HAVE_D3D11 OR APPLE")
 
 if (XRT_FEATURE_SERVICE)
 	# Disable the client debug gui by default for out-of-proc -
