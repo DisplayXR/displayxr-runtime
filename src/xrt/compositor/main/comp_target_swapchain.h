@@ -109,6 +109,8 @@ struct comp_target_swapchain
 	 * VkSWapchain, this keeps track if we have done it.
 	 */
 	bool has_logged_info;
+
+	bool has_logged_vblank_info;
 };
 
 

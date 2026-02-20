@@ -67,7 +67,7 @@
 #include <assert.h>
 #include <math.h>
 
-DEBUG_GET_ONCE_LOG_OPTION(comp_frame_lag_level, "XRT_COMP_FRAME_LAG_LOG_AS_LEVEL", U_LOGGING_WARN)
+DEBUG_GET_ONCE_LOG_OPTION(comp_frame_lag_level, "XRT_COMP_FRAME_LAG_LOG_AS_LEVEL", U_LOGGING_INFO)
 #define LOG_FRAME_LAG(...) U_LOG_IFL(debug_get_log_option_comp_frame_lag_level(), u_log_get_global_level(), __VA_ARGS__)
 
 /*
@@ -817,7 +817,9 @@ renderer_acquire_swapchain_image(struct comp_renderer *r)
 
 		/* Acquire image again to silence validation error */
 		ret = comp_target_acquire(r->c->target, &buffer_index);
-		if (ret != VK_SUCCESS) {
+		if (ret == VK_SUBOPTIMAL_KHR) {
+			COMP_DEBUG(r->c, "Swapchain still suboptimal after recreate, will retry next frame.");
+		} else if (ret != VK_SUCCESS) {
 			COMP_ERROR(r->c, "comp_target_acquire: %s", vk_result_string(ret));
 		}
 	} else if (ret != VK_SUCCESS) {
