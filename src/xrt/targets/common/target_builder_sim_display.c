@@ -98,12 +98,11 @@ sim_display_open_system_impl(struct xrt_builder *xb,
 			if (qwerty_head != NULL) {
 				xsysd->xdevs[xsysd->xdev_count++] = qwerty_head;
 
-				// Set qwerty HMD initial pose to match sim_display's
-				// nominal viewer position so the scene starts correctly.
-				struct xrt_space_relation rel;
-				head->get_tracked_pose(head, XRT_INPUT_GENERIC_HEAD_POSE, 0, &rel);
+				// Qwerty HMD pose = virtual display position in world space.
+				// Start at origin; sim_display adds the nominal eye offset.
 				struct qwerty_device *qd = qwerty_device(qwerty_head);
-				qd->pose = rel.pose;
+				qd->pose.position = (struct xrt_vec3){0, 0, 0};
+				qd->pose.orientation = (struct xrt_quat){0, 0, 0, 1};
 
 				// Delegate sim_display pose to qwerty HMD.
 				sim_display_hmd_set_pose_source(head, qwerty_head);

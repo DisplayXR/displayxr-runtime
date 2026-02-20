@@ -44,20 +44,24 @@ u_hud_is_visible(void);
  */
 struct u_hud_data
 {
+	const char *device_name;                       //!< Device identifier (e.g. "Sim 3D Display")
 	float fps;
 	float frame_time_ms;
 	bool mode_3d;
-	const char *output_mode; //!< "Weaved", "Fallback", "SBS", etc.
+	const char *output_mode;                       //!< "Weaved", "Fallback", "SBS", etc.
 	uint32_t render_width;
 	uint32_t render_height;
 	uint32_t window_width;
 	uint32_t window_height;
 	float display_width_mm;
 	float display_height_mm;
-	float nominal_x, nominal_y, nominal_z;     //!< Display nominal position (mm)
-	float left_eye_x, left_eye_y, left_eye_z;  //!< Left eye position (mm)
-	float right_eye_x, right_eye_y, right_eye_z; //!< Right eye position (mm)
+	float nominal_x, nominal_y, nominal_z;         //!< Display nominal position (mm)
+	float left_eye_x, left_eye_y, left_eye_z;      //!< Left eye position (mm)
+	float right_eye_x, right_eye_y, right_eye_z;   //!< Right eye position (mm)
 	bool eye_tracking_active;
+	float zoom_scale;                               //!< Zoom factor (1.0 = no zoom)
+	float vdisp_x, vdisp_y, vdisp_z;               //!< Virtual display position (m)
+	float forward_x, forward_y, forward_z;         //!< Head forward direction
 };
 
 struct u_hud;

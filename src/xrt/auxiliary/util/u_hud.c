@@ -163,13 +163,13 @@ u_hud_update(struct u_hud *hud, const struct u_hud_data *data)
 	}
 	hud->last_update_ns = now_ns;
 
-	// Clear to opaque black background
+	// Clear to semi-transparent black background
 	uint32_t total_pixels = hud->width * hud->height;
 	for (uint32_t i = 0; i < total_pixels; i++) {
 		hud->pixels[i * 4 + 0] = 0;   // R
 		hud->pixels[i * 4 + 1] = 0;   // G
 		hud->pixels[i * 4 + 2] = 0;   // B
-		hud->pixels[i * 4 + 3] = 255; // A (opaque)
+		hud->pixels[i * 4 + 3] = 160; // A (semi-transparent)
 	}
 
 	// Format and draw text lines
@@ -178,59 +178,83 @@ u_hud_update(struct u_hud *hud, const struct u_hud_data *data)
 	int y = HUD_MARGIN;
 	int line_h = GLYPH_H + 2; // 2px spacing between lines
 
-	// Line 1: FPS
+	// Device name
+	if (data->device_name) {
+		draw_string(hud, x, y, data->device_name);
+		y += line_h;
+	}
+
+	// FPS
 	snprintf(line, sizeof(line), "FPS: %.0f  (%.1f ms)", data->fps, data->frame_time_ms);
 	draw_string(hud, x, y, line);
 	y += line_h;
 
-	// Line 2: Mode and output
+	// Mode and output
 	snprintf(line, sizeof(line), "Mode: %s  Output: %s", data->mode_3d ? "3D" : "2D",
 	         data->output_mode ? data->output_mode : "N/A");
 	draw_string(hud, x, y, line);
 	y += line_h;
 
-	// Line 3: Render size
+	// Render size
 	snprintf(line, sizeof(line), "Render: %ux%u", data->render_width, data->render_height);
 	draw_string(hud, x, y, line);
 	y += line_h;
 
-	// Line 4: Window size
+	// Window size
 	snprintf(line, sizeof(line), "Window: %ux%u", data->window_width, data->window_height);
 	draw_string(hud, x, y, line);
 	y += line_h;
 
-	// Line 5: Display dimensions
+	// Display dimensions
 	snprintf(line, sizeof(line), "Display: (%.0fx%.0f) mm", data->display_width_mm, data->display_height_mm);
 	draw_string(hud, x, y, line);
 	y += line_h;
 
-	// Line 6: Nominal position
+	// Nominal position
 	snprintf(line, sizeof(line), "Nominal: (%.0f, %.0f, %.0f) mm", data->nominal_x, data->nominal_y,
 	         data->nominal_z);
 	draw_string(hud, x, y, line);
 	y += line_h;
 
-	// Line 7: Left eye
+	// Left eye
 	snprintf(line, sizeof(line), "L eye: (%.0f, %.0f, %.0f) mm", data->left_eye_x, data->left_eye_y,
 	         data->left_eye_z);
 	draw_string(hud, x, y, line);
 	y += line_h;
 
-	// Line 8: Right eye
+	// Right eye
 	snprintf(line, sizeof(line), "R eye: (%.0f, %.0f, %.0f) mm", data->right_eye_x, data->right_eye_y,
 	         data->right_eye_z);
 	draw_string(hud, x, y, line);
 	y += line_h;
 
-	// Line 9: Tracking status
+	// Tracking status
 	snprintf(line, sizeof(line), "Track: %s", data->eye_tracking_active ? "Active" : "Inactive");
 	draw_string(hud, x, y, line);
 	y += line_h;
 
-	// Line 10: Blank separator
+	// Zoom factor (only show if meaningful)
+	if (data->zoom_scale > 0.0f) {
+		snprintf(line, sizeof(line), "Zoom: %.2f", data->zoom_scale);
+		draw_string(hud, x, y, line);
+		y += line_h;
+	}
+
+	// Virtual display position
+	snprintf(line, sizeof(line), "Virtual Display: (%.2f, %.2f, %.2f) m", data->vdisp_x, data->vdisp_y,
+	         data->vdisp_z);
+	draw_string(hud, x, y, line);
+	y += line_h;
+
+	// Forward vector
+	snprintf(line, sizeof(line), "Fwd: (%.2f, %.2f, %.2f)", data->forward_x, data->forward_y, data->forward_z);
+	draw_string(hud, x, y, line);
+	y += line_h;
+
+	// Blank separator
 	y += line_h / 2;
 
-	// Line 11: Key hints
+	// Key hints
 	draw_string(hud, x, y, "TAB=HUD  V=2D/3D  ESC=Quit");
 
 	hud->dirty = true;

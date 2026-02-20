@@ -36,6 +36,7 @@
 
 struct comp_window_peek;
 struct comp_target_factory;
+struct xrt_system_devices;
 
 #ifdef __cplusplus
 extern "C" {
@@ -168,6 +169,9 @@ struct comp_compositor
 
 	//! Service for creating per-session render targets (provided to comp_multi)
 	struct comp_target_service target_service;
+
+	//! System devices (for accessing qwerty HMD pose in HUD)
+	struct xrt_system_devices *xsysd;
 };
 
 

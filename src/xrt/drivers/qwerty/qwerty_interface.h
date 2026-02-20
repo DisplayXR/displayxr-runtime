@@ -20,6 +20,7 @@ extern "C" {
 #endif
 
 
+struct xrt_pose;
 typedef union SDL_Event SDL_Event;
 
 /*!
@@ -106,6 +107,23 @@ qwerty_create_devices(enum u_logging_level log_level,
                       struct xrt_device **out_hmd,
                       struct xrt_device **out_left,
                       struct xrt_device **out_right);
+
+/*!
+ * Get the current qwerty HMD pose without side effects.
+ *
+ * Finds the qwerty HMD in @p xdevs and returns its current internal
+ * pose state. Unlike get_tracked_pose(), this does not consume input
+ * deltas or accumulate movement — it just reads the current state.
+ *
+ * @param xdevs     Array of devices to search for the qwerty HMD.
+ * @param xdev_count Number of devices in the array.
+ * @param[out] out_pose Receives the current qwerty HMD pose.
+ * @return true if a qwerty HMD was found and out_pose was set.
+ *
+ * @ingroup drv_qwerty
+ */
+bool
+qwerty_get_hmd_pose(struct xrt_device **xdevs, size_t xdev_count, struct xrt_pose *out_pose);
 
 /*!
  * Check if a runtime-side display mode toggle is pending.

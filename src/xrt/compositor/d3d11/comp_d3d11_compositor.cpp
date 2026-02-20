@@ -628,7 +628,7 @@ d3d11_render_hud_overlay(struct comp_d3d11_compositor *c, bool is_mono, bool wea
 	float disp_h_mm = disp_h_m * 1000.0f;
 
 	// Fill HUD data
-	struct u_hud_data data = {0};
+	struct u_hud_data data = {};
 	data.fps = fps;
 	data.frame_time_ms = c->smoothed_frame_time_ms;
 	data.mode_3d = !is_mono;

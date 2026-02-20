@@ -891,6 +891,28 @@ qwerty_check_display_mode_toggle(struct xrt_device **xdevs, size_t xdev_count, b
 	return false;
 }
 
+bool
+qwerty_get_hmd_pose(struct xrt_device **xdevs, size_t xdev_count, struct xrt_pose *out_pose)
+{
+	if (xdevs == NULL || out_pose == NULL) {
+		return false;
+	}
+
+	for (size_t i = 0; i < xdev_count; i++) {
+		if (xdevs[i] == NULL) {
+			continue;
+		}
+		const char *name = xdevs[i]->tracking_origin->name;
+		if (strcmp(name, QWERTY_HMD_TRACKER_STR) == 0) {
+			struct qwerty_device *qd = qwerty_device(xdevs[i]);
+			*out_pose = qd->pose;
+			return true;
+		}
+	}
+
+	return false;
+}
+
 void
 qwerty_toggle_display_mode(struct qwerty_system *qs)
 {

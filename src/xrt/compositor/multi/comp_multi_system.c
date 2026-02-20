@@ -40,6 +40,11 @@
 
 // Vulkan helpers needed for Y-flip SBS blit (not Leia-specific)
 #include "vk/vk_helpers.h"
+#include "vk/vk_hud_blend.h"
+
+#include "sim_display/sim_display_interface.h"
+#include "xrt/xrt_system.h"
+#include "math/m_api.h"
 
 #ifdef XRT_HAVE_LEIA_SR_VULKAN
 #include "leia/leia_sr.h"
@@ -1820,7 +1825,7 @@ session_render_hud_init_gpu(struct multi_compositor *mc, struct vk_bundle *vk)
 	uint32_t pixel_size = hud_w * hud_h * 4;
 	VkResult ret;
 
-	// Create HUD image (TRANSFER_SRC for blit to swapchain)
+	// Create HUD image (TRANSFER_DST for upload, SAMPLED for blend pipeline)
 	VkImageCreateInfo image_info = {
 	    .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
 	    .imageType = VK_IMAGE_TYPE_2D,
@@ -1830,7 +1835,7 @@ session_render_hud_init_gpu(struct multi_compositor *mc, struct vk_bundle *vk)
 	    .arrayLayers = 1,
 	    .samples = VK_SAMPLE_COUNT_1_BIT,
 	    .tiling = VK_IMAGE_TILING_OPTIMAL,
-	    .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+	    .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
 	    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
 	};
 	ret = vk->vkCreateImage(vk->device, &image_info, NULL, &mc->session_render.hud_image);
@@ -1906,20 +1911,28 @@ session_render_hud_init_gpu(struct multi_compositor *mc, struct vk_bundle *vk)
 		return false;
 	}
 
+	// Init alpha-blend pipeline for semi-transparent HUD overlay
+	if (!vk_hud_blend_init(&mc->session_render.hud_blend, vk, mc->session_render.target->format,
+	                        mc->session_render.hud_image, hud_w, hud_h)) {
+		U_LOG_E("[HUD] Failed to init alpha-blend pipeline");
+		return false;
+	}
+
 	mc->session_render.hud_gpu_initialized = true;
 	U_LOG_W("[HUD] Vulkan GPU resources initialized (%ux%u)", hud_w, hud_h);
 	return true;
 }
 
 /*!
- * Render HUD overlay onto swapchain image (post-weave).
- * Transitions: PRESENT_SRC -> TRANSFER_DST -> blit -> PRESENT_SRC
+ * Alpha-blend HUD overlay onto swapchain image (post-weave).
+ * Transitions: PRESENT_SRC -> COLOR_ATTACHMENT -> PRESENT_SRC
  */
 static void
 session_render_hud_overlay(struct multi_compositor *mc,
                            struct vk_bundle *vk,
                            VkCommandBuffer cmd,
                            VkImage swapchain_image,
+                           VkImageView swapchain_view,
                            uint32_t fb_width,
                            uint32_t fb_height,
                            bool is_mono)
@@ -1973,6 +1986,22 @@ session_render_hud_overlay(struct multi_compositor *mc,
 	}
 #endif
 
+	// Get head device for device name and forward vector
+	struct xrt_device *xdev = (mc->xsysd != NULL) ? mc->xsysd->static_roles.head : NULL;
+
+	// Fallback: get display info from sim_display device
+	float zoom_scale = 0.0f;
+	if (disp_w_mm == 0.0f && disp_h_mm == 0.0f && xdev != NULL) {
+		struct sim_display_info sd_info;
+		if (sim_display_get_display_info(xdev, &sd_info)) {
+			disp_w_mm = sd_info.display_width_m * 1000.0f;
+			disp_h_mm = sd_info.display_height_m * 1000.0f;
+			nom_y = sd_info.nominal_y_m * 1000.0f;
+			nom_z = sd_info.nominal_z_m * 1000.0f;
+			zoom_scale = sd_info.zoom_scale;
+		}
+	}
+
 	// Determine output mode
 	const char *output_mode = "Fallback";
 	if (is_mono) {
@@ -1997,8 +2026,29 @@ session_render_hud_overlay(struct multi_compositor *mc,
 		}
 	}
 
+	// Virtual display position + forward vector from qwerty device pose.
+	float vdisp_x = 0.0f, vdisp_y = 0.0f, vdisp_z = 0.0f;
+	float fwd_x = 0.0f, fwd_y = 0.0f, fwd_z = -1.0f;
+#ifdef XRT_BUILD_DRIVER_QWERTY
+	if (mc->xsysd != NULL) {
+		struct xrt_pose qwerty_pose;
+		if (qwerty_get_hmd_pose(mc->xsysd->xdevs, mc->xsysd->xdev_count, &qwerty_pose)) {
+			vdisp_x = qwerty_pose.position.x;
+			vdisp_y = qwerty_pose.position.y;
+			vdisp_z = qwerty_pose.position.z;
+			struct xrt_vec3 fwd_in = {0, 0, -1};
+			struct xrt_vec3 fwd_out;
+			math_quat_rotate_vec3(&qwerty_pose.orientation, &fwd_in, &fwd_out);
+			fwd_x = fwd_out.x;
+			fwd_y = fwd_out.y;
+			fwd_z = fwd_out.z;
+		}
+	}
+#endif
+
 	// Fill HUD data
 	struct u_hud_data data = {0};
+	data.device_name = (xdev != NULL) ? xdev->str : NULL;
 	data.fps = fps;
 	data.frame_time_ms = mc->session_render.hud_smoothed_frame_time_ms;
 	data.mode_3d = !is_mono;
@@ -2019,6 +2069,13 @@ session_render_hud_overlay(struct multi_compositor *mc,
 	data.right_eye_y = right_y;
 	data.right_eye_z = right_z;
 	data.eye_tracking_active = tracking_active;
+	data.zoom_scale = zoom_scale;
+	data.vdisp_x = vdisp_x;
+	data.vdisp_y = vdisp_y;
+	data.vdisp_z = vdisp_z;
+	data.forward_x = fwd_x;
+	data.forward_y = fwd_y;
+	data.forward_z = fwd_z;
 
 	bool dirty = u_hud_update(mc->session_render.hud, &data);
 
@@ -2061,58 +2118,22 @@ session_render_hud_overlay(struct multi_compositor *mc,
 	                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 	                           1, &copy_region);
 
-	// Transition HUD image: TRANSFER_DST -> TRANSFER_SRC (for blit to swapchain)
+	// Transition HUD image: TRANSFER_DST -> SHADER_READ_ONLY (for sampling in blend pipeline)
 	VkImageMemoryBarrier hud_to_src = {
 	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
 	    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-	    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+	    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
 	    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-	    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	    .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
 	    .image = mc->session_render.hud_image,
 	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
 	};
 	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-	                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &hud_to_src);
+	                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &hud_to_src);
 
-	// Transition swapchain: PRESENT_SRC -> TRANSFER_DST
-	VkImageMemoryBarrier sc_to_dst = {
-	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-	    .srcAccessMask = 0,
-	    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-	    .oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-	    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-	    .image = swapchain_image,
-	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-	};
-	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-	                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &sc_to_dst);
-
-	// Blit HUD to bottom-left of swapchain (NEAREST for crisp pixel text)
-	uint32_t dst_x = 10;
-	uint32_t dst_y = (fb_height > hud_h + 10) ? (fb_height - hud_h - 10) : 0;
-	VkImageBlit blit = {
-	    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-	    .srcOffsets = {{0, 0, 0}, {(int32_t)hud_w, (int32_t)hud_h, 1}},
-	    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-	    .dstOffsets = {{(int32_t)dst_x, (int32_t)dst_y, 0},
-	                   {(int32_t)(dst_x + hud_w), (int32_t)(dst_y + hud_h), 1}},
-	};
-	vk->vkCmdBlitImage(cmd, mc->session_render.hud_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-	                   swapchain_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-	                   1, &blit, VK_FILTER_NEAREST);
-
-	// Transition swapchain: TRANSFER_DST -> PRESENT_SRC
-	VkImageMemoryBarrier sc_to_present = {
-	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-	    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-	    .dstAccessMask = 0,
-	    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-	    .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-	    .image = swapchain_image,
-	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-	};
-	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-	                         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL, 0, NULL, 1, &sc_to_present);
+	// Alpha-blend HUD onto swapchain (PRESENT_SRC -> COLOR_ATTACHMENT -> PRESENT_SRC)
+	vk_hud_blend_draw(&mc->session_render.hud_blend, vk, cmd, swapchain_view, swapchain_image, fb_width,
+	                   fb_height, hud_w, hud_h);
 }
 
 /*!
@@ -2730,6 +2751,7 @@ submit_and_present:
 	// HUD overlay (post-weave, always readable)
 	if (mc->session_render.owns_window) {
 		session_render_hud_overlay(mc, vk, cmd, ct->images[buffer_index].handle,
+		                           ct->images[buffer_index].view,
 		                           framebufferWidth, framebufferHeight, is_mono);
 	}
 
@@ -2951,10 +2973,10 @@ transfer_layers_locked(struct multi_system_compositor *msc, int64_t display_time
 	}
 #endif
 
-	// One-time: pass xsysd to main compositor's Vulkan window for qwerty forwarding
+	// One-time: pass xsysd to main compositor for qwerty forwarding + HUD
 #ifdef XRT_BUILD_DRIVER_QWERTY
 	static bool xsysd_forwarded = false;
-	if (!xsysd_forwarded && msc->set_window_system_devices != NULL && msc->xcn_is_comp_compositor) {
+	if (!xsysd_forwarded && msc->xcn_is_comp_compositor) {
 		for (size_t k = 0; k < count; k++) {
 			struct multi_compositor *mc = array[k];
 			if (mc->session_render.initialized) {
@@ -2962,10 +2984,11 @@ transfer_layers_locked(struct multi_system_compositor *msc, int64_t display_time
 			}
 			if (mc->xsysd != NULL) {
 				struct comp_compositor *cc = comp_compositor(&msc->xcn->base);
-				if (cc->target != NULL) {
+				cc->xsysd = mc->xsysd;
+				if (msc->set_window_system_devices != NULL && cc->target != NULL) {
 					msc->set_window_system_devices(cc->target, mc->xsysd);
-					xsysd_forwarded = true;
 				}
+				xsysd_forwarded = true;
 				break;
 			}
 		}

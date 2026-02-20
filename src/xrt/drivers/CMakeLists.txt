@@ -692,6 +692,12 @@ if(WIN32)
 		sim_display/sim_display_processor_d3d11.cpp)
 endif()
 
+# macOS visible frame helper (NSScreen query)
+if(APPLE)
+	list(APPEND SIM_DISPLAY_SOURCES
+		sim_display/sim_display_macos.m)
+endif()
+
 add_library(drv_sim_display STATIC ${SIM_DISPLAY_SOURCES})
 target_link_libraries(drv_sim_display PRIVATE xrt-interfaces aux_util aux_os PUBLIC drv_includes)
 
@@ -705,7 +711,7 @@ if(WIN32)
 endif()
 
 if(APPLE)
-	target_link_libraries(drv_sim_display PRIVATE "-framework CoreGraphics")
+	target_link_libraries(drv_sim_display PRIVATE "-framework CoreGraphics" "-framework AppKit")
 endif()
 
 list(APPEND ENABLED_DRIVERS drv_sim_display)
