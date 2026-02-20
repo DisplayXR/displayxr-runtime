@@ -29,3 +29,13 @@ sim_display_macos_get_visible_frame(uint32_t *out_w, uint32_t *out_h)
 	*out_w = (uint32_t)content.size.width;
 	*out_h = (uint32_t)content.size.height;
 }
+
+float
+sim_display_macos_get_backing_scale(void)
+{
+	NSScreen *screen = [NSScreen mainScreen];
+	if (screen == nil) {
+		return 1.0f;
+	}
+	return (float)[screen backingScaleFactor];
+}

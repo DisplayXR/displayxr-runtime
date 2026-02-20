@@ -378,6 +378,14 @@ sim_display_hmd_create(void)
 	}
 #endif
 
+#ifdef XRT_OS_MACOS
+	// Physical pixel dimensions for Retina displays.
+	// display_pixel_width/height drive the render resolution via sd_scale_x,
+	// while pixel_w/pixel_h (logical points) control the NSWindow size.
+	extern float sim_display_macos_get_backing_scale(void);
+	float backing_scale = sim_display_macos_get_backing_scale();
+#endif
+
 	// Eye/camera configuration.
 	const float ipd = 0.06f;       // 60mm inter-pupillary distance
 	const float eye_y = 0.1f;      // 10cm above display center
@@ -390,8 +398,13 @@ sim_display_hmd_create(void)
 	// Store config.
 	hmd->display_width_m = display_w_m;
 	hmd->display_height_m = display_h_m;
+#ifdef XRT_OS_MACOS
+	hmd->display_pixel_width = (uint32_t)(pixel_w * backing_scale);
+	hmd->display_pixel_height = (uint32_t)(pixel_h * backing_scale);
+#else
 	hmd->display_pixel_width = (uint32_t)pixel_w;
 	hmd->display_pixel_height = (uint32_t)pixel_h;
+#endif
 	hmd->ipd_m = ipd;
 	hmd->zoom_scale = 1.0f;
 	hmd->nominal_z_m = nominal_z;
@@ -491,8 +504,9 @@ sim_display_hmd_create(void)
 	u_var_add_f32(hmd, &hmd->nominal_z_m, "nominal_z_m");
 	u_var_add_log_level(hmd, &hmd->log_level, "log_level");
 
-	U_LOG_W("Created sim 3D display: %dx%d px, %.3fx%.3f m, eye=(0,%.2f,%.2f) IPD=%.0fmm",
-	        pixel_w, pixel_h, display_w_m, display_h_m, eye_y, eye_z, ipd * 1000.0f);
+	U_LOG_W("Created sim 3D display: logical=%dx%d, physical=%ux%u, %.3fx%.3f m, eye=(0,%.2f,%.2f) IPD=%.0fmm",
+	        pixel_w, pixel_h, hmd->display_pixel_width, hmd->display_pixel_height,
+	        display_w_m, display_h_m, eye_y, eye_z, ipd * 1000.0f);
 
 	return &hmd->base;
 }

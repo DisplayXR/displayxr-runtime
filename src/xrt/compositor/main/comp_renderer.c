@@ -1323,7 +1323,6 @@ renderer_blit_hud(struct comp_renderer *r,
 			break;
 		}
 	}
-
 	// Virtual display position + forward vector from qwerty device pose.
 	float vdisp_x = 0.0f, vdisp_y = 0.0f, vdisp_z = 0.0f;
 	float fwd_x = 0.0f, fwd_y = 0.0f, fwd_z = -1.0f;
@@ -1820,24 +1819,129 @@ dispatch_graphics(struct comp_renderer *r,
 
 	render_gfx_begin(render);
 
-	comp_render_gfx_dispatch( //
-	    render,               //
-	    layers,               //
-	    layer_count,          //
-	    &frame_state->data);  //
+	if (is_mono) {
+		// Mono (2D) path: direct blit view 0 to fill entire target.
+		// Bypasses comp_render_gfx_dispatch which uses a distortion mesh
+		// designed for per-eye half-width stereo rendering (produces SBS visual).
+		VkCommandBuffer cmd = render->r->cmd;
 
-	if (!is_mono) {
-		// End current cmd buffer before do_weaving (which resets the
-		// cmd pool for display processor, or does nothing for fallback).
-		render_gfx_end(render);
-		do_weaving(r, render, rtr, layers, frame_state);
-	} else {
-		// Mono: blit HUD while cmd buffer is still open, then end.
+		// Extract view 0 swapchain image and sub-rect from first projection layer.
+		const struct comp_layer *layer = NULL;
+		for (uint32_t i = 0; i < layer_count; i++) {
+			if (layers[i].data.type == XRT_LAYER_PROJECTION ||
+			    layers[i].data.type == XRT_LAYER_PROJECTION_DEPTH) {
+				layer = &layers[i];
+				break;
+			}
+		}
+
+		if (layer != NULL) {
+			const struct xrt_layer_projection_view_data *vd = &layer->data.proj.v[0];
+			const struct comp_swapchain *sc =
+			    (const struct comp_swapchain *)comp_layer_get_swapchain(layer, 0);
+			VkImage srcImage = sc->vkic.images[vd->sub.image_index].handle;
+			uint32_t srcArrayIndex = vd->sub.array_index;
+			int srcOffsetX = vd->sub.rect.offset.w;
+			int srcOffsetY = vd->sub.rect.offset.h;
+			int srcWidth = vd->sub.rect.extent.w;
+			int srcHeight = vd->sub.rect.extent.h;
+			bool flip_y = layer->data.flip_y;
+
+			int src_top = srcOffsetY + (flip_y ? srcHeight : 0);
+			int src_bot = srcOffsetY + (flip_y ? 0 : srcHeight);
+
+			VkImage dstImage = r->c->target->images[r->acquired_buffer].handle;
+			uint32_t dstWidth = rtr->extent.width;
+			uint32_t dstHeight = rtr->extent.height;
+
+			// Pre-barriers: source GENERAL -> TRANSFER_SRC, target UNDEFINED -> TRANSFER_DST
+			VkImageMemoryBarrier mono_pre[2] = {
+			    {
+			        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+			        .srcAccessMask = 0,
+			        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+			        .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+			        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+			        .image = srcImage,
+			        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, srcArrayIndex, 1},
+			    },
+			    {
+			        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+			        .srcAccessMask = 0,
+			        .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+			        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+			        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+			        .image = dstImage,
+			        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+			    },
+			};
+			vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+			                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 2,
+			                         mono_pre);
+
+			// Blit view 0 to fill entire target
+			VkImageBlit mono_blit = {
+			    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, srcArrayIndex, 1},
+			    .srcOffsets = {{srcOffsetX, src_top, 0},
+			                   {srcOffsetX + srcWidth, src_bot, 1}},
+			    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+			    .dstOffsets = {{0, 0, 0}, {(int32_t)dstWidth, (int32_t)dstHeight, 1}},
+			};
+			vk->vkCmdBlitImage(cmd, srcImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+			                   dstImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+			                   &mono_blit, VK_FILTER_LINEAR);
+
+			// Post-barriers: source -> GENERAL, target -> PRESENT_SRC_KHR
+			VkImageMemoryBarrier mono_post[2] = {
+			    {
+			        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+			        .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+			        .dstAccessMask = 0,
+			        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+			        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+			        .image = srcImage,
+			        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, srcArrayIndex, 1},
+			    },
+			    {
+			        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+			        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+			        .dstAccessMask = 0,
+			        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+			        .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+			        .image = dstImage,
+			        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+			    },
+			};
+			vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+			                         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL, 0, NULL,
+			                         2, mono_post);
+
+			static bool mono_logged = false;
+			if (!mono_logged) {
+				U_LOG_W("[shared] Mono (2D) blit: %dx%d -> %ux%u (flip_y=%d)",
+				        srcWidth, srcHeight, dstWidth, dstHeight, flip_y);
+				mono_logged = true;
+			}
+		}
+
+		// HUD overlay (target is in PRESENT_SRC_KHR as expected by vk_hud_blend_draw)
 		renderer_blit_hud(r, render->r->cmd,
 		                  r->c->target->images[r->acquired_buffer].handle,
 		                  r->c->target->images[r->acquired_buffer].view,
 		                  rtr->extent.width, rtr->extent.height, true);
 		render_gfx_end(render);
+	} else {
+		// Stereo: distortion mesh + weaving
+		comp_render_gfx_dispatch( //
+		    render,               //
+		    layers,               //
+		    layer_count,          //
+		    &frame_state->data);  //
+
+		// End current cmd buffer before do_weaving (which resets the
+		// cmd pool for display processor, or does nothing for fallback).
+		render_gfx_end(render);
+		do_weaving(r, render, rtr, layers, frame_state);
 	}
 
 	// Everything is ready, submit to the queue.

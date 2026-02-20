@@ -1130,8 +1130,7 @@ multi_compositor_destroy(struct xrt_compositor *xc)
 		// Destroy display processor before underlying weaver
 		xrt_display_processor_destroy(&mc->session_render.display_processor);
 
-#ifdef XRT_HAVE_LEIA_SR_VULKAN
-		// Destroy composite resources (intermediate pre-weaving targets)
+		// Destroy composite resources (intermediate pre-display-processing targets)
 		if (vk != NULL && mc->session_render.composite_initialized) {
 			if (mc->session_render.composite_ubo_buffer != VK_NULL_HANDLE) {
 				vk->vkDestroyBuffer(vk->device, mc->session_render.composite_ubo_buffer, NULL);
@@ -1172,6 +1171,7 @@ multi_compositor_destroy(struct xrt_compositor *xc)
 			mc->session_render.composite_initialized = false;
 		}
 
+#ifdef XRT_HAVE_LEIA_SR_VULKAN
 		if (mc->session_render.weaver != NULL) {
 			leiasr_destroy(mc->session_render.weaver);
 			mc->session_render.weaver = NULL;

@@ -149,8 +149,11 @@ comp_window_macos_destroy(struct comp_target *ct)
 	comp_target_swapchain_cleanup(&w->base);
 
 	if (w->window != nil) {
-		[w->window close];
+		NSWindow *window = w->window;
 		w->window = nil;
+		dispatch_async(dispatch_get_main_queue(), ^{
+		    [window close];
+		});
 	}
 
 	w->view = nil;
@@ -198,6 +201,7 @@ comp_window_macos_init_on_main_thread(struct comp_window_macos *w, uint32_t widt
 		w->view = [[MonadoMetalView alloc] initWithFrame:frame];
 		[w->view setWantsLayer:YES];
 		w->metal_layer = (CAMetalLayer *)[w->view layer];
+		w->metal_layer.contentsScale = [w->window backingScaleFactor];
 
 		[w->window setContentView:w->view];
 		[w->window makeKeyAndOrderFront:nil];
@@ -229,12 +233,23 @@ comp_window_macos_init(struct comp_target *ct)
 	uint32_t width = ct->c->settings.preferred.width;
 	uint32_t height = ct->c->settings.preferred.height;
 
-	// With is_deferred=true, this may be called from the render thread
-	// during compositor_begin_session. Creating an NSWindow on a non-main
-	// thread is not recommended by Apple but works in practice.
-	// Using dispatch_sync(dispatch_get_main_queue()) would deadlock
-	// because the main thread is typically blocked in xrWaitFrame.
-	if (!comp_window_macos_init_on_main_thread(w, width, height)) {
+	bool result;
+	if ([NSThread isMainThread]) {
+		// In-process runtime: xrBeginSession called from app's main thread.
+		result = comp_window_macos_init_on_main_thread(w, width, height);
+	} else {
+		// IPC service mode: begin_session called from per-client IPC handler thread.
+		// NSWindow/AppKit operations MUST run on the main thread.
+		// The service's main thread runs CFRunLoopRunInMode which processes
+		// GCD dispatches, so dispatch_sync will not deadlock.
+		__block bool block_result = false;
+		dispatch_sync(dispatch_get_main_queue(), ^{
+		    block_result = comp_window_macos_init_on_main_thread(w, width, height);
+		});
+		result = block_result;
+	}
+
+	if (!result) {
 		COMP_ERROR(ct->c, "Failed to create macOS window");
 		return false;
 	}

@@ -364,6 +364,9 @@ target_link_libraries(
 	)
 target_include_directories(comp_multi PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
+# comp_render provides render_shaders_load/fini used by window-space layer compositing
+target_link_libraries(comp_multi PRIVATE comp_render)
+
 # Link comp_multi and comp_main to sim_display driver for display processor creation
 target_link_libraries(comp_multi PRIVATE drv_sim_display)
 

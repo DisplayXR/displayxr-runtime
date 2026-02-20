@@ -29,9 +29,7 @@
 #include "xrt/xrt_vulkan_includes.h"
 #include "vk/vk_hud_blend.h"
 
-#ifdef XRT_HAVE_LEIA_SR_VULKAN
 #include "render/render_interface.h"
-#endif
 
 // Forward declarations for per-session rendering
 struct comp_target;
@@ -262,17 +260,15 @@ struct multi_compositor
 
 		//! @}
 
-#ifdef XRT_HAVE_LEIA_SR_VULKAN
-		//! @name Leia SR-specific resources
+		//! @name Window-space layer compositing resources (vendor-neutral Vulkan)
+		//! Used to composite overlay/HUD layers onto projection layers before
+		//! display processing. Pure Vulkan — no vendor SDK dependencies.
 		//! @{
-
-		//! Per-session SR weaver for this session's window
-		struct leiasr *weaver;
 
 		//! Per-eye composite images (one per eye, not side-by-side)
 		VkImage composite_images[2];
 		VkDeviceMemory composite_memories[2];
-		VkImageView composite_eye_views[2];      //!< Per-eye image views for weaver input
+		VkImageView composite_eye_views[2];      //!< Per-eye image views for display processor input
 		VkFramebuffer composite_framebuffers[2]; //!< Per-eye framebuffers for overlay rendering
 		VkRenderPass composite_render_pass;      //!< LOAD_OP_LOAD for overlay compositing
 		VkPipeline composite_pipeline;           //!< Alpha-blended quad pipeline
@@ -302,6 +298,9 @@ struct multi_compositor
 
 		//! @}
 
+#ifdef XRT_HAVE_LEIA_SR_VULKAN
+		//! Per-session SR weaver for this session's window
+		struct leiasr *weaver;
 #endif // XRT_HAVE_LEIA_SR_VULKAN
 
 		//! @name Display processor crop images (imageRect sub-region extraction)

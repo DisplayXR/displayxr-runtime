@@ -46,9 +46,10 @@
 #include "xrt/xrt_system.h"
 #include "math/m_api.h"
 
+#include "render/render_interface.h"
+
 #ifdef XRT_HAVE_LEIA_SR_VULKAN
 #include "leia/leia_sr.h"
-#include "render/render_interface.h"
 #endif
 
 #ifdef XRT_OS_WINDOWS
@@ -343,10 +344,8 @@ get_session_layer_view(struct multi_layer_entry *layer,
 	return (*out_image_view != VK_NULL_HANDLE);
 }
 
-#ifdef XRT_HAVE_LEIA_SR_VULKAN
-
 /*!
- * Initialize intermediate composite resources for pre-weaving layer compositing.
+ * Initialize intermediate composite resources for pre-display-processing layer compositing.
  * Creates a side-by-side stereo image, per-eye views, render pass, framebuffers,
  * pipeline, and descriptor resources.
  *
@@ -880,10 +879,6 @@ fini_composite_resources(struct multi_compositor *mc, struct vk_bundle *vk)
 	mc->session_render.composite_initialized = false;
 }
 
-#endif // XRT_HAVE_LEIA_SR_VULKAN (composite resources)
-
-#ifdef XRT_HAVE_LEIA_SR_VULKAN
-
 /*!
  * Check if any window-space layers exist in the delivered frame.
  */
@@ -900,7 +895,7 @@ has_window_space_layers(struct multi_compositor *mc)
 
 /*!
  * Composite all layers (projection + window-space) into the intermediate stereo
- * targets before weaving. This is the pre-weaving compositing step.
+ * targets before display processing. This is the pre-display-processing compositing step.
  *
  * Intel CCS workaround (Intel Iris Xe / Gen12 iGPU):
  * On Intel, fragment shader sampling of cross-device shared images produces a
@@ -1399,8 +1394,6 @@ composite_layers_to_intermediate(struct multi_compositor *mc,
 
 	return true;
 }
-
-#endif // XRT_HAVE_LEIA_SR_VULKAN (composite_layers_to_intermediate)
 
 /*!
  * Recreate the per-session swapchain after a window resize.
@@ -2447,7 +2440,6 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 			dp_logged = true;
 		}
 
-#ifdef XRT_HAVE_LEIA_SR_VULKAN
 		// Window-space overlay path: composite projection + HUD layers into
 		// intermediate per-eye images, then pass directly to display processor.
 		// composite_layers_to_intermediate() outputs SHADER_READ_ONLY_OPTIMAL
@@ -2476,7 +2468,6 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 				goto submit_and_present;
 			}
 		}
-#endif
 
 		// Crop-blit path (no window-space layers): blit source sub-region into
 		// intermediates, then pass the cropped views to the display processor.
