@@ -79,9 +79,7 @@ oxr_xrGetSystemProperties(XrInstance instance, XrSystemId systemId, XrSystemProp
 {
 	OXR_TRACE_MARKER();
 
-#ifdef XRT_OS_WINDOWS
-	OutputDebugStringA("[SRMonado] xrGetSystemProperties: API ENTRY\n");
-#endif
+	U_LOG_D("[SRMonado] xrGetSystemProperties: API ENTRY");
 
 	struct oxr_instance *inst;
 	struct oxr_logger log;
@@ -91,22 +89,17 @@ oxr_xrGetSystemProperties(XrInstance instance, XrSystemId systemId, XrSystemProp
 
 	XrResult ret = oxr_system_get_properties(&log, sys, properties);
 
-#ifdef XRT_OS_WINDOWS
 	if (ret == XR_SUCCESS) {
-		char buf[512];
-		snprintf(buf, sizeof(buf),
-		         "[SRMonado] xrGetSystemProperties: name='%s' vendorId=%u "
-		         "gfx.maxSwapchainW=%u gfx.maxSwapchainH=%u gfx.maxLayers=%u "
-		         "tracking.orientationTracking=%d tracking.positionTracking=%d\n",
-		         properties->systemName, properties->vendorId,
-		         properties->graphicsProperties.maxSwapchainImageWidth,
-		         properties->graphicsProperties.maxSwapchainImageHeight,
-		         properties->graphicsProperties.maxLayerCount,
-		         properties->trackingProperties.orientationTracking,
-		         properties->trackingProperties.positionTracking);
-		OutputDebugStringA(buf);
+		U_LOG_D("[SRMonado] xrGetSystemProperties: name='%s' vendorId=%u "
+		        "gfx.maxSwapchainW=%u gfx.maxSwapchainH=%u gfx.maxLayers=%u "
+		        "tracking.orientationTracking=%d tracking.positionTracking=%d",
+		        properties->systemName, properties->vendorId,
+		        properties->graphicsProperties.maxSwapchainImageWidth,
+		        properties->graphicsProperties.maxSwapchainImageHeight,
+		        properties->graphicsProperties.maxLayerCount,
+		        properties->trackingProperties.orientationTracking,
+		        properties->trackingProperties.positionTracking);
 	}
-#endif
 
 	return ret;
 }
@@ -139,15 +132,8 @@ oxr_xrEnumerateEnvironmentBlendModes(XrInstance instance,
 {
 	OXR_TRACE_MARKER();
 
-#ifdef XRT_OS_WINDOWS
-	{
-		char buf[256];
-		snprintf(buf, sizeof(buf),
-		         "[SRMonado] xrEnumerateEnvironmentBlendModes: API ENTRY viewConfig=%d cap=%u\n",
-		         (int)viewConfigurationType, environmentBlendModeCapacityInput);
-		OutputDebugStringA(buf);
-	}
-#endif
+	U_LOG_D("[SRMonado] xrEnumerateEnvironmentBlendModes: API ENTRY viewConfig=%d cap=%u",
+	        (int)viewConfigurationType, environmentBlendModeCapacityInput);
 
 	struct oxr_instance *inst;
 	struct oxr_logger log;
@@ -156,9 +142,7 @@ oxr_xrEnumerateEnvironmentBlendModes(XrInstance instance,
 	OXR_VERIFY_VIEW_CONFIG_TYPE(&log, inst, viewConfigurationType);
 
 	if (viewConfigurationType != sys->view_config_type) {
-#ifdef XRT_OS_WINDOWS
-		OutputDebugStringA("[SRMonado] xrEnumerateEnvironmentBlendModes: UNSUPPORTED view config\n");
-#endif
+		U_LOG_D("[SRMonado] xrEnumerateEnvironmentBlendModes: UNSUPPORTED view config");
 		return oxr_error(&log, XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED,
 		                 "(viewConfigurationType == 0x%08x) "
 		                 "unsupported view configuration type",
@@ -169,22 +153,13 @@ oxr_xrEnumerateEnvironmentBlendModes(XrInstance instance,
 	                                                environmentBlendModeCapacityInput,
 	                                                environmentBlendModeCountOutput, environmentBlendModes);
 
-#ifdef XRT_OS_WINDOWS
-	{
-		char buf[256];
-		snprintf(buf, sizeof(buf),
-		         "[SRMonado] xrEnumerateEnvironmentBlendModes: ret=%d count=%u\n", (int)ret,
-		         environmentBlendModeCountOutput ? *environmentBlendModeCountOutput : 0);
-		OutputDebugStringA(buf);
-		if (ret == XR_SUCCESS && environmentBlendModes && environmentBlendModeCountOutput) {
-			for (uint32_t i = 0; i < *environmentBlendModeCountOutput; i++) {
-				snprintf(buf, sizeof(buf), "[SRMonado]   blendMode[%u] = %d\n", i,
-				         (int)environmentBlendModes[i]);
-				OutputDebugStringA(buf);
-			}
+	U_LOG_D("[SRMonado] xrEnumerateEnvironmentBlendModes: ret=%d count=%u", (int)ret,
+	        environmentBlendModeCountOutput ? *environmentBlendModeCountOutput : 0);
+	if (ret == XR_SUCCESS && environmentBlendModes && environmentBlendModeCountOutput) {
+		for (uint32_t i = 0; i < *environmentBlendModeCountOutput; i++) {
+			U_LOG_D("[SRMonado]   blendMode[%u] = %d", i, (int)environmentBlendModes[i]);
 		}
 	}
-#endif
 
 	return ret;
 }
@@ -216,15 +191,8 @@ oxr_xrEnumerateViewConfigurationViews(XrInstance instance,
 {
 	OXR_TRACE_MARKER();
 
-#ifdef XRT_OS_WINDOWS
-	{
-		char buf[256];
-		snprintf(buf, sizeof(buf),
-		         "[SRMonado] xrEnumerateViewConfigurationViews: API ENTRY viewConfig=%d cap=%u\n",
-		         (int)viewConfigurationType, viewCapacityInput);
-		OutputDebugStringA(buf);
-	}
-#endif
+	U_LOG_D("[SRMonado] xrEnumerateViewConfigurationViews: API ENTRY viewConfig=%d cap=%u",
+	        (int)viewConfigurationType, viewCapacityInput);
 
 	struct oxr_instance *inst;
 	struct oxr_logger log;
@@ -238,24 +206,16 @@ oxr_xrEnumerateViewConfigurationViews(XrInstance instance,
 	XrResult ret = oxr_system_enumerate_view_conf_views(&log, sys, viewConfigurationType, viewCapacityInput,
 	                                                    viewCountOutput, views);
 
-#ifdef XRT_OS_WINDOWS
-	{
-		char buf[512];
-		snprintf(buf, sizeof(buf), "[SRMonado] xrEnumerateViewConfigurationViews: ret=%d count=%u\n",
-		         (int)ret, viewCountOutput ? *viewCountOutput : 0);
-		OutputDebugStringA(buf);
-		if (ret == XR_SUCCESS && views && viewCountOutput) {
-			for (uint32_t i = 0; i < *viewCountOutput; i++) {
-				snprintf(buf, sizeof(buf),
-				         "[SRMonado]   view[%u]: recommended=%ux%u max=%ux%u samples=%u/%u\n", i,
-				         views[i].recommendedImageRectWidth, views[i].recommendedImageRectHeight,
-				         views[i].maxImageRectWidth, views[i].maxImageRectHeight,
-				         views[i].recommendedSwapchainSampleCount, views[i].maxSwapchainSampleCount);
-				OutputDebugStringA(buf);
-			}
+	U_LOG_D("[SRMonado] xrEnumerateViewConfigurationViews: ret=%d count=%u",
+	        (int)ret, viewCountOutput ? *viewCountOutput : 0);
+	if (ret == XR_SUCCESS && views && viewCountOutput) {
+		for (uint32_t i = 0; i < *viewCountOutput; i++) {
+			U_LOG_D("[SRMonado]   view[%u]: recommended=%ux%u max=%ux%u samples=%u/%u", i,
+			        views[i].recommendedImageRectWidth, views[i].recommendedImageRectHeight,
+			        views[i].maxImageRectWidth, views[i].maxImageRectHeight,
+			        views[i].recommendedSwapchainSampleCount, views[i].maxSwapchainSampleCount);
 		}
 	}
-#endif
 
 	return ret;
 }

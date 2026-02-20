@@ -12,11 +12,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "xrt/xrt_config_os.h"
-#ifdef XRT_OS_WINDOWS
-#include "xrt/xrt_windows.h"
-#endif
-
 #include "math/m_space.h"
 #include "xrt/xrt_compiler.h"
 
@@ -95,14 +90,8 @@ oxr_xrBeginSession(XrSession session, const XrSessionBeginInfo *beginInfo)
 {
 	OXR_TRACE_MARKER();
 
-#ifdef XRT_OS_WINDOWS
-	{
-		char buf[256];
-		snprintf(buf, sizeof(buf), "[SRMonado] xrBeginSession: API ENTRY viewConfig=%d\n",
-		         beginInfo ? (int)beginInfo->primaryViewConfigurationType : -1);
-		OutputDebugStringA(buf);
-	}
-#endif
+	U_LOG_D("[SRMonado] xrBeginSession: API ENTRY viewConfig=%d",
+	        beginInfo ? (int)beginInfo->primaryViewConfigurationType : -1);
 
 	struct oxr_session *sess;
 	struct oxr_logger log;
@@ -117,21 +106,13 @@ oxr_xrBeginSession(XrSession session, const XrSessionBeginInfo *beginInfo)
 
 	// Going to effectively double check this, but this gives us an early out.
 	if (oxr_frame_sync_is_session_running(&sess->frame_sync)) {
-#ifdef XRT_OS_WINDOWS
-		OutputDebugStringA("[SRMonado] xrBeginSession: FAILED - already running\n");
-#endif
+		U_LOG_D("[SRMonado] xrBeginSession: FAILED - already running");
 		return oxr_error(&log, XR_ERROR_SESSION_RUNNING, "Session is already running");
 	}
 
 	XrResult ret = oxr_session_begin(&log, sess, beginInfo);
 
-#ifdef XRT_OS_WINDOWS
-	{
-		char buf[256];
-		snprintf(buf, sizeof(buf), "[SRMonado] xrBeginSession: ret=%d\n", (int)ret);
-		OutputDebugStringA(buf);
-	}
-#endif
+	U_LOG_D("[SRMonado] xrBeginSession: ret=%d", (int)ret);
 
 	return ret;
 }
@@ -155,9 +136,7 @@ oxr_xrWaitFrame(XrSession session, const XrFrameWaitInfo *frameWaitInfo, XrFrame
 {
 	OXR_TRACE_MARKER();
 
-#ifdef XRT_OS_WINDOWS
-	OutputDebugStringA("[SRMonado] oxr_xrWaitFrame: API ENTRY\n");
-#endif
+	U_LOG_D("[SRMonado] oxr_xrWaitFrame: API ENTRY");
 
 	struct oxr_session *sess;
 	struct oxr_logger log;
@@ -168,19 +147,11 @@ oxr_xrWaitFrame(XrSession session, const XrFrameWaitInfo *frameWaitInfo, XrFrame
 	OXR_VERIFY_ARG_TYPE_AND_NOT_NULL(&log, frameState, XR_TYPE_FRAME_STATE);
 	OXR_VERIFY_ARG_NOT_NULL(&log, frameState);
 
-#ifdef XRT_OS_WINDOWS
-	OutputDebugStringA("[SRMonado] oxr_xrWaitFrame: Calling oxr_session_frame_wait\n");
-#endif
+	U_LOG_D("[SRMonado] oxr_xrWaitFrame: Calling oxr_session_frame_wait");
 
 	XrResult res = oxr_session_frame_wait(&log, sess, frameState);
 
-#ifdef XRT_OS_WINDOWS
-	{
-		char buf[128];
-		snprintf(buf, sizeof(buf), "[SRMonado] oxr_xrWaitFrame: result=%d\n", (int)res);
-		OutputDebugStringA(buf);
-	}
-#endif
+	U_LOG_D("[SRMonado] oxr_xrWaitFrame: result=%d", (int)res);
 
 	return res;
 }
@@ -190,9 +161,7 @@ oxr_xrBeginFrame(XrSession session, const XrFrameBeginInfo *frameBeginInfo)
 {
 	OXR_TRACE_MARKER();
 
-#ifdef XRT_OS_WINDOWS
-	OutputDebugStringA("[SRMonado] oxr_xrBeginFrame: API ENTRY\n");
-#endif
+	U_LOG_D("[SRMonado] oxr_xrBeginFrame: API ENTRY");
 
 	struct oxr_session *sess;
 	struct oxr_logger log;
@@ -204,13 +173,7 @@ oxr_xrBeginFrame(XrSession session, const XrFrameBeginInfo *frameBeginInfo)
 
 	XrResult res = oxr_session_frame_begin(&log, sess);
 
-#ifdef XRT_OS_WINDOWS
-	{
-		char buf[128];
-		snprintf(buf, sizeof(buf), "[SRMonado] oxr_xrBeginFrame: result=%d\n", (int)res);
-		OutputDebugStringA(buf);
-	}
-#endif
+	U_LOG_D("[SRMonado] oxr_xrBeginFrame: result=%d", (int)res);
 
 #ifdef XRT_FEATURE_RENDERDOC
 	if (sess->sys->inst->rdoc_api) {
@@ -228,9 +191,7 @@ oxr_xrEndFrame(XrSession session, const XrFrameEndInfo *frameEndInfo)
 {
 	OXR_TRACE_MARKER();
 
-#ifdef XRT_OS_WINDOWS
-	OutputDebugStringA("[SRMonado] oxr_xrEndFrame: API ENTRY\n");
-#endif
+	U_LOG_D("[SRMonado] oxr_xrEndFrame: API ENTRY");
 
 	struct oxr_session *sess;
 	struct oxr_logger log;
@@ -291,14 +252,8 @@ oxr_xrLocateViews(XrSession session,
 {
 	OXR_TRACE_MARKER();
 
-#ifdef XRT_OS_WINDOWS
-	{
-		char buf[256];
-		snprintf(buf, sizeof(buf), "[SRMonado] xrLocateViews: API ENTRY viewConfig=%d cap=%u\n",
-		         viewLocateInfo ? (int)viewLocateInfo->viewConfigurationType : -1, viewCapacityInput);
-		OutputDebugStringA(buf);
-	}
-#endif
+	U_LOG_D("[SRMonado] xrLocateViews: API ENTRY viewConfig=%d cap=%u",
+	        viewLocateInfo ? (int)viewLocateInfo->viewConfigurationType : -1, viewCapacityInput);
 
 	struct oxr_session *sess;
 	struct oxr_space *spc;

@@ -12,12 +12,6 @@
 #include <stdlib.h>
 #include <stdio.h>
 
-#include "xrt/xrt_config_os.h"
-#ifdef XRT_OS_WINDOWS
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#endif
-
 #include "util/u_misc.h"
 #include "util/u_logging.h"
 
@@ -28,19 +22,6 @@
 #include "oxr_logger.h"
 #include "oxr_two_call.h"
 #include "oxr_handle.h"
-
-// Helper macro for OutputDebugString diagnostics
-#ifdef XRT_OS_WINDOWS
-#define DBG_LOG(msg) OutputDebugStringA("[SRMonado] " msg "\n")
-#define DBG_LOG_FMT(fmt, ...) do { \
-	char _dbg_buf[256]; \
-	snprintf(_dbg_buf, sizeof(_dbg_buf), "[SRMonado] " fmt "\n", __VA_ARGS__); \
-	OutputDebugStringA(_dbg_buf); \
-} while(0)
-#else
-#define DBG_LOG(msg) ((void)0)
-#define DBG_LOG_FMT(fmt, ...) ((void)0)
-#endif
 
 
 XrResult

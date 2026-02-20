@@ -2952,7 +2952,7 @@ transfer_layers_locked(struct multi_system_compositor *msc, int64_t display_time
 #endif
 
 	// One-time: pass xsysd to main compositor's Vulkan window for qwerty forwarding
-#if defined(XRT_OS_WINDOWS) && defined(XRT_BUILD_DRIVER_QWERTY)
+#ifdef XRT_BUILD_DRIVER_QWERTY
 	static bool xsysd_forwarded = false;
 	if (!xsysd_forwarded && msc->set_window_system_devices != NULL && msc->xcn_is_comp_compositor) {
 		for (size_t k = 0; k < count; k++) {

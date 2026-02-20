@@ -148,27 +148,13 @@ oxr_xrEnumerateReferenceSpaces(XrSession session,
 {
 	OXR_TRACE_MARKER();
 
-#ifdef XRT_OS_WINDOWS
-	{
-		char buf[256];
-		snprintf(buf, sizeof(buf), "[SRMonado] xrEnumerateReferenceSpaces: API ENTRY cap=%u\n",
-		         spaceCapacityInput);
-		OutputDebugStringA(buf);
-	}
-#endif
+	U_LOG_D("[SRMonado] xrEnumerateReferenceSpaces: API ENTRY cap=%u", spaceCapacityInput);
 
 	struct oxr_session *sess;
 	struct oxr_logger log;
 	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrEnumerateReferenceSpaces");
 
-#ifdef XRT_OS_WINDOWS
-	{
-		char buf[256];
-		snprintf(buf, sizeof(buf), "[SRMonado] xrEnumerateReferenceSpaces: count=%u\n",
-		         sess->sys->reference_space_count);
-		OutputDebugStringA(buf);
-	}
-#endif
+	U_LOG_D("[SRMonado] xrEnumerateReferenceSpaces: count=%u", sess->sys->reference_space_count);
 
 	OXR_TWO_CALL_HELPER(                   //
 	    &log,                              //
@@ -210,14 +196,8 @@ oxr_xrCreateReferenceSpace(XrSession session, const XrReferenceSpaceCreateInfo *
 {
 	OXR_TRACE_MARKER();
 
-#ifdef XRT_OS_WINDOWS
-	{
-		char buf[256];
-		snprintf(buf, sizeof(buf), "[SRMonado] xrCreateReferenceSpace: API ENTRY type=%d\n",
-		         createInfo ? (int)createInfo->referenceSpaceType : -1);
-		OutputDebugStringA(buf);
-	}
-#endif
+	U_LOG_D("[SRMonado] xrCreateReferenceSpace: API ENTRY type=%d",
+	        createInfo ? (int)createInfo->referenceSpaceType : -1);
 
 	XrResult ret;
 	struct oxr_session *sess;
@@ -231,13 +211,7 @@ oxr_xrCreateReferenceSpace(XrSession session, const XrReferenceSpaceCreateInfo *
 	ret = is_reference_space_type_valid(&log, sess->sys, "createInfo->referenceSpaceType",
 	                                    createInfo->referenceSpaceType);
 	if (ret != XR_SUCCESS) {
-#ifdef XRT_OS_WINDOWS
-		{
-			char buf[256];
-			snprintf(buf, sizeof(buf), "[SRMonado] xrCreateReferenceSpace: INVALID type ret=%d\n", (int)ret);
-			OutputDebugStringA(buf);
-		}
-#endif
+		U_LOG_D("[SRMonado] xrCreateReferenceSpace: INVALID type ret=%d", (int)ret);
 		// The CTS currently requires us to return XR_ERROR_REFERENCE_SPACE_UNSUPPORTED.
 		if (sess->sys->inst->quirks.no_validation_error_in_create_ref_space &&
 		    ret == XR_ERROR_VALIDATION_FAILURE) {
@@ -250,34 +224,19 @@ oxr_xrCreateReferenceSpace(XrSession session, const XrReferenceSpaceCreateInfo *
 	ret = is_reference_space_type_supported(&log, sess->sys, "createInfo->referenceSpaceType",
 	                                        createInfo->referenceSpaceType);
 	if (ret != XR_SUCCESS) {
-#ifdef XRT_OS_WINDOWS
-		{
-			char buf[256];
-			snprintf(buf, sizeof(buf), "[SRMonado] xrCreateReferenceSpace: UNSUPPORTED type ret=%d\n",
-			         (int)ret);
-			OutputDebugStringA(buf);
-		}
-#endif
+		U_LOG_D("[SRMonado] xrCreateReferenceSpace: UNSUPPORTED type ret=%d", (int)ret);
 		return ret;
 	}
 
 	ret = oxr_space_reference_create(&log, sess, createInfo, &spc);
 	if (ret != XR_SUCCESS) {
-#ifdef XRT_OS_WINDOWS
-		{
-			char buf[256];
-			snprintf(buf, sizeof(buf), "[SRMonado] xrCreateReferenceSpace: CREATE FAILED ret=%d\n", (int)ret);
-			OutputDebugStringA(buf);
-		}
-#endif
+		U_LOG_D("[SRMonado] xrCreateReferenceSpace: CREATE FAILED ret=%d", (int)ret);
 		return ret;
 	}
 
 	*out_space = oxr_space_to_openxr(spc);
 
-#ifdef XRT_OS_WINDOWS
-	OutputDebugStringA("[SRMonado] xrCreateReferenceSpace: SUCCESS\n");
-#endif
+	U_LOG_D("[SRMonado] xrCreateReferenceSpace: SUCCESS");
 
 	return oxr_session_success_result(sess);
 }

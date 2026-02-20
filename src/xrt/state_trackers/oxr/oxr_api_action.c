@@ -126,14 +126,8 @@ oxr_xrSyncActions(XrSession session, const XrActionsSyncInfo *syncInfo)
 {
 	OXR_TRACE_MARKER();
 
-#ifdef XRT_OS_WINDOWS
-	{
-		char buf[256];
-		snprintf(buf, sizeof(buf), "[SRMonado] xrSyncActions: API ENTRY count=%u\n",
-		         syncInfo ? syncInfo->countActiveActionSets : 0);
-		OutputDebugStringA(buf);
-	}
-#endif
+	U_LOG_D("[SRMonado] xrSyncActions: API ENTRY count=%u",
+	        syncInfo ? syncInfo->countActiveActionSets : 0);
 
 	struct oxr_session *sess;
 	struct oxr_logger log;
@@ -190,14 +184,8 @@ oxr_xrAttachSessionActionSets(XrSession session, const XrSessionActionSetsAttach
 {
 	OXR_TRACE_MARKER();
 
-#ifdef XRT_OS_WINDOWS
-	{
-		char buf[256];
-		snprintf(buf, sizeof(buf), "[SRMonado] xrAttachSessionActionSets: API ENTRY count=%u\n",
-		         bindInfo ? bindInfo->countActionSets : 0);
-		OutputDebugStringA(buf);
-	}
-#endif
+	U_LOG_D("[SRMonado] xrAttachSessionActionSets: API ENTRY count=%u",
+	        bindInfo ? bindInfo->countActionSets : 0);
 
 	struct oxr_session *sess;
 	struct oxr_logger log;
@@ -206,18 +194,14 @@ oxr_xrAttachSessionActionSets(XrSession session, const XrSessionActionSetsAttach
 	OXR_VERIFY_ARG_TYPE_AND_NOT_NULL(&log, bindInfo, XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO);
 
 	if (sess->act_set_attachments != NULL) {
-#ifdef XRT_OS_WINDOWS
-		OutputDebugStringA("[SRMonado] xrAttachSessionActionSets: FAILED - already attached\n");
-#endif
+		U_LOG_D("[SRMonado] xrAttachSessionActionSets: FAILED - already attached");
 		return oxr_error(&log, XR_ERROR_ACTIONSETS_ALREADY_ATTACHED,
 		                 "(session) has already had action sets "
 		                 "attached, can only attach action sets once.");
 	}
 
 	if (bindInfo->countActionSets == 0) {
-#ifdef XRT_OS_WINDOWS
-		OutputDebugStringA("[SRMonado] xrAttachSessionActionSets: FAILED - zero action sets\n");
-#endif
+		U_LOG_D("[SRMonado] xrAttachSessionActionSets: FAILED - zero action sets");
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
 		                 "(bindInfo->countActionSets == 0) must attach "
 		                 "at least one action set.");
@@ -230,13 +214,7 @@ oxr_xrAttachSessionActionSets(XrSession session, const XrSessionActionSetsAttach
 
 	XrResult ret = oxr_session_attach_action_sets(&log, sess, bindInfo);
 
-#ifdef XRT_OS_WINDOWS
-	{
-		char buf[256];
-		snprintf(buf, sizeof(buf), "[SRMonado] xrAttachSessionActionSets: ret=%d\n", (int)ret);
-		OutputDebugStringA(buf);
-	}
-#endif
+	U_LOG_D("[SRMonado] xrAttachSessionActionSets: ret=%d", (int)ret);
 
 	return ret;
 }
