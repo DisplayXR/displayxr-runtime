@@ -2047,8 +2047,20 @@ session_render_hud_overlay(struct multi_compositor *mc,
 #endif
 
 	// Fill HUD data
+	// Build device name with render mode for sim_display
+	char device_name_buf[128];
+	const char *device_name = (xdev != NULL) ? xdev->str : NULL;
+	if (zoom_scale > 0.0f && device_name != NULL) { // sim_display was detected
+		const char *mode_str = "SBS";
+		enum sim_display_output_mode sd_mode = sim_display_get_output_mode();
+		if (sd_mode == SIM_DISPLAY_OUTPUT_ANAGLYPH) mode_str = "Anaglyph";
+		else if (sd_mode == SIM_DISPLAY_OUTPUT_BLEND) mode_str = "Blended";
+		snprintf(device_name_buf, sizeof(device_name_buf), "%s (%s)", device_name, mode_str);
+		device_name = device_name_buf;
+	}
+
 	struct u_hud_data data = {0};
-	data.device_name = (xdev != NULL) ? xdev->str : NULL;
+	data.device_name = device_name;
 	data.fps = fps;
 	data.frame_time_ms = mc->session_render.hud_smoothed_frame_time_ms;
 	data.mode_3d = !is_mono;

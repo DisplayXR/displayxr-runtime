@@ -8,6 +8,7 @@
  */
 
 #import <AppKit/NSScreen.h>
+#import <AppKit/NSWindow.h>
 
 void
 sim_display_macos_get_visible_frame(uint32_t *out_w, uint32_t *out_h)
@@ -19,7 +20,12 @@ sim_display_macos_get_visible_frame(uint32_t *out_w, uint32_t *out_h)
 		return;
 	}
 
+	// visibleFrame = screen area minus menu bar and dock.
+	// Subtract the title bar height to get the actual window content area.
 	NSRect visible = [screen visibleFrame];
-	*out_w = (uint32_t)visible.size.width;
-	*out_h = (uint32_t)visible.size.height;
+	NSUInteger style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
+	                   NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable;
+	NSRect content = [NSWindow contentRectForFrameRect:visible styleMask:style];
+	*out_w = (uint32_t)content.size.width;
+	*out_h = (uint32_t)content.size.height;
 }
