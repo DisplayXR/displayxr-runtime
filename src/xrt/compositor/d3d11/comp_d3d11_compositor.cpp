@@ -1035,9 +1035,15 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 		c->hwnd = static_cast<HWND>(hwnd);
 		U_LOG_I("Using app-provided window handle: %p", hwnd);
 	} else {
-		// No window provided - create our own
-		U_LOG_I("No window handle provided, creating self-owned window");
-		xrt_result_t xret = comp_d3d11_window_create(1920, 1080, &c->own_window);
+		// No window provided - create our own at native display resolution
+		uint32_t win_w = xdev->hmd->screens[0].w_pixels;
+		uint32_t win_h = xdev->hmd->screens[0].h_pixels;
+		if (win_w == 0 || win_h == 0) {
+			win_w = 1920;
+			win_h = 1080;
+		}
+		U_LOG_I("No window handle provided, creating self-owned window (%ux%u)", win_w, win_h);
+		xrt_result_t xret = comp_d3d11_window_create(win_w, win_h, &c->own_window);
 		if (xret != XRT_SUCCESS) {
 			U_LOG_E("Failed to create self-owned window");
 			delete c;
@@ -1101,8 +1107,12 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 
 	// Initialize settings with defaults (simplified for D3D11 native compositor)
 	memset(&c->settings, 0, sizeof(c->settings));
-	c->settings.preferred.width = 1920;  // Default resolution
-	c->settings.preferred.height = 1080;
+	c->settings.preferred.width = xdev->hmd->screens[0].w_pixels;
+	c->settings.preferred.height = xdev->hmd->screens[0].h_pixels;
+	if (c->settings.preferred.width == 0 || c->settings.preferred.height == 0) {
+		c->settings.preferred.width = 1920;
+		c->settings.preferred.height = 1080;
+	}
 	c->settings.nominal_frame_interval_ns = xdev->hmd->screens[0].nominal_frame_interval_ns;
 	if (c->settings.nominal_frame_interval_ns == 0) {
 		c->settings.nominal_frame_interval_ns = (1000 * 1000 * 1000) / 60; // 60Hz default

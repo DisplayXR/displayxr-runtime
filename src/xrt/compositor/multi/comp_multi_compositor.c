@@ -521,10 +521,16 @@ multi_compositor_begin_session(struct xrt_compositor *xc, const struct xrt_begin
 				}
 			}
 		} else {
-			// No external window - create our own for SR display output
-			U_LOG_W("No external HWND provided, creating self-owned window for Vulkan compositor");
+			// No external window - create our own at native display resolution
+			uint32_t win_w = mc->msc->base.info.display_pixel_width;
+			uint32_t win_h = mc->msc->base.info.display_pixel_height;
+			if (win_w == 0 || win_h == 0) {
+				win_w = 1920;
+				win_h = 1080;
+			}
+			U_LOG_W("No external HWND provided, creating self-owned window (%ux%u)", win_w, win_h);
 			struct comp_d3d11_window *own_win = NULL;
-			xrt_result_t xret = comp_d3d11_window_create(1920, 1080, &own_win);
+			xrt_result_t xret = comp_d3d11_window_create(win_w, win_h, &own_win);
 			if (xret == XRT_SUCCESS && own_win != NULL) {
 				mc->session_render.own_window = own_win;
 				mc->session_render.owns_window = true;
