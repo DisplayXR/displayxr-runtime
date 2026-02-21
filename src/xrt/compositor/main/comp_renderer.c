@@ -668,9 +668,15 @@ renderer_init(struct comp_renderer *r, struct comp_compositor *c, VkExtent2D scr
 		}
 	}
 
-	// Create HUD overlay (only for runtime-owned windows, not app-provided windows)
+	// Create HUD overlay (only for runtime-owned windows, not app-provided windows).
+	// Use display_pixel_width (physical pixels) for Retina-aware HUD scaling.
 	if (r->c->external_window_handle == NULL) {
-		u_hud_create(&r->hud.hud, 480, 304);
+		struct sim_display_info sd_hud_info;
+		uint32_t hud_target_w = r->c->settings.preferred.width;
+		if (sim_display_get_display_info(r->c->xdev, &sd_hud_info) && sd_hud_info.display_pixel_width > 0) {
+			hud_target_w = sd_hud_info.display_pixel_width;
+		}
+		u_hud_create(&r->hud.hud, hud_target_w);
 	}
 
 	VkResult ret = comp_mirror_init( //

@@ -70,13 +70,13 @@ struct u_hud;
  * Create a HUD renderer.
  *
  * @param out_hud Receives the created HUD.
- * @param width Pixel buffer width (e.g. 480).
- * @param height Pixel buffer height (e.g. 256).
+ * @param target_width Display/swapchain width in physical pixels.
+ *        Used to compute integer scale factor (1x at <=1920, 2x at >1920).
  * @return true on success.
  * @ingroup aux_util
  */
 bool
-u_hud_create(struct u_hud **out_hud, uint32_t width, uint32_t height);
+u_hud_create(struct u_hud **out_hud, uint32_t target_width);
 
 /*!
  * Destroy a HUD renderer.

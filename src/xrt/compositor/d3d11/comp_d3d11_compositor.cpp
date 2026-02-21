@@ -1294,7 +1294,7 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	c->last_frame_time_ns = 0;
 	c->smoothed_frame_time_ms = 16.67f;
 	if (c->owns_window) {
-		u_hud_create(&c->hud, 480, 256);
+		u_hud_create(&c->hud, c->settings.preferred.width);
 	}
 
 	// Populate supported swapchain formats (DXGI formats for D3D11)

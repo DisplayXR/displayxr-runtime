@@ -50,21 +50,37 @@ u_hud_is_visible(void)
 	return g_hud_visible;
 }
 
+/*
+ * Base HUD dimensions at 1x scale (designed for ~1920px displays).
+ */
+#define HUD_BASE_W 480
+#define HUD_BASE_H 304
+
 struct u_hud
 {
 	uint8_t *pixels; //!< RGBA pixel buffer
 	uint32_t width;
 	uint32_t height;
+	uint32_t scale;          //!< Integer scale factor (1, 2, 3...)
 	uint64_t last_update_ns; //!< Timestamp of last redraw
 	bool dirty;              //!< True if pixels changed since last query
 };
 
 bool
-u_hud_create(struct u_hud **out_hud, uint32_t width, uint32_t height)
+u_hud_create(struct u_hud **out_hud, uint32_t target_width)
 {
-	if (out_hud == NULL || width == 0 || height == 0) {
+	if (out_hud == NULL) {
 		return false;
 	}
+
+	// Integer scale: 1x for <=1920, 2x for <=3840, etc.
+	uint32_t scale = 1;
+	if (target_width > 1920) {
+		scale = (target_width + 1919) / 1920; // ceiling division
+	}
+
+	uint32_t width = HUD_BASE_W * scale;
+	uint32_t height = HUD_BASE_H * scale;
 
 	struct u_hud *hud = (struct u_hud *)calloc(1, sizeof(struct u_hud));
 	if (hud == NULL) {
@@ -79,6 +95,7 @@ u_hud_create(struct u_hud **out_hud, uint32_t width, uint32_t height)
 
 	hud->width = width;
 	hud->height = height;
+	hud->scale = scale;
 	hud->last_update_ns = 0;
 	hud->dirty = false;
 
@@ -111,25 +128,32 @@ draw_char(struct u_hud *hud, int px, int py, char ch)
 		return;
 	}
 
-	for (int row = 0; row < GLYPH_H; row++) {
-		int y = py + row;
-		if (y < 0 || y >= (int)hud->height) {
-			continue;
-		}
+	uint32_t s = hud->scale;
 
+	for (int row = 0; row < GLYPH_H; row++) {
 		unsigned char bits = u_hud_font_data[c][row];
 		for (int col = 0; col < GLYPH_W; col++) {
-			int x = px + col;
-			if (x < 0 || x >= (int)hud->width) {
+			if (!(bits & (0x80 >> col))) {
 				continue;
 			}
 
-			if (bits & (0x80 >> col)) {
-				uint32_t offset = (y * hud->width + x) * 4;
-				hud->pixels[offset + 0] = 255; // R
-				hud->pixels[offset + 1] = 255; // G
-				hud->pixels[offset + 2] = 255; // B
-				hud->pixels[offset + 3] = 255; // A
+			// Fill a scale x scale block for this font pixel
+			for (uint32_t sy = 0; sy < s; sy++) {
+				int y = py + row * (int)s + (int)sy;
+				if (y < 0 || y >= (int)hud->height) {
+					continue;
+				}
+				for (uint32_t sx = 0; sx < s; sx++) {
+					int x = px + col * (int)s + (int)sx;
+					if (x < 0 || x >= (int)hud->width) {
+						continue;
+					}
+					uint32_t offset = (y * hud->width + x) * 4;
+					hud->pixels[offset + 0] = 255; // R
+					hud->pixels[offset + 1] = 255; // G
+					hud->pixels[offset + 2] = 255; // B
+					hud->pixels[offset + 3] = 255; // A
+				}
 			}
 		}
 	}
@@ -142,9 +166,10 @@ static void
 draw_string(struct u_hud *hud, int px, int py, const char *str)
 {
 	int x = px;
+	int advance = GLYPH_W * (int)hud->scale;
 	while (*str != '\0') {
 		draw_char(hud, x, py, *str);
-		x += GLYPH_W;
+		x += advance;
 		str++;
 	}
 }
@@ -174,9 +199,10 @@ u_hud_update(struct u_hud *hud, const struct u_hud_data *data)
 
 	// Format and draw text lines
 	char line[80];
-	int x = HUD_MARGIN;
-	int y = HUD_MARGIN;
-	int line_h = GLYPH_H + 2; // 2px spacing between lines
+	int s = (int)hud->scale;
+	int x = HUD_MARGIN * s;
+	int y = HUD_MARGIN * s;
+	int line_h = (GLYPH_H + 2) * s; // 2px spacing between lines (scaled)
 
 	// Device name
 	if (data->device_name) {

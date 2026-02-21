@@ -1645,7 +1645,11 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 	mc->session_render.hud_last_frame_time_ns = 0;
 	mc->session_render.hud_smoothed_frame_time_ms = 16.67f;
 	if (mc->session_render.owns_window) {
-		u_hud_create(&mc->session_render.hud, 480, 304);
+		uint32_t disp_w = mc->msc->base.info.display_pixel_width;
+		if (disp_w == 0) {
+			disp_w = mc->msc->base.info.views[0].recommended.width_pixels;
+		}
+		u_hud_create(&mc->session_render.hud, disp_w);
 	}
 
 	U_LOG_W("Setting session_render.initialized = true...");
