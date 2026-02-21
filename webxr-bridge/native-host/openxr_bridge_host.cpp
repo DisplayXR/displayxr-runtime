@@ -836,13 +836,21 @@ static int ws_callback(struct lws* wsi, enum lws_callback_reasons reason,
     case LWS_CALLBACK_ESTABLISHED: {
         LOG_INFO("WebSocket client connected");
         g_clientWsi = wsi;
-        // Send config message with swapchain dimensions so extension captures at correct resolution
+        // Send config message with swapchain dimensions and display settings
         if (g_appState && g_appState->swapchainWidth > 0) {
-            char cfg[128];
+            const char* simDisplayOutput = getenv("SIM_DISPLAY_OUTPUT");
+            const char* dispMode = simDisplayOutput ? simDisplayOutput : "sbs";
+            bool isBrowserDisplay = getenv("BROWSER_DISPLAY") != nullptr;
+
+            char cfg[256];
             int cfgLen = snprintf(cfg + LWS_PRE, sizeof(cfg) - LWS_PRE,
-                "{\"w\":%u,\"h\":%u}", g_appState->swapchainWidth, g_appState->swapchainHeight);
+                "{\"w\":%u,\"h\":%u,\"displayMode\":\"%s\",\"browserDisplay\":%s}",
+                g_appState->swapchainWidth, g_appState->swapchainHeight,
+                dispMode, isBrowserDisplay ? "true" : "false");
             lws_write(wsi, (unsigned char*)cfg + LWS_PRE, cfgLen, LWS_WRITE_TEXT);
-            LOG_INFO("Sent config: %ux%u", g_appState->swapchainWidth, g_appState->swapchainHeight);
+            LOG_INFO("Sent config: %ux%u displayMode=%s browserDisplay=%s",
+                     g_appState->swapchainWidth, g_appState->swapchainHeight,
+                     dispMode, isBrowserDisplay ? "true" : "false");
         }
         break;
     }

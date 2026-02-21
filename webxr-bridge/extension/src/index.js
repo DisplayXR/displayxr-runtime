@@ -124,6 +124,136 @@ function updateCamera(time) {
 
 requestAnimationFrame(updateCamera);
 
+// --- Display Mode State ---
+// 'sbs' = side-by-side (no post-process), 'anaglyph' = red-cyan, 'blend' = 50% mix
+let displayMode = 'sbs';
+// When true, browser handles display — skip frame capture to Monado
+let browserDisplay = false;
+
+// --- Post-Process Shader Pipeline ---
+// Lazy-initialized WebGL2 resources for SBS→anaglyph/blend display processing.
+// Reusable across Option D (copyTexImage2D), Option A (texImage2D from readback),
+// and future browser-native (importExternalTexture).
+
+let ppProgram = null;
+let ppTexture = null;
+let ppVAO = null;
+let ppInitialized = false;
+
+const PP_VERT_SRC = `#version 300 es
+in vec2 aPos;
+out vec2 vUV;
+void main() {
+    vUV = aPos * 0.5 + 0.5;
+    gl_Position = vec4(aPos, 0.0, 1.0);
+}`;
+
+const PP_FRAG_SRC = `#version 300 es
+precision mediump float;
+uniform sampler2D uSBS;
+uniform int uMode; // 1=anaglyph, 2=blend
+in vec2 vUV;
+out vec4 fragColor;
+void main() {
+    vec4 left = texture(uSBS, vec2(vUV.x * 0.5, vUV.y));
+    vec4 right = texture(uSBS, vec2(vUV.x * 0.5 + 0.5, vUV.y));
+    if (uMode == 1) {
+        fragColor = vec4(left.r, right.g, right.b, 1.0);
+    } else {
+        fragColor = mix(left, right, 0.5);
+    }
+}`;
+
+function initPostProcess(gl) {
+    // Compile shaders
+    const vs = gl.createShader(gl.VERTEX_SHADER);
+    gl.shaderSource(vs, PP_VERT_SRC);
+    gl.compileShader(vs);
+    if (!gl.getShaderParameter(vs, gl.COMPILE_STATUS)) {
+        console.error('MonadoXR: PP vertex shader error:', gl.getShaderInfoLog(vs));
+        return false;
+    }
+
+    const fs = gl.createShader(gl.FRAGMENT_SHADER);
+    gl.shaderSource(fs, PP_FRAG_SRC);
+    gl.compileShader(fs);
+    if (!gl.getShaderParameter(fs, gl.COMPILE_STATUS)) {
+        console.error('MonadoXR: PP fragment shader error:', gl.getShaderInfoLog(fs));
+        return false;
+    }
+
+    ppProgram = gl.createProgram();
+    gl.attachShader(ppProgram, vs);
+    gl.attachShader(ppProgram, fs);
+    gl.bindAttribLocation(ppProgram, 0, 'aPos');
+    gl.linkProgram(ppProgram);
+    if (!gl.getProgramParameter(ppProgram, gl.LINK_STATUS)) {
+        console.error('MonadoXR: PP program link error:', gl.getProgramInfoLog(ppProgram));
+        return false;
+    }
+    gl.deleteShader(vs);
+    gl.deleteShader(fs);
+
+    // Fullscreen quad VAO (triangle strip: [-1,-1], [1,-1], [-1,1], [1,1])
+    ppVAO = gl.createVertexArray();
+    gl.bindVertexArray(ppVAO);
+    const quadBuf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+    gl.bindVertexArray(null);
+
+    // Texture for capturing current canvas content
+    ppTexture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, ppTexture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+
+    ppInitialized = true;
+    console.log('MonadoXR: Post-process shader pipeline initialized');
+    return true;
+}
+
+function applyDisplayProcessing(gl, width, height) {
+    if (!ppInitialized && !initPostProcess(gl)) return;
+
+    const modeInt = displayMode === 'anaglyph' ? 1 : 2; // blend
+
+    // Save WebGL state
+    const prevProgram = gl.getParameter(gl.CURRENT_PROGRAM);
+    const prevFB = gl.getParameter(gl.FRAMEBUFFER_BINDING);
+    const prevVAO = gl.getParameter(gl.VERTEX_ARRAY_BINDING);
+    const prevActiveTexture = gl.getParameter(gl.ACTIVE_TEXTURE);
+    const prevTex2D = gl.getParameter(gl.TEXTURE_BINDING_2D);
+    const prevViewport = gl.getParameter(gl.VIEWPORT);
+
+    // Capture current canvas content into texture
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, ppTexture);
+    gl.copyTexImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 0, 0, width, height, 0);
+
+    // Draw fullscreen quad with post-process shader
+    gl.useProgram(ppProgram);
+    gl.uniform1i(gl.getUniformLocation(ppProgram, 'uSBS'), 0);
+    gl.uniform1i(gl.getUniformLocation(ppProgram, 'uMode'), modeInt);
+    gl.viewport(0, 0, width, height);
+    gl.bindVertexArray(ppVAO);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+    // Restore WebGL state
+    gl.useProgram(prevProgram);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, prevFB);
+    gl.bindVertexArray(prevVAO);
+    gl.activeTexture(prevActiveTexture);
+    gl.bindTexture(gl.TEXTURE_2D, prevTex2D);
+    gl.viewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
+}
+
 // --- WebSocket Frame Capture ---
 // Sends stereo SBS frames to the native OpenXR bridge host via WebSocket.
 // Protocol: [uint32 width][uint32 height][RGBA pixels]
@@ -155,13 +285,21 @@ function connectWebSocket() {
     if (typeof evt.data === 'string') {
       try {
         const msg = JSON.parse(evt.data);
-        // Config message: swapchain dimensions
+        // Config message: swapchain dimensions + display mode
         if (msg.w && msg.h) {
           captureWidth = msg.w;
           captureHeight = msg.h;
           captureCanvas = null;
           captureCtx = null;
           console.log(`MonadoXR: Native host requested capture at ${msg.w}x${msg.h}`);
+        }
+        if (msg.displayMode) {
+          displayMode = msg.displayMode;
+          console.log(`MonadoXR: Display mode set to ${displayMode}`);
+        }
+        if (msg.browserDisplay !== undefined) {
+          browserDisplay = msg.browserDisplay;
+          console.log(`MonadoXR: Browser display mode ${browserDisplay ? 'enabled' : 'disabled'}`);
         }
         // Pose message: [px, py, pz, qx, qy, qz, qw]
         if (msg.pose) {
@@ -260,7 +398,22 @@ XRSession.prototype.requestAnimationFrame = function(callback) {
     // Let the app render first
     callback(time, frame);
 
-    // Then capture the result
+    // Apply display processing if browser handles display (anaglyph/blend)
+    if (displayMode !== 'sbs' && displayMode !== 'none') {
+      const baseLayer = this.renderState?.baseLayer;
+      if (baseLayer) {
+        const gl = baseLayer.context;
+        const glCanvas = gl?.canvas;
+        if (gl && glCanvas) {
+          applyDisplayProcessing(gl, glCanvas.width, glCanvas.height);
+        }
+      }
+    }
+
+    // Skip frame capture if browser handles display
+    if (browserDisplay) return;
+
+    // Then capture the result and send to native host
     if (!wsConnected || !ws || ws.readyState !== WebSocket.OPEN) return;
     if (ws.bufferedAmount > BACKPRESSURE_LIMIT) return;
 
@@ -304,4 +457,4 @@ XRSession.prototype.requestAnimationFrame = function(callback) {
   });
 };
 
-console.log('Monado WebXR Bridge: iwer runtime installed, stereo SBS active, frame capture enabled');
+console.log('Monado WebXR Bridge: iwer runtime installed, stereo SBS active, display processing ready');
