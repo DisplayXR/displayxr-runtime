@@ -8,8 +8,7 @@
     "watch": "esbuild extension/src/index.js --bundle --outfile=extension/webxr-polyfill-bundle.js --format=iife --target=chrome100 --watch"
   },
   "dependencies": {
-    "gl-matrix": "^3.4.3",
-    "webxr-polyfill": "^2.0.3"
+    "iwer": "^2.1.0"
   },
   "devDependencies": {
     "esbuild": "^0.20.0"

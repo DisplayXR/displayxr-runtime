@@ -1053,10 +1053,10 @@ static void RenderScene(
         float vp[16];
         mat4_multiply(vp, e.projMat, e.viewMat);
 
-        // Draw cube — base rests on grid at y=0
+        // Draw cube at eye height (1.6m), matching Windows sr_cube_openxr
         {
             const float cubeSize = 0.06f;
-            const float cubeHeight = cubeSize / 2.0f;
+            const float cubeHeight = 1.6f;
 
             float scale[16], rot[16], trans[16];
             mat4_scaling(scale, cubeSize, cubeSize, cubeSize);

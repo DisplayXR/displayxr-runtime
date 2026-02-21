@@ -99,9 +99,9 @@ sim_display_open_system_impl(struct xrt_builder *xb,
 				xsysd->xdevs[xsysd->xdev_count++] = qwerty_head;
 
 				// Qwerty HMD pose = virtual display position in world space.
-				// Start at origin; sim_display adds the nominal eye offset.
+				// Start at standing height; sim_display adds the nominal eye offset.
 				struct qwerty_device *qd = qwerty_device(qwerty_head);
-				qd->pose.position = (struct xrt_vec3){0, 0, 0};
+				qd->pose.position = (struct xrt_vec3){0, 1.6f, 0};
 				qd->pose.orientation = (struct xrt_quat){0, 0, 0, 1};
 
 				// Delegate sim_display pose to qwerty HMD.

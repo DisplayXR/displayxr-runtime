@@ -83,13 +83,9 @@ cmake --build "$ROOT/test_apps/sim_cube_openxr_ext_macos/build"
 # Step 4: Package artifacts (mirrors CI workflow)
 echo "=== Packaging artifacts ==="
 PKG_DIR="$ROOT/_package/SRMonado-macOS"
-if [ -d "$ROOT/_package" ]; then
-  rm -rf "$ROOT/_package" 2>/dev/null || {
-    echo "Warning: cannot remove _package (root-owned files from a previous sudo run?)"
-    echo "Retrying with sudo..."
-    sudo rm -rf "$ROOT/_package"
-  }
-fi
+# Clean managed directories only (preserve user-added files like run_bridge_host.sh)
+rm -rf "$PKG_DIR/lib" "$PKG_DIR/bin" "$PKG_DIR/share" 2>/dev/null || true
+rm -f "$PKG_DIR/openxr_monado.json" "$PKG_DIR/run_sim_cube.sh" "$PKG_DIR/run_sim_cube_ext.sh" 2>/dev/null || true
 mkdir -p "$PKG_DIR/lib"
 mkdir -p "$PKG_DIR/share/vulkan/icd.d"
 mkdir -p "$PKG_DIR/bin"

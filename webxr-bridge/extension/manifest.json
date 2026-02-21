@@ -9,14 +9,9 @@
   "content_scripts": [
     {
       "matches": ["*://*/*"],
-      "js": ["content-script.js"],
-      "run_at": "document_start"
-    }
-  ],
-  "web_accessible_resources": [
-    {
-      "resources": ["webxr-polyfill-bundle.js"],
-      "matches": ["*://*/*"]
+      "js": ["webxr-polyfill-bundle.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
     }
   ],
   "permissions": [

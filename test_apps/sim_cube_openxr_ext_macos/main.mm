@@ -1016,7 +1016,7 @@ static void CleanupVkRenderer(VkRenderer& renderer) {
     (void)dirtyRect;
     if (_hudText.length == 0) return;
     NSBezierPath *bg = [NSBezierPath bezierPathWithRoundedRect:self.bounds xRadius:6 yRadius:6];
-    [[NSColor colorWithCalibratedRed:0 green:0 blue:0 alpha:0.75] setFill];
+    [[NSColor colorWithCalibratedRed:0 green:0 blue:0 alpha:0.5] setFill];
     [bg fill];
     NSFont *font = [NSFont fontWithName:@"Menlo" size:11];
     if (!font) font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
@@ -1143,6 +1143,10 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
 }
 
 static void PumpMacOSEvents() {
+    // Track whether left-click started in content area vs title bar.
+    // Title bar drags should move the window, not rotate the scene.
+    static bool leftDragInContent = false;
+
     @autoreleasepool {
         NSEvent *event;
         while ((event = [NSApp nextEventMatchingMask:NSEventMaskAny
@@ -1152,12 +1156,16 @@ static void PumpMacOSEvents() {
             NSEventType type = [event type];
 
             if (type == NSEventTypeLeftMouseDown) {
+                NSPoint loc = [event locationInWindow];
+                NSRect contentRect = g_window ? [[g_window contentView] frame] : NSZeroRect;
+                leftDragInContent = NSMouseInRect(loc, contentRect, NO);
                 if ([event clickCount] >= 2) g_input.resetViewRequested = true;
             } else if (type == NSEventTypeLeftMouseDragged) {
-                // Rotate camera only while left button is physically held.
+                // Rotate camera only while left button is physically held AND
+                // the drag started in the content area (not the title bar).
                 // Uses event deltas — no persistent drag state that can get
                 // stuck when the window-resize modal loop swallows MouseUp.
-                if ([NSEvent pressedMouseButtons] & 1) {
+                if (leftDragInContent && ([NSEvent pressedMouseButtons] & 1)) {
                     g_input.yaw   -= (float)[event deltaX] * 0.005f;
                     g_input.pitch -= (float)[event deltaY] * 0.005f;
                     if (g_input.pitch > 1.4f) g_input.pitch = 1.4f;
