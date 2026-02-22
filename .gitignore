@@ -119,3 +119,6 @@ cnsdk
 
 # Ignore packaging artifacts
 _package/
+
+# Ignore Unity plugin build artifacts (native binaries built from native~/)
+com.monado.display3d/Runtime/Plugins/
