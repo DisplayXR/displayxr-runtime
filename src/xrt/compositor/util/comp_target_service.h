@@ -17,7 +17,8 @@
 
 #include "xrt/xrt_results.h"
 
-#include <stddef.h> // For NULL
+#include <stddef.h>   // For NULL
+#include <stdint.h>   // For uint8_t, uint32_t
 
 #ifdef __cplusplus
 extern "C" {
@@ -74,6 +75,21 @@ struct comp_target_service
 	 * @return XRT_SUCCESS or error code
 	 */
 	xrt_result_t (*init_main_target)(struct comp_target_service *service);
+
+	/*!
+	 * Create an offscreen render target with readback callback.
+	 * Composited pixels are read back from GPU and delivered to the callback.
+	 *
+	 * @param service  The service instance
+	 * @param callback Called with composited RGBA pixels after each present
+	 * @param userdata Passed to callback
+	 * @param out_target Created target (caller takes ownership)
+	 * @return XRT_SUCCESS or error code
+	 */
+	xrt_result_t (*create_offscreen)(struct comp_target_service *service,
+	                                 void (*callback)(const uint8_t *, uint32_t, uint32_t, void *),
+	                                 void *userdata,
+	                                 struct comp_target **out_target);
 
 	//! Opaque context for implementation (typically comp_compositor*)
 	void *context;
@@ -139,6 +155,24 @@ comp_target_service_init_main_target(struct comp_target_service *service)
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}
 	return service->init_main_target(service);
+}
+
+/*!
+ * Convenience wrapper for creating an offscreen target with readback callback.
+ *
+ * @public @memberof comp_target_service
+ * @ingroup comp_util
+ */
+static inline xrt_result_t
+comp_target_service_create_offscreen(struct comp_target_service *service,
+                                     void (*callback)(const uint8_t *, uint32_t, uint32_t, void *),
+                                     void *userdata,
+                                     struct comp_target **out_target)
+{
+	if (service == NULL || service->create_offscreen == NULL) {
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+	return service->create_offscreen(service, callback, userdata, out_target);
 }
 
 

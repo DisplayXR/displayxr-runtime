@@ -223,6 +223,10 @@ struct multi_compositor
 		//! External window handle (HWND on Windows), NULL for shared rendering
 		void *external_window_handle;
 
+		//! Readback callback for offscreen compositing (composited RGBA pixels)
+		void (*readback_callback)(const uint8_t *, uint32_t, uint32_t, void *);
+		void *readback_userdata;
+
 		//! Per-session render target (VkSwapchain from external HWND)
 		struct comp_target *target;
 
@@ -599,7 +603,7 @@ multi_compositor_init_session_render(struct multi_compositor *mc);
 static inline bool
 multi_compositor_has_session_render(struct multi_compositor *mc)
 {
-	return mc->session_render.external_window_handle != NULL;
+	return mc->session_render.external_window_handle != NULL || mc->session_render.readback_callback != NULL;
 }
 
 #ifdef XRT_HAVE_LEIA_SR_VULKAN

@@ -18,9 +18,12 @@ function connectWebSocket() {
   };
 
   ws.onmessage = (evt) => {
-    // All incoming messages from native host are JSON text — forward to main world
     if (typeof evt.data === 'string') {
+      // JSON text (pose, config, etc.) — forward to main world
       window.postMessage({ type: 'monado-ws-in', json: evt.data }, '*');
+    } else if (evt.data instanceof ArrayBuffer) {
+      // Binary readback frame from Monado (Option A) — relay to main world
+      window.postMessage({ type: 'monado-ws-binary', buffer: evt.data }, '*', [evt.data]);
     }
   };
 

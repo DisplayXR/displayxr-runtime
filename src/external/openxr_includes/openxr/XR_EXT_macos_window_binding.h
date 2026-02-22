@@ -16,21 +16,26 @@
  * - Application control over window input (keyboard, mouse)
  * - Multiple OpenXR applications on the same display
  * - HUD overlays and custom UI compositing
+ * - Offscreen readback: viewHandle=NULL + readbackCallback → composited
+ *   pixels delivered to callback instead of presented to a window
  *
  * The app provides an NSView subclass whose -makeBackingLayer returns
  * a CAMetalLayer. MoltenVK creates its VkSurfaceKHR from this layer.
+ * Alternatively, set viewHandle=NULL and provide a readbackCallback to
+ * receive composited pixels via GPU readback (no window required).
  */
 #ifndef XR_EXT_MACOS_WINDOW_BINDING_H
 #define XR_EXT_MACOS_WINDOW_BINDING_H 1
 
 #include <openxr/openxr.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 #define XR_EXT_macos_window_binding 1
-#define XR_EXT_macos_window_binding_SPEC_VERSION 1
+#define XR_EXT_macos_window_binding_SPEC_VERSION 2
 #define XR_EXT_MACOS_WINDOW_BINDING_EXTENSION_NAME "XR_EXT_macos_window_binding"
 
 // Use a value in the vendor extension range (1000000000+)
@@ -51,12 +56,20 @@ extern "C" {
  * The viewHandle must point to an NSView whose backing layer is a
  * CAMetalLayer (i.e., -makeBackingLayer returns [CAMetalLayer layer]).
  *
+ * Alternatively, set viewHandle to NULL and provide a readbackCallback
+ * to receive composited pixels via GPU readback (offscreen mode).
+ *
  * @extends XrSessionCreateInfo
  */
+typedef void (*PFN_xrReadbackCallback)(
+    const uint8_t *pixels, uint32_t width, uint32_t height, void *userdata);
+
 typedef struct XrMacOSWindowBindingCreateInfoEXT {
-    XrStructureType          type;       //!< Must be XR_TYPE_MACOS_WINDOW_BINDING_CREATE_INFO_EXT
-    const void* XR_MAY_ALIAS next;       //!< Pointer to next structure in chain
-    void*                    viewHandle; //!< NSView* with CAMetalLayer backing (macOS only)
+    XrStructureType          type;              //!< Must be XR_TYPE_MACOS_WINDOW_BINDING_CREATE_INFO_EXT
+    const void* XR_MAY_ALIAS next;              //!< Pointer to next structure in chain
+    void*                    viewHandle;        //!< NSView* with CAMetalLayer backing, or NULL for offscreen
+    PFN_xrReadbackCallback   readbackCallback;  //!< Called with composited RGBA pixels (offscreen mode)
+    void*                    readbackUserdata;   //!< Passed to readbackCallback
 } XrMacOSWindowBindingCreateInfoEXT;
 
 #ifdef __cplusplus

@@ -1886,10 +1886,17 @@ oxr_session_create(struct oxr_logger *log,
 
 #ifdef XRT_OS_MACOS
 	// Parse XR_EXT_macos_window_binding extension - allows app to provide its own NSView
+	// or offscreen readback (viewHandle=NULL + readbackCallback)
 	const XrMacOSWindowBindingCreateInfoEXT *macos_target_info = OXR_GET_INPUT_FROM_CHAIN(
 	    createInfo, XR_TYPE_MACOS_WINDOW_BINDING_CREATE_INFO_EXT, XrMacOSWindowBindingCreateInfoEXT);
-	if (macos_target_info && macos_target_info->viewHandle) {
-		xsi.external_window_handle = (void *)macos_target_info->viewHandle;
+	if (macos_target_info) {
+		if (macos_target_info->viewHandle) {
+			xsi.external_window_handle = (void *)macos_target_info->viewHandle;
+		}
+		if (macos_target_info->readbackCallback) {
+			xsi.readback_callback = macos_target_info->readbackCallback;
+			xsi.readback_userdata = macos_target_info->readbackUserdata;
+		}
 	}
 #endif
 
@@ -1905,8 +1912,8 @@ oxr_session_create(struct oxr_logger *log,
 		return ret;
 	}
 
-	// Track whether this session has an external window handle
-	sess->has_external_window = (xsi.external_window_handle != NULL);
+	// Track whether this session has an external window handle or offscreen readback
+	sess->has_external_window = (xsi.external_window_handle != NULL || xsi.readback_callback != NULL);
 
 	// Tell sim_display driver to return raw eye positions (no qwerty compose)
 	if (sess->has_external_window) {

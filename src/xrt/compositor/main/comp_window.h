@@ -219,6 +219,22 @@ extern const struct comp_target_factory comp_target_factory_macos;
 
 #endif // XRT_OS_MACOS
 
+/*!
+ * Create an offscreen comp_target that reads back composited pixels via a callback.
+ * Used for WebXR bridge readback mode (Option A).
+ *
+ * @param c The compositor
+ * @param callback Called with composited RGBA pixels after each present
+ * @param userdata Passed to callback
+ * @return The created target, or NULL on failure
+ *
+ * @ingroup comp_main
+ */
+struct comp_target *
+comp_window_offscreen_create(struct comp_compositor *c,
+                             void (*callback)(const uint8_t *, uint32_t, uint32_t, void *),
+                             void *userdata);
+
 #ifdef __cplusplus
 }
 #endif
