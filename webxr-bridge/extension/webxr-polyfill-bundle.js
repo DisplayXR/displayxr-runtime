@@ -10152,10 +10152,24 @@ void main() {
     if (mode === "immersive-vr") {
       vrSessionActive = true;
       console.log("MonadoXR: VR session started \u2014 IO controls enabled");
+      if (wsConnected && overlayDisplay) {
+        window.postMessage({
+          type: "monado-ws-out",
+          json: JSON.stringify({ sessionActive: true })
+        }, "*");
+        console.log("MonadoXR: Sent sessionActive=true to bridge host");
+      }
       session.addEventListener("end", () => {
         vrSessionActive = false;
         mouseDragging = false;
         console.log("MonadoXR: VR session ended \u2014 IO controls disabled");
+        if (wsConnected && overlayDisplay) {
+          window.postMessage({
+            type: "monado-ws-out",
+            json: JSON.stringify({ sessionActive: false })
+          }, "*");
+          console.log("MonadoXR: Sent sessionActive=false to bridge host");
+        }
       });
     }
     return session;
@@ -10276,7 +10290,7 @@ void main() {
     if (!vrSessionActive)
       return;
     if (ctrlPressed || altPressed) {
-      if (wsConnected && !browserDisplay)
+      if (wsConnected && !localInput)
         return;
       const dx = e.movementX * 1e-3;
       const dy = -e.movementY * 1e-3;
@@ -10292,7 +10306,7 @@ void main() {
     }
     if (!mouseDragging)
       return;
-    if (wsConnected && !browserDisplay)
+    if (wsConnected && !localInput)
       return;
     camYaw -= e.movementX * 5e-3;
     camPitch -= e.movementY * 5e-3;
@@ -10304,7 +10318,7 @@ void main() {
   window.addEventListener("wheel", (e) => {
     if (!vrSessionActive)
       return;
-    if (wsConnected && !browserDisplay)
+    if (wsConnected && !localInput)
       return;
     e.preventDefault();
     const factor = e.deltaY < 0 ? 1.1 : 1 / 1.1;
@@ -10318,7 +10332,7 @@ void main() {
     requestAnimationFrame(updateCamera);
     if (!vrSessionActive)
       return;
-    if (wsConnected && !browserDisplay)
+    if (wsConnected && !localInput)
       return;
     const now = time / 1e3;
     const dt = lastTime > 0 ? Math.min(now - lastTime, 0.1) : 1 / 60;
@@ -10414,6 +10428,27 @@ void main() {
   requestAnimationFrame(updateCamera);
   var lastCanvasWidth = 0;
   var lastCanvasHeight = 0;
+  var lastOverlayX = -1;
+  var lastOverlayY = -1;
+  var lastOverlayCW = -1;
+  var lastOverlayCH = -1;
+  function sendOverlayCanvasRect(canvas) {
+    const rect = canvas.getBoundingClientRect();
+    const chromeHeight = window.outerHeight - window.innerHeight;
+    const screenX = window.screenX + rect.left;
+    const screenY = window.screenY + chromeHeight + rect.top;
+    const cssW = rect.width;
+    const cssH = rect.height;
+    if (screenX !== lastOverlayX || screenY !== lastOverlayY || cssW !== lastOverlayCW || cssH !== lastOverlayCH) {
+      lastOverlayX = screenX;
+      lastOverlayY = screenY;
+      lastOverlayCW = cssW;
+      lastOverlayCH = cssH;
+      const msg = { canvasRect: { x: screenX, y: screenY, w: cssW, h: cssH } };
+      window.postMessage({ type: "monado-ws-out", json: JSON.stringify(msg) }, "*");
+      console.log(`MonadoXR: Overlay canvasRect sent: (${screenX}, ${screenY}) ${cssW}x${cssH}`);
+    }
+  }
   function checkCanvasResize() {
     requestAnimationFrame(checkCanvasResize);
     if (!wsConnected)
@@ -10422,16 +10457,51 @@ void main() {
     if (!canvas)
       return;
     const w = canvas.width, h = canvas.height;
-    if (w === lastCanvasWidth && h === lastCanvasHeight)
-      return;
-    lastCanvasWidth = w;
-    lastCanvasHeight = h;
-    window.postMessage({ type: "monado-ws-out", json: JSON.stringify({ resize: { w, h } }) }, "*");
-    console.log(`MonadoXR: Canvas resized to ${w}x${h}, notified bridge host`);
+    if (w !== lastCanvasWidth || h !== lastCanvasHeight) {
+      lastCanvasWidth = w;
+      lastCanvasHeight = h;
+      window.postMessage({ type: "monado-ws-out", json: JSON.stringify({ resize: { w, h } }) }, "*");
+      console.log(`MonadoXR: Canvas resized to ${w}x${h}, notified bridge host`);
+    }
+    if (overlayDisplay) {
+      sendOverlayCanvasRect(canvas);
+    }
   }
   requestAnimationFrame(checkCanvasResize);
+  document.addEventListener("visibilitychange", () => {
+    if (wsConnected && overlayDisplay) {
+      const visible = !document.hidden;
+      window.postMessage({
+        type: "monado-ws-out",
+        json: JSON.stringify({ tabVisible: visible })
+      }, "*");
+      console.log(`MonadoXR: Sent tabVisible=${visible}`);
+    }
+  });
+  window.addEventListener("blur", () => {
+    if (wsConnected && overlayDisplay) {
+      window.postMessage({
+        type: "monado-ws-out",
+        json: JSON.stringify({ windowFocused: false })
+      }, "*");
+      console.log("MonadoXR: Sent windowFocused=false");
+    }
+  });
+  window.addEventListener("focus", () => {
+    if (wsConnected && overlayDisplay) {
+      window.postMessage({
+        type: "monado-ws-out",
+        json: JSON.stringify({ windowFocused: true })
+      }, "*");
+      console.log("MonadoXR: Sent windowFocused=true");
+    }
+  });
   var displayMode = "sbs";
   var browserDisplay = false;
+  var readbackDisplay = false;
+  var overlayDisplay = false;
+  var localInput = false;
+  var compositedFrame = null;
   var ppProgram = null;
   var ppTexture = null;
   var ppVAO = null;
@@ -10446,16 +10516,20 @@ void main() {
   var PP_FRAG_SRC = `#version 300 es
 precision mediump float;
 uniform sampler2D uSBS;
-uniform int uMode; // 1=anaglyph, 2=blend
+uniform int uMode; // 0=passthrough, 1=anaglyph, 2=blend
 in vec2 vUV;
 out vec4 fragColor;
 void main() {
-    vec4 left = texture(uSBS, vec2(vUV.x * 0.5, vUV.y));
-    vec4 right = texture(uSBS, vec2(vUV.x * 0.5 + 0.5, vUV.y));
-    if (uMode == 1) {
-        fragColor = vec4(left.r, right.g, right.b, 1.0);
+    if (uMode == 0) {
+        fragColor = texture(uSBS, vUV);
     } else {
-        fragColor = mix(left, right, 0.5);
+        vec4 left = texture(uSBS, vec2(vUV.x * 0.5, vUV.y));
+        vec4 right = texture(uSBS, vec2(vUV.x * 0.5 + 0.5, vUV.y));
+        if (uMode == 1) {
+            fragColor = vec4(left.r, right.g, right.b, 1.0);
+        } else {
+            fragColor = mix(left, right, 0.5);
+        }
     }
 }`;
   function initPostProcess(gl) {
@@ -10542,6 +10616,54 @@ void main() {
     gl.bindTexture(gl.TEXTURE_2D, prevTex2D);
     gl.viewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
   }
+  function displayCompositedFrame(gl, frame) {
+    if (!ppInitialized && !initPostProcess(gl))
+      return;
+    const prevProgram = gl.getParameter(gl.CURRENT_PROGRAM);
+    const prevFB = gl.getParameter(gl.FRAMEBUFFER_BINDING);
+    const prevVAO = gl.getParameter(gl.VERTEX_ARRAY_BINDING);
+    const prevActiveTexture = gl.getParameter(gl.ACTIVE_TEXTURE);
+    const prevTex2D = gl.getParameter(gl.TEXTURE_BINDING_2D);
+    const prevViewport = gl.getParameter(gl.VIEWPORT);
+    const prevDepthTest = gl.isEnabled(gl.DEPTH_TEST);
+    const prevStencilTest = gl.isEnabled(gl.STENCIL_TEST);
+    const prevBlend = gl.isEnabled(gl.BLEND);
+    gl.disable(gl.DEPTH_TEST);
+    gl.disable(gl.STENCIL_TEST);
+    gl.disable(gl.BLEND);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, ppTexture);
+    gl.texImage2D(
+      gl.TEXTURE_2D,
+      0,
+      gl.RGBA,
+      frame.width,
+      frame.height,
+      0,
+      gl.RGBA,
+      gl.UNSIGNED_BYTE,
+      frame.pixels
+    );
+    gl.useProgram(ppProgram);
+    gl.uniform1i(gl.getUniformLocation(ppProgram, "uSBS"), 0);
+    gl.uniform1i(gl.getUniformLocation(ppProgram, "uMode"), 0);
+    gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
+    gl.bindVertexArray(ppVAO);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    if (prevDepthTest)
+      gl.enable(gl.DEPTH_TEST);
+    if (prevStencilTest)
+      gl.enable(gl.STENCIL_TEST);
+    if (prevBlend)
+      gl.enable(gl.BLEND);
+    gl.useProgram(prevProgram);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, prevFB);
+    gl.bindVertexArray(prevVAO);
+    gl.activeTexture(prevActiveTexture);
+    gl.bindTexture(gl.TEXTURE_2D, prevTex2D);
+    gl.viewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
+  }
   var wsConnected = false;
   var captureCanvas = null;
   var captureCtx = null;
@@ -10575,6 +10697,15 @@ void main() {
         browserDisplay = msg.browserDisplay;
         console.log(`MonadoXR: Browser display mode ${browserDisplay ? "enabled" : "disabled"}`);
       }
+      if (msg.readbackDisplay !== void 0) {
+        readbackDisplay = msg.readbackDisplay;
+        console.log(`MonadoXR: Readback display mode ${readbackDisplay ? "enabled" : "disabled"}`);
+      }
+      if (msg.overlayDisplay !== void 0) {
+        overlayDisplay = msg.overlayDisplay;
+        console.log(`MonadoXR: Overlay display mode ${overlayDisplay ? "enabled" : "disabled"}`);
+      }
+      localInput = browserDisplay || readbackDisplay || overlayDisplay;
       if (msg.displayWidthM) {
         displayWidthM = msg.displayWidthM;
         displayHeightM = msg.displayHeightM;
@@ -10587,7 +10718,7 @@ void main() {
           console.log(`MonadoXR: Nominal viewer position: (${msg.nominalViewer.map((v) => v.toFixed(3)).join(", ")})`);
         }
       }
-      if (msg.pose && !browserDisplay) {
+      if (msg.pose && !localInput) {
         const [px, py, pz, qx, qy, qz, qw] = msg.pose;
         xrDevice.position.set(px, py, pz);
         xrDevice.quaternion.set(qx, qy, qz, qw);
@@ -10598,7 +10729,7 @@ void main() {
       if (msg.fov) {
         fovAngles = msg.fov;
       }
-      if (msg.ctrl && !browserDisplay) {
+      if (msg.ctrl && !localInput) {
         const controllers = xrDevice.controllers;
         const hands = ["left", "right"];
         for (let i = 0; i < 2; i++) {
@@ -10630,6 +10761,14 @@ void main() {
     } else if (evt.data.type === "monado-ws-status") {
       wsConnected = evt.data.connected;
       console.log(`MonadoXR: WebSocket ${wsConnected ? "connected" : "disconnected"}`);
+    } else if (evt.data.type === "monado-ws-binary" && evt.data.buffer) {
+      const buf = evt.data.buffer;
+      if (buf.byteLength > 8) {
+        const view = new DataView(buf);
+        const w = view.getUint32(0, true);
+        const h = view.getUint32(4, true);
+        compositedFrame = { width: w, height: h, pixels: new Uint8Array(buf, 8) };
+      }
     }
   });
   function fovToProjectionMatrix(angleLeft, angleRight, angleUp, angleDown, near, far) {
@@ -10686,7 +10825,7 @@ void main() {
     const pose = origGetViewerPose.call(this, refSpace);
     if (!pose)
       return pose;
-    if (browserDisplay || !wsConnected) {
+    if (localInput || !wsConnected) {
       const playerOri = quatFromYawPitch(camYaw, camPitch);
       const zs = zoomScale;
       for (let i = 0; i < pose.views.length; i++) {
@@ -10780,7 +10919,7 @@ void main() {
       }
       console.log(`  Viewport: ${vpW}x${vpH}, texture: ${texW}x${texH} (viewport * viewScale)`);
       console.log(`  Kooima screen rect: ${screenW.toFixed(4)}x${fullSH.toFixed(4)} m (${sbsMode ? "SBS half" : "full"} width)`);
-      console.log(`  displayMode: ${displayMode}, browserDisplay: ${browserDisplay}`);
+      console.log(`  displayMode: ${displayMode}, browserDisplay: ${browserDisplay}, readbackDisplay: ${readbackDisplay}, overlayDisplay: ${overlayDisplay}`);
       console.log("============================");
     }
     return pose;
@@ -10789,7 +10928,12 @@ void main() {
   XRSession.prototype.requestAnimationFrame = function(callback) {
     return origRAF.call(this, (time, frame) => {
       callback(time, frame);
-      if (displayMode !== "sbs" && displayMode !== "none") {
+      if (overlayDisplay && wsConnected) {
+        const glCanvas2 = this.renderState?.baseLayer?.context?.canvas;
+        if (glCanvas2)
+          sendOverlayCanvasRect(glCanvas2);
+      }
+      if (!readbackDisplay && displayMode !== "sbs" && displayMode !== "none") {
         const baseLayer2 = this.renderState?.baseLayer;
         if (baseLayer2) {
           const gl = baseLayer2.context;
@@ -10828,6 +10972,9 @@ void main() {
       packet.set(new Uint8Array(header), 0);
       packet.set(imageData.data, 8);
       window.postMessage({ type: "monado-ws-out", binary: packet.buffer }, "*", [packet.buffer]);
+      if (readbackDisplay && compositedFrame) {
+        displayCompositedFrame(baseLayer.context, compositedFrame);
+      }
     });
   };
   console.log("Monado WebXR Bridge: iwer runtime installed, stereo SBS active, display processing ready");
