@@ -10333,7 +10333,7 @@ void main() {
     }
     const hasMovement = keys["KeyW"] || keys["KeyS"] || keys["KeyA"] || keys["KeyD"] || keys["KeyE"] || keys["KeyQ"];
     if (hasMovement) {
-      const d = 0.1 * dt;
+      const d = 0.1 * dt * 4 / zoomScale;
       if (ctrlPressed || altPressed) {
         const targets = [];
         if (ctrlPressed)
@@ -10392,14 +10392,22 @@ void main() {
       }
     }
     const headOri = quatFromYawPitch(camYaw, camPitch);
-    const headX = camPosX, headY = EYE_HEIGHT + camPosY, headZ = camPosZ;
+    const zs = zoomScale;
+    const [nvX, nvY, nvZ] = nominalViewPos;
     const ctrls = xrDevice.controllers;
     for (const [hand, offset] of [["left", ctrlOffsetLeft], ["right", ctrlOffsetRight]]) {
       const ctrl = ctrls[hand];
       if (!ctrl)
         continue;
-      const r = quatRotateVec3(headOri, offset.x, offset.y, offset.z);
-      ctrl.position.set(headX + r.x, headY + r.y, headZ + r.z);
+      const dx = (nvX + offset.x) / zs;
+      const dy = (nvY + offset.y) / zs;
+      const dz = (nvZ + offset.z) / zs;
+      const r = quatRotateVec3(headOri, dx, dy, dz);
+      ctrl.position.set(
+        r.x + camPosX,
+        r.y + EYE_HEIGHT + camPosY,
+        r.z + camPosZ
+      );
       ctrl.quaternion.set(headOri.x, headOri.y, headOri.z, headOri.w);
     }
   }
@@ -10541,6 +10549,7 @@ void main() {
   var captureHeight = 0;
   var fovAngles = null;
   var rawEyePositions = null;
+  var nominalViewPos = [0, 0.1, 0.65];
   var displayWidthM = 0;
   var displayHeightM = 0;
   var displayPixelW = 0;
@@ -10574,6 +10583,7 @@ void main() {
         viewScaleX = msg.viewScaleX || 1;
         viewScaleY = msg.viewScaleY || 1;
         if (msg.nominalViewer) {
+          nominalViewPos = msg.nominalViewer;
           console.log(`MonadoXR: Nominal viewer position: (${msg.nominalViewer.map((v) => v.toFixed(3)).join(", ")})`);
         }
       }

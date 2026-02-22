@@ -272,7 +272,7 @@ function updateCamera(time) {
     keys['KeyD'] || keys['KeyE'] || keys['KeyQ'];
 
   if (hasMovement) {
-    const d = 0.1 * dt; // m/frame-tick
+    const d = 0.1 * dt * 4 / zoomScale; // m/frame-tick, scaled by 4/zoomScale
 
     if (ctrlPressed || altPressed) {
       // Controller focused: move controller offset in head-local space
@@ -302,15 +302,27 @@ function updateCamera(time) {
     }
   }
 
-  // Update controller positions: follow head + offset rotated by head orientation
+  // Update controller positions using same transform as getViewerPose:
+  //   displayPos = nominalViewPos + offset  (controller pos in display space)
+  //   worldPos = rotate(displayPos / zoomScale, playerOri) + cameraPos
   const headOri = quatFromYawPitch(camYaw, camPitch);
-  const headX = camPosX, headY = EYE_HEIGHT + camPosY, headZ = camPosZ;
+  const zs = zoomScale;
+  const [nvX, nvY, nvZ] = nominalViewPos;
   const ctrls = xrDevice.controllers;
   for (const [hand, offset] of [['left', ctrlOffsetLeft], ['right', ctrlOffsetRight]]) {
     const ctrl = ctrls[hand];
     if (!ctrl) continue;
-    const r = quatRotateVec3(headOri, offset.x, offset.y, offset.z);
-    ctrl.position.set(headX + r.x, headY + r.y, headZ + r.z);
+    // Display-space position: nominal viewer + head-local offset
+    const dx = (nvX + offset.x) / zs;
+    const dy = (nvY + offset.y) / zs;
+    const dz = (nvZ + offset.z) / zs;
+    // Rotate into world space + camera translation (matches eye transform)
+    const r = quatRotateVec3(headOri, dx, dy, dz);
+    ctrl.position.set(
+      r.x + camPosX,
+      r.y + EYE_HEIGHT + camPosY,
+      r.z + camPosZ
+    );
     ctrl.quaternion.set(headOri.x, headOri.y, headOri.z, headOri.w);
   }
 }
@@ -497,6 +509,8 @@ let fovAngles = null;
 // Raw per-eye positions from xrLocateViews — [[x,y,z], [x,y,z]]
 // These are in display-local space (relative to display center).
 let rawEyePositions = null;
+// Nominal viewer position in display space (from bridge host config)
+let nominalViewPos = [0, 0.1, 0.65];
 // Physical display dimensions from XR_EXT_display_info (for Kooima projection)
 let displayWidthM = 0;
 let displayHeightM = 0;
@@ -538,6 +552,7 @@ function handleWsMessage(jsonStr) {
       viewScaleX = msg.viewScaleX || 1.0;
       viewScaleY = msg.viewScaleY || 1.0;
       if (msg.nominalViewer) {
+        nominalViewPos = msg.nominalViewer;
         console.log(`MonadoXR: Nominal viewer position: (${msg.nominalViewer.map(v => v.toFixed(3)).join(', ')})`);
       }
     }
