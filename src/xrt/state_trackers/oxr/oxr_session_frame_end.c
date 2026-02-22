@@ -1828,7 +1828,7 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 	 */
 
 	if (frameEndInfo->layerCount == 0) {
-		U_LOG_W("[frame_end] layerCount==0, discarding frame %" PRId64, sess->frame_id.begun);
+		U_LOG_I("[frame_end] layerCount==0, discarding frame %" PRId64, sess->frame_id.begun);
 
 		os_mutex_lock(&sess->active_wait_frames_lock);
 		sess->active_wait_frames--;

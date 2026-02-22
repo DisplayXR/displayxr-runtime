@@ -254,11 +254,6 @@ u_hud_update(struct u_hud *hud, const struct u_hud_data *data)
 	draw_string(hud, x, y, line);
 	y += line_h;
 
-	// Tracking status
-	snprintf(line, sizeof(line), "Track: %s", data->eye_tracking_active ? "Active" : "Inactive");
-	draw_string(hud, x, y, line);
-	y += line_h;
-
 	// Zoom factor (only show if meaningful)
 	if (data->zoom_scale > 0.0f) {
 		snprintf(line, sizeof(line), "Zoom: %.2f", data->zoom_scale);

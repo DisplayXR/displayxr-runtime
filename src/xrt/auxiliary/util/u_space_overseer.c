@@ -1169,8 +1169,10 @@ u_space_overseer_legacy_setup(struct u_space_overseer *uso,
 	// Set local to the local offset.
 	u_space_overseer_create_offset_space(uso, uso->base.semantic.root, local_offset, &uso->base.semantic.local);
 
-	// Display space: same as local origin (display center), but parented to root
-	// so it's unaffected by recentering.
+	// Display space: same offset as local (display center at standing height),
+	// but parented to root so it's unaffected by recentering.
+	// Must match the device tracking origin offset (set by u_builder_setup_tracking_origins)
+	// so that poses in tracking space transform correctly to DISPLAY space.
 	u_space_overseer_create_offset_space(uso, uso->base.semantic.root, local_offset, &uso->base.semantic.display);
 
 	// Set local floor to be under local, but at y == 0 from stage.

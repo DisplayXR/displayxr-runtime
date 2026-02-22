@@ -102,8 +102,12 @@ Object.defineProperty(navigator.xr, 'requestSession', {
   configurable: true,
 });
 
-// --- Camera Controls (matches EXT app: test_apps/sim_cube_openxr_ext_macos) ---
-// Mouse drag = look, WASD = move, Q/E = up/down, Scroll = zoom, Space = reset
+// --- Camera & Controller Controls ---
+// Matches EXT app (test_apps/sim_cube_openxr_ext_macos) + qwerty_macos.m pattern.
+// Default: WASD = move camera, LMB drag = look, Q/E = up/down, Scroll = zoom
+// CTRL held: focus LEFT controller — mouse = move, LMB = trigger, MMB = squeeze
+// ALT held: focus RIGHT controller — same
+// CTRL+ALT: focus both controllers
 
 const keys = {};
 let lastTime = 0;
@@ -116,6 +120,17 @@ let zoomScale = 1.0;
 
 // Mouse drag state
 let mouseDragging = false;
+
+// Controller state — offsets from head position in head-local space.
+// Updated by CTRL/ALT + mouse/WASD. Controllers follow the head each frame.
+let ctrlPressed = false;
+let altPressed = false;
+const ctrlOffsetLeft  = { x: -0.2, y: -0.15, z: -0.3 };
+const ctrlOffsetRight = { x:  0.2, y: -0.15, z: -0.3 };
+const CTRL_OFFSET_DEFAULTS = {
+  left:  { x: -0.2, y: -0.15, z: -0.3 },
+  right: { x:  0.2, y: -0.15, z: -0.3 },
+};
 
 // Quaternion from yaw/pitch (matches EXT app quat_from_yaw_pitch)
 function quatFromYawPitch(yaw, pitch) {
@@ -156,24 +171,61 @@ function quatRotateVec3(q, vx, vy, vz) {
 window.addEventListener('keydown', (e) => {
   if (!vrSessionActive) return;
   keys[e.code] = true;
-  if (e.code === 'Space') e.preventDefault(); // Prevent page scroll
+  if (e.code === 'Space') e.preventDefault();
+  if (e.key === 'Control') ctrlPressed = true;
+  if (e.key === 'Alt') { altPressed = true; e.preventDefault(); }
 });
 window.addEventListener('keyup', (e) => {
   if (!vrSessionActive) return;
   keys[e.code] = false;
+  if (e.key === 'Control') ctrlPressed = false;
+  if (e.key === 'Alt') altPressed = false;
 });
 
-// Mouse drag for yaw/pitch rotation
+// Mouse events — routes to controllers when CTRL/ALT held, camera otherwise.
+// Matches qwerty_macos.m: modifier+mousemove = controller XY translation,
+// LMB = trigger, MMB = squeeze (when controller focused).
 window.addEventListener('mousedown', (e) => {
   if (!vrSessionActive) return;
+  if (ctrlPressed || altPressed) {
+    const ctrls = xrDevice.controllers;
+    if (e.button === 0) { // LMB = trigger
+      if (ctrlPressed && ctrls.left)  ctrls.left.updateButtonValue('trigger', 1);
+      if (altPressed  && ctrls.right) ctrls.right.updateButtonValue('trigger', 1);
+    } else if (e.button === 1) { // MMB = squeeze
+      if (ctrlPressed && ctrls.left)  ctrls.left.updateButtonValue('squeeze', 1);
+      if (altPressed  && ctrls.right) ctrls.right.updateButtonValue('squeeze', 1);
+    }
+    return;
+  }
   if (e.button === 0) mouseDragging = true;
 });
 window.addEventListener('mouseup', (e) => {
   if (!vrSessionActive) return;
+  if (ctrlPressed || altPressed) {
+    const ctrls = xrDevice.controllers;
+    if (e.button === 0) {
+      if (ctrlPressed && ctrls.left)  ctrls.left.updateButtonValue('trigger', 0);
+      if (altPressed  && ctrls.right) ctrls.right.updateButtonValue('trigger', 0);
+    } else if (e.button === 1) {
+      if (ctrlPressed && ctrls.left)  ctrls.left.updateButtonValue('squeeze', 0);
+      if (altPressed  && ctrls.right) ctrls.right.updateButtonValue('squeeze', 0);
+    }
+    return;
+  }
   if (e.button === 0) mouseDragging = false;
 });
 window.addEventListener('mousemove', (e) => {
   if (!vrSessionActive) return;
+  if (ctrlPressed || altPressed) {
+    // Controller focused: mouse move = XY translation in head-local space
+    if (wsConnected && !browserDisplay) return;
+    const dx = e.movementX * 0.001;
+    const dy = -e.movementY * 0.001; // Screen Y is inverted
+    if (ctrlPressed) { ctrlOffsetLeft.x  += dx; ctrlOffsetLeft.y  += dy; }
+    if (altPressed)  { ctrlOffsetRight.x += dx; ctrlOffsetRight.y += dy; }
+    return;
+  }
   if (!mouseDragging) return;
   if (wsConnected && !browserDisplay) return; // Monado handles input
   camYaw -= e.movementX * 0.005;
@@ -198,40 +250,68 @@ window.addEventListener('wheel', (e) => {
 
 function updateCamera(time) {
   requestAnimationFrame(updateCamera);
-  if (!vrSessionActive) return; // No camera updates outside VR sessions
-  if (wsConnected && !browserDisplay) return; // Monado provides pose unless browser owns display
+  if (!vrSessionActive) return;
+  if (wsConnected && !browserDisplay) return;
 
   const now = time / 1000;
   const dt = lastTime > 0 ? Math.min(now - lastTime, 0.1) : 1 / 60;
   lastTime = now;
 
-  // Space = reset view
+  // Space = reset view + controller offsets
   if (keys['Space']) {
     camPosX = camPosY = camPosZ = 0;
     camYaw = camPitch = 0;
     zoomScale = 1.0;
-    keys['Space'] = false; // One-shot
-    return;
+    Object.assign(ctrlOffsetLeft, CTRL_OFFSET_DEFAULTS.left);
+    Object.assign(ctrlOffsetRight, CTRL_OFFSET_DEFAULTS.right);
+    keys['Space'] = false;
   }
 
-  // WASD/QE movement — direction from yaw/pitch quaternion (matches EXT app)
+  // WASD/QE movement
   const hasMovement = keys['KeyW'] || keys['KeyS'] || keys['KeyA'] ||
     keys['KeyD'] || keys['KeyE'] || keys['KeyQ'];
 
   if (hasMovement) {
-    const moveSpeed = 0.1; // m/frame-tick, matches EXT app
-    const q = quatFromYawPitch(camYaw, camPitch);
-    const fwd = quatRotateVec3(q, 0, 0, -1);
-    const rt = quatRotateVec3(q, 1, 0, 0);
-    const up = quatRotateVec3(q, 0, 1, 0);
-    const d = moveSpeed * dt;
+    const d = 0.1 * dt; // m/frame-tick
 
-    if (keys['KeyW']) { camPosX += fwd.x*d; camPosY += fwd.y*d; camPosZ += fwd.z*d; }
-    if (keys['KeyS']) { camPosX -= fwd.x*d; camPosY -= fwd.y*d; camPosZ -= fwd.z*d; }
-    if (keys['KeyD']) { camPosX += rt.x*d; camPosY += rt.y*d; camPosZ += rt.z*d; }
-    if (keys['KeyA']) { camPosX -= rt.x*d; camPosY -= rt.y*d; camPosZ -= rt.z*d; }
-    if (keys['KeyE']) { camPosX += up.x*d; camPosY += up.y*d; camPosZ += up.z*d; }
-    if (keys['KeyQ']) { camPosX -= up.x*d; camPosY -= up.y*d; camPosZ -= up.z*d; }
+    if (ctrlPressed || altPressed) {
+      // Controller focused: move controller offset in head-local space
+      const targets = [];
+      if (ctrlPressed) targets.push(ctrlOffsetLeft);
+      if (altPressed)  targets.push(ctrlOffsetRight);
+      for (const off of targets) {
+        if (keys['KeyW']) off.z -= d; // Forward = -Z
+        if (keys['KeyS']) off.z += d;
+        if (keys['KeyA']) off.x -= d;
+        if (keys['KeyD']) off.x += d;
+        if (keys['KeyE']) off.y += d;
+        if (keys['KeyQ']) off.y -= d;
+      }
+    } else {
+      // Camera movement (existing)
+      const q = quatFromYawPitch(camYaw, camPitch);
+      const fwd = quatRotateVec3(q, 0, 0, -1);
+      const rt = quatRotateVec3(q, 1, 0, 0);
+      const up = quatRotateVec3(q, 0, 1, 0);
+      if (keys['KeyW']) { camPosX += fwd.x*d; camPosY += fwd.y*d; camPosZ += fwd.z*d; }
+      if (keys['KeyS']) { camPosX -= fwd.x*d; camPosY -= fwd.y*d; camPosZ -= fwd.z*d; }
+      if (keys['KeyD']) { camPosX += rt.x*d; camPosY += rt.y*d; camPosZ += rt.z*d; }
+      if (keys['KeyA']) { camPosX -= rt.x*d; camPosY -= rt.y*d; camPosZ -= rt.z*d; }
+      if (keys['KeyE']) { camPosX += up.x*d; camPosY += up.y*d; camPosZ += up.z*d; }
+      if (keys['KeyQ']) { camPosX -= up.x*d; camPosY -= up.y*d; camPosZ -= up.z*d; }
+    }
+  }
+
+  // Update controller positions: follow head + offset rotated by head orientation
+  const headOri = quatFromYawPitch(camYaw, camPitch);
+  const headX = camPosX, headY = EYE_HEIGHT + camPosY, headZ = camPosZ;
+  const ctrls = xrDevice.controllers;
+  for (const [hand, offset] of [['left', ctrlOffsetLeft], ['right', ctrlOffsetRight]]) {
+    const ctrl = ctrls[hand];
+    if (!ctrl) continue;
+    const r = quatRotateVec3(headOri, offset.x, offset.y, offset.z);
+    ctrl.position.set(headX + r.x, headY + r.y, headZ + r.z);
+    ctrl.quaternion.set(headOri.x, headOri.y, headOri.z, headOri.w);
   }
 }
 
@@ -466,7 +546,8 @@ function handleWsMessage(jsonStr) {
       fovAngles = msg.fov;
     }
     // Controller state: [{pose, tr, sq, mn, ts, tc}, {same}] for [left, right]
-    if (msg.ctrl) {
+    // Skip when browser owns display — IWER handles controllers locally
+    if (msg.ctrl && !browserDisplay) {
       const controllers = xrDevice.controllers;
       const hands = ['left', 'right'];
       for (let i = 0; i < 2; i++) {

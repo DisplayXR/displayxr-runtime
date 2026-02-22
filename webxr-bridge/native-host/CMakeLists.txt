@@ -82,3 +82,16 @@ endif()
 # pthreads
 find_package(Threads REQUIRED)
 target_link_libraries(openxr_bridge_host PRIVATE Threads::Threads)
+
+# macOS: hidden window for XR_EXT_macos_window_binding (suppresses Monado popup)
+if(APPLE)
+    enable_language(OBJC OBJCXX)
+    target_sources(openxr_bridge_host PRIVATE bridge_window_macos.mm)
+    set_source_files_properties(bridge_window_macos.mm PROPERTIES
+        COMPILE_FLAGS "-fobjc-arc"
+    )
+    target_link_libraries(openxr_bridge_host PRIVATE
+        "-framework AppKit"
+        "-framework QuartzCore"
+    )
+endif()

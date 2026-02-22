@@ -61,6 +61,8 @@
 #include "leia/leia_types.h"
 #endif
 
+#include "sim_display_interface.h"
+
 #include "multi/comp_multi_private.h"
 
 #ifdef XRT_HAVE_LEIA_SR_VULKAN
@@ -1178,6 +1180,7 @@ oxr_session_locate_views(struct oxr_logger *log,
 	m_relation_chain_push_relation(&xrc, &T_base_xdev);
 	m_relation_chain_resolve(&xrc, &T_base_head);
 
+
 	if (print) {
 		for (uint32_t i = 0; i < view_count; i++) {
 			char tmp[32];
@@ -1904,6 +1907,14 @@ oxr_session_create(struct oxr_logger *log,
 
 	// Track whether this session has an external window handle
 	sess->has_external_window = (xsi.external_window_handle != NULL);
+
+	// Tell sim_display driver to return raw eye positions (no qwerty compose)
+	if (sess->has_external_window) {
+		struct xrt_device *head = GET_XDEV_BY_ROLE(sess->sys, head);
+		if (head != NULL && strcmp(head->str, "Sim 3D Display") == 0) {
+			sim_display_hmd_set_ext_app_mode(head, true);
+		}
+	}
 
 	// Track whether this is an AppContainer app (Chrome WebXR)
 	// Used to delay session state transitions for sandbox compatibility

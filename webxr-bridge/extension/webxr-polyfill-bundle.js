@@ -10177,6 +10177,14 @@ void main() {
   var camPosZ = 0;
   var zoomScale = 1;
   var mouseDragging = false;
+  var ctrlPressed = false;
+  var altPressed = false;
+  var ctrlOffsetLeft = { x: -0.2, y: -0.15, z: -0.3 };
+  var ctrlOffsetRight = { x: 0.2, y: -0.15, z: -0.3 };
+  var CTRL_OFFSET_DEFAULTS = {
+    left: { x: -0.2, y: -0.15, z: -0.3 },
+    right: { x: 0.2, y: -0.15, z: -0.3 }
+  };
   function quatFromYawPitch(yaw, pitch) {
     const cy = Math.cos(yaw / 2), sy = Math.sin(yaw / 2);
     const cp = Math.cos(pitch / 2), sp = Math.sin(pitch / 2);
@@ -10206,27 +10214,82 @@ void main() {
     keys[e.code] = true;
     if (e.code === "Space")
       e.preventDefault();
+    if (e.key === "Control")
+      ctrlPressed = true;
+    if (e.key === "Alt") {
+      altPressed = true;
+      e.preventDefault();
+    }
   });
   window.addEventListener("keyup", (e) => {
     if (!vrSessionActive)
       return;
     keys[e.code] = false;
+    if (e.key === "Control")
+      ctrlPressed = false;
+    if (e.key === "Alt")
+      altPressed = false;
   });
   window.addEventListener("mousedown", (e) => {
     if (!vrSessionActive)
       return;
+    if (ctrlPressed || altPressed) {
+      const ctrls = xrDevice.controllers;
+      if (e.button === 0) {
+        if (ctrlPressed && ctrls.left)
+          ctrls.left.updateButtonValue("trigger", 1);
+        if (altPressed && ctrls.right)
+          ctrls.right.updateButtonValue("trigger", 1);
+      } else if (e.button === 1) {
+        if (ctrlPressed && ctrls.left)
+          ctrls.left.updateButtonValue("squeeze", 1);
+        if (altPressed && ctrls.right)
+          ctrls.right.updateButtonValue("squeeze", 1);
+      }
+      return;
+    }
     if (e.button === 0)
       mouseDragging = true;
   });
   window.addEventListener("mouseup", (e) => {
     if (!vrSessionActive)
       return;
+    if (ctrlPressed || altPressed) {
+      const ctrls = xrDevice.controllers;
+      if (e.button === 0) {
+        if (ctrlPressed && ctrls.left)
+          ctrls.left.updateButtonValue("trigger", 0);
+        if (altPressed && ctrls.right)
+          ctrls.right.updateButtonValue("trigger", 0);
+      } else if (e.button === 1) {
+        if (ctrlPressed && ctrls.left)
+          ctrls.left.updateButtonValue("squeeze", 0);
+        if (altPressed && ctrls.right)
+          ctrls.right.updateButtonValue("squeeze", 0);
+      }
+      return;
+    }
     if (e.button === 0)
       mouseDragging = false;
   });
   window.addEventListener("mousemove", (e) => {
     if (!vrSessionActive)
       return;
+    if (ctrlPressed || altPressed) {
+      if (wsConnected && !browserDisplay)
+        return;
+      const dx = e.movementX * 1e-3;
+      const dy = -e.movementY * 1e-3;
+      if (ctrlPressed) {
+        ctrlOffsetLeft.x += dx;
+        ctrlOffsetLeft.y += dy;
+      }
+      if (altPressed) {
+        ctrlOffsetRight.x += dx;
+        ctrlOffsetRight.y += dy;
+      }
+      return;
+    }
     if (!mouseDragging)
       return;
     if (wsConnected && !browserDisplay)
@@ -10264,47 +10327,80 @@ void main() {
       camPosX = camPosY = camPosZ = 0;
       camYaw = camPitch = 0;
       zoomScale = 1;
+      Object.assign(ctrlOffsetLeft, CTRL_OFFSET_DEFAULTS.left);
+      Object.assign(ctrlOffsetRight, CTRL_OFFSET_DEFAULTS.right);
       keys["Space"] = false;
-      return;
     }
     const hasMovement = keys["KeyW"] || keys["KeyS"] || keys["KeyA"] || keys["KeyD"] || keys["KeyE"] || keys["KeyQ"];
     if (hasMovement) {
-      const moveSpeed = 0.1;
-      const q = quatFromYawPitch(camYaw, camPitch);
-      const fwd = quatRotateVec3(q, 0, 0, -1);
-      const rt = quatRotateVec3(q, 1, 0, 0);
-      const up = quatRotateVec3(q, 0, 1, 0);
-      const d = moveSpeed * dt;
-      if (keys["KeyW"]) {
-        camPosX += fwd.x * d;
-        camPosY += fwd.y * d;
-        camPosZ += fwd.z * d;
+      const d = 0.1 * dt;
+      if (ctrlPressed || altPressed) {
+        const targets = [];
+        if (ctrlPressed)
+          targets.push(ctrlOffsetLeft);
+        if (altPressed)
+          targets.push(ctrlOffsetRight);
+        for (const off of targets) {
+          if (keys["KeyW"])
+            off.z -= d;
+          if (keys["KeyS"])
+            off.z += d;
+          if (keys["KeyA"])
+            off.x -= d;
+          if (keys["KeyD"])
+            off.x += d;
+          if (keys["KeyE"])
+            off.y += d;
+          if (keys["KeyQ"])
+            off.y -= d;
+        }
+      } else {
+        const q = quatFromYawPitch(camYaw, camPitch);
+        const fwd = quatRotateVec3(q, 0, 0, -1);
+        const rt = quatRotateVec3(q, 1, 0, 0);
+        const up = quatRotateVec3(q, 0, 1, 0);
+        if (keys["KeyW"]) {
+          camPosX += fwd.x * d;
+          camPosY += fwd.y * d;
+          camPosZ += fwd.z * d;
+        }
+        if (keys["KeyS"]) {
+          camPosX -= fwd.x * d;
+          camPosY -= fwd.y * d;
+          camPosZ -= fwd.z * d;
+        }
+        if (keys["KeyD"]) {
+          camPosX += rt.x * d;
+          camPosY += rt.y * d;
+          camPosZ += rt.z * d;
+        }
+        if (keys["KeyA"]) {
+          camPosX -= rt.x * d;
+          camPosY -= rt.y * d;
+          camPosZ -= rt.z * d;
+        }
+        if (keys["KeyE"]) {
+          camPosX += up.x * d;
+          camPosY += up.y * d;
+          camPosZ += up.z * d;
+        }
+        if (keys["KeyQ"]) {
+          camPosX -= up.x * d;
+          camPosY -= up.y * d;
+          camPosZ -= up.z * d;
+        }
       }
-      if (keys["KeyS"]) {
-        camPosX -= fwd.x * d;
-        camPosY -= fwd.y * d;
-        camPosZ -= fwd.z * d;
-      }
-      if (keys["KeyD"]) {
-        camPosX += rt.x * d;
-        camPosY += rt.y * d;
-        camPosZ += rt.z * d;
-      }
-      if (keys["KeyA"]) {
-        camPosX -= rt.x * d;
-        camPosY -= rt.y * d;
-        camPosZ -= rt.z * d;
-      }
-      if (keys["KeyE"]) {
-        camPosX += up.x * d;
-        camPosY += up.y * d;
-        camPosZ += up.z * d;
-      }
-      if (keys["KeyQ"]) {
-        camPosX -= up.x * d;
-        camPosY -= up.y * d;
-        camPosZ -= up.z * d;
-      }
+    }
+    const headOri = quatFromYawPitch(camYaw, camPitch);
+    const headX = camPosX, headY = EYE_HEIGHT + camPosY, headZ = camPosZ;
+    const ctrls = xrDevice.controllers;
+    for (const [hand, offset] of [["left", ctrlOffsetLeft], ["right", ctrlOffsetRight]]) {
+      const ctrl = ctrls[hand];
+      if (!ctrl)
+        continue;
+      const r = quatRotateVec3(headOri, offset.x, offset.y, offset.z);
+      ctrl.position.set(headX + r.x, headY + r.y, headZ + r.z);
+      ctrl.quaternion.set(headOri.x, headOri.y, headOri.z, headOri.w);
     }
   }
   requestAnimationFrame(updateCamera);
@@ -10480,7 +10576,7 @@ void main() {
       if (msg.fov) {
         fovAngles = msg.fov;
       }
-      if (msg.ctrl) {
+      if (msg.ctrl && !browserDisplay) {
         const controllers = xrDevice.controllers;
         const hands = ["left", "right"];
         for (let i = 0; i < 2; i++) {

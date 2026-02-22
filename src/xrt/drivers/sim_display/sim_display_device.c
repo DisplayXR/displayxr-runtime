@@ -133,6 +133,10 @@ struct sim_display_hmd
 	//! When set, get_tracked_pose delegates to this device.
 	struct xrt_device *pose_source;
 
+	//! EXT app mode: return raw hmd->pose without qwerty compose.
+	//! Set when the session has an external window handle.
+	bool ext_app_mode;
+
 	//! Physical display dimensions in meters.
 	float display_width_m;
 	float display_height_m;
@@ -179,6 +183,18 @@ sim_display_hmd_get_tracked_pose(struct xrt_device *xdev,
 	if (name != XRT_INPUT_GENERIC_HEAD_POSE) {
 		U_LOG_E("Unknown input name: 0x%08x", name);
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+
+	// EXT app mode: return raw eye position in display space (no qwerty compose).
+	// The external app owns the virtual display model and expects raw positions.
+	if (hmd->ext_app_mode) {
+		out_relation->pose = hmd->pose;
+		out_relation->relation_flags = (enum xrt_space_relation_flags)(
+		    XRT_SPACE_RELATION_ORIENTATION_VALID_BIT |
+		    XRT_SPACE_RELATION_POSITION_VALID_BIT |
+		    XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT |
+		    XRT_SPACE_RELATION_POSITION_TRACKED_BIT);
+		return XRT_SUCCESS;
 	}
 
 	// Orbit camera model using external pose source (e.g. qwerty HMD).
@@ -302,6 +318,13 @@ sim_display_hmd_set_pose_source(struct xrt_device *sim_hmd, struct xrt_device *s
 {
 	struct sim_display_hmd *hmd = sim_display_hmd(sim_hmd);
 	hmd->pose_source = source;
+}
+
+void
+sim_display_hmd_set_ext_app_mode(struct xrt_device *xdev, bool enabled)
+{
+	struct sim_display_hmd *hmd = sim_display_hmd(xdev);
+	hmd->ext_app_mode = enabled;
 }
 
 bool

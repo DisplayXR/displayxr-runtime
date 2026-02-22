@@ -165,6 +165,21 @@ void
 sim_display_hmd_set_pose_source(struct xrt_device *sim_hmd, struct xrt_device *source);
 
 /*!
+ * Enable or disable EXT app mode for a sim_display HMD.
+ *
+ * When enabled, get_tracked_pose returns the raw hmd->pose (eye offset
+ * relative to display center) without composing with the qwerty pose source.
+ * Used when the session has an external window handle and the app owns the
+ * virtual display model.
+ *
+ * @param xdev    The sim_display HMD device.
+ * @param enabled true to enable EXT app mode.
+ * @ingroup drv_sim_display
+ */
+void
+sim_display_hmd_set_ext_app_mode(struct xrt_device *xdev, bool enabled);
+
+/*!
  * Create the simulation display system builder.
  *
  * Enabled via SIM_DISPLAY_ENABLE=1 environment variable.

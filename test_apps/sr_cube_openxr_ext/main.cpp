@@ -380,7 +380,8 @@ static void RenderOneFrame(RenderState& rs) {
                     if (g_inputState.hudVisible && xr.hasHudSwapchain && rs.hudSwapchainImages && !rs.hudSwapchainImages->empty() && rs.hudOk) {
                         uint32_t hudImageIndex;
                         if (AcquireHudSwapchainImage(xr, hudImageIndex)) {
-                            std::wstring sessionText = L"Session: ";
+                            std::wstring sessionText(xr.systemName, xr.systemName + strlen(xr.systemName));
+                            sessionText += L"\nSession: ";
                             sessionText += FormatSessionState((int)xr.sessionState);
                             std::wstring modeText = xr.hasWin32WindowBindingExt ?
                                 L"XR_EXT_win32_window_binding: ACTIVE (D3D11)" :

@@ -80,6 +80,14 @@ cmake -B "$ROOT/test_apps/sim_cube_openxr_ext_macos/build" \
   -DCMAKE_PREFIX_PATH="$OPENXR_DIR"
 cmake --build "$ROOT/test_apps/sim_cube_openxr_ext_macos/build"
 
+# Step 3c: Build WebXR bridge host
+echo "=== Building openxr_bridge_host ==="
+cmake -B "$ROOT/webxr-bridge/native-host/build" \
+  -S "$ROOT/webxr-bridge/native-host" -G Ninja \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_PREFIX_PATH="$OPENXR_DIR"
+cmake --build "$ROOT/webxr-bridge/native-host/build"
+
 # Step 4: Package artifacts (mirrors CI workflow)
 echo "=== Packaging artifacts ==="
 PKG_DIR="$ROOT/_package/SRMonado-macOS"

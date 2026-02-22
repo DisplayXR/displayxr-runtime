@@ -76,6 +76,9 @@ struct XrSessionManager {
     bool sessionRunning = false;
     bool exitRequested = false;
 
+    // System name from xrGetSystemProperties (e.g. "Leia SR", "Sim 3D Display (SBS)")
+    char systemName[XR_MAX_SYSTEM_NAME_SIZE] = {};
+
     // Extension support (used by ext app, ignored by non-ext app)
     bool hasWin32WindowBindingExt = false;
     bool hasDisplayInfoExt = false;

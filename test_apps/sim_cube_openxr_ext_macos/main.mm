@@ -1116,7 +1116,7 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
         [g_window setContentView:g_metalView];
 
         // HUD overlay (semi-transparent text overlay, positioned bottom-left)
-        NSRect hudFrame = NSMakeRect(10, 10, 420, 290);
+        NSRect hudFrame = NSMakeRect(10, 10, 420, 305);
         g_hudView = [[HudOverlayView alloc] initWithFrame:hudFrame];
         [g_metalView addSubview:g_hudView];
 
@@ -1343,6 +1343,9 @@ struct AppXrSession {
     float leftEyeX = 0, leftEyeY = 0, leftEyeZ = 0;
     float rightEyeX = 0, rightEyeY = 0, rightEyeZ = 0;
     bool eyeTrackingActive = false;
+
+    // System name from xrGetSystemProperties
+    char systemName[XR_MAX_SYSTEM_NAME_SIZE] = {};
 };
 
 static bool InitializeOpenXR(AppXrSession& xr) {
@@ -1397,6 +1400,15 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     sysInfo.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
     XR_CHECK(xrGetSystem(xr.instance, &sysInfo, &xr.systemId));
     LOG_INFO("Got system ID: %llu", (unsigned long long)xr.systemId);
+
+    // Get system name
+    {
+        XrSystemProperties sysProps = {XR_TYPE_SYSTEM_PROPERTIES};
+        if (XR_SUCCEEDED(xrGetSystemProperties(xr.instance, xr.systemId, &sysProps))) {
+            memcpy(xr.systemName, sysProps.systemName, sizeof(xr.systemName));
+            LOG_INFO("System name: %s", xr.systemName);
+        }
+    }
 
     // Query display info via XR_EXT_display_info
     if (xr.hasDisplayInfoExt) {
@@ -2261,7 +2273,8 @@ int main() {
                         ? sessionStateNames[stateIdx] : "INVALID";
 
                     NSString *text = [NSString stringWithFormat:
-                        @"Session: %s\n"
+                        @"%s\n"
+                        "Session: %s\n"
                         "XR_EXT_macos_window_binding: %s\n"
                         "Mode: %s%s  Output: %s\n"
                         "FPS: %.0f  (%.1f ms)\n"
@@ -2278,6 +2291,7 @@ int main() {
                         "WASD/QE=Move  Drag=Look  Scroll=Zoom\n"
                         "Space=Reset  V=2D/3D  1/2/3=Output\n"
                         "Tab=HUD  Cmd+Ctrl+F=Fullscreen  ESC=Quit",
+                        xr.systemName,
                         sessionStateName,
                         xr.hasMacosWindowBinding ? "ACTIVE" : "NOT AVAILABLE",
                         g_input.displayMode3D ? "3D (Stereo)" : "2D (Mono)",

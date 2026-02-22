@@ -116,6 +116,15 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     XR_CHECK_LOG(xrGetSystem(xr.instance, &systemInfo, &xr.systemId));
     LOG_INFO("System ID: %llu", (unsigned long long)xr.systemId);
 
+    // Get system name
+    {
+        XrSystemProperties sysProps = {XR_TYPE_SYSTEM_PROPERTIES};
+        if (XR_SUCCEEDED(xrGetSystemProperties(xr.instance, xr.systemId, &sysProps))) {
+            memcpy(xr.systemName, sysProps.systemName, sizeof(xr.systemName));
+            LOG_INFO("System name: %s", xr.systemName);
+        }
+    }
+
     // Query display info via XR_EXT_display_info
     if (xr.hasDisplayInfoExt) {
         XrSystemProperties sysProps = {XR_TYPE_SYSTEM_PROPERTIES};

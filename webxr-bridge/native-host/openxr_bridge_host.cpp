@@ -19,6 +19,7 @@
 #define XR_USE_GRAPHICS_API_VULKAN
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
+#include <openxr/XR_EXT_display_info.h>
 
 #include <libwebsockets.h>
 
@@ -35,6 +36,11 @@
 #include <windows.h>
 #else
 #include <unistd.h>
+#endif
+
+#ifdef __APPLE__
+#include <openxr/XR_EXT_macos_window_binding.h>
+extern "C" void* bridge_create_hidden_metal_view(uint32_t w, uint32_t h);
 #endif
 
 // ============================================================================
@@ -92,11 +98,25 @@ struct AppState {
     XrSession session = XR_NULL_HANDLE;
     XrSpace localSpace = XR_NULL_HANDLE;
     XrSpace viewSpace = XR_NULL_HANDLE;
+    XrSpace displaySpace = XR_NULL_HANDLE; // XR_EXT_display_info: display-anchored space
     XrSwapchain swapchain = XR_NULL_HANDLE;
     XrSessionState sessionState = XR_SESSION_STATE_UNKNOWN;
     XrViewConfigurationType viewConfigType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
     bool sessionRunning = false;
     bool exitRequested = false;
+    bool hasDisplayInfo = false;
+
+    // XR_EXT_display_info: physical display properties for Kooima projection
+    float displayWidthM = 0.0f;
+    float displayHeightM = 0.0f;
+    uint32_t displayPixelWidth = 0;
+    uint32_t displayPixelHeight = 0;
+    float recommendedViewScaleX = 1.0f;
+    float recommendedViewScaleY = 1.0f;
+    float nominalViewerX = 0, nominalViewerY = 0, nominalViewerZ = 0; // Nominal viewer pos in display space
+#ifdef __APPLE__
+    bool hasMacosWindowBinding = false;
+#endif
 
     uint32_t swapchainWidth = 0;
     uint32_t swapchainHeight = 0;
@@ -148,9 +168,13 @@ static bool InitializeOpenXR(AppState& app) {
     XR_CHECK(xrEnumerateInstanceExtensionProperties(nullptr, extensionCount, &extensionCount, extensions.data()));
 
     bool hasVulkan = false;
+    bool hasDisplayInfo = false;
     for (const auto& ext : extensions) {
         if (strcmp(ext.extensionName, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) == 0) {
             hasVulkan = true;
+        }
+        if (strcmp(ext.extensionName, XR_EXT_DISPLAY_INFO_EXTENSION_NAME) == 0) {
+            hasDisplayInfo = true;
         }
     }
 
@@ -159,8 +183,31 @@ static bool InitializeOpenXR(AppState& app) {
         return false;
     }
 
+#ifdef __APPLE__
+    bool hasMacosWindowBinding = false;
+    for (const auto& ext : extensions) {
+        if (strcmp(ext.extensionName, XR_EXT_MACOS_WINDOW_BINDING_EXTENSION_NAME) == 0) {
+            hasMacosWindowBinding = true;
+        }
+    }
+#endif
+
     std::vector<const char*> enabledExtensions;
     enabledExtensions.push_back(XR_KHR_VULKAN_ENABLE_EXTENSION_NAME);
+
+    if (hasDisplayInfo) {
+        enabledExtensions.push_back(XR_EXT_DISPLAY_INFO_EXTENSION_NAME);
+        app.hasDisplayInfo = true;
+        LOG_INFO("XR_EXT_display_info: available, enabling (DISPLAY space for Kooima)");
+    }
+
+#ifdef __APPLE__
+    if (hasMacosWindowBinding) {
+        enabledExtensions.push_back(XR_EXT_MACOS_WINDOW_BINDING_EXTENSION_NAME);
+        app.hasMacosWindowBinding = true;
+        LOG_INFO("XR_EXT_macos_window_binding: available, enabling");
+    }
+#endif
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
     strncpy(createInfo.applicationInfo.applicationName, "WebXRBridge",
@@ -179,6 +226,31 @@ static bool InitializeOpenXR(AppState& app) {
     XrSystemGetInfo systemInfo = {XR_TYPE_SYSTEM_GET_INFO};
     systemInfo.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
     XR_CHECK(xrGetSystem(app.instance, &systemInfo, &app.systemId));
+
+    // Query display info (XR_EXT_display_info) for physical display dimensions.
+    // Kooima projection needs the display rect to compute the asymmetric frustum.
+    if (app.hasDisplayInfo) {
+        XrSystemProperties sysProps = {XR_TYPE_SYSTEM_PROPERTIES};
+        XrDisplayInfoEXT displayInfo = {};
+        displayInfo.type = XR_TYPE_DISPLAY_INFO_EXT;
+        sysProps.next = &displayInfo;
+        if (XR_SUCCEEDED(xrGetSystemProperties(app.instance, app.systemId, &sysProps))) {
+            app.displayWidthM = displayInfo.displaySizeMeters.width;
+            app.displayHeightM = displayInfo.displaySizeMeters.height;
+            app.displayPixelWidth = displayInfo.displayPixelWidth;
+            app.displayPixelHeight = displayInfo.displayPixelHeight;
+            app.recommendedViewScaleX = displayInfo.recommendedViewScaleX;
+            app.recommendedViewScaleY = displayInfo.recommendedViewScaleY;
+            app.nominalViewerX = displayInfo.nominalViewerPositionInDisplaySpace.x;
+            app.nominalViewerY = displayInfo.nominalViewerPositionInDisplaySpace.y;
+            app.nominalViewerZ = displayInfo.nominalViewerPositionInDisplaySpace.z;
+            LOG_INFO("Display: %.3fx%.3f m, %ux%u px, viewScale=%.3fx%.3f, nominalViewer=(%.3f,%.3f,%.3f)",
+                     app.displayWidthM, app.displayHeightM,
+                     app.displayPixelWidth, app.displayPixelHeight,
+                     app.recommendedViewScaleX, app.recommendedViewScaleY,
+                     app.nominalViewerX, app.nominalViewerY, app.nominalViewerZ);
+        }
+    }
 
     uint32_t viewCount = 0;
     XR_CHECK(xrEnumerateViewConfigurationViews(app.instance, app.systemId, app.viewConfigType, 0, &viewCount, nullptr));
@@ -521,6 +593,22 @@ static bool CreateSession(AppState& app) {
     sessionInfo.next = &vkBinding;
     sessionInfo.systemId = app.systemId;
 
+#ifdef __APPLE__
+    XrMacOSWindowBindingCreateInfoEXT macosBinding = {};
+    macosBinding.type = XR_TYPE_MACOS_WINDOW_BINDING_CREATE_INFO_EXT;
+    macosBinding.next = nullptr;
+
+    if (app.hasMacosWindowBinding) {
+        // Create hidden Metal view — Monado uses per-session rendering, no popup window
+        macosBinding.viewHandle = bridge_create_hidden_metal_view(
+            app.swapchainWidth ? app.swapchainWidth : 1920,
+            app.swapchainHeight ? app.swapchainHeight : 1080);
+        vkBinding.next = &macosBinding;
+        LOG_INFO("Chaining XR_EXT_macos_window_binding with hidden NSView %p",
+                 macosBinding.viewHandle);
+    }
+#endif
+
     XR_CHECK(xrCreateSession(app.instance, &sessionInfo, &app.session));
     LOG_INFO("Session created");
     return true;
@@ -539,7 +627,24 @@ static bool CreateSpaces(AppState& app) {
     viewSpaceInfo.poseInReferenceSpace.position = {0, 0, 0};
     XR_CHECK(xrCreateReferenceSpace(app.session, &viewSpaceInfo, &app.viewSpace));
 
-    LOG_INFO("Reference spaces created (LOCAL + VIEW)");
+    // DISPLAY space (XR_EXT_display_info): physically anchored to the display.
+    // Views located in this space give display-relative eye positions needed
+    // for correct Kooima projection (matching the ext test apps exactly).
+    if (app.hasDisplayInfo) {
+        XrReferenceSpaceCreateInfo displaySpaceInfo = {XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+        displaySpaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_DISPLAY_EXT;
+        displaySpaceInfo.poseInReferenceSpace.orientation = {0, 0, 0, 1};
+        displaySpaceInfo.poseInReferenceSpace.position = {0, 0, 0};
+        XrResult dispResult = xrCreateReferenceSpace(app.session, &displaySpaceInfo, &app.displaySpace);
+        if (XR_SUCCEEDED(dispResult)) {
+            LOG_INFO("DISPLAY space created (display-relative eye positions for Kooima)");
+        } else {
+            LOG_WARN("DISPLAY space creation failed (%d), falling back to LOCAL", (int)dispResult);
+            app.displaySpace = XR_NULL_HANDLE;
+        }
+    }
+
+    LOG_INFO("Reference spaces created (LOCAL + VIEW%s)", app.displaySpace ? " + DISPLAY" : "");
     return true;
 }
 
@@ -842,11 +947,19 @@ static int ws_callback(struct lws* wsi, enum lws_callback_reasons reason,
             const char* dispMode = simDisplayOutput ? simDisplayOutput : "sbs";
             bool isBrowserDisplay = getenv("BROWSER_DISPLAY") != nullptr;
 
-            char cfg[256];
+            char cfg[640];
             int cfgLen = snprintf(cfg + LWS_PRE, sizeof(cfg) - LWS_PRE,
-                "{\"w\":%u,\"h\":%u,\"displayMode\":\"%s\",\"browserDisplay\":%s}",
+                "{\"w\":%u,\"h\":%u,\"displayMode\":\"%s\",\"browserDisplay\":%s,"
+                "\"displayWidthM\":%.6f,\"displayHeightM\":%.6f,"
+                "\"displayPixelW\":%u,\"displayPixelH\":%u,"
+                "\"viewScaleX\":%.6f,\"viewScaleY\":%.6f,"
+                "\"nominalViewer\":[%.5f,%.5f,%.5f]}",
                 g_appState->swapchainWidth, g_appState->swapchainHeight,
-                dispMode, isBrowserDisplay ? "true" : "false");
+                dispMode, isBrowserDisplay ? "true" : "false",
+                g_appState->displayWidthM, g_appState->displayHeightM,
+                g_appState->displayPixelWidth, g_appState->displayPixelHeight,
+                g_appState->recommendedViewScaleX, g_appState->recommendedViewScaleY,
+                g_appState->nominalViewerX, g_appState->nominalViewerY, g_appState->nominalViewerZ);
             lws_write(wsi, (unsigned char*)cfg + LWS_PRE, cfgLen, LWS_WRITE_TEXT);
             LOG_INFO("Sent config: %ux%u displayMode=%s browserDisplay=%s",
                      g_appState->swapchainWidth, g_appState->swapchainHeight,
@@ -1001,6 +1114,9 @@ static void Cleanup(AppState& app) {
     if (app.swapchain != XR_NULL_HANDLE) {
         xrDestroySwapchain(app.swapchain);
     }
+    if (app.displaySpace != XR_NULL_HANDLE) {
+        xrDestroySpace(app.displaySpace);
+    }
     if (app.viewSpace != XR_NULL_HANDLE) {
         xrDestroySpace(app.viewSpace);
     }
@@ -1103,7 +1219,7 @@ int main() {
     LOG_INFO("Waiting for WebSocket frames on ws://localhost:9013 ...");
 
     uint32_t frameCount = 0;
-    bool loggedFirstFrame = false;
+    bool loggedInitInfo = false;
 
     while (g_running.load() && !app.exitRequested) {
         PollEvents(app);
@@ -1126,7 +1242,7 @@ int main() {
         result = xrBeginFrame(app.session, &beginInfo);
         if (XR_FAILED(result)) continue;
 
-        // Locate views for pose data
+        // Locate views in LOCAL space (needed for xrEndFrame submission)
         XrViewLocateInfo locateInfo = {XR_TYPE_VIEW_LOCATE_INFO};
         locateInfo.viewConfigurationType = app.viewConfigType;
         locateInfo.displayTime = frameState.predictedDisplayTime;
@@ -1136,6 +1252,81 @@ int main() {
         uint32_t viewCount = 2;
         XrView views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
         xrLocateViews(app.session, &locateInfo, &viewState, 2, &viewCount, views);
+
+        // Locate views in DISPLAY space for display-relative eye positions.
+        // These are needed for correct Kooima projection in the browser
+        // (matching ext app: rawEyePos from display-space xrLocateViews).
+        XrView displayViews[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+        if (app.displaySpace != XR_NULL_HANDLE) {
+            XrViewLocateInfo dispLocateInfo = {XR_TYPE_VIEW_LOCATE_INFO};
+            dispLocateInfo.viewConfigurationType = app.viewConfigType;
+            dispLocateInfo.displayTime = frameState.predictedDisplayTime;
+            dispLocateInfo.space = app.displaySpace;
+
+            XrViewState dispViewState = {XR_TYPE_VIEW_STATE};
+            uint32_t dispViewCount = 2;
+            xrLocateViews(app.session, &dispLocateInfo, &dispViewState,
+                          2, &dispViewCount, displayViews);
+        } else {
+            // Fallback: use local-space views (Kooima will be approximate)
+            displayViews[0] = views[0];
+            displayViews[1] = views[1];
+        }
+
+        // One-time init logging: display pose, eye positions, FOV, dimensions
+        if (!loggedInitInfo) {
+            loggedInitInfo = true;
+
+            // Virtual display pose in LOCAL space
+            if (app.displaySpace != XR_NULL_HANDLE) {
+                XrSpaceLocation dispLoc = {XR_TYPE_SPACE_LOCATION};
+                if (XR_SUCCEEDED(xrLocateSpace(app.displaySpace, app.localSpace,
+                        frameState.predictedDisplayTime, &dispLoc))) {
+                    auto& dp = dispLoc.pose.position;
+                    auto& dq = dispLoc.pose.orientation;
+                    LOG_INFO("=== Virtual Display Init ===");
+                    LOG_INFO("  Display pose (LOCAL): pos=(%.4f, %.4f, %.4f) ori=(%.4f, %.4f, %.4f, %.4f)",
+                             dp.x, dp.y, dp.z, dq.x, dq.y, dq.z, dq.w);
+                }
+            }
+
+            // Raw eye positions in DISPLAY space (display-relative, for Kooima)
+            auto& ld = displayViews[0].pose.position;
+            auto& rd = displayViews[1].pose.position;
+            LOG_INFO("  Eyes (DISPLAY space): L=(%.5f, %.5f, %.5f) R=(%.5f, %.5f, %.5f)",
+                     ld.x, ld.y, ld.z, rd.x, rd.y, rd.z);
+
+            // Eye positions in LOCAL space (world coordinates)
+            auto& ll = views[0].pose.position;
+            auto& rl = views[1].pose.position;
+            LOG_INFO("  Eyes (LOCAL  space): L=(%.5f, %.5f, %.5f) R=(%.5f, %.5f, %.5f)",
+                     ll.x, ll.y, ll.z, rl.x, rl.y, rl.z);
+
+            // FOV (from LOCAL-space views, Kooima computed at driver level)
+            LOG_INFO("  FOV L: left=%.2f right=%.2f up=%.2f down=%.2f deg",
+                     views[0].fov.angleLeft * 180.0f / 3.14159f,
+                     views[0].fov.angleRight * 180.0f / 3.14159f,
+                     views[0].fov.angleUp * 180.0f / 3.14159f,
+                     views[0].fov.angleDown * 180.0f / 3.14159f);
+            LOG_INFO("  FOV R: left=%.2f right=%.2f up=%.2f down=%.2f deg",
+                     views[1].fov.angleLeft * 180.0f / 3.14159f,
+                     views[1].fov.angleRight * 180.0f / 3.14159f,
+                     views[1].fov.angleUp * 180.0f / 3.14159f,
+                     views[1].fov.angleDown * 180.0f / 3.14159f);
+
+            // Display dimensions and viewport
+            LOG_INFO("  Display: %.3fx%.3f m, %ux%u px, viewScale=%.3fx%.3f",
+                     app.displayWidthM, app.displayHeightM,
+                     app.displayPixelWidth, app.displayPixelHeight,
+                     app.recommendedViewScaleX, app.recommendedViewScaleY);
+            LOG_INFO("  Swapchain (SBS): %ux%u, viewport: %ux%u per eye",
+                     app.swapchainWidth, app.swapchainHeight,
+                     app.swapchainWidth / 2, app.swapchainHeight);
+            LOG_INFO("  Texture size (viewport * scale): %ux%u",
+                     (uint32_t)(app.swapchainWidth / 2 * app.recommendedViewScaleX),
+                     (uint32_t)(app.swapchainHeight * app.recommendedViewScaleY));
+            LOG_INFO("========================");
+        }
 
         // Sync controller actions every frame
         XrActiveActionSet activeAS = {};
@@ -1228,11 +1419,17 @@ int main() {
                 int bufSize = (int)(sizeof(g_poseBuf) - LWS_PRE);
                 int len = 0;
 
-                // Head pose + FOV
+                // Head pose (LOCAL space) + display-relative eye positions + FOV
+                // eyes: from DISPLAY-space xrLocateViews (matches ext app rawEyePos)
+                // fov: from LOCAL-space views (Kooima FOV computed at driver level)
+                auto& lep = displayViews[0].pose.position;
+                auto& rep = displayViews[1].pose.position;
                 len += snprintf(buf + len, bufSize - len,
                     "{\"pose\":[%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f],"
+                    "\"eyes\":[[%.5f,%.5f,%.5f],[%.5f,%.5f,%.5f]],"
                     "\"fov\":[[%.6f,%.6f,%.6f,%.6f],[%.6f,%.6f,%.6f,%.6f]]",
                     p.x, p.y, p.z, q.x, q.y, q.z, q.w,
+                    lep.x, lep.y, lep.z, rep.x, rep.y, rep.z,
                     views[0].fov.angleLeft, views[0].fov.angleRight,
                     views[0].fov.angleUp, views[0].fov.angleDown,
                     views[1].fov.angleLeft, views[1].fov.angleRight,
@@ -1292,12 +1489,6 @@ int main() {
 
         if (hasFrame && frameState.shouldRender) {
             framePixels = localCopy.data();
-
-            if (!loggedFirstFrame) {
-                LOG_INFO("First WebSocket frame received: %ux%u (%zu bytes)",
-                         frameW, frameH, localCopy.size());
-                loggedFirstFrame = true;
-            }
 
             uint32_t imageIndex;
             XrSwapchainImageAcquireInfo acquireInfo = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};

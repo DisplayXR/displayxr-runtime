@@ -406,7 +406,8 @@ static void RenderThreadFunc(
                             uint32_t hudImageIndex;
                             if (AcquireHudSwapchainImage(*xr, hudImageIndex)) {
                                 LOG_INFO("[FRAME] HUD: Acquired image %u", hudImageIndex);
-                                std::wstring sessionText = L"Session: ";
+                                std::wstring sessionText(xr->systemName, xr->systemName + strlen(xr->systemName));
+                                sessionText += L"\nSession: ";
                                 sessionText += FormatSessionState((int)xr->sessionState);
                                 std::wstring modeText = xr->hasWin32WindowBindingExt ?
                                     L"XR_EXT_win32_window_binding: ACTIVE (Vulkan)" :
