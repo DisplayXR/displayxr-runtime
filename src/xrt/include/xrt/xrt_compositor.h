@@ -958,6 +958,11 @@ struct xrt_session_info
 
 	//! External window handle for session target extension (HWND on Windows)
 	void *external_window_handle;
+
+	//! Readback callback for offscreen compositing (called with composited RGBA pixels)
+	void (*readback_callback)(const uint8_t *pixels, uint32_t w, uint32_t h, void *userdata);
+	//! Userdata passed to readback_callback
+	void *readback_userdata;
 };
 
 /*!

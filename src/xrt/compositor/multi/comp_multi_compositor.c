@@ -555,6 +555,11 @@ multi_compositor_begin_session(struct xrt_compositor *xc, const struct xrt_begin
 			mc->session_render.external_window_handle = mc->xsi.external_window_handle;
 			U_LOG_I("Session has external NSView %p, will use per-session rendering",
 			        mc->session_render.external_window_handle);
+		} else if (mc->xsi.readback_callback != NULL) {
+			// Offscreen readback — composited pixels delivered via callback.
+			mc->session_render.readback_callback = mc->xsi.readback_callback;
+			mc->session_render.readback_userdata = mc->xsi.readback_userdata;
+			U_LOG_I("Session has readback callback, will use offscreen rendering");
 		} else {
 			// No external view — create the runtime's window now.
 			// This runs on the main thread (xrBeginSession), which is
@@ -1372,10 +1377,15 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 		return true;
 	}
 
-	// No external window handle - use shared native compositor
-	if (mc->session_render.external_window_handle == NULL) {
+	// No external window handle or readback callback - use shared native compositor
+	if (mc->session_render.external_window_handle == NULL && mc->session_render.readback_callback == NULL) {
+		U_LOG_I("init_session_render: no window handle or readback callback, using shared compositor");
 		return false;
 	}
+
+	U_LOG_W("init_session_render: window=%p readback_callback=%p — initializing per-session rendering",
+	        mc->session_render.external_window_handle,
+	        (void *)(uintptr_t)mc->session_render.readback_callback);
 
 	// Check if target service is available
 	if (mc->msc->target_service == NULL) {
@@ -1405,10 +1415,22 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 #endif
 
 	// Create per-session comp_target using the target service
-	U_LOG_W("About to create per-session comp_target for HWND %p", mc->session_render.external_window_handle);
-	xrt_result_t ret = comp_target_service_create(mc->msc->target_service,
-	                                              mc->session_render.external_window_handle,
-	                                              &mc->session_render.target);
+	xrt_result_t ret;
+	if (mc->session_render.readback_callback != NULL) {
+		// Offscreen readback path — no window, composited pixels via callback
+		U_LOG_W("About to create offscreen readback comp_target");
+		ret = comp_target_service_create_offscreen(mc->msc->target_service,
+		                                           mc->session_render.readback_callback,
+		                                           mc->session_render.readback_userdata,
+		                                           &mc->session_render.target);
+	} else {
+		// Window path — create from external window handle
+		U_LOG_W("About to create per-session comp_target for HWND %p",
+		        mc->session_render.external_window_handle);
+		ret = comp_target_service_create(mc->msc->target_service,
+		                                 mc->session_render.external_window_handle,
+		                                 &mc->session_render.target);
+	}
 
 	U_LOG_W("comp_target_service_create returned %d, target=%p", ret, (void *)mc->session_render.target);
 

@@ -296,6 +296,59 @@ target_service_create_from_window(struct comp_target_service *service,
 }
 
 /*!
+ * Service callback: create an offscreen comp_target with readback callback.
+ * Composited pixels are read back from GPU and delivered to the callback.
+ */
+static xrt_result_t
+target_service_create_offscreen(struct comp_target_service *service,
+                                void (*callback)(const uint8_t *, uint32_t, uint32_t, void *),
+                                void *userdata,
+                                struct comp_target **out_target)
+{
+	struct comp_compositor *c = (struct comp_compositor *)service->context;
+
+	struct comp_target *ct = comp_window_offscreen_create(c, callback, userdata);
+	if (ct == NULL) {
+		COMP_ERROR(c, "Failed to create offscreen readback target");
+		return XRT_ERROR_VULKAN;
+	}
+
+	// Initialize post-Vulkan
+	if (!comp_target_init_post_vulkan(ct, c->settings.preferred.width, c->settings.preferred.height)) {
+		COMP_ERROR(c, "Failed to init post vulkan for offscreen target");
+		comp_target_destroy(&ct);
+		return XRT_ERROR_VULKAN;
+	}
+
+	// Create images — need TRANSFER_SRC for GPU readback
+	struct comp_target_create_images_info info = {
+	    .extent =
+	        {
+	            .width = ct->width ? ct->width : c->settings.preferred.width,
+	            .height = ct->height ? ct->height : c->settings.preferred.height,
+	        },
+	    .image_usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+	                   VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+	    .color_space = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
+	    .present_mode = VK_PRESENT_MODE_FIFO_KHR,
+	    .format_count = 2,
+	    .formats = {VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_R8G8B8A8_UNORM},
+	};
+
+	comp_target_create_images(ct, &info);
+
+	if (!comp_target_has_images(ct)) {
+		COMP_ERROR(c, "Failed to create images for offscreen target");
+		comp_target_destroy(&ct);
+		return XRT_ERROR_VULKAN;
+	}
+
+	COMP_INFO(c, "Created offscreen readback target (%ux%u)", ct->width, ct->height);
+	*out_target = ct;
+	return XRT_SUCCESS;
+}
+
+/*!
  * Service callback: destroy a comp_target created by this service.
  */
 static void
@@ -356,6 +409,7 @@ static void
 compositor_init_target_service(struct comp_compositor *c)
 {
 	c->target_service.create_from_window = target_service_create_from_window;
+	c->target_service.create_offscreen = target_service_create_offscreen;
 	c->target_service.destroy_target = target_service_destroy_target;
 	c->target_service.get_vk = target_service_get_vk;
 	c->target_service.init_main_target = target_service_init_main_target;

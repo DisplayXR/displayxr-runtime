@@ -2903,8 +2903,8 @@ transfer_layers_locked(struct multi_system_compositor *msc, int64_t display_time
 			continue;
 		}
 
-		// Lazily initialize per-session render resources if session has external HWND
-		// This creates the per-session comp_target and SR weaver for multi-app support
+		// Lazily initialize per-session render resources if session has external HWND or readback
+		// This creates the per-session comp_target and display processor for multi-app support
 		if (multi_compositor_has_session_render(mc) && !mc->session_render.initialized) {
 			U_LOG_W("Calling multi_compositor_init_session_render...");
 			bool init_result = multi_compositor_init_session_render(mc);
