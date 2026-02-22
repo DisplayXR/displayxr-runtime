@@ -3172,7 +3172,7 @@
   };
 
   // node_modules/iwer/lib/primitives/XRRigidTransform.js
-  var XRRigidTransform = class _XRRigidTransform {
+  var XRRigidTransform2 = class _XRRigidTransform {
     constructor(position, orientation) {
       const defaultPosition = vec3_exports.fromValues(0, 0, 0);
       const defaultOrientation = quat_exports.create();
@@ -3228,7 +3228,7 @@
     constructor(origin, direction) {
       const _origin = { x: 0, y: 0, z: 0, w: 1 };
       const _direction = { x: 0, y: 0, z: -1, w: 0 };
-      if (origin instanceof XRRigidTransform) {
+      if (origin instanceof XRRigidTransform2) {
         const transform = origin;
         const matrix = transform.matrix;
         const originVec4 = vec4_exports.set(vec4_exports.create(), _origin.x, _origin.y, _origin.z, _origin.w);
@@ -3322,7 +3322,7 @@
       return this[P_HIT_TEST].frame.getPose(this[P_HIT_TEST].offsetSpace, baseSpace);
     }
     createAnchor() {
-      return this[P_HIT_TEST].frame.createAnchor(new XRRigidTransform(), this[P_HIT_TEST].offsetSpace);
+      return this[P_HIT_TEST].frame.createAnchor(new XRRigidTransform2(), this[P_HIT_TEST].offsetSpace);
     }
   };
 
@@ -3548,7 +3548,7 @@
       mat4_exports.getTranslation(position, this[P_FRAME].tempMat4);
       const orientation = quat_exports.create();
       mat4_exports.getRotation(orientation, this[P_FRAME].tempMat4);
-      return new XRPose(new XRRigidTransform({ x: position[0], y: position[1], z: position[2], w: 1 }, {
+      return new XRPose(new XRRigidTransform2({ x: position[0], y: position[1], z: position[2], w: 1 }, {
         x: orientation[0],
         y: orientation[1],
         z: orientation[2],
@@ -9556,7 +9556,7 @@ void main() {
       globalObject["XRJointSpace"] = XRJointSpace;
       globalObject["XRView"] = XRView;
       globalObject["XRViewport"] = XRViewport;
-      globalObject["XRRigidTransform"] = XRRigidTransform;
+      globalObject["XRRigidTransform"] = XRRigidTransform2;
       globalObject["XRPose"] = XRPose;
       globalObject["XRViewerPose"] = XRViewerPose;
       globalObject["XRJointPose"] = XRJointPose;
@@ -10107,7 +10107,6 @@ void main() {
     interactionMode: "world-space",
     userAgent: navigator.userAgent
   };
-  var MOVE_SPEED = 2;
   var EYE_HEIGHT = 1.6;
   window.addEventListener("unhandledrejection", (e) => {
     console.error("MonadoXR: UNHANDLED REJECTION:", e.reason);
@@ -10146,128 +10145,375 @@ void main() {
     configurable: true,
     enumerable: true
   });
+  var vrSessionActive = false;
+  var origRequestSession = navigator.xr.requestSession.bind(navigator.xr);
+  var wrappedRequestSession = async function(mode, ...rest) {
+    const session = await origRequestSession(mode, ...rest);
+    if (mode === "immersive-vr") {
+      vrSessionActive = true;
+      console.log("MonadoXR: VR session started \u2014 IO controls enabled");
+      session.addEventListener("end", () => {
+        vrSessionActive = false;
+        mouseDragging = false;
+        console.log("MonadoXR: VR session ended \u2014 IO controls disabled");
+      });
+    }
+    return session;
+  };
+  Object.defineProperty(navigator.xr, "requestSession", {
+    get() {
+      return wrappedRequestSession;
+    },
+    set() {
+    },
+    configurable: true
+  });
   var keys = {};
-  var yaw = 0;
   var lastTime = 0;
+  var camYaw = 0;
+  var camPitch = 0;
+  var camPosX = 0;
+  var camPosY = 0;
+  var camPosZ = 0;
+  var zoomScale = 1;
+  var mouseDragging = false;
+  function quatFromYawPitch(yaw, pitch) {
+    const cy = Math.cos(yaw / 2), sy = Math.sin(yaw / 2);
+    const cp = Math.cos(pitch / 2), sp = Math.sin(pitch / 2);
+    return { x: cy * sp, y: sy * cp, z: -sy * sp, w: cy * cp };
+  }
+  function quatMultiply(a, b) {
+    return {
+      x: a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+      y: a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+      z: a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+      w: a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z
+    };
+  }
+  function quatRotateVec3(q, vx, vy, vz) {
+    const tx = 2 * (q.y * vz - q.z * vy);
+    const ty = 2 * (q.z * vx - q.x * vz);
+    const tz = 2 * (q.x * vy - q.y * vx);
+    return {
+      x: vx + q.w * tx + (q.y * tz - q.z * ty),
+      y: vy + q.w * ty + (q.z * tx - q.x * tz),
+      z: vz + q.w * tz + (q.x * ty - q.y * tx)
+    };
+  }
   window.addEventListener("keydown", (e) => {
+    if (!vrSessionActive)
+      return;
     keys[e.code] = true;
+    if (e.code === "Space")
+      e.preventDefault();
   });
   window.addEventListener("keyup", (e) => {
+    if (!vrSessionActive)
+      return;
     keys[e.code] = false;
   });
+  window.addEventListener("mousedown", (e) => {
+    if (!vrSessionActive)
+      return;
+    if (e.button === 0)
+      mouseDragging = true;
+  });
+  window.addEventListener("mouseup", (e) => {
+    if (!vrSessionActive)
+      return;
+    if (e.button === 0)
+      mouseDragging = false;
+  });
+  window.addEventListener("mousemove", (e) => {
+    if (!vrSessionActive)
+      return;
+    if (!mouseDragging)
+      return;
+    if (wsConnected && !browserDisplay)
+      return;
+    camYaw -= e.movementX * 5e-3;
+    camPitch -= e.movementY * 5e-3;
+    if (camPitch > 1.4)
+      camPitch = 1.4;
+    if (camPitch < -1.4)
+      camPitch = -1.4;
+  });
+  window.addEventListener("wheel", (e) => {
+    if (!vrSessionActive)
+      return;
+    if (wsConnected && !browserDisplay)
+      return;
+    e.preventDefault();
+    const factor = e.deltaY < 0 ? 1.1 : 1 / 1.1;
+    zoomScale *= factor;
+    if (zoomScale < 0.1)
+      zoomScale = 0.1;
+    if (zoomScale > 10)
+      zoomScale = 10;
+  }, { passive: false });
   function updateCamera(time) {
     requestAnimationFrame(updateCamera);
-    if (wsConnected)
+    if (!vrSessionActive)
+      return;
+    if (wsConnected && !browserDisplay)
       return;
     const now = time / 1e3;
     const dt = lastTime > 0 ? Math.min(now - lastTime, 0.1) : 1 / 60;
     lastTime = now;
-    const hasMovement = keys["KeyW"] || keys["KeyS"] || keys["KeyA"] || keys["KeyD"] || keys["Space"] || keys["ShiftLeft"] || keys["ArrowLeft"] || keys["ArrowRight"];
-    if (!hasMovement)
+    if (keys["Space"]) {
+      camPosX = camPosY = camPosZ = 0;
+      camYaw = camPitch = 0;
+      zoomScale = 1;
+      keys["Space"] = false;
       return;
-    const moveSpeed = MOVE_SPEED * dt;
-    if (keys["ArrowLeft"])
-      yaw += 1.5 * dt;
-    if (keys["ArrowRight"])
-      yaw -= 1.5 * dt;
-    const fwdX = -Math.sin(yaw);
-    const fwdZ = -Math.cos(yaw);
-    const rightX = Math.cos(yaw);
-    const rightZ = -Math.sin(yaw);
-    let dx = 0, dy = 0, dz = 0;
-    if (keys["KeyW"]) {
-      dx += fwdX * moveSpeed;
-      dz += fwdZ * moveSpeed;
     }
-    if (keys["KeyS"]) {
-      dx -= fwdX * moveSpeed;
-      dz -= fwdZ * moveSpeed;
+    const hasMovement = keys["KeyW"] || keys["KeyS"] || keys["KeyA"] || keys["KeyD"] || keys["KeyE"] || keys["KeyQ"];
+    if (hasMovement) {
+      const moveSpeed = 0.1;
+      const q = quatFromYawPitch(camYaw, camPitch);
+      const fwd = quatRotateVec3(q, 0, 0, -1);
+      const rt = quatRotateVec3(q, 1, 0, 0);
+      const up = quatRotateVec3(q, 0, 1, 0);
+      const d = moveSpeed * dt;
+      if (keys["KeyW"]) {
+        camPosX += fwd.x * d;
+        camPosY += fwd.y * d;
+        camPosZ += fwd.z * d;
+      }
+      if (keys["KeyS"]) {
+        camPosX -= fwd.x * d;
+        camPosY -= fwd.y * d;
+        camPosZ -= fwd.z * d;
+      }
+      if (keys["KeyD"]) {
+        camPosX += rt.x * d;
+        camPosY += rt.y * d;
+        camPosZ += rt.z * d;
+      }
+      if (keys["KeyA"]) {
+        camPosX -= rt.x * d;
+        camPosY -= rt.y * d;
+        camPosZ -= rt.z * d;
+      }
+      if (keys["KeyE"]) {
+        camPosX += up.x * d;
+        camPosY += up.y * d;
+        camPosZ += up.z * d;
+      }
+      if (keys["KeyQ"]) {
+        camPosX -= up.x * d;
+        camPosY -= up.y * d;
+        camPosZ -= up.z * d;
+      }
     }
-    if (keys["KeyD"]) {
-      dx += rightX * moveSpeed;
-      dz += rightZ * moveSpeed;
-    }
-    if (keys["KeyA"]) {
-      dx -= rightX * moveSpeed;
-      dz -= rightZ * moveSpeed;
-    }
-    if (keys["Space"])
-      dy += moveSpeed;
-    if (keys["ShiftLeft"])
-      dy -= moveSpeed;
-    const pos = xrDevice.position;
-    pos.set(pos.x + dx, pos.y + dy, pos.z + dz);
-    const halfYaw = yaw / 2;
-    xrDevice.quaternion.set(0, Math.sin(halfYaw), 0, Math.cos(halfYaw));
   }
   requestAnimationFrame(updateCamera);
-  var WS_URL = "ws://localhost:9013";
-  var BACKPRESSURE_LIMIT = 4 * 1024 * 1024;
-  var ws = null;
+  var lastCanvasWidth = 0;
+  var lastCanvasHeight = 0;
+  function checkCanvasResize() {
+    requestAnimationFrame(checkCanvasResize);
+    if (!wsConnected)
+      return;
+    const canvas = document.querySelector("canvas");
+    if (!canvas)
+      return;
+    const w = canvas.width, h = canvas.height;
+    if (w === lastCanvasWidth && h === lastCanvasHeight)
+      return;
+    lastCanvasWidth = w;
+    lastCanvasHeight = h;
+    window.postMessage({ type: "monado-ws-out", json: JSON.stringify({ resize: { w, h } }) }, "*");
+    console.log(`MonadoXR: Canvas resized to ${w}x${h}, notified bridge host`);
+  }
+  requestAnimationFrame(checkCanvasResize);
+  var displayMode = "sbs";
+  var browserDisplay = false;
+  var ppProgram = null;
+  var ppTexture = null;
+  var ppVAO = null;
+  var ppInitialized = false;
+  var PP_VERT_SRC = `#version 300 es
+in vec2 aPos;
+out vec2 vUV;
+void main() {
+    vUV = aPos * 0.5 + 0.5;
+    gl_Position = vec4(aPos, 0.0, 1.0);
+}`;
+  var PP_FRAG_SRC = `#version 300 es
+precision mediump float;
+uniform sampler2D uSBS;
+uniform int uMode; // 1=anaglyph, 2=blend
+in vec2 vUV;
+out vec4 fragColor;
+void main() {
+    vec4 left = texture(uSBS, vec2(vUV.x * 0.5, vUV.y));
+    vec4 right = texture(uSBS, vec2(vUV.x * 0.5 + 0.5, vUV.y));
+    if (uMode == 1) {
+        fragColor = vec4(left.r, right.g, right.b, 1.0);
+    } else {
+        fragColor = mix(left, right, 0.5);
+    }
+}`;
+  function initPostProcess(gl) {
+    const vs = gl.createShader(gl.VERTEX_SHADER);
+    gl.shaderSource(vs, PP_VERT_SRC);
+    gl.compileShader(vs);
+    if (!gl.getShaderParameter(vs, gl.COMPILE_STATUS)) {
+      console.error("MonadoXR: PP vertex shader error:", gl.getShaderInfoLog(vs));
+      return false;
+    }
+    const fs = gl.createShader(gl.FRAGMENT_SHADER);
+    gl.shaderSource(fs, PP_FRAG_SRC);
+    gl.compileShader(fs);
+    if (!gl.getShaderParameter(fs, gl.COMPILE_STATUS)) {
+      console.error("MonadoXR: PP fragment shader error:", gl.getShaderInfoLog(fs));
+      return false;
+    }
+    ppProgram = gl.createProgram();
+    gl.attachShader(ppProgram, vs);
+    gl.attachShader(ppProgram, fs);
+    gl.bindAttribLocation(ppProgram, 0, "aPos");
+    gl.linkProgram(ppProgram);
+    if (!gl.getProgramParameter(ppProgram, gl.LINK_STATUS)) {
+      console.error("MonadoXR: PP program link error:", gl.getProgramInfoLog(ppProgram));
+      return false;
+    }
+    gl.deleteShader(vs);
+    gl.deleteShader(fs);
+    ppVAO = gl.createVertexArray();
+    gl.bindVertexArray(ppVAO);
+    const quadBuf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+    gl.bindVertexArray(null);
+    ppTexture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, ppTexture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+    ppInitialized = true;
+    console.log("MonadoXR: Post-process shader pipeline initialized");
+    return true;
+  }
+  function applyDisplayProcessing(gl, width, height) {
+    if (!ppInitialized && !initPostProcess(gl))
+      return;
+    const modeInt = displayMode === "anaglyph" ? 1 : 2;
+    const prevProgram = gl.getParameter(gl.CURRENT_PROGRAM);
+    const prevFB = gl.getParameter(gl.FRAMEBUFFER_BINDING);
+    const prevVAO = gl.getParameter(gl.VERTEX_ARRAY_BINDING);
+    const prevActiveTexture = gl.getParameter(gl.ACTIVE_TEXTURE);
+    const prevTex2D = gl.getParameter(gl.TEXTURE_BINDING_2D);
+    const prevViewport = gl.getParameter(gl.VIEWPORT);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, ppTexture);
+    gl.copyTexImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 0, 0, width, height, 0);
+    gl.useProgram(ppProgram);
+    gl.uniform1i(gl.getUniformLocation(ppProgram, "uSBS"), 0);
+    gl.uniform1i(gl.getUniformLocation(ppProgram, "uMode"), modeInt);
+    gl.viewport(0, 0, width, height);
+    gl.bindVertexArray(ppVAO);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    gl.useProgram(prevProgram);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, prevFB);
+    gl.bindVertexArray(prevVAO);
+    gl.activeTexture(prevActiveTexture);
+    gl.bindTexture(gl.TEXTURE_2D, prevTex2D);
+    gl.viewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
+  }
   var wsConnected = false;
   var captureCanvas = null;
   var captureCtx = null;
   var captureWidth = 0;
   var captureHeight = 0;
   var fovAngles = null;
-  function connectWebSocket() {
-    ws = new WebSocket(WS_URL);
-    ws.binaryType = "arraybuffer";
-    ws.onopen = () => {
-      wsConnected = true;
-      console.log("MonadoXR: WebSocket connected to native host");
-    };
-    ws.onmessage = (evt) => {
-      if (typeof evt.data === "string") {
-        try {
-          const msg = JSON.parse(evt.data);
-          if (msg.w && msg.h) {
-            captureWidth = msg.w;
-            captureHeight = msg.h;
-            captureCanvas = null;
-            captureCtx = null;
-            console.log(`MonadoXR: Native host requested capture at ${msg.w}x${msg.h}`);
-          }
-          if (msg.pose) {
-            const [px, py, pz, qx, qy, qz, qw] = msg.pose;
-            xrDevice.position.set(px, py, pz);
-            xrDevice.quaternion.set(qx, qy, qz, qw);
-          }
-          if (msg.fov) {
-            fovAngles = msg.fov;
-          }
-          if (msg.ctrl) {
-            const controllers = xrDevice.controllers;
-            const hands = ["left", "right"];
-            for (let i = 0; i < 2; i++) {
-              const c = msg.ctrl[i];
-              const controller = controllers[hands[i]];
-              if (!c || !controller)
-                continue;
-              if (c.pose) {
-                controller.position.set(c.pose[0], c.pose[1], c.pose[2]);
-                controller.quaternion.set(c.pose[3], c.pose[4], c.pose[5], c.pose[6]);
-              }
-              controller.updateButtonValue("trigger", c.tr);
-              controller.updateButtonValue("squeeze", c.sq ? 1 : 0);
-              controller.updateButtonValue(i === 0 ? "x-button" : "a-button", c.mn ? 1 : 0);
-              controller.updateButtonValue("thumbstick", c.tc ? 1 : 0);
-              controller.updateAxes("thumbstick", c.ts[0], c.ts[1]);
-            }
-          }
-        } catch (e) {
+  var rawEyePositions = null;
+  var displayWidthM = 0;
+  var displayHeightM = 0;
+  var displayPixelW = 0;
+  var displayPixelH = 0;
+  var viewScaleX = 1;
+  var viewScaleY = 1;
+  var loggedBridgeInit = false;
+  function handleWsMessage(jsonStr) {
+    try {
+      const msg = JSON.parse(jsonStr);
+      if (msg.w && msg.h) {
+        captureWidth = msg.w;
+        captureHeight = msg.h;
+        captureCanvas = null;
+        captureCtx = null;
+        console.log(`MonadoXR: Native host requested capture at ${msg.w}x${msg.h}`);
+      }
+      if (msg.displayMode) {
+        displayMode = msg.displayMode;
+        console.log(`MonadoXR: Display mode set to ${displayMode}`);
+      }
+      if (msg.browserDisplay !== void 0) {
+        browserDisplay = msg.browserDisplay;
+        console.log(`MonadoXR: Browser display mode ${browserDisplay ? "enabled" : "disabled"}`);
+      }
+      if (msg.displayWidthM) {
+        displayWidthM = msg.displayWidthM;
+        displayHeightM = msg.displayHeightM;
+        displayPixelW = msg.displayPixelW || 0;
+        displayPixelH = msg.displayPixelH || 0;
+        viewScaleX = msg.viewScaleX || 1;
+        viewScaleY = msg.viewScaleY || 1;
+        if (msg.nominalViewer) {
+          console.log(`MonadoXR: Nominal viewer position: (${msg.nominalViewer.map((v) => v.toFixed(3)).join(", ")})`);
         }
       }
-    };
-    ws.onclose = () => {
-      wsConnected = false;
-      console.log("MonadoXR: WebSocket disconnected, reconnecting in 2s...");
-      setTimeout(connectWebSocket, 2e3);
-    };
-    ws.onerror = () => {
-    };
+      if (msg.pose && !browserDisplay) {
+        const [px, py, pz, qx, qy, qz, qw] = msg.pose;
+        xrDevice.position.set(px, py, pz);
+        xrDevice.quaternion.set(qx, qy, qz, qw);
+      }
+      if (msg.eyes) {
+        rawEyePositions = msg.eyes;
+      }
+      if (msg.fov) {
+        fovAngles = msg.fov;
+      }
+      if (msg.ctrl) {
+        const controllers = xrDevice.controllers;
+        const hands = ["left", "right"];
+        for (let i = 0; i < 2; i++) {
+          const c = msg.ctrl[i];
+          const controller = controllers[hands[i]];
+          if (!c || !controller)
+            continue;
+          if (c.pose) {
+            controller.position.set(c.pose[0], c.pose[1], c.pose[2]);
+            controller.quaternion.set(c.pose[3], c.pose[4], c.pose[5], c.pose[6]);
+          }
+          controller.updateButtonValue("trigger", c.tr);
+          controller.updateButtonValue("squeeze", c.sq ? 1 : 0);
+          controller.updateButtonValue(i === 0 ? "x-button" : "a-button", c.mn ? 1 : 0);
+          controller.updateButtonValue("thumbstick", c.tc ? 1 : 0);
+          controller.updateAxes("thumbstick", c.ts[0], c.ts[1]);
+        }
+      }
+    } catch (e) {
+    }
   }
-  connectWebSocket();
+  window.addEventListener("message", (evt) => {
+    if (evt.source !== window)
+      return;
+    if (!evt.data)
+      return;
+    if (evt.data.type === "monado-ws-in") {
+      handleWsMessage(evt.data.json);
+    } else if (evt.data.type === "monado-ws-status") {
+      wsConnected = evt.data.connected;
+      console.log(`MonadoXR: WebSocket ${wsConnected ? "connected" : "disconnected"}`);
+    }
+  });
   function fovToProjectionMatrix(angleLeft, angleRight, angleUp, angleDown, near, far) {
     const l = near * Math.tan(angleLeft);
     const r = near * Math.tan(angleRight);
@@ -10283,12 +10529,104 @@ void main() {
     m[14] = -2 * far * near / (far - near);
     return m;
   }
+  function kooimaProjectionMatrix(eyePos, screenW, screenH, near, far) {
+    let ez = eyePos[2];
+    if (ez <= 1e-3)
+      ez = 0.65;
+    const halfW = screenW / 2;
+    const halfH = screenH / 2;
+    const ex = eyePos[0], ey = eyePos[1];
+    const left = near * (-halfW - ex) / ez;
+    const right = near * (halfW - ex) / ez;
+    const bottom = near * (-halfH - ey) / ez;
+    const top = near * (halfH - ey) / ez;
+    const w = right - left, h = top - bottom;
+    const m = new Float32Array(16);
+    m[0] = 2 * near / w;
+    m[5] = 2 * near / h;
+    m[8] = (right + left) / w;
+    m[9] = (top + bottom) / h;
+    m[10] = -(far + near) / (far - near);
+    m[11] = -1;
+    m[14] = -2 * far * near / (far - near);
+    return m;
+  }
+  function computeKooimaScreenRect(canvasW, canvasH) {
+    const dispPxW = displayPixelW > 0 ? displayPixelW : captureWidth;
+    const dispPxH = displayPixelH > 0 ? displayPixelH : captureHeight;
+    const pxSizeX = displayWidthM / dispPxW;
+    const pxSizeY = displayHeightM / dispPxH;
+    const winW_m = canvasW * pxSizeX;
+    const winH_m = canvasH * pxSizeY;
+    const minDisp = Math.min(displayWidthM, displayHeightM);
+    const minWin = Math.min(winW_m, winH_m);
+    const vs = minDisp / minWin;
+    return { screenW: winW_m * vs, screenH: winH_m * vs };
+  }
   var origGetViewerPose = XRFrame.prototype.getViewerPose;
   XRFrame.prototype.getViewerPose = function(refSpace) {
     const pose = origGetViewerPose.call(this, refSpace);
-    if (pose && fovAngles) {
-      const near = this.session?.renderState?.depthNear ?? 0.1;
-      const far = this.session?.renderState?.depthFar ?? 1e3;
+    if (!pose)
+      return pose;
+    if (browserDisplay || !wsConnected) {
+      const playerOri = quatFromYawPitch(camYaw, camPitch);
+      const zs = zoomScale;
+      for (let i = 0; i < pose.views.length; i++) {
+        const view = pose.views[i];
+        const t = view.transform;
+        let localX, localY, localZ;
+        if (rawEyePositions && i < rawEyePositions.length) {
+          [localX, localY, localZ] = rawEyePositions[i];
+        } else {
+          const headPos = xrDevice.position;
+          localX = t.position.x - headPos.x;
+          localY = t.position.y - headPos.y;
+          localZ = t.position.z - headPos.z + 0.65;
+        }
+        const scaled = quatRotateVec3(playerOri, localX / zs, localY / zs, localZ / zs);
+        const worldX = scaled.x + camPosX;
+        const worldY = scaled.y + EYE_HEIGHT + camPosY;
+        const worldZ = scaled.z + camPosZ;
+        const lo = t.orientation;
+        const wo = quatMultiply(playerOri, { x: lo.x, y: lo.y, z: lo.z, w: lo.w });
+        try {
+          const newTransform = new XRRigidTransform(
+            { x: worldX, y: worldY, z: worldZ },
+            { x: wo.x, y: wo.y, z: wo.z, w: wo.w }
+          );
+          Object.defineProperty(view, "transform", {
+            value: newTransform,
+            configurable: true
+          });
+        } catch (e) {
+        }
+      }
+    }
+    const near = this.session?.renderState?.depthNear ?? 0.1;
+    const far = this.session?.renderState?.depthFar ?? 1e3;
+    if (displayWidthM > 0 && displayHeightM > 0 && rawEyePositions) {
+      const baseLayer = this.session?.renderState?.baseLayer;
+      const canvasW = baseLayer ? baseLayer.framebufferWidth : captureWidth || 1920;
+      const canvasH = baseLayer ? baseLayer.framebufferHeight : captureHeight || 1080;
+      const { screenW: fullScreenW, screenH: fullScreenH } = computeKooimaScreenRect(canvasW, canvasH);
+      const zs = zoomScale;
+      const sbsMode = displayMode === "sbs";
+      for (let i = 0; i < pose.views.length && i < rawEyePositions.length; i++) {
+        const [ex, ey, ez] = rawEyePositions[i];
+        const kooimaEye = [ex / zs, ey / zs, ez / zs];
+        const screenW = (sbsMode ? fullScreenW / 2 : fullScreenW) / zs;
+        const screenH = fullScreenH / zs;
+        const newMatrix = kooimaProjectionMatrix(kooimaEye, screenW, screenH, near, far);
+        try {
+          Object.defineProperty(pose.views[i], "projectionMatrix", {
+            value: newMatrix,
+            configurable: true
+          });
+        } catch (e) {
+          pose.views[i].projectionMatrix = newMatrix;
+        }
+      }
+    } else if (fovAngles) {
       for (let i = 0; i < pose.views.length && i < fovAngles.length; i++) {
         const [aL, aR, aU, aD] = fovAngles[i];
         const newMatrix = fovToProjectionMatrix(aL, aR, aU, aD, near, far);
@@ -10302,15 +10640,50 @@ void main() {
         }
       }
     }
+    if (!loggedBridgeInit && rawEyePositions && displayWidthM > 0) {
+      loggedBridgeInit = true;
+      const baseLayer = this.session?.renderState?.baseLayer;
+      const vpW = baseLayer ? baseLayer.framebufferWidth : captureWidth || 0;
+      const vpH = baseLayer ? baseLayer.framebufferHeight : captureHeight || 0;
+      const texW = Math.round(vpW * viewScaleX);
+      const texH = Math.round(vpH * viewScaleY);
+      const sbsMode = displayMode === "sbs";
+      const { screenW: fullSW, screenH: fullSH } = computeKooimaScreenRect(vpW, vpH);
+      const screenW = sbsMode ? fullSW / 2 : fullSW;
+      console.log("=== MonadoXR Bridge Init ===");
+      console.log(`  Display pose: pos=(0, ${EYE_HEIGHT}, 0) ori=(0, 0, 0, 1)`);
+      console.log(`  Display: ${displayWidthM.toFixed(4)}x${displayHeightM.toFixed(4)} m, ${displayPixelW}x${displayPixelH} px`);
+      console.log(`  viewScale: ${viewScaleX.toFixed(3)}x${viewScaleY.toFixed(3)}`);
+      console.log(`  Raw eyes (DISPLAY frame): L=(${rawEyePositions[0].map((v) => v.toFixed(5)).join(", ")}) R=(${rawEyePositions[1].map((v) => v.toFixed(5)).join(", ")})`);
+      for (let i = 0; i < pose.views.length; i++) {
+        const t = pose.views[i].transform;
+        const side = i === 0 ? "L" : "R";
+        console.log(`  Eye ${side} (world): pos=(${t.position.x.toFixed(5)}, ${t.position.y.toFixed(5)}, ${t.position.z.toFixed(5)})`);
+      }
+      console.log(`  Viewport: ${vpW}x${vpH}, texture: ${texW}x${texH} (viewport * viewScale)`);
+      console.log(`  Kooima screen rect: ${screenW.toFixed(4)}x${fullSH.toFixed(4)} m (${sbsMode ? "SBS half" : "full"} width)`);
+      console.log(`  displayMode: ${displayMode}, browserDisplay: ${browserDisplay}`);
+      console.log("============================");
+    }
     return pose;
   };
   var origRAF = XRSession.prototype.requestAnimationFrame;
   XRSession.prototype.requestAnimationFrame = function(callback) {
     return origRAF.call(this, (time, frame) => {
       callback(time, frame);
-      if (!wsConnected || !ws || ws.readyState !== WebSocket.OPEN)
+      if (displayMode !== "sbs" && displayMode !== "none") {
+        const baseLayer2 = this.renderState?.baseLayer;
+        if (baseLayer2) {
+          const gl = baseLayer2.context;
+          const glCanvas2 = gl?.canvas;
+          if (gl && glCanvas2) {
+            applyDisplayProcessing(gl, glCanvas2.width, glCanvas2.height);
+          }
+        }
+      }
+      if (browserDisplay)
         return;
-      if (ws.bufferedAmount > BACKPRESSURE_LIMIT)
+      if (!wsConnected)
         return;
       const baseLayer = this.renderState?.baseLayer;
       if (!baseLayer)
@@ -10336,10 +10709,10 @@ void main() {
       const packet = new Uint8Array(8 + imageData.data.length);
       packet.set(new Uint8Array(header), 0);
       packet.set(imageData.data, 8);
-      ws.send(packet.buffer);
+      window.postMessage({ type: "monado-ws-out", binary: packet.buffer }, "*", [packet.buffer]);
     });
   };
-  console.log("Monado WebXR Bridge: iwer runtime installed, stereo SBS active, frame capture enabled");
+  console.log("Monado WebXR Bridge: iwer runtime installed, stereo SBS active, display processing ready");
 })();
 /*! Bundled license information:
 

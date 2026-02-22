@@ -1,7 +1,8 @@
 // Monado WebXR Bridge — Entry point
 // Uses Meta's IWER (Immersive Web Emulation Runtime) to provide a complete
 // WebXR implementation. Overrides Chrome's native navigator.xr (which doesn't
-// support immersive-vr on macOS). WASD keyboard controls for camera movement.
+// support immersive-vr on macOS). Camera controls match EXT test apps:
+// mouse drag = look, WASD = move, Q/E = up/down, scroll = zoom, space = reset.
 
 import { XRDevice } from 'iwer';
 import { metaQuestTouchPlus } from 'iwer/lib/device/configs/controller/meta.js';
@@ -23,7 +24,6 @@ const MONADO_CONFIG = {
   userAgent: navigator.userAgent,
 };
 
-const MOVE_SPEED = 2.0;   // m/s
 const EYE_HEIGHT = 1.6;   // meters
 
 // --- Setup ---
@@ -75,54 +75,191 @@ Object.defineProperty(window, 'XRWebGLLayer', {
   enumerable: true,
 });
 
-// --- WASD Camera Controls ---
+// --- VR Session Lifecycle ---
+// Track whether an immersive VR session is active so IO interception
+// (keyboard, mouse, scroll) only fires during a session.
+let vrSessionActive = false;
+
+const origRequestSession = navigator.xr.requestSession.bind(navigator.xr);
+const wrappedRequestSession = async function(mode, ...rest) {
+  const session = await origRequestSession(mode, ...rest);
+  if (mode === 'immersive-vr') {
+    vrSessionActive = true;
+    console.log('MonadoXR: VR session started — IO controls enabled');
+    session.addEventListener('end', () => {
+      vrSessionActive = false;
+      mouseDragging = false;
+      console.log('MonadoXR: VR session ended — IO controls disabled');
+    });
+  }
+  return session;
+};
+
+// Re-protect requestSession after our override (same pattern as above)
+Object.defineProperty(navigator.xr, 'requestSession', {
+  get() { return wrappedRequestSession; },
+  set() {},
+  configurable: true,
+});
+
+// --- Camera Controls (matches EXT app: test_apps/sim_cube_openxr_ext_macos) ---
+// Mouse drag = look, WASD = move, Q/E = up/down, Scroll = zoom, Space = reset
 
 const keys = {};
-let yaw = 0;
 let lastTime = 0;
 
-window.addEventListener('keydown', (e) => { keys[e.code] = true; });
-window.addEventListener('keyup', (e) => { keys[e.code] = false; });
+// Camera state (ported from InputState in EXT apps)
+let camYaw = 0;
+let camPitch = 0;
+let camPosX = 0, camPosY = 0, camPosZ = 0;
+let zoomScale = 1.0;
+
+// Mouse drag state
+let mouseDragging = false;
+
+// Quaternion from yaw/pitch (matches EXT app quat_from_yaw_pitch)
+function quatFromYawPitch(yaw, pitch) {
+  const cy = Math.cos(yaw / 2), sy = Math.sin(yaw / 2);
+  const cp = Math.cos(pitch / 2), sp = Math.sin(pitch / 2);
+  return { x: cy * sp, y: sy * cp, z: -sy * sp, w: cy * cp };
+}
+
+// Hamilton product: a * b (matches EXT app quat_multiply)
+function quatMultiply(a, b) {
+  return {
+    x: a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+    y: a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+    z: a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+    w: a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
+  };
+}
+
+// Rotate vec3 by quaternion: v' = q * v * q^-1
+function quatRotateVec3(q, vx, vy, vz) {
+  const tx = 2 * (q.y * vz - q.z * vy);
+  const ty = 2 * (q.z * vx - q.x * vz);
+  const tz = 2 * (q.x * vy - q.y * vx);
+  return {
+    x: vx + q.w * tx + (q.y * tz - q.z * ty),
+    y: vy + q.w * ty + (q.z * tx - q.x * tz),
+    z: vz + q.w * tz + (q.x * ty - q.y * tx),
+  };
+}
+
+// iwer device stays at fixed neutral position (set once at init, line 42).
+// All view transforms are computed in getViewerPose from:
+//   1. rawEyePositions (from xrLocateViews via bridge host)
+//   2. virtual display pose (camPos + camYaw/camPitch from WASD/mouse)
+// iwer is just the WebXR API shim — we bypass its eye positioning entirely.
+// IPD will be controlled by modifying rawEyePositions directly (not iwer's IPD setter).
+
+window.addEventListener('keydown', (e) => {
+  if (!vrSessionActive) return;
+  keys[e.code] = true;
+  if (e.code === 'Space') e.preventDefault(); // Prevent page scroll
+});
+window.addEventListener('keyup', (e) => {
+  if (!vrSessionActive) return;
+  keys[e.code] = false;
+});
+
+// Mouse drag for yaw/pitch rotation
+window.addEventListener('mousedown', (e) => {
+  if (!vrSessionActive) return;
+  if (e.button === 0) mouseDragging = true;
+});
+window.addEventListener('mouseup', (e) => {
+  if (!vrSessionActive) return;
+  if (e.button === 0) mouseDragging = false;
+});
+window.addEventListener('mousemove', (e) => {
+  if (!vrSessionActive) return;
+  if (!mouseDragging) return;
+  if (wsConnected && !browserDisplay) return; // Monado handles input
+  camYaw -= e.movementX * 0.005;
+  camPitch -= e.movementY * 0.005;
+  if (camPitch > 1.4) camPitch = 1.4;
+  if (camPitch < -1.4) camPitch = -1.4;
+});
+
+// Scroll wheel for display-centric zoom (matches EXT app)
+// zoomScale divides both eye positions and screen dimensions in Kooima math.
+// Currently cancels (same ratio), but kept explicit for upcoming
+// baseline/parallax/perspective modifiers.
+window.addEventListener('wheel', (e) => {
+  if (!vrSessionActive) return; // Don't intercept scroll outside VR sessions
+  if (wsConnected && !browserDisplay) return; // Monado handles input
+  e.preventDefault();
+  const factor = e.deltaY < 0 ? 1.1 : (1.0 / 1.1);
+  zoomScale *= factor;
+  if (zoomScale < 0.1) zoomScale = 0.1;
+  if (zoomScale > 10.0) zoomScale = 10.0;
+}, { passive: false });
 
 function updateCamera(time) {
   requestAnimationFrame(updateCamera);
-  if (wsConnected) return; // Monado provides all pose data via bridge
+  if (!vrSessionActive) return; // No camera updates outside VR sessions
+  if (wsConnected && !browserDisplay) return; // Monado provides pose unless browser owns display
 
   const now = time / 1000;
   const dt = lastTime > 0 ? Math.min(now - lastTime, 0.1) : 1 / 60;
   lastTime = now;
 
+  // Space = reset view
+  if (keys['Space']) {
+    camPosX = camPosY = camPosZ = 0;
+    camYaw = camPitch = 0;
+    zoomScale = 1.0;
+    keys['Space'] = false; // One-shot
+    return;
+  }
+
+  // WASD/QE movement — direction from yaw/pitch quaternion (matches EXT app)
   const hasMovement = keys['KeyW'] || keys['KeyS'] || keys['KeyA'] ||
-    keys['KeyD'] || keys['Space'] || keys['ShiftLeft'] ||
-    keys['ArrowLeft'] || keys['ArrowRight'];
-  if (!hasMovement) return;
+    keys['KeyD'] || keys['KeyE'] || keys['KeyQ'];
 
-  const moveSpeed = MOVE_SPEED * dt;
+  if (hasMovement) {
+    const moveSpeed = 0.1; // m/frame-tick, matches EXT app
+    const q = quatFromYawPitch(camYaw, camPitch);
+    const fwd = quatRotateVec3(q, 0, 0, -1);
+    const rt = quatRotateVec3(q, 1, 0, 0);
+    const up = quatRotateVec3(q, 0, 1, 0);
+    const d = moveSpeed * dt;
 
-  if (keys['ArrowLeft']) yaw += 1.5 * dt;
-  if (keys['ArrowRight']) yaw -= 1.5 * dt;
-
-  const fwdX = -Math.sin(yaw);
-  const fwdZ = -Math.cos(yaw);
-  const rightX = Math.cos(yaw);
-  const rightZ = -Math.sin(yaw);
-
-  let dx = 0, dy = 0, dz = 0;
-  if (keys['KeyW']) { dx += fwdX * moveSpeed; dz += fwdZ * moveSpeed; }
-  if (keys['KeyS']) { dx -= fwdX * moveSpeed; dz -= fwdZ * moveSpeed; }
-  if (keys['KeyD']) { dx += rightX * moveSpeed; dz += rightZ * moveSpeed; }
-  if (keys['KeyA']) { dx -= rightX * moveSpeed; dz -= rightZ * moveSpeed; }
-  if (keys['Space']) dy += moveSpeed;
-  if (keys['ShiftLeft']) dy -= moveSpeed;
-
-  const pos = xrDevice.position;
-  pos.set(pos.x + dx, pos.y + dy, pos.z + dz);
-
-  const halfYaw = yaw / 2;
-  xrDevice.quaternion.set(0, Math.sin(halfYaw), 0, Math.cos(halfYaw));
+    if (keys['KeyW']) { camPosX += fwd.x*d; camPosY += fwd.y*d; camPosZ += fwd.z*d; }
+    if (keys['KeyS']) { camPosX -= fwd.x*d; camPosY -= fwd.y*d; camPosZ -= fwd.z*d; }
+    if (keys['KeyD']) { camPosX += rt.x*d; camPosY += rt.y*d; camPosZ += rt.z*d; }
+    if (keys['KeyA']) { camPosX -= rt.x*d; camPosY -= rt.y*d; camPosZ -= rt.z*d; }
+    if (keys['KeyE']) { camPosX += up.x*d; camPosY += up.y*d; camPosZ += up.z*d; }
+    if (keys['KeyQ']) { camPosX -= up.x*d; camPosY -= up.y*d; camPosZ -= up.z*d; }
+  }
 }
 
 requestAnimationFrame(updateCamera);
+
+// --- Canvas Resize Handling ---
+// Send viewport dimensions to bridge host when canvas size changes,
+// so it can adjust swapchain/FOV like EXT apps do on window resize.
+
+let lastCanvasWidth = 0, lastCanvasHeight = 0;
+
+function checkCanvasResize() {
+  requestAnimationFrame(checkCanvasResize);
+  if (!wsConnected) return;
+
+  // Find the active WebGL canvas
+  const canvas = document.querySelector('canvas');
+  if (!canvas) return;
+  const w = canvas.width, h = canvas.height;
+  if (w === lastCanvasWidth && h === lastCanvasHeight) return;
+  lastCanvasWidth = w;
+  lastCanvasHeight = h;
+
+  window.postMessage({ type: 'monado-ws-out', json: JSON.stringify({ resize: { w, h } }) }, '*');
+  console.log(`MonadoXR: Canvas resized to ${w}x${h}, notified bridge host`);
+}
+
+requestAnimationFrame(checkCanvasResize);
 
 // --- Display Mode State ---
 // 'sbs' = side-by-side (no post-process), 'anaglyph' = red-cyan, 'blend' = 50% mix
@@ -258,10 +395,6 @@ function applyDisplayProcessing(gl, width, height) {
 // Sends stereo SBS frames to the native OpenXR bridge host via WebSocket.
 // Protocol: [uint32 width][uint32 height][RGBA pixels]
 
-const WS_URL = 'ws://localhost:9013';
-const BACKPRESSURE_LIMIT = 4 * 1024 * 1024; // 4MB
-
-let ws = null;
 let wsConnected = false;
 let captureCanvas = null;
 let captureCtx = null;
@@ -270,86 +403,104 @@ let captureWidth = 0;
 let captureHeight = 0;
 // Per-eye Kooima FOV from OpenXR runtime — [[angleL,angleR,angleU,angleD], [same for right eye]]
 let fovAngles = null;
+// Raw per-eye positions from xrLocateViews — [[x,y,z], [x,y,z]]
+// These are in display-local space (relative to display center).
+let rawEyePositions = null;
+// Physical display dimensions from XR_EXT_display_info (for Kooima projection)
+let displayWidthM = 0;
+let displayHeightM = 0;
+let displayPixelW = 0;
+let displayPixelH = 0;
+let viewScaleX = 1.0;
+let viewScaleY = 1.0;
+let loggedBridgeInit = false;
 
-function connectWebSocket() {
-  ws = new WebSocket(WS_URL);
-  ws.binaryType = 'arraybuffer';
+// --- WebSocket relay via isolated-world content script ---
+// The content script (ISOLATED world) owns the WebSocket and is exempt from
+// page CSP. We communicate via window.postMessage.
 
-  ws.onopen = () => {
-    wsConnected = true;
-    console.log('MonadoXR: WebSocket connected to native host');
-  };
-
-  ws.onmessage = (evt) => {
-    // Text messages are JSON from native host
-    if (typeof evt.data === 'string') {
-      try {
-        const msg = JSON.parse(evt.data);
-        // Config message: swapchain dimensions + display mode
-        if (msg.w && msg.h) {
-          captureWidth = msg.w;
-          captureHeight = msg.h;
-          captureCanvas = null;
-          captureCtx = null;
-          console.log(`MonadoXR: Native host requested capture at ${msg.w}x${msg.h}`);
-        }
-        if (msg.displayMode) {
-          displayMode = msg.displayMode;
-          console.log(`MonadoXR: Display mode set to ${displayMode}`);
-        }
-        if (msg.browserDisplay !== undefined) {
-          browserDisplay = msg.browserDisplay;
-          console.log(`MonadoXR: Browser display mode ${browserDisplay ? 'enabled' : 'disabled'}`);
-        }
-        // Pose message: [px, py, pz, qx, qy, qz, qw]
-        if (msg.pose) {
-          const [px, py, pz, qx, qy, qz, qw] = msg.pose;
-          xrDevice.position.set(px, py, pz);
-          xrDevice.quaternion.set(qx, qy, qz, qw);
-        }
-        // Per-eye FOV from Kooima projection: [[angleL,angleR,angleU,angleD],[...]]
-        if (msg.fov) {
-          fovAngles = msg.fov;
-        }
-        // Controller state: [{pose, tr, sq, mn, ts, tc}, {same}] for [left, right]
-        if (msg.ctrl) {
-          const controllers = xrDevice.controllers;
-          const hands = ['left', 'right'];
-          for (let i = 0; i < 2; i++) {
-            const c = msg.ctrl[i];
-            const controller = controllers[hands[i]];
-            if (!c || !controller) continue;
-
-            // Grip pose
-            if (c.pose) {
-              controller.position.set(c.pose[0], c.pose[1], c.pose[2]);
-              controller.quaternion.set(c.pose[3], c.pose[4], c.pose[5], c.pose[6]);
-            }
-            // Buttons
-            controller.updateButtonValue('trigger', c.tr);
-            controller.updateButtonValue('squeeze', c.sq ? 1 : 0);
-            controller.updateButtonValue(i === 0 ? 'x-button' : 'a-button', c.mn ? 1 : 0);
-            controller.updateButtonValue('thumbstick', c.tc ? 1 : 0);
-            // Thumbstick axes
-            controller.updateAxes('thumbstick', c.ts[0], c.ts[1]);
-          }
-        }
-      } catch (e) { /* ignore non-JSON */ }
+function handleWsMessage(jsonStr) {
+  try {
+    const msg = JSON.parse(jsonStr);
+    // Config message: swapchain dimensions + display mode
+    if (msg.w && msg.h) {
+      captureWidth = msg.w;
+      captureHeight = msg.h;
+      captureCanvas = null;
+      captureCtx = null;
+      console.log(`MonadoXR: Native host requested capture at ${msg.w}x${msg.h}`);
     }
-  };
+    if (msg.displayMode) {
+      displayMode = msg.displayMode;
+      console.log(`MonadoXR: Display mode set to ${displayMode}`);
+    }
+    if (msg.browserDisplay !== undefined) {
+      browserDisplay = msg.browserDisplay;
+      console.log(`MonadoXR: Browser display mode ${browserDisplay ? 'enabled' : 'disabled'}`);
+    }
+    // Physical display dimensions for Kooima projection
+    if (msg.displayWidthM) {
+      displayWidthM = msg.displayWidthM;
+      displayHeightM = msg.displayHeightM;
+      displayPixelW = msg.displayPixelW || 0;
+      displayPixelH = msg.displayPixelH || 0;
+      viewScaleX = msg.viewScaleX || 1.0;
+      viewScaleY = msg.viewScaleY || 1.0;
+      if (msg.nominalViewer) {
+        console.log(`MonadoXR: Nominal viewer position: (${msg.nominalViewer.map(v => v.toFixed(3)).join(', ')})`);
+      }
+    }
+    // Pose message: [px, py, pz, qx, qy, qz, qw]
+    // Skip when browser owns display — WASD controls pose locally
+    if (msg.pose && !browserDisplay) {
+      const [px, py, pz, qx, qy, qz, qw] = msg.pose;
+      xrDevice.position.set(px, py, pz);
+      xrDevice.quaternion.set(qx, qy, qz, qw);
+    }
+    // Per-eye positions from xrLocateViews (display-space): [[x,y,z],[x,y,z]]
+    if (msg.eyes) {
+      rawEyePositions = msg.eyes;
+    }
+    // Per-eye FOV from Kooima projection: [[angleL,angleR,angleU,angleD],[...]]
+    if (msg.fov) {
+      fovAngles = msg.fov;
+    }
+    // Controller state: [{pose, tr, sq, mn, ts, tc}, {same}] for [left, right]
+    if (msg.ctrl) {
+      const controllers = xrDevice.controllers;
+      const hands = ['left', 'right'];
+      for (let i = 0; i < 2; i++) {
+        const c = msg.ctrl[i];
+        const controller = controllers[hands[i]];
+        if (!c || !controller) continue;
 
-  ws.onclose = () => {
-    wsConnected = false;
-    console.log('MonadoXR: WebSocket disconnected, reconnecting in 2s...');
-    setTimeout(connectWebSocket, 2000);
-  };
-
-  ws.onerror = () => {
-    // onclose will fire after this, triggering reconnect
-  };
+        // Grip pose
+        if (c.pose) {
+          controller.position.set(c.pose[0], c.pose[1], c.pose[2]);
+          controller.quaternion.set(c.pose[3], c.pose[4], c.pose[5], c.pose[6]);
+        }
+        // Buttons
+        controller.updateButtonValue('trigger', c.tr);
+        controller.updateButtonValue('squeeze', c.sq ? 1 : 0);
+        controller.updateButtonValue(i === 0 ? 'x-button' : 'a-button', c.mn ? 1 : 0);
+        controller.updateButtonValue('thumbstick', c.tc ? 1 : 0);
+        // Thumbstick axes
+        controller.updateAxes('thumbstick', c.ts[0], c.ts[1]);
+      }
+    }
+  } catch (e) { /* ignore non-JSON */ }
 }
 
-connectWebSocket();
+window.addEventListener('message', (evt) => {
+  if (evt.source !== window) return;
+  if (!evt.data) return;
+  if (evt.data.type === 'monado-ws-in') {
+    handleWsMessage(evt.data.json);
+  } else if (evt.data.type === 'monado-ws-status') {
+    wsConnected = evt.data.connected;
+    console.log(`MonadoXR: WebSocket ${wsConnected ? 'connected' : 'disconnected'}`);
+  }
+});
 
 // Build a column-major 4x4 perspective matrix from OpenXR FOV angles (radians)
 function fovToProjectionMatrix(angleLeft, angleRight, angleUp, angleDown, near, far) {
@@ -368,26 +519,183 @@ function fovToProjectionMatrix(angleLeft, angleRight, angleUp, angleDown, near, 
   return m;
 }
 
-// Override projection matrices with Kooima FOV from the OpenXR runtime
+// Kooima off-axis perspective projection (matches ext app mat4_kooima_projection).
+// eyePos: display-relative eye position [x,y,z] from DISPLAY-space xrLocateViews.
+// screenW, screenH: virtual display rect in meters (after viewport scaling).
+function kooimaProjectionMatrix(eyePos, screenW, screenH, near, far) {
+  let ez = eyePos[2];
+  if (ez <= 0.001) ez = 0.65;
+  const halfW = screenW / 2;
+  const halfH = screenH / 2;
+  const ex = eyePos[0], ey = eyePos[1];
+
+  // Asymmetric frustum bounds from eye offset relative to screen center
+  const left   = near * (-halfW - ex) / ez;
+  const right  = near * ( halfW - ex) / ez;
+  const bottom = near * (-halfH - ey) / ez;
+  const top    = near * ( halfH - ey) / ez;
+  const w = right - left, h = top - bottom;
+
+  const m = new Float32Array(16);
+  m[0]  = 2 * near / w;
+  m[5]  = 2 * near / h;
+  m[8]  = (right + left) / w;
+  m[9]  = (top + bottom) / h;
+  m[10] = -(far + near) / (far - near);
+  m[11] = -1;
+  m[14] = -2 * far * near / (far - near);
+  return m;
+}
+
+// Compute Kooima screen rect from display dimensions and canvas size.
+// Matches ext app viewport-scaling logic: convert window pixels to meters,
+// then apply isotropic scale so FOV stays consistent across window sizes.
+function computeKooimaScreenRect(canvasW, canvasH) {
+  const dispPxW = displayPixelW > 0 ? displayPixelW : captureWidth;
+  const dispPxH = displayPixelH > 0 ? displayPixelH : captureHeight;
+  const pxSizeX = displayWidthM / dispPxW;
+  const pxSizeY = displayHeightM / dispPxH;
+  const winW_m = canvasW * pxSizeX;
+  const winH_m = canvasH * pxSizeY;
+  const minDisp = Math.min(displayWidthM, displayHeightM);
+  const minWin  = Math.min(winW_m, winH_m);
+  const vs = minDisp / minWin;
+  return { screenW: winW_m * vs, screenH: winH_m * vs };
+}
+
+// Override view poses and projection matrices.
+// Display-centric transform (matches EXT apps exactly):
+//   localEyePos = raw eye position from xrLocateViews (display-space)
+//   worldPos = rotate(localEyePos / zoomScale, playerOri) + cameraPos
+//   worldOri = playerOri * localOri
+// Rotation pivots around the display center (origin), not the eyes.
+// zoomScale divides both eye positions and screen dims in Kooima (cancels
+// for now, kept explicit for upcoming baseline/parallax/perspective modifiers).
 const origGetViewerPose = XRFrame.prototype.getViewerPose;
 XRFrame.prototype.getViewerPose = function(refSpace) {
   const pose = origGetViewerPose.call(this, refSpace);
-  if (pose && fovAngles) {
-    const near = this.session?.renderState?.depthNear ?? 0.1;
-    const far = this.session?.renderState?.depthFar ?? 1000;
+  if (!pose) return pose;
+
+  // Apply display-centric transform when browser handles input
+  if (browserDisplay || !wsConnected) {
+    const playerOri = quatFromYawPitch(camYaw, camPitch);
+    const zs = zoomScale;
+
+    for (let i = 0; i < pose.views.length; i++) {
+      const view = pose.views[i];
+      const t = view.transform;
+
+      // Display-space eye position from xrLocateViews (via bridge host).
+      // Includes viewer Z distance from display, IPD offsets, etc.
+      // Future: IPD will be controlled by modifying rawEyePositions directly.
+      let localX, localY, localZ;
+      if (rawEyePositions && i < rawEyePositions.length) {
+        [localX, localY, localZ] = rawEyePositions[i];
+      } else {
+        // Standalone fallback (no bridge host): use iwer offsets + default 0.65m viewer distance
+        const headPos = xrDevice.position;
+        localX = t.position.x - headPos.x;
+        localY = t.position.y - headPos.y;
+        localZ = (t.position.z - headPos.z) + 0.65;
+      }
+
+      // Scale by 1/zoomScale, rotate by player orientation, translate
+      // (matches EXT app: worldPos = rotate(eyePos/zs, playerOri) + cameraPos)
+      const scaled = quatRotateVec3(playerOri, localX / zs, localY / zs, localZ / zs);
+      const worldX = scaled.x + camPosX;
+      const worldY = scaled.y + EYE_HEIGHT + camPosY;
+      const worldZ = scaled.z + camPosZ;
+
+      // worldOri = playerOri * localOri (compose rotation)
+      const lo = t.orientation;
+      const wo = quatMultiply(playerOri, { x: lo.x, y: lo.y, z: lo.z, w: lo.w });
+
+      try {
+        const newTransform = new XRRigidTransform(
+          { x: worldX, y: worldY, z: worldZ },
+          { x: wo.x, y: wo.y, z: wo.z, w: wo.w });
+        Object.defineProperty(view, 'transform', {
+          value: newTransform, configurable: true });
+      } catch (e) { /* fallback: view unchanged */ }
+    }
+  }
+
+  // Override projection with Kooima asymmetric frustum.
+  // When display dimensions are available, compute Kooima directly from
+  // display-relative eye positions + display rect (matches ext app exactly).
+  // Falls back to runtime FOV angles if display info unavailable.
+  const near = this.session?.renderState?.depthNear ?? 0.1;
+  const far = this.session?.renderState?.depthFar ?? 1000;
+
+  if (displayWidthM > 0 && displayHeightM > 0 && rawEyePositions) {
+    // Get canvas dimensions for viewport scaling
+    const baseLayer = this.session?.renderState?.baseLayer;
+    const canvasW = baseLayer ? baseLayer.framebufferWidth : (captureWidth || 1920);
+    const canvasH = baseLayer ? baseLayer.framebufferHeight : (captureHeight || 1080);
+
+    const { screenW: fullScreenW, screenH: fullScreenH } = computeKooimaScreenRect(canvasW, canvasH);
+    const zs = zoomScale;
+    // SBS mode: each eye sees half the display width
+    const sbsMode = displayMode === 'sbs';
+
+    for (let i = 0; i < pose.views.length && i < rawEyePositions.length; i++) {
+      const [ex, ey, ez] = rawEyePositions[i];
+      const kooimaEye = [ex / zs, ey / zs, ez / zs];
+      const screenW = (sbsMode ? fullScreenW / 2 : fullScreenW) / zs;
+      const screenH = fullScreenH / zs;
+      const newMatrix = kooimaProjectionMatrix(kooimaEye, screenW, screenH, near, far);
+      try {
+        Object.defineProperty(pose.views[i], 'projectionMatrix', {
+          value: newMatrix, configurable: true });
+      } catch (e) {
+        pose.views[i].projectionMatrix = newMatrix;
+      }
+    }
+  } else if (fovAngles) {
+    // Fallback: use runtime FOV angles
     for (let i = 0; i < pose.views.length && i < fovAngles.length; i++) {
       const [aL, aR, aU, aD] = fovAngles[i];
       const newMatrix = fovToProjectionMatrix(aL, aR, aU, aD, near, far);
       try {
         Object.defineProperty(pose.views[i], 'projectionMatrix', {
-          value: newMatrix,
-          configurable: true,
-        });
+          value: newMatrix, configurable: true });
       } catch (e) {
         pose.views[i].projectionMatrix = newMatrix;
       }
     }
   }
+
+  // One-time init logging: all relevant display/projection variables
+  if (!loggedBridgeInit && rawEyePositions && displayWidthM > 0) {
+    loggedBridgeInit = true;
+    const baseLayer = this.session?.renderState?.baseLayer;
+    const vpW = baseLayer ? baseLayer.framebufferWidth : (captureWidth || 0);
+    const vpH = baseLayer ? baseLayer.framebufferHeight : (captureHeight || 0);
+    const texW = Math.round(vpW * viewScaleX);
+    const texH = Math.round(vpH * viewScaleY);
+    const sbsMode = displayMode === 'sbs';
+    const { screenW: fullSW, screenH: fullSH } = computeKooimaScreenRect(vpW, vpH);
+    const screenW = sbsMode ? fullSW / 2 : fullSW;
+
+    console.log('=== MonadoXR Bridge Init ===');
+    console.log(`  Display pose: pos=(0, ${EYE_HEIGHT}, 0) ori=(0, 0, 0, 1)`);
+    console.log(`  Display: ${displayWidthM.toFixed(4)}x${displayHeightM.toFixed(4)} m, ${displayPixelW}x${displayPixelH} px`);
+    console.log(`  viewScale: ${viewScaleX.toFixed(3)}x${viewScaleY.toFixed(3)}`);
+    console.log(`  Raw eyes (DISPLAY frame): L=(${rawEyePositions[0].map(v => v.toFixed(5)).join(', ')}) R=(${rawEyePositions[1].map(v => v.toFixed(5)).join(', ')})`);
+
+    // World-space eyes for each view
+    for (let i = 0; i < pose.views.length; i++) {
+      const t = pose.views[i].transform;
+      const side = i === 0 ? 'L' : 'R';
+      console.log(`  Eye ${side} (world): pos=(${t.position.x.toFixed(5)}, ${t.position.y.toFixed(5)}, ${t.position.z.toFixed(5)})`);
+    }
+
+    console.log(`  Viewport: ${vpW}x${vpH}, texture: ${texW}x${texH} (viewport * viewScale)`);
+    console.log(`  Kooima screen rect: ${screenW.toFixed(4)}x${fullSH.toFixed(4)} m (${sbsMode ? 'SBS half' : 'full'} width)`);
+    console.log(`  displayMode: ${displayMode}, browserDisplay: ${browserDisplay}`);
+    console.log('============================');
+  }
+
   return pose;
 };
 
@@ -413,9 +721,8 @@ XRSession.prototype.requestAnimationFrame = function(callback) {
     // Skip frame capture if browser handles display
     if (browserDisplay) return;
 
-    // Then capture the result and send to native host
-    if (!wsConnected || !ws || ws.readyState !== WebSocket.OPEN) return;
-    if (ws.bufferedAmount > BACKPRESSURE_LIMIT) return;
+    // Then capture the result and send to native host via content script relay
+    if (!wsConnected) return;
 
     // Find the WebGL canvas (the one iwer renders SBS content to)
     const baseLayer = this.renderState?.baseLayer;
@@ -453,7 +760,8 @@ XRSession.prototype.requestAnimationFrame = function(callback) {
     packet.set(new Uint8Array(header), 0);
     packet.set(imageData.data, 8);
 
-    ws.send(packet.buffer);
+    // Transfer binary to content script (zero-copy via transferable)
+    window.postMessage({ type: 'monado-ws-out', binary: packet.buffer }, '*', [packet.buffer]);
   });
 };
 
