@@ -130,9 +130,12 @@ if(APPLE)
 	if(XRT_BUILD_DRIVER_QWERTY AND TARGET drv_qwerty)
 		target_link_libraries(st_oxr PRIVATE drv_qwerty drv_qwerty_includes)
 	endif()
-	if(TARGET drv_sim_display)
-		target_link_libraries(st_oxr PRIVATE drv_sim_display drv_sim_display_includes)
-	endif()
+endif()
+
+# sim_display includes + library needed on all platforms for ext_app_mode
+# (oxr_session.c calls sim_display_hmd_set_ext_app_mode)
+if(TARGET drv_sim_display)
+	target_link_libraries(st_oxr PRIVATE drv_sim_display drv_sim_display_includes)
 endif()
 
 if(WIN32 AND XRT_HAVE_OPENGL)

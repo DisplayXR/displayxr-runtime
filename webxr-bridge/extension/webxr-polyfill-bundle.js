@@ -10509,12 +10509,24 @@ void main() {
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, ppTexture);
     gl.copyTexImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 0, 0, width, height, 0);
+    const prevDepthTest = gl.isEnabled(gl.DEPTH_TEST);
+    const prevStencilTest = gl.isEnabled(gl.STENCIL_TEST);
+    const prevBlend = gl.isEnabled(gl.BLEND);
+    gl.disable(gl.DEPTH_TEST);
+    gl.disable(gl.STENCIL_TEST);
+    gl.disable(gl.BLEND);
     gl.useProgram(ppProgram);
     gl.uniform1i(gl.getUniformLocation(ppProgram, "uSBS"), 0);
     gl.uniform1i(gl.getUniformLocation(ppProgram, "uMode"), modeInt);
     gl.viewport(0, 0, width, height);
     gl.bindVertexArray(ppVAO);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    if (prevDepthTest)
+      gl.enable(gl.DEPTH_TEST);
+    if (prevStencilTest)
+      gl.enable(gl.STENCIL_TEST);
+    if (prevBlend)
+      gl.enable(gl.BLEND);
     gl.useProgram(prevProgram);
     gl.bindFramebuffer(gl.FRAMEBUFFER, prevFB);
     gl.bindVertexArray(prevVAO);
