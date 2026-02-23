@@ -8,7 +8,12 @@
 #include "gl_renderer.h"
 #include "logging.h"
 #include <cmath>
+#include <cstddef>
 #include <vector>
+
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+#include <string>
 
 using namespace DirectX;
 
@@ -17,20 +22,50 @@ static const char* g_cubeVertSrc = R"(
 #version 330 core
 layout(location = 0) in vec3 aPosition;
 layout(location = 1) in vec4 aColor;
+layout(location = 2) in vec2 aUV;
+layout(location = 3) in vec3 aNormal;
+layout(location = 4) in vec3 aTangent;
 uniform mat4 uTransform;
-out vec4 vColor;
+uniform mat4 uModel;
+out vec2 vUV;
+out vec3 vWorldNormal;
+out vec3 vWorldTangent;
 void main() {
     gl_Position = uTransform * vec4(aPosition, 1.0);
-    vColor = aColor;
+    vUV = aUV;
+    mat3 normalMat = mat3(uModel);
+    vWorldNormal = normalMat * aNormal;
+    vWorldTangent = normalMat * aTangent;
 }
 )";
 
 static const char* g_cubeFragSrc = R"(
 #version 330 core
-in vec4 vColor;
+uniform sampler2D basecolorTex;
+uniform sampler2D normalTex;
+uniform sampler2D aoTex;
+uniform int useTextures;
+in vec2 vUV;
+in vec3 vWorldNormal;
+in vec3 vWorldTangent;
 out vec4 FragColor;
 void main() {
-    FragColor = vColor;
+    if (useTextures == 0) {
+        FragColor = vec4(1.0);
+        return;
+    }
+    vec3 basecolor = texture(basecolorTex, vUV).rgb;
+    vec3 normalMap = texture(normalTex, vUV).rgb;
+    float ao = texture(aoTex, vUV).r;
+    vec3 N = normalize(vWorldNormal);
+    vec3 T = normalize(vWorldTangent);
+    T = normalize(T - dot(T, N) * N);
+    vec3 B = cross(N, T);
+    mat3 TBN = mat3(T, B, N);
+    vec3 mappedNormal = normalize(TBN * (normalMap * 2.0 - 1.0));
+    vec3 lightDir = normalize(vec3(0.3, 0.8, 0.5));
+    float diffuse = max(dot(mappedNormal, lightDir), 0.0) * 0.7 + 0.3;
+    FragColor = vec4(basecolor * ao * diffuse, 1.0);
 }
 )";
 
@@ -53,7 +88,7 @@ void main() {
 }
 )";
 
-struct CubeVertex { float pos[3]; float color[4]; };
+struct CubeVertex { float pos[3]; float color[4]; float uv[2]; float normal[3]; float tangent[3]; };
 struct GridVertex { float pos[3]; };
 
 static GLuint CompileShader(GLenum type, const char* source) {
@@ -101,29 +136,51 @@ bool InitializeGLRenderer(GLRenderer& renderer) {
     renderer.cubeProgram = CreateProgram(g_cubeVertSrc, g_cubeFragSrc);
     if (!renderer.cubeProgram) return false;
 
+    // Set texture sampler uniforms
+    glUseProgram_(renderer.cubeProgram);
+    GLint basecolorLoc = glGetUniformLocation_(renderer.cubeProgram, "basecolorTex");
+    GLint normalLoc = glGetUniformLocation_(renderer.cubeProgram, "normalTex");
+    GLint aoLoc = glGetUniformLocation_(renderer.cubeProgram, "aoTex");
+    if (basecolorLoc >= 0) glUniform1i_(basecolorLoc, 0);
+    if (normalLoc >= 0) glUniform1i_(normalLoc, 1);
+    if (aoLoc >= 0) glUniform1i_(aoLoc, 2);
+    glUseProgram_(0);
+
     renderer.gridProgram = CreateProgram(g_gridVertSrc, g_gridFragSrc);
     if (!renderer.gridProgram) return false;
 
-    // Cube geometry (same vertex data as D3D11 version)
+    // Cube geometry with UVs, normals, tangents
     CubeVertex cubeVerts[] = {
-        // Front (red)
-        {{-0.5f,-0.5f,-0.5f},{1,0,0,1}}, {{-0.5f,0.5f,-0.5f},{1,0,0,1}},
-        {{0.5f,0.5f,-0.5f},{1,0,0,1}},   {{0.5f,-0.5f,-0.5f},{1,0,0,1}},
-        // Back (green)
-        {{-0.5f,-0.5f,0.5f},{0,1,0,1}},  {{0.5f,-0.5f,0.5f},{0,1,0,1}},
-        {{0.5f,0.5f,0.5f},{0,1,0,1}},    {{-0.5f,0.5f,0.5f},{0,1,0,1}},
-        // Top (blue)
-        {{-0.5f,0.5f,-0.5f},{0,0,1,1}},  {{-0.5f,0.5f,0.5f},{0,0,1,1}},
-        {{0.5f,0.5f,0.5f},{0,0,1,1}},    {{0.5f,0.5f,-0.5f},{0,0,1,1}},
-        // Bottom (yellow)
-        {{-0.5f,-0.5f,-0.5f},{1,1,0,1}}, {{0.5f,-0.5f,-0.5f},{1,1,0,1}},
-        {{0.5f,-0.5f,0.5f},{1,1,0,1}},   {{-0.5f,-0.5f,0.5f},{1,1,0,1}},
-        // Left (magenta)
-        {{-0.5f,-0.5f,0.5f},{1,0,1,1}},  {{-0.5f,0.5f,0.5f},{1,0,1,1}},
-        {{-0.5f,0.5f,-0.5f},{1,0,1,1}},  {{-0.5f,-0.5f,-0.5f},{1,0,1,1}},
-        // Right (cyan)
-        {{0.5f,-0.5f,-0.5f},{0,1,1,1}},  {{0.5f,0.5f,-0.5f},{0,1,1,1}},
-        {{0.5f,0.5f,0.5f},{0,1,1,1}},    {{0.5f,-0.5f,0.5f},{0,1,1,1}},
+        // Front face (-Z): normal (0,0,-1), tangent (1,0,0)
+        {{-0.5f,-0.5f,-0.5f},{1,1,1,1},{0,1},{0,0,-1},{1,0,0}},
+        {{-0.5f, 0.5f,-0.5f},{1,1,1,1},{0,0},{0,0,-1},{1,0,0}},
+        {{ 0.5f, 0.5f,-0.5f},{1,1,1,1},{1,0},{0,0,-1},{1,0,0}},
+        {{ 0.5f,-0.5f,-0.5f},{1,1,1,1},{1,1},{0,0,-1},{1,0,0}},
+        // Back face (+Z): normal (0,0,1), tangent (-1,0,0)
+        {{-0.5f,-0.5f, 0.5f},{1,1,1,1},{1,1},{0,0,1},{-1,0,0}},
+        {{ 0.5f,-0.5f, 0.5f},{1,1,1,1},{0,1},{0,0,1},{-1,0,0}},
+        {{ 0.5f, 0.5f, 0.5f},{1,1,1,1},{0,0},{0,0,1},{-1,0,0}},
+        {{-0.5f, 0.5f, 0.5f},{1,1,1,1},{1,0},{0,0,1},{-1,0,0}},
+        // Top face (+Y): normal (0,1,0), tangent (1,0,0)
+        {{-0.5f, 0.5f,-0.5f},{1,1,1,1},{0,1},{0,1,0},{1,0,0}},
+        {{-0.5f, 0.5f, 0.5f},{1,1,1,1},{0,0},{0,1,0},{1,0,0}},
+        {{ 0.5f, 0.5f, 0.5f},{1,1,1,1},{1,0},{0,1,0},{1,0,0}},
+        {{ 0.5f, 0.5f,-0.5f},{1,1,1,1},{1,1},{0,1,0},{1,0,0}},
+        // Bottom face (-Y): normal (0,-1,0), tangent (1,0,0)
+        {{-0.5f,-0.5f,-0.5f},{1,1,1,1},{0,0},{0,-1,0},{1,0,0}},
+        {{ 0.5f,-0.5f,-0.5f},{1,1,1,1},{1,0},{0,-1,0},{1,0,0}},
+        {{ 0.5f,-0.5f, 0.5f},{1,1,1,1},{1,1},{0,-1,0},{1,0,0}},
+        {{-0.5f,-0.5f, 0.5f},{1,1,1,1},{0,1},{0,-1,0},{1,0,0}},
+        // Left face (-X): normal (-1,0,0), tangent (0,0,-1)
+        {{-0.5f,-0.5f, 0.5f},{1,1,1,1},{0,1},{-1,0,0},{0,0,-1}},
+        {{-0.5f, 0.5f, 0.5f},{1,1,1,1},{0,0},{-1,0,0},{0,0,-1}},
+        {{-0.5f, 0.5f,-0.5f},{1,1,1,1},{1,0},{-1,0,0},{0,0,-1}},
+        {{-0.5f,-0.5f,-0.5f},{1,1,1,1},{1,1},{-1,0,0},{0,0,-1}},
+        // Right face (+X): normal (1,0,0), tangent (0,0,1)
+        {{ 0.5f,-0.5f,-0.5f},{1,1,1,1},{0,1},{1,0,0},{0,0,1}},
+        {{ 0.5f, 0.5f,-0.5f},{1,1,1,1},{0,0},{1,0,0},{0,0,1}},
+        {{ 0.5f, 0.5f, 0.5f},{1,1,1,1},{1,0},{1,0,0},{0,0,1}},
+        {{ 0.5f,-0.5f, 0.5f},{1,1,1,1},{1,1},{1,0,0},{0,0,1}},
     };
 
     unsigned short cubeIndices[] = {
@@ -143,11 +200,66 @@ bool InitializeGLRenderer(GLRenderer& renderer) {
     glBufferData_(GL_ELEMENT_ARRAY_BUFFER, sizeof(cubeIndices), cubeIndices, GL_STATIC_DRAW);
 
     glEnableVertexAttribArray_(0);
-    glVertexAttribPointer_(0, 3, GL_FLOAT, GL_FALSE, sizeof(CubeVertex), (void*)0);
+    glVertexAttribPointer_(0, 3, GL_FLOAT, GL_FALSE, sizeof(CubeVertex), (void*)offsetof(CubeVertex, pos));
     glEnableVertexAttribArray_(1);
-    glVertexAttribPointer_(1, 4, GL_FLOAT, GL_FALSE, sizeof(CubeVertex), (void*)(3 * sizeof(float)));
+    glVertexAttribPointer_(1, 4, GL_FLOAT, GL_FALSE, sizeof(CubeVertex), (void*)offsetof(CubeVertex, color));
+    glEnableVertexAttribArray_(2);
+    glVertexAttribPointer_(2, 2, GL_FLOAT, GL_FALSE, sizeof(CubeVertex), (void*)offsetof(CubeVertex, uv));
+    glEnableVertexAttribArray_(3);
+    glVertexAttribPointer_(3, 3, GL_FLOAT, GL_FALSE, sizeof(CubeVertex), (void*)offsetof(CubeVertex, normal));
+    glEnableVertexAttribArray_(4);
+    glVertexAttribPointer_(4, 3, GL_FLOAT, GL_FALSE, sizeof(CubeVertex), (void*)offsetof(CubeVertex, tangent));
 
     glBindVertexArray_(0);
+
+    // Load textures
+    {
+        char exePath[MAX_PATH];
+        GetModuleFileNameA(NULL, exePath, MAX_PATH);
+        std::string exeDir(exePath);
+        exeDir = exeDir.substr(0, exeDir.find_last_of("\\/") + 1);
+        std::string texDir = exeDir + "textures/";
+
+        const char* texFiles[3] = {
+            "Wood_Crate_001_basecolor.jpg",
+            "Wood_Crate_001_normal.jpg",
+            "Wood_Crate_001_ambientOcclusion.jpg",
+        };
+
+        // Fallback data: white for basecolor/AO, flat blue for normal
+        unsigned char whitePixel[4] = {255, 255, 255, 255};
+        unsigned char normalPixel[4] = {128, 128, 255, 255};
+
+        glGenTextures(3, renderer.textures);
+
+        for (int i = 0; i < 3; i++) {
+            glBindTexture(GL_TEXTURE_2D, renderer.textures[i]);
+
+            std::string path = texDir + texFiles[i];
+            int w, h, channels;
+            unsigned char* pixels = stbi_load(path.c_str(), &w, &h, &channels, 4);
+
+            if (pixels) {
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+                glGenerateMipmap_(GL_TEXTURE_2D);
+                stbi_image_free(pixels);
+                LOG_INFO("Loaded texture: %s (%dx%d)", texFiles[i], w, h);
+            } else {
+                // Fallback 1x1 texture
+                unsigned char* fallback = (i == 1) ? normalPixel : whitePixel;
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, fallback);
+                LOG_INFO("Using fallback texture for %s", texFiles[i]);
+            }
+
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+        }
+
+        glBindTexture(GL_TEXTURE_2D, 0);
+        renderer.texturesLoaded = true;
+    }
 
     // Grid geometry
     const int gridSize = 10;
@@ -268,8 +380,31 @@ void RenderScene(
         glUseProgram_(renderer.cubeProgram);
         SetMatrix(renderer.cubeProgram, "uTransform", cubeWVP);
 
+        XMMATRIX cubeModel = cubeRot * cubeScale;
+        SetMatrix(renderer.cubeProgram, "uModel", cubeModel);
+
+        // Bind textures
+        if (renderer.texturesLoaded) {
+            GLint useLoc = glGetUniformLocation_(renderer.cubeProgram, "useTextures");
+            if (useLoc >= 0) glUniform1i_(useLoc, 1);
+            for (int i = 0; i < 3; i++) {
+                glActiveTexture_(GL_TEXTURE0 + i);
+                glBindTexture(GL_TEXTURE_2D, renderer.textures[i]);
+            }
+        } else {
+            GLint useLoc = glGetUniformLocation_(renderer.cubeProgram, "useTextures");
+            if (useLoc >= 0) glUniform1i_(useLoc, 0);
+        }
+
         glBindVertexArray_(renderer.cubeVAO);
         glDrawElements(GL_TRIANGLES, 36, GL_UNSIGNED_SHORT, 0);
+
+        // Unbind textures
+        for (int i = 0; i < 3; i++) {
+            glActiveTexture_(GL_TEXTURE0 + i);
+            glBindTexture(GL_TEXTURE_2D, 0);
+        }
+        glActiveTexture_(GL_TEXTURE0);
     }
 
     // Draw grid
@@ -295,6 +430,11 @@ void RenderScene(
 }
 
 void CleanupGLRenderer(GLRenderer& renderer) {
+    if (renderer.textures[0]) {
+        glDeleteTextures(3, renderer.textures);
+        renderer.textures[0] = renderer.textures[1] = renderer.textures[2] = 0;
+    }
+
     if (!renderer.fbos.empty()) {
         glDeleteFramebuffers_((GLsizei)renderer.fbos.size(), renderer.fbos.data());
         renderer.fbos.clear();

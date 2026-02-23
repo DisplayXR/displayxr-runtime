@@ -56,6 +56,8 @@ std::wstring FormatEyeTrackingInfo(float lx, float ly, float lz, float rx, float
 std::wstring FormatParallaxInfo(bool parallaxEnabled, float eyePosX, float eyePosY);
 std::wstring FormatOutputMode(int outputMode);
 std::wstring FormatCameraInfo(float cameraPosX, float cameraPosY, float cameraPosZ,
-    float forwardX, float forwardY, float forwardZ, float zoom);
+    float forwardX, float forwardY, float forwardZ);
+std::wstring FormatStereoParams(float ipdFactor, float parallaxFactor,
+    float perspectiveFactor, float scaleFactor);
 std::wstring FormatScaleInfo(float scaleX, float scaleY);
 std::wstring FormatHelpText();

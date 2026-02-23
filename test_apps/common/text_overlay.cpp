@@ -241,12 +241,20 @@ std::wstring FormatOutputMode(int outputMode) {
 }
 
 std::wstring FormatCameraInfo(float cameraPosX, float cameraPosY, float cameraPosZ,
-    float forwardX, float forwardY, float forwardZ, float zoom) {
+    float forwardX, float forwardY, float forwardZ) {
     std::wostringstream oss;
     oss << std::fixed << std::setprecision(2);
     oss << L"Virtual Display: (" << cameraPosX << L", " << cameraPosY << L", " << cameraPosZ << L")\n";
-    oss << L"Forward: (" << forwardX << L", " << forwardY << L", " << forwardZ << L")\n";
-    oss << L"Zoom: " << zoom << L"x";
+    oss << L"Forward: (" << forwardX << L", " << forwardY << L", " << forwardZ << L")";
+    return oss.str();
+}
+
+std::wstring FormatStereoParams(float ipdFactor, float parallaxFactor,
+    float perspectiveFactor, float scaleFactor) {
+    std::wostringstream oss;
+    oss << std::fixed << std::setprecision(2);
+    oss << L"IPD: " << ipdFactor << L"  Parallax: " << parallaxFactor << L"\n";
+    oss << L"Persp: " << perspectiveFactor << L"  Scale: " << scaleFactor;
     return oss.str();
 }
 
@@ -258,7 +266,7 @@ std::wstring FormatScaleInfo(float scaleX, float scaleY) {
 }
 
 std::wstring FormatHelpText() {
-    return L"WASD/QE=Move  Drag=Look  Scroll=Zoom\n"
-           L"Space=Reset  V=2D/3D  1/2/3=Output\n"
-           L"Tab=HUD  F11=Fullscreen  ESC=Quit";
+    return L"WASD/QE=Move  Drag=Look  Space=Reset\n"
+           L"Scroll=Scale  Shift=IPD  Ctrl=Parallax  Alt=Persp\n"
+           L"V=2D/3D  1/2/3=Output  Tab=HUD  F11=Full  ESC=Quit";
 }

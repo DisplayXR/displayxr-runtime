@@ -52,7 +52,10 @@ endif()
 
 add_executable(sim_cube_openxr_ext_macos main.mm)
 
-target_include_directories(sim_cube_openxr_ext_macos PRIVATE ${OPENXR_INCLUDE_DIR})
+target_include_directories(sim_cube_openxr_ext_macos PRIVATE
+    ${OPENXR_INCLUDE_DIR}
+    "${CMAKE_SOURCE_DIR}/../common"
+)
 
 target_link_libraries(sim_cube_openxr_ext_macos PRIVATE
     OpenXR::openxr_loader
@@ -62,4 +65,12 @@ target_link_libraries(sim_cube_openxr_ext_macos PRIVATE
     "-framework CoreGraphics"
     "-framework CoreText"
     "-framework CoreFoundation"
+)
+
+# Copy texture files to build output directory
+file(GLOB TEXTURE_FILES "${CMAKE_SOURCE_DIR}/../common/textures/*.jpg")
+add_custom_command(TARGET sim_cube_openxr_ext_macos POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:sim_cube_openxr_ext_macos>/textures"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${TEXTURE_FILES} "$<TARGET_FILE_DIR:sim_cube_openxr_ext_macos>/textures/"
+    COMMENT "Copying texture files to build output"
 )

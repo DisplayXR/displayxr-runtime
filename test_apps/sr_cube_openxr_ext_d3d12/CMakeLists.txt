@@ -109,6 +109,16 @@ if(TARGET OpenXR::openxr_loader)
     endif()
 endif()
 
+# Copy texture files to build output directory
+file(GLOB TEXTURE_FILES "${CMAKE_CURRENT_SOURCE_DIR}/../common/textures/*.jpg")
+if(TEXTURE_FILES)
+    add_custom_command(TARGET sr_cube_openxr_ext_d3d12 POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:sr_cube_openxr_ext_d3d12>/textures"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${TEXTURE_FILES} "$<TARGET_FILE_DIR:sr_cube_openxr_ext_d3d12>/textures/"
+        COMMENT "Copying texture files to build output"
+    )
+endif()
+
 # Copy bundled SimulatedRealityVulkanBeta.dll to output directory
 # (temporary: bundled until the SR SDK stabilizes and ships this DLL)
 set(VK_WEAVER_DLL "${CMAKE_CURRENT_SOURCE_DIR}/../common/SimulatedRealityVulkanBeta.dll")

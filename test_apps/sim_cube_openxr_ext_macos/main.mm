@@ -41,6 +41,11 @@
 #include <mach-o/dyld.h>
 #include <unistd.h>
 
+#include "stereo_params.h"
+
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+
 // ============================================================================
 // Logging
 // ============================================================================
@@ -86,8 +91,8 @@ struct InputState {
     // View reset
     bool resetViewRequested = false;
 
-    // Scroll zoom
-    float zoomScale = 1.0f;
+    // Stereo camera parameters (IPD, parallax, perspective, scale/zoom)
+    StereoParams stereo;
 
     // HUD toggle (Tab)
     bool hudVisible = true;
@@ -419,11 +424,224 @@ static const uint32_t gridFragSpv[] = {
     0x0000000b,0x0003003e,0x00000009,0x0000000c,0x000100fd,0x00010038,
 };
 
+// Textured cube vertex shader: push constants (MVP + model), outputs UV/normal/tangent
+static const uint32_t cubeTexturedVertSpv[] = {
+    0x07230203,0x00010000,0x0008000b,0x00000043,0x00000000,0x00020011,
+    0x00000001,0x0006000b,0x00000001,0x4c534c47,0x6474732e,0x3035342e,
+    0x00000000,0x0003000e,0x00000000,0x00000001,0x000e000f,0x00000000,
+    0x00000004,0x6e69616d,0x00000000,0x0000000d,0x00000019,0x00000025,
+    0x00000027,0x00000037,0x00000039,0x0000003c,0x0000003e,0x00000042,
+    0x00030003,0x00000002,0x000001c2,0x00040005,0x00000004,0x6e69616d,
+    0x00000000,0x00060005,0x0000000b,0x505f6c67,0x65567265,0x78657472,
+    0x00000000,0x00060006,0x0000000b,0x00000000,0x505f6c67,0x7469736f,
+    0x006e6f69,0x00070006,0x0000000b,0x00000001,0x505f6c67,0x746e696f,
+    0x657a6953,0x00000000,0x00070006,0x0000000b,0x00000002,0x435f6c67,
+    0x4470696c,0x61747369,0x0065636e,0x00070006,0x0000000b,0x00000003,
+    0x435f6c67,0x446c6c75,0x61747369,0x0065636e,0x00030005,0x0000000d,
+    0x00000000,0x00060005,0x00000011,0x68737550,0x736e6f43,0x746e6174,
+    0x00000073,0x00040006,0x00000011,0x00000000,0x0070766d,0x00050006,
+    0x00000011,0x00000001,0x65646f6d,0x0000006c,0x00030005,0x00000013,
+    0x00000000,0x00050005,0x00000019,0x6f506e69,0x69746973,0x00006e6f,
+    0x00040005,0x00000025,0x67617266,0x00005655,0x00040005,0x00000027,
+    0x56556e69,0x00000000,0x00050005,0x0000002b,0x6d726f6e,0x614d6c61,
+    0x00000074,0x00060005,0x00000037,0x67617266,0x6c726f57,0x726f4e64,
+    0x006c616d,0x00050005,0x00000039,0x6f4e6e69,0x6c616d72,0x00000000,
+    0x00070005,0x0000003c,0x67617266,0x6c726f57,0x6e615464,0x746e6567,
+    0x00000000,0x00050005,0x0000003e,0x61546e69,0x6e65676e,0x00000074,
+    0x00040005,0x00000042,0x6f436e69,0x00726f6c,0x00030047,0x0000000b,
+    0x00000002,0x00050048,0x0000000b,0x00000000,0x0000000b,0x00000000,
+    0x00050048,0x0000000b,0x00000001,0x0000000b,0x00000001,0x00050048,
+    0x0000000b,0x00000002,0x0000000b,0x00000003,0x00050048,0x0000000b,
+    0x00000003,0x0000000b,0x00000004,0x00030047,0x00000011,0x00000002,
+    0x00040048,0x00000011,0x00000000,0x00000005,0x00050048,0x00000011,
+    0x00000000,0x00000007,0x00000010,0x00050048,0x00000011,0x00000000,
+    0x00000023,0x00000000,0x00040048,0x00000011,0x00000001,0x00000005,
+    0x00050048,0x00000011,0x00000001,0x00000007,0x00000010,0x00050048,
+    0x00000011,0x00000001,0x00000023,0x00000040,0x00040047,0x00000019,
+    0x0000001e,0x00000000,0x00040047,0x00000025,0x0000001e,0x00000000,
+    0x00040047,0x00000027,0x0000001e,0x00000002,0x00040047,0x00000037,
+    0x0000001e,0x00000001,0x00040047,0x00000039,0x0000001e,0x00000003,
+    0x00040047,0x0000003c,0x0000001e,0x00000002,0x00040047,0x0000003e,
+    0x0000001e,0x00000004,0x00040047,0x00000042,0x0000001e,0x00000001,
+    0x00020013,0x00000002,0x00030021,0x00000003,0x00000002,0x00030016,
+    0x00000006,0x00000020,0x00040017,0x00000007,0x00000006,0x00000004,
+    0x00040015,0x00000008,0x00000020,0x00000000,0x0004002b,0x00000008,
+    0x00000009,0x00000001,0x0004001c,0x0000000a,0x00000006,0x00000009,
+    0x0006001e,0x0000000b,0x00000007,0x00000006,0x0000000a,0x0000000a,
+    0x00040020,0x0000000c,0x00000003,0x0000000b,0x0004003b,0x0000000c,
+    0x0000000d,0x00000003,0x00040015,0x0000000e,0x00000020,0x00000001,
+    0x0004002b,0x0000000e,0x0000000f,0x00000000,0x00040018,0x00000010,
+    0x00000007,0x00000004,0x0004001e,0x00000011,0x00000010,0x00000010,
+    0x00040020,0x00000012,0x00000009,0x00000011,0x0004003b,0x00000012,
+    0x00000013,0x00000009,0x00040020,0x00000014,0x00000009,0x00000010,
+    0x00040017,0x00000017,0x00000006,0x00000003,0x00040020,0x00000018,
+    0x00000001,0x00000017,0x0004003b,0x00000018,0x00000019,0x00000001,
+    0x0004002b,0x00000006,0x0000001b,0x3f800000,0x00040020,0x00000021,
+    0x00000003,0x00000007,0x00040017,0x00000023,0x00000006,0x00000002,
+    0x00040020,0x00000024,0x00000003,0x00000023,0x0004003b,0x00000024,
+    0x00000025,0x00000003,0x00040020,0x00000026,0x00000001,0x00000023,
+    0x0004003b,0x00000026,0x00000027,0x00000001,0x00040018,0x00000029,
+    0x00000017,0x00000003,0x00040020,0x0000002a,0x00000007,0x00000029,
+    0x0004002b,0x0000000e,0x0000002c,0x00000001,0x00040020,0x00000036,
+    0x00000003,0x00000017,0x0004003b,0x00000036,0x00000037,0x00000003,
+    0x0004003b,0x00000018,0x00000039,0x00000001,0x0004003b,0x00000036,
+    0x0000003c,0x00000003,0x0004003b,0x00000018,0x0000003e,0x00000001,
+    0x00040020,0x00000041,0x00000001,0x00000007,0x0004003b,0x00000041,
+    0x00000042,0x00000001,0x00050036,0x00000002,0x00000004,0x00000000,
+    0x00000003,0x000200f8,0x00000005,0x0004003b,0x0000002a,0x0000002b,
+    0x00000007,0x00050041,0x00000014,0x00000015,0x00000013,0x0000000f,
+    0x0004003d,0x00000010,0x00000016,0x00000015,0x0004003d,0x00000017,
+    0x0000001a,0x00000019,0x00050051,0x00000006,0x0000001c,0x0000001a,
+    0x00000000,0x00050051,0x00000006,0x0000001d,0x0000001a,0x00000001,
+    0x00050051,0x00000006,0x0000001e,0x0000001a,0x00000002,0x00070050,
+    0x00000007,0x0000001f,0x0000001c,0x0000001d,0x0000001e,0x0000001b,
+    0x00050091,0x00000007,0x00000020,0x00000016,0x0000001f,0x00050041,
+    0x00000021,0x00000022,0x0000000d,0x0000000f,0x0003003e,0x00000022,
+    0x00000020,0x0004003d,0x00000023,0x00000028,0x00000027,0x0003003e,
+    0x00000025,0x00000028,0x00050041,0x00000014,0x0000002d,0x00000013,
+    0x0000002c,0x0004003d,0x00000010,0x0000002e,0x0000002d,0x00050051,
+    0x00000007,0x0000002f,0x0000002e,0x00000000,0x0008004f,0x00000017,
+    0x00000030,0x0000002f,0x0000002f,0x00000000,0x00000001,0x00000002,
+    0x00050051,0x00000007,0x00000031,0x0000002e,0x00000001,0x0008004f,
+    0x00000017,0x00000032,0x00000031,0x00000031,0x00000000,0x00000001,
+    0x00000002,0x00050051,0x00000007,0x00000033,0x0000002e,0x00000002,
+    0x0008004f,0x00000017,0x00000034,0x00000033,0x00000033,0x00000000,
+    0x00000001,0x00000002,0x00060050,0x00000029,0x00000035,0x00000030,
+    0x00000032,0x00000034,0x0003003e,0x0000002b,0x00000035,0x0004003d,
+    0x00000029,0x00000038,0x0000002b,0x0004003d,0x00000017,0x0000003a,
+    0x00000039,0x00050091,0x00000017,0x0000003b,0x00000038,0x0000003a,
+    0x0003003e,0x00000037,0x0000003b,0x0004003d,0x00000029,0x0000003d,
+    0x0000002b,0x0004003d,0x00000017,0x0000003f,0x0000003e,0x00050091,
+    0x00000017,0x00000040,0x0000003d,0x0000003f,0x0003003e,0x0000003c,
+    0x00000040,0x000100fd,0x00010038,
+};
+
+// Textured cube fragment shader: samples basecolor, normal, AO textures with directional lighting
+static const uint32_t cubeTexturedFragSpv[] = {
+    0x07230203,0x00010000,0x0008000b,0x00000071,0x00000000,0x00020011,
+    0x00000001,0x0006000b,0x00000001,0x4c534c47,0x6474732e,0x3035342e,
+    0x00000000,0x0003000e,0x00000000,0x00000001,0x0009000f,0x00000004,
+    0x00000004,0x6e69616d,0x00000000,0x00000011,0x00000027,0x0000002b,
+    0x00000067,0x00030010,0x00000004,0x00000007,0x00030003,0x00000002,
+    0x000001c2,0x00040005,0x00000004,0x6e69616d,0x00000000,0x00050005,
+    0x00000009,0x65736162,0x6f6c6f63,0x00000072,0x00060005,0x0000000d,
+    0x65736162,0x6f6c6f63,0x78655472,0x00000000,0x00040005,0x00000011,
+    0x67617266,0x00005655,0x00050005,0x00000016,0x6d726f6e,0x614d6c61,
+    0x00000070,0x00050005,0x00000017,0x6d726f6e,0x65546c61,0x00000078,
+    0x00030005,0x0000001d,0x00006f61,0x00040005,0x0000001e,0x65546f61,
+    0x00000078,0x00030005,0x00000025,0x0000004e,0x00060005,0x00000027,
+    0x67617266,0x6c726f57,0x726f4e64,0x006c616d,0x00030005,0x0000002a,
+    0x00000054,0x00070005,0x0000002b,0x67617266,0x6c726f57,0x6e615464,
+    0x746e6567,0x00000000,0x00030005,0x00000036,0x00000042,0x00030005,
+    0x0000003c,0x004e4254,0x00060005,0x0000004f,0x7070616d,0x6f4e6465,
+    0x6c616d72,0x00000000,0x00050005,0x00000058,0x6867696c,0x72694474,
+    0x00000000,0x00040005,0x0000005d,0x66666964,0x00657375,0x00050005,
+    0x00000067,0x4374756f,0x726f6c6f,0x00000000,0x00040047,0x0000000d,
+    0x00000021,0x00000000,0x00040047,0x0000000d,0x00000022,0x00000000,
+    0x00040047,0x00000011,0x0000001e,0x00000000,0x00040047,0x00000017,
+    0x00000021,0x00000001,0x00040047,0x00000017,0x00000022,0x00000000,
+    0x00040047,0x0000001e,0x00000021,0x00000002,0x00040047,0x0000001e,
+    0x00000022,0x00000000,0x00040047,0x00000027,0x0000001e,0x00000001,
+    0x00040047,0x0000002b,0x0000001e,0x00000002,0x00040047,0x00000067,
+    0x0000001e,0x00000000,0x00020013,0x00000002,0x00030021,0x00000003,
+    0x00000002,0x00030016,0x00000006,0x00000020,0x00040017,0x00000007,
+    0x00000006,0x00000003,0x00040020,0x00000008,0x00000007,0x00000007,
+    0x00090019,0x0000000a,0x00000006,0x00000001,0x00000000,0x00000000,
+    0x00000000,0x00000001,0x00000000,0x0003001b,0x0000000b,0x0000000a,
+    0x00040020,0x0000000c,0x00000000,0x0000000b,0x0004003b,0x0000000c,
+    0x0000000d,0x00000000,0x00040017,0x0000000f,0x00000006,0x00000002,
+    0x00040020,0x00000010,0x00000001,0x0000000f,0x0004003b,0x00000010,
+    0x00000011,0x00000001,0x00040017,0x00000013,0x00000006,0x00000004,
+    0x0004003b,0x0000000c,0x00000017,0x00000000,0x00040020,0x0000001c,
+    0x00000007,0x00000006,0x0004003b,0x0000000c,0x0000001e,0x00000000,
+    0x00040015,0x00000022,0x00000020,0x00000000,0x0004002b,0x00000022,
+    0x00000023,0x00000000,0x00040020,0x00000026,0x00000001,0x00000007,
+    0x0004003b,0x00000026,0x00000027,0x00000001,0x0004003b,0x00000026,
+    0x0000002b,0x00000001,0x00040018,0x0000003a,0x00000007,0x00000003,
+    0x00040020,0x0000003b,0x00000007,0x0000003a,0x0004002b,0x00000006,
+    0x00000040,0x3f800000,0x0004002b,0x00000006,0x00000041,0x00000000,
+    0x0004002b,0x00000006,0x00000052,0x40000000,0x0004002b,0x00000006,
+    0x00000059,0x3e9b28d0,0x0004002b,0x00000006,0x0000005a,0x3f4ee116,
+    0x0004002b,0x00000006,0x0000005b,0x3f014cae,0x0006002c,0x00000007,
+    0x0000005c,0x00000059,0x0000005a,0x0000005b,0x0004002b,0x00000006,
+    0x00000062,0x3f333333,0x0004002b,0x00000006,0x00000064,0x3e99999a,
+    0x00040020,0x00000066,0x00000003,0x00000013,0x0004003b,0x00000066,
+    0x00000067,0x00000003,0x00050036,0x00000002,0x00000004,0x00000000,
+    0x00000003,0x000200f8,0x00000005,0x0004003b,0x00000008,0x00000009,
+    0x00000007,0x0004003b,0x00000008,0x00000016,0x00000007,0x0004003b,
+    0x0000001c,0x0000001d,0x00000007,0x0004003b,0x00000008,0x00000025,
+    0x00000007,0x0004003b,0x00000008,0x0000002a,0x00000007,0x0004003b,
+    0x00000008,0x00000036,0x00000007,0x0004003b,0x0000003b,0x0000003c,
+    0x00000007,0x0004003b,0x00000008,0x0000004f,0x00000007,0x0004003b,
+    0x00000008,0x00000058,0x00000007,0x0004003b,0x0000001c,0x0000005d,
+    0x00000007,0x0004003d,0x0000000b,0x0000000e,0x0000000d,0x0004003d,
+    0x0000000f,0x00000012,0x00000011,0x00050057,0x00000013,0x00000014,
+    0x0000000e,0x00000012,0x0008004f,0x00000007,0x00000015,0x00000014,
+    0x00000014,0x00000000,0x00000001,0x00000002,0x0003003e,0x00000009,
+    0x00000015,0x0004003d,0x0000000b,0x00000018,0x00000017,0x0004003d,
+    0x0000000f,0x00000019,0x00000011,0x00050057,0x00000013,0x0000001a,
+    0x00000018,0x00000019,0x0008004f,0x00000007,0x0000001b,0x0000001a,
+    0x0000001a,0x00000000,0x00000001,0x00000002,0x0003003e,0x00000016,
+    0x0000001b,0x0004003d,0x0000000b,0x0000001f,0x0000001e,0x0004003d,
+    0x0000000f,0x00000020,0x00000011,0x00050057,0x00000013,0x00000021,
+    0x0000001f,0x00000020,0x00050051,0x00000006,0x00000024,0x00000021,
+    0x00000000,0x0003003e,0x0000001d,0x00000024,0x0004003d,0x00000007,
+    0x00000028,0x00000027,0x0006000c,0x00000007,0x00000029,0x00000001,
+    0x00000045,0x00000028,0x0003003e,0x00000025,0x00000029,0x0004003d,
+    0x00000007,0x0000002c,0x0000002b,0x0006000c,0x00000007,0x0000002d,
+    0x00000001,0x00000045,0x0000002c,0x0003003e,0x0000002a,0x0000002d,
+    0x0004003d,0x00000007,0x0000002e,0x0000002a,0x0004003d,0x00000007,
+    0x0000002f,0x0000002a,0x0004003d,0x00000007,0x00000030,0x00000025,
+    0x00050094,0x00000006,0x00000031,0x0000002f,0x00000030,0x0004003d,
+    0x00000007,0x00000032,0x00000025,0x0005008e,0x00000007,0x00000033,
+    0x00000032,0x00000031,0x00050083,0x00000007,0x00000034,0x0000002e,
+    0x00000033,0x0006000c,0x00000007,0x00000035,0x00000001,0x00000045,
+    0x00000034,0x0003003e,0x0000002a,0x00000035,0x0004003d,0x00000007,
+    0x00000037,0x00000025,0x0004003d,0x00000007,0x00000038,0x0000002a,
+    0x0007000c,0x00000007,0x00000039,0x00000001,0x00000044,0x00000037,
+    0x00000038,0x0003003e,0x00000036,0x00000039,0x0004003d,0x00000007,
+    0x0000003d,0x0000002a,0x0004003d,0x00000007,0x0000003e,0x00000036,
+    0x0004003d,0x00000007,0x0000003f,0x00000025,0x00050051,0x00000006,
+    0x00000042,0x0000003d,0x00000000,0x00050051,0x00000006,0x00000043,
+    0x0000003d,0x00000001,0x00050051,0x00000006,0x00000044,0x0000003d,
+    0x00000002,0x00050051,0x00000006,0x00000045,0x0000003e,0x00000000,
+    0x00050051,0x00000006,0x00000046,0x0000003e,0x00000001,0x00050051,
+    0x00000006,0x00000047,0x0000003e,0x00000002,0x00050051,0x00000006,
+    0x00000048,0x0000003f,0x00000000,0x00050051,0x00000006,0x00000049,
+    0x0000003f,0x00000001,0x00050051,0x00000006,0x0000004a,0x0000003f,
+    0x00000002,0x00060050,0x00000007,0x0000004b,0x00000042,0x00000043,
+    0x00000044,0x00060050,0x00000007,0x0000004c,0x00000045,0x00000046,
+    0x00000047,0x00060050,0x00000007,0x0000004d,0x00000048,0x00000049,
+    0x0000004a,0x00060050,0x0000003a,0x0000004e,0x0000004b,0x0000004c,
+    0x0000004d,0x0003003e,0x0000003c,0x0000004e,0x0004003d,0x0000003a,
+    0x00000050,0x0000003c,0x0004003d,0x00000007,0x00000051,0x00000016,
+    0x0005008e,0x00000007,0x00000053,0x00000051,0x00000052,0x00060050,
+    0x00000007,0x00000054,0x00000040,0x00000040,0x00000040,0x00050083,
+    0x00000007,0x00000055,0x00000053,0x00000054,0x00050091,0x00000007,
+    0x00000056,0x00000050,0x00000055,0x0006000c,0x00000007,0x00000057,
+    0x00000001,0x00000045,0x00000056,0x0003003e,0x0000004f,0x00000057,
+    0x0003003e,0x00000058,0x0000005c,0x0004003d,0x00000007,0x0000005e,
+    0x0000004f,0x0004003d,0x00000007,0x0000005f,0x00000058,0x00050094,
+    0x00000006,0x00000060,0x0000005e,0x0000005f,0x0007000c,0x00000006,
+    0x00000061,0x00000001,0x00000028,0x00000060,0x00000041,0x00050085,
+    0x00000006,0x00000063,0x00000061,0x00000062,0x00050081,0x00000006,
+    0x00000065,0x00000063,0x00000064,0x0003003e,0x0000005d,0x00000065,
+    0x0004003d,0x00000007,0x00000068,0x00000009,0x0004003d,0x00000006,
+    0x00000069,0x0000001d,0x0005008e,0x00000007,0x0000006a,0x00000068,
+    0x00000069,0x0004003d,0x00000006,0x0000006b,0x0000005d,0x0005008e,
+    0x00000007,0x0000006c,0x0000006a,0x0000006b,0x00050051,0x00000006,
+    0x0000006d,0x0000006c,0x00000000,0x00050051,0x00000006,0x0000006e,
+    0x0000006c,0x00000001,0x00050051,0x00000006,0x0000006f,0x0000006c,
+    0x00000002,0x00070050,0x00000013,0x00000070,0x0000006d,0x0000006e,
+    0x0000006f,0x00000040,0x0003003e,0x00000067,0x00000070,0x000100fd,
+    0x00010038,
+};
+
 // ============================================================================
 // Vulkan renderer structures (same as sim_cube_openxr)
 // ============================================================================
 
-struct CubeVertex { float pos[3]; float color[4]; };
+struct CubeVertex { float pos[3]; float color[4]; float uv[2]; float normal[3]; float tangent[3]; };
 struct GridVertex { float pos[3]; };
 
 struct SwapchainFramebuffers {
@@ -440,7 +658,8 @@ struct VkRenderer {
     VkDevice device = VK_NULL_HANDLE;
     VkQueue graphicsQueue = VK_NULL_HANDLE;
     VkRenderPass renderPass = VK_NULL_HANDLE;
-    VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
+    VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;       // grid: push constants only (64 bytes)
+    VkPipelineLayout cubePipelineLayout = VK_NULL_HANDLE;   // textured cube: descriptor set + push constants (128 bytes)
     VkPipeline cubePipeline = VK_NULL_HANDLE;
     VkPipeline gridPipeline = VK_NULL_HANDLE;
     VkBuffer cubeVertexBuffer = VK_NULL_HANDLE;
@@ -456,7 +675,32 @@ struct VkRenderer {
     float cubeRotation = 0.0f;
     SwapchainFramebuffers swapchainFBs;
     VkRenderPass renderPassLoad = VK_NULL_HANDLE;
+    // Texture resources
+    VkImage texImages[3] = {};          // basecolor, normal, AO
+    VkDeviceMemory texMemory[3] = {};
+    VkImageView texViews[3] = {};
+    VkSampler texSampler = VK_NULL_HANDLE;
+    VkDescriptorSetLayout descriptorSetLayout = VK_NULL_HANDLE;
+    VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
+    VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+    bool texturesLoaded = false;
 };
+
+// ============================================================================
+// Texture path helper
+// ============================================================================
+
+static std::string GetTextureDir() {
+    char pathBuf[4096];
+    uint32_t pathSize = sizeof(pathBuf);
+    if (_NSGetExecutablePath(pathBuf, &pathSize) == 0) {
+        // Find last '/' to get directory
+        char* lastSlash = strrchr(pathBuf, '/');
+        if (lastSlash) *lastSlash = '\0';
+        return std::string(pathBuf) + "/textures/";
+    }
+    return "textures/";
+}
 
 // ============================================================================
 // Vulkan helpers (same as sim_cube_openxr)
@@ -525,6 +769,140 @@ static bool CreateDepthImage(VkDevice device, VkPhysicalDevice physDevice,
     if (vkAllocateMemory(device, &allocInfo, nullptr, &memory) != VK_SUCCESS) return false;
     vkBindImageMemory(device, image, memory, 0);
     return true;
+}
+
+// Load a texture from disk, create VkImage + VkImageView, upload via staging buffer.
+// If the file can't be loaded, creates a 1x1 fallback (white for basecolor/AO, flat blue for normal).
+static bool CreateTextureFromFile(VkDevice device, VkPhysicalDevice physDevice,
+    VkCommandPool cmdPool, VkQueue queue,
+    const char* path, bool isNormalMap,
+    VkImage& outImage, VkDeviceMemory& outMemory, VkImageView& outView)
+{
+    int w, h, channels;
+    unsigned char* pixels = stbi_load(path, &w, &h, &channels, 4); // force RGBA
+    bool fallback = false;
+    if (!pixels) {
+        LOG_WARN("Failed to load texture: %s — using fallback", path);
+        w = h = 1;
+        static unsigned char whitePixel[] = {255, 255, 255, 255};
+        static unsigned char bluePixel[] = {128, 128, 255, 255}; // flat normal
+        pixels = isNormalMap ? bluePixel : whitePixel;
+        fallback = true;
+    }
+
+    VkDeviceSize imageSize = (VkDeviceSize)w * h * 4;
+
+    // Staging buffer
+    VkBuffer stagingBuffer;
+    VkDeviceMemory stagingMemory;
+    VkBufferCreateInfo bufInfo = {};
+    bufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufInfo.size = imageSize;
+    bufInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    bufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    vkCreateBuffer(device, &bufInfo, nullptr, &stagingBuffer);
+
+    VkMemoryRequirements memReqs;
+    vkGetBufferMemoryRequirements(device, stagingBuffer, &memReqs);
+    VkMemoryAllocateInfo allocInfo = {};
+    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocInfo.allocationSize = memReqs.size;
+    allocInfo.memoryTypeIndex = FindMemoryType(physDevice, memReqs.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    vkAllocateMemory(device, &allocInfo, nullptr, &stagingMemory);
+    vkBindBufferMemory(device, stagingBuffer, stagingMemory, 0);
+
+    void* data;
+    vkMapMemory(device, stagingMemory, 0, imageSize, 0, &data);
+    memcpy(data, pixels, (size_t)imageSize);
+    vkUnmapMemory(device, stagingMemory);
+    if (!fallback) stbi_image_free(pixels);
+
+    // Create image
+    VkImageCreateInfo imgInfo = {};
+    imgInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    imgInfo.imageType = VK_IMAGE_TYPE_2D;
+    imgInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+    imgInfo.extent = {(uint32_t)w, (uint32_t)h, 1};
+    imgInfo.mipLevels = 1;
+    imgInfo.arrayLayers = 1;
+    imgInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imgInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    imgInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    imgInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    vkCreateImage(device, &imgInfo, nullptr, &outImage);
+
+    vkGetImageMemoryRequirements(device, outImage, &memReqs);
+    allocInfo.allocationSize = memReqs.size;
+    allocInfo.memoryTypeIndex = FindMemoryType(physDevice, memReqs.memoryTypeBits,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    vkAllocateMemory(device, &allocInfo, nullptr, &outMemory);
+    vkBindImageMemory(device, outImage, outMemory, 0);
+
+    // Copy staging → image via one-shot command buffer
+    VkCommandBufferAllocateInfo cmdAlloc = {};
+    cmdAlloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cmdAlloc.commandPool = cmdPool;
+    cmdAlloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cmdAlloc.commandBufferCount = 1;
+    VkCommandBuffer cmd;
+    vkAllocateCommandBuffers(device, &cmdAlloc, &cmd);
+
+    VkCommandBufferBeginInfo beginInfo = {};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &beginInfo);
+
+    // Transition UNDEFINED → TRANSFER_DST
+    VkImageMemoryBarrier barrier = {};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = outImage;
+    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    barrier.srcAccessMask = 0;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+    VkBufferImageCopy region = {};
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {(uint32_t)w, (uint32_t)h, 1};
+    vkCmdCopyBufferToImage(cmd, stagingBuffer, outImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+    // Transition TRANSFER_DST → SHADER_READ_ONLY
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+    vkEndCommandBuffer(cmd);
+    VkSubmitInfo submitInfo = {};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &cmd;
+    vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
+    vkQueueWaitIdle(queue);
+    vkFreeCommandBuffers(device, cmdPool, 1, &cmd);
+
+    // Cleanup staging
+    vkDestroyBuffer(device, stagingBuffer, nullptr);
+    vkFreeMemory(device, stagingMemory, nullptr);
+
+    // Create image view
+    VkImageViewCreateInfo viewInfo = {};
+    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    viewInfo.image = outImage;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+    viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCreateImageView(device, &viewInfo, nullptr, &outView);
+
+    return !fallback;
 }
 
 // Store physDevice globally for depth image creation
@@ -630,17 +1008,45 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
     attachments[1].initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
     VK_CHECK(vkCreateRenderPass(device, &rpInfo, nullptr, &renderer.renderPassLoad));
 
-    // Pipeline layout (push constants for MVP)
-    VkPushConstantRange pushRange = {};
-    pushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
-    pushRange.offset = 0;
-    pushRange.size = 64; // 4x4 matrix
+    // Grid pipeline layout (push constants only, 64 bytes)
+    VkPushConstantRange gridPushRange = {};
+    gridPushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    gridPushRange.offset = 0;
+    gridPushRange.size = 64; // MVP matrix
 
-    VkPipelineLayoutCreateInfo layoutInfo = {};
-    layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    layoutInfo.pushConstantRangeCount = 1;
-    layoutInfo.pPushConstantRanges = &pushRange;
-    VK_CHECK(vkCreatePipelineLayout(device, &layoutInfo, nullptr, &renderer.pipelineLayout));
+    VkPipelineLayoutCreateInfo gridLayoutInfo = {};
+    gridLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    gridLayoutInfo.pushConstantRangeCount = 1;
+    gridLayoutInfo.pPushConstantRanges = &gridPushRange;
+    VK_CHECK(vkCreatePipelineLayout(device, &gridLayoutInfo, nullptr, &renderer.pipelineLayout));
+
+    // Descriptor set layout for textured cube (3 combined image samplers)
+    VkDescriptorSetLayoutBinding bindings[3] = {};
+    for (int i = 0; i < 3; i++) {
+        bindings[i].binding = i;
+        bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        bindings[i].descriptorCount = 1;
+        bindings[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo dslInfo = {};
+    dslInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    dslInfo.bindingCount = 3;
+    dslInfo.pBindings = bindings;
+    VK_CHECK(vkCreateDescriptorSetLayout(device, &dslInfo, nullptr, &renderer.descriptorSetLayout));
+
+    // Cube pipeline layout (descriptor set + 128 bytes push constants: MVP + model)
+    VkPushConstantRange cubePushRange = {};
+    cubePushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    cubePushRange.offset = 0;
+    cubePushRange.size = 128; // MVP + model matrices
+
+    VkPipelineLayoutCreateInfo cubeLayoutInfo = {};
+    cubeLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    cubeLayoutInfo.setLayoutCount = 1;
+    cubeLayoutInfo.pSetLayouts = &renderer.descriptorSetLayout;
+    cubeLayoutInfo.pushConstantRangeCount = 1;
+    cubeLayoutInfo.pPushConstantRanges = &cubePushRange;
+    VK_CHECK(vkCreatePipelineLayout(device, &cubeLayoutInfo, nullptr, &renderer.cubePipelineLayout));
 
     // Shader modules
     auto createShaderModule = [&](const uint32_t* code, size_t size) -> VkShaderModule {
@@ -653,8 +1059,8 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
         return sm;
     };
 
-    VkShaderModule cubeVert = createShaderModule(cubeVertSpv, sizeof(cubeVertSpv));
-    VkShaderModule cubeFrag = createShaderModule(cubeFragSpv, sizeof(cubeFragSpv));
+    VkShaderModule cubeVert = createShaderModule(cubeTexturedVertSpv, sizeof(cubeTexturedVertSpv));
+    VkShaderModule cubeFrag = createShaderModule(cubeTexturedFragSpv, sizeof(cubeTexturedFragSpv));
     VkShaderModule gridVert = createShaderModule(gridVertSpv, sizeof(gridVertSpv));
     VkShaderModule gridFrag = createShaderModule(gridFragSpv, sizeof(gridFragSpv));
 
@@ -695,7 +1101,7 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
     dynamicState.dynamicStateCount = 2;
     dynamicState.pDynamicStates = dynamicStates;
 
-    // Cube pipeline
+    // Textured cube pipeline
     {
         VkPipelineShaderStageCreateInfo stages[2] = {};
         stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -709,15 +1115,18 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
 
         VkVertexInputBindingDescription binding = {};
         binding.stride = sizeof(CubeVertex);
-        VkVertexInputAttributeDescription attrs[2] = {};
-        attrs[0].location = 0; attrs[0].format = VK_FORMAT_R32G32B32_SFLOAT; attrs[0].offset = 0;
-        attrs[1].location = 1; attrs[1].format = VK_FORMAT_R32G32B32A32_SFLOAT; attrs[1].offset = 12;
+        VkVertexInputAttributeDescription attrs[5] = {};
+        attrs[0].location = 0; attrs[0].format = VK_FORMAT_R32G32B32_SFLOAT; attrs[0].offset = offsetof(CubeVertex, pos);
+        attrs[1].location = 1; attrs[1].format = VK_FORMAT_R32G32B32A32_SFLOAT; attrs[1].offset = offsetof(CubeVertex, color);
+        attrs[2].location = 2; attrs[2].format = VK_FORMAT_R32G32_SFLOAT; attrs[2].offset = offsetof(CubeVertex, uv);
+        attrs[3].location = 3; attrs[3].format = VK_FORMAT_R32G32B32_SFLOAT; attrs[3].offset = offsetof(CubeVertex, normal);
+        attrs[4].location = 4; attrs[4].format = VK_FORMAT_R32G32B32_SFLOAT; attrs[4].offset = offsetof(CubeVertex, tangent);
 
         VkPipelineVertexInputStateCreateInfo vertexInput = {};
         vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
         vertexInput.vertexBindingDescriptionCount = 1;
         vertexInput.pVertexBindingDescriptions = &binding;
-        vertexInput.vertexAttributeDescriptionCount = 2;
+        vertexInput.vertexAttributeDescriptionCount = 5;
         vertexInput.pVertexAttributeDescriptions = attrs;
 
         VkPipelineInputAssemblyStateCreateInfo inputAssembly = {};
@@ -736,7 +1145,7 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
         pipelineInfo.pDepthStencilState = &depthStencil;
         pipelineInfo.pColorBlendState = &colorBlend;
         pipelineInfo.pDynamicState = &dynamicState;
-        pipelineInfo.layout = renderer.pipelineLayout;
+        pipelineInfo.layout = renderer.cubePipelineLayout;
         pipelineInfo.renderPass = renderer.renderPass;
         VK_CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &renderer.cubePipeline));
     }
@@ -791,20 +1200,39 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
     vkDestroyShaderModule(device, gridVert, nullptr);
     vkDestroyShaderModule(device, gridFrag, nullptr);
 
-    // Vertex/index buffers
+    // Vertex/index buffers — textured cube with UV, normal, tangent per vertex
+    //   pos[3], color[4], uv[2], normal[3], tangent[3] = 15 floats per vertex
     CubeVertex cubeVerts[] = {
-        {{-0.5f,-0.5f,-0.5f},{1,0,0,1}}, {{-0.5f,0.5f,-0.5f},{1,0,0,1}},
-        {{0.5f,0.5f,-0.5f},{1,0,0,1}},   {{0.5f,-0.5f,-0.5f},{1,0,0,1}},
-        {{-0.5f,-0.5f,0.5f},{0,1,0,1}},  {{0.5f,-0.5f,0.5f},{0,1,0,1}},
-        {{0.5f,0.5f,0.5f},{0,1,0,1}},    {{-0.5f,0.5f,0.5f},{0,1,0,1}},
-        {{-0.5f,0.5f,-0.5f},{0,0,1,1}},  {{-0.5f,0.5f,0.5f},{0,0,1,1}},
-        {{0.5f,0.5f,0.5f},{0,0,1,1}},    {{0.5f,0.5f,-0.5f},{0,0,1,1}},
-        {{-0.5f,-0.5f,-0.5f},{1,1,0,1}}, {{0.5f,-0.5f,-0.5f},{1,1,0,1}},
-        {{0.5f,-0.5f,0.5f},{1,1,0,1}},   {{-0.5f,-0.5f,0.5f},{1,1,0,1}},
-        {{-0.5f,-0.5f,0.5f},{1,0,1,1}},  {{-0.5f,0.5f,0.5f},{1,0,1,1}},
-        {{-0.5f,0.5f,-0.5f},{1,0,1,1}},  {{-0.5f,-0.5f,-0.5f},{1,0,1,1}},
-        {{0.5f,-0.5f,-0.5f},{0,1,1,1}},  {{0.5f,0.5f,-0.5f},{0,1,1,1}},
-        {{0.5f,0.5f,0.5f},{0,1,1,1}},    {{0.5f,-0.5f,0.5f},{0,1,1,1}},
+        // Front face (-Z): normal (0,0,-1), tangent (1,0,0)
+        {{-0.5f,-0.5f,-0.5f},{1,1,1,1},{0,1},{0,0,-1},{1,0,0}},
+        {{-0.5f, 0.5f,-0.5f},{1,1,1,1},{0,0},{0,0,-1},{1,0,0}},
+        {{ 0.5f, 0.5f,-0.5f},{1,1,1,1},{1,0},{0,0,-1},{1,0,0}},
+        {{ 0.5f,-0.5f,-0.5f},{1,1,1,1},{1,1},{0,0,-1},{1,0,0}},
+        // Back face (+Z): normal (0,0,1), tangent (-1,0,0)
+        {{-0.5f,-0.5f, 0.5f},{1,1,1,1},{1,1},{0,0,1},{-1,0,0}},
+        {{ 0.5f,-0.5f, 0.5f},{1,1,1,1},{0,1},{0,0,1},{-1,0,0}},
+        {{ 0.5f, 0.5f, 0.5f},{1,1,1,1},{0,0},{0,0,1},{-1,0,0}},
+        {{-0.5f, 0.5f, 0.5f},{1,1,1,1},{1,0},{0,0,1},{-1,0,0}},
+        // Top face (+Y): normal (0,1,0), tangent (1,0,0)
+        {{-0.5f, 0.5f,-0.5f},{1,1,1,1},{0,1},{0,1,0},{1,0,0}},
+        {{-0.5f, 0.5f, 0.5f},{1,1,1,1},{0,0},{0,1,0},{1,0,0}},
+        {{ 0.5f, 0.5f, 0.5f},{1,1,1,1},{1,0},{0,1,0},{1,0,0}},
+        {{ 0.5f, 0.5f,-0.5f},{1,1,1,1},{1,1},{0,1,0},{1,0,0}},
+        // Bottom face (-Y): normal (0,-1,0), tangent (1,0,0)
+        {{-0.5f,-0.5f,-0.5f},{1,1,1,1},{0,0},{0,-1,0},{1,0,0}},
+        {{ 0.5f,-0.5f,-0.5f},{1,1,1,1},{1,0},{0,-1,0},{1,0,0}},
+        {{ 0.5f,-0.5f, 0.5f},{1,1,1,1},{1,1},{0,-1,0},{1,0,0}},
+        {{-0.5f,-0.5f, 0.5f},{1,1,1,1},{0,1},{0,-1,0},{1,0,0}},
+        // Left face (-X): normal (-1,0,0), tangent (0,0,-1)
+        {{-0.5f,-0.5f, 0.5f},{1,1,1,1},{0,1},{-1,0,0},{0,0,-1}},
+        {{-0.5f, 0.5f, 0.5f},{1,1,1,1},{0,0},{-1,0,0},{0,0,-1}},
+        {{-0.5f, 0.5f,-0.5f},{1,1,1,1},{1,0},{-1,0,0},{0,0,-1}},
+        {{-0.5f,-0.5f,-0.5f},{1,1,1,1},{1,1},{-1,0,0},{0,0,-1}},
+        // Right face (+X): normal (1,0,0), tangent (0,0,1)
+        {{ 0.5f,-0.5f,-0.5f},{1,1,1,1},{0,1},{1,0,0},{0,0,1}},
+        {{ 0.5f, 0.5f,-0.5f},{1,1,1,1},{0,0},{1,0,0},{0,0,1}},
+        {{ 0.5f, 0.5f, 0.5f},{1,1,1,1},{1,0},{1,0,0},{0,0,1}},
+        {{ 0.5f,-0.5f, 0.5f},{1,1,1,1},{1,1},{1,0,0},{0,0,1}},
     };
 
     uint16_t cubeIndices[] = {
@@ -867,6 +1295,78 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
     fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
     VK_CHECK(vkCreateFence(device, &fenceInfo, nullptr, &renderer.frameFence));
+
+    // Load textures and create descriptor set
+    {
+        std::string texDir = GetTextureDir();
+        const char* texFiles[3] = {
+            "Wood_Crate_001_basecolor.jpg",
+            "Wood_Crate_001_normal.jpg",
+            "Wood_Crate_001_ambientOcclusion.jpg",
+        };
+        bool isNormal[3] = {false, true, false};
+        renderer.texturesLoaded = true;
+        for (int i = 0; i < 3; i++) {
+            std::string path = texDir + texFiles[i];
+            if (!CreateTextureFromFile(device, physDevice, renderer.commandPool,
+                    renderer.graphicsQueue, path.c_str(), isNormal[i],
+                    renderer.texImages[i], renderer.texMemory[i], renderer.texViews[i])) {
+                renderer.texturesLoaded = false;
+            }
+        }
+
+        // Sampler (linear filtering, repeat wrap)
+        VkSamplerCreateInfo samplerInfo = {};
+        samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        samplerInfo.magFilter = VK_FILTER_LINEAR;
+        samplerInfo.minFilter = VK_FILTER_LINEAR;
+        samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        samplerInfo.maxAnisotropy = 1.0f;
+        samplerInfo.maxLod = 1.0f;
+        VK_CHECK(vkCreateSampler(device, &samplerInfo, nullptr, &renderer.texSampler));
+
+        // Descriptor pool and set
+        VkDescriptorPoolSize poolSize = {};
+        poolSize.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        poolSize.descriptorCount = 3;
+        VkDescriptorPoolCreateInfo poolInfo = {};
+        poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        poolInfo.maxSets = 1;
+        poolInfo.poolSizeCount = 1;
+        poolInfo.pPoolSizes = &poolSize;
+        VK_CHECK(vkCreateDescriptorPool(device, &poolInfo, nullptr, &renderer.descriptorPool));
+
+        VkDescriptorSetAllocateInfo dsAllocInfo = {};
+        dsAllocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        dsAllocInfo.descriptorPool = renderer.descriptorPool;
+        dsAllocInfo.descriptorSetCount = 1;
+        dsAllocInfo.pSetLayouts = &renderer.descriptorSetLayout;
+        VK_CHECK(vkAllocateDescriptorSets(device, &dsAllocInfo, &renderer.descriptorSet));
+
+        // Update descriptor set with texture views
+        VkDescriptorImageInfo imageInfos[3] = {};
+        VkWriteDescriptorSet writes[3] = {};
+        for (int i = 0; i < 3; i++) {
+            imageInfos[i].sampler = renderer.texSampler;
+            imageInfos[i].imageView = renderer.texViews[i];
+            imageInfos[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet = renderer.descriptorSet;
+            writes[i].dstBinding = i;
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[i].pImageInfo = &imageInfos[i];
+        }
+        vkUpdateDescriptorSets(device, 3, writes, 0, nullptr);
+
+        if (renderer.texturesLoaded) {
+            LOG_INFO("All crate textures loaded successfully");
+        } else {
+            LOG_WARN("Some textures missing — using fallback colors");
+        }
+    }
 
     LOG_INFO("Vulkan renderer initialized");
     return true;
@@ -936,7 +1436,7 @@ static void RenderScene(VkRenderer& renderer, uint32_t imageIndex,
             vkCmdDraw(cmd, renderer.gridVertexCount, 1, 0, 0);
         }
 
-        // Draw cube
+        // Draw cube (textured)
         {
             const float cubeSize = 0.06f;
             const float cubeHeight = cubeSize / 2.0f;
@@ -949,8 +1449,15 @@ static void RenderScene(VkRenderer& renderer, uint32_t imageIndex,
             float mvp[16];
             mat4_multiply(mvp, vp, model);
 
+            // Push constants: MVP (64 bytes) + model (64 bytes) = 128 bytes
+            float pushData[32];
+            memcpy(pushData, mvp, 64);
+            memcpy(pushData + 16, model, 64);
+
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, renderer.cubePipeline);
-            vkCmdPushConstants(cmd, renderer.pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, 64, mvp);
+            vkCmdPushConstants(cmd, renderer.cubePipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, 128, pushData);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, renderer.cubePipelineLayout,
+                0, 1, &renderer.descriptorSet, 0, nullptr);
             VkDeviceSize offset = 0;
             vkCmdBindVertexBuffers(cmd, 0, 1, &renderer.cubeVertexBuffer, &offset);
             vkCmdBindIndexBuffer(cmd, renderer.cubeIndexBuffer, 0, VK_INDEX_TYPE_UINT16);
@@ -991,6 +1498,16 @@ static void CleanupVkRenderer(VkRenderer& renderer) {
     if (renderer.cubeVertexMemory) vkFreeMemory(renderer.device, renderer.cubeVertexMemory, nullptr);
     if (renderer.gridPipeline) vkDestroyPipeline(renderer.device, renderer.gridPipeline, nullptr);
     if (renderer.cubePipeline) vkDestroyPipeline(renderer.device, renderer.cubePipeline, nullptr);
+    // Texture cleanup
+    if (renderer.descriptorPool) vkDestroyDescriptorPool(renderer.device, renderer.descriptorPool, nullptr);
+    if (renderer.descriptorSetLayout) vkDestroyDescriptorSetLayout(renderer.device, renderer.descriptorSetLayout, nullptr);
+    if (renderer.texSampler) vkDestroySampler(renderer.device, renderer.texSampler, nullptr);
+    for (int i = 0; i < 3; i++) {
+        if (renderer.texViews[i]) vkDestroyImageView(renderer.device, renderer.texViews[i], nullptr);
+        if (renderer.texImages[i]) vkDestroyImage(renderer.device, renderer.texImages[i], nullptr);
+        if (renderer.texMemory[i]) vkFreeMemory(renderer.device, renderer.texMemory[i], nullptr);
+    }
+    if (renderer.cubePipelineLayout) vkDestroyPipelineLayout(renderer.device, renderer.cubePipelineLayout, nullptr);
     if (renderer.pipelineLayout) vkDestroyPipelineLayout(renderer.device, renderer.pipelineLayout, nullptr);
     if (renderer.renderPassLoad) vkDestroyRenderPass(renderer.device, renderer.renderPassLoad, nullptr);
     if (renderer.renderPass) vkDestroyRenderPass(renderer.device, renderer.renderPass, nullptr);
@@ -1174,9 +1691,24 @@ static void PumpMacOSEvents() {
             } else if (type == NSEventTypeScrollWheel) {
                 float dy = (float)[event scrollingDeltaY];
                 float factor = (dy > 0) ? 1.1f : (1.0f / 1.1f);
-                g_input.zoomScale *= factor;
-                if (g_input.zoomScale < 0.1f) g_input.zoomScale = 0.1f;
-                if (g_input.zoomScale > 10.0f) g_input.zoomScale = 10.0f;
+                NSUInteger scrollMods = [event modifierFlags];
+                if (scrollMods & NSEventModifierFlagShift) {
+                    g_input.stereo.ipdFactor *= factor;
+                    if (g_input.stereo.ipdFactor < 0.0f) g_input.stereo.ipdFactor = 0.0f;
+                    if (g_input.stereo.ipdFactor > 1.0f) g_input.stereo.ipdFactor = 1.0f;
+                } else if (scrollMods & NSEventModifierFlagControl) {
+                    g_input.stereo.parallaxFactor *= factor;
+                    if (g_input.stereo.parallaxFactor < 0.0f) g_input.stereo.parallaxFactor = 0.0f;
+                    if (g_input.stereo.parallaxFactor > 1.0f) g_input.stereo.parallaxFactor = 1.0f;
+                } else if (scrollMods & NSEventModifierFlagOption) {
+                    g_input.stereo.perspectiveFactor *= factor;
+                    if (g_input.stereo.perspectiveFactor < 0.1f) g_input.stereo.perspectiveFactor = 0.1f;
+                    if (g_input.stereo.perspectiveFactor > 10.0f) g_input.stereo.perspectiveFactor = 10.0f;
+                } else {
+                    g_input.stereo.scaleFactor *= factor;
+                    if (g_input.stereo.scaleFactor < 0.1f) g_input.stereo.scaleFactor = 0.1f;
+                    if (g_input.stereo.scaleFactor > 10.0f) g_input.stereo.scaleFactor = 10.0f;
+                }
             } else if (type == NSEventTypeKeyDown) {
                 // Cmd+Ctrl+F fullscreen toggle (keyCode 3 = 'f', ignores character remapping)
                 NSUInteger mods = [event modifierFlags];
@@ -1271,12 +1803,12 @@ static void UpdateCameraMovement(InputState& state, float deltaTime) {
     if (state.resetViewRequested) {
         state.cameraPosX = state.cameraPosY = state.cameraPosZ = 0.0f;
         state.yaw = state.pitch = 0.0f;
-        state.zoomScale = 1.0f;
+        state.stereo = StereoParams{};
         state.resetViewRequested = false;
         return;
     }
 
-    const float moveSpeed = 0.1f;
+    const float moveSpeed = 0.1f / state.stereo.scaleFactor;
     XrQuaternionf ori;
     quat_from_yaw_pitch(state.yaw, state.pitch, &ori);
 
@@ -2112,15 +2644,25 @@ int main() {
                         xr.eyeTrackingActive = (viewState.viewStateFlags
                             & XR_VIEW_STATE_POSITION_TRACKED_BIT) != 0;
 
+                        // Apply stereo eye factors (IPD + parallax) to raw eye positions
+                        XrVector3f processedEyes[2];
+                        ApplyEyeFactors(
+                            views[0].pose.position, views[1].pose.position,
+                            xr.nominalViewerX, xr.nominalViewerY, xr.nominalViewerZ,
+                            g_input.stereo.ipdFactor, g_input.stereo.parallaxFactor,
+                            processedEyes[0], processedEyes[1]);
+                        views[0].pose.position = processedEyes[0];
+                        views[1].pose.position = processedEyes[1];
+
                         // Apply player transform (production-engine locomotion pattern)
                         XrQuaternionf playerOri;
                         quat_from_yaw_pitch(g_input.yaw, g_input.pitch, &playerOri);
 
                         for (int i = 0; i < 2; i++) {
-                            // Scale by zoom, rotate by player, translate
-                            float lx = views[i].pose.position.x / g_input.zoomScale;
-                            float ly = views[i].pose.position.y / g_input.zoomScale;
-                            float lz = views[i].pose.position.z / g_input.zoomScale;
+                            // Scale by scaleFactor, rotate by player, translate
+                            float lx = views[i].pose.position.x / g_input.stereo.scaleFactor;
+                            float ly = views[i].pose.position.y / g_input.stereo.scaleFactor;
+                            float lz = views[i].pose.position.z / g_input.stereo.scaleFactor;
                             float wx, wy, wz;
                             quat_rotate_vec3(playerOri, lx, ly, lz, &wx, &wy, &wz);
                             views[i].pose.position = {
@@ -2141,6 +2683,10 @@ int main() {
                                 (rawEyePos[0].x + rawEyePos[1].x) / 2.0f,
                                 (rawEyePos[0].y + rawEyePos[1].y) / 2.0f,
                                 (rawEyePos[0].z + rawEyePos[1].z) / 2.0f};
+                            processedEyes[0] = {
+                                (processedEyes[0].x + processedEyes[1].x) / 2.0f,
+                                (processedEyes[0].y + processedEyes[1].y) / 2.0f,
+                                (processedEyes[0].z + processedEyes[1].z) / 2.0f};
                             views[0].pose.position = {
                                 (views[0].pose.position.x + views[1].pose.position.x) / 2.0f,
                                 (views[0].pose.position.y + views[1].pose.position.y) / 2.0f,
@@ -2180,14 +2726,13 @@ int main() {
                             for (int eye = 0; eye < eyeCount; eye++) {
                                 mat4_view_from_xr_pose(eyeParams[eye].viewMat, views[eye].pose);
 
-                                // Kooima projection uses RAW display-space positions
+                                // Kooima projection uses processed display-space positions
+                                // (after IPD + parallax factors applied earlier).
                                 // Viewport-scaled: convert window pixels to meters,
                                 // apply isotropic scale so FOV stays consistent across
                                 // window sizes on the 3D display.
                                 XrFovf submitFov = views[eye].fov;
                                 if (xr.displayWidthM > 0 && xr.displayHeightM > 0) {
-                                    float zs = g_input.zoomScale;
-                                    XrVector3f kooimaEye = {rawEyePos[eye].x / zs, rawEyePos[eye].y / zs, rawEyePos[eye].z / zs};
                                     float dispPxW = xr.displayPixelWidth > 0 ? (float)xr.displayPixelWidth : (float)xr.swapchain.width;
                                     float dispPxH = xr.displayPixelHeight > 0 ? (float)xr.displayPixelHeight : (float)xr.swapchain.height;
                                     float pxSizeX = xr.displayWidthM / dispPxW;
@@ -2202,14 +2747,17 @@ int main() {
                                     // Halve screenW only for SBS mode (each eye sees
                                     // half the display). Anaglyph/blend: full width.
                                     bool sbsMode = g_input.displayMode3D && g_currentOutputMode == 0;
-                                    float screenW = (sbsMode
-                                        ? screenWidthM / 2.0f
-                                        : screenWidthM) / zs;
-                                    float screenH = screenHeightM / zs;
+                                    float baseScreenW = sbsMode ? screenWidthM / 2.0f : screenWidthM;
+                                    // Apply stereo factors: processedEyes already have IPD+parallax
+                                    XrVector3f kooimaEye = KooimaEyePos(processedEyes[eye],
+                                        g_input.stereo.perspectiveFactor, g_input.stereo.scaleFactor);
+                                    float kScreenW, kScreenH;
+                                    KooimaScreenDim(baseScreenW, screenHeightM,
+                                        g_input.stereo.scaleFactor, kScreenW, kScreenH);
                                     mat4_kooima_projection(eyeParams[eye].projMat, kooimaEye,
-                                        screenW, screenH, 0.01f, 100.0f);
+                                        kScreenW, kScreenH, 0.01f, 100.0f);
                                     submitFov = compute_kooima_fov(kooimaEye,
-                                        screenW, screenH);
+                                        kScreenW, kScreenH);
                                 } else {
                                     mat4_from_xr_fov(eyeParams[eye].projMat, views[eye].fov, 0.01f, 100.0f);
                                 }
@@ -2286,11 +2834,13 @@ int main() {
                         "Eye L: (%.3f, %.3f, %.3f)\n"
                         "Eye R: (%.3f, %.3f, %.3f)\n"
                         "Virtual Display: (%.2f, %.2f, %.2f)\n"
-                        "Forward: (%.2f, %.2f, %.2f)  Zoom: %.2fx\n"
+                        "Forward: (%.2f, %.2f, %.2f)\n"
+                        "IPD: %.2f  Parallax: %.2f\n"
+                        "Persp: %.2f  Scale: %.2f\n"
                         "\n"
-                        "WASD/QE=Move  Drag=Look  Scroll=Zoom\n"
-                        "Space=Reset  V=2D/3D  1/2/3=Output\n"
-                        "Tab=HUD  Cmd+Ctrl+F=Fullscreen  ESC=Quit",
+                        "WASD/QE=Move  Drag=Look  Space=Reset\n"
+                        "Scroll=Scale  Shift=IPD  Ctrl=Parallax  Opt=Persp\n"
+                        "V=2D/3D  1/2/3=Output  Tab=HUD  ESC=Quit",
                         xr.systemName,
                         sessionStateName,
                         xr.hasMacosWindowBinding ? "ACTIVE" : "NOT AVAILABLE",
@@ -2309,7 +2859,8 @@ int main() {
                         -sinf(g_input.yaw) * cosf(g_input.pitch),
                          sinf(g_input.pitch),
                         -cosf(g_input.yaw) * cosf(g_input.pitch),
-                        g_input.zoomScale];
+                        g_input.stereo.ipdFactor, g_input.stereo.parallaxFactor,
+                        g_input.stereo.perspectiveFactor, g_input.stereo.scaleFactor];
                     g_hudView.hudText = text;
                     [g_hudView setNeedsDisplay:YES];
                     [g_hudView setHidden:NO];

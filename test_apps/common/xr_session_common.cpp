@@ -410,7 +410,7 @@ bool LocateViews(
     float playerPosZ,
     float playerYaw,
     float playerPitch,
-    float zoomScale
+    const StereoParams& stereo
 ) {
     XrViewLocateInfo locateInfo = {XR_TYPE_VIEW_LOCATE_INFO};
     locateInfo.viewConfigurationType = xr.viewConfigType;
@@ -432,6 +432,17 @@ bool LocateViews(
         return false;
     }
 
+    // Apply stereo eye factors (IPD + parallax) before player transform.
+    // This modifies eye positions in display space according to stereo params.
+    XrVector3f processedLeft, processedRight;
+    ApplyEyeFactors(
+        views[0].pose.position, views[1].pose.position,
+        xr.nominalViewerX, xr.nominalViewerY, xr.nominalViewerZ,
+        stereo.ipdFactor, stereo.parallaxFactor,
+        processedLeft, processedRight);
+    views[0].pose.position = processedLeft;
+    views[1].pose.position = processedRight;
+
     // Apply player transform to XR poses (production-engine locomotion pattern).
     // The reference space stays fixed at the physical tracking origin. We apply the
     // player's virtual position/orientation to every pose from OpenXR, so all
@@ -441,13 +452,13 @@ bool LocateViews(
     XMVECTOR playerPos = XMVectorSet(playerPosX, playerPosY, playerPosZ, 0.0f);
 
     for (int i = 0; i < 2; i++) {
-        // Transform position: worldPos = playerOrientation * (localPos/zoomScale) + playerPosition
-        // Zoom scales the eye position toward the display center (origin of display space),
+        // Transform position: worldPos = playerOrientation * (localPos/scaleFactor) + playerPosition
+        // Scale divides the eye position toward the display center (origin of display space),
         // reducing stereo baseline and parallax for a magnification effect.
         XMVECTOR localPos = XMVectorSet(
             views[i].pose.position.x, views[i].pose.position.y,
             views[i].pose.position.z, 0.0f);
-        localPos = localPos / zoomScale;
+        localPos = localPos / stereo.scaleFactor;
         XMVECTOR worldPos = XMVector3Rotate(localPos, playerOri) + playerPos;
 
         // Transform orientation: worldOri = playerOrientation * localOrientation

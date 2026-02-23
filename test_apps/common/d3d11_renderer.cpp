@@ -10,13 +10,20 @@
 #include <d3dcompiler.h>
 #include <cmath>
 #include <vector>
+#include <string>
+
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
 
 using namespace DirectX;
 
-// Vertex structure for cube
+// Vertex structure for cube (with UV, normal, tangent for texture mapping)
 struct CubeVertex {
     XMFLOAT3 position;
     XMFLOAT4 color;
+    XMFLOAT2 uv;
+    XMFLOAT3 normal;
+    XMFLOAT3 tangent;
 };
 
 // Vertex structure for grid lines
@@ -24,33 +31,61 @@ struct GridVertex {
     XMFLOAT3 position;
 };
 
-// HLSL shader source for cube (colored faces)
-// NOTE: Uses mul(matrix, position) convention like reference example
+// HLSL shader source for textured cube with normal mapping and directional lighting
 static const char* g_cubeShaderSource = R"(
 cbuffer Constants : register(b0) {
     float4x4 transform;
     float4 color;
+    float4x4 model;
 };
+
+Texture2D basecolorTex : register(t0);
+Texture2D normalTex : register(t1);
+Texture2D aoTex : register(t2);
+SamplerState texSampler : register(s0);
 
 struct VSInput {
     float3 position : POSITION;
     float4 color : COLOR;
+    float2 uv : TEXCOORD;
+    float3 normal : NORMAL;
+    float3 tangent : TANGENT;
 };
 
 struct PSInput {
     float4 position : SV_POSITION;
-    float4 color : COLOR;
+    float2 uv : TEXCOORD;
+    float3 worldNormal : NORMAL;
+    float3 worldTangent : TANGENT;
 };
 
 PSInput VSMain(VSInput input) {
     PSInput output;
     output.position = mul(transform, float4(input.position, 1.0));
-    output.color = input.color;
+    output.uv = input.uv;
+    float3x3 normalMat = (float3x3)model;
+    output.worldNormal = mul(normalMat, input.normal);
+    output.worldTangent = mul(normalMat, input.tangent);
     return output;
 }
 
 float4 PSMain(PSInput input) : SV_TARGET {
-    return input.color;
+    float3 basecolor = basecolorTex.Sample(texSampler, input.uv).rgb;
+    float3 normalMap = normalTex.Sample(texSampler, input.uv).rgb;
+    float ao = aoTex.Sample(texSampler, input.uv).r;
+
+    float3 N = normalize(input.worldNormal);
+    float3 T = normalize(input.worldTangent);
+    T = normalize(T - dot(T, N) * N);
+    float3 B = cross(N, T);
+    float3x3 TBN = float3x3(T, B, N);
+
+    float3 mappedNormal = normalize(mul(normalMap * 2.0 - 1.0, TBN));
+
+    float3 lightDir = normalize(float3(0.3, 0.8, 0.5));
+    float diffuse = max(dot(mappedNormal, lightDir), 0.0) * 0.7 + 0.3;
+
+    return float4(basecolor * ao * diffuse, 1.0);
 }
 )";
 
@@ -294,10 +329,13 @@ bool CreateResources(D3D11Renderer& renderer) {
         nullptr, &renderer.cubePixelShader);
     if (FAILED(hr)) return false;
 
-    // Create cube input layout
+    // Create cube input layout (position + color + uv + normal + tangent)
     D3D11_INPUT_ELEMENT_DESC cubeInputElements[] = {
         { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
         { "COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 28, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 36, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "TANGENT", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 48, D3D11_INPUT_PER_VERTEX_DATA, 0 },
     };
     hr = renderer.device->CreateInputLayout(
         cubeInputElements, ARRAYSIZE(cubeInputElements),
@@ -333,38 +371,38 @@ bool CreateResources(D3D11Renderer& renderer) {
         &renderer.gridInputLayout);
     if (FAILED(hr)) return false;
 
-    // Create cube vertices (colored faces)
+    // Create cube vertices with UV, normal, tangent for texture mapping
     CubeVertex cubeVertices[] = {
-        // Front face (red)
-        { XMFLOAT3(-0.5f, -0.5f, -0.5f), XMFLOAT4(1, 0, 0, 1) },
-        { XMFLOAT3(-0.5f,  0.5f, -0.5f), XMFLOAT4(1, 0, 0, 1) },
-        { XMFLOAT3( 0.5f,  0.5f, -0.5f), XMFLOAT4(1, 0, 0, 1) },
-        { XMFLOAT3( 0.5f, -0.5f, -0.5f), XMFLOAT4(1, 0, 0, 1) },
-        // Back face (green)
-        { XMFLOAT3(-0.5f, -0.5f,  0.5f), XMFLOAT4(0, 1, 0, 1) },
-        { XMFLOAT3( 0.5f, -0.5f,  0.5f), XMFLOAT4(0, 1, 0, 1) },
-        { XMFLOAT3( 0.5f,  0.5f,  0.5f), XMFLOAT4(0, 1, 0, 1) },
-        { XMFLOAT3(-0.5f,  0.5f,  0.5f), XMFLOAT4(0, 1, 0, 1) },
-        // Top face (blue)
-        { XMFLOAT3(-0.5f,  0.5f, -0.5f), XMFLOAT4(0, 0, 1, 1) },
-        { XMFLOAT3(-0.5f,  0.5f,  0.5f), XMFLOAT4(0, 0, 1, 1) },
-        { XMFLOAT3( 0.5f,  0.5f,  0.5f), XMFLOAT4(0, 0, 1, 1) },
-        { XMFLOAT3( 0.5f,  0.5f, -0.5f), XMFLOAT4(0, 0, 1, 1) },
-        // Bottom face (yellow)
-        { XMFLOAT3(-0.5f, -0.5f, -0.5f), XMFLOAT4(1, 1, 0, 1) },
-        { XMFLOAT3( 0.5f, -0.5f, -0.5f), XMFLOAT4(1, 1, 0, 1) },
-        { XMFLOAT3( 0.5f, -0.5f,  0.5f), XMFLOAT4(1, 1, 0, 1) },
-        { XMFLOAT3(-0.5f, -0.5f,  0.5f), XMFLOAT4(1, 1, 0, 1) },
-        // Left face (magenta)
-        { XMFLOAT3(-0.5f, -0.5f,  0.5f), XMFLOAT4(1, 0, 1, 1) },
-        { XMFLOAT3(-0.5f,  0.5f,  0.5f), XMFLOAT4(1, 0, 1, 1) },
-        { XMFLOAT3(-0.5f,  0.5f, -0.5f), XMFLOAT4(1, 0, 1, 1) },
-        { XMFLOAT3(-0.5f, -0.5f, -0.5f), XMFLOAT4(1, 0, 1, 1) },
-        // Right face (cyan)
-        { XMFLOAT3( 0.5f, -0.5f, -0.5f), XMFLOAT4(0, 1, 1, 1) },
-        { XMFLOAT3( 0.5f,  0.5f, -0.5f), XMFLOAT4(0, 1, 1, 1) },
-        { XMFLOAT3( 0.5f,  0.5f,  0.5f), XMFLOAT4(0, 1, 1, 1) },
-        { XMFLOAT3( 0.5f, -0.5f,  0.5f), XMFLOAT4(0, 1, 1, 1) },
+        // Front face (-Z): normal (0,0,-1), tangent (1,0,0)
+        { XMFLOAT3(-0.5f,-0.5f,-0.5f), XMFLOAT4(1,1,1,1), XMFLOAT2(0,1), XMFLOAT3(0,0,-1), XMFLOAT3(1,0,0) },
+        { XMFLOAT3(-0.5f, 0.5f,-0.5f), XMFLOAT4(1,1,1,1), XMFLOAT2(0,0), XMFLOAT3(0,0,-1), XMFLOAT3(1,0,0) },
+        { XMFLOAT3( 0.5f, 0.5f,-0.5f), XMFLOAT4(1,1,1,1), XMFLOAT2(1,0), XMFLOAT3(0,0,-1), XMFLOAT3(1,0,0) },
+        { XMFLOAT3( 0.5f,-0.5f,-0.5f), XMFLOAT4(1,1,1,1), XMFLOAT2(1,1), XMFLOAT3(0,0,-1), XMFLOAT3(1,0,0) },
+        // Back face (+Z): normal (0,0,1), tangent (-1,0,0)
+        { XMFLOAT3(-0.5f,-0.5f, 0.5f), XMFLOAT4(1,1,1,1), XMFLOAT2(1,1), XMFLOAT3(0,0,1), XMFLOAT3(-1,0,0) },
+        { XMFLOAT3( 0.5f,-0.5f, 0.5f), XMFLOAT4(1,1,1,1), XMFLOAT2(0,1), XMFLOAT3(0,0,1), XMFLOAT3(-1,0,0) },
+        { XMFLOAT3( 0.5f, 0.5f, 0.5f), XMFLOAT4(1,1,1,1), XMFLOAT2(0,0), XMFLOAT3(0,0,1), XMFLOAT3(-1,0,0) },
+        { XMFLOAT3(-0.5f, 0.5f, 0.5f), XMFLOAT4(1,1,1,1), XMFLOAT2(1,0), XMFLOAT3(0,0,1), XMFLOAT3(-1,0,0) },
+        // Top face (+Y): normal (0,1,0), tangent (1,0,0)
+        { XMFLOAT3(-0.5f, 0.5f,-0.5f), XMFLOAT4(1,1,1,1), XMFLOAT2(0,1), XMFLOAT3(0,1,0), XMFLOAT3(1,0,0) },
+        { XMFLOAT3(-0.5f, 0.5f, 0.5f), XMFLOAT4(1,1,1,1), XMFLOAT2(0,0), XMFLOAT3(0,1,0), XMFLOAT3(1,0,0) },
+        { XMFLOAT3( 0.5f, 0.5f, 0.5f), XMFLOAT4(1,1,1,1), XMFLOAT2(1,0), XMFLOAT3(0,1,0), XMFLOAT3(1,0,0) },
+        { XMFLOAT3( 0.5f, 0.5f,-0.5f), XMFLOAT4(1,1,1,1), XMFLOAT2(1,1), XMFLOAT3(0,1,0), XMFLOAT3(1,0,0) },
+        // Bottom face (-Y): normal (0,-1,0), tangent (1,0,0)
+        { XMFLOAT3(-0.5f,-0.5f,-0.5f), XMFLOAT4(1,1,1,1), XMFLOAT2(0,0), XMFLOAT3(0,-1,0), XMFLOAT3(1,0,0) },
+        { XMFLOAT3( 0.5f,-0.5f,-0.5f), XMFLOAT4(1,1,1,1), XMFLOAT2(1,0), XMFLOAT3(0,-1,0), XMFLOAT3(1,0,0) },
+        { XMFLOAT3( 0.5f,-0.5f, 0.5f), XMFLOAT4(1,1,1,1), XMFLOAT2(1,1), XMFLOAT3(0,-1,0), XMFLOAT3(1,0,0) },
+        { XMFLOAT3(-0.5f,-0.5f, 0.5f), XMFLOAT4(1,1,1,1), XMFLOAT2(0,1), XMFLOAT3(0,-1,0), XMFLOAT3(1,0,0) },
+        // Left face (-X): normal (-1,0,0), tangent (0,0,-1)
+        { XMFLOAT3(-0.5f,-0.5f, 0.5f), XMFLOAT4(1,1,1,1), XMFLOAT2(0,1), XMFLOAT3(-1,0,0), XMFLOAT3(0,0,-1) },
+        { XMFLOAT3(-0.5f, 0.5f, 0.5f), XMFLOAT4(1,1,1,1), XMFLOAT2(0,0), XMFLOAT3(-1,0,0), XMFLOAT3(0,0,-1) },
+        { XMFLOAT3(-0.5f, 0.5f,-0.5f), XMFLOAT4(1,1,1,1), XMFLOAT2(1,0), XMFLOAT3(-1,0,0), XMFLOAT3(0,0,-1) },
+        { XMFLOAT3(-0.5f,-0.5f,-0.5f), XMFLOAT4(1,1,1,1), XMFLOAT2(1,1), XMFLOAT3(-1,0,0), XMFLOAT3(0,0,-1) },
+        // Right face (+X): normal (1,0,0), tangent (0,0,1)
+        { XMFLOAT3( 0.5f,-0.5f,-0.5f), XMFLOAT4(1,1,1,1), XMFLOAT2(0,1), XMFLOAT3(1,0,0), XMFLOAT3(0,0,1) },
+        { XMFLOAT3( 0.5f, 0.5f,-0.5f), XMFLOAT4(1,1,1,1), XMFLOAT2(0,0), XMFLOAT3(1,0,0), XMFLOAT3(0,0,1) },
+        { XMFLOAT3( 0.5f, 0.5f, 0.5f), XMFLOAT4(1,1,1,1), XMFLOAT2(1,0), XMFLOAT3(1,0,0), XMFLOAT3(0,0,1) },
+        { XMFLOAT3( 0.5f,-0.5f, 0.5f), XMFLOAT4(1,1,1,1), XMFLOAT2(1,1), XMFLOAT3(1,0,0), XMFLOAT3(0,0,1) },
     };
 
     D3D11_BUFFER_DESC vbDesc = {};
@@ -449,11 +487,86 @@ bool CreateResources(D3D11Renderer& renderer) {
     hr = renderer.device->CreateRasterizerState(&rsDesc, &renderer.rasterizerState);
     if (FAILED(hr)) return false;
 
+    // Load textures (basecolor, normal, AO)
+    {
+        // Find executable directory for texture path
+        char exePath[MAX_PATH] = {};
+        GetModuleFileNameA(NULL, exePath, MAX_PATH);
+        std::string exeDir(exePath);
+        size_t lastSlash = exeDir.find_last_of("\\/");
+        if (lastSlash != std::string::npos) exeDir = exeDir.substr(0, lastSlash + 1);
+        std::string texDir = exeDir + "textures\\";
+
+        const char* texFiles[3] = {
+            "Wood_Crate_001_basecolor.jpg",
+            "Wood_Crate_001_normal.jpg",
+            "Wood_Crate_001_ambientOcclusion.jpg",
+        };
+        bool isNormal[3] = {false, true, false};
+        renderer.texturesLoaded = true;
+
+        for (int i = 0; i < 3; i++) {
+            std::string path = texDir + texFiles[i];
+            int w, h, channels;
+            unsigned char* pixels = stbi_load(path.c_str(), &w, &h, &channels, 4);
+            bool fallback = false;
+            if (!pixels) {
+                LOG_WARN("Failed to load texture: %s — using fallback", path.c_str());
+                w = h = 1;
+                static unsigned char whitePixel[] = {255, 255, 255, 255};
+                static unsigned char bluePixel[] = {128, 128, 255, 255};
+                pixels = isNormal[i] ? bluePixel : whitePixel;
+                fallback = true;
+                renderer.texturesLoaded = false;
+            }
+
+            D3D11_TEXTURE2D_DESC texDesc = {};
+            texDesc.Width = w;
+            texDesc.Height = h;
+            texDesc.MipLevels = 1;
+            texDesc.ArraySize = 1;
+            texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            texDesc.SampleDesc.Count = 1;
+            texDesc.Usage = D3D11_USAGE_IMMUTABLE;
+            texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+            D3D11_SUBRESOURCE_DATA texData = {};
+            texData.pSysMem = pixels;
+            texData.SysMemPitch = w * 4;
+
+            ComPtr<ID3D11Texture2D> tex;
+            hr = renderer.device->CreateTexture2D(&texDesc, &texData, &tex);
+            if (!fallback) stbi_image_free(pixels);
+            if (FAILED(hr)) continue;
+
+            hr = renderer.device->CreateShaderResourceView(tex.Get(), nullptr, &renderer.textureSRVs[i]);
+            if (FAILED(hr)) continue;
+        }
+
+        // Sampler
+        D3D11_SAMPLER_DESC sampDesc = {};
+        sampDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+        sampDesc.AddressU = D3D11_TEXTURE_ADDRESS_WRAP;
+        sampDesc.AddressV = D3D11_TEXTURE_ADDRESS_WRAP;
+        sampDesc.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
+        sampDesc.MaxAnisotropy = 1;
+        sampDesc.MaxLOD = D3D11_FLOAT32_MAX;
+        renderer.device->CreateSamplerState(&sampDesc, &renderer.textureSampler);
+
+        if (renderer.texturesLoaded) {
+            LOG_INFO("All crate textures loaded successfully");
+        } else {
+            LOG_WARN("Some textures missing — using fallback colors");
+        }
+    }
+
     return true;
 }
 
 void CleanupD3D11(D3D11Renderer& renderer) {
     // ComPtr handles cleanup automatically
+    for (int i = 0; i < 3; i++) renderer.textureSRVs[i].Reset();
+    renderer.textureSampler.Reset();
     renderer.cubeVertexShader.Reset();
     renderer.cubePixelShader.Reset();
     renderer.cubeInputLayout.Reset();
@@ -479,7 +592,8 @@ void UpdateScene(D3D11Renderer& renderer, float deltaTime) {
     }
 }
 
-static void UpdateConstantBuffer(D3D11Renderer& renderer, const XMMATRIX& wvp, const XMFLOAT4& color) {
+static void UpdateConstantBuffer(D3D11Renderer& renderer, const XMMATRIX& wvp, const XMFLOAT4& color,
+    const XMMATRIX& model = XMMatrixIdentity()) {
     D3D11_MAPPED_SUBRESOURCE mapped;
     HRESULT hr = renderer.context->Map(renderer.constantBuffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
     if (SUCCEEDED(hr)) {
@@ -492,6 +606,7 @@ static void UpdateConstantBuffer(D3D11Renderer& renderer, const XMMATRIX& wvp, c
         // without transposing (mat4f has the same row-major memory layout).
         XMStoreFloat4x4(&cb->worldViewProj, wvp);
         cb->color = color;
+        XMStoreFloat4x4(&cb->model, model);
         renderer.context->Unmap(renderer.constantBuffer.Get(), 0);
     }
 }
@@ -547,7 +662,16 @@ void RenderScene(
     renderer.context->VSSetConstantBuffers(0, 1, renderer.constantBuffer.GetAddressOf());
     renderer.context->PSSetConstantBuffers(0, 1, renderer.constantBuffer.GetAddressOf());
 
-    UpdateConstantBuffer(renderer, cubeWVP, XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f)); // White (colors come from vertices)
+    // Bind textures and sampler for cube
+    ID3D11ShaderResourceView* srvs[3] = {
+        renderer.textureSRVs[0].Get(),
+        renderer.textureSRVs[1].Get(),
+        renderer.textureSRVs[2].Get()
+    };
+    renderer.context->PSSetShaderResources(0, 3, srvs);
+    renderer.context->PSSetSamplers(0, 1, renderer.textureSampler.GetAddressOf());
+
+    UpdateConstantBuffer(renderer, cubeWVP, XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f), cubeWorld);
     renderer.context->DrawIndexed(36, 0, 0);
 
     // Render grid
@@ -627,13 +751,15 @@ void RenderCubeWithMVP(
         ConstantBufferData* cb = (ConstantBufferData*)mapped.pData;
         memcpy(&cb->worldViewProj, mvpData, sizeof(float) * 16);
         cb->color = XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f);
+        // Set model to identity for native app (MVP already includes model transform)
+        XMStoreFloat4x4(&cb->model, XMMatrixIdentity());
         renderer.context->Unmap(renderer.constantBuffer.Get(), 0);
     }
 
     // Set up cube rendering
     renderer.context->IASetInputLayout(renderer.cubeInputLayout.Get());
     renderer.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    UINT stride = 28;  // sizeof(CubeVertex) = 3 floats + 4 floats = 28 bytes
+    UINT stride = sizeof(CubeVertex);
     UINT offset = 0;
     renderer.context->IASetVertexBuffers(0, 1, renderer.cubeVertexBuffer.GetAddressOf(), &stride, &offset);
     renderer.context->IASetIndexBuffer(renderer.cubeIndexBuffer.Get(), DXGI_FORMAT_R16_UINT, 0);
@@ -641,6 +767,15 @@ void RenderCubeWithMVP(
     renderer.context->PSSetShader(renderer.cubePixelShader.Get(), nullptr, 0);
     renderer.context->VSSetConstantBuffers(0, 1, renderer.constantBuffer.GetAddressOf());
     renderer.context->PSSetConstantBuffers(0, 1, renderer.constantBuffer.GetAddressOf());
+
+    // Bind textures and sampler
+    ID3D11ShaderResourceView* srvs[3] = {
+        renderer.textureSRVs[0].Get(),
+        renderer.textureSRVs[1].Get(),
+        renderer.textureSRVs[2].Get()
+    };
+    renderer.context->PSSetShaderResources(0, 3, srvs);
+    renderer.context->PSSetSamplers(0, 1, renderer.textureSampler.GetAddressOf());
 
     // Draw cube
     renderer.context->DrawIndexed(36, 0, 0);

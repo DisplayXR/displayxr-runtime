@@ -101,6 +101,16 @@ if(MSVC)
     )
 endif()
 
+# Copy texture files to build output directory
+file(GLOB TEXTURE_FILES "${CMAKE_CURRENT_SOURCE_DIR}/../common/textures/*.jpg")
+if(TEXTURE_FILES)
+    add_custom_command(TARGET sr_cube_openxr_ext POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:sr_cube_openxr_ext>/textures"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${TEXTURE_FILES} "$<TARGET_FILE_DIR:sr_cube_openxr_ext>/textures/"
+        COMMENT "Copying texture files to build output"
+    )
+endif()
+
 # Copy runtime DLLs
 if(TARGET OpenXR::openxr_loader)
     get_target_property(_loader_location OpenXR::openxr_loader IMPORTED_LOCATION)

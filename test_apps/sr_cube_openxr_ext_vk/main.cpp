@@ -248,7 +248,7 @@ static void RenderThreadFunc(
             if (resetRequested) {
                 g_inputState.yaw = inputSnapshot.yaw;
                 g_inputState.pitch = inputSnapshot.pitch;
-                g_inputState.zoomScale = inputSnapshot.zoomScale;
+                g_inputState.stereo = inputSnapshot.stereo;
             }
         }
 
@@ -275,7 +275,7 @@ static void RenderThreadFunc(
                         rightViewMatrix, rightProjMatrix,
                         inputSnapshot.cameraPosX, inputSnapshot.cameraPosY, inputSnapshot.cameraPosZ,
                         inputSnapshot.yaw, inputSnapshot.pitch,
-                        inputSnapshot.zoomScale)) {
+                        inputSnapshot.stereo)) {
                         LOG_INFO("[FRAME] LocateViews OK");
 
                         // Get raw view poses for projection views.
@@ -338,24 +338,31 @@ static void RenderThreadFunc(
                             // float screenWidthM = xr->displayWidthM * (float)eyeRenderW / (float)(xr->swapchain.width / 2);
                             // float screenHeightM = xr->displayHeightM * (float)eyeRenderH / (float)xr->swapchain.height;
 
-                            // Display-center zoom: scale eye positions and screen size by
-                            // 1/zoomScale. These cancel in Kooima (same ratio), but are kept
-                            // explicit for upcoming baseline/parallax/perspective modifiers.
-                            float zs = inputSnapshot.zoomScale;
-                            for (int e = 0; e < 2; e++) {
-                                XrVector3f eyePos = rawViews[e].pose.position;
-                                eyePos.x /= zs;
-                                eyePos.y /= zs;
-                                eyePos.z /= zs;
-                                if (e == 0)
-                                    leftProjMatrix = ComputeKooimaProjection(
-                                        eyePos, screenWidthM / zs, screenHeightM / zs, 0.01f, 100.0f);
-                                else
-                                    rightProjMatrix = ComputeKooimaProjection(
-                                        eyePos, screenWidthM / zs, screenHeightM / zs, 0.01f, 100.0f);
-                                appFov[e] = ComputeKooimaFov(
-                                    eyePos, screenWidthM / zs, screenHeightM / zs);
-                            }
+                        // Apply stereo eye factors (IPD + parallax) to raw eye positions
+                        XrVector3f processedEyes[2];
+                        ApplyEyeFactors(
+                            rawViews[0].pose.position, rawViews[1].pose.position,
+                            xr->nominalViewerX, xr->nominalViewerY, xr->nominalViewerZ,
+                            inputSnapshot.stereo.ipdFactor, inputSnapshot.stereo.parallaxFactor,
+                            processedEyes[0], processedEyes[1]);
+
+                        // Kooima projection with perspective + scale factors
+                        float kScreenW, kScreenH;
+                        KooimaScreenDim(screenWidthM, screenHeightM,
+                            inputSnapshot.stereo.scaleFactor, kScreenW, kScreenH);
+                        for (int e = 0; e < 2; e++) {
+                            XrVector3f kooimaEye = KooimaEyePos(processedEyes[e],
+                                inputSnapshot.stereo.perspectiveFactor,
+                                inputSnapshot.stereo.scaleFactor);
+                            if (e == 0)
+                                leftProjMatrix = ComputeKooimaProjection(
+                                    kooimaEye, kScreenW, kScreenH, 0.01f, 100.0f);
+                            else
+                                rightProjMatrix = ComputeKooimaProjection(
+                                    kooimaEye, kScreenW, kScreenH, 0.01f, 100.0f);
+                            appFov[e] = ComputeKooimaFov(
+                                kooimaEye, kScreenW, kScreenH);
+                        }
                         }
 
                         rendered = true;
@@ -378,7 +385,7 @@ static void RenderThreadFunc(
                             RenderScene(*renderer, imageIndex,
                                 xr->swapchain.width, xr->swapchain.height,
                                 eyeParams, 2,
-                                useAppProjection ? 1.0f : inputSnapshot.zoomScale);
+                                useAppProjection ? 1.0f : inputSnapshot.stereo.scaleFactor);
 
                             for (int eye = 0; eye < 2; eye++) {
                                 projectionViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
@@ -429,12 +436,15 @@ static void RenderThreadFunc(
                                 float fwdZ = -cosf(inputSnapshot.yaw) * cosf(inputSnapshot.pitch);
                                 std::wstring cameraText = FormatCameraInfo(
                                     inputSnapshot.cameraPosX, inputSnapshot.cameraPosY, inputSnapshot.cameraPosZ,
-                                    fwdX, fwdY, fwdZ, inputSnapshot.zoomScale);
+                                    fwdX, fwdY, fwdZ);
+                                std::wstring stereoText = FormatStereoParams(
+                                    inputSnapshot.stereo.ipdFactor, inputSnapshot.stereo.parallaxFactor,
+                                    inputSnapshot.stereo.perspectiveFactor, inputSnapshot.stereo.scaleFactor);
                                 std::wstring helpText = FormatHelpText();
 
                                 uint32_t srcRowPitch = 0;
                                 const void* pixels = RenderHudAndMap(*hud, &srcRowPitch, sessionText, modeText, perfText, dispText, eyeText,
-                                    cameraText, helpText);
+                                    cameraText, stereoText, helpText);
                                 if (pixels) {
                                     const uint8_t* src = (const uint8_t*)pixels;
                                     uint8_t* dst = (uint8_t*)hudStagingMapped;

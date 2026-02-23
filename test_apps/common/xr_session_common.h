@@ -31,6 +31,8 @@
 #include <vector>
 #include <string>
 
+#include "stereo_params.h"
+
 // [Commented out — will be reused for 3D-positioned HUD later]
 // struct ConvergencePlane {
 //     XrPosef pose;    // center position + orientation in LOCAL space
@@ -156,7 +158,7 @@ bool LocateViews(
     float playerPosZ = 0.0f,
     float playerYaw = 0.0f,
     float playerPitch = 0.0f,
-    float zoomScale = 1.0f
+    const StereoParams& stereo = StereoParams{}
 );
 
 // Acquire swapchain image for rendering

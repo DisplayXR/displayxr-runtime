@@ -82,6 +82,7 @@ const void* RenderHudAndMap(HudRenderer& hud, uint32_t* rowPitch,
     const std::wstring& perfText, const std::wstring& displayInfoText,
     const std::wstring& eyeText,
     const std::wstring& cameraText,
+    const std::wstring& stereoText,
     const std::wstring& helpText)
 {
     // Clear render texture with semi-transparent black
@@ -93,11 +94,11 @@ const void* RenderHudAndMap(HudRenderer& hud, uint32_t* rowPitch,
         rtv->Release();
     }
 
-    // Has extra sections (camera, help)?
-    bool hasExtra = !cameraText.empty() || !helpText.empty();
+    // Has extra sections (camera, stereo, help)?
+    bool hasExtra = !cameraText.empty() || !stereoText.empty() || !helpText.empty();
 
     // Scale layout proportionally from base dimensions
-    float baseH = hasExtra ? 420.0f : 280.0f;
+    float baseH = hasExtra ? 470.0f : 280.0f;
     float sy = hud.height / baseH;
     float px = 12.0f * (hud.width / 380.0f);   // left padding
     float tw = (float)hud.width - 2.0f * px;    // text width
@@ -119,12 +120,17 @@ const void* RenderHudAndMap(HudRenderer& hud, uint32_t* rowPitch,
 
     if (!cameraText.empty()) {
         RenderText(hud.overlay, hud.device.Get(), hud.renderTex.Get(),
-            cameraText, px, 272*sy, tw, 66*sy, true);
+            cameraText, px, 272*sy, tw, 44*sy, true);
+    }
+
+    if (!stereoText.empty()) {
+        RenderText(hud.overlay, hud.device.Get(), hud.renderTex.Get(),
+            stereoText, px, 322*sy, tw, 44*sy, true);
     }
 
     if (!helpText.empty()) {
         RenderText(hud.overlay, hud.device.Get(), hud.renderTex.Get(),
-            helpText, px, 348*sy, tw, 60*sy, true);
+            helpText, px, 376*sy, tw, 80*sy, true);
     }
 
     // Copy render texture to staging texture, then map for CPU read

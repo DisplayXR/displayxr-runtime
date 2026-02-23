@@ -43,6 +43,10 @@ typedef ptrdiff_t GLintptr;
 #define GL_RGBA8                          0x8058
 #define GL_TEXTURE_WRAP_S                 0x2802
 #define GL_TEXTURE_WRAP_T                 0x2803
+#define GL_TEXTURE0                       0x84C0
+#ifndef GL_LINEAR_MIPMAP_LINEAR
+#define GL_LINEAR_MIPMAP_LINEAR           0x2703
+#endif
 
 // WGL constants
 #define WGL_CONTEXT_MAJOR_VERSION_ARB     0x2091
@@ -89,6 +93,9 @@ typedef void (APIENTRY *PFNGLFRAMEBUFFERRENDERBUFFERPROC)(GLenum target, GLenum 
 typedef void (APIENTRY *PFNGLDELETERENDERBUFFERSPROC)(GLsizei n, const GLuint* renderbuffers);
 typedef void (APIENTRY *PFNGLBLITFRAMEBUFFERPROC)(GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1,
     GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1, GLbitfield mask, GLenum filter);
+typedef void (APIENTRY *PFNGLACTIVETEXTUREPROC)(GLenum texture);
+typedef void (APIENTRY *PFNGLUNIFORM1IPROC)(GLint location, GLint v0);
+typedef void (APIENTRY *PFNGLGENERATEMIPMAPPROC)(GLenum target);
 
 typedef HGLRC (APIENTRY *PFNWGLCREATECONTEXTATTRIBSARBPROC)(HDC hDC, HGLRC hShareContext, const int* attribList);
 
@@ -129,6 +136,9 @@ extern PFNGLRENDERBUFFERSTORAGEPROC glRenderbufferStorage_;
 extern PFNGLFRAMEBUFFERRENDERBUFFERPROC glFramebufferRenderbuffer_;
 extern PFNGLDELETERENDERBUFFERSPROC glDeleteRenderbuffers_;
 extern PFNGLBLITFRAMEBUFFERPROC glBlitFramebuffer_;
+extern PFNGLACTIVETEXTUREPROC glActiveTexture_;
+extern PFNGLUNIFORM1IPROC glUniform1i_;
+extern PFNGLGENERATEMIPMAPPROC glGenerateMipmap_;
 
 extern PFNWGLCREATECONTEXTATTRIBSARBPROC wglCreateContextAttribsARB_;
 

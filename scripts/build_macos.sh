@@ -107,6 +107,10 @@ cp "$RUNTIME_LIB" "$PKG_DIR/lib/"
 cp "$ROOT/test_apps/sim_cube_openxr/build/sim_cube_openxr" "$PKG_DIR/bin/"
 cp "$ROOT/test_apps/sim_cube_openxr_ext_macos/build/sim_cube_openxr_ext_macos" "$PKG_DIR/bin/"
 
+# Copy texture files for ext app
+mkdir -p "$PKG_DIR/bin/textures"
+cp "$ROOT/test_apps/common/textures/"*.jpg "$PKG_DIR/bin/textures/" 2>/dev/null || true
+
 # Copy OpenXR loader
 cp "$OPENXR_DIR"/lib/libopenxr_loader*.dylib "$PKG_DIR/lib/"
 

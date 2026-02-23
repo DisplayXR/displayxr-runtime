@@ -13,6 +13,8 @@
 #include <windows.h>
 #include <string>
 
+#include "stereo_params.h"
+
 struct InputState {
     // Mouse state
     int mouseX = 0;
@@ -56,8 +58,8 @@ struct InputState {
     bool fullscreen = false;
     bool fullscreenToggleRequested = false;
 
-    // Mouse scroll zoom
-    float zoomScale = 1.0f;
+    // Stereo camera parameters (IPD, parallax, perspective, scale/zoom)
+    StereoParams stereo;
 
     // HUD visibility toggle (TAB key)
     bool hudVisible = true;

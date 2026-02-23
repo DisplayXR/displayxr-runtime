@@ -21,10 +21,21 @@ struct VkRenderer {
     // Render pass (clears attachments, single pass renders all eyes)
     VkRenderPass renderPass = VK_NULL_HANDLE;
 
-    // Pipeline layout + pipelines
-    VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
+    // Pipeline layouts + pipelines
+    VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;      // Grid: 64-byte push constants
+    VkPipelineLayout cubePipelineLayout = VK_NULL_HANDLE;   // Cube: descriptor set + 128-byte push constants
     VkPipeline cubePipeline = VK_NULL_HANDLE;
     VkPipeline gridPipeline = VK_NULL_HANDLE;
+
+    // Textures (basecolor, normal, AO)
+    VkImage texImages[3] = {VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkDeviceMemory texMemory[3] = {VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkImageView texViews[3] = {VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
+    VkSampler texSampler = VK_NULL_HANDLE;
+    VkDescriptorSetLayout descriptorSetLayout = VK_NULL_HANDLE;
+    VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
+    VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+    bool texturesLoaded = false;
 
     // Cube geometry
     VkBuffer cubeVertexBuffer = VK_NULL_HANDLE;
@@ -57,10 +68,16 @@ struct VkRenderer {
     float cubeRotation = 0.0f;
 };
 
-// Push constant data: MVP matrix + color
+// Push constant data for grid: MVP matrix + color (64 bytes)
 struct VkPushConstants {
     DirectX::XMFLOAT4X4 transform;
     float color[4];
+};
+
+// Push constant data for textured cube: MVP + model matrices (128 bytes)
+struct VkCubePushConstants {
+    DirectX::XMFLOAT4X4 mvp;
+    DirectX::XMFLOAT4X4 model;
 };
 
 // Initialize Vulkan renderer (pipelines, geometry)

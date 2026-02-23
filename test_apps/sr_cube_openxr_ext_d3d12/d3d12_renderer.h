@@ -54,6 +54,13 @@ struct D3D12Renderer {
     ComPtr<ID3D12DescriptorHeap> dsvHeap;
     UINT dsvDescriptorSize = 0;
 
+    // Textures (basecolor, normal, AO)
+    ComPtr<ID3D12Resource> texResources[3];
+    ComPtr<ID3D12DescriptorHeap> srvHeap;
+    ComPtr<ID3D12RootSignature> cubeRootSignature;
+    ComPtr<ID3D12PipelineState> cubePSOTextured;
+    bool texturesLoaded = false;
+
     // Synchronization
     ComPtr<ID3D12Fence> fence;
     UINT64 fenceValue = 0;
@@ -69,6 +76,7 @@ struct D3D12Renderer {
 struct D3D12ConstantBuffer {
     DirectX::XMFLOAT4X4 worldViewProj;
     DirectX::XMFLOAT4 color;
+    DirectX::XMFLOAT4X4 model;
 };
 
 // Initialize D3D12 device on a specific adapter

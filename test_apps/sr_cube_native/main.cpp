@@ -424,7 +424,7 @@ static void RenderThreadFunc(HWND hwnd, D3D11Renderer* renderer, TextOverlay* te
             if (resetRequested) {
                 g_inputState.yaw = inputSnapshot.yaw;
                 g_inputState.pitch = inputSnapshot.pitch;
-                g_inputState.zoomScale = inputSnapshot.zoomScale;
+                g_inputState.stereo = inputSnapshot.stereo;
             }
         }
 

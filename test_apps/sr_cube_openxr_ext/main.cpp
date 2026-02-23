@@ -44,7 +44,7 @@ static UINT g_windowWidth = 1280;
 static UINT g_windowHeight = 720;
 static bool g_inSizeMove = false;  // True while user is dragging/resizing the window
 static const uint32_t HUD_PIXEL_WIDTH = 380;
-static const uint32_t HUD_PIXEL_HEIGHT = 420;
+static const uint32_t HUD_PIXEL_HEIGHT = 470;
 static const float HUD_WIDTH_FRACTION = 0.30f;
 
 // sim_display output mode switching (loaded at runtime via GetProcAddress)
@@ -302,7 +302,7 @@ static void RenderOneFrame(RenderState& rs) {
                     rightViewMatrix, rightProjMatrix,
                     g_inputState.cameraPosX, g_inputState.cameraPosY, g_inputState.cameraPosZ,
                     g_inputState.yaw, g_inputState.pitch,
-                    g_inputState.zoomScale)) {
+                    g_inputState.stereo)) {
 
                     // Get raw view poses (pre-player-transform) for projection views.
                     // Use DISPLAY space when available: it is physically anchored to the
@@ -353,23 +353,30 @@ static void RenderOneFrame(RenderState& rs) {
                         // float screenWidthM = xr.displayWidthM * (float)eyeRenderW / (float)(xr.swapchain.width / 2);
                         // float screenHeightM = xr.displayHeightM * (float)eyeRenderH / (float)xr.swapchain.height;
 
-                        // Display-center zoom: scale eye positions and screen size by
-                        // 1/zoomScale. These cancel in Kooima (same ratio), but are kept
-                        // explicit for upcoming baseline/parallax/perspective modifiers.
-                        float zs = g_inputState.zoomScale;
+                        // Apply stereo eye factors (IPD + parallax) to raw eye positions
+                        XrVector3f processedEyes[2];
+                        ApplyEyeFactors(
+                            rawViews[0].pose.position, rawViews[1].pose.position,
+                            xr.nominalViewerX, xr.nominalViewerY, xr.nominalViewerZ,
+                            g_inputState.stereo.ipdFactor, g_inputState.stereo.parallaxFactor,
+                            processedEyes[0], processedEyes[1]);
+
+                        // Kooima projection with perspective + scale factors
+                        float kScreenW, kScreenH;
+                        KooimaScreenDim(screenWidthM, screenHeightM,
+                            g_inputState.stereo.scaleFactor, kScreenW, kScreenH);
                         for (int e = 0; e < 2; e++) {
-                            XrVector3f eyePos = rawViews[e].pose.position;
-                            eyePos.x /= zs;
-                            eyePos.y /= zs;
-                            eyePos.z /= zs;
+                            XrVector3f kooimaEye = KooimaEyePos(processedEyes[e],
+                                g_inputState.stereo.perspectiveFactor,
+                                g_inputState.stereo.scaleFactor);
                             if (e == 0)
                                 leftProjMatrix = ComputeKooimaProjection(
-                                    eyePos, screenWidthM / zs, screenHeightM / zs, 0.01f, 100.0f);
+                                    kooimaEye, kScreenW, kScreenH, 0.01f, 100.0f);
                             else
                                 rightProjMatrix = ComputeKooimaProjection(
-                                    eyePos, screenWidthM / zs, screenHeightM / zs, 0.01f, 100.0f);
+                                    kooimaEye, kScreenW, kScreenH, 0.01f, 100.0f);
                             appFov[e] = ComputeKooimaFov(
-                                eyePos, screenWidthM / zs, screenHeightM / zs);
+                                kooimaEye, kScreenW, kScreenH);
                         }
                     }
 
@@ -422,13 +429,16 @@ static void RenderOneFrame(RenderState& rs) {
                             float fwdZ = -cosf(g_inputState.yaw) * cosf(g_inputState.pitch);
                             std::wstring cameraText = FormatCameraInfo(
                                 g_inputState.cameraPosX, g_inputState.cameraPosY, g_inputState.cameraPosZ,
-                                fwdX, fwdY, fwdZ, g_inputState.zoomScale);
+                                fwdX, fwdY, fwdZ);
+                            std::wstring stereoText = FormatStereoParams(
+                                g_inputState.stereo.ipdFactor, g_inputState.stereo.parallaxFactor,
+                                g_inputState.stereo.perspectiveFactor, g_inputState.stereo.scaleFactor);
                             std::wstring helpText = FormatHelpText();
 
                             uint32_t srcRowPitch = 0;
                             const void* pixels = RenderHudAndMap(*rs.hudRenderer, &srcRowPitch,
                                 sessionText, modeText, perfText, dispText, eyeText,
-                                cameraText, helpText);
+                                cameraText, stereoText, helpText);
                             if (pixels) {
                                 ID3D11Texture2D* hudTexture = (*rs.hudSwapchainImages)[hudImageIndex].texture;
                                 D3D11_BOX box = {0, 0, 0, xr.hudSwapchain.width, xr.hudSwapchain.height, 1};
@@ -456,7 +466,6 @@ static void RenderOneFrame(RenderState& rs) {
                         monoPose.position.z = (rawViews[0].pose.position.z + rawViews[1].pose.position.z) * 0.5f;
 
                         if (useAppProjection) {
-                            XrVector3f centerEye = monoPose.position;
                             float pxSizeX = xr.displayWidthM / (float)xr.swapchain.width;
                             float pxSizeY = xr.displayHeightM / (float)xr.swapchain.height;
                             float winW_m = (float)g_windowWidth * pxSizeX;
@@ -466,14 +475,21 @@ static void RenderOneFrame(RenderState& rs) {
                             float vs = minDisp / minWin;
                             float screenWidthM  = winW_m * vs;
                             float screenHeightM = winH_m * vs;
-                            float zs = g_inputState.zoomScale;
-                            centerEye.x /= zs;
-                            centerEye.y /= zs;
-                            centerEye.z /= zs;
+                            // Mono center eye uses parallax factor only (no IPD)
+                            XrVector3f centerEye = monoPose.position;
+                            float cx = centerEye.x, cy = centerEye.y, cz = centerEye.z;
+                            centerEye.x = xr.nominalViewerX + g_inputState.stereo.parallaxFactor * (cx - xr.nominalViewerX);
+                            centerEye.y = xr.nominalViewerY + g_inputState.stereo.parallaxFactor * (cy - xr.nominalViewerY);
+                            centerEye.z = xr.nominalViewerZ + g_inputState.stereo.parallaxFactor * (cz - xr.nominalViewerZ);
+                            XrVector3f kooimaEye = KooimaEyePos(centerEye,
+                                g_inputState.stereo.perspectiveFactor, g_inputState.stereo.scaleFactor);
+                            float kScreenW, kScreenH;
+                            KooimaScreenDim(screenWidthM, screenHeightM,
+                                g_inputState.stereo.scaleFactor, kScreenW, kScreenH);
                             monoProjMatrix = ComputeKooimaProjection(
-                                centerEye, screenWidthM / zs, screenHeightM / zs, 0.01f, 100.0f);
+                                kooimaEye, kScreenW, kScreenH, 0.01f, 100.0f);
                             monoFov = ComputeKooimaFov(
-                                centerEye, screenWidthM / zs, screenHeightM / zs);
+                                kooimaEye, kScreenW, kScreenH);
                         } else {
                             // Use average of left/right view/proj matrices
                             monoProjMatrix = leftProjMatrix;  // Close enough for 2D
@@ -490,7 +506,7 @@ static void RenderOneFrame(RenderState& rs) {
                                 rawViews[0].pose.orientation.x, rawViews[0].pose.orientation.y,
                                 rawViews[0].pose.orientation.z, rawViews[0].pose.orientation.w);
 
-                            float zoomS = g_inputState.zoomScale;
+                            float zoomS = g_inputState.stereo.scaleFactor;
                             XMVECTOR playerOri = XMQuaternionRotationRollPitchYaw(
                                 g_inputState.pitch, g_inputState.yaw, 0);
                             XMVECTOR playerPos = XMVectorSet(
@@ -554,7 +570,7 @@ static void RenderOneFrame(RenderState& rs) {
                             RenderScene(renderer, rtv, rs.depthDSV.Get(),
                                 renderW, renderH,
                                 viewMatrix, projMatrix,
-                                useAppProjection ? 1.0f : g_inputState.zoomScale,
+                                useAppProjection ? 1.0f : g_inputState.stereo.scaleFactor,
                                 0.03f);  // cubeHeight = 0.03 (half cube size)
 
                             projectionViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;

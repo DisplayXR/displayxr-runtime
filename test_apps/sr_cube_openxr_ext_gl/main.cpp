@@ -343,7 +343,7 @@ static void RenderThreadFunc(
             if (resetRequested) {
                 g_inputState.yaw = inputSnapshot.yaw;
                 g_inputState.pitch = inputSnapshot.pitch;
-                g_inputState.zoomScale = inputSnapshot.zoomScale;
+                g_inputState.stereo = inputSnapshot.stereo;
             }
         }
 
@@ -375,7 +375,7 @@ static void RenderThreadFunc(
                         rightViewMatrix, rightProjMatrix,
                         inputSnapshot.cameraPosX, inputSnapshot.cameraPosY, inputSnapshot.cameraPosZ,
                         inputSnapshot.yaw, inputSnapshot.pitch,
-                        inputSnapshot.zoomScale)) {
+                        inputSnapshot.stereo)) {
 
                         // Get raw view poses for projection views.
                         // Use DISPLAY space when available: it is physically anchored to the
@@ -448,23 +448,30 @@ static void RenderThreadFunc(
                             // float screenWidthM = xr->displayWidthM * (float)renderW / (float)eyeRenderW;
                             // float screenHeightM = xr->displayHeightM * (float)renderH / (float)eyeRenderH;
 
-                            // Display-center zoom: scale eye positions and screen size by
-                            // 1/zoomScale. These cancel in Kooima (same ratio), but are kept
-                            // explicit for upcoming baseline/parallax/perspective modifiers.
-                            float zs = inputSnapshot.zoomScale;
+                            // Apply stereo eye factors (IPD + parallax) to raw eye positions
+                            XrVector3f processedEyes[2];
+                            ApplyEyeFactors(
+                                rawViews[0].pose.position, rawViews[1].pose.position,
+                                xr->nominalViewerX, xr->nominalViewerY, xr->nominalViewerZ,
+                                inputSnapshot.stereo.ipdFactor, inputSnapshot.stereo.parallaxFactor,
+                                processedEyes[0], processedEyes[1]);
+
+                            // Kooima projection with perspective + scale factors
+                            float kScreenW, kScreenH;
+                            KooimaScreenDim(screenWidthM, screenHeightM,
+                                inputSnapshot.stereo.scaleFactor, kScreenW, kScreenH);
                             for (int e = 0; e < 2; e++) {
-                                XrVector3f eyePos = rawViews[e].pose.position;
-                                eyePos.x /= zs;
-                                eyePos.y /= zs;
-                                eyePos.z /= zs;
+                                XrVector3f kooimaEye = KooimaEyePos(processedEyes[e],
+                                    inputSnapshot.stereo.perspectiveFactor,
+                                    inputSnapshot.stereo.scaleFactor);
                                 if (e == 0)
                                     leftProjMatrix = ComputeKooimaProjection(
-                                        eyePos, screenWidthM / zs, screenHeightM / zs, 0.01f, 100.0f);
+                                        kooimaEye, kScreenW, kScreenH, 0.01f, 100.0f);
                                 else
                                     rightProjMatrix = ComputeKooimaProjection(
-                                        eyePos, screenWidthM / zs, screenHeightM / zs, 0.01f, 100.0f);
+                                        kooimaEye, kScreenW, kScreenH, 0.01f, 100.0f);
                                 appFov[e] = ComputeKooimaFov(
-                                    eyePos, screenWidthM / zs, screenHeightM / zs);
+                                    kooimaEye, kScreenW, kScreenH);
                             }
                         }
 
@@ -491,14 +498,20 @@ static void RenderThreadFunc(
                                 float vs = minDisp / minWin;
                                 float screenWidthM  = winW_m * vs;
                                 float screenHeightM = winH_m * vs;
-                                float zs = inputSnapshot.zoomScale;
-                                centerEye.x /= zs;
-                                centerEye.y /= zs;
-                                centerEye.z /= zs;
+                                // Mono center eye uses parallax factor only (no IPD)
+                                float cx = centerEye.x, cy = centerEye.y, cz = centerEye.z;
+                                centerEye.x = xr->nominalViewerX + inputSnapshot.stereo.parallaxFactor * (cx - xr->nominalViewerX);
+                                centerEye.y = xr->nominalViewerY + inputSnapshot.stereo.parallaxFactor * (cy - xr->nominalViewerY);
+                                centerEye.z = xr->nominalViewerZ + inputSnapshot.stereo.parallaxFactor * (cz - xr->nominalViewerZ);
+                                XrVector3f kooimaEye = KooimaEyePos(centerEye,
+                                    inputSnapshot.stereo.perspectiveFactor, inputSnapshot.stereo.scaleFactor);
+                                float kScreenW, kScreenH;
+                                KooimaScreenDim(screenWidthM, screenHeightM,
+                                    inputSnapshot.stereo.scaleFactor, kScreenW, kScreenH);
                                 monoProjMatrix = ComputeKooimaProjection(
-                                    centerEye, screenWidthM / zs, screenHeightM / zs, 0.01f, 100.0f);
+                                    kooimaEye, kScreenW, kScreenH, 0.01f, 100.0f);
                                 monoFov = ComputeKooimaFov(
-                                    centerEye, screenWidthM / zs, screenHeightM / zs);
+                                    kooimaEye, kScreenW, kScreenH);
                             } else {
                                 monoProjMatrix = leftProjMatrix;
                                 monoFov = rawViews[0].fov;
@@ -514,7 +527,7 @@ static void RenderThreadFunc(
                                     rawViews[0].pose.orientation.x, rawViews[0].pose.orientation.y,
                                     rawViews[0].pose.orientation.z, rawViews[0].pose.orientation.w);
 
-                                float zoomS = inputSnapshot.zoomScale;
+                                float zoomS = inputSnapshot.stereo.scaleFactor;
                                 XMVECTOR playerOri = XMQuaternionRotationRollPitchYaw(
                                     inputSnapshot.pitch, inputSnapshot.yaw, 0);
                                 XMVECTOR playerPos = XMVectorSet(
@@ -543,7 +556,7 @@ static void RenderThreadFunc(
                                     monoMode ? 0 : eye * renderW, 0,
                                     renderW, renderH,
                                     viewMatrix, projMatrix,
-                                    useAppProjection ? 1.0f : inputSnapshot.zoomScale);
+                                    useAppProjection ? 1.0f : inputSnapshot.stereo.scaleFactor);
 
                                 projectionViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
                                 projectionViews[eye].subImage.swapchain = xr->swapchain.swapchain;
@@ -616,13 +629,16 @@ static void RenderThreadFunc(
                                 float fwdZ = -cosf(inputSnapshot.yaw) * cosf(inputSnapshot.pitch);
                                 std::wstring cameraText = FormatCameraInfo(
                                     inputSnapshot.cameraPosX, inputSnapshot.cameraPosY, inputSnapshot.cameraPosZ,
-                                    fwdX, fwdY, fwdZ, inputSnapshot.zoomScale);
+                                    fwdX, fwdY, fwdZ);
+                                std::wstring stereoText = FormatStereoParams(
+                                    inputSnapshot.stereo.ipdFactor, inputSnapshot.stereo.parallaxFactor,
+                                    inputSnapshot.stereo.perspectiveFactor, inputSnapshot.stereo.scaleFactor);
                                 std::wstring helpText = FormatHelpText();
 
                                 uint32_t srcRowPitch = 0;
                                 const void* pixels = RenderHudAndMap(*hud, &srcRowPitch,
                                     sessionText, modeText, perfText, dispText, eyeText,
-                                    cameraText, helpText);
+                                    cameraText, stereoText, helpText);
                                 bool uploadOk = false;
                                 if (pixels) {
                                     // Clear any prior GL errors

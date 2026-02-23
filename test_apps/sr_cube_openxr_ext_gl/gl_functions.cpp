@@ -45,6 +45,9 @@ PFNGLRENDERBUFFERSTORAGEPROC glRenderbufferStorage_ = nullptr;
 PFNGLFRAMEBUFFERRENDERBUFFERPROC glFramebufferRenderbuffer_ = nullptr;
 PFNGLDELETERENDERBUFFERSPROC glDeleteRenderbuffers_ = nullptr;
 PFNGLBLITFRAMEBUFFERPROC glBlitFramebuffer_ = nullptr;
+PFNGLACTIVETEXTUREPROC glActiveTexture_ = nullptr;
+PFNGLUNIFORM1IPROC glUniform1i_ = nullptr;
+PFNGLGENERATEMIPMAPPROC glGenerateMipmap_ = nullptr;
 
 PFNWGLCREATECONTEXTATTRIBSARBPROC wglCreateContextAttribsARB_ = nullptr;
 
@@ -91,6 +94,9 @@ bool LoadGLFunctions() {
     LOAD_GL(glFramebufferRenderbuffer, PFNGLFRAMEBUFFERRENDERBUFFERPROC);
     LOAD_GL(glDeleteRenderbuffers, PFNGLDELETERENDERBUFFERSPROC);
     LOAD_GL(glBlitFramebuffer, PFNGLBLITFRAMEBUFFERPROC);
+    LOAD_GL(glActiveTexture, PFNGLACTIVETEXTUREPROC);
+    LOAD_GL(glUniform1i, PFNGLUNIFORM1IPROC);
+    LOAD_GL(glGenerateMipmap, PFNGLGENERATEMIPMAPPROC);
 
     // WGL extensions (optional — may already be loaded for context creation)
     wglCreateContextAttribsARB_ = (PFNWGLCREATECONTEXTATTRIBSARBPROC)wglGetProcAddress("wglCreateContextAttribsARB");

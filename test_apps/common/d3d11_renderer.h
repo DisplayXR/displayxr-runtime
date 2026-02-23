@@ -44,6 +44,11 @@ struct D3D11Renderer {
     ComPtr<ID3D11DepthStencilState> depthStencilState;
     ComPtr<ID3D11RasterizerState> rasterizerState;
 
+    // Textures (basecolor, normal, AO)
+    ComPtr<ID3D11ShaderResourceView> textureSRVs[3];
+    ComPtr<ID3D11SamplerState> textureSampler;
+    bool texturesLoaded = false;
+
     // Scene state
     float cubeRotation = 0.0f;
 
@@ -56,6 +61,7 @@ struct D3D11Renderer {
 struct ConstantBufferData {
     DirectX::XMFLOAT4X4 worldViewProj;
     DirectX::XMFLOAT4 color;
+    DirectX::XMFLOAT4X4 model;  // model matrix for normal mapping
 };
 
 // Initialize D3D11 device and create resources (uses default adapter)

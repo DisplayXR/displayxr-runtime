@@ -26,6 +26,10 @@ struct GLRenderer {
     GLuint gridVBO = 0;
     int gridVertexCount = 0;
 
+    // Textures (basecolor, normal, AO)
+    GLuint textures[3] = {0, 0, 0};
+    bool texturesLoaded = false;
+
     // Single set of FBOs and depth renderbuffer (SBS swapchain)
     // Indexed as: fbos[imageIndex]
     std::vector<GLuint> fbos;
