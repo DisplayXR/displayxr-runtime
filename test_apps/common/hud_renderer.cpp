@@ -114,7 +114,7 @@ const void* RenderHudAndMap(HudRenderer& hud, uint32_t* rowPitch,
     float y = gap;                               // top padding
 
     // Render each section and advance Y cursor
-    struct Section { const std::wstring& text; bool small; };
+    struct Section { const std::wstring& text; bool isSmall; };
     Section sections[] = {
         {sessionText, false},
         {modeText, true},
@@ -128,10 +128,10 @@ const void* RenderHudAndMap(HudRenderer& hud, uint32_t* rowPitch,
 
     for (const auto& s : sections) {
         if (s.text.empty()) continue;
-        float lh = s.small ? smallLineH : normalLineH;
+        float lh = s.isSmall ? smallLineH : normalLineH;
         float h = lh * countLines(s.text);
         RenderText(hud.overlay, hud.device.Get(), hud.renderTex.Get(),
-            s.text, px, y, tw, h, s.small);
+            s.text, px, y, tw, h, s.isSmall);
         y += h + gap;
     }
 
