@@ -49,7 +49,7 @@ add_library(
 	u_hand_simulation.h
 	u_hud.c
 	u_hud.h
-	u_hud_font.h
+	u_hud_font_ttf.h
 	u_handles.c
 	u_handles.h
 	u_hashmap.cpp
@@ -132,6 +132,8 @@ target_link_libraries(
 		aux_generated_bindings_helpers
 		aux_os
 		aux_math
+	PRIVATE
+		xrt-external-stb
 	)
 
 # Only uses normal Windows libraries, doesn't add anything extra.
