@@ -165,20 +165,19 @@ bool CreateSwapchain(XrSessionManager& xr) {
 
     const auto& view = xr.configViews[0];
 
-    // Ext apps (with win32_window_binding): swapchain at native display resolution.
-    // Non-ext / unmodified apps: swapchain at recommended (runtime handles upscaling).
+    // If display info is available (via XR_EXT_display_info), use native display resolution.
+    // Otherwise fall back to recommended dimensions from xrEnumerateViewConfigurationViews.
     uint32_t width, height;
-    if (xr.hasWin32WindowBindingExt && xr.displayPixelWidth > 0 && xr.displayPixelHeight > 0) {
-        // Ext path: native display res (app manages viewport scaling itself)
+    if (xr.displayPixelWidth > 0 && xr.displayPixelHeight > 0) {
+        // Native display res — app manages viewport scaling via recommendedViewScaleX/Y
         width = xr.displayPixelWidth;
         height = xr.displayPixelHeight;
-        LOG_INFO("Ext app: swapchain at native display res %ux%u", width, height);
+        LOG_INFO("Swapchain at native display res %ux%u (from XR_EXT_display_info)", width, height);
     } else {
-        // Non-ext / unmodified app: use recommended from xrEnumerateViewConfigurationViews
-        // Runtime already applied worst-case scale; compositor handles upscaling to native.
+        // Fallback: use recommended from xrEnumerateViewConfigurationViews
         width = view.recommendedImageRectWidth * 2;
         height = view.recommendedImageRectHeight;
-        LOG_INFO("Non-ext app: swapchain at recommended %ux%u", width, height);
+        LOG_INFO("Swapchain at recommended %ux%u (no display info)", width, height);
     }
 
     XrSwapchainCreateInfo swapchainInfo = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
