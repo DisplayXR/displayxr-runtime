@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: BSL-1.0
 
 #include "monado3d_kooima.h"
+#include "display3d_view.h"
 #include <math.h>
 
 // Quaternion-rotate a vector: v' = q * v * q^-1
@@ -61,23 +62,8 @@ monado3d_apply_scene_transform(const XrVector3f *raw_left,
 XrFovf
 monado3d_compute_kooima_fov(XrVector3f eye_pos, float screen_width_m, float screen_height_m)
 {
-	float ez = eye_pos.z;
-	if (ez <= 0.001f) {
-		ez = 0.65f; // Fallback: ~arm's length
-	}
-
-	float half_w = screen_width_m / 2.0f;
-	float half_h = screen_height_m / 2.0f;
-	float ex = eye_pos.x;
-	float ey = eye_pos.y;
-
-	XrFovf fov;
-	fov.angleLeft = atanf((-half_w - ex) / ez);
-	fov.angleRight = atanf((half_w - ex) / ez);
-	fov.angleDown = atanf((-half_h - ey) / ez);
-	fov.angleUp = atanf((half_h - ey) / ez);
-
-	return fov;
+	// Delegate to canonical display3d_view library
+	return display3d_compute_fov(eye_pos, screen_width_m, screen_height_m);
 }
 
 void
@@ -88,36 +74,26 @@ monado3d_apply_tunables(const XrVector3f *raw_left,
                         XrVector3f *out_left,
                         XrVector3f *out_right)
 {
-	// Compute eye center (midpoint between left and right eyes)
-	float center_x = (raw_left->x + raw_right->x) * 0.5f;
-	float center_y = (raw_left->y + raw_right->y) * 0.5f;
-	float center_z = (raw_left->z + raw_right->z) * 0.5f;
+	// Delegate IPD + parallax to canonical library.
+	// The library lerps the eye center toward nominal on all XYZ axes
+	// (previously this was X/Y-only parallax + Z-only perspective).
+	XrVector3f nominal = {
+	    display_info->nominal_viewer_x,
+	    display_info->nominal_viewer_y,
+	    display_info->nominal_viewer_z,
+	};
+	display3d_apply_eye_factors(raw_left, raw_right, &nominal,
+	                            tunables->ipd_factor, tunables->parallax_factor,
+	                            out_left, out_right);
 
-	// Half-IPD vector (from center to right eye)
-	float half_ipd_x = (raw_right->x - raw_left->x) * 0.5f;
-	float half_ipd_y = (raw_right->y - raw_left->y) * 0.5f;
-	float half_ipd_z = (raw_right->z - raw_left->z) * 0.5f;
+	// Apply perspective factor: scale all XYZ (matches test apps)
+	out_left->x *= tunables->perspective_factor;
+	out_left->y *= tunables->perspective_factor;
+	out_left->z *= tunables->perspective_factor;
 
-	// Apply IPD factor: scale inter-eye distance
-	half_ipd_x *= tunables->ipd_factor;
-	half_ipd_y *= tunables->ipd_factor;
-	half_ipd_z *= tunables->ipd_factor;
-
-	// Apply parallax factor: scale X/Y offset from display center
-	float parallax_cx = center_x * tunables->parallax_factor;
-	float parallax_cy = center_y * tunables->parallax_factor;
-
-	// Apply perspective factor: scale Z only
-	float perspective_cz = center_z * tunables->perspective_factor;
-
-	// Reconstruct modified eye positions
-	out_left->x = parallax_cx - half_ipd_x;
-	out_left->y = parallax_cy - half_ipd_y;
-	out_left->z = perspective_cz - half_ipd_z;
-
-	out_right->x = parallax_cx + half_ipd_x;
-	out_right->y = parallax_cy + half_ipd_y;
-	out_right->z = perspective_cz + half_ipd_z;
+	out_right->x *= tunables->perspective_factor;
+	out_right->y *= tunables->perspective_factor;
+	out_right->z *= tunables->perspective_factor;
 }
 
 void

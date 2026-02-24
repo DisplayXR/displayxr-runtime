@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: BSL-1.0
 
 cmake_minimum_required(VERSION 3.21)
-project(sr_common LANGUAGES CXX)
+project(sr_common LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -24,6 +24,8 @@ add_library(sr_common_base STATIC
     leia_math.h
     xr_session_common.cpp
     xr_session_common.h
+    display3d_view.c
+    display3d_view.h
 )
 
 target_include_directories(sr_common_base PUBLIC

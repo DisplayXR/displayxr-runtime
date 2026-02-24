@@ -6,6 +6,7 @@
  */
 
 #include "xr_session_common.h"
+#include "display3d_view.h"
 #include "logging.h"
 #include <cstring>
 #include <cmath>
@@ -71,32 +72,17 @@ XMMATRIX ComputeKooimaProjection(
     float screenWidthM, float screenHeightM,
     float nearZ, float farZ)
 {
-    // Kooima asymmetric frustum: the screen is centered at the origin in DISPLAY space,
-    // with half-extents defining the physical edges. The eye position (from xrLocateViews
-    // in DISPLAY space) gives the viewer's offset from screen center.
-    float ez = eyePos.z;
-    if (ez <= 0.001f) ez = 0.65f; // Fallback: ~arm's length, matches runtime default
+    // Delegate to canonical display3d_view library (column-major output).
+    // The old code stored columns in XMMATRIX r[] (OpenGL convention),
+    // so we load column-major directly: r[i] = column i.
+    float m[16];
+    display3d_compute_projection(eyePos, screenWidthM, screenHeightM, nearZ, farZ, m);
 
-    float halfW = screenWidthM / 2.0f;
-    float halfH = screenHeightM / 2.0f;
-    float ex = eyePos.x;
-    float ey = eyePos.y;
-
-    // Near-plane edge distances (similar triangles: project screen edges through eye)
-    float left   = nearZ * (-halfW - ex) / ez;
-    float right  = nearZ * ( halfW - ex) / ez;
-    float bottom = nearZ * (-halfH - ey) / ez;
-    float top    = nearZ * ( halfH - ey) / ez;
-
-    float width  = right - left;
-    float height = top - bottom;
-
-    // Same matrix layout as XrFovToProjectionMatrix (OpenGL-style, row-major DirectXMath)
-    XMMATRIX proj = XMMatrixIdentity();
-    proj.r[0] = XMVectorSet(2.0f * nearZ / width, 0, 0, 0);
-    proj.r[1] = XMVectorSet(0, 2.0f * nearZ / height, 0, 0);
-    proj.r[2] = XMVectorSet((right + left) / width, (top + bottom) / height, -(farZ + nearZ) / (farZ - nearZ), -1);
-    proj.r[3] = XMVectorSet(0, 0, -2.0f * farZ * nearZ / (farZ - nearZ), 0);
+    XMMATRIX proj;
+    proj.r[0] = XMVectorSet(m[0],  m[1],  m[2],  m[3]);
+    proj.r[1] = XMVectorSet(m[4],  m[5],  m[6],  m[7]);
+    proj.r[2] = XMVectorSet(m[8],  m[9],  m[10], m[11]);
+    proj.r[3] = XMVectorSet(m[12], m[13], m[14], m[15]);
 
     return proj;
 }
@@ -105,21 +91,7 @@ XrFovf ComputeKooimaFov(
     const XrVector3f& eyePos,
     float screenWidthM, float screenHeightM)
 {
-    float ez = eyePos.z;
-    if (ez <= 0.001f) ez = 0.65f; // Fallback matches runtime
-
-    float halfW = screenWidthM / 2.0f;
-    float halfH = screenHeightM / 2.0f;
-    float ex = eyePos.x;
-    float ey = eyePos.y;
-
-    XrFovf fov;
-    fov.angleLeft  = atanf((-halfW - ex) / ez);
-    fov.angleRight = atanf(( halfW - ex) / ez);
-    fov.angleDown  = atanf((-halfH - ey) / ez);
-    fov.angleUp    = atanf(( halfH - ey) / ez);
-
-    return fov;
+    return display3d_compute_fov(eyePos, screenWidthM, screenHeightM);
 }
 
 bool CreateSpaces(XrSessionManager& xr) {
@@ -434,12 +406,12 @@ bool LocateViews(
 
     // Apply stereo eye factors (IPD + parallax) before player transform.
     // This modifies eye positions in display space according to stereo params.
+    XrVector3f nominalViewer = {xr.nominalViewerX, xr.nominalViewerY, xr.nominalViewerZ};
     XrVector3f processedLeft, processedRight;
-    ApplyEyeFactors(
-        views[0].pose.position, views[1].pose.position,
-        xr.nominalViewerX, xr.nominalViewerY, xr.nominalViewerZ,
-        stereo.ipdFactor, stereo.parallaxFactor,
-        processedLeft, processedRight);
+    display3d_apply_eye_factors(
+        &views[0].pose.position, &views[1].pose.position,
+        &nominalViewer, stereo.ipdFactor, stereo.parallaxFactor,
+        &processedLeft, &processedRight);
     views[0].pose.position = processedLeft;
     views[1].pose.position = processedRight;
 
@@ -454,7 +426,7 @@ bool LocateViews(
     for (int i = 0; i < 2; i++) {
         // Transform position: worldPos = playerOrientation * (localPos * p / s) + playerPosition
         // perspectiveFactor and scaleFactor both scale the eye position in display space.
-        // This must match KooimaEyePos() so display-plane content stays fixed.
+        // This must match the Kooima eye scaling so display-plane content stays fixed.
         XMVECTOR localPos = XMVectorSet(
             views[i].pose.position.x, views[i].pose.position.y,
             views[i].pose.position.z, 0.0f);

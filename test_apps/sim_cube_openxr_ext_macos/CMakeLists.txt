@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: BSL-1.0
 
 cmake_minimum_required(VERSION 3.21)
-project(sim_cube_openxr_ext_macos LANGUAGES CXX OBJCXX)
+project(sim_cube_openxr_ext_macos LANGUAGES C CXX OBJCXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -50,7 +50,10 @@ if(NOT OPENXR_FOUND)
     message(FATAL_ERROR "OpenXR not found. Install via: brew install openxr-loader")
 endif()
 
-add_executable(sim_cube_openxr_ext_macos main.mm)
+add_executable(sim_cube_openxr_ext_macos
+    main.mm
+    "${CMAKE_SOURCE_DIR}/../common/display3d_view.c"
+)
 
 target_include_directories(sim_cube_openxr_ext_macos PRIVATE
     ${OPENXR_INCLUDE_DIR}

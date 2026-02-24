@@ -18,6 +18,7 @@
 #include "gl_renderer.h"
 #include "hud_renderer.h"
 #include "text_overlay.h"
+#include "display3d_view.h"
 
 #include <atomic>
 #include <chrono>
@@ -450,20 +451,18 @@ static void RenderThreadFunc(
 
                             // Apply stereo eye factors (IPD + parallax) to raw eye positions
                             XrVector3f processedEyes[2];
-                            ApplyEyeFactors(
-                                rawViews[0].pose.position, rawViews[1].pose.position,
-                                xr->nominalViewerX, xr->nominalViewerY, xr->nominalViewerZ,
-                                inputSnapshot.stereo.ipdFactor, inputSnapshot.stereo.parallaxFactor,
-                                processedEyes[0], processedEyes[1]);
+                            XrVector3f nominalViewer = {xr->nominalViewerX, xr->nominalViewerY, xr->nominalViewerZ};
+                            display3d_apply_eye_factors(
+                                &rawViews[0].pose.position, &rawViews[1].pose.position,
+                                &nominalViewer, inputSnapshot.stereo.ipdFactor, inputSnapshot.stereo.parallaxFactor,
+                                &processedEyes[0], &processedEyes[1]);
 
                             // Kooima projection with perspective + scale factors
-                            float kScreenW, kScreenH;
-                            KooimaScreenDim(screenWidthM, screenHeightM,
-                                inputSnapshot.stereo.scaleFactor, kScreenW, kScreenH);
+                            float kScreenW = screenWidthM / inputSnapshot.stereo.scaleFactor;
+                            float kScreenH = screenHeightM / inputSnapshot.stereo.scaleFactor;
                             for (int e = 0; e < 2; e++) {
-                                XrVector3f kooimaEye = KooimaEyePos(processedEyes[e],
-                                    inputSnapshot.stereo.perspectiveFactor,
-                                    inputSnapshot.stereo.scaleFactor);
+                                float es = inputSnapshot.stereo.perspectiveFactor / inputSnapshot.stereo.scaleFactor;
+                                XrVector3f kooimaEye = {processedEyes[e].x * es, processedEyes[e].y * es, processedEyes[e].z * es};
                                 if (e == 0)
                                     leftProjMatrix = ComputeKooimaProjection(
                                         kooimaEye, kScreenW, kScreenH, 0.01f, 100.0f);
@@ -503,11 +502,10 @@ static void RenderThreadFunc(
                                 centerEye.x = xr->nominalViewerX + inputSnapshot.stereo.parallaxFactor * (cx - xr->nominalViewerX);
                                 centerEye.y = xr->nominalViewerY + inputSnapshot.stereo.parallaxFactor * (cy - xr->nominalViewerY);
                                 centerEye.z = xr->nominalViewerZ + inputSnapshot.stereo.parallaxFactor * (cz - xr->nominalViewerZ);
-                                XrVector3f kooimaEye = KooimaEyePos(centerEye,
-                                    inputSnapshot.stereo.perspectiveFactor, inputSnapshot.stereo.scaleFactor);
-                                float kScreenW, kScreenH;
-                                KooimaScreenDim(screenWidthM, screenHeightM,
-                                    inputSnapshot.stereo.scaleFactor, kScreenW, kScreenH);
+                                float es = inputSnapshot.stereo.perspectiveFactor / inputSnapshot.stereo.scaleFactor;
+                                XrVector3f kooimaEye = {centerEye.x * es, centerEye.y * es, centerEye.z * es};
+                                float kScreenW = screenWidthM / inputSnapshot.stereo.scaleFactor;
+                                float kScreenH = screenHeightM / inputSnapshot.stereo.scaleFactor;
                                 monoProjMatrix = ComputeKooimaProjection(
                                     kooimaEye, kScreenW, kScreenH, 0.01f, 100.0f);
                                 monoFov = ComputeKooimaFov(
