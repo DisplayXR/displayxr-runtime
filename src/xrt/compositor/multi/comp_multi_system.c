@@ -1162,7 +1162,13 @@ composite_layers_to_intermediate(struct multi_compositor *mc,
 			ubo_data.post_transform.x = 0.0f;
 			ubo_data.post_transform.y = 0.0f;
 			ubo_data.post_transform.w = 1.0f;
-			ubo_data.post_transform.h = proj_layer->data.flip_y ? -1.0f : 1.0f;
+			ubo_data.post_transform.h = 1.0f;
+			if (proj_layer->data.flip_y) {
+				// GL textures are Y-flipped: remap UV y from [0,1]→[1,0]
+				// to flip the preblit content. Same pattern as overlay layers.
+				ubo_data.post_transform.y += ubo_data.post_transform.h;
+				ubo_data.post_transform.h = -ubo_data.post_transform.h;
+			}
 			ubo_data.mvp = mvp;
 
 			// Write UBO data — projection uses first slot per eye
@@ -2281,7 +2287,7 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 			        vk_result_string(ret));
 			return;
 		}
-	} else if (ret != VK_SUCCESS) {
+	} else if (ret != VK_SUCCESS && ret != VK_SUBOPTIMAL_KHR) {
 		U_LOG_E("[per-session] Failed to acquire per-session target image: %s", vk_result_string(ret));
 		return;
 	}
@@ -2804,6 +2810,8 @@ submit_and_present:
 	if (ret == VK_ERROR_OUT_OF_DATE_KHR) {
 		U_LOG_W("[per-session] Present returned OUT_OF_DATE, flagging for recreation");
 		mc->session_render.swapchain_needs_recreate = true;
+	} else if (ret == VK_SUBOPTIMAL_KHR) {
+		// Presentation succeeded — swapchain size differs from surface but content is shown.
 	} else if (ret != VK_SUCCESS) {
 		U_LOG_E("[per-session] Failed to present per-session target: %s", vk_result_string(ret));
 	}
