@@ -24,6 +24,7 @@
 #include <libwebsockets.h>
 
 #include <atomic>
+#include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <cstring>
@@ -41,6 +42,8 @@
 #ifdef __APPLE__
 #include <openxr/XR_EXT_macos_window_binding.h>
 extern "C" void* bridge_create_hidden_metal_view(uint32_t w, uint32_t h);
+extern "C" void bridge_render_hud_text(const char* text, uint8_t* buffer,
+                                       uint32_t width, uint32_t height);
 
 struct BridgeOverlay;
 extern "C" BridgeOverlay* bridge_overlay_create(uint32_t w, uint32_t h, void** outViewHandle);
@@ -125,21 +128,34 @@ static bool g_overlayWindowFocused = true;
 
 static void updateOverlayVisibility() {
     if (!g_overlay) return;
+    // Don't use windowFocused — TAB key causes spurious blur/focus events that
+    // flicker the overlay. tabVisible (document.visibilitychange) is sufficient
+    // to hide when the user switches browser tabs.
     bool show = g_overlayCanvasRectKnown && g_overlaySessionActive
-             && g_overlayTabVisible && g_overlayWindowFocused;
+             && g_overlayTabVisible;
     static bool lastShow = false;
     if (show != lastShow) {
-        LOG_INFO("Overlay visible=%s (rect=%s session=%s tab=%s focus=%s)",
+        LOG_INFO("Overlay visible=%s (rect=%s session=%s tab=%s)",
                  show ? "YES" : "NO",
                  g_overlayCanvasRectKnown ? "Y" : "N",
                  g_overlaySessionActive ? "Y" : "N",
-                 g_overlayTabVisible ? "Y" : "N",
-                 g_overlayWindowFocused ? "Y" : "N");
+                 g_overlayTabVisible ? "Y" : "N");
         lastShow = show;
     }
     bridge_overlay_set_visible(g_overlay, show);
 }
 #endif
+
+// HUD rendering state
+static std::vector<uint8_t> g_hudPixels;
+static bool g_hudDirty = true;
+static float g_hudUpdateTimer = 0.0f;
+static uint32_t g_canvasWidth = 0, g_canvasHeight = 0; // From extension
+
+// FPS tracking
+static double g_frameTimeAccum = 0.0;
+static uint32_t g_frameTimeCount = 0;
+static double g_avgFrameTime = 0.0;
 
 static void readback_callback(const uint8_t* pixels, uint32_t w, uint32_t h, void* /*ud*/) {
     std::lock_guard<std::mutex> lock(g_readbackBuffer.mutex);
@@ -203,6 +219,17 @@ struct AppState {
     // Command pool for transfer commands
     VkCommandPool cmdPool = VK_NULL_HANDLE;
     VkFence uploadFence = VK_NULL_HANDLE;
+
+    // HUD overlay (window-space composition layer)
+    XrSwapchain hudSwapchain = XR_NULL_HANDLE;
+    uint32_t hudSwapchainWidth = 0;
+    uint32_t hudSwapchainHeight = 0;
+    int64_t hudSwapchainFormat = 0;
+    uint32_t hudSwapchainImageCount = 0;
+    std::vector<XrSwapchainImageVulkanKHR> hudSwapchainImages;
+    bool hasHudSwapchain = false;
+    bool hudVisible = true;
+    char systemName[XR_MAX_SYSTEM_NAME_SIZE] = {};
 
     // Controller actions
     XrActionSet actionSet = XR_NULL_HANDLE;
@@ -288,6 +315,15 @@ static bool InitializeOpenXR(AppState& app) {
     XrSystemGetInfo systemInfo = {XR_TYPE_SYSTEM_GET_INFO};
     systemInfo.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
     XR_CHECK(xrGetSystem(app.instance, &systemInfo, &app.systemId));
+
+    // Query system name
+    {
+        XrSystemProperties sysProps = {XR_TYPE_SYSTEM_PROPERTIES};
+        if (XR_SUCCEEDED(xrGetSystemProperties(app.instance, app.systemId, &sysProps))) {
+            strncpy(app.systemName, sysProps.systemName, sizeof(app.systemName) - 1);
+            LOG_INFO("System: %s", app.systemName);
+        }
+    }
 
     // Query display info (XR_EXT_display_info) for physical display dimensions.
     // Kooima projection needs the display rect to compute the asymmetric frustum.
@@ -842,27 +878,83 @@ static bool CreateStagingResources(AppState& app) {
 }
 
 // ============================================================================
+// HUD swapchain (window-space overlay layer)
+// ============================================================================
+
+static const uint32_t HUD_WIDTH  = 512;
+static const uint32_t HUD_HEIGHT = 384;
+
+static bool CreateHudSwapchain(AppState& app) {
+    LOG_INFO("Creating HUD swapchain for window-space layer (%ux%u)...", HUD_WIDTH, HUD_HEIGHT);
+
+    uint32_t formatCount = 0;
+    XR_CHECK(xrEnumerateSwapchainFormats(app.session, 0, &formatCount, nullptr));
+    std::vector<int64_t> formats(formatCount);
+    XR_CHECK(xrEnumerateSwapchainFormats(app.session, formatCount, &formatCount, formats.data()));
+
+    // Prefer R8G8B8A8_UNORM (VK=37) since HUD pixels are rendered as straight RGBA
+    int64_t selectedFormat = formats[0];
+    for (uint32_t i = 0; i < formatCount; i++) {
+        if (formats[i] == VK_FORMAT_R8G8B8A8_UNORM) {
+            selectedFormat = formats[i];
+            break;
+        }
+        if (formats[i] == VK_FORMAT_B8G8R8A8_UNORM) {
+            selectedFormat = formats[i]; // fallback
+        }
+    }
+    LOG_INFO("HUD swapchain format: %lld (0x%llX)", (long long)selectedFormat, (long long)selectedFormat);
+
+    XrSwapchainCreateInfo swapchainInfo = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    swapchainInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
+                               XR_SWAPCHAIN_USAGE_SAMPLED_BIT |
+                               XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+    swapchainInfo.format = selectedFormat;
+    swapchainInfo.sampleCount = 1;
+    swapchainInfo.width = HUD_WIDTH;
+    swapchainInfo.height = HUD_HEIGHT;
+    swapchainInfo.faceCount = 1;
+    swapchainInfo.arraySize = 1;
+    swapchainInfo.mipCount = 1;
+
+    XR_CHECK(xrCreateSwapchain(app.session, &swapchainInfo, &app.hudSwapchain));
+
+    app.hudSwapchainWidth = HUD_WIDTH;
+    app.hudSwapchainHeight = HUD_HEIGHT;
+    app.hudSwapchainFormat = selectedFormat;
+
+    uint32_t imageCount = 0;
+    XR_CHECK(xrEnumerateSwapchainImages(app.hudSwapchain, 0, &imageCount, nullptr));
+    app.hudSwapchainImageCount = imageCount;
+    app.hudSwapchainImages.resize(imageCount, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
+    XR_CHECK(xrEnumerateSwapchainImages(app.hudSwapchain, imageCount, &imageCount,
+        (XrSwapchainImageBaseHeader*)app.hudSwapchainImages.data()));
+
+    app.hasHudSwapchain = true;
+    LOG_INFO("HUD swapchain created: %u images", imageCount);
+    return true;
+}
+
+// ============================================================================
 // Frame upload: CPU pixels → staging buffer → swapchain image
 // ============================================================================
 
-static bool UploadFrameToSwapchain(AppState& app, uint32_t imageIndex,
-                                   const uint8_t* pixels, uint32_t width, uint32_t height)
+// Generic upload: CPU RGBA pixels → staging buffer → VkImage
+static bool UploadPixelsToImage(AppState& app, VkImage dstImage,
+                                const uint8_t* pixels, uint32_t srcW, uint32_t srcH,
+                                uint32_t dstW, uint32_t dstH, int64_t dstFormat)
 {
-    VkImage dstImage = app.swapchainImages[imageIndex].image;
-
-    // Clamp to swapchain dimensions
-    uint32_t copyW = (width < app.swapchainWidth) ? width : app.swapchainWidth;
-    uint32_t copyH = (height < app.swapchainHeight) ? height : app.swapchainHeight;
+    uint32_t copyW = (srcW < dstW) ? srcW : dstW;
+    uint32_t copyH = (srcH < dstH) ? srcH : dstH;
 
     // Copy pixels to staging buffer contiguously (source row stride = copyW)
-    // This layout matches bufferRowLength = copyW in VkBufferImageCopy
-    VkFormat fmt = (VkFormat)app.swapchainFormat;
+    VkFormat fmt = (VkFormat)dstFormat;
     bool needSwizzle = (fmt == VK_FORMAT_B8G8R8A8_SRGB || fmt == VK_FORMAT_B8G8R8A8_UNORM);
 
     if (needSwizzle) {
         uint8_t* dst = (uint8_t*)app.stagingMapped;
         for (uint32_t y = 0; y < copyH; y++) {
-            const uint8_t* srcRow = pixels + y * width * 4;
+            const uint8_t* srcRow = pixels + y * srcW * 4;
             uint8_t* dstRow = dst + y * copyW * 4;
             for (uint32_t x = 0; x < copyW; x++) {
                 dstRow[x * 4 + 0] = srcRow[x * 4 + 2]; // B
@@ -872,13 +964,12 @@ static bool UploadFrameToSwapchain(AppState& app, uint32_t imageIndex,
             }
         }
     } else {
-        // Direct RGBA copy — contiguous with source row stride
-        if (width == copyW) {
+        if (srcW == copyW) {
             memcpy(app.stagingMapped, pixels, (size_t)copyW * copyH * 4);
         } else {
             uint8_t* dst = (uint8_t*)app.stagingMapped;
             for (uint32_t y = 0; y < copyH; y++) {
-                memcpy(dst + y * copyW * 4, pixels + y * width * 4, copyW * 4);
+                memcpy(dst + y * copyW * 4, pixels + y * srcW * 4, copyW * 4);
             }
         }
     }
@@ -920,14 +1011,15 @@ static bool UploadFrameToSwapchain(AppState& app, uint32_t imageIndex,
     vkCmdCopyBufferToImage(cmdBuf, app.stagingBuffer, dstImage,
         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
-    // Barrier: TRANSFER_DST → COLOR_ATTACHMENT_OPTIMAL
+    // Barrier: TRANSFER_DST → GENERAL
+    // Compositor expects swapchain images in VK_IMAGE_LAYOUT_GENERAL for sampling.
     barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
     barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
     vkCmdPipelineBarrier(cmdBuf,
         VK_PIPELINE_STAGE_TRANSFER_BIT,
-        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
         0, 0, nullptr, 0, nullptr, 1, &barrier);
 
     VK_CHECK(vkEndCommandBuffer(cmdBuf));
@@ -944,6 +1036,24 @@ static bool UploadFrameToSwapchain(AppState& app, uint32_t imageIndex,
     vkFreeCommandBuffers(app.device, app.cmdPool, 1, &cmdBuf);
 
     return true;
+}
+
+static bool UploadFrameToSwapchain(AppState& app, uint32_t imageIndex,
+                                   const uint8_t* pixels, uint32_t width, uint32_t height)
+{
+    return UploadPixelsToImage(app, app.swapchainImages[imageIndex].image,
+                               pixels, width, height,
+                               app.swapchainWidth, app.swapchainHeight,
+                               app.swapchainFormat);
+}
+
+static bool UploadHudToSwapchain(AppState& app, uint32_t imageIndex,
+                                 const uint8_t* pixels)
+{
+    return UploadPixelsToImage(app, app.hudSwapchainImages[imageIndex].image,
+                               pixels, HUD_WIDTH, HUD_HEIGHT,
+                               HUD_WIDTH, HUD_HEIGHT,
+                               app.hudSwapchainFormat);
 }
 
 // ============================================================================
@@ -1013,9 +1123,39 @@ static char g_poseBuf[LWS_PRE + 2048]; // LWS_PRE padding + JSON (pose + FOV + c
 static int g_poseLen = 0;
 static std::atomic<bool> g_poseReady{false};
 
-// Handle parsed text messages from browser (JSON, parsed with sscanf)
+// Handle parsed text messages from browser (JSON, parsed with strstr/sscanf)
 static void handleTextMessage(const std::string& msg) {
     LOG_INFO("WS text: %.*s", (int)std::min(msg.size(), (size_t)200), msg.c_str());
+
+    // HUD toggle (any mode)
+    if (strstr(msg.c_str(), "\"hudToggle\"")) {
+        if (g_appState) {
+            g_appState->hudVisible = !g_appState->hudVisible;
+            g_hudDirty = true;
+            LOG_INFO("HUD %s", g_appState->hudVisible ? "shown" : "hidden");
+        }
+        return;
+    }
+
+    // Canvas/window size (any mode)
+    {
+        const char* wsp = strstr(msg.c_str(), "\"windowSize\"");
+        if (wsp) {
+            const char* wp = strstr(wsp, "\"w\":");
+            const char* hp = strstr(wsp, "\"h\":");
+            if (wp && hp) {
+                uint32_t w = 0, h = 0;
+                sscanf(wp, "\"w\":%u", &w);
+                sscanf(hp, "\"h\":%u", &h);
+                if (w > 0 && h > 0) {
+                    g_canvasWidth = w;
+                    g_canvasHeight = h;
+                    g_hudDirty = true;
+                }
+            }
+            return;
+        }
+    }
 
 #ifdef __APPLE__
     if (!g_overlayMode) return;
@@ -1053,10 +1193,8 @@ static void handleTextMessage(const std::string& msg) {
         updateOverlayVisibility();
         return;
     }
+    // windowFocused messages ignored — spurious blur/focus from TAB key
     if (strstr(msg.c_str(), "\"windowFocused\"")) {
-        g_overlayWindowFocused = strstr(msg.c_str(), "true") != nullptr;
-        LOG_INFO("Overlay windowFocused=%s", g_overlayWindowFocused ? "true" : "false");
-        updateOverlayVisibility();
         return;
     }
     if (strstr(msg.c_str(), "\"sessionActive\"")) {
@@ -1289,6 +1427,9 @@ static void Cleanup(AppState& app) {
     if (app.stagingMemory != VK_NULL_HANDLE) {
         vkFreeMemory(app.device, app.stagingMemory, nullptr);
     }
+    if (app.hudSwapchain != XR_NULL_HANDLE) {
+        xrDestroySwapchain(app.hudSwapchain);
+    }
     if (app.swapchain != XR_NULL_HANDLE) {
         xrDestroySwapchain(app.swapchain);
     }
@@ -1395,6 +1536,11 @@ int main() {
         Cleanup(app);
         return 1;
     }
+    if (!CreateHudSwapchain(app)) {
+        LOG_WARN("HUD swapchain creation failed (HUD disabled)");
+    } else {
+        g_hudPixels.resize((size_t)HUD_WIDTH * HUD_HEIGHT * 4, 0);
+    }
 
     // --- Start WebSocket server thread ---
     g_appState = &app;
@@ -1405,6 +1551,8 @@ int main() {
 
     uint32_t frameCount = 0;
     bool loggedInitInfo = false;
+    bool hudRenderedOnce = false;
+    auto lastFrameTime = std::chrono::steady_clock::now();
 
     while (g_running.load() && !app.exitRequested) {
         PollEvents(app);
@@ -1412,6 +1560,19 @@ int main() {
         if (!app.sessionRunning) {
             usleep(100000); // 100ms
             continue;
+        }
+
+        // --- Frame timing ---
+        auto now = std::chrono::steady_clock::now();
+        double deltaTime = std::chrono::duration<double>(now - lastFrameTime).count();
+        lastFrameTime = now;
+        g_frameTimeAccum += deltaTime;
+        g_frameTimeCount++;
+        if (g_frameTimeAccum >= 1.0) {
+            g_avgFrameTime = g_frameTimeAccum / g_frameTimeCount;
+            g_frameTimeAccum = 0;
+            g_frameTimeCount = 0;
+            g_hudDirty = true;
         }
 
         // --- OpenXR frame loop ---
@@ -1522,16 +1683,22 @@ int main() {
         syncInfo.activeActionSets = &activeAS;
         xrSyncActions(app.session, &syncInfo);
 
+        // Locate view space (head pose) — used for both pose sending and HUD
+        XrSpaceLocation viewLoc = {XR_TYPE_SPACE_LOCATION};
+        bool viewLocValid = false;
+        if (XR_SUCCEEDED(xrLocateSpace(app.viewSpace, app.localSpace,
+                frameState.predictedDisplayTime, &viewLoc)) &&
+            (viewLoc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) &&
+            (viewLoc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT))
+        {
+            viewLocValid = true;
+        }
+
         // Send composed head pose + per-eye Kooima FOV + controller state to browser.
         // sim_display's get_tracked_pose composes: qwerty_pos + rotate(eye_offset, qwerty_ori)
         // The FOV from xrLocateViews changes with display mode (SBS uses half display width,
         // anaglyph/blend/2D use full width), so we must send it every frame.
-        if (g_clientWsi && !g_poseReady.load()) {
-            XrSpaceLocation viewLoc = {XR_TYPE_SPACE_LOCATION};
-            if (XR_SUCCEEDED(xrLocateSpace(app.viewSpace, app.localSpace,
-                    frameState.predictedDisplayTime, &viewLoc)) &&
-                (viewLoc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) &&
-                (viewLoc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT))
+        if (g_clientWsi && !g_poseReady.load() && viewLocValid)
             {
                 // Query controller state for each hand
                 struct { bool hasData; bool hasPose; float pose[7]; float tr; int sq, mn, tc; float ts[2]; } ctrl[2] = {};
@@ -1652,7 +1819,136 @@ int main() {
                 g_poseReady.store(true);
                 if (g_lwsContext) lws_cancel_service(g_lwsContext);
             }
+
+        // --- HUD rendering (throttled to ~2Hz) ---
+        g_hudUpdateTimer += (float)deltaTime;
+#ifdef __APPLE__
+        if (app.hasHudSwapchain && app.hudVisible &&
+            (g_hudDirty || g_hudUpdateTimer >= 0.5f))
+        {
+            g_hudUpdateTimer = 0.0f;
+            g_hudDirty = false;
+
+            // Session state name
+            const char* stateNames[] = {
+                "UNKNOWN", "IDLE", "READY", "SYNCHRONIZED", "VISIBLE",
+                "FOCUSED", "STOPPING", "LOSS_PENDING", "EXITING"
+            };
+            int si = (int)app.sessionState;
+            const char* stateName = (si >= 0 && si <= 8) ? stateNames[si] : "?";
+
+            // Output mode
+            const char* simDisplayOutput = getenv("SIM_DISPLAY_OUTPUT");
+            const char* outputName = "SBS";
+            if (simDisplayOutput) {
+                if (strcmp(simDisplayOutput, "anaglyph") == 0) outputName = "Anaglyph";
+                else if (strcmp(simDisplayOutput, "blend") == 0) outputName = "Blend";
+            }
+
+            // FPS
+            double fps = (g_avgFrameTime > 0) ? 1.0 / g_avgFrameTime : 0;
+
+            // Forward vector from view orientation quaternion
+            float qx = viewLoc.pose.orientation.x;
+            float qy = viewLoc.pose.orientation.y;
+            float qz = viewLoc.pose.orientation.z;
+            float qw = viewLoc.pose.orientation.w;
+            float fx = -2.0f * (qx * qz + qw * qy);
+            float fy = -2.0f * (qy * qz - qw * qx);
+            float fz = 2.0f * (qx * qx + qy * qy) - 1.0f;
+
+            // Virtual display pose (display space in local space)
+            float dispX = 0, dispY = 0, dispZ = 0;
+            if (app.displaySpace != XR_NULL_HANDLE) {
+                XrSpaceLocation dispLoc = {XR_TYPE_SPACE_LOCATION};
+                if (XR_SUCCEEDED(xrLocateSpace(app.displaySpace, app.localSpace,
+                        frameState.predictedDisplayTime, &dispLoc))) {
+                    dispX = dispLoc.pose.position.x;
+                    dispY = dispLoc.pose.position.y;
+                    dispZ = dispLoc.pose.position.z;
+                }
+            }
+
+            // Eye positions from display-space views
+            auto& lep = displayViews[0].pose.position;
+            auto& rep = displayViews[1].pose.position;
+
+            char hudText[2048];
+            snprintf(hudText, sizeof(hudText),
+                "WebXR Bridge — %s\n"
+                "Session: %s\n"
+                "XR_EXT_macos_window_binding: %s\n"
+                "Mode: 3D  Output: %s\n"
+                "FPS: %.0f  (%.1f ms)\n"
+                "Render: %ux%u  Canvas: %ux%u\n"
+                "Display: %.3f x %.3f m\n"
+                "Scale: %.2f x %.2f\n"
+                "Nominal: (%.3f, %.3f, %.3f)\n"
+                "Eye L: (%.3f, %.3f, %.3f)\n"
+                "Eye R: (%.3f, %.3f, %.3f)\n"
+                "Virtual Display: (%.2f, %.2f, %.2f)\n"
+                "Forward: (%.2f, %.2f, %.2f)\n"
+                "Camera: (%.2f, %.2f, %.2f)\n"
+                "\n"
+                "Tab=HUD  WASD/QE=Move  Scroll=Zoom",
+                app.systemName,
+                stateName,
+                app.hasMacosWindowBinding ? "YES" : "NO",
+                outputName,
+                fps, g_avgFrameTime * 1000.0,
+                app.swapchainWidth / 2, app.swapchainHeight,
+                g_canvasWidth, g_canvasHeight,
+                app.displayWidthM, app.displayHeightM,
+                app.recommendedViewScaleX, app.recommendedViewScaleY,
+                app.nominalViewerX, app.nominalViewerY, app.nominalViewerZ,
+                lep.x, lep.y, lep.z,
+                rep.x, rep.y, rep.z,
+                dispX, dispY, dispZ,
+                fx, fy, fz,
+                viewLoc.pose.position.x, viewLoc.pose.position.y,
+                viewLoc.pose.position.z);
+
+            bridge_render_hud_text(hudText, g_hudPixels.data(), HUD_WIDTH, HUD_HEIGHT);
+
+            // Verify HUD pixels are non-zero (first time only)
+            if (!hudRenderedOnce) {
+                uint32_t nonZero = 0;
+                for (uint32_t i = 0; i < HUD_WIDTH * HUD_HEIGHT * 4; i++) {
+                    if (g_hudPixels[i] != 0) { nonZero++; break; }
+                }
+                LOG_INFO("HUD render: %s (text len=%zu)",
+                         nonZero ? "has pixels" : "ALL ZERO", strlen(hudText));
+            }
+
+            // Upload to HUD swapchain
+            uint32_t hudImageIndex;
+            XrSwapchainImageAcquireInfo hudAcq = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+            XrResult hudAcqResult = xrAcquireSwapchainImage(app.hudSwapchain, &hudAcq, &hudImageIndex);
+            if (XR_SUCCEEDED(hudAcqResult)) {
+                XrSwapchainImageWaitInfo hudWait = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+                hudWait.timeout = XR_INFINITE_DURATION;
+                XrResult hudWaitResult = xrWaitSwapchainImage(app.hudSwapchain, &hudWait);
+                if (XR_SUCCEEDED(hudWaitResult)) {
+                    bool ok = UploadHudToSwapchain(app, hudImageIndex, g_hudPixels.data());
+                    if (!hudRenderedOnce) {
+                        LOG_INFO("HUD upload %s (image %u, fmt %lld)",
+                                 ok ? "OK" : "FAILED", hudImageIndex,
+                                 (long long)app.hudSwapchainFormat);
+                    }
+                } else {
+                    LOG_WARN("HUD swapchain wait failed: %d", (int)hudWaitResult);
+                }
+                XrSwapchainImageReleaseInfo hudRel = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+                xrReleaseSwapchainImage(app.hudSwapchain, &hudRel);
+                if (!hudRenderedOnce) {
+                    LOG_INFO("HUD first render+upload complete");
+                }
+                hudRenderedOnce = true;
+            } else {
+                LOG_WARN("HUD swapchain acquire failed: %d", (int)hudAcqResult);
+            }
         }
+#endif
 
         bool hasFrame = false;
         const uint8_t* framePixels = nullptr;
@@ -1708,16 +2004,48 @@ int main() {
                 projLayer.viewCount = 2;
                 projLayer.views = projViews;
 
-                const XrCompositionLayerBaseHeader* layers[] = {
-                    (XrCompositionLayerBaseHeader*)&projLayer
-                };
+                // Build layers array (projection + optional HUD)
+                const XrCompositionLayerBaseHeader* layers[2];
+                layers[0] = (XrCompositionLayerBaseHeader*)&projLayer;
+                uint32_t layerCount = 1;
+
+#ifdef __APPLE__
+                XrCompositionLayerWindowSpaceEXT hudLayer = {};
+                bool submitHud = app.hasHudSwapchain && app.hudVisible && hudRenderedOnce;
+                if (submitHud) {
+                    hudLayer.type = (XrStructureType)XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT;
+                    hudLayer.next = nullptr;
+                    hudLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+                    hudLayer.subImage.swapchain = app.hudSwapchain;
+                    hudLayer.subImage.imageRect.offset = {0, 0};
+                    hudLayer.subImage.imageRect.extent = {(int32_t)HUD_WIDTH, (int32_t)HUD_HEIGHT};
+                    hudLayer.subImage.imageArrayIndex = 0;
+                    hudLayer.x = 0.01f;       // 1% from left
+                    hudLayer.y = 0.60f;       // 60% from top (bottom 40%)
+                    hudLayer.width = 0.38f;   // 38% of window width
+                    hudLayer.height = 0.39f;  // 39% of window height
+                    hudLayer.disparity = 0.0f; // screen depth
+                    layers[1] = (XrCompositionLayerBaseHeader*)&hudLayer;
+                    layerCount = 2;
+                }
+#endif
+
+                static bool loggedHudSubmit = false;
+                if (submitHud && !loggedHudSubmit) {
+                    LOG_INFO("HUD layer submitted: x=%.2f y=%.2f w=%.2f h=%.2f (layers=%u)",
+                             hudLayer.x, hudLayer.y, hudLayer.width, hudLayer.height, layerCount);
+                    loggedHudSubmit = true;
+                }
 
                 XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
                 endInfo.displayTime = frameState.predictedDisplayTime;
                 endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-                endInfo.layerCount = 1;
+                endInfo.layerCount = layerCount;
                 endInfo.layers = layers;
-                xrEndFrame(app.session, &endInfo);
+                XrResult endResult = xrEndFrame(app.session, &endInfo);
+                if (XR_FAILED(endResult) && submitHud) {
+                    LOG_WARN("xrEndFrame with HUD layer failed: %d", (int)endResult);
+                }
             } else {
                 // Failed to acquire — submit empty frame
                 XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};

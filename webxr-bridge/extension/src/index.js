@@ -185,6 +185,12 @@ window.addEventListener('keydown', (e) => {
   if (e.code === 'Space') e.preventDefault();
   if (e.key === 'Control') ctrlPressed = true;
   if (e.key === 'Alt') { altPressed = true; e.preventDefault(); }
+  // TAB toggles HUD overlay
+  if (e.key === 'Tab' && !e.repeat && wsConnected) {
+    e.preventDefault();
+    window.postMessage({ type: 'monado-ws-out',
+      json: JSON.stringify({ hudToggle: true }) }, '*');
+  }
 });
 window.addEventListener('keyup', (e) => {
   if (!vrSessionActive) return;
@@ -345,6 +351,7 @@ requestAnimationFrame(updateCamera);
 // so it can adjust swapchain/FOV like EXT apps do on window resize.
 
 let lastCanvasWidth = 0, lastCanvasHeight = 0;
+let lastWindowW = 0, lastWindowH = 0;
 let lastOverlayX = -1, lastOverlayY = -1, lastOverlayCW = -1, lastOverlayCH = -1;
 
 // Shared overlay rect tracker — called from both window rAF and XR session rAF
@@ -381,6 +388,14 @@ function checkCanvasResize() {
     window.postMessage({ type: 'monado-ws-out', json: JSON.stringify({ resize: { w, h } }) }, '*');
     console.log(`MonadoXR: Canvas resized to ${w}x${h}, notified bridge host`);
   }
+  // Send CSS canvas size for HUD display (all modes)
+  const rect = canvas.getBoundingClientRect();
+  const ww = Math.round(rect.width), wh = Math.round(rect.height);
+  if (ww !== lastWindowW || wh !== lastWindowH) {
+    lastWindowW = ww;
+    lastWindowH = wh;
+    window.postMessage({ type: 'monado-ws-out', json: JSON.stringify({ windowSize: { w: ww, h: wh } }) }, '*');
+  }
 
   // Overlay mode: track canvas screen position + CSS size for overlay window placement
   if (overlayDisplay) {
@@ -403,21 +418,8 @@ document.addEventListener('visibilitychange', () => {
   }
 });
 
-window.addEventListener('blur', () => {
-  if (wsConnected && overlayDisplay) {
-    window.postMessage({ type: 'monado-ws-out',
-      json: JSON.stringify({ windowFocused: false }) }, '*');
-    console.log('MonadoXR: Sent windowFocused=false');
-  }
-});
-
-window.addEventListener('focus', () => {
-  if (wsConnected && overlayDisplay) {
-    window.postMessage({ type: 'monado-ws-out',
-      json: JSON.stringify({ windowFocused: true }) }, '*');
-    console.log('MonadoXR: Sent windowFocused=true');
-  }
-});
+// blur/focus listeners removed — they caused the overlay to flicker when
+// pressing TAB. tabVisible (from visibilitychange) handles tab-switching.
 
 // --- Display Mode State ---
 // 'sbs' = side-by-side (no post-process), 'anaglyph' = red-cyan, 'blend' = 50% mix

@@ -1152,20 +1152,17 @@ composite_layers_to_intermediate(struct multi_compositor *mc,
 				struct xrt_matrix_4x4 mvp;
 			} ubo_data;
 
-			// UV post_transform: use projection view's norm_rect to sample
-			// only the sub-image region of the swapchain. This handles apps
-			// that render at a smaller resolution than the swapchain (e.g.
-			// GL apps using recommendedViewScale < 1.0).
-			const struct xrt_layer_projection_view_data *pvd = &proj_layer->data.proj.v[eye];
-			ubo_data.post_transform.x = pvd->sub.norm_rect.x;
-			ubo_data.post_transform.y = pvd->sub.norm_rect.y;
-			ubo_data.post_transform.w = pvd->sub.norm_rect.w;
-			ubo_data.post_transform.h = pvd->sub.norm_rect.h;
-
-			if (proj_layer->data.flip_y) {
-				ubo_data.post_transform.y += ubo_data.post_transform.h;
-				ubo_data.post_transform.h = -ubo_data.post_transform.h;
-			}
+			// UV post_transform: identity {0,0,1,1} because the preblit
+			// images already contain the correctly cropped per-eye content.
+			// The original norm_rect maps into the full SBS swapchain UV
+			// space, but the preblit step (above) extracted each eye's
+			// sub-region into a full-extent local image. Using norm_rect
+			// here would double-crop (e.g. sampling only UVs [0,0.5] of
+			// an already-cropped 960px image → showing only 480px).
+			ubo_data.post_transform.x = 0.0f;
+			ubo_data.post_transform.y = 0.0f;
+			ubo_data.post_transform.w = 1.0f;
+			ubo_data.post_transform.h = proj_layer->data.flip_y ? -1.0f : 1.0f;
 			ubo_data.mvp = mvp;
 
 			// Write UBO data — projection uses first slot per eye
@@ -2269,16 +2266,17 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 	// Acquire the next swapchain image from the per-session target
 	uint32_t buffer_index = 0;
 	VkResult ret = comp_target_acquire(ct, &buffer_index);
-	if (ret == VK_ERROR_OUT_OF_DATE_KHR || ret == VK_SUBOPTIMAL_KHR) {
-		U_LOG_W("[per-session] Swapchain out of date/suboptimal (%s), recreating now",
-		        vk_result_string(ret));
+	if (ret == VK_ERROR_OUT_OF_DATE_KHR) {
+		U_LOG_W("[per-session] Swapchain out of date, recreating now");
 		recreate_session_swapchain(mc, vk);
 		ct = mc->session_render.target;
 		mc->session_render.swapchain_needs_recreate = false;
 
-		// Retry acquire after recreation
+		// Retry acquire after recreation.
+		// Accept VK_SUBOPTIMAL_KHR — the image IS acquired, it's just not
+		// optimal (e.g. overlay window still resizing asynchronously).
 		ret = comp_target_acquire(ct, &buffer_index);
-		if (ret != VK_SUCCESS) {
+		if (ret != VK_SUCCESS && ret != VK_SUBOPTIMAL_KHR) {
 			U_LOG_E("[per-session] Failed to acquire after swapchain recreation: %s",
 			        vk_result_string(ret));
 			return;
@@ -2803,9 +2801,8 @@ submit_and_present:
 
 	// Present the image (GPU work is complete, semaphore already signaled)
 	ret = comp_target_present(ct, vk->main_queue->queue, buffer_index, 0, display_time_ns, 0);
-	if (ret == VK_ERROR_OUT_OF_DATE_KHR || ret == VK_SUBOPTIMAL_KHR) {
-		U_LOG_W("[per-session] Present returned %s, flagging for recreation",
-		        vk_result_string(ret));
+	if (ret == VK_ERROR_OUT_OF_DATE_KHR) {
+		U_LOG_W("[per-session] Present returned OUT_OF_DATE, flagging for recreation");
 		mc->session_render.swapchain_needs_recreate = true;
 	} else if (ret != VK_SUCCESS) {
 		U_LOG_E("[per-session] Failed to present per-session target: %s", vk_result_string(ret));

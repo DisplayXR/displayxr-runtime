@@ -18,6 +18,16 @@
 - (CALayer *)makeBackingLayer { return [CAMetalLayer layer]; }
 @end
 
+// Overlay window that refuses keyboard focus — prevents TAB from stealing
+// focus away from the browser and causing the overlay to hide.
+@interface BridgeOverlayWindow : NSWindow
+@end
+
+@implementation BridgeOverlayWindow
+- (BOOL)canBecomeKeyWindow { return NO; }
+- (BOOL)canBecomeMainWindow { return NO; }
+@end
+
 // ============================================================================
 // Overlay window — borderless, click-through, floating, tracks browser canvas
 // ============================================================================
@@ -31,7 +41,7 @@ extern "C" BridgeOverlay* bridge_overlay_create(uint32_t w, uint32_t h, void** o
     [NSApplication sharedApplication];
 
     NSRect frame = NSMakeRect(0, 0, w, h);
-    NSWindow *window = [[NSWindow alloc]
+    NSWindow *window = [[BridgeOverlayWindow alloc]
         initWithContentRect:frame
         styleMask:NSWindowStyleMaskBorderless
         backing:NSBackingStoreBuffered
@@ -94,6 +104,74 @@ extern "C" void bridge_overlay_destroy(BridgeOverlay* ov) {
 
 extern "C" double bridge_get_main_screen_height(void) {
     return [[NSScreen mainScreen] frame].size.height;
+}
+
+// ============================================================================
+// HUD text rendering — CoreGraphics to RGBA buffer
+// ============================================================================
+
+extern "C" void bridge_render_hud_text(
+    const char* text,
+    uint8_t* buffer,
+    uint32_t width,
+    uint32_t height)
+{
+    @autoreleasepool {
+        // Clear buffer to fully transparent
+        memset(buffer, 0, (size_t)width * height * 4);
+
+        CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+        CGContextRef ctx = CGBitmapContextCreate(
+            buffer, width, height, 8, width * 4, colorSpace,
+            kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+        CGColorSpaceRelease(colorSpace);
+        if (!ctx) return;
+
+        // Flip coordinate system (CoreGraphics is bottom-up, we want top-down)
+        CGContextTranslateCTM(ctx, 0, height);
+        CGContextScaleCTM(ctx, 1, -1);
+
+        // Draw semi-transparent black rounded rect background
+        CGRect bgRect = CGRectMake(4, 4, width - 8, height - 8);
+        CGPathRef path = CGPathCreateWithRoundedRect(bgRect, 6, 6, NULL);
+        CGContextSetRGBFillColor(ctx, 0, 0, 0, 0.6);
+        CGContextAddPath(ctx, path);
+        CGContextFillPath(ctx);
+        CGPathRelease(path);
+
+        // Draw text using NSString/NSGraphicsContext
+        NSGraphicsContext *nsCtx = [NSGraphicsContext graphicsContextWithCGContext:ctx flipped:YES];
+        [NSGraphicsContext saveGraphicsState];
+        [NSGraphicsContext setCurrentContext:nsCtx];
+
+        NSFont *font = [NSFont fontWithName:@"Menlo" size:11];
+        if (!font) font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
+        NSDictionary *attrs = @{
+            NSFontAttributeName: font,
+            NSForegroundColorAttributeName: [NSColor colorWithCalibratedRed:0.9 green:0.9 blue:0.9 alpha:1.0]
+        };
+
+        NSString *str = [NSString stringWithUTF8String:text];
+        NSRect textRect = NSMakeRect(10, 10, width - 20, height - 20);
+        [str drawWithRect:textRect
+                  options:NSStringDrawingUsesLineFragmentOrigin | NSStringDrawingTruncatesLastVisibleLine
+               attributes:attrs
+                  context:nil];
+
+        [NSGraphicsContext restoreGraphicsState];
+        CGContextRelease(ctx);
+
+        // Convert premultiplied alpha → straight alpha for OpenXR compositor
+        for (uint32_t i = 0; i < width * height; i++) {
+            uint8_t *px = buffer + i * 4;
+            uint8_t a = px[3];
+            if (a > 0 && a < 255) {
+                px[0] = (uint8_t)((uint16_t)px[0] * 255 / a);
+                px[1] = (uint8_t)((uint16_t)px[1] * 255 / a);
+                px[2] = (uint8_t)((uint16_t)px[2] * 255 / a);
+            }
+        }
+    }
 }
 
 // ============================================================================

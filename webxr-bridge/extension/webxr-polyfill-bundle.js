@@ -10234,6 +10234,13 @@ void main() {
       altPressed = true;
       e.preventDefault();
     }
+    if (e.key === "Tab" && !e.repeat && wsConnected) {
+      e.preventDefault();
+      window.postMessage({
+        type: "monado-ws-out",
+        json: JSON.stringify({ hudToggle: true })
+      }, "*");
+    }
   });
   window.addEventListener("keyup", (e) => {
     if (!vrSessionActive)
@@ -10428,6 +10435,8 @@ void main() {
   requestAnimationFrame(updateCamera);
   var lastCanvasWidth = 0;
   var lastCanvasHeight = 0;
+  var lastWindowW = 0;
+  var lastWindowH = 0;
   var lastOverlayX = -1;
   var lastOverlayY = -1;
   var lastOverlayCW = -1;
@@ -10463,6 +10472,13 @@ void main() {
       window.postMessage({ type: "monado-ws-out", json: JSON.stringify({ resize: { w, h } }) }, "*");
       console.log(`MonadoXR: Canvas resized to ${w}x${h}, notified bridge host`);
     }
+    const rect = canvas.getBoundingClientRect();
+    const ww = Math.round(rect.width), wh = Math.round(rect.height);
+    if (ww !== lastWindowW || wh !== lastWindowH) {
+      lastWindowW = ww;
+      lastWindowH = wh;
+      window.postMessage({ type: "monado-ws-out", json: JSON.stringify({ windowSize: { w: ww, h: wh } }) }, "*");
+    }
     if (overlayDisplay) {
       sendOverlayCanvasRect(canvas);
     }
@@ -10476,24 +10492,6 @@ void main() {
         json: JSON.stringify({ tabVisible: visible })
       }, "*");
       console.log(`MonadoXR: Sent tabVisible=${visible}`);
-    }
-  });
-  window.addEventListener("blur", () => {
-    if (wsConnected && overlayDisplay) {
-      window.postMessage({
-        type: "monado-ws-out",
-        json: JSON.stringify({ windowFocused: false })
-      }, "*");
-      console.log("MonadoXR: Sent windowFocused=false");
-    }
-  });
-  window.addEventListener("focus", () => {
-    if (wsConnected && overlayDisplay) {
-      window.postMessage({
-        type: "monado-ws-out",
-        json: JSON.stringify({ windowFocused: true })
-      }, "*");
-      console.log("MonadoXR: Sent windowFocused=true");
     }
   });
   var displayMode = "sbs";
