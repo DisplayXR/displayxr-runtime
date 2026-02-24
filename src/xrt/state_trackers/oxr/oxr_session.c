@@ -220,9 +220,14 @@ oxr_session_get_window_metrics(struct oxr_session *sess,
 	}
 #endif
 
-	// Vendor-neutral path — works for both SR and sim_display
-	struct multi_compositor *mc = multi_compositor(&sess->xcn->base);
-	return multi_compositor_get_window_metrics(mc, out_metrics);
+	// Vendor-neutral path — works for both SR and sim_display (in-process only).
+	// IPC clients have an ipc_client_compositor, not a multi_compositor.
+	if (sess->sys->xsysc->xmcc != NULL) {
+		struct multi_compositor *mc = multi_compositor(&sess->xcn->base);
+		return multi_compositor_get_window_metrics(mc, out_metrics);
+	}
+
+	return false;
 }
 
 /*!
@@ -319,7 +324,9 @@ oxr_session_request_display_mode(struct oxr_logger *log, struct oxr_session *ses
 	}
 #endif
 
-	{
+	// In-process multi compositor path (not used for IPC clients).
+	// IPC clients have an ipc_client_compositor, not a multi_compositor.
+	if (sess->sys->xsysc->xmcc != NULL) {
 		struct multi_compositor *mc = multi_compositor(&sess->xcn->base);
 		success = multi_compositor_request_display_mode(mc, enable_3d);
 		if (success) {
@@ -1618,9 +1625,7 @@ oxr_session_allocate_and_init(struct oxr_logger *log,
 		if ((SESS)->sys->xsysc->xmcc != NULL) {                                                                \
 			xrt_syscomp_set_state((SESS)->sys->xsysc, &(SESS)->xcn->base, true, true);                     \
 			xrt_syscomp_set_z_order((SESS)->sys->xsysc, &(SESS)->xcn->base, 0);                            \
-		}                                                                                                      \
-		/* Pass system devices to multi_compositor for qwerty input */                                         \
-		{                                                                                                      \
+			/* Pass system devices to multi_compositor for qwerty input */                                  \
 			struct multi_compositor *_mc = multi_compositor(&(SESS)->xcn->base);                            \
 			_mc->xsysd = (SESS)->sys->xsysd;                                                              \
 		}                                                                                                      \
