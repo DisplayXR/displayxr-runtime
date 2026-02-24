@@ -63,10 +63,12 @@ bool InitializeHudRenderer(HudRenderer& hud, uint32_t w, uint32_t h) {
     }
 
     // Scale font sizes proportionally based on HUD dimensions.
-    // Base reference: 280px height with 20pt/15pt fonts (D3D11 ext app).
-    float fontScale = h / 280.0f;
+    // Base reference: 470px height (full layout with all sections).
+    float fontScale = h / 470.0f;
     float normalFontSize = 20.0f * fontScale;
     float smallFontSize = 15.0f * fontScale;
+    hud.normalFontSize = normalFontSize;
+    hud.smallFontSize = smallFontSize;
 
     if (!InitializeTextOverlay(hud.overlay, normalFontSize, smallFontSize)) {
         LOG_ERROR("HudRenderer: InitializeTextOverlay failed");
@@ -75,6 +77,14 @@ bool InitializeHudRenderer(HudRenderer& hud, uint32_t w, uint32_t h) {
 
     LOG_INFO("HudRenderer: initialized (%ux%u)", w, h);
     return true;
+}
+
+// Count newline-delimited lines in a text section
+static int countLines(const std::wstring& text) {
+    if (text.empty()) return 0;
+    int n = 1;
+    for (wchar_t c : text) if (c == L'\n') n++;
+    return n;
 }
 
 const void* RenderHudAndMap(HudRenderer& hud, uint32_t* rowPitch,
@@ -94,43 +104,35 @@ const void* RenderHudAndMap(HudRenderer& hud, uint32_t* rowPitch,
         rtv->Release();
     }
 
-    // Has extra sections (camera, stereo, help)?
-    bool hasExtra = !cameraText.empty() || !stereoText.empty() || !helpText.empty();
-
-    // Scale layout proportionally from base dimensions
-    float baseH = hasExtra ? 470.0f : 280.0f;
-    float sy = hud.height / baseH;
+    // Flow-based layout: position each section sequentially based on
+    // actual font size and line count, with proportional padding.
+    float normalLineH = hud.normalFontSize * 1.4f;
+    float smallLineH = hud.smallFontSize * 1.4f;
     float px = 12.0f * (hud.width / 380.0f);   // left padding
     float tw = (float)hud.width - 2.0f * px;    // text width
+    float gap = smallLineH * 0.3f;              // inter-section gap
+    float y = gap;                               // top padding
 
-    RenderText(hud.overlay, hud.device.Get(), hud.renderTex.Get(),
-        sessionText, px, 12*sy, tw, 26*sy);
+    // Render each section and advance Y cursor
+    struct Section { const std::wstring& text; bool small; };
+    Section sections[] = {
+        {sessionText, false},
+        {modeText, true},
+        {perfText, true},
+        {displayInfoText, true},
+        {eyeText, true},
+        {cameraText, true},
+        {stereoText, true},
+        {helpText, true},
+    };
 
-    RenderText(hud.overlay, hud.device.Get(), hud.renderTex.Get(),
-        modeText, px, 42*sy, tw, 22*sy, true);
-
-    RenderText(hud.overlay, hud.device.Get(), hud.renderTex.Get(),
-        perfText, px, 74*sy, tw, 88*sy, true);
-
-    RenderText(hud.overlay, hud.device.Get(), hud.renderTex.Get(),
-        displayInfoText, px, 172*sy, tw, 44*sy, true);
-
-    RenderText(hud.overlay, hud.device.Get(), hud.renderTex.Get(),
-        eyeText, px, 222*sy, tw, 44*sy, true);
-
-    if (!cameraText.empty()) {
+    for (const auto& s : sections) {
+        if (s.text.empty()) continue;
+        float lh = s.small ? smallLineH : normalLineH;
+        float h = lh * countLines(s.text);
         RenderText(hud.overlay, hud.device.Get(), hud.renderTex.Get(),
-            cameraText, px, 272*sy, tw, 44*sy, true);
-    }
-
-    if (!stereoText.empty()) {
-        RenderText(hud.overlay, hud.device.Get(), hud.renderTex.Get(),
-            stereoText, px, 322*sy, tw, 44*sy, true);
-    }
-
-    if (!helpText.empty()) {
-        RenderText(hud.overlay, hud.device.Get(), hud.renderTex.Get(),
-            helpText, px, 376*sy, tw, 80*sy, true);
+            s.text, px, y, tw, h, s.small);
+        y += h + gap;
     }
 
     // Copy render texture to staging texture, then map for CPU read

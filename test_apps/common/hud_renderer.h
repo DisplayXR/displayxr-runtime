@@ -31,6 +31,8 @@ struct HudRenderer {
     TextOverlay overlay;
     uint32_t width = 0;
     uint32_t height = 0;
+    float normalFontSize = 0;
+    float smallFontSize = 0;
 };
 
 // Create a standalone D3D11 device, render + staging textures, and DirectWrite resources

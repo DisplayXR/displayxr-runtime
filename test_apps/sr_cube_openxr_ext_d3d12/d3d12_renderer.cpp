@@ -262,9 +262,10 @@ static bool CreateResources(D3D12Renderer& renderer) {
         { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
     };
 
-    // Cube PSO (fallback, uses grid root signature)
+    // Cube PSO (fallback, non-textured path — still needs cubeRootSignature
+    // because the cube shader references SRV/sampler bindings)
     D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc = {};
-    psoDesc.pRootSignature = renderer.rootSignature.Get();
+    psoDesc.pRootSignature = renderer.cubeRootSignature.Get();
     psoDesc.VS = { cubeVS->GetBufferPointer(), cubeVS->GetBufferSize() };
     psoDesc.PS = { cubePS->GetBufferPointer(), cubePS->GetBufferSize() };
     psoDesc.InputLayout = { cubeInputElements, _countof(cubeInputElements) };
@@ -326,7 +327,8 @@ static bool CreateResources(D3D12Renderer& renderer) {
         }
     }
 
-    // Grid PSO (line list topology)
+    // Grid PSO (line list topology — uses simple grid root signature)
+    psoDesc.pRootSignature = renderer.rootSignature.Get();
     psoDesc.VS = { gridVS->GetBufferPointer(), gridVS->GetBufferSize() };
     psoDesc.PS = { gridPS->GetBufferPointer(), gridPS->GetBufferSize() };
     psoDesc.InputLayout = { gridInputElements, _countof(gridInputElements) };
@@ -649,7 +651,7 @@ bool CreateSwapchainRTVs(D3D12Renderer& renderer,
 
         // Recreate PSOs with the actual swapchain format
         D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc = {};
-        psoDesc.pRootSignature = renderer.rootSignature.Get();
+        psoDesc.pRootSignature = renderer.cubeRootSignature.Get();
         psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         psoDesc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
         psoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
@@ -711,11 +713,12 @@ bool CreateSwapchainRTVs(D3D12Renderer& renderer,
             }
         }
 
-        // Grid input layout
+        // Grid input layout (uses simple grid root signature)
         D3D12_INPUT_ELEMENT_DESC gridInputElements[] = {
             { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
         };
 
+        psoDesc.pRootSignature = renderer.rootSignature.Get();
         psoDesc.VS = { gridVS->GetBufferPointer(), gridVS->GetBufferSize() };
         psoDesc.PS = { gridPS->GetBufferPointer(), gridPS->GetBufferSize() };
         psoDesc.InputLayout = { gridInputElements, _countof(gridInputElements) };
@@ -893,9 +896,14 @@ void RenderScene(
             cmdList->SetDescriptorHeaps(1, heaps);
             cmdList->SetGraphicsRootDescriptorTable(1, renderer.srvHeap->GetGPUDescriptorHandleForHeapStart());
         } else {
-            cmdList->SetGraphicsRootSignature(renderer.rootSignature.Get());
+            cmdList->SetGraphicsRootSignature(renderer.cubeRootSignature.Get());
             cmdList->SetPipelineState(renderer.cubePSO.Get());
             cmdList->SetGraphicsRoot32BitConstants(0, sizeof(cb) / 4, &cb, 0);
+            if (renderer.srvHeap) {
+                ID3D12DescriptorHeap* heaps[] = { renderer.srvHeap.Get() };
+                cmdList->SetDescriptorHeaps(1, heaps);
+                cmdList->SetGraphicsRootDescriptorTable(1, renderer.srvHeap->GetGPUDescriptorHandleForHeapStart());
+            }
         }
         cmdList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         cmdList->IASetVertexBuffers(0, 1, &renderer.cubeVBV);
