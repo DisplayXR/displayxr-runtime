@@ -404,8 +404,8 @@ d3d11_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 								uint32_t new_vw = (uint32_t)((float)sr_w * ratio);
 								uint32_t new_vh = (uint32_t)((float)sr_h * ratio);
 
-								uint32_t resize_target_h = (c->display_processor != NULL) ? new_vh : new_height;
-							comp_d3d11_renderer_resize(c->renderer, new_vw, new_vh, resize_target_h);
+								// Always use window height so mono mode fills the full window
+							comp_d3d11_renderer_resize(c->renderer, new_vw, new_vh, new_height);
 							}
 						} else
 #endif
@@ -413,8 +413,7 @@ d3d11_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 						if (!in_size_move) {
 							uint32_t new_vw = new_width / 2;
 							uint32_t new_vh = new_height;
-							uint32_t resize_target_h = (c->display_processor != NULL) ? new_vh : new_height;
-							comp_d3d11_renderer_resize(c->renderer, new_vw, new_vh, resize_target_h);
+							comp_d3d11_renderer_resize(c->renderer, new_vw, new_vh, new_height);
 						}
 					}
 				}
@@ -1258,9 +1257,11 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	}
 
 	// Create renderer with the correct view dimensions.
-	// When a display processor (weaver) is present, the stereo texture must match the view height
-	// so the weaver samples only rendered content. Without a weaver, use the window height for mono/2D mode.
-	uint32_t target_height = (c->display_processor != NULL) ? view_height : c->settings.preferred.height;
+	// target_height = window height so the stereo texture is at least as tall as the window.
+	// This ensures mono/2D mode (fallback blit) fills the full window, not just the top portion.
+	// The display processor receives explicit view_width×view_height, so it correctly
+	// samples only the rendered region even when the texture is taller than the view.
+	uint32_t target_height = c->settings.preferred.height;
 	xret = comp_d3d11_renderer_create(c, view_width, view_height, target_height, &c->renderer);
 	if (xret != XRT_SUCCESS) {
 		U_LOG_E("Failed to create D3D11 renderer");
