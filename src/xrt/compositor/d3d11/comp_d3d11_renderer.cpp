@@ -1252,3 +1252,86 @@ comp_d3d11_renderer_resize(struct comp_d3d11_renderer *renderer,
 
 	return XRT_SUCCESS;
 }
+
+extern "C" xrt_result_t
+comp_d3d11_renderer_blit_stretch(struct comp_d3d11_renderer *renderer,
+                                 void *back_buffer_texture,
+                                 uint32_t target_width,
+                                 uint32_t target_height)
+{
+	if (renderer == nullptr || back_buffer_texture == nullptr) {
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+
+	auto internals = get_internals(renderer->c);
+	ID3D11Texture2D *bb = static_cast<ID3D11Texture2D *>(back_buffer_texture);
+
+	// Create temporary RTV for the back buffer
+	ID3D11RenderTargetView *rtv = nullptr;
+	HRESULT hr = internals->device->CreateRenderTargetView(bb, nullptr, &rtv);
+	if (FAILED(hr)) {
+		U_LOG_E("blit_stretch: failed to create RTV: 0x%08x", hr);
+		return XRT_ERROR_D3D;
+	}
+
+	// Bind back buffer as render target (no depth)
+	internals->context->OMSetRenderTargets(1, &rtv, nullptr);
+
+	// Set viewport to fill the entire back buffer
+	D3D11_VIEWPORT vp = {};
+	vp.Width = static_cast<float>(target_width);
+	vp.Height = static_cast<float>(target_height);
+	vp.MaxDepth = 1.0f;
+	internals->context->RSSetViewports(1, &vp);
+
+	// Set pipeline state (reuse renderer's existing objects)
+	internals->context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+	internals->context->IASetInputLayout(nullptr);
+	internals->context->VSSetShader(renderer->projection_vs, nullptr, 0);
+	internals->context->PSSetShader(renderer->projection_ps, nullptr, 0);
+	internals->context->RSSetState(renderer->rasterizer_state);
+	internals->context->OMSetDepthStencilState(renderer->depth_stencil_state, 0);
+	internals->context->OMSetBlendState(renderer->blend_opaque, nullptr, 0xFFFFFFFF);
+	internals->context->PSSetSamplers(0, 1, &renderer->sampler_linear);
+
+	// Bind stereo texture SRV
+	internals->context->PSSetShaderResources(0, 1, &renderer->stereo_srv);
+
+	// Set constant buffer: identity MVP, UV covers the full stereo texture
+	LayerConstants constants = {};
+	// Identity MVP (fullscreen quad in NDC)
+	constants.mvp[0] = 1.0f;
+	constants.mvp[5] = 1.0f;
+	constants.mvp[10] = 1.0f;
+	constants.mvp[15] = 1.0f;
+	// UV transform: sample the entire stereo texture
+	constants.post_transform[0] = 0.0f; // x offset
+	constants.post_transform[1] = 0.0f; // y offset
+	constants.post_transform[2] = 1.0f; // width scale
+	constants.post_transform[3] = 1.0f; // height scale
+	// Color identity
+	constants.color_scale[0] = 1.0f;
+	constants.color_scale[1] = 1.0f;
+	constants.color_scale[2] = 1.0f;
+	constants.color_scale[3] = 1.0f;
+
+	D3D11_MAPPED_SUBRESOURCE mapped;
+	hr = internals->context->Map(renderer->constant_buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+	if (SUCCEEDED(hr)) {
+		memcpy(mapped.pData, &constants, sizeof(constants));
+		internals->context->Unmap(renderer->constant_buffer, 0);
+	}
+	internals->context->VSSetConstantBuffers(0, 1, &renderer->constant_buffer);
+	internals->context->PSSetConstantBuffers(0, 1, &renderer->constant_buffer);
+
+	// Draw fullscreen quad (triangle strip, 4 vertices)
+	internals->context->Draw(4, 0);
+
+	// Unbind SRV to prevent hazard warnings
+	ID3D11ShaderResourceView *null_srv = nullptr;
+	internals->context->PSSetShaderResources(0, 1, &null_srv);
+
+	rtv->Release();
+
+	return XRT_SUCCESS;
+}

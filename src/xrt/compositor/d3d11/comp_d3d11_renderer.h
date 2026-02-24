@@ -147,6 +147,29 @@ comp_d3d11_renderer_resize(struct comp_d3d11_renderer *renderer,
                            uint32_t new_view_height,
                            uint32_t new_target_height);
 
+/*!
+ * Blit the stereo texture to a back buffer with GPU stretching.
+ *
+ * Used for mono/2D fallback when the stereo texture is smaller than
+ * the window (e.g. display processor present → texture_height = view_height
+ * which may be less than window height). Renders a fullscreen quad from
+ * the stereo texture SRV to the back buffer, stretching to fill the target.
+ *
+ * @param renderer The renderer.
+ * @param back_buffer_texture The back buffer (ID3D11Texture2D*) to blit to.
+ * @param target_width Width of the back buffer in pixels.
+ * @param target_height Height of the back buffer in pixels.
+ *
+ * @return XRT_SUCCESS on success, error code otherwise.
+ *
+ * @ingroup comp_d3d11
+ */
+xrt_result_t
+comp_d3d11_renderer_blit_stretch(struct comp_d3d11_renderer *renderer,
+                                 void *back_buffer_texture,
+                                 uint32_t target_width,
+                                 uint32_t target_height);
+
 #ifdef __cplusplus
 }
 #endif
