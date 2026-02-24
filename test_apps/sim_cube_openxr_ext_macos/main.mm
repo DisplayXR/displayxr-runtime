@@ -42,6 +42,7 @@
 #include <unistd.h>
 
 #include "stereo_params.h"
+#include "display3d_view.h"
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
@@ -277,45 +278,7 @@ static XrQuaternionf quat_multiply(XrQuaternionf a, XrQuaternionf b) {
     };
 }
 
-// Kooima asymmetric frustum projection from eye position and screen extents
-// Reference: Robert Kooima, "Generalized Perspective Projection" (2009)
-static void mat4_kooima_projection(float* m, XrVector3f eyePos,
-    float screenWidthM, float screenHeightM, float nearZ, float farZ) {
-    float ez = eyePos.z;
-    if (ez <= 0.001f) ez = 0.65f;
-    float halfW = screenWidthM / 2.0f;
-    float halfH = screenHeightM / 2.0f;
-    float ex = eyePos.x, ey = eyePos.y;
-
-    float left   = nearZ * (-halfW - ex) / ez;
-    float right  = nearZ * ( halfW - ex) / ez;
-    float bottom = nearZ * (-halfH - ey) / ez;
-    float top    = nearZ * ( halfH - ey) / ez;
-    float w = right - left, h = top - bottom;
-
-    memset(m, 0, 16 * sizeof(float));
-    m[0]  = 2.0f * nearZ / w;
-    m[5]  = 2.0f * nearZ / h;
-    m[8]  = (right + left) / w;
-    m[9]  = (top + bottom) / h;
-    m[10] = -(farZ + nearZ) / (farZ - nearZ);
-    m[11] = -1.0f;
-    m[14] = -(2.0f * farZ * nearZ) / (farZ - nearZ);
-}
-
-// Compute Kooima FOV angles for layer submission
-static XrFovf compute_kooima_fov(XrVector3f eyePos, float screenWidthM, float screenHeightM) {
-    float ez = eyePos.z;
-    if (ez <= 0.001f) ez = 0.65f;
-    float halfW = screenWidthM / 2.0f;
-    float halfH = screenHeightM / 2.0f;
-    return {
-        atanf((-halfW - eyePos.x) / ez),
-        atanf(( halfW - eyePos.x) / ez),
-        atanf(( halfH - eyePos.y) / ez),
-        atanf((-halfH - eyePos.y) / ez)
-    };
-}
+// Kooima projection and FOV now provided by display3d_view.h
 
 // ============================================================================
 // SPIR-V shaders (embedded)
@@ -2644,37 +2607,6 @@ int main() {
                         xr.eyeTrackingActive = (viewState.viewStateFlags
                             & XR_VIEW_STATE_POSITION_TRACKED_BIT) != 0;
 
-                        // Apply stereo eye factors (IPD + parallax) to raw eye positions
-                        XrVector3f processedEyes[2];
-                        ApplyEyeFactors(
-                            views[0].pose.position, views[1].pose.position,
-                            xr.nominalViewerX, xr.nominalViewerY, xr.nominalViewerZ,
-                            g_input.stereo.ipdFactor, g_input.stereo.parallaxFactor,
-                            processedEyes[0], processedEyes[1]);
-                        views[0].pose.position = processedEyes[0];
-                        views[1].pose.position = processedEyes[1];
-
-                        // Apply player transform (production-engine locomotion pattern)
-                        XrQuaternionf playerOri;
-                        quat_from_yaw_pitch(g_input.yaw, g_input.pitch, &playerOri);
-
-                        for (int i = 0; i < 2; i++) {
-                            // Scale by perspectiveFactor/scaleFactor (must match KooimaEyePos)
-                            float es = g_input.stereo.perspectiveFactor / g_input.stereo.scaleFactor;
-                            float lx = views[i].pose.position.x * es;
-                            float ly = views[i].pose.position.y * es;
-                            float lz = views[i].pose.position.z * es;
-                            float wx, wy, wz;
-                            quat_rotate_vec3(playerOri, lx, ly, lz, &wx, &wy, &wz);
-                            views[i].pose.position = {
-                                wx + g_input.cameraPosX,
-                                wy + g_input.cameraPosY,
-                                wz + g_input.cameraPosZ};
-                            // worldOri = playerOri * localOri (rotate local by player in world frame)
-                            XrQuaternionf localOri = views[i].pose.orientation;
-                            views[i].pose.orientation = quat_multiply(playerOri, localOri);
-                        }
-
                         // Determine eye count (mono in 2D, stereo in 3D)
                         int eyeCount = g_input.displayMode3D ? 2 : 1;
 
@@ -2684,15 +2616,22 @@ int main() {
                                 (rawEyePos[0].x + rawEyePos[1].x) / 2.0f,
                                 (rawEyePos[0].y + rawEyePos[1].y) / 2.0f,
                                 (rawEyePos[0].z + rawEyePos[1].z) / 2.0f};
-                            processedEyes[0] = {
-                                (processedEyes[0].x + processedEyes[1].x) / 2.0f,
-                                (processedEyes[0].y + processedEyes[1].y) / 2.0f,
-                                (processedEyes[0].z + processedEyes[1].z) / 2.0f};
-                            views[0].pose.position = {
-                                (views[0].pose.position.x + views[1].pose.position.x) / 2.0f,
-                                (views[0].pose.position.y + views[1].pose.position.y) / 2.0f,
-                                (views[0].pose.position.z + views[1].pose.position.z) / 2.0f};
+                            rawEyePos[1] = rawEyePos[0];
                         }
+
+                        // Build display pose from player transform
+                        XrPosef displayPose;
+                        quat_from_yaw_pitch(g_input.yaw, g_input.pitch, &displayPose.orientation);
+                        displayPose.position = {g_input.cameraPosX, g_input.cameraPosY, g_input.cameraPosZ};
+
+                        // Build tunables from stereo params
+                        Display3DTunables tunables;
+                        tunables.ipd_factor = g_input.stereo.ipdFactor;
+                        tunables.parallax_factor = g_input.stereo.parallaxFactor;
+                        tunables.perspective_factor = g_input.stereo.perspectiveFactor;
+                        tunables.scale_factor = g_input.stereo.scaleFactor;
+
+                        XrVector3f nominalViewer = {xr.nominalViewerX, xr.nominalViewerY, xr.nominalViewerZ};
 
                         // Compute render dims for SBS single-swapchain.
                         // Scale depends on current output mode (may change at runtime):
@@ -2720,46 +2659,52 @@ int main() {
                         g_renderW = renderW;
                         g_renderH = renderH;
 
+                        // Compute stereo views using display3d library
+                        Display3DStereoView stereoViews[2];
+                        bool hasKooima = (xr.displayWidthM > 0 && xr.displayHeightM > 0);
+                        if (hasKooima) {
+                            // Compute viewport-scaled screen dimensions in meters
+                            float dispPxW = xr.displayPixelWidth > 0 ? (float)xr.displayPixelWidth : (float)xr.swapchain.width;
+                            float dispPxH = xr.displayPixelHeight > 0 ? (float)xr.displayPixelHeight : (float)xr.swapchain.height;
+                            float pxSizeX = xr.displayWidthM / dispPxW;
+                            float pxSizeY = xr.displayHeightM / dispPxH;
+                            float winW_m = (float)g_windowW * pxSizeX;
+                            float winH_m = (float)g_windowH * pxSizeY;
+                            float minDisp = fminf(xr.displayWidthM, xr.displayHeightM);
+                            float minWin  = fminf(winW_m, winH_m);
+                            float vs = minDisp / minWin;
+                            float screenWidthM  = winW_m * vs;
+                            float screenHeightM = winH_m * vs;
+                            // Halve screenW only for SBS mode (each eye sees
+                            // half the display). Anaglyph/blend: full width.
+                            bool sbsMode = g_input.displayMode3D && g_currentOutputMode == 0;
+                            float baseScreenW = sbsMode ? screenWidthM / 2.0f : screenWidthM;
+
+                            Display3DScreen screen;
+                            screen.width_m = baseScreenW;
+                            screen.height_m = screenHeightM;
+
+                            display3d_compute_stereo_views(
+                                &rawEyePos[0], &rawEyePos[1], &nominalViewer,
+                                &screen, &tunables, &displayPose,
+                                0.01f, 100.0f, &stereoViews[0], &stereoViews[1]);
+                        }
+
                         rendered = true;
                         uint32_t imageIndex;
                         if (AcquireSwapchainImage(xr, imageIndex)) {
                             EyeRenderParams eyeParams[2];
                             for (int eye = 0; eye < eyeCount; eye++) {
-                                mat4_view_from_xr_pose(eyeParams[eye].viewMat, views[eye].pose);
-
-                                // Kooima projection uses processed display-space positions
-                                // (after IPD + parallax factors applied earlier).
-                                // Viewport-scaled: convert window pixels to meters,
-                                // apply isotropic scale so FOV stays consistent across
-                                // window sizes on the 3D display.
                                 XrFovf submitFov = views[eye].fov;
-                                if (xr.displayWidthM > 0 && xr.displayHeightM > 0) {
-                                    float dispPxW = xr.displayPixelWidth > 0 ? (float)xr.displayPixelWidth : (float)xr.swapchain.width;
-                                    float dispPxH = xr.displayPixelHeight > 0 ? (float)xr.displayPixelHeight : (float)xr.swapchain.height;
-                                    float pxSizeX = xr.displayWidthM / dispPxW;
-                                    float pxSizeY = xr.displayHeightM / dispPxH;
-                                    float winW_m = (float)g_windowW * pxSizeX;
-                                    float winH_m = (float)g_windowH * pxSizeY;
-                                    float minDisp = fminf(xr.displayWidthM, xr.displayHeightM);
-                                    float minWin  = fminf(winW_m, winH_m);
-                                    float vs = minDisp / minWin;
-                                    float screenWidthM  = winW_m * vs;
-                                    float screenHeightM = winH_m * vs;
-                                    // Halve screenW only for SBS mode (each eye sees
-                                    // half the display). Anaglyph/blend: full width.
-                                    bool sbsMode = g_input.displayMode3D && g_currentOutputMode == 0;
-                                    float baseScreenW = sbsMode ? screenWidthM / 2.0f : screenWidthM;
-                                    // Apply stereo factors: processedEyes already have IPD+parallax
-                                    XrVector3f kooimaEye = KooimaEyePos(processedEyes[eye],
-                                        g_input.stereo.perspectiveFactor, g_input.stereo.scaleFactor);
-                                    float kScreenW, kScreenH;
-                                    KooimaScreenDim(baseScreenW, screenHeightM,
-                                        g_input.stereo.scaleFactor, kScreenW, kScreenH);
-                                    mat4_kooima_projection(eyeParams[eye].projMat, kooimaEye,
-                                        kScreenW, kScreenH, 0.01f, 100.0f);
-                                    submitFov = compute_kooima_fov(kooimaEye,
-                                        kScreenW, kScreenH);
+                                if (hasKooima) {
+                                    memcpy(eyeParams[eye].viewMat, stereoViews[eye].view_matrix, sizeof(float) * 16);
+                                    memcpy(eyeParams[eye].projMat, stereoViews[eye].projection_matrix, sizeof(float) * 16);
+                                    submitFov = stereoViews[eye].fov;
+                                    // Update view pose for layer submission
+                                    views[eye].pose.position = stereoViews[eye].eye_world;
+                                    views[eye].pose.orientation = displayPose.orientation;
                                 } else {
+                                    mat4_view_from_xr_pose(eyeParams[eye].viewMat, views[eye].pose);
                                     mat4_from_xr_fov(eyeParams[eye].projMat, views[eye].fov, 0.01f, 100.0f);
                                 }
 

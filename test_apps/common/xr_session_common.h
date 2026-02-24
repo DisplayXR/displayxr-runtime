@@ -167,20 +167,14 @@ bool AcquireSwapchainImage(XrSessionManager& xr, uint32_t& imageIndex);
 // Release swapchain image after rendering
 bool ReleaseSwapchainImage(XrSessionManager& xr);
 
-// App-side Kooima asymmetric frustum projection (RAW mode, app-owned camera model).
-// Builds a projection matrix directly from eye position and physical screen extents,
-// bypassing the atan/tan roundtrip through XrFovf. The screen dimensions should be
-// the *effective* physical extent of the rendered area (meters), computed from the
-// display's physical size scaled by renderSize / swapchainSize.
-// Reference: Robert Kooima, "Generalized Perspective Projection" (2009).
+// App-side Kooima asymmetric frustum projection (delegates to display3d_view library).
+// Wraps display3d_compute_projection() into an XMMATRIX for DirectX apps.
 DirectX::XMMATRIX ComputeKooimaProjection(
     const XrVector3f& eyePos,
     float screenWidthM, float screenHeightM,
     float nearZ, float farZ);
 
-// Compute FOV angles (XrFovf) from eye position and physical screen extents.
-// Same geometry as ComputeKooimaProjection but returns atan-based angles for
-// layer submission via projectionViews[].fov.
+// Compute FOV angles (delegates to display3d_compute_fov()).
 XrFovf ComputeKooimaFov(
     const XrVector3f& eyePos,
     float screenWidthM, float screenHeightM);
