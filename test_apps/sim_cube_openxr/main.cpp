@@ -1485,7 +1485,7 @@ static void RenderScene(
         // Draw textured cube
         {
             const float cubeSize = 0.06f;
-            const float cubeHeight = cubeSize / 2.0f;
+            const float cubeHeight = 1.6f;
 
             float rot[16], scl[16], trans[16], model[16], tmp[16];
             mat4_rotation_y(rot, renderer.cubeRotation);
