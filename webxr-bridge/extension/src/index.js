@@ -86,21 +86,10 @@ const wrappedRequestSession = async function(mode, ...rest) {
   if (mode === 'immersive-vr') {
     vrSessionActive = true;
     console.log('MonadoXR: VR session started — IO controls enabled');
-    // Notify bridge host for overlay visibility
-    if (wsConnected && overlayDisplay) {
-      window.postMessage({ type: 'monado-ws-out',
-        json: JSON.stringify({ sessionActive: true }) }, '*');
-      console.log('MonadoXR: Sent sessionActive=true to bridge host');
-    }
     session.addEventListener('end', () => {
       vrSessionActive = false;
       mouseDragging = false;
       console.log('MonadoXR: VR session ended — IO controls disabled');
-      if (wsConnected && overlayDisplay) {
-        window.postMessage({ type: 'monado-ws-out',
-          json: JSON.stringify({ sessionActive: false }) }, '*');
-        console.log('MonadoXR: Sent sessionActive=false to bridge host');
-      }
     });
   }
   return session;
@@ -191,6 +180,10 @@ window.addEventListener('keydown', (e) => {
     window.postMessage({ type: 'monado-ws-out',
       json: JSON.stringify({ hudToggle: true }) }, '*');
   }
+  // 1/2/3 switch display processing mode
+  if (e.key === '1' && !e.repeat) { displayMode = 'sbs';      console.log('MonadoXR: Display mode → SBS'); }
+  if (e.key === '2' && !e.repeat) { displayMode = 'anaglyph';  console.log('MonadoXR: Display mode → Anaglyph'); }
+  if (e.key === '3' && !e.repeat) { displayMode = 'blend';     console.log('MonadoXR: Display mode → Blend'); }
 });
 window.addEventListener('keyup', (e) => {
   if (!vrSessionActive) return;
@@ -352,28 +345,6 @@ requestAnimationFrame(updateCamera);
 
 let lastCanvasWidth = 0, lastCanvasHeight = 0;
 let lastWindowW = 0, lastWindowH = 0;
-let lastOverlayX = -1, lastOverlayY = -1, lastOverlayCW = -1, lastOverlayCH = -1;
-
-// Shared overlay rect tracker — called from both window rAF and XR session rAF
-function sendOverlayCanvasRect(canvas) {
-  const rect = canvas.getBoundingClientRect();
-  const chromeHeight = window.outerHeight - window.innerHeight;
-  const screenX = window.screenX + rect.left;
-  const screenY = window.screenY + chromeHeight + rect.top;
-  const cssW = rect.width;
-  const cssH = rect.height;
-  if (screenX !== lastOverlayX || screenY !== lastOverlayY ||
-      cssW !== lastOverlayCW || cssH !== lastOverlayCH) {
-    lastOverlayX = screenX;
-    lastOverlayY = screenY;
-    lastOverlayCW = cssW;
-    lastOverlayCH = cssH;
-    const msg = { canvasRect: { x: screenX, y: screenY, w: cssW, h: cssH } };
-    window.postMessage({ type: 'monado-ws-out', json: JSON.stringify(msg) }, '*');
-    console.log(`MonadoXR: Overlay canvasRect sent: (${screenX}, ${screenY}) ${cssW}x${cssH}`);
-  }
-}
-
 function checkCanvasResize() {
   requestAnimationFrame(checkCanvasResize);
   if (!wsConnected) return;
@@ -396,50 +367,21 @@ function checkCanvasResize() {
     lastWindowH = wh;
     window.postMessage({ type: 'monado-ws-out', json: JSON.stringify({ windowSize: { w: ww, h: wh } }) }, '*');
   }
-
-  // Overlay mode: track canvas screen position + CSS size for overlay window placement
-  if (overlayDisplay) {
-    sendOverlayCanvasRect(canvas);
-  }
 }
 
 requestAnimationFrame(checkCanvasResize);
-
-// --- Overlay Visibility Events ---
-// Notify bridge host when browser tab/window visibility changes so the overlay
-// window can hide when the user switches away.
-
-document.addEventListener('visibilitychange', () => {
-  if (wsConnected && overlayDisplay) {
-    const visible = !document.hidden;
-    window.postMessage({ type: 'monado-ws-out',
-      json: JSON.stringify({ tabVisible: visible }) }, '*');
-    console.log(`MonadoXR: Sent tabVisible=${visible}`);
-  }
-});
-
-// blur/focus listeners removed — they caused the overlay to flicker when
-// pressing TAB. tabVisible (from visibilitychange) handles tab-switching.
 
 // --- Display Mode State ---
 // 'sbs' = side-by-side (no post-process), 'anaglyph' = red-cyan, 'blend' = 50% mix
 let displayMode = 'sbs';
 // When true, browser handles display — skip frame capture to Monado
 let browserDisplay = false;
-// When true, Monado sends composited frames via readback — display on canvas
-let readbackDisplay = false;
-// When true, Monado presents to a visible overlay window positioned over the browser canvas
-let overlayDisplay = false;
-// When true, browser owns input (WASD/mouse/controllers) — set by browserDisplay, readbackDisplay, or overlayDisplay
-// In these modes the extension handles IO locally since Monado can't capture browser events.
+// When true, browser owns input (WASD/mouse/controllers)
+// In browser display mode the extension handles IO locally since Monado can't capture browser events.
 let localInput = false;
-// Latest composited frame from Monado readback (Option A)
-let compositedFrame = null;
 
 // --- Post-Process Shader Pipeline ---
 // Lazy-initialized WebGL2 resources for SBS→anaglyph/blend display processing.
-// Reusable across Option D (copyTexImage2D), Option A (texImage2D from readback),
-// and future browser-native (importExternalTexture).
 
 let ppProgram = null;
 let ppTexture = null;
@@ -575,51 +517,6 @@ function applyDisplayProcessing(gl, width, height) {
     gl.viewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
 }
 
-// Display a composited frame received from Monado readback (Option A).
-// Uses the same PP pipeline in passthrough mode (uMode=0).
-function displayCompositedFrame(gl, frame) {
-    if (!ppInitialized && !initPostProcess(gl)) return;
-
-    // Save WebGL state
-    const prevProgram = gl.getParameter(gl.CURRENT_PROGRAM);
-    const prevFB = gl.getParameter(gl.FRAMEBUFFER_BINDING);
-    const prevVAO = gl.getParameter(gl.VERTEX_ARRAY_BINDING);
-    const prevActiveTexture = gl.getParameter(gl.ACTIVE_TEXTURE);
-    const prevTex2D = gl.getParameter(gl.TEXTURE_BINDING_2D);
-    const prevViewport = gl.getParameter(gl.VIEWPORT);
-
-    const prevDepthTest = gl.isEnabled(gl.DEPTH_TEST);
-    const prevStencilTest = gl.isEnabled(gl.STENCIL_TEST);
-    const prevBlend = gl.isEnabled(gl.BLEND);
-    gl.disable(gl.DEPTH_TEST);
-    gl.disable(gl.STENCIL_TEST);
-    gl.disable(gl.BLEND);
-
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, ppTexture);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, frame.width, frame.height, 0,
-                  gl.RGBA, gl.UNSIGNED_BYTE, frame.pixels);
-
-    gl.useProgram(ppProgram);
-    gl.uniform1i(gl.getUniformLocation(ppProgram, 'uSBS'), 0);
-    gl.uniform1i(gl.getUniformLocation(ppProgram, 'uMode'), 0); // passthrough
-    gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
-    gl.bindVertexArray(ppVAO);
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-
-    // Restore WebGL state
-    if (prevDepthTest) gl.enable(gl.DEPTH_TEST);
-    if (prevStencilTest) gl.enable(gl.STENCIL_TEST);
-    if (prevBlend) gl.enable(gl.BLEND);
-    gl.useProgram(prevProgram);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, prevFB);
-    gl.bindVertexArray(prevVAO);
-    gl.activeTexture(prevActiveTexture);
-    gl.bindTexture(gl.TEXTURE_2D, prevTex2D);
-    gl.viewport(prevViewport[0], prevViewport[1], prevViewport[2], prevViewport[3]);
-}
-
 // --- WebSocket Frame Capture ---
 // Sends stereo SBS frames to the native OpenXR bridge host via WebSocket.
 // Protocol: [uint32 width][uint32 height][RGBA pixels]
@@ -667,18 +564,9 @@ function handleWsMessage(jsonStr) {
     }
     if (msg.browserDisplay !== undefined) {
       browserDisplay = msg.browserDisplay;
+      localInput = browserDisplay;
       console.log(`MonadoXR: Browser display mode ${browserDisplay ? 'enabled' : 'disabled'}`);
     }
-    if (msg.readbackDisplay !== undefined) {
-      readbackDisplay = msg.readbackDisplay;
-      console.log(`MonadoXR: Readback display mode ${readbackDisplay ? 'enabled' : 'disabled'}`);
-    }
-    if (msg.overlayDisplay !== undefined) {
-      overlayDisplay = msg.overlayDisplay;
-      console.log(`MonadoXR: Overlay display mode ${overlayDisplay ? 'enabled' : 'disabled'}`);
-    }
-    // Update local input flag — browser owns IO in browser-display, readback, and overlay modes
-    localInput = browserDisplay || readbackDisplay || overlayDisplay;
     // Physical display dimensions for Kooima projection
     if (msg.displayWidthM) {
       displayWidthM = msg.displayWidthM;
@@ -742,15 +630,6 @@ window.addEventListener('message', (evt) => {
   } else if (evt.data.type === 'monado-ws-status') {
     wsConnected = evt.data.connected;
     console.log(`MonadoXR: WebSocket ${wsConnected ? 'connected' : 'disconnected'}`);
-  } else if (evt.data.type === 'monado-ws-binary' && evt.data.buffer) {
-    // Binary readback frame from Monado (Option A)
-    const buf = evt.data.buffer;
-    if (buf.byteLength > 8) {
-      const view = new DataView(buf);
-      const w = view.getUint32(0, true);
-      const h = view.getUint32(4, true);
-      compositedFrame = { width: w, height: h, pixels: new Uint8Array(buf, 8) };
-    }
   }
 });
 
@@ -944,7 +823,7 @@ XRFrame.prototype.getViewerPose = function(refSpace) {
 
     console.log(`  Viewport: ${vpW}x${vpH}, texture: ${texW}x${texH} (viewport * viewScale)`);
     console.log(`  Kooima screen rect: ${screenW.toFixed(4)}x${fullSH.toFixed(4)} m (${sbsMode ? 'SBS half' : 'full'} width)`);
-    console.log(`  displayMode: ${displayMode}, browserDisplay: ${browserDisplay}, readbackDisplay: ${readbackDisplay}, overlayDisplay: ${overlayDisplay}`);
+    console.log(`  displayMode: ${displayMode}, browserDisplay: ${browserDisplay}`);
     console.log('============================');
   }
 
@@ -958,14 +837,8 @@ XRSession.prototype.requestAnimationFrame = function(callback) {
     // Let the app render first
     callback(time, frame);
 
-    // Overlay mode: track canvas rect inside XR session rAF (window rAF may be throttled)
-    if (overlayDisplay && wsConnected) {
-      const glCanvas = this.renderState?.baseLayer?.context?.canvas;
-      if (glCanvas) sendOverlayCanvasRect(glCanvas);
-    }
-
-    // Apply browser-side display processing (anaglyph/blend) if not using readback
-    if (!readbackDisplay && displayMode !== 'sbs' && displayMode !== 'none') {
+    // Apply browser-side display processing (anaglyph/blend)
+    if (displayMode !== 'sbs' && displayMode !== 'none') {
       const baseLayer = this.renderState?.baseLayer;
       if (baseLayer) {
         const gl = baseLayer.context;
@@ -1021,15 +894,6 @@ XRSession.prototype.requestAnimationFrame = function(callback) {
     // Transfer binary to content script (zero-copy via transferable)
     window.postMessage({ type: 'monado-ws-out', binary: packet.buffer }, '*', [packet.buffer]);
 
-    // Display composited frame from Monado readback (Option A).
-    // Overwrites the app's SBS canvas with Monado's display-processed output.
-    // Keep the last composited frame and re-display every RAF so the app's
-    // next SBS render never shows through (readback arrives async, often
-    // slower than 60fps — without persistence, SBS blinks on frames with
-    // no new readback data).
-    if (readbackDisplay && compositedFrame) {
-      displayCompositedFrame(baseLayer.context, compositedFrame);
-    }
   });
 };
 

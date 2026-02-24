@@ -44,13 +44,6 @@
 extern "C" void* bridge_create_hidden_metal_view(uint32_t w, uint32_t h);
 extern "C" void bridge_render_hud_text(const char* text, uint8_t* buffer,
                                        uint32_t width, uint32_t height);
-
-struct BridgeOverlay;
-extern "C" BridgeOverlay* bridge_overlay_create(uint32_t w, uint32_t h, void** outViewHandle);
-extern "C" void bridge_overlay_set_frame(BridgeOverlay* ov, double x, double y, double w, double h);
-extern "C" void bridge_overlay_set_visible(BridgeOverlay* ov, bool visible);
-extern "C" void bridge_overlay_destroy(BridgeOverlay* ov);
-extern "C" double bridge_get_main_screen_height(void);
 #endif
 
 // ============================================================================
@@ -98,53 +91,31 @@ struct FrameBuffer {
 static FrameBuffer g_frameBuffer;
 
 // ============================================================================
-// Readback buffer — composited pixels from Monado (Option A)
+// Display mode notes
 // ============================================================================
-
-struct ReadbackBuffer {
-    std::mutex mutex;
-    std::vector<uint8_t> data;
-    uint32_t width = 0;
-    uint32_t height = 0;
-    std::atomic<bool> ready{false};
-};
-
-static ReadbackBuffer g_readbackBuffer;
-
+//
+// Browser-only rendering (current): The extension captures the WebXR app's
+// SBS output, applies display processing (anaglyph/blend/SBS) locally in the
+// browser, and shows the result directly on the canvas. Keys 1/2/3 switch
+// modes. Monado still provides pose/FOV/controller data via WebSocket but
+// does not process frames.
+//
+// Two alternative approaches were tried and abandoned:
+//
+// --readback: Monado composites SBS frames through the display processor
+// offscreen, then sends the processed RGBA pixels back to the browser via
+// WebSocket for display. Too slow: ~4.75 MB uncompressed per frame at
+// 1920x1080, achieving < 1 FPS. JPEG compression would fix bandwidth but
+// destroys lenticular pixel mapping.
+//
+// --overlay: Monado renders into a borderless click-through NSWindow
+// (CAMetalLayer + MoltenVK) floating above the browser canvas. Zero
+// readback, full GPU path. Problems: VK_SUBOPTIMAL_KHR on every frame
+// due to async window resize, clunky canvas-tracking (window position
+// lags behind browser motion), and low FPS from repeated swapchain
+// recreation. A proper solution requires browser-native GPU texture
+// sharing (e.g. WebGPU importExternalTexture or similar).
 // ============================================================================
-// Overlay mode — borderless click-through window over browser canvas
-// ============================================================================
-
-#ifdef __APPLE__
-static bool g_overlayMode = false;
-static BridgeOverlay* g_overlay = nullptr;
-static void* g_overlayViewHandle = nullptr;
-
-// Visibility state machine
-static bool g_overlayCanvasRectKnown = false;
-static bool g_overlaySessionActive = false;
-static bool g_overlayTabVisible = true;
-static bool g_overlayWindowFocused = true;
-
-static void updateOverlayVisibility() {
-    if (!g_overlay) return;
-    // Don't use windowFocused — TAB key causes spurious blur/focus events that
-    // flicker the overlay. tabVisible (document.visibilitychange) is sufficient
-    // to hide when the user switches browser tabs.
-    bool show = g_overlayCanvasRectKnown && g_overlaySessionActive
-             && g_overlayTabVisible;
-    static bool lastShow = false;
-    if (show != lastShow) {
-        LOG_INFO("Overlay visible=%s (rect=%s session=%s tab=%s)",
-                 show ? "YES" : "NO",
-                 g_overlayCanvasRectKnown ? "Y" : "N",
-                 g_overlaySessionActive ? "Y" : "N",
-                 g_overlayTabVisible ? "Y" : "N");
-        lastShow = show;
-    }
-    bridge_overlay_set_visible(g_overlay, show);
-}
-#endif
 
 // HUD rendering state
 static std::vector<uint8_t> g_hudPixels;
@@ -156,14 +127,6 @@ static uint32_t g_canvasWidth = 0, g_canvasHeight = 0; // From extension
 static double g_frameTimeAccum = 0.0;
 static uint32_t g_frameTimeCount = 0;
 static double g_avgFrameTime = 0.0;
-
-static void readback_callback(const uint8_t* pixels, uint32_t w, uint32_t h, void* /*ud*/) {
-    std::lock_guard<std::mutex> lock(g_readbackBuffer.mutex);
-    g_readbackBuffer.data.assign(pixels, pixels + (size_t)w * h * 4);
-    g_readbackBuffer.width = w;
-    g_readbackBuffer.height = h;
-    g_readbackBuffer.ready.store(true);
-}
 
 // ============================================================================
 // OpenXR + Vulkan state
@@ -697,29 +660,13 @@ static bool CreateSession(AppState& app) {
     macosBinding.next = nullptr;
 
     if (app.hasMacosWindowBinding) {
-        if (getenv("READBACK_MODE")) {
-            // Offscreen readback — no window, composited pixels via callback
-            macosBinding.viewHandle = nullptr;
-            macosBinding.readbackCallback = readback_callback;
-            macosBinding.readbackUserdata = nullptr;
-            LOG_INFO("Chaining XR_EXT_macos_window_binding with offscreen readback");
-        } else if (g_overlayMode) {
-            // Overlay mode — visible click-through window positioned over browser canvas
-            g_overlay = bridge_overlay_create(
-                app.swapchainWidth ? app.swapchainWidth : 1920,
-                app.swapchainHeight ? app.swapchainHeight : 1080,
-                &g_overlayViewHandle);
-            macosBinding.viewHandle = g_overlayViewHandle;
-            LOG_INFO("Chaining XR_EXT_macos_window_binding with overlay NSView %p",
-                     g_overlayViewHandle);
-        } else {
-            // Default: hidden Metal view for per-session rendering
-            macosBinding.viewHandle = bridge_create_hidden_metal_view(
-                app.swapchainWidth ? app.swapchainWidth : 1920,
-                app.swapchainHeight ? app.swapchainHeight : 1080);
-            LOG_INFO("Chaining XR_EXT_macos_window_binding with hidden NSView %p",
-                     macosBinding.viewHandle);
-        }
+        // Hidden Metal view for per-session rendering (Monado composites
+        // but output is not displayed — browser handles display directly)
+        macosBinding.viewHandle = bridge_create_hidden_metal_view(
+            app.swapchainWidth ? app.swapchainWidth : 1920,
+            app.swapchainHeight ? app.swapchainHeight : 1080);
+        LOG_INFO("Chaining XR_EXT_macos_window_binding with hidden NSView %p",
+                 macosBinding.viewHandle);
         vkBinding.next = &macosBinding;
     }
 #endif
@@ -772,11 +719,15 @@ static bool CreateSwapchain(AppState& app) {
     std::vector<int64_t> formats(formatCount);
     XR_CHECK(xrEnumerateSwapchainFormats(app.session, formatCount, &formatCount, formats.data()));
 
-    // Prefer UNORM — browser pixels are already sRGB-encoded, using _SRGB would
-    // double-gamma and make the image too dark
+    // Prefer SRGB — browser pixels are sRGB-encoded bytes uploaded via
+    // vkCmdCopyBufferToImage (raw copy, no conversion). Using _SRGB tells the
+    // GPU to convert sRGB→linear on sample, which is correct since the
+    // compositor writes to an SRGB framebuffer (linear→sRGB on write).
+    // Using _UNORM would treat gamma-encoded values as linear, then apply
+    // gamma encoding again on write → washed-out output.
     int64_t selectedFormat = formats[0];
     for (int64_t fmt : formats) {
-        if (fmt == VK_FORMAT_R8G8B8A8_UNORM || fmt == VK_FORMAT_B8G8R8A8_UNORM) {
+        if (fmt == VK_FORMAT_R8G8B8A8_SRGB || fmt == VK_FORMAT_B8G8R8A8_SRGB) {
             selectedFormat = fmt;
             break;
         }
@@ -1157,55 +1108,6 @@ static void handleTextMessage(const std::string& msg) {
         }
     }
 
-#ifdef __APPLE__
-    if (!g_overlayMode) return;
-
-    // canvasRect: {"canvasRect":{"x":...,"y":...,"w":...,"h":...}}
-    // Use strstr to find the key, then sscanf from the value
-    const char* crp = strstr(msg.c_str(), "\"canvasRect\"");
-    if (crp) {
-        double x = 0, y = 0, w = 0, h = 0;
-        // Scan for x/y/w/h values after the canvasRect key
-        const char* xp = strstr(crp, "\"x\":");
-        const char* yp = strstr(crp, "\"y\":");
-        const char* wp = strstr(crp, "\"w\":");
-        const char* hp = strstr(crp, "\"h\":");
-        if (xp && yp && wp && hp) {
-            sscanf(xp, "\"x\":%lf", &x);
-            sscanf(yp, "\"y\":%lf", &y);
-            sscanf(wp, "\"w\":%lf", &w);
-            sscanf(hp, "\"h\":%lf", &h);
-
-            double screenH = bridge_get_main_screen_height();
-            double macY = screenH - y - h;
-            bridge_overlay_set_frame(g_overlay, x, macY, w, h);
-            g_overlayCanvasRectKnown = true;
-            updateOverlayVisibility();
-            LOG_INFO("Overlay frame: browser(%.0f,%.0f) %.0fx%.0f -> mac(%.0f,%.0f) screenH=%.0f",
-                     x, y, w, h, x, macY, screenH);
-        }
-        return;
-    }
-
-    if (strstr(msg.c_str(), "\"tabVisible\"")) {
-        g_overlayTabVisible = strstr(msg.c_str(), "true") != nullptr;
-        LOG_INFO("Overlay tabVisible=%s", g_overlayTabVisible ? "true" : "false");
-        updateOverlayVisibility();
-        return;
-    }
-    // windowFocused messages ignored — spurious blur/focus from TAB key
-    if (strstr(msg.c_str(), "\"windowFocused\"")) {
-        return;
-    }
-    if (strstr(msg.c_str(), "\"sessionActive\"")) {
-        g_overlaySessionActive = strstr(msg.c_str(), "true") != nullptr;
-        LOG_INFO("Overlay sessionActive=%s", g_overlaySessionActive ? "true" : "false");
-        updateOverlayVisibility();
-        return;
-    }
-#else
-    (void)msg;
-#endif
 }
 
 // Protocol: 8-byte header [uint32 width][uint32 height] + RGBA pixels
@@ -1220,35 +1122,22 @@ static int ws_callback(struct lws* wsi, enum lws_callback_reasons reason,
         if (g_appState && g_appState->swapchainWidth > 0) {
             const char* simDisplayOutput = getenv("SIM_DISPLAY_OUTPUT");
             const char* dispMode = simDisplayOutput ? simDisplayOutput : "sbs";
-            bool isBrowserDisplay = getenv("BROWSER_DISPLAY") != nullptr;
-            bool isReadbackMode = getenv("READBACK_MODE") != nullptr;
-#ifdef __APPLE__
-            bool isOverlayMode = g_overlayMode;
-#else
-            bool isOverlayMode = false;
-#endif
 
             char cfg[768];
             int cfgLen = snprintf(cfg + LWS_PRE, sizeof(cfg) - LWS_PRE,
-                "{\"w\":%u,\"h\":%u,\"displayMode\":\"%s\",\"browserDisplay\":%s,"
-                "\"readbackDisplay\":%s,\"overlayDisplay\":%s,"
+                "{\"w\":%u,\"h\":%u,\"displayMode\":\"%s\",\"browserDisplay\":true,"
                 "\"displayWidthM\":%.6f,\"displayHeightM\":%.6f,"
                 "\"displayPixelW\":%u,\"displayPixelH\":%u,"
                 "\"viewScaleX\":%.6f,\"viewScaleY\":%.6f,"
                 "\"nominalViewer\":[%.5f,%.5f,%.5f]}",
-                g_appState->swapchainWidth, g_appState->swapchainHeight,
-                dispMode, isBrowserDisplay ? "true" : "false",
-                isReadbackMode ? "true" : "false",
-                isOverlayMode ? "true" : "false",
+                g_appState->swapchainWidth, g_appState->swapchainHeight, dispMode,
                 g_appState->displayWidthM, g_appState->displayHeightM,
                 g_appState->displayPixelWidth, g_appState->displayPixelHeight,
                 g_appState->recommendedViewScaleX, g_appState->recommendedViewScaleY,
                 g_appState->nominalViewerX, g_appState->nominalViewerY, g_appState->nominalViewerZ);
             lws_write(wsi, (unsigned char*)cfg + LWS_PRE, cfgLen, LWS_WRITE_TEXT);
-            LOG_INFO("Sent config: %ux%u displayMode=%s browserDisplay=%s overlayDisplay=%s",
-                     g_appState->swapchainWidth, g_appState->swapchainHeight,
-                     dispMode, isBrowserDisplay ? "true" : "false",
-                     isOverlayMode ? "true" : "false");
+            LOG_INFO("Sent config: %ux%u displayMode=%s",
+                     g_appState->swapchainWidth, g_appState->swapchainHeight, dispMode);
         }
         break;
     }
@@ -1322,33 +1211,12 @@ static int ws_callback(struct lws* wsi, enum lws_callback_reasons reason,
                 g_poseReady.store(false);
             }
         }
-        // Send readback frame if available (Option A: composited pixels from Monado)
-        if (g_readbackBuffer.ready.load()) {
-            std::lock_guard<std::mutex> lock(g_readbackBuffer.mutex);
-            size_t pixelSize = g_readbackBuffer.data.size();
-            if (pixelSize > 0) {
-                std::vector<uint8_t> packet(LWS_PRE + 8 + pixelSize);
-                uint8_t *p = packet.data() + LWS_PRE;
-                memcpy(p, &g_readbackBuffer.width, 4);
-                memcpy(p + 4, &g_readbackBuffer.height, 4);
-                memcpy(p + 8, g_readbackBuffer.data.data(), pixelSize);
-                lws_write(wsi, p, 8 + pixelSize, LWS_WRITE_BINARY);
-            }
-            g_readbackBuffer.ready.store(false);
-        }
         break;
     }
 
     case LWS_CALLBACK_CLOSED:
         LOG_INFO("WebSocket client disconnected");
         g_clientWsi = nullptr;
-#ifdef __APPLE__
-        if (g_overlayMode) {
-            g_overlaySessionActive = false;
-            g_overlayCanvasRectKnown = false;
-            updateOverlayVisibility();
-        }
-#endif
         break;
 
     default:
@@ -1372,6 +1240,7 @@ static void WebSocketThread() {
     info.gid = -1;
     info.uid = -1;
     info.options = LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
+    info.max_http_header_data = 16384; // 16KB header buffer (default ~4KB too small)
 
     struct lws_context* context = lws_create_context(&info);
     if (!context) {
@@ -1385,8 +1254,8 @@ static void WebSocketThread() {
     while (g_running.load()) {
         lws_service(context, 50); // 50ms timeout
 
-        // If pose data or readback frame is pending and client connected, request writable callback
-        if ((g_poseReady.load() || g_readbackBuffer.ready.load()) && g_clientWsi) {
+        // If pose data is pending and client connected, request writable callback
+        if (g_poseReady.load() && g_clientWsi) {
             lws_callback_on_writable(g_clientWsi);
         }
     }
@@ -1471,13 +1340,6 @@ int main() {
     signal(SIGTERM, SignalHandler);
 
     LOG_INFO("=== WebXR-to-OpenXR Bridge Host ===");
-
-#ifdef __APPLE__
-    if (getenv("OVERLAY_MODE")) {
-        g_overlayMode = true;
-        LOG_INFO("Overlay mode enabled — will create click-through window over browser");
-    }
-#endif
 
     AppState app = {};
 
@@ -2084,13 +1946,6 @@ int main() {
     if (wsThread.joinable()) {
         wsThread.join();
     }
-
-#ifdef __APPLE__
-    if (g_overlay) {
-        bridge_overlay_destroy(g_overlay);
-        g_overlay = nullptr;
-    }
-#endif
 
     Cleanup(app);
 
