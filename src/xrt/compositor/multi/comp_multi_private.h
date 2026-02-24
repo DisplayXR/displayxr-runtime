@@ -355,6 +355,9 @@ struct multi_compositor
 		float hud_smoothed_frame_time_ms;
 		//! @}
 
+		//! Saved sim_display output mode before 2D switch (-1 = none saved)
+		int saved_sim_display_mode;
+
 		//! True if per-session resources are initialized
 		bool initialized;
 	} session_render;

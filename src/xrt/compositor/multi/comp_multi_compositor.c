@@ -1921,9 +1921,20 @@ multi_compositor_request_display_mode(struct multi_compositor *mc, bool enable_3
 	}
 #endif
 
-	// sim_display fallback: 3D=SBS, 2D=BLEND
+	// sim_display fallback: save mode before 2D, restore on 3D
 	if (mc->session_render.display_processor != NULL) {
-		sim_display_set_output_mode(enable_3d ? SIM_DISPLAY_OUTPUT_SBS : SIM_DISPLAY_OUTPUT_BLEND);
+		if (!enable_3d) {
+			// Switching to 2D: save current mode, then set BLEND
+			mc->session_render.saved_sim_display_mode = (int)sim_display_get_output_mode();
+			sim_display_set_output_mode(SIM_DISPLAY_OUTPUT_BLEND);
+		} else {
+			// Switching to 3D: restore saved mode (default to anaglyph if none saved)
+			int saved = mc->session_render.saved_sim_display_mode;
+			enum sim_display_output_mode restore_mode =
+			    (saved >= 0) ? (enum sim_display_output_mode)saved : SIM_DISPLAY_OUTPUT_ANAGLYPH;
+			sim_display_set_output_mode(restore_mode);
+			mc->session_render.saved_sim_display_mode = -1;
+		}
 		return true;
 	}
 
@@ -1970,6 +1981,7 @@ multi_compositor_create(struct multi_system_compositor *msc,
 	mc->msc = msc;
 	mc->xses = xses;
 	mc->xsi = *xsi;
+	mc->session_render.saved_sim_display_mode = -1;
 
 	os_mutex_init(&mc->slot_lock);
 	os_thread_helper_init(&mc->wait_thread.oth);
