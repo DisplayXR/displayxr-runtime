@@ -156,6 +156,15 @@ oxr_system_fill_in(
 			// Display processor present: scale is relative to full display size
 			w = (uint32_t)(info->display_pixel_width * view_scale_x * scale);
 			h = (uint32_t)(info->display_pixel_height * view_scale_y * scale);
+			// The null compositor's max is based on the Qwerty HMD's tiny
+			// screen (e.g. 640x720), not the real display. Override max
+			// with actual display dimensions so recommended isn't clamped.
+			if (w_max < info->display_pixel_width) {
+				w_max = info->display_pixel_width;
+			}
+			if (h_max < info->display_pixel_height) {
+				h_max = info->display_pixel_height;
+			}
 		} else {
 			// Legacy: no display processor, use compositor recommended directly
 			w = (uint32_t)(info->views[i].recommended.width_pixels * scale);
