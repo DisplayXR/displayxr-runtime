@@ -404,8 +404,8 @@ d3d11_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 								uint32_t new_vw = (uint32_t)((float)sr_w * ratio);
 								uint32_t new_vh = (uint32_t)((float)sr_h * ratio);
 
-								// Always use window height so mono mode fills the full window
-							comp_d3d11_renderer_resize(c->renderer, new_vw, new_vh, new_height);
+								uint32_t resize_target_h = (c->display_processor != NULL) ? new_vh : new_height;
+							comp_d3d11_renderer_resize(c->renderer, new_vw, new_vh, resize_target_h);
 							}
 						} else
 #endif
@@ -413,7 +413,8 @@ d3d11_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 						if (!in_size_move) {
 							uint32_t new_vw = new_width / 2;
 							uint32_t new_vh = new_height;
-							comp_d3d11_renderer_resize(c->renderer, new_vw, new_vh, new_height);
+							uint32_t resize_target_h = (c->display_processor != NULL) ? new_vh : new_height;
+							comp_d3d11_renderer_resize(c->renderer, new_vw, new_vh, resize_target_h);
 						}
 					}
 				}
@@ -863,42 +864,44 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			fallback_warned = true;
 		}
 
-		// Get stereo texture from renderer
-		ID3D11Texture2D *stereo_texture =
-		    static_cast<ID3D11Texture2D *>(comp_d3d11_renderer_get_stereo_texture(c->renderer));
-
 		// Get target back buffer directly (not from OMGetRenderTargets, which
 		// returns the renderer's stereo RTV after comp_d3d11_renderer_draw)
 		ID3D11Texture2D *back_buffer = static_cast<ID3D11Texture2D *>(
 		    comp_d3d11_target_get_back_buffer(c->target));
 
-		if (back_buffer != nullptr && stereo_texture != nullptr) {
-			D3D11_TEXTURE2D_DESC src_desc, dst_desc;
-			stereo_texture->GetDesc(&src_desc);
-			back_buffer->GetDesc(&dst_desc);
-
+		if (back_buffer != nullptr) {
 			if (is_mono) {
-				// MONO: the renderer drew at (tgt_width x tgt_height)
-				// into the top-left of the SBS texture. Copy exactly
-				// that region to the back buffer.
-				UINT copy_width = (tgt_width < src_desc.Width) ? tgt_width : src_desc.Width;
-				UINT copy_height = (tgt_height < src_desc.Height) ? tgt_height : src_desc.Height;
-				copy_width = (copy_width < dst_desc.Width) ? copy_width : dst_desc.Width;
-				copy_height = (copy_height < dst_desc.Height) ? copy_height : dst_desc.Height;
-				D3D11_BOX src_box = {0, 0, 0, copy_width, copy_height, 1};
-				c->context->CopySubresourceRegion(back_buffer, 0, 0, 0, 0,
-				                                   stereo_texture, 0, &src_box);
-			} else if (src_desc.Width == dst_desc.Width && src_desc.Height == dst_desc.Height) {
-				// Stereo, sizes match - use fast CopyResource
-				c->context->CopyResource(back_buffer, stereo_texture);
+				// MONO: GPU stretch blit from stereo texture to back buffer.
+				// The stereo texture may be shorter than the window (when a
+				// display processor is present, texture_height = view_height).
+				// A pixel-copy would only fill the top portion; the stretch
+				// blit renders a fullscreen quad that scales to fill the window.
+				comp_d3d11_renderer_blit_stretch(c->renderer, back_buffer,
+				                                 tgt_width, tgt_height);
 			} else {
-				// Stereo, sizes don't match - copy what fits
-				UINT copy_width = (src_desc.Width < dst_desc.Width) ? src_desc.Width : dst_desc.Width;
-				UINT copy_height =
-				    (src_desc.Height < dst_desc.Height) ? src_desc.Height : dst_desc.Height;
-				D3D11_BOX src_box = {0, 0, 0, copy_width, copy_height, 1};
-				c->context->CopySubresourceRegion(back_buffer, 0, 0, 0, 0, stereo_texture, 0,
-				                                   &src_box);
+				// STEREO fallback: pixel-copy from stereo texture to back buffer
+				ID3D11Texture2D *stereo_texture = static_cast<ID3D11Texture2D *>(
+				    comp_d3d11_renderer_get_stereo_texture(c->renderer));
+				if (stereo_texture != nullptr) {
+					D3D11_TEXTURE2D_DESC src_desc, dst_desc;
+					stereo_texture->GetDesc(&src_desc);
+					back_buffer->GetDesc(&dst_desc);
+
+					if (src_desc.Width == dst_desc.Width &&
+					    src_desc.Height == dst_desc.Height) {
+						c->context->CopyResource(back_buffer, stereo_texture);
+					} else {
+						UINT copy_width = (src_desc.Width < dst_desc.Width)
+						                      ? src_desc.Width
+						                      : dst_desc.Width;
+						UINT copy_height = (src_desc.Height < dst_desc.Height)
+						                       ? src_desc.Height
+						                       : dst_desc.Height;
+						D3D11_BOX src_box = {0, 0, 0, copy_width, copy_height, 1};
+						c->context->CopySubresourceRegion(
+						    back_buffer, 0, 0, 0, 0, stereo_texture, 0, &src_box);
+					}
+				}
 			}
 			// No Release needed: back_buffer is a borrowed pointer from the target
 		}
@@ -1257,11 +1260,12 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	}
 
 	// Create renderer with the correct view dimensions.
-	// target_height = window height so the stereo texture is at least as tall as the window.
-	// This ensures mono/2D mode (fallback blit) fills the full window, not just the top portion.
-	// The display processor receives explicit view_width×view_height, so it correctly
-	// samples only the rendered region even when the texture is taller than the view.
-	uint32_t target_height = c->settings.preferred.height;
+	// When a display processor (weaver) is present, the stereo texture height must match
+	// view_height so the display processor's UV 0..1 maps exactly to the rendered content.
+	// Without a display processor, use the window height so the stereo texture is tall enough
+	// for mono fallback blitting.  Mono/2D mode uses a GPU stretch blit to fill the full
+	// window regardless of stereo texture height.
+	uint32_t target_height = (c->display_processor != NULL) ? view_height : c->settings.preferred.height;
 	xret = comp_d3d11_renderer_create(c, view_width, view_height, target_height, &c->renderer);
 	if (xret != XRT_SUCCESS) {
 		U_LOG_E("Failed to create D3D11 renderer");
