@@ -1593,6 +1593,12 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
         g_metalView = [[AppMetalView alloc] initWithFrame:frame];
         [g_metalView setWantsLayer:YES];
 
+        // Set Retina scale so CAMetalLayer produces pixel-resolution drawables
+        CAMetalLayer *metalLayer = (CAMetalLayer *)[g_metalView layer];
+        if (metalLayer) {
+            metalLayer.contentsScale = [g_window backingScaleFactor];
+        }
+
         [g_window setContentView:g_metalView];
 
         // HUD overlay (semi-transparent text overlay, positioned bottom-left)

@@ -379,10 +379,18 @@ comp_window_macos_create_from_external(struct comp_compositor *c,
 		w->window = [view window]; // May be nil if not yet attached
 		w->metal_layer = (CAMetalLayer *)[view layer];
 
-		// Get dimensions from view
+		// Enable Retina rendering: set contentsScale so the CAMetalLayer
+		// produces drawables at physical pixel resolution, not point resolution.
+		CGFloat scale = 1.0;
+		if (w->window != nil) {
+			scale = [w->window backingScaleFactor];
+			w->metal_layer.contentsScale = scale;
+		}
+
+		// Get dimensions in pixels (points × backingScaleFactor)
 		NSRect bounds = [view bounds];
-		w->base.base.width = (uint32_t)bounds.size.width;
-		w->base.base.height = (uint32_t)bounds.size.height;
+		w->base.base.width = (uint32_t)(bounds.size.width * scale);
+		w->base.base.height = (uint32_t)(bounds.size.height * scale);
 	}
 
 	if (w->metal_layer == nil) {
@@ -398,7 +406,7 @@ comp_window_macos_create_from_external(struct comp_compositor *c,
 	w->base.base.init_post_vulkan = comp_window_macos_init_swapchain;
 	w->base.base.set_title = comp_window_macos_update_window_title_noop;
 
-	COMP_INFO(c, "Created macOS target from external NSView %p (%ux%u)",
+	COMP_INFO(c, "Created macOS target from external NSView %p (%ux%u px)",
 	          external_view, w->base.base.width, w->base.base.height);
 
 	*out_ct = &w->base.base;
