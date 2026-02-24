@@ -233,7 +233,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                         xrLocateViews(xr.session, &locateInfo, &viewState, 2, &viewCount, rawViews);
 
                         // Single swapchain: acquire once, render both eyes with SBS viewports, release once
-                        uint32_t eyeRenderW = xr.swapchain.width / 2;
+                        uint32_t eyeRenderW = (xr.recommendedViewScaleX > 0.0f && xr.recommendedViewScaleX < 1.0f)
+                            ? (uint32_t)(xr.swapchain.width * xr.recommendedViewScaleX)
+                            : xr.swapchain.width / 2;
                         uint32_t eyeRenderH = xr.swapchain.height;
 
                         uint32_t imageIndex;
