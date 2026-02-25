@@ -249,11 +249,10 @@ leiasr_d3d11_destroy(struct leiasr_d3d11 **leiasr_ptr)
 
 	leiasr_d3d11 *sr = *leiasr_ptr;
 
-	// Destroy SwitchableLensHint before weaver/context
-	if (sr->lens_hint != nullptr) {
-		delete sr->lens_hint;
-		sr->lens_hint = nullptr;
-	}
+	// SwitchableLensHint is managed by SRContext — do NOT delete it manually.
+	// SRContext::~SRContext() calls deleteAllSenses() which cleans it up.
+	// Manually deleting it causes a crash (double-free).
+	sr->lens_hint = nullptr;
 
 	// Destroy weaver (SR SDK restores the app's original WndProc)
 	if (sr->weaver != nullptr) {

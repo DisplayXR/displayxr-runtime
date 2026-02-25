@@ -333,11 +333,10 @@ leiasr_destroy(struct leiasr *leiasr)
 		}
 	}
 
-	// Clean up SwitchableLensHint before context
-	if (leiasr->lens_hint != nullptr) {
-		delete leiasr->lens_hint;
-		leiasr->lens_hint = nullptr;
-	}
+	// SwitchableLensHint is managed by SRContext — do NOT delete it manually.
+	// SRContext::~SRContext() calls deleteAllSenses() which cleans it up.
+	// Manually deleting it causes a crash (double-free).
+	leiasr->lens_hint = nullptr;
 
 	// Clean up context (this triggers weaver destruction in SR SDK)
 	if (leiasr->context != nullptr) {
