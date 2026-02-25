@@ -560,11 +560,12 @@ if(XRT_HAVE_LEIA_SR)
 	# Start with empty source list - weavers are added conditionally based on available SR libraries
 	set(LEIA_SOURCES)
 
-	# Common sources (device, interface, types) — always present
+	# Common sources (device, interface, types, probe) — always present
 	list(APPEND LEIA_SOURCES
 		leia/leia_device.c
 		leia/leia_interface.h
-		leia/leia_types.h)
+		leia/leia_types.h
+		leia/leia_sr_probe.cpp)
 
 	# Check for Vulkan weaver support (SimulatedRealityVulkanBeta.lib)
 	set(LEIA_SR_VULKAN_AVAILABLE FALSE)
@@ -649,6 +650,7 @@ if(XRT_HAVE_CNSDK AND NOT TARGET drv_leia)
 		leia/leia_device.c
 		leia/leia_interface.h
 		leia/leia_types.h
+		leia/leia_sr_probe.cpp
 		leia/leia_cnsdk.cpp
 		leia/leia_cnsdk.h)
 	target_link_libraries(drv_leia PRIVATE

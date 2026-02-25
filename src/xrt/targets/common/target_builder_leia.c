@@ -8,11 +8,11 @@
  */
 
 #include "xrt/xrt_config_drivers.h"
-#include "xrt/xrt_instance.h"
 
 #include "util/u_misc.h"
 #include "util/u_debug.h"
 #include "util/u_builders.h"
+#include "util/u_logging.h"
 #include "util/u_system_helpers.h"
 
 #include "target_builder_interface.h"
@@ -47,21 +47,15 @@ leia_estimate_system(struct xrt_builder *xb,
                      struct xrt_prober *xp,
                      struct xrt_builder_estimate *estimate)
 {
-	// Check if the app uses XR_EXT_win32_window_binding (extension app).
-	bool is_ext_app = false;
-	if (xp->instance_info != NULL) {
-		is_ext_app = xp->instance_info->app_info.ext_win32_window_binding_enabled;
-	}
-
-	estimate->certain.head = true;
-
-	if (is_ext_app) {
-		// Extension apps: Leia is preferred head device.
-		estimate->priority = 0;
+	bool hw_found = leiasr_probe_display(3.0);
+	if (hw_found) {
+		estimate->certain.head = true;
+		U_LOG_I("SR hardware detected — Leia builder claims head device");
 	} else {
-		// Non-extension apps: lower priority than qwerty (keyboard/mouse).
-		estimate->priority = -15;
+		U_LOG_I("No SR hardware detected — Leia builder will not claim head device");
 	}
+
+	estimate->priority = -15;
 
 	return XRT_SUCCESS;
 }

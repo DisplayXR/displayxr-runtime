@@ -128,15 +128,10 @@ typedef void (*xrt_prober_list_video_func_t)(struct xrt_prober *xp,
  *
  * @ingroup xrt_iface
  */
-struct xrt_instance_info;
-
 struct xrt_prober
 {
 	//! Factory for producing tracked objects.
 	struct xrt_tracking_factory *tracking;
-
-	//! Instance info, set before create_system is called. May be NULL.
-	const struct xrt_instance_info *instance_info;
 
 	/*!
 	 * Enumerate all connected devices, whether or not we have an associated

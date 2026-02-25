@@ -629,7 +629,7 @@ renderer_init(struct comp_renderer *r, struct comp_compositor *c, VkExtent2D scr
 	// Get external window handle from compositor (if provided via XR_EXT_win32_window_binding)
 	// NULL = fullscreen mode, valid HWND = windowed mode
 	void *window_handle = r->c->external_window_handle;
-	xrt_result_t sr_ret = leiasr_create(1000.0, vk->device, vk->physical_device, vk->main_queue->queue, r->target_render_pass.r->cmd_pool, window_handle, &r->leiasr);
+	xrt_result_t sr_ret = leiasr_create(5.0, vk->device, vk->physical_device, vk->main_queue->queue, r->target_render_pass.r->cmd_pool, window_handle, &r->leiasr);
 	if (sr_ret != XRT_SUCCESS) {
 		COMP_WARN(c, "Failed to create SR Vulkan weaver, continuing without interlacing");
 		r->leiasr = NULL;

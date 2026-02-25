@@ -301,9 +301,6 @@ u_system_devices_create_from_prober(struct xrt_instance *xinst,
 		return xret;
 	}
 
-	// Make instance info available to builders during system creation.
-	xp->instance_info = &xinst->instance_info;
-
 	xret = xrt_prober_probe(xp);
 	if (xret < 0) {
 		return xret;

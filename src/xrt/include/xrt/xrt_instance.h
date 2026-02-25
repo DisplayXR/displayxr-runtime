@@ -81,7 +81,6 @@ struct xrt_application_info
 	bool meta_body_tracking_full_body_enabled;
 	bool meta_body_tracking_calibration_enabled;
 	bool ext_win32_appcontainer_compatible_enabled;  //!< Chrome WebXR uses this
-	bool ext_win32_window_binding_enabled;           //!< App provides its own window (extension app)
 };
 
 /*!

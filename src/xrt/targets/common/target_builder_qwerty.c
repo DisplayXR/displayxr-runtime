@@ -8,7 +8,6 @@
  */
 
 #include "xrt/xrt_config_drivers.h"
-#include "xrt/xrt_instance.h"
 
 #include "util/u_misc.h"
 #include "util/u_debug.h"
@@ -53,23 +52,10 @@ qwerty_estimate_system(struct xrt_builder *xb,
                        struct xrt_prober *xp,
                        struct xrt_builder_estimate *estimate)
 {
-	// Check if the app uses XR_EXT_win32_window_binding (extension app).
-	bool is_ext_app = false;
-	if (xp->instance_info != NULL) {
-		is_ext_app = xp->instance_info->app_info.ext_win32_window_binding_enabled;
-	}
-
 	estimate->certain.head = true;
 	estimate->certain.left = true;
 	estimate->certain.right = true;
-
-	if (is_ext_app) {
-		// Extension apps prefer Leia; qwerty is low-priority fallback.
-		estimate->priority = -25;
-	} else {
-		// Non-extension apps always use qwerty for keyboard/mouse camera.
-		estimate->priority = 0;
-	}
+	estimate->priority = -25;
 
 	return XRT_SUCCESS;
 }

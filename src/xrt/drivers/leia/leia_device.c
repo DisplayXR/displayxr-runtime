@@ -29,10 +29,6 @@
 #include "util/u_misc.h"
 #include "util/u_var.h"
 
-#ifdef XRT_HAVE_LEIA_SR_D3D11
-#include "leia_sr_d3d11.h"
-#endif
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -130,32 +126,22 @@ leia_hmd_create(void)
 	float display_h_m = 0.194f;
 	float nominal_z = 0.65f;
 
-#ifdef XRT_HAVE_LEIA_SR_D3D11
+	// Use cached probe results from leiasr_probe_display() if available.
 	{
-		uint32_t view_w = 0, view_h = 0;
-		float hz = 0.0f;
-		uint32_t native_w = 0, native_h = 0;
-		if (leiasr_query_recommended_view_dimensions(5.0, &view_w, &view_h, &hz, &native_w, &native_h)) {
-			// SR gives per-view width; full display is native res.
-			if (native_w > 0 && native_h > 0) {
-				pixel_w = (int)native_w;
-				pixel_h = (int)native_h;
+		struct leiasr_probe_result probe;
+		if (leiasr_get_probe_results(&probe) && probe.hw_found) {
+			pixel_w = (int)probe.pixel_w;
+			pixel_h = (int)probe.pixel_h;
+			if (probe.refresh_hz > 0.0f) {
+				refresh_hz = probe.refresh_hz;
 			}
-			if (hz > 0.0f) {
-				refresh_hz = hz;
-			}
-		}
-
-		struct leiasr_display_dimensions dims;
-		if (leiasr_static_get_display_dimensions(&dims) && dims.valid) {
-			display_w_m = dims.width_m;
-			display_h_m = dims.height_m;
-			if (dims.nominal_z_m > 0.0f) {
-				nominal_z = dims.nominal_z_m;
+			display_w_m = probe.display_w_m;
+			display_h_m = probe.display_h_m;
+			if (probe.nominal_z_m > 0.0f) {
+				nominal_z = probe.nominal_z_m;
 			}
 		}
 	}
-#endif
 
 	enum u_device_alloc_flags flags =
 	    (enum u_device_alloc_flags)(U_DEVICE_ALLOC_HMD | U_DEVICE_ALLOC_TRACKING_NONE);

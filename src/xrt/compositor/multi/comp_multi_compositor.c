@@ -1627,7 +1627,7 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 #ifdef XRT_HAVE_LEIA_SR_VULKAN
 	{
 		U_LOG_W("Creating per-session SR weaver (leiasr_create)...");
-		xrt_result_t sr_ret = leiasr_create(1000.0,                                     // maxTime
+		xrt_result_t sr_ret = leiasr_create(5.0,                                        // maxTime
 		                                    vk->device,                                 // Vulkan device
 		                                    vk->physical_device,                        // Physical device
 		                                    vk->main_queue->queue,                      // Graphics queue
