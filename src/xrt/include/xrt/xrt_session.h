@@ -67,6 +67,11 @@ enum xrt_session_event_type
 
 	//! User presence has changed (hmd may have been put on or removed)
 	XRT_SESSION_EVENT_USER_PRESENCE_CHANGE = 10,
+
+	//! Runtime requests session exit (e.g. own window was closed).
+	//! Triggers FOCUSED→VISIBLE→SYNCHRONIZED→STOPPING transition so
+	//! the app can call xrEndSession and continue running.
+	XRT_SESSION_EVENT_EXIT_REQUEST = 11,
 };
 
 /*!

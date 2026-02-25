@@ -192,11 +192,11 @@ struct d3d11_service_compositor
 	//! Current focus state
 	bool state_focused;
 
-	//! Whether the window has been closed (triggers session loss)
+	//! Whether the window has been closed (triggers session exit)
 	bool window_closed;
 
-	//! Whether the LOST event has already been sent (prevent duplicates)
-	bool loss_sent;
+	//! Whether the EXIT_REQUEST event has already been sent (prevent duplicates)
+	bool exit_request_sent;
 
 	//! Number of frames since window close was detected
 	uint32_t window_closed_frame_count;
@@ -1957,11 +1957,16 @@ compositor_predict_frame(struct xrt_compositor *xc,
 	std::lock_guard<std::mutex> lock(c->mutex);
 
 	// Failsafe: if window closed and client keeps calling predict_frame
-	// without layer_commit, force session end after a few frames
+	// without layer_commit, push exit request after a few frames
 	if (c->window_closed && c->window_closed_frame_count >= 3) {
-		U_LOG_W("Window closed failsafe: %u frames since close, forcing session end",
-		        c->window_closed_frame_count);
-		return XRT_ERROR_IPC_FAILURE;
+		if (!c->exit_request_sent && c->xses != nullptr) {
+			U_LOG_W("Window closed failsafe: %u frames since close, requesting session exit",
+			        c->window_closed_frame_count);
+			union xrt_session_event xse = XRT_STRUCT_INIT;
+			xse.type = XRT_SESSION_EVENT_EXIT_REQUEST;
+			xrt_session_event_sink_push(c->xses, &xse);
+			c->exit_request_sent = true;
+		}
 	}
 
 	c->frame_id++;
@@ -1988,9 +1993,21 @@ compositor_wait_frame(struct xrt_compositor *xc,
 
 	std::lock_guard<std::mutex> lock(c->mutex);
 
-	// If window was closed, fail immediately to break the frame loop
+	// If window was closed, push exit request and return dummy frame data
 	if (c->window_closed) {
-		return XRT_ERROR_IPC_FAILURE;
+		if (!c->exit_request_sent && c->xses != nullptr) {
+			union xrt_session_event xse = XRT_STRUCT_INIT;
+			xse.type = XRT_SESSION_EVENT_EXIT_REQUEST;
+			xrt_session_event_sink_push(c->xses, &xse);
+			c->exit_request_sent = true;
+		}
+		c->frame_id++;
+		*out_frame_id = c->frame_id;
+		int64_t now_ns = static_cast<int64_t>(os_monotonic_get_ns());
+		int64_t period_ns = static_cast<int64_t>(U_TIME_1S_IN_NS / c->sys->refresh_rate);
+		*out_predicted_display_time_ns = now_ns + period_ns * 2;
+		*out_predicted_display_period_ns = period_ns;
+		return XRT_SUCCESS;
 	}
 
 	c->frame_id++;
@@ -2171,33 +2188,25 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			window_valid = IsWindow(c->render.hwnd) != FALSE;
 		}
 		if (!window_valid) {
-			U_LOG_W("Window closed - signaling session loss");
+			U_LOG_W("Window closed - requesting session exit");
 			c->window_closed = true;
-			c->loss_sent = false;
+			c->exit_request_sent = false;
 			c->window_closed_frame_count = 0;
-			// Push LOSS_PENDING event to start orderly shutdown
-			if (c->xses != nullptr) {
-				union xrt_session_event xse = XRT_STRUCT_INIT;
-				xse.type = XRT_SESSION_EVENT_LOSS_PENDING;
-				xse.loss_pending.loss_time_ns = (int64_t)os_monotonic_get_ns();
-				xrt_session_event_sink_push(c->xses, &xse);
-			}
-			return XRT_SUCCESS; // Give app one frame to notice LOSS_PENDING
 		}
 	}
 
 	if (c->window_closed) {
 		c->window_closed_frame_count++;
-		// Push LOST event only once to avoid duplicate events
-		if (!c->loss_sent && c->xses != nullptr) {
+		// Push EXIT_REQUEST once to trigger graceful session shutdown
+		if (!c->exit_request_sent && c->xses != nullptr) {
 			union xrt_session_event xse = XRT_STRUCT_INIT;
-			xse.type = XRT_SESSION_EVENT_LOST;
+			xse.type = XRT_SESSION_EVENT_EXIT_REQUEST;
 			xrt_session_event_sink_push(c->xses, &xse);
-			c->loss_sent = true;
+			c->exit_request_sent = true;
 		}
 		// Return success so the error doesn't propagate as XR_ERROR_INSTANCE_LOST.
-		// The LOSS_PENDING/LOST events will drive the session state machine to
-		// shut down the session gracefully without terminating the app.
+		// The EXIT_REQUEST event drives the session to STOPPING so the app
+		// calls xrEndSession and continues running.
 		return XRT_SUCCESS;
 	}
 
@@ -3004,7 +3013,7 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 	c->state_visible = false;
 	c->state_focused = false;
 	c->window_closed = false;
-	c->loss_sent = false;
+	c->exit_request_sent = false;
 	c->window_closed_frame_count = 0;
 
 	// Initialize layer accumulator

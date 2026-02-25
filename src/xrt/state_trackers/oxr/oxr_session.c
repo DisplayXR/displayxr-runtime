@@ -824,6 +824,22 @@ oxr_session_poll(struct oxr_logger *log, struct oxr_session *sess)
 			                                                 xse.presence_change.is_user_present);
 #endif // OXR_HAVE_EXT_user_presence
 			break;
+		case XRT_SESSION_EVENT_EXIT_REQUEST:
+			// Runtime-initiated session exit (e.g. own window was closed).
+			// Drive the state machine to STOPPING so the app calls xrEndSession.
+			if (sess->state == XR_SESSION_STATE_FOCUSED) {
+				oxr_session_change_state(log, sess, XR_SESSION_STATE_VISIBLE, 0);
+			}
+			if (sess->state == XR_SESSION_STATE_VISIBLE) {
+				oxr_session_change_state(log, sess, XR_SESSION_STATE_SYNCHRONIZED, 0);
+			}
+			if (!sess->has_ended_once && sess->state != XR_SESSION_STATE_SYNCHRONIZED) {
+				oxr_session_change_state(log, sess, XR_SESSION_STATE_SYNCHRONIZED, 0);
+				sess->has_ended_once = true;
+			}
+			oxr_session_change_state(log, sess, XR_SESSION_STATE_STOPPING, 0);
+			sess->exiting = true;
+			break;
 		default: U_LOG_W("unhandled event type! %d", xse.type); break;
 		}
 	}

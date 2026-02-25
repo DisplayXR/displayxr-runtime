@@ -690,7 +690,7 @@ multi_compositor_end_session(struct xrt_compositor *xc)
 		}
 		mc->session_render.owns_window = false;
 #endif
-		mc->session_render.window_close_loss_sent = false;
+		mc->session_render.window_close_exit_sent = false;
 		mc->session_render.external_window_handle = NULL;
 
 		multi_system_compositor_update_session_status(mc->msc, false);
@@ -767,13 +767,12 @@ multi_compositor_wait_frame(struct xrt_compositor *xc,
 	// Check if self-owned window was closed (ESC, close button, ALT+F4)
 	if (mc->session_render.owns_window && mc->session_render.own_window != NULL &&
 	    !comp_d3d11_window_is_valid(mc->session_render.own_window)) {
-		if (!mc->session_render.window_close_loss_sent) {
-			U_LOG_W("Self-owned window closed - signaling session loss");
+		if (!mc->session_render.window_close_exit_sent) {
+			U_LOG_W("Self-owned window closed - requesting session exit");
 			union xrt_session_event xse = XRT_STRUCT_INIT;
-			xse.type = XRT_SESSION_EVENT_LOSS_PENDING;
-			xse.loss_pending.loss_time_ns = (int64_t)os_monotonic_get_ns();
+			xse.type = XRT_SESSION_EVENT_EXIT_REQUEST;
 			(void)multi_compositor_push_event(mc, &xse);
-			mc->session_render.window_close_loss_sent = true;
+			mc->session_render.window_close_exit_sent = true;
 		}
 		*out_frame_id = 0;
 		*out_predicted_display_time_ns = (int64_t)os_monotonic_get_ns();
@@ -787,13 +786,12 @@ multi_compositor_wait_frame(struct xrt_compositor *xc,
 	{
 		extern bool oxr_macos_window_closed(void);
 		if (oxr_macos_window_closed()) {
-			if (!mc->session_render.window_close_loss_sent) {
-				U_LOG_W("macOS window closed - signaling session loss");
+			if (!mc->session_render.window_close_exit_sent) {
+				U_LOG_W("macOS window closed - requesting session exit");
 				union xrt_session_event xse = XRT_STRUCT_INIT;
-				xse.type = XRT_SESSION_EVENT_LOSS_PENDING;
-				xse.loss_pending.loss_time_ns = (int64_t)os_monotonic_get_ns();
+				xse.type = XRT_SESSION_EVENT_EXIT_REQUEST;
 				(void)multi_compositor_push_event(mc, &xse);
-				mc->session_render.window_close_loss_sent = true;
+				mc->session_render.window_close_exit_sent = true;
 			}
 			*out_frame_id = 0;
 			*out_predicted_display_time_ns = (int64_t)os_monotonic_get_ns();
@@ -1405,7 +1403,7 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 	}
 
 	// Don't try to (re-)init if window close is in progress — the HWND is destroyed
-	if (mc->session_render.window_close_loss_sent) {
+	if (mc->session_render.window_close_exit_sent) {
 		return false;
 	}
 
