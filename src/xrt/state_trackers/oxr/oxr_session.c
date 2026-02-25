@@ -827,9 +827,12 @@ oxr_session_poll(struct oxr_logger *log, struct oxr_session *sess)
 		case XRT_SESSION_EVENT_EXIT_REQUEST:
 			// Runtime-initiated session exit (e.g. own window was closed).
 			// Drive the state machine to STOPPING so the app calls xrEndSession.
-			// Do NOT set sess->exiting — this lets xrEndSession transition to
-			// IDLE → READY (not IDLE → EXITING), so the app stays alive and
-			// can start a new VR session.
+			// Set sess->exiting so xrEndSession transitions IDLE → EXITING
+			// (not IDLE → READY). Without this, apps like Blender see READY
+			// and immediately restart VR, creating a new window in a loop.
+			// With EXITING, apps destroy the session and stay alive — the user
+			// can start a new VR session manually.
+			sess->exiting = true;
 			if (sess->state == XR_SESSION_STATE_FOCUSED) {
 				oxr_session_change_state(log, sess, XR_SESSION_STATE_VISIBLE, 0);
 			}
