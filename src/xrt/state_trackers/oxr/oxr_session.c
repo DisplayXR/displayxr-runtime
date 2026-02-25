@@ -827,6 +827,9 @@ oxr_session_poll(struct oxr_logger *log, struct oxr_session *sess)
 		case XRT_SESSION_EVENT_EXIT_REQUEST:
 			// Runtime-initiated session exit (e.g. own window was closed).
 			// Drive the state machine to STOPPING so the app calls xrEndSession.
+			// Do NOT set sess->exiting — this lets xrEndSession transition to
+			// IDLE → READY (not IDLE → EXITING), so the app stays alive and
+			// can start a new VR session.
 			if (sess->state == XR_SESSION_STATE_FOCUSED) {
 				oxr_session_change_state(log, sess, XR_SESSION_STATE_VISIBLE, 0);
 			}
@@ -838,7 +841,6 @@ oxr_session_poll(struct oxr_logger *log, struct oxr_session *sess)
 				sess->has_ended_once = true;
 			}
 			oxr_session_change_state(log, sess, XR_SESSION_STATE_STOPPING, 0);
-			sess->exiting = true;
 			break;
 		default: U_LOG_W("unhandled event type! %d", xse.type); break;
 		}
