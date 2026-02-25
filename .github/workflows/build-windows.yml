@@ -292,6 +292,7 @@ jobs:
           path: |
             test_apps/sr_cube_openxr_ext/build/sr_cube_openxr_ext.exe
             test_apps/sr_cube_openxr_ext/build/*.dll
+            test_apps/sr_cube_openxr_ext/build/textures/
 
   # Standalone Vulkan cube test (no OpenXR) - DISABLED: removed in test_apps refactor
   # VulkanCubeStandalone:
@@ -373,6 +374,7 @@ jobs:
           path: |
             test_apps/sr_cube_native/build/sr_cube_native.exe
             test_apps/sr_cube_native/build/*.dll
+            test_apps/sr_cube_native/build/textures/
 
   # Native SR SDK Vulkan app (no OpenXR) - Direct LeiaSR SDK + Vulkan weaver
   TestAppNativeVulkan:
@@ -498,6 +500,7 @@ jobs:
           path: |
             test_apps/sr_cube_openxr/build/sr_cube_openxr.exe
             test_apps/sr_cube_openxr/build/*.dll
+            test_apps/sr_cube_openxr/build/textures/
 
   # D3D12 test app with XR_EXT_session_target
   TestAppD3D12:
@@ -558,6 +561,7 @@ jobs:
           path: |
             test_apps/sr_cube_openxr_ext_d3d12/build/sr_cube_openxr_ext_d3d12.exe
             test_apps/sr_cube_openxr_ext_d3d12/build/*.dll
+            test_apps/sr_cube_openxr_ext_d3d12/build/textures/
 
   # OpenGL test app with XR_EXT_session_target
   TestAppOpenGL:
@@ -618,6 +622,7 @@ jobs:
           path: |
             test_apps/sr_cube_openxr_ext_gl/build/sr_cube_openxr_ext_gl.exe
             test_apps/sr_cube_openxr_ext_gl/build/*.dll
+            test_apps/sr_cube_openxr_ext_gl/build/textures/
 
   # Vulkan test app with XR_EXT_session_target (requires Vulkan SDK)
   TestAppVulkan:
@@ -684,6 +689,7 @@ jobs:
           path: |
             test_apps/sr_cube_openxr_ext_vk/build/sr_cube_openxr_ext_vk.exe
             test_apps/sr_cube_openxr_ext_vk/build/*.dll
+            test_apps/sr_cube_openxr_ext_vk/build/textures/
 
   # Bundle all test apps into a single artifact with per-app subfolders
   BundleTestApps:

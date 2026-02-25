@@ -71,3 +71,13 @@ if(HAVE_LEIA_SR)
         COMMAND_EXPAND_LISTS
     )
 endif()
+
+# Copy texture files to build output directory
+file(GLOB TEXTURE_FILES "${CMAKE_CURRENT_SOURCE_DIR}/../common/textures/*.jpg")
+if(TEXTURE_FILES)
+    add_custom_command(TARGET sr_cube_native POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:sr_cube_native>/textures"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${TEXTURE_FILES} "$<TARGET_FILE_DIR:sr_cube_native>/textures/"
+        COMMENT "Copying texture files to build output"
+    )
+endif()
