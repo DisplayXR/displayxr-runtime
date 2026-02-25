@@ -405,16 +405,21 @@ vk_hud_blend_draw(struct vk_hud_blend *blend,
 	}
 
 	// Transition swapchain: PRESENT_SRC -> COLOR_ATTACHMENT_OPTIMAL
+	// srcAccessMask must include all write types that may have touched the
+	// target before this barrier: TRANSFER_WRITE (mono blit path) and
+	// COLOR_ATTACHMENT_WRITE (stereo weaver/render pass path).  Without
+	// TRANSFER_WRITE, the mono blit data is not made available for the
+	// layout transition, causing LOAD_OP_LOAD to read stale content.
 	VkImageMemoryBarrier to_color = {
 	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-	    .srcAccessMask = 0,
+	    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
 	    .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
 	    .oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
 	    .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
 	    .image = target_image,
 	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
 	};
-	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 	                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0, NULL, 1, &to_color);
 
 	// Begin render pass (LOAD_OP_LOAD preserves 3D content)

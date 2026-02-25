@@ -2140,6 +2140,13 @@ session_render_hud_overlay(struct multi_compositor *mc,
 	                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &hud_to_src);
 
 	// Alpha-blend HUD onto swapchain (PRESENT_SRC -> COLOR_ATTACHMENT -> PRESENT_SRC)
+	static bool mono_hud_blend_logged = false;
+	if (is_mono && !mono_hud_blend_logged) {
+		U_LOG_W("[HUD] Mono (2D) mode: blend draw fb=%ux%u hud=%ux%u init=%d",
+		        fb_width, fb_height, hud_w, hud_h,
+		        mc->session_render.hud_blend.initialized);
+		mono_hud_blend_logged = true;
+	}
 	vk_hud_blend_draw(&mc->session_render.hud_blend, vk, cmd, swapchain_view, swapchain_image, fb_width,
 	                   fb_height, hud_w, hud_h);
 }
@@ -2402,7 +2409,7 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 				    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
 				};
 				vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-				                         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL,
+				                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL,
 				                         0, NULL, 1, &hud_mono_post);
 
 				static bool mono_hud_logged = false;
@@ -2477,7 +2484,7 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 		    },
 		};
 		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-		                         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL, 0, NULL, 2,
+		                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0, NULL, 2,
 		                         mono_post);
 
 		static bool mono_logged = false;
@@ -2822,7 +2829,7 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 			};
 			vk->vkCmdPipelineBarrier(cmd,
 			                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-			                         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+			                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 			                         0, 0, NULL, 0, NULL, 1, &post_weave_barrier);
 		}
 	}
