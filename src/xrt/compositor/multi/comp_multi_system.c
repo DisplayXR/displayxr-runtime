@@ -2342,6 +2342,80 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 	// directly to the presentation target without side-by-side packing or
 	// light-field interlacing (weaving).
 	if (is_mono) {
+		// Mono + window-space overlays: when the V-key forces 2D mode but the
+		// app submitted 2 views, we can use composite_layers_to_intermediate()
+		// to composite projection + HUD overlays into an intermediate image,
+		// then blit that to the target. This ensures the HUD is visible in 2D mode.
+		if (has_window_space_layers(mc) && layer->data.view_count >= 2) {
+			VkImageView comp_left = VK_NULL_HANDLE, comp_right = VK_NULL_HANDLE;
+			if (composite_layers_to_intermediate(mc, vk, cmd, &comp_left, &comp_right)) {
+				// composite_images[0] is in SHADER_READ_ONLY_OPTIMAL.
+				// Transition it to TRANSFER_SRC, target to TRANSFER_DST.
+				VkImageMemoryBarrier hud_mono_pre[2] = {
+				    {
+				        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+				        .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
+				        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+				        .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+				        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+				        .image = mc->session_render.composite_images[0],
+				        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+				    },
+				    {
+				        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+				        .srcAccessMask = 0,
+				        .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+				        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+				        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+				        .image = ct->images[buffer_index].handle,
+				        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+				    },
+				};
+				vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+				                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL,
+				                         2, hud_mono_pre);
+
+				uint32_t cw = mc->session_render.composite_width;
+				uint32_t ch = mc->session_render.composite_height;
+
+				VkImageBlit hud_mono_blit = {
+				    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+				    .srcOffsets = {{0, 0, 0}, {(int32_t)cw, (int32_t)ch, 1}},
+				    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+				    .dstOffsets = {{0, 0, 0},
+				                  {(int32_t)framebufferWidth, (int32_t)framebufferHeight, 1}},
+				};
+				vk->vkCmdBlitImage(cmd, mc->session_render.composite_images[0],
+				                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+				                   ct->images[buffer_index].handle,
+				                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &hud_mono_blit,
+				                   VK_FILTER_LINEAR);
+
+				// Post: target TRANSFER_DST → PRESENT_SRC
+				VkImageMemoryBarrier hud_mono_post = {
+				    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+				    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+				    .dstAccessMask = 0,
+				    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+				    .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+				    .image = ct->images[buffer_index].handle,
+				    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+				};
+				vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+				                         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL,
+				                         0, NULL, 1, &hud_mono_post);
+
+				static bool mono_hud_logged = false;
+				if (!mono_hud_logged) {
+					U_LOG_W("[per-session] Mono (2D) + HUD: composited %ux%u -> %ux%u",
+					        cw, ch, framebufferWidth, framebufferHeight);
+					mono_hud_logged = true;
+				}
+				goto submit_and_present;
+			}
+			// Fallthrough to direct blit if compositing fails
+		}
+
 		bool flip_y = layer->data.flip_y;
 		int src_top = leftOffsetY + (flip_y ? imageHeight : 0);
 		int src_bot = leftOffsetY + (flip_y ? 0 : imageHeight);
