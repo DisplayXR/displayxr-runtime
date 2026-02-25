@@ -2829,12 +2829,12 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 #endif // XRT_HAVE_LEIA_SR_VULKAN
 
 submit_and_present:
-	// HUD overlay (post-weave, always readable)
-	if (mc->session_render.owns_window) {
-		session_render_hud_overlay(mc, vk, cmd, ct->images[buffer_index].handle,
-		                           ct->images[buffer_index].view,
-		                           framebufferWidth, framebufferHeight, is_mono);
-	}
+	// HUD overlay (post-weave, always readable).
+	// Render for all per-session windows (self-owned and app-provided),
+	// matching the D3D11 compositor which renders HUD for all sessions.
+	session_render_hud_overlay(mc, vk, cmd, ct->images[buffer_index].handle,
+	                           ct->images[buffer_index].view,
+	                           framebufferWidth, framebufferHeight, is_mono);
 
 	// End command buffer
 	ret = vk->vkEndCommandBuffer(cmd);

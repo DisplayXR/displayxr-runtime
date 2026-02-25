@@ -1698,7 +1698,10 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 	mc->session_render.hud_gpu_initialized = false;
 	mc->session_render.hud_last_frame_time_ns = 0;
 	mc->session_render.hud_smoothed_frame_time_ms = 16.67f;
-	if (mc->session_render.owns_window) {
+	// Create HUD for all per-session windows (both self-owned and app-provided).
+	// The D3D11 compositor already renders HUD for all sessions; match that behavior
+	// for the Vulkan per-session path so ext apps see HUD in both compositors.
+	{
 		uint32_t disp_w = mc->msc->base.info.display_pixel_width;
 		if (disp_w == 0) {
 			disp_w = mc->msc->base.info.views[0].recommended.width_pixels;
