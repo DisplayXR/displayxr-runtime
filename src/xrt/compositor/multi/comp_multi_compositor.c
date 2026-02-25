@@ -1404,6 +1404,11 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 		return false;
 	}
 
+	// Don't try to (re-)init if window close is in progress — the HWND is destroyed
+	if (mc->session_render.window_close_loss_sent) {
+		return false;
+	}
+
 	U_LOG_W("init_session_render: window=%p readback_callback=%p — initializing per-session rendering",
 	        mc->session_render.external_window_handle,
 	        (void *)(uintptr_t)mc->session_render.readback_callback);
