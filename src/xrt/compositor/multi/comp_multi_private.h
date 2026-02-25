@@ -358,6 +358,9 @@ struct multi_compositor
 		//! Saved sim_display output mode before 2D switch (-1 = none saved)
 		int saved_sim_display_mode;
 
+		//! True if window-close loss event has been pushed (avoids duplicates)
+		bool window_close_loss_sent;
+
 		//! True if per-session resources are initialized
 		bool initialized;
 	} session_render;

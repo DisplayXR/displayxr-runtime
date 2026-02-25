@@ -690,6 +690,7 @@ multi_compositor_end_session(struct xrt_compositor *xc)
 		}
 		mc->session_render.owns_window = false;
 #endif
+		mc->session_render.window_close_loss_sent = false;
 		mc->session_render.external_window_handle = NULL;
 
 		multi_system_compositor_update_session_status(mc->msc, false);
@@ -766,8 +767,18 @@ multi_compositor_wait_frame(struct xrt_compositor *xc,
 	// Check if self-owned window was closed (ESC, close button, ALT+F4)
 	if (mc->session_render.owns_window && mc->session_render.own_window != NULL &&
 	    !comp_d3d11_window_is_valid(mc->session_render.own_window)) {
-		U_LOG_W("Self-owned window closed - signaling session loss");
-		return XRT_ERROR_IPC_FAILURE;
+		if (!mc->session_render.window_close_loss_sent) {
+			U_LOG_W("Self-owned window closed - signaling session loss");
+			union xrt_session_event xse = XRT_STRUCT_INIT;
+			xse.type = XRT_SESSION_EVENT_LOSS_PENDING;
+			xse.loss_pending.loss_time_ns = (int64_t)os_monotonic_get_ns();
+			(void)multi_compositor_push_event(mc, &xse);
+			mc->session_render.window_close_loss_sent = true;
+		}
+		*out_frame_id = 0;
+		*out_predicted_display_time_ns = (int64_t)os_monotonic_get_ns();
+		*out_predicted_display_period_ns = U_TIME_1S_IN_NS / 60;
+		return XRT_SUCCESS;
 	}
 #endif
 #ifdef XRT_OS_MACOS
@@ -776,8 +787,18 @@ multi_compositor_wait_frame(struct xrt_compositor *xc,
 	{
 		extern bool oxr_macos_window_closed(void);
 		if (oxr_macos_window_closed()) {
-			U_LOG_W("macOS window closed - signaling session loss");
-			return XRT_ERROR_IPC_FAILURE;
+			if (!mc->session_render.window_close_loss_sent) {
+				U_LOG_W("macOS window closed - signaling session loss");
+				union xrt_session_event xse = XRT_STRUCT_INIT;
+				xse.type = XRT_SESSION_EVENT_LOSS_PENDING;
+				xse.loss_pending.loss_time_ns = (int64_t)os_monotonic_get_ns();
+				(void)multi_compositor_push_event(mc, &xse);
+				mc->session_render.window_close_loss_sent = true;
+			}
+			*out_frame_id = 0;
+			*out_predicted_display_time_ns = (int64_t)os_monotonic_get_ns();
+			*out_predicted_display_period_ns = U_TIME_1S_IN_NS / 60;
+			return XRT_SUCCESS;
 		}
 	}
 #endif

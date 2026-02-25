@@ -2195,7 +2195,10 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			xrt_session_event_sink_push(c->xses, &xse);
 			c->loss_sent = true;
 		}
-		return XRT_ERROR_IPC_FAILURE;
+		// Return success so the error doesn't propagate as XR_ERROR_INSTANCE_LOST.
+		// The LOSS_PENDING/LOST events will drive the session state machine to
+		// shut down the session gracefully without terminating the app.
+		return XRT_SUCCESS;
 	}
 
 	// Track this as the active compositor for eye position queries
