@@ -8,6 +8,7 @@
  */
 
 #include "xrt/xrt_config_drivers.h"
+#include "xrt/xrt_instance.h"
 
 #include "util/u_misc.h"
 #include "util/u_debug.h"
@@ -27,9 +28,6 @@
 
 // Using INFO as default to inform events real devices could report physically
 DEBUG_GET_ONCE_LOG_OPTION(qwerty_log, "QWERTY_LOG", U_LOGGING_INFO)
-
-// Driver disabled by default for being experimental
-DEBUG_GET_ONCE_BOOL_OPTION(enable_qwerty, "QWERTY_ENABLE", false)
 
 
 /*
@@ -55,14 +53,23 @@ qwerty_estimate_system(struct xrt_builder *xb,
                        struct xrt_prober *xp,
                        struct xrt_builder_estimate *estimate)
 {
-	if (!debug_get_bool_option_enable_qwerty()) {
-		return XRT_SUCCESS;
+	// Check if the app uses XR_EXT_win32_window_binding (extension app).
+	bool is_ext_app = false;
+	if (xp->instance_info != NULL) {
+		is_ext_app = xp->instance_info->app_info.ext_win32_window_binding_enabled;
 	}
 
 	estimate->certain.head = true;
 	estimate->certain.left = true;
 	estimate->certain.right = true;
-	estimate->priority = -25;
+
+	if (is_ext_app) {
+		// Extension apps prefer Leia; qwerty is low-priority fallback.
+		estimate->priority = -25;
+	} else {
+		// Non-extension apps always use qwerty for keyboard/mouse camera.
+		estimate->priority = 0;
+	}
 
 	return XRT_SUCCESS;
 }
@@ -129,7 +136,7 @@ t_builder_qwerty_create(void)
 	ub->base.name = "Qwerty devices builder";
 	ub->base.driver_identifiers = driver_list;
 	ub->base.driver_identifier_count = ARRAY_SIZE(driver_list);
-	ub->base.exclude_from_automatic_discovery = !debug_get_bool_option_enable_qwerty();
+	ub->base.exclude_from_automatic_discovery = false; // Always available; priority set per-app in estimate
 
 	// u_builder fields.
 	ub->open_system_static_roles = qwerty_open_system_impl;

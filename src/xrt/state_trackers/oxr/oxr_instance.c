@@ -331,6 +331,9 @@ oxr_instance_create(struct oxr_logger *log,
 #ifdef OXR_HAVE_EXT_win32_appcontainer_compatible
 	    .ext_win32_appcontainer_compatible_enabled = extensions->EXT_win32_appcontainer_compatible,
 #endif
+#ifdef OXR_HAVE_EXT_win32_window_binding
+	    .ext_win32_window_binding_enabled = extensions->EXT_win32_window_binding,
+#endif
 	};
 	snprintf(i_info.app_info.application_name, sizeof(i_info.app_info.application_name), "%s",
 	         createInfo->applicationInfo.applicationName);
