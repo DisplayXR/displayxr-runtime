@@ -2098,6 +2098,20 @@ session_render_hud_overlay(struct multi_compositor *mc,
 	data.forward_y = fwd_y;
 	data.forward_z = fwd_z;
 
+#ifdef XRT_BUILD_DRIVER_QWERTY
+	if (mc->xsysd != NULL) {
+		struct qwerty_stereo_state ss;
+		if (qwerty_get_stereo_state(mc->xsysd->xdevs, mc->xsysd->xdev_count, &ss)) {
+			data.camera_mode = ss.camera_mode;
+			data.stereo_ipd_factor = ss.ipd_factor;
+			data.stereo_parallax_factor = ss.parallax_factor;
+			data.stereo_zoom_or_scale = ss.zoom_or_scale;
+			data.stereo_convergence_or_perspective = ss.convergence_or_perspective;
+			data.stereo_half_tan_vfov = ss.half_tan_vfov;
+		}
+	}
+#endif
+
 	bool dirty = u_hud_update(mc->session_render.hud, &data);
 
 	// Lazy-init GPU resources

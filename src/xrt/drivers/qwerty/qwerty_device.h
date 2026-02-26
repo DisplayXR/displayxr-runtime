@@ -43,6 +43,14 @@ struct qwerty_system
 	bool rctrl_focused; //!< Same as `hmd_focused` but for the right controller
 	bool force_2d_mode;              //!< Runtime-side 2D/3D toggle (V key when HMD focused)
 	bool display_mode_toggle_pending; //!< Set by key handler, cleared by compositor
+
+	// Camera-centric stereo controls (P/[/]/-/=/;/'/,/. keys when HMD focused)
+	bool camera_mode;                //!< true=camera-centric, false=display-centric
+	float ipd_factor;                //!< [0,1] (default: 1.0)
+	float parallax_factor;           //!< [0,1] (default: 1.0)
+	float zoom_or_scale;             //!< [0.1,10] (default: 1.0)
+	float convergence_or_perspective; //!< [0.1,10] (default: 0.5 -> 2m convergence)
+	float half_tan_vfov;             //!< tan(18deg) ~ 0.3249 for 36deg vFOV
 };
 
 /*!
@@ -425,6 +433,41 @@ qwerty_reset_controller_pose(struct qwerty_controller *qc);
  */
 void
 qwerty_toggle_display_mode(struct qwerty_system *qs);
+
+/*!
+ * Toggle between camera-centric and display-centric stereo mode.
+ * @public @memberof qwerty_system
+ */
+void
+qwerty_toggle_camera_mode(struct qwerty_system *qs);
+
+/*!
+ * Adjust IPD factor by delta (clamped to [0,1]).
+ * @public @memberof qwerty_system
+ */
+void
+qwerty_adjust_ipd_factor(struct qwerty_system *qs, float delta);
+
+/*!
+ * Adjust parallax factor by delta (clamped to [0,1]).
+ * @public @memberof qwerty_system
+ */
+void
+qwerty_adjust_parallax_factor(struct qwerty_system *qs, float delta);
+
+/*!
+ * Adjust zoom (camera) or scale (display) by multiplicative factor.
+ * @public @memberof qwerty_system
+ */
+void
+qwerty_adjust_zoom_or_scale(struct qwerty_system *qs, float multiplier);
+
+/*!
+ * Adjust convergence (camera) or perspective (display) by multiplicative factor.
+ * @public @memberof qwerty_system
+ */
+void
+qwerty_adjust_convergence_or_perspective(struct qwerty_system *qs, float multiplier);
 
 
 /*!

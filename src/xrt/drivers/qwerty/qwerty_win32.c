@@ -514,6 +514,44 @@ qwerty_process_win32(struct xrt_device **xdevs,
 				u_hud_toggle();
 			break;
 
+		// === Camera-centric stereo controls (HMD focused only) ===
+		case 'P': // Toggle camera/display mode
+			if (is_keydown && qsys->hmd_focused)
+				qwerty_toggle_camera_mode(qsys);
+			break;
+		case VK_OEM_4: // '[' - Zoom/Scale decrease
+			if (is_keydown && qsys->hmd_focused)
+				qwerty_adjust_zoom_or_scale(qsys, 1.0f / 1.05f);
+			break;
+		case VK_OEM_6: // ']' - Zoom/Scale increase
+			if (is_keydown && qsys->hmd_focused)
+				qwerty_adjust_zoom_or_scale(qsys, 1.05f);
+			break;
+		case VK_OEM_MINUS: // '-' - IPD factor decrease
+			if (is_keydown && qsys->hmd_focused)
+				qwerty_adjust_ipd_factor(qsys, -0.05f);
+			break;
+		case VK_OEM_PLUS: // '=' - IPD factor increase
+			if (is_keydown && qsys->hmd_focused)
+				qwerty_adjust_ipd_factor(qsys, 0.05f);
+			break;
+		case VK_OEM_1: // ';' - Parallax factor decrease
+			if (is_keydown && qsys->hmd_focused)
+				qwerty_adjust_parallax_factor(qsys, -0.05f);
+			break;
+		case VK_OEM_7: // '\'' - Parallax factor increase
+			if (is_keydown && qsys->hmd_focused)
+				qwerty_adjust_parallax_factor(qsys, 0.05f);
+			break;
+		case VK_OEM_COMMA: // ',' - Convergence/Perspective decrease
+			if (is_keydown && qsys->hmd_focused)
+				qwerty_adjust_convergence_or_perspective(qsys, 1.0f / 1.05f);
+			break;
+		case VK_OEM_PERIOD: // '.' - Convergence/Perspective increase
+			if (is_keydown && qsys->hmd_focused)
+				qwerty_adjust_convergence_or_perspective(qsys, 1.05f);
+			break;
+
 		// ESC key to close window
 		case VK_ESCAPE:
 			if (is_keydown) {

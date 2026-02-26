@@ -22,6 +22,7 @@
 #include "os/os_time.h"
 
 #include "qwerty_device.h"
+#include "qwerty_interface.h"
 
 #include <stdio.h>
 #include <assert.h>
@@ -582,6 +583,14 @@ qwerty_system_create(struct qwerty_hmd *qhmd,
 	qs->log_level = log_level;
 	qs->process_keys = true;
 
+	// Camera-centric stereo defaults
+	qs->camera_mode = true;
+	qs->ipd_factor = 1.0f;
+	qs->parallax_factor = 1.0f;
+	qs->zoom_or_scale = 1.0f;
+	qs->convergence_or_perspective = 0.5f; // 1/0.5 = 2m convergence distance
+	qs->half_tan_vfov = 0.3249f;           // tan(18 deg) -> 36 deg vFOV
+
 	if (qhmd) {
 		qhmd->base.sys = qs;
 	}
@@ -897,6 +906,87 @@ qwerty_toggle_display_mode(struct qwerty_system *qs)
 	qs->force_2d_mode = !qs->force_2d_mode;
 	qs->display_mode_toggle_pending = true;
 	U_LOG_W("Qwerty: display mode toggled to %s", qs->force_2d_mode ? "2D" : "3D");
+}
+
+void
+qwerty_toggle_camera_mode(struct qwerty_system *qs)
+{
+	qs->camera_mode = !qs->camera_mode;
+	U_LOG_W("Qwerty: stereo mode -> %s", qs->camera_mode ? "Camera" : "Display");
+}
+
+// Clamp helper
+static inline float
+clampf(float v, float lo, float hi)
+{
+	if (v < lo)
+		return lo;
+	if (v > hi)
+		return hi;
+	return v;
+}
+
+void
+qwerty_adjust_ipd_factor(struct qwerty_system *qs, float delta)
+{
+	qs->ipd_factor = clampf(qs->ipd_factor + delta, 0.0f, 1.0f);
+	U_LOG_I("Qwerty: IPD factor = %.2f", qs->ipd_factor);
+}
+
+void
+qwerty_adjust_parallax_factor(struct qwerty_system *qs, float delta)
+{
+	qs->parallax_factor = clampf(qs->parallax_factor + delta, 0.0f, 1.0f);
+	U_LOG_I("Qwerty: Parallax factor = %.2f", qs->parallax_factor);
+}
+
+void
+qwerty_adjust_zoom_or_scale(struct qwerty_system *qs, float multiplier)
+{
+	qs->zoom_or_scale = clampf(qs->zoom_or_scale * multiplier, 0.1f, 10.0f);
+	U_LOG_I("Qwerty: %s = %.2f", qs->camera_mode ? "Zoom" : "Scale", qs->zoom_or_scale);
+}
+
+void
+qwerty_adjust_convergence_or_perspective(struct qwerty_system *qs, float multiplier)
+{
+	qs->convergence_or_perspective = clampf(qs->convergence_or_perspective * multiplier, 0.1f, 10.0f);
+	U_LOG_I("Qwerty: %s = %.2f", qs->camera_mode ? "Convergence" : "Perspective",
+	        qs->convergence_or_perspective);
+}
+
+bool
+qwerty_get_stereo_state(struct xrt_device **xdevs, size_t xdev_count, struct qwerty_stereo_state *out)
+{
+	if (xdevs == NULL || out == NULL) {
+		return false;
+	}
+
+	// Find a qwerty device in the device list
+	struct qwerty_system *qs = NULL;
+	for (size_t i = 0; i < xdev_count; i++) {
+		if (xdevs[i] == NULL) {
+			continue;
+		}
+		const char *name = xdevs[i]->tracking_origin->name;
+		if (strcmp(name, QWERTY_HMD_TRACKER_STR) == 0 || strcmp(name, QWERTY_LEFT_TRACKER_STR) == 0 ||
+		    strcmp(name, QWERTY_RIGHT_TRACKER_STR) == 0) {
+			qs = qwerty_device(xdevs[i])->sys;
+			break;
+		}
+	}
+
+	if (qs == NULL) {
+		return false;
+	}
+
+	out->camera_mode = qs->camera_mode;
+	out->ipd_factor = qs->ipd_factor;
+	out->parallax_factor = qs->parallax_factor;
+	out->zoom_or_scale = qs->zoom_or_scale;
+	out->convergence_or_perspective = qs->convergence_or_perspective;
+	out->half_tan_vfov = qs->half_tan_vfov;
+	return true;
 }
 
 void

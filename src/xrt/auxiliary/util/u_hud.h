@@ -62,6 +62,14 @@ struct u_hud_data
 	float zoom_scale;                               //!< Zoom factor (1.0 = no zoom)
 	float vdisp_x, vdisp_y, vdisp_z;               //!< Virtual display position (m)
 	float forward_x, forward_y, forward_z;         //!< Head forward direction
+
+	// Camera-centric stereo controls
+	bool camera_mode;                               //!< true=camera, false=display
+	float stereo_ipd_factor;                        //!< IPD factor [0,1]
+	float stereo_parallax_factor;                   //!< Parallax factor [0,1]
+	float stereo_zoom_or_scale;                     //!< Zoom/Scale [0.1,10]
+	float stereo_convergence_or_perspective;        //!< Convergence/Perspective [0.1,10]
+	float stereo_half_tan_vfov;                     //!< tan(vFOV/2)
 };
 
 struct u_hud;

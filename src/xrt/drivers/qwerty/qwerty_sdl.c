@@ -248,6 +248,21 @@ qwerty_process_event(struct xrt_device **xdevs, size_t xdev_count, SDL_Event eve
 	if (event.type == SDL_KEYDOWN && event.key.keysym.scancode == SDL_SCANCODE_M) qwerty_press_trackpad_click(qctrl);
 	if (event.type == SDL_KEYUP && event.key.keysym.scancode == SDL_SCANCODE_M) qwerty_release_trackpad_click(qctrl);
 
+	// Camera-centric stereo controls (HMD focused, one-shot on keydown)
+	if (event.type == SDL_KEYDOWN && event.key.repeat == 0 && qdev == qd_hmd) {
+		if (event.key.keysym.scancode == SDL_SCANCODE_P) qwerty_toggle_camera_mode(qsys);
+	}
+	if (event.type == SDL_KEYDOWN && qdev == qd_hmd) {
+		if (event.key.keysym.scancode == SDL_SCANCODE_LEFTBRACKET) qwerty_adjust_zoom_or_scale(qsys, 1.0f / 1.05f);
+		if (event.key.keysym.scancode == SDL_SCANCODE_RIGHTBRACKET) qwerty_adjust_zoom_or_scale(qsys, 1.05f);
+		if (event.key.keysym.scancode == SDL_SCANCODE_MINUS) qwerty_adjust_ipd_factor(qsys, -0.05f);
+		if (event.key.keysym.scancode == SDL_SCANCODE_EQUALS) qwerty_adjust_ipd_factor(qsys, 0.05f);
+		if (event.key.keysym.scancode == SDL_SCANCODE_SEMICOLON) qwerty_adjust_parallax_factor(qsys, -0.05f);
+		if (event.key.keysym.scancode == SDL_SCANCODE_APOSTROPHE) qwerty_adjust_parallax_factor(qsys, 0.05f);
+		if (event.key.keysym.scancode == SDL_SCANCODE_COMMA) qwerty_adjust_convergence_or_perspective(qsys, 1.0f / 1.05f);
+		if (event.key.keysym.scancode == SDL_SCANCODE_PERIOD) qwerty_adjust_convergence_or_perspective(qsys, 1.05f);
+	}
+
 	// clang-format on
 
 	// Controllers follow/unfollow HMD
