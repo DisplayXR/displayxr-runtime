@@ -37,7 +37,9 @@
 #include "math/m_api.h"
 #include "math/m_mathinclude.h"
 #include "math/m_space.h"
-#include "math/m_stereo3d.h"
+
+#include "display3d_view.h"
+#include "camera3d_view.h"
 
 #include "oxr_objects.h"
 #include "oxr_logger.h"
@@ -215,78 +217,14 @@ oxr_session_get_window_metrics(struct oxr_session *sess,
 	return false;
 }
 
-/*!
- * Compute Kooima asymmetric FOV based on eye position relative to screen.
- *
- * The Kooima algorithm (from "Generalized Perspective Projection") computes
- * a perspective frustum where the eye is not centered on the screen. This is
- * essential for SR displays where the user's head moves relative to the screen.
- *
- * @param eye Eye position in meters (x=right, y=up, z=toward viewer from screen center)
- * @param screen_width_m Screen width in meters
- * @param screen_height_m Screen height in meters
- * @param eye_name Name of the eye ("Left" or "Right") for diagnostic logging
- * @param should_log Whether to log this frame (caller controls throttling)
- * @param[out] out_fov FOV angles in radians
- */
-static void
-compute_kooima_fov(const struct xrt_eye_position *eye,
-                   float screen_width_m,
-                   float screen_height_m,
-                   const char *eye_name,
-                   bool should_log,
-                   struct xrt_fov *out_fov)
+// Helper: copy XrFovf → xrt_fov (same layout, different field names)
+static inline void
+xrfov_to_xrt_fov(const XrFovf *src, struct xrt_fov *dst)
 {
-	const float half_w = screen_width_m / 2.0f;
-	const float half_h = screen_height_m / 2.0f;
-	const float distance = eye->z;
-
-	// Fallback if eye too close to screen to avoid division issues
-	if (distance <= 0.001f) {
-		out_fov->angle_left = -0.785398f;   // -45 degrees
-		out_fov->angle_right = 0.785398f;   //  45 degrees
-		out_fov->angle_up = 0.523599f;      //  30 degrees
-		out_fov->angle_down = -0.523599f;   // -30 degrees
-		if (should_log) {
-			U_LOG_W("Kooima FOV [%s]: eye too close (z=%.4fm), using fallback angles", eye_name, eye->z);
-		}
-		return;
-	}
-
-	// Screen corners relative to screen center (at z=0):
-	// pa (top-left):     (-half_w,  half_h, 0)
-	// pb (top-right):    ( half_w,  half_h, 0)
-	// pc (bottom-left):  (-half_w, -half_h, 0)
-	//
-	// Eye position: (eye->x, eye->y, eye->z) where z is distance toward viewer
-	//
-	// For each edge, compute the tangent of the angle from eye to that edge,
-	// then convert to angle. Since screen normal is (0,0,1) and eye is at z=distance:
-	//
-	// tan(angle_left)  = (left_edge_x - eye_x) / distance  = (-half_w - eye->x) / distance
-	// tan(angle_right) = (right_edge_x - eye_x) / distance = (half_w - eye->x) / distance
-	// tan(angle_up)    = (top_edge_y - eye_y) / distance   = (half_h - eye->y) / distance
-	// tan(angle_down)  = (bottom_edge_y - eye_y) / distance = (-half_h - eye->y) / distance
-
-	out_fov->angle_left = atanf((-half_w - eye->x) / distance);
-	out_fov->angle_right = atanf((half_w - eye->x) / distance);
-	out_fov->angle_up = atanf((half_h - eye->y) / distance);
-	out_fov->angle_down = atanf((-half_h - eye->y) / distance);
-
-	// Diagnostic logging (caller controls throttling)
-	if (should_log) {
-		float h_fov_deg = (out_fov->angle_right - out_fov->angle_left) * 180.0f / 3.14159265f;
-		float v_fov_deg = (out_fov->angle_up - out_fov->angle_down) * 180.0f / 3.14159265f;
-		U_LOG_I("Kooima FOV [%s]: eye=(%.4f,%.4f,%.4f)m, screen=%.4fx%.4fm",
-		        eye_name, eye->x, eye->y, eye->z, screen_width_m, screen_height_m);
-		U_LOG_I("  [%s] angles: L=%.2f° R=%.2f° U=%.2f° D=%.2f° (H=%.2f° V=%.2f°)",
-		        eye_name,
-		        out_fov->angle_left * 180.0f / 3.14159265f,
-		        out_fov->angle_right * 180.0f / 3.14159265f,
-		        out_fov->angle_up * 180.0f / 3.14159265f,
-		        out_fov->angle_down * 180.0f / 3.14159265f,
-		        h_fov_deg, v_fov_deg);
-	}
+	dst->angle_left = src->angleLeft;
+	dst->angle_right = src->angleRight;
+	dst->angle_up = src->angleUp;
+	dst->angle_down = src->angleDown;
 }
 
 #ifdef OXR_HAVE_EXT_display_info
@@ -979,7 +917,7 @@ oxr_session_locate_views(struct oxr_logger *log,
 	bool have_stereo_state = qwerty_get_stereo_state(
 	    sess->sys->xsysd->xdevs, sess->sys->xsysd->xdev_count, &stereo_state);
 	if (should_log) {
-		U_LOG_W("STEREO STATE: have=%d cam=%d ipd=%.2f par=%.2f zoom=%.2f conv=%.2f htan=%.4f",
+		U_LOG_I("STEREO STATE: have=%d cam=%d ipd=%.2f par=%.2f zoom=%.2f conv=%.2f htan=%.4f",
 		        have_stereo_state, stereo_state.camera_mode,
 		        stereo_state.ipd_factor, stereo_state.parallax_factor,
 		        stereo_state.zoom_or_scale, stereo_state.convergence_or_perspective,
@@ -1079,81 +1017,84 @@ oxr_session_locate_views(struct oxr_logger *log,
 			}
 
 			if (should_log) {
-					U_LOG_W("KOOIMA GATE: have_eyes=%d screen=%.4fx%.4f have_stereo=%d cam=%d ext_win=%d",
+					U_LOG_I("KOOIMA GATE: have_eyes=%d screen=%.4fx%.4f have_stereo=%d cam=%d ext_win=%d",
 					        have_eye_positions, screen_width_m, screen_height_m,
 					        have_stereo_state, stereo_state.camera_mode,
 					        sess->has_external_window);
 				}
 
 				if (screen_width_m > 0.0f && screen_height_m > 0.0f) {
-				// Camera-centric path: use m_stereo3d_camera_compute
+				// Nominal viewer for stereo math (parallax lerp target)
+				const struct xrt_system_compositor_info *si = &sess->sys->xsysc->info;
+				XrVector3f nominal = {0, si->nominal_viewer_y_m, si->nominal_viewer_z_m};
+				XrVector3f raw_l = {adj_left.x, adj_left.y, adj_left.z};
+				XrVector3f raw_r = {adj_right.x, adj_right.y, adj_right.z};
+				Display3DScreen scr = {screen_width_m, screen_height_m};
+				XrPosef display_pose = {
+				    {world_head_ori.x, world_head_ori.y, world_head_ori.z, world_head_ori.w},
+				    {world_head_pos.x, world_head_pos.y, world_head_pos.z}};
+
+				// Camera-centric path: canonical camera3d_compute_stereo_views
 				if (have_stereo_state && stereo_state.camera_mode &&
 				    !sess->has_external_window) {
-					struct xrt_vec3 raw_left = {adj_left.x, adj_left.y, adj_left.z};
-					struct xrt_vec3 raw_right = {adj_right.x, adj_right.y, adj_right.z};
-					struct m_stereo3d_screen scr = {screen_width_m, screen_height_m};
-					struct m_stereo3d_camera_tunables tunables = {
+					Camera3DTunables ct = {
 					    .ipd_factor = stereo_state.ipd_factor,
 					    .parallax_factor = stereo_state.parallax_factor,
 					    .inv_convergence_distance = 1.0f / stereo_state.convergence_or_perspective,
 					    .half_tan_vfov = stereo_state.half_tan_vfov / stereo_state.zoom_or_scale,
 					};
-					struct xrt_pose camera_pose = {world_head_ori, world_head_pos};
+					Camera3DStereoView cam_views[2];
+					camera3d_compute_stereo_views(&raw_l, &raw_r, &nominal, &scr, &ct,
+					                              &display_pose, 0.01f, 100.0f,
+					                              &cam_views[0], &cam_views[1]);
 
-					m_stereo3d_camera_compute(
-					    &raw_left, &raw_right, NULL, &scr, &tunables,
-					    &camera_pose, fovs, stereo_eye_world);
+					// Extract {fov, eye_world} — runtime doesn't need matrices
+					for (int ei = 0; ei < 2; ei++) {
+						xrfov_to_xrt_fov(&cam_views[ei].fov, &fovs[ei]);
+						stereo_eye_world[ei] = (struct xrt_vec3){
+						    cam_views[ei].eye_world.x,
+						    cam_views[ei].eye_world.y,
+						    cam_views[ei].eye_world.z};
+					}
 					have_kooima_fov = true;
 					have_stereo_eye_override = true;
-
-					if (should_log) {
-						float h_fov = (fovs[0].angle_right - fovs[0].angle_left) * 180.0f / 3.14159265f;
-						float v_fov = (fovs[0].angle_up - fovs[0].angle_down) * 180.0f / 3.14159265f;
-						U_LOG_I("Camera FOV: H=%.2f° V=%.2f° eye0=(%.3f,%.3f,%.3f)",
-						        h_fov, v_fov,
-						        stereo_eye_world[0].x, stereo_eye_world[0].y,
-						        stereo_eye_world[0].z);
-					}
 				} else {
-					// Display-centric path: apply eye factors then Kooima
+					// Display-centric (Kooima) path: canonical display3d_compute_stereo_views
+					Display3DTunables dt = display3d_default_tunables();
 					if (have_stereo_state && !sess->has_external_window) {
-						// Apply IPD/parallax factors from qwerty controls
-						struct xrt_vec3 raw_l = {adj_left.x, adj_left.y, adj_left.z};
-						struct xrt_vec3 raw_r = {adj_right.x, adj_right.y, adj_right.z};
-						struct xrt_vec3 out_l, out_r;
-						m_stereo3d_apply_eye_factors(&raw_l, &raw_r, NULL,
-						                            stereo_state.ipd_factor,
-						                            stereo_state.parallax_factor,
-						                            &out_l, &out_r);
-						adj_left = (struct xrt_eye_position){out_l.x, out_l.y, out_l.z};
-						adj_right = (struct xrt_eye_position){out_r.x, out_r.y, out_r.z};
+						dt.ipd_factor = stereo_state.ipd_factor;
+						dt.parallax_factor = stereo_state.parallax_factor;
+					}
+					dt.virtual_display_height = screen_height_m; // identity m2v
 
-						// Transform display-space eyes to world-space for view pose override
-						// (must match the FOV so app projection + view are consistent)
-						struct xrt_vec3 disp_eyes[2] = {out_l, out_r};
+					Display3DStereoView disp_views[2];
+					display3d_compute_stereo_views(&raw_l, &raw_r, &nominal, &scr, &dt,
+					                               &display_pose, 0.01f, 100.0f,
+					                               &disp_views[0], &disp_views[1]);
+
+					// Extract {fov, eye_world} — runtime doesn't need matrices
+					for (int ei = 0; ei < 2; ei++) {
+						xrfov_to_xrt_fov(&disp_views[ei].fov, &fovs[ei]);
+					}
+					have_kooima_fov = true;
+
+					if (!sess->has_external_window) {
 						for (int ei = 0; ei < 2; ei++) {
-							struct xrt_vec3 rotated;
-							math_quat_rotate_vec3(&world_head_ori, &disp_eyes[ei], &rotated);
-							stereo_eye_world[ei].x = world_head_pos.x + rotated.x;
-							stereo_eye_world[ei].y = world_head_pos.y + rotated.y;
-							stereo_eye_world[ei].z = world_head_pos.z + rotated.z;
+							stereo_eye_world[ei] = (struct xrt_vec3){
+							    disp_views[ei].eye_world.x,
+							    disp_views[ei].eye_world.y,
+							    disp_views[ei].eye_world.z};
 						}
 						have_stereo_eye_override = true;
 					}
-
-					compute_kooima_fov(&adj_left, screen_width_m, screen_height_m,
-					                   "Left", should_log, &fovs[0]);
-					compute_kooima_fov(&adj_right, screen_width_m, screen_height_m,
-					                   "Right", should_log, &fovs[1]);
-					have_kooima_fov = true;
 				}
 
 				// Compare FOVs between eyes (throttled logging)
 				if (should_log) {
-					float left_h_fov = (fovs[0].angle_right - fovs[0].angle_left) * 180.0f / 3.14159265f;
-					float right_h_fov = (fovs[1].angle_right - fovs[1].angle_left) * 180.0f / 3.14159265f;
-					float left_v_fov = (fovs[0].angle_up - fovs[0].angle_down) * 180.0f / 3.14159265f;
-					float right_v_fov = (fovs[1].angle_up - fovs[1].angle_down) * 180.0f / 3.14159265f;
+					float left_h_fov = (fovs[0].angle_right - fovs[0].angle_left) * 57.2958f;
+					float right_h_fov = (fovs[1].angle_right - fovs[1].angle_left) * 57.2958f;
+					float left_v_fov = (fovs[0].angle_up - fovs[0].angle_down) * 57.2958f;
+					float right_v_fov = (fovs[1].angle_up - fovs[1].angle_down) * 57.2958f;
 					U_LOG_I("FOV: Left H=%.2f° V=%.2f°, Right H=%.2f° V=%.2f°",
 					        left_h_fov, left_v_fov, right_h_fov, right_v_fov);
 				}
@@ -1193,7 +1134,7 @@ oxr_session_locate_views(struct oxr_logger *log,
 		if (should_log) {
 			float h0 = (fovs[0].angle_right - fovs[0].angle_left) * 57.2958f;
 			float v0 = (fovs[0].angle_up - fovs[0].angle_down) * 57.2958f;
-			U_LOG_W("FINAL FOV: kooima=%d override=%d H=%.2f° V=%.2f° "
+			U_LOG_I("FINAL FOV: kooima=%d override=%d H=%.2f° V=%.2f° "
 			        "L=%.4f R=%.4f U=%.4f D=%.4f",
 			        have_kooima_fov, have_stereo_eye_override, h0, v0,
 			        fovs[0].angle_left, fovs[0].angle_right,
@@ -1313,7 +1254,7 @@ oxr_session_locate_views(struct oxr_logger *log,
 		OXR_XRT_FOV_TO_XRFOVF(fov, views[i].fov);
 
 		if (should_log && i == 0) {
-			U_LOG_W("VIEW[0] FINAL: pos=(%.3f,%.3f,%.3f) fov_L=%.4f fov_R=%.4f fov_U=%.4f fov_D=%.4f",
+			U_LOG_I("VIEW[0] FINAL: pos=(%.3f,%.3f,%.3f) fov_L=%.4f fov_R=%.4f fov_U=%.4f fov_D=%.4f",
 			        views[0].pose.position.x, views[0].pose.position.y, views[0].pose.position.z,
 			        views[0].fov.angleLeft, views[0].fov.angleRight,
 			        views[0].fov.angleUp, views[0].fov.angleDown);

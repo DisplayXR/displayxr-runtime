@@ -583,8 +583,8 @@ qwerty_system_create(struct qwerty_hmd *qhmd,
 	qs->log_level = log_level;
 	qs->process_keys = true;
 
-	// Camera-centric stereo defaults
-	qs->camera_mode = true;
+	// Display-centric stereo defaults
+	qs->camera_mode = false;
 	qs->ipd_factor = 1.0f;
 	qs->parallax_factor = 1.0f;
 	qs->zoom_or_scale = 1.0f;

@@ -28,6 +28,10 @@
 // Using INFO as default to inform events real devices could report physically
 DEBUG_GET_ONCE_LOG_OPTION(qwerty_log, "QWERTY_LOG", U_LOGGING_INFO)
 
+// When sim_display is enabled, defer to the sim_display builder
+// (which creates qwerty internally for keyboard/mouse input).
+DEBUG_GET_ONCE_BOOL_OPTION(sim_display_active, "SIM_DISPLAY_ENABLE", false)
+
 
 /*
  *
@@ -52,6 +56,13 @@ qwerty_estimate_system(struct xrt_builder *xb,
                        struct xrt_prober *xp,
                        struct xrt_builder_estimate *estimate)
 {
+	// When sim_display is enabled, don't claim head — let the sim_display
+	// builder win. It creates sim_display as head (display properties) and
+	// qwerty internally (keyboard/mouse input). Qwerty alone has no display.
+	if (debug_get_bool_option_sim_display_active()) {
+		return XRT_SUCCESS;
+	}
+
 	estimate->certain.head = true;
 	estimate->certain.left = true;
 	estimate->certain.right = true;

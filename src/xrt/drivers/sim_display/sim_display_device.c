@@ -197,30 +197,15 @@ sim_display_hmd_get_tracked_pose(struct xrt_device *xdev,
 		return XRT_SUCCESS;
 	}
 
-	// Orbit camera model using external pose source (e.g. qwerty HMD).
-	// The qwerty HMD pose = virtual display position in world space.
-	// Eye position = display_pos + rotate(eye_offset, display_orientation).
-	// This orbits the eye around the display center, matching the Windows
-	// app's camera model in sr_cube_openxr_ext/LocateViews.
+	// Display pose from external source (e.g. qwerty HMD via WASD/mouse).
+	// Returns the display center position and orientation in world space.
+	// Eye offsets are NOT applied here — the Kooima block in oxr_session.c
+	// computes world-space eye positions from display-space data.
 	if (hmd->pose_source != NULL) {
 		struct xrt_space_relation src_rel;
 		hmd->pose_source->get_tracked_pose(hmd->pose_source, name, at_timestamp_ns, &src_rel);
 
-		// Display position in world space (from qwerty WASD)
-		struct xrt_vec3 display_pos = src_rel.pose.position;
-
-		// Nominal eye offset relative to display center
-		struct xrt_vec3 eye_offset = hmd->pose.position;
-
-		// Orbit: rotate eye offset around display center by display orientation
-		struct xrt_vec3 rotated_eye;
-		math_quat_rotate_vec3(&src_rel.pose.orientation, &eye_offset, &rotated_eye);
-
-		// Final eye position = display position + orbited eye offset
-		out_relation->pose.position.x = display_pos.x + rotated_eye.x;
-		out_relation->pose.position.y = display_pos.y + rotated_eye.y;
-		out_relation->pose.position.z = display_pos.z + rotated_eye.z;
-		out_relation->pose.orientation = src_rel.pose.orientation;
+		out_relation->pose = src_rel.pose;
 		out_relation->relation_flags = (enum xrt_space_relation_flags)(
 		    XRT_SPACE_RELATION_ORIENTATION_VALID_BIT |
 		    XRT_SPACE_RELATION_POSITION_VALID_BIT |
