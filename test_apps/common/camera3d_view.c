@@ -132,7 +132,7 @@ camera3d_default_tunables(void)
 	t.ipd_factor = 1.0f;
 	t.parallax_factor = 1.0f;
 	t.inv_convergence_distance = 1.0f;
-	t.half_tan_vfov = 0.57735026919f; // tan(30 deg) ≈ 1/sqrt(3) → 60° vFOV
+	t.half_tan_vfov = 0.32491969623f; // tan(18 deg) → 36° vFOV
 	return t;
 }
 

@@ -116,7 +116,7 @@ static volatile bool g_running = true;
 static NSWindow *g_window = nil;
 static NSView *g_metalView = nil;
 static InputState g_input;
-static const float CAMERA_HALF_TAN_VFOV = 0.57735026919f; // tan(30°) → 60° vFOV
+static const float CAMERA_HALF_TAN_VFOV = 0.32491969623f; // tan(18°) → 36° vFOV
 
 // dlsym handle for sim_display live mode switching (Bug 4 fix)
 typedef void (*PFN_sim_display_set_output_mode)(int mode);

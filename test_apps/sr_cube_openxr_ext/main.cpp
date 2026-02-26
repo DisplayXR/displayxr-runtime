@@ -47,7 +47,7 @@ static UINT g_windowHeight = 720;
 static bool g_inSizeMove = false;  // True while user is dragging/resizing the window
 static const uint32_t HUD_PIXEL_WIDTH = 380;
 static const uint32_t HUD_PIXEL_HEIGHT = 470;
-static const float CAMERA_HALF_TAN_VFOV = 0.57735026919f; // tan(30°) → 60° vFOV
+static const float CAMERA_HALF_TAN_VFOV = 0.32491969623f; // tan(18°) → 36° vFOV
 static const float HUD_WIDTH_FRACTION = 0.30f;
 
 // sim_display output mode switching (loaded at runtime via GetProcAddress)

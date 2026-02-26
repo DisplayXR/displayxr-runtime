@@ -83,7 +83,7 @@ camera3d_compute_stereo_views(const XrVector3f *raw_left,
                               Camera3DStereoView *out_right);
 
 /*!
- * Default camera tunables: ipd=1, parallax=1, invd=1, half_tan=tan(30deg) (~60deg vFOV).
+ * Default camera tunables: ipd=1, parallax=1, invd=1, half_tan=tan(18deg) (~36deg vFOV).
  */
 Camera3DTunables
 camera3d_default_tunables(void);
