@@ -44,6 +44,7 @@ typedef struct Display3DStereoView {
 	XrFovf fov;                  //!< Equivalent asymmetric FOV angles (radians)
 	XrVector3f eye_display;      //!< Modified eye position in display space (after all factors)
 	XrVector3f eye_world;        //!< Eye position in world space (after display pose transform)
+	XrQuaternionf orientation;   //!< Display/camera orientation (same for both eyes)
 } Display3DStereoView;
 
 // --- Functions ---

@@ -193,6 +193,7 @@ camera3d_compute_stereo_views(const XrVector3f *raw_left,
 
 		// Step 4: Build view matrix from world-space eye + camera orientation
 		cam3d_build_view_matrix(outputs[i]->view_matrix, cam_ori, eye_world);
+		outputs[i]->orientation = cam_ori;
 
 		// Step 5: Scale eye_local by inv_convergence_distance for projection shifts
 		float dx = eye_local.x * invd;

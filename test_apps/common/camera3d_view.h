@@ -42,6 +42,7 @@ typedef struct Camera3DStereoView {
 	float projection_matrix[16]; //!< Column-major 4x4 asymmetric frustum (per-eye)
 	XrFovf fov;                  //!< Asymmetric FOV angles in radians (per-eye)
 	XrVector3f eye_world;        //!< Eye position in world space
+	XrQuaternionf orientation;   //!< Camera orientation (same for both eyes)
 } Camera3DStereoView;
 
 // --- Functions ---

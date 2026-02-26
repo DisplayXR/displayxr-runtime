@@ -271,6 +271,7 @@ display3d_compute_stereo_views(const XrVector3f *raw_left,
 
 		// Step 6: Build view matrix from world-space eye + display orientation
 		build_view_matrix(outputs[i]->view_matrix, disp_ori, eye_world);
+		outputs[i]->orientation = disp_ori;
 
 		// Step 7: Build Kooima projection from display-space scaled eye + scaled screen
 		display3d_compute_projection(eye_scaled, kScreenW, kScreenH,
