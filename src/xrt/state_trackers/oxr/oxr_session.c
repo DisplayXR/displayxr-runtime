@@ -56,11 +56,7 @@
 // Vendor-neutral display metric types (eye positions, window metrics, Kooima FOV)
 #include "xrt/xrt_display_metrics.h"
 
-// SR eye tracking support (Leia-specific, requires SR SDK)
-#if defined(XRT_HAVE_LEIA_SR_VULKAN) || defined(XRT_HAVE_LEIA_SR_D3D11)
-#define XRT_HAVE_LEIA_SR_EYE_TRACKING
-#include "leia/leia_types.h"
-#endif
+// Eye tracking backends (vendor-specific headers gated by their own ifdefs)
 
 #include "sim_display_interface.h"
 
@@ -120,41 +116,26 @@ to_string(XrSessionState state)
 	}
 }
 
-#ifdef XRT_HAVE_LEIA_SR_EYE_TRACKING
 /*!
- * Get predicted eye positions from the session's per-session weaver.
- * Uses the weaver's LookaroundFilter which adapts to application-specific latency.
- * Returns false if eye positions are not available.
+ * Get predicted eye positions from the session's compositor.
+ * Returns false if eye tracking is not available.
  */
 static bool
-oxr_session_get_predicted_eye_positions(struct oxr_session *sess, struct leiasr_eye_pair *out_eye_pair)
+oxr_session_get_predicted_eye_positions(struct oxr_session *sess, struct xrt_eye_pair *out_eye_pair)
 {
 	if (sess == NULL || sess->xcn == NULL || out_eye_pair == NULL) {
 		return false;
 	}
 
 #if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_NATIVE_COMPOSITOR)
-	// Check if using D3D11 native compositor (not multi_compositor)
+	// D3D11 native compositor path
 	if (sess->is_d3d11_native_compositor) {
 		struct xrt_vec3 left_eye, right_eye;
 		bool got_positions = comp_d3d11_compositor_get_predicted_eye_positions(&sess->xcn->base, &left_eye, &right_eye);
 
-		// Log periodically for debugging (every ~60 frames)
-		static int log_counter = 0;
-		if (++log_counter >= 60) {
-			log_counter = 0;
-			U_LOG_D("D3D11 eye tracking: got_positions=%d, left=(%.3f, %.3f, %.3f), right=(%.3f, %.3f, %.3f)",
-			        got_positions, left_eye.x, left_eye.y, left_eye.z,
-			        right_eye.x, right_eye.y, right_eye.z);
-		}
-
 		if (got_positions) {
-			out_eye_pair->left.x = left_eye.x;
-			out_eye_pair->left.y = left_eye.y;
-			out_eye_pair->left.z = left_eye.z;
-			out_eye_pair->right.x = right_eye.x;
-			out_eye_pair->right.y = right_eye.y;
-			out_eye_pair->right.z = right_eye.z;
+			out_eye_pair->left = (struct xrt_eye_position){left_eye.x, left_eye.y, left_eye.z};
+			out_eye_pair->right = (struct xrt_eye_position){right_eye.x, right_eye.y, right_eye.z};
 			out_eye_pair->timestamp_ns = os_monotonic_get_ns();
 			out_eye_pair->valid = true;
 			return true;
@@ -164,14 +145,13 @@ oxr_session_get_predicted_eye_positions(struct oxr_session *sess, struct leiasr_
 #endif
 
 #ifdef XRT_HAVE_LEIA_SR_VULKAN
-	// The session's xcn is a multi_compositor in the multi-client architecture
+	// Multi-compositor path (Vulkan)
 	struct multi_compositor *mc = multi_compositor(&sess->xcn->base);
-	return multi_compositor_get_predicted_eye_positions(mc, out_eye_pair);
+	return multi_compositor_get_predicted_eye_positions(mc, (struct leiasr_eye_pair *)out_eye_pair);
 #else
 	return false;
 #endif
 }
-#endif // XRT_HAVE_LEIA_SR_EYE_TRACKING
 
 /*!
  * Get display dimensions for Kooima asymmetric FOV calculation.
@@ -981,38 +961,40 @@ oxr_session_locate_views(struct oxr_logger *log,
 
 	// Eye pair and tracking state (vendor-neutral types)
 	struct xrt_eye_pair eye_pair = {0};
-	bool have_sr_eye_tracking = false;
 	bool have_kooima_fov = false;
 
 	// Throttled logging for display/Kooima diagnostics
-	static int sr_log_counter = 0;
-	bool sr_should_log = (++sr_log_counter % 120) == 1; // Log every ~2 seconds at 60fps
+	static int log_counter = 0;
+	bool should_log = (++log_counter % 120) == 1; // Log every ~2 seconds at 60fps
 
 	// World head pose - declared here so it's accessible in the view loop later
 	struct xrt_vec3 world_head_pos = {0.0f, 1.6f, 0.0f};  // Default: standing height
 	struct xrt_quat world_head_ori = XRT_QUAT_IDENTITY;
 
-	// Camera-centric stereo state from qwerty device
-	bool have_camera_mode = false;
-	struct xrt_vec3 camera_eye_world[2] = {{0}};
+	// Stereo view override: when set, view poses use these world-space eye positions
+	bool have_stereo_eye_override = false;
+	struct xrt_vec3 stereo_eye_world[2] = {{0}};
 #ifdef XRT_BUILD_DRIVER_QWERTY
 	struct qwerty_stereo_state stereo_state = {0};
 	bool have_stereo_state = qwerty_get_stereo_state(
 	    sess->sys->xsysd->xdevs, sess->sys->xsysd->xdev_count, &stereo_state);
+	if (should_log) {
+		U_LOG_W("STEREO STATE: have=%d cam=%d ipd=%.2f par=%.2f zoom=%.2f conv=%.2f htan=%.4f",
+		        have_stereo_state, stereo_state.camera_mode,
+		        stereo_state.ipd_factor, stereo_state.parallax_factor,
+		        stereo_state.zoom_or_scale, stereo_state.convergence_or_perspective,
+		        stereo_state.half_tan_vfov);
+	}
 #else
 	struct { bool camera_mode; float ipd_factor, parallax_factor, zoom_or_scale,
 	         convergence_or_perspective, half_tan_vfov; } stereo_state = {0};
 	bool have_stereo_state = false;
 #endif
 
-	// Query SR eye tracking (requires SR SDK)
-#ifdef XRT_HAVE_LEIA_SR_EYE_TRACKING
-	bool got_eye_positions = oxr_session_get_predicted_eye_positions(sess, (struct leiasr_eye_pair *)&eye_pair);
-#else
-	bool got_eye_positions = false;
-#endif
+	// Query eye tracking (vendor-neutral — returns false if no backend available)
+	bool got_eye_positions = oxr_session_get_predicted_eye_positions(sess, &eye_pair);
 
-	if (sr_should_log) {
+	if (should_log) {
 		U_LOG_I("Eye tracking: got_positions=%d, valid=%d, is_d3d11=%d",
 		        got_eye_positions, eye_pair.valid, sess->is_d3d11_native_compositor);
 		if (got_eye_positions) {
@@ -1022,64 +1004,31 @@ oxr_session_locate_views(struct oxr_logger *log,
 		}
 	}
 
-	// SR eye midpoint - used for Kooima FOV calculation
-	struct xrt_vec3 sr_eye_midpoint = {0};
+	// Get device pose for stereo world-space computation (qwerty = virtual display)
+	if (!sess->has_external_window) {
+		struct xrt_space_relation display_relation = XRT_SPACE_RELATION_ZERO;
+		xrt_device_get_tracked_pose(xdev, XRT_INPUT_GENERIC_HEAD_POSE, xdisplay_time, &display_relation);
+		world_head_pos = display_relation.pose.position;
+		world_head_ori = display_relation.pose.orientation;
 
-	if (got_eye_positions && eye_pair.valid) {
-		have_sr_eye_tracking = true;
-
-		// Compute midpoint (only needed for Kooima FOV calculation below)
-		sr_eye_midpoint.x = (eye_pair.left.x + eye_pair.right.x) / 2.0f;
-		sr_eye_midpoint.y = (eye_pair.left.y + eye_pair.right.y) / 2.0f;
-		sr_eye_midpoint.z = (eye_pair.left.z + eye_pair.right.z) / 2.0f;
-
-		// DISPLAY-CENTRIC MODEL (Monado window mode):
-		// - qwerty_device = virtual display pose (starts at 0, 1.6, 0)
-		// - SR eye positions are in display-local coords (e.g., 0.03, 0, 0.6)
-		// - View pose = display_pos + rotate(sr_eye, display_ori)
-		//
-		// For session_target mode: SR eye positions used directly (no transform)
-
-		if (!sess->has_external_window) {
-			// Get display pose from qwerty_device
-			struct xrt_space_relation display_relation = XRT_SPACE_RELATION_ZERO;
-			xrt_device_get_tracked_pose(xdev, XRT_INPUT_GENERIC_HEAD_POSE, xdisplay_time, &display_relation);
-
-			struct xrt_vec3 display_pos = display_relation.pose.position;
-			struct xrt_quat display_ori = display_relation.pose.orientation;
-
-			// Store for use in view loop below
-			world_head_pos = display_pos;
-			world_head_ori = display_ori;
-
-			if (sr_should_log) {
-				U_LOG_I("Display pose: pos=(%.3f,%.3f,%.3f) ori=(%.3f,%.3f,%.3f,%.3f)",
-				        display_pos.x, display_pos.y, display_pos.z,
-				        display_ori.x, display_ori.y, display_ori.z, display_ori.w);
-			}
+		if (should_log) {
+			U_LOG_I("Display pose: pos=(%.3f,%.3f,%.3f) ori=(%.3f,%.3f,%.3f,%.3f)",
+			        world_head_pos.x, world_head_pos.y, world_head_pos.z,
+			        world_head_ori.x, world_head_ori.y, world_head_ori.z, world_head_ori.w);
 		}
-		// For session_target: world_head_pos/ori stay at defaults (not used)
-
-		// Set head relation (used by some internal calculations)
-		T_xdev_head.pose.position = world_head_pos;
-		T_xdev_head.pose.orientation = world_head_ori;
-		T_xdev_head.relation_flags = XRT_SPACE_RELATION_POSITION_VALID_BIT |
-		                             XRT_SPACE_RELATION_ORIENTATION_VALID_BIT |
-		                             XRT_SPACE_RELATION_POSITION_TRACKED_BIT |
-		                             XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT;
-
-		// poses[] not used for SR path - we set views directly in the loop below
 	}
 
+	bool have_eyes = got_eye_positions && eye_pair.valid;
+
 	// Kooima FOV computation (vendor-neutral)
-	// Works with either SR tracked eye positions or nominal viewer position
+	// Works with either tracked eye positions or nominal viewer position
 	{
 		struct xrt_eye_position adj_left = {0};
 		struct xrt_eye_position adj_right = {0};
 		bool have_eye_positions = false;
 
-		if (have_sr_eye_tracking) {
-			// SR tracked eyes
+		if (have_eyes) {
+			// Tracked eyes (from eye tracking SDK)
 			adj_left = eye_pair.left;
 			adj_right = eye_pair.right;
 			have_eye_positions = true;
@@ -1093,7 +1042,7 @@ oxr_session_locate_views(struct oxr_logger *log,
 				adj_right = (struct xrt_eye_position){
 				    ipd_m / 2.0f, sinfo->nominal_viewer_y_m, sinfo->nominal_viewer_z_m};
 				have_eye_positions = true;
-				if (sr_should_log) {
+				if (should_log) {
 					U_LOG_I("Nominal eyes: L=(%.4f,%.4f,%.4f) R=(%.4f,%.4f,%.4f), IPD=%.1fmm",
 					        adj_left.x, adj_left.y, adj_left.z,
 					        adj_right.x, adj_right.y, adj_right.z,
@@ -1118,7 +1067,7 @@ oxr_session_locate_views(struct oxr_logger *log,
 				screen_width_m  = wm.window_width_m * vs;
 				screen_height_m = wm.window_height_m * vs;
 
-				if (sr_should_log) {
+				if (should_log) {
 					U_LOG_I("Window-adaptive FOV: vs=%.3f, screen=%.4fx%.4fm, "
 					        "eye_offset=(%.4f,%.4f)m",
 					        vs, screen_width_m, screen_height_m,
@@ -1129,7 +1078,14 @@ oxr_session_locate_views(struct oxr_logger *log,
 				// Fallback: full display dimensions (fullscreen or no window metrics)
 			}
 
-			if (screen_width_m > 0.0f && screen_height_m > 0.0f) {
+			if (should_log) {
+					U_LOG_W("KOOIMA GATE: have_eyes=%d screen=%.4fx%.4f have_stereo=%d cam=%d ext_win=%d",
+					        have_eye_positions, screen_width_m, screen_height_m,
+					        have_stereo_state, stereo_state.camera_mode,
+					        sess->has_external_window);
+				}
+
+				if (screen_width_m > 0.0f && screen_height_m > 0.0f) {
 				// Camera-centric path: use m_stereo3d_camera_compute
 				if (have_stereo_state && stereo_state.camera_mode &&
 				    !sess->has_external_window) {
@@ -1146,17 +1102,17 @@ oxr_session_locate_views(struct oxr_logger *log,
 
 					m_stereo3d_camera_compute(
 					    &raw_left, &raw_right, NULL, &scr, &tunables,
-					    &camera_pose, fovs, camera_eye_world);
+					    &camera_pose, fovs, stereo_eye_world);
 					have_kooima_fov = true;
-					have_camera_mode = true;
+					have_stereo_eye_override = true;
 
-					if (sr_should_log) {
+					if (should_log) {
 						float h_fov = (fovs[0].angle_right - fovs[0].angle_left) * 180.0f / 3.14159265f;
 						float v_fov = (fovs[0].angle_up - fovs[0].angle_down) * 180.0f / 3.14159265f;
 						U_LOG_I("Camera FOV: H=%.2f° V=%.2f° eye0=(%.3f,%.3f,%.3f)",
 						        h_fov, v_fov,
-						        camera_eye_world[0].x, camera_eye_world[0].y,
-						        camera_eye_world[0].z);
+						        stereo_eye_world[0].x, stereo_eye_world[0].y,
+						        stereo_eye_world[0].z);
 					}
 				} else {
 					// Display-centric path: apply eye factors then Kooima
@@ -1171,17 +1127,29 @@ oxr_session_locate_views(struct oxr_logger *log,
 						                            &out_l, &out_r);
 						adj_left = (struct xrt_eye_position){out_l.x, out_l.y, out_l.z};
 						adj_right = (struct xrt_eye_position){out_r.x, out_r.y, out_r.z};
+
+						// Transform display-space eyes to world-space for view pose override
+						// (must match the FOV so app projection + view are consistent)
+						struct xrt_vec3 disp_eyes[2] = {out_l, out_r};
+						for (int ei = 0; ei < 2; ei++) {
+							struct xrt_vec3 rotated;
+							math_quat_rotate_vec3(&world_head_ori, &disp_eyes[ei], &rotated);
+							stereo_eye_world[ei].x = world_head_pos.x + rotated.x;
+							stereo_eye_world[ei].y = world_head_pos.y + rotated.y;
+							stereo_eye_world[ei].z = world_head_pos.z + rotated.z;
+						}
+						have_stereo_eye_override = true;
 					}
 
 					compute_kooima_fov(&adj_left, screen_width_m, screen_height_m,
-					                   "Left", sr_should_log, &fovs[0]);
+					                   "Left", should_log, &fovs[0]);
 					compute_kooima_fov(&adj_right, screen_width_m, screen_height_m,
-					                   "Right", sr_should_log, &fovs[1]);
+					                   "Right", should_log, &fovs[1]);
 					have_kooima_fov = true;
 				}
 
 				// Compare FOVs between eyes (throttled logging)
-				if (sr_should_log) {
+				if (should_log) {
 					float left_h_fov = (fovs[0].angle_right - fovs[0].angle_left) * 180.0f / 3.14159265f;
 					float right_h_fov = (fovs[1].angle_right - fovs[1].angle_left) * 180.0f / 3.14159265f;
 					float left_v_fov = (fovs[0].angle_up - fovs[0].angle_down) * 180.0f / 3.14159265f;
@@ -1189,24 +1157,17 @@ oxr_session_locate_views(struct oxr_logger *log,
 					U_LOG_I("FOV: Left H=%.2f° V=%.2f°, Right H=%.2f° V=%.2f°",
 					        left_h_fov, left_v_fov, right_h_fov, right_v_fov);
 				}
-			} else if (have_sr_eye_tracking) {
-				// SR eye tracking active but no display dims — fallback to device FOV
+			} else if (have_eyes) {
+				// Eye tracking active but no display dims — fallback to device FOV
 				fovs[0] = xdev->hmd->distortion.fov[0];
 				fovs[1] = xdev->hmd->distortion.fov[1];
 			}
 		}
 	}
 
-	if (!have_sr_eye_tracking) {
-		if (sr_should_log) {
-			U_LOG_I("SR eye tracking NOT available - using simulated device path");
-		}
-	}
-
-	if (!have_sr_eye_tracking)
+	// Always get view poses from device (provides T_xdev_head and poses[])
+	// Save Kooima fovs before xrt_device_get_view_poses overwrites them
 	{
-		// Normal path: get view poses from device (for non-SR or when SR eye tracking unavailable)
-		// Save Kooima fovs before xrt_device_get_view_poses overwrites them
 		struct xrt_fov kooima_fovs[2];
 		if (have_kooima_fov) {
 			kooima_fovs[0] = fovs[0];
@@ -1227,6 +1188,16 @@ oxr_session_locate_views(struct oxr_logger *log,
 		if (have_kooima_fov) {
 			fovs[0] = kooima_fovs[0];
 			fovs[1] = kooima_fovs[1];
+		}
+
+		if (should_log) {
+			float h0 = (fovs[0].angle_right - fovs[0].angle_left) * 57.2958f;
+			float v0 = (fovs[0].angle_up - fovs[0].angle_down) * 57.2958f;
+			U_LOG_W("FINAL FOV: kooima=%d override=%d H=%.2f° V=%.2f° "
+			        "L=%.4f R=%.4f U=%.4f D=%.4f",
+			        have_kooima_fov, have_stereo_eye_override, h0, v0,
+			        fovs[0].angle_left, fovs[0].angle_right,
+			        fovs[0].angle_up, fovs[0].angle_down);
 		}
 	}
 
@@ -1285,28 +1256,27 @@ oxr_session_locate_views(struct oxr_logger *log,
 		m_relation_chain_resolve(&xrc, &result);
 		OXR_XRT_POSE_TO_XRPOSEF(result.pose, views[i].pose);
 
-		// For SR eye tracking, bypass the relation chain and set view poses directly.
-		// The eye positions from SR SDK are in display space; we apply the player
-		// transform (from qwerty device) to move the virtual world.
-		// (Runtime check — sim_display never enters this block since have_sr_eye_tracking == false)
-		if (have_sr_eye_tracking && view_count == 2) {
-			if (have_camera_mode && !sess->has_external_window) {
-				// CAMERA MODE: use pre-computed world-space eye positions
-				views[i].pose.position.x = camera_eye_world[i].x;
-				views[i].pose.position.y = camera_eye_world[i].y;
-				views[i].pose.position.z = camera_eye_world[i].z;
+		// Override view poses for stereo controls or eye tracking.
+		// stereo_eye_world[] is set by either camera-centric or display-centric path
+		// to ensure FOV and view position are consistent.
+		if ((have_eyes || have_stereo_eye_override) && view_count == 2) {
+			if (have_stereo_eye_override && !sess->has_external_window) {
+				// STEREO OVERRIDE: use pre-computed world-space eye positions
+				views[i].pose.position.x = stereo_eye_world[i].x;
+				views[i].pose.position.y = stereo_eye_world[i].y;
+				views[i].pose.position.z = stereo_eye_world[i].z;
 				views[i].pose.orientation = (XrQuaternionf){
 				    world_head_ori.x, world_head_ori.y, world_head_ori.z, world_head_ori.w};
-			} else {
-				// Get SR eye position for this view (in display-local coords)
-				struct xrt_vec3 sr_eye = (i == 0)
+			} else if (have_eyes) {
+				// Get tracked eye position for this view (in display-local coords)
+				struct xrt_vec3 tracked_eye = (i == 0)
 				    ? (struct xrt_vec3){eye_pair.left.x, eye_pair.left.y, eye_pair.left.z}
 				    : (struct xrt_vec3){eye_pair.right.x, eye_pair.right.y, eye_pair.right.z};
 
 				if (!sess->has_external_window) {
-					// DISPLAY MODE (Monado window): Transform SR eye to world
+					// DISPLAY MODE (Monado window): Transform tracked eye to world
 					struct xrt_vec3 rotated_eye;
-					math_quat_rotate_vec3(&world_head_ori, &sr_eye, &rotated_eye);
+					math_quat_rotate_vec3(&world_head_ori, &tracked_eye, &rotated_eye);
 
 					views[i].pose.position.x = world_head_pos.x + rotated_eye.x;
 					views[i].pose.position.y = world_head_pos.y + rotated_eye.y;
@@ -1314,19 +1284,19 @@ oxr_session_locate_views(struct oxr_logger *log,
 					views[i].pose.orientation = (XrQuaternionf){
 					    world_head_ori.x, world_head_ori.y, world_head_ori.z, world_head_ori.w};
 				} else {
-					// SESSION TARGET: Use SR eye positions directly
-					views[i].pose.position.x = sr_eye.x;
-					views[i].pose.position.y = sr_eye.y;
-					views[i].pose.position.z = sr_eye.z;
+					// SESSION TARGET: Use tracked eye positions directly
+					views[i].pose.position.x = tracked_eye.x;
+					views[i].pose.position.y = tracked_eye.y;
+					views[i].pose.position.z = tracked_eye.z;
 					views[i].pose.orientation = (XrQuaternionf){0.0f, 0.0f, 0.0f, 1.0f};
 				}
 			}
 
-			if (sr_should_log) {
+			if (should_log) {
 				U_LOG_I("Eye %d: view=(%.3f,%.3f,%.3f) mode=%s",
 				        i, views[i].pose.position.x, views[i].pose.position.y,
 				        views[i].pose.position.z,
-				        have_camera_mode ? "camera" : "display");
+				        have_stereo_eye_override ? "camera" : "display");
 			}
 		}
 
@@ -1341,6 +1311,13 @@ oxr_session_locate_views(struct oxr_logger *log,
 		}
 
 		OXR_XRT_FOV_TO_XRFOVF(fov, views[i].fov);
+
+		if (should_log && i == 0) {
+			U_LOG_W("VIEW[0] FINAL: pos=(%.3f,%.3f,%.3f) fov_L=%.4f fov_R=%.4f fov_U=%.4f fov_D=%.4f",
+			        views[0].pose.position.x, views[0].pose.position.y, views[0].pose.position.z,
+			        views[0].fov.angleLeft, views[0].fov.angleRight,
+			        views[0].fov.angleUp, views[0].fov.angleDown);
+		}
 
 
 		/*
