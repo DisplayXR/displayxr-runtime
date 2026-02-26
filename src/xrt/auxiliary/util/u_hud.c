@@ -35,7 +35,7 @@
 
 #define HUD_UPDATE_INTERVAL_NS (500ULL * 1000ULL * 1000ULL)
 #define HUD_BASE_W 480
-#define HUD_BASE_H 304
+#define HUD_BASE_H 370
 #define HUD_MARGIN 10
 #define HUD_CORNER_RADIUS 8
 #define HUD_BORDER_WIDTH 1
@@ -626,8 +626,35 @@ u_hud_update(struct u_hud *hud, const struct u_hud_data *data)
 	draw_hline(hud, sep_x0, sep_x1, y - hud->font.ascent + 2 * s, COLOR_SEP);
 	y += s * 3;
 
+	// === Stereo controls section ===
+	{
+		const char *mode_str = data->camera_mode ? "Camera" : "Display";
+		snprintf(buf, sizeof(buf), "%s [P]  IPD:%.2f [-/=]  Prlx:%.2f [;/']",
+		         mode_str, data->stereo_ipd_factor, data->stereo_parallax_factor);
+		draw_string_aa(hud, x, y, buf, COLOR_VALUE);
+		y += lh;
+
+		if (data->camera_mode) {
+			float vfov_deg = 2.0f * atanf(data->stereo_half_tan_vfov) * 180.0f / 3.14159265f;
+			snprintf(buf, sizeof(buf), "Zoom:%.2f [/]  Conv:%.2f [,/.]  vFOV:%.1f",
+			         data->stereo_zoom_or_scale,
+			         data->stereo_convergence_or_perspective,
+			         vfov_deg);
+		} else {
+			snprintf(buf, sizeof(buf), "Scale:%.2f [/]  Persp:%.2f [,/.]",
+			         data->stereo_zoom_or_scale,
+			         data->stereo_convergence_or_perspective);
+		}
+		draw_string_aa(hud, x, y, buf, COLOR_VALUE);
+		y += lh;
+	}
+
+	// --- Separator ---
+	draw_hline(hud, sep_x0, sep_x1, y - hud->font.ascent + 2 * s, COLOR_SEP);
+	y += s * 3;
+
 	// === Key hints (dimmed) ===
-	draw_string_aa(hud, x, y, "TAB=HUD  V=2D/3D  ESC=Quit", COLOR_DIM);
+	draw_string_aa(hud, x, y, "TAB=HUD  V=2D/3D  P=Cam/Disp  ESC=Quit", COLOR_DIM);
 
 	hud->dirty = true;
 	return true;

@@ -41,6 +41,8 @@ add_library(
 	m_relation_history.h
 	m_space.cpp
 	m_space.h
+	m_stereo3d.c
+	m_stereo3d.h
 	m_vec2.h
 	m_vec3.h
 	)

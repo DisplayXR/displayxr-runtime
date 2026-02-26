@@ -37,6 +37,7 @@
 #include "math/m_api.h"
 #include "math/m_mathinclude.h"
 #include "math/m_space.h"
+#include "math/m_stereo3d.h"
 
 #include "oxr_objects.h"
 #include "oxr_logger.h"
@@ -62,6 +63,10 @@
 #endif
 
 #include "sim_display_interface.h"
+
+#ifdef XRT_BUILD_DRIVER_QWERTY
+#include "qwerty_interface.h"
+#endif
 
 #include "multi/comp_multi_private.h"
 
@@ -987,6 +992,19 @@ oxr_session_locate_views(struct oxr_logger *log,
 	struct xrt_vec3 world_head_pos = {0.0f, 1.6f, 0.0f};  // Default: standing height
 	struct xrt_quat world_head_ori = XRT_QUAT_IDENTITY;
 
+	// Camera-centric stereo state from qwerty device
+	bool have_camera_mode = false;
+	struct xrt_vec3 camera_eye_world[2] = {{0}};
+#ifdef XRT_BUILD_DRIVER_QWERTY
+	struct qwerty_stereo_state stereo_state = {0};
+	bool have_stereo_state = qwerty_get_stereo_state(
+	    sess->sys->xsysd->xdevs, sess->sys->xsysd->xdev_count, &stereo_state);
+#else
+	struct { bool camera_mode; float ipd_factor, parallax_factor, zoom_or_scale,
+	         convergence_or_perspective, half_tan_vfov; } stereo_state = {0};
+	bool have_stereo_state = false;
+#endif
+
 	// Query SR eye tracking (requires SR SDK)
 #ifdef XRT_HAVE_LEIA_SR_EYE_TRACKING
 	bool got_eye_positions = oxr_session_get_predicted_eye_positions(sess, (struct leiasr_eye_pair *)&eye_pair);
@@ -1100,12 +1118,6 @@ oxr_session_locate_views(struct oxr_logger *log,
 				screen_width_m  = wm.window_width_m * vs;
 				screen_height_m = wm.window_height_m * vs;
 
-				// // Shift eye positions for window center offset
-				// adj_left.x  -= wm.window_center_offset_x_m;
-				// adj_left.y  -= wm.window_center_offset_y_m;
-				// adj_right.x -= wm.window_center_offset_x_m;
-				// adj_right.y -= wm.window_center_offset_y_m;
-
 				if (sr_should_log) {
 					U_LOG_I("Window-adaptive FOV: vs=%.3f, screen=%.4fx%.4fm, "
 					        "eye_offset=(%.4f,%.4f)m",
@@ -1118,11 +1130,55 @@ oxr_session_locate_views(struct oxr_logger *log,
 			}
 
 			if (screen_width_m > 0.0f && screen_height_m > 0.0f) {
-				compute_kooima_fov(&adj_left, screen_width_m, screen_height_m,
-				                   "Left", sr_should_log, &fovs[0]);
-				compute_kooima_fov(&adj_right, screen_width_m, screen_height_m,
-				                   "Right", sr_should_log, &fovs[1]);
-				have_kooima_fov = true;
+				// Camera-centric path: use m_stereo3d_camera_compute
+				if (have_stereo_state && stereo_state.camera_mode &&
+				    !sess->has_external_window) {
+					struct xrt_vec3 raw_left = {adj_left.x, adj_left.y, adj_left.z};
+					struct xrt_vec3 raw_right = {adj_right.x, adj_right.y, adj_right.z};
+					struct m_stereo3d_screen scr = {screen_width_m, screen_height_m};
+					struct m_stereo3d_camera_tunables tunables = {
+					    .ipd_factor = stereo_state.ipd_factor,
+					    .parallax_factor = stereo_state.parallax_factor,
+					    .inv_convergence_distance = 1.0f / stereo_state.convergence_or_perspective,
+					    .half_tan_vfov = stereo_state.half_tan_vfov / stereo_state.zoom_or_scale,
+					};
+					struct xrt_pose camera_pose = {world_head_ori, world_head_pos};
+
+					m_stereo3d_camera_compute(
+					    &raw_left, &raw_right, NULL, &scr, &tunables,
+					    &camera_pose, fovs, camera_eye_world);
+					have_kooima_fov = true;
+					have_camera_mode = true;
+
+					if (sr_should_log) {
+						float h_fov = (fovs[0].angle_right - fovs[0].angle_left) * 180.0f / 3.14159265f;
+						float v_fov = (fovs[0].angle_up - fovs[0].angle_down) * 180.0f / 3.14159265f;
+						U_LOG_I("Camera FOV: H=%.2f° V=%.2f° eye0=(%.3f,%.3f,%.3f)",
+						        h_fov, v_fov,
+						        camera_eye_world[0].x, camera_eye_world[0].y,
+						        camera_eye_world[0].z);
+					}
+				} else {
+					// Display-centric path: apply eye factors then Kooima
+					if (have_stereo_state && !sess->has_external_window) {
+						// Apply IPD/parallax factors from qwerty controls
+						struct xrt_vec3 raw_l = {adj_left.x, adj_left.y, adj_left.z};
+						struct xrt_vec3 raw_r = {adj_right.x, adj_right.y, adj_right.z};
+						struct xrt_vec3 out_l, out_r;
+						m_stereo3d_apply_eye_factors(&raw_l, &raw_r, NULL,
+						                            stereo_state.ipd_factor,
+						                            stereo_state.parallax_factor,
+						                            &out_l, &out_r);
+						adj_left = (struct xrt_eye_position){out_l.x, out_l.y, out_l.z};
+						adj_right = (struct xrt_eye_position){out_r.x, out_r.y, out_r.z};
+					}
+
+					compute_kooima_fov(&adj_left, screen_width_m, screen_height_m,
+					                   "Left", sr_should_log, &fovs[0]);
+					compute_kooima_fov(&adj_right, screen_width_m, screen_height_m,
+					                   "Right", sr_should_log, &fovs[1]);
+					have_kooima_fov = true;
+				}
 
 				// Compare FOVs between eyes (throttled logging)
 				if (sr_should_log) {
@@ -1130,18 +1186,8 @@ oxr_session_locate_views(struct oxr_logger *log,
 					float right_h_fov = (fovs[1].angle_right - fovs[1].angle_left) * 180.0f / 3.14159265f;
 					float left_v_fov = (fovs[0].angle_up - fovs[0].angle_down) * 180.0f / 3.14159265f;
 					float right_v_fov = (fovs[1].angle_up - fovs[1].angle_down) * 180.0f / 3.14159265f;
-					U_LOG_I("Kooima FOV: Left H=%.2f° V=%.2f°, Right H=%.2f° V=%.2f°",
+					U_LOG_I("FOV: Left H=%.2f° V=%.2f°, Right H=%.2f° V=%.2f°",
 					        left_h_fov, left_v_fov, right_h_fov, right_v_fov);
-					U_LOG_I("  Left  FOV: L=%.2f° R=%.2f° U=%.2f° D=%.2f°",
-					        fovs[0].angle_left * 180.0f / 3.14159265f,
-					        fovs[0].angle_right * 180.0f / 3.14159265f,
-					        fovs[0].angle_up * 180.0f / 3.14159265f,
-					        fovs[0].angle_down * 180.0f / 3.14159265f);
-					U_LOG_I("  Right FOV: L=%.2f° R=%.2f° U=%.2f° D=%.2f°",
-					        fovs[1].angle_left * 180.0f / 3.14159265f,
-					        fovs[1].angle_right * 180.0f / 3.14159265f,
-					        fovs[1].angle_up * 180.0f / 3.14159265f,
-					        fovs[1].angle_down * 180.0f / 3.14159265f);
 				}
 			} else if (have_sr_eye_tracking) {
 				// SR eye tracking active but no display dims — fallback to device FOV
@@ -1244,38 +1290,43 @@ oxr_session_locate_views(struct oxr_logger *log,
 		// transform (from qwerty device) to move the virtual world.
 		// (Runtime check — sim_display never enters this block since have_sr_eye_tracking == false)
 		if (have_sr_eye_tracking && view_count == 2) {
-			// Get SR eye position for this view (in display-local coords)
-			struct xrt_vec3 sr_eye = (i == 0)
-			    ? (struct xrt_vec3){eye_pair.left.x, eye_pair.left.y, eye_pair.left.z}
-			    : (struct xrt_vec3){eye_pair.right.x, eye_pair.right.y, eye_pair.right.z};
-
-			if (!sess->has_external_window) {
-				// MONADO WINDOW: Transform SR eye from display-local to world
-				// view_pos = display_pos + rotate(sr_eye, display_ori)
-				// view_ori = display_ori
-				struct xrt_vec3 rotated_eye;
-				math_quat_rotate_vec3(&world_head_ori, &sr_eye, &rotated_eye);
-
-				views[i].pose.position.x = world_head_pos.x + rotated_eye.x;
-				views[i].pose.position.y = world_head_pos.y + rotated_eye.y;
-				views[i].pose.position.z = world_head_pos.z + rotated_eye.z;
+			if (have_camera_mode && !sess->has_external_window) {
+				// CAMERA MODE: use pre-computed world-space eye positions
+				views[i].pose.position.x = camera_eye_world[i].x;
+				views[i].pose.position.y = camera_eye_world[i].y;
+				views[i].pose.position.z = camera_eye_world[i].z;
 				views[i].pose.orientation = (XrQuaternionf){
 				    world_head_ori.x, world_head_ori.y, world_head_ori.z, world_head_ori.w};
-
-				if (sr_should_log) {
-					U_LOG_I("Eye %d: sr_eye=(%.3f,%.3f,%.3f) display=(%.3f,%.3f,%.3f) "
-					        "-> view=(%.3f,%.3f,%.3f)",
-					        i, sr_eye.x, sr_eye.y, sr_eye.z,
-					        world_head_pos.x, world_head_pos.y, world_head_pos.z,
-					        views[i].pose.position.x, views[i].pose.position.y,
-					        views[i].pose.position.z);
-				}
 			} else {
-				// SESSION TARGET: Use SR eye positions directly (app controls scene)
-				views[i].pose.position.x = sr_eye.x;
-				views[i].pose.position.y = sr_eye.y;
-				views[i].pose.position.z = sr_eye.z;
-				views[i].pose.orientation = (XrQuaternionf){0.0f, 0.0f, 0.0f, 1.0f};
+				// Get SR eye position for this view (in display-local coords)
+				struct xrt_vec3 sr_eye = (i == 0)
+				    ? (struct xrt_vec3){eye_pair.left.x, eye_pair.left.y, eye_pair.left.z}
+				    : (struct xrt_vec3){eye_pair.right.x, eye_pair.right.y, eye_pair.right.z};
+
+				if (!sess->has_external_window) {
+					// DISPLAY MODE (Monado window): Transform SR eye to world
+					struct xrt_vec3 rotated_eye;
+					math_quat_rotate_vec3(&world_head_ori, &sr_eye, &rotated_eye);
+
+					views[i].pose.position.x = world_head_pos.x + rotated_eye.x;
+					views[i].pose.position.y = world_head_pos.y + rotated_eye.y;
+					views[i].pose.position.z = world_head_pos.z + rotated_eye.z;
+					views[i].pose.orientation = (XrQuaternionf){
+					    world_head_ori.x, world_head_ori.y, world_head_ori.z, world_head_ori.w};
+				} else {
+					// SESSION TARGET: Use SR eye positions directly
+					views[i].pose.position.x = sr_eye.x;
+					views[i].pose.position.y = sr_eye.y;
+					views[i].pose.position.z = sr_eye.z;
+					views[i].pose.orientation = (XrQuaternionf){0.0f, 0.0f, 0.0f, 1.0f};
+				}
+			}
+
+			if (sr_should_log) {
+				U_LOG_I("Eye %d: view=(%.3f,%.3f,%.3f) mode=%s",
+				        i, views[i].pose.position.x, views[i].pose.position.y,
+				        views[i].pose.position.z,
+				        have_camera_mode ? "camera" : "display");
 			}
 		}
 

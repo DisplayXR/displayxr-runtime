@@ -22,15 +22,21 @@
 #include "xrt/xrt_config_have.h"
 
 #include "math/m_api.h"
+#include "math/m_stereo3d.h"
 
 #ifdef XRT_GRAPHICS_SYNC_HANDLE_IS_FD
 #include <unistd.h>
 #endif
 
 #include <math.h>
+#include <string.h>
 
 #if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 #include "d3d11_service/comp_d3d11_service.h"
+#endif
+
+#ifdef XRT_BUILD_DRIVER_QWERTY
+#include "qwerty_interface.h"
 #endif
 
 
@@ -224,55 +230,95 @@ ipc_try_get_sr_view_poses(struct ipc_server *s,
 		}
 	}
 
-	// DISPLAY-CENTRIC MODEL:
-	// - qwerty_device = virtual display pose (starts at 0, 1.6, 0)
-	// - SR eye positions are in display-local coords
-	// - View pose = display_pos + rotate(sr_eye, display_ori)
-	//
-	// For session_target: SR eye positions used directly (no transform)
-
 	bool compositor_owns_window = comp_d3d11_service_owns_window(s->xsysc);
 
 	struct xrt_vec3 display_pos = qwerty_relation.pose.position;
 	struct xrt_quat display_ori = qwerty_relation.pose.orientation;
 
-	// For IPC, we return head_relation and view poses relative to head.
-	// To get view = display + rotate(sr_eye, display_ori), we set:
-	//   head = display pose
-	//   view_pose = rotate(sr_eye, display_ori)  [relative to display origin]
-
-	if (compositor_owns_window) {
-		// Monado window: head = display pose
-		out_head_relation->pose.position = display_pos;
-		out_head_relation->pose.orientation = display_ori;
-	} else {
-		// Session target: head at origin, identity orientation
-		out_head_relation->pose.position = (struct xrt_vec3){0, 0, 0};
-		out_head_relation->pose.orientation = (struct xrt_quat)XRT_QUAT_IDENTITY;
+	// Query qwerty stereo state for camera-centric controls
+#ifdef XRT_BUILD_DRIVER_QWERTY
+	struct qwerty_stereo_state stereo_state = {0};
+	bool have_stereo_state = false;
+	{
+		// Build xrt_device* array from ipc_server idevs
+		struct xrt_device *xdevs[XRT_SYSTEM_MAX_DEVICES] = {0};
+		for (size_t i = 0; i < XRT_SYSTEM_MAX_DEVICES; i++) {
+			xdevs[i] = s->idevs[i].xdev;
+		}
+		have_stereo_state = qwerty_get_stereo_state(xdevs, XRT_SYSTEM_MAX_DEVICES, &stereo_state);
 	}
+#else
+	struct { bool camera_mode; float ipd_factor, parallax_factor, zoom_or_scale,
+	         convergence_or_perspective, half_tan_vfov; } stereo_state = {0};
+	bool have_stereo_state = false;
+#endif
+
 	out_head_relation->relation_flags = XRT_SPACE_RELATION_POSITION_VALID_BIT |
 	                                    XRT_SPACE_RELATION_ORIENTATION_VALID_BIT |
 	                                    XRT_SPACE_RELATION_POSITION_TRACKED_BIT |
 	                                    XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT;
 
-	// Compute view poses (eye positions relative to head)
-	// Since head = display pose, and we want:
-	//   view_world = head_pos + rotate(view_local, head_ori)
-	//   view_world = display_pos + rotate(sr_eye, display_ori)
-	// We set view_local = sr_eye (raw, not pre-rotated)
-	struct xrt_vec3 sr_left = {left_eye.x, left_eye.y, left_eye.z};
-	struct xrt_vec3 sr_right = {right_eye.x, right_eye.y, right_eye.z};
+	if (have_stereo_state && stereo_state.camera_mode && compositor_owns_window) {
+		// CAMERA-CENTRIC PATH
+		struct m_stereo3d_screen scr = {screen_width_m, screen_height_m};
+		struct m_stereo3d_camera_tunables tunables = {
+		    .ipd_factor = stereo_state.ipd_factor,
+		    .parallax_factor = stereo_state.parallax_factor,
+		    .inv_convergence_distance = 1.0f / stereo_state.convergence_or_perspective,
+		    .half_tan_vfov = stereo_state.half_tan_vfov / stereo_state.zoom_or_scale,
+		};
+		struct xrt_pose camera_pose = {display_ori, display_pos};
+		struct xrt_vec3 camera_eye_world[2];
 
-	// View poses are in head-local space (not pre-rotated)
-	// The head orientation will rotate them when combined
-	out_poses[0].position = sr_left;
-	out_poses[1].position = sr_right;
-	out_poses[0].orientation = (struct xrt_quat)XRT_QUAT_IDENTITY;
-	out_poses[1].orientation = (struct xrt_quat)XRT_QUAT_IDENTITY;
+		m_stereo3d_camera_compute(&left_eye, &right_eye, NULL, &scr, &tunables,
+		                          &camera_pose, out_fovs, camera_eye_world);
 
-	// Compute Kooima FOV
-	ipc_compute_kooima_fov(&left_eye, screen_width_m, screen_height_m, &out_fovs[0]);
-	ipc_compute_kooima_fov(&right_eye, screen_width_m, screen_height_m, &out_fovs[1]);
+		// Head = camera pose
+		out_head_relation->pose.position = display_pos;
+		out_head_relation->pose.orientation = display_ori;
+
+		// View poses relative to head: inverse-rotate (eye_world - camera_pos)
+		// Since head_world = camera_pos + rotate(view_local, camera_ori),
+		// view_local = inverse_rotate(eye_world - camera_pos, camera_ori)
+		struct xrt_quat inv_ori;
+		math_quat_invert(&display_ori, &inv_ori);
+		for (int i = 0; i < 2; i++) {
+			struct xrt_vec3 diff = {
+			    camera_eye_world[i].x - display_pos.x,
+			    camera_eye_world[i].y - display_pos.y,
+			    camera_eye_world[i].z - display_pos.z,
+			};
+			math_quat_rotate_vec3(&inv_ori, &diff, &out_poses[i].position);
+			out_poses[i].orientation = (struct xrt_quat)XRT_QUAT_IDENTITY;
+		}
+	} else {
+		// DISPLAY-CENTRIC PATH
+		if (compositor_owns_window) {
+			out_head_relation->pose.position = display_pos;
+			out_head_relation->pose.orientation = display_ori;
+		} else {
+			out_head_relation->pose.position = (struct xrt_vec3){0, 0, 0};
+			out_head_relation->pose.orientation = (struct xrt_quat)XRT_QUAT_IDENTITY;
+		}
+
+		// Apply eye factors if stereo state available
+		struct xrt_vec3 adj_left = left_eye;
+		struct xrt_vec3 adj_right = right_eye;
+		if (have_stereo_state && compositor_owns_window) {
+			m_stereo3d_apply_eye_factors(&left_eye, &right_eye, NULL,
+			                            stereo_state.ipd_factor,
+			                            stereo_state.parallax_factor,
+			                            &adj_left, &adj_right);
+		}
+
+		out_poses[0].position = adj_left;
+		out_poses[1].position = adj_right;
+		out_poses[0].orientation = (struct xrt_quat)XRT_QUAT_IDENTITY;
+		out_poses[1].orientation = (struct xrt_quat)XRT_QUAT_IDENTITY;
+
+		ipc_compute_kooima_fov(&adj_left, screen_width_m, screen_height_m, &out_fovs[0]);
+		ipc_compute_kooima_fov(&adj_right, screen_width_m, screen_height_m, &out_fovs[1]);
+	}
 
 	// Log periodically
 	static int log_counter = 0;
@@ -280,9 +326,9 @@ ipc_try_get_sr_view_poses(struct ipc_server *s,
 		log_counter = 0;
 		float left_h = (out_fovs[0].angle_right - out_fovs[0].angle_left) * 180.0f / 3.14159265f;
 		float left_v = (out_fovs[0].angle_up - out_fovs[0].angle_down) * 180.0f / 3.14159265f;
-		IPC_WARN(s, "IPC SR: display=(%.2f,%.2f,%.2f) SR eye L=(%.3f,%.3f,%.3f) FOV H=%.1f° V=%.1f°",
+		IPC_WARN(s, "IPC SR: mode=%s display=(%.2f,%.2f,%.2f) FOV H=%.1f° V=%.1f°",
+		         (have_stereo_state && stereo_state.camera_mode) ? "camera" : "display",
 		         display_pos.x, display_pos.y, display_pos.z,
-		         left_eye.x, left_eye.y, left_eye.z,
 		         left_h, left_v);
 	}
 

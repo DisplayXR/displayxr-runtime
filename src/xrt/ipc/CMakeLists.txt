@@ -130,6 +130,12 @@ if(XRT_HAVE_LEIA_SR AND WIN32)
 	target_compile_definitions(ipc_server PRIVATE XRT_HAVE_D3D11_SERVICE_COMPOSITOR XRT_HAVE_LEIA_SR_D3D11)
 endif()
 
+# Qwerty driver stereo state access for camera-centric controls
+if(XRT_BUILD_DRIVER_QWERTY)
+	target_include_directories(ipc_server PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../drivers/qwerty)
+	target_link_libraries(ipc_server PRIVATE drv_qwerty)
+endif()
+
 if(XRT_HAVE_SYSTEMD)
 	target_include_directories(ipc_server PRIVATE ${SYSTEMD_INCLUDE_DIRS})
 	target_link_libraries(ipc_server PRIVATE ${SYSTEMD_LIBRARIES})

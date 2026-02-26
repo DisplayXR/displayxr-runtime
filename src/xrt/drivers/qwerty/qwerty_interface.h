@@ -21,6 +21,20 @@ extern "C" {
 
 
 struct xrt_pose;
+
+/*!
+ * Snapshot of qwerty stereo tuning state (camera-centric controls).
+ * @ingroup drv_qwerty
+ */
+struct qwerty_stereo_state
+{
+	bool camera_mode;                //!< true=camera, false=display
+	float ipd_factor;                //!< [0,1]
+	float parallax_factor;           //!< [0,1]
+	float zoom_or_scale;             //!< [0.1,10]
+	float convergence_or_perspective; //!< [0.1,10]
+	float half_tan_vfov;             //!< tan(vFOV/2)
+};
 typedef union SDL_Event SDL_Event;
 
 /*!
@@ -141,6 +155,23 @@ qwerty_get_hmd_pose(struct xrt_device **xdevs, size_t xdev_count, struct xrt_pos
  */
 bool
 qwerty_check_display_mode_toggle(struct xrt_device **xdevs, size_t xdev_count, bool *out_force_2d);
+
+/*!
+ * Get the current qwerty stereo tuning state.
+ *
+ * Scans @p xdevs for a qwerty_system and copies its stereo state.
+ *
+ * @param xdevs     Array of devices to search for qwerty devices.
+ * @param xdev_count Number of devices in the array.
+ * @param[out] out  Receives the current stereo state.
+ * @return true if a qwerty system was found and out was set.
+ *
+ * @ingroup drv_qwerty
+ */
+bool
+qwerty_get_stereo_state(struct xrt_device **xdevs,
+                        size_t xdev_count,
+                        struct qwerty_stereo_state *out);
 
 
 #ifdef __cplusplus

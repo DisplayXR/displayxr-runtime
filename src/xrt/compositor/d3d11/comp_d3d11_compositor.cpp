@@ -657,6 +657,20 @@ d3d11_render_hud_overlay(struct comp_d3d11_compositor *c, bool is_mono, bool wea
 	data.right_eye_z = right_eye->z * 1000.0f;
 	data.eye_tracking_active = (left_eye->z != 0.6f || right_eye->z != 0.6f);
 
+#ifdef XRT_BUILD_DRIVER_QWERTY
+	if (c->xsysd != nullptr) {
+		struct qwerty_stereo_state ss;
+		if (qwerty_get_stereo_state(c->xsysd->xdevs, c->xsysd->xdev_count, &ss)) {
+			data.camera_mode = ss.camera_mode;
+			data.stereo_ipd_factor = ss.ipd_factor;
+			data.stereo_parallax_factor = ss.parallax_factor;
+			data.stereo_zoom_or_scale = ss.zoom_or_scale;
+			data.stereo_convergence_or_perspective = ss.convergence_or_perspective;
+			data.stereo_half_tan_vfov = ss.half_tan_vfov;
+		}
+	}
+#endif
+
 	bool dirty = u_hud_update(c->hud, &data);
 
 	// Lazy-create the D3D11 staging texture
