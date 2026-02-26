@@ -774,7 +774,10 @@ multi_compositor_wait_frame(struct xrt_compositor *xc,
 			(void)multi_compositor_push_event(mc, &xse);
 			mc->session_render.window_close_exit_sent = true;
 		}
-		*out_frame_id = 0;
+		// Return frame_id = -1 so do_wait_frame_and_checks() returns
+		// XR_ERROR_RUNTIME_FAILURE, causing xrWaitFrame to fail and the
+		// app to exit its frame loop cleanly.
+		*out_frame_id = -1;
 		*out_predicted_display_time_ns = (int64_t)os_monotonic_get_ns();
 		*out_predicted_display_period_ns = U_TIME_1S_IN_NS / 60;
 		return XRT_SUCCESS;
@@ -793,7 +796,10 @@ multi_compositor_wait_frame(struct xrt_compositor *xc,
 				(void)multi_compositor_push_event(mc, &xse);
 				mc->session_render.window_close_exit_sent = true;
 			}
-			*out_frame_id = 0;
+			// Return frame_id = -1 so do_wait_frame_and_checks()
+			// returns XR_ERROR_RUNTIME_FAILURE, causing xrWaitFrame
+			// to fail and the app to exit its frame loop cleanly.
+			*out_frame_id = -1;
 			*out_predicted_display_time_ns = (int64_t)os_monotonic_get_ns();
 			*out_predicted_display_period_ns = U_TIME_1S_IN_NS / 60;
 			return XRT_SUCCESS;
