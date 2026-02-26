@@ -235,7 +235,7 @@ These modes are specific to the sim_display driver and are **not available** on 
 | HUD units | Millimeters (display, eye pos) | Meters |
 | sim_display switching | Environment variable only | Live hot-reload via `dlsym` + env fallback |
 | Shared code | `common/` library (input, session, HUD, renderer) | Self-contained `main.mm` |
-| Mouse yaw direction | `yaw += dx * 0.005` | `yaw -= dx * 0.005` (NSView Y-up) |
+| Mouse yaw direction | `yaw -= dx * 0.005` | `yaw += dx * 0.005` (NSView Y-up) |
 
 ## Building & Running
 

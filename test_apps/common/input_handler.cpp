@@ -58,8 +58,8 @@ bool UpdateInputState(InputState& state, UINT msg, WPARAM wParam, LPARAM lParam)
         if (state.dragging) {
             int dx = state.mouseX - state.dragStartX;
             int dy = state.mouseY - state.dragStartY;
-            state.yaw += dx * 0.005f;
-            state.pitch += dy * 0.005f;
+            state.yaw -= dx * 0.005f;
+            state.pitch -= dy * 0.005f;
             // Clamp pitch to avoid gimbal lock
             if (state.pitch > 1.4f) state.pitch = 1.4f;
             if (state.pitch < -1.4f) state.pitch = -1.4f;
