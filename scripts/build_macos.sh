@@ -57,7 +57,8 @@ if [ ! -f "$OPENXR_DIR/lib/libopenxr_loader.dylib" ]; then
   cmake -B /tmp/openxr-sdk/build -S /tmp/openxr-sdk -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX="$OPENXR_DIR" \
-    -DBUILD_TESTS=OFF -DBUILD_CONFORMANCE_TESTS=OFF
+    -DBUILD_TESTS=OFF -DBUILD_CONFORMANCE_TESTS=OFF \
+    -DCMAKE_MAP_IMPORTED_CONFIG_RELEASE="Release;None;"
   cmake --build /tmp/openxr-sdk/build
   cmake --install /tmp/openxr-sdk/build
 else
