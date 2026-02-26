@@ -1658,8 +1658,8 @@ static void PumpMacOSEvents() {
                 // Uses event deltas — no persistent drag state that can get
                 // stuck when the window-resize modal loop swallows MouseUp.
                 if (leftDragInContent && ([NSEvent pressedMouseButtons] & 1)) {
-                    g_input.yaw   += (float)[event deltaX] * 0.005f;
-                    g_input.pitch += (float)[event deltaY] * 0.005f;
+                    g_input.yaw   -= (float)[event deltaX] * 0.005f;
+                    g_input.pitch -= (float)[event deltaY] * 0.005f;
                     if (g_input.pitch > 1.4f) g_input.pitch = 1.4f;
                     if (g_input.pitch < -1.4f) g_input.pitch = -1.4f;
                 }
