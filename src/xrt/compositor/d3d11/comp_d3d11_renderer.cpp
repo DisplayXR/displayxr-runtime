@@ -20,6 +20,7 @@
 #include <d3d11_4.h>
 #include <d3dcompiler.h>
 
+#include <algorithm>
 #include <cstring>
 
 /*!
@@ -1312,8 +1313,8 @@ comp_d3d11_renderer_blit_stretch(struct comp_d3d11_renderer *renderer,
 	// UV transform: sample only the mono-rendered portion of the stereo texture
 	uint32_t tex_w = renderer->view_width * 2;
 	uint32_t tex_h = renderer->texture_height;
-	float u_scale = (tex_w > 0) ? fminf((float)target_width / (float)tex_w, 1.0f) : 1.0f;
-	float v_scale = (tex_h > 0) ? fminf((float)target_height / (float)tex_h, 1.0f) : 1.0f;
+	float u_scale = (tex_w > 0) ? (std::min)((float)target_width / (float)tex_w, 1.0f) : 1.0f;
+	float v_scale = (tex_h > 0) ? (std::min)((float)target_height / (float)tex_h, 1.0f) : 1.0f;
 	constants.post_transform[0] = 0.0f;    // x offset
 	constants.post_transform[1] = 0.0f;    // y offset
 	constants.post_transform[2] = u_scale;  // width scale
