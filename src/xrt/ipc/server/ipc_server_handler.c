@@ -248,8 +248,9 @@ ipc_try_get_sr_view_poses(struct ipc_server *s,
 		have_stereo_state = qwerty_get_stereo_state(xdevs, XRT_SYSTEM_MAX_DEVICES, &stereo_state);
 	}
 #else
-	struct { bool camera_mode; float ipd_factor, parallax_factor, zoom_or_scale,
-	         convergence_or_perspective, half_tan_vfov; } stereo_state = {0};
+	struct { bool camera_mode; float cam_ipd_factor, cam_parallax_factor, cam_convergence,
+	         cam_half_tan_vfov, disp_ipd_factor, disp_parallax_factor,
+	         disp_vHeight, nominal_viewer_z, screen_height_m; } stereo_state = {0};
 	bool have_stereo_state = false;
 #endif
 
@@ -262,10 +263,10 @@ ipc_try_get_sr_view_poses(struct ipc_server *s,
 		// CAMERA-CENTRIC PATH
 		struct m_stereo3d_screen scr = {screen_width_m, screen_height_m};
 		struct m_stereo3d_camera_tunables tunables = {
-		    .ipd_factor = stereo_state.ipd_factor,
-		    .parallax_factor = stereo_state.parallax_factor,
-		    .inv_convergence_distance = 1.0f / stereo_state.convergence_or_perspective,
-		    .half_tan_vfov = stereo_state.half_tan_vfov / stereo_state.zoom_or_scale,
+		    .ipd_factor = stereo_state.cam_ipd_factor,
+		    .parallax_factor = stereo_state.cam_parallax_factor,
+		    .inv_convergence_distance = stereo_state.cam_convergence,
+		    .half_tan_vfov = stereo_state.cam_half_tan_vfov,
 		};
 		struct xrt_pose camera_pose = {display_ori, display_pos};
 		struct xrt_vec3 camera_eye_world[2];
@@ -304,11 +305,16 @@ ipc_try_get_sr_view_poses(struct ipc_server *s,
 		// Apply eye factors if stereo state available
 		struct xrt_vec3 adj_left = left_eye;
 		struct xrt_vec3 adj_right = right_eye;
+		float kooima_w = screen_width_m;
+		float kooima_h = screen_height_m;
 		if (have_stereo_state && compositor_owns_window) {
 			m_stereo3d_apply_eye_factors(&left_eye, &right_eye, NULL,
-			                            stereo_state.ipd_factor,
-			                            stereo_state.parallax_factor,
+			                            stereo_state.disp_ipd_factor,
+			                            stereo_state.disp_parallax_factor,
 			                            &adj_left, &adj_right);
+			// perspective_factor = 1.0 in display mode (no scaling)
+			kooima_h = stereo_state.disp_vHeight;
+			kooima_w = screen_width_m * (kooima_h / screen_height_m);
 		}
 
 		out_poses[0].position = adj_left;
@@ -316,8 +322,8 @@ ipc_try_get_sr_view_poses(struct ipc_server *s,
 		out_poses[0].orientation = (struct xrt_quat)XRT_QUAT_IDENTITY;
 		out_poses[1].orientation = (struct xrt_quat)XRT_QUAT_IDENTITY;
 
-		ipc_compute_kooima_fov(&adj_left, screen_width_m, screen_height_m, &out_fovs[0]);
-		ipc_compute_kooima_fov(&adj_right, screen_width_m, screen_height_m, &out_fovs[1]);
+		ipc_compute_kooima_fov(&adj_left, kooima_w, kooima_h, &out_fovs[0]);
+		ipc_compute_kooima_fov(&adj_right, kooima_w, kooima_h, &out_fovs[1]);
 	}
 
 	// Log periodically

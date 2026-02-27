@@ -135,8 +135,8 @@ qwerty_process_win32(struct xrt_device **xdevs,
 {
 	// Cached state (persists across calls)
 	static struct qwerty_system *qsys = NULL;
-	static bool alt_pressed = false;
-	static bool ctrl_pressed = false;
+	static bool ctrl_pressed = false;  // CTRL = left controller focus
+	static bool alt_pressed = false;   // ALT = right controller focus
 	static struct qwerty_device *default_qdev = NULL;
 	static struct qwerty_controller *default_qctrl = NULL;
 	static bool cached = false;
@@ -159,7 +159,7 @@ qwerty_process_win32(struct xrt_device **xdevs,
 		default_qdev = default_qwerty_device(xdevs, xdev_count, qsys);
 		default_qctrl = default_qwerty_controller(xdevs, xdev_count, qsys);
 		cached = true;
-		U_LOG_W("QWERTY Win32 input initialized - WASDQE move, RMB+drag look, LMB trigger, ESC quit");
+		U_LOG_W("QWERTY Win32 input initialized - WASDQE move, RMB+drag look, F/G controller focus");
 	}
 
 	if (qsys == NULL || !qsys->process_keys) {
@@ -177,32 +177,32 @@ qwerty_process_win32(struct xrt_device **xdevs,
 	struct qwerty_hmd *qhmd = using_qhmd ? qsys->hmd : NULL;
 	struct qwerty_device *qd_hmd = using_qhmd ? &qhmd->base : NULL;
 
-	// Check modifier key state
+	// Check key state
 	bool is_keydown = (message == WM_KEYDOWN || message == WM_SYSKEYDOWN);
 	bool is_keyup = (message == WM_KEYUP || message == WM_SYSKEYUP);
 
 	// Handle CTRL/ALT for focus switching
 	if (is_keydown || is_keyup) {
-		bool alt_change = false;
 		bool ctrl_change = false;
+		bool alt_change = false;
 
-		if (wParam == VK_LMENU || wParam == VK_MENU) {
-			bool new_state = is_keydown;
-			if (alt_pressed != new_state) {
-				alt_change = true;
-				alt_pressed = new_state;
-			}
-		}
-		if (wParam == VK_LCONTROL || wParam == VK_CONTROL) {
+		if (wParam == VK_CONTROL) {
 			bool new_state = is_keydown;
 			if (ctrl_pressed != new_state) {
 				ctrl_change = true;
 				ctrl_pressed = new_state;
 			}
 		}
+		if (wParam == VK_MENU) {
+			bool new_state = is_keydown;
+			if (alt_pressed != new_state) {
+				alt_change = true;
+				alt_pressed = new_state;
+			}
+		}
 
 		// Release all on focus change and reset mouse baseline to prevent jump
-		if (alt_change || ctrl_change) {
+		if (ctrl_change || alt_change) {
 			if (using_qhmd) {
 				qwerty_release_all(qd_hmd);
 			}
@@ -213,19 +213,6 @@ qwerty_process_win32(struct xrt_device **xdevs,
 	}
 
 	// Determine focused device
-	// Use GetAsyncKeyState for reliable modifier detection (avoids stuck keys from missed key-up events)
-	bool alt_actual = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
-	bool ctrl_actual = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-
-	// Sync our tracked state with actual state (in case we missed key-up events)
-	if (alt_pressed != alt_actual) {
-		alt_pressed = alt_actual;
-	}
-	if (ctrl_pressed != ctrl_actual) {
-		ctrl_pressed = ctrl_actual;
-	}
-
-	// Build target arrays for dual controller support (CTRL+ALT = both)
 	struct qwerty_device *targets[2];
 	struct qwerty_controller *ctrl_targets[2];
 	int target_count;
@@ -387,39 +374,52 @@ qwerty_process_win32(struct xrt_device **xdevs,
 			}
 			break;
 
-		// Thumbstick
+		// Thumbstick + Trackpad (T/F/G/H = up/left/down/right)
 		case 'F':
 			for (int i = 0; i < target_count; i++) {
-				if (is_keydown)
+				if (is_keydown) {
 					qwerty_press_thumbstick_left(ctrl_targets[i]);
-				else
+					qwerty_press_trackpad_left(ctrl_targets[i]);
+				} else {
 					qwerty_release_thumbstick_left(ctrl_targets[i]);
+					qwerty_release_trackpad_left(ctrl_targets[i]);
+				}
 			}
 			break;
 		case 'H':
 			for (int i = 0; i < target_count; i++) {
-				if (is_keydown)
+				if (is_keydown) {
 					qwerty_press_thumbstick_right(ctrl_targets[i]);
-				else
+					qwerty_press_trackpad_right(ctrl_targets[i]);
+				} else {
 					qwerty_release_thumbstick_right(ctrl_targets[i]);
+					qwerty_release_trackpad_right(ctrl_targets[i]);
+				}
 			}
 			break;
 		case 'T':
 			for (int i = 0; i < target_count; i++) {
-				if (is_keydown)
+				if (is_keydown) {
 					qwerty_press_thumbstick_up(ctrl_targets[i]);
-				else
+					qwerty_press_trackpad_up(ctrl_targets[i]);
+				} else {
 					qwerty_release_thumbstick_up(ctrl_targets[i]);
+					qwerty_release_trackpad_up(ctrl_targets[i]);
+				}
 			}
 			break;
 		case 'G':
 			for (int i = 0; i < target_count; i++) {
-				if (is_keydown)
+				if (is_keydown) {
 					qwerty_press_thumbstick_down(ctrl_targets[i]);
-				else
+					qwerty_press_trackpad_down(ctrl_targets[i]);
+				} else {
 					qwerty_release_thumbstick_down(ctrl_targets[i]);
+					qwerty_release_trackpad_down(ctrl_targets[i]);
+				}
 			}
 			break;
+
 		case 'V':
 			if (qsys->hmd_focused) {
 				// HMD focused: toggle runtime-side 2D/3D display mode
@@ -433,48 +433,6 @@ qwerty_process_win32(struct xrt_device **xdevs,
 					else
 						qwerty_release_thumbstick_click(ctrl_targets[i]);
 				}
-			}
-			break;
-
-		// Trackpad
-		case 'J':
-			for (int i = 0; i < target_count; i++) {
-				if (is_keydown)
-					qwerty_press_trackpad_left(ctrl_targets[i]);
-				else
-					qwerty_release_trackpad_left(ctrl_targets[i]);
-			}
-			break;
-		case 'L':
-			for (int i = 0; i < target_count; i++) {
-				if (is_keydown)
-					qwerty_press_trackpad_right(ctrl_targets[i]);
-				else
-					qwerty_release_trackpad_right(ctrl_targets[i]);
-			}
-			break;
-		case 'I':
-			for (int i = 0; i < target_count; i++) {
-				if (is_keydown)
-					qwerty_press_trackpad_up(ctrl_targets[i]);
-				else
-					qwerty_release_trackpad_up(ctrl_targets[i]);
-			}
-			break;
-		case 'K':
-			for (int i = 0; i < target_count; i++) {
-				if (is_keydown)
-					qwerty_press_trackpad_down(ctrl_targets[i]);
-				else
-					qwerty_release_trackpad_down(ctrl_targets[i]);
-			}
-			break;
-		case 'M':
-			for (int i = 0; i < target_count; i++) {
-				if (is_keydown)
-					qwerty_press_trackpad_click(ctrl_targets[i]);
-				else
-					qwerty_release_trackpad_click(ctrl_targets[i]);
 			}
 			break;
 
@@ -514,42 +472,16 @@ qwerty_process_win32(struct xrt_device **xdevs,
 				u_hud_toggle();
 			break;
 
-		// === Camera-centric stereo controls (HMD focused only) ===
-		case 'P': // Toggle camera/display mode
+		// P = toggle camera/display mode (HMD focused only)
+		case 'P':
 			if (is_keydown && qsys->hmd_focused)
 				qwerty_toggle_camera_mode(qsys);
 			break;
-		case VK_OEM_4: // '[' - Zoom/Scale decrease
+
+		// Spacebar = reset stereo to camera defaults (HMD focused only)
+		case VK_SPACE:
 			if (is_keydown && qsys->hmd_focused)
-				qwerty_adjust_zoom_or_scale(qsys, 1.0f / 1.05f);
-			break;
-		case VK_OEM_6: // ']' - Zoom/Scale increase
-			if (is_keydown && qsys->hmd_focused)
-				qwerty_adjust_zoom_or_scale(qsys, 1.05f);
-			break;
-		case VK_OEM_MINUS: // '-' - IPD factor decrease
-			if (is_keydown && qsys->hmd_focused)
-				qwerty_adjust_ipd_factor(qsys, -0.05f);
-			break;
-		case VK_OEM_PLUS: // '=' - IPD factor increase
-			if (is_keydown && qsys->hmd_focused)
-				qwerty_adjust_ipd_factor(qsys, 0.05f);
-			break;
-		case VK_OEM_1: // ';' - Parallax factor decrease
-			if (is_keydown && qsys->hmd_focused)
-				qwerty_adjust_parallax_factor(qsys, -0.05f);
-			break;
-		case VK_OEM_7: // '\'' - Parallax factor increase
-			if (is_keydown && qsys->hmd_focused)
-				qwerty_adjust_parallax_factor(qsys, 0.05f);
-			break;
-		case VK_OEM_COMMA: // ',' - Convergence/Perspective decrease
-			if (is_keydown && qsys->hmd_focused)
-				qwerty_adjust_convergence_or_perspective(qsys, 1.0f / 1.05f);
-			break;
-		case VK_OEM_PERIOD: // '.' - Convergence/Perspective increase
-			if (is_keydown && qsys->hmd_focused)
-				qwerty_adjust_convergence_or_perspective(qsys, 1.05f);
+				qwerty_reset_stereo(qsys);
 			break;
 
 		// ESC key to close window
@@ -694,8 +626,23 @@ qwerty_process_win32(struct xrt_device **xdevs,
 		short delta = (short)HIWORD(wParam);
 		int steps = delta / WHEEL_DELTA;
 		if (steps != 0) {
-			for (int i = 0; i < target_count; i++)
-				qwerty_change_movement_speed(targets[i], (float)steps);
+			if (qsys->hmd_focused) {
+				// HMD focused: mouse wheel + modifiers for stereo controls
+				bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+				if (shift) {
+					float mult = (steps > 0) ? 1.1f : (1.0f / 1.1f);
+					qwerty_adjust_stereo_factor(qsys, mult);
+				} else if (qsys->camera_mode) {
+					qwerty_adjust_convergence(qsys, (steps > 0) ? 1.0f : -1.0f);
+				} else {
+					float mult = (steps > 0) ? 1.05f : (1.0f / 1.05f);
+					qwerty_adjust_vheight(qsys, mult);
+				}
+			} else {
+				// Controller focused: movement speed
+				for (int i = 0; i < target_count; i++)
+					qwerty_change_movement_speed(targets[i], (float)steps);
+			}
 		}
 		if (out_handled != NULL) {
 			*out_handled = true;

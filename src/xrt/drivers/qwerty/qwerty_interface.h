@@ -23,17 +23,30 @@ extern "C" {
 struct xrt_pose;
 
 /*!
- * Snapshot of qwerty stereo tuning state (camera-centric controls).
+ * Snapshot of qwerty stereo tuning state.
+ * Each mode (camera/display) has its own independent variable set.
+ * Camera mode: ipd_factor, parallax_factor, convergence, half_tan_vfov.
+ * Display mode: ipd_factor, parallax_factor, vHeight (perspective always 1.0).
  * @ingroup drv_qwerty
  */
 struct qwerty_stereo_state
 {
-	bool camera_mode;                //!< true=camera, false=display
-	float ipd_factor;                //!< [0,1]
-	float parallax_factor;           //!< [0,1]
-	float zoom_or_scale;             //!< [0.1,10]
-	float convergence_or_perspective; //!< [0.1,10]
-	float half_tan_vfov;             //!< tan(vFOV/2)
+	bool camera_mode; //!< true=camera (default), false=display
+
+	// Camera-centric variables
+	float cam_ipd_factor;      //!< [0.01,1] default 1.0 (= cam_parallax always)
+	float cam_parallax_factor; //!< [0.01,1] default 1.0 (= cam_ipd always)
+	float cam_convergence;     //!< [0,2] diopters, default 0.5
+	float cam_half_tan_vfov;   //!< default 0.3249 — derived only, not user-adjustable
+
+	// Display-centric variables
+	float disp_ipd_factor;      //!< [0.01,1] default 1.0 (= disp_parallax always)
+	float disp_parallax_factor; //!< [0.01,1] default 1.0 (= disp_ipd always)
+	float disp_vHeight;         //!< [0.1,10] meters, default 1.3
+
+	// Hardware config
+	float nominal_viewer_z; //!< meters (e.g. 0.6 from sim_display)
+	float screen_height_m;  //!< meters (e.g. 0.194 from sim_display)
 };
 typedef union SDL_Event SDL_Event;
 

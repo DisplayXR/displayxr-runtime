@@ -99,10 +99,17 @@ sim_display_open_system_impl(struct xrt_builder *xb,
 				xsysd->xdevs[xsysd->xdev_count++] = qwerty_head;
 
 				// Qwerty HMD pose = virtual display position in world space.
-				// Start at standing height; sim_display adds the nominal eye offset.
+				// Default is camera-centric mode: viewer at (0, 1.6, 0).
 				struct qwerty_device *qd = qwerty_device(qwerty_head);
 				qd->pose.position = (struct xrt_vec3){0, 1.6f, 0};
 				qd->pose.orientation = (struct xrt_quat){0, 0, 0, 1};
+
+				// Set hardware config from sim_display info.
+				struct sim_display_info info;
+				if (sim_display_get_display_info(head, &info)) {
+					qd->sys->screen_height_m = info.display_height_m;
+					qd->sys->nominal_viewer_z = info.nominal_z_m;
+				}
 
 				// Delegate sim_display pose to qwerty HMD.
 				sim_display_hmd_set_pose_source(head, qwerty_head);
