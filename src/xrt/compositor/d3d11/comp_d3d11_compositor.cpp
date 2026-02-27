@@ -1224,14 +1224,38 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	} else {
 		U_LOG_W("SR D3D11 weaver created successfully");
 
-		// Query SR recommended view dimensions - these must be used for the stereo
-		// texture to match what the weaver expects (same as sr_cube_native app)
+		// Query SR recommended view dimensions and scale them to the window size.
+		// The raw recommended dims are for full-display rendering; for a windowed
+		// app we must scale down proportionally (same ratio as the resize path in
+		// begin_frame) so the stereo texture matches the window from the start.
+		// Without this, the mono/2D fallback blit would sample a huge texture and
+		// the content appears squished in the top-left corner until the first resize.
 		uint32_t sr_width = 0, sr_height = 0;
 		if (leiasr_d3d11_get_recommended_view_dimensions(c->weaver, &sr_width, &sr_height)) {
-			U_LOG_W("Using SR recommended view dimensions: %ux%u per eye (was %ux%u from window)",
+			U_LOG_W("SR recommended view dimensions: %ux%u per eye (was %ux%u from window)",
 			        sr_width, sr_height, view_width, view_height);
-			view_width = sr_width;
-			view_height = sr_height;
+
+			// Scale by window/display pixel ratio (same as resize path)
+			uint32_t disp_px_w = 0, disp_px_h = 0;
+			int32_t disp_left = 0, disp_top = 0;
+			float disp_w_m = 0, disp_h_m = 0;
+			if (leiasr_d3d11_get_display_pixel_info(
+			        c->weaver, &disp_px_w, &disp_px_h,
+			        &disp_left, &disp_top, &disp_w_m, &disp_h_m) &&
+			    disp_px_w > 0 && disp_px_h > 0) {
+				float ratio = fminf(
+				    (float)c->settings.preferred.width / (float)disp_px_w,
+				    (float)c->settings.preferred.height / (float)disp_px_h);
+				if (ratio > 1.0f) {
+					ratio = 1.0f;
+				}
+				view_width = (uint32_t)((float)sr_width * ratio);
+				view_height = (uint32_t)((float)sr_height * ratio);
+				U_LOG_W("Scaled to window ratio %.3f: %ux%u per eye", ratio, view_width, view_height);
+			} else {
+				view_width = sr_width;
+				view_height = sr_height;
+			}
 		} else {
 			U_LOG_W("Could not get SR recommended dimensions, using window-derived: %ux%u",
 			        view_width, view_height);

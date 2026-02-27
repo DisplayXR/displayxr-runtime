@@ -1297,18 +1297,27 @@ comp_d3d11_renderer_blit_stretch(struct comp_d3d11_renderer *renderer,
 	// Bind stereo texture SRV
 	internals->context->PSSetShaderResources(0, 1, &renderer->stereo_srv);
 
-	// Set constant buffer: identity MVP, UV covers the full stereo texture
+	// Set constant buffer: identity MVP, UV covers the mono-rendered region.
+	// In mono mode, the rendered content occupies the top-left
+	// min(target_w, 2*view_w) x min(target_h, texture_h) of the stereo texture.
+	// If the stereo texture is larger than the mono viewport (e.g. SR recommended
+	// dims exceed window size at initial creation), we must restrict the UV range
+	// to avoid sampling unrendered texels — otherwise the content appears squished.
 	LayerConstants constants = {};
 	// Identity MVP (fullscreen quad in NDC)
 	constants.mvp[0] = 1.0f;
 	constants.mvp[5] = 1.0f;
 	constants.mvp[10] = 1.0f;
 	constants.mvp[15] = 1.0f;
-	// UV transform: sample the entire stereo texture
-	constants.post_transform[0] = 0.0f; // x offset
-	constants.post_transform[1] = 0.0f; // y offset
-	constants.post_transform[2] = 1.0f; // width scale
-	constants.post_transform[3] = 1.0f; // height scale
+	// UV transform: sample only the mono-rendered portion of the stereo texture
+	uint32_t tex_w = renderer->view_width * 2;
+	uint32_t tex_h = renderer->texture_height;
+	float u_scale = (tex_w > 0) ? fminf((float)target_width / (float)tex_w, 1.0f) : 1.0f;
+	float v_scale = (tex_h > 0) ? fminf((float)target_height / (float)tex_h, 1.0f) : 1.0f;
+	constants.post_transform[0] = 0.0f;    // x offset
+	constants.post_transform[1] = 0.0f;    // y offset
+	constants.post_transform[2] = u_scale;  // width scale
+	constants.post_transform[3] = v_scale;  // height scale
 	// Color identity
 	constants.color_scale[0] = 1.0f;
 	constants.color_scale[1] = 1.0f;
