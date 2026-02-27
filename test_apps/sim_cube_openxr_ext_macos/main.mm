@@ -106,6 +106,9 @@ struct InputState {
     // Camera vs display mode toggle (C key)
     bool cameraMode = false;
     float nominalViewerZ = 0.5f;  // Cached from runtime for camera-mode init
+
+    // Eye tracking mode toggle (T key)
+    bool eyeTrackingModeToggleRequested = false;
 };
 
 // ============================================================================
@@ -1721,6 +1724,9 @@ static void PumpMacOSEvents() {
                         g_input.displayMode3D = !g_input.displayMode3D;
                         g_input.displayModeToggleRequested = true;
                     }
+                    else if (ch == 't' && !isRepeat) {
+                        g_input.eyeTrackingModeToggleRequested = true;
+                    }
                     else if (ch == 'c' && !isRepeat) {
                         g_input.cameraMode = !g_input.cameraMode;
                         if (g_input.cameraMode) {
@@ -1894,6 +1900,13 @@ struct AppXrSession {
     bool supportsDisplayModeSwitch = false;
     PFN_xrRequestDisplayModeEXT pfnRequestDisplayModeEXT = nullptr;
 
+    // Eye tracking mode control (XR_EXT_display_info v6)
+    uint32_t supportedEyeTrackingModes = 0;
+    uint32_t defaultEyeTrackingMode = 0;
+    bool isEyeTracking = false;
+    uint32_t activeEyeTrackingMode = 0;
+    PFN_xrRequestEyeTrackingModeEXT pfnRequestEyeTrackingModeEXT = nullptr;
+
     // Eye tracking data for HUD
     float leftEyeX = 0, leftEyeY = 0, leftEyeZ = 0;
     float rightEyeX = 0, rightEyeY = 0, rightEyeZ = 0;
@@ -1970,6 +1983,9 @@ static bool InitializeOpenXR(AppXrSession& xr) {
         XrSystemProperties sysProps = {XR_TYPE_SYSTEM_PROPERTIES};
         XrDisplayInfoEXT displayInfo = {};
         displayInfo.type = XR_TYPE_DISPLAY_INFO_EXT;
+        XrEyeTrackingModeCapabilitiesEXT eyeCaps = {};
+        eyeCaps.type = (XrStructureType)XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_EXT;
+        displayInfo.next = &eyeCaps;
         sysProps.next = &displayInfo;
         if (XR_SUCCEEDED(xrGetSystemProperties(xr.instance, xr.systemId, &sysProps))) {
             xr.recommendedViewScaleX = displayInfo.recommendedViewScaleX;
@@ -1982,17 +1998,27 @@ static bool InitializeOpenXR(AppXrSession& xr) {
             xr.supportsDisplayModeSwitch = displayInfo.supportsDisplayModeSwitch;
             xr.displayPixelWidth = displayInfo.displayPixelWidth;
             xr.displayPixelHeight = displayInfo.displayPixelHeight;
+            xr.supportedEyeTrackingModes = (uint32_t)eyeCaps.supportedModes;
+            xr.defaultEyeTrackingMode = (uint32_t)eyeCaps.defaultMode;
             LOG_INFO("Display pixels: %ux%u", xr.displayPixelWidth, xr.displayPixelHeight);
             LOG_INFO("Display info: %.3fx%.3f m, scale=%.2fx%.2f, nominal=(%.3f,%.3f,%.3f)",
                 xr.displayWidthM, xr.displayHeightM,
                 xr.recommendedViewScaleX, xr.recommendedViewScaleY,
                 xr.nominalViewerX, xr.nominalViewerY, xr.nominalViewerZ);
             LOG_INFO("Display mode switch: %s", xr.supportsDisplayModeSwitch ? "supported" : "not supported");
+            LOG_INFO("Eye tracking: supported=0x%x, default=%u",
+                xr.supportedEyeTrackingModes, xr.defaultEyeTrackingMode);
         }
 
         // Load display mode request function pointer
         xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayModeEXT",
             (PFN_xrVoidFunction*)&xr.pfnRequestDisplayModeEXT);
+
+        // Load eye tracking mode request function pointer
+        if (xr.supportedEyeTrackingModes != 0) {
+            xrGetInstanceProcAddr(xr.instance, "xrRequestEyeTrackingModeEXT",
+                (PFN_xrVoidFunction*)&xr.pfnRequestEyeTrackingModeEXT);
+        }
     }
 
     uint32_t viewCount = 0;
@@ -2635,6 +2661,19 @@ int main() {
             }
         }
 
+        // Handle eye tracking mode toggle (T key)
+        if (g_input.eyeTrackingModeToggleRequested) {
+            g_input.eyeTrackingModeToggleRequested = false;
+            if (xr.pfnRequestEyeTrackingModeEXT && xr.session != XR_NULL_HANDLE) {
+                XrEyeTrackingModeEXT newMode = (xr.activeEyeTrackingMode == XR_EYE_TRACKING_MODE_SMOOTH_EXT)
+                    ? XR_EYE_TRACKING_MODE_RAW_EXT : XR_EYE_TRACKING_MODE_SMOOTH_EXT;
+                XrResult etResult = xr.pfnRequestEyeTrackingModeEXT(xr.session, newMode);
+                LOG_INFO("Eye tracking mode → %s (%s)",
+                    newMode == XR_EYE_TRACKING_MODE_RAW_EXT ? "RAW" : "SMOOTH",
+                    XR_SUCCEEDED(etResult) ? "OK" : "unsupported");
+            }
+        }
+
         PollEvents(xr);
 
         if (xr.sessionRunning) {
@@ -2652,6 +2691,12 @@ int main() {
                         ? xr.displaySpace : xr.localSpace;
 
                     XrViewState viewState = {XR_TYPE_VIEW_STATE};
+
+                    // Chain eye tracking state (v6)
+                    XrViewEyeTrackingStateEXT eyeTrackingState = {};
+                    eyeTrackingState.type = (XrStructureType)XR_TYPE_VIEW_EYE_TRACKING_STATE_EXT;
+                    viewState.next = &eyeTrackingState;
+
                     uint32_t viewCount = 2;
                     XrView views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
 
@@ -2667,8 +2712,9 @@ int main() {
                         // Store raw eye positions for HUD (pre-player-transform)
                         xr.leftEyeX = rawEyePos[0].x; xr.leftEyeY = rawEyePos[0].y; xr.leftEyeZ = rawEyePos[0].z;
                         xr.rightEyeX = rawEyePos[1].x; xr.rightEyeY = rawEyePos[1].y; xr.rightEyeZ = rawEyePos[1].z;
-                        xr.eyeTrackingActive = (viewState.viewStateFlags
-                            & XR_VIEW_STATE_POSITION_TRACKED_BIT) != 0;
+                        xr.isEyeTracking = (eyeTrackingState.isTracking == XR_TRUE);
+                        xr.activeEyeTrackingMode = (uint32_t)eyeTrackingState.activeMode;
+                        xr.eyeTrackingActive = xr.isEyeTracking;
 
                         // Determine eye count (mono in 2D, stereo in 3D)
                         int eyeCount = g_input.displayMode3D ? 2 : 1;
@@ -2872,6 +2918,12 @@ int main() {
                             g_input.stereo.virtualDisplayHeight, m2v);
                     }
 
+                    // Eye tracking mode info
+                    const char *eyeModeName = (xr.activeEyeTrackingMode == 1) ? "RAW" : "SMOOTH";
+                    char eyeTrackLine[80];
+                    snprintf(eyeTrackLine, sizeof(eyeTrackLine), "Tracking: %s [%s] [T]",
+                        xr.isEyeTracking ? "YES" : "NO", eyeModeName);
+
                     NSString *text = [NSString stringWithFormat:
                         @"%s\n"
                         "Session: %s\n"
@@ -2886,6 +2938,7 @@ int main() {
                         "Nominal: (%.3f, %.3f, %.3f)\n"
                         "Eye L: (%.3f, %.3f, %.3f)\n"
                         "Eye R: (%.3f, %.3f, %.3f)\n"
+                        "%s\n"
                         "%s: (%.2f, %.2f, %.2f)\n"
                         "Forward: (%.2f, %.2f, %.2f)\n"
                         "IPD: %.2f  Parallax: %.2f\n"
@@ -2894,7 +2947,7 @@ int main() {
                         "\n"
                         "WASD/QE=Move  Drag=Look  Space=Reset\n"
                         "%s  Shift=IPD  Ctrl=Parallax  %s\n"
-                        "C=Mode  V=2D/3D  1/2/3=Output  Tab=HUD  ESC=Quit",
+                        "C=Mode  V=2D/3D  T=EyeMode  1/2/3=Output  Tab=HUD  ESC=Quit",
                         xr.systemName,
                         sessionStateName,
                         xr.hasMacosWindowBinding ? "ACTIVE" : "NOT AVAILABLE",
@@ -2910,6 +2963,7 @@ int main() {
                         xr.nominalViewerX, xr.nominalViewerY, xr.nominalViewerZ,
                         xr.leftEyeX, xr.leftEyeY, xr.leftEyeZ,
                         xr.rightEyeX, xr.rightEyeY, xr.rightEyeZ,
+                        eyeTrackLine,
                         poseLabel,
                         g_input.cameraPosX, g_input.cameraPosY, g_input.cameraPosZ,
                         -sinf(g_input.yaw) * cosf(g_input.pitch),

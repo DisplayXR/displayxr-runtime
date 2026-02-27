@@ -102,6 +102,13 @@ struct XrSessionManager {
     bool supportsDisplayModeSwitch = false;
     PFN_xrRequestDisplayModeEXT pfnRequestDisplayModeEXT = nullptr;
 
+    // Eye tracking mode control (XR_EXT_display_info v6)
+    uint32_t supportedEyeTrackingModes = 0;   // bitmask: SMOOTH_BIT=1, RAW_BIT=2
+    uint32_t defaultEyeTrackingMode = 0;      // 0=SMOOTH, 1=RAW
+    bool isEyeTracking = false;               // per-frame: true if eyes actively tracked
+    uint32_t activeEyeTrackingMode = 0;       // per-frame: currently active mode
+    PFN_xrRequestEyeTrackingModeEXT pfnRequestEyeTrackingModeEXT = nullptr;
+
     // Window handle for session target (used by ext app, ignored by non-ext app)
     HWND windowHandle = nullptr;
 

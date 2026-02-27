@@ -140,6 +140,12 @@ oxr_session_get_predicted_eye_positions(struct oxr_session *sess, struct xrt_eye
 			out_eye_pair->right = (struct xrt_eye_position){right_eye.x, right_eye.y, right_eye.z};
 			out_eye_pair->timestamp_ns = os_monotonic_get_ns();
 			out_eye_pair->valid = true;
+			// Heuristic: collapsed eye positions = tracking lost
+			float dx = right_eye.x - left_eye.x;
+			float dy = right_eye.y - left_eye.y;
+			float dz = right_eye.z - left_eye.z;
+			float dist_sq = dx * dx + dy * dy + dz * dz;
+			out_eye_pair->is_tracking = (dist_sq > 1e-6f);
 			return true;
 		}
 		return false;
@@ -1297,6 +1303,36 @@ oxr_session_locate_views(struct oxr_logger *log,
 			viewState->viewStateFlags &= xrt_to_view_state_flags(result.relation_flags);
 		}
 	}
+
+#ifdef OXR_HAVE_EXT_display_info
+	if (sess->sys->inst->extensions.EXT_display_info) {
+		XrViewEyeTrackingStateEXT *ets = OXR_GET_OUTPUT_FROM_CHAIN(
+		    viewState, XR_TYPE_VIEW_EYE_TRACKING_STATE_EXT, XrViewEyeTrackingStateEXT);
+		if (ets) {
+			ets->activeMode = (XrEyeTrackingModeEXT)sess->eye_tracking_mode;
+			if (got_eye_positions && eye_pair.valid) {
+				ets->isTracking = eye_pair.is_tracking ? XR_TRUE : XR_FALSE;
+			} else {
+				// No eye tracking backend or invalid data.
+				// For sim_display (RAW_BIT, always "tracking"), eye positions
+				// come from nominal viewer, not the eye tracking path.
+				// Report isTracking based on whether the system has tracking
+				// and the nominal path was used successfully.
+				const struct xrt_system_compositor_info *et_info =
+				    sess->sys->xsysc ? &sess->sys->xsysc->info : NULL;
+				uint32_t supported = et_info ? et_info->supported_eye_tracking_modes : 0;
+				if (supported != 0 && !got_eye_positions) {
+					// System claims tracking support but no eye tracking
+					// backend is active (e.g., sim_display with nominal viewer).
+					// Sim display is always "tracking" its simulated viewer.
+					ets->isTracking = XR_TRUE;
+				} else {
+					ets->isTracking = XR_FALSE;
+				}
+			}
+		}
+	}
+#endif // OXR_HAVE_EXT_display_info
 
 	if (print) {
 		oxr_log_slog(log, &slog);

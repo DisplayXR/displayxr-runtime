@@ -275,6 +275,19 @@ static void RenderOneFrame(RenderState& rs) {
         }
     }
 
+    // Handle eye tracking mode toggle (T key)
+    if (g_inputState.eyeTrackingModeToggleRequested) {
+        g_inputState.eyeTrackingModeToggleRequested = false;
+        if (xr.pfnRequestEyeTrackingModeEXT && xr.session != XR_NULL_HANDLE) {
+            XrEyeTrackingModeEXT newMode = (xr.activeEyeTrackingMode == XR_EYE_TRACKING_MODE_SMOOTH_EXT)
+                ? XR_EYE_TRACKING_MODE_RAW_EXT : XR_EYE_TRACKING_MODE_SMOOTH_EXT;
+            XrResult etResult = xr.pfnRequestEyeTrackingModeEXT(xr.session, newMode);
+            LOG_INFO("Eye tracking mode -> %s (%s)",
+                newMode == XR_EYE_TRACKING_MODE_RAW_EXT ? "RAW" : "SMOOTH",
+                XR_SUCCEEDED(etResult) ? "OK" : "unsupported");
+        }
+    }
+
     // Handle output mode change (1/2/3 keys)
     if (g_inputState.outputModeChangeRequested) {
         g_inputState.outputModeChangeRequested = false;
@@ -451,7 +464,8 @@ static void RenderOneFrame(RenderState& rs) {
                             std::wstring eyeText = FormatEyeTrackingInfo(
                                 xr.leftEyeX, xr.leftEyeY, xr.leftEyeZ,
                                 xr.rightEyeX, xr.rightEyeY, xr.rightEyeZ,
-                                xr.eyeTrackingActive);
+                                xr.eyeTrackingActive, xr.isEyeTracking,
+                                xr.activeEyeTrackingMode, xr.supportedEyeTrackingModes);
 
                             float fwdX = -sinf(g_inputState.yaw) * cosf(g_inputState.pitch);
                             float fwdY =  sinf(g_inputState.pitch);

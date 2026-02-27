@@ -49,6 +49,9 @@ struct xrt_eye_pair
 	struct xrt_eye_position right; //!< Right eye position in meters
 	int64_t timestamp_ns;          //!< Monotonic timestamp when the eye positions were sampled
 	bool valid;                    //!< True if the eye positions are valid
+	bool is_tracking;              //!< True if physical eye tracker has lock on user.
+	                               //!< When false, positions are still valid — vendor SDK
+	                               //!< provides reasonable fallback (last known, filtered, etc.)
 };
 
 /*!

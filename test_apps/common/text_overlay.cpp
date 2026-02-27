@@ -209,7 +209,8 @@ std::wstring FormatDisplayInfo(float widthM, float heightM, float nomX, float no
     return oss.str();
 }
 
-std::wstring FormatEyeTrackingInfo(float lx, float ly, float lz, float rx, float ry, float rz, bool active) {
+std::wstring FormatEyeTrackingInfo(float lx, float ly, float lz, float rx, float ry, float rz,
+    bool active, bool isTracking, uint32_t activeMode, uint32_t supportedModes) {
     std::wostringstream oss;
     oss << std::fixed << std::setprecision(0);
     if (active) {
@@ -218,6 +219,17 @@ std::wstring FormatEyeTrackingInfo(float lx, float ly, float lz, float rx, float
     } else {
         oss << L"Eyes: inactive";
     }
+
+    // Eye tracking mode info (v6)
+    const wchar_t* modeName = (activeMode == 1) ? L"RAW" : L"SMOOTH";
+    oss << L"\nTracking: " << (isTracking ? L"YES" : L"NO") << L" [" << modeName << L"]";
+    // Show supported modes
+    oss << L"  (";
+    bool first = true;
+    if (supportedModes & 0x1) { oss << L"SMOOTH"; first = false; }
+    if (supportedModes & 0x2) { if (!first) oss << L"|"; oss << L"RAW"; }
+    if (supportedModes == 0) { oss << L"none"; }
+    oss << L") [T]";
     return oss.str();
 }
 
@@ -281,13 +293,13 @@ std::wstring FormatHelpText(bool simDisplayAvailable, bool cameraMode) {
         s += scrollLabel;
         s += L"  Shift=IPD  Ctrl=Parallax  ";
         s += perspLabel;
-        s += L"\nC=Mode  V=2D/3D  1/2/3=Output  Tab=HUD  F11=Full  ESC=Quit";
+        s += L"\nC=Mode  V=2D/3D  T=EyeMode  1/2/3=Output  Tab=HUD  F11=Full  ESC=Quit";
         return s;
     }
     std::wstring s = L"WASD/QE=Move  Drag=Look  Space=Reset\n";
     s += scrollLabel;
     s += L"  Shift=IPD  Ctrl=Parallax  ";
     s += perspLabel;
-    s += L"\nC=Mode  V=2D/3D  Tab=HUD  F11=Full  ESC=Quit";
+    s += L"\nC=Mode  V=2D/3D  T=EyeMode  Tab=HUD  F11=Full  ESC=Quit";
     return s;
 }

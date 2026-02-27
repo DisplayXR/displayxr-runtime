@@ -100,6 +100,8 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     if (xr.hasDisplayInfoExt) {
         XrSystemProperties sysProps = {XR_TYPE_SYSTEM_PROPERTIES};
         XrDisplayInfoEXT displayInfo = {(XrStructureType)XR_TYPE_DISPLAY_INFO_EXT};
+        XrEyeTrackingModeCapabilitiesEXT eyeCaps = {(XrStructureType)XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_EXT};
+        displayInfo.next = &eyeCaps;
         sysProps.next = &displayInfo;
         XrResult diResult = xrGetSystemProperties(xr.instance, xr.systemId, &sysProps);
         if (XR_SUCCEEDED(diResult)) {
@@ -110,13 +112,31 @@ bool InitializeOpenXR(XrSessionManager& xr) {
             xr.nominalViewerX = displayInfo.nominalViewerPositionInDisplaySpace.x;
             xr.nominalViewerY = displayInfo.nominalViewerPositionInDisplaySpace.y;
             xr.nominalViewerZ = displayInfo.nominalViewerPositionInDisplaySpace.z;
+            xr.supportsDisplayModeSwitch = (displayInfo.supportsDisplayModeSwitch == XR_TRUE);
             xr.displayPixelWidth = displayInfo.displayPixelWidth;
             xr.displayPixelHeight = displayInfo.displayPixelHeight;
-            LOG_INFO("Display info: scale=%.3fx%.3f, size=%.3fx%.3fm, pixels=%ux%u, nominal=(%.0f,%.0f,%.0f)mm",
+            xr.supportedEyeTrackingModes = (uint32_t)eyeCaps.supportedModes;
+            xr.defaultEyeTrackingMode = (uint32_t)eyeCaps.defaultMode;
+            LOG_INFO("Display info: scale=%.3fx%.3f, size=%.3fx%.3fm, pixels=%ux%u, nominal=(%.0f,%.0f,%.0f)mm, modeSwitch=%s",
                 xr.recommendedViewScaleX, xr.recommendedViewScaleY,
                 xr.displayWidthM, xr.displayHeightM,
                 xr.displayPixelWidth, xr.displayPixelHeight,
-                xr.nominalViewerX * 1000.0f, xr.nominalViewerY * 1000.0f, xr.nominalViewerZ * 1000.0f);
+                xr.nominalViewerX * 1000.0f, xr.nominalViewerY * 1000.0f, xr.nominalViewerZ * 1000.0f,
+                xr.supportsDisplayModeSwitch ? "YES" : "NO");
+            LOG_INFO("Eye tracking: supported=0x%x, default=%u",
+                xr.supportedEyeTrackingModes, xr.defaultEyeTrackingMode);
+        }
+
+        // Load xrRequestDisplayModeEXT function pointer
+        if (xr.supportsDisplayModeSwitch) {
+            xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayModeEXT",
+                (PFN_xrVoidFunction*)&xr.pfnRequestDisplayModeEXT);
+        }
+
+        // Load xrRequestEyeTrackingModeEXT function pointer
+        if (xr.supportedEyeTrackingModes != 0) {
+            xrGetInstanceProcAddr(xr.instance, "xrRequestEyeTrackingModeEXT",
+                (PFN_xrVoidFunction*)&xr.pfnRequestEyeTrackingModeEXT);
         }
     }
 

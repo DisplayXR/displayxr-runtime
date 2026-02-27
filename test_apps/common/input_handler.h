@@ -75,6 +75,9 @@ struct InputState {
     // Output mode for sim_display (1/2/3 keys: 0=SBS, 1=Anaglyph, 2=Blend)
     int outputMode = 0;
     bool outputModeChangeRequested = false;
+
+    // Eye tracking mode toggle (T key)
+    bool eyeTrackingModeToggleRequested = false;
 };
 
 // Process a Win32 message and update input state

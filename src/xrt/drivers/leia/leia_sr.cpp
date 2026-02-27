@@ -411,6 +411,14 @@ leiasr_get_predicted_eye_positions(struct leiasr *leiasr, struct leiasr_eye_pair
 	out_eye_pair->timestamp_ns = os_monotonic_get_ns();
 	out_eye_pair->valid = true;
 
+	// Heuristic: when SR SDK loses tracking, eye positions collapse to a single point.
+	// Detect this by checking if inter-eye distance is near zero.
+	float dx = rightEye[0] - leftEye[0];
+	float dy = rightEye[1] - leftEye[1];
+	float dz = rightEye[2] - leftEye[2];
+	float dist_sq = dx * dx + dy * dy + dz * dz;
+	out_eye_pair->is_tracking = (dist_sq > 1e-6f);
+
 	return true;
 }
 

@@ -155,6 +155,13 @@ struct AppState {
     float recommendedViewScaleX = 1.0f;
     float recommendedViewScaleY = 1.0f;
     float nominalViewerX = 0, nominalViewerY = 0, nominalViewerZ = 0; // Nominal viewer pos in display space
+
+    // Eye tracking mode control (XR_EXT_display_info v6)
+    uint32_t supportedEyeTrackingModes = 0;
+    uint32_t defaultEyeTrackingMode = 0;
+    bool isEyeTracking = false;
+    uint32_t activeEyeTrackingMode = 0;
+
 #ifdef __APPLE__
     bool hasMacosWindowBinding = false;
 #endif
@@ -294,6 +301,9 @@ static bool InitializeOpenXR(AppState& app) {
         XrSystemProperties sysProps = {XR_TYPE_SYSTEM_PROPERTIES};
         XrDisplayInfoEXT displayInfo = {};
         displayInfo.type = XR_TYPE_DISPLAY_INFO_EXT;
+        XrEyeTrackingModeCapabilitiesEXT eyeCaps = {};
+        eyeCaps.type = (XrStructureType)XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_EXT;
+        displayInfo.next = &eyeCaps;
         sysProps.next = &displayInfo;
         if (XR_SUCCEEDED(xrGetSystemProperties(app.instance, app.systemId, &sysProps))) {
             app.displayWidthM = displayInfo.displaySizeMeters.width;
@@ -305,11 +315,15 @@ static bool InitializeOpenXR(AppState& app) {
             app.nominalViewerX = displayInfo.nominalViewerPositionInDisplaySpace.x;
             app.nominalViewerY = displayInfo.nominalViewerPositionInDisplaySpace.y;
             app.nominalViewerZ = displayInfo.nominalViewerPositionInDisplaySpace.z;
+            app.supportedEyeTrackingModes = (uint32_t)eyeCaps.supportedModes;
+            app.defaultEyeTrackingMode = (uint32_t)eyeCaps.defaultMode;
             LOG_INFO("Display: %.3fx%.3f m, %ux%u px, viewScale=%.3fx%.3f, nominalViewer=(%.3f,%.3f,%.3f)",
                      app.displayWidthM, app.displayHeightM,
                      app.displayPixelWidth, app.displayPixelHeight,
                      app.recommendedViewScaleX, app.recommendedViewScaleY,
                      app.nominalViewerX, app.nominalViewerY, app.nominalViewerZ);
+            LOG_INFO("Eye tracking: supported=0x%x, default=%u",
+                     app.supportedEyeTrackingModes, app.defaultEyeTrackingMode);
         }
     }
 
@@ -1472,9 +1486,18 @@ int main() {
             dispLocateInfo.space = app.displaySpace;
 
             XrViewState dispViewState = {XR_TYPE_VIEW_STATE};
+
+            // Chain eye tracking state (v6)
+            XrViewEyeTrackingStateEXT eyeTrackingState = {};
+            eyeTrackingState.type = (XrStructureType)XR_TYPE_VIEW_EYE_TRACKING_STATE_EXT;
+            dispViewState.next = &eyeTrackingState;
+
             uint32_t dispViewCount = 2;
             xrLocateViews(app.session, &dispLocateInfo, &dispViewState,
                           2, &dispViewCount, displayViews);
+
+            app.isEyeTracking = (eyeTrackingState.isTracking == XR_TRUE);
+            app.activeEyeTrackingMode = (uint32_t)eyeTrackingState.activeMode;
         } else {
             // Fallback: use local-space views (Kooima will be approximate)
             displayViews[0] = views[0];
@@ -1641,13 +1664,16 @@ int main() {
                 len += snprintf(buf + len, bufSize - len,
                     "{\"pose\":[%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f],"
                     "\"eyes\":[[%.5f,%.5f,%.5f],[%.5f,%.5f,%.5f]],"
-                    "\"fov\":[[%.6f,%.6f,%.6f,%.6f],[%.6f,%.6f,%.6f,%.6f]]",
+                    "\"fov\":[[%.6f,%.6f,%.6f,%.6f],[%.6f,%.6f,%.6f,%.6f]],"
+                    "\"isTracking\":%s,\"activeMode\":%u",
                     p.x, p.y, p.z, q.x, q.y, q.z, q.w,
                     lep.x, lep.y, lep.z, rep.x, rep.y, rep.z,
                     views[0].fov.angleLeft, views[0].fov.angleRight,
                     views[0].fov.angleUp, views[0].fov.angleDown,
                     views[1].fov.angleLeft, views[1].fov.angleRight,
-                    views[1].fov.angleUp, views[1].fov.angleDown);
+                    views[1].fov.angleUp, views[1].fov.angleDown,
+                    app.isEyeTracking ? "true" : "false",
+                    app.activeEyeTrackingMode);
 
                 // Controller data
                 len += snprintf(buf + len, bufSize - len, ",\"ctrl\":[");

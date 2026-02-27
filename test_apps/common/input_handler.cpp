@@ -180,6 +180,9 @@ bool UpdateInputState(InputState& state, UINT msg, WPARAM wParam, LPARAM lParam)
             state.outputMode = 2;
             state.outputModeChangeRequested = true;
             break;
+        case 'T':
+            state.eyeTrackingModeToggleRequested = true;
+            break;
         case 'C':
             state.cameraMode = !state.cameraMode;
             if (state.cameraMode) {

@@ -600,6 +600,7 @@ struct xrt_eye_pair
     struct xrt_eye_position right;  //!< Right eye position in meters
     int64_t timestamp_ns;           //!< Monotonic timestamp when sampled
     bool valid;                     //!< True if eye positions are valid
+    bool is_tracking;               //!< True if physical eye tracker has lock (v6)
 };
 
 struct xrt_window_metrics
@@ -638,6 +639,8 @@ float nominal_viewer_z_m;         // Nominal viewer Z (display space, meters)
 float recommended_view_scale_x;   // Recommended render scale X
 float recommended_view_scale_y;   // Recommended render scale Y
 bool  supports_display_mode_switch; // 2D/3D mode switching
+uint32_t supported_eye_tracking_modes; // Bitmask: SMOOTH_BIT=1, RAW_BIT=2 (v6)
+uint32_t default_eye_tracking_mode;    // 0=SMOOTH, 1=RAW (v6)
 ```
 
 **Coordinate system:** All positions are in display-local coordinates with
@@ -817,6 +820,77 @@ and `info.display_height_m` — no vendor SDK call at runtime.
 returns `xrt_window_metrics`.  The Vulkan path computes window metrics from
 generic Win32/macOS APIs (no vendor SDK needed); the D3D11 path may query
 the vendor SDK if it manages the window.
+
+### 6.6 Eye Tracking Mode Control (v6)
+
+Version 6 of `XR_EXT_display_info` adds eye tracking mode control, allowing apps
+to choose between smooth (SDK-filtered) and raw eye tracking.
+
+#### Required Internal Fields
+
+**`xrt_eye_pair.is_tracking`** — Set by the vendor's eye position function.
+`true` when the physical eye tracker has lock on the user. When `false`, positions
+are still valid — the vendor SDK provides reasonable fallback (last known, filtered,
+nominal viewer). The runtime passes vendor values through unchanged.
+
+**`xrt_system_compositor_info.supported_eye_tracking_modes`** — Bitmask set at init:
+- `1` (SMOOTH_BIT): SDK handles grace period + smoothing
+- `2` (RAW_BIT): SDK provides unfiltered positions
+- `3` (both): Runtime supports both modes
+- `0`: No eye tracking (display only)
+
+**`xrt_system_compositor_info.default_eye_tracking_mode`** — `0` for SMOOTH, `1` for RAW.
+
+#### Capability Advertisement
+
+Set these fields in `target_instance.c` alongside other `xrt_system_compositor_info`
+fields:
+
+```c
+// Leia SR: smooth only
+xsysc->info.supported_eye_tracking_modes = 1; // SMOOTH_BIT
+xsysc->info.default_eye_tracking_mode = 0;    // SMOOTH
+
+// Sim display: raw only
+xsysc->info.supported_eye_tracking_modes = 2; // RAW_BIT
+xsysc->info.default_eye_tracking_mode = 1;    // RAW
+```
+
+#### `is_tracking` Contract
+
+- Vendor **MUST** set `is_tracking` to reflect physical tracker lock status
+- `xrLocateViews` **ALWAYS** returns fully populated views regardless of `is_tracking`
+- When `is_tracking == false`, vendor SDK populates positions as it sees fit
+  (nominal, last known, filtered)
+- `isTracking` only tells the app whether positions are from live tracking or fallback
+
+#### Smooth Mode Implementation
+
+Vendor SDK handles grace/resume smoothing internally. The runtime passes positions
+through unchanged. Eye positions converge smoothly to a rest position when tracking
+is lost. `is_tracking` reflects the vendor heuristic (e.g., inter-eye distance
+approaching zero).
+
+#### Raw Mode Implementation
+
+Vendor SDK provides unfiltered positions. Vendor is still responsible for providing
+fallback positions when tracking is lost. The app uses `isTracking` to handle
+tracking loss with its own animations/UI.
+
+#### No-Tracking Displays
+
+Set `supported_eye_tracking_modes = 0`. Runtime reports `supportedModes = NONE`,
+`isTracking = XR_FALSE` always. `xrLocateViews` still returns fully populated views
+(vendor SDK populates positions, e.g., nominal viewer). `xrRequestEyeTrackingModeEXT`
+returns `XR_ERROR_FEATURE_UNSUPPORTED` for any mode.
+
+#### Reference Implementations
+
+| Vendor | `supported` | `default` | `is_tracking` source |
+|--------|-------------|-----------|---------------------|
+| Leia SR | `1` (SMOOTH) | `0` (SMOOTH) | Eye-distance heuristic: `dist² > 1e-6` |
+| Sim display | `2` (RAW) | `1` (RAW) | Always `true` (simulated) |
+| No-tracker | `0` (NONE) | N/A | Always `false` |
 
 ---
 

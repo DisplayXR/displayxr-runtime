@@ -1844,6 +1844,9 @@ struct oxr_session
 	//! True if display is currently in 3D mode (set by xrRequestDisplayModeEXT).
 	bool display_mode_3d;
 
+	//! Active eye tracking mode (0=SMOOTH, 1=RAW). Default: 0 (SMOOTH).
+	uint32_t eye_tracking_mode;
+
 	//! True if XR_EXT_win32_appcontainer_compatible was enabled (Chrome WebXR).
 	//! Used to delay session state transitions for AppContainer sandbox compatibility.
 	bool is_appcontainer;

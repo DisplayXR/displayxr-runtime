@@ -769,6 +769,9 @@ oxr_xrSuggestBodyTrackingCalibrationOverrideMETA(XrBodyTrackerFB bodyTracker,
 //! OpenXR API function @ep{xrRequestDisplayModeEXT}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrRequestDisplayModeEXT(XrSession session, XrDisplayModeEXT displayMode);
+//! OpenXR API function @ep{xrRequestEyeTrackingModeEXT}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrRequestEyeTrackingModeEXT(XrSession session, XrEyeTrackingModeEXT mode);
 #endif
 
 /*!

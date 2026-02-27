@@ -420,6 +420,7 @@ handle_non_null(struct oxr_instance *inst, struct oxr_logger *log, const char *n
 
 #ifdef OXR_HAVE_EXT_display_info
 	ENTRY_IF_EXT(xrRequestDisplayModeEXT, EXT_display_info);
+	ENTRY_IF_EXT(xrRequestEyeTrackingModeEXT, EXT_display_info);
 #endif
 
 #ifdef OXR_HAVE_KHR_locate_spaces

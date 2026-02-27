@@ -323,6 +323,7 @@ static void RenderThreadFunc(
             g_inputState.resetViewRequested = false;
             g_inputState.fullscreenToggleRequested = false;
             g_inputState.displayModeToggleRequested = false;
+            g_inputState.eyeTrackingModeToggleRequested = false;
             outputModeChanged = g_inputState.outputModeChangeRequested;
             g_inputState.outputModeChangeRequested = false;
             windowW = g_windowWidth;
@@ -354,6 +355,18 @@ static void RenderThreadFunc(
                 XrDisplayModeEXT mode = inputSnapshot.displayMode3D ?
                     XR_DISPLAY_MODE_3D_EXT : XR_DISPLAY_MODE_2D_EXT;
                 xr->pfnRequestDisplayModeEXT(xr->session, mode);
+            }
+        }
+
+        // Handle eye tracking mode toggle (T key)
+        if (inputSnapshot.eyeTrackingModeToggleRequested) {
+            if (xr->pfnRequestEyeTrackingModeEXT && xr->session != XR_NULL_HANDLE) {
+                XrEyeTrackingModeEXT newMode = (xr->activeEyeTrackingMode == XR_EYE_TRACKING_MODE_SMOOTH_EXT)
+                    ? XR_EYE_TRACKING_MODE_RAW_EXT : XR_EYE_TRACKING_MODE_SMOOTH_EXT;
+                XrResult etResult = xr->pfnRequestEyeTrackingModeEXT(xr->session, newMode);
+                LOG_INFO("Eye tracking mode -> %s (%s)",
+                    newMode == XR_EYE_TRACKING_MODE_RAW_EXT ? "RAW" : "SMOOTH",
+                    XR_SUCCEEDED(etResult) ? "OK" : "unsupported");
             }
         }
 
@@ -592,7 +605,8 @@ static void RenderThreadFunc(
                                 std::wstring eyeText = FormatEyeTrackingInfo(
                                     xr->leftEyeX, xr->leftEyeY, xr->leftEyeZ,
                                     xr->rightEyeX, xr->rightEyeY, xr->rightEyeZ,
-                                    xr->eyeTrackingActive);
+                                    xr->eyeTrackingActive, xr->isEyeTracking,
+                                    xr->activeEyeTrackingMode, xr->supportedEyeTrackingModes);
 
                                 float fwdX = -sinf(inputSnapshot.yaw) * cosf(inputSnapshot.pitch);
                                 float fwdY =  sinf(inputSnapshot.pitch);

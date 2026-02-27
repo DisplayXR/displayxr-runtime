@@ -391,6 +391,11 @@ bool LocateViews(
     locateInfo.space = (xr.displaySpace != XR_NULL_HANDLE) ? xr.displaySpace : xr.localSpace;
 
     XrViewState viewState = {XR_TYPE_VIEW_STATE};
+
+    // Chain eye tracking state (v6) — runtime fills if extension enabled
+    XrViewEyeTrackingStateEXT eyeTrackingState = {(XrStructureType)XR_TYPE_VIEW_EYE_TRACKING_STATE_EXT};
+    viewState.next = &eyeTrackingState;
+
     uint32_t viewCount = 2;
     XrView views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
 
@@ -459,7 +464,9 @@ bool LocateViews(
     rightViewMatrix = XrPoseToViewMatrix(views[1].pose);
     rightProjMatrix = XrFovToProjectionMatrix(views[1].fov, 0.01f, 100.0f);
 
-    xr.eyeTrackingActive = (viewState.viewStateFlags & XR_VIEW_STATE_POSITION_TRACKED_BIT) != 0;
+    xr.isEyeTracking = (eyeTrackingState.isTracking == XR_TRUE);
+    xr.activeEyeTrackingMode = (uint32_t)eyeTrackingState.activeMode;
+    xr.eyeTrackingActive = xr.isEyeTracking;  // backward compat for HUD
 
     return true;
 }

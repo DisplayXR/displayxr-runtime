@@ -22,7 +22,7 @@ extern "C" {
 #endif
 
 #define XR_EXT_display_info 1
-#define XR_EXT_display_info_SPEC_VERSION 5
+#define XR_EXT_display_info_SPEC_VERSION 6
 #define XR_EXT_DISPLAY_INFO_EXTENSION_NAME "XR_EXT_display_info"
 
 // Reuse the type value from the deleted XR_EXT_dynamic_render_resolution
@@ -85,6 +85,101 @@ typedef XrResult (XRAPI_PTR *PFN_xrRequestDisplayModeEXT)(XrSession session, XrD
 XRAPI_ATTR XrResult XRAPI_CALL xrRequestDisplayModeEXT(
     XrSession                                   session,
     XrDisplayModeEXT                            displayMode);
+#endif
+
+// ---- v6: Eye Tracking Mode Control ----
+
+#define XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_EXT ((XrStructureType)1000999006)
+#define XR_TYPE_VIEW_EYE_TRACKING_STATE_EXT        ((XrStructureType)1000999007)
+
+/*!
+ * @brief Eye tracking mode enum.
+ *
+ * SMOOTH (0) is the default — apps that never call xrRequestEyeTrackingModeEXT
+ * get current behavior (vendor SDK handles grace period + smoothing).
+ * RAW (1) provides unfiltered positions + explicit isTracking flag.
+ */
+typedef enum XrEyeTrackingModeEXT {
+    XR_EYE_TRACKING_MODE_SMOOTH_EXT   = 0,
+    XR_EYE_TRACKING_MODE_RAW_EXT      = 1,
+    XR_EYE_TRACKING_MODE_MAX_ENUM_EXT = 0x7FFFFFFF
+} XrEyeTrackingModeEXT;
+
+/*!
+ * @brief Capability flags for eye tracking modes (bitmask).
+ *
+ * A value of 0 means the display has NO eye tracking capability at all.
+ */
+typedef XrFlags64 XrEyeTrackingModeCapabilityFlagsEXT;
+static const XrEyeTrackingModeCapabilityFlagsEXT
+    XR_EYE_TRACKING_MODE_CAPABILITY_NONE_EXT       = 0;
+static const XrEyeTrackingModeCapabilityFlagsEXT
+    XR_EYE_TRACKING_MODE_CAPABILITY_SMOOTH_BIT_EXT = 0x00000001;
+static const XrEyeTrackingModeCapabilityFlagsEXT
+    XR_EYE_TRACKING_MODE_CAPABILITY_RAW_BIT_EXT    = 0x00000002;
+
+/*!
+ * @brief Eye tracking mode capabilities — chained to XrSystemProperties.
+ *
+ * If supportedModes is 0 (NONE), the display has no eye tracking. In that
+ * case defaultMode is undefined, xrRequestEyeTrackingModeEXT returns
+ * XR_ERROR_FEATURE_UNSUPPORTED for any mode, and XrViewEyeTrackingStateEXT
+ * always reports isTracking=XR_FALSE.
+ *
+ * xrLocateViews ALWAYS returns fully populated views (count, positions, FOVs)
+ * regardless of tracking capability or state. The vendor SDK decides the view
+ * positions (e.g., nominal viewer, last known, filtered). isTracking only
+ * indicates whether those positions come from live eye tracking or a fallback.
+ *
+ * @extends XrSystemProperties
+ */
+typedef struct XrEyeTrackingModeCapabilitiesEXT {
+    XrStructureType                        type;           //!< Must be XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_EXT
+    void* XR_MAY_ALIAS                     next;
+    XrEyeTrackingModeCapabilityFlagsEXT    supportedModes; //!< Bitmask of supported modes (0 = no tracking)
+    XrEyeTrackingModeEXT                   defaultMode;    //!< Mode used if app never requests one
+} XrEyeTrackingModeCapabilitiesEXT;
+
+/*!
+ * @brief Per-frame eye tracking state — chained to XrViewState in xrLocateViews.
+ *
+ * xrLocateViews ALWAYS returns fully populated views (positions, FOVs)
+ * regardless of isTracking. When isTracking is XR_FALSE, positions are
+ * still valid — the vendor SDK populates them as it sees fit (e.g., last
+ * known, nominal viewer, filtered). isTracking tells the app whether
+ * positions come from live eye tracking or vendor-chosen fallback.
+ * The app may use isTracking to trigger its own animations or UI.
+ *
+ * @extends XrViewState
+ */
+typedef struct XrViewEyeTrackingStateEXT {
+    XrStructureType           type;       //!< Must be XR_TYPE_VIEW_EYE_TRACKING_STATE_EXT
+    void* XR_MAY_ALIAS        next;
+    XrBool32                  isTracking; //!< XR_TRUE if eyes are actively tracked this frame
+    XrEyeTrackingModeEXT     activeMode; //!< Currently active mode
+} XrViewEyeTrackingStateEXT;
+
+/*!
+ * @brief Request eye tracking mode switch.
+ *
+ * Switches between smooth and raw eye tracking modes. In smooth mode,
+ * the vendor SDK handles grace period + smoothing internally. In raw mode,
+ * the SDK provides unfiltered positions and the app uses isTracking to
+ * handle tracking loss.
+ *
+ * @param session A valid XrSession handle.
+ * @param mode The desired eye tracking mode.
+ * @return XR_SUCCESS on success,
+ *         XR_ERROR_FEATURE_UNSUPPORTED if the mode is not supported,
+ *         XR_ERROR_VALIDATION_FAILURE if mode is invalid.
+ */
+typedef XrResult (XRAPI_PTR *PFN_xrRequestEyeTrackingModeEXT)(
+    XrSession session, XrEyeTrackingModeEXT mode);
+
+#ifndef XR_NO_PROTOTYPES
+XRAPI_ATTR XrResult XRAPI_CALL xrRequestEyeTrackingModeEXT(
+    XrSession               session,
+    XrEyeTrackingModeEXT    mode);
 #endif
 
 #ifdef __cplusplus

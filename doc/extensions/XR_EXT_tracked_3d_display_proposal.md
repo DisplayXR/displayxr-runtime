@@ -629,7 +629,7 @@ No known IP claims.
 ### Name Strings
 
 - Extension name: `XR_EXT_display_info`
-- Spec version: 4
+- Spec version: 6
 - Extension name define: `XR_EXT_DISPLAY_INFO_EXTENSION_NAME`
 
 ### Overview
@@ -1552,6 +1552,118 @@ existing OpenXR contract already handles this transparently:
 
 ---
 
+## 7b. Eye Tracking Mode Control (v6)
+
+### Problem Statement
+
+The Leia SR SDK has internal `grace_period_s` / `resume_period_s` that smoothly collapse
+eye positions to a rest position when tracking is lost. This is convenient for most apps,
+but some developers want raw tracking values plus an explicit `isTracking` flag to handle
+tracking loss themselves (e.g., custom transition animations, UI overlays).
+
+### New Types
+
+#### `XrEyeTrackingModeEXT` — Mode Enum
+
+```c
+typedef enum XrEyeTrackingModeEXT {
+    XR_EYE_TRACKING_MODE_SMOOTH_EXT   = 0,  // default: SDK handles smoothing
+    XR_EYE_TRACKING_MODE_RAW_EXT      = 1,  // app handles tracking loss
+    XR_EYE_TRACKING_MODE_MAX_ENUM_EXT = 0x7FFFFFFF
+} XrEyeTrackingModeEXT;
+```
+
+`SMOOTH = 0` ensures zero-init defaults to current behavior for legacy apps.
+
+#### `XrEyeTrackingModeCapabilityFlagsEXT` — Capability Bitmask
+
+```c
+typedef XrFlags64 XrEyeTrackingModeCapabilityFlagsEXT;
+XR_EYE_TRACKING_MODE_CAPABILITY_NONE_EXT       = 0            // no tracking
+XR_EYE_TRACKING_MODE_CAPABILITY_SMOOTH_BIT_EXT = 0x00000001
+XR_EYE_TRACKING_MODE_CAPABILITY_RAW_BIT_EXT    = 0x00000002
+```
+
+A runtime that supports both modes sets `supportedModes = SMOOTH_BIT | RAW_BIT`.
+A display with no eye tracking sets `supportedModes = 0`.
+
+#### `XrEyeTrackingModeCapabilitiesEXT` — Extends `XrSystemProperties`
+
+```c
+typedef struct XrEyeTrackingModeCapabilitiesEXT {
+    XrStructureType                        type;           // XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_EXT
+    void* XR_MAY_ALIAS                     next;
+    XrEyeTrackingModeCapabilityFlagsEXT    supportedModes; // bitmask
+    XrEyeTrackingModeEXT                   defaultMode;    // mode used if app never requests one
+} XrEyeTrackingModeCapabilitiesEXT;
+```
+
+Chained to `XrSystemProperties` alongside `XrDisplayInfoEXT`. If `supportedModes == 0`,
+the display has no eye tracking; `defaultMode` is undefined and
+`xrRequestEyeTrackingModeEXT` returns `XR_ERROR_FEATURE_UNSUPPORTED` for any mode.
+
+#### `XrViewEyeTrackingStateEXT` — Extends `XrViewState`
+
+```c
+typedef struct XrViewEyeTrackingStateEXT {
+    XrStructureType           type;       // XR_TYPE_VIEW_EYE_TRACKING_STATE_EXT
+    void* XR_MAY_ALIAS        next;
+    XrBool32                  isTracking; // XR_TRUE if eyes are actively tracked
+    XrEyeTrackingModeEXT     activeMode; // currently active mode
+} XrViewEyeTrackingStateEXT;
+```
+
+Opt-in: only populated if the app chains this struct to `XrViewState` in `xrLocateViews`.
+
+### New Function: `xrRequestEyeTrackingModeEXT`
+
+```c
+XrResult xrRequestEyeTrackingModeEXT(XrSession session, XrEyeTrackingModeEXT mode);
+```
+
+**Return codes:**
+- `XR_SUCCESS` — mode switched
+- `XR_ERROR_FEATURE_UNSUPPORTED` — requested mode not in `supportedModes`
+- `XR_ERROR_VALIDATION_FAILURE` — invalid mode enum value
+
+### Behavioral Contract
+
+1. `xrLocateViews` **always** returns fully populated views (positions, FOVs) regardless
+   of tracking capability or `isTracking` state.
+2. When `isTracking == XR_FALSE`, the vendor SDK provides fallback positions (last known,
+   filtered, nominal viewer). The runtime passes vendor values through unchanged.
+3. `isTracking` is orthogonal to `XrViewState.viewStateFlags` (`POSITION_TRACKED_BIT` etc.)
+   — those flags reflect head pose tracking, not eye tracking.
+
+### Mode Semantics
+
+**Smooth mode** (default):
+- Vendor SDK handles grace period + resume smoothing internally
+- Eye positions converge smoothly to rest position when tracking lost
+- `isTracking` reflects vendor heuristic (e.g., eye distance > threshold)
+
+**Raw mode**:
+- Vendor SDK provides unfiltered positions
+- Vendor still responsible for fallback positions when tracking lost
+- App uses `isTracking` to trigger its own transition animations
+
+### Backward Compatibility
+
+- Apps compiled against v5 are unaffected: new structs/function are opt-in
+- `SMOOTH = 0` means apps that never call `xrRequestEyeTrackingModeEXT` get unchanged behavior
+- `XrViewEyeTrackingStateEXT` is only populated if chained by the app
+
+### Vendor Examples
+
+| Vendor | `supportedModes` | `defaultMode` | `isTracking` source |
+|--------|-------------------|---------------|---------------------|
+| Leia SR (current) | `SMOOTH_BIT` | `SMOOTH` | Eye-distance heuristic (collapsed = not tracking) |
+| Leia SR (future) | `SMOOTH_BIT \| RAW_BIT` | `SMOOTH` | SDK native flag |
+| Sim display | `RAW_BIT` | `RAW` | Always `XR_TRUE` (simulated) |
+| No-tracker display | `0` (NONE) | undefined | Always `XR_FALSE` |
+
+---
+
 ## 8. Version History
 
 ### XR_EXT_win32_window_binding
@@ -1574,6 +1686,8 @@ existing OpenXR contract already handles this transparently:
 | 2 | 2025-03-01 | David Fattal | Replaced absolute sizes with `recommendedViewScaleX/Y` scale factors. Added `XR_REFERENCE_SPACE_TYPE_DISPLAY_EXT`. Added nominal viewer pose. |
 | 3 | 2025-06-01 | David Fattal | Changed `nominalViewerPoseInDisplaySpace` from `XrPosef` to `XrVector3f nominalViewerPositionInDisplaySpace`. Orientation was always identity; position is now populated from the SR SDK's `getDefaultViewingPosition()`. |
 | 4 | 2026-02-13 | David Fattal | Added `supportsDisplayModeSwitch` capability flag, `XrDisplayModeEXT` enum, and `xrRequestDisplayModeEXT` function for 2D/3D mode control. Added automatic lifecycle behavior (3D on session READY, 2D on session STOPPING). |
+| 5 | 2026-02-20 | David Fattal | Added `displayPixelWidth` / `displayPixelHeight` to `XrDisplayInfoEXT`. |
+| 6 | 2026-02-27 | David Fattal | Eye tracking mode control: `XrEyeTrackingModeEXT` enum, `XrEyeTrackingModeCapabilitiesEXT` (chained to `XrSystemProperties`), `XrViewEyeTrackingStateEXT` (chained to `XrViewState`), and `xrRequestEyeTrackingModeEXT` function. Allows apps to choose between smooth (SDK-filtered) and raw eye tracking, with explicit `isTracking` flag. |
 
 ---
 
