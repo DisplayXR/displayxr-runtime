@@ -570,7 +570,7 @@ static void RenderThreadFunc(HWND hwnd, D3D11Renderer* renderer, TextOverlay* te
             std::wstring eyeText = FormatEyeTrackingInfo(
                 leftEyePosX, leftEyePosY, leftEyePosZ,
                 rightEyePosX, rightEyePosY, rightEyePosZ,
-                eyeTrackingActive);
+                eyeTrackingActive, eyeTrackingActive, 0, 0);
             std::wstring parallaxText = inputSnapshot.parallaxEnabled ?
                 L"Parallax: ON (tracking)" : L"Parallax: OFF (fixed)";
             std::wstring helpText = L"P: Parallax | ESC: Quit";
