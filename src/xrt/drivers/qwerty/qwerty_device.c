@@ -864,7 +864,7 @@ qwerty_check_display_mode_toggle(struct xrt_device **xdevs, size_t xdev_count, b
 	// Find a qwerty device in the device list
 	struct qwerty_system *qs = NULL;
 	for (size_t i = 0; i < xdev_count; i++) {
-		if (xdevs[i] == NULL) {
+		if (xdevs[i] == NULL || xdevs[i]->destroy != qwerty_destroy) {
 			continue;
 		}
 		const char *name = xdevs[i]->tracking_origin->name;
@@ -1057,7 +1057,7 @@ qwerty_get_stereo_state(struct xrt_device **xdevs, size_t xdev_count, struct qwe
 	// Find a qwerty device in the device list
 	struct qwerty_system *qs = NULL;
 	for (size_t i = 0; i < xdev_count; i++) {
-		if (xdevs[i] == NULL) {
+		if (xdevs[i] == NULL || xdevs[i]->destroy != qwerty_destroy) {
 			continue;
 		}
 		const char *name = xdevs[i]->tracking_origin->name;
