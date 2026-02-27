@@ -110,8 +110,8 @@ qwerty_process_macos(struct xrt_device **xdevs,
 
 	// Cached state (persists across calls)
 	static struct qwerty_system *qsys = NULL;
-	static bool option_pressed = false; // Option = Alt on macOS
-	static bool ctrl_pressed = false;
+	static bool ctrl_pressed = false;  // CTRL = left controller focus
+	static bool alt_pressed = false;   // ALT/Option = right controller focus
 	static struct qwerty_device *default_qdev = NULL;
 	static struct qwerty_controller *default_qctrl = NULL;
 	static bool cached = false;
@@ -127,7 +127,7 @@ qwerty_process_macos(struct xrt_device **xdevs,
 		default_qdev = default_qwerty_device(xdevs, xdev_count, qsys);
 		default_qctrl = default_qwerty_controller(xdevs, xdev_count, qsys);
 		cached = true;
-		U_LOG_W("QWERTY macOS input initialized - WASDQE move, RMB+drag look, LMB trigger, ESC quit");
+		U_LOG_W("QWERTY macOS input initialized - WASDQE move, RMB+drag look, F/G controller focus");
 	}
 
 	if (qsys == NULL || !qsys->process_keys) {
@@ -145,32 +145,15 @@ qwerty_process_macos(struct xrt_device **xdevs,
 
 	NSEventType type = [event type];
 
-	// Handle modifier key changes (Control, Option)
-	if (type == NSEventTypeFlagsChanged) {
-		NSUInteger flags = [event modifierFlags];
-		bool new_ctrl = (flags & NSEventModifierFlagControl) != 0;
-		bool new_option = (flags & NSEventModifierFlagOption) != 0;
+	// Handle F/G key state via flagsChanged won't work (they're not modifiers).
+	// We track F/G in the keyDown/keyUp handler below.
 
-		bool changed = (new_ctrl != ctrl_pressed) || (new_option != option_pressed);
-		ctrl_pressed = new_ctrl;
-		option_pressed = new_option;
-
-		if (changed) {
-			if (using_qhmd) {
-				qwerty_release_all(qd_hmd);
-			}
-			qwerty_release_all(qd_right);
-			qwerty_release_all(qd_left);
-			last_mouse_pos = [NSEvent mouseLocation];
-		}
-	}
-
-	// Build target arrays for dual controller support (CTRL+Option = both)
+	// Build target arrays for dual controller support (F+G = both)
 	struct qwerty_device *targets[2];
 	struct qwerty_controller *ctrl_targets[2];
 	int target_count;
 
-	if (ctrl_pressed && option_pressed) {
+	if (ctrl_pressed && alt_pressed) {
 		targets[0] = qd_left;
 		targets[1] = qd_right;
 		ctrl_targets[0] = qleft;
@@ -180,7 +163,7 @@ qwerty_process_macos(struct xrt_device **xdevs,
 		targets[0] = qd_left;
 		ctrl_targets[0] = qleft;
 		target_count = 1;
-	} else if (option_pressed) {
+	} else if (alt_pressed) {
 		targets[0] = qd_right;
 		ctrl_targets[0] = qright;
 		target_count = 1;
@@ -192,8 +175,41 @@ qwerty_process_macos(struct xrt_device **xdevs,
 
 	// Update GUI tracking vars
 	qsys->lctrl_focused = ctrl_pressed;
-	qsys->rctrl_focused = option_pressed;
-	qsys->hmd_focused = (!ctrl_pressed && !option_pressed && targets[0] == qd_hmd);
+	qsys->rctrl_focused = alt_pressed;
+	qsys->hmd_focused = (!ctrl_pressed && !alt_pressed && targets[0] == qd_hmd);
+
+	// Handle modifier key changes (CTRL/ALT for controller focus)
+	if (type == NSEventTypeFlagsChanged) {
+		NSUInteger flags = [event modifierFlags];
+		bool new_ctrl = (flags & NSEventModifierFlagControl) != 0;
+		bool new_alt = (flags & NSEventModifierFlagOption) != 0;
+
+		if (new_ctrl != ctrl_pressed || new_alt != alt_pressed) {
+			ctrl_pressed = new_ctrl;
+			alt_pressed = new_alt;
+			if (using_qhmd) qwerty_release_all(qd_hmd);
+			qwerty_release_all(qd_right);
+			qwerty_release_all(qd_left);
+			last_mouse_pos = [NSEvent mouseLocation];
+
+			// Rebuild targets after focus change
+			if (ctrl_pressed && alt_pressed) {
+				targets[0] = qd_left; targets[1] = qd_right;
+				ctrl_targets[0] = qleft; ctrl_targets[1] = qright;
+				target_count = 2;
+			} else if (ctrl_pressed) {
+				targets[0] = qd_left; ctrl_targets[0] = qleft; target_count = 1;
+			} else if (alt_pressed) {
+				targets[0] = qd_right; ctrl_targets[0] = qright; target_count = 1;
+			} else {
+				targets[0] = default_qdev; ctrl_targets[0] = default_qctrl; target_count = 1;
+			}
+			qsys->lctrl_focused = ctrl_pressed;
+			qsys->rctrl_focused = alt_pressed;
+			qsys->hmd_focused = (!ctrl_pressed && !alt_pressed && targets[0] == qd_hmd);
+		}
+		return; // Modifier change consumed
+	}
 
 	// Handle key events
 	if (type == NSEventTypeKeyDown || type == NSEventTypeKeyUp) {
@@ -204,94 +220,72 @@ qwerty_process_macos(struct xrt_device **xdevs,
 		// WASDQE Movement
 		case kVK_ANSI_W:
 			for (int i = 0; i < target_count; i++) {
-				if (is_down)
-					qwerty_press_forward(targets[i]);
-				else
-					qwerty_release_forward(targets[i]);
+				if (is_down) qwerty_press_forward(targets[i]);
+				else qwerty_release_forward(targets[i]);
 			}
 			break;
 		case kVK_ANSI_A:
 			for (int i = 0; i < target_count; i++) {
-				if (is_down)
-					qwerty_press_left(targets[i]);
-				else
-					qwerty_release_left(targets[i]);
+				if (is_down) qwerty_press_left(targets[i]);
+				else qwerty_release_left(targets[i]);
 			}
 			break;
 		case kVK_ANSI_S:
 			for (int i = 0; i < target_count; i++) {
-				if (is_down)
-					qwerty_press_backward(targets[i]);
-				else
-					qwerty_release_backward(targets[i]);
+				if (is_down) qwerty_press_backward(targets[i]);
+				else qwerty_release_backward(targets[i]);
 			}
 			break;
 		case kVK_ANSI_D:
 			for (int i = 0; i < target_count; i++) {
-				if (is_down)
-					qwerty_press_right(targets[i]);
-				else
-					qwerty_release_right(targets[i]);
+				if (is_down) qwerty_press_right(targets[i]);
+				else qwerty_release_right(targets[i]);
 			}
 			break;
 		case kVK_ANSI_Q:
 			for (int i = 0; i < target_count; i++) {
-				if (is_down)
-					qwerty_press_down(targets[i]);
-				else
-					qwerty_release_down(targets[i]);
+				if (is_down) qwerty_press_down(targets[i]);
+				else qwerty_release_down(targets[i]);
 			}
 			break;
 		case kVK_ANSI_E:
 			for (int i = 0; i < target_count; i++) {
-				if (is_down)
-					qwerty_press_up(targets[i]);
-				else
-					qwerty_release_up(targets[i]);
+				if (is_down) qwerty_press_up(targets[i]);
+				else qwerty_release_up(targets[i]);
 			}
 			break;
 
 		// Arrow keys rotation
 		case kVK_LeftArrow:
 			for (int i = 0; i < target_count; i++) {
-				if (is_down)
-					qwerty_press_look_left(targets[i]);
-				else
-					qwerty_release_look_left(targets[i]);
+				if (is_down) qwerty_press_look_left(targets[i]);
+				else qwerty_release_look_left(targets[i]);
 			}
 			break;
 		case kVK_RightArrow:
 			for (int i = 0; i < target_count; i++) {
-				if (is_down)
-					qwerty_press_look_right(targets[i]);
-				else
-					qwerty_release_look_right(targets[i]);
+				if (is_down) qwerty_press_look_right(targets[i]);
+				else qwerty_release_look_right(targets[i]);
 			}
 			break;
 		case kVK_UpArrow:
 			for (int i = 0; i < target_count; i++) {
-				if (is_down)
-					qwerty_press_look_up(targets[i]);
-				else
-					qwerty_release_look_up(targets[i]);
+				if (is_down) qwerty_press_look_up(targets[i]);
+				else qwerty_release_look_up(targets[i]);
 			}
 			break;
 		case kVK_DownArrow:
 			for (int i = 0; i < target_count; i++) {
-				if (is_down)
-					qwerty_press_look_down(targets[i]);
-				else
-					qwerty_release_look_down(targets[i]);
+				if (is_down) qwerty_press_look_down(targets[i]);
+				else qwerty_release_look_down(targets[i]);
 			}
 			break;
 
 		// Sprint
 		case kVK_Shift:
 			for (int i = 0; i < target_count; i++) {
-				if (is_down)
-					qwerty_press_sprint(targets[i]);
-				else
-					qwerty_release_sprint(targets[i]);
+				if (is_down) qwerty_press_sprint(targets[i]);
+				else qwerty_release_sprint(targets[i]);
 			}
 			break;
 
@@ -312,54 +306,63 @@ qwerty_process_macos(struct xrt_device **xdevs,
 		// Controller buttons
 		case kVK_ANSI_N:
 			for (int i = 0; i < target_count; i++) {
-				if (is_down)
-					qwerty_press_menu(ctrl_targets[i]);
-				else
-					qwerty_release_menu(ctrl_targets[i]);
+				if (is_down) qwerty_press_menu(ctrl_targets[i]);
+				else qwerty_release_menu(ctrl_targets[i]);
 			}
 			break;
 		case kVK_ANSI_B:
 			for (int i = 0; i < target_count; i++) {
-				if (is_down)
-					qwerty_press_system(ctrl_targets[i]);
-				else
-					qwerty_release_system(ctrl_targets[i]);
+				if (is_down) qwerty_press_system(ctrl_targets[i]);
+				else qwerty_release_system(ctrl_targets[i]);
 			}
 			break;
 
-		// Thumbstick
+		// Thumbstick + Trackpad (T/F/G/H = up/left/down/right)
 		case kVK_ANSI_F:
 			for (int i = 0; i < target_count; i++) {
-				if (is_down)
+				if (is_down) {
 					qwerty_press_thumbstick_left(ctrl_targets[i]);
-				else
+					qwerty_press_trackpad_left(ctrl_targets[i]);
+				} else {
 					qwerty_release_thumbstick_left(ctrl_targets[i]);
+					qwerty_release_trackpad_left(ctrl_targets[i]);
+				}
 			}
 			break;
 		case kVK_ANSI_H:
 			for (int i = 0; i < target_count; i++) {
-				if (is_down)
+				if (is_down) {
 					qwerty_press_thumbstick_right(ctrl_targets[i]);
-				else
+					qwerty_press_trackpad_right(ctrl_targets[i]);
+				} else {
 					qwerty_release_thumbstick_right(ctrl_targets[i]);
+					qwerty_release_trackpad_right(ctrl_targets[i]);
+				}
 			}
 			break;
 		case kVK_ANSI_T:
 			for (int i = 0; i < target_count; i++) {
-				if (is_down)
+				if (is_down) {
 					qwerty_press_thumbstick_up(ctrl_targets[i]);
-				else
+					qwerty_press_trackpad_up(ctrl_targets[i]);
+				} else {
 					qwerty_release_thumbstick_up(ctrl_targets[i]);
+					qwerty_release_trackpad_up(ctrl_targets[i]);
+				}
 			}
 			break;
 		case kVK_ANSI_G:
 			for (int i = 0; i < target_count; i++) {
-				if (is_down)
+				if (is_down) {
 					qwerty_press_thumbstick_down(ctrl_targets[i]);
-				else
+					qwerty_press_trackpad_down(ctrl_targets[i]);
+				} else {
 					qwerty_release_thumbstick_down(ctrl_targets[i]);
+					qwerty_release_trackpad_down(ctrl_targets[i]);
+				}
 			}
 			break;
+
 		case kVK_ANSI_V:
 			if (qsys->hmd_focused) {
 				// HMD focused: toggle runtime-side 2D/3D display mode
@@ -368,60 +371,16 @@ qwerty_process_macos(struct xrt_device **xdevs,
 			} else {
 				// Controller focused: thumbstick click
 				for (int i = 0; i < target_count; i++) {
-					if (is_down)
-						qwerty_press_thumbstick_click(ctrl_targets[i]);
-					else
-						qwerty_release_thumbstick_click(ctrl_targets[i]);
+					if (is_down) qwerty_press_thumbstick_click(ctrl_targets[i]);
+					else qwerty_release_thumbstick_click(ctrl_targets[i]);
 				}
-			}
-			break;
-
-		// Trackpad
-		case kVK_ANSI_J:
-			for (int i = 0; i < target_count; i++) {
-				if (is_down)
-					qwerty_press_trackpad_left(ctrl_targets[i]);
-				else
-					qwerty_release_trackpad_left(ctrl_targets[i]);
-			}
-			break;
-		case kVK_ANSI_L:
-			for (int i = 0; i < target_count; i++) {
-				if (is_down)
-					qwerty_press_trackpad_right(ctrl_targets[i]);
-				else
-					qwerty_release_trackpad_right(ctrl_targets[i]);
-			}
-			break;
-		case kVK_ANSI_I:
-			for (int i = 0; i < target_count; i++) {
-				if (is_down)
-					qwerty_press_trackpad_up(ctrl_targets[i]);
-				else
-					qwerty_release_trackpad_up(ctrl_targets[i]);
-			}
-			break;
-		case kVK_ANSI_K:
-			for (int i = 0; i < target_count; i++) {
-				if (is_down)
-					qwerty_press_trackpad_down(ctrl_targets[i]);
-				else
-					qwerty_release_trackpad_down(ctrl_targets[i]);
-			}
-			break;
-		case kVK_ANSI_M:
-			for (int i = 0; i < target_count; i++) {
-				if (is_down)
-					qwerty_press_trackpad_click(ctrl_targets[i]);
-				else
-					qwerty_release_trackpad_click(ctrl_targets[i]);
 			}
 			break;
 
 		// Controller follow HMD toggle
 		case kVK_ANSI_C:
 			if (is_down && ![event isARepeat]) {
-				if (ctrl_pressed || option_pressed) {
+				if (ctrl_pressed || alt_pressed) {
 					for (int i = 0; i < target_count; i++)
 						qwerty_follow_hmd(ctrl_targets[i], !ctrl_targets[i]->follow_hmd);
 				} else {
@@ -435,7 +394,7 @@ qwerty_process_macos(struct xrt_device **xdevs,
 		// Reset controller pose
 		case kVK_ANSI_R:
 			if (is_down && ![event isARepeat]) {
-				if (ctrl_pressed || option_pressed) {
+				if (ctrl_pressed || alt_pressed) {
 					for (int i = 0; i < target_count; i++)
 						qwerty_reset_controller_pose(ctrl_targets[i]);
 				} else {
@@ -450,42 +409,16 @@ qwerty_process_macos(struct xrt_device **xdevs,
 				u_hud_toggle();
 			break;
 
-		// === Camera-centric stereo controls (HMD focused only) ===
-		case kVK_ANSI_P: // Toggle camera/display mode
+		// P = toggle camera/display mode (HMD focused only)
+		case kVK_ANSI_P:
 			if (is_down && ![event isARepeat] && qsys->hmd_focused)
 				qwerty_toggle_camera_mode(qsys);
 			break;
-		case kVK_ANSI_LeftBracket: // '[' - Zoom/Scale decrease
-			if (is_down && qsys->hmd_focused)
-				qwerty_adjust_zoom_or_scale(qsys, 1.0f / 1.05f);
-			break;
-		case kVK_ANSI_RightBracket: // ']' - Zoom/Scale increase
-			if (is_down && qsys->hmd_focused)
-				qwerty_adjust_zoom_or_scale(qsys, 1.05f);
-			break;
-		case kVK_ANSI_Minus: // '-' - IPD factor decrease
-			if (is_down && qsys->hmd_focused)
-				qwerty_adjust_ipd_factor(qsys, -0.05f);
-			break;
-		case kVK_ANSI_Equal: // '=' - IPD factor increase
-			if (is_down && qsys->hmd_focused)
-				qwerty_adjust_ipd_factor(qsys, 0.05f);
-			break;
-		case kVK_ANSI_Semicolon: // ';' - Parallax factor decrease
-			if (is_down && qsys->hmd_focused)
-				qwerty_adjust_parallax_factor(qsys, -0.05f);
-			break;
-		case kVK_ANSI_Quote: // '\'' - Parallax factor increase
-			if (is_down && qsys->hmd_focused)
-				qwerty_adjust_parallax_factor(qsys, 0.05f);
-			break;
-		case kVK_ANSI_Comma: // ',' - Convergence/Perspective decrease
-			if (is_down && qsys->hmd_focused)
-				qwerty_adjust_convergence_or_perspective(qsys, 1.0f / 1.05f);
-			break;
-		case kVK_ANSI_Period: // '.' - Convergence/Perspective increase
-			if (is_down && qsys->hmd_focused)
-				qwerty_adjust_convergence_or_perspective(qsys, 1.05f);
+
+		// Spacebar = reset stereo to camera defaults (HMD focused only)
+		case kVK_Space:
+			if (is_down && ![event isARepeat] && qsys->hmd_focused)
+				qwerty_reset_stereo(qsys);
 			break;
 
 		default:
@@ -540,7 +473,7 @@ qwerty_process_macos(struct xrt_device **xdevs,
 				float pitch = dy * SENSITIVITY;
 				for (int i = 0; i < target_count; i++)
 					qwerty_add_look_delta(targets[i], yaw, pitch);
-			} else if (ctrl_pressed || option_pressed) {
+			} else if (ctrl_pressed || alt_pressed) {
 				// Controller focused (no RMB): XY translation
 				float pos_dx = dx * POSITION_SENSITIVITY;
 				float pos_dy = dy * POSITION_SENSITIVITY;
@@ -558,9 +491,24 @@ qwerty_process_macos(struct xrt_device **xdevs,
 			delta_y /= 10.0f; // Normalize trackpad scrolling
 		}
 		if (delta_y != 0) {
-			int steps = (delta_y > 0) ? 1 : -1;
-			for (int i = 0; i < target_count; i++)
-				qwerty_change_movement_speed(targets[i], (float)steps);
+			if (qsys->hmd_focused) {
+				// HMD focused: mouse wheel + modifiers for stereo controls
+				NSUInteger flags = [event modifierFlags];
+				if (flags & NSEventModifierFlagShift) {
+					float mult = (delta_y > 0) ? 1.1f : (1.0f / 1.1f);
+					qwerty_adjust_stereo_factor(qsys, mult);
+				} else if (qsys->camera_mode) {
+					qwerty_adjust_convergence(qsys, (delta_y > 0) ? 1.0f : -1.0f);
+				} else {
+					float mult = (delta_y > 0) ? 1.05f : (1.0f / 1.05f);
+					qwerty_adjust_vheight(qsys, mult);
+				}
+			} else {
+				// Controller focused: movement speed
+				int steps = (delta_y > 0) ? 1 : -1;
+				for (int i = 0; i < target_count; i++)
+					qwerty_change_movement_speed(targets[i], (float)steps);
+			}
 		}
 	} break;
 

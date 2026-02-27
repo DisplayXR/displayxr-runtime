@@ -104,10 +104,10 @@ qwerty_process_event(struct xrt_device **xdevs, size_t xdev_count, SDL_Event eve
 {
 	static struct qwerty_system *qsys = NULL;
 
-	static bool alt_pressed = false;
-	static bool ctrl_pressed = false;
+	static bool ctrl_pressed = false; // CTRL = left controller focus
+	static bool alt_pressed = false;  // ALT = right controller focus
 
-	// Default focused device: the one focused when CTRL and ALT are not pressed
+	// Default focused device: the one focused when F and G are not pressed
 	static struct qwerty_device *default_qdev;
 	// Default focused controller: the one used for qwerty_controller specific methods
 	static struct qwerty_controller *default_qctrl;
@@ -138,17 +138,17 @@ qwerty_process_event(struct xrt_device **xdevs, size_t xdev_count, SDL_Event eve
 	struct qwerty_device *qd_hmd = using_qhmd ? &qhmd->base : NULL;
 
 	// clang-format off
-	// CTRL/ALT keys logic
-	bool alt_down = event.type == SDL_KEYDOWN && event.key.keysym.scancode == SDL_SCANCODE_LALT;
-	bool alt_up = event.type == SDL_KEYUP && event.key.keysym.scancode == SDL_SCANCODE_LALT;
+	// CTRL/ALT keys for controller focus
 	bool ctrl_down = event.type == SDL_KEYDOWN && event.key.keysym.scancode == SDL_SCANCODE_LCTRL;
 	bool ctrl_up = event.type == SDL_KEYUP && event.key.keysym.scancode == SDL_SCANCODE_LCTRL;
-	if (alt_down) alt_pressed = true;
-	if (alt_up) alt_pressed = false;
+	bool alt_down = event.type == SDL_KEYDOWN && event.key.keysym.scancode == SDL_SCANCODE_LALT;
+	bool alt_up = event.type == SDL_KEYUP && event.key.keysym.scancode == SDL_SCANCODE_LALT;
 	if (ctrl_down) ctrl_pressed = true;
 	if (ctrl_up) ctrl_pressed = false;
+	if (alt_down) alt_pressed = true;
+	if (alt_up) alt_pressed = false;
 
-	bool change_focus = alt_down || alt_up || ctrl_down || ctrl_up;
+	bool change_focus = ctrl_down || ctrl_up || alt_down || alt_up;
 	if (change_focus) {
 		if (using_qhmd) qwerty_release_all(qd_hmd);
 		qwerty_release_all(qd_right);
@@ -193,8 +193,24 @@ qwerty_process_event(struct xrt_device **xdevs, size_t xdev_count, SDL_Event eve
 	if (event.type == SDL_KEYDOWN && event.key.keysym.scancode == SDL_SCANCODE_DOWN) qwerty_press_look_down(qdev);
 	if (event.type == SDL_KEYUP && event.key.keysym.scancode == SDL_SCANCODE_DOWN) qwerty_release_look_down(qdev);
 
-	// Movement speed
-	if (event.type == SDL_MOUSEWHEEL) qwerty_change_movement_speed(qdev, event.wheel.y);
+	// Mouse wheel: stereo controls (HMD focused) or movement speed (controller focused)
+	if (event.type == SDL_MOUSEWHEEL && event.wheel.y != 0) {
+		if (qdev == qd_hmd) {
+			SDL_Keymod mod = SDL_GetModState();
+			if (mod & KMOD_SHIFT) {
+				float mult = (event.wheel.y > 0) ? 1.1f : (1.0f / 1.1f);
+				qwerty_adjust_stereo_factor(qsys, mult);
+			} else if (qsys->camera_mode) {
+				qwerty_adjust_convergence(qsys, (event.wheel.y > 0) ? 1.0f : -1.0f);
+			} else {
+				float mult = (event.wheel.y > 0) ? 1.05f : (1.0f / 1.05f);
+				qwerty_adjust_vheight(qsys, mult);
+			}
+		} else {
+			// Controller focused: movement speed
+			qwerty_change_movement_speed(qdev, event.wheel.y);
+		}
+	}
 	if (event.type == SDL_KEYDOWN && event.key.keysym.scancode == SDL_SCANCODE_KP_PLUS) qwerty_change_movement_speed(qdev, 1);
 	if (event.type == SDL_KEYDOWN && event.key.keysym.scancode == SDL_SCANCODE_KP_MINUS) qwerty_change_movement_speed(qdev, -1);
 
@@ -224,43 +240,31 @@ qwerty_process_event(struct xrt_device **xdevs, size_t xdev_count, SDL_Event eve
 	if (event.type == SDL_KEYDOWN && event.key.keysym.scancode == SDL_SCANCODE_B) qwerty_press_system(qctrl);
 	if (event.type == SDL_KEYUP && event.key.keysym.scancode == SDL_SCANCODE_B) qwerty_release_system(qctrl);
 
-	// Thumbstick
-	if (event.type == SDL_KEYDOWN && event.key.keysym.scancode == SDL_SCANCODE_F) qwerty_press_thumbstick_left(qctrl);
-	if (event.type == SDL_KEYUP && event.key.keysym.scancode == SDL_SCANCODE_F) qwerty_release_thumbstick_left(qctrl);
-	if (event.type == SDL_KEYDOWN && event.key.keysym.scancode == SDL_SCANCODE_H) qwerty_press_thumbstick_right(qctrl);
-	if (event.type == SDL_KEYUP && event.key.keysym.scancode == SDL_SCANCODE_H) qwerty_release_thumbstick_right(qctrl);
-	if (event.type == SDL_KEYDOWN && event.key.keysym.scancode == SDL_SCANCODE_T) qwerty_press_thumbstick_up(qctrl);
-	if (event.type == SDL_KEYUP && event.key.keysym.scancode == SDL_SCANCODE_T) qwerty_release_thumbstick_up(qctrl);
-	if (event.type == SDL_KEYDOWN && event.key.keysym.scancode == SDL_SCANCODE_G) qwerty_press_thumbstick_down(qctrl);
-	if (event.type == SDL_KEYUP && event.key.keysym.scancode == SDL_SCANCODE_G) qwerty_release_thumbstick_down(qctrl);
-	if (event.type == SDL_KEYDOWN && event.key.keysym.scancode == SDL_SCANCODE_V) qwerty_press_thumbstick_click(qctrl);
-	if (event.type == SDL_KEYUP && event.key.keysym.scancode == SDL_SCANCODE_V) qwerty_release_thumbstick_click(qctrl);
+	// Thumbstick + Trackpad (T/F/G/H = up/left/right/down)
+	if (event.type == SDL_KEYDOWN && event.key.keysym.scancode == SDL_SCANCODE_F) { qwerty_press_thumbstick_left(qctrl); qwerty_press_trackpad_left(qctrl); }
+	if (event.type == SDL_KEYUP && event.key.keysym.scancode == SDL_SCANCODE_F) { qwerty_release_thumbstick_left(qctrl); qwerty_release_trackpad_left(qctrl); }
+	if (event.type == SDL_KEYDOWN && event.key.keysym.scancode == SDL_SCANCODE_H) { qwerty_press_thumbstick_right(qctrl); qwerty_press_trackpad_right(qctrl); }
+	if (event.type == SDL_KEYUP && event.key.keysym.scancode == SDL_SCANCODE_H) { qwerty_release_thumbstick_right(qctrl); qwerty_release_trackpad_right(qctrl); }
+	if (event.type == SDL_KEYDOWN && event.key.keysym.scancode == SDL_SCANCODE_T) { qwerty_press_thumbstick_up(qctrl); qwerty_press_trackpad_up(qctrl); }
+	if (event.type == SDL_KEYUP && event.key.keysym.scancode == SDL_SCANCODE_T) { qwerty_release_thumbstick_up(qctrl); qwerty_release_trackpad_up(qctrl); }
+	if (event.type == SDL_KEYDOWN && event.key.keysym.scancode == SDL_SCANCODE_G) { qwerty_press_thumbstick_down(qctrl); qwerty_press_trackpad_down(qctrl); }
+	if (event.type == SDL_KEYUP && event.key.keysym.scancode == SDL_SCANCODE_G) { qwerty_release_thumbstick_down(qctrl); qwerty_release_trackpad_down(qctrl); }
 
-	// Trackpad
-	if (event.type == SDL_KEYDOWN && event.key.keysym.scancode == SDL_SCANCODE_J) qwerty_press_trackpad_left(qctrl);
-	if (event.type == SDL_KEYUP && event.key.keysym.scancode == SDL_SCANCODE_J) qwerty_release_trackpad_left(qctrl);
-	if (event.type == SDL_KEYDOWN && event.key.keysym.scancode == SDL_SCANCODE_L) qwerty_press_trackpad_right(qctrl);
-	if (event.type == SDL_KEYUP && event.key.keysym.scancode == SDL_SCANCODE_L) qwerty_release_trackpad_right(qctrl);
-	if (event.type == SDL_KEYDOWN && event.key.keysym.scancode == SDL_SCANCODE_I) qwerty_press_trackpad_up(qctrl);
-	if (event.type == SDL_KEYUP && event.key.keysym.scancode == SDL_SCANCODE_I) qwerty_release_trackpad_up(qctrl);
-	if (event.type == SDL_KEYDOWN && event.key.keysym.scancode == SDL_SCANCODE_K) qwerty_press_trackpad_down(qctrl);
-	if (event.type == SDL_KEYUP && event.key.keysym.scancode == SDL_SCANCODE_K) qwerty_release_trackpad_down(qctrl);
-	if (event.type == SDL_KEYDOWN && event.key.keysym.scancode == SDL_SCANCODE_M) qwerty_press_trackpad_click(qctrl);
-	if (event.type == SDL_KEYUP && event.key.keysym.scancode == SDL_SCANCODE_M) qwerty_release_trackpad_click(qctrl);
-
-	// Camera-centric stereo controls (HMD focused, one-shot on keydown)
+	// Stereo mode toggle (HMD focused, one-shot on keydown)
 	if (event.type == SDL_KEYDOWN && event.key.repeat == 0 && qdev == qd_hmd) {
 		if (event.key.keysym.scancode == SDL_SCANCODE_P) qwerty_toggle_camera_mode(qsys);
+		if (event.key.keysym.scancode == SDL_SCANCODE_SPACE) qwerty_reset_stereo(qsys);
 	}
-	if (event.type == SDL_KEYDOWN && qdev == qd_hmd) {
-		if (event.key.keysym.scancode == SDL_SCANCODE_LEFTBRACKET) qwerty_adjust_zoom_or_scale(qsys, 1.0f / 1.05f);
-		if (event.key.keysym.scancode == SDL_SCANCODE_RIGHTBRACKET) qwerty_adjust_zoom_or_scale(qsys, 1.05f);
-		if (event.key.keysym.scancode == SDL_SCANCODE_MINUS) qwerty_adjust_ipd_factor(qsys, -0.05f);
-		if (event.key.keysym.scancode == SDL_SCANCODE_EQUALS) qwerty_adjust_ipd_factor(qsys, 0.05f);
-		if (event.key.keysym.scancode == SDL_SCANCODE_SEMICOLON) qwerty_adjust_parallax_factor(qsys, -0.05f);
-		if (event.key.keysym.scancode == SDL_SCANCODE_APOSTROPHE) qwerty_adjust_parallax_factor(qsys, 0.05f);
-		if (event.key.keysym.scancode == SDL_SCANCODE_COMMA) qwerty_adjust_convergence_or_perspective(qsys, 1.0f / 1.05f);
-		if (event.key.keysym.scancode == SDL_SCANCODE_PERIOD) qwerty_adjust_convergence_or_perspective(qsys, 1.05f);
+
+	// V key: HMD focused = 2D/3D toggle, controller focused = thumbstick click
+	if (event.type == SDL_KEYDOWN && event.key.repeat == 0) {
+		if (event.key.keysym.scancode == SDL_SCANCODE_V) {
+			if (qdev == qd_hmd) qwerty_toggle_display_mode(qsys);
+			else qwerty_press_thumbstick_click(qctrl);
+		}
+	}
+	if (event.type == SDL_KEYUP && event.key.keysym.scancode == SDL_SCANCODE_V && qdev != qd_hmd) {
+		qwerty_release_thumbstick_click(qctrl);
 	}
 
 	// clang-format on

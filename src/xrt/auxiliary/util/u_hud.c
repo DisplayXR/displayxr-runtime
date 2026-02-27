@@ -628,22 +628,28 @@ u_hud_update(struct u_hud *hud, const struct u_hud_data *data)
 
 	// === Stereo controls section ===
 	{
-		const char *mode_str = data->camera_mode ? "Camera" : "Display";
-		snprintf(buf, sizeof(buf), "%s [P]  IPD:%.2f [-/=]  Prlx:%.2f [;/']",
-		         mode_str, data->stereo_ipd_factor, data->stereo_parallax_factor);
-		draw_string_aa(hud, x, y, buf, COLOR_VALUE);
-		y += lh;
-
 		if (data->camera_mode) {
-			float vfov_deg = 2.0f * atanf(data->stereo_half_tan_vfov) * 180.0f / 3.14159265f;
-			snprintf(buf, sizeof(buf), "Zoom:%.2f [/]  Conv:%.2f [,/.]  vFOV:%.1f",
-			         data->stereo_zoom_or_scale,
-			         data->stereo_convergence_or_perspective,
-			         vfov_deg);
+			snprintf(buf, sizeof(buf), "Camera [P]  IPD/Prlx:%.3f [Sh+Wh]",
+			         data->cam_ipd_factor);
+			draw_string_aa(hud, x, y, buf, COLOR_VALUE);
+			y += lh;
+
+			float vfov_deg = 2.0f * atanf(data->cam_half_tan_vfov) * 180.0f / 3.14159265f;
+			float derived_persp = 1.0f;
+			if (data->nominal_viewer_z > 0.0f && data->cam_half_tan_vfov > 0.0f) {
+				derived_persp = data->screen_height_m /
+				                (2.0f * data->nominal_viewer_z * data->cam_half_tan_vfov);
+			}
+			snprintf(buf, sizeof(buf), "Conv:%.2f dp [Wh]  vFOV:%.1f  Persp*:%.2f",
+			         data->cam_convergence, vfov_deg, derived_persp);
 		} else {
-			snprintf(buf, sizeof(buf), "Scale:%.2f [/]  Persp:%.2f [,/.]",
-			         data->stereo_zoom_or_scale,
-			         data->stereo_convergence_or_perspective);
+			snprintf(buf, sizeof(buf), "Display [P]  IPD/Prlx:%.3f [Sh+Wh]",
+			         data->disp_ipd_factor);
+			draw_string_aa(hud, x, y, buf, COLOR_VALUE);
+			y += lh;
+
+			snprintf(buf, sizeof(buf), "vH:%.2fm [Wh]",
+			         data->disp_vHeight);
 		}
 		draw_string_aa(hud, x, y, buf, COLOR_VALUE);
 		y += lh;

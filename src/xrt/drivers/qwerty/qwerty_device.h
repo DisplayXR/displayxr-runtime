@@ -44,13 +44,23 @@ struct qwerty_system
 	bool force_2d_mode;              //!< Runtime-side 2D/3D toggle (V key when HMD focused)
 	bool display_mode_toggle_pending; //!< Set by key handler, cleared by compositor
 
-	// Camera-centric stereo controls (P/[/]/-/=/;/'/,/. keys when HMD focused)
-	bool camera_mode;                //!< true=camera-centric, false=display-centric
-	float ipd_factor;                //!< [0,1] (default: 1.0)
-	float parallax_factor;           //!< [0,1] (default: 1.0)
-	float zoom_or_scale;             //!< [0.1,10] (default: 1.0)
-	float convergence_or_perspective; //!< [0.1,10] (default: 0.5 -> 2m convergence)
-	float half_tan_vfov;             //!< tan(18deg) ~ 0.3249 for 36deg vFOV
+	// Stereo controls (P toggles mode with derivation, spacebar resets)
+	bool camera_mode; //!< true=camera-centric (default), false=display-centric
+
+	// Camera-centric state (user adjusts when camera_mode=true)
+	float cam_ipd_factor;      //!< [0.01,1] default 1.0 (= cam_parallax always)
+	float cam_parallax_factor; //!< [0.01,1] default 1.0 (= cam_ipd always)
+	float cam_convergence;     //!< [0,2] diopters, default 0.5
+	float cam_half_tan_vfov;   //!< default 0.3249 — derived only, not user-adjustable
+
+	// Display-centric state (user adjusts when camera_mode=false)
+	float disp_ipd_factor;      //!< [0.01,1] default 1.0 (= disp_parallax always)
+	float disp_parallax_factor; //!< [0.01,1] default 1.0 (= disp_ipd always)
+	float disp_vHeight;         //!< [0.1,10] meters, default 1.3
+
+	// Hardware config (set by target builder)
+	float nominal_viewer_z; //!< meters (e.g. 0.6 from sim_display)
+	float screen_height_m;  //!< meters (e.g. 0.194 from sim_display)
 };
 
 /*!
@@ -442,32 +452,34 @@ void
 qwerty_toggle_camera_mode(struct qwerty_system *qs);
 
 /*!
- * Adjust IPD factor by delta (clamped to [0,1]).
+ * Adjust IPD+parallax factor by multiplier (both set to same value, clamped [0.01,1]).
  * @public @memberof qwerty_system
  */
 void
-qwerty_adjust_ipd_factor(struct qwerty_system *qs, float delta);
+qwerty_adjust_stereo_factor(struct qwerty_system *qs, float multiplier);
 
 /*!
- * Adjust parallax factor by delta (clamped to [0,1]).
+ * Adjust convergence by additive direction (camera mode only, ±0.05, clamped [0,2]).
+ * No-op if in display mode.
  * @public @memberof qwerty_system
  */
 void
-qwerty_adjust_parallax_factor(struct qwerty_system *qs, float delta);
+qwerty_adjust_convergence(struct qwerty_system *qs, float direction);
 
 /*!
- * Adjust zoom (camera) or scale (display) by multiplicative factor.
+ * Adjust virtual display height by multiplier (display mode only, clamped [0.1,10]).
+ * No-op if in camera mode.
  * @public @memberof qwerty_system
  */
 void
-qwerty_adjust_zoom_or_scale(struct qwerty_system *qs, float multiplier);
+qwerty_adjust_vheight(struct qwerty_system *qs, float multiplier);
 
 /*!
- * Adjust convergence (camera) or perspective (display) by multiplicative factor.
+ * Reset all stereo state to camera defaults and HMD position to (0, 1.6, 0).
  * @public @memberof qwerty_system
  */
 void
-qwerty_adjust_convergence_or_perspective(struct qwerty_system *qs, float multiplier);
+qwerty_reset_stereo(struct qwerty_system *qs);
 
 
 /*!

@@ -13,10 +13,13 @@
 
 The qwerty driver provides simulated HMD and controller devices that are controlled entirely via keyboard and mouse input. It allows developers to test OpenXR applications without physical VR hardware by moving a virtual headset and two virtual controllers through keyboard commands and mouse look.
 
-The driver has two input backends:
+**Note:** The qwerty device is a pure input device — it captures keyboard/mouse input on the Monado-owned window and translates it into HMD pose + controller state. It does not produce any display output.
+
+The driver has three input backends:
 
 - **SDL backend** (`qwerty_sdl.c`) — Uses the Monado debug GUI window. Cross-platform.
 - **Win32 backend** (`qwerty_win32.c`) — Uses the D3D11 compositor window directly. Windows only. Active when Monado creates its own window (no HWND provided via `XR_EXT_win32_window_binding`).
+- **macOS backend** (`qwerty_macos.m`) — Uses the Vulkan compositor NSWindow directly. macOS only.
 
 ---
 
@@ -139,9 +142,11 @@ When toggling follow mode, the controller's pose is transformed between global a
 
 | Device | Initial Position (meters) |
 |--------|--------------------------|
-| HMD | (0, 1.6, 0) — standing eye height |
+| HMD | (0, 1.6, 0) — camera mode default (viewer at eye height) |
 | Left Controller | (-0.2, -0.3, -0.5) relative to HMD |
 | Right Controller | (0.2, -0.3, -0.5) relative to HMD |
+
+Default startup is camera mode at (0, 1.6, 0). Display mode position is derived when toggling with P.
 
 ### 3.6 Movement Speed
 
@@ -154,9 +159,83 @@ Speed is adjusted by mouse wheel or numpad +/- in exponential steps of 1.25x.
 
 ---
 
-## 4. Win32 Input Reference
+## 4. Stereo Controls
 
-### 4.1 Device Focus
+The qwerty driver supports two stereo projection modes: **Camera-centric** and **Display-centric**, toggled by the **P** key.
+
+### 4.1 Dual State Model
+
+Each mode has its own independent variable set:
+
+| Variable | Camera Mode | Display Mode |
+|----------|-------------|-------------|
+| IPD factor | `cam_ipd_factor` [0.01, 1] default 1.0 | `disp_ipd_factor` [0.01, 1] default 1.0 |
+| Parallax factor | `cam_parallax_factor` (= ipd always) | `disp_parallax_factor` (= ipd always) |
+| Convergence | `cam_convergence` [0, 2] diopters, default 0.5 | — |
+| Half-tan vFOV | `cam_half_tan_vfov` default 0.3249 (derived only) | — |
+| Virtual height | — | `disp_vHeight` [0.1, 10] meters, default 1.3 |
+| Perspective | derived: `screen_h / (2 * viewer_z * half_tan_vfov)` | always 1.0 |
+
+IPD and parallax are always equal within each mode. SHIFT+wheel controls both simultaneously.
+
+### 4.2 Controls
+
+| Input | Camera Mode | Display Mode |
+|-------|-------------|-------------|
+| Wheel (HMD focused) | Convergence ±0.05, clamp [0, 2] | vHeight ×/÷ 1.05, clamp [0.1, 10] |
+| SHIFT + Wheel (HMD) | IPD+Parallax ×/÷ 1.1, clamp [0.01, 1] | IPD+Parallax ×/÷ 1.1, clamp [0.01, 1] |
+| P | Toggle mode (derive target state) | Toggle mode (derive target state) |
+| Spacebar | Reset all to camera defaults | Reset all to camera defaults |
+| V (HMD focused) | 2D/3D display mode toggle | 2D/3D display mode toggle |
+
+Controller-focused wheel remains movement speed (unchanged).
+
+### 4.3 Mode Toggle Derivation
+
+When pressing P, the target mode's variables are derived from the current state for seamless continuity — no values are reset.
+
+**Camera → Display:**
+```
+fwd = rotate((0,0,-1), orientation)
+conv_dist = (convergence > 0.001) ? 1/convergence : 1000
+disp_pos = cam_pos + fwd * conv_dist
+disp_vHeight = clamp(2 * half_tan_vfov * conv_dist, 0.1, 10)
+disp_ipd, disp_parallax: kept from previous display state
+```
+
+**Display → Camera:**
+```
+m2v = disp_vHeight / screen_height_m
+cam_distance = nominal_viewer_z * m2v    (perspective=1)
+cam_pos = disp_pos - fwd * cam_distance
+cam_convergence = clamp(1/cam_distance, 0, 2)
+cam_half_tan_vfov = disp_vHeight / (2 * cam_distance)
+cam_ipd, cam_parallax: kept from previous camera state
+```
+
+### 4.4 HUD Display
+
+Camera mode:
+```
+Camera [P]  IPD/Prlx:0.750 [Sh+Wh]
+Conv:0.50 dp [Wh]  vFOV:36.0  Persp*:1.67
+```
+
+Display mode:
+```
+Display [P]  IPD/Prlx:1.000 [Sh+Wh]
+vH:1.30m [Wh]
+```
+
+### 4.5 Hardware Config
+
+The builder sets `nominal_viewer_z` and `screen_height_m` from the display device (e.g., sim_display defaults: 0.60m viewer distance, 0.194m screen height). These are used for display→camera derivation and derived perspective calculation.
+
+---
+
+## 5. Win32 Input Reference
+
+### 5.1 Device Focus
 
 | Modifier | Focused Device | Notes |
 |----------|---------------|-------|
@@ -167,7 +246,7 @@ Speed is adjusted by mouse wheel or numpad +/- in exponential steps of 1.25x.
 
 Focus is determined by `GetAsyncKeyState()` for reliability (avoids stuck keys from missed key-up events). Releasing a modifier calls `qwerty_release_all()` on all devices and resets the mouse baseline to prevent position jumps.
 
-### 4.2 Keyboard Controls
+### 5.2 Keyboard Controls
 
 | Key | Action | Scope |
 |-----|--------|-------|
@@ -180,13 +259,15 @@ Focus is determined by `GetAsyncKeyState()` for reliability (avoids stuck keys f
 | C | Toggle HMD parenting | Both (no mod) or focused (with mod) |
 | N | Menu button | Focused controller |
 | B | System button | Focused controller |
+| P | Toggle camera/display stereo mode | HMD focused |
+| Spacebar | Reset stereo to camera defaults | HMD focused |
+| V | 2D/3D display toggle (HMD) / Thumbstick click (controller) | Focused device |
 | T / F / G / H | Thumbstick up/left/down/right | Focused controller |
-| V | Thumbstick click | Focused controller |
 | I / J / K / L | Trackpad up/left/down/right | Focused controller |
 | M | Trackpad click | Focused controller |
 | ESC | Close window | Global |
 
-### 4.3 Mouse Controls
+### 5.3 Mouse Controls
 
 | Action | No Modifier (HMD) | CTRL (Left) | ALT (Right) | CTRL+ALT (Both) |
 |--------|-------------------|-------------|-------------|------------------|
@@ -194,9 +275,10 @@ Focus is determined by `GetAsyncKeyState()` for reliability (avoids stuck keys f
 | RMB + Drag | Rotate HMD | Rotate controller | Rotate controller | Rotate both |
 | LMB Click | Trigger | Trigger left | Trigger right | Trigger both |
 | MMB Click | Squeeze | Squeeze left | Squeeze right | Squeeze both |
-| Wheel | Speed +/- | Speed +/- | Speed +/- | Speed +/- both |
+| Wheel | Convergence/vHeight (see §4) | Speed +/- | Speed +/- | Speed +/- both |
+| SHIFT + Wheel | IPD+Parallax ×/÷ 1.1 | — | — | — |
 
-### 4.4 Sensitivity Constants
+### 5.4 Sensitivity Constants
 
 | Constant | Value | Effect |
 |----------|-------|--------|
@@ -209,13 +291,13 @@ Effective translation: `0.2 * 0.005 = 0.001 m/px` for controllers at default spe
 
 ---
 
-## 5. Touchpad Fallback (Palm Rejection Workaround)
+## 6. Touchpad Fallback (Palm Rejection Workaround)
 
-### 5.1 Problem
+### 6.1 Problem
 
 Windows Precision Touchpad drivers suppress `WM_LBUTTONDOWN` and `WM_LBUTTONUP` messages when system modifier keys (CTRL, ALT) are held. This is a palm rejection feature. Since the qwerty driver uses CTRL/ALT for controller focus, laptop trackpad taps/clicks do not fire trigger or squeeze actions.
 
-### 5.2 Solution
+### 6.2 Solution
 
 `WM_MOUSEMOVE` messages are delivered even with modifiers held, and their `wParam` contains `MK_LBUTTON` and `MK_MBUTTON` flags indicating the current button state. The Win32 handler detects button state transitions in `WM_MOUSEMOVE` as a fallback:
 
@@ -229,13 +311,13 @@ if (lmb_down != lmb_was_down) {
 
 The `lmb_was_down` / `mmb_was_down` trackers are also synced in the regular `WM_LBUTTONDOWN`/`UP` and `WM_MBUTTONDOWN`/`UP` handlers, so both code paths stay consistent.
 
-### 5.3 Why Not Use Regular Keys Like SRHydra?
+### 6.3 Why Not Use Regular Keys Like SRHydra?
 
 SRHydra uses regular letter keys (F/G) for controller focus instead of CTRL/ALT, avoiding the palm rejection issue entirely. However, regular letter keys would conflict with the existing WASD movement and controller button bindings. CTRL and ALT are conventional modifier keys that don't generate character input and are intuitively understood as "hold to modify behavior." The `wParam` fallback preserves this ergonomic choice while still working on touchpads.
 
 ---
 
-## 6. Files Reference
+## 7. Files Reference
 
 ### Core Driver
 
@@ -261,16 +343,16 @@ SRHydra uses regular letter keys (F/G) for controller focus instead of CTRL/ALT,
 
 ---
 
-## 7. Implementation Notes
+## 8. Implementation Notes
 
-### 7.1 Static State
+### 8.1 Static State
 
 `qwerty_process_win32()` uses `static` variables for state that persists across calls (cached device pointers, modifier key state, mouse position, button tracking). This is safe because there is exactly one window and one message pump thread.
 
-### 7.2 Focus Change Release
+### 8.2 Focus Change Release
 
 When CTRL or ALT state changes, `qwerty_release_all()` is called on all devices. This prevents stuck movement keys when switching focus (e.g., pressing W while HMD-focused, then pressing CTRL to switch to left controller -- W release would go to the wrong device without the release-all).
 
-### 7.3 Dual Controller Targeting
+### 8.3 Dual Controller Targeting
 
 All keyboard and mouse actions use `targets[]` / `ctrl_targets[]` arrays with `target_count`. When CTRL+ALT are both held, both arrays contain both controllers and `target_count = 2`. Every action loops over the array, so both controllers move, rotate, trigger, etc. simultaneously.

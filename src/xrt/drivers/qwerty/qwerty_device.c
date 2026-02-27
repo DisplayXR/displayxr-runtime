@@ -36,7 +36,8 @@
 
 // clang-format off
 // Values copied from u_device_setup_tracking_origins. CONTROLLER relative to HMD.
-#define QWERTY_HMD_INITIAL_POS (struct xrt_vec3){0, 1.6f, 0}
+#define QWERTY_HMD_CAMERA_POS (struct xrt_vec3){0, 1.6f, 0}
+#define QWERTY_HMD_DISPLAY_POS (struct xrt_vec3){0, 1.6f, -2.0f}
 #define QWERTY_CONTROLLER_INITIAL_POS(is_left) (struct xrt_vec3){(is_left) ? -0.2f : 0.2f, -0.3f, -0.5f}
 // clang-format on
 
@@ -406,7 +407,7 @@ qwerty_hmd_create(void)
 
 	struct qwerty_device *qd = &qh->base;
 	qd->pose.orientation.w = 1.f;
-	qd->pose.position = QWERTY_HMD_INITIAL_POS;
+	qd->pose.position = QWERTY_HMD_CAMERA_POS; // Default is camera-centric mode
 	qd->movement_speed = QWERTY_HMD_INITIAL_MOVEMENT_SPEED;
 	qd->look_speed = QWERTY_HMD_INITIAL_LOOK_SPEED;
 
@@ -548,12 +549,14 @@ qwerty_setup_var_tracking(struct qwerty_system *qs)
 	u_var_add_gui_header(qs, NULL, "Help");
 	u_var_add_ro_text(qs, "FD: focused device. FC: focused controller.", "Notation");
 	u_var_add_ro_text(qs, "HMD is FD by default. Right is FC by default", "Defaults");
-	u_var_add_ro_text(qs, "Hold left/right FD", "LCTRL/LALT");
+	u_var_add_ro_text(qs, "Hold left/right controller focus", "CTRL/ALT");
 	u_var_add_ro_text(qs, "Move FD", "WASDQE");
 	u_var_add_ro_text(qs, "Rotate FD", "Arrow keys");
 	u_var_add_ro_text(qs, "Rotate FD", "Hold right click");
-	u_var_add_ro_text(qs, "Hold for movement speed", "LSHIFT");
-	u_var_add_ro_text(qs, "Modify FD movement speed", "Mouse wheel");
+	u_var_add_ro_text(qs, "Hold for sprint", "LSHIFT");
+	u_var_add_ro_text(qs, "HMD: Wh=Conv/vH  Sh+Wh=IPD+Prlx", "Mouse wheel");
+	u_var_add_ro_text(qs, "Toggle camera/display stereo mode", "P");
+	u_var_add_ro_text(qs, "Reset stereo to camera defaults", "Space");
 	u_var_add_ro_text(qs, "Modify FD movement speed", "Numpad +/-");
 	u_var_add_ro_text(qs, "Reset both or FC pose", "R");
 	u_var_add_ro_text(qs, "Toggle both or FC parenting to HMD", "C");
@@ -561,10 +564,9 @@ qwerty_setup_var_tracking(struct qwerty_system *qs)
 	u_var_add_ro_text(qs, "FC Squeeze click", "Middle Click");
 	u_var_add_ro_text(qs, "FC Menu click", "N");
 	u_var_add_ro_text(qs, "FC System click", "B");
-	u_var_add_ro_text(qs, "FC Joystick direction", "TFGH");
 	u_var_add_ro_text(qs, "HMD: 2D/3D toggle, FC: Joystick click", "V");
-	u_var_add_ro_text(qs, "FC Trackpad touch direction", "IJKL");
-	u_var_add_ro_text(qs, "FC Trackpad click", "M");
+	u_var_add_ro_text(qs, "FC Joystick+Trackpad direction", "TFGH");
+	u_var_add_ro_text(qs, "FC Joystick+Trackpad click", "V(ctrl)");
 }
 
 struct qwerty_system *
@@ -583,13 +585,23 @@ qwerty_system_create(struct qwerty_hmd *qhmd,
 	qs->log_level = log_level;
 	qs->process_keys = true;
 
-	// Display-centric stereo defaults
-	qs->camera_mode = false;
-	qs->ipd_factor = 1.0f;
-	qs->parallax_factor = 1.0f;
-	qs->zoom_or_scale = 1.0f;
-	qs->convergence_or_perspective = 0.5f; // 1/0.5 = 2m convergence distance
-	qs->half_tan_vfov = 0.3249f;           // tan(18 deg) -> 36 deg vFOV
+	// Stereo defaults
+	qs->camera_mode = true;
+
+	// Camera-centric defaults
+	qs->cam_ipd_factor = 1.0f;
+	qs->cam_parallax_factor = 1.0f;
+	qs->cam_convergence = 0.5f;      // 0.5 diopters = 2m convergence
+	qs->cam_half_tan_vfov = 0.3249f; // tan(18 deg) -> 36 deg vFOV
+
+	// Display-centric defaults
+	qs->disp_ipd_factor = 1.0f;
+	qs->disp_parallax_factor = 1.0f;
+	qs->disp_vHeight = 1.3f; // 1.3m
+
+	// Hardware config defaults (overridden by target builder)
+	qs->nominal_viewer_z = 0.6f;  // meters
+	qs->screen_height_m = 0.194f; // meters
 
 	if (qhmd) {
 		qhmd->base.sys = qs;
@@ -900,21 +912,6 @@ qwerty_get_hmd_pose(struct xrt_device **xdevs, size_t xdev_count, struct xrt_pos
 	return false;
 }
 
-void
-qwerty_toggle_display_mode(struct qwerty_system *qs)
-{
-	qs->force_2d_mode = !qs->force_2d_mode;
-	qs->display_mode_toggle_pending = true;
-	U_LOG_W("Qwerty: display mode toggled to %s", qs->force_2d_mode ? "2D" : "3D");
-}
-
-void
-qwerty_toggle_camera_mode(struct qwerty_system *qs)
-{
-	qs->camera_mode = !qs->camera_mode;
-	U_LOG_W("Qwerty: stereo mode -> %s", qs->camera_mode ? "Camera" : "Display");
-}
-
 // Clamp helper
 static inline float
 clampf(float v, float lo, float hi)
@@ -927,32 +924,127 @@ clampf(float v, float lo, float hi)
 }
 
 void
-qwerty_adjust_ipd_factor(struct qwerty_system *qs, float delta)
+qwerty_toggle_display_mode(struct qwerty_system *qs)
 {
-	qs->ipd_factor = clampf(qs->ipd_factor + delta, 0.0f, 1.0f);
-	U_LOG_I("Qwerty: IPD factor = %.2f", qs->ipd_factor);
+	qs->force_2d_mode = !qs->force_2d_mode;
+	qs->display_mode_toggle_pending = true;
+	U_LOG_W("Qwerty: display mode toggled to %s", qs->force_2d_mode ? "2D" : "3D");
 }
 
 void
-qwerty_adjust_parallax_factor(struct qwerty_system *qs, float delta)
+qwerty_toggle_camera_mode(struct qwerty_system *qs)
 {
-	qs->parallax_factor = clampf(qs->parallax_factor + delta, 0.0f, 1.0f);
-	U_LOG_I("Qwerty: Parallax factor = %.2f", qs->parallax_factor);
+	if (qs->hmd == NULL) {
+		return;
+	}
+
+	struct xrt_pose *pose = &qs->hmd->base.pose;
+
+	// Compute forward direction from current orientation
+	struct xrt_vec3 fwd_in = {0, 0, -1};
+	struct xrt_vec3 fwd;
+	math_quat_rotate_vec3(&pose->orientation, &fwd_in, &fwd);
+
+	if (qs->camera_mode) {
+		// Camera -> Display: derive display state from camera state
+		float conv_dist = (qs->cam_convergence > 0.001f) ? (1.0f / qs->cam_convergence) : 1000.0f;
+
+		// Display position = camera position + forward * convergence_distance
+		struct xrt_vec3 disp_pos = {
+		    pose->position.x + fwd.x * conv_dist,
+		    pose->position.y + fwd.y * conv_dist,
+		    pose->position.z + fwd.z * conv_dist,
+		};
+
+		// Derive vHeight from camera FOV and convergence distance
+		qs->disp_vHeight = clampf(2.0f * qs->cam_half_tan_vfov * conv_dist, 0.1f, 10.0f);
+
+		// IPD/parallax: keep current display values (independent per mode)
+
+		// Move HMD to display position
+		pose->position = disp_pos;
+	} else {
+		// Display -> Camera: derive camera state from display state
+		float m2v = qs->disp_vHeight / qs->screen_height_m;
+		float cam_distance = qs->nominal_viewer_z * m2v; // perspective=1.0
+
+		// Camera position = display position - forward * cam_distance
+		struct xrt_vec3 cam_pos = {
+		    pose->position.x - fwd.x * cam_distance,
+		    pose->position.y - fwd.y * cam_distance,
+		    pose->position.z - fwd.z * cam_distance,
+		};
+
+		qs->cam_convergence = clampf(1.0f / cam_distance, 0.0f, 2.0f);
+		qs->cam_half_tan_vfov = qs->disp_vHeight / (2.0f * cam_distance);
+
+		// IPD/parallax: keep current camera values (independent per mode)
+
+		// Move HMD to camera position
+		pose->position = cam_pos;
+	}
+
+	qs->camera_mode = !qs->camera_mode;
+	U_LOG_W("Qwerty: stereo mode -> %s (derived from previous state)",
+	        qs->camera_mode ? "Camera" : "Display");
 }
 
 void
-qwerty_adjust_zoom_or_scale(struct qwerty_system *qs, float multiplier)
+qwerty_adjust_stereo_factor(struct qwerty_system *qs, float multiplier)
 {
-	qs->zoom_or_scale = clampf(qs->zoom_or_scale * multiplier, 0.1f, 10.0f);
-	U_LOG_I("Qwerty: %s = %.2f", qs->camera_mode ? "Zoom" : "Scale", qs->zoom_or_scale);
+	if (qs->camera_mode) {
+		float v = clampf(qs->cam_ipd_factor * multiplier, 0.01f, 1.0f);
+		qs->cam_ipd_factor = v;
+		qs->cam_parallax_factor = v;
+		U_LOG_I("Qwerty: Camera IPD/Parallax = %.3f", v);
+	} else {
+		float v = clampf(qs->disp_ipd_factor * multiplier, 0.01f, 1.0f);
+		qs->disp_ipd_factor = v;
+		qs->disp_parallax_factor = v;
+		U_LOG_I("Qwerty: Display IPD/Parallax = %.3f", v);
+	}
 }
 
 void
-qwerty_adjust_convergence_or_perspective(struct qwerty_system *qs, float multiplier)
+qwerty_adjust_convergence(struct qwerty_system *qs, float direction)
 {
-	qs->convergence_or_perspective = clampf(qs->convergence_or_perspective * multiplier, 0.1f, 10.0f);
-	U_LOG_I("Qwerty: %s = %.2f", qs->camera_mode ? "Convergence" : "Perspective",
-	        qs->convergence_or_perspective);
+	if (!qs->camera_mode) {
+		return; // No-op in display mode
+	}
+	qs->cam_convergence = clampf(qs->cam_convergence + direction * 0.05f, 0.0f, 2.0f);
+	U_LOG_I("Qwerty: Convergence = %.2f diopters", qs->cam_convergence);
+}
+
+void
+qwerty_adjust_vheight(struct qwerty_system *qs, float multiplier)
+{
+	if (qs->camera_mode) {
+		return; // No-op in camera mode
+	}
+	qs->disp_vHeight = clampf(qs->disp_vHeight * multiplier, 0.1f, 10.0f);
+	U_LOG_I("Qwerty: vHeight = %.2f m", qs->disp_vHeight);
+}
+
+void
+qwerty_reset_stereo(struct qwerty_system *qs)
+{
+	qs->camera_mode = true;
+
+	qs->cam_ipd_factor = 1.0f;
+	qs->cam_parallax_factor = 1.0f;
+	qs->cam_convergence = 0.5f;
+	qs->cam_half_tan_vfov = 0.3249f;
+
+	qs->disp_ipd_factor = 1.0f;
+	qs->disp_parallax_factor = 1.0f;
+	qs->disp_vHeight = 1.3f;
+
+	if (qs->hmd != NULL) {
+		qs->hmd->base.pose.position = QWERTY_HMD_CAMERA_POS;
+		qs->hmd->base.pose.orientation = (struct xrt_quat)XRT_QUAT_IDENTITY;
+	}
+
+	U_LOG_W("Qwerty: stereo reset to camera defaults");
 }
 
 bool
@@ -981,11 +1073,18 @@ qwerty_get_stereo_state(struct xrt_device **xdevs, size_t xdev_count, struct qwe
 	}
 
 	out->camera_mode = qs->camera_mode;
-	out->ipd_factor = qs->ipd_factor;
-	out->parallax_factor = qs->parallax_factor;
-	out->zoom_or_scale = qs->zoom_or_scale;
-	out->convergence_or_perspective = qs->convergence_or_perspective;
-	out->half_tan_vfov = qs->half_tan_vfov;
+
+	out->cam_ipd_factor = qs->cam_ipd_factor;
+	out->cam_parallax_factor = qs->cam_parallax_factor;
+	out->cam_convergence = qs->cam_convergence;
+	out->cam_half_tan_vfov = qs->cam_half_tan_vfov;
+
+	out->disp_ipd_factor = qs->disp_ipd_factor;
+	out->disp_parallax_factor = qs->disp_parallax_factor;
+	out->disp_vHeight = qs->disp_vHeight;
+
+	out->nominal_viewer_z = qs->nominal_viewer_z;
+	out->screen_height_m = qs->screen_height_m;
 	return true;
 }
 

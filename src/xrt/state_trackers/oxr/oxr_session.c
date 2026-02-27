@@ -917,15 +917,15 @@ oxr_session_locate_views(struct oxr_logger *log,
 	bool have_stereo_state = qwerty_get_stereo_state(
 	    sess->sys->xsysd->xdevs, sess->sys->xsysd->xdev_count, &stereo_state);
 	if (should_log) {
-		U_LOG_I("STEREO STATE: have=%d cam=%d ipd=%.2f par=%.2f zoom=%.2f conv=%.2f htan=%.4f",
+		U_LOG_I("STEREO STATE: have=%d cam=%d cam_ipd=%.3f cam_conv=%.2f disp_ipd=%.3f disp_vH=%.2f",
 		        have_stereo_state, stereo_state.camera_mode,
-		        stereo_state.ipd_factor, stereo_state.parallax_factor,
-		        stereo_state.zoom_or_scale, stereo_state.convergence_or_perspective,
-		        stereo_state.half_tan_vfov);
+		        stereo_state.cam_ipd_factor, stereo_state.cam_convergence,
+		        stereo_state.disp_ipd_factor, stereo_state.disp_vHeight);
 	}
 #else
-	struct { bool camera_mode; float ipd_factor, parallax_factor, zoom_or_scale,
-	         convergence_or_perspective, half_tan_vfov; } stereo_state = {0};
+	struct { bool camera_mode; float cam_ipd_factor, cam_parallax_factor, cam_convergence,
+	         cam_half_tan_vfov, disp_ipd_factor, disp_parallax_factor, disp_vHeight,
+	         nominal_viewer_z, screen_height_m; } stereo_state = {0};
 	bool have_stereo_state = false;
 #endif
 
@@ -1038,10 +1038,10 @@ oxr_session_locate_views(struct oxr_logger *log,
 				if (have_stereo_state && stereo_state.camera_mode &&
 				    !sess->has_external_window) {
 					Camera3DTunables ct = {
-					    .ipd_factor = stereo_state.ipd_factor,
-					    .parallax_factor = stereo_state.parallax_factor,
-					    .inv_convergence_distance = 1.0f / stereo_state.convergence_or_perspective,
-					    .half_tan_vfov = stereo_state.half_tan_vfov / stereo_state.zoom_or_scale,
+					    .ipd_factor = stereo_state.cam_ipd_factor,
+					    .parallax_factor = stereo_state.cam_parallax_factor,
+					    .inv_convergence_distance = stereo_state.cam_convergence,
+					    .half_tan_vfov = stereo_state.cam_half_tan_vfov,
 					};
 					Camera3DStereoView cam_views[2];
 					camera3d_compute_stereo_views(&raw_l, &raw_r, &nominal, &scr, &ct,
@@ -1062,10 +1062,13 @@ oxr_session_locate_views(struct oxr_logger *log,
 					// Display-centric (Kooima) path: canonical display3d_compute_stereo_views
 					Display3DTunables dt = display3d_default_tunables();
 					if (have_stereo_state && !sess->has_external_window) {
-						dt.ipd_factor = stereo_state.ipd_factor;
-						dt.parallax_factor = stereo_state.parallax_factor;
+						dt.ipd_factor = stereo_state.disp_ipd_factor;
+						dt.parallax_factor = stereo_state.disp_parallax_factor;
+						dt.perspective_factor = 1.0f;
+						dt.virtual_display_height = stereo_state.disp_vHeight;
+					} else {
+						dt.virtual_display_height = screen_height_m; // identity m2v
 					}
-					dt.virtual_display_height = screen_height_m; // identity m2v
 
 					Display3DStereoView disp_views[2];
 					display3d_compute_stereo_views(&raw_l, &raw_r, &nominal, &scr, &dt,

@@ -662,11 +662,15 @@ d3d11_render_hud_overlay(struct comp_d3d11_compositor *c, bool is_mono, bool wea
 		struct qwerty_stereo_state ss;
 		if (qwerty_get_stereo_state(c->xsysd->xdevs, c->xsysd->xdev_count, &ss)) {
 			data.camera_mode = ss.camera_mode;
-			data.stereo_ipd_factor = ss.ipd_factor;
-			data.stereo_parallax_factor = ss.parallax_factor;
-			data.stereo_zoom_or_scale = ss.zoom_or_scale;
-			data.stereo_convergence_or_perspective = ss.convergence_or_perspective;
-			data.stereo_half_tan_vfov = ss.half_tan_vfov;
+			data.cam_ipd_factor = ss.cam_ipd_factor;
+			data.cam_parallax_factor = ss.cam_parallax_factor;
+			data.cam_convergence = ss.cam_convergence;
+			data.cam_half_tan_vfov = ss.cam_half_tan_vfov;
+			data.disp_ipd_factor = ss.disp_ipd_factor;
+			data.disp_parallax_factor = ss.disp_parallax_factor;
+			data.disp_vHeight = ss.disp_vHeight;
+			data.nominal_viewer_z = ss.nominal_viewer_z;
+			data.screen_height_m = ss.screen_height_m;
 		}
 	}
 #endif

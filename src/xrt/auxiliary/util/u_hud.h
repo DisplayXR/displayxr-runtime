@@ -63,13 +63,17 @@ struct u_hud_data
 	float vdisp_x, vdisp_y, vdisp_z;               //!< Virtual display position (m)
 	float forward_x, forward_y, forward_z;         //!< Head forward direction
 
-	// Camera-centric stereo controls
-	bool camera_mode;                               //!< true=camera, false=display
-	float stereo_ipd_factor;                        //!< IPD factor [0,1]
-	float stereo_parallax_factor;                   //!< Parallax factor [0,1]
-	float stereo_zoom_or_scale;                     //!< Zoom/Scale [0.1,10]
-	float stereo_convergence_or_perspective;        //!< Convergence/Perspective [0.1,10]
-	float stereo_half_tan_vfov;                     //!< tan(vFOV/2)
+	// Stereo controls (dual camera/display state)
+	bool camera_mode;                //!< true=camera, false=display
+	float cam_ipd_factor;            //!< Camera: IPD factor [0.01,1]
+	float cam_parallax_factor;       //!< Camera: parallax factor [0.01,1]
+	float cam_convergence;           //!< Camera: convergence in diopters [0,2]
+	float cam_half_tan_vfov;         //!< Camera: half_tan_vfov (derived)
+	float disp_ipd_factor;           //!< Display: IPD factor [0.01,1]
+	float disp_parallax_factor;      //!< Display: parallax factor [0.01,1]
+	float disp_vHeight;              //!< Display: virtual display height (m) [0.1,10]
+	float nominal_viewer_z;          //!< Hardware: nominal viewer distance (m)
+	float screen_height_m;           //!< Hardware: screen height (m)
 };
 
 struct u_hud;
