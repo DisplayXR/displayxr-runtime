@@ -1619,6 +1619,13 @@ oxr_session_allocate_and_init(struct oxr_logger *log,
 	sess->frame_timing_spew = debug_get_bool_option_frame_timing_spew();
 	sess->frame_timing_wait_sleep_ms = debug_get_num_option_wait_frame_sleep();
 
+#ifdef OXR_HAVE_EXT_display_info
+	// Initialize eye tracking mode from driver's default
+	if (sys->xsysc) {
+		sess->eye_tracking_mode = sys->xsysc->info.default_eye_tracking_mode;
+	}
+#endif
+
 	// Action system hashmaps.
 	u_hashmap_int_create(&sess->act_sets_attachments_by_key);
 	u_hashmap_int_create(&sess->act_attachments_by_key);
