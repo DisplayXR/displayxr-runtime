@@ -262,11 +262,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                                 XMMATRIX viewMatrix = (eye == 0) ? leftViewMatrix : rightViewMatrix;
                                 XMMATRIX projMatrix = (eye == 0) ? leftProjMatrix : rightProjMatrix;
 
-                                // zoomScale = 1.0 (no zoom control without input handler)
+                                // Non-ext app: 0.3m cube at z=-2m, no zoom control
                                 RenderScene(renderer, rtv, depthDSV.Get(),
                                     eyeRenderW, eyeRenderH,
                                     viewMatrix, projMatrix,
-                                    1.0f);
+                                    1.0f, 1.6f, -2.0f, 0.3f);
 
                                 // Set up projection view for this eye
                                 projectionViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
