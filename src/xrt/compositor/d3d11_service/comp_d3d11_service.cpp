@@ -30,6 +30,12 @@
 #include "d3d/d3d_d3d11_fence.hpp"
 #include "d3d/d3d_dxgi_formats.h"
 
+#include "util/u_hud.h"
+
+#ifdef XRT_BUILD_DRIVER_QWERTY
+#include "qwerty/qwerty_interface.h"
+#endif
+
 #ifdef XRT_HAVE_LEIA_SR_D3D11
 #include "leia/leia_sr_d3d11.h"
 #endif
@@ -169,6 +175,21 @@ struct d3d11_client_render_resources
 	//! SR weaver for light field display
 	struct leiasr_d3d11 *weaver;
 #endif
+
+	//! HUD overlay (runtime-owned windows only)
+	struct u_hud *hud;
+
+	//! D3D11 staging texture for HUD pixel upload
+	wil::com_ptr<ID3D11Texture2D> hud_texture;
+
+	//! True if HUD GPU resources are initialized
+	bool hud_initialized;
+
+	//! Last frame timestamp for FPS calculation
+	uint64_t last_frame_time_ns;
+
+	//! Smoothed frame time for display
+	float smoothed_frame_time_ms;
 };
 
 
@@ -1168,6 +1189,10 @@ fini_client_render_resources(struct d3d11_client_render_resources *res)
 		return;
 	}
 
+	// Clean up HUD resources
+	res->hud_texture.reset();
+	u_hud_destroy(&res->hud);
+
 #ifdef XRT_HAVE_LEIA_SR_D3D11
 	if (res->weaver != nullptr) {
 		leiasr_d3d11_destroy(&res->weaver);
@@ -1231,6 +1256,12 @@ init_client_render_resources(struct d3d11_service_system *sys,
 		}
 
 		U_LOG_W("Created window for client: hwnd=%p (%ux%u)", res->hwnd, sys->output_width, sys->output_height);
+	}
+
+	// Create HUD overlay for runtime-owned windows
+	if (res->owns_window) {
+		res->smoothed_frame_time_ms = 16.67f;
+		u_hud_create(&res->hud, sys->output_width);
 	}
 
 	// Create swap chain at native display resolution
@@ -2171,6 +2202,154 @@ compositor_layer_passthrough(struct xrt_compositor *xc,
 	return XRT_SUCCESS;
 }
 
+/*!
+ * Render the HUD overlay onto the back buffer (post-weave).
+ * Uses CopySubresourceRegion for zero-shader simplicity.
+ */
+static void
+d3d11_service_render_hud(struct d3d11_service_system *sys,
+                          struct d3d11_client_render_resources *res,
+                          bool is_mono,
+                          bool weaving_done,
+                          const struct xrt_vec3 *left_eye,
+                          const struct xrt_vec3 *right_eye)
+{
+	if (!res->owns_window || res->hud == NULL || !u_hud_is_visible()) {
+		return;
+	}
+
+	// Compute FPS from frame timestamps
+	uint64_t now_ns = os_monotonic_get_ns();
+	if (res->last_frame_time_ns != 0) {
+		float dt_ms = (float)(now_ns - res->last_frame_time_ns) / 1e6f;
+		// Exponential moving average (alpha=0.1 for smooth display)
+		res->smoothed_frame_time_ms = res->smoothed_frame_time_ms * 0.9f + dt_ms * 0.1f;
+	}
+	res->last_frame_time_ns = now_ns;
+
+	float fps = (res->smoothed_frame_time_ms > 0.0f) ? (1000.0f / res->smoothed_frame_time_ms) : 0.0f;
+
+	// Determine output mode string
+	const char *output_mode = "Fallback";
+	if (!is_mono && weaving_done) {
+		output_mode = "Weaved";
+	} else if (is_mono) {
+		output_mode = "2D";
+	}
+
+	// Get render and window dimensions
+	uint32_t render_w = sys->view_width;
+	uint32_t render_h = sys->view_height;
+	uint32_t win_w = sys->output_width;
+	uint32_t win_h = sys->output_height;
+
+	// Get display physical dimensions from SR SDK
+	float disp_w_mm = 0.0f, disp_h_mm = 0.0f;
+	float nom_x = 0.0f, nom_y = 0.0f, nom_z = 600.0f;
+#ifdef XRT_HAVE_LEIA_SR_D3D11
+	if (res->weaver != nullptr) {
+		struct leiasr_display_dimensions dims;
+		if (leiasr_d3d11_get_display_dimensions(res->weaver, &dims) && dims.valid) {
+			disp_w_mm = dims.width_m * 1000.0f;
+			disp_h_mm = dims.height_m * 1000.0f;
+		}
+	}
+#endif
+
+	// Fill HUD data
+	struct u_hud_data data = {};
+	data.fps = fps;
+	data.frame_time_ms = res->smoothed_frame_time_ms;
+	data.mode_3d = !is_mono;
+	data.output_mode = output_mode;
+	data.render_width = render_w;
+	data.render_height = render_h;
+	data.window_width = win_w;
+	data.window_height = win_h;
+	data.display_width_mm = disp_w_mm;
+	data.display_height_mm = disp_h_mm;
+	data.nominal_x = nom_x;
+	data.nominal_y = nom_y;
+	data.nominal_z = nom_z;
+	data.left_eye_x = left_eye->x * 1000.0f;
+	data.left_eye_y = left_eye->y * 1000.0f;
+	data.left_eye_z = left_eye->z * 1000.0f;
+	data.right_eye_x = right_eye->x * 1000.0f;
+	data.right_eye_y = right_eye->y * 1000.0f;
+	data.right_eye_z = right_eye->z * 1000.0f;
+	data.eye_tracking_active = (left_eye->z != 0.6f || right_eye->z != 0.6f);
+
+#ifdef XRT_BUILD_DRIVER_QWERTY
+	if (sys->xsysd != nullptr) {
+		struct qwerty_stereo_state ss;
+		if (qwerty_get_stereo_state(sys->xsysd->xdevs, sys->xsysd->xdev_count, &ss)) {
+			data.camera_mode = ss.camera_mode;
+			data.cam_ipd_factor = ss.cam_ipd_factor;
+			data.cam_parallax_factor = ss.cam_parallax_factor;
+			data.cam_convergence = ss.cam_convergence;
+			data.cam_half_tan_vfov = ss.cam_half_tan_vfov;
+			data.disp_ipd_factor = ss.disp_ipd_factor;
+			data.disp_parallax_factor = ss.disp_parallax_factor;
+			data.disp_vHeight = ss.disp_vHeight;
+			data.nominal_viewer_z = ss.nominal_viewer_z;
+			data.screen_height_m = ss.screen_height_m;
+		}
+	}
+#endif
+
+	bool dirty = u_hud_update(res->hud, &data);
+
+	// Lazy-create the D3D11 staging texture
+	if (!res->hud_initialized) {
+		uint32_t hud_w = u_hud_get_width(res->hud);
+		uint32_t hud_h = u_hud_get_height(res->hud);
+
+		D3D11_TEXTURE2D_DESC desc = {};
+		desc.Width = hud_w;
+		desc.Height = hud_h;
+		desc.MipLevels = 1;
+		desc.ArraySize = 1;
+		desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		desc.SampleDesc.Count = 1;
+		desc.Usage = D3D11_USAGE_DEFAULT;
+		desc.BindFlags = 0; // No shader binding needed, just copy source
+
+		HRESULT hr = sys->device->CreateTexture2D(&desc, nullptr, res->hud_texture.put());
+		if (FAILED(hr)) {
+			U_LOG_E("Failed to create HUD texture: 0x%08lx", hr);
+			return;
+		}
+		res->hud_initialized = true;
+		dirty = true; // Force initial upload
+	}
+
+	// Upload pixels to staging texture if changed
+	if (dirty && res->hud_texture) {
+		uint32_t hud_w = u_hud_get_width(res->hud);
+		sys->context->UpdateSubresource(res->hud_texture.get(), 0, nullptr,
+		                                 u_hud_get_pixels(res->hud),
+		                                 hud_w * 4, 0);
+	}
+
+	// Blit HUD texture to bottom-left of back buffer
+	if (res->hud_texture && res->swap_chain) {
+		wil::com_ptr<ID3D11Texture2D> back_buffer;
+		res->swap_chain->GetBuffer(0, IID_PPV_ARGS(back_buffer.put()));
+		if (back_buffer) {
+			uint32_t hud_w = u_hud_get_width(res->hud);
+			uint32_t hud_h = u_hud_get_height(res->hud);
+
+			// Position at bottom-left with 10px margin
+			uint32_t dst_x = 10;
+			uint32_t dst_y = (win_h > hud_h + 10) ? (win_h - hud_h - 10) : 0;
+
+			D3D11_BOX src_box = {0, 0, 0, hud_w, hud_h, 1};
+			sys->context->CopySubresourceRegion(back_buffer.get(), 0, dst_x, dst_y, 0,
+			                                     res->hud_texture.get(), 0, &src_box);
+		}
+	}
+}
+
 static xrt_result_t
 compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
 {
@@ -2367,6 +2546,25 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			break;
 		}
 	}
+
+	// Get predicted eye positions (used for UI layers and HUD)
+	struct xrt_vec3 left_eye = {-0.032f, 0.0f, 0.6f};   // Default: 64mm IPD, 60cm from screen
+	struct xrt_vec3 right_eye = {0.032f, 0.0f, 0.6f};
+	bool weaving_done = false;
+
+#ifdef XRT_HAVE_LEIA_SR_D3D11
+	if (c->render.weaver != nullptr) {
+		float left[3], right[3];
+		if (leiasr_d3d11_get_predicted_eye_positions(c->render.weaver, left, right)) {
+			left_eye.x = left[0];
+			left_eye.y = left[1];
+			left_eye.z = left[2];
+			right_eye.x = right[0];
+			right_eye.y = right[1];
+			right_eye.z = right[2];
+		}
+	}
+#endif
 
 	// Pre-compute whether there are UI overlay layers (quad/cylinder/equirect/cube).
 	// Needed to decide if same-swapchain SBS can bypass the stereo texture entirely.
@@ -2692,24 +2890,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		struct xrt_pose view_poses[2];
 		struct xrt_fov fovs[2];
 
-		// Get eye positions from SR weaver for proper convergence plane
-		// Default: 64mm IPD, 60cm from screen (z=0.6)
-		struct xrt_vec3 left_eye = {-0.032f, 0.0f, 0.6f};
-		struct xrt_vec3 right_eye = {0.032f, 0.0f, 0.6f};
-
-#ifdef XRT_HAVE_LEIA_SR_D3D11
-		if (c->render.weaver != nullptr) {
-			float left[3], right[3];
-			if (leiasr_d3d11_get_predicted_eye_positions(c->render.weaver, left, right)) {
-				left_eye.x = left[0];
-				left_eye.y = left[1];
-				left_eye.z = left[2];
-				right_eye.x = right[0];
-				right_eye.y = right[1];
-				right_eye.z = right[2];
-			}
-		}
-#endif
+		// Use function-scoped eye positions (already fetched from SR weaver above)
 
 		// Identity orientation for both eyes
 		view_poses[0].orientation.x = 0.0f;
@@ -2875,6 +3056,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 
 		// Perform weaving
 		leiasr_d3d11_weave(c->render.weaver);
+		weaving_done = true;
 	} else
 #endif
 	{
@@ -2909,6 +3091,9 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			}
 		}
 	}
+
+	// Render HUD overlay (post-weave, pre-present)
+	d3d11_service_render_hud(sys, &c->render, is_mono, weaving_done, &left_eye, &right_eye);
 
 	// Present to display
 	if (c->render.swap_chain) {

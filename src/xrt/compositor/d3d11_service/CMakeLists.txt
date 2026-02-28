@@ -36,6 +36,12 @@ target_link_libraries(
 
 target_include_directories(comp_d3d11_service PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/.. ${CMAKE_CURRENT_SOURCE_DIR}/../d3d11)
 
+# Qwerty include path for stereo state polling in HUD overlay
+if(XRT_BUILD_DRIVER_QWERTY)
+	target_link_libraries(comp_d3d11_service PRIVATE drv_qwerty_includes)
+	target_compile_definitions(comp_d3d11_service PRIVATE XRT_BUILD_DRIVER_QWERTY)
+endif()
+
 if(XRT_HAVE_LEIA_SR)
 	target_link_libraries(comp_d3d11_service PRIVATE drv_leia)
 endif()
