@@ -203,6 +203,9 @@ qwerty_system_remove(struct qwerty_system *qs, struct qwerty_device *qd);
 static void
 qwerty_system_destroy(struct qwerty_system *qs);
 
+static void
+qwerty_destroy(struct xrt_device *xd);
+
 // Compare any two pointers without verbose casts
 static inline bool
 eq(void *a, void *b)
@@ -215,12 +218,13 @@ eq(void *a, void *b)
 struct qwerty_device *
 qwerty_device(struct xrt_device *xd)
 {
-	struct qwerty_device *qd = (struct qwerty_device *)xd;
-	bool is_qwerty_device = eq(qd, qd->sys->hmd) || eq(qd, qd->sys->lctrl) || eq(qd, qd->sys->rctrl);
-	assert(is_qwerty_device);
-	if (!is_qwerty_device) {
+	// Precondition: must be a real qwerty device, not an IPC proxy.
+	// Check destroy function pointer before casting — safe for any xrt_device.
+	if (xd == NULL || xd->destroy != qwerty_destroy) {
 		return NULL;
 	}
+	struct qwerty_device *qd = (struct qwerty_device *)xd;
+	assert(eq(qd, qd->sys->hmd) || eq(qd, qd->sys->lctrl) || eq(qd, qd->sys->rctrl));
 	return qd;
 }
 
