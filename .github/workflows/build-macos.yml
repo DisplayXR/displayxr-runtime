@@ -132,6 +132,34 @@ jobs:
           SCRIPT
           chmod +x _package/SRMonado-macOS/run_sim_cube.sh
 
+      - name: Build 3DGS test app (sim_3dgs_openxr_ext_macos)
+        if: env.BUILD_TEST_APP == 'true'
+        run: |
+          cmake -B test_apps/sim_3dgs_openxr_ext_macos/build \
+            -S test_apps/sim_3dgs_openxr_ext_macos -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_PREFIX_PATH=/tmp/openxr-install
+          cmake --build test_apps/sim_3dgs_openxr_ext_macos/build
+
+      - name: Package 3DGS test app
+        if: env.BUILD_TEST_APP == 'true'
+        run: |
+          cp test_apps/sim_3dgs_openxr_ext_macos/build/sim_3dgs_openxr_ext_macos _package/SRMonado-macOS/bin/
+          install_name_tool -add_rpath @executable_path/../lib _package/SRMonado-macOS/bin/sim_3dgs_openxr_ext_macos 2>/dev/null || true
+          # Create run script
+          cat > _package/SRMonado-macOS/run_sim_3dgs_ext.sh <<'SCRIPT'
+          #!/bin/bash
+          DIR="$(cd "$(dirname "$0")" && pwd)"
+          export XR_RUNTIME_JSON="$DIR/openxr_monado.json"
+          export DYLD_LIBRARY_PATH="$DIR/lib:${DYLD_LIBRARY_PATH:-}"
+          export VK_ICD_FILENAMES="$DIR/share/vulkan/icd.d/MoltenVK_icd.json"
+          export SIM_DISPLAY_ENABLE=1
+          export SIM_DISPLAY_OUTPUT="${SIM_DISPLAY_OUTPUT:-anaglyph}"
+          echo "Starting sim_3dgs_openxr_ext_macos with $SIM_DISPLAY_OUTPUT output..."
+          exec "$DIR/bin/sim_3dgs_openxr_ext_macos" "$@"
+          SCRIPT
+          chmod +x _package/SRMonado-macOS/run_sim_3dgs_ext.sh
+
       - name: Build macOS installer (.pkg)
         run: |
           chmod +x installer/macos/build_installer.sh
