@@ -553,13 +553,31 @@ static void RenderThreadFunc(
                             }
                         }
 
+                        // Build per-eye view/projection matrices (column-major float[16])
+                        float viewMat[2][16], projMat[2][16];
+                        for (int eye = 0; eye < eyeCount; eye++) {
+                            if (useAppProjection) {
+                                int srcEye = monoMode ? 0 : eye;
+                                memcpy(viewMat[eye], stereoViews[srcEye].view_matrix, sizeof(float) * 16);
+                                memcpy(projMat[eye], stereoViews[srcEye].projection_matrix, sizeof(float) * 16);
+                            } else {
+                                // Fallback: use DirectXMath mono matrices, store as column-major
+                                XMMATRIX v = monoMode ? monoViewMatrix :
+                                    XMMatrixLookAtRH(XMLoadFloat3((XMFLOAT3*)&rawViews[eye].pose.position),
+                                        XMLoadFloat3((XMFLOAT3*)&rawViews[eye].pose.position) + XMVectorSet(0,0,-1,0),
+                                        XMVectorSet(0,1,0,0));
+                                XMMATRIX p = monoMode ? monoProjMatrix : leftProjMatrix;
+                                // XMMatrix is row-major; transpose to get column-major for shader
+                                XMMATRIX vT = XMMatrixTranspose(v);
+                                XMMATRIX pT = XMMatrixTranspose(p);
+                                XMStoreFloat4x4((XMFLOAT4X4*)viewMat[eye], vT);
+                                XMStoreFloat4x4((XMFLOAT4X4*)projMat[eye], pT);
+                            }
+                        }
+
                         uint32_t imageIndex;
                         if (AcquireSwapchainImage(*xr, imageIndex)) {
                             VkFormat colorFormat = (VkFormat)xr->swapchain.format;
-
-                            // Get swapchain image
-                            // (swapchain images were enumerated in WinMain and stored in the XrSessionManager)
-                            // For now, we use the image from OpenXR directly
 
                             bool hasGsScene;
                             {
@@ -568,13 +586,15 @@ static void RenderThreadFunc(
                             }
 
                             if (hasGsScene) {
-                                // Render 3DGS scene for each eye
-                                // TODO: Need swapchain image views for gs_renderer.
-                                // For now, use placeholder until swapchain image views are set up.
-                                RenderPlaceholder(vkDevice, graphicsQueue, renderCmdPool,
-                                    (*swapchainVkImages)[imageIndex], xr->swapchain.width, xr->swapchain.height);
+                                for (int eye = 0; eye < eyeCount; eye++) {
+                                    uint32_t vpX = monoMode ? 0 : eye * renderW;
+                                    g_gsRenderer.renderEye(
+                                        (*swapchainVkImages)[imageIndex], colorFormat,
+                                        xr->swapchain.width, xr->swapchain.height,
+                                        vpX, 0, renderW, renderH,
+                                        viewMat[eye], projMat[eye]);
+                                }
                             } else {
-                                // No scene loaded — show dark placeholder
                                 RenderPlaceholder(vkDevice, graphicsQueue, renderCmdPool,
                                     (*swapchainVkImages)[imageIndex], xr->swapchain.width, xr->swapchain.height);
                             }
@@ -962,7 +982,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     // Initialize 3DGS renderer with the OpenXR Vulkan device
     {
-        uint32_t renderW = xr.swapchain.width / 2;
+        uint32_t renderW = xr.swapchain.width;   // Full width — mono uses entire swapchain
         uint32_t renderH = xr.swapchain.height;
         if (!g_gsRenderer.init(vkInstance, physDevice, vkDevice, graphicsQueue,
                                queueFamilyIndex, renderW, renderH)) {

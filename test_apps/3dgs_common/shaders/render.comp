@@ -1,0 +1,91 @@
+// Copyright 2025, Leia Inc.
+// SPDX-License-Identifier: BSL-1.0
+// Ported from 3DGS.cpp (https://github.com/shg8/3DGS.cpp)
+// Per-pixel tile-based alpha blending, writes to storage image.
+
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : enable
+
+layout (std430, set = 0, binding = 0) readonly buffer Vertices {
+    VertexAttribute attr[];
+};
+
+layout (std430, set = 0, binding = 1) readonly buffer Boundaries {
+    uint boundaries[];
+};
+
+layout (std430, set = 0, binding = 2) readonly buffer SortedVertices {
+    uint sorted_vertices[];
+};
+
+layout (set = 1, binding = 0) uniform writeonly image2D output_image;
+
+layout (push_constant) uniform Constants {
+    uint width;
+    uint height;
+    uint apply_srgb;
+};
+
+layout (local_size_x = TILE_WIDTH, local_size_y = TILE_HEIGHT, local_size_z = 1) in;
+
+float linearToSrgb(float c) {
+    if (c <= 0.0031308)
+        return c * 12.92;
+    else
+        return 1.055 * pow(c, 1.0 / 2.4) - 0.055;
+}
+
+void main() {
+    uint tileX = gl_WorkGroupID.x;
+    uint tileY = gl_WorkGroupID.y;
+    uint localX = gl_LocalInvocationID.x;
+    uint localY = gl_LocalInvocationID.y;
+
+    uvec2 curr_uv = uvec2(tileX * TILE_WIDTH + localX, tileY * TILE_HEIGHT + localY);
+    if (curr_uv.x >= width || curr_uv.y >= height) {
+        return;
+    }
+
+    uint tiles_width = ((width + TILE_WIDTH - 1) / TILE_WIDTH);
+
+    uint start = boundaries[(tileX + tileY * tiles_width) * 2];
+    uint end = boundaries[(tileX + tileY * tiles_width) * 2 + 1];
+
+    float T = 1.0f;
+    vec3 c = vec3(0.0f);
+
+    for (uint i = start; i < end; i++) {
+        uint vertex_key = sorted_vertices[i];
+        vec2 uv = attr[vertex_key].uv;
+        vec2 distance = uv - vec2(curr_uv);
+        vec4 co = attr[vertex_key].conic_opacity;
+        float power = -0.5f * (co.x * distance.x * distance.x + co.z * distance.y * distance.y) - co.y * distance.x * distance.y;
+
+        if (power > 0.0f) {
+            continue;
+        }
+
+        float alpha = min(0.99f, co.w * exp(power));
+        if (alpha < 1.0f / 255.0f) {
+            continue;
+        }
+
+        float test_T = T * (1 - alpha);
+        if (test_T < 0.0001f) {
+            break;
+        }
+
+        c += attr[vertex_key].color_radii.xyz * alpha * T;
+        T = test_T;
+    }
+
+    // Apply sRGB gamma encoding if writing to an sRGB-format swapchain
+    if (apply_srgb != 0u) {
+        c = vec3(linearToSrgb(c.x), linearToSrgb(c.y), linearToSrgb(c.z));
+    }
+
+    imageStore(output_image, ivec2(curr_uv), vec4(c, 1.0f));
+}

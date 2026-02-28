@@ -1044,10 +1044,11 @@ int main() {
           (XrSwapchainImageBaseHeader*)swapchainImages.data()); }
 
     // Initialize 3DGS renderer
-    { uint32_t rw = xr.swapchain.width / 2;
+    { uint32_t rw = xr.swapchain.width;   // Full width — mono uses entire swapchain
       uint32_t rh = xr.swapchain.height;
       if (!g_gsRenderer.init(vkInstance, physDevice, vkDevice, graphicsQueue, queueFamilyIndex, rw, rh))
-          LOG_WARN("3DGS renderer init failed"); }
+          LOG_WARN("3DGS renderer init failed");
+    }
 
     // Command pool for placeholder rendering
     VkCommandPool cmdPool = VK_NULL_HANDLE;
@@ -1225,11 +1226,22 @@ int main() {
 
                             // Render 3DGS or placeholder
                             VkImage targetImage = swapchainImages[imageIndex].image;
-                            // TODO: Full 3DGS rendering per eye once compute pipeline is integrated
-                            // For now, render placeholder (tinted by camera orientation for visual feedback)
-                            RenderPlaceholder(vkDevice, graphicsQueue, cmdPool,
-                                targetImage, xr.swapchain.width, xr.swapchain.height,
-                                g_input.yaw, g_input.pitch);
+                            VkFormat swapFormat = (VkFormat)xr.swapchain.format;
+
+                            if (g_gsRenderer.hasScene()) {
+                                for (int eye = 0; eye < eyeCount; eye++) {
+                                    uint32_t vpX = g_input.displayMode3D ? (eye * renderW) : 0;
+                                    g_gsRenderer.renderEye(
+                                        targetImage, swapFormat,
+                                        xr.swapchain.width, xr.swapchain.height,
+                                        vpX, 0, renderW, renderH,
+                                        viewMat[eye], projMat[eye]);
+                                }
+                            } else {
+                                RenderPlaceholder(vkDevice, graphicsQueue, cmdPool,
+                                    targetImage, xr.swapchain.width, xr.swapchain.height,
+                                    g_input.yaw, g_input.pitch);
+                            }
 
                             ReleaseSwapchainImage(xr);
                         } else {
