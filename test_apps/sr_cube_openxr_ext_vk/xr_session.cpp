@@ -293,8 +293,7 @@ bool GetVulkanDeviceExtensions(XrSessionManager& xr, VkInstance vkInstance, VkPh
     xrGetVulkanDeviceExtensionsKHR(xr.instance, xr.systemId, bufferSize, &bufferSize, extensionsStr.data());
 
     // Parse space-separated extension names
-    extensionStorage.clear();
-    deviceExtensions.clear();
+    std::vector<std::string> requested;
     {
         size_t start = 0;
         while (start < extensionsStr.size()) {
@@ -302,14 +301,36 @@ bool GetVulkanDeviceExtensions(XrSessionManager& xr, VkInstance vkInstance, VkPh
             if (end == std::string::npos) end = extensionsStr.size();
             std::string name = extensionsStr.substr(start, end - start);
             if (!name.empty() && name[0] != '\0') {
-                extensionStorage.push_back(name);
+                requested.push_back(name);
             }
             start = end + 1;
         }
     }
+
+    // Query which extensions the device actually supports
+    uint32_t availCount = 0;
+    vkEnumerateDeviceExtensionProperties(physDevice, nullptr, &availCount, nullptr);
+    std::vector<VkExtensionProperties> availExts(availCount);
+    vkEnumerateDeviceExtensionProperties(physDevice, nullptr, &availCount, availExts.data());
+
+    // Filter: only request extensions the device actually exposes
+    // (extensions promoted to Vulkan core may not be listed)
+    extensionStorage.clear();
+    deviceExtensions.clear();
+    for (auto& name : requested) {
+        bool available = false;
+        for (auto& ext : availExts) {
+            if (name == ext.extensionName) { available = true; break; }
+        }
+        if (available) {
+            extensionStorage.push_back(name);
+            LOG_INFO("  Required VkDevice extension: %s", name.c_str());
+        } else {
+            LOG_INFO("  Skipping promoted-to-core extension: %s", name.c_str());
+        }
+    }
     for (auto& name : extensionStorage) {
         deviceExtensions.push_back(name.c_str());
-        LOG_INFO("  Required VkDevice extension: %s", name.c_str());
     }
 
     return true;
