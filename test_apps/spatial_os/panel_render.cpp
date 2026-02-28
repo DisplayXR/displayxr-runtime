@@ -12,7 +12,8 @@
 #pragma comment(lib, "dwrite.lib")
 
 bool InitializePanelRenderer(PanelRenderer& renderer) {
-    HRESULT hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &renderer.d2dFactory);
+    HRESULT hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,
+        __uuidof(ID2D1Factory), reinterpret_cast<void**>(renderer.d2dFactory.GetAddressOf()));
     if (FAILED(hr)) {
         LOG_ERROR("PanelRenderer: D2D1CreateFactory failed: 0x%08X", hr);
         return false;
