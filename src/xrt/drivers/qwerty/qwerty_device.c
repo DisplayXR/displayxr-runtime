@@ -968,23 +968,18 @@ qwerty_toggle_camera_mode(struct qwerty_system *qs)
 		// Move HMD to display position
 		pose->position = disp_pos;
 	} else {
-		// Display -> Camera: derive camera state from display state
-		float m2v = qs->disp_vHeight / qs->screen_height_m;
-		float cam_distance = qs->nominal_viewer_z * m2v; // perspective=1.0
+		// Display -> Camera: reset to camera defaults
+		float cam_distance = 2.0f; // 1 / 0.5 diopters
+		qs->cam_convergence = 0.5f;
+		qs->cam_half_tan_vfov = 0.3249f;
 
-		// Camera position = display position - forward * cam_distance
+		// Move HMD backward by default camera distance
 		struct xrt_vec3 cam_pos = {
 		    pose->position.x - fwd.x * cam_distance,
 		    pose->position.y - fwd.y * cam_distance,
 		    pose->position.z - fwd.z * cam_distance,
 		};
 
-		qs->cam_convergence = clampf(1.0f / cam_distance, 0.0f, 2.0f);
-		qs->cam_half_tan_vfov = qs->disp_vHeight / (2.0f * cam_distance);
-
-		// IPD/parallax: keep current camera values (independent per mode)
-
-		// Move HMD to camera position
 		pose->position = cam_pos;
 	}
 
