@@ -383,19 +383,6 @@ qwerty_get_tracked_pose(struct xrt_device *xd,
 		m_relation_chain_push_pose(&relation_chain, &qd->pose);     // controller pose
 		m_relation_chain_push_pose(&relation_chain, &qd_hmd->pose); // base space is hmd space
 		m_relation_chain_resolve(&relation_chain, out_relation);
-
-		// One-shot debug: log poses on first left controller query
-		bool is_left = (qc == qd->sys->lctrl);
-		static bool logged_left = false;
-		if (is_left && !logged_left) {
-			logged_left = true;
-			U_LOG_W("CTRL DEBUG: ctrl_pose=(%.3f,%.3f,%.3f) hmd_pose=(%.3f,%.3f,%.3f) "
-			        "composed=(%.3f,%.3f,%.3f) follow_hmd=%d",
-			        qd->pose.position.x, qd->pose.position.y, qd->pose.position.z,
-			        qd_hmd->pose.position.x, qd_hmd->pose.position.y, qd_hmd->pose.position.z,
-			        out_relation->pose.position.x, out_relation->pose.position.y,
-			        out_relation->pose.position.z, qc->follow_hmd);
-		}
 	} else {
 		out_relation->pose = qd->pose;
 	}
@@ -499,9 +486,16 @@ qwerty_controller_create(bool is_left, struct qwerty_hmd *qhmd)
 	snprintf(xd->str, XRT_DEVICE_NAME_LEN, "%s", controller_name);
 	snprintf(xd->serial, XRT_DEVICE_NAME_LEN, "%s", controller_name);
 
-	xd->tracking_origin->type = XRT_TRACKING_TYPE_OTHER;
-	char *tracker_name = is_left ? QWERTY_LEFT_TRACKER_STR : QWERTY_RIGHT_TRACKER_STR;
-	snprintf(xd->tracking_origin->name, XRT_TRACKING_NAME_LEN, "%s", tracker_name);
+	// Share the HMD's tracking origin so all qwerty devices occupy the same
+	// node in the space overseer graph. With separate origins the IPC client
+	// may treat cross-origin xrLocateSpace as invalid, zeroing controller poses.
+	if (qhmd != NULL) {
+		xd->tracking_origin = qhmd->base.base.tracking_origin;
+	} else {
+		xd->tracking_origin->type = XRT_TRACKING_TYPE_OTHER;
+		char *tracker_name = is_left ? QWERTY_LEFT_TRACKER_STR : QWERTY_RIGHT_TRACKER_STR;
+		snprintf(xd->tracking_origin->name, XRT_TRACKING_NAME_LEN, "%s", tracker_name);
+	}
 
 	xd->inputs[QWERTY_TRIGGER].name = XRT_INPUT_WMR_TRIGGER_VALUE;
 	xd->inputs[QWERTY_MENU].name = XRT_INPUT_WMR_MENU_CLICK;
