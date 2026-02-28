@@ -365,15 +365,24 @@ bool CreateVulkanDevice(VkPhysicalDevice physDevice, uint32_t queueFamilyIndex,
     queueInfo.queueCount = 1;
     queueInfo.pQueuePriorities = &queuePriority;
 
-    // Enable features required by 3DGS.cpp compute shaders
+    // Query supported features before requesting them
+    VkPhysicalDeviceVulkan12Features supported12 = {};
+    supported12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+    VkPhysicalDeviceFeatures2 supportedFeatures2 = {};
+    supportedFeatures2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    supportedFeatures2.pNext = &supported12;
+    vkGetPhysicalDeviceFeatures2(physDevice, &supportedFeatures2);
+
+    // Enable features required by 3DGS compute shaders (only if available)
     VkPhysicalDeviceFeatures features = {};
-    features.shaderInt64 = VK_TRUE;
+    features.shaderInt64 = supportedFeatures2.features.shaderInt64;
     features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
 
     VkPhysicalDeviceVulkan12Features features12 = {};
     features12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
-    features12.shaderBufferInt64Atomics = VK_TRUE;
-    features12.shaderSharedInt64Atomics = VK_TRUE;
+    // 64-bit atomics are optional — sort.comp uses CAS fallback when unavailable
+    features12.shaderBufferInt64Atomics = supported12.shaderBufferInt64Atomics;
+    features12.shaderSharedInt64Atomics = supported12.shaderSharedInt64Atomics;
 
     VkDeviceCreateInfo createInfo = {};
     createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
