@@ -153,9 +153,14 @@ oxr_session_get_predicted_eye_positions(struct oxr_session *sess, struct xrt_eye
 #endif
 
 #ifdef XRT_HAVE_LEIA_SR_VULKAN
-	// Multi-compositor path (Vulkan)
-	struct multi_compositor *mc = multi_compositor(&sess->xcn->base);
-	return multi_compositor_get_predicted_eye_positions(mc, (struct leiasr_eye_pair *)out_eye_pair);
+	// Multi-compositor path (Vulkan) — only valid for in-process mode.
+	// In IPC mode, sess->xcn is an IPC proxy, not a multi_compositor.
+	// xmcc is only non-NULL for in-process multi_system_compositor.
+	if (sess->sys->xsysc->xmcc != NULL) {
+		struct multi_compositor *mc = multi_compositor(&sess->xcn->base);
+		return multi_compositor_get_predicted_eye_positions(mc, (struct leiasr_eye_pair *)out_eye_pair);
+	}
+	return false;
 #else
 	return false;
 #endif
@@ -935,8 +940,14 @@ oxr_session_locate_views(struct oxr_logger *log,
 	bool have_stereo_state = false;
 #endif
 
-	// Query eye tracking (vendor-neutral — returns false if no backend available)
-	bool got_eye_positions = oxr_session_get_predicted_eye_positions(sess, &eye_pair);
+	// Query eye tracking (vendor-neutral — returns false if no backend available).
+	// Only call when compositor type is known-safe. In IPC mode, sess->xcn
+	// is an IPC proxy — multi_compositor() cast would read garbage memory.
+	// Server handles eye tracking via ipc_try_get_sr_view_poses.
+	bool got_eye_positions = false;
+	if (have_stereo_state || sess->is_d3d11_native_compositor) {
+		got_eye_positions = oxr_session_get_predicted_eye_positions(sess, &eye_pair);
+	}
 
 	if (should_log) {
 		U_LOG_I("Eye tracking: got_positions=%d, valid=%d, is_d3d11=%d",
@@ -1087,7 +1098,7 @@ oxr_session_locate_views(struct oxr_logger *log,
 					}
 					have_kooima_fov = true;
 
-					if (!sess->has_external_window) {
+					if (have_stereo_state && !sess->has_external_window) {
 						for (int ei = 0; ei < 2; ei++) {
 							stereo_eye_world[ei] = (struct xrt_vec3){
 							    disp_views[ei].eye_world.x,
