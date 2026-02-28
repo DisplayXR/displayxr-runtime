@@ -38,10 +38,10 @@ struct Panel {
     PanelLayout target;
     PanelLayout defaultLayout;  // original resting position
 
-    // Disparity for 3D effect (0 = flat, negative = pop toward viewer)
+    // Disparity for 3D effect (0 = flat, negative = pop toward viewer, positive = push behind)
     float disparity = 0.0f;
     float targetDisparity = 0.0f;
-    int disparityLevel = 0;  // 0, 1, 2 — cycles through 0, -0.02, -0.04
+    int disparityLevel = 0;  // 0..3 — cycles: flat, slightly out, slightly in, flat
 
     // Swapchain for window-space panels
     SwapchainInfo swapchainInfo;
@@ -63,6 +63,6 @@ static const PanelLayout LAYOUT_AGENDA       = {0.0f,  0.54f, 0.25f, 0.26f};
 static const PanelLayout LAYOUT_ACTION_ITEMS = {0.0f,  0.80f, 1.0f,  0.20f};
 static const PanelLayout LAYOUT_SCENE_3D     = {0.25f, 0.0f,  0.75f, 0.80f};
 
-// Disparity levels for "promote to 3D" cycling
-static const float DISPARITY_LEVELS[] = {0.0f, -0.02f, -0.04f};
-static const int NUM_DISPARITY_LEVELS = 3;
+// Disparity levels: flat → slightly out → slightly in → flat
+static const float DISPARITY_LEVELS[] = {0.0f, -0.005f, 0.005f, 0.0f};
+static const int NUM_DISPARITY_LEVELS = 4;
