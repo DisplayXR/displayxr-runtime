@@ -691,18 +691,85 @@ jobs:
             test_apps/sr_cube_openxr_ext_vk/build/*.dll
             test_apps/sr_cube_openxr_ext_vk/build/textures/
 
+  # Spatial OS demo app (multi-layer war room)
+  TestAppSpatialOS:
+    if: true  # <-- Change to 'false' to disable
+    runs-on: windows-2022
+    needs: Runtime
+
+    env:
+      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
+          submodules: recursive
+
+      - name: Download runtime artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: SRMonado
+          path: runtime
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install OpenXR loader
+        run: |
+          $openxrVersion = "1.1.38"
+          $openxrUrl = "https://github.com/KhronosGroup/OpenXR-SDK-Source/releases/download/release-$openxrVersion/openxr_loader_windows-$openxrVersion.zip"
+          Invoke-WebRequest -Uri $openxrUrl -OutFile openxr_loader.zip
+          Expand-Archive -Path openxr_loader.zip -DestinationPath openxr_sdk -Force
+
+      - name: Build Spatial OS demo (spatial_os)
+        run: |
+          cd test_apps/spatial_os
+          cmake -S . -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DOpenXR_ROOT="${{ github.workspace }}/openxr_sdk"
+          cmake --build build
+
+      - name: Copy required DLLs
+        run: |
+          $loaderDll = Get-ChildItem -Path openxr_sdk -Recurse -Filter "openxr_loader.dll" | Where-Object { $_.FullName -like "*x64*" } | Select-Object -First 1
+          if (-not $loaderDll) {
+            $loaderDll = Get-ChildItem -Path openxr_sdk -Recurse -Filter "openxr_loader.dll" | Select-Object -First 1
+          }
+          if ($loaderDll) {
+            Copy-Item $loaderDll.FullName -Destination test_apps/spatial_os/build/
+          }
+
+      - name: Upload Spatial OS demo
+        uses: actions/upload-artifact@v4
+        with:
+          name: SpatialOS
+          if-no-files-found: error
+          path: |
+            test_apps/spatial_os/build/spatial_os.exe
+            test_apps/spatial_os/build/*.dll
+            test_apps/spatial_os/build/textures/
+
   # Bundle all test apps into a single artifact with per-app subfolders
   BundleTestApps:
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
-    needs: [TestAppSessionTarget, TestAppNative, TestAppNativeVulkan, TestAppStandard, TestAppD3D12, TestAppOpenGL, TestAppVulkan]
+    needs: [TestAppSessionTarget, TestAppNative, TestAppNativeVulkan, TestAppStandard, TestAppD3D12, TestAppOpenGL, TestAppVulkan, TestAppSpatialOS]
 
     steps:
-      - name: Download all test app artifacts
+      - name: Download SRCube test app artifacts
         uses: actions/download-artifact@v4
         with:
           path: TestApps
           pattern: SRCube*
+
+      - name: Download SpatialOS artifact
+        uses: actions/download-artifact@v4
+        with:
+          path: TestApps
+          pattern: SpatialOS
 
       - name: List bundled contents
         run: |
@@ -728,6 +795,7 @@ jobs:
             SRCubeOpenXRExtD3D12
             SRCubeOpenXRExtGL
             SRCubeOpenXRExtVK
+            SpatialOS
 
       - name: Install rclone
         run: |
