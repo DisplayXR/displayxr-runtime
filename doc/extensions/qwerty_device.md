@@ -262,7 +262,8 @@ fallback for development when no real display is available.
 |---------|-----------|----------|----------|
 | leia | `certain.head` | -15 | SR SDK hardware detected |
 | sim_display | `certain.head` | -20 | `SIM_DISPLAY_ENABLE=1` |
-| qwerty | `maybe.head` | -25 | No display builder active (fallback) |
+| qwerty | `maybe.head` | -19 | No display builder active (fallback) |
+| legacy | `maybe.head` | -20 | Upstream Monado catch-all |
 
 ### 5.3 Pose Delegation
 

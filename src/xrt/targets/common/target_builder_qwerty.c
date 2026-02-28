@@ -56,10 +56,14 @@ qwerty_estimate_system(struct xrt_builder *xb,
 	// Display builders (Leia, sim_display) claim certain.head and always win.
 	// Qwerty only claims maybe.head as a last-resort fallback for development
 	// when no real display builder is available.
+	//
+	// Priority -19: must beat legacy builder (-20, maybe.head) in the fallback
+	// round, since qwerty provides a functional HMD while legacy finds nothing
+	// without physical VR hardware. Higher number = higher priority in Monado.
 	estimate->maybe.head = true;
 	estimate->certain.left = true;
 	estimate->certain.right = true;
-	estimate->priority = -25;
+	estimate->priority = -19;
 
 	return XRT_SUCCESS;
 }

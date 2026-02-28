@@ -1128,8 +1128,9 @@ ordering when the runtime picks between multiple builders that claim hardware:
 |----------|---------|-----------|-------------|
 | (high) | remote, simulated | `certain.head` | Debug/override drivers |
 | -15 | leia | `certain.head` | Leia 3D display (SR SDK) |
+| -19 | qwerty | `maybe.head` | Fallback when no display builder active |
 | -20 | sim_display | `certain.head` | Simulation display |
-| -25 | qwerty | `maybe.head` | Last-resort fallback (no display) |
+| -20 | legacy | `maybe.head` | Upstream Monado catch-all |
 | (lower) | lighthouse, wmr, etc. | `certain.head` | Traditional VR hardware |
 
 Display builders claim `certain.head` and always win over qwerty's `maybe.head`.
