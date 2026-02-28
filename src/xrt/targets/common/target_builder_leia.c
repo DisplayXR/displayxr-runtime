@@ -93,17 +93,15 @@ leia_open_system_impl(struct xrt_builder *xb,
 	if (qwerty_hmd != NULL) {
 		struct qwerty_device *qd = qwerty_device(qwerty_hmd);
 
-		// Set initial pose to Leia's nominal viewing position.
-		float nominal_z = 0.65f;
+		// Configure stereo params from Leia display info.
 		struct leiasr_probe_result probe;
 		if (leiasr_get_probe_results(&probe) && probe.hw_found) {
-			if (probe.nominal_z_m > 0.0f) {
-				nominal_z = probe.nominal_z_m;
-			}
 			qd->sys->screen_height_m = probe.display_h_m;
-			qd->sys->nominal_viewer_z = probe.nominal_z_m;
+			qd->sys->nominal_viewer_z = (probe.nominal_z_m > 0.0f) ? probe.nominal_z_m : 0.65f;
 		}
-		qd->pose.position = (struct xrt_vec3){0, 0, -nominal_z};
+
+		// Camera mode default position (eye height, looking forward).
+		qd->pose.position = (struct xrt_vec3){0, 1.6f, 0};
 		qd->pose.orientation = (struct xrt_quat){0, 0, 0, 1};
 
 		// Delegate head pose to qwerty HMD for WASD/mouse camera control.
