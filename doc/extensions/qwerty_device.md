@@ -13,7 +13,7 @@
 
 The qwerty driver provides simulated HMD and controller devices that are controlled entirely via keyboard and mouse input. It allows developers to test OpenXR applications without physical VR hardware by moving a virtual headset and two virtual controllers through keyboard commands and mouse look.
 
-**Note:** The qwerty device is a pure input device — it captures keyboard/mouse input on the Monado-owned window and translates it into HMD pose + controller state. It does not produce any display output.
+**Note:** The qwerty device is a pure input device — it captures keyboard/mouse input on the Monado-owned window and translates it into HMD pose + controller state. It does not produce any display output. The qwerty builder uses `maybe.head` (last-resort fallback), not `certain.head` — display builders (Leia, sim_display) always win via `certain.head`. Display builders get qwerty input devices via the shared helper `t_builder_add_qwerty_input()`.
 
 The driver has three input backends:
 
@@ -233,9 +233,54 @@ The builder sets `nominal_viewer_z` and `screen_height_m` from the display devic
 
 ---
 
-## 5. Win32 Input Reference
+## 5. Builder Integration
 
-### 5.1 Device Focus
+### 5.1 Shared Helper
+
+Display builders (Leia, sim_display, future vendors) add qwerty keyboard/mouse
+input to their system by calling `t_builder_add_qwerty_input()`:
+
+```c
+#include "target_builder_qwerty_input.h"
+
+// In open_system_impl, after creating head:
+struct xrt_device *qwerty_hmd = NULL;
+t_builder_add_qwerty_input(xsysd, ubrh, U_LOGGING_INFO, &qwerty_hmd);
+```
+
+The helper creates the qwerty HMD + left/right controllers, adds them to the
+device list, and assigns controllers to left/right roles. It is guarded by
+`XRT_BUILD_DRIVER_QWERTY` and is a no-op when qwerty is not built.
+
+### 5.2 Qwerty Builder as Fallback
+
+The qwerty builder itself uses `maybe.head` (not `certain.head`). This means it
+only wins when no display builder claims `certain.head` — serving as a last-resort
+fallback for development when no real display is available.
+
+| Builder | Head Claim | Priority | Use Case |
+|---------|-----------|----------|----------|
+| leia | `certain.head` | -15 | SR SDK hardware detected |
+| sim_display | `certain.head` | -20 | `SIM_DISPLAY_ENABLE=1` |
+| qwerty | `maybe.head` | -25 | No display builder active (fallback) |
+
+### 5.3 Pose Delegation
+
+The `out_qwerty_hmd` parameter enables pose delegation: the display builder's
+head device stays as the HMD role (keeping display properties, Kooima FOV, and
+display processor), but delegates its pose to the qwerty HMD for WASD/mouse
+camera control.
+
+- **sim_display** uses pose delegation: calls `sim_display_hmd_set_pose_source()`
+  to make the sim_display HMD track the qwerty HMD's position/orientation.
+- **Leia** does not use pose delegation (passes `NULL`): SR SDK eye tracking
+  provides the head pose directly.
+
+---
+
+## 6. Win32 Input Reference
+
+### 6.1 Device Focus
 
 | Modifier | Focused Device | Notes |
 |----------|---------------|-------|
@@ -246,7 +291,7 @@ The builder sets `nominal_viewer_z` and `screen_height_m` from the display devic
 
 Focus is determined by `GetAsyncKeyState()` for reliability (avoids stuck keys from missed key-up events). Releasing a modifier calls `qwerty_release_all()` on all devices and resets the mouse baseline to prevent position jumps.
 
-### 5.2 Keyboard Controls
+### 6.2 Keyboard Controls
 
 | Key | Action | Scope |
 |-----|--------|-------|
@@ -267,7 +312,7 @@ Focus is determined by `GetAsyncKeyState()` for reliability (avoids stuck keys f
 | M | Trackpad click | Focused controller |
 | ESC | Close window | Global |
 
-### 5.3 Mouse Controls
+### 6.3 Mouse Controls
 
 | Action | No Modifier (HMD) | CTRL (Left) | ALT (Right) | CTRL+ALT (Both) |
 |--------|-------------------|-------------|-------------|------------------|
@@ -278,7 +323,7 @@ Focus is determined by `GetAsyncKeyState()` for reliability (avoids stuck keys f
 | Wheel | Convergence/vHeight (see §4) | Speed +/- | Speed +/- | Speed +/- both |
 | SHIFT + Wheel | IPD+Parallax ×/÷ 1.1 | — | — | — |
 
-### 5.4 Sensitivity Constants
+### 6.4 Sensitivity Constants
 
 | Constant | Value | Effect |
 |----------|-------|--------|
@@ -291,13 +336,13 @@ Effective translation: `0.2 * 0.005 = 0.001 m/px` for controllers at default spe
 
 ---
 
-## 6. Touchpad Fallback (Palm Rejection Workaround)
+## 7. Touchpad Fallback (Palm Rejection Workaround)
 
-### 6.1 Problem
+### 7.1 Problem
 
 Windows Precision Touchpad drivers suppress `WM_LBUTTONDOWN` and `WM_LBUTTONUP` messages when system modifier keys (CTRL, ALT) are held. This is a palm rejection feature. Since the qwerty driver uses CTRL/ALT for controller focus, laptop trackpad taps/clicks do not fire trigger or squeeze actions.
 
-### 6.2 Solution
+### 7.2 Solution
 
 `WM_MOUSEMOVE` messages are delivered even with modifiers held, and their `wParam` contains `MK_LBUTTON` and `MK_MBUTTON` flags indicating the current button state. The Win32 handler detects button state transitions in `WM_MOUSEMOVE` as a fallback:
 
@@ -311,13 +356,13 @@ if (lmb_down != lmb_was_down) {
 
 The `lmb_was_down` / `mmb_was_down` trackers are also synced in the regular `WM_LBUTTONDOWN`/`UP` and `WM_MBUTTONDOWN`/`UP` handlers, so both code paths stay consistent.
 
-### 6.3 Why Not Use Regular Keys Like SRHydra?
+### 7.3 Why Not Use Regular Keys Like SRHydra?
 
 SRHydra uses regular letter keys (F/G) for controller focus instead of CTRL/ALT, avoiding the palm rejection issue entirely. However, regular letter keys would conflict with the existing WASD movement and controller button bindings. CTRL and ALT are conventional modifier keys that don't generate character input and are intuitively understood as "hold to modify behavior." The `wParam` fallback preserves this ergonomic choice while still working on touchpads.
 
 ---
 
-## 7. Files Reference
+## 8. Files Reference
 
 ### Core Driver
 
@@ -343,16 +388,16 @@ SRHydra uses regular letter keys (F/G) for controller focus instead of CTRL/ALT,
 
 ---
 
-## 8. Implementation Notes
+## 9. Implementation Notes
 
-### 8.1 Static State
+### 9.1 Static State
 
 `qwerty_process_win32()` uses `static` variables for state that persists across calls (cached device pointers, modifier key state, mouse position, button tracking). This is safe because there is exactly one window and one message pump thread.
 
-### 8.2 Focus Change Release
+### 9.2 Focus Change Release
 
 When CTRL or ALT state changes, `qwerty_release_all()` is called on all devices. This prevents stuck movement keys when switching focus (e.g., pressing W while HMD-focused, then pressing CTRL to switch to left controller -- W release would go to the wrong device without the release-all).
 
-### 8.3 Dual Controller Targeting
+### 9.3 Dual Controller Targeting
 
 All keyboard and mouse actions use `targets[]` / `ctrl_targets[]` arrays with `target_count`. When CTRL+ALT are both held, both arrays contain both controllers and `target_count = 2`. Every action loops over the array, so both controllers move, rotate, trigger, etc. simultaneously.

@@ -16,6 +16,7 @@
 #include "util/u_system_helpers.h"
 
 #include "target_builder_interface.h"
+#include "target_builder_qwerty_input.h"
 
 #include "leia/leia_interface.h"
 
@@ -79,6 +80,10 @@ leia_open_system_impl(struct xrt_builder *xb,
 
 	// Assign to role(s).
 	ubrh->head = head;
+
+	// Add qwerty controllers for keyboard/mouse input.
+	// No pose delegation — Leia uses SR SDK eye tracking.
+	t_builder_add_qwerty_input(xsysd, ubrh, U_LOGGING_INFO, NULL);
 
 	return XRT_SUCCESS;
 }

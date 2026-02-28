@@ -1052,6 +1052,7 @@ each, and the highest-priority builder that claims hardware creates the devices.
 #include "util/u_builders.h"
 #include "util/u_system_helpers.h"
 #include "target_builder_interface.h"
+#include "target_builder_qwerty_input.h"
 #include "my_vendor/my_vendor_interface.h"
 
 static const char *driver_list[] = { "my_vendor" };
@@ -1083,6 +1084,12 @@ my_vendor_open_system_impl(struct xrt_builder *xb,
 
     xsysd->xdevs[xsysd->xdev_count++] = head;
     ubrh->head = head;
+
+    // Add qwerty keyboard/mouse input devices (controllers + optional HMD for pose).
+    // Pass &qwerty_hmd if you need pose delegation (e.g., WASD camera control),
+    // or NULL if your SDK provides its own head tracking.
+    t_builder_add_qwerty_input(xsysd, ubrh, U_LOGGING_INFO, NULL);
+
     return XRT_SUCCESS;
 }
 
@@ -1117,13 +1124,17 @@ t_builder_my_vendor_create(void)
 Builders are tried in list order.  The `estimate->priority` field controls
 ordering when the runtime picks between multiple builders that claim hardware:
 
-| Priority | Builder | Description |
-|----------|---------|-------------|
-| (high) | qwerty, remote, simulated | Debug/override drivers |
-| -15 | leia | Leia 3D display (SR SDK) |
-| -20 | sim_display | Simulation display |
-| -25 | qwerty (as fallback) | Keyboard/mouse debug |
-| (lower) | lighthouse, wmr, etc. | Traditional VR hardware |
+| Priority | Builder | Head Claim | Description |
+|----------|---------|-----------|-------------|
+| (high) | remote, simulated | `certain.head` | Debug/override drivers |
+| -15 | leia | `certain.head` | Leia 3D display (SR SDK) |
+| -20 | sim_display | `certain.head` | Simulation display |
+| -25 | qwerty | `maybe.head` | Last-resort fallback (no display) |
+| (lower) | lighthouse, wmr, etc. | `certain.head` | Traditional VR hardware |
+
+Display builders claim `certain.head` and always win over qwerty's `maybe.head`.
+Qwerty provides keyboard/mouse input devices — display builders add them via
+`t_builder_add_qwerty_input()` in their `open_system_impl`.
 
 **Guideline:** Use a priority between -10 and -20 for real hardware.
 
@@ -1551,8 +1562,9 @@ For a vendor starting from scratch, here is the recommended order:
 5. **Wire up eye tracking** — return `xrt_eye_pair` through the compositor interface
 6. **Populate `xrt_system_compositor_info`** with display geometry at device init
 7. **Register the builder** in target_builder_interface.h and target_lists.c
-8. **Update CMakeLists.txt** files to build and link the new driver
-9. **Test with `SIM_DISPLAY_ENABLE=0`** and your actual hardware
+8. **Add keyboard/mouse input** by calling `t_builder_add_qwerty_input()` in your builder's `open_system_impl`
+9. **Update CMakeLists.txt** files to build and link the new driver
+10. **Test with `SIM_DISPLAY_ENABLE=0`** and your actual hardware
 
 **Remember:** vendor-specific code goes **only** in `src/xrt/drivers/<vendor>/`.
 No changes to runtime files (`oxr_session.c`, `comp_multi_compositor.c`, etc.)

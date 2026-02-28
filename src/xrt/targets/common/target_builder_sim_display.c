@@ -15,11 +15,11 @@
 #include "util/u_system_helpers.h"
 
 #include "target_builder_interface.h"
+#include "target_builder_qwerty_input.h"
 
 #include "sim_display/sim_display_interface.h"
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
-#include "qwerty/qwerty_interface.h"
 #include "qwerty/qwerty_device.h"
 #endif
 
@@ -58,7 +58,7 @@ sim_display_estimate_system(struct xrt_builder *xb,
 	}
 
 	estimate->certain.head = true;
-	estimate->priority = -20; // Lower than qwerty (-25) but higher than real hardware
+	estimate->priority = -20; // Higher than qwerty fallback (-25), lower than leia (-15)
 
 	return XRT_SUCCESS;
 }
@@ -83,46 +83,25 @@ sim_display_open_system_impl(struct xrt_builder *xb,
 	// Assign to role(s).
 	ubrh->head = head;
 
+	// Add qwerty keyboard/mouse input devices (controllers + HMD for pose).
+	struct xrt_device *qwerty_hmd = NULL;
+	t_builder_add_qwerty_input(xsysd, ubrh, U_LOGGING_INFO, &qwerty_hmd);
+
 #ifdef XRT_BUILD_DRIVER_QWERTY
-	// Create qwerty devices for keyboard/mouse input.
-	// The sim_display HMD stays as head (keeps Kooima FOV + display processor),
-	// but delegates its pose to the qwerty HMD for WASD/mouse camera control.
-	{
-		struct xrt_device *qwerty_head = NULL;
-		struct xrt_device *left = NULL;
-		struct xrt_device *right = NULL;
-		enum u_logging_level log_level = U_LOGGING_INFO;
+	// sim_display-specific: configure qwerty HMD pose and delegate sim_display
+	// pose to qwerty for WASD/mouse camera control.
+	if (qwerty_hmd != NULL) {
+		struct qwerty_device *qd = qwerty_device(qwerty_hmd);
+		qd->pose.position = (struct xrt_vec3){0, 1.6f, 0};
+		qd->pose.orientation = (struct xrt_quat){0, 0, 0, 1};
 
-		xrt_result_t xret = qwerty_create_devices(log_level, &qwerty_head, &left, &right);
-		if (xret == XRT_SUCCESS) {
-			if (qwerty_head != NULL) {
-				xsysd->xdevs[xsysd->xdev_count++] = qwerty_head;
-
-				// Qwerty HMD pose = virtual display position in world space.
-				// Default is camera-centric mode: viewer at (0, 1.6, 0).
-				struct qwerty_device *qd = qwerty_device(qwerty_head);
-				qd->pose.position = (struct xrt_vec3){0, 1.6f, 0};
-				qd->pose.orientation = (struct xrt_quat){0, 0, 0, 1};
-
-				// Set hardware config from sim_display info.
-				struct sim_display_info info;
-				if (sim_display_get_display_info(head, &info)) {
-					qd->sys->screen_height_m = info.display_height_m;
-					qd->sys->nominal_viewer_z = info.nominal_z_m;
-				}
-
-				// Delegate sim_display pose to qwerty HMD.
-				sim_display_hmd_set_pose_source(head, qwerty_head);
-			}
-			if (left != NULL) {
-				xsysd->xdevs[xsysd->xdev_count++] = left;
-				ubrh->left = left;
-			}
-			if (right != NULL) {
-				xsysd->xdevs[xsysd->xdev_count++] = right;
-				ubrh->right = right;
-			}
+		struct sim_display_info info;
+		if (sim_display_get_display_info(head, &info)) {
+			qd->sys->screen_height_m = info.display_height_m;
+			qd->sys->nominal_viewer_z = info.nominal_z_m;
 		}
+
+		sim_display_hmd_set_pose_source(head, qwerty_hmd);
 	}
 #endif
 

@@ -6,8 +6,9 @@
 #
 
 add_library(
-	target_lists STATIC target_builder_interface.h target_builder_legacy.c target_lists.c
-			    target_lists.h
+	target_lists STATIC target_builder_interface.h target_builder_legacy.c
+			    target_builder_qwerty_input.c target_builder_qwerty_input.h
+			    target_lists.c target_lists.h
 	)
 target_link_libraries(target_lists PRIVATE xrt-interfaces aux_util aux_util_sink drv_includes)
 target_include_directories(target_lists PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -74,7 +75,7 @@ endif()
 target_sources(target_lists PRIVATE target_builder_sim_display.c)
 target_link_libraries(target_lists PRIVATE drv_sim_display)
 if(XRT_BUILD_DRIVER_QWERTY)
-	# sim_display builder creates qwerty controllers alongside its HMD
+	# sim_display builder uses qwerty_device.h for pose delegation config
 	target_link_libraries(target_lists PRIVATE drv_qwerty drv_qwerty_includes)
 endif()
 
