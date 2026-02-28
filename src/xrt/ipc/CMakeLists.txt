@@ -134,6 +134,7 @@ endif()
 if(XRT_BUILD_DRIVER_QWERTY)
 	target_include_directories(ipc_server PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../drivers/qwerty)
 	target_link_libraries(ipc_server PRIVATE drv_qwerty)
+	target_compile_definitions(ipc_server PRIVATE XRT_BUILD_DRIVER_QWERTY)
 endif()
 
 if(XRT_HAVE_SYSTEMD)
