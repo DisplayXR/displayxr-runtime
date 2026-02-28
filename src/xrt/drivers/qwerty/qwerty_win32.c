@@ -82,7 +82,10 @@ default_qwerty_device(struct xrt_device **xdevs, size_t xdev_count, struct qwert
 	struct xrt_device *xd_right = &qsys->rctrl->base.base;
 
 	struct qwerty_device *default_qdev = NULL;
-	if (head >= 0 && head < (int)xdev_count && xdevs[head] == xd_hmd) {
+	if (xd_hmd != NULL) {
+		// Qwerty HMD exists — default to it regardless of head role.
+		// When a display builder (Leia, sim_display) owns the head role,
+		// the qwerty HMD is still in the device list for pose/stereo control.
 		default_qdev = qwerty_device(xd_hmd);
 	} else if (right >= 0 && right < (int)xdev_count && xdevs[right] == xd_right) {
 		default_qdev = qwerty_device(xd_right);
