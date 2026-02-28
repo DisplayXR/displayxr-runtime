@@ -100,7 +100,7 @@ void HandleSpaceKey(SpatialAppState& app) {
         focused.target = {0.20f, 0.10f, 0.60f, 0.60f};
         focused.targetAlpha = 1.0f;
         if (focused.disparityLevel > 0) {
-            focused.targetDisparity = DISPARITY_LEVELS[focused.disparityLevel] * 1.5f;  // dramatic depth
+            focused.targetDisparity = DISPARITY_LEVELS[focused.disparityLevel] * 2.0f;  // boost depth in focus mode
         }
 
         // Non-focused panels: shrink to bottom strip, dim
