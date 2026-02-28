@@ -8,6 +8,7 @@
 
 #include "xrt/xrt_config_build.h"
 #include "xrt/xrt_config_drivers.h"
+#include "xrt/xrt_config_have.h"
 
 
 /*

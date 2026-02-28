@@ -131,7 +131,7 @@ positions through vendor-neutral interfaces.
 | 2 | **Device Driver** | `xrt_device` with display specs (resolution, physical size, refresh rate, FOV) | Yes |
 | 3 | **Eye Tracking** | Predicted L/R eye positions in display-local coordinates | Recommended |
 | 4 | **SDK Wrapper** | Opaque C wrapper isolating vendor headers from the codebase | Recommended |
-| 5 | **Target Builder** | Registers the driver with the runtime's builder system | Yes |
+| 5 | **Target Builder** | Builder .c file + registration in 5 build system files (see §8.1) | Yes |
 
 ---
 
@@ -1035,13 +1035,60 @@ my_vendor_sdk_weave(struct my_vendor_sdk *sdk, /* ... */)
 
 ---
 
-## 8. Component 5: Target Builder
+## 8. Component 5: Target Builder and Build System Registration
 
 The target builder registers the vendor's driver with the runtime.  When the
 runtime starts, it iterates the builder list, calls `estimate_system()` on
 each, and the highest-priority builder that claims hardware creates the devices.
 
-### 8.1 Builder Implementation
+**Registration requires touching 5 files** beyond your driver code.  Missing any
+one silently excludes the builder from the runtime — there will be no error at
+build time, the builder simply won't appear in the builder list at runtime.
+
+### 8.1 Registration Checklist
+
+Every step is required.  The table shows the exact file and what to add:
+
+| # | File | What to Add | If Missing... |
+|---|------|-------------|---------------|
+| 1 | `CMakeLists.txt` (root) | `"MY_VENDOR"` to `AVAILABLE_DRIVERS` list | `XRT_BUILD_DRIVER_MY_VENDOR` never defined |
+| 2 | `src/xrt/drivers/CMakeLists.txt` | `drv_my_vendor` library definition | Driver objects not compiled |
+| 3 | `src/xrt/targets/common/target_builder_interface.h` | `T_BUILDER_MY_VENDOR` guard + function declaration | Builder not registered in target_lists.c |
+| 4 | `src/xrt/targets/common/target_lists.c` | `t_builder_my_vendor_create` in builder array | Builder compiled but never instantiated |
+| 5 | `src/xrt/targets/common/CMakeLists.txt` | `target_sources` + `target_link_libraries` | Builder .c file not compiled / linked |
+
+### 8.2 Config Header System (Important)
+
+The build system generates **two** config headers.  Understanding which one
+contains your guard is critical — using the wrong header silently breaks
+registration:
+
+| Header | Generated From | Contains | Used For |
+|--------|---------------|----------|----------|
+| `xrt_config_drivers.h` | `AVAILABLE_DRIVERS` list in root `CMakeLists.txt` | `XRT_BUILD_DRIVER_*` defines | Driver compile guards |
+| `xrt_config_have.h` | `option_with_deps()` calls in root `CMakeLists.txt` | `XRT_HAVE_*` defines | External dependency guards |
+
+`target_builder_interface.h` includes **both** headers, so you can use either
+guard style.  The recommended approach depends on how your SDK is found:
+
+**Option A (recommended for most vendors):** Add your driver to `AVAILABLE_DRIVERS`
+and use `XRT_BUILD_DRIVER_MY_VENDOR`.  This is the standard Monado pattern:
+
+```cmake
+# In root CMakeLists.txt, add to the AVAILABLE_DRIVERS list:
+list(APPEND AVAILABLE_DRIVERS "MY_VENDOR")
+
+# Then enable it based on SDK detection:
+cmake_dependent_option(XRT_BUILD_DRIVER_MY_VENDOR
+    "Enable MyVendor 3D display driver" ON "MY_VENDOR_SDK_FOUND" OFF)
+```
+
+**Option B (external SDK dependency):** If your driver is gated by
+`find_package()` and uses `option_with_deps()`, you get an `XRT_HAVE_*` define
+instead.  This is what Leia uses (`XRT_HAVE_LEIA_SR`).  Both approaches work in
+`target_builder_interface.h`.
+
+### 8.3 Builder Implementation
 
 **File:** `src/xrt/targets/common/target_builder_<vendor>.c`
 
@@ -1063,8 +1110,10 @@ my_vendor_estimate_system(struct xrt_builder *xb,
                           struct xrt_prober *xp,
                           struct xrt_builder_estimate *estimate)
 {
+    // Probe for hardware (or check env var, etc.)
+    // Only claim certain.head if your display is actually present.
     estimate->certain.head = true;
-    estimate->priority = -15;  // Lower = checked first
+    estimate->priority = -15;  // Higher number = higher priority
     return XRT_SUCCESS;
 }
 
@@ -1119,33 +1168,60 @@ t_builder_my_vendor_create(void)
 }
 ```
 
-### 8.2 Priority System
+### 8.4 Priority and Selection System
 
-Builders are tried in list order.  The `estimate->priority` field controls
-ordering when the runtime picks between multiple builders that claim hardware:
+The runtime selects a builder in two passes:
+
+1. **Certain pass:** Find the builder with the highest `priority` that set
+   `estimate->certain.head = true`.  If found, use it.
+2. **Maybe pass:** If no builder is certain, find the highest-priority builder
+   that set `estimate->maybe.head = true`.
+
+**Higher number = higher priority** (closer to 0 wins).  `-15` beats `-20`.
 
 | Priority | Builder | Head Claim | Description |
 |----------|---------|-----------|-------------|
 | (high) | remote, simulated | `certain.head` | Debug/override drivers |
 | -15 | leia | `certain.head` | Leia 3D display (SR SDK) |
-| -19 | qwerty | `maybe.head` | Fallback when no display builder active |
 | -20 | sim_display | `certain.head` | Simulation display |
+| -19 | qwerty | `maybe.head` | Fallback when no display builder active |
 | -20 | legacy | `maybe.head` | Upstream Monado catch-all |
 | (lower) | lighthouse, wmr, etc. | `certain.head` | Traditional VR hardware |
 
-Display builders claim `certain.head` and always win over qwerty's `maybe.head`.
-Qwerty provides keyboard/mouse input devices — display builders add them via
+Display builders must claim `certain.head` — this guarantees they win over
+qwerty's `maybe.head` fallback regardless of priority.  Qwerty provides
+keyboard/mouse input devices — display builders add them via
 `t_builder_add_qwerty_input()` in their `open_system_impl`.
 
 **Guideline:** Use a priority between -10 and -20 for real hardware.
 
-### 8.3 Registration in `target_builder_interface.h`
+### 8.5 Step-by-Step: Registration in `CMakeLists.txt` (root)
 
-Add the builder guard and declaration:
+Add your driver name to the `AVAILABLE_DRIVERS` list (alphabetical order):
+
+```cmake
+list(
+    APPEND
+    AVAILABLE_DRIVERS
+    ...
+    "MY_VENDOR"    # <-- add here
+    ...
+)
+```
+
+This generates `#define XRT_BUILD_DRIVER_MY_VENDOR` in the auto-generated
+`xrt_config_drivers.h` header when the driver is enabled.
+
+### 8.6 Step-by-Step: Registration in `target_builder_interface.h`
+
+Add the builder guard and function declaration:
 
 ```c
 // In target_builder_interface.h:
 
+// Use XRT_BUILD_DRIVER_MY_VENDOR (from xrt_config_drivers.h, via AVAILABLE_DRIVERS)
+// or XRT_HAVE_MY_VENDOR_SDK (from xrt_config_have.h, via option_with_deps) —
+// both headers are included at the top of this file.
 #if defined(XRT_BUILD_DRIVER_MY_VENDOR) || defined(XRT_DOXYGEN)
 #define T_BUILDER_MY_VENDOR
 #endif
@@ -1159,7 +1235,7 @@ t_builder_my_vendor_create(void);
 #endif
 ```
 
-### 8.4 Registration in `target_lists.c`
+### 8.7 Step-by-Step: Registration in `target_lists.c`
 
 Add the builder to the builder list array:
 
@@ -1180,9 +1256,9 @@ xrt_builder_create_func_t target_builder_list[] = {
 **Placement matters:** Place your entry in the list at the position
 corresponding to your priority (after overrides, before traditional VR).
 
-### 8.5 CMake Integration
+### 8.8 Step-by-Step: CMake Integration
 
-Two CMake files need changes:
+Two more CMake files need changes:
 
 #### `src/xrt/drivers/CMakeLists.txt`
 
@@ -1222,12 +1298,33 @@ if(XRT_BUILD_DRIVER_MY_VENDOR)
 endif()
 ```
 
-### 8.6 Reference Files
+### 8.9 Verification
+
+After completing all registration steps, verify your builder appears at runtime:
+
+```
+[INFO ] [p_create_system] Creating system:
+    Builders:
+        my_vendor: MyVendor 3D Display      <-- must appear here
+        qwerty: Qwerty devices builder
+        ...
+    Selected my_vendor (priority -15) because it was certain it could create a head
+```
+
+If your builder is **missing from the list**, check:
+1. Is `XRT_BUILD_DRIVER_MY_VENDOR` defined? → Check `AVAILABLE_DRIVERS` in root CMakeLists.txt
+2. Is the guard in `target_builder_interface.h` using the right define? → `xrt_config_drivers.h` has `XRT_BUILD_DRIVER_*`, `xrt_config_have.h` has `XRT_HAVE_*`
+3. Is the builder added to `target_lists.c` inside the `#ifdef T_BUILDER_MY_VENDOR` guard?
+4. Is the builder .c file added to `target_sources` in `targets/common/CMakeLists.txt`?
+
+### 8.10 Reference Files
 
 - **Leia builder:** `src/xrt/targets/common/target_builder_leia.c`
 - **sim_display builder:** `src/xrt/targets/common/target_builder_sim_display.c`
 - **Builder interface:** `src/xrt/targets/common/target_builder_interface.h`
 - **Builder list:** `src/xrt/targets/common/target_lists.c`
+- **Available drivers:** root `CMakeLists.txt` → `AVAILABLE_DRIVERS`
+- **Config headers:** `src/xrt/include/xrt/xrt_config_drivers.h.cmake_in`, `xrt_config_have.h.cmake_in`
 
 ---
 
@@ -1252,10 +1349,11 @@ src/xrt/drivers/my_vendor/
 src/xrt/targets/common/
 ├── target_builder_my_vendor.c             Builder registration
 
-Modified files:
+Modified files (all 5 required — see §8.1 checklist):
+├── CMakeLists.txt (root)                  Add to AVAILABLE_DRIVERS list
 ├── src/xrt/drivers/CMakeLists.txt         Add drv_my_vendor library
 ├── src/xrt/targets/common/CMakeLists.txt  Link builder to driver
-├── src/xrt/targets/common/target_builder_interface.h  Declare builder
+├── src/xrt/targets/common/target_builder_interface.h  Declare builder guard + function
 └── src/xrt/targets/common/target_lists.c  Register builder in list
 ```
 
@@ -1562,9 +1660,14 @@ For a vendor starting from scratch, here is the recommended order:
 4. **Add your SDK wrapper** (.h/.cpp pair with opaque struct)
 5. **Wire up eye tracking** — return `xrt_eye_pair` through the compositor interface
 6. **Populate `xrt_system_compositor_info`** with display geometry at device init
-7. **Register the builder** in target_builder_interface.h and target_lists.c
+7. **Register in the build system** (all 5 files — see §8.1 checklist):
+   - Add `"MY_VENDOR"` to `AVAILABLE_DRIVERS` in root `CMakeLists.txt`
+   - Add `drv_my_vendor` library in `src/xrt/drivers/CMakeLists.txt`
+   - Add `T_BUILDER_MY_VENDOR` guard + declaration in `target_builder_interface.h`
+   - Add `t_builder_my_vendor_create` in `target_lists.c`
+   - Add `target_sources` + `target_link_libraries` in `targets/common/CMakeLists.txt`
 8. **Add keyboard/mouse input** by calling `t_builder_add_qwerty_input()` in your builder's `open_system_impl`
-9. **Update CMakeLists.txt** files to build and link the new driver
+9. **Verify builder appears** in the runtime log: `Builders: ... my_vendor: MyVendor 3D Display`
 10. **Test with `SIM_DISPLAY_ENABLE=0`** and your actual hardware
 
 **Remember:** vendor-specific code goes **only** in `src/xrt/drivers/<vendor>/`.
