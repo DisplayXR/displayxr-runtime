@@ -1973,7 +1973,7 @@ oxr_session_create(struct oxr_logger *log,
 	// Tell sim_display driver to return raw eye positions (no qwerty compose)
 	if (sess->has_external_window) {
 		struct xrt_device *head = GET_XDEV_BY_ROLE(sess->sys, head);
-		if (head != NULL && strcmp(head->str, "Sim 3D Display") == 0) {
+		if (head != NULL && strcmp(head->serial, "sim_display_0") == 0) {
 			sim_display_hmd_set_ext_app_mode(head, true);
 		}
 	}

@@ -347,7 +347,6 @@ if(WIN32)
 		target_link_libraries(comp_win32_window PRIVATE drv_qwerty drv_qwerty_includes)
 		target_compile_definitions(comp_win32_window PRIVATE XRT_BUILD_DRIVER_QWERTY)
 	endif()
-	target_link_libraries(comp_win32_window PRIVATE drv_sim_display_includes)
 endif()
 
 ###

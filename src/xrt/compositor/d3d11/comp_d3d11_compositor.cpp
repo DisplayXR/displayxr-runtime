@@ -39,6 +39,8 @@
 
 #include "math/m_api.h"
 
+// TODO: Move display processor creation to driver layer
+// to fully decouple compositor from sim_display driver internals.
 #include "sim_display/sim_display_interface.h"
 
 #ifdef XRT_BUILD_DRIVER_QWERTY

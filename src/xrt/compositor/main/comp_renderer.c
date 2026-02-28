@@ -61,6 +61,8 @@
 
 #include "xrt/xrt_config_drivers.h"
 #include "xrt/xrt_display_processor.h"
+// TODO: Move display processor creation and display info queries to driver layer
+// to fully decouple compositor from sim_display driver internals.
 #include "sim_display/sim_display_interface.h"
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
@@ -1349,17 +1351,8 @@ renderer_blit_hud(struct comp_renderer *r,
 	}
 #endif
 
-	// Build device name with render mode for sim_display
-	char device_name_buf[128];
+	// Device name includes mode suffix (set by device's set_property handler)
 	const char *device_name = r->c->xdev->str;
-	if (zoom_scale > 0.0f) { // sim_display was detected
-		const char *mode_str = "SBS";
-		enum sim_display_output_mode sd_mode = sim_display_get_output_mode();
-		if (sd_mode == SIM_DISPLAY_OUTPUT_ANAGLYPH) mode_str = "Anaglyph";
-		else if (sd_mode == SIM_DISPLAY_OUTPUT_BLEND) mode_str = "Blended";
-		snprintf(device_name_buf, sizeof(device_name_buf), "%s (%s)", r->c->xdev->str, mode_str);
-		device_name = device_name_buf;
-	}
 
 	// Fill HUD data
 	struct u_hud_data data = {0};

@@ -335,6 +335,45 @@ sim_display_get_display_info(struct xrt_device *xdev, struct sim_display_info *o
 
 /*
  *
+ * Generic property interface.
+ *
+ */
+
+static xrt_result_t
+sim_display_hmd_set_property(struct xrt_device *xdev,
+                              enum xrt_device_property_id property,
+                              int32_t value)
+{
+	if (property == XRT_DEVICE_PROPERTY_OUTPUT_MODE) {
+		sim_display_set_output_mode((enum sim_display_output_mode)value);
+		// Update device name to reflect current mode
+		const char *mode_names[] = {"SBS", "Anaglyph", "Blended"};
+		int idx = (value >= 0 && value <= 2) ? value : 0;
+		snprintf(xdev->str, XRT_DEVICE_NAME_LEN, "Sim 3D Display (%s)", mode_names[idx]);
+		return XRT_SUCCESS;
+	}
+	return XRT_ERROR_NOT_IMPLEMENTED;
+}
+
+static xrt_result_t
+sim_display_hmd_get_property(struct xrt_device *xdev,
+                              enum xrt_device_property_id property,
+                              int32_t *out_value)
+{
+	if (property == XRT_DEVICE_PROPERTY_OUTPUT_MODE) {
+		*out_value = (int32_t)sim_display_get_output_mode();
+		return XRT_SUCCESS;
+	}
+	if (property == XRT_DEVICE_PROPERTY_SBS_MODE) {
+		*out_value = (sim_display_get_output_mode() == SIM_DISPLAY_OUTPUT_SBS) ? 1 : 0;
+		return XRT_SUCCESS;
+	}
+	return XRT_ERROR_NOT_IMPLEMENTED;
+}
+
+
+/*
+ *
  * Creation function.
  *
  */
@@ -423,6 +462,8 @@ sim_display_hmd_create(void)
 	hmd->base.get_tracked_pose = sim_display_hmd_get_tracked_pose;
 	hmd->base.get_view_poses = sim_display_get_view_poses;
 	hmd->base.get_visibility_mask = u_device_get_visibility_mask;
+	hmd->base.set_property = sim_display_hmd_set_property;
+	hmd->base.get_property = sim_display_hmd_get_property;
 	hmd->base.destroy = sim_display_hmd_destroy;
 	hmd->base.name = XRT_DEVICE_GENERIC_HMD;
 	hmd->base.device_type = XRT_DEVICE_TYPE_HMD;
@@ -435,7 +476,12 @@ sim_display_hmd_create(void)
 
 	hmd->base.hmd->view_count = 2;
 
-	snprintf(hmd->base.str, XRT_DEVICE_NAME_LEN, "Sim 3D Display");
+	{
+		const char *mode_names[] = {"SBS", "Anaglyph", "Blended"};
+		int idx = (int)sim_display_get_output_mode();
+		if (idx < 0 || idx > 2) idx = 0;
+		snprintf(hmd->base.str, XRT_DEVICE_NAME_LEN, "Sim 3D Display (%s)", mode_names[idx]);
+	}
 	snprintf(hmd->base.serial, XRT_DEVICE_NAME_LEN, "sim_display_0");
 
 	// Head pose input.

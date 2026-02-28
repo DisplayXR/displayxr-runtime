@@ -32,8 +32,12 @@
 // Vulkan helpers needed for Y-flip SBS cleanup (not Leia-specific)
 #include "vk/vk_helpers.h"
 
-// sim_display processor for development without SR hardware
+// TODO: Move display processor creation and display info queries to driver layer
+// to fully decouple compositor from sim_display driver internals.
 #include "sim_display/sim_display_interface.h"
+
+#include "xrt/xrt_device.h"
+#include "xrt/xrt_system.h"
 
 #ifdef XRT_HAVE_LEIA_SR_VULKAN
 #include "leia/leia_sr.h"
@@ -1889,7 +1893,11 @@ compute_window_metrics_from_comp_target(struct multi_system_compositor *msc,
 
 	// In SBS mode each eye sees half the display width.
 	// Check dynamically so Kooima FOV updates when mode switches at runtime.
-	bool sbs_mode = (sim_display_get_output_mode() == SIM_DISPLAY_OUTPUT_SBS);
+	int32_t sbs_val = 0;
+	struct xrt_device *head = cc->xdev;
+	bool sbs_mode = (head != NULL &&
+	                 xrt_device_get_property(head, XRT_DEVICE_PROPERTY_SBS_MODE, &sbs_val) == XRT_SUCCESS &&
+	                 sbs_val != 0);
 	float disp_w_m = sbs_mode ? info->display_width_m / 2.0f : info->display_width_m;
 
 	memset(out_metrics, 0, sizeof(*out_metrics));
@@ -1954,19 +1962,20 @@ multi_compositor_request_display_mode(struct multi_compositor *mc, bool enable_3
 	}
 #endif
 
-	// sim_display fallback: save mode before 2D, restore on 3D
-	if (mc->session_render.display_processor != NULL) {
+	// Generic device output mode save/restore for 2D/3D transitions
+	// NOTE: May be replaced by XR_EXT_display_render_mode / xrSetDisplayRenderModeEXT()
+	struct xrt_device *head = mc->xsysd ? mc->xsysd->static_roles.head : NULL;
+	if (head != NULL && head->set_property != NULL) {
 		if (!enable_3d) {
-			// Switching to 2D: save current mode, then set BLEND
-			mc->session_render.saved_sim_display_mode = (int)sim_display_get_output_mode();
-			sim_display_set_output_mode(SIM_DISPLAY_OUTPUT_BLEND);
+			int32_t current_mode = 0;
+			xrt_device_get_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, &current_mode);
+			mc->session_render.saved_output_mode = current_mode;
+			xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, 2); // blend for 2D
 		} else {
-			// Switching to 3D: restore saved mode (default to anaglyph if none saved)
-			int saved = mc->session_render.saved_sim_display_mode;
-			enum sim_display_output_mode restore_mode =
-			    (saved >= 0) ? (enum sim_display_output_mode)saved : SIM_DISPLAY_OUTPUT_ANAGLYPH;
-			sim_display_set_output_mode(restore_mode);
-			mc->session_render.saved_sim_display_mode = -1;
+			int saved = mc->session_render.saved_output_mode;
+			int32_t restore_mode = (saved >= 0) ? saved : 1; // default anaglyph
+			xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, restore_mode);
+			mc->session_render.saved_output_mode = -1;
 		}
 		return true;
 	}
@@ -2014,7 +2023,7 @@ multi_compositor_create(struct multi_system_compositor *msc,
 	mc->msc = msc;
 	mc->xses = xses;
 	mc->xsi = *xsi;
-	mc->session_render.saved_sim_display_mode = -1;
+	mc->session_render.saved_output_mode = -1;
 
 	os_mutex_init(&mc->slot_lock);
 	os_thread_helper_init(&mc->wait_thread.oth);

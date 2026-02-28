@@ -355,8 +355,8 @@ struct multi_compositor
 		float hud_smoothed_frame_time_ms;
 		//! @}
 
-		//! Saved sim_display output mode before 2D switch (-1 = none saved)
-		int saved_sim_display_mode;
+		//! Saved device output mode before 2D switch (-1 = none saved)
+		int saved_output_mode;
 
 		//! True if window-close exit request has been pushed (avoids duplicates)
 		bool window_close_exit_sent;

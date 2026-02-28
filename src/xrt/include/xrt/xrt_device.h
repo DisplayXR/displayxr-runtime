@@ -223,6 +223,24 @@ struct xrt_binding_profile
 };
 
 /*!
+ * Generic device property identifiers.
+ *
+ * @note This property mechanism may be replaced by XR_EXT_display_render_mode
+ * with xrSetDisplayRenderModeEXT() in a future version.
+ *
+ * @ingroup xrt_iface
+ */
+enum xrt_device_property_id
+{
+	//! Output rendering mode index (int32_t, device-specific values 0..N).
+	XRT_DEVICE_PROPERTY_OUTPUT_MODE = 0,
+
+	//! Whether current mode uses side-by-side layout (half-width per eye).
+	//! Returns 1 for SBS, 0 otherwise. Read-only.
+	XRT_DEVICE_PROPERTY_SBS_MODE = 1,
+};
+
+/*!
  * Higher level features for devices.
  */
 enum xrt_device_feature_type
@@ -682,6 +700,26 @@ struct xrt_device
 	xrt_result_t (*end_feature)(struct xrt_device *xdev, enum xrt_device_feature_type type);
 
 	/*!
+	 * Set a generic device property.
+	 *
+	 * @note This may be replaced by XR_EXT_display_render_mode with
+	 * xrSetDisplayRenderModeEXT() in a future version.
+	 */
+	xrt_result_t (*set_property)(struct xrt_device *xdev,
+	                              enum xrt_device_property_id property,
+	                              int32_t value);
+
+	/*!
+	 * Get a generic device property.
+	 *
+	 * @note This may be replaced by XR_EXT_display_render_mode with
+	 * xrSetDisplayRenderModeEXT() in a future version.
+	 */
+	xrt_result_t (*get_property)(struct xrt_device *xdev,
+	                              enum xrt_device_property_id property,
+	                              int32_t *out_value);
+
+	/*!
 	 * Destroy device.
 	 */
 	void (*destroy)(struct xrt_device *xdev);
@@ -1045,6 +1083,38 @@ static inline xrt_result_t
 xrt_device_end_feature(struct xrt_device *xdev, enum xrt_device_feature_type type)
 {
 	return xdev->end_feature(xdev, type);
+}
+
+/*!
+ * Helper function for @ref xrt_device::set_property.
+ *
+ * @public @memberof xrt_device
+ */
+static inline xrt_result_t
+xrt_device_set_property(struct xrt_device *xdev,
+                        enum xrt_device_property_id property,
+                        int32_t value)
+{
+	if (xdev->set_property == NULL) {
+		return XRT_ERROR_NOT_IMPLEMENTED;
+	}
+	return xdev->set_property(xdev, property, value);
+}
+
+/*!
+ * Helper function for @ref xrt_device::get_property.
+ *
+ * @public @memberof xrt_device
+ */
+static inline xrt_result_t
+xrt_device_get_property(struct xrt_device *xdev,
+                        enum xrt_device_property_id property,
+                        int32_t *out_value)
+{
+	if (xdev->get_property == NULL) {
+		return XRT_ERROR_NOT_IMPLEMENTED;
+	}
+	return xdev->get_property(xdev, property, out_value);
 }
 
 /*!
