@@ -41,6 +41,9 @@
 #define QWERTY_CONTROLLER_INITIAL_POS(is_left) (struct xrt_vec3){(is_left) ? -0.2f : 0.2f, -0.3f, -0.5f}
 // clang-format on
 
+static void
+reset_controller_for_mode(struct qwerty_system *qs, struct qwerty_controller *qc, bool is_left);
+
 // Indices for fake controller input components
 #define QWERTY_TRIGGER 0
 #define QWERTY_MENU 1
@@ -984,6 +987,15 @@ qwerty_toggle_camera_mode(struct qwerty_system *qs)
 	}
 
 	qs->camera_mode = !qs->camera_mode;
+
+	// Reset controllers to mode-appropriate default positions (attached to head)
+	if (qs->lctrl) {
+		reset_controller_for_mode(qs, qs->lctrl, true);
+	}
+	if (qs->rctrl) {
+		reset_controller_for_mode(qs, qs->rctrl, false);
+	}
+
 	U_LOG_W("Qwerty: stereo mode -> %s (derived from previous state)",
 	        qs->camera_mode ? "Camera" : "Display");
 }
@@ -1085,6 +1097,36 @@ qwerty_get_stereo_state(struct xrt_device **xdevs, size_t xdev_count, struct qwe
 	out->nominal_viewer_z = qs->nominal_viewer_z;
 	out->screen_height_m = qs->screen_height_m;
 	return true;
+}
+
+static void
+reset_controller_for_mode(struct qwerty_system *qs, struct qwerty_controller *qc, bool is_left)
+{
+	struct qwerty_device *qd = &qc->base;
+
+	// Ensure controller is attached to head
+	qwerty_follow_hmd(qc, true);
+
+	if (qs->camera_mode) {
+		// Camera mode: standard HMD-relative offsets
+		qd->pose = (struct xrt_pose){XRT_QUAT_IDENTITY, QWERTY_CONTROLLER_INITIAL_POS(is_left)};
+	} else {
+		// Display mode: match extension math —
+		//   displayPos = (nominalViewPos + offset) / zoomScale
+		// where zoomScale = screen_height_m / disp_vHeight
+		float zs = qs->screen_height_m / qs->disp_vHeight;
+		float nvX = 0.0f;
+		float nvY = 0.0f;
+		float nvZ = qs->nominal_viewer_z;
+		float offX = is_left ? -0.2f : 0.2f;
+		float offY = -0.15f;
+		float offZ = -0.3f;
+
+		qd->pose = (struct xrt_pose){
+		    XRT_QUAT_IDENTITY,
+		    {(nvX + offX) / zs, (nvY + offY) / zs, (nvZ + offZ) / zs},
+		};
+	}
 }
 
 void
