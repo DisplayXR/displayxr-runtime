@@ -321,15 +321,6 @@ static void RenderPlaceholder(VkDevice device, VkQueue queue, VkCommandPool cmdP
     vkFreeCommandBuffers(device, cmdPool, 1, &cmd);
 }
 
-// Convert stereo view matrix from column-major float[16] to XMMATRIX
-static XMMATRIX ColumnMajorToXMMatrix(const float m[16]) {
-    return XMMATRIX(
-        m[0], m[1], m[2], m[3],
-        m[4], m[5], m[6], m[7],
-        m[8], m[9], m[10], m[11],
-        m[12], m[13], m[14], m[15]);
-}
-
 static void RenderThreadFunc(
     HWND hwnd,
     XrSessionManager* xr,
@@ -338,6 +329,7 @@ static void RenderThreadFunc(
     uint32_t queueFamilyIndex,
     VkInstance vkInstance,
     VkPhysicalDevice physDevice,
+    std::vector<VkImage>* swapchainVkImages,
     HudRenderer* hud,
     uint32_t hudWidth,
     uint32_t hudHeight,
@@ -580,11 +572,11 @@ static void RenderThreadFunc(
                                 // TODO: Need swapchain image views for gs_renderer.
                                 // For now, use placeholder until swapchain image views are set up.
                                 RenderPlaceholder(vkDevice, graphicsQueue, renderCmdPool,
-                                    xr->swapchainImages[imageIndex], xr->swapchain.width, xr->swapchain.height);
+                                    (*swapchainVkImages)[imageIndex], xr->swapchain.width, xr->swapchain.height);
                             } else {
                                 // No scene loaded — show dark placeholder
                                 RenderPlaceholder(vkDevice, graphicsQueue, renderCmdPool,
-                                    xr->swapchainImages[imageIndex], xr->swapchain.width, xr->swapchain.height);
+                                    (*swapchainVkImages)[imageIndex], xr->swapchain.width, xr->swapchain.height);
                             }
 
                             for (int eye = 0; eye < eyeCount; eye++) {
@@ -961,11 +953,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             (XrSwapchainImageBaseHeader*)swapchainImages.data());
         LOG_INFO("Enumerated %u Vulkan swapchain images", count);
 
-        // Store VkImage handles for render thread access
-        xr.swapchainImages.resize(count);
-        for (uint32_t i = 0; i < count; i++) {
-            xr.swapchainImages[i] = swapchainImages[i].image;
-        }
+        // Extract VkImage handles for render thread access
+    }
+    std::vector<VkImage> swapchainVkImages(swapchainImages.size());
+    for (uint32_t i = 0; i < (uint32_t)swapchainImages.size(); i++) {
+        swapchainVkImages[i] = swapchainImages[i].image;
     }
 
     // Initialize 3DGS renderer with the OpenXR Vulkan device
@@ -1079,6 +1071,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     std::thread renderThread(RenderThreadFunc, hwnd, &xr, vkDevice, graphicsQueue,
         queueFamilyIndex, vkInstance, physDevice,
+        &swapchainVkImages,
         hudOk ? &hudRenderer : nullptr, hudWidth, hudHeight,
         hudStagingBuffer, hudStagingMapped, hudCmdPool,
         hudOk ? &hudSwapImages : nullptr,
