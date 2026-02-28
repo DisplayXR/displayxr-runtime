@@ -12,6 +12,7 @@
 #   sr_cube_openxr_ext_gl  - OpenGL port of sr_cube_openxr_ext
 #   sr_cube_openxr_ext_vk  - Vulkan port of sr_cube_openxr_ext (requires Vulkan SDK)
 #   sr_cube_native_vk      - Native SR SDK Vulkan (no OpenXR) - requires LeiaSR SDK + Vulkan SDK
+#   spatial_os             - Spatial OS demo (multi-layer war room, D3D11)
 
 cmake_minimum_required(VERSION 3.21)
 project(test_apps LANGUAGES CXX)
@@ -35,6 +36,7 @@ if(OpenXR_FOUND OR DEFINED OpenXR_ROOT)
     add_subdirectory(sr_cube_openxr_ext_d3d12)
     add_subdirectory(sr_cube_openxr_ext_gl)
     add_subdirectory(sr_cube_openxr_ext_vk)
+    add_subdirectory(spatial_os)
 else()
     message(STATUS "OpenXR not found, skipping OpenXR test apps")
     message(STATUS "To build them, set OpenXR_ROOT or install OpenXR SDK")
