@@ -570,7 +570,7 @@ struct AppXrSession {
     PFN_xrRequestDisplayModeEXT pfnRequestDisplayModeEXT = nullptr;
     PFN_xrRequestEyeTrackingModeEXT pfnRequestEyeTrackingModeEXT = nullptr;
 
-    HWND windowHandle = nullptr;  // unused on macOS, kept for compatibility
+    void* windowHandle = nullptr;  // unused on macOS, kept for compatibility
 };
 
 // Forward declarations for OpenXR functions (same as sim_cube_openxr_ext_macos)
@@ -777,8 +777,8 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
     vkBinding.queueFamilyIndex = qfi;
     vkBinding.queueIndex = 0;
 
-    XrMacosWindowBindingCreateInfoEXT macBinding = {(XrStructureType)XR_TYPE_MACOS_WINDOW_BINDING_CREATE_INFO_EXT};
-    macBinding.nsView = (__bridge void*)g_metalView;
+    XrMacOSWindowBindingCreateInfoEXT macBinding = {(XrStructureType)XR_TYPE_MACOS_WINDOW_BINDING_CREATE_INFO_EXT};
+    macBinding.viewHandle = (__bridge void*)g_metalView;
     if (xr.hasMacosWindowBinding && g_metalView) {
         vkBinding.next = &macBinding;
         LOG_INFO("Using XR_EXT_macos_window_binding");
