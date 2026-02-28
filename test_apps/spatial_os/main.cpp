@@ -610,6 +610,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
 
+    // Start in fullscreen — this app is meant to showcase a spatial desktop
+    ToggleFullscreen(hwnd);
+
     LOG_INFO("=== Entering main loop ===");
     LOG_INFO("Controls: Tab=Select, Space=Focus, 3=Depth, ESC=Reset, WASD=Fly, V=2D/3D, F11=Fullscreen");
 
