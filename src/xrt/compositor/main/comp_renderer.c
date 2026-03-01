@@ -54,16 +54,9 @@
 #include "leia/leia_cnsdk.h"
 #endif
 
-#ifdef XRT_HAVE_LEIA_SR_VULKAN
-#include "leia/leia_sr.h"
-#include "leia/leia_display_processor.h"
-#endif
-
 #include "xrt/xrt_config_drivers.h"
 #include "xrt/xrt_display_processor.h"
-// TODO: Move display processor creation and display info queries to driver layer
-// to fully decouple compositor from sim_display driver internals.
-#include "sim_display/sim_display_interface.h"
+#include "xrt/xrt_display_metrics.h"
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
 #include "qwerty/qwerty_interface.h"
@@ -174,13 +167,13 @@ struct comp_renderer
 
 	//! Generic display output processor (interlacing, SBS, etc.).
 	//! If NULL, standard Monado distortion is used.
+	//! Created lazily in do_weaving() via the factory in xrt_system_compositor_info.
 	struct xrt_display_processor *display_processor;
 
-	struct leia_cnsdk *cnsdk;
+	//! True after the first attempt to create the display processor (prevent retry loops).
+	bool dp_init_attempted;
 
-#ifdef XRT_HAVE_LEIA_SR_VULKAN
-	struct leiasr* leiasr;
-#endif // XRT_HAVE_LEIA_SR_VULKAN
+	struct leia_cnsdk *cnsdk;
 
 	//! Intermediate images for Y-flipping GL textures before display processing
 	struct
@@ -627,57 +620,18 @@ renderer_init(struct comp_renderer *r, struct comp_compositor *c, VkExtent2D scr
 
 	struct vk_bundle *vk = &r->c->base.vk;
 
-#ifdef XRT_HAVE_LEIA_SR_VULKAN
-	// Get external window handle from compositor (if provided via XR_EXT_win32_window_binding)
-	// NULL = fullscreen mode, valid HWND = windowed mode
-	void *window_handle = r->c->external_window_handle;
-	xrt_result_t sr_ret = leiasr_create(5.0, vk->device, vk->physical_device, vk->main_queue->queue, r->target_render_pass.r->cmd_pool, window_handle, &r->leiasr);
-	if (sr_ret != XRT_SUCCESS) {
-		COMP_WARN(c, "Failed to create SR Vulkan weaver, continuing without interlacing");
-		r->leiasr = NULL;
-	}
-
-	// Wrap the SR weaver in a generic display processor
-	if (r->leiasr != NULL) {
-		xrt_result_t dp_ret = leia_display_processor_create(r->leiasr, &r->display_processor);
-		if (dp_ret != XRT_SUCCESS) {
-			COMP_WARN(c, "Failed to create SR display processor wrapper");
-			r->display_processor = NULL;
-		}
-	}
-#endif // XRT_HAVE_LEIA_SR_VULKAN
-
-	// Create sim_display processor if SIM_DISPLAY_ENABLE=1 and no display processor yet
-	if (r->display_processor == NULL) {
-		const char *sim_enable = getenv("SIM_DISPLAY_ENABLE");
-		if (sim_enable != NULL && strcmp(sim_enable, "1") == 0) {
-			enum sim_display_output_mode mode = SIM_DISPLAY_OUTPUT_SBS;
-			const char *mode_str = getenv("SIM_DISPLAY_OUTPUT");
-			if (mode_str != NULL) {
-				if (strcmp(mode_str, "anaglyph") == 0) {
-					mode = SIM_DISPLAY_OUTPUT_ANAGLYPH;
-				} else if (strcmp(mode_str, "blend") == 0) {
-					mode = SIM_DISPLAY_OUTPUT_BLEND;
-				}
-			}
-
-			xrt_result_t dp_ret = sim_display_processor_create(
-			    mode, vk, (int32_t)r->c->target->format, &r->display_processor);
-			if (dp_ret != XRT_SUCCESS) {
-				COMP_WARN(c, "Failed to create sim display processor");
-				r->display_processor = NULL;
-			}
-		}
-	}
+	// Display processor is created lazily in do_weaving() on first use.
+	// The factory lives in xrt_system_compositor_info.dp_factory_vk, which is
+	// set by target_instance.c after the system compositor is created.
+	// At init time, the system compositor doesn't exist yet.
 
 	// Create HUD overlay (only for runtime-owned windows, not app-provided windows).
-	// Use display_pixel_width (physical pixels) for Retina-aware HUD scaling.
+	// Use display pixel info from xrt_system_compositor_info for Retina-aware HUD scaling.
 	if (r->c->external_window_handle == NULL) {
-		struct sim_display_info sd_hud_info;
 		uint32_t hud_target_w = r->c->settings.preferred.width;
-		if (sim_display_get_display_info(r->c->xdev, &sd_hud_info) && sd_hud_info.display_pixel_width > 0) {
-			hud_target_w = sd_hud_info.display_pixel_width;
-		}
+		// HUD pixel sizing: check xrt_system_compositor_info after it's available.
+		// For now, use preferred width; runtime display info from display processor
+		// is used in the HUD update function (renderer_hud_update).
 		u_hud_create(&r->hud.hud, hud_target_w);
 	}
 
@@ -1025,9 +979,6 @@ renderer_fini(struct comp_renderer *r)
 		r->crop.initialized = false;
 	}
 
-#ifdef XRT_HAVE_LEIA_SR_VULKAN
-	leiasr_destroy(r->leiasr);
-#endif // XRT_HAVE_LEIA_SR_VULKAN
 }
 
 static bool getLayerInfo(struct comp_renderer *r, int view_index, int* width, int* height, VkFormat* format, VkImageView* imageView)
@@ -1269,10 +1220,10 @@ renderer_blit_hud(struct comp_renderer *r,
 	float disp_w_mm = 0.0f, disp_h_mm = 0.0f;
 	float nom_x = 0.0f, nom_y = 0.0f, nom_z = 600.0f;
 
-#ifdef XRT_HAVE_LEIA_SR_VULKAN
-	if (r->leiasr != NULL) {
-		struct leiasr_eye_pair eyes;
-		if (leiasr_get_predicted_eye_positions(r->leiasr, &eyes) && eyes.valid) {
+	// Get eye positions and display dimensions from display processor vtable
+	if (r->display_processor != NULL) {
+		struct xrt_eye_pair eyes;
+		if (xrt_display_processor_get_predicted_eye_positions(r->display_processor, &eyes) && eyes.valid) {
 			left_x = eyes.left.x * 1000.0f;
 			left_y = eyes.left.y * 1000.0f;
 			left_z = eyes.left.z * 1000.0f;
@@ -1282,27 +1233,22 @@ renderer_blit_hud(struct comp_renderer *r,
 			tracking_active = true;
 		}
 
-		struct leiasr_display_dimensions dims;
-		if (leiasr_get_display_dimensions(r->leiasr, &dims) && dims.valid) {
-			disp_w_mm = dims.width_m * 1000.0f;
-			disp_h_mm = dims.height_m * 1000.0f;
-			nom_x = dims.nominal_x_m * 1000.0f;
-			nom_y = dims.nominal_y_m * 1000.0f;
-			nom_z = dims.nominal_z_m * 1000.0f;
+		float dim_w = 0.0f, dim_h = 0.0f;
+		if (xrt_display_processor_get_display_dimensions(r->display_processor, &dim_w, &dim_h)) {
+			disp_w_mm = dim_w * 1000.0f;
+			disp_h_mm = dim_h * 1000.0f;
 		}
 	}
-#endif
 
-	// Fallback: get display info from sim_display device
+	// Fallback: display info from xrt_system_compositor_info (populated at init)
 	float zoom_scale = 0.0f;
-	if (disp_w_mm == 0.0f && disp_h_mm == 0.0f) {
-		struct sim_display_info sd_info;
-		if (sim_display_get_display_info(r->c->xdev, &sd_info)) {
-			disp_w_mm = sd_info.display_width_m * 1000.0f;
-			disp_h_mm = sd_info.display_height_m * 1000.0f;
-			nom_y = sd_info.nominal_y_m * 1000.0f;
-			nom_z = sd_info.nominal_z_m * 1000.0f;
-			zoom_scale = sd_info.zoom_scale;
+	if (disp_w_mm == 0.0f && disp_h_mm == 0.0f && r->c->xsysc != NULL) {
+		const struct xrt_system_compositor_info *info = &r->c->xsysc->info;
+		if (info->display_width_m > 0.0f) {
+			disp_w_mm = info->display_width_m * 1000.0f;
+			disp_h_mm = info->display_height_m * 1000.0f;
+			nom_y = info->nominal_viewer_y_m * 1000.0f;
+			nom_z = info->nominal_viewer_z_m * 1000.0f;
 		}
 	}
 
@@ -1313,11 +1259,6 @@ renderer_blit_hud(struct comp_renderer *r,
 	} else if (r->display_processor != NULL) {
 		output_mode = "Weaved";
 	}
-#ifdef XRT_HAVE_LEIA_SR_VULKAN
-	else if (r->leiasr != NULL) {
-		output_mode = "Weaved (direct)";
-	}
-#endif
 
 	// Get render dimensions from layer data
 	uint32_t render_w = 0, render_h = 0;
@@ -1465,6 +1406,27 @@ do_weaving(struct comp_renderer *r,
            const struct comp_layer *layer,
            struct chl_frame_state *frame_state)
 {
+	// Lazy display processor init: factory is set by target_instance.c on xsysc->info
+	// after the system compositor is created, so it's not available during renderer init.
+	if (r->display_processor == NULL && r->c->xsysc != NULL && !r->dp_init_attempted) {
+		r->dp_init_attempted = true;
+		xrt_dp_factory_vk_fn_t factory =
+		    (xrt_dp_factory_vk_fn_t)r->c->xsysc->info.dp_factory_vk;
+		if (factory != NULL) {
+			struct vk_bundle *vk = &r->c->base.vk;
+			void *window_handle = r->c->external_window_handle;
+			xrt_result_t dp_ret = factory(
+			    vk,                                   // vk_bundle
+			    &r->target_render_pass.r->cmd_pool,   // cmd_pool
+			    window_handle,                        // window_handle
+			    (int32_t)r->c->target->format,        // target_format
+			    &r->display_processor);               // out_xdp
+			if (dp_ret != XRT_SUCCESS) {
+				U_LOG_W("Display processor factory failed, continuing without display processing");
+				r->display_processor = NULL;
+			}
+		}
+	}
 
 #ifdef XRT_HAVE_CNSDK
 	if (r->cnsdk != NULL) {

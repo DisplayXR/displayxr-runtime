@@ -114,6 +114,10 @@ struct comp_compositor
 	//! Renderer helper.
 	struct comp_renderer *r;
 
+	//! Back-reference to the system compositor (set after creation).
+	//! Used by the renderer to access dp_factory_vk for lazy display processor init.
+	struct xrt_system_compositor *xsysc;
+
 	//! Duration of a frame at current refresh rate.
 	int64_t frame_interval_ns;
 
