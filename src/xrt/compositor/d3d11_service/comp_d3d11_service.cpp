@@ -34,7 +34,7 @@
 #include "util/u_hud.h"
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
-#include "qwerty/qwerty_interface.h"
+#include "qwerty_interface.h"
 #endif
 
 #define WIN32_LEAN_AND_MEAN
