@@ -1417,7 +1417,7 @@ do_weaving(struct comp_renderer *r,
 			void *window_handle = r->c->external_window_handle;
 			xrt_result_t dp_ret = factory(
 			    vk,                                   // vk_bundle
-			    &r->target_render_pass.r->cmd_pool,   // cmd_pool
+			    (void *)(uintptr_t)r->target_render_pass.r->cmd_pool, // cmd_pool
 			    window_handle,                        // window_handle
 			    (int32_t)r->c->target->format,        // target_format
 			    &r->display_processor);               // out_xdp

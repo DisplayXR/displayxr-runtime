@@ -1605,7 +1605,7 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 		if (factory != NULL) {
 			xrt_result_t dp_ret = factory(
 			    vk,                                          // vk_bundle
-			    &mc->session_render.cmd_pool,                // cmd_pool
+			    (void *)(uintptr_t)mc->session_render.cmd_pool, // cmd_pool
 			    mc->session_render.external_window_handle,   // window_handle
 			    (int32_t)ct->format,                         // target_format
 			    &mc->session_render.display_processor);      // out_xdp

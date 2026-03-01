@@ -18,6 +18,7 @@
 #include "xrt/xrt_display_metrics.h"
 #include "vk/vk_helpers.h"
 #include "util/u_logging.h"
+#include <cstdint>
 #include <cstdlib>
 
 
@@ -157,7 +158,7 @@ leia_dp_factory_vk(void *vk_bundle_ptr,
 
 	struct leiasr *leiasr = NULL;
 	xrt_result_t ret = leiasr_create(5.0, vk->device, vk->physical_device, vk->main_queue->queue,
-	                                 (VkCommandPool)vk_cmd_pool, window_handle, &leiasr);
+	                                 (VkCommandPool)(uintptr_t)vk_cmd_pool, window_handle, &leiasr);
 	if (ret != XRT_SUCCESS || leiasr == NULL) {
 		U_LOG_W("Failed to create SR Vulkan weaver, continuing without interlacing");
 		return ret != XRT_SUCCESS ? ret : XRT_ERROR_DEVICE_CREATION_FAILED;
