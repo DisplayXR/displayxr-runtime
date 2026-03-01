@@ -131,8 +131,15 @@ oxr_session_populate_d3d11_native(struct oxr_logger *log,
 	struct xrt_device *xdev = get_role_head(sess->sys);
 	struct xrt_compositor_native *xcn = NULL;
 
+	// Get D3D11 display processor factory from system compositor info (set by target builder)
+	void *dp_factory_d3d11 = NULL;
+	if (sys->xsysc != NULL) {
+		dp_factory_d3d11 = sys->xsysc->info.dp_factory_d3d11;
+	}
+
 	// Create the D3D11 native compositor
-	xrt_result_t xret = comp_d3d11_compositor_create(xdev, window_handle, (void *)next->device, &xcn);
+	xrt_result_t xret = comp_d3d11_compositor_create(
+	    xdev, window_handle, (void *)next->device, dp_factory_d3d11, &xcn);
 	if (xret != XRT_SUCCESS) {
 		return oxr_error(log, XR_ERROR_INITIALIZATION_FAILED,
 		                 "Failed to create D3D11 native compositor: %d", xret);

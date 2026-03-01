@@ -13,7 +13,7 @@
 #include "xrt/xrt_defines.h"
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_results.h"
-#include "leia/leia_types.h"
+#include "xrt/xrt_display_metrics.h"
 
 // Forward declarations
 struct comp_d3d11_compositor;
@@ -33,6 +33,7 @@ extern "C" {
  * @param xdev The device we are displaying to.
  * @param hwnd The window handle from XR_EXT_win32_window_binding (or NULL for fullscreen).
  * @param d3d11_device The D3D11 device from the application's graphics binding.
+ * @param dp_factory_d3d11 Display processor factory (xrt_dp_factory_d3d11_fn_t), or NULL.
  * @param out_xc Pointer to receive the created compositor.
  *
  * @return XRT_SUCCESS on success, error code otherwise.
@@ -43,10 +44,11 @@ xrt_result_t
 comp_d3d11_compositor_create(struct xrt_device *xdev,
                              void *hwnd,
                              void *d3d11_device,
+                             void *dp_factory_d3d11,
                              struct xrt_compositor_native **out_xc);
 
 /*!
- * Get the predicted eye positions from the SR SDK weaver.
+ * Get the predicted eye positions from the display processor.
  *
  * @param xc The compositor.
  * @param out_left_eye Pointer to receive left eye position (x, y, z in meters).
@@ -62,7 +64,7 @@ comp_d3d11_compositor_get_predicted_eye_positions(struct xrt_compositor *xc,
                                                   struct xrt_vec3 *out_right_eye);
 
 /*!
- * Get the display dimensions from the SR SDK.
+ * Get the display dimensions from the display processor.
  *
  * @param xc The compositor.
  * @param out_width_m Pointer to receive display width in meters.
@@ -92,10 +94,10 @@ comp_d3d11_compositor_get_display_dimensions(struct xrt_compositor *xc,
  */
 bool
 comp_d3d11_compositor_get_window_metrics(struct xrt_compositor *xc,
-                                          struct leiasr_window_metrics *out_metrics);
+                                          struct xrt_window_metrics *out_metrics);
 
 /*!
- * Request display mode switch (2D/3D) via SR SwitchableLensHint.
+ * Request display mode switch (2D/3D) via display processor.
  *
  * @param xc The compositor.
  * @param enable_3d true to switch to 3D mode, false for 2D mode.

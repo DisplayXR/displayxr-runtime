@@ -211,10 +211,9 @@ oxr_session_get_window_metrics(struct oxr_session *sess,
 		return false;
 	}
 
-#if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_NATIVE_COMPOSITOR)
+#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
 	if (sess->is_d3d11_native_compositor) {
-		return comp_d3d11_compositor_get_window_metrics(&sess->xcn->base,
-		    (struct leiasr_window_metrics *)out_metrics);
+		return comp_d3d11_compositor_get_window_metrics(&sess->xcn->base, out_metrics);
 	}
 #endif
 
