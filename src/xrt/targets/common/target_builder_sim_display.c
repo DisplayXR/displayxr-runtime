@@ -92,14 +92,20 @@ sim_display_open_system_impl(struct xrt_builder *xb,
 	// pose to qwerty for WASD/mouse camera control.
 	if (qwerty_hmd != NULL) {
 		struct qwerty_device *qd = qwerty_device(qwerty_hmd);
-		qd->pose.position = (struct xrt_vec3){0, 1.6f, 0};
-		qd->pose.orientation = (struct xrt_quat){0, 0, 0, 1};
 
 		struct sim_display_info info;
 		if (sim_display_get_display_info(head, &info)) {
 			qd->sys->screen_height_m = info.display_height_m;
 			qd->sys->nominal_viewer_z = info.nominal_z_m;
 		}
+
+		// Share sim_display head's tracking origin with all qwerty devices
+		// so they occupy the same node in the space overseer graph.
+		qwerty_hmd->tracking_origin = head->tracking_origin;
+		if (qd->sys->lctrl)
+			qd->sys->lctrl->base.base.tracking_origin = head->tracking_origin;
+		if (qd->sys->rctrl)
+			qd->sys->rctrl->base.base.tracking_origin = head->tracking_origin;
 
 		sim_display_hmd_set_pose_source(head, qwerty_hmd);
 	}

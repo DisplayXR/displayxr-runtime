@@ -36,8 +36,8 @@
 
 // clang-format off
 // Values copied from u_device_setup_tracking_origins. CONTROLLER relative to HMD.
-#define QWERTY_HMD_CAMERA_POS (struct xrt_vec3){0, 1.6f, 0}
-#define QWERTY_HMD_DISPLAY_POS (struct xrt_vec3){0, 1.6f, -2.0f}
+#define QWERTY_HMD_CAMERA_POS (struct xrt_vec3){0, 0, 0}   // height from tracking origin
+#define QWERTY_HMD_DISPLAY_POS (struct xrt_vec3){0, 0, -2.0f} // unused ref
 #define QWERTY_CONTROLLER_INITIAL_POS(is_left) (struct xrt_vec3){(is_left) ? -0.2f : 0.2f, -0.3f, -0.5f}
 // clang-format on
 
@@ -486,16 +486,9 @@ qwerty_controller_create(bool is_left, struct qwerty_hmd *qhmd)
 	snprintf(xd->str, XRT_DEVICE_NAME_LEN, "%s", controller_name);
 	snprintf(xd->serial, XRT_DEVICE_NAME_LEN, "%s", controller_name);
 
-	// Share the HMD's tracking origin so all qwerty devices occupy the same
-	// node in the space overseer graph. With separate origins the IPC client
-	// may treat cross-origin xrLocateSpace as invalid, zeroing controller poses.
-	if (qhmd != NULL) {
-		xd->tracking_origin = qhmd->base.base.tracking_origin;
-	} else {
-		xd->tracking_origin->type = XRT_TRACKING_TYPE_OTHER;
-		char *tracker_name = is_left ? QWERTY_LEFT_TRACKER_STR : QWERTY_RIGHT_TRACKER_STR;
-		snprintf(xd->tracking_origin->name, XRT_TRACKING_NAME_LEN, "%s", tracker_name);
-	}
+	xd->tracking_origin->type = XRT_TRACKING_TYPE_OTHER;
+	char *tracker_name = is_left ? QWERTY_LEFT_TRACKER_STR : QWERTY_RIGHT_TRACKER_STR;
+	snprintf(xd->tracking_origin->name, XRT_TRACKING_NAME_LEN, "%s", tracker_name);
 
 	xd->inputs[QWERTY_TRIGGER].name = XRT_INPUT_WMR_TRIGGER_VALUE;
 	xd->inputs[QWERTY_MENU].name = XRT_INPUT_WMR_MENU_CLICK;
