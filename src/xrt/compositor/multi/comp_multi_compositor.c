@@ -12,7 +12,6 @@
 #include "util/u_logging.h"
 #include "xrt/xrt_session.h"
 #include "xrt/xrt_config_os.h"
-#include "xrt/xrt_config_have.h"
 #include "xrt/xrt_display_metrics.h"
 
 #include "os/os_time.h"
@@ -32,18 +31,8 @@
 // Vulkan helpers needed for Y-flip SBS cleanup (not Leia-specific)
 #include "vk/vk_helpers.h"
 
-// TODO: Move display processor creation and display info queries to driver layer
-// to fully decouple compositor from sim_display driver internals.
-#include "sim_display/sim_display_interface.h"
-
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_system.h"
-
-#ifdef XRT_HAVE_LEIA_SR_VULKAN
-#include "leia/leia_sr.h"
-#include "leia/leia_display_processor.h"
-#include "render/render_interface.h"
-#endif
 
 #ifdef XRT_OS_WINDOWS
 #include "comp_d3d11_window.h"
@@ -611,28 +600,8 @@ multi_compositor_end_session(struct xrt_compositor *xc)
 				mc->session_render.fenced_buffer = -1;
 			}
 
-			// Destroy display processor before underlying weaver
+			// Destroy display processor (owns any vendor SDK handles)
 			xrt_display_processor_destroy(&mc->session_render.display_processor);
-
-#ifdef XRT_HAVE_LEIA_SR_VULKAN
-			// Destroy per-session SR weaver
-			if (mc->session_render.weaver != NULL) {
-				leiasr_destroy(mc->session_render.weaver);
-				mc->session_render.weaver = NULL;
-				U_LOG_I("Destroyed per-session SR weaver for HWND %p",
-				        mc->session_render.external_window_handle);
-			}
-
-			// Destroy per-session shaders and pipeline cache
-			if (vk != NULL && mc->session_render.shaders_loaded) {
-				render_shaders_fini(&mc->session_render.shaders, vk);
-				mc->session_render.shaders_loaded = false;
-			}
-			if (vk != NULL && mc->session_render.pipeline_cache != VK_NULL_HANDLE) {
-				vk->vkDestroyPipelineCache(vk->device, mc->session_render.pipeline_cache, NULL);
-				mc->session_render.pipeline_cache = VK_NULL_HANDLE;
-			}
-#endif
 
 			// Destroy fences (generic Vulkan)
 			if (vk != NULL && mc->session_render.fences != NULL) {
@@ -1167,7 +1136,7 @@ multi_compositor_destroy(struct xrt_compositor *xc)
 			mc->session_render.fenced_buffer = -1;
 		}
 
-		// Destroy display processor before underlying weaver
+		// Destroy display processor (owns any vendor SDK handles)
 		xrt_display_processor_destroy(&mc->session_render.display_processor);
 
 		// Destroy composite resources (intermediate pre-display-processing targets)
@@ -1210,13 +1179,6 @@ multi_compositor_destroy(struct xrt_compositor *xc)
 			}
 			mc->session_render.composite_initialized = false;
 		}
-
-#ifdef XRT_HAVE_LEIA_SR_VULKAN
-		if (mc->session_render.weaver != NULL) {
-			leiasr_destroy(mc->session_render.weaver);
-			mc->session_render.weaver = NULL;
-		}
-#endif
 
 		// Destroy HUD resources
 		if (vk != NULL && mc->session_render.hud_gpu_initialized) {
@@ -1634,66 +1596,27 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 	}
 
 	//
-	// SR-SPECIFIC: Create SR weaver (only when SR SDK is available)
-	//
-
-#ifdef XRT_HAVE_LEIA_SR_VULKAN
-	{
-		U_LOG_W("Creating per-session SR weaver (leiasr_create)...");
-		xrt_result_t sr_ret = leiasr_create(5.0,                                        // maxTime
-		                                    vk->device,                                 // Vulkan device
-		                                    vk->physical_device,                        // Physical device
-		                                    vk->main_queue->queue,                      // Graphics queue
-		                                    mc->session_render.cmd_pool,                // Command pool
-		                                    mc->session_render.external_window_handle,  // Window handle
-		                                    &mc->session_render.weaver);                // Output weaver
-
-		if (sr_ret != XRT_SUCCESS) {
-			U_LOG_W("Failed to create per-session SR weaver: %d (continuing without)", sr_ret);
-			mc->session_render.weaver = NULL;
-		} else {
-			U_LOG_W("Created per-session SR weaver for HWND %p",
-			        mc->session_render.external_window_handle);
-		}
-	}
-#endif
-
-	//
-	// DISPLAY PROCESSOR SELECTION
-	// sim_display takes priority (if enabled), otherwise use Leia SR
+	// DISPLAY PROCESSOR: create via factory (set by driver at init time)
 	//
 
 	{
-		const char *sim_enable = getenv("SIM_DISPLAY_ENABLE");
-		if (sim_enable != NULL && strcmp(sim_enable, "1") == 0) {
-			// Parse SIM_DISPLAY_OUTPUT mode
-			enum sim_display_output_mode mode = SIM_DISPLAY_OUTPUT_SBS;
-			const char *mode_str = getenv("SIM_DISPLAY_OUTPUT");
-			if (mode_str != NULL) {
-				if (strcmp(mode_str, "anaglyph") == 0) {
-					mode = SIM_DISPLAY_OUTPUT_ANAGLYPH;
-				} else if (strcmp(mode_str, "blend") == 0) {
-					mode = SIM_DISPLAY_OUTPUT_BLEND;
-				}
-			}
-
-			xrt_result_t dp_ret = sim_display_processor_create(
-			    mode, vk, (int32_t)ct->format, &mc->session_render.display_processor);
+		xrt_dp_factory_vk_fn_t factory =
+		    (xrt_dp_factory_vk_fn_t)mc->msc->base.info.dp_factory_vk;
+		if (factory != NULL) {
+			xrt_result_t dp_ret = factory(
+			    vk,                                          // vk_bundle
+			    &mc->session_render.cmd_pool,                // cmd_pool
+			    mc->session_render.external_window_handle,   // window_handle
+			    (int32_t)ct->format,                         // target_format
+			    &mc->session_render.display_processor);      // out_xdp
 			if (dp_ret != XRT_SUCCESS) {
-				U_LOG_W("Failed to create sim display processor, continuing without");
+				U_LOG_W("Display processor factory failed: %d (continuing without)", dp_ret);
 				mc->session_render.display_processor = NULL;
+			} else {
+				U_LOG_W("Created display processor via factory for HWND %p",
+				        mc->session_render.external_window_handle);
 			}
 		}
-#ifdef XRT_HAVE_LEIA_SR_VULKAN
-		else if (mc->session_render.weaver != NULL) {
-			xrt_result_t dp_ret = leia_display_processor_create(
-			    mc->session_render.weaver, &mc->session_render.display_processor);
-			if (dp_ret != XRT_SUCCESS) {
-				U_LOG_W("Failed to create per-session display processor, continuing without");
-				mc->session_render.display_processor = NULL;
-			}
-		}
-#endif
 	}
 
 	// Create HUD overlay for runtime-owned windows
@@ -1724,30 +1647,27 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 	return true;
 }
 
-#ifdef XRT_HAVE_LEIA_SR_VULKAN
 bool
-multi_compositor_get_predicted_eye_positions(struct multi_compositor *mc, struct leiasr_eye_pair *out_eye_pair)
+multi_compositor_get_predicted_eye_positions(struct multi_compositor *mc, struct xrt_eye_pair *out_eye_pair)
 {
 	if (mc == NULL || out_eye_pair == NULL) {
 		return false;
 	}
 
-	// Check if session has per-session rendering with a weaver
-	if (!mc->session_render.initialized || mc->session_render.weaver == NULL) {
+	if (!mc->session_render.initialized || mc->session_render.display_processor == NULL) {
 		out_eye_pair->valid = false;
 		return false;
 	}
 
-	// Get predicted eye positions from the session's weaver
-	return leiasr_get_predicted_eye_positions(mc->session_render.weaver, out_eye_pair);
+	return xrt_display_processor_get_predicted_eye_positions(
+	    mc->session_render.display_processor, out_eye_pair);
 }
-#endif
 
 #ifdef XRT_OS_WINDOWS
 /*!
  * Compute window metrics from Win32 APIs and system compositor info.
  * This is the vendor-neutral fallback when no SR weaver is available.
- * Same math as leiasr_get_window_metrics() but uses MonitorFromWindow
+ * Vendor-neutral: uses MonitorFromWindow
  * and xrt_system_compositor_info instead of cached SR data.
  */
 static bool
@@ -1926,13 +1846,13 @@ multi_compositor_get_window_metrics(struct multi_compositor *mc, struct xrt_wind
 
 	// Per-session rendering paths (ext apps with their own window)
 	if (mc->session_render.initialized) {
-#ifdef XRT_HAVE_LEIA_SR_VULKAN
-		// Prefer SR SDK path (has precise display screen position from SR::Display)
-		if (mc->session_render.weaver != NULL) {
-			return leiasr_get_window_metrics(mc->session_render.weaver,
-			                                 (struct leiasr_window_metrics *)out_metrics);
+		// Prefer display processor path (vendor-specific, e.g. SR SDK precise display position)
+		if (mc->session_render.display_processor != NULL) {
+			if (xrt_display_processor_get_window_metrics(
+			        mc->session_render.display_processor, out_metrics)) {
+				return true;
+			}
 		}
-#endif
 
 #ifdef XRT_OS_WINDOWS
 		// Generic fallback: compute from HWND + system compositor info
@@ -1956,11 +1876,13 @@ multi_compositor_request_display_mode(struct multi_compositor *mc, bool enable_3
 		return false;
 	}
 
-#ifdef XRT_HAVE_LEIA_SR_VULKAN
-	if (mc->session_render.weaver != NULL) {
-		return leiasr_request_display_mode(mc->session_render.weaver, enable_3d);
+	// Prefer display processor path (vendor-specific, e.g. SR SwitchableLensHint)
+	if (mc->session_render.display_processor != NULL) {
+		if (xrt_display_processor_request_display_mode(
+		        mc->session_render.display_processor, enable_3d)) {
+			return true;
+		}
 	}
-#endif
 
 	// Generic device output mode save/restore for 2D/3D transitions
 	// NOTE: May be replaced by XR_EXT_display_render_mode / xrSetDisplayRenderModeEXT()
