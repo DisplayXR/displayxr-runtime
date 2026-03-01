@@ -50,6 +50,7 @@ FetchContent_MakeAvailable(spz)
 # 2. 0.0f/0.0f and 1.0f/0.0f cause C2124 → use std::numeric_limits
 if(MSVC)
     # Patch splat-types.h: constexpr → inline (MSVC C3615 fix)
+    # Also add missing #include <algorithm> (for std::sort) and _USE_MATH_DEFINES (for M_PI)
     set(_SPZ_HEADER "${spz_SOURCE_DIR}/src/cc/splat-types.h")
     file(READ "${_SPZ_HEADER}" _spz_content)
     string(FIND "${_spz_content}" "constexpr" _spz_has_constexpr)
@@ -57,6 +58,14 @@ if(MSVC)
         string(REPLACE "constexpr " "inline " _spz_content "${_spz_content}")
         file(WRITE "${_SPZ_HEADER}" "${_spz_content}")
         message(STATUS "Patched spz splat-types.h: constexpr -> inline for MSVC")
+    endif()
+    # Add #include <algorithm> if missing (std::sort used in header)
+    string(FIND "${_spz_content}" "#include <algorithm>" _spz_has_algo)
+    if(_spz_has_algo EQUAL -1)
+        file(READ "${_SPZ_HEADER}" _spz_content)
+        string(REPLACE "#include <cmath>" "#define _USE_MATH_DEFINES\n#include <cmath>\n#include <algorithm>" _spz_content "${_spz_content}")
+        file(WRITE "${_SPZ_HEADER}" "${_spz_content}")
+        message(STATUS "Patched spz splat-types.h: added <algorithm> and _USE_MATH_DEFINES for MSVC")
     endif()
 
     # Patch splat-types.cc: replace 0/0 NaN/Inf literals with std::numeric_limits (MSVC C2124 fix)
@@ -88,8 +97,9 @@ set_target_properties(spz_lib PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED O
 if(MSVC)
     # _USE_MATH_DEFINES: spz uses M_PI which MSVC only defines with this macro
     # /FI<file>: force-include <algorithm> so std::sort is available in spz headers
-    target_compile_definitions(spz_lib PRIVATE _USE_MATH_DEFINES)
-    target_compile_options(spz_lib PRIVATE /FIalgorithm)
+    # PUBLIC: propagate to consumers (gs_renderer) that include spz headers
+    target_compile_definitions(spz_lib PUBLIC _USE_MATH_DEFINES)
+    target_compile_options(spz_lib PUBLIC /FIalgorithm)
     set_target_properties(spz_lib PROPERTIES
         MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
     )
