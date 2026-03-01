@@ -348,6 +348,10 @@ struct d3d11_service_system
 
 	//! Mutex for active_compositor access
 	std::mutex active_compositor_mutex;
+
+	//! Runtime-side 2D/3D toggle (V key). When true, forces 2D rendering
+	//! even if the app submits stereo layers.
+	bool force_2d_mode;
 };
 
 
@@ -1188,6 +1192,11 @@ fini_client_render_resources(struct d3d11_client_render_resources *res)
 	res->hud_texture.reset();
 	u_hud_destroy(&res->hud);
 
+	// Auto-switch to 2D mode before destroying display processor
+	if (res->display_processor != nullptr) {
+		xrt_display_processor_d3d11_request_display_mode(
+		    res->display_processor, false);
+	}
 	xrt_display_processor_d3d11_destroy(&res->display_processor);
 
 	res->back_buffer_rtv.reset();
@@ -1330,6 +1339,11 @@ init_client_render_resources(struct d3d11_service_system *sys,
 			res->display_processor = nullptr;
 		} else {
 			U_LOG_W("D3D11 display processor created via factory for client");
+			// Auto-switch to 3D mode when display processor is ready
+			if (!sys->force_2d_mode) {
+				xrt_display_processor_d3d11_request_display_mode(
+				    res->display_processor, true);
+			}
 		}
 	} else {
 		U_LOG_W("No D3D11 display processor factory provided");
@@ -2507,6 +2521,23 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		}
 	}
 
+	// Runtime-side 2D/3D toggle (V key) — polls qwerty driver each frame
+#ifdef XRT_BUILD_DRIVER_QWERTY
+	if (sys->xsysd != NULL) {
+		bool force_2d = false;
+		bool toggled = qwerty_check_display_mode_toggle(
+		    sys->xsysd->xdevs, sys->xsysd->xdev_count, &force_2d);
+		if (toggled && c->render.display_processor != nullptr) {
+			xrt_display_processor_d3d11_request_display_mode(
+			    c->render.display_processor, !force_2d);
+		}
+		sys->force_2d_mode = force_2d;
+	}
+#endif
+	if (sys->force_2d_mode) {
+		is_mono = true;
+	}
+
 	// Get predicted eye positions (used for UI layers and HUD)
 	struct xrt_vec3 left_eye = {-0.032f, 0.0f, 0.6f};   // Default: 64mm IPD, 60cm from screen
 	struct xrt_vec3 right_eye = {0.032f, 0.0f, 0.6f};
@@ -2979,34 +3010,37 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		    back_buffer_width, back_buffer_height);
 		weaving_done = true;
 	} else {
-		// No display processor - copy stereo/direct texture to back buffer directly
+		// No display processor or mono — copy to back buffer directly
 		if (c->render.back_buffer_rtv) {
 			wil::com_ptr<ID3D11Resource> back_buffer;
 			c->render.back_buffer_rtv->GetResource(back_buffer.put());
 
-			if (use_direct_sbs && direct_sbs_tex) {
+			if (is_mono) {
+				// MONO / forced 2D: copy left eye to back buffer.
+				// When force_2d with stereo submission, the stereo texture
+				// contains SBS content — copy only the left half (view_width).
+				uint32_t src_w = sys->view_width;
+				uint32_t src_h = sys->view_height;
+
+				if (use_direct_sbs && direct_sbs_tex) {
+					D3D11_BOX src_box = {0, 0, 0, src_w, src_h, 1};
+					sys->context->CopySubresourceRegion(
+					    back_buffer.get(), 0, 0, 0, 0,
+					    direct_sbs_tex, 0, &src_box);
+				} else if (c->render.stereo_texture) {
+					D3D11_BOX src_box = {0, 0, 0, src_w, src_h, 1};
+					sys->context->CopySubresourceRegion(
+					    back_buffer.get(), 0, 0, 0, 0,
+					    c->render.stereo_texture.get(), 0, &src_box);
+				}
+			} else if (use_direct_sbs && direct_sbs_tex) {
 				// Same-swapchain SBS: copy app's SBS region to back buffer
 				D3D11_BOX src_box = {0, 0, 0, input_view_w * 2, input_view_h, 1};
 				sys->context->CopySubresourceRegion(
 				    back_buffer.get(), 0, 0, 0, 0,
 				    direct_sbs_tex, 0, &src_box);
 			} else if (c->render.stereo_texture) {
-				if (is_mono) {
-					// MONO: copy the rendered region (output dims, capped
-					// to stereo texture) to the back buffer.
-					D3D11_TEXTURE2D_DESC src_desc = {};
-					c->render.stereo_texture->GetDesc(&src_desc);
-					uint32_t copy_w = (sys->output_width < src_desc.Width)
-					                      ? sys->output_width : src_desc.Width;
-					uint32_t copy_h = (sys->output_height < src_desc.Height)
-					                      ? sys->output_height : src_desc.Height;
-					D3D11_BOX src_box = {0, 0, 0, copy_w, copy_h, 1};
-					sys->context->CopySubresourceRegion(
-					    back_buffer.get(), 0, 0, 0, 0,
-					    c->render.stereo_texture.get(), 0, &src_box);
-				} else {
-					sys->context->CopyResource(back_buffer.get(), c->render.stereo_texture.get());
-				}
+				sys->context->CopyResource(back_buffer.get(), c->render.stereo_texture.get());
 			}
 		}
 	}
