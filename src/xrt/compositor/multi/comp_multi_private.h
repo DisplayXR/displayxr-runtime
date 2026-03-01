@@ -13,7 +13,6 @@
 #include "xrt/xrt_defines.h"
 #include "xrt/xrt_limits.h"
 #include "xrt/xrt_compositor.h"
-#include "xrt/xrt_config_have.h"
 #include "xrt/xrt_display_processor.h"
 
 #include "os/os_time.h"
@@ -33,8 +32,6 @@
 
 // Forward declarations for per-session rendering
 struct comp_target;
-struct leiasr;
-struct leiasr_eye_pair;
 struct xrt_eye_pair;
 struct xrt_window_metrics;
 struct xrt_system_devices;
@@ -231,11 +228,11 @@ struct multi_compositor
 		struct comp_target *target;
 
 		//! Generic display output processor for this session.
-		//! Wraps vendor-specific weaving (SR SDK, CNSDK, sim_display, etc.).
+		//! Wraps vendor-specific display processing (created via factory).
 		struct xrt_display_processor *display_processor;
 
 		//! @name Generic per-session Vulkan rendering resources
-		//! Used by any display processor path (sim_display, Leia SR, etc.)
+		//! Used by any display processor path.
 		//! @{
 
 		//! Command pool for per-session rendering
@@ -301,11 +298,6 @@ struct multi_compositor
 		VkPipelineCache pipeline_cache;
 
 		//! @}
-
-#ifdef XRT_HAVE_LEIA_SR_VULKAN
-		//! Per-session SR weaver for this session's window
-		struct leiasr *weaver;
-#endif // XRT_HAVE_LEIA_SR_VULKAN
 
 		//! @name Display processor crop images (imageRect sub-region extraction)
 		//! When the app renders to a sub-region of the swapchain (imageRect.extent
@@ -612,15 +604,9 @@ multi_compositor_has_session_render(struct multi_compositor *mc)
 	return mc->session_render.external_window_handle != NULL || mc->session_render.readback_callback != NULL;
 }
 
-#ifdef XRT_HAVE_LEIA_SR_VULKAN
 /*!
- * Get predicted eye positions from the session's per-session weaver.
- * This uses the weaver's LookaroundFilter which adapts to application-specific latency.
- *
- * This is the preferred method for LookAround functionality as it:
- * - Uses the LookaroundFilter tuned for application update rate
- * - Doesn't require the SimulatedRealitySense library
- * - Works with any SR weaver instance
+ * Get predicted eye positions from the session's display processor.
+ * Uses the display processor's eye tracking (e.g. SR SDK LookaroundFilter).
  *
  * @param mc The multi_compositor (must have per-session rendering initialized)
  * @param[out] out_eye_pair Pointer to receive the eye positions (in meters)
@@ -630,8 +616,7 @@ multi_compositor_has_session_render(struct multi_compositor *mc)
  * @private @memberof multi_compositor
  */
 bool
-multi_compositor_get_predicted_eye_positions(struct multi_compositor *mc, struct leiasr_eye_pair *out_eye_pair);
-#endif
+multi_compositor_get_predicted_eye_positions(struct multi_compositor *mc, struct xrt_eye_pair *out_eye_pair);
 
 /*!
  * Get window metrics for adaptive FOV and eye position adjustment.
@@ -653,8 +638,8 @@ multi_compositor_get_window_metrics(struct multi_compositor *mc, struct xrt_wind
 /*!
  * Request display mode switch (2D/3D).
  *
- * Uses SR SwitchableLensHint when available, or sim_display output mode
- * fallback (SBS for 3D, blend for 2D).
+ * Uses display processor vtable when available, falls back to
+ * generic device property output mode switching.
  *
  * @param mc The multi_compositor (must have per-session rendering initialized)
  * @param enable_3d true to switch to 3D mode, false for 2D mode.
