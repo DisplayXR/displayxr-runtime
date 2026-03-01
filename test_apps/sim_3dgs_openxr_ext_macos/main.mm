@@ -250,6 +250,43 @@ static void UpdateCameraMovement(InputState& input, float dt, float displayHeigh
 }
 
 // ============================================================================
+// Pick ray construction from mouse position
+// ============================================================================
+
+static void buildPickRay(float mouseX_pts, float mouseY_pts,
+                         float windowW_pts, float windowH_pts,
+                         float camYaw, float camPitch,
+                         const float camPos[3],
+                         float rayOrigin[3], float rayDir[3])
+{
+    // Mouse to NDC (NSView is bottom-up, matching NDC Y convention)
+    float ndcX = 2.0f * mouseX_pts / windowW_pts - 1.0f;
+    float ndcY = 2.0f * mouseY_pts / windowH_pts - 1.0f;
+
+    // View-space direction using projection half-tangents
+    float aspect = windowW_pts / windowH_pts;
+    float tanHalfFovY = CAMERA_HALF_TAN_VFOV;
+    float tanHalfFovX = tanHalfFovY * aspect;
+
+    float vx = ndcX * tanHalfFovX;
+    float vy = ndcY * tanHalfFovY;
+    float vz = -1.0f;
+
+    // Normalize view-space direction
+    float len = sqrtf(vx * vx + vy * vy + vz * vz);
+    vx /= len; vy /= len; vz /= len;
+
+    // Rotate by camera orientation quaternion to get world-space direction
+    XrQuaternionf ori;
+    quat_from_yaw_pitch(camYaw, camPitch, &ori);
+    quat_rotate_vec3(ori, vx, vy, vz, &rayDir[0], &rayDir[1], &rayDir[2]);
+
+    rayOrigin[0] = camPos[0];
+    rayOrigin[1] = camPos[1];
+    rayOrigin[2] = camPos[2];
+}
+
+// ============================================================================
 // HUD overlay (simple NSView with CoreText)
 // ============================================================================
 
@@ -1167,6 +1204,26 @@ int main() {
                         XrPosef cameraPose;
                         quat_from_yaw_pitch(g_input.yaw, g_input.pitch, &cameraPose.orientation);
                         cameraPose.position = {g_input.cameraPosX, g_input.cameraPosY, g_input.cameraPosZ};
+
+                        // Double-click teleport
+                        if (g_input.teleportRequested) {
+                            g_input.teleportRequested = false;
+                            NSSize viewSize = [[g_window contentView] bounds].size;
+                            float camPos[3] = {g_input.cameraPosX, g_input.cameraPosY, g_input.cameraPosZ};
+                            float rayOrigin[3], rayDir[3];
+                            buildPickRay(g_input.teleportMouseX, g_input.teleportMouseY,
+                                         (float)viewSize.width, (float)viewSize.height,
+                                         g_input.yaw, g_input.pitch, camPos,
+                                         rayOrigin, rayDir);
+                            float hitPos[3];
+                            if (g_gsRenderer.pickGaussian(rayOrigin, rayDir, hitPos)) {
+                                g_input.cameraPosX = hitPos[0];
+                                g_input.cameraPosY = hitPos[1];
+                                g_input.cameraPosZ = hitPos[2];
+                                cameraPose.position = {hitPos[0], hitPos[1], hitPos[2]};
+                                LOG_INFO("Teleported to (%.3f, %.3f, %.3f)", hitPos[0], hitPos[1], hitPos[2]);
+                            }
+                        }
 
                         XrVector3f nominalViewer = {xr.nominalViewerX, xr.nominalViewerY, xr.nominalViewerZ};
 
