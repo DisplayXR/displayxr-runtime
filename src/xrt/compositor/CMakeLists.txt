@@ -310,14 +310,21 @@ if(XRT_MODULE_COMPOSITOR_MAIN)
 	endif()
 endif()
 
-# drv_leia exports XRT_HAVE_CNSDK, XRT_HAVE_LEIA_SR_VULKAN, and/or
-# XRT_HAVE_LEIA_SR_D3D11 as PUBLIC compile definitions.
-# CNSDK::leiaSDK flows through drv_leia (no direct link needed here).
+# drv_leia exports XRT_HAVE_CNSDK as a PUBLIC compile definition.
+# comp_renderer.c still uses CNSDK directly (leia_cnsdk.h).
+# Note: XRT_HAVE_LEIA_SR_VULKAN no longer used — display processor factory
+# replaces direct leiasr calls.
 if(XRT_HAVE_LEIA_SR OR XRT_HAVE_CNSDK)
 	if(NOT TARGET drv_leia)
 		message(FATAL_ERROR "no drv_leia target")
 	endif()
 	target_link_libraries(comp_main PUBLIC drv_leia)
+endif()
+
+# Qwerty include path for comp_renderer.c HUD stereo toggle
+if(XRT_BUILD_DRIVER_QWERTY)
+	target_link_libraries(comp_main PRIVATE drv_includes)
+	target_compile_definitions(comp_main PRIVATE XRT_BUILD_DRIVER_QWERTY)
 endif()
 
 ###
@@ -367,20 +374,10 @@ target_include_directories(comp_multi PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # comp_render provides render_shaders_load/fini used by window-space layer compositing
 target_link_libraries(comp_multi PRIVATE comp_render)
 
-# Link comp_multi and comp_main to sim_display driver for display processor creation
-target_link_libraries(comp_multi PRIVATE drv_sim_display)
-
 # Qwerty include path for runtime-side 2D/3D toggle polling
 if(XRT_BUILD_DRIVER_QWERTY)
-	target_link_libraries(comp_multi PRIVATE drv_qwerty_includes)
+	target_link_libraries(comp_multi PRIVATE drv_includes)
 	target_compile_definitions(comp_multi PRIVATE XRT_BUILD_DRIVER_QWERTY)
-endif()
-target_link_libraries(comp_main PRIVATE drv_sim_display)
-
-# Link comp_multi to leiasr driver for per-session SR weaver creation
-# drv_leia exports XRT_HAVE_LEIA_SR_VULKAN as PUBLIC when Vulkan SR is available
-if(XRT_HAVE_LEIA_SR)
-	target_link_libraries(comp_multi PRIVATE drv_leia)
 endif()
 
 # Link comp_multi to shared Win32 window for self-owned window creation

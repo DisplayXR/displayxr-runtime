@@ -42,7 +42,4 @@ if(XRT_BUILD_DRIVER_QWERTY)
 	target_compile_definitions(comp_d3d11_service PRIVATE XRT_BUILD_DRIVER_QWERTY)
 endif()
 
-if(XRT_HAVE_LEIA_SR)
-	target_link_libraries(comp_d3d11_service PRIVATE drv_leia)
-endif()
 

@@ -87,24 +87,6 @@ if(XRT_HAVE_D3D11)
 	endif()
 endif()
 
-# Leia SR eye tracking support for computing view poses from face tracking
-# drv_leia exports XRT_HAVE_LEIA_SR_VULKAN and/or XRT_HAVE_LEIA_SR_D3D11
-# as PUBLIC compile definitions based on available SR libraries
-if(XRT_HAVE_LEIA_SR AND TARGET drv_leia)
-	target_link_libraries(st_oxr PRIVATE drv_leia)
-
-	# Explicitly propagate compile definitions from drv_leia
-	# CMake's PUBLIC compile definitions should propagate automatically, but we ensure it here
-	get_target_property(DRIVEIASR_DEFS drv_leia INTERFACE_COMPILE_DEFINITIONS)
-	if(DRIVEIASR_DEFS)
-		foreach(DEF IN LISTS DRIVEIASR_DEFS)
-			if(DEF MATCHES "^XRT_HAVE_LEIA_SR_(VULKAN|D3D11)$")
-				target_compile_definitions(st_oxr PRIVATE ${DEF})
-				message(STATUS "st_oxr: Added compile definition ${DEF} from drv_leia")
-			endif()
-		endforeach()
-	endif()
-endif()
 
 if(XRT_HAVE_D3D12)
 	target_sources(st_oxr PRIVATE oxr_session_gfx_d3d12.c oxr_swapchain_d3d12.c oxr_d3d12.cpp)
@@ -124,9 +106,9 @@ if(APPLE)
 	target_sources(st_oxr PRIVATE oxr_macos.m)
 	target_link_libraries(st_oxr PRIVATE "-framework Cocoa" "-framework QuartzCore")
 	# On macOS, link against both the include targets (for header paths) and the
-	# actual driver libraries (for symbols). oxr_macos.m calls qwerty_process_macos()
-	# and sim_display_set_output_mode(), and the macOS linker resolves symbols in
-	# a single left-to-right pass so these must be direct dependencies.
+	# actual driver libraries (for symbols). oxr_macos.m calls qwerty_process_macos(),
+	# and the macOS linker resolves symbols in a single left-to-right pass so
+	# these must be direct dependencies.
 	if(XRT_BUILD_DRIVER_QWERTY AND TARGET drv_qwerty)
 		target_link_libraries(st_oxr PRIVATE drv_qwerty drv_qwerty_includes)
 	endif()
@@ -139,11 +121,6 @@ if(XRT_BUILD_DRIVER_QWERTY AND TARGET drv_qwerty)
 	target_compile_definitions(st_oxr PRIVATE XRT_BUILD_DRIVER_QWERTY)
 endif()
 
-# sim_display includes + library needed on all platforms for ext_app_mode
-# (oxr_session.c calls sim_display_hmd_set_ext_app_mode)
-if(TARGET drv_sim_display)
-	target_link_libraries(st_oxr PRIVATE drv_sim_display drv_sim_display_includes)
-endif()
 
 # Canonical stereo math (display3d + camera3d) used by oxr_session.c for
 # Kooima and camera-centric FOV/pose computation. Single source of truth
