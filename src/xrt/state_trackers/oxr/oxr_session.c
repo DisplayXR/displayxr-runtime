@@ -930,13 +930,11 @@ oxr_session_locate_views(struct oxr_logger *log,
 #endif
 
 	// Query eye tracking (vendor-neutral — returns false if no backend available).
-	// Only call when compositor type is known-safe. In IPC mode, sess->xcn
-	// is an IPC proxy — multi_compositor() cast would read garbage memory.
-	// Server handles eye tracking via ipc_try_get_sr_view_poses.
-	bool got_eye_positions = false;
-	if (have_stereo_state || sess->is_d3d11_native_compositor) {
-		got_eye_positions = oxr_session_get_predicted_eye_positions(sess, &eye_pair);
-	}
+	// Safe to call unconditionally: oxr_session_get_predicted_eye_positions()
+	// checks xmcc != NULL before casting to multi_compositor, so IPC proxies
+	// are handled safely (returns false). In IPC mode, the server handles
+	// eye tracking via ipc_try_get_sr_view_poses.
+	bool got_eye_positions = oxr_session_get_predicted_eye_positions(sess, &eye_pair);
 
 	if (should_log) {
 		U_LOG_I("Eye tracking: got_positions=%d, valid=%d, is_d3d11=%d",
@@ -1119,7 +1117,7 @@ oxr_session_locate_views(struct oxr_logger *log,
 	// Save Kooima fovs before xrt_device_get_view_poses overwrites them
 	{
 		struct xrt_fov kooima_fovs[2];
-		if (have_kooima_fov && have_stereo_state) {
+		if (have_kooima_fov) {
 			kooima_fovs[0] = fovs[0];
 			kooima_fovs[1] = fovs[1];
 		}
@@ -1134,11 +1132,10 @@ oxr_session_locate_views(struct oxr_logger *log,
 		    poses);
 		OXR_CHECK_XRET(log, sess, xret, xrt_device_get_view_poses);
 
-		// Restore client-side Kooima FOVs only when the client has local
-		// stereo state (non-IPC mode). In IPC mode, the server already
-		// computes stereo-adjusted Kooima FOVs and returns them via
-		// get_view_poses — don't override those.
-		if (have_kooima_fov && have_stereo_state) {
+		// Restore client-side Kooima FOVs. In IPC mode, have_kooima_fov
+		// is false (eye tracking returns false when xmcc is NULL), so
+		// server-computed FOVs from get_view_poses are preserved.
+		if (have_kooima_fov) {
 			fovs[0] = kooima_fovs[0];
 			fovs[1] = kooima_fovs[1];
 		}
