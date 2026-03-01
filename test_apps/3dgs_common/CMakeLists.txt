@@ -47,14 +47,14 @@ FetchContent_MakeAvailable(spz)
 
 # Patch spz for MSVC: std::sqrt is not constexpr on MSVC, so constexpr
 # functions calling it (normalized, times) cause C3615 errors.
-# Replace 'constexpr' with 'inline' for these math helper functions.
+# Replace all 'constexpr' function qualifiers with 'inline' in spz headers.
+# This is safe because these are small math helpers in a header file.
 if(MSVC)
     set(_SPZ_HEADER "${spz_SOURCE_DIR}/src/cc/splat-types.h")
     file(READ "${_SPZ_HEADER}" _spz_content)
-    string(FIND "${_spz_content}" "constexpr Vec3 normalized" _spz_patched)
-    if(NOT _spz_patched EQUAL -1)
-        string(REPLACE "constexpr Vec3 normalized" "inline Vec3 normalized" _spz_content "${_spz_content}")
-        string(REPLACE "constexpr Vec3 times" "inline Vec3 times" _spz_content "${_spz_content}")
+    string(FIND "${_spz_content}" "constexpr" _spz_has_constexpr)
+    if(NOT _spz_has_constexpr EQUAL -1)
+        string(REPLACE "constexpr " "inline " _spz_content "${_spz_content}")
         file(WRITE "${_SPZ_HEADER}" "${_spz_content}")
         message(STATUS "Patched spz splat-types.h: constexpr -> inline for MSVC compatibility")
     endif()
