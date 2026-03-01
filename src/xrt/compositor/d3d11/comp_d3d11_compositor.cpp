@@ -1176,7 +1176,7 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	// Create display processor via factory (set by the target builder at init time).
 	if (dp_factory_d3d11 != NULL) {
 		auto factory = (xrt_dp_factory_d3d11_fn_t)dp_factory_d3d11;
-		xrt_result_t dp_ret = factory(c->device, c->hwnd, &c->display_processor);
+		xrt_result_t dp_ret = factory(c->device, c->context, c->hwnd, &c->display_processor);
 		if (dp_ret != XRT_SUCCESS) {
 			U_LOG_W("D3D11 display processor factory failed (error %d), continuing without",
 			        (int)dp_ret);

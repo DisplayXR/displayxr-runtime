@@ -225,11 +225,13 @@ xrt_display_processor_d3d11_get_display_pixel_info(struct xrt_display_processor_
  * xrt_system_compositor_info.
  *
  * @param d3d11_device   D3D11 device (ID3D11Device*).
+ * @param d3d11_context  D3D11 immediate context (ID3D11DeviceContext*).
  * @param window_handle  Native window handle (HWND), may be NULL.
  * @param[out] out_xdp   Created display processor on success.
  * @return XRT_SUCCESS on success.
  */
 typedef xrt_result_t (*xrt_dp_factory_d3d11_fn_t)(void *d3d11_device,
+                                                   void *d3d11_context,
                                                    void *window_handle,
                                                    struct xrt_display_processor_d3d11 **out_xdp);
 

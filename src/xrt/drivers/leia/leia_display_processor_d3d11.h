@@ -31,6 +31,7 @@ struct leiasr_d3d11;
  */
 xrt_result_t
 leia_dp_factory_d3d11(void *d3d11_device,
+                      void *d3d11_context,
                       void *window_handle,
                       struct xrt_display_processor_d3d11 **out_xdp);
 

@@ -1323,7 +1323,7 @@ init_client_render_resources(struct d3d11_service_system *sys,
 	// Create display processor via factory (set by the target builder at init time)
 	if (sys->base.info.dp_factory_d3d11 != NULL) {
 		auto factory = (xrt_dp_factory_d3d11_fn_t)sys->base.info.dp_factory_d3d11;
-		xrt_result_t dp_ret = factory(sys->device.get(), res->hwnd, &res->display_processor);
+		xrt_result_t dp_ret = factory(sys->device.get(), sys->context.get(), res->hwnd, &res->display_processor);
 		if (dp_ret != XRT_SUCCESS) {
 			U_LOG_W("D3D11 display processor factory failed (error %d), continuing without",
 			        (int)dp_ret);
@@ -3348,7 +3348,7 @@ comp_d3d11_service_create_system(struct xrt_device *xdev,
 	if (sys->base.info.dp_factory_d3d11 != NULL) {
 		auto factory = (xrt_dp_factory_d3d11_fn_t)sys->base.info.dp_factory_d3d11;
 		struct xrt_display_processor_d3d11 *tmp_dp = nullptr;
-		xrt_result_t dp_ret = factory(sys->device.get(), NULL, &tmp_dp);
+		xrt_result_t dp_ret = factory(sys->device.get(), sys->context.get(), NULL, &tmp_dp);
 		if (dp_ret == XRT_SUCCESS && tmp_dp != nullptr) {
 			uint32_t disp_px_w = 0, disp_px_h = 0;
 			int32_t disp_left = 0, disp_top = 0;

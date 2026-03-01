@@ -222,7 +222,7 @@ leiasr_d3d11_create(double max_time,
 	                                               &sr->weaver);
 	if (result != WeaverErrorCode::WeaverSuccess) {
 		U_LOG_E("Failed to create SR D3D11 weaver: %d", (int)result);
-		delete sr->context;
+		SR::SRContext::deleteSRContext(sr->context);
 		delete sr;
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
 	}

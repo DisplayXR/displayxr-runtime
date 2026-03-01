@@ -180,19 +180,16 @@ leia_dp_d3d11_init_vtable(struct leia_display_processor_d3d11_impl *ldp)
 
 extern "C" xrt_result_t
 leia_dp_factory_d3d11(void *d3d11_device,
+                      void *d3d11_context,
                       void *window_handle,
                       struct xrt_display_processor_d3d11 **out_xdp)
 {
-	// We need view dimensions for the D3D11 weaver. Query from SR SDK.
-	uint32_t view_w = 0, view_h = 0;
-	if (!leiasr_query_recommended_view_dimensions(5.0, &view_w, &view_h, NULL, NULL, NULL)) {
-		U_LOG_W("Failed to query SR recommended view dimensions for D3D11 weaver");
-		return XRT_ERROR_DEVICE_CREATION_FAILED;
-	}
-
+	// Create weaver — view dimensions are set per-frame via setInputViewTexture,
+	// so we pass 0,0 here (avoids creating a redundant temp SR context just to
+	// query recommended dims that leiasr_d3d11_create queries again internally).
 	struct leiasr_d3d11 *weaver = NULL;
-	xrt_result_t ret = leiasr_d3d11_create(5.0, d3d11_device, NULL, // context passed separately per-frame
-	                                       window_handle, view_w, view_h, &weaver);
+	xrt_result_t ret = leiasr_d3d11_create(5.0, d3d11_device, d3d11_context,
+	                                       window_handle, 0, 0, &weaver);
 	if (ret != XRT_SUCCESS || weaver == NULL) {
 		U_LOG_W("Failed to create SR D3D11 weaver");
 		return ret != XRT_SUCCESS ? ret : XRT_ERROR_DEVICE_CREATION_FAILED;
