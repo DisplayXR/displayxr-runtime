@@ -2467,6 +2467,24 @@ struct xrt_system_compositor_info
 
 	//! Default eye tracking mode (0=SMOOTH, 1=RAW).
 	uint32_t default_eye_tracking_mode;
+
+	/*!
+	 * @name Display Processor Factories
+	 * Set by the target builder at init time. The compositor calls these
+	 * to create display processors for each session, avoiding direct
+	 * driver dependencies.
+	 * @{
+	 */
+
+	//! Vulkan display processor factory (NULL = no Vulkan display processing).
+	//! Signature: xrt_dp_factory_vk_fn_t (see xrt_display_processor.h).
+	void *dp_factory_vk;
+
+	//! D3D11 display processor factory (NULL = no D3D11 display processing).
+	//! Signature: xrt_dp_factory_d3d11_fn_t (see xrt_display_processor_d3d11.h).
+	void *dp_factory_d3d11;
+
+	/*! @} */
 };
 
 struct xrt_system_compositor;

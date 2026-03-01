@@ -21,11 +21,16 @@
 #include "xrt/xrt_compiler.h"
 #include "xrt/xrt_results.h"
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+// Forward declarations for types used by optional vtable methods.
+struct xrt_eye_pair;
+struct xrt_window_metrics;
 
 /*!
  * @interface xrt_display_processor_d3d11
@@ -67,6 +72,45 @@ struct xrt_display_processor_d3d11
 	                       uint32_t target_height);
 
 	/*!
+	 * Get predicted eye positions from vendor eye tracking SDK.
+	 * Optional — NULL means not supported.
+	 */
+	bool (*get_predicted_eye_positions)(struct xrt_display_processor_d3d11 *xdp,
+	                                    struct xrt_eye_pair *out_eye_pair);
+
+	/*!
+	 * Get window metrics for adaptive FOV calculation.
+	 * Optional — NULL means not supported.
+	 */
+	bool (*get_window_metrics)(struct xrt_display_processor_d3d11 *xdp,
+	                           struct xrt_window_metrics *out_metrics);
+
+	/*!
+	 * Request a display mode switch (2D/3D).
+	 * Optional — NULL means not supported.
+	 */
+	bool (*request_display_mode)(struct xrt_display_processor_d3d11 *xdp,
+	                             bool enable_3d);
+
+	/*!
+	 * Get physical display dimensions in meters.
+	 * Optional — NULL means not supported.
+	 */
+	bool (*get_display_dimensions)(struct xrt_display_processor_d3d11 *xdp,
+	                               float *out_width_m,
+	                               float *out_height_m);
+
+	/*!
+	 * Get native display pixel info (resolution and screen position).
+	 * Optional — NULL means not supported.
+	 */
+	bool (*get_display_pixel_info)(struct xrt_display_processor_d3d11 *xdp,
+	                               uint32_t *out_pixel_width,
+	                               uint32_t *out_pixel_height,
+	                               int32_t *out_screen_left,
+	                               int32_t *out_screen_top);
+
+	/*!
 	 * Destroy this display processor and free all resources.
 	 *
 	 * @param xdp Pointer to self.
@@ -94,6 +138,100 @@ xrt_display_processor_d3d11_process_stereo(struct xrt_display_processor_d3d11 *x
 	xdp->process_stereo(xdp, d3d11_context, stereo_srv, view_width, view_height, format, target_width,
 	                    target_height);
 }
+
+/*!
+ * @copydoc xrt_display_processor_d3d11::get_predicted_eye_positions
+ * Returns false if not supported (function pointer is NULL).
+ * @public @memberof xrt_display_processor_d3d11
+ */
+static inline bool
+xrt_display_processor_d3d11_get_predicted_eye_positions(struct xrt_display_processor_d3d11 *xdp,
+                                                        struct xrt_eye_pair *out_eye_pair)
+{
+	if (xdp == NULL || xdp->get_predicted_eye_positions == NULL) {
+		return false;
+	}
+	return xdp->get_predicted_eye_positions(xdp, out_eye_pair);
+}
+
+/*!
+ * @copydoc xrt_display_processor_d3d11::get_window_metrics
+ * Returns false if not supported (function pointer is NULL).
+ * @public @memberof xrt_display_processor_d3d11
+ */
+static inline bool
+xrt_display_processor_d3d11_get_window_metrics(struct xrt_display_processor_d3d11 *xdp,
+                                               struct xrt_window_metrics *out_metrics)
+{
+	if (xdp == NULL || xdp->get_window_metrics == NULL) {
+		return false;
+	}
+	return xdp->get_window_metrics(xdp, out_metrics);
+}
+
+/*!
+ * @copydoc xrt_display_processor_d3d11::request_display_mode
+ * Returns false if not supported (function pointer is NULL).
+ * @public @memberof xrt_display_processor_d3d11
+ */
+static inline bool
+xrt_display_processor_d3d11_request_display_mode(struct xrt_display_processor_d3d11 *xdp, bool enable_3d)
+{
+	if (xdp == NULL || xdp->request_display_mode == NULL) {
+		return false;
+	}
+	return xdp->request_display_mode(xdp, enable_3d);
+}
+
+/*!
+ * @copydoc xrt_display_processor_d3d11::get_display_dimensions
+ * Returns false if not supported (function pointer is NULL).
+ * @public @memberof xrt_display_processor_d3d11
+ */
+static inline bool
+xrt_display_processor_d3d11_get_display_dimensions(struct xrt_display_processor_d3d11 *xdp,
+                                                   float *out_width_m,
+                                                   float *out_height_m)
+{
+	if (xdp == NULL || xdp->get_display_dimensions == NULL) {
+		return false;
+	}
+	return xdp->get_display_dimensions(xdp, out_width_m, out_height_m);
+}
+
+/*!
+ * @copydoc xrt_display_processor_d3d11::get_display_pixel_info
+ * Returns false if not supported (function pointer is NULL).
+ * @public @memberof xrt_display_processor_d3d11
+ */
+static inline bool
+xrt_display_processor_d3d11_get_display_pixel_info(struct xrt_display_processor_d3d11 *xdp,
+                                                   uint32_t *out_pixel_width,
+                                                   uint32_t *out_pixel_height,
+                                                   int32_t *out_screen_left,
+                                                   int32_t *out_screen_top)
+{
+	if (xdp == NULL || xdp->get_display_pixel_info == NULL) {
+		return false;
+	}
+	return xdp->get_display_pixel_info(xdp, out_pixel_width, out_pixel_height, out_screen_left, out_screen_top);
+}
+
+/*!
+ * Factory function type for creating a D3D11 display processor.
+ *
+ * Called by the compositor to create a display processor for a session.
+ * The factory is set by the target builder at init time and stored in
+ * xrt_system_compositor_info.
+ *
+ * @param d3d11_device   D3D11 device (ID3D11Device*).
+ * @param window_handle  Native window handle (HWND), may be NULL.
+ * @param[out] out_xdp   Created display processor on success.
+ * @return XRT_SUCCESS on success.
+ */
+typedef xrt_result_t (*xrt_dp_factory_d3d11_fn_t)(void *d3d11_device,
+                                                   void *window_handle,
+                                                   struct xrt_display_processor_d3d11 **out_xdp);
 
 /*!
  * Destroy an xrt_display_processor_d3d11 — helper function.
