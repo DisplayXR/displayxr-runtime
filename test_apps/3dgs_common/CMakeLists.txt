@@ -52,8 +52,12 @@ add_library(spz_lib STATIC
 )
 target_include_directories(spz_lib PUBLIC ${spz_SOURCE_DIR}/src/cc)
 target_link_libraries(spz_lib PRIVATE ${SPZ_ZLIB_TARGET})
-set_target_properties(spz_lib PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+set_target_properties(spz_lib PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
 if(MSVC)
+    # _USE_MATH_DEFINES: spz uses M_PI which MSVC only defines with this macro
+    # /FI<file>: force-include <algorithm> so std::sort is available in spz headers
+    target_compile_definitions(spz_lib PRIVATE _USE_MATH_DEFINES)
+    target_compile_options(spz_lib PRIVATE /FIalgorithm)
     set_target_properties(spz_lib PROPERTIES
         MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
     )
