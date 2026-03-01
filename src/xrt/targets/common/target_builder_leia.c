@@ -100,9 +100,15 @@ leia_open_system_impl(struct xrt_builder *xb,
 			qd->sys->nominal_viewer_z = (probe.nominal_z_m > 0.0f) ? probe.nominal_z_m : 0.65f;
 		}
 
-		// Camera mode default position (eye height, looking forward).
-		qd->pose.position = (struct xrt_vec3){0, 1.6f, 0};
-		qd->pose.orientation = (struct xrt_quat){0, 0, 0, 1};
+		// Share leia head's tracking origin with all qwerty devices so they
+		// occupy the same node in the space overseer graph.  u_builder's
+		// setup_tracking_origins processes head LAST, overwriting any
+		// controller defaults with the correct (0, 1.6, 0) offset.
+		qwerty_hmd->tracking_origin = head->tracking_origin;
+		if (qd->sys->lctrl)
+			qd->sys->lctrl->base.base.tracking_origin = head->tracking_origin;
+		if (qd->sys->rctrl)
+			qd->sys->rctrl->base.base.tracking_origin = head->tracking_origin;
 
 		// Delegate head pose to qwerty HMD for WASD/mouse camera control.
 		leia_hmd_set_pose_source(head, qwerty_hmd);
