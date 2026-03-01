@@ -153,9 +153,12 @@ oxr_system_fill_in(
 		uint32_t w, h;
 		if (view_scale_x > 0.0f && view_scale_y > 0.0f &&
 		    info->display_pixel_width > 0 && info->display_pixel_height > 0) {
-			// Display processor present: scale is relative to full display size
-			w = (uint32_t)(info->display_pixel_width * view_scale_x * scale);
-			h = (uint32_t)(info->display_pixel_height * view_scale_y * scale);
+			// Display processor present: recommended = native per-eye dims.
+			// Swapchain must be at native display resolution; the view scale
+			// (communicated via XR_EXT_display_info) tells display-aware apps
+			// to render at a smaller viewport within the swapchain.
+			w = (uint32_t)(info->display_pixel_width / 2 * scale);
+			h = (uint32_t)(info->display_pixel_height * scale);
 			// The null compositor's max is based on the Qwerty HMD's tiny
 			// screen (e.g. 640x720), not the real display. Override max
 			// with actual display dimensions so recommended isn't clamped.
