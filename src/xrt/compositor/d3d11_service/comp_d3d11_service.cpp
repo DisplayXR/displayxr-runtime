@@ -1258,16 +1258,36 @@ init_client_render_resources(struct d3d11_service_system *sys,
 		U_LOG_W("Created window for client: hwnd=%p (%ux%u)", res->hwnd, sys->output_width, sys->output_height);
 	}
 
+	// Get actual window client area (may differ from requested size if window
+	// went fullscreen to native monitor resolution during creation)
+	uint32_t actual_width = sys->output_width;
+	uint32_t actual_height = sys->output_height;
+	if (res->hwnd != nullptr) {
+		RECT client_rect;
+		if (GetClientRect(res->hwnd, &client_rect)) {
+			uint32_t cw = static_cast<uint32_t>(client_rect.right - client_rect.left);
+			uint32_t ch = static_cast<uint32_t>(client_rect.bottom - client_rect.top);
+			if (cw > 0 && ch > 0) {
+				actual_width = cw;
+				actual_height = ch;
+				if (cw != sys->output_width || ch != sys->output_height) {
+					U_LOG_W("Window actual size differs from defaults: %ux%u (was %ux%u)",
+					        cw, ch, sys->output_width, sys->output_height);
+				}
+			}
+		}
+	}
+
 	// Create HUD overlay for runtime-owned windows
 	if (res->owns_window) {
 		res->smoothed_frame_time_ms = 16.67f;
-		u_hud_create(&res->hud, sys->output_width);
+		u_hud_create(&res->hud, actual_width);
 	}
 
-	// Create swap chain at native display resolution
+	// Create swap chain at actual window size (not defaults)
 	DXGI_SWAP_CHAIN_DESC1 sc_desc = {};
-	sc_desc.Width = sys->output_width;
-	sc_desc.Height = sys->output_height;
+	sc_desc.Width = actual_width;
+	sc_desc.Height = actual_height;
 	sc_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
 	sc_desc.SampleDesc.Count = 1;
 	sc_desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -1343,6 +1363,75 @@ init_client_render_resources(struct d3d11_service_system *sys,
 			if (!sys->force_2d_mode) {
 				xrt_display_processor_d3d11_request_display_mode(
 				    res->display_processor, true);
+			}
+
+			// Query display pixel info from the real (windowed) display processor.
+			// The temp DP at system init uses NULL window and may fail to return
+			// pixel info, leaving sys dimensions at 1920x1080 defaults.  Update now.
+			uint32_t dp_px_w = 0, dp_px_h = 0;
+			int32_t dp_left = 0, dp_top = 0;
+			if (xrt_display_processor_d3d11_get_display_pixel_info(
+			        res->display_processor, &dp_px_w, &dp_px_h,
+			        &dp_left, &dp_top) &&
+			    dp_px_w > 0 && dp_px_h > 0 &&
+			    (dp_px_w != sys->output_width || dp_px_h != sys->output_height)) {
+				U_LOG_W("Updating dims from display processor: %ux%u -> %ux%u",
+				        sys->output_width, sys->output_height, dp_px_w, dp_px_h);
+				sys->output_width = dp_px_w;
+				sys->output_height = dp_px_h;
+				sys->view_width = dp_px_w / 2;
+				sys->view_height = dp_px_h;
+				sys->display_width = sys->view_width * 2;
+				sys->display_height = sys->view_height;
+
+				// Recreate stereo texture at correct dimensions
+				res->stereo_rtv.reset();
+				res->stereo_srv.reset();
+				res->stereo_texture.reset();
+
+				D3D11_TEXTURE2D_DESC stereo_desc = {};
+				stereo_desc.Width = sys->display_width;
+				stereo_desc.Height = sys->display_height;
+				stereo_desc.MipLevels = 1;
+				stereo_desc.ArraySize = 1;
+				stereo_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+				stereo_desc.SampleDesc.Count = 1;
+				stereo_desc.Usage = D3D11_USAGE_DEFAULT;
+				stereo_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+
+				hr = sys->device->CreateTexture2D(&stereo_desc, nullptr,
+				                                  res->stereo_texture.put());
+				if (SUCCEEDED(hr)) {
+					sys->device->CreateShaderResourceView(
+					    res->stereo_texture.get(), nullptr, res->stereo_srv.put());
+					sys->device->CreateRenderTargetView(
+					    res->stereo_texture.get(), nullptr, res->stereo_rtv.put());
+					U_LOG_W("Stereo texture recreated at %ux%u",
+					        sys->display_width, sys->display_height);
+				}
+
+				// Resize window and swap chain to match display
+				if (res->owns_window && res->hwnd != nullptr) {
+					RECT client_rect;
+					if (GetClientRect(res->hwnd, &client_rect)) {
+						uint32_t cw = (uint32_t)(client_rect.right - client_rect.left);
+						uint32_t ch = (uint32_t)(client_rect.bottom - client_rect.top);
+						if (cw != dp_px_w || ch != dp_px_h) {
+							// Resize swap chain to match
+							res->back_buffer_rtv.reset();
+							HRESULT rhr = res->swap_chain->ResizeBuffers(
+							    0, dp_px_w, dp_px_h, DXGI_FORMAT_UNKNOWN, 0);
+							if (SUCCEEDED(rhr)) {
+								wil::com_ptr<ID3D11Texture2D> bb;
+								res->swap_chain->GetBuffer(0, IID_PPV_ARGS(bb.put()));
+								sys->device->CreateRenderTargetView(
+								    bb.get(), nullptr, res->back_buffer_rtv.put());
+								U_LOG_W("Swap chain resized to %ux%u to match display",
+								        dp_px_w, dp_px_h);
+							}
+						}
+					}
+				}
 			}
 		}
 	} else {
