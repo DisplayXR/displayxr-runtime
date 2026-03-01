@@ -613,6 +613,17 @@ bool GsRenderer::loadScene(const char* plyPath)
     numPrefixSumIter_ = (uint32_t)std::ceil(std::log2((double)numGaussians_));
     if (numPrefixSumIter_ == 0) numPrefixSumIter_ = 1;
 
+    // Build compact pick data for CPU raycast (20 bytes/gaussian)
+    pickData_.resize(numGaussians_);
+    for (uint32_t i = 0; i < numGaussians_; i++) {
+        const auto& v = vertices[i];
+        pickData_[i].px = v.position[0];
+        pickData_[i].py = v.position[1];
+        pickData_[i].pz = v.position[2];
+        pickData_[i].maxScale = std::max({v.scale_opacity[0], v.scale_opacity[1], v.scale_opacity[2]});
+        pickData_[i].opacity = v.scale_opacity[3];
+    }
+
     // Create compute pipelines (first time only — they don't depend on scene size)
     if (pipePrecompCov3d_ == VK_NULL_HANDLE) {
         if (!createPipelines()) {
@@ -729,6 +740,10 @@ bool GsRenderer::loadDebugScene(float x, float y, float z, float radius)
     std::vector<GsVertex> vertices = {v};
     numGaussians_ = 1;
     numPrefixSumIter_ = 1;
+
+    // Build pick data for the single debug splat
+    pickData_.resize(1);
+    pickData_[0] = {x, y, z, radius, 0.99f};
 
     if (pipePrecompCov3d_ == VK_NULL_HANDLE) {
         if (!createPipelines()) return false;
@@ -1153,6 +1168,61 @@ void GsRenderer::renderEye(VkImage swapchainImage,
 }
 
 // ═════════════════════════════════════════════════════════════════════════
+// pickGaussian — CPU raycast to find nearest visible gaussian along a ray
+// ═════════════════════════════════════════════════════════════════════════
+
+bool GsRenderer::pickGaussian(const float rayOrigin[3], const float rayDir[3],
+                               float hitPos[3], float maxDistance) const
+{
+    if (pickData_.empty()) return false;
+
+    float bestScore = 1e30f;
+    int bestIdx = -1;
+
+    for (size_t i = 0; i < pickData_.size(); i++) {
+        const auto& g = pickData_[i];
+
+        // Vector from ray origin to gaussian center
+        float dx = g.px - rayOrigin[0];
+        float dy = g.py - rayOrigin[1];
+        float dz = g.pz - rayOrigin[2];
+
+        // Project center onto ray: t = dot(d, rayDir)
+        float t = dx * rayDir[0] + dy * rayDir[1] + dz * rayDir[2];
+
+        // Reject if behind camera or beyond max distance
+        if (t < 0.0f || t > maxDistance) continue;
+
+        // Perpendicular distance squared from ray to center
+        float perpX = dx - t * rayDir[0];
+        float perpY = dy - t * rayDir[1];
+        float perpZ = dz - t * rayDir[2];
+        float perpDistSq = perpX * perpX + perpY * perpY + perpZ * perpZ;
+
+        // Reject if ray misses the 3-sigma sphere
+        float radius = 3.0f * g.maxScale;
+        if (perpDistSq > radius * radius) continue;
+
+        // Score: favor close, opaque, large gaussians
+        float perpDist = sqrtf(perpDistSq);
+        float eps = 1e-6f;
+        float score = (perpDist + eps) / (g.opacity * g.maxScale + eps);
+
+        if (score < bestScore) {
+            bestScore = score;
+            bestIdx = (int)i;
+        }
+    }
+
+    if (bestIdx < 0) return false;
+
+    hitPos[0] = pickData_[bestIdx].px;
+    hitPos[1] = pickData_[bestIdx].py;
+    hitPos[2] = pickData_[bestIdx].pz;
+    return true;
+}
+
+// ═════════════════════════════════════════════════════════════════════════
 // cleanupScene — destroy scene-specific resources (buffers, descriptors)
 // ═════════════════════════════════════════════════════════════════════════
 
@@ -1199,6 +1269,9 @@ void GsRenderer::cleanupScene()
 
     // Destroy render image
     gsDestroyImage(device_, renderImage_);
+
+    pickData_.clear();
+    pickData_.shrink_to_fit();
 
     sceneLoaded_ = false;
     numGaussians_ = 0;

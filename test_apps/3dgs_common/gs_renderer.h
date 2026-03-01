@@ -18,7 +18,14 @@
 #include <vulkan/vulkan.h>
 #include <string>
 #include <cstdint>
+#include <vector>
 #include "gs_vulkan_utils.h"
+
+struct GsPickData {
+    float px, py, pz;   // world-space position
+    float maxScale;      // max(sx, sy, sz) — sphere radius for ray test
+    float opacity;       // for scoring (favor visible splats)
+};
 
 struct GsRenderer {
     // Initialize with the OpenXR runtime's Vulkan resources.
@@ -45,6 +52,11 @@ struct GsRenderer {
 
     // Returns the number of Gaussians in the loaded scene.
     uint32_t gaussianCount() const;
+
+    // Raycast pick: find the nearest visible gaussian along a ray.
+    // Returns true if a hit was found, with the gaussian center written to hitPos.
+    bool pickGaussian(const float rayOrigin[3], const float rayDir[3],
+                      float hitPos[3], float maxDistance = 100.0f) const;
 
     // Render one eye's view to a region of a Vulkan swapchain image.
     // Manages its own command buffers internally (allocate, record, submit, wait).
@@ -157,6 +169,9 @@ private:
     // ── Radix sort sizing ────────────────────────────────────────────────
     uint32_t numRadixSortBlocksPerWG_ = 256;  // Apple default
     uint32_t numSortWorkgroups_ = 0;
+
+    // ── CPU pick data (compact: 20 bytes/gaussian) ─────────────────────
+    std::vector<GsPickData> pickData_;
 
     // ── Private methods ──────────────────────────────────────────────────
     bool createPipelines();
