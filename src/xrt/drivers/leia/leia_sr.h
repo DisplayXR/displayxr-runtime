@@ -1,8 +1,11 @@
 #pragma once
 
 #include "xrt/xrt_results.h"
-#include "xrt/xrt_vulkan_includes.h"
+#include "xrt/xrt_config_vulkan.h" // VK_USE_PLATFORM_WIN32_KHR etc.
+#include "xrt/xrt_windows.h"       // windows.h with proper defines (before vulkan.h)
 #include "leia_types.h"
+
+#include <vulkan/vulkan.h>
 
 #ifdef __cplusplus
 extern "C" {
