@@ -1190,8 +1190,8 @@ bool GsRenderer::pickGaussian(const float rayOrigin[3], const float rayDir[3],
         // Project center onto ray: t = dot(d, rayDir)
         float t = dx * rayDir[0] + dy * rayDir[1] + dz * rayDir[2];
 
-        // Reject if behind camera or beyond max distance
-        if (t < 0.0f || t > maxDistance) continue;
+        // Reject if behind camera, too close (inside current gaussian), or beyond max distance
+        if (t < 0.05f || t > maxDistance) continue;
 
         // Perpendicular distance squared from ray to center
         float perpX = dx - t * rayDir[0];
