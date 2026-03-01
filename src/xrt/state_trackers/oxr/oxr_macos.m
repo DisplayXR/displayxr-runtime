@@ -28,7 +28,6 @@
 #ifdef XRT_BUILD_DRIVER_QWERTY
 #include "qwerty_interface.h"
 #endif
-#include "sim_display_interface.h"
 
 // Defined in os_macos.c (aux_os library, linked by all targets)
 extern void oxr_macos_set_window_closed(void);
@@ -49,7 +48,7 @@ extern void oxr_macos_set_window_closed(void);
  * background thread never reaches the display.
  */
 void
-oxr_macos_pump_events(struct xrt_device **xdevs, uint32_t xdev_count)
+oxr_macos_pump_events(struct xrt_device **xdevs, uint32_t xdev_count, struct xrt_device *head)
 {
 	@autoreleasepool {
 		if (NSApp == nil) {
@@ -69,15 +68,16 @@ oxr_macos_pump_events(struct xrt_device **xdevs, uint32_t xdev_count)
 				oxr_macos_set_window_closed();
 			}
 
-			// 1/2/3 keys: switch sim_display output mode.
-			if ([event type] == NSEventTypeKeyDown) {
+			// 1/2/3 keys: switch display output mode via device property.
+			// Values: 0=SBS, 1=Anaglyph, 2=Blend (matches sim_display_output_mode enum)
+			if ([event type] == NSEventTypeKeyDown && head != NULL) {
 				unsigned short kc = [event keyCode];
 				if (kc == 18) { // '1'
-					sim_display_set_output_mode(SIM_DISPLAY_OUTPUT_SBS);
+					xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, 0);
 				} else if (kc == 19) { // '2'
-					sim_display_set_output_mode(SIM_DISPLAY_OUTPUT_ANAGLYPH);
+					xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, 1);
 				} else if (kc == 20) { // '3'
-					sim_display_set_output_mode(SIM_DISPLAY_OUTPUT_BLEND);
+					xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, 2);
 				}
 			}
 

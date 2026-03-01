@@ -58,21 +58,13 @@
 // Vendor-neutral display metric types (eye positions, window metrics, Kooima FOV)
 #include "xrt/xrt_display_metrics.h"
 
-// Eye tracking backends (vendor-specific headers gated by their own ifdefs)
-
-#include "sim_display_interface.h"
-
 #ifdef XRT_BUILD_DRIVER_QWERTY
 #include "qwerty_interface.h"
 #endif
 
 #include "multi/comp_multi_private.h"
 
-#ifdef XRT_HAVE_LEIA_SR_VULKAN
-#include "leia/leia_sr.h"
-#endif
-
-#if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_NATIVE_COMPOSITOR)
+#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
 #include "d3d11/comp_d3d11_compositor.h"
 #endif
 
@@ -129,11 +121,12 @@ oxr_session_get_predicted_eye_positions(struct oxr_session *sess, struct xrt_eye
 		return false;
 	}
 
-#if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_NATIVE_COMPOSITOR)
+#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
 	// D3D11 native compositor path
 	if (sess->is_d3d11_native_compositor) {
 		struct xrt_vec3 left_eye, right_eye;
-		bool got_positions = comp_d3d11_compositor_get_predicted_eye_positions(&sess->xcn->base, &left_eye, &right_eye);
+		bool got_positions =
+		    comp_d3d11_compositor_get_predicted_eye_positions(&sess->xcn->base, &left_eye, &right_eye);
 
 		if (got_positions) {
 			out_eye_pair->left = (struct xrt_eye_position){left_eye.x, left_eye.y, left_eye.z};
@@ -152,18 +145,14 @@ oxr_session_get_predicted_eye_positions(struct oxr_session *sess, struct xrt_eye
 	}
 #endif
 
-#ifdef XRT_HAVE_LEIA_SR_VULKAN
 	// Multi-compositor path (Vulkan) — only valid for in-process mode.
 	// In IPC mode, sess->xcn is an IPC proxy, not a multi_compositor.
 	// xmcc is only non-NULL for in-process multi_system_compositor.
 	if (sess->sys->xsysc->xmcc != NULL) {
 		struct multi_compositor *mc = multi_compositor(&sess->xcn->base);
-		return multi_compositor_get_predicted_eye_positions(mc, (struct leiasr_eye_pair *)out_eye_pair);
+		return multi_compositor_get_predicted_eye_positions(mc, out_eye_pair);
 	}
 	return false;
-#else
-	return false;
-#endif
 }
 
 /*!
@@ -180,7 +169,7 @@ oxr_session_get_display_dimensions(struct oxr_session *sess, float *out_width_m,
 		return false;
 	}
 
-#if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_NATIVE_COMPOSITOR)
+#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
 	// D3D11 native compositor path (has its own display dimension query)
 	if (sess->xcn != NULL && sess->is_d3d11_native_compositor) {
 		return comp_d3d11_compositor_get_display_dimensions(&sess->xcn->base, out_width_m, out_height_m);
@@ -247,7 +236,7 @@ oxr_session_request_display_mode(struct oxr_logger *log, struct oxr_session *ses
 
 	bool success = false;
 
-#if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_NATIVE_COMPOSITOR)
+#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
 	if (sess->is_d3d11_native_compositor) {
 		success = comp_d3d11_compositor_request_display_mode(&sess->xcn->base, enable_3d);
 		if (success) {
@@ -658,8 +647,9 @@ oxr_session_poll(struct oxr_logger *log, struct oxr_session *sess)
 	// require periodic run loop processing for the Window Server to
 	// commit rendered content to the screen. This is the only place
 	// where the app's main thread calls into the runtime each frame.
-	extern void oxr_macos_pump_events(struct xrt_device **xdevs, uint32_t xdev_count);
-	oxr_macos_pump_events(sess->sys->xsysd->xdevs, sess->sys->xsysd->xdev_count);
+	extern void oxr_macos_pump_events(struct xrt_device **xdevs, uint32_t xdev_count, struct xrt_device *head);
+	struct xrt_device *head_dev = GET_XDEV_BY_ROLE(sess->sys, head);
+	oxr_macos_pump_events(sess->sys->xsysd->xdevs, sess->sys->xsysd->xdev_count, head_dev);
 #endif
 
 #ifdef XRT_OS_ANDROID
@@ -1969,11 +1959,11 @@ oxr_session_create(struct oxr_logger *log,
 	// Track whether this session has an external window handle or offscreen readback
 	sess->has_external_window = (xsi.external_window_handle != NULL || xsi.readback_callback != NULL);
 
-	// Tell sim_display driver to return raw eye positions (no qwerty compose)
+	// Tell the head device to return raw eye positions (no qwerty compose)
 	if (sess->has_external_window) {
 		struct xrt_device *head = GET_XDEV_BY_ROLE(sess->sys, head);
-		if (head != NULL && strcmp(head->serial, "sim_display_0") == 0) {
-			sim_display_hmd_set_ext_app_mode(head, true);
+		if (head != NULL) {
+			xrt_device_set_property(head, XRT_DEVICE_PROPERTY_EXT_APP_MODE, 1);
 		}
 	}
 
