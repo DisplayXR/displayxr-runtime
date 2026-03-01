@@ -14,8 +14,7 @@
 #pragma once
 
 #include "xrt/xrt_results.h"
-
-#include <vulkan/vulkan.h>
+#include "xrt/xrt_vulkan_includes.h"
 
 #ifdef __cplusplus
 extern "C" {

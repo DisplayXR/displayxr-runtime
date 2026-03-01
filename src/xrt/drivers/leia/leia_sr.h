@@ -1,8 +1,8 @@
 #pragma once
 
 #include "xrt/xrt_results.h"
+#include "xrt/xrt_vulkan_includes.h"
 #include "leia_types.h"
-#include <vulkan/vulkan.h>
 
 #ifdef __cplusplus
 extern "C" {

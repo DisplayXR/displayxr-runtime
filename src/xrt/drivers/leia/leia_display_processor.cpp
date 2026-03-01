@@ -18,8 +18,6 @@
 #include "xrt/xrt_display_metrics.h"
 #include "vk/vk_helpers.h"
 #include "util/u_logging.h"
-
-#include <vulkan/vulkan.h>
 #include <cstdlib>
 
 
