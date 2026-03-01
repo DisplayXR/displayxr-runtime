@@ -1570,6 +1570,9 @@ comp_main_create_system_compositor(struct xrt_device *xdev,
 	xret = comp_multi_create_system_compositor(&c->base.base, upaf, sys_info, !c->deferred_surface,
 	                                           &c->target_service, true, set_window_sysdevs, out_xsysc);
 	if (xret == XRT_SUCCESS) {
+		// Store back-reference so comp_renderer can lazily access dp_factory_vk
+		// (set by target_instance.c on xsysc->info after this function returns).
+		c->xsysc = *out_xsysc;
 		return xret;
 	}
 
