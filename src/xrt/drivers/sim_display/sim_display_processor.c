@@ -281,6 +281,9 @@ create_pipeline_resources(struct sim_display_processor *sdp, int32_t target_form
 
 	// 5. Create one graphics pipeline per output mode (SBS, anaglyph, blend)
 	//    so runtime switching is instant (no pipeline recreation).
+	//    All shader modules are created upfront and all pipelines are created
+	//    in a single batch call to avoid potential driver issues with module
+	//    handle reuse between iterations (observed on MoltenVK/macOS).
 	struct {
 		const uint32_t *code;
 		size_t size;
@@ -290,6 +293,19 @@ create_pipeline_resources(struct sim_display_processor *sdp, int32_t target_form
 	    {sim_display_shaders_anaglyph_frag, sizeof(sim_display_shaders_anaglyph_frag), "Anaglyph"},
 	    {sim_display_shaders_blend_frag, sizeof(sim_display_shaders_blend_frag), "Blend"},
 	};
+
+	// Create all fragment shader modules upfront (keep alive until all pipelines are created)
+	VkShaderModule frag_modules[3] = {VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
+	for (int i = 0; i < 3; i++) {
+		ret = create_shader_module(vk, frag_shaders[i].code, frag_shaders[i].size, &frag_modules[i]);
+		if (ret != VK_SUCCESS) {
+			U_LOG_E("sim_display: Failed to create %s fragment shader: %d", frag_shaders[i].name, ret);
+			for (int j = 0; j < i; j++)
+				vk->vkDestroyShaderModule(vk->device, frag_modules[j], NULL);
+			vk->vkDestroyShaderModule(vk->device, vert_module, NULL);
+			return false;
+		}
+	}
 
 	VkPipelineVertexInputStateCreateInfo vertex_input = {
 	    .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
@@ -337,34 +353,26 @@ create_pipeline_resources(struct sim_display_processor *sdp, int32_t target_form
 	    .pDynamicStates = dynamic_states,
 	};
 
+	// Build all 3 pipeline create infos with their own stage arrays
+	VkPipelineShaderStageCreateInfo all_stages[3][2];
+	VkGraphicsPipelineCreateInfo pipeline_infos[3];
 	for (int i = 0; i < 3; i++) {
-		VkShaderModule frag_module = VK_NULL_HANDLE;
-		ret = create_shader_module(vk, frag_shaders[i].code, frag_shaders[i].size, &frag_module);
-		if (ret != VK_SUCCESS) {
-			U_LOG_E("sim_display: Failed to create %s fragment shader: %d", frag_shaders[i].name, ret);
-			vk->vkDestroyShaderModule(vk->device, vert_module, NULL);
-			return false;
-		}
-
-		VkPipelineShaderStageCreateInfo stages[2] = {
-		    {
-		        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-		        .stage = VK_SHADER_STAGE_VERTEX_BIT,
-		        .module = vert_module,
-		        .pName = "main",
-		    },
-		    {
-		        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-		        .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
-		        .module = frag_module,
-		        .pName = "main",
-		    },
+		all_stages[i][0] = (VkPipelineShaderStageCreateInfo){
+		    .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+		    .stage = VK_SHADER_STAGE_VERTEX_BIT,
+		    .module = vert_module,
+		    .pName = "main",
 		};
-
-		VkGraphicsPipelineCreateInfo pipeline_info = {
+		all_stages[i][1] = (VkPipelineShaderStageCreateInfo){
+		    .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+		    .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+		    .module = frag_modules[i],
+		    .pName = "main",
+		};
+		pipeline_infos[i] = (VkGraphicsPipelineCreateInfo){
 		    .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
 		    .stageCount = 2,
-		    .pStages = stages,
+		    .pStages = all_stages[i],
 		    .pVertexInputState = &vertex_input,
 		    .pInputAssemblyState = &input_assembly,
 		    .pViewportState = &viewport_state,
@@ -376,19 +384,21 @@ create_pipeline_resources(struct sim_display_processor *sdp, int32_t target_form
 		    .renderPass = sdp->render_pass,
 		    .subpass = 0,
 		};
-
-		ret = vk->vkCreateGraphicsPipelines(vk->device, VK_NULL_HANDLE, 1, &pipeline_info, NULL,
-		                                     &sdp->pipelines[i]);
-		vk->vkDestroyShaderModule(vk->device, frag_module, NULL);
-
-		if (ret != VK_SUCCESS) {
-			U_LOG_E("sim_display: Failed to create %s pipeline: %d", frag_shaders[i].name, ret);
-			vk->vkDestroyShaderModule(vk->device, vert_module, NULL);
-			return false;
-		}
 	}
 
+	// Create all 3 pipelines in a single batch call
+	ret = vk->vkCreateGraphicsPipelines(vk->device, VK_NULL_HANDLE, 3, pipeline_infos, NULL, sdp->pipelines);
+
+	// Destroy all shader modules now that pipelines are created
+	for (int i = 0; i < 3; i++)
+		vk->vkDestroyShaderModule(vk->device, frag_modules[i], NULL);
 	vk->vkDestroyShaderModule(vk->device, vert_module, NULL);
+
+	if (ret != VK_SUCCESS) {
+		U_LOG_E("sim_display: Failed to create pipelines: %d", ret);
+		return false;
+	}
+
 
 	// 6. Create sampler (linear filtering, clamp to edge)
 	VkSamplerCreateInfo sampler_info = {

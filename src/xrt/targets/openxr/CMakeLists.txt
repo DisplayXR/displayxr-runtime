@@ -64,14 +64,16 @@ else()
 endif()
 
 if(APPLE)
-	# macOS: export only the negotiate symbol using linker flags.
+	# macOS: export negotiate symbol + sim_display hot-reload symbol.
 	# GNU ld version scripts are not supported by the macOS linker.
+	# sim_display_set_output_mode is resolved via dlsym() by test apps
+	# for live mode switching (SBS/anaglyph/blend) without restart.
 	set_property(
 		TARGET ${RUNTIME_TARGET}
 		APPEND_STRING
 		PROPERTY
 			LINK_FLAGS
-			" -Wl,-exported_symbol,_xrNegotiateLoaderRuntimeInterface"
+			" -Wl,-exported_symbol,_xrNegotiateLoaderRuntimeInterface -Wl,-exported_symbol,_sim_display_set_output_mode"
 		)
 elseif(NOT WIN32)
 	# Force the main "negotiate" symbol's inclusion
