@@ -312,9 +312,16 @@ ipc_try_get_sr_view_poses(struct ipc_server *s,
 			                            stereo_state.disp_ipd_factor,
 			                            stereo_state.disp_parallax_factor,
 			                            &adj_left, &adj_right);
-			// perspective_factor = 1.0 in display mode (no scaling)
+			// Scale screen by m2v (meters-to-virtual)
 			kooima_h = stereo_state.disp_vHeight;
 			kooima_w = screen_width_m * (kooima_h / screen_height_m);
+			// Scale eye by perspective_factor * m2v to match in-process path
+			// (display3d_view.c line 252). With perspective=1.0 and both eye
+			// and screen scaled by m2v, the m2v cancels in the Kooima FOV
+			// but correctly scales the head-relative view positions.
+			float m2v = kooima_h / screen_height_m;
+			adj_left.x *= m2v; adj_left.y *= m2v; adj_left.z *= m2v;
+			adj_right.x *= m2v; adj_right.y *= m2v; adj_right.z *= m2v;
 		}
 
 		out_poses[0].position = adj_left;
