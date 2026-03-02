@@ -15,8 +15,11 @@
 #include "sim_display_interface.h"
 
 #include "xrt/xrt_display_processor_d3d11.h"
+#include "xrt/xrt_display_metrics.h"
 
+#include "util/u_debug.h"
 #include "util/u_logging.h"
+#include "os/os_time.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -25,6 +28,8 @@
 
 #include <cstdlib>
 #include <cstring>
+
+DEBUG_GET_ONCE_FLOAT_OPTION(sim_display_nominal_z_m_d3d11, "SIM_DISPLAY_NOMINAL_Z_M", 0.60f)
 
 
 // Fullscreen quad vertex shader (4 vertices, triangle strip via SV_VertexID)
@@ -87,6 +92,12 @@ struct sim_display_processor_d3d11_impl
 	ID3D11VertexShader *vs;
 	ID3D11PixelShader *ps_shaders[3]; //!< One per output mode (SBS, anaglyph, blend)
 	ID3D11SamplerState *sampler;
+
+	//! Nominal viewer parameters for faked eye positions.
+	float ipd_m;
+	float nominal_x_m;
+	float nominal_y_m;
+	float nominal_z_m;
 };
 
 static inline struct sim_display_processor_d3d11_impl *
@@ -153,6 +164,21 @@ sim_dp_d3d11_process_stereo(struct xrt_display_processor_d3d11 *xdp,
 	ctx->PSSetShaderResources(0, 1, &null_srv);
 }
 
+
+static bool
+sim_dp_d3d11_get_predicted_eye_positions(struct xrt_display_processor_d3d11 *xdp,
+                                          struct xrt_eye_pair *out_eye_pair)
+{
+	struct sim_display_processor_d3d11_impl *sdp = sim_dp_d3d11(xdp);
+	float half_ipd = sdp->ipd_m / 2.0f;
+
+	out_eye_pair->left = {sdp->nominal_x_m - half_ipd, sdp->nominal_y_m, sdp->nominal_z_m};
+	out_eye_pair->right = {sdp->nominal_x_m + half_ipd, sdp->nominal_y_m, sdp->nominal_z_m};
+	out_eye_pair->timestamp_ns = os_monotonic_get_ns();
+	out_eye_pair->valid = true;
+	out_eye_pair->is_tracking = false; // Nominal, not real tracking
+	return true;
+}
 
 static void
 sim_dp_d3d11_destroy(struct xrt_display_processor_d3d11 *xdp)
@@ -226,6 +252,13 @@ sim_display_processor_d3d11_create(enum sim_display_output_mode mode,
 
 	sdp->base.destroy = sim_dp_d3d11_destroy;
 	sdp->base.process_stereo = sim_dp_d3d11_process_stereo;
+	sdp->base.get_predicted_eye_positions = sim_dp_d3d11_get_predicted_eye_positions;
+
+	// Nominal viewer parameters (same defaults as sim_display_hmd_create)
+	sdp->ipd_m = 0.06f;
+	sdp->nominal_x_m = 0.0f;
+	sdp->nominal_y_m = 0.1f;
+	sdp->nominal_z_m = debug_get_float_option_sim_display_nominal_z_m_d3d11();
 
 	ID3D11Device *device = static_cast<ID3D11Device *>(d3d11_device);
 
@@ -293,4 +326,25 @@ sim_display_processor_d3d11_create(enum sim_display_output_mode mode,
 
 	*out_xdp = &sdp->base;
 	return XRT_SUCCESS;
+}
+
+
+/*
+ *
+ * Factory function — matches xrt_dp_factory_d3d11_fn_t signature.
+ *
+ */
+
+extern "C" xrt_result_t
+sim_display_dp_factory_d3d11(void *d3d11_device,
+                              void *d3d11_context,
+                              void *window_handle,
+                              struct xrt_display_processor_d3d11 **out_xdp)
+{
+	(void)d3d11_context;
+	(void)window_handle;
+
+	enum sim_display_output_mode mode = sim_display_get_output_mode();
+
+	return sim_display_processor_d3d11_create(mode, d3d11_device, out_xdp);
 }

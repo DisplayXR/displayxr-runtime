@@ -294,10 +294,15 @@ out:
 				        sd_mode == SIM_DISPLAY_OUTPUT_ANAGLYPH ? "Anaglyph" : "Blend",
 				        sd_info.display_pixel_width, sd_info.display_pixel_height);
 
-				// Set sim_display factory (only if Leia SR didn't already set one)
+				// Set sim_display factories (only if Leia SR didn't already set them)
 				if (xsysc->info.dp_factory_vk == NULL) {
 					xsysc->info.dp_factory_vk = (void *)sim_display_dp_factory_vk;
 				}
+#ifdef XRT_OS_WINDOWS
+				if (xsysc->info.dp_factory_d3d11 == NULL) {
+					xsysc->info.dp_factory_d3d11 = (void *)sim_display_dp_factory_d3d11;
+				}
+#endif
 			}
 		}
 
