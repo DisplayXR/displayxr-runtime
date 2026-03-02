@@ -379,23 +379,13 @@ static void OpenLoadDialog() {
     if (flags & NSEventModifierFlagShift) {
         g_input.stereo.ipdFactor += delta * 0.5f;
         if (g_input.stereo.ipdFactor < 0.0f) g_input.stereo.ipdFactor = 0.0f;
-        if (g_input.stereo.ipdFactor > 5.0f) g_input.stereo.ipdFactor = 5.0f;
-    } else if (flags & NSEventModifierFlagControl) {
-        g_input.stereo.parallaxFactor += delta;
-    } else if (flags & NSEventModifierFlagOption) {
-        if (g_input.cameraMode) {
-            g_input.stereo.invConvergenceDistance += delta * 0.5f;
-        } else {
-            g_input.stereo.perspectiveFactor += delta * 0.5f;
-        }
+        if (g_input.stereo.ipdFactor > 1.0f) g_input.stereo.ipdFactor = 1.0f;
+        g_input.stereo.parallaxFactor += delta * 0.5f;
+        if (g_input.stereo.parallaxFactor < 0.0f) g_input.stereo.parallaxFactor = 0.0f;
+        if (g_input.stereo.parallaxFactor > 1.0f) g_input.stereo.parallaxFactor = 1.0f;
     } else {
-        if (g_input.cameraMode) {
-            g_input.stereo.zoomFactor += delta * 0.5f;
-            if (g_input.stereo.zoomFactor < 0.1f) g_input.stereo.zoomFactor = 0.1f;
-        } else {
-            g_input.stereo.scaleFactor += delta * 0.5f;
-            if (g_input.stereo.scaleFactor < 0.1f) g_input.stereo.scaleFactor = 0.1f;
-        }
+        g_input.stereo.scaleFactor += delta * 0.5f;
+        if (g_input.stereo.scaleFactor < 0.1f) g_input.stereo.scaleFactor = 0.1f;
     }
 }
 
@@ -1352,10 +1342,10 @@ int main() {
                         "Eye R: (%.3f, %.3f, %.3f)\n"
                         "Camera: (%.2f, %.2f, %.2f)\n"
                         "Fwd: (%.3f, %.3f, %.3f)\n"
-                        "IPD: %.2f  Parallax: %.2f\n"
-                        "Persp: %.2f  Scale: %.2f\n"
+                        "IPD: %.2f  Parallax: %.2f  Scale: %.2f\n"
                         "\nL=Load  WASD=Move  DblClick=Teleport\n"
-                        "V=2D/3D  Tab=HUD  1/2/3=Output  ESC=Quit",
+                        "Scroll=Scale  Shift+Scroll=IPD+Parallax\n"
+                        "V=2D/3D  Tab=HUD  Space=Reset  ESC=Quit",
                         xr.systemName, (int)xr.sessionState,
                         g_input.displayMode3D ? "3D" : "2D", g_currentOutputMode,
                         sceneInfo,
@@ -1369,8 +1359,20 @@ int main() {
                         -sinf(g_input.pitch),
                         -cosf(g_input.pitch) * cosf(g_input.yaw),
                         g_input.stereo.ipdFactor, g_input.stereo.parallaxFactor,
-                        g_input.stereo.perspectiveFactor, g_input.stereo.scaleFactor];
+                        g_input.stereo.scaleFactor];
                     g_hudView.hudText = text;
+                    // Auto-size HUD to fit text
+                    NSDictionary *attrs = @{
+                        NSFontAttributeName: [NSFont monospacedSystemFontOfSize:10 weight:NSFontWeightRegular]
+                    };
+                    NSRect textBounds = [text boundingRectWithSize:NSMakeSize(400, CGFLOAT_MAX)
+                                         options:NSStringDrawingUsesLineFragmentOrigin
+                                         attributes:attrs];
+                    CGFloat pad = 16.0;
+                    NSRect hudFrame = NSMakeRect(8, 8,
+                        ceilf(textBounds.size.width + pad),
+                        ceilf(textBounds.size.height + pad));
+                    [g_hudView setFrame:hudFrame];
                     [g_hudView setNeedsDisplay:YES];
                     [g_hudView setHidden:NO];
                 } else if (g_hudView != nil) {

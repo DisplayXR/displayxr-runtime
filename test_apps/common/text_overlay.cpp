@@ -269,12 +269,8 @@ std::wstring FormatStereoParams(float ipdFactor, float parallaxFactor,
     float perspectiveFactor, float scaleFactor, bool cameraMode) {
     std::wostringstream oss;
     oss << std::fixed << std::setprecision(2);
-    oss << L"IPD: " << ipdFactor << L"  Parallax: " << parallaxFactor << L"\n";
-    if (cameraMode) {
-        oss << L"Conv: " << perspectiveFactor << L"  Zoom: " << scaleFactor;
-    } else {
-        oss << L"Persp: " << perspectiveFactor << L"  Scale: " << scaleFactor;
-    }
+    oss << L"IPD: " << ipdFactor << L"  Parallax: " << parallaxFactor
+        << L"  Scale: " << scaleFactor;
     return oss.str();
 }
 
@@ -286,20 +282,12 @@ std::wstring FormatScaleInfo(float scaleX, float scaleY) {
 }
 
 std::wstring FormatHelpText(bool simDisplayAvailable, bool cameraMode) {
-    const wchar_t* scrollLabel = cameraMode ? L"Scroll=Zoom" : L"Scroll=Scale";
-    const wchar_t* perspLabel = cameraMode ? L"Alt=Conv" : L"Alt=Persp";
     if (simDisplayAvailable) {
-        std::wstring s = L"WASD/QE=Move  Drag=Look  Space=Reset\n";
-        s += scrollLabel;
-        s += L"  Shift=IPD  Ctrl=Parallax  ";
-        s += perspLabel;
-        s += L"\nC=Mode  V=2D/3D  T=EyeMode  1/2/3=Output  Tab=HUD  F11=Full  ESC=Quit";
-        return s;
+        return L"WASD/QE=Move  Drag=Look  Space=Reset\n"
+               L"Scroll=Scale  Shift+Scroll=IPD+Parallax\n"
+               L"V=2D/3D  T=EyeMode  1/2/3=Output  Tab=HUD  F11=Full  ESC=Quit";
     }
-    std::wstring s = L"WASD/QE=Move  Drag=Look  Space=Reset\n";
-    s += scrollLabel;
-    s += L"  Shift=IPD  Ctrl=Parallax  ";
-    s += perspLabel;
-    s += L"\nC=Mode  V=2D/3D  T=EyeMode  Tab=HUD  F11=Full  ESC=Quit";
-    return s;
+    return L"WASD/QE=Move  Drag=Look  Space=Reset\n"
+           L"Scroll=Scale  Shift+Scroll=IPD+Parallax\n"
+           L"V=2D/3D  T=EyeMode  Tab=HUD  F11=Full  ESC=Quit";
 }

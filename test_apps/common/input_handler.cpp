@@ -109,36 +109,17 @@ bool UpdateInputState(InputState& state, UINT msg, WPARAM wParam, LPARAM lParam)
         int zDelta = GET_WHEEL_DELTA_WPARAM(wParam);
         float factor = (zDelta > 0) ? 1.1f : (1.0f / 1.1f);
         bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
-        bool ctrl  = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
-        bool alt   = (GetKeyState(VK_MENU) & 0x8000) != 0;
         if (shift) {
             state.stereo.ipdFactor *= factor;
             if (state.stereo.ipdFactor < 0.0f) state.stereo.ipdFactor = 0.0f;
             if (state.stereo.ipdFactor > 1.0f) state.stereo.ipdFactor = 1.0f;
-        } else if (ctrl) {
             state.stereo.parallaxFactor *= factor;
             if (state.stereo.parallaxFactor < 0.0f) state.stereo.parallaxFactor = 0.0f;
             if (state.stereo.parallaxFactor > 1.0f) state.stereo.parallaxFactor = 1.0f;
-        } else if (alt) {
-            if (state.cameraMode) {
-                state.stereo.invConvergenceDistance *= factor;
-                if (state.stereo.invConvergenceDistance < 0.1f) state.stereo.invConvergenceDistance = 0.1f;
-                if (state.stereo.invConvergenceDistance > 10.0f) state.stereo.invConvergenceDistance = 10.0f;
-            } else {
-                state.stereo.perspectiveFactor *= factor;
-                if (state.stereo.perspectiveFactor < 0.1f) state.stereo.perspectiveFactor = 0.1f;
-                if (state.stereo.perspectiveFactor > 10.0f) state.stereo.perspectiveFactor = 10.0f;
-            }
         } else {
-            if (state.cameraMode) {
-                state.stereo.zoomFactor *= factor;
-                if (state.stereo.zoomFactor < 0.1f) state.stereo.zoomFactor = 0.1f;
-                if (state.stereo.zoomFactor > 10.0f) state.stereo.zoomFactor = 10.0f;
-            } else {
-                state.stereo.scaleFactor *= factor;
-                if (state.stereo.scaleFactor < 0.1f) state.stereo.scaleFactor = 0.1f;
-                if (state.stereo.scaleFactor > 10.0f) state.stereo.scaleFactor = 10.0f;
-            }
+            state.stereo.scaleFactor *= factor;
+            if (state.stereo.scaleFactor < 0.1f) state.stereo.scaleFactor = 0.1f;
+            if (state.stereo.scaleFactor > 10.0f) state.stereo.scaleFactor = 10.0f;
         }
         return true;
     }
