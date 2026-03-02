@@ -56,6 +56,10 @@ struct InputState {
     float teleportMouseX = 0.0f;
     float teleportMouseY = 0.0f;
 
+    // Teleport animation
+    bool teleportAnimating = false;
+    float teleportTargetX = 0, teleportTargetY = 0, teleportTargetZ = 0;
+
     // Parallax toggle state
     bool parallaxEnabled = true;
 

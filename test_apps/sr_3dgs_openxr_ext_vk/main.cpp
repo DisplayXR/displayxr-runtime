@@ -549,10 +549,11 @@ static void RenderThreadFunc(
                                 std::lock_guard<std::mutex> sceneLock(g_sceneMutex);
                                 if (g_gsRenderer.pickGaussian(rayOrigin, rayDir, hitPos)) {
                                     std::lock_guard<std::mutex> inputLock(g_inputMutex);
-                                    g_inputState.cameraPosX = hitPos[0];
-                                    g_inputState.cameraPosY = hitPos[1];
-                                    g_inputState.cameraPosZ = hitPos[2];
-                                    LOG_INFO("Teleported to (%.3f, %.3f, %.3f)", hitPos[0], hitPos[1], hitPos[2]);
+                                    g_inputState.teleportAnimating = true;
+                                    g_inputState.teleportTargetX = hitPos[0];
+                                    g_inputState.teleportTargetY = hitPos[1];
+                                    g_inputState.teleportTargetZ = hitPos[2];
+                                    LOG_INFO("Teleporting to (%.3f, %.3f, %.3f)", hitPos[0], hitPos[1], hitPos[2]);
                                 }
                             }
                         }

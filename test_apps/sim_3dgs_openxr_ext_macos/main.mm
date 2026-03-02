@@ -96,6 +96,10 @@ struct InputState {
     bool loadRequested = false;
     bool teleportRequested = false;
     float teleportMouseX = 0.0f, teleportMouseY = 0.0f; // logical points
+
+    // Teleport animation
+    bool teleportAnimating = false;
+    float teleportTargetX = 0, teleportTargetY = 0, teleportTargetZ = 0;
 };
 
 // ============================================================================
@@ -225,6 +229,7 @@ static void UpdateCameraMovement(InputState& input, float dt, float displayHeigh
         input.stereo = StereoParams();
         input.stereo.virtualDisplayHeight = 0.24f;
         input.resetViewRequested = false;
+        input.teleportAnimating = false;
         return;
     }
 
@@ -247,6 +252,19 @@ static void UpdateCameraMovement(InputState& input, float dt, float displayHeigh
     if (input.keyA) { input.cameraPosX -= rtX*d;  input.cameraPosY -= rtY*d;  input.cameraPosZ -= rtZ*d; }
     if (input.keyE) { input.cameraPosX += upX*d;  input.cameraPosY += upY*d;  input.cameraPosZ += upZ*d; }
     if (input.keyQ) { input.cameraPosX -= upX*d;  input.cameraPosY -= upY*d;  input.cameraPosZ -= upZ*d; }
+
+    // Teleport animation: exponential ease-out
+    if (input.teleportAnimating) {
+        float t = 1.0f - expf(-10.0f * dt); // ~90% in 0.23s
+        input.cameraPosX += (input.teleportTargetX - input.cameraPosX) * t;
+        input.cameraPosY += (input.teleportTargetY - input.cameraPosY) * t;
+        input.cameraPosZ += (input.teleportTargetZ - input.cameraPosZ) * t;
+        float dx = input.teleportTargetX - input.cameraPosX;
+        float dy = input.teleportTargetY - input.cameraPosY;
+        float dz = input.teleportTargetZ - input.cameraPosZ;
+        if (dx*dx + dy*dy + dz*dz < 1e-8f)
+            input.teleportAnimating = false;
+    }
 }
 
 // ============================================================================
@@ -1243,11 +1261,11 @@ int main() {
 
                             float hitPos[3];
                             if (g_gsRenderer.pickGaussian(rayOrigin, rayDir, hitPos)) {
-                                g_input.cameraPosX = hitPos[0];
-                                g_input.cameraPosY = hitPos[1];
-                                g_input.cameraPosZ = hitPos[2];
-                                cameraPose.position = {hitPos[0], hitPos[1], hitPos[2]};
-                                LOG_INFO("Teleported to (%.3f, %.3f, %.3f)", hitPos[0], hitPos[1], hitPos[2]);
+                                g_input.teleportAnimating = true;
+                                g_input.teleportTargetX = hitPos[0];
+                                g_input.teleportTargetY = hitPos[1];
+                                g_input.teleportTargetZ = hitPos[2];
+                                LOG_INFO("Teleporting to (%.3f, %.3f, %.3f)", hitPos[0], hitPos[1], hitPos[2]);
                             }
                         } else if (g_input.teleportRequested) {
                             g_input.teleportRequested = false; // consume without Kooima

@@ -227,6 +227,7 @@ void UpdateCameraMovement(InputState& state, float deltaTime, float displayHeigh
             state.cameraPosZ = 0.0f;
         }
         state.resetViewRequested = false;
+        state.teleportAnimating = false;
         return;
     }
 
@@ -280,6 +281,19 @@ void UpdateCameraMovement(InputState& state, float deltaTime, float displayHeigh
         state.cameraPosX -= up.x * moveSpeed * deltaTime;
         state.cameraPosY -= up.y * moveSpeed * deltaTime;
         state.cameraPosZ -= up.z * moveSpeed * deltaTime;
+    }
+
+    // Teleport animation: exponential ease-out
+    if (state.teleportAnimating) {
+        float t = 1.0f - expf(-10.0f * deltaTime); // ~90% in 0.23s
+        state.cameraPosX += (state.teleportTargetX - state.cameraPosX) * t;
+        state.cameraPosY += (state.teleportTargetY - state.cameraPosY) * t;
+        state.cameraPosZ += (state.teleportTargetZ - state.cameraPosZ) * t;
+        float dx = state.teleportTargetX - state.cameraPosX;
+        float dy = state.teleportTargetY - state.cameraPosY;
+        float dz = state.teleportTargetZ - state.cameraPosZ;
+        if (dx*dx + dy*dy + dz*dz < 1e-8f)
+            state.teleportAnimating = false;
     }
 }
 
