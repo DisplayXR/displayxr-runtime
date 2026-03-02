@@ -6,12 +6,15 @@ This project uses **GitHub Pull Requests** (not GitLab Merge Requests) for all c
 
 ### Workflow
 
-1. Fork this repository
-2. Create a feature branch off `main`
-3. Make your changes and commit
-4. Submit a pull request targeting `main`
-5. Both CI jobs (Windows + macOS) must pass
-6. A maintainer will review your PR
+**Collaborators** (repo write access): create a feature branch off `main` and submit a PR.
+
+**External contributors**: fork the repository, branch off `main`, and submit a PR from your fork.
+
+1. Create a feature branch off `main` (e.g., `feature/my-change`)
+2. Make your changes and commit
+3. Submit a pull request targeting `main`
+4. Both CI jobs (Windows + macOS) must pass
+5. A maintainer will review your PR
 
 ### Code Style
 
