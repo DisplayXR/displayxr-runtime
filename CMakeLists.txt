@@ -4,7 +4,7 @@
 cmake_minimum_required(VERSION 3.22)
 project(
 	XRT
-	VERSION 25.0.0
+	VERSION 25.1.0
 	LANGUAGES C CXX
 	DESCRIPTION "Monado(XRT) by Collabora et al"
 	)
