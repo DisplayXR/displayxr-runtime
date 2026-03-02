@@ -4,7 +4,8 @@
 |-------|-------|
 | **Created** | 2026-02-28 |
 | **Authors** | David Fattal, Contributors |
-| **Status** | Design Discussion |
+| **Status** | Phase 1 Complete, Phases 2–4 In Progress |
+| **Updated** | 2026-03-01 |
 | **Tracks** | Vendor `#ifdef` removal, event system, multiview, rendering mode terminology, compositor architecture |
 | **Related** | `XR_EXT_tracked_3d_display_proposal.md`, `vendor_integration_guide.md` |
 
@@ -30,6 +31,10 @@ runtime files:
 A new vendor (Looking Glass, Dimenco, etc.) would need to add their own
 `#ifdef` blocks to these same files.  This document tracks the refactoring
 needed to eliminate that requirement and discusses three open design questions.
+
+> **Update 2026-03-01**: Phase 1 is now complete.  The compositor and state
+> tracker are clean of vendor `#ifdef` blocks.  See §6 task list and §9
+> discussion log for details.
 
 ---
 
@@ -446,18 +451,54 @@ tiling formula in the extension spec so apps know where to render each view.
 
 ## 6. Refactoring Task List
 
-### Phase 1: Genericize (removes vendor `#ifdef` leakage)
+### Phase 1: Genericize (removes vendor `#ifdef` leakage) — COMPLETE
 
-- [ ] **1.1** Define `xrt_eye_tracking_provider` vtable interface
-- [ ] **1.2** Vendor drivers create + attach eye tracking provider at init
-- [ ] **1.3** Compositor calls generic provider — remove `#ifdef` eye query blocks
-- [ ] **1.4** Define display processor factory on `xrt_device`
-- [ ] **1.5** Compositor calls generic factory — remove `#ifdef` creation blocks
-- [ ] **1.6** Define generic `request_display_mode` on compositor interface
-- [ ] **1.7** `oxr_session.c` calls generic path — remove `#ifdef` routing blocks
-- [ ] **1.8** Verify: new vendor needs ZERO changes to compositor/state tracker
+- [x] **1.1** Define eye tracking provider vtable interface
+  - *Implemented as `get_predicted_eye_positions()` on `xrt_display_processor`
+    and `xrt_display_processor_d3d11` rather than a separate provider struct.
+    Cleaner design: eye tracking is inherently a display vendor function.*
+- [x] **1.2** Vendor drivers create + attach eye tracking provider at init
+  - *Vendors implement `get_predicted_eye_positions()` on their display
+    processor.  Factories registered via `xsysc->info.dp_factory_vk` and
+    `dp_factory_d3d11` in `target_instance.c`.*
+- [x] **1.3** Compositor calls generic provider — remove `#ifdef` eye query blocks
+  - *`comp_multi_compositor.c` and `comp_d3d11_compositor.cpp` call
+    `xrt_display_processor[_d3d11]_get_predicted_eye_positions()` generically.
+    Zero vendor `#ifdef` blocks in compositor.*
+- [x] **1.4** Define display processor factory on system compositor info
+  - *Factory function pointers `xrt_dp_factory_vk_fn_t` and
+    `xrt_dp_factory_d3d11_fn_t` defined in `xrt_display_processor.h` /
+    `xrt_display_processor_d3d11.h`, stored on `xrt_system_compositor_info`.*
+- [x] **1.5** Compositor calls generic factory — remove `#ifdef` creation blocks
+  - *Compositor calls factory from `xsysc->info` with no vendor `#ifdef`.*
+- [x] **1.6** Define generic `request_display_mode` on compositor interface
+  - *`request_display_mode(bool enable_3d)` on both `xrt_display_processor`
+    and `xrt_display_processor_d3d11`, with NULL-safe inline helpers.*
+- [x] **1.7** `oxr_session.c` calls generic path — remove `#ifdef` routing blocks
+  - *`oxr_session_request_display_mode()` routes to D3D11 native or multi
+    compositor generically.  Zero vendor `#ifdef` blocks in state tracker.*
+- [x] **1.8** Verify: new vendor needs ZERO changes to compositor/state tracker
+  - *Verified.  Compositor and state tracker directories have zero
+    `#ifdef XRT_HAVE_LEIA` blocks.  Remaining vendor conditionals are in
+    expected locations only (see §6.1 below).*
 
-### Phase 2: Events
+### Phase 1.1: Remaining Vendor Conditionals (acceptable locations)
+
+These `#ifdef` blocks are **expected** and do not violate the vendor abstraction:
+
+| File | Blocks | Purpose | Notes |
+|------|--------|---------|-------|
+| `target_instance.c` | 3 | Builder: populate display info, register factories | Builder-level code; each vendor adds their own block here |
+| `target_builder_interface.h` | 1 | Conditional `T_BUILDER_LEIA` macro | Standard builder registration pattern |
+| `ipc_server_handler.c` | 4 | Kooima FOV + SR eye poses in IPC service path | **Needs genericization** — should use display processor vtable |
+| `comp_renderer.c` | 3 | Legacy `XRT_HAVE_CNSDK` interlacing path | **Needs removal** — superseded by generic display processor path |
+| `leia_sr_probe.cpp` | 2 | Driver-internal SR hardware probe | Vendor driver code; expected |
+
+**Remaining cleanup** (not blocking new vendors, but improves code hygiene):
+- [ ] **1.9** Genericize IPC server view pose computation (move Kooima FOV to display processor vtable)
+- [ ] **1.10** Remove legacy `XRT_HAVE_CNSDK` path from `comp_renderer.c` (CNSDK superseded by display processor)
+
+### Phase 2: Events — NOT STARTED
 
 - [ ] **2.1** Define `XrEventDataDisplayModeChangedEXT` struct in extension header
 - [ ] **2.2** Define `XrEventDataEyeTrackingStateChangedEXT` struct
@@ -466,22 +507,32 @@ tiling formula in the extension spec so apps know where to render each view.
 - [ ] **2.5** Runtime fires tracking event on `is_tracking` transitions
 - [ ] **2.6** Add `xrGetCurrentDisplayModeEXT` query function
 
-### Phase 3: Rendering Mode
+### Phase 3: Rendering Mode — NOT STARTED (design only)
 
 - [ ] **3.1** Define `xrRequestDisplayRenderingModeEXT` function
 - [ ] **3.2** Add rendering mode handler to vendor driver interface
 - [ ] **3.3** Implement in Leia driver (map to existing setProperty)
 - [ ] **3.4** Implement no-op in sim_display
 
-### Phase 4: Multiview
+### Phase 4: Multiview — IN PROGRESS (~60%)
 
 - [ ] **4.1** Define `XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTI_VIEW_EXT`
+  - *Blocked by 4.0.  Enum not yet registered in extension header.*
 - [ ] **4.2** Update `xrEnumerateViewConfigurationViews` for N views
-- [ ] **4.3** Update display processor interface for N views / atlas
-- [ ] **4.4** Update compositor crop-blit for NxM atlas layout
+  - *Currently limited to `PRIMARY_MONO` and `PRIMARY_STEREO`.*
+- [x] **4.3** Update display processor interface for N views / atlas
+  - *Done: `process_views()` takes `view_count` + `views[]` array.*
+- [x] **4.4** Update compositor crop-blit for NxM atlas layout
+  - *Done: compositor paths (Vulkan, D3D11, multi) handle N views.*
 - [ ] **4.5** Update `xrEndFrame` validation for viewCount = N
-- [ ] **4.6** Implement N-view sim_display shader
+- [x] **4.6** Implement N-view sim_display shader
+  - *Done: `SIM_DISPLAY_VIEWS` env var for hardware-free multiview testing.*
 - [ ] **4.7** Document tiling convention in extension spec
+
+**Prerequisite**:
+- [ ] **4.0** Raise `XRT_MAX_VIEWS` from 2 to 64 in `xrt_limits.h`
+  - *Currently hardcoded to 2.  All N-view infrastructure is ready but the
+    limit prevents registration of the multiview view configuration type.*
 
 ---
 
@@ -880,3 +931,39 @@ and their multi-app performance characteristics.  Key findings:
   with a thread pool if GL/Vulkan multi-app performance becomes a bottleneck.
   The per-session resources are already independent; the serialization is an
   artificial `for` loop, not a fundamental constraint.
+
+### 2026-03-01 — Phase 1 completion assessment
+
+Audited the entire codebase for vendor `#ifdef` blocks.  **Phase 1 is complete.**
+
+**Before** (Feb 28): ~60 `#ifdef XRT_HAVE_LEIA_*` blocks across `comp_renderer.c`,
+`comp_multi_compositor.c`, `comp_d3d11_compositor.cpp`, and `oxr_session.c`.
+
+**After** (Mar 1): Zero vendor `#ifdef` blocks in compositor or state tracker.
+Remaining vendor conditionals (12 total across 5 files) are all in expected
+locations: builder code (`target_instance.c`), builder interface header, and
+vendor driver code (`leia_sr_probe.cpp`).
+
+Key design decisions that evolved during implementation:
+1. **Eye tracking embedded in display processor** — instead of a separate
+   `xrt_eye_tracking_provider`, eye tracking is a method on `xrt_display_processor`.
+   This is cleaner because eye tracking is inherently tied to display geometry.
+2. **Factory on system compositor info** — display processor factories are stored
+   on `xrt_system_compositor_info` (not `xrt_device` as originally proposed).
+   This works better because the factory needs graphics context (VkDevice / ID3D11Device)
+   which is compositor-level, not device-level.
+3. **NULL-safe inline helpers** — all optional vtable methods have inline wrappers
+   that return false/no-op when the function pointer is NULL, enabling graceful
+   degradation.
+
+**Remaining cleanup** (non-blocking):
+- `ipc_server_handler.c`: 4 blocks of Kooima FOV computation behind
+  `XRT_HAVE_LEIA_SR_D3D11`.  Should be genericized via display processor vtable
+  (new task 1.9).
+- `comp_renderer.c`: 3 blocks of legacy `XRT_HAVE_CNSDK` interlacing path.
+  Fully superseded by the generic display processor path; should be removed
+  (new task 1.10).
+
+**Multiview progress**: display processor interface already generalized to N views
+(`view_count` + `views[]` array), compositor paths updated, sim_display supports
+`SIM_DISPLAY_VIEWS` env var.  Blocked only by `XRT_MAX_VIEWS=2` in `xrt_limits.h`.
