@@ -5,8 +5,8 @@
 | **Created** | 2026-02-28 |
 | **Authors** | David Fattal, Contributors |
 | **Status** | Phase 1 Complete, Phases 2–4 In Progress |
-| **Updated** | 2026-03-01 |
-| **Tracks** | Vendor `#ifdef` removal, event system, multiview, rendering mode terminology, compositor architecture |
+| **Updated** | 2026-03-02 |
+| **Tracks** | Vendor `#ifdef` removal, event system, multiview, rendering mode terminology, compositor architecture, upstream contribution plan |
 | **Related** | `XR_EXT_tracked_3d_display_proposal.md`, `vendor_integration_guide.md` |
 
 ---
@@ -1050,3 +1050,159 @@ closely, with the SR SDK D3D12 weaver providing the display processing backend.
 - `src/xrt/drivers/leia/leia_display_processor_d3d12.cpp` — display processor impl
 - `xrt_display_processor_d3d12.h` — generic D3D12 display processor interface
 - Session routing in `oxr_session.c` for D3D12 apps (analogous to D3D11 routing)
+
+### 2026-03-02 — Upstream contribution plan and repo reorganization
+
+**Context**: The `LeiaInc/CNSDK-OpenXR` repo accumulated 2,720 commits on a
+single monolithic branch (`XR_EXT_session_target`).  A fresh repo
+`dfattal/openxr-3d-display` was created with:
+
+- `main` tracking upstream Monado HEAD (for syncing + submitting PRs)
+- `dev` containing all current work (identical to `XR_EXT_session_target`)
+- `cnsdk` preserved for reference (original Leia fork point)
+
+**Goal**: Extract self-contained features into clean topic branches off
+`upstream/main` for potential upstream Monado contribution.  Each branch should
+be <20 commits, follow Monado commit style, and represent one reviewable PR.
+
+#### Upstreamable features
+
+| Branch | Feature | Upstream value | Extraction effort |
+|--------|---------|---------------|-------------------|
+| `upstream/sim-display` | sim_display driver + builder + shaders | High — any runtime benefits from a fallback display device for development/testing | Medium — fairly self-contained under `drivers/sim_display/` + builder |
+| `upstream/display-processor` | `xrt_display_processor` abstraction + factory pattern | High — generic vendor interface, benefits Looking Glass, Dimenco, etc. | Medium — `xrt_display_processor.h`, factory registration, compositor integration |
+| `upstream/d3d11-native-compositor` | D3D11 native compositor module | Medium — useful for any Windows windowed runtime | High — large module with many dependencies |
+| `upstream/single-swapchain` | Single-swapchain / atlas rendering support | Medium — useful for any tiled/atlas rendering pipeline | Medium — compositor + state tracker changes |
+| `upstream/qwerty-input-helper` | Shared qwerty input builder utility | Low-medium — convenient shared utility for any driver needing keyboard input | Low — small isolated files |
+
+#### What stays in the fork only (not upstreamable)
+
+- **WebXR bridge** — experimental, macOS-specific, not planned for production
+- **3DGS test app** — application-level, not runtime infrastructure
+- **Spatial OS test app** — application-level
+- **Leia-specific driver** (`src/xrt/drivers/leia/`) — vendor glue tightly
+  coupled to SR SDK; the open-source glue code is fine to share but the driver
+  is only useful on Leia hardware
+- **Test apps** (`test_apps/sr_cube_*`) — product-specific test applications
+
+#### Extraction approach
+
+For each feature branch:
+
+```bash
+git checkout -b upstream/sim-display upstream/main    # branch off upstream Monado
+# Cherry-pick or rewrite the relevant commits cleanly
+# Ensure each commit builds independently
+# Follow Monado commit style: "area: Short description"
+```
+
+**Extraction order** (dependencies flow downward):
+
+1. **sim_display** — most self-contained, good first extraction to validate
+   the workflow.  No dependencies on other fork features.
+2. **Display processor abstraction** — core interface that other features
+   build on.  Includes `xrt_display_processor.h`, factory pattern, compositor
+   changes to call display processor generically.
+3. **Single-swapchain support** — depends on display processor for atlas
+   input.  Compositor changes for same-swapchain detection + crop-blit.
+4. **Qwerty input helper** — independent utility, can be extracted at any
+   time.  Small scope.
+5. **D3D11 native compositor** — largest extraction, depends on display
+   processor abstraction.  Includes `compositor/d3d11/`, window management,
+   session routing.
+
+#### Branch strategy going forward
+
+```
+dfattal/openxr-3d-display
+  main                              <-- tracks upstream Monado (fetch + merge)
+  dev                               <-- active development integration branch
+  upstream/sim-display              <-- clean extraction for Monado MR
+  upstream/display-processor        <-- clean extraction for Monado MR
+  upstream/single-swapchain         <-- clean extraction for Monado MR
+  upstream/qwerty-input-helper      <-- clean extraction for Monado MR
+  upstream/d3d11-native-compositor  <-- clean extraction for Monado MR
+  feature/d3d12-compositor          <-- future work (see D3D12 assessment above)
+
+LeiaInc/CNSDK-OpenXR                <-- stays active in parallel (existing CI + workflows)
+```
+
+New features develop on short-lived branches off `dev`, merge back when stable.
+Upstream extractions are separate clean branches off `main` (upstream Monado HEAD).
+
+#### GitHub Issues
+
+Six issues created on `dfattal/openxr-3d-display` tracking the remaining
+refactor and extension work:
+
+1. [Genericize IPC server view pose computation](https://github.com/dfattal/openxr-3d-display/issues/1) — task 1.9
+2. [Remove legacy XRT_HAVE_CNSDK interlacing path](https://github.com/dfattal/openxr-3d-display/issues/2) — task 1.10
+3. [Event system: display mode + eye tracking state changes](https://github.com/dfattal/openxr-3d-display/issues/3) — Phase 2
+4. [Vendor rendering mode API](https://github.com/dfattal/openxr-3d-display/issues/4) — Phase 3
+5. [Multiview support: raise XRT_MAX_VIEWS + register view config](https://github.com/dfattal/openxr-3d-display/issues/5) — Phase 4
+6. [D3D12 native compositor](https://github.com/dfattal/openxr-3d-display/issues/6) — future
+
+#### Merge conflict analysis: upstream Monado `main` → `dev`
+
+As of 2026-03-02, merging the 2,504 upstream Monado commits (between the
+`cnsdk` fork point and current `main`) into `dev` produces **43 content
+conflicts** across 41 files, plus 2 modify/delete conflicts.
+
+**Branch relationship**:
+
+```
+                    ┌── cnsdk (fork point + 3 commits)
+                    │
+6b493e296 ──────────┤
+(merge base)        │
+                    └── main (2,504 commits ahead = current upstream Monado)
+
+cnsdk ──────────────── dev (2,722 commits ahead = all current work)
+```
+
+`cnsdk` is a stale snapshot of Monado with 3 small Leia commits on top.
+`main` is current upstream Monado — 2,504 commits ahead of that fork point.
+
+**Conflict breakdown by area**:
+
+| Area | Files | Severity | Notes |
+|------|-------|----------|-------|
+| OpenXR state tracker (`oxr_*`) | 12 | Heavy | `oxr_session.c`, `oxr_objects.h`, `oxr_system.c` — core files we modified extensively for D3D11 routing, display mode, extension support |
+| Vulkan helpers (`vk_*`) | 5 | Medium | `vk_helpers.c/.h`, `vk_bundle_init.c` — our Metal/macOS additions collide with upstream Vulkan changes |
+| IPC server/client | 4 | Medium | `ipc_server_handler.c` + **modify/delete** on `proto.json` (upstream deleted, we modified) |
+| Compositor | 3 | Medium | `comp_renderer.c`, `null_compositor.c`, compositor CMakeLists |
+| Core includes (`xrt_*`) | 3 | Medium | `xrt_instance.h`, `xrt_session.h`, `xrt_openxr_config.h` — interface evolution |
+| Drivers | 3 | Low | `qwerty_device.c`, `android_sensors.c`, drivers CMakeLists |
+| Build system | 3 | Low | Root CMakeLists, CompilerFlags, targets CMakeLists |
+| Other | 2 | Tricky | `oxr_extension_support.h` **modify/delete** (upstream restructured, we added extensions), `p_prober.c` |
+
+**Modify/delete conflicts** (hardest to resolve):
+
+1. **`src/xrt/ipc/shared/proto.json`** — upstream deleted this file; we
+   modified it.  Need to understand how upstream replaced the IPC protocol
+   definition and port our additions to the new mechanism.
+2. **`src/xrt/state_trackers/oxr/oxr_extension_support.h`** — upstream deleted
+   or restructured; we added extension declarations.  Need to find where
+   upstream moved extension registration and add ours there.
+
+**Implication for the upstream contribution strategy**:
+
+A full merge of `main` into `dev` is feasible but would require significant
+manual conflict resolution (~43 files).  This reinforces the plan to extract
+features as **clean topic branches off `main`** rather than merging the entire
+`dev` history upstream:
+
+- Each `upstream/*` branch touches only the files relevant to that feature
+- Far fewer conflicts per branch (e.g., `upstream/sim-display` would conflict
+  only in `drivers/CMakeLists.txt` and `target_lists.c`, not 43 files)
+- Conflicts are resolved once per feature, against current upstream code
+- The `dev` branch continues independently — no need to rebase 2,722 commits
+
+If a full sync is ever desired (e.g., to pick up upstream bug fixes in `dev`),
+the recommended approach is:
+
+```bash
+git fetch upstream main
+git merge upstream/main dev    # resolve 43 conflicts once
+# Or: periodic smaller merges to keep conflict count manageable
+```
