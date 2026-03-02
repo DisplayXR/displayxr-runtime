@@ -967,3 +967,38 @@ Key design decisions that evolved during implementation:
 **Multiview progress**: display processor interface already generalized to N views
 (`view_count` + `views[]` array), compositor paths updated, sim_display supports
 `SIM_DISPLAY_VIEWS` env var.  Blocked only by `XRT_MAX_VIEWS=2` in `xrt_limits.h`.
+
+### 2026-03-02 — Vulkan weaver input format: SBS vs separate views
+
+Investigated what the SR SDK Vulkan weaver actually accepts and how it interacts
+with Monado's single-swapchain layout.
+
+**Finding**: The SR SDK Vulkan weaver (`setInputViewTexture`) supports **both**
+input modes via a simple convention:
+- `rightView != NULL` → separate per-eye views (`ubo.stereoViews = 0`), shader
+  samples left and right from two separate textures.
+- `rightView == NULL` → SBS mode (`ubo.stereoViews = 1`), shader samples both
+  eyes from the left texture at `UV` and `UV + (0.5, 0)`.
+
+Detection is at `vkweaver.cpp:1887`: `usingStereoViewTexture = (viewTextureViewRight == nullptr)`.
+Descriptor binding falls back to left view when right is NULL (`vkweaver.cpp:1223`).
+
+**Current Monado state**: After the single-swapchain refactor (commit `2c9ae6f56`),
+apps write both views as tiles to a single swapchain. The Leia Vulkan display
+processor sets `prefers_sbs_input = true`, so the compositor constructs an SBS
+intermediate and calls the weaver with `(sbs_view, VK_NULL_HANDLE)`. This is
+correct and produces correct output on hardware.
+
+**D3D11 comparison**: The D3D11 weaver (`leiasr_d3d11_set_input_texture`) was
+designed SBS-only from the start — consistent with the Vulkan SBS path.
+
+**Recommendation to SR SDK team**: If standardizing on one input mode, choose SBS
+for the Vulkan weaver to match D3D11. The single-swapchain layout makes SBS the
+natural zero-overhead format end-to-end (app → compositor → weaver).
+
+**sim_display stays on separate views**: sim_display's `prefers_sbs_input = false`
+is correct and should not change. Its per-eye shaders (anaglyph, alpha-blend)
+naturally consume separate views. Keeping both compositor paths exercised is
+valuable for future vendors whose weavers may prefer either format. The
+`prefers_sbs_input` flag on `xrt_display_processor` exists precisely for this
+flexibility.
