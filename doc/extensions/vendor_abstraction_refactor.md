@@ -5,7 +5,7 @@
 | **Created** | 2026-02-28 |
 | **Authors** | David Fattal, Contributors |
 | **Status** | Design Discussion |
-| **Tracks** | Vendor `#ifdef` removal, event system, multiview, rendering mode terminology |
+| **Tracks** | Vendor `#ifdef` removal, event system, multiview, rendering mode terminology, compositor architecture |
 | **Related** | `XR_EXT_tracked_3d_display_proposal.md`, `vendor_integration_guide.md` |
 
 ---
@@ -661,7 +661,181 @@ exclusively through generic vtable interfaces.
 
 ---
 
-## 8. Discussion Log
+## 8. Compositor Architecture for 3D Displays
+
+This section documents how the runtime's compositor stack differs from
+traditional HMD runtimes and why.  Understanding these paths is essential for
+vendors choosing how to integrate and for developers reasoning about multi-app
+performance.
+
+### 8.1 Three Independent Dimensions
+
+Every session configuration is described by three orthogonal choices:
+
+| Dimension | Options | Key files |
+|-----------|---------|-----------|
+| **Process mode** | In-process, Service (IPC), Hybrid | `targets/openxr/target.c`, `targets/service/main.c`, `ipc/client/` |
+| **Graphics backend** | Vulkan (`comp_main`), Null/headless, D3D11 native, D3D11 service | `compositor/main/`, `compositor/null/`, `compositor/d3d11/`, `compositor/d3d11_service/` |
+| **Window ownership** | App-provided (via `XR_EXT_win32_window_binding`), Runtime-created | `oxr_session.c`, `comp_multi_compositor.c`, `comp_d3d11_window.cpp` |
+
+These compose freely.  For example: "in-process, D3D11 native, app-provided
+window" or "service mode, null compositor, app-provided window."
+
+### 8.2 The Two Compositor Paths
+
+#### D3D11 Native Compositor (independent, parallel)
+
+When a D3D11 app creates a session, `oxr_session.c` calls
+`comp_d3d11_compositor_create()` which produces a **standalone** compositor
+instance.  Each session gets its own:
+
+- `ID3D11Device` (the app's device, passed in at session creation)
+- `IDXGISwapChain` (bound to that session's HWND)
+- SR D3D11 weaver (its own instance)
+- D3D11 renderer
+
+The compositor is set directly on the session (`sess->xcn = xcn`).  **No multi
+compositor, no null compositor, no shared render thread.**  The render loop is
+the app's own `xrEndFrame` call — rendering and presentation happen on the
+calling thread.
+
+```
+App A (D3D11 + HWND_A)              App B (D3D11 + HWND_B)
+  xrEndFrame()                        xrEndFrame()
+    |                                   |
+  comp_d3d11_compositor A             comp_d3d11_compositor B
+    own D3D11 device                    own D3D11 device
+    own DXGI swapchain                  own DXGI swapchain
+    own SR D3D11 weaver                 own SR D3D11 weaver
+    Present()                           Present()
+```
+
+No contention, no shared state, true GPU parallelism via the OS/driver
+scheduler.
+
+**Key files**: `compositor/d3d11/comp_d3d11_compositor.cpp`,
+`state_trackers/oxr/oxr_session_gfx_d3d11_native.c`
+
+#### Vulkan Multi Compositor (serialized, coordinated)
+
+Non-D3D11 apps (OpenGL, Vulkan) go through the multi compositor.  A single
+`multi_system_compositor` owns one native backend (typically `null_compositor`
+for headless Vulkan) and creates a `multi_compositor` instance per session.
+
+All sessions are driven by a **single render thread** (`multi_main_loop` in
+`comp_multi_system.c`).  Each frame tick:
+
+1. **Shared clients** (no external window): layers collected by
+   `transfer_layers_locked()` and submitted to the native compositor.
+2. **Per-session clients** (with HWND): `render_per_session_clients_locked()`
+   iterates all per-session clients **sequentially**, rendering each to its own
+   `VkSwapchainKHR` (created from the session's HWND via `comp_target_service`).
+
+Each per-session client has its own Vulkan resources (`VkCommandPool`,
+`VkCommandBuffer[]`, `VkFence[]`, display processor, SR weaver), but they all
+share the same `VkDevice` and are driven by the same thread.
+
+```
+multi_main_loop (single thread)
+  |
+  +-- transfer_layers_locked()           <-- shared clients (no HWND)
+  |     submit to native compositor
+  |
+  +-- render_per_session_clients_locked() <-- per-session clients (with HWND)
+        for each session (sequentially):
+          extract views
+          Vulkan blit/composite
+          display processor / weaver
+          VkSwapchain present
+```
+
+**Key files**: `compositor/multi/comp_multi_system.c`,
+`compositor/multi/comp_multi_compositor.c`, `compositor/multi/comp_multi_private.h`
+
+### 8.3 Multi-App Performance Comparison
+
+For the windowed 3D display use case (multiple apps, each with its own window):
+
+| Aspect | D3D11 native | Vulkan multi (per-session) |
+|--------|-------------|--------------------------|
+| **Parallelism** | True — each app independent | Serialized — single render thread |
+| **Interop cost** | Zero — D3D11 end-to-end | GL apps pay GL-to-Vulkan import |
+| **Frame pacing** | Independent per app | All sessions share one `predicted_display_time_ns` |
+| **GPU resources** | Each session: own device + weaver | Shared `VkDevice`, own per-session resources |
+| **Bottleneck** | GPU bandwidth (natural) | Single render thread (artificial) |
+| **Latency** | `xrEndFrame` to present: one hop | App thread to multi thread to present: two hops |
+
+**D3D11 native is the better architecture for multi-app windowed scenarios.**
+
+### 8.4 Why Monado Developed the Multi Compositor (HMD Context)
+
+The multi compositor was designed for HMDs, where the constraints are
+fundamentally different from windowed 3D displays:
+
+| HMD constraint | Why it requires centralized compositing |
+|---------------|---------------------------------------|
+| **One display, no windows** | The HMD is a single screen — no window manager. Someone must own that display surface and merge all layers onto it. |
+| **Distortion correction** | HMD lenses require barrel distortion as a final pass on the **combined** image. Cannot be done per-app. |
+| **Overlay compositing** | System UI, notifications, guardian boundaries are separate sessions whose layers must be z-sorted and merged. |
+| **Precise frame timing** | At 90 Hz (11 ms budget), a single compositor thread provides deterministic vsync submission and can apply reprojection on missed frames. |
+| **Process isolation** | The compositor runs as a system service so app crashes don't black out the HMD display. |
+| **Direct display mode** | The runtime takes exclusive GPU ownership of the HMD, bypassing the OS compositor entirely. |
+
+For windowed 3D displays, none of these constraints apply: apps have their own
+windows via the OS window manager, weaving is per-window (not a global final
+pass), and the OS desktop compositor handles vsync.  The multi compositor's
+coordination overhead becomes cost without benefit.
+
+### 8.5 Should We Build a Vulkan Native Compositor?
+
+**Question**: should we build a `comp_vulkan_native` (analogous to
+`comp_d3d11_compositor`) for Vulkan/GL apps to bypass multi?
+
+**Recommendation: No** — not as a new standalone module.  The multi per-session
+path already has 90% of the required infrastructure (per-session `comp_target`,
+`VkCommandPool`, fences, display processor).  The only real problem is that
+it's driven by a single render thread.
+
+**Preferred approach: parallelize the multi render loop.**
+
+Instead of the current sequential iteration:
+```c
+// Current: sequential
+for each per-session client:
+    render_session_to_own_target(mc);   // one after another
+```
+
+Dispatch to a thread pool:
+```c
+// Proposed: parallel
+for each per-session client:
+    dispatch_to_thread_pool(render_session_to_own_target, mc);
+wait_all();
+```
+
+Each per-session client already has its own Vulkan resources (command pool,
+fences, target).  They share the `VkDevice` but Vulkan devices are thread-safe
+for independent command pools.  The serialization is artificial — it's a `for`
+loop, not a fundamental constraint.
+
+**Rationale**:
+
+1. **D3D11 native already covers the high-performance Windows case.**  Most
+   Windows apps targeting 3D displays are D3D11.
+2. **Vulkan apps don't pay interop tax.**  Unlike GL, a Vulkan app through
+   multi uses Vulkan end-to-end.  The overhead is serialization and extra
+   copies, not API translation.
+3. **Minimal code change.**  A thread pool in `render_per_session_clients_locked()`
+   is far less work than a new compositor module.
+4. **Small target audience.**  Pure Vulkan windowed apps for 3D displays is a
+   niche within a niche.
+
+**Exception**: if macOS or Linux becomes a primary multi-app platform where
+D3D11 doesn't exist, a standalone Vulkan native compositor could be revisited.
+
+---
+
+## 9. Discussion Log
 
 *(Developers: add dated entries below as design decisions are made.)*
 
@@ -687,3 +861,22 @@ this model.  Key insight: no plugin/DLL model needed at the OpenXR runtime
 level — the vendor's own runtime is already the plugin, loaded dynamically by
 the vendor's public SDK.  The OpenXR driver is just open-source glue code
 calling the public SDK API.
+
+### 2026-03-01 — Compositor architecture documented
+
+Added §8 documenting the two compositor paths (D3D11 native vs Vulkan multi)
+and their multi-app performance characteristics.  Key findings:
+
+- **D3D11 native** (independent per-session compositors) is the better
+  architecture for multi-app windowed 3D display scenarios: true parallelism,
+  zero interop cost, independent frame pacing.
+- **Vulkan multi** (single render thread, per-session rendering) exists because
+  Monado was designed for HMDs where a centralized compositor is mandatory
+  (single display, distortion correction, overlay merging, precise timing).
+- For windowed 3D displays, the multi compositor's coordination overhead is
+  cost without benefit — apps have their own windows and weaving is per-window.
+- **Recommendation**: do NOT build a standalone Vulkan native compositor.
+  Instead, parallelize the multi render loop (`render_per_session_clients_locked`)
+  with a thread pool if GL/Vulkan multi-app performance becomes a bottleneck.
+  The per-session resources are already independent; the serialization is an
+  artificial `for` loop, not a fundamental constraint.
