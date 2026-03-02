@@ -6,7 +6,6 @@ on:
       - main
       - '*with-ci-build'
       - 'XR_EXT_session_target'
-      - 'refactor/remove-vendor-ifdefs'
     tags:
       - 'v*'
   pull_request:
