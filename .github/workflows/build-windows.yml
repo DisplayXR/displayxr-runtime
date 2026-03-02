@@ -4,8 +4,8 @@ on:
   push:
     branches:
       - main
+      - dev
       - '*with-ci-build'
-      - 'XR_EXT_session_target'
     tags:
       - 'v*'
   pull_request:
@@ -18,7 +18,6 @@ jobs:
     runs-on: windows-2022
 
     env:
-      SLACK_WEBHOOK_URL: https://hooks.slack.com/services/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
       SR_TAG: 1.35.0.2011
       GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
 
@@ -169,29 +168,6 @@ jobs:
           Write-Host "Uploading $($installer.Name) to OneDrive: $destPath"
           rclone copy $installer.FullName "onedrive:$destPath" --progress
           Write-Host "Upload complete!"
-
-      - name: Post build to Slack
-        if: success() && !contains(github.event.head_commit.message, '[skip slack]')
-        uses: act10ns/slack@v2
-        with:
-          status: starting
-          message: ':thumbsup: ${{ github.event.head_commit.message }}
-
-            READY
-
-            ${{ steps.installer-upload-step.outputs.artifact-url }}'
-
-      - name: Post failure to Slack
-        if: failure() && !contains(github.event.head_commit.message, '[skip slack]')
-        uses: act10ns/slack@v2
-        with:
-          status: starting
-
-          message: ':thumbsdown: ${{ github.event.head_commit.message }}
-
-            FAILED
-
-            ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
 
   # Test app build (D3D11 with XR_EXT_session_target) - toggle by changing 'if: false' to 'if: true'
   TestAppSessionTarget:
