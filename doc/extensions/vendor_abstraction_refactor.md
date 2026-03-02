@@ -1002,3 +1002,51 @@ naturally consume separate views. Keeping both compositor paths exercised is
 valuable for future vendors whose weavers may prefer either format. The
 `prefers_sbs_input` flag on `xrt_display_processor` exists precisely for this
 flexibility.
+
+### 2026-03-02 — D3D12 native compositor: feasibility assessment
+
+**Question**: Should we build a `comp_d3d12` native compositor analogous to
+`comp_d3d11_compositor`?
+
+**Context**: The D3D11 native compositor was built to solve Intel GPU D3D11→Vulkan
+texture interop failures. D3D12→Vulkan interop does not have that problem (both
+are explicit APIs with compatible memory models, NT handle sharing works on Intel,
+AMD, and NVIDIA). D3D12 apps currently work through the Vulkan multi compositor
+path (`sr_cube_openxr_ext_d3d12` test app).
+
+**SR SDK support**: The SR SDK already has a full D3D12 weaver (`IDX12Weaver1` in
+`SimulatedRealityDirectX.dll`). API: `setInputViewTexture(ID3D12Resource*, ...)`,
+`setCommandList(ID3D12GraphicsCommandList*)`, SBS input. Factory:
+`CreateDX12Weaver(SRContext*, ID3D12Device*, HWND, IDX12Weaver1**)`. This removes
+what would otherwise be the main blocker.
+
+**Arguments for**:
+- Same architecture benefits as D3D11 native: independent per-session compositors,
+  true GPU parallelism, no shared render thread bottleneck, zero interop overhead.
+- D3D12 is the modern Windows graphics API. Unity, Unreal, and new apps
+  increasingly default to D3D12. For 3D display adoption, supporting the API game
+  engines actually use matters.
+- `comp_d3d11_compositor` provides a proven architectural template. The per-session
+  pattern (own device, own swapchain, own weaver, own command recording) maps
+  directly to D3D12.
+- Eliminates D3D12→Vulkan interop overhead (texture import, cross-API layout
+  transitions, synchronization) even though that interop is functional.
+
+**Arguments to defer**:
+- D3D12 boilerplate is significantly more than D3D11: root signatures, descriptor
+  heaps, pipeline state objects, explicit resource barriers, command allocator
+  management. Estimated 2–3x the code volume.
+- D3D12 apps work today through Vulkan multi. No one is currently blocked.
+- D3D11 covers most current Windows apps targeting 3D displays.
+
+**Recommendation**: Build as a **Phase 2 investment** — not urgent, but
+architecturally sound and future-facing. Prioritize if game engine adoption of 3D
+displays becomes a focus. The implementation can follow the `comp_d3d11` pattern
+closely, with the SR SDK D3D12 weaver providing the display processing backend.
+
+**Implementation outline** (when prioritized):
+- `src/xrt/compositor/d3d12/` — new compositor module
+- `src/xrt/drivers/leia/leia_sr_d3d12.cpp` — SR SDK D3D12 weaver wrapper
+- `src/xrt/drivers/leia/leia_display_processor_d3d12.cpp` — display processor impl
+- `xrt_display_processor_d3d12.h` — generic D3D12 display processor interface
+- Session routing in `oxr_session.c` for D3D12 apps (analogous to D3D11 routing)
