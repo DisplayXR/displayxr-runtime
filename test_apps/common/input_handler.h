@@ -48,8 +48,13 @@ struct InputState {
     float cameraPosY = 0.0f;
     float cameraPosZ = 0.0f;  // Start at origin (OpenXR view matrix provides eye offset)
 
-    // View reset (spacebar or double-click)
+    // View reset (spacebar)
     bool resetViewRequested = false;
+
+    // Teleport to clicked point (double-click)
+    bool teleportRequested = false;
+    float teleportMouseX = 0.0f;
+    float teleportMouseY = 0.0f;
 
     // Parallax toggle state
     bool parallaxEnabled = true;

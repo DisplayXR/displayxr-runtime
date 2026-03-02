@@ -366,6 +366,7 @@ static void RenderThreadFunc(
             inputSnapshot = g_inputState;
             resetRequested = g_inputState.resetViewRequested;
             g_inputState.resetViewRequested = false;
+            g_inputState.teleportRequested = false;
             g_inputState.fullscreenToggleRequested = false;
             g_inputState.displayModeToggleRequested = false;
             g_inputState.eyeTrackingModeToggleRequested = false;
@@ -515,6 +516,45 @@ static void RenderThreadFunc(
                                 &rawLeft, &rawRight, &nominalViewer,
                                 &screen, &tunables, &displayPose,
                                 0.01f, 100.0f, &stereoViews[0], &stereoViews[1]);
+                        }
+
+                        // Double-click teleport: unproject through left eye matrices
+                        if (inputSnapshot.teleportRequested && useAppProjection) {
+                            // Mouse to NDC (Win32: Y=0 at top, NDC Y=+1 at top)
+                            float ndcX = 2.0f * inputSnapshot.teleportMouseX / (float)windowW - 1.0f;
+                            float ndcY = -(2.0f * inputSnapshot.teleportMouseY / (float)windowH - 1.0f);
+
+                            // Unproject NDC through left eye projection (column-major)
+                            const float *P = stereoViews[0].projection_matrix;
+                            float vx = (ndcX + P[8]) / P[0];
+                            float vy = (ndcY + P[9]) / P[5];
+                            float vz = -1.0f;
+
+                            // View-space direction to world-space via inverse view rotation (transpose of 3x3)
+                            const float *V = stereoViews[0].view_matrix;
+                            float wx = V[0]*vx + V[1]*vy + V[2]*vz;
+                            float wy = V[4]*vx + V[5]*vy + V[6]*vz;
+                            float wz = V[8]*vx + V[9]*vy + V[10]*vz;
+
+                            float len = sqrtf(wx*wx + wy*wy + wz*wz);
+                            if (len > 0.0f) {
+                                float rayDir[3] = {wx/len, wy/len, wz/len};
+                                float rayOrigin[3] = {
+                                    stereoViews[0].eye_world.x,
+                                    stereoViews[0].eye_world.y,
+                                    stereoViews[0].eye_world.z
+                                };
+
+                                float hitPos[3];
+                                std::lock_guard<std::mutex> sceneLock(g_sceneMutex);
+                                if (g_gsRenderer.pickGaussian(rayOrigin, rayDir, hitPos)) {
+                                    std::lock_guard<std::mutex> inputLock(g_inputMutex);
+                                    g_inputState.cameraPosX = hitPos[0];
+                                    g_inputState.cameraPosY = hitPos[1];
+                                    g_inputState.cameraPosZ = hitPos[2];
+                                    LOG_INFO("Teleported to (%.3f, %.3f, %.3f)", hitPos[0], hitPos[1], hitPos[2]);
+                                }
+                            }
                         }
 
                         rendered = true;

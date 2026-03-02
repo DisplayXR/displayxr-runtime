@@ -69,7 +69,9 @@ bool UpdateInputState(InputState& state, UINT msg, WPARAM wParam, LPARAM lParam)
         return true;
 
     case WM_LBUTTONDBLCLK:
-        state.resetViewRequested = true;
+        state.teleportRequested = true;
+        state.teleportMouseX = (float)LOWORD(lParam);
+        state.teleportMouseY = (float)HIWORD(lParam);
         return true;
 
     case WM_LBUTTONDOWN:
@@ -223,7 +225,7 @@ bool UpdateInputState(InputState& state, UINT msg, WPARAM wParam, LPARAM lParam)
 }
 
 void UpdateCameraMovement(InputState& state, float deltaTime, float displayHeightM) {
-    // Handle view reset (spacebar or double-click)
+    // Handle view reset (spacebar)
     if (state.resetViewRequested) {
         state.yaw = 0.0f;
         state.pitch = 0.0f;

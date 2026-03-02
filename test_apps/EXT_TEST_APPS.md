@@ -43,7 +43,8 @@ All apps create `XR_REFERENCE_SPACE_TYPE_DISPLAY_EXT` for view location and laye
 | Move up/down | E / Q | E / Q |
 | Look around | Mouse drag (LMB) | Mouse drag (LMB) |
 | Zoom | Scroll wheel | Scroll wheel |
-| Reset view | Space or double-click | Space or double-click |
+| Reset view | Space | Space |
+| Teleport focus | Double-click (3DGS) | Double-click (3DGS) |
 | 2D/3D toggle | V | V |
 | HUD toggle | Tab | Tab |
 | Fullscreen | F11 | Cmd+Ctrl+F |
