@@ -1,5 +1,36 @@
 # Contribution Guidelines
 
+## Contributing to OpenXR 3D Display Runtime
+
+This project uses **GitHub Pull Requests** (not GitLab Merge Requests) for all contributions.
+
+### Workflow
+
+1. Fork this repository
+2. Create a feature branch off `main`
+3. Make your changes and commit
+4. Submit a pull request targeting `main`
+5. Both CI jobs (Windows + macOS) must pass
+6. A maintainer will review your PR
+
+### Code Style
+
+We use **clang-format** (version 11 or newer). Before committing, format your changes:
+
+```bash
+git clang-format
+```
+
+### Vendor Integrations
+
+If you're adding support for a new display vendor, please review the [vendor integration guide](doc/extensions/vendor_integration_guide.md) first. Vendor-specific code should be isolated behind the abstraction layer described in the [vendor abstraction refactor](doc/extensions/vendor_abstraction_refactor.md).
+
+---
+
+## Upstream Monado Guidelines
+
+The guidelines below are inherited from the upstream Monado project and remain applicable.
+
 <!--
 Copyright 2018-2019 Collabora, Ltd.
 
