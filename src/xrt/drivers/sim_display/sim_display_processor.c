@@ -17,12 +17,17 @@
 #include "sim_display_interface.h"
 
 #include "xrt/xrt_display_processor.h"
+#include "xrt/xrt_display_metrics.h"
 
 #include "vk/vk_helpers.h"
+#include "util/u_debug.h"
 #include "util/u_logging.h"
+#include "os/os_time.h"
 
 #include <stdlib.h>
 #include <string.h>
+
+DEBUG_GET_ONCE_FLOAT_OPTION(sim_display_nominal_z_m, "SIM_DISPLAY_NOMINAL_Z_M", 0.60f)
 
 // SPIR-V shader headers (generated at build time by spirv_shaders())
 #include "sim_display/shaders/fullscreen.vert.h"
@@ -45,6 +50,12 @@ struct sim_display_processor
 	VkDescriptorPool desc_pool;
 	VkDescriptorSet desc_set;       //!< Persistent descriptor set (allocated once)
 	VkSampler sampler;
+
+	//! Nominal viewer parameters for faked eye positions.
+	float ipd_m;
+	float nominal_x_m;
+	float nominal_y_m;
+	float nominal_z_m;
 };
 
 static inline struct sim_display_processor *
@@ -455,6 +466,20 @@ create_pipeline_resources(struct sim_display_processor *sdp, int32_t target_form
 }
 
 
+static bool
+sim_dp_get_predicted_eye_positions(struct xrt_display_processor *xdp, struct xrt_eye_pair *out_eye_pair)
+{
+	struct sim_display_processor *sdp = sim_display_processor(xdp);
+	float half_ipd = sdp->ipd_m / 2.0f;
+
+	out_eye_pair->left = (struct xrt_eye_position){sdp->nominal_x_m - half_ipd, sdp->nominal_y_m, sdp->nominal_z_m};
+	out_eye_pair->right = (struct xrt_eye_position){sdp->nominal_x_m + half_ipd, sdp->nominal_y_m, sdp->nominal_z_m};
+	out_eye_pair->timestamp_ns = os_monotonic_get_ns();
+	out_eye_pair->valid = true;
+	out_eye_pair->is_tracking = false; // Nominal, not real tracking
+	return true;
+}
+
 static void
 sim_dp_destroy(struct xrt_display_processor *xdp)
 {
@@ -511,6 +536,13 @@ sim_display_processor_create(enum sim_display_output_mode mode,
 	}
 
 	sdp->base.destroy = sim_dp_destroy;
+	sdp->base.get_predicted_eye_positions = sim_dp_get_predicted_eye_positions;
+
+	// Nominal viewer parameters (same defaults as sim_display_hmd_create)
+	sdp->ipd_m = 0.06f;
+	sdp->nominal_x_m = 0.0f;
+	sdp->nominal_y_m = 0.1f;
+	sdp->nominal_z_m = debug_get_float_option_sim_display_nominal_z_m();
 
 	if (vk == NULL) {
 		U_LOG_E("sim_display: Vulkan bundle required for display processor");
