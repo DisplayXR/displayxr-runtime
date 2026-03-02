@@ -1,278 +1,137 @@
-# Monado - XR Runtime (XRT)
+# OpenXR Runtime for Tracked 3D Displays
 
-<!--
-Copyright 2018-2021, Collabora, Ltd.
+An open-source [OpenXR](https://www.khronos.org/openxr/) runtime that brings standardized XR support to glasses-free 3D displays — autostereoscopic monitors and laptops that deliver head-tracked stereoscopic 3D without worn hardware.
 
-SPDX-License-Identifier: CC-BY-4.0
+## The Problem
 
-This must stay in sync with the last section!
--->
+OpenXR assumes a head-mounted display. The runtime owns the screen, creates rendering targets, and locks views to the user's head. None of this maps to a tracked 3D display, where:
 
-> * Main homepage and documentation: <https://monado.freedesktop.org/>
-> * Promotional homepage: <https://monado.dev>
-> * Maintained at <https://gitlab.freedesktop.org/monado/monado>
-> * Latest API documentation: <https://monado.pages.freedesktop.org/monado>
-> * Continuously-updated changelog of the default branch:
->   <https://monado.pages.freedesktop.org/monado/_c_h_a_n_g_e_l_o_g.html>
+- The display is a **shared desktop monitor**, not a private headset — apps need to render into their own windows
+- The display has **fixed physical geometry** — apps may need raw screen dimensions for custom camera models (e.g., Kooima off-axis projection)
+- Views are **eye-tracked, not head-locked** — the runtime must expose viewer eye positions relative to a fixed screen
 
-Monado is an open source XR runtime delivering immersive experiences such as VR
-and AR on mobile, PC/desktop, and any other device
-(because gosh darn people
-come up with a lot of weird hardware).
-Monado aims to be a complete and conforming implementation
-of the OpenXR API made by Khronos.
-The project is primarily developed on GNU/Linux, but also runs on Android and Windows.
-"Monado" has no specific meaning and is just a name.
+Without a standard API, every display vendor ships a proprietary SDK, fragmenting the ecosystem and forcing developers to write separate codepaths for each vendor.
 
-## Monado source tree
+## Proposed Extensions
 
-* `src/xrt/include` - headers that define the internal interfaces of Monado.
-* `src/xrt/compositor` - code for doing distortion and driving the display hardware of a device.
-* `src/xrt/auxiliary` - utilities and other larger components.
-* `src/xrt/drivers` - hardware drivers.
-* `src/xrt/state_trackers/oxr` - OpenXR API implementation.
-* `src/xrt/targets` - glue code and build logic to produce final binaries.
-* `src/external` - a small collection of external code and headers.
+This project implements three OpenXR extensions to close that gap:
 
-## Getting Started
+| Extension | Purpose |
+|-----------|---------|
+| `XR_EXT_win32_window_binding` | App provides its own Win32 HWND for OpenXR rendering (windowed mode, multi-app) |
+| `XR_EXT_android_surface_binding` | Same concept for Android — app provides a Surface for rendering |
+| `XR_EXT_display_info` | Exposes physical display geometry, canonical viewing pyramid, nominal viewer position, and recommended render resolution scaling |
 
-Dependencies include:
+See the [full extension proposal](doc/extensions/XR_EXT_tracked_3d_display_proposal.md) for the formal specification.
 
-* [CMake][] 3.13 or newer (Note Ubuntu 18.04 only has 3.10)
-* Python 3.6 or newer
-* Vulkan headers and loader - Fedora package `vulkan-loader-devel`
-* OpenGL headers
-* Eigen3 - Debian/Ubuntu package `libeigen3-dev`
-* glslangValidator - Debian/Ubuntu package `glslang-tools`, Fedora package `glslang`.
-* libusb
-* libudev - Debian/Ubuntu package `libudev-dev`, Fedora package `systemd-devel`
-* Video 4 Linux - Debian/Ubuntu package `libv4l-dev`.
+## Quick Start
 
-Optional (but recommended) dependencies:
+### Windows (Primary Platform)
 
-* libxcb and xcb-xrandr development packages
-* [OpenHMD][] 0.3.0 or newer (found using pkg-config)
-
-Truly optional dependencies, useful for some drivers, app support, etc.:
-
-* Doxygen - Debian/Ubuntu package `doxygen` and `graphviz`
-* Wayland development packages
-* Xlib development packages
-* libhidapi - Debian/Ubuntu package `libhidapi-dev`
-* OpenCV
-* libuvc - Debian/Ubuntu package `libuvc-dev`
-* libjpeg
-* libbluetooth - Debian/Ubuntu package `libbluetooth-dev`
-* libsdl - Debian/Ubuntu package `libsdl2-dev`
-
-Experimental Windows support requires the Vulkan SDK and also needs or works
-best with the following vcpkg packages installed:
-
-* pthreads eigen3 libusb hidapi zlib doxygen
-
-If you have a recent [vcpkg](https://vcpkg.io) installed and use the appropriate
-CMake toolchain file, the vcpkg manifest in the Monado repository will instruct
-vcpkg to locally install the dependencies automatically. The Vulkan SDK
-installer should set the `VULKAN_SDK` Windows environment variable to point
-at the installation location (for example, `C:/VulkanSDK/1.3.250.1`), though
-make sure you open a new terminal (or open the CMake GUI) *after* doing that
-install to make sure it is available.
-
-Monado has been tested on these distributions, but is expected to work on almost
-any modern distribution.
-
-* Ubuntu 24.04, 22.04, 20.04, (18.04 may not be fully supported)
-* Debian 11 `bookworm`, 10 `buster`
-  * Up-to-date package lists can be found in our CI config file,
-    `.gitlab-ci.yml`
-* Archlinux
-
-These distributions include recent-enough versions of all the
-software to use direct mode,
-without using any external, third-party, or backported
-package sources.
-
-See also [Status of DRM Leases][drm-lease]
-for more details on specific packages, versions, and commits.
-
-Due to the lack of a OpenGL extension: GL_EXT_memory_object_fd on Intel's
-OpenGL driver, only the AMD
-radeonsi driver and the proprietary NVIDIA driver will work for OpenGL OpenXR
-clients. This is due to a requirement of the Compositor. Support status of the
-extension can be found on the [mesamatrix website][mesamatrix-ext].
-
-### CMake
-
-Build process is similar to other CMake builds,
-so something like the following will build it.
-
-Go into the source directory, create a build directory,
-and change into it.
+Requires Visual Studio 2022, CMake, Ninja, and the [Leia SR SDK](https://www.leiainc.com/).
 
 ```bash
-mkdir build
-cd build
-```
+# Set SDK path
+set LEIASR_SDKROOT=C:\path\to\SimulatedReality
 
-Then, invoke [CMake to generate a project][cmake-generate].
-Feel free to change the build type or generator ("Ninja" is fast and parallel) as you see fit.
-
-```bash
-cmake .. -DCMAKE_BUILD_TYPE=Debug -G "Unix Makefiles"
-```
-
-If you plan to install the runtime,
-append something like `-DCMAKE_INSTALL_PREFIX=~/.local`
-to specify the root of the install directory.
-(The default install prefix is `/usr/local`.)
-
-To build, [the generic CMake build commands][cmake-build] below will work on all systems,
-though you can manually invoke your build tool (`make`, `ninja`, etc.) if you prefer.
-The first command builds the runtime and docs,
-and the second, which is optional, installs the runtime under `${CMAKE_INSTALL_PREFIX}`.
-
-```bash
+# Build
+mkdir build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Debug -G Ninja -DCMAKE_PREFIX_PATH=%LEIASR_SDKROOT%
 cmake --build .
-cmake --build . --target install
 ```
 
-Alternately, if using Make, the following will build the runtime and docs, then install.
-Replace `make` with `ninja` if you used the Ninja generator.
+### macOS (Development / Testing)
+
+macOS builds are useful for development and testing with the simulation driver. No vendor hardware required.
 
 ```bash
-make
-make install
+# Prerequisites
+brew install cmake ninja eigen vulkan-sdk
+
+# Build
+./scripts/build_macos.sh
 ```
 
-Documentation can be browsed by opening `doc/html/index.html` in the build directory in a web browser.
+> **Note:** The Vulkan compositor won't function at runtime on macOS due to MoltenVK lacking `VK_KHR_external_memory_fd`. This is expected — use the sim_display driver for testing.
 
-## Getting started using OpenXR with Monado
-
-This implements the [OpenXR][] API,
-so to do anything with it, you'll need an application
-that uses OpenXR, along with the OpenXR loader.
-The OpenXR loader is a glue library that connects OpenXR applications to OpenXR runtimes such as Monado
-It determines which runtime to use by looking for the config file `active_runtime.json` (either a symlink to
-or a copy of a runtime manifest) in the usual XDG config paths
-and processes environment variables such as `XR_RUNTIME_JSON=/usr/share/openxr/0/openxr_monado.json`.
-It can also insert OpenXR API Layers without the application or the runtime having to do it.
-
-You can use the `hello_xr` sample provided with the OpenXR SDK.
-
-The OpenXR loader can be pointed to a runtime json file in a nonstandard location with the environment variable `XR_RUNTIME_JSON`. Example:
+### Running Without Installing
 
 ```bash
-XR_RUNTIME_JSON=~/monado/build/openxr_monado-dev.json ./openxr-example
+XR_RUNTIME_JSON=./build/openxr_monado-dev.json ./your_openxr_app
 ```
 
-For ease of development Monado creates a runtime manifest file in its build directory using an absolute path to the
-Monado runtime in the build directory called `openxr_monado-dev.json`. Pointing `XR_RUNTIME_JSON` to this
-file allows using Monado after building, without installing.
+See [CLAUDE.md](CLAUDE.md) for full build details, CMake options, and CI configuration.
 
-Note that the loader can always find and load the runtime
-if the path to the runtime library given in the json manifest is an absolute path,
-but if a relative path like `libopenxr_monado.so.0` is given,
-then `LD_LIBRARY_PATH` must include the directory that contains `libopenxr_monado.so.0`.
-The absolute path in `openxr_monado-dev.json` takes care of this for you.
+## Simulation Driver
 
-Distribution packages for monado may provide the  "active runtime" file `/etc/xdg/openxr/1/active_runtime.json`.
-In this case the loader will automatically use Monado when starting an OpenXR application. This global configuration
-can be overridden on a per user basis by creating `~/.config/openxr/1/active_runtime.json`.
-
-## Direct mode
-
-On AMD and Intel GPUs our direct mode code requires a connected HMD to have
-the `non-desktop` xrandr property set to 1.
-Only the most common HMDs have the needed quirks added to the linux kernel.
-
-If you know that your HMD lacks the quirk you can run this command **before** or
-after connecting the HMD and it will have it. Where `HDMI-A-0` is the xrandr
-output name where you plug the HMD in.
+You don't need a 3D display to develop against this runtime. The **sim_display** driver provides a simulated tracked 3D display with keyboard-controlled eye position, letting you test the full OpenXR pipeline on any machine:
 
 ```bash
-xrandr --output HDMI-A-0 --prop --set non-desktop 1
+# After building, run the test cube app
+XR_RUNTIME_JSON=./build/openxr_monado-dev.json ./build/test_apps/sim_cube_openxr/sim_cube_openxr
 ```
 
-You can verify that it stuck with the command.
+Use WASD + mouse to move the simulated eye position and observe perspective-correct stereo rendering.
 
-```bash
-xrandr --prop
-```
+## Branch Structure
 
-## Running Vulkan Validation
+| Branch | Purpose |
+|--------|---------|
+| `main` | Active development — submit PRs here |
+| `upstream-monado` | Tracks upstream [Monado](https://gitlab.freedesktop.org/monado/monado) (locked, read-only) |
+| `cnsdk` | Historical reference — early integration with Leia CNSDK (archived) |
 
-To run Monado with Vulkan validation the loader's layer functionality can be used.
-```
-VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation ./build/src/xrt/targets/service/monado-service
-```
-The same can be done when launching a Vulkan client.
+## Contributing
 
-If you want a backtrace to be produced at validation errors, create a `vk_layer_settings.txt`
-file with the following content:
-```
-khronos_validation.debug_action = VK_DBG_LAYER_ACTION_LOG_MSG,VK_DBG_LAYER_ACTION_BREAK
-khronos_validation.report_flags = error,warn
-khronos_validation.log_filename = stdout
-```
+We welcome contributions! The workflow:
 
-## Coding style and formatting
+1. Fork the repository
+2. Create a feature branch off `main`
+3. Submit a PR to `main`
+4. CI (Windows + macOS) must pass
+5. Review by a maintainer
 
-[clang-format][] is used,
-and a `.clang-format` config file is present in the repo
-to allow your editor to use them.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for detailed guidelines.
 
-To manually apply clang-format to every non-external source file in the tree,
-run this command in the source dir with a `sh`-compatible shell
-(Git for Windows git-bash should be OK):
+### For Display Vendors
 
-```bash
-scripts/format-project.sh
-```
+If you're a display vendor looking to integrate your hardware with this runtime, see the [vendor integration guide](doc/extensions/vendor_integration_guide.md) and the [vendor abstraction refactor](doc/extensions/vendor_abstraction_refactor.md) design document.
 
-You can optionally put something like `CLANG_FORMAT=clang-format-7` before that command
-if your clang-format binary isn't named `clang-format`.
-**Note that you'll typically prefer** to use something like `git clang-format`
-to re-format only your changes, in case version differences in tools result in overall format changes.
-The CI "style" job currently runs on Debian Bullseye, so it has clang-format-11.
+## Key Documentation
 
-[OpenHMD]: http://openhmd.net
-[drm-lease]: https://haagch.frickel.club/#!drmlease%2Emd
-[OpenXR]: https://khronos.org/openxr
-[clang-format]: https://releases.llvm.org/7.0.0/tools/clang/docs/ClangFormat.html
-[cmake-build]: https://cmake.org/cmake/help/v3.12/manual/cmake.1.html#build-tool-mode
-[cmake-generate]: https://cmake.org/cmake/help/v3.12/manual/cmake.1.html
-[CMake]: https://cmake.org
-[mesamatrix-ext]: https://mesamatrix.net/#Version_ExtensionsthatarenotpartofanyOpenGLorOpenGLESversion
+- [Extension Proposal](doc/extensions/XR_EXT_tracked_3d_display_proposal.md) — formal specification of the three proposed extensions
+- [Implementation Plan](doc/extensions/OpenXR_Tracked_3D_Display_Extensions.md) — design and implementation guidance
+- [Vendor Integration Guide](doc/extensions/vendor_integration_guide.md) — how to add support for a new display vendor
+- [Vendor Abstraction Refactor](doc/extensions/vendor_abstraction_refactor.md) — architecture for multi-vendor support
 
-## Contributing, Code of Conduct
+## Roadmap
 
-See `CONTRIBUTING.md` for details of contribution guidelines. GitLab Issues and
-Merge Requests are the preferred way to discuss problems, suggest enhancements,
-or submit changes for review. **In case of a security issue**, you should choose
-the "confidential" option when using the GitLab issues page. For highest
-security, you can send encrypted email (using GPG/OpenPGP) to Rylie Pavlik at
-<rylie.pavlik@collabora.com> and using the associated key from
-<https://keys.openpgp.org/vks/v1/by-fingerprint/45207B2B1E53E1F2755FF63CC5A2D593A61DBC9D>.
+Active work items tracked as [GitHub Issues](https://github.com/dfattal/openxr-3d-display/issues):
 
-Please note that this project is released with a Contributor Code of Conduct.
-By participating in this project you agree to abide by its terms.
+| # | Item | Status |
+|---|------|--------|
+| [#1](https://github.com/dfattal/openxr-3d-display/issues/1) | Genericize IPC server view pose computation | refactor |
+| [#2](https://github.com/dfattal/openxr-3d-display/issues/2) | Remove legacy CNSDK interlacing path | cleanup |
+| [#3](https://github.com/dfattal/openxr-3d-display/issues/3) | Event system: display mode + eye tracking state changes | extension |
+| [#4](https://github.com/dfattal/openxr-3d-display/issues/4) | Vendor rendering mode API | design needed |
+| [#5](https://github.com/dfattal/openxr-3d-display/issues/5) | Multiview support (raise XRT_MAX_VIEWS + register view config) | extension |
+| [#6](https://github.com/dfattal/openxr-3d-display/issues/6) | D3D12 native compositor | future |
 
-We follow the standard freedesktop.org code of conduct,
-available at <https://www.freedesktop.org/wiki/CodeOfConduct/>,
-which is based on the [Contributor Covenant](https://www.contributor-covenant.org).
+## Architecture
 
-Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported by contacting:
+This is a fork of [Monado](https://monado.freedesktop.org/), the open-source OpenXR runtime by Collabora. Key additions:
 
-* First-line project contacts:
-  * Rylie Pavlik <rylie.pavlik@collabora.com>
-  * Frederic Plourde <frederic.plourde@collabora.com>
-  * Jakob Bornecrantz <tbornecrantz@nvidia.com>
-* freedesktop.org contacts: see most recent list at <https://www.freedesktop.org/wiki/CodeOfConduct/>
+- **LeiaSR driver** (`src/xrt/drivers/leiasr/`) — Vulkan and D3D11 weavers for light field interlacing
+- **D3D11 native compositor** (`src/xrt/compositor/d3d11/`) — bypasses Vulkan for Intel GPU compatibility
+- **Simulation driver** (`src/xrt/drivers/sim_display/`) — virtual tracked 3D display for development
+- **Window binding extension** — `XR_EXT_win32_window_binding` implementation in the OpenXR state tracker
 
-Code of Conduct section excerpt adapted from the
-[Contributor Covenant](https://www.contributor-covenant.org), version 1.4.1,
-available at
-<https://www.contributor-covenant.org/version/1/4/code-of-conduct.html>, and
-from the freedesktop.org-specific version of that code, available at
-<https://www.freedesktop.org/wiki/CodeOfConduct/>, used under CC-BY-4.0.
+See [CLAUDE.md](CLAUDE.md) for a detailed source tree walkthrough.
+
+## License
+
+This project is licensed under the [ISC License](LICENSE), the same as upstream Monado.
+
+## Acknowledgments
+
+Built on [Monado](https://monado.freedesktop.org/) by [Collabora](https://www.collabora.com/) and the open-source XR community. Leia SR SDK integration by [Leia Inc.](https://www.leiainc.com/)

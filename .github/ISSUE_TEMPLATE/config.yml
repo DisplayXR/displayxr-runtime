@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Extension Proposal
+    url: https://github.com/dfattal/openxr-3d-display/blob/main/doc/extensions/XR_EXT_tracked_3d_display_proposal.md
+    about: Read the formal extension proposal before asking design questions
+  - name: Vendor Integration Guide
+    url: https://github.com/dfattal/openxr-3d-display/blob/main/doc/extensions/vendor_integration_guide.md
+    about: Guide for display vendors looking to integrate their hardware
