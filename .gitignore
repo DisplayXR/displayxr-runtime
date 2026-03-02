@@ -47,6 +47,10 @@ build/
 build*/
 cmake-build-*/
 
+# Ignore Claude Code local files (keep skills shared)
+.claude/
+!.claude/skills/
+
 # Ignore local settings
 .vscode
 *.autosave
