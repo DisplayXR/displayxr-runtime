@@ -128,6 +128,18 @@ This is a fork of [Monado](https://monado.freedesktop.org/), the open-source Ope
 
 See [CLAUDE.md](CLAUDE.md) for a detailed source tree walkthrough.
 
+## Unity Plugin
+
+The **Monado 3D Display** Unity plugin lives in a separate repository:
+[**dfattal/unity-3d-display**](https://github.com/dfattal/unity-3d-display)
+
+Install via Unity Package Manager with the git URL:
+```
+https://github.com/dfattal/unity-3d-display.git
+```
+
+The plugin intercepts Unity's OpenXR pipeline to provide Kooima asymmetric frustum projection for stereo rendering on 3D displays. It has no source dependency on this runtime — install the runtime separately and point `XR_RUNTIME_JSON` to it.
+
 ## License
 
 This project is licensed under the [ISC License](LICENSE), the same as upstream Monado.
