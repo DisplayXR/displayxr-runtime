@@ -581,13 +581,17 @@ multi_compositor_end_session(struct xrt_compositor *xc)
 	if (mc->state.session_active) {
 		// Clean up per-session render resources
 		if (mc->session_render.initialized) {
-			// Mark as not initialized under the compositor lock FIRST.
-			// This prevents the compositor render thread from entering
-			// render_session_to_own_target while we tear down resources.
-			// If a render is in progress (holding the lock), we block
-			// here until it completes.
+			// Save handle for logging before we NULL it
+			void *saved_window_handle = mc->session_render.external_window_handle;
+
+			// Mark as not initialized AND clear the window handle under
+			// the compositor lock. Both must be cleared atomically so the
+			// compositor thread's has_session_render() returns false and
+			// won't attempt re-initialization during teardown.
 			os_mutex_lock(&mc->msc->list_and_timing_lock);
 			mc->session_render.initialized = false;
+			mc->session_render.external_window_handle = NULL;
+			mc->session_render.readback_callback = NULL;
 			os_mutex_unlock(&mc->msc->list_and_timing_lock);
 
 			struct vk_bundle *vk = comp_target_service_get_vk(mc->msc->target_service);
@@ -649,12 +653,10 @@ multi_compositor_end_session(struct xrt_compositor *xc)
 			// Destroy per-session target using the service
 			if (mc->session_render.target != NULL && mc->msc->target_service != NULL) {
 				comp_target_service_destroy(mc->msc->target_service, &mc->session_render.target);
-				U_LOG_I("Destroyed per-session target for HWND %p",
-				        mc->session_render.external_window_handle);
+				U_LOG_I("Destroyed per-session target for HWND %p", saved_window_handle);
 			}
 
-			U_LOG_I("Cleaned up per-session render resources for HWND %p",
-			        mc->session_render.external_window_handle);
+			U_LOG_I("Cleaned up per-session render resources for HWND %p", saved_window_handle);
 		}
 #ifdef XRT_OS_WINDOWS
 		if (mc->session_render.owns_window && mc->session_render.own_window != NULL) {
@@ -664,7 +666,6 @@ multi_compositor_end_session(struct xrt_compositor *xc)
 		mc->session_render.owns_window = false;
 #endif
 		mc->session_render.window_close_exit_sent = false;
-		mc->session_render.external_window_handle = NULL;
 
 		multi_system_compositor_update_session_status(mc->msc, false);
 		mc->state.session_active = false;
@@ -1119,11 +1120,14 @@ multi_compositor_destroy(struct xrt_compositor *xc)
 
 	// Clean up per-session render resources if still initialized
 	if (mc->session_render.initialized) {
-		// Mark as not initialized under the compositor lock FIRST.
-		// This prevents the compositor render thread from entering
-		// render_session_to_own_target while we tear down resources.
+		// Mark as not initialized AND clear the window handle under
+		// the compositor lock. Both must be cleared atomically so the
+		// compositor thread's has_session_render() returns false and
+		// won't attempt re-initialization during teardown.
 		os_mutex_lock(&mc->msc->list_and_timing_lock);
 		mc->session_render.initialized = false;
+		mc->session_render.external_window_handle = NULL;
+		mc->session_render.readback_callback = NULL;
 		os_mutex_unlock(&mc->msc->list_and_timing_lock);
 
 		struct vk_bundle *vk = comp_target_service_get_vk(mc->msc->target_service);
