@@ -3,7 +3,7 @@
 /*!
  * @file
  * @brief  Creates a hidden NSWindow + CAMetalLayer-backed NSView for
- *         XR_EXT_macos_window_binding. This triggers Monado's per-session
+ *         XR_EXT_cocoa_window_binding. This triggers Monado's per-session
  *         rendering path so no popup window is created.
  */
 

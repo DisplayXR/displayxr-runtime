@@ -331,7 +331,7 @@ comp_window_macos_update_window_title_noop(struct comp_target *ct, const char *t
 
 /*
  *
- * External window support (XR_EXT_macos_window_binding).
+ * External window support (XR_EXT_cocoa_window_binding).
  *
  */
 

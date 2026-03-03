@@ -14,12 +14,13 @@ Without a standard API, every display vendor ships a proprietary SDK, fragmentin
 
 ## Proposed Extensions
 
-This project implements three OpenXR extensions to close that gap:
+This project implements four OpenXR extensions to close that gap:
 
 | Extension | Purpose |
 |-----------|---------|
 | `XR_EXT_win32_window_binding` | App provides its own Win32 HWND for OpenXR rendering (windowed mode, multi-app) |
 | `XR_EXT_android_surface_binding` | Same concept for Android — app provides a Surface for rendering |
+| `XR_EXT_cocoa_window_binding` | Same concept for macOS — app provides a Cocoa NSView for rendering |
 | `XR_EXT_display_info` | Exposes physical display geometry, canonical viewing pyramid, nominal viewer position, and recommended render resolution scaling |
 
 See the [full extension proposal](doc/extensions/XR_EXT_tracked_3d_display_proposal.md) for the formal specification.
@@ -28,7 +29,7 @@ See the [full extension proposal](doc/extensions/XR_EXT_tracked_3d_display_propo
 
 ### Windows (Primary Platform)
 
-Requires Visual Studio 2022, CMake, Ninja, and the [Leia SR SDK](https://www.leiainc.com/).
+Requires Visual Studio 2022, CMake, Ninja, and a vendor SDK (e.g., [Leia SR SDK](https://www.leiainc.com/)).
 
 ```bash
 # Set SDK path
@@ -40,9 +41,9 @@ cmake .. -DCMAKE_BUILD_TYPE=Debug -G Ninja -DCMAKE_PREFIX_PATH=%LEIASR_SDKROOT%
 cmake --build .
 ```
 
-### macOS (Development / Testing)
+### macOS
 
-macOS builds are useful for development and testing with the simulation driver. No vendor hardware required.
+macOS builds use the sim_display driver as a vendor-neutral test target. No vendor hardware required.
 
 ```bash
 # Prerequisites
@@ -99,7 +100,7 @@ If you're a display vendor looking to integrate your hardware with this runtime,
 
 ## Key Documentation
 
-- [Extension Proposal](doc/extensions/XR_EXT_tracked_3d_display_proposal.md) — formal specification of the three proposed extensions
+- [Extension Proposal](doc/extensions/XR_EXT_tracked_3d_display_proposal.md) — formal specification of the four proposed extensions
 - [Project Structure](doc/extensions/project_structure.md) — architecture and source tree reference
 - [Vendor Integration Guide](doc/extensions/vendor_integration_guide.md) — how to add support for a new display vendor
 - [Vendor Abstraction Refactor](doc/extensions/vendor_abstraction_refactor.md) — architecture for multi-vendor support
@@ -116,6 +117,7 @@ Active work items tracked as [GitHub Issues](https://github.com/dfattal/openxr-3
 | [#4](https://github.com/dfattal/openxr-3d-display/issues/4) | Vendor rendering mode API | design needed |
 | [#5](https://github.com/dfattal/openxr-3d-display/issues/5) | Multiview support (raise XRT_MAX_VIEWS + register view config) | extension |
 | [#6](https://github.com/dfattal/openxr-3d-display/issues/6) | D3D12 native compositor | future |
+| [#7](https://github.com/dfattal/openxr-3d-display/issues/7) | Rename `XR_EXT_macos_window_binding` → `XR_EXT_cocoa_window_binding`; add to docs | done |
 
 ## Architecture
 
@@ -124,7 +126,7 @@ This is a fork of [Monado](https://monado.freedesktop.org/), the open-source Ope
 - **LeiaSR driver** (`src/xrt/drivers/leiasr/`) — Vulkan and D3D11 weavers for light field interlacing
 - **D3D11 native compositor** (`src/xrt/compositor/d3d11/`) — bypasses Vulkan for Intel GPU compatibility
 - **Simulation driver** (`src/xrt/drivers/sim_display/`) — virtual tracked 3D display for development
-- **Window binding extension** — `XR_EXT_win32_window_binding` implementation in the OpenXR state tracker
+- **Window binding extensions** — `XR_EXT_win32_window_binding` and `XR_EXT_cocoa_window_binding` in the OpenXR state tracker
 
 See the [project structure guide](doc/extensions/project_structure.md) for a detailed source tree walkthrough.
 

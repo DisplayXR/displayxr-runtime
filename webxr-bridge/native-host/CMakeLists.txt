@@ -83,7 +83,7 @@ endif()
 find_package(Threads REQUIRED)
 target_link_libraries(openxr_bridge_host PRIVATE Threads::Threads)
 
-# macOS: hidden window for XR_EXT_macos_window_binding (suppresses Monado popup)
+# macOS: hidden window for XR_EXT_cocoa_window_binding (suppresses Monado popup)
 if(APPLE)
     enable_language(OBJC OBJCXX)
     target_sources(openxr_bridge_host PRIVATE bridge_window_macos.mm)

@@ -12,9 +12,9 @@ Five test applications that demonstrate the **external window binding** and **di
 
 ## OpenXR Extensions Demonstrated
 
-### XR_EXT_win32_window_binding / XR_EXT_macos_window_binding
+### XR_EXT_win32_window_binding / XR_EXT_cocoa_window_binding
 
-The app creates its own window and passes the handle to the runtime at session creation. On Windows, an `XrWin32WindowBindingCreateInfoEXT` struct carrying the HWND is chained into `XrSessionCreateInfo.next`. On macOS, `XrMacOSWindowBindingCreateInfoEXT` carries the NSView (a CAMetalLayer-backed view). The runtime renders into the app's window instead of creating its own, enabling windowed mode, multi-app scenarios, and app-controlled input.
+The app creates its own window and passes the handle to the runtime at session creation. On Windows, an `XrWin32WindowBindingCreateInfoEXT` struct carrying the HWND is chained into `XrSessionCreateInfo.next`. On macOS, `XrCocoaWindowBindingCreateInfoEXT` carries the NSView (a CAMetalLayer-backed view). The runtime renders into the app's window instead of creating its own, enabling windowed mode, multi-app scenarios, and app-controlled input.
 
 ### XR_EXT_display_info
 
@@ -229,7 +229,7 @@ These modes are specific to the sim_display driver and are **not available** on 
 |--------|-----------------|-------|
 | Window API | Win32 HWND | NSWindow + CAMetalLayer NSView |
 | Graphics binding | D3D11 / Vulkan / OpenGL / D3D12 | Vulkan |
-| Window extension | `XR_EXT_win32_window_binding` | `XR_EXT_macos_window_binding` |
+| Window extension | `XR_EXT_win32_window_binding` | `XR_EXT_cocoa_window_binding` |
 | Fullscreen shortcut | F11 | Cmd+Ctrl+F |
 | Fullscreen style | `WS_POPUP` borderless | `NSWindowStyleMaskBorderless` |
 | HUD rendering | DirectWrite/D2D (shared `hud_renderer.cpp`) | Core Text NSView overlay (Menlo 11pt) |

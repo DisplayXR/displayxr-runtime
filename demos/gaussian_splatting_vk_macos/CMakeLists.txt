@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: BSL-1.0
 #
 # 3D Gaussian Splatting with OpenXR (Vulkan/MoltenVK, macOS)
-# Renders 3DGS scenes on tracked 3D displays via OpenXR and XR_EXT_macos_window_binding.
+# Renders 3DGS scenes on tracked 3D displays via OpenXR and XR_EXT_cocoa_window_binding.
 
 cmake_minimum_required(VERSION 3.21)
 project(gaussian_splatting_vk_macos LANGUAGES C CXX OBJCXX)

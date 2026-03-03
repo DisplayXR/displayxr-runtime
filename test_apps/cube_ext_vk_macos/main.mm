@@ -4,13 +4,13 @@
  * @file
  * @brief  macOS Vulkan OpenXR spinning cube with external window binding
  *
- * Demonstrates XR_EXT_macos_window_binding: the app creates its own
+ * Demonstrates XR_EXT_cocoa_window_binding: the app creates its own
  * NSWindow + MetalView (with CAMetalLayer) and passes the NSView to
  * the runtime via the extension. The runtime renders into the app's
  * window instead of creating its own.
  *
  * Features:
- * - App creates and owns the NSWindow (XR_EXT_macos_window_binding)
+ * - App creates and owns the NSWindow (XR_EXT_cocoa_window_binding)
  * - Mouse drag camera, WASD/QE movement, scroll zoom
  * - XR_EXT_display_info: Kooima projection, display metrics
  * - 2D/3D toggle (V key) via xrRequestDisplayModeEXT
@@ -26,7 +26,7 @@
 #define XR_USE_GRAPHICS_API_VULKAN
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
-#include <openxr/XR_EXT_macos_window_binding.h>
+#include <openxr/XR_EXT_cocoa_window_binding.h>
 #include <openxr/XR_EXT_display_info.h>
 
 #include <cmath>
@@ -1886,7 +1886,7 @@ struct AppXrSession {
     XrSessionState sessionState = XR_SESSION_STATE_UNKNOWN;
     bool sessionRunning = false;
     bool exitRequested = false;
-    bool hasMacosWindowBinding = false;
+    bool hasCocoaWindowBinding = false;
 
     // XR_EXT_display_info
     bool hasDisplayInfoExt = false;
@@ -1928,8 +1928,8 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     bool hasVulkan = false;
     for (const auto& ext : extensions) {
         if (strcmp(ext.extensionName, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) == 0) hasVulkan = true;
-        if (strcmp(ext.extensionName, XR_EXT_MACOS_WINDOW_BINDING_EXTENSION_NAME) == 0) {
-            xr.hasMacosWindowBinding = true;
+        if (strcmp(ext.extensionName, XR_EXT_COCOA_WINDOW_BINDING_EXTENSION_NAME) == 0) {
+            xr.hasCocoaWindowBinding = true;
         }
         if (strcmp(ext.extensionName, XR_EXT_DISPLAY_INFO_EXTENSION_NAME) == 0) {
             xr.hasDisplayInfoExt = true;
@@ -1941,14 +1941,14 @@ static bool InitializeOpenXR(AppXrSession& xr) {
         return false;
     }
 
-    LOG_INFO("XR_EXT_macos_window_binding: %s", xr.hasMacosWindowBinding ? "available" : "not available");
+    LOG_INFO("XR_EXT_cocoa_window_binding: %s", xr.hasCocoaWindowBinding ? "available" : "not available");
     LOG_INFO("XR_EXT_display_info: %s", xr.hasDisplayInfoExt ? "available" : "not available");
 
     // Build extension list
     std::vector<const char*> enabledExtensions;
     enabledExtensions.push_back(XR_KHR_VULKAN_ENABLE_EXTENSION_NAME);
-    if (xr.hasMacosWindowBinding) {
-        enabledExtensions.push_back(XR_EXT_MACOS_WINDOW_BINDING_EXTENSION_NAME);
+    if (xr.hasCocoaWindowBinding) {
+        enabledExtensions.push_back(XR_EXT_COCOA_WINDOW_BINDING_EXTENSION_NAME);
     }
     if (xr.hasDisplayInfoExt) {
         enabledExtensions.push_back(XR_EXT_DISPLAY_INFO_EXTENSION_NAME);
@@ -2220,8 +2220,8 @@ static bool CreateVulkanDevice(VkPhysicalDevice physDevice, uint32_t queueFamily
 }
 
 /*!
- * Create OpenXR session WITH the macos_window_binding extension.
- * Chains XrMacOSWindowBindingCreateInfoEXT into session create info.
+ * Create OpenXR session WITH the cocoa_window_binding extension.
+ * Chains XrCocoaWindowBindingCreateInfoEXT into session create info.
  */
 static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDevice physDevice,
     VkDevice device, uint32_t queueFamilyIndex)
@@ -2236,15 +2236,15 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
     vkBinding.queueIndex = 0;
 
     // Chain the macOS window binding extension — pass our NSView to the runtime
-    XrMacOSWindowBindingCreateInfoEXT macosBinding = {};
-    macosBinding.type = XR_TYPE_MACOS_WINDOW_BINDING_CREATE_INFO_EXT;
+    XrCocoaWindowBindingCreateInfoEXT macosBinding = {};
+    macosBinding.type = XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_EXT;
     macosBinding.next = nullptr;
     macosBinding.viewHandle = (__bridge void *)g_metalView;
 
     // Chain: sessionInfo -> vkBinding -> macosBinding
-    if (xr.hasMacosWindowBinding) {
+    if (xr.hasCocoaWindowBinding) {
         vkBinding.next = &macosBinding;
-        LOG_INFO("Chaining XR_EXT_macos_window_binding with NSView %p", macosBinding.viewHandle);
+        LOG_INFO("Chaining XR_EXT_cocoa_window_binding with NSView %p", macosBinding.viewHandle);
     }
 
     XrSessionCreateInfo sessionInfo = {XR_TYPE_SESSION_CREATE_INFO};
@@ -2252,7 +2252,7 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
     sessionInfo.systemId = xr.systemId;
 
     XR_CHECK(xrCreateSession(xr.instance, &sessionInfo, &xr.session));
-    LOG_INFO("Session created%s", xr.hasMacosWindowBinding ? " (with external window)" : "");
+    LOG_INFO("Session created%s", xr.hasCocoaWindowBinding ? " (with external window)" : "");
 
     return true;
 }
@@ -2927,7 +2927,7 @@ int main() {
                     NSString *text = [NSString stringWithFormat:
                         @"%s\n"
                         "Session: %s\n"
-                        "XR_EXT_macos_window_binding: %s\n"
+                        "XR_EXT_cocoa_window_binding: %s\n"
                         "Mode: %s%s  Output: %s\n"
                         "Kooima: %s\n"
                         "FPS: %.0f  (%.1f ms)\n"
@@ -2950,7 +2950,7 @@ int main() {
                         "C=Mode  V=2D/3D  T=EyeMode  1/2/3=Output  Tab=HUD  ESC=Quit",
                         xr.systemName,
                         sessionStateName,
-                        xr.hasMacosWindowBinding ? "ACTIVE" : "NOT AVAILABLE",
+                        xr.hasCocoaWindowBinding ? "ACTIVE" : "NOT AVAILABLE",
                         g_input.displayMode3D ? "3D (Stereo)" : "2D (Mono)",
                         xr.supportsDisplayModeSwitch ? "" : " [no switch]",
                         outputModeName,

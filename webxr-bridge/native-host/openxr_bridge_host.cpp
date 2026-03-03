@@ -40,7 +40,7 @@
 #endif
 
 #ifdef __APPLE__
-#include <openxr/XR_EXT_macos_window_binding.h>
+#include <openxr/XR_EXT_cocoa_window_binding.h>
 extern "C" void* bridge_create_hidden_metal_view(uint32_t w, uint32_t h);
 extern "C" void bridge_render_hud_text(const char* text, uint8_t* buffer,
                                        uint32_t width, uint32_t height);
@@ -163,7 +163,7 @@ struct AppState {
     uint32_t activeEyeTrackingMode = 0;
 
 #ifdef __APPLE__
-    bool hasMacosWindowBinding = false;
+    bool hasCocoaWindowBinding = false;
 #endif
 
     uint32_t swapchainWidth = 0;
@@ -243,10 +243,10 @@ static bool InitializeOpenXR(AppState& app) {
     }
 
 #ifdef __APPLE__
-    bool hasMacosWindowBinding = false;
+    bool hasCocoaWindowBinding = false;
     for (const auto& ext : extensions) {
-        if (strcmp(ext.extensionName, XR_EXT_MACOS_WINDOW_BINDING_EXTENSION_NAME) == 0) {
-            hasMacosWindowBinding = true;
+        if (strcmp(ext.extensionName, XR_EXT_COCOA_WINDOW_BINDING_EXTENSION_NAME) == 0) {
+            hasCocoaWindowBinding = true;
         }
     }
 #endif
@@ -261,10 +261,10 @@ static bool InitializeOpenXR(AppState& app) {
     }
 
 #ifdef __APPLE__
-    if (hasMacosWindowBinding) {
-        enabledExtensions.push_back(XR_EXT_MACOS_WINDOW_BINDING_EXTENSION_NAME);
-        app.hasMacosWindowBinding = true;
-        LOG_INFO("XR_EXT_macos_window_binding: available, enabling");
+    if (hasCocoaWindowBinding) {
+        enabledExtensions.push_back(XR_EXT_COCOA_WINDOW_BINDING_EXTENSION_NAME);
+        app.hasCocoaWindowBinding = true;
+        LOG_INFO("XR_EXT_cocoa_window_binding: available, enabling");
     }
 #endif
 
@@ -669,17 +669,17 @@ static bool CreateSession(AppState& app) {
     sessionInfo.systemId = app.systemId;
 
 #ifdef __APPLE__
-    XrMacOSWindowBindingCreateInfoEXT macosBinding = {};
-    macosBinding.type = XR_TYPE_MACOS_WINDOW_BINDING_CREATE_INFO_EXT;
+    XrCocoaWindowBindingCreateInfoEXT macosBinding = {};
+    macosBinding.type = XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_EXT;
     macosBinding.next = nullptr;
 
-    if (app.hasMacosWindowBinding) {
+    if (app.hasCocoaWindowBinding) {
         // Hidden Metal view for per-session rendering (Monado composites
         // but output is not displayed — browser handles display directly)
         macosBinding.viewHandle = bridge_create_hidden_metal_view(
             app.swapchainWidth ? app.swapchainWidth : 1920,
             app.swapchainHeight ? app.swapchainHeight : 1080);
-        LOG_INFO("Chaining XR_EXT_macos_window_binding with hidden NSView %p",
+        LOG_INFO("Chaining XR_EXT_cocoa_window_binding with hidden NSView %p",
                  macosBinding.viewHandle);
         vkBinding.next = &macosBinding;
     }
@@ -1765,7 +1765,7 @@ int main() {
             snprintf(hudText, sizeof(hudText),
                 "WebXR Bridge — %s\n"
                 "Session: %s\n"
-                "XR_EXT_macos_window_binding: %s\n"
+                "XR_EXT_cocoa_window_binding: %s\n"
                 "Mode: 3D  Output: %s\n"
                 "FPS: %.0f  (%.1f ms)\n"
                 "Render: %ux%u  Canvas: %ux%u\n"
@@ -1781,7 +1781,7 @@ int main() {
                 "Tab=HUD  WASD/QE=Move  Scroll=Zoom",
                 app.systemName,
                 stateName,
-                app.hasMacosWindowBinding ? "YES" : "NO",
+                app.hasCocoaWindowBinding ? "YES" : "NO",
                 outputName,
                 fps, g_avgFrameTime * 1000.0,
                 app.swapchainWidth / 2, app.swapchainHeight,

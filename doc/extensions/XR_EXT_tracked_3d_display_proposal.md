@@ -1,6 +1,6 @@
 # OpenXR Extensions for Tracked 3D Displays
 
-## Formal Proposal for XR_EXT_win32_window_binding, XR_EXT_android_surface_binding, and XR_EXT_display_info
+## Formal Proposal for XR_EXT_win32_window_binding, XR_EXT_android_surface_binding, XR_EXT_cocoa_window_binding, and XR_EXT_display_info
 
 | Field | Value |
 |---|---|
@@ -9,7 +9,7 @@
 | **Date** | 2026-02-13 |
 | **Revision** | 0.2 |
 | **Status** | Draft — proposed for Khronos OpenXR Working Group review |
-| **Extension Names** | `XR_EXT_win32_window_binding`, `XR_EXT_android_surface_binding`, `XR_EXT_display_info` |
+| **Extension Names** | `XR_EXT_win32_window_binding`, `XR_EXT_android_surface_binding`, `XR_EXT_cocoa_window_binding`, `XR_EXT_display_info` |
 | **OpenXR Version** | 1.0 |
 | **Extension Type** | Instance extensions |
 | **Dependencies** | OpenXR 1.0 core |
@@ -71,16 +71,17 @@ OpenXR can prevent this fragmentation — but only if it provides the missing pr
 
 ### What These Extensions Solve
 
-This proposal introduces three independent but complementary extensions:
+This proposal introduces four independent but complementary extensions:
 
 | Extension | Purpose |
 |---|---|
 | `XR_EXT_win32_window_binding` | App provides a Win32 HWND for runtime rendering; enables windowed mode, multi-app, app-controlled input, and window-space overlay layers. |
 | `XR_EXT_android_surface_binding` | App provides an Android `ANativeWindow` for runtime rendering; the Android counterpart to the Win32 window binding. |
+| `XR_EXT_cocoa_window_binding` | App provides a Cocoa `NSView*` (with `CAMetalLayer` backing) for runtime rendering on macOS. |
 | `XR_EXT_display_info` | Runtime exposes physical display geometry, nominal viewer position, recommended render scale, display mode switching capability, and a DISPLAY reference space anchored to the physical screen. Provides `xrRequestDisplayModeEXT` for 2D/3D mode control. |
 
 Together they form a minimal, complete interface for tracked 3D display rendering through
-OpenXR across desktop and mobile platforms.
+OpenXR across desktop, mobile, and macOS platforms.
 
 **Future direction — multiview and passive displays**: while this proposal focuses on
 stereo (2-view) tracked displays, the architecture is designed to extend naturally to
@@ -99,6 +100,7 @@ displays. See [OPEN 4](#open-issues) in the Issues section.
         ├── xrCreateInstance()
         │       enable "XR_EXT_win32_window_binding"   (Win32)
         │         — or "XR_EXT_android_surface_binding" (Android)
+        │         — or "XR_EXT_cocoa_window_binding"   (macOS)
         │       enable "XR_EXT_display_info"
         │
         ├── xrGetSystemProperties()
@@ -114,10 +116,13 @@ displays. See [OPEN 4](#open-issues) in the Issues section.
         │        │            └── next: XrWin32WindowBindingCreateInfoEXT
         │        │                       • windowHandle = app HWND
         │        └── next: XrGraphicsBindingVulkanKHR          (Android)
-        │                    └── next: XrAndroidSurfaceBindingCreateInfoEXT
-        │                               • nativeWindow = app ANativeWindow*
-        │                               • surface = Java Surface jobject
-        │                               • screenOffsetX/Y = position on display
+        │        │            └── next: XrAndroidSurfaceBindingCreateInfoEXT
+        │        │                       • nativeWindow = app ANativeWindow*
+        │        │                       • surface = Java Surface jobject
+        │        │                       • screenOffsetX/Y = position on display
+        │        └── next: XrGraphicsBindingVulkanKHR          (macOS)
+        │                    └── next: XrCocoaWindowBindingCreateInfoEXT
+        │                               • viewHandle = app NSView* (CAMetalLayer)
         │
         │   ┌── Session READY → runtime auto-requests 3D mode (if supported)
         │
@@ -1447,20 +1452,23 @@ exactly the flexibility that motivated the RAW mode design.
 
 ---
 
-**RESOLVED 7: Android platform variant for window/surface binding.**
+**RESOLVED 7: Platform variants for window/surface binding.**
 
-*Problem*: `XR_EXT_win32_window_binding` is Win32-specific. How should Android (and other
-platforms) provide equivalent functionality?
+*Problem*: `XR_EXT_win32_window_binding` is Win32-specific. How should other
+platforms provide equivalent functionality?
 
-*Resolution*: **Per-platform surface binding extensions.** `XR_EXT_android_surface_binding`
+*Resolution*: **Per-platform surface binding extensions.** Each platform extension
 follows the same structural pattern — chain a platform-specific surface handle to the
-graphics binding at session creation — using `ANativeWindow*` instead of `HWND`. The
-`XrCompositionLayerWindowSpaceEXT` layer type is platform-independent and works with all
-surface binding variants. Future platforms (Wayland, X11, macOS/Cocoa) would follow the
-same pattern:
+graphics binding at session creation. The `XrCompositionLayerWindowSpaceEXT` layer type
+is platform-independent and works with all surface binding variants.
+
+Implemented:
+- `XR_EXT_android_surface_binding` (with `ANativeWindow*` + Java `Surface`)
+- `XR_EXT_cocoa_window_binding` (with `NSView*` backed by `CAMetalLayer`)
+
+Future platforms would follow the same pattern:
 - `XR_EXT_wayland_surface_binding` (with `wl_surface*`)
 - `XR_EXT_xlib_window_binding` (with X11 `Window`)
-- `XR_EXT_cocoa_window_binding` (with `NSWindow*`)
 
 ---
 

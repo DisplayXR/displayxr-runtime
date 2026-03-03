@@ -66,7 +66,7 @@ SDK types.
 │  Types used:  OpenXR API types only                                 │
 │  - XrView, XrFovf, XrPosef, XrDisplayInfoEXT                       │
 │  - XR_REFERENCE_SPACE_TYPE_DISPLAY_EXT                              │
-│  - XrWin32WindowBindingCreateInfoEXT / XrMacOSWindowBindingCreateInfoEXT │
+│  - XrWin32WindowBindingCreateInfoEXT / XrCocoaWindowBindingCreateInfoEXT │
 │                                                                     │
 │  The app never sees runtime or vendor internals.                    │
 ├─────────────────────────────────────────────────────────────────────┤
@@ -210,18 +210,18 @@ fractional window coordinates with per-eye disparity shift.
 **Vendor impact:** The vendor's SDK wrapper receives the window handle at init
 time and must create the weaver/interlacer targeting that window.
 
-### 3.3 `XR_EXT_macos_window_binding` (macOS)
+### 3.3 `XR_EXT_cocoa_window_binding` (macOS)
 
-**Header:** `src/external/openxr_includes/openxr/XR_EXT_macos_window_binding.h`
+**Header:** `src/external/openxr_includes/openxr/XR_EXT_cocoa_window_binding.h`
 
 macOS equivalent — app passes an `NSView*` with `CAMetalLayer` backing:
 
 ```c
-typedef struct XrMacOSWindowBindingCreateInfoEXT {
-    XrStructureType type;        // XR_TYPE_MACOS_WINDOW_BINDING_CREATE_INFO_EXT
+typedef struct XrCocoaWindowBindingCreateInfoEXT {
+    XrStructureType type;        // XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_EXT
     const void*     next;
     void*           viewHandle;  // NSView* with CAMetalLayer backing
-} XrMacOSWindowBindingCreateInfoEXT;
+} XrCocoaWindowBindingCreateInfoEXT;
 ```
 
 ### 3.4 How `xrLocateViews` Returns Eye Positions: RAW vs RENDER_READY
@@ -233,7 +233,7 @@ The mode is determined automatically based on whether the app uses the
 #### RAW Mode (extension-aware apps)
 
 When the app enables `XR_EXT_display_info` and creates a session with an
-external window (`XR_EXT_win32_window_binding` / `XR_EXT_macos_window_binding`),
+external window (`XR_EXT_win32_window_binding` / `XR_EXT_cocoa_window_binding`),
 `xrLocateViews()` returns views in **RAW mode**:
 
 - `XrView.pose.position` — the physical eye center in DISPLAY space, directly
@@ -1514,7 +1514,7 @@ src/xrt/drivers/leia/
 | **Eye tracking** | SR SDK LookaroundFilter | CNSDK face tracking | Vendor SDK | Vendor SDK |
 | **SDK wrapper (Vulkan)** | `leia_sr.cpp` | `leia_cnsdk.cpp` | — | — |
 | **SDK wrapper (D3D11)** | `leia_sr_d3d11.cpp` | N/A | N/A | N/A |
-| **Window binding** | `XR_EXT_win32_window_binding` | N/A | — | `XR_EXT_macos_window_binding` |
+| **Window binding** | `XR_EXT_win32_window_binding` | N/A | — | `XR_EXT_cocoa_window_binding` |
 | **2D/3D mode switch** | SwitchableLensHint | Backlight API | Vendor-specific | Vendor-specific |
 
 ### Platform-Specific Notes
