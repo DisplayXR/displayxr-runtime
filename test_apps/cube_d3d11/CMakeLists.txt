@@ -83,7 +83,7 @@ add_executable(cube_d3d11 WIN32
     main.cpp
     xr_session.cpp
     xr_session.h
-    cube_d3d11.manifest
+    sr_cube_openxr.manifest
     resource.rc
 )
 
@@ -97,7 +97,7 @@ target_link_libraries(cube_d3d11 PRIVATE
 # Embed manifest
 if(MSVC)
     set_target_properties(cube_d3d11 PROPERTIES
-        LINK_FLAGS "/MANIFEST:EMBED /MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/cube_d3d11.manifest"
+        LINK_FLAGS "/MANIFEST:EMBED /MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/sr_cube_openxr.manifest"
     )
 endif()
 
