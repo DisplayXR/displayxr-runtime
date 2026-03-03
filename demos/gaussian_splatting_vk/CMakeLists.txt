@@ -88,7 +88,7 @@ add_executable(gaussian_splatting_vk WIN32
     ${CMAKE_CURRENT_SOURCE_DIR}/../../test_apps/common/hud_renderer.h
     ${CMAKE_CURRENT_SOURCE_DIR}/../../test_apps/common/text_overlay.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../test_apps/common/text_overlay.h
-    gaussian_splatting_vk.manifest
+    sr_3dgs_openxr_ext_vk.manifest
     resource.rc
 )
 
@@ -105,7 +105,7 @@ target_link_libraries(gaussian_splatting_vk PRIVATE
 
 if(MSVC)
     set_target_properties(gaussian_splatting_vk PROPERTIES
-        LINK_FLAGS "/MANIFEST:EMBED /MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/gaussian_splatting_vk.manifest"
+        LINK_FLAGS "/MANIFEST:EMBED /MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/sr_3dgs_openxr_ext_vk.manifest"
     )
 endif()
 

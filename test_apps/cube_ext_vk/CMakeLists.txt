@@ -84,7 +84,7 @@ add_executable(cube_ext_vk WIN32
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/hud_renderer.h
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/text_overlay.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/text_overlay.h
-    cube_ext_vk.manifest
+    sr_cube_openxr_ext_vk.manifest
     resource.rc
 )
 
@@ -99,7 +99,7 @@ target_link_libraries(cube_ext_vk PRIVATE
 
 if(MSVC)
     set_target_properties(cube_ext_vk PROPERTIES
-        LINK_FLAGS "/MANIFEST:EMBED /MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/cube_ext_vk.manifest"
+        LINK_FLAGS "/MANIFEST:EMBED /MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/sr_cube_openxr_ext_vk.manifest"
     )
 endif()
 

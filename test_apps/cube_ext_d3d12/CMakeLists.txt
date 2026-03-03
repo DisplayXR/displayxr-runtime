@@ -76,7 +76,7 @@ add_executable(cube_ext_d3d12 WIN32
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/hud_renderer.h
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/text_overlay.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/text_overlay.h
-    cube_ext_d3d12.manifest
+    sr_cube_openxr_ext_d3d12.manifest
     resource.rc
 )
 
@@ -93,7 +93,7 @@ target_link_libraries(cube_ext_d3d12 PRIVATE
 
 if(MSVC)
     set_target_properties(cube_ext_d3d12 PROPERTIES
-        LINK_FLAGS "/MANIFEST:EMBED /MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/cube_ext_d3d12.manifest"
+        LINK_FLAGS "/MANIFEST:EMBED /MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/sr_cube_openxr_ext_d3d12.manifest"
     )
 endif()
 
