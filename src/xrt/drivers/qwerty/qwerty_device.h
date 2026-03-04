@@ -44,6 +44,9 @@ struct qwerty_system
 	bool force_2d_mode;              //!< Runtime-side 2D/3D toggle (V key when HMD focused)
 	bool display_mode_toggle_pending; //!< Set by key handler, cleared by compositor
 
+	int rendering_mode;                  //!< Current rendering mode index (0=SBS, 1+=vendor-defined)
+	bool rendering_mode_change_pending;  //!< Set by key handler, cleared by caller
+
 	// Stereo controls (P toggles mode with derivation, spacebar resets)
 	bool camera_mode; //!< true=camera-centric (default), false=display-centric
 
@@ -443,6 +446,15 @@ qwerty_reset_controller_pose(struct qwerty_controller *qc);
  */
 void
 qwerty_toggle_display_mode(struct qwerty_system *qs);
+
+/*!
+ * Set the rendering mode index (1/2/3 keys). Marks the change as
+ * pending for the compositor to pick up via
+ * qwerty_check_rendering_mode_change().
+ * @public @memberof qwerty_system
+ */
+void
+qwerty_set_rendering_mode(struct qwerty_system *qs, int mode);
 
 /*!
  * Toggle between camera-centric and display-centric stereo mode.

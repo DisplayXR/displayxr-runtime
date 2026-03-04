@@ -543,3 +543,35 @@ oxr_xrGetD3D12GraphicsRequirementsKHR(XrInstance instance,
 	return oxr_d3d12_get_requirements(&log, sys, graphicsRequirements);
 }
 #endif
+
+
+/*
+ *
+ * Metal
+ *
+ */
+
+#ifdef XR_USE_GRAPHICS_API_METAL
+
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrGetMetalGraphicsRequirementsKHR(XrInstance instance,
+                                      XrSystemId systemId,
+                                      XrGraphicsRequirementsMetalKHR *graphicsRequirements)
+{
+	struct oxr_instance *inst;
+	struct oxr_logger log;
+	OXR_VERIFY_INSTANCE_AND_INIT_LOG(&log, instance, inst, "xrGetMetalGraphicsRequirementsKHR");
+	OXR_VERIFY_ARG_TYPE_AND_NOT_NULL(&log, graphicsRequirements, XR_TYPE_GRAPHICS_REQUIREMENTS_METAL_KHR);
+	OXR_VERIFY_SYSTEM_AND_GET(&log, inst, systemId, sys);
+	OXR_VERIFY_XSYSC(&log, sys);
+
+	sys->gotten_requirements = true;
+
+	// Metal doesn't need device matching like D3D11/D3D12 (LUID check).
+	// Just return the system's default Metal device.
+	// The metalDevice field will be NULL, meaning "use system default".
+	graphicsRequirements->metalDevice = NULL;
+
+	return XR_SUCCESS;
+}
+#endif

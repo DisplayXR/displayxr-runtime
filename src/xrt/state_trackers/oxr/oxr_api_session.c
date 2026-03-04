@@ -1308,4 +1308,22 @@ oxr_xrRequestEyeTrackingModeEXT(XrSession session, XrEyeTrackingModeEXT mode)
 	return XR_SUCCESS;
 }
 
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrRequestDisplayRenderingModeEXT(XrSession session, uint32_t modeIndex)
+{
+	OXR_TRACE_MARKER();
+
+	struct oxr_session *sess;
+	struct oxr_logger log;
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrRequestDisplayRenderingModeEXT");
+
+	struct xrt_device *head = GET_XDEV_BY_ROLE(sess->sys, head);
+	if (head == NULL) {
+		return oxr_error(&log, XR_ERROR_RUNTIME_FAILURE, "No head device available");
+	}
+
+	xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, modeIndex);
+	return XR_SUCCESS;
+}
+
 #endif // OXR_HAVE_EXT_display_info

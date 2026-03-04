@@ -381,6 +381,10 @@ handle_non_null(struct oxr_instance *inst, struct oxr_logger *log, const char *n
 	ENTRY_IF_EXT(xrGetD3D12GraphicsRequirementsKHR, KHR_D3D12_enable);
 #endif // OXR_HAVE_KHR_D3D12_enable
 
+#ifdef OXR_HAVE_KHR_metal_enable
+	ENTRY_IF_EXT(xrGetMetalGraphicsRequirementsKHR, KHR_metal_enable);
+#endif // OXR_HAVE_KHR_metal_enable
+
 #ifdef OXR_HAVE_HTC_facial_tracking
 	ENTRY_IF_EXT(xrCreateFacialTrackerHTC, HTC_facial_tracking);
 	ENTRY_IF_EXT(xrDestroyFacialTrackerHTC, HTC_facial_tracking);
@@ -421,6 +425,7 @@ handle_non_null(struct oxr_instance *inst, struct oxr_logger *log, const char *n
 #ifdef OXR_HAVE_EXT_display_info
 	ENTRY_IF_EXT(xrRequestDisplayModeEXT, EXT_display_info);
 	ENTRY_IF_EXT(xrRequestEyeTrackingModeEXT, EXT_display_info);
+	ENTRY_IF_EXT(xrRequestDisplayRenderingModeEXT, EXT_display_info);
 #endif
 
 #ifdef OXR_HAVE_KHR_locate_spaces

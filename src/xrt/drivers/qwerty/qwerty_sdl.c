@@ -267,6 +267,13 @@ qwerty_process_event(struct xrt_device **xdevs, size_t xdev_count, SDL_Event eve
 		qwerty_release_thumbstick_click(qctrl);
 	}
 
+	// 1/2/3: rendering mode (HMD focused, keydown, no repeat)
+	if (event.type == SDL_KEYDOWN && event.key.repeat == 0 && qdev == qd_hmd) {
+		if (event.key.keysym.scancode == SDL_SCANCODE_1) qwerty_set_rendering_mode(qsys, 0);
+		if (event.key.keysym.scancode == SDL_SCANCODE_2) qwerty_set_rendering_mode(qsys, 1);
+		if (event.key.keysym.scancode == SDL_SCANCODE_3) qwerty_set_rendering_mode(qsys, 2);
+	}
+
 	// clang-format on
 
 	// Controllers follow/unfollow HMD

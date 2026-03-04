@@ -194,6 +194,7 @@ After building test apps locally, copy binaries to `_package/SRMonado-macOS/bin/
 |----------|-------------|---------------|------------|
 | cube_vk_macos | `test_apps/cube_vk_macos/build/cube_vk_macos` | `_package/SRMonado-macOS/bin/cube_vk_macos` | `run_cube_vk.sh` |
 | cube_ext_vk_macos | `test_apps/cube_ext_vk_macos/build/cube_ext_vk_macos` | `_package/SRMonado-macOS/bin/cube_ext_vk_macos` | `run_cube_ext_vk.sh` |
+| cube_ext_metal_macos | `test_apps/cube_ext_metal_macos/build/cube_ext_metal_macos` | `_package/SRMonado-macOS/bin/cube_ext_metal_macos` | `run_cube_ext_metal.sh` |
 | gaussian_splatting_vk_macos | `demos/gaussian_splatting_vk_macos/build/gaussian_splatting_vk_macos` | `_package/SRMonado-macOS/bin/gaussian_splatting_vk_macos` | `run_gaussian_splatting.sh` |
 
 When adding new test apps, follow the same pattern: binary goes in `bin/`, run script in the package root.

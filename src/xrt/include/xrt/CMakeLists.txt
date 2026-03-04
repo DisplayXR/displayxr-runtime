@@ -70,6 +70,7 @@ endif()
 
 if(APPLE AND NOT ANDROID)
 	set(XR_USE_PLATFORM_MACOS ON)
+	set(XR_USE_GRAPHICS_API_METAL ON)
 endif()
 
 configure_file(

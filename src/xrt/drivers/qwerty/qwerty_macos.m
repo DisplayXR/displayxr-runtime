@@ -377,6 +377,14 @@ qwerty_process_macos(struct xrt_device **xdevs,
 			}
 			break;
 
+		// 1/2/3: rendering mode (HMD focused, keydown, no repeat)
+		case kVK_ANSI_1:
+		case kVK_ANSI_2:
+		case kVK_ANSI_3:
+			if (is_down && ![event isARepeat] && qsys->hmd_focused)
+				qwerty_set_rendering_mode(qsys, keyCode - kVK_ANSI_1);
+			break;
+
 		// Controller follow HMD toggle
 		case kVK_ANSI_C:
 			if (is_down && ![event isARepeat]) {

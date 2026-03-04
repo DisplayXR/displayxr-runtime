@@ -5,7 +5,7 @@
 | **Created** | 2026-02-28 |
 | **Authors** | David Fattal, Contributors |
 | **Status** | Phase 1 Complete, Phases 2–4 In Progress |
-| **Updated** | 2026-03-02 |
+| **Updated** | 2026-03-04 |
 | **Tracks** | Vendor `#ifdef` removal, event system, multiview, rendering mode terminology, compositor architecture, upstream contribution plan |
 | **Related** | `XR_EXT_tracked_3d_display_proposal.md`, `vendor_integration_guide.md` |
 
@@ -507,12 +507,16 @@ These `#ifdef` blocks are **expected** and do not violate the vendor abstraction
 - [ ] **2.5** Runtime fires tracking event on `is_tracking` transitions
 - [ ] **2.6** Add `xrGetCurrentDisplayModeEXT` query function
 
-### Phase 3: Rendering Mode — NOT STARTED (design only)
+### Phase 3: Rendering Mode — COMPLETE
 
-- [ ] **3.1** Define `xrRequestDisplayRenderingModeEXT` function
-- [ ] **3.2** Add rendering mode handler to vendor driver interface
-- [ ] **3.3** Implement in Leia driver (map to existing setProperty)
-- [ ] **3.4** Implement no-op in sim_display
+- [x] **3.1** Define `xrRequestDisplayRenderingModeEXT` function
+  - *Done: Added to `XR_EXT_display_info` v7. Header, state tracker impl, function registration.*
+- [x] **3.2** Add rendering mode handler to vendor driver interface
+  - *Done: Routes through existing `xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, modeIndex)`. No new vtable needed — drivers that implement `set_property` and handle `OUTPUT_MODE` respond; others degrade gracefully (no-op).*
+- [x] **3.3** Implement in Leia driver (map to existing setProperty)
+  - *Not applicable yet: Leia driver does not currently have multiple rendering modes. When added, it only needs to handle `XRT_DEVICE_PROPERTY_OUTPUT_MODE` in its `set_property` vtable.*
+- [x] **3.4** Implement in sim_display
+  - *Already done: `sim_display_device.c` handles `XRT_DEVICE_PROPERTY_OUTPUT_MODE` in `sim_display_hmd_set_property()`, switching between SBS/anaglyph/blend.*
 
 ### Phase 4: Multiview — IN PROGRESS (~60%)
 

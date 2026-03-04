@@ -112,6 +112,13 @@ if(APPLE)
 	if(XRT_BUILD_DRIVER_QWERTY AND TARGET drv_qwerty)
 		target_link_libraries(st_oxr PRIVATE drv_qwerty drv_qwerty_includes)
 	endif()
+
+	# Metal native compositor support (bypasses Vulkan)
+	if(XRT_HAVE_METAL AND TARGET comp_metal)
+		target_sources(st_oxr PRIVATE oxr_session_gfx_metal_native.c oxr_swapchain_metal.c)
+		target_link_libraries(st_oxr PRIVATE comp_metal)
+		target_compile_definitions(st_oxr PRIVATE XRT_HAVE_METAL_NATIVE_COMPOSITOR)
+	endif()
 endif()
 
 # Qwerty driver: needed on all platforms for camera-centric stereo controls

@@ -439,6 +439,14 @@ qwerty_process_win32(struct xrt_device **xdevs,
 			}
 			break;
 
+		// 1/2/3: rendering mode (HMD focused, keydown only)
+		case '1':
+		case '2':
+		case '3':
+			if (is_keydown && qsys->hmd_focused)
+				qwerty_set_rendering_mode(qsys, (int)(wParam - '1'));
+			break;
+
 		// Controller follow HMD toggle
 		case 'C':
 			if (is_keydown) {

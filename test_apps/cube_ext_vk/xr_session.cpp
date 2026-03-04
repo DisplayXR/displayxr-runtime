@@ -138,6 +138,10 @@ bool InitializeOpenXR(XrSessionManager& xr) {
             xrGetInstanceProcAddr(xr.instance, "xrRequestEyeTrackingModeEXT",
                 (PFN_xrVoidFunction*)&xr.pfnRequestEyeTrackingModeEXT);
         }
+
+        // Load xrRequestDisplayRenderingModeEXT function pointer (v7)
+        xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayRenderingModeEXT",
+            (PFN_xrVoidFunction*)&xr.pfnRequestDisplayRenderingModeEXT);
     }
 
     uint32_t viewCount = 0;

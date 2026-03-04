@@ -22,6 +22,7 @@
 #cmakedefine XRT_HAVE_JPEG
 #cmakedefine XRT_HAVE_LEIA_SR
 #cmakedefine XRT_HAVE_LIBBSD
+#cmakedefine XRT_HAVE_METAL
 #cmakedefine XRT_HAVE_LIBUDEV
 #cmakedefine XRT_HAVE_LIBUSB
 #cmakedefine XRT_HAVE_LIBUVC

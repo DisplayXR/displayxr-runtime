@@ -78,7 +78,7 @@ This proposal introduces four independent but complementary extensions:
 | `XR_EXT_win32_window_binding` | App provides a Win32 HWND for runtime rendering; enables windowed mode, multi-app, app-controlled input, and window-space overlay layers. |
 | `XR_EXT_android_surface_binding` | App provides an Android `ANativeWindow` for runtime rendering; the Android counterpart to the Win32 window binding. |
 | `XR_EXT_cocoa_window_binding` | App provides a Cocoa `NSView*` (with `CAMetalLayer` backing) for runtime rendering on macOS. |
-| `XR_EXT_display_info` | Runtime exposes physical display geometry, nominal viewer position, recommended render scale, display mode switching capability, and a DISPLAY reference space anchored to the physical screen. Provides `xrRequestDisplayModeEXT` for 2D/3D mode control. |
+| `XR_EXT_display_info` | Runtime exposes physical display geometry, nominal viewer position, recommended render scale, display mode switching capability, and a DISPLAY reference space anchored to the physical screen. Provides `xrRequestDisplayModeEXT` for 2D/3D mode control, `xrRequestEyeTrackingModeEXT` for smooth/raw eye tracking selection, and `xrRequestDisplayRenderingModeEXT` for vendor-specific rendering mode switching. |
 
 Together they form a minimal, complete interface for tracked 3D display rendering through
 OpenXR across desktop, mobile, and macOS platforms.
@@ -128,6 +128,9 @@ displays. See [OPEN 4](#open-issues) in the Issues section.
         │
         ├── xrRequestDisplayModeEXT(session, mode)     [optional override]
         │       XR_DISPLAY_MODE_3D_EXT  /  XR_DISPLAY_MODE_2D_EXT
+        │
+        ├── xrRequestDisplayRenderingModeEXT(session, modeIndex)  [optional]
+        │       mode 0 = standard, 1+ = vendor-defined
         │
         ├── xrCreateReferenceSpace(DISPLAY)
         │       origin = display center, +X right, +Y up, +Z toward viewer
@@ -1708,6 +1711,55 @@ XrResult xrRequestEyeTrackingModeEXT(XrSession session, XrEyeTrackingModeEXT mod
 
 ---
 
+## 7. Display Rendering Mode Control (v7)
+
+### Motivation
+
+Different 3D display vendors support multiple rendering variations — for example,
+side-by-side stereo, anaglyph, lenticular, or holographic. The runtime needs a
+vendor-neutral way for applications to switch between these modes at runtime.
+
+### New Function: `xrRequestDisplayRenderingModeEXT`
+
+```c
+XrResult xrRequestDisplayRenderingModeEXT(XrSession session, uint32_t modeIndex);
+```
+
+Switches the active display rendering mode. Mode indices are vendor-defined:
+
+| Index | Meaning |
+|-------|---------|
+| 0 | Standard rendering (always available) |
+| 1+ | Vendor-specific variations |
+
+### Internal Dispatch
+
+The runtime dispatches the request through the existing device property mechanism:
+
+```c
+xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, modeIndex);
+```
+
+This requires **no new vtable or interface**. Vendor drivers that support multiple
+rendering modes handle `XRT_DEVICE_PROPERTY_OUTPUT_MODE` in their `set_property`
+implementation. Drivers that do not implement `set_property` (or do not recognize
+the property) silently ignore the call — graceful degradation.
+
+### Vendor Examples
+
+| Vendor | Mode 0 | Mode 1 | Mode 2 |
+|--------|--------|--------|--------|
+| sim_display | SBS stereo | Anaglyph | Blend |
+| Leia SR | Standard | (future: vendor-specific) | — |
+
+### Backward Compatibility
+
+- Apps compiled against v6 are unaffected: the new function is opt-in
+- The runtime never calls `xrRequestDisplayRenderingModeEXT` automatically
+- Drivers that do not handle the property are unaffected
+
+---
+
 ## 8. Version History
 
 ### XR_EXT_win32_window_binding
@@ -1732,6 +1784,7 @@ XrResult xrRequestEyeTrackingModeEXT(XrSession session, XrEyeTrackingModeEXT mod
 | 4 | 2026-02-13 | David Fattal | Added `supportsDisplayModeSwitch` capability flag, `XrDisplayModeEXT` enum, and `xrRequestDisplayModeEXT` function for 2D/3D mode control. Added automatic lifecycle behavior (3D on session READY, 2D on session STOPPING). |
 | 5 | 2026-02-20 | David Fattal | Added `displayPixelWidth` / `displayPixelHeight` to `XrDisplayInfoEXT`. |
 | 6 | 2026-02-27 | David Fattal | Eye tracking mode control: `XrEyeTrackingModeEXT` enum, `XrEyeTrackingModeCapabilitiesEXT` (chained to `XrSystemProperties`), `XrViewEyeTrackingStateEXT` (chained to `XrViewState`), and `xrRequestEyeTrackingModeEXT` function. Allows apps to choose between smooth (SDK-filtered) and raw eye tracking, with explicit `isTracking` flag. |
+| 7 | 2026-03-04 | David Fattal | Vendor-specific display rendering mode control: `xrRequestDisplayRenderingModeEXT(session, modeIndex)` for switching between vendor-defined rendering variations (e.g., SBS stereo, anaglyph, lenticular). Mode 0 = standard (always available), mode 1+ = vendor-defined. Dispatches through `xrt_device_set_property`; no-op if driver doesn't support it. |
 
 ---
 
@@ -1773,4 +1826,5 @@ integration:
 | **Nominal viewer position** | A static, design-time expectation of the viewer's position relative to the display. Not tracked; defines the apex of the canonical display pyramid. |
 | **Disparity** | Horizontal shift between left and right eye images, measured as a fraction of window width. Controls perceived depth of window-space layers. |
 | **Display mode** | The operational mode of a tracked 3D display: 2D (standard flat panel) or 3D (light field interlacing active). Controlled via `xrRequestDisplayModeEXT`. |
+| **Display rendering mode** | A vendor-specific rendering variation within 3D mode (e.g., SBS stereo, anaglyph, lenticular). Controlled via `xrRequestDisplayRenderingModeEXT`. Mode 0 is standard; higher indices are vendor-defined. |
 | **Surface binding** | A platform-specific mechanism for the application to provide its own rendering surface to the runtime (`HWND` on Win32; `ANativeWindow*` + Java `Surface` + screen position on Android). |

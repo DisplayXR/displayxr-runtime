@@ -946,6 +946,43 @@ qwerty_toggle_display_mode(struct qwerty_system *qs)
 }
 
 void
+qwerty_set_rendering_mode(struct qwerty_system *qs, int mode)
+{
+	qs->rendering_mode = mode;
+	qs->rendering_mode_change_pending = true;
+	U_LOG_W("Qwerty: rendering mode set to %d", mode);
+}
+
+bool
+qwerty_check_rendering_mode_change(struct xrt_device **xdevs, size_t xdev_count, int *out_mode)
+{
+	struct qwerty_system *qs = NULL;
+	for (size_t i = 0; i < xdev_count; i++) {
+		if (xdevs[i] == NULL || xdevs[i]->destroy != qwerty_destroy) {
+			continue;
+		}
+		const char *name = xdevs[i]->tracking_origin->name;
+		if (strcmp(name, QWERTY_HMD_TRACKER_STR) == 0 || strcmp(name, QWERTY_LEFT_TRACKER_STR) == 0 ||
+		    strcmp(name, QWERTY_RIGHT_TRACKER_STR) == 0) {
+			qs = qwerty_device(xdevs[i])->sys;
+			break;
+		}
+	}
+
+	if (qs == NULL) {
+		return false;
+	}
+
+	if (qs->rendering_mode_change_pending) {
+		qs->rendering_mode_change_pending = false;
+		*out_mode = qs->rendering_mode;
+		return true;
+	}
+
+	return false;
+}
+
+void
 qwerty_toggle_camera_mode(struct qwerty_system *qs)
 {
 	if (qs->hmd == NULL) {

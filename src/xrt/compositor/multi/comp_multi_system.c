@@ -10,6 +10,7 @@
  */
 
 #include "xrt/xrt_config_os.h"
+#include "xrt/xrt_device.h"
 #include "xrt/xrt_handles.h"
 #include "xrt/xrt_session.h"
 #include "xrt/xrt_display_metrics.h"
@@ -2092,6 +2093,15 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 		if (force_2d) {
 			is_mono = true;
 		}
+
+		// Rendering mode change from qwerty 1/2/3 keys
+		int render_mode = -1;
+		if (qwerty_check_rendering_mode_change(mc->xsysd->xdevs, mc->xsysd->xdev_count, &render_mode)) {
+			struct xrt_device *head = mc->xsysd->static_roles.head;
+			if (head != NULL) {
+				xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, render_mode);
+			}
+		}
 	}
 #endif
 
@@ -3005,7 +3015,18 @@ transfer_layers_locked(struct multi_system_compositor *msc, int64_t display_time
 				multi_compositor_request_display_mode(mc, !force_2d);
 			}
 			shared_force_2d = force_2d;
-			break; // one toggle check per frame is enough
+
+			// Rendering mode change from qwerty 1/2/3 keys
+			int render_mode = -1;
+			if (qwerty_check_rendering_mode_change(mc->xsysd->xdevs, mc->xsysd->xdev_count,
+			                                       &render_mode)) {
+				struct xrt_device *head = mc->xsysd->static_roles.head;
+				if (head != NULL) {
+					xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, render_mode);
+				}
+			}
+
+			break; // one check per frame is enough
 		}
 	}
 #endif

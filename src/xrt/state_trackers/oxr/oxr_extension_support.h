@@ -178,6 +178,18 @@
 
 
 /*
+ * XR_KHR_metal_enable
+ */
+#if defined(XR_KHR_metal_enable) && defined(XR_USE_GRAPHICS_API_METAL)
+#define OXR_HAVE_KHR_metal_enable
+#define OXR_EXTENSION_SUPPORT_KHR_metal_enable(_) \
+    _(KHR_metal_enable, KHR_METAL_ENABLE)
+#else
+#define OXR_EXTENSION_SUPPORT_KHR_metal_enable(_)
+#endif
+
+
+/*
  * XR_KHR_loader_init
  */
 #if defined(XR_KHR_loader_init) && defined(XR_USE_PLATFORM_ANDROID)
@@ -985,6 +997,7 @@
     OXR_EXTENSION_SUPPORT_KHR_loader_init_android(_) \
     OXR_EXTENSION_SUPPORT_KHR_locate_spaces(_) \
     OXR_EXTENSION_SUPPORT_KHR_maintenance1(_) \
+    OXR_EXTENSION_SUPPORT_KHR_metal_enable(_) \
     OXR_EXTENSION_SUPPORT_KHR_opengl_enable(_) \
     OXR_EXTENSION_SUPPORT_KHR_opengl_es_enable(_) \
     OXR_EXTENSION_SUPPORT_KHR_swapchain_usage_input_attachment_bit(_) \

@@ -1180,7 +1180,7 @@ verify_window_space_layer(struct oxr_session *sess,
                           uint64_t timestamp)
 {
 	// Window-space layers require a session created with XR_EXT_win32_window_binding
-	if (!sess->is_d3d11_native_compositor && !sess->has_external_window) {
+	if (!sess->is_d3d11_native_compositor && !sess->is_metal_native_compositor && !sess->has_external_window) {
 		return oxr_error(log, XR_ERROR_LAYER_INVALID,
 		                 "(frameEndInfo->layers[%u]) window-space layer requires session created with "
 		                 "XR_EXT_win32_window_binding",

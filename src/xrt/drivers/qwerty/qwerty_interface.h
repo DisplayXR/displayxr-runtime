@@ -170,6 +170,23 @@ bool
 qwerty_check_display_mode_toggle(struct xrt_device **xdevs, size_t xdev_count, bool *out_force_2d);
 
 /*!
+ * Check if a rendering mode change is pending (1/2/3 key).
+ *
+ * Scans @p xdevs for a qwerty_system and checks its pending state.
+ * If a change is pending, clears the pending flag and sets @p out_mode
+ * to the requested rendering mode index.
+ *
+ * @param xdevs Array of devices to search for qwerty devices
+ * @param xdev_count Number of devices in the array
+ * @param[out] out_mode Receives the rendering mode index (0=SBS, 1+=vendor-defined)
+ * @return true if a change was pending (and is now cleared), false otherwise
+ *
+ * @ingroup drv_qwerty
+ */
+bool
+qwerty_check_rendering_mode_change(struct xrt_device **xdevs, size_t xdev_count, int *out_mode);
+
+/*!
  * Get the current qwerty stereo tuning state.
  *
  * Scans @p xdevs for a qwerty_system and copies its stereo state.

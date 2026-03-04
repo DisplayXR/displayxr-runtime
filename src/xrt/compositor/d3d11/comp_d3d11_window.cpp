@@ -281,22 +281,8 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			U_LOG_W("D3D11 window: F11 toggled to %s mode", fs ? "fullscreen" : "windowed");
 			return 0;
 		}
-		// 1/2/3: switch device output mode (generic property interface)
-		// NOTE: May be replaced by XR_EXT_display_render_mode / xrSetDisplayRenderModeEXT()
-		if (w->xsysd != NULL) {
-			struct xrt_device *head = w->xsysd->static_roles.head;
-			if (wParam == '1') {
-				xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, 0);
-				return 0;
-			} else if (wParam == '2') {
-				xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, 1);
-				return 0;
-			} else if (wParam == '3') {
-				xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, 2);
-				return 0;
-			}
-		}
 		// Forward to qwerty driver if enabled (fall through to WM_KEYUP case)
+		// (1/2/3 rendering mode keys are handled by qwerty driver and polled in layer_commit)
 		// FALLTHROUGH
 	case WM_KEYUP:
 	case WM_SYSKEYDOWN:

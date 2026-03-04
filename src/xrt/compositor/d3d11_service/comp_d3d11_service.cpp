@@ -2621,6 +2621,15 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			    c->render.display_processor, !force_2d);
 		}
 		sys->force_2d_mode = force_2d;
+
+		// Rendering mode change from qwerty 1/2/3 keys
+		int render_mode = -1;
+		if (qwerty_check_rendering_mode_change(sys->xsysd->xdevs, sys->xsysd->xdev_count, &render_mode)) {
+			struct xrt_device *head = sys->xsysd->static_roles.head;
+			if (head != NULL) {
+				xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, render_mode);
+			}
+		}
 	}
 #endif
 	if (sys->force_2d_mode) {

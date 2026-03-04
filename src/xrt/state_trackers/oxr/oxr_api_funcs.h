@@ -263,6 +263,15 @@ oxr_xrGetD3D12GraphicsRequirementsKHR(XrInstance instance,
                                       XrGraphicsRequirementsD3D12KHR *graphicsRequirements);
 #endif // XR_USE_GRAPHICS_API_D3D12
 
+#ifdef XR_USE_GRAPHICS_API_METAL
+
+//! OpenXR API function @ep{xrGetMetalGraphicsRequirementsKHR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrGetMetalGraphicsRequirementsKHR(XrInstance instance,
+                                      XrSystemId systemId,
+                                      XrGraphicsRequirementsMetalKHR *graphicsRequirements);
+#endif // XR_USE_GRAPHICS_API_METAL
+
 /*
  *
  * oxr_api_session.c
@@ -772,6 +781,9 @@ oxr_xrRequestDisplayModeEXT(XrSession session, XrDisplayModeEXT displayMode);
 //! OpenXR API function @ep{xrRequestEyeTrackingModeEXT}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrRequestEyeTrackingModeEXT(XrSession session, XrEyeTrackingModeEXT mode);
+//! OpenXR API function @ep{xrRequestDisplayRenderingModeEXT}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrRequestDisplayRenderingModeEXT(XrSession session, uint32_t modeIndex);
 #endif
 
 /*!

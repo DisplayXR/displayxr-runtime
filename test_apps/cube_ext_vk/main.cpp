@@ -41,10 +41,6 @@ static const wchar_t* WINDOW_TITLE = L"SR Cube OpenXR Ext Vulkan (Press ESC to e
 static const float HUD_WIDTH_FRACTION = 0.30f;
 static const float HUD_HEIGHT_FRACTION = 0.50f;
 
-// sim_display output mode switching (loaded at runtime via GetProcAddress)
-typedef void (*PFN_sim_display_set_output_mode)(int mode);
-static PFN_sim_display_set_output_mode g_pfnSetOutputMode = nullptr;
-
 // Global state (shared between main thread and render thread)
 static InputState g_inputState;
 static std::mutex g_inputMutex;
@@ -236,8 +232,9 @@ static void RenderThreadFunc(
             windowH = g_windowHeight;
         }
 
-        if (outputModeChanged && g_pfnSetOutputMode) {
-            g_pfnSetOutputMode(inputSnapshot.outputMode);
+        if (outputModeChanged && xr->pfnRequestDisplayRenderingModeEXT &&
+            xr->session != XR_NULL_HANDLE) {
+            xr->pfnRequestDisplayRenderingModeEXT(xr->session, (uint32_t)inputSnapshot.outputMode);
         }
 
         // Handle display mode toggle (V key)
@@ -521,7 +518,7 @@ static void RenderThreadFunc(
                                 std::wstring dispText = FormatDisplayInfo(xr->displayWidthM, xr->displayHeightM,
                                     xr->nominalViewerX, xr->nominalViewerY, xr->nominalViewerZ);
                                 dispText += L"\n" + FormatScaleInfo(xr->recommendedViewScaleX, xr->recommendedViewScaleY);
-                                dispText += L"\n" + FormatOutputMode(inputSnapshot.outputMode, g_pfnSetOutputMode != nullptr);
+                                dispText += L"\n" + FormatOutputMode(inputSnapshot.outputMode, xr->pfnRequestDisplayRenderingModeEXT != nullptr);
                                 std::wstring eyeText = FormatEyeTrackingInfo(
                                     xr->leftEyeX, xr->leftEyeY, xr->leftEyeZ,
                                     xr->rightEyeX, xr->rightEyeY, xr->rightEyeZ,
@@ -546,7 +543,7 @@ static void RenderThreadFunc(
                                         inputSnapshot.stereo.virtualDisplayHeight, hudM2v);
                                     stereoText += vhBuf;
                                 }
-                                std::wstring helpText = FormatHelpText(g_pfnSetOutputMode != nullptr);
+                                std::wstring helpText = FormatHelpText(xr->pfnRequestDisplayRenderingModeEXT != nullptr);
 
                                 uint32_t srcRowPitch = 0;
                                 const void* pixels = RenderHudAndMap(*hud, &srcRowPitch, sessionText, modeText, perfText, dispText, eyeText,
@@ -738,16 +735,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         g_xr = nullptr;
         ShutdownLogging();
         return 1;
-    }
-
-    // Try to load sim_display_set_output_mode from the runtime (for 1/2/3 key switching)
-    {
-        HMODULE rtModule = GetModuleHandleA("openxr_monado.dll");
-        if (!rtModule) rtModule = GetModuleHandleA("openxr_monado");
-        if (rtModule) {
-            g_pfnSetOutputMode = (PFN_sim_display_set_output_mode)GetProcAddress(rtModule, "sim_display_set_output_mode");
-        }
-        LOG_INFO("sim_display output mode: %s", g_pfnSetOutputMode ? "available" : "not available");
     }
 
     // Get Vulkan graphics requirements (must be called before creating Vulkan instance per spec)

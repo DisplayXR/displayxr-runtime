@@ -407,6 +407,13 @@ if(WIN32 AND XRT_HAVE_D3D11)
 endif()
 
 ###
+# Native Metal compositor (bypasses Vulkan entirely)
+#
+if(APPLE AND XRT_HAVE_METAL)
+	add_subdirectory(metal)
+endif()
+
+###
 # D3D11 Service compositor (for hybrid mode)
 #
 if(WIN32 AND XRT_FEATURE_HYBRID_MODE)

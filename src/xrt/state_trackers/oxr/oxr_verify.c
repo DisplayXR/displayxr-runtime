@@ -539,6 +539,15 @@ oxr_verify_XrSessionCreateInfo(struct oxr_logger *log,
 	}
 #endif // XR_USE_GRAPHICS_API_D3D12
 
+#if defined(XR_USE_GRAPHICS_API_METAL)
+	XrGraphicsBindingMetalKHR const *metal =
+	    OXR_GET_INPUT_FROM_CHAIN(createInfo, XR_TYPE_GRAPHICS_BINDING_METAL_KHR, XrGraphicsBindingMetalKHR);
+	if (metal != NULL) {
+		OXR_VERIFY_EXTENSION(log, inst, KHR_metal_enable);
+		return oxr_verify_XrGraphicsBindingMetalKHR(log, metal);
+	}
+#endif // XR_USE_GRAPHICS_API_METAL
+
 	/*
 	 * Add any new graphics binding structs here - before the headless
 	 * check. (order for non-headless checks not specified in standard.)
@@ -706,6 +715,21 @@ oxr_verify_XrGraphicsBindingD3D12KHR(struct oxr_logger *log, const XrGraphicsBin
 	return XR_SUCCESS;
 }
 #endif // defined(XR_USE_GRAPHICS_API_D3D12)
+
+#if defined(XR_USE_GRAPHICS_API_METAL)
+XrResult
+oxr_verify_XrGraphicsBindingMetalKHR(struct oxr_logger *log, const XrGraphicsBindingMetalKHR *next)
+{
+	if (next->type != XR_TYPE_GRAPHICS_BINDING_METAL_KHR) {
+		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE, "Graphics binding has invalid type");
+	}
+	if (next->commandQueue == NULL) {
+		return oxr_error(log, XR_ERROR_GRAPHICS_DEVICE_INVALID,
+		                 "XrGraphicsBindingMetalKHR::commandQueue cannot be NULL");
+	}
+	return XR_SUCCESS;
+}
+#endif // defined(XR_USE_GRAPHICS_API_METAL)
 
 #ifdef XR_EXT_dpad_binding
 XrResult

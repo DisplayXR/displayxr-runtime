@@ -18,4 +18,5 @@
 #cmakedefine XR_USE_GRAPHICS_API_D3D12
 #cmakedefine XR_USE_PLATFORM_ANDROID
 #cmakedefine XR_USE_PLATFORM_WIN32
+#cmakedefine XR_USE_GRAPHICS_API_METAL
 #cmakedefine XR_USE_PLATFORM_MACOS

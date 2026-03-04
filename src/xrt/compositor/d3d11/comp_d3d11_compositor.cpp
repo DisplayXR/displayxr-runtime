@@ -778,6 +778,15 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		if (force_2d) {
 			is_mono = true;
 		}
+
+		// Rendering mode change from qwerty 1/2/3 keys
+		int render_mode = -1;
+		if (qwerty_check_rendering_mode_change(c->xsysd->xdevs, c->xsysd->xdev_count, &render_mode)) {
+			struct xrt_device *head = c->xsysd->static_roles.head;
+			if (head != nullptr) {
+				xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, render_mode);
+			}
+		}
 	}
 #endif
 

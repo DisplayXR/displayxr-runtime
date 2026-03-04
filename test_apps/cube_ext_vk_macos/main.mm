@@ -14,7 +14,7 @@
  * - Mouse drag camera, WASD/QE movement, scroll zoom
  * - XR_EXT_display_info: Kooima projection, display metrics
  * - 2D/3D toggle (V key) via xrRequestDisplayModeEXT
- * - 1/2/3 keys for sim_display modes (SBS/anaglyph/blend)
+ * - 1/2/3 keys for rendering modes (SBS/anaglyph/blend) via xrRequestDisplayRenderingModeEXT
  * - Tab: toggle HUD overlay, Space: reset camera, ESC: quit
  */
 
@@ -37,7 +37,6 @@
 #include <chrono>
 #include <vector>
 
-#include <dlfcn.h>
 #include <mach-o/dyld.h>
 #include <unistd.h>
 
@@ -103,6 +102,9 @@ struct InputState {
     bool displayMode3D = true;
     bool displayModeToggleRequested = false;
 
+    // Rendering mode change (1/2/3 keys)
+    bool renderingModeChangeRequested = false;
+
     // Camera vs display mode toggle (C key)
     bool cameraMode = false;
     float nominalViewerZ = 0.5f;  // Cached from runtime for camera-mode init
@@ -121,15 +123,7 @@ static NSView *g_metalView = nil;
 static InputState g_input;
 static const float CAMERA_HALF_TAN_VFOV = 0.32491969623f; // tan(18°) → 36° vFOV
 
-// dlsym handle for sim_display live mode switching (Bug 4 fix)
-typedef void (*PFN_sim_display_set_output_mode)(int mode);
-static PFN_sim_display_set_output_mode g_pfnSetOutputMode = nullptr;
-
-// Current sim_display output mode (0=SBS, 1=anaglyph, 2=blend)
-// Tracks which mode the display processor is using so the app can
-// adjust render dimensions and Kooima FOV accordingly.
-// SBS: each eye = half width, Kooima uses half display width
-// Anaglyph/blend: each eye = full width, Kooima uses full display width
+// Current display rendering mode (0=SBS, 1=anaglyph, 2=blend — vendor-defined)
 static int g_currentOutputMode = 0;
 
 // Borderless fullscreen state
@@ -1746,35 +1740,9 @@ static void PumpMacOSEvents() {
                             g_input.pitch = 0.0f;
                         }
                     }
-                    else if (ch == '1' && !isRepeat) {
-                        g_currentOutputMode = 0;
-                        if (g_pfnSetOutputMode) {
-                            g_pfnSetOutputMode(0); // SIM_DISPLAY_OUTPUT_SBS
-                            LOG_INFO("Switched to SBS mode (live)");
-                        } else {
-                            setenv("SIM_DISPLAY_OUTPUT", "sbs", 1);
-                            LOG_INFO("Switched to SBS mode (restart required)");
-                        }
-                    }
-                    else if (ch == '2' && !isRepeat) {
-                        g_currentOutputMode = 1;
-                        if (g_pfnSetOutputMode) {
-                            g_pfnSetOutputMode(1); // SIM_DISPLAY_OUTPUT_ANAGLYPH
-                            LOG_INFO("Switched to anaglyph mode (live)");
-                        } else {
-                            setenv("SIM_DISPLAY_OUTPUT", "anaglyph", 1);
-                            LOG_INFO("Switched to anaglyph mode (restart required)");
-                        }
-                    }
-                    else if (ch == '3' && !isRepeat) {
-                        g_currentOutputMode = 2;
-                        if (g_pfnSetOutputMode) {
-                            g_pfnSetOutputMode(2); // SIM_DISPLAY_OUTPUT_BLEND
-                            LOG_INFO("Switched to blend mode (live)");
-                        } else {
-                            setenv("SIM_DISPLAY_OUTPUT", "blend", 1);
-                            LOG_INFO("Switched to blend mode (restart required)");
-                        }
+                    else if ((ch == '1' || ch == '2' || ch == '3') && !isRepeat) {
+                        g_currentOutputMode = ch - '1'; // 0=SBS, 1=anaglyph, 2=blend
+                        g_input.renderingModeChangeRequested = true;
                     }
                 }
             } else if (type == NSEventTypeKeyUp) {
@@ -1899,6 +1867,7 @@ struct AppXrSession {
     float nominalViewerZ = 0.5f;
     bool supportsDisplayModeSwitch = false;
     PFN_xrRequestDisplayModeEXT pfnRequestDisplayModeEXT = nullptr;
+    PFN_xrRequestDisplayRenderingModeEXT pfnRequestDisplayRenderingModeEXT = nullptr;
 
     // Eye tracking mode control (XR_EXT_display_info v6)
     uint32_t supportedEyeTrackingModes = 0;
@@ -2010,9 +1979,11 @@ static bool InitializeOpenXR(AppXrSession& xr) {
                 xr.supportedEyeTrackingModes, xr.defaultEyeTrackingMode);
         }
 
-        // Load display mode request function pointer
+        // Load display extension function pointers
         xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayModeEXT",
             (PFN_xrVoidFunction*)&xr.pfnRequestDisplayModeEXT);
+        xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayRenderingModeEXT",
+            (PFN_xrVoidFunction*)&xr.pfnRequestDisplayRenderingModeEXT);
 
         // Load eye tracking mode request function pointer
         if (xr.supportedEyeTrackingModes != 0) {
@@ -2491,30 +2462,6 @@ int main() {
         return 1;
     }
 
-    // Try to find sim_display_set_output_mode in the loaded runtime (1/2/3 keys).
-    // OpenXR loader dlopen's the runtime with RTLD_LOCAL, so RTLD_DEFAULT won't see it.
-    // Use _dyld APIs to find the loaded runtime library and get a proper handle.
-    {
-        void *rtHandle = NULL;
-        uint32_t imageCount = _dyld_image_count();
-        for (uint32_t i = 0; i < imageCount; i++) {
-            const char *name = _dyld_get_image_name(i);
-            if (name && strstr(name, "openxr_monado")) {
-                LOG_INFO("Found runtime image: %s", name);
-                rtHandle = dlopen(name, RTLD_NOLOAD);
-                break;
-            }
-        }
-        if (rtHandle) {
-            g_pfnSetOutputMode = (PFN_sim_display_set_output_mode)dlsym(rtHandle, "sim_display_set_output_mode");
-        }
-        if (g_pfnSetOutputMode) {
-            LOG_INFO("sim_display hot-reload: available");
-        } else {
-            LOG_INFO("sim_display hot-reload: not available (%s)", dlerror());
-        }
-    }
-
     if (!GetVulkanGraphicsRequirements(xr)) {
         CleanupOpenXR(xr);
         return 1;
@@ -2671,6 +2618,18 @@ int main() {
                 LOG_INFO("Eye tracking mode → %s (%s)",
                     newMode == XR_EYE_TRACKING_MODE_RAW_EXT ? "RAW" : "SMOOTH",
                     XR_SUCCEEDED(etResult) ? "OK" : "unsupported");
+            }
+        }
+
+        // Handle rendering mode change (1/2/3 keys)
+        if (g_input.renderingModeChangeRequested) {
+            g_input.renderingModeChangeRequested = false;
+            if (xr.pfnRequestDisplayRenderingModeEXT && xr.session != XR_NULL_HANDLE) {
+                const char *modeNames[] = {"SBS", "Anaglyph", "Blend"};
+                XrResult res = xr.pfnRequestDisplayRenderingModeEXT(xr.session, (uint32_t)g_currentOutputMode);
+                LOG_INFO("Rendering mode → %s (%s)",
+                    modeNames[g_currentOutputMode],
+                    XR_SUCCEEDED(res) ? "OK" : "failed");
             }
         }
 

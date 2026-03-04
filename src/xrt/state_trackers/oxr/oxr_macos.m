@@ -68,19 +68,6 @@ oxr_macos_pump_events(struct xrt_device **xdevs, uint32_t xdev_count, struct xrt
 				oxr_macos_set_window_closed();
 			}
 
-			// 1/2/3 keys: switch display output mode via device property.
-			// Values: 0=SBS, 1=Anaglyph, 2=Blend (matches sim_display_output_mode enum)
-			if ([event type] == NSEventTypeKeyDown && head != NULL) {
-				unsigned short kc = [event keyCode];
-				if (kc == 18) { // '1'
-					xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, 0);
-				} else if (kc == 19) { // '2'
-					xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, 1);
-				} else if (kc == 20) { // '3'
-					xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, 2);
-				}
-			}
-
 			bool skip_send = false;
 #ifdef XRT_BUILD_DRIVER_QWERTY
 			// Forward event to qwerty device handler for
@@ -100,6 +87,16 @@ oxr_macos_pump_events(struct xrt_device **xdevs, uint32_t xdev_count, struct xrt
 				[NSApp sendEvent:event];
 			}
 		}
+
+#ifdef XRT_BUILD_DRIVER_QWERTY
+		// Poll for rendering mode change (1/2/3 keys via qwerty driver)
+		if (xdevs != NULL && xdev_count > 0 && head != NULL) {
+			int render_mode = -1;
+			if (qwerty_check_rendering_mode_change(xdevs, xdev_count, &render_mode)) {
+				xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, render_mode);
+			}
+		}
+#endif
 
 		// Detect window close: track the first window we see and
 		// check if it has been closed (no longer visible).  We must

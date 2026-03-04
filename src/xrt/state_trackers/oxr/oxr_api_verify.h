@@ -440,6 +440,11 @@ XrResult
 oxr_verify_XrGraphicsBindingD3D12KHR(struct oxr_logger *, const XrGraphicsBindingD3D12KHR *);
 #endif // defined(XR_USE_GRAPHICS_API_D3D12)
 
+#if defined(XR_USE_GRAPHICS_API_METAL)
+XrResult
+oxr_verify_XrGraphicsBindingMetalKHR(struct oxr_logger *, const XrGraphicsBindingMetalKHR *);
+#endif // defined(XR_USE_GRAPHICS_API_METAL)
+
 #ifdef XR_EXT_dpad_binding
 XrResult
 oxr_verify_XrInteractionProfileDpadBindingEXT(struct oxr_logger *,

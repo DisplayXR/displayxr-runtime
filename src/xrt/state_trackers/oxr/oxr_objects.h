@@ -1427,6 +1427,35 @@ oxr_session_populate_d3d11_native(struct oxr_logger *log,
 
 /*
  *
+ * Metal, located in various files.
+ *
+ */
+
+#ifdef XR_USE_GRAPHICS_API_METAL
+
+/*!
+ * Check if Metal native compositor should be used.
+ */
+bool
+oxr_metal_native_compositor_supported(struct oxr_system *sys, void *window_handle);
+
+#ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR
+/*!
+ * Populate the session with the Metal native compositor.
+ * This bypasses Vulkan entirely for Metal apps.
+ */
+XrResult
+oxr_session_populate_metal_native(struct oxr_logger *log,
+                                  struct oxr_system *sys,
+                                  XrGraphicsBindingMetalKHR const *next,
+                                  void *window_handle,
+                                  struct oxr_session *sess);
+#endif
+
+#endif
+
+/*
+ *
  * D3D12, located in various files.
  *
  */
@@ -1837,6 +1866,9 @@ struct oxr_session
 
 	//! True if using D3D11 native compositor (not multi_compositor).
 	bool is_d3d11_native_compositor;
+
+	//! True if using Metal native compositor (not multi_compositor).
+	bool is_metal_native_compositor;
 
 	//! True if session was created with an external window handle (XR_EXT_win32_window_binding).
 	bool has_external_window;

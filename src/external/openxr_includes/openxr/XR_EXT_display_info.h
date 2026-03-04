@@ -22,7 +22,7 @@ extern "C" {
 #endif
 
 #define XR_EXT_display_info 1
-#define XR_EXT_display_info_SPEC_VERSION 6
+#define XR_EXT_display_info_SPEC_VERSION 7
 #define XR_EXT_DISPLAY_INFO_EXTENSION_NAME "XR_EXT_display_info"
 
 // Reuse the type value from the deleted XR_EXT_dynamic_render_resolution
@@ -180,6 +180,35 @@ typedef XrResult (XRAPI_PTR *PFN_xrRequestEyeTrackingModeEXT)(
 XRAPI_ATTR XrResult XRAPI_CALL xrRequestEyeTrackingModeEXT(
     XrSession               session,
     XrEyeTrackingModeEXT    mode);
+#endif
+
+// ---- v7: Display Rendering Mode Control ----
+
+/*!
+ * @brief Request a vendor-specific display rendering mode.
+ *
+ * Different 3D display vendors support multiple rendering variations
+ * (e.g., side-by-side stereo, anaglyph, lenticular). This function lets
+ * the application switch between them at runtime.
+ *
+ * Mode indices are vendor-defined:
+ *   - Mode 0 = standard rendering (always available)
+ *   - Mode 1+ = vendor-specific variations
+ *
+ * The runtime dispatches the request to the active display device, which
+ * may accept or silently ignore unsupported indices.
+ *
+ * @param session A valid XrSession handle.
+ * @param modeIndex The vendor-defined rendering mode index.
+ * @return XR_SUCCESS on success.
+ */
+typedef XrResult (XRAPI_PTR *PFN_xrRequestDisplayRenderingModeEXT)(
+    XrSession session, uint32_t modeIndex);
+
+#ifndef XR_NO_PROTOTYPES
+XRAPI_ATTR XrResult XRAPI_CALL xrRequestDisplayRenderingModeEXT(
+    XrSession               session,
+    uint32_t                modeIndex);
 #endif
 
 #ifdef __cplusplus

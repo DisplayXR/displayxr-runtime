@@ -1099,6 +1099,15 @@ oxr_session_locate_views(struct oxr_logger *log,
 			} else if (oxr_session_get_display_dimensions(sess, &screen_width_m, &screen_height_m) &&
 			           screen_width_m > 0.0f && screen_height_m > 0.0f) {
 				// Fallback: full display dimensions (fullscreen or no window metrics)
+				// In SBS mode each eye sees half the display width
+				int32_t output_mode = 0;
+				struct xrt_device *head_xdev = GET_XDEV_BY_ROLE(sess->sys, head);
+				if (head_xdev != NULL &&
+				    xrt_device_get_property(head_xdev, XRT_DEVICE_PROPERTY_OUTPUT_MODE,
+				                            &output_mode) == XRT_SUCCESS &&
+				    output_mode == 0) { // 0 = SBS
+					screen_width_m /= 2.0f;
+				}
 			}
 
 			if (should_log) {
