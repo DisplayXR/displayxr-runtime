@@ -16,6 +16,10 @@ Five test applications that demonstrate the **external window binding** and **di
 
 The app creates its own window and passes the handle to the runtime at session creation. On Windows, an `XrWin32WindowBindingCreateInfoEXT` struct carrying the HWND is chained into `XrSessionCreateInfo.next`. On macOS, `XrCocoaWindowBindingCreateInfoEXT` carries the NSView (a CAMetalLayer-backed view). The runtime renders into the app's window instead of creating its own, enabling windowed mode, multi-app scenarios, and app-controlled input.
 
+Both extensions also support **offscreen modes** (no window required):
+- **Readback callback** (`readbackCallback`): CPU fallback — composited RGBA pixels delivered per frame via callback (GPU→CPU round-trip).
+- **Shared GPU texture** (`sharedTextureHandle` on Win32, `sharedIOSurface` on macOS): zero-copy GPU→GPU texture sharing via platform-native shared handles (D3D11/D3D12 HANDLE or IOSurface).
+
 ### XR_EXT_display_info
 
 Queries physical display properties by chaining `XrDisplayInfoEXT` into `xrGetSystemProperties`:
@@ -201,21 +205,28 @@ View matrix from player-transformed pose, projection matrix from Kooima. The com
 - Submit count: `viewCount = displayMode3D ? 2 : 1`
 - HUD shows "[no switch]" if runtime doesn't support `xrRequestDisplayModeEXT`
 
-## sim_display Visualization Modes
+## Display Rendering Mode Switching
 
-Keys **1/2/3** switch between sim_display output modes for development without a real 3D display:
+Keys **1/2/3** switch between vendor-defined rendering modes via the OpenXR API
+`xrRequestDisplayRenderingModeEXT(session, modeIndex)` (added in `XR_EXT_display_info` v7):
 
-| Key | Mode | Description |
-|-----|------|-------------|
-| 1 | SBS | Side-by-side stereo |
-| 2 | Anaglyph | Red-cyan anaglyph (use red-cyan glasses) |
-| 3 | Blend | Alpha-blend 50/50 overlay of L/R eyes |
+| Key | Mode Index | sim_display Behavior |
+|-----|-----------|---------------------|
+| 1 | 0 | SBS — Side-by-side stereo |
+| 2 | 1 | Anaglyph — Red-cyan (use red-cyan glasses) |
+| 3 | 2 | Blend — Alpha-blend 50/50 overlay of L/R eyes |
 
-**macOS:** Uses `dlsym` to find `sim_display_set_output_mode()` in the loaded runtime via `_dyld` APIs. Calls the function directly for **live hot-reload** without restarting. Falls back to `setenv("SIM_DISPLAY_OUTPUT", ...)` if the symbol isn't found (restart required).
+Mode indices are vendor-defined. Mode 0 is always "standard rendering." The
+sim_display driver maps 0/1/2 to SBS/anaglyph/blend. Other vendors define their
+own modes. Drivers that don't support rendering mode switching silently ignore
+the call (graceful degradation).
 
-**Windows:** The Windows ext apps do not currently include 1/2/3 key bindings. Use the `SIM_DISPLAY_OUTPUT` environment variable before launching.
+The function pointer is loaded at startup via `xrGetInstanceProcAddr`. If the
+runtime doesn't support it, mode switching is disabled and the HUD shows
+"[not available]".
 
-These modes are specific to the sim_display driver and are **not available** on Leia hardware, which uses its own light field weaver.
+The initial mode can also be set via the `SIM_DISPLAY_OUTPUT` environment
+variable (`sbs`, `anaglyph`, or `blend`) before launching.
 
 ## Fullscreen
 

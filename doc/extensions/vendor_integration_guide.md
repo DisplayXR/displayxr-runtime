@@ -141,7 +141,7 @@ The runtime exposes three custom extensions that surface vendor data to
 applications.  The vendor provides the underlying data; the runtime maps it
 onto the OpenXR API.
 
-### 3.1 `XR_EXT_display_info` (v4)
+### 3.1 `XR_EXT_display_info` (v7)
 
 **Header:** `src/external/openxr_includes/openxr/XR_EXT_display_info.h`
 
@@ -198,14 +198,21 @@ Allows the app to pass an HWND for windowed rendering:
 
 ```c
 typedef struct XrWin32WindowBindingCreateInfoEXT {
-    XrStructureType type;        // XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT
+    XrStructureType type;                  // XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT
     const void*     next;
-    void*           windowHandle; // HWND
+    void*           windowHandle;          // HWND (or NULL for offscreen)
+    PFN_xrReadbackCallback readbackCallback; // CPU readback (offscreen), or NULL
+    void*           readbackUserdata;
+    void*           sharedTextureHandle;   // Shared D3D11/D3D12 HANDLE (zero-copy), or NULL
 } XrWin32WindowBindingCreateInfoEXT;
 ```
 
 Also defines `XrCompositionLayerWindowSpaceEXT` for layers positioned in
 fractional window coordinates with per-eye disparity shift.
+
+**Offscreen modes** (spec version 2): Set `windowHandle=NULL` and provide
+either `readbackCallback` (CPU round-trip) or `sharedTextureHandle` (zero-copy
+GPU texture sharing via D3D11/D3D12 shared HANDLE).
 
 **Vendor impact:** The vendor's SDK wrapper receives the window handle at init
 time and must create the weaver/interlacer targeting that window.
@@ -218,11 +225,18 @@ macOS equivalent — app passes an `NSView*` with `CAMetalLayer` backing:
 
 ```c
 typedef struct XrCocoaWindowBindingCreateInfoEXT {
-    XrStructureType type;        // XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_EXT
+    XrStructureType type;                  // XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_EXT
     const void*     next;
-    void*           viewHandle;  // NSView* with CAMetalLayer backing
+    void*           viewHandle;            // NSView* with CAMetalLayer backing (or NULL)
+    PFN_xrReadbackCallback readbackCallback; // CPU readback (offscreen), or NULL
+    void*           readbackUserdata;
+    void*           sharedIOSurface;       // IOSurfaceRef (zero-copy), or NULL
 } XrCocoaWindowBindingCreateInfoEXT;
 ```
+
+**Offscreen modes** (spec version 3): Set `viewHandle=NULL` and provide
+either `readbackCallback` (CPU round-trip) or `sharedIOSurface` (zero-copy
+GPU texture sharing via IOSurface).
 
 ### 3.4 How `xrLocateViews` Returns Eye Positions: RAW vs RENDER_READY
 
@@ -891,6 +905,56 @@ returns `XR_ERROR_FEATURE_UNSUPPORTED` for any mode.
 | Leia SR | `1` (SMOOTH) | `0` (SMOOTH) | Eye-distance heuristic: `dist² > 1e-6` |
 | Sim display | `2` (RAW) | `1` (RAW) | Always `true` (simulated) |
 | No-tracker | `0` (NONE) | N/A | Always `false` |
+
+### 6.7 Display Rendering Mode Control (v7)
+
+Version 7 of `XR_EXT_display_info` adds vendor-specific rendering mode switching
+via `xrRequestDisplayRenderingModeEXT(session, modeIndex)`.
+
+Different 3D display vendors may support multiple rendering variations (e.g.,
+side-by-side stereo, lenticular, anaglyph). This function lets apps switch
+between them at runtime.
+
+#### Mode Convention
+
+- **Mode 0** = standard rendering (always available)
+- **Mode 1+** = vendor-defined variations
+
+Mode indices are vendor-specific. The runtime dispatches the request to the
+device driver via `xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, modeIndex)`.
+
+#### Vendor Implementation
+
+Drivers handle rendering mode through the existing `set_property` / `get_property`
+vtable on `xrt_device`. **No new vtable or interface is needed.**
+
+If a driver does not implement `set_property`, or implements it but does not
+handle `XRT_DEVICE_PROPERTY_OUTPUT_MODE`, the call is a no-op — graceful
+degradation with no crash or error.
+
+To support rendering modes, a vendor driver adds a case in its `set_property`:
+
+```c
+static xrt_result_t
+my_driver_set_property(struct xrt_device *xdev,
+                       enum xrt_device_property_id property,
+                       int32_t value)
+{
+    if (property == XRT_DEVICE_PROPERTY_OUTPUT_MODE) {
+        // Switch to vendor-specific rendering mode 'value'
+        my_sdk_set_rendering_mode(value);
+        return XRT_SUCCESS;
+    }
+    return XRT_ERROR_DEVICE_PROPERTY_NOT_SUPPORTED;
+}
+```
+
+#### Reference Implementations
+
+| Driver | Modes | Behavior |
+|--------|-------|----------|
+| sim_display | 0=SBS, 1=anaglyph, 2=blend | Switches display processor output |
+| Leia SR | 0=standard | Not yet multi-mode (no-op for mode > 0) |
 
 ---
 

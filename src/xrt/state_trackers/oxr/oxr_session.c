@@ -68,6 +68,10 @@
 #include "d3d11/comp_d3d11_compositor.h"
 #endif
 
+#ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR
+#include "metal/comp_metal_compositor.h"
+#endif
+
 
 DEBUG_GET_ONCE_NUM_OPTION(ipd, "OXR_DEBUG_IPD_MM", 63)
 DEBUG_GET_ONCE_NUM_OPTION(wait_frame_sleep, "OXR_DEBUG_WAIT_FRAME_EXTRA_SLEEP_MS", 0)
@@ -145,6 +149,29 @@ oxr_session_get_predicted_eye_positions(struct oxr_session *sess, struct xrt_eye
 	}
 #endif
 
+#ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR
+	// Metal native compositor path
+	if (sess->is_metal_native_compositor) {
+		struct xrt_vec3 left_eye, right_eye;
+		bool got_positions =
+		    comp_metal_compositor_get_predicted_eye_positions(&sess->xcn->base, &left_eye, &right_eye);
+
+		if (got_positions) {
+			out_eye_pair->left = (struct xrt_eye_position){left_eye.x, left_eye.y, left_eye.z};
+			out_eye_pair->right = (struct xrt_eye_position){right_eye.x, right_eye.y, right_eye.z};
+			out_eye_pair->timestamp_ns = os_monotonic_get_ns();
+			out_eye_pair->valid = true;
+			float dx = right_eye.x - left_eye.x;
+			float dy = right_eye.y - left_eye.y;
+			float dz = right_eye.z - left_eye.z;
+			float dist_sq = dx * dx + dy * dy + dz * dz;
+			out_eye_pair->is_tracking = (dist_sq > 1e-6f);
+			return true;
+		}
+		return false;
+	}
+#endif
+
 	// Multi-compositor path (Vulkan) — only valid for in-process mode.
 	// In IPC mode, sess->xcn is an IPC proxy, not a multi_compositor.
 	// xmcc is only non-NULL for in-process multi_system_compositor.
@@ -176,6 +203,15 @@ oxr_session_get_display_dimensions(struct oxr_session *sess, float *out_width_m,
 	}
 #endif
 
+#ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR
+	// Metal native compositor path (falls through to generic if no display processor)
+	if (sess->xcn != NULL && sess->is_metal_native_compositor) {
+		if (comp_metal_compositor_get_display_dimensions(&sess->xcn->base, out_width_m, out_height_m)) {
+			return true;
+		}
+	}
+#endif
+
 	// Generic path: read from system compositor info (populated at init by SR or sim_display)
 	const struct xrt_system_compositor_info *info = &sess->sys->xsysc->info;
 	if (info->display_width_m <= 0.0f || info->display_height_m <= 0.0f) {
@@ -203,6 +239,15 @@ oxr_session_get_window_metrics(struct oxr_session *sess,
 #ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
 	if (sess->is_d3d11_native_compositor) {
 		return comp_d3d11_compositor_get_window_metrics(&sess->xcn->base, out_metrics);
+	}
+#endif
+
+#ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR
+	if (sess->is_metal_native_compositor) {
+		if (comp_metal_compositor_get_window_metrics(&sess->xcn->base, out_metrics)) {
+			return true;
+		}
+		// Fall through to generic path when no display processor
 	}
 #endif
 
@@ -239,6 +284,16 @@ oxr_session_request_display_mode(struct oxr_logger *log, struct oxr_session *ses
 #ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
 	if (sess->is_d3d11_native_compositor) {
 		success = comp_d3d11_compositor_request_display_mode(&sess->xcn->base, enable_3d);
+		if (success) {
+			sess->display_mode_3d = enable_3d;
+		}
+		return XR_SUCCESS;
+	}
+#endif
+
+#ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR
+	if (sess->is_metal_native_compositor) {
+		success = comp_metal_compositor_request_display_mode(&sess->xcn->base, enable_3d);
 		if (success) {
 			sess->display_mode_3d = enable_3d;
 		}
@@ -650,6 +705,29 @@ oxr_session_poll(struct oxr_logger *log, struct oxr_session *sess)
 	extern void oxr_macos_pump_events(struct xrt_device **xdevs, uint32_t xdev_count, struct xrt_device *head);
 	struct xrt_device *head_dev = GET_XDEV_BY_ROLE(sess->sys, head);
 	oxr_macos_pump_events(sess->sys->xsysd->xdevs, sess->sys->xsysd->xdev_count, head_dev);
+
+	// Check if macOS window was closed (close button or Escape key).
+	// For the Vulkan multi compositor this is also handled via
+	// XRT_SESSION_EVENT_EXIT_REQUEST, but the Metal native compositor
+	// has no session event sink. Checking directly here covers both.
+	{
+		extern bool oxr_macos_window_closed(void);
+		if (oxr_macos_window_closed() && !sess->exiting) {
+			U_LOG_W("macOS window closed — requesting session exit");
+			sess->exiting = true;
+			if (sess->state == XR_SESSION_STATE_FOCUSED) {
+				oxr_session_change_state(log, sess, XR_SESSION_STATE_VISIBLE, 0);
+			}
+			if (sess->state == XR_SESSION_STATE_VISIBLE) {
+				oxr_session_change_state(log, sess, XR_SESSION_STATE_SYNCHRONIZED, 0);
+			}
+			if (!sess->has_ended_once && sess->state != XR_SESSION_STATE_SYNCHRONIZED) {
+				oxr_session_change_state(log, sess, XR_SESSION_STATE_SYNCHRONIZED, 0);
+				sess->has_ended_once = true;
+			}
+			oxr_session_change_state(log, sess, XR_SESSION_STATE_STOPPING, 0);
+		}
+	}
 #endif
 
 #ifdef XRT_OS_ANDROID
@@ -937,8 +1015,9 @@ oxr_session_locate_views(struct oxr_logger *log,
 	bool got_eye_positions = oxr_session_get_predicted_eye_positions(sess, &eye_pair);
 
 	if (should_log) {
-		U_LOG_I("Eye tracking: got_positions=%d, valid=%d, is_d3d11=%d",
-		        got_eye_positions, eye_pair.valid, sess->is_d3d11_native_compositor);
+		U_LOG_I("Eye tracking: got_positions=%d, valid=%d, is_d3d11=%d, is_metal=%d",
+		        got_eye_positions, eye_pair.valid, sess->is_d3d11_native_compositor,
+		        sess->is_metal_native_compositor);
 		if (got_eye_positions) {
 			U_LOG_I("  left=(%.3f,%.3f,%.3f) right=(%.3f,%.3f,%.3f)",
 			        eye_pair.left.x, eye_pair.left.y, eye_pair.left.z,
@@ -977,6 +1056,8 @@ oxr_session_locate_views(struct oxr_logger *log,
 		} else {
 			// Nominal viewer from system compositor info (sim_display, etc.)
 			const struct xrt_system_compositor_info *sinfo = &sess->sys->xsysc->info;
+			U_LOG_I("Kooima: nominal_y=%.3f nominal_z=%.3f",
+			        sinfo->nominal_viewer_y_m, sinfo->nominal_viewer_z_m);
 			if (sinfo->nominal_viewer_z_m > 0.0f) {
 				float ipd_m = sess->ipd_meters;
 				adj_left = (struct xrt_eye_position){
@@ -1110,6 +1191,15 @@ oxr_session_locate_views(struct oxr_logger *log,
 				fovs[0] = xdev->hmd->distortion.fov[0];
 				fovs[1] = xdev->hmd->distortion.fov[1];
 			}
+
+			// Ext apps: use raw nominal eye positions directly.
+			// FOVs come from the device (sim_display Kooima), so we only
+			// need to override the view positions to bypass the LOCAL space offset.
+			if (sess->has_external_window && !have_stereo_eye_override) {
+				stereo_eye_world[0] = (struct xrt_vec3){adj_left.x, adj_left.y, adj_left.z};
+				stereo_eye_world[1] = (struct xrt_vec3){adj_right.x, adj_right.y, adj_right.z};
+				have_stereo_eye_override = true;
+			}
 		}
 	}
 
@@ -1211,8 +1301,9 @@ oxr_session_locate_views(struct oxr_logger *log,
 		// stereo_eye_world[] is set by either camera-centric or display-centric path
 		// to ensure FOV and view position are consistent.
 		if ((have_eyes || have_stereo_eye_override) && view_count == 2) {
-			if (have_stereo_eye_override && !sess->has_external_window) {
-				// STEREO OVERRIDE: use pre-computed world-space eye positions
+			if (have_stereo_eye_override) {
+				// STEREO OVERRIDE: use pre-computed eye positions
+				// For ext apps: display-local coords; for non-ext: world-space
 				views[i].pose.position.x = stereo_eye_world[i].x;
 				views[i].pose.position.y = stereo_eye_world[i].y;
 				views[i].pose.position.z = stereo_eye_world[i].z;
@@ -1578,8 +1669,16 @@ oxr_session_destroy(struct oxr_logger *log, struct oxr_handle_base *hb)
 	u_hashmap_int_destroy(&sess->act_sets_attachments_by_key);
 	u_hashmap_int_destroy(&sess->act_attachments_by_key);
 
-	xrt_comp_destroy(&sess->compositor);
-	xrt_comp_native_destroy(&sess->xcn);
+	// For native compositors (D3D11, Metal), sess->compositor and
+	// sess->xcn->base point to the same object. Only destroy once.
+	if (sess->compositor != NULL && sess->xcn != NULL &&
+	    sess->compositor == &sess->xcn->base) {
+		xrt_comp_native_destroy(&sess->xcn);
+		sess->compositor = NULL;
+	} else {
+		xrt_comp_destroy(&sess->compositor);
+		xrt_comp_native_destroy(&sess->xcn);
+	}
 	xrt_session_destroy(&sess->xs);
 
 	os_precise_sleeper_deinit(&sess->sleeper);
@@ -1870,6 +1969,57 @@ oxr_session_create_impl(struct oxr_logger *log,
 		return oxr_session_populate_d3d12(log, sys, d3d12, *out_session);
 	}
 #endif
+
+#ifdef XR_USE_GRAPHICS_API_METAL
+	XrGraphicsBindingMetalKHR const *metal =
+	    OXR_GET_INPUT_FROM_CHAIN(createInfo, XR_TYPE_GRAPHICS_BINDING_METAL_KHR, XrGraphicsBindingMetalKHR);
+	if (metal != NULL) {
+		OXR_CHECK_XSYSC(log, sys);
+
+		if (!sys->gotten_requirements) {
+			return oxr_error(log, XR_ERROR_GRAPHICS_REQUIREMENTS_CALL_MISSING,
+			                 "Has not called xrGetMetalGraphicsRequirementsKHR");
+		}
+
+		OXR_SESSION_ALLOCATE_AND_INIT(log, sys, OXR_SESSION_GRAPHICS_EXT_METAL, *out_session);
+
+		U_LOG_IFL_I(U_LOGGING_INFO, "Metal session creation - checking compositor options...");
+
+#ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR
+		// Check if Metal native compositor should be used (bypasses Vulkan)
+		if (oxr_metal_native_compositor_supported(sys, xsi->external_window_handle)) {
+			xrt_result_t xret = xrt_system_create_session(sys->xsys, xsi, &(*out_session)->xs, NULL);
+			if (xret == XRT_ERROR_MULTI_SESSION_NOT_IMPLEMENTED) {
+				return oxr_error(log, XR_ERROR_LIMIT_REACHED, "Per instance multi-session not supported.");
+			}
+			if (xret != XRT_SUCCESS) {
+				return oxr_error(log, XR_ERROR_RUNTIME_FAILURE, "Failed to create xrt_session! '%i'", xret);
+			}
+
+			// Set ext_app_mode before early return (this path bypasses the common code below)
+			(*out_session)->has_external_window =
+			    (xsi->external_window_handle != NULL || xsi->shared_texture_handle != NULL);
+			U_LOG_I("Metal native: external_window=%p", xsi->external_window_handle);
+			if ((*out_session)->has_external_window) {
+				struct xrt_device *head = GET_XDEV_BY_ROLE((*out_session)->sys, head);
+				if (head != NULL) {
+					xrt_device_set_property(head, XRT_DEVICE_PROPERTY_EXT_APP_MODE, 1);
+				}
+			}
+
+			return oxr_session_populate_metal_native(log, sys, metal, xsi->external_window_handle, *out_session);
+		}
+#else
+		U_LOG_IFL_I(U_LOGGING_INFO, "Metal native compositor NOT compiled in (XRT_HAVE_METAL_NATIVE_COMPOSITOR not defined)");
+#endif
+		// Fall back to Vulkan-backed Metal compositor
+		U_LOG_IFL_I(U_LOGGING_INFO, "Using Vulkan compositor for Metal session");
+		OXR_CREATE_XRT_SESSION_AND_NATIVE_COMPOSITOR(log, xsi, *out_session);
+		return oxr_error(log, XR_ERROR_GRAPHICS_DEVICE_INVALID,
+		                 "Metal without native compositor is not yet supported");
+	}
+#endif
+
 	/*
 	 * Add any new graphics binding structs here - before the headless
 	 * check. (order for non-headless checks not specified in standard.)
@@ -1918,11 +2068,21 @@ oxr_session_create(struct oxr_logger *log,
 	}
 
 #ifdef XRT_OS_WINDOWS
-	// Parse XR_EXT_win32_window_binding extension - allows app to provide its own window
+	// Parse XR_EXT_win32_window_binding extension - allows app to provide its own window,
+	// offscreen readback callback, or shared GPU texture handle
 	const XrWin32WindowBindingCreateInfoEXT *target_info = OXR_GET_INPUT_FROM_CHAIN(
 	    createInfo, XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT, XrWin32WindowBindingCreateInfoEXT);
-	if (target_info && target_info->windowHandle) {
-		xsi.external_window_handle = (void *)target_info->windowHandle;
+	if (target_info) {
+		if (target_info->windowHandle) {
+			xsi.external_window_handle = (void *)target_info->windowHandle;
+		}
+		if (target_info->readbackCallback) {
+			xsi.readback_callback = target_info->readbackCallback;
+			xsi.readback_userdata = target_info->readbackUserdata;
+		}
+		if (target_info->sharedTextureHandle) {
+			xsi.shared_texture_handle = target_info->sharedTextureHandle;
+		}
 	}
 #endif
 
@@ -1939,6 +2099,9 @@ oxr_session_create(struct oxr_logger *log,
 			xsi.readback_callback = macos_target_info->readbackCallback;
 			xsi.readback_userdata = macos_target_info->readbackUserdata;
 		}
+		if (macos_target_info->sharedIOSurface) {
+			xsi.shared_texture_handle = macos_target_info->sharedIOSurface;
+		}
 	}
 #endif
 
@@ -1954,8 +2117,9 @@ oxr_session_create(struct oxr_logger *log,
 		return ret;
 	}
 
-	// Track whether this session has an external window handle or offscreen readback
-	sess->has_external_window = (xsi.external_window_handle != NULL || xsi.readback_callback != NULL);
+	// Track whether this session has an external window handle, offscreen readback, or shared texture
+	sess->has_external_window =
+	    (xsi.external_window_handle != NULL || xsi.readback_callback != NULL || xsi.shared_texture_handle != NULL);
 
 	// Tell the head device to return raw eye positions (no qwerty compose)
 	if (sess->has_external_window) {

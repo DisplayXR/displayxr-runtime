@@ -224,6 +224,10 @@ struct multi_compositor
 		void (*readback_callback)(const uint8_t *, uint32_t, uint32_t, void *);
 		void *readback_userdata;
 
+		//! Shared GPU texture handle for zero-copy offscreen compositing
+		//! (HANDLE on Win32, IOSurfaceRef on macOS). NULL if not used.
+		void *shared_texture_handle;
+
 		//! Per-session render target (VkSwapchain from external HWND)
 		struct comp_target *target;
 
@@ -601,7 +605,8 @@ multi_compositor_init_session_render(struct multi_compositor *mc);
 static inline bool
 multi_compositor_has_session_render(struct multi_compositor *mc)
 {
-	return mc->session_render.external_window_handle != NULL || mc->session_render.readback_callback != NULL;
+	return mc->session_render.external_window_handle != NULL || mc->session_render.readback_callback != NULL ||
+	       mc->session_render.shared_texture_handle != NULL;
 }
 
 /*!

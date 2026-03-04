@@ -513,7 +513,20 @@ multi_compositor_begin_session(struct xrt_compositor *xc, const struct xrt_begin
 					}
 				}
 			}
-		} else {
+		}
+		// Propagate readback callback and shared texture handle (offscreen modes)
+		if (mc->xsi.readback_callback != NULL) {
+			mc->session_render.readback_callback = mc->xsi.readback_callback;
+			mc->session_render.readback_userdata = mc->xsi.readback_userdata;
+			U_LOG_I("Session has readback callback (Windows offscreen mode)");
+		}
+		if (mc->xsi.shared_texture_handle != NULL) {
+			mc->session_render.shared_texture_handle = mc->xsi.shared_texture_handle;
+			U_LOG_I("Session has shared texture handle %p (Windows zero-copy mode)",
+			        mc->session_render.shared_texture_handle);
+		}
+		if (mc->xsi.external_window_handle == NULL && mc->xsi.readback_callback == NULL &&
+		    mc->xsi.shared_texture_handle == NULL) {
 			// No external window - create our own at native display resolution
 			uint32_t win_w = mc->msc->base.info.display_pixel_width;
 			uint32_t win_h = mc->msc->base.info.display_pixel_height;
@@ -553,6 +566,11 @@ multi_compositor_begin_session(struct xrt_compositor *xc, const struct xrt_begin
 			mc->session_render.readback_callback = mc->xsi.readback_callback;
 			mc->session_render.readback_userdata = mc->xsi.readback_userdata;
 			U_LOG_I("Session has readback callback, will use offscreen rendering");
+		} else if (mc->xsi.shared_texture_handle != NULL) {
+			// Zero-copy shared texture — IOSurface for Metal texture sharing.
+			mc->session_render.shared_texture_handle = mc->xsi.shared_texture_handle;
+			U_LOG_I("Session has shared IOSurface %p, will use zero-copy rendering",
+			        mc->session_render.shared_texture_handle);
 		} else {
 			// No external view — create the runtime's window now.
 			// This runs on the main thread (xrBeginSession), which is
@@ -592,6 +610,7 @@ multi_compositor_end_session(struct xrt_compositor *xc)
 			mc->session_render.initialized = false;
 			mc->session_render.external_window_handle = NULL;
 			mc->session_render.readback_callback = NULL;
+			mc->session_render.shared_texture_handle = NULL;
 			os_mutex_unlock(&mc->msc->list_and_timing_lock);
 
 			struct vk_bundle *vk = comp_target_service_get_vk(mc->msc->target_service);
@@ -1372,9 +1391,11 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 		return true;
 	}
 
-	// No external window handle or readback callback - use shared native compositor
-	if (mc->session_render.external_window_handle == NULL && mc->session_render.readback_callback == NULL) {
-		U_LOG_I("init_session_render: no window handle or readback callback, using shared compositor");
+	// No external window handle, readback callback, or shared texture - use shared native compositor
+	if (mc->session_render.external_window_handle == NULL && mc->session_render.readback_callback == NULL &&
+	    mc->session_render.shared_texture_handle == NULL) {
+		U_LOG_I("init_session_render: no window handle, readback callback, or shared texture, using shared "
+		        "compositor");
 		return false;
 	}
 
@@ -1383,9 +1404,10 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 		return false;
 	}
 
-	U_LOG_W("init_session_render: window=%p readback_callback=%p — initializing per-session rendering",
+	U_LOG_W("init_session_render: window=%p readback=%p shared_texture=%p — initializing per-session rendering",
 	        mc->session_render.external_window_handle,
-	        (void *)(uintptr_t)mc->session_render.readback_callback);
+	        (void *)(uintptr_t)mc->session_render.readback_callback,
+	        mc->session_render.shared_texture_handle);
 
 	// Check if target service is available
 	if (mc->msc->target_service == NULL) {

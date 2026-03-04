@@ -14,24 +14,43 @@
  * - Windowed mode rendering (vs fullscreen)
  * - Application control over window input (keyboard, mouse)
  * - Multiple OpenXR applications on the same display
+ * - Offscreen readback: windowHandle=NULL + readbackCallback → composited
+ *   pixels delivered to callback instead of presented to a window
+ * - Zero-copy shared texture: windowHandle=NULL + sharedTextureHandle →
+ *   runtime composites into a shared D3D11/D3D12 texture (HANDLE)
  */
 #ifndef XR_EXT_WIN32_WINDOW_BINDING_H
 #define XR_EXT_WIN32_WINDOW_BINDING_H 1
 
 #include <openxr/openxr.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 #define XR_EXT_win32_window_binding 1
-#define XR_EXT_win32_window_binding_SPEC_VERSION 1
+#define XR_EXT_win32_window_binding_SPEC_VERSION 2
 #define XR_EXT_WIN32_WINDOW_BINDING_EXTENSION_NAME "XR_EXT_win32_window_binding"
 
 // Use a value in the vendor extension range (1000000000+)
 // This should be replaced with an official Khronos-assigned value if the extension is standardized
 #define XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT ((XrStructureType)1000999001)
 #define XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT ((XrStructureType)1000999002)
+
+/*!
+ * @brief Callback for offscreen readback mode (CPU fallback).
+ *
+ * When set in XrWin32WindowBindingCreateInfoEXT with windowHandle=NULL,
+ * the runtime delivers composited RGBA pixels via this callback each frame.
+ *
+ * @param pixels   Pointer to RGBA pixel data (width * height * 4 bytes)
+ * @param width    Image width in pixels
+ * @param height   Image height in pixels
+ * @param userdata Opaque pointer from readbackUserdata
+ */
+typedef void (*PFN_xrReadbackCallback)(
+    const uint8_t *pixels, uint32_t width, uint32_t height, void *userdata);
 
 /*!
  * @brief Structure passed in XrSessionCreateInfo::next chain to provide
@@ -44,16 +63,23 @@ extern "C" {
  * - Handling the window message pump
  * - Processing input events
  *
+ * Alternatively, set windowHandle to NULL and provide either:
+ * - readbackCallback for CPU-side offscreen readback (GPU→CPU round-trip), or
+ * - sharedTextureHandle for zero-copy GPU texture sharing (D3D11/D3D12 HANDLE)
+ *
  * @extends XrSessionCreateInfo
  */
 typedef struct XrWin32WindowBindingCreateInfoEXT {
-    XrStructureType             type;           //!< Must be XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT
-    const void* XR_MAY_ALIAS    next;           //!< Pointer to next structure in chain
+    XrStructureType             type;                  //!< Must be XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT
+    const void* XR_MAY_ALIAS    next;                  //!< Pointer to next structure in chain
 #ifdef _WIN32
-    void*                       windowHandle;   //!< HWND of the target window (Windows only)
+    void*                       windowHandle;          //!< HWND of the target window (Windows only)
 #else
-    void*                       windowHandle;   //!< Platform-specific window handle (reserved)
+    void*                       windowHandle;          //!< Platform-specific window handle (reserved)
 #endif
+    PFN_xrReadbackCallback      readbackCallback;      //!< Offscreen readback callback (CPU fallback), or NULL
+    void*                       readbackUserdata;      //!< Passed to readbackCallback
+    void*                       sharedTextureHandle;   //!< Shared D3D11/D3D12 texture HANDLE for zero-copy, or NULL
 } XrWin32WindowBindingCreateInfoEXT;
 
 /*!

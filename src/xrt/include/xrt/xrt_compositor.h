@@ -963,6 +963,10 @@ struct xrt_session_info
 	void (*readback_callback)(const uint8_t *pixels, uint32_t w, uint32_t h, void *userdata);
 	//! Userdata passed to readback_callback
 	void *readback_userdata;
+
+	//! Shared GPU texture handle for zero-copy offscreen compositing.
+	//! Platform-specific: HANDLE on Windows (D3D11/D3D12), IOSurfaceRef on macOS.
+	void *shared_texture_handle;
 };
 
 /*!
@@ -2483,6 +2487,10 @@ struct xrt_system_compositor_info
 	//! D3D11 display processor factory (NULL = no D3D11 display processing).
 	//! Signature: xrt_dp_factory_d3d11_fn_t (see xrt_display_processor_d3d11.h).
 	void *dp_factory_d3d11;
+
+	//! Metal display processor factory (NULL = no Metal display processing).
+	//! Signature: xrt_dp_factory_metal_fn_t (see xrt_display_processor_metal.h).
+	void *dp_factory_metal;
 
 	/*! @} */
 };

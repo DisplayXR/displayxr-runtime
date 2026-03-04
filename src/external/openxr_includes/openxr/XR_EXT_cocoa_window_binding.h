@@ -35,7 +35,7 @@ extern "C" {
 #endif
 
 #define XR_EXT_cocoa_window_binding 1
-#define XR_EXT_cocoa_window_binding_SPEC_VERSION 2
+#define XR_EXT_cocoa_window_binding_SPEC_VERSION 3
 #define XR_EXT_COCOA_WINDOW_BINDING_EXTENSION_NAME "XR_EXT_cocoa_window_binding"
 
 // Use a value in the vendor extension range (1000000000+)
@@ -98,6 +98,7 @@ typedef struct XrCocoaWindowBindingCreateInfoEXT {
     void*                    viewHandle;        //!< NSView* with CAMetalLayer backing, or NULL for offscreen
     PFN_xrReadbackCallback   readbackCallback;  //!< Called with composited RGBA pixels (offscreen mode)
     void*                    readbackUserdata;   //!< Passed to readbackCallback
+    void*                    sharedIOSurface;   //!< IOSurfaceRef for zero-copy Metal texture sharing, or NULL
 } XrCocoaWindowBindingCreateInfoEXT;
 
 #ifdef __cplusplus
