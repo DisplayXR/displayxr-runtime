@@ -1404,7 +1404,19 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 	c->sampler_linear = nil;
 	c->depth_stencil_state = nil;
 
-	// 6. Close window if we own it — use dispatch_async to avoid
+	// 6. Detach views from window hierarchy before closing.
+	//    This prevents _recursiveBreakKeyViewLoop from walking
+	//    freed subviews when NSWindow eventually deallocs.
+	if (c->hud_view != nil) {
+		[c->hud_view removeFromSuperview];
+		c->hud_view = nil;
+	}
+	if (c->window != nil && c->view != nil) {
+		[c->window setContentView:[[NSView alloc] init]];
+	}
+	c->view = nil;
+
+	// 7. Close window if we own it — use dispatch_async to avoid
 	//    deadlocking when called from a non-main thread.
 	if (c->owns_window && c->window != nil) {
 		NSWindow *window = c->window;
@@ -1418,8 +1430,7 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 		}
 	}
 
-	// 7. Release remaining objects
-	c->view = nil;
+	// 8. Release remaining objects
 	c->command_queue = nil;
 	c->device = nil;
 
