@@ -93,6 +93,13 @@ void
 comp_metal_compositor_set_sys_info(struct xrt_compositor *xc,
                                     const struct xrt_system_compositor_info *info);
 
+/*!
+ * Get the system default Metal device (id<MTLDevice> as void*).
+ * Used by xrGetMetalGraphicsRequirementsKHR to return a real device pointer.
+ */
+void *
+comp_metal_get_system_default_device(void);
+
 #ifdef __cplusplus
 }
 #endif

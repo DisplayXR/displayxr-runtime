@@ -552,6 +552,7 @@ oxr_xrGetD3D12GraphicsRequirementsKHR(XrInstance instance,
  */
 
 #ifdef XR_USE_GRAPHICS_API_METAL
+#include "metal/comp_metal_compositor.h"
 
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrGetMetalGraphicsRequirementsKHR(XrInstance instance,
@@ -567,10 +568,8 @@ oxr_xrGetMetalGraphicsRequirementsKHR(XrInstance instance,
 
 	sys->gotten_requirements = true;
 
-	// Metal doesn't need device matching like D3D11/D3D12 (LUID check).
-	// Just return the system's default Metal device.
-	// The metalDevice field will be NULL, meaning "use system default".
-	graphicsRequirements->metalDevice = NULL;
+	// Return the system default Metal device so Unity can match it against its own.
+	graphicsRequirements->metalDevice = comp_metal_get_system_default_device();
 
 	return XR_SUCCESS;
 }

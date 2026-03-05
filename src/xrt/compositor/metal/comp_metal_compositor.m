@@ -1591,3 +1591,9 @@ comp_metal_compositor_set_sys_info(struct xrt_compositor *xc,
 	struct comp_metal_compositor *c = metal_comp(xc);
 	c->sys_info = info;
 }
+
+void *
+comp_metal_get_system_default_device(void)
+{
+	return (__bridge void *)MTLCreateSystemDefaultDevice();
+}
