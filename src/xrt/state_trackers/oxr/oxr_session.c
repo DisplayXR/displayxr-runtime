@@ -698,6 +698,13 @@ oxr_session_poll(struct oxr_logger *log, struct oxr_session *sess)
 	}
 
 #ifdef XRT_OS_MACOS
+	// Skip macOS event pump if the compositor has already been destroyed
+	// (e.g. during session teardown). Pumping events with a torn-down
+	// compositor can trigger AppKit callbacks into freed resources.
+	if (sess->xcn == NULL) {
+		return XR_SUCCESS;
+	}
+
 	// Pump macOS events on the main thread. NSWindow and CAMetalLayer
 	// require periodic run loop processing for the Window Server to
 	// commit rendered content to the screen. This is the only place

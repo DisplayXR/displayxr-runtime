@@ -1370,19 +1370,31 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 
 	U_LOG_I("Destroying Metal compositor");
 
-	// Destroy display processor
+	// 1. GPU drain — wait for all in-flight command buffers to finish
+	//    before releasing any resources they may reference.
+	if (c->command_queue != nil) {
+		id<MTLCommandBuffer> fence = [c->command_queue commandBuffer];
+		[fence commit];
+		[fence waitUntilCompleted];
+	}
+
+	// 2. Nil metal_layer early — prevents AppKit callbacks from
+	//    acquiring new drawables during teardown.
+	c->metal_layer = nil;
+
+	// 3. Destroy display processor
 	if (c->display_processor != NULL) {
 		xrt_display_processor_metal_destroy(&c->display_processor);
 	}
 
-	// Release shared texture resources
+	// 4. Release shared texture resources
 	c->shared_texture = nil;
 	if (c->shared_iosurface != NULL) {
 		CFRelease(c->shared_iosurface);
 		c->shared_iosurface = NULL;
 	}
 
-	// Release Metal resources
+	// 5. Release Metal resources
 	c->stereo_texture = nil;
 	c->depth_texture = nil;
 	c->projection_pipeline = nil;
@@ -1391,20 +1403,22 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 	c->blend_pipeline = nil;
 	c->sampler_linear = nil;
 	c->depth_stencil_state = nil;
-	c->metal_layer = nil;
 
-	// Close window if we own it
+	// 6. Close window if we own it — use dispatch_async to avoid
+	//    deadlocking when called from a non-main thread.
 	if (c->owns_window && c->window != nil) {
+		NSWindow *window = c->window;
+		c->window = nil;
 		if ([NSThread isMainThread]) {
-			[c->window close];
+			[window close];
 		} else {
-			dispatch_sync(dispatch_get_main_queue(), ^{
-				[c->window close];
+			dispatch_async(dispatch_get_main_queue(), ^{
+				[window close];
 			});
 		}
-		c->window = nil;
 	}
 
+	// 7. Release remaining objects
 	c->view = nil;
 	c->command_queue = nil;
 	c->device = nil;
