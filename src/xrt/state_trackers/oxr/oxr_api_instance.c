@@ -37,7 +37,13 @@ DEBUG_GET_ONCE_BOOL_OPTION(ignore_openxr_version, "OXR_IGNORE_OPENXR_VERSION", f
 
 #define MAKE_EXTENSION_PROPERTIES(mixed_case, all_caps)                                                                \
 	{XR_TYPE_EXTENSION_PROPERTIES, NULL, XR_##all_caps##_EXTENSION_NAME, XR_##mixed_case##_SPEC_VERSION},
-static const XrExtensionProperties extension_properties[] = {OXR_EXTENSION_SUPPORT_GENERATE(MAKE_EXTENSION_PROPERTIES)};
+static const XrExtensionProperties extension_properties[] = {
+    OXR_EXTENSION_SUPPORT_GENERATE(MAKE_EXTENSION_PROPERTIES)
+#ifdef OXR_HAVE_KHR_metal_enable
+    // Unity's OpenXR plugin requests the provisional name XR_KHRX2_metal_enable
+    {XR_TYPE_EXTENSION_PROPERTIES, NULL, "XR_KHRX2_metal_enable", XR_KHR_metal_enable_SPEC_VERSION},
+#endif
+};
 
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrEnumerateInstanceExtensionProperties(const char *layerName,
@@ -181,6 +187,14 @@ oxr_xrCreateInstance(const XrInstanceCreateInfo *createInfo, XrInstance *out_ins
 	}
 	for (uint32_t i = 0; i < createInfo->enabledExtensionCount; ++i) {
 		OXR_EXTENSION_SUPPORT_GENERATE(CHECK_EXT_NAME)
+
+#ifdef OXR_HAVE_KHR_metal_enable
+		// Accept the provisional name Unity uses
+		if (strcmp(createInfo->enabledExtensionNames[i], "XR_KHRX2_metal_enable") == 0) {
+			extensions.KHR_metal_enable = true;
+			continue;
+		}
+#endif
 
 		return oxr_error(&log, XR_ERROR_EXTENSION_NOT_PRESENT,
 		                 "(createInfo->enabledExtensionNames[%d]) Unrecognized extension name '%s'", i,
