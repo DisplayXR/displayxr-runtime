@@ -1443,12 +1443,18 @@ oxr_metal_native_compositor_supported(struct oxr_system *sys, void *window_handl
 /*!
  * Populate the session with the Metal native compositor.
  * This bypasses Vulkan entirely for Metal apps.
+ *
+ * @param offscreen  True when the Cocoa window binding was provided with
+ *                   viewHandle=NULL, signalling the app wants offscreen /
+ *                   shared-texture mode (no visible compositor window).
  */
 XrResult
 oxr_session_populate_metal_native(struct oxr_logger *log,
                                   struct oxr_system *sys,
                                   XrGraphicsBindingMetalKHR const *next,
                                   void *window_handle,
+                                  bool offscreen,
+                                  void *shared_texture_handle,
                                   struct oxr_session *sess);
 #endif
 

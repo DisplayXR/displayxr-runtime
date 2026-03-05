@@ -710,9 +710,11 @@ oxr_session_poll(struct oxr_logger *log, struct oxr_session *sess)
 	// For the Vulkan multi compositor this is also handled via
 	// XRT_SESSION_EVENT_EXIT_REQUEST, but the Metal native compositor
 	// has no session event sink. Checking directly here covers both.
+	// Skip this check for external-window / offscreen sessions (Unity plugin
+	// sends viewHandle=NULL; the hidden window can't be closed by the user).
 	{
 		extern bool oxr_macos_window_closed(void);
-		if (oxr_macos_window_closed() && !sess->exiting) {
+		if (oxr_macos_window_closed() && !sess->exiting && !sess->has_external_window) {
 			U_LOG_W("macOS window closed — requesting session exit");
 			sess->exiting = true;
 			if (sess->state == XR_SESSION_STATE_FOCUSED) {
@@ -2005,10 +2007,15 @@ oxr_session_create_impl(struct oxr_logger *log,
 				return oxr_error(log, XR_ERROR_RUNTIME_FAILURE, "Failed to create xrt_session! '%i'", xret);
 			}
 
-			// Set ext_app_mode before early return (this path bypasses the common code below)
+			// Set ext_app_mode before early return (this path bypasses the common code below).
+			// Must match the common-path check: include readback_callback (our plugin always
+			// sets it even before creating the shared IOSurface).
 			(*out_session)->has_external_window =
-			    (xsi->external_window_handle != NULL || xsi->shared_texture_handle != NULL);
-			U_LOG_I("Metal native: external_window=%p", xsi->external_window_handle);
+			    (xsi->external_window_handle != NULL || xsi->readback_callback != NULL ||
+			     xsi->shared_texture_handle != NULL);
+			U_LOG_I("Metal native: external_window=%p, readback=%p, shared_tex=%p, has_ext=%d",
+			        xsi->external_window_handle, (void *)xsi->readback_callback,
+			        xsi->shared_texture_handle, (*out_session)->has_external_window);
 			if ((*out_session)->has_external_window) {
 				struct xrt_device *head = GET_XDEV_BY_ROLE((*out_session)->sys, head);
 				if (head != NULL) {
@@ -2016,7 +2023,13 @@ oxr_session_create_impl(struct oxr_logger *log,
 				}
 			}
 
-			return oxr_session_populate_metal_native(log, sys, metal, xsi->external_window_handle, *out_session);
+			// Offscreen mode: Cocoa binding present with viewHandle=NULL
+			// but readback or shared texture requested.
+			bool offscreen = (xsi->external_window_handle == NULL) &&
+			                 (xsi->readback_callback != NULL || xsi->shared_texture_handle != NULL);
+
+			return oxr_session_populate_metal_native(log, sys, metal, xsi->external_window_handle, offscreen,
+			                                        xsi->shared_texture_handle, *out_session);
 		}
 #else
 		U_LOG_IFL_I(U_LOGGING_INFO, "Metal native compositor NOT compiled in (XRT_HAVE_METAL_NATIVE_COMPOSITOR not defined)");

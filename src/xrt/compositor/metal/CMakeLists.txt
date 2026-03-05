@@ -23,6 +23,7 @@ if(APPLE AND XRT_HAVE_METAL)
 			"-framework Metal"
 			"-framework Cocoa"
 			"-framework QuartzCore"
+			"-framework IOSurface"
 		)
 
 	target_include_directories(comp_metal PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)

@@ -71,7 +71,8 @@ oxr_metal_native_compositor_supported(struct oxr_system *sys, void *window_handl
 	if (window_handle != NULL) {
 		U_LOG_IFL_I(U_LOGGING_INFO, "Metal native compositor ENABLED with app-provided window");
 	} else {
-		U_LOG_IFL_I(U_LOGGING_INFO, "Metal native compositor ENABLED, will create own window");
+		U_LOG_IFL_I(U_LOGGING_INFO, "Metal native compositor ENABLED (no window provided — "
+		            "offscreen mode will be determined by caller)");
 	}
 	return true;
 #else
@@ -97,6 +98,8 @@ oxr_session_populate_metal_native(struct oxr_logger *log,
                                   struct oxr_system *sys,
                                   XrGraphicsBindingMetalKHR const *next,
                                   void *window_handle,
+                                  bool offscreen,
+                                  void *shared_texture_handle,
                                   struct oxr_session *sess)
 {
 	struct xrt_device *xdev = get_role_head(sess->sys);
@@ -110,7 +113,8 @@ oxr_session_populate_metal_native(struct oxr_logger *log,
 
 	// Create the Metal native compositor
 	xrt_result_t xret = comp_metal_compositor_create(
-	    xdev, window_handle, (void *)next->commandQueue, dp_factory_metal, &xcn);
+	    xdev, window_handle, (void *)next->commandQueue, dp_factory_metal, offscreen,
+	    shared_texture_handle, &xcn);
 	if (xret != XRT_SUCCESS) {
 		return oxr_error(log, XR_ERROR_INITIALIZATION_FAILED,
 		                 "Failed to create Metal native compositor: %d", xret);

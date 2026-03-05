@@ -17,6 +17,7 @@
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
 #import <Cocoa/Cocoa.h>
+#import <IOSurface/IOSurface.h>
 
 #include "comp_metal_compositor.h"
 
@@ -169,6 +170,15 @@ struct comp_metal_compositor
 
 	//! True if we created the window ourselves.
 	bool owns_window;
+
+	//! True if running in offscreen mode (hidden window, no visible UI).
+	bool offscreen;
+
+	//! App-provided IOSurface for shared texture output (retained, may be NULL).
+	IOSurfaceRef shared_iosurface;
+
+	//! Metal texture wrapping the shared IOSurface (render target).
+	id<MTLTexture> shared_texture;
 
 	//! Generic Metal display processor.
 	struct xrt_display_processor_metal *display_processor;
@@ -547,30 +557,36 @@ create_window_on_main_thread(struct comp_metal_compositor *c, uint32_t width, ui
 	c->metal_layer.contentsScale = scale;
 	c->metal_layer.drawableSize = CGSizeMake(width * scale, height * scale);
 
-	[c->window makeKeyAndOrderFront:nil];
+	if (!c->offscreen) {
+		[c->window makeKeyAndOrderFront:nil];
 
-	// Bring the app to the front.
-	[NSApp activateIgnoringOtherApps:YES];
+		// Bring the app to the front.
+		[NSApp activateIgnoringOtherApps:YES];
 
-	// Pump the event loop once so the window actually appears.
-	// Without this, makeKeyAndOrderFront is deferred until the
-	// next event loop iteration, which may never happen because the
-	// compositor renders on a background thread.
-	NSEvent *event;
-	while ((event = [NSApp nextEventMatchingMask:NSEventMaskAny
-	                                   untilDate:nil
-	                                      inMode:NSDefaultRunLoopMode
-	                                     dequeue:YES]) != nil) {
-		[NSApp sendEvent:event];
+		// Pump the event loop once so the window actually appears.
+		// Without this, makeKeyAndOrderFront is deferred until the
+		// next event loop iteration, which may never happen because the
+		// compositor renders on a background thread.
+		NSEvent *event;
+		while ((event = [NSApp nextEventMatchingMask:NSEventMaskAny
+		                                   untilDate:nil
+		                                      inMode:NSDefaultRunLoopMode
+		                                     dequeue:YES]) != nil) {
+			[NSApp sendEvent:event];
+		}
+	} else {
+		U_LOG_I("Offscreen mode — window created but hidden");
 	}
 
 	c->owns_window = true;
 
-	// Create HUD overlay view (bottom-left, hidden initially)
-	NSRect hudFrame = NSMakeRect(10, 10, 420, 380);
-	c->hud_view = [[CompHudOverlayView alloc] initWithFrame:hudFrame];
-	[metalView addSubview:c->hud_view];
-	[c->hud_view setHidden:YES];
+	if (!c->offscreen) {
+		// Create HUD overlay view (bottom-left, hidden initially)
+		NSRect hudFrame = NSMakeRect(10, 10, 420, 380);
+		c->hud_view = [[CompHudOverlayView alloc] initWithFrame:hudFrame];
+		[metalView addSubview:c->hud_view];
+		[c->hud_view setHidden:YES];
+	}
 
 	*out_success = true;
 }
@@ -578,7 +594,7 @@ create_window_on_main_thread(struct comp_metal_compositor *c, uint32_t width, ui
 static bool
 create_window(struct comp_metal_compositor *c, uint32_t width, uint32_t height)
 {
-	bool success = false;
+	__block bool success = false;
 
 	if ([NSThread isMainThread]) {
 		// Already on main thread — call directly to avoid deadlock
@@ -1127,23 +1143,38 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	static uint32_t commit_count = 0;
 	commit_count++;
 
-	// Get drawable from CAMetalLayer
-	id<CAMetalDrawable> drawable = [c->metal_layer nextDrawable];
-	if (drawable == nil) {
-		if (commit_count <= 3) {
-			fprintf(stderr, "METAL #%u: nextDrawable=nil, size=%.0fx%.0f, scale=%.1f\n",
-			        commit_count, c->metal_layer.drawableSize.width,
-			        c->metal_layer.drawableSize.height, c->metal_layer.contentsScale);
-		}
-		return XRT_SUCCESS; // Non-fatal, skip this frame
-	}
+	// Get output texture — either from shared IOSurface or CAMetalLayer drawable
+	id<MTLTexture> output_texture = nil;
+	id<CAMetalDrawable> drawable = nil;
 
-	if (commit_count <= 3) {
-		fprintf(stderr, "METAL #%u: drawable=%lux%lu, stereo=%lux%lu, layers=%u\n",
-		        commit_count,
-		        (unsigned long)drawable.texture.width, (unsigned long)drawable.texture.height,
-		        (unsigned long)c->stereo_texture.width, (unsigned long)c->stereo_texture.height,
-		        c->layer_accum.layer_count);
+	if (c->shared_texture != nil) {
+		output_texture = c->shared_texture;
+		if (commit_count <= 3) {
+			fprintf(stderr, "METAL #%u: shared_texture=%lux%lu, stereo=%lux%lu, layers=%u\n",
+			        commit_count,
+			        (unsigned long)output_texture.width, (unsigned long)output_texture.height,
+			        (unsigned long)c->stereo_texture.width, (unsigned long)c->stereo_texture.height,
+			        c->layer_accum.layer_count);
+		}
+	} else {
+		drawable = [c->metal_layer nextDrawable];
+		if (drawable == nil) {
+			if (commit_count <= 3) {
+				fprintf(stderr, "METAL #%u: nextDrawable=nil, size=%.0fx%.0f, scale=%.1f\n",
+				        commit_count, c->metal_layer.drawableSize.width,
+				        c->metal_layer.drawableSize.height, c->metal_layer.contentsScale);
+			}
+			return XRT_SUCCESS; // Non-fatal, skip this frame
+		}
+		output_texture = drawable.texture;
+
+		if (commit_count <= 3) {
+			fprintf(stderr, "METAL #%u: drawable=%lux%lu, stereo=%lux%lu, layers=%u\n",
+			        commit_count,
+			        (unsigned long)output_texture.width, (unsigned long)output_texture.height,
+			        (unsigned long)c->stereo_texture.width, (unsigned long)c->stereo_texture.height,
+			        c->layer_accum.layer_count);
+		}
 	}
 
 	id<MTLCommandBuffer> cmd_buf = [c->command_queue commandBuffer];
@@ -1276,9 +1307,9 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		    c->view_width,
 		    c->view_height,
 		    (uint32_t)MTLPixelFormatRGBA8Unorm,
-		    (__bridge void *)drawable.texture,
-		    (uint32_t)drawable.texture.width,
-		    (uint32_t)drawable.texture.height);
+		    (__bridge void *)output_texture,
+		    (uint32_t)output_texture.width,
+		    (uint32_t)output_texture.height);
 	} else {
 		// No display processor: do SBS/anaglyph/blend conversion here.
 		// Query output mode from the HMD device (set by 1/2/3 keys or
@@ -1297,7 +1328,7 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 
 		MTLRenderPassDescriptor *blit_pass = [MTLRenderPassDescriptor renderPassDescriptor];
-		blit_pass.colorAttachments[0].texture = drawable.texture;
+		blit_pass.colorAttachments[0].texture = output_texture;
 		blit_pass.colorAttachments[0].loadAction = MTLLoadActionClear;
 		blit_pass.colorAttachments[0].storeAction = MTLStoreActionStore;
 		blit_pass.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
@@ -1315,8 +1346,16 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	}
 
 	// Present and commit
-	[cmd_buf presentDrawable:drawable];
+	if (drawable != nil) {
+		[cmd_buf presentDrawable:drawable];
+	}
 	[cmd_buf commit];
+
+	// For shared texture mode, wait for GPU completion so the IOSurface
+	// is fully written before the app reads it.
+	if (c->shared_texture != nil) {
+		[cmd_buf waitUntilCompleted];
+	}
 
 	// Reset layer accumulator
 	c->layer_accum.layer_count = 0;
@@ -1334,6 +1373,13 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 	// Destroy display processor
 	if (c->display_processor != NULL) {
 		xrt_display_processor_metal_destroy(&c->display_processor);
+	}
+
+	// Release shared texture resources
+	c->shared_texture = nil;
+	if (c->shared_iosurface != NULL) {
+		CFRelease(c->shared_iosurface);
+		c->shared_iosurface = NULL;
 	}
 
 	// Release Metal resources
@@ -1397,6 +1443,8 @@ comp_metal_compositor_create(struct xrt_device *xdev,
                              void *window_handle,
                              void *command_queue_ptr,
                              void *dp_factory_metal,
+                             bool offscreen,
+                             void *shared_iosurface,
                              struct xrt_compositor_native **out_xc)
 {
 	struct comp_metal_compositor *c = U_TYPED_CALLOC(struct comp_metal_compositor);
@@ -1414,6 +1462,7 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 	c->command_queue = (__bridge id<MTLCommandQueue>)command_queue_ptr;
 	c->device = c->command_queue.device;
 	c->display_refresh_rate = 60.0f;
+	c->offscreen = offscreen;
 
 	// Get recommended rendering dimensions from device
 	uint32_t recommended_width = 0;
@@ -1438,6 +1487,33 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 			os_mutex_destroy(&c->mutex);
 			free(c);
 			return XRT_ERROR_VULKAN;
+		}
+	}
+
+	// Set up shared IOSurface texture if provided
+	if (shared_iosurface != NULL) {
+		IOSurfaceRef surface = (IOSurfaceRef)shared_iosurface;
+		CFRetain(surface);
+		c->shared_iosurface = surface;
+
+		size_t iosW = IOSurfaceGetWidth(surface);
+		size_t iosH = IOSurfaceGetHeight(surface);
+
+		MTLTextureDescriptor *ioDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+		                                                                                  width:iosW
+		                                                                                 height:iosH
+		                                                                              mipmapped:NO];
+		ioDesc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+		ioDesc.storageMode = MTLStorageModeShared;
+		c->shared_texture = [c->device newTextureWithDescriptor:ioDesc
+		                                             iosurface:surface
+		                                                 plane:0];
+		if (c->shared_texture == nil) {
+			U_LOG_E("Failed to create MTLTexture from IOSurface (%zux%zu)", iosW, iosH);
+			CFRelease(c->shared_iosurface);
+			c->shared_iosurface = NULL;
+		} else {
+			U_LOG_W("Created shared IOSurface texture: %zux%zu", iosW, iosH);
 		}
 	}
 

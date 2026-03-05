@@ -34,6 +34,13 @@ extern "C" {
  * @param window_handle   App-provided NSView* (NULL = auto-create window).
  * @param command_queue   App's id<MTLCommandQueue> from XrGraphicsBindingMetalKHR.
  * @param dp_factory_metal Display processor factory (may be NULL).
+ * @param offscreen       If true and window_handle is NULL, create a hidden
+ *                        window (no visible UI). Used when the app provides a
+ *                        Cocoa window binding with viewHandle=NULL to signal
+ *                        offscreen / shared-texture mode.
+ * @param shared_iosurface  IOSurfaceRef for shared texture output, or NULL.
+ *                        When non-NULL, the compositor renders into this
+ *                        IOSurface instead of the CAMetalLayer drawable.
  * @param[out] out_xc     Created compositor on success.
  * @return XRT_SUCCESS on success.
  *
@@ -44,6 +51,8 @@ comp_metal_compositor_create(struct xrt_device *xdev,
                              void *window_handle,
                              void *command_queue,
                              void *dp_factory_metal,
+                             bool offscreen,
+                             void *shared_iosurface,
                              struct xrt_compositor_native **out_xc);
 
 /*!
