@@ -135,117 +135,135 @@ Function AddToPath
   Exch $0  ; Path to add
   Push $1
   Push $2
+  Push $3
 
-  ; Strip trailing backslash
+  ;----------------------------------------
+  ; 1. Strip trailing backslash
   StrCpy $1 $0 "" -1
   StrCmp $1 "\" 0 +2
     StrCpy $0 $0 -1
 
-  ; Read system PATH (EXPAND_SZ) to preserve % variables
-  ReadRegExpandStr $1 HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path"
+  ;----------------------------------------
+  ; 2. Read raw PATH from registry (REG_EXPAND_SZ)
+  ReadRegStr $1 HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path"
 
-  ; Check if path already exists
-  Push $1
-  Push $0
+  ;----------------------------------------
+  ; 3. Lowercase versions for comparison
+  StrCpy $2 $0
+  StrCpy $3 $1
+  ${StrLower} $2 $2
+  ${StrLower} $3 $3
+
+  ;----------------------------------------
+  ; 4. Check if path already exists (case-insensitive)
+  Push $3
+  Push $2
   Call StrStr
   Pop $2
-  StrCmp $2 "" 0 done  ; Already exists? Skip
+  StrCmp $2 "" 0 done  ; Already present → skip
 
-  ; Append path
+  ;----------------------------------------
+  ; 5. Append new path
   StrCmp $1 "" 0 +3
-    StrCpy $1 "$0"
+    StrCpy $1 "$0"       ; Empty PATH → just set
     Goto write
-  StrCpy $1 "$1;$0"
+  StrCpy $1 "$1;$0"      ; Non-empty PATH → append with semicolon
 
 write:
+  ;----------------------------------------
+  ; 6. Write back as REG_EXPAND_SZ
   WriteRegExpandStr HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path" "$1"
 
-  ; Notify Windows (Unicode safe)
-  System::Call 'user32::SendMessageTimeoutW(i ${HWND_BROADCAST}, i ${WM_SETTINGCHANGE}, i 0, t "Environment", i 0, i 5000, *i .r0)'
+  ;----------------------------------------
+  ; 7. Notify Windows about environment change
+  System::Call 'user32::SendMessageTimeoutW(i ${HWND_BROADCAST}, i ${WM_SETTINGCHANGE}, i 0, w "Environment", i 0x0, i 5000, *i .r0)'
 
 done:
+  Pop $3
   Pop $2
   Pop $1
   Pop $0
 FunctionEnd
 
-;--------------------------------
-; RemoveFromPath - Removes a directory from the system PATH with success/failure dialog
-; Usage: Push "C:\path\to\remove"
-;        Call un.RemoveFromPath
 Function un.RemoveFromPath
-    Exch $0 ; path to remove
-    Push $1
-    Push $2
-    Push $3
-    Push $4
-    Push $5
-    Push $6  ; flag to indicate success
+    Exch $0 ; Path to remove
+    Push $1 ; Raw PATH
+    Push $2 ; Rebuilt PATH
+    Push $3 ; Current segment
+    Push $4 ; Lowercase temp
+    Push $5 ; Lowercase target
+    Push $6 ; Temp copy for cleaning
 
-    ; Read current system PATH
+    ;----------------------------------------
+    ; 1. Prepare target: strip trailing backslash & lowercase
+    StrCpy $1 $0 "" -1
+    StrCmp $1 "\" 0 +2
+        StrCpy $0 $0 -1
+    StrCpy $5 $0
+    ${StrLower} $5 $5
+
+    ;----------------------------------------
+    ; 2. Read raw PATH from registry
     ReadRegStr $1 HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path"
-    StrCpy $2 ""  ; New PATH
-    StrCpy $6 0   ; Flag: path removed?
-
-    ; Normalize trailing slash of target
-    StrCpy $3 $0 "" -1
-    StrCmp $3 "\" 0 +2
-    StrCpy $0 $0 -1
+    StrCpy $2 "" ; rebuilt PATH
 
 loop:
-    StrCmp $1 "" done
+    StrCmp $1 "" write ; done parsing
 
+    ;----------------------------------------
+    ; 3. Get next segment up to semicolon
     Push $1
     Push ";"
     Call un.StrStr
-    Pop $3
+    Pop $3 ; next segment
+    StrCmp $3 "" last_segment
 
-    StrCmp $3 "" last
-
+    ; calculate length
     StrLen $4 $1
-    StrLen $5 $3
-    IntOp $4 $4 - $5
-    StrCpy $4 $1 $4
-    IntOp $5 $5 + 1
-    StrCpy $1 $1 "" $5
-    Goto check
+    StrLen $6 $3
+    IntOp $4 $4 - $6
+    StrCpy $3 $1 $4
+    IntOp $6 $6 + 1
+    StrCpy $1 $1 "" $6
+    Goto check_segment
 
-last:
-    StrCpy $4 $1
+last_segment:
+    StrCpy $3 $1
     StrCpy $1 ""
 
-check:
-    ; normalize trailing slash
-    StrCpy $3 $4 "" -1
-    StrCmp $3 "\" 0 +2
-    StrCpy $4 $4 -1
+check_segment:
+    ; Skip empty segments
+    StrCmp $3 "" loop
+
+    ;----------------------------------------
+    ; 4. Copy segment for cleaning & lowercase
+    StrCpy $6 $3
+    StrCpy $4 $6 "" -1
+    StrCmp $4 "\" 0 +2
+        StrCpy $6 $6 -1
+    ${StrLower} $4 $6
 
     ; Compare to target
-    StrCmp $4 $0 skip
-        StrCpy $6 1 ; Mark as removed
-    skip:
-    StrCmp $2 "" 0 +3
-        StrCpy $2 $4
-        Goto loop
+    StrCmp $4 $5 loop ; matches → skip
 
-    StrCpy $2 "$2;$4"
+    ;----------------------------------------
+    ; 5. Append ORIGINAL segment ($3) to rebuilt PATH
+    StrCmp $2 "" 0 +3
+        StrCpy $2 $3
+        Goto loop
+    StrCpy $2 "$2;$3"
     Goto loop
 
-done:
+write:
+    ;----------------------------------------
+    ; 6. Write back rebuilt PATH
     WriteRegExpandStr HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path" "$2"
 
-    ; Broadcast environment change
-    SendMessage ${HWND_BROADCAST} ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=5000
+    ;----------------------------------------
+    ; 7. Notify Windows about environment change
+    System::Call 'user32::SendMessageTimeoutW(i ${HWND_BROADCAST}, i ${WM_SETTINGCHANGE}, i 0, w "Environment", i 0, i 5000, *i .r0)'
 
-    ; Show result dialog
-    StrCmp $6 1 success
-    ;MessageBox MB_OK|MB_ICONWARNING "SRMonado path '$0' was not found in the system PATH or could not be removed."
-    Goto finish
-
-success:
-    ;MessageBox MB_OK|MB_ICONINFORMATION "SRMonado path '$0' was successfully removed from the system PATH."
-
-finish:
+done:
     Pop $6
     Pop $5
     Pop $4
