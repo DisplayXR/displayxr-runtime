@@ -292,99 +292,130 @@ Function un.RemoveFromPath
   Push $8
   Push $9
 
-  ; Open log file
+  ; Open log
   StrCpy $9 "$TEMP\RemoveFromPath.log"
   FileOpen $9 $9 "a"
 
   StrCmp $9 "" +2
     FileWrite $9 "=== RemoveFromPath started ===$\r$\n"
 
-  ; Backup original PATH
+  ; Read PATH
   ReadRegStr $1 HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path"
+
+  ; Trim CR/LF
+  Push $1
+  Call un.TrimCRLF
+  Pop $1
+
   StrCpy $8 $1
 
   StrCmp $9 "" +2
     FileWrite $9 "Original PATH: $1$\r$\n"
 
-  ; Normalize target path (remove trailing \)
+  ; Normalize target (remove trailing \)
   StrCpy $4 $0
-loop_trim_target:
+trim_target:
   StrLen $5 $4
   IntCmp $5 0 trim_target_done
   IntOp $5 $5 - 1
   StrCpy $6 $4 1 $5
   StrCmp $6 "\" 0 trim_target_done
   StrCpy $4 $4 $5
-  Goto loop_trim_target
+  Goto trim_target
 trim_target_done:
+
+  ; Lowercase target
+  Push $4
+  Call un.StrLower
+  Pop $4
 
   StrCpy $2 ""
 
 loop:
   StrCmp $1 "" done_loop
 
+  ; Find next semicolon
   Push $1
   Push ";"
   Call un.StrStr
   Pop $3
 
-  StrCmp $3 "" 0 +4
-    StrCpy $3 $1
-    StrCpy $1 ""
-    Goto process_segment
+  StrCmp $3 "" no_semicolon
 
+  ; Extract segment before semicolon
   StrLen $6 $1
   StrLen $7 $3
   IntOp $6 $6 - $7
   StrCpy $3 $1 $6
-  IntOp $7 $7 - 1
-  StrCpy $1 $3 "" $6
-  StrCpy $1 $1 "" 1
+
+  ; Move remainder forward
+  IntOp $6 $6 + 1
+  StrCpy $1 $1 "" $6
+  Goto process_segment
+
+no_semicolon:
+  StrCpy $3 $1
+  StrCpy $1 ""
 
 process_segment:
 
+  ; Trim CR/LF from segment
+  Push $3
+  Call un.TrimCRLF
+  Pop $3
+
   ; Normalize segment (remove trailing \)
   StrCpy $5 $3
-loop_trim_seg:
+trim_seg:
   StrLen $6 $5
   IntCmp $6 0 trim_seg_done
   IntOp $6 $6 - 1
   StrCpy $7 $5 1 $6
   StrCmp $7 "\" 0 trim_seg_done
   StrCpy $5 $5 $6
-  Goto loop_trim_seg
+  Goto trim_seg
 trim_seg_done:
 
-  ; Compare with target
-  StrCmp $5 $4 skip_segment
+  ; Lowercase segment
+  Push $5
+  Call un.StrLower
+  Pop $5
 
-  ; Append to rebuilt PATH
+  ; Compare with target
+  StrCmp $5 $4 remove_segment
+
+  ; Keep segment
   StrCmp $2 "" 0 +3
     StrCpy $2 "$3"
-    Goto continue_loop
+    Goto loop
 
   StrCpy $2 "$2;$3"
-  Goto continue_loop
+  Goto loop
 
-skip_segment:
+remove_segment:
   StrCmp $9 "" +2
     FileWrite $9 "Removed segment: $3$\r$\n"
-
-continue_loop:
   Goto loop
 
 done_loop:
 
-write:
-  ; If rebuilt PATH equals original, nothing changed
+  ; If unchanged, exit
   StrCmp $2 $8 done
 
-  ; SAFETY: prevent wiping PATH
+  ; Check if original had multiple entries
+  Push $8
+  Push ";"
+  Call un.StrStr
+  Pop $6
+
+  ; Prevent wiping multi-entry PATH
   StrCmp $2 "" 0 write_reg
-    DetailPrint "Safety abort: rebuilt PATH empty, keeping original PATH"
-    StrCmp $9 "" +2
-      FileWrite $9 "Safety abort: rebuilt PATH empty$\r$\n"
-    Goto done
+  StrCmp $6 "" write_reg
+
+  DetailPrint "Safety abort: rebuilt PATH empty"
+  StrCmp $9 "" +2
+    FileWrite $9 "Safety abort triggered$\r$\n"
+  Goto done
 
 write_reg:
   WriteRegExpandStr HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path" "$2"
@@ -396,13 +427,11 @@ write_reg:
     FileWrite $9 "Updated PATH: $2$\r$\n"
 
 done:
-  SetRegView 32
-
   StrCmp $9 "" +3
     FileWrite $9 "=== RemoveFromPath completed ===$\r$\n"
     FileClose $9
 
-  DetailPrint "=== RemoveFromPath completed ==="
+  DetailPrint "RemoveFromPath completed"
 
   Pop $9
   Pop $8
