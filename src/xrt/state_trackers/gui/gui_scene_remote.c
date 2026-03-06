@@ -18,7 +18,9 @@
 #include "gui_common.h"
 #include "gui_imgui.h"
 
+#ifdef XRT_BUILD_DRIVER_REMOTE
 #include "remote/r_interface.h"
+#endif
 
 
 /*

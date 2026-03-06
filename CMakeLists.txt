@@ -354,42 +354,8 @@ option_with_deps(XRT_HAVE_LIBUVC "Enable libuvc video driver" DEPENDS LIBUVC_FOU
 option_with_deps(XRT_HAVE_REALSENSE "Enable RealSense support" DEPENDS realsense2_FOUND)
 option_with_deps(XRT_HAVE_OPENVR "Enable OpenVR support" DEPENDS OPENVR_FOUND)
 
-# Drivers to build (sorted)
-option_with_deps(XRT_BUILD_DRIVER_ANDROID "Enable Android sensors driver" DEPENDS ANDROID)
-option_with_deps(XRT_BUILD_DRIVER_ARDUINO "Enable Arduino input device with BLE" DEPENDS XRT_HAVE_DBUS)
-option_with_deps(XRT_BUILD_DRIVER_BLUBUR_S1 "Enable 3Glasses Blubur S1 device driver" DEPENDS XRT_HAVE_INTERNAL_HID)
-option_with_deps(XRT_BUILD_DRIVER_DAYDREAM "Enable the Google Daydream View controller driver (BLE)" DEPENDS XRT_HAVE_DBUS)
-option_with_deps(XRT_BUILD_DRIVER_DEPTHAI "DepthAI" DEPENDS depthai_FOUND)
-option_with_deps(XRT_BUILD_DRIVER_EUROC "Enable EuRoC dataset driver for SLAM evaluation" DEPENDS XRT_HAVE_OPENCV "NOT MSVC")
-option_with_deps(XRT_BUILD_DRIVER_HANDTRACKING "Enable Camera Hand Tracking driver" DEPENDS XRT_MODULE_MERCURY_HANDTRACKING)
-option_with_deps(XRT_BUILD_DRIVER_TWRAP "Enable Tracking Wrapper drivers" "NOT ANDROID") # only depends on imu
-option_with_deps(XRT_BUILD_DRIVER_HDK "Enable HDK driver" DEPENDS XRT_HAVE_INTERNAL_HID)
-option_with_deps(XRT_BUILD_DRIVER_HYDRA "Enable Hydra driver" DEPENDS XRT_HAVE_INTERNAL_HID)
-option_with_deps(XRT_BUILD_DRIVER_ILLIXR "Enable ILLIXR driver" DEPENDS ILLIXR_PATH)
-option_with_deps(XRT_BUILD_DRIVER_NS "Enable North Star driver" "NOT ANDROID")
-option_with_deps(XRT_BUILD_DRIVER_OHMD "Enable OpenHMD driver" DEPENDS OPENHMD_FOUND)
-option_with_deps(XRT_BUILD_DRIVER_OPENGLOVES "Enable OpenGloves driver" DEPENDS XRT_HAVE_LIBUDEV XRT_HAVE_BLUETOOTH)
-option_with_deps(XRT_BUILD_DRIVER_PSMV "Enable Playstation Move driver" DEPENDS XRT_HAVE_INTERNAL_HID "NOT MSVC")
-option_with_deps(XRT_BUILD_DRIVER_PSSENSE "Enable PlayStation Sense driver" DEPENDS XRT_HAVE_INTERNAL_HID)
-option_with_deps(XRT_BUILD_DRIVER_PSVR "Enable PSVR HMD driver" DEPENDS XRT_HAVE_HIDAPI)
+# Drivers to build
 option_with_deps(XRT_BUILD_DRIVER_QWERTY "Enable Qwerty driver" DEPENDS "XRT_HAVE_SDL2 OR WIN32 OR APPLE")
-option_with_deps(XRT_BUILD_DRIVER_REALSENSE "Enable RealSense device driver" DEPENDS XRT_HAVE_REALSENSE)
-option_with_deps(XRT_BUILD_DRIVER_REMOTE "Enable remote debugging driver" DEPENDS "XRT_HAVE_LINUX OR ANDROID OR WIN32 OR XRT_HAVE_MACOS")
-option_with_deps(XRT_BUILD_DRIVER_RIFT "Enable Oculus Rift (DK2) device driver")
-option_with_deps(XRT_BUILD_DRIVER_RIFT_S "Enable Oculus Rift S device driver" DEPENDS XRT_HAVE_V4L2)
-option_with_deps(XRT_BUILD_DRIVER_ROKID "Enable Rokid driver" DEPENDS "XRT_HAVE_LIBUSB")
-option_with_deps(XRT_BUILD_DRIVER_STEAMVR_LIGHTHOUSE "Enable SteamVR Lighthouse driver" DEPENDS XRT_HAVE_LINUX XRT_MODULE_AUX_VIVE)
-option_with_deps(XRT_BUILD_DRIVER_SURVIVE "Enable libsurvive driver" DEPENDS SURVIVE_FOUND XRT_MODULE_AUX_VIVE)
-option_with_deps(XRT_BUILD_DRIVER_ULV2 "Enable Ultraleap v2 driver" DEPENDS LeapV2_FOUND)
-option_with_deps(XRT_BUILD_DRIVER_ULV5 "Enable Ultraleap v5 driver" DEPENDS LeapSDK_FOUND)
-option_with_deps(XRT_BUILD_DRIVER_VF "Build video frame driver (for video file support, uses gstreamer)" DEPENDS XRT_HAVE_GST)
-option_with_deps(XRT_BUILD_DRIVER_VIVE "Enable driver for HTC Vive, Vive Pro, Valve Index, and their controllers" DEPENDS ZLIB_FOUND XRT_HAVE_LINUX XRT_MODULE_AUX_VIVE)
-option_with_deps(XRT_BUILD_DRIVER_WMR "Enable Windows Mixed Reality driver" DEPENDS LINUX)
-option_with_deps(XRT_BUILD_DRIVER_XREAL_AIR "Enable Xreal Air HMD driver" DEPENDS XRT_HAVE_HIDAPI)
-option_with_deps(XRT_BUILD_DRIVER_SIMULAVR "Enable simula driver" DEPENDS XRT_HAVE_REALSENSE)
-option(XRT_BUILD_DRIVER_SIMULATED "Enable simulated driver" ON)
-
-option(XRT_BUILD_SAMPLES "Enable compiling sample code implementations that will not be linked into any final targets" ON)
 set(XRT_IPC_MSG_SOCK_FILENAME monado_comp_ipc CACHE STRING "Service socket filename")
 set(XRT_IPC_SERVICE_PID_FILENAME monado.pid CACHE STRING "Service pidfile filename")
 set(XRT_OXR_RUNTIME_SUFFIX monado CACHE STRING "OpenXR client library suffix")
@@ -464,40 +430,7 @@ option(XRT_FEATURE_OPENXR_SPACE_UNBOUNDED "Enable XR_MSFT_unbounded_reference_sp
 list(
 	APPEND
 	AVAILABLE_DRIVERS
-	"ANDROID"
-	"ARDUINO"
-	"BLUBUR_S1"
-	"DAYDREAM"
-	"SIMULATED"
-	"HANDTRACKING"
-	"HDK"
-	"HYDRA"
-	"ILLIXR"
-	"NS"
-	"OHMD"
-	"OPENGLOVES"
-	"PSMV"
-	"PSSENSE"
-	"PSVR"
-	"REALSENSE"
-	"REMOTE"
-	"RIFT"
-	"RIFT_S"
-	"ROKID"
-	"SURVIVE"
-	"V4L2"
-	"ULV2"
-	"ULV5"
-	"VF"
-	"DEPTHAI"
-	"VIVE"
 	"QWERTY"
-	"WMR"
-	"EUROC"
-	"SIMULAVR"
-	"TWRAP"
-	"XREAL_AIR"
-	"STEAMVR_LIGHTHOUSE"
 	)
 
 # Package name needs to be known by the native code itself.
@@ -711,39 +644,8 @@ message(STATUS "#    FEATURE_STEAMVR_PLUGIN:                        ${XRT_FEATUR
 message(STATUS "#    FEATURE_TRACING:                               ${XRT_FEATURE_TRACING}")
 message(STATUS "#    FEATURE_WINDOW_PEEK:                           ${XRT_FEATURE_WINDOW_PEEK}")
 message(STATUS "#")
-message(STATUS "#    DRIVER_ANDROID:              ${XRT_BUILD_DRIVER_ANDROID}")
-message(STATUS "#    DRIVER_ARDUINO:              ${XRT_BUILD_DRIVER_ARDUINO}")
-message(STATUS "#    DRIVER_BLUBUR_S1:            ${XRT_BUILD_DRIVER_BLUBUR_S1}")
-message(STATUS "#    DRIVER_DAYDREAM:             ${XRT_BUILD_DRIVER_DAYDREAM}")
-message(STATUS "#    DRIVER_DEPTHAI:              ${XRT_BUILD_DRIVER_DEPTHAI}")
-message(STATUS "#    DRIVER_EUROC:                ${XRT_BUILD_DRIVER_EUROC}")
-message(STATUS "#    DRIVER_HANDTRACKING:         ${XRT_BUILD_DRIVER_HANDTRACKING}")
-message(STATUS "#    DRIVER_HDK:                  ${XRT_BUILD_DRIVER_HDK}")
-message(STATUS "#    DRIVER_HYDRA:                ${XRT_BUILD_DRIVER_HYDRA}")
-message(STATUS "#    DRIVER_ILLIXR:               ${XRT_BUILD_DRIVER_ILLIXR}")
-message(STATUS "#    DRIVER_NS:                   ${XRT_BUILD_DRIVER_NS}")
-message(STATUS "#    DRIVER_OHMD:                 ${XRT_BUILD_DRIVER_OHMD}")
-message(STATUS "#    DRIVER_OPENGLOVES:           ${XRT_BUILD_DRIVER_OPENGLOVES}")
-message(STATUS "#    DRIVER_PSMV:                 ${XRT_BUILD_DRIVER_PSMV}")
-message(STATUS "#    DRIVER_PSSENSE:              ${XRT_BUILD_DRIVER_PSSENSE}")
-message(STATUS "#    DRIVER_PSVR:                 ${XRT_BUILD_DRIVER_PSVR}")
 message(STATUS "#    DRIVER_QWERTY:               ${XRT_BUILD_DRIVER_QWERTY}")
-message(STATUS "#    DRIVER_REALSENSE:            ${XRT_BUILD_DRIVER_REALSENSE}")
-message(STATUS "#    DRIVER_REMOTE:               ${XRT_BUILD_DRIVER_REMOTE}")
-message(STATUS "#    DRIVER_RIFT:                 ${XRT_BUILD_DRIVER_RIFT}")
-message(STATUS "#    DRIVER_RIFT_S:               ${XRT_BUILD_DRIVER_RIFT_S}")
-message(STATUS "#    DRIVER_ROKID:                ${XRT_BUILD_DRIVER_ROKID}")
-message(STATUS "#    DRIVER_SIMULATED:            ${XRT_BUILD_DRIVER_SIMULATED}")
-message(STATUS "#    DRIVER_SIMULAVR:             ${XRT_BUILD_DRIVER_SIMULAVR}")
-message(STATUS "#    DRIVER_SURVIVE:              ${XRT_BUILD_DRIVER_SURVIVE}")
-message(STATUS "#    DRIVER_TWRAP:                ${XRT_BUILD_DRIVER_TWRAP}")
-message(STATUS "#    DRIVER_ULV2:                 ${XRT_BUILD_DRIVER_ULV2}")
-message(STATUS "#    DRIVER_ULV5:                 ${XRT_BUILD_DRIVER_ULV5}")
-message(STATUS "#    DRIVER_VF:                   ${XRT_BUILD_DRIVER_VF}")
-message(STATUS "#    DRIVER_VIVE:                 ${XRT_BUILD_DRIVER_VIVE}")
-message(STATUS "#    DRIVER_WMR:                  ${XRT_BUILD_DRIVER_WMR}")
-message(STATUS "#    DRIVER_XREAL_AIR:            ${XRT_BUILD_DRIVER_XREAL_AIR}")
-message(STATUS "#    DRIVER_STEAMVR_LIGHTHOUSE:   ${XRT_BUILD_DRIVER_STEAMVR_LIGHTHOUSE}")
+message(STATUS "#    DRIVER_LEIA_SR:              ${XRT_HAVE_LEIA_SR}")
 message(STATUS "#####----- Config -----#####")
 # cmake-format: on
 

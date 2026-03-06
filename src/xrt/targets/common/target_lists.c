@@ -12,102 +12,6 @@
 #include "target_builder_interface.h"
 
 
-#ifdef XRT_BUILD_DRIVER_ARDUINO
-#include "arduino/arduino_interface.h"
-#endif
-
-#ifdef XRT_BUILD_DRIVER_BLUBUR_S1
-#include "blubur_s1/blubur_s1_interface.h"
-#endif
-
-#ifdef XRT_BUILD_DRIVER_SIMULATED
-#include "simulated/simulated_interface.h"
-#endif
-
-#ifdef XRT_BUILD_DRIVER_HDK
-#include "hdk/hdk_interface.h"
-#endif
-
-#ifdef XRT_BUILD_DRIVER_OHMD
-#include "ohmd/oh_interface.h"
-#endif
-
-#ifdef XRT_BUILD_DRIVER_PSMV
-#include "psmv/psmv_interface.h"
-#endif
-
-#ifdef XRT_BUILD_DRIVER_PSSENSE
-#include "pssense/pssense_interface.h"
-#endif
-
-#ifdef XRT_BUILD_DRIVER_PSVR
-#include "psvr/psvr_interface.h"
-#endif
-
-#ifdef XRT_BUILD_DRIVER_RIFT
-#include "rift/rift_interface.h"
-#endif
-
-#ifdef XRT_BUILD_DRIVER_RIFT_S
-#include "rift_s/rift_s_interface.h"
-#endif
-
-#ifdef XRT_BUILD_DRIVER_ROKID
-#include "rokid/rokid_interface.h"
-#endif
-
-#ifdef XRT_BUILD_DRIVER_HYDRA
-#include "hydra/hydra_interface.h"
-#endif
-
-#ifdef XRT_BUILD_DRIVER_DAYDREAM
-#include "daydream/daydream_interface.h"
-#endif
-
-#ifdef XRT_BUILD_DRIVER_ANDROID
-#include "android/android_prober.h"
-#endif
-
-#ifdef XRT_BUILD_DRIVER_ILLIXR
-#include "illixr/illixr_interface.h"
-#endif
-
-#ifdef XRT_BUILD_DRIVER_REALSENSE
-#include "realsense/rs_interface.h"
-#endif
-
-#ifdef XRT_BUILD_DRIVER_ULV2
-#include "ultraleap_v2/ulv2_interface.h"
-#endif
-
-#ifdef XRT_BUILD_DRIVER_ULV5
-#include "ultraleap_v5/ulv5_interface.h"
-#endif
-
-#ifdef XRT_BUILD_DRIVER_DEPTHAI
-#include "depthai/depthai_interface.h"
-#endif
-
-#ifdef XRT_BUILD_DRIVER_WMR
-#include "wmr/wmr_interface.h"
-#include "wmr/wmr_common.h"
-#endif
-
-#ifdef XRT_BUILD_DRIVER_XREAL_AIR
-#include "xreal_air/xreal_air_interface.h"
-#endif
-
-#ifdef XRT_BUILD_DRIVER_EUROC
-#include "euroc/euroc_interface.h"
-#endif
-
-#ifdef XRT_BUILD_DRIVER_HANDTRACKING
-#ifdef XRT_BUILD_DRIVER_DEPTHAI
-#include "ht/ht_interface.h"
-#endif
-#endif
-
-
 /*!
  * Builders
  */
@@ -116,14 +20,6 @@ xrt_builder_create_func_t target_builder_list[] = {
     t_builder_qwerty_create,
 #endif // T_BUILDER_QWERTY
 
-#ifdef T_BUILDER_REMOTE // High up to override any real hardware.
-    t_builder_remote_create,
-#endif // T_BUILDER_REMOTE
-
-#ifdef T_BUILDER_SIMULATED // High up to override any real hardware.
-    t_builder_simulated_create,
-#endif // T_BUILDER_SIMULATED
-
 #ifdef T_BUILDER_LEIA // Leia 3D display (SR SDK / CNSDK).
     t_builder_leia_create,
 #endif // T_BUILDER_LEIA
@@ -131,38 +27,6 @@ xrt_builder_create_func_t target_builder_list[] = {
 #ifdef T_BUILDER_SIM_DISPLAY // After overrides, before real hardware.
     t_builder_sim_display_create,
 #endif // T_BUILDER_SIM_DISPLAY
-
-#ifdef XRT_BUILD_DRIVER_RIFT_S
-    rift_s_builder_create,
-#endif // XRT_BUILD_DRIVER_RIFT_S
-
-#ifdef T_BUILDER_RGB_TRACKING
-    t_builder_rgb_tracking_create,
-#endif // T_BUILDER_RGB_TRACKING
-
-#ifdef T_BUILDER_SIMULAVR
-    t_builder_simula_create,
-#endif // T_BUILDER_SIMULAVR
-
-#ifdef T_BUILDER_STEAMVR
-    t_builder_steamvr_create,
-#endif // T_BUILDER_STEAMVR
-
-#ifdef T_BUILDER_LIGHTHOUSE
-    t_builder_lighthouse_create,
-#endif // T_BUILDER_LIGHTHOUSE
-
-#ifdef T_BUILDER_NS
-    t_builder_north_star_create,
-#endif // T_BUILDER_NS
-
-#ifdef T_BUILDER_WMR
-    t_builder_wmr_create,
-#endif // T_BUILDER_WMR
-
-#ifdef XRT_BUILD_DRIVER_XREAL_AIR
-    xreal_air_builder_create,
-#endif // T_BUILDER_XREAL_AIR
 
 #ifdef T_BUILDER_LEGACY
     t_builder_legacy_create,
@@ -190,36 +54,6 @@ xrt_builder_create_func_t target_builder_list[] = {
  * assign sequential elements of out_xdevs to the created devices.
  */
 struct xrt_prober_entry target_entry_list[] = {
-#ifdef XRT_BUILD_DRIVER_PSMV
-    {PSMV_VID, PSMV_PID_ZCM1, psmv_found, "PS Move Controller (ZCM1)", "psmv"},
-    {PSMV_VID, PSMV_PID_ZCM2, psmv_found, "PS Move Controller (ZCM2)", "psmv"},
-#endif // XRT_BUILD_DRIVER_PSMV
-
-#ifdef XRT_BUILD_DRIVER_PSSENSE
-    {PSSENSE_VID, PSSENSE_PID_LEFT, pssense_found, "PlayStation VR2 Sense Controller (L)", "pssense"},
-    {PSSENSE_VID, PSSENSE_PID_RIGHT, pssense_found, "PlayStation VR2 Sense Controller (R)", "pssense"},
-#endif // XRT_BUILD_DRIVER_PSSENSE
-
-#ifdef XRT_BUILD_DRIVER_RIFT
-    {OCULUS_VR_VID, OCULUS_DK2_PID, rift_found, "Rift (DK2)", "rift"},
-#endif // XRT_BUILD_DRIVER_RIFT
-
-#ifdef XRT_BUILD_DRIVER_BLUBUR_S1
-    {BLUBUR_S1_VID, BLUBUR_S1_PID, blubur_s1_found, "Blubur S1", "blubur_s1"},
-#endif // XRT_BUILD_DRIVER_BLUBUR_S1
-
-#ifdef XRT_BUILD_DRIVER_ROKID
-    {ROKID_VID, ROKID_PID, rokid_found, "Rokid Air or Max", "rokid"},
-#endif // XRT_BUILD_DRIVER_ROKID
-
-#ifdef XRT_BUILD_DRIVER_HYDRA
-    {HYDRA_VID, HYDRA_PID, hydra_found, "Razer Hydra", "hydra"},
-#endif // XRT_BUILD_DRIVER_HYDRA
-
-#ifdef XRT_BUILD_DRIVER_HDK
-    {HDK_VID, HDK_PID, hdk_found, "OSVR HDK", "osvr"},
-#endif // XRT_BUILD_DRIVER_HDK
-
     {0x0000, 0x0000, NULL, NULL, NULL}, // Terminate
 };
 
@@ -229,46 +63,6 @@ struct xrt_prober_entry *target_entry_lists[] = {
 };
 
 xrt_auto_prober_create_func_t target_auto_list[] = {
-#ifdef XRT_BUILD_DRIVER_PSVR
-    psvr_create_auto_prober,
-#endif
-
-#ifdef XRT_BUILD_DRIVER_ARDUINO
-    // Before OpenHMD
-    arduino_create_auto_prober,
-#endif
-
-#ifdef XRT_BUILD_DRIVER_DAYDREAM
-    // Before OpenHMD
-    daydream_create_auto_prober,
-#endif
-
-#ifdef XRT_BUILD_DRIVER_OHMD
-    // OpenHMD almost as the end as we want to override it with native drivers.
-    oh_create_auto_prober,
-#endif
-
-#ifdef XRT_BUILD_DRIVER_ANDROID
-    android_create_auto_prober,
-#endif
-
-#ifdef XRT_BUILD_DRIVER_ILLIXR
-    illixr_create_auto_prober,
-#endif
-
-#ifdef XRT_BUILD_DRIVER_REALSENSE
-    rs_create_auto_prober,
-#endif
-
-#ifdef XRT_BUILD_DRIVER_EUROC
-    euroc_create_auto_prober,
-#endif
-
-#ifdef XRT_BUILD_DRIVER_SIMULATED
-    // Simulated headset driver last.
-    simulated_create_auto_prober,
-#endif
-
     NULL, // Terminate
 };
 

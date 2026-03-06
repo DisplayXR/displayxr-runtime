@@ -15,7 +15,6 @@ target_link_libraries(
 	st_prober
 	PRIVATE
 		drv_includes
-		drv_multi
 		aux_util
 		aux_util_sink
 		aux_os
@@ -41,13 +40,4 @@ if(XRT_HAVE_LIBUVC)
 	target_sources(st_prober PRIVATE p_libuvc.c)
 	target_include_directories(st_prober PRIVATE ${LIBUVC_INCLUDES})
 	target_link_libraries(st_prober PRIVATE ${LIBUVC_LIBRARIES})
-endif()
-
-if(XRT_HAVE_V4L2)
-	# Uses v4l2_fs_create
-	target_link_libraries(st_prober PRIVATE drv_v4l2)
-endif()
-
-if(XRT_BUILD_DRIVER_VF)
-	target_link_libraries(st_prober PRIVATE drv_vf)
 endif()

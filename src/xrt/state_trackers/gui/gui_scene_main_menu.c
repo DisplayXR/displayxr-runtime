@@ -71,22 +71,6 @@ scene_render(struct gui_scene *scene, struct gui_program *p)
 		gui_scene_record(p, "leap_motion");
 	}
 
-	if (igButton("Remote", button_dims)) {
-		gui_scene_delete_me(p, scene);
-
-		gui_scene_remote(p, NULL);
-	}
-
-	if (igButton("Hand-Tracking Demo", button_dims)) {
-		gui_scene_delete_me(p, scene);
-		gui_scene_hand_tracking_demo(p);
-	}
-
-	if (igButton("EuRoC recorder (DepthAI Stereo)", button_dims)) {
-		gui_scene_delete_me(p, scene);
-		gui_scene_record_euroc(p);
-	}
-
 	if (igButton("Resampler Test", button_dims)) {
 		gui_scene_delete_me(p, scene);
 		gui_scene_resampler_test(p);

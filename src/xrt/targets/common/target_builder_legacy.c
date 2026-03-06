@@ -20,68 +20,8 @@
 #include <assert.h>
 
 static const char *driver_list[] = {
-#ifdef XRT_BUILD_DRIVER_HYDRA
-    "hydra",
-#endif
-
-#ifdef XRT_BUILD_DRIVER_HDK
-    "hdk",
-#endif
-
-#ifdef XRT_BUILD_DRIVER_ULV2
-    "ulv2",
-#endif
-
-#ifdef XRT_BUILD_DRIVER_DEPTHAI
-    "depthai",
-#endif
-
-#ifdef XRT_BUILD_DRIVER_WMR
-    "wmr",
-#endif
-
-#ifdef XRT_BUILD_DRIVER_ARDUINO
-    "arduino",
-#endif
-
-#ifdef XRT_BUILD_DRIVER_DAYDREAM
-    "daydream",
-#endif
-
-#ifdef XRT_BUILD_DRIVER_OHMD
-    "oh",
-#endif
-
-#ifdef XRT_BUILD_DRIVER_NS
-    "ns",
-#endif
-
-#ifdef XRT_BUILD_DRIVER_ANDROID
-    "android",
-#endif
-
-#ifdef XRT_BUILD_DRIVER_ILLIXR
-    "illixr",
-#endif
-
-#ifdef XRT_BUILD_DRIVER_REALSENSE
-    "rs",
-#endif
-
-#ifdef XRT_BUILD_DRIVER_EUROC
-    "euroc",
-#endif
-
 #ifdef XRT_BUILD_DRIVER_QWERTY
     "qwerty",
-#endif
-
-#if defined(XRT_BUILD_DRIVER_HANDTRACKING) && defined(XRT_BUILD_DRIVER_DEPTHAI)
-    "ht",
-#endif
-
-#if defined(XRT_BUILD_DRIVER_SIMULATED)
-    "simulated",
 #endif
     NULL,
 };
@@ -156,8 +96,6 @@ legacy_open_system_impl(struct xrt_builder *xb,
 
 	struct xrt_device *head = NULL;
 	struct xrt_device *left = NULL, *right = NULL, *gamepad = NULL;
-	struct xrt_device *unobstructed_left_ht = NULL, *unobstructed_right_ht = NULL;
-	struct xrt_device *conforming_left_ht = NULL, *conforming_right_ht = NULL;
 
 	if (head_idx >= 0) {
 		head = xsysd->xdevs[head_idx];
@@ -172,22 +110,11 @@ legacy_open_system_impl(struct xrt_builder *xb,
 		gamepad = xsysd->xdevs[gamepad_idx];
 	}
 
-	// Find hand tracking devices.
-	unobstructed_left_ht = u_system_devices_get_ht_device_unobstructed_left(xsysd);
-	unobstructed_right_ht = u_system_devices_get_ht_device_unobstructed_right(xsysd);
-
-	conforming_left_ht = u_system_devices_get_ht_device_conforming_left(xsysd);
-	conforming_right_ht = u_system_devices_get_ht_device_conforming_right(xsysd);
-
 	// Assign to role(s).
 	ubrh->head = head;
 	ubrh->left = left;
 	ubrh->right = right;
 	ubrh->gamepad = gamepad;
-	ubrh->hand_tracking.unobstructed.left = unobstructed_left_ht;
-	ubrh->hand_tracking.unobstructed.right = unobstructed_right_ht;
-	ubrh->hand_tracking.conforming.left = conforming_left_ht;
-	ubrh->hand_tracking.conforming.right = conforming_right_ht;
 
 	return XRT_SUCCESS;
 }

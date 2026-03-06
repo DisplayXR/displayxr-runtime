@@ -40,11 +40,8 @@ add_library(
 	st_gui STATIC
 	gui_prober.c
 	gui_scene_calibrate.c
-	gui_scene_hand_tracking_demo.c
 	gui_scene_main_menu.c
 	gui_scene_record.c
-	gui_scene_record_euroc.c
-	gui_scene_remote.c
 	gui_scene_resampler_test.c
 	gui_scene_tracking_overrides.c
 	gui_scene_video.c
@@ -68,17 +65,6 @@ if(XRT_HAVE_GST)
 	target_link_libraries(st_gui PRIVATE aux_gstreamer)
 endif()
 
-if(XRT_BUILD_DRIVER_DEPTHAI)
-	target_link_libraries(st_gui PRIVATE drv_depthai)
-endif()
-
-if(XRT_BUILD_DRIVER_HANDTRACKING)
-	target_link_libraries(st_gui PRIVATE drv_ht)
-endif()
-
-if(XRT_BUILD_DRIVER_REMOTE)
-	target_link_libraries(st_gui PRIVATE drv_remote)
-endif()
 
 if(XRT_HAVE_SDL2)
 	target_link_libraries(st_gui PUBLIC xrt-external-imgui-sdl2)

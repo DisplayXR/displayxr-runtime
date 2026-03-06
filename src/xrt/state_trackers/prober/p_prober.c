@@ -43,7 +43,6 @@
 #include <string.h>
 #include <assert.h>
 
-#include "multi_wrapper/multi.h"
 
 
 /*
@@ -767,48 +766,11 @@ add_from_auto_probers(struct prober *p, struct xrt_device **xdevs, size_t xdev_c
 static void
 apply_tracking_override(struct prober *p, struct xrt_device **xdevs, size_t xdev_count, struct xrt_tracking_override *o)
 {
-	struct xrt_device *target_xdev = NULL;
-	size_t target_idx = 0;
-	struct xrt_device *tracker_xdev = NULL;
-
-	for (size_t i = 0; i < xdev_count; i++) {
-		struct xrt_device *xdev = xdevs[i];
-		if (xdev == NULL) {
-			continue;
-		}
-
-		if (strncmp(xdev->serial, o->target_device_serial, XRT_DEVICE_NAME_LEN) == 0) {
-			target_xdev = xdev;
-			target_idx = i;
-		}
-		if (strncmp(xdev->serial, o->tracker_device_serial, XRT_DEVICE_NAME_LEN) == 0) {
-			tracker_xdev = xdev;
-		}
-	}
-
-	if (target_xdev == NULL) {
-		P_WARN(p, "Tracking override target xdev %s not found", o->target_device_serial);
-	}
-
-	if (tracker_xdev == NULL) {
-		P_WARN(p, "Tracking override tracker xdev %s not found", o->tracker_device_serial);
-	}
-
-
-	if (target_xdev != NULL && tracker_xdev != NULL) {
-		struct xrt_device *multi = multi_create_tracking_override(o->override_type, target_xdev, tracker_xdev,
-		                                                          o->input_name, &o->offset);
-
-		if (multi) {
-			P_INFO(p, "Applying Tracking override %s <- %s", o->target_device_serial,
-			       o->tracker_device_serial);
-			// drops the target device from the list, but keeps the tracker
-			// a tracker could be attached to multiple targets with different names
-			xdevs[target_idx] = multi;
-		} else {
-			P_ERROR(p, "Failed to create tracking override multi device");
-		}
-	}
+	// Tracking overrides (multi_wrapper) removed — not used for 3D display runtime.
+	P_WARN(p, "Tracking overrides not supported in this build");
+	(void)xdevs;
+	(void)xdev_count;
+	(void)o;
 }
 
 struct xrt_builder *

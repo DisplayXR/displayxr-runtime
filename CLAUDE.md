@@ -2,6 +2,61 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Branch Mission: Lightweight Runtime (Issue #23)
+
+This branch implements **issue #23** — transforming the Monado fork into a lightweight standalone OpenXR runtime purpose-built for 3D displays. Target: ~150-200 files (vs 500+ today) where every file is relevant.
+
+### Sub-issues (execution order)
+
+**Phase 1: Strip down**
+- [ ] #24 — Remove 34 unused VR drivers (keep leia, sim_display, qwerty)
+- [ ] #25 — Remove Vulkan server compositor (`compositor/main/`, `render/`, `shaders/`) and tracking infrastructure
+- [ ] #26 — Clean up CMake build system (remove 30+ unused toggles, dead find modules)
+- [ ] #32 — Move stereo math (`display3d_view.c`, `camera3d_view.c`) into `auxiliary/math/`
+
+**Phase 2: Add native compositors**
+- [ ] #27 — Native D3D12 compositor
+- [ ] #28 — Native Vulkan compositor (direct submit, not server)
+- [ ] #29 — Native OpenGL compositor
+
+**Phase 3: Complete test app coverage**
+- [ ] #30 — Non-ext test apps (cube_d3d12, cube_vk, cube_gl)
+- [ ] #31 — Shared texture test apps (cube_shared_d3d11, cube_shared_d3d12, cube_shared_vk, cube_shared_vk_macos, cube_shared_gl)
+
+**Phase 4: Conformance**
+- [ ] #33 — OpenXR conformance testing (Khronos CTS)
+
+### Architecture Goal
+
+```
+App (any graphics API)
+        |
+   OpenXR State Tracker (from Monado)
+        |
+   Core xrt interfaces
+        |
+   +----+-----+--------+--------+
+   |    |     |        |        |
+ D3D11 D3D12 Vulkan  Metal   OpenGL   <-- native compositors
+   |    |     |        |        |
+   Weaver (LeiaSR / CNSDK / sim_display)
+        |
+   Display
+```
+
+Each graphics API gets a native compositor — no interop, no Vulkan intermediary.
+
+### Two App Classes
+
+1. **3D Display-aware apps** — use window binding + display info extensions, Kooima projection
+2. **Standard OpenXR/WebXR apps** — runtime provides window, qwerty simulates controllers, eye tracking drives perspective
+
+### Key Risks to Watch
+- Compositor vtable has 56 methods — use `comp_base` helper for boilerplate
+- IPC/service mode (39 files, 12K LOC) must be preserved for WebXR + multi-app
+- Keep `compositor/multi/` (multi-client), `compositor/client/`, `compositor/null/`, `compositor/util/`
+- `display3d_view.c` / `camera3d_view.c` are load-bearing — extract before removing dependencies
+
 ## Project Overview
 
 This is a fork of **Monado**, an open source OpenXR runtime for VR/AR devices. This fork integrates **Leia SR SDK** for eye tracked 3D Display support. The project implements the OpenXR API standard from Khronos and runs on Linux, Android, and Windows.
@@ -9,22 +64,17 @@ This is a fork of **Monado**, an open source OpenXR runtime for VR/AR devices. T
 ## Build Commands
 
 ### Local macOS Build
-Local macOS builds work for the runtime and sim_display test app. Use the convenience script:
 ```bash
 # Prerequisites: brew install cmake ninja eigen vulkan-sdk
 ./scripts/build_macos.sh
 ```
-This builds the runtime (with qwerty/debug GUI disabled), OpenXR loader, and cube_vk_macos test app. Note: the Vulkan compositor will fail at runtime with `VK_ERROR_EXTENSION_NOT_PRESENT` because MoltenVK lacks `VK_KHR_external_memory_fd` — this is a known MoltenVK limitation, not a build issue.
+Builds the runtime, OpenXR loader, and test apps. The Vulkan compositor will fail at runtime with `VK_ERROR_EXTENSION_NOT_PRESENT` (MoltenVK limitation, not a build issue).
 
 ### Windows CI Build (Primary)
-This project primarily targets **Windows** with LeiaSR SDK and D3D11 support. Use `/ci-monitor` to:
-- Commit and push changes
-- Monitor GitHub Actions builds (Windows + macOS)
-- Auto-diagnose and fix build errors
-
 ```bash
 /ci-monitor "your commit message"
 ```
+Commits, pushes, monitors GitHub Actions (Windows + macOS), auto-fixes common build errors.
 
 ### Standard CMake Build
 ```bash
@@ -34,173 +84,122 @@ cmake --build .
 ```
 
 ### With LeiaSR SDK Support
-LeiaSR SDK is found via `find_package(simulatedreality CONFIG)` and `find_package(srDirectX CONFIG)`. Set `LEIASR_SDKROOT` environment variable to the SDK install path. The build will warn if LeiaSR SDK is not found.
+Set `LEIASR_SDKROOT` environment variable. Found via `find_package(simulatedreality CONFIG)` and `find_package(srDirectX CONFIG)`.
 
 ### Running Tests
 ```bash
-cd build
-ctest
-# Or run individual test:
-./tests/tests_json --success
+cd build && ctest
 ```
 
 ### Code Formatting
 ```bash
-# Format all source files
-scripts/format-project.sh
-
-# Prefer git clang-format to only format your changes
-git clang-format
+git clang-format    # Format only your changes (preferred)
+scripts/format-project.sh   # Format all
 ```
-
-The project uses clang-format (version 11+ preferred). A `.clang-format` file is in `src/xrt/`.
 
 ## Architecture
 
 ### Source Tree Structure (`src/xrt/`)
-- **include/xrt/** - Core interface headers defining the internal APIs (`xrt_device.h`, `xrt_compositor.h`, `xrt_instance.h`, etc.)
-- **auxiliary/** - Shared utilities: math (`m_*`), utilities (`u_*`), OS abstraction (`os_*`), Vulkan helpers (`vk_*`), tracking (`t_*`)
-- **compositor/** - Display compositor handling distortion, layer rendering, and display output
-  - `main/` - Vulkan compositor with LeiaSR weaver integration (`comp_renderer.c`)
-  - `d3d11/` - Native D3D11 compositor (Windows) bypassing Vulkan for Intel GPU compatibility
-- **drivers/** - Hardware drivers for various HMDs and controllers (Vive, WMR, PSVR, Rift S, etc.)
-  - `leiasr/` - LeiaSR SDK driver providing Vulkan and D3D11 weavers for light field interlacing
-- **state_trackers/oxr/** - OpenXR API implementation
-- **ipc/** - Inter-process communication for service mode
-- **targets/** - Build targets producing final binaries (monado-cli, monado-service, OpenXR runtime library)
+- **include/xrt/** — Core interface headers (`xrt_device.h`, `xrt_compositor.h`, `xrt_instance.h`, etc.)
+- **auxiliary/** — Shared utilities: math (`m_*`), utilities (`u_*`), OS abstraction (`os_*`), Vulkan helpers (`vk_*`)
+- **compositor/** — Display compositors
+  - `d3d11/` — Native D3D11 compositor (Windows)
+  - `d3d11_service/` — D3D11 service compositor
+  - `metal/` — Native Metal compositor (macOS)
+  - `multi/` — Multi-client compositor (IPC/multi-app)
+  - `client/` — Client compositor bindings
+  - `null/` — Null compositor (testing)
+  - `util/` — Compositor utilities
+  - `main/` — Vulkan server compositor (TO BE REMOVED in #25)
+  - `render/` — Vulkan render helpers (TO BE REMOVED in #25)
+  - `shaders/` — Vulkan shaders (TO BE REMOVED in #25)
+- **drivers/** — Hardware drivers
+  - `leia/` — LeiaSR SDK driver (Vulkan + D3D11 weavers)
+  - `sim_display/` — Simulation display driver
+  - `qwerty/` — Keyboard/mouse simulated controllers
+  - 34 unused VR drivers (TO BE REMOVED in #24)
+- **state_trackers/oxr/** — OpenXR API implementation
+- **ipc/** — Inter-process communication for service mode
+- **targets/** — Build targets (runtime library, monado-cli, monado-service)
 
 ### Key Interfaces
-The codebase uses C interfaces with vtable-style polymorphism. Key structures:
-- `struct xrt_device` - Abstract device interface (HMDs, controllers)
-- `struct xrt_compositor` - Graphics compositor interface
-- `struct xrt_instance` - Runtime instance
-- `struct xrt_prober` - Device discovery
+C interfaces with vtable-style polymorphism:
+- `struct xrt_device` — Abstract device interface
+- `struct xrt_compositor` — Graphics compositor interface
+- `struct xrt_instance` — Runtime instance
+- `struct xrt_prober` — Device discovery
 
 ### LeiaSR SDK Integration
-This fork adds LeiaSR SDK integration for eye-tracked light field displays:
-- Controlled by `XRT_HAVE_LEIA_SR` CMake option (auto-enabled if SDK found)
-- Vulkan weaver: `src/xrt/compositor/main/comp_renderer.c` using `leiasr/leiasr.cpp`
-- D3D11 weaver: `src/xrt/compositor/d3d11/` using `leiasr/leiasr_d3d11.cpp`
-- Eye tracking via SR SDK's LookaroundFilter for dynamic perspective rendering
+- `XRT_HAVE_LEIA_SR` CMake option (auto-enabled if SDK found)
+- Vulkan weaver: `compositor/main/comp_renderer.c` via `leiasr/leiasr.cpp`
+- D3D11 weaver: `compositor/d3d11/` via `leiasr/leiasr_d3d11.cpp`
+- Eye tracking via SR SDK's LookaroundFilter
 - Display dimensions from SR::Display for Kooima asymmetric frustum projection
 
-### D3D11 Native Compositor
-A native D3D11 compositor (`src/xrt/compositor/d3d11/`) added to solve Intel GPU interop issues where D3D11→Vulkan texture import fails. Features:
-- Direct D3D11 rendering pipeline bypassing Vulkan entirely
-- Integrates with LeiaSR D3D11 weaver for light field interlacing
-- Supports app-provided windows via XR_EXT_win32_window_binding extension
-- Controlled by `OXR_ENABLE_D3D11_NATIVE_COMPOSITOR` env var (default: enabled)
+### Native Compositors
+Each bypasses Vulkan entirely for its graphics API:
+- **D3D11** (`compositor/d3d11/`) — Direct D3D11 pipeline, LeiaSR D3D11 weaver, `XR_EXT_win32_window_binding`
+- **Metal** (`compositor/metal/`) — Direct Metal pipeline, sim_display weaver, `XR_EXT_cocoa_window_binding`
+- **D3D12** — Planned (#27)
+- **Vulkan** — Planned (#28), direct submit (not the Monado server compositor)
+- **OpenGL** — Planned (#29)
 
-### XR_EXT_win32_window_binding Extension
-Custom OpenXR extension allowing apps to pass window handles (HWND) to the runtime:
-- Apps chain `XrWin32WindowBindingCreateInfoEXT` to `XrSessionCreateInfo`
-- Runtime renders into the app's window instead of creating its own
-- Enables windowed mode, multi-app scenarios, and app-controlled input
-- Header: `src/external/openxr_includes/openxr/XR_EXT_win32_window_binding.h`
-- Integration: `src/xrt/state_trackers/oxr/oxr_session.c`
+### Custom OpenXR Extensions
+- `XR_EXT_win32_window_binding` — App passes HWND to runtime
+- `XR_EXT_cocoa_window_binding` — App passes NSWindow to runtime
+- `XR_EXT_display_info` — Display dimensions, eye tracking modes
+- `XR_EXT_android_surface_binding` — Android surface binding
 
 ## Development Notes
 
 ### Languages and Standards
-- C11 for core code
-- C++17 where needed
-- Python 3.6+ for build scripts
+- C11 for core code, C++17 where needed, Python 3.6+ for build scripts
 
 ### Running Without Installing
 ```bash
 XR_RUNTIME_JSON=./build/openxr_monado-dev.json ./your_openxr_app
 ```
 
-### Changelog Fragments
-For substantial changes, create a fragment in `doc/changes/<section>/mr.NUMBER.md` describing your change for the release notes (uses Proclamation tool).
-
 ### Key CMake Options
-- `XRT_HAVE_LEIA_SR` - Enable LeiaSR SDK support (auto-enabled if SDK found)
-- `XRT_HAVE_LEIA_SR_VULKAN` - Vulkan weaver available
-- `XRT_HAVE_LEIA_SR_D3D11` - D3D11 weaver available (Windows only)
-- `XRT_FEATURE_SERVICE` - Enable out-of-process service mode
-- `XRT_BUILD_DRIVER_*` - Enable specific hardware drivers
-- `BUILD_TESTING` - Enable test suite
+- `XRT_HAVE_LEIA_SR` — LeiaSR SDK support
+- `XRT_HAVE_LEIA_SR_VULKAN` / `XRT_HAVE_LEIA_SR_D3D11` — API-specific weavers
+- `XRT_FEATURE_SERVICE` — Out-of-process service mode
+- `BUILD_TESTING` — Test suite
 
 ### CMake Variable Notes
-- `LEIASR_SDKROOT` - **Required environment variable** pointing to LeiaSR SDK install path
-- `SR_PATH` - Internal variable in `src/xrt/drivers/CMakeLists.txt`, automatically set from `LEIASR_SDKROOT`
-- The drivers CMakeLists.txt uses `SR_PATH` to locate SDK libraries (SimulatedRealityCore.lib, SimulatedRealityDirectX.lib, etc.)
-- If `LEIASR_SDKROOT` is not set, a CMake warning is shown and SR weaver support is disabled
+- `LEIASR_SDKROOT` — Required env var for LeiaSR SDK path
+- `SR_PATH` — Internal, auto-set from `LEIASR_SDKROOT`
 
 ### GitHub Actions Build
 **Windows** (`.github/workflows/build-windows.yml`):
-- `LEIASR_SDKROOT` env var set in the Generate step pointing to the downloaded SR SDK
-- `CMAKE_PREFIX_PATH` pointing to the SR SDK for find_package to work
-- Both are needed: PREFIX_PATH for find_package detection, LEIASR_SDKROOT for library paths
-- Artifact: `SRMonado` (runtime + installer + test apps)
+- `LEIASR_SDKROOT` + `CMAKE_PREFIX_PATH` both needed
+- Artifact: `SRMonado`
 
 **macOS** (`.github/workflows/build-macos.yml`):
-- Builds runtime with Vulkan SDK via MoltenVK, packages cube_vk_macos and cube_ext_vk_macos test apps
-- Bundles libvulkan, MoltenVK, and OpenXR loader for self-contained artifact
-- Toggle test app build with `BUILD_TEST_APP: true/false` env var
-- Artifact: `SRMonado-macOS` (runtime + test apps + run scripts)
+- Vulkan SDK via MoltenVK, bundles libvulkan + OpenXR loader
+- Artifact: `SRMonado-macOS`
 
 ## Claude Code Skills
 
 ### /ci-monitor - Automated Build Workflow
-Automates the complete CI workflow: commit → push → monitor → auto-fix.
-
-**Usage:**
-```bash
-/ci-monitor "commit message"    # Commit with message and monitor build
-/ci-monitor                      # Auto-generate commit message from changes
-/ci-monitor --watch-only         # Just monitor current build without committing
-```
-
-**Features:**
-- Launches subagent to preserve main conversation context
-- Monitors GitHub Actions `build-windows.yml` and `build-macos.yml` workflows
-- Auto-diagnoses common build errors (missing includes, undeclared identifiers, linker errors)
-- Attempts up to 3 automatic fixes before reporting failure
-- Reports success with artifact URL or failure with diagnostics
-
-**Skill location:** `.claude/skills/ci-monitor/SKILL.md`
+Automates commit, push, GitHub Actions monitoring, auto-fix. See `.claude/skills/ci-monitor/SKILL.md`.
 
 ### /ask-gemini - Code Analysis with Gemini
-Ask Gemini to analyze code and produce a read-only report. Automatically gathers relevant context based on your request.
-
-**Usage:**
-```bash
-/ask-gemini <your request>
-```
-
-**Examples:**
-```bash
-/ask-gemini review the latest commit and flag potential issues
-/ask-gemini explain the architecture of comp_renderer.c
-/ask-gemini analyze the error handling patterns in oxr_session.c
-```
-
-**Features:**
-- Launches subagent to preserve main conversation context
-- Smart context detection based on keywords (commit, diff, file paths, etc.)
-- Automatically gathers relevant git history, diffs, or file contents
-- Constructs detailed prompts with READ-ONLY instructions
-- Displays Gemini's analysis report
-
-**Skill location:** `~/.claude/skills/ask-gemini/SKILL.md` (user-level, available across all projects)
+Ask Gemini to analyze code and produce a read-only report. See `~/.claude/skills/ask-gemini/SKILL.md`.
 
 ## macOS Test App Local Builds
 
-After building test apps locally, copy binaries to `_package/SRMonado-macOS/bin/` (NOT the parent directory). The run scripts (`run_*.sh`) exec from `$DIR/bin/`.
+Copy binaries to `_package/SRMonado-macOS/bin/`. Run scripts exec from `$DIR/bin/`.
 
 | Test App | Build Output | Package Binary | Run Script |
 |----------|-------------|---------------|------------|
-| cube_vk_macos | `test_apps/cube_vk_macos/build/cube_vk_macos` | `_package/SRMonado-macOS/bin/cube_vk_macos` | `run_cube_vk.sh` |
-| cube_ext_vk_macos | `test_apps/cube_ext_vk_macos/build/cube_ext_vk_macos` | `_package/SRMonado-macOS/bin/cube_ext_vk_macos` | `run_cube_ext_vk.sh` |
-| cube_ext_metal_macos | `test_apps/cube_ext_metal_macos/build/cube_ext_metal_macos` | `_package/SRMonado-macOS/bin/cube_ext_metal_macos` | `run_cube_ext_metal.sh` |
-| cube_shared_metal_macos | `test_apps/cube_shared_metal_macos/build/cube_shared_metal_macos` | `_package/SRMonado-macOS/bin/cube_shared_metal_macos` | `run_cube_shared_metal.sh` |
-| gaussian_splatting_vk_macos | `demos/gaussian_splatting_vk_macos/build/gaussian_splatting_vk_macos` | `_package/SRMonado-macOS/bin/gaussian_splatting_vk_macos` | `run_gaussian_splatting.sh` |
-
-When adding new test apps, follow the same pattern: binary goes in `bin/`, run script in the package root.
+| cube_vk_macos | `test_apps/cube_vk_macos/build/cube_vk_macos` | `_package/.../bin/cube_vk_macos` | `run_cube_vk.sh` |
+| cube_ext_vk_macos | `test_apps/cube_ext_vk_macos/build/cube_ext_vk_macos` | `_package/.../bin/cube_ext_vk_macos` | `run_cube_ext_vk.sh` |
+| cube_ext_metal_macos | `test_apps/cube_ext_metal_macos/build/cube_ext_metal_macos` | `_package/.../bin/cube_ext_metal_macos` | `run_cube_ext_metal.sh` |
+| cube_shared_metal_macos | `test_apps/cube_shared_metal_macos/build/cube_shared_metal_macos` | `_package/.../bin/cube_shared_metal_macos` | `run_cube_shared_metal.sh` |
+| gaussian_splatting_vk_macos | `demos/gaussian_splatting_vk_macos/build/gaussian_splatting_vk_macos` | `_package/.../bin/gaussian_splatting_vk_macos` | `run_gaussian_splatting.sh` |
 
 ## Debug Logs
 - Use U_LOG_W (WARN) only for one-off init, error, and lifecycle events
 - Use U_LOG_I (INFO) for recurring/throttled diagnostic logs (per-frame, per-keystroke, etc.)
-- Never add per-frame U_LOG_W calls - they cause massive log bloat (~10K WARN lines per 6-min session)
+- Never add per-frame U_LOG_W calls — they cause massive log bloat

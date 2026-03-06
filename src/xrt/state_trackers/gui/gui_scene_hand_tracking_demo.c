@@ -16,8 +16,6 @@
 
 #include "math/m_api.h"
 #include "math/m_space.h"
-#include "multi_wrapper/multi.h"
-#include "realsense/rs_interface.h"
 #include "tracking/t_hand_tracking.h"
 #include "tracking/t_tracking.h"
 
