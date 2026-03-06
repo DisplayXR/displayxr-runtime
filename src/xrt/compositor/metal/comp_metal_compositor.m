@@ -1518,7 +1518,7 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 	if (recommended_width == 0) recommended_width = 960;
 	if (recommended_height == 0) recommended_height = 1080;
 
-	// Window setup
+	// Window / headless setup
 	NSView *external_view = (__bridge NSView *)window_handle;
 	if (external_view != nil) {
 		if (!setup_external_window(c, external_view)) {
@@ -1526,12 +1526,23 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 			free(c);
 			return XRT_ERROR_VULKAN;
 		}
-	} else {
+	} else if (shared_iosurface == NULL) {
+		// Only create a window when there's no shared IOSurface.
+		// With IOSurface, we render headless — no window needed.
 		if (!create_window(c, recommended_width, recommended_height)) {
 			os_mutex_destroy(&c->mutex);
 			free(c);
 			return XRT_ERROR_VULKAN;
 		}
+	} else {
+		// Headless mode: shared IOSurface without a window.
+		// No NSWindow, no NSView, no CAMetalLayer — output goes
+		// directly to the IOSurface-backed MTLTexture.
+		c->window = nil;
+		c->view = nil;
+		c->metal_layer = nil;
+		c->owns_window = false;
+		U_LOG_I("Headless mode — no window (IOSurface shared texture)");
 	}
 
 	// Set up shared IOSurface texture if provided
@@ -1565,7 +1576,15 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 	// The recommended swapchain height from oxr_system.c uses physical pixels
 	// (display_pixel_height = 1646), but xdev->hmd->views[].h_pixels is logical.
 	// Scale height to match the physical drawable resolution.
-	CGFloat scale = c->metal_layer.contentsScale;
+	CGFloat scale = 1.0;
+	if (c->metal_layer != nil) {
+		scale = c->metal_layer.contentsScale;
+	} else if (c->window != nil) {
+		scale = c->window.backingScaleFactor;
+	} else {
+		// Headless — use main screen backing scale
+		scale = [NSScreen mainScreen].backingScaleFactor;
+	}
 	if (scale > 1.0) {
 		recommended_height = (uint32_t)(recommended_height * scale);
 	}
