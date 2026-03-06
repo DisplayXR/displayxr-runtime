@@ -290,6 +290,7 @@ Function un.RemoveFromPath
   Push $6  ; Temp / Length
   Push $7  ; Extra temp
   Push $8  ; Original PATH backup
+  Push $9  ; Temp log file handle
 
   DetailPrint "=== RemoveFromPath started ==="
   DetailPrint "Target to remove: $0"
@@ -377,7 +378,18 @@ write:
     DetailPrint "Updated PATH: $2"
 
 done:
+  ; Save PATH change log to temp file
+  StrCpy $0 "$TEMP\SRMonado_RemoveFromPath.log"
+  FileOpen $9 $0 "w"
+  StrCmp $9 "" skip_log
+    FileWrite $9 "Original PATH: $8$\r$\n"
+    FileWrite $9 "Target removed: $5$\r$\n"
+    FileWrite $9 "New PATH: $2$\r$\n"
+    FileClose $9
+  skip_log:
+
   SetRegView 32
+  Pop $9
   Pop $8
   Pop $7
   Pop $6
