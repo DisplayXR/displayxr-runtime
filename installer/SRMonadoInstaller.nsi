@@ -281,43 +281,39 @@ FunctionEnd
 ; Usage: Push "C:\path\to\remove" 
 ;        Call un.RemoveFromPath
 Function un.RemoveFromPath
-  Exch $0  ; Path to remove (from stack)
-  Push $1  ; Current raw PATH
-  Push $2  ; Rebuilt PATH
-  Push $3  ; Current segment
-  Push $4  ; Normalized segment
-  Push $5  ; Normalized target
-  Push $6  ; Temp / Length for math
-  Push $7  ; Extra temp
-  Push $8  ; Original PATH backup
-  Push $9  ; Temp log file handle
+  Exch $0
+  Push $1
+  Push $2
+  Push $3
+  Push $4
+  Push $5
+  Push $6
+  Push $7
+  Push $8
+  Push $9
 
   DetailPrint "=== RemoveFromPath started ==="
   DetailPrint "Target to remove: $0"
 
   SetRegView 64
 
-  ; 1. Normalize target (lowercase + trim)
   Push $0
   Call un.StrLower
   Pop $5
   Push $5
   Call un.TrimCRLF
   Pop $5
-  ; Strip trailing backslash if present
   StrLen $6 $5
   StrCpy $7 $5 1 -1
   StrCmp $7 "\" 0 +2
     StrCpy $5 $5 -1
   DetailPrint "Normalized target: $5"
 
-  ; 2. Read system PATH
   ReadRegStr $1 HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path"
-  StrCpy $8 $1  ; Backup original PATH
-  StrCpy $2 ""   ; Rebuilt PATH
+  StrCpy $8 $1
+  StrCpy $2 ""
   DetailPrint "Current PATH: $1"
 
-  ; 3. Prepare temp log file
   StrCpy $9 "$TEMP\SRMonado_uninstall.log"
   FileOpen $9 $9 "w"
   StrCmp $9 "" 0 +2
@@ -326,7 +322,6 @@ Function un.RemoveFromPath
 loop:
   StrCmp $1 "" write
 
-  ; Extract next segment
   Push $1
   Push ";"
   Call un.StrStr
@@ -349,14 +344,12 @@ last_segment:
 check_segment:
   StrCmp $3 "" loop
 
-  ; Normalize segment
   Push $3
   Call un.StrLower
   Pop $4
   Push $4
   Call un.TrimCRLF
   Pop $4
-  ; Strip trailing backslash
   StrLen $6 $4
   StrCpy $7 $4 1 -1
   StrCmp $7 "\" 0 +2
@@ -364,10 +357,8 @@ check_segment:
 
   DetailPrint "Checking segment: $3 (normalized: $4)"
 
-  ; Compare with target
   StrCmp $4 $5 skip_append
 
-  ; Append to rebuilt PATH
   StrCmp $2 "" 0 +3
     StrCpy $2 $3
     Goto loop
@@ -379,26 +370,20 @@ skip_append:
   Goto loop
 
 write:
-  ; If the rebuilt path is the same as the backup, do nothing
   StrCmp $2 $8 done
-
-  ; If rebuilt path is empty, decide what to do
   StrCmp $2 "" 0 write_reg
-    ; PATH became empty
-    StrCmp $8 "" done   ; Already empty
+    StrCmp $8 "" done
     DetailPrint "PATH is now empty"
     Goto write_reg
 
 write_reg:
   WriteRegExpandStr HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path" "$2"
   SendMessage ${HWND_BROADCAST} ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=5000
-  ; Corrected branch for logging
   StrCmp $9 "" +2
     FileWrite $9 "Updated PATH: $2$\r$\n"
 
 done:
   SetRegView 32
-  ; Close log file if opened
   StrCmp $9 "" +2
     FileClose $9
 
@@ -413,7 +398,7 @@ done:
   Pop $3
   Pop $2
   Pop $1
-  Pop $0 ; Restore original $0 from Exch $0
+  Pop $0
 FunctionEnd
 
 ; ---------------------------------------------------------
