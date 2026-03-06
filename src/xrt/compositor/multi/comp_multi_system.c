@@ -32,7 +32,6 @@
 
 #include "multi/comp_multi_private.h"
 #include "multi/comp_multi_interface.h"
-#include "main/comp_compositor.h"
 #include "main/comp_target.h"
 
 // Per-session rendering support (Phase 4)
@@ -3031,29 +3030,8 @@ transfer_layers_locked(struct multi_system_compositor *msc, int64_t display_time
 	}
 #endif
 
-	// Forward xsysd to main compositor for qwerty HUD + window input.
-	// Uses msc->clients[] (not the filtered array) so this works even
-	// before the session has delivered its first visible frame.
-#ifdef XRT_BUILD_DRIVER_QWERTY
-	if (msc->xcn_is_comp_compositor) {
-		struct comp_compositor *cc = comp_compositor(&msc->xcn->base);
-		if (cc->xsysd == NULL) {
-			for (size_t k = 0; k < MULTI_MAX_CLIENTS; k++) {
-				struct multi_compositor *mc = msc->clients[k];
-				if (mc == NULL) {
-					continue;
-				}
-				if (mc->xsysd != NULL) {
-					cc->xsysd = mc->xsysd;
-					if (msc->set_window_system_devices != NULL && cc->target != NULL) {
-						msc->set_window_system_devices(cc->target, mc->xsysd);
-					}
-					break;
-				}
-			}
-		}
-	}
-#endif
+	// Note: qwerty input forwarding to main compositor removed (comp_main no longer exists).
+	// Per-session windows handle their own input forwarding.
 
 	// Copy all active layers (skip sessions with per-session rendering - Phase 4).
 	for (size_t k = 0; k < count; k++) {
@@ -3520,8 +3498,6 @@ comp_multi_create_system_compositor(struct xrt_compositor_native *xcn,
                                     const struct xrt_system_compositor_info *xsci,
                                     bool do_warm_start,
                                     struct comp_target_service *target_service,
-                                    bool xcn_is_comp_compositor,
-                                    comp_window_set_system_devices_fn set_window_system_devices,
                                     struct xrt_system_compositor **out_xsysc)
 {
 	struct multi_system_compositor *msc = U_TYPED_CALLOC(struct multi_system_compositor);
@@ -3537,8 +3513,6 @@ comp_multi_create_system_compositor(struct xrt_compositor_native *xcn,
 	msc->base.info = *xsci;
 	msc->upaf = upaf;
 	msc->xcn = xcn;
-	msc->xcn_is_comp_compositor = xcn_is_comp_compositor;
-	msc->set_window_system_devices = set_window_system_devices;
 
 	// Store the target service for per-session rendering (Phase 3)
 	msc->target_service = target_service;

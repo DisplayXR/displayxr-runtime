@@ -44,7 +44,6 @@ if(XRT_FEATURE_HYBRID_MODE)
 			target_lists
 			target_instance_hybrid  # Native compositor (renamed to avoid symbol conflict)
 			ipc_client              # IPC client for sandboxed apps
-			comp_main
 			comp_client
 		)
 	target_compile_definitions(${RUNTIME_TARGET} PRIVATE XRT_FEATURE_HYBRID_MODE)
@@ -58,7 +57,6 @@ else()
 			st_prober
 			target_lists
 			target_instance
-			comp_main
 			comp_client
 		)
 endif()

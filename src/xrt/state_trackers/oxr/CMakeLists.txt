@@ -118,6 +118,10 @@ if(APPLE)
 		target_sources(st_oxr PRIVATE oxr_session_gfx_metal_native.c oxr_swapchain_metal.c)
 		target_link_libraries(st_oxr PRIVATE comp_metal)
 		target_compile_definitions(st_oxr PRIVATE XRT_HAVE_METAL_NATIVE_COMPOSITOR)
+		# Vulkan apps on macOS route through Metal native compositor for presentation
+		if(XRT_HAVE_VULKAN)
+			target_sources(st_oxr PRIVATE oxr_session_gfx_vk_native.c)
+		endif()
 	endif()
 endif()
 

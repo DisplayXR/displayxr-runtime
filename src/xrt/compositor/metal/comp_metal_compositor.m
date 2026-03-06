@@ -61,6 +61,9 @@ struct comp_metal_swapchain
 
 	id<MTLTexture> images[METAL_SWAPCHAIN_MAX_IMAGES];
 
+	//! IOSurface backing each swapchain image (for cross-API sharing).
+	IOSurfaceRef iosurfaces[METAL_SWAPCHAIN_MAX_IMAGES];
+
 	uint32_t image_count;
 	struct xrt_swapchain_create_info info;
 
@@ -318,20 +321,43 @@ static NSString *const metal_shader_source = @
 static MTLPixelFormat
 xrt_format_to_metal(int64_t format)
 {
-	// Check if already a Metal format (MTLPixelFormat values are > 0 and < 1000 typically)
-	if (format > 0 && format < 1000) {
-		return (MTLPixelFormat)format;
-	}
-
-	// Map common Vulkan formats to Metal
+	// Handle both Vulkan format values and Metal format values.
+	// The enum ranges don't overlap for the formats we support.
 	switch (format) {
-	case 37: return MTLPixelFormatRGBA8Unorm;       // VK_FORMAT_R8G8B8A8_UNORM
-	case 43: return MTLPixelFormatRGBA8Unorm_sRGB;   // VK_FORMAT_R8G8B8A8_SRGB
-	case 44: return MTLPixelFormatBGRA8Unorm;         // VK_FORMAT_B8G8R8A8_UNORM
-	case 50: return MTLPixelFormatBGRA8Unorm_sRGB;    // VK_FORMAT_B8G8R8A8_SRGB
-	case 97: return MTLPixelFormatRGBA16Float;        // VK_FORMAT_R16G16B16A16_SFLOAT
-	case 64: return MTLPixelFormatRGB10A2Unorm;       // VK_FORMAT_A2B10G10R10_UNORM_PACK32
-	default: return MTLPixelFormatRGBA8Unorm;
+	// Vulkan format → Metal format
+	case 37:  return MTLPixelFormatRGBA8Unorm;       // VK_FORMAT_R8G8B8A8_UNORM
+	case 43:  return MTLPixelFormatRGBA8Unorm_sRGB;  // VK_FORMAT_R8G8B8A8_SRGB
+	case 44:  return MTLPixelFormatBGRA8Unorm;        // VK_FORMAT_B8G8R8A8_UNORM
+	case 50:  return MTLPixelFormatBGRA8Unorm_sRGB;   // VK_FORMAT_B8G8R8A8_SRGB
+	case 64:  return MTLPixelFormatRGB10A2Unorm;      // VK_FORMAT_A2B10G10R10_UNORM_PACK32
+	case 97:  return MTLPixelFormatRGBA16Float;       // VK_FORMAT_R16G16B16A16_SFLOAT
+	case 126: return MTLPixelFormatDepth32Float;      // VK_FORMAT_D32_SFLOAT
+	// Metal format pass-through (already correct)
+	case 70:  return MTLPixelFormatRGBA8Unorm;
+	case 71:  return MTLPixelFormatRGBA8Unorm_sRGB;
+	case 80:  return MTLPixelFormatBGRA8Unorm;
+	case 81:  return MTLPixelFormatBGRA8Unorm_sRGB;
+	case 90:  return MTLPixelFormatRGB10A2Unorm;
+	case 115: return MTLPixelFormatRGBA16Float;
+	case 252: return MTLPixelFormatDepth32Float;
+	default:  return MTLPixelFormatRGBA8Unorm;
+	}
+}
+
+static uint32_t
+metal_format_bytes_per_pixel(MTLPixelFormat format)
+{
+	switch (format) {
+	case MTLPixelFormatRGBA8Unorm:
+	case MTLPixelFormatRGBA8Unorm_sRGB:
+	case MTLPixelFormatBGRA8Unorm:
+	case MTLPixelFormatBGRA8Unorm_sRGB:
+	case MTLPixelFormatRGB10A2Unorm:
+		return 4;
+	case MTLPixelFormatRGBA16Float:
+		return 8;
+	default:
+		return 4;
 	}
 }
 
@@ -709,6 +735,10 @@ metal_swapchain_destroy(struct xrt_swapchain *xsc)
 
 	for (uint32_t i = 0; i < msc->image_count; i++) {
 		msc->images[i] = nil;
+		if (msc->iosurfaces[i] != NULL) {
+			CFRelease(msc->iosurfaces[i]);
+			msc->iosurfaces[i] = NULL;
+		}
 	}
 
 	free(msc);
@@ -803,30 +833,48 @@ metal_compositor_create_swapchain(struct xrt_compositor *xc,
 	msc->waited_index = -1;
 
 	MTLPixelFormat format = xrt_format_to_metal(info->format);
+	uint32_t bpp = metal_format_bytes_per_pixel(format);
 
 	for (uint32_t i = 0; i < msc->image_count; i++) {
+		// Create IOSurface backing for cross-API sharing (Vulkan import)
+		NSDictionary *props = @{
+			(id)kIOSurfaceWidth: @(info->width),
+			(id)kIOSurfaceHeight: @(info->height),
+			(id)kIOSurfaceBytesPerElement: @(bpp),
+		};
+		IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+		if (surface == NULL) {
+			U_LOG_E("Failed to create IOSurface for swapchain image %u", i);
+			metal_swapchain_destroy(&msc->base.base);
+			return XRT_ERROR_ALLOCATION;
+		}
+		msc->iosurfaces[i] = surface;
+
+		// Create MTLTexture from IOSurface (shared storage required)
 		MTLTextureDescriptor *desc = [MTLTextureDescriptor
 		    texture2DDescriptorWithPixelFormat:format
 		                                width:info->width
 		                               height:info->height
 		                            mipmapped:(info->mip_count > 1) ? YES : NO];
 		desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-		desc.storageMode = MTLStorageModePrivate;
+		desc.storageMode = MTLStorageModeShared;
 		if (info->array_size > 1) {
 			desc.textureType = MTLTextureType2DArray;
 			desc.arrayLength = info->array_size;
 		}
 
-		msc->images[i] = [c->device newTextureWithDescriptor:desc];
+		msc->images[i] = [c->device newTextureWithDescriptor:desc
+		                                           iosurface:surface
+		                                               plane:0];
 		if (msc->images[i] == nil) {
-			U_LOG_E("Failed to create swapchain image %u", i);
+			U_LOG_E("Failed to create swapchain image %u from IOSurface", i);
 			metal_swapchain_destroy(&msc->base.base);
 			return XRT_ERROR_ALLOCATION;
 		}
 
-		// Store the Metal texture pointer in the native handle
-		// This is what the app receives via xrEnumerateSwapchainImages
-		msc->base.images[i].handle = (xrt_graphics_buffer_handle_t)(uintptr_t)(__bridge void *)msc->images[i];
+		// Store IOSurfaceRef as native handle (for Vulkan import via MoltenVK)
+		CFRetain(surface);
+		msc->base.images[i].handle = (xrt_graphics_buffer_handle_t)surface;
 	}
 
 	// Set up vtable
@@ -1182,41 +1230,18 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		metal_compositor_update_hud(c, dt);
 	}
 
-	static uint32_t commit_count = 0;
-	commit_count++;
-
 	// Get output texture — either from shared IOSurface or CAMetalLayer drawable
 	id<MTLTexture> output_texture = nil;
 	id<CAMetalDrawable> drawable = nil;
 
 	if (c->shared_texture != nil) {
 		output_texture = c->shared_texture;
-		if (commit_count <= 3) {
-			fprintf(stderr, "METAL #%u: shared_texture=%lux%lu, stereo=%lux%lu, layers=%u\n",
-			        commit_count,
-			        (unsigned long)output_texture.width, (unsigned long)output_texture.height,
-			        (unsigned long)c->stereo_texture.width, (unsigned long)c->stereo_texture.height,
-			        c->layer_accum.layer_count);
-		}
 	} else {
 		drawable = [c->metal_layer nextDrawable];
 		if (drawable == nil) {
-			if (commit_count <= 3) {
-				fprintf(stderr, "METAL #%u: nextDrawable=nil, size=%.0fx%.0f, scale=%.1f\n",
-				        commit_count, c->metal_layer.drawableSize.width,
-				        c->metal_layer.drawableSize.height, c->metal_layer.contentsScale);
-			}
 			return XRT_SUCCESS; // Non-fatal, skip this frame
 		}
 		output_texture = drawable.texture;
-
-		if (commit_count <= 3) {
-			fprintf(stderr, "METAL #%u: drawable=%lux%lu, stereo=%lux%lu, layers=%u\n",
-			        commit_count,
-			        (unsigned long)output_texture.width, (unsigned long)output_texture.height,
-			        (unsigned long)c->stereo_texture.width, (unsigned long)c->stereo_texture.height,
-			        c->layer_accum.layer_count);
-		}
 	}
 
 	id<MTLCommandBuffer> cmd_buf = [c->command_queue commandBuffer];
@@ -1252,20 +1277,17 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			for (uint32_t eye = 0; eye < 2; eye++) {
 				struct xrt_swapchain *sc = layer->sc_array[eye];
 				if (sc == NULL) {
-					if (commit_count <= 3) fprintf(stderr, "  eye%u: sc=NULL\n", eye);
 					continue;
 				}
 
 				struct comp_metal_swapchain *msc = metal_swapchain(sc);
 				uint32_t img_idx = layer->data.proj.v[eye].sub.image_index;
 				if (img_idx >= msc->image_count) {
-					if (commit_count <= 3) fprintf(stderr, "  eye%u: img_idx=%u >= count=%u\n", eye, img_idx, msc->image_count);
 					continue;
 				}
 
 				id<MTLTexture> src_tex = msc->images[img_idx];
 				if (src_tex == nil) {
-					if (commit_count <= 3) fprintf(stderr, "  eye%u: src_tex=nil\n", eye);
 					continue;
 				}
 
@@ -1276,14 +1298,6 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 					nr.y = 0.0f;
 					nr.w = 1.0f;
 					nr.h = 1.0f;
-				}
-
-				if (commit_count <= 3) {
-					fprintf(stderr, "  eye%u: src=%lux%lu fmt=%lu usage=0x%lx storage=%lu img=%u, nr=(%.2f,%.2f,%.2f,%.2f), vp=(%u,%u)\n",
-					        eye, (unsigned long)src_tex.width, (unsigned long)src_tex.height,
-					        (unsigned long)src_tex.pixelFormat, (unsigned long)src_tex.usage,
-					        (unsigned long)src_tex.storageMode,
-					        img_idx, nr.x, nr.y, nr.w, nr.h, c->view_width, c->view_height);
 				}
 
 				// Set viewport for this eye
@@ -1542,6 +1556,16 @@ static const int64_t metal_supported_formats[] = {
  *
  */
 
+void *
+comp_metal_swapchain_get_texture(struct xrt_swapchain *xsc, uint32_t index)
+{
+	struct comp_metal_swapchain *msc = metal_swapchain(xsc);
+	if (index >= msc->image_count) {
+		return NULL;
+	}
+	return (__bridge void *)msc->images[index];
+}
+
 xrt_result_t
 comp_metal_compositor_create(struct xrt_device *xdev,
                              void *window_handle,
@@ -1563,13 +1587,34 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 	}
 
 	c->xdev = xdev;
-	// Retain the command queue and device — this file is compiled
-	// WITHOUT ARC (see CMakeLists.txt), so ObjC object lifetimes
-	// must be managed explicitly with retain/release.
-	c->command_queue = (__bridge id<MTLCommandQueue>)command_queue_ptr;
-	[c->command_queue retain];
-	c->device = c->command_queue.device;
-	[c->device retain];
+	// Set up Metal device and command queue.
+	// This file is compiled WITHOUT ARC (see CMakeLists.txt), so ObjC
+	// object lifetimes must be managed explicitly with retain/release.
+	if (command_queue_ptr != NULL) {
+		// Use app-provided command queue (Metal native apps)
+		c->command_queue = (__bridge id<MTLCommandQueue>)command_queue_ptr;
+		[c->command_queue retain];
+		c->device = c->command_queue.device;
+		[c->device retain];
+	} else {
+		// Create own Metal device + queue (Vulkan apps routed through Metal for presentation)
+		c->device = MTLCreateSystemDefaultDevice();
+		if (c->device == nil) {
+			U_LOG_E("Failed to create Metal device");
+			os_mutex_destroy(&c->mutex);
+			free(c);
+			return XRT_ERROR_VULKAN;
+		}
+		c->command_queue = [c->device newCommandQueue];
+		if (c->command_queue == nil) {
+			U_LOG_E("Failed to create Metal command queue");
+			[c->device release];
+			os_mutex_destroy(&c->mutex);
+			free(c);
+			return XRT_ERROR_VULKAN;
+		}
+		U_LOG_I("Created internal Metal device + command queue for Vulkan presentation");
+	}
 	c->display_refresh_rate = 60.0f;
 	c->offscreen = offscreen;
 

@@ -1884,6 +1884,22 @@ oxr_session_create_impl(struct oxr_logger *log,
 		}
 
 		OXR_SESSION_ALLOCATE_AND_INIT(log, sys, OXR_SESSION_GRAPHICS_EXT_VULKAN, *out_session);
+
+#if defined(XRT_HAVE_METAL_NATIVE_COMPOSITOR)
+		// On macOS, route Vulkan apps through Metal native compositor for
+		// presentation. The null compositor has no display output.
+		if (oxr_metal_native_compositor_supported(sys, xsi->external_window_handle)) {
+			xrt_result_t xret = xrt_system_create_session(
+			    sys->xsys, xsi, &(*out_session)->xs, NULL);
+			if (xret != XRT_SUCCESS) {
+				return oxr_error(log, XR_ERROR_RUNTIME_FAILURE,
+				                 "Failed to create xrt_session!");
+			}
+			return oxr_session_populate_vk_with_metal_native(
+			    log, sys, vulkan, *out_session);
+		}
+#endif
+
 		OXR_CREATE_XRT_SESSION_AND_NATIVE_COMPOSITOR(log, xsi, *out_session);
 		return oxr_session_populate_vk(log, sys, vulkan, *out_session);
 	}

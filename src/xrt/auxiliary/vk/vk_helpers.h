@@ -1589,6 +1589,7 @@ vk_cb_get_buffer_external_handle_type(struct vk_bundle *vk);
 	THING_COLOR(R8G8B8_SRGB)         /* OGL VK - Uncommon. */                                                      \
 	THING_COLOR(R8G8B8_UNORM)        /* OGL VK - Uncommon. Bad color precision. */                                 \
 	THING_COLOR(B8G8R8_UNORM)        /* VK     - Uncommon. Bad color precision. */                                 \
+	THING_COLOR(A2B10G10R10_UNORM_PACK32) /* VK - 10-bit color (MoltenVK). */                                       \
 	THING_COLOR(R5G6B5_UNORM_PACK16) /* OLG VK - Bad color precision. */                                           \
 	THING_COLOR(R32_SFLOAT)          /* OGL VK */                                                                  \
 	/* depth formats */                                                                                            \

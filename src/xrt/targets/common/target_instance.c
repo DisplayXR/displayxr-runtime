@@ -11,6 +11,7 @@
 
 #include "xrt/xrt_space.h"
 #include "xrt/xrt_system.h"
+#include "xrt/xrt_compositor.h"
 #include "xrt/xrt_config_build.h"
 #include "xrt/xrt_config_os.h"
 
@@ -22,11 +23,8 @@
 #include "util/u_trace_marker.h"
 #include "util/u_system_helpers.h"
 
-// Only include main compositor header when we actually need it
-// (not in hybrid mode native apps which use null compositor during instance creation)
-#if defined(XRT_MODULE_COMPOSITOR_MAIN) && !defined(XRT_HYBRID_USE_NULL_COMPOSITOR)
-#include "main/comp_main_interface.h"
-#endif
+// comp_main (Vulkan server compositor) has been removed — lightweight runtime
+// uses null compositor + native compositors (D3D11/Metal) only.
 
 // D3D11 service compositor is used when available (both service and hybrid client)
 #ifdef XRT_USE_D3D11_SERVICE_COMPOSITOR
@@ -52,15 +50,8 @@
 #include "android/android_instance_base.h"
 #endif
 
-// For hybrid mode native apps, always use null compositor during instance creation
-// (D3D11 native compositor is created during session creation)
-#ifdef XRT_HYBRID_USE_NULL_COMPOSITOR
+// Always use null compositor — no Vulkan server compositor in lightweight runtime.
 #define USE_NULL_DEFAULT (true)
-#elif defined(XRT_MODULE_COMPOSITOR_MAIN)
-#define USE_NULL_DEFAULT (false)
-#else
-#define USE_NULL_DEFAULT (true)
-#endif
 
 DEBUG_GET_ONCE_BOOL_OPTION(use_null, "XRT_COMPOSITOR_NULL", USE_NULL_DEFAULT)
 
@@ -192,19 +183,10 @@ t_instance_create_system(struct xrt_instance *xinst,
 #endif
 #endif
 
-// Vulkan compositor fallback (not available in D3D11-only service mode or hybrid native apps)
-#if defined(XRT_MODULE_COMPOSITOR_MAIN) && !defined(XRT_D3D11_SERVICE_ONLY) && !defined(XRT_HYBRID_USE_NULL_COMPOSITOR)
-	if (xret == XRT_SUCCESS && xsysc == NULL) {
-		xret = comp_main_create_system_compositor(head, NULL, NULL, &xsysc);
-	}
-#endif
-
-#if !defined(XRT_MODULE_COMPOSITOR_MAIN) || defined(XRT_HYBRID_USE_NULL_COMPOSITOR)
 	if (!use_null && xsysc == NULL) {
 		U_LOG_E("Explicitly didn't request the null compositor, but no compositor is available!");
 		xret = XRT_ERROR_VULKAN;
 	}
-#endif
 
 	if (xret != XRT_SUCCESS) {
 		goto err_destroy;

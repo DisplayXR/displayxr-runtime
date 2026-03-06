@@ -20,11 +20,13 @@
 #include "oxr_logger.h"
 #include "oxr_swapchain_common.h"
 
+#include "metal/comp_metal_compositor.h"
+
 /*!
  * Enumerate images for Metal native compositor.
  *
- * The native compositor creates xrt_swapchain_native where the Metal
- * textures (id<MTLTexture>) are stored in images[i].handle.
+ * The native handle is an IOSurfaceRef (for cross-API sharing with Vulkan).
+ * Use comp_metal_swapchain_get_texture() to get the actual id<MTLTexture>.
  */
 static XrResult
 metal_native_enumerate_images(struct oxr_logger *log,
@@ -32,12 +34,10 @@ metal_native_enumerate_images(struct oxr_logger *log,
                               uint32_t count,
                               XrSwapchainImageBaseHeader *images)
 {
-	struct xrt_swapchain_native *xscn = (struct xrt_swapchain_native *)sc->swapchain;
 	XrSwapchainImageMetalKHR *metal_imgs = (XrSwapchainImageMetalKHR *)images;
 
 	for (uint32_t i = 0; i < count; i++) {
-		// The Metal native compositor stores id<MTLTexture> in handle
-		metal_imgs[i].texture = (void *)(uintptr_t)xscn->images[i].handle;
+		metal_imgs[i].texture = comp_metal_swapchain_get_texture(sc->swapchain, i);
 	}
 
 	return oxr_session_success_result(sc->sess);

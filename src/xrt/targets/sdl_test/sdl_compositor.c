@@ -579,6 +579,6 @@ sdl_compositor_create_system(struct sdl_program *sp, struct xrt_system_composito
 	XRT_MAYBE_UNUSED xrt_result_t xret = u_pa_factory_create(&upaf);
 	assert(xret == XRT_SUCCESS && upaf != NULL);
 
-	return comp_multi_create_system_compositor(&sp->c.base.base, upaf, &sp->c.sys_info, false, NULL, false,
-	                                           NULL, out_xsysc);
+	return comp_multi_create_system_compositor(&sp->c.base.base, upaf, &sp->c.sys_info, false, NULL,
+	                                           out_xsysc);
 }

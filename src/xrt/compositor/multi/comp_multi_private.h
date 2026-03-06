@@ -543,19 +543,11 @@ struct multi_system_compositor
 	//! List of active clients.
 	struct multi_compositor *clients[MULTI_MAX_CLIENTS];
 
-	//! True if xcn is actually a comp_compositor (not null_compositor or other)
-	bool xcn_is_comp_compositor;
-
 	//! External window handle from first session with HWND (for windowed mode)
 	void *external_window_handle;
 
 	//! Service for creating per-session render targets (provided by comp_main)
 	struct comp_target_service *target_service;
-
-	//! Optional callback to pass system devices to the Vulkan window for input forwarding.
-	//! Set by comp_main when the native compositor is a comp_compositor with a window target.
-	//! NULL when comp_main is not linked (e.g. sdl-test).
-	comp_window_set_system_devices_fn set_window_system_devices;
 };
 
 /*!

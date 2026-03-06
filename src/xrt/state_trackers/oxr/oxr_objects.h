@@ -1431,10 +1431,12 @@ oxr_session_populate_d3d11_native(struct oxr_logger *log,
  *
  */
 
-#ifdef XR_USE_GRAPHICS_API_METAL
+#if defined(XR_USE_GRAPHICS_API_METAL) || defined(XRT_HAVE_METAL_NATIVE_COMPOSITOR)
 
 /*!
  * Check if Metal native compositor should be used.
+ * Declared under both XR_USE_GRAPHICS_API_METAL and XRT_HAVE_METAL_NATIVE_COMPOSITOR
+ * so Vulkan session code can also check for Metal native support.
  */
 bool
 oxr_metal_native_compositor_supported(struct oxr_system *sys, void *window_handle);
@@ -1456,6 +1458,19 @@ oxr_session_populate_metal_native(struct oxr_logger *log,
                                   bool offscreen,
                                   void *shared_texture_handle,
                                   struct oxr_session *sess);
+#endif
+
+#if defined(XRT_HAVE_METAL_NATIVE_COMPOSITOR) && defined(XR_USE_GRAPHICS_API_VULKAN)
+/*!
+ * Populate a Vulkan session using the Metal native compositor for presentation.
+ * The Metal compositor handles windowing and display; comp_vk_client bridges
+ * Vulkan swapchains to Metal textures via VK_EXT_external_memory_metal.
+ */
+XrResult
+oxr_session_populate_vk_with_metal_native(struct oxr_logger *log,
+                                           struct oxr_system *sys,
+                                           XrGraphicsBindingVulkanKHR const *next,
+                                           struct oxr_session *sess);
 #endif
 
 #endif

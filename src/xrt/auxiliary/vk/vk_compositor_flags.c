@@ -22,6 +22,7 @@
 
 #include "util/u_misc.h"
 #include "util/u_debug.h"
+#include "util/u_logging.h"
 
 #include "vk/vk_helpers.h"
 
@@ -121,8 +122,8 @@ vk_csci_get_barrier_optimal_layout(VkFormat format)
 	switch (format) {
 		VK_CSCI_FORMATS(CASE_COLOR, CASE_DS, CASE_DS, CASE_DS)
 	default: //
-		assert(false && !"Format not supported!");
-		return VK_IMAGE_LAYOUT_UNDEFINED;
+		U_LOG_E("vk_csci_get_barrier_optimal_layout: unsupported format %d (0x%x)", (int)format, (int)format);
+		return VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL; // Best-effort fallback
 	}
 
 #undef CASE_COLOR
@@ -142,8 +143,8 @@ vk_csci_get_barrier_aspect_mask(VkFormat format)
 	switch (format) {
 		VK_CSCI_FORMATS(CASE_COLOR, CASE_DS, CASE_D, CASE_S)
 	default: //
-		assert(false && !"Format not supported!");
-		return 0;
+		U_LOG_E("vk_csci_get_barrier_aspect_mask: unsupported format %d (0x%x)", (int)format, (int)format);
+		return VK_IMAGE_ASPECT_COLOR_BIT; // Best-effort fallback
 	}
 
 #undef CASE_COLOR
@@ -165,7 +166,7 @@ vk_csci_get_image_view_aspect(VkFormat format, enum xrt_swapchain_usage_bits bit
 	switch (format) {
 		VK_CSCI_FORMATS(CASE_COLOR, CASE_DS, CASE_D, CASE_S)
 	default: //
-		assert(false && !"Format not supported!");
+		U_LOG_E("vk_csci: unsupported format %d (0x%x)", (int)format, (int)format);
 		return 0;
 	}
 

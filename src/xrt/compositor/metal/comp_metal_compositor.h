@@ -103,6 +103,15 @@ comp_metal_compositor_set_sys_info(struct xrt_compositor *xc,
                                     const struct xrt_system_compositor_info *info);
 
 /*!
+ * Get the MTLTexture (as void*) for a given swapchain image index.
+ * Used by Metal native apps to enumerate swapchain images.
+ * The handle stored in xrt_image_native is an IOSurfaceRef for cross-API sharing;
+ * this function returns the actual id<MTLTexture> wrapping that IOSurface.
+ */
+void *
+comp_metal_swapchain_get_texture(struct xrt_swapchain *xsc, uint32_t index);
+
+/*!
  * Get the system default Metal device (id<MTLDevice> as void*).
  * Used by xrGetMetalGraphicsRequirementsKHR to return a real device pointer.
  */
