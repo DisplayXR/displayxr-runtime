@@ -299,14 +299,14 @@ FunctionEnd
 ; RemoveFromPath - Removes a directory from the system PATH
 ; Handles 64-bit registry, Unicode characters, and case-insensitive matching.
 Function un.RemoveFromPath
-  Exch $0 ; Target path to remove
-  Push $1 ; Full PATH (Remaining to process)
-  Push $2 ; Rebuilt PATH (Output)
-  Push $3 ; Current Segment character-by-character
-  Push $4 ; Normalized Target (Lowercase, no slash)
-  Push $5 ; Normalized Segment (Lowercase, no slash)
-  Push $6 ; Loop Index / Counter
-  Push $7 ; Temp Char / Segment Length
+  Exch $0 ; Target path
+  Push $1 ; Full PATH 
+  Push $2 ; Rebuilt PATH 
+  Push $3 ; Current Segment 
+  Push $4 ; Normalized Target 
+  Push $5 ; Normalized Segment 
+  Push $6 ; Loop Index 
+  Push $7 ; Temp Char 
   Push $8 ; Log Handle
 
   SetRegView 64
@@ -325,40 +325,40 @@ Function un.RemoveFromPath
   IntOp $7 $7 - 1
   StrCpy $6 $4 1 $7
   StrCmp $6 "\" 0 +2
-    StrCpy $4 $4 $7 ; Strip trailing \
+    StrCpy $4 $4 $7 
+  
   Push $4
   Call un.StrLower
   Pop $4 
   FileWrite $8 "Normalized Target: '$4'$\r$\n"
 
-  StrCpy $2 "" ; Clear rebuild buffer
+  ; SAFETY GUARD: Do not proceed if target is empty!
+  StrCmp $4 "" 0 +3
+    FileWrite $8 "ERROR: Normalized target is empty. Aborting to save PATH.$\r$\n"
+    Goto done_cleanup
 
-  ; 3. Segment Isolation (Manual Parse)
+  StrCpy $2 "" 
+
 loop_segments:
   StrCmp $1 "" done_loop
-  StrCpy $6 0 ; Reset segment pointer
-  StrCpy $3 "" ; Reset current segment string
+  StrCpy $6 0 
+  StrCpy $3 "" 
 
 find_semi:
-  StrCpy $7 $1 1 $6 ; Get 1 character at index $6
-  StrCmp $7 "" segment_found ; End of Path
-  StrCmp $7 ";" segment_found ; Found delimiter
+  StrCpy $7 $1 1 $6 
+  StrCmp $7 "" segment_found 
+  StrCmp $7 ";" segment_found 
   IntOp $6 $6 + 1
   Goto find_semi
 
 segment_found:
-  StrCpy $3 $1 $6 ; Extract segment text
-  ; Remove segment + semicolon from the main PATH string ($1)
+  StrCpy $3 $1 $6 
   IntOp $6 $6 + 1
   StrCpy $1 $1 "" $6 
 
-  FileWrite $8 "--- Extracting Segment ---$\r$\n"
-  FileWrite $8 "Found: '$3'$\r$\n"
+  StrCmp $3 "" loop_segments ; Skip empty segments
 
-  ; Skip empty segments (handles ;; or trailing ;)
-  StrCmp $3 "" loop_segments
-
-  ; 4. Normalize Segment
+  ; Normalize Segment
   StrCpy $5 $3
   StrLen $7 $5
   IntOp $7 $7 - 1
@@ -370,26 +370,23 @@ segment_found:
   Call un.StrLower
   Pop $5
   
-  FileWrite $8 "Comparing '$5' against '$4'$\r$\n"
-
-  ; 5. Decision: Match or Keep?
+  ; 3. Compare
   StrCmp $5 $4 is_match
-    FileWrite $8 "Result: MATCH FOUND - REMOVING.$\r$\n"
+    ; Result: NO MATCH - KEEPING
+    StrCmp $2 "" 0 +3
+      StrCpy $2 "$3" 
+      Goto loop_segments
+    StrCpy $2 "$2;$3" 
     Goto loop_segments
 
 is_match:
-  ; If NOT match, append to our rebuilt path ($2)
-  FileWrite $8 "Result: NO MATCH - KEEPING.$\r$\n"
-  StrCmp $2 "" 0 +3
-    StrCpy $2 "$3" ; First item
-    Goto loop_segments
-  StrCpy $2 "$2;$3" ; Append with separator
-  Goto loop_segments
+  FileWrite $8 "MATCHED AND REMOVED: '$3'$\r$\n"
+  Goto loop_segments ; Go back to loop!
 
 done_loop:
   FileWrite $8 "FINAL REBUILT PATH: '$2'$\r$\n"
 
-  ; 6. Safety Check & Write
+  ; 4. Safety Check & Write
   ReadRegStr $1 HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path"
   StrCmp $2 $1 done_write
     WriteRegExpandStr HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path" "$2"
@@ -397,8 +394,9 @@ done_loop:
   
 done_write:
   FileWrite $8 "=== RemoveFromPath completed ===$\r$\n"
-  FileClose $8
 
+done_cleanup:
+  FileClose $8
   SendMessage ${HWND_BROADCAST} ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=5000
   SetRegView 32
 
