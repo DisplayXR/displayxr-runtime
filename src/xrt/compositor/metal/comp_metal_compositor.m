@@ -352,6 +352,9 @@ compile_shaders(struct comp_metal_compositor *c)
 	U_LOG_I("Compiling Metal shaders on device: %s",
 	        c->device.name.UTF8String);
 
+	// This file is compiled WITHOUT ARC (see CMakeLists.txt).
+	// All objects created with new/alloc must be explicitly released.
+
 	NSError *error = nil;
 	id<MTLLibrary> library = [c->device newLibraryWithSource:metal_shader_source
 	                                                 options:nil
@@ -376,10 +379,11 @@ compile_shaders(struct comp_metal_compositor *c)
 	blit_desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
 
 	c->blit_pipeline = [c->device newRenderPipelineStateWithDescriptor:blit_desc error:&error];
+	[blit_desc release];
 	if (c->blit_pipeline == nil) {
 		U_LOG_E("Failed to create blit pipeline: %s",
 		        error.localizedDescription.UTF8String);
-		return false;
+		goto cleanup;
 	}
 
 	// Anaglyph pipeline (red from left eye, cyan from right)
@@ -389,10 +393,11 @@ compile_shaders(struct comp_metal_compositor *c)
 	anag_desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
 
 	c->anaglyph_pipeline = [c->device newRenderPipelineStateWithDescriptor:anag_desc error:&error];
+	[anag_desc release];
 	if (c->anaglyph_pipeline == nil) {
 		U_LOG_E("Failed to create anaglyph pipeline: %s",
 		        error.localizedDescription.UTF8String);
-		return false;
+		goto cleanup;
 	}
 
 	// Blend pipeline (50/50 mix of both eyes)
@@ -402,46 +407,75 @@ compile_shaders(struct comp_metal_compositor *c)
 	blend_desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
 
 	c->blend_pipeline = [c->device newRenderPipelineStateWithDescriptor:blend_desc error:&error];
+	[blend_desc release];
 	if (c->blend_pipeline == nil) {
 		U_LOG_E("Failed to create blend pipeline: %s",
 		        error.localizedDescription.UTF8String);
-		return false;
+		goto cleanup;
 	}
 
 	// Projection pipeline (renders into stereo texture)
-	MTLRenderPipelineDescriptor *proj_desc = [[MTLRenderPipelineDescriptor alloc] init];
-	proj_desc.vertexFunction = proj_vs;
-	proj_desc.fragmentFunction = proj_fs;
-	proj_desc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
-	proj_desc.colorAttachments[0].blendingEnabled = YES;
-	proj_desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
-	proj_desc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-	proj_desc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
-	proj_desc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-	proj_desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+	{
+		MTLRenderPipelineDescriptor *proj_desc = [[MTLRenderPipelineDescriptor alloc] init];
+		proj_desc.vertexFunction = proj_vs;
+		proj_desc.fragmentFunction = proj_fs;
+		proj_desc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+		proj_desc.colorAttachments[0].blendingEnabled = YES;
+		proj_desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+		proj_desc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+		proj_desc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+		proj_desc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+		proj_desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
 
-	c->projection_pipeline = [c->device newRenderPipelineStateWithDescriptor:proj_desc error:&error];
-	if (c->projection_pipeline == nil) {
-		U_LOG_E("Failed to create projection pipeline: %s",
-		        error.localizedDescription.UTF8String);
-		return false;
+		c->projection_pipeline = [c->device newRenderPipelineStateWithDescriptor:proj_desc error:&error];
+		[proj_desc release];
+		if (c->projection_pipeline == nil) {
+			U_LOG_E("Failed to create projection pipeline: %s",
+			        error.localizedDescription.UTF8String);
+			goto cleanup;
+		}
 	}
 
 	// Sampler
-	MTLSamplerDescriptor *sampler_desc = [[MTLSamplerDescriptor alloc] init];
-	sampler_desc.minFilter = MTLSamplerMinMagFilterLinear;
-	sampler_desc.magFilter = MTLSamplerMinMagFilterLinear;
-	sampler_desc.sAddressMode = MTLSamplerAddressModeClampToEdge;
-	sampler_desc.tAddressMode = MTLSamplerAddressModeClampToEdge;
-	c->sampler_linear = [c->device newSamplerStateWithDescriptor:sampler_desc];
+	{
+		MTLSamplerDescriptor *sampler_desc = [[MTLSamplerDescriptor alloc] init];
+		sampler_desc.minFilter = MTLSamplerMinMagFilterLinear;
+		sampler_desc.magFilter = MTLSamplerMinMagFilterLinear;
+		sampler_desc.sAddressMode = MTLSamplerAddressModeClampToEdge;
+		sampler_desc.tAddressMode = MTLSamplerAddressModeClampToEdge;
+		c->sampler_linear = [c->device newSamplerStateWithDescriptor:sampler_desc];
+		[sampler_desc release];
+	}
 
 	// Depth stencil state
-	MTLDepthStencilDescriptor *ds_desc = [[MTLDepthStencilDescriptor alloc] init];
-	ds_desc.depthCompareFunction = MTLCompareFunctionLessEqual;
-	ds_desc.depthWriteEnabled = YES;
-	c->depth_stencil_state = [c->device newDepthStencilStateWithDescriptor:ds_desc];
+	{
+		MTLDepthStencilDescriptor *ds_desc = [[MTLDepthStencilDescriptor alloc] init];
+		ds_desc.depthCompareFunction = MTLCompareFunctionLessEqual;
+		ds_desc.depthWriteEnabled = YES;
+		c->depth_stencil_state = [c->device newDepthStencilStateWithDescriptor:ds_desc];
+		[ds_desc release];
+	}
+
+	// Release temporary objects (MRR — all new/alloc must be balanced)
+	[proj_fs release];
+	[proj_vs release];
+	[blend_fs release];
+	[anaglyph_fs release];
+	[blit_fs release];
+	[blit_vs release];
+	[library release];
 
 	return true;
+
+cleanup:
+	[proj_fs release];
+	[proj_vs release];
+	[blend_fs release];
+	[anaglyph_fs release];
+	[blit_fs release];
+	[blit_vs release];
+	[library release];
+	return false;
 }
 
 /*
@@ -1462,6 +1496,13 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 			c->hud_view = nil;
 		}
 		c->view = nil;
+
+		// Drain any pending dispatch_async blocks (HUD hide/show)
+		// that captured the raw 'c' pointer — they must complete
+		// before we free the struct.
+		if (![NSThread isMainThread]) {
+			dispatch_sync(dispatch_get_main_queue(), ^{});
+		}
 	}
 
 	// 8. Release remaining objects (MRR — explicit release required)

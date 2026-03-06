@@ -46,6 +46,25 @@
 #include <stdio.h>
 #include <math.h>
 
+/*
+ * Tombstone for the most recently destroyed oxr_instance.
+ *
+ * Unity's OpenXR loader caches the runtime's XrInstance handle (which is a
+ * raw pointer to our oxr_instance) and continues calling xrPollEvent after
+ * xrDestroyInstance.  The loader's dispatch reads from the XrInstance handle
+ * BEFORE reaching our g_live_instance guard in oxr_xrPollEvent.  If the
+ * memory has been freed (and unmapped by the VM for large allocations), the
+ * read faults with SIGSEGV.
+ *
+ * By keeping the last destroyed instance allocation alive as a "tombstone",
+ * the memory remains mapped and readable.  The handle's state has already
+ * been set to OXR_HANDLE_STATE_DESTROYED by oxr_handle_do_destroy, so any
+ * VERIFY macro will reject the stale handle gracefully.  The tombstone is
+ * freed when the next instance is destroyed (or never, which is fine — it's
+ * a single allocation per process lifetime).
+ */
+static struct oxr_instance *g_instance_tombstone = NULL;
+
 DEBUG_GET_ONCE_BOOL_OPTION(debug_views, "OXR_DEBUG_VIEWS", false)
 DEBUG_GET_ONCE_BOOL_OPTION(debug_spaces, "OXR_DEBUG_SPACES", false)
 DEBUG_GET_ONCE_BOOL_OPTION(debug_bindings, "OXR_DEBUG_BINDINGS", false)
@@ -108,7 +127,28 @@ oxr_instance_destroy(struct oxr_logger *log, struct oxr_handle_base *hb)
 	// Mutex goes last.
 	os_mutex_destroy(&inst->event.mutex);
 
-	free(inst);
+	// Keep the allocation alive as a tombstone so that post-destroy
+	// reads from the stale XrInstance handle don't fault.  Free the
+	// previous tombstone first (at most one outstanding at a time).
+	//
+	// Zero out pointer fields that Unity's dispatch trampoline might
+	// chase past the handle header.  The sub-objects they pointed to
+	// have already been freed above, so these are dangling.
+	inst->sessions = NULL;
+	inst->system.xsysd = NULL;
+	inst->system.xsys = NULL;
+	inst->system.xso = NULL;
+	inst->system.xsysc = NULL;
+	inst->xinst = NULL;
+	inst->timekeeping = NULL;
+	inst->path_store = NULL;
+	inst->path_array = NULL;
+	inst->profiles = NULL;
+	inst->event.next = NULL;
+	inst->event.last = NULL;
+
+	free(g_instance_tombstone);
+	g_instance_tombstone = inst;
 
 	return XR_SUCCESS;
 }
