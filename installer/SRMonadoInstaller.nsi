@@ -237,54 +237,87 @@ FunctionEnd
 ; Usage: Push "C:\path\to\remove"
 ;        Call un.RemoveFromPath
 Function un.RemoveFromPath
-  Exch $0       ; path to remove
-  Push $1
-  Push $2
-  Push $3
-  Push $4
+  Exch $0  ; Path to remove (from stack)
+  Push $1  ; Current raw PATH
+  Push $2  ; Rebuilt PATH
+  Push $3  ; Current segment being checked
+  Push $4  ; Lowercase segment
+  Push $5  ; Lowercase target
+  Push $6  ; Temp/Length variable
 
-  ; Read current PATH
+  SetRegView 64 ; Ensure we are looking at the 64-bit System Path
+
+  ; 1. Prepare lowercase target for comparison
+  Push $0
+  Call un.StrLower
+  Pop $5
+
+  ; Strip trailing backslash from target if it exists
+  StrCpy $6 $5 1 -1
+  StrCmp $6 "\" 0 +2
+    StrCpy $5 $5 -1
+
+  ; 2. Read the actual System Path
   ReadRegStr $1 HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path"
-  StrCpy $2 ""
+  StrCpy $2 "" ; Initialize our new rebuilt string
 
 loop:
-  StrCpy $3 $1 "" ";"      ; get first segment
-  StrCmp $3 "" write       ; no more segments
+  StrCmp $1 "" write ; If no string left to process, go to write
 
-  ; Remove trailing backslash
-  StrCpy $4 $3
-  StrCpy $4 $4 1 -1
-  StrCmp $4 "\" 0 +2
-    StrCpy $3 $3 -1
-
-  ; Compare case-insensitive
-  Push $3
-  Call StrLower
+  ; 3. Find the next semicolon
+  Push $1
+  Push ";"
+  Call un.StrStr
   Pop $3
-  Push $0
-  Call StrLower
+
+  StrCmp $3 "" last_segment
+
+  ; 4. Extract segment (everything before the semicolon)
+  StrLen $4 $1
+  StrLen $6 $3
+  IntOp $4 $4 - $6
+  StrCpy $3 $1 $4     ; $3 is the segment (original casing)
+  IntOp $6 $6 + 1
+  StrCpy $1 $1 "" $6  ; Move $1 past the semicolon for next iteration
+  Goto check_segment
+
+last_segment:
+  StrCpy $3 $1
+  StrCpy $1 ""
+
+check_segment:
+  StrCmp $3 "" loop ; Skip empty segments
+
+  ; 5. Normalize segment for comparison (don't clobber the original $3)
+  Push $3
+  Call un.StrLower
   Pop $4
-  StrCmp $3 $4 0 +3
-    Goto skip
 
-  ; Append to rebuilt PATH
+  ; Strip trailing backslash from segment for comparison
+  StrCpy $6 $4 1 -1
+  StrCmp $6 "\" 0 +2
+    StrCpy $4 $4 -1
+
+  ; 6. Compare normalized segment to normalized target
+  StrCmp $4 $5 loop ; If match, skip it (don't add to rebuilt PATH)
+
+  ; 7. Append original-cased segment to rebuilt PATH
   StrCmp $2 "" 0 +3
-    StrCpy $2 $3
-    Goto skip
-  StrCpy $2 "$2;$3"
-
-skip:
-  ; Remove first segment from $1
-  StrLen $4 $3
-  IntOp $4 $4 + 1
-  StrCpy $1 $1 "" $4
+    StrCpy $2 $3      ; First segment, no semicolon needed
+    Goto loop
+  StrCpy $2 "$2;$3"   ; Append with semicolon
   Goto loop
 
 write:
-  WriteRegExpandStr HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path" "$2"
-  SendMessage ${HWND_BROADCAST} ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=5000
-  DetailPrint "Removed SRMonado path from system PATH"
+  ; Only write if we actually have a PATH string (safety check)
+  StrCmp $2 "" done
+    WriteRegExpandStr HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path" "$2"
+    SendMessage ${HWND_BROADCAST} ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=5000
 
+done:
+  SetRegView 32 ; Restore registry view
+  Pop $6
+  Pop $5
   Pop $4
   Pop $3
   Pop $2
