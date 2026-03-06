@@ -181,11 +181,11 @@ write:
     StrCmp $2 "" fail success
 
 success:
-    MessageBox MB_OK|MB_ICONINFORMATION "SRMonado was successfully added to the system PATH."
+    ;MessageBox MB_OK|MB_ICONINFORMATION "SRMonado was successfully added to the system PATH."
     Goto done
 
 fail:
-    MessageBox MB_OK|MB_ICONWARNING "SRMonado could not be added to the system PATH automatically.\r\n\r\nPlease add manually:\r\n$0"
+    ;MessageBox MB_OK|MB_ICONWARNING "SRMonado could not be added to the system PATH automatically.\r\n\r\nPlease add manually:\r\n$0"
     Goto done
 
 already:
@@ -268,11 +268,11 @@ done:
 
     ; Show result dialog
     StrCmp $6 1 success
-    MessageBox MB_OK|MB_ICONWARNING "SRMonado path '$0' was not found in the system PATH or could not be removed."
+    ;MessageBox MB_OK|MB_ICONWARNING "SRMonado path '$0' was not found in the system PATH or could not be removed."
     Goto finish
 
 success:
-    MessageBox MB_OK|MB_ICONINFORMATION "SRMonado path '$0' was successfully removed from the system PATH."
+    ;MessageBox MB_OK|MB_ICONINFORMATION "SRMonado path '$0' was successfully removed from the system PATH."
 
 finish:
     Pop $6
