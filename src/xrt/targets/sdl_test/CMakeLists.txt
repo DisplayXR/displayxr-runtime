@@ -28,7 +28,6 @@ target_link_libraries(
 		ipc_server
 		st_gui
 		drv_includes
-		drv_simulated
 	)
 
 if(WIN32)
