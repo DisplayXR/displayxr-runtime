@@ -17,10 +17,7 @@
 
 #include "sdl_internal.h"
 
-#if 0 && defined(XRT_BUILD_DRIVER_SIMULATED)
-#include "simulated/simulated_interface.h"
-#define USE_SIMULATED
-#endif
+/* simulated driver removed */
 
 
 /*
