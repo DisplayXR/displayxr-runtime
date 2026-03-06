@@ -54,8 +54,6 @@ main(int argc, char **argv)
 		gui_scene_tracking_overrides(&p.base);
 	} else if (argc >= 2 && strcmp("record", argv[1]) == 0) {
 		gui_scene_record(&p.base, argc >= 3 ? argv[2] : NULL);
-	} else if (argc >= 2 && strcmp("remote", argv[1]) == 0) {
-		gui_scene_remote(&p.base, argc >= 3 ? argv[2] : NULL);
 	} else {
 		gui_scene_main_menu(&p.base);
 	}
