@@ -233,7 +233,7 @@ oxr_xrCreateInstance(const XrInstanceCreateInfo *createInfo, XrInstance *out_ins
 	}
 
 	*out_instance = oxr_instance_to_openxr(inst);
-	atomic_store(&g_live_instance, (uintptr_t)*out_instance);
+	g_live_instance = (uintptr_t)*out_instance;
 
 	return XR_SUCCESS;
 }
@@ -247,7 +247,7 @@ oxr_xrDestroyInstance(XrInstance instance)
 	struct oxr_logger log;
 	OXR_VERIFY_INSTANCE_AND_INIT_LOG(&log, instance, inst, "xrDestroyInstance");
 
-	atomic_store(&g_live_instance, (uintptr_t)0);
+	g_live_instance = 0;
 
 	return oxr_handle_destroy(&log, &inst->handle);
 }
@@ -274,7 +274,7 @@ oxr_xrPollEvent(XrInstance instance, XrEventDataBuffer *eventData)
 	// Guard against calls after xrDestroyInstance — Unity's loader
 	// continues polling events after destroying the instance.
 	// Without this check, the VERIFY macro dereferences freed memory.
-	if (atomic_load(&g_live_instance) != (uintptr_t)instance) {
+	if (g_live_instance != (uintptr_t)instance) {
 		return XR_EVENT_UNAVAILABLE;
 	}
 
