@@ -144,12 +144,9 @@ Function AddToPath
 	Exch $0 ; path to add
 	Push $1
 	Push $2
-	Push $3
 
-	; Read existing PATH
 	ReadRegStr $1 HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path"
 
-	; If empty fallback to env
 	StrCmp $1 "" 0 +2
 	ReadEnvStr $1 PATH
 
@@ -158,7 +155,7 @@ Function AddToPath
 	StrCmp $2 "\" 0 +2
 	StrCpy $0 $0 -1
 
-	; Check if already present
+	; Check if already exists
 	Push $1
 	Push $0
 	Call StrStr
@@ -168,7 +165,6 @@ Function AddToPath
 add:
 	StrCmp $1 "" 0 +2
 	StrCpy $1 "$0"
-	StrCmp $1 "" done
 	StrCmp $1 "$0" 0 +2
 	Goto write
 
@@ -179,7 +175,6 @@ write:
 	DetailPrint "Added $0 to system PATH"
 
 done:
-	Pop $3
 	Pop $2
 	Pop $1
 	Pop $0
