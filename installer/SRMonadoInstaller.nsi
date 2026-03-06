@@ -392,7 +392,7 @@ write:
 write_reg:
   WriteRegExpandStr HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path" "$2"
   SendMessage ${HWND_BROADCAST} ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=5000
-  ; ✅ Corrected branch for logging
+  ; Corrected branch for logging
   StrCmp $9 "" +2
     FileWrite $9 "Updated PATH: $2$\r$\n"
 
