@@ -132,121 +132,156 @@ Function DumpLog
 FunctionEnd
 
 ;--------------------------------
-; PATH manipulation functions
-; Based on NSIS Wiki and SR Platform installer
-
-; AddToPath - Adds a directory to the system PATH
-; Uses System::Call to read REG_EXPAND_SZ properly (ReadRegStr can fail on
-; REG_EXPAND_SZ values, returning empty and causing PATH to be overwritten).
+; AddToPath - Adds a directory to the system PATH with confirmation dialog
 ; Usage: Push "C:\path\to\add"
 ;        Call AddToPath
 Function AddToPath
-	Exch $0 ; path to add
-	Push $1
-	Push $2
+    Exch $0 ; path to add
+    Push $1
+    Push $2
+    Push $3
 
-	ReadRegStr $1 HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path"
+    ; Read current system PATH
+    ReadRegStr $1 HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path"
+    StrCmp $1 "" 0 +2
+    ReadEnvStr $1 PATH
 
-	StrCmp $1 "" 0 +2
-	ReadEnvStr $1 PATH
+    ; Normalize trailing slash
+    StrCpy $2 $0 "" -1
+    StrCmp $2 "\" 0 +2
+    StrCpy $0 $0 -1
 
-	; Normalize trailing slash
-	StrCpy $2 $0 "" -1
-	StrCmp $2 "\" 0 +2
-	StrCpy $0 $0 -1
+    ; Check if path already exists
+    Push $1
+    Push $0
+    Call StrStr
+    Pop $2
+    StrCmp $2 "" 0 already
 
-	; Check if already exists
-	Push $1
-	Push $0
-	Call StrStr
-	Pop $2
-	StrCmp $2 "" add done
+    ; Append to PATH
+    StrCmp $1 "" 0 +2
+    StrCpy $1 "$0"
+    StrCmp $1 "$0" 0 +2
+    Goto write
 
-add:
-	StrCmp $1 "" 0 +2
-	StrCpy $1 "$0"
-	StrCmp $1 "$0" 0 +2
-	Goto write
-
-	StrCpy $1 "$1;$0"
+    StrCpy $1 "$1;$0"
 
 write:
-	WriteRegExpandStr HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path" "$1"
-	DetailPrint "Added $0 to system PATH"
+    WriteRegExpandStr HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path" "$1"
+
+    ; Broadcast environment change
+    SendMessage ${HWND_BROADCAST} ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=5000
+
+    ; Verify PATH update
+    ReadRegStr $3 HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path"
+    Push $3
+    Push $0
+    Call StrStr
+    Pop $2
+    StrCmp $2 "" fail success
+
+success:
+    MessageBox MB_ICONINFORMATION "SRMonado was successfully added to the system PATH."
+    Goto done
+
+fail:
+    MessageBox MB_ICONWARNING "SRMonado could not be added to the system PATH automatically.$\r$\n$\r$\nPlease add manually:$\r$\n$0"
+    Goto done
+
+already:
+    DetailPrint "$0 already present in PATH"
 
 done:
-	Pop $2
-	Pop $1
-	Pop $0
+    Pop $3
+    Pop $2
+    Pop $1
+    Pop $0
 FunctionEnd
 
-; RemoveFromPath - Removes a directory from the system PATH
-; Handles multiple occurrences, trailing backslashes, and case variations
+;--------------------------------
+; RemoveFromPath - Removes a directory from the system PATH with success/failure dialog
 ; Usage: Push "C:\path\to\remove"
 ;        Call un.RemoveFromPath
 Function un.RemoveFromPath
-	Exch $0 ; path to remove
-	Push $1
-	Push $2
-	Push $3
-	Push $4
-	Push $5
+    Exch $0 ; path to remove
+    Push $1
+    Push $2
+    Push $3
+    Push $4
+    Push $5
+    Push $6  ; flag to indicate success
 
-	ReadRegStr $1 HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path"
-	StrCpy $2 ""
+    ; Read current system PATH
+    ReadRegStr $1 HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path"
+    StrCpy $2 ""  ; New PATH
+    StrCpy $6 0   ; Flag: path removed?
 
-	; Normalize trailing slash of target
-	StrCpy $3 $0 "" -1
-	StrCmp $3 "\" 0 +2
-	StrCpy $0 $0 -1
+    ; Normalize trailing slash of target
+    StrCpy $3 $0 "" -1
+    StrCmp $3 "\" 0 +2
+    StrCpy $0 $0 -1
 
 loop:
-	StrCmp $1 "" done
+    StrCmp $1 "" done
 
-	Push $1
-	Push ";"
-	Call un.StrStr
-	Pop $3
+    Push $1
+    Push ";"
+    Call un.StrStr
+    Pop $3
 
-	StrCmp $3 "" last
+    StrCmp $3 "" last
 
-	StrLen $4 $1
-	StrLen $5 $3
-	IntOp $4 $4 - $5
-	StrCpy $4 $1 $4
-	IntOp $5 $5 + 1
-	StrCpy $1 $1 "" $5
-	Goto check
+    StrLen $4 $1
+    StrLen $5 $3
+    IntOp $4 $4 - $5
+    StrCpy $4 $1 $4
+    IntOp $5 $5 + 1
+    StrCpy $1 $1 "" $5
+    Goto check
 
 last:
-	StrCpy $4 $1
-	StrCpy $1 ""
+    StrCpy $4 $1
+    StrCpy $1 ""
 
 check:
-	; normalize trailing slash
-	StrCpy $3 $4 "" -1
-	StrCmp $3 "\" 0 +2
-	StrCpy $4 $4 -1
+    ; normalize trailing slash
+    StrCpy $3 $4 "" -1
+    StrCmp $3 "\" 0 +2
+    StrCpy $4 $4 -1
 
-	StrCmp $4 $0 loop
+    ; Compare to target
+    StrCmp $4 $0 skip
+        StrCpy $6 1 ; Mark as removed
+    skip:
+    StrCmp $2 "" 0 +3
+        StrCpy $2 $4
+        Goto loop
 
-	StrCmp $2 "" 0 +3
-	StrCpy $2 $4
-	Goto loop
-
-	StrCpy $2 "$2;$4"
-	Goto loop
+    StrCpy $2 "$2;$4"
+    Goto loop
 
 done:
-	WriteRegExpandStr HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path" "$2"
-	DetailPrint "Removed $0 from system PATH"
+    WriteRegExpandStr HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path" "$2"
 
-	Pop $5
-	Pop $4
-	Pop $3
-	Pop $2
-	Pop $1
-	Pop $0
+    ; Broadcast environment change
+    SendMessage ${HWND_BROADCAST} ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=5000
+
+    ; Show result dialog
+    StrCmp $6 1 success
+    MessageBox MB_ICONWARNING "SRMonado path '$0' was not found in the system PATH or could not be removed."
+    Goto finish
+
+success:
+    MessageBox MB_ICONINFORMATION "SRMonado path '$0' was successfully removed from the system PATH."
+
+finish:
+    Pop $6
+    Pop $5
+    Pop $4
+    Pop $3
+    Pop $2
+    Pop $1
+    Pop $0
 FunctionEnd
 
 ; StrStr - Find substring in string
