@@ -1410,30 +1410,41 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 	c->sampler_linear = nil;
 	c->depth_stencil_state = nil;
 
-	// 6. Detach views from window hierarchy before closing.
-	//    This prevents _recursiveBreakKeyViewLoop from walking
-	//    freed subviews when NSWindow eventually deallocs.
-	if (c->hud_view != nil) {
-		[c->hud_view removeFromSuperview];
-		c->hud_view = nil;
-	}
-	if (c->window != nil && c->view != nil) {
-		[c->window setContentView:[[NSView alloc] init]];
-	}
-	c->view = nil;
-
-	// 7. Close window if we own it — use dispatch_async to avoid
-	//    deadlocking when called from a non-main thread.
+	// 6. Close window synchronously inside @autoreleasepool so the
+	//    NSWindow dealloc (and its frame view cascade) happens NOW,
+	//    while all backing resources are still valid.
 	if (c->owns_window && c->window != nil) {
+		// Detach custom views from hierarchy first — prevents
+		// _recursiveBreakKeyViewLoop from walking freed subviews.
+		if (c->hud_view != nil) {
+			[c->hud_view removeFromSuperview];
+			c->hud_view = nil;
+		}
+		if (c->view != nil) {
+			[c->window setContentView:[[NSView alloc] init]];
+		}
+		c->view = nil;
+
+		// Close must happen on the main thread. Use dispatch_sync
+		// (not async) so dealloc occurs inside this @autoreleasepool.
 		NSWindow *window = c->window;
 		c->window = nil;
-		if ([NSThread isMainThread]) {
+		void (^closeBlock)(void) = ^{
+			[window orderOut:nil];
 			[window close];
+		};
+		if ([NSThread isMainThread]) {
+			closeBlock();
 		} else {
-			dispatch_async(dispatch_get_main_queue(), ^{
-				[window close];
-			});
+			dispatch_sync(dispatch_get_main_queue(), closeBlock);
 		}
+	} else {
+		// Not our window — just detach views.
+		if (c->hud_view != nil) {
+			[c->hud_view removeFromSuperview];
+			c->hud_view = nil;
+		}
+		c->view = nil;
 	}
 
 	// 8. Release remaining objects
