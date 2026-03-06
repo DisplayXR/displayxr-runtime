@@ -141,89 +141,44 @@ FunctionEnd
 ; Usage: Push "C:\path\to\add"
 ;        Call AddToPath
 Function AddToPath
-	Exch $0  ; Path to add
-	Push $1  ; Current PATH
-	Push $2  ; Temp for search result
-	Push $3  ; Registry handle
-	Push $4  ; Data type / buffer pointer
-	Push $5  ; Data length
+	Exch $0 ; path to add
+	Push $1
+	Push $2
+	Push $3
 
-	; Open the Environment registry key
-	; 0x80000002 = HKEY_LOCAL_MACHINE, 0x20019 = KEY_READ
-	System::Call 'Advapi32::RegOpenKeyExW(i 0x80000002, w "SYSTEM\CurrentControlSet\Control\Session Manager\Environment", i 0, i 0x20019, *i .r3) i .r2'
-	StrCmp $2 0 0 reg_failed
-
-	; Query the size of the Path value first (pass null buffer to get size)
-	System::Call 'Advapi32::RegQueryValueExW(i r3, w "Path", i 0, i 0, i 0, *i .r5) i .r2'
-	StrCmp $2 0 0 reg_close_failed
-
-	; Allocate buffer and read the value
-	System::Alloc $5
-	Pop $4  ; $4 = buffer pointer
-	System::Call 'Advapi32::RegQueryValueExW(i r3, w "Path", i 0, i 0, i r4, *i r5) i .r2'
-	StrCmp $2 0 0 reg_free_failed
-
-	; Copy the buffer contents to $1 as a string
-	System::Call '*$4(&w${NSIS_MAX_STRLEN} .r1)'
-
-	; Free buffer and close key
-	System::Free $4
-	System::Call 'Advapi32::RegCloseKey(i r3)'
-
-	Goto got_path
-
-reg_free_failed:
-	System::Free $4
-reg_close_failed:
-	System::Call 'Advapi32::RegCloseKey(i r3)'
-reg_failed:
-	; Fall back to ReadRegStr if the System::Call approach fails
+	; Read existing PATH
 	ReadRegStr $1 HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path"
 
-got_path:
-	; Check if PATH is empty - if so, this is suspicious on a normal Windows system.
-	; Read from the expanded environment as a safety fallback to avoid wiping PATH.
-	StrCmp $1 "" try_expanded
-
-	Goto check_exists
-
-try_expanded:
-	; Last resort: read the current PATH from the process environment
-	; This won't have unexpanded %vars% but is better than losing PATH entirely
+	; If empty fallback to env
+	StrCmp $1 "" 0 +2
 	ReadEnvStr $1 PATH
-	StrCmp $1 "" empty_path
 
-check_exists:
-	; Check if path already exists in PATH (avoid duplicates)
-	; Extra Push $0: StrStr returns via Exch $0 which clobbers $0 and
-	; consumes one stack item below the args. This extra push provides
-	; the item for Exch $0 to restore $0 to path_to_add.
-	Push $0
+	; Normalize trailing slash
+	StrCpy $2 $0 "" -1
+	StrCmp $2 "\" 0 +2
+	StrCpy $0 $0 -1
+
+	; Check if already present
 	Push $1
 	Push $0
 	Call StrStr
 	Pop $2
-	StrCmp $2 "" 0 already_exists
+	StrCmp $2 "" add done
 
-	; Append to existing PATH
-	StrCpy $0 "$1;$0"
-	Goto write_path
+add:
+	StrCmp $1 "" 0 +2
+	StrCpy $1 "$0"
+	StrCmp $1 "" done
+	StrCmp $1 "$0" 0 +2
+	Goto write
 
-empty_path:
-	; PATH is truly empty (fresh system?), just use our path (already in $0)
+	StrCpy $1 "$1;$0"
 
-write_path:
-	; Write new PATH
-	WriteRegExpandStr HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path" "$0"
-	DetailPrint "Added to system PATH"
-	Goto done
-
-already_exists:
-	DetailPrint "Path already exists in system PATH, skipping"
+write:
+	WriteRegExpandStr HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path" "$1"
+	DetailPrint "Added $0 to system PATH"
 
 done:
-	Pop $5
-	Pop $4
 	Pop $3
 	Pop $2
 	Pop $1
@@ -235,46 +190,63 @@ FunctionEnd
 ; Usage: Push "C:\path\to\remove"
 ;        Call un.RemoveFromPath
 Function un.RemoveFromPath
-	Exch $0 ; Path to remove
-	Push $1 ; Current PATH
-	Push $2 ; New PATH
-	Push $3 ; Current part
-	Push $4 ; Temp
+	Exch $0 ; path to remove
+	Push $1
+	Push $2
+	Push $3
+	Push $4
+	Push $5
 
 	ReadRegStr $1 HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path"
 	StrCpy $2 ""
 
+	; Normalize trailing slash of target
+	StrCpy $3 $0 "" -1
+	StrCmp $3 "\" 0 +2
+	StrCpy $0 $0 -1
+
 loop:
 	StrCmp $1 "" done
+
 	Push $1
 	Push ";"
 	Call un.StrStr
 	Pop $3
-	StrCmp $3 "" lastpart
-	StrLen $4 $3
-	StrLen $3 $1
-	IntOp $3 $3 - $4
-	StrCpy $4 $1 $3 
-	IntOp $3 $3 + 1
-	StrCpy $1 $1 "" $3 
+
+	StrCmp $3 "" last
+
+	StrLen $4 $1
+	StrLen $5 $3
+	IntOp $4 $4 - $5
+	StrCpy $4 $1 $4
+	IntOp $5 $5 + 1
+	StrCpy $1 $1 "" $5
 	Goto check
-lastpart:
+
+last:
 	StrCpy $4 $1
 	StrCpy $1 ""
+
 check:
-	StrCmp $4 $0 loop ; Skip this entry if it matches
-	StrCmp $4 "$INSTDIR" loop ; Skip this entry if it matches INSTDIR
-	
-	; Rebuild PATH string with current part
+	; normalize trailing slash
+	StrCpy $3 $4 "" -1
+	StrCmp $3 "\" 0 +2
+	StrCpy $4 $4 -1
+
+	StrCmp $4 $0 loop
+
 	StrCmp $2 "" 0 +3
 	StrCpy $2 $4
 	Goto loop
+
 	StrCpy $2 "$2;$4"
 	Goto loop
 
 done:
 	WriteRegExpandStr HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path" "$2"
-	DetailPrint "Removed SRMonado entries from system PATH"
+	DetailPrint "Removed $0 from system PATH"
+
+	Pop $5
 	Pop $4
 	Pop $3
 	Pop $2
