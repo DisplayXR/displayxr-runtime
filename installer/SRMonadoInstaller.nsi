@@ -136,36 +136,41 @@ FunctionEnd
 ; Usage: Push "C:\path\to\add"
 ;        Call AddToPath
 Function AddToPath
-    Exch $0 ; path to add
-    Push $1
-    Push $2
+  Exch $0  ; Path to add
+  Push $1
+  Push $2
 
-    ; 1. Read existing PATH
-    ReadRegStr $1 HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path"
-    
-    ; 2. Check if already exists (avoids duplicates)
-    Push $1
-    Push $0
-    Call StrStr
-    Pop $2
-    StrCmp $2 "" 0 done ; If found, skip to end
+  ; Strip trailing backslash
+  StrCpy $0 $0 "" -1
+  StrCmp $0 "\" 0 +2
+    StrCpy $0 $0 -1
 
-    ; 3. Append logic
-    StrCmp $1 "" 0 +3
-        StrCpy $1 "$0"    ; Path was empty, just set it
-        Goto write
-    StrCpy $1 "$1;$0"     ; Path had data, append with semicolon
+  ; Read current PATH
+  ReadRegExpandStr $1 HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path"
+
+  ; Check if already exists
+  Push $1
+  Push $0
+  Call StrStr
+  Pop $2
+  StrCmp $2 "" 0 done  ; If exists, skip
+
+  ; Append path
+  StrCmp $1 "" 0 +3
+    StrCpy $1 "$0"      ; empty PATH
+    Goto write
+  StrCpy $1 "$1;$0"     ; non-empty PATH, append
 
 write:
-    WriteRegExpandStr HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path" "$1"
+  WriteRegExpandStr HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path" "$1"
 
-    ; 4. Notify Windows of the change
-    SendMessage ${HWND_BROADCAST} ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=5000
+  ; Notify Windows
+  System::Call 'user32::SendMessageTimeoutA(i ${HWND_BROADCAST}, i ${WM_SETTINGCHANGE}, i 0, t "Environment", i 0, i 5000, *i .r0)'
 
 done:
-    Pop $2
-    Pop $1
-    Pop $0
+  Pop $2
+  Pop $1
+  Pop $0
 FunctionEnd
 
 ;--------------------------------
