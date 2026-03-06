@@ -29,15 +29,18 @@
 #include "openxr/openxr.h"
 #include "openxr/openxr_reflection.h"
 
-#include <stdatomic.h>
-
 /*!
  * Track the live XrInstance handle so xrPollEvent can detect calls
  * after xrDestroyInstance without dereferencing freed memory.
  * Unity's OpenXR loader calls xrPollEvent after destroying both
  * session and instance — accessing the freed handle would SIGSEGV.
+ *
+ * Uses volatile instead of C11 atomics because MSVC does not enable
+ * <stdatomic.h> in C mode.  A volatile store/load is sufficient here:
+ * the guard only needs to prevent use-after-free, not provide full
+ * sequential-consistency between threads.
  */
-static _Atomic XrInstance g_live_instance = XR_NULL_HANDLE;
+static volatile uintptr_t g_live_instance = 0;
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -230,7 +233,7 @@ oxr_xrCreateInstance(const XrInstanceCreateInfo *createInfo, XrInstance *out_ins
 	}
 
 	*out_instance = oxr_instance_to_openxr(inst);
-	atomic_store(&g_live_instance, *out_instance);
+	atomic_store(&g_live_instance, (uintptr_t)*out_instance);
 
 	return XR_SUCCESS;
 }
@@ -244,7 +247,7 @@ oxr_xrDestroyInstance(XrInstance instance)
 	struct oxr_logger log;
 	OXR_VERIFY_INSTANCE_AND_INIT_LOG(&log, instance, inst, "xrDestroyInstance");
 
-	atomic_store(&g_live_instance, XR_NULL_HANDLE);
+	atomic_store(&g_live_instance, (uintptr_t)0);
 
 	return oxr_handle_destroy(&log, &inst->handle);
 }
@@ -271,7 +274,7 @@ oxr_xrPollEvent(XrInstance instance, XrEventDataBuffer *eventData)
 	// Guard against calls after xrDestroyInstance — Unity's loader
 	// continues polling events after destroying the instance.
 	// Without this check, the VERIFY macro dereferences freed memory.
-	if (atomic_load(&g_live_instance) != instance) {
+	if (atomic_load(&g_live_instance) != (uintptr_t)instance) {
 		return XR_EVENT_UNAVAILABLE;
 	}
 
