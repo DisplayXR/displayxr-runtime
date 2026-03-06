@@ -7,8 +7,12 @@ add_library(
 	aux_math STATIC
 	m_api.h
 	m_base.cpp
+	m_camera3d_view.c
+	m_camera3d_view.h
 	m_clock_tracking.c
 	m_clock_tracking.h
+	m_display3d_view.c
+	m_display3d_view.h
 	m_documentation.hpp
 	m_eigen_interop.hpp
 	m_filter_fifo.c

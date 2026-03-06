@@ -133,14 +133,7 @@ if(XRT_BUILD_DRIVER_QWERTY AND TARGET drv_qwerty)
 endif()
 
 
-# Canonical stereo math (display3d + camera3d) used by oxr_session.c for
-# Kooima and camera-centric FOV/pose computation. Single source of truth
-# shared with test apps — runtime extracts {eye_world, fov, orientation}.
-target_sources(st_oxr PRIVATE
-	${CMAKE_SOURCE_DIR}/test_apps/common/display3d_view.c
-	${CMAKE_SOURCE_DIR}/test_apps/common/camera3d_view.c
-)
-target_include_directories(st_oxr PRIVATE ${CMAKE_SOURCE_DIR}/test_apps/common)
+# Stereo math now lives in aux_math (m_display3d_view, m_camera3d_view)
 
 if(WIN32 AND XRT_HAVE_OPENGL)
 	target_sources(st_oxr PRIVATE oxr_session_gfx_gl_win32.c)

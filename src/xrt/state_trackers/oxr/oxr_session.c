@@ -38,8 +38,8 @@
 #include "math/m_mathinclude.h"
 #include "math/m_space.h"
 
-#include "display3d_view.h"
-#include "camera3d_view.h"
+#include "math/m_display3d_view.h"
+#include "math/m_camera3d_view.h"
 
 #include "oxr_objects.h"
 #include "oxr_logger.h"
@@ -253,16 +253,6 @@ oxr_session_get_window_metrics(struct oxr_session *sess,
 	}
 
 	return false;
-}
-
-// Helper: copy XrFovf → xrt_fov (same layout, different field names)
-static inline void
-xrfov_to_xrt_fov(const XrFovf *src, struct xrt_fov *dst)
-{
-	dst->angle_left = src->angleLeft;
-	dst->angle_right = src->angleRight;
-	dst->angle_up = src->angleUp;
-	dst->angle_down = src->angleDown;
 }
 
 #ifdef OXR_HAVE_EXT_display_info
@@ -1120,11 +1110,11 @@ oxr_session_locate_views(struct oxr_logger *log,
 				if (screen_width_m > 0.0f && screen_height_m > 0.0f) {
 				// Nominal viewer for stereo math (parallax lerp target)
 				const struct xrt_system_compositor_info *si = &sess->sys->xsysc->info;
-				XrVector3f nominal = {0, si->nominal_viewer_y_m, si->nominal_viewer_z_m};
-				XrVector3f raw_l = {adj_left.x, adj_left.y, adj_left.z};
-				XrVector3f raw_r = {adj_right.x, adj_right.y, adj_right.z};
+				struct xrt_vec3 nominal = {0, si->nominal_viewer_y_m, si->nominal_viewer_z_m};
+				struct xrt_vec3 raw_l = {adj_left.x, adj_left.y, adj_left.z};
+				struct xrt_vec3 raw_r = {adj_right.x, adj_right.y, adj_right.z};
 				Display3DScreen scr = {screen_width_m, screen_height_m};
-				XrPosef display_pose = {
+				struct xrt_pose display_pose = {
 				    {world_head_ori.x, world_head_ori.y, world_head_ori.z, world_head_ori.w},
 				    {world_head_pos.x, world_head_pos.y, world_head_pos.z}};
 
@@ -1144,11 +1134,8 @@ oxr_session_locate_views(struct oxr_logger *log,
 
 					// Extract {fov, eye_world} — runtime doesn't need matrices
 					for (int ei = 0; ei < 2; ei++) {
-						xrfov_to_xrt_fov(&cam_views[ei].fov, &fovs[ei]);
-						stereo_eye_world[ei] = (struct xrt_vec3){
-						    cam_views[ei].eye_world.x,
-						    cam_views[ei].eye_world.y,
-						    cam_views[ei].eye_world.z};
+						fovs[ei] = cam_views[ei].fov;
+						stereo_eye_world[ei] = cam_views[ei].eye_world;
 					}
 					have_kooima_fov = true;
 					have_stereo_eye_override = true;
@@ -1171,16 +1158,13 @@ oxr_session_locate_views(struct oxr_logger *log,
 
 					// Extract {fov, eye_world} — runtime doesn't need matrices
 					for (int ei = 0; ei < 2; ei++) {
-						xrfov_to_xrt_fov(&disp_views[ei].fov, &fovs[ei]);
+						fovs[ei] = disp_views[ei].fov;
 					}
 					have_kooima_fov = true;
 
 					if (have_stereo_state && !sess->has_external_window) {
 						for (int ei = 0; ei < 2; ei++) {
-							stereo_eye_world[ei] = (struct xrt_vec3){
-							    disp_views[ei].eye_world.x,
-							    disp_views[ei].eye_world.y,
-							    disp_views[ei].eye_world.z};
+							stereo_eye_world[ei] = disp_views[ei].eye_world;
 						}
 						have_stereo_eye_override = true;
 					}
