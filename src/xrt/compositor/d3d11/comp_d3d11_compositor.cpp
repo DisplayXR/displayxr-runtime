@@ -13,7 +13,6 @@
 #include "comp_d3d11_renderer.h"
 #include "comp_d3d11_window.h"
 
-#include "main/comp_settings.h"
 #include "util/comp_layer_accum.h"
 
 #include "xrt/xrt_handles.h"
@@ -53,6 +52,21 @@
 #include <string.h>
 #include <mutex>
 #include <cmath>
+
+/*!
+ * Minimal settings struct for D3D11 compositor (replaces deleted main/comp_settings.h).
+ */
+struct comp_settings
+{
+	struct
+	{
+		uint32_t width;
+		uint32_t height;
+	} preferred;
+
+	//! Nominal frame interval in nanoseconds.
+	int64_t nominal_frame_interval_ns;
+};
 
 /*!
  * The D3D11 native compositor structure.
