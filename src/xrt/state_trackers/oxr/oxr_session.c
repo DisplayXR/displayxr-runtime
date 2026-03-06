@@ -204,11 +204,8 @@ oxr_session_get_display_dimensions(struct oxr_session *sess, float *out_width_m,
 #endif
 
 #ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR
-	// Metal native compositor path (falls through to generic if no display processor)
 	if (sess->xcn != NULL && sess->is_metal_native_compositor) {
-		if (comp_metal_compositor_get_display_dimensions(&sess->xcn->base, out_width_m, out_height_m)) {
-			return true;
-		}
+		return comp_metal_compositor_get_display_dimensions(&sess->xcn->base, out_width_m, out_height_m);
 	}
 #endif
 
@@ -244,10 +241,7 @@ oxr_session_get_window_metrics(struct oxr_session *sess,
 
 #ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR
 	if (sess->is_metal_native_compositor) {
-		if (comp_metal_compositor_get_window_metrics(&sess->xcn->base, out_metrics)) {
-			return true;
-		}
-		// Fall through to generic path when no display processor
+		return comp_metal_compositor_get_window_metrics(&sess->xcn->base, out_metrics);
 	}
 #endif
 
