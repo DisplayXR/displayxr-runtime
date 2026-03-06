@@ -234,7 +234,7 @@ FunctionEnd
 ; Uses System::Call to read REG_EXPAND_SZ properly (ReadRegStr can fail on
 ; REG_EXPAND_SZ values, returning empty and causing PATH to be overwritten).
 ; Handles multiple occurrences, trailing backslashes, and case variations
-; Usage: Push "C:\path\to\remove"
+; Usage: Push "C:\path\to\remove" 
 ;        Call un.RemoveFromPath
 Function un.RemoveFromPath
   Exch $0  ; Path to remove (from stack)
