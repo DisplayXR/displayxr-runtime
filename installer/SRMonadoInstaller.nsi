@@ -281,35 +281,39 @@ FunctionEnd
 ; Usage: Push "C:\path\to\remove" 
 ;        Call un.RemoveFromPath
 Function un.RemoveFromPath
-  Exch $0  ; Path to remove (from stack)
-  Push $1
-  Push $2
-  Push $3
-  Push $4
-  Push $5
-  Push $6
-  Push $7
+  Exch $0  ; Path to remove
+  Push $1  ; Current raw PATH
+  Push $2  ; Rebuilt PATH
+  Push $3  ; Current segment
+  Push $4  ; Normalized segment
+  Push $5  ; Normalized target
+  Push $6  ; Temp / Length
+  Push $7  ; Extra temp
+  Push $8  ; Original PATH backup
+
+  DetailPrint "=== RemoveFromPath started ==="
+  DetailPrint "Target to remove: $0"
 
   SetRegView 64
 
-  ; Open log
-  StrCpy $7 "$TEMP\RemoveFromPath.log"
-  FileOpen $7 $7 "w"
-  FileWriteUTF16LE $7 "Removing path: $0\r\n"
-
-  ; Lowercase target
+  ; 1. Normalize target (lowercase + trim)
   Push $0
   Call un.StrLower
   Pop $5
-  StrCpy $6 $5 1 -1
-  StrCmp $6 "\" 0 +2
+  Push $5
+  Call un.TrimCRLF
+  Pop $5
+  StrLen $6 $5
+  StrCpy $7 $5 1 -1
+  StrCmp $7 "\" 0 +2
     StrCpy $5 $5 -1
-  FileWriteUTF16LE $7 "Normalized target: $5\r\n"
+  DetailPrint "Normalized target: $5"
 
-  ; Read system PATH
+  ; 2. Read system PATH
   ReadRegStr $1 HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path"
-  FileWriteUTF16LE $7 "Current PATH: $1\r\n"
-  StrCpy $2 ""
+  StrCpy $8 $1 ; Save original PATH
+  StrCpy $2 ""  ; Rebuilt PATH
+  DetailPrint "Current PATH: $1"
 
 loop:
   StrCmp $1 "" write
@@ -336,34 +340,45 @@ last_segment:
 check_segment:
   StrCmp $3 "" loop
 
+  ; Normalize segment
   Push $3
   Call un.StrLower
   Pop $4
-  StrCpy $6 $4 1 -1
-  StrCmp $6 "\" 0 +2
+  Push $4
+  Call TrimCRLF
+  Pop $4
+
+  ; Strip trailing backslash
+  StrLen $6 $4
+  StrCpy $7 $4 1 -1
+  StrCmp $7 "\" 0 +2
     StrCpy $4 $4 -1
 
-  FileWriteUTF16LE $7 "Checking segment: $3 (normalized: $4)\r\n"
+  DetailPrint "Checking segment: $3 (normalized: $4)"
 
-  StrCmp $4 $5 skip_segment
-    FileWriteUTF16LE $7 "Skipping segment (matches target): $3\r\n"
-    Goto loop
+  ; Compare
+  StrCmp $4 $5 skip_append
 
-skip_segment:
+  ; Append to rebuilt PATH
   StrCmp $2 "" 0 +3
     StrCpy $2 $3
     Goto loop
   StrCpy $2 "$2;$3"
   Goto loop
 
+skip_append:
+  DetailPrint "Skipped matching segment: $3"
+  Goto loop
+
 write:
-  FileWriteUTF16LE $7 "Writing updated PATH: $2\r\n"
-  WriteRegExpandStr HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path" "$2"
-  SendMessage ${HWND_BROADCAST} ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=5000
+  StrCmp $2 $8 done
+    WriteRegExpandStr HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path" "$2"
+    SendMessage ${HWND_BROADCAST} ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=5000
+    DetailPrint "Updated PATH: $2"
 
 done:
-  FileClose $7
   SetRegView 32
+  Pop $8
   Pop $7
   Pop $6
   Pop $5
@@ -372,6 +387,27 @@ done:
   Pop $2
   Pop $1
   Pop $0
+  DetailPrint "=== RemoveFromPath completed ==="
+FunctionEnd
+
+; ---------------------------------------------------------
+; Uninstaller version of TrimCRLF
+; ---------------------------------------------------------
+Function un.TrimCRLF
+  Exch $R0 ; Get string from stack
+  Push $R1 ; Save $R1
+loop:
+  StrCpy $R1 $R0 1 -1 ; Get last character
+  StrCmp $R1 "$\r" trim
+  StrCmp $R1 "$\n" trim
+  StrCmp $R1 " "   trim ; Optional: trim trailing spaces too
+  Goto done
+trim:
+  StrCpy $R0 $R0 -1    ; Remove last character
+  Goto loop
+done:
+  Pop $R1  ; Restore $R1
+  Exch $R0 ; Put trimmed string back on stack
 FunctionEnd
 
 ; StrStr - Find substring in string
