@@ -345,7 +345,7 @@ check_segment:
   Call un.StrLower
   Pop $4
   Push $4
-  Call TrimCRLF
+  Call un.TrimCRLF
   Pop $4
 
   ; Strip trailing backslash
