@@ -265,6 +265,13 @@ if(APPLE AND XRT_HAVE_METAL)
 endif()
 
 ###
+# Native OpenGL compositor (bypasses Vulkan entirely)
+#
+if(XRT_HAVE_OPENGL)
+	add_subdirectory(gl)
+endif()
+
+###
 # D3D11 Service compositor (for hybrid mode)
 #
 if(WIN32 AND XRT_FEATURE_HYBRID_MODE)

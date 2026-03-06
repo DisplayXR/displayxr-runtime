@@ -137,6 +137,13 @@ endif()
 
 if(WIN32 AND XRT_HAVE_OPENGL)
 	target_sources(st_oxr PRIVATE oxr_session_gfx_gl_win32.c)
+
+	# GL native compositor support (bypasses Vulkan)
+	if(TARGET comp_gl)
+		target_sources(st_oxr PRIVATE oxr_session_gfx_gl_native.c)
+		target_link_libraries(st_oxr PRIVATE comp_gl)
+		target_compile_definitions(st_oxr PRIVATE XRT_HAVE_GL_NATIVE_COMPOSITOR)
+	endif()
 endif()
 
 if(XRT_FEATURE_OPENXR_LAYER_FB_PASSTHROUGH)

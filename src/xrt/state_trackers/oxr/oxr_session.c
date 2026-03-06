@@ -72,6 +72,10 @@
 #include "metal/comp_metal_compositor.h"
 #endif
 
+#ifdef XRT_HAVE_GL_NATIVE_COMPOSITOR
+#include "gl/comp_gl_compositor.h"
+#endif
+
 
 DEBUG_GET_ONCE_NUM_OPTION(ipd, "OXR_DEBUG_IPD_MM", 63)
 DEBUG_GET_ONCE_NUM_OPTION(wait_frame_sleep, "OXR_DEBUG_WAIT_FRAME_EXTRA_SLEEP_MS", 0)
@@ -1829,6 +1833,24 @@ oxr_session_create_impl(struct oxr_logger *log,
 		}
 
 		OXR_SESSION_ALLOCATE_AND_INIT(log, sys, OXR_SESSION_GRAPHICS_EXT_WIN32_GL, *out_session);
+
+#ifdef XRT_HAVE_GL_NATIVE_COMPOSITOR
+		// Check if GL native compositor should be used (bypasses Vulkan)
+		if (oxr_gl_native_compositor_supported(sys)) {
+			// Create session without Vulkan compositor
+			xrt_result_t xret = xrt_system_create_session(sys->xsys, xsi, &(*out_session)->xs, NULL);
+			if (xret == XRT_ERROR_MULTI_SESSION_NOT_IMPLEMENTED) {
+				return oxr_error(log, XR_ERROR_LIMIT_REACHED, "Per instance multi-session not supported.");
+			}
+			if (xret != XRT_SUCCESS) {
+				return oxr_error(log, XR_ERROR_RUNTIME_FAILURE, "Failed to create xrt_session! '%i'", xret);
+			}
+			// Use GL native compositor — no Vulkan involvement
+			return oxr_session_populate_gl_native(log, sys, (void *)opengl_win32->hGLRC,
+			                                       (void *)opengl_win32->hDC, *out_session);
+		}
+#endif
+		// Fall back to Vulkan-backed GL compositor
 		OXR_CREATE_XRT_SESSION_AND_NATIVE_COMPOSITOR(log, xsi, *out_session);
 		return oxr_session_populate_gl_win32(log, sys, opengl_win32, *out_session);
 	}
