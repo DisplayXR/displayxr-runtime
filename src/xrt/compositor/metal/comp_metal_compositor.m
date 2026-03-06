@@ -344,6 +344,14 @@ xrt_format_to_metal(int64_t format)
 static bool
 compile_shaders(struct comp_metal_compositor *c)
 {
+	if (c->device == nil) {
+		U_LOG_E("Metal device is nil — cannot compile shaders");
+		return false;
+	}
+
+	U_LOG_I("Compiling Metal shaders on device: %s",
+	        c->device.name.UTF8String);
+
 	NSError *error = nil;
 	id<MTLLibrary> library = [c->device newLibraryWithSource:metal_shader_source
 	                                                 options:nil
@@ -1393,21 +1401,30 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 		xrt_display_processor_metal_destroy(&c->display_processor);
 	}
 
-	// 4. Release shared texture resources
+	// 4. Release shared texture resources (MRR — explicit release)
+	[c->shared_texture release];
 	c->shared_texture = nil;
 	if (c->shared_iosurface != NULL) {
 		CFRelease(c->shared_iosurface);
 		c->shared_iosurface = NULL;
 	}
 
-	// 5. Release Metal resources
+	// 5. Release Metal resources (MRR — explicit release)
+	[c->stereo_texture release];
 	c->stereo_texture = nil;
+	[c->depth_texture release];
 	c->depth_texture = nil;
+	[c->projection_pipeline release];
 	c->projection_pipeline = nil;
+	[c->blit_pipeline release];
 	c->blit_pipeline = nil;
+	[c->anaglyph_pipeline release];
 	c->anaglyph_pipeline = nil;
+	[c->blend_pipeline release];
 	c->blend_pipeline = nil;
+	[c->sampler_linear release];
 	c->sampler_linear = nil;
+	[c->depth_stencil_state release];
 	c->depth_stencil_state = nil;
 
 	// 6. Close window synchronously inside @autoreleasepool so the
@@ -1447,8 +1464,10 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 		c->view = nil;
 	}
 
-	// 8. Release remaining objects
+	// 8. Release remaining objects (MRR — explicit release required)
+	[c->command_queue release];
 	c->command_queue = nil;
+	[c->device release];
 	c->device = nil;
 
 	} // @autoreleasepool — all autoreleased ObjC objects drained here
@@ -1503,8 +1522,13 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 	}
 
 	c->xdev = xdev;
+	// Retain the command queue and device — this file is compiled
+	// WITHOUT ARC (see CMakeLists.txt), so ObjC object lifetimes
+	// must be managed explicitly with retain/release.
 	c->command_queue = (__bridge id<MTLCommandQueue>)command_queue_ptr;
+	[c->command_queue retain];
 	c->device = c->command_queue.device;
+	[c->device retain];
 	c->display_refresh_rate = 60.0f;
 	c->offscreen = offscreen;
 
