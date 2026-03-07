@@ -131,6 +131,64 @@ Function DumpLog
 		Pop $5
 FunctionEnd
 
+; Pure NSIS Lowercase function (Installer)
+Function StrLower
+  Exch $0 ; Input string
+  Push $1 ; Index
+  Push $2 ; Current Char
+  Push $3 ; Result Buffer
+  
+  StrCpy $3 "" 
+  StrCpy $1 0  
+
+loop:
+  StrCpy $2 $0 1 $1 
+  StrCmp $2 "" done 
+  
+  ; FIX: Added 'W' to CharLower and used 'w' for the type
+  System::Call "user32::CharLowerW(w r2)w.r2"
+  
+  StrCpy $3 "$3$2" 
+  IntOp $1 $1 + 1  
+  Goto loop
+
+done:
+  StrCpy $0 $3     
+  Pop $3
+  Pop $2
+  Pop $1
+  Exch $0          
+FunctionEnd
+
+; Pure NSIS Lowercase function (Uninstaller)
+Function un.StrLower
+  Exch $0 ; Input string
+  Push $1 ; Index
+  Push $2 ; Current Char
+  Push $3 ; Result Buffer
+  
+  StrCpy $3 "" 
+  StrCpy $1 0  
+
+loop:
+  StrCpy $2 $0 1 $1 
+  StrCmp $2 "" done 
+  
+  ; FIX: Added 'W' to CharLower and used 'w' for the type
+  System::Call "user32::CharLowerW(w r2)w.r2"
+  
+  StrCpy $3 "$3$2" 
+  IntOp $1 $1 + 1  
+  Goto loop
+
+done:
+  StrCpy $0 $3     
+  Pop $3
+  Pop $2
+  Pop $1
+  Exch $0          
+FunctionEnd
+
 ;--------------------------------
 ; PATH manipulation functions
 ; Based on NSIS Wiki and SR Platform installer
@@ -234,149 +292,149 @@ FunctionEnd
 ; Uses System::Call to read REG_EXPAND_SZ properly (ReadRegStr can fail on
 ; REG_EXPAND_SZ values, returning empty and causing PATH to be overwritten).
 ; Handles multiple occurrences, trailing backslashes, and case variations
-; Usage: Push "C:\path\to\remove"
+; Usage: Push "C:\path\to\remove" 
 ;        Call un.RemoveFromPath
+; RemoveFromPath - Removes a directory from the system PATH
+; Handles 64-bit registry, Unicode characters, and case-insensitive matching.
+; RemoveFromPath - Removes a directory from the system PATH
+; Handles 64-bit registry, Unicode characters, and case-insensitive matching.
 Function un.RemoveFromPath
-	Exch $0  ; Path to remove
-	Push $1  ; Current PATH
-	Push $2  ; Temp
-	Push $3  ; New PATH
-	Push $4  ; Current part
-	Push $5  ; Normalized path to remove
-	Push $6  ; Normalized current part
+  Exch $0 ; Target path
+  Push $1 ; Full PATH 
+  Push $2 ; Rebuilt PATH 
+  Push $3 ; Current Segment 
+  Push $4 ; Normalized Target 
+  Push $5 ; Normalized Segment 
+  Push $6 ; Loop Index 
+  Push $7 ; Temp Char 
+  Push $8 ; Log Handle (Unused but kept for stack balance)
 
-	; Read current PATH using RegQueryValueExW (handles REG_EXPAND_SZ)
-	Push $R0  ; Registry handle
-	Push $R1  ; Buffer pointer
-	Push $R2  ; Data length
+  SetRegView 64
+  
+  ; Logging disabled for production
+  ; StrCpy $8 "$TEMP\RemoveFromPath.log"
+  ; FileOpen $8 $8 "w"
+  ; FileWrite $8 "=== RemoveFromPath started ===$\r$\n"
+  ; FileWrite $8 "Target to remove: '$0'$\r$\n"
 
-	System::Call 'Advapi32::RegOpenKeyExW(i 0x80000002, w "SYSTEM\CurrentControlSet\Control\Session Manager\Environment", i 0, i 0x20019, *i .R0) i .r2'
-	StrCmp $2 0 0 un_reg_failed
+  ; 1. Read Registry
+  ReadRegStr $1 HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path"
+  ; FileWrite $8 "FULL REGISTRY PATH: '$1'$\r$\n"
 
-	System::Call 'Advapi32::RegQueryValueExW(i R0, w "Path", i 0, i 0, i 0, *i .R2) i .r2'
-	StrCmp $2 0 0 un_reg_close_failed
+  ; 2. Normalize Target
+  StrCpy $4 $0
+  StrLen $7 $4
+  IntOp $7 $7 - 1
+  StrCpy $6 $4 1 $7
+  StrCmp $6 "\" 0 +2
+    StrCpy $4 $4 $7 
+  
+  Push $4
+  Call un.StrLower
+  Pop $4 
+  ; FileWrite $8 "Normalized Target: '$4'$\r$\n"
 
-	System::Alloc $R2
-	Pop $R1
-	System::Call 'Advapi32::RegQueryValueExW(i R0, w "Path", i 0, i 0, i R1, *i R2) i .r2'
-	StrCmp $2 0 0 un_reg_free_failed
+  ; SAFETY GUARD: Do not proceed if target is empty!
+  StrCmp $4 "" 0 +2
+    ; FileWrite $8 "ERROR: Normalized target is empty. Aborting to save PATH.$\r$\n"
+    Goto done_cleanup
 
-	System::Call '*$R1(&w${NSIS_MAX_STRLEN} .r1)'
+  StrCpy $2 "" 
 
-	System::Free $R1
-	System::Call 'Advapi32::RegCloseKey(i R0)'
-	Goto un_got_path
+loop_segments:
+  StrCmp $1 "" done_loop
+  StrCpy $6 0 
+  StrCpy $3 "" 
 
-un_reg_free_failed:
-	System::Free $R1
-un_reg_close_failed:
-	System::Call 'Advapi32::RegCloseKey(i R0)'
-un_reg_failed:
-	; Fall back to ReadRegStr if the System::Call approach fails
-	ReadRegStr $1 HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path"
+find_semi:
+  StrCpy $7 $1 1 $6 
+  StrCmp $7 "" segment_found 
+  StrCmp $7 ";" segment_found 
+  IntOp $6 $6 + 1
+  Goto find_semi
 
-un_got_path:
-	Pop $R2
-	Pop $R1
-	Pop $R0
+segment_found:
+  StrCpy $3 $1 $6 
+  IntOp $6 $6 + 1
+  StrCpy $1 $1 "" $6 
 
-	; Normalize path to remove (strip trailing backslash)
-	StrCpy $5 $0
-	StrCpy $2 $5 1 -1  ; Get last char
-	StrCmp $2 "\" 0 +2
-	StrCpy $5 $5 -1    ; Remove trailing backslash
+  StrCmp $3 "" loop_segments ; Skip empty segments
 
-	; Initialize new PATH
-	StrCpy $3 ""
+  ; Normalize Segment
+  StrCpy $5 $3
+  StrLen $7 $5
+  IntOp $7 $7 - 1
+  StrCpy $6 $5 1 $7
+  StrCmp $6 "\" 0 +2
+    StrCpy $5 $5 $7
+  
+  Push $5
+  Call un.StrLower
+  Pop $5
+  
+  ; 3. Compare
+  StrCmp $5 $4 is_match
+    ; Result: NO MATCH - KEEPING
+    StrCmp $2 "" 0 +3
+      StrCpy $2 "$3" 
+      Goto loop_segments
+    StrCpy $2 "$2;$3" 
+    Goto loop_segments
 
-	; Parse PATH and rebuild without our directory
+is_match:
+  ; FileWrite $8 "MATCHED AND REMOVED: '$3'$\r$\n"
+  Goto loop_segments ; Go back to loop!
+
+done_loop:
+  ; FileWrite $8 "FINAL REBUILT PATH: '$2'$\r$\n"
+
+  ; 4. Final Safety Check & Write
+  ReadRegStr $1 HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path"
+  
+  ; Final sanity check: don't write an empty path if the original wasn't empty
+  StrCmp $2 "" done_write 
+  
+  StrCmp $2 $1 done_write
+    WriteRegExpandStr HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path" "$2"
+    ; FileWrite $8 "Registry successfully updated.$\r$\n"
+  
+done_write:
+  ; FileWrite $8 "=== RemoveFromPath completed ===$\r$\n"
+
+done_cleanup:
+  ; FileClose $8
+  SendMessage ${HWND_BROADCAST} ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=5000
+  SetRegView 32
+
+  Pop $8
+  Pop $7
+  Pop $6
+  Pop $5
+  Pop $4
+  Pop $3
+  Pop $2
+  Pop $1
+  Pop $0
+FunctionEnd
+
+; ---------------------------------------------------------
+; Uninstaller version of TrimCRLF
+; ---------------------------------------------------------
+Function un.TrimCRLF
+  Exch $R0 ; Get string from stack
+  Push $R1 ; Save $R1
 loop:
-	StrLen $2 $1
-	StrCmp $2 0 writepath
-
-	; Find next semicolon
-	; Extra Push $0: un.StrStr returns via Exch $0 which consumes one stack item
-	Push $0
-	Push $1
-	Push ";"
-	Call un.StrStr
-	Pop $2
-
-	StrCmp $2 "" lastpart
-
-	; Get length of current part
-	StrLen $4 $2
-	StrLen $2 $1
-	IntOp $2 $2 - $4
-	StrCpy $4 $1 $2  ; Current part
-	IntOp $2 $2 + 1
-	StrCpy $1 $1 "" $2  ; Rest of PATH
-
-	; Normalize current part (strip trailing backslash)
-	StrCpy $6 $4
-	StrCpy $2 $6 1 -1  ; Get last char
-	StrCmp $2 "\" 0 +2
-	StrCpy $6 $6 -1    ; Remove trailing backslash
-
-	; Check if this part matches what we want to remove (case-insensitive via StrCmp)
-	StrCmp $6 $5 loop  ; Skip if matches
-
-	; Also check if the path contains "SRMonado" as substring (catches any install path variations)
-	Push $0
-	Push $6
-	Push "SRMonado"
-	Call un.StrStr
-	Pop $2
-	StrCmp $2 "" 0 loop  ; Skip if contains SRMonado
-
-	; Add to new PATH
-	StrLen $2 $3
-	StrCmp $2 0 0 +3
-	StrCpy $3 $4
-	Goto loop
-	StrCpy $3 "$3;$4"
-	Goto loop
-
-lastpart:
-	; Handle last part (no trailing semicolon)
-	; Normalize it
-	StrCpy $6 $1
-	StrCpy $2 $6 1 -1
-	StrCmp $2 "\" 0 +2
-	StrCpy $6 $6 -1
-
-	StrCmp $6 $5 writepath  ; Skip if matches
-
-	; Also check for SRMonado substring
-	Push $0
-	Push $6
-	Push "SRMonado"
-	Call un.StrStr
-	Pop $2
-	StrCmp $2 "" 0 writepath  ; Skip if contains SRMonado
-
-	StrLen $2 $3
-	StrCmp $2 0 0 +3
-	StrCpy $3 $1
-	Goto writepath
-	StrCpy $3 "$3;$1"
-
-writepath:
-	; Write new PATH
-	WriteRegExpandStr HKLM "SYSTEM\CurrentControlSet\Control\Session Manager\Environment" "Path" "$3"
-
-	; Broadcast WM_SETTINGCHANGE
-	SendMessage ${HWND_BROADCAST} ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=5000
-
-	DetailPrint "Removed SRMonado entries from system PATH"
-
-	Pop $6
-	Pop $5
-	Pop $4
-	Pop $3
-	Pop $2
-	Pop $1
-	Pop $0
+  StrCpy $R1 $R0 1 -1 ; Get last character
+  StrCmp $R1 "$\r" trim
+  StrCmp $R1 "$\n" trim
+  StrCmp $R1 " "   trim ; Optional: trim trailing spaces too
+  Goto done
+trim:
+  StrCpy $R0 $R0 -1    ; Remove last character
+  Goto loop
+done:
+  Pop $R1  ; Restore $R1
+  Exch $R0 ; Put trimmed string back on stack
 FunctionEnd
 
 ; StrStr - Find substring in string
