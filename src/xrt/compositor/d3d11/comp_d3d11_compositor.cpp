@@ -1348,7 +1348,7 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	// for mono fallback blitting.  Mono/2D mode uses a GPU stretch blit to fill the full
 	// window regardless of stereo texture height.
 	uint32_t target_height = (c->display_processor != NULL) ? view_height : c->settings.preferred.height;
-	xret = comp_d3d11_renderer_create(c, view_width, view_height, target_height, &c->renderer);
+	xrt_result_t xret = comp_d3d11_renderer_create(c, view_width, view_height, target_height, &c->renderer);
 	if (xret != XRT_SUCCESS) {
 		U_LOG_E("Failed to create D3D11 renderer");
 		d3d11_compositor_destroy(&c->base.base);
@@ -1365,8 +1365,8 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	if (gui_ret == 0 && c->debug_gui != nullptr) {
 		// Debug GUI was created, now create the readback module
 		// Stereo texture is 2x view width
-		xret = comp_d3d11_debug_create(c->device, view_width * 2, view_height, &c->debug);
-		if (xret != XRT_SUCCESS) {
+		xrt_result_t xret2 = comp_d3d11_debug_create(c->device, view_width * 2, view_height, &c->debug);
+		if (xret2 != XRT_SUCCESS) {
 			U_LOG_W("Failed to create D3D11 debug readback, debug GUI preview disabled");
 			c->debug = nullptr;
 		} else {
