@@ -198,6 +198,7 @@ Copy binaries to `_package/SRMonado-macOS/bin/`. Run scripts exec from `$DIR/bin
 | cube_ext_metal_macos | `test_apps/cube_ext_metal_macos/build/cube_ext_metal_macos` | `_package/.../bin/cube_ext_metal_macos` | `run_cube_ext_metal.sh` |
 | cube_shared_metal_macos | `test_apps/cube_shared_metal_macos/build/cube_shared_metal_macos` | `_package/.../bin/cube_shared_metal_macos` | `run_cube_shared_metal.sh` |
 | cube_shared_gl_macos | `test_apps/cube_shared_gl_macos/build/cube_shared_gl_macos` | `_package/.../bin/cube_shared_gl_macos` | `run_cube_shared_gl.sh` |
+| cube_shared_vk_macos | `test_apps/cube_shared_vk_macos/build/cube_shared_vk_macos` | `_package/.../bin/cube_shared_vk_macos` | `run_cube_shared_vk.sh` |
 | gaussian_splatting_vk_macos | `demos/gaussian_splatting_vk_macos/build/gaussian_splatting_vk_macos` | `_package/.../bin/gaussian_splatting_vk_macos` | `run_gaussian_splatting.sh` |
 
 ## Debug Logs

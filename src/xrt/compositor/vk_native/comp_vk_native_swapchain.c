@@ -10,7 +10,7 @@
 #include "comp_vk_native_swapchain.h"
 #include "comp_vk_native_compositor.h"
 
-#include "xrt/xrt_handles.h"
+#include "xrt/xrt_compositor.h"
 #include "xrt/xrt_vulkan_includes.h"
 #include "vk/vk_helpers.h"
 
@@ -30,7 +30,11 @@
 struct comp_vk_native_swapchain
 {
 	//! Base type - must be first!
-	struct xrt_swapchain_native base;
+	//! Uses xrt_swapchain_vk (not xrt_swapchain_native) because vk_enumerate_images
+	//! casts to xrt_swapchain_vk and reads base.images[] as VkImage pointers.
+	//! Since there's no client compositor wrapper in the VK native path, the
+	//! swapchain struct must match what the OpenXR state tracker expects.
+	struct xrt_swapchain_vk base;
 
 	//! Vulkan bundle (borrowed from compositor).
 	struct vk_bundle *vk;
@@ -337,11 +341,8 @@ comp_vk_native_swapchain_create(struct comp_vk_native_compositor *c,
 			U_LOG_W("Failed to create image view for swapchain %u: %d", i, res);
 		}
 
-		// Set up native image handle
-		sc->base.images[i].handle = (xrt_graphics_buffer_handle_t)(uintptr_t)sc->images[i];
-		sc->base.images[i].size = 0;
-		sc->base.images[i].use_dedicated_allocation = false;
-		sc->base.images[i].is_dxgi_handle = false;
+		// Populate xrt_swapchain_vk.images[] so vk_enumerate_images can return them
+		sc->base.images[i] = sc->images[i];
 	}
 
 	// Set up swapchain interface

@@ -38,7 +38,7 @@ static const float HUD_WIDTH_FRACTION = 0.30f;
 static const float HUD_HEIGHT_FRACTION = 0.50f;
 
 static const wchar_t* WINDOW_CLASS = L"SRCubeOpenXRExtGLClass";
-static const wchar_t* WINDOW_TITLE = L"SR Cube OpenXR Ext OpenGL (Press ESC to exit)";
+static const wchar_t* WINDOW_TITLE = L"OpenGL Cube \u2014 GL Native Compositor (External Window)";
 
 // Global state (shared between main thread and render thread)
 static InputState g_inputState;

@@ -2,24 +2,38 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  macOS Vulkan OpenXR spinning cube with external window binding
+ * @brief  macOS Vulkan OpenXR spinning cube with IOSurface shared texture
  *
- * Demonstrates XR_EXT_cocoa_window_binding: the app creates its own
- * NSWindow + MetalView (with CAMetalLayer) and passes the NSView to
- * the runtime via the extension. The runtime renders into the app's
- * window instead of creating its own.
+ * Demonstrates XR_EXT_cocoa_window_binding with IOSurface shared texture:
+ * the app creates an IOSurface and passes it to the runtime via the cocoa
+ * window binding (viewHandle=NULL, sharedIOSurface=surface). The runtime
+ * composites the output into the IOSurface. The app then blits the IOSurface
+ * content into its own window using a Metal blit pipeline.
+ *
+ * Key difference from cube_ext_vk_macos: the app's CAMetalLayer is NOT
+ * passed to the runtime. Instead, the IOSurface acts as a shared render
+ * target, and the app composites the result into its own rendering pipeline.
+ *
+ * The Vulkan rendering pipeline is unchanged -- all cube rendering goes
+ * through VK OpenXR swapchains. Metal is ONLY used for the final blit of
+ * the IOSurface content to the screen.
  *
  * Features:
- * - App creates and owns the NSWindow (XR_EXT_cocoa_window_binding)
+ * - IOSurface shared texture (zero-copy texture sharing)
+ * - Vulkan rendering via OpenXR swapchains (SPIR-V shaders)
+ * - Metal blit pipeline for IOSurface-to-drawable presentation
+ * - App-owned window with toolbar and status bar UI
  * - Mouse drag camera, WASD/QE movement, scroll zoom
  * - XR_EXT_display_info: Kooima projection, display metrics
  * - 2D/3D toggle (V key) via xrRequestDisplayModeEXT
- * - 1/2/3 keys for rendering modes (SBS/anaglyph/blend) via xrRequestDisplayRenderingModeEXT
+ * - 1/2/3 keys for rendering modes (SBS/anaglyph/blend)
  * - Tab: toggle HUD overlay, Space: reset camera, ESC: quit
  */
 
 #import <Cocoa/Cocoa.h>
+#import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
+#import <IOSurface/IOSurface.h>
 
 #include <vulkan/vulkan.h>
 
@@ -121,9 +135,9 @@ static volatile bool g_running = true;
 static NSWindow *g_window = nil;
 static NSView *g_metalView = nil;
 static InputState g_input;
-static const float CAMERA_HALF_TAN_VFOV = 0.32491969623f; // tan(18°) → 36° vFOV
+static const float CAMERA_HALF_TAN_VFOV = 0.32491969623f; // tan(18 deg) -> 36 deg vFOV
 
-// Current display rendering mode (0=SBS, 1=anaglyph, 2=blend — vendor-defined)
+// Current display rendering mode (0=SBS, 1=anaglyph, 2=blend -- vendor-defined)
 static int g_currentOutputMode = 0;
 
 // Borderless fullscreen state
@@ -161,8 +175,191 @@ static float g_hudUpdateTimer = 0.0f;
 static uint32_t g_renderW = 0, g_renderH = 0;
 static uint32_t g_windowW = 0, g_windowH = 0;
 
+// IOSurface shared texture
+static IOSurfaceRef g_ioSurface = NULL;
+static uint32_t g_ioSurfaceWidth = 1920;
+static uint32_t g_ioSurfaceHeight = 1080;
+
+// Metal blit pipeline (for IOSurface -> drawable)
+static id<MTLDevice> g_blitDevice = nil;
+static id<MTLCommandQueue> g_blitQueue = nil;
+static id<MTLRenderPipelineState> g_blitPipeline = nil;
+static id<MTLTexture> g_ioSurfaceReadTexture = nil;
+static id<MTLSamplerState> g_blitSampler = nil;
+
+// UI layout constants
+static const float TOOLBAR_HEIGHT = 30.0f;
+static const float STATUSBAR_HEIGHT = 30.0f;
+
 // ============================================================================
-// Inline math — column-major float[16] matrices
+// Metal blit shader (MSL source string for fullscreen triangle)
+// ============================================================================
+
+static const char *g_blitShaderSource = R"MSL(
+#include <metal_stdlib>
+using namespace metal;
+struct BlitVertexOut {
+    float4 position [[position]];
+    float2 uv;
+};
+vertex BlitVertexOut blit_vertex(uint vid [[vertex_id]]) {
+    BlitVertexOut out;
+    out.uv = float2((vid << 1) & 2, vid & 2);
+    out.position = float4(out.uv * 2.0 - 1.0, 0.0, 1.0);
+    out.uv.y = 1.0 - out.uv.y;
+    return out;
+}
+fragment float4 blit_fragment(BlitVertexOut in [[stage_in]],
+                                texture2d<float> tex [[texture(0)]],
+                                sampler samp [[sampler(0)]]) {
+    return tex.sample(samp, in.uv);
+}
+)MSL";
+
+// ============================================================================
+// InitBlitPipeline -- creates Metal device, command queue, blit pipeline
+// ============================================================================
+
+static bool InitBlitPipeline() {
+    g_blitDevice = MTLCreateSystemDefaultDevice();
+    if (g_blitDevice == nil) {
+        LOG_ERROR("No Metal device available for blit pipeline");
+        return false;
+    }
+    LOG_INFO("Metal blit device: %s", g_blitDevice.name.UTF8String);
+
+    g_blitQueue = [g_blitDevice newCommandQueue];
+
+    // Compile blit shader
+    NSError *error = nil;
+    NSString *source = [NSString stringWithUTF8String:g_blitShaderSource];
+    id<MTLLibrary> library = [g_blitDevice newLibraryWithSource:source options:nil error:&error];
+    if (library == nil) {
+        LOG_ERROR("Failed to compile blit shader: %s", error.localizedDescription.UTF8String);
+        return false;
+    }
+
+    id<MTLFunction> vertFunc = [library newFunctionWithName:@"blit_vertex"];
+    id<MTLFunction> fragFunc = [library newFunctionWithName:@"blit_fragment"];
+
+    MTLRenderPipelineDescriptor *pipeDesc = [[MTLRenderPipelineDescriptor alloc] init];
+    pipeDesc.vertexFunction = vertFunc;
+    pipeDesc.fragmentFunction = fragFunc;
+    pipeDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+
+    g_blitPipeline = [g_blitDevice newRenderPipelineStateWithDescriptor:pipeDesc error:&error];
+    if (g_blitPipeline == nil) {
+        LOG_ERROR("Failed to create blit pipeline: %s", error.localizedDescription.UTF8String);
+        return false;
+    }
+
+    // Sampler
+    MTLSamplerDescriptor *sampDesc = [[MTLSamplerDescriptor alloc] init];
+    sampDesc.minFilter = MTLSamplerMinMagFilterLinear;
+    sampDesc.magFilter = MTLSamplerMinMagFilterLinear;
+    g_blitSampler = [g_blitDevice newSamplerStateWithDescriptor:sampDesc];
+
+    LOG_INFO("Metal blit pipeline initialized");
+    return true;
+}
+
+// ============================================================================
+// CreateIOSurface
+// ============================================================================
+
+static bool CreateIOSurface(uint32_t width, uint32_t height) {
+    NSDictionary *props = @{
+        (id)kIOSurfaceWidth:       @(width),
+        (id)kIOSurfaceHeight:      @(height),
+        (id)kIOSurfaceBytesPerElement: @(4),
+        (id)kIOSurfacePixelFormat: @((uint32_t)'BGRA'),
+    };
+
+    g_ioSurface = IOSurfaceCreate((CFDictionaryRef)props);
+    if (g_ioSurface == NULL) {
+        LOG_ERROR("Failed to create IOSurface (%ux%u)", width, height);
+        return false;
+    }
+
+    g_ioSurfaceWidth = width;
+    g_ioSurfaceHeight = height;
+
+    // Create a read-only texture view for blitting to the app's drawable
+    MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                    width:width
+                                                                                   height:height
+                                                                                mipmapped:NO];
+    desc.usage = MTLTextureUsageShaderRead;
+    desc.storageMode = MTLStorageModeShared;
+    g_ioSurfaceReadTexture = [g_blitDevice newTextureWithDescriptor:desc
+                                                          iosurface:g_ioSurface
+                                                              plane:0];
+    if (g_ioSurfaceReadTexture == nil) {
+        LOG_ERROR("Failed to create read texture from IOSurface");
+        CFRelease(g_ioSurface);
+        g_ioSurface = NULL;
+        return false;
+    }
+
+    LOG_INFO("Created IOSurface: %ux%u, BGRA8, id=%u", width, height, IOSurfaceGetID(g_ioSurface));
+    return true;
+}
+
+// ============================================================================
+// BlitIOSurfaceToDrawable
+// ============================================================================
+
+static void BlitIOSurfaceToDrawable(CAMetalLayer *metalLayer) {
+    id<CAMetalDrawable> drawable = [metalLayer nextDrawable];
+    if (drawable == nil) return;
+
+    MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
+    rpd.colorAttachments[0].texture = drawable.texture;
+    rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
+    rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+    rpd.colorAttachments[0].clearColor = MTLClearColorMake(0.08, 0.08, 0.1, 1.0);
+
+    id<MTLCommandBuffer> cmdBuf = [g_blitQueue commandBuffer];
+    id<MTLRenderCommandEncoder> enc = [cmdBuf renderCommandEncoderWithDescriptor:rpd];
+
+    // Blit the IOSurface content, letterboxed into the drawable
+    if (g_ioSurfaceReadTexture != nil) {
+        float drawW = (float)drawable.texture.width;
+        float drawH = (float)drawable.texture.height;
+        float surfW = (float)g_ioSurfaceWidth;
+        float surfH = (float)g_ioSurfaceHeight;
+
+        // Compute letterbox viewport (fit IOSurface aspect ratio into drawable)
+        float surfAspect = surfW / surfH;
+        float drawAspect = drawW / drawH;
+        float vpX, vpY, vpW, vpH;
+        if (surfAspect > drawAspect) {
+            vpW = drawW;
+            vpH = drawW / surfAspect;
+            vpX = 0;
+            vpY = (drawH - vpH) / 2.0f;
+        } else {
+            vpH = drawH;
+            vpW = drawH * surfAspect;
+            vpX = (drawW - vpW) / 2.0f;
+            vpY = 0;
+        }
+
+        MTLViewport vp = {(double)vpX, (double)vpY, (double)vpW, (double)vpH, 0.0, 1.0};
+        [enc setViewport:vp];
+        [enc setRenderPipelineState:g_blitPipeline];
+        [enc setFragmentTexture:g_ioSurfaceReadTexture atIndex:0];
+        [enc setFragmentSamplerState:g_blitSampler atIndex:0];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    }
+
+    [enc endEncoding];
+    [cmdBuf presentDrawable:drawable];
+    [cmdBuf commit];
+}
+
+// ============================================================================
+// Inline math -- column-major float[16] matrices
 // ============================================================================
 
 static void mat4_identity(float* m) {
@@ -250,7 +447,7 @@ static void mat4_view_from_xr_pose(float* viewMat, XrPosef pose) {
     mat4_multiply(viewMat, invRot, invTrans);
 }
 
-// Quaternion from yaw/pitch (matches DirectX::XMQuaternionRotationRollPitchYaw(pitch, yaw, 0))
+// Quaternion from yaw/pitch
 static void quat_from_yaw_pitch(float yaw, float pitch, XrQuaternionf* out) {
     float cy = cosf(yaw / 2.0f), sy = sinf(yaw / 2.0f);
     float cp = cosf(pitch / 2.0f), sp = sinf(pitch / 2.0f);
@@ -281,7 +478,6 @@ static XrQuaternionf quat_multiply(XrQuaternionf a, XrQuaternionf b) {
     };
 }
 
-// Kooima projection and FOV now provided by display3d_view.h
 
 // ============================================================================
 // SPIR-V shaders (embedded)
@@ -604,7 +800,7 @@ static const uint32_t cubeTexturedFragSpv[] = {
 };
 
 // ============================================================================
-// Vulkan renderer structures (same as cube_vk_macos)
+// Vulkan renderer structures
 // ============================================================================
 
 struct CubeVertex { float pos[3]; float color[4]; float uv[2]; float normal[3]; float tangent[3]; };
@@ -624,8 +820,8 @@ struct VkRenderer {
     VkDevice device = VK_NULL_HANDLE;
     VkQueue graphicsQueue = VK_NULL_HANDLE;
     VkRenderPass renderPass = VK_NULL_HANDLE;
-    VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;       // grid: push constants only (64 bytes)
-    VkPipelineLayout cubePipelineLayout = VK_NULL_HANDLE;   // textured cube: descriptor set + push constants (128 bytes)
+    VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
+    VkPipelineLayout cubePipelineLayout = VK_NULL_HANDLE;
     VkPipeline cubePipeline = VK_NULL_HANDLE;
     VkPipeline gridPipeline = VK_NULL_HANDLE;
     VkBuffer cubeVertexBuffer = VK_NULL_HANDLE;
@@ -641,8 +837,7 @@ struct VkRenderer {
     float cubeRotation = 0.0f;
     SwapchainFramebuffers swapchainFBs;
     VkRenderPass renderPassLoad = VK_NULL_HANDLE;
-    // Texture resources
-    VkImage texImages[3] = {};          // basecolor, normal, AO
+    VkImage texImages[3] = {};
     VkDeviceMemory texMemory[3] = {};
     VkImageView texViews[3] = {};
     VkSampler texSampler = VK_NULL_HANDLE;
@@ -660,7 +855,6 @@ static std::string GetTextureDir() {
     char pathBuf[4096];
     uint32_t pathSize = sizeof(pathBuf);
     if (_NSGetExecutablePath(pathBuf, &pathSize) == 0) {
-        // Find last '/' to get directory
         char* lastSlash = strrchr(pathBuf, '/');
         if (lastSlash) *lastSlash = '\0';
         return std::string(pathBuf) + "/textures/";
@@ -669,7 +863,7 @@ static std::string GetTextureDir() {
 }
 
 // ============================================================================
-// Vulkan helpers (same as cube_vk_macos)
+// Vulkan helpers
 // ============================================================================
 
 static uint32_t FindMemoryType(VkPhysicalDevice physDevice, uint32_t typeFilter, VkMemoryPropertyFlags properties) {
@@ -737,28 +931,25 @@ static bool CreateDepthImage(VkDevice device, VkPhysicalDevice physDevice,
     return true;
 }
 
-// Load a texture from disk, create VkImage + VkImageView, upload via staging buffer.
-// If the file can't be loaded, creates a 1x1 fallback (white for basecolor/AO, flat blue for normal).
 static bool CreateTextureFromFile(VkDevice device, VkPhysicalDevice physDevice,
     VkCommandPool cmdPool, VkQueue queue,
     const char* path, bool isNormalMap,
     VkImage& outImage, VkDeviceMemory& outMemory, VkImageView& outView)
 {
     int w, h, channels;
-    unsigned char* pixels = stbi_load(path, &w, &h, &channels, 4); // force RGBA
+    unsigned char* pixels = stbi_load(path, &w, &h, &channels, 4);
     bool fallback = false;
     if (!pixels) {
-        LOG_WARN("Failed to load texture: %s — using fallback", path);
+        LOG_WARN("Failed to load texture: %s -- using fallback", path);
         w = h = 1;
         static unsigned char whitePixel[] = {255, 255, 255, 255};
-        static unsigned char bluePixel[] = {128, 128, 255, 255}; // flat normal
+        static unsigned char bluePixel[] = {128, 128, 255, 255};
         pixels = isNormalMap ? bluePixel : whitePixel;
         fallback = true;
     }
 
     VkDeviceSize imageSize = (VkDeviceSize)w * h * 4;
 
-    // Staging buffer
     VkBuffer stagingBuffer;
     VkDeviceMemory stagingMemory;
     VkBufferCreateInfo bufInfo = {};
@@ -784,7 +975,6 @@ static bool CreateTextureFromFile(VkDevice device, VkPhysicalDevice physDevice,
     vkUnmapMemory(device, stagingMemory);
     if (!fallback) stbi_image_free(pixels);
 
-    // Create image
     VkImageCreateInfo imgInfo = {};
     imgInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     imgInfo.imageType = VK_IMAGE_TYPE_2D;
@@ -805,7 +995,6 @@ static bool CreateTextureFromFile(VkDevice device, VkPhysicalDevice physDevice,
     vkAllocateMemory(device, &allocInfo, nullptr, &outMemory);
     vkBindImageMemory(device, outImage, outMemory, 0);
 
-    // Copy staging → image via one-shot command buffer
     VkCommandBufferAllocateInfo cmdAlloc = {};
     cmdAlloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     cmdAlloc.commandPool = cmdPool;
@@ -819,7 +1008,6 @@ static bool CreateTextureFromFile(VkDevice device, VkPhysicalDevice physDevice,
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmd, &beginInfo);
 
-    // Transition UNDEFINED → TRANSFER_DST
     VkImageMemoryBarrier barrier = {};
     barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -838,7 +1026,6 @@ static bool CreateTextureFromFile(VkDevice device, VkPhysicalDevice physDevice,
     region.imageExtent = {(uint32_t)w, (uint32_t)h, 1};
     vkCmdCopyBufferToImage(cmd, stagingBuffer, outImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
-    // Transition TRANSFER_DST → SHADER_READ_ONLY
     barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -855,11 +1042,9 @@ static bool CreateTextureFromFile(VkDevice device, VkPhysicalDevice physDevice,
     vkQueueWaitIdle(queue);
     vkFreeCommandBuffers(device, cmdPool, 1, &cmd);
 
-    // Cleanup staging
     vkDestroyBuffer(device, stagingBuffer, nullptr);
     vkFreeMemory(device, stagingMemory, nullptr);
 
-    // Create image view
     VkImageViewCreateInfo viewInfo = {};
     viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
     viewInfo.image = outImage;
@@ -871,7 +1056,6 @@ static bool CreateTextureFromFile(VkDevice device, VkPhysicalDevice physDevice,
     return !fallback;
 }
 
-// Store physDevice globally for depth image creation
 static VkPhysicalDevice g_physDevice = VK_NULL_HANDLE;
 
 static bool CreateSwapchainFramebuffers(VkRenderer& renderer,
@@ -885,7 +1069,6 @@ static bool CreateSwapchainFramebuffers(VkRenderer& renderer,
     fb.depthViews.resize(imageCount);
     fb.framebuffers.resize(imageCount);
 
-    // g_physDevice is set during GetVulkanPhysicalDevice
     VkPhysicalDevice physDevice = g_physDevice;
 
     if (!CreateDepthImage(renderer.device, physDevice, width, height,
@@ -934,7 +1117,6 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
     renderer.graphicsQueue = graphicsQueue;
     g_physDevice = physDevice;
 
-    // Render pass
     VkAttachmentDescription attachments[2] = {};
     attachments[0].format = colorFormat;
     attachments[0].samples = VK_SAMPLE_COUNT_1_BIT;
@@ -967,18 +1149,16 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
     rpInfo.pSubpasses = &subpass;
     VK_CHECK(vkCreateRenderPass(device, &rpInfo, nullptr, &renderer.renderPass));
 
-    // Create second render pass with LOAD instead of CLEAR (for second eye in SBS)
     attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
     attachments[0].initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     attachments[1].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
     attachments[1].initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
     VK_CHECK(vkCreateRenderPass(device, &rpInfo, nullptr, &renderer.renderPassLoad));
 
-    // Grid pipeline layout (push constants only, 64 bytes)
     VkPushConstantRange gridPushRange = {};
     gridPushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
     gridPushRange.offset = 0;
-    gridPushRange.size = 64; // MVP matrix
+    gridPushRange.size = 64;
 
     VkPipelineLayoutCreateInfo gridLayoutInfo = {};
     gridLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -986,7 +1166,6 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
     gridLayoutInfo.pPushConstantRanges = &gridPushRange;
     VK_CHECK(vkCreatePipelineLayout(device, &gridLayoutInfo, nullptr, &renderer.pipelineLayout));
 
-    // Descriptor set layout for textured cube (3 combined image samplers)
     VkDescriptorSetLayoutBinding bindings[3] = {};
     for (int i = 0; i < 3; i++) {
         bindings[i].binding = i;
@@ -1000,11 +1179,10 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
     dslInfo.pBindings = bindings;
     VK_CHECK(vkCreateDescriptorSetLayout(device, &dslInfo, nullptr, &renderer.descriptorSetLayout));
 
-    // Cube pipeline layout (descriptor set + 128 bytes push constants: MVP + model)
     VkPushConstantRange cubePushRange = {};
     cubePushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
     cubePushRange.offset = 0;
-    cubePushRange.size = 128; // MVP + model matrices
+    cubePushRange.size = 128;
 
     VkPipelineLayoutCreateInfo cubeLayoutInfo = {};
     cubeLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -1014,7 +1192,6 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
     cubeLayoutInfo.pPushConstantRanges = &cubePushRange;
     VK_CHECK(vkCreatePipelineLayout(device, &cubeLayoutInfo, nullptr, &renderer.cubePipelineLayout));
 
-    // Shader modules
     auto createShaderModule = [&](const uint32_t* code, size_t size) -> VkShaderModule {
         VkShaderModuleCreateInfo ci = {};
         ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
@@ -1030,7 +1207,6 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
     VkShaderModule gridVert = createShaderModule(gridVertSpv, sizeof(gridVertSpv));
     VkShaderModule gridFrag = createShaderModule(gridFragSpv, sizeof(gridFragSpv));
 
-    // Common pipeline states
     VkPipelineViewportStateCreateInfo viewportState = {};
     viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
     viewportState.viewportCount = 1;
@@ -1166,35 +1342,28 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
     vkDestroyShaderModule(device, gridVert, nullptr);
     vkDestroyShaderModule(device, gridFrag, nullptr);
 
-    // Vertex/index buffers — textured cube with UV, normal, tangent per vertex
-    //   pos[3], color[4], uv[2], normal[3], tangent[3] = 15 floats per vertex
+    // Vertex/index buffers
     CubeVertex cubeVerts[] = {
-        // Front face (-Z): normal (0,0,-1), tangent (1,0,0)
         {{-0.5f,-0.5f,-0.5f},{1,1,1,1},{0,1},{0,0,-1},{1,0,0}},
         {{-0.5f, 0.5f,-0.5f},{1,1,1,1},{0,0},{0,0,-1},{1,0,0}},
         {{ 0.5f, 0.5f,-0.5f},{1,1,1,1},{1,0},{0,0,-1},{1,0,0}},
         {{ 0.5f,-0.5f,-0.5f},{1,1,1,1},{1,1},{0,0,-1},{1,0,0}},
-        // Back face (+Z): normal (0,0,1), tangent (-1,0,0)
         {{-0.5f,-0.5f, 0.5f},{1,1,1,1},{1,1},{0,0,1},{-1,0,0}},
         {{ 0.5f,-0.5f, 0.5f},{1,1,1,1},{0,1},{0,0,1},{-1,0,0}},
         {{ 0.5f, 0.5f, 0.5f},{1,1,1,1},{0,0},{0,0,1},{-1,0,0}},
         {{-0.5f, 0.5f, 0.5f},{1,1,1,1},{1,0},{0,0,1},{-1,0,0}},
-        // Top face (+Y): normal (0,1,0), tangent (1,0,0)
         {{-0.5f, 0.5f,-0.5f},{1,1,1,1},{0,1},{0,1,0},{1,0,0}},
         {{-0.5f, 0.5f, 0.5f},{1,1,1,1},{0,0},{0,1,0},{1,0,0}},
         {{ 0.5f, 0.5f, 0.5f},{1,1,1,1},{1,0},{0,1,0},{1,0,0}},
         {{ 0.5f, 0.5f,-0.5f},{1,1,1,1},{1,1},{0,1,0},{1,0,0}},
-        // Bottom face (-Y): normal (0,-1,0), tangent (1,0,0)
         {{-0.5f,-0.5f,-0.5f},{1,1,1,1},{0,0},{0,-1,0},{1,0,0}},
         {{ 0.5f,-0.5f,-0.5f},{1,1,1,1},{1,0},{0,-1,0},{1,0,0}},
         {{ 0.5f,-0.5f, 0.5f},{1,1,1,1},{1,1},{0,-1,0},{1,0,0}},
         {{-0.5f,-0.5f, 0.5f},{1,1,1,1},{0,1},{0,-1,0},{1,0,0}},
-        // Left face (-X): normal (-1,0,0), tangent (0,0,-1)
         {{-0.5f,-0.5f, 0.5f},{1,1,1,1},{0,1},{-1,0,0},{0,0,-1}},
         {{-0.5f, 0.5f, 0.5f},{1,1,1,1},{0,0},{-1,0,0},{0,0,-1}},
         {{-0.5f, 0.5f,-0.5f},{1,1,1,1},{1,0},{-1,0,0},{0,0,-1}},
         {{-0.5f,-0.5f,-0.5f},{1,1,1,1},{1,1},{-1,0,0},{0,0,-1}},
-        // Right face (+X): normal (1,0,0), tangent (0,0,1)
         {{ 0.5f,-0.5f,-0.5f},{1,1,1,1},{0,1},{1,0,0},{0,0,1}},
         {{ 0.5f, 0.5f,-0.5f},{1,1,1,1},{0,0},{1,0,0},{0,0,1}},
         {{ 0.5f, 0.5f, 0.5f},{1,1,1,1},{1,0},{1,0,0},{0,0,1}},
@@ -1243,26 +1412,25 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
     memcpy(data, gridVerts.data(), (size_t)gridBufSize);
     vkUnmapMemory(device, renderer.gridVertexMemory);
 
-    // Command pool + buffer
     VkCommandPoolCreateInfo poolInfo = {};
     poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     poolInfo.queueFamilyIndex = queueFamilyIndex;
     VK_CHECK(vkCreateCommandPool(device, &poolInfo, nullptr, &renderer.commandPool));
 
-    VkCommandBufferAllocateInfo allocInfo = {};
-    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    allocInfo.commandPool = renderer.commandPool;
-    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    allocInfo.commandBufferCount = 1;
-    VK_CHECK(vkAllocateCommandBuffers(device, &allocInfo, &renderer.commandBuffer));
+    VkCommandBufferAllocateInfo cmdAllocInfo = {};
+    cmdAllocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cmdAllocInfo.commandPool = renderer.commandPool;
+    cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cmdAllocInfo.commandBufferCount = 1;
+    VK_CHECK(vkAllocateCommandBuffers(device, &cmdAllocInfo, &renderer.commandBuffer));
 
     VkFenceCreateInfo fenceInfo = {};
     fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
     VK_CHECK(vkCreateFence(device, &fenceInfo, nullptr, &renderer.frameFence));
 
-    // Load textures and create descriptor set
+    // Load textures
     {
         std::string texDir = GetTextureDir();
         const char* texFiles[3] = {
@@ -1281,7 +1449,6 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
             }
         }
 
-        // Sampler (linear filtering, repeat wrap)
         VkSamplerCreateInfo samplerInfo = {};
         samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
         samplerInfo.magFilter = VK_FILTER_LINEAR;
@@ -1293,16 +1460,15 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
         samplerInfo.maxLod = 1.0f;
         VK_CHECK(vkCreateSampler(device, &samplerInfo, nullptr, &renderer.texSampler));
 
-        // Descriptor pool and set
-        VkDescriptorPoolSize poolSize = {};
-        poolSize.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        poolSize.descriptorCount = 3;
-        VkDescriptorPoolCreateInfo poolInfo = {};
-        poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-        poolInfo.maxSets = 1;
-        poolInfo.poolSizeCount = 1;
-        poolInfo.pPoolSizes = &poolSize;
-        VK_CHECK(vkCreateDescriptorPool(device, &poolInfo, nullptr, &renderer.descriptorPool));
+        VkDescriptorPoolSize dpSize = {};
+        dpSize.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        dpSize.descriptorCount = 3;
+        VkDescriptorPoolCreateInfo dpInfo = {};
+        dpInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        dpInfo.maxSets = 1;
+        dpInfo.poolSizeCount = 1;
+        dpInfo.pPoolSizes = &dpSize;
+        VK_CHECK(vkCreateDescriptorPool(device, &dpInfo, nullptr, &renderer.descriptorPool));
 
         VkDescriptorSetAllocateInfo dsAllocInfo = {};
         dsAllocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
@@ -1311,7 +1477,6 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
         dsAllocInfo.pSetLayouts = &renderer.descriptorSetLayout;
         VK_CHECK(vkAllocateDescriptorSets(device, &dsAllocInfo, &renderer.descriptorSet));
 
-        // Update descriptor set with texture views
         VkDescriptorImageInfo imageInfos[3] = {};
         VkWriteDescriptorSet writes[3] = {};
         for (int i = 0; i < 3; i++) {
@@ -1330,7 +1495,7 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
         if (renderer.texturesLoaded) {
             LOG_INFO("All crate textures loaded successfully");
         } else {
-            LOG_WARN("Some textures missing — using fallback colors");
+            LOG_WARN("Some textures missing -- using fallback colors");
         }
     }
 
@@ -1373,7 +1538,6 @@ static void RenderScene(VkRenderer& renderer, uint32_t imageIndex,
     rpBegin.pClearValues = clearValues;
     vkCmdBeginRenderPass(cmd, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
 
-    // Render all eyes in a single render pass — just change viewport/scissor
     for (int eye = 0; eye < eyeCount; eye++) {
         const auto& e = eyes[eye];
 
@@ -1415,7 +1579,6 @@ static void RenderScene(VkRenderer& renderer, uint32_t imageIndex,
             float mvp[16];
             mat4_multiply(mvp, vp, model);
 
-            // Push constants: MVP (64 bytes) + model (64 bytes) = 128 bytes
             float pushData[32];
             memcpy(pushData, mvp, 64);
             memcpy(pushData + 16, model, 64);
@@ -1464,7 +1627,6 @@ static void CleanupVkRenderer(VkRenderer& renderer) {
     if (renderer.cubeVertexMemory) vkFreeMemory(renderer.device, renderer.cubeVertexMemory, nullptr);
     if (renderer.gridPipeline) vkDestroyPipeline(renderer.device, renderer.gridPipeline, nullptr);
     if (renderer.cubePipeline) vkDestroyPipeline(renderer.device, renderer.cubePipeline, nullptr);
-    // Texture cleanup
     if (renderer.descriptorPool) vkDestroyDescriptorPool(renderer.device, renderer.descriptorPool, nullptr);
     if (renderer.descriptorSetLayout) vkDestroyDescriptorSetLayout(renderer.device, renderer.descriptorSetLayout, nullptr);
     if (renderer.texSampler) vkDestroySampler(renderer.device, renderer.texSampler, nullptr);
@@ -1480,7 +1642,7 @@ static void CleanupVkRenderer(VkRenderer& renderer) {
 }
 
 // ============================================================================
-// HUD overlay view (macOS native text overlay)
+// HUD Overlay View (semi-transparent text overlay)
 // ============================================================================
 
 @interface HudOverlayView : NSView
@@ -1517,13 +1679,79 @@ static void CleanupVkRenderer(VkRenderer& renderer) {
 static HudOverlayView *g_hudView = nil;
 
 // ============================================================================
-// macOS Window + Metal View
+// Toolbar View (top bar with mode label)
 // ============================================================================
 
-/*!
- * NSView subclass whose backing layer is a CAMetalLayer.
- * Same pattern as MonadoMetalView in comp_window_macos.m.
- */
+@interface ToolbarView : NSView
+@property (nonatomic, copy) NSString *toolbarText;
+@end
+
+@implementation ToolbarView
+- (instancetype)initWithFrame:(NSRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) { _toolbarText = @"IOSurface Shared Texture (VK)"; [self setWantsLayer:YES]; }
+    return self;
+}
+- (BOOL)isOpaque { return YES; }
+- (NSView *)hitTest:(NSPoint)point { (void)point; return nil; }
+- (void)drawRect:(NSRect)dirtyRect {
+    (void)dirtyRect;
+    [[NSColor colorWithCalibratedRed:0.15 green:0.15 blue:0.2 alpha:1.0] setFill];
+    NSRectFill(self.bounds);
+    NSFont *font = [NSFont fontWithName:@"Menlo" size:12];
+    if (!font) font = [NSFont monospacedSystemFontOfSize:12 weight:NSFontWeightRegular];
+    NSDictionary *attrs = @{
+        NSFontAttributeName: font,
+        NSForegroundColorAttributeName: [NSColor colorWithCalibratedRed:0.8 green:0.9 blue:1.0 alpha:1.0]
+    };
+    NSRect textRect = NSInsetRect(self.bounds, 10, 4);
+    [_toolbarText drawWithRect:textRect
+                       options:NSStringDrawingUsesLineFragmentOrigin
+                    attributes:attrs context:nil];
+}
+@end
+
+static ToolbarView *g_toolbarView = nil;
+
+// ============================================================================
+// Status bar view (bottom bar with eye pos / display info)
+// ============================================================================
+
+@interface StatusBarView : NSView
+@property (nonatomic, copy) NSString *statusText;
+@end
+
+@implementation StatusBarView
+- (instancetype)initWithFrame:(NSRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) { _statusText = @""; [self setWantsLayer:YES]; }
+    return self;
+}
+- (BOOL)isOpaque { return YES; }
+- (NSView *)hitTest:(NSPoint)point { (void)point; return nil; }
+- (void)drawRect:(NSRect)dirtyRect {
+    (void)dirtyRect;
+    [[NSColor colorWithCalibratedRed:0.12 green:0.12 blue:0.16 alpha:1.0] setFill];
+    NSRectFill(self.bounds);
+    NSFont *font = [NSFont fontWithName:@"Menlo" size:10];
+    if (!font) font = [NSFont monospacedSystemFontOfSize:10 weight:NSFontWeightRegular];
+    NSDictionary *attrs = @{
+        NSFontAttributeName: font,
+        NSForegroundColorAttributeName: [NSColor colorWithCalibratedRed:0.7 green:0.7 blue:0.75 alpha:1.0]
+    };
+    NSRect textRect = NSInsetRect(self.bounds, 10, 4);
+    [_statusText drawWithRect:textRect
+                      options:NSStringDrawingUsesLineFragmentOrigin
+                   attributes:attrs context:nil];
+}
+@end
+
+static StatusBarView *g_statusBarView = nil;
+
+// ============================================================================
+// macOS window creation (CAMetalLayer-backed NSView with UI chrome)
+// ============================================================================
+
 @interface AppMetalView : NSView
 @end
 
@@ -1536,10 +1764,6 @@ static HudOverlayView *g_hudView = nil;
 }
 @end
 
-// NSApplicationDelegate: prevent termination when the window is closed or app
-// loses focus.  Without this, macOS terminates CLI-launched GUI apps as soon as
-// the last window closes (applicationShouldTerminateAfterLastWindowClosed
-// defaults to YES).
 @interface AppDelegate : NSObject <NSApplicationDelegate>
 @end
 @implementation AppDelegate
@@ -1550,26 +1774,25 @@ static HudOverlayView *g_hudView = nil;
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)sender {
     (void)sender;
     g_running = false;
-    return NSTerminateCancel; // let our loop handle cleanup
+    return NSTerminateCancel;
 }
 @end
 
-// NSWindowDelegate: translate window-close into g_running = false so the render
-// loop exits gracefully; also keeps the app alive on focus loss.
 @interface AppWindowDelegate : NSObject <NSWindowDelegate>
 @end
 @implementation AppWindowDelegate
 - (BOOL)windowShouldClose:(NSWindow *)sender {
     (void)sender;
     g_running = false;
-    return NO; // we handle teardown ourselves
+    return NO;
 }
 @end
 
 static AppDelegate *g_appDelegate = nil;
 static AppWindowDelegate *g_windowDelegate = nil;
 
-static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
+static bool CreateMacOSWindow(uint32_t width, uint32_t height, id<MTLDevice> device)
+{
     @autoreleasepool {
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
@@ -1586,29 +1809,51 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
                                                  backing:NSBackingStoreBuffered
                                                    defer:NO];
 
-        [g_window setTitle:@"Vulkan Cube — VK Native Compositor (External Window)"];
+        [g_window setTitle:@"Vulkan Cube — Metal Native Compositor (IOSurface Shared)"];
         [g_window setAcceptsMouseMovedEvents:YES];
         [g_window setReleasedWhenClosed:NO];
 
         g_windowDelegate = [[AppWindowDelegate alloc] init];
         [g_window setDelegate:g_windowDelegate];
 
-        g_metalView = [[AppMetalView alloc] initWithFrame:frame];
-        [g_metalView setWantsLayer:YES];
+        // Create a container view that holds toolbar + Metal view + status bar
+        NSView *container = [[NSView alloc] initWithFrame:frame];
 
-        // Set Retina scale so CAMetalLayer produces pixel-resolution drawables
+        // Toolbar (top)
+        NSRect toolbarFrame = NSMakeRect(0, height - TOOLBAR_HEIGHT, width, TOOLBAR_HEIGHT);
+        g_toolbarView = [[ToolbarView alloc] initWithFrame:toolbarFrame];
+        g_toolbarView.autoresizingMask = NSViewWidthSizable | NSViewMinYMargin;
+        [container addSubview:g_toolbarView];
+
+        // Status bar (bottom)
+        NSRect statusFrame = NSMakeRect(0, 0, width, STATUSBAR_HEIGHT);
+        g_statusBarView = [[StatusBarView alloc] initWithFrame:statusFrame];
+        g_statusBarView.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
+        [container addSubview:g_statusBarView];
+
+        // Metal view (center, between toolbar and status bar)
+        float metalH = height - TOOLBAR_HEIGHT - STATUSBAR_HEIGHT;
+        NSRect metalFrame = NSMakeRect(0, STATUSBAR_HEIGHT, width, metalH);
+        g_metalView = [[AppMetalView alloc] initWithFrame:metalFrame];
+        [g_metalView setWantsLayer:YES];
+        g_metalView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+
+        // Set Retina scale and configure Metal layer for blit
         CAMetalLayer *metalLayer = (CAMetalLayer *)[g_metalView layer];
         if (metalLayer) {
+            metalLayer.device = device;
+            metalLayer.pixelFormat = MTLPixelFormatBGRA8Unorm;
             metalLayer.contentsScale = [g_window backingScaleFactor];
         }
 
-        [g_window setContentView:g_metalView];
+        [container addSubview:g_metalView];
 
-        // HUD overlay (semi-transparent text overlay, positioned bottom-left)
-        NSRect hudFrame = NSMakeRect(10, 10, 420, 305);
+        // HUD overlay (bottom-left of Metal view area)
+        NSRect hudFrame = NSMakeRect(10, 10, 420, 380);
         g_hudView = [[HudOverlayView alloc] initWithFrame:hudFrame];
         [g_metalView addSubview:g_hudView];
 
+        [g_window setContentView:container];
         [g_window makeKeyAndOrderFront:nil];
         [NSApp activateIgnoringOtherApps:YES];
 
@@ -1627,9 +1872,13 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
         return false;
     }
 
-    LOG_INFO("Created macOS window %ux%u with CAMetalLayer-backed NSView", width, height);
+    LOG_INFO("Created macOS window (%ux%u) with toolbar + Metal view + status bar", width, height);
     return true;
 }
+
+// ============================================================================
+// macOS event pump
+// ============================================================================
 
 static void PumpMacOSEvents() {
     // Track whether left-click started in content area vs title bar.
@@ -1650,10 +1899,6 @@ static void PumpMacOSEvents() {
                 leftDragInContent = NSMouseInRect(loc, contentRect, NO);
                 if ([event clickCount] >= 2) g_input.resetViewRequested = true;
             } else if (type == NSEventTypeLeftMouseDragged) {
-                // Rotate camera only while left button is physically held AND
-                // the drag started in the content area (not the title bar).
-                // Uses event deltas — no persistent drag state that can get
-                // stuck when the window-resize modal loop swallows MouseUp.
                 if (leftDragInContent && ([NSEvent pressedMouseButtons] & 1)) {
                     g_input.yaw   -= (float)[event deltaX] * 0.005f;
                     g_input.pitch -= (float)[event deltaY] * 0.005f;
@@ -1764,8 +2009,6 @@ static void PumpMacOSEvents() {
         }
 
         // Update window dimensions from actual drawable size (handles resize + fullscreen).
-        // Multiply by backingScaleFactor to get pixel dimensions matching the Vulkan
-        // surface extent (CAMetalLayer uses pixel dimensions on Retina).
         if (g_window != nil) {
             NSSize contentSize = [[g_window contentView] bounds].size;
             CGFloat backingScale = [g_window backingScaleFactor];
@@ -1922,7 +2165,7 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     }
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
-    strncpy(createInfo.applicationInfo.applicationName, "SimCubeExtMacOS", XR_MAX_APPLICATION_NAME_SIZE);
+    strncpy(createInfo.applicationInfo.applicationName, "CubeSharedVkMacOS", XR_MAX_APPLICATION_NAME_SIZE);
     createInfo.applicationInfo.applicationVersion = 1;
     createInfo.applicationInfo.apiVersion = XR_MAKE_VERSION(1, 0, 0);
     createInfo.enabledExtensionCount = (uint32_t)enabledExtensions.size();
@@ -2055,19 +2298,19 @@ static bool CreateVulkanInstance(AppXrSession& xr, VkInstance& vkInstance) {
 
     VkApplicationInfo appInfo = {};
     appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-    appInfo.pApplicationName = "SimCubeExtMacOS";
+    appInfo.pApplicationName = "CubeSharedVkMacOS";
     appInfo.apiVersion = VK_API_VERSION_1_0;
 
-    VkInstanceCreateInfo createInfo = {};
-    createInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
-    createInfo.pApplicationInfo = &appInfo;
-    createInfo.enabledExtensionCount = (uint32_t)extensionPtrs.size();
-    createInfo.ppEnabledExtensionNames = extensionPtrs.data();
+    VkInstanceCreateInfo vkCreateInfo = {};
+    vkCreateInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+    vkCreateInfo.pApplicationInfo = &appInfo;
+    vkCreateInfo.enabledExtensionCount = (uint32_t)extensionPtrs.size();
+    vkCreateInfo.ppEnabledExtensionNames = extensionPtrs.data();
     if (hasPortabilityEnum) {
-        createInfo.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+        vkCreateInfo.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
     }
 
-    VK_CHECK(vkCreateInstance(&createInfo, nullptr, &vkInstance));
+    VK_CHECK(vkCreateInstance(&vkCreateInfo, nullptr, &vkInstance));
     LOG_INFO("Vulkan instance created");
     return true;
 }
@@ -2127,8 +2370,7 @@ static bool GetVulkanDeviceExtensions(AppXrSession& xr,
         return false;
     };
 
-    // Phase 1: Build extensionStorage (all strings) first to avoid
-    // dangling c_str() pointers from vector reallocation.
+    // Phase 1: Build extensionStorage (all strings) first
     extensionStorage.clear();
     size_t start = 0;
     for (size_t i = 0; i <= extStr.size(); i++) {
@@ -2156,7 +2398,6 @@ static bool GetVulkanDeviceExtensions(AppXrSession& xr,
     }
 
     // Phase 2: Build deviceExtensions pointers from final extensionStorage
-    // (safe now since extensionStorage won't be modified again)
     for (const auto& name : extensionStorage) {
         deviceExtensions.push_back(name.c_str());
         LOG_INFO("  Device ext: %s", name.c_str());
@@ -2175,27 +2416,28 @@ static bool CreateVulkanDevice(VkPhysicalDevice physDevice, uint32_t queueFamily
     queueInfo.queueCount = 1;
     queueInfo.pQueuePriorities = &queuePriority;
 
-    VkDeviceCreateInfo createInfo = {};
-    createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-    createInfo.queueCreateInfoCount = 1;
-    createInfo.pQueueCreateInfos = &queueInfo;
-    createInfo.enabledExtensionCount = (uint32_t)deviceExtensions.size();
-    createInfo.ppEnabledExtensionNames = deviceExtensions.data();
+    VkDeviceCreateInfo vkDevCreateInfo = {};
+    vkDevCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+    vkDevCreateInfo.queueCreateInfoCount = 1;
+    vkDevCreateInfo.pQueueCreateInfos = &queueInfo;
+    vkDevCreateInfo.enabledExtensionCount = (uint32_t)deviceExtensions.size();
+    vkDevCreateInfo.ppEnabledExtensionNames = deviceExtensions.data();
 
-    VK_CHECK(vkCreateDevice(physDevice, &createInfo, nullptr, &device));
+    VK_CHECK(vkCreateDevice(physDevice, &vkDevCreateInfo, nullptr, &device));
     vkGetDeviceQueue(device, queueFamilyIndex, 0, &graphicsQueue);
     LOG_INFO("Vulkan device created");
     return true;
 }
 
 /*!
- * Create OpenXR session WITH the cocoa_window_binding extension.
- * Chains XrCocoaWindowBindingCreateInfoEXT into session create info.
+ * Create OpenXR session with Vulkan binding + IOSurface shared texture.
+ * Chains XrCocoaWindowBindingCreateInfoEXT with viewHandle=NULL and
+ * sharedIOSurface=g_ioSurface (instead of passing the NSView).
  */
 static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDevice physDevice,
     VkDevice device, uint32_t queueFamilyIndex)
 {
-    LOG_INFO("Creating OpenXR session with Vulkan binding + macOS window binding...");
+    LOG_INFO("Creating OpenXR session with Vulkan binding + IOSurface shared texture...");
 
     XrGraphicsBindingVulkanKHR vkBinding = {XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR};
     vkBinding.instance = vkInstance;
@@ -2204,16 +2446,20 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
     vkBinding.queueFamilyIndex = queueFamilyIndex;
     vkBinding.queueIndex = 0;
 
-    // Chain the macOS window binding extension — pass our NSView to the runtime
+    // Chain the macOS window binding extension — IOSurface shared texture mode
+    // viewHandle=NULL tells the runtime NOT to acquire the NSView's CAMetalLayer.
+    // sharedIOSurface points to our IOSurface for zero-copy texture sharing.
     XrCocoaWindowBindingCreateInfoEXT macosBinding = {};
     macosBinding.type = XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_EXT;
     macosBinding.next = nullptr;
-    macosBinding.viewHandle = (__bridge void *)g_metalView;
+    macosBinding.viewHandle = NULL;
+    macosBinding.sharedIOSurface = (void *)g_ioSurface;
 
     // Chain: sessionInfo -> vkBinding -> macosBinding
     if (xr.hasCocoaWindowBinding) {
         vkBinding.next = &macosBinding;
-        LOG_INFO("Chaining XR_EXT_cocoa_window_binding with NSView %p", macosBinding.viewHandle);
+        LOG_INFO("Chaining XR_EXT_cocoa_window_binding with IOSurface %p (viewHandle=NULL)",
+                 macosBinding.sharedIOSurface);
     }
 
     XrSessionCreateInfo sessionInfo = {XR_TYPE_SESSION_CREATE_INFO};
@@ -2221,7 +2467,7 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
     sessionInfo.systemId = xr.systemId;
 
     XR_CHECK(xrCreateSession(xr.instance, &sessionInfo, &xr.session));
-    LOG_INFO("Session created%s", xr.hasCocoaWindowBinding ? " (with external window)" : "");
+    LOG_INFO("Session created%s", xr.hasCocoaWindowBinding ? " (with IOSurface shared texture)" : "");
 
     return true;
 }
@@ -2404,7 +2650,7 @@ int main() {
     signal(SIGINT, SignalHandler);
     signal(SIGTERM, SignalHandler);
 
-    LOG_INFO("=== Sim Cube OpenXR + External macOS Window ===");
+    LOG_INFO("=== Vulkan Cube OpenXR + IOSurface Shared Texture ===");
 
     // Initialize output mode from env var (matches runtime's parsing).
     {
@@ -2419,16 +2665,23 @@ int main() {
         }
     }
 
-    // Step 1: Create the macOS window FIRST (app owns it)
+    // Step 1: Initialize Metal blit device (needed for window creation and IOSurface)
+    g_blitDevice = MTLCreateSystemDefaultDevice();
+    if (!g_blitDevice) {
+        LOG_ERROR("Failed to create Metal device for blit pipeline");
+        return 1;
+    }
+    LOG_INFO("Metal blit device: %s", [[g_blitDevice name] UTF8String]);
+
+    // Step 2: Create the macOS window (app owns it, with toolbar/statusbar)
     g_windowW = 1280;
     g_windowH = 720;
-    if (!CreateMacOSWindow(g_windowW, g_windowH)) {
+    if (!CreateMacOSWindow(g_windowW, g_windowH, g_blitDevice)) {
         LOG_ERROR("Failed to create macOS window");
         return 1;
     }
 
     // Update g_windowW/H to actual drawable pixel dimensions (Retina-aware).
-    // The initial 1280x720 are in points; the Vulkan surface uses pixel dimensions.
     {
         NSSize contentSize = [[g_window contentView] bounds].size;
         CGFloat backingScale = [g_window backingScaleFactor];
@@ -2438,7 +2691,7 @@ int main() {
                  g_windowW, g_windowH, contentSize.width, contentSize.height, (float)backingScale);
     }
 
-    // Step 2: Initialize OpenXR
+    // Step 3: Initialize OpenXR
     AppXrSession xr = {};
     if (!InitializeOpenXR(xr)) {
         LOG_ERROR("OpenXR initialization failed");
@@ -2450,7 +2703,7 @@ int main() {
         return 1;
     }
 
-    // Step 3: Create Vulkan instance + device
+    // Step 4: Create Vulkan instance + device
     VkInstance vkInstance = VK_NULL_HANDLE;
     if (!CreateVulkanInstance(xr, vkInstance)) {
         CleanupOpenXR(xr);
@@ -2486,7 +2739,30 @@ int main() {
         return 1;
     }
 
-    // Step 4: Create OpenXR session WITH the external window binding
+    // Step 5: Create IOSurface for shared texture
+    // Use display pixel dimensions if available, otherwise use window dimensions
+    g_ioSurfaceWidth = xr.displayPixelWidth > 0 ? xr.displayPixelWidth : g_windowW;
+    g_ioSurfaceHeight = xr.displayPixelHeight > 0 ? xr.displayPixelHeight : g_windowH;
+    LOG_INFO("IOSurface dimensions: %ux%u", g_ioSurfaceWidth, g_ioSurfaceHeight);
+
+    if (!CreateIOSurface(g_ioSurfaceWidth, g_ioSurfaceHeight)) {
+        LOG_ERROR("Failed to create IOSurface");
+        vkDestroyDevice(vkDevice, nullptr);
+        vkDestroyInstance(vkInstance, nullptr);
+        CleanupOpenXR(xr);
+        return 1;
+    }
+
+    // Step 6: Initialize Metal blit pipeline
+    if (!InitBlitPipeline()) {
+        LOG_ERROR("Failed to initialize Metal blit pipeline");
+        vkDestroyDevice(vkDevice, nullptr);
+        vkDestroyInstance(vkInstance, nullptr);
+        CleanupOpenXR(xr);
+        return 1;
+    }
+
+    // Step 7: Create OpenXR session WITH IOSurface shared texture binding
     if (!CreateSession(xr, vkInstance, physDevice, vkDevice, queueFamilyIndex)) {
         vkDestroyDevice(vkDevice, nullptr);
         vkDestroyInstance(vkInstance, nullptr);
@@ -2501,7 +2777,7 @@ int main() {
         return 1;
     }
 
-    // Step 5: Enumerate swapchain images + init renderer
+    // Step 8: Enumerate swapchain images + init renderer
     std::vector<XrSwapchainImageVulkanKHR> swapchainImages;
     {
         uint32_t count = xr.swapchain.imageCount;
@@ -2542,23 +2818,6 @@ int main() {
 
     LOG_INFO("=== Entering main loop ===");
     LOG_INFO("Controls: WASD=move, Mouse=look, Scroll=zoom, Space=reset, V=2D/3D, 1/2/3=SBS/anaglyph/blend, TAB=HUD, Cmd+Ctrl+F=fullscreen, ESC=quit");
-    LOG_INFO("          V=2D/3D, Tab=HUD, 1/2/3=SBS/Ana/Blend, ESC=quit");
-
-    // Known issue: during window resize, [NSApp sendEvent:] enters a modal
-    // tracking loop that blocks this while loop, freezing animation and frame
-    // submission until the mouse is released. Two approaches were tried:
-    //
-    //  1. CFRunLoopTimer on kCFRunLoopCommonModes — fires during resize
-    //     tracking but caused "Unknown failure" from the OpenXR loader
-    //     (C++ exception escaping from the Monado runtime).
-    //
-    //  2. Dedicated render pthread — same "Unknown failure". The Monado
-    //     runtime throws when OpenXR frame-loop calls (xrWaitFrame /
-    //     xrBeginFrame / xrEndFrame) run on a thread other than the one
-    //     that created the session. Even starting the session on the main
-    //     thread first did not help.
-    //
-    // The simple while-loop works reliably; resize just pauses animation.
 
     auto lastTime = std::chrono::high_resolution_clock::now();
 
@@ -2586,7 +2845,7 @@ int main() {
                 XrDisplayModeEXT mode = g_input.displayMode3D
                     ? XR_DISPLAY_MODE_3D_EXT : XR_DISPLAY_MODE_2D_EXT;
                 XrResult modeResult = xr.pfnRequestDisplayModeEXT(xr.session, mode);
-                LOG_INFO("Display mode → %s (%s)", g_input.displayMode3D ? "3D" : "2D",
+                LOG_INFO("Display mode -> %s (%s)", g_input.displayMode3D ? "3D" : "2D",
                     XR_SUCCEEDED(modeResult) ? "OK" : "failed");
             }
         }
@@ -2598,7 +2857,7 @@ int main() {
                 XrEyeTrackingModeEXT newMode = (xr.activeEyeTrackingMode == XR_EYE_TRACKING_MODE_SMOOTH_EXT)
                     ? XR_EYE_TRACKING_MODE_RAW_EXT : XR_EYE_TRACKING_MODE_SMOOTH_EXT;
                 XrResult etResult = xr.pfnRequestEyeTrackingModeEXT(xr.session, newMode);
-                LOG_INFO("Eye tracking mode → %s (%s)",
+                LOG_INFO("Eye tracking mode -> %s (%s)",
                     newMode == XR_EYE_TRACKING_MODE_RAW_EXT ? "RAW" : "SMOOTH",
                     XR_SUCCEEDED(etResult) ? "OK" : "unsupported");
             }
@@ -2610,7 +2869,7 @@ int main() {
             if (xr.pfnRequestDisplayRenderingModeEXT && xr.session != XR_NULL_HANDLE) {
                 const char *modeNames[] = {"SBS", "Anaglyph", "Blend"};
                 XrResult res = xr.pfnRequestDisplayRenderingModeEXT(xr.session, (uint32_t)g_currentOutputMode);
-                LOG_INFO("Rendering mode → %s (%s)",
+                LOG_INFO("Rendering mode -> %s (%s)",
                     modeNames[g_currentOutputMode],
                     XR_SUCCEEDED(res) ? "OK" : "failed");
             }
@@ -2676,9 +2935,6 @@ int main() {
                         XrVector3f nominalViewer = {xr.nominalViewerX, xr.nominalViewerY, xr.nominalViewerZ};
 
                         // Compute render dims for SBS single-swapchain.
-                        // Scale depends on current output mode (may change at runtime):
-                        //   SBS (0):          scaleX=0.5, scaleY=1.0
-                        //   Anaglyph/Blend:   scaleX=0.5, scaleY=0.5
                         float scaleX = 0.5f;
                         float scaleY = (g_currentOutputMode == 0) ? 1.0f : 0.5f;
                         xr.recommendedViewScaleX = scaleX;
@@ -2705,7 +2961,6 @@ int main() {
                         Display3DStereoView stereoViews[2];
                         bool hasKooima = (xr.displayWidthM > 0 && xr.displayHeightM > 0);
                         if (hasKooima) {
-                            // Compute viewport-scaled screen dimensions in meters
                             float dispPxW = xr.displayPixelWidth > 0 ? (float)xr.displayPixelWidth : (float)xr.swapchain.width;
                             float dispPxH = xr.displayPixelHeight > 0 ? (float)xr.displayPixelHeight : (float)xr.swapchain.height;
                             float pxSizeX = xr.displayWidthM / dispPxW;
@@ -2717,8 +2972,7 @@ int main() {
                             float vs = minDisp / minWin;
                             float screenWidthM  = winW_m * vs;
                             float screenHeightM = winH_m * vs;
-                            // Halve screenW only for SBS mode (each eye sees
-                            // half the display). Anaglyph/blend: full width.
+
                             bool sbsMode = g_input.displayMode3D && g_currentOutputMode == 0;
                             float baseScreenW = sbsMode ? screenWidthM / 2.0f : screenWidthM;
 
@@ -2727,7 +2981,6 @@ int main() {
                             screen.height_m = screenHeightM;
 
                             if (g_input.cameraMode) {
-                                // Camera-centric path
                                 Camera3DTunables camTunables;
                                 camTunables.ipd_factor = g_input.stereo.ipdFactor;
                                 camTunables.parallax_factor = g_input.stereo.parallaxFactor;
@@ -2740,7 +2993,6 @@ int main() {
                                     &screen, &camTunables, &cameraPose,
                                     0.01f, 100.0f, &camViews[0], &camViews[1]);
 
-                                // Copy into Display3DStereoView for uniform downstream rendering
                                 for (int i = 0; i < 2; i++) {
                                     memcpy(stereoViews[i].view_matrix, camViews[i].view_matrix, sizeof(float) * 16);
                                     memcpy(stereoViews[i].projection_matrix, camViews[i].projection_matrix, sizeof(float) * 16);
@@ -2748,7 +3000,6 @@ int main() {
                                     stereoViews[i].eye_world = camViews[i].eye_world;
                                 }
                             } else {
-                                // Display-centric path
                                 Display3DTunables tunables;
                                 tunables.ipd_factor = g_input.stereo.ipdFactor;
                                 tunables.parallax_factor = g_input.stereo.parallaxFactor;
@@ -2772,7 +3023,6 @@ int main() {
                                     memcpy(eyeParams[eye].viewMat, stereoViews[eye].view_matrix, sizeof(float) * 16);
                                     memcpy(eyeParams[eye].projMat, stereoViews[eye].projection_matrix, sizeof(float) * 16);
                                     submitFov = stereoViews[eye].fov;
-                                    // Update view pose for layer submission
                                     views[eye].pose.position = stereoViews[eye].eye_world;
                                     views[eye].pose.orientation = cameraPose.orientation;
                                 } else {
@@ -2815,6 +3065,15 @@ int main() {
                     endInfo.layers = nullptr;
                     xrEndFrame(xr.session, &endInfo);
                 }
+
+                // After xrEndFrame, the runtime has composited into the IOSurface.
+                // Blit the IOSurface content to our CAMetalLayer drawable.
+                if (rendered) {
+                    CAMetalLayer *metalLayer = (CAMetalLayer *)g_metalView.layer;
+                    if (metalLayer) {
+                        BlitIOSurfaceToDrawable(metalLayer);
+                    }
+                }
             }
         } else {
             usleep(100000);
@@ -2830,7 +3089,6 @@ int main() {
                     const char *outputModeNames[] = {"SBS", "Anaglyph", "Blend"};
                     const char *outputModeName = (g_currentOutputMode >= 0 && g_currentOutputMode <= 2)
                         ? outputModeNames[g_currentOutputMode] : "?";
-                    // Session state name lookup
                     const char *sessionStateNames[] = {
                         "UNKNOWN", "IDLE", "READY", "SYNCHRONIZED",
                         "VISIBLE", "FOCUSED", "STOPPING", "LOSS_PENDING", "EXITING"};
@@ -2867,7 +3125,7 @@ int main() {
                     NSString *text = [NSString stringWithFormat:
                         @"%s\n"
                         "Session: %s\n"
-                        "XR_EXT_cocoa_window_binding: %s\n"
+                        "IOSurface: %ux%u (shared texture)\n"
                         "Mode: %s%s  Output: %s\n"
                         "Kooima: %s\n"
                         "FPS: %.0f  (%.1f ms)\n"
@@ -2890,7 +3148,7 @@ int main() {
                         "C=Mode  V=2D/3D  T=EyeMode  1/2/3=Output  Tab=HUD  ESC=Quit",
                         xr.systemName,
                         sessionStateName,
-                        xr.hasCocoaWindowBinding ? "ACTIVE" : "NOT AVAILABLE",
+                        g_ioSurfaceWidth, g_ioSurfaceHeight,
                         g_input.displayMode3D ? "3D (Stereo)" : "2D (Mono)",
                         xr.supportsDisplayModeSwitch ? "" : " [no switch]",
                         outputModeName,
@@ -2920,6 +3178,17 @@ int main() {
                 } else if (g_hudView != nil) {
                     [g_hudView setHidden:YES];
                 }
+
+                // Update status bar with IOSurface info
+                if (g_statusBarView != nil) {
+                    NSString *statusText = [NSString stringWithFormat:
+                        @"IOSurface: %ux%u  |  Eye L: (%.3f, %.3f, %.3f)  R: (%.3f, %.3f, %.3f)",
+                        g_ioSurfaceWidth, g_ioSurfaceHeight,
+                        xr.leftEyeX, xr.leftEyeY, xr.leftEyeZ,
+                        xr.rightEyeX, xr.rightEyeY, xr.rightEyeZ];
+                    g_statusBarView.statusText = statusText;
+                    [g_statusBarView setNeedsDisplay:YES];
+                }
             }
         }
     }
@@ -2940,6 +3209,17 @@ int main() {
     CleanupOpenXR(xr);
     vkDestroyDevice(vkDevice, nullptr);
     vkDestroyInstance(vkInstance, nullptr);
+
+    // Cleanup IOSurface and Metal blit resources
+    g_ioSurfaceReadTexture = nil;
+    g_blitPipeline = nil;
+    g_blitSampler = nil;
+    g_blitQueue = nil;
+    g_blitDevice = nil;
+    if (g_ioSurface) {
+        CFRelease(g_ioSurface);
+        g_ioSurface = NULL;
+    }
 
     LOG_INFO("Application shutdown complete");
     return 0;

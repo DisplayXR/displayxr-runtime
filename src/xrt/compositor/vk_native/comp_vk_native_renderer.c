@@ -45,13 +45,17 @@ struct comp_vk_native_renderer
 	//! Memory for stereo texture.
 	VkDeviceMemory stereo_memory;
 
-	//! Full image view for the stereo texture.
+	//! Full image view for the stereo texture (used for SBS fallback blit).
 	VkImageView stereo_view;
 
-	//! Left eye image view.
-	VkImageView left_view;
+	//! Per-eye images for display processors that expect separate views.
+	VkImage left_image;
+	VkImage right_image;
+	VkDeviceMemory left_memory;
+	VkDeviceMemory right_memory;
 
-	//! Right eye image view.
+	//! Per-eye image views (each is view_width x texture_height).
+	VkImageView left_view;
 	VkImageView right_view;
 
 	//! Width per view.
@@ -91,6 +95,22 @@ destroy_stereo_resources(struct comp_vk_native_renderer *r)
 	if (r->stereo_memory != VK_NULL_HANDLE) {
 		vk->vkFreeMemory(vk->device, r->stereo_memory, NULL);
 		r->stereo_memory = VK_NULL_HANDLE;
+	}
+	if (r->left_image != VK_NULL_HANDLE) {
+		vk->vkDestroyImage(vk->device, r->left_image, NULL);
+		r->left_image = VK_NULL_HANDLE;
+	}
+	if (r->right_image != VK_NULL_HANDLE) {
+		vk->vkDestroyImage(vk->device, r->right_image, NULL);
+		r->right_image = VK_NULL_HANDLE;
+	}
+	if (r->left_memory != VK_NULL_HANDLE) {
+		vk->vkFreeMemory(vk->device, r->left_memory, NULL);
+		r->left_memory = VK_NULL_HANDLE;
+	}
+	if (r->right_memory != VK_NULL_HANDLE) {
+		vk->vkFreeMemory(vk->device, r->right_memory, NULL);
+		r->right_memory = VK_NULL_HANDLE;
 	}
 }
 
@@ -184,17 +204,61 @@ create_stereo_resources(struct comp_vk_native_renderer *r,
 		return XRT_ERROR_VULKAN;
 	}
 
-	res = vk->vkCreateImageView(vk->device, &view_ci, NULL, &r->left_view);
-	if (res != VK_SUCCESS) {
-		U_LOG_E("Failed to create left view: %d", res);
-		return XRT_ERROR_VULKAN;
+	// Create separate per-eye images for display processors that expect separate views.
+	// VkImageView can't select a horizontal subregion of a 2D image, so we need
+	// separate images that get blitted from the SBS stereo texture.
+	VkImageCreateInfo eye_image_ci = image_ci;
+	eye_image_ci.extent.width = view_width;
+	eye_image_ci.extent.height = r->texture_height;
+
+	VkImage eye_images[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+	VkDeviceMemory eye_memories[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+	VkImageView eye_views[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+
+	for (int eye = 0; eye < 2; eye++) {
+		res = vk->vkCreateImage(vk->device, &eye_image_ci, NULL, &eye_images[eye]);
+		if (res != VK_SUCCESS) {
+			U_LOG_E("Failed to create eye %d image: %d", eye, res);
+			return XRT_ERROR_VULKAN;
+		}
+
+		VkMemoryRequirements eye_mem_reqs;
+		vk->vkGetImageMemoryRequirements(vk->device, eye_images[eye], &eye_mem_reqs);
+
+		VkMemoryAllocateInfo eye_alloc = {
+		    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+		    .allocationSize = eye_mem_reqs.size,
+		    .memoryTypeIndex = mem_type_index,
+		};
+
+		res = vk->vkAllocateMemory(vk->device, &eye_alloc, NULL, &eye_memories[eye]);
+		if (res != VK_SUCCESS) {
+			U_LOG_E("Failed to allocate eye %d memory: %d", eye, res);
+			return XRT_ERROR_VULKAN;
+		}
+
+		res = vk->vkBindImageMemory(vk->device, eye_images[eye], eye_memories[eye], 0);
+		if (res != VK_SUCCESS) {
+			U_LOG_E("Failed to bind eye %d memory: %d", eye, res);
+			return XRT_ERROR_VULKAN;
+		}
+
+		VkImageViewCreateInfo eye_view_ci = view_ci;
+		eye_view_ci.image = eye_images[eye];
+
+		res = vk->vkCreateImageView(vk->device, &eye_view_ci, NULL, &eye_views[eye]);
+		if (res != VK_SUCCESS) {
+			U_LOG_E("Failed to create eye %d view: %d", eye, res);
+			return XRT_ERROR_VULKAN;
+		}
 	}
 
-	res = vk->vkCreateImageView(vk->device, &view_ci, NULL, &r->right_view);
-	if (res != VK_SUCCESS) {
-		U_LOG_E("Failed to create right view: %d", res);
-		return XRT_ERROR_VULKAN;
-	}
+	r->left_image = eye_images[0];
+	r->right_image = eye_images[1];
+	r->left_memory = eye_memories[0];
+	r->right_memory = eye_memories[1];
+	r->left_view = eye_views[0];
+	r->right_view = eye_views[1];
 
 	U_LOG_I("Created stereo texture: %ux%u (view %ux%u)", stereo_width, r->texture_height,
 	        view_width, view_height);
@@ -432,8 +496,71 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 		}
 	}
 
-	// Transition stereo image to shader read for display processor
+	// Transition stereo image to transfer src, then blit each half to per-eye images
 	cmd_image_barrier(vk, cmd, r->stereo_image,
+	                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	                   VK_ACCESS_TRANSFER_WRITE_BIT,
+	                   VK_ACCESS_TRANSFER_READ_BIT,
+	                   VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                   VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+	// Transition per-eye images to transfer dst
+	cmd_image_barrier(vk, cmd, r->left_image,
+	                   VK_IMAGE_LAYOUT_UNDEFINED,
+	                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	                   0,
+	                   VK_ACCESS_TRANSFER_WRITE_BIT,
+	                   VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+	                   VK_PIPELINE_STAGE_TRANSFER_BIT);
+	cmd_image_barrier(vk, cmd, r->right_image,
+	                   VK_IMAGE_LAYOUT_UNDEFINED,
+	                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	                   0,
+	                   VK_ACCESS_TRANSFER_WRITE_BIT,
+	                   VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+	                   VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+	// Blit left half of stereo texture to left eye image
+	VkImageBlit left_blit = {
+	    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .srcOffsets = {{0, 0, 0}, {(int32_t)r->view_width, (int32_t)r->texture_height, 1}},
+	    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .dstOffsets = {{0, 0, 0}, {(int32_t)r->view_width, (int32_t)r->texture_height, 1}},
+	};
+	vk->vkCmdBlitImage(cmd,
+	                    r->stereo_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	                    r->left_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	                    1, &left_blit, VK_FILTER_NEAREST);
+
+	// Blit right half of stereo texture to right eye image
+	VkImageBlit right_blit = {
+	    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .srcOffsets = {{(int32_t)r->view_width, 0, 0}, {(int32_t)(r->view_width * 2), (int32_t)r->texture_height, 1}},
+	    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .dstOffsets = {{0, 0, 0}, {(int32_t)r->view_width, (int32_t)r->texture_height, 1}},
+	};
+	vk->vkCmdBlitImage(cmd,
+	                    r->stereo_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	                    r->right_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	                    1, &right_blit, VK_FILTER_NEAREST);
+
+	// Transition all images to shader read for display processor
+	cmd_image_barrier(vk, cmd, r->stereo_image,
+	                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	                   VK_ACCESS_TRANSFER_READ_BIT,
+	                   VK_ACCESS_SHADER_READ_BIT,
+	                   VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                   VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+	cmd_image_barrier(vk, cmd, r->left_image,
+	                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	                   VK_ACCESS_TRANSFER_WRITE_BIT,
+	                   VK_ACCESS_SHADER_READ_BIT,
+	                   VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                   VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+	cmd_image_barrier(vk, cmd, r->right_image,
 	                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 	                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
 	                   VK_ACCESS_TRANSFER_WRITE_BIT,

@@ -34,7 +34,7 @@ using namespace DirectX;
 static const char* APP_NAME = "cube_ext_vk";
 
 static const wchar_t* WINDOW_CLASS = L"SRCubeOpenXRExtVKClass";
-static const wchar_t* WINDOW_TITLE = L"SR Cube OpenXR Ext Vulkan (Press ESC to exit)";
+static const wchar_t* WINDOW_TITLE = L"Vulkan Cube \u2014 VK Native Compositor (External Window)";
 
 // HUD overlay fractions: WIDTH_FRACTION anchors how wide the HUD appears on screen;
 // HEIGHT_FRACTION sets the HUD texture pixel height (aspect ratio preserved dynamically).

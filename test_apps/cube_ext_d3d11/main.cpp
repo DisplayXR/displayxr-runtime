@@ -36,7 +36,7 @@ static const char* APP_NAME = "cube_ext_d3d11";
 
 // Window settings
 static const wchar_t* WINDOW_CLASS = L"SRCubeOpenXRExtClass";
-static const wchar_t* WINDOW_TITLE = L"SR Cube OpenXR Ext - XR_EXT_win32_window_binding (Press ESC to exit)";
+static const wchar_t* WINDOW_TITLE = L"D3D11 Cube \u2014 D3D11 Native Compositor (External Window)";
 
 // Global state (single-threaded — all accessed from the main thread only)
 static InputState g_inputState;

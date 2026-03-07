@@ -1995,9 +1995,54 @@ oxr_session_create_impl(struct oxr_logger *log,
 
 		OXR_SESSION_ALLOCATE_AND_INIT(log, sys, OXR_SESSION_GRAPHICS_EXT_VULKAN, *out_session);
 
+#if defined(XRT_HAVE_VK_NATIVE_COMPOSITOR)
+		// Direct Vulkan path (Windows + macOS via MoltenVK).
+		// On macOS, this takes priority over the Metal compositor path
+		// unless shared textures are requested or env var disables it.
+		if (oxr_vk_native_compositor_supported(sys, xsi->external_window_handle)) {
+			void *window_handle = xsi->external_window_handle;
+			void *shared_texture_handle = xsi->shared_texture_handle;
+
+#ifdef XRT_OS_MACOS
+			// On macOS, extract from cocoa_window_binding
+			const XrCocoaWindowBindingCreateInfoEXT *cocoa_binding = OXR_GET_INPUT_FROM_CHAIN(
+			    createInfo, XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_EXT, XrCocoaWindowBindingCreateInfoEXT);
+			if (cocoa_binding != NULL) {
+				if (cocoa_binding->viewHandle != NULL) {
+					window_handle = (void *)cocoa_binding->viewHandle;
+				}
+				if (cocoa_binding->sharedIOSurface != NULL) {
+					shared_texture_handle = (void *)cocoa_binding->sharedIOSurface;
+				}
+			}
+			// If shared texture requested on macOS, fall through to Metal path
+			// (VK_EXT_external_memory_metal import not yet supported)
+			if (shared_texture_handle != NULL) {
+				goto try_metal_path;
+			}
+#endif
+
+			xrt_result_t xret = xrt_system_create_session(
+			    sys->xsys, xsi, &(*out_session)->xs, NULL);
+			if (xret == XRT_ERROR_MULTI_SESSION_NOT_IMPLEMENTED) {
+				return oxr_error(log, XR_ERROR_LIMIT_REACHED,
+				                 "Per instance multi-session not supported.");
+			}
+			if (xret != XRT_SUCCESS) {
+				return oxr_error(log, XR_ERROR_RUNTIME_FAILURE,
+				                 "Failed to create xrt_session! '%i'", xret);
+			}
+			return oxr_session_populate_vk_native(
+			    log, sys, vulkan, window_handle, shared_texture_handle, *out_session);
+		}
+#endif
+
 #if defined(XRT_HAVE_METAL_NATIVE_COMPOSITOR)
-		// On macOS, route Vulkan apps through Metal native compositor for
-		// presentation. The null compositor has no display output.
+#if defined(XRT_HAVE_VK_NATIVE_COMPOSITOR) && defined(XRT_OS_MACOS)
+	try_metal_path:
+#endif
+		// Fallback: route Vulkan apps through Metal native compositor
+		// (cross-API interop via MoltenVK).
 		if (oxr_metal_native_compositor_supported(sys, xsi->external_window_handle)) {
 			xrt_result_t xret = xrt_system_create_session(
 			    sys->xsys, xsi, &(*out_session)->xs, NULL);
@@ -2028,28 +2073,6 @@ oxr_session_create_impl(struct oxr_logger *log,
 				}
 			}
 			return ret;
-		}
-#endif
-
-#if defined(XRT_HAVE_VK_NATIVE_COMPOSITOR)
-		// On Windows, Vulkan apps can use the VK native compositor
-		// for direct rendering without the multi-compositor.
-		if (oxr_vk_native_compositor_supported(sys, xsi->external_window_handle)) {
-			xrt_result_t xret = xrt_system_create_session(
-			    sys->xsys, xsi, &(*out_session)->xs, NULL);
-			if (xret == XRT_ERROR_MULTI_SESSION_NOT_IMPLEMENTED) {
-				return oxr_error(log, XR_ERROR_LIMIT_REACHED,
-				                 "Per instance multi-session not supported.");
-			}
-			if (xret != XRT_SUCCESS) {
-				return oxr_error(log, XR_ERROR_RUNTIME_FAILURE,
-				                 "Failed to create xrt_session! '%i'", xret);
-			}
-			// Extract window handle from win32_window_binding if present
-			void *window_handle = xsi->external_window_handle;
-			void *shared_texture_handle = xsi->shared_texture_handle;
-			return oxr_session_populate_vk_native(
-			    log, sys, vulkan, window_handle, shared_texture_handle, *out_session);
 		}
 #endif
 

@@ -971,7 +971,7 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height, id<MTLDevice> dev
                                                  backing:NSBackingStoreBuffered
                                                    defer:NO];
 
-        [g_window setTitle:@"Metal Cube OpenXR (IOSurface Shared Texture)"];
+        [g_window setTitle:@"Metal Cube — Metal Native Compositor (IOSurface Shared)"];
         [g_window setAcceptsMouseMovedEvents:YES];
         [g_window setReleasedWhenClosed:NO];
 

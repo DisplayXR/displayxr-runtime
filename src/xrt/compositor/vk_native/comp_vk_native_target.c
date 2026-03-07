@@ -21,6 +21,10 @@
 #include <vulkan/vulkan_win32.h>
 #endif
 
+#ifdef XRT_OS_MACOS
+#include <vulkan/vulkan_metal.h>
+#endif
+
 #define MAX_TARGET_IMAGES 4
 
 /*!
@@ -255,8 +259,49 @@ comp_vk_native_target_create(struct comp_vk_native_compositor *c,
 		free(target);
 		return XRT_ERROR_VULKAN;
 	}
+#elif defined(XRT_OS_MACOS)
+	// Create Metal surface via VK_EXT_metal_surface
+	// hwnd parameter is actually a CAMetalLayer* on macOS
+	// Try vk_bundle's pre-loaded function pointer first,
+	// fall back to runtime lookup via vkGetInstanceProcAddr
+	PFN_vkCreateMetalSurfaceEXT pfnCreateMetalSurface = vk->vkCreateMetalSurfaceEXT;
+	if (pfnCreateMetalSurface == NULL) {
+		pfnCreateMetalSurface = (PFN_vkCreateMetalSurfaceEXT)
+		    vk->vkGetInstanceProcAddr(vk->instance, "vkCreateMetalSurfaceEXT");
+	}
+	if (pfnCreateMetalSurface == NULL) {
+		U_LOG_E("vkCreateMetalSurfaceEXT not available — VK_EXT_metal_surface must be enabled");
+		free(target);
+		return XRT_ERROR_VULKAN;
+	}
+
+	U_LOG_I("Creating Metal surface from CAMetalLayer %p", hwnd);
+
+	VkMetalSurfaceCreateInfoEXT surface_ci = {
+	    .sType = VK_STRUCTURE_TYPE_METAL_SURFACE_CREATE_INFO_EXT,
+	    .pLayer = (const CAMetalLayer *)hwnd,
+	};
+
+	VkResult res = pfnCreateMetalSurface(vk->instance, &surface_ci, NULL, &target->surface);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("Failed to create Metal surface: %d", res);
+		free(target);
+		return XRT_ERROR_VULKAN;
+	}
+
+	// Check present support
+	VkBool32 present_support = VK_FALSE;
+	vk->vkGetPhysicalDeviceSurfaceSupportKHR(vk->physical_device,
+	                                          queue_family_index,
+	                                          target->surface, &present_support);
+	if (!present_support) {
+		U_LOG_E("Queue family does not support presentation to Metal surface");
+		vk->vkDestroySurfaceKHR(vk->instance, target->surface, NULL);
+		free(target);
+		return XRT_ERROR_VULKAN;
+	}
 #else
-	U_LOG_E("VK native target only supports Win32 surfaces");
+	U_LOG_E("VK native target: no supported surface type on this platform");
 	free(target);
 	return XRT_ERROR_DEVICE_CREATION_FAILED;
 #endif
@@ -335,6 +380,9 @@ xrt_result_t
 comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *out_index)
 {
 	struct vk_bundle *vk = target->vk;
+
+	// Use the semaphore for acquire, then do a dummy submit that waits on it
+	// to ensure the image is actually available before the compositor renders.
 	VkResult res = vk->vkAcquireNextImageKHR(vk->device, target->swapchain,
 	                                          UINT64_MAX, target->image_available,
 	                                          VK_NULL_HANDLE, &target->current_index);
@@ -347,6 +395,18 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 		return XRT_ERROR_VULKAN;
 	}
 
+	// Wait for the acquired image to be available by doing a dummy submit
+	// that waits on the image_available semaphore.
+	VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+	VkSubmitInfo wait_submit = {
+	    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+	    .waitSemaphoreCount = 1,
+	    .pWaitSemaphores = &target->image_available,
+	    .pWaitDstStageMask = &wait_stage,
+	};
+	vk->vkQueueSubmit(vk->main_queue->queue, 1, &wait_submit, VK_NULL_HANDLE);
+	vk->vkQueueWaitIdle(vk->main_queue->queue);
+
 	*out_index = target->current_index;
 	return XRT_SUCCESS;
 }
@@ -355,10 +415,13 @@ xrt_result_t
 comp_vk_native_target_present(struct comp_vk_native_target *target)
 {
 	struct vk_bundle *vk = target->vk;
+
+	// No semaphore wait needed — the compositor calls vkQueueWaitIdle
+	// after all rendering commands before presenting.
 	VkPresentInfoKHR present_info = {
 	    .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
-	    .waitSemaphoreCount = 1,
-	    .pWaitSemaphores = &target->render_finished,
+	    .waitSemaphoreCount = 0,
+	    .pWaitSemaphores = NULL,
 	    .swapchainCount = 1,
 	    .pSwapchains = &target->swapchain,
 	    .pImageIndices = &target->current_index,

@@ -390,7 +390,7 @@ window_thread_func(LPVOID param)
 	U_LOG_W("D3D11 window thread: Creating window at (%d, %d) size %ux%u",
 	        (int)rc.left, (int)rc.top, w->requested_width, w->requested_height);
 
-	HWND hwnd = CreateWindowExW(0, szWindowClass, L"Monado D3D11", WS_OVERLAPPEDWINDOW, rc.left, rc.top,
+	HWND hwnd = CreateWindowExW(0, szWindowClass, L"Monado OpenXR \u2014 D3D11 Native Compositor", WS_OVERLAPPEDWINDOW, rc.left, rc.top,
 	                            rc.right - rc.left, rc.bottom - rc.top, NULL, NULL, w->instance, NULL);
 
 	if (hwnd == NULL) {

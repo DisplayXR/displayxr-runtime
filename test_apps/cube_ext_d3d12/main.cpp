@@ -43,7 +43,7 @@ static const uint32_t HUD_PIXEL_HEIGHT = 560;
 static const float HUD_WIDTH_FRACTION = 0.30f;
 
 static const wchar_t* WINDOW_CLASS = L"SRCubeOpenXRExtD3D12Class";
-static const wchar_t* WINDOW_TITLE = L"SR Cube OpenXR Ext D3D12 (Press ESC to exit)";
+static const wchar_t* WINDOW_TITLE = L"D3D12 Cube \u2014 D3D12 Native Compositor (External Window)";
 
 // Global state (shared between main thread and render thread)
 static InputState g_inputState;

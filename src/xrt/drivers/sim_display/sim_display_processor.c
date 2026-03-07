@@ -480,6 +480,13 @@ sim_dp_get_predicted_eye_positions(struct xrt_display_processor *xdp, struct xrt
 	return true;
 }
 
+static VkRenderPass
+sim_dp_get_render_pass(struct xrt_display_processor *xdp)
+{
+	struct sim_display_processor *sdp = sim_display_processor(xdp);
+	return sdp->render_pass;
+}
+
 static void
 sim_dp_destroy(struct xrt_display_processor *xdp)
 {
@@ -536,6 +543,7 @@ sim_display_processor_create(enum sim_display_output_mode mode,
 	}
 
 	sdp->base.destroy = sim_dp_destroy;
+	sdp->base.get_render_pass = sim_dp_get_render_pass;
 	sdp->base.get_predicted_eye_positions = sim_dp_get_predicted_eye_positions;
 
 	// Nominal viewer parameters (same defaults as sim_display_hmd_create)

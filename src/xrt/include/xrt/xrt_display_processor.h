@@ -30,9 +30,11 @@ typedef struct VkCommandBuffer_T *VkCommandBuffer;
 #ifdef XRT_64_BIT
 typedef struct VkImageView_T *VkImageView;
 typedef struct VkFramebuffer_T *VkFramebuffer;
+typedef struct VkRenderPass_T *VkRenderPass;
 #else
 typedef uint64_t VkImageView;
 typedef uint64_t VkFramebuffer;
+typedef uint64_t VkRenderPass;
 #endif
 
 // Re-use Vulkan enum values without including vulkan.h.
@@ -133,6 +135,17 @@ struct xrt_display_processor
 	 */
 	bool (*request_display_mode)(struct xrt_display_processor *xdp,
 	                             bool enable_3d);
+
+	/*!
+	 * Get the Vulkan render pass used by this display processor.
+	 * Required by compositors that need to create VkFramebuffers
+	 * for the display processor's render pass.
+	 * Optional — NULL means not supported.
+	 *
+	 * @param xdp  Pointer to self.
+	 * @return VkRenderPass handle, or VK_NULL_HANDLE if not available.
+	 */
+	VkRenderPass (*get_render_pass)(struct xrt_display_processor *xdp);
 
 	/*!
 	 * Get physical display dimensions in meters.
@@ -254,6 +267,20 @@ xrt_display_processor_request_display_mode(struct xrt_display_processor *xdp, bo
 		return false;
 	}
 	return xdp->request_display_mode(xdp, enable_3d);
+}
+
+/*!
+ * @copydoc xrt_display_processor::get_render_pass
+ * Returns VK_NULL_HANDLE if not supported (function pointer is NULL).
+ * @public @memberof xrt_display_processor
+ */
+static inline VkRenderPass
+xrt_display_processor_get_render_pass(struct xrt_display_processor *xdp)
+{
+	if (xdp == NULL || xdp->get_render_pass == NULL) {
+		return (VkRenderPass)0;
+	}
+	return xdp->get_render_pass(xdp);
 }
 
 /*!
