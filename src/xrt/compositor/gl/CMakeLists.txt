@@ -39,7 +39,7 @@ endif()
 
 # Platform-specific linking
 if(WIN32)
-	target_link_libraries(comp_gl PRIVATE opengl32)
+	target_link_libraries(comp_gl PRIVATE opengl32 d3d11)
 elseif(APPLE)
 	target_link_libraries(comp_gl PRIVATE "-framework OpenGL")
 endif()

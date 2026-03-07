@@ -41,12 +41,33 @@
 #ifdef XRT_OS_WINDOWS
 #include "ogl/ogl_api.h"
 #include "ogl/wgl_api.h"
+#include <d3d11.h>
+// GUID for ID3D11Texture2D (needed for OpenSharedResource in C)
+static const IID IID_ID3D11Texture2D_local = {
+    0x6f15aaf2, 0xd208, 0x4e89,
+    {0x9a, 0xb4, 0x48, 0x95, 0x35, 0xd3, 0x4f, 0x9c}};
 #elif defined(XRT_OS_ANDROID)
 #include "ogl/ogl_api.h"
 #include "ogl/egl_api.h"
 #elif defined(__APPLE__)
 #include <OpenGL/OpenGL.h>
 #include <OpenGL/gl3.h>
+#endif
+
+/*
+ * WGL_NV_DX_interop2 function types (loaded dynamically via wglGetProcAddress)
+ */
+#ifdef XRT_OS_WINDOWS
+typedef BOOL(WINAPI *PFN_wglDXSetResourceShareHandleNV)(void *dxObject, HANDLE shareHandle);
+typedef HANDLE(WINAPI *PFN_wglDXOpenDeviceNV)(void *dxDevice);
+typedef BOOL(WINAPI *PFN_wglDXCloseDeviceNV)(HANDLE hDevice);
+typedef HANDLE(WINAPI *PFN_wglDXRegisterObjectNV)(HANDLE hDevice, void *dxObject,
+                                                   GLuint name, GLenum type, GLenum access);
+typedef BOOL(WINAPI *PFN_wglDXUnregisterObjectNV)(HANDLE hDevice, HANDLE hObject);
+typedef BOOL(WINAPI *PFN_wglDXLockObjectsNV)(HANDLE hDevice, GLint count, HANDLE *hObjects);
+typedef BOOL(WINAPI *PFN_wglDXUnlockObjectsNV)(HANDLE hDevice, GLint count, HANDLE *hObjects);
+
+#define WGL_ACCESS_READ_WRITE_NV 0x0001
 #endif
 
 
@@ -204,6 +225,27 @@ struct comp_gl_compositor
 	void *egl_surface;   //!< EGLSurface
 #elif defined(__APPLE__)
 	void *cgl_context;   //!< CGLContextObj
+#endif
+
+	// --- Shared texture (D3D11 interop via WGL_NV_DX_interop2, Windows only) ---
+#ifdef XRT_OS_WINDOWS
+	bool has_shared_texture;
+	ID3D11Device *dx_device;
+	ID3D11DeviceContext *dx_context;
+	ID3D11Texture2D *dx_shared_texture;
+	HANDLE dx_interop_device;      //!< wglDXOpenDeviceNV handle
+	HANDLE dx_interop_object;      //!< wglDXRegisterObjectNV handle
+	GLuint shared_gl_texture;      //!< GL texture mapped to D3D11 shared texture
+	uint32_t shared_width;
+	uint32_t shared_height;
+
+	// WGL_NV_DX_interop2 function pointers
+	PFN_wglDXOpenDeviceNV pfn_wglDXOpenDeviceNV;
+	PFN_wglDXCloseDeviceNV pfn_wglDXCloseDeviceNV;
+	PFN_wglDXRegisterObjectNV pfn_wglDXRegisterObjectNV;
+	PFN_wglDXUnregisterObjectNV pfn_wglDXUnregisterObjectNV;
+	PFN_wglDXLockObjectsNV pfn_wglDXLockObjectsNV;
+	PFN_wglDXUnlockObjectsNV pfn_wglDXUnlockObjectsNV;
 #endif
 
 	// --- State ---
@@ -641,35 +683,72 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 		}
 	}
 
-	// --- Step 2: Present SBS texture to screen ---
-	glBindFramebuffer(GL_FRAMEBUFFER, 0);
-
-	// Select output shader based on display mode
-	GLuint output_program;
-	switch (c->output_mode) {
-	case GL_OUTPUT_ANAGLYPH: output_program = c->program_anaglyph; break;
-	case GL_OUTPUT_BLEND:    output_program = c->program_blend; break;
-	default:                 output_program = c->program_sbs; break;
-	}
-
-	glViewport(0, 0, c->view_width * 2, c->view_height);
-	glUseProgram(output_program);
-
-	glActiveTexture(GL_TEXTURE0);
-	glBindTexture(GL_TEXTURE_2D, c->stereo_texture);
-	GLint loc_out_tex = glGetUniformLocation(output_program, "u_texture");
-	glUniform1i(loc_out_tex, 0);
-
-	glDrawArrays(GL_TRIANGLES, 0, 3);
-
-	// Platform-specific swap
+	// --- Step 2: Present SBS texture ---
 #ifdef XRT_OS_WINDOWS
-	SwapBuffers(c->hdc);
-#elif defined(XRT_OS_ANDROID)
-	// eglSwapBuffers(c->egl_display, c->egl_surface);
-#elif defined(__APPLE__)
-	// CGLFlushDrawable(c->cgl_context);
+	if (c->has_shared_texture) {
+		// Shared texture mode: blit SBS stereo texture to the DX-interop GL texture
+		if (c->pfn_wglDXLockObjectsNV(c->dx_interop_device, 1, &c->dx_interop_object)) {
+			glBindFramebuffer(GL_FRAMEBUFFER, c->fbo);
+			glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+			                        c->shared_gl_texture, 0);
+
+			glViewport(0, 0, c->shared_width, c->shared_height);
+
+			// Select output shader based on display mode
+			GLuint output_program;
+			switch (c->output_mode) {
+			case GL_OUTPUT_ANAGLYPH: output_program = c->program_anaglyph; break;
+			case GL_OUTPUT_BLEND:    output_program = c->program_blend; break;
+			default:                 output_program = c->program_sbs; break;
+			}
+
+			glUseProgram(output_program);
+			glActiveTexture(GL_TEXTURE0);
+			glBindTexture(GL_TEXTURE_2D, c->stereo_texture);
+			GLint loc_out_tex = glGetUniformLocation(output_program, "u_texture");
+			glUniform1i(loc_out_tex, 0);
+			glDrawArrays(GL_TRIANGLES, 0, 3);
+
+			glFlush();
+
+			// Restore FBO to not target shared texture
+			glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+			glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+			c->pfn_wglDXUnlockObjectsNV(c->dx_interop_device, 1, &c->dx_interop_object);
+		}
+	} else
 #endif
+	{
+		// Normal window mode: present to screen
+		glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+		GLuint output_program;
+		switch (c->output_mode) {
+		case GL_OUTPUT_ANAGLYPH: output_program = c->program_anaglyph; break;
+		case GL_OUTPUT_BLEND:    output_program = c->program_blend; break;
+		default:                 output_program = c->program_sbs; break;
+		}
+
+		glViewport(0, 0, c->view_width * 2, c->view_height);
+		glUseProgram(output_program);
+
+		glActiveTexture(GL_TEXTURE0);
+		glBindTexture(GL_TEXTURE_2D, c->stereo_texture);
+		GLint loc_out_tex = glGetUniformLocation(output_program, "u_texture");
+		glUniform1i(loc_out_tex, 0);
+
+		glDrawArrays(GL_TRIANGLES, 0, 3);
+
+		// Platform-specific swap
+#ifdef XRT_OS_WINDOWS
+		SwapBuffers(c->hdc);
+#elif defined(XRT_OS_ANDROID)
+		// eglSwapBuffers(c->egl_display, c->egl_surface);
+#elif defined(__APPLE__)
+		// CGLFlushDrawable(c->cgl_context);
+#endif
+	}
 
 	glBindVertexArray(0);
 	glUseProgram(0);
@@ -698,6 +777,28 @@ gl_compositor_destroy(struct xrt_compositor *xc)
 	if (c->stereo_texture) glDeleteTextures(1, &c->stereo_texture);
 
 #ifdef XRT_OS_WINDOWS
+	// Clean up D3D11 interop resources
+	if (c->has_shared_texture) {
+		if (c->dx_interop_object && c->pfn_wglDXUnregisterObjectNV) {
+			c->pfn_wglDXUnregisterObjectNV(c->dx_interop_device, c->dx_interop_object);
+		}
+		if (c->shared_gl_texture) {
+			glDeleteTextures(1, &c->shared_gl_texture);
+		}
+		if (c->dx_interop_device && c->pfn_wglDXCloseDeviceNV) {
+			c->pfn_wglDXCloseDeviceNV(c->dx_interop_device);
+		}
+		if (c->dx_shared_texture) {
+			c->dx_shared_texture->lpVtbl->Release(c->dx_shared_texture);
+		}
+		if (c->dx_context) {
+			c->dx_context->lpVtbl->Release(c->dx_context);
+		}
+		if (c->dx_device) {
+			c->dx_device->lpVtbl->Release(c->dx_device);
+		}
+	}
+
 	if (c->hglrc) {
 		wglMakeCurrent(NULL, NULL);
 		wglDeleteContext(c->hglrc);
@@ -938,6 +1039,7 @@ comp_gl_compositor_create(struct xrt_device *xdev,
                           void *gl_context,
                           void *gl_display,
                           void *dp_factory_gl,
+                          void *shared_texture_handle,
                           struct xrt_compositor_native **out_xcn)
 {
 	struct comp_gl_compositor *c = U_TYPED_CALLOC(struct comp_gl_compositor);
@@ -959,9 +1061,90 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 		free(c);
 		return XRT_ERROR_OPENGL;
 	}
+
+	// Set up D3D11 interop if shared texture handle provided
+	if (shared_texture_handle != NULL) {
+		// Load WGL_NV_DX_interop2 function pointers
+		c->pfn_wglDXOpenDeviceNV = (PFN_wglDXOpenDeviceNV)wglGetProcAddress("wglDXOpenDeviceNV");
+		c->pfn_wglDXCloseDeviceNV = (PFN_wglDXCloseDeviceNV)wglGetProcAddress("wglDXCloseDeviceNV");
+		c->pfn_wglDXRegisterObjectNV = (PFN_wglDXRegisterObjectNV)wglGetProcAddress("wglDXRegisterObjectNV");
+		c->pfn_wglDXUnregisterObjectNV = (PFN_wglDXUnregisterObjectNV)wglGetProcAddress("wglDXUnregisterObjectNV");
+		c->pfn_wglDXLockObjectsNV = (PFN_wglDXLockObjectsNV)wglGetProcAddress("wglDXLockObjectsNV");
+		c->pfn_wglDXUnlockObjectsNV = (PFN_wglDXUnlockObjectsNV)wglGetProcAddress("wglDXUnlockObjectsNV");
+
+		if (!c->pfn_wglDXOpenDeviceNV || !c->pfn_wglDXRegisterObjectNV ||
+		    !c->pfn_wglDXLockObjectsNV || !c->pfn_wglDXUnlockObjectsNV) {
+			U_LOG_E("WGL_NV_DX_interop2 not available — shared texture requires NVIDIA or AMD GPU");
+			free(c);
+			return XRT_ERROR_OPENGL;
+		}
+
+		// Create D3D11 device for interop
+		HRESULT hr = D3D11CreateDevice(
+		    NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0,
+		    NULL, 0, D3D11_SDK_VERSION,
+		    &c->dx_device, NULL, &c->dx_context);
+		if (FAILED(hr)) {
+			U_LOG_E("Failed to create D3D11 device for GL interop: 0x%08x", hr);
+			free(c);
+			return XRT_ERROR_OPENGL;
+		}
+
+		// Open the shared D3D11 texture
+		hr = c->dx_device->lpVtbl->OpenSharedResource(
+		    c->dx_device, (HANDLE)shared_texture_handle,
+		    &IID_ID3D11Texture2D_local, (void **)&c->dx_shared_texture);
+		if (FAILED(hr)) {
+			U_LOG_E("Failed to open shared D3D11 texture: 0x%08x", hr);
+			c->dx_context->lpVtbl->Release(c->dx_context);
+			c->dx_device->lpVtbl->Release(c->dx_device);
+			free(c);
+			return XRT_ERROR_OPENGL;
+		}
+
+		// Get shared texture dimensions
+		D3D11_TEXTURE2D_DESC desc;
+		c->dx_shared_texture->lpVtbl->GetDesc(c->dx_shared_texture, &desc);
+		c->shared_width = desc.Width;
+		c->shared_height = desc.Height;
+
+		// Register D3D11 device with WGL
+		c->dx_interop_device = c->pfn_wglDXOpenDeviceNV(c->dx_device);
+		if (!c->dx_interop_device) {
+			U_LOG_E("wglDXOpenDeviceNV failed: %lu", GetLastError());
+			c->dx_shared_texture->lpVtbl->Release(c->dx_shared_texture);
+			c->dx_context->lpVtbl->Release(c->dx_context);
+			c->dx_device->lpVtbl->Release(c->dx_device);
+			free(c);
+			return XRT_ERROR_OPENGL;
+		}
+
+		// Create GL texture and map it to the D3D11 shared texture
+		glGenTextures(1, &c->shared_gl_texture);
+		c->dx_interop_object = c->pfn_wglDXRegisterObjectNV(
+		    c->dx_interop_device, c->dx_shared_texture,
+		    c->shared_gl_texture, GL_TEXTURE_2D, WGL_ACCESS_READ_WRITE_NV);
+		if (!c->dx_interop_object) {
+			U_LOG_E("wglDXRegisterObjectNV failed: %lu", GetLastError());
+			glDeleteTextures(1, &c->shared_gl_texture);
+			c->pfn_wglDXCloseDeviceNV(c->dx_interop_device);
+			c->dx_shared_texture->lpVtbl->Release(c->dx_shared_texture);
+			c->dx_context->lpVtbl->Release(c->dx_context);
+			c->dx_device->lpVtbl->Release(c->dx_device);
+			free(c);
+			return XRT_ERROR_OPENGL;
+		}
+
+		c->has_shared_texture = true;
+		U_LOG_W("D3D11/GL interop initialized: shared texture %ux%u mapped to GL texture %u",
+		         c->shared_width, c->shared_height, c->shared_gl_texture);
+	}
 #elif defined(__APPLE__)
 	// macOS: use provided CGL context directly
 	c->cgl_context = gl_context;
+	(void)shared_texture_handle;
+#else
+	(void)shared_texture_handle;
 #endif
 
 	// Initialize GL resources

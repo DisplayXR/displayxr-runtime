@@ -76,6 +76,7 @@ oxr_session_populate_gl_native(struct oxr_logger *log,
                                 struct oxr_system *sys,
                                 void *gl_context,
                                 void *gl_display,
+                                void *shared_texture_handle,
                                 struct oxr_session *sess)
 {
 	struct xrt_device *xdev = get_role_head(sess->sys);
@@ -92,6 +93,7 @@ oxr_session_populate_gl_native(struct oxr_logger *log,
 	    gl_context,
 	    gl_display,
 	    dp_factory_gl,
+	    shared_texture_handle,
 	    &xcn);
 	if (xret != XRT_SUCCESS) {
 		return oxr_error(log, XR_ERROR_INITIALIZATION_FAILED,
