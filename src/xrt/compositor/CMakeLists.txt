@@ -280,6 +280,13 @@ if(APPLE AND XRT_HAVE_METAL)
 endif()
 
 ###
+# Native Vulkan compositor (direct submit, no multi-compositor)
+#
+if(WIN32 AND XRT_HAVE_VULKAN)
+	add_subdirectory(vk_native)
+endif()
+
+###
 # Native OpenGL compositor (bypasses Vulkan entirely)
 #
 if(XRT_HAVE_OPENGL)

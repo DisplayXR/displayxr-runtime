@@ -107,6 +107,13 @@ endif()
 
 if(WIN32)
 	target_link_libraries(st_oxr PRIVATE kernel32)
+
+	# VK native compositor support (direct Vulkan, no multi-compositor)
+	if(XRT_HAVE_VULKAN AND TARGET comp_vk_native)
+		target_sources(st_oxr PRIVATE oxr_session_gfx_vk_native.c)
+		target_link_libraries(st_oxr PRIVATE comp_vk_native)
+		target_compile_definitions(st_oxr PRIVATE XRT_HAVE_VK_NATIVE_COMPOSITOR)
+	endif()
 endif()
 
 if(APPLE)

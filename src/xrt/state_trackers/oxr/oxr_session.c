@@ -2005,8 +2005,51 @@ oxr_session_create_impl(struct oxr_logger *log,
 				return oxr_error(log, XR_ERROR_RUNTIME_FAILURE,
 				                 "Failed to create xrt_session!");
 			}
-			return oxr_session_populate_vk_with_metal_native(
-			    log, sys, vulkan, *out_session);
+			// Extract external window handle and shared IOSurface from cocoa_window_binding if present
+			void *window_handle = NULL;
+			void *shared_iosurface = NULL;
+			const XrCocoaWindowBindingCreateInfoEXT *cocoa_binding = OXR_GET_INPUT_FROM_CHAIN(
+			    createInfo, XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_EXT, XrCocoaWindowBindingCreateInfoEXT);
+			if (cocoa_binding != NULL) {
+				if (cocoa_binding->viewHandle != NULL) {
+					window_handle = (void *)cocoa_binding->viewHandle;
+				}
+				if (cocoa_binding->sharedIOSurface != NULL) {
+					shared_iosurface = (void *)cocoa_binding->sharedIOSurface;
+				}
+			}
+			XrResult ret = oxr_session_populate_vk_with_metal_native(
+			    log, sys, vulkan, window_handle, shared_iosurface, *out_session);
+			if (ret == XR_SUCCESS && window_handle != NULL) {
+				(*out_session)->has_external_window = true;
+				struct xrt_device *head = GET_XDEV_BY_ROLE((*out_session)->sys, head);
+				if (head != NULL) {
+					xrt_device_set_property(head, XRT_DEVICE_PROPERTY_EXT_APP_MODE, 1);
+				}
+			}
+			return ret;
+		}
+#endif
+
+#if defined(XRT_HAVE_VK_NATIVE_COMPOSITOR)
+		// On Windows, Vulkan apps can use the VK native compositor
+		// for direct rendering without the multi-compositor.
+		if (oxr_vk_native_compositor_supported(sys, xsi->external_window_handle)) {
+			xrt_result_t xret = xrt_system_create_session(
+			    sys->xsys, xsi, &(*out_session)->xs, NULL);
+			if (xret == XRT_ERROR_MULTI_SESSION_NOT_IMPLEMENTED) {
+				return oxr_error(log, XR_ERROR_LIMIT_REACHED,
+				                 "Per instance multi-session not supported.");
+			}
+			if (xret != XRT_SUCCESS) {
+				return oxr_error(log, XR_ERROR_RUNTIME_FAILURE,
+				                 "Failed to create xrt_session! '%i'", xret);
+			}
+			// Extract window handle from win32_window_binding if present
+			void *window_handle = xsi->external_window_handle;
+			void *shared_texture_handle = xsi->shared_texture_handle;
+			return oxr_session_populate_vk_native(
+			    log, sys, vulkan, window_handle, shared_texture_handle, *out_session);
 		}
 #endif
 

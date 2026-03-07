@@ -2,14 +2,13 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  Vulkan session using Metal native compositor for presentation (macOS).
+ * @brief  Vulkan session using native compositors for presentation.
  *
  * On macOS, Vulkan apps are routed through the Metal native compositor:
  *   App (Vulkan) → comp_vk_client → Metal native compositor → CAMetalLayer
  *
- * The Metal compositor creates its own MTLDevice when no command queue is
- * provided. comp_vk_client imports Metal textures as VkImages via
- * VK_EXT_external_memory_metal (MoltenVK).
+ * On Windows, Vulkan apps can use the VK native compositor directly:
+ *   App (Vulkan) → VK native compositor → Win32 surface → Display
  *
  * @author David Fattal
  * @ingroup oxr_main
@@ -61,6 +60,8 @@ XrResult
 oxr_session_populate_vk_with_metal_native(struct oxr_logger *log,
                                            struct oxr_system *sys,
                                            XrGraphicsBindingVulkanKHR const *next,
+                                           void *window_handle,
+                                           void *shared_iosurface,
                                            struct oxr_session *sess)
 {
 	struct xrt_device *xdev = get_role_head(sess->sys);
@@ -72,15 +73,17 @@ oxr_session_populate_vk_with_metal_native(struct oxr_logger *log,
 		dp_factory_metal = sys->xsysc->info.dp_factory_metal;
 	}
 
-	// Create the Metal native compositor with NULL command queue
+	bool offscreen = (window_handle == NULL && shared_iosurface != NULL);
+
+	// Create the Metal native compositor
 	// (it will create its own MTLDevice + MTLCommandQueue internally)
 	xrt_result_t xret = comp_metal_compositor_create(
 	    xdev,
-	    NULL,  // window_handle — compositor creates its own window
+	    window_handle,
 	    NULL,  // command_queue — compositor creates its own Metal device
 	    dp_factory_metal,
-	    false, // offscreen
-	    NULL,  // shared_iosurface
+	    offscreen,
+	    shared_iosurface,
 	    &xcn);
 	if (xret != XRT_SUCCESS) {
 		return oxr_error(log, XR_ERROR_INITIALIZATION_FAILED,
@@ -171,3 +174,134 @@ oxr_session_populate_vk_with_metal_native(struct oxr_logger *log,
 }
 
 #endif /* XRT_HAVE_METAL_NATIVE_COMPOSITOR && XR_USE_GRAPHICS_API_VULKAN */
+
+/*
+ *
+ * Windows: VK native compositor (direct Vulkan, no multi-compositor)
+ *
+ */
+
+#ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
+#include "vk_native/comp_vk_native_compositor.h"
+#endif
+
+/*
+ * Environment variable to enable/disable VK native compositor.
+ * Default is TRUE — VK native compositor is enabled by default for in-process mode.
+ * Set OXR_ENABLE_VK_NATIVE_COMPOSITOR=0 to force multi-compositor (for debugging).
+ */
+DEBUG_GET_ONCE_BOOL_OPTION(enable_vk_native_compositor, "OXR_ENABLE_VK_NATIVE_COMPOSITOR", true)
+
+bool
+oxr_vk_native_compositor_supported(struct oxr_system *sys, void *window_handle)
+{
+#ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
+	(void)window_handle;
+
+	bool is_service_mode = sys->xsysc != NULL && sys->xsysc->info.is_service_mode;
+	bool env_enabled = debug_get_bool_option_enable_vk_native_compositor();
+
+	U_LOG_IFL_I(U_LOGGING_INFO,
+	            "VK native compositor check: XRT_HAVE_VK_NATIVE_COMPOSITOR=defined, "
+	            "OXR_ENABLE_VK_NATIVE_COMPOSITOR=%s, window_handle=%p, is_service_mode=%s",
+	            env_enabled ? "1 (enabled)" : "0 (disabled)", window_handle,
+	            is_service_mode ? "true" : "false");
+
+	if (is_service_mode) {
+		U_LOG_IFL_I(U_LOGGING_INFO,
+		            "VK native compositor DISABLED - running in service mode");
+		return false;
+	}
+
+	if (!env_enabled) {
+		U_LOG_IFL_I(U_LOGGING_INFO,
+		            "VK native compositor DISABLED - falling back to multi-compositor");
+		return false;
+	}
+
+	U_LOG_IFL_I(U_LOGGING_INFO, "VK native compositor ENABLED");
+	return true;
+#else
+	U_LOG_IFL_I(U_LOGGING_INFO,
+	            "VK native compositor check: XRT_HAVE_VK_NATIVE_COMPOSITOR=NOT defined");
+	(void)sys;
+	(void)window_handle;
+	return false;
+#endif
+}
+
+#ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
+
+// Forward declaration — use VK native swapchain create
+extern XrResult
+oxr_swapchain_vk_create(struct oxr_logger *log,
+                        struct oxr_session *sess,
+                        const XrSwapchainCreateInfo *createInfo,
+                        struct oxr_swapchain **out_swapchain);
+
+XrResult
+oxr_session_populate_vk_native(struct oxr_logger *log,
+                                struct oxr_system *sys,
+                                XrGraphicsBindingVulkanKHR const *next,
+                                void *window_handle,
+                                void *shared_texture_handle,
+                                struct oxr_session *sess)
+{
+	struct xrt_device *xdev = get_role_head(sess->sys);
+	struct xrt_compositor_native *xcn = NULL;
+
+	// Get VK display processor factory from system compositor info
+	void *dp_factory_vk = NULL;
+	if (sys->xsysc != NULL) {
+		dp_factory_vk = sys->xsysc->info.dp_factory_vk;
+	}
+
+	// Create the VK native compositor
+	xrt_result_t xret = comp_vk_native_compositor_create(
+	    xdev, window_handle,
+	    (void *)next->instance,
+	    (void *)next->physicalDevice,
+	    (void *)next->device,
+	    next->queueFamilyIndex,
+	    next->queueIndex,
+	    dp_factory_vk, shared_texture_handle, &xcn);
+	if (xret != XRT_SUCCESS) {
+		return oxr_error(log, XR_ERROR_INITIALIZATION_FAILED,
+		                 "Failed to create VK native compositor: %d", xret);
+	}
+
+	// Set system devices for qwerty driver support
+	comp_vk_native_compositor_set_system_devices(&xcn->base, sess->sys->xsysd);
+
+	// Set the compositor directly — no client wrapper needed
+	// The VK native compositor creates swapchains with real VkImages
+	// that the app renders to directly (same VkDevice).
+	sess->xcn = xcn;
+	sess->compositor = &xcn->base;
+	sess->create_swapchain = oxr_swapchain_vk_create;
+
+	// D3D11 native compositor has is_d3d11_native_compositor flag;
+	// we add is_vk_native_compositor for consistency
+	sess->is_vk_native_compositor = true;
+
+	// Native compositor is always visible and focused
+	sess->compositor_visible = true;
+	sess->compositor_focused = true;
+
+	// Track external window / shared texture mode
+	sess->has_external_window =
+	    (window_handle != NULL || shared_texture_handle != NULL);
+	if (sess->has_external_window) {
+		struct xrt_device *head = GET_XDEV_BY_ROLE(sess->sys, head);
+		if (head != NULL) {
+			xrt_device_set_property(head, XRT_DEVICE_PROPERTY_EXT_APP_MODE, 1);
+		}
+	}
+
+	U_LOG_IFL_I(U_LOGGING_INFO, "Using VK native compositor (direct Vulkan, no multi-compositor)%s",
+	            shared_texture_handle ? " — shared texture mode" : "");
+
+	return XR_SUCCESS;
+}
+
+#endif /* XRT_HAVE_VK_NATIVE_COMPOSITOR */

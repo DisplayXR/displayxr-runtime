@@ -1365,6 +1365,26 @@ oxr_swapchain_vk_create(struct oxr_logger * /*log*/,
                         const XrSwapchainCreateInfo * /*createInfo*/,
                         struct oxr_swapchain **out_swapchain);
 
+/*!
+ * Check if VK native compositor should be used (Windows only).
+ */
+bool
+oxr_vk_native_compositor_supported(struct oxr_system *sys, void *window_handle);
+
+#ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
+/*!
+ * Populate the session with the VK native compositor.
+ * This uses direct Vulkan rendering without the multi-compositor.
+ */
+XrResult
+oxr_session_populate_vk_native(struct oxr_logger *log,
+                                struct oxr_system *sys,
+                                XrGraphicsBindingVulkanKHR const *next,
+                                void *window_handle,
+                                void *shared_texture_handle,
+                                struct oxr_session *sess);
+#endif
+
 #endif
 
 
@@ -1529,6 +1549,8 @@ XrResult
 oxr_session_populate_vk_with_metal_native(struct oxr_logger *log,
                                            struct oxr_system *sys,
                                            XrGraphicsBindingVulkanKHR const *next,
+                                           void *window_handle,
+                                           void *shared_iosurface,
                                            struct oxr_session *sess);
 #endif
 
@@ -1952,6 +1974,9 @@ struct oxr_session
 
 	//! True if using D3D12 native compositor (not multi_compositor).
 	bool is_d3d12_native_compositor;
+
+	//! True if using VK native compositor (not multi_compositor).
+	bool is_vk_native_compositor;
 
 	//! True if using GL native compositor (not multi_compositor).
 	bool is_gl_native_compositor;
