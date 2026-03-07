@@ -42,7 +42,7 @@ using namespace DirectX;
 
 static const char* APP_NAME = "cube_shared_d3d12";
 static const wchar_t* WINDOW_CLASS = L"SRCubeSharedD3D12Class";
-static const wchar_t* WINDOW_TITLE = L"SR Cube Shared Texture D3D12 (Press ESC to exit)";
+static const wchar_t* WINDOW_TITLE = L"D3D12 Cube \u2014 D3D12 Native Compositor (Shared Texture)";
 
 // Global state
 static InputState g_inputState;

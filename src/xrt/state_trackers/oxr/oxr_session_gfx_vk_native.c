@@ -4,10 +4,11 @@
  * @file
  * @brief  Vulkan session using native compositors for presentation.
  *
- * On macOS, Vulkan apps are routed through the Metal native compositor:
- *   App (Vulkan) → comp_vk_client → Metal native compositor → CAMetalLayer
+ * On macOS, Vulkan apps can use:
+ *   1. VK native compositor (preferred): App (VK) → VK native → VkSurfaceKHR (Metal) → Display
+ *   2. Metal native compositor (fallback): App (VK) → comp_vk_client → Metal → CAMetalLayer
  *
- * On Windows, Vulkan apps can use the VK native compositor directly:
+ * On Windows, Vulkan apps use the VK native compositor directly:
  *   App (Vulkan) → VK native compositor → Win32 surface → Display
  *
  * @author David Fattal

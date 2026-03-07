@@ -144,6 +144,15 @@ jobs:
             -DCMAKE_PREFIX_PATH=/tmp/openxr-install
           cmake --build test_apps/cube_shared_metal_macos/build
 
+      - name: Build test app (cube_shared_vk_macos)
+        if: env.BUILD_TEST_APP == 'true'
+        run: |
+          cmake -B test_apps/cube_shared_vk_macos/build \
+            -S test_apps/cube_shared_vk_macos -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_PREFIX_PATH=/tmp/openxr-install
+          cmake --build test_apps/cube_shared_vk_macos/build
+
       - name: Package test apps
         if: env.BUILD_TEST_APP == 'true'
         run: |
@@ -153,6 +162,7 @@ jobs:
           cp test_apps/cube_metal_macos/build/cube_metal_macos _package/SRMonado-macOS/bin/
           cp test_apps/cube_ext_metal_macos/build/cube_ext_metal_macos _package/SRMonado-macOS/bin/
           cp test_apps/cube_shared_metal_macos/build/cube_shared_metal_macos _package/SRMonado-macOS/bin/
+          cp test_apps/cube_shared_vk_macos/build/cube_shared_vk_macos _package/SRMonado-macOS/bin/
           # Bundle the OpenXR loader dylib so it works without system install
           cp /tmp/openxr-install/lib/libopenxr_loader*.dylib _package/SRMonado-macOS/lib/
           # Fix rpaths so test apps and loader find bundled libvulkan/MoltenVK
@@ -161,6 +171,7 @@ jobs:
           install_name_tool -add_rpath @executable_path/../lib _package/SRMonado-macOS/bin/cube_metal_macos 2>/dev/null || true
           install_name_tool -add_rpath @executable_path/../lib _package/SRMonado-macOS/bin/cube_ext_metal_macos 2>/dev/null || true
           install_name_tool -add_rpath @executable_path/../lib _package/SRMonado-macOS/bin/cube_shared_metal_macos 2>/dev/null || true
+          install_name_tool -add_rpath @executable_path/../lib _package/SRMonado-macOS/bin/cube_shared_vk_macos 2>/dev/null || true
           install_name_tool -add_rpath @loader_path _package/SRMonado-macOS/lib/libopenxr_loader*.dylib 2>/dev/null || true
           # Copy textures for test apps
           mkdir -p _package/SRMonado-macOS/bin/textures
@@ -214,6 +225,19 @@ jobs:
           exec "$DIR/bin/cube_shared_metal_macos" "$@"
           SCRIPT
           chmod +x _package/SRMonado-macOS/run_cube_shared_metal.sh
+          # Create run script for cube_shared_vk_macos (Vulkan, IOSurface shared texture)
+          cat > _package/SRMonado-macOS/run_cube_shared_vk.sh <<'SCRIPT'
+          #!/bin/bash
+          DIR="$(cd "$(dirname "$0")" && pwd)"
+          export XR_RUNTIME_JSON="$DIR/openxr_monado.json"
+          export DYLD_LIBRARY_PATH="$DIR/lib:${DYLD_LIBRARY_PATH:-}"
+          export VK_ICD_FILENAMES="$DIR/share/vulkan/icd.d/MoltenVK_icd.json"
+          export SIM_DISPLAY_ENABLE=1
+          export SIM_DISPLAY_OUTPUT="${SIM_DISPLAY_OUTPUT:-anaglyph}"
+          echo "Starting cube_shared_vk_macos (Vulkan, IOSurface shared texture) with $SIM_DISPLAY_OUTPUT output..."
+          exec "$DIR/bin/cube_shared_vk_macos" "$@"
+          SCRIPT
+          chmod +x _package/SRMonado-macOS/run_cube_shared_vk.sh
 
       - name: Build 3DGS demo app (gaussian_splatting_vk_macos)
         if: env.BUILD_TEST_APP == 'true'

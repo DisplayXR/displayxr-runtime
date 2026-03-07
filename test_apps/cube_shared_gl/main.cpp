@@ -49,7 +49,7 @@ using namespace DirectX;
 
 static const char* APP_NAME = "cube_shared_gl";
 static const wchar_t* WINDOW_CLASS = L"SRCubeSharedGLClass";
-static const wchar_t* WINDOW_TITLE = L"SR Cube Shared Texture OpenGL (Press ESC to exit)";
+static const wchar_t* WINDOW_TITLE = L"OpenGL Cube \u2014 GL Native Compositor (Shared Texture)";
 
 // Global state
 static InputState g_inputState;

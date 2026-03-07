@@ -9,6 +9,7 @@
  */
 
 #include "client/comp_vk_client.h"
+#include "xrt/xrt_config_os.h"
 
 #include <stdlib.h>
 
@@ -19,7 +20,13 @@
 // platform!
 const char *xrt_gfx_vk_instance_extensions = VK_KHR_EXTERNAL_FENCE_CAPABILITIES_EXTENSION_NAME
     " " VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME " " VK_KHR_EXTERNAL_SEMAPHORE_CAPABILITIES_EXTENSION_NAME
-    " " VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME;
+    " " VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME
+#if defined(VK_EXT_metal_surface) && defined(XRT_OS_MACOS)
+    // VK native compositor on macOS needs VkSurfaceKHR via VK_EXT_metal_surface
+    " " VK_KHR_SURFACE_EXTENSION_NAME
+    " " VK_EXT_METAL_SURFACE_EXTENSION_NAME
+#endif
+    ;
 
 // The device extensions do vary by platform, but in a very regular way.
 // This should match the list in comp_compositor, except it shouldn't include
@@ -43,6 +50,8 @@ const char *xrt_gfx_vk_device_extensions = VK_KHR_DEDICATED_ALLOCATION_EXTENSION
 #elif defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_METAL)
     " " VK_EXT_EXTERNAL_MEMORY_METAL_EXTENSION_NAME
     " " VK_EXT_METAL_OBJECTS_EXTENSION_NAME
+    // VK native compositor on macOS needs swapchain for direct presentation
+    " " VK_KHR_SWAPCHAIN_EXTENSION_NAME
 
 #elif defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_WIN32_HANDLE)
     " " VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME

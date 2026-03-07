@@ -142,6 +142,13 @@ if(APPLE)
 			target_include_directories(st_oxr PRIVATE ${CMAKE_SOURCE_DIR}/src/external/openxr_includes)
 		endif()
 	endif()
+
+	# VK native compositor on macOS (direct Vulkan via MoltenVK)
+	if(XRT_HAVE_VULKAN AND TARGET comp_vk_native)
+		# oxr_session_gfx_vk_native.c already compiled from Metal block above
+		target_link_libraries(st_oxr PRIVATE comp_vk_native)
+		target_compile_definitions(st_oxr PRIVATE XRT_HAVE_VK_NATIVE_COMPOSITOR)
+	endif()
 endif()
 
 # Qwerty driver: needed on all platforms for camera-centric stereo controls

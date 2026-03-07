@@ -846,7 +846,7 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height)
                                                  backing:NSBackingStoreBuffered
                                                    defer:NO];
 
-        [g_window setTitle:@"Metal Cube OpenXR (External Window)"];
+        [g_window setTitle:@"Metal Cube — Metal Native Compositor (External Window)"];
         [g_window setAcceptsMouseMovedEvents:YES];
         [g_window setReleasedWhenClosed:NO];
 

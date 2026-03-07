@@ -43,6 +43,10 @@
 #include "d3d11/comp_d3d11_window.h"
 #endif
 
+#ifdef XRT_OS_MACOS
+#include "vk_native/comp_vk_native_window_macos.h"
+#endif
+
 #include <string.h>
 #include <math.h>
 
@@ -95,6 +99,14 @@ struct comp_vk_native_compositor
 
 	//! Self-created window (NULL if app provided window).
 	struct comp_d3d11_window *own_window;
+
+	//! True if we created the window ourselves.
+	bool owns_window;
+#endif
+
+#ifdef XRT_OS_MACOS
+	//! macOS window helper (self-owned or external view).
+	struct comp_vk_native_window_macos *macos_window;
 
 	//! True if we created the window ourselves.
 	bool owns_window;
@@ -254,6 +266,14 @@ vk_compositor_wait_frame(struct xrt_compositor *xc,
 	}
 #endif
 
+#ifdef XRT_OS_MACOS
+	if (c->owns_window && c->macos_window != NULL &&
+	    !comp_vk_native_window_macos_is_valid(c->macos_window)) {
+		U_LOG_I("Window closed - signaling session exit");
+		return XRT_ERROR_IPC_FAILURE;
+	}
+#endif
+
 	int64_t period_ns = (int64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate);
 
 	c->frame_id++;
@@ -307,6 +327,32 @@ vk_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 				uint32_t new_vh = new_height;
 				comp_vk_native_renderer_resize(c->renderer, new_vw, new_vh, new_height);
 			}
+		}
+	}
+#endif
+
+#ifdef XRT_OS_MACOS
+	if (c->macos_window != NULL) {
+		uint32_t new_width = 0, new_height = 0;
+		comp_vk_native_window_macos_get_dimensions(c->macos_window, &new_width, &new_height);
+
+		if (new_width > 0 && new_height > 0 &&
+		    (new_width != c->settings.preferred.width ||
+		     new_height != c->settings.preferred.height)) {
+
+			U_LOG_I("Window resized: %ux%u -> %ux%u",
+			        c->settings.preferred.width, c->settings.preferred.height,
+			        new_width, new_height);
+
+			if (c->target != NULL) {
+				comp_vk_native_target_resize(c->target, new_width, new_height);
+			}
+			c->settings.preferred.width = new_width;
+			c->settings.preferred.height = new_height;
+
+			uint32_t new_vw = new_width / 2;
+			uint32_t new_vh = new_height;
+			comp_vk_native_renderer_resize(c->renderer, new_vw, new_vh, new_height);
 		}
 	}
 #endif
@@ -517,9 +563,6 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 
 			int32_t view_format = comp_vk_native_renderer_get_format(c->renderer);
 
-			uint64_t target_image, target_view;
-			comp_vk_native_target_get_current_image(c->target, &target_image, &target_view);
-
 			VkCommandPool cmd_pool = (VkCommandPool)(uintptr_t)
 			    comp_vk_native_renderer_get_cmd_pool(c->renderer);
 
@@ -539,8 +582,25 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				};
 				vk->vkBeginCommandBuffer(cmd, &begin_info);
 
+				// Create framebuffer for the display processor's render pass
+				uint64_t target_image, target_view;
+				comp_vk_native_target_get_current_image(c->target, &target_image, &target_view);
+
+				VkRenderPass dp_render_pass = xrt_display_processor_get_render_pass(c->display_processor);
 				VkFramebuffer target_fb = VK_NULL_HANDLE;
-				// TODO: Create proper framebuffer when display processor render pass is available
+				if (dp_render_pass != VK_NULL_HANDLE && target_view != 0) {
+					VkImageView tv = (VkImageView)(uintptr_t)target_view;
+					VkFramebufferCreateInfo fb_ci = {
+					    .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+					    .renderPass = dp_render_pass,
+					    .attachmentCount = 1,
+					    .pAttachments = &tv,
+					    .width = tgt_width,
+					    .height = tgt_height,
+					    .layers = 1,
+					};
+					vk->vkCreateFramebuffer(vk->device, &fb_ci, NULL, &target_fb);
+				}
 
 				xrt_display_processor_process_views(
 				    c->display_processor,
@@ -568,6 +628,10 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				}
 
 				vk->vkFreeCommandBuffers(vk->device, cmd_pool, 1, &cmd);
+
+				if (target_fb != VK_NULL_HANDLE) {
+					vk->vkDestroyFramebuffer(vk->device, target_fb, NULL);
+				}
 			}
 		}
 
@@ -685,6 +749,12 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 	}
 #endif
 
+#ifdef XRT_OS_MACOS
+	if (c->macos_window != NULL) {
+		comp_vk_native_window_macos_destroy(&c->macos_window);
+	}
+#endif
+
 	// Note: we do NOT destroy the VkDevice — it belongs to the app.
 	// vk_bundle cleanup is minimal (just mutexes).
 
@@ -774,6 +844,45 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	}
 #endif
 
+#ifdef XRT_OS_MACOS
+	// Handle window on macOS
+	if (hwnd != NULL) {
+		// hwnd is an NSView* from cocoa_window_binding
+		xrt_result_t xret = comp_vk_native_window_macos_setup_external(
+		    hwnd, &c->macos_window);
+		if (xret != XRT_SUCCESS) {
+			U_LOG_E("Failed to set up external view for VK native");
+			free(c);
+			return xret;
+		}
+		c->owns_window = false;
+		U_LOG_I("Using app-provided NSView for VK native compositor");
+	} else if (shared_texture_handle != NULL) {
+		c->macos_window = NULL;
+		U_LOG_I("Offscreen mode — no window (shared texture)");
+	} else {
+		uint32_t win_w = xdev->hmd->screens[0].w_pixels;
+		uint32_t win_h = xdev->hmd->screens[0].h_pixels;
+		if (win_w == 0 || win_h == 0) {
+			win_w = 1920;
+			win_h = 1080;
+		}
+		U_LOG_I("Creating self-owned macOS window (%ux%u)", win_w, win_h);
+		xrt_result_t xret = comp_vk_native_window_macos_create(
+		    win_w, win_h, &c->macos_window);
+		if (xret != XRT_SUCCESS) {
+			U_LOG_E("Failed to create self-owned macOS window");
+			free(c);
+			return xret;
+		}
+		c->owns_window = true;
+	}
+	// Set hwnd to the CAMetalLayer for target creation
+	if (c->macos_window != NULL) {
+		hwnd = comp_vk_native_window_macos_get_layer(c->macos_window);
+	}
+#endif
+
 	// Initialize settings
 	memset(&c->settings, 0, sizeof(c->settings));
 	c->settings.preferred.width = xdev->hmd->screens[0].w_pixels;
@@ -797,9 +906,23 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	}
 #endif
 
+#ifdef XRT_OS_MACOS
+	if (c->macos_window != NULL) {
+		uint32_t mac_w = 0, mac_h = 0;
+		comp_vk_native_window_macos_get_dimensions(c->macos_window, &mac_w, &mac_h);
+		if (mac_w > 0 && mac_h > 0) {
+			c->settings.preferred.width = mac_w;
+			c->settings.preferred.height = mac_h;
+		}
+	}
+#endif
+
 	// Create output target (VkSwapchainKHR) if we have a window
 	if (hwnd != NULL
 #ifdef XRT_OS_WINDOWS
+	    || c->owns_window
+#endif
+#ifdef XRT_OS_MACOS
 	    || c->owns_window
 #endif
 	) {
@@ -1054,6 +1177,60 @@ comp_vk_native_compositor_get_window_metrics(struct xrt_compositor *xc,
 
 	out_metrics->valid = true;
 	return true;
+#elif defined(XRT_OS_MACOS)
+	// On macOS, delegate to display processor if available
+	if (c->display_processor != NULL) {
+		// Use xrt_display_processor_get_display_pixel_info + dimensions
+		uint32_t disp_px_w = 0, disp_px_h = 0;
+		int32_t disp_left = 0, disp_top = 0;
+		if (!xrt_display_processor_get_display_pixel_info(
+		        c->display_processor, &disp_px_w, &disp_px_h,
+		        &disp_left, &disp_top)) {
+			return false;
+		}
+		if (disp_px_w == 0 || disp_px_h == 0) return false;
+
+		float disp_w_m = 0.0f, disp_h_m = 0.0f;
+		if (!xrt_display_processor_get_display_dimensions(
+		        c->display_processor, &disp_w_m, &disp_h_m)) {
+			return false;
+		}
+
+		uint32_t win_px_w = c->settings.preferred.width;
+		uint32_t win_px_h = c->settings.preferred.height;
+		if (win_px_w == 0 || win_px_h == 0) return false;
+
+		float pixel_size_x = disp_w_m / (float)disp_px_w;
+		float pixel_size_y = disp_h_m / (float)disp_px_h;
+
+		out_metrics->display_width_m = disp_w_m;
+		out_metrics->display_height_m = disp_h_m;
+		out_metrics->display_pixel_width = disp_px_w;
+		out_metrics->display_pixel_height = disp_px_h;
+		out_metrics->display_screen_left = disp_left;
+		out_metrics->display_screen_top = disp_top;
+
+		out_metrics->window_pixel_width = win_px_w;
+		out_metrics->window_pixel_height = win_px_h;
+		out_metrics->window_screen_left = 0;
+		out_metrics->window_screen_top = 0;
+
+		out_metrics->window_width_m = (float)win_px_w * pixel_size_x;
+		out_metrics->window_height_m = (float)win_px_h * pixel_size_y;
+
+		// Center offset (assume centered for now)
+		float win_center_px_x = (float)win_px_w / 2.0f;
+		float win_center_px_y = (float)win_px_h / 2.0f;
+		float disp_center_px_x = (float)disp_px_w / 2.0f;
+		float disp_center_px_y = (float)disp_px_h / 2.0f;
+
+		out_metrics->window_center_offset_x_m = (win_center_px_x - disp_center_px_x) * pixel_size_x;
+		out_metrics->window_center_offset_y_m = -((win_center_px_y - disp_center_px_y) * pixel_size_y);
+
+		out_metrics->valid = true;
+		return true;
+	}
+	return false;
 #else
 	(void)c;
 	return false;
@@ -1084,6 +1261,8 @@ comp_vk_native_compositor_set_system_devices(struct xrt_compositor *xc,
 	if (xsysd != NULL) {
 		U_LOG_I("VK native compositor: system devices set");
 	}
+
+	// macOS: no window-level input handling needed (uses oxr_macos event pump)
 
 #ifdef XRT_OS_WINDOWS
 	if (c->owns_window && c->own_window != NULL) {
