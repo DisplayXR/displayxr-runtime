@@ -62,6 +62,14 @@ if(XRT_HAVE_OPENGL AND WIN32)
 		)
 endif()
 
+if(APPLE AND XRT_HAVE_OPENGL AND XRT_HAVE_METAL)
+	target_sources(
+		comp_client PRIVATE client/comp_gl_macos_client.h client/comp_gl_macos_client.m
+				    client/comp_gl_macos_glue.m
+		)
+	target_link_libraries(comp_client PRIVATE "-framework OpenGL" "-framework IOSurface")
+endif()
+
 if(XRT_HAVE_D3D11 OR XRT_HAVE_D3D12)
 	target_link_libraries(comp_client PRIVATE aux_d3d)
 	target_sources(comp_client PRIVATE client/comp_d3d_common.cpp client/comp_d3d_common.hpp)

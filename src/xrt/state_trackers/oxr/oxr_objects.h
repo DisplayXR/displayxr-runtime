@@ -1279,6 +1279,17 @@ oxr_session_populate_gl_native(struct oxr_logger *log,
                                 struct oxr_session *sess);
 #endif
 
+#if defined(XRT_HAVE_METAL_NATIVE_COMPOSITOR) && defined(XRT_HAVE_OPENGL)
+/*!
+ * Populate the session for macOS OpenGL via Metal native compositor + IOSurface.
+ */
+XrResult
+oxr_session_populate_gl_macos(struct oxr_logger *log,
+                               struct oxr_system *sys,
+                               const void *next,
+                               struct oxr_session *sess);
+#endif
+
 #if defined(XR_USE_GRAPHICS_API_OPENGL_ES)
 #if defined(XR_USE_PLATFORM_ANDROID)
 XrResult
