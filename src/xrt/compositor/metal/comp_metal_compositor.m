@@ -177,6 +177,9 @@ struct comp_metal_compositor
 	//! True if running in offscreen mode (hidden window, no visible UI).
 	bool offscreen;
 
+	//! True if swapchain content comes from GL (needs Y-flip on sample).
+	bool source_is_gl;
+
 	//! App-provided IOSurface for shared texture output (retained, may be NULL).
 	IOSurfaceRef shared_iosurface;
 
@@ -290,6 +293,8 @@ static NSString *const metal_shader_source = @
     "    float4 src_rect;  // x, y, width, height (input UV sub-region)\n"
     "    float4 color_scale;\n"
     "    float4 color_bias;\n"
+    "    float  swizzle_rb; // 1.0 to swap R and B channels (GL BGRA IOSurface)\n"
+    "    float  _pad[3];\n"
     "};\n"
     "\n"
     "vertex VertexOut projection_vertex(uint vid [[vertex_id]],\n"
@@ -309,6 +314,7 @@ static NSString *const metal_shader_source = @
     "                                    sampler smp [[sampler(0)]],\n"
     "                                    constant ProjectionConstants &pc [[buffer(0)]]) {\n"
     "    float4 color = tex.sample(smp, in.texCoord);\n"
+    "    if (pc.swizzle_rb > 0.5) color = float4(color.b, color.g, color.r, color.a);\n"
     "    return color * pc.color_scale + pc.color_bias;\n"
     "}\n";
 
@@ -685,13 +691,17 @@ setup_external_window(struct comp_metal_compositor *c, NSView *external_view)
 	if ([external_view.layer isKindOfClass:[CAMetalLayer class]]) {
 		c->metal_layer = (CAMetalLayer *)external_view.layer;
 	} else {
-		// View doesn't have a CAMetalLayer - create one
+		// View doesn't have a CAMetalLayer (e.g. NSOpenGLView for GL apps).
+		// Add a CAMetalLayer as a sublayer on top so both GL context and
+		// Metal presentation can coexist.
 		void (^setup_layer)(void) = ^{
 			external_view.wantsLayer = YES;
 			CAMetalLayer *layer = [CAMetalLayer layer];
 			layer.device = c->device;
 			layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
-			external_view.layer = layer;
+			layer.frame = external_view.bounds;
+			layer.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
+			[external_view.layer addSublayer:layer];
 			c->metal_layer = layer;
 		};
 		if ([NSThread isMainThread]) {
@@ -1322,6 +1332,8 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 					float src_rect[4];
 					float color_scale[4];
 					float color_bias[4];
+					float swizzle_rb;
+					float _pad[3];
 				} constants;
 
 				constants.viewport[0] = 0.0f;
@@ -1330,9 +1342,16 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 				constants.viewport[3] = 1.0f;
 
 				constants.src_rect[0] = nr.x;
-				constants.src_rect[1] = nr.y;
+				if (c->source_is_gl) {
+					// GL renders bottom-up, IOSurface/Metal is top-down.
+					// Flip Y: start at bottom of source rect, sample upward.
+					constants.src_rect[1] = nr.y + nr.h;
+					constants.src_rect[3] = -nr.h;
+				} else {
+					constants.src_rect[1] = nr.y;
+					constants.src_rect[3] = nr.h;
+				}
 				constants.src_rect[2] = nr.w;
-				constants.src_rect[3] = nr.h;
 
 				constants.color_scale[0] = 1.0f;
 				constants.color_scale[1] = 1.0f;
@@ -1342,6 +1361,8 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 				constants.color_bias[1] = 0.0f;
 				constants.color_bias[2] = 0.0f;
 				constants.color_bias[3] = 0.0f;
+				constants.swizzle_rb = c->source_is_gl ? 1.0f : 0.0f;
+				constants._pad[0] = constants._pad[1] = constants._pad[2] = 0.0f;
 
 				[encoder setVertexBytes:&constants length:sizeof(constants) atIndex:0];
 				[encoder setFragmentBytes:&constants length:sizeof(constants) atIndex:0];
@@ -1839,6 +1860,13 @@ comp_metal_compositor_set_sys_info(struct xrt_compositor *xc,
 {
 	struct comp_metal_compositor *c = metal_comp(xc);
 	c->sys_info = info;
+}
+
+void
+comp_metal_compositor_set_source_gl(struct xrt_compositor *xc)
+{
+	struct comp_metal_compositor *c = metal_comp(xc);
+	c->source_is_gl = true;
 }
 
 void *

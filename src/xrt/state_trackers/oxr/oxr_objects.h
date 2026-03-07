@@ -1287,6 +1287,7 @@ XrResult
 oxr_session_populate_gl_macos(struct oxr_logger *log,
                                struct oxr_system *sys,
                                const void *next,
+                               void *window_handle,
                                struct oxr_session *sess);
 #endif
 

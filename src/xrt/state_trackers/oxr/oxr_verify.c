@@ -548,6 +548,21 @@ oxr_verify_XrSessionCreateInfo(struct oxr_logger *log,
 	}
 #endif // XR_USE_GRAPHICS_API_METAL
 
+#if defined(XRT_HAVE_METAL_NATIVE_COMPOSITOR) && defined(XRT_HAVE_OPENGL)
+	{
+		const XrGraphicsBindingOpenGLMacOSEXT *opengl_macos = OXR_GET_INPUT_FROM_CHAIN(
+		    createInfo, XR_TYPE_GRAPHICS_BINDING_OPENGL_MACOS_EXT, XrGraphicsBindingOpenGLMacOSEXT);
+		if (opengl_macos != NULL) {
+			OXR_VERIFY_EXTENSION(log, inst, EXT_macos_gl_binding);
+			if (opengl_macos->cglContext == NULL) {
+				return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
+				                 "(XrGraphicsBindingOpenGLMacOSEXT) cglContext is NULL");
+			}
+			return XR_SUCCESS;
+		}
+	}
+#endif
+
 	/*
 	 * Add any new graphics binding structs here - before the headless
 	 * check. (order for non-headless checks not specified in standard.)

@@ -33,18 +33,20 @@
 #include "openxr/XR_EXT_macos_gl_binding.h"
 
 /*!
- * Convert Metal pixel format enum values to GL format enum values.
- * Metal and GL use different format numbering.
+ * Convert Metal pixel format enum values to Vulkan format enum values.
+ * The GL client compositor's init (client_gl_compositor_init) will then
+ * convert these VK values to GL via vk_format_to_gl().
  */
 static int64_t
-metal_format_to_gl(int64_t metal_fmt)
+metal_format_to_vk(int64_t metal_fmt)
 {
 	switch (metal_fmt) {
-	case 70:  return 0x8058; // MTLPixelFormatRGBA8Unorm -> GL_RGBA8
-	case 71:  return 0x8C43; // MTLPixelFormatRGBA8Unorm_sRGB -> GL_SRGB8_ALPHA8
-	case 80:  return 0x8058; // MTLPixelFormatBGRA8Unorm -> GL_RGBA8
-	case 81:  return 0x8C43; // MTLPixelFormatBGRA8Unorm_sRGB -> GL_SRGB8_ALPHA8
-	case 115: return 0x881A; // MTLPixelFormatRGBA16Float -> GL_RGBA16F
+	case 70:  return 37;  // MTLPixelFormatRGBA8Unorm     -> VK_FORMAT_R8G8B8A8_UNORM
+	case 71:  return 43;  // MTLPixelFormatRGBA8Unorm_sRGB -> VK_FORMAT_R8G8B8A8_SRGB
+	case 80:  return 44;  // MTLPixelFormatBGRA8Unorm     -> VK_FORMAT_B8G8R8A8_UNORM
+	case 81:  return 50;  // MTLPixelFormatBGRA8Unorm_sRGB -> VK_FORMAT_B8G8R8A8_SRGB
+	case 115: return 97;  // MTLPixelFormatRGBA16Float    -> VK_FORMAT_R16G16B16A16_SFLOAT
+	case 252: return 126; // MTLPixelFormatDepth32Float   -> VK_FORMAT_D32_SFLOAT
 	default:  return metal_fmt;
 	}
 }
@@ -53,6 +55,7 @@ XrResult
 oxr_session_populate_gl_macos(struct oxr_logger *log,
                                struct oxr_system *sys,
                                const void *next_ptr,
+                               void *window_handle,
                                struct oxr_session *sess)
 {
 	const XrGraphicsBindingOpenGLMacOSEXT *next = (const XrGraphicsBindingOpenGLMacOSEXT *)next_ptr;
@@ -65,19 +68,24 @@ oxr_session_populate_gl_macos(struct oxr_logger *log,
 		dp_factory_metal = sys->xsysc->info.dp_factory_metal;
 	}
 
-	// Create the Metal native compositor (it will create its own device)
+	// Create the Metal native compositor.
+	// Pass the external window handle (NSView) from cocoa_window_binding if available.
+	// The Metal compositor will add a CAMetalLayer to this view for presentation.
 	xrt_result_t xret = comp_metal_compositor_create(
 	    xdev,
-	    NULL,  // window_handle
-	    NULL,  // command_queue
+	    window_handle,  // NSView from cocoa_window_binding (or NULL)
+	    NULL,           // command_queue
 	    dp_factory_metal,
-	    false, // offscreen
-	    NULL,  // shared_iosurface
+	    false,          // offscreen
+	    NULL,           // shared_iosurface
 	    &xcn);
 	if (xret != XRT_SUCCESS) {
 		return oxr_error(log, XR_ERROR_INITIALIZATION_FAILED,
 		                 "Failed to create Metal native compositor for GL app: %d", xret);
 	}
+
+	// Mark as GL source so Metal compositor flips Y when sampling
+	comp_metal_compositor_set_source_gl(&xcn->base);
 
 	// Set system devices for qwerty driver support
 	comp_metal_compositor_set_system_devices(&xcn->base, sess->sys->xsysd);
@@ -87,9 +95,10 @@ oxr_session_populate_gl_macos(struct oxr_logger *log,
 		comp_metal_compositor_set_sys_info(&xcn->base, &sys->xsysc->info);
 	}
 
-	// Convert format list from Metal to GL enum values
+	// Convert format list from Metal to VK enum values.
+	// client_gl_compositor_init will then convert VK -> GL.
 	for (uint32_t i = 0; i < xcn->base.info.format_count; i++) {
-		xcn->base.info.formats[i] = metal_format_to_gl(xcn->base.info.formats[i]);
+		xcn->base.info.formats[i] = metal_format_to_vk(xcn->base.info.formats[i]);
 	}
 
 	// Wrap the Metal native compositor with a macOS GL client compositor.
