@@ -56,6 +56,7 @@ oxr_session_populate_gl_macos(struct oxr_logger *log,
                                struct oxr_system *sys,
                                const void *next_ptr,
                                void *window_handle,
+                               void *shared_iosurface,
                                struct oxr_session *sess)
 {
 	const XrGraphicsBindingOpenGLMacOSEXT *next = (const XrGraphicsBindingOpenGLMacOSEXT *)next_ptr;
@@ -68,16 +69,19 @@ oxr_session_populate_gl_macos(struct oxr_logger *log,
 		dp_factory_metal = sys->xsysc->info.dp_factory_metal;
 	}
 
+	// Offscreen mode: no window handle but has shared IOSurface
+	bool offscreen = (window_handle == NULL && shared_iosurface != NULL);
+
 	// Create the Metal native compositor.
 	// Pass the external window handle (NSView) from cocoa_window_binding if available.
 	// The Metal compositor will add a CAMetalLayer to this view for presentation.
 	xrt_result_t xret = comp_metal_compositor_create(
 	    xdev,
-	    window_handle,  // NSView from cocoa_window_binding (or NULL)
-	    NULL,           // command_queue
+	    window_handle,      // NSView from cocoa_window_binding (or NULL)
+	    NULL,               // command_queue
 	    dp_factory_metal,
-	    false,          // offscreen
-	    NULL,           // shared_iosurface
+	    offscreen,          // offscreen
+	    shared_iosurface,   // shared_iosurface from cocoa_window_binding
 	    &xcn);
 	if (xret != XRT_SUCCESS) {
 		return oxr_error(log, XR_ERROR_INITIALIZATION_FAILED,

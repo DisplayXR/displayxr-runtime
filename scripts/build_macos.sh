@@ -114,6 +114,14 @@ cmake -B "$ROOT/test_apps/cube_shared_metal_macos/build" \
   -DCMAKE_PREFIX_PATH="$OPENXR_DIR"
 cmake --build "$ROOT/test_apps/cube_shared_metal_macos/build"
 
+# Step 3h: Build OpenGL shared texture cube test app
+echo "=== Building cube_shared_gl_macos ==="
+cmake -B "$ROOT/test_apps/cube_shared_gl_macos/build" \
+  -S "$ROOT/test_apps/cube_shared_gl_macos" -G Ninja \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_PREFIX_PATH="$OPENXR_DIR"
+cmake --build "$ROOT/test_apps/cube_shared_gl_macos/build"
+
 # Step 3f: Build 3DGS demo app
 echo "=== Building gaussian_splatting_vk_macos ==="
 cmake -B "$ROOT/demos/gaussian_splatting_vk_macos/build" \
@@ -135,7 +143,7 @@ echo "=== Packaging artifacts ==="
 PKG_DIR="$ROOT/_package/SRMonado-macOS"
 # Clean managed directories only (preserve user-added files like run_bridge_host.sh)
 rm -rf "$PKG_DIR/lib" "$PKG_DIR/bin" "$PKG_DIR/share" 2>/dev/null || true
-rm -f "$PKG_DIR/openxr_monado.json" "$PKG_DIR/run_cube_vk.sh" "$PKG_DIR/run_cube_ext_vk.sh" "$PKG_DIR/run_cube_metal.sh" "$PKG_DIR/run_cube_ext_metal.sh" "$PKG_DIR/run_cube_ext_gl.sh" "$PKG_DIR/run_cube_metal_ext.sh" "$PKG_DIR/run_gaussian_splatting.sh" "$PKG_DIR/run_sim_cube.sh" "$PKG_DIR/run_sim_cube_ext.sh" "$PKG_DIR/run_sim_3dgs_ext.sh" 2>/dev/null || true
+rm -f "$PKG_DIR/openxr_monado.json" "$PKG_DIR/run_cube_vk.sh" "$PKG_DIR/run_cube_ext_vk.sh" "$PKG_DIR/run_cube_metal.sh" "$PKG_DIR/run_cube_ext_metal.sh" "$PKG_DIR/run_cube_ext_gl.sh" "$PKG_DIR/run_cube_shared_metal.sh" "$PKG_DIR/run_cube_shared_gl.sh" "$PKG_DIR/run_cube_metal_ext.sh" "$PKG_DIR/run_gaussian_splatting.sh" "$PKG_DIR/run_sim_cube.sh" "$PKG_DIR/run_sim_cube_ext.sh" "$PKG_DIR/run_sim_3dgs_ext.sh" 2>/dev/null || true
 mkdir -p "$PKG_DIR/lib"
 mkdir -p "$PKG_DIR/share/vulkan/icd.d"
 mkdir -p "$PKG_DIR/bin"
@@ -152,6 +160,7 @@ cp "$ROOT/test_apps/cube_metal_macos/build/cube_metal_macos" "$PKG_DIR/bin/" 2>/
 cp "$ROOT/test_apps/cube_ext_metal_macos/build/cube_ext_metal_macos" "$PKG_DIR/bin/" 2>/dev/null || true
 cp "$ROOT/test_apps/cube_ext_gl_macos/build/cube_ext_gl_macos" "$PKG_DIR/bin/" 2>/dev/null || true
 cp "$ROOT/test_apps/cube_shared_metal_macos/build/cube_shared_metal_macos" "$PKG_DIR/bin/" 2>/dev/null || true
+cp "$ROOT/test_apps/cube_shared_gl_macos/build/cube_shared_gl_macos" "$PKG_DIR/bin/" 2>/dev/null || true
 cp "$ROOT/demos/gaussian_splatting_vk_macos/build/gaussian_splatting_vk_macos" "$PKG_DIR/bin/" 2>/dev/null || true
 
 # Copy texture files for ext app
@@ -184,6 +193,7 @@ install_name_tool -add_rpath @executable_path/../lib "$PKG_DIR/bin/cube_metal_ma
 install_name_tool -add_rpath @executable_path/../lib "$PKG_DIR/bin/cube_ext_metal_macos" 2>/dev/null || true
 install_name_tool -add_rpath @executable_path/../lib "$PKG_DIR/bin/cube_ext_gl_macos" 2>/dev/null || true
 install_name_tool -add_rpath @executable_path/../lib "$PKG_DIR/bin/cube_shared_metal_macos" 2>/dev/null || true
+install_name_tool -add_rpath @executable_path/../lib "$PKG_DIR/bin/cube_shared_gl_macos" 2>/dev/null || true
 install_name_tool -add_rpath @executable_path/../lib "$PKG_DIR/bin/gaussian_splatting_vk_macos" 2>/dev/null || true
 install_name_tool -add_rpath @loader_path "$PKG_DIR"/lib/libopenxr_loader*.dylib 2>/dev/null || true
 
@@ -292,6 +302,19 @@ exec "$DIR/bin/cube_shared_metal_macos" "$@"
 SCRIPT
 chmod +x "$PKG_DIR/run_cube_shared_metal.sh"
 
+# Create run script for OpenGL shared texture cube test app
+cat > "$PKG_DIR/run_cube_shared_gl.sh" <<'SCRIPT'
+#!/bin/bash
+DIR="$(cd "$(dirname "$0")" && pwd)"
+export XR_RUNTIME_JSON="$DIR/openxr_monado.json"
+export DYLD_LIBRARY_PATH="$DIR/lib:${DYLD_LIBRARY_PATH:-}"
+export SIM_DISPLAY_ENABLE=1
+export SIM_DISPLAY_OUTPUT="${SIM_DISPLAY_OUTPUT:-anaglyph}"
+echo "Starting cube_shared_gl_macos (OpenGL, IOSurface shared texture) with $SIM_DISPLAY_OUTPUT output..."
+exec "$DIR/bin/cube_shared_gl_macos" "$@"
+SCRIPT
+chmod +x "$PKG_DIR/run_cube_shared_gl.sh"
+
 # Create run script for 3DGS demo app
 cat > "$PKG_DIR/run_gaussian_splatting.sh" <<'SCRIPT'
 #!/bin/bash
@@ -330,6 +353,7 @@ echo "  $PKG_DIR/run_cube_metal.sh"
 echo "  $PKG_DIR/run_cube_ext_metal.sh"
 echo "  $PKG_DIR/run_cube_ext_gl.sh"
 echo "  $PKG_DIR/run_cube_shared_metal.sh"
+echo "  $PKG_DIR/run_cube_shared_gl.sh"
 echo "  $PKG_DIR/run_gaussian_splatting.sh"
 echo ""
 echo "Or run manually:"
