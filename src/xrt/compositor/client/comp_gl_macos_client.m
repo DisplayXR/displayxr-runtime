@@ -83,37 +83,26 @@ client_gl_iosurface_swapchain_destroy(struct xrt_swapchain *xsc)
 }
 
 /*!
- * Convert Metal pixel format to GL internal format for IOSurface binding.
+ * Get the GL pixel transfer format for CGLTexImageIOSurface2D from the GL internal format.
+ * Apple requires GL_BGRA + GL_UNSIGNED_INT_8_8_8_8_REV for 8-bit IOSurface textures.
+ * This means R and B channels are swapped relative to RGBA — the Metal compositor
+ * handles the swizzle when source_is_gl is set.
  */
 static GLenum
-metal_format_to_gl_internal(int64_t metal_fmt)
+gl_internal_to_transfer_format(GLenum gl_internal)
 {
-	switch (metal_fmt) {
-	case 70:  return GL_RGBA8;       // MTLPixelFormatRGBA8Unorm
-	case 71:  return GL_SRGB8_ALPHA8; // MTLPixelFormatRGBA8Unorm_sRGB
-	case 80:  return GL_RGBA8;       // MTLPixelFormatBGRA8Unorm (GL doesn't distinguish BGRA internal)
-	case 81:  return GL_SRGB8_ALPHA8; // MTLPixelFormatBGRA8Unorm_sRGB
-	case 115: return GL_RGBA16F;     // MTLPixelFormatRGBA16Float
-	default:  return GL_RGBA8;
+	switch (gl_internal) {
+	case GL_RGBA16F:      return GL_RGBA;
+	default:              return GL_BGRA;
 	}
 }
 
 static GLenum
-metal_format_to_gl_format(int64_t metal_fmt)
+gl_internal_to_transfer_type(GLenum gl_internal)
 {
-	switch (metal_fmt) {
-	case 80:
-	case 81:  return GL_BGRA; // MTLPixelFormatBGRA8Unorm[_sRGB]
-	default:  return GL_RGBA;
-	}
-}
-
-static GLenum
-metal_format_to_gl_type(int64_t metal_fmt)
-{
-	switch (metal_fmt) {
-	case 115: return GL_HALF_FLOAT; // MTLPixelFormatRGBA16Float
-	default:  return GL_UNSIGNED_BYTE;
+	switch (gl_internal) {
+	case GL_RGBA16F:      return GL_HALF_FLOAT;
+	default:              return GL_UNSIGNED_INT_8_8_8_8_REV;
 	}
 }
 
@@ -143,9 +132,10 @@ client_gl_iosurface_swapchain_create(struct xrt_compositor *xc,
 	struct xrt_swapchain_gl *xscgl = &sc->base.base;
 	glGenTextures(native_xsc->image_count, xscgl->images);
 
-	GLenum gl_internal = metal_format_to_gl_internal(info->format);
-	GLenum gl_format = metal_format_to_gl_format(info->format);
-	GLenum gl_type = metal_format_to_gl_type(info->format);
+	// info->format is already a GL internal format (e.g. GL_RGBA8, GL_SRGB8_ALPHA8, GL_RGBA16F)
+	GLenum gl_internal = (GLenum)info->format;
+	GLenum gl_format = gl_internal_to_transfer_format(gl_internal);
+	GLenum gl_type = gl_internal_to_transfer_type(gl_internal);
 
 	for (uint32_t i = 0; i < native_xsc->image_count; i++) {
 		IOSurfaceRef surface = (IOSurfaceRef)xscn->images[i].handle;

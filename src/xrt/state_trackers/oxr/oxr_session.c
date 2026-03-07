@@ -1924,7 +1924,22 @@ oxr_session_create_impl(struct oxr_logger *log,
 			if (xret != XRT_SUCCESS) {
 				return oxr_error(log, XR_ERROR_RUNTIME_FAILURE, "Failed to create xrt_session! '%i'", xret);
 			}
-			return oxr_session_populate_gl_macos(log, sys, opengl_macos, *out_session);
+			// Extract external window handle from cocoa_window_binding if present
+			void *window_handle = NULL;
+			const XrCocoaWindowBindingCreateInfoEXT *cocoa_binding = OXR_GET_INPUT_FROM_CHAIN(
+			    createInfo, XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_EXT, XrCocoaWindowBindingCreateInfoEXT);
+			if (cocoa_binding != NULL && cocoa_binding->viewHandle != NULL) {
+				window_handle = (void *)cocoa_binding->viewHandle;
+			}
+			XrResult ret = oxr_session_populate_gl_macos(log, sys, opengl_macos, window_handle, *out_session);
+			if (ret == XR_SUCCESS && window_handle != NULL) {
+				(*out_session)->has_external_window = true;
+				struct xrt_device *head = GET_XDEV_BY_ROLE((*out_session)->sys, head);
+				if (head != NULL) {
+					xrt_device_set_property(head, XRT_DEVICE_PROPERTY_EXT_APP_MODE, 1);
+				}
+			}
+			return ret;
 		}
 	}
 #endif
