@@ -12,13 +12,15 @@
 #include <stdlib.h>
 
 #import <OpenGL/OpenGL.h>
-#import <OpenGL/gl3.h>
-#import <IOSurface/IOSurface.h>
 #import <OpenGL/CGLIOSurface.h>
+#import <IOSurface/IOSurface.h>
+#include <dlfcn.h>
 
 #include "xrt/xrt_handles.h"
 #include "util/u_misc.h"
 #include "util/u_logging.h"
+
+// Use GLAD for GL functions (not <OpenGL/gl3.h> which conflicts with GLAD)
 #include "ogl/ogl_api.h"
 
 #include "client/comp_gl_client.h"
@@ -235,6 +237,17 @@ client_gl_context_end_locked(struct xrt_compositor *xc, enum client_gl_context_r
 
 
 // ============================================================================
+// GLAD loader for macOS (dlsym on OpenGL framework)
+// ============================================================================
+
+static GLADapiproc
+gl_get_proc_addr_macos(void *userptr, const char *name)
+{
+	return (GLADapiproc)dlsym(userptr, name);
+}
+
+
+// ============================================================================
 // Public API
 // ============================================================================
 
@@ -256,8 +269,15 @@ client_gl_macos_compositor_create(struct xrt_compositor_native *xcn, void *cglCo
 		return NULL;
 	}
 
-	// Load GL functions via GLAD
-	int gl_result = gladLoadGLUserPtr((GLADuserptrloadfunc)CGLGetProcAddress, NULL);
+	// Load GL functions via GLAD using dlsym on the OpenGL framework
+	void *gl_framework = dlopen("/System/Library/Frameworks/OpenGL.framework/OpenGL", RTLD_LAZY);
+	if (gl_framework == NULL) {
+		U_LOG_E("Failed to open OpenGL framework: %s", dlerror());
+		if (need_make_current) context_make_current(&current_ctx);
+		return NULL;
+	}
+
+	int gl_result = gladLoadGLUserPtr(gl_get_proc_addr_macos, gl_framework);
 
 	if (glGetString != NULL) {
 		U_LOG_W("OpenGL context (macOS CGL):"
@@ -276,6 +296,7 @@ client_gl_macos_compositor_create(struct xrt_compositor_native *xcn, void *cglCo
 
 	if (gl_result == 0) {
 		U_LOG_E("Failed to load GL functions via GLAD: 0x%08x", gl_result);
+		dlclose(gl_framework);
 		return NULL;
 	}
 

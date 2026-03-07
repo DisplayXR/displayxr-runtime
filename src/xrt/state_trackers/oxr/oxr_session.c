@@ -70,6 +70,9 @@
 
 #ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR
 #include "metal/comp_metal_compositor.h"
+#ifdef XRT_HAVE_OPENGL
+#include "openxr/XR_EXT_macos_gl_binding.h"
+#endif
 #endif
 
 #ifdef XRT_HAVE_GL_NATIVE_COMPOSITOR
@@ -1853,6 +1856,26 @@ oxr_session_create_impl(struct oxr_logger *log,
 		// Fall back to Vulkan-backed GL compositor
 		OXR_CREATE_XRT_SESSION_AND_NATIVE_COMPOSITOR(log, xsi, *out_session);
 		return oxr_session_populate_gl_win32(log, sys, opengl_win32, *out_session);
+	}
+#endif
+
+#if defined(XRT_HAVE_METAL_NATIVE_COMPOSITOR) && defined(XRT_HAVE_OPENGL)
+	// macOS OpenGL apps: route through Metal native compositor via IOSurface
+	{
+		const XrGraphicsBindingOpenGLMacOSEXT *opengl_macos = OXR_GET_INPUT_FROM_CHAIN(
+		    createInfo, XR_TYPE_GRAPHICS_BINDING_OPENGL_MACOS_EXT, XrGraphicsBindingOpenGLMacOSEXT);
+		if (opengl_macos != NULL) {
+			OXR_SESSION_ALLOCATE_AND_INIT(log, sys, OXR_SESSION_GRAPHICS_EXT_MACOS_GL, *out_session);
+			// Create session without Vulkan compositor — Metal handles presentation
+			xrt_result_t xret = xrt_system_create_session(sys->xsys, xsi, &(*out_session)->xs, NULL);
+			if (xret == XRT_ERROR_MULTI_SESSION_NOT_IMPLEMENTED) {
+				return oxr_error(log, XR_ERROR_LIMIT_REACHED, "Per instance multi-session not supported.");
+			}
+			if (xret != XRT_SUCCESS) {
+				return oxr_error(log, XR_ERROR_RUNTIME_FAILURE, "Failed to create xrt_session! '%i'", xret);
+			}
+			return oxr_session_populate_gl_macos(log, sys, opengl_macos, *out_session);
+		}
 	}
 #endif
 

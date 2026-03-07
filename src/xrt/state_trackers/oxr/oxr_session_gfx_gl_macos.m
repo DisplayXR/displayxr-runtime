@@ -52,9 +52,10 @@ metal_format_to_gl(int64_t metal_fmt)
 XrResult
 oxr_session_populate_gl_macos(struct oxr_logger *log,
                                struct oxr_system *sys,
-                               XrGraphicsBindingOpenGLMacOSEXT const *next,
+                               const void *next_ptr,
                                struct oxr_session *sess)
 {
+	const XrGraphicsBindingOpenGLMacOSEXT *next = (const XrGraphicsBindingOpenGLMacOSEXT *)next_ptr;
 	struct xrt_device *xdev = get_role_head(sess->sys);
 	struct xrt_compositor_native *xcn = NULL;
 
