@@ -449,7 +449,7 @@ comp_d3d12_renderer_draw(struct comp_d3d12_renderer *renderer,
 			struct xrt_swapchain_native *xscn = (struct xrt_swapchain_native *)xsc;
 			uint32_t img_index = layer->data.flip_y ? 0 : 0; // Use last released
 			// The image to use is determined by the sub_image index
-			img_index = layer->data.views[vi].sub.image_index;
+			img_index = layer->data.proj.v[vi].sub.image_index;
 			ID3D12Resource *src_resource = reinterpret_cast<ID3D12Resource *>(
 			    xscn->images[img_index].handle);
 
