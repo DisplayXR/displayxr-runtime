@@ -78,36 +78,7 @@ struct comp_metal_swapchain
  *
  */
 
-@interface CompHudOverlayView : NSView
-@property (nonatomic, copy) NSString *hudText;
-@end
-
-@implementation CompHudOverlayView
-- (instancetype)initWithFrame:(NSRect)frame {
-	self = [super initWithFrame:frame];
-	if (self) { _hudText = @""; [self setWantsLayer:YES]; }
-	return self;
-}
-- (BOOL)isOpaque { return NO; }
-- (NSView *)hitTest:(NSPoint)point { (void)point; return nil; }
-- (void)drawRect:(NSRect)dirtyRect {
-	(void)dirtyRect;
-	if (_hudText.length == 0) return;
-	NSBezierPath *bg = [NSBezierPath bezierPathWithRoundedRect:self.bounds xRadius:6 yRadius:6];
-	[[NSColor colorWithCalibratedRed:0 green:0 blue:0 alpha:0.5] setFill];
-	[bg fill];
-	NSFont *font = [NSFont fontWithName:@"Menlo" size:11];
-	if (!font) font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
-	NSDictionary *attrs = @{
-	    NSFontAttributeName: font,
-	    NSForegroundColorAttributeName: [NSColor colorWithCalibratedRed:0.9 green:0.9 blue:0.9 alpha:1.0]
-	};
-	NSRect textRect = NSInsetRect(self.bounds, 8, 8);
-	[_hudText drawWithRect:textRect
-	               options:NSStringDrawingUsesLineFragmentOrigin | NSStringDrawingTruncatesLastVisibleLine
-	            attributes:attrs context:nil];
-}
-@end
+#import "util/comp_hud_overlay_macos.h"
 
 /*
  *
@@ -1113,8 +1084,10 @@ metal_compositor_update_hud(struct comp_metal_compositor *c, float dt)
 	if (c->xdev != NULL) {
 		xrt_device_get_property(c->xdev, XRT_DEVICE_PROPERTY_OUTPUT_MODE, &output_mode);
 	}
-	const char *mode_names[] = {"SBS", "Anaglyph", "Blend"};
-	const char *mode_name = (output_mode >= 0 && output_mode <= 2) ? mode_names[output_mode] : "?";
+	const char *mode_name = "?";
+	if (c->xdev != NULL && output_mode >= 0 && (uint32_t)output_mode < c->xdev->rendering_mode_count) {
+		mode_name = c->xdev->rendering_modes[output_mode].mode_name;
+	}
 
 	// Display info from system compositor
 	float disp_w_mm = 0, disp_h_mm = 0;

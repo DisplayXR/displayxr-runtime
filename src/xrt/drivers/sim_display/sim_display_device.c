@@ -495,6 +495,15 @@ sim_display_hmd_create(void)
 	}
 	snprintf(hmd->base.serial, XRT_DEVICE_NAME_LEN, "sim_display_0");
 
+	// Rendering modes: sim_display supports 3 modes.
+	hmd->base.rendering_mode_count = 3;
+	hmd->base.rendering_modes[0].mode_index = 0;
+	snprintf(hmd->base.rendering_modes[0].mode_name, XRT_DEVICE_NAME_LEN, "SBS");
+	hmd->base.rendering_modes[1].mode_index = 1;
+	snprintf(hmd->base.rendering_modes[1].mode_name, XRT_DEVICE_NAME_LEN, "Anaglyph");
+	hmd->base.rendering_modes[2].mode_index = 2;
+	snprintf(hmd->base.rendering_modes[2].mode_name, XRT_DEVICE_NAME_LEN, "Blend");
+
 	// Head pose input.
 	hmd->base.inputs[0].name = XRT_INPUT_GENERIC_HEAD_POSE;
 

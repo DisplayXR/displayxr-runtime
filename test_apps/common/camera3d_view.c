@@ -137,6 +137,70 @@ camera3d_default_tunables(void)
 }
 
 void
+camera3d_compute_view(const XrVector3f *processed_eye,
+                      float nominal_z,
+                      const Display3DScreen *screen,
+                      const Camera3DTunables *tunables,
+                      const XrPosef *camera_pose,
+                      float near_z,
+                      float far_z,
+                      Camera3DStereoView *out)
+{
+	Camera3DTunables t = tunables ? *tunables : camera3d_default_tunables();
+
+	XrQuaternionf cam_ori = {0, 0, 0, 1};
+	XrVector3f cam_pos = {0, 0, 0};
+	if (camera_pose) {
+		cam_ori = camera_pose->orientation;
+		cam_pos = camera_pose->position;
+	}
+
+	float aspect = screen->width_m / screen->height_m;
+	float ro = t.half_tan_vfov * aspect;
+	float uo = t.half_tan_vfov;
+	float invd = t.inv_convergence_distance;
+
+	// eye_local = displacement from nominal screen plane
+	XrVector3f eye_local;
+	eye_local.x = processed_eye->x;
+	eye_local.y = processed_eye->y;
+	eye_local.z = processed_eye->z - nominal_z;
+
+	// Transform to world space
+	XrVector3f eye_world = cam3d_quat_rotate(cam_ori, eye_local);
+	eye_world.x += cam_pos.x;
+	eye_world.y += cam_pos.y;
+	eye_world.z += cam_pos.z;
+	out->eye_world = eye_world;
+
+	// Build view matrix
+	cam3d_build_view_matrix(out->view_matrix, cam_ori, eye_world);
+	out->orientation = cam_ori;
+
+	// Scale by inv_convergence_distance for projection shifts
+	float dx = eye_local.x * invd;
+	float dy = eye_local.y * invd;
+	float dz = eye_local.z * invd;
+
+	// Asymmetric frustum tangent half-angles
+	float denom = 1.0f + dz;
+	float tan_right = (ro - dx) / denom;
+	float tan_left = (ro + dx) / denom;
+	float tan_up = (uo - dy) / denom;
+	float tan_down = (uo + dy) / denom;
+
+	// Build projection matrix
+	cam3d_build_projection_from_tangents(tan_left, tan_right, tan_down, tan_up,
+	                                     near_z, far_z, out->projection_matrix);
+
+	// Convert tangents to XrFovf
+	out->fov.angleLeft = -atanf(tan_left);
+	out->fov.angleRight = atanf(tan_right);
+	out->fov.angleUp = atanf(tan_up);
+	out->fov.angleDown = -atanf(tan_down);
+}
+
+void
 camera3d_compute_stereo_views(const XrVector3f *raw_left,
                               const XrVector3f *raw_right,
                               const XrVector3f *nominal_viewer,
@@ -148,73 +212,24 @@ camera3d_compute_stereo_views(const XrVector3f *raw_left,
                               Camera3DStereoView *out_left,
                               Camera3DStereoView *out_right)
 {
-	// Resolve defaults
 	Camera3DTunables t = tunables ? *tunables : camera3d_default_tunables();
 
-	XrQuaternionf cam_ori = {0, 0, 0, 1};
-	XrVector3f cam_pos = {0, 0, 0};
-	if (camera_pose) {
-		cam_ori = camera_pose->orientation;
-		cam_pos = camera_pose->position;
-	}
-
-	// Default nominal viewer
 	float nom_z = 0.5f;
 	if (nominal_viewer) {
 		nom_z = nominal_viewer->z;
 	}
 
-	// Step 1: Apply IPD and parallax factors (shared with display-centric path)
+	// Apply IPD and parallax factors (2-eye path)
+	XrVector3f raw[2] = {*raw_left, *raw_right};
 	XrVector3f processed[2];
-	display3d_apply_eye_factors(raw_left, raw_right, nominal_viewer, t.ipd_factor, t.parallax_factor,
-	                            &processed[0], &processed[1]);
+	display3d_apply_eye_factors_n(raw, 2, nominal_viewer,
+	                              t.ipd_factor, t.parallax_factor,
+	                              processed);
 
-	// Aspect ratio for horizontal FOV
-	float aspect = screen->width_m / screen->height_m;
-	float ro = t.half_tan_vfov * aspect; // horizontal half-tangent
-	float uo = t.half_tan_vfov;          // vertical half-tangent
-	float invd = t.inv_convergence_distance;
-
-	// Process each eye
+	// Compute each eye via single-eye primitive
 	Camera3DStereoView *outputs[2] = {out_left, out_right};
 	for (int i = 0; i < 2; i++) {
-		// Step 2: Compute eye_local = displacement from nominal screen plane
-		XrVector3f eye_local;
-		eye_local.x = processed[i].x;
-		eye_local.y = processed[i].y;
-		eye_local.z = processed[i].z - nom_z;
-
-		// Step 3: Transform eye_local to world space via camera_pose
-		XrVector3f eye_world = cam3d_quat_rotate(cam_ori, eye_local);
-		eye_world.x += cam_pos.x;
-		eye_world.y += cam_pos.y;
-		eye_world.z += cam_pos.z;
-		outputs[i]->eye_world = eye_world;
-
-		// Step 4: Build view matrix from world-space eye + camera orientation
-		cam3d_build_view_matrix(outputs[i]->view_matrix, cam_ori, eye_world);
-		outputs[i]->orientation = cam_ori;
-
-		// Step 5: Scale eye_local by inv_convergence_distance for projection shifts
-		float dx = eye_local.x * invd;
-		float dy = eye_local.y * invd;
-		float dz = eye_local.z * invd;
-
-		// Step 6-7: Compute asymmetric frustum tangent half-angles
-		float denom = 1.0f + dz;
-		float tan_right = (ro - dx) / denom;
-		float tan_left = (ro + dx) / denom;
-		float tan_up = (uo - dy) / denom;
-		float tan_down = (uo + dy) / denom;
-
-		// Step 8: Build projection matrix from tangent half-angles
-		cam3d_build_projection_from_tangents(tan_left, tan_right, tan_down, tan_up, near_z, far_z,
-		                                     outputs[i]->projection_matrix);
-
-		// Step 9: Convert tangents to XrFovf (OpenXR signed angle convention)
-		outputs[i]->fov.angleLeft = -atanf(tan_left);
-		outputs[i]->fov.angleRight = atanf(tan_right);
-		outputs[i]->fov.angleUp = atanf(tan_up);
-		outputs[i]->fov.angleDown = -atanf(tan_down);
+		camera3d_compute_view(&processed[i], nom_z, screen, &t,
+		                      camera_pose, near_z, far_z, outputs[i]);
 	}
 }

@@ -86,6 +86,31 @@ camera3d_compute_stereo_views(const XrVector3f *raw_left,
                               Camera3DStereoView *out_right);
 
 /*!
+ * Compute camera-centric view+projection for a single eye.
+ *
+ * Takes a pre-processed eye position (after display3d_apply_eye_factors) and
+ * computes view matrix, projection matrix, FOV, and world-space eye position.
+ *
+ * @param processed_eye  Processed eye position (after apply_eye_factors)
+ * @param nominal_z      Nominal viewer Z distance (e.g. 0.5)
+ * @param screen         Physical screen dimensions (for aspect ratio)
+ * @param tunables       Camera tunables (or NULL for defaults)
+ * @param camera_pose    Camera pose in world space (or NULL for identity)
+ * @param near_z         Near clip plane distance
+ * @param far_z          Far clip plane distance
+ * @param out            Output view for this eye
+ */
+void
+camera3d_compute_view(const XrVector3f *processed_eye,
+                      float nominal_z,
+                      const Display3DScreen *screen,
+                      const Camera3DTunables *tunables,
+                      const XrPosef *camera_pose,
+                      float near_z,
+                      float far_z,
+                      Camera3DStereoView *out);
+
+/*!
  * Default camera tunables: ipd=1, parallax=1, invd=1, half_tan=tan(18deg) (~36deg vFOV).
  */
 Camera3DTunables

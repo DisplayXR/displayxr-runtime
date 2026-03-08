@@ -9,6 +9,7 @@
 
 #include "display3d_view.h"
 #include <math.h>
+#include <stdint.h>
 #include <string.h>
 
 // ============================================================================
@@ -215,6 +216,95 @@ display3d_compute_projection(XrVector3f eye_pos,
 }
 
 void
+display3d_apply_eye_factors_n(const XrVector3f *raw_eyes,
+                              uint32_t count,
+                              const XrVector3f *nominal_viewer,
+                              float ipd_factor,
+                              float parallax_factor,
+                              XrVector3f *out_eyes)
+{
+	if (count == 0) {
+		return;
+	}
+
+	float nom_z = 0.5f;
+	if (nominal_viewer) {
+		nom_z = nominal_viewer->z;
+	}
+
+	// Compute centroid of all eyes
+	float cx = 0.0f, cy = 0.0f, cz = 0.0f;
+	for (uint32_t i = 0; i < count; i++) {
+		cx += raw_eyes[i].x;
+		cy += raw_eyes[i].y;
+		cz += raw_eyes[i].z;
+	}
+	float inv_n = 1.0f / (float)count;
+	cx *= inv_n;
+	cy *= inv_n;
+	cz *= inv_n;
+
+	// Parallax factor: lerp center toward (0, 0, nom_z)
+	float cx2 = parallax_factor * cx;
+	float cy2 = parallax_factor * cy;
+	float cz2 = nom_z + parallax_factor * (cz - nom_z);
+
+	// IPD factor: scale each eye's offset from center
+	for (uint32_t i = 0; i < count; i++) {
+		out_eyes[i].x = cx2 + (raw_eyes[i].x - cx) * ipd_factor;
+		out_eyes[i].y = cy2 + (raw_eyes[i].y - cy) * ipd_factor;
+		out_eyes[i].z = cz2 + (raw_eyes[i].z - cz) * ipd_factor;
+	}
+}
+
+void
+display3d_compute_view(const XrVector3f *processed_eye,
+                       const Display3DScreen *screen,
+                       const Display3DTunables *tunables,
+                       const XrPosef *display_pose,
+                       float near_z,
+                       float far_z,
+                       Display3DStereoView *out)
+{
+	Display3DTunables t = tunables ? *tunables : display3d_default_tunables();
+
+	XrQuaternionf disp_ori = {0, 0, 0, 1};
+	XrVector3f disp_pos = {0, 0, 0};
+	if (display_pose) {
+		disp_ori = display_pose->orientation;
+		disp_pos = display_pose->position;
+	}
+
+	float m2v = t.virtual_display_height / screen->height_m;
+
+	// Apply perspective * m2v to eye XYZ
+	float es = t.perspective_factor * m2v;
+	XrVector3f eye_scaled;
+	eye_scaled.x = processed_eye->x * es;
+	eye_scaled.y = processed_eye->y * es;
+	eye_scaled.z = processed_eye->z * es;
+	out->eye_display = eye_scaled;
+
+	// Apply m2v to screen dimensions
+	float kScreenW = screen->width_m * m2v;
+	float kScreenH = screen->height_m * m2v;
+
+	// Transform display-space eye -> world-space via display_pose
+	XrVector3f eye_world = quat_rotate(disp_ori, eye_scaled);
+	eye_world.x += disp_pos.x;
+	eye_world.y += disp_pos.y;
+	eye_world.z += disp_pos.z;
+	out->eye_world = eye_world;
+
+	// Build view matrix + projection + FOV
+	build_view_matrix(out->view_matrix, disp_ori, eye_world);
+	out->orientation = disp_ori;
+	display3d_compute_projection(eye_scaled, kScreenW, kScreenH,
+	                             near_z, far_z, out->projection_matrix);
+	out->fov = display3d_compute_fov(eye_scaled, kScreenW, kScreenH);
+}
+
+void
 display3d_compute_stereo_views(const XrVector3f *raw_left,
                                const XrVector3f *raw_right,
                                const XrVector3f *nominal_viewer,
@@ -226,58 +316,20 @@ display3d_compute_stereo_views(const XrVector3f *raw_left,
                                Display3DStereoView *out_left,
                                Display3DStereoView *out_right)
 {
-	// Resolve defaults
 	Display3DTunables t = tunables ? *tunables : display3d_default_tunables();
 
-	XrQuaternionf disp_ori = {0, 0, 0, 1};
-	XrVector3f disp_pos = {0, 0, 0};
-	if (display_pose) {
-		disp_ori = display_pose->orientation;
-		disp_pos = display_pose->position;
-	}
-
-	// Step 1-2: Apply IPD and parallax factors
+	// Apply IPD and parallax factors (2-eye path)
+	XrVector3f raw[2] = {*raw_left, *raw_right};
 	XrVector3f processed[2];
-	display3d_apply_eye_factors(raw_left, raw_right, nominal_viewer,
-	                            t.ipd_factor, t.parallax_factor,
-	                            &processed[0], &processed[1]);
+	display3d_apply_eye_factors_n(raw, 2, nominal_viewer,
+	                              t.ipd_factor, t.parallax_factor,
+	                              processed);
 
-	// Compute meters-to-virtual conversion factor
-	float m2v = t.virtual_display_height / screen->height_m;
-
-	// Process each eye
+	// Compute each eye via single-eye primitive
 	Display3DStereoView *outputs[2] = {out_left, out_right};
 	for (int i = 0; i < 2; i++) {
-		// Step 3: Apply perspective * m2v to eye XYZ
-		float es = t.perspective_factor * m2v;
-		XrVector3f eye_scaled;
-		eye_scaled.x = processed[i].x * es;
-		eye_scaled.y = processed[i].y * es;
-		eye_scaled.z = processed[i].z * es;
-
-		// Store display-space eye (after all factors)
-		outputs[i]->eye_display = eye_scaled;
-
-		// Step 4: Apply m2v to screen dimensions
-		float kScreenW = screen->width_m * m2v;
-		float kScreenH = screen->height_m * m2v;
-
-		// Step 5: Transform display-space eye -> world-space via display_pose
-		XrVector3f eye_world = quat_rotate(disp_ori, eye_scaled);
-		eye_world.x += disp_pos.x;
-		eye_world.y += disp_pos.y;
-		eye_world.z += disp_pos.z;
-		outputs[i]->eye_world = eye_world;
-
-		// Step 6: Build view matrix from world-space eye + display orientation
-		build_view_matrix(outputs[i]->view_matrix, disp_ori, eye_world);
-		outputs[i]->orientation = disp_ori;
-
-		// Step 7: Build Kooima projection from display-space scaled eye + scaled screen
-		display3d_compute_projection(eye_scaled, kScreenW, kScreenH,
-		                             near_z, far_z, outputs[i]->projection_matrix);
-
-		// Step 8: Compute FOV angles from same
-		outputs[i]->fov = display3d_compute_fov(eye_scaled, kScreenW, kScreenH);
+		display3d_compute_view(&processed[i], screen, &t,
+		                       display_pose, near_z, far_z,
+		                       outputs[i]);
 	}
 }

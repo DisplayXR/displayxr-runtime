@@ -752,36 +752,7 @@ static void SignalHandler(int)
 // HUD overlay (semi-transparent text, rendered as NSView subview)
 // ============================================================================
 
-@interface HudOverlayView : NSView
-@property (nonatomic, copy) NSString *hudText;
-@end
-
-@implementation HudOverlayView
-- (instancetype)initWithFrame:(NSRect)frame {
-    self = [super initWithFrame:frame];
-    if (self) { _hudText = @""; [self setWantsLayer:YES]; }
-    return self;
-}
-- (BOOL)isOpaque { return NO; }
-- (NSView *)hitTest:(NSPoint)point { (void)point; return nil; }
-- (void)drawRect:(NSRect)dirtyRect {
-    (void)dirtyRect;
-    if (_hudText.length == 0) return;
-    NSBezierPath *bg = [NSBezierPath bezierPathWithRoundedRect:self.bounds xRadius:6 yRadius:6];
-    [[NSColor colorWithCalibratedRed:0 green:0 blue:0 alpha:0.5] setFill];
-    [bg fill];
-    NSFont *font = [NSFont fontWithName:@"Menlo" size:11];
-    if (!font) font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
-    NSDictionary *attrs = @{
-        NSFontAttributeName: font,
-        NSForegroundColorAttributeName: [NSColor colorWithCalibratedRed:0.9 green:0.9 blue:0.9 alpha:1.0]
-    };
-    NSRect textRect = NSInsetRect(self.bounds, 8, 8);
-    [_hudText drawWithRect:textRect
-                   options:NSStringDrawingUsesLineFragmentOrigin | NSStringDrawingTruncatesLastVisibleLine
-                attributes:attrs context:nil];
-}
-@end
+#import "hud_overlay_macos.h"
 
 static HudOverlayView *g_hudView = nil;
 
@@ -1099,6 +1070,11 @@ struct AppXrSession {
     bool supportsDisplayModeSwitch;
     PFN_xrRequestDisplayModeEXT pfnRequestDisplayModeEXT;
     PFN_xrRequestDisplayRenderingModeEXT pfnRequestDisplayRenderingModeEXT;
+    PFN_xrEnumerateDisplayRenderingModesEXT pfnEnumerateDisplayRenderingModesEXT;
+
+    // Enumerated rendering mode names
+    uint32_t renderingModeCount;
+    char renderingModeNames[8][XR_MAX_SYSTEM_NAME_SIZE];
 
     // Eye tracking
     float leftEyeX, leftEyeY, leftEyeZ;
@@ -1205,6 +1181,8 @@ static bool InitializeOpenXR(AppXrSession &app)
                 (PFN_xrVoidFunction*)&app.pfnRequestDisplayModeEXT);
             xrGetInstanceProcAddr(app.instance, "xrRequestDisplayRenderingModeEXT",
                 (PFN_xrVoidFunction*)&app.pfnRequestDisplayRenderingModeEXT);
+            xrGetInstanceProcAddr(app.instance, "xrEnumerateDisplayRenderingModesEXT",
+                (PFN_xrVoidFunction*)&app.pfnEnumerateDisplayRenderingModesEXT);
         }
     }
 
@@ -1266,6 +1244,30 @@ static bool CreateSession(AppXrSession &app, MetalRenderer &r)
 
     XR_CHECK(xrCreateSession(app.instance, &sessionInfo, &app.session));
     LOG_INFO("Session created%s", app.hasCocoaWindowBinding ? " (with external window)" : "");
+
+    // Enumerate available rendering modes and store names
+    app.renderingModeCount = 0;
+    if (app.pfnEnumerateDisplayRenderingModesEXT && app.session != XR_NULL_HANDLE) {
+        uint32_t modeCount = 0;
+        XrResult enumRes = app.pfnEnumerateDisplayRenderingModesEXT(app.session, 0, &modeCount, nullptr);
+        if (XR_SUCCEEDED(enumRes) && modeCount > 0) {
+            std::vector<XrDisplayRenderingModeInfoEXT> modes(modeCount);
+            for (uint32_t i = 0; i < modeCount; i++) {
+                modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT;
+                modes[i].next = nullptr;
+            }
+            enumRes = app.pfnEnumerateDisplayRenderingModesEXT(app.session, modeCount, &modeCount, modes.data());
+            if (XR_SUCCEEDED(enumRes)) {
+                app.renderingModeCount = modeCount > 8 ? 8 : modeCount;
+                LOG_INFO("Display rendering modes (%u):", modeCount);
+                for (uint32_t i = 0; i < app.renderingModeCount; i++) {
+                    strncpy(app.renderingModeNames[i], modes[i].modeName, XR_MAX_SYSTEM_NAME_SIZE - 1);
+                    app.renderingModeNames[i][XR_MAX_SYSTEM_NAME_SIZE - 1] = '\0';
+                    LOG_INFO("  [%u] %s", modes[i].modeIndex, modes[i].modeName);
+                }
+            }
+        }
+    }
 
     app.sessionState = XR_SESSION_STATE_UNKNOWN;
     app.sessionRunning = false;
@@ -1479,10 +1481,11 @@ int main(int argc, char **argv)
         if (g_input.renderingModeChangeRequested) {
             g_input.renderingModeChangeRequested = false;
             if (app.pfnRequestDisplayRenderingModeEXT && app.session != XR_NULL_HANDLE) {
-                const char *modeNames[] = {"SBS", "Anaglyph", "Blend"};
+                const char *modeName = (app.renderingModeCount > 0 && (uint32_t)g_currentOutputMode < app.renderingModeCount)
+                    ? app.renderingModeNames[g_currentOutputMode] : "?";
                 XrResult res = app.pfnRequestDisplayRenderingModeEXT(app.session, (uint32_t)g_currentOutputMode);
                 LOG_INFO("Rendering mode → %s (%s)",
-                    modeNames[g_currentOutputMode],
+                    modeName,
                     XR_SUCCEEDED(res) ? "OK" : "failed");
             }
         }
@@ -1739,9 +1742,14 @@ int main(int argc, char **argv)
                             g_input.stereo.virtualDisplayHeight, m2v);
                     }
 
-                    const char *outputModeNames[] = {"SBS", "Anaglyph", "Blend"};
-                    const char *outputModeName = (g_currentOutputMode >= 0 && g_currentOutputMode <= 2)
-                        ? outputModeNames[g_currentOutputMode] : "?";
+                    const char *outputModeName = (app.renderingModeCount > 0 && (uint32_t)g_currentOutputMode < app.renderingModeCount)
+                        ? app.renderingModeNames[g_currentOutputMode] : "?";
+
+                    // Build output mode hint: "1-N=Output" if >1 mode, empty if single
+                    char outputHint[32] = "";
+                    if (app.renderingModeCount > 1) {
+                        snprintf(outputHint, sizeof(outputHint), "  1-%u=Output", app.renderingModeCount);
+                    }
 
                     NSString *text = [NSString stringWithFormat:
                         @"%s\n"
@@ -1762,7 +1770,7 @@ int main(int argc, char **argv)
                         "\n"
                         "WASD/QE=Move  Drag=Look  Space=Reset\n"
                         "%s  Shift=IPD  Ctrl=Parallax  %s\n"
-                        "C=Mode  V=2D/3D  1/2/3=Output  Tab=HUD  ESC=Quit",
+                        "C=Mode  V=2D/3D%s  Tab=HUD  ESC=Quit",
                         app.systemName,
                         sessionStateName,
                         g_input.displayMode3D ? "3D (Stereo)" : "2D (Mono)",
@@ -1782,7 +1790,8 @@ int main(int argc, char **argv)
                         param1Label, g_input.cameraMode ? g_input.stereo.invConvergenceDistance : g_input.stereo.perspectiveFactor,
                         param2Label, g_input.cameraMode ? g_input.stereo.zoomFactor : g_input.stereo.scaleFactor,
                         valueLine,
-                        scrollHint, perspHint];
+                        scrollHint, perspHint,
+                        outputHint];
                     g_hudView.hudText = text;
                     [g_hudView setNeedsDisplay:YES];
                     [g_hudView setHidden:NO];

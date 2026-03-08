@@ -784,6 +784,12 @@ oxr_xrRequestEyeTrackingModeEXT(XrSession session, XrEyeTrackingModeEXT mode);
 //! OpenXR API function @ep{xrRequestDisplayRenderingModeEXT}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrRequestDisplayRenderingModeEXT(XrSession session, uint32_t modeIndex);
+//! OpenXR API function @ep{xrEnumerateDisplayRenderingModesEXT}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrEnumerateDisplayRenderingModesEXT(XrSession session,
+                                        uint32_t modeCapacityInput,
+                                        uint32_t *modeCountOutput,
+                                        XrDisplayRenderingModeInfoEXT *modes);
 #endif
 
 /*!

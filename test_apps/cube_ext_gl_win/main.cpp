@@ -595,7 +595,9 @@ static void RenderThreadFunc(
                                 std::wstring dispText = FormatDisplayInfo(xr->displayWidthM, xr->displayHeightM,
                                     xr->nominalViewerX, xr->nominalViewerY, xr->nominalViewerZ);
                                 dispText += L"\n" + FormatScaleInfo(xr->recommendedViewScaleX, xr->recommendedViewScaleY);
-                                dispText += L"\n" + FormatOutputMode(inputSnapshot.outputMode, xr->pfnRequestDisplayRenderingModeEXT != nullptr);
+                                dispText += L"\n" + FormatOutputMode(inputSnapshot.outputMode, xr->pfnRequestDisplayRenderingModeEXT != nullptr,
+                                    (xr->renderingModeCount > 0 && (uint32_t)inputSnapshot.outputMode < xr->renderingModeCount) ? xr->renderingModeNames[inputSnapshot.outputMode] : nullptr,
+                                    xr->renderingModeCount);
                                 std::wstring eyeText = FormatEyeTrackingInfo(
                                     xr->leftEyeX, xr->leftEyeY, xr->leftEyeZ,
                                     xr->rightEyeX, xr->rightEyeY, xr->rightEyeZ,
@@ -620,7 +622,7 @@ static void RenderThreadFunc(
                                         inputSnapshot.stereo.virtualDisplayHeight, hudM2v);
                                     stereoText += vhBuf;
                                 }
-                                std::wstring helpText = FormatHelpText(xr->pfnRequestDisplayRenderingModeEXT != nullptr);
+                                std::wstring helpText = FormatHelpText(xr->pfnRequestDisplayRenderingModeEXT != nullptr, false, xr->renderingModeCount);
 
                                 uint32_t srcRowPitch = 0;
                                 const void* pixels = RenderHudAndMap(*hud, &srcRowPitch,

@@ -22,7 +22,7 @@ extern "C" {
 #endif
 
 #define XR_EXT_display_info 1
-#define XR_EXT_display_info_SPEC_VERSION 7
+#define XR_EXT_display_info_SPEC_VERSION 8
 #define XR_EXT_DISPLAY_INFO_EXTENSION_NAME "XR_EXT_display_info"
 
 // Reuse the type value from the deleted XR_EXT_dynamic_render_resolution
@@ -208,6 +208,49 @@ typedef XrResult (XRAPI_PTR *PFN_xrRequestDisplayRenderingModeEXT)(
 XRAPI_ATTR XrResult XRAPI_CALL xrRequestDisplayRenderingModeEXT(
     XrSession               session,
     uint32_t                modeIndex);
+#endif
+
+// ---- v8: Rendering Mode Enumeration ----
+
+#define XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT ((XrStructureType)1000999008)
+
+/*!
+ * @brief Information about a single display rendering mode.
+ *
+ * Returned by xrEnumerateDisplayRenderingModesEXT to describe each available
+ * vendor-specific rendering mode (e.g., side-by-side, anaglyph, lenticular).
+ */
+typedef struct XrDisplayRenderingModeInfoEXT {
+    XrStructureType             type;       //!< Must be XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT
+    void* XR_MAY_ALIAS          next;       //!< Pointer to next structure in chain
+    uint32_t                    modeIndex;  //!< Vendor-defined mode index (pass to xrRequestDisplayRenderingModeEXT)
+    char                        modeName[XR_MAX_SYSTEM_NAME_SIZE]; //!< Human-readable mode name
+} XrDisplayRenderingModeInfoEXT;
+
+/*!
+ * @brief Enumerate available display rendering modes.
+ *
+ * Standard OpenXR two-call enumerate pattern. First call with
+ * modeCapacityInput=0 to query modeCountOutput, then allocate and call again.
+ *
+ * @param session              A valid XrSession handle.
+ * @param modeCapacityInput    Capacity of the modes array (0 to query count).
+ * @param modeCountOutput      Output: number of modes available.
+ * @param modes                Output array of mode info structs.
+ * @return XR_SUCCESS on success, XR_ERROR_SIZE_INSUFFICIENT if capacity too small.
+ */
+typedef XrResult (XRAPI_PTR *PFN_xrEnumerateDisplayRenderingModesEXT)(
+    XrSession session,
+    uint32_t modeCapacityInput,
+    uint32_t *modeCountOutput,
+    XrDisplayRenderingModeInfoEXT *modes);
+
+#ifndef XR_NO_PROTOTYPES
+XRAPI_ATTR XrResult XRAPI_CALL xrEnumerateDisplayRenderingModesEXT(
+    XrSession                           session,
+    uint32_t                            modeCapacityInput,
+    uint32_t                           *modeCountOutput,
+    XrDisplayRenderingModeInfoEXT      *modes);
 #endif
 
 #ifdef __cplusplus

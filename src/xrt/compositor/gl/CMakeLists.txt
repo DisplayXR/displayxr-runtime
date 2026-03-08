@@ -35,7 +35,9 @@ target_include_directories(comp_gl PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../aux
 # Silence macOS deprecation warnings for OpenGL
 if(APPLE)
 	target_compile_definitions(comp_gl PRIVATE GL_SILENCE_DEPRECATION)
-	target_sources(comp_gl PRIVATE comp_gl_window_macos.h comp_gl_window_macos.m)
+	target_sources(comp_gl PRIVATE comp_gl_window_macos.h comp_gl_window_macos.m
+		${CMAKE_CURRENT_SOURCE_DIR}/../util/comp_hud_overlay_macos.m
+		${CMAKE_CURRENT_SOURCE_DIR}/../util/comp_hud_overlay_macos.h)
 endif()
 
 # Platform-specific linking

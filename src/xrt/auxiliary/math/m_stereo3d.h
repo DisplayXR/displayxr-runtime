@@ -115,6 +115,55 @@ m_stereo3d_apply_eye_factors(const struct xrt_vec3 *raw_left,
                              struct xrt_vec3 *out_right);
 
 /*!
+ * Apply IPD and parallax factors to N raw eye positions.
+ *
+ * N-eye generalization of m_stereo3d_apply_eye_factors. The center is computed
+ * as the centroid of all N eyes, then each eye is scaled by ipd_factor around
+ * that center, and the center is lerped toward nominal by parallax_factor.
+ *
+ * @param raw_eyes       Array of N raw eye positions
+ * @param count          Number of eyes (must be >= 1)
+ * @param nominal_viewer Nominal viewer position (or NULL for {0,0,0.5})
+ * @param ipd_factor     IPD scaling factor [0, 1]
+ * @param parallax_factor Parallax lerp factor [0, 1]
+ * @param out_eyes       Output array of N processed eye positions
+ *
+ * @ingroup aux_math
+ */
+void
+m_stereo3d_apply_eye_factors_n(const struct xrt_vec3 *raw_eyes,
+                               uint32_t count,
+                               const struct xrt_vec3 *nominal_viewer,
+                               float ipd_factor,
+                               float parallax_factor,
+                               struct xrt_vec3 *out_eyes);
+
+/*!
+ * Compute camera-centric FOV and world-space position for a single eye.
+ *
+ * Takes a pre-processed eye position (after IPD/parallax factors) and computes
+ * the asymmetric frustum FOV and world-space eye position.
+ *
+ * @param processed_eye  Processed eye position (after apply_eye_factors)
+ * @param nominal_z      Nominal viewer Z distance (e.g. 0.5)
+ * @param screen         Physical screen dimensions (for aspect ratio)
+ * @param tunables       Camera tunables (inv_convergence_distance, half_tan_vfov)
+ * @param camera_pose    Camera pose in world space (or NULL for identity)
+ * @param out_fov        Output FOV for this eye
+ * @param out_eye_world  Output world-space position for this eye
+ *
+ * @ingroup aux_math
+ */
+void
+m_stereo3d_camera_compute_view(const struct xrt_vec3 *processed_eye,
+                               float nominal_z,
+                               const struct m_stereo3d_screen *screen,
+                               const struct m_stereo3d_camera_tunables *tunables,
+                               const struct xrt_pose *camera_pose,
+                               struct xrt_fov *out_fov,
+                               struct xrt_vec3 *out_eye_world);
+
+/*!
  * Default camera tunables: ipd=1, parallax=1, inv_conv=2.0 (0.5m), half_tan=tan(18deg).
  * @ingroup aux_math
  */

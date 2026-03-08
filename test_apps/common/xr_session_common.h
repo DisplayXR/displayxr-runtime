@@ -108,6 +108,11 @@ struct XrSessionManager {
 
     // Display rendering mode control (XR_EXT_display_info v7)
     PFN_xrRequestDisplayRenderingModeEXT pfnRequestDisplayRenderingModeEXT = nullptr;
+    PFN_xrEnumerateDisplayRenderingModesEXT pfnEnumerateDisplayRenderingModesEXT = nullptr;
+
+    // Enumerated rendering mode names
+    uint32_t renderingModeCount = 0;
+    char renderingModeNames[8][XR_MAX_SYSTEM_NAME_SIZE] = {};
 
     // Window handle for session target (used by ext app, ignored by non-ext app)
     HWND windowHandle = nullptr;

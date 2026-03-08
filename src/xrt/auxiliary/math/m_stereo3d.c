@@ -14,6 +14,7 @@
 #include "m_stereo3d.h"
 
 #include <math.h>
+#include <stdint.h>
 
 // Quaternion-rotate a vector: v' = q * v * q^-1
 // Uses the efficient cross-product form (no matrix conversion).
@@ -87,16 +88,56 @@ m_stereo3d_apply_eye_factors(const struct xrt_vec3 *raw_left,
 }
 
 void
-m_stereo3d_camera_compute(const struct xrt_vec3 *raw_left,
-                          const struct xrt_vec3 *raw_right,
-                          const struct xrt_vec3 *nominal_viewer,
-                          const struct m_stereo3d_screen *screen,
-                          const struct m_stereo3d_camera_tunables *tunables,
-                          const struct xrt_pose *camera_pose,
-                          struct xrt_fov *out_fovs,
-                          struct xrt_vec3 *out_eye_world)
+m_stereo3d_apply_eye_factors_n(const struct xrt_vec3 *raw_eyes,
+                               uint32_t count,
+                               const struct xrt_vec3 *nominal_viewer,
+                               float ipd_factor,
+                               float parallax_factor,
+                               struct xrt_vec3 *out_eyes)
 {
-	// Resolve defaults
+	if (count == 0) {
+		return;
+	}
+
+	float nom_z = 0.5f;
+	if (nominal_viewer) {
+		nom_z = nominal_viewer->z;
+	}
+
+	// Compute centroid of all eyes
+	float cx = 0.0f, cy = 0.0f, cz = 0.0f;
+	for (uint32_t i = 0; i < count; i++) {
+		cx += raw_eyes[i].x;
+		cy += raw_eyes[i].y;
+		cz += raw_eyes[i].z;
+	}
+	float inv_n = 1.0f / (float)count;
+	cx *= inv_n;
+	cy *= inv_n;
+	cz *= inv_n;
+
+	// Parallax factor: lerp center toward (0, 0, nom_z)
+	float cx2 = parallax_factor * cx;
+	float cy2 = parallax_factor * cy;
+	float cz2 = nom_z + parallax_factor * (cz - nom_z);
+
+	// IPD factor: scale each eye's offset from center
+	for (uint32_t i = 0; i < count; i++) {
+		out_eyes[i].x = cx2 + (raw_eyes[i].x - cx) * ipd_factor;
+		out_eyes[i].y = cy2 + (raw_eyes[i].y - cy) * ipd_factor;
+		out_eyes[i].z = cz2 + (raw_eyes[i].z - cz) * ipd_factor;
+	}
+}
+
+void
+m_stereo3d_camera_compute_view(const struct xrt_vec3 *processed_eye,
+                               float nominal_z,
+                               const struct m_stereo3d_screen *screen,
+                               const struct m_stereo3d_camera_tunables *tunables,
+                               const struct xrt_pose *camera_pose,
+                               struct xrt_fov *out_fov,
+                               struct xrt_vec3 *out_eye_world)
+{
 	struct m_stereo3d_camera_tunables t =
 	    tunables ? *tunables : m_stereo3d_default_camera_tunables();
 
@@ -107,55 +148,72 @@ m_stereo3d_camera_compute(const struct xrt_vec3 *raw_left,
 		cam_pos = camera_pose->position;
 	}
 
-	// Default nominal viewer
+	float aspect = screen->width_m / screen->height_m;
+	float ro = t.half_tan_vfov * aspect;
+	float uo = t.half_tan_vfov;
+	float invd = t.inv_convergence_distance;
+
+	// eye_local = displacement from nominal screen plane
+	struct xrt_vec3 eye_local;
+	eye_local.x = processed_eye->x;
+	eye_local.y = processed_eye->y;
+	eye_local.z = processed_eye->z - nominal_z;
+
+	// Transform to world space
+	struct xrt_vec3 eye_world = quat_rotate_vec3(cam_ori, eye_local);
+	eye_world.x += cam_pos.x;
+	eye_world.y += cam_pos.y;
+	eye_world.z += cam_pos.z;
+	*out_eye_world = eye_world;
+
+	// Scale by inv_convergence_distance
+	float dx = eye_local.x * invd;
+	float dy = eye_local.y * invd;
+	float dz = eye_local.z * invd;
+
+	// Asymmetric frustum tangent half-angles
+	float denom = 1.0f + dz;
+	float tan_right = (ro - dx) / denom;
+	float tan_left = (ro + dx) / denom;
+	float tan_up = (uo - dy) / denom;
+	float tan_down = (uo + dy) / denom;
+
+	// Convert tangents to xrt_fov (signed angle convention)
+	out_fov->angle_left = -atanf(tan_left);
+	out_fov->angle_right = atanf(tan_right);
+	out_fov->angle_up = atanf(tan_up);
+	out_fov->angle_down = -atanf(tan_down);
+}
+
+void
+m_stereo3d_camera_compute(const struct xrt_vec3 *raw_left,
+                          const struct xrt_vec3 *raw_right,
+                          const struct xrt_vec3 *nominal_viewer,
+                          const struct m_stereo3d_screen *screen,
+                          const struct m_stereo3d_camera_tunables *tunables,
+                          const struct xrt_pose *camera_pose,
+                          struct xrt_fov *out_fovs,
+                          struct xrt_vec3 *out_eye_world)
+{
+	struct m_stereo3d_camera_tunables t =
+	    tunables ? *tunables : m_stereo3d_default_camera_tunables();
+
 	float nom_z = 0.5f;
 	if (nominal_viewer) {
 		nom_z = nominal_viewer->z;
 	}
 
-	// Step 1: Apply IPD and parallax factors
+	// Apply IPD and parallax factors (2-eye path)
+	struct xrt_vec3 raw[2] = {*raw_left, *raw_right};
 	struct xrt_vec3 processed[2];
-	m_stereo3d_apply_eye_factors(raw_left, raw_right, nominal_viewer,
-	                             t.ipd_factor, t.parallax_factor,
-	                             &processed[0], &processed[1]);
+	m_stereo3d_apply_eye_factors_n(raw, 2, nominal_viewer,
+	                               t.ipd_factor, t.parallax_factor,
+	                               processed);
 
-	// Aspect ratio for horizontal FOV
-	float aspect = screen->width_m / screen->height_m;
-	float ro = t.half_tan_vfov * aspect; // horizontal half-tangent
-	float uo = t.half_tan_vfov;          // vertical half-tangent
-	float invd = t.inv_convergence_distance;
-
-	// Process each eye
+	// Compute each eye via single-eye primitive
 	for (int i = 0; i < 2; i++) {
-		// Step 2: eye_local = displacement from nominal screen plane
-		struct xrt_vec3 eye_local;
-		eye_local.x = processed[i].x;
-		eye_local.y = processed[i].y;
-		eye_local.z = processed[i].z - nom_z;
-
-		// Step 3: Transform eye_local to world space via camera_pose
-		struct xrt_vec3 eye_world = quat_rotate_vec3(cam_ori, eye_local);
-		eye_world.x += cam_pos.x;
-		eye_world.y += cam_pos.y;
-		eye_world.z += cam_pos.z;
-		out_eye_world[i] = eye_world;
-
-		// Step 4: Scale eye_local by inv_convergence_distance
-		float dx = eye_local.x * invd;
-		float dy = eye_local.y * invd;
-		float dz = eye_local.z * invd;
-
-		// Step 5: Compute asymmetric frustum tangent half-angles
-		float denom = 1.0f + dz;
-		float tan_right = (ro - dx) / denom;
-		float tan_left = (ro + dx) / denom;
-		float tan_up = (uo - dy) / denom;
-		float tan_down = (uo + dy) / denom;
-
-		// Step 6: Convert tangents to xrt_fov (signed angle convention)
-		out_fovs[i].angle_left = -atanf(tan_left);
-		out_fovs[i].angle_right = atanf(tan_right);
-		out_fovs[i].angle_up = atanf(tan_up);
-		out_fovs[i].angle_down = -atanf(tan_down);
+		m_stereo3d_camera_compute_view(&processed[i], nom_z, screen,
+		                               &t, camera_pose,
+		                               &out_fovs[i], &out_eye_world[i]);
 	}
 }

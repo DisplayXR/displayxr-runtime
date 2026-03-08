@@ -662,8 +662,10 @@ gl_compositor_update_hud(struct comp_gl_compositor *c, float dt)
 	if (c->xdev != NULL) {
 		xrt_device_get_property(c->xdev, XRT_DEVICE_PROPERTY_OUTPUT_MODE, &output_mode);
 	}
-	const char *mode_names[] = {"SBS", "Anaglyph", "Blend"};
-	const char *mode_name = (output_mode >= 0 && output_mode <= 2) ? mode_names[output_mode] : "?";
+	const char *mode_name = "?";
+	if (c->xdev != NULL && output_mode >= 0 && (uint32_t)output_mode < c->xdev->rendering_mode_count) {
+		mode_name = c->xdev->rendering_modes[output_mode].mode_name;
+	}
 
 	// Display info from system compositor
 	float disp_w_mm = 0, disp_h_mm = 0;
