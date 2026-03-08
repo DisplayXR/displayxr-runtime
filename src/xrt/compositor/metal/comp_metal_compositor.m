@@ -1640,8 +1640,9 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 	c->offscreen = offscreen;
 
 	// Get display dimensions from device.
-	// Use screens[0] (full SBS logical size), matching the GL compositor.
-	// create_stereo_texture treats this as per-eye width (SBS = 2x).
+	// screens[0] holds the logical (point) size — used for NSWindow creation.
+	// The stereo texture must be at Retina (physical pixel) resolution so
+	// the app's retina-resolution swapchain isn't downscaled then re-upscaled.
 	uint32_t display_width = 0;
 	uint32_t display_height = 0;
 	if (xdev != NULL && xdev->hmd != NULL &&
@@ -1651,8 +1652,12 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 	}
 	if (display_width == 0) display_width = 1920;
 	if (display_height == 0) display_height = 1080;
-	// Per-eye width for the stereo texture
-	uint32_t per_eye_width = display_width / 2;
+
+	// Scale stereo texture to Retina physical pixels
+	CGFloat backing_scale = [NSScreen mainScreen].backingScaleFactor;
+	uint32_t pixel_width = (uint32_t)(display_width * backing_scale);
+	uint32_t pixel_height = (uint32_t)(display_height * backing_scale);
+	uint32_t per_eye_width = pixel_width / 2;
 
 	// Window / headless setup
 	NSView *external_view = (__bridge NSView *)window_handle;
@@ -1715,9 +1720,9 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 		return XRT_ERROR_VULKAN;
 	}
 
-	// Create SBS stereo texture using per-eye logical dimensions
-	// (matching the GL compositor which uses screens[0].w_pixels / 2).
-	if (!create_stereo_texture(c, per_eye_width, display_height)) {
+	// Create SBS stereo texture at Retina (physical pixel) resolution
+	// so the app's retina-resolution swapchain blits 1:1.
+	if (!create_stereo_texture(c, per_eye_width, pixel_height)) {
 		os_mutex_destroy(&c->mutex);
 		free(c);
 		return XRT_ERROR_VULKAN;
