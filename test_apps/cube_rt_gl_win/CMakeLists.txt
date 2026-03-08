@@ -79,7 +79,7 @@ add_executable(cube_rt_gl_win WIN32
 )
 
 target_include_directories(cube_rt_gl_win PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_ext_gl
+    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_ext_gl_win
 )
 
 target_link_libraries(cube_rt_gl_win PRIVATE

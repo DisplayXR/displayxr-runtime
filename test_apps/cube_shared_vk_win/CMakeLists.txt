@@ -89,7 +89,7 @@ add_executable(cube_shared_vk_win WIN32
 )
 
 target_include_directories(cube_shared_vk_win PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_ext_vk
+    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_ext_vk_win
 )
 
 target_link_libraries(cube_shared_vk_win PRIVATE

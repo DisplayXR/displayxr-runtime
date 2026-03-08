@@ -77,7 +77,7 @@ add_executable(cube_rt_d3d12_win WIN32
 )
 
 target_include_directories(cube_rt_d3d12_win PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_ext_d3d12
+    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_ext_d3d12_win
 )
 
 target_link_libraries(cube_rt_d3d12_win PRIVATE
