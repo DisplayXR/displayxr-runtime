@@ -15,6 +15,7 @@
 
 #include "util/comp_layer_accum.h"
 
+#include "xrt/xrt_device.h"
 #include "xrt/xrt_handles.h"
 #include "xrt/xrt_config_build.h"
 #include "xrt/xrt_config_os.h"
@@ -52,6 +53,7 @@ static const IID IID_ID3D11Texture2D_local = {
 #elif defined(__APPLE__)
 #include <OpenGL/OpenGL.h>
 #include <OpenGL/gl3.h>
+#include "comp_gl_window_macos.h"
 #endif
 
 /*
@@ -226,7 +228,8 @@ struct comp_gl_compositor
 	void *egl_context;   //!< EGLContext
 	void *egl_surface;   //!< EGLSurface
 #elif defined(__APPLE__)
-	void *cgl_context;   //!< CGLContextObj
+	struct comp_gl_window_macos *macos_window;  //!< macOS window helper
+	bool owns_window;
 #endif
 
 	// --- Shared texture (D3D11 interop via WGL_NV_DX_interop2, Windows only) ---
@@ -537,8 +540,8 @@ gl_compositor_wait_frame(struct xrt_compositor *xc,
                           int64_t *out_predicted_display_time,
                           int64_t *out_predicted_display_period)
 {
-	int64_t frame_id, wake, gpu_time;
-	return gl_compositor_predict_frame(xc, &frame_id, &wake, &gpu_time,
+	int64_t wake, gpu_time;
+	return gl_compositor_predict_frame(xc, out_frame_id, &wake, &gpu_time,
 	                                    out_predicted_display_time,
 	                                    out_predicted_display_period);
 }
@@ -628,6 +631,22 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 		return XRT_SUCCESS;
 	}
 
+	// Ensure compositor context is current
+#ifdef __APPLE__
+	comp_gl_window_macos_make_current(c->macos_window);
+#endif
+
+	// Save and set GL state — the app may have left depth test, blend, etc. on
+	GLboolean prev_depth_test = glIsEnabled(GL_DEPTH_TEST);
+	GLboolean prev_blend = glIsEnabled(GL_BLEND);
+	GLboolean prev_cull_face = glIsEnabled(GL_CULL_FACE);
+	GLboolean prev_scissor_test = glIsEnabled(GL_SCISSOR_TEST);
+	glDisable(GL_DEPTH_TEST);
+	glDisable(GL_BLEND);
+	glDisable(GL_CULL_FACE);
+	glDisable(GL_SCISSOR_TEST);
+
+
 	// --- Step 1: Render layers into SBS stereo texture ---
 	glBindFramebuffer(GL_FRAMEBUFFER, c->fbo);
 	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
@@ -685,6 +704,17 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 		}
 	}
 
+	// Query current output mode from device (tracks sim_display mode changes)
+	if (c->xdev != NULL) {
+		int32_t mode = 0;
+		xrt_device_get_property(c->xdev, XRT_DEVICE_PROPERTY_OUTPUT_MODE, &mode);
+		switch (mode) {
+		case 1:  c->output_mode = GL_OUTPUT_ANAGLYPH; break;
+		case 2:  c->output_mode = GL_OUTPUT_BLEND; break;
+		default: c->output_mode = GL_OUTPUT_SBS; break;
+		}
+	}
+
 	// --- Step 2: Present SBS texture ---
 #ifdef XRT_OS_WINDOWS
 	if (c->has_shared_texture) {
@@ -732,7 +762,13 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 		default:                 output_program = c->program_sbs; break;
 		}
 
-		glViewport(0, 0, c->view_width * 2, c->view_height);
+		// Use actual window backing dimensions (Retina-aware)
+		uint32_t present_w = c->view_width * 2;
+		uint32_t present_h = c->view_height;
+#ifdef __APPLE__
+		comp_gl_window_macos_get_dimensions(c->macos_window, &present_w, &present_h);
+#endif
+		glViewport(0, 0, present_w, present_h);
 		glUseProgram(output_program);
 
 		glActiveTexture(GL_TEXTURE0);
@@ -748,12 +784,19 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 #elif defined(XRT_OS_ANDROID)
 		// eglSwapBuffers(c->egl_display, c->egl_surface);
 #elif defined(__APPLE__)
-		// CGLFlushDrawable(c->cgl_context);
+		comp_gl_window_macos_swap_buffers(c->macos_window);
 #endif
 	}
 
 	glBindVertexArray(0);
 	glUseProgram(0);
+	glBindTexture(GL_TEXTURE_2D, 0);
+
+	// Restore previous GL state
+	if (prev_depth_test) glEnable(GL_DEPTH_TEST);
+	if (prev_blend) glEnable(GL_BLEND);
+	if (prev_cull_face) glEnable(GL_CULL_FACE);
+	if (prev_scissor_test) glEnable(GL_SCISSOR_TEST);
 
 	return XRT_SUCCESS;
 }
@@ -807,6 +850,10 @@ gl_compositor_destroy(struct xrt_compositor *xc)
 	}
 	if (c->owns_window && c->hwnd) {
 		DestroyWindow(c->hwnd);
+	}
+#elif defined(__APPLE__)
+	if (c->macos_window != NULL) {
+		comp_gl_window_macos_destroy(&c->macos_window);
 	}
 #endif
 
@@ -991,24 +1038,10 @@ gl_init_resources(struct comp_gl_compositor *c, uint32_t width, uint32_t height)
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 	glBindTexture(GL_TEXTURE_2D, 0);
 
-	// Parse output mode from environment
-	const char *mode_env = getenv("SIM_DISPLAY_OUTPUT_MODE");
-	if (mode_env != NULL) {
-		if (strcmp(mode_env, "anaglyph") == 0) {
-			c->output_mode = GL_OUTPUT_ANAGLYPH;
-		} else if (strcmp(mode_env, "blend") == 0) {
-			c->output_mode = GL_OUTPUT_BLEND;
-		} else {
-			c->output_mode = GL_OUTPUT_SBS;
-		}
-	} else {
-		c->output_mode = GL_OUTPUT_SBS;
-	}
+	c->output_mode = GL_OUTPUT_SBS;
 
-	U_LOG_W("GL compositor resources initialized: %ux%u per eye, mode=%s",
-	         c->view_width, c->view_height,
-	         c->output_mode == GL_OUTPUT_SBS ? "SBS" :
-	         c->output_mode == GL_OUTPUT_ANAGLYPH ? "Anaglyph" : "Blend");
+	U_LOG_W("GL compositor resources initialized: %ux%u per eye, mode=SBS",
+	         c->view_width, c->view_height);
 
 	return true;
 }
@@ -1142,9 +1175,30 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 		         c->shared_width, c->shared_height, c->shared_gl_texture);
 	}
 #elif defined(__APPLE__)
-	// macOS: use provided CGL context directly
-	c->cgl_context = gl_context;
+	// macOS: create window/context via NSOpenGLView helper
+	if (window_handle != NULL) {
+		// App provided an NSView — set up external
+		xrt_result_t xret = comp_gl_window_macos_setup_external(
+		    window_handle, gl_context, &c->macos_window);
+		if (xret != XRT_SUCCESS) {
+			free(c);
+			return XRT_ERROR_OPENGL;
+		}
+		c->owns_window = false;
+	} else {
+		// Create our own window
+		xrt_result_t xret = comp_gl_window_macos_create(
+		    width, height, gl_context, &c->macos_window);
+		if (xret != XRT_SUCCESS) {
+			free(c);
+			return XRT_ERROR_OPENGL;
+		}
+		c->owns_window = true;
+	}
+	// Make compositor context current for resource init
+	comp_gl_window_macos_make_current(c->macos_window);
 	(void)shared_texture_handle;
+	(void)gl_display;
 #else
 	(void)shared_texture_handle;
 #endif
