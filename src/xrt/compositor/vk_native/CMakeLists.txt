@@ -40,7 +40,7 @@ if((WIN32 OR APPLE) AND XRT_HAVE_VULKAN)
 			comp_vk_native_window_macos.m
 			comp_vk_native_window_macos.h)
 		target_link_libraries(comp_vk_native PRIVATE
-			"-framework Cocoa" "-framework QuartzCore")
+			"-framework Cocoa" "-framework QuartzCore" "-framework IOSurface")
 	endif()
 
 	# Qwerty include path for runtime-side 2D/3D toggle polling

@@ -2015,11 +2015,8 @@ oxr_session_create_impl(struct oxr_logger *log,
 					shared_texture_handle = (void *)cocoa_binding->sharedIOSurface;
 				}
 			}
-			// If shared texture requested on macOS, fall through to Metal path
-			// (VK_EXT_external_memory_metal import not yet supported)
-			if (shared_texture_handle != NULL) {
-				goto try_metal_path;
-			}
+			// Shared texture (IOSurface) is now handled by VK native compositor
+			// via VK_EXT_metal_objects import.
 #endif
 
 			xrt_result_t xret = xrt_system_create_session(
@@ -2038,9 +2035,6 @@ oxr_session_create_impl(struct oxr_logger *log,
 #endif
 
 #if defined(XRT_HAVE_METAL_NATIVE_COMPOSITOR)
-#if defined(XRT_HAVE_VK_NATIVE_COMPOSITOR) && defined(XRT_OS_MACOS)
-	try_metal_path:
-#endif
 		// Fallback: route Vulkan apps through Metal native compositor
 		// (cross-API interop via MoltenVK).
 		if (oxr_metal_native_compositor_supported(sys, xsi->external_window_handle)) {

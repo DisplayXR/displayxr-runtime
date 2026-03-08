@@ -45,6 +45,7 @@
 
 #ifdef XRT_OS_MACOS
 #include "vk_native/comp_vk_native_window_macos.h"
+#include <IOSurface/IOSurface.h>
 #endif
 
 #include <string.h>
@@ -148,6 +149,216 @@ struct comp_vk_native_compositor
  * Helper functions
  *
  */
+
+#ifdef XRT_OS_MACOS
+/*!
+ * Import an IOSurface as a VkImage for shared texture rendering.
+ *
+ * Uses VK_EXT_metal_objects to import the IOSurface, export the MTLTexture,
+ * and allocate memory via VK_EXT_external_memory_metal.
+ */
+static bool
+import_shared_iosurface(struct comp_vk_native_compositor *c, void *iosurface_handle)
+{
+	struct vk_bundle *vk = &c->vk;
+
+#if defined(VK_EXT_metal_objects) && defined(VK_EXT_external_memory_metal)
+	if (!vk->has_EXT_metal_objects || !vk->has_EXT_external_memory_metal) {
+		U_LOG_E("VK_EXT_metal_objects or VK_EXT_external_memory_metal not available");
+		return false;
+	}
+
+	IOSurfaceRef surface = (IOSurfaceRef)iosurface_handle;
+	uint32_t width = (uint32_t)IOSurfaceGetWidth(surface);
+	uint32_t height = (uint32_t)IOSurfaceGetHeight(surface);
+
+	if (width == 0 || height == 0) {
+		U_LOG_E("IOSurface has zero dimensions");
+		return false;
+	}
+
+	U_LOG_W("Importing IOSurface %ux%u as VkImage for shared texture", width, height);
+
+	// Chain: VkImageCreateInfo -> VkImportMetalIOSurfaceInfoEXT -> VkExportMetalObjectCreateInfoEXT
+	VkExportMetalObjectCreateInfoEXT export_metal_tex_info = {
+	    .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECT_CREATE_INFO_EXT,
+	    .pNext = NULL,
+	    .exportObjectType = VK_EXPORT_METAL_OBJECT_TYPE_METAL_TEXTURE_BIT_EXT,
+	};
+	VkImportMetalIOSurfaceInfoEXT import_iosurface_info = {
+	    .sType = VK_STRUCTURE_TYPE_IMPORT_METAL_IO_SURFACE_INFO_EXT,
+	    .pNext = &export_metal_tex_info,
+	    .ioSurface = surface,
+	};
+
+	VkImageCreateInfo image_ci = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+	    .pNext = &import_iosurface_info,
+	    .imageType = VK_IMAGE_TYPE_2D,
+	    .format = VK_FORMAT_B8G8R8A8_UNORM,  // IOSurface is BGRA8
+	    .extent = {width, height, 1},
+	    .mipLevels = 1,
+	    .arrayLayers = 1,
+	    .samples = VK_SAMPLE_COUNT_1_BIT,
+	    .tiling = VK_IMAGE_TILING_OPTIMAL,
+	    .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+	             VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+	             VK_IMAGE_USAGE_SAMPLED_BIT,
+	    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+	    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+	};
+
+	VkResult ret = vk->vkCreateImage(vk->device, &image_ci, NULL, &c->shared_image);
+	if (ret != VK_SUCCESS) {
+		U_LOG_E("vkCreateImage for shared IOSurface failed: %d", ret);
+		return false;
+	}
+
+	// Export MTLTexture from the VkImage (MoltenVK created it from the IOSurface)
+	VkExportMetalTextureInfoEXT export_tex_info = {
+	    .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_TEXTURE_INFO_EXT,
+	    .image = c->shared_image,
+	    .imageView = VK_NULL_HANDLE,
+	    .bufferView = VK_NULL_HANDLE,
+	    .plane = VK_IMAGE_ASPECT_COLOR_BIT,
+	    .mtlTexture = NULL,
+	};
+	VkExportMetalObjectsInfoEXT export_objects_info = {
+	    .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT,
+	    .pNext = &export_tex_info,
+	};
+	vk->vkExportMetalObjectsEXT(vk->device, &export_objects_info);
+
+	void *metal_texture_handle = (void *)export_tex_info.mtlTexture;
+	if (metal_texture_handle == NULL) {
+		U_LOG_E("Failed to export MTLTexture from shared VkImage");
+		vk->vkDestroyImage(vk->device, c->shared_image, NULL);
+		c->shared_image = VK_NULL_HANDLE;
+		return false;
+	}
+
+	// Get memory requirements
+	VkMemoryRequirements requirements = {0};
+	vk->vkGetImageMemoryRequirements(vk->device, c->shared_image, &requirements);
+
+	// Get valid memory type bits from the MTLTexture
+	VkMemoryMetalHandlePropertiesEXT metal_props = {
+	    .sType = VK_STRUCTURE_TYPE_MEMORY_METAL_HANDLE_PROPERTIES_EXT,
+	};
+	ret = vk->vkGetMemoryMetalHandlePropertiesEXT(
+	    vk->device,
+	    VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT,
+	    metal_texture_handle,
+	    &metal_props);
+	if (ret != VK_SUCCESS) {
+		U_LOG_E("vkGetMemoryMetalHandlePropertiesEXT failed: %d", ret);
+		vk->vkDestroyImage(vk->device, c->shared_image, NULL);
+		c->shared_image = VK_NULL_HANDLE;
+		return false;
+	}
+
+	requirements.memoryTypeBits = metal_props.memoryTypeBits;
+
+	// Import memory using the MTLTexture handle with dedicated allocation
+	// (matches vk_helpers.c pattern for Metal texture import)
+	VkImportMemoryMetalHandleInfoEXT import_memory_info = {
+	    .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_METAL_HANDLE_INFO_EXT,
+	    .pNext = NULL,
+	    .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT,
+	    .handle = metal_texture_handle,
+	};
+
+	VkMemoryDedicatedAllocateInfoKHR dedicated_info = {
+	    .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO_KHR,
+	    .pNext = &import_memory_info,
+	    .image = c->shared_image,
+	    .buffer = VK_NULL_HANDLE,
+	};
+
+	// Find a valid memory type
+	VkPhysicalDeviceMemoryProperties mem_props;
+	vk->vkGetPhysicalDeviceMemoryProperties(vk->physical_device, &mem_props);
+
+	uint32_t memory_type_index = UINT32_MAX;
+	for (uint32_t i = 0; i < mem_props.memoryTypeCount; i++) {
+		if ((requirements.memoryTypeBits & (1u << i)) != 0) {
+			memory_type_index = i;
+			break;
+		}
+	}
+	if (memory_type_index == UINT32_MAX) {
+		U_LOG_E("No valid memory type for shared IOSurface");
+		vk->vkDestroyImage(vk->device, c->shared_image, NULL);
+		c->shared_image = VK_NULL_HANDLE;
+		return false;
+	}
+
+	VkMemoryAllocateInfo alloc_info = {
+	    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+	    .pNext = &dedicated_info,
+	    .allocationSize = requirements.size,
+	    .memoryTypeIndex = memory_type_index,
+	};
+
+	ret = vk->vkAllocateMemory(vk->device, &alloc_info, NULL, &c->shared_memory);
+	if (ret != VK_SUCCESS) {
+		U_LOG_E("vkAllocateMemory for shared IOSurface failed: %d", ret);
+		vk->vkDestroyImage(vk->device, c->shared_image, NULL);
+		c->shared_image = VK_NULL_HANDLE;
+		return false;
+	}
+
+	ret = vk->vkBindImageMemory(vk->device, c->shared_image, c->shared_memory, 0);
+	if (ret != VK_SUCCESS) {
+		U_LOG_E("vkBindImageMemory for shared IOSurface failed: %d", ret);
+		vk->vkFreeMemory(vk->device, c->shared_memory, NULL);
+		vk->vkDestroyImage(vk->device, c->shared_image, NULL);
+		c->shared_image = VK_NULL_HANDLE;
+		c->shared_memory = VK_NULL_HANDLE;
+		return false;
+	}
+
+	// Create image view
+	VkImageViewCreateInfo view_ci = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+	    .image = c->shared_image,
+	    .viewType = VK_IMAGE_VIEW_TYPE_2D,
+	    .format = VK_FORMAT_B8G8R8A8_UNORM,
+	    .components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+	                   VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY},
+	    .subresourceRange = {
+	        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+	        .baseMipLevel = 0,
+	        .levelCount = 1,
+	        .baseArrayLayer = 0,
+	        .layerCount = 1,
+	    },
+	};
+
+	ret = vk->vkCreateImageView(vk->device, &view_ci, NULL, &c->shared_view);
+	if (ret != VK_SUCCESS) {
+		U_LOG_E("vkCreateImageView for shared IOSurface failed: %d", ret);
+		vk->vkFreeMemory(vk->device, c->shared_memory, NULL);
+		vk->vkDestroyImage(vk->device, c->shared_image, NULL);
+		c->shared_image = VK_NULL_HANDLE;
+		c->shared_memory = VK_NULL_HANDLE;
+		return false;
+	}
+
+	c->has_shared_texture = true;
+	c->settings.preferred.width = width;
+	c->settings.preferred.height = height;
+
+	U_LOG_W("Shared IOSurface imported: %ux%u, VkImage=%p, VkImageView=%p",
+	        width, height, (void *)(uintptr_t)c->shared_image,
+	        (void *)(uintptr_t)c->shared_view);
+	return true;
+#else
+	U_LOG_E("VK_EXT_metal_objects not available at compile time");
+	return false;
+#endif
+}
+#endif // XRT_OS_MACOS
 
 static inline struct comp_vk_native_compositor *
 vk_comp(struct xrt_compositor *xc)
@@ -536,6 +747,109 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 		return xret;
 	}
 
+	// Shared texture output path — render to IOSurface-backed VkImage
+	if (c->has_shared_texture && c->shared_image != VK_NULL_HANDLE) {
+		VkCommandPool cmd_pool = (VkCommandPool)(uintptr_t)
+		    comp_vk_native_renderer_get_cmd_pool(c->renderer);
+
+		VkCommandBufferAllocateInfo cmd_alloc = {
+		    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+		    .commandPool = cmd_pool,
+		    .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+		    .commandBufferCount = 1,
+		};
+
+		VkCommandBuffer cmd;
+		VkResult res = vk->vkAllocateCommandBuffers(vk->device, &cmd_alloc, &cmd);
+		if (res != VK_SUCCESS) {
+			U_LOG_E("Failed to allocate command buffer for shared texture");
+			return XRT_ERROR_VULKAN;
+		}
+
+		VkCommandBufferBeginInfo begin_info = {
+		    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+		    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+		};
+		vk->vkBeginCommandBuffer(cmd, &begin_info);
+
+		bool weaving_done = false;
+
+		// Display processor weaving path
+		if (!is_mono && c->display_processor != NULL) {
+			uint64_t left_view, right_view;
+			comp_vk_native_renderer_get_stereo_views(c->renderer, &left_view, &right_view);
+
+			uint32_t view_width, view_height;
+			comp_vk_native_renderer_get_view_dimensions(c->renderer, &view_width, &view_height);
+
+			int32_t view_format = comp_vk_native_renderer_get_format(c->renderer);
+
+			VkRenderPass dp_render_pass = xrt_display_processor_get_render_pass(c->display_processor);
+			VkFramebuffer shared_fb = VK_NULL_HANDLE;
+			if (dp_render_pass != VK_NULL_HANDLE) {
+				VkFramebufferCreateInfo fb_ci = {
+				    .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+				    .renderPass = dp_render_pass,
+				    .attachmentCount = 1,
+				    .pAttachments = &c->shared_view,
+				    .width = tgt_width,
+				    .height = tgt_height,
+				    .layers = 1,
+				};
+				vk->vkCreateFramebuffer(vk->device, &fb_ci, NULL, &shared_fb);
+			}
+
+			xrt_display_processor_process_views(
+			    c->display_processor,
+			    cmd,
+			    (VkImageView)(uintptr_t)left_view,
+			    (VkImageView)(uintptr_t)right_view,
+			    view_width, view_height,
+			    (VkFormat_XDP)view_format,
+			    shared_fb,
+			    tgt_width, tgt_height,
+			    (VkFormat_XDP)view_format);
+
+			vk->vkEndCommandBuffer(cmd);
+
+			VkSubmitInfo submit_info = {
+			    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+			    .commandBufferCount = 1,
+			    .pCommandBuffers = &cmd,
+			};
+			res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, VK_NULL_HANDLE);
+			if (res == VK_SUCCESS) {
+				vk->vkQueueWaitIdle(vk->main_queue->queue);
+				weaving_done = true;
+			}
+
+			if (shared_fb != VK_NULL_HANDLE) {
+				vk->vkDestroyFramebuffer(vk->device, shared_fb, NULL);
+			}
+		}
+
+		// Fallback: blit stereo texture to shared image
+		if (!weaving_done) {
+			comp_vk_native_renderer_blit_to_shared(c->renderer, cmd,
+			    (uint64_t)(uintptr_t)c->shared_image, tgt_width, tgt_height);
+
+			vk->vkEndCommandBuffer(cmd);
+
+			VkSubmitInfo submit_info = {
+			    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+			    .commandBufferCount = 1,
+			    .pCommandBuffers = &cmd,
+			};
+			res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, VK_NULL_HANDLE);
+			if (res == VK_SUCCESS) {
+				vk->vkQueueWaitIdle(vk->main_queue->queue);
+			}
+		}
+
+		vk->vkFreeCommandBuffers(vk->device, cmd_pool, 1, &cmd);
+		return XRT_SUCCESS;
+	}
+
 	// If we have a target (window), present to it
 	if (c->target != NULL) {
 		uint32_t target_index;
@@ -816,6 +1130,17 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		return XRT_ERROR_VULKAN;
 	}
 
+#ifdef XRT_OS_MACOS
+	// Import shared IOSurface if provided
+	if (shared_texture_handle != NULL) {
+		if (!import_shared_iosurface(c, shared_texture_handle)) {
+			U_LOG_E("Failed to import shared IOSurface");
+			free(c);
+			return XRT_ERROR_VULKAN;
+		}
+	}
+#endif
+
 #ifdef XRT_OS_WINDOWS
 	// Handle window
 	if (hwnd != NULL) {
@@ -914,6 +1239,13 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 			c->settings.preferred.width = mac_w;
 			c->settings.preferred.height = mac_h;
 		}
+	}
+	// Shared IOSurface dimensions take priority (import_shared_iosurface set them,
+	// but settings init above may have overwritten with screen logical dimensions)
+	if (c->has_shared_texture && shared_texture_handle != NULL) {
+		IOSurfaceRef surface = (IOSurfaceRef)shared_texture_handle;
+		c->settings.preferred.width = (uint32_t)IOSurfaceGetWidth(surface);
+		c->settings.preferred.height = (uint32_t)IOSurfaceGetHeight(surface);
 	}
 #endif
 

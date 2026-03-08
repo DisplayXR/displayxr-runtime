@@ -164,6 +164,25 @@ comp_vk_native_renderer_blit_to_target(struct comp_vk_native_renderer *renderer,
                                         uint32_t dst_height);
 
 /*!
+ * Blit the stereo texture to a shared (non-swapchain) image.
+ * Same as blit_to_target but transitions to GENERAL instead of PRESENT_SRC_KHR.
+ *
+ * @param renderer The renderer.
+ * @param cmd Command buffer to record into.
+ * @param dst_image Destination VkImage.
+ * @param dst_width Destination width.
+ * @param dst_height Destination height.
+ *
+ * @ingroup comp_vk_native
+ */
+void
+comp_vk_native_renderer_blit_to_shared(struct comp_vk_native_renderer *renderer,
+                                        void *cmd,
+                                        uint64_t dst_image,
+                                        uint32_t dst_width,
+                                        uint32_t dst_height);
+
+/*!
  * Get the command pool for recording commands.
  *
  * @param renderer The renderer.
