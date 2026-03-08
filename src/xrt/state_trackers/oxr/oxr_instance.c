@@ -47,6 +47,31 @@
 #include <math.h>
 
 /*
+ * Stub for the post-destroy dispatch table.
+ *
+ * Unity's OpenXR dispatch template reads *(void**)instance as a vtable
+ * pointer and calls a function pointer from it after xrDestroyInstance.
+ * Every slot in our stub table points here.  Ignoring arguments is safe
+ * on ARM64 and x86_64 C calling convention (args in registers, not stack).
+ */
+static XrResult
+oxr_tombstone_stub(void)
+{
+	return XR_EVENT_UNAVAILABLE;
+}
+
+typedef XrResult (*oxr_stub_fn)(void);
+static oxr_stub_fn g_tombstone_dispatch[512];
+
+static void
+oxr_tombstone_dispatch_init(void)
+{
+	for (int i = 0; i < 512; i++) {
+		g_tombstone_dispatch[i] = oxr_tombstone_stub;
+	}
+}
+
+/*
  * Tombstone for the most recently destroyed oxr_instance.
  *
  * Unity's OpenXR loader caches the runtime's XrInstance handle (which is a
@@ -146,6 +171,14 @@ oxr_instance_destroy(struct oxr_logger *log, struct oxr_handle_base *hb)
 	inst->profiles = NULL;
 	inst->event.next = NULL;
 	inst->event.last = NULL;
+
+	// Initialize the stub dispatch table (idempotent, cheap).
+	oxr_tombstone_dispatch_init();
+
+	// Replace debug magic with pointer to stub dispatch table.
+	// Unity's dispatch template reads *(void**)instance as a vtable;
+	// every entry returns XR_EVENT_UNAVAILABLE.
+	inst->handle.debug = (uint64_t)(uintptr_t)g_tombstone_dispatch;
 
 	free(g_instance_tombstone);
 	g_instance_tombstone = inst;
