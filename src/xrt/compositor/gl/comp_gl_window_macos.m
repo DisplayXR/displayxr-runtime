@@ -173,7 +173,16 @@ create_window_on_main_thread(struct comp_gl_window_macos *win,
 	GLint swapInterval = 1;
 	[ctx setValues:&swapInterval forParameter:NSOpenGLContextParameterSwapInterval];
 
-	[win->window setContentView:glView];
+	// Use a plain NSView as container so the HUD overlay doesn't
+	// trigger NSOpenGLView display cycles (which cause GL context
+	// threading crashes).
+	NSView *container = [[NSView alloc] initWithFrame:frame];
+	[container setAutoresizesSubviews:YES];
+	[glView setFrame:container.bounds];
+	[glView setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
+	[container addSubview:glView];
+
+	[win->window setContentView:container];
 	win->view = glView;
 	win->gl_context = ctx;
 
@@ -189,10 +198,11 @@ create_window_on_main_thread(struct comp_gl_window_macos *win,
 		[NSApp sendEvent:event];
 	}
 
-	// Create HUD overlay view (bottom-left, hidden initially)
+	// Create HUD overlay view as sibling of glView (not subview)
+	// so HUD redraws don't interfere with GL context
 	NSRect hudFrame = NSMakeRect(10, 10, 420, 380);
 	win->hud_view = [[CompGLHudOverlayView alloc] initWithFrame:hudFrame];
-	[glView addSubview:win->hud_view];
+	[container addSubview:win->hud_view positioned:NSWindowAbove relativeTo:glView];
 	[win->hud_view setHidden:YES];
 
 	win->owns_window = true;

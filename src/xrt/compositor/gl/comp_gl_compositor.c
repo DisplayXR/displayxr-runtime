@@ -688,7 +688,7 @@ gl_compositor_update_hud(struct comp_gl_compositor *c, float dt)
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
 	struct qwerty_stereo_state ss = {0};
-	bool have_ss = qwerty_get_stereo_state(
+	bool have_ss = (c->xsysd != NULL) && qwerty_get_stereo_state(
 	    c->xsysd->xdevs, c->xsysd->xdev_count, &ss);
 
 	if (have_ss) {
@@ -712,7 +712,7 @@ gl_compositor_update_hud(struct comp_gl_compositor *c, float dt)
 	}
 
 	// Get virtual display/camera position from qwerty HMD
-	{
+	if (c->xsysd != NULL) {
 		struct xrt_device *qwerty_hmd = NULL;
 		for (uint32_t i = 0; i < c->xsysd->xdev_count; i++) {
 			if (c->xsysd->xdevs[i] != NULL &&
