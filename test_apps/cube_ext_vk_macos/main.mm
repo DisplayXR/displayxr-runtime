@@ -2831,9 +2831,9 @@ int main() {
                         ? xr.renderingModeNames[g_currentOutputMode] : "?";
 
                     // Build output mode hint: "1-N=Output" if >1 mode, empty if single
-                    char outputHint[32] = "";
+                    NSString *outputHintStr = @"";
                     if (xr.renderingModeCount > 1) {
-                        snprintf(outputHint, sizeof(outputHint), "  1-%u=Output", xr.renderingModeCount);
+                        outputHintStr = [NSString stringWithFormat:@"  1-%u=Output", xr.renderingModeCount];
                     }
 
                     // Session state name lookup
@@ -2893,7 +2893,7 @@ int main() {
                         "\n"
                         "WASD/QE=Move  Drag=Look  Space=Reset\n"
                         "%s  Shift=IPD  Ctrl=Parallax  %s\n"
-                        "C=Mode  V=2D/3D  T=EyeMode%s  Tab=HUD  ESC=Quit",
+                        "C=Mode  V=2D/3D  T=EyeMode%@  Tab=HUD  ESC=Quit",
                         xr.systemName,
                         sessionStateName,
                         xr.hasCocoaWindowBinding ? "ACTIVE" : "NOT AVAILABLE",
@@ -2920,7 +2920,7 @@ int main() {
                         param2Label, g_input.cameraMode ? g_input.stereo.zoomFactor : g_input.stereo.scaleFactor,
                         valueLine,
                         scrollHint, perspHint,
-                        outputHint];
+                        outputHintStr];
                     g_hudView.hudText = text;
                     [g_hudView setNeedsDisplay:YES];
                     [g_hudView setHidden:NO];

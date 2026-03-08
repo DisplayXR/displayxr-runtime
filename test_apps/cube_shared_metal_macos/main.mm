@@ -1970,9 +1970,9 @@ int main(int argc, char **argv)
                     ? app.renderingModeNames[g_currentOutputMode] : "?";
 
                 // Build output mode hint: "1-N=Output" if >1 mode, empty if single
-                char outputHint[32] = "";
+                NSString *outputHintStr = @"";
                 if (app.renderingModeCount > 1) {
-                    snprintf(outputHint, sizeof(outputHint), "  1-%u=Output", app.renderingModeCount);
+                    outputHintStr = [NSString stringWithFormat:@"  1-%u=Output", app.renderingModeCount];
                 }
 
                 // Update toolbar
@@ -2044,7 +2044,7 @@ int main(int argc, char **argv)
                             "\n"
                             "WASD/QE=Move  Drag=Look  Space=Reset\n"
                             "%s  Shift=IPD  Ctrl=Parallax  %s\n"
-                            "C=Mode  V=2D/3D%s  Tab=HUD  ESC=Quit",
+                            "C=Mode  V=2D/3D%@  Tab=HUD  ESC=Quit",
                             app.systemName,
                             sessionStateName,
                             kooimaMode,
@@ -2059,7 +2059,7 @@ int main(int argc, char **argv)
                             param2Label, g_input.cameraMode ? g_input.stereo.zoomFactor : g_input.stereo.scaleFactor,
                             valueLineStr,
                             scrollHint, perspHint,
-                            outputHint];
+                            outputHintStr];
                         g_hudView.hudText = text;
                         [g_hudView setNeedsDisplay:YES];
                         [g_hudView setHidden:NO];
