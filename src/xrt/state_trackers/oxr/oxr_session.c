@@ -740,9 +740,14 @@ oxr_session_poll(struct oxr_logger *log, struct oxr_session *sess)
 
 #ifdef XRT_OS_MACOS
 	// Skip macOS event pump if the compositor has already been destroyed
-	// (e.g. during session teardown). Pumping events with a torn-down
-	// compositor can trigger AppKit callbacks into freed resources.
-	if (sess->xcn == NULL) {
+	// or the session has ended (IDLE/EXITING). After xrEndSession calls
+	// xrt_comp_end_session(), the compositor is in a half-torn-down state
+	// but xcn is still non-null. Pumping events (CATransaction flush,
+	// CFRunLoop) with a torn-down compositor triggers AppKit/Metal
+	// callbacks into freed resources → SIGSEGV.
+	if (sess->xcn == NULL ||
+	    sess->state == XR_SESSION_STATE_IDLE ||
+	    sess->state == XR_SESSION_STATE_EXITING) {
 		return XR_SUCCESS;
 	}
 

@@ -54,6 +54,7 @@ add_executable(cube_shared_vk_macos
     main.mm
     "${CMAKE_SOURCE_DIR}/../common/display3d_view.c"
     "${CMAKE_SOURCE_DIR}/../common/camera3d_view.c"
+    "${CMAKE_SOURCE_DIR}/../common/hud_overlay_macos.m"
 )
 
 target_include_directories(cube_shared_vk_macos PRIVATE

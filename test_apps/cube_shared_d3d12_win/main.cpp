@@ -479,7 +479,9 @@ static void RenderOneFrame(RenderState& rs) {
                             std::wstring dispText = FormatDisplayInfo(xr.displayWidthM, xr.displayHeightM,
                                 xr.nominalViewerX, xr.nominalViewerY, xr.nominalViewerZ);
                             dispText += L"\n" + FormatScaleInfo(xr.recommendedViewScaleX, xr.recommendedViewScaleY);
-                            dispText += L"\n" + FormatOutputMode(g_inputState.outputMode, xr.pfnRequestDisplayRenderingModeEXT != nullptr);
+                            dispText += L"\n" + FormatOutputMode(g_inputState.outputMode, xr.pfnRequestDisplayRenderingModeEXT != nullptr,
+                                (xr.renderingModeCount > 0 && (uint32_t)g_inputState.outputMode < xr.renderingModeCount) ? xr.renderingModeNames[g_inputState.outputMode] : nullptr,
+                                xr.renderingModeCount);
                             std::wstring eyeText = FormatEyeTrackingInfo(
                                 xr.leftEyeX, xr.leftEyeY, xr.leftEyeZ,
                                 xr.rightEyeX, xr.rightEyeY, xr.rightEyeZ,
@@ -511,7 +513,7 @@ static void RenderOneFrame(RenderState& rs) {
                                 }
                                 stereoText += vhBuf;
                             }
-                            std::wstring helpText = FormatHelpText(xr.pfnRequestDisplayRenderingModeEXT != nullptr, g_inputState.cameraMode);
+                            std::wstring helpText = FormatHelpText(xr.pfnRequestDisplayRenderingModeEXT != nullptr, g_inputState.cameraMode, xr.renderingModeCount);
 
                             uint32_t srcRowPitch = 0;
                             const void* pixels = RenderHudAndMap(*rs.hudRenderer, &srcRowPitch,

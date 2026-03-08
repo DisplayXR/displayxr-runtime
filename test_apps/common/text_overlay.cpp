@@ -244,14 +244,23 @@ std::wstring FormatParallaxInfo(bool parallaxEnabled, float eyePosX, float eyePo
     return oss.str();
 }
 
-std::wstring FormatOutputMode(int outputMode, bool simDisplayAvailable) {
+std::wstring FormatOutputMode(int outputMode, bool simDisplayAvailable, const char* modeName, uint32_t modeCount) {
     if (!simDisplayAvailable) {
         return L"Output: Weaved";
     }
-    const wchar_t* modeNames[] = {L"SBS", L"Anaglyph", L"Blend"};
-    const wchar_t* name = (outputMode >= 0 && outputMode <= 2) ? modeNames[outputMode] : L"?";
     std::wostringstream oss;
-    oss << L"Output: " << name << L" [1/2/3]";
+    if (modeName != nullptr && modeName[0] != '\0') {
+        std::wstring wname(modeName, modeName + strlen(modeName));
+        oss << L"Output: " << wname;
+    } else {
+        const wchar_t* modeNames[] = {L"SBS", L"Anaglyph", L"Blend"};
+        const wchar_t* name = (outputMode >= 0 && outputMode <= 2) ? modeNames[outputMode] : L"?";
+        oss << L"Output: " << name;
+    }
+    // Show key hint only if more than 1 mode available
+    if (modeCount > 1) {
+        oss << L" [1-" << modeCount << L"]";
+    }
     return oss.str();
 }
 
@@ -281,13 +290,14 @@ std::wstring FormatScaleInfo(float scaleX, float scaleY) {
     return oss.str();
 }
 
-std::wstring FormatHelpText(bool simDisplayAvailable, bool cameraMode) {
-    if (simDisplayAvailable) {
-        return L"WASD/QE=Move  Drag=Look  Space=Reset\n"
-               L"Scroll=Scale  Shift+Scroll=IPD+Parallax\n"
-               L"V=2D/3D  T=EyeMode  1/2/3=Output  Tab=HUD  F11=Full  ESC=Quit";
+std::wstring FormatHelpText(bool simDisplayAvailable, bool cameraMode, uint32_t modeCount) {
+    std::wostringstream oss;
+    oss << L"WASD/QE=Move  Drag=Look  Space=Reset\n"
+        << L"Scroll=Scale  Shift+Scroll=IPD+Parallax\n"
+        << L"V=2D/3D  T=EyeMode";
+    if (simDisplayAvailable && modeCount > 1) {
+        oss << L"  1-" << modeCount << L"=Output";
     }
-    return L"WASD/QE=Move  Drag=Look  Space=Reset\n"
-           L"Scroll=Scale  Shift+Scroll=IPD+Parallax\n"
-           L"V=2D/3D  T=EyeMode  Tab=HUD  F11=Full  ESC=Quit";
+    oss << L"  Tab=HUD  F11=Full  ESC=Quit";
+    return oss.str();
 }

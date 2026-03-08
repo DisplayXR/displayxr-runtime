@@ -32,36 +32,7 @@
  *
  */
 
-@interface CompGLHudOverlayView : NSView
-@property (nonatomic, copy) NSString *hudText;
-@end
-
-@implementation CompGLHudOverlayView
-- (instancetype)initWithFrame:(NSRect)frame {
-	self = [super initWithFrame:frame];
-	if (self) { _hudText = @""; [self setWantsLayer:YES]; }
-	return self;
-}
-- (BOOL)isOpaque { return NO; }
-- (NSView *)hitTest:(NSPoint)point { (void)point; return nil; }
-- (void)drawRect:(NSRect)dirtyRect {
-	(void)dirtyRect;
-	if (_hudText.length == 0) return;
-	NSBezierPath *bg = [NSBezierPath bezierPathWithRoundedRect:self.bounds xRadius:6 yRadius:6];
-	[[NSColor colorWithCalibratedRed:0 green:0 blue:0 alpha:0.5] setFill];
-	[bg fill];
-	NSFont *font = [NSFont fontWithName:@"Menlo" size:11];
-	if (!font) font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
-	NSDictionary *attrs = @{
-	    NSFontAttributeName: font,
-	    NSForegroundColorAttributeName: [NSColor colorWithCalibratedRed:0.9 green:0.9 blue:0.9 alpha:1.0]
-	};
-	NSRect textRect = NSInsetRect(self.bounds, 8, 8);
-	[_hudText drawWithRect:textRect
-	               options:NSStringDrawingUsesLineFragmentOrigin | NSStringDrawingTruncatesLastVisibleLine
-	            attributes:attrs context:nil];
-}
-@end
+#import "comp_hud_overlay_macos.h"
 
 struct comp_gl_window_macos
 {
@@ -78,7 +49,7 @@ struct comp_gl_window_macos
 	bool owns_window;
 
 	//! HUD overlay view (for runtime-owned windows).
-	CompGLHudOverlayView *hud_view;
+	CompHudOverlayView *hud_view;
 };
 
 static void
@@ -201,7 +172,7 @@ create_window_on_main_thread(struct comp_gl_window_macos *win,
 	// Create HUD overlay view as sibling of glView (not subview)
 	// so HUD redraws don't interfere with GL context
 	NSRect hudFrame = NSMakeRect(10, 10, 420, 380);
-	win->hud_view = [[CompGLHudOverlayView alloc] initWithFrame:hudFrame];
+	win->hud_view = [[CompHudOverlayView alloc] initWithFrame:hudFrame];
 	[container addSubview:win->hud_view positioned:NSWindowAbove relativeTo:glView];
 	[win->hud_view setHidden:YES];
 

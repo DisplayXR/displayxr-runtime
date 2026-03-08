@@ -223,6 +223,17 @@ struct xrt_binding_profile
 };
 
 /*!
+ * A named rendering mode exposed by a device.
+ *
+ * @ingroup xrt_iface
+ */
+struct xrt_rendering_mode
+{
+	uint32_t mode_index;                    //!< Vendor-defined mode index
+	char mode_name[XRT_DEVICE_NAME_LEN];    //!< Human-readable mode name
+};
+
+/*!
  * Generic device property identifiers.
  *
  * @note This property mechanism may be replaced by XR_EXT_display_render_mode
@@ -332,6 +343,11 @@ struct xrt_device
 	size_t output_count;
 	//! Array of output structs.
 	struct xrt_output *outputs;
+
+	//! Number of rendering modes.
+	uint32_t rendering_mode_count;
+	//! Array of named rendering modes.
+	struct xrt_rendering_mode rendering_modes[XRT_MAX_RENDERING_MODES];
 
 	//! What features/functions/things does this device supports?
 	struct xrt_device_supported supported;

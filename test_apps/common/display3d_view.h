@@ -138,6 +138,48 @@ display3d_apply_eye_factors(const XrVector3f *raw_left,
                             XrVector3f *out_right);
 
 /*!
+ * Apply eye factors to N eyes. N-eye generalization of display3d_apply_eye_factors.
+ * Center is the centroid of all N raw positions.
+ *
+ * @param raw_eyes       Array of N raw eye positions
+ * @param count          Number of eyes (must be >= 1)
+ * @param nominal_viewer Nominal viewer position (or NULL for {0,0,0.5})
+ * @param ipd_factor     IPD scaling factor [0, 1]
+ * @param parallax_factor Parallax lerp factor [0, 1]
+ * @param out_eyes       Output array of N processed eye positions
+ */
+void
+display3d_apply_eye_factors_n(const XrVector3f *raw_eyes,
+                              uint32_t count,
+                              const XrVector3f *nominal_viewer,
+                              float ipd_factor,
+                              float parallax_factor,
+                              XrVector3f *out_eyes);
+
+/*!
+ * Compute display-centric view+projection for a single eye.
+ *
+ * Takes a pre-processed eye position (after apply_eye_factors) and computes
+ * view matrix, projection matrix, FOV, and world-space eye position.
+ *
+ * @param processed_eye  Processed eye position (after apply_eye_factors)
+ * @param screen         Physical screen dimensions
+ * @param tunables       Stereo factors (perspective_factor, virtual_display_height)
+ * @param display_pose   Display pose in world space (or NULL for identity)
+ * @param near_z         Near clip plane distance
+ * @param far_z          Far clip plane distance
+ * @param out            Output view for this eye
+ */
+void
+display3d_compute_view(const XrVector3f *processed_eye,
+                       const Display3DScreen *screen,
+                       const Display3DTunables *tunables,
+                       const XrPosef *display_pose,
+                       float near_z,
+                       float far_z,
+                       Display3DStereoView *out);
+
+/*!
  * Default tunables (all factors = 1.0).
  */
 Display3DTunables

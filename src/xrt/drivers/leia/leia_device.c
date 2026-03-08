@@ -203,6 +203,11 @@ leia_hmd_create(void)
 	snprintf(hmd->base.str, XRT_DEVICE_NAME_LEN, "Leia 3D Display");
 	snprintf(hmd->base.serial, XRT_DEVICE_NAME_LEN, "leia_display_0");
 
+	// Rendering modes: Leia exposes 1 mode (LeiaSR).
+	hmd->base.rendering_mode_count = 1;
+	hmd->base.rendering_modes[0].mode_index = 0;
+	snprintf(hmd->base.rendering_modes[0].mode_name, XRT_DEVICE_NAME_LEN, "LeiaSR");
+
 	// Head pose input.
 	hmd->base.inputs[0].name = XRT_INPUT_GENERIC_HEAD_POSE;
 

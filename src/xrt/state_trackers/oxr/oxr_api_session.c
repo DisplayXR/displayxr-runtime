@@ -1326,4 +1326,46 @@ oxr_xrRequestDisplayRenderingModeEXT(XrSession session, uint32_t modeIndex)
 	return XR_SUCCESS;
 }
 
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrEnumerateDisplayRenderingModesEXT(XrSession session,
+                                        uint32_t modeCapacityInput,
+                                        uint32_t *modeCountOutput,
+                                        XrDisplayRenderingModeInfoEXT *modes)
+{
+	OXR_TRACE_MARKER();
+
+	struct oxr_session *sess;
+	struct oxr_logger log;
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrEnumerateDisplayRenderingModesEXT");
+
+	struct xrt_device *head = GET_XDEV_BY_ROLE(sess->sys, head);
+	if (head == NULL) {
+		return oxr_error(&log, XR_ERROR_RUNTIME_FAILURE, "No head device available");
+	}
+
+	uint32_t count = head->rendering_mode_count;
+
+	if (modeCountOutput == NULL) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE, "modeCountOutput");
+	}
+	*modeCountOutput = count;
+
+	if (modeCapacityInput == 0) {
+		return XR_SUCCESS;
+	}
+	if (modeCapacityInput < count) {
+		return oxr_error(&log, XR_ERROR_SIZE_INSUFFICIENT, "modeCapacityInput");
+	}
+
+	for (uint32_t i = 0; i < count; i++) {
+		modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT;
+		modes[i].next = NULL;
+		modes[i].modeIndex = head->rendering_modes[i].mode_index;
+		snprintf(modes[i].modeName, XR_MAX_SYSTEM_NAME_SIZE, "%s",
+		         head->rendering_modes[i].mode_name);
+	}
+
+	return XR_SUCCESS;
+}
+
 #endif // OXR_HAVE_EXT_display_info
