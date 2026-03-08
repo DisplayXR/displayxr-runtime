@@ -1639,20 +1639,20 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 	c->display_refresh_rate = 60.0f;
 	c->offscreen = offscreen;
 
-	// Get recommended rendering dimensions from device.
-	// views[].display.w_pixels is the full display logical width;
-	// the null compositor recommends half that per eye, so the SBS
-	// stereo texture must use half-width per eye to match.
-	uint32_t recommended_width = 0;
-	uint32_t recommended_height = 0;
-	if (xdev != NULL && xdev->hmd != NULL) {
-		uint32_t screen_w = xdev->hmd->screens[0].w_pixels;
-		uint32_t view_count = xdev->hmd->view_count;
-		recommended_width = (screen_w > 0 && view_count > 0) ? (screen_w / view_count) : 0;
-		recommended_height = xdev->hmd->views[0].display.h_pixels;
+	// Get display dimensions from device.
+	// Use screens[0] (full SBS logical size), matching the GL compositor.
+	// create_stereo_texture treats this as per-eye width (SBS = 2x).
+	uint32_t display_width = 0;
+	uint32_t display_height = 0;
+	if (xdev != NULL && xdev->hmd != NULL &&
+	    xdev->hmd->screens[0].w_pixels > 0) {
+		display_width = xdev->hmd->screens[0].w_pixels;
+		display_height = xdev->hmd->screens[0].h_pixels;
 	}
-	if (recommended_width == 0) recommended_width = 960;
-	if (recommended_height == 0) recommended_height = 1080;
+	if (display_width == 0) display_width = 1920;
+	if (display_height == 0) display_height = 1080;
+	// Per-eye width for the stereo texture
+	uint32_t per_eye_width = display_width / 2;
 
 	// Window / headless setup
 	NSView *external_view = (__bridge NSView *)window_handle;
@@ -1665,7 +1665,7 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 	} else if (shared_iosurface == NULL) {
 		// Only create a window when there's no shared IOSurface.
 		// With IOSurface, we render headless — no window needed.
-		if (!create_window(c, recommended_width * 2, recommended_height)) {
+		if (!create_window(c, display_width, display_height)) {
 			os_mutex_destroy(&c->mutex);
 			free(c);
 			return XRT_ERROR_VULKAN;
@@ -1708,23 +1708,6 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 		}
 	}
 
-	// The HMD views report logical dimensions (e.g. 1512x823 on Retina).
-	// The recommended swapchain height from oxr_system.c uses physical pixels
-	// (display_pixel_height = 1646), but xdev->hmd->views[].h_pixels is logical.
-	// Scale height to match the physical drawable resolution.
-	CGFloat scale = 1.0;
-	if (c->metal_layer != nil) {
-		scale = c->metal_layer.contentsScale;
-	} else if (c->window != nil) {
-		scale = c->window.backingScaleFactor;
-	} else {
-		// Headless — use main screen backing scale
-		scale = [NSScreen mainScreen].backingScaleFactor;
-	}
-	if (scale > 1.0) {
-		recommended_height = (uint32_t)(recommended_height * scale);
-	}
-
 	// Compile shaders
 	if (!compile_shaders(c)) {
 		os_mutex_destroy(&c->mutex);
@@ -1732,8 +1715,9 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 		return XRT_ERROR_VULKAN;
 	}
 
-	// Create SBS stereo texture
-	if (!create_stereo_texture(c, recommended_width, recommended_height)) {
+	// Create SBS stereo texture using per-eye logical dimensions
+	// (matching the GL compositor which uses screens[0].w_pixels / 2).
+	if (!create_stereo_texture(c, per_eye_width, display_height)) {
 		os_mutex_destroy(&c->mutex);
 		free(c);
 		return XRT_ERROR_VULKAN;

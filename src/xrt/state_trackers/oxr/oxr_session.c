@@ -246,7 +246,10 @@ oxr_session_get_display_dimensions(struct oxr_session *sess, float *out_width_m,
 
 #ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR
 	if (sess->xcn != NULL && sess->is_metal_native_compositor) {
-		return comp_metal_compositor_get_display_dimensions(&sess->xcn->base, out_width_m, out_height_m);
+		if (comp_metal_compositor_get_display_dimensions(&sess->xcn->base, out_width_m, out_height_m)) {
+			return true;
+		}
+		// Fall through to generic path (e.g., sim_display with no display_processor)
 	}
 #endif
 
