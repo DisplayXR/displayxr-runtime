@@ -5,7 +5,7 @@
  * @brief  OpenXR session management for OpenGL (standard mode, no win32_window_binding)
  *
  * This version does NOT use the XR_EXT_win32_window_binding extension.
- * OpenXR/Monado will create its own window for rendering.
+ * OpenXR/DisplayXR will create its own window for rendering.
  */
 
 #pragma once
@@ -21,5 +21,5 @@ bool InitializeOpenXR(XrSessionManager& xr);
 // Get OpenGL graphics requirements (min/max GL version)
 bool GetOpenGLGraphicsRequirements(XrSessionManager& xr);
 
-// Create session with OpenGL context (no window handle - Monado creates window)
+// Create session with OpenGL context (no window handle - DisplayXR creates window)
 bool CreateSession(XrSessionManager& xr, HDC hDC, HGLRC hGLRC);

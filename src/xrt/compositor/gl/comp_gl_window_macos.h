@@ -148,6 +148,25 @@ comp_gl_window_macos_is_valid(struct comp_gl_window_macos *win);
 void
 comp_gl_window_macos_destroy(struct comp_gl_window_macos **win_ptr);
 
+/*!
+ * Update the HUD overlay text (only for self-owned windows).
+ *
+ * Dispatches to main thread for NSView update.
+ *
+ * @param win  The window handle.
+ * @param text The HUD text to display.
+ */
+void
+comp_gl_window_macos_update_hud(struct comp_gl_window_macos *win, const char *text);
+
+/*!
+ * Hide the HUD overlay (only for self-owned windows).
+ *
+ * @param win The window handle.
+ */
+void
+comp_gl_window_macos_hide_hud(struct comp_gl_window_macos *win);
+
 #ifdef __cplusplus
 }
 #endif

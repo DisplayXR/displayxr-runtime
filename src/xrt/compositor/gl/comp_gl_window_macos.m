@@ -93,7 +93,7 @@ create_window_on_main_thread(struct comp_gl_window_macos *win,
 		return;
 	}
 
-	[win->window setTitle:@"Monado OpenXR — GL Native Compositor"];
+	[win->window setTitle:@"DisplayXR — GL Native Compositor"];
 
 	// Create pixel format and GL context
 	NSOpenGLPixelFormat *pf = create_pixel_format();

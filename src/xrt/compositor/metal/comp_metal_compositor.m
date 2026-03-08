@@ -614,7 +614,7 @@ create_window_on_main_thread(struct comp_metal_compositor *c, uint32_t width, ui
 		return;
 	}
 
-	[c->window setTitle:@"Monado OpenXR — Metal Native Compositor"];
+	[c->window setTitle:@"DisplayXR — Metal Native Compositor"];
 
 	CompMetalView *metalView = [[CompMetalView alloc] initWithFrame:frame];
 	metalView.wantsLayer = YES;

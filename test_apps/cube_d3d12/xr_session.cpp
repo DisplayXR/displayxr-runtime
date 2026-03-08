@@ -168,7 +168,7 @@ bool InitializeOpenXR(XrSessionManager& xr) {
 }
 
 bool CreateSession(XrSessionManager& xr, ID3D12Device* device, ID3D12CommandQueue* queue) {
-    LOG_INFO("Creating OpenXR session (Monado creates window)...");
+    LOG_INFO("Creating OpenXR session (DisplayXR creates window)...");
     LOG_INFO("  D3D12 Device: 0x%p", device);
     LOG_INFO("  Command Queue: 0x%p", queue);
 

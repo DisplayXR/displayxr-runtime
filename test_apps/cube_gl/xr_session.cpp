@@ -174,7 +174,7 @@ bool InitializeOpenXR(XrSessionManager& xr) {
 }
 
 bool CreateSession(XrSessionManager& xr, HDC hDC, HGLRC hGLRC) {
-    LOG_INFO("Creating OpenXR session (Monado creates window)...");
+    LOG_INFO("Creating OpenXR session (DisplayXR creates window)...");
     LOG_INFO("  HDC: 0x%p", hDC);
     LOG_INFO("  HGLRC: 0x%p", hGLRC);
 

@@ -5,7 +5,7 @@
  * @brief  OpenXR session management for D3D12 (standard mode, no win32_window_binding)
  *
  * This version does NOT use the XR_EXT_win32_window_binding extension.
- * OpenXR/Monado will create its own window for rendering.
+ * OpenXR/DisplayXR will create its own window for rendering.
  */
 
 #pragma once
@@ -21,5 +21,5 @@ bool InitializeOpenXR(XrSessionManager& xr);
 // Get the D3D12 graphics requirements (adapter LUID)
 bool GetD3D12GraphicsRequirements(XrSessionManager& xr, LUID* outAdapterLuid);
 
-// Create session with D3D12 device only (no window handle - Monado creates window)
+// Create session with D3D12 device only (no window handle - DisplayXR creates window)
 bool CreateSession(XrSessionManager& xr, ID3D12Device* device, ID3D12CommandQueue* queue);

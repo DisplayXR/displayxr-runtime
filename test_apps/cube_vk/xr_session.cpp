@@ -371,7 +371,7 @@ bool CreateVulkanDevice(VkPhysicalDevice physDevice, uint32_t queueFamilyIndex,
 bool CreateSession(XrSessionManager& xr, VkInstance vkInstance, VkPhysicalDevice physDevice,
     VkDevice device, uint32_t queueFamilyIndex, uint32_t queueIndex)
 {
-    LOG_INFO("Creating OpenXR session (Monado creates window)...");
+    LOG_INFO("Creating OpenXR session (DisplayXR creates window)...");
     LOG_INFO("  VkInstance: 0x%p", (void*)vkInstance);
     LOG_INFO("  VkPhysicalDevice: 0x%p", (void*)physDevice);
     LOG_INFO("  VkDevice: 0x%p", (void*)device);

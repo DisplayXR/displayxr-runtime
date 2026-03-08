@@ -1522,7 +1522,7 @@ static HudOverlayView *g_hudView = nil;
 
 /*!
  * NSView subclass whose backing layer is a CAMetalLayer.
- * Same pattern as MonadoMetalView in comp_window_macos.m.
+ * Same pattern as DisplayXRMetalView in comp_window_macos.m.
  */
 @interface AppMetalView : NSView
 @end
@@ -2550,9 +2550,9 @@ int main() {
     //
     //  1. CFRunLoopTimer on kCFRunLoopCommonModes — fires during resize
     //     tracking but caused "Unknown failure" from the OpenXR loader
-    //     (C++ exception escaping from the Monado runtime).
+    //     (C++ exception escaping from the DisplayXR runtime).
     //
-    //  2. Dedicated render pthread — same "Unknown failure". The Monado
+    //  2. Dedicated render pthread — same "Unknown failure". The DisplayXR
     //     runtime throws when OpenXR frame-loop calls (xrWaitFrame /
     //     xrBeginFrame / xrEndFrame) run on a thread other than the one
     //     that created the session. Even starting the session on the main

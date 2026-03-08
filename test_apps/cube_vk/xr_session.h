@@ -5,7 +5,7 @@
  * @brief  OpenXR session management for Vulkan (standard mode, no win32_window_binding)
  *
  * This version does NOT use the XR_EXT_win32_window_binding extension.
- * OpenXR/Monado will create its own window for rendering.
+ * OpenXR/DisplayXR will create its own window for rendering.
  */
 
 #pragma once
@@ -39,6 +39,6 @@ bool CreateVulkanDevice(VkPhysicalDevice physDevice, uint32_t queueFamilyIndex,
     const std::vector<const char*>& deviceExtensions,
     VkDevice& device, VkQueue& graphicsQueue);
 
-// Create OpenXR session with Vulkan binding (no window handle - Monado creates window)
+// Create OpenXR session with Vulkan binding (no window handle - DisplayXR creates window)
 bool CreateSession(XrSessionManager& xr, VkInstance vkInstance, VkPhysicalDevice physDevice,
     VkDevice device, uint32_t queueFamilyIndex, uint32_t queueIndex);

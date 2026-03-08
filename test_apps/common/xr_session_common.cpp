@@ -769,7 +769,7 @@ XrPosef ComputeHUDPose(
     XMVECTOR hudWorldCenter = XMVectorAdd(planeCenter, worldOffset);
 
     // Transform from LOCAL (world) space to VIEW space.
-    // The Monado state tracker silently drops LOCAL-space quad layers when
+    // The DisplayXR state tracker silently drops LOCAL-space quad layers when
     // handle_space() fails to locate the head device. VIEW space always works
     // because it bypasses device locating. We compute the view-relative pose here.
     //
@@ -813,7 +813,7 @@ bool EndFrameWithQuadLayer(
     projectionLayer.views = projViews;
 
     // Quad layer for UI overlay - positioned in VIEW space (pose is view-relative)
-    // We use VIEW space because Monado's handle_space() silently drops LOCAL-space
+    // We use VIEW space because DisplayXR's handle_space() silently drops LOCAL-space
     // quad layers when the head device relation flags are zero. The caller computes
     // the view-relative pose from the convergence plane each frame.
     XrCompositionLayerQuad quadLayer = {XR_TYPE_COMPOSITION_LAYER_QUAD};

@@ -169,7 +169,7 @@ bool InitializeOpenXR(XrSessionManager& xr) {
 }
 
 bool CreateSession(XrSessionManager& xr, ID3D11Device* d3d11Device) {
-    LOG_INFO("Creating OpenXR session (Monado creates window)...");
+    LOG_INFO("Creating OpenXR session (DisplayXR creates window)...");
     LOG_INFO("  D3D11 Device: 0x%p", d3d11Device);
 
     XrGraphicsBindingD3D11KHR d3d11Binding = {XR_TYPE_GRAPHICS_BINDING_D3D11_KHR};

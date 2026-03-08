@@ -90,7 +90,7 @@ create_window_on_main_thread(struct comp_vk_native_window_macos *win,
 		return;
 	}
 
-	[win->window setTitle:@"Monado OpenXR — VK Native Compositor"];
+	[win->window setTitle:@"DisplayXR — VK Native Compositor"];
 
 	CompVkNativeView *vkView = [[CompVkNativeView alloc] initWithFrame:frame];
 	vkView.wantsLayer = YES;
