@@ -301,7 +301,7 @@ Both achieve the same goal: **stable window position during weave + Present**. T
 
 ## References
 
-- Test app implementation: `test_apps/cube_ext_d3d11/` (D3D11 with WM_PAINT handling)
+- Test app implementation: `test_apps/cube_ext_d3d11_win/` (D3D11 with WM_PAINT handling)
 - Monado window management: `src/xrt/compositor/d3d11/comp_d3d11_window.cpp`
 - Monado compositor integration: `src/xrt/compositor/d3d11/comp_d3d11_compositor.cpp`
 - Extension spec: `doc/extensions/XR_EXT_win32_window_binding.md` (Section 4.3)

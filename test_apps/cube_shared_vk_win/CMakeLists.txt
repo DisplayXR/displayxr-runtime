@@ -78,8 +78,8 @@ add_executable(cube_shared_vk_win WIN32
     main.cpp
     xr_session.cpp
     xr_session.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_ext_vk/vk_renderer.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_ext_vk/vk_renderer.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_ext_vk_win/vk_renderer.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_ext_vk_win/vk_renderer.h
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/hud_renderer.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/hud_renderer.h
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/text_overlay.cpp

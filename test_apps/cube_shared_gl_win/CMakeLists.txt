@@ -71,10 +71,10 @@ add_executable(cube_shared_gl_win WIN32
     xr_session.cpp
     xr_session.h
     # Reuse GL renderer and function loading from cube_ext_gl
-    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_ext_gl/gl_renderer.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_ext_gl/gl_renderer.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_ext_gl/gl_functions.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_ext_gl/gl_functions.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_ext_gl_win/gl_renderer.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_ext_gl_win/gl_renderer.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_ext_gl_win/gl_functions.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_ext_gl_win/gl_functions.h
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/hud_renderer.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/hud_renderer.h
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/text_overlay.cpp

@@ -70,8 +70,8 @@ add_executable(cube_shared_d3d12_win WIN32
     main.cpp
     xr_session.cpp
     xr_session.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_ext_d3d12/d3d12_renderer.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_ext_d3d12/d3d12_renderer.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_ext_d3d12_win/d3d12_renderer.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_ext_d3d12_win/d3d12_renderer.h
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/hud_renderer.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/hud_renderer.h
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/text_overlay.cpp

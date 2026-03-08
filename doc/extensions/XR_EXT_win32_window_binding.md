@@ -735,11 +735,11 @@ The D3D11 immediate device context is **single-threaded by design**. Application
 
 | Directory | Description |
 |-----------|-------------|
-| `test_apps/cube_ext_d3d11/` | D3D11 test app using `XR_EXT_win32_window_binding` with WM_PAINT drag handling |
-| `test_apps/cube_ext_vk/` | Vulkan variant |
-| `test_apps/cube_ext_gl/` | OpenGL variant |
-| `test_apps/cube_ext_d3d12/` | D3D12 variant |
-| `test_apps/cube_d3d11/` | Standard OpenXR test app (no window binding, uses shared compositor) |
+| `test_apps/cube_ext_d3d11_win/` | D3D11 test app using `XR_EXT_win32_window_binding` with WM_PAINT drag handling |
+| `test_apps/cube_ext_vk_win/` | Vulkan variant |
+| `test_apps/cube_ext_gl_win/` | OpenGL variant |
+| `test_apps/cube_ext_d3d12_win/` | D3D12 variant |
+| `test_apps/cube_rt_d3d11_win/` | Standard OpenXR test app (no window binding, uses shared compositor) |
 | `test_apps/common/` | Shared utilities: window manager, D3D11 renderer, HUD renderer, text overlay, input handler |
 
 ---

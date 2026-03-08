@@ -70,10 +70,10 @@ add_executable(cube_rt_gl_win WIN32
     main.cpp
     xr_session.cpp
     xr_session.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_ext_gl/gl_renderer.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_ext_gl/gl_renderer.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_ext_gl/gl_functions.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_ext_gl/gl_functions.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_ext_gl_win/gl_renderer.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_ext_gl_win/gl_renderer.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_ext_gl_win/gl_functions.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_ext_gl_win/gl_functions.h
     sr_cube_openxr.manifest
     resource.rc
 )
