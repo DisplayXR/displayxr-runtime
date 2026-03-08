@@ -1639,11 +1639,16 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 	c->display_refresh_rate = 60.0f;
 	c->offscreen = offscreen;
 
-	// Get recommended rendering dimensions from device
+	// Get recommended rendering dimensions from device.
+	// views[].display.w_pixels is the full display logical width;
+	// the null compositor recommends half that per eye, so the SBS
+	// stereo texture must use half-width per eye to match.
 	uint32_t recommended_width = 0;
 	uint32_t recommended_height = 0;
 	if (xdev != NULL && xdev->hmd != NULL) {
-		recommended_width = xdev->hmd->views[0].display.w_pixels;
+		uint32_t screen_w = xdev->hmd->screens[0].w_pixels;
+		uint32_t view_count = xdev->hmd->view_count;
+		recommended_width = (screen_w > 0 && view_count > 0) ? (screen_w / view_count) : 0;
 		recommended_height = xdev->hmd->views[0].display.h_pixels;
 	}
 	if (recommended_width == 0) recommended_width = 960;
@@ -1660,7 +1665,7 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 	} else if (shared_iosurface == NULL) {
 		// Only create a window when there's no shared IOSurface.
 		// With IOSurface, we render headless — no window needed.
-		if (!create_window(c, recommended_width, recommended_height)) {
+		if (!create_window(c, recommended_width * 2, recommended_height)) {
 			os_mutex_destroy(&c->mutex);
 			free(c);
 			return XRT_ERROR_VULKAN;
