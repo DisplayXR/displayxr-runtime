@@ -136,10 +136,14 @@ if(APPLE)
 		if(XRT_HAVE_VULKAN)
 			target_sources(st_oxr PRIVATE oxr_session_gfx_vk_native.c)
 		endif()
-		# OpenGL apps on macOS route through Metal native compositor via IOSurface
+		# OpenGL apps on macOS: native GL compositor if available, Metal fallback otherwise
 		if(XRT_HAVE_OPENGL)
 			target_sources(st_oxr PRIVATE oxr_session_gfx_gl_macos.m)
 			target_include_directories(st_oxr PRIVATE ${CMAKE_SOURCE_DIR}/src/external/openxr_includes)
+			if(TARGET comp_gl)
+				target_link_libraries(st_oxr PRIVATE comp_gl)
+				target_compile_definitions(st_oxr PRIVATE XRT_HAVE_GL_NATIVE_COMPOSITOR)
+			endif()
 		endif()
 	endif()
 

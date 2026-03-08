@@ -35,13 +35,14 @@ target_include_directories(comp_gl PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../aux
 # Silence macOS deprecation warnings for OpenGL
 if(APPLE)
 	target_compile_definitions(comp_gl PRIVATE GL_SILENCE_DEPRECATION)
+	target_sources(comp_gl PRIVATE comp_gl_window_macos.h comp_gl_window_macos.m)
 endif()
 
 # Platform-specific linking
 if(WIN32)
 	target_link_libraries(comp_gl PRIVATE opengl32 d3d11)
 elseif(APPLE)
-	target_link_libraries(comp_gl PRIVATE "-framework OpenGL")
+	target_link_libraries(comp_gl PRIVATE "-framework OpenGL" "-framework Cocoa" "-framework IOSurface")
 endif()
 
 # Qwerty include path for runtime-side 2D/3D toggle polling
