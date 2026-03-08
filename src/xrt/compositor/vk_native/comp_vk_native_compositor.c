@@ -360,6 +360,162 @@ import_shared_iosurface(struct comp_vk_native_compositor *c, void *iosurface_han
 }
 #endif // XRT_OS_MACOS
 
+#ifdef XRT_OS_WINDOWS
+/*!
+ * Import a D3D11 shared texture HANDLE as a VkImage for shared texture rendering.
+ *
+ * Uses VK_KHR_external_memory_win32 to import the D3D11 MISC_SHARED handle
+ * as VkDeviceMemory backed by the same GPU resource.
+ */
+static bool
+import_shared_d3d11_texture(struct comp_vk_native_compositor *c, void *shared_handle)
+{
+	struct vk_bundle *vk = &c->vk;
+
+	if (shared_handle == NULL) {
+		U_LOG_E("shared_handle is NULL");
+		return false;
+	}
+
+	// We need the display pixel dimensions from the device
+	uint32_t width = c->settings.preferred.width;
+	uint32_t height = c->settings.preferred.height;
+	if (width == 0 || height == 0) {
+		width = 1920;
+		height = 1080;
+	}
+
+	U_LOG_W("Importing D3D11 shared texture as VkImage: %ux%u, handle=%p",
+	        width, height, shared_handle);
+
+	// Create VkImage with external memory info for D3D11 KMT handle
+	VkExternalMemoryImageCreateInfo external_ci = {
+	    .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+	    .pNext = NULL,
+	    .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT,
+	};
+
+	VkImageCreateInfo image_ci = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+	    .pNext = &external_ci,
+	    .imageType = VK_IMAGE_TYPE_2D,
+	    .format = VK_FORMAT_B8G8R8A8_UNORM,
+	    .extent = {width, height, 1},
+	    .mipLevels = 1,
+	    .arrayLayers = 1,
+	    .samples = VK_SAMPLE_COUNT_1_BIT,
+	    .tiling = VK_IMAGE_TILING_OPTIMAL,
+	    .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+	             VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+	             VK_IMAGE_USAGE_SAMPLED_BIT,
+	    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+	    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+	};
+
+	VkResult ret = vk->vkCreateImage(vk->device, &image_ci, NULL, &c->shared_image);
+	if (ret != VK_SUCCESS) {
+		U_LOG_E("vkCreateImage for shared D3D11 texture failed: %d", ret);
+		return false;
+	}
+
+	// Get memory requirements
+	VkMemoryRequirements requirements = {0};
+	vk->vkGetImageMemoryRequirements(vk->device, c->shared_image, &requirements);
+
+	// Import D3D11 KMT handle as Vulkan memory
+	VkImportMemoryWin32HandleInfoKHR import_memory_info = {
+	    .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR,
+	    .pNext = NULL,
+	    .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT,
+	    .handle = (HANDLE)shared_handle,
+	};
+
+	VkMemoryDedicatedAllocateInfoKHR dedicated_info = {
+	    .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO_KHR,
+	    .pNext = &import_memory_info,
+	    .image = c->shared_image,
+	    .buffer = VK_NULL_HANDLE,
+	};
+
+	// Find a valid memory type (device-local preferred)
+	VkPhysicalDeviceMemoryProperties mem_props;
+	vk->vkGetPhysicalDeviceMemoryProperties(vk->physical_device, &mem_props);
+
+	uint32_t memory_type_index = UINT32_MAX;
+	for (uint32_t i = 0; i < mem_props.memoryTypeCount; i++) {
+		if ((requirements.memoryTypeBits & (1u << i)) != 0) {
+			memory_type_index = i;
+			break;
+		}
+	}
+	if (memory_type_index == UINT32_MAX) {
+		U_LOG_E("No valid memory type for shared D3D11 texture");
+		vk->vkDestroyImage(vk->device, c->shared_image, NULL);
+		c->shared_image = VK_NULL_HANDLE;
+		return false;
+	}
+
+	VkMemoryAllocateInfo alloc_info = {
+	    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+	    .pNext = &dedicated_info,
+	    .allocationSize = requirements.size,
+	    .memoryTypeIndex = memory_type_index,
+	};
+
+	ret = vk->vkAllocateMemory(vk->device, &alloc_info, NULL, &c->shared_memory);
+	if (ret != VK_SUCCESS) {
+		U_LOG_E("vkAllocateMemory for shared D3D11 texture failed: %d", ret);
+		vk->vkDestroyImage(vk->device, c->shared_image, NULL);
+		c->shared_image = VK_NULL_HANDLE;
+		return false;
+	}
+
+	ret = vk->vkBindImageMemory(vk->device, c->shared_image, c->shared_memory, 0);
+	if (ret != VK_SUCCESS) {
+		U_LOG_E("vkBindImageMemory for shared D3D11 texture failed: %d", ret);
+		vk->vkFreeMemory(vk->device, c->shared_memory, NULL);
+		vk->vkDestroyImage(vk->device, c->shared_image, NULL);
+		c->shared_image = VK_NULL_HANDLE;
+		c->shared_memory = VK_NULL_HANDLE;
+		return false;
+	}
+
+	// Create image view
+	VkImageViewCreateInfo view_ci = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+	    .image = c->shared_image,
+	    .viewType = VK_IMAGE_VIEW_TYPE_2D,
+	    .format = VK_FORMAT_B8G8R8A8_UNORM,
+	    .components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+	                   VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY},
+	    .subresourceRange = {
+	        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+	        .baseMipLevel = 0,
+	        .levelCount = 1,
+	        .baseArrayLayer = 0,
+	        .layerCount = 1,
+	    },
+	};
+
+	ret = vk->vkCreateImageView(vk->device, &view_ci, NULL, &c->shared_view);
+	if (ret != VK_SUCCESS) {
+		U_LOG_E("vkCreateImageView for shared D3D11 texture failed: %d", ret);
+		vk->vkFreeMemory(vk->device, c->shared_memory, NULL);
+		vk->vkDestroyImage(vk->device, c->shared_image, NULL);
+		c->shared_image = VK_NULL_HANDLE;
+		c->shared_memory = VK_NULL_HANDLE;
+		return false;
+	}
+
+	c->has_shared_texture = true;
+
+	U_LOG_W("Shared D3D11 texture imported: %ux%u, VkImage=%p, VkImageView=%p",
+	        width, height, (void *)(uintptr_t)c->shared_image,
+	        (void *)(uintptr_t)c->shared_view);
+	return true;
+}
+#endif // XRT_OS_WINDOWS
+
 static inline struct comp_vk_native_compositor *
 vk_comp(struct xrt_compositor *xc)
 {
@@ -1142,6 +1298,15 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 #endif
 
 #ifdef XRT_OS_WINDOWS
+	// Import shared D3D11 texture if provided
+	if (shared_texture_handle != NULL) {
+		if (!import_shared_d3d11_texture(c, shared_texture_handle)) {
+			U_LOG_E("Failed to import shared D3D11 texture");
+			free(c);
+			return XRT_ERROR_VULKAN;
+		}
+	}
+
 	// Handle window
 	if (hwnd != NULL) {
 		c->hwnd = hwnd;
