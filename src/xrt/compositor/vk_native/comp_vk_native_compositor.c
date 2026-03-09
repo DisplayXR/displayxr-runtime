@@ -128,6 +128,9 @@ struct comp_vk_native_compositor
 	//! Shared texture HANDLE (Win32).
 	void *shared_texture_handle;
 
+	//! Command pool for display processor factory.
+	VkCommandPool cmd_pool;
+
 	//! Generic Vulkan display processor (vendor-agnostic weaving).
 	struct xrt_display_processor *display_processor;
 
@@ -1225,6 +1228,11 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 	}
 #endif
 
+	// Destroy command pool (we created it for the display processor factory)
+	if (c->cmd_pool != VK_NULL_HANDLE) {
+		vk->vkDestroyCommandPool(vk->device, c->cmd_pool, NULL);
+	}
+
 	// Note: we do NOT destroy the VkDevice — it belongs to the app.
 	// vk_bundle cleanup is minimal (just mutexes).
 
@@ -1452,7 +1460,21 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	if (dp_factory_vk != NULL) {
 		xrt_dp_factory_vk_fn_t factory = (xrt_dp_factory_vk_fn_t)dp_factory_vk;
 
-		xrt_result_t dp_ret = factory(&c->vk, NULL,
+		// Create command pool for display processor (SR weaver needs it)
+		VkCommandPoolCreateInfo pool_ci = {
+		    .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+		    .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+		    .queueFamilyIndex = c->queue_family_index,
+		};
+		VkResult pool_ret = c->vk.vkCreateCommandPool(
+		    c->vk.device, &pool_ci, NULL, &c->cmd_pool);
+		if (pool_ret != VK_SUCCESS) {
+			U_LOG_E("Failed to create command pool for display processor: %d", pool_ret);
+			vk_compositor_destroy(&c->base.base);
+			return XRT_ERROR_VULKAN;
+		}
+
+		xrt_result_t dp_ret = factory(&c->vk, (void *)(uintptr_t)c->cmd_pool,
 #ifdef XRT_OS_WINDOWS
 		                               c->hwnd,
 #else
