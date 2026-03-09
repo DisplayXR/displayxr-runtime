@@ -1274,6 +1274,7 @@ oxr_gl_native_compositor_supported(struct oxr_system *sys);
 XrResult
 oxr_session_populate_gl_native(struct oxr_logger *log,
                                 struct oxr_system *sys,
+                                void *window_handle,
                                 void *gl_context,
                                 void *gl_display,
                                 void *shared_texture_handle,

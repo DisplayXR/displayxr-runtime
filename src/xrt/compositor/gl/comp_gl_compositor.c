@@ -443,7 +443,16 @@ gl_compositor_create_swapchain(struct xrt_compositor *xc,
                                 struct xrt_swapchain **out_xsc)
 {
 	struct comp_gl_compositor *c = gl_comp(xc);
-	(void)c;
+
+	// Ensure compositor's GL context is current for texture creation
+#ifdef XRT_OS_WINDOWS
+	HDC prev_hdc = wglGetCurrentDC();
+	HGLRC prev_hglrc = wglGetCurrentContext();
+	wglMakeCurrent(c->hdc, c->hglrc);
+#elif defined(__APPLE__)
+	CGLContextObj prev_cgl_ctx = CGLGetCurrentContext();
+	comp_gl_window_macos_make_current(c->macos_window);
+#endif
 
 	uint32_t image_count = 3;
 	if (image_count > GL_SWAPCHAIN_MAX_IMAGES) {
@@ -492,6 +501,19 @@ gl_compositor_create_swapchain(struct xrt_compositor *xc,
 
 	U_LOG_W("Created GL swapchain: %ux%u, %u images, format 0x%x",
 	         info->width, info->height, image_count, (unsigned)info->format);
+
+	// Restore previous GL context
+#ifdef XRT_OS_WINDOWS
+	if (prev_hglrc != NULL) {
+		wglMakeCurrent(prev_hdc, prev_hglrc);
+	} else {
+		wglMakeCurrent(NULL, NULL);
+	}
+#elif defined(__APPLE__)
+	if (prev_cgl_ctx != NULL) {
+		CGLSetCurrentContext(prev_cgl_ctx);
+	}
+#endif
 
 	return XRT_SUCCESS;
 }
@@ -1147,7 +1169,9 @@ gl_window_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 static bool
 gl_create_window_and_context(struct comp_gl_compositor *c,
                               void *window_handle,
-                              void *app_gl_context)
+                              void *app_gl_context,
+                              uint32_t width,
+                              uint32_t height)
 {
 	// Register window class
 	WNDCLASSEXW wc = {0};
@@ -1166,7 +1190,8 @@ gl_create_window_and_context(struct comp_gl_compositor *c,
 		    0, GL_WINDOW_CLASS, L"OpenXR GL Compositor",
 		    WS_OVERLAPPEDWINDOW | WS_VISIBLE,
 		    CW_USEDEFAULT, CW_USEDEFAULT,
-		    GL_DEFAULT_WIDTH, GL_DEFAULT_HEIGHT,
+		    width > 0 ? width : GL_DEFAULT_WIDTH,
+		    height > 0 ? height : GL_DEFAULT_HEIGHT,
 		    NULL, NULL, GetModuleHandleW(NULL), NULL);
 		c->owns_window = true;
 	}
@@ -1333,7 +1358,7 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 
 	// Platform-specific context/window setup
 #ifdef XRT_OS_WINDOWS
-	if (!gl_create_window_and_context(c, window_handle, gl_context)) {
+	if (!gl_create_window_and_context(c, window_handle, gl_context, width, height)) {
 		free(c);
 		return XRT_ERROR_OPENGL;
 	}

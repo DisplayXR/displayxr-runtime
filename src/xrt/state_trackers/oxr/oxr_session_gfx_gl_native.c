@@ -74,6 +74,7 @@ oxr_gl_native_compositor_supported(struct oxr_system *sys)
 XrResult
 oxr_session_populate_gl_native(struct oxr_logger *log,
                                 struct oxr_system *sys,
+                                void *window_handle,
                                 void *gl_context,
                                 void *gl_display,
                                 void *shared_texture_handle,
@@ -89,7 +90,7 @@ oxr_session_populate_gl_native(struct oxr_logger *log,
 	// Create the GL native compositor
 	xrt_result_t xret = comp_gl_compositor_create(
 	    xdev,
-	    NULL,  // window_handle (compositor creates its own)
+	    window_handle,
 	    gl_context,
 	    gl_display,
 	    dp_factory_gl,

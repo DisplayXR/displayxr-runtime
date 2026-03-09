@@ -1914,16 +1914,23 @@ oxr_session_create_impl(struct oxr_logger *log,
 				return oxr_error(log, XR_ERROR_RUNTIME_FAILURE, "Failed to create xrt_session! '%i'", xret);
 			}
 
-			// Extract shared texture handle from win32 window binding if present
+			// Extract window handle and shared texture from win32 window binding
+			void *ext_window_handle = NULL;
 			void *shared_texture_handle = NULL;
 			const XrWin32WindowBindingCreateInfoEXT *win32_binding = OXR_GET_INPUT_FROM_CHAIN(
 			    createInfo, XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT, XrWin32WindowBindingCreateInfoEXT);
-			if (win32_binding != NULL && win32_binding->sharedTextureHandle != NULL) {
-				shared_texture_handle = (void *)win32_binding->sharedTextureHandle;
+			if (win32_binding != NULL) {
+				if (win32_binding->windowHandle != NULL) {
+					ext_window_handle = (void *)win32_binding->windowHandle;
+				}
+				if (win32_binding->sharedTextureHandle != NULL) {
+					shared_texture_handle = (void *)win32_binding->sharedTextureHandle;
+				}
 			}
 
 			// Use GL native compositor — no Vulkan involvement
-			return oxr_session_populate_gl_native(log, sys, (void *)opengl_win32->hGLRC,
+			return oxr_session_populate_gl_native(log, sys, ext_window_handle,
+			                                       (void *)opengl_win32->hGLRC,
 			                                       (void *)opengl_win32->hDC,
 			                                       shared_texture_handle, *out_session);
 		}
