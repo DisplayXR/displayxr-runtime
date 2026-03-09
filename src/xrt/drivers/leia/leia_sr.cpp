@@ -378,7 +378,12 @@ leiasr_weave(struct leiasr *leiasr,
 
 	leiasr->weaver->setViewport(rect);
 	leiasr->weaver->setScissorRect(rect);
-	leiasr->weaver->setCommandBuffer(commandBuffer);
+	// Only override the command buffer if one is provided.
+	// VK_NULL_HANDLE means the weaver should use its own internal command buffer
+	// (used when the weaver owns its swapchain and manages submit+present).
+	if (commandBuffer != VK_NULL_HANDLE) {
+		leiasr->weaver->setCommandBuffer(commandBuffer);
+	}
 	leiasr->weaver->setInputViewTexture(leftImageView, rightImageView, imageWidth, imageHeight, imageFormat);
 	// Only override the output framebuffer if one is provided.
 	// VK_NULL_HANDLE means the weaver should use its own internal swapchain.

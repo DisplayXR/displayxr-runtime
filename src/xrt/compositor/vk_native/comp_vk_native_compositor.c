@@ -1010,7 +1010,8 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 	}
 
 	// Display processor owns output — weaver handles its own swapchain + present.
-	// No target needed; just pass stereo views and let weave() do everything.
+	// No target needed; pass VK_NULL_HANDLE for both command buffer and framebuffer
+	// so the weaver uses its own internal resources for the full render cycle.
 	if (c->target == NULL && !is_mono && c->display_processor != NULL) {
 		static bool dp_logged = false;
 		if (!dp_logged) {
@@ -1026,52 +1027,19 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 
 		int32_t view_format = comp_vk_native_renderer_get_format(c->renderer);
 
-		VkCommandPool cmd_pool = c->cmd_pool;
-
-		VkCommandBufferAllocateInfo alloc_info = {
-		    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-		    .commandPool = cmd_pool,
-		    .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-		    .commandBufferCount = 1,
-		};
-
-		VkCommandBuffer cmd;
-		VkResult res = vk->vkAllocateCommandBuffers(vk->device, &alloc_info, &cmd);
-		if (res == VK_SUCCESS) {
-			VkCommandBufferBeginInfo begin_info = {
-			    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-			    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-			};
-			vk->vkBeginCommandBuffer(cmd, &begin_info);
-
-			// Pass VK_NULL_HANDLE as framebuffer — the SR weaver
-			// manages its own swapchain and framebuffers internally.
-			xrt_display_processor_process_views(
-			    c->display_processor,
-			    cmd,
-			    (VkImageView)(uintptr_t)left_view,
-			    (VkImageView)(uintptr_t)right_view,
-			    view_width, view_height,
-			    (VkFormat_XDP)view_format,
-			    VK_NULL_HANDLE,
-			    tgt_width, tgt_height,
-			    (VkFormat_XDP)view_format);
-
-			vk->vkEndCommandBuffer(cmd);
-
-			VkSubmitInfo submit_info = {
-			    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-			    .commandBufferCount = 1,
-			    .pCommandBuffers = &cmd,
-			};
-
-			res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, VK_NULL_HANDLE);
-			if (res == VK_SUCCESS) {
-				vk->vkQueueWaitIdle(vk->main_queue->queue);
-			}
-
-			vk->vkFreeCommandBuffers(vk->device, cmd_pool, 1, &cmd);
-		}
+		// Pass VK_NULL_HANDLE for both cmd buffer and framebuffer.
+		// The SR weaver manages its own command buffer, swapchain
+		// acquire, interlacing render pass, submit, and present.
+		xrt_display_processor_process_views(
+		    c->display_processor,
+		    VK_NULL_HANDLE,
+		    (VkImageView)(uintptr_t)left_view,
+		    (VkImageView)(uintptr_t)right_view,
+		    view_width, view_height,
+		    (VkFormat_XDP)view_format,
+		    VK_NULL_HANDLE,
+		    tgt_width, tgt_height,
+		    (VkFormat_XDP)view_format);
 
 		return XRT_SUCCESS;
 	}
