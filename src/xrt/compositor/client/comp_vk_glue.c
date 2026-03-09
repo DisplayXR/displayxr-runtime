@@ -25,6 +25,10 @@ const char *xrt_gfx_vk_instance_extensions = VK_KHR_EXTERNAL_FENCE_CAPABILITIES_
     // VK native compositor on macOS needs VkSurfaceKHR via VK_EXT_metal_surface
     " " VK_KHR_SURFACE_EXTENSION_NAME
     " " VK_EXT_METAL_SURFACE_EXTENSION_NAME
+#elif defined(VK_KHR_win32_surface) && defined(XRT_OS_WINDOWS)
+    // VK native compositor on Windows needs VkSurfaceKHR via VK_KHR_win32_surface
+    " " VK_KHR_SURFACE_EXTENSION_NAME
+    " " VK_KHR_WIN32_SURFACE_EXTENSION_NAME
 #endif
     ;
 
@@ -55,6 +59,8 @@ const char *xrt_gfx_vk_device_extensions = VK_KHR_DEDICATED_ALLOCATION_EXTENSION
 
 #elif defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_WIN32_HANDLE)
     " " VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME
+    // VK native compositor on Windows needs swapchain for direct presentation
+    " " VK_KHR_SWAPCHAIN_EXTENSION_NAME
 #else
 #error "Need port!"
 #endif
