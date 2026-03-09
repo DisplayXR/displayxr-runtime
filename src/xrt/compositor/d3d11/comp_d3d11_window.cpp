@@ -93,6 +93,9 @@ struct comp_d3d11_window
 	//! True while inside a modal move/size loop (window thread writes, compositor reads)
 	volatile LONG in_size_move;
 
+	//! True if window should stay hidden (for SR weaver HWND in shared-texture mode)
+	bool hidden;
+
 	//! Window thread handle
 	HANDLE thread_handle;
 
@@ -404,19 +407,21 @@ window_thread_func(LPVOID param)
 		return 1;
 	}
 
-	// Check if we should start fullscreen
-	bool start_fullscreen = !debug_get_bool_option_start_windowed();
-	if (start_fullscreen) {
-		InterlockedExchange(&w->is_fullscreen, TRUE);
-		set_fullscreen(hwnd, true);
-	}
-
 	// Associate window data before showing
 	SetPropW(hwnd, szWindowData, w);
 	SetWindowLongPtr(hwnd, GWLP_USERDATA, (LONG_PTR)w);
 
-	ShowWindow(hwnd, SW_SHOWDEFAULT);
-	UpdateWindow(hwnd);
+	if (!w->hidden) {
+		// Check if we should start fullscreen
+		bool start_fullscreen = !debug_get_bool_option_start_windowed();
+		if (start_fullscreen) {
+			InterlockedExchange(&w->is_fullscreen, TRUE);
+			set_fullscreen(hwnd, true);
+		}
+
+		ShowWindow(hwnd, SW_SHOWDEFAULT);
+		UpdateWindow(hwnd);
+	}
 
 	// Store initial client dimensions
 	RECT client_rect;
@@ -528,6 +533,70 @@ comp_d3d11_window_create(uint32_t width, uint32_t height, struct comp_d3d11_wind
 	}
 
 	U_LOG_W("D3D11 window: Window created on thread %lu, HWND=%p", w->thread_id, (void *)w->hwnd);
+	*out = w;
+	return XRT_SUCCESS;
+}
+
+extern "C" xrt_result_t
+comp_d3d11_window_create_hidden(uint32_t width, uint32_t height, struct comp_d3d11_window **out)
+{
+	struct comp_d3d11_window *w = U_TYPED_CALLOC(struct comp_d3d11_window);
+	if (w == NULL) {
+		return XRT_ERROR_ALLOCATION;
+	}
+
+	w->instance = GetModuleHandle(NULL);
+	w->requested_width = width > 0 ? width : 1920;
+	w->requested_height = height > 0 ? height : 1080;
+	w->xsysd = NULL;
+	w->qwerty_enabled = false;
+	w->hidden = true;
+
+	U_LOG_W("D3D11 window: Creating HIDDEN window for SR weaver (%ux%u)", w->requested_width, w->requested_height);
+
+	w->window_ready_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+	if (w->window_ready_event == NULL) {
+		free(w);
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+
+	w->paint_requested_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+	w->paint_done_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+	if (w->paint_requested_event == NULL || w->paint_done_event == NULL) {
+		if (w->paint_requested_event != NULL) CloseHandle(w->paint_requested_event);
+		if (w->paint_done_event != NULL) CloseHandle(w->paint_done_event);
+		CloseHandle(w->window_ready_event);
+		free(w);
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+
+	w->thread_handle = CreateThread(NULL, 0, window_thread_func, w, 0, &w->thread_id);
+	if (w->thread_handle == NULL) {
+		CloseHandle(w->window_ready_event);
+		free(w);
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+
+	DWORD wait_result = WaitForSingleObject(w->window_ready_event, 10000);
+	if (wait_result != WAIT_OBJECT_0) {
+		U_LOG_E("D3D11 window: Timeout waiting for hidden window thread");
+		WaitForSingleObject(w->thread_handle, 1000);
+		CloseHandle(w->thread_handle);
+		CloseHandle(w->window_ready_event);
+		free(w);
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+
+	if (w->hwnd == NULL) {
+		U_LOG_E("D3D11 window: Hidden window thread failed to create HWND");
+		WaitForSingleObject(w->thread_handle, 5000);
+		CloseHandle(w->thread_handle);
+		CloseHandle(w->window_ready_event);
+		free(w);
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+
+	U_LOG_W("D3D11 window: Hidden window created on thread %lu, HWND=%p", w->thread_id, (void *)w->hwnd);
 	*out = w;
 	return XRT_SUCCESS;
 }

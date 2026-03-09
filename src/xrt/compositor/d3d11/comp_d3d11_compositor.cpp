@@ -300,8 +300,10 @@ d3d11_compositor_wait_frame(struct xrt_compositor *xc,
 {
 	struct comp_d3d11_compositor *c = d3d11_comp(xc);
 
-	// Check if window was closed (user pressed ESC or closed window)
-	if (c->owns_window && c->own_window != nullptr &&
+	// Check if window was closed (user pressed ESC or closed window).
+	// Skip for shared texture mode (hidden window) — session lifetime is
+	// controlled by the app, not our hidden weaver window.
+	if (c->owns_window && c->own_window != nullptr && c->hwnd != nullptr &&
 	    !comp_d3d11_window_is_valid(c->own_window)) {
 		U_LOG_I("Window closed - signaling session exit");
 		return XRT_ERROR_IPC_FAILURE;
@@ -310,7 +312,7 @@ d3d11_compositor_wait_frame(struct xrt_compositor *xc,
 	// During drag, synchronize with the window thread's WM_PAINT cycle.
 	// This ensures the window position is stable between weave() and Present(),
 	// so the interlacing pattern matches the actual displayed position.
-	if (c->owns_window && c->own_window != nullptr &&
+	if (c->owns_window && c->own_window != nullptr && c->hwnd != nullptr &&
 	    comp_d3d11_window_is_in_size_move(c->own_window)) {
 		comp_d3d11_window_wait_for_paint(c->own_window);
 	}
@@ -1105,9 +1107,25 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 		c->hwnd = static_cast<HWND>(hwnd);
 		U_LOG_I("Using app-provided window handle: %p", hwnd);
 	} else if (shared_texture_handle != nullptr) {
-		// Offscreen mode: shared texture without a window
+		// Shared texture mode: no visible window, but create a hidden window
+		// for the SR weaver (it needs a valid HWND for interlacing alignment).
+		// c->hwnd stays NULL so the offscreen rendering path is used.
 		c->hwnd = nullptr;
-		U_LOG_I("Offscreen mode — no window (shared texture handle: %p)", shared_texture_handle);
+		uint32_t win_w = xdev->hmd->screens[0].w_pixels;
+		uint32_t win_h = xdev->hmd->screens[0].h_pixels;
+		if (win_w == 0 || win_h == 0) {
+			win_w = 1920;
+			win_h = 1080;
+		}
+		xrt_result_t xret = comp_d3d11_window_create_hidden(win_w, win_h, &c->own_window);
+		if (xret != XRT_SUCCESS) {
+			U_LOG_W("Failed to create hidden weaver window, continuing without");
+			c->own_window = nullptr;
+		} else {
+			c->owns_window = true;
+			U_LOG_I("Shared texture mode with hidden weaver window: %p",
+			        comp_d3d11_window_get_hwnd(c->own_window));
+		}
 	} else {
 		// No window provided - create our own at native display resolution
 		uint32_t win_w = xdev->hmd->screens[0].w_pixels;
@@ -1303,7 +1321,13 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	// Create display processor via factory (set by the target builder at init time).
 	if (dp_factory_d3d11 != NULL) {
 		auto factory = (xrt_dp_factory_d3d11_fn_t)dp_factory_d3d11;
-		xrt_result_t dp_ret = factory(c->device, c->context, c->hwnd, &c->display_processor);
+		// Use hidden weaver window HWND if available (shared texture mode),
+		// otherwise use the compositor's own HWND
+		HWND weaver_hwnd = c->hwnd;
+		if (weaver_hwnd == nullptr && c->own_window != nullptr) {
+			weaver_hwnd = static_cast<HWND>(comp_d3d11_window_get_hwnd(c->own_window));
+		}
+		xrt_result_t dp_ret = factory(c->device, c->context, weaver_hwnd, &c->display_processor);
 		if (dp_ret != XRT_SUCCESS) {
 			U_LOG_W("D3D11 display processor factory failed (error %d), continuing without",
 			        (int)dp_ret);

@@ -51,6 +51,22 @@ xrt_result_t
 comp_d3d11_window_create(uint32_t width, uint32_t height, struct comp_d3d11_window **out);
 
 /*!
+ * Create a hidden window for the SR weaver in shared-texture mode.
+ *
+ * Same as comp_d3d11_window_create but the window is never shown.
+ * The SR weaver needs a valid HWND for interlacing alignment even
+ * when rendering to a shared texture instead of a window surface.
+ *
+ * @param width  Requested window width
+ * @param height Requested window height
+ * @param out    Pointer to receive the created window handle
+ *
+ * @return XRT_SUCCESS on success, error code otherwise
+ */
+xrt_result_t
+comp_d3d11_window_create_hidden(uint32_t width, uint32_t height, struct comp_d3d11_window **out);
+
+/*!
  * Destroy the self-owned window.
  *
  * Posts WM_CLOSE to the window thread and waits for it to exit.
