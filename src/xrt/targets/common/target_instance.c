@@ -53,8 +53,13 @@
 #include "android/android_instance_base.h"
 #endif
 
-// Always use null compositor — no Vulkan server compositor in lightweight runtime.
+// In D3D11-only service mode, prefer D3D11 service compositor over null.
+// Otherwise, use null compositor (no Vulkan server compositor in lightweight runtime).
+#ifdef XRT_D3D11_SERVICE_ONLY
+#define USE_NULL_DEFAULT (false)
+#else
 #define USE_NULL_DEFAULT (true)
+#endif
 
 DEBUG_GET_ONCE_BOOL_OPTION(use_null, "XRT_COMPOSITOR_NULL", USE_NULL_DEFAULT)
 
