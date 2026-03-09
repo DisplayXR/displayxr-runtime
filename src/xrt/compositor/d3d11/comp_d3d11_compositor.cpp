@@ -844,13 +844,16 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	// Offscreen shared-texture-only path: no DXGI target
 	if (c->target == nullptr) {
 		// Weave/blit directly into the shared texture
-		if (!is_mono && c->display_processor != NULL) {
+		if (!is_mono && c->display_processor != NULL && c->shared_rtv != nullptr) {
 			void *stereo_srv = comp_d3d11_renderer_get_stereo_srv(c->renderer);
 			uint32_t view_width, view_height;
 			comp_d3d11_renderer_get_view_dimensions(c->renderer, &view_width, &view_height);
 
 			D3D11_TEXTURE2D_DESC st_desc;
 			c->shared_texture->GetDesc(&st_desc);
+
+			// Bind shared texture as render target for the weaver
+			c->context->OMSetRenderTargets(1, &c->shared_rtv, nullptr);
 
 			xrt_display_processor_d3d11_process_stereo(
 			    c->display_processor, c->context, stereo_srv, view_width, view_height,
