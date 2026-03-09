@@ -148,26 +148,19 @@ comp_d3d12_target_create(struct comp_d3d12_compositor *c,
 	DXGI_SWAP_CHAIN_FULLSCREEN_DESC fs_desc = {};
 	fs_desc.Windowed = TRUE;
 
-	// Get DXGI factory from device
-	IDXGIDevice *dxgi_device = nullptr;
-	hr = internals->device->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void **>(&dxgi_device));
+	// Get DXGI factory.
+	// Note: ID3D12Device does NOT implement IDXGIDevice (unlike D3D11),
+	// so we must get the factory via the device's adapter LUID.
 	IDXGIFactory4 *dxgi_factory = nullptr;
-
-	if (SUCCEEDED(hr) && dxgi_device != nullptr) {
-		IDXGIAdapter *adapter = nullptr;
-		dxgi_device->GetAdapter(&adapter);
-		if (adapter != nullptr) {
-			adapter->GetParent(__uuidof(IDXGIFactory4), reinterpret_cast<void **>(&dxgi_factory));
-			adapter->Release();
+	{
+		LUID adapter_luid = internals->device->GetAdapterLuid();
+		hr = CreateDXGIFactory2(0, __uuidof(IDXGIFactory4), reinterpret_cast<void **>(&dxgi_factory));
+		if (FAILED(hr) || dxgi_factory == nullptr) {
+			U_LOG_E("Failed to create DXGI factory: 0x%08x", hr);
+			target->rtv_heap->Release();
+			delete target;
+			return XRT_ERROR_D3D;
 		}
-		dxgi_device->Release();
-	}
-
-	if (dxgi_factory == nullptr) {
-		U_LOG_E("Failed to get DXGI factory");
-		target->rtv_heap->Release();
-		delete target;
-		return XRT_ERROR_D3D;
 	}
 
 	// Create swapchain using the command queue (D3D12 requirement)
