@@ -390,10 +390,15 @@ window_thread_func(LPVOID param)
 		rc.bottom = monitor_y + (LONG)w->requested_height;
 	}
 
-	U_LOG_W("D3D11 window thread: Creating window at (%d, %d) size %ux%u",
+	// Hidden windows use WS_POPUP (borderless) so client rect = window rect = exact texture size.
+	// Visible windows use WS_OVERLAPPEDWINDOW for normal window chrome.
+	DWORD style = w->hidden ? WS_POPUP : WS_OVERLAPPEDWINDOW;
+
+	U_LOG_W("D3D11 window thread: Creating %s window at (%d, %d) size %ux%u",
+	        w->hidden ? "hidden" : "visible",
 	        (int)rc.left, (int)rc.top, w->requested_width, w->requested_height);
 
-	HWND hwnd = CreateWindowExW(0, szWindowClass, L"DisplayXR \u2014 D3D11 Native Compositor", WS_OVERLAPPEDWINDOW, rc.left, rc.top,
+	HWND hwnd = CreateWindowExW(0, szWindowClass, L"DisplayXR \u2014 D3D11 Native Compositor", style, rc.left, rc.top,
 	                            rc.right - rc.left, rc.bottom - rc.top, NULL, NULL, w->instance, NULL);
 
 	if (hwnd == NULL) {
