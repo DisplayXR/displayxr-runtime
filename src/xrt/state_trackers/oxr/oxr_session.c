@@ -748,7 +748,11 @@ oxr_session_poll(struct oxr_logger *log, struct oxr_session *sess)
 	if (sess->xcn == NULL ||
 	    sess->state == XR_SESSION_STATE_IDLE ||
 	    sess->state == XR_SESSION_STATE_EXITING) {
-		return XR_SUCCESS;
+		// Skip macOS event pump AND window close detection — compositor
+		// is torn down or tearing down. But fall through to the
+		// xrt_session_poll_events loop below so state transitions
+		// (IDLE→EXITING) are still delivered to the application.
+		goto skip_macos_pump;
 	}
 
 	// Pump macOS events on the main thread. NSWindow and CAMetalLayer
@@ -815,6 +819,9 @@ oxr_session_poll(struct oxr_logger *log, struct oxr_session *sess)
 	}
 #endif // XRT_OS_ANDROID
 
+#ifdef XRT_OS_MACOS
+skip_macos_pump:
+#endif
 
 	bool read_more_events = true;
 	while (read_more_events) {
