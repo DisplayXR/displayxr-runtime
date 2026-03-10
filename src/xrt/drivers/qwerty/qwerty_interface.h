@@ -204,6 +204,23 @@ qwerty_get_stereo_state(struct xrt_device **xdevs,
                         struct qwerty_stereo_state *out);
 
 
+/*!
+ * Enable or disable qwerty input processing (keyboard/mouse events).
+ *
+ * When disabled, all qwerty input handlers (SDL, Win32, macOS) return
+ * early without processing events. Used to silence qwerty for _ext/_shared
+ * apps where the app owns the window and input.
+ *
+ * @param xdevs     Array of devices to search for qwerty devices.
+ * @param xdev_count Number of devices in the array.
+ * @param enabled   true to enable input processing, false to disable.
+ *
+ * @ingroup drv_qwerty
+ */
+void
+qwerty_set_process_keys(struct xrt_device **xdevs, size_t xdev_count, bool enabled);
+
+
 #ifdef __cplusplus
 }
 #endif

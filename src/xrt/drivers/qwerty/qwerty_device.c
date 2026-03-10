@@ -1143,6 +1143,26 @@ qwerty_get_stereo_state(struct xrt_device **xdevs, size_t xdev_count, struct qwe
 	return true;
 }
 
+void
+qwerty_set_process_keys(struct xrt_device **xdevs, size_t xdev_count, bool enabled)
+{
+	if (xdevs == NULL) {
+		return;
+	}
+
+	for (size_t i = 0; i < xdev_count; i++) {
+		if (xdevs[i] == NULL || xdevs[i]->destroy != qwerty_destroy) {
+			continue;
+		}
+		const char *name = xdevs[i]->tracking_origin->name;
+		if (strcmp(name, QWERTY_HMD_TRACKER_STR) == 0 || strcmp(name, QWERTY_LEFT_TRACKER_STR) == 0 ||
+		    strcmp(name, QWERTY_RIGHT_TRACKER_STR) == 0) {
+			qwerty_device(xdevs[i])->sys->process_keys = enabled;
+			return;
+		}
+	}
+}
+
 static void
 reset_controller_for_mode(struct qwerty_system *qs, struct qwerty_controller *qc, bool is_left)
 {

@@ -28,6 +28,7 @@
 #include "oxr_xret.h"
 
 #include <math.h>
+#include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -802,7 +803,7 @@ oxr_find_profiles_from_roles(struct oxr_logger *log,
 #define FIND_PROFILE(X)                                                                                                \
 	if (!oxr_get_profile_for_device_name(log, sess, GET_PROFILE_NAME_BY_ROLE(sess->sys, X), &out_profiles->X)) {   \
 		struct xrt_device *xdev = GET_XDEV_BY_ROLE(sess->sys, X);                                              \
-		if (xdev != NULL) {                                                                                    \
+		if (xdev != NULL && !(sess->has_external_window && strstr(xdev->str, "Qwerty") != NULL)) {             \
 			oxr_find_profile_for_device(log, sess, xdev, &out_profiles->X);                                \
 		}                                                                                                      \
 	}
