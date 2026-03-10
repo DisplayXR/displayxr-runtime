@@ -310,7 +310,7 @@ static void RenderOneFrame(RenderState& rs) {
                     uint32_t eyeRenderH = xr.swapchain.height;
 
                     Display3DStereoView stereoViews[2];
-                    bool appMonoMode = (g_inputState.currentRenderingMode == 0) || (xr.renderingModeCount > 0 && !xr.renderingModeDisplay3D[g_inputState.currentRenderingMode]);
+                    bool appMonoMode = (xr.renderingModeCount > 0 && !xr.renderingModeDisplay3D[g_inputState.currentRenderingMode]);
                     bool useAppProjection = (xr.hasDisplayInfoExt && xr.displayWidthM > 0.0f);
                     if (useAppProjection) {
                         float pxSizeX = xr.displayWidthM / (float)xr.swapchain.width;

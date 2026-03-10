@@ -383,7 +383,7 @@ static void RenderOneFrame(RenderState& rs) {
 
                         XrVector3f rawLeft = rawViews[0].pose.position;
                         XrVector3f rawRight = rawViews[1].pose.position;
-                        bool appMonoMode = (g_inputState.currentRenderingMode == 0) || (xr.renderingModeCount > 0 && !xr.renderingModeDisplay3D[g_inputState.currentRenderingMode]);
+                        bool appMonoMode = (xr.renderingModeCount > 0 && !xr.renderingModeDisplay3D[g_inputState.currentRenderingMode]);
                             if (appMonoMode) {
                                 XrVector3f center = {
                                 (rawLeft.x + rawRight.x) * 0.5f,
@@ -454,7 +454,7 @@ static void RenderOneFrame(RenderState& rs) {
                                 L"\nKooima: Camera-Centric [C=Toggle]" :
                                 L"\nKooima: Display-Centric [C=Toggle]";
 
-                            bool monoMode = (g_inputState.currentRenderingMode == 0) || (xr.renderingModeCount > 0 && !xr.renderingModeDisplay3D[g_inputState.currentRenderingMode]);
+                            bool monoMode = (xr.renderingModeCount > 0 && !xr.renderingModeDisplay3D[g_inputState.currentRenderingMode]);
                             uint32_t dispRenderW, dispRenderH;
                             if (monoMode) {
                                 dispRenderW = g_sharedWidth;
@@ -627,7 +627,7 @@ static void RenderOneFrame(RenderState& rs) {
                         }
                     }
 
-                    bool monoMode = (g_inputState.currentRenderingMode == 0) || (xr.renderingModeCount > 0 && !xr.renderingModeDisplay3D[g_inputState.currentRenderingMode]);
+                    bool monoMode = (xr.renderingModeCount > 0 && !xr.renderingModeDisplay3D[g_inputState.currentRenderingMode]);
                     int eyeCount = monoMode ? 1 : 2;
 
                     XMMATRIX monoViewMatrix, monoProjMatrix;

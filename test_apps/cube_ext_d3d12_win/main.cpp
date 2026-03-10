@@ -312,7 +312,7 @@ static void RenderThreadFunc(
                         xr->rightEyeZ = rawViews[1].pose.position.z;
 
                         // Determine mono vs stereo rendering
-                        bool monoMode = (inputSnapshot.currentRenderingMode == 0) || (xr->renderingModeCount > 0 && !xr->renderingModeDisplay3D[inputSnapshot.currentRenderingMode]);
+                        bool monoMode = (xr->renderingModeCount > 0 && !xr->renderingModeDisplay3D[inputSnapshot.currentRenderingMode]);
 
                         // Max per-eye capacity from swapchain
                         uint32_t eyeRenderW = xr->swapchain.width / 2;

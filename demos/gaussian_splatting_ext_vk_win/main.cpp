@@ -445,7 +445,7 @@ static void RenderThreadFunc(
                         xr->rightEyeY = rawViews[1].pose.position.y;
                         xr->rightEyeZ = rawViews[1].pose.position.z;
 
-                        bool monoMode = (inputSnapshot.currentRenderingMode == 0) || (xr->renderingModeCount > 0 && !xr->renderingModeDisplay3D[inputSnapshot.currentRenderingMode]);
+                        bool monoMode = (xr->renderingModeCount > 0 && !xr->renderingModeDisplay3D[inputSnapshot.currentRenderingMode]);
                         uint32_t eyeRenderW = xr->swapchain.width / 2;
                         uint32_t eyeRenderH = xr->swapchain.height;
 
@@ -679,7 +679,7 @@ static void RenderThreadFunc(
                                 }
                                 modeText += sceneText;
 
-                                bool dispMonoMode = (inputSnapshot.currentRenderingMode == 0) || (xr->renderingModeCount > 0 && !xr->renderingModeDisplay3D[inputSnapshot.currentRenderingMode]);
+                                bool dispMonoMode = (xr->renderingModeCount > 0 && !xr->renderingModeDisplay3D[inputSnapshot.currentRenderingMode]);
                                 uint32_t dispRenderW, dispRenderH;
                                 if (dispMonoMode) {
                                     dispRenderW = windowW;

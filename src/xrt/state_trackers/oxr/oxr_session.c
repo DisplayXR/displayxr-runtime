@@ -607,18 +607,20 @@ oxr_session_begin(struct oxr_logger *log, struct oxr_session *sess, const XrSess
 		                 "Frame sync object refused to let us begin session, probably already running");
 	}
 
-	// Start in mode 0 (typically 2D) to match app default.
-	// Apps that want 3D can explicitly request it via xrRequestDisplayRenderingModeEXT.
-	// Session end also resets to mode 0, so begin/end are symmetric.
+	// Auto-switch to default rendering mode on session begin
 #ifdef OXR_HAVE_EXT_display_info
 	{
 		struct xrt_device *head = GET_XDEV_BY_ROLE(sess->sys, head);
-		if (head != NULL && head->hmd != NULL && head->rendering_mode_count > 0) {
-			struct xrt_rendering_mode *mode0 = &head->rendering_modes[0];
-			oxr_session_request_display_mode(log, sess, mode0->display_3d);
-			xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, 0);
-			head->hmd->view_count = mode0->view_count;
-			head->hmd->active_rendering_mode_index = 0;
+		if (head != NULL && head->hmd != NULL) {
+			uint32_t default_mode = head->hmd->active_rendering_mode_index;
+			if (default_mode < head->rendering_mode_count) {
+				struct xrt_rendering_mode *mode = &head->rendering_modes[default_mode];
+				head->hmd->view_count = mode->view_count;
+				oxr_session_request_display_mode(log, sess, mode->display_3d);
+				xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, default_mode);
+			} else {
+				oxr_session_request_display_mode(log, sess, true);
+			}
 		} else {
 			oxr_session_request_display_mode(log, sess, true);
 		}

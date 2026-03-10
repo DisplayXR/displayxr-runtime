@@ -345,7 +345,7 @@ static void RenderOneFrame(RenderState& rs) {
                         // For mono: pass center eye as both L/R
                         XrVector3f rawLeft = rawViews[0].pose.position;
                         XrVector3f rawRight = rawViews[1].pose.position;
-                        bool appMonoMode = (g_inputState.currentRenderingMode == 0) || (xr.renderingModeCount > 0 && !xr.renderingModeDisplay3D[g_inputState.currentRenderingMode]);
+                        bool appMonoMode = (xr.renderingModeCount > 0 && !xr.renderingModeDisplay3D[g_inputState.currentRenderingMode]);
                         if (appMonoMode) {
                             XrVector3f center = {
                                 (rawLeft.x + rawRight.x) * 0.5f,
@@ -426,7 +426,7 @@ static void RenderOneFrame(RenderState& rs) {
                                 L"\nKooima: Display-Centric [C=Toggle]";
 
                             // Dynamic render dims matching the actual viewport computation
-                            bool dispMonoMode = (g_inputState.currentRenderingMode == 0) || (xr.renderingModeCount > 0 && !xr.renderingModeDisplay3D[g_inputState.currentRenderingMode]);
+                            bool dispMonoMode = (xr.renderingModeCount > 0 && !xr.renderingModeDisplay3D[g_inputState.currentRenderingMode]);
                             uint32_t dispRenderW, dispRenderH;
                             if (dispMonoMode) {
                                 dispRenderW = g_windowWidth;
@@ -498,7 +498,7 @@ static void RenderOneFrame(RenderState& rs) {
                     }
 
                     // Determine mono vs stereo rendering
-                    bool monoMode = (g_inputState.currentRenderingMode == 0) || (xr.renderingModeCount > 0 && !xr.renderingModeDisplay3D[g_inputState.currentRenderingMode]);
+                    bool monoMode = (xr.renderingModeCount > 0 && !xr.renderingModeDisplay3D[g_inputState.currentRenderingMode]);
                     int eyeCount = monoMode ? 1 : 2;
 
                     // For mono: compute center eye position and projection

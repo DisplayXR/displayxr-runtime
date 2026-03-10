@@ -457,8 +457,7 @@ static void RenderThreadFunc(
                         xr->rightEyeY = rawViews[1].pose.position.y;
                         xr->rightEyeZ = rawViews[1].pose.position.z;
 
-                        bool monoMode = (inputSnapshot.currentRenderingMode == 0) ||
-                            (xr->renderingModeCount > 0 && !xr->renderingModeDisplay3D[inputSnapshot.currentRenderingMode]);
+                        bool monoMode = (xr->renderingModeCount > 0 && !xr->renderingModeDisplay3D[inputSnapshot.currentRenderingMode]);
                         uint32_t eyeRenderW = xr->swapchain.width / 2;
                         uint32_t eyeRenderH = xr->swapchain.height;
 
@@ -489,8 +488,7 @@ static void RenderThreadFunc(
 
                             XrVector3f rawLeft = rawViews[0].pose.position;
                             XrVector3f rawRight = rawViews[1].pose.position;
-                            bool appMonoMode = (inputSnapshot.currentRenderingMode == 0) ||
-                                (xr->renderingModeCount > 0 && !xr->renderingModeDisplay3D[inputSnapshot.currentRenderingMode]);
+                            bool appMonoMode = (xr->renderingModeCount > 0 && !xr->renderingModeDisplay3D[inputSnapshot.currentRenderingMode]);
                             if (appMonoMode) {
                                 XrVector3f center = {
                                     (rawLeft.x + rawRight.x) * 0.5f,
@@ -638,8 +636,7 @@ static void RenderThreadFunc(
                                     L"\nKooima: Camera-Centric [C=Toggle]" :
                                     L"\nKooima: Display-Centric [C=Toggle]";
 
-                                bool hudMonoMode = (inputSnapshot.currentRenderingMode == 0) ||
-                                    (xr->renderingModeCount > 0 && !xr->renderingModeDisplay3D[inputSnapshot.currentRenderingMode]);
+                                bool hudMonoMode = (xr->renderingModeCount > 0 && !xr->renderingModeDisplay3D[inputSnapshot.currentRenderingMode]);
                                 uint32_t dispRenderW, dispRenderH;
                                 if (hudMonoMode) {
                                     dispRenderW = g_sharedWidth;

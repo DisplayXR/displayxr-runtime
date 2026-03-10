@@ -1212,7 +1212,7 @@ int main() {
                         xr.isEyeTracking = (eyeTrackingState.isTracking == XR_TRUE);
                         xr.activeEyeTrackingMode = (uint32_t)eyeTrackingState.activeMode;
 
-                        bool monoMode = (g_input.currentRenderingMode == 0) || (xr.renderingModeCount > 0 && !xr.renderingModeDisplay3D[g_input.currentRenderingMode]);
+                        bool monoMode = (xr.renderingModeCount > 0 && !xr.renderingModeDisplay3D[g_input.currentRenderingMode]);
                         int eyeCount = monoMode ? 1 : 2;
                         if (monoMode) {
                             rawEyePos[0] = {
