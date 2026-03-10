@@ -78,6 +78,20 @@ leiasr_d3d12_set_input_texture(struct leiasr_d3d12 *leiasr,
                                uint32_t format);
 
 /*!
+ * Set the output render target format so the weaver can create its pipeline state.
+ *
+ * Must be called before the first weave() call, otherwise the weaver's
+ * internal pipeline state will be null and weaving will silently no-op.
+ *
+ * @param leiasr The D3D12 weaver instance.
+ * @param format DXGI format of the output render target (DXGI_FORMAT as uint32_t).
+ *
+ * @ingroup drv_leia
+ */
+void
+leiasr_d3d12_set_output_format(struct leiasr_d3d12 *leiasr, uint32_t format);
+
+/*!
  * Perform weaving from the stereo texture to the render target.
  *
  * Records draw commands onto the provided command list.

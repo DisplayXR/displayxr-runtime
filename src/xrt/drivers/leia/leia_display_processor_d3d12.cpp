@@ -69,6 +69,13 @@ leia_dp_d3d12_process_stereo(struct xrt_display_processor_d3d12 *xdp,
 	leiasr_d3d12_weave(ldp->leiasr, d3d12_command_list, target_width, target_height);
 }
 
+static void
+leia_dp_d3d12_set_output_format(struct xrt_display_processor_d3d12 *xdp, uint32_t format)
+{
+	struct leia_display_processor_d3d12_impl *ldp = leia_dp_d3d12(xdp);
+	leiasr_d3d12_set_output_format(ldp->leiasr, format);
+}
+
 static bool
 leia_dp_d3d12_get_predicted_eye_positions(struct xrt_display_processor_d3d12 *xdp,
                                           struct xrt_eye_pair *out_eye_pair)
@@ -165,6 +172,7 @@ leia_dp_factory_d3d12(void *d3d12_device,
 	}
 
 	ldp->base.process_stereo = leia_dp_d3d12_process_stereo;
+	ldp->base.set_output_format = leia_dp_d3d12_set_output_format;
 	ldp->base.get_predicted_eye_positions = leia_dp_d3d12_get_predicted_eye_positions;
 	ldp->base.get_window_metrics = NULL;
 	ldp->base.request_display_mode = leia_dp_d3d12_request_display_mode;
