@@ -617,60 +617,75 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		return XRT_SUCCESS;
 	}
 
-	// Display processor owns output: the SR D3D12 weaver creates its own
-	// DXGI swapchain on the HWND and handles presentation internally.
-	// Execute the stereo texture copy first, then hand off to the weaver.
-	// Always take this path when dp is present — even in mono/2D mode,
-	// the weaver must still process and present (it handles 2D internally
-	// via SwitchableLensHint).
-	if (c->display_processor != NULL && c->target == nullptr) {
+	// Display processor path: the D3D12 weaver renders to whatever render
+	// target is bound on the command list. We bind the swapchain back buffer
+	// as RT, call weave, then present.
+	if (c->display_processor != NULL && c->target != nullptr) {
 		static bool dp_logged = false;
 		if (!dp_logged) {
-			U_LOG_W("D3D12 weaving via display processor (weaver-owned output)");
+			U_LOG_W("D3D12 weaving via display processor (swapchain RT)");
 			dp_logged = true;
 		}
 
 		// Execute stereo copy so the texture is ready for the weaver
-		HRESULT hr_close = c->cmd_list->Close();
-		if (diag_log) {
-			U_LOG_I("D3D12 dp path: copy Close hr=0x%08x", (unsigned)hr_close);
-		}
+		c->cmd_list->Close();
 		ID3D12CommandList *copy_lists[] = {c->cmd_list};
 		c->command_queue->ExecuteCommandLists(1, copy_lists);
 		gpu_wait_idle(c);
 
 		// Give the weaver a fresh command list
-		HRESULT hr_alloc = c->cmd_allocator->Reset();
-		HRESULT hr_list = c->cmd_list->Reset(c->cmd_allocator, nullptr);
-		if (diag_log) {
-			U_LOG_I("D3D12 dp path: alloc Reset hr=0x%08x, list Reset hr=0x%08x",
-			        (unsigned)hr_alloc, (unsigned)hr_list);
-		}
+		c->cmd_allocator->Reset();
+		c->cmd_list->Reset(c->cmd_allocator, nullptr);
+
+		// Get swapchain back buffer and bind as render target
+		uint32_t bb_index = comp_d3d12_target_get_current_index(c->target);
+		ID3D12Resource *back_buffer = static_cast<ID3D12Resource *>(
+		    comp_d3d12_target_get_back_buffer(c->target, bb_index));
+		uint64_t rtv_handle_raw = comp_d3d12_target_get_rtv_handle(c->target, bb_index);
+		D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle;
+		rtv_handle.ptr = static_cast<SIZE_T>(rtv_handle_raw);
+
+		// Transition back buffer: PRESENT → RENDER_TARGET
+		D3D12_RESOURCE_BARRIER barrier = {};
+		barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		barrier.Transition.pResource = back_buffer;
+		barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+		barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+		barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+		c->cmd_list->ResourceBarrier(1, &barrier);
+
+		// Bind back buffer as render target
+		c->cmd_list->OMSetRenderTargets(1, &rtv_handle, FALSE, nullptr);
 
 		uint32_t view_width, view_height;
 		comp_d3d12_renderer_get_view_dimensions(c->renderer, &view_width, &view_height);
-
 		void *stereo_resource = comp_d3d12_renderer_get_stereo_resource(c->renderer);
 
 		if (diag_log) {
-			U_LOG_I("D3D12 dp path: stereo_resource=%p, view=%ux%u, target=%ux%u",
-			        stereo_resource, view_width, view_height, tgt_width, tgt_height);
+			U_LOG_I("D3D12 dp path: stereo=%p, view=%ux%u, target=%ux%u, bb=%u",
+			        stereo_resource, view_width, view_height,
+			        tgt_width, tgt_height, bb_index);
 		}
 
 		xrt_display_processor_d3d12_process_stereo(
 		    c->display_processor, c->cmd_list, stereo_resource, 0, 0,
-		    view_width, view_height, DXGI_FORMAT_R8G8B8A8_UNORM, tgt_width, tgt_height);
+		    view_width, view_height, DXGI_FORMAT_R8G8B8A8_UNORM,
+		    tgt_width, tgt_height);
 
-		// The weaver recorded draw commands onto our command list.
-		// Close and execute so the GPU processes the weaving.
-		HRESULT hr_weave_close = c->cmd_list->Close();
-		if (diag_log) {
-			U_LOG_I("D3D12 dp path: weave Close hr=0x%08x", (unsigned)hr_weave_close);
-		}
+		// Transition back buffer: RENDER_TARGET → PRESENT
+		barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+		barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+		c->cmd_list->ResourceBarrier(1, &barrier);
+
+		// Close and execute
+		c->cmd_list->Close();
 		ID3D12CommandList *weave_lists[] = {c->cmd_list};
 		c->command_queue->ExecuteCommandLists(1, weave_lists);
 
-		// Wait for weaving to complete (frame pacing)
+		// Present with VSync
+		comp_d3d12_target_present(c->target, 1);
+
+		// Wait for frame completion (frame pacing)
 		gpu_wait_idle(c);
 
 		return XRT_SUCCESS;
@@ -971,17 +986,16 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 		}
 	}
 
-	// Create output target (skip for shared texture offscreen mode and
-	// when a display processor is present — the SR D3D12 weaver creates
-	// its own DXGI swapchain on the HWND internally).
+	// Create output target (DXGI swapchain).
+	// The D3D12 weaver renders to whatever render target is bound on the
+	// command list — it does NOT create its own swapchain. So we always
+	// need a swapchain when we have a window, even with a display processor.
+	// Skip only for shared texture offscreen mode (no window to present to).
 	xrt_result_t xret;
-	if (c->has_shared_texture) {
+	if (c->has_shared_texture && c->hwnd == nullptr) {
 		c->target = nullptr;
-		U_LOG_I("Skipping DXGI swapchain (shared texture offscreen mode)");
-	} else if (dp_factory_d3d12 != NULL) {
-		c->target = nullptr;
-		U_LOG_I("Skipping DXGI swapchain (display processor owns output)");
-	} else {
+		U_LOG_I("Skipping DXGI swapchain (shared texture offscreen mode, no window)");
+	} else if (c->hwnd != nullptr) {
 		xret = comp_d3d12_target_create(c, c->hwnd,
 		                                              c->settings.preferred.width,
 		                                              c->settings.preferred.height,
@@ -991,6 +1005,9 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 			d3d12_compositor_destroy(&c->base.base);
 			return xret;
 		}
+	} else {
+		c->target = nullptr;
+		U_LOG_I("No window — skipping DXGI swapchain");
 	}
 
 	// Query display refresh rate
@@ -1000,57 +1017,24 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 	uint32_t view_width = c->settings.preferred.width / 2;
 	uint32_t view_height = c->settings.preferred.height;
 
-	// Create display processor via factory.
-	// The SR weaver creates its own DXGI swapchain on the HWND it receives,
-	// so it must be a window at native display resolution for correct interlacing.
-	// If the app provided a smaller window (e.g. 1280x720 _ext app), create a
-	// hidden window at native resolution specifically for the weaver.
+	// Create display processor via factory
 	if (dp_factory_d3d12 != NULL) {
 		auto factory = (xrt_dp_factory_d3d12_fn_t)dp_factory_d3d12;
-		HWND weaver_hwnd = c->hwnd;
-
-		// Check if we need a hidden window for the weaver
-		uint32_t native_w = xdev->hmd->screens[0].w_pixels;
-		uint32_t native_h = xdev->hmd->screens[0].h_pixels;
-		if (native_w > 0 && native_h > 0) {
-			bool need_hidden = false;
-			if (weaver_hwnd == nullptr) {
-				// Shared texture mode — no app window
-				need_hidden = true;
-			} else {
-				// Check if app window is smaller than native display
-				RECT rect;
-				if (GetClientRect(weaver_hwnd, &rect)) {
-					uint32_t win_w = rect.right - rect.left;
-					uint32_t win_h = rect.bottom - rect.top;
-					if (win_w < native_w || win_h < native_h) {
-						U_LOG_W("App window %ux%u smaller than display %ux%u, creating hidden weaver window",
-						        win_w, win_h, native_w, native_h);
-						need_hidden = true;
-					}
-				}
-			}
-			if (need_hidden && c->own_window == nullptr) {
-				xrt_result_t wret = comp_d3d11_window_create_hidden(native_w, native_h, &c->own_window);
-				if (wret == XRT_SUCCESS) {
-					c->owns_window = true;
-					weaver_hwnd = static_cast<HWND>(comp_d3d11_window_get_hwnd(c->own_window));
-					U_LOG_W("Created hidden weaver window at %ux%u: HWND=%p",
-					        native_w, native_h, (void *)weaver_hwnd);
-				} else {
-					U_LOG_W("Failed to create hidden weaver window, using app window");
-				}
-			} else if (need_hidden && c->own_window != nullptr) {
-				weaver_hwnd = static_cast<HWND>(comp_d3d11_window_get_hwnd(c->own_window));
-			}
-		}
-
-		xrt_result_t dp_ret = factory(c->device, c->command_queue, weaver_hwnd, &c->display_processor);
+		xrt_result_t dp_ret = factory(c->device, c->command_queue, c->hwnd, &c->display_processor);
 		if (dp_ret != XRT_SUCCESS) {
 			U_LOG_W("D3D12 display processor factory failed (error %d), continuing without", (int)dp_ret);
 			c->display_processor = nullptr;
 		} else {
 			U_LOG_W("D3D12 display processor created via factory");
+
+			// Tell the weaver the output render target format so it can
+			// create its internal pipeline state. Without this, the weaver's
+			// pipeline state stays null and weave() silently no-ops.
+			if (c->target != nullptr) {
+				xrt_display_processor_d3d12_set_output_format(
+				    c->display_processor,
+				    DXGI_FORMAT_R8G8B8A8_UNORM);
+			}
 		}
 	} else {
 		U_LOG_W("No D3D12 display processor factory provided");

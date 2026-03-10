@@ -75,6 +75,18 @@ struct xrt_display_processor_d3d12
 	                       uint32_t target_height);
 
 	/*!
+	 * Set the output render target format.
+	 *
+	 * Must be called before the first process_stereo() call so the
+	 * display processor can create its internal pipeline state.
+	 * Optional — NULL means format is set during creation.
+	 *
+	 * @param xdp    Pointer to self.
+	 * @param format DXGI format of the output render target (DXGI_FORMAT as uint32_t).
+	 */
+	void (*set_output_format)(struct xrt_display_processor_d3d12 *xdp, uint32_t format);
+
+	/*!
 	 * Get predicted eye positions from vendor eye tracking SDK.
 	 * Optional — NULL means not supported.
 	 */
@@ -142,6 +154,19 @@ xrt_display_processor_d3d12_process_stereo(struct xrt_display_processor_d3d12 *x
 {
 	xdp->process_stereo(xdp, d3d12_command_list, stereo_texture_resource, stereo_srv_gpu_handle,
 	                    target_rtv_cpu_handle, view_width, view_height, format, target_width, target_height);
+}
+
+/*!
+ * @copydoc xrt_display_processor_d3d12::set_output_format
+ * No-op if not supported (function pointer is NULL).
+ * @public @memberof xrt_display_processor_d3d12
+ */
+static inline void
+xrt_display_processor_d3d12_set_output_format(struct xrt_display_processor_d3d12 *xdp, uint32_t format)
+{
+	if (xdp != NULL && xdp->set_output_format != NULL) {
+		xdp->set_output_format(xdp, format);
+	}
 }
 
 /*!

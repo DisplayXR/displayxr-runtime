@@ -249,6 +249,18 @@ leiasr_d3d12_destroy(struct leiasr_d3d12 **leiasr_ptr)
 }
 
 void
+leiasr_d3d12_set_output_format(struct leiasr_d3d12 *leiasr, uint32_t format)
+{
+	if (leiasr == nullptr || leiasr->weaver == nullptr) {
+		return;
+	}
+
+	DXGI_FORMAT dxgi_format = static_cast<DXGI_FORMAT>(format);
+	leiasr->weaver->setOutputFormat(dxgi_format);
+	U_LOG_I("SR D3D12 weaver output format set to %u", (unsigned)format);
+}
+
+void
 leiasr_d3d12_set_input_texture(struct leiasr_d3d12 *leiasr,
                                void *stereo_resource,
                                uint32_t view_width,
