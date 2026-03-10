@@ -248,7 +248,9 @@ out:
 		}
 
 		// Set Leia display processor factories for vendor-agnostic compositor use.
+#ifdef XRT_HAVE_LEIA_SR_VULKAN
 		xsysc->info.dp_factory_vk = (void *)leia_dp_factory_vk;
+#endif
 		xsysc->info.dp_factory_d3d11 = (void *)leia_dp_factory_d3d11;
 #ifdef XRT_HAVE_LEIA_SR_D3D12
 		xsysc->info.dp_factory_d3d12 = (void *)leia_dp_factory_d3d12;
