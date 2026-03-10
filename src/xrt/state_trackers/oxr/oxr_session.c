@@ -83,6 +83,10 @@
 #include "gl/comp_gl_compositor.h"
 #endif
 
+#ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
+#include "vk_native/comp_vk_native_compositor.h"
+#endif
+
 
 DEBUG_GET_ONCE_NUM_OPTION(ipd, "OXR_DEBUG_IPD_MM", 63)
 DEBUG_GET_ONCE_NUM_OPTION(wait_frame_sleep, "OXR_DEBUG_WAIT_FRAME_EXTRA_SLEEP_MS", 0)
@@ -206,6 +210,29 @@ oxr_session_get_predicted_eye_positions(struct oxr_session *sess, struct xrt_eye
 	}
 #endif
 
+#ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
+	// VK native compositor path
+	if (sess->is_vk_native_compositor) {
+		struct xrt_vec3 left_eye, right_eye;
+		bool got_positions =
+		    comp_vk_native_compositor_get_predicted_eye_positions(&sess->xcn->base, &left_eye, &right_eye);
+
+		if (got_positions) {
+			out_eye_pair->left = (struct xrt_eye_position){left_eye.x, left_eye.y, left_eye.z};
+			out_eye_pair->right = (struct xrt_eye_position){right_eye.x, right_eye.y, right_eye.z};
+			out_eye_pair->timestamp_ns = os_monotonic_get_ns();
+			out_eye_pair->valid = true;
+			float dx = right_eye.x - left_eye.x;
+			float dy = right_eye.y - left_eye.y;
+			float dz = right_eye.z - left_eye.z;
+			float dist_sq = dx * dx + dy * dy + dz * dz;
+			out_eye_pair->is_tracking = (dist_sq > 1e-6f);
+			return true;
+		}
+		return false;
+	}
+#endif
+
 	// Multi-compositor path (Vulkan) — only valid for in-process mode.
 	// In IPC mode, sess->xcn is an IPC proxy, not a multi_compositor.
 	// xmcc is only non-NULL for in-process multi_system_compositor.
@@ -253,6 +280,13 @@ oxr_session_get_display_dimensions(struct oxr_session *sess, float *out_width_m,
 	}
 #endif
 
+#ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
+	// VK native compositor path
+	if (sess->xcn != NULL && sess->is_vk_native_compositor) {
+		return comp_vk_native_compositor_get_display_dimensions(&sess->xcn->base, out_width_m, out_height_m);
+	}
+#endif
+
 	// Generic path: read from system compositor info (populated at init by SR or sim_display)
 	const struct xrt_system_compositor_info *info = &sess->sys->xsysc->info;
 	if (info->display_width_m <= 0.0f || info->display_height_m <= 0.0f) {
@@ -292,6 +326,12 @@ oxr_session_get_window_metrics(struct oxr_session *sess,
 #ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR
 	if (sess->is_metal_native_compositor) {
 		return comp_metal_compositor_get_window_metrics(&sess->xcn->base, out_metrics);
+	}
+#endif
+
+#ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
+	if (sess->is_vk_native_compositor) {
+		return comp_vk_native_compositor_get_window_metrics(&sess->xcn->base, out_metrics);
 	}
 #endif
 
@@ -348,6 +388,16 @@ oxr_session_request_display_mode(struct oxr_logger *log, struct oxr_session *ses
 #ifdef XRT_HAVE_GL_NATIVE_COMPOSITOR
 	if (sess->is_gl_native_compositor) {
 		success = comp_gl_compositor_request_display_mode(&sess->xcn->base, enable_3d);
+		if (success) {
+			sess->display_mode_3d = enable_3d;
+		}
+		return XR_SUCCESS;
+	}
+#endif
+
+#ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
+	if (sess->is_vk_native_compositor) {
+		success = comp_vk_native_compositor_request_display_mode(&sess->xcn->base, enable_3d);
 		if (success) {
 			sess->display_mode_3d = enable_3d;
 		}
