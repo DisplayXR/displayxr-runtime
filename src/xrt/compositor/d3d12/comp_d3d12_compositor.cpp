@@ -636,9 +636,15 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		    c->display_processor, c->cmd_list, stereo_resource, 0, 0,
 		    view_width, view_height, DXGI_FORMAT_R8G8B8A8_UNORM, tgt_width, tgt_height);
 
-		// The SR D3D12 weaver manages its own command list lifecycle:
-		// it records, closes, executes, and presents internally.
-		// Wait for the weaver's work to complete.
+		// The weaver recorded draw commands onto our command list.
+		// Close and execute so the GPU processes the weaving.
+		// The SR D3D12 weaver's own swapchain present happens
+		// internally (either during weave() or on command execution).
+		c->cmd_list->Close();
+		ID3D12CommandList *weave_lists[] = {c->cmd_list};
+		c->command_queue->ExecuteCommandLists(1, weave_lists);
+
+		// Wait for weaving to complete (frame pacing)
 		gpu_wait_idle(c);
 
 		return XRT_SUCCESS;
