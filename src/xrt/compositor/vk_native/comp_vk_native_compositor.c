@@ -1009,9 +1009,10 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 		return XRT_SUCCESS;
 	}
 
-	// Display processor owns output — weaver handles its own swapchain + present.
-	// No target needed; pass VK_NULL_HANDLE for both command buffer and framebuffer
-	// so the weaver uses its own internal resources for the full render cycle.
+	// Display processor owns output — weaver manages its own swapchain.
+	// Pass a fresh (not-begun) command buffer so the weaver can manage
+	// the full lifecycle: begin, acquire swapchain, record, end, submit, present.
+	// VK_NULL_HANDLE for framebuffer = weaver uses its own swapchain images.
 	if (c->target == NULL && !is_mono && c->display_processor != NULL) {
 		static bool dp_logged = false;
 		if (!dp_logged) {
@@ -1027,19 +1028,36 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 
 		int32_t view_format = comp_vk_native_renderer_get_format(c->renderer);
 
-		// Pass VK_NULL_HANDLE for both cmd buffer and framebuffer.
-		// The SR weaver manages its own command buffer, swapchain
-		// acquire, interlacing render pass, submit, and present.
-		xrt_display_processor_process_views(
-		    c->display_processor,
-		    VK_NULL_HANDLE,
-		    (VkImageView)(uintptr_t)left_view,
-		    (VkImageView)(uintptr_t)right_view,
-		    view_width, view_height,
-		    (VkFormat_XDP)view_format,
-		    VK_NULL_HANDLE,
-		    tgt_width, tgt_height,
-		    (VkFormat_XDP)view_format);
+		VkCommandPool cmd_pool = c->cmd_pool;
+		VkCommandBufferAllocateInfo alloc_info = {
+		    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+		    .commandPool = cmd_pool,
+		    .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+		    .commandBufferCount = 1,
+		};
+
+		VkCommandBuffer cmd;
+		VkResult res = vk->vkAllocateCommandBuffers(vk->device, &alloc_info, &cmd);
+		if (res == VK_SUCCESS) {
+			// Do NOT begin the command buffer — the weaver manages
+			// its own begin/end/submit/present cycle when it owns
+			// the swapchain (no external framebuffer provided).
+			xrt_display_processor_process_views(
+			    c->display_processor,
+			    cmd,
+			    (VkImageView)(uintptr_t)left_view,
+			    (VkImageView)(uintptr_t)right_view,
+			    view_width, view_height,
+			    (VkFormat_XDP)view_format,
+			    VK_NULL_HANDLE,
+			    tgt_width, tgt_height,
+			    (VkFormat_XDP)view_format);
+
+			// Wait for the weaver's submit to complete before
+			// freeing the command buffer.
+			vk->vkQueueWaitIdle(vk->main_queue->queue);
+			vk->vkFreeCommandBuffers(vk->device, cmd_pool, 1, &cmd);
+		}
 
 		return XRT_SUCCESS;
 	}
