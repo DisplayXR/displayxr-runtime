@@ -607,47 +607,25 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		return XRT_SUCCESS;
 	}
 
-	// Get current back buffer index
-	uint32_t bb_index = comp_d3d12_target_get_current_index(c->target);
-	ID3D12Resource *back_buffer = static_cast<ID3D12Resource *>(
-	    comp_d3d12_target_get_back_buffer(c->target, bb_index));
-
-	bool weaving_done = false;
-
-	// Use display processor for weaving
-	if (!is_mono && c->display_processor != NULL && back_buffer != nullptr) {
+	// Display processor owns output: the SR D3D12 weaver creates its own
+	// DXGI swapchain on the HWND and handles presentation internally.
+	// Execute the stereo texture copy first, then hand off to the weaver.
+	if (!is_mono && c->display_processor != NULL && c->target == nullptr) {
 		static bool dp_logged = false;
 		if (!dp_logged) {
-			U_LOG_W("D3D12 weaving via display processor interface");
+			U_LOG_W("D3D12 weaving via display processor (weaver-owned output)");
 			dp_logged = true;
 		}
 
-		// Barrier: back buffer PRESENT -> RENDER_TARGET
-		D3D12_RESOURCE_BARRIER barrier = {};
-		barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-		barrier.Transition.pResource = back_buffer;
-		barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-		barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-		barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-		c->cmd_list->ResourceBarrier(1, &barrier);
+		// Execute stereo copy so the texture is ready for the weaver
+		c->cmd_list->Close();
+		ID3D12CommandList *copy_lists[] = {c->cmd_list};
+		c->command_queue->ExecuteCommandLists(1, copy_lists);
+		gpu_wait_idle(c);
 
-		// Copy stereo SRV descriptor from renderer's heap to dp_srv_heap
-		// (D3D12 requires the bound heap to contain the referenced descriptors)
-		{
-			D3D12_CPU_DESCRIPTOR_HANDLE src_cpu;
-			src_cpu.ptr = static_cast<SIZE_T>(comp_d3d12_renderer_get_stereo_srv_cpu_handle(c->renderer));
-			D3D12_CPU_DESCRIPTOR_HANDLE dst_cpu = c->dp_srv_heap->GetCPUDescriptorHandleForHeapStart();
-			c->device->CopyDescriptorsSimple(1, dst_cpu, src_cpu,
-			                                 D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-		}
-
-		// Set descriptor heaps for display processor
-		ID3D12DescriptorHeap *heaps[] = {c->dp_srv_heap};
-		c->cmd_list->SetDescriptorHeaps(1, heaps);
-
-		// Get GPU handle from dp_srv_heap (which now has the copied SRV)
-		uint64_t stereo_srv = c->dp_srv_heap->GetGPUDescriptorHandleForHeapStart().ptr;
-		uint64_t target_rtv = comp_d3d12_target_get_rtv_handle(c->target, bb_index);
+		// Give the weaver a fresh command list
+		c->cmd_allocator->Reset();
+		c->cmd_list->Reset(c->cmd_allocator, nullptr);
 
 		uint32_t view_width, view_height;
 		comp_d3d12_renderer_get_view_dimensions(c->renderer, &view_width, &view_height);
@@ -655,82 +633,87 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		void *stereo_resource = comp_d3d12_renderer_get_stereo_resource(c->renderer);
 
 		xrt_display_processor_d3d12_process_stereo(
-		    c->display_processor, c->cmd_list, stereo_resource, stereo_srv, target_rtv,
+		    c->display_processor, c->cmd_list, stereo_resource, 0, 0,
 		    view_width, view_height, DXGI_FORMAT_R8G8B8A8_UNORM, tgt_width, tgt_height);
 
-		// Barrier: back buffer RENDER_TARGET -> PRESENT
-		barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-		barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-		c->cmd_list->ResourceBarrier(1, &barrier);
+		// The SR D3D12 weaver manages its own command list lifecycle:
+		// it records, closes, executes, and presents internally.
+		// Wait for the weaver's work to complete.
+		gpu_wait_idle(c);
 
-		weaving_done = true;
+		return XRT_SUCCESS;
 	}
 
-	// Fallback: copy stereo texture to back buffer
-	if (!weaving_done && back_buffer != nullptr) {
-		static bool fallback_warned = false;
-		if (!fallback_warned) {
-			U_LOG_W("Display processing not available, using fallback copy (mono=%d)", is_mono);
-			fallback_warned = true;
+	// Target path (no display processor, or mono fallback)
+	if (c->target != nullptr) {
+		uint32_t bb_index = comp_d3d12_target_get_current_index(c->target);
+		ID3D12Resource *back_buffer = static_cast<ID3D12Resource *>(
+		    comp_d3d12_target_get_back_buffer(c->target, bb_index));
+
+		if (back_buffer != nullptr) {
+			static bool fallback_warned = false;
+			if (!fallback_warned) {
+				U_LOG_W("Display processing not available, using fallback copy (mono=%d)", is_mono);
+				fallback_warned = true;
+			}
+
+			ID3D12Resource *stereo_resource = static_cast<ID3D12Resource *>(
+			    comp_d3d12_renderer_get_stereo_resource(c->renderer));
+
+			if (stereo_resource != nullptr) {
+				// Barrier: back buffer PRESENT -> COPY_DEST
+				D3D12_RESOURCE_BARRIER barriers[2] = {};
+				barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+				barriers[0].Transition.pResource = back_buffer;
+				barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+				barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+				barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+				barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+				barriers[1].Transition.pResource = stereo_resource;
+				barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+				barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+				barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+				c->cmd_list->ResourceBarrier(2, barriers);
+
+				c->cmd_list->CopyResource(back_buffer, stereo_resource);
+
+				// Barrier: back to original states
+				barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+				barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+				barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+				barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
+				c->cmd_list->ResourceBarrier(2, barriers);
+			}
 		}
 
-		ID3D12Resource *stereo_resource = static_cast<ID3D12Resource *>(
-		    comp_d3d12_renderer_get_stereo_resource(c->renderer));
+		// Close and execute command list
+		c->cmd_list->Close();
+		ID3D12CommandList *lists[] = {c->cmd_list};
+		c->command_queue->ExecuteCommandLists(1, lists);
 
-		if (stereo_resource != nullptr) {
-			// Barrier: back buffer PRESENT -> COPY_DEST
-			D3D12_RESOURCE_BARRIER barriers[2] = {};
-			barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-			barriers[0].Transition.pResource = back_buffer;
-			barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-			barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-			barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+		// Present with VSync
+		xret = comp_d3d12_target_present(c->target, 1);
 
-			// Stereo texture should already be in PIXEL_SHADER_RESOURCE, transition to COPY_SOURCE
-			barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-			barriers[1].Transition.pResource = stereo_resource;
-			barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-			barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-			barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-
-			c->cmd_list->ResourceBarrier(2, barriers);
-
-			c->cmd_list->CopyResource(back_buffer, stereo_resource);
-
-			// Barrier: back to original states
-			barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-			barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-			barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-			barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-
-			c->cmd_list->ResourceBarrier(2, barriers);
+		// Signal WM_PAINT for modal drag loop
+		if (c->owns_window && c->own_window != nullptr) {
+			comp_d3d11_window_signal_paint_done(c->own_window);
 		}
-	}
 
-	// Close and execute command list
-	c->cmd_list->Close();
-	ID3D12CommandList *lists[] = {c->cmd_list};
-	c->command_queue->ExecuteCommandLists(1, lists);
+		// Signal fence and wait for frame completion (frame pacing)
+		c->fence_value++;
+		c->command_queue->Signal(c->fence, c->fence_value);
+		if (c->fence->GetCompletedValue() < c->fence_value) {
+			c->fence->SetEventOnCompletion(c->fence_value, c->fence_event);
+			WaitForSingleObject(c->fence_event, INFINITE);
+		}
 
-	// Present with VSync
-	xret = comp_d3d12_target_present(c->target, 1);
-
-	// Signal WM_PAINT for modal drag loop
-	if (c->owns_window && c->own_window != nullptr) {
-		comp_d3d11_window_signal_paint_done(c->own_window);
-	}
-
-	// Signal fence and wait for frame completion (frame pacing)
-	c->fence_value++;
-	c->command_queue->Signal(c->fence, c->fence_value);
-	if (c->fence->GetCompletedValue() < c->fence_value) {
-		c->fence->SetEventOnCompletion(c->fence_value, c->fence_event);
-		WaitForSingleObject(c->fence_event, INFINITE);
-	}
-
-	if (xret != XRT_SUCCESS) {
-		U_LOG_E("Failed to present");
-		return xret;
+		if (xret != XRT_SUCCESS) {
+			U_LOG_E("Failed to present");
+			return xret;
+		}
 	}
 
 	return XRT_SUCCESS;
@@ -956,9 +939,17 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 		}
 	}
 
-	// Create output target (skip for shared texture offscreen mode)
+	// Create output target (skip for shared texture offscreen mode and
+	// when a display processor is present — the SR D3D12 weaver creates
+	// its own DXGI swapchain on the HWND internally).
 	xrt_result_t xret;
-	if (!c->has_shared_texture) {
+	if (c->has_shared_texture) {
+		c->target = nullptr;
+		U_LOG_I("Skipping DXGI swapchain (shared texture offscreen mode)");
+	} else if (dp_factory_d3d12 != NULL) {
+		c->target = nullptr;
+		U_LOG_I("Skipping DXGI swapchain (display processor owns output)");
+	} else {
 		xret = comp_d3d12_target_create(c, c->hwnd,
 		                                              c->settings.preferred.width,
 		                                              c->settings.preferred.height,
@@ -968,9 +959,6 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 			d3d12_compositor_destroy(&c->base.base);
 			return xret;
 		}
-	} else {
-		c->target = nullptr;
-		U_LOG_I("Skipping DXGI swapchain (shared texture offscreen mode)");
 	}
 
 	// Query display refresh rate
