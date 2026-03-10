@@ -1657,6 +1657,14 @@ do_wait_frame_and_checks(struct oxr_logger *log,
 XrResult
 oxr_session_frame_wait(struct oxr_logger *log, struct oxr_session *sess, XrFrameState *frameState)
 {
+	// Diagnostic: log first few xrWaitFrame calls to trace frame pipeline
+	static int wait_frame_count = 0;
+	wait_frame_count++;
+	if (wait_frame_count <= 3 || (wait_frame_count % 300) == 0) {
+		U_LOG_W("[frame_wait] call #%d, state=%d, compositor=%p",
+		        wait_frame_count, (int)sess->state, (void *)sess->compositor);
+	}
+
 	//! @todo this should be carefully synchronized, because there may be
 	//! more than one session per instance.
 	XRT_MAYBE_UNUSED timepoint_ns now = time_state_get_now_and_update(sess->sys->inst->timekeeping);
@@ -1688,8 +1696,11 @@ oxr_session_frame_wait(struct oxr_logger *log, struct oxr_session *sess, XrFrame
 	 * waiting for xrBeginFrame has happened, for better timing information.
 	 */
 	XrResult ret = oxr_frame_sync_wait_frame(&sess->frame_sync);
+	if (wait_frame_count <= 3) {
+		U_LOG_W("[frame_wait] frame_sync returned %d", (int)ret);
+	}
 	if (XR_SUCCESS != ret) {
-		// session not running
+		U_LOG_W("[frame_wait] frame_sync FAILED: %d — session not running", (int)ret);
 		return ret;
 	}
 
@@ -1709,7 +1720,12 @@ oxr_session_frame_wait(struct oxr_logger *log, struct oxr_session *sess, XrFrame
 	    &predicted_display_time,    // out_predicted_display_time
 	    &predicted_display_period,  // out_predicted_display_period
 	    &converted_time);           // out_converted_time
+	if (wait_frame_count <= 3) {
+		U_LOG_W("[frame_wait] do_wait_frame_and_checks returned %d, frame_id=%" PRId64,
+		        (int)ret, frame_id);
+	}
 	if (ret != XR_SUCCESS) {
+		U_LOG_W("[frame_wait] do_wait_frame_and_checks FAILED: %d", (int)ret);
 		// On error we need to release the semaphore ourselves as xrBeginFrame won't do it.
 		// Should not get an error.
 		XrResult release_ret = oxr_frame_sync_release(&sess->frame_sync);
@@ -1737,6 +1753,11 @@ oxr_session_frame_wait(struct oxr_logger *log, struct oxr_session *sess, XrFrame
 	frameState->predictedDisplayPeriod = predicted_display_period;
 	frameState->predictedDisplayTime = converted_time;
 
+	if (wait_frame_count <= 3) {
+		U_LOG_W("[frame_wait] returning XR_SUCCESS, shouldRender=%d, frame_id=%" PRId64,
+		        (int)frameState->shouldRender, frame_id);
+	}
+
 	if (sess->frame_timing_spew) {
 		oxr_log(log,
 		        "Waiting finished at %8.3fms. Predicted display time "
@@ -1756,6 +1777,14 @@ oxr_session_frame_wait(struct oxr_logger *log, struct oxr_session *sess, XrFrame
 XrResult
 oxr_session_frame_begin(struct oxr_logger *log, struct oxr_session *sess)
 {
+	// Diagnostic: log first few xrBeginFrame calls
+	static int begin_frame_count = 0;
+	begin_frame_count++;
+	if (begin_frame_count <= 3) {
+		U_LOG_W("[frame_begin] call #%d, frame_started=%d, compositor=%p",
+		        begin_frame_count, (int)sess->frame_started, (void *)sess->compositor);
+	}
+
 	struct xrt_compositor *xc = sess->compositor;
 
 	os_mutex_lock(&sess->active_wait_frames_lock);
@@ -1799,7 +1828,7 @@ oxr_session_frame_begin(struct oxr_logger *log, struct oxr_session *sess)
 	// beginFrame is about to succeed, we can release an xrWaitFrame, if available.
 	XrResult osh_ret = oxr_frame_sync_release(&sess->frame_sync);
 	if (XR_SUCCESS != osh_ret) {
-		// session not running
+		U_LOG_W("[frame_begin] frame_sync_release FAILED: %d", (int)osh_ret);
 		return osh_ret;
 	}
 
