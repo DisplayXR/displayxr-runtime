@@ -131,6 +131,9 @@ struct comp_vk_native_compositor
 	//! Command pool for display processor factory.
 	VkCommandPool cmd_pool;
 
+	//! Simple render pass for display processor framebuffer creation.
+	VkRenderPass dp_render_pass;
+
 	//! Generic Vulkan display processor (vendor-agnostic weaving).
 	struct xrt_display_processor *display_processor;
 
@@ -1009,16 +1012,28 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 		return XRT_SUCCESS;
 	}
 
-	// Display processor owns output — weaver manages its own swapchain.
-	// Pass a fresh (not-begun) command buffer so the weaver can manage
-	// the full lifecycle: begin, acquire swapchain, record, end, submit, present.
-	// VK_NULL_HANDLE for framebuffer = weaver uses its own swapchain images.
-	if (c->target == NULL && !is_mono && c->display_processor != NULL) {
+	// Display processor + target path: weave stereo views into the target's
+	// swapchain image via the display processor, then present.
+	if (c->target != NULL && !is_mono && c->display_processor != NULL) {
 		static bool dp_logged = false;
 		if (!dp_logged) {
-			U_LOG_W("VK weaving via display processor (weaver-owned output)");
+			U_LOG_W("VK weaving via display processor -> target swapchain");
 			dp_logged = true;
 		}
+
+		uint32_t target_index;
+		xret = comp_vk_native_target_acquire(c->target, &target_index);
+		if (xret != XRT_SUCCESS) {
+			U_LOG_E("Failed to acquire target for display processor");
+			return xret;
+		}
+
+		uint64_t tgt_image_u64, tgt_view_u64;
+		comp_vk_native_target_get_current_image(c->target, &tgt_image_u64, &tgt_view_u64);
+		VkImageView tgt_view = (VkImageView)(uintptr_t)tgt_view_u64;
+
+		uint32_t target_width, target_height;
+		comp_vk_native_target_get_dimensions(c->target, &target_width, &target_height);
 
 		uint64_t left_view, right_view;
 		comp_vk_native_renderer_get_stereo_views(c->renderer, &left_view, &right_view);
@@ -1027,6 +1042,19 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 		comp_vk_native_renderer_get_view_dimensions(c->renderer, &view_width, &view_height);
 
 		int32_t view_format = comp_vk_native_renderer_get_format(c->renderer);
+
+		// Create a temporary framebuffer from the target's swapchain image.
+		VkFramebuffer fb = VK_NULL_HANDLE;
+		VkFramebufferCreateInfo fb_ci = {
+		    .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+		    .renderPass = c->dp_render_pass,
+		    .attachmentCount = 1,
+		    .pAttachments = &tgt_view,
+		    .width = target_width,
+		    .height = target_height,
+		    .layers = 1,
+		};
+		vk->vkCreateFramebuffer(vk->device, &fb_ci, NULL, &fb);
 
 		VkCommandPool cmd_pool = c->cmd_pool;
 		VkCommandBufferAllocateInfo alloc_info = {
@@ -1039,9 +1067,12 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 		VkCommandBuffer cmd;
 		VkResult res = vk->vkAllocateCommandBuffers(vk->device, &alloc_info, &cmd);
 		if (res == VK_SUCCESS) {
-			// Do NOT begin the command buffer — the weaver manages
-			// its own begin/end/submit/present cycle when it owns
-			// the swapchain (no external framebuffer provided).
+			VkCommandBufferBeginInfo begin_info = {
+			    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+			    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+			};
+			vk->vkBeginCommandBuffer(cmd, &begin_info);
+
 			xrt_display_processor_process_views(
 			    c->display_processor,
 			    cmd,
@@ -1049,16 +1080,30 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			    (VkImageView)(uintptr_t)right_view,
 			    view_width, view_height,
 			    (VkFormat_XDP)view_format,
-			    VK_NULL_HANDLE,
-			    tgt_width, tgt_height,
-			    (VkFormat_XDP)view_format);
+			    fb,
+			    target_width, target_height,
+			    (VkFormat_XDP)VK_FORMAT_B8G8R8A8_UNORM);
 
-			// Wait for the weaver's submit to complete before
-			// freeing the command buffer.
-			vk->vkQueueWaitIdle(vk->main_queue->queue);
+			vk->vkEndCommandBuffer(cmd);
+
+			VkSubmitInfo submit_info = {
+			    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+			    .commandBufferCount = 1,
+			    .pCommandBuffers = &cmd,
+			};
+			res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, VK_NULL_HANDLE);
+			if (res == VK_SUCCESS) {
+				vk->vkQueueWaitIdle(vk->main_queue->queue);
+			}
+
 			vk->vkFreeCommandBuffers(vk->device, cmd_pool, 1, &cmd);
 		}
 
+		if (fb != VK_NULL_HANDLE) {
+			vk->vkDestroyFramebuffer(vk->device, fb, NULL);
+		}
+
+		comp_vk_native_target_present(c->target);
 		return XRT_SUCCESS;
 	}
 
@@ -1148,8 +1193,11 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 
 	vk->vkDeviceWaitIdle(vk->device);
 
-	// Destroy display processor
+	// Destroy display processor and its render pass
 	xrt_display_processor_destroy(&c->display_processor);
+	if (c->dp_render_pass != VK_NULL_HANDLE) {
+		vk->vkDestroyRenderPass(vk->device, c->dp_render_pass, NULL);
+	}
 
 	// Destroy shared texture resources
 	if (c->shared_view != VK_NULL_HANDLE) {
@@ -1417,39 +1465,67 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		U_LOG_W("No VK display processor factory provided");
 	}
 
-	// Create output target (VkSwapchainKHR) only if there is NO display
-	// processor.  The SR weaver creates its own VkSwapchain on the HWND
-	// and handles presentation internally — creating a second swapchain
-	// on the same surface would violate the Vulkan spec.
-	if (c->display_processor == NULL) {
-		if (hwnd != NULL
+	// Create output target (VkSwapchainKHR) for presentation.
+	// Even when a display processor (SR weaver) is active, we need our own
+	// swapchain: the weaver's setOutputFrameBuffer requires a valid
+	// VkFramebuffer, and we present via our swapchain after weaving.
+	if (hwnd != NULL
 #ifdef XRT_OS_WINDOWS
-		    || c->owns_window
+	    || c->owns_window
 #endif
 #ifdef XRT_OS_MACOS
-		    || c->owns_window
+	    || c->owns_window
 #endif
-		) {
-			void *target_hwnd = hwnd;
+	) {
+		void *target_hwnd = hwnd;
 #ifdef XRT_OS_WINDOWS
-			if (target_hwnd == NULL) target_hwnd = c->hwnd;
+		if (target_hwnd == NULL) target_hwnd = c->hwnd;
 #endif
-			xrt_result_t xret = comp_vk_native_target_create(c, target_hwnd,
-			                                                  c->settings.preferred.width,
-			                                                  c->settings.preferred.height,
-			                                                  &c->target);
-			if (xret != XRT_SUCCESS) {
-				U_LOG_E("Failed to create VK target");
-				vk_compositor_destroy(&c->base.base);
-				return xret;
-			}
-		} else {
-			c->target = NULL;
-			U_LOG_I("No VK target — offscreen shared texture mode");
+		xrt_result_t xret = comp_vk_native_target_create(c, target_hwnd,
+		                                                  c->settings.preferred.width,
+		                                                  c->settings.preferred.height,
+		                                                  &c->target);
+		if (xret != XRT_SUCCESS) {
+			U_LOG_E("Failed to create VK target");
+			vk_compositor_destroy(&c->base.base);
+			return xret;
 		}
 	} else {
 		c->target = NULL;
-		U_LOG_I("Display processor owns output — skipping target creation");
+		U_LOG_I("No VK target — offscreen shared texture mode");
+	}
+
+	// Create a simple render pass for display processor framebuffer creation.
+	// This must be compatible with the weaver's internal render pass
+	// (single color attachment, B8G8R8A8_UNORM, store result).
+	if (c->display_processor != NULL) {
+		VkAttachmentDescription color_attachment = {
+		    .format = VK_FORMAT_B8G8R8A8_UNORM,
+		    .samples = VK_SAMPLE_COUNT_1_BIT,
+		    .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+		    .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+		    .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+		    .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+		    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+		    .finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+		};
+		VkAttachmentReference color_ref = {
+		    .attachment = 0,
+		    .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		};
+		VkSubpassDescription subpass = {
+		    .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
+		    .colorAttachmentCount = 1,
+		    .pColorAttachments = &color_ref,
+		};
+		VkRenderPassCreateInfo rp_ci = {
+		    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+		    .attachmentCount = 1,
+		    .pAttachments = &color_attachment,
+		    .subpassCount = 1,
+		    .pSubpasses = &subpass,
+		};
+		c->vk.vkCreateRenderPass(c->vk.device, &rp_ci, NULL, &c->dp_render_pass);
 	}
 
 	// Determine view dimensions
