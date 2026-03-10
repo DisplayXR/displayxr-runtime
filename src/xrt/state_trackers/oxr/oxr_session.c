@@ -345,6 +345,16 @@ oxr_session_request_display_mode(struct oxr_logger *log, struct oxr_session *ses
 	}
 #endif
 
+#ifdef XRT_HAVE_GL_NATIVE_COMPOSITOR
+	if (sess->is_gl_native_compositor) {
+		success = comp_gl_compositor_request_display_mode(&sess->xcn->base, enable_3d);
+		if (success) {
+			sess->display_mode_3d = enable_3d;
+		}
+		return XR_SUCCESS;
+	}
+#endif
+
 	// In-process multi compositor path (not used for IPC clients).
 	// IPC clients have an ipc_client_compositor, not a multi_compositor.
 	if (sess->sys->xsysc->xmcc != NULL) {

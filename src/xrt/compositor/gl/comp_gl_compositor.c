@@ -1389,6 +1389,22 @@ comp_gl_compositor_set_sys_info(struct xrt_compositor *xc, const struct xrt_syst
 	c->sys_info_set = true;
 }
 
+bool
+comp_gl_compositor_request_display_mode(struct xrt_compositor *xc, bool enable_3d)
+{
+	if (xc == NULL) {
+		return false;
+	}
+
+	struct comp_gl_compositor *c = gl_comp(xc);
+
+	if (c->display_processor != NULL) {
+		return xrt_display_processor_gl_request_display_mode(c->display_processor, enable_3d);
+	}
+
+	return false;
+}
+
 xrt_result_t
 comp_gl_compositor_create(struct xrt_device *xdev,
                           void *window_handle,

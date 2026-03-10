@@ -62,6 +62,18 @@ comp_gl_compositor_set_system_devices(struct xrt_compositor *xc, struct xrt_syst
 void
 comp_gl_compositor_set_sys_info(struct xrt_compositor *xc, const struct xrt_system_compositor_info *info);
 
+/*!
+ * Request display mode switch (2D/3D) via the GL display processor.
+ *
+ * @param xc        GL compositor base.
+ * @param enable_3d true for 3D mode, false for 2D.
+ * @return true if the display processor handled the request.
+ *
+ * @ingroup comp_gl
+ */
+bool
+comp_gl_compositor_request_display_mode(struct xrt_compositor *xc, bool enable_3d);
+
 #ifdef __cplusplus
 }
 #endif
