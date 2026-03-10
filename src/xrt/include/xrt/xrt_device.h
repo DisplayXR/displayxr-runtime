@@ -112,6 +112,10 @@ struct xrt_hmd_parts
 	struct xrt_view views[XRT_MAX_VIEWS];
 
 	size_t view_count;
+
+	//! Currently active rendering mode index
+	uint32_t active_rendering_mode_index;
+
 	/*!
 	 * Array of supported blend modes.
 	 */
@@ -231,6 +235,10 @@ struct xrt_rendering_mode
 {
 	uint32_t mode_index;                    //!< Vendor-defined mode index
 	char mode_name[XRT_DEVICE_NAME_LEN];    //!< Human-readable mode name
+	uint32_t view_count;                    //!< 1=mono, 2=stereo, 4=quad, etc.
+	float view_scale_x;                     //!< Per-view horizontal scale (vendor-provided)
+	float view_scale_y;                     //!< Per-view vertical scale (vendor-provided)
+	bool display_3d;                        //!< Whether display hardware is in 3D mode
 };
 
 /*!

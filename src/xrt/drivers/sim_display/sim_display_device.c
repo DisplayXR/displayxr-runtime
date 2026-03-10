@@ -345,11 +345,30 @@ sim_display_hmd_set_property(struct xrt_device *xdev,
                               int32_t value)
 {
 	if (property == XRT_DEVICE_PROPERTY_OUTPUT_MODE) {
-		sim_display_set_output_mode((enum sim_display_output_mode)value);
-		// Update device name to reflect current mode
-		const char *mode_names[] = {"SBS", "Anaglyph", "Blended"};
-		int idx = (value >= 0 && value <= 2) ? value : 0;
-		snprintf(xdev->str, XRT_DEVICE_NAME_LEN, "Sim 3D Display (%s)", mode_names[idx]);
+		// Unified mode index: 0=2D, 1=SBS, 2=Anaglyph, 3=Blend
+		// Map to internal sim_display output mode: 0=SBS, 1=Anaglyph, 2=Blend
+		enum sim_display_output_mode internal_mode;
+		const char *mode_name;
+		switch (value) {
+		case 0: // 2D — keep current output mode, 3D toggle handled by state tracker
+			return XRT_SUCCESS;
+		case 1:
+			internal_mode = SIM_DISPLAY_OUTPUT_SBS;
+			mode_name = "SBS";
+			break;
+		case 2:
+			internal_mode = SIM_DISPLAY_OUTPUT_ANAGLYPH;
+			mode_name = "Anaglyph";
+			break;
+		case 3:
+			internal_mode = SIM_DISPLAY_OUTPUT_BLEND;
+			mode_name = "Blend";
+			break;
+		default:
+			return XRT_ERROR_NOT_IMPLEMENTED;
+		}
+		sim_display_set_output_mode(internal_mode);
+		snprintf(xdev->str, XRT_DEVICE_NAME_LEN, "Sim 3D Display (%s)", mode_name);
 		return XRT_SUCCESS;
 	}
 	if (property == XRT_DEVICE_PROPERTY_EXT_APP_MODE) {
@@ -365,7 +384,9 @@ sim_display_hmd_get_property(struct xrt_device *xdev,
                               int32_t *out_value)
 {
 	if (property == XRT_DEVICE_PROPERTY_OUTPUT_MODE) {
-		*out_value = (int32_t)sim_display_get_output_mode();
+		// Return unified mode index: internal 0=SBS→1, 1=Anaglyph→2, 2=Blend→3
+		int32_t internal = (int32_t)sim_display_get_output_mode();
+		*out_value = internal + 1; // Offset by 1 (mode 0 is 2D)
 		return XRT_SUCCESS;
 	}
 	if (property == XRT_DEVICE_PROPERTY_SBS_MODE) {
@@ -489,20 +510,48 @@ sim_display_hmd_create(void)
 
 	{
 		const char *mode_names[] = {"SBS", "Anaglyph", "Blended"};
-		int idx = (int)sim_display_get_output_mode();
+		int idx = (int)sim_display_get_output_mode(); // internal: 0=SBS, 1=Anaglyph, 2=Blend
 		if (idx < 0 || idx > 2) idx = 0;
 		snprintf(hmd->base.str, XRT_DEVICE_NAME_LEN, "Sim 3D Display (%s)", mode_names[idx]);
 	}
 	snprintf(hmd->base.serial, XRT_DEVICE_NAME_LEN, "sim_display_0");
 
-	// Rendering modes: sim_display supports 3 modes.
-	hmd->base.rendering_mode_count = 3;
+	// Rendering modes: sim_display supports 4 modes (2D + 3 stereo).
+	hmd->base.rendering_mode_count = 4;
+
+	// Mode 0: 2D (mono, full resolution)
 	hmd->base.rendering_modes[0].mode_index = 0;
-	snprintf(hmd->base.rendering_modes[0].mode_name, XRT_DEVICE_NAME_LEN, "SBS");
+	snprintf(hmd->base.rendering_modes[0].mode_name, XRT_DEVICE_NAME_LEN, "2D");
+	hmd->base.rendering_modes[0].view_count = 1;
+	hmd->base.rendering_modes[0].view_scale_x = 1.0f;
+	hmd->base.rendering_modes[0].view_scale_y = 1.0f;
+	hmd->base.rendering_modes[0].display_3d = false;
+
+	// Mode 1: SBS (stereo)
 	hmd->base.rendering_modes[1].mode_index = 1;
-	snprintf(hmd->base.rendering_modes[1].mode_name, XRT_DEVICE_NAME_LEN, "Anaglyph");
+	snprintf(hmd->base.rendering_modes[1].mode_name, XRT_DEVICE_NAME_LEN, "SBS");
+	hmd->base.rendering_modes[1].view_count = 2;
+	hmd->base.rendering_modes[1].view_scale_x = 0.5f;
+	hmd->base.rendering_modes[1].view_scale_y = 0.5f;
+	hmd->base.rendering_modes[1].display_3d = true;
+
+	// Mode 2: Anaglyph (stereo)
 	hmd->base.rendering_modes[2].mode_index = 2;
-	snprintf(hmd->base.rendering_modes[2].mode_name, XRT_DEVICE_NAME_LEN, "Blend");
+	snprintf(hmd->base.rendering_modes[2].mode_name, XRT_DEVICE_NAME_LEN, "Anaglyph");
+	hmd->base.rendering_modes[2].view_count = 2;
+	hmd->base.rendering_modes[2].view_scale_x = 0.5f;
+	hmd->base.rendering_modes[2].view_scale_y = 0.5f;
+	hmd->base.rendering_modes[2].display_3d = true;
+
+	// Mode 3: Blend (stereo)
+	hmd->base.rendering_modes[3].mode_index = 3;
+	snprintf(hmd->base.rendering_modes[3].mode_name, XRT_DEVICE_NAME_LEN, "Blend");
+	hmd->base.rendering_modes[3].view_count = 2;
+	hmd->base.rendering_modes[3].view_scale_x = 0.5f;
+	hmd->base.rendering_modes[3].view_scale_y = 0.5f;
+	hmd->base.rendering_modes[3].display_3d = true;
+
+	hmd->base.hmd->active_rendering_mode_index = 1; // Default to SBS (3D)
 
 	// Head pose input.
 	hmd->base.inputs[0].name = XRT_INPUT_GENERIC_HEAD_POSE;
