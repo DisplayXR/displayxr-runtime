@@ -620,7 +620,10 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	// Display processor owns output: the SR D3D12 weaver creates its own
 	// DXGI swapchain on the HWND and handles presentation internally.
 	// Execute the stereo texture copy first, then hand off to the weaver.
-	if (!is_mono && c->display_processor != NULL && c->target == nullptr) {
+	// Always take this path when dp is present — even in mono/2D mode,
+	// the weaver must still process and present (it handles 2D internally
+	// via SwitchableLensHint).
+	if (c->display_processor != NULL && c->target == nullptr) {
 		static bool dp_logged = false;
 		if (!dp_logged) {
 			U_LOG_W("D3D12 weaving via display processor (weaver-owned output)");
@@ -1011,25 +1014,19 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 		U_LOG_W("No D3D12 display processor factory provided");
 	}
 
-	// If display processor available, query display pixel info for optimal view dimensions
+	// If display processor available, query display pixel info for view dimensions.
+	// Use display-native resolution — the weaver reads the stereo texture at
+	// full resolution and handles output sizing to its own swapchain internally.
 	if (c->display_processor != nullptr) {
 		uint32_t disp_px_w = 0, disp_px_h = 0;
 		int32_t disp_left = 0, disp_top = 0;
 		if (xrt_display_processor_d3d12_get_display_pixel_info(
 		        c->display_processor, &disp_px_w, &disp_px_h, &disp_left, &disp_top) &&
 		    disp_px_w > 0 && disp_px_h > 0) {
-			uint32_t base_vw = disp_px_w / 2;
-			uint32_t base_vh = disp_px_h;
-
-			float ratio = fminf(
-			    (float)c->settings.preferred.width / (float)disp_px_w,
-			    (float)c->settings.preferred.height / (float)disp_px_h);
-			if (ratio > 1.0f) {
-				ratio = 1.0f;
-			}
-			view_width = (uint32_t)((float)base_vw * ratio);
-			view_height = (uint32_t)((float)base_vh * ratio);
-			U_LOG_W("Scaled to window ratio %.3f: %ux%u per eye", ratio, view_width, view_height);
+			view_width = disp_px_w / 2;
+			view_height = disp_px_h;
+			U_LOG_W("Display processor: using native resolution %ux%u per eye (display %ux%u)",
+			        view_width, view_height, disp_px_w, disp_px_h);
 		}
 	}
 

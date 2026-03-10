@@ -459,8 +459,24 @@ comp_d3d12_renderer_draw(struct comp_d3d12_renderer *renderer,
 
 			// Get swapchain image dimensions
 			D3D12_RESOURCE_DESC src_desc = src_resource->GetDesc();
-			uint32_t copy_w = (std::min)(static_cast<uint32_t>(src_desc.Width), renderer->view_width);
-			uint32_t copy_h = (std::min)(static_cast<uint32_t>(src_desc.Height), renderer->texture_height);
+
+			// Use image_rect from layer data to handle single-swapchain
+			// packed views (e.g., 7680x4320 with left at x=0, right at x=3840)
+			struct xrt_rect sub_rect = layer->data.proj.v[vi].sub.rect;
+			uint32_t src_x = 0;
+			uint32_t src_y = 0;
+			uint32_t src_w = static_cast<uint32_t>(src_desc.Width);
+			uint32_t src_h = static_cast<uint32_t>(src_desc.Height);
+
+			if (sub_rect.extent.w > 0 && sub_rect.extent.h > 0) {
+				src_x = static_cast<uint32_t>(sub_rect.offset.w);
+				src_y = static_cast<uint32_t>(sub_rect.offset.h);
+				src_w = static_cast<uint32_t>(sub_rect.extent.w);
+				src_h = static_cast<uint32_t>(sub_rect.extent.h);
+			}
+
+			uint32_t copy_w = (std::min)(src_w, renderer->view_width);
+			uint32_t copy_h = (std::min)(src_h, renderer->texture_height);
 
 			// Destination X offset: view 0 = left half, view 1 = right half
 			uint32_t dst_x = 0;
@@ -472,9 +488,11 @@ comp_d3d12_renderer_draw(struct comp_d3d12_renderer *renderer,
 			}
 
 			if (draw_log) {
-				U_LOG_I("D3D12 renderer: copy layer=%u view=%u, src=%p (%llux%u), dst_x=%u, copy=%ux%u",
+				U_LOG_I("D3D12 renderer: copy layer=%u view=%u, src=%p (%llux%u), "
+				        "sub_rect=(%u,%u %ux%u), dst_x=%u, copy=%ux%u",
 				        li, vi, (void *)src_resource,
 				        (unsigned long long)src_desc.Width, (unsigned)src_desc.Height,
+				        src_x, src_y, src_w, src_h,
 				        dst_x, copy_w, copy_h);
 			}
 
@@ -490,11 +508,11 @@ comp_d3d12_renderer_draw(struct comp_d3d12_renderer *renderer,
 			src_loc.SubresourceIndex = 0;
 
 			D3D12_BOX src_box = {};
-			src_box.left = 0;
-			src_box.top = 0;
+			src_box.left = src_x;
+			src_box.top = src_y;
 			src_box.front = 0;
-			src_box.right = copy_w;
-			src_box.bottom = copy_h;
+			src_box.right = src_x + copy_w;
+			src_box.bottom = src_y + copy_h;
 			src_box.back = 1;
 
 			cmd_list->CopyTextureRegion(&dst_loc, dst_x, 0, 0, &src_loc, &src_box);
