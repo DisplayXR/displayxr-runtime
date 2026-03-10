@@ -1000,10 +1000,52 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 	uint32_t view_width = c->settings.preferred.width / 2;
 	uint32_t view_height = c->settings.preferred.height;
 
-	// Create display processor via factory
+	// Create display processor via factory.
+	// The SR weaver creates its own DXGI swapchain on the HWND it receives,
+	// so it must be a window at native display resolution for correct interlacing.
+	// If the app provided a smaller window (e.g. 1280x720 _ext app), create a
+	// hidden window at native resolution specifically for the weaver.
 	if (dp_factory_d3d12 != NULL) {
 		auto factory = (xrt_dp_factory_d3d12_fn_t)dp_factory_d3d12;
-		xrt_result_t dp_ret = factory(c->device, c->command_queue, c->hwnd, &c->display_processor);
+		HWND weaver_hwnd = c->hwnd;
+
+		// Check if we need a hidden window for the weaver
+		uint32_t native_w = xdev->hmd->screens[0].w_pixels;
+		uint32_t native_h = xdev->hmd->screens[0].h_pixels;
+		if (native_w > 0 && native_h > 0) {
+			bool need_hidden = false;
+			if (weaver_hwnd == nullptr) {
+				// Shared texture mode — no app window
+				need_hidden = true;
+			} else {
+				// Check if app window is smaller than native display
+				RECT rect;
+				if (GetClientRect(weaver_hwnd, &rect)) {
+					uint32_t win_w = rect.right - rect.left;
+					uint32_t win_h = rect.bottom - rect.top;
+					if (win_w < native_w || win_h < native_h) {
+						U_LOG_W("App window %ux%u smaller than display %ux%u, creating hidden weaver window",
+						        win_w, win_h, native_w, native_h);
+						need_hidden = true;
+					}
+				}
+			}
+			if (need_hidden && c->own_window == nullptr) {
+				xrt_result_t wret = comp_d3d11_window_create_hidden(native_w, native_h, &c->own_window);
+				if (wret == XRT_SUCCESS) {
+					c->owns_window = true;
+					weaver_hwnd = static_cast<HWND>(comp_d3d11_window_get_hwnd(c->own_window));
+					U_LOG_W("Created hidden weaver window at %ux%u: HWND=%p",
+					        native_w, native_h, (void *)weaver_hwnd);
+				} else {
+					U_LOG_W("Failed to create hidden weaver window, using app window");
+				}
+			} else if (need_hidden && c->own_window != nullptr) {
+				weaver_hwnd = static_cast<HWND>(comp_d3d11_window_get_hwnd(c->own_window));
+			}
+		}
+
+		xrt_result_t dp_ret = factory(c->device, c->command_queue, weaver_hwnd, &c->display_processor);
 		if (dp_ret != XRT_SUCCESS) {
 			U_LOG_W("D3D12 display processor factory failed (error %d), continuing without", (int)dp_ret);
 			c->display_processor = nullptr;
