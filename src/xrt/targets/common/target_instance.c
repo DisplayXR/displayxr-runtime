@@ -268,15 +268,19 @@ out:
 				xsysc->info.nominal_viewer_x_m = 0.0f;
 				xsysc->info.nominal_viewer_y_m = sd_info.nominal_y_m;
 				xsysc->info.nominal_viewer_z_m = sd_info.nominal_z_m;
-				// Read scale from the active rendering mode
-				uint32_t active_idx = head->hmd->active_rendering_mode_index;
-				if (active_idx < head->rendering_mode_count) {
-					xsysc->info.recommended_view_scale_x = head->rendering_modes[active_idx].view_scale_x;
-					xsysc->info.recommended_view_scale_y = head->rendering_modes[active_idx].view_scale_y;
-				} else {
-					xsysc->info.recommended_view_scale_x = 0.5f;
-					xsysc->info.recommended_view_scale_y = 0.5f;
+				// Worst-case (smallest) scale across all modes so swapchains
+				// created at init work for every mode without reallocation.
+				float min_scale_x = 1.0f, min_scale_y = 1.0f;
+				for (uint32_t mi = 0; mi < head->rendering_mode_count; mi++) {
+					if (head->rendering_modes[mi].view_scale_x > 0.0f &&
+					    head->rendering_modes[mi].view_scale_x < min_scale_x)
+						min_scale_x = head->rendering_modes[mi].view_scale_x;
+					if (head->rendering_modes[mi].view_scale_y > 0.0f &&
+					    head->rendering_modes[mi].view_scale_y < min_scale_y)
+						min_scale_y = head->rendering_modes[mi].view_scale_y;
 				}
+				xsysc->info.recommended_view_scale_x = min_scale_x;
+				xsysc->info.recommended_view_scale_y = min_scale_y;
 				xsysc->info.supports_display_mode_switch = true;
 				xsysc->info.display_pixel_width = sd_info.display_pixel_width;
 				xsysc->info.display_pixel_height = sd_info.display_pixel_height;
@@ -284,12 +288,11 @@ out:
 				xsysc->info.supported_eye_tracking_modes = 2; // RAW_BIT
 				xsysc->info.default_eye_tracking_mode = 1;    // RAW
 				U_LOG_W("XR_EXT_display_info (sim_display): display=%.3fx%.3f m, "
-				        "nominal=(0, %.3f, %.3f) m, scale=%.2fx%.2f (mode %u), pixels=%ux%u",
+				        "nominal=(0, %.3f, %.3f) m, scale=%.2fx%.2f (worst-case), pixels=%ux%u",
 				        sd_info.display_width_m, sd_info.display_height_m,
 				        sd_info.nominal_y_m, sd_info.nominal_z_m,
 				        xsysc->info.recommended_view_scale_x,
 				        xsysc->info.recommended_view_scale_y,
-				        active_idx,
 				        sd_info.display_pixel_width, sd_info.display_pixel_height);
 
 				// Set sim_display factories (only if Leia SR didn't already set them)

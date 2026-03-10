@@ -1351,8 +1351,7 @@ oxr_xrRequestDisplayRenderingModeEXT(XrSession session, uint32_t modeIndex)
 		oxr_session_request_display_mode(&log, sess, mode->display_3d);
 	}
 
-	// 3. Update view count and active mode
-	head->hmd->view_count = mode->view_count;
+	// 3. Update active mode (view_count stays fixed at 2 for STEREO)
 	head->hmd->active_rendering_mode_index = modeIndex;
 
 	// 4. Update recommended view scales
