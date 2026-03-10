@@ -1761,6 +1761,15 @@ submit_passthrough_layer(struct oxr_session *sess,
 XrResult
 oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const XrFrameEndInfo *frameEndInfo)
 {
+	// Diagnostic: log first few xrEndFrame calls
+	static int end_frame_count = 0;
+	end_frame_count++;
+	if (end_frame_count <= 3 || (end_frame_count % 300) == 0) {
+		U_LOG_W("[frame_end] call #%d, layerCount=%u, displayTime=%" PRIi64 ", frame_started=%d",
+		        end_frame_count, frameEndInfo->layerCount, frameEndInfo->displayTime,
+		        (int)sess->frame_started);
+	}
+
 	/*
 	 * Call order.
 	 */
@@ -1971,6 +1980,9 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 	}
 
 	xret = xrt_comp_layer_commit(xc, XRT_GRAPHICS_SYNC_HANDLE_INVALID);
+	if (end_frame_count <= 3) {
+		U_LOG_W("[frame_end] layer_commit returned %d", (int)xret);
+	}
 	OXR_CHECK_XRET(log, sess, xret, xrt_comp_layer_commit);
 
 	sess->frame_id.begun = -1;
@@ -1979,6 +1991,10 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 	os_mutex_lock(&sess->active_wait_frames_lock);
 	sess->active_wait_frames--;
 	os_mutex_unlock(&sess->active_wait_frames_lock);
+
+	if (end_frame_count <= 3) {
+		U_LOG_W("[frame_end] frame #%d completed successfully", end_frame_count);
+	}
 
 	return oxr_session_success_result(sess);
 }
