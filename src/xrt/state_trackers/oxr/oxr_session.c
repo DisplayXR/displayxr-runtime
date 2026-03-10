@@ -607,9 +607,23 @@ oxr_session_begin(struct oxr_logger *log, struct oxr_session *sess, const XrSess
 		                 "Frame sync object refused to let us begin session, probably already running");
 	}
 
-	// Auto-switch to 3D mode on session begin
+	// Auto-switch to default 3D mode on session begin
 #ifdef OXR_HAVE_EXT_display_info
-	oxr_session_request_display_mode(log, sess, true);
+	{
+		struct xrt_device *head = GET_XDEV_BY_ROLE(sess->sys, head);
+		if (head != NULL && head->hmd != NULL) {
+			uint32_t default_mode = head->hmd->active_rendering_mode_index;
+			if (default_mode < head->rendering_mode_count) {
+				struct xrt_rendering_mode *mode = &head->rendering_modes[default_mode];
+				oxr_session_request_display_mode(log, sess, mode->display_3d);
+				xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, default_mode);
+			} else {
+				oxr_session_request_display_mode(log, sess, true);
+			}
+		} else {
+			oxr_session_request_display_mode(log, sess, true);
+		}
+	}
 #endif
 
 	return oxr_session_success_result(sess);
@@ -639,9 +653,18 @@ oxr_session_end(struct oxr_logger *log, struct oxr_session *sess)
 		return oxr_error(log, XR_ERROR_SESSION_NOT_STOPPING, "Session is not stopping");
 	}
 
-	// Auto-switch to 2D mode on session end
+	// Auto-switch to 2D mode (mode 0) on session end
 #ifdef OXR_HAVE_EXT_display_info
-	oxr_session_request_display_mode(log, sess, false);
+	{
+		struct xrt_device *head = GET_XDEV_BY_ROLE(sess->sys, head);
+		if (head != NULL && head->rendering_mode_count > 0 &&
+		    !head->rendering_modes[0].display_3d) {
+			xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, 0);
+			head->hmd->view_count = head->rendering_modes[0].view_count;
+			head->hmd->active_rendering_mode_index = 0;
+		}
+		oxr_session_request_display_mode(log, sess, false);
+	}
 #endif
 
 	struct xrt_compositor *xc = sess->compositor;
@@ -1161,15 +1184,7 @@ oxr_session_locate_views(struct oxr_logger *log,
 			} else if (oxr_session_get_display_dimensions(sess, &screen_width_m, &screen_height_m) &&
 			           screen_width_m > 0.0f && screen_height_m > 0.0f) {
 				// Fallback: full display dimensions (fullscreen or no window metrics)
-				// In SBS mode each eye sees half the display width
-				int32_t output_mode = 0;
-				struct xrt_device *head_xdev = GET_XDEV_BY_ROLE(sess->sys, head);
-				if (head_xdev != NULL &&
-				    xrt_device_get_property(head_xdev, XRT_DEVICE_PROPERTY_OUTPUT_MODE,
-				                            &output_mode) == XRT_SUCCESS &&
-				    output_mode == 0) { // 0 = SBS
-					screen_width_m /= 2.0f;
-				}
+				// Kooima always uses full physical display — display processor handles cropping/layout
 			}
 
 			if (should_log) {
@@ -2372,11 +2387,13 @@ oxr_session_create(struct oxr_logger *log,
 	    (xsi.external_window_handle != NULL || xsi.readback_callback != NULL || xsi.shared_texture_handle != NULL);
 
 	// Tell the head device to return raw eye positions (no qwerty compose)
+	// and disable qwerty input processing for _ext/_shared apps
 	if (sess->has_external_window) {
 		struct xrt_device *head = GET_XDEV_BY_ROLE(sess->sys, head);
 		if (head != NULL) {
 			xrt_device_set_property(head, XRT_DEVICE_PROPERTY_EXT_APP_MODE, 1);
 		}
+		qwerty_set_process_keys(sess->sys->xsysd->xdevs, sess->sys->xsysd->xdev_count, false);
 	}
 
 	// Track whether this is an AppContainer app (Chrome WebXR)
