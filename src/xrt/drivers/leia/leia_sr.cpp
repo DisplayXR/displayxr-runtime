@@ -248,15 +248,13 @@ leiasr_create(double maxTime,
 	sr->device = device;
 	sr->windowHandle = (HWND)windowHandle;
 
-	// ALWAYS pass NULL HWND to CreateVulkanWeaver.
-	// The SR VK weaver creates its own internal VkSwapchain when given a
-	// valid HWND. Our compositor also creates a VkSwapchain on the same HWND
-	// (via comp_vk_native_target_create) for framebuffer management. Having
-	// two VkSwapchains on the same HWND violates the Vulkan spec and crashes.
-	// By passing NULL, the weaver skips internal swapchain creation and we
-	// provide framebuffers via setOutputFrameBuffer instead.
-	// The HWND is still stored in sr->windowHandle for window metrics queries.
-	HWND weaverHwnd = NULL;
+	// Pass the real HWND to CreateVulkanWeaver.
+	// The SR VK weaver creates its own internal VkSwapchain on this HWND.
+	// The compositor must NOT create a second VkSwapchain on the same HWND
+	// (two swapchains on one HWND violates the Vulkan spec).
+	// Instead, the compositor skips target creation when a display processor
+	// is present, and lets the weaver manage its own swapchain internally.
+	HWND weaverHwnd = (HWND)windowHandle;
 	if (!CreateSRWeaver(sr->context, device, physicalDevice, graphicsQueue, commandPool, weaverHwnd, sr)) {
 		U_LOG_E("Failed to create SR weaver");
 		delete sr;
@@ -267,7 +265,7 @@ leiasr_create(double maxTime,
 
 	*out = sr;
 
-	U_LOG_W("Created leiasr instance with weaver (window HWND %p, weaver HWND=NULL to avoid dual swapchain)", windowHandle);
+	U_LOG_W("Created leiasr instance with weaver for HWND %p (weaver owns VkSwapchain)", windowHandle);
 
 	return XRT_SUCCESS;
 }
@@ -378,7 +376,13 @@ leiasr_weave(struct leiasr *leiasr,
 
 	leiasr->weaver->setViewport(rect);
 	leiasr->weaver->setScissorRect(rect);
-	leiasr->weaver->setCommandBuffer(commandBuffer);
+	// Only override the command buffer if one is provided.
+	// VK_NULL_HANDLE means the weaver should use its own internal command buffer.
+	// IMPORTANT: calling setCommandBuffer(VK_NULL_HANDLE) overrides the internal
+	// one with null (causing black screen), so we must skip the call entirely.
+	if (commandBuffer != VK_NULL_HANDLE) {
+		leiasr->weaver->setCommandBuffer(commandBuffer);
+	}
 	leiasr->weaver->setInputViewTexture(leftImageView, rightImageView, imageWidth, imageHeight, imageFormat);
 	// Only override the output framebuffer if one is provided.
 	// VK_NULL_HANDLE means the weaver should use its own internal swapchain.
