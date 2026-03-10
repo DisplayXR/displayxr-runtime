@@ -106,6 +106,20 @@ if(XRT_HAVE_LEIA_SR)
 		endif()
 	endif()
 
+	# Check for GL weaver support on Windows
+	set(LEIA_SR_GL_AVAILABLE FALSE)
+	if(WIN32)
+		if(EXISTS "${SR_PATH}/lib/SimulatedRealityOpenGL.lib")
+			message(STATUS "Found SimulatedRealityOpenGL.lib - enabling GL weaver")
+			list(APPEND LEIA_SOURCES
+				leia/leia_sr_gl.cpp leia/leia_sr_gl.h
+				leia/leia_display_processor_gl.cpp leia/leia_display_processor_gl.h)
+			set(LEIA_SR_GL_AVAILABLE TRUE)
+		else()
+			message(STATUS "SimulatedRealityOpenGL.lib not found - GL weaver disabled")
+		endif()
+	endif()
+
 	# Only create the driver if at least one weaver is available
 	if(LEIA_SOURCES)
 		add_library(drv_leia STATIC ${LEIA_SOURCES})
@@ -148,6 +162,14 @@ if(XRT_HAVE_LEIA_SR)
 			target_compile_definitions(drv_leia PUBLIC XRT_HAVE_LEIA_SR_D3D12)
 		endif()
 
+		# GL weaver library (conditional)
+		if(LEIA_SR_GL_AVAILABLE)
+			target_link_libraries(drv_leia PRIVATE
+				${SR_PATH}/lib/SimulatedRealityOpenGL.lib
+				opengl32)
+			target_compile_definitions(drv_leia PUBLIC XRT_HAVE_LEIA_SR_GL)
+		endif()
+
 		# Eye tracking is handled by the weaver's getPredictedEyePositions() - no separate library needed
 
 		# CNSDK support (Android interlacing) — added to drv_leia when both SDKs available
@@ -161,6 +183,7 @@ if(XRT_HAVE_LEIA_SR)
 		set(LEIA_SR_VULKAN_AVAILABLE ${LEIA_SR_VULKAN_AVAILABLE} CACHE INTERNAL "LeiaSR Vulkan weaver available")
 		set(LEIA_SR_D3D11_AVAILABLE ${LEIA_SR_D3D11_AVAILABLE} CACHE INTERNAL "LeiaSR D3D11 weaver available")
 		set(LEIA_SR_D3D12_AVAILABLE ${LEIA_SR_D3D12_AVAILABLE} CACHE INTERNAL "LeiaSR D3D12 weaver available")
+		set(LEIA_SR_GL_AVAILABLE ${LEIA_SR_GL_AVAILABLE} CACHE INTERNAL "LeiaSR GL weaver available")
 
 		list(APPEND ENABLED_DRIVERS drv_leia)
 	else()
@@ -225,6 +248,10 @@ if(WIN32 AND XRT_HAVE_D3D12)
 		sim_display/sim_display_processor_d3d12.cpp)
 endif()
 
+# GL display processor (GLSL shaders compiled at runtime)
+list(APPEND SIM_DISPLAY_SOURCES
+	sim_display/sim_display_processor_gl.c)
+
 # macOS visible frame helper (NSScreen query)
 if(APPLE)
 	list(APPEND SIM_DISPLAY_SOURCES
@@ -233,7 +260,10 @@ if(APPLE)
 endif()
 
 add_library(drv_sim_display STATIC ${SIM_DISPLAY_SOURCES})
-target_link_libraries(drv_sim_display PRIVATE xrt-interfaces aux_util aux_os PUBLIC drv_includes)
+target_link_libraries(drv_sim_display PRIVATE xrt-interfaces aux_util aux_os aux_ogl PUBLIC drv_includes)
+
+# aux_ogl headers (ogl_api.h) are in auxiliary/ogl/
+target_include_directories(drv_sim_display PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../auxiliary)
 
 if(XRT_HAVE_VULKAN)
 	target_link_libraries(drv_sim_display PRIVATE aux_vk)
@@ -241,14 +271,15 @@ if(XRT_HAVE_VULKAN)
 endif()
 
 if(WIN32)
-	target_link_libraries(drv_sim_display PRIVATE d3d11 d3dcompiler)
+	target_link_libraries(drv_sim_display PRIVATE d3d11 d3dcompiler opengl32)
 	if(XRT_HAVE_D3D12)
 		target_link_libraries(drv_sim_display PRIVATE d3d12)
 	endif()
 endif()
 
 if(APPLE)
-	target_link_libraries(drv_sim_display PRIVATE "-framework CoreGraphics" "-framework AppKit" "-framework Metal")
+	target_link_libraries(drv_sim_display PRIVATE "-framework CoreGraphics" "-framework AppKit" "-framework Metal" "-framework OpenGL")
+	target_compile_definitions(drv_sim_display PRIVATE GL_SILENCE_DEPRECATION)
 endif()
 
 list(APPEND ENABLED_DRIVERS drv_sim_display)

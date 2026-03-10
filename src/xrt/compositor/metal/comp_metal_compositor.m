@@ -1181,8 +1181,8 @@ metal_compositor_update_hud(struct comp_metal_compositor *c, float dt)
 	    "%s\n"
 	    "%s\n"
 	    "\n"
-	    "Output: %s  (1/2/3)\n"
-	    "TAB=HUD  V=2D/3D  P=Cam/Disp  ESC=Quit",
+	    "Output: %s  (0-3=Mode  V=Cycle)\n"
+	    "TAB=HUD  P=Cam/Disp  ESC=Quit",
 	    dev_name,
 	    fps, c->smoothed_frame_time_ms,
 	    c->view_width, c->view_height,
@@ -1236,6 +1236,15 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		return XRT_SUCCESS;
 	}
 
+	// Sync display_3d from device's active rendering mode (for _rt apps where
+	// qwerty driver updates the device directly without going through request_display_mode)
+	if (c->xdev != NULL && c->xdev->hmd != NULL) {
+		uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
+		if (idx < c->xdev->rendering_mode_count) {
+			c->display_3d = c->xdev->rendering_modes[idx].display_3d;
+		}
+	}
+
 	// Step 1: Render layers into SBS stereo texture
 	if (c->stereo_texture != nil && c->layer_accum.layer_count > 0) {
 		MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -1286,10 +1295,14 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 					nr.h = 1.0f;
 				}
 
+				// In 2D mode, only render eye 0 at full width (skip eye 1)
+				if (!c->display_3d && eye > 0) {
+					continue;
+				}
+
 				// Set viewport for this eye
-				// In 2D mode (mono), use full stereo texture width for eye 0
 				MTLViewport vp;
-				if (!c->display_3d && eye == 0) {
+				if (!c->display_3d) {
 					vp.originX = 0;
 					vp.width = c->view_width * 2;
 				} else {

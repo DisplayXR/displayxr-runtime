@@ -51,7 +51,7 @@ oxr_session_populate_gl_macos(struct oxr_logger *log,
 	    window_handle,        // NSView from cocoa_window_binding (or NULL for shared texture)
 	    next->cglContext,     // App's CGLContextObj for texture sharing
 	    NULL,                 // gl_display (not used on macOS)
-	    NULL,                 // dp_factory_gl (TODO: when GL display processors exist)
+	    (sys->xsysc != NULL) ? sys->xsysc->info.dp_factory_gl : NULL,
 	    shared_iosurface,     // IOSurfaceRef for shared texture mode (or NULL for windowed)
 	    &xcn);
 	if (xret != XRT_SUCCESS) {

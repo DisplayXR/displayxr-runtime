@@ -118,7 +118,7 @@ Run:
 git commit -m "$(cat <<'EOF'
 [YOUR COMMIT MESSAGE HERE]
 
-Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
 EOF
 )"
 ```

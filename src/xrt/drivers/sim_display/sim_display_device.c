@@ -347,11 +347,22 @@ sim_display_hmd_set_property(struct xrt_device *xdev,
 	if (property == XRT_DEVICE_PROPERTY_OUTPUT_MODE) {
 		// Unified mode index: 0=2D, 1=Anaglyph, 2=SBS, 3=Blend
 		// Map to internal sim_display output mode: 0=SBS, 1=Anaglyph, 2=Blend
+		if ((uint32_t)value >= xdev->rendering_mode_count) {
+			return XRT_ERROR_NOT_IMPLEMENTED;
+		}
+
+		// Always update active rendering mode index
+		xdev->hmd->active_rendering_mode_index = (uint32_t)value;
+
+		if (value == 0) {
+			// 2D — don't change weaver, compositor bypasses it
+			snprintf(xdev->str, XRT_DEVICE_NAME_LEN, "Sim 3D Display (2D)");
+			return XRT_SUCCESS;
+		}
+
 		enum sim_display_output_mode internal_mode;
 		const char *mode_name;
 		switch (value) {
-		case 0: // 2D — keep current output mode, 3D toggle handled by state tracker
-			return XRT_SUCCESS;
 		case 1:
 			internal_mode = SIM_DISPLAY_OUTPUT_ANAGLYPH;
 			mode_name = "Anaglyph";

@@ -2496,6 +2496,10 @@ struct xrt_system_compositor_info
 	//! Signature: xrt_dp_factory_metal_fn_t (see xrt_display_processor_metal.h).
 	void *dp_factory_metal;
 
+	//! OpenGL display processor factory (NULL = no GL display processing).
+	//! Signature: xrt_dp_factory_gl_fn_t (see xrt_display_processor_gl.h).
+	void *dp_factory_gl;
+
 	/*! @} */
 };
 

@@ -599,6 +599,9 @@ qwerty_system_create(struct qwerty_hmd *qhmd,
 	qs->log_level = log_level;
 	qs->process_keys = true;
 
+	// Default rendering mode matches sim_display default (mode 1 = first 3D mode)
+	qs->rendering_mode = 1;
+
 	// Stereo defaults
 	qs->camera_mode = true;
 
@@ -980,6 +983,26 @@ qwerty_check_rendering_mode_change(struct xrt_device **xdevs, size_t xdev_count,
 	}
 
 	return false;
+}
+
+void
+qwerty_set_rendering_mode_silent(struct xrt_device **xdevs, size_t xdev_count, int mode)
+{
+	struct qwerty_system *qs = NULL;
+	for (size_t i = 0; i < xdev_count; i++) {
+		if (xdevs[i] == NULL || xdevs[i]->destroy != qwerty_destroy) {
+			continue;
+		}
+		const char *name = xdevs[i]->tracking_origin->name;
+		if (strcmp(name, QWERTY_HMD_TRACKER_STR) == 0 || strcmp(name, QWERTY_LEFT_TRACKER_STR) == 0 ||
+		    strcmp(name, QWERTY_RIGHT_TRACKER_STR) == 0) {
+			qs = qwerty_device(xdevs[i])->sys;
+			break;
+		}
+	}
+	if (qs != NULL) {
+		qs->rendering_mode = mode;
+	}
 }
 
 void

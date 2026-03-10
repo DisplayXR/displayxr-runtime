@@ -44,7 +44,7 @@ struct qwerty_system
 	bool force_2d_mode;              //!< Runtime-side 2D/3D toggle (V key when HMD focused)
 	bool display_mode_toggle_pending; //!< Set by key handler, cleared by compositor
 
-	int rendering_mode;                  //!< Current rendering mode index (0=SBS, 1+=vendor-defined)
+	int rendering_mode;                  //!< Current unified rendering mode index (0=2D, 1+=3D modes)
 	bool rendering_mode_change_pending;  //!< Set by key handler, cleared by caller
 
 	// Stereo controls (P toggles mode with derivation, spacebar resets)

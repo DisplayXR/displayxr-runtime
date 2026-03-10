@@ -1612,12 +1612,10 @@ int main(int argc, char **argv)
                 float vs = minDisp / minWin;
                 float screenWidthM  = winW_m * vs;
                 float screenHeightM = winH_m * vs;
-                // SBS: each eye sees half the display width; anaglyph/blend: full width
-                bool sbsMode = display3D && g_input.currentRenderingMode == 2;
-                float baseScreenW = sbsMode ? screenWidthM / 2.0f : screenWidthM;
-
+                // Kooima always uses full physical display dimensions.
+                // The display processor (weaver) handles cropping for SBS layout.
                 Display3DScreen screen;
-                screen.width_m = baseScreenW;
+                screen.width_m = screenWidthM;
                 screen.height_m = screenHeightM;
 
                 if (g_input.cameraMode) {

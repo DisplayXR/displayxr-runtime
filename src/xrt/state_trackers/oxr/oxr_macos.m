@@ -89,11 +89,20 @@ oxr_macos_pump_events(struct xrt_device **xdevs, uint32_t xdev_count, struct xrt
 		}
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
-		// Poll for rendering mode change (1/2/3 keys via qwerty driver)
+		// Poll for unified rendering mode change (0-3/V keys via qwerty driver)
 		if (xdevs != NULL && xdev_count > 0 && head != NULL) {
 			int render_mode = -1;
 			if (qwerty_check_rendering_mode_change(xdevs, xdev_count, &render_mode)) {
+				// Wrap for V key cycling and feed back wrapped value
+				if (head->rendering_mode_count > 0) {
+					render_mode = render_mode % (int)head->rendering_mode_count;
+					// Update qwerty's stored mode for correct V cycling
+					qwerty_set_rendering_mode_silent(xdevs, xdev_count, render_mode);
+				}
 				xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, render_mode);
+				// Note: do NOT change hmd->view_count for _rt apps.
+				// _rt apps always render stereo; the compositor/weaver
+				// handles 2D by displaying one eye or blending.
 			}
 		}
 #endif

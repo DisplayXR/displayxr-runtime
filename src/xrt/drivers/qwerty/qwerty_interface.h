@@ -187,6 +187,15 @@ bool
 qwerty_check_rendering_mode_change(struct xrt_device **xdevs, size_t xdev_count, int *out_mode);
 
 /*!
+ * Update the qwerty stored rendering mode without triggering a pending change.
+ * Used by the polling code to feed back wrapped mode indices (for V key cycling).
+ *
+ * @ingroup drv_qwerty
+ */
+void
+qwerty_set_rendering_mode_silent(struct xrt_device **xdevs, size_t xdev_count, int mode);
+
+/*!
  * Get the current qwerty stereo tuning state.
  *
  * Scans @p xdevs for a qwerty_system and copies its stereo state.

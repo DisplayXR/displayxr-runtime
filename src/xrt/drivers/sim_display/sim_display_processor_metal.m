@@ -51,11 +51,21 @@ static NSString *const shader_source = @
     "    return out;\n"
     "}\n"
     "\n"
-    "// SBS pass-through\n"
+    "// SBS with center crop: each eye rendered at full-display FOV,\n"
+    "// crop center 50% horizontally to match half-display SBS layout.\n"
     "fragment float4 sbs_fragment(VertexOut in [[stage_in]],\n"
     "                             texture2d<float> tex [[texture(0)]],\n"
     "                             sampler smp [[sampler(0)]]) {\n"
-    "    return tex.sample(smp, in.texCoord);\n"
+    "    float x = in.texCoord.x;\n"
+    "    float src_u;\n"
+    "    if (x < 0.5) {\n"
+    "        float eye_u = x / 0.5;\n"              // [0,1] within left output half
+    "        src_u = 0.125 + eye_u * 0.25;\n"       // center 50% of left eye [0.125, 0.375]
+    "    } else {\n"
+    "        float eye_u = (x - 0.5) / 0.5;\n"      // [0,1] within right output half
+    "        src_u = 0.625 + eye_u * 0.25;\n"        // center 50% of right eye [0.625, 0.875]
+    "    }\n"
+    "    return tex.sample(smp, float2(src_u, in.texCoord.y));\n"
     "}\n"
     "\n"
     "// Anaglyph: red from left eye, cyan from right eye\n"

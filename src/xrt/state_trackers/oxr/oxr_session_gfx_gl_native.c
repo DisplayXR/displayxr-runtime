@@ -84,8 +84,7 @@ oxr_session_populate_gl_native(struct oxr_logger *log,
 	struct xrt_compositor_native *xcn = NULL;
 
 	// Get GL display processor factory from system compositor info
-	void *dp_factory_gl = NULL;
-	// TODO: dp_factory_gl when GL display processors are implemented
+	void *dp_factory_gl = (sys->xsysc != NULL) ? sys->xsysc->info.dp_factory_gl : NULL;
 
 	// Create the GL native compositor
 	xrt_result_t xret = comp_gl_compositor_create(

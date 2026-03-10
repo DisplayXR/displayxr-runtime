@@ -1260,10 +1260,9 @@ int main() {
                             float vs = minDisp / minWin;
                             float screenWidthM = winW_m * vs;
                             float screenHeightM = winH_m * vs;
-                            bool sbsMode = !monoMode && scaleX <= 0.5f;
-                            float baseScreenW = sbsMode ? screenWidthM / 2.0f : screenWidthM;
-
-                            Display3DScreen screen = {baseScreenW, screenHeightM};
+                            // Kooima always uses full physical display dimensions.
+                            // The display processor (weaver) handles cropping for SBS layout.
+                            Display3DScreen screen = {screenWidthM, screenHeightM};
                             Display3DTunables tunables;
                             tunables.ipd_factor = g_input.stereo.ipdFactor;
                             tunables.parallax_factor = g_input.stereo.parallaxFactor;

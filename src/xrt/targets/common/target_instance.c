@@ -40,6 +40,9 @@
 #ifdef XRT_HAVE_LEIA_SR_D3D12
 #include "leia/leia_display_processor_d3d12.h"
 #endif
+#ifdef XRT_HAVE_LEIA_SR_GL
+#include "leia/leia_display_processor_gl.h"
+#endif
 #endif
 
 // sim_display display info for XR_EXT_display_info fallback
@@ -250,6 +253,9 @@ out:
 #ifdef XRT_HAVE_LEIA_SR_D3D12
 		xsysc->info.dp_factory_d3d12 = (void *)leia_dp_factory_d3d12;
 #endif
+#ifdef XRT_HAVE_LEIA_SR_GL
+		xsysc->info.dp_factory_gl = (void *)leia_dp_factory_gl;
+#endif
 #endif
 
 		// sim_display fallback: populate display info and factory if not already set by SR SDK
@@ -305,6 +311,9 @@ out:
 					xsysc->info.dp_factory_metal = (void *)sim_display_dp_factory_metal;
 				}
 #endif
+				if (xsysc->info.dp_factory_gl == NULL) {
+					xsysc->info.dp_factory_gl = (void *)sim_display_dp_factory_gl;
+				}
 			}
 		}
 

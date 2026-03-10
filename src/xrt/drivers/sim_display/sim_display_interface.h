@@ -23,6 +23,7 @@ struct xrt_display_processor;
 struct xrt_display_processor_d3d11;
 struct xrt_display_processor_d3d12;
 struct xrt_display_processor_metal;
+struct xrt_display_processor_gl;
 struct vk_bundle;
 
 /*!
@@ -304,6 +305,39 @@ sim_display_dp_factory_metal(void *metal_device,
                              void *command_queue,
                              void *window_handle,
                              struct xrt_display_processor_metal **out_xdp);
+
+/*!
+ * Create a simulation GL display processor.
+ *
+ * All 3 GLSL shaders (SBS, anaglyph, blend) are compiled at init
+ * for instant runtime switching via 1/2/3 keys.
+ *
+ * @param mode          Output mode (SBS, anaglyph, or blend).
+ * @param[out] out_xdp  Receives the created display processor.
+ * @return XRT_SUCCESS on success.
+ * @ingroup drv_sim_display
+ */
+xrt_result_t
+sim_display_processor_gl_create(enum sim_display_output_mode mode,
+                                 struct xrt_display_processor_gl **out_xdp);
+
+/*!
+ * Factory function for creating a sim_display GL display processor.
+ *
+ * Matches the @ref xrt_dp_factory_gl_fn_t signature.
+ * Reads SIM_DISPLAY_OUTPUT env var internally to determine the initial mode.
+ *
+ * Set this as dp_factory_gl in xrt_system_compositor_info from
+ * target_instance.c when sim_display is the active driver.
+ *
+ * @param window_handle  Unused by sim_display (may be NULL).
+ * @param[out] out_xdp   Receives the created display processor.
+ * @return XRT_SUCCESS on success.
+ * @ingroup drv_sim_display
+ */
+xrt_result_t
+sim_display_dp_factory_gl(void *window_handle,
+                           struct xrt_display_processor_gl **out_xdp);
 
 /*!
  * Create the simulation display system builder.
