@@ -37,8 +37,9 @@ jobs:
           Get-ChildItem -Recurse LeiaSR-SDK-$env:SR_TAG-win64
           gh release download -R LeiaInc/SR-SDK-Windows-Releases-Internal-Public $env:SR_TAG -p SimulatedRealityVulkanBeta.lib -D LeiaSR-SDK-$env:SR_TAG-win64/lib
           gh release download -R LeiaInc/SR-SDK-Windows-Releases-Internal-Public $env:SR_TAG -p vkweaver.h -D LeiaSR-SDK-$env:SR_TAG-win64/include/sr/weaver
-          gh release download -R LeiaInc/SR-SDK-Windows-Releases-Internal-Public $env:SR_TAG -p SimulatedRealityOpenGL.lib -D LeiaSR-SDK-$env:SR_TAG-win64/lib
-          gh release download -R LeiaInc/SR-SDK-Windows-Releases-Internal-Public $env:SR_TAG -p glweaver.h -D LeiaSR-SDK-$env:SR_TAG-win64/include/sr/weaver
+          # GL weaver assets not yet available in SR SDK release - uncomment when uploaded:
+          # gh release download -R LeiaInc/SR-SDK-Windows-Releases-Internal-Public $env:SR_TAG -p SimulatedRealityOpenGL.lib -D LeiaSR-SDK-$env:SR_TAG-win64/lib
+          # gh release download -R LeiaInc/SR-SDK-Windows-Releases-Internal-Public $env:SR_TAG -p glweaver.h -D LeiaSR-SDK-$env:SR_TAG-win64/include/sr/weaver
 
       - name: Restore from cache and setup vcpkg executable and data files.
         uses: lukka/run-vcpkg@v11
