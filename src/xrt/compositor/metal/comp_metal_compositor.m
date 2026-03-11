@@ -347,6 +347,31 @@ metal_format_bytes_per_pixel(MTLPixelFormat format)
  *
  */
 
+static uint32_t
+metal_format_to_iosurface_fourcc(MTLPixelFormat format)
+{
+	switch (format) {
+	case MTLPixelFormatBGRA8Unorm:
+	case MTLPixelFormatBGRA8Unorm_sRGB:
+		return 'BGRA';
+	case MTLPixelFormatRGBA8Unorm:
+	case MTLPixelFormatRGBA8Unorm_sRGB:
+		return 'RGBA';
+	default:
+		return 'BGRA';
+	}
+}
+
+static MTLPixelFormat
+iosurface_fourcc_to_metal_format(uint32_t fourcc)
+{
+	switch (fourcc) {
+	case 'BGRA': return MTLPixelFormatBGRA8Unorm;
+	case 'RGBA': return MTLPixelFormatRGBA8Unorm;
+	default:     return MTLPixelFormatBGRA8Unorm;
+	}
+}
+
 static bool
 compile_shaders(struct comp_metal_compositor *c)
 {
@@ -425,7 +450,7 @@ compile_shaders(struct comp_metal_compositor *c)
 		MTLRenderPipelineDescriptor *proj_desc = [[MTLRenderPipelineDescriptor alloc] init];
 		proj_desc.vertexFunction = proj_vs;
 		proj_desc.fragmentFunction = proj_fs;
-		proj_desc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+		proj_desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
 		proj_desc.colorAttachments[0].blendingEnabled = YES;
 		proj_desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
 		proj_desc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
@@ -495,7 +520,7 @@ create_stereo_texture(struct comp_metal_compositor *c, uint32_t view_width, uint
 {
 	// SBS stereo texture: 2 * view_width × view_height
 	MTLTextureDescriptor *desc = [MTLTextureDescriptor
-	    texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+	    texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
 	                                width:view_width * 2
 	                               height:view_height
 	                            mipmapped:NO];
@@ -825,6 +850,7 @@ metal_compositor_create_swapchain(struct xrt_compositor *xc,
 			(id)kIOSurfaceWidth: @(info->width),
 			(id)kIOSurfaceHeight: @(info->height),
 			(id)kIOSurfaceBytesPerElement: @(bpp),
+			(id)kIOSurfacePixelFormat: @(metal_format_to_iosurface_fourcc(format)),
 		};
 		IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)props);
 		if (surface == NULL) {
@@ -1378,7 +1404,7 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		    (__bridge void *)c->stereo_texture,
 		    c->view_width,
 		    c->view_height,
-		    (uint32_t)MTLPixelFormatRGBA8Unorm,
+		    (uint32_t)MTLPixelFormatBGRA8Unorm,
 		    (__bridge void *)output_texture,
 		    (uint32_t)output_texture.width,
 		    (uint32_t)output_texture.height);
@@ -1692,7 +1718,10 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 		size_t iosW = IOSurfaceGetWidth(surface);
 		size_t iosH = IOSurfaceGetHeight(surface);
 
-		MTLTextureDescriptor *ioDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+		uint32_t iosFourCC = IOSurfaceGetPixelFormat(surface);
+		MTLPixelFormat iosFormat = iosurface_fourcc_to_metal_format(iosFourCC);
+
+		MTLTextureDescriptor *ioDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:iosFormat
 		                                                                                  width:iosW
 		                                                                                 height:iosH
 		                                                                              mipmapped:NO];
