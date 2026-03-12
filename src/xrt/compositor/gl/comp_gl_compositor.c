@@ -833,7 +833,7 @@ gl_compositor_update_hud(struct comp_gl_compositor *c, float dt)
 	    "%s\n"
 	    "\n"
 	    "Output: %s  (1/2/3)\n"
-	    "TAB=HUD  V=2D/3D  P=Cam/Disp  ESC=Quit",
+	    "TAB=HUD  V=Mode  P=Cam/Disp  ESC=Quit",
 	    dev_name,
 	    fps, c->smoothed_frame_time_ms,
 	    c->view_width, c->view_height,

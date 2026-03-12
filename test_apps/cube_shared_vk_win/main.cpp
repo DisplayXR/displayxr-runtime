@@ -1047,7 +1047,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     LOG_INFO("");
     LOG_INFO("=== Entering main loop ===");
     LOG_INFO("Shared texture mode: VK native compositor renders to D3D11 shared texture, app blits to window");
-    LOG_INFO("Controls: WASD=Fly, Mouse=Look, Space=Reset, V=2D/3D, TAB=HUD, F11=Fullscreen, ESC=Quit");
+    LOG_INFO("Controls: WASD=Fly, Mouse=Look, Space=Reset, V=Mode, TAB=HUD, F11=Fullscreen, ESC=Quit");
 
     PerformanceStats perfStats = {};
     perfStats.lastTime = std::chrono::high_resolution_clock::now();

@@ -55,7 +55,7 @@ std::wstring FormatDisplayInfo(float widthM, float heightM, float nomX, float no
 std::wstring FormatEyeTrackingInfo(float lx, float ly, float lz, float rx, float ry, float rz,
     bool active, bool isTracking, uint32_t activeMode, uint32_t supportedModes);
 std::wstring FormatParallaxInfo(bool parallaxEnabled, float eyePosX, float eyePosY);
-std::wstring FormatOutputMode(int outputMode, bool simDisplayAvailable, const char* modeName = nullptr, uint32_t modeCount = 0);
+std::wstring FormatMode(int outputMode, bool simDisplayAvailable, const char* modeName = nullptr, uint32_t modeCount = 0, bool display3D = true);
 std::wstring FormatCameraInfo(float cameraPosX, float cameraPosY, float cameraPosZ,
     float forwardX, float forwardY, float forwardZ, bool cameraMode = false);
 std::wstring FormatStereoParams(float ipdFactor, float parallaxFactor,

@@ -660,7 +660,7 @@ u_hud_update(struct u_hud *hud, const struct u_hud_data *data)
 	y += s * 3;
 
 	// === Key hints (dimmed) ===
-	draw_string_aa(hud, x, y, "TAB=HUD  V=2D/3D  P=Cam/Disp  ESC=Quit", COLOR_DIM);
+	draw_string_aa(hud, x, y, "TAB=HUD  V=Mode  P=Cam/Disp  ESC=Quit", COLOR_DIM);
 
 	hud->dirty = true;
 	return true;

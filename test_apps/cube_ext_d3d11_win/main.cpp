@@ -805,7 +805,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     LOG_INFO("=== Entering main loop ===");
     LOG_INFO("XR rendering happens in the application window (XR_EXT_win32_window_binding)");
     LOG_INFO("Single-threaded: message pump + render on the main thread (WM_PAINT during drag/resize)");
-    LOG_INFO("Controls: WASD=Fly, QE=Up/Down, Mouse=Look, Space/DblClick=Reset, P=Parallax, V=2D/3D, TAB=HUD, F11=Fullscreen, ESC=Quit");
+    LOG_INFO("Controls: WASD=Fly, QE=Up/Down, Mouse=Look, Space/DblClick=Reset, P=Parallax, V=Mode, TAB=HUD, F11=Fullscreen, ESC=Quit");
     LOG_INFO("");
 
     PerformanceStats perfStats = {};

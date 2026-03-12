@@ -94,7 +94,7 @@ Yaw: 0.0 deg  Pitch: 0.0 deg  Zoom: 1.00x
 Track: Active
 
 WASD/QE=Move  Drag=Look  Scroll=Zoom
-Space=Reset  V=2D/3D  Tab=HUD  ESC=Quit
+Space=Reset  V=Mode  Tab=HUD  ESC=Quit
 ```
 
 **Key fields:**

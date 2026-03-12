@@ -244,20 +244,20 @@ std::wstring FormatParallaxInfo(bool parallaxEnabled, float eyePosX, float eyePo
     return oss.str();
 }
 
-std::wstring FormatOutputMode(int outputMode, bool simDisplayAvailable, const char* modeName, uint32_t modeCount) {
+std::wstring FormatMode(int outputMode, bool simDisplayAvailable, const char* modeName, uint32_t modeCount, bool display3D) {
     if (!simDisplayAvailable) {
-        return L"Output: Weaved";
+        return L"Mode: Weaved";
     }
     std::wostringstream oss;
     if (modeName != nullptr && modeName[0] != '\0') {
         std::wstring wname(modeName, modeName + strlen(modeName));
-        oss << L"Output: " << wname;
+        oss << L"Mode: " << wname;
     } else {
         const wchar_t* modeNames[] = {L"SBS", L"Anaglyph", L"Blend"};
         const wchar_t* name = (outputMode >= 0 && outputMode <= 2) ? modeNames[outputMode] : L"?";
-        oss << L"Output: " << name;
+        oss << L"Mode: " << name;
     }
-    // Show key hint only if more than 1 mode available
+    oss << L" (" << (display3D ? L"3D" : L"2D") << L")";
     if (modeCount > 1) {
         oss << L" [1-" << modeCount << L"]";
     }
@@ -294,7 +294,7 @@ std::wstring FormatHelpText(bool simDisplayAvailable, bool cameraMode, uint32_t 
     std::wostringstream oss;
     oss << L"WASD/QE=Move  Drag=Look  Space=Reset\n"
         << L"Scroll=Scale  Shift+Scroll=IPD+Parallax\n"
-        << L"V=2D/3D  T=EyeMode";
+        << L"V=Mode  T=EyeMode";
     if (simDisplayAvailable && modeCount > 1) {
         oss << L"  1-" << modeCount << L"=Output";
     }

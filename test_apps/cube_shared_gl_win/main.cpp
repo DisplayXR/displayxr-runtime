@@ -995,7 +995,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     LOG_INFO("");
     LOG_INFO("=== Entering main loop ===");
     LOG_INFO("Shared texture mode: GL rendering, runtime composites via WGL/DX interop, app blits D3D11 to window");
-    LOG_INFO("Controls: WASD=Fly, Mouse=Look, Space=Reset, V=2D/3D, TAB=HUD, F11=Fullscreen, ESC=Quit");
+    LOG_INFO("Controls: WASD=Fly, Mouse=Look, Space=Reset, V=Mode, TAB=HUD, F11=Fullscreen, ESC=Quit");
 
     // Release GL context from main thread before handing to render thread
     wglMakeCurrent(nullptr, nullptr);
