@@ -233,6 +233,29 @@ oxr_session_get_predicted_eye_positions(struct oxr_session *sess, struct xrt_eye
 	}
 #endif
 
+#ifdef XRT_HAVE_GL_NATIVE_COMPOSITOR
+	// GL native compositor path
+	if (sess->is_gl_native_compositor) {
+		struct xrt_vec3 left_eye, right_eye;
+		bool got_positions =
+		    comp_gl_compositor_get_predicted_eye_positions(&sess->xcn->base, &left_eye, &right_eye);
+
+		if (got_positions) {
+			out_eye_pair->left = (struct xrt_eye_position){left_eye.x, left_eye.y, left_eye.z};
+			out_eye_pair->right = (struct xrt_eye_position){right_eye.x, right_eye.y, right_eye.z};
+			out_eye_pair->timestamp_ns = os_monotonic_get_ns();
+			out_eye_pair->valid = true;
+			float dx = right_eye.x - left_eye.x;
+			float dy = right_eye.y - left_eye.y;
+			float dz = right_eye.z - left_eye.z;
+			float dist_sq = dx * dx + dy * dy + dz * dz;
+			out_eye_pair->is_tracking = (dist_sq > 1e-6f);
+			return true;
+		}
+		return false;
+	}
+#endif
+
 	// Multi-compositor path (Vulkan) — only valid for in-process mode.
 	// In IPC mode, sess->xcn is an IPC proxy, not a multi_compositor.
 	// xmcc is only non-NULL for in-process multi_system_compositor.

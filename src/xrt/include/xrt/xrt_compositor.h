@@ -2457,6 +2457,12 @@ struct xrt_system_compositor_info
 	//! Native display panel height in pixels. 0 if unknown.
 	uint32_t display_pixel_height;
 
+	//! Worst-case atlas width across all rendering modes. 0 if unknown.
+	uint32_t atlas_width_pixels;
+
+	//! Worst-case atlas height across all rendering modes. 0 if unknown.
+	uint32_t atlas_height_pixels;
+
 	//! Display left edge in OS screen coordinates. 0 if unknown.
 	int32_t display_screen_left;
 

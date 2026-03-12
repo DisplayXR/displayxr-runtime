@@ -20,6 +20,7 @@
 
 #include "util/u_debug.h"
 #include "util/u_system.h"
+#include "util/u_tiling.h"
 #include "util/u_trace_marker.h"
 #include "util/u_system_helpers.h"
 
@@ -246,6 +247,19 @@ out:
 			}
 		}
 
+		// Compute tiling for all modes (Leia SR path)
+		if (xsysc->info.display_pixel_width > 0 && xsysc->info.display_pixel_height > 0) {
+			for (uint32_t mi = 0; mi < head->rendering_mode_count; mi++) {
+				u_tiling_compute_mode(&head->rendering_modes[mi],
+				                      xsysc->info.display_pixel_width,
+				                      xsysc->info.display_pixel_height);
+			}
+			u_tiling_compute_system_atlas(head->rendering_modes,
+			                              head->rendering_mode_count,
+			                              &xsysc->info.atlas_width_pixels,
+			                              &xsysc->info.atlas_height_pixels);
+		}
+
 		// Set Leia display processor factories for vendor-agnostic compositor use.
 #ifdef XRT_HAVE_LEIA_SR_VULKAN
 		xsysc->info.dp_factory_vk = (void *)leia_dp_factory_vk;
@@ -269,8 +283,21 @@ out:
 				xsysc->info.nominal_viewer_x_m = 0.0f;
 				xsysc->info.nominal_viewer_y_m = sd_info.nominal_y_m;
 				xsysc->info.nominal_viewer_z_m = sd_info.nominal_z_m;
-				// Worst-case (smallest) scale across all modes so swapchains
-				// created at init work for every mode without reallocation.
+				xsysc->info.display_pixel_width = sd_info.display_pixel_width;
+				xsysc->info.display_pixel_height = sd_info.display_pixel_height;
+
+				// Compute tiling for all modes and derive system atlas
+				for (uint32_t mi = 0; mi < head->rendering_mode_count; mi++) {
+					u_tiling_compute_mode(&head->rendering_modes[mi],
+					                      sd_info.display_pixel_width,
+					                      sd_info.display_pixel_height);
+				}
+				u_tiling_compute_system_atlas(head->rendering_modes,
+				                              head->rendering_mode_count,
+				                              &xsysc->info.atlas_width_pixels,
+				                              &xsysc->info.atlas_height_pixels);
+
+				// Backward compat: recommended_view_scale from worst-case mode
 				float min_scale_x = 1.0f, min_scale_y = 1.0f;
 				for (uint32_t mi = 0; mi < head->rendering_mode_count; mi++) {
 					if (head->rendering_modes[mi].view_scale_x > 0.0f &&
@@ -282,17 +309,18 @@ out:
 				}
 				xsysc->info.recommended_view_scale_x = min_scale_x;
 				xsysc->info.recommended_view_scale_y = min_scale_y;
-				xsysc->info.display_pixel_width = sd_info.display_pixel_width;
-				xsysc->info.display_pixel_height = sd_info.display_pixel_height;
+
 				// Sim display: raw eye tracking only (simulated device, always "tracking")
 				xsysc->info.supported_eye_tracking_modes = 2; // RAW_BIT
 				xsysc->info.default_eye_tracking_mode = 1;    // RAW
 				U_LOG_W("XR_EXT_display_info (sim_display): display=%.3fx%.3f m, "
-				        "nominal=(0, %.3f, %.3f) m, scale=%.2fx%.2f (worst-case), pixels=%ux%u",
+				        "nominal=(0, %.3f, %.3f) m, scale=%.2fx%.2f, atlas=%ux%u, pixels=%ux%u",
 				        sd_info.display_width_m, sd_info.display_height_m,
 				        sd_info.nominal_y_m, sd_info.nominal_z_m,
 				        xsysc->info.recommended_view_scale_x,
 				        xsysc->info.recommended_view_scale_y,
+				        xsysc->info.atlas_width_pixels,
+				        xsysc->info.atlas_height_pixels,
 				        sd_info.display_pixel_width, sd_info.display_pixel_height);
 
 				// Set sim_display factories (only if Leia SR didn't already set them)

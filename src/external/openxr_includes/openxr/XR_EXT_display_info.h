@@ -22,7 +22,7 @@ extern "C" {
 #endif
 
 #define XR_EXT_display_info 1
-#define XR_EXT_display_info_SPEC_VERSION 10
+#define XR_EXT_display_info_SPEC_VERSION 12
 #define XR_EXT_DISPLAY_INFO_EXTENSION_NAME "XR_EXT_display_info"
 
 // Reuse the type value from the deleted XR_EXT_dynamic_render_resolution
@@ -235,6 +235,10 @@ typedef struct XrDisplayRenderingModeInfoEXT {
     float                       viewScaleX; //!< Per-view horizontal scale (vendor-provided)
     float                       viewScaleY; //!< Per-view vertical scale (vendor-provided)
     XrBool32                    hardwareDisplay3D;  //!< Whether display hardware is in 3D mode
+    uint32_t                    tileColumns;     //!< Tile columns in atlas layout (v12)
+    uint32_t                    tileRows;        //!< Tile rows in atlas layout (v12)
+    uint32_t                    viewWidthPixels; //!< Per-view width in pixels (v12)
+    uint32_t                    viewHeightPixels;//!< Per-view height in pixels (v12)
 } XrDisplayRenderingModeInfoEXT;
 
 /*!

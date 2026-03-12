@@ -233,12 +233,21 @@ struct xrt_binding_profile
  */
 struct xrt_rendering_mode
 {
+	// --- Vendor-provided (driver sets these) ---
 	uint32_t mode_index;                    //!< Vendor-defined mode index
 	char mode_name[XRT_DEVICE_NAME_LEN];    //!< Human-readable mode name
 	uint32_t view_count;                    //!< 1=mono, 2=stereo, 4=quad, etc.
 	float view_scale_x;                     //!< Per-view horizontal scale (vendor-provided)
 	float view_scale_y;                     //!< Per-view vertical scale (vendor-provided)
-	bool hardware_display_3d;                        //!< Whether display hardware is in 3D mode
+	bool hardware_display_3d;               //!< Whether display hardware is in 3D mode
+
+	// --- Runtime-computed (u_tiling_compute_mode fills these) ---
+	uint32_t tile_columns;                  //!< Tile columns in atlas layout
+	uint32_t tile_rows;                     //!< Tile rows in atlas layout
+	uint32_t view_width_pixels;             //!< Per-view width in pixels
+	uint32_t view_height_pixels;            //!< Per-view height in pixels
+	uint32_t atlas_width_pixels;            //!< Atlas width for this mode
+	uint32_t atlas_height_pixels;           //!< Atlas height for this mode
 };
 
 /*!

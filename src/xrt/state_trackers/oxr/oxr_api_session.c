@@ -1422,6 +1422,10 @@ oxr_xrEnumerateDisplayRenderingModesEXT(XrSession session,
 		modes[i].viewScaleX = head->rendering_modes[i].view_scale_x;
 		modes[i].viewScaleY = head->rendering_modes[i].view_scale_y;
 		modes[i].hardwareDisplay3D = head->rendering_modes[i].hardware_display_3d ? XR_TRUE : XR_FALSE;
+		modes[i].tileColumns = head->rendering_modes[i].tile_columns;
+		modes[i].tileRows = head->rendering_modes[i].tile_rows;
+		modes[i].viewWidthPixels = head->rendering_modes[i].view_width_pixels;
+		modes[i].viewHeightPixels = head->rendering_modes[i].view_height_pixels;
 	}
 
 	return XR_SUCCESS;
