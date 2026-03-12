@@ -230,7 +230,7 @@ static bool CreateBlitResources(ID3D11Device* device) {
 
 // Blit shared texture to back buffer with aspect-ratio letterboxing
 static void BlitSharedTextureToBackBuffer(D3D11Renderer& renderer, ID3D11RenderTargetView* backBufferRTV,
-                                           uint32_t winW, uint32_t winH) {
+                                           uint32_t winW, uint32_t winH, XrSessionManager& xr) {
     if (!g_sharedSRV) return;
 
     renderer.context->OMSetRenderTargets(1, &backBufferRTV, nullptr);
@@ -255,6 +255,14 @@ static void BlitSharedTextureToBackBuffer(D3D11Renderer& renderer, ID3D11RenderT
     }
     vp.MaxDepth = 1.0f;
     renderer.context->RSSetViewports(1, &vp);
+
+    // Tell the runtime where the shared texture is displayed within our window
+    // so the SR weaver hidden window aligns correctly for interlacing
+    if (xr.pfnSetSharedTextureOutputRectEXT && xr.session != XR_NULL_HANDLE) {
+        xr.pfnSetSharedTextureOutputRectEXT(xr.session,
+            (int32_t)vp.TopLeftX, (int32_t)vp.TopLeftY,
+            (uint32_t)vp.Width, (uint32_t)vp.Height);
+    }
 
     renderer.context->VSSetShader(g_blitVS.Get(), nullptr, 0);
     renderer.context->PSSetShader(g_blitPS.Get(), nullptr, 0);
@@ -661,7 +669,7 @@ static void RenderOneFrame(RenderState& rs) {
                 float clearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
                 renderer.context->ClearRenderTargetView(rs.appBackBufferRTV.Get(), clearColor);
                 BlitSharedTextureToBackBuffer(renderer, rs.appBackBufferRTV.Get(),
-                                               g_windowWidth, g_windowHeight);
+                                               g_windowWidth, g_windowHeight, xr);
                 rs.appSwapchain->Present(1, 0);
             }
         }

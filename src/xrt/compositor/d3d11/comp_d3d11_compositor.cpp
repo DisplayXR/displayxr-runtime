@@ -123,6 +123,15 @@ struct comp_d3d11_compositor
 	//! True if shared texture mode is active.
 	bool has_shared_texture;
 
+	//! Output rect within app's client area where shared texture is displayed.
+	//! When has_output_rect is true, the hidden weaver window is positioned
+	//! to match this sub-rect instead of the full client rect.
+	bool has_output_rect;
+	int32_t output_rect_x;
+	int32_t output_rect_y;
+	uint32_t output_rect_w;
+	uint32_t output_rect_h;
+
 	//! Generic D3D11 display processor (vendor-agnostic weaving).
 	struct xrt_display_processor_d3d11 *display_processor;
 
@@ -862,16 +871,28 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 
 	// Offscreen shared-texture-only path: no DXGI target
 	if (c->target == nullptr) {
-		// Sync hidden weaver window position to app's client rect
+		// Sync hidden weaver window position to where the shared texture
+		// will be displayed on screen. If the app set an output rect
+		// (sub-rect within its window), use that; otherwise use the
+		// full client rect.
 		if (c->app_hwnd != nullptr && c->own_window != nullptr) {
-			RECT cr;
-			if (GetClientRect(c->app_hwnd, &cr)) {
-				POINT tl = {cr.left, cr.top};
-				ClientToScreen(c->app_hwnd, &tl);
+			POINT origin = {0, 0};
+			ClientToScreen(c->app_hwnd, &origin);
+
+			if (c->has_output_rect) {
 				comp_d3d11_window_set_rect(c->own_window,
-				    tl.x, tl.y,
-				    (uint32_t)(cr.right - cr.left),
-				    (uint32_t)(cr.bottom - cr.top));
+				    origin.x + c->output_rect_x,
+				    origin.y + c->output_rect_y,
+				    c->output_rect_w,
+				    c->output_rect_h);
+			} else {
+				RECT cr;
+				if (GetClientRect(c->app_hwnd, &cr)) {
+					comp_d3d11_window_set_rect(c->own_window,
+					    origin.x, origin.y,
+					    (uint32_t)(cr.right - cr.left),
+					    (uint32_t)(cr.bottom - cr.top));
+				}
 			}
 		}
 
@@ -1131,6 +1152,7 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	c->own_window = nullptr;
 	c->owns_window = false;
 	c->app_hwnd = nullptr;
+	c->has_output_rect = false;
 	c->hardware_display_3d = true;
 	c->last_3d_mode_index = 1;
 
@@ -1511,6 +1533,19 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	            c->settings.preferred.width, c->settings.preferred.height);
 
 	return XRT_SUCCESS;
+}
+
+extern "C" void
+comp_d3d11_compositor_set_output_rect(struct xrt_compositor *xc,
+                                       int32_t x, int32_t y,
+                                       uint32_t w, uint32_t h)
+{
+	struct comp_d3d11_compositor *c = d3d11_comp(xc);
+	c->output_rect_x = x;
+	c->output_rect_y = y;
+	c->output_rect_w = w;
+	c->output_rect_h = h;
+	c->has_output_rect = true;
 }
 
 extern "C" bool

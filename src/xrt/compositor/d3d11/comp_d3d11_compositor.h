@@ -49,6 +49,27 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
                              struct xrt_compositor_native **out_xc);
 
 /*!
+ * Set the output rect within the app's client area where the shared
+ * texture will be displayed. The runtime positions the hidden SR weaver
+ * window at this sub-rect for correct interlacing alignment.
+ *
+ * Only meaningful in shared-texture mode with an app HWND.
+ * Call when the blit viewport changes (e.g. on window resize).
+ *
+ * @param xc The compositor.
+ * @param x  Left edge in client-area pixels.
+ * @param y  Top edge in client-area pixels.
+ * @param w  Width in pixels.
+ * @param h  Height in pixels.
+ *
+ * @ingroup comp_d3d11
+ */
+void
+comp_d3d11_compositor_set_output_rect(struct xrt_compositor *xc,
+                                       int32_t x, int32_t y,
+                                       uint32_t w, uint32_t h);
+
+/*!
  * Get the predicted eye positions from the display processor.
  *
  * @param xc The compositor.

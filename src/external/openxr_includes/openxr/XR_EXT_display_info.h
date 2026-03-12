@@ -299,6 +299,39 @@ typedef struct XrEventDataHardwareDisplayStateChangedEXT {
     XrBool32                    hardwareDisplay3D;
 } XrEventDataHardwareDisplayStateChangedEXT;
 
+// ---- v11: Shared Texture Output Rect ----
+
+/*!
+ * @brief Set the sub-rect within the app's window where the shared texture
+ *        will be displayed.
+ *
+ * In shared-texture mode, the runtime needs to know where the weaved output
+ * will appear on screen for correct interlacing alignment. The app calls this
+ * whenever its blit viewport changes (e.g. on window resize).
+ *
+ * Coordinates are in client-area pixels of the app's window (the HWND passed
+ * alongside the shared texture handle at session creation).
+ *
+ * @param session The session.
+ * @param x       Left edge of the output rect in client-area pixels.
+ * @param y       Top edge of the output rect in client-area pixels.
+ * @param width   Width of the output rect in pixels.
+ * @param height  Height of the output rect in pixels.
+ *
+ * @return XR_SUCCESS on success.
+ */
+typedef XrResult (XRAPI_PTR *PFN_xrSetSharedTextureOutputRectEXT)(
+    XrSession session, int32_t x, int32_t y, uint32_t width, uint32_t height);
+
+#ifndef XR_NO_PROTOTYPES
+XRAPI_ATTR XrResult XRAPI_CALL xrSetSharedTextureOutputRectEXT(
+    XrSession                           session,
+    int32_t                             x,
+    int32_t                             y,
+    uint32_t                            width,
+    uint32_t                            height);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

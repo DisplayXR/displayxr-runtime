@@ -28,6 +28,10 @@
 #include "oxr_handle.h"
 #include "oxr_chain.h"
 
+#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
+#include "d3d11/comp_d3d11_compositor.h"
+#endif
+
 
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrCreateSession(XrInstance instance, const XrSessionCreateInfo *createInfo, XrSession *out_session)
@@ -1421,6 +1425,28 @@ oxr_xrEnumerateDisplayRenderingModesEXT(XrSession session,
 	}
 
 	return XR_SUCCESS;
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSetSharedTextureOutputRectEXT(XrSession session,
+                                     int32_t x, int32_t y,
+                                     uint32_t width, uint32_t height)
+{
+	OXR_TRACE_MARKER();
+
+	struct oxr_session *sess;
+	struct oxr_logger log;
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrSetSharedTextureOutputRectEXT");
+
+#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
+	if (sess->is_d3d11_native_compositor && sess->xcn != NULL) {
+		comp_d3d11_compositor_set_output_rect(&sess->xcn->base, x, y, width, height);
+		return XR_SUCCESS;
+	}
+#endif
+
+	return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
+	                 "Output rect not supported for this compositor");
 }
 
 #endif // OXR_HAVE_EXT_display_info

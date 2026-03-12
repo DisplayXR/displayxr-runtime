@@ -790,6 +790,12 @@ oxr_xrEnumerateDisplayRenderingModesEXT(XrSession session,
                                         uint32_t modeCapacityInput,
                                         uint32_t *modeCountOutput,
                                         XrDisplayRenderingModeInfoEXT *modes);
+
+//! OpenXR API function @ep{xrSetSharedTextureOutputRectEXT}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSetSharedTextureOutputRectEXT(XrSession session,
+                                     int32_t x, int32_t y,
+                                     uint32_t width, uint32_t height);
 #endif
 
 /*!
