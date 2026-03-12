@@ -1089,52 +1089,32 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 		U_LOG_W("No D3D12 display processor factory provided");
 	}
 
-	// If display processor available, query display pixel info for view dimensions.
-	// Use display-native resolution — the weaver reads the stereo texture at
-	// full resolution and handles output sizing to its own swapchain internally.
+	// If display processor is available, query display pixel info to compute
+	// optimal view dimensions (scaled to window size, matching D3D11 model).
+	// Do NOT resize the app's window — _ext apps own their window.
 	if (c->display_processor != nullptr) {
 		uint32_t disp_px_w = 0, disp_px_h = 0;
 		int32_t disp_left = 0, disp_top = 0;
 		if (xrt_display_processor_d3d12_get_display_pixel_info(
 		        c->display_processor, &disp_px_w, &disp_px_h, &disp_left, &disp_top) &&
 		    disp_px_w > 0 && disp_px_h > 0) {
-			view_width = disp_px_w / 2;
-			view_height = disp_px_h;
-			U_LOG_W("Display processor: using native resolution %ux%u per eye (display %ux%u)",
-			        view_width, view_height, disp_px_w, disp_px_h);
+			// Use half display width as base view dims
+			uint32_t base_vw = disp_px_w / 2;
+			uint32_t base_vh = disp_px_h;
 
-			// Take over app window: resize to cover the Leia display
-			// at native resolution. The SR weaver's interlacing pattern
-			// must match the physical pixel grid — a 1280x720 window
-			// on a 2240x1400 display would produce wrong interlacing.
-			if (c->hwnd != nullptr && c->target != nullptr) {
-				// Make window borderless for exact display coverage
-				LONG style = GetWindowLong(c->hwnd, GWL_STYLE);
-				SetWindowLong(c->hwnd, GWL_STYLE,
-				              style & ~(WS_CAPTION | WS_THICKFRAME | WS_BORDER));
+			U_LOG_W("Display pixel info: %ux%u, base view dims: %ux%u per eye",
+			        disp_px_w, disp_px_h, base_vw, base_vh);
 
-				// Position and resize to cover the Leia display exactly
-				SetWindowPos(c->hwnd, HWND_TOP,
-				             (int)disp_left, (int)disp_top,
-				             (int)disp_px_w, (int)disp_px_h,
-				             SWP_FRAMECHANGED | SWP_SHOWWINDOW);
-
-				// Resize swapchain to match native display resolution
-				gpu_wait_idle(c);
-				xrt_result_t resize_ret = comp_d3d12_target_resize(
-				    c->target, disp_px_w, disp_px_h);
-				if (resize_ret == XRT_SUCCESS) {
-					c->settings.preferred.width = disp_px_w;
-					c->settings.preferred.height = disp_px_h;
-					U_LOG_W("Resized window+swapchain to display native: "
-					        "%ux%u at (%d,%d)",
-					        disp_px_w, disp_px_h,
-					        (int)disp_left, (int)disp_top);
-				} else {
-					U_LOG_E("Failed to resize swapchain to %ux%u",
-					        disp_px_w, disp_px_h);
-				}
+			// Scale by window/display pixel ratio (same as D3D11 resize path)
+			float ratio = fminf(
+			    (float)c->settings.preferred.width / (float)disp_px_w,
+			    (float)c->settings.preferred.height / (float)disp_px_h);
+			if (ratio > 1.0f) {
+				ratio = 1.0f;
 			}
+			view_width = (uint32_t)((float)base_vw * ratio);
+			view_height = (uint32_t)((float)base_vh * ratio);
+			U_LOG_W("Scaled to window ratio %.3f: %ux%u per eye", ratio, view_width, view_height);
 		}
 	}
 
