@@ -657,34 +657,55 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		// Bind back buffer as render target
 		c->cmd_list->OMSetRenderTargets(1, &rtv_handle, FALSE, nullptr);
 
-		// DEBUG: Clear to magenta to verify RT binding + present pipeline.
-		// If screen shows magenta, swapchain works and weaver is the issue.
-		// If still black, the swapchain/present is broken.
-		float debug_clear[4] = {1.0f, 0.0f, 1.0f, 1.0f};
-		c->cmd_list->ClearRenderTargetView(rtv_handle, debug_clear, 0, nullptr);
-
 		uint32_t view_width, view_height;
 		comp_d3d12_renderer_get_view_dimensions(c->renderer, &view_width, &view_height);
-		void *stereo_resource = comp_d3d12_renderer_get_stereo_resource(c->renderer);
+		ID3D12Resource *stereo_resource = static_cast<ID3D12Resource *>(
+		    comp_d3d12_renderer_get_stereo_resource(c->renderer));
 
 		if (diag_log) {
 			U_LOG_W("D3D12 dp path: stereo=%p, view=%ux%u, target=%ux%u, bb=%u, "
 			        "back_buffer=%p, rtv=0x%llx",
-			        stereo_resource, view_width, view_height,
+			        (void *)stereo_resource, view_width, view_height,
 			        tgt_width, tgt_height, bb_index,
 			        (void *)back_buffer,
 			        (unsigned long long)rtv_handle.ptr);
 		}
 
-		xrt_display_processor_d3d12_process_stereo(
-		    c->display_processor, c->cmd_list, stereo_resource, 0, 0,
-		    view_width, view_height, DXGI_FORMAT_R8G8B8A8_UNORM,
-		    tgt_width, tgt_height);
+		// DEBUG: Skip weaver — copy stereo texture directly to back buffer
+		// to verify the renderer produces visible content.
+		// If we see SBS stereo on screen, the renderer works and issue is
+		// purely in the SR weaver.
+		if (stereo_resource != nullptr) {
+			// Transition: stereo PIXEL_SHADER_RESOURCE → COPY_SOURCE
+			D3D12_RESOURCE_BARRIER copy_barriers[2] = {};
+			copy_barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+			copy_barriers[0].Transition.pResource = stereo_resource;
+			copy_barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+			copy_barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+			copy_barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 
-		// Transition back buffer: RENDER_TARGET → PRESENT
-		barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-		barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-		c->cmd_list->ResourceBarrier(1, &barrier);
+			// Transition: back buffer RENDER_TARGET → COPY_DEST
+			copy_barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+			copy_barriers[1].Transition.pResource = back_buffer;
+			copy_barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+			copy_barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+			copy_barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+			c->cmd_list->ResourceBarrier(2, copy_barriers);
+			c->cmd_list->CopyResource(back_buffer, stereo_resource);
+
+			// Transition back: stereo → PIXEL_SHADER_RESOURCE, back buffer → PRESENT
+			copy_barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+			copy_barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+			copy_barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+			copy_barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+			c->cmd_list->ResourceBarrier(2, copy_barriers);
+		} else {
+			// No stereo resource — just transition back buffer to PRESENT
+			barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+			barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+			c->cmd_list->ResourceBarrier(1, &barrier);
+		}
 
 		// Close and execute
 		c->cmd_list->Close();
