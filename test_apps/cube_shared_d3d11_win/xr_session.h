@@ -5,7 +5,8 @@
  * @brief  OpenXR session management with shared D3D11 texture
  *
  * This version uses XR_EXT_win32_window_binding with sharedTextureHandle
- * (windowHandle=NULL) for offscreen shared texture compositing.
+ * for offscreen shared texture compositing. The app's HWND is passed
+ * for weaver position tracking (interlacing alignment).
  */
 
 #pragma once
@@ -20,5 +21,5 @@ bool InitializeOpenXR(XrSessionManager& xr);
 // Get the D3D11 graphics requirements (adapter LUID)
 bool GetD3D11GraphicsRequirements(XrSessionManager& xr, LUID* outAdapterLuid);
 
-// Create session with D3D11 device and shared texture handle (offscreen mode)
-bool CreateSession(XrSessionManager& xr, ID3D11Device* d3d11Device, HANDLE sharedTextureHandle);
+// Create session with D3D11 device, shared texture handle, and app window (for position tracking)
+bool CreateSession(XrSessionManager& xr, ID3D11Device* d3d11Device, HANDLE sharedTextureHandle, HWND appHwnd);

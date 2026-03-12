@@ -174,23 +174,24 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     return true;
 }
 
-bool CreateSession(XrSessionManager& xr, ID3D11Device* d3d11Device, HANDLE sharedTextureHandle) {
+bool CreateSession(XrSessionManager& xr, ID3D11Device* d3d11Device, HANDLE sharedTextureHandle, HWND appHwnd) {
     LOG_INFO("Creating OpenXR session with shared texture handle...");
     LOG_INFO("  D3D11 Device: 0x%p", d3d11Device);
     LOG_INFO("  Shared texture handle: 0x%p", sharedTextureHandle);
+    LOG_INFO("  App HWND (position tracking): 0x%p", (void*)appHwnd);
 
     // D3D11 binding
     XrGraphicsBindingD3D11KHR d3d11Binding = {XR_TYPE_GRAPHICS_BINDING_D3D11_KHR};
     d3d11Binding.device = d3d11Device;
 
-    // Win32 window binding with shared texture (windowHandle=NULL for offscreen)
+    // Win32 window binding with shared texture + app HWND for position tracking
     XrWin32WindowBindingCreateInfoEXT sessionTarget = {XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT};
-    sessionTarget.windowHandle = NULL;
+    sessionTarget.windowHandle = (void*)appHwnd;
     sessionTarget.sharedTextureHandle = (void*)sharedTextureHandle;
 
     // Chain: sessionInfo -> d3d11Binding -> sessionTarget
     d3d11Binding.next = &sessionTarget;
-    LOG_INFO("Using XR_EXT_win32_window_binding with shared texture (offscreen mode)");
+    LOG_INFO("Using XR_EXT_win32_window_binding with shared texture + position tracking");
 
     XrSessionCreateInfo sessionInfo = {XR_TYPE_SESSION_CREATE_INFO};
     sessionInfo.next = &d3d11Binding;

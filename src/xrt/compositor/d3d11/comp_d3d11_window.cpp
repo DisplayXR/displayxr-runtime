@@ -687,6 +687,22 @@ comp_d3d11_window_is_in_size_move(struct comp_d3d11_window *window)
 }
 
 extern "C" void
+comp_d3d11_window_set_rect(struct comp_d3d11_window *window,
+                           int x, int y, uint32_t w, uint32_t h)
+{
+	if (window == NULL || window->hwnd == NULL) {
+		return;
+	}
+	// SetWindowPos is thread-safe — Windows serializes it with the window
+	// thread's message pump.  For WS_POPUP (hidden) windows the client rect
+	// equals the window rect, so this directly sets the client area position.
+	SetWindowPos(window->hwnd, NULL, x, y, (int)w, (int)h,
+	             SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING);
+	InterlockedExchange(&window->current_width, (LONG)w);
+	InterlockedExchange(&window->current_height, (LONG)h);
+}
+
+extern "C" void
 comp_d3d11_window_pump_messages(struct comp_d3d11_window *window)
 {
 	// No-op: the dedicated window thread runs its own message loop.

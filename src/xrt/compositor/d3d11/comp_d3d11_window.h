@@ -145,6 +145,26 @@ void
 comp_d3d11_window_signal_paint_done(struct comp_d3d11_window *window);
 
 /*!
+ * Reposition and resize the window's client area.
+ *
+ * Used in shared-texture mode to keep the hidden weaver window aligned
+ * with the app's actual display rect on screen. The coordinates are
+ * screen-space pixels for the desired client area. For WS_POPUP windows
+ * the client rect equals the window rect, so this is a direct SetWindowPos.
+ *
+ * Thread-safe: posts to the window thread.
+ *
+ * @param window The window object
+ * @param x      Client area left in screen pixels
+ * @param y      Client area top in screen pixels
+ * @param w      Client area width in pixels
+ * @param h      Client area height in pixels
+ */
+void
+comp_d3d11_window_set_rect(struct comp_d3d11_window *window,
+                           int x, int y, uint32_t w, uint32_t h);
+
+/*!
  * No-op. The dedicated window thread handles its own messages.
  *
  * Retained for API compatibility. Callers do not need to pump messages

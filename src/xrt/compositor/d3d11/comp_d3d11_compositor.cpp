@@ -100,8 +100,13 @@ struct comp_d3d11_compositor
 	//! Compositor settings.
 	struct comp_settings settings;
 
-	//! Window handle (either from app or self-created).
+	//! Window handle for rendering (either from app or self-created).
 	HWND hwnd;
+
+	//! App's window handle for position tracking in shared-texture mode.
+	//! When non-NULL, the hidden weaver window is repositioned each frame
+	//! to match this window's client rect on screen.
+	HWND app_hwnd;
 
 	//! Self-created window (NULL if app provided window).
 	struct comp_d3d11_window *own_window;
@@ -656,6 +661,12 @@ d3d11_render_hud_overlay(struct comp_d3d11_compositor *c, bool is_mono, bool wea
 	data.frame_time_ms = c->smoothed_frame_time_ms;
 	data.mode_3d = !is_mono;
 	data.output_mode = output_mode;
+	if (c->xdev != NULL && c->xdev->hmd != NULL) {
+		uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
+		if (idx < c->xdev->rendering_mode_count) {
+			data.rendering_mode_name = c->xdev->rendering_modes[idx].mode_name;
+		}
+	}
 	data.render_width = render_w;
 	data.render_height = render_h;
 	data.window_width = win_w;
@@ -845,6 +856,19 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 
 	// Offscreen shared-texture-only path: no DXGI target
 	if (c->target == nullptr) {
+		// Sync hidden weaver window position to app's client rect
+		if (c->app_hwnd != nullptr && c->own_window != nullptr) {
+			RECT cr;
+			if (GetClientRect(c->app_hwnd, &cr)) {
+				POINT tl = {cr.left, cr.top};
+				ClientToScreen(c->app_hwnd, &tl);
+				comp_d3d11_window_set_rect(c->own_window,
+				    tl.x, tl.y,
+				    (uint32_t)(cr.right - cr.left),
+				    (uint32_t)(cr.bottom - cr.top));
+			}
+		}
+
 		// Weave/blit directly into the shared texture
 		if (!is_mono && c->display_processor != NULL && c->shared_rtv != nullptr) {
 			void *stereo_srv = comp_d3d11_renderer_get_stereo_srv(c->renderer);
@@ -1100,17 +1124,18 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	c->xdev = xdev;
 	c->own_window = nullptr;
 	c->owns_window = false;
+	c->app_hwnd = nullptr;
 
 	// Handle window: use provided HWND, create our own, or go offscreen (shared texture)
-	if (hwnd != nullptr) {
-		// App provided window via XR_EXT_win32_window_binding
-		c->hwnd = static_cast<HWND>(hwnd);
-		U_LOG_I("Using app-provided window handle: %p", hwnd);
-	} else if (shared_texture_handle != nullptr) {
-		// Shared texture mode: no visible window, but create a hidden window
-		// for the SR weaver (it needs a valid HWND for interlacing alignment).
+	if (shared_texture_handle != nullptr) {
+		// Shared texture mode: create a hidden window for SR weaver alignment.
 		// c->hwnd stays NULL so the offscreen rendering path is used.
+		// If app also provided an HWND, store it for per-frame position tracking.
 		c->hwnd = nullptr;
+		if (hwnd != nullptr) {
+			c->app_hwnd = static_cast<HWND>(hwnd);
+			U_LOG_I("Shared texture mode with app HWND for position tracking: %p", hwnd);
+		}
 		uint32_t win_w = xdev->hmd->screens[0].w_pixels;
 		uint32_t win_h = xdev->hmd->screens[0].h_pixels;
 		if (win_w == 0 || win_h == 0) {
@@ -1126,6 +1151,10 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 			U_LOG_I("Shared texture mode with hidden weaver window: %p",
 			        comp_d3d11_window_get_hwnd(c->own_window));
 		}
+	} else if (hwnd != nullptr) {
+		// App provided window via XR_EXT_win32_window_binding (ext mode)
+		c->hwnd = static_cast<HWND>(hwnd);
+		U_LOG_I("Using app-provided window handle: %p", hwnd);
 	} else {
 		// No window provided - create our own at native display resolution
 		uint32_t win_w = xdev->hmd->screens[0].w_pixels;

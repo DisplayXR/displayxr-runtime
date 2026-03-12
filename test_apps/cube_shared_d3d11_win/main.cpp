@@ -812,8 +812,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     HudRenderer hudRenderer = {};
     bool hudOk = InitializeHudRenderer(hudRenderer, HUD_PIXEL_WIDTH, HUD_PIXEL_HEIGHT);
 
-    // Create OpenXR session with shared texture
-    if (!CreateSession(xr, renderer.device.Get(), g_sharedHandle)) {
+    // Create OpenXR session with shared texture + app HWND for weaver position tracking
+    if (!CreateSession(xr, renderer.device.Get(), g_sharedHandle, hwnd)) {
         LOG_ERROR("Session creation failed");
         if (hudOk) CleanupHudRenderer(hudRenderer);
         CleanupD3D11(renderer);
