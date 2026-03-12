@@ -517,9 +517,9 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 	}
 
-	// Diagnostic: log layer info periodically (every ~60 frames)
+	// Diagnostic: log layer info for first 5 frames then every ~300 frames
 	static uint32_t diag_counter = 0;
-	bool diag_log = (diag_counter % 60 == 0);
+	bool diag_log = (diag_counter < 5 || diag_counter % 300 == 0);
 	diag_counter++;
 	if (diag_log) {
 		U_LOG_I("D3D12 layer_commit: layers=%u, is_mono=%d, dp=%p, target=%p",
@@ -657,14 +657,23 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		// Bind back buffer as render target
 		c->cmd_list->OMSetRenderTargets(1, &rtv_handle, FALSE, nullptr);
 
+		// DEBUG: Clear to magenta to verify RT binding + present pipeline.
+		// If screen shows magenta, swapchain works and weaver is the issue.
+		// If still black, the swapchain/present is broken.
+		float debug_clear[4] = {1.0f, 0.0f, 1.0f, 1.0f};
+		c->cmd_list->ClearRenderTargetView(rtv_handle, debug_clear, 0, nullptr);
+
 		uint32_t view_width, view_height;
 		comp_d3d12_renderer_get_view_dimensions(c->renderer, &view_width, &view_height);
 		void *stereo_resource = comp_d3d12_renderer_get_stereo_resource(c->renderer);
 
 		if (diag_log) {
-			U_LOG_I("D3D12 dp path: stereo=%p, view=%ux%u, target=%ux%u, bb=%u",
+			U_LOG_W("D3D12 dp path: stereo=%p, view=%ux%u, target=%ux%u, bb=%u, "
+			        "back_buffer=%p, rtv=0x%llx",
 			        stereo_resource, view_width, view_height,
-			        tgt_width, tgt_height, bb_index);
+			        tgt_width, tgt_height, bb_index,
+			        (void *)back_buffer,
+			        (unsigned long long)rtv_handle.ptr);
 		}
 
 		xrt_display_processor_d3d12_process_stereo(
