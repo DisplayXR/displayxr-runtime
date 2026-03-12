@@ -1271,9 +1271,13 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				vk_compositor_blit_window_space_layers(c, cmd,
 				    (VkImage)(uintptr_t)target_image, tgt_width, tgt_height);
 			} else {
-				// No display processor: blit stereo texture to target
+				// No display processor (or mono/2D mode): blit stereo texture to target
 				comp_vk_native_renderer_blit_to_target(c->renderer, cmd,
 				                                        target_image, tgt_width, tgt_height);
+
+				// Post-blit: HUD overlays onto target (flat 2D, same as post-weave path)
+				vk_compositor_blit_window_space_layers(c, cmd,
+				    (VkImage)(uintptr_t)target_image, tgt_width, tgt_height);
 			}
 
 			vk->vkEndCommandBuffer(cmd);
