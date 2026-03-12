@@ -671,35 +671,54 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			        (unsigned long long)rtv_handle.ptr);
 		}
 
-		// DEBUG: Skip weaver — copy stereo texture directly to back buffer
-		// to verify the renderer produces visible content.
-		// If we see SBS stereo on screen, the renderer works and issue is
-		// purely in the SR weaver.
 		if (stereo_resource != nullptr) {
-			// Transition: stereo PIXEL_SHADER_RESOURCE → COPY_SOURCE
-			D3D12_RESOURCE_BARRIER copy_barriers[2] = {};
-			copy_barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-			copy_barriers[0].Transition.pResource = stereo_resource;
-			copy_barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-			copy_barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-			copy_barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+			// Transition stereo texture: PIXEL_SHADER_RESOURCE → COMMON
+			// The SR D3D12 weaver expects input in COMMON state
+			D3D12_RESOURCE_BARRIER stereo_barrier = {};
+			stereo_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+			stereo_barrier.Transition.pResource = stereo_resource;
+			stereo_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+			stereo_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+			stereo_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+			c->cmd_list->ResourceBarrier(1, &stereo_barrier);
 
-			// Transition: back buffer RENDER_TARGET → COPY_DEST
-			copy_barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-			copy_barriers[1].Transition.pResource = back_buffer;
-			copy_barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-			copy_barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-			copy_barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+			// Set viewport and scissor on the command list (required by reference impl)
+			D3D12_VIEWPORT viewport = {};
+			viewport.TopLeftX = 0.0f;
+			viewport.TopLeftY = 0.0f;
+			viewport.Width = static_cast<float>(tgt_width);
+			viewport.Height = static_cast<float>(tgt_height);
+			viewport.MinDepth = 0.0f;
+			viewport.MaxDepth = 1.0f;
+			c->cmd_list->RSSetViewports(1, &viewport);
 
-			c->cmd_list->ResourceBarrier(2, copy_barriers);
-			c->cmd_list->CopyResource(back_buffer, stereo_resource);
+			D3D12_RECT scissor = {};
+			scissor.left = 0;
+			scissor.top = 0;
+			scissor.right = static_cast<LONG>(tgt_width);
+			scissor.bottom = static_cast<LONG>(tgt_height);
+			c->cmd_list->RSSetScissorRects(1, &scissor);
 
-			// Transition back: stereo → PIXEL_SHADER_RESOURCE, back buffer → PRESENT
-			copy_barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-			copy_barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-			copy_barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-			copy_barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-			c->cmd_list->ResourceBarrier(2, copy_barriers);
+			// Call display processor to weave
+			xrt_display_processor_d3d12_process_stereo(
+			    c->display_processor,
+			    c->cmd_list,
+			    stereo_resource,
+			    0,  // SRV GPU handle — SR weaver uses setInputViewTexture instead
+			    rtv_handle.ptr,
+			    view_width, view_height,
+			    static_cast<uint32_t>(DXGI_FORMAT_R8G8B8A8_UNORM),
+			    tgt_width, tgt_height);
+
+			// Transition stereo back: COMMON → PIXEL_SHADER_RESOURCE
+			stereo_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+			stereo_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+			c->cmd_list->ResourceBarrier(1, &stereo_barrier);
+
+			// Transition back buffer: RENDER_TARGET → PRESENT
+			barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+			barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+			c->cmd_list->ResourceBarrier(1, &barrier);
 		} else {
 			// No stereo resource — just transition back buffer to PRESENT
 			barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
