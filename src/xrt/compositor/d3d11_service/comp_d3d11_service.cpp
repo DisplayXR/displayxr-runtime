@@ -32,6 +32,7 @@
 #include "d3d/d3d_dxgi_formats.h"
 
 #include "util/u_hud.h"
+#include "util/u_tiling.h"
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
 #include "qwerty_interface.h"
@@ -163,10 +164,10 @@ struct d3d11_client_render_resources
 	//! Back buffer render target view
 	wil::com_ptr<ID3D11RenderTargetView> back_buffer_rtv;
 
-	//! Stereo render target (side-by-side views)
-	wil::com_ptr<ID3D11Texture2D> stereo_texture;
-	wil::com_ptr<ID3D11ShaderResourceView> stereo_srv;
-	wil::com_ptr<ID3D11RenderTargetView> stereo_rtv;
+	//! Atlas render target (tiled views)
+	wil::com_ptr<ID3D11Texture2D> atlas_texture;
+	wil::com_ptr<ID3D11ShaderResourceView> atlas_srv;
+	wil::com_ptr<ID3D11RenderTargetView> atlas_rtv;
 
 	//! Generic D3D11 display processor (vendor-agnostic weaving)
 	struct xrt_display_processor_d3d11 *display_processor;
@@ -323,7 +324,7 @@ struct d3d11_service_system
 	//! Depth stencil state (disabled)
 	wil::com_ptr<ID3D11DepthStencilState> depth_disabled;
 
-	//! Stereo texture dimensions (side-by-side views, input to display processor)
+	//! Atlas texture dimensions (tiled views, input to display processor)
 	uint32_t display_width;
 	uint32_t display_height;
 
@@ -334,6 +335,10 @@ struct d3d11_service_system
 	//! View dimensions (per eye, reported to apps)
 	uint32_t view_width;
 	uint32_t view_height;
+
+	//! Tile layout for atlas (from active rendering mode, default 2x1)
+	uint32_t tile_columns;
+	uint32_t tile_rows;
 
 	//! Display refresh rate
 	float refresh_rate;
@@ -385,6 +390,29 @@ static inline struct d3d11_service_semaphore *
 d3d11_service_semaphore_from_xrt(struct xrt_compositor_semaphore *xcsem)
 {
 	return reinterpret_cast<struct d3d11_service_semaphore *>(xcsem);
+}
+
+/*!
+ * Sync tile layout from the active rendering mode of the head device.
+ * Defaults to 2 columns, 1 row (side-by-side stereo) if not available.
+ */
+static void
+sync_tile_layout(struct d3d11_service_system *sys)
+{
+	sys->tile_columns = 2;
+	sys->tile_rows = 1;
+
+	if (sys->xdev != NULL && sys->xdev->hmd != NULL) {
+		uint32_t idx = sys->xdev->hmd->active_rendering_mode_index;
+		if (idx < sys->xdev->rendering_mode_count) {
+			uint32_t tc = sys->xdev->rendering_modes[idx].tile_columns;
+			uint32_t tr = sys->xdev->rendering_modes[idx].tile_rows;
+			if (tc > 0 && tr > 0) {
+				sys->tile_columns = tc;
+				sys->tile_rows = tr;
+			}
+		}
+	}
 }
 
 /*!
@@ -734,7 +762,7 @@ create_layer_resources(struct d3d11_service_system *sys)
  * @param is_srgb Whether source is SRGB format (triggers gamma conversion)
  */
 static void
-blit_to_stereo_texture(struct d3d11_service_system *sys,
+blit_to_atlas_texture(struct d3d11_service_system *sys,
                        struct d3d11_client_render_resources *res,
                        ID3D11ShaderResourceView *src_srv,
                        float src_x, float src_y, float src_w, float src_h,
@@ -775,7 +803,7 @@ blit_to_stereo_texture(struct d3d11_service_system *sys,
 	sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
 
 	// Set render target to per-client stereo texture
-	ID3D11RenderTargetView *rtvs[] = {res->stereo_rtv.get()};
+	ID3D11RenderTargetView *rtvs[] = {res->atlas_rtv.get()};
 	sys->context->OMSetRenderTargets(1, rtvs, nullptr);
 
 	// Set viewport to cover destination region
@@ -1202,9 +1230,9 @@ fini_client_render_resources(struct d3d11_client_render_resources *res)
 	xrt_display_processor_d3d11_destroy(&res->display_processor);
 
 	res->back_buffer_rtv.reset();
-	res->stereo_rtv.reset();
-	res->stereo_srv.reset();
-	res->stereo_texture.reset();
+	res->atlas_rtv.reset();
+	res->atlas_srv.reset();
+	res->atlas_texture.reset();
 	res->swap_chain.reset();
 
 	if (res->owns_window && res->window != nullptr) {
@@ -1316,35 +1344,35 @@ init_client_render_resources(struct d3d11_service_system *sys,
 	sys->device->CreateRenderTargetView(back_buffer.get(), nullptr, res->back_buffer_rtv.put());
 
 	// Create stereo render target texture (side-by-side views)
-	D3D11_TEXTURE2D_DESC stereo_desc = {};
-	stereo_desc.Width = sys->display_width;
-	stereo_desc.Height = sys->display_height;
-	stereo_desc.MipLevels = 1;
-	stereo_desc.ArraySize = 1;
-	stereo_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-	stereo_desc.SampleDesc.Count = 1;
-	stereo_desc.Usage = D3D11_USAGE_DEFAULT;
-	stereo_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+	D3D11_TEXTURE2D_DESC atlas_desc = {};
+	atlas_desc.Width = sys->display_width;
+	atlas_desc.Height = sys->display_height;
+	atlas_desc.MipLevels = 1;
+	atlas_desc.ArraySize = 1;
+	atlas_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	atlas_desc.SampleDesc.Count = 1;
+	atlas_desc.Usage = D3D11_USAGE_DEFAULT;
+	atlas_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
 
-	hr = sys->device->CreateTexture2D(&stereo_desc, nullptr, res->stereo_texture.put());
+	hr = sys->device->CreateTexture2D(&atlas_desc, nullptr, res->atlas_texture.put());
 	if (FAILED(hr)) {
-		U_LOG_E("Failed to create stereo texture for client: 0x%08lx", hr);
+		U_LOG_E("Failed to create atlas texture for client: 0x%08lx", hr);
 		fini_client_render_resources(res);
 		return XRT_ERROR_VULKAN;
 	}
 
 	// Create SRV for stereo texture
-	hr = sys->device->CreateShaderResourceView(res->stereo_texture.get(), nullptr, res->stereo_srv.put());
+	hr = sys->device->CreateShaderResourceView(res->atlas_texture.get(), nullptr, res->atlas_srv.put());
 	if (FAILED(hr)) {
-		U_LOG_E("Failed to create stereo SRV for client: 0x%08lx", hr);
+		U_LOG_E("Failed to create atlas SRV for client: 0x%08lx", hr);
 		fini_client_render_resources(res);
 		return XRT_ERROR_VULKAN;
 	}
 
 	// Create RTV for stereo texture
-	hr = sys->device->CreateRenderTargetView(res->stereo_texture.get(), nullptr, res->stereo_rtv.put());
+	hr = sys->device->CreateRenderTargetView(res->atlas_texture.get(), nullptr, res->atlas_rtv.put());
 	if (FAILED(hr)) {
-		U_LOG_E("Failed to create stereo RTV for client: 0x%08lx", hr);
+		U_LOG_E("Failed to create atlas RTV for client: 0x%08lx", hr);
 		fini_client_render_resources(res);
 		return XRT_ERROR_VULKAN;
 	}
@@ -1379,35 +1407,36 @@ init_client_render_resources(struct d3d11_service_system *sys,
 			    (dp_px_w != sys->output_width || dp_px_h != sys->output_height)) {
 				U_LOG_W("Updating dims from display processor: %ux%u -> %ux%u",
 				        sys->output_width, sys->output_height, dp_px_w, dp_px_h);
+				sync_tile_layout(sys);
 				sys->output_width = dp_px_w;
 				sys->output_height = dp_px_h;
-				sys->view_width = dp_px_w / 2;
-				sys->view_height = dp_px_h;
-				sys->display_width = sys->view_width * 2;
-				sys->display_height = sys->view_height;
+				sys->view_width = dp_px_w / sys->tile_columns;
+				sys->view_height = dp_px_h / sys->tile_rows;
+				sys->display_width = sys->tile_columns * sys->view_width;
+				sys->display_height = sys->tile_rows * sys->view_height;
 
 				// Recreate stereo texture at correct dimensions
-				res->stereo_rtv.reset();
-				res->stereo_srv.reset();
-				res->stereo_texture.reset();
+				res->atlas_rtv.reset();
+				res->atlas_srv.reset();
+				res->atlas_texture.reset();
 
-				D3D11_TEXTURE2D_DESC stereo_desc = {};
-				stereo_desc.Width = sys->display_width;
-				stereo_desc.Height = sys->display_height;
-				stereo_desc.MipLevels = 1;
-				stereo_desc.ArraySize = 1;
-				stereo_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-				stereo_desc.SampleDesc.Count = 1;
-				stereo_desc.Usage = D3D11_USAGE_DEFAULT;
-				stereo_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+				D3D11_TEXTURE2D_DESC atlas_desc = {};
+				atlas_desc.Width = sys->display_width;
+				atlas_desc.Height = sys->display_height;
+				atlas_desc.MipLevels = 1;
+				atlas_desc.ArraySize = 1;
+				atlas_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+				atlas_desc.SampleDesc.Count = 1;
+				atlas_desc.Usage = D3D11_USAGE_DEFAULT;
+				atlas_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
 
-				hr = sys->device->CreateTexture2D(&stereo_desc, nullptr,
-				                                  res->stereo_texture.put());
+				hr = sys->device->CreateTexture2D(&atlas_desc, nullptr,
+				                                  res->atlas_texture.put());
 				if (SUCCEEDED(hr)) {
 					sys->device->CreateShaderResourceView(
-					    res->stereo_texture.get(), nullptr, res->stereo_srv.put());
+					    res->atlas_texture.get(), nullptr, res->atlas_srv.put());
 					sys->device->CreateRenderTargetView(
-					    res->stereo_texture.get(), nullptr, res->stereo_rtv.put());
+					    res->atlas_texture.get(), nullptr, res->atlas_rtv.put());
 					U_LOG_W("Stereo texture recreated at %ux%u",
 					        sys->display_width, sys->display_height);
 				}
@@ -2519,9 +2548,9 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 						        &disp_left, &disp_top) &&
 						    disp_px_w > 0 && disp_px_h > 0) {
 
-							// Compute base view dims from display pixel info
-							uint32_t base_vw = disp_px_w / 2;
-							uint32_t base_vh = disp_px_h;
+							// Compute base view dims from display pixel info using tile layout
+							uint32_t base_vw = disp_px_w / sys->tile_columns;
+							uint32_t base_vh = disp_px_h / sys->tile_rows;
 
 							// Scale view dims by window/display ratio
 							// This preserves aspect ratio during resize
@@ -2534,53 +2563,54 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 
 							uint32_t new_view_w = (uint32_t)((float)base_vw * ratio);
 							uint32_t new_view_h = (uint32_t)((float)base_vh * ratio);
-							uint32_t new_stereo_w = new_view_w * 2;
+							uint32_t new_atlas_w = sys->tile_columns * new_view_w;
+							uint32_t new_atlas_h = sys->tile_rows * new_view_h;
 
 							// Only resize if significantly different (avoid churn)
 							D3D11_TEXTURE2D_DESC current_desc = {};
-							if (c->render.stereo_texture) {
-								c->render.stereo_texture->GetDesc(&current_desc);
+							if (c->render.atlas_texture) {
+								c->render.atlas_texture->GetDesc(&current_desc);
 							}
 
-							if (current_desc.Width != new_stereo_w || current_desc.Height != new_view_h) {
-								U_LOG_W("Resizing stereo texture: %ux%u -> %ux%u (ratio=%.3f)",
+							if (current_desc.Width != new_atlas_w || current_desc.Height != new_atlas_h) {
+								U_LOG_W("Resizing atlas texture: %ux%u -> %ux%u (ratio=%.3f)",
 								        current_desc.Width, current_desc.Height,
-								        new_stereo_w, new_view_h, ratio);
+								        new_atlas_w, new_atlas_h, ratio);
 
 								// Release old stereo texture resources
-								c->render.stereo_rtv.reset();
-								c->render.stereo_srv.reset();
-								c->render.stereo_texture.reset();
+								c->render.atlas_rtv.reset();
+								c->render.atlas_srv.reset();
+								c->render.atlas_texture.reset();
 
-								// Create new stereo texture
-								D3D11_TEXTURE2D_DESC stereo_desc = {};
-								stereo_desc.Width = new_stereo_w;
-								stereo_desc.Height = new_view_h;
-								stereo_desc.MipLevels = 1;
-								stereo_desc.ArraySize = 1;
-								stereo_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-								stereo_desc.SampleDesc.Count = 1;
-								stereo_desc.Usage = D3D11_USAGE_DEFAULT;
-								stereo_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+								// Create new atlas texture
+								D3D11_TEXTURE2D_DESC atlas_desc = {};
+								atlas_desc.Width = new_atlas_w;
+								atlas_desc.Height = new_atlas_h;
+								atlas_desc.MipLevels = 1;
+								atlas_desc.ArraySize = 1;
+								atlas_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+								atlas_desc.SampleDesc.Count = 1;
+								atlas_desc.Usage = D3D11_USAGE_DEFAULT;
+								atlas_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
 
-								HRESULT stereo_hr = sys->device->CreateTexture2D(
-								    &stereo_desc, nullptr, c->render.stereo_texture.put());
-								if (SUCCEEDED(stereo_hr)) {
+								HRESULT atlas_hr = sys->device->CreateTexture2D(
+								    &atlas_desc, nullptr, c->render.atlas_texture.put());
+								if (SUCCEEDED(atlas_hr)) {
 									sys->device->CreateShaderResourceView(
-									    c->render.stereo_texture.get(), nullptr, c->render.stereo_srv.put());
+									    c->render.atlas_texture.get(), nullptr, c->render.atlas_srv.put());
 									sys->device->CreateRenderTargetView(
-									    c->render.stereo_texture.get(), nullptr, c->render.stereo_rtv.put());
+									    c->render.atlas_texture.get(), nullptr, c->render.atlas_rtv.put());
 
 									// Update system view dimensions for rendering
 									sys->view_width = new_view_w;
 									sys->view_height = new_view_h;
-									sys->display_width = new_stereo_w;
-									sys->display_height = new_view_h;
+									sys->display_width = new_atlas_w;
+									sys->display_height = new_atlas_h;
 
-									U_LOG_W("Stereo texture resized: view=%ux%u, stereo=%ux%u",
-									        new_view_w, new_view_h, new_stereo_w, new_view_h);
+									U_LOG_W("Atlas texture resized: view=%ux%u, atlas=%ux%u",
+									        new_view_w, new_view_h, new_atlas_w, new_atlas_h);
 								} else {
-									U_LOG_E("Failed to resize stereo texture: 0x%08lx", stereo_hr);
+									U_LOG_E("Failed to resize atlas texture: 0x%08lx", atlas_hr);
 								}
 							}
 						}
@@ -2593,12 +2623,13 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	}
 
 	// Clear stereo render target
-	if (c->render.stereo_rtv) {
+	if (c->render.atlas_rtv) {
 		float clear_color[4] = {0.0f, 0.0f, 0.0f, 1.0f};
-		sys->context->ClearRenderTargetView(c->render.stereo_rtv.get(), clear_color);
+		sys->context->ClearRenderTargetView(c->render.atlas_rtv.get(), clear_color);
 	}
 
-	// Sync hardware_display_3d from device's active rendering mode
+	// Sync hardware_display_3d and tile layout from device's active rendering mode
+	sync_tile_layout(sys);
 	if (sys->xdev != NULL && sys->xdev->hmd != NULL) {
 		uint32_t idx = sys->xdev->hmd->active_rendering_mode_index;
 		if (idx < sys->xdev->rendering_mode_count) {
@@ -2781,7 +2812,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				        layer->data.proj.v[0].sub.rect.offset.w, layer->data.proj.v[0].sub.rect.offset.h,
 				        layer->data.proj.v[0].sub.rect.extent.w, layer->data.proj.v[0].sub.rect.extent.h,
 				        layer->data.proj.v[0].sub.array_index);
-				U_LOG_W("  stereo_texture=%ux%u, view_width=%u, view_height=%u, fmt=%u(srgb=%d)",
+				U_LOG_W("  atlas_texture=%ux%u, view_width=%u, view_height=%u, fmt=%u(srgb=%d)",
 				        sys->display_width, sys->display_height, sys->view_width, sys->view_height,
 				        left_desc.Format, left_is_srgb);
 			} else {
@@ -2792,7 +2823,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				        layer->data.proj.v[1].sub.rect.offset.w, layer->data.proj.v[1].sub.rect.offset.h,
 				        layer->data.proj.v[1].sub.rect.extent.w, layer->data.proj.v[1].sub.rect.extent.h,
 				        layer->data.proj.v[0].sub.array_index, layer->data.proj.v[1].sub.array_index);
-				U_LOG_W("  stereo_texture=%ux%u, view_width=%u, view_height=%u, left_fmt=%u(srgb=%d), right_fmt=%u(srgb=%d)",
+				U_LOG_W("  atlas_texture=%ux%u, view_width=%u, view_height=%u, left_fmt=%u(srgb=%d), right_fmt=%u(srgb=%d)",
 				        sys->display_width, sys->display_height, sys->view_width, sys->view_height,
 				        left_desc.Format, left_is_srgb, right_desc.Format, right_is_srgb);
 			}
@@ -2873,7 +2904,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 
 			HRESULT hr = sys->device->CreateShaderResourceView(left_tex, &srv_desc, srgb_srv.put());
 			if (SUCCEEDED(hr)) {
-				blit_to_stereo_texture(sys, &c->render, srgb_srv.get(),
+				blit_to_atlas_texture(sys, &c->render, srgb_srv.get(),
 				                       left_src_x, left_src_y, left_src_w, left_src_h,
 				                       static_cast<float>(left_desc.Width), static_cast<float>(left_desc.Height),
 				                       0.0f, 0.0f,
@@ -2888,7 +2919,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				left_box.bottom = static_cast<UINT>(left_src_y + left_src_h);
 				left_box.front = 0;
 				left_box.back = 1;
-				sys->context->CopySubresourceRegion(c->render.stereo_texture.get(), 0, 0, 0, 0,
+				sys->context->CopySubresourceRegion(c->render.atlas_texture.get(), 0, 0, 0, 0,
 				                                     left_tex, layer->data.proj.v[0].sub.array_index, &left_box);
 			}
 		} else {
@@ -2902,7 +2933,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			left_box.back = 1;
 
 			sys->context->CopySubresourceRegion(
-			    c->render.stereo_texture.get(),
+			    c->render.atlas_texture.get(),
 			    0,             // dst subresource
 			    0, 0, 0,       // dst x, y, z (left half)
 			    left_tex,
@@ -2920,12 +2951,18 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				srv_desc.Texture2D.MipLevels = 1;
 				srv_desc.Texture2D.MostDetailedMip = 0;
 
+				// Compute right eye tile position in atlas
+				uint32_t right_tile_x, right_tile_y;
+				u_tiling_view_origin(1, sys->tile_columns,
+				                     sys->view_width, sys->view_height,
+				                     &right_tile_x, &right_tile_y);
+
 				HRESULT hr = sys->device->CreateShaderResourceView(right_tex, &srv_desc, srgb_srv.put());
 				if (SUCCEEDED(hr)) {
-					blit_to_stereo_texture(sys, &c->render, srgb_srv.get(),
+					blit_to_atlas_texture(sys, &c->render, srgb_srv.get(),
 					                       right_src_x, right_src_y, right_src_w, right_src_h,
 					                       static_cast<float>(right_desc.Width), static_cast<float>(right_desc.Height),
-					                       static_cast<float>(sys->view_width), 0.0f,
+					                       static_cast<float>(right_tile_x), static_cast<float>(right_tile_y),
 					                       true);  // is_srgb = true
 				} else {
 					U_LOG_W("Failed to create SRGB SRV for right eye, falling back to copy");
@@ -2936,11 +2973,17 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 					right_box.bottom = static_cast<UINT>(right_src_y + right_src_h);
 					right_box.front = 0;
 					right_box.back = 1;
-					sys->context->CopySubresourceRegion(c->render.stereo_texture.get(), 0, sys->view_width, 0, 0,
+					sys->context->CopySubresourceRegion(c->render.atlas_texture.get(), 0,
+					                                     right_tile_x, right_tile_y, 0,
 					                                     right_tex, layer->data.proj.v[1].sub.array_index, &right_box);
 				}
 			} else {
 				// Non-SRGB: use fast CopySubresourceRegion
+				uint32_t right_tile_x, right_tile_y;
+				u_tiling_view_origin(1, sys->tile_columns,
+				                     sys->view_width, sys->view_height,
+				                     &right_tile_x, &right_tile_y);
+
 				D3D11_BOX right_box = {};
 				right_box.left = static_cast<UINT>(right_src_x);
 				right_box.top = static_cast<UINT>(right_src_y);
@@ -2950,9 +2993,9 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				right_box.back = 1;
 
 				sys->context->CopySubresourceRegion(
-				    c->render.stereo_texture.get(),
+				    c->render.atlas_texture.get(),
 				    0,                            // dst subresource
-				    sys->view_width, 0, 0,        // dst x, y, z (right half)
+				    right_tile_x, right_tile_y, 0, // dst x, y, z (right eye tile)
 				    right_tex,
 				    layer->data.proj.v[1].sub.array_index,  // src subresource
 				    &right_box);
@@ -2974,7 +3017,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	// Render UI layers if any exist and shaders are ready
 	if (has_ui_layers && sys->quad_vs) {
 		// Bind per-client stereo render target
-		ID3D11RenderTargetView *rtvs[] = {c->render.stereo_rtv.get()};
+		ID3D11RenderTargetView *rtvs[] = {c->render.atlas_rtv.get()};
 		sys->context->OMSetRenderTargets(1, rtvs, nullptr);
 
 		// Set common rendering state
@@ -3027,12 +3070,16 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				viewport.Width = static_cast<float>(mono_w);
 				viewport.Height = static_cast<float>(mono_h);
 			} else {
-				// STEREO: side-by-side
-				viewport.TopLeftX = static_cast<float>(view_index * sys->view_width);
+				// STEREO: tiled atlas layout
+				uint32_t tile_x, tile_y;
+				u_tiling_view_origin(view_index, sys->tile_columns,
+				                     sys->view_width, sys->view_height,
+				                     &tile_x, &tile_y);
+				viewport.TopLeftX = static_cast<float>(tile_x);
+				viewport.TopLeftY = static_cast<float>(tile_y);
 				viewport.Width = static_cast<float>(sys->view_width);
 				viewport.Height = static_cast<float>(sys->view_height);
 			}
-			viewport.TopLeftY = 0.0f;
 			viewport.MinDepth = 0.0f;
 			viewport.MaxDepth = 1.0f;
 			sys->context->RSSetViewports(1, &viewport);
@@ -3083,9 +3130,9 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		comp_d3d11_window_wait_for_paint(c->render.window);
 	}
 
-	// Select display processor input: direct SBS from app's swapchain, or intermediate stereo_texture
+	// Select display processor input: direct SBS from app's swapchain, or intermediate atlas_texture
 	ID3D11ShaderResourceView *input_srv = use_direct_sbs
-	    ? direct_sbs_srv.get() : c->render.stereo_srv.get();
+	    ? direct_sbs_srv.get() : c->render.atlas_srv.get();
 	uint32_t input_view_w = use_direct_sbs ? direct_view_w : sys->view_width;
 	uint32_t input_view_h = use_direct_sbs ? direct_view_h : sys->view_height;
 
@@ -3111,10 +3158,10 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			}
 		}
 
-		xrt_display_processor_d3d11_process_stereo(
+		xrt_display_processor_d3d11_process_atlas(
 		    c->render.display_processor, sys->context.get(), input_srv,
-		    input_view_w, input_view_h, DXGI_FORMAT_R8G8B8A8_UNORM,
-		    back_buffer_width, back_buffer_height);
+		    input_view_w, input_view_h, sys->tile_columns, sys->tile_rows,
+		    DXGI_FORMAT_R8G8B8A8_UNORM, back_buffer_width, back_buffer_height);
 		weaving_done = true;
 	} else {
 		// No display processor or mono — copy to back buffer directly
@@ -3136,12 +3183,12 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 					eye_h = direct_view_h;
 					tex_w = direct_view_w * 2;
 					tex_h = direct_view_h;
-				} else if (c->render.stereo_srv) {
-					src_srv = c->render.stereo_srv.get();
+				} else if (c->render.atlas_srv) {
+					src_srv = c->render.atlas_srv.get();
 					eye_w = sys->view_width;
 					eye_h = sys->view_height;
-					tex_w = sys->view_width * 2;
-					tex_h = sys->view_height;
+					tex_w = sys->tile_columns * sys->view_width;
+					tex_h = sys->tile_rows * sys->view_height;
 				}
 
 				if (src_srv != nullptr) {
@@ -3211,8 +3258,8 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				sys->context->CopySubresourceRegion(
 				    back_buffer.get(), 0, 0, 0, 0,
 				    direct_sbs_tex, 0, &src_box);
-			} else if (c->render.stereo_texture) {
-				sys->context->CopyResource(back_buffer.get(), c->render.stereo_texture.get());
+			} else if (c->render.atlas_texture) {
+				sys->context->CopyResource(back_buffer.get(), c->render.atlas_texture.get());
 			}
 		}
 	}
@@ -3432,7 +3479,7 @@ system_destroy(struct xrt_system_compositor *xsysc)
 	sys->blit_ps.reset();
 	sys->blit_vs.reset();
 
-	// NOTE: Per-client resources (window, swap_chain, stereo_texture, display processor)
+	// NOTE: Per-client resources (window, swap_chain, atlas_texture, display processor)
 	// are cleaned up in fini_client_render_resources() when each client disconnects.
 	// System only needs to clean up shared resources (device, shaders, etc.)
 
@@ -3466,13 +3513,16 @@ comp_d3d11_service_create_system(struct xrt_device *xdev,
 	sys->hardware_display_3d = true;
 	sys->last_3d_mode_index = 1;
 
-	// Default display dimensions (used when no display processor is available)
-	sys->display_width = 1920;
-	sys->display_height = 1080;
-	sys->output_width = sys->display_width;
-	sys->output_height = sys->display_height;
-	sys->view_width = sys->display_width / 2;
-	sys->view_height = sys->display_height;
+	// Default tile layout (stereo side-by-side) and display dimensions
+	sys->tile_columns = 2;
+	sys->tile_rows = 1;
+	sync_tile_layout(sys);
+	sys->output_width = 1920;
+	sys->output_height = 1080;
+	sys->view_width = sys->output_width / sys->tile_columns;
+	sys->view_height = sys->output_height / sys->tile_rows;
+	sys->display_width = sys->tile_columns * sys->view_width;
+	sys->display_height = sys->tile_rows * sys->view_height;
 	sys->refresh_rate = 60.0f;
 	// NOTE: Display processor queries happen after D3D11 device creation (below).
 
@@ -3563,15 +3613,16 @@ comp_d3d11_service_create_system(struct xrt_device *xdev,
 			if (xrt_display_processor_d3d11_get_display_pixel_info(
 			        tmp_dp, &disp_px_w, &disp_px_h, &disp_left, &disp_top) &&
 			    disp_px_w > 0 && disp_px_h > 0) {
-				// Use half display width as view dims (same as comp_d3d11 reference)
-				sys->view_width = disp_px_w / 2;
-				sys->view_height = disp_px_h;
-				sys->display_width = sys->view_width * 2;
-				sys->display_height = sys->view_height;
+				// Compute per-view dims using tile layout from active rendering mode
+				sys->view_width = disp_px_w / sys->tile_columns;
+				sys->view_height = disp_px_h / sys->tile_rows;
+				sys->display_width = sys->tile_columns * sys->view_width;
+				sys->display_height = sys->tile_rows * sys->view_height;
 				sys->output_width = disp_px_w;
 				sys->output_height = disp_px_h;
-				U_LOG_W("Display processor pixel info: %ux%u, view=%ux%u per eye",
-				        disp_px_w, disp_px_h, sys->view_width, sys->view_height);
+				U_LOG_W("Display processor pixel info: %ux%u, view=%ux%u per eye (tiles %ux%u)",
+				        disp_px_w, disp_px_h, sys->view_width, sys->view_height,
+				        sys->tile_columns, sys->tile_rows);
 			} else {
 				U_LOG_W("Display processor created but pixel info unavailable, using defaults");
 			}

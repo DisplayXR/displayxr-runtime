@@ -109,20 +109,14 @@ struct comp_metal_compositor
 	//! Render pipeline for fullscreen blit (stereo→target, SBS passthrough).
 	id<MTLRenderPipelineState> blit_pipeline;
 
-	//! Render pipeline for red-cyan anaglyph output.
-	id<MTLRenderPipelineState> anaglyph_pipeline;
-
-	//! Render pipeline for 50/50 alpha-blend output.
-	id<MTLRenderPipelineState> blend_pipeline;
-
 	//! Sampler state for texture sampling.
 	id<MTLSamplerState> sampler_linear;
 
 	//! Depth stencil state.
 	id<MTLDepthStencilState> depth_stencil_state;
 
-	//! SBS stereo texture (2 * view_width × view_height).
-	id<MTLTexture> stereo_texture;
+	//! Atlas stereo texture (tile_columns * view_width × tile_rows * view_height).
+	id<MTLTexture> atlas_texture;
 
 	//! Depth texture matching stereo texture.
 	id<MTLTexture> depth_texture;
@@ -130,11 +124,26 @@ struct comp_metal_compositor
 	//! Accumulated layers for the current frame.
 	struct comp_layer_accum layer_accum;
 
-	//! Per-eye view width (half of stereo texture).
+	//! Per-eye view width.
 	uint32_t view_width;
 
 	//! Per-eye view height.
 	uint32_t view_height;
+
+	//! Number of tile columns in the atlas (default 2 for SBS stereo).
+	uint32_t tile_columns;
+
+	//! Number of tile rows in the atlas (default 1 for SBS stereo).
+	uint32_t tile_rows;
+
+	//! Atlas texture width (worst-case, fixed at init).
+	uint32_t atlas_width;
+
+	//! Atlas texture height (worst-case, fixed at init).
+	uint32_t atlas_height;
+
+	//! Retina backing scale factor.
+	float backing_scale;
 
 	//! Window (either from app or self-created).
 	NSWindow *window;
@@ -240,26 +249,6 @@ static NSString *const metal_shader_source = @
     "                              texture2d<float> tex [[texture(0)]],\n"
     "                              sampler smp [[sampler(0)]]) {\n"
     "    return tex.sample(smp, in.texCoord);\n"
-    "}\n"
-    "\n"
-    "// Anaglyph: red from left eye (left half), cyan from right eye (right half)\n"
-    "fragment float4 anaglyph_fragment(VertexOut in [[stage_in]],\n"
-    "                                  texture2d<float> tex [[texture(0)]],\n"
-    "                                  sampler smp [[sampler(0)]]) {\n"
-    "    float2 left_uv  = float2(in.texCoord.x * 0.5, in.texCoord.y);\n"
-    "    float2 right_uv = float2(in.texCoord.x * 0.5 + 0.5, in.texCoord.y);\n"
-    "    float4 left  = tex.sample(smp, left_uv);\n"
-    "    float4 right = tex.sample(smp, right_uv);\n"
-    "    return float4(left.r, right.g, right.b, 1.0);\n"
-    "}\n"
-    "\n"
-    "// Blend: 50/50 mix of left eye (left half) and right eye (right half)\n"
-    "fragment float4 blend_fragment(VertexOut in [[stage_in]],\n"
-    "                               texture2d<float> tex [[texture(0)]],\n"
-    "                               sampler smp [[sampler(0)]]) {\n"
-    "    float2 left_uv  = float2(in.texCoord.x * 0.5, in.texCoord.y);\n"
-    "    float2 right_uv = float2(in.texCoord.x * 0.5 + 0.5, in.texCoord.y);\n"
-    "    return mix(tex.sample(smp, left_uv), tex.sample(smp, right_uv), 0.5);\n"
     "}\n"
     "\n"
     "struct ProjectionConstants {\n"
@@ -398,8 +387,6 @@ compile_shaders(struct comp_metal_compositor *c)
 
 	id<MTLFunction> blit_vs = [library newFunctionWithName:@"blit_vertex"];
 	id<MTLFunction> blit_fs = [library newFunctionWithName:@"blit_fragment"];
-	id<MTLFunction> anaglyph_fs = [library newFunctionWithName:@"anaglyph_fragment"];
-	id<MTLFunction> blend_fs = [library newFunctionWithName:@"blend_fragment"];
 	id<MTLFunction> proj_vs = [library newFunctionWithName:@"projection_vertex"];
 	id<MTLFunction> proj_fs = [library newFunctionWithName:@"projection_fragment"];
 
@@ -413,34 +400,6 @@ compile_shaders(struct comp_metal_compositor *c)
 	[blit_desc release];
 	if (c->blit_pipeline == nil) {
 		U_LOG_E("Failed to create blit pipeline: %s",
-		        error.localizedDescription.UTF8String);
-		goto cleanup;
-	}
-
-	// Anaglyph pipeline (red from left eye, cyan from right)
-	MTLRenderPipelineDescriptor *anag_desc = [[MTLRenderPipelineDescriptor alloc] init];
-	anag_desc.vertexFunction = blit_vs;
-	anag_desc.fragmentFunction = anaglyph_fs;
-	anag_desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-
-	c->anaglyph_pipeline = [c->device newRenderPipelineStateWithDescriptor:anag_desc error:&error];
-	[anag_desc release];
-	if (c->anaglyph_pipeline == nil) {
-		U_LOG_E("Failed to create anaglyph pipeline: %s",
-		        error.localizedDescription.UTF8String);
-		goto cleanup;
-	}
-
-	// Blend pipeline (50/50 mix of both eyes)
-	MTLRenderPipelineDescriptor *blend_desc = [[MTLRenderPipelineDescriptor alloc] init];
-	blend_desc.vertexFunction = blit_vs;
-	blend_desc.fragmentFunction = blend_fs;
-	blend_desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-
-	c->blend_pipeline = [c->device newRenderPipelineStateWithDescriptor:blend_desc error:&error];
-	[blend_desc release];
-	if (c->blend_pipeline == nil) {
-		U_LOG_E("Failed to create blend pipeline: %s",
 		        error.localizedDescription.UTF8String);
 		goto cleanup;
 	}
@@ -490,8 +449,6 @@ compile_shaders(struct comp_metal_compositor *c)
 	// Release temporary objects (MRR — all new/alloc must be balanced)
 	[proj_fs release];
 	[proj_vs release];
-	[blend_fs release];
-	[anaglyph_fs release];
 	[blit_fs release];
 	[blit_vs release];
 	[library release];
@@ -501,8 +458,6 @@ compile_shaders(struct comp_metal_compositor *c)
 cleanup:
 	[proj_fs release];
 	[proj_vs release];
-	[blend_fs release];
-	[anaglyph_fs release];
 	[blit_fs release];
 	[blit_vs release];
 	[library release];
@@ -516,19 +471,23 @@ cleanup:
  */
 
 static bool
-create_stereo_texture(struct comp_metal_compositor *c, uint32_t view_width, uint32_t view_height)
+create_atlas_texture(struct comp_metal_compositor *c,
+                       uint32_t atlas_width,
+                       uint32_t atlas_height,
+                       uint32_t view_width,
+                       uint32_t view_height)
 {
-	// SBS stereo texture: 2 * view_width × view_height
+	// Atlas texture at worst-case size (fixed, never resized)
 	MTLTextureDescriptor *desc = [MTLTextureDescriptor
 	    texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-	                                width:view_width * 2
-	                               height:view_height
+	                                width:atlas_width
+	                               height:atlas_height
 	                            mipmapped:NO];
 	desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
 	desc.storageMode = MTLStorageModePrivate;
 
-	c->stereo_texture = [c->device newTextureWithDescriptor:desc];
-	if (c->stereo_texture == nil) {
+	c->atlas_texture = [c->device newTextureWithDescriptor:desc];
+	if (c->atlas_texture == nil) {
 		U_LOG_E("Failed to create stereo texture");
 		return false;
 	}
@@ -536,8 +495,8 @@ create_stereo_texture(struct comp_metal_compositor *c, uint32_t view_width, uint
 	// Depth texture
 	MTLTextureDescriptor *depth_desc = [MTLTextureDescriptor
 	    texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
-	                                width:view_width * 2
-	                               height:view_height
+	                                width:atlas_width
+	                               height:atlas_height
 	                            mipmapped:NO];
 	depth_desc.usage = MTLTextureUsageRenderTarget;
 	depth_desc.storageMode = MTLStorageModePrivate;
@@ -548,11 +507,14 @@ create_stereo_texture(struct comp_metal_compositor *c, uint32_t view_width, uint
 		return false;
 	}
 
+	c->atlas_width = atlas_width;
+	c->atlas_height = atlas_height;
 	c->view_width = view_width;
 	c->view_height = view_height;
 
-	U_LOG_I("Created stereo texture: %ux%u (per-eye: %ux%u)",
-	        view_width * 2, view_height, view_width, view_height);
+	U_LOG_I("Created atlas texture: %ux%u (per-view: %ux%u, tiles: %ux%u)",
+	        atlas_width, atlas_height, view_width, view_height,
+	        c->tile_columns, c->tile_rows);
 
 	return true;
 }
@@ -1211,7 +1173,7 @@ metal_compositor_update_hud(struct comp_metal_compositor *c, float dt)
 	    dev_name,
 	    fps, c->smoothed_frame_time_ms,
 	    c->view_width, c->view_height,
-	    c->view_width * 2, c->view_height,
+	    c->tile_columns * c->view_width, c->tile_rows * c->view_height,
 	    disp_w_mm, disp_h_mm,
 	    -half_ipd, nom_y, nom_z,
 	    half_ipd, nom_y, nom_z,
@@ -1261,19 +1223,30 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		return XRT_SUCCESS;
 	}
 
-	// Sync hardware_display_3d from device's active rendering mode (for _rt apps where
-	// qwerty driver updates the device directly without going through request_display_mode)
+	// Sync hardware_display_3d, tile layout, and per-view dimensions
+	// from device's active rendering mode (for _rt apps where qwerty
+	// driver updates the device directly without going through
+	// request_display_mode)
 	if (c->xdev != NULL && c->xdev->hmd != NULL) {
 		uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
 		if (idx < c->xdev->rendering_mode_count) {
-			c->hardware_display_3d = c->xdev->rendering_modes[idx].hardware_display_3d;
+			const struct xrt_rendering_mode *mode = &c->xdev->rendering_modes[idx];
+			c->hardware_display_3d = mode->hardware_display_3d;
+			if (mode->tile_columns > 0) {
+				c->tile_columns = mode->tile_columns;
+				c->tile_rows = mode->tile_rows;
+			}
+			if (mode->view_width_pixels > 0) {
+				c->view_width = (uint32_t)(mode->view_width_pixels * c->backing_scale);
+				c->view_height = (uint32_t)(mode->view_height_pixels * c->backing_scale);
+			}
 		}
 	}
 
 	// Step 1: Render layers into SBS stereo texture
-	if (c->stereo_texture != nil && c->layer_accum.layer_count > 0) {
+	if (c->atlas_texture != nil && c->layer_accum.layer_count > 0) {
 		MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
-		pass.colorAttachments[0].texture = c->stereo_texture;
+		pass.colorAttachments[0].texture = c->atlas_texture;
 		pass.colorAttachments[0].loadAction = MTLLoadActionClear;
 		pass.colorAttachments[0].storeAction = MTLStoreActionStore;
 		pass.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
@@ -1320,7 +1293,7 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 					nr.h = 1.0f;
 				}
 
-				// In 2D mode, only render eye 0 at full width (skip eye 1)
+				// In 2D mode, only render eye 0 at full atlas (skip eye 1)
 				if (!c->hardware_display_3d && eye > 0) {
 					continue;
 				}
@@ -1329,13 +1302,18 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 				MTLViewport vp;
 				if (!c->hardware_display_3d) {
 					vp.originX = 0;
-					vp.width = c->view_width * 2;
+					vp.originY = 0;
+					vp.width = c->tile_columns * c->view_width;
+					vp.height = c->tile_rows * c->view_height;
 				} else {
-					vp.originX = eye * c->view_width;
+					// Tiled layout: place each eye in its tile
+					uint32_t tile_x = eye % c->tile_columns;
+					uint32_t tile_y = eye / c->tile_columns;
+					vp.originX = tile_x * c->view_width;
+					vp.originY = tile_y * c->view_height;
 					vp.width = c->view_width;
+					vp.height = c->view_height;
 				}
-				vp.originY = 0;
-				vp.height = c->view_height;
 				vp.znear = 0.0;
 				vp.zfar = 1.0;
 				[encoder setViewport:vp];
@@ -1396,36 +1374,21 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	}
 
 	// Step 2: Blit stereo texture to drawable (or process through display processor)
-	if (c->hardware_display_3d && c->display_processor != NULL && c->stereo_texture != nil) {
-		xrt_display_processor_metal_process_stereo(
+	if (c->hardware_display_3d && c->display_processor != NULL && c->atlas_texture != nil) {
+		xrt_display_processor_metal_process_atlas(
 		    c->display_processor,
 		    (__bridge void *)cmd_buf,
-		    (__bridge void *)c->stereo_texture,
+		    (__bridge void *)c->atlas_texture,
 		    c->view_width,
 		    c->view_height,
+		    c->tile_columns,
+		    c->tile_rows,
 		    (uint32_t)MTLPixelFormatBGRA8Unorm,
 		    (__bridge void *)output_texture,
 		    (uint32_t)output_texture.width,
 		    (uint32_t)output_texture.height);
 	} else {
-		// No display processor OR 2D mode: do conversion here.
-		// In 2D mode (hardware_display_3d=false), always blit (passthrough).
-		id<MTLRenderPipelineState> pipeline;
-		if (!c->hardware_display_3d) {
-			pipeline = c->blit_pipeline;
-		} else {
-			// 3D mode without display processor: query output mode
-			int32_t output_mode = 0; // SBS default
-			if (c->xdev != NULL) {
-				xrt_device_get_property(c->xdev, XRT_DEVICE_PROPERTY_OUTPUT_MODE, &output_mode);
-			}
-			switch (output_mode) {
-			case 1:  pipeline = c->anaglyph_pipeline; break;
-			case 2:  pipeline = c->blend_pipeline;    break;
-			default: pipeline = c->blit_pipeline;     break;
-			}
-		}
-
+		// No display processor or 2D mode: simple blit passthrough.
 		MTLRenderPassDescriptor *blit_pass = [MTLRenderPassDescriptor renderPassDescriptor];
 		blit_pass.colorAttachments[0].texture = output_texture;
 		blit_pass.colorAttachments[0].loadAction = MTLLoadActionClear;
@@ -1434,9 +1397,9 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 
 		id<MTLRenderCommandEncoder> blit_encoder = [cmd_buf renderCommandEncoderWithDescriptor:blit_pass];
 
-		if (c->stereo_texture != nil) {
-			[blit_encoder setRenderPipelineState:pipeline];
-			[blit_encoder setFragmentTexture:c->stereo_texture atIndex:0];
+		if (c->atlas_texture != nil) {
+			[blit_encoder setRenderPipelineState:c->blit_pipeline];
+			[blit_encoder setFragmentTexture:c->atlas_texture atIndex:0];
 			[blit_encoder setFragmentSamplerState:c->sampler_linear atIndex:0];
 			[blit_encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
 		}
@@ -1501,18 +1464,14 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 	}
 
 	// 5. Release Metal resources (MRR — explicit release)
-	[c->stereo_texture release];
-	c->stereo_texture = nil;
+	[c->atlas_texture release];
+	c->atlas_texture = nil;
 	[c->depth_texture release];
 	c->depth_texture = nil;
 	[c->projection_pipeline release];
 	c->projection_pipeline = nil;
 	[c->blit_pipeline release];
 	c->blit_pipeline = nil;
-	[c->anaglyph_pipeline release];
-	c->anaglyph_pipeline = nil;
-	[c->blend_pipeline release];
-	c->blend_pipeline = nil;
 	[c->sampler_linear release];
 	c->sampler_linear = nil;
 	[c->depth_stencil_state release];
@@ -1675,11 +1634,11 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 	if (display_width == 0) display_width = 1920;
 	if (display_height == 0) display_height = 1080;
 
-	// Scale stereo texture to Retina physical pixels
+	// Scale to Retina physical pixels
 	CGFloat backing_scale = [NSScreen mainScreen].backingScaleFactor;
+	c->backing_scale = (float)backing_scale;
 	uint32_t pixel_width = (uint32_t)(display_width * backing_scale);
 	uint32_t pixel_height = (uint32_t)(display_height * backing_scale);
-	uint32_t per_eye_width = pixel_width / 2;
 
 	// Window / headless setup
 	NSView *external_view = (__bridge NSView *)window_handle;
@@ -1738,6 +1697,31 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 		}
 	}
 
+	// Initialize tile layout and per-view dimensions from active rendering mode
+	uint32_t init_view_w = pixel_width / 2;  // fallback: half display
+	uint32_t init_view_h = pixel_height;
+	c->tile_columns = 2;
+	c->tile_rows = 1;
+	if (xdev != NULL && xdev->hmd != NULL) {
+		uint32_t idx = xdev->hmd->active_rendering_mode_index;
+		if (idx < xdev->rendering_mode_count) {
+			const struct xrt_rendering_mode *mode = &xdev->rendering_modes[idx];
+			if (mode->tile_columns > 0) {
+				c->tile_columns = mode->tile_columns;
+				c->tile_rows = mode->tile_rows;
+			}
+			if (mode->view_width_pixels > 0) {
+				init_view_w = (uint32_t)(mode->view_width_pixels * backing_scale);
+				init_view_h = (uint32_t)(mode->view_height_pixels * backing_scale);
+			}
+		}
+	}
+
+	// Worst-case atlas = display resolution (Retina-scaled).
+	// All modes tile within this space — never reallocated.
+	uint32_t atlas_w = pixel_width;
+	uint32_t atlas_h = pixel_height;
+
 	// Compile shaders
 	if (!compile_shaders(c)) {
 		os_mutex_destroy(&c->mutex);
@@ -1745,9 +1729,8 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 		return XRT_ERROR_VULKAN;
 	}
 
-	// Create SBS stereo texture at Retina (physical pixel) resolution
-	// so the app's retina-resolution swapchain blits 1:1.
-	if (!create_stereo_texture(c, per_eye_width, pixel_height)) {
+	// Create atlas stereo texture at worst-case Retina resolution
+	if (!create_atlas_texture(c, atlas_w, atlas_h, init_view_w, init_view_h)) {
 		os_mutex_destroy(&c->mutex);
 		free(c);
 		return XRT_ERROR_VULKAN;
@@ -1802,8 +1785,10 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 
 	*out_xc = &c->base;
 
-	U_LOG_W("Metal compositor created: device=%s, stereo=%ux%u",
-	        c->device.name.UTF8String, c->view_width * 2, c->view_height);
+	U_LOG_W("Metal compositor created: device=%s, atlas=%ux%u (tiles %ux%u)",
+	        c->device.name.UTF8String,
+	        c->tile_columns * c->view_width, c->tile_rows * c->view_height,
+	        c->tile_columns, c->tile_rows);
 
 	return XRT_SUCCESS;
 }

@@ -86,10 +86,10 @@ struct comp_d3d12_renderer
 	//! Parent compositor.
 	struct comp_d3d12_compositor *c;
 
-	//! Side-by-side stereo texture.
-	ID3D12Resource *stereo_texture;
+	//! Side-by-side atlas texture.
+	ID3D12Resource *atlas_texture;
 
-	//! RTV descriptor heap for stereo texture.
+	//! RTV descriptor heap for atlas texture.
 	ID3D12DescriptorHeap *rtv_heap;
 
 	//! SRV/CBV descriptor heap (shader visible).
@@ -109,7 +109,11 @@ struct comp_d3d12_renderer
 	uint32_t view_width;
 	uint32_t view_height;
 
-	//! Actual stereo texture height (may be max of view_height and target_height).
+	//! Tile layout for atlas (columns x rows of views).
+	uint32_t tile_columns;
+	uint32_t tile_rows;
+
+	//! Actual atlas texture height (may be max of view_height and target_height).
 	uint32_t texture_height;
 };
 
@@ -132,15 +136,15 @@ compile_shader(const char *source, const char *entry, const char *target, ID3DBl
 
 
 static xrt_result_t
-create_stereo_texture(struct comp_d3d12_renderer *r, ID3D12Device *device, uint32_t width, uint32_t height)
+create_atlas_texture(struct comp_d3d12_renderer *r, ID3D12Device *device, uint32_t width, uint32_t height)
 {
 	D3D12_HEAP_PROPERTIES heap_props = {};
 	heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
 
 	D3D12_RESOURCE_DESC res_desc = {};
 	res_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-	res_desc.Width = width * 2; // SBS: two views side by side
-	res_desc.Height = height;
+	res_desc.Width = r->tile_columns * width; // Atlas: tile_columns views across
+	res_desc.Height = r->tile_rows * height; // Atlas: tile_rows views tall
 	res_desc.DepthOrArraySize = 1;
 	res_desc.MipLevels = 1;
 	res_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -153,7 +157,7 @@ create_stereo_texture(struct comp_d3d12_renderer *r, ID3D12Device *device, uint3
 	HRESULT hr = device->CreateCommittedResource(
 	    &heap_props, D3D12_HEAP_FLAG_NONE, &res_desc,
 	    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &clear_value,
-	    __uuidof(ID3D12Resource), reinterpret_cast<void **>(&r->stereo_texture));
+	    __uuidof(ID3D12Resource), reinterpret_cast<void **>(&r->atlas_texture));
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create stereo texture: 0x%08x", hr);
 		return XRT_ERROR_D3D;
@@ -161,7 +165,7 @@ create_stereo_texture(struct comp_d3d12_renderer *r, ID3D12Device *device, uint3
 
 	// Create RTV for stereo texture
 	D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle = r->rtv_heap->GetCPUDescriptorHandleForHeapStart();
-	device->CreateRenderTargetView(r->stereo_texture, nullptr, rtv_handle);
+	device->CreateRenderTargetView(r->atlas_texture, nullptr, rtv_handle);
 
 	// Create SRV for stereo texture
 	D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
@@ -171,7 +175,7 @@ create_stereo_texture(struct comp_d3d12_renderer *r, ID3D12Device *device, uint3
 	srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 
 	D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu = r->srv_heap->GetCPUDescriptorHandleForHeapStart();
-	device->CreateShaderResourceView(r->stereo_texture, &srv_desc, srv_cpu);
+	device->CreateShaderResourceView(r->atlas_texture, &srv_desc, srv_cpu);
 
 	return XRT_SUCCESS;
 }
@@ -192,7 +196,28 @@ comp_d3d12_renderer_create(struct comp_d3d12_compositor *c,
 	r->c = c;
 	r->view_width = view_width;
 	r->view_height = view_height;
-	r->texture_height = (std::max)(view_height, target_height);
+
+	// Initialize tile layout from the active rendering mode
+	if (internals->xdev != NULL && internals->xdev->hmd != NULL) {
+		uint32_t idx = internals->xdev->hmd->active_rendering_mode_index;
+		if (idx < internals->xdev->rendering_mode_count) {
+			r->tile_columns = internals->xdev->rendering_modes[idx].tile_columns;
+			r->tile_rows = internals->xdev->rendering_modes[idx].tile_rows;
+		}
+	}
+	// Default to stereo side-by-side if not set
+	if (r->tile_columns == 0) {
+		r->tile_columns = 2;
+	}
+	if (r->tile_rows == 0) {
+		r->tile_rows = 1;
+	}
+
+	// Texture height must accommodate tile_rows * view_height for
+	// multi-row layouts, and at least target_height for mono fallback.
+	uint32_t atlas_h = r->tile_rows * view_height;
+	uint32_t min_h = (target_height > atlas_h) ? target_height : atlas_h;
+	r->texture_height = (min_h > view_height) ? min_h : view_height;
 
 	r->rtv_descriptor_size = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 	r->srv_descriptor_size = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -227,7 +252,7 @@ comp_d3d12_renderer_create(struct comp_d3d12_compositor *c,
 	}
 
 	// Create stereo texture
-	xrt_result_t xret = create_stereo_texture(r, device, view_width, r->texture_height);
+	xrt_result_t xret = create_atlas_texture(r, device, view_width, r->texture_height);
 	if (xret != XRT_SUCCESS) {
 		r->srv_heap->Release();
 		r->rtv_heap->Release();
@@ -342,8 +367,10 @@ comp_d3d12_renderer_create(struct comp_d3d12_compositor *c,
 
 	*out_renderer = r;
 
-	U_LOG_I("Created D3D12 renderer: %ux%u per view, texture %ux%u",
-	        view_width, view_height, view_width * 2, r->texture_height);
+	U_LOG_I("Created D3D12 renderer: %ux%u per view, atlas %ux%u (%u cols x %u rows), texture_h=%u",
+	        view_width, view_height,
+	        r->tile_columns * view_width, r->tile_rows * r->texture_height,
+	        r->tile_columns, r->tile_rows, r->texture_height);
 
 	return XRT_SUCCESS;
 }
@@ -364,8 +391,8 @@ comp_d3d12_renderer_destroy(struct comp_d3d12_renderer **renderer_ptr)
 	if (r->root_signature != nullptr) {
 		r->root_signature->Release();
 	}
-	if (r->stereo_texture != nullptr) {
-		r->stereo_texture->Release();
+	if (r->atlas_texture != nullptr) {
+		r->atlas_texture->Release();
 	}
 	if (r->srv_heap != nullptr) {
 		r->srv_heap->Release();
@@ -409,7 +436,7 @@ comp_d3d12_renderer_draw(struct comp_d3d12_renderer *renderer,
 	// Transition stereo texture to COPY_DEST for receiving swapchain content
 	D3D12_RESOURCE_BARRIER barrier = {};
 	barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-	barrier.Transition.pResource = renderer->stereo_texture;
+	barrier.Transition.pResource = renderer->atlas_texture;
 	barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 	barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
 	barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
@@ -478,27 +505,30 @@ comp_d3d12_renderer_draw(struct comp_d3d12_renderer *renderer,
 			uint32_t copy_w = (std::min)(src_w, renderer->view_width);
 			uint32_t copy_h = (std::min)(src_h, renderer->texture_height);
 
-			// Destination X offset: view 0 = left half, view 1 = right half
+			// Destination offset: tile position in atlas grid
 			uint32_t dst_x = 0;
+			uint32_t dst_y = 0;
 			if (layer_view_count == 1) {
-				// Mono: copy to left half, will be duplicated or stretched later
+				// Mono: copy to first tile, will be duplicated later
 				dst_x = 0;
+				dst_y = 0;
 			} else {
-				dst_x = vi * renderer->view_width;
+				dst_x = (vi % renderer->tile_columns) * renderer->view_width;
+				dst_y = (vi / renderer->tile_columns) * renderer->view_height;
 			}
 
 			if (draw_log) {
 				U_LOG_I("D3D12 renderer: copy layer=%u view=%u, src=%p (%llux%u), "
-				        "sub_rect=(%u,%u %ux%u), dst_x=%u, copy=%ux%u",
+				        "sub_rect=(%u,%u %ux%u), dst=(%u,%u), copy=%ux%u",
 				        li, vi, (void *)src_resource,
 				        (unsigned long long)src_desc.Width, (unsigned)src_desc.Height,
 				        src_x, src_y, src_w, src_h,
-				        dst_x, copy_w, copy_h);
+				        dst_x, dst_y, copy_w, copy_h);
 			}
 
 			// Copy region from swapchain to stereo texture
 			D3D12_TEXTURE_COPY_LOCATION dst_loc = {};
-			dst_loc.pResource = renderer->stereo_texture;
+			dst_loc.pResource = renderer->atlas_texture;
 			dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
 			dst_loc.SubresourceIndex = 0;
 
@@ -515,11 +545,13 @@ comp_d3d12_renderer_draw(struct comp_d3d12_renderer *renderer,
 			src_box.bottom = src_y + copy_h;
 			src_box.back = 1;
 
-			cmd_list->CopyTextureRegion(&dst_loc, dst_x, 0, 0, &src_loc, &src_box);
+			cmd_list->CopyTextureRegion(&dst_loc, dst_x, dst_y, 0, &src_loc, &src_box);
 
-			// For mono: duplicate left eye to right half
+			// For mono: duplicate to second tile position
 			if (layer_view_count == 1 && view_count == 2) {
-				cmd_list->CopyTextureRegion(&dst_loc, renderer->view_width, 0, 0,
+				uint32_t dup_x = (1 % renderer->tile_columns) * renderer->view_width;
+				uint32_t dup_y = (1 / renderer->tile_columns) * renderer->view_height;
+				cmd_list->CopyTextureRegion(&dst_loc, dup_x, dup_y, 0,
 				                            &src_loc, &src_box);
 			}
 
@@ -540,14 +572,14 @@ comp_d3d12_renderer_draw(struct comp_d3d12_renderer *renderer,
 
 
 extern "C" uint64_t
-comp_d3d12_renderer_get_stereo_srv_handle(struct comp_d3d12_renderer *renderer)
+comp_d3d12_renderer_get_atlas_srv_handle(struct comp_d3d12_renderer *renderer)
 {
 	D3D12_GPU_DESCRIPTOR_HANDLE handle = renderer->srv_heap->GetGPUDescriptorHandleForHeapStart();
 	return handle.ptr;
 }
 
 extern "C" uint64_t
-comp_d3d12_renderer_get_stereo_srv_cpu_handle(struct comp_d3d12_renderer *renderer)
+comp_d3d12_renderer_get_atlas_srv_cpu_handle(struct comp_d3d12_renderer *renderer)
 {
 	D3D12_CPU_DESCRIPTOR_HANDLE handle = renderer->srv_heap->GetCPUDescriptorHandleForHeapStart();
 	return handle.ptr;
@@ -562,8 +594,26 @@ comp_d3d12_renderer_get_view_dimensions(struct comp_d3d12_renderer *renderer,
 	*out_view_height = renderer->view_height;
 }
 
-extern "C" void *
-comp_d3d12_renderer_get_stereo_resource(struct comp_d3d12_renderer *renderer)
+extern "C" void
+comp_d3d12_renderer_get_tile_layout(struct comp_d3d12_renderer *renderer,
+                                    uint32_t *out_tile_columns,
+                                    uint32_t *out_tile_rows)
 {
-	return renderer->stereo_texture;
+	*out_tile_columns = renderer->tile_columns;
+	*out_tile_rows = renderer->tile_rows;
+}
+
+extern "C" void
+comp_d3d12_renderer_set_tile_layout(struct comp_d3d12_renderer *renderer,
+                                    uint32_t tile_columns,
+                                    uint32_t tile_rows)
+{
+	renderer->tile_columns = tile_columns;
+	renderer->tile_rows = tile_rows;
+}
+
+extern "C" void *
+comp_d3d12_renderer_get_atlas_resource(struct comp_d3d12_renderer *renderer)
+{
+	return renderer->atlas_texture;
 }

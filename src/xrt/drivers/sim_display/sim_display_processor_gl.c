@@ -4,7 +4,7 @@
  * @file
  * @brief  Simulation GL display processor: SBS, anaglyph, alpha-blend output.
  *
- * Implements SBS, anaglyph, and alpha-blend stereo output modes using GLSL
+ * Implements SBS, anaglyph, and alpha-blend atlas output modes using GLSL
  * shaders compiled at init. All 3 programs are pre-compiled for instant
  * runtime switching via 1/2/3 keys.
  *
@@ -58,17 +58,26 @@ static const char *FS_SBS =
     "in vec2 v_uv;\n"
     "out vec4 fragColor;\n"
     "uniform sampler2D u_texture;\n"
+    "uniform float u_tile_cols_inv;\n"
+    "uniform float u_tile_rows_inv;\n"
+    "uniform float u_tile_cols;\n"
+    "uniform float u_tile_rows;\n"
     "void main() {\n"
     "    float x = v_uv.x;\n"
+    "    float col_right = mod(1.0, u_tile_cols);\n"
+    "    float row_right = floor(1.0 / u_tile_cols);\n"
     "    float src_u;\n"
+    "    float src_v;\n"
     "    if (x < 0.5) {\n"
     "        float eye_u = x / 0.5;\n"
-    "        src_u = 0.125 + eye_u * 0.25;\n"   // center 50% of left eye [0.125, 0.375]
+    "        src_u = (0.25 + eye_u * 0.5) * u_tile_cols_inv;\n"
+    "        src_v = v_uv.y * u_tile_rows_inv;\n"
     "    } else {\n"
     "        float eye_u = (x - 0.5) / 0.5;\n"
-    "        src_u = 0.625 + eye_u * 0.25;\n"    // center 50% of right eye [0.625, 0.875]
+    "        src_u = (0.25 + eye_u * 0.5 + col_right) * u_tile_cols_inv;\n"
+    "        src_v = (v_uv.y + row_right) * u_tile_rows_inv;\n"
     "    }\n"
-    "    fragColor = texture(u_texture, vec2(src_u, v_uv.y));\n"
+    "    fragColor = texture(u_texture, vec2(src_u, src_v));\n"
     "}\n";
 
 //! Anaglyph: red from left eye, cyan from right eye.
@@ -77,9 +86,15 @@ static const char *FS_ANAGLYPH =
     "in vec2 v_uv;\n"
     "out vec4 fragColor;\n"
     "uniform sampler2D u_texture;\n"
+    "uniform float u_tile_cols_inv;\n"
+    "uniform float u_tile_rows_inv;\n"
+    "uniform float u_tile_cols;\n"
+    "uniform float u_tile_rows;\n"
     "void main() {\n"
-    "    vec2 uv_left = vec2(v_uv.x * 0.5, v_uv.y);\n"
-    "    vec2 uv_right = vec2(v_uv.x * 0.5 + 0.5, v_uv.y);\n"
+    "    vec2 uv_left = vec2(v_uv.x * u_tile_cols_inv, v_uv.y * u_tile_rows_inv);\n"
+    "    float col = mod(1.0, u_tile_cols);\n"
+    "    float row = floor(1.0 / u_tile_cols);\n"
+    "    vec2 uv_right = vec2((v_uv.x + col) * u_tile_cols_inv, (v_uv.y + row) * u_tile_rows_inv);\n"
     "    vec4 left = texture(u_texture, uv_left);\n"
     "    vec4 right = texture(u_texture, uv_right);\n"
     "    fragColor = vec4(left.r, right.g, right.b, 1.0);\n"
@@ -91,9 +106,15 @@ static const char *FS_BLEND =
     "in vec2 v_uv;\n"
     "out vec4 fragColor;\n"
     "uniform sampler2D u_texture;\n"
+    "uniform float u_tile_cols_inv;\n"
+    "uniform float u_tile_rows_inv;\n"
+    "uniform float u_tile_cols;\n"
+    "uniform float u_tile_rows;\n"
     "void main() {\n"
-    "    vec2 uv_left = vec2(v_uv.x * 0.5, v_uv.y);\n"
-    "    vec2 uv_right = vec2(v_uv.x * 0.5 + 0.5, v_uv.y);\n"
+    "    vec2 uv_left = vec2(v_uv.x * u_tile_cols_inv, v_uv.y * u_tile_rows_inv);\n"
+    "    float col = mod(1.0, u_tile_cols);\n"
+    "    float row = floor(1.0 / u_tile_cols);\n"
+    "    vec2 uv_right = vec2((v_uv.x + col) * u_tile_cols_inv, (v_uv.y + row) * u_tile_rows_inv);\n"
     "    vec4 left = texture(u_texture, uv_left);\n"
     "    vec4 right = texture(u_texture, uv_right);\n"
     "    fragColor = mix(left, right, 0.5);\n"
@@ -130,10 +151,12 @@ sim_dp_gl(struct xrt_display_processor_gl *xdp)
  */
 
 static void
-sim_dp_gl_process_stereo(struct xrt_display_processor_gl *xdp,
-                          uint32_t stereo_texture,
+sim_dp_gl_process_atlas(struct xrt_display_processor_gl *xdp,
+                          uint32_t atlas_texture,
                           uint32_t view_width,
                           uint32_t view_height,
+                          uint32_t tile_columns,
+                          uint32_t tile_rows,
                           uint32_t format,
                           uint32_t target_width,
                           uint32_t target_height)
@@ -152,9 +175,25 @@ sim_dp_gl_process_stereo(struct xrt_display_processor_gl *xdp,
 
 	glUseProgram(active_program);
 	glActiveTexture(GL_TEXTURE0);
-	glBindTexture(GL_TEXTURE_2D, (GLuint)stereo_texture);
+	glBindTexture(GL_TEXTURE_2D, (GLuint)atlas_texture);
 	GLint loc = glGetUniformLocation(active_program, "u_texture");
 	glUniform1i(loc, 0);
+
+	// Compute UV scale from view/atlas dimensions (not 1/tile_columns)
+	// so mapping is correct when atlas is larger than the tiled region.
+	GLint atlas_w = 0, atlas_h = 0;
+	glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &atlas_w);
+	glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &atlas_h);
+	float tile_cols_inv = (atlas_w > 0) ? ((float)view_width / (float)atlas_w) : (1.0f / (float)tile_columns);
+	float tile_rows_inv = (atlas_h > 0) ? ((float)view_height / (float)atlas_h) : (1.0f / (float)tile_rows);
+	GLint loc_cols = glGetUniformLocation(active_program, "u_tile_cols_inv");
+	GLint loc_rows = glGetUniformLocation(active_program, "u_tile_rows_inv");
+	GLint loc_tc = glGetUniformLocation(active_program, "u_tile_cols");
+	GLint loc_tr = glGetUniformLocation(active_program, "u_tile_rows");
+	glUniform1f(loc_cols, tile_cols_inv);
+	glUniform1f(loc_rows, tile_rows_inv);
+	glUniform1f(loc_tc, (float)tile_columns);
+	glUniform1f(loc_tr, (float)tile_rows);
 
 	glBindVertexArray(sdp->vao_empty);
 	glDrawArrays(GL_TRIANGLES, 0, 3);
@@ -279,7 +318,7 @@ sim_display_processor_gl_create(enum sim_display_output_mode mode,
 	}
 
 	sdp->base.destroy = sim_dp_gl_destroy;
-	sdp->base.process_stereo = sim_dp_gl_process_stereo;
+	sdp->base.process_atlas = sim_dp_gl_process_atlas;
 	sdp->base.get_predicted_eye_positions = sim_dp_gl_get_predicted_eye_positions;
 
 	// Nominal viewer parameters (same defaults as sim_display_hmd_create)
@@ -304,7 +343,7 @@ sim_display_processor_gl_create(enum sim_display_output_mode mode,
 	// Empty VAO for fullscreen triangle
 	glGenVertexArrays(1, &sdp->vao_empty);
 
-	// Set the initial output mode (atomic global read by process_stereo each frame)
+	// Set the initial output mode (atomic global read by process_atlas each frame)
 	sim_display_set_output_mode(mode);
 
 	U_LOG_W("Created sim display GL processor (all 3 shaders), initial mode: %s",

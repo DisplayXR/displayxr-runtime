@@ -799,11 +799,16 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 	}
 
-	// Sync hardware_display_3d from device's active rendering mode
+	// Sync hardware_display_3d and tile layout from device's active rendering mode
 	if (c->xdev != NULL && c->xdev->hmd != NULL) {
 		uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
 		if (idx < c->xdev->rendering_mode_count) {
-			c->hardware_display_3d = c->xdev->rendering_modes[idx].hardware_display_3d;
+			const struct xrt_rendering_mode *mode = &c->xdev->rendering_modes[idx];
+			c->hardware_display_3d = mode->hardware_display_3d;
+			if (mode->tile_columns > 0 && c->renderer != NULL) {
+				comp_d3d11_renderer_set_tile_layout(
+				    c->renderer, mode->tile_columns, mode->tile_rows);
+			}
 		}
 	}
 
@@ -861,9 +866,9 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 #ifdef XRT_FEATURE_DEBUG_GUI
 	// Update debug GUI preview with the rendered stereo texture
 	if (comp_d3d11_debug_is_active(c->debug)) {
-		ID3D11Texture2D *stereo_texture =
-		    static_cast<ID3D11Texture2D *>(comp_d3d11_renderer_get_stereo_texture(c->renderer));
-		comp_d3d11_debug_update_preview(c->debug, c->context, stereo_texture);
+		ID3D11Texture2D *atlas_texture =
+		    static_cast<ID3D11Texture2D *>(comp_d3d11_renderer_get_atlas_texture(c->renderer));
+		comp_d3d11_debug_update_preview(c->debug, c->context, atlas_texture);
 	}
 #endif
 
@@ -898,9 +903,11 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 
 		// Weave/blit directly into the shared texture
 		if (c->hardware_display_3d && c->display_processor != NULL && c->shared_rtv != nullptr) {
-			void *stereo_srv = comp_d3d11_renderer_get_stereo_srv(c->renderer);
+			void *atlas_srv = comp_d3d11_renderer_get_atlas_srv(c->renderer);
 			uint32_t view_width, view_height;
 			comp_d3d11_renderer_get_view_dimensions(c->renderer, &view_width, &view_height);
+			uint32_t tile_columns, tile_rows;
+			comp_d3d11_renderer_get_tile_layout(c->renderer, &tile_columns, &tile_rows);
 
 			D3D11_TEXTURE2D_DESC st_desc;
 			c->shared_texture->GetDesc(&st_desc);
@@ -908,9 +915,9 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			// Bind shared texture as render target for the weaver
 			c->context->OMSetRenderTargets(1, &c->shared_rtv, nullptr);
 
-			xrt_display_processor_d3d11_process_stereo(
-			    c->display_processor, c->context, stereo_srv, view_width, view_height,
-			    DXGI_FORMAT_R8G8B8A8_UNORM, st_desc.Width, st_desc.Height);
+			xrt_display_processor_d3d11_process_atlas(
+			    c->display_processor, c->context, atlas_srv, view_width, view_height,
+			    tile_columns, tile_rows, DXGI_FORMAT_R8G8B8A8_UNORM, st_desc.Width, st_desc.Height);
 			weaving_done = true;
 		}
 
@@ -922,10 +929,10 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 				comp_d3d11_renderer_blit_stretch(c->renderer, c->shared_texture,
 				                                 st_desc.Width, st_desc.Height);
 			} else {
-				ID3D11Texture2D *stereo_texture = static_cast<ID3D11Texture2D *>(
-				    comp_d3d11_renderer_get_stereo_texture(c->renderer));
-				if (stereo_texture != nullptr) {
-					c->context->CopyResource(c->shared_texture, stereo_texture);
+				ID3D11Texture2D *atlas_texture = static_cast<ID3D11Texture2D *>(
+				    comp_d3d11_renderer_get_atlas_texture(c->renderer));
+				if (atlas_texture != nullptr) {
+					c->context->CopyResource(c->shared_texture, atlas_texture);
 				}
 			}
 		}
@@ -950,17 +957,19 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			dp_logged = true;
 		}
 
-		void *stereo_srv = comp_d3d11_renderer_get_stereo_srv(c->renderer);
+		void *atlas_srv = comp_d3d11_renderer_get_atlas_srv(c->renderer);
 
 		uint32_t view_width, view_height;
 		comp_d3d11_renderer_get_view_dimensions(c->renderer, &view_width, &view_height);
+		uint32_t tile_columns, tile_rows;
+		comp_d3d11_renderer_get_tile_layout(c->renderer, &tile_columns, &tile_rows);
 
 		uint32_t target_width, target_height;
 		comp_d3d11_target_get_dimensions(c->target, &target_width, &target_height);
 
-		xrt_display_processor_d3d11_process_stereo(
-		    c->display_processor, c->context, stereo_srv, view_width, view_height,
-		    DXGI_FORMAT_R8G8B8A8_UNORM, target_width, target_height);
+		xrt_display_processor_d3d11_process_atlas(
+		    c->display_processor, c->context, atlas_srv, view_width, view_height,
+		    tile_columns, tile_rows, DXGI_FORMAT_R8G8B8A8_UNORM, target_width, target_height);
 		weaving_done = true;
 	}
 
@@ -980,16 +989,16 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 				comp_d3d11_renderer_blit_stretch(c->renderer, back_buffer,
 				                                 tgt_width, tgt_height);
 			} else {
-				ID3D11Texture2D *stereo_texture = static_cast<ID3D11Texture2D *>(
-				    comp_d3d11_renderer_get_stereo_texture(c->renderer));
-				if (stereo_texture != nullptr) {
+				ID3D11Texture2D *atlas_texture = static_cast<ID3D11Texture2D *>(
+				    comp_d3d11_renderer_get_atlas_texture(c->renderer));
+				if (atlas_texture != nullptr) {
 					D3D11_TEXTURE2D_DESC src_desc, dst_desc;
-					stereo_texture->GetDesc(&src_desc);
+					atlas_texture->GetDesc(&src_desc);
 					back_buffer->GetDesc(&dst_desc);
 
 					if (src_desc.Width == dst_desc.Width &&
 					    src_desc.Height == dst_desc.Height) {
-						c->context->CopyResource(back_buffer, stereo_texture);
+						c->context->CopyResource(back_buffer, atlas_texture);
 					} else {
 						UINT copy_width = (src_desc.Width < dst_desc.Width)
 						                      ? src_desc.Width
@@ -999,7 +1008,7 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 						                       : dst_desc.Height;
 						D3D11_BOX src_box = {0, 0, 0, copy_width, copy_height, 1};
 						c->context->CopySubresourceRegion(
-						    back_buffer, 0, 0, 0, 0, stereo_texture, 0, &src_box);
+						    back_buffer, 0, 0, 0, 0, atlas_texture, 0, &src_box);
 					}
 				}
 			}

@@ -88,7 +88,7 @@ comp_d3d12_renderer_draw(struct comp_d3d12_renderer *renderer,
  * @ingroup comp_d3d12
  */
 uint64_t
-comp_d3d12_renderer_get_stereo_srv_handle(struct comp_d3d12_renderer *renderer);
+comp_d3d12_renderer_get_atlas_srv_handle(struct comp_d3d12_renderer *renderer);
 
 /*!
  * Get the stereo texture SRV CPU descriptor handle (for copying to another heap).
@@ -99,7 +99,7 @@ comp_d3d12_renderer_get_stereo_srv_handle(struct comp_d3d12_renderer *renderer);
  * @ingroup comp_d3d12
  */
 uint64_t
-comp_d3d12_renderer_get_stereo_srv_cpu_handle(struct comp_d3d12_renderer *renderer);
+comp_d3d12_renderer_get_atlas_srv_cpu_handle(struct comp_d3d12_renderer *renderer);
 
 /*!
  * Get stereo texture dimensions.
@@ -116,6 +116,34 @@ comp_d3d12_renderer_get_view_dimensions(struct comp_d3d12_renderer *renderer,
                                         uint32_t *out_view_height);
 
 /*!
+ * Get the tile layout of the atlas texture.
+ *
+ * @param renderer The renderer.
+ * @param out_tile_columns Number of tile columns (e.g. 2 for stereo SBS).
+ * @param out_tile_rows Number of tile rows (e.g. 1 for stereo SBS).
+ *
+ * @ingroup comp_d3d12
+ */
+void
+comp_d3d12_renderer_get_tile_layout(struct comp_d3d12_renderer *renderer,
+                                    uint32_t *out_tile_columns,
+                                    uint32_t *out_tile_rows);
+
+/*!
+ * Set the tile layout of the atlas texture.
+ *
+ * @param renderer The renderer.
+ * @param tile_columns Number of tile columns.
+ * @param tile_rows Number of tile rows.
+ *
+ * @ingroup comp_d3d12
+ */
+void
+comp_d3d12_renderer_set_tile_layout(struct comp_d3d12_renderer *renderer,
+                                    uint32_t tile_columns,
+                                    uint32_t tile_rows);
+
+/*!
  * Get the stereo texture resource for direct copy.
  *
  * @param renderer The renderer.
@@ -124,7 +152,7 @@ comp_d3d12_renderer_get_view_dimensions(struct comp_d3d12_renderer *renderer,
  * @ingroup comp_d3d12
  */
 void *
-comp_d3d12_renderer_get_stereo_resource(struct comp_d3d12_renderer *renderer);
+comp_d3d12_renderer_get_atlas_resource(struct comp_d3d12_renderer *renderer);
 
 #ifdef __cplusplus
 }

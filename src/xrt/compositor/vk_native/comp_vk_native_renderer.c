@@ -6,9 +6,11 @@
  * @author David Fattal
  * @ingroup comp_vk_native
  *
- * Creates a side-by-side stereo texture and copies/blits app swapchain
- * content into left/right eye regions. The stereo texture is then consumed
+ * Creates a tiled atlas texture and copies/blits app swapchain
+ * content into per-eye tile regions. The atlas texture is then consumed
  * by the display processor (weaver) or blitted to the target for 2D fallback.
+ * Default layout is 2x1 (side-by-side stereo); tile_columns and tile_rows
+ * can be changed to support arbitrary atlas layouts (e.g. 2x2 for quad views).
  *
  * Uses vkCmdBlitImage for simplicity — no render pass or pipeline needed.
  */
@@ -39,24 +41,20 @@ struct comp_vk_native_renderer
 	//! Command pool for recording blit commands.
 	VkCommandPool cmd_pool;
 
-	//! Side-by-side stereo texture (2*view_width x texture_height).
-	VkImage stereo_image;
+	//! Number of tile columns in the atlas (default 2 for SBS stereo).
+	uint32_t tile_columns;
 
-	//! Memory for stereo texture.
-	VkDeviceMemory stereo_memory;
+	//! Number of tile rows in the atlas (default 1 for SBS stereo).
+	uint32_t tile_rows;
 
-	//! Full image view for the stereo texture (used for SBS fallback blit).
-	VkImageView stereo_view;
+	//! Atlas texture (tile_columns * view_width x tile_rows * texture_height).
+	VkImage atlas_image;
 
-	//! Per-eye images for display processors that expect separate views.
-	VkImage left_image;
-	VkImage right_image;
-	VkDeviceMemory left_memory;
-	VkDeviceMemory right_memory;
+	//! Memory for atlas texture.
+	VkDeviceMemory atlas_memory;
 
-	//! Per-eye image views (each is view_width x texture_height).
-	VkImageView left_view;
-	VkImageView right_view;
+	//! Full image view for the atlas texture.
+	VkImageView atlas_view;
 
 	//! Width per view.
 	uint32_t view_width;
@@ -72,53 +70,29 @@ struct comp_vk_native_renderer
 };
 
 static void
-destroy_stereo_resources(struct comp_vk_native_renderer *r)
+destroy_atlas_resources(struct comp_vk_native_renderer *r)
 {
 	struct vk_bundle *vk = r->vk;
 
-	if (r->left_view != VK_NULL_HANDLE) {
-		vk->vkDestroyImageView(vk->device, r->left_view, NULL);
-		r->left_view = VK_NULL_HANDLE;
+	if (r->atlas_view != VK_NULL_HANDLE) {
+		vk->vkDestroyImageView(vk->device, r->atlas_view, NULL);
+		r->atlas_view = VK_NULL_HANDLE;
 	}
-	if (r->right_view != VK_NULL_HANDLE) {
-		vk->vkDestroyImageView(vk->device, r->right_view, NULL);
-		r->right_view = VK_NULL_HANDLE;
+	if (r->atlas_image != VK_NULL_HANDLE) {
+		vk->vkDestroyImage(vk->device, r->atlas_image, NULL);
+		r->atlas_image = VK_NULL_HANDLE;
 	}
-	if (r->stereo_view != VK_NULL_HANDLE) {
-		vk->vkDestroyImageView(vk->device, r->stereo_view, NULL);
-		r->stereo_view = VK_NULL_HANDLE;
-	}
-	if (r->stereo_image != VK_NULL_HANDLE) {
-		vk->vkDestroyImage(vk->device, r->stereo_image, NULL);
-		r->stereo_image = VK_NULL_HANDLE;
-	}
-	if (r->stereo_memory != VK_NULL_HANDLE) {
-		vk->vkFreeMemory(vk->device, r->stereo_memory, NULL);
-		r->stereo_memory = VK_NULL_HANDLE;
-	}
-	if (r->left_image != VK_NULL_HANDLE) {
-		vk->vkDestroyImage(vk->device, r->left_image, NULL);
-		r->left_image = VK_NULL_HANDLE;
-	}
-	if (r->right_image != VK_NULL_HANDLE) {
-		vk->vkDestroyImage(vk->device, r->right_image, NULL);
-		r->right_image = VK_NULL_HANDLE;
-	}
-	if (r->left_memory != VK_NULL_HANDLE) {
-		vk->vkFreeMemory(vk->device, r->left_memory, NULL);
-		r->left_memory = VK_NULL_HANDLE;
-	}
-	if (r->right_memory != VK_NULL_HANDLE) {
-		vk->vkFreeMemory(vk->device, r->right_memory, NULL);
-		r->right_memory = VK_NULL_HANDLE;
+	if (r->atlas_memory != VK_NULL_HANDLE) {
+		vk->vkFreeMemory(vk->device, r->atlas_memory, NULL);
+		r->atlas_memory = VK_NULL_HANDLE;
 	}
 }
 
 static xrt_result_t
-create_stereo_resources(struct comp_vk_native_renderer *r,
-                         uint32_t view_width,
-                         uint32_t view_height,
-                         uint32_t target_height)
+create_atlas_resources(struct comp_vk_native_renderer *r,
+                       uint32_t view_width,
+                       uint32_t view_height,
+                       uint32_t target_height)
 {
 	struct vk_bundle *vk = r->vk;
 
@@ -126,13 +100,14 @@ create_stereo_resources(struct comp_vk_native_renderer *r,
 	r->view_height = view_height;
 	r->texture_height = view_height > target_height ? view_height : target_height;
 
-	uint32_t stereo_width = view_width * 2;
+	uint32_t atlas_width = r->tile_columns * view_width;
+	uint32_t atlas_height = r->tile_rows * r->texture_height;
 
 	VkImageCreateInfo image_ci = {
 	    .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
 	    .imageType = VK_IMAGE_TYPE_2D,
 	    .format = r->format,
-	    .extent = {stereo_width, r->texture_height, 1},
+	    .extent = {atlas_width, atlas_height, 1},
 	    .mipLevels = 1,
 	    .arrayLayers = 1,
 	    .samples = VK_SAMPLE_COUNT_1_BIT,
@@ -145,14 +120,14 @@ create_stereo_resources(struct comp_vk_native_renderer *r,
 	    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
 	};
 
-	VkResult res = vk->vkCreateImage(vk->device, &image_ci, NULL, &r->stereo_image);
+	VkResult res = vk->vkCreateImage(vk->device, &image_ci, NULL, &r->atlas_image);
 	if (res != VK_SUCCESS) {
-		U_LOG_E("Failed to create stereo image: %d", res);
+		U_LOG_E("Failed to create atlas image: %d", res);
 		return XRT_ERROR_VULKAN;
 	}
 
 	VkMemoryRequirements mem_reqs;
-	vk->vkGetImageMemoryRequirements(vk->device, r->stereo_image, &mem_reqs);
+	vk->vkGetImageMemoryRequirements(vk->device, r->atlas_image, &mem_reqs);
 
 	// Find device-local memory type
 	uint32_t mem_type_index = 0;
@@ -172,21 +147,21 @@ create_stereo_resources(struct comp_vk_native_renderer *r,
 	    .memoryTypeIndex = mem_type_index,
 	};
 
-	res = vk->vkAllocateMemory(vk->device, &alloc_info, NULL, &r->stereo_memory);
+	res = vk->vkAllocateMemory(vk->device, &alloc_info, NULL, &r->atlas_memory);
 	if (res != VK_SUCCESS) {
-		U_LOG_E("Failed to allocate stereo memory: %d", res);
+		U_LOG_E("Failed to allocate atlas memory: %d", res);
 		return XRT_ERROR_VULKAN;
 	}
 
-	res = vk->vkBindImageMemory(vk->device, r->stereo_image, r->stereo_memory, 0);
+	res = vk->vkBindImageMemory(vk->device, r->atlas_image, r->atlas_memory, 0);
 	if (res != VK_SUCCESS) {
-		U_LOG_E("Failed to bind stereo memory: %d", res);
+		U_LOG_E("Failed to bind atlas memory: %d", res);
 		return XRT_ERROR_VULKAN;
 	}
 
 	VkImageViewCreateInfo view_ci = {
 	    .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-	    .image = r->stereo_image,
+	    .image = r->atlas_image,
 	    .viewType = VK_IMAGE_VIEW_TYPE_2D,
 	    .format = r->format,
 	    .subresourceRange = {
@@ -198,70 +173,14 @@ create_stereo_resources(struct comp_vk_native_renderer *r,
 	    },
 	};
 
-	res = vk->vkCreateImageView(vk->device, &view_ci, NULL, &r->stereo_view);
+	res = vk->vkCreateImageView(vk->device, &view_ci, NULL, &r->atlas_view);
 	if (res != VK_SUCCESS) {
-		U_LOG_E("Failed to create stereo view: %d", res);
+		U_LOG_E("Failed to create atlas view: %d", res);
 		return XRT_ERROR_VULKAN;
 	}
 
-	// Create separate per-eye images for display processors that expect separate views.
-	// VkImageView can't select a horizontal subregion of a 2D image, so we need
-	// separate images that get blitted from the SBS stereo texture.
-	VkImageCreateInfo eye_image_ci = image_ci;
-	eye_image_ci.extent.width = view_width;
-	eye_image_ci.extent.height = r->texture_height;
-
-	VkImage eye_images[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
-	VkDeviceMemory eye_memories[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
-	VkImageView eye_views[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
-
-	for (int eye = 0; eye < 2; eye++) {
-		res = vk->vkCreateImage(vk->device, &eye_image_ci, NULL, &eye_images[eye]);
-		if (res != VK_SUCCESS) {
-			U_LOG_E("Failed to create eye %d image: %d", eye, res);
-			return XRT_ERROR_VULKAN;
-		}
-
-		VkMemoryRequirements eye_mem_reqs;
-		vk->vkGetImageMemoryRequirements(vk->device, eye_images[eye], &eye_mem_reqs);
-
-		VkMemoryAllocateInfo eye_alloc = {
-		    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-		    .allocationSize = eye_mem_reqs.size,
-		    .memoryTypeIndex = mem_type_index,
-		};
-
-		res = vk->vkAllocateMemory(vk->device, &eye_alloc, NULL, &eye_memories[eye]);
-		if (res != VK_SUCCESS) {
-			U_LOG_E("Failed to allocate eye %d memory: %d", eye, res);
-			return XRT_ERROR_VULKAN;
-		}
-
-		res = vk->vkBindImageMemory(vk->device, eye_images[eye], eye_memories[eye], 0);
-		if (res != VK_SUCCESS) {
-			U_LOG_E("Failed to bind eye %d memory: %d", eye, res);
-			return XRT_ERROR_VULKAN;
-		}
-
-		VkImageViewCreateInfo eye_view_ci = view_ci;
-		eye_view_ci.image = eye_images[eye];
-
-		res = vk->vkCreateImageView(vk->device, &eye_view_ci, NULL, &eye_views[eye]);
-		if (res != VK_SUCCESS) {
-			U_LOG_E("Failed to create eye %d view: %d", eye, res);
-			return XRT_ERROR_VULKAN;
-		}
-	}
-
-	r->left_image = eye_images[0];
-	r->right_image = eye_images[1];
-	r->left_memory = eye_memories[0];
-	r->right_memory = eye_memories[1];
-	r->left_view = eye_views[0];
-	r->right_view = eye_views[1];
-
-	U_LOG_I("Created stereo texture: %ux%u (view %ux%u)", stereo_width, r->texture_height,
-	        view_width, view_height);
+	U_LOG_I("Created atlas texture: %ux%u (view %ux%u, tiles %ux%u)", atlas_width, atlas_height,
+	        view_width, view_height, r->tile_columns, r->tile_rows);
 
 	return XRT_SUCCESS;
 }
@@ -283,6 +202,8 @@ comp_vk_native_renderer_create(struct comp_vk_native_compositor *c,
 
 	r->vk = vk;
 	r->format = VK_FORMAT_R8G8B8A8_UNORM;
+	r->tile_columns = 2;
+	r->tile_rows = 1;
 
 	VkCommandPoolCreateInfo pool_ci = {
 	    .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
@@ -297,7 +218,7 @@ comp_vk_native_renderer_create(struct comp_vk_native_compositor *c,
 		return XRT_ERROR_VULKAN;
 	}
 
-	xrt_result_t xret = create_stereo_resources(r, view_width, view_height, target_height);
+	xrt_result_t xret = create_atlas_resources(r, view_width, view_height, target_height);
 	if (xret != XRT_SUCCESS) {
 		vk->vkDestroyCommandPool(vk->device, r->cmd_pool, NULL);
 		free(r);
@@ -320,7 +241,7 @@ comp_vk_native_renderer_destroy(struct comp_vk_native_renderer **renderer_ptr)
 
 	vk->vkDeviceWaitIdle(vk->device);
 
-	destroy_stereo_resources(r);
+	destroy_atlas_resources(r);
 
 	if (r->cmd_pool != VK_NULL_HANDLE) {
 		vk->vkDestroyCommandPool(vk->device, r->cmd_pool, NULL);
@@ -396,15 +317,15 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 	};
 	vk->vkBeginCommandBuffer(cmd, &begin_info);
 
-	// Transition stereo image to transfer dst
-	cmd_image_barrier(vk, cmd, r->stereo_image,
+	// Transition atlas image to transfer dst
+	cmd_image_barrier(vk, cmd, r->atlas_image,
 	                   VK_IMAGE_LAYOUT_UNDEFINED,
 	                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 	                   0, VK_ACCESS_TRANSFER_WRITE_BIT,
 	                   VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
 	                   VK_PIPELINE_STAGE_TRANSFER_BIT);
 
-	// Clear stereo texture to black
+	// Clear atlas texture to black
 	VkClearColorValue clear_color = {{0.0f, 0.0f, 0.0f, 1.0f}};
 	VkImageSubresourceRange range = {
 	    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
@@ -413,11 +334,11 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 	    .baseArrayLayer = 0,
 	    .layerCount = 1,
 	};
-	vk->vkCmdClearColorImage(cmd, r->stereo_image,
+	vk->vkCmdClearColorImage(cmd, r->atlas_image,
 	                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 	                          &clear_color, 1, &range);
 
-	// Blit each projection layer into the stereo texture
+	// Blit each projection layer into the atlas texture
 	for (uint32_t i = 0; i < layers->layer_count; i++) {
 		struct comp_layer *layer = &layers->layers[i];
 
@@ -453,15 +374,19 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 
 			int32_t dx0, dy0, dx1, dy1;
 			if (!hardware_display_3d || view_count == 1) {
+				// 2D mode: stretch across entire atlas
 				dx0 = 0;
 				dy0 = 0;
-				dx1 = (int32_t)(r->view_width * 2);
-				dy1 = (int32_t)r->view_height;
+				dx1 = (int32_t)(r->tile_columns * r->view_width);
+				dy1 = (int32_t)(r->tile_rows * r->view_height);
 			} else {
-				dx0 = (int32_t)(eye * r->view_width);
-				dy0 = 0;
+				// Tiled layout: place each eye in its tile
+				uint32_t tile_x = eye % r->tile_columns;
+				uint32_t tile_y = eye / r->tile_columns;
+				dx0 = (int32_t)(tile_x * r->view_width);
+				dy0 = (int32_t)(tile_y * r->view_height);
 				dx1 = dx0 + (int32_t)r->view_width;
-				dy1 = (int32_t)r->view_height;
+				dy1 = dy0 + (int32_t)r->view_height;
 			}
 
 			VkImageBlit blit = {
@@ -483,7 +408,7 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 
 			vk->vkCmdBlitImage(cmd,
 			                    src_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-			                    r->stereo_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+			                    r->atlas_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 			                    1, &blit, VK_FILTER_LINEAR);
 
 			cmd_image_barrier(vk, cmd, src_image,
@@ -496,71 +421,8 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 		}
 	}
 
-	// Transition stereo image to transfer src, then blit each half to per-eye images
-	cmd_image_barrier(vk, cmd, r->stereo_image,
-	                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-	                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-	                   VK_ACCESS_TRANSFER_WRITE_BIT,
-	                   VK_ACCESS_TRANSFER_READ_BIT,
-	                   VK_PIPELINE_STAGE_TRANSFER_BIT,
-	                   VK_PIPELINE_STAGE_TRANSFER_BIT);
-
-	// Transition per-eye images to transfer dst
-	cmd_image_barrier(vk, cmd, r->left_image,
-	                   VK_IMAGE_LAYOUT_UNDEFINED,
-	                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-	                   0,
-	                   VK_ACCESS_TRANSFER_WRITE_BIT,
-	                   VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-	                   VK_PIPELINE_STAGE_TRANSFER_BIT);
-	cmd_image_barrier(vk, cmd, r->right_image,
-	                   VK_IMAGE_LAYOUT_UNDEFINED,
-	                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-	                   0,
-	                   VK_ACCESS_TRANSFER_WRITE_BIT,
-	                   VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-	                   VK_PIPELINE_STAGE_TRANSFER_BIT);
-
-	// Blit left half of stereo texture to left eye image
-	VkImageBlit left_blit = {
-	    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-	    .srcOffsets = {{0, 0, 0}, {(int32_t)r->view_width, (int32_t)r->texture_height, 1}},
-	    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-	    .dstOffsets = {{0, 0, 0}, {(int32_t)r->view_width, (int32_t)r->texture_height, 1}},
-	};
-	vk->vkCmdBlitImage(cmd,
-	                    r->stereo_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-	                    r->left_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-	                    1, &left_blit, VK_FILTER_NEAREST);
-
-	// Blit right half of stereo texture to right eye image
-	VkImageBlit right_blit = {
-	    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-	    .srcOffsets = {{(int32_t)r->view_width, 0, 0}, {(int32_t)(r->view_width * 2), (int32_t)r->texture_height, 1}},
-	    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-	    .dstOffsets = {{0, 0, 0}, {(int32_t)r->view_width, (int32_t)r->texture_height, 1}},
-	};
-	vk->vkCmdBlitImage(cmd,
-	                    r->stereo_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-	                    r->right_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-	                    1, &right_blit, VK_FILTER_NEAREST);
-
-	// Transition all images to shader read for display processor
-	cmd_image_barrier(vk, cmd, r->stereo_image,
-	                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-	                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-	                   VK_ACCESS_TRANSFER_READ_BIT,
-	                   VK_ACCESS_SHADER_READ_BIT,
-	                   VK_PIPELINE_STAGE_TRANSFER_BIT,
-	                   VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
-	cmd_image_barrier(vk, cmd, r->left_image,
-	                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-	                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-	                   VK_ACCESS_TRANSFER_WRITE_BIT,
-	                   VK_ACCESS_SHADER_READ_BIT,
-	                   VK_PIPELINE_STAGE_TRANSFER_BIT,
-	                   VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
-	cmd_image_barrier(vk, cmd, r->right_image,
+	// Transition atlas image to shader read for display processor
+	cmd_image_barrier(vk, cmd, r->atlas_image,
 	                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 	                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
 	                   VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -589,34 +451,16 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 	return XRT_SUCCESS;
 }
 
-void
-comp_vk_native_renderer_get_stereo_views(struct comp_vk_native_renderer *r,
-                                          uint64_t *out_left_view,
-                                          uint64_t *out_right_view)
+uint64_t
+comp_vk_native_renderer_get_atlas_view(struct comp_vk_native_renderer *r)
 {
-	*out_left_view = (uint64_t)(uintptr_t)r->left_view;
-	*out_right_view = (uint64_t)(uintptr_t)r->right_view;
+	return (uint64_t)(uintptr_t)r->atlas_view;
 }
 
 uint64_t
-comp_vk_native_renderer_get_sbs_view(struct comp_vk_native_renderer *r)
+comp_vk_native_renderer_get_atlas_image(struct comp_vk_native_renderer *r)
 {
-	return (uint64_t)(uintptr_t)r->stereo_view;
-}
-
-uint64_t
-comp_vk_native_renderer_get_stereo_image(struct comp_vk_native_renderer *r)
-{
-	return (uint64_t)(uintptr_t)r->stereo_image;
-}
-
-void
-comp_vk_native_renderer_get_eye_images(struct comp_vk_native_renderer *r,
-                                        uint64_t *out_left_image,
-                                        uint64_t *out_right_image)
-{
-	*out_left_image = (uint64_t)(uintptr_t)r->left_image;
-	*out_right_image = (uint64_t)(uintptr_t)r->right_image;
+	return (uint64_t)(uintptr_t)r->atlas_image;
 }
 
 void
@@ -650,9 +494,9 @@ comp_vk_native_renderer_resize(struct comp_vk_native_renderer *r,
 	}
 
 	vk->vkDeviceWaitIdle(vk->device);
-	destroy_stereo_resources(r);
+	destroy_atlas_resources(r);
 
-	return create_stereo_resources(r, new_view_width, new_view_height, new_target_height);
+	return create_atlas_resources(r, new_view_width, new_view_height, new_target_height);
 }
 
 void
@@ -666,7 +510,7 @@ comp_vk_native_renderer_blit_to_target(struct comp_vk_native_renderer *r,
 	VkCommandBuffer cmd = (VkCommandBuffer)cmd_ptr;
 	VkImage dst_image = (VkImage)(uintptr_t)dst_image_u64;
 
-	cmd_image_barrier(vk, cmd, r->stereo_image,
+	cmd_image_barrier(vk, cmd, r->atlas_image,
 	                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
 	                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
 	                   VK_ACCESS_SHADER_READ_BIT,
@@ -688,7 +532,7 @@ comp_vk_native_renderer_blit_to_target(struct comp_vk_native_renderer *r,
 	        .baseArrayLayer = 0,
 	        .layerCount = 1,
 	    },
-	    .srcOffsets = {{0, 0, 0}, {(int32_t)(r->view_width * 2), (int32_t)r->view_height, 1}},
+	    .srcOffsets = {{0, 0, 0}, {(int32_t)(r->tile_columns * r->view_width), (int32_t)(r->tile_rows * r->view_height), 1}},
 	    .dstSubresource = {
 	        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
 	        .mipLevel = 0,
@@ -699,11 +543,11 @@ comp_vk_native_renderer_blit_to_target(struct comp_vk_native_renderer *r,
 	};
 
 	vk->vkCmdBlitImage(cmd,
-	                    r->stereo_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	                    r->atlas_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
 	                    dst_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 	                    1, &blit, VK_FILTER_LINEAR);
 
-	cmd_image_barrier(vk, cmd, r->stereo_image,
+	cmd_image_barrier(vk, cmd, r->atlas_image,
 	                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
 	                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
 	                   VK_ACCESS_TRANSFER_READ_BIT,
@@ -731,7 +575,7 @@ comp_vk_native_renderer_blit_to_shared(struct comp_vk_native_renderer *r,
 	VkCommandBuffer cmd = (VkCommandBuffer)cmd_ptr;
 	VkImage dst_image = (VkImage)(uintptr_t)dst_image_u64;
 
-	cmd_image_barrier(vk, cmd, r->stereo_image,
+	cmd_image_barrier(vk, cmd, r->atlas_image,
 	                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
 	                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
 	                   VK_ACCESS_SHADER_READ_BIT,
@@ -753,7 +597,7 @@ comp_vk_native_renderer_blit_to_shared(struct comp_vk_native_renderer *r,
 	        .baseArrayLayer = 0,
 	        .layerCount = 1,
 	    },
-	    .srcOffsets = {{0, 0, 0}, {(int32_t)(r->view_width * 2), (int32_t)r->view_height, 1}},
+	    .srcOffsets = {{0, 0, 0}, {(int32_t)(r->tile_columns * r->view_width), (int32_t)(r->tile_rows * r->view_height), 1}},
 	    .dstSubresource = {
 	        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
 	        .mipLevel = 0,
@@ -764,11 +608,11 @@ comp_vk_native_renderer_blit_to_shared(struct comp_vk_native_renderer *r,
 	};
 
 	vk->vkCmdBlitImage(cmd,
-	                    r->stereo_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	                    r->atlas_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
 	                    dst_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 	                    1, &blit, VK_FILTER_LINEAR);
 
-	cmd_image_barrier(vk, cmd, r->stereo_image,
+	cmd_image_barrier(vk, cmd, r->atlas_image,
 	                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
 	                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
 	                   VK_ACCESS_TRANSFER_READ_BIT,
@@ -784,6 +628,24 @@ comp_vk_native_renderer_blit_to_shared(struct comp_vk_native_renderer *r,
 	                   0,
 	                   VK_PIPELINE_STAGE_TRANSFER_BIT,
 	                   VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+}
+
+void
+comp_vk_native_renderer_get_tile_layout(struct comp_vk_native_renderer *r,
+                                         uint32_t *out_tile_columns,
+                                         uint32_t *out_tile_rows)
+{
+	*out_tile_columns = r->tile_columns;
+	*out_tile_rows = r->tile_rows;
+}
+
+void
+comp_vk_native_renderer_set_tile_layout(struct comp_vk_native_renderer *r,
+                                         uint32_t tile_columns,
+                                         uint32_t tile_rows)
+{
+	r->tile_columns = tile_columns;
+	r->tile_rows = tile_rows;
 }
 
 uint64_t

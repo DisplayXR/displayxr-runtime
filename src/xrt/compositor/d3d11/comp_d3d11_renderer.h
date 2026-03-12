@@ -93,7 +93,7 @@ comp_d3d11_renderer_draw(struct comp_d3d11_renderer *renderer,
  * @ingroup comp_d3d11
  */
 void *
-comp_d3d11_renderer_get_stereo_srv(struct comp_d3d11_renderer *renderer);
+comp_d3d11_renderer_get_atlas_srv(struct comp_d3d11_renderer *renderer);
 
 /*!
  * Get stereo texture dimensions.
@@ -110,6 +110,34 @@ comp_d3d11_renderer_get_view_dimensions(struct comp_d3d11_renderer *renderer,
                                         uint32_t *out_view_height);
 
 /*!
+ * Get the tile layout of the atlas texture.
+ *
+ * @param renderer The renderer.
+ * @param out_tile_columns Number of tile columns (e.g. 2 for stereo SBS).
+ * @param out_tile_rows Number of tile rows (e.g. 1 for stereo SBS).
+ *
+ * @ingroup comp_d3d11
+ */
+void
+comp_d3d11_renderer_get_tile_layout(struct comp_d3d11_renderer *renderer,
+                                    uint32_t *out_tile_columns,
+                                    uint32_t *out_tile_rows);
+
+/*!
+ * Set the tile layout of the atlas texture.
+ *
+ * @param renderer The renderer.
+ * @param tile_columns Number of tile columns.
+ * @param tile_rows Number of tile rows.
+ *
+ * @ingroup comp_d3d11
+ */
+void
+comp_d3d11_renderer_set_tile_layout(struct comp_d3d11_renderer *renderer,
+                                    uint32_t tile_columns,
+                                    uint32_t tile_rows);
+
+/*!
  * Get the stereo texture for debug readback.
  *
  * Returns the ID3D11Texture2D of the side-by-side stereo texture.
@@ -121,7 +149,7 @@ comp_d3d11_renderer_get_view_dimensions(struct comp_d3d11_renderer *renderer,
  * @ingroup comp_d3d11
  */
 void *
-comp_d3d11_renderer_get_stereo_texture(struct comp_d3d11_renderer *renderer);
+comp_d3d11_renderer_get_atlas_texture(struct comp_d3d11_renderer *renderer);
 
 /*!
  * Resize the renderer's stereo texture to match a new view size.

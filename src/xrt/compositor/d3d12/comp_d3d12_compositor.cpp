@@ -513,11 +513,16 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 	}
 
-	// Sync hardware_display_3d from device's active rendering mode
+	// Sync hardware_display_3d and tile layout from device's active rendering mode
 	if (c->xdev != NULL && c->xdev->hmd != NULL) {
 		uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
 		if (idx < c->xdev->rendering_mode_count) {
-			c->hardware_display_3d = c->xdev->rendering_modes[idx].hardware_display_3d;
+			const struct xrt_rendering_mode *mode = &c->xdev->rendering_modes[idx];
+			c->hardware_display_3d = mode->hardware_display_3d;
+			if (mode->tile_columns > 0 && c->renderer != NULL) {
+				comp_d3d12_renderer_set_tile_layout(
+				    c->renderer, mode->tile_columns, mode->tile_rows);
+			}
 		}
 	}
 
@@ -584,10 +589,10 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 
 	// Shared texture mode: copy stereo output to shared texture and skip window present
 	if (c->has_shared_texture && c->shared_texture != nullptr) {
-		ID3D12Resource *stereo_resource = static_cast<ID3D12Resource *>(
-		    comp_d3d12_renderer_get_stereo_resource(c->renderer));
+		ID3D12Resource *atlas_resource = static_cast<ID3D12Resource *>(
+		    comp_d3d12_renderer_get_atlas_resource(c->renderer));
 
-		if (stereo_resource != nullptr) {
+		if (atlas_resource != nullptr) {
 			// Barrier: shared texture to COPY_DEST, stereo to COPY_SOURCE
 			D3D12_RESOURCE_BARRIER barriers[2] = {};
 			barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -597,14 +602,14 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 
 			barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-			barriers[1].Transition.pResource = stereo_resource;
+			barriers[1].Transition.pResource = atlas_resource;
 			barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 			barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
 			barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 
 			c->cmd_list->ResourceBarrier(2, barriers);
 
-			c->cmd_list->CopyResource(c->shared_texture, stereo_resource);
+			c->cmd_list->CopyResource(c->shared_texture, atlas_resource);
 
 			// Barrier: back to original states
 			barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
@@ -673,28 +678,28 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 
 		uint32_t view_width, view_height;
 		comp_d3d12_renderer_get_view_dimensions(c->renderer, &view_width, &view_height);
-		ID3D12Resource *stereo_resource = static_cast<ID3D12Resource *>(
-		    comp_d3d12_renderer_get_stereo_resource(c->renderer));
+		ID3D12Resource *atlas_resource = static_cast<ID3D12Resource *>(
+		    comp_d3d12_renderer_get_atlas_resource(c->renderer));
 
 		if (diag_log) {
 			U_LOG_W("D3D12 dp path: stereo=%p, view=%ux%u, target=%ux%u, bb=%u, "
 			        "back_buffer=%p, rtv=0x%llx",
-			        (void *)stereo_resource, view_width, view_height,
+			        (void *)atlas_resource, view_width, view_height,
 			        tgt_width, tgt_height, bb_index,
 			        (void *)back_buffer,
 			        (unsigned long long)rtv_handle.ptr);
 		}
 
-		if (stereo_resource != nullptr) {
+		if (atlas_resource != nullptr) {
 			// Transition stereo texture: PIXEL_SHADER_RESOURCE → COMMON
 			// The SR D3D12 weaver expects input in COMMON state
-			D3D12_RESOURCE_BARRIER stereo_barrier = {};
-			stereo_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-			stereo_barrier.Transition.pResource = stereo_resource;
-			stereo_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-			stereo_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
-			stereo_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-			c->cmd_list->ResourceBarrier(1, &stereo_barrier);
+			D3D12_RESOURCE_BARRIER atlas_barrier = {};
+			atlas_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+			atlas_barrier.Transition.pResource = atlas_resource;
+			atlas_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+			atlas_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+			atlas_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+			c->cmd_list->ResourceBarrier(1, &atlas_barrier);
 
 			// Set viewport and scissor on the command list (required by reference impl)
 			D3D12_VIEWPORT viewport = {};
@@ -714,20 +719,24 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			c->cmd_list->RSSetScissorRects(1, &scissor);
 
 			// Call display processor to weave
-			xrt_display_processor_d3d12_process_stereo(
+			uint32_t tile_columns, tile_rows;
+			comp_d3d12_renderer_get_tile_layout(c->renderer, &tile_columns, &tile_rows);
+
+			xrt_display_processor_d3d12_process_atlas(
 			    c->display_processor,
 			    c->cmd_list,
-			    stereo_resource,
+			    atlas_resource,
 			    0,  // SRV GPU handle — SR weaver uses setInputViewTexture instead
 			    rtv_handle.ptr,
 			    view_width, view_height,
+			    tile_columns, tile_rows,
 			    static_cast<uint32_t>(DXGI_FORMAT_R8G8B8A8_UNORM),
 			    tgt_width, tgt_height);
 
 			// Transition stereo back: COMMON → PIXEL_SHADER_RESOURCE
-			stereo_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-			stereo_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-			c->cmd_list->ResourceBarrier(1, &stereo_barrier);
+			atlas_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+			atlas_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+			c->cmd_list->ResourceBarrier(1, &atlas_barrier);
 
 			// Transition back buffer: RENDER_TARGET → PRESENT
 			barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
@@ -767,10 +776,10 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 				fallback_warned = true;
 			}
 
-			ID3D12Resource *stereo_resource = static_cast<ID3D12Resource *>(
-			    comp_d3d12_renderer_get_stereo_resource(c->renderer));
+			ID3D12Resource *atlas_resource = static_cast<ID3D12Resource *>(
+			    comp_d3d12_renderer_get_atlas_resource(c->renderer));
 
-			if (stereo_resource != nullptr) {
+			if (atlas_resource != nullptr) {
 				// Barrier: back buffer PRESENT -> COPY_DEST
 				D3D12_RESOURCE_BARRIER barriers[2] = {};
 				barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -780,14 +789,14 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 				barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 
 				barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-				barriers[1].Transition.pResource = stereo_resource;
+				barriers[1].Transition.pResource = atlas_resource;
 				barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 				barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
 				barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 
 				c->cmd_list->ResourceBarrier(2, barriers);
 
-				c->cmd_list->CopyResource(back_buffer, stereo_resource);
+				c->cmd_list->CopyResource(back_buffer, atlas_resource);
 
 				// Barrier: back to original states
 				barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;

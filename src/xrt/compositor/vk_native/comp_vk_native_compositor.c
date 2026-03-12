@@ -1019,11 +1019,17 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 		}
 	}
 
-	// Sync hardware_display_3d from device's active rendering mode
+	// Sync hardware_display_3d, tile layout, and per-view dimensions
+	// from device's active rendering mode
 	if (c->xdev != NULL && c->xdev->hmd != NULL) {
 		uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
 		if (idx < c->xdev->rendering_mode_count) {
-			c->hardware_display_3d = c->xdev->rendering_modes[idx].hardware_display_3d;
+			const struct xrt_rendering_mode *mode = &c->xdev->rendering_modes[idx];
+			c->hardware_display_3d = mode->hardware_display_3d;
+			if (mode->tile_columns > 0 && c->renderer != NULL) {
+				comp_vk_native_renderer_set_tile_layout(
+				    c->renderer, mode->tile_columns, mode->tile_rows);
+			}
 		}
 	}
 
@@ -1095,11 +1101,13 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 
 		// Display processor weaving path
 		if (c->hardware_display_3d && c->display_processor != NULL) {
-			uint64_t left_view, right_view;
-			comp_vk_native_renderer_get_stereo_views(c->renderer, &left_view, &right_view);
+			uint64_t atlas_view_u64 = comp_vk_native_renderer_get_atlas_view(c->renderer);
 
 			uint32_t view_width, view_height;
 			comp_vk_native_renderer_get_view_dimensions(c->renderer, &view_width, &view_height);
+
+			uint32_t tc, tr;
+			comp_vk_native_renderer_get_tile_layout(c->renderer, &tc, &tr);
 
 			int32_t view_format = comp_vk_native_renderer_get_format(c->renderer);
 
@@ -1118,12 +1126,12 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				vk->vkCreateFramebuffer(vk->device, &fb_ci, NULL, &shared_fb);
 			}
 
-			xrt_display_processor_process_views(
+			xrt_display_processor_process_atlas(
 			    c->display_processor,
 			    cmd,
-			    (VkImageView)(uintptr_t)left_view,
-			    (VkImageView)(uintptr_t)right_view,
+			    (VkImageView)(uintptr_t)atlas_view_u64,
 			    view_width, view_height,
+			    tc, tr,
 			    (VkFormat_XDP)view_format,
 			    shared_fb,
 			    tgt_width, tgt_height,
@@ -1215,10 +1223,10 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				uint32_t view_width, view_height;
 				comp_vk_native_renderer_get_view_dimensions(c->renderer, &view_width, &view_height);
 
-				int32_t view_format = comp_vk_native_renderer_get_format(c->renderer);
+				uint32_t tc, tr;
+				comp_vk_native_renderer_get_tile_layout(c->renderer, &tc, &tr);
 
-				// Check if display processor prefers SBS input (single side-by-side texture)
-				bool sbs_mode = c->display_processor->prefers_sbs_input;
+				int32_t view_format = comp_vk_native_renderer_get_format(c->renderer);
 
 				// Create temporary framebuffer from the target's swapchain image
 				VkImageView fb_view = (VkImageView)(uintptr_t)target_view;
@@ -1248,36 +1256,18 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 				    0, 0, NULL, 0, NULL, 1, &pre_weave);
 
-				// Call display processor: records interlacing commands into cmd
-				if (sbs_mode) {
-					// SBS mode: pass single side-by-side view (matching multi-compositor)
-					uint64_t sbs_view = comp_vk_native_renderer_get_sbs_view(c->renderer);
-					xrt_display_processor_process_views(
-					    c->display_processor,
-					    cmd,
-					    (VkImageView)(uintptr_t)sbs_view,
-					    VK_NULL_HANDLE,       // right = NULL for SBS mode
-					    view_width * 2,        // full SBS width
-					    view_height,
-					    (VkFormat_XDP)view_format,
-					    target_fb,
-					    tgt_width, tgt_height,
-					    (VkFormat_XDP)VK_FORMAT_B8G8R8A8_UNORM);
-				} else {
-					// Separate views mode
-					uint64_t left_view, right_view;
-					comp_vk_native_renderer_get_stereo_views(c->renderer, &left_view, &right_view);
-					xrt_display_processor_process_views(
-					    c->display_processor,
-					    cmd,
-					    (VkImageView)(uintptr_t)left_view,
-					    (VkImageView)(uintptr_t)right_view,
-					    view_width, view_height,
-					    (VkFormat_XDP)view_format,
-					    target_fb,
-					    tgt_width, tgt_height,
-					    (VkFormat_XDP)VK_FORMAT_B8G8R8A8_UNORM);
-				}
+				// Call display processor with atlas texture
+				uint64_t atlas_view_u64 = comp_vk_native_renderer_get_atlas_view(c->renderer);
+				xrt_display_processor_process_atlas(
+				    c->display_processor,
+				    cmd,
+				    (VkImageView)(uintptr_t)atlas_view_u64,
+				    view_width, view_height,
+				    tc, tr,
+				    (VkFormat_XDP)view_format,
+				    target_fb,
+				    tgt_width, tgt_height,
+				    (VkFormat_XDP)VK_FORMAT_B8G8R8A8_UNORM);
 
 				// Render pass finalLayout handles transition to PRESENT_SRC_KHR
 
@@ -1723,6 +1713,17 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		U_LOG_E("Failed to create VK renderer");
 		vk_compositor_destroy(&c->base.base);
 		return xret;
+	}
+
+	// Set tile layout from active rendering mode
+	if (c->xdev != NULL && c->xdev->hmd != NULL) {
+		uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
+		if (idx < c->xdev->rendering_mode_count && c->xdev->rendering_modes[idx].tile_columns > 0) {
+			comp_vk_native_renderer_set_tile_layout(
+			    c->renderer,
+			    c->xdev->rendering_modes[idx].tile_columns,
+			    c->xdev->rendering_modes[idx].tile_rows);
+		}
 	}
 
 	// Initialize layer accumulator

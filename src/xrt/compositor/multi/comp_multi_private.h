@@ -323,12 +323,13 @@ struct multi_compositor
 		bool dp_crop_initialized;
 		//! @}
 
-		//! @name SBS (side-by-side) flip image for GL textures (Y-flip + stereo packing)
+		//! @name Atlas flip image for GL textures (Y-flip + tiled view packing)
 		//! Used by any display processor, not Leia-specific.
+		//! Layout is tile_columns * per_eye_width x tile_rows * per_eye_height.
 		//! @{
-		VkImage flip_sbs_image;          //!< Single SBS image (2*eye_width x eye_height)
+		VkImage flip_sbs_image;          //!< Atlas image (tile_cols*eye_w x tile_rows*eye_h)
 		VkDeviceMemory flip_sbs_memory;
-		VkImageView flip_sbs_view;       //!< Full-image view covering both L/R halves
+		VkImageView flip_sbs_view;       //!< Full-image view covering all tiles
 		int flip_width;                  //!< Per-eye width
 		int flip_height;
 		VkFormat flip_format;

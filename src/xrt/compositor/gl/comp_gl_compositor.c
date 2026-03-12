@@ -16,6 +16,7 @@
 #include "util/comp_layer_accum.h"
 
 #include "xrt/xrt_device.h"
+#include "xrt/xrt_display_metrics.h"
 #include "xrt/xrt_display_processor_gl.h"
 #include "xrt/xrt_handles.h"
 #include "xrt/xrt_config_build.h"
@@ -149,40 +150,6 @@ static const char *FS_BLIT =
     "    fragColor = texture(u_texture, uv);\n"
     "}\n";
 
-//! Fragment shader: SBS with center crop (each eye rendered at full-display FOV,
-//! crop center 50% horizontally to match half-display SBS layout).
-static const char *FS_SBS =
-    "#version 330 core\n"
-    "in vec2 v_uv;\n"
-    "out vec4 fragColor;\n"
-    "uniform sampler2D u_texture;\n" // SBS stereo texture (left|right)
-    "void main() {\n"
-    "    float x = v_uv.x;\n"
-    "    float src_u;\n"
-    "    if (x < 0.5) {\n"
-    "        float eye_u = x / 0.5;\n"
-    "        src_u = 0.125 + eye_u * 0.25;\n"  // center 50% of left eye
-    "    } else {\n"
-    "        float eye_u = (x - 0.5) / 0.5;\n"
-    "        src_u = 0.625 + eye_u * 0.25;\n"  // center 50% of right eye
-    "    }\n"
-    "    fragColor = texture(u_texture, vec2(src_u, v_uv.y));\n"
-    "}\n";
-
-//! Fragment shader: anaglyph (red/cyan).
-static const char *FS_ANAGLYPH =
-    "#version 330 core\n"
-    "in vec2 v_uv;\n"
-    "out vec4 fragColor;\n"
-    "uniform sampler2D u_texture;\n" // SBS stereo texture
-    "void main() {\n"
-    "    vec2 uv_left = vec2(v_uv.x * 0.5, v_uv.y);\n"
-    "    vec2 uv_right = vec2(v_uv.x * 0.5 + 0.5, v_uv.y);\n"
-    "    vec4 left = texture(u_texture, uv_left);\n"
-    "    vec4 right = texture(u_texture, uv_right);\n"
-    "    fragColor = vec4(left.r, right.g, right.b, 1.0);\n"
-    "}\n";
-
 //! Vertex shader: positioned quad for window-space layers.
 //! Takes uniform position/size in NDC.
 static const char *VS_WINDOW_SPACE =
@@ -210,34 +177,11 @@ static const char *FS_TEXTURED =
     "    fragColor = texture(u_texture, uv);\n"
     "}\n";
 
-//! Fragment shader: 50/50 blend.
-static const char *FS_BLEND =
-    "#version 330 core\n"
-    "in vec2 v_uv;\n"
-    "out vec4 fragColor;\n"
-    "uniform sampler2D u_texture;\n" // SBS stereo texture
-    "void main() {\n"
-    "    vec2 uv_left = vec2(v_uv.x * 0.5, v_uv.y);\n"
-    "    vec2 uv_right = vec2(v_uv.x * 0.5 + 0.5, v_uv.y);\n"
-    "    vec4 left = texture(u_texture, uv_left);\n"
-    "    vec4 right = texture(u_texture, uv_right);\n"
-    "    fragColor = mix(left, right, 0.5);\n"
-    "}\n";
-
-
 /*
  *
  * GL compositor structure
  *
  */
-
-//! Output mode for display processor.
-enum gl_output_mode
-{
-	GL_OUTPUT_SBS = 0,
-	GL_OUTPUT_ANAGLYPH = 1,
-	GL_OUTPUT_BLEND = 2,
-};
 
 struct comp_gl_compositor
 {
@@ -246,15 +190,14 @@ struct comp_gl_compositor
 
 	// --- GL resources ---
 	GLuint program_blit;      //!< Shader for blitting eye to SBS texture
-	GLuint program_sbs;       //!< SBS pass-through
-	GLuint program_anaglyph;  //!< Anaglyph red/cyan
-	GLuint program_blend;     //!< 50/50 blend
 	GLuint program_window_space; //!< Window-space layer (positioned quad)
 	GLuint vao_empty;         //!< Empty VAO for vertex-shader-generated fullscreen quad
 	GLuint fbo;               //!< Framebuffer for rendering into SBS texture
-	GLuint stereo_texture;    //!< SBS stereo texture (width = 2*view_width)
+	GLuint atlas_texture;    //!< Atlas stereo texture (tile_columns * view_width x tile_rows * view_height)
 	uint32_t view_width;
 	uint32_t view_height;
+	uint32_t tile_columns;    //!< Tile columns in atlas layout (default 2 for SBS stereo)
+	uint32_t tile_rows;       //!< Tile rows in atlas layout (default 1 for SBS stereo)
 
 	// --- Layer accumulation ---
 	struct comp_layer_accum layer_accum;
@@ -305,7 +248,6 @@ struct comp_gl_compositor
 	struct xrt_display_processor_gl *display_processor;
 
 	// --- State ---
-	enum gl_output_mode output_mode;
 	bool hardware_display_3d;  //!< True when in 3D mode, false = 2D passthrough
 	uint64_t last_frame_ns;
 	float hud_timer;            //!< HUD update throttle timer (seconds)
@@ -836,7 +778,7 @@ gl_compositor_update_hud(struct comp_gl_compositor *c, float dt)
 	    dev_name,
 	    fps, c->smoothed_frame_time_ms,
 	    c->view_width, c->view_height,
-	    c->view_width * 2, c->view_height,
+	    c->tile_columns * c->view_width, c->tile_rows * c->view_height,
 	    disp_w_mm, disp_h_mm,
 	    -half_ipd, nom_y, nom_z,
 	    half_ipd, nom_y, nom_z,
@@ -900,9 +842,9 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 	// --- Step 1: Render layers into SBS stereo texture ---
 	glBindFramebuffer(GL_FRAMEBUFFER, c->fbo);
 	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
-	                        c->stereo_texture, 0);
+	                        c->atlas_texture, 0);
 
-	glViewport(0, 0, c->view_width * 2, c->view_height);
+	glViewport(0, 0, c->tile_columns * c->view_width, c->tile_rows * c->view_height);
 	glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
 	glClear(GL_COLOR_BUFFER_BIT);
 
@@ -946,11 +888,14 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				nr.h = 1.0f;
 			}
 
-			// Set viewport for this eye in the SBS texture
+			// Set viewport for this eye in the atlas texture
 			if (!c->hardware_display_3d) {
-				glViewport(0, 0, c->view_width * 2, c->view_height);
+				glViewport(0, 0, c->tile_columns * c->view_width, c->tile_rows * c->view_height);
 			} else {
-				glViewport(eye * c->view_width, 0, c->view_width, c->view_height);
+				uint32_t tile_x = eye % c->tile_columns;
+				uint32_t tile_y = eye / c->tile_columns;
+				glViewport(tile_x * c->view_width, tile_y * c->view_height,
+				           c->view_width, c->view_height);
 			}
 
 			glActiveTexture(GL_TEXTURE0);
@@ -1000,13 +945,16 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 		GLint loc_ws_tex = glGetUniformLocation(c->program_window_space, "u_texture");
 		GLint loc_ws_src = glGetUniformLocation(c->program_window_space, "u_src_rect");
 
-		uint32_t effective_views = c->hardware_display_3d ? 2 : 1;
+		uint32_t effective_views = c->hardware_display_3d ? (c->tile_columns * c->tile_rows) : 1;
 		for (uint32_t eye = 0; eye < effective_views; eye++) {
 			// Set viewport for this eye
 			if (!c->hardware_display_3d) {
-				glViewport(0, 0, c->view_width * 2, c->view_height);
+				glViewport(0, 0, c->tile_columns * c->view_width, c->tile_rows * c->view_height);
 			} else {
-				glViewport(eye * c->view_width, 0, c->view_width, c->view_height);
+				uint32_t tile_x = eye % c->tile_columns;
+				uint32_t tile_y = eye / c->tile_columns;
+				glViewport(tile_x * c->view_width, tile_y * c->view_height,
+				           c->view_width, c->view_height);
 			}
 
 			// Per-eye disparity offset
@@ -1031,34 +979,21 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 		glDisable(GL_BLEND);
 	}
 
-	// Sync hardware_display_3d and output mode from device's active rendering mode
+	// Sync hardware_display_3d, tile layout, and per-view dimensions
+	// from device's active rendering mode
 	if (c->xdev != NULL && c->xdev->hmd != NULL) {
 		uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
 		if (idx < c->xdev->rendering_mode_count) {
-			c->hardware_display_3d = c->xdev->rendering_modes[idx].hardware_display_3d;
-		}
-		int32_t mode = 0;
-		xrt_device_get_property(c->xdev, XRT_DEVICE_PROPERTY_OUTPUT_MODE, &mode);
-		// Unified indices: 0=2D, 1=Anaglyph, 2=SBS, 3=Blend
-		switch (mode) {
-		case 0:  c->output_mode = GL_OUTPUT_SBS; break; // SBS is default (unused in 2D)
-		case 1:  c->output_mode = GL_OUTPUT_ANAGLYPH; break;
-		case 2:  c->output_mode = GL_OUTPUT_SBS; break;
-		case 3:  c->output_mode = GL_OUTPUT_BLEND; break;
-		default: c->output_mode = GL_OUTPUT_SBS; break;
-		}
-	}
-
-	// Select output shader: 2D mode uses blit (passthrough), 3D uses mode-specific
-	GLuint output_program;
-	bool use_blit_for_2d = !c->hardware_display_3d;
-	if (use_blit_for_2d) {
-		output_program = c->program_blit;
-	} else {
-		switch (c->output_mode) {
-		case GL_OUTPUT_ANAGLYPH: output_program = c->program_anaglyph; break;
-		case GL_OUTPUT_BLEND:    output_program = c->program_blend; break;
-		default:                 output_program = c->program_sbs; break;
+			const struct xrt_rendering_mode *mode = &c->xdev->rendering_modes[idx];
+			c->hardware_display_3d = mode->hardware_display_3d;
+			if (mode->tile_columns > 0) {
+				c->tile_columns = mode->tile_columns;
+				c->tile_rows = mode->tile_rows;
+			}
+			if (mode->view_width_pixels > 0) {
+				c->view_width = mode->view_width_pixels;
+				c->view_height = mode->view_height_pixels;
+			}
 		}
 	}
 
@@ -1073,14 +1008,12 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 
 			glViewport(0, 0, c->shared_width, c->shared_height);
 
-			glUseProgram(output_program);
-			if (use_blit_for_2d) {
-				GLint loc_rect = glGetUniformLocation(output_program, "u_src_rect");
-				glUniform4f(loc_rect, 0.0f, 0.0f, 1.0f, 1.0f);
-			}
+			glUseProgram(c->program_blit);
+			GLint loc_rect = glGetUniformLocation(c->program_blit, "u_src_rect");
+			glUniform4f(loc_rect, 0.0f, 0.0f, 1.0f, 1.0f);
 			glActiveTexture(GL_TEXTURE0);
-			glBindTexture(GL_TEXTURE_2D, c->stereo_texture);
-			GLint loc_out_tex = glGetUniformLocation(output_program, "u_texture");
+			glBindTexture(GL_TEXTURE_2D, c->atlas_texture);
+			GLint loc_out_tex = glGetUniformLocation(c->program_blit, "u_texture");
 			glUniform1i(loc_out_tex, 0);
 			glDrawArrays(GL_TRIANGLES, 0, 3);
 
@@ -1103,17 +1036,15 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 
 		glViewport(0, 0, c->iosurface_width, c->iosurface_height);
 
-		glUseProgram(output_program);
-		if (use_blit_for_2d) {
-			GLint loc_rect = glGetUniformLocation(output_program, "u_src_rect");
-			glUniform4f(loc_rect, 0.0f, 0.0f, 1.0f, 1.0f);
-		}
+		glUseProgram(c->program_blit);
+		GLint loc_rect = glGetUniformLocation(c->program_blit, "u_src_rect");
+		glUniform4f(loc_rect, 0.0f, 0.0f, 1.0f, 1.0f);
 		// Flip Y so IOSurface content matches Metal's top-down convention
-		GLint loc_flip = glGetUniformLocation(output_program, "u_flip_y");
+		GLint loc_flip = glGetUniformLocation(c->program_blit, "u_flip_y");
 		glUniform1f(loc_flip, 1.0f);
 		glActiveTexture(GL_TEXTURE0);
-		glBindTexture(GL_TEXTURE_2D, c->stereo_texture);
-		GLint loc_out_tex = glGetUniformLocation(output_program, "u_texture");
+		glBindTexture(GL_TEXTURE_2D, c->atlas_texture);
+		GLint loc_out_tex = glGetUniformLocation(c->program_blit, "u_texture");
 		glUniform1i(loc_out_tex, 0);
 		glDrawArrays(GL_TRIANGLES, 0, 3);
 
@@ -1130,8 +1061,8 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 		glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
 		// Use actual window backing dimensions
-		uint32_t present_w = c->view_width * 2;
-		uint32_t present_h = c->view_height;
+		uint32_t present_w = c->tile_columns * c->view_width;
+		uint32_t present_h = c->tile_rows * c->view_height;
 #ifdef XRT_OS_WINDOWS
 		if (c->hwnd != NULL) {
 			RECT rc;
@@ -1151,26 +1082,26 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 		if (c->hardware_display_3d && c->display_processor != NULL) {
 			// Display processor handles the stereo-to-display conversion
 			glViewport(0, 0, present_w, present_h);
-			xrt_display_processor_gl_process_stereo(
+			xrt_display_processor_gl_process_atlas(
 			    c->display_processor,
-			    c->stereo_texture,
+			    c->atlas_texture,
 			    c->view_width,
 			    c->view_height,
+			    c->tile_columns,
+			    c->tile_rows,
 			    GL_RGBA8,
 			    present_w,
 			    present_h);
 		} else {
-			// Fallback: built-in shader blit
+			// Simple blit (2D mode or no display processor)
 			glViewport(0, 0, present_w, present_h);
-			glUseProgram(output_program);
-			if (use_blit_for_2d) {
-				GLint loc_rect = glGetUniformLocation(output_program, "u_src_rect");
-				glUniform4f(loc_rect, 0.0f, 0.0f, 1.0f, 1.0f);
-			}
+			glUseProgram(c->program_blit);
+			GLint loc_rect = glGetUniformLocation(c->program_blit, "u_src_rect");
+			glUniform4f(loc_rect, 0.0f, 0.0f, 1.0f, 1.0f);
 
 			glActiveTexture(GL_TEXTURE0);
-			glBindTexture(GL_TEXTURE_2D, c->stereo_texture);
-			GLint loc_out_tex = glGetUniformLocation(output_program, "u_texture");
+			glBindTexture(GL_TEXTURE_2D, c->atlas_texture);
+			GLint loc_out_tex = glGetUniformLocation(c->program_blit, "u_texture");
 			glUniform1i(loc_out_tex, 0);
 
 			glDrawArrays(GL_TRIANGLES, 0, 3);
@@ -1235,13 +1166,10 @@ gl_compositor_destroy(struct xrt_compositor *xc)
 	xrt_display_processor_gl_destroy(&c->display_processor);
 
 	if (c->program_blit) glDeleteProgram(c->program_blit);
-	if (c->program_sbs) glDeleteProgram(c->program_sbs);
-	if (c->program_anaglyph) glDeleteProgram(c->program_anaglyph);
-	if (c->program_blend) glDeleteProgram(c->program_blend);
 	if (c->program_window_space) glDeleteProgram(c->program_window_space);
 	if (c->vao_empty) glDeleteVertexArrays(1, &c->vao_empty);
 	if (c->fbo) glDeleteFramebuffers(1, &c->fbo);
-	if (c->stereo_texture) glDeleteTextures(1, &c->stereo_texture);
+	if (c->atlas_texture) glDeleteTextures(1, &c->atlas_texture);
 
 #ifdef XRT_OS_WINDOWS
 	// Clean up D3D11 interop resources
@@ -1436,18 +1364,29 @@ gl_create_window_and_context(struct comp_gl_compositor *c,
 static bool
 gl_init_resources(struct comp_gl_compositor *c, uint32_t width, uint32_t height)
 {
-	c->view_width = width / 2;
-	c->view_height = height;
+	// Initialize tile layout from active rendering mode if available
+	if (c->xdev != NULL && c->xdev->hmd != NULL) {
+		uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
+		if (idx < c->xdev->rendering_mode_count &&
+		    c->xdev->rendering_modes[idx].tile_columns > 0) {
+			c->tile_columns = c->xdev->rendering_modes[idx].tile_columns;
+			c->tile_rows = c->xdev->rendering_modes[idx].tile_rows;
+		}
+	}
+	// Default to 2x1 (SBS stereo) if not set
+	if (c->tile_columns == 0) {
+		c->tile_columns = 2;
+		c->tile_rows = 1;
+	}
+
+	c->view_width = width / c->tile_columns;
+	c->view_height = height / c->tile_rows;
 
 	// Compile shaders
 	c->program_blit = create_program(VS_FULLSCREEN_QUAD, FS_BLIT);
-	c->program_sbs = create_program(VS_FULLSCREEN_QUAD, FS_SBS);
-	c->program_anaglyph = create_program(VS_FULLSCREEN_QUAD, FS_ANAGLYPH);
-	c->program_blend = create_program(VS_FULLSCREEN_QUAD, FS_BLEND);
 	c->program_window_space = create_program(VS_WINDOW_SPACE, FS_TEXTURED);
 
-	if (!c->program_blit || !c->program_sbs || !c->program_anaglyph || !c->program_blend ||
-	    !c->program_window_space) {
+	if (!c->program_blit || !c->program_window_space) {
 		U_LOG_E("Failed to compile GL compositor shaders");
 		return false;
 	}
@@ -1455,24 +1394,25 @@ gl_init_resources(struct comp_gl_compositor *c, uint32_t width, uint32_t height)
 	// Empty VAO for vertex-shader-generated geometry
 	glGenVertexArrays(1, &c->vao_empty);
 
-	// FBO for offscreen rendering into SBS texture
+	// FBO for offscreen rendering into atlas texture
 	glGenFramebuffers(1, &c->fbo);
 
-	// SBS stereo texture (left|right side by side)
-	glGenTextures(1, &c->stereo_texture);
-	glBindTexture(GL_TEXTURE_2D, c->stereo_texture);
+	// Atlas stereo texture (tile_columns * view_width x tile_rows * view_height)
+	uint32_t atlas_width = c->tile_columns * c->view_width;
+	uint32_t atlas_height = c->tile_rows * c->view_height;
+	glGenTextures(1, &c->atlas_texture);
+	glBindTexture(GL_TEXTURE_2D, c->atlas_texture);
 	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8,
-	             c->view_width * 2, c->view_height, 0,
+	             atlas_width, atlas_height, 0,
 	             GL_RGBA, GL_UNSIGNED_BYTE, NULL);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 	glBindTexture(GL_TEXTURE_2D, 0);
 
-	c->output_mode = GL_OUTPUT_SBS;
 	c->hardware_display_3d = true;
 
-	U_LOG_W("GL compositor resources initialized: %ux%u per eye, mode=SBS",
-	         c->view_width, c->view_height);
+	U_LOG_W("GL compositor resources initialized: %ux%u per eye, atlas %ux%u (%u cols x %u rows)",
+	         c->view_width, c->view_height, atlas_width, atlas_height, c->tile_columns, c->tile_rows);
 
 	return true;
 }
@@ -1512,6 +1452,41 @@ comp_gl_compositor_request_display_mode(struct xrt_compositor *xc, bool enable_3
 		return xrt_display_processor_gl_request_display_mode(c->display_processor, enable_3d);
 	}
 
+	return false;
+}
+
+bool
+comp_gl_compositor_get_predicted_eye_positions(struct xrt_compositor *xc,
+                                               struct xrt_vec3 *out_left_eye,
+                                               struct xrt_vec3 *out_right_eye)
+{
+	if (xc == NULL) {
+		return false;
+	}
+
+	struct comp_gl_compositor *c = gl_comp(xc);
+
+	if (c->display_processor != NULL) {
+		struct xrt_eye_pair eyes;
+		if (xrt_display_processor_gl_get_predicted_eye_positions(c->display_processor, &eyes) &&
+		    eyes.valid) {
+			out_left_eye->x = eyes.left.x;
+			out_left_eye->y = eyes.left.y;
+			out_left_eye->z = eyes.left.z;
+			out_right_eye->x = eyes.right.x;
+			out_right_eye->y = eyes.right.y;
+			out_right_eye->z = eyes.right.z;
+			return true;
+		}
+	}
+
+	// Default eye positions
+	out_left_eye->x = -0.032f;
+	out_left_eye->y = 0.0f;
+	out_left_eye->z = 0.6f;
+	out_right_eye->x = 0.032f;
+	out_right_eye->y = 0.0f;
+	out_right_eye->z = 0.6f;
 	return false;
 }
 

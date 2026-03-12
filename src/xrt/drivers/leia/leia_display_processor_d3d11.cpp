@@ -45,9 +45,9 @@ leia_dp_d3d11(struct xrt_display_processor_d3d11 *xdp)
  */
 
 static void
-leia_dp_d3d11_process_stereo(struct xrt_display_processor_d3d11 *xdp,
+leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
                              void *d3d11_context,
-                             void *stereo_srv,
+                             void *atlas_srv,
                              uint32_t view_width,
                              uint32_t view_height,
                              uint32_t format,
@@ -58,7 +58,7 @@ leia_dp_d3d11_process_stereo(struct xrt_display_processor_d3d11 *xdp,
 	ID3D11DeviceContext *ctx = static_cast<ID3D11DeviceContext *>(d3d11_context);
 
 	// Set input texture for weaving (view_width is single eye, weaver handles SBS)
-	leiasr_d3d11_set_input_texture(ldp->leiasr, stereo_srv, view_width, view_height, format);
+	leiasr_d3d11_set_input_texture(ldp->leiasr, atlas_srv, view_width, view_height, format);
 
 	// Set viewport for target dimensions
 	D3D11_VIEWPORT viewport = {};
@@ -162,7 +162,7 @@ leia_dp_d3d11_destroy(struct xrt_display_processor_d3d11 *xdp)
 static void
 leia_dp_d3d11_init_vtable(struct leia_display_processor_d3d11_impl *ldp)
 {
-	ldp->base.process_stereo = leia_dp_d3d11_process_stereo;
+	ldp->base.process_atlas = leia_dp_d3d11_process_atlas;
 	ldp->base.get_predicted_eye_positions = leia_dp_d3d11_get_predicted_eye_positions;
 	ldp->base.get_window_metrics = leia_dp_d3d11_get_window_metrics;
 	ldp->base.request_display_mode = leia_dp_d3d11_request_display_mode;

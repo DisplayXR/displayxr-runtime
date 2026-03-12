@@ -44,8 +44,8 @@ leia_dp_gl(struct xrt_display_processor_gl *xdp)
  */
 
 static void
-leia_dp_gl_process_stereo(struct xrt_display_processor_gl *xdp,
-                           uint32_t stereo_texture,
+leia_dp_gl_process_atlas(struct xrt_display_processor_gl *xdp,
+                           uint32_t atlas_texture,
                            uint32_t view_width,
                            uint32_t view_height,
                            uint32_t format,
@@ -55,7 +55,7 @@ leia_dp_gl_process_stereo(struct xrt_display_processor_gl *xdp,
 	struct leia_display_processor_gl_impl *ldp = leia_dp_gl(xdp);
 
 	// Set input texture for weaving
-	leiasr_gl_set_input_texture(ldp->leiasr, stereo_texture, view_width, view_height, format);
+	leiasr_gl_set_input_texture(ldp->leiasr, atlas_texture, view_width, view_height, format);
 
 	// Perform weaving to the currently bound framebuffer
 	leiasr_gl_weave(ldp->leiasr);
@@ -145,7 +145,7 @@ leia_dp_gl_destroy(struct xrt_display_processor_gl *xdp)
 static void
 leia_dp_gl_init_vtable(struct leia_display_processor_gl_impl *ldp)
 {
-	ldp->base.process_stereo = leia_dp_gl_process_stereo;
+	ldp->base.process_atlas = leia_dp_gl_process_atlas;
 	ldp->base.get_predicted_eye_positions = leia_dp_gl_get_predicted_eye_positions;
 	ldp->base.get_window_metrics = leia_dp_gl_get_window_metrics;
 	ldp->base.request_display_mode = leia_dp_gl_request_display_mode;

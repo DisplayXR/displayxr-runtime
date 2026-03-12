@@ -5,10 +5,10 @@
  * @brief  Header for @ref xrt_display_processor_d3d11 interface.
  *
  * D3D11 variant of the display processor abstraction for vendor-specific
- * stereo-to-display output processing (interlacing, SBS, anaglyph, etc.).
+ * atlas-to-display output processing (interlacing, SBS, anaglyph, etc.).
  *
  * Unlike the Vulkan variant, this interface operates on D3D11 resources:
- * - Input is a side-by-side stereo SRV (not separate left/right views)
+ * - Input is an atlas SRV (not separate left/right views)
  * - Output goes to the currently bound render target (no framebuffer param)
  * - No command buffer — D3D11 uses immediate-mode device context
  *
@@ -35,11 +35,11 @@ struct xrt_window_metrics;
 /*!
  * @interface xrt_display_processor_d3d11
  *
- * D3D11 display output processor that converts a side-by-side stereo
+ * D3D11 display output processor that converts an atlas
  * texture into the final display output format.
  *
- * The compositor calls process_stereo() after rendering the stereo
- * pair into an SBS texture. The display processor writes the final
+ * The compositor calls process_atlas() after rendering the view
+ * pair into an atlas texture. The display processor writes the final
  * output (interlaced pattern, etc.) to the currently bound render target.
  *
  * @ingroup xrt_iface
@@ -47,7 +47,7 @@ struct xrt_window_metrics;
 struct xrt_display_processor_d3d11
 {
 	/*!
-	 * Process a side-by-side stereo texture into the final display output.
+	 * Process an atlas texture into the final display output.
 	 *
 	 * The output render target must already be bound via OMSetRenderTargets.
 	 * The implementation will set the viewport and perform the display-
@@ -55,18 +55,22 @@ struct xrt_display_processor_d3d11
 	 *
 	 * @param      xdp              Pointer to self.
 	 * @param      d3d11_context    D3D11 device context (ID3D11DeviceContext*).
-	 * @param      stereo_srv       SBS stereo texture SRV (ID3D11ShaderResourceView*).
-	 * @param      view_width       Width of one eye view (half of SBS texture width).
-	 * @param      view_height      Height of the views.
-	 * @param      format           DXGI format of the stereo texture (DXGI_FORMAT as uint32_t).
+	 * @param      atlas_srv       Atlas texture SRV (ID3D11ShaderResourceView*).
+	 * @param      view_width       Width of one eye view in pixels.
+	 * @param      view_height      Height of one eye view in pixels.
+	 * @param      tile_columns     Number of tile columns in the atlas layout.
+	 * @param      tile_rows        Number of tile rows in the atlas layout.
+	 * @param      format           DXGI format of the atlas texture (DXGI_FORMAT as uint32_t).
 	 * @param      target_width     Width of the output render target in pixels.
 	 * @param      target_height    Height of the output render target in pixels.
 	 */
-	void (*process_stereo)(struct xrt_display_processor_d3d11 *xdp,
+	void (*process_atlas)(struct xrt_display_processor_d3d11 *xdp,
 	                       void *d3d11_context,
-	                       void *stereo_srv,
+	                       void *atlas_srv,
 	                       uint32_t view_width,
 	                       uint32_t view_height,
+	                       uint32_t tile_columns,
+	                       uint32_t tile_rows,
 	                       uint32_t format,
 	                       uint32_t target_width,
 	                       uint32_t target_height);
@@ -119,24 +123,26 @@ struct xrt_display_processor_d3d11
 };
 
 /*!
- * @copydoc xrt_display_processor_d3d11::process_stereo
+ * @copydoc xrt_display_processor_d3d11::process_atlas
  *
  * Helper for calling through the function pointer.
  *
  * @public @memberof xrt_display_processor_d3d11
  */
 static inline void
-xrt_display_processor_d3d11_process_stereo(struct xrt_display_processor_d3d11 *xdp,
+xrt_display_processor_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
                                            void *d3d11_context,
-                                           void *stereo_srv,
+                                           void *atlas_srv,
                                            uint32_t view_width,
                                            uint32_t view_height,
+                                           uint32_t tile_columns,
+                                           uint32_t tile_rows,
                                            uint32_t format,
                                            uint32_t target_width,
                                            uint32_t target_height)
 {
-	xdp->process_stereo(xdp, d3d11_context, stereo_srv, view_width, view_height, format, target_width,
-	                    target_height);
+	xdp->process_atlas(xdp, d3d11_context, atlas_srv, view_width, view_height, tile_columns, tile_rows, format,
+	                    target_width, target_height);
 }
 
 /*!

@@ -5,10 +5,10 @@
  * @brief  Header for @ref xrt_display_processor_gl interface.
  *
  * OpenGL variant of the display processor abstraction for vendor-specific
- * stereo-to-display output processing (interlacing, SBS, anaglyph, etc.).
+ * atlas-to-display output processing (interlacing, SBS, anaglyph, etc.).
  *
  * Unlike the D3D11 variant, this interface operates on GL resources:
- * - Input is a side-by-side stereo texture (GLuint)
+ * - Input is an atlas texture (GLuint)
  * - Output goes to the currently bound framebuffer (FBO 0 for window)
  * - No context param — GL context is thread-local state
  *
@@ -35,11 +35,11 @@ struct xrt_window_metrics;
 /*!
  * @interface xrt_display_processor_gl
  *
- * OpenGL display output processor that converts a side-by-side stereo
+ * OpenGL display output processor that converts an atlas
  * texture into the final display output format.
  *
- * The compositor calls process_stereo() after rendering the stereo
- * pair into an SBS texture. The display processor writes the final
+ * The compositor calls process_atlas() after rendering the view
+ * pair into an atlas texture. The display processor writes the final
  * output to the currently bound framebuffer.
  *
  * @ingroup xrt_iface
@@ -47,24 +47,28 @@ struct xrt_window_metrics;
 struct xrt_display_processor_gl
 {
 	/*!
-	 * Process a side-by-side stereo texture into the final display output.
+	 * Process an atlas texture into the final display output.
 	 *
 	 * The caller must bind the target framebuffer (FBO 0 for window)
 	 * and set the viewport before calling. The implementation renders
 	 * the display-specific output (interlacing, etc.) to the bound FBO.
 	 *
 	 * @param      xdp              Pointer to self.
-	 * @param      stereo_texture   SBS stereo texture (GLuint).
-	 * @param      view_width       Width of one eye view (half of SBS texture width).
-	 * @param      view_height      Height of the views.
-	 * @param      format           GL internal format of the stereo texture (GLenum as uint32_t).
+	 * @param      atlas_texture   Atlas texture (GLuint).
+	 * @param      view_width       Width of one eye view in pixels.
+	 * @param      view_height      Height of one eye view in pixels.
+	 * @param      tile_columns     Number of tile columns in the atlas layout.
+	 * @param      tile_rows        Number of tile rows in the atlas layout.
+	 * @param      format           GL internal format of the atlas texture (GLenum as uint32_t).
 	 * @param      target_width     Width of the output render target in pixels.
 	 * @param      target_height    Height of the output render target in pixels.
 	 */
-	void (*process_stereo)(struct xrt_display_processor_gl *xdp,
-	                       uint32_t stereo_texture,
+	void (*process_atlas)(struct xrt_display_processor_gl *xdp,
+	                       uint32_t atlas_texture,
 	                       uint32_t view_width,
 	                       uint32_t view_height,
+	                       uint32_t tile_columns,
+	                       uint32_t tile_rows,
 	                       uint32_t format,
 	                       uint32_t target_width,
 	                       uint32_t target_height);
@@ -117,22 +121,25 @@ struct xrt_display_processor_gl
 };
 
 /*!
- * @copydoc xrt_display_processor_gl::process_stereo
+ * @copydoc xrt_display_processor_gl::process_atlas
  *
  * Helper for calling through the function pointer.
  *
  * @public @memberof xrt_display_processor_gl
  */
 static inline void
-xrt_display_processor_gl_process_stereo(struct xrt_display_processor_gl *xdp,
-                                        uint32_t stereo_texture,
+xrt_display_processor_gl_process_atlas(struct xrt_display_processor_gl *xdp,
+                                        uint32_t atlas_texture,
                                         uint32_t view_width,
                                         uint32_t view_height,
+                                        uint32_t tile_columns,
+                                        uint32_t tile_rows,
                                         uint32_t format,
                                         uint32_t target_width,
                                         uint32_t target_height)
 {
-	xdp->process_stereo(xdp, stereo_texture, view_width, view_height, format, target_width, target_height);
+	xdp->process_atlas(xdp, atlas_texture, view_width, view_height, tile_columns, tile_rows, format,
+	                    target_width, target_height);
 }
 
 /*!

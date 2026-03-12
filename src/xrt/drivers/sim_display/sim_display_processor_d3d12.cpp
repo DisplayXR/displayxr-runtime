@@ -4,7 +4,7 @@
  * @file
  * @brief  Simulation D3D12 display processor: SBS, anaglyph, alpha-blend output.
  *
- * Implements SBS, anaglyph, and alpha-blend stereo output modes using HLSL
+ * Implements SBS, anaglyph, and alpha-blend atlas output modes using HLSL
  * shaders compiled at runtime via D3DCompile. All 3 PSOs are pre-compiled
  * at init for instant runtime switching via 1/2/3 keys.
  *
@@ -53,34 +53,56 @@ VS_OUTPUT main(uint id : SV_VertexID) {
 
 // SBS pixel shader: pass-through (identity) so all modes go through the same path
 static const char *ps_sbs_source = R"(
-Texture2D stereo_tex : register(t0);
+Texture2D atlas_tex : register(t0);
 SamplerState samp : register(s0);
 
 float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
-	return stereo_tex.Sample(samp, uv);
+	return atlas_tex.Sample(samp, uv);
 }
 )";
 
-// Anaglyph pixel shader: SBS texture, left=red, right=green+blue
+// Anaglyph pixel shader: tiled atlas texture, left=red, right=green+blue
 static const char *ps_anaglyph_source = R"(
-Texture2D stereo_tex : register(t0);
+Texture2D atlas_tex : register(t0);
 SamplerState samp : register(s0);
 
+cbuffer TileParams : register(b0) {
+	float tile_cols_inv;
+	float tile_rows_inv;
+	float tile_cols;
+	float tile_rows;
+};
+
 float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
-	float4 left  = stereo_tex.Sample(samp, float2(uv.x * 0.5, uv.y));
-	float4 right = stereo_tex.Sample(samp, float2(uv.x * 0.5 + 0.5, uv.y));
+	float2 left_uv = float2(uv.x * tile_cols_inv, uv.y * tile_rows_inv);
+	uint col1 = 1 % (uint)tile_cols;
+	uint row1 = 1 / (uint)tile_cols;
+	float2 right_uv = float2((uv.x + col1) * tile_cols_inv, (uv.y + row1) * tile_rows_inv);
+	float4 left  = atlas_tex.Sample(samp, left_uv);
+	float4 right = atlas_tex.Sample(samp, right_uv);
 	return float4(left.r, right.g, right.b, 1.0);
 }
 )";
 
-// Blend pixel shader: SBS texture, 50/50 mix
+// Blend pixel shader: tiled atlas texture, 50/50 mix
 static const char *ps_blend_source = R"(
-Texture2D stereo_tex : register(t0);
+Texture2D atlas_tex : register(t0);
 SamplerState samp : register(s0);
 
+cbuffer TileParams : register(b0) {
+	float tile_cols_inv;
+	float tile_rows_inv;
+	float tile_cols;
+	float tile_rows;
+};
+
 float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
-	float4 left  = stereo_tex.Sample(samp, float2(uv.x * 0.5, uv.y));
-	float4 right = stereo_tex.Sample(samp, float2(uv.x * 0.5 + 0.5, uv.y));
+	float2 left_uv = float2(uv.x * tile_cols_inv, uv.y * tile_rows_inv);
+	uint col1 = 1 % (uint)tile_cols;
+	uint row1 = 1 / (uint)tile_cols;
+	float2 right_uv = float2((uv.x + col1) * tile_cols_inv, (uv.y + row1) * tile_rows_inv);
+	float4 left  = atlas_tex.Sample(samp, left_uv);
+	float4 right = atlas_tex.Sample(samp, right_uv);
 	return lerp(left, right, 0.5);
 }
 )";
@@ -116,20 +138,22 @@ sim_dp_d3d12(struct xrt_display_processor_d3d12 *xdp)
  */
 
 static void
-sim_dp_d3d12_process_stereo(struct xrt_display_processor_d3d12 *xdp,
+sim_dp_d3d12_process_atlas(struct xrt_display_processor_d3d12 *xdp,
                              void *d3d12_command_list,
-                             void *stereo_texture_resource,
-                             uint64_t stereo_srv_gpu_handle,
+                             void *atlas_texture_resource,
+                             uint64_t atlas_srv_gpu_handle,
                              uint64_t target_rtv_cpu_handle,
                              uint32_t view_width,
                              uint32_t view_height,
+                             uint32_t tile_columns,
+                             uint32_t tile_rows,
                              uint32_t format,
                              uint32_t target_width,
                              uint32_t target_height)
 {
-	(void)stereo_texture_resource;
 	struct sim_display_processor_d3d12_impl *sdp = sim_dp_d3d12(xdp);
 	ID3D12GraphicsCommandList *cmd_list = static_cast<ID3D12GraphicsCommandList *>(d3d12_command_list);
+	ID3D12Resource *atlas_res = static_cast<ID3D12Resource *>(atlas_texture_resource);
 
 	if (cmd_list == nullptr) {
 		return;
@@ -171,8 +195,28 @@ sim_dp_d3d12_process_stereo(struct xrt_display_processor_d3d12 *xdp,
 
 	// Set SRV via root descriptor table
 	D3D12_GPU_DESCRIPTOR_HANDLE srv_handle;
-	srv_handle.ptr = stereo_srv_gpu_handle;
+	srv_handle.ptr = atlas_srv_gpu_handle;
 	cmd_list->SetGraphicsRootDescriptorTable(0, srv_handle);
+
+	// Compute UV scale from view/atlas dimensions (not 1/tile_columns)
+	// so mapping is correct when atlas is larger than the tiled region.
+	uint32_t atlas_w = tile_columns * view_width;
+	uint32_t atlas_h = tile_rows * view_height;
+	if (atlas_res != nullptr) {
+		D3D12_RESOURCE_DESC desc = atlas_res->GetDesc();
+		atlas_w = static_cast<uint32_t>(desc.Width);
+		atlas_h = static_cast<uint32_t>(desc.Height);
+	}
+	float tile_cols_inv = (atlas_w > 0) ? (static_cast<float>(view_width) / static_cast<float>(atlas_w)) : 0.5f;
+	float tile_rows_inv = (atlas_h > 0) ? (static_cast<float>(view_height) / static_cast<float>(atlas_h)) : 1.0f;
+	float tile_cols_f = static_cast<float>(tile_columns);
+	float tile_rows_f = static_cast<float>(tile_rows);
+	uint32_t tile_constants[4];
+	memcpy(&tile_constants[0], &tile_cols_inv, sizeof(float));
+	memcpy(&tile_constants[1], &tile_rows_inv, sizeof(float));
+	memcpy(&tile_constants[2], &tile_cols_f, sizeof(float));
+	memcpy(&tile_constants[3], &tile_rows_f, sizeof(float));
+	cmd_list->SetGraphicsRoot32BitConstants(1, 4, tile_constants, 0);
 
 	// Draw fullscreen quad (4 vertices, triangle strip)
 	cmd_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
@@ -239,7 +283,7 @@ compile_shader(const char *source, const char *entry, const char *target, ID3DBl
 
 /*
  *
- * Helper: create root signature with 1 SRV descriptor table + 1 static sampler.
+ * Helper: create root signature with 1 SRV descriptor table + 2 root constants + 1 static sampler.
  *
  */
 
@@ -254,12 +298,19 @@ create_root_signature(ID3D12Device *device, ID3D12RootSignature **out_rs)
 	srv_range.RegisterSpace = 0;
 	srv_range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
-	// Root parameter: 1 descriptor table
-	D3D12_ROOT_PARAMETER root_param = {};
-	root_param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-	root_param.DescriptorTable.NumDescriptorRanges = 1;
-	root_param.DescriptorTable.pDescriptorRanges = &srv_range;
-	root_param.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+	// Root parameter 0: 1 descriptor table (SRV)
+	D3D12_ROOT_PARAMETER root_params[2] = {};
+	root_params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+	root_params[0].DescriptorTable.NumDescriptorRanges = 1;
+	root_params[0].DescriptorTable.pDescriptorRanges = &srv_range;
+	root_params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+	// Root parameter 1: 4 x 32-bit constants (tile_cols_inv, tile_rows_inv, tile_cols, tile_rows) -> cbuffer b0
+	root_params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+	root_params[1].Constants.ShaderRegister = 0;
+	root_params[1].Constants.RegisterSpace = 0;
+	root_params[1].Constants.Num32BitValues = 4;
+	root_params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
 	// Static sampler: linear, clamp (register s0)
 	D3D12_STATIC_SAMPLER_DESC sampler = {};
@@ -278,8 +329,8 @@ create_root_signature(ID3D12Device *device, ID3D12RootSignature **out_rs)
 	sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
 	D3D12_ROOT_SIGNATURE_DESC rs_desc = {};
-	rs_desc.NumParameters = 1;
-	rs_desc.pParameters = &root_param;
+	rs_desc.NumParameters = 2;
+	rs_desc.pParameters = root_params;
 	rs_desc.NumStaticSamplers = 1;
 	rs_desc.pStaticSamplers = &sampler;
 	rs_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
@@ -331,7 +382,7 @@ sim_display_processor_d3d12_create(enum sim_display_output_mode mode,
 	}
 
 	sdp->base.destroy = sim_dp_d3d12_destroy;
-	sdp->base.process_stereo = sim_dp_d3d12_process_stereo;
+	sdp->base.process_atlas = sim_dp_d3d12_process_atlas;
 	sdp->base.get_predicted_eye_positions = sim_dp_d3d12_get_predicted_eye_positions;
 
 	// Nominal viewer parameters (same defaults as sim_display_hmd_create)
