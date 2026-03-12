@@ -183,6 +183,33 @@ static const char *FS_ANAGLYPH =
     "    fragColor = vec4(left.r, right.g, right.b, 1.0);\n"
     "}\n";
 
+//! Vertex shader: positioned quad for window-space layers.
+//! Takes uniform position/size in NDC.
+static const char *VS_WINDOW_SPACE =
+    "#version 330 core\n"
+    "out vec2 v_uv;\n"
+    "uniform vec4 u_rect;\n" // x, y, w, h in NDC [-1,1]
+    "void main() {\n"
+    "    float x = float((gl_VertexID & 1) << 1) - 1.0;\n" // -1 or 1
+    "    float y = float((gl_VertexID & 2)) - 1.0;\n"       // -1 or 1
+    "    v_uv = vec2((x + 1.0) * 0.5, (y + 1.0) * 0.5);\n"
+    "    gl_Position = vec4(u_rect.x + (x * 0.5 + 0.5) * u_rect.z,\n"
+    "                       u_rect.y + (y * 0.5 + 0.5) * u_rect.w,\n"
+    "                       0.0, 1.0);\n"
+    "}\n";
+
+//! Fragment shader: textured quad with alpha.
+static const char *FS_TEXTURED =
+    "#version 330 core\n"
+    "in vec2 v_uv;\n"
+    "out vec4 fragColor;\n"
+    "uniform sampler2D u_texture;\n"
+    "uniform vec4 u_src_rect;\n" // x, y, w, h in texture coords
+    "void main() {\n"
+    "    vec2 uv = u_src_rect.xy + v_uv * u_src_rect.zw;\n"
+    "    fragColor = texture(u_texture, uv);\n"
+    "}\n";
+
 //! Fragment shader: 50/50 blend.
 static const char *FS_BLEND =
     "#version 330 core\n"
@@ -222,6 +249,7 @@ struct comp_gl_compositor
 	GLuint program_sbs;       //!< SBS pass-through
 	GLuint program_anaglyph;  //!< Anaglyph red/cyan
 	GLuint program_blend;     //!< 50/50 blend
+	GLuint program_window_space; //!< Window-space layer (positioned quad)
 	GLuint vao_empty;         //!< Empty VAO for vertex-shader-generated fullscreen quad
 	GLuint fbo;               //!< Framebuffer for rendering into SBS texture
 	GLuint stereo_texture;    //!< SBS stereo texture (width = 2*view_width)
@@ -278,7 +306,7 @@ struct comp_gl_compositor
 
 	// --- State ---
 	enum gl_output_mode output_mode;
-	bool display_3d;  //!< True when in 3D mode, false = 2D passthrough
+	bool hardware_display_3d;  //!< True when in 3D mode, false = 2D passthrough
 	uint64_t last_frame_ns;
 	float hud_timer;            //!< HUD update throttle timer (seconds)
 	float smoothed_frame_time_ms; //!< Smoothed frame time for HUD FPS display
@@ -895,7 +923,7 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 
 		for (uint32_t eye = 0; eye < 2; eye++) {
 			// In 2D mode, only render eye 0 at full width (skip eye 1)
-			if (!c->display_3d && eye > 0) {
+			if (!c->hardware_display_3d && eye > 0) {
 				continue;
 			}
 
@@ -920,7 +948,7 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			}
 
 			// Set viewport for this eye in the SBS texture
-			if (!c->display_3d) {
+			if (!c->hardware_display_3d) {
 				glViewport(0, 0, c->view_width * 2, c->view_height);
 			} else {
 				glViewport(eye * c->view_width, 0, c->view_width, c->view_height);
@@ -936,11 +964,79 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 		}
 	}
 
-	// Sync display_3d and output mode from device's active rendering mode
+	// --- Step 1b: Render window-space layers (HUD overlays) ---
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		struct comp_layer *layer = &c->layer_accum.layers[i];
+
+		if (layer->data.type != XRT_LAYER_WINDOW_SPACE) {
+			continue;
+		}
+
+		const struct xrt_layer_window_space_data *ws = &layer->data.window_space;
+		struct xrt_swapchain *sc = layer->sc_array[0];
+		if (sc == NULL) {
+			continue;
+		}
+
+		struct comp_gl_swapchain *gsc = gl_swapchain(sc);
+		uint32_t img_idx = ws->sub.image_index;
+		if (img_idx >= gsc->image_count) {
+			continue;
+		}
+
+		// Sub-image UV rect
+		struct xrt_normalized_rect nr = ws->sub.norm_rect;
+		if (nr.w <= 0.0f || nr.h <= 0.0f) {
+			nr.x = 0.0f;
+			nr.y = 0.0f;
+			nr.w = 1.0f;
+			nr.h = 1.0f;
+		}
+
+		glUseProgram(c->program_window_space);
+		glEnable(GL_BLEND);
+		glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+		GLint loc_ws_rect = glGetUniformLocation(c->program_window_space, "u_rect");
+		GLint loc_ws_tex = glGetUniformLocation(c->program_window_space, "u_texture");
+		GLint loc_ws_src = glGetUniformLocation(c->program_window_space, "u_src_rect");
+
+		uint32_t effective_views = c->hardware_display_3d ? 2 : 1;
+		for (uint32_t eye = 0; eye < effective_views; eye++) {
+			// Set viewport for this eye
+			if (!c->hardware_display_3d) {
+				glViewport(0, 0, c->view_width * 2, c->view_height);
+			} else {
+				glViewport(eye * c->view_width, 0, c->view_width, c->view_height);
+			}
+
+			// Per-eye disparity offset
+			float half_disp = ws->disparity / 2.0f;
+			float eye_shift = (eye == 0) ? -half_disp : half_disp;
+
+			// Window-space fractional coords → NDC [-1, 1]
+			float ndc_x = (ws->x + eye_shift) * 2.0f - 1.0f;
+			float ndc_y = 1.0f - (ws->y + ws->height) * 2.0f; // flip Y: GL origin is bottom-left
+			float ndc_w = ws->width * 2.0f;
+			float ndc_h = ws->height * 2.0f;
+
+			glUniform4f(loc_ws_rect, ndc_x, ndc_y, ndc_w, ndc_h);
+			glUniform4f(loc_ws_src, nr.x, nr.y, nr.w, nr.h);
+			glActiveTexture(GL_TEXTURE0);
+			glBindTexture(GL_TEXTURE_2D, gsc->textures[img_idx]);
+			glUniform1i(loc_ws_tex, 0);
+
+			glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+		}
+
+		glDisable(GL_BLEND);
+	}
+
+	// Sync hardware_display_3d and output mode from device's active rendering mode
 	if (c->xdev != NULL && c->xdev->hmd != NULL) {
 		uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
 		if (idx < c->xdev->rendering_mode_count) {
-			c->display_3d = c->xdev->rendering_modes[idx].display_3d;
+			c->hardware_display_3d = c->xdev->rendering_modes[idx].hardware_display_3d;
 		}
 		int32_t mode = 0;
 		xrt_device_get_property(c->xdev, XRT_DEVICE_PROPERTY_OUTPUT_MODE, &mode);
@@ -956,7 +1052,7 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 
 	// Select output shader: 2D mode uses blit (passthrough), 3D uses mode-specific
 	GLuint output_program;
-	bool use_blit_for_2d = !c->display_3d;
+	bool use_blit_for_2d = !c->hardware_display_3d;
 	if (use_blit_for_2d) {
 		output_program = c->program_blit;
 	} else {
@@ -1053,7 +1149,7 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 		comp_gl_window_macos_get_dimensions(c->macos_window, &present_w, &present_h);
 #endif
 
-		if (c->display_3d && c->display_processor != NULL) {
+		if (c->hardware_display_3d && c->display_processor != NULL) {
 			// Display processor handles the stereo-to-display conversion
 			glViewport(0, 0, present_w, present_h);
 			xrt_display_processor_gl_process_stereo(
@@ -1143,6 +1239,7 @@ gl_compositor_destroy(struct xrt_compositor *xc)
 	if (c->program_sbs) glDeleteProgram(c->program_sbs);
 	if (c->program_anaglyph) glDeleteProgram(c->program_anaglyph);
 	if (c->program_blend) glDeleteProgram(c->program_blend);
+	if (c->program_window_space) glDeleteProgram(c->program_window_space);
 	if (c->vao_empty) glDeleteVertexArrays(1, &c->vao_empty);
 	if (c->fbo) glDeleteFramebuffers(1, &c->fbo);
 	if (c->stereo_texture) glDeleteTextures(1, &c->stereo_texture);
@@ -1348,8 +1445,10 @@ gl_init_resources(struct comp_gl_compositor *c, uint32_t width, uint32_t height)
 	c->program_sbs = create_program(VS_FULLSCREEN_QUAD, FS_SBS);
 	c->program_anaglyph = create_program(VS_FULLSCREEN_QUAD, FS_ANAGLYPH);
 	c->program_blend = create_program(VS_FULLSCREEN_QUAD, FS_BLEND);
+	c->program_window_space = create_program(VS_WINDOW_SPACE, FS_TEXTURED);
 
-	if (!c->program_blit || !c->program_sbs || !c->program_anaglyph || !c->program_blend) {
+	if (!c->program_blit || !c->program_sbs || !c->program_anaglyph || !c->program_blend ||
+	    !c->program_window_space) {
 		U_LOG_E("Failed to compile GL compositor shaders");
 		return false;
 	}
@@ -1371,7 +1470,7 @@ gl_init_resources(struct comp_gl_compositor *c, uint32_t width, uint32_t height)
 	glBindTexture(GL_TEXTURE_2D, 0);
 
 	c->output_mode = GL_OUTPUT_SBS;
-	c->display_3d = true;
+	c->hardware_display_3d = true;
 
 	U_LOG_W("GL compositor resources initialized: %ux%u per eye, mode=SBS",
 	         c->view_width, c->view_height);
