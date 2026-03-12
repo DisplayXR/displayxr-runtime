@@ -567,13 +567,7 @@ u_hud_update(struct u_hud *hud, const struct u_hud_data *data)
 
 	// === Title ===
 	if (data->device_name) {
-		const char *mode_str = data->mode_3d ? "3D" : "2D";
-		const char *out_str = data->output_mode ? data->output_mode : "";
-		if (out_str[0] != '\0') {
-			snprintf(buf, sizeof(buf), "%s (%s %s)", data->device_name, mode_str, out_str);
-		} else {
-			snprintf(buf, sizeof(buf), "%s (%s)", data->device_name, mode_str);
-		}
+		snprintf(buf, sizeof(buf), "%s", data->device_name);
 		draw_string_aa(hud, x, y, buf, COLOR_TITLE);
 	}
 	y += lh;
@@ -581,6 +575,15 @@ u_hud_update(struct u_hud *hud, const struct u_hud_data *data)
 	// --- Separator ---
 	draw_hline(hud, sep_x0, sep_x1, y - hud->font.ascent + 2 * s, COLOR_SEP);
 	y += s * 3;
+
+	// === Mode ===
+	if (data->rendering_mode_name) {
+		snprintf(buf, sizeof(buf), "%s (%s)", data->rendering_mode_name, data->mode_3d ? "3D" : "2D");
+	} else {
+		const char *out_str = data->output_mode ? data->output_mode : "?";
+		snprintf(buf, sizeof(buf), "%s (%s)", out_str, data->mode_3d ? "3D" : "2D");
+	}
+	y += draw_label_value(hud, x, y, "Mode    ", buf);
 
 	// === Performance section ===
 	snprintf(buf, sizeof(buf), "%.1f    (%.1f ms)", data->fps, data->frame_time_ms);

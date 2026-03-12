@@ -49,6 +49,7 @@ struct u_hud_data
 	float frame_time_ms;
 	bool mode_3d;
 	const char *output_mode;                       //!< "Weaved", "Fallback", "SBS", etc.
+	const char *rendering_mode_name;               //!< Rendering mode label (e.g. "Blend", "SBS", "2D")
 	uint32_t render_width;
 	uint32_t render_height;
 	uint32_t window_width;
