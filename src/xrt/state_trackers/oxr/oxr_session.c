@@ -359,7 +359,7 @@ oxr_session_request_display_mode(struct oxr_logger *log, struct oxr_session *ses
 	if (sess->is_d3d11_native_compositor) {
 		success = comp_d3d11_compositor_request_display_mode(&sess->xcn->base, enable_3d);
 		if (success) {
-			sess->display_mode_3d = enable_3d;
+			sess->hardware_display_3d = enable_3d;
 		}
 		return XR_SUCCESS;
 	}
@@ -369,7 +369,7 @@ oxr_session_request_display_mode(struct oxr_logger *log, struct oxr_session *ses
 	if (sess->is_d3d12_native_compositor) {
 		success = comp_d3d12_compositor_request_display_mode(&sess->xcn->base, enable_3d);
 		if (success) {
-			sess->display_mode_3d = enable_3d;
+			sess->hardware_display_3d = enable_3d;
 		}
 		return XR_SUCCESS;
 	}
@@ -379,7 +379,7 @@ oxr_session_request_display_mode(struct oxr_logger *log, struct oxr_session *ses
 	if (sess->is_metal_native_compositor) {
 		success = comp_metal_compositor_request_display_mode(&sess->xcn->base, enable_3d);
 		if (success) {
-			sess->display_mode_3d = enable_3d;
+			sess->hardware_display_3d = enable_3d;
 		}
 		return XR_SUCCESS;
 	}
@@ -389,7 +389,7 @@ oxr_session_request_display_mode(struct oxr_logger *log, struct oxr_session *ses
 	if (sess->is_gl_native_compositor) {
 		success = comp_gl_compositor_request_display_mode(&sess->xcn->base, enable_3d);
 		if (success) {
-			sess->display_mode_3d = enable_3d;
+			sess->hardware_display_3d = enable_3d;
 		}
 		return XR_SUCCESS;
 	}
@@ -399,7 +399,7 @@ oxr_session_request_display_mode(struct oxr_logger *log, struct oxr_session *ses
 	if (sess->is_vk_native_compositor) {
 		success = comp_vk_native_compositor_request_display_mode(&sess->xcn->base, enable_3d);
 		if (success) {
-			sess->display_mode_3d = enable_3d;
+			sess->hardware_display_3d = enable_3d;
 		}
 		return XR_SUCCESS;
 	}
@@ -411,7 +411,7 @@ oxr_session_request_display_mode(struct oxr_logger *log, struct oxr_session *ses
 		struct multi_compositor *mc = multi_compositor(&sess->xcn->base);
 		success = multi_compositor_request_display_mode(mc, enable_3d);
 		if (success) {
-			sess->display_mode_3d = enable_3d;
+			sess->hardware_display_3d = enable_3d;
 		}
 		return XR_SUCCESS;
 	}
@@ -675,7 +675,7 @@ oxr_session_begin(struct oxr_logger *log, struct oxr_session *sess, const XrSess
 			uint32_t default_mode = head->hmd->active_rendering_mode_index;
 			if (default_mode < head->rendering_mode_count) {
 				struct xrt_rendering_mode *mode = &head->rendering_modes[default_mode];
-				oxr_session_request_display_mode(log, sess, mode->display_3d);
+				oxr_session_request_display_mode(log, sess, mode->hardware_display_3d);
 				xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, default_mode);
 			} else {
 				oxr_session_request_display_mode(log, sess, true);
@@ -718,7 +718,7 @@ oxr_session_end(struct oxr_logger *log, struct oxr_session *sess)
 	{
 		struct xrt_device *head = GET_XDEV_BY_ROLE(sess->sys, head);
 		if (head != NULL && head->rendering_mode_count > 0 &&
-		    !head->rendering_modes[0].display_3d) {
+		    !head->rendering_modes[0].hardware_display_3d) {
 			xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, 0);
 			head->hmd->active_rendering_mode_index = 0;
 		}
