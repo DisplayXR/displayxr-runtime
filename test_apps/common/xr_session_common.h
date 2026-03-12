@@ -109,6 +109,9 @@ struct XrSessionManager {
     PFN_xrRequestDisplayRenderingModeEXT pfnRequestDisplayRenderingModeEXT = nullptr;
     PFN_xrEnumerateDisplayRenderingModesEXT pfnEnumerateDisplayRenderingModesEXT = nullptr;
 
+    // Shared texture output rect (XR_EXT_display_info v11)
+    PFN_xrSetSharedTextureOutputRectEXT pfnSetSharedTextureOutputRectEXT = nullptr;
+
     // Enumerated rendering mode info
     uint32_t renderingModeCount = 0;
     char renderingModeNames[8][XR_MAX_SYSTEM_NAME_SIZE] = {};
