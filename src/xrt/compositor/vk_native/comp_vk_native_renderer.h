@@ -102,6 +102,20 @@ uint64_t
 comp_vk_native_renderer_get_stereo_image(struct comp_vk_native_renderer *renderer);
 
 /*!
+ * Get the per-eye VkImages (for compositing window-space layers).
+ *
+ * @param renderer The renderer.
+ * @param out_left_image Left eye VkImage as uint64_t.
+ * @param out_right_image Right eye VkImage as uint64_t.
+ *
+ * @ingroup comp_vk_native
+ */
+void
+comp_vk_native_renderer_get_eye_images(struct comp_vk_native_renderer *renderer,
+                                        uint64_t *out_left_image,
+                                        uint64_t *out_right_image);
+
+/*!
  * Get stereo texture dimensions.
  *
  * @param renderer The renderer.

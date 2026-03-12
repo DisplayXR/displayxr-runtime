@@ -847,6 +847,222 @@ vk_compositor_layer_window_space(struct xrt_compositor *xc,
 	return XRT_SUCCESS;
 }
 
+/*!
+ * Blit window-space (HUD) layers onto the per-eye images, pre-weave.
+ * Called after renderer_draw has produced the per-eye images in
+ * SHADER_READ_ONLY_OPTIMAL layout.
+ */
+static void
+vk_compositor_blit_window_space_layers(struct comp_vk_native_compositor *c)
+{
+	struct vk_bundle *vk = &c->vk;
+
+	// Check if there are any window-space layers
+	bool has_ws = false;
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		if (c->layer_accum.layers[i].data.type == XRT_LAYER_WINDOW_SPACE) {
+			has_ws = true;
+			break;
+		}
+	}
+	if (!has_ws) {
+		return;
+	}
+
+	uint64_t left_img_u64, right_img_u64;
+	comp_vk_native_renderer_get_eye_images(c->renderer, &left_img_u64, &right_img_u64);
+	VkImage left_img = (VkImage)(uintptr_t)left_img_u64;
+	VkImage right_img = (VkImage)(uintptr_t)right_img_u64;
+
+	uint32_t view_width, view_height;
+	comp_vk_native_renderer_get_view_dimensions(c->renderer, &view_width, &view_height);
+
+	VkCommandPool cmd_pool = (VkCommandPool)(uintptr_t)
+	    comp_vk_native_renderer_get_cmd_pool(c->renderer);
+
+	VkCommandBufferAllocateInfo alloc_info = {
+	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+	    .commandPool = cmd_pool,
+	    .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+	    .commandBufferCount = 1,
+	};
+
+	VkCommandBuffer cmd;
+	VkResult res = vk->vkAllocateCommandBuffers(vk->device, &alloc_info, &cmd);
+	if (res != VK_SUCCESS) {
+		return;
+	}
+
+	VkCommandBufferBeginInfo begin_info = {
+	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+	    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+	};
+	vk->vkBeginCommandBuffer(cmd, &begin_info);
+
+	// Transition per-eye images from SHADER_READ_ONLY to TRANSFER_DST
+	VkImageMemoryBarrier to_dst[2] = {
+	    {
+	        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	        .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
+	        .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+	        .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	        .image = left_img,
+	        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	    },
+	    {
+	        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	        .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
+	        .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+	        .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	        .image = right_img,
+	        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	    },
+	};
+	vk->vkCmdPipelineBarrier(cmd,
+	    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+	    VK_PIPELINE_STAGE_TRANSFER_BIT,
+	    0, 0, NULL, 0, NULL, 2, to_dst);
+
+	// Blit each window-space layer onto both per-eye images
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		struct comp_layer *layer = &c->layer_accum.layers[i];
+		if (layer->data.type != XRT_LAYER_WINDOW_SPACE) {
+			continue;
+		}
+
+		struct xrt_swapchain *xsc = layer->sc_array[0];
+		if (xsc == NULL) {
+			continue;
+		}
+
+		const struct xrt_layer_window_space_data *ws = &layer->data.window_space;
+		uint32_t sc_index = ws->sub.image_index;
+
+		VkImage src_image = (VkImage)(uintptr_t)
+		    comp_vk_native_swapchain_get_image(xsc, sc_index);
+		if (src_image == VK_NULL_HANDLE) {
+			continue;
+		}
+
+		// Source rect from the swapchain sub-image
+		const struct xrt_rect *src_rect = &ws->sub.rect;
+		int32_t sx0 = src_rect->offset.w;
+		int32_t sy0 = src_rect->offset.h;
+		int32_t sx1 = sx0 + (int32_t)src_rect->extent.w;
+		int32_t sy1 = sy0 + (int32_t)src_rect->extent.h;
+
+		// Destination rect in per-eye coordinates (fractional window position)
+		int32_t dx0 = (int32_t)(ws->x * (float)view_width);
+		int32_t dy0 = (int32_t)(ws->y * (float)view_height);
+		int32_t dw = (int32_t)(ws->width * (float)view_width);
+		int32_t dh = (int32_t)(ws->height * (float)view_height);
+
+		// Disparity shift in pixels (fraction of view width)
+		int32_t disp_px = (int32_t)(ws->disparity * (float)view_width);
+
+		// Transition source to TRANSFER_SRC
+		VkImageMemoryBarrier src_to_transfer = {
+		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		    .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+		    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+		    .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		    .image = src_image,
+		    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1,
+		                         ws->sub.array_index, 1},
+		};
+		vk->vkCmdPipelineBarrier(cmd,
+		    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		    VK_PIPELINE_STAGE_TRANSFER_BIT,
+		    0, 0, NULL, 0, NULL, 1, &src_to_transfer);
+
+		// Blit to left eye (shift left by half disparity)
+		VkImageBlit left_blit = {
+		    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0,
+		                       ws->sub.array_index, 1},
+		    .srcOffsets = {{sx0, sy0, 0}, {sx1, sy1, 1}},
+		    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+		    .dstOffsets = {{dx0 - disp_px, dy0, 0},
+		                   {dx0 - disp_px + dw, dy0 + dh, 1}},
+		};
+		vk->vkCmdBlitImage(cmd,
+		    src_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		    left_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		    1, &left_blit, VK_FILTER_LINEAR);
+
+		// Blit to right eye (shift right by half disparity)
+		VkImageBlit right_blit = {
+		    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0,
+		                       ws->sub.array_index, 1},
+		    .srcOffsets = {{sx0, sy0, 0}, {sx1, sy1, 1}},
+		    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+		    .dstOffsets = {{dx0 + disp_px, dy0, 0},
+		                   {dx0 + disp_px + dw, dy0 + dh, 1}},
+		};
+		vk->vkCmdBlitImage(cmd,
+		    src_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		    right_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		    1, &right_blit, VK_FILTER_LINEAR);
+
+		// Transition source back to COLOR_ATTACHMENT
+		VkImageMemoryBarrier src_back = {
+		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		    .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+		    .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+		    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		    .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		    .image = src_image,
+		    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1,
+		                         ws->sub.array_index, 1},
+		};
+		vk->vkCmdPipelineBarrier(cmd,
+		    VK_PIPELINE_STAGE_TRANSFER_BIT,
+		    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		    0, 0, NULL, 0, NULL, 1, &src_back);
+	}
+
+	// Transition per-eye images back to SHADER_READ_ONLY
+	VkImageMemoryBarrier to_shader[2] = {
+	    {
+	        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+	        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+	        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	        .image = left_img,
+	        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	    },
+	    {
+	        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+	        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+	        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	        .image = right_img,
+	        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	    },
+	};
+	vk->vkCmdPipelineBarrier(cmd,
+	    VK_PIPELINE_STAGE_TRANSFER_BIT,
+	    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+	    0, 0, NULL, 0, NULL, 2, to_shader);
+
+	vk->vkEndCommandBuffer(cmd);
+
+	VkSubmitInfo submit_info = {
+	    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+	    .commandBufferCount = 1,
+	    .pCommandBuffers = &cmd,
+	};
+	res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, VK_NULL_HANDLE);
+	if (res == VK_SUCCESS) {
+		vk->vkQueueWaitIdle(vk->main_queue->queue);
+	}
+	vk->vkFreeCommandBuffers(vk->device, cmd_pool, 1, &cmd);
+}
+
 static xrt_result_t
 vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
 {
@@ -901,13 +1117,16 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 		comp_vk_native_target_get_dimensions(c->target, &tgt_width, &tgt_height);
 	}
 
-	// Render layers to stereo texture
+	// Render projection layers to stereo texture (per-eye images)
 	xrt_result_t xret = comp_vk_native_renderer_draw(
 	    c->renderer, &c->layer_accum, &left_eye, &right_eye, tgt_width, tgt_height, is_mono);
 	if (xret != XRT_SUCCESS) {
 		U_LOG_E("Failed to render layers");
 		return xret;
 	}
+
+	// Composite window-space (HUD) layers onto per-eye images before weaving
+	vk_compositor_blit_window_space_layers(c);
 
 	// Shared texture output path — render to IOSurface-backed VkImage
 	if (c->has_shared_texture && c->shared_image != VK_NULL_HANDLE) {

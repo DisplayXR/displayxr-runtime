@@ -605,6 +605,15 @@ comp_vk_native_renderer_get_stereo_image(struct comp_vk_native_renderer *r)
 }
 
 void
+comp_vk_native_renderer_get_eye_images(struct comp_vk_native_renderer *r,
+                                        uint64_t *out_left_image,
+                                        uint64_t *out_right_image)
+{
+	*out_left_image = (uint64_t)(uintptr_t)r->left_image;
+	*out_right_image = (uint64_t)(uintptr_t)r->right_image;
+}
+
+void
 comp_vk_native_renderer_get_view_dimensions(struct comp_vk_native_renderer *r,
                                              uint32_t *out_view_width,
                                              uint32_t *out_view_height)
