@@ -48,10 +48,14 @@ leia_dp_gl_process_atlas(struct xrt_display_processor_gl *xdp,
                            uint32_t atlas_texture,
                            uint32_t view_width,
                            uint32_t view_height,
+                           uint32_t tile_columns,
+                           uint32_t tile_rows,
                            uint32_t format,
                            uint32_t target_width,
                            uint32_t target_height)
 {
+	(void)tile_columns;
+	(void)tile_rows;
 	struct leia_display_processor_gl_impl *ldp = leia_dp_gl(xdp);
 
 	// Set input texture for weaving

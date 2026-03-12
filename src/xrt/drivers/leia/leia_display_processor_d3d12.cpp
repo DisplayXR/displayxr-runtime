@@ -51,12 +51,16 @@ leia_dp_d3d12_process_atlas(struct xrt_display_processor_d3d12 *xdp,
                              uint64_t target_rtv_cpu_handle,
                              uint32_t view_width,
                              uint32_t view_height,
+                             uint32_t tile_columns,
+                             uint32_t tile_rows,
                              uint32_t format,
                              uint32_t target_width,
                              uint32_t target_height)
 {
 	(void)atlas_srv_gpu_handle;
 	(void)target_rtv_cpu_handle;
+	(void)tile_columns;
+	(void)tile_rows;
 	struct leia_display_processor_d3d12_impl *ldp = leia_dp_d3d12(xdp);
 
 	// Set input texture — SR DX12 weaver needs the ID3D12Resource*

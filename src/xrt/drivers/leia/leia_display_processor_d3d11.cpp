@@ -50,10 +50,14 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
                              void *atlas_srv,
                              uint32_t view_width,
                              uint32_t view_height,
+                             uint32_t tile_columns,
+                             uint32_t tile_rows,
                              uint32_t format,
                              uint32_t target_width,
                              uint32_t target_height)
 {
+	(void)tile_columns;
+	(void)tile_rows;
 	struct leia_display_processor_d3d11_impl *ldp = leia_dp_d3d11(xdp);
 	ID3D11DeviceContext *ctx = static_cast<ID3D11DeviceContext *>(d3d11_context);
 
