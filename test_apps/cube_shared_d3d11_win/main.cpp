@@ -924,6 +924,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     LOG_INFO("=== Shutting down ===");
 
+    // Release RenderState ComPtrs first — these hold copies from the locals
+    rs.appBackBufferRTV.Reset();
+    rs.appSwapchain.Reset();
+    rs.depthDSV.Reset();
+    rs.depthTexture.Reset();
+
     depthDSV.Reset();
     depthTexture.Reset();
     g_sharedSRV.Reset();
