@@ -78,21 +78,7 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *renderer,
                               bool hardware_display_3d);
 
 /*!
- * Get the stereo texture left and right VkImageViews for the display processor.
- *
- * @param renderer The renderer.
- * @param out_left_view VkImageView for left eye (as uint64_t).
- * @param out_right_view VkImageView for right eye (as uint64_t).
- *
- * @ingroup comp_vk_native
- */
-void
-comp_vk_native_renderer_get_stereo_views(struct comp_vk_native_renderer *renderer,
-                                          uint64_t *out_left_view,
-                                          uint64_t *out_right_view);
-
-/*!
- * Get the full side-by-side stereo VkImageView (2*view_width x height).
+ * Get the atlas VkImageView (tile_columns * view_width x tile_rows * height).
  *
  * @param renderer The renderer.
  * @return VkImageView as uint64_t.
@@ -100,10 +86,10 @@ comp_vk_native_renderer_get_stereo_views(struct comp_vk_native_renderer *rendere
  * @ingroup comp_vk_native
  */
 uint64_t
-comp_vk_native_renderer_get_sbs_view(struct comp_vk_native_renderer *renderer);
+comp_vk_native_renderer_get_atlas_view(struct comp_vk_native_renderer *renderer);
 
 /*!
- * Get the stereo texture VkImage.
+ * Get the atlas VkImage.
  *
  * @param renderer The renderer.
  * @return VkImage as uint64_t.
@@ -111,21 +97,7 @@ comp_vk_native_renderer_get_sbs_view(struct comp_vk_native_renderer *renderer);
  * @ingroup comp_vk_native
  */
 uint64_t
-comp_vk_native_renderer_get_stereo_image(struct comp_vk_native_renderer *renderer);
-
-/*!
- * Get the per-eye VkImages (for compositing window-space layers).
- *
- * @param renderer The renderer.
- * @param out_left_image Left eye VkImage as uint64_t.
- * @param out_right_image Right eye VkImage as uint64_t.
- *
- * @ingroup comp_vk_native
- */
-void
-comp_vk_native_renderer_get_eye_images(struct comp_vk_native_renderer *renderer,
-                                        uint64_t *out_left_image,
-                                        uint64_t *out_right_image);
+comp_vk_native_renderer_get_atlas_image(struct comp_vk_native_renderer *renderer);
 
 /*!
  * Get stereo texture dimensions.
@@ -207,6 +179,34 @@ comp_vk_native_renderer_blit_to_shared(struct comp_vk_native_renderer *renderer,
                                         uint64_t dst_image,
                                         uint32_t dst_width,
                                         uint32_t dst_height);
+
+/*!
+ * Get the tile layout of the atlas texture.
+ *
+ * @param renderer The renderer.
+ * @param out_tile_columns Number of tile columns.
+ * @param out_tile_rows Number of tile rows.
+ *
+ * @ingroup comp_vk_native
+ */
+void
+comp_vk_native_renderer_get_tile_layout(struct comp_vk_native_renderer *renderer,
+                                         uint32_t *out_tile_columns,
+                                         uint32_t *out_tile_rows);
+
+/*!
+ * Set the tile layout of the atlas texture.
+ *
+ * @param renderer The renderer.
+ * @param tile_columns Number of tile columns.
+ * @param tile_rows Number of tile rows.
+ *
+ * @ingroup comp_vk_native
+ */
+void
+comp_vk_native_renderer_set_tile_layout(struct comp_vk_native_renderer *renderer,
+                                         uint32_t tile_columns,
+                                         uint32_t tile_rows);
 
 /*!
  * Get the command pool for recording commands.

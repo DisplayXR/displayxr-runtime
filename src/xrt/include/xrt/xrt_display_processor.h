@@ -4,7 +4,7 @@
  * @file
  * @brief  Header for @ref xrt_display_processor interface.
  *
- * Abstracts vendor-specific stereo-to-display output processing
+ * Abstracts vendor-specific atlas-to-display output processing
  * (interlacing for light field displays, SBS layout, anaglyph, etc.)
  * so the compositor remains vendor-agnostic.
  *
@@ -48,18 +48,18 @@ struct xrt_window_metrics;
 /*!
  * @interface xrt_display_processor
  *
- * Generic display output processor that converts rendered stereo views
+ * Generic display output processor that converts a tiled atlas texture
  * into the final display output format. Each vendor (Leia SR SDK, CNSDK,
  * simulation, etc.) provides its own implementation.
  *
- * The compositor calls process_views() after compositing the left/right
- * eye layers, and the display processor produces the final output
+ * The compositor calls process_atlas() after compositing all views
+ * into an atlas texture, and the display processor produces the final output
  * (interlaced light field pattern, side-by-side, anaglyph, etc.).
  *
  * Lifecycle:
  * - Created by the vendor driver or builder
  * - Passed to the compositor at init time
- * - Compositor calls process_views() each frame
+ * - Compositor calls process_atlas() each frame
  * - Compositor calls xrt_display_processor_destroy() at shutdown
  *
  * @ingroup xrt_iface
@@ -72,31 +72,33 @@ struct xrt_display_processor
 	 */
 
 	/*!
-	 * Process left and right eye views into the final display output.
+	 * Process a tiled atlas texture into the final display output.
 	 *
 	 * Called by the compositor after layer compositing is complete.
 	 * The implementation records Vulkan commands into @p cmd_buffer
-	 * that transform the stereo views into the target framebuffer
+	 * that transform the atlas texture into the target framebuffer
 	 * in the display's native format.
 	 *
 	 * @param      xdp              Pointer to self.
 	 * @param      cmd_buffer       Vulkan command buffer to record into.
-	 * @param      left_view        Left eye image view.
-	 * @param      right_view       Right eye image view.
-	 * @param      view_width       Width of each eye view in pixels.
-	 * @param      view_height      Height of each eye view in pixels.
-	 * @param      view_format      Vulkan format of the eye views.
+	 * @param      atlas_view       Atlas image view (tiled views).
+	 * @param      view_width       Width of one view in the atlas in pixels.
+	 * @param      view_height      Height of one view in the atlas in pixels.
+	 * @param      tile_columns     Number of tile columns in the atlas layout.
+	 * @param      tile_rows        Number of tile rows in the atlas layout.
+	 * @param      view_format      Vulkan format of the atlas texture.
 	 * @param      target_fb        Target framebuffer to render into.
 	 * @param      target_width     Width of the target framebuffer in pixels.
 	 * @param      target_height    Height of the target framebuffer in pixels.
 	 * @param      target_format    Vulkan format of the target framebuffer.
 	 */
-	void (*process_views)(struct xrt_display_processor *xdp,
+	void (*process_atlas)(struct xrt_display_processor *xdp,
 	                      VkCommandBuffer cmd_buffer,
-	                      VkImageView left_view,
-	                      VkImageView right_view,
+	                      VkImageView atlas_view,
 	                      uint32_t view_width,
 	                      uint32_t view_height,
+	                      uint32_t tile_columns,
+	                      uint32_t tile_rows,
 	                      VkFormat_XDP view_format,
 	                      VkFramebuffer target_fb,
 	                      uint32_t target_width,
@@ -185,43 +187,34 @@ struct xrt_display_processor
 	void (*destroy)(struct xrt_display_processor *xdp);
 
 	/*! @} */
-
-	/*!
-	 * If true, the display processor expects side-by-side stereo input:
-	 * left_view contains both eyes (left half + right half), right_view
-	 * is VK_NULL_HANDLE, and view_width is the full SBS width (2 * per_eye).
-	 *
-	 * If false (default), the display processor receives separate per-eye
-	 * views with view_width equal to a single eye's width.
-	 *
-	 * The compositor checks this flag and prepares input accordingly.
-	 */
-	bool prefers_sbs_input;
 };
 
 /*!
- * @copydoc xrt_display_processor::process_views
+ * @copydoc xrt_display_processor::process_atlas
  *
  * Helper for calling through the function pointer.
  *
  * @public @memberof xrt_display_processor
  */
 static inline void
-xrt_display_processor_process_views(struct xrt_display_processor *xdp,
+xrt_display_processor_process_atlas(struct xrt_display_processor *xdp,
                                     VkCommandBuffer cmd_buffer,
-                                    VkImageView left_view,
-                                    VkImageView right_view,
+                                    VkImageView atlas_view,
                                     uint32_t view_width,
                                     uint32_t view_height,
+                                    uint32_t tile_columns,
+                                    uint32_t tile_rows,
                                     VkFormat_XDP view_format,
                                     VkFramebuffer target_fb,
                                     uint32_t target_width,
                                     uint32_t target_height,
                                     VkFormat_XDP target_format)
 {
-	xdp->process_views(xdp, cmd_buffer, left_view, right_view,
-	                   view_width, view_height, view_format,
-	                   target_fb, target_width, target_height,
+	xdp->process_atlas(xdp, cmd_buffer, atlas_view,
+	                   view_width, view_height,
+	                   tile_columns, tile_rows,
+	                   view_format, target_fb,
+	                   target_width, target_height,
 	                   target_format);
 }
 

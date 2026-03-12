@@ -42,14 +42,14 @@ struct comp_d3d11_renderer
 	//! Parent compositor.
 	struct comp_d3d11_compositor *c;
 
-	//! Side-by-side stereo texture.
-	ID3D11Texture2D *stereo_texture;
+	//! Side-by-side atlas texture.
+	ID3D11Texture2D *atlas_texture;
 
-	//! SRV for stereo texture (for weaver input).
-	ID3D11ShaderResourceView *stereo_srv;
+	//! SRV for atlas texture (for weaver input).
+	ID3D11ShaderResourceView *atlas_srv;
 
-	//! RTV for stereo texture (for rendering).
-	ID3D11RenderTargetView *stereo_rtv;
+	//! RTV for atlas texture (for rendering).
+	ID3D11RenderTargetView *atlas_rtv;
 
 	//! Depth texture.
 	ID3D11Texture2D *depth_texture;
@@ -97,8 +97,12 @@ struct comp_d3d11_renderer
 	uint32_t view_width;
 	uint32_t view_height;
 
+	//! Tile layout for atlas (e.g. 2x1 for stereo SBS, 2x2 for quad).
+	uint32_t tile_columns;
+	uint32_t tile_rows;
+
 	//! Texture height (may be > view_height to accommodate mono/2D mode).
-	//! The SBS texture is 2*view_width x texture_height.
+	//! The atlas texture is tile_columns*view_width x texture_height.
 	uint32_t texture_height;
 };
 
@@ -359,11 +363,11 @@ create_resources(struct comp_d3d11_renderer *r)
 {
 	auto internals = get_internals(r->c);
 
-	// Create side-by-side stereo texture (2x width).
+	// Create atlas texture (tile_columns * view_width).
 	// Height is texture_height which may be > view_height to accommodate
 	// mono (2D) rendering at full window resolution.
 	D3D11_TEXTURE2D_DESC texDesc = {};
-	texDesc.Width = r->view_width * 2;
+	texDesc.Width = r->tile_columns * r->view_width;
 	texDesc.Height = r->texture_height;
 	texDesc.MipLevels = 1;
 	texDesc.ArraySize = 1;
@@ -372,14 +376,15 @@ create_resources(struct comp_d3d11_renderer *r)
 	texDesc.Usage = D3D11_USAGE_DEFAULT;
 	texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
 
-	HRESULT hr = internals->device->CreateTexture2D(&texDesc, nullptr, &r->stereo_texture);
+	HRESULT hr = internals->device->CreateTexture2D(&texDesc, nullptr, &r->atlas_texture);
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create stereo texture: 0x%08x", hr);
 		return XRT_ERROR_D3D;
 	}
 
-	U_LOG_W("Created stereo texture: %ux%u (view=%ux%u per eye, tex_h=%u)",
-	        texDesc.Width, texDesc.Height, r->view_width, r->view_height, r->texture_height);
+	U_LOG_W("Created atlas texture: %ux%u (view=%ux%u, tiles=%ux%u, tex_h=%u)",
+	        texDesc.Width, texDesc.Height, r->view_width, r->view_height,
+	        r->tile_columns, r->tile_rows, r->texture_height);
 
 	// Create SRV for stereo texture
 	D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
@@ -387,14 +392,14 @@ create_resources(struct comp_d3d11_renderer *r)
 	srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
 	srvDesc.Texture2D.MipLevels = 1;
 
-	hr = internals->device->CreateShaderResourceView(r->stereo_texture, &srvDesc, &r->stereo_srv);
+	hr = internals->device->CreateShaderResourceView(r->atlas_texture, &srvDesc, &r->atlas_srv);
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create stereo SRV: 0x%08x", hr);
 		return XRT_ERROR_D3D;
 	}
 
 	// Create RTV for stereo texture
-	hr = internals->device->CreateRenderTargetView(r->stereo_texture, nullptr, &r->stereo_rtv);
+	hr = internals->device->CreateRenderTargetView(r->atlas_texture, nullptr, &r->atlas_rtv);
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create stereo RTV: 0x%08x", hr);
 		return XRT_ERROR_D3D;
@@ -896,7 +901,29 @@ comp_d3d11_renderer_create(struct comp_d3d11_compositor *c,
 	r->c = c;
 	r->view_width = view_width;
 	r->view_height = view_height;
-	r->texture_height = (target_height > view_height) ? target_height : view_height;
+
+	// Initialize tile layout from the active rendering mode
+	auto ci = get_internals(c);
+	if (ci->xdev != NULL && ci->xdev->hmd != NULL) {
+		uint32_t idx = ci->xdev->hmd->active_rendering_mode_index;
+		if (idx < ci->xdev->rendering_mode_count) {
+			r->tile_columns = ci->xdev->rendering_modes[idx].tile_columns;
+			r->tile_rows = ci->xdev->rendering_modes[idx].tile_rows;
+		}
+	}
+	// Default to stereo side-by-side if not set
+	if (r->tile_columns == 0) {
+		r->tile_columns = 2;
+	}
+	if (r->tile_rows == 0) {
+		r->tile_rows = 1;
+	}
+
+	// Texture height must accommodate tile_rows * view_height for
+	// multi-row layouts, and at least target_height for mono fallback.
+	uint32_t atlas_h = r->tile_rows * view_height;
+	uint32_t min_h = (target_height > atlas_h) ? target_height : atlas_h;
+	r->texture_height = (min_h > view_height) ? min_h : view_height;
 
 	xrt_result_t xret = create_shaders(r);
 	if (xret != XRT_SUCCESS) {
@@ -912,8 +939,9 @@ comp_d3d11_renderer_create(struct comp_d3d11_compositor *c,
 
 	*out_renderer = r;
 
-	U_LOG_I("Created D3D11 renderer: view=%ux%u, tex_h=%u (target_h=%u)",
-	        view_width, view_height, r->texture_height, target_height);
+	U_LOG_I("Created D3D11 renderer: view=%ux%u, tiles=%ux%u, tex_h=%u (target_h=%u)",
+	        view_width, view_height, r->tile_columns, r->tile_rows,
+	        r->texture_height, target_height);
 
 	return XRT_SUCCESS;
 }
@@ -947,9 +975,9 @@ comp_d3d11_renderer_destroy(struct comp_d3d11_renderer **renderer_ptr)
 	SAFE_RELEASE(r->projection_vs);
 	SAFE_RELEASE(r->depth_dsv);
 	SAFE_RELEASE(r->depth_texture);
-	SAFE_RELEASE(r->stereo_rtv);
-	SAFE_RELEASE(r->stereo_srv);
-	SAFE_RELEASE(r->stereo_texture);
+	SAFE_RELEASE(r->atlas_rtv);
+	SAFE_RELEASE(r->atlas_srv);
+	SAFE_RELEASE(r->atlas_texture);
 
 #undef SAFE_RELEASE
 
@@ -969,11 +997,11 @@ comp_d3d11_renderer_draw(struct comp_d3d11_renderer *renderer,
 	auto internals = get_internals(renderer->c);
 
 	// Set render target to stereo texture
-	internals->context->OMSetRenderTargets(1, &renderer->stereo_rtv, renderer->depth_dsv);
+	internals->context->OMSetRenderTargets(1, &renderer->atlas_rtv, renderer->depth_dsv);
 
 	// Clear to dark blue (similar to Vulkan compositor)
 	float clear_color[4] = {0.05f, 0.05f, 0.25f, 1.0f};
-	internals->context->ClearRenderTargetView(renderer->stereo_rtv, clear_color);
+	internals->context->ClearRenderTargetView(renderer->atlas_rtv, clear_color);
 	internals->context->ClearDepthStencilView(renderer->depth_dsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f,
 	                                           0);
 
@@ -1030,17 +1058,18 @@ comp_d3d11_renderer_draw(struct comp_d3d11_renderer *renderer,
 		effective_views = 1;
 	}
 
-	// Render each view (1 for mono, 2 for stereo)
+	// Render each view (1 for mono, 2+ for stereo/multi-view)
 	for (uint32_t view_index = 0; view_index < effective_views; view_index++) {
 		// Set viewport for this view
 		D3D11_VIEWPORT viewport = {};
 		if (effective_views == 1) {
 			// MONO: use target (window) dimensions so 2D content fills
-			// the full window. Width is capped to the SBS texture width
-			// (2*view_width); height is capped to texture_height.
-			uint32_t mono_w = (target_width < renderer->view_width * 2)
+			// the full window. Width is capped to the atlas texture width
+			// (tile_columns*view_width); height is capped to texture_height.
+			uint32_t atlas_w = renderer->tile_columns * renderer->view_width;
+			uint32_t mono_w = (target_width < atlas_w)
 			                      ? target_width
-			                      : renderer->view_width * 2;
+			                      : atlas_w;
 			uint32_t mono_h = (target_height < renderer->texture_height)
 			                      ? target_height
 			                      : renderer->texture_height;
@@ -1048,12 +1077,14 @@ comp_d3d11_renderer_draw(struct comp_d3d11_renderer *renderer,
 			viewport.Width = static_cast<float>(mono_w);
 			viewport.Height = static_cast<float>(mono_h);
 		} else {
-			// STEREO: side-by-side
-			viewport.TopLeftX = static_cast<float>(view_index * renderer->view_width);
+			// MULTI-VIEW: tile-based atlas layout
+			uint32_t col = view_index % renderer->tile_columns;
+			uint32_t row = view_index / renderer->tile_columns;
+			viewport.TopLeftX = static_cast<float>(col * renderer->view_width);
+			viewport.TopLeftY = static_cast<float>(row * renderer->view_height);
 			viewport.Width = static_cast<float>(renderer->view_width);
 			viewport.Height = static_cast<float>(renderer->view_height);
 		}
-		viewport.TopLeftY = 0.0f;
 		viewport.MinDepth = 0.0f;
 		viewport.MaxDepth = 1.0f;
 		internals->context->RSSetViewports(1, &viewport);
@@ -1118,9 +1149,9 @@ comp_d3d11_renderer_draw(struct comp_d3d11_renderer *renderer,
 }
 
 extern "C" void *
-comp_d3d11_renderer_get_stereo_srv(struct comp_d3d11_renderer *renderer)
+comp_d3d11_renderer_get_atlas_srv(struct comp_d3d11_renderer *renderer)
 {
-	return renderer->stereo_srv;
+	return renderer->atlas_srv;
 }
 
 extern "C" void
@@ -1132,10 +1163,28 @@ comp_d3d11_renderer_get_view_dimensions(struct comp_d3d11_renderer *renderer,
 	*out_view_height = renderer->view_height;
 }
 
-extern "C" void *
-comp_d3d11_renderer_get_stereo_texture(struct comp_d3d11_renderer *renderer)
+extern "C" void
+comp_d3d11_renderer_get_tile_layout(struct comp_d3d11_renderer *renderer,
+                                    uint32_t *out_tile_columns,
+                                    uint32_t *out_tile_rows)
 {
-	return renderer->stereo_texture;
+	*out_tile_columns = renderer->tile_columns;
+	*out_tile_rows = renderer->tile_rows;
+}
+
+extern "C" void
+comp_d3d11_renderer_set_tile_layout(struct comp_d3d11_renderer *renderer,
+                                    uint32_t tile_columns,
+                                    uint32_t tile_rows)
+{
+	renderer->tile_columns = tile_columns;
+	renderer->tile_rows = tile_rows;
+}
+
+extern "C" void *
+comp_d3d11_renderer_get_atlas_texture(struct comp_d3d11_renderer *renderer)
+{
+	return renderer->atlas_texture;
 }
 
 extern "C" xrt_result_t
@@ -1156,9 +1205,9 @@ comp_d3d11_renderer_resize(struct comp_d3d11_renderer *renderer,
 		new_view_height = 64;
 	}
 
-	uint32_t new_texture_height = (new_target_height > new_view_height)
-	                                  ? new_target_height
-	                                  : new_view_height;
+	uint32_t atlas_h = renderer->tile_rows * new_view_height;
+	uint32_t min_h = (new_target_height > atlas_h) ? new_target_height : atlas_h;
+	uint32_t new_texture_height = (min_h > new_view_height) ? min_h : new_view_height;
 
 	// Skip if unchanged
 	if (new_view_width == renderer->view_width &&
@@ -1183,9 +1232,9 @@ comp_d3d11_renderer_resize(struct comp_d3d11_renderer *renderer,
 
 	SAFE_RELEASE(renderer->depth_dsv);
 	SAFE_RELEASE(renderer->depth_texture);
-	SAFE_RELEASE(renderer->stereo_rtv);
-	SAFE_RELEASE(renderer->stereo_srv);
-	SAFE_RELEASE(renderer->stereo_texture);
+	SAFE_RELEASE(renderer->atlas_rtv);
+	SAFE_RELEASE(renderer->atlas_srv);
+	SAFE_RELEASE(renderer->atlas_texture);
 
 #undef SAFE_RELEASE
 
@@ -1194,9 +1243,9 @@ comp_d3d11_renderer_resize(struct comp_d3d11_renderer *renderer,
 	renderer->view_height = new_view_height;
 	renderer->texture_height = new_texture_height;
 
-	// Recreate stereo texture (2x width for side-by-side)
+	// Recreate atlas texture (tile_columns * view_width)
 	D3D11_TEXTURE2D_DESC texDesc = {};
-	texDesc.Width = new_view_width * 2;
+	texDesc.Width = renderer->tile_columns * new_view_width;
 	texDesc.Height = new_texture_height;
 	texDesc.MipLevels = 1;
 	texDesc.ArraySize = 1;
@@ -1205,7 +1254,7 @@ comp_d3d11_renderer_resize(struct comp_d3d11_renderer *renderer,
 	texDesc.Usage = D3D11_USAGE_DEFAULT;
 	texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
 
-	HRESULT hr = internals->device->CreateTexture2D(&texDesc, nullptr, &renderer->stereo_texture);
+	HRESULT hr = internals->device->CreateTexture2D(&texDesc, nullptr, &renderer->atlas_texture);
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to recreate stereo texture: 0x%08x", hr);
 		return XRT_ERROR_D3D;
@@ -1217,14 +1266,14 @@ comp_d3d11_renderer_resize(struct comp_d3d11_renderer *renderer,
 	srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
 	srvDesc.Texture2D.MipLevels = 1;
 
-	hr = internals->device->CreateShaderResourceView(renderer->stereo_texture, &srvDesc, &renderer->stereo_srv);
+	hr = internals->device->CreateShaderResourceView(renderer->atlas_texture, &srvDesc, &renderer->atlas_srv);
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to recreate stereo SRV: 0x%08x", hr);
 		return XRT_ERROR_D3D;
 	}
 
 	// Recreate RTV
-	hr = internals->device->CreateRenderTargetView(renderer->stereo_texture, nullptr, &renderer->stereo_rtv);
+	hr = internals->device->CreateRenderTargetView(renderer->atlas_texture, nullptr, &renderer->atlas_rtv);
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to recreate stereo RTV: 0x%08x", hr);
 		return XRT_ERROR_D3D;
@@ -1247,9 +1296,10 @@ comp_d3d11_renderer_resize(struct comp_d3d11_renderer *renderer,
 		return XRT_ERROR_D3D;
 	}
 
-	U_LOG_W("Renderer resized: stereo texture now %ux%u (view=%ux%u, tex_h=%u)",
-	        new_view_width * 2, new_texture_height, new_view_width, new_view_height,
-	        new_texture_height);
+	U_LOG_W("Renderer resized: atlas texture now %ux%u (view=%ux%u, tiles=%ux%u, tex_h=%u)",
+	        renderer->tile_columns * new_view_width, new_texture_height,
+	        new_view_width, new_view_height,
+	        renderer->tile_columns, renderer->tile_rows, new_texture_height);
 
 	return XRT_SUCCESS;
 }
@@ -1296,12 +1346,12 @@ comp_d3d11_renderer_blit_stretch(struct comp_d3d11_renderer *renderer,
 	internals->context->PSSetSamplers(0, 1, &renderer->sampler_linear);
 
 	// Bind stereo texture SRV
-	internals->context->PSSetShaderResources(0, 1, &renderer->stereo_srv);
+	internals->context->PSSetShaderResources(0, 1, &renderer->atlas_srv);
 
 	// Set constant buffer: identity MVP, UV covers the mono-rendered region.
 	// In mono mode, the rendered content occupies the top-left
-	// min(target_w, 2*view_w) x min(target_h, texture_h) of the stereo texture.
-	// If the stereo texture is larger than the mono viewport (e.g. SR recommended
+	// min(target_w, atlas_w) x min(target_h, texture_h) of the atlas texture.
+	// If the atlas texture is larger than the mono viewport (e.g. SR recommended
 	// dims exceed window size at initial creation), we must restrict the UV range
 	// to avoid sampling unrendered texels — otherwise the content appears squished.
 	LayerConstants constants = {};
@@ -1310,8 +1360,8 @@ comp_d3d11_renderer_blit_stretch(struct comp_d3d11_renderer *renderer,
 	constants.mvp[5] = 1.0f;
 	constants.mvp[10] = 1.0f;
 	constants.mvp[15] = 1.0f;
-	// UV transform: sample only the mono-rendered portion of the stereo texture
-	uint32_t tex_w = renderer->view_width * 2;
+	// UV transform: sample only the mono-rendered portion of the atlas texture
+	uint32_t tex_w = renderer->tile_columns * renderer->view_width;
 	uint32_t tex_h = renderer->texture_height;
 	float u_scale = (tex_w > 0) ? (std::min)((float)target_width / (float)tex_w, 1.0f) : 1.0f;
 	float v_scale = (tex_h > 0) ? (std::min)((float)target_height / (float)tex_h, 1.0f) : 1.0f;

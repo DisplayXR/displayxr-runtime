@@ -4,7 +4,7 @@
  * @file
  * @brief  Simulation Metal display processor: SBS, anaglyph, alpha-blend output.
  *
- * Implements SBS, anaglyph, and alpha-blend stereo output modes using MSL
+ * Implements SBS, anaglyph, and alpha-blend atlas output modes using MSL
  * shaders compiled at runtime. All 3 pipelines are pre-compiled at init
  * for instant runtime switching via 1/2/3 keys.
  *
@@ -44,6 +44,13 @@ static NSString *const shader_source = @
     "    float2 texCoord;\n"
     "};\n"
     "\n"
+    "struct TileParams {\n"
+    "    float tile_cols_inv;\n"
+    "    float tile_rows_inv;\n"
+    "    float tile_cols;\n"
+    "    float tile_rows;\n"
+    "};\n"
+    "\n"
     "vertex VertexOut fullscreen_vertex(uint vid [[vertex_id]]) {\n"
     "    VertexOut out;\n"
     "    out.texCoord = float2((vid << 1) & 2, vid & 2);\n"
@@ -53,27 +60,46 @@ static NSString *const shader_source = @
     "\n"
     "// SBS with center crop: each eye rendered at full-display FOV,\n"
     "// crop center 50% horizontally to match half-display SBS layout.\n"
+    "// Tile-aware: uses tile_cols/tile_rows to locate each view in the atlas.\n"
     "fragment float4 sbs_fragment(VertexOut in [[stage_in]],\n"
     "                             texture2d<float> tex [[texture(0)]],\n"
-    "                             sampler smp [[sampler(0)]]) {\n"
+    "                             sampler smp [[sampler(0)]],\n"
+    "                             constant TileParams &tp [[buffer(0)]]) {\n"
     "    float x = in.texCoord.x;\n"
+    "    // View 0 (left): col=0, row=0\n"
+    "    float2 left_uv = float2(in.texCoord.x * tp.tile_cols_inv,\n"
+    "                            in.texCoord.y * tp.tile_rows_inv);\n"
+    "    // View 1 (right): col=1%tile_cols, row=1/tile_cols\n"
+    "    float col1 = float(1 % uint(tp.tile_cols));\n"
+    "    float row1 = float(1 / uint(tp.tile_cols));\n"
+    "    float2 right_uv = float2((in.texCoord.x + col1) * tp.tile_cols_inv,\n"
+    "                             (in.texCoord.y + row1) * tp.tile_rows_inv);\n"
     "    float src_u;\n"
+    "    float src_v;\n"
     "    if (x < 0.5) {\n"
-    "        float eye_u = x / 0.5;\n"              // [0,1] within left output half
-    "        src_u = 0.125 + eye_u * 0.25;\n"       // center 50% of left eye [0.125, 0.375]
+    "        float eye_u = x / 0.5;\n"
+    "        // center crop: take middle 50% of the left view\n"
+    "        src_u = (0.25 + eye_u * 0.5) * tp.tile_cols_inv;\n"
+    "        src_v = in.texCoord.y * tp.tile_rows_inv;\n"
     "    } else {\n"
-    "        float eye_u = (x - 0.5) / 0.5;\n"      // [0,1] within right output half
-    "        src_u = 0.625 + eye_u * 0.25;\n"        // center 50% of right eye [0.625, 0.875]
+    "        float eye_u = (x - 0.5) / 0.5;\n"
+    "        src_u = (col1 + 0.25 + eye_u * 0.5) * tp.tile_cols_inv;\n"
+    "        src_v = (in.texCoord.y + row1) * tp.tile_rows_inv;\n"
     "    }\n"
-    "    return tex.sample(smp, float2(src_u, in.texCoord.y));\n"
+    "    return tex.sample(smp, float2(src_u, src_v));\n"
     "}\n"
     "\n"
     "// Anaglyph: red from left eye, cyan from right eye\n"
     "fragment float4 anaglyph_fragment(VertexOut in [[stage_in]],\n"
     "                                  texture2d<float> tex [[texture(0)]],\n"
-    "                                  sampler smp [[sampler(0)]]) {\n"
-    "    float2 left_uv  = float2(in.texCoord.x * 0.5, in.texCoord.y);\n"
-    "    float2 right_uv = float2(in.texCoord.x * 0.5 + 0.5, in.texCoord.y);\n"
+    "                                  sampler smp [[sampler(0)]],\n"
+    "                                  constant TileParams &tp [[buffer(0)]]) {\n"
+    "    float2 left_uv  = float2(in.texCoord.x * tp.tile_cols_inv,\n"
+    "                             in.texCoord.y * tp.tile_rows_inv);\n"
+    "    float col1 = float(1 % uint(tp.tile_cols));\n"
+    "    float row1 = float(1 / uint(tp.tile_cols));\n"
+    "    float2 right_uv = float2((in.texCoord.x + col1) * tp.tile_cols_inv,\n"
+    "                             (in.texCoord.y + row1) * tp.tile_rows_inv);\n"
     "    float4 left  = tex.sample(smp, left_uv);\n"
     "    float4 right = tex.sample(smp, right_uv);\n"
     "    return float4(left.r, right.g, right.b, 1.0);\n"
@@ -82,9 +108,14 @@ static NSString *const shader_source = @
     "// Blend: 50/50 mix\n"
     "fragment float4 blend_fragment(VertexOut in [[stage_in]],\n"
     "                               texture2d<float> tex [[texture(0)]],\n"
-    "                               sampler smp [[sampler(0)]]) {\n"
-    "    float2 left_uv  = float2(in.texCoord.x * 0.5, in.texCoord.y);\n"
-    "    float2 right_uv = float2(in.texCoord.x * 0.5 + 0.5, in.texCoord.y);\n"
+    "                               sampler smp [[sampler(0)]],\n"
+    "                               constant TileParams &tp [[buffer(0)]]) {\n"
+    "    float2 left_uv  = float2(in.texCoord.x * tp.tile_cols_inv,\n"
+    "                             in.texCoord.y * tp.tile_rows_inv);\n"
+    "    float col1 = float(1 % uint(tp.tile_cols));\n"
+    "    float row1 = float(1 / uint(tp.tile_cols));\n"
+    "    float2 right_uv = float2((in.texCoord.x + col1) * tp.tile_cols_inv,\n"
+    "                             (in.texCoord.y + row1) * tp.tile_rows_inv);\n"
     "    return mix(tex.sample(smp, left_uv), tex.sample(smp, right_uv), 0.5);\n"
     "}\n";
 
@@ -115,16 +146,30 @@ sim_dp_metal(struct xrt_display_processor_metal *xdp)
 
 /*
  *
- * process_stereo: fullscreen quad with runtime-switchable fragment shader.
+ * process_atlas: fullscreen quad with runtime-switchable fragment shader.
  *
  */
 
+/*!
+ * Tile parameter constants passed to Metal fragment shaders.
+ * Must match the TileParams struct in the MSL shader source.
+ */
+struct tile_params
+{
+	float tile_cols_inv;
+	float tile_rows_inv;
+	float tile_cols;
+	float tile_rows;
+};
+
 static void
-sim_dp_metal_process_stereo(struct xrt_display_processor_metal *xdp,
+sim_dp_metal_process_atlas(struct xrt_display_processor_metal *xdp,
                             void *command_buffer,
-                            void *stereo_texture,
+                            void *atlas_texture,
                             uint32_t view_width,
                             uint32_t view_height,
+                            uint32_t tile_columns,
+                            uint32_t tile_rows,
                             uint32_t format,
                             void *target_texture,
                             uint32_t target_width,
@@ -132,10 +177,10 @@ sim_dp_metal_process_stereo(struct xrt_display_processor_metal *xdp,
 {
 	struct sim_display_processor_metal *sdp = sim_dp_metal(xdp);
 	id<MTLCommandBuffer> cmd_buf = (__bridge id<MTLCommandBuffer>)command_buffer;
-	id<MTLTexture> stereo_tex = (__bridge id<MTLTexture>)stereo_texture;
+	id<MTLTexture> atlas_tex = (__bridge id<MTLTexture>)atlas_texture;
 	id<MTLTexture> target_tex = (__bridge id<MTLTexture>)target_texture;
 
-	if (cmd_buf == nil || stereo_tex == nil || target_tex == nil) {
+	if (cmd_buf == nil || atlas_tex == nil || target_tex == nil) {
 		return;
 	}
 
@@ -146,6 +191,18 @@ sim_dp_metal_process_stereo(struct xrt_display_processor_metal *xdp,
 		return;
 	}
 
+	// Prepare tile layout constants for the fragment shader.
+	// Use view_width/atlas_width (not 1/tile_columns) so UV mapping is
+	// correct when the atlas texture is larger than the tiled region.
+	uint32_t atlas_w = (uint32_t)atlas_tex.width;
+	uint32_t atlas_h = (uint32_t)atlas_tex.height;
+	struct tile_params tp = {
+	    .tile_cols_inv = (atlas_w > 0) ? ((float)view_width / (float)atlas_w) : 0.5f,
+	    .tile_rows_inv = (atlas_h > 0) ? ((float)view_height / (float)atlas_h) : 1.0f,
+	    .tile_cols = (float)tile_columns,
+	    .tile_rows = (float)tile_rows,
+	};
+
 	MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
 	pass.colorAttachments[0].texture = target_tex;
 	pass.colorAttachments[0].loadAction = MTLLoadActionClear;
@@ -155,8 +212,9 @@ sim_dp_metal_process_stereo(struct xrt_display_processor_metal *xdp,
 	id<MTLRenderCommandEncoder> encoder = [cmd_buf renderCommandEncoderWithDescriptor:pass];
 
 	[encoder setRenderPipelineState:active_pipeline];
-	[encoder setFragmentTexture:stereo_tex atIndex:0];
+	[encoder setFragmentTexture:atlas_tex atIndex:0];
 	[encoder setFragmentSamplerState:sdp->sampler atIndex:0];
+	[encoder setFragmentBytes:&tp length:sizeof(tp) atIndex:0];
 
 	MTLViewport vp = {
 	    .originX = 0,
@@ -296,7 +354,7 @@ sim_display_processor_metal_create(enum sim_display_output_mode mode,
 	}
 
 	sdp->base.destroy = sim_dp_metal_destroy;
-	sdp->base.process_stereo = sim_dp_metal_process_stereo;
+	sdp->base.process_atlas = sim_dp_metal_process_atlas;
 	sdp->base.get_predicted_eye_positions = sim_dp_metal_get_predicted_eye_positions;
 
 	// Nominal viewer parameters (same defaults as sim_display_hmd_create)
@@ -313,7 +371,7 @@ sim_display_processor_metal_create(enum sim_display_output_mode mode,
 		return XRT_ERROR_VULKAN;
 	}
 
-	// Set the initial output mode (atomic global read by process_stereo each frame)
+	// Set the initial output mode (atomic global read by process_atlas each frame)
 	sim_display_set_output_mode(mode);
 
 	U_LOG_W("Created sim display Metal processor (all 3 pipelines), initial mode: %s",

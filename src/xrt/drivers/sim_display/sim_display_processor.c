@@ -71,18 +71,30 @@ sim_display_processor(struct xrt_display_processor *xdp)
  *
  */
 
+/*!
+ * Push constant data for tile layout parameters.
+ */
+struct tile_push_constants
+{
+	float inv_tile_columns;
+	float inv_tile_rows;
+	float tile_columns;
+	float tile_rows;
+};
+
 static void
-sim_dp_process_views_shader(struct xrt_display_processor *xdp,
-                            VkCommandBuffer cmd_buffer,
-                            VkImageView left_view,
-                            VkImageView right_view,
-                            uint32_t view_width,
-                            uint32_t view_height,
-                            VkFormat_XDP view_format,
-                            VkFramebuffer target_fb,
-                            uint32_t target_width,
-                            uint32_t target_height,
-                            VkFormat_XDP target_format)
+sim_dp_process_atlas(struct xrt_display_processor *xdp,
+                     VkCommandBuffer cmd_buffer,
+                     VkImageView atlas_view,
+                     uint32_t view_width,
+                     uint32_t view_height,
+                     uint32_t tile_columns,
+                     uint32_t tile_rows,
+                     VkFormat_XDP view_format,
+                     VkFramebuffer target_fb,
+                     uint32_t target_width,
+                     uint32_t target_height,
+                     VkFormat_XDP target_format)
 {
 	struct sim_display_processor *sdp = sim_display_processor(xdp);
 	struct vk_bundle *vk = sdp->vk;
@@ -95,40 +107,23 @@ sim_dp_process_views_shader(struct xrt_display_processor *xdp,
 		return;
 	}
 
-	// Update persistent descriptor set with current left and right image views
-	VkDescriptorImageInfo image_infos[2] = {
-	    {
-	        .sampler = sdp->sampler,
-	        .imageView = left_view,
-	        .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-	    },
-	    {
-	        .sampler = sdp->sampler,
-	        .imageView = right_view,
-	        .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-	    },
+	// Update persistent descriptor set with atlas image view
+	VkDescriptorImageInfo image_info = {
+	    .sampler = sdp->sampler,
+	    .imageView = atlas_view,
+	    .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
 	};
 
-	VkWriteDescriptorSet writes[2] = {
-	    {
-	        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-	        .dstSet = sdp->desc_set,
-	        .dstBinding = 0,
-	        .descriptorCount = 1,
-	        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-	        .pImageInfo = &image_infos[0],
-	    },
-	    {
-	        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-	        .dstSet = sdp->desc_set,
-	        .dstBinding = 1,
-	        .descriptorCount = 1,
-	        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-	        .pImageInfo = &image_infos[1],
-	    },
+	VkWriteDescriptorSet write = {
+	    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+	    .dstSet = sdp->desc_set,
+	    .dstBinding = 0,
+	    .descriptorCount = 1,
+	    .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+	    .pImageInfo = &image_info,
 	};
 
-	vk->vkUpdateDescriptorSets(vk->device, 2, writes, 0, NULL);
+	vk->vkUpdateDescriptorSets(vk->device, 1, &write, 0, NULL);
 
 	// Begin render pass
 	VkClearValue clear_value = {.color = {{0.0f, 0.0f, 0.0f, 1.0f}}};
@@ -151,6 +146,17 @@ sim_dp_process_views_shader(struct xrt_display_processor *xdp,
 	vk->vkCmdBindPipeline(cmd_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, active_pipeline);
 	vk->vkCmdBindDescriptorSets(cmd_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, sdp->pipeline_layout, 0, 1,
 	                             &sdp->desc_set, 0, NULL);
+
+	// Push tile layout constants to fragment shader
+	struct tile_push_constants pc = {
+	    .inv_tile_columns = 1.0f / (float)tile_columns,
+	    .inv_tile_rows = 1.0f / (float)tile_rows,
+	    .tile_columns = (float)tile_columns,
+	    .tile_rows = (float)tile_rows,
+	};
+	vk->vkCmdPushConstants(cmd_buffer, sdp->pipeline_layout,
+	                        VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+	                        sizeof(pc), &pc);
 
 	// Set dynamic viewport and scissor
 	VkViewport viewport = {
@@ -240,26 +246,18 @@ create_pipeline_resources(struct sim_display_processor *sdp, int32_t target_form
 		return false;
 	}
 
-	// 2. Create descriptor set layout (2 combined image samplers)
-	VkDescriptorSetLayoutBinding bindings[2] = {
-	    {
-	        .binding = 0,
-	        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-	        .descriptorCount = 1,
-	        .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
-	    },
-	    {
-	        .binding = 1,
-	        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-	        .descriptorCount = 1,
-	        .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
-	    },
+	// 2. Create descriptor set layout (1 combined image sampler for atlas)
+	VkDescriptorSetLayoutBinding binding = {
+	    .binding = 0,
+	    .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+	    .descriptorCount = 1,
+	    .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
 	};
 
 	VkDescriptorSetLayoutCreateInfo desc_layout_info = {
 	    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-	    .bindingCount = 2,
-	    .pBindings = bindings,
+	    .bindingCount = 1,
+	    .pBindings = &binding,
 	};
 
 	ret = vk->vkCreateDescriptorSetLayout(vk->device, &desc_layout_info, NULL, &sdp->desc_layout);
@@ -268,11 +266,19 @@ create_pipeline_resources(struct sim_display_processor *sdp, int32_t target_form
 		return false;
 	}
 
-	// 3. Create pipeline layout
+	// 3. Create pipeline layout (with push constants for tile params)
+	VkPushConstantRange push_range = {
+	    .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+	    .offset = 0,
+	    .size = sizeof(struct tile_push_constants),
+	};
+
 	VkPipelineLayoutCreateInfo pipe_layout_info = {
 	    .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
 	    .setLayoutCount = 1,
 	    .pSetLayouts = &sdp->desc_layout,
+	    .pushConstantRangeCount = 1,
+	    .pPushConstantRanges = &push_range,
 	};
 
 	ret = vk->vkCreatePipelineLayout(vk->device, &pipe_layout_info, NULL, &sdp->pipeline_layout);
@@ -432,7 +438,7 @@ create_pipeline_resources(struct sim_display_processor *sdp, int32_t target_form
 	// 7. Create descriptor pool (persistent set, never freed individually)
 	VkDescriptorPoolSize pool_size = {
 	    .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-	    .descriptorCount = 2, // One set with 2 samplers
+	    .descriptorCount = 1, // One set with 1 atlas sampler
 	};
 
 	VkDescriptorPoolCreateInfo pool_info = {
@@ -559,7 +565,7 @@ sim_display_processor_create(enum sim_display_output_mode mode,
 	}
 
 	sdp->vk = vk;
-	sdp->base.process_views = sim_dp_process_views_shader;
+	sdp->base.process_atlas = sim_dp_process_atlas;
 
 	if (!create_pipeline_resources(sdp, target_format)) {
 		U_LOG_E("sim_display: Failed to create pipeline resources");
@@ -567,7 +573,7 @@ sim_display_processor_create(enum sim_display_output_mode mode,
 		return XRT_ERROR_VULKAN;
 	}
 
-	// Set the initial output mode (atomic global read by process_views each frame)
+	// Set the initial output mode (atomic global read by process_atlas each frame)
 	sim_display_set_output_mode(mode);
 
 	U_LOG_W("Created sim display processor (all 3 pipelines), initial mode: %s",

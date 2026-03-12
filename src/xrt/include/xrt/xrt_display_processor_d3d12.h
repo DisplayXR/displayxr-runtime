@@ -5,10 +5,10 @@
  * @brief  Header for @ref xrt_display_processor_d3d12 interface.
  *
  * D3D12 variant of the display processor abstraction for vendor-specific
- * stereo-to-display output processing (interlacing, SBS, anaglyph, etc.).
+ * atlas-to-display output processing (interlacing, SBS, anaglyph, etc.).
  *
  * Unlike the D3D11 variant, this interface operates on D3D12 resources:
- * - Input is a side-by-side stereo SRV (GPU descriptor handle)
+ * - Input is an atlas texture SRV (GPU descriptor handle)
  * - Output goes to a render target (CPU descriptor handle for RTV)
  * - Commands are recorded onto a provided command list (deferred execution)
  *
@@ -35,11 +35,11 @@ struct xrt_window_metrics;
 /*!
  * @interface xrt_display_processor_d3d12
  *
- * D3D12 display output processor that converts a side-by-side stereo
+ * D3D12 display output processor that converts an atlas
  * texture into the final display output format.
  *
- * The compositor calls process_stereo() after rendering the stereo
- * pair into an SBS texture. The display processor records draw commands
+ * The compositor calls process_atlas() after rendering the view
+ * pair into an atlas texture. The display processor records draw commands
  * onto the provided command list to write the final output.
  *
  * @ingroup xrt_iface
@@ -47,29 +47,33 @@ struct xrt_window_metrics;
 struct xrt_display_processor_d3d12
 {
 	/*!
-	 * Process a side-by-side stereo texture into the final display output.
+	 * Process an atlas texture into the final display output.
 	 *
 	 * Records draw commands onto the provided command list. The caller
 	 * is responsible for executing the command list and synchronization.
 	 *
 	 * @param      xdp                   Pointer to self.
 	 * @param      d3d12_command_list     Command list (ID3D12GraphicsCommandList*).
-	 * @param      stereo_texture_resource Stereo texture resource (ID3D12Resource*), may be NULL.
-	 * @param      stereo_srv_gpu_handle  SBS stereo texture SRV (D3D12_GPU_DESCRIPTOR_HANDLE as uint64_t).
+	 * @param      atlas_texture_resource Stereo texture resource (ID3D12Resource*), may be NULL.
+	 * @param      atlas_srv_gpu_handle  Atlas texture SRV (D3D12_GPU_DESCRIPTOR_HANDLE as uint64_t).
 	 * @param      target_rtv_cpu_handle  Output render target RTV (D3D12_CPU_DESCRIPTOR_HANDLE as uint64_t).
-	 * @param      view_width            Width of one eye view (half of SBS texture width).
-	 * @param      view_height           Height of the views.
-	 * @param      format                DXGI format of the stereo texture (DXGI_FORMAT as uint32_t).
+	 * @param      view_width            Width of one eye view in pixels.
+	 * @param      view_height           Height of one eye view in pixels.
+	 * @param      tile_columns          Number of tile columns in the atlas layout.
+	 * @param      tile_rows             Number of tile rows in the atlas layout.
+	 * @param      format                DXGI format of the atlas texture (DXGI_FORMAT as uint32_t).
 	 * @param      target_width          Width of the output render target in pixels.
 	 * @param      target_height         Height of the output render target in pixels.
 	 */
-	void (*process_stereo)(struct xrt_display_processor_d3d12 *xdp,
+	void (*process_atlas)(struct xrt_display_processor_d3d12 *xdp,
 	                       void *d3d12_command_list,
-	                       void *stereo_texture_resource,
-	                       uint64_t stereo_srv_gpu_handle,
+	                       void *atlas_texture_resource,
+	                       uint64_t atlas_srv_gpu_handle,
 	                       uint64_t target_rtv_cpu_handle,
 	                       uint32_t view_width,
 	                       uint32_t view_height,
+	                       uint32_t tile_columns,
+	                       uint32_t tile_rows,
 	                       uint32_t format,
 	                       uint32_t target_width,
 	                       uint32_t target_height);
@@ -77,7 +81,7 @@ struct xrt_display_processor_d3d12
 	/*!
 	 * Set the output render target format.
 	 *
-	 * Must be called before the first process_stereo() call so the
+	 * Must be called before the first process_atlas() call so the
 	 * display processor can create its internal pipeline state.
 	 * Optional — NULL means format is set during creation.
 	 *
@@ -134,26 +138,29 @@ struct xrt_display_processor_d3d12
 };
 
 /*!
- * @copydoc xrt_display_processor_d3d12::process_stereo
+ * @copydoc xrt_display_processor_d3d12::process_atlas
  *
  * Helper for calling through the function pointer.
  *
  * @public @memberof xrt_display_processor_d3d12
  */
 static inline void
-xrt_display_processor_d3d12_process_stereo(struct xrt_display_processor_d3d12 *xdp,
+xrt_display_processor_d3d12_process_atlas(struct xrt_display_processor_d3d12 *xdp,
                                            void *d3d12_command_list,
-                                           void *stereo_texture_resource,
-                                           uint64_t stereo_srv_gpu_handle,
+                                           void *atlas_texture_resource,
+                                           uint64_t atlas_srv_gpu_handle,
                                            uint64_t target_rtv_cpu_handle,
                                            uint32_t view_width,
                                            uint32_t view_height,
+                                           uint32_t tile_columns,
+                                           uint32_t tile_rows,
                                            uint32_t format,
                                            uint32_t target_width,
                                            uint32_t target_height)
 {
-	xdp->process_stereo(xdp, d3d12_command_list, stereo_texture_resource, stereo_srv_gpu_handle,
-	                    target_rtv_cpu_handle, view_width, view_height, format, target_width, target_height);
+	xdp->process_atlas(xdp, d3d12_command_list, atlas_texture_resource, atlas_srv_gpu_handle,
+	                    target_rtv_cpu_handle, view_width, view_height, tile_columns, tile_rows, format,
+	                    target_width, target_height);
 }
 
 /*!

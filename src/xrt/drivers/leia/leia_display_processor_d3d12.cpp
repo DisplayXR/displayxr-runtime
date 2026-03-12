@@ -44,10 +44,10 @@ leia_dp_d3d12(struct xrt_display_processor_d3d12 *xdp)
  */
 
 static void
-leia_dp_d3d12_process_stereo(struct xrt_display_processor_d3d12 *xdp,
+leia_dp_d3d12_process_atlas(struct xrt_display_processor_d3d12 *xdp,
                              void *d3d12_command_list,
-                             void *stereo_texture_resource,
-                             uint64_t stereo_srv_gpu_handle,
+                             void *atlas_texture_resource,
+                             uint64_t atlas_srv_gpu_handle,
                              uint64_t target_rtv_cpu_handle,
                              uint32_t view_width,
                              uint32_t view_height,
@@ -55,13 +55,13 @@ leia_dp_d3d12_process_stereo(struct xrt_display_processor_d3d12 *xdp,
                              uint32_t target_width,
                              uint32_t target_height)
 {
-	(void)stereo_srv_gpu_handle;
+	(void)atlas_srv_gpu_handle;
 	(void)target_rtv_cpu_handle;
 	struct leia_display_processor_d3d12_impl *ldp = leia_dp_d3d12(xdp);
 
 	// Set input texture — SR DX12 weaver needs the ID3D12Resource*
-	if (stereo_texture_resource != NULL) {
-		leiasr_d3d12_set_input_texture(ldp->leiasr, stereo_texture_resource,
+	if (atlas_texture_resource != NULL) {
+		leiasr_d3d12_set_input_texture(ldp->leiasr, atlas_texture_resource,
 		                               view_width, view_height, format);
 	}
 
@@ -171,7 +171,7 @@ leia_dp_factory_d3d12(void *d3d12_device,
 		return XRT_ERROR_ALLOCATION;
 	}
 
-	ldp->base.process_stereo = leia_dp_d3d12_process_stereo;
+	ldp->base.process_atlas = leia_dp_d3d12_process_atlas;
 	ldp->base.set_output_format = leia_dp_d3d12_set_output_format;
 	ldp->base.get_predicted_eye_positions = leia_dp_d3d12_get_predicted_eye_positions;
 	ldp->base.get_window_metrics = NULL;

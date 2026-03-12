@@ -37,6 +37,7 @@
 // Per-session rendering support (Phase 4)
 #include "util/comp_swapchain.h"
 #include "util/comp_render_helpers.h"
+#include "util/u_tiling.h"
 
 // Vulkan helpers needed for Y-flip SBS blit (not Leia-specific)
 #include "vk/vk_helpers.h"
@@ -1559,77 +1560,42 @@ recreate_session_swapchain(struct multi_compositor *mc, struct vk_bundle *vk)
 
 }
 
+
 /*!
- * Ensure per-eye crop images exist for display processor sub-region extraction.
- * When the app renders to a sub-region of the swapchain (imageRect.extent < swapchain size),
- * we blit the valid region into these intermediates so the display processor can sample
- * UVs 0..1 without reading uninitialized texels. Also handles GL Y-flip.
- * Recreates if size or format changed.
+ * Get tile layout from the active rendering mode of the head device.
+ * Defaults to 2 columns, 1 row (side-by-side stereo) if not available.
  */
-static bool
-ensure_session_dp_crop_images(struct multi_compositor *mc, struct vk_bundle *vk, int width, int height, VkFormat format)
+static void
+get_active_tile_layout(struct multi_compositor *mc, uint32_t *out_tile_columns, uint32_t *out_tile_rows)
 {
-	if (mc->session_render.dp_crop_initialized && mc->session_render.dp_crop_width == width &&
-	    mc->session_render.dp_crop_height == height && mc->session_render.dp_crop_format == format) {
-		return true;
-	}
+	*out_tile_columns = 2;
+	*out_tile_rows = 1;
 
-	// Destroy old if resizing
-	if (mc->session_render.dp_crop_initialized) {
-		for (int i = 0; i < 2; i++) {
-			if (mc->session_render.dp_crop_views[i] != VK_NULL_HANDLE)
-				vk->vkDestroyImageView(vk->device, mc->session_render.dp_crop_views[i], NULL);
-			if (mc->session_render.dp_crop_images[i] != VK_NULL_HANDLE)
-				vk->vkDestroyImage(vk->device, mc->session_render.dp_crop_images[i], NULL);
-			if (mc->session_render.dp_crop_memories[i] != VK_NULL_HANDLE)
-				vk->vkFreeMemory(vk->device, mc->session_render.dp_crop_memories[i], NULL);
-		}
-		mc->session_render.dp_crop_initialized = false;
-	}
-
-	VkExtent2D extent = {(uint32_t)width, (uint32_t)height};
-	VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-	VkImageSubresourceRange range = {
-	    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-	    .levelCount = 1,
-	    .layerCount = 1,
-	};
-
-	for (int i = 0; i < 2; i++) {
-		VkResult ret = vk_create_image_simple(vk, extent, format, usage,
-		                                      &mc->session_render.dp_crop_memories[i],
-		                                      &mc->session_render.dp_crop_images[i]);
-		if (ret != VK_SUCCESS) {
-			U_LOG_E("[per-session] Failed to create dp_crop image %d: %s", i, vk_result_string(ret));
-			return false;
-		}
-
-		ret = vk_create_view(vk, mc->session_render.dp_crop_images[i], VK_IMAGE_VIEW_TYPE_2D, format, range,
-		                     &mc->session_render.dp_crop_views[i]);
-		if (ret != VK_SUCCESS) {
-			U_LOG_E("[per-session] Failed to create dp_crop view %d: %s", i, vk_result_string(ret));
-			return false;
+	struct xrt_device *xdev_head = (mc->xsysd != NULL) ? mc->xsysd->static_roles.head : NULL;
+	if (xdev_head != NULL && xdev_head->hmd != NULL) {
+		uint32_t idx = xdev_head->hmd->active_rendering_mode_index;
+		if (idx < xdev_head->rendering_mode_count) {
+			uint32_t tc = xdev_head->rendering_modes[idx].tile_columns;
+			uint32_t tr = xdev_head->rendering_modes[idx].tile_rows;
+			if (tc > 0 && tr > 0) {
+				*out_tile_columns = tc;
+				*out_tile_rows = tr;
+			}
 		}
 	}
-
-	mc->session_render.dp_crop_width = width;
-	mc->session_render.dp_crop_height = height;
-	mc->session_render.dp_crop_format = format;
-	mc->session_render.dp_crop_initialized = true;
-
-	U_LOG_W("[per-session] Created dp_crop images: %dx%d format=%d", width, height, format);
-	return true;
 }
 
 /*!
- * Ensure the SBS (side-by-side) intermediate image exists for display processors
- * that prefer SBS input. Creates a single image at (2*per_eye_width x height)
- * so both eyes can be blitted side-by-side before passing to the display processor.
+ * Ensure the atlas intermediate image exists for display processors
+ * that prefer packed atlas input. Creates a single image at
+ * (tile_columns * per_eye_width x tile_rows * height) so all views can be
+ * blitted into a tiled atlas before passing to the display processor.
  * Reuses the flip_sbs_* fields in session_render.
  * Recreates if size or format changed.
  */
 static bool
-ensure_session_sbs_image(struct multi_compositor *mc, struct vk_bundle *vk, int per_eye_width, int height, VkFormat format)
+ensure_session_sbs_image(struct multi_compositor *mc, struct vk_bundle *vk, int per_eye_width, int height,
+                         uint32_t tile_columns, uint32_t tile_rows, VkFormat format)
 {
 	if (mc->session_render.flip_initialized && mc->session_render.flip_width == per_eye_width &&
 	    mc->session_render.flip_height == height && mc->session_render.flip_format == format) {
@@ -1647,7 +1613,9 @@ ensure_session_sbs_image(struct multi_compositor *mc, struct vk_bundle *vk, int 
 		mc->session_render.flip_initialized = false;
 	}
 
-	VkExtent2D extent = {(uint32_t)(per_eye_width * 2), (uint32_t)height};
+	uint32_t atlas_width = tile_columns * (uint32_t)per_eye_width;
+	uint32_t atlas_height = tile_rows * (uint32_t)height;
+	VkExtent2D extent = {atlas_width, atlas_height};
 	VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
 	VkImageSubresourceRange range = {
 	    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
@@ -1659,14 +1627,14 @@ ensure_session_sbs_image(struct multi_compositor *mc, struct vk_bundle *vk, int 
 	                                      &mc->session_render.flip_sbs_memory,
 	                                      &mc->session_render.flip_sbs_image);
 	if (ret != VK_SUCCESS) {
-		U_LOG_E("[per-session] Failed to create SBS image: %s", vk_result_string(ret));
+		U_LOG_E("[per-session] Failed to create atlas image: %s", vk_result_string(ret));
 		return false;
 	}
 
 	ret = vk_create_view(vk, mc->session_render.flip_sbs_image, VK_IMAGE_VIEW_TYPE_2D, format, range,
 	                     &mc->session_render.flip_sbs_view);
 	if (ret != VK_SUCCESS) {
-		U_LOG_E("[per-session] Failed to create SBS view: %s", vk_result_string(ret));
+		U_LOG_E("[per-session] Failed to create atlas view: %s", vk_result_string(ret));
 		return false;
 	}
 
@@ -1675,8 +1643,8 @@ ensure_session_sbs_image(struct multi_compositor *mc, struct vk_bundle *vk, int 
 	mc->session_render.flip_format = format;
 	mc->session_render.flip_initialized = true;
 
-	U_LOG_W("[per-session] Created SBS image: %dx%d (per-eye %dx%d) format=%d",
-	        per_eye_width * 2, height, per_eye_width, height, format);
+	U_LOG_W("[per-session] Created atlas image: %ux%u (per-eye %dx%d, tiles %ux%u) format=%d",
+	        atlas_width, atlas_height, per_eye_width, height, tile_columns, tile_rows, format);
 	return true;
 }
 
@@ -2412,33 +2380,29 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 		framebuffer = mc->session_render.framebuffers[buffer_index];
 	}
 
-	// Display processor path: blit source sub-regions into intermediates,
+	// Display processor path: blit source sub-regions into a tiled atlas,
 	// then pass to the display processor for final output.
-	//
-	// Two input modes:
-	// - SBS (prefers_sbs_input=true): blit both eyes into a single side-by-side
-	//   image, add pre/post-weave layout barriers. Used by SR SDK Vulkan weaver
-	//   which expects a single SBS view with rightView=NULL.
-	// - Separate views (prefers_sbs_input=false): blit each eye into its own
-	//   crop image, pass separate left/right views. Used by sim_display which
-	//   has its own render pass with proper layout transitions.
+	// All display processors now accept atlas input with explicit tile params.
 	if (mc->session_render.display_processor != NULL) {
 		static bool dp_logged = false;
 		if (!dp_logged) {
-			U_LOG_W("[per-session] Vulkan display processor: input=%dx%d fmt=%d, fb=%ux%u fmt=%d, sbs=%d",
+			U_LOG_W("[per-session] Vulkan display processor: input=%dx%d fmt=%d, fb=%ux%u fmt=%d",
 			        imageWidth, imageHeight, imageFormat,
-			        framebufferWidth, framebufferHeight, framebufferFormat,
-			        mc->session_render.display_processor->prefers_sbs_input);
+			        framebufferWidth, framebufferHeight, framebufferFormat);
 			dp_logged = true;
 		}
 
-		bool sbs_mode = mc->session_render.display_processor->prefers_sbs_input;
-
 		// ================================================================
-		// SBS INPUT PATH: blit both eyes into single SBS image, then weave
+		// ATLAS INPUT PATH: blit eyes into tiled atlas image, then weave
 		// with explicit pre/post layout barriers on the target image.
+		// Tile layout comes from the active rendering mode (default 2x1
+		// for stereo side-by-side).
 		// ================================================================
-		if (sbs_mode) {
+		{
+			// Get tile layout from active rendering mode
+			uint32_t tile_columns, tile_rows;
+			get_active_tile_layout(mc, &tile_columns, &tile_rows);
+
 			// Determine blit sources — either composited overlay images or
 			// direct swapchain sub-regions.
 			VkImage sbs_src_left = leftImage;
@@ -2468,9 +2432,10 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 				}
 			}
 
-			// Ensure SBS intermediate image exists (2*eye_w x eye_h)
-			if (!ensure_session_sbs_image(mc, vk, sbs_eye_w, sbs_eye_h, imageFormat)) {
-				U_LOG_E("[per-session] Failed to ensure SBS image");
+			// Ensure atlas intermediate image exists (tile_columns*eye_w x tile_rows*eye_h)
+			if (!ensure_session_sbs_image(mc, vk, sbs_eye_w, sbs_eye_h,
+			                              tile_columns, tile_rows, imageFormat)) {
+				U_LOG_E("[per-session] Failed to ensure atlas image");
 				goto submit_and_present;
 			}
 
@@ -2480,7 +2445,7 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 			int r_src_top = sbs_right_off_y + (sbs_flip_y ? sbs_eye_h : 0);
 			int r_src_bot = sbs_right_off_y + (sbs_flip_y ? 0 : sbs_eye_h);
 
-			// Pre-barriers: sources → TRANSFER_SRC, SBS image → TRANSFER_DST
+			// Pre-barriers: sources → TRANSFER_SRC, atlas image → TRANSFER_DST
 			uint32_t sbs_pre_count = sbs_same_src ? 2 : 3;
 			VkImageMemoryBarrier sbs_pre[3] = {
 			    {
@@ -2517,33 +2482,41 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 			                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL,
 			                         sbs_pre_count, sbs_pre);
 
-			// Blit left eye into left half of SBS image
+			// Blit left eye into tile position 0 of atlas
+			uint32_t left_tile_x, left_tile_y;
+			u_tiling_view_origin(0, tile_columns, (uint32_t)sbs_eye_w, (uint32_t)sbs_eye_h,
+			                     &left_tile_x, &left_tile_y);
 			VkImageBlit sbs_left_blit = {
 			    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, sbs_left_array, 1},
 			    .srcOffsets = {{sbs_left_off_x, l_src_top, 0},
 			                   {sbs_left_off_x + sbs_eye_w, l_src_bot, 1}},
 			    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-			    .dstOffsets = {{0, 0, 0}, {sbs_eye_w, sbs_eye_h, 1}},
+			    .dstOffsets = {{(int32_t)left_tile_x, (int32_t)left_tile_y, 0},
+			                   {(int32_t)(left_tile_x + sbs_eye_w), (int32_t)(left_tile_y + sbs_eye_h), 1}},
 			};
 			vk->vkCmdBlitImage(cmd, sbs_src_left, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
 			                   mc->session_render.flip_sbs_image,
 			                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 			                   1, &sbs_left_blit, VK_FILTER_NEAREST);
 
-			// Blit right eye into right half of SBS image
+			// Blit right eye into tile position 1 of atlas
+			uint32_t right_tile_x, right_tile_y;
+			u_tiling_view_origin(1, tile_columns, (uint32_t)sbs_eye_w, (uint32_t)sbs_eye_h,
+			                     &right_tile_x, &right_tile_y);
 			VkImageBlit sbs_right_blit = {
 			    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, sbs_right_array, 1},
 			    .srcOffsets = {{sbs_right_off_x, r_src_top, 0},
 			                   {sbs_right_off_x + sbs_eye_w, r_src_bot, 1}},
 			    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-			    .dstOffsets = {{sbs_eye_w, 0, 0}, {sbs_eye_w * 2, sbs_eye_h, 1}},
+			    .dstOffsets = {{(int32_t)right_tile_x, (int32_t)right_tile_y, 0},
+			                   {(int32_t)(right_tile_x + sbs_eye_w), (int32_t)(right_tile_y + sbs_eye_h), 1}},
 			};
 			vk->vkCmdBlitImage(cmd, sbs_src_right, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
 			                   mc->session_render.flip_sbs_image,
 			                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 			                   1, &sbs_right_blit, VK_FILTER_NEAREST);
 
-			// Post-barriers: sources → original layout, SBS → SHADER_READ_ONLY
+			// Post-barriers: sources → original layout, atlas → SHADER_READ_ONLY
 			uint32_t sbs_post_count = sbs_same_src ? 2 : 3;
 			VkImageMemoryBarrier sbs_post[3] = {
 			    {
@@ -2594,13 +2567,14 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 			                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 			                         0, 0, NULL, 0, NULL, 1, &pre_weave);
 
-			// Call display processor with SBS input
-			xrt_display_processor_process_views(
+			// Call display processor with atlas input
+			xrt_display_processor_process_atlas(
 			    mc->session_render.display_processor, cmd,
-			    mc->session_render.flip_sbs_view,  // SBS view (L+R side-by-side)
-			    VK_NULL_HANDLE,                     // right = NULL for SBS mode
-			    (uint32_t)(sbs_eye_w * 2),          // full SBS width
-			    (uint32_t)sbs_eye_h,
+			    mc->session_render.flip_sbs_view,  // atlas view (tiled views)
+			    (uint32_t)sbs_eye_w,               // per-view width
+			    (uint32_t)sbs_eye_h,               // per-view height
+			    tile_columns,                       // tile layout columns
+			    tile_rows,                          // tile layout rows
 			    (VkFormat_XDP)imageFormat,
 			    framebuffer, framebufferWidth, framebufferHeight,
 			    (VkFormat_XDP)framebufferFormat);
@@ -2622,196 +2596,6 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 			goto submit_and_present;
 		}
 
-		// ================================================================
-		// SEPARATE VIEWS PATH: crop-blit each eye into its own image, then
-		// pass separate left/right views to the display processor.
-		// The display processor's render pass handles layout transitions
-		// (e.g., sim_display uses initialLayout=UNDEFINED, finalLayout=PRESENT_SRC_KHR).
-		// ================================================================
-
-		// Window-space overlay path: composite projection + HUD layers into
-		// intermediate per-eye images, then pass directly to display processor.
-		// composite_layers_to_intermediate() outputs SHADER_READ_ONLY_OPTIMAL
-		// views which is what the display processor expects as sampled input.
-		if (has_window_space_layers(mc)) {
-			VkImageView comp_left = VK_NULL_HANDLE, comp_right = VK_NULL_HANDLE;
-			if (composite_layers_to_intermediate(mc, vk, cmd, &comp_left, &comp_right)) {
-				static bool comp_dp_logged = false;
-				if (!comp_dp_logged) {
-					U_LOG_W("[per-session] Display processor with composited overlays, "
-					        "composite=%ux%u",
-					        mc->session_render.composite_width,
-					        mc->session_render.composite_height);
-					comp_dp_logged = true;
-				}
-
-				xrt_display_processor_process_views(
-				    mc->session_render.display_processor, cmd,
-				    comp_left, comp_right,
-				    mc->session_render.composite_width,
-				    mc->session_render.composite_height,
-				    (VkFormat_XDP)imageFormat,
-				    framebuffer, framebufferWidth, framebufferHeight,
-				    (VkFormat_XDP)framebufferFormat);
-
-				goto submit_and_present;
-			}
-		}
-
-		// Crop-blit path (no window-space layers): blit source sub-region into
-		// intermediates, then pass the cropped views to the display processor.
-
-		// Ensure crop images exist at the correct size
-		if (!ensure_session_dp_crop_images(mc, vk, imageWidth, imageHeight, imageFormat)) {
-			U_LOG_E("[per-session] Failed to ensure dp_crop images");
-			goto submit_and_present;
-		}
-
-		bool flip_y = layer->data.flip_y;
-		int left_src_top = leftOffsetY + (flip_y ? imageHeight : 0);
-		int left_src_bot = leftOffsetY + (flip_y ? 0 : imageHeight);
-		int right_src_top = rightOffsetY + (flip_y ? imageHeight : 0);
-		int right_src_bot = rightOffsetY + (flip_y ? 0 : imageHeight);
-
-		// Pre-barriers: sources GENERAL → TRANSFER_SRC, crop images UNDEFINED → TRANSFER_DST
-		// When same_swapchain, left and right are the same VkImage — use 3 barriers instead of 4.
-		uint32_t pre_barrier_count = same_swapchain ? 3 : 4;
-		VkImageMemoryBarrier pre_barriers[4] = {
-		    {
-		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		        .srcAccessMask = 0,
-		        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-		        .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
-		        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-		        .image = leftImage,
-		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, leftArrayIndex, 1},
-		    },
-		    {
-		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		        .srcAccessMask = 0,
-		        .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-		        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-		        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-		        .image = mc->session_render.dp_crop_images[0],
-		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-		    },
-		    {
-		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		        .srcAccessMask = 0,
-		        .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-		        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-		        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-		        .image = mc->session_render.dp_crop_images[1],
-		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-		    },
-		};
-		// When not same_swapchain, insert right-eye source barrier at index 1 and shift crop barriers
-		if (!same_swapchain) {
-			pre_barriers[3] = pre_barriers[2];
-			pre_barriers[2] = pre_barriers[1];
-			pre_barriers[1] = (VkImageMemoryBarrier){
-			    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-			    .srcAccessMask = 0,
-			    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-			    .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
-			    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-			    .image = rightImage,
-			    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, rightArrayIndex, 1},
-			};
-		}
-		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-		                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL,
-		                         pre_barrier_count, pre_barriers);
-
-		// Blit left eye: source sub-region → crop image (with optional Y-flip)
-		VkImageBlit left_blit = {
-		    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, leftArrayIndex, 1},
-		    .srcOffsets = {{leftOffsetX, left_src_top, 0}, {leftOffsetX + imageWidth, left_src_bot, 1}},
-		    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-		    .dstOffsets = {{0, 0, 0}, {imageWidth, imageHeight, 1}},
-		};
-		vk->vkCmdBlitImage(cmd, leftImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-		                   mc->session_render.dp_crop_images[0], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-		                   1, &left_blit, VK_FILTER_NEAREST);
-
-		// Blit right eye
-		VkImageBlit right_blit = {
-		    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, rightArrayIndex, 1},
-		    .srcOffsets = {{rightOffsetX, right_src_top, 0}, {rightOffsetX + imageWidth, right_src_bot, 1}},
-		    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-		    .dstOffsets = {{0, 0, 0}, {imageWidth, imageHeight, 1}},
-		};
-		vk->vkCmdBlitImage(cmd, rightImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-		                   mc->session_render.dp_crop_images[1], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-		                   1, &right_blit, VK_FILTER_NEAREST);
-
-		// Post-barriers: sources → GENERAL, crop images → SHADER_READ_ONLY
-		// When same_swapchain, deduplicate the source barrier (3 instead of 4).
-		uint32_t post_barrier_count = same_swapchain ? 3 : 4;
-		VkImageMemoryBarrier post_barriers[4] = {
-		    {
-		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		        .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-		        .dstAccessMask = 0,
-		        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-		        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-		        .image = leftImage,
-		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, leftArrayIndex, 1},
-		    },
-		    {
-		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-		        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-		        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-		        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-		        .image = mc->session_render.dp_crop_images[0],
-		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-		    },
-		    {
-		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-		        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-		        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-		        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-		        .image = mc->session_render.dp_crop_images[1],
-		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-		    },
-		};
-		if (!same_swapchain) {
-			// Insert right-eye source restore barrier at index 1, shift crop barriers
-			post_barriers[3] = post_barriers[2];
-			post_barriers[2] = post_barriers[1];
-			post_barriers[1] = (VkImageMemoryBarrier){
-			    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-			    .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-			    .dstAccessMask = 0,
-			    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-			    .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-			    .image = rightImage,
-			    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, rightArrayIndex, 1},
-			};
-		}
-		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-		                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-		                         0, 0, NULL, 0, NULL, post_barrier_count, post_barriers);
-
-		// Pass cropped views to display processor (UVs 0..1 now cover only valid content)
-		xrt_display_processor_process_views(
-		    mc->session_render.display_processor,
-		    cmd,
-		    mc->session_render.dp_crop_views[0],
-		    mc->session_render.dp_crop_views[1],
-		    (uint32_t)imageWidth,
-		    (uint32_t)imageHeight,
-		    (VkFormat_XDP)imageFormat,
-		    framebuffer,
-		    framebufferWidth,
-		    framebufferHeight,
-		    (VkFormat_XDP)framebufferFormat);
-
-		// Display processor render pass handles target layout transitions
-		// (e.g., sim_display: initialLayout=UNDEFINED → finalLayout=PRESENT_SRC_KHR)
-		goto submit_and_present;
 	}
 
 submit_and_present:
