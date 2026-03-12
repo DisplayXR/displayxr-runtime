@@ -901,6 +901,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     rs.perfStats = &perfStats;
     rs.appSwapchain = appSwapchain;
     rs.appBackBufferRTV = appBackBufferRTV;
+    // Release originals so rs holds the only reference — required for ResizeBuffers
+    appBackBufferRTV.Reset();
+    appSwapchain.Reset();
     g_renderState = &rs;
 
     MSG msg = {};

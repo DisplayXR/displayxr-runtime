@@ -535,19 +535,6 @@ render_projection_layer(struct comp_d3d11_renderer *r,
 	struct xrt_layer_projection_view_data *view_data = &layer->data.proj.v[view_index];
 	uint32_t image_index = view_data->sub.image_index;
 
-	// Diagnostic: log first few projection renders
-	static int proj_render_count = 0;
-	proj_render_count++;
-	if (proj_render_count <= 6) { // 2 views x 3 frames
-		U_LOG_W("[proj_render] #%d view=%u img=%u norm_rect=(%.3f,%.3f,%.3f,%.3f) "
-		        "img_rect=(%d,%d,%d,%d)",
-		        proj_render_count, view_index, image_index,
-		        view_data->sub.norm_rect.x, view_data->sub.norm_rect.y,
-		        view_data->sub.norm_rect.w, view_data->sub.norm_rect.h,
-		        view_data->sub.rect.offset.w, view_data->sub.rect.offset.h,
-		        view_data->sub.rect.extent.w, view_data->sub.rect.extent.h);
-	}
-
 	// Get the D3D11 swapchain's SRV for this image
 	ID3D11ShaderResourceView *srv = static_cast<ID3D11ShaderResourceView *>(
 	    comp_d3d11_swapchain_get_srv(xsc, image_index));

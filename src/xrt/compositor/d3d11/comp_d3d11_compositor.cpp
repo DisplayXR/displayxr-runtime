@@ -845,22 +845,6 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 
 	// Offscreen shared-texture-only path: no DXGI target
 	if (c->target == nullptr) {
-		// Diagnostic: log shared texture path state (first 3 frames)
-		static int shared_frame_count = 0;
-		shared_frame_count++;
-		if (shared_frame_count <= 3) {
-			U_LOG_W("[shared_path] frame %d: is_mono=%d, display_processor=%p, shared_rtv=%p, "
-			        "layer_count=%u",
-			        shared_frame_count, (int)is_mono, (void *)c->display_processor,
-			        (void *)c->shared_rtv, c->layer_accum.layer_count);
-			// Log first projection layer's view_count
-			for (uint32_t li = 0; li < c->layer_accum.layer_count; li++) {
-				U_LOG_W("[shared_path] frame %d: layer[%u] type=%d view_count=%u",
-				        shared_frame_count, li, (int)c->layer_accum.layers[li].data.type,
-				        c->layer_accum.layers[li].data.view_count);
-			}
-		}
-
 		// Weave/blit directly into the shared texture
 		if (!is_mono && c->display_processor != NULL && c->shared_rtv != nullptr) {
 			void *stereo_srv = comp_d3d11_renderer_get_stereo_srv(c->renderer);
@@ -870,13 +854,6 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			D3D11_TEXTURE2D_DESC st_desc;
 			c->shared_texture->GetDesc(&st_desc);
 
-			if (shared_frame_count <= 3) {
-				U_LOG_W("[shared_path] frame %d: WEAVING stereo_srv=%p, view=%ux%u, "
-				        "shared=%ux%u fmt=%u",
-				        shared_frame_count, stereo_srv, view_width, view_height,
-				        st_desc.Width, st_desc.Height, st_desc.Format);
-			}
-
 			// Bind shared texture as render target for the weaver
 			c->context->OMSetRenderTargets(1, &c->shared_rtv, nullptr);
 
@@ -884,17 +861,9 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			    c->display_processor, c->context, stereo_srv, view_width, view_height,
 			    DXGI_FORMAT_R8G8B8A8_UNORM, st_desc.Width, st_desc.Height);
 			weaving_done = true;
-
-			if (shared_frame_count <= 3) {
-				U_LOG_W("[shared_path] frame %d: weaving DONE", shared_frame_count);
-			}
 		}
 
 		if (!weaving_done) {
-			if (shared_frame_count <= 3) {
-				U_LOG_W("[shared_path] frame %d: FALLBACK is_mono=%d", shared_frame_count,
-				        (int)is_mono);
-			}
 			// Fallback: blit stereo texture directly to shared texture
 			if (is_mono) {
 				D3D11_TEXTURE2D_DESC st_desc;
