@@ -869,10 +869,10 @@ vk_compositor_blit_window_space_layers(struct comp_vk_native_compositor *c)
 		return;
 	}
 
-	uint64_t left_img_u64, right_img_u64;
-	comp_vk_native_renderer_get_eye_images(c->renderer, &left_img_u64, &right_img_u64);
-	VkImage left_img = (VkImage)(uintptr_t)left_img_u64;
-	VkImage right_img = (VkImage)(uintptr_t)right_img_u64;
+	// Get the stereo SBS image — we blit window_space layers directly onto
+	// the SBS texture so the weaver sees them (per-eye images are copies).
+	uint64_t stereo_img_u64 = comp_vk_native_renderer_get_stereo_image(c->renderer);
+	VkImage stereo_img = (VkImage)(uintptr_t)stereo_img_u64;
 
 	uint32_t view_width, view_height;
 	comp_vk_native_renderer_get_view_dimensions(c->renderer, &view_width, &view_height);
@@ -899,31 +899,20 @@ vk_compositor_blit_window_space_layers(struct comp_vk_native_compositor *c)
 	};
 	vk->vkBeginCommandBuffer(cmd, &begin_info);
 
-	// Transition per-eye images from SHADER_READ_ONLY to TRANSFER_DST
-	VkImageMemoryBarrier to_dst[2] = {
-	    {
-	        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-	        .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
-	        .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-	        .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-	        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-	        .image = left_img,
-	        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-	    },
-	    {
-	        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-	        .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
-	        .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-	        .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-	        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-	        .image = right_img,
-	        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-	    },
+	// Transition stereo SBS image from SHADER_READ_ONLY to TRANSFER_DST
+	VkImageMemoryBarrier to_dst = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
+	    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+	    .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	    .image = stereo_img,
+	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
 	};
 	vk->vkCmdPipelineBarrier(cmd,
 	    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
 	    VK_PIPELINE_STAGE_TRANSFER_BIT,
-	    0, 0, NULL, 0, NULL, 2, to_dst);
+	    0, 0, NULL, 0, NULL, 1, &to_dst);
 
 	// Blit each window-space layer onto both per-eye images
 	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
@@ -978,7 +967,7 @@ vk_compositor_blit_window_space_layers(struct comp_vk_native_compositor *c)
 		    VK_PIPELINE_STAGE_TRANSFER_BIT,
 		    0, 0, NULL, 0, NULL, 1, &src_to_transfer);
 
-		// Blit to left eye (shift left by half disparity)
+		// Blit to left half of SBS stereo image (x offset = 0)
 		VkImageBlit left_blit = {
 		    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0,
 		                       ws->sub.array_index, 1},
@@ -989,21 +978,22 @@ vk_compositor_blit_window_space_layers(struct comp_vk_native_compositor *c)
 		};
 		vk->vkCmdBlitImage(cmd,
 		    src_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-		    left_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		    stereo_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 		    1, &left_blit, VK_FILTER_LINEAR);
 
-		// Blit to right eye (shift right by half disparity)
+		// Blit to right half of SBS stereo image (x offset = view_width)
+		int32_t right_x_offset = (int32_t)view_width;
 		VkImageBlit right_blit = {
 		    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0,
 		                       ws->sub.array_index, 1},
 		    .srcOffsets = {{sx0, sy0, 0}, {sx1, sy1, 1}},
 		    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-		    .dstOffsets = {{dx0 + disp_px, dy0, 0},
-		                   {dx0 + disp_px + dw, dy0 + dh, 1}},
+		    .dstOffsets = {{right_x_offset + dx0 + disp_px, dy0, 0},
+		                   {right_x_offset + dx0 + disp_px + dw, dy0 + dh, 1}},
 		};
 		vk->vkCmdBlitImage(cmd,
 		    src_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-		    right_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		    stereo_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 		    1, &right_blit, VK_FILTER_LINEAR);
 
 		// Transition source back to COLOR_ATTACHMENT
@@ -1023,31 +1013,20 @@ vk_compositor_blit_window_space_layers(struct comp_vk_native_compositor *c)
 		    0, 0, NULL, 0, NULL, 1, &src_back);
 	}
 
-	// Transition per-eye images back to SHADER_READ_ONLY
-	VkImageMemoryBarrier to_shader[2] = {
-	    {
-	        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-	        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-	        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-	        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-	        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-	        .image = left_img,
-	        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-	    },
-	    {
-	        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-	        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-	        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-	        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-	        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-	        .image = right_img,
-	        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-	    },
+	// Transition stereo SBS image back to SHADER_READ_ONLY
+	VkImageMemoryBarrier to_shader = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+	    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+	    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	    .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	    .image = stereo_img,
+	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
 	};
 	vk->vkCmdPipelineBarrier(cmd,
 	    VK_PIPELINE_STAGE_TRANSFER_BIT,
 	    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-	    0, 0, NULL, 0, NULL, 2, to_shader);
+	    0, 0, NULL, 0, NULL, 1, &to_shader);
 
 	vk->vkEndCommandBuffer(cmd);
 
@@ -1274,13 +1253,13 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 					dp_logged = true;
 				}
 
-				uint64_t left_view, right_view;
-				comp_vk_native_renderer_get_stereo_views(c->renderer, &left_view, &right_view);
-
 				uint32_t view_width, view_height;
 				comp_vk_native_renderer_get_view_dimensions(c->renderer, &view_width, &view_height);
 
 				int32_t view_format = comp_vk_native_renderer_get_format(c->renderer);
+
+				// Check if display processor prefers SBS input (single side-by-side texture)
+				bool sbs_mode = c->display_processor->prefers_sbs_input;
 
 				// Create temporary framebuffer from the target's swapchain image
 				VkImageView fb_view = (VkImageView)(uintptr_t)target_view;
@@ -1311,16 +1290,35 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				    0, 0, NULL, 0, NULL, 1, &pre_weave);
 
 				// Call display processor: records interlacing commands into cmd
-				xrt_display_processor_process_views(
-				    c->display_processor,
-				    cmd,
-				    (VkImageView)(uintptr_t)left_view,
-				    (VkImageView)(uintptr_t)right_view,
-				    view_width, view_height,
-				    (VkFormat_XDP)view_format,
-				    target_fb,
-				    tgt_width, tgt_height,
-				    (VkFormat_XDP)VK_FORMAT_B8G8R8A8_UNORM);
+				if (sbs_mode) {
+					// SBS mode: pass single side-by-side view (matching multi-compositor)
+					uint64_t sbs_view = comp_vk_native_renderer_get_sbs_view(c->renderer);
+					xrt_display_processor_process_views(
+					    c->display_processor,
+					    cmd,
+					    (VkImageView)(uintptr_t)sbs_view,
+					    VK_NULL_HANDLE,       // right = NULL for SBS mode
+					    view_width * 2,        // full SBS width
+					    view_height,
+					    (VkFormat_XDP)view_format,
+					    target_fb,
+					    tgt_width, tgt_height,
+					    (VkFormat_XDP)VK_FORMAT_B8G8R8A8_UNORM);
+				} else {
+					// Separate views mode
+					uint64_t left_view, right_view;
+					comp_vk_native_renderer_get_stereo_views(c->renderer, &left_view, &right_view);
+					xrt_display_processor_process_views(
+					    c->display_processor,
+					    cmd,
+					    (VkImageView)(uintptr_t)left_view,
+					    (VkImageView)(uintptr_t)right_view,
+					    view_width, view_height,
+					    (VkFormat_XDP)view_format,
+					    target_fb,
+					    tgt_width, tgt_height,
+					    (VkFormat_XDP)VK_FORMAT_B8G8R8A8_UNORM);
+				}
 
 				// Render pass finalLayout handles transition to PRESENT_SRC_KHR
 			} else {

@@ -599,6 +599,12 @@ comp_vk_native_renderer_get_stereo_views(struct comp_vk_native_renderer *r,
 }
 
 uint64_t
+comp_vk_native_renderer_get_sbs_view(struct comp_vk_native_renderer *r)
+{
+	return (uint64_t)(uintptr_t)r->stereo_view;
+}
+
+uint64_t
 comp_vk_native_renderer_get_stereo_image(struct comp_vk_native_renderer *r)
 {
 	return (uint64_t)(uintptr_t)r->stereo_image;

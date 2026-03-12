@@ -91,6 +91,17 @@ comp_vk_native_renderer_get_stereo_views(struct comp_vk_native_renderer *rendere
                                           uint64_t *out_right_view);
 
 /*!
+ * Get the full side-by-side stereo VkImageView (2*view_width x height).
+ *
+ * @param renderer The renderer.
+ * @return VkImageView as uint64_t.
+ *
+ * @ingroup comp_vk_native
+ */
+uint64_t
+comp_vk_native_renderer_get_sbs_view(struct comp_vk_native_renderer *renderer);
+
+/*!
  * Get the stereo texture VkImage.
  *
  * @param renderer The renderer.
