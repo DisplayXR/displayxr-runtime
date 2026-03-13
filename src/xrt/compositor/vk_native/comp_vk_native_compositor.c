@@ -32,6 +32,7 @@
 #include "os/os_time.h"
 
 #include "math/m_api.h"
+#include "util/u_tiling.h"
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
 #include "qwerty_interface.h"
@@ -130,9 +131,6 @@ struct comp_vk_native_compositor
 
 	//! Command pool for display processor factory.
 	VkCommandPool cmd_pool;
-
-	//! Simple render pass for display processor framebuffer creation.
-	VkRenderPass dp_render_pass;
 
 	//! Generic Vulkan display processor (vendor-agnostic weaving).
 	struct xrt_display_processor *display_processor;
@@ -704,7 +702,10 @@ vk_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 
 				uint32_t new_vw = new_width / 2;
 				uint32_t new_vh = new_height;
-				comp_vk_native_renderer_resize(c->renderer, new_vw, new_vh, new_height);
+				uint32_t tc, tr;
+				comp_vk_native_renderer_get_tile_layout(c->renderer, &tc, &tr);
+				comp_vk_native_renderer_resize(c->renderer, new_vw, new_vh,
+				                                tc * new_vw, tr * new_vh);
 			}
 		}
 	}
@@ -731,7 +732,10 @@ vk_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 
 			uint32_t new_vw = new_width / 2;
 			uint32_t new_vh = new_height;
-			comp_vk_native_renderer_resize(c->renderer, new_vw, new_vh, new_height);
+			uint32_t tc, tr;
+			comp_vk_native_renderer_get_tile_layout(c->renderer, &tc, &tr);
+			comp_vk_native_renderer_resize(c->renderer, new_vw, new_vh,
+			                                tc * new_vw, tr * new_vh);
 		}
 	}
 #endif
@@ -1027,8 +1031,21 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			const struct xrt_rendering_mode *mode = &c->xdev->rendering_modes[idx];
 			c->hardware_display_3d = mode->hardware_display_3d;
 			if (mode->tile_columns > 0 && c->renderer != NULL) {
-				comp_vk_native_renderer_set_tile_layout(
-				    c->renderer, mode->tile_columns, mode->tile_rows);
+				uint32_t old_tc, old_tr;
+				comp_vk_native_renderer_get_tile_layout(
+				    c->renderer, &old_tc, &old_tr);
+				if (old_tc != mode->tile_columns || old_tr != mode->tile_rows) {
+					// Tile layout changed — resize atlas to match
+					uint32_t vw, vh;
+					comp_vk_native_renderer_get_view_dimensions(
+					    c->renderer, &vw, &vh);
+					comp_vk_native_renderer_resize(
+					    c->renderer, vw, vh,
+					    mode->tile_columns * vw,
+					    mode->tile_rows * vh);
+					comp_vk_native_renderer_set_tile_layout(
+					    c->renderer, mode->tile_columns, mode->tile_rows);
+				}
 			}
 		}
 	}
@@ -1213,7 +1230,11 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			// into our command buffer using a framebuffer from our target.
 			// This matches the multi-compositor approach where the weaver is
 			// a command recorder, not a standalone presenter.
-			if (c->hardware_display_3d && c->display_processor != NULL && c->dp_render_pass != VK_NULL_HANDLE) {
+			VkRenderPass dp_render_pass = (c->display_processor != NULL)
+			    ? xrt_display_processor_get_render_pass(c->display_processor)
+			    : VK_NULL_HANDLE;
+
+			if (c->hardware_display_3d && c->display_processor != NULL && dp_render_pass != VK_NULL_HANDLE) {
 				static bool dp_logged = false;
 				if (!dp_logged) {
 					U_LOG_W("VK weaving via display processor (compositor-owned swapchain)");
@@ -1228,11 +1249,12 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 
 				int32_t view_format = comp_vk_native_renderer_get_format(c->renderer);
 
-				// Create temporary framebuffer from the target's swapchain image
+				// Create temporary framebuffer from the target's swapchain image.
+				// Must use the DP's render pass for compatibility with vkCmdBeginRenderPass.
 				VkImageView fb_view = (VkImageView)(uintptr_t)target_view;
 				VkFramebufferCreateInfo fb_ci = {
 				    .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
-				    .renderPass = c->dp_render_pass,
+				    .renderPass = dp_render_pass,
 				    .attachmentCount = 1,
 				    .pAttachments = &fb_view,
 				    .width = tgt_width,
@@ -1341,11 +1363,8 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 
 	vk->vkDeviceWaitIdle(vk->device);
 
-	// Destroy display processor and its render pass
+	// Destroy display processor
 	xrt_display_processor_destroy(&c->display_processor);
-	if (c->dp_render_pass != VK_NULL_HANDLE) {
-		vk->vkDestroyRenderPass(vk->device, c->dp_render_pass, NULL);
-	}
 
 	// Destroy shared texture resources
 	if (c->shared_view != VK_NULL_HANDLE) {
@@ -1602,7 +1621,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 #else
 		                               NULL,
 #endif
-		                               (int32_t)VK_FORMAT_R8G8B8A8_UNORM,
+		                               (int32_t)VK_FORMAT_B8G8R8A8_UNORM,
 		                               &c->display_processor);
 		if (dp_ret != XRT_SUCCESS) {
 			U_LOG_W("VK display processor factory failed (error %d), continuing without",
@@ -1648,39 +1667,6 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		U_LOG_I("No VK target — offscreen shared texture mode");
 	}
 
-	// Create a simple render pass for display processor framebuffer creation.
-	// This must be compatible with the weaver's internal render pass
-	// (single color attachment, B8G8R8A8_UNORM, store result).
-	if (c->display_processor != NULL) {
-		VkAttachmentDescription color_attachment = {
-		    .format = VK_FORMAT_B8G8R8A8_UNORM,
-		    .samples = VK_SAMPLE_COUNT_1_BIT,
-		    .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-		    .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-		    .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-		    .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-		    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-		    .finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-		};
-		VkAttachmentReference color_ref = {
-		    .attachment = 0,
-		    .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-		};
-		VkSubpassDescription subpass = {
-		    .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
-		    .colorAttachmentCount = 1,
-		    .pColorAttachments = &color_ref,
-		};
-		VkRenderPassCreateInfo rp_ci = {
-		    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
-		    .attachmentCount = 1,
-		    .pAttachments = &color_attachment,
-		    .subpassCount = 1,
-		    .pSubpasses = &subpass,
-		};
-		c->vk.vkCreateRenderPass(c->vk.device, &rp_ci, NULL, &c->dp_render_pass);
-	}
-
 	// Determine view dimensions
 	uint32_t view_width = c->settings.preferred.width / 2;
 	uint32_t view_height = c->settings.preferred.height;
@@ -1706,9 +1692,24 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		}
 	}
 
-	// Create renderer
-	uint32_t target_height = (c->display_processor != NULL) ? view_height : c->settings.preferred.height;
-	xrt_result_t xret = comp_vk_native_renderer_create(c, view_width, view_height, target_height, &c->renderer);
+	// Compute atlas dimensions from active rendering mode
+	uint32_t tile_cols = 2, tile_rows = 1;
+	if (c->xdev != NULL && c->xdev->hmd != NULL) {
+		uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
+		if (idx < c->xdev->rendering_mode_count) {
+			const struct xrt_rendering_mode *mode = &c->xdev->rendering_modes[idx];
+			if (mode->tile_columns > 0) {
+				tile_cols = mode->tile_columns;
+				tile_rows = mode->tile_rows;
+			}
+		}
+	}
+	uint32_t atlas_width = tile_cols * view_width;
+	uint32_t atlas_height = tile_rows * view_height;
+
+	// Create renderer with active mode atlas
+	xrt_result_t xret = comp_vk_native_renderer_create(c, view_width, view_height,
+	                                                     atlas_width, atlas_height, &c->renderer);
 	if (xret != XRT_SUCCESS) {
 		U_LOG_E("Failed to create VK renderer");
 		vk_compositor_destroy(&c->base.base);

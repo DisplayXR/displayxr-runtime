@@ -38,6 +38,7 @@
 
 #include "math/m_api.h"
 #include "util/u_hud.h"
+#include "util/u_tiling.h"
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
 #include "qwerty_interface.h"
@@ -1717,10 +1718,15 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 		}
 	}
 
-	// Worst-case atlas = display resolution (Retina-scaled).
-	// All modes tile within this space — never reallocated.
+	// Worst-case atlas = max across all rendering modes.
+	// With near-square tiling, a 1x2 layout can be taller than the display.
 	uint32_t atlas_w = pixel_width;
 	uint32_t atlas_h = pixel_height;
+	if (xdev != NULL && xdev->rendering_mode_count > 0) {
+		u_tiling_compute_system_atlas(xdev->rendering_modes,
+		                              xdev->rendering_mode_count,
+		                              &atlas_w, &atlas_h);
+	}
 
 	// Compile shaders
 	if (!compile_shaders(c)) {

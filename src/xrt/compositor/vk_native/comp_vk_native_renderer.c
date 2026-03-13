@@ -92,16 +92,14 @@ static xrt_result_t
 create_atlas_resources(struct comp_vk_native_renderer *r,
                        uint32_t view_width,
                        uint32_t view_height,
-                       uint32_t target_height)
+                       uint32_t atlas_width,
+                       uint32_t atlas_height)
 {
 	struct vk_bundle *vk = r->vk;
 
 	r->view_width = view_width;
 	r->view_height = view_height;
-	r->texture_height = view_height > target_height ? view_height : target_height;
-
-	uint32_t atlas_width = r->tile_columns * view_width;
-	uint32_t atlas_height = r->tile_rows * r->texture_height;
+	r->texture_height = view_height;
 
 	VkImageCreateInfo image_ci = {
 	    .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
@@ -189,7 +187,8 @@ xrt_result_t
 comp_vk_native_renderer_create(struct comp_vk_native_compositor *c,
                                 uint32_t view_width,
                                 uint32_t view_height,
-                                uint32_t target_height,
+                                uint32_t atlas_width,
+                                uint32_t atlas_height,
                                 struct comp_vk_native_renderer **out_renderer)
 {
 	struct vk_bundle *vk = comp_vk_native_compositor_get_vk(c);
@@ -218,7 +217,7 @@ comp_vk_native_renderer_create(struct comp_vk_native_compositor *c,
 		return XRT_ERROR_VULKAN;
 	}
 
-	xrt_result_t xret = create_atlas_resources(r, view_width, view_height, target_height);
+	xrt_result_t xret = create_atlas_resources(r, view_width, view_height, atlas_width, atlas_height);
 	if (xret != XRT_SUCCESS) {
 		vk->vkDestroyCommandPool(vk->device, r->cmd_pool, NULL);
 		free(r);
@@ -350,13 +349,29 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 		uint32_t view_count = hardware_display_3d ? layer->data.view_count : 1;
 		if (view_count == 0) view_count = 1;
 
+		static bool blit_logged = false;
+		if (!blit_logged) {
+			U_LOG_W("Atlas blit: view_count=%u, hardware_3d=%d, tiles=%ux%u, "
+			        "view=%ux%u, layer_view_count=%u",
+			        view_count, (int)hardware_display_3d,
+			        r->tile_columns, r->tile_rows,
+			        r->view_width, r->view_height,
+			        layer->data.view_count);
+		}
+
 		for (uint32_t eye = 0; eye < view_count; eye++) {
 			struct xrt_swapchain *xsc = layer->sc_array[eye];
-			if (xsc == NULL) continue;
+			if (xsc == NULL) {
+				if (!blit_logged) U_LOG_W("Atlas blit: eye %u swapchain NULL", eye);
+				continue;
+			}
 
 			uint32_t sc_index = layer->data.proj.v[eye].sub.image_index;
 			VkImage src_image = (VkImage)(uintptr_t)comp_vk_native_swapchain_get_image(xsc, sc_index);
-			if (src_image == VK_NULL_HANDLE) continue;
+			if (src_image == VK_NULL_HANDLE) {
+				if (!blit_logged) U_LOG_W("Atlas blit: eye %u image NULL", eye);
+				continue;
+			}
 
 			cmd_image_barrier(vk, cmd, src_image,
 			                   VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -419,6 +434,8 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 			                   VK_PIPELINE_STAGE_TRANSFER_BIT,
 			                   VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
 		}
+
+		blit_logged = true;
 	}
 
 	// Transition atlas image to shader read for display processor
@@ -482,7 +499,8 @@ xrt_result_t
 comp_vk_native_renderer_resize(struct comp_vk_native_renderer *r,
                                 uint32_t new_view_width,
                                 uint32_t new_view_height,
-                                uint32_t new_target_height)
+                                uint32_t new_atlas_width,
+                                uint32_t new_atlas_height)
 {
 	struct vk_bundle *vk = r->vk;
 
@@ -496,7 +514,7 @@ comp_vk_native_renderer_resize(struct comp_vk_native_renderer *r,
 	vk->vkDeviceWaitIdle(vk->device);
 	destroy_atlas_resources(r);
 
-	return create_atlas_resources(r, new_view_width, new_view_height, new_target_height);
+	return create_atlas_resources(r, new_view_width, new_view_height, new_atlas_width, new_atlas_height);
 }
 
 void

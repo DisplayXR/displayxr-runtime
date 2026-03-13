@@ -219,7 +219,7 @@ leia_hmd_create(void)
 	snprintf(hmd->base.rendering_modes[1].mode_name, XRT_DEVICE_NAME_LEN, "LeiaSR");
 	hmd->base.rendering_modes[1].view_count = 2;
 	hmd->base.rendering_modes[1].view_scale_x = 0.5f; // Default, overridden by SR SDK
-	hmd->base.rendering_modes[1].view_scale_y = 1.0f;
+	hmd->base.rendering_modes[1].view_scale_y = 0.5f;
 	hmd->base.rendering_modes[1].hardware_display_3d = true;
 
 	hmd->base.hmd->active_rendering_mode_index = 1; // Default to LeiaSR (3D)

@@ -17,12 +17,15 @@ layout(location = 0) out vec4 out_color;
 
 void main()
 {
-	// Sample left eye (tile 0,0)
+	// Sample left eye (tile index 0: col=0, row=0)
 	vec2 left_uv = in_uv * vec2(tile.inv_tile_columns, tile.inv_tile_rows);
 	vec4 left = texture(atlas_tex, left_uv);
 
-	// Sample right eye (tile 1,0)
-	vec2 right_uv = left_uv + vec2(tile.inv_tile_columns, 0.0);
+	// Sample right eye (tile index 1: general position)
+	float col = mod(1.0, tile.tile_columns);
+	float row = floor(1.0 / tile.tile_columns);
+	vec2 right_uv = vec2((in_uv.x + col) * tile.inv_tile_columns,
+	                     (in_uv.y + row) * tile.inv_tile_rows);
 	vec4 right = texture(atlas_tex, right_uv);
 
 	// Red-cyan anaglyph: red channel from left eye,
