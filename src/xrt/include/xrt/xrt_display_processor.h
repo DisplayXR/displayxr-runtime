@@ -28,10 +28,12 @@ extern "C" {
 typedef struct VkCommandBuffer_T *VkCommandBuffer;
 
 #ifdef XRT_64_BIT
+typedef struct VkImage_T *VkImage_XDP;
 typedef struct VkImageView_T *VkImageView;
 typedef struct VkFramebuffer_T *VkFramebuffer;
 typedef struct VkRenderPass_T *VkRenderPass;
 #else
+typedef uint64_t VkImage_XDP;
 typedef uint64_t VkImageView;
 typedef uint64_t VkFramebuffer;
 typedef uint64_t VkRenderPass;
@@ -81,6 +83,7 @@ struct xrt_display_processor
 	 *
 	 * @param      xdp              Pointer to self.
 	 * @param      cmd_buffer       Vulkan command buffer to record into.
+	 * @param      atlas_image      Atlas VkImage handle (for copy/blit ops).
 	 * @param      atlas_view       Atlas image view (tiled views).
 	 * @param      view_width       Width of one view in the atlas in pixels.
 	 * @param      view_height      Height of one view in the atlas in pixels.
@@ -94,6 +97,7 @@ struct xrt_display_processor
 	 */
 	void (*process_atlas)(struct xrt_display_processor *xdp,
 	                      VkCommandBuffer cmd_buffer,
+	                      VkImage_XDP atlas_image,
 	                      VkImageView atlas_view,
 	                      uint32_t view_width,
 	                      uint32_t view_height,
@@ -199,6 +203,7 @@ struct xrt_display_processor
 static inline void
 xrt_display_processor_process_atlas(struct xrt_display_processor *xdp,
                                     VkCommandBuffer cmd_buffer,
+                                    VkImage_XDP atlas_image,
                                     VkImageView atlas_view,
                                     uint32_t view_width,
                                     uint32_t view_height,
@@ -210,7 +215,7 @@ xrt_display_processor_process_atlas(struct xrt_display_processor *xdp,
                                     uint32_t target_height,
                                     VkFormat_XDP target_format)
 {
-	xdp->process_atlas(xdp, cmd_buffer, atlas_view,
+	xdp->process_atlas(xdp, cmd_buffer, atlas_image, atlas_view,
 	                   view_width, view_height,
 	                   tile_columns, tile_rows,
 	                   view_format, target_fb,

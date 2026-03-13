@@ -1119,6 +1119,7 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 		// Display processor weaving path
 		if (c->hardware_display_3d && c->display_processor != NULL) {
 			uint64_t atlas_view_u64 = comp_vk_native_renderer_get_atlas_view(c->renderer);
+			uint64_t atlas_image_u64 = comp_vk_native_renderer_get_atlas_image(c->renderer);
 
 			uint32_t view_width, view_height;
 			comp_vk_native_renderer_get_view_dimensions(c->renderer, &view_width, &view_height);
@@ -1146,6 +1147,7 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			xrt_display_processor_process_atlas(
 			    c->display_processor,
 			    cmd,
+			    (VkImage_XDP)(uintptr_t)atlas_image_u64,
 			    (VkImageView)(uintptr_t)atlas_view_u64,
 			    view_width, view_height,
 			    tc, tr,
@@ -1280,9 +1282,11 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 
 				// Call display processor with atlas texture
 				uint64_t atlas_view_u64 = comp_vk_native_renderer_get_atlas_view(c->renderer);
+				uint64_t atlas_image_u64 = comp_vk_native_renderer_get_atlas_image(c->renderer);
 				xrt_display_processor_process_atlas(
 				    c->display_processor,
 				    cmd,
+				    (VkImage_XDP)(uintptr_t)atlas_image_u64,
 				    (VkImageView)(uintptr_t)atlas_view_u64,
 				    view_width, view_height,
 				    tc, tr,

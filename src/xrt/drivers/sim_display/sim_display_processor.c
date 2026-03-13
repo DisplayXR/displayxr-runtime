@@ -85,6 +85,7 @@ struct tile_push_constants
 static void
 sim_dp_process_atlas(struct xrt_display_processor *xdp,
                      VkCommandBuffer cmd_buffer,
+                     VkImage_XDP atlas_image,
                      VkImageView atlas_view,
                      uint32_t view_width,
                      uint32_t view_height,
@@ -96,6 +97,7 @@ sim_dp_process_atlas(struct xrt_display_processor *xdp,
                      uint32_t target_height,
                      VkFormat_XDP target_format)
 {
+	(void)atlas_image; // sim_display uses atlas_view via shader sampling
 	struct sim_display_processor *sdp = sim_display_processor(xdp);
 	struct vk_bundle *vk = sdp->vk;
 

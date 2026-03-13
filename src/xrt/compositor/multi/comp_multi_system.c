@@ -2570,6 +2570,7 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 			// Call display processor with atlas input
 			xrt_display_processor_process_atlas(
 			    mc->session_render.display_processor, cmd,
+			    (VkImage_XDP)mc->session_render.flip_sbs_image, // atlas image (for copy/blit)
 			    mc->session_render.flip_sbs_view,  // atlas view (tiled views)
 			    (uint32_t)sbs_eye_w,               // per-view width
 			    (uint32_t)sbs_eye_h,               // per-view height
