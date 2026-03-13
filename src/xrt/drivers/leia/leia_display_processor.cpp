@@ -67,6 +67,14 @@ leia_dp_process_atlas(struct xrt_display_processor *xdp,
 	viewport.extent.width = target_width;
 	viewport.extent.height = target_height;
 
+	// TODO: When tile_columns != 2 || tile_rows != 1, the atlas is not SBS
+	// and needs rearrangement. The VK DP interface only provides VkImageView
+	// (not VkImage), so vkCmdCopyImage isn't possible here. Fix requires either
+	// extending the interface to pass VkImage, or using a blit render pass.
+	// For now, pass atlas as-is — correct only when tile_columns=2, tile_rows=1.
+	(void)tile_columns;
+	(void)tile_rows;
+
 	// SR weaver expects SBS atlas as left_view, VK_NULL_HANDLE as right
 	leiasr_weave(ldp->leiasr,
 	             cmd_buffer,
