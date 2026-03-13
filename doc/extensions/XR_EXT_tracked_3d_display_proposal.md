@@ -1568,6 +1568,14 @@ A future revision would need to define:
 
 The compositor and OpenXR state tracker layers would need essentially zero changes.
 
+#### Tiling Convention
+
+The runtime's internal rendering modes now require `tile_columns` and `tile_rows` to be specified by the driver. The near-square formula has been removed in favor of explicit driver-specified tiling:
+
+- **Single-swapchain tiling**: The driver specifies `tile_columns × tile_rows`. Views are placed at positions `(v % cols) * view_w, (v / cols) * view_h` within the atlas.
+- **Zero-copy passthrough**: When the app's swapchain already matches the DP's expected tiled layout (same dimensions, correct tile positions, single swapchain for all views), the compositor skips the atlas copy entirely and passes the swapchain texture directly to the display processor.
+- **DP contract**: The display processor always receives an exactly-sized tiled texture: `tile_columns × view_width` by `tile_rows × view_height`, with views packed in row-major order.
+
 **Passive (non-tracked) displays.** Not all multiview 3D displays have eye tracking.
 Passive autostereoscopic displays (lenticular, parallax barrier) present fixed-viewpoint 3D
 without tracking the viewer. A dedicated `hasTracking` flag is **not needed** because the

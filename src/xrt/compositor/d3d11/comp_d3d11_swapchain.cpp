@@ -457,3 +457,11 @@ comp_d3d11_swapchain_get_texture(struct xrt_swapchain *xsc, uint32_t index)
 
 	return sc->images[index];
 }
+
+extern "C" void
+comp_d3d11_swapchain_get_dimensions(struct xrt_swapchain *xsc, uint32_t *out_w, uint32_t *out_h)
+{
+	struct comp_d3d11_swapchain *sc = d3d11_sc(xsc);
+	*out_w = sc->info.width;
+	*out_h = sc->info.height;
+}

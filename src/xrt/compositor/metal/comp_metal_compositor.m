@@ -1244,8 +1244,65 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 	}
 
-	// Step 1: Render layers into SBS stereo texture
-	if (c->atlas_texture != nil && c->layer_accum.layer_count > 0) {
+	// Zero-copy check: can we pass the app's swapchain directly to the DP?
+	bool zero_copy = false;
+	id<MTLTexture> zc_texture = nil;
+
+	if (c->layer_accum.layer_count == 1) {
+		struct comp_layer *layer = &c->layer_accum.layers[0];
+		if (layer->data.type == XRT_LAYER_PROJECTION ||
+		    layer->data.type == XRT_LAYER_PROJECTION_DEPTH) {
+			const struct xrt_rendering_mode *mode = NULL;
+			if (c->xdev != NULL && c->xdev->hmd != NULL) {
+				uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
+				if (idx < c->xdev->rendering_mode_count)
+					mode = &c->xdev->rendering_modes[idx];
+			}
+			if (mode != NULL && mode->view_count <= XRT_MAX_VIEWS) {
+				uint32_t vc = mode->view_count;
+				// All views must reference the same swapchain
+				bool same_sc = (vc > 0 && layer->sc_array[0] != NULL);
+				for (uint32_t v = 1; v < vc && same_sc; v++) {
+					if (layer->sc_array[v] != layer->sc_array[0])
+						same_sc = false;
+				}
+				if (same_sc) {
+					uint32_t img_idx = layer->data.proj.v[0].sub.image_index;
+					bool same_idx = true;
+					for (uint32_t v = 1; v < vc; v++) {
+						if (layer->data.proj.v[v].sub.image_index != img_idx) {
+							same_idx = false;
+							break;
+						}
+					}
+					bool all_array_zero = same_idx;
+					for (uint32_t v = 0; v < vc && all_array_zero; v++) {
+						if (layer->data.proj.v[v].sub.array_index != 0)
+							all_array_zero = false;
+					}
+					if (all_array_zero) {
+						struct comp_metal_swapchain *msc = metal_swapchain(layer->sc_array[0]);
+						int32_t rxs[XRT_MAX_VIEWS], rys[XRT_MAX_VIEWS];
+						uint32_t rws[XRT_MAX_VIEWS], rhs[XRT_MAX_VIEWS];
+						for (uint32_t v = 0; v < vc; v++) {
+							rxs[v] = layer->data.proj.v[v].sub.rect.offset.w;
+							rys[v] = layer->data.proj.v[v].sub.rect.offset.h;
+							rws[v] = layer->data.proj.v[v].sub.rect.extent.w;
+							rhs[v] = layer->data.proj.v[v].sub.rect.extent.h;
+						}
+						if (u_tiling_can_zero_copy(vc, rxs, rys, rws, rhs,
+						                           msc->info.width, msc->info.height, mode)) {
+							zero_copy = true;
+							zc_texture = msc->images[img_idx];
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Step 1: Render layers into SBS stereo texture (skip if zero-copy)
+	if (!zero_copy && c->atlas_texture != nil && c->layer_accum.layer_count > 0) {
 		MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
 		pass.colorAttachments[0].texture = c->atlas_texture;
 		pass.colorAttachments[0].loadAction = MTLLoadActionClear;
@@ -1375,11 +1432,12 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	}
 
 	// Step 2: Blit stereo texture to drawable (or process through display processor)
-	if (c->hardware_display_3d && c->display_processor != NULL && c->atlas_texture != nil) {
+	id<MTLTexture> atlas_src = zero_copy ? zc_texture : c->atlas_texture;
+	if (c->hardware_display_3d && c->display_processor != NULL && atlas_src != nil) {
 		xrt_display_processor_metal_process_atlas(
 		    c->display_processor,
 		    (__bridge void *)cmd_buf,
-		    (__bridge void *)c->atlas_texture,
+		    (__bridge void *)atlas_src,
 		    c->view_width,
 		    c->view_height,
 		    c->tile_columns,
@@ -1398,9 +1456,9 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 
 		id<MTLRenderCommandEncoder> blit_encoder = [cmd_buf renderCommandEncoderWithDescriptor:blit_pass];
 
-		if (c->atlas_texture != nil) {
+		if (atlas_src != nil) {
 			[blit_encoder setRenderPipelineState:c->blit_pipeline];
-			[blit_encoder setFragmentTexture:c->atlas_texture atIndex:0];
+			[blit_encoder setFragmentTexture:atlas_src atIndex:0];
 			[blit_encoder setFragmentSamplerState:c->sampler_linear atIndex:0];
 			[blit_encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
 		}

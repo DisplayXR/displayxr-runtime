@@ -507,7 +507,10 @@ comp_vk_native_renderer_resize(struct comp_vk_native_renderer *r,
 	if (new_view_width < 64) new_view_width = 64;
 	if (new_view_height < 64) new_view_height = 64;
 
-	if (new_view_width == r->view_width && new_view_height == r->view_height) {
+	uint32_t cur_atlas_w = r->tile_columns * r->view_width;
+	uint32_t cur_atlas_h = r->tile_rows * r->view_height;
+	if (new_view_width == r->view_width && new_view_height == r->view_height &&
+	    new_atlas_width == cur_atlas_w && new_atlas_height == cur_atlas_h) {
 		return XRT_SUCCESS;
 	}
 

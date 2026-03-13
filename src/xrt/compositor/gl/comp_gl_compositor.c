@@ -26,6 +26,7 @@
 
 #include "util/u_logging.h"
 #include "util/u_misc.h"
+#include "util/u_tiling.h"
 #include "util/u_time.h"
 #include "util/u_hud.h"
 #include "os/os_time.h"
@@ -839,7 +840,63 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 	glDisable(GL_SCISSOR_TEST);
 
 
-	// --- Step 1: Render layers into SBS stereo texture ---
+	// Zero-copy check: can we pass the app's swapchain directly to the DP?
+	bool zero_copy = false;
+	GLuint zc_texture = 0;
+	{
+		const struct xrt_rendering_mode *mode = NULL;
+		if (c->xdev != NULL && c->xdev->hmd != NULL) {
+			uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
+			if (idx < c->xdev->rendering_mode_count)
+				mode = &c->xdev->rendering_modes[idx];
+		}
+		if (mode != NULL && c->layer_accum.layer_count == 1) {
+			struct comp_layer *layer = &c->layer_accum.layers[0];
+			if (layer->data.type == XRT_LAYER_PROJECTION ||
+			    layer->data.type == XRT_LAYER_PROJECTION_DEPTH) {
+				uint32_t vc = mode->view_count;
+				bool same_sc = (vc > 0 && vc <= XRT_MAX_VIEWS && layer->sc_array[0] != NULL);
+				for (uint32_t v = 1; v < vc && same_sc; v++) {
+					if (layer->sc_array[v] != layer->sc_array[0])
+						same_sc = false;
+				}
+				if (same_sc) {
+					uint32_t img_idx = layer->data.proj.v[0].sub.image_index;
+					bool same_idx = true;
+					for (uint32_t v = 1; v < vc; v++) {
+						if (layer->data.proj.v[v].sub.image_index != img_idx) {
+							same_idx = false;
+							break;
+						}
+					}
+					bool all_array_zero = same_idx;
+					for (uint32_t v = 0; v < vc && all_array_zero; v++) {
+						if (layer->data.proj.v[v].sub.array_index != 0)
+							all_array_zero = false;
+					}
+					if (all_array_zero) {
+						struct comp_gl_swapchain *gsc = gl_swapchain(layer->sc_array[0]);
+						int32_t rxs[XRT_MAX_VIEWS], rys[XRT_MAX_VIEWS];
+						uint32_t rws[XRT_MAX_VIEWS], rhs_arr[XRT_MAX_VIEWS];
+						for (uint32_t v = 0; v < vc; v++) {
+							rxs[v] = layer->data.proj.v[v].sub.rect.offset.w;
+							rys[v] = layer->data.proj.v[v].sub.rect.offset.h;
+							rws[v] = layer->data.proj.v[v].sub.rect.extent.w;
+							rhs_arr[v] = layer->data.proj.v[v].sub.rect.extent.h;
+						}
+						if (u_tiling_can_zero_copy(vc, rxs, rys, rws, rhs_arr,
+						                           gsc->info.width, gsc->info.height, mode)) {
+							zero_copy = true;
+							zc_texture = gsc->textures[img_idx];
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// --- Step 1: Render layers into SBS stereo texture (skip if zero-copy) ---
+	if (!zero_copy) {
 	glBindFramebuffer(GL_FRAMEBUFFER, c->fbo);
 	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
 	                        c->atlas_texture, 0);
@@ -978,6 +1035,7 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 
 		glDisable(GL_BLEND);
 	}
+	} // end if (!zero_copy)
 
 	// Sync hardware_display_3d, tile layout, and per-view dimensions
 	// from device's active rendering mode
@@ -998,6 +1056,7 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 	}
 
 	// --- Step 2: Present SBS texture ---
+	GLuint atlas_for_present = zero_copy ? zc_texture : c->atlas_texture;
 #ifdef XRT_OS_WINDOWS
 	if (c->has_shared_texture) {
 		// Shared texture mode: blit SBS stereo texture to the DX-interop GL texture
@@ -1012,7 +1071,7 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			GLint loc_rect = glGetUniformLocation(c->program_blit, "u_src_rect");
 			glUniform4f(loc_rect, 0.0f, 0.0f, 1.0f, 1.0f);
 			glActiveTexture(GL_TEXTURE0);
-			glBindTexture(GL_TEXTURE_2D, c->atlas_texture);
+			glBindTexture(GL_TEXTURE_2D, atlas_for_present);
 			GLint loc_out_tex = glGetUniformLocation(c->program_blit, "u_texture");
 			glUniform1i(loc_out_tex, 0);
 			glDrawArrays(GL_TRIANGLES, 0, 3);
@@ -1043,7 +1102,7 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 		GLint loc_flip = glGetUniformLocation(c->program_blit, "u_flip_y");
 		glUniform1f(loc_flip, 1.0f);
 		glActiveTexture(GL_TEXTURE0);
-		glBindTexture(GL_TEXTURE_2D, c->atlas_texture);
+		glBindTexture(GL_TEXTURE_2D, atlas_for_present);
 		GLint loc_out_tex = glGetUniformLocation(c->program_blit, "u_texture");
 		glUniform1i(loc_out_tex, 0);
 		glDrawArrays(GL_TRIANGLES, 0, 3);
@@ -1084,7 +1143,7 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			glViewport(0, 0, present_w, present_h);
 			xrt_display_processor_gl_process_atlas(
 			    c->display_processor,
-			    c->atlas_texture,
+			    atlas_for_present,
 			    c->view_width,
 			    c->view_height,
 			    c->tile_columns,
@@ -1100,7 +1159,7 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			glUniform4f(loc_rect, 0.0f, 0.0f, 1.0f, 1.0f);
 
 			glActiveTexture(GL_TEXTURE0);
-			glBindTexture(GL_TEXTURE_2D, c->atlas_texture);
+			glBindTexture(GL_TEXTURE_2D, atlas_for_present);
 			GLint loc_out_tex = glGetUniformLocation(c->program_blit, "u_texture");
 			glUniform1i(loc_out_tex, 0);
 

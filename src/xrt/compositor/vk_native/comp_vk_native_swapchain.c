@@ -381,3 +381,11 @@ comp_vk_native_swapchain_get_image(struct xrt_swapchain *xsc, uint32_t index)
 	}
 	return (uint64_t)(uintptr_t)sc->images[index];
 }
+
+void
+comp_vk_native_swapchain_get_dimensions(struct xrt_swapchain *xsc, uint32_t *out_w, uint32_t *out_h)
+{
+	struct comp_vk_native_swapchain *sc = vk_sc(xsc);
+	*out_w = sc->info.width;
+	*out_h = sc->info.height;
+}

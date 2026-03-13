@@ -100,6 +100,27 @@ static const char *FS_ANAGLYPH =
     "    fragColor = vec4(left.r, right.g, right.b, 1.0);\n"
     "}\n";
 
+//! Squeezed SBS: left tile on left half, right tile on right half, no crop.
+static const char *FS_SQUEEZED_SBS =
+    "#version 330 core\n"
+    "in vec2 v_uv;\n"
+    "out vec4 fragColor;\n"
+    "uniform sampler2D u_texture;\n"
+    "uniform float u_tile_cols_inv;\n"
+    "uniform float u_tile_rows_inv;\n"
+    "uniform float u_tile_cols;\n"
+    "uniform float u_tile_rows;\n"
+    "void main() {\n"
+    "    float x = v_uv.x;\n"
+    "    float eye_index = (x < 0.5) ? 0.0 : 1.0;\n"
+    "    float eye_u = (x < 0.5) ? (x / 0.5) : ((x - 0.5) / 0.5);\n"
+    "    float col = mod(eye_index, u_tile_cols);\n"
+    "    float row = floor(eye_index / u_tile_cols);\n"
+    "    float src_u = (eye_u + col) * u_tile_cols_inv;\n"
+    "    float src_v = (v_uv.y + row) * u_tile_rows_inv;\n"
+    "    fragColor = texture(u_texture, vec2(src_u, src_v));\n"
+    "}\n";
+
 //! 50/50 blend.
 static const char *FS_BLEND =
     "#version 330 core\n"
@@ -127,7 +148,7 @@ static const char *FS_BLEND =
 struct sim_display_processor_gl
 {
 	struct xrt_display_processor_gl base;
-	GLuint programs[3]; //!< One per output mode (SBS, anaglyph, blend)
+	GLuint programs[4]; //!< One per output mode (SBS, anaglyph, blend, squeezed SBS)
 	GLuint vao_empty;   //!< Empty VAO for vertex-shader-generated fullscreen triangle
 
 	//! Nominal viewer parameters for faked eye positions.
@@ -224,7 +245,7 @@ sim_dp_gl_destroy(struct xrt_display_processor_gl *xdp)
 {
 	struct sim_display_processor_gl *sdp = sim_dp_gl(xdp);
 
-	for (int i = 0; i < 3; i++) {
+	for (int i = 0; i < 4; i++) {
 		if (sdp->programs[i] != 0) {
 			glDeleteProgram(sdp->programs[i]);
 		}
@@ -328,10 +349,10 @@ sim_display_processor_gl_create(enum sim_display_output_mode mode,
 	sdp->nominal_z_m = debug_get_float_option_sim_display_nominal_z_m_gl();
 
 	// Compile all 3 shader programs for instant runtime switching
-	const char *fs_sources[3] = {FS_SBS, FS_ANAGLYPH, FS_BLEND};
-	const char *mode_names[3] = {"SBS", "Anaglyph", "Blend"};
+	const char *fs_sources[4] = {FS_SBS, FS_ANAGLYPH, FS_BLEND, FS_SQUEEZED_SBS};
+	const char *mode_names[4] = {"SBS", "Anaglyph", "Blend", "Squeezed SBS"};
 
-	for (int i = 0; i < 3; i++) {
+	for (int i = 0; i < 4; i++) {
 		sdp->programs[i] = create_program(VS_FULLSCREEN, fs_sources[i]);
 		if (sdp->programs[i] == 0) {
 			U_LOG_E("sim_display GL: failed to create %s program", mode_names[i]);
@@ -346,9 +367,10 @@ sim_display_processor_gl_create(enum sim_display_output_mode mode,
 	// Set the initial output mode (atomic global read by process_atlas each frame)
 	sim_display_set_output_mode(mode);
 
-	U_LOG_W("Created sim display GL processor (all 3 shaders), initial mode: %s",
-	        mode == SIM_DISPLAY_OUTPUT_SBS       ? "SBS" :
-	        mode == SIM_DISPLAY_OUTPUT_ANAGLYPH   ? "Anaglyph" : "Blend");
+	U_LOG_W("Created sim display GL processor (all 4 shaders), initial mode: %s",
+	        mode == SIM_DISPLAY_OUTPUT_SBS           ? "SBS" :
+	        mode == SIM_DISPLAY_OUTPUT_ANAGLYPH       ? "Anaglyph" :
+	        mode == SIM_DISPLAY_OUTPUT_SQUEEZED_SBS   ? "Squeezed SBS" : "Blend");
 
 	*out_xdp = &sdp->base;
 	return XRT_SUCCESS;

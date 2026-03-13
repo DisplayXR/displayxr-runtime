@@ -74,6 +74,18 @@ comp_d3d11_swapchain_get_rtv(struct xrt_swapchain *xsc, uint32_t index);
 void *
 comp_d3d11_swapchain_get_texture(struct xrt_swapchain *xsc, uint32_t index);
 
+/*!
+ * Get the dimensions of a swapchain.
+ *
+ * @param xsc The swapchain.
+ * @param[out] out_w Width in pixels.
+ * @param[out] out_h Height in pixels.
+ *
+ * @ingroup comp_d3d11
+ */
+void
+comp_d3d11_swapchain_get_dimensions(struct xrt_swapchain *xsc, uint32_t *out_w, uint32_t *out_h);
+
 #ifdef __cplusplus
 }
 #endif
