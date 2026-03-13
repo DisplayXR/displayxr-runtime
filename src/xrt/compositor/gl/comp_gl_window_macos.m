@@ -129,6 +129,9 @@ create_window_on_main_thread(struct comp_gl_window_macos *win,
 		return;
 	}
 
+	// Enable Retina resolution so the GL surface matches physical pixels
+	[glView setWantsBestResolutionOpenGLSurface:YES];
+
 	// Create context sharing with app
 	NSOpenGLContext *ctx = [[NSOpenGLContext alloc] initWithFormat:pf shareContext:share_ctx];
 	if (ctx == nil) {
@@ -405,6 +408,21 @@ comp_gl_window_macos_map_iosurface(struct comp_gl_window_macos *win,
 
 	U_LOG_W("IOSurface mapped to GL texture %u: %ux%u", tex, w, h);
 	return XRT_SUCCESS;
+}
+
+float
+comp_gl_window_macos_get_backing_scale(void)
+{
+	__block float scale = 1.0f;
+	void (^get_scale)(void) = ^{
+		scale = (float)[NSScreen mainScreen].backingScaleFactor;
+	};
+	if ([NSThread isMainThread]) {
+		get_scale();
+	} else {
+		dispatch_sync(dispatch_get_main_queue(), get_scale);
+	}
+	return scale;
 }
 
 void *
