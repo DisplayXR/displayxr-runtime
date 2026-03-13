@@ -1926,3 +1926,40 @@ should be necessary.
 
 Total lines of code for a minimal integration (without eye tracking):
 approximately 300-500 lines across 4-5 files.
+
+---
+
+## Driver-Specified Tiling
+
+### Mandatory Tile Layout
+
+Every rendering mode **must** set `tile_columns` and `tile_rows` in `struct xrt_rendering_mode`. There is no fallback formula — the runtime will not compute a tile layout automatically.
+
+Example for a 2-view SBS display:
+```c
+mode.tile_columns = 2;  // Side-by-side
+mode.tile_rows = 1;
+```
+
+Example for a 2-view top-bottom display:
+```c
+mode.tile_columns = 1;
+mode.tile_rows = 2;    // Top-bottom
+```
+
+### Display Processor Contract
+
+The display processor always receives a texture that is exactly `tile_columns × view_width` pixels wide by `tile_rows × view_height` pixels tall, with views packed in row-major order starting from the top-left.
+
+### Zero-Copy Optimization
+
+If the app renders all views into a single swapchain at the correct tile positions (matching `tile_columns × tile_rows` layout and atlas dimensions), the compositor can skip the atlas copy and pass the app's swapchain directly to the display processor. This happens automatically when:
+
+1. Exactly one projection layer is submitted
+2. All views reference the same swapchain and image index
+3. Each view's `subImage.imageRect` matches the expected tile position
+4. The swapchain dimensions equal the atlas dimensions
+
+### Format Requirements
+
+For zero-copy compatibility, ensure the display processor can handle the swapchain format the app is likely to choose (typically `formats[0]` from the compositor's format list).

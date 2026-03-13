@@ -61,6 +61,18 @@ comp_vk_native_swapchain_get_image_view(struct xrt_swapchain *xsc, uint32_t inde
 uint64_t
 comp_vk_native_swapchain_get_image(struct xrt_swapchain *xsc, uint32_t index);
 
+/*!
+ * Get the dimensions of a swapchain.
+ *
+ * @param xsc The swapchain.
+ * @param[out] out_w Width in pixels.
+ * @param[out] out_h Height in pixels.
+ *
+ * @ingroup comp_vk_native
+ */
+void
+comp_vk_native_swapchain_get_dimensions(struct xrt_swapchain *xsc, uint32_t *out_w, uint32_t *out_h);
+
 #ifdef __cplusplus
 }
 #endif

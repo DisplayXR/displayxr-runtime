@@ -38,6 +38,30 @@ comp_d3d12_swapchain_create(struct comp_d3d12_compositor *c,
                             const struct xrt_swapchain_create_info *info,
                             struct xrt_swapchain **out_xsc);
 
+/*!
+ * Get the dimensions of a swapchain.
+ *
+ * @param xsc The swapchain.
+ * @param[out] out_w Width in pixels.
+ * @param[out] out_h Height in pixels.
+ *
+ * @ingroup comp_d3d12
+ */
+void
+comp_d3d12_swapchain_get_dimensions(struct xrt_swapchain *xsc, uint32_t *out_w, uint32_t *out_h);
+
+/*!
+ * Get the D3D12 resource for a swapchain image.
+ *
+ * @param xsc The swapchain.
+ * @param index Image index.
+ * @return The resource as void pointer, or NULL if not available.
+ *
+ * @ingroup comp_d3d12
+ */
+void *
+comp_d3d12_swapchain_get_resource(struct xrt_swapchain *xsc, uint32_t index);
+
 #ifdef __cplusplus
 }
 #endif

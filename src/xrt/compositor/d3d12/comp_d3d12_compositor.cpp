@@ -30,6 +30,7 @@
 #include "xrt/xrt_display_processor_d3d12.h"
 
 #include "math/m_api.h"
+#include "util/u_tiling.h"
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
 #include "qwerty_interface.h"
@@ -575,16 +576,75 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		comp_d3d12_target_get_dimensions(c->target, &tgt_width, &tgt_height);
 	}
 
+	// Zero-copy check: can we pass the app's swapchain directly to the DP?
+	bool zero_copy = false;
+	void *zc_resource = nullptr;
+	{
+		const struct xrt_rendering_mode *mode = NULL;
+		if (c->xdev != NULL && c->xdev->hmd != NULL) {
+			uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
+			if (idx < c->xdev->rendering_mode_count)
+				mode = &c->xdev->rendering_modes[idx];
+		}
+		if (mode != NULL && c->layer_accum.layer_count == 1) {
+			struct comp_layer *layer = &c->layer_accum.layers[0];
+			if (layer->data.type == XRT_LAYER_PROJECTION ||
+			    layer->data.type == XRT_LAYER_PROJECTION_DEPTH) {
+				uint32_t vc = mode->view_count;
+				bool same_sc = (vc > 0 && vc <= XRT_MAX_VIEWS && layer->sc_array[0] != NULL);
+				for (uint32_t v = 1; v < vc && same_sc; v++) {
+					if (layer->sc_array[v] != layer->sc_array[0])
+						same_sc = false;
+				}
+				if (same_sc) {
+					uint32_t img_idx = layer->data.proj.v[0].sub.image_index;
+					bool same_idx = true;
+					for (uint32_t v = 1; v < vc; v++) {
+						if (layer->data.proj.v[v].sub.image_index != img_idx) {
+							same_idx = false;
+							break;
+						}
+					}
+					bool all_array_zero = same_idx;
+					for (uint32_t v = 0; v < vc && all_array_zero; v++) {
+						if (layer->data.proj.v[v].sub.array_index != 0)
+							all_array_zero = false;
+					}
+					if (all_array_zero) {
+						uint32_t sw, sh;
+						comp_d3d12_swapchain_get_dimensions(layer->sc_array[0], &sw, &sh);
+						int32_t rxs[XRT_MAX_VIEWS], rys[XRT_MAX_VIEWS];
+						uint32_t rws[XRT_MAX_VIEWS], rhs_arr[XRT_MAX_VIEWS];
+						for (uint32_t v = 0; v < vc; v++) {
+							rxs[v] = layer->data.proj.v[v].sub.rect.offset.w;
+							rys[v] = layer->data.proj.v[v].sub.rect.offset.h;
+							rws[v] = layer->data.proj.v[v].sub.rect.extent.w;
+							rhs_arr[v] = layer->data.proj.v[v].sub.rect.extent.h;
+						}
+						if (u_tiling_can_zero_copy(vc, rxs, rys, rws, rhs_arr, sw, sh, mode)) {
+							zc_resource = comp_d3d12_swapchain_get_resource(layer->sc_array[0], img_idx);
+							if (zc_resource != nullptr)
+								zero_copy = true;
+						}
+					}
+				}
+			}
+		}
+	}
+
 	// Reset command allocator and command list
 	c->cmd_allocator->Reset();
 	c->cmd_list->Reset(c->cmd_allocator, nullptr);
 
-	// Render layers to SBS stereo texture
-	xrt_result_t xret = comp_d3d12_renderer_draw(
-	    c->renderer, c->cmd_list, &c->layer_accum, &left_eye, &right_eye, tgt_width, tgt_height, c->hardware_display_3d);
-	if (xret != XRT_SUCCESS) {
-		U_LOG_E("Failed to render layers");
-		return xret;
+	// Render layers to SBS stereo texture (skip if zero-copy)
+	xrt_result_t xret = XRT_SUCCESS;
+	if (!zero_copy) {
+		xret = comp_d3d12_renderer_draw(
+		    c->renderer, c->cmd_list, &c->layer_accum, &left_eye, &right_eye, tgt_width, tgt_height, c->hardware_display_3d);
+		if (xret != XRT_SUCCESS) {
+			U_LOG_E("Failed to render layers");
+			return xret;
+		}
 	}
 
 	// Shared texture mode: copy stereo output to shared texture and skip window present
@@ -678,8 +738,9 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 
 		uint32_t view_width, view_height;
 		comp_d3d12_renderer_get_view_dimensions(c->renderer, &view_width, &view_height);
-		ID3D12Resource *atlas_resource = static_cast<ID3D12Resource *>(
-		    comp_d3d12_renderer_get_atlas_resource(c->renderer));
+		ID3D12Resource *atlas_resource = zero_copy
+		    ? static_cast<ID3D12Resource *>(zc_resource)
+		    : static_cast<ID3D12Resource *>(comp_d3d12_renderer_get_atlas_resource(c->renderer));
 
 		if (diag_log) {
 			U_LOG_W("D3D12 dp path: stereo=%p, view=%ux%u, target=%ux%u, bb=%u, "

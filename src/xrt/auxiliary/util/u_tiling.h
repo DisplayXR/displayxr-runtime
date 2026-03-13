@@ -6,61 +6,26 @@
  * @author David Fattal
  * @ingroup aux_util
  *
- * Given N views at per-view scale (fraction of display), computes
- * a near-square tile layout and atlas dimensions for swapchain creation.
+ * Drivers specify tile_columns and tile_rows in each rendering mode.
+ * This file computes derived pixel dimensions and provides helpers
+ * for atlas layout and zero-copy eligibility checking.
  */
 
 #pragma once
 
 #include "xrt/xrt_device.h"
-
-#include <math.h>
+#include <assert.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 /*!
- * Compute near-square tile layout for N views of size V_w x V_h.
- *
- * @param view_count     Number of views (N).
- * @param view_w         Per-view width in pixels.
- * @param view_h         Per-view height in pixels.
- * @param[out] out_cols  Tile columns (C).
- * @param[out] out_rows  Tile rows (R).
- */
-static inline void
-u_tiling_compute_layout(uint32_t view_count,
-                        uint32_t view_w,
-                        uint32_t view_h,
-                        uint32_t *out_cols,
-                        uint32_t *out_rows)
-{
-	if (view_count <= 1 || view_w == 0 || view_h == 0) {
-		*out_cols = 1;
-		*out_rows = 1;
-		return;
-	}
-
-	// C = round(sqrt(N * V_h / V_w)) — nearest-square optimization
-	double ratio = (double)view_count * (double)view_h / (double)view_w;
-	uint32_t cols = (uint32_t)(sqrt(ratio) + 0.5);
-	if (cols < 1)
-		cols = 1;
-	if (cols > view_count)
-		cols = view_count;
-
-	uint32_t rows = (view_count + cols - 1) / cols; // ceil(N / C)
-
-	*out_cols = cols;
-	*out_rows = rows;
-}
-
-/*!
  * Compute tiling fields for a single rendering mode.
  *
- * Fills the runtime-computed fields: tile_columns, tile_rows,
- * view_width_pixels, view_height_pixels, atlas_width_pixels, atlas_height_pixels.
+ * Fills the runtime-computed fields: view_width_pixels, view_height_pixels,
+ * atlas_width_pixels, atlas_height_pixels. The driver must have already set
+ * tile_columns and tile_rows.
  *
  * @param mode       The rendering mode to fill (in/out).
  * @param display_w  Native display width in pixels.
@@ -71,6 +36,9 @@ u_tiling_compute_mode(struct xrt_rendering_mode *mode,
                       uint32_t display_w,
                       uint32_t display_h)
 {
+	assert(mode->tile_columns > 0 && "Driver must set tile_columns");
+	assert(mode->tile_rows > 0 && "Driver must set tile_rows");
+
 	uint32_t vw = (uint32_t)(display_w * mode->view_scale_x);
 	uint32_t vh = (uint32_t)(display_h * mode->view_scale_y);
 	if (vw == 0)
@@ -80,14 +48,9 @@ u_tiling_compute_mode(struct xrt_rendering_mode *mode,
 
 	mode->view_width_pixels = vw;
 	mode->view_height_pixels = vh;
-
-	uint32_t cols, rows;
-	u_tiling_compute_layout(mode->view_count, vw, vh, &cols, &rows);
-
-	mode->tile_columns = cols;
-	mode->tile_rows = rows;
-	mode->atlas_width_pixels = cols * vw;
-	mode->atlas_height_pixels = rows * vh;
+	// tile_columns and tile_rows are already set by the driver
+	mode->atlas_width_pixels = mode->tile_columns * vw;
+	mode->atlas_height_pixels = mode->tile_rows * vh;
 }
 
 /*!
@@ -135,6 +98,83 @@ u_tiling_view_origin(uint32_t view_index,
 {
 	*out_x = (view_index % cols) * view_w;
 	*out_y = (view_index / cols) * view_h;
+}
+
+/*!
+ * Check whether a view's subImage rect matches the expected tile position
+ * for zero-copy passthrough.
+ *
+ * @param view_index       Index of the view (0..N-1).
+ * @param rect_x           subImage.imageRect.offset.x
+ * @param rect_y           subImage.imageRect.offset.y
+ * @param rect_w           subImage.imageRect.extent.width
+ * @param rect_h           subImage.imageRect.extent.height
+ * @param mode             Active rendering mode.
+ * @return true if the rect matches the expected tile position and size.
+ */
+static inline bool
+u_tiling_view_matches_tile(uint32_t view_index,
+                           int32_t rect_x,
+                           int32_t rect_y,
+                           uint32_t rect_w,
+                           uint32_t rect_h,
+                           const struct xrt_rendering_mode *mode)
+{
+	uint32_t expected_x, expected_y;
+	u_tiling_view_origin(view_index, mode->tile_columns,
+	                     mode->view_width_pixels, mode->view_height_pixels,
+	                     &expected_x, &expected_y);
+
+	return (uint32_t)rect_x == expected_x &&
+	       (uint32_t)rect_y == expected_y &&
+	       rect_w == mode->view_width_pixels &&
+	       rect_h == mode->view_height_pixels;
+}
+
+/*!
+ * Check whether a swapchain can be passed directly to the display processor
+ * without atlas copy (zero-copy passthrough).
+ *
+ * Checks that all views' subImage rects match expected tile positions and
+ * that the swapchain dimensions match the atlas dimensions.
+ *
+ * @param view_count       Number of views.
+ * @param rect_xs          Array of subImage.imageRect.offset.x per view.
+ * @param rect_ys          Array of subImage.imageRect.offset.y per view.
+ * @param rect_ws          Array of subImage.imageRect.extent.width per view.
+ * @param rect_hs          Array of subImage.imageRect.extent.height per view.
+ * @param swapchain_w      Swapchain width.
+ * @param swapchain_h      Swapchain height.
+ * @param mode             Active rendering mode.
+ * @return true if zero-copy is possible.
+ */
+static inline bool
+u_tiling_can_zero_copy(uint32_t view_count,
+                       const int32_t *rect_xs,
+                       const int32_t *rect_ys,
+                       const uint32_t *rect_ws,
+                       const uint32_t *rect_hs,
+                       uint32_t swapchain_w,
+                       uint32_t swapchain_h,
+                       const struct xrt_rendering_mode *mode)
+{
+	// View count must match mode
+	if (view_count != mode->view_count)
+		return false;
+
+	// Swapchain must match atlas dimensions exactly
+	if (swapchain_w != mode->atlas_width_pixels ||
+	    swapchain_h != mode->atlas_height_pixels)
+		return false;
+
+	// Each view's rect must match its expected tile position
+	for (uint32_t i = 0; i < view_count; i++) {
+		if (!u_tiling_view_matches_tile(i, rect_xs[i], rect_ys[i],
+		                                rect_ws[i], rect_hs[i], mode))
+			return false;
+	}
+
+	return true;
 }
 
 #ifdef __cplusplus

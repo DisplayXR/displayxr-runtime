@@ -84,6 +84,29 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
 }
 )";
 
+// Squeezed SBS pixel shader: left tile on left half, right tile on right half, no crop
+static const char *ps_squeezed_sbs_source = R"(
+Texture2D atlas_tex : register(t0);
+SamplerState samp : register(s0);
+
+cbuffer TileParams : register(b0) {
+	float tile_cols_inv;
+	float tile_rows_inv;
+	float tile_cols;
+	float tile_rows;
+};
+
+float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
+	float eye_index = (uv.x < 0.5) ? 0.0 : 1.0;
+	float eye_u = (uv.x < 0.5) ? (uv.x / 0.5) : ((uv.x - 0.5) / 0.5);
+	uint col = (uint)eye_index % (uint)tile_cols;
+	uint row = (uint)eye_index / (uint)tile_cols;
+	float src_u = (eye_u + col) * tile_cols_inv;
+	float src_v = (uv.y + row) * tile_rows_inv;
+	return atlas_tex.Sample(samp, float2(src_u, src_v));
+}
+)";
+
 // Blend pixel shader: tiled atlas texture, 50/50 mix
 static const char *ps_blend_source = R"(
 Texture2D atlas_tex : register(t0);
@@ -115,7 +138,7 @@ struct sim_display_processor_d3d12_impl
 {
 	struct xrt_display_processor_d3d12 base;
 	ID3D12RootSignature *root_signature;
-	ID3D12PipelineState *psos[3]; //!< One per output mode (SBS, anaglyph, blend)
+	ID3D12PipelineState *psos[4]; //!< One per output mode (SBS, anaglyph, blend, squeezed SBS)
 
 	//! Nominal viewer parameters for faked eye positions.
 	float ipd_m;
@@ -248,7 +271,7 @@ sim_dp_d3d12_destroy(struct xrt_display_processor_d3d12 *xdp)
 	if (sdp->root_signature != nullptr) {
 		sdp->root_signature->Release();
 	}
-	for (int i = 0; i < 3; i++) {
+	for (int i = 0; i < 4; i++) {
 		if (sdp->psos[i] != nullptr) {
 			sdp->psos[i]->Release();
 		}
@@ -410,11 +433,11 @@ sim_display_processor_d3d12_create(enum sim_display_output_mode mode,
 		return XRT_ERROR_D3D;
 	}
 
-	// Compile all 3 pixel shaders and create PSOs
-	const char *ps_sources[3] = {ps_sbs_source, ps_anaglyph_source, ps_blend_source};
-	const char *ps_names[3] = {"SBS", "Anaglyph", "Blend"};
+	// Compile all 4 pixel shaders and create PSOs
+	const char *ps_sources[4] = {ps_sbs_source, ps_anaglyph_source, ps_blend_source, ps_squeezed_sbs_source};
+	const char *ps_names[4] = {"SBS", "Anaglyph", "Blend", "Squeezed SBS"};
 
-	for (int i = 0; i < 3; i++) {
+	for (int i = 0; i < 4; i++) {
 		ID3DBlob *ps_blob = nullptr;
 		hr = compile_shader(ps_sources[i], "main", "ps_5_0", &ps_blob);
 		if (FAILED(hr)) {
@@ -462,9 +485,10 @@ sim_display_processor_d3d12_create(enum sim_display_output_mode mode,
 	// Set the initial output mode
 	sim_display_set_output_mode(mode);
 
-	U_LOG_W("Created sim display D3D12 processor (all 3 PSOs), initial mode: %s",
-	        mode == SIM_DISPLAY_OUTPUT_SBS       ? "SBS" :
-	        mode == SIM_DISPLAY_OUTPUT_ANAGLYPH   ? "Anaglyph" : "Blend");
+	U_LOG_W("Created sim display D3D12 processor (all 4 PSOs), initial mode: %s",
+	        mode == SIM_DISPLAY_OUTPUT_SBS           ? "SBS" :
+	        mode == SIM_DISPLAY_OUTPUT_ANAGLYPH       ? "Anaglyph" :
+	        mode == SIM_DISPLAY_OUTPUT_SQUEEZED_SBS   ? "Squeezed SBS" : "Blend");
 
 	*out_xdp = &sdp->base;
 	return XRT_SUCCESS;

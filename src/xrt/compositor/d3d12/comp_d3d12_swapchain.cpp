@@ -342,3 +342,21 @@ comp_d3d12_swapchain_create(struct comp_d3d12_compositor *c,
 
 	return XRT_SUCCESS;
 }
+
+extern "C" void
+comp_d3d12_swapchain_get_dimensions(struct xrt_swapchain *xsc, uint32_t *out_w, uint32_t *out_h)
+{
+	struct comp_d3d12_swapchain *sc = d3d12_sc(xsc);
+	*out_w = sc->info.width;
+	*out_h = sc->info.height;
+}
+
+extern "C" void *
+comp_d3d12_swapchain_get_resource(struct xrt_swapchain *xsc, uint32_t index)
+{
+	struct comp_d3d12_swapchain *sc = d3d12_sc(xsc);
+	if (index >= sc->image_count) {
+		return nullptr;
+	}
+	return sc->images[index];
+}

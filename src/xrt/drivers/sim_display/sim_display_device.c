@@ -92,8 +92,9 @@ sim_display_set_output_mode(enum sim_display_output_mode mode)
 	enum sim_display_output_mode old = (enum sim_display_output_mode)xrt_atomic_s32_exchange(&g_sim_display_output_mode, (int)mode);
 	if (old != mode) {
 		U_LOG_W("Sim display mode changed: %s",
-		        mode == SIM_DISPLAY_OUTPUT_SBS ? "SBS" :
-		        mode == SIM_DISPLAY_OUTPUT_ANAGLYPH ? "Anaglyph" : "Blend");
+		        mode == SIM_DISPLAY_OUTPUT_SBS           ? "SBS" :
+		        mode == SIM_DISPLAY_OUTPUT_ANAGLYPH       ? "Anaglyph" :
+		        mode == SIM_DISPLAY_OUTPUT_SQUEEZED_SBS   ? "Squeezed SBS" : "Blend");
 	}
 }
 
@@ -368,7 +369,7 @@ sim_display_hmd_set_property(struct xrt_device *xdev,
 			internal_mode = SIM_DISPLAY_OUTPUT_SBS;
 			break;
 		case 3:
-			internal_mode = SIM_DISPLAY_OUTPUT_BLEND;
+			internal_mode = SIM_DISPLAY_OUTPUT_SQUEEZED_SBS;
 			break;
 		default:
 			return XRT_ERROR_NOT_IMPLEMENTED;
@@ -522,50 +523,58 @@ sim_display_hmd_create(void)
 	snprintf(hmd->base.serial, XRT_DEVICE_NAME_LEN, "sim_display_0");
 
 	// Rendering modes: sim_display supports 4 modes (2D + 3 stereo).
-	// Order: 0=2D, 1=Anaglyph (default 3D), 2=SBS, 3=Blend
+	// Order: 0=2D, 1=Anaglyph (default 3D), 2=Cropped SBS, 3=Squeezed SBS
 	hmd->base.rendering_mode_count = 4;
 
-	// Mode 0: 2D (mono, full resolution)
+	// Mode 0: 2D (mono, full resolution, 1×1 tile)
 	hmd->base.rendering_modes[0].mode_index = 0;
 	snprintf(hmd->base.rendering_modes[0].mode_name, XRT_DEVICE_NAME_LEN, "2D");
 	hmd->base.rendering_modes[0].view_count = 1;
 	hmd->base.rendering_modes[0].view_scale_x = 1.0f;
 	hmd->base.rendering_modes[0].view_scale_y = 1.0f;
 	hmd->base.rendering_modes[0].hardware_display_3d = false;
+	hmd->base.rendering_modes[0].tile_columns = 1;
+	hmd->base.rendering_modes[0].tile_rows = 1;
 
-	// Mode 1: Anaglyph (stereo, default 3D)
+	// Mode 1: Anaglyph (stereo, default 3D, 2×1 tiles = side-by-side half-res)
 	hmd->base.rendering_modes[1].mode_index = 1;
 	snprintf(hmd->base.rendering_modes[1].mode_name, XRT_DEVICE_NAME_LEN, "Anaglyph");
 	hmd->base.rendering_modes[1].view_count = 2;
 	hmd->base.rendering_modes[1].view_scale_x = 0.5f;
 	hmd->base.rendering_modes[1].view_scale_y = 0.5f;
 	hmd->base.rendering_modes[1].hardware_display_3d = true;
+	hmd->base.rendering_modes[1].tile_columns = 2;
+	hmd->base.rendering_modes[1].tile_rows = 1;
 
-	// Mode 2: SBS (stereo)
+	// Mode 2: Cropped SBS (stereo, 1×2 tiles = top-bottom half-res)
 	hmd->base.rendering_modes[2].mode_index = 2;
-	snprintf(hmd->base.rendering_modes[2].mode_name, XRT_DEVICE_NAME_LEN, "SBS");
+	snprintf(hmd->base.rendering_modes[2].mode_name, XRT_DEVICE_NAME_LEN, "Cropped SBS");
 	hmd->base.rendering_modes[2].view_count = 2;
 	hmd->base.rendering_modes[2].view_scale_x = 0.5f;
 	hmd->base.rendering_modes[2].view_scale_y = 0.5f;
 	hmd->base.rendering_modes[2].hardware_display_3d = true;
+	hmd->base.rendering_modes[2].tile_columns = 1;
+	hmd->base.rendering_modes[2].tile_rows = 2;
 
-	// Mode 3: Blend (stereo)
+	// Mode 3: Squeezed SBS (stereo, 2×1 tiles = side-by-side full-height)
 	hmd->base.rendering_modes[3].mode_index = 3;
-	snprintf(hmd->base.rendering_modes[3].mode_name, XRT_DEVICE_NAME_LEN, "Blend");
+	snprintf(hmd->base.rendering_modes[3].mode_name, XRT_DEVICE_NAME_LEN, "Squeezed SBS");
 	hmd->base.rendering_modes[3].view_count = 2;
 	hmd->base.rendering_modes[3].view_scale_x = 0.5f;
-	hmd->base.rendering_modes[3].view_scale_y = 0.5f;
+	hmd->base.rendering_modes[3].view_scale_y = 1.0f;
 	hmd->base.rendering_modes[3].hardware_display_3d = true;
+	hmd->base.rendering_modes[3].tile_columns = 2;
+	hmd->base.rendering_modes[3].tile_rows = 1;
 
 	// Set default active mode from env var
 	{
 		enum sim_display_output_mode sd_mode = sim_display_get_output_mode();
-		// Map internal mode to unified index: SBS→2, Anaglyph→1, Blend→3
+		// Map internal mode to unified index: SBS→2, Anaglyph→1, SqueezedSBS→3
 		switch (sd_mode) {
-		case SIM_DISPLAY_OUTPUT_SBS:      hmd->base.hmd->active_rendering_mode_index = 2; break;
-		case SIM_DISPLAY_OUTPUT_ANAGLYPH: hmd->base.hmd->active_rendering_mode_index = 1; break;
-		case SIM_DISPLAY_OUTPUT_BLEND:    hmd->base.hmd->active_rendering_mode_index = 3; break;
-		default:                          hmd->base.hmd->active_rendering_mode_index = 1; break;
+		case SIM_DISPLAY_OUTPUT_SBS:          hmd->base.hmd->active_rendering_mode_index = 2; break;
+		case SIM_DISPLAY_OUTPUT_ANAGLYPH:     hmd->base.hmd->active_rendering_mode_index = 1; break;
+		case SIM_DISPLAY_OUTPUT_SQUEEZED_SBS: hmd->base.hmd->active_rendering_mode_index = 3; break;
+		default:                              hmd->base.hmd->active_rendering_mode_index = 1; break;
 		}
 	}
 

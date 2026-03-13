@@ -46,9 +46,10 @@ struct vk_bundle;
  */
 enum sim_display_output_mode
 {
-	SIM_DISPLAY_OUTPUT_SBS = 0,      //!< Side-by-side stereo
-	SIM_DISPLAY_OUTPUT_ANAGLYPH = 1, //!< Red-cyan anaglyph
-	SIM_DISPLAY_OUTPUT_BLEND = 2,    //!< 50/50 alpha blend
+	SIM_DISPLAY_OUTPUT_SBS = 0,          //!< Side-by-side stereo (center crop)
+	SIM_DISPLAY_OUTPUT_ANAGLYPH = 1,     //!< Red-cyan anaglyph
+	SIM_DISPLAY_OUTPUT_BLEND = 2,        //!< 50/50 alpha blend
+	SIM_DISPLAY_OUTPUT_SQUEEZED_SBS = 3, //!< Squeezed SBS (no crop, tiles placed as-is)
 };
 
 /*!

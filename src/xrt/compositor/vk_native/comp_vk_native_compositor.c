@@ -1031,18 +1031,14 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			const struct xrt_rendering_mode *mode = &c->xdev->rendering_modes[idx];
 			c->hardware_display_3d = mode->hardware_display_3d;
 			if (mode->tile_columns > 0 && c->renderer != NULL) {
-				uint32_t old_tc, old_tr;
-				comp_vk_native_renderer_get_tile_layout(
-				    c->renderer, &old_tc, &old_tr);
-				if (old_tc != mode->tile_columns || old_tr != mode->tile_rows) {
-					// Tile layout changed — resize atlas to match
-					uint32_t vw, vh;
-					comp_vk_native_renderer_get_view_dimensions(
-					    c->renderer, &vw, &vh);
+				// Always sync view dimensions and tile layout from active mode
+				uint32_t new_vw = mode->view_width_pixels;
+				uint32_t new_vh = mode->view_height_pixels;
+				uint32_t new_aw = mode->atlas_width_pixels;
+				uint32_t new_ah = mode->atlas_height_pixels;
+				if (new_vw > 0 && new_vh > 0) {
 					comp_vk_native_renderer_resize(
-					    c->renderer, vw, vh,
-					    mode->tile_columns * vw,
-					    mode->tile_rows * vh);
+					    c->renderer, new_vw, new_vh, new_aw, new_ah);
 					comp_vk_native_renderer_set_tile_layout(
 					    c->renderer, mode->tile_columns, mode->tile_rows);
 				}
@@ -1081,12 +1077,77 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 		comp_vk_native_target_get_dimensions(c->target, &tgt_width, &tgt_height);
 	}
 
-	// Render projection layers to stereo texture (per-eye images)
-	xrt_result_t xret = comp_vk_native_renderer_draw(
-	    c->renderer, &c->layer_accum, &left_eye, &right_eye, tgt_width, tgt_height, c->hardware_display_3d);
-	if (xret != XRT_SUCCESS) {
-		U_LOG_E("Failed to render layers");
-		return xret;
+	// Zero-copy check: can we pass the app's swapchain directly to the DP?
+	bool zero_copy = false;
+	uint64_t zc_image_u64 = 0;
+	uint64_t zc_view_u64 = 0;
+	int32_t zc_format = 0;
+
+	{
+		const struct xrt_rendering_mode *mode = NULL;
+		if (c->xdev != NULL && c->xdev->hmd != NULL) {
+			uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
+			if (idx < c->xdev->rendering_mode_count)
+				mode = &c->xdev->rendering_modes[idx];
+		}
+		if (mode != NULL && c->layer_accum.layer_count == 1) {
+			struct comp_layer *layer = &c->layer_accum.layers[0];
+			if (layer->data.type == XRT_LAYER_PROJECTION ||
+			    layer->data.type == XRT_LAYER_PROJECTION_DEPTH) {
+				uint32_t vc = mode->view_count;
+				bool same_sc = (vc > 0 && vc <= XRT_MAX_VIEWS && layer->sc_array[0] != NULL);
+				for (uint32_t v = 1; v < vc && same_sc; v++) {
+					if (layer->sc_array[v] != layer->sc_array[0])
+						same_sc = false;
+				}
+				if (same_sc) {
+					uint32_t img_idx = layer->data.proj.v[0].sub.image_index;
+					bool same_idx = true;
+					for (uint32_t v = 1; v < vc; v++) {
+						if (layer->data.proj.v[v].sub.image_index != img_idx) {
+							same_idx = false;
+							break;
+						}
+					}
+					bool all_array_zero = same_idx;
+					for (uint32_t v = 0; v < vc && all_array_zero; v++) {
+						if (layer->data.proj.v[v].sub.array_index != 0)
+							all_array_zero = false;
+					}
+					if (all_array_zero) {
+						uint32_t sw, sh;
+						comp_vk_native_swapchain_get_dimensions(layer->sc_array[0], &sw, &sh);
+						int32_t rxs[XRT_MAX_VIEWS], rys[XRT_MAX_VIEWS];
+						uint32_t rws[XRT_MAX_VIEWS], rhs_arr[XRT_MAX_VIEWS];
+						for (uint32_t v = 0; v < vc; v++) {
+							rxs[v] = layer->data.proj.v[v].sub.rect.offset.w;
+							rys[v] = layer->data.proj.v[v].sub.rect.offset.h;
+							rws[v] = layer->data.proj.v[v].sub.rect.extent.w;
+							rhs_arr[v] = layer->data.proj.v[v].sub.rect.extent.h;
+						}
+						if (u_tiling_can_zero_copy(vc, rxs, rys, rws, rhs_arr, sw, sh, mode)) {
+							zc_image_u64 = comp_vk_native_swapchain_get_image(layer->sc_array[0], img_idx);
+							zc_view_u64 = comp_vk_native_swapchain_get_image_view(layer->sc_array[0], img_idx);
+							if (zc_image_u64 != 0 && zc_view_u64 != 0) {
+								zero_copy = true;
+								zc_format = comp_vk_native_renderer_get_format(c->renderer);
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Render projection layers to stereo texture (skip if zero-copy)
+	xrt_result_t xret = XRT_SUCCESS;
+	if (!zero_copy) {
+		xret = comp_vk_native_renderer_draw(
+		    c->renderer, &c->layer_accum, &left_eye, &right_eye, tgt_width, tgt_height, c->hardware_display_3d);
+		if (xret != XRT_SUCCESS) {
+			U_LOG_E("Failed to render layers");
+			return xret;
+		}
 	}
 
 	// Shared texture output path — render to IOSurface-backed VkImage
@@ -1118,16 +1179,22 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 
 		// Display processor weaving path
 		if (c->hardware_display_3d && c->display_processor != NULL) {
-			uint64_t atlas_view_u64 = comp_vk_native_renderer_get_atlas_view(c->renderer);
-			uint64_t atlas_image_u64 = comp_vk_native_renderer_get_atlas_image(c->renderer);
+			uint64_t src_image_u64, src_view_u64;
+			int32_t view_format;
+			uint32_t view_width, view_height, tc, tr;
 
-			uint32_t view_width, view_height;
+			if (zero_copy) {
+				src_image_u64 = zc_image_u64;
+				src_view_u64 = zc_view_u64;
+				view_format = zc_format;
+			} else {
+				src_image_u64 = comp_vk_native_renderer_get_atlas_image(c->renderer);
+				src_view_u64 = comp_vk_native_renderer_get_atlas_view(c->renderer);
+				view_format = comp_vk_native_renderer_get_format(c->renderer);
+			}
+
 			comp_vk_native_renderer_get_view_dimensions(c->renderer, &view_width, &view_height);
-
-			uint32_t tc, tr;
 			comp_vk_native_renderer_get_tile_layout(c->renderer, &tc, &tr);
-
-			int32_t view_format = comp_vk_native_renderer_get_format(c->renderer);
 
 			VkRenderPass dp_render_pass = xrt_display_processor_get_render_pass(c->display_processor);
 			VkFramebuffer shared_fb = VK_NULL_HANDLE;
@@ -1147,8 +1214,8 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			xrt_display_processor_process_atlas(
 			    c->display_processor,
 			    cmd,
-			    (VkImage_XDP)(uintptr_t)atlas_image_u64,
-			    (VkImageView)(uintptr_t)atlas_view_u64,
+			    (VkImage_XDP)(uintptr_t)src_image_u64,
+			    (VkImageView)(uintptr_t)src_view_u64,
 			    view_width, view_height,
 			    tc, tr,
 			    (VkFormat_XDP)view_format,
@@ -1243,13 +1310,22 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 					dp_logged = true;
 				}
 
-				uint32_t view_width, view_height;
+				uint64_t src_image_u64, src_view_u64;
+				int32_t view_format;
+				uint32_t view_width, view_height, tc, tr;
+
+				if (zero_copy) {
+					src_image_u64 = zc_image_u64;
+					src_view_u64 = zc_view_u64;
+					view_format = zc_format;
+				} else {
+					src_image_u64 = comp_vk_native_renderer_get_atlas_image(c->renderer);
+					src_view_u64 = comp_vk_native_renderer_get_atlas_view(c->renderer);
+					view_format = comp_vk_native_renderer_get_format(c->renderer);
+				}
+
 				comp_vk_native_renderer_get_view_dimensions(c->renderer, &view_width, &view_height);
-
-				uint32_t tc, tr;
 				comp_vk_native_renderer_get_tile_layout(c->renderer, &tc, &tr);
-
-				int32_t view_format = comp_vk_native_renderer_get_format(c->renderer);
 
 				// Create temporary framebuffer from the target's swapchain image.
 				// Must use the DP's render pass for compatibility with vkCmdBeginRenderPass.
@@ -1280,14 +1356,12 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 				    0, 0, NULL, 0, NULL, 1, &pre_weave);
 
-				// Call display processor with atlas texture
-				uint64_t atlas_view_u64 = comp_vk_native_renderer_get_atlas_view(c->renderer);
-				uint64_t atlas_image_u64 = comp_vk_native_renderer_get_atlas_image(c->renderer);
+				// Call display processor with atlas (or zero-copy swapchain) texture
 				xrt_display_processor_process_atlas(
 				    c->display_processor,
 				    cmd,
-				    (VkImage_XDP)(uintptr_t)atlas_image_u64,
-				    (VkImageView)(uintptr_t)atlas_view_u64,
+				    (VkImage_XDP)(uintptr_t)src_image_u64,
+				    (VkImageView)(uintptr_t)src_view_u64,
 				    view_width, view_height,
 				    tc, tr,
 				    (VkFormat_XDP)view_format,
