@@ -538,7 +538,7 @@ sim_display_hmd_create(void)
 	snprintf(hmd->base.rendering_modes[1].mode_name, XRT_DEVICE_NAME_LEN, "Anaglyph");
 	hmd->base.rendering_modes[1].view_count = 2;
 	hmd->base.rendering_modes[1].view_scale_x = 0.5f;
-	hmd->base.rendering_modes[1].view_scale_y = 0.5f;
+	hmd->base.rendering_modes[1].view_scale_y = 1.0f;
 	hmd->base.rendering_modes[1].hardware_display_3d = true;
 
 	// Mode 2: SBS (stereo)
@@ -546,7 +546,7 @@ sim_display_hmd_create(void)
 	snprintf(hmd->base.rendering_modes[2].mode_name, XRT_DEVICE_NAME_LEN, "SBS");
 	hmd->base.rendering_modes[2].view_count = 2;
 	hmd->base.rendering_modes[2].view_scale_x = 0.5f;
-	hmd->base.rendering_modes[2].view_scale_y = 0.5f;
+	hmd->base.rendering_modes[2].view_scale_y = 1.0f;
 	hmd->base.rendering_modes[2].hardware_display_3d = true;
 
 	// Mode 3: Blend (stereo)
@@ -554,7 +554,7 @@ sim_display_hmd_create(void)
 	snprintf(hmd->base.rendering_modes[3].mode_name, XRT_DEVICE_NAME_LEN, "Blend");
 	hmd->base.rendering_modes[3].view_count = 2;
 	hmd->base.rendering_modes[3].view_scale_x = 0.5f;
-	hmd->base.rendering_modes[3].view_scale_y = 0.5f;
+	hmd->base.rendering_modes[3].view_scale_y = 1.0f;
 	hmd->base.rendering_modes[3].hardware_display_3d = true;
 
 	// Set default active mode from env var
