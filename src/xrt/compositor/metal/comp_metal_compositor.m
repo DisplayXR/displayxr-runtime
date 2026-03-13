@@ -1237,8 +1237,8 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 				c->tile_rows = mode->tile_rows;
 			}
 			if (mode->view_width_pixels > 0) {
-				c->view_width = (uint32_t)(mode->view_width_pixels * c->backing_scale);
-				c->view_height = (uint32_t)(mode->view_height_pixels * c->backing_scale);
+				c->view_width = mode->view_width_pixels;
+				c->view_height = mode->view_height_pixels;
 			}
 		}
 	}
@@ -1711,8 +1711,8 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 				c->tile_rows = mode->tile_rows;
 			}
 			if (mode->view_width_pixels > 0) {
-				init_view_w = (uint32_t)(mode->view_width_pixels * backing_scale);
-				init_view_h = (uint32_t)(mode->view_height_pixels * backing_scale);
+				init_view_w = mode->view_width_pixels;
+				init_view_h = mode->view_height_pixels;
 			}
 		}
 	}
