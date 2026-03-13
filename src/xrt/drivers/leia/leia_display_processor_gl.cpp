@@ -23,10 +23,9 @@
 #include "xrt/xrt_display_metrics.h"
 #include "util/u_logging.h"
 
-// GL types and functions — Leia GL DP is Windows-only
+// GL types and functions — use glad via ogl_api.h (provides all GL symbols on Windows)
 #include "xrt/xrt_windows.h"
-#include <GL/gl.h>
-#include <GL/glext.h>
+#include "ogl/ogl_api.h"
 
 #include <cstdlib>
 

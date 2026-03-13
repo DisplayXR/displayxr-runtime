@@ -166,7 +166,8 @@ if(XRT_HAVE_LEIA_SR)
 		if(LEIA_SR_GL_AVAILABLE)
 			target_link_libraries(drv_leia PRIVATE
 				${SR_PATH}/lib/SimulatedRealityOpenGL.lib
-				opengl32)
+				opengl32
+				aux_ogl)
 			target_compile_definitions(drv_leia PUBLIC XRT_HAVE_LEIA_SR_GL)
 		endif()
 
