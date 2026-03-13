@@ -17,13 +17,25 @@ layout(location = 0) out vec4 out_color;
 
 void main()
 {
-	// Determine which tile column we're in based on screen X
-	float col = floor(in_uv.x * tile.tile_columns);
-	col = min(col, tile.tile_columns - 1.0);
+	// SBS display: left half of screen = left eye, right half = right eye.
+	// Map screen position to the correct tile in the atlas.
+	float eye_index;
+	float eye_u;
+	if (in_uv.x < 0.5) {
+		eye_index = 0.0;
+		eye_u = in_uv.x / 0.5;
+	} else {
+		eye_index = 1.0;
+		eye_u = (in_uv.x - 0.5) / 0.5;
+	}
 
-	// Map screen UV to atlas UV
-	float atlas_u = (col + fract(in_uv.x * tile.tile_columns)) * tile.inv_tile_columns;
-	float atlas_v = in_uv.y * tile.inv_tile_rows;
+	// Compute tile position for this eye
+	float col = mod(eye_index, tile.tile_columns);
+	float row = floor(eye_index / tile.tile_columns);
+
+	// Crop center 50% horizontally within tile (matching GL SBS shader)
+	float atlas_u = (0.25 + eye_u * 0.5 + col) * tile.inv_tile_columns;
+	float atlas_v = (in_uv.y + row) * tile.inv_tile_rows;
 
 	out_color = texture(atlas_tex, vec2(atlas_u, atlas_v));
 }

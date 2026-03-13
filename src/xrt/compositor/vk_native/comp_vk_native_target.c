@@ -387,10 +387,34 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 	                                          UINT64_MAX, target->image_available,
 	                                          VK_NULL_HANDLE, &target->current_index);
 	if (res == VK_ERROR_OUT_OF_DATE_KHR || res == VK_SUBOPTIMAL_KHR) {
-		U_LOG_I("Swapchain out of date, needs recreation");
-		return XRT_ERROR_VULKAN;
-	}
-	if (res != VK_SUCCESS) {
+		// Swapchain invalidated (window resize, minimize, etc.) — recreate and retry
+		U_LOG_I("Swapchain out of date, recreating");
+
+		vk->vkDeviceWaitIdle(vk->device);
+		destroy_swapchain_views(target);
+
+		// Destroy old swapchain BEFORE creating new one — MoltenVK requires
+		// the native window to be free (VK_ERROR_NATIVE_WINDOW_IN_USE_KHR).
+		if (target->swapchain != VK_NULL_HANDLE) {
+			vk->vkDestroySwapchainKHR(vk->device, target->swapchain, NULL);
+			target->swapchain = VK_NULL_HANDLE;
+		}
+
+		xrt_result_t xret = create_swapchain(target);
+		if (xret != XRT_SUCCESS) {
+			U_LOG_E("Failed to recreate swapchain");
+			return XRT_ERROR_VULKAN;
+		}
+
+		// Retry acquire with new swapchain
+		res = vk->vkAcquireNextImageKHR(vk->device, target->swapchain,
+		                                 UINT64_MAX, target->image_available,
+		                                 VK_NULL_HANDLE, &target->current_index);
+		if (res != VK_SUCCESS) {
+			U_LOG_E("Failed to acquire after swapchain recreation: %d", res);
+			return XRT_ERROR_VULKAN;
+		}
+	} else if (res != VK_SUCCESS) {
 		U_LOG_E("Failed to acquire swapchain image: %d", res);
 		return XRT_ERROR_VULKAN;
 	}

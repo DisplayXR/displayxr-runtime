@@ -28,9 +28,10 @@ extern "C" {
  * Create a Vulkan renderer for layer compositing.
  *
  * @param c The Vulkan native compositor.
- * @param view_width Width of one view (half of stereo texture width).
- * @param view_height Height of the views.
- * @param target_height Height of the render target (window).
+ * @param view_width Width of one view.
+ * @param view_height Height of one view.
+ * @param atlas_width Width of the atlas texture (worst-case across modes).
+ * @param atlas_height Height of the atlas texture (worst-case across modes).
  * @param out_renderer Pointer to receive the created renderer.
  *
  * @return XRT_SUCCESS on success, error code otherwise.
@@ -41,7 +42,8 @@ xrt_result_t
 comp_vk_native_renderer_create(struct comp_vk_native_compositor *c,
                                 uint32_t view_width,
                                 uint32_t view_height,
-                                uint32_t target_height,
+                                uint32_t atlas_width,
+                                uint32_t atlas_height,
                                 struct comp_vk_native_renderer **out_renderer);
 
 /*!
@@ -130,7 +132,8 @@ comp_vk_native_renderer_get_format(struct comp_vk_native_renderer *renderer);
  * @param renderer The renderer.
  * @param new_view_width New width per view.
  * @param new_view_height New height per view.
- * @param new_target_height New render target height.
+ * @param new_atlas_width New atlas width.
+ * @param new_atlas_height New atlas height.
  *
  * @return XRT_SUCCESS on success, error code otherwise.
  *
@@ -140,7 +143,8 @@ xrt_result_t
 comp_vk_native_renderer_resize(struct comp_vk_native_renderer *renderer,
                                 uint32_t new_view_width,
                                 uint32_t new_view_height,
-                                uint32_t new_target_height);
+                                uint32_t new_atlas_width,
+                                uint32_t new_atlas_height);
 
 /*!
  * Blit the stereo texture to a target image with stretching.
