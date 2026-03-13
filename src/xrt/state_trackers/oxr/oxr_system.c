@@ -150,26 +150,12 @@ oxr_system_fill_in(
 		uint32_t h_max = info->views[i].max.height_pixels;
 
 		uint32_t w, h;
-		if (info->atlas_width_pixels > 0 && info->atlas_height_pixels > 0) {
-			// Display processor present: use worst-case atlas dims.
-			// Per-view recommended = atlas / view_count (for stereo: atlas_w / 2).
-			// Standard apps create swapchain at recommended * 2 = atlas_w.
-			w = (uint32_t)(info->atlas_width_pixels / view_count * scale);
-			h = (uint32_t)(info->atlas_height_pixels * scale);
-			// The null compositor's max is based on the Qwerty HMD's tiny
-			// screen (e.g. 640x720), not the real display. Override max
-			// with actual display dimensions so recommended isn't clamped.
-			if (w_max < info->atlas_width_pixels) {
-				w_max = info->atlas_width_pixels;
-			}
-			if (h_max < info->atlas_height_pixels) {
-				h_max = info->atlas_height_pixels;
-			}
-		} else if (view_scale_x > 0.0f && view_scale_y > 0.0f &&
-		           info->display_pixel_width > 0 && info->display_pixel_height > 0) {
-			// Fallback: display processor present but no atlas computed
-			w = (uint32_t)(info->display_pixel_width / 2 * scale);
-			h = (uint32_t)(info->display_pixel_height * scale);
+		if (view_scale_x > 0.0f && view_scale_y > 0.0f &&
+		    info->display_pixel_width > 0 && info->display_pixel_height > 0) {
+			// Per-view recommended = display_pixels * view_scale
+			w = (uint32_t)(info->display_pixel_width * view_scale_x * scale);
+			h = (uint32_t)(info->display_pixel_height * view_scale_y * scale);
+			// Override max with display dimensions so recommended isn't clamped
 			if (w_max < info->display_pixel_width) {
 				w_max = info->display_pixel_width;
 			}
