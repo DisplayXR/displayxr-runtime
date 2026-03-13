@@ -1656,6 +1656,17 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 	(void)shared_texture_handle;
 #endif
 
+	// Scale to Retina physical pixels on macOS.
+	// width/height are logical points from screens[0]; the atlas texture
+	// and rendering resources must match the actual backing resolution.
+#ifdef __APPLE__
+	{
+		float backing_scale = comp_gl_window_macos_get_backing_scale();
+		width = (uint32_t)(width * backing_scale);
+		height = (uint32_t)(height * backing_scale);
+	}
+#endif
+
 	// Initialize GL resources
 	if (!gl_init_resources(c, width, height)) {
 		free(c);
