@@ -278,7 +278,7 @@ std::wstring FormatCameraInfo(float cameraPosX, float cameraPosY, float cameraPo
     return oss.str();
 }
 
-std::wstring FormatStereoParams(float ipdFactor, float parallaxFactor,
+std::wstring FormatViewParams(float ipdFactor, float parallaxFactor,
     float perspectiveFactor, float scaleFactor, bool cameraMode) {
     std::wostringstream oss;
     oss << std::fixed << std::setprecision(2);
