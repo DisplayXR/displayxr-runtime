@@ -144,6 +144,9 @@ struct comp_d3d12_compositor
 	//! Last known 3D rendering mode index (for V-key toggle restore).
 	uint32_t last_3d_mode_index;
 
+	//! True when a legacy app is using a compromise view scale.
+	bool legacy_app_tile_scaling;
+
 	//! Thread safety.
 	std::mutex mutex;
 };
@@ -560,7 +563,7 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 
 		// Rendering mode change from qwerty 1/2/3 keys (disabled for legacy apps).
-		if (!c->base.base.info.legacy_app_tile_scaling) {
+		if (!c->legacy_app_tile_scaling) {
 			int render_mode = -1;
 			if (qwerty_check_rendering_mode_change(c->xsysd->xdevs, c->xsysd->xdev_count, &render_mode)) {
 				struct xrt_device *head = c->xsysd->static_roles.head;
@@ -1334,4 +1337,14 @@ comp_d3d12_compositor_set_system_devices(struct xrt_compositor *xc,
 {
 	struct comp_d3d12_compositor *c = d3d12_comp(xc);
 	c->xsysd = xsysd;
+}
+
+void
+comp_d3d12_compositor_set_legacy_app_tile_scaling(struct xrt_compositor *xc, bool legacy)
+{
+	if (xc == nullptr) {
+		return;
+	}
+	struct comp_d3d12_compositor *c = d3d12_comp(xc);
+	c->legacy_app_tile_scaling = legacy;
 }

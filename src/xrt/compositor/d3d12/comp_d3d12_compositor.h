@@ -117,6 +117,17 @@ void
 comp_d3d12_compositor_set_system_devices(struct xrt_compositor *xc,
                                           struct xrt_system_devices *xsysd);
 
+/*!
+ * Set the legacy app tile scaling flag for the compositor.
+ *
+ * @param xc The compositor.
+ * @param legacy true if legacy app tile scaling is active.
+ *
+ * @ingroup comp_d3d12
+ */
+void
+comp_d3d12_compositor_set_legacy_app_tile_scaling(struct xrt_compositor *xc, bool legacy);
+
 #ifdef __cplusplus
 }
 #endif

@@ -149,6 +149,12 @@ oxr_session_populate_d3d11_native(struct oxr_logger *log,
 	// Set system devices for debug GUI qwerty driver support
 	comp_d3d11_compositor_set_system_devices(&xcn->base, sess->sys->xsysd);
 
+	// Pass legacy app tile scaling flag so compositor can disable 1/2/3 mode keys
+	if (sess->sys->xsysc != NULL) {
+		comp_d3d11_compositor_set_legacy_app_tile_scaling(
+		    &xcn->base, sess->sys->xsysc->info.legacy_app_tile_scaling);
+	}
+
 	// Set the compositor directly - no client wrapper needed
 	sess->xcn = xcn;
 	sess->compositor = &xcn->base;

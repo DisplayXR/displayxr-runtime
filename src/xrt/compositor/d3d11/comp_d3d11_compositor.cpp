@@ -179,6 +179,11 @@ struct comp_d3d11_compositor
 	//! Last known 3D rendering mode index (for V-key toggle restore).
 	uint32_t last_3d_mode_index;
 
+	//! True when a legacy app is using a compromise view scale that doesn't
+	//! match the 3D mode's native scale, so direct rendering mode selection
+	//! via 1/2/3 keys should be disabled.
+	bool legacy_app_tile_scaling;
+
 	//! Thread safety.
 	std::mutex mutex;
 };
@@ -840,7 +845,7 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		// Rendering mode change from qwerty 1/2/3 keys.
 		// Legacy apps (no XR_EXT_display_info) only support V toggle between
 		// mode 0 (2D) and mode 1 (default 3D) — skip direct mode selection.
-		if (!c->base.base.info.legacy_app_tile_scaling) {
+		if (!c->legacy_app_tile_scaling) {
 			int render_mode = -1;
 			if (qwerty_check_rendering_mode_change(c->xsysd->xdevs, c->xsysd->xdev_count, &render_mode)) {
 				struct xrt_device *head = c->xsysd->static_roles.head;
@@ -1791,4 +1796,14 @@ comp_d3d11_compositor_set_system_devices(struct xrt_compositor *xc,
 	if (c->owns_window && c->own_window != nullptr) {
 		comp_d3d11_window_set_system_devices(c->own_window, xsysd);
 	}
+}
+
+void
+comp_d3d11_compositor_set_legacy_app_tile_scaling(struct xrt_compositor *xc, bool legacy)
+{
+	if (xc == nullptr) {
+		return;
+	}
+	struct comp_d3d11_compositor *c = d3d11_comp(xc);
+	c->legacy_app_tile_scaling = legacy;
 }
