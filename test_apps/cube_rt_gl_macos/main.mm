@@ -695,7 +695,7 @@ struct AppXrSession {
     float renderingModeScaleX[8] = {};
     float renderingModeScaleY[8] = {};
     uint32_t renderingModeViewCounts[8] = {};
-    uint32_t currentModeIndex = 0;
+    uint32_t currentModeIndex = 1;  // Default: mode 1 (first 3D mode, matches runtime default)
 };
 
 static volatile bool g_running = true;
@@ -1120,18 +1120,21 @@ int main(int argc, char **argv)
         waitImgInfo.timeout = XR_INFINITE_DURATION;
         xrWaitSwapchainImage(app.swapchain.swapchain, &waitImgInfo);
 
+        // Use current mode's view count (not xrLocateViews count, which is max across all modes)
+        uint32_t modeViewCount = (app.currentModeIndex < app.renderingModeCount)
+            ? app.renderingModeViewCounts[app.currentModeIndex] : viewCount;
         // Render N views into tile positions using runtime-provided tile layout.
         // Falls back to derived layout if mode enumeration unavailable.
         uint32_t tileColumns = (app.currentModeIndex < app.renderingModeCount)
-            ? app.renderingModeTileColumns[app.currentModeIndex] : (viewCount >= 2 ? 2 : 1);
+            ? app.renderingModeTileColumns[app.currentModeIndex] : (modeViewCount >= 2 ? 2 : 1);
         uint32_t tileRows = (app.currentModeIndex < app.renderingModeCount)
-            ? app.renderingModeTileRows[app.currentModeIndex] : ((viewCount + tileColumns - 1) / tileColumns);
-        if (frameState.shouldRender && viewCount >= 1) {
+            ? app.renderingModeTileRows[app.currentModeIndex] : ((modeViewCount + tileColumns - 1) / tileColumns);
+        if (frameState.shouldRender && modeViewCount >= 1) {
             uint32_t eyeW = tileColumns > 0 ? app.swapchain.width / tileColumns : app.swapchain.width;
             uint32_t eyeH = tileRows > 0 ? app.swapchain.height / tileRows : app.swapchain.height;
 
-            std::vector<EyeRenderParams> eyeParams(viewCount);
-            for (uint32_t i = 0; i < viewCount; i++) {
+            std::vector<EyeRenderParams> eyeParams(modeViewCount);
+            for (uint32_t i = 0; i < modeViewCount; i++) {
                 uint32_t tileX = i % tileColumns;
                 uint32_t tileY = i / tileColumns;
                 eyeParams[i].viewportX = tileX * eyeW;
@@ -1143,7 +1146,7 @@ int main(int argc, char **argv)
             }
 
             RenderScene(renderer, app.swapchain.images[imageIndex],
-                        app.swapchain.width, app.swapchain.height, eyeParams.data(), (int)viewCount);
+                        app.swapchain.width, app.swapchain.height, eyeParams.data(), (int)modeViewCount);
         }
 
         // Release swapchain image
@@ -1151,8 +1154,8 @@ int main(int argc, char **argv)
         xrReleaseSwapchainImage(app.swapchain.swapchain, &relInfo);
 
         // End frame
-        std::vector<XrCompositionLayerProjectionView> projViews(viewCount, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
-        for (uint32_t i = 0; i < viewCount; i++) {
+        std::vector<XrCompositionLayerProjectionView> projViews(modeViewCount, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
+        for (uint32_t i = 0; i < modeViewCount; i++) {
             uint32_t tileX = i % tileColumns;
             uint32_t tileY = i / tileColumns;
             uint32_t eyeW = tileColumns > 0 ? app.swapchain.width / tileColumns : app.swapchain.width;
@@ -1170,7 +1173,7 @@ int main(int argc, char **argv)
 
         XrCompositionLayerProjection projLayer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
         projLayer.space = app.localSpace;
-        projLayer.viewCount = viewCount;
+        projLayer.viewCount = modeViewCount;
         projLayer.views = projViews.data();
 
         const XrCompositionLayerBaseHeader *layers[] = {

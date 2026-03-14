@@ -280,8 +280,9 @@ uniform vec2 uTexSize;
 void main() {
     vec2 uv = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
     gl_Position = vec4(uv * 2.0 - 1.0, 0.0, 1.0);
-    // Flip Y for correct orientation, scale to pixel coords for TEXTURE_RECTANGLE
-    vUV = vec2(uv.x, 1.0 - uv.y) * uTexSize;
+    // Scale to pixel coords for TEXTURE_RECTANGLE (no Y-flip needed:
+    // compositor writes GL bottom-up, GL window system handles orientation)
+    vUV = uv * uTexSize;
 }
 )GLSL";
 

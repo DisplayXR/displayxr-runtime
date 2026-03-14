@@ -74,7 +74,7 @@ SDK types.
 │                (state tracker + compositor core)                     │
 │                                                                     │
 │  Types used:  Vendor-NEUTRAL xrt_* types only                       │
-│  - struct xrt_eye_position, xrt_eye_pair   (xrt_display_metrics.h)  │
+│  - struct xrt_eye_position, xrt_eye_positions   (xrt_display_metrics.h)  │
 │  - struct xrt_window_metrics               (xrt_display_metrics.h)  │
 │  - struct xrt_system_compositor_info       (xrt_compositor.h)       │
 │  - struct xrt_display_processor            (xrt_display_processor.h)│
@@ -359,7 +359,7 @@ struct xrt_display_processor
 
     // --- Optional: eye tracking (recommended) ---
     bool (*get_predicted_eye_positions)(struct xrt_display_processor *xdp,
-                                        struct xrt_eye_pair *out_eye_pair);
+                                        struct xrt_eye_positions *out_eye_pos);
 
     // --- Optional: window/display queries ---
     bool (*get_window_metrics)(struct xrt_display_processor *xdp,
@@ -396,7 +396,7 @@ Key design points:
 xrt_display_processor_process_views(xdp, cmd_buffer, ...);
 
 // Query eye positions (returns false if method is NULL or tracking unavailable)
-xrt_display_processor_get_predicted_eye_positions(xdp, &eye_pair);
+xrt_display_processor_get_predicted_eye_positions(xdp, &eye_pos);
 
 // Destroy and NULL the pointer
 xrt_display_processor_destroy(&xdp);
@@ -423,7 +423,7 @@ struct xrt_display_processor_d3d11
 
     // --- Optional (same as Vulkan variant) ---
     bool (*get_predicted_eye_positions)(struct xrt_display_processor_d3d11 *xdp,
-                                        struct xrt_eye_pair *out_eye_pair);
+                                        struct xrt_eye_positions *out_eye_pos);
     bool (*get_window_metrics)(struct xrt_display_processor_d3d11 *xdp,
                                struct xrt_window_metrics *out_metrics);
     bool (*get_display_dimensions)(struct xrt_display_processor_d3d11 *xdp,
@@ -485,10 +485,10 @@ leia_dp_process_views(struct xrt_display_processor *xdp,
 // Eye tracking delivered through the SAME struct as weaving
 static bool
 leia_dp_get_predicted_eye_positions(struct xrt_display_processor *xdp,
-                                    struct xrt_eye_pair *out_eye_pair)
+                                    struct xrt_eye_positions *out_eye_pos)
 {
     struct leia_display_processor *ldp = (struct leia_display_processor *)xdp;
-    return leiasr_get_predicted_eye_positions(ldp->leiasr, out_eye_pair);
+    return leiasr_get_predicted_eye_positions(ldp->leiasr, out_eye_pos);
 }
 
 xrt_result_t
@@ -692,7 +692,7 @@ struct xrt_eye_position
     float z;  //!< Depth position (positive = toward viewer), meters
 };
 
-struct xrt_eye_pair
+struct xrt_eye_positions
 {
     struct xrt_eye_position left;   //!< Left eye position in meters
     struct xrt_eye_position right;  //!< Right eye position in meters
@@ -755,7 +755,7 @@ to the runtime.
 
 The vendor's eye tracking data flows through the **display processor vtable**
 (`get_predicted_eye_positions`) — the same struct that handles weaving.
-The runtime calls this method each frame; the vendor returns `xrt_eye_pair`.
+The runtime calls this method each frame; the vendor returns `xrt_eye_positions`.
 
 The data then takes different paths depending on whether the app uses the
 extension (RAW mode) or is a legacy app (RENDER_READY mode).  The vendor
@@ -763,7 +763,7 @@ only provides the raw eye positions; the runtime decides what to do with them.
 
 Note the **boundary between vendor driver and runtime**: vendor-specific types
 (`leiasr_eye_pair`, etc.) exist only inside the driver box.  At the boundary,
-data is converted to vendor-neutral `xrt_eye_pair`.
+data is converted to vendor-neutral `xrt_eye_positions`.
 
 ```
  ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐
@@ -782,7 +782,7 @@ data is converted to vendor-neutral `xrt_eye_pair`.
  │  │  get_window_metrics()           → geometry   │            │
  │  └──────────────────┬───────────────────────────┘            │
  └ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─┼─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─┘
-     ═══════════════════╪═══════════  BOUNDARY: xrt_eye_pair
+     ═══════════════════╪═══════════  BOUNDARY: xrt_eye_positions
  ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─┼─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─┐
  │  OPENXR RUNTIME     │ (vendor-neutral types only)            │
  │                      ▼                                        │
@@ -790,7 +790,7 @@ data is converted to vendor-neutral `xrt_eye_pair`.
  │  │     Compositor               │                            │
  │  │  calls display_processor->   │                            │
  │  │  get_predicted_eye_positions │                            │
- │  │  → xrt_eye_pair             │                            │
+ │  │  → xrt_eye_positions             │                            │
  │  └──────────────┬───────────────┘                            │
  │                 │                                             │
  │                 ▼                                             │
@@ -883,7 +883,7 @@ vendor-neutral types and works with both SR tracked eye positions (from Leia)
 and nominal viewer positions (from sim_display or any future vendor).
 
 **Vendor takeaway:** The vendor only provides raw eye positions (via
-`xrt_eye_pair`).  The runtime handles the RENDER_READY Kooima math;
+`xrt_eye_positions`).  The runtime handles the RENDER_READY Kooima math;
 extension-aware apps handle their own.
 
 ### 6.4 Fallback Positions
@@ -909,10 +909,10 @@ to `oxr_session.c`.  The compositor simply delegates to the display processor:
 
 1. **D3D11 path:** `comp_d3d11_compositor_get_predicted_eye_positions()`
    → calls `xrt_display_processor_d3d11_get_predicted_eye_positions()` on
-   the session's display processor → returns `xrt_eye_pair`
+   the session's display processor → returns `xrt_eye_positions`
 2. **Vulkan path:** `multi_compositor_get_predicted_eye_positions()`
    → calls `xrt_display_processor_get_predicted_eye_positions()` on
-   the session's display processor → returns `xrt_eye_pair`
+   the session's display processor → returns `xrt_eye_positions`
 3. **Metal/D3D12/GL paths:** Same pattern — compositor holds the display
    processor and delegates eye tracking queries to it.
 
@@ -935,7 +935,7 @@ to choose between smooth (SDK-filtered) and raw eye tracking.
 
 #### Required Internal Fields
 
-**`xrt_eye_pair.is_tracking`** — Set by the vendor's eye position function.
+**`xrt_eye_positions.is_tracking`** — Set by the vendor's eye position function.
 `true` when the physical eye tracker has lock on the user. When `false`, positions
 are still valid — the vendor SDK provides reasonable fallback (last known, filtered,
 nominal viewer). The runtime passes vendor values through unchanged.
@@ -1624,13 +1624,13 @@ src/xrt/drivers/leia/
  │ │ prediction filter  │                  │
  │ └─────────┬──────────┘                  │
  └ ─ ─ ─ ─ ─┼─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─┘
-    ═════════╪═══════  BOUNDARY: xrt_eye_pair
+    ═════════╪═══════  BOUNDARY: xrt_eye_positions
  ┌ ─ ─ ─ ─ ─┼─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─┐
  │ RUNTIME   │ (vendor-neutral types)      │
  │           ▼                             │
  │ ┌────────────────────┐                  │
  │ │ Compositor         │                  │
- │ │ → xrt_eye_pair     │                  │
+ │ │ → xrt_eye_positions     │                  │
  │ └─────────┬──────────┘                  │
  │           │                             │
  │           ▼                             │
@@ -1837,7 +1837,7 @@ This model solves the multi-vendor build problem cleanly:
 
 ## Appendix A: Key Type References
 
-### `xrt_eye_position` / `xrt_eye_pair` / `xrt_window_metrics`
+### `xrt_eye_position` / `xrt_eye_positions` / `xrt_window_metrics`
 
 ```c
 // From xrt_display_metrics.h — vendor-neutral runtime interface types

@@ -141,6 +141,9 @@ struct comp_vk_native_compositor
 	//! Last known 3D rendering mode index (for V-key toggle restore).
 	uint32_t last_3d_mode_index;
 
+	//! True if app is legacy (no XR_EXT_display_info) — gates 1/2/3 key mode selection.
+	bool legacy_app_tile_scaling;
+
 	//! System devices (for qwerty driver).
 	struct xrt_system_devices *xsysd;
 
@@ -1066,6 +1069,18 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				}
 			}
 			comp_vk_native_compositor_request_display_mode(&c->base.base, !force_2d);
+		}
+
+		// Rendering mode change from qwerty 0/1/2/3/4 keys.
+		// Legacy apps only support V toggle — skip direct mode selection.
+		if (!c->legacy_app_tile_scaling) {
+			int render_mode = -1;
+			if (qwerty_check_rendering_mode_change(c->xsysd->xdevs, c->xsysd->xdev_count, &render_mode)) {
+				struct xrt_device *head = c->xsysd->static_roles.head;
+				if (head != NULL) {
+					xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, render_mode);
+				}
+			}
 		}
 	}
 #endif
@@ -2055,6 +2070,14 @@ comp_vk_native_compositor_set_system_devices(struct xrt_compositor *xc,
 		comp_d3d11_window_set_system_devices(c->own_window, xsysd);
 	}
 #endif
+}
+
+void
+comp_vk_native_compositor_set_legacy_app_tile_scaling(struct xrt_compositor *xc, bool legacy)
+{
+	if (xc == NULL) return;
+	struct comp_vk_native_compositor *c = vk_comp(xc);
+	c->legacy_app_tile_scaling = legacy;
 }
 
 struct vk_bundle *

@@ -213,8 +213,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                         0.0f, 0.0f, 0.0f,  // playerPos (handled by qwerty)
                         0.0f, 0.0f)) {     // playerYaw/Pitch (handled by qwerty)
 
-                        uint32_t viewCount = xr.viewCount;
-                        submitViewCount = viewCount;
+                        // Use current mode's view count (not xr.viewCount which is max across all modes)
+                        uint32_t modeViewCount = (xr.currentModeIndex < xr.renderingModeCount)
+                            ? xr.renderingModeViewCounts[xr.currentModeIndex] : xr.viewCount;
+                        submitViewCount = modeViewCount;
 
                         // Get raw view poses (pre-player-transform) for projection views.
                         XrViewLocateInfo locateInfo = {XR_TYPE_VIEW_LOCATE_INFO};
@@ -230,9 +232,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
                         // Get tile layout from rendering mode, with fallback
                         uint32_t tileColumns = (xr.currentModeIndex < xr.renderingModeCount)
-                            ? xr.renderingModeTileColumns[xr.currentModeIndex] : (viewCount >= 2 ? 2 : 1);
+                            ? xr.renderingModeTileColumns[xr.currentModeIndex] : (modeViewCount >= 2 ? 2 : 1);
                         uint32_t tileRows = (xr.currentModeIndex < xr.renderingModeCount)
-                            ? xr.renderingModeTileRows[xr.currentModeIndex] : ((viewCount + tileColumns - 1) / tileColumns);
+                            ? xr.renderingModeTileRows[xr.currentModeIndex] : ((modeViewCount + tileColumns - 1) / tileColumns);
 
                         uint32_t tileW = xr.swapchain.width / tileColumns;
                         uint32_t tileH = xr.swapchain.height / tileRows;
@@ -250,7 +252,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                             renderer.context->ClearDepthStencilView(depthDSV.Get(),
                                 D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
 
-                            for (uint32_t eye = 0; eye < viewCount; eye++) {
+                            for (uint32_t eye = 0; eye < modeViewCount; eye++) {
                                 uint32_t tileX = eye % tileColumns;
                                 uint32_t tileY = eye / tileColumns;
 

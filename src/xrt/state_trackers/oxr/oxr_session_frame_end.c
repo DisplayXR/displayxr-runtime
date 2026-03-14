@@ -607,23 +607,28 @@ verify_projection_layer(struct oxr_session *sess,
 		}
 		break;
 	case XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO: {
-		// Accept viewCount of 1 (mono) or matching the active rendering
-		// mode's view_count. This is permissive because the active mode
-		// may change (2D=1 view, stereo=2, quad=4) and the app/runtime
-		// may momentarily disagree during mode transitions.
-		uint32_t expected = 2; // default stereo
-		if (head != NULL && head->hmd != NULL &&
-		    head->rendering_mode_count > 0) {
-			uint32_t idx = head->hmd->active_rendering_mode_index;
-			if (idx < head->rendering_mode_count) {
-				expected = head->rendering_modes[idx].view_count;
+		// Accept viewCount that matches ANY rendering mode's view_count.
+		// The app may be one frame behind during mode transitions (race
+		// between mode change and xrEndFrame), so we can't restrict to
+		// only the currently active mode.  viewCount == 1 is always
+		// accepted (mono fallback).
+		bool valid = (proj->viewCount == 1);
+		if (!valid && head != NULL && head->rendering_mode_count > 0) {
+			for (uint32_t mi = 0; mi < head->rendering_mode_count; mi++) {
+				if (proj->viewCount == head->rendering_modes[mi].view_count) {
+					valid = true;
+					break;
+				}
 			}
 		}
-		if (proj->viewCount != 1 && proj->viewCount != expected) {
+		if (!valid && proj->viewCount == 2) {
+			valid = true; // default stereo always accepted
+		}
+		if (!valid) {
 			return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
-			                 "(frameEndInfo->layers[%u]->viewCount == %u) must be 1 or %u for "
-			                 "XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO",
-			                 layer_index, proj->viewCount, expected);
+			                 "(frameEndInfo->layers[%u]->viewCount == %u) does not match any "
+			                 "rendering mode for XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO",
+			                 layer_index, proj->viewCount);
 		}
 		break;
 	}

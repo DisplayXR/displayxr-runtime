@@ -125,6 +125,14 @@ comp_vk_native_compositor_set_system_devices(struct xrt_compositor *xc,
                                               struct xrt_system_devices *xsysd);
 
 /*!
+ * Set legacy app tile scaling flag (gates 1/2/3 key mode selection).
+ *
+ * @ingroup comp_vk_native
+ */
+void
+comp_vk_native_compositor_set_legacy_app_tile_scaling(struct xrt_compositor *xc, bool legacy);
+
+/*!
  * Get the vk_bundle from a VK native compositor (for sub-modules).
  *
  * @ingroup comp_vk_native

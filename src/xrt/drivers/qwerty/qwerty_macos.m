@@ -385,6 +385,7 @@ qwerty_process_macos(struct xrt_device **xdevs,
 		case kVK_ANSI_1:
 		case kVK_ANSI_2:
 		case kVK_ANSI_3:
+		case kVK_ANSI_4:
 			if (is_down && ![event isARepeat] && qsys->hmd_focused)
 				qwerty_set_rendering_mode(qsys, keyCode - kVK_ANSI_1 + 1);
 			break;

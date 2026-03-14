@@ -169,7 +169,7 @@ Each mode has its own independent variable set:
 
 | Variable | Camera Mode | Display Mode |
 |----------|-------------|-------------|
-| IPD factor | `cam_ipd_factor` [0.01, 1] default 1.0 | `disp_ipd_factor` [0.01, 1] default 1.0 |
+| IPD factor | `cam_spread_factor` [0.01, 1] default 1.0 | `disp_spread_factor` [0.01, 1] default 1.0 |
 | Parallax factor | `cam_parallax_factor` (= ipd always) | `disp_parallax_factor` (= ipd always) |
 | Convergence | `cam_convergence` [0, 2] diopters, default 0.5 | — |
 | Half-tan vFOV | `cam_half_tan_vfov` default 0.3249 (derived only) | — |
