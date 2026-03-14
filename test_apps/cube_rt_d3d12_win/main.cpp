@@ -198,17 +198,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         if (xr.sessionRunning) {
             XrFrameState frameState;
             if (BeginFrame(xr, frameState)) {
-                XrCompositionLayerProjectionView projectionViews[2] = {};
+                XrCompositionLayerProjectionView projectionViews[8] = {};
+                uint32_t submitViewCount = 2;
 
                 if (frameState.shouldRender) {
-                    XMMATRIX leftViewMatrix, leftProjMatrix;
-                    XMMATRIX rightViewMatrix, rightProjMatrix;
-
                     if (LocateViews(xr, frameState.predictedDisplayTime,
-                        leftViewMatrix, leftProjMatrix,
-                        rightViewMatrix, rightProjMatrix,
                         0.0f, 0.0f, 0.0f,
                         0.0f, 0.0f)) {
+
+                        uint32_t viewCount = xr.viewCount;
+                        submitViewCount = viewCount;
 
                         XrViewLocateInfo locateInfo = {XR_TYPE_VIEW_LOCATE_INFO};
                         locateInfo.viewConfigurationType = xr.viewConfigType;
@@ -216,38 +215,46 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                         locateInfo.space = xr.localSpace;
 
                         XrViewState viewState = {XR_TYPE_VIEW_STATE};
-                        uint32_t viewCount = 2;
-                        XrView rawViews[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
-                        xrLocateViews(xr.session, &locateInfo, &viewState, 2, &viewCount, rawViews);
+                        uint32_t rawViewCount = 8;
+                        XrView rawViews[8];
+                        for (uint32_t i = 0; i < 8; i++) rawViews[i] = {XR_TYPE_VIEW};
+                        xrLocateViews(xr.session, &locateInfo, &viewState, 8, &rawViewCount, rawViews);
 
-                        uint32_t eyeRenderW = (xr.recommendedViewScaleX > 0.0f && xr.recommendedViewScaleX < 1.0f)
-                            ? (uint32_t)(xr.swapchain.width * xr.recommendedViewScaleX)
-                            : xr.swapchain.width / 2;
-                        uint32_t eyeRenderH = xr.swapchain.height;
+                        // Get tile layout from rendering mode, with fallback
+                        uint32_t tileColumns = (xr.currentModeIndex < xr.renderingModeCount)
+                            ? xr.renderingModeTileColumns[xr.currentModeIndex] : (viewCount >= 2 ? 2 : 1);
+                        uint32_t tileRows = (xr.currentModeIndex < xr.renderingModeCount)
+                            ? xr.renderingModeTileRows[xr.currentModeIndex] : ((viewCount + tileColumns - 1) / tileColumns);
+
+                        uint32_t tileW = xr.swapchain.width / tileColumns;
+                        uint32_t tileH = xr.swapchain.height / tileRows;
 
                         uint32_t imageIndex;
                         if (AcquireSwapchainImage(xr, imageIndex)) {
                             ID3D12Resource* swapchainTexture = swapchainImages[imageIndex].texture;
 
-                            // Render both eyes with SBS viewports
-                            for (int eye = 0; eye < 2; eye++) {
-                                XMMATRIX viewMatrix = (eye == 0) ? leftViewMatrix : rightViewMatrix;
-                                XMMATRIX projMatrix = (eye == 0) ? leftProjMatrix : rightProjMatrix;
+                            // Render all views with tile layout
+                            for (uint32_t eye = 0; eye < viewCount; eye++) {
+                                uint32_t tileX = eye % tileColumns;
+                                uint32_t tileY = eye / tileColumns;
+
+                                XMMATRIX viewMatrix = xr.viewMatrices[eye];
+                                XMMATRIX projMatrix = xr.projMatrices[eye];
 
                                 RenderScene(renderer, swapchainTexture, (int)imageIndex,
-                                    eye * eyeRenderW, 0,
-                                    eyeRenderW, eyeRenderH,
+                                    tileX * tileW, tileY * tileH,
+                                    tileW, tileH,
                                     viewMatrix, projMatrix,
                                     1.0f, eye == 0);
 
                                 projectionViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
                                 projectionViews[eye].subImage.swapchain = xr.swapchain.swapchain;
                                 projectionViews[eye].subImage.imageRect.offset = {
-                                    (int32_t)(eye * eyeRenderW), 0
+                                    (int32_t)(tileX * tileW), (int32_t)(tileY * tileH)
                                 };
                                 projectionViews[eye].subImage.imageRect.extent = {
-                                    (int32_t)eyeRenderW,
-                                    (int32_t)eyeRenderH
+                                    (int32_t)tileW,
+                                    (int32_t)tileH
                                 };
                                 projectionViews[eye].subImage.imageArrayIndex = 0;
                                 projectionViews[eye].pose = rawViews[eye].pose;
@@ -261,7 +268,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                     }
                 }
 
-                EndFrame(xr, frameState.predictedDisplayTime, projectionViews);
+                EndFrame(xr, frameState.predictedDisplayTime, projectionViews, submitViewCount);
             }
         } else {
             Sleep(100);

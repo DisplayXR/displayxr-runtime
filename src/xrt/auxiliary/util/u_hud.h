@@ -65,11 +65,11 @@ struct u_hud_data
 
 	// Stereo controls (dual camera/display state)
 	bool camera_mode;                //!< true=camera, false=display
-	float cam_ipd_factor;            //!< Camera: IPD factor [0.01,1]
+	float cam_spread_factor;            //!< Camera: IPD factor [0.01,1]
 	float cam_parallax_factor;       //!< Camera: parallax factor [0.01,1]
 	float cam_convergence;           //!< Camera: convergence in diopters [0,2]
 	float cam_half_tan_vfov;         //!< Camera: half_tan_vfov (derived)
-	float disp_ipd_factor;           //!< Display: IPD factor [0.01,1]
+	float disp_spread_factor;           //!< Display: IPD factor [0.01,1]
 	float disp_parallax_factor;      //!< Display: parallax factor [0.01,1]
 	float disp_vHeight;              //!< Display: virtual display height (m) [0.1,10]
 	float nominal_viewer_z;          //!< Hardware: nominal viewer distance (m)

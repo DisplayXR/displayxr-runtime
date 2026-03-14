@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  Unified display-centric stereo view math for 3D displays
+ * @brief  Unified display-centric multiview math for 3D displays
  *
  * Canonical implementation — see display3d_view.h for API docs.
  */
@@ -10,6 +10,7 @@
 #include "display3d_view.h"
 #include <math.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 // ============================================================================
@@ -264,7 +265,7 @@ display3d_compute_view(const XrVector3f *processed_eye,
                        const XrPosef *display_pose,
                        float near_z,
                        float far_z,
-                       Display3DStereoView *out)
+                       Display3DView *out)
 {
 	Display3DTunables t = tunables ? *tunables : display3d_default_tunables();
 
@@ -305,31 +306,32 @@ display3d_compute_view(const XrVector3f *processed_eye,
 }
 
 void
-display3d_compute_stereo_views(const XrVector3f *raw_left,
-                               const XrVector3f *raw_right,
+display3d_compute_views(const XrVector3f *raw_eyes,
+                               uint32_t count,
                                const XrVector3f *nominal_viewer,
                                const Display3DScreen *screen,
                                const Display3DTunables *tunables,
                                const XrPosef *display_pose,
                                float near_z,
                                float far_z,
-                               Display3DStereoView *out_left,
-                               Display3DStereoView *out_right)
+                               Display3DView *out_views)
 {
 	Display3DTunables t = tunables ? *tunables : display3d_default_tunables();
 
-	// Apply IPD and parallax factors (2-eye path)
-	XrVector3f raw[2] = {*raw_left, *raw_right};
-	XrVector3f processed[2];
-	display3d_apply_eye_factors_n(raw, 2, nominal_viewer,
+	// Apply IPD and parallax factors (N-view path)
+	XrVector3f stack_processed[8];
+	XrVector3f *processed = (count <= 8) ? stack_processed : (XrVector3f *)malloc(count * sizeof(XrVector3f));
+	display3d_apply_eye_factors_n(raw_eyes, count, nominal_viewer,
 	                              t.ipd_factor, t.parallax_factor,
 	                              processed);
 
-	// Compute each eye via single-eye primitive
-	Display3DStereoView *outputs[2] = {out_left, out_right};
-	for (int i = 0; i < 2; i++) {
+	// Compute each view via single-eye primitive
+	for (uint32_t i = 0; i < count; i++) {
 		display3d_compute_view(&processed[i], screen, &t,
 		                       display_pose, near_z, far_z,
-		                       outputs[i]);
+		                       &out_views[i]);
 	}
+
+	if (count > 8)
+		free(processed);
 }

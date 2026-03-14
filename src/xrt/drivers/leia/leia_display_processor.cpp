@@ -264,11 +264,11 @@ do_weave:;
 }
 
 static bool
-leia_dp_get_predicted_eye_positions(struct xrt_display_processor *xdp, struct xrt_eye_pair *out_eye_pair)
+leia_dp_get_predicted_eye_positions(struct xrt_display_processor *xdp, struct xrt_eye_positions *out_eye_pos)
 {
 	struct leia_display_processor *ldp = leia_display_processor(xdp);
-	// leiasr_eye_pair is #defined to xrt_eye_pair in leia_types.h
-	return leiasr_get_predicted_eye_positions(ldp->leiasr, (struct leiasr_eye_pair *)out_eye_pair);
+	// leiasr_eye_pair is #defined to xrt_eye_positions in leia_types.h
+	return leiasr_get_predicted_eye_positions(ldp->leiasr, (struct leiasr_eye_pair *)out_eye_pos);
 }
 
 static bool

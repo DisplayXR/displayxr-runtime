@@ -48,7 +48,8 @@ extern void oxr_macos_set_window_closed(void);
  * background thread never reaches the display.
  */
 void
-oxr_macos_pump_events(struct xrt_device **xdevs, uint32_t xdev_count, struct xrt_device *head)
+oxr_macos_pump_events(struct xrt_device **xdevs, uint32_t xdev_count, struct xrt_device *head,
+                      bool legacy_app)
 {
 	@autoreleasepool {
 		if (NSApp == nil) {
@@ -89,8 +90,10 @@ oxr_macos_pump_events(struct xrt_device **xdevs, uint32_t xdev_count, struct xrt
 		}
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
-		// Poll for unified rendering mode change (0-3/V keys via qwerty driver)
-		if (xdevs != NULL && xdev_count > 0 && head != NULL) {
+		// Poll for direct rendering mode change (1/2/3 keys via qwerty driver).
+		// Legacy apps (no XR_EXT_display_info) only support V toggle between
+		// mode 0 (2D) and mode 1 (default 3D) — skip direct mode selection.
+		if (!legacy_app && xdevs != NULL && xdev_count > 0 && head != NULL) {
 			int render_mode = -1;
 			if (qwerty_check_rendering_mode_change(xdevs, xdev_count, &render_mode)) {
 				// Wrap for V key cycling and feed back wrapped value

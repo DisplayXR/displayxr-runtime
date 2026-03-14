@@ -108,6 +108,7 @@ oxr_system_fill_in(
 
 	sys->inst = inst;
 	sys->systemId = systemId;
+	sys->view_count = view_count;
 	if (view_count == 1) {
 		sys->view_config_type = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MONO;
 	} else {
@@ -144,6 +145,39 @@ oxr_system_fill_in(
 #define imin(a, b) (a < b ? a : b)
 	float view_scale_x = info->recommended_view_scale_x;
 	float view_scale_y = info->recommended_view_scale_y;
+
+#ifdef OXR_HAVE_EXT_display_info
+	// Legacy app compromise: apps without XR_EXT_display_info can't adapt to
+	// mode changes, so we pick a compromise view scale that works across 2D and 3D.
+	// If the default 3D mode has 2 views with scaleX/Y <= 0.5 (typical SBS),
+	// use 0.5x1.0 so the app renders full-height tiles. The compositor will
+	// downscale Y for 3D and stretch X for 2D.
+	if (!inst->extensions.EXT_display_info) {
+		struct xrt_device *head = GET_XDEV_BY_ROLE(sys, head);
+		if (head != NULL && head->rendering_mode_count > 1) {
+			uint32_t default_3d_idx = head->hmd->active_rendering_mode_index;
+			struct xrt_rendering_mode *mode3d = &head->rendering_modes[default_3d_idx];
+			if (mode3d->view_count == 2 &&
+			    mode3d->view_scale_x <= 0.5f && mode3d->view_scale_y <= 0.5f) {
+				// Case A: typical SBS — compromise to 0.5x1.0
+				view_scale_x = 0.5f;
+				view_scale_y = 1.0f;
+				info->legacy_app_tile_scaling = true;
+				U_LOG_W("Legacy app (no XR_EXT_display_info): using compromise "
+				        "view scale 0.5x1.0 (3D mode '%s' is %.1fx%.1f)",
+				        mode3d->mode_name, mode3d->view_scale_x, mode3d->view_scale_y);
+			} else {
+				// Case B: use 3D mode's actual scale, stretch for 2D
+				view_scale_x = mode3d->view_scale_x;
+				view_scale_y = mode3d->view_scale_y;
+				info->legacy_app_tile_scaling = true;
+				U_LOG_W("Legacy app (no XR_EXT_display_info): using 3D mode '%s' "
+				        "scale %.2fx%.2f", mode3d->mode_name,
+				        mode3d->view_scale_x, mode3d->view_scale_y);
+			}
+		}
+	}
+#endif // OXR_HAVE_EXT_display_info
 
 	for (uint32_t i = 0; i < view_count; ++i) {
 		uint32_t w_max = info->views[i].max.width_pixels;
@@ -704,7 +738,7 @@ oxr_system_enumerate_view_conf_views(struct oxr_logger *log,
 		OXR_TWO_CALL_FILL_IN_HELPER(log, viewCapacityInput, viewCountOutput, views, 1,
 		                            view_configuration_view_fill_in, sys->views, XR_SUCCESS);
 	} else {
-		OXR_TWO_CALL_FILL_IN_HELPER(log, viewCapacityInput, viewCountOutput, views, 2,
+		OXR_TWO_CALL_FILL_IN_HELPER(log, viewCapacityInput, viewCountOutput, views, sys->view_count,
 		                            view_configuration_view_fill_in, sys->views, XR_SUCCESS);
 	}
 }

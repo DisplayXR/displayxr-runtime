@@ -502,15 +502,15 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	struct xrt_vec3 right_eye = {0.032f, 0.0f, 0.6f};
 
 	if (c->display_processor != nullptr) {
-		struct xrt_eye_pair eyes;
+		struct xrt_eye_positions eyes;
 		if (xrt_display_processor_d3d12_get_predicted_eye_positions(c->display_processor, &eyes) &&
 		    eyes.valid) {
-			left_eye.x = eyes.left.x;
-			left_eye.y = eyes.left.y;
-			left_eye.z = eyes.left.z;
-			right_eye.x = eyes.right.x;
-			right_eye.y = eyes.right.y;
-			right_eye.z = eyes.right.z;
+			left_eye.x = eyes.eyes[0].x;
+			left_eye.y = eyes.eyes[0].y;
+			left_eye.z = eyes.eyes[0].z;
+			right_eye.x = eyes.eyes[1].x;
+			right_eye.y = eyes.eyes[1].y;
+			right_eye.z = eyes.eyes[1].z;
 		}
 	}
 
@@ -559,11 +559,14 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			comp_d3d12_compositor_request_display_mode(&c->base.base, !force_2d);
 		}
 
-		int render_mode = -1;
-		if (qwerty_check_rendering_mode_change(c->xsysd->xdevs, c->xsysd->xdev_count, &render_mode)) {
-			struct xrt_device *head = c->xsysd->static_roles.head;
-			if (head != nullptr) {
-				xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, render_mode);
+		// Rendering mode change from qwerty 1/2/3 keys (disabled for legacy apps).
+		if (!c->base.info.legacy_app_tile_scaling) {
+			int render_mode = -1;
+			if (qwerty_check_rendering_mode_change(c->xsysd->xdevs, c->xsysd->xdev_count, &render_mode)) {
+				struct xrt_device *head = c->xsysd->static_roles.head;
+				if (head != nullptr) {
+					xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, render_mode);
+				}
 			}
 		}
 	}
@@ -1283,31 +1286,17 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 
 extern "C" bool
 comp_d3d12_compositor_get_predicted_eye_positions(struct xrt_compositor *xc,
-                                                  struct xrt_vec3 *out_left_eye,
-                                                  struct xrt_vec3 *out_right_eye)
+                                                  struct xrt_eye_positions *out_eye_pos)
 {
 	struct comp_d3d12_compositor *c = d3d12_comp(xc);
 
 	if (c->display_processor != nullptr) {
-		struct xrt_eye_pair eyes;
-		if (xrt_display_processor_d3d12_get_predicted_eye_positions(c->display_processor, &eyes) &&
-		    eyes.valid) {
-			out_left_eye->x = eyes.left.x;
-			out_left_eye->y = eyes.left.y;
-			out_left_eye->z = eyes.left.z;
-			out_right_eye->x = eyes.right.x;
-			out_right_eye->y = eyes.right.y;
-			out_right_eye->z = eyes.right.z;
+		if (xrt_display_processor_d3d12_get_predicted_eye_positions(c->display_processor, out_eye_pos) &&
+		    out_eye_pos->valid) {
 			return true;
 		}
 	}
 
-	out_left_eye->x = -0.032f;
-	out_left_eye->y = 0.0f;
-	out_left_eye->z = 0.6f;
-	out_right_eye->x = 0.032f;
-	out_right_eye->y = 0.0f;
-	out_right_eye->z = 0.6f;
 	return false;
 }
 

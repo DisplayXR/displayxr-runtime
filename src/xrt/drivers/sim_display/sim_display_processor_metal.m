@@ -4,9 +4,9 @@
  * @file
  * @brief  Simulation Metal display processor: SBS, anaglyph, alpha-blend output.
  *
- * Implements SBS, anaglyph, and alpha-blend atlas output modes using MSL
- * shaders compiled at runtime. All 3 pipelines are pre-compiled at init
- * for instant runtime switching via 1/2/3 keys.
+ * Implements SBS, anaglyph, alpha-blend, squeezed SBS, and quad atlas output
+ * modes using MSL shaders compiled at runtime. All 5 pipelines are pre-compiled
+ * at init for instant runtime switching via 1/2/3/4/5 keys.
  *
  * @author David Fattal
  * @ingroup drv_sim_display
@@ -132,6 +132,23 @@ static NSString *const shader_source = @
     "    float src_u = (eye_u + col) * tp.tile_cols_inv;\n"
     "    float src_v = (in.texCoord.y + row) * tp.tile_rows_inv;\n"
     "    return tex.sample(smp, float2(src_u, src_v));\n"
+    "}\n"
+    "\n"
+    "// Quad: 2x2 grid — TL=view0, TR=view1, BL=view2, BR=view3.\n"
+    "fragment float4 quad_fragment(VertexOut in [[stage_in]],\n"
+    "                              texture2d<float> tex [[texture(0)]],\n"
+    "                              sampler smp [[sampler(0)]],\n"
+    "                              constant TileParams &tp [[buffer(0)]]) {\n"
+    "    float col_idx = (in.texCoord.x < 0.5) ? 0.0 : 1.0;\n"
+    "    float row_idx = (in.texCoord.y < 0.5) ? 0.0 : 1.0;\n"
+    "    float view_index = row_idx * 2.0 + col_idx;\n"
+    "    float local_u = fract(in.texCoord.x * 2.0);\n"
+    "    float local_v = fract(in.texCoord.y * 2.0);\n"
+    "    float col = fmod(view_index, tp.tile_cols);\n"
+    "    float row = floor(view_index / tp.tile_cols);\n"
+    "    float atlas_u = (local_u + col) * tp.tile_cols_inv;\n"
+    "    float atlas_v = (local_v + row) * tp.tile_rows_inv;\n"
+    "    return tex.sample(smp, float2(atlas_u, atlas_v));\n"
     "}\n";
 
 
@@ -142,7 +159,7 @@ struct sim_display_processor_metal
 {
 	struct xrt_display_processor_metal base;
 	id<MTLDevice> device;
-	id<MTLRenderPipelineState> pipelines[4]; //!< One per output mode (SBS, anaglyph, blend, squeezed SBS)
+	id<MTLRenderPipelineState> pipelines[5]; //!< One per output mode (SBS, anaglyph, blend, squeezed SBS, quad)
 	id<MTLSamplerState> sampler;
 
 	//! Nominal viewer parameters for faked eye positions.
@@ -249,16 +266,29 @@ sim_dp_metal_process_atlas(struct xrt_display_processor_metal *xdp,
 
 static bool
 sim_dp_metal_get_predicted_eye_positions(struct xrt_display_processor_metal *xdp,
-                                         struct xrt_eye_pair *out_eye_pair)
+                                         struct xrt_eye_positions *out)
 {
 	struct sim_display_processor_metal *sdp = sim_dp_metal(xdp);
 	float half_ipd = sdp->ipd_m / 2.0f;
+	uint32_t vc = sim_display_get_view_count();
 
-	out_eye_pair->left = (struct xrt_eye_position){sdp->nominal_x_m - half_ipd, sdp->nominal_y_m, sdp->nominal_z_m};
-	out_eye_pair->right = (struct xrt_eye_position){sdp->nominal_x_m + half_ipd, sdp->nominal_y_m, sdp->nominal_z_m};
-	out_eye_pair->timestamp_ns = os_monotonic_get_ns();
-	out_eye_pair->valid = true;
-	out_eye_pair->is_tracking = false; // Nominal, not real tracking
+	if (vc == 1) {
+		out->eyes[0] = (struct xrt_eye_position){sdp->nominal_x_m, sdp->nominal_y_m, sdp->nominal_z_m};
+		out->count = 1;
+	} else if (vc >= 4) {
+		out->eyes[0] = (struct xrt_eye_position){sdp->nominal_x_m - half_ipd, sdp->nominal_y_m - 0.032f, sdp->nominal_z_m};
+		out->eyes[1] = (struct xrt_eye_position){sdp->nominal_x_m + half_ipd, sdp->nominal_y_m - 0.032f, sdp->nominal_z_m};
+		out->eyes[2] = (struct xrt_eye_position){sdp->nominal_x_m - half_ipd, sdp->nominal_y_m + 0.032f, sdp->nominal_z_m};
+		out->eyes[3] = (struct xrt_eye_position){sdp->nominal_x_m + half_ipd, sdp->nominal_y_m + 0.032f, sdp->nominal_z_m};
+		out->count = 4;
+	} else {
+		out->eyes[0] = (struct xrt_eye_position){sdp->nominal_x_m - half_ipd, sdp->nominal_y_m, sdp->nominal_z_m};
+		out->eyes[1] = (struct xrt_eye_position){sdp->nominal_x_m + half_ipd, sdp->nominal_y_m, sdp->nominal_z_m};
+		out->count = 2;
+	}
+	out->timestamp_ns = os_monotonic_get_ns();
+	out->valid = true;
+	out->is_tracking = false; // Nominal, not real tracking
 	return true;
 }
 
@@ -267,7 +297,7 @@ sim_dp_metal_destroy(struct xrt_display_processor_metal *xdp)
 {
 	struct sim_display_processor_metal *sdp = sim_dp_metal(xdp);
 
-	for (int i = 0; i < 4; i++) {
+	for (int i = 0; i < 5; i++) {
 		sdp->pipelines[i] = nil;
 	}
 	sdp->sampler = nil;
@@ -303,10 +333,10 @@ create_pipelines(struct sim_display_processor_metal *sdp)
 		return false;
 	}
 
-	NSString *frag_names[4] = {@"sbs_fragment", @"anaglyph_fragment", @"blend_fragment", @"squeezed_sbs_fragment"};
-	const char *mode_names[4] = {"SBS", "Anaglyph", "Blend", "Squeezed SBS"};
+	NSString *frag_names[5] = {@"sbs_fragment", @"anaglyph_fragment", @"blend_fragment", @"squeezed_sbs_fragment", @"quad_fragment"};
+	const char *mode_names[5] = {"SBS", "Anaglyph", "Blend", "Squeezed SBS", "Quad"};
 
-	for (int i = 0; i < 4; i++) {
+	for (int i = 0; i < 5; i++) {
 		id<MTLFunction> frag_fn = [library newFunctionWithName:frag_names[i]];
 		if (frag_fn == nil) {
 			U_LOG_E("sim_display Metal: %s fragment function not found", mode_names[i]);
@@ -389,10 +419,11 @@ sim_display_processor_metal_create(enum sim_display_output_mode mode,
 	// Set the initial output mode (atomic global read by process_atlas each frame)
 	sim_display_set_output_mode(mode);
 
-	U_LOG_W("Created sim display Metal processor (all 4 pipelines), initial mode: %s",
+	U_LOG_W("Created sim display Metal processor (all 5 pipelines), initial mode: %s",
 	        mode == SIM_DISPLAY_OUTPUT_SBS           ? "SBS" :
 	        mode == SIM_DISPLAY_OUTPUT_ANAGLYPH       ? "Anaglyph" :
-	        mode == SIM_DISPLAY_OUTPUT_SQUEEZED_SBS   ? "Squeezed SBS" : "Blend");
+	        mode == SIM_DISPLAY_OUTPUT_SQUEEZED_SBS   ? "Squeezed SBS" :
+	        mode == SIM_DISPLAY_OUTPUT_QUAD            ? "Quad" : "Blend");
 
 	*out_xdp = &sdp->base;
 	return XRT_SUCCESS;

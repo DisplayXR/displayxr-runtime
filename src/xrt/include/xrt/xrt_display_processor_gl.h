@@ -29,7 +29,7 @@ extern "C" {
 #endif
 
 // Forward declarations for types used by optional vtable methods.
-struct xrt_eye_pair;
+struct xrt_eye_positions;
 struct xrt_window_metrics;
 
 /*!
@@ -78,7 +78,7 @@ struct xrt_display_processor_gl
 	 * Optional — NULL means not supported.
 	 */
 	bool (*get_predicted_eye_positions)(struct xrt_display_processor_gl *xdp,
-	                                    struct xrt_eye_pair *out_eye_pair);
+	                                    struct xrt_eye_positions *out_eye_pos);
 
 	/*!
 	 * Get window metrics for adaptive FOV calculation.
@@ -149,12 +149,12 @@ xrt_display_processor_gl_process_atlas(struct xrt_display_processor_gl *xdp,
  */
 static inline bool
 xrt_display_processor_gl_get_predicted_eye_positions(struct xrt_display_processor_gl *xdp,
-                                                     struct xrt_eye_pair *out_eye_pair)
+                                                     struct xrt_eye_positions *out_eye_pos)
 {
 	if (xdp == NULL || xdp->get_predicted_eye_positions == NULL) {
 		return false;
 	}
-	return xdp->get_predicted_eye_positions(xdp, out_eye_pair);
+	return xdp->get_predicted_eye_positions(xdp, out_eye_pos);
 }
 
 /*!

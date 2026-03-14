@@ -35,6 +35,7 @@ DEBUG_GET_ONCE_FLOAT_OPTION(sim_display_nominal_z_m, "SIM_DISPLAY_NOMINAL_Z_M", 
 #include "sim_display/shaders/blend.frag.h"
 #include "sim_display/shaders/sbs.frag.h"
 #include "sim_display/shaders/squeezed_sbs.frag.h"
+#include "sim_display/shaders/quad.frag.h"
 
 
 /*!
@@ -45,7 +46,7 @@ struct sim_display_processor
 	struct xrt_display_processor base;
 	struct vk_bundle *vk;
 	VkRenderPass render_pass;
-	VkPipeline pipelines[4];        //!< One per output mode (SBS, anaglyph, blend, squeezed SBS)
+	VkPipeline pipelines[5];        //!< One per output mode (SBS, anaglyph, blend, squeezed SBS, quad)
 	VkPipelineLayout pipeline_layout;
 	VkDescriptorSetLayout desc_layout;
 	VkDescriptorPool desc_pool;
@@ -308,16 +309,17 @@ create_pipeline_resources(struct sim_display_processor *sdp, int32_t target_form
 		const uint32_t *code;
 		size_t size;
 		const char *name;
-	} frag_shaders[4] = {
+	} frag_shaders[5] = {
 	    {sim_display_shaders_sbs_frag, sizeof(sim_display_shaders_sbs_frag), "SBS"},
 	    {sim_display_shaders_anaglyph_frag, sizeof(sim_display_shaders_anaglyph_frag), "Anaglyph"},
 	    {sim_display_shaders_blend_frag, sizeof(sim_display_shaders_blend_frag), "Blend"},
 	    {sim_display_shaders_squeezed_sbs_frag, sizeof(sim_display_shaders_squeezed_sbs_frag), "Squeezed SBS"},
+	    {sim_display_shaders_quad_frag, sizeof(sim_display_shaders_quad_frag), "Quad"},
 	};
 
 	// Create all fragment shader modules upfront (keep alive until all pipelines are created)
-	VkShaderModule frag_modules[4] = {VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
-	for (int i = 0; i < 4; i++) {
+	VkShaderModule frag_modules[5] = {VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE};
+	for (int i = 0; i < 5; i++) {
 		ret = create_shader_module(vk, frag_shaders[i].code, frag_shaders[i].size, &frag_modules[i]);
 		if (ret != VK_SUCCESS) {
 			U_LOG_E("sim_display: Failed to create %s fragment shader: %d", frag_shaders[i].name, ret);
@@ -374,10 +376,10 @@ create_pipeline_resources(struct sim_display_processor *sdp, int32_t target_form
 	    .pDynamicStates = dynamic_states,
 	};
 
-	// Build all 3 pipeline create infos with their own stage arrays
-	VkPipelineShaderStageCreateInfo all_stages[4][2];
-	VkGraphicsPipelineCreateInfo pipeline_infos[4];
-	for (int i = 0; i < 4; i++) {
+	// Build all pipeline create infos with their own stage arrays
+	VkPipelineShaderStageCreateInfo all_stages[5][2];
+	VkGraphicsPipelineCreateInfo pipeline_infos[5];
+	for (int i = 0; i < 5; i++) {
 		all_stages[i][0] = (VkPipelineShaderStageCreateInfo){
 		    .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
 		    .stage = VK_SHADER_STAGE_VERTEX_BIT,
@@ -407,11 +409,11 @@ create_pipeline_resources(struct sim_display_processor *sdp, int32_t target_form
 		};
 	}
 
-	// Create all 3 pipelines in a single batch call
-	ret = vk->vkCreateGraphicsPipelines(vk->device, VK_NULL_HANDLE, 4, pipeline_infos, NULL, sdp->pipelines);
+	// Create all pipelines in a single batch call
+	ret = vk->vkCreateGraphicsPipelines(vk->device, VK_NULL_HANDLE, 5, pipeline_infos, NULL, sdp->pipelines);
 
 	// Destroy all shader modules now that pipelines are created
-	for (int i = 0; i < 4; i++)
+	for (int i = 0; i < 5; i++)
 		vk->vkDestroyShaderModule(vk->device, frag_modules[i], NULL);
 	vk->vkDestroyShaderModule(vk->device, vert_module, NULL);
 
@@ -477,16 +479,29 @@ create_pipeline_resources(struct sim_display_processor *sdp, int32_t target_form
 
 
 static bool
-sim_dp_get_predicted_eye_positions(struct xrt_display_processor *xdp, struct xrt_eye_pair *out_eye_pair)
+sim_dp_get_predicted_eye_positions(struct xrt_display_processor *xdp, struct xrt_eye_positions *out)
 {
 	struct sim_display_processor *sdp = sim_display_processor(xdp);
 	float half_ipd = sdp->ipd_m / 2.0f;
+	uint32_t vc = sim_display_get_view_count();
 
-	out_eye_pair->left = (struct xrt_eye_position){sdp->nominal_x_m - half_ipd, sdp->nominal_y_m, sdp->nominal_z_m};
-	out_eye_pair->right = (struct xrt_eye_position){sdp->nominal_x_m + half_ipd, sdp->nominal_y_m, sdp->nominal_z_m};
-	out_eye_pair->timestamp_ns = os_monotonic_get_ns();
-	out_eye_pair->valid = true;
-	out_eye_pair->is_tracking = false; // Nominal, not real tracking
+	if (vc == 1) {
+		out->eyes[0] = (struct xrt_eye_position){sdp->nominal_x_m, sdp->nominal_y_m, sdp->nominal_z_m};
+		out->count = 1;
+	} else if (vc >= 4) {
+		out->eyes[0] = (struct xrt_eye_position){sdp->nominal_x_m - half_ipd, sdp->nominal_y_m - 0.032f, sdp->nominal_z_m};
+		out->eyes[1] = (struct xrt_eye_position){sdp->nominal_x_m + half_ipd, sdp->nominal_y_m - 0.032f, sdp->nominal_z_m};
+		out->eyes[2] = (struct xrt_eye_position){sdp->nominal_x_m - half_ipd, sdp->nominal_y_m + 0.032f, sdp->nominal_z_m};
+		out->eyes[3] = (struct xrt_eye_position){sdp->nominal_x_m + half_ipd, sdp->nominal_y_m + 0.032f, sdp->nominal_z_m};
+		out->count = 4;
+	} else {
+		out->eyes[0] = (struct xrt_eye_position){sdp->nominal_x_m - half_ipd, sdp->nominal_y_m, sdp->nominal_z_m};
+		out->eyes[1] = (struct xrt_eye_position){sdp->nominal_x_m + half_ipd, sdp->nominal_y_m, sdp->nominal_z_m};
+		out->count = 2;
+	}
+	out->timestamp_ns = os_monotonic_get_ns();
+	out->valid = true;
+	out->is_tracking = false; // Nominal, not real tracking
 	return true;
 }
 
@@ -511,7 +526,7 @@ sim_dp_destroy(struct xrt_display_processor *xdp)
 		if (sdp->sampler != VK_NULL_HANDLE) {
 			vk->vkDestroySampler(vk->device, sdp->sampler, NULL);
 		}
-		for (int i = 0; i < 4; i++) {
+		for (int i = 0; i < 5; i++) {
 			if (sdp->pipelines[i] != VK_NULL_HANDLE) {
 				vk->vkDestroyPipeline(vk->device, sdp->pipelines[i], NULL);
 			}
@@ -580,10 +595,11 @@ sim_display_processor_create(enum sim_display_output_mode mode,
 	// Set the initial output mode (atomic global read by process_atlas each frame)
 	sim_display_set_output_mode(mode);
 
-	U_LOG_W("Created sim display processor (all 4 pipelines), initial mode: %s",
+	U_LOG_W("Created sim display processor (all 5 pipelines), initial mode: %s",
 	        mode == SIM_DISPLAY_OUTPUT_SBS           ? "SBS" :
 	        mode == SIM_DISPLAY_OUTPUT_ANAGLYPH       ? "Anaglyph" :
-	        mode == SIM_DISPLAY_OUTPUT_SQUEEZED_SBS   ? "Squeezed SBS" : "Blend");
+	        mode == SIM_DISPLAY_OUTPUT_SQUEEZED_SBS   ? "Squeezed SBS" :
+	        mode == SIM_DISPLAY_OUTPUT_QUAD            ? "Quad" : "Blend");
 
 	*out_xdp = &sdp->base;
 	return XRT_SUCCESS;

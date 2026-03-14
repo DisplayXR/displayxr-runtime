@@ -1103,22 +1103,22 @@ metal_compositor_update_hud(struct comp_metal_compositor *c, float dt)
 	char fwd_buf[128] = {0};
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
-	struct qwerty_stereo_state ss = {0};
-	bool have_ss = qwerty_get_stereo_state(
+	struct qwerty_view_state ss = {0};
+	bool have_ss = qwerty_get_view_state(
 	    c->xsysd->xdevs, c->xsysd->xdev_count, &ss);
 
 	if (have_ss) {
 		const char *mode_label = ss.camera_mode ? "Camera [P]" : "Display [P]";
 		if (ss.camera_mode) {
 			snprintf(stereo_buf1, sizeof(stereo_buf1),
-			         "%s  IPD/Prlx:%.3f", mode_label, ss.cam_ipd_factor);
+			         "%s  IPD/Prlx:%.3f", mode_label, ss.cam_spread_factor);
 			snprintf(stereo_buf2, sizeof(stereo_buf2),
 			         "Conv:%.2f dp  vFOV:%.1f",
 			         ss.cam_convergence,
 			         atanf(ss.cam_half_tan_vfov) * 2.0f * 57.2958f);
 		} else {
 			snprintf(stereo_buf1, sizeof(stereo_buf1),
-			         "%s  IPD/Prlx:%.3f [Sh+Wh]", mode_label, ss.disp_ipd_factor);
+			         "%s  IPD/Prlx:%.3f [Sh+Wh]", mode_label, ss.disp_spread_factor);
 			snprintf(stereo_buf2, sizeof(stereo_buf2),
 			         "Conv:%.2f dp [Wh]  vFOV:%.1f  Persp*:%.2f",
 			         0.0f, 0.0f, 0.0f);
@@ -1169,8 +1169,8 @@ metal_compositor_update_hud(struct comp_metal_compositor *c, float dt)
 	    "%s\n"
 	    "%s\n"
 	    "\n"
-	    "Mode: %s (%s)  (0-3  V=Cycle)\n"
-	    "TAB=HUD  P=Cam/Disp  ESC=Quit",
+	    "Mode: %s (%s)\n"
+	    "TAB=HUD  V=Mode  P=Cam/Disp  ESC=Quit",
 	    dev_name,
 	    fps, c->smoothed_frame_time_ms,
 	    c->view_width, c->view_height,
@@ -1859,27 +1859,14 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 
 bool
 comp_metal_compositor_get_predicted_eye_positions(struct xrt_compositor *xc,
-                                                  struct xrt_vec3 *out_left_eye,
-                                                  struct xrt_vec3 *out_right_eye)
+                                                  struct xrt_eye_positions *out_eye_pos)
 {
 	struct comp_metal_compositor *c = metal_comp(xc);
 	if (c->display_processor == NULL) {
 		return false;
 	}
 
-	struct xrt_eye_pair pair;
-	if (!xrt_display_processor_metal_get_predicted_eye_positions(c->display_processor, &pair)) {
-		return false;
-	}
-
-	out_left_eye->x = pair.left.x;
-	out_left_eye->y = pair.left.y;
-	out_left_eye->z = pair.left.z;
-	out_right_eye->x = pair.right.x;
-	out_right_eye->y = pair.right.y;
-	out_right_eye->z = pair.right.z;
-
-	return true;
+	return xrt_display_processor_metal_get_predicted_eye_positions(c->display_processor, out_eye_pos);
 }
 
 bool

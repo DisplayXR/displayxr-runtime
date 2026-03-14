@@ -2463,6 +2463,11 @@ struct xrt_system_compositor_info
 	//! Worst-case atlas height across all rendering modes. 0 if unknown.
 	uint32_t atlas_height_pixels;
 
+	//! True when a legacy app (no XR_EXT_display_info) is using a compromise
+	//! view scale that doesn't match the 3D mode's native scale. The compositor
+	//! must scale tiles before passing to the display processor.
+	bool legacy_app_tile_scaling;
+
 	//! Display left edge in OS screen coordinates. 0 if unknown.
 	int32_t display_screen_left;
 

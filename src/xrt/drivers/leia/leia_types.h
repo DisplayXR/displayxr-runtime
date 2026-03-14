@@ -28,11 +28,11 @@ extern "C" {
  * which now resolve to the vendor-neutral xrt_* types.
  *
  * We use #define instead of typedef so that "struct leiasr_eye_pair"
- * expands to "struct xrt_eye_pair" (typedef only creates a type alias,
+ * expands to "struct xrt_eye_positions" (typedef only creates a type alias,
  * not a struct tag).
  */
 #define leiasr_eye_position xrt_eye_position
-#define leiasr_eye_pair xrt_eye_pair
+#define leiasr_eye_pair xrt_eye_positions
 #define leiasr_window_metrics xrt_window_metrics
 
 /*!

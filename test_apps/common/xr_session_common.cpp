@@ -308,6 +308,13 @@ bool PollEvents(XrSessionManager& xr) {
             LOG_WARN("Instance loss pending - requesting exit");
             xr.exitRequested = true;
             break;
+        case (XrStructureType)XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_EXT: {
+            auto* modeEvent = (XrEventDataRenderingModeChangedEXT*)&event;
+            LOG_INFO("Rendering mode changed: %u -> %u",
+                modeEvent->previousModeIndex, modeEvent->currentModeIndex);
+            xr.currentModeIndex = modeEvent->currentModeIndex;
+            break;
+        }
         default:
             LOG_DEBUG("Received event type: %d", event.type);
             break;
@@ -344,16 +351,12 @@ bool BeginFrame(XrSessionManager& xr, XrFrameState& frameState) {
 bool LocateViews(
     XrSessionManager& xr,
     XrTime displayTime,
-    XMMATRIX& leftViewMatrix,
-    XMMATRIX& leftProjMatrix,
-    XMMATRIX& rightViewMatrix,
-    XMMATRIX& rightProjMatrix,
     float playerPosX,
     float playerPosY,
     float playerPosZ,
     float playerYaw,
     float playerPitch,
-    const StereoParams& stereo
+    const ViewParams& viewParams
 ) {
     XrViewLocateInfo locateInfo = {XR_TYPE_VIEW_LOCATE_INFO};
     locateInfo.viewConfigurationType = xr.viewConfigType;
@@ -366,10 +369,14 @@ bool LocateViews(
     XrViewEyeTrackingStateEXT eyeTrackingState = {(XrStructureType)XR_TYPE_VIEW_EYE_TRACKING_STATE_EXT};
     viewState.next = &eyeTrackingState;
 
-    uint32_t viewCount = 2;
-    XrView views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+    uint32_t viewCount = 8;
+    XrView views[8];
+    for (uint32_t i = 0; i < 8; i++) {
+        views[i] = {XR_TYPE_VIEW};
+    }
 
-    XrResult result = xrLocateViews(xr.session, &locateInfo, &viewState, 2, &viewCount, views);
+    XrResult result = xrLocateViews(xr.session, &locateInfo, &viewState, 8, &viewCount, views);
+    xr.viewCount = viewCount;
     if (XR_FAILED(result)) return false;
 
     // Check if views are valid
@@ -378,16 +385,18 @@ bool LocateViews(
         return false;
     }
 
-    // Apply stereo eye factors (IPD + parallax) before player transform.
-    // This modifies eye positions in display space according to stereo params.
+    // Apply view eye factors (IPD + parallax) before player transform.
+    // This modifies eye positions in display space according to view params.
     XrVector3f nominalViewer = {xr.nominalViewerX, xr.nominalViewerY, xr.nominalViewerZ};
-    XrVector3f processedLeft, processedRight;
-    display3d_apply_eye_factors(
-        &views[0].pose.position, &views[1].pose.position,
-        &nominalViewer, stereo.ipdFactor, stereo.parallaxFactor,
-        &processedLeft, &processedRight);
-    views[0].pose.position = processedLeft;
-    views[1].pose.position = processedRight;
+    XrVector3f rawPositions[8], processedPositions[8];
+    for (uint32_t i = 0; i < viewCount; i++)
+        rawPositions[i] = views[i].pose.position;
+    display3d_apply_eye_factors_n(
+        rawPositions, viewCount,
+        &nominalViewer, viewParams.ipdFactor, viewParams.parallaxFactor,
+        processedPositions);
+    for (uint32_t i = 0; i < viewCount; i++)
+        views[i].pose.position = processedPositions[i];
 
     // Apply player transform to XR poses (production-engine locomotion pattern).
     // The reference space stays fixed at the physical tracking origin. We apply the
@@ -399,17 +408,22 @@ bool LocateViews(
 
     // Compute meters-to-virtual conversion factor (must match Kooima projection scaling)
     float m2v = 1.0f;
-    if (stereo.virtualDisplayHeight > 0.0f && xr.displayHeightM > 0.0f)
-        m2v = stereo.virtualDisplayHeight / xr.displayHeightM;
+    if (viewParams.virtualDisplayHeight > 0.0f && xr.displayHeightM > 0.0f)
+        m2v = viewParams.virtualDisplayHeight / xr.displayHeightM;
 
-    for (int i = 0; i < 2; i++) {
+    for (uint32_t i = 0; i < viewCount; i++) {
+        // Store raw eye position for HUD display
+        xr.eyePositions[i][0] = views[i].pose.position.x;
+        xr.eyePositions[i][1] = views[i].pose.position.y;
+        xr.eyePositions[i][2] = views[i].pose.position.z;
+
         // Transform position: worldPos = playerOrientation * (localPos * p * m2v / s) + playerPosition
         // perspectiveFactor, m2v, and scaleFactor all scale the eye position in display space.
         // This must match the Kooima eye scaling so display-plane content stays fixed.
         XMVECTOR localPos = XMVectorSet(
             views[i].pose.position.x, views[i].pose.position.y,
             views[i].pose.position.z, 0.0f);
-        localPos = localPos * stereo.perspectiveFactor * m2v / stereo.scaleFactor;
+        localPos = localPos * viewParams.perspectiveFactor * m2v / viewParams.scaleFactor;
         XMVECTOR worldPos = XMVector3Rotate(localPos, playerOri) + playerPos;
 
         // Transform orientation: worldOri = playerOrientation * localOrientation
@@ -428,11 +442,11 @@ bool LocateViews(
         views[i].pose.orientation = {ori4.x, ori4.y, ori4.z, ori4.w};
     }
 
-    // Convert transformed poses to view matrices
-    leftViewMatrix = XrPoseToViewMatrix(views[0].pose);
-    leftProjMatrix = XrFovToProjectionMatrix(views[0].fov, 0.01f, 100.0f);
-    rightViewMatrix = XrPoseToViewMatrix(views[1].pose);
-    rightProjMatrix = XrFovToProjectionMatrix(views[1].fov, 0.01f, 100.0f);
+    // Convert transformed poses to view/projection matrices (N-view)
+    for (uint32_t i = 0; i < viewCount; i++) {
+        xr.viewMatrices[i] = XrPoseToViewMatrix(views[i].pose);
+        xr.projMatrices[i] = XrFovToProjectionMatrix(views[i].fov, 0.01f, 100.0f);
+    }
 
     xr.isEyeTracking = (eyeTrackingState.isTracking == XR_TRUE);
     xr.activeEyeTrackingMode = (uint32_t)eyeTrackingState.activeMode;

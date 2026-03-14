@@ -145,21 +145,22 @@ do_weave:
 
 static bool
 leia_dp_gl_get_predicted_eye_positions(struct xrt_display_processor_gl *xdp,
-                                        struct xrt_eye_pair *out_eye_pair)
+                                        struct xrt_eye_positions *out_eye_pos)
 {
 	struct leia_display_processor_gl_impl *ldp = leia_dp_gl(xdp);
 	float left[3], right[3];
 	if (!leiasr_gl_get_predicted_eye_positions(ldp->leiasr, left, right)) {
 		return false;
 	}
-	out_eye_pair->left.x = left[0];
-	out_eye_pair->left.y = left[1];
-	out_eye_pair->left.z = left[2];
-	out_eye_pair->right.x = right[0];
-	out_eye_pair->right.y = right[1];
-	out_eye_pair->right.z = right[2];
-	out_eye_pair->valid = true;
-	out_eye_pair->is_tracking = true;
+	out_eye_pos->eyes[0].x = left[0];
+	out_eye_pos->eyes[0].y = left[1];
+	out_eye_pos->eyes[0].z = left[2];
+	out_eye_pos->eyes[1].x = right[0];
+	out_eye_pos->eyes[1].y = right[1];
+	out_eye_pos->eyes[1].z = right[2];
+	out_eye_pos->count = 2;
+	out_eye_pos->valid = true;
+	out_eye_pos->is_tracking = true;
 	return true;
 }
 

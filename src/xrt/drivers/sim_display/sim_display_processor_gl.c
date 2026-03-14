@@ -4,9 +4,9 @@
  * @file
  * @brief  Simulation GL display processor: SBS, anaglyph, alpha-blend output.
  *
- * Implements SBS, anaglyph, and alpha-blend atlas output modes using GLSL
- * shaders compiled at init. All 3 programs are pre-compiled for instant
- * runtime switching via 1/2/3 keys.
+ * Implements SBS, anaglyph, alpha-blend, squeezed SBS, and quad atlas output
+ * modes using GLSL shaders compiled at init. All 5 programs are pre-compiled
+ * for instant runtime switching via 1/2/3/4/5 keys.
  *
  * @author David Fattal
  * @ingroup drv_sim_display
@@ -121,6 +121,29 @@ static const char *FS_SQUEEZED_SBS =
     "    fragColor = texture(u_texture, vec2(src_u, src_v));\n"
     "}\n";
 
+//! Quad: 2x2 grid — TL=view0, TR=view1, BL=view2, BR=view3.
+static const char *FS_QUAD =
+    "#version 330 core\n"
+    "in vec2 v_uv;\n"
+    "out vec4 fragColor;\n"
+    "uniform sampler2D u_texture;\n"
+    "uniform float u_tile_cols_inv;\n"
+    "uniform float u_tile_rows_inv;\n"
+    "uniform float u_tile_cols;\n"
+    "uniform float u_tile_rows;\n"
+    "void main() {\n"
+    "    float col_idx = (v_uv.x < 0.5) ? 0.0 : 1.0;\n"
+    "    float row_idx = (v_uv.y < 0.5) ? 0.0 : 1.0;\n"
+    "    float view_index = row_idx * 2.0 + col_idx;\n"
+    "    float local_u = fract(v_uv.x * 2.0);\n"
+    "    float local_v = fract(v_uv.y * 2.0);\n"
+    "    float col = mod(view_index, u_tile_cols);\n"
+    "    float row = floor(view_index / u_tile_cols);\n"
+    "    float atlas_u = (local_u + col) * u_tile_cols_inv;\n"
+    "    float atlas_v = (local_v + row) * u_tile_rows_inv;\n"
+    "    fragColor = texture(u_texture, vec2(atlas_u, atlas_v));\n"
+    "}\n";
+
 //! 50/50 blend.
 static const char *FS_BLEND =
     "#version 330 core\n"
@@ -148,7 +171,7 @@ static const char *FS_BLEND =
 struct sim_display_processor_gl
 {
 	struct xrt_display_processor_gl base;
-	GLuint programs[4]; //!< One per output mode (SBS, anaglyph, blend, squeezed SBS)
+	GLuint programs[5]; //!< One per output mode (SBS, anaglyph, blend, squeezed SBS, quad)
 	GLuint vao_empty;   //!< Empty VAO for vertex-shader-generated fullscreen triangle
 
 	//! Nominal viewer parameters for faked eye positions.
@@ -227,16 +250,29 @@ sim_dp_gl_process_atlas(struct xrt_display_processor_gl *xdp,
 
 static bool
 sim_dp_gl_get_predicted_eye_positions(struct xrt_display_processor_gl *xdp,
-                                       struct xrt_eye_pair *out_eye_pair)
+                                       struct xrt_eye_positions *out)
 {
 	struct sim_display_processor_gl *sdp = sim_dp_gl(xdp);
 	float half_ipd = sdp->ipd_m / 2.0f;
+	uint32_t vc = sim_display_get_view_count();
 
-	out_eye_pair->left = (struct xrt_eye_position){sdp->nominal_x_m - half_ipd, sdp->nominal_y_m, sdp->nominal_z_m};
-	out_eye_pair->right = (struct xrt_eye_position){sdp->nominal_x_m + half_ipd, sdp->nominal_y_m, sdp->nominal_z_m};
-	out_eye_pair->timestamp_ns = os_monotonic_get_ns();
-	out_eye_pair->valid = true;
-	out_eye_pair->is_tracking = false; // Nominal, not real tracking
+	if (vc == 1) {
+		out->eyes[0] = (struct xrt_eye_position){sdp->nominal_x_m, sdp->nominal_y_m, sdp->nominal_z_m};
+		out->count = 1;
+	} else if (vc >= 4) {
+		out->eyes[0] = (struct xrt_eye_position){sdp->nominal_x_m - half_ipd, sdp->nominal_y_m - 0.032f, sdp->nominal_z_m};
+		out->eyes[1] = (struct xrt_eye_position){sdp->nominal_x_m + half_ipd, sdp->nominal_y_m - 0.032f, sdp->nominal_z_m};
+		out->eyes[2] = (struct xrt_eye_position){sdp->nominal_x_m - half_ipd, sdp->nominal_y_m + 0.032f, sdp->nominal_z_m};
+		out->eyes[3] = (struct xrt_eye_position){sdp->nominal_x_m + half_ipd, sdp->nominal_y_m + 0.032f, sdp->nominal_z_m};
+		out->count = 4;
+	} else {
+		out->eyes[0] = (struct xrt_eye_position){sdp->nominal_x_m - half_ipd, sdp->nominal_y_m, sdp->nominal_z_m};
+		out->eyes[1] = (struct xrt_eye_position){sdp->nominal_x_m + half_ipd, sdp->nominal_y_m, sdp->nominal_z_m};
+		out->count = 2;
+	}
+	out->timestamp_ns = os_monotonic_get_ns();
+	out->valid = true;
+	out->is_tracking = false; // Nominal, not real tracking
 	return true;
 }
 
@@ -245,7 +281,7 @@ sim_dp_gl_destroy(struct xrt_display_processor_gl *xdp)
 {
 	struct sim_display_processor_gl *sdp = sim_dp_gl(xdp);
 
-	for (int i = 0; i < 4; i++) {
+	for (int i = 0; i < 5; i++) {
 		if (sdp->programs[i] != 0) {
 			glDeleteProgram(sdp->programs[i]);
 		}
@@ -348,11 +384,11 @@ sim_display_processor_gl_create(enum sim_display_output_mode mode,
 	sdp->nominal_y_m = 0.1f;
 	sdp->nominal_z_m = debug_get_float_option_sim_display_nominal_z_m_gl();
 
-	// Compile all 3 shader programs for instant runtime switching
-	const char *fs_sources[4] = {FS_SBS, FS_ANAGLYPH, FS_BLEND, FS_SQUEEZED_SBS};
-	const char *mode_names[4] = {"SBS", "Anaglyph", "Blend", "Squeezed SBS"};
+	// Compile all 5 shader programs for instant runtime switching
+	const char *fs_sources[5] = {FS_SBS, FS_ANAGLYPH, FS_BLEND, FS_SQUEEZED_SBS, FS_QUAD};
+	const char *mode_names[5] = {"SBS", "Anaglyph", "Blend", "Squeezed SBS", "Quad"};
 
-	for (int i = 0; i < 4; i++) {
+	for (int i = 0; i < 5; i++) {
 		sdp->programs[i] = create_program(VS_FULLSCREEN, fs_sources[i]);
 		if (sdp->programs[i] == 0) {
 			U_LOG_E("sim_display GL: failed to create %s program", mode_names[i]);
@@ -367,10 +403,11 @@ sim_display_processor_gl_create(enum sim_display_output_mode mode,
 	// Set the initial output mode (atomic global read by process_atlas each frame)
 	sim_display_set_output_mode(mode);
 
-	U_LOG_W("Created sim display GL processor (all 4 shaders), initial mode: %s",
+	U_LOG_W("Created sim display GL processor (all 5 shaders), initial mode: %s",
 	        mode == SIM_DISPLAY_OUTPUT_SBS           ? "SBS" :
 	        mode == SIM_DISPLAY_OUTPUT_ANAGLYPH       ? "Anaglyph" :
-	        mode == SIM_DISPLAY_OUTPUT_SQUEEZED_SBS   ? "Squeezed SBS" : "Blend");
+	        mode == SIM_DISPLAY_OUTPUT_SQUEEZED_SBS   ? "Squeezed SBS" :
+	        mode == SIM_DISPLAY_OUTPUT_QUAD            ? "Quad" : "Blend");
 
 	*out_xdp = &sdp->base;
 	return XRT_SUCCESS;

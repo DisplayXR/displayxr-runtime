@@ -393,14 +393,14 @@ leiasr_weave(struct leiasr *leiasr,
 }
 
 bool
-leiasr_get_predicted_eye_positions(struct leiasr *leiasr, struct leiasr_eye_pair *out_eye_pair)
+leiasr_get_predicted_eye_positions(struct leiasr *leiasr, struct leiasr_eye_pair *out_eye_pos)
 {
-	if (leiasr == nullptr || out_eye_pair == nullptr) {
+	if (leiasr == nullptr || out_eye_pos == nullptr) {
 		return false;
 	}
 
 	if (leiasr->weaver == nullptr) {
-		out_eye_pair->valid = false;
+		out_eye_pos->valid = false;
 		return false;
 	}
 
@@ -410,14 +410,15 @@ leiasr_get_predicted_eye_positions(struct leiasr *leiasr, struct leiasr_eye_pair
 	leiasr->weaver->getPredictedEyePositions(leftEye, rightEye);
 
 	// Convert from millimeters to meters
-	out_eye_pair->left.x = leftEye[0] / 1000.0f;
-	out_eye_pair->left.y = leftEye[1] / 1000.0f;
-	out_eye_pair->left.z = leftEye[2] / 1000.0f;
-	out_eye_pair->right.x = rightEye[0] / 1000.0f;
-	out_eye_pair->right.y = rightEye[1] / 1000.0f;
-	out_eye_pair->right.z = rightEye[2] / 1000.0f;
-	out_eye_pair->timestamp_ns = os_monotonic_get_ns();
-	out_eye_pair->valid = true;
+	out_eye_pos->eyes[0].x = leftEye[0] / 1000.0f;
+	out_eye_pos->eyes[0].y = leftEye[1] / 1000.0f;
+	out_eye_pos->eyes[0].z = leftEye[2] / 1000.0f;
+	out_eye_pos->eyes[1].x = rightEye[0] / 1000.0f;
+	out_eye_pos->eyes[1].y = rightEye[1] / 1000.0f;
+	out_eye_pos->eyes[1].z = rightEye[2] / 1000.0f;
+	out_eye_pos->count = 2;
+	out_eye_pos->timestamp_ns = os_monotonic_get_ns();
+	out_eye_pos->valid = true;
 
 	// Heuristic: when SR SDK loses tracking, eye positions collapse to a single point.
 	// Detect this by checking if inter-eye distance is near zero.
@@ -425,7 +426,7 @@ leiasr_get_predicted_eye_positions(struct leiasr *leiasr, struct leiasr_eye_pair
 	float dy = rightEye[1] - leftEye[1];
 	float dz = rightEye[2] - leftEye[2];
 	float dist_sq = dx * dx + dy * dy + dz * dz;
-	out_eye_pair->is_tracking = (dist_sq > 1e-6f);
+	out_eye_pos->is_tracking = (dist_sq > 1e-6f);
 
 	return true;
 }

@@ -430,7 +430,7 @@ qwerty_process_macos(struct xrt_device **xdevs,
 		// Spacebar = reset stereo to camera defaults (HMD focused only)
 		case kVK_Space:
 			if (is_down && ![event isARepeat] && qsys->hmd_focused)
-				qwerty_reset_stereo(qsys);
+				qwerty_reset_view_state(qsys);
 			break;
 
 		default:
@@ -508,7 +508,7 @@ qwerty_process_macos(struct xrt_device **xdevs,
 				NSUInteger flags = [event modifierFlags];
 				if (flags & NSEventModifierFlagShift) {
 					float mult = (delta_y > 0) ? 1.1f : (1.0f / 1.1f);
-					qwerty_adjust_stereo_factor(qsys, mult);
+					qwerty_adjust_view_factor(qsys, mult);
 				} else if (qsys->camera_mode) {
 					qwerty_adjust_convergence(qsys, (delta_y > 0) ? 1.0f : -1.0f);
 				} else {

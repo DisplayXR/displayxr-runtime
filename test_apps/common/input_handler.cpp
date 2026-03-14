@@ -110,16 +110,16 @@ bool UpdateInputState(InputState& state, UINT msg, WPARAM wParam, LPARAM lParam)
         float factor = (zDelta > 0) ? 1.1f : (1.0f / 1.1f);
         bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
         if (shift) {
-            state.stereo.ipdFactor *= factor;
-            if (state.stereo.ipdFactor < 0.0f) state.stereo.ipdFactor = 0.0f;
-            if (state.stereo.ipdFactor > 1.0f) state.stereo.ipdFactor = 1.0f;
-            state.stereo.parallaxFactor *= factor;
-            if (state.stereo.parallaxFactor < 0.0f) state.stereo.parallaxFactor = 0.0f;
-            if (state.stereo.parallaxFactor > 1.0f) state.stereo.parallaxFactor = 1.0f;
+            state.viewParams.ipdFactor *= factor;
+            if (state.viewParams.ipdFactor < 0.0f) state.viewParams.ipdFactor = 0.0f;
+            if (state.viewParams.ipdFactor > 1.0f) state.viewParams.ipdFactor = 1.0f;
+            state.viewParams.parallaxFactor *= factor;
+            if (state.viewParams.parallaxFactor < 0.0f) state.viewParams.parallaxFactor = 0.0f;
+            if (state.viewParams.parallaxFactor > 1.0f) state.viewParams.parallaxFactor = 1.0f;
         } else {
-            state.stereo.scaleFactor *= factor;
-            if (state.stereo.scaleFactor < 0.1f) state.stereo.scaleFactor = 0.1f;
-            if (state.stereo.scaleFactor > 10.0f) state.stereo.scaleFactor = 10.0f;
+            state.viewParams.scaleFactor *= factor;
+            if (state.viewParams.scaleFactor < 0.1f) state.viewParams.scaleFactor = 0.1f;
+            if (state.viewParams.scaleFactor > 10.0f) state.viewParams.scaleFactor = 10.0f;
         }
         return true;
     }
@@ -202,8 +202,8 @@ bool UpdateInputState(InputState& state, UINT msg, WPARAM wParam, LPARAM lParam)
                 state.yaw = 0.0f;
                 state.pitch = 0.0f;
                 if (state.nominalViewerZ > 0.0f)
-                    state.stereo.invConvergenceDistance = 1.0f / state.nominalViewerZ;
-                state.stereo.zoomFactor = 1.0f;
+                    state.viewParams.invConvergenceDistance = 1.0f / state.nominalViewerZ;
+                state.viewParams.zoomFactor = 1.0f;
             } else {
                 state.cameraPosX = 0.0f;
                 state.cameraPosY = 0.0f;
@@ -237,17 +237,17 @@ void UpdateCameraMovement(InputState& state, float deltaTime, float displayHeigh
     if (state.resetViewRequested) {
         state.yaw = 0.0f;
         state.pitch = 0.0f;
-        float savedVDH = state.stereo.virtualDisplayHeight;
+        float savedVDH = state.viewParams.virtualDisplayHeight;
         bool savedCameraMode = state.cameraMode;
-        state.stereo = StereoParams{};
-        state.stereo.virtualDisplayHeight = savedVDH;
+        state.viewParams = ViewParams{};
+        state.viewParams.virtualDisplayHeight = savedVDH;
         state.cameraMode = savedCameraMode;
         if (state.cameraMode) {
             state.cameraPosX = 0.0f;
             state.cameraPosY = 0.0f;
             state.cameraPosZ = state.nominalViewerZ;
             if (state.nominalViewerZ > 0.0f)
-                state.stereo.invConvergenceDistance = 1.0f / state.nominalViewerZ;
+                state.viewParams.invConvergenceDistance = 1.0f / state.nominalViewerZ;
         } else {
             state.cameraPosX = 0.0f;
             state.cameraPosY = 0.0f;
@@ -260,10 +260,10 @@ void UpdateCameraMovement(InputState& state, float deltaTime, float displayHeigh
 
     // Meters-to-virtual conversion (matches Kooima projection scaling)
     float m2v = 1.0f;
-    if (state.stereo.virtualDisplayHeight > 0.0f && displayHeightM > 0.0f)
-        m2v = state.stereo.virtualDisplayHeight / displayHeightM;
+    if (state.viewParams.virtualDisplayHeight > 0.0f && displayHeightM > 0.0f)
+        m2v = state.viewParams.virtualDisplayHeight / displayHeightM;
 
-    const float moveSpeed = 0.1f * m2v / state.stereo.scaleFactor; // Virtual units per second, scaled with zoom
+    const float moveSpeed = 0.1f * m2v / state.viewParams.scaleFactor; // Virtual units per second, scaled with zoom
 
     // Build orientation quaternion using the same function as LocateViews,
     // guaranteeing movement vectors match the view rotation exactly.

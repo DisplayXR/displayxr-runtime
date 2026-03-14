@@ -2,13 +2,14 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  Camera-centric stereo view math for 3D displays
+ * @brief  Camera-centric multiview math for 3D displays
  *
  * Canonical implementation — see camera3d_view.h for API docs.
  */
 
 #include "camera3d_view.h"
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 // ============================================================================
@@ -144,7 +145,7 @@ camera3d_compute_view(const XrVector3f *processed_eye,
                       const XrPosef *camera_pose,
                       float near_z,
                       float far_z,
-                      Camera3DStereoView *out)
+                      Camera3DView *out)
 {
 	Camera3DTunables t = tunables ? *tunables : camera3d_default_tunables();
 
@@ -201,16 +202,15 @@ camera3d_compute_view(const XrVector3f *processed_eye,
 }
 
 void
-camera3d_compute_stereo_views(const XrVector3f *raw_left,
-                              const XrVector3f *raw_right,
+camera3d_compute_views(const XrVector3f *raw_eyes,
+                              uint32_t count,
                               const XrVector3f *nominal_viewer,
                               const Display3DScreen *screen,
                               const Camera3DTunables *tunables,
                               const XrPosef *camera_pose,
                               float near_z,
                               float far_z,
-                              Camera3DStereoView *out_left,
-                              Camera3DStereoView *out_right)
+                              Camera3DView *out_views)
 {
 	Camera3DTunables t = tunables ? *tunables : camera3d_default_tunables();
 
@@ -219,17 +219,19 @@ camera3d_compute_stereo_views(const XrVector3f *raw_left,
 		nom_z = nominal_viewer->z;
 	}
 
-	// Apply IPD and parallax factors (2-eye path)
-	XrVector3f raw[2] = {*raw_left, *raw_right};
-	XrVector3f processed[2];
-	display3d_apply_eye_factors_n(raw, 2, nominal_viewer,
+	// Apply IPD and parallax factors (N-view path)
+	XrVector3f stack_processed[8];
+	XrVector3f *processed = (count <= 8) ? stack_processed : (XrVector3f *)malloc(count * sizeof(XrVector3f));
+	display3d_apply_eye_factors_n(raw_eyes, count, nominal_viewer,
 	                              t.ipd_factor, t.parallax_factor,
 	                              processed);
 
-	// Compute each eye via single-eye primitive
-	Camera3DStereoView *outputs[2] = {out_left, out_right};
-	for (int i = 0; i < 2; i++) {
+	// Compute each view via single-eye primitive
+	for (uint32_t i = 0; i < count; i++) {
 		camera3d_compute_view(&processed[i], nom_z, screen, &t,
-		                      camera_pose, near_z, far_z, outputs[i]);
+		                      camera_pose, near_z, far_z, &out_views[i]);
 	}
+
+	if (count > 8)
+		free(processed);
 }

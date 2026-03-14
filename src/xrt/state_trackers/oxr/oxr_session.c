@@ -134,125 +134,42 @@ to_string(XrSessionState state)
  * Returns false if eye tracking is not available.
  */
 static bool
-oxr_session_get_predicted_eye_positions(struct oxr_session *sess, struct xrt_eye_pair *out_eye_pair)
+oxr_session_get_predicted_eye_positions(struct oxr_session *sess, struct xrt_eye_positions *out_eye_pos)
 {
-	if (sess == NULL || sess->xcn == NULL || out_eye_pair == NULL) {
+	if (sess == NULL || sess->xcn == NULL || out_eye_pos == NULL) {
 		return false;
 	}
 
-#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
-	// D3D11 native compositor path
-	if (sess->is_d3d11_native_compositor) {
-		struct xrt_vec3 left_eye, right_eye;
-		bool got_positions =
-		    comp_d3d11_compositor_get_predicted_eye_positions(&sess->xcn->base, &left_eye, &right_eye);
+	// Each compositor now passes xrt_eye_positions through directly from the
+	// display processor — no left/right decomposition, N-view aware.
 
-		if (got_positions) {
-			out_eye_pair->left = (struct xrt_eye_position){left_eye.x, left_eye.y, left_eye.z};
-			out_eye_pair->right = (struct xrt_eye_position){right_eye.x, right_eye.y, right_eye.z};
-			out_eye_pair->timestamp_ns = os_monotonic_get_ns();
-			out_eye_pair->valid = true;
-			// Heuristic: collapsed eye positions = tracking lost
-			float dx = right_eye.x - left_eye.x;
-			float dy = right_eye.y - left_eye.y;
-			float dz = right_eye.z - left_eye.z;
-			float dist_sq = dx * dx + dy * dy + dz * dz;
-			out_eye_pair->is_tracking = (dist_sq > 1e-6f);
-			return true;
-		}
-		return false;
+#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
+	if (sess->is_d3d11_native_compositor) {
+		return comp_d3d11_compositor_get_predicted_eye_positions(&sess->xcn->base, out_eye_pos);
 	}
 #endif
 
 #ifdef XRT_HAVE_D3D12_NATIVE_COMPOSITOR
-	// D3D12 native compositor path
 	if (sess->is_d3d12_native_compositor) {
-		struct xrt_vec3 left_eye, right_eye;
-		bool got_positions =
-		    comp_d3d12_compositor_get_predicted_eye_positions(&sess->xcn->base, &left_eye, &right_eye);
-
-		if (got_positions) {
-			out_eye_pair->left = (struct xrt_eye_position){left_eye.x, left_eye.y, left_eye.z};
-			out_eye_pair->right = (struct xrt_eye_position){right_eye.x, right_eye.y, right_eye.z};
-			out_eye_pair->timestamp_ns = os_monotonic_get_ns();
-			out_eye_pair->valid = true;
-			float dx = right_eye.x - left_eye.x;
-			float dy = right_eye.y - left_eye.y;
-			float dz = right_eye.z - left_eye.z;
-			float dist_sq = dx * dx + dy * dy + dz * dz;
-			out_eye_pair->is_tracking = (dist_sq > 1e-6f);
-			return true;
-		}
-		return false;
+		return comp_d3d12_compositor_get_predicted_eye_positions(&sess->xcn->base, out_eye_pos);
 	}
 #endif
 
 #ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR
-	// Metal native compositor path
 	if (sess->is_metal_native_compositor) {
-		struct xrt_vec3 left_eye, right_eye;
-		bool got_positions =
-		    comp_metal_compositor_get_predicted_eye_positions(&sess->xcn->base, &left_eye, &right_eye);
-
-		if (got_positions) {
-			out_eye_pair->left = (struct xrt_eye_position){left_eye.x, left_eye.y, left_eye.z};
-			out_eye_pair->right = (struct xrt_eye_position){right_eye.x, right_eye.y, right_eye.z};
-			out_eye_pair->timestamp_ns = os_monotonic_get_ns();
-			out_eye_pair->valid = true;
-			float dx = right_eye.x - left_eye.x;
-			float dy = right_eye.y - left_eye.y;
-			float dz = right_eye.z - left_eye.z;
-			float dist_sq = dx * dx + dy * dy + dz * dz;
-			out_eye_pair->is_tracking = (dist_sq > 1e-6f);
-			return true;
-		}
-		return false;
+		return comp_metal_compositor_get_predicted_eye_positions(&sess->xcn->base, out_eye_pos);
 	}
 #endif
 
 #ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
-	// VK native compositor path
 	if (sess->is_vk_native_compositor) {
-		struct xrt_vec3 left_eye, right_eye;
-		bool got_positions =
-		    comp_vk_native_compositor_get_predicted_eye_positions(&sess->xcn->base, &left_eye, &right_eye);
-
-		if (got_positions) {
-			out_eye_pair->left = (struct xrt_eye_position){left_eye.x, left_eye.y, left_eye.z};
-			out_eye_pair->right = (struct xrt_eye_position){right_eye.x, right_eye.y, right_eye.z};
-			out_eye_pair->timestamp_ns = os_monotonic_get_ns();
-			out_eye_pair->valid = true;
-			float dx = right_eye.x - left_eye.x;
-			float dy = right_eye.y - left_eye.y;
-			float dz = right_eye.z - left_eye.z;
-			float dist_sq = dx * dx + dy * dy + dz * dz;
-			out_eye_pair->is_tracking = (dist_sq > 1e-6f);
-			return true;
-		}
-		return false;
+		return comp_vk_native_compositor_get_predicted_eye_positions(&sess->xcn->base, out_eye_pos);
 	}
 #endif
 
 #ifdef XRT_HAVE_GL_NATIVE_COMPOSITOR
-	// GL native compositor path
 	if (sess->is_gl_native_compositor) {
-		struct xrt_vec3 left_eye, right_eye;
-		bool got_positions =
-		    comp_gl_compositor_get_predicted_eye_positions(&sess->xcn->base, &left_eye, &right_eye);
-
-		if (got_positions) {
-			out_eye_pair->left = (struct xrt_eye_position){left_eye.x, left_eye.y, left_eye.z};
-			out_eye_pair->right = (struct xrt_eye_position){right_eye.x, right_eye.y, right_eye.z};
-			out_eye_pair->timestamp_ns = os_monotonic_get_ns();
-			out_eye_pair->valid = true;
-			float dx = right_eye.x - left_eye.x;
-			float dy = right_eye.y - left_eye.y;
-			float dz = right_eye.z - left_eye.z;
-			float dist_sq = dx * dx + dy * dy + dz * dz;
-			out_eye_pair->is_tracking = (dist_sq > 1e-6f);
-			return true;
-		}
-		return false;
+		return comp_gl_compositor_get_predicted_eye_positions(&sess->xcn->base, out_eye_pos);
 	}
 #endif
 
@@ -261,7 +178,7 @@ oxr_session_get_predicted_eye_positions(struct oxr_session *sess, struct xrt_eye
 	// xmcc is only non-NULL for in-process multi_system_compositor.
 	if (sess->sys->xsysc->xmcc != NULL) {
 		struct multi_compositor *mc = multi_compositor(&sess->xcn->base);
-		return multi_compositor_get_predicted_eye_positions(mc, out_eye_pair);
+		return multi_compositor_get_predicted_eye_positions(mc, out_eye_pos);
 	}
 	return false;
 }
@@ -864,9 +781,11 @@ oxr_session_poll(struct oxr_logger *log, struct oxr_session *sess)
 	// require periodic run loop processing for the Window Server to
 	// commit rendered content to the screen. This is the only place
 	// where the app's main thread calls into the runtime each frame.
-	extern void oxr_macos_pump_events(struct xrt_device **xdevs, uint32_t xdev_count, struct xrt_device *head);
+	extern void oxr_macos_pump_events(struct xrt_device **xdevs, uint32_t xdev_count, struct xrt_device *head,
+	                                  bool legacy_app);
 	struct xrt_device *head_dev = GET_XDEV_BY_ROLE(sess->sys, head);
-	oxr_macos_pump_events(sess->sys->xsysd->xdevs, sess->sys->xsysd->xdev_count, head_dev);
+	bool legacy = sess->sys->xsysc != NULL && sess->sys->xsysc->info.legacy_app_tile_scaling;
+	oxr_macos_pump_events(sess->sys->xsysd->xdevs, sess->sys->xsysd->xdev_count, head_dev, legacy);
 
 	// Check if macOS window was closed (close button or Escape key).
 	// For the Vulkan multi compositor this is also handled via
@@ -1104,6 +1023,14 @@ oxr_session_locate_views(struct oxr_logger *log,
 	struct oxr_space *baseSpc = XRT_CAST_OXR_HANDLE_TO_PTR(struct oxr_space *, viewLocateInfo->space);
 	uint32_t view_count = xdev->hmd->view_count;
 
+	// Active rendering mode's view count — controls mono vs stereo eye assignment.
+	// view_count is the max across all modes (always returned to the app),
+	// but active_view_count reflects the current mode (e.g., 1 for 2D, 2 for stereo).
+	uint32_t active_mode_idx = xdev->hmd->active_rendering_mode_index;
+	uint32_t active_view_count = (active_mode_idx < xdev->rendering_mode_count)
+	    ? xdev->rendering_modes[active_mode_idx].view_count
+	    : view_count;
+
 	// Start two call handling.
 	if (viewCountOutput != NULL) {
 		*viewCountOutput = view_count;
@@ -1143,7 +1070,7 @@ oxr_session_locate_views(struct oxr_logger *log,
 	struct xrt_pose poses[XRT_MAX_VIEWS] = {0};
 
 	// Eye pair and tracking state (vendor-neutral types)
-	struct xrt_eye_pair eye_pair = {0};
+	struct xrt_eye_positions eye_pos = {0};
 	bool have_kooima_fov = false;
 
 	// Throttled logging for display/Kooima diagnostics
@@ -1154,24 +1081,24 @@ oxr_session_locate_views(struct oxr_logger *log,
 	struct xrt_vec3 world_head_pos = {0.0f, 1.6f, 0.0f};  // Default: standing height
 	struct xrt_quat world_head_ori = XRT_QUAT_IDENTITY;
 
-	// Stereo view override: when set, view poses use these world-space eye positions
-	bool have_stereo_eye_override = false;
-	struct xrt_vec3 stereo_eye_world[2] = {{0}};
+	// View override: when set, view poses use these world-space eye positions
+	bool have_eye_override = false;
+	struct xrt_vec3 view_eye_world[XRT_MAX_VIEWS] = {{0}};
 #ifdef XRT_BUILD_DRIVER_QWERTY
-	struct qwerty_stereo_state stereo_state = {0};
-	bool have_stereo_state = qwerty_get_stereo_state(
-	    sess->sys->xsysd->xdevs, sess->sys->xsysd->xdev_count, &stereo_state);
+	struct qwerty_view_state view_state = {0};
+	bool have_view_state = qwerty_get_view_state(
+	    sess->sys->xsysd->xdevs, sess->sys->xsysd->xdev_count, &view_state);
 	if (should_log) {
-		U_LOG_I("STEREO STATE: have=%d cam=%d cam_ipd=%.3f cam_conv=%.2f disp_ipd=%.3f disp_vH=%.2f",
-		        have_stereo_state, stereo_state.camera_mode,
-		        stereo_state.cam_ipd_factor, stereo_state.cam_convergence,
-		        stereo_state.disp_ipd_factor, stereo_state.disp_vHeight);
+		U_LOG_I("VIEW STATE: have=%d cam=%d spread=%.3f conv=%.2f disp_spread=%.3f disp_vH=%.2f",
+		        have_view_state, view_state.camera_mode,
+		        view_state.cam_spread_factor, view_state.cam_convergence,
+		        view_state.disp_spread_factor, view_state.disp_vHeight);
 	}
 #else
-	struct { bool camera_mode; float cam_ipd_factor, cam_parallax_factor, cam_convergence,
-	         cam_half_tan_vfov, disp_ipd_factor, disp_parallax_factor, disp_vHeight,
-	         nominal_viewer_z, screen_height_m; } stereo_state = {0};
-	bool have_stereo_state = false;
+	struct { bool camera_mode; float cam_spread_factor, cam_parallax_factor, cam_convergence,
+	         cam_half_tan_vfov, disp_spread_factor, disp_parallax_factor, disp_vHeight,
+	         nominal_viewer_z, screen_height_m; } view_state = {0};
+	bool have_view_state = false;
 #endif
 
 	// Query eye tracking (vendor-neutral — returns false if no backend available).
@@ -1179,16 +1106,16 @@ oxr_session_locate_views(struct oxr_logger *log,
 	// checks xmcc != NULL before casting to multi_compositor, so IPC proxies
 	// are handled safely (returns false). In IPC mode, the server handles
 	// eye tracking via ipc_try_get_sr_view_poses.
-	bool got_eye_positions = oxr_session_get_predicted_eye_positions(sess, &eye_pair);
+	bool got_eye_positions = oxr_session_get_predicted_eye_positions(sess, &eye_pos);
 
 	if (should_log) {
 		U_LOG_I("Eye tracking: got_positions=%d, valid=%d, is_d3d11=%d, is_d3d12=%d, is_metal=%d",
-		        got_eye_positions, eye_pair.valid, sess->is_d3d11_native_compositor,
+		        got_eye_positions, eye_pos.valid, sess->is_d3d11_native_compositor,
 		        sess->is_d3d12_native_compositor, sess->is_metal_native_compositor);
 		if (got_eye_positions) {
 			U_LOG_I("  left=(%.3f,%.3f,%.3f) right=(%.3f,%.3f,%.3f)",
-			        eye_pair.left.x, eye_pair.left.y, eye_pair.left.z,
-			        eye_pair.right.x, eye_pair.right.y, eye_pair.right.z);
+			        eye_pos.eyes[0].x, eye_pos.eyes[0].y, eye_pos.eyes[0].z,
+			        eye_pos.eyes[1].x, eye_pos.eyes[1].y, eye_pos.eyes[1].z);
 		}
 	}
 
@@ -1206,19 +1133,21 @@ oxr_session_locate_views(struct oxr_logger *log,
 		}
 	}
 
-	bool have_eyes = got_eye_positions && eye_pair.valid;
+	bool have_eyes = got_eye_positions && eye_pos.valid;
 
 	// Kooima FOV computation (vendor-neutral)
 	// Works with either tracked eye positions or nominal viewer position
 	{
-		struct xrt_eye_position adj_left = {0};
-		struct xrt_eye_position adj_right = {0};
+		struct xrt_eye_position adj_eyes[XRT_MAX_VIEWS] = {{0}};
+		uint32_t eye_count = 0;
 		bool have_eye_positions = false;
 
 		if (have_eyes) {
 			// Tracked eyes (from eye tracking SDK)
-			adj_left = eye_pair.left;
-			adj_right = eye_pair.right;
+			eye_count = eye_pos.count;
+			for (uint32_t ei = 0; ei < eye_count && ei < XRT_MAX_VIEWS; ei++) {
+				adj_eyes[ei] = eye_pos.eyes[ei];
+			}
 			have_eye_positions = true;
 		} else {
 			// Nominal viewer from system compositor info (sim_display, etc.)
@@ -1227,15 +1156,16 @@ oxr_session_locate_views(struct oxr_logger *log,
 			        sinfo->nominal_viewer_y_m, sinfo->nominal_viewer_z_m);
 			if (sinfo->nominal_viewer_z_m > 0.0f) {
 				float ipd_m = sess->ipd_meters;
-				adj_left = (struct xrt_eye_position){
+				eye_count = 2;
+				adj_eyes[0] = (struct xrt_eye_position){
 				    -ipd_m / 2.0f, sinfo->nominal_viewer_y_m, sinfo->nominal_viewer_z_m};
-				adj_right = (struct xrt_eye_position){
+				adj_eyes[1] = (struct xrt_eye_position){
 				    ipd_m / 2.0f, sinfo->nominal_viewer_y_m, sinfo->nominal_viewer_z_m};
 				have_eye_positions = true;
 				if (should_log) {
-					U_LOG_I("Nominal eyes: L=(%.4f,%.4f,%.4f) R=(%.4f,%.4f,%.4f), IPD=%.1fmm",
-					        adj_left.x, adj_left.y, adj_left.z,
-					        adj_right.x, adj_right.y, adj_right.z,
+					U_LOG_I("Nominal eyes: [0]=(%.4f,%.4f,%.4f) [1]=(%.4f,%.4f,%.4f), IPD=%.1fmm",
+					        adj_eyes[0].x, adj_eyes[0].y, adj_eyes[0].z,
+					        adj_eyes[1].x, adj_eyes[1].y, adj_eyes[1].z,
 					        ipd_m * 1000.0f);
 				}
 			}
@@ -1270,72 +1200,74 @@ oxr_session_locate_views(struct oxr_logger *log,
 			}
 
 			if (should_log) {
-					U_LOG_I("KOOIMA GATE: have_eyes=%d screen=%.4fx%.4f have_stereo=%d cam=%d ext_win=%d",
+					U_LOG_I("KOOIMA GATE: have_eyes=%d screen=%.4fx%.4f have_view=%d cam=%d ext_win=%d",
 					        have_eye_positions, screen_width_m, screen_height_m,
-					        have_stereo_state, stereo_state.camera_mode,
+					        have_view_state, view_state.camera_mode,
 					        sess->has_external_window);
 				}
 
 				if (screen_width_m > 0.0f && screen_height_m > 0.0f) {
-				// Nominal viewer for stereo math (parallax lerp target)
+				// Nominal viewer for view math (parallax lerp target)
 				const struct xrt_system_compositor_info *si = &sess->sys->xsysc->info;
 				struct xrt_vec3 nominal = {0, si->nominal_viewer_y_m, si->nominal_viewer_z_m};
-				struct xrt_vec3 raw_l = {adj_left.x, adj_left.y, adj_left.z};
-				struct xrt_vec3 raw_r = {adj_right.x, adj_right.y, adj_right.z};
+				struct xrt_vec3 raw_eyes[XRT_MAX_VIEWS];
+				for (uint32_t ei = 0; ei < eye_count; ei++) {
+					raw_eyes[ei] = (struct xrt_vec3){adj_eyes[ei].x, adj_eyes[ei].y, adj_eyes[ei].z};
+				}
 				Display3DScreen scr = {screen_width_m, screen_height_m};
 				struct xrt_pose display_pose = {
 				    {world_head_ori.x, world_head_ori.y, world_head_ori.z, world_head_ori.w},
 				    {world_head_pos.x, world_head_pos.y, world_head_pos.z}};
 
-				// Camera-centric path: canonical camera3d_compute_stereo_views
-				if (have_stereo_state && stereo_state.camera_mode &&
+				// Camera-centric path: canonical camera3d_compute_views
+				if (have_view_state && view_state.camera_mode &&
 				    !sess->has_external_window) {
 					Camera3DTunables ct = {
-					    .ipd_factor = stereo_state.cam_ipd_factor,
-					    .parallax_factor = stereo_state.cam_parallax_factor,
-					    .inv_convergence_distance = stereo_state.cam_convergence,
-					    .half_tan_vfov = stereo_state.cam_half_tan_vfov,
+					    .ipd_factor = view_state.cam_spread_factor,
+					    .parallax_factor = view_state.cam_parallax_factor,
+					    .inv_convergence_distance = view_state.cam_convergence,
+					    .half_tan_vfov = view_state.cam_half_tan_vfov,
 					};
-					Camera3DStereoView cam_views[2];
-					camera3d_compute_stereo_views(&raw_l, &raw_r, &nominal, &scr, &ct,
-					                              &display_pose, 0.01f, 100.0f,
-					                              &cam_views[0], &cam_views[1]);
+					Camera3DView cam_views[XRT_MAX_VIEWS];
+					camera3d_compute_views(raw_eyes, eye_count, &nominal, &scr, &ct,
+					                       &display_pose, 0.01f, 100.0f,
+					                       cam_views);
 
 					// Extract {fov, eye_world} — runtime doesn't need matrices
-					for (int ei = 0; ei < 2; ei++) {
+					for (uint32_t ei = 0; ei < eye_count; ei++) {
 						fovs[ei] = cam_views[ei].fov;
-						stereo_eye_world[ei] = cam_views[ei].eye_world;
+						view_eye_world[ei] = cam_views[ei].eye_world;
 					}
 					have_kooima_fov = true;
-					have_stereo_eye_override = true;
+					have_eye_override = true;
 				} else {
-					// Display-centric (Kooima) path: canonical display3d_compute_stereo_views
+					// Display-centric (Kooima) path: canonical display3d_compute_views
 					Display3DTunables dt = display3d_default_tunables();
-					if (have_stereo_state && !sess->has_external_window) {
-						dt.ipd_factor = stereo_state.disp_ipd_factor;
-						dt.parallax_factor = stereo_state.disp_parallax_factor;
+					if (have_view_state && !sess->has_external_window) {
+						dt.ipd_factor = view_state.disp_spread_factor;
+						dt.parallax_factor = view_state.disp_parallax_factor;
 						dt.perspective_factor = 1.0f;
-						dt.virtual_display_height = stereo_state.disp_vHeight;
+						dt.virtual_display_height = view_state.disp_vHeight;
 					} else {
 						dt.virtual_display_height = screen_height_m; // identity m2v
 					}
 
-					Display3DStereoView disp_views[2];
-					display3d_compute_stereo_views(&raw_l, &raw_r, &nominal, &scr, &dt,
-					                               &display_pose, 0.01f, 100.0f,
-					                               &disp_views[0], &disp_views[1]);
+					Display3DView disp_views[XRT_MAX_VIEWS];
+					display3d_compute_views(raw_eyes, eye_count, &nominal, &scr, &dt,
+					                        &display_pose, 0.01f, 100.0f,
+					                        disp_views);
 
 					// Extract {fov, eye_world} — runtime doesn't need matrices
-					for (int ei = 0; ei < 2; ei++) {
+					for (uint32_t ei = 0; ei < eye_count; ei++) {
 						fovs[ei] = disp_views[ei].fov;
 					}
 					have_kooima_fov = true;
 
-					if (have_stereo_state && !sess->has_external_window) {
-						for (int ei = 0; ei < 2; ei++) {
-							stereo_eye_world[ei] = disp_views[ei].eye_world;
+					if (have_view_state && !sess->has_external_window) {
+						for (uint32_t ei = 0; ei < eye_count; ei++) {
+							view_eye_world[ei] = disp_views[ei].eye_world;
 						}
-						have_stereo_eye_override = true;
+						have_eye_override = true;
 					}
 				}
 
@@ -1350,17 +1282,20 @@ oxr_session_locate_views(struct oxr_logger *log,
 				}
 			} else if (have_eyes) {
 				// Eye tracking active but no display dims — fallback to device FOV
-				fovs[0] = xdev->hmd->distortion.fov[0];
-				fovs[1] = xdev->hmd->distortion.fov[1];
+				for (uint32_t ei = 0; ei < view_count; ei++) {
+					fovs[ei] = xdev->hmd->distortion.fov[ei];
+				}
 			}
 
 			// Ext apps: use raw nominal eye positions directly.
 			// FOVs come from the device (sim_display Kooima), so we only
 			// need to override the view positions to bypass the LOCAL space offset.
-			if (sess->has_external_window && !have_stereo_eye_override) {
-				stereo_eye_world[0] = (struct xrt_vec3){adj_left.x, adj_left.y, adj_left.z};
-				stereo_eye_world[1] = (struct xrt_vec3){adj_right.x, adj_right.y, adj_right.z};
-				have_stereo_eye_override = true;
+			if (sess->has_external_window && !have_eye_override) {
+				for (uint32_t ei = 0; ei < eye_count; ei++) {
+					view_eye_world[ei] = (struct xrt_vec3){
+					    adj_eyes[ei].x, adj_eyes[ei].y, adj_eyes[ei].z};
+				}
+				have_eye_override = true;
 			}
 		}
 	}
@@ -1368,10 +1303,11 @@ oxr_session_locate_views(struct oxr_logger *log,
 	// Always get view poses from device (provides T_xdev_head and poses[])
 	// Save Kooima fovs before xrt_device_get_view_poses overwrites them
 	{
-		struct xrt_fov kooima_fovs[2];
-		if (have_kooima_fov && have_stereo_state) {
-			kooima_fovs[0] = fovs[0];
-			kooima_fovs[1] = fovs[1];
+		struct xrt_fov kooima_fovs[XRT_MAX_VIEWS];
+		if (have_kooima_fov && have_view_state) {
+			for (uint32_t ei = 0; ei < view_count; ei++) {
+				kooima_fovs[ei] = fovs[ei];
+			}
 		}
 
 		xrt_result_t xret = xrt_device_get_view_poses( //
@@ -1388,9 +1324,10 @@ oxr_session_locate_views(struct oxr_logger *log,
 		// stereo state (non-IPC mode). In IPC mode, the server already
 		// computes stereo-adjusted Kooima FOVs and returns them via
 		// get_view_poses — don't override those.
-		if (have_kooima_fov && have_stereo_state) {
-			fovs[0] = kooima_fovs[0];
-			fovs[1] = kooima_fovs[1];
+		if (have_kooima_fov && have_view_state) {
+			for (uint32_t ei = 0; ei < view_count; ei++) {
+				fovs[ei] = kooima_fovs[ei];
+			}
 		}
 
 		if (should_log) {
@@ -1398,7 +1335,7 @@ oxr_session_locate_views(struct oxr_logger *log,
 			float v0 = (fovs[0].angle_up - fovs[0].angle_down) * 57.2958f;
 			U_LOG_I("FINAL FOV: kooima=%d override=%d H=%.2f° V=%.2f° "
 			        "L=%.4f R=%.4f U=%.4f D=%.4f",
-			        have_kooima_fov, have_stereo_eye_override, h0, v0,
+			        have_kooima_fov, have_eye_override, h0, v0,
 			        fovs[0].angle_left, fovs[0].angle_right,
 			        fovs[0].angle_up, fovs[0].angle_down);
 		}
@@ -1459,43 +1396,55 @@ oxr_session_locate_views(struct oxr_logger *log,
 		m_relation_chain_resolve(&xrc, &result);
 		OXR_XRT_POSE_TO_XRPOSEF(result.pose, views[i].pose);
 
-		// Override view poses for stereo controls or eye tracking.
-		// stereo_eye_world[] is set by either camera-centric or display-centric path
+		// Override view poses for view controls or eye tracking.
+		// view_eye_world[] is set by either camera-centric or display-centric path
 		// to ensure FOV and view position are consistent.
-		// Apply for mono too (view_count==1): use center eye position so ext apps
-		// get display-relative coords instead of head-tracked world position.
-		if (have_eyes || have_stereo_eye_override) {
-			// For mono (view_count==1), use center eye; for stereo, use per-eye
-			uint32_t eye_idx = i; // 0=left, 1=right for stereo
+		// Apply for mono too (active_view_count==1, i.e. 2D mode): centroid of all eye positions.
+		if (have_eyes || have_eye_override) {
+			uint32_t eye_idx = i;
 
-			if (have_stereo_eye_override) {
-				// STEREO OVERRIDE: use pre-computed eye positions
+			if (have_eye_override) {
+				// VIEW OVERRIDE: use pre-computed eye positions
 				// For ext apps: display-local coords; for non-ext: world-space
-				if (view_count == 1) {
-					// Mono: center eye
-					views[i].pose.position.x = (stereo_eye_world[0].x + stereo_eye_world[1].x) / 2.0f;
-					views[i].pose.position.y = (stereo_eye_world[0].y + stereo_eye_world[1].y) / 2.0f;
-					views[i].pose.position.z = (stereo_eye_world[0].z + stereo_eye_world[1].z) / 2.0f;
+				if (active_view_count == 1) {
+					// Mono: centroid of all eyes
+					float cx = 0, cy = 0, cz = 0;
+					uint32_t nc = eye_pos.count > 0 ? eye_pos.count : 2;
+					for (uint32_t ei = 0; ei < nc; ei++) {
+						cx += view_eye_world[ei].x;
+						cy += view_eye_world[ei].y;
+						cz += view_eye_world[ei].z;
+					}
+					views[i].pose.position.x = cx / (float)nc;
+					views[i].pose.position.y = cy / (float)nc;
+					views[i].pose.position.z = cz / (float)nc;
 				} else {
-					views[i].pose.position.x = stereo_eye_world[eye_idx].x;
-					views[i].pose.position.y = stereo_eye_world[eye_idx].y;
-					views[i].pose.position.z = stereo_eye_world[eye_idx].z;
+					views[i].pose.position.x = view_eye_world[eye_idx].x;
+					views[i].pose.position.y = view_eye_world[eye_idx].y;
+					views[i].pose.position.z = view_eye_world[eye_idx].z;
 				}
 				views[i].pose.orientation = (XrQuaternionf){
 				    world_head_ori.x, world_head_ori.y, world_head_ori.z, world_head_ori.w};
 			} else if (have_eyes) {
 				// Get tracked eye position for this view (in display-local coords)
 				struct xrt_vec3 tracked_eye;
-				if (view_count == 1) {
-					// Mono: center eye
+				if (active_view_count == 1) {
+					// Mono: centroid of all tracked eyes
+					float cx = 0, cy = 0, cz = 0;
+					for (uint32_t ei = 0; ei < eye_pos.count; ei++) {
+						cx += eye_pos.eyes[ei].x;
+						cy += eye_pos.eyes[ei].y;
+						cz += eye_pos.eyes[ei].z;
+					}
+					float inv = 1.0f / (float)eye_pos.count;
+					tracked_eye = (struct xrt_vec3){cx * inv, cy * inv, cz * inv};
+				} else if (eye_idx < eye_pos.count) {
 					tracked_eye = (struct xrt_vec3){
-					    (eye_pair.left.x + eye_pair.right.x) / 2.0f,
-					    (eye_pair.left.y + eye_pair.right.y) / 2.0f,
-					    (eye_pair.left.z + eye_pair.right.z) / 2.0f};
+					    eye_pos.eyes[eye_idx].x,
+					    eye_pos.eyes[eye_idx].y,
+					    eye_pos.eyes[eye_idx].z};
 				} else {
-					tracked_eye = (eye_idx == 0)
-					    ? (struct xrt_vec3){eye_pair.left.x, eye_pair.left.y, eye_pair.left.z}
-					    : (struct xrt_vec3){eye_pair.right.x, eye_pair.right.y, eye_pair.right.z};
+					tracked_eye = (struct xrt_vec3){0, 0, 0.5f};
 				}
 
 				if (!sess->has_external_window) {
@@ -1521,7 +1470,7 @@ oxr_session_locate_views(struct oxr_logger *log,
 				U_LOG_I("Eye %d: view=(%.3f,%.3f,%.3f) mode=%s",
 				        i, views[i].pose.position.x, views[i].pose.position.y,
 				        views[i].pose.position.z,
-				        have_stereo_eye_override ? "camera" : "display");
+				        have_eye_override ? "camera" : "display");
 			}
 		}
 
@@ -1585,8 +1534,8 @@ oxr_session_locate_views(struct oxr_logger *log,
 		    viewState, XR_TYPE_VIEW_EYE_TRACKING_STATE_EXT, XrViewEyeTrackingStateEXT);
 		if (ets) {
 			ets->activeMode = (XrEyeTrackingModeEXT)sess->eye_tracking_mode;
-			if (got_eye_positions && eye_pair.valid) {
-				ets->isTracking = eye_pair.is_tracking ? XR_TRUE : XR_FALSE;
+			if (got_eye_positions && eye_pos.valid) {
+				ets->isTracking = eye_pos.is_tracking ? XR_TRUE : XR_FALSE;
 			} else {
 				// No eye tracking backend or invalid data.
 				// For sim_display (RAW_BIT, always "tracking"), eye positions

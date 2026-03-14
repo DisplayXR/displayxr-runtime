@@ -61,8 +61,7 @@ comp_metal_compositor_create(struct xrt_device *xdev,
  */
 bool
 comp_metal_compositor_get_predicted_eye_positions(struct xrt_compositor *xc,
-                                                  struct xrt_vec3 *out_left_eye,
-                                                  struct xrt_vec3 *out_right_eye);
+                                                  struct xrt_eye_positions *out_eye_pos);
 
 /*!
  * Get physical display dimensions in meters.

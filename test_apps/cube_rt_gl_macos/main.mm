@@ -22,6 +22,7 @@
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 #include <openxr/XR_EXT_macos_gl_binding.h>
+#include <openxr/XR_EXT_display_info.h>
 
 #include <cmath>
 #include <csignal>
@@ -684,6 +685,17 @@ struct AppXrSession {
     XrSessionState sessionState;
     bool sessionRunning;
     bool exitRequested;
+
+    // Rendering mode enumeration (XR_EXT_display_info)
+    PFN_xrEnumerateDisplayRenderingModesEXT pfnEnumerateDisplayRenderingModesEXT = nullptr;
+    uint32_t displayPixelWidth = 0, displayPixelHeight = 0;
+    uint32_t renderingModeCount = 0;
+    uint32_t renderingModeTileColumns[8] = {};
+    uint32_t renderingModeTileRows[8] = {};
+    float renderingModeScaleX[8] = {};
+    float renderingModeScaleY[8] = {};
+    uint32_t renderingModeViewCounts[8] = {};
+    uint32_t currentModeIndex = 0;
 };
 
 static volatile bool g_running = true;
@@ -705,11 +717,14 @@ static bool InitializeOpenXR(AppXrSession &app)
     xrEnumerateInstanceExtensionProperties(nullptr, extCount, &extCount, exts.data());
 
     bool hasMacosGlBinding = false;
+    bool hasDisplayInfoExt = false;
     LOG_INFO("Available OpenXR extensions:");
     for (auto &e : exts) {
         LOG_INFO("  %s v%u", e.extensionName, e.extensionVersion);
         if (strcmp(e.extensionName, XR_EXT_MACOS_GL_BINDING_EXTENSION_NAME) == 0)
             hasMacosGlBinding = true;
+        if (strcmp(e.extensionName, "XR_EXT_display_info") == 0)
+            hasDisplayInfoExt = true;
     }
 
     if (!hasMacosGlBinding) {
@@ -717,15 +732,17 @@ static bool InitializeOpenXR(AppXrSession &app)
         return false;
     }
 
-    // Create instance — only enable macos_gl_binding (non-ext: no window binding)
-    const char *enabledExts[] = {XR_EXT_MACOS_GL_BINDING_EXTENSION_NAME};
+    // Create instance — enable macos_gl_binding + display_info if available
+    std::vector<const char*> enabledExts = {XR_EXT_MACOS_GL_BINDING_EXTENSION_NAME};
+    if (hasDisplayInfoExt)
+        enabledExts.push_back("XR_EXT_display_info");
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
     strncpy(createInfo.applicationInfo.applicationName, "GLCubeOpenXR",
             XR_MAX_APPLICATION_NAME_SIZE);
     createInfo.applicationInfo.applicationVersion = 1;
     createInfo.applicationInfo.apiVersion = XR_CURRENT_API_VERSION;
-    createInfo.enabledExtensionCount = 1;
-    createInfo.enabledExtensionNames = enabledExts;
+    createInfo.enabledExtensionCount = (uint32_t)enabledExts.size();
+    createInfo.enabledExtensionNames = enabledExts.data();
 
     XR_CHECK(xrCreateInstance(&createInfo, &app.instance));
     LOG_INFO("OpenXR instance created");
@@ -735,6 +752,18 @@ static bool InitializeOpenXR(AppXrSession &app)
     sysInfo.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
     XR_CHECK(xrGetSystem(app.instance, &sysInfo, &app.systemId));
     LOG_INFO("Got system ID: %llu", (unsigned long long)app.systemId);
+
+    // Query display pixel dimensions for swapchain sizing
+    {
+        XrSystemProperties sysProps = {XR_TYPE_SYSTEM_PROPERTIES};
+        XrDisplayInfoEXT displayInfo = {XR_TYPE_DISPLAY_INFO_EXT};
+        sysProps.next = &displayInfo;
+        if (XR_SUCCEEDED(xrGetSystemProperties(app.instance, app.systemId, &sysProps))) {
+            app.displayPixelWidth = displayInfo.displayPixelWidth;
+            app.displayPixelHeight = displayInfo.displayPixelHeight;
+            LOG_INFO("Display pixels: %ux%u", app.displayPixelWidth, app.displayPixelHeight);
+        }
+    }
 
     // Enumerate view configs
     app.viewConfigType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
@@ -771,6 +800,39 @@ static bool CreateSession(AppXrSession &app, CGLContextObj cglContext, CGLPixelF
     XR_CHECK(xrCreateSession(app.instance, &sessionInfo, &app.session));
     LOG_INFO("OpenXR session created with CGL binding");
 
+    // Get rendering mode enumeration function pointer
+    xrGetInstanceProcAddr(app.instance, "xrEnumerateDisplayRenderingModesEXT",
+        (PFN_xrVoidFunction*)&app.pfnEnumerateDisplayRenderingModesEXT);
+
+    // Enumerate rendering modes for tile layout info
+    if (app.pfnEnumerateDisplayRenderingModesEXT) {
+        uint32_t modeCount = 0;
+        XrResult enumRes = app.pfnEnumerateDisplayRenderingModesEXT(app.session, 0, &modeCount, nullptr);
+        if (XR_SUCCEEDED(enumRes) && modeCount > 0) {
+            std::vector<XrDisplayRenderingModeInfoEXT> modes(modeCount);
+            for (uint32_t i = 0; i < modeCount; i++) {
+                modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT;
+                modes[i].next = nullptr;
+            }
+            enumRes = app.pfnEnumerateDisplayRenderingModesEXT(app.session, modeCount, &modeCount, modes.data());
+            if (XR_SUCCEEDED(enumRes)) {
+                app.renderingModeCount = modeCount > 8 ? 8 : modeCount;
+                LOG_INFO("Display rendering modes (%u):", modeCount);
+                for (uint32_t i = 0; i < app.renderingModeCount; i++) {
+                    app.renderingModeViewCounts[i] = modes[i].viewCount;
+                    app.renderingModeTileColumns[i] = modes[i].tileColumns;
+                    app.renderingModeTileRows[i] = modes[i].tileRows;
+                    app.renderingModeScaleX[i] = modes[i].viewScaleX;
+                    app.renderingModeScaleY[i] = modes[i].viewScaleY;
+                    LOG_INFO("  Mode %u: '%s' views=%u tiles=%ux%u scale=%.2fx%.2f",
+                        i, modes[i].modeName, modes[i].viewCount,
+                        modes[i].tileColumns, modes[i].tileRows,
+                        modes[i].viewScaleX, modes[i].viewScaleY);
+                }
+            }
+        }
+    }
+
     app.sessionState = XR_SESSION_STATE_UNKNOWN;
     app.sessionRunning = false;
     app.exitRequested = false;
@@ -793,9 +855,19 @@ static bool CreateSpaces(AppXrSession &app)
 
 static bool CreateSwapchain(AppXrSession &app)
 {
-    // Single SBS swapchain: 2x width for stereo
-    uint32_t w = app.configViews[0].recommendedImageRectWidth * 2;
+    // Size swapchain for the maximum atlas across all rendering modes.
+    // Each mode's atlas is: (tileColumns * scaleX * displayW) × (tileRows * scaleY * displayH).
+    uint32_t w = app.configViews[0].recommendedImageRectWidth * 2;  // fallback: stereo SBS
     uint32_t h = app.configViews[0].recommendedImageRectHeight;
+    if (app.renderingModeCount > 0 && app.displayPixelWidth > 0 && app.displayPixelHeight > 0) {
+        w = 0; h = 0;
+        for (uint32_t i = 0; i < app.renderingModeCount; i++) {
+            uint32_t mw = (uint32_t)(app.renderingModeTileColumns[i] * app.renderingModeScaleX[i] * app.displayPixelWidth);
+            uint32_t mh = (uint32_t)(app.renderingModeTileRows[i] * app.renderingModeScaleY[i] * app.displayPixelHeight);
+            if (mw > w) w = mw;
+            if (mh > h) h = mh;
+        }
+    }
 
     // Query supported formats
     uint32_t formatCount = 0;
@@ -878,6 +950,12 @@ static void PollEvents(AppXrSession &app)
                        ssc->state == XR_SESSION_STATE_LOSS_PENDING) {
                 app.exitRequested = true;
             }
+            break;
+        }
+        case XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_EXT: {
+            auto *rmc = (XrEventDataRenderingModeChangedEXT *)&event;
+            app.currentModeIndex = rmc->currentModeIndex;
+            LOG_INFO("Rendering mode changed: %u -> %u", rmc->previousModeIndex, rmc->currentModeIndex);
             break;
         }
         default: break;
@@ -1042,15 +1120,22 @@ int main(int argc, char **argv)
         waitImgInfo.timeout = XR_INFINITE_DURATION;
         xrWaitSwapchainImage(app.swapchain.swapchain, &waitImgInfo);
 
-        // Render
-        if (frameState.shouldRender && viewCount >= 2) {
-            uint32_t eyeW = app.swapchain.width / 2;
-            uint32_t eyeH = app.swapchain.height;
+        // Render N views into tile positions using runtime-provided tile layout.
+        // Falls back to derived layout if mode enumeration unavailable.
+        uint32_t tileColumns = (app.currentModeIndex < app.renderingModeCount)
+            ? app.renderingModeTileColumns[app.currentModeIndex] : (viewCount >= 2 ? 2 : 1);
+        uint32_t tileRows = (app.currentModeIndex < app.renderingModeCount)
+            ? app.renderingModeTileRows[app.currentModeIndex] : ((viewCount + tileColumns - 1) / tileColumns);
+        if (frameState.shouldRender && viewCount >= 1) {
+            uint32_t eyeW = tileColumns > 0 ? app.swapchain.width / tileColumns : app.swapchain.width;
+            uint32_t eyeH = tileRows > 0 ? app.swapchain.height / tileRows : app.swapchain.height;
 
-            EyeRenderParams eyeParams[2];
-            for (int i = 0; i < 2; i++) {
-                eyeParams[i].viewportX = i * eyeW;
-                eyeParams[i].viewportY = 0;
+            std::vector<EyeRenderParams> eyeParams(viewCount);
+            for (uint32_t i = 0; i < viewCount; i++) {
+                uint32_t tileX = i % tileColumns;
+                uint32_t tileY = i / tileColumns;
+                eyeParams[i].viewportX = tileX * eyeW;
+                eyeParams[i].viewportY = tileY * eyeH;
                 eyeParams[i].width = eyeW;
                 eyeParams[i].height = eyeH;
                 mat4_view_from_xr_pose(eyeParams[i].viewMat, views[i].pose);
@@ -1058,7 +1143,7 @@ int main(int argc, char **argv)
             }
 
             RenderScene(renderer, app.swapchain.images[imageIndex],
-                        app.swapchain.width, app.swapchain.height, eyeParams, 2);
+                        app.swapchain.width, app.swapchain.height, eyeParams.data(), (int)viewCount);
         }
 
         // Release swapchain image
@@ -1066,24 +1151,27 @@ int main(int argc, char **argv)
         xrReleaseSwapchainImage(app.swapchain.swapchain, &relInfo);
 
         // End frame
-        XrCompositionLayerProjectionView projViews[2] = {};
-        for (int i = 0; i < 2 && i < (int)viewCount; i++) {
-            projViews[i].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
+        std::vector<XrCompositionLayerProjectionView> projViews(viewCount, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
+        for (uint32_t i = 0; i < viewCount; i++) {
+            uint32_t tileX = i % tileColumns;
+            uint32_t tileY = i / tileColumns;
+            uint32_t eyeW = tileColumns > 0 ? app.swapchain.width / tileColumns : app.swapchain.width;
+            uint32_t eyeH = tileRows > 0 ? app.swapchain.height / tileRows : app.swapchain.height;
             projViews[i].pose = views[i].pose;
             projViews[i].fov = views[i].fov;
             projViews[i].subImage.swapchain = app.swapchain.swapchain;
-            projViews[i].subImage.imageRect.offset = {(int32_t)(i * app.swapchain.width / 2), 0};
+            projViews[i].subImage.imageRect.offset = {(int32_t)(tileX * eyeW), (int32_t)(tileY * eyeH)};
             projViews[i].subImage.imageRect.extent = {
-                (int32_t)(app.swapchain.width / 2),
-                (int32_t)app.swapchain.height
+                (int32_t)eyeW,
+                (int32_t)eyeH
             };
             projViews[i].subImage.imageArrayIndex = 0;
         }
 
         XrCompositionLayerProjection projLayer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
         projLayer.space = app.localSpace;
-        projLayer.viewCount = 2;
-        projLayer.views = projViews;
+        projLayer.viewCount = viewCount;
+        projLayer.views = projViews.data();
 
         const XrCompositionLayerBaseHeader *layers[] = {
             (XrCompositionLayerBaseHeader *)&projLayer

@@ -199,7 +199,7 @@ qwerty_process_event(struct xrt_device **xdevs, size_t xdev_count, SDL_Event eve
 			SDL_Keymod mod = SDL_GetModState();
 			if (mod & KMOD_SHIFT) {
 				float mult = (event.wheel.y > 0) ? 1.1f : (1.0f / 1.1f);
-				qwerty_adjust_stereo_factor(qsys, mult);
+				qwerty_adjust_view_factor(qsys, mult);
 			} else if (qsys->camera_mode) {
 				qwerty_adjust_convergence(qsys, (event.wheel.y > 0) ? 1.0f : -1.0f);
 			} else {
@@ -253,7 +253,7 @@ qwerty_process_event(struct xrt_device **xdevs, size_t xdev_count, SDL_Event eve
 	// Stereo mode toggle (HMD focused, one-shot on keydown)
 	if (event.type == SDL_KEYDOWN && event.key.repeat == 0 && qdev == qd_hmd) {
 		if (event.key.keysym.scancode == SDL_SCANCODE_P) qwerty_toggle_camera_mode(qsys);
-		if (event.key.keysym.scancode == SDL_SCANCODE_SPACE) qwerty_reset_stereo(qsys);
+		if (event.key.keysym.scancode == SDL_SCANCODE_SPACE) qwerty_reset_view_state(qsys);
 	}
 
 	// V key: HMD focused = 2D/3D toggle, controller focused = thumbstick click

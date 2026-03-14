@@ -14,6 +14,7 @@
 #pragma once
 
 #include "xrt/xrt_compositor.h"
+#include "xrt/xrt_display_metrics.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -78,16 +79,14 @@ comp_gl_compositor_request_display_mode(struct xrt_compositor *xc, bool enable_3
  * Get predicted eye positions from the GL display processor.
  *
  * @param xc            GL compositor base.
- * @param out_left_eye  Left eye position (x, y, z in meters).
- * @param out_right_eye Right eye position (x, y, z in meters).
+ * @param out_eye_pos   Output eye positions (N-view).
  * @return true if display processor provided eye positions.
  *
  * @ingroup comp_gl
  */
 bool
 comp_gl_compositor_get_predicted_eye_positions(struct xrt_compositor *xc,
-                                               struct xrt_vec3 *out_left_eye,
-                                               struct xrt_vec3 *out_right_eye);
+                                               struct xrt_eye_positions *out_eye_pos);
 
 #ifdef __cplusplus
 }

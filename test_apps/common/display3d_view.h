@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  Unified display-centric stereo view math for 3D displays
+ * @brief  Unified display-centric multiview math for 3D displays
  *
  * Canonical implementation of Kooima asymmetric frustum projection, view matrix
- * construction, and stereo eye factor processing. Any project that needs
- * display-centric stereo views should use this library instead of reimplementing
+ * construction, and per-eye factor processing. Any project that needs
+ * display-centric 3D views should use this library instead of reimplementing
  * the math. Pure C, depends only on <openxr/openxr.h> and <math.h>.
  *
  * Reference: Robert Kooima, "Generalized Perspective Projection" (2009)
@@ -39,22 +39,22 @@ typedef struct Display3DScreen {
 	float height_m; //!< Physical screen height (meters)
 } Display3DScreen;
 
-typedef struct Display3DStereoView {
+typedef struct Display3DView {
 	float view_matrix[16];       //!< Column-major 4x4 view matrix
 	float projection_matrix[16]; //!< Column-major 4x4 projection matrix
 	XrFovf fov;                  //!< Equivalent asymmetric FOV angles (radians)
 	XrVector3f eye_display;      //!< Modified eye position in display space (after all factors)
 	XrVector3f eye_world;        //!< Eye position in world space (after display pose transform)
 	XrQuaternionf orientation;   //!< Display/camera orientation (same for both eyes)
-} Display3DStereoView;
+} Display3DView;
 
 // --- Functions ---
 
 /*!
- * All-in-one: compute stereo view+projection from raw eye tracking data.
+ * All-in-one: compute 3D view+projection from raw eye tracking data.
  *
  * Pipeline:
- *   1. Apply IPD factor (scale inter-eye vector, keep center fixed)
+ *   1. Apply IPD factor (scale inter-view vector, keep center fixed)
  *   2. Apply parallax factor (lerp center toward nominal viewer)
  *   3. Apply perspective * m2v to eye XYZ (view matrix + Kooima eye)
  *   4. Apply m2v to screen W/H (Kooima screen dims)
@@ -63,28 +63,26 @@ typedef struct Display3DStereoView {
  *   7. Build Kooima projection matrix from display-space scaled eye + scaled screen
  *   8. Compute FOV angles from same
  *
- * @param raw_left       Raw left eye in DISPLAY space (from xrLocateViews)
- * @param raw_right      Raw right eye in DISPLAY space (from xrLocateViews)
+ * @param raw_eyes       Array of N raw eye positions in DISPLAY space (from xrLocateViews)
+ * @param count          Number of views (must be >= 1)
  * @param nominal_viewer Nominal viewer position in DISPLAY space (or NULL for {0,0,0.5})
  * @param screen         Physical screen dimensions
- * @param tunables       Stereo factors (or NULL for defaults: all 1.0)
+ * @param tunables       View factors (or NULL for defaults: all 1.0)
  * @param display_pose   Display pose in world space (or NULL for identity)
  * @param near_z         Near clip plane distance
  * @param far_z          Far clip plane distance
- * @param out_left       Output left eye view
- * @param out_right      Output right eye view
+ * @param out_views      Output array of N views
  */
 void
-display3d_compute_stereo_views(const XrVector3f *raw_left,
-                               const XrVector3f *raw_right,
+display3d_compute_views(const XrVector3f *raw_eyes,
+                               uint32_t count,
                                const XrVector3f *nominal_viewer,
                                const Display3DScreen *screen,
                                const Display3DTunables *tunables,
                                const XrPosef *display_pose,
                                float near_z,
                                float far_z,
-                               Display3DStereoView *out_left,
-                               Display3DStereoView *out_right);
+                               Display3DView *out_views);
 
 /*!
  * Compute Kooima FOV angles only (no matrices). Useful for runtime-side
@@ -164,7 +162,7 @@ display3d_apply_eye_factors_n(const XrVector3f *raw_eyes,
  *
  * @param processed_eye  Processed eye position (after apply_eye_factors)
  * @param screen         Physical screen dimensions
- * @param tunables       Stereo factors (perspective_factor, virtual_display_height)
+ * @param tunables       View factors (perspective_factor, virtual_display_height)
  * @param display_pose   Display pose in world space (or NULL for identity)
  * @param near_z         Near clip plane distance
  * @param far_z          Far clip plane distance
@@ -177,7 +175,7 @@ display3d_compute_view(const XrVector3f *processed_eye,
                        const XrPosef *display_pose,
                        float near_z,
                        float far_z,
-                       Display3DStereoView *out);
+                       Display3DView *out);
 
 /*!
  * Default tunables (all factors = 1.0).

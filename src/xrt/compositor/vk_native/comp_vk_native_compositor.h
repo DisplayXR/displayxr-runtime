@@ -60,8 +60,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
  * Get the predicted eye positions from the display processor.
  *
  * @param xc The compositor.
- * @param out_left_eye Pointer to receive left eye position (x, y, z in meters).
- * @param out_right_eye Pointer to receive right eye position (x, y, z in meters).
+ * @param out_eye_pos Output eye positions (N-view).
  *
  * @return true if eye tracking is available and positions were retrieved.
  *
@@ -69,8 +68,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
  */
 bool
 comp_vk_native_compositor_get_predicted_eye_positions(struct xrt_compositor *xc,
-                                                      struct xrt_vec3 *out_left_eye,
-                                                      struct xrt_vec3 *out_right_eye);
+                                                      struct xrt_eye_positions *out_eye_pos);
 
 /*!
  * Get the display dimensions from the display processor.

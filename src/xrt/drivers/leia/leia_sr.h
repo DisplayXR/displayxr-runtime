@@ -81,11 +81,11 @@ leiasr_weave(struct leiasr *leiasr,
  * application-specific latency.
  *
  * @param leiasr The leiasr instance (must have a weaver)
- * @param[out] out_eye_pair Pointer to receive the eye positions (in meters)
+ * @param[out] out_eye_pos Pointer to receive the eye positions (in meters)
  * @return true if valid eye positions are available, false otherwise
  */
 bool
-leiasr_get_predicted_eye_positions(struct leiasr *leiasr, struct leiasr_eye_pair *out_eye_pair);
+leiasr_get_predicted_eye_positions(struct leiasr *leiasr, struct leiasr_eye_pair *out_eye_pos);
 
 /*!
  * Check if the leiasr instance has a weaver (and thus supports getPredictedEyePositions).

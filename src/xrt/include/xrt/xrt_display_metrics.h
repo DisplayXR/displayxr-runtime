@@ -39,19 +39,23 @@ struct xrt_eye_position
 };
 
 /*!
- * Eye pair containing both left and right eye positions.
+ * N-view eye positions for multiview rendering.
+ *
+ * Holds up to XRT_MAX_VIEWS eye positions. The count field indicates
+ * how many entries in the eyes[] array are valid (e.g. 2 for stereo,
+ * 4 for quad, 1 for mono).
  *
  * @ingroup xrt_iface
  */
-struct xrt_eye_pair
+struct xrt_eye_positions
 {
-	struct xrt_eye_position left;  //!< Left eye position in meters
-	struct xrt_eye_position right; //!< Right eye position in meters
-	int64_t timestamp_ns;          //!< Monotonic timestamp when the eye positions were sampled
-	bool valid;                    //!< True if the eye positions are valid
-	bool is_tracking;              //!< True if physical eye tracker has lock on user.
-	                               //!< When false, positions are still valid — vendor SDK
-	                               //!< provides reasonable fallback (last known, filtered, etc.)
+	struct xrt_eye_position eyes[8]; //!< Per-view eye positions in meters (max XRT_MAX_VIEWS)
+	uint32_t count;                  //!< Number of valid eye positions
+	int64_t timestamp_ns;            //!< Monotonic timestamp when the eye positions were sampled
+	bool valid;                      //!< True if the eye positions are valid
+	bool is_tracking;                //!< True if physical eye tracker has lock on user.
+	                                 //!< When false, positions are still valid — vendor SDK
+	                                 //!< provides reasonable fallback (last known, filtered, etc.)
 };
 
 /*!

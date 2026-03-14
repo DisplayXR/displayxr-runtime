@@ -45,6 +45,7 @@
  */
 
 static xrt_atomic_s32_t g_sim_display_output_mode = SIM_DISPLAY_OUTPUT_SBS;
+static xrt_atomic_s32_t g_sim_display_view_count = 2;
 
 /*!
  * Cross-platform atomic load for xrt_atomic_s32_t.
@@ -94,8 +95,21 @@ sim_display_set_output_mode(enum sim_display_output_mode mode)
 		U_LOG_W("Sim display mode changed: %s",
 		        mode == SIM_DISPLAY_OUTPUT_SBS           ? "SBS" :
 		        mode == SIM_DISPLAY_OUTPUT_ANAGLYPH       ? "Anaglyph" :
-		        mode == SIM_DISPLAY_OUTPUT_SQUEEZED_SBS   ? "Squeezed SBS" : "Blend");
+		        mode == SIM_DISPLAY_OUTPUT_SQUEEZED_SBS   ? "Squeezed SBS" :
+		        mode == SIM_DISPLAY_OUTPUT_QUAD           ? "Quad" : "Blend");
 	}
+}
+
+uint32_t
+sim_display_get_view_count(void)
+{
+	return (uint32_t)xrt_atomic_s32_load(&g_sim_display_view_count);
+}
+
+void
+sim_display_set_view_count(uint32_t count)
+{
+	xrt_atomic_s32_exchange(&g_sim_display_view_count, (int32_t)count);
 }
 
 
@@ -156,6 +170,9 @@ struct sim_display_hmd
 	//! and screen dimensions for Kooima projection. Ready for future
 	//! scroll-wheel zoom support.
 	float zoom_scale;
+
+	//! Per-view eye position offsets for Kooima FOV computation.
+	struct xrt_vec3 view_eye_offsets[8]; // XRT_MAX_VIEWS
 
 	enum u_logging_level log_level;
 };
@@ -262,9 +279,13 @@ sim_display_get_view_poses(struct xrt_device *xdev,
 		return xret;
 	}
 
-	// Per-eye head-relative offset poses.
+	// Per-view head-relative offset poses from stored eye offsets.
 	for (uint32_t i = 0; i < view_count && i < ARRAY_SIZE(xdev->hmd->views); i++) {
-		u_device_get_view_pose(default_eye_relation, i, &out_poses[i]);
+		out_poses[i].orientation = (struct xrt_quat){0, 0, 0, 1};
+		// View offset relative to head center
+		out_poses[i].position.x = hmd->view_eye_offsets[i].x;
+		out_poses[i].position.y = hmd->view_eye_offsets[i].y - hmd->pose.position.y;
+		out_poses[i].position.z = hmd->view_eye_offsets[i].z - hmd->pose.position.z;
 	}
 
 	// Kooima projection: recompute FOV each frame from tracked eye position.
@@ -346,14 +367,13 @@ sim_display_hmd_set_property(struct xrt_device *xdev,
                               int32_t value)
 {
 	if (property == XRT_DEVICE_PROPERTY_OUTPUT_MODE) {
-		// Unified mode index: 0=2D, 1=Anaglyph, 2=SBS, 3=Blend
-		// Map to internal sim_display output mode: 0=SBS, 1=Anaglyph, 2=Blend
 		if ((uint32_t)value >= xdev->rendering_mode_count) {
 			return XRT_ERROR_NOT_IMPLEMENTED;
 		}
 
-		// Always update active rendering mode index
+		// Always update active rendering mode index and view count
 		xdev->hmd->active_rendering_mode_index = (uint32_t)value;
+		sim_display_set_view_count(xdev->rendering_modes[value].view_count);
 
 		if (value == 0) {
 			// 2D — don't change weaver, compositor bypasses it
@@ -370,6 +390,9 @@ sim_display_hmd_set_property(struct xrt_device *xdev,
 			break;
 		case 3:
 			internal_mode = SIM_DISPLAY_OUTPUT_SQUEEZED_SBS;
+			break;
+		case 4:
+			internal_mode = SIM_DISPLAY_OUTPUT_QUAD;
 			break;
 		default:
 			return XRT_ERROR_NOT_IMPLEMENTED;
@@ -393,10 +416,12 @@ sim_display_hmd_get_property(struct xrt_device *xdev,
 		// Return unified mode index: internal SBS(0)→2, Anaglyph(1)→1, Blend(2)→3
 		enum sim_display_output_mode internal = sim_display_get_output_mode();
 		switch (internal) {
-		case SIM_DISPLAY_OUTPUT_SBS:      *out_value = 2; break;
-		case SIM_DISPLAY_OUTPUT_ANAGLYPH: *out_value = 1; break;
-		case SIM_DISPLAY_OUTPUT_BLEND:    *out_value = 3; break;
-		default:                          *out_value = 1; break;
+		case SIM_DISPLAY_OUTPUT_SBS:          *out_value = 2; break;
+		case SIM_DISPLAY_OUTPUT_ANAGLYPH:     *out_value = 1; break;
+		case SIM_DISPLAY_OUTPUT_BLEND:        *out_value = 3; break;
+		case SIM_DISPLAY_OUTPUT_SQUEEZED_SBS: *out_value = 3; break;
+		case SIM_DISPLAY_OUTPUT_QUAD:         *out_value = 4; break;
+		default:                              *out_value = 1; break;
 		}
 		return XRT_SUCCESS;
 	}
@@ -517,14 +542,12 @@ sim_display_hmd_create(void)
 	hmd->pose.position.y = eye_y;
 	hmd->pose.position.z = eye_z;
 
-	hmd->base.hmd->view_count = 2;
-
 	snprintf(hmd->base.str, XRT_DEVICE_NAME_LEN, "Sim 3D Display");
 	snprintf(hmd->base.serial, XRT_DEVICE_NAME_LEN, "sim_display_0");
 
-	// Rendering modes: sim_display supports 4 modes (2D + 3 stereo).
-	// Order: 0=2D, 1=Anaglyph (default 3D), 2=Cropped SBS, 3=Squeezed SBS
-	hmd->base.rendering_mode_count = 4;
+	// Rendering modes: sim_display supports 5 modes (2D + 3 stereo + quad).
+	// Order: 0=2D, 1=Anaglyph (default 3D), 2=Cropped SBS, 3=Squeezed SBS, 4=Quad
+	hmd->base.rendering_mode_count = 5;
 
 	// Mode 0: 2D (mono, full resolution, 1×1 tile)
 	hmd->base.rendering_modes[0].mode_index = 0;
@@ -566,42 +589,67 @@ sim_display_hmd_create(void)
 	hmd->base.rendering_modes[3].tile_columns = 2;
 	hmd->base.rendering_modes[3].tile_rows = 1;
 
+	// Mode 4: Quad (4 views, 2x2 grid, each quadrant at half-res)
+	hmd->base.rendering_modes[4].mode_index = 4;
+	snprintf(hmd->base.rendering_modes[4].mode_name, XRT_DEVICE_NAME_LEN, "Quad");
+	hmd->base.rendering_modes[4].view_count = 4;
+	hmd->base.rendering_modes[4].view_scale_x = 0.5f;
+	hmd->base.rendering_modes[4].view_scale_y = 0.5f;
+	hmd->base.rendering_modes[4].hardware_display_3d = true;
+	hmd->base.rendering_modes[4].tile_columns = 2;
+	hmd->base.rendering_modes[4].tile_rows = 2;
+
+	// view_count = max across all rendering modes
+	{
+		uint32_t max_views = 1;
+		for (uint32_t m = 0; m < hmd->base.rendering_mode_count; m++) {
+			if (hmd->base.rendering_modes[m].view_count > max_views)
+				max_views = hmd->base.rendering_modes[m].view_count;
+		}
+		hmd->base.hmd->view_count = max_views;
+	}
+
 	// Set default active mode from env var
 	{
 		enum sim_display_output_mode sd_mode = sim_display_get_output_mode();
 		// Map internal mode to unified index: SBS→2, Anaglyph→1, SqueezedSBS→3
+		uint32_t default_mode;
 		switch (sd_mode) {
-		case SIM_DISPLAY_OUTPUT_SBS:          hmd->base.hmd->active_rendering_mode_index = 2; break;
-		case SIM_DISPLAY_OUTPUT_ANAGLYPH:     hmd->base.hmd->active_rendering_mode_index = 1; break;
-		case SIM_DISPLAY_OUTPUT_SQUEEZED_SBS: hmd->base.hmd->active_rendering_mode_index = 3; break;
-		default:                              hmd->base.hmd->active_rendering_mode_index = 1; break;
+		case SIM_DISPLAY_OUTPUT_SBS:          default_mode = 2; break;
+		case SIM_DISPLAY_OUTPUT_ANAGLYPH:     default_mode = 1; break;
+		case SIM_DISPLAY_OUTPUT_SQUEEZED_SBS: default_mode = 3; break;
+		default:                              default_mode = 1; break;
+		}
+		hmd->base.hmd->active_rendering_mode_index = default_mode;
+		sim_display_set_view_count(hmd->base.rendering_modes[default_mode].view_count);
+	}
+
+	// Initialize per-view eye offsets based on max view_count
+	{
+		float half_ipd = ipd / 2.0f;
+		// Views 0-1: standard stereo layout
+		hmd->view_eye_offsets[0] = (struct xrt_vec3){-half_ipd, eye_y, eye_z};
+		hmd->view_eye_offsets[1] = (struct xrt_vec3){ half_ipd, eye_y, eye_z};
+		// Views 2-3: quad mode upper row (offset Y positions)
+		hmd->view_eye_offsets[2] = (struct xrt_vec3){-half_ipd, eye_y + ipd, eye_z};
+		hmd->view_eye_offsets[3] = (struct xrt_vec3){ half_ipd, eye_y + ipd, eye_z};
+		// Pad remaining with center position
+		for (uint32_t v = 4; v < 8; v++) {
+			hmd->view_eye_offsets[v] = (struct xrt_vec3){0, eye_y, eye_z};
 		}
 	}
 
 	// Head pose input.
 	hmd->base.inputs[0].name = XRT_INPUT_GENERIC_HEAD_POSE;
 
-	// Display geometry using helper struct.
-	struct u_device_simple_info info;
-	info.display.w_pixels = pixel_w;
-	info.display.h_pixels = pixel_h;
-	info.display.w_meters = display_w_m;
-	info.display.h_meters = display_h_m;
-	info.lens_horizontal_separation_meters = ipd;
-	info.lens_vertical_position_meters = display_h_m / 2.0f;
-
-	// Temporary symmetric FOV for u_device_setup_split_side_by_side
-	// (will be overridden with Kooima asymmetric frustum below).
-	float half_fov_h = atanf((display_w_m / 2.0f) / eye_z);
-	info.fov[0] = half_fov_h * 2.0f;
-	info.fov[1] = half_fov_h * 2.0f;
-
-	bool setup_ok = u_device_setup_split_side_by_side(&hmd->base, &info);
-	if (!setup_ok) {
-		U_LOG_E("Failed to setup sim display device info");
-		sim_display_hmd_destroy(&hmd->base);
-		return NULL;
-	}
+	// Manual display setup (replaces u_device_setup_split_side_by_side which only handles 2 views)
+	hmd->base.hmd->blend_modes[0] = XRT_BLEND_MODE_OPAQUE;
+	hmd->base.hmd->blend_mode_count = 1;
+	hmd->base.hmd->distortion.models = XRT_DISTORTION_MODEL_NONE;
+	hmd->base.hmd->distortion.preferred = XRT_DISTORTION_MODEL_NONE;
+	hmd->base.hmd->screens[0].w_pixels = pixel_w;
+	hmd->base.hmd->screens[0].h_pixels = pixel_h;
+	hmd->base.hmd->screens[0].nominal_frame_interval_ns = (uint64_t)time_s_to_ns(1.0f / 60.0f);
 
 	// Override display/viewport dimensions: all modes use the display processor
 	// for final output, so each eye gets full-resolution swapchains.
@@ -612,9 +660,9 @@ sim_display_hmd_create(void)
 		hmd->base.hmd->views[i].viewport.w_pixels = pixel_w;
 	}
 
-	// Kooima off-axis asymmetric frustum per eye.
-	// Display plane at Z=0, centered at origin. Each eye computes frustum
-	// angles from its position to the display edges.
+	// Kooima off-axis asymmetric frustum per view.
+	// Display plane at Z=0, centered at origin. Each view computes frustum
+	// angles from its eye position to the display edges.
 	// In SBS mode each eye sees half the display width.
 	{
 		bool sbs_mode = (sim_display_get_output_mode() == SIM_DISPLAY_OUTPUT_SBS);
@@ -622,19 +670,18 @@ sim_display_hmd_create(void)
 		const float half_h = display_h_m / 2.0f;
 
 		for (uint32_t i = 0; i < hmd->base.hmd->view_count; i++) {
-			// Eye X offset: left eye negative, right eye positive.
-			float eye_x = (i == 0) ? -ipd / 2.0f : ipd / 2.0f;
+			float eye_x = hmd->view_eye_offsets[i].x;
+			float eye_y_fov = hmd->view_eye_offsets[i].y;
+			float eye_z_fov = hmd->view_eye_offsets[i].z;
+			if (eye_z_fov <= 0.001f) eye_z_fov = nominal_z;
 
-			// Frustum angles from eye to display edges (Kooima projection).
-			// Display left edge at x = -half_w, right edge at x = +half_w.
-			// Display bottom at y = -half_h, top at y = +half_h.
-			hmd->base.hmd->distortion.fov[i].angle_left = atanf((-half_w - eye_x) / eye_z);
-			hmd->base.hmd->distortion.fov[i].angle_right = atanf((half_w - eye_x) / eye_z);
-			hmd->base.hmd->distortion.fov[i].angle_down = atanf((-half_h - eye_y) / eye_z);
-			hmd->base.hmd->distortion.fov[i].angle_up = atanf((half_h - eye_y) / eye_z);
+			hmd->base.hmd->distortion.fov[i].angle_left = atanf((-half_w - eye_x) / eye_z_fov);
+			hmd->base.hmd->distortion.fov[i].angle_right = atanf((half_w - eye_x) / eye_z_fov);
+			hmd->base.hmd->distortion.fov[i].angle_down = atanf((-half_h - eye_y_fov) / eye_z_fov);
+			hmd->base.hmd->distortion.fov[i].angle_up = atanf((half_h - eye_y_fov) / eye_z_fov);
 		}
 
-		U_LOG_W("Kooima FOV (left eye): L=%.1f R=%.1f U=%.1f D=%.1f deg",
+		U_LOG_W("Kooima FOV (view 0): L=%.1f R=%.1f U=%.1f D=%.1f deg",
 		        hmd->base.hmd->distortion.fov[0].angle_left * 180.0f / M_PI,
 		        hmd->base.hmd->distortion.fov[0].angle_right * 180.0f / M_PI,
 		        hmd->base.hmd->distortion.fov[0].angle_up * 180.0f / M_PI,

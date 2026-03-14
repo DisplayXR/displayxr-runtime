@@ -50,6 +50,7 @@ enum sim_display_output_mode
 	SIM_DISPLAY_OUTPUT_ANAGLYPH = 1,     //!< Red-cyan anaglyph
 	SIM_DISPLAY_OUTPUT_BLEND = 2,        //!< 50/50 alpha blend
 	SIM_DISPLAY_OUTPUT_SQUEEZED_SBS = 3, //!< Squeezed SBS (no crop, tiles placed as-is)
+	SIM_DISPLAY_OUTPUT_QUAD = 4,         //!< 2x2 quad view (4 views)
 };
 
 /*!
@@ -75,6 +76,29 @@ sim_display_get_output_mode(void);
  */
 void
 sim_display_set_output_mode(enum sim_display_output_mode mode);
+
+/*!
+ * Get the current view count for the active rendering mode.
+ *
+ * Thread-safe (atomic). The display processor reads this each frame
+ * to determine how many eye positions to return.
+ *
+ * @return Current view count (1 for 2D, 2 for stereo, 4 for quad).
+ * @ingroup drv_sim_display
+ */
+uint32_t
+sim_display_get_view_count(void);
+
+/*!
+ * Set the view count for the active rendering mode.
+ *
+ * Thread-safe (atomic). Called when the rendering mode changes.
+ *
+ * @param count The view count for the new mode.
+ * @ingroup drv_sim_display
+ */
+void
+sim_display_set_view_count(uint32_t count);
 
 /*!
  * Display info for a sim_display device.

@@ -1665,19 +1665,19 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 }
 
 bool
-multi_compositor_get_predicted_eye_positions(struct multi_compositor *mc, struct xrt_eye_pair *out_eye_pair)
+multi_compositor_get_predicted_eye_positions(struct multi_compositor *mc, struct xrt_eye_positions *out_eye_pos)
 {
-	if (mc == NULL || out_eye_pair == NULL) {
+	if (mc == NULL || out_eye_pos == NULL) {
 		return false;
 	}
 
 	if (!mc->session_render.initialized || mc->session_render.display_processor == NULL) {
-		out_eye_pair->valid = false;
+		out_eye_pos->valid = false;
 		return false;
 	}
 
 	return xrt_display_processor_get_predicted_eye_positions(
-	    mc->session_render.display_processor, out_eye_pair);
+	    mc->session_render.display_processor, out_eye_pos);
 }
 
 #ifdef XRT_OS_WINDOWS

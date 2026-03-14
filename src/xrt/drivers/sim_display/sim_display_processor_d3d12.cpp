@@ -4,9 +4,9 @@
  * @file
  * @brief  Simulation D3D12 display processor: SBS, anaglyph, alpha-blend output.
  *
- * Implements SBS, anaglyph, and alpha-blend atlas output modes using HLSL
- * shaders compiled at runtime via D3DCompile. All 3 PSOs are pre-compiled
- * at init for instant runtime switching via 1/2/3 keys.
+ * Implements SBS, anaglyph, alpha-blend, squeezed SBS, and quad atlas output
+ * modes using HLSL shaders compiled at runtime via D3DCompile. All 5 PSOs are
+ * pre-compiled at init for instant runtime switching via 1/2/3/4/5 keys.
  *
  * Unlike the D3D11 variant, this records draw commands onto a provided
  * command list rather than executing immediately.
@@ -107,6 +107,32 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
 }
 )";
 
+// Quad pixel shader: 2x2 grid — TL=view0, TR=view1, BL=view2, BR=view3
+static const char *ps_quad_source = R"(
+Texture2D atlas_tex : register(t0);
+SamplerState samp : register(s0);
+
+cbuffer TileParams : register(b0) {
+	float tile_cols_inv;
+	float tile_rows_inv;
+	float tile_cols;
+	float tile_rows;
+};
+
+float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
+	float col_idx = (uv.x < 0.5) ? 0.0 : 1.0;
+	float row_idx = (uv.y < 0.5) ? 0.0 : 1.0;
+	float view_index = row_idx * 2.0 + col_idx;
+	float local_u = frac(uv.x * 2.0);
+	float local_v = frac(uv.y * 2.0);
+	float col = fmod(view_index, tile_cols);
+	float row = floor(view_index / tile_cols);
+	float atlas_u = (local_u + col) * tile_cols_inv;
+	float atlas_v = (local_v + row) * tile_rows_inv;
+	return atlas_tex.Sample(samp, float2(atlas_u, atlas_v));
+}
+)";
+
 // Blend pixel shader: tiled atlas texture, 50/50 mix
 static const char *ps_blend_source = R"(
 Texture2D atlas_tex : register(t0);
@@ -138,7 +164,7 @@ struct sim_display_processor_d3d12_impl
 {
 	struct xrt_display_processor_d3d12 base;
 	ID3D12RootSignature *root_signature;
-	ID3D12PipelineState *psos[4]; //!< One per output mode (SBS, anaglyph, blend, squeezed SBS)
+	ID3D12PipelineState *psos[5]; //!< One per output mode (SBS, anaglyph, blend, squeezed SBS, quad)
 
 	//! Nominal viewer parameters for faked eye positions.
 	float ipd_m;
@@ -250,16 +276,29 @@ sim_dp_d3d12_process_atlas(struct xrt_display_processor_d3d12 *xdp,
 
 static bool
 sim_dp_d3d12_get_predicted_eye_positions(struct xrt_display_processor_d3d12 *xdp,
-                                          struct xrt_eye_pair *out_eye_pair)
+                                          struct xrt_eye_positions *out)
 {
 	struct sim_display_processor_d3d12_impl *sdp = sim_dp_d3d12(xdp);
 	float half_ipd = sdp->ipd_m / 2.0f;
+	uint32_t vc = sim_display_get_view_count();
 
-	out_eye_pair->left = {sdp->nominal_x_m - half_ipd, sdp->nominal_y_m, sdp->nominal_z_m};
-	out_eye_pair->right = {sdp->nominal_x_m + half_ipd, sdp->nominal_y_m, sdp->nominal_z_m};
-	out_eye_pair->timestamp_ns = os_monotonic_get_ns();
-	out_eye_pair->valid = true;
-	out_eye_pair->is_tracking = false; // Nominal, not real tracking
+	if (vc == 1) {
+		out->eyes[0] = {sdp->nominal_x_m, sdp->nominal_y_m, sdp->nominal_z_m};
+		out->count = 1;
+	} else if (vc >= 4) {
+		out->eyes[0] = {sdp->nominal_x_m - half_ipd, sdp->nominal_y_m - 0.032f, sdp->nominal_z_m};
+		out->eyes[1] = {sdp->nominal_x_m + half_ipd, sdp->nominal_y_m - 0.032f, sdp->nominal_z_m};
+		out->eyes[2] = {sdp->nominal_x_m - half_ipd, sdp->nominal_y_m + 0.032f, sdp->nominal_z_m};
+		out->eyes[3] = {sdp->nominal_x_m + half_ipd, sdp->nominal_y_m + 0.032f, sdp->nominal_z_m};
+		out->count = 4;
+	} else {
+		out->eyes[0] = {sdp->nominal_x_m - half_ipd, sdp->nominal_y_m, sdp->nominal_z_m};
+		out->eyes[1] = {sdp->nominal_x_m + half_ipd, sdp->nominal_y_m, sdp->nominal_z_m};
+		out->count = 2;
+	}
+	out->timestamp_ns = os_monotonic_get_ns();
+	out->valid = true;
+	out->is_tracking = false; // Nominal, not real tracking
 	return true;
 }
 
@@ -271,7 +310,7 @@ sim_dp_d3d12_destroy(struct xrt_display_processor_d3d12 *xdp)
 	if (sdp->root_signature != nullptr) {
 		sdp->root_signature->Release();
 	}
-	for (int i = 0; i < 4; i++) {
+	for (int i = 0; i < 5; i++) {
 		if (sdp->psos[i] != nullptr) {
 			sdp->psos[i]->Release();
 		}
@@ -433,11 +472,11 @@ sim_display_processor_d3d12_create(enum sim_display_output_mode mode,
 		return XRT_ERROR_D3D;
 	}
 
-	// Compile all 4 pixel shaders and create PSOs
-	const char *ps_sources[4] = {ps_sbs_source, ps_anaglyph_source, ps_blend_source, ps_squeezed_sbs_source};
-	const char *ps_names[4] = {"SBS", "Anaglyph", "Blend", "Squeezed SBS"};
+	// Compile all 5 pixel shaders and create PSOs
+	const char *ps_sources[5] = {ps_sbs_source, ps_anaglyph_source, ps_blend_source, ps_squeezed_sbs_source, ps_quad_source};
+	const char *ps_names[5] = {"SBS", "Anaglyph", "Blend", "Squeezed SBS", "Quad"};
 
-	for (int i = 0; i < 4; i++) {
+	for (int i = 0; i < 5; i++) {
 		ID3DBlob *ps_blob = nullptr;
 		hr = compile_shader(ps_sources[i], "main", "ps_5_0", &ps_blob);
 		if (FAILED(hr)) {
@@ -485,10 +524,11 @@ sim_display_processor_d3d12_create(enum sim_display_output_mode mode,
 	// Set the initial output mode
 	sim_display_set_output_mode(mode);
 
-	U_LOG_W("Created sim display D3D12 processor (all 4 PSOs), initial mode: %s",
+	U_LOG_W("Created sim display D3D12 processor (all 5 PSOs), initial mode: %s",
 	        mode == SIM_DISPLAY_OUTPUT_SBS           ? "SBS" :
 	        mode == SIM_DISPLAY_OUTPUT_ANAGLYPH       ? "Anaglyph" :
-	        mode == SIM_DISPLAY_OUTPUT_SQUEEZED_SBS   ? "Squeezed SBS" : "Blend");
+	        mode == SIM_DISPLAY_OUTPUT_SQUEEZED_SBS   ? "Squeezed SBS" :
+	        mode == SIM_DISPLAY_OUTPUT_QUAD            ? "Quad" : "Blend");
 
 	*out_xdp = &sdp->base;
 	return XRT_SUCCESS;

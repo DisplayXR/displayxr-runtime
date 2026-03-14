@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  Stereo camera parameters struct
+ * @brief  View parameters struct for 3D display rendering
  *
  * UI-facing struct for IPD, parallax, perspective, and scale factors.
  * The math that applies these factors lives in display3d_view.h.
@@ -10,7 +10,7 @@
 
 #pragma once
 
-struct StereoParams {
+struct ViewParams {
     float ipdFactor = 1.0f;             // [0, 1] — 0=mono, 1=normal IPD
     float parallaxFactor = 1.0f;        // [0, 1] — 0=no head tracking, 1=full
 

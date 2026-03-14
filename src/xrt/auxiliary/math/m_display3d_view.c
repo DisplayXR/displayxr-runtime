@@ -2,13 +2,15 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  Unified display-centric stereo view math for 3D displays
+ * @brief  Unified display-centric multiview math for 3D displays
  *
- * Canonical implementation — see display3d_view.h for API docs.
+ * Canonical implementation — see m_display3d_view.h for API docs.
  */
 
 #include "m_display3d_view.h"
+#include "m_multiview.h"
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 // ============================================================================
@@ -112,50 +114,6 @@ display3d_default_tunables(void)
 	return t;
 }
 
-void
-display3d_apply_eye_factors(const struct xrt_vec3 *raw_left,
-                            const struct xrt_vec3 *raw_right,
-                            const struct xrt_vec3 *nominal_viewer,
-                            float ipd_factor,
-                            float parallax_factor,
-                            struct xrt_vec3 *out_left,
-                            struct xrt_vec3 *out_right)
-{
-	// Default nominal viewer if NULL (only z is used — x/y lerp toward origin)
-	float nom_z = 0.5f;
-	if (nominal_viewer) {
-		nom_z = nominal_viewer->z;
-	}
-
-	// Step 1: IPD factor — scale inter-eye vector, keep center fixed
-	float cx = (raw_left->x + raw_right->x) * 0.5f;
-	float cy = (raw_left->y + raw_right->y) * 0.5f;
-	float cz = (raw_left->z + raw_right->z) * 0.5f;
-
-	float lvx = (raw_left->x - cx) * ipd_factor;
-	float lvy = (raw_left->y - cy) * ipd_factor;
-	float lvz = (raw_left->z - cz) * ipd_factor;
-
-	float rvx = (raw_right->x - cx) * ipd_factor;
-	float rvy = (raw_right->y - cy) * ipd_factor;
-	float rvz = (raw_right->z - cz) * ipd_factor;
-
-	// Step 2: Parallax factor — lerp center toward (0, 0, nom_z).
-	// We use origin for x/y so that reducing parallax drives the viewpoint
-	// to the display-center axis rather than to an arbitrary nominal offset.
-	float cx2 = parallax_factor * cx;
-	float cy2 = parallax_factor * cy;
-	float cz2 = nom_z + parallax_factor * (cz - nom_z);
-
-	out_left->x = cx2 + lvx;
-	out_left->y = cy2 + lvy;
-	out_left->z = cz2 + lvz;
-
-	out_right->x = cx2 + rvx;
-	out_right->y = cy2 + rvy;
-	out_right->z = cz2 + rvz;
-}
-
 struct xrt_fov
 display3d_compute_fov(struct xrt_vec3 eye_pos, float screen_width_m, float screen_height_m)
 {
@@ -215,16 +173,15 @@ display3d_compute_projection(struct xrt_vec3 eye_pos,
 }
 
 void
-display3d_compute_stereo_views(const struct xrt_vec3 *raw_left,
-                               const struct xrt_vec3 *raw_right,
-                               const struct xrt_vec3 *nominal_viewer,
-                               const Display3DScreen *screen,
-                               const Display3DTunables *tunables,
-                               const struct xrt_pose *display_pose,
-                               float near_z,
-                               float far_z,
-                               Display3DStereoView *out_left,
-                               Display3DStereoView *out_right)
+display3d_compute_views(const struct xrt_vec3 *raw_eyes,
+                        uint32_t count,
+                        const struct xrt_vec3 *nominal_viewer,
+                        const Display3DScreen *screen,
+                        const Display3DTunables *tunables,
+                        const struct xrt_pose *display_pose,
+                        float near_z,
+                        float far_z,
+                        Display3DView *out_views)
 {
 	// Resolve defaults
 	Display3DTunables t = tunables ? *tunables : display3d_default_tunables();
@@ -236,18 +193,19 @@ display3d_compute_stereo_views(const struct xrt_vec3 *raw_left,
 		disp_pos = display_pose->position;
 	}
 
-	// Step 1-2: Apply IPD and parallax factors
-	struct xrt_vec3 processed[2];
-	display3d_apply_eye_factors(raw_left, raw_right, nominal_viewer,
-	                            t.ipd_factor, t.parallax_factor,
-	                            &processed[0], &processed[1]);
+	// Step 1-2: Apply view spread and parallax factors via N-view function
+	// Use stack allocation for small counts, heap for large
+	struct xrt_vec3 stack_processed[8];
+	struct xrt_vec3 *processed = (count <= 8) ? stack_processed : (struct xrt_vec3 *)malloc(count * sizeof(struct xrt_vec3));
+	m_multiview_apply_eye_factors(raw_eyes, count, nominal_viewer,
+	                              t.ipd_factor, t.parallax_factor,
+	                              processed);
 
 	// Compute meters-to-virtual conversion factor
 	float m2v = t.virtual_display_height / screen->height_m;
 
-	// Process each eye
-	Display3DStereoView *outputs[2] = {out_left, out_right};
-	for (int i = 0; i < 2; i++) {
+	// Process each view
+	for (uint32_t i = 0; i < count; i++) {
 		// Step 3: Apply perspective * m2v to eye XYZ
 		float es = t.perspective_factor * m2v;
 		struct xrt_vec3 eye_scaled;
@@ -256,7 +214,7 @@ display3d_compute_stereo_views(const struct xrt_vec3 *raw_left,
 		eye_scaled.z = processed[i].z * es;
 
 		// Store display-space eye (after all factors)
-		outputs[i]->eye_display = eye_scaled;
+		out_views[i].eye_display = eye_scaled;
 
 		// Step 4: Apply m2v to screen dimensions
 		float kScreenW = screen->width_m * m2v;
@@ -267,17 +225,20 @@ display3d_compute_stereo_views(const struct xrt_vec3 *raw_left,
 		eye_world.x += disp_pos.x;
 		eye_world.y += disp_pos.y;
 		eye_world.z += disp_pos.z;
-		outputs[i]->eye_world = eye_world;
+		out_views[i].eye_world = eye_world;
 
 		// Step 6: Build view matrix from world-space eye + display orientation
-		build_view_matrix(outputs[i]->view_matrix, disp_ori, eye_world);
-		outputs[i]->orientation = disp_ori;
+		build_view_matrix(out_views[i].view_matrix, disp_ori, eye_world);
+		out_views[i].orientation = disp_ori;
 
 		// Step 7: Build Kooima projection from display-space scaled eye + scaled screen
 		display3d_compute_projection(eye_scaled, kScreenW, kScreenH,
-		                             near_z, far_z, outputs[i]->projection_matrix);
+		                             near_z, far_z, out_views[i].projection_matrix);
 
 		// Step 8: Compute FOV angles from same
-		outputs[i]->fov = display3d_compute_fov(eye_scaled, kScreenW, kScreenH);
+		out_views[i].fov = display3d_compute_fov(eye_scaled, kScreenW, kScreenH);
 	}
+
+	if (count > 8)
+		free(processed);
 }

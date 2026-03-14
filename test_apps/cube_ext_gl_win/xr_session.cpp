@@ -237,8 +237,10 @@ bool CreateSession(XrSessionManager& xr, HDC hDC, HGLRC hGLRC, HWND hwnd) {
                 for (uint32_t i = 0; i < xr.renderingModeCount; i++) {
                     strncpy(xr.renderingModeNames[i], modes[i].modeName, XR_MAX_SYSTEM_NAME_SIZE - 1);
                     xr.renderingModeNames[i][XR_MAX_SYSTEM_NAME_SIZE - 1] = '\0';
-                    LOG_INFO("  [%u] %s (views=%u, scale=%.2fx%.2f, 3D=%d)", modes[i].modeIndex, modes[i].modeName, modes[i].viewCount, modes[i].viewScaleX, modes[i].viewScaleY, modes[i].hardwareDisplay3D);
+                    LOG_INFO("  [%u] %s (views=%u, tiles=%ux%u, scale=%.2fx%.2f, 3D=%d)", modes[i].modeIndex, modes[i].modeName, modes[i].viewCount, modes[i].tileColumns, modes[i].tileRows, modes[i].viewScaleX, modes[i].viewScaleY, modes[i].hardwareDisplay3D);
                     xr.renderingModeViewCounts[i] = modes[i].viewCount;
+                    xr.renderingModeTileColumns[i] = modes[i].tileColumns;
+                    xr.renderingModeTileRows[i] = modes[i].tileRows;
                     xr.renderingModeScaleX[i] = modes[i].viewScaleX;
                     xr.renderingModeScaleY[i] = modes[i].viewScaleY;
                     xr.renderingModeDisplay3D[i] = modes[i].hardwareDisplay3D ? true : false;

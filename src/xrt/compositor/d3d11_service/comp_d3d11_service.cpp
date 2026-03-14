@@ -2372,14 +2372,14 @@ d3d11_service_render_hud(struct d3d11_service_system *sys,
 			data.forward_z = fwd_out.z;
 		}
 
-		struct qwerty_stereo_state ss;
-		if (qwerty_get_stereo_state(sys->xsysd->xdevs, sys->xsysd->xdev_count, &ss)) {
+		struct qwerty_view_state ss;
+		if (qwerty_get_view_state(sys->xsysd->xdevs, sys->xsysd->xdev_count, &ss)) {
 			data.camera_mode = ss.camera_mode;
-			data.cam_ipd_factor = ss.cam_ipd_factor;
+			data.cam_spread_factor = ss.cam_spread_factor;
 			data.cam_parallax_factor = ss.cam_parallax_factor;
 			data.cam_convergence = ss.cam_convergence;
 			data.cam_half_tan_vfov = ss.cam_half_tan_vfov;
-			data.disp_ipd_factor = ss.disp_ipd_factor;
+			data.disp_spread_factor = ss.disp_spread_factor;
 			data.disp_parallax_factor = ss.disp_parallax_factor;
 			data.disp_vHeight = ss.disp_vHeight;
 			data.nominal_viewer_z = ss.nominal_viewer_z;
@@ -2665,12 +2665,14 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			}
 		}
 
-		// Rendering mode change from qwerty 1/2/3 keys
-		int render_mode = -1;
-		if (qwerty_check_rendering_mode_change(sys->xsysd->xdevs, sys->xsysd->xdev_count, &render_mode)) {
-			struct xrt_device *head = sys->xsysd->static_roles.head;
-			if (head != NULL) {
-				xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, render_mode);
+		// Rendering mode change from qwerty 1/2/3 keys (disabled for legacy apps).
+		if (!sys->base.info.legacy_app_tile_scaling) {
+			int render_mode = -1;
+			if (qwerty_check_rendering_mode_change(sys->xsysd->xdevs, sys->xsysd->xdev_count, &render_mode)) {
+				struct xrt_device *head = sys->xsysd->static_roles.head;
+				if (head != NULL) {
+					xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, render_mode);
+				}
 			}
 		}
 	}
@@ -2682,15 +2684,15 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	bool weaving_done = false;
 
 	if (c->render.display_processor != nullptr) {
-		struct xrt_eye_pair eyes;
+		struct xrt_eye_positions eyes;
 		if (xrt_display_processor_d3d11_get_predicted_eye_positions(
 		        c->render.display_processor, &eyes) && eyes.valid) {
-			left_eye.x = eyes.left.x;
-			left_eye.y = eyes.left.y;
-			left_eye.z = eyes.left.z;
-			right_eye.x = eyes.right.x;
-			right_eye.y = eyes.right.y;
-			right_eye.z = eyes.right.z;
+			left_eye.x = eyes.eyes[0].x;
+			left_eye.y = eyes.eyes[0].y;
+			left_eye.z = eyes.eyes[0].z;
+			right_eye.x = eyes.eyes[1].x;
+			right_eye.y = eyes.eyes[1].y;
+			right_eye.z = eyes.eyes[1].z;
 		}
 	}
 
@@ -3747,14 +3749,14 @@ comp_d3d11_service_get_predicted_eye_positions(struct xrt_system_compositor *xsy
 	}
 
 	if (dp != nullptr) {
-		struct xrt_eye_pair eyes;
+		struct xrt_eye_positions eyes;
 		if (xrt_display_processor_d3d11_get_predicted_eye_positions(dp, &eyes) && eyes.valid) {
-			out_left->x = eyes.left.x;
-			out_left->y = eyes.left.y;
-			out_left->z = eyes.left.z;
-			out_right->x = eyes.right.x;
-			out_right->y = eyes.right.y;
-			out_right->z = eyes.right.z;
+			out_left->x = eyes.eyes[0].x;
+			out_left->y = eyes.eyes[0].y;
+			out_left->z = eyes.eyes[0].z;
+			out_right->x = eyes.eyes[1].x;
+			out_right->y = eyes.eyes[1].y;
+			out_right->z = eyes.eyes[1].z;
 
 			// Log periodically for debugging
 			static int log_counter = 0;

@@ -17,6 +17,7 @@
 #define XR_USE_GRAPHICS_API_VULKAN
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
+#include <openxr/XR_EXT_display_info.h>
 
 #include <cmath>
 #include <csignal>
@@ -1687,6 +1688,17 @@ struct AppXrSession {
     XrSessionState sessionState = XR_SESSION_STATE_UNKNOWN;
     bool sessionRunning = false;
     bool exitRequested = false;
+
+    // Rendering mode enumeration (XR_EXT_display_info)
+    PFN_xrEnumerateDisplayRenderingModesEXT pfnEnumerateDisplayRenderingModesEXT = nullptr;
+    uint32_t displayPixelWidth = 0, displayPixelHeight = 0;
+    uint32_t renderingModeCount = 0;
+    uint32_t renderingModeTileColumns[8] = {};
+    uint32_t renderingModeTileRows[8] = {};
+    float renderingModeScaleX[8] = {};
+    float renderingModeScaleY[8] = {};
+    uint32_t renderingModeViewCounts[8] = {};
+    uint32_t currentModeIndex = 0;
 };
 
 static bool InitializeOpenXR(AppXrSession& xr) {
@@ -1699,13 +1711,18 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     XR_CHECK(xrEnumerateInstanceExtensionProperties(nullptr, extensionCount, &extensionCount, extensions.data()));
 
     bool hasVulkan = false;
+    bool hasDisplayInfo = false;
     for (const auto& ext : extensions) {
         if (strcmp(ext.extensionName, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) == 0) {
             hasVulkan = true;
         }
+        if (strcmp(ext.extensionName, XR_EXT_DISPLAY_INFO_EXTENSION_NAME) == 0) {
+            hasDisplayInfo = true;
+        }
     }
 
     LOG_INFO("XR_KHR_vulkan_enable: %s", hasVulkan ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_EXT_display_info: %s", hasDisplayInfo ? "AVAILABLE" : "NOT FOUND");
     if (!hasVulkan) {
         LOG_ERROR("XR_KHR_vulkan_enable extension not available");
         return false;
@@ -1713,6 +1730,9 @@ static bool InitializeOpenXR(AppXrSession& xr) {
 
     std::vector<const char*> enabledExtensions;
     enabledExtensions.push_back(XR_KHR_VULKAN_ENABLE_EXTENSION_NAME);
+    if (hasDisplayInfo) {
+        enabledExtensions.push_back(XR_EXT_DISPLAY_INFO_EXTENSION_NAME);
+    }
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
     strncpy(createInfo.applicationInfo.applicationName, "SimCubeOpenXR",
@@ -1731,6 +1751,18 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     XrSystemGetInfo systemInfo = {XR_TYPE_SYSTEM_GET_INFO};
     systemInfo.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
     XR_CHECK(xrGetSystem(xr.instance, &systemInfo, &xr.systemId));
+
+    // Query display pixel dimensions for swapchain sizing
+    {
+        XrSystemProperties sysProps = {XR_TYPE_SYSTEM_PROPERTIES};
+        XrDisplayInfoEXT displayInfo = {XR_TYPE_DISPLAY_INFO_EXT};
+        sysProps.next = &displayInfo;
+        if (XR_SUCCEEDED(xrGetSystemProperties(xr.instance, xr.systemId, &sysProps))) {
+            xr.displayPixelWidth = displayInfo.displayPixelWidth;
+            xr.displayPixelHeight = displayInfo.displayPixelHeight;
+            LOG_INFO("Display pixels: %ux%u", xr.displayPixelWidth, xr.displayPixelHeight);
+        }
+    }
 
     uint32_t viewCount = 0;
     XR_CHECK(xrEnumerateViewConfigurationViews(xr.instance, xr.systemId, xr.viewConfigType, 0, &viewCount, nullptr));
@@ -1968,6 +2000,36 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
     XR_CHECK(xrCreateSession(xr.instance, &sessionInfo, &xr.session));
     LOG_INFO("Session created");
 
+    // Enumerate rendering modes (XR_EXT_display_info)
+    xrGetInstanceProcAddr(xr.instance, "xrEnumerateDisplayRenderingModesEXT",
+        (PFN_xrVoidFunction*)&xr.pfnEnumerateDisplayRenderingModesEXT);
+    if (xr.pfnEnumerateDisplayRenderingModesEXT) {
+        uint32_t modeCount = 0;
+        XrResult enumRes = xr.pfnEnumerateDisplayRenderingModesEXT(xr.session, 0, &modeCount, nullptr);
+        if (XR_SUCCEEDED(enumRes) && modeCount > 0) {
+            std::vector<XrDisplayRenderingModeInfoEXT> modes(modeCount);
+            for (uint32_t i = 0; i < modeCount; i++) {
+                modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT;
+                modes[i].next = nullptr;
+            }
+            enumRes = xr.pfnEnumerateDisplayRenderingModesEXT(xr.session, modeCount, &modeCount, modes.data());
+            if (XR_SUCCEEDED(enumRes)) {
+                xr.renderingModeCount = modeCount > 8 ? 8 : modeCount;
+                for (uint32_t i = 0; i < xr.renderingModeCount; i++) {
+                    xr.renderingModeViewCounts[i] = modes[i].viewCount;
+                    xr.renderingModeTileColumns[i] = modes[i].tileColumns;
+                    xr.renderingModeTileRows[i] = modes[i].tileRows;
+                    xr.renderingModeScaleX[i] = modes[i].viewScaleX;
+                    xr.renderingModeScaleY[i] = modes[i].viewScaleY;
+                    LOG_INFO("  Mode %u: '%s' views=%u tiles=%ux%u scale=%.2fx%.2f",
+                        i, modes[i].modeName, modes[i].viewCount,
+                        modes[i].tileColumns, modes[i].tileRows,
+                        modes[i].viewScaleX, modes[i].viewScaleY);
+                }
+            }
+        }
+    }
+
     return true;
 }
 
@@ -1991,7 +2053,7 @@ static bool CreateSpaces(AppXrSession& xr) {
 }
 
 static bool CreateSwapchain(AppXrSession& xr) {
-    LOG_INFO("Creating single SBS swapchain...");
+    LOG_INFO("Creating atlas swapchain...");
 
     uint32_t formatCount = 0;
     XR_CHECK(xrEnumerateSwapchainFormats(xr.session, 0, &formatCount, nullptr));
@@ -2004,18 +2066,31 @@ static bool CreateSwapchain(AppXrSession& xr) {
 
     const auto& view = xr.configViews[0];
 
-    // Single SBS swapchain: 2x width for side-by-side stereo
+    // Size swapchain for the maximum atlas across all rendering modes.
+    // Each mode's atlas is: (tileColumns * scaleX * displayW) × (tileRows * scaleY * displayH).
+    uint32_t scWidth = view.recommendedImageRectWidth * 2;  // fallback: stereo SBS
+    uint32_t scHeight = view.recommendedImageRectHeight;
+    if (xr.renderingModeCount > 0 && xr.displayPixelWidth > 0 && xr.displayPixelHeight > 0) {
+        scWidth = 0; scHeight = 0;
+        for (uint32_t i = 0; i < xr.renderingModeCount; i++) {
+            uint32_t mw = (uint32_t)(xr.renderingModeTileColumns[i] * xr.renderingModeScaleX[i] * xr.displayPixelWidth);
+            uint32_t mh = (uint32_t)(xr.renderingModeTileRows[i] * xr.renderingModeScaleY[i] * xr.displayPixelHeight);
+            if (mw > scWidth) scWidth = mw;
+            if (mh > scHeight) scHeight = mh;
+        }
+    }
+
     XrSwapchainCreateInfo swapchainInfo = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
     swapchainInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
     swapchainInfo.format = selectedFormat;
     swapchainInfo.sampleCount = view.recommendedSwapchainSampleCount;
-    swapchainInfo.width = view.recommendedImageRectWidth * 2;
-    swapchainInfo.height = view.recommendedImageRectHeight;
+    swapchainInfo.width = scWidth;
+    swapchainInfo.height = scHeight;
     swapchainInfo.faceCount = 1;
     swapchainInfo.arraySize = 1;
     swapchainInfo.mipCount = 1;
 
-    LOG_INFO("  SBS swapchain: %ux%u", swapchainInfo.width, swapchainInfo.height);
+    LOG_INFO("  Atlas swapchain: %ux%u", swapchainInfo.width, swapchainInfo.height);
 
     XR_CHECK(xrCreateSwapchain(xr.session, &swapchainInfo, &xr.swapchain.swapchain));
 
@@ -2028,7 +2103,7 @@ static bool CreateSwapchain(AppXrSession& xr) {
     xr.swapchain.imageCount = imageCount;
 
     LOG_INFO("  %u swapchain images", imageCount);
-    LOG_INFO("SBS swapchain created");
+    LOG_INFO("Atlas swapchain created");
     return true;
 }
 
@@ -2068,6 +2143,13 @@ static bool PollEvents(AppXrSession& xr) {
         case XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING:
             xr.exitRequested = true;
             break;
+        case (XrStructureType)XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_EXT: {
+            auto* modeEvent = (XrEventDataRenderingModeChangedEXT*)&event;
+            LOG_INFO("Rendering mode changed: %u -> %u",
+                modeEvent->previousModeIndex, modeEvent->currentModeIndex);
+            xr.currentModeIndex = modeEvent->currentModeIndex;
+            break;
+        }
         default:
             break;
         }
@@ -2117,10 +2199,10 @@ static bool ReleaseSwapchainImage(AppXrSession& xr) {
     return XR_SUCCEEDED(xrReleaseSwapchainImage(xr.swapchain.swapchain, &releaseInfo));
 }
 
-static bool EndFrame(AppXrSession& xr, XrTime displayTime, const XrCompositionLayerProjectionView* views) {
+static bool EndFrame(AppXrSession& xr, XrTime displayTime, const XrCompositionLayerProjectionView* views, uint32_t viewCount) {
     XrCompositionLayerProjection projectionLayer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
     projectionLayer.space = xr.localSpace;
-    projectionLayer.viewCount = 2;
+    projectionLayer.viewCount = viewCount;
     projectionLayer.views = views;
 
     const XrCompositionLayerBaseHeader* layers[] = {
@@ -2321,21 +2403,24 @@ int main() {
         if (xr.sessionRunning) {
             XrFrameState frameState;
             if (BeginFrame(xr, frameState)) {
-                XrCompositionLayerProjectionView projectionViews[2] = {};
                 bool rendered = false;
+                uint32_t viewCount = 0;
+                std::vector<XrCompositionLayerProjectionView> projectionViews;
 
                 if (frameState.shouldRender) {
-                    // Locate views
+                    // Locate views — first query count, then fetch
                     XrViewLocateInfo locateInfo = {XR_TYPE_VIEW_LOCATE_INFO};
                     locateInfo.viewConfigurationType = xr.viewConfigType;
                     locateInfo.displayTime = frameState.predictedDisplayTime;
                     locateInfo.space = xr.localSpace;
 
                     XrViewState viewState = {XR_TYPE_VIEW_STATE};
-                    uint32_t viewCount = 2;
-                    XrView views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+                    // Query view count
+                    xrLocateViews(xr.session, &locateInfo, &viewState, 0, &viewCount, nullptr);
+                    if (viewCount == 0) viewCount = 2; // fallback
 
-                    XrResult locResult = xrLocateViews(xr.session, &locateInfo, &viewState, 2, &viewCount, views);
+                    std::vector<XrView> views(viewCount, {XR_TYPE_VIEW});
+                    XrResult locResult = xrLocateViews(xr.session, &locateInfo, &viewState, viewCount, &viewCount, views.data());
                     if (XR_SUCCEEDED(locResult) &&
                         (viewState.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) &&
                         (viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT))
@@ -2344,37 +2429,51 @@ int main() {
                         if (AcquireSwapchainImage(xr, imageIndex)) {
                             rendered = true;
 
-                            uint32_t renderW = xr.swapchain.width / 2;
-                            uint32_t renderH = xr.swapchain.height;
-
-                            EyeRenderParams eyeParams[2] = {};
-                            for (int eye = 0; eye < 2; eye++) {
-                                eyeParams[eye].viewportX = eye * renderW;
-                                eyeParams[eye].viewportY = 0;
-                                eyeParams[eye].width = renderW;
-                                eyeParams[eye].height = renderH;
-                                mat4_view_from_xr_pose(eyeParams[eye].viewMat, views[eye].pose);
-                                mat4_from_xr_fov(eyeParams[eye].projMat, views[eye].fov, 0.01f, 100.0f);
-
-                                projectionViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
-                                projectionViews[eye].subImage.swapchain = xr.swapchain.swapchain;
-                                projectionViews[eye].subImage.imageRect.offset = {(int32_t)(eye * renderW), 0};
-                                projectionViews[eye].subImage.imageRect.extent = {
-                                    (int32_t)renderW, (int32_t)renderH
-                                };
-                                projectionViews[eye].subImage.imageArrayIndex = 0;
-                                projectionViews[eye].pose = views[eye].pose;
-                                projectionViews[eye].fov = views[eye].fov;
+                            // Get tile layout from current rendering mode (fallback: Nx1)
+                            uint32_t tileColumns = viewCount;
+                            uint32_t tileRows = 1;
+                            if (xr.renderingModeCount > 0 && xr.currentModeIndex < xr.renderingModeCount) {
+                                tileColumns = xr.renderingModeTileColumns[xr.currentModeIndex];
+                                tileRows = xr.renderingModeTileRows[xr.currentModeIndex];
+                                if (tileColumns == 0) tileColumns = viewCount;
+                                if (tileRows == 0) tileRows = 1;
                             }
 
-                            RenderScene(vkRenderer, imageIndex, eyeParams, 2);
+                            uint32_t eyeW = xr.swapchain.width / tileColumns;
+                            uint32_t eyeH = xr.swapchain.height / tileRows;
+
+                            std::vector<EyeRenderParams> eyeParams(viewCount);
+                            projectionViews.resize(viewCount, {});
+                            for (uint32_t i = 0; i < viewCount; i++) {
+                                uint32_t tileX = i % tileColumns;
+                                uint32_t tileY = i / tileColumns;
+
+                                eyeParams[i].viewportX = tileX * eyeW;
+                                eyeParams[i].viewportY = tileY * eyeH;
+                                eyeParams[i].width = eyeW;
+                                eyeParams[i].height = eyeH;
+                                mat4_view_from_xr_pose(eyeParams[i].viewMat, views[i].pose);
+                                mat4_from_xr_fov(eyeParams[i].projMat, views[i].fov, 0.01f, 100.0f);
+
+                                projectionViews[i].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
+                                projectionViews[i].subImage.swapchain = xr.swapchain.swapchain;
+                                projectionViews[i].subImage.imageRect.offset = {(int32_t)(tileX * eyeW), (int32_t)(tileY * eyeH)};
+                                projectionViews[i].subImage.imageRect.extent = {
+                                    (int32_t)eyeW, (int32_t)eyeH
+                                };
+                                projectionViews[i].subImage.imageArrayIndex = 0;
+                                projectionViews[i].pose = views[i].pose;
+                                projectionViews[i].fov = views[i].fov;
+                            }
+
+                            RenderScene(vkRenderer, imageIndex, eyeParams.data(), (int)viewCount);
                             ReleaseSwapchainImage(xr);
                         }
                     }
                 }
 
                 if (rendered) {
-                    EndFrame(xr, frameState.predictedDisplayTime, projectionViews);
+                    EndFrame(xr, frameState.predictedDisplayTime, projectionViews.data(), viewCount);
                 } else {
                     // Submit empty frame
                     XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};

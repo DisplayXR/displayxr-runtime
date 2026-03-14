@@ -492,7 +492,7 @@ qwerty_process_win32(struct xrt_device **xdevs,
 		// Spacebar = reset stereo to camera defaults (HMD focused only)
 		case VK_SPACE:
 			if (is_keydown && qsys->hmd_focused)
-				qwerty_reset_stereo(qsys);
+				qwerty_reset_view_state(qsys);
 			break;
 
 		// ESC key to close window
@@ -642,7 +642,7 @@ qwerty_process_win32(struct xrt_device **xdevs,
 				bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
 				if (shift) {
 					float mult = (steps > 0) ? 1.1f : (1.0f / 1.1f);
-					qwerty_adjust_stereo_factor(qsys, mult);
+					qwerty_adjust_view_factor(qsys, mult);
 				} else if (qsys->camera_mode) {
 					qwerty_adjust_convergence(qsys, (steps > 0) ? 1.0f : -1.0f);
 				} else {

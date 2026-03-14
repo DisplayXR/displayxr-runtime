@@ -47,17 +47,17 @@ struct qwerty_system
 	int rendering_mode;                  //!< Current unified rendering mode index (0=2D, 1+=3D modes)
 	bool rendering_mode_change_pending;  //!< Set by key handler, cleared by caller
 
-	// Stereo controls (P toggles mode with derivation, spacebar resets)
+	// View controls (P toggles mode with derivation, spacebar resets)
 	bool camera_mode; //!< true=camera-centric (default), false=display-centric
 
 	// Camera-centric state (user adjusts when camera_mode=true)
-	float cam_ipd_factor;      //!< [0.01,1] default 1.0 (= cam_parallax always)
+	float cam_spread_factor;      //!< [0.01,1] default 1.0 (= cam_parallax always)
 	float cam_parallax_factor; //!< [0.01,1] default 1.0 (= cam_ipd always)
 	float cam_convergence;     //!< [0,2] diopters, default 0.5
 	float cam_half_tan_vfov;   //!< default 0.3249 — derived only, not user-adjustable
 
 	// Display-centric state (user adjusts when camera_mode=false)
-	float disp_ipd_factor;      //!< [0.01,1] default 1.0 (= disp_parallax always)
+	float disp_spread_factor;      //!< [0.01,1] default 1.0 (= disp_parallax always)
 	float disp_parallax_factor; //!< [0.01,1] default 1.0 (= disp_ipd always)
 	float disp_vHeight;         //!< [0.1,10] meters, default 1.3
 
@@ -457,7 +457,7 @@ void
 qwerty_set_rendering_mode(struct qwerty_system *qs, int mode);
 
 /*!
- * Toggle between camera-centric and display-centric stereo mode.
+ * Toggle between camera-centric and display-centric view mode.
  * @public @memberof qwerty_system
  */
 void
@@ -468,7 +468,7 @@ qwerty_toggle_camera_mode(struct qwerty_system *qs);
  * @public @memberof qwerty_system
  */
 void
-qwerty_adjust_stereo_factor(struct qwerty_system *qs, float multiplier);
+qwerty_adjust_view_factor(struct qwerty_system *qs, float multiplier);
 
 /*!
  * Adjust convergence by additive direction (camera mode only, ±0.05, clamped [0,2]).
@@ -487,11 +487,11 @@ void
 qwerty_adjust_vheight(struct qwerty_system *qs, float multiplier);
 
 /*!
- * Reset all stereo state to camera defaults and HMD position to (0, 1.6, 0).
+ * Reset all view state to camera defaults and HMD position to (0, 1.6, 0).
  * @public @memberof qwerty_system
  */
 void
-qwerty_reset_stereo(struct qwerty_system *qs);
+qwerty_reset_view_state(struct qwerty_system *qs);
 
 
 /*!

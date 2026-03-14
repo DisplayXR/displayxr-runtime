@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  Unified display-centric stereo view math for 3D displays
+ * @brief  Unified display-centric multiview math for 3D displays
  *
  * Canonical implementation of Kooima asymmetric frustum projection, view matrix
- * construction, and stereo eye factor processing. Any project that needs
- * display-centric stereo views should use this library instead of reimplementing
+ * construction, and multiview factor processing. Any project that needs
+ * display-centric views should use this library instead of reimplementing
  * the math. Pure C, depends only on xrt_defines.h and <math.h>.
  *
  * Reference: Robert Kooima, "Generalized Perspective Projection" (2009)
@@ -28,8 +28,8 @@ extern "C" {
 // --- Structs ---
 
 typedef struct Display3DTunables {
-	float ipd_factor;              //!< [0, 1] — scales inter-eye distance (0=mono, 1=full)
-	float parallax_factor;         //!< [0, 1] — lerps eye center toward nominal (0=no tracking, 1=full)
+	float ipd_factor;              //!< [0, 1] — scales inter-view distance (0=mono, 1=full)
+	float parallax_factor;         //!< [0, 1] — lerps view center toward nominal (0=no tracking, 1=full)
 	float perspective_factor;      //!< [0.1, 10] — scales eye XYZ only (changes object perspective)
 	float virtual_display_height;  //!< Virtual display height in app units (always required;
 	                               //!< use physical display height for 1:1 meters)
@@ -40,22 +40,22 @@ typedef struct Display3DScreen {
 	float height_m; //!< Physical screen height (meters)
 } Display3DScreen;
 
-typedef struct Display3DStereoView {
+typedef struct Display3DView {
 	float view_matrix[16];       //!< Column-major 4x4 view matrix
 	float projection_matrix[16]; //!< Column-major 4x4 projection matrix
 	struct xrt_fov fov;          //!< Equivalent asymmetric FOV angles (radians)
 	struct xrt_vec3 eye_display; //!< Modified eye position in display space (after all factors)
 	struct xrt_vec3 eye_world;   //!< Eye position in world space (after display pose transform)
-	struct xrt_quat orientation; //!< Display/camera orientation (same for both eyes)
-} Display3DStereoView;
+	struct xrt_quat orientation; //!< Display/camera orientation (same for all views)
+} Display3DView;
 
 // --- Functions ---
 
 /*!
- * All-in-one: compute stereo view+projection from raw eye tracking data.
+ * All-in-one: compute multiview view+projection from raw eye tracking data.
  *
  * Pipeline:
- *   1. Apply IPD factor (scale inter-eye vector, keep center fixed)
+ *   1. Apply view spread factor (scale inter-view vector, keep center fixed)
  *   2. Apply parallax factor (lerp center toward nominal viewer)
  *   3. Apply perspective * m2v to eye XYZ (view matrix + Kooima eye)
  *   4. Apply m2v to screen W/H (Kooima screen dims)
@@ -64,30 +64,28 @@ typedef struct Display3DStereoView {
  *   7. Build Kooima projection matrix from display-space scaled eye + scaled screen
  *   8. Compute FOV angles from same
  *
- * @param raw_left       Raw left eye in DISPLAY space (from xrLocateViews)
- * @param raw_right      Raw right eye in DISPLAY space (from xrLocateViews)
+ * @param raw_eyes       Array of N raw view positions in DISPLAY space (from xrLocateViews)
+ * @param count          Number of views (must be >= 1)
  * @param nominal_viewer Nominal viewer position in DISPLAY space (or NULL for {0,0,0.5})
  * @param screen         Physical screen dimensions
- * @param tunables       Stereo factors (or NULL for defaults: all 1.0)
+ * @param tunables       View factors (or NULL for defaults: all 1.0)
  * @param display_pose   Display pose in world space (or NULL for identity)
  * @param near_z         Near clip plane distance
  * @param far_z          Far clip plane distance
- * @param out_left       Output left eye view
- * @param out_right      Output right eye view
+ * @param out_views      Output array of N views
  *
  * @ingroup aux_math
  */
 void
-display3d_compute_stereo_views(const struct xrt_vec3 *raw_left,
-                               const struct xrt_vec3 *raw_right,
-                               const struct xrt_vec3 *nominal_viewer,
-                               const Display3DScreen *screen,
-                               const Display3DTunables *tunables,
-                               const struct xrt_pose *display_pose,
-                               float near_z,
-                               float far_z,
-                               Display3DStereoView *out_left,
-                               Display3DStereoView *out_right);
+display3d_compute_views(const struct xrt_vec3 *raw_eyes,
+                        uint32_t count,
+                        const struct xrt_vec3 *nominal_viewer,
+                        const Display3DScreen *screen,
+                        const Display3DTunables *tunables,
+                        const struct xrt_pose *display_pose,
+                        float near_z,
+                        float far_z,
+                        Display3DView *out_views);
 
 /*!
  * Compute Kooima FOV angles only (no matrices). Useful for runtime-side
@@ -122,29 +120,6 @@ display3d_compute_projection(struct xrt_vec3 eye_pos,
                              float near_z,
                              float far_z,
                              float *out_matrix);
-
-/*!
- * Apply eye factors only (IPD + parallax). Useful when caller builds
- * its own view matrix but wants consistent eye processing.
- *
- * @param raw_left        Raw left eye position
- * @param raw_right       Raw right eye position
- * @param nominal_viewer  Nominal viewer position (or NULL for {0,0,0.5})
- * @param ipd_factor      IPD scaling factor [0, 1]
- * @param parallax_factor Parallax lerp factor [0, 1]
- * @param out_left        Output processed left eye position
- * @param out_right       Output processed right eye position
- *
- * @ingroup aux_math
- */
-void
-display3d_apply_eye_factors(const struct xrt_vec3 *raw_left,
-                            const struct xrt_vec3 *raw_right,
-                            const struct xrt_vec3 *nominal_viewer,
-                            float ipd_factor,
-                            float parallax_factor,
-                            struct xrt_vec3 *out_left,
-                            struct xrt_vec3 *out_right);
 
 /*!
  * Default tunables (all factors = 1.0).

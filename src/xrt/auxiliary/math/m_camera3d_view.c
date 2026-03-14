@@ -2,13 +2,15 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  Camera-centric stereo view math for 3D displays
+ * @brief  Camera-centric multiview math for 3D displays
  *
- * Canonical implementation — see camera3d_view.h for API docs.
+ * Canonical implementation — see m_camera3d_view.h for API docs.
  */
 
 #include "m_camera3d_view.h"
+#include "m_multiview.h"
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 // ============================================================================
@@ -132,21 +134,20 @@ camera3d_default_tunables(void)
 	t.ipd_factor = 1.0f;
 	t.parallax_factor = 1.0f;
 	t.inv_convergence_distance = 1.0f;
-	t.half_tan_vfov = 0.32491969623f; // tan(18 deg) → 36° vFOV
+	t.half_tan_vfov = 0.32491969623f; // tan(18 deg) -> 36 deg vFOV
 	return t;
 }
 
 void
-camera3d_compute_stereo_views(const struct xrt_vec3 *raw_left,
-                              const struct xrt_vec3 *raw_right,
-                              const struct xrt_vec3 *nominal_viewer,
-                              const Display3DScreen *screen,
-                              const Camera3DTunables *tunables,
-                              const struct xrt_pose *camera_pose,
-                              float near_z,
-                              float far_z,
-                              Camera3DStereoView *out_left,
-                              Camera3DStereoView *out_right)
+camera3d_compute_views(const struct xrt_vec3 *raw_eyes,
+                       uint32_t count,
+                       const struct xrt_vec3 *nominal_viewer,
+                       const Display3DScreen *screen,
+                       const Camera3DTunables *tunables,
+                       const struct xrt_pose *camera_pose,
+                       float near_z,
+                       float far_z,
+                       Camera3DView *out_views)
 {
 	// Resolve defaults
 	Camera3DTunables t = tunables ? *tunables : camera3d_default_tunables();
@@ -164,10 +165,11 @@ camera3d_compute_stereo_views(const struct xrt_vec3 *raw_left,
 		nom_z = nominal_viewer->z;
 	}
 
-	// Step 1: Apply IPD and parallax factors (shared with display-centric path)
-	struct xrt_vec3 processed[2];
-	display3d_apply_eye_factors(raw_left, raw_right, nominal_viewer, t.ipd_factor, t.parallax_factor,
-	                            &processed[0], &processed[1]);
+	// Step 1: Apply view spread and parallax factors via N-view function
+	struct xrt_vec3 stack_processed[8];
+	struct xrt_vec3 *processed = (count <= 8) ? stack_processed : (struct xrt_vec3 *)malloc(count * sizeof(struct xrt_vec3));
+	m_multiview_apply_eye_factors(raw_eyes, count, nominal_viewer, t.ipd_factor, t.parallax_factor,
+	                              processed);
 
 	// Aspect ratio for horizontal FOV
 	float aspect = screen->width_m / screen->height_m;
@@ -175,9 +177,8 @@ camera3d_compute_stereo_views(const struct xrt_vec3 *raw_left,
 	float uo = t.half_tan_vfov;          // vertical half-tangent
 	float invd = t.inv_convergence_distance;
 
-	// Process each eye
-	Camera3DStereoView *outputs[2] = {out_left, out_right};
-	for (int i = 0; i < 2; i++) {
+	// Process each view
+	for (uint32_t i = 0; i < count; i++) {
 		// Step 2: Compute eye_local = displacement from nominal screen plane
 		struct xrt_vec3 eye_local;
 		eye_local.x = processed[i].x;
@@ -189,11 +190,11 @@ camera3d_compute_stereo_views(const struct xrt_vec3 *raw_left,
 		eye_world.x += cam_pos.x;
 		eye_world.y += cam_pos.y;
 		eye_world.z += cam_pos.z;
-		outputs[i]->eye_world = eye_world;
+		out_views[i].eye_world = eye_world;
 
 		// Step 4: Build view matrix from world-space eye + camera orientation
-		cam3d_build_view_matrix(outputs[i]->view_matrix, cam_ori, eye_world);
-		outputs[i]->orientation = cam_ori;
+		cam3d_build_view_matrix(out_views[i].view_matrix, cam_ori, eye_world);
+		out_views[i].orientation = cam_ori;
 
 		// Step 5: Scale eye_local by inv_convergence_distance for projection shifts
 		float dx = eye_local.x * invd;
@@ -209,12 +210,15 @@ camera3d_compute_stereo_views(const struct xrt_vec3 *raw_left,
 
 		// Step 8: Build projection matrix from tangent half-angles
 		cam3d_build_projection_from_tangents(tan_left, tan_right, tan_down, tan_up, near_z, far_z,
-		                                     outputs[i]->projection_matrix);
+		                                     out_views[i].projection_matrix);
 
 		// Step 9: Convert tangents to xrt_fov (signed angle convention)
-		outputs[i]->fov.angle_left = -atanf(tan_left);
-		outputs[i]->fov.angle_right = atanf(tan_right);
-		outputs[i]->fov.angle_up = atanf(tan_up);
-		outputs[i]->fov.angle_down = -atanf(tan_down);
+		out_views[i].fov.angle_left = -atanf(tan_left);
+		out_views[i].fov.angle_right = atanf(tan_right);
+		out_views[i].fov.angle_up = atanf(tan_up);
+		out_views[i].fov.angle_down = -atanf(tan_down);
 	}
+
+	if (count > 8)
+		free(processed);
 }

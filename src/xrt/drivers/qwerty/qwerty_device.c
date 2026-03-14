@@ -602,17 +602,17 @@ qwerty_system_create(struct qwerty_hmd *qhmd,
 	// Default rendering mode matches sim_display default (mode 1 = first 3D mode)
 	qs->rendering_mode = 1;
 
-	// Stereo defaults
+	// View defaults
 	qs->camera_mode = true;
 
 	// Camera-centric defaults
-	qs->cam_ipd_factor = 1.0f;
+	qs->cam_spread_factor = 1.0f;
 	qs->cam_parallax_factor = 1.0f;
 	qs->cam_convergence = 0.5f;      // 0.5 diopters = 2m convergence
 	qs->cam_half_tan_vfov = 0.3249f; // tan(18 deg) -> 36 deg vFOV
 
 	// Display-centric defaults
-	qs->disp_ipd_factor = 1.0f;
+	qs->disp_spread_factor = 1.0f;
 	qs->disp_parallax_factor = 1.0f;
 	qs->disp_vHeight = 1.3f; // 1.3m
 
@@ -1063,21 +1063,21 @@ qwerty_toggle_camera_mode(struct qwerty_system *qs)
 		reset_controller_for_mode(qs, qs->rctrl, false);
 	}
 
-	U_LOG_W("Qwerty: stereo mode -> %s (derived from previous state)",
+	U_LOG_W("Qwerty: view mode -> %s (derived from previous state)",
 	        qs->camera_mode ? "Camera" : "Display");
 }
 
 void
-qwerty_adjust_stereo_factor(struct qwerty_system *qs, float multiplier)
+qwerty_adjust_view_factor(struct qwerty_system *qs, float multiplier)
 {
 	if (qs->camera_mode) {
-		float v = clampf(qs->cam_ipd_factor * multiplier, 0.01f, 1.0f);
-		qs->cam_ipd_factor = v;
+		float v = clampf(qs->cam_spread_factor * multiplier, 0.01f, 1.0f);
+		qs->cam_spread_factor = v;
 		qs->cam_parallax_factor = v;
 		U_LOG_I("Qwerty: Camera IPD/Parallax = %.3f", v);
 	} else {
-		float v = clampf(qs->disp_ipd_factor * multiplier, 0.01f, 1.0f);
-		qs->disp_ipd_factor = v;
+		float v = clampf(qs->disp_spread_factor * multiplier, 0.01f, 1.0f);
+		qs->disp_spread_factor = v;
 		qs->disp_parallax_factor = v;
 		U_LOG_I("Qwerty: Display IPD/Parallax = %.3f", v);
 	}
@@ -1104,16 +1104,16 @@ qwerty_adjust_vheight(struct qwerty_system *qs, float multiplier)
 }
 
 void
-qwerty_reset_stereo(struct qwerty_system *qs)
+qwerty_reset_view_state(struct qwerty_system *qs)
 {
 	qs->camera_mode = true;
 
-	qs->cam_ipd_factor = 1.0f;
+	qs->cam_spread_factor = 1.0f;
 	qs->cam_parallax_factor = 1.0f;
 	qs->cam_convergence = 0.5f;
 	qs->cam_half_tan_vfov = 0.3249f;
 
-	qs->disp_ipd_factor = 1.0f;
+	qs->disp_spread_factor = 1.0f;
 	qs->disp_parallax_factor = 1.0f;
 	qs->disp_vHeight = 1.3f;
 
@@ -1122,11 +1122,11 @@ qwerty_reset_stereo(struct qwerty_system *qs)
 		qs->hmd->base.pose.orientation = (struct xrt_quat)XRT_QUAT_IDENTITY;
 	}
 
-	U_LOG_W("Qwerty: stereo reset to camera defaults");
+	U_LOG_W("Qwerty: view state reset to camera defaults");
 }
 
 bool
-qwerty_get_stereo_state(struct xrt_device **xdevs, size_t xdev_count, struct qwerty_stereo_state *out)
+qwerty_get_view_state(struct xrt_device **xdevs, size_t xdev_count, struct qwerty_view_state *out)
 {
 	if (xdevs == NULL || out == NULL) {
 		return false;
@@ -1152,12 +1152,12 @@ qwerty_get_stereo_state(struct xrt_device **xdevs, size_t xdev_count, struct qwe
 
 	out->camera_mode = qs->camera_mode;
 
-	out->cam_ipd_factor = qs->cam_ipd_factor;
+	out->cam_spread_factor = qs->cam_spread_factor;
 	out->cam_parallax_factor = qs->cam_parallax_factor;
 	out->cam_convergence = qs->cam_convergence;
 	out->cam_half_tan_vfov = qs->cam_half_tan_vfov;
 
-	out->disp_ipd_factor = qs->disp_ipd_factor;
+	out->disp_spread_factor = qs->disp_spread_factor;
 	out->disp_parallax_factor = qs->disp_parallax_factor;
 	out->disp_vHeight = qs->disp_vHeight;
 

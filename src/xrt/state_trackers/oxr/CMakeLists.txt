@@ -155,8 +155,8 @@ if(APPLE)
 	endif()
 endif()
 
-# Qwerty driver: needed on all platforms for camera-centric stereo controls
-# (oxr_session.c calls qwerty_get_stereo_state behind #ifdef XRT_BUILD_DRIVER_QWERTY)
+# Qwerty driver: needed on all platforms for camera-centric view controls
+# (oxr_session.c calls qwerty_get_view_state behind #ifdef XRT_BUILD_DRIVER_QWERTY)
 if(XRT_BUILD_DRIVER_QWERTY AND TARGET drv_qwerty)
 	target_link_libraries(st_oxr PRIVATE drv_qwerty_includes)
 	target_compile_definitions(st_oxr PRIVATE XRT_BUILD_DRIVER_QWERTY)

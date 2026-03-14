@@ -23,24 +23,24 @@ extern "C" {
 struct xrt_pose;
 
 /*!
- * Snapshot of qwerty stereo tuning state.
+ * Snapshot of qwerty view tuning state.
  * Each mode (camera/display) has its own independent variable set.
  * Camera mode: ipd_factor, parallax_factor, convergence, half_tan_vfov.
  * Display mode: ipd_factor, parallax_factor, vHeight (perspective always 1.0).
  * @ingroup drv_qwerty
  */
-struct qwerty_stereo_state
+struct qwerty_view_state
 {
 	bool camera_mode; //!< true=camera (default), false=display
 
 	// Camera-centric variables
-	float cam_ipd_factor;      //!< [0.01,1] default 1.0 (= cam_parallax always)
+	float cam_spread_factor;      //!< [0.01,1] default 1.0 (= cam_parallax always)
 	float cam_parallax_factor; //!< [0.01,1] default 1.0 (= cam_ipd always)
 	float cam_convergence;     //!< [0,2] diopters, default 0.5
 	float cam_half_tan_vfov;   //!< default 0.3249 — derived only, not user-adjustable
 
 	// Display-centric variables
-	float disp_ipd_factor;      //!< [0.01,1] default 1.0 (= disp_parallax always)
+	float disp_spread_factor;      //!< [0.01,1] default 1.0 (= disp_parallax always)
 	float disp_parallax_factor; //!< [0.01,1] default 1.0 (= disp_ipd always)
 	float disp_vHeight;         //!< [0.1,10] meters, default 1.3
 
@@ -196,9 +196,9 @@ void
 qwerty_set_rendering_mode_silent(struct xrt_device **xdevs, size_t xdev_count, int mode);
 
 /*!
- * Get the current qwerty stereo tuning state.
+ * Get the current qwerty view tuning state.
  *
- * Scans @p xdevs for a qwerty_system and copies its stereo state.
+ * Scans @p xdevs for a qwerty_system and copies its view state.
  *
  * @param xdevs     Array of devices to search for qwerty devices.
  * @param xdev_count Number of devices in the array.
@@ -208,9 +208,9 @@ qwerty_set_rendering_mode_silent(struct xrt_device **xdevs, size_t xdev_count, i
  * @ingroup drv_qwerty
  */
 bool
-qwerty_get_stereo_state(struct xrt_device **xdevs,
+qwerty_get_view_state(struct xrt_device **xdevs,
                         size_t xdev_count,
-                        struct qwerty_stereo_state *out);
+                        struct qwerty_view_state *out);
 
 
 /*!

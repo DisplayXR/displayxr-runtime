@@ -1676,6 +1676,7 @@ struct oxr_system
 	bool gotten_requirements;
 
 	XrViewConfigurationType view_config_type;
+	uint32_t view_count; //!< Number of views (1=mono, 2=stereo, 4=quad, etc.)
 	XrViewConfigurationView views[XRT_MAX_VIEWS];
 	uint32_t blend_mode_count;
 	XrEnvironmentBlendMode blend_modes[3];

@@ -606,19 +606,27 @@ verify_projection_layer(struct oxr_session *sess,
 			                 layer_index, proj->viewCount);
 		}
 		break;
-	case XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO:
-		// Accept viewCount of 1 (mono) or 2 (stereo). The compositor
-		// handles both via is_mono detection in layer_commit. This is
-		// permissive because the active rendering mode may change
-		// (2D=1 view, LeiaSR=2 views) and the app/runtime may
-		// momentarily disagree during mode transitions.
-		if (proj->viewCount != 1 && proj->viewCount != 2) {
+	case XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO: {
+		// Accept viewCount of 1 (mono) or matching the active rendering
+		// mode's view_count. This is permissive because the active mode
+		// may change (2D=1 view, stereo=2, quad=4) and the app/runtime
+		// may momentarily disagree during mode transitions.
+		uint32_t expected = 2; // default stereo
+		if (head != NULL && head->hmd != NULL &&
+		    head->rendering_mode_count > 0) {
+			uint32_t idx = head->hmd->active_rendering_mode_index;
+			if (idx < head->rendering_mode_count) {
+				expected = head->rendering_modes[idx].view_count;
+			}
+		}
+		if (proj->viewCount != 1 && proj->viewCount != expected) {
 			return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
-			                 "(frameEndInfo->layers[%u]->viewCount == %u) must be 1 or 2 for "
+			                 "(frameEndInfo->layers[%u]->viewCount == %u) must be 1 or %u for "
 			                 "XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO",
-			                 layer_index, proj->viewCount);
+			                 layer_index, proj->viewCount, expected);
 		}
 		break;
+	}
 	case XR_VIEW_CONFIGURATION_TYPE_PRIMARY_QUAD_VARJO:
 		if (proj->viewCount != 4) {
 			return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,

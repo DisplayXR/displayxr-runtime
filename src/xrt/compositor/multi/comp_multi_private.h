@@ -32,7 +32,7 @@
 
 // Forward declarations for per-session rendering
 struct comp_target;
-struct xrt_eye_pair;
+struct xrt_eye_positions;
 struct xrt_window_metrics;
 struct xrt_system_devices;
 
@@ -613,14 +613,14 @@ multi_compositor_has_session_render(struct multi_compositor *mc)
  * Uses the display processor's eye tracking (e.g. SR SDK LookaroundFilter).
  *
  * @param mc The multi_compositor (must have per-session rendering initialized)
- * @param[out] out_eye_pair Pointer to receive the eye positions (in meters)
+ * @param[out] out_eye_pos Pointer to receive the eye positions (in meters)
  * @return true if valid eye positions are available, false otherwise
  *
  * @ingroup comp_multi
  * @private @memberof multi_compositor
  */
 bool
-multi_compositor_get_predicted_eye_positions(struct multi_compositor *mc, struct xrt_eye_pair *out_eye_pair);
+multi_compositor_get_predicted_eye_positions(struct multi_compositor *mc, struct xrt_eye_positions *out_eye_pos);
 
 /*!
  * Get window metrics for adaptive FOV and eye position adjustment.

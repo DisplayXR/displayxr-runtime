@@ -43,7 +43,7 @@ typedef uint64_t VkRenderPass;
 typedef int32_t VkFormat_XDP;
 
 // Forward declarations for types used by optional vtable methods.
-struct xrt_eye_pair;
+struct xrt_eye_positions;
 struct xrt_window_metrics;
 
 
@@ -114,11 +114,11 @@ struct xrt_display_processor
 	 * Optional — NULL means not supported.
 	 *
 	 * @param      xdp           Pointer to self.
-	 * @param[out] out_eye_pair  Predicted left/right eye positions.
+	 * @param[out] out_eye_pos   Predicted N-view eye positions.
 	 * @return true if eye positions are valid.
 	 */
 	bool (*get_predicted_eye_positions)(struct xrt_display_processor *xdp,
-	                                    struct xrt_eye_pair *out_eye_pair);
+	                                    struct xrt_eye_positions *out_eye_pos);
 
 	/*!
 	 * Get window metrics for adaptive FOV calculation.
@@ -230,12 +230,12 @@ xrt_display_processor_process_atlas(struct xrt_display_processor *xdp,
  */
 static inline bool
 xrt_display_processor_get_predicted_eye_positions(struct xrt_display_processor *xdp,
-                                                  struct xrt_eye_pair *out_eye_pair)
+                                                  struct xrt_eye_positions *out_eye_pos)
 {
 	if (xdp == NULL || xdp->get_predicted_eye_positions == NULL) {
 		return false;
 	}
-	return xdp->get_predicted_eye_positions(xdp, out_eye_pair);
+	return xdp->get_predicted_eye_positions(xdp, out_eye_pos);
 }
 
 /*!

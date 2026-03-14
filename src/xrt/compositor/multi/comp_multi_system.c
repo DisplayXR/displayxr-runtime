@@ -1801,15 +1801,15 @@ session_render_hud_overlay(struct multi_compositor *mc,
 	float nom_x = 0.0f, nom_y = 0.0f, nom_z = 600.0f;
 
 	if (mc->session_render.display_processor != NULL) {
-		struct xrt_eye_pair eyes;
+		struct xrt_eye_positions eyes;
 		if (xrt_display_processor_get_predicted_eye_positions(
 		        mc->session_render.display_processor, &eyes) && eyes.valid) {
-			left_x = eyes.left.x * 1000.0f;
-			left_y = eyes.left.y * 1000.0f;
-			left_z = eyes.left.z * 1000.0f;
-			right_x = eyes.right.x * 1000.0f;
-			right_y = eyes.right.y * 1000.0f;
-			right_z = eyes.right.z * 1000.0f;
+			left_x = eyes.eyes[0].x * 1000.0f;
+			left_y = eyes.eyes[0].y * 1000.0f;
+			left_z = eyes.eyes[0].z * 1000.0f;
+			right_x = eyes.eyes[1].x * 1000.0f;
+			right_y = eyes.eyes[1].y * 1000.0f;
+			right_z = eyes.eyes[1].z * 1000.0f;
 			tracking_active = true;
 		}
 
@@ -1907,14 +1907,14 @@ session_render_hud_overlay(struct multi_compositor *mc,
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
 	if (mc->xsysd != NULL) {
-		struct qwerty_stereo_state ss;
-		if (qwerty_get_stereo_state(mc->xsysd->xdevs, mc->xsysd->xdev_count, &ss)) {
+		struct qwerty_view_state ss;
+		if (qwerty_get_view_state(mc->xsysd->xdevs, mc->xsysd->xdev_count, &ss)) {
 			data.camera_mode = ss.camera_mode;
-			data.cam_ipd_factor = ss.cam_ipd_factor;
+			data.cam_spread_factor = ss.cam_spread_factor;
 			data.cam_parallax_factor = ss.cam_parallax_factor;
 			data.cam_convergence = ss.cam_convergence;
 			data.cam_half_tan_vfov = ss.cam_half_tan_vfov;
-			data.disp_ipd_factor = ss.disp_ipd_factor;
+			data.disp_spread_factor = ss.disp_spread_factor;
 			data.disp_parallax_factor = ss.disp_parallax_factor;
 			data.disp_vHeight = ss.disp_vHeight;
 			data.nominal_viewer_z = ss.nominal_viewer_z;
@@ -2083,12 +2083,14 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 			multi_compositor_request_display_mode(mc, !force_2d);
 		}
 
-		// Rendering mode change from qwerty 1/2/3 keys
-		int render_mode = -1;
-		if (qwerty_check_rendering_mode_change(mc->xsysd->xdevs, mc->xsysd->xdev_count, &render_mode)) {
-			struct xrt_device *head = mc->xsysd->static_roles.head;
-			if (head != NULL) {
-				xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, render_mode);
+		// Rendering mode change from qwerty 1/2/3 keys (disabled for legacy apps).
+		if (!mc->msc->base.info.legacy_app_tile_scaling) {
+			int render_mode = -1;
+			if (qwerty_check_rendering_mode_change(mc->xsysd->xdevs, mc->xsysd->xdev_count, &render_mode)) {
+				struct xrt_device *head = mc->xsysd->static_roles.head;
+				if (head != NULL) {
+					xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, render_mode);
+				}
 			}
 		}
 	}
@@ -2834,13 +2836,16 @@ transfer_layers_locked(struct multi_system_compositor *msc, int64_t display_time
 				multi_compositor_request_display_mode(mc, !force_2d);
 			}
 
-			// Rendering mode change from qwerty 1/2/3 keys
-			int render_mode = -1;
-			if (qwerty_check_rendering_mode_change(mc->xsysd->xdevs, mc->xsysd->xdev_count,
-			                                       &render_mode)) {
-				struct xrt_device *head = mc->xsysd->static_roles.head;
-				if (head != NULL) {
-					xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, render_mode);
+			// Rendering mode change from qwerty 1/2/3 keys (disabled for legacy apps).
+			if (!mc->msc->base.info.legacy_app_tile_scaling) {
+				int render_mode = -1;
+				if (qwerty_check_rendering_mode_change(mc->xsysd->xdevs, mc->xsysd->xdev_count,
+				                                       &render_mode)) {
+					struct xrt_device *head = mc->xsysd->static_roles.head;
+					if (head != NULL) {
+						xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE,
+						                        render_mode);
+					}
 				}
 			}
 

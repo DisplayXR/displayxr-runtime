@@ -31,7 +31,7 @@
 #include <vector>
 #include <string>
 
-#include "stereo_params.h"
+#include "view_params.h"
 
 // [Commented out — will be reused for 3D-positioned HUD later]
 // struct ConvergencePlane {
@@ -113,9 +113,12 @@ struct XrSessionManager {
     PFN_xrSetSharedTextureOutputRectEXT pfnSetSharedTextureOutputRectEXT = nullptr;
 
     // Enumerated rendering mode info
+    uint32_t currentModeIndex = 0;
     uint32_t renderingModeCount = 0;
     char renderingModeNames[8][XR_MAX_SYSTEM_NAME_SIZE] = {};
     uint32_t renderingModeViewCounts[8] = {};
+    uint32_t renderingModeTileColumns[8] = {};
+    uint32_t renderingModeTileRows[8] = {};
     float renderingModeScaleX[8] = {};
     float renderingModeScaleY[8] = {};
     bool renderingModeDisplay3D[8] = {};
@@ -127,9 +130,11 @@ struct XrSessionManager {
     SwapchainInfo hudSwapchain;
     bool hasHudSwapchain = false;
 
-    // Eye tracking data — raw per-eye positions in display space
-    float leftEyeX = 0.0f, leftEyeY = 0.0f, leftEyeZ = 0.0f;
-    float rightEyeX = 0.0f, rightEyeY = 0.0f, rightEyeZ = 0.0f;
+    // Per-view data (N-view: up to 8 views, matching XRT_MAX_VIEWS)
+    uint32_t viewCount = 2;
+    float eyePositions[8][3] = {};       // [view][x,y,z] — raw per-eye positions in display space
+    DirectX::XMMATRIX viewMatrices[8];   // per-view view matrices from LocateViews
+    DirectX::XMMATRIX projMatrices[8];   // per-view projection matrices from LocateViews
     bool eyeTrackingActive = false;
 
     // Frame timing
@@ -167,16 +172,12 @@ bool BeginFrame(XrSessionManager& xr, XrFrameState& frameState);
 bool LocateViews(
     XrSessionManager& xr,
     XrTime displayTime,
-    DirectX::XMMATRIX& leftViewMatrix,
-    DirectX::XMMATRIX& leftProjMatrix,
-    DirectX::XMMATRIX& rightViewMatrix,
-    DirectX::XMMATRIX& rightProjMatrix,
     float playerPosX = 0.0f,
     float playerPosY = 0.0f,
     float playerPosZ = 0.0f,
     float playerYaw = 0.0f,
     float playerPitch = 0.0f,
-    const StereoParams& stereo = StereoParams{}
+    const ViewParams& viewParams = ViewParams{}
 );
 
 // Acquire swapchain image for rendering

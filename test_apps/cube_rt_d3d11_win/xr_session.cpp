@@ -8,6 +8,7 @@
 #include "xr_session.h"
 #include "logging.h"
 #include <cstring>
+#include <vector>
 
 // Helper macro for XR error checking with logging
 #define XR_CHECK(call) \
@@ -149,6 +150,12 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         }
     }
 
+    // Get rendering mode enumeration function pointer
+    if (xr.hasDisplayInfoExt) {
+        xrGetInstanceProcAddr(xr.instance, "xrEnumerateDisplayRenderingModesEXT",
+            (PFN_xrVoidFunction*)&xr.pfnEnumerateDisplayRenderingModesEXT);
+    }
+
     LOG_INFO("Enumerating view configuration views...");
     uint32_t viewCount = 0;
     XR_CHECK(xrEnumerateViewConfigurationViews(xr.instance, xr.systemId, xr.viewConfigType, 0, &viewCount, nullptr));
@@ -183,6 +190,38 @@ bool CreateSession(XrSessionManager& xr, ID3D11Device* d3d11Device) {
     LOG_INFO("Calling xrCreateSession...");
     XR_CHECK_LOG(xrCreateSession(xr.instance, &sessionInfo, &xr.session));
     LOG_INFO("Session created: 0x%p", (void*)xr.session);
+
+    // Enumerate rendering modes for tile layout
+    if (xr.pfnEnumerateDisplayRenderingModesEXT && xr.session != XR_NULL_HANDLE) {
+        uint32_t modeCount = 0;
+        XrResult enumRes = xr.pfnEnumerateDisplayRenderingModesEXT(xr.session, 0, &modeCount, nullptr);
+        if (XR_SUCCEEDED(enumRes) && modeCount > 0) {
+            std::vector<XrDisplayRenderingModeInfoEXT> modes(modeCount);
+            for (uint32_t i = 0; i < modeCount; i++) {
+                modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT;
+                modes[i].next = nullptr;
+            }
+            enumRes = xr.pfnEnumerateDisplayRenderingModesEXT(xr.session, modeCount, &modeCount, modes.data());
+            if (XR_SUCCEEDED(enumRes)) {
+                xr.renderingModeCount = modeCount > 8 ? 8 : modeCount;
+                LOG_INFO("Display rendering modes (%u):", modeCount);
+                for (uint32_t i = 0; i < xr.renderingModeCount; i++) {
+                    strncpy(xr.renderingModeNames[i], modes[i].modeName, XR_MAX_SYSTEM_NAME_SIZE - 1);
+                    xr.renderingModeNames[i][XR_MAX_SYSTEM_NAME_SIZE - 1] = '\0';
+                    xr.renderingModeViewCounts[i] = modes[i].viewCount;
+                    xr.renderingModeTileColumns[i] = modes[i].tileColumns;
+                    xr.renderingModeTileRows[i] = modes[i].tileRows;
+                    xr.renderingModeScaleX[i] = modes[i].viewScaleX;
+                    xr.renderingModeScaleY[i] = modes[i].viewScaleY;
+                    xr.renderingModeDisplay3D[i] = modes[i].hardwareDisplay3D ? true : false;
+                    LOG_INFO("  [%u] %s (views=%u, tiles=%ux%u, scale=%.2fx%.2f, 3D=%d)",
+                        modes[i].modeIndex, modes[i].modeName, modes[i].viewCount,
+                        modes[i].tileColumns, modes[i].tileRows,
+                        modes[i].viewScaleX, modes[i].viewScaleY, modes[i].hardwareDisplay3D);
+                }
+            }
+        }
+    }
 
     return true;
 }

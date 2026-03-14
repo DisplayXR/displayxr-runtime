@@ -232,6 +232,7 @@ if(XRT_HAVE_VULKAN)
 		sim_display/shaders/blend.frag
 		sim_display/shaders/sbs.frag
 		sim_display/shaders/squeezed_sbs.frag
+		sim_display/shaders/quad.frag
 		)
 	list(APPEND SIM_DISPLAY_SOURCES
 		${SIM_DISPLAY_SHADER_HEADERS}
