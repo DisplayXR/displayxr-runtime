@@ -2003,6 +2003,9 @@ struct oxr_session
 	//! Active eye tracking mode (0=SMOOTH, 1=RAW). Default: 0 (SMOOTH).
 	uint32_t eye_tracking_mode;
 
+	//! Cached rendering mode index for detecting compositor-driven mode changes.
+	uint32_t last_rendering_mode_index;
+
 	//! True if XR_EXT_win32_appcontainer_compatible was enabled (Chrome WebXR).
 	//! Used to delay session state transitions for AppContainer sandbox compatibility.
 	bool is_appcontainer;

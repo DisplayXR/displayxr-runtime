@@ -613,6 +613,7 @@ oxr_session_begin(struct oxr_logger *log, struct oxr_session *sess, const XrSess
 		struct xrt_device *head = GET_XDEV_BY_ROLE(sess->sys, head);
 		if (head != NULL && head->hmd != NULL) {
 			uint32_t default_mode = head->hmd->active_rendering_mode_index;
+			sess->last_rendering_mode_index = default_mode;
 			if (default_mode < head->rendering_mode_count) {
 				struct xrt_rendering_mode *mode = &head->rendering_modes[default_mode];
 				oxr_session_request_display_mode(log, sess, mode->hardware_display_3d);
@@ -842,6 +843,38 @@ oxr_session_poll(struct oxr_logger *log, struct oxr_session *sess)
 		}
 	}
 #endif // XRT_OS_ANDROID
+
+	// Detect compositor-driven rendering mode changes (e.g., qwerty 0/1/2/3/4 keys).
+	// The compositor sets active_rendering_mode_index directly via xrt_device_set_property;
+	// we must detect this and push the event to the app.
+#ifdef OXR_HAVE_EXT_display_info
+	{
+		struct xrt_device *head = GET_XDEV_BY_ROLE(sess->sys, head);
+		if (head != NULL && head->hmd != NULL) {
+			uint32_t cur = head->hmd->active_rendering_mode_index;
+			if (cur != sess->last_rendering_mode_index && cur < head->rendering_mode_count) {
+				const struct xrt_rendering_mode *mode = &head->rendering_modes[cur];
+
+				// Update session hardware display state and view scales
+				bool old_3d = sess->hardware_display_3d;
+				sess->hardware_display_3d = mode->hardware_display_3d;
+				struct xrt_system_compositor *xsysc = sess->sys->xsysc;
+				if (xsysc != NULL) {
+					xsysc->info.recommended_view_scale_x = mode->view_scale_x;
+					xsysc->info.recommended_view_scale_y = mode->view_scale_y;
+				}
+
+				oxr_event_push_XrEventDataRenderingModeChanged(
+				    log, sess, sess->last_rendering_mode_index, cur);
+				if (mode->hardware_display_3d != old_3d) {
+					oxr_event_push_XrEventDataHardwareDisplayStateChanged(
+					    log, sess, mode->hardware_display_3d ? XR_TRUE : XR_FALSE);
+				}
+				sess->last_rendering_mode_index = cur;
+			}
+		}
+	}
+#endif
 
 	bool read_more_events = true;
 #ifdef XRT_OS_MACOS
