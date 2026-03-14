@@ -843,6 +843,59 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 	glDisable(GL_CULL_FACE);
 	glDisable(GL_SCISSOR_TEST);
 
+	// Runtime-side 2D/3D toggle from qwerty V key
+#ifdef XRT_BUILD_DRIVER_QWERTY
+	if (c->xsysd != NULL) {
+		bool force_2d = false;
+		bool toggled = qwerty_check_display_mode_toggle(c->xsysd->xdevs, c->xsysd->xdev_count, &force_2d);
+		if (toggled) {
+			struct xrt_device *head = c->xsysd->static_roles.head;
+			if (head != NULL && head->hmd != NULL) {
+				if (force_2d) {
+					uint32_t cur = head->hmd->active_rendering_mode_index;
+					if (cur < head->rendering_mode_count &&
+					    head->rendering_modes[cur].hardware_display_3d) {
+						c->last_3d_mode_index = cur;
+					}
+					head->hmd->active_rendering_mode_index = 0;
+				} else {
+					head->hmd->active_rendering_mode_index = c->last_3d_mode_index;
+				}
+			}
+			comp_gl_compositor_request_display_mode(&c->base.base, !force_2d);
+		}
+
+		// Rendering mode change from qwerty 0/1/2/3/4 keys.
+		// Legacy apps only support V toggle — skip direct mode selection.
+		if (!c->legacy_app_tile_scaling) {
+			int render_mode = -1;
+			if (qwerty_check_rendering_mode_change(c->xsysd->xdevs, c->xsysd->xdev_count, &render_mode)) {
+				struct xrt_device *head = c->xsysd->static_roles.head;
+				if (head != NULL) {
+					xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, render_mode);
+				}
+			}
+		}
+	}
+#endif
+
+	// Sync hardware_display_3d, tile layout, and per-view dimensions
+	// from device's active rendering mode (MUST be before zero-copy check and blit)
+	if (c->xdev != NULL && c->xdev->hmd != NULL) {
+		uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
+		if (idx < c->xdev->rendering_mode_count) {
+			const struct xrt_rendering_mode *mode = &c->xdev->rendering_modes[idx];
+			c->hardware_display_3d = mode->hardware_display_3d;
+			if (mode->tile_columns > 0) {
+				c->tile_columns = mode->tile_columns;
+				c->tile_rows = mode->tile_rows;
+			}
+			if (mode->view_width_pixels > 0) {
+				c->view_width = mode->view_width_pixels;
+				c->view_height = mode->view_height_pixels;
+			}
+		}
+	}
 
 	// Zero-copy check: can we pass the app's swapchain directly to the DP?
 	bool zero_copy = false;
@@ -1045,60 +1098,6 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 		glDisable(GL_BLEND);
 	}
 	} // end if (!zero_copy)
-
-	// Runtime-side 2D/3D toggle from qwerty V key
-#ifdef XRT_BUILD_DRIVER_QWERTY
-	if (c->xsysd != NULL) {
-		bool force_2d = false;
-		bool toggled = qwerty_check_display_mode_toggle(c->xsysd->xdevs, c->xsysd->xdev_count, &force_2d);
-		if (toggled) {
-			struct xrt_device *head = c->xsysd->static_roles.head;
-			if (head != NULL && head->hmd != NULL) {
-				if (force_2d) {
-					uint32_t cur = head->hmd->active_rendering_mode_index;
-					if (cur < head->rendering_mode_count &&
-					    head->rendering_modes[cur].hardware_display_3d) {
-						c->last_3d_mode_index = cur;
-					}
-					head->hmd->active_rendering_mode_index = 0;
-				} else {
-					head->hmd->active_rendering_mode_index = c->last_3d_mode_index;
-				}
-			}
-			comp_gl_compositor_request_display_mode(&c->base.base, !force_2d);
-		}
-
-		// Rendering mode change from qwerty 0/1/2/3/4 keys.
-		// Legacy apps only support V toggle — skip direct mode selection.
-		if (!c->legacy_app_tile_scaling) {
-			int render_mode = -1;
-			if (qwerty_check_rendering_mode_change(c->xsysd->xdevs, c->xsysd->xdev_count, &render_mode)) {
-				struct xrt_device *head = c->xsysd->static_roles.head;
-				if (head != NULL) {
-					xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, render_mode);
-				}
-			}
-		}
-	}
-#endif
-
-	// Sync hardware_display_3d, tile layout, and per-view dimensions
-	// from device's active rendering mode
-	if (c->xdev != NULL && c->xdev->hmd != NULL) {
-		uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
-		if (idx < c->xdev->rendering_mode_count) {
-			const struct xrt_rendering_mode *mode = &c->xdev->rendering_modes[idx];
-			c->hardware_display_3d = mode->hardware_display_3d;
-			if (mode->tile_columns > 0) {
-				c->tile_columns = mode->tile_columns;
-				c->tile_rows = mode->tile_rows;
-			}
-			if (mode->view_width_pixels > 0) {
-				c->view_width = mode->view_width_pixels;
-				c->view_height = mode->view_height_pixels;
-			}
-		}
-	}
 
 	// --- Step 2: Present SBS texture ---
 	// Ensure VAO is bound for present draw calls (zero-copy skips the atlas

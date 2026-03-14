@@ -1364,10 +1364,9 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 				continue;
 			}
 
-			// For each eye/view: use the layer's actual view count (the app
-			// may be one frame behind a mode switch, so the compositor's tile
-			// layout can differ from what the app submitted)
-			uint32_t view_count = layer->data.view_count;
+			// Use min of compositor's tile count and layer's submitted views
+			uint32_t mode_views = c->hardware_display_3d ? (c->tile_columns * c->tile_rows) : 1;
+			uint32_t view_count = (layer->data.view_count < mode_views) ? layer->data.view_count : mode_views;
 			if (view_count == 0) view_count = 1;
 			for (uint32_t eye = 0; eye < view_count; eye++) {
 				struct xrt_swapchain *sc = layer->sc_array[eye];
