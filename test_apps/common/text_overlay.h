@@ -52,7 +52,7 @@ std::wstring FormatSessionState(int state);
 std::wstring FormatPerformanceInfo(float fps, float frameTimeMs, uint32_t renderW, uint32_t renderH, uint32_t windowW = 0, uint32_t windowH = 0);
 std::wstring FormatInputInfo(const std::string& lastKey, int mouseX, int mouseY, const std::string& mouseButtons);
 std::wstring FormatDisplayInfo(float widthM, float heightM, float nomX, float nomY, float nomZ);
-std::wstring FormatEyeTrackingInfo(float lx, float ly, float lz, float rx, float ry, float rz,
+std::wstring FormatEyeTrackingInfo(const float eyePositions[][3], uint32_t eyeCount,
     bool active, bool isTracking, uint32_t activeMode, uint32_t supportedModes);
 std::wstring FormatParallaxInfo(bool parallaxEnabled, float eyePosX, float eyePosY);
 std::wstring FormatMode(int outputMode, bool simDisplayAvailable, const char* modeName = nullptr, uint32_t modeCount = 0, bool display3D = true);

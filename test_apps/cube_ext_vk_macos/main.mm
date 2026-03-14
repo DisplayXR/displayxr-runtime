@@ -40,7 +40,7 @@
 #include <mach-o/dyld.h>
 #include <unistd.h>
 
-#include "stereo_params.h"
+#include "view_params.h"
 #include "display3d_view.h"
 #include "camera3d_view.h"
 
@@ -93,7 +93,7 @@ struct InputState {
     bool resetViewRequested = false;
 
     // Stereo camera parameters (IPD, parallax, perspective, scale/zoom)
-    StereoParams stereo;
+    ViewParams viewParams;
 
     // HUD toggle (Tab)
     bool hudVisible = true;
@@ -1631,32 +1631,32 @@ static void PumpMacOSEvents() {
                 float factor = (dy > 0) ? 1.1f : (1.0f / 1.1f);
                 NSUInteger scrollMods = [event modifierFlags];
                 if (scrollMods & NSEventModifierFlagShift) {
-                    g_input.stereo.ipdFactor *= factor;
-                    if (g_input.stereo.ipdFactor < 0.0f) g_input.stereo.ipdFactor = 0.0f;
-                    if (g_input.stereo.ipdFactor > 1.0f) g_input.stereo.ipdFactor = 1.0f;
+                    g_input.viewParams.ipdFactor *= factor;
+                    if (g_input.viewParams.ipdFactor < 0.0f) g_input.viewParams.ipdFactor = 0.0f;
+                    if (g_input.viewParams.ipdFactor > 1.0f) g_input.viewParams.ipdFactor = 1.0f;
                 } else if (scrollMods & NSEventModifierFlagControl) {
-                    g_input.stereo.parallaxFactor *= factor;
-                    if (g_input.stereo.parallaxFactor < 0.0f) g_input.stereo.parallaxFactor = 0.0f;
-                    if (g_input.stereo.parallaxFactor > 1.0f) g_input.stereo.parallaxFactor = 1.0f;
+                    g_input.viewParams.parallaxFactor *= factor;
+                    if (g_input.viewParams.parallaxFactor < 0.0f) g_input.viewParams.parallaxFactor = 0.0f;
+                    if (g_input.viewParams.parallaxFactor > 1.0f) g_input.viewParams.parallaxFactor = 1.0f;
                 } else if (scrollMods & NSEventModifierFlagOption) {
                     if (g_input.cameraMode) {
-                        g_input.stereo.invConvergenceDistance *= factor;
-                        if (g_input.stereo.invConvergenceDistance < 0.1f) g_input.stereo.invConvergenceDistance = 0.1f;
-                        if (g_input.stereo.invConvergenceDistance > 10.0f) g_input.stereo.invConvergenceDistance = 10.0f;
+                        g_input.viewParams.invConvergenceDistance *= factor;
+                        if (g_input.viewParams.invConvergenceDistance < 0.1f) g_input.viewParams.invConvergenceDistance = 0.1f;
+                        if (g_input.viewParams.invConvergenceDistance > 10.0f) g_input.viewParams.invConvergenceDistance = 10.0f;
                     } else {
-                        g_input.stereo.perspectiveFactor *= factor;
-                        if (g_input.stereo.perspectiveFactor < 0.1f) g_input.stereo.perspectiveFactor = 0.1f;
-                        if (g_input.stereo.perspectiveFactor > 10.0f) g_input.stereo.perspectiveFactor = 10.0f;
+                        g_input.viewParams.perspectiveFactor *= factor;
+                        if (g_input.viewParams.perspectiveFactor < 0.1f) g_input.viewParams.perspectiveFactor = 0.1f;
+                        if (g_input.viewParams.perspectiveFactor > 10.0f) g_input.viewParams.perspectiveFactor = 10.0f;
                     }
                 } else {
                     if (g_input.cameraMode) {
-                        g_input.stereo.zoomFactor *= factor;
-                        if (g_input.stereo.zoomFactor < 0.1f) g_input.stereo.zoomFactor = 0.1f;
-                        if (g_input.stereo.zoomFactor > 10.0f) g_input.stereo.zoomFactor = 10.0f;
+                        g_input.viewParams.zoomFactor *= factor;
+                        if (g_input.viewParams.zoomFactor < 0.1f) g_input.viewParams.zoomFactor = 0.1f;
+                        if (g_input.viewParams.zoomFactor > 10.0f) g_input.viewParams.zoomFactor = 10.0f;
                     } else {
-                        g_input.stereo.scaleFactor *= factor;
-                        if (g_input.stereo.scaleFactor < 0.1f) g_input.stereo.scaleFactor = 0.1f;
-                        if (g_input.stereo.scaleFactor > 10.0f) g_input.stereo.scaleFactor = 10.0f;
+                        g_input.viewParams.scaleFactor *= factor;
+                        if (g_input.viewParams.scaleFactor < 0.1f) g_input.viewParams.scaleFactor = 0.1f;
+                        if (g_input.viewParams.scaleFactor > 10.0f) g_input.viewParams.scaleFactor = 10.0f;
                     }
                 }
             } else if (type == NSEventTypeKeyDown) {
@@ -1698,8 +1698,8 @@ static void PumpMacOSEvents() {
                             g_input.yaw = 0.0f;
                             g_input.pitch = 0.0f;
                             if (g_input.nominalViewerZ > 0.0f)
-                                g_input.stereo.invConvergenceDistance = 1.0f / g_input.nominalViewerZ;
-                            g_input.stereo.zoomFactor = 1.0f;
+                                g_input.viewParams.invConvergenceDistance = 1.0f / g_input.nominalViewerZ;
+                            g_input.viewParams.zoomFactor = 1.0f;
                         } else {
                             g_input.cameraPosX = 0.0f;
                             g_input.cameraPosY = 0.0f;
@@ -1753,17 +1753,17 @@ static void PumpMacOSEvents() {
 static void UpdateCameraMovement(InputState& state, float deltaTime, float displayHeightM = 0.0f) {
     if (state.resetViewRequested) {
         state.yaw = state.pitch = 0.0f;
-        float savedVDH = state.stereo.virtualDisplayHeight;
+        float savedVDH = state.viewParams.virtualDisplayHeight;
         bool savedCameraMode = state.cameraMode;
-        state.stereo = StereoParams{};
-        state.stereo.virtualDisplayHeight = savedVDH;
+        state.viewParams = ViewParams{};
+        state.viewParams.virtualDisplayHeight = savedVDH;
         state.cameraMode = savedCameraMode;
         if (state.cameraMode) {
             state.cameraPosX = 0.0f;
             state.cameraPosY = 0.0f;
             state.cameraPosZ = state.nominalViewerZ;
             if (state.nominalViewerZ > 0.0f)
-                state.stereo.invConvergenceDistance = 1.0f / state.nominalViewerZ;
+                state.viewParams.invConvergenceDistance = 1.0f / state.nominalViewerZ;
         } else {
             state.cameraPosX = state.cameraPosY = state.cameraPosZ = 0.0f;
         }
@@ -1773,10 +1773,10 @@ static void UpdateCameraMovement(InputState& state, float deltaTime, float displ
 
     // Meters-to-virtual conversion (matches Kooima projection scaling)
     float m2v = 1.0f;
-    if (state.stereo.virtualDisplayHeight > 0.0f && displayHeightM > 0.0f)
-        m2v = state.stereo.virtualDisplayHeight / displayHeightM;
+    if (state.viewParams.virtualDisplayHeight > 0.0f && displayHeightM > 0.0f)
+        m2v = state.viewParams.virtualDisplayHeight / displayHeightM;
 
-    const float moveSpeed = 0.1f * m2v / state.stereo.scaleFactor;
+    const float moveSpeed = 0.1f * m2v / state.viewParams.scaleFactor;
     XrQuaternionf ori;
     quat_from_yaw_pitch(state.yaw, state.pitch, &ori);
 
@@ -1840,6 +1840,8 @@ struct AppXrSession {
     uint32_t renderingModeCount = 0;
     char renderingModeNames[8][XR_MAX_SYSTEM_NAME_SIZE] = {};
     uint32_t renderingModeViewCounts[8] = {};
+    uint32_t renderingModeTileColumns[8] = {};
+    uint32_t renderingModeTileRows[8] = {};
     float renderingModeScaleX[8] = {};
     float renderingModeScaleY[8] = {};
     bool renderingModeDisplay3D[8] = {};
@@ -1852,8 +1854,8 @@ struct AppXrSession {
     PFN_xrRequestEyeTrackingModeEXT pfnRequestEyeTrackingModeEXT = nullptr;
 
     // Eye tracking data for HUD
-    float leftEyeX = 0, leftEyeY = 0, leftEyeZ = 0;
-    float rightEyeX = 0, rightEyeY = 0, rightEyeZ = 0;
+    uint32_t eyeCount = 2;
+    float eyePositions[8][3] = {};  // [view][x,y,z] — raw per-eye positions in display space
     bool eyeTrackingActive = false;
 
     // System name from xrGetSystemProperties
@@ -2218,12 +2220,15 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
                     strncpy(xr.renderingModeNames[i], modes[i].modeName, XR_MAX_SYSTEM_NAME_SIZE - 1);
                     xr.renderingModeNames[i][XR_MAX_SYSTEM_NAME_SIZE - 1] = '\0';
                     xr.renderingModeViewCounts[i] = modes[i].viewCount;
+                    xr.renderingModeTileColumns[i] = modes[i].tileColumns;
+                    xr.renderingModeTileRows[i] = modes[i].tileRows;
                     xr.renderingModeScaleX[i] = modes[i].viewScaleX;
                     xr.renderingModeScaleY[i] = modes[i].viewScaleY;
                     xr.renderingModeDisplay3D[i] = modes[i].hardwareDisplay3D ? true : false;
-                    LOG_INFO("  [%u] %s (views=%u, scale=%.2fx%.2f, 3D=%s)",
+                    LOG_INFO("  [%u] %s (views=%u, tiles=%ux%u, scale=%.2fx%.2f, 3D=%s)",
                         modes[i].modeIndex, modes[i].modeName,
-                        modes[i].viewCount, modes[i].viewScaleX, modes[i].viewScaleY,
+                        modes[i].viewCount, modes[i].tileColumns, modes[i].tileRows,
+                        modes[i].viewScaleX, modes[i].viewScaleY,
                         modes[i].hardwareDisplay3D ? "yes" : "no");
                 }
                 g_input.renderingModeCount = xr.renderingModeCount;
@@ -2549,7 +2554,7 @@ int main() {
 
     g_input.renderingModeChangeRequested = true;
 
-    g_input.stereo.virtualDisplayHeight = 0.24f;
+    g_input.viewParams.virtualDisplayHeight = 0.24f;
     g_input.nominalViewerZ = xr.nominalViewerZ;
 
     LOG_INFO("=== Entering main loop ===");
@@ -2622,10 +2627,21 @@ int main() {
         if (xr.sessionRunning) {
             XrFrameState frameState;
             if (BeginFrame(xr, frameState)) {
-                XrCompositionLayerProjectionView projectionViews[2] = {};
                 bool rendered = false;
                 bool display3D = (g_input.currentRenderingMode < xr.renderingModeCount)
                     ? xr.renderingModeDisplay3D[g_input.currentRenderingMode] : true;
+
+                // Get N-view mode info from enumerated rendering modes
+                uint32_t modeViewCount = (g_input.currentRenderingMode < xr.renderingModeCount)
+                    ? xr.renderingModeViewCounts[g_input.currentRenderingMode] : 2;
+                uint32_t tileColumns = (g_input.currentRenderingMode < xr.renderingModeCount)
+                    ? xr.renderingModeTileColumns[g_input.currentRenderingMode] : 2;
+                uint32_t tileRows = (g_input.currentRenderingMode < xr.renderingModeCount)
+                    ? xr.renderingModeTileRows[g_input.currentRenderingMode] : 1;
+                int eyeCount = display3D ? (int)modeViewCount : 1;
+
+                // Dynamic arrays for N-view rendering
+                std::vector<XrCompositionLayerProjectionView> projectionViews(eyeCount, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
 
                 if (frameState.shouldRender) {
                     XrViewLocateInfo locateInfo = {XR_TYPE_VIEW_LOCATE_INFO};
@@ -2640,37 +2656,43 @@ int main() {
                     eyeTrackingState.type = (XrStructureType)XR_TYPE_VIEW_EYE_TRACKING_STATE_EXT;
                     viewState.next = &eyeTrackingState;
 
-                    uint32_t viewCount = 2;
-                    XrView views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+                    uint32_t viewCount = (uint32_t)xr.configViews.size();
+                    std::vector<XrView> views(viewCount, {XR_TYPE_VIEW});
 
                     XrResult locResult = xrLocateViews(xr.session, &locateInfo,
-                        &viewState, 2, &viewCount, views);
+                        &viewState, viewCount, &viewCount, views.data());
                     if (XR_SUCCEEDED(locResult) &&
                         (viewState.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) &&
                         (viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT))
                     {
-                        // Save raw display-space positions for Kooima + HUD
-                        XrVector3f rawEyePos[2];
-                        rawEyePos[0] = views[0].pose.position;
-                        rawEyePos[1] = (viewCount >= 2) ? views[1].pose.position : views[0].pose.position;
+                        // Save raw display-space eye positions for Kooima + HUD
+                        xr.eyeCount = modeViewCount;
+                        for (uint32_t v = 0; v < viewCount && v < 8; v++) {
+                            xr.eyePositions[v][0] = views[v].pose.position.x;
+                            xr.eyePositions[v][1] = views[v].pose.position.y;
+                            xr.eyePositions[v][2] = views[v].pose.position.z;
+                        }
+                        std::vector<XrVector3f> rawEyePos(modeViewCount);
+                        for (uint32_t v = 0; v < modeViewCount; v++) {
+                            rawEyePos[v] = (v < viewCount) ? views[v].pose.position : views[0].pose.position;
+                        }
 
-                        // Store raw eye positions for HUD (pre-player-transform)
-                        xr.leftEyeX = rawEyePos[0].x; xr.leftEyeY = rawEyePos[0].y; xr.leftEyeZ = rawEyePos[0].z;
-                        xr.rightEyeX = rawEyePos[1].x; xr.rightEyeY = rawEyePos[1].y; xr.rightEyeZ = rawEyePos[1].z;
                         xr.isEyeTracking = (eyeTrackingState.isTracking == XR_TRUE);
                         xr.activeEyeTrackingMode = (uint32_t)eyeTrackingState.activeMode;
                         xr.eyeTrackingActive = xr.isEyeTracking;
 
-                        // Determine eye count from rendering mode
-                        int eyeCount = display3D ? 2 : 1;
-
-                        // In mono mode, use center eye (average of L/R)
-                        if (!display3D) {
-                            rawEyePos[0] = {
-                                (rawEyePos[0].x + rawEyePos[1].x) / 2.0f,
-                                (rawEyePos[0].y + rawEyePos[1].y) / 2.0f,
-                                (rawEyePos[0].z + rawEyePos[1].z) / 2.0f};
-                            rawEyePos[1] = rawEyePos[0];
+                        // In mono mode, use center eye (average of all views)
+                        if (!display3D && modeViewCount >= 2) {
+                            XrVector3f center = {0, 0, 0};
+                            for (uint32_t v = 0; v < modeViewCount; v++) {
+                                center.x += rawEyePos[v].x;
+                                center.y += rawEyePos[v].y;
+                                center.z += rawEyePos[v].z;
+                            }
+                            center.x /= modeViewCount;
+                            center.y /= modeViewCount;
+                            center.z /= modeViewCount;
+                            rawEyePos[0] = center;
                         }
 
                         // Build camera/display pose from player transform
@@ -2689,8 +2711,8 @@ int main() {
                         xr.recommendedViewScaleX = scaleX;
                         xr.recommendedViewScaleY = scaleY;
 
-                        uint32_t eyeRenderW = xr.swapchain.width / 2;
-                        uint32_t eyeRenderH = xr.swapchain.height;
+                        uint32_t maxTileW = tileColumns > 0 ? xr.swapchain.width / tileColumns : xr.swapchain.width;
+                        uint32_t maxTileH = tileRows > 0 ? xr.swapchain.height / tileRows : xr.swapchain.height;
                         uint32_t renderW, renderH;
                         if (!display3D) {
                             renderW = g_windowW;
@@ -2700,14 +2722,14 @@ int main() {
                         } else {
                             renderW = (uint32_t)(g_windowW * scaleX);
                             renderH = (uint32_t)(g_windowH * scaleY);
-                            if (renderW > eyeRenderW) renderW = eyeRenderW;
-                            if (renderH > eyeRenderH) renderH = eyeRenderH;
+                            if (renderW > maxTileW) renderW = maxTileW;
+                            if (renderH > maxTileH) renderH = maxTileH;
                         }
                         g_renderW = renderW;
                         g_renderH = renderH;
 
-                        // Compute stereo views using display3d or camera3d library
-                        Display3DStereoView stereoViews[2];
+                        // Compute N views using display3d or camera3d library
+                        std::vector<Display3DView> d3dViews(eyeCount);
                         bool hasKooima = (xr.displayWidthM > 0 && xr.displayHeightM > 0);
                         if (hasKooima) {
                             // Compute viewport-scaled screen dimensions in meters
@@ -2731,74 +2753,78 @@ int main() {
                             if (g_input.cameraMode) {
                                 // Camera-centric path
                                 Camera3DTunables camTunables;
-                                camTunables.ipd_factor = g_input.stereo.ipdFactor;
-                                camTunables.parallax_factor = g_input.stereo.parallaxFactor;
-                                camTunables.inv_convergence_distance = g_input.stereo.invConvergenceDistance;
-                                camTunables.half_tan_vfov = CAMERA_HALF_TAN_VFOV / g_input.stereo.zoomFactor;
+                                camTunables.ipd_factor = g_input.viewParams.ipdFactor;
+                                camTunables.parallax_factor = g_input.viewParams.parallaxFactor;
+                                camTunables.inv_convergence_distance = g_input.viewParams.invConvergenceDistance;
+                                camTunables.half_tan_vfov = CAMERA_HALF_TAN_VFOV / g_input.viewParams.zoomFactor;
 
-                                Camera3DStereoView camViews[2];
-                                camera3d_compute_stereo_views(
-                                    &rawEyePos[0], &rawEyePos[1], &nominalViewer,
+                                std::vector<Camera3DView> camViews(eyeCount);
+                                camera3d_compute_views(
+                                    rawEyePos.data(), eyeCount, &nominalViewer,
                                     &screen, &camTunables, &cameraPose,
-                                    0.01f, 100.0f, &camViews[0], &camViews[1]);
+                                    0.01f, 100.0f, camViews.data());
 
-                                // Copy into Display3DStereoView for uniform downstream rendering
-                                for (int i = 0; i < 2; i++) {
-                                    memcpy(stereoViews[i].view_matrix, camViews[i].view_matrix, sizeof(float) * 16);
-                                    memcpy(stereoViews[i].projection_matrix, camViews[i].projection_matrix, sizeof(float) * 16);
-                                    stereoViews[i].fov = camViews[i].fov;
-                                    stereoViews[i].eye_world = camViews[i].eye_world;
+                                // Copy into Display3DView for uniform downstream rendering
+                                for (int i = 0; i < eyeCount; i++) {
+                                    memcpy(d3dViews[i].view_matrix, camViews[i].view_matrix, sizeof(float) * 16);
+                                    memcpy(d3dViews[i].projection_matrix, camViews[i].projection_matrix, sizeof(float) * 16);
+                                    d3dViews[i].fov = camViews[i].fov;
+                                    d3dViews[i].eye_world = camViews[i].eye_world;
                                 }
                             } else {
                                 // Display-centric path
                                 Display3DTunables tunables;
-                                tunables.ipd_factor = g_input.stereo.ipdFactor;
-                                tunables.parallax_factor = g_input.stereo.parallaxFactor;
-                                tunables.perspective_factor = g_input.stereo.perspectiveFactor;
-                                tunables.virtual_display_height = g_input.stereo.virtualDisplayHeight / g_input.stereo.scaleFactor;
+                                tunables.ipd_factor = g_input.viewParams.ipdFactor;
+                                tunables.parallax_factor = g_input.viewParams.parallaxFactor;
+                                tunables.perspective_factor = g_input.viewParams.perspectiveFactor;
+                                tunables.virtual_display_height = g_input.viewParams.virtualDisplayHeight / g_input.viewParams.scaleFactor;
 
-                                display3d_compute_stereo_views(
-                                    &rawEyePos[0], &rawEyePos[1], &nominalViewer,
+                                display3d_compute_views(
+                                    rawEyePos.data(), eyeCount, &nominalViewer,
                                     &screen, &tunables, &cameraPose,
-                                    0.01f, 100.0f, &stereoViews[0], &stereoViews[1]);
+                                    0.01f, 100.0f, d3dViews.data());
                             }
                         }
 
                         rendered = true;
                         uint32_t imageIndex;
                         if (AcquireSwapchainImage(xr, imageIndex)) {
-                            EyeRenderParams eyeParams[2];
+                            std::vector<EyeRenderParams> eyeParams(eyeCount);
                             for (int eye = 0; eye < eyeCount; eye++) {
-                                XrFovf submitFov = views[eye].fov;
+                                XrFovf submitFov = views[eye < (int)viewCount ? eye : 0].fov;
                                 if (hasKooima) {
-                                    memcpy(eyeParams[eye].viewMat, stereoViews[eye].view_matrix, sizeof(float) * 16);
-                                    memcpy(eyeParams[eye].projMat, stereoViews[eye].projection_matrix, sizeof(float) * 16);
-                                    submitFov = stereoViews[eye].fov;
+                                    memcpy(eyeParams[eye].viewMat, d3dViews[eye].view_matrix, sizeof(float) * 16);
+                                    memcpy(eyeParams[eye].projMat, d3dViews[eye].projection_matrix, sizeof(float) * 16);
+                                    submitFov = d3dViews[eye].fov;
                                     // Update view pose for layer submission
-                                    views[eye].pose.position = stereoViews[eye].eye_world;
-                                    views[eye].pose.orientation = cameraPose.orientation;
+                                    views[eye < (int)viewCount ? eye : 0].pose.position = d3dViews[eye].eye_world;
+                                    views[eye < (int)viewCount ? eye : 0].pose.orientation = cameraPose.orientation;
                                 } else {
-                                    mat4_view_from_xr_pose(eyeParams[eye].viewMat, views[eye].pose);
-                                    mat4_from_xr_fov(eyeParams[eye].projMat, views[eye].fov, 0.01f, 100.0f);
+                                    int vi = eye < (int)viewCount ? eye : 0;
+                                    mat4_view_from_xr_pose(eyeParams[eye].viewMat, views[vi].pose);
+                                    mat4_from_xr_fov(eyeParams[eye].projMat, views[vi].fov, 0.01f, 100.0f);
                                 }
 
-                                uint32_t vpX = display3D ? (eye * renderW) : 0;
+                                // Tile-aware viewport: place each view in the correct tile position
+                                uint32_t tileX = display3D ? (eye % tileColumns) : 0;
+                                uint32_t tileY = display3D ? (eye / tileColumns) : 0;
+                                uint32_t vpX = tileX * renderW;
+                                uint32_t vpY = tileY * renderH;
                                 eyeParams[eye].viewportX = vpX;
-                                eyeParams[eye].viewportY = 0;
+                                eyeParams[eye].viewportY = vpY;
                                 eyeParams[eye].width = renderW;
                                 eyeParams[eye].height = renderH;
 
-                                projectionViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
                                 projectionViews[eye].subImage.swapchain = xr.swapchain.swapchain;
-                                projectionViews[eye].subImage.imageRect.offset = {(int32_t)vpX, 0};
+                                projectionViews[eye].subImage.imageRect.offset = {(int32_t)vpX, (int32_t)vpY};
                                 projectionViews[eye].subImage.imageRect.extent = {
                                     (int32_t)renderW,
                                     (int32_t)renderH};
                                 projectionViews[eye].subImage.imageArrayIndex = 0;
-                                projectionViews[eye].pose = views[eye].pose;
+                                projectionViews[eye].pose = views[eye < (int)viewCount ? eye : 0].pose;
                                 projectionViews[eye].fov = submitFov;
                             }
-                            RenderScene(vkRenderer, imageIndex, eyeParams, eyeCount);
+                            RenderScene(vkRenderer, imageIndex, eyeParams.data(), eyeCount);
                             ReleaseSwapchainImage(xr);
                         } else {
                             rendered = false;
@@ -2807,8 +2833,7 @@ int main() {
                 }
 
                 if (rendered) {
-                    uint32_t submitCount = display3D ? 2u : 1u;
-                    EndFrame(xr, frameState.predictedDisplayTime, projectionViews, submitCount);
+                    EndFrame(xr, frameState.predictedDisplayTime, projectionViews.data(), (uint32_t)eyeCount);
                 } else {
                     XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
                     endInfo.displayTime = frameState.predictedDisplayTime;
@@ -2859,13 +2884,13 @@ int main() {
                     // Mode-dependent last value line
                     char valueLine[64];
                     if (g_input.cameraMode) {
-                        float tanHFOV = CAMERA_HALF_TAN_VFOV / g_input.stereo.zoomFactor;
+                        float tanHFOV = CAMERA_HALF_TAN_VFOV / g_input.viewParams.zoomFactor;
                         snprintf(valueLine, sizeof(valueLine), "tanHFOV: %.3f", tanHFOV);
                     } else {
-                        float m2v = (g_input.stereo.virtualDisplayHeight > 0.0f && xr.displayHeightM > 0.0f)
-                            ? g_input.stereo.virtualDisplayHeight / xr.displayHeightM : 1.0f;
+                        float m2v = (g_input.viewParams.virtualDisplayHeight > 0.0f && xr.displayHeightM > 0.0f)
+                            ? g_input.viewParams.virtualDisplayHeight / xr.displayHeightM : 1.0f;
                         snprintf(valueLine, sizeof(valueLine), "vHeight: %.3f  m2v: %.3f",
-                            g_input.stereo.virtualDisplayHeight, m2v);
+                            g_input.viewParams.virtualDisplayHeight, m2v);
                     }
 
                     // Eye tracking mode info
@@ -2873,6 +2898,13 @@ int main() {
                     char eyeTrackLine[80];
                     snprintf(eyeTrackLine, sizeof(eyeTrackLine), "Tracking: %s [%s] [T]",
                         xr.isEyeTracking ? "YES" : "NO", eyeModeName);
+
+                    // Build dynamic eye position lines based on active view count
+                    NSMutableString *eyeLines = [NSMutableString string];
+                    for (uint32_t e = 0; e < xr.eyeCount && e < 8; e++) {
+                        [eyeLines appendFormat:@"Eye[%u]: (%.3f, %.3f, %.3f)\n",
+                            e, xr.eyePositions[e][0], xr.eyePositions[e][1], xr.eyePositions[e][2]];
+                    }
 
                     NSString *text = [NSString stringWithFormat:
                         @"%s\n"
@@ -2886,8 +2918,7 @@ int main() {
                         "Display: %.3f x %.3f m\n"
                         "Scale: %.2f x %.2f\n"
                         "Nominal: (%.3f, %.3f, %.3f)\n"
-                        "Eye L: (%.3f, %.3f, %.3f)\n"
-                        "Eye R: (%.3f, %.3f, %.3f)\n"
+                        "%@"
                         "%s\n"
                         "%s: (%.2f, %.2f, %.2f)\n"
                         "Forward: (%.2f, %.2f, %.2f)\n"
@@ -2910,17 +2941,16 @@ int main() {
                         xr.displayWidthM, xr.displayHeightM,
                         xr.recommendedViewScaleX, xr.recommendedViewScaleY,
                         xr.nominalViewerX, xr.nominalViewerY, xr.nominalViewerZ,
-                        xr.leftEyeX, xr.leftEyeY, xr.leftEyeZ,
-                        xr.rightEyeX, xr.rightEyeY, xr.rightEyeZ,
+                        eyeLines,
                         eyeTrackLine,
                         poseLabel,
                         g_input.cameraPosX, g_input.cameraPosY, g_input.cameraPosZ,
                         -sinf(g_input.yaw) * cosf(g_input.pitch),
                          sinf(g_input.pitch),
                         -cosf(g_input.yaw) * cosf(g_input.pitch),
-                        g_input.stereo.ipdFactor, g_input.stereo.parallaxFactor,
-                        param1Label, g_input.cameraMode ? g_input.stereo.invConvergenceDistance : g_input.stereo.perspectiveFactor,
-                        param2Label, g_input.cameraMode ? g_input.stereo.zoomFactor : g_input.stereo.scaleFactor,
+                        g_input.viewParams.ipdFactor, g_input.viewParams.parallaxFactor,
+                        param1Label, g_input.cameraMode ? g_input.viewParams.invConvergenceDistance : g_input.viewParams.perspectiveFactor,
+                        param2Label, g_input.cameraMode ? g_input.viewParams.zoomFactor : g_input.viewParams.scaleFactor,
                         valueLine,
                         scrollHint, perspHint,
                         outputHintStr];

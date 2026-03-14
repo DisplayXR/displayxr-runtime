@@ -209,13 +209,17 @@ std::wstring FormatDisplayInfo(float widthM, float heightM, float nomX, float no
     return oss.str();
 }
 
-std::wstring FormatEyeTrackingInfo(float lx, float ly, float lz, float rx, float ry, float rz,
+std::wstring FormatEyeTrackingInfo(const float eyePositions[][3], uint32_t eyeCount,
     bool active, bool isTracking, uint32_t activeMode, uint32_t supportedModes) {
     std::wostringstream oss;
     oss << std::fixed << std::setprecision(0);
-    if (active) {
-        oss << L"L eye: (" << (lx * 1000.0f) << L"," << (ly * 1000.0f) << L"," << (lz * 1000.0f) << L") mm\n";
-        oss << L"R eye: (" << (rx * 1000.0f) << L"," << (ry * 1000.0f) << L"," << (rz * 1000.0f) << L") mm";
+    if (active && eyeCount > 0) {
+        for (uint32_t e = 0; e < eyeCount && e < 8; e++) {
+            if (e > 0) oss << L"\n";
+            oss << L"Eye[" << e << L"]: (" << (eyePositions[e][0] * 1000.0f)
+                << L"," << (eyePositions[e][1] * 1000.0f)
+                << L"," << (eyePositions[e][2] * 1000.0f) << L") mm";
+        }
     } else {
         oss << L"Eyes: inactive";
     }

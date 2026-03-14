@@ -708,22 +708,22 @@ gl_compositor_update_hud(struct comp_gl_compositor *c, float dt)
 	char fwd_buf[128] = {0};
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
-	struct qwerty_stereo_state ss = {0};
-	bool have_ss = (c->xsysd != NULL) && qwerty_get_stereo_state(
+	struct qwerty_view_state ss = {0};
+	bool have_ss = (c->xsysd != NULL) && qwerty_get_view_state(
 	    c->xsysd->xdevs, c->xsysd->xdev_count, &ss);
 
 	if (have_ss) {
 		const char *mode_label = ss.camera_mode ? "Camera [P]" : "Display [P]";
 		if (ss.camera_mode) {
 			snprintf(stereo_buf1, sizeof(stereo_buf1),
-			         "%s  IPD/Prlx:%.3f", mode_label, ss.cam_ipd_factor);
+			         "%s  IPD/Prlx:%.3f", mode_label, ss.cam_spread_factor);
 			snprintf(stereo_buf2, sizeof(stereo_buf2),
 			         "Conv:%.2f dp  vFOV:%.1f",
 			         ss.cam_convergence,
 			         atanf(ss.cam_half_tan_vfov) * 2.0f * 57.2958f);
 		} else {
 			snprintf(stereo_buf1, sizeof(stereo_buf1),
-			         "%s  IPD/Prlx:%.3f [Sh+Wh]", mode_label, ss.disp_ipd_factor);
+			         "%s  IPD/Prlx:%.3f [Sh+Wh]", mode_label, ss.disp_spread_factor);
 			snprintf(stereo_buf2, sizeof(stereo_buf2),
 			         "Conv:%.2f dp [Wh]  vFOV:%.1f  Persp*:%.2f",
 			         0.0f, 0.0f, 0.0f);
@@ -774,7 +774,7 @@ gl_compositor_update_hud(struct comp_gl_compositor *c, float dt)
 	    "%s\n"
 	    "%s\n"
 	    "\n"
-	    "Mode: %s (%s)  (1/2/3)\n"
+	    "Mode: %s (%s)\n"
 	    "TAB=HUD  V=Mode  P=Cam/Disp  ESC=Quit",
 	    dev_name,
 	    fps, c->smoothed_frame_time_ms,
@@ -1056,6 +1056,9 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 	}
 
 	// --- Step 2: Present SBS texture ---
+	// Ensure VAO is bound for present draw calls (zero-copy skips the atlas
+	// blit which normally binds it, causing GL_INVALID_OPERATION in core profile)
+	glBindVertexArray(c->vao_empty);
 	GLuint atlas_for_present = zero_copy ? zc_texture : c->atlas_texture;
 #ifdef XRT_OS_WINDOWS
 	if (c->has_shared_texture) {
@@ -1157,6 +1160,8 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			glUseProgram(c->program_blit);
 			GLint loc_rect = glGetUniformLocation(c->program_blit, "u_src_rect");
 			glUniform4f(loc_rect, 0.0f, 0.0f, 1.0f, 1.0f);
+			GLint loc_flip = glGetUniformLocation(c->program_blit, "u_flip_y");
+			glUniform1f(loc_flip, 0.0f);
 
 			glActiveTexture(GL_TEXTURE0);
 			glBindTexture(GL_TEXTURE_2D, atlas_for_present);
@@ -1516,36 +1521,21 @@ comp_gl_compositor_request_display_mode(struct xrt_compositor *xc, bool enable_3
 
 bool
 comp_gl_compositor_get_predicted_eye_positions(struct xrt_compositor *xc,
-                                               struct xrt_vec3 *out_left_eye,
-                                               struct xrt_vec3 *out_right_eye)
+                                               struct xrt_eye_positions *out_eye_pos)
 {
-	if (xc == NULL) {
+	if (xc == NULL || out_eye_pos == NULL) {
 		return false;
 	}
 
 	struct comp_gl_compositor *c = gl_comp(xc);
 
 	if (c->display_processor != NULL) {
-		struct xrt_eye_pair eyes;
-		if (xrt_display_processor_gl_get_predicted_eye_positions(c->display_processor, &eyes) &&
-		    eyes.valid) {
-			out_left_eye->x = eyes.left.x;
-			out_left_eye->y = eyes.left.y;
-			out_left_eye->z = eyes.left.z;
-			out_right_eye->x = eyes.right.x;
-			out_right_eye->y = eyes.right.y;
-			out_right_eye->z = eyes.right.z;
+		if (xrt_display_processor_gl_get_predicted_eye_positions(c->display_processor, out_eye_pos) &&
+		    out_eye_pos->valid) {
 			return true;
 		}
 	}
 
-	// Default eye positions
-	out_left_eye->x = -0.032f;
-	out_left_eye->y = 0.0f;
-	out_left_eye->z = 0.6f;
-	out_right_eye->x = 0.032f;
-	out_right_eye->y = 0.0f;
-	out_right_eye->z = 0.6f;
 	return false;
 }
 
