@@ -685,8 +685,7 @@ static void RenderThreadFunc(
                                     xr->renderingModeCount,
                                     xr->renderingModeCount > 0 ? xr->renderingModeDisplay3D[inputSnapshot.currentRenderingMode] : true);
                                 std::wstring eyeText = FormatEyeTrackingInfo(
-                                    xr->eyePositions[0][0], xr->eyePositions[0][1], xr->eyePositions[0][2],
-                                    xr->eyePositions[1][0], xr->eyePositions[1][1], xr->eyePositions[1][2],
+                                    xr->eyePositions, xr->viewCount,
                                     xr->eyeTrackingActive, xr->isEyeTracking,
                                     xr->activeEyeTrackingMode, xr->supportedEyeTrackingModes);
 

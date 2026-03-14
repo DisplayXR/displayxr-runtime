@@ -58,7 +58,7 @@ std::wstring FormatParallaxInfo(bool parallaxEnabled, float eyePosX, float eyePo
 std::wstring FormatMode(int outputMode, bool simDisplayAvailable, const char* modeName = nullptr, uint32_t modeCount = 0, bool display3D = true);
 std::wstring FormatCameraInfo(float cameraPosX, float cameraPosY, float cameraPosZ,
     float forwardX, float forwardY, float forwardZ, bool cameraMode = false);
-std::wstring FormatStereoParams(float ipdFactor, float parallaxFactor,
+std::wstring FormatViewParams(float ipdFactor, float parallaxFactor,
     float perspectiveFactor, float scaleFactor, bool cameraMode = false);
 std::wstring FormatScaleInfo(float scaleX, float scaleY);
 std::wstring FormatHelpText(bool simDisplayAvailable, bool cameraMode = false, uint32_t modeCount = 0);
