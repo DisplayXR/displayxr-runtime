@@ -173,6 +173,12 @@ struct comp_metal_compositor
 	//! True when display is in 3D mode (weaver active). False = 2D passthrough.
 	bool hardware_display_3d;
 
+	//! Last 3D mode index (for V-key toggle restore).
+	uint32_t last_3d_mode_index;
+
+	//! True if app is legacy (no XR_EXT_display_info) — gates 1/2/3 key mode selection.
+	bool legacy_app_tile_scaling;
+
 	//! System devices (for qwerty driver keyboard input).
 	struct xrt_system_devices *xsysd;
 
@@ -1224,10 +1230,44 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		return XRT_SUCCESS;
 	}
 
+	// Runtime-side 2D/3D toggle from qwerty V key
+#ifdef XRT_BUILD_DRIVER_QWERTY
+	if (c->xsysd != NULL) {
+		bool force_2d = false;
+		bool toggled = qwerty_check_display_mode_toggle(c->xsysd->xdevs, c->xsysd->xdev_count, &force_2d);
+		if (toggled) {
+			struct xrt_device *head = c->xsysd->static_roles.head;
+			if (head != NULL && head->hmd != NULL) {
+				if (force_2d) {
+					uint32_t cur = head->hmd->active_rendering_mode_index;
+					if (cur < head->rendering_mode_count &&
+					    head->rendering_modes[cur].hardware_display_3d) {
+						c->last_3d_mode_index = cur;
+					}
+					head->hmd->active_rendering_mode_index = 0;
+				} else {
+					head->hmd->active_rendering_mode_index = c->last_3d_mode_index;
+				}
+			}
+			comp_metal_compositor_request_display_mode(&c->base.base, !force_2d);
+		}
+
+		// Rendering mode change from qwerty 0/1/2/3/4 keys.
+		// Legacy apps only support V toggle — skip direct mode selection.
+		if (!c->legacy_app_tile_scaling) {
+			int render_mode = -1;
+			if (qwerty_check_rendering_mode_change(c->xsysd->xdevs, c->xsysd->xdev_count, &render_mode)) {
+				struct xrt_device *head = c->xsysd->static_roles.head;
+				if (head != NULL) {
+					xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, render_mode);
+				}
+			}
+		}
+	}
+#endif
+
 	// Sync hardware_display_3d, tile layout, and per-view dimensions
-	// from device's active rendering mode (for _rt apps where qwerty
-	// driver updates the device directly without going through
-	// request_display_mode)
+	// from device's active rendering mode
 	if (c->xdev != NULL && c->xdev->hmd != NULL) {
 		uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
 		if (idx < c->xdev->rendering_mode_count) {
@@ -1324,8 +1364,12 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 				continue;
 			}
 
-			// For each eye (left=0, right=1)
-			for (uint32_t eye = 0; eye < 2; eye++) {
+			// For each eye/view: use the layer's actual view count (the app
+			// may be one frame behind a mode switch, so the compositor's tile
+			// layout can differ from what the app submitted)
+			uint32_t view_count = layer->data.view_count;
+			if (view_count == 0) view_count = 1;
+			for (uint32_t eye = 0; eye < view_count; eye++) {
 				struct xrt_swapchain *sc = layer->sc_array[eye];
 				if (sc == NULL) {
 					continue;
@@ -1349,11 +1393,6 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 					nr.y = 0.0f;
 					nr.w = 1.0f;
 					nr.h = 1.0f;
-				}
-
-				// In 2D mode, only render eye 0 at full atlas (skip eye 1)
-				if (!c->hardware_display_3d && eye > 0) {
-					continue;
 				}
 
 				// Set viewport for this eye
@@ -1920,6 +1959,8 @@ comp_metal_compositor_set_sys_info(struct xrt_compositor *xc,
 {
 	struct comp_metal_compositor *c = metal_comp(xc);
 	c->sys_info = info;
+	c->legacy_app_tile_scaling = info->legacy_app_tile_scaling;
+	c->last_3d_mode_index = 1;
 }
 
 void

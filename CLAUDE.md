@@ -54,6 +54,23 @@ The first three classes all use a native compositor in-process. The `_ipc` class
 - `_ext` / `_shared` / `_rt` → `compositor/{d3d11,d3d12,metal,gl,vk_native}/` (in-process)
 - `_ipc` → `compositor/client/` → `ipc/` → `compositor/multi/` → native compositor (out-of-process)
 
+### Extension Apps vs Legacy Apps
+
+Orthogonal to the four app classes above, apps are either **extension apps** or **legacy apps** based on whether they enable `XR_EXT_display_info`:
+
+| Type | Detection | Rendering modes | Swapchain sizing | Mode switching |
+|------|-----------|----------------|-----------------|----------------|
+| **Extension app** | Enables `XR_EXT_display_info` | Enumerates all modes, handles `XrEventDataRenderingModeChangedEXT` | `max(tileColumns[i] * scaleX[i] * displayW)` across all modes | All modes: V toggle + 1/2/3 direct selection |
+| **Legacy app** | Does not enable `XR_EXT_display_info` | Unaware of modes, always renders stereo | `recommendedImageRectWidth * 2` (compromise scale) | Only V toggle between mode 0 (2D) and mode 1 (default 3D) |
+
+`_ext` and `_shared` apps are always extension apps (they need the extension for window binding). `_rt` apps can be either — a DisplayXR-aware `_rt` app enables `XR_EXT_display_info`, while a generic OpenXR `_rt` app (e.g. WebXR, third-party) is legacy.
+
+**Legacy app compromise view scale** (in `oxr_system_fill_in`):
+- **Case A** — Default 3D mode has `view_count == 2` and `scaleX <= 0.5` and `scaleY <= 0.5` (typical SBS): runtime reports `recommendedViewScale = 0.5×1.0`. App renders half-width, full-height tiles. Compositor must downscale Y for 3D, stretch X for 2D.
+- **Case B** — Otherwise: runtime uses the 3D mode's actual scale. Compositor stretches for 2D.
+
+The `legacy_app_tile_scaling` flag on `xrt_system_compositor_info` signals compositors to gate 1/2/3 key mode selection and (future) perform tile scaling before the display processor.
+
 ### Key Architectural Notes
 - Compositor vtable has 56 methods — use `comp_base` helper for boilerplate
 - IPC/service mode (`ipc/`, `compositor/client/`, `compositor/multi/`) must be preserved for `_ipc` apps, WebXR, and multi-app spatial shell

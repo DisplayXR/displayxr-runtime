@@ -1698,7 +1698,7 @@ struct AppXrSession {
     float renderingModeScaleX[8] = {};
     float renderingModeScaleY[8] = {};
     uint32_t renderingModeViewCounts[8] = {};
-    uint32_t currentModeIndex = 0;
+    uint32_t currentModeIndex = 1;  // Default: mode 1 (first 3D mode, matches runtime default)
 };
 
 static bool InitializeOpenXR(AppXrSession& xr) {
@@ -2429,22 +2429,24 @@ int main() {
                         if (AcquireSwapchainImage(xr, imageIndex)) {
                             rendered = true;
 
-                            // Get tile layout from current rendering mode (fallback: Nx1)
+                            // Use current mode's view count (not xrLocateViews count, which is max across all modes)
+                            uint32_t modeViewCount = viewCount;
                             uint32_t tileColumns = viewCount;
                             uint32_t tileRows = 1;
                             if (xr.renderingModeCount > 0 && xr.currentModeIndex < xr.renderingModeCount) {
+                                modeViewCount = xr.renderingModeViewCounts[xr.currentModeIndex];
                                 tileColumns = xr.renderingModeTileColumns[xr.currentModeIndex];
                                 tileRows = xr.renderingModeTileRows[xr.currentModeIndex];
-                                if (tileColumns == 0) tileColumns = viewCount;
+                                if (tileColumns == 0) tileColumns = modeViewCount;
                                 if (tileRows == 0) tileRows = 1;
                             }
 
                             uint32_t eyeW = xr.swapchain.width / tileColumns;
                             uint32_t eyeH = xr.swapchain.height / tileRows;
 
-                            std::vector<EyeRenderParams> eyeParams(viewCount);
-                            projectionViews.resize(viewCount, {});
-                            for (uint32_t i = 0; i < viewCount; i++) {
+                            std::vector<EyeRenderParams> eyeParams(modeViewCount);
+                            projectionViews.resize(modeViewCount, {});
+                            for (uint32_t i = 0; i < modeViewCount; i++) {
                                 uint32_t tileX = i % tileColumns;
                                 uint32_t tileY = i / tileColumns;
 
@@ -2466,14 +2468,14 @@ int main() {
                                 projectionViews[i].fov = views[i].fov;
                             }
 
-                            RenderScene(vkRenderer, imageIndex, eyeParams.data(), (int)viewCount);
+                            RenderScene(vkRenderer, imageIndex, eyeParams.data(), (int)modeViewCount);
                             ReleaseSwapchainImage(xr);
                         }
                     }
                 }
 
                 if (rendered) {
-                    EndFrame(xr, frameState.predictedDisplayTime, projectionViews.data(), viewCount);
+                    EndFrame(xr, frameState.predictedDisplayTime, projectionViews.data(), (uint32_t)projectionViews.size());
                 } else {
                     // Submit empty frame
                     XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};

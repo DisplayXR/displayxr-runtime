@@ -113,7 +113,7 @@ struct XrSessionManager {
     PFN_xrSetSharedTextureOutputRectEXT pfnSetSharedTextureOutputRectEXT = nullptr;
 
     // Enumerated rendering mode info
-    uint32_t currentModeIndex = 0;
+    uint32_t currentModeIndex = 1;  // Default: mode 1 (first 3D mode, matches runtime default)
     uint32_t renderingModeCount = 0;
     char renderingModeNames[8][XR_MAX_SYSTEM_NAME_SIZE] = {};
     uint32_t renderingModeViewCounts[8] = {};

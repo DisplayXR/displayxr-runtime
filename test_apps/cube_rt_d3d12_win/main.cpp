@@ -206,8 +206,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                         0.0f, 0.0f, 0.0f,
                         0.0f, 0.0f)) {
 
-                        uint32_t viewCount = xr.viewCount;
-                        submitViewCount = viewCount;
+                        // Use current mode's view count (not xr.viewCount which is max across all modes)
+                        uint32_t modeViewCount = (xr.currentModeIndex < xr.renderingModeCount)
+                            ? xr.renderingModeViewCounts[xr.currentModeIndex] : xr.viewCount;
+                        submitViewCount = modeViewCount;
 
                         XrViewLocateInfo locateInfo = {XR_TYPE_VIEW_LOCATE_INFO};
                         locateInfo.viewConfigurationType = xr.viewConfigType;
@@ -222,9 +224,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
                         // Get tile layout from rendering mode, with fallback
                         uint32_t tileColumns = (xr.currentModeIndex < xr.renderingModeCount)
-                            ? xr.renderingModeTileColumns[xr.currentModeIndex] : (viewCount >= 2 ? 2 : 1);
+                            ? xr.renderingModeTileColumns[xr.currentModeIndex] : (modeViewCount >= 2 ? 2 : 1);
                         uint32_t tileRows = (xr.currentModeIndex < xr.renderingModeCount)
-                            ? xr.renderingModeTileRows[xr.currentModeIndex] : ((viewCount + tileColumns - 1) / tileColumns);
+                            ? xr.renderingModeTileRows[xr.currentModeIndex] : ((modeViewCount + tileColumns - 1) / tileColumns);
 
                         uint32_t tileW = xr.swapchain.width / tileColumns;
                         uint32_t tileH = xr.swapchain.height / tileRows;
@@ -234,7 +236,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                             ID3D12Resource* swapchainTexture = swapchainImages[imageIndex].texture;
 
                             // Render all views with tile layout
-                            for (uint32_t eye = 0; eye < viewCount; eye++) {
+                            for (uint32_t eye = 0; eye < modeViewCount; eye++) {
                                 uint32_t tileX = eye % tileColumns;
                                 uint32_t tileY = eye / tileColumns;
 

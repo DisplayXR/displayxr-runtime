@@ -15,7 +15,7 @@ diverge in how they build the view and projection matrices.
 | Camera-centric | `test_apps/common/camera3d_view.h` | `test_apps/common/camera3d_view.c` |
 
 Runtime-side port (xrt types, FOV-only — no matrices):
-`src/xrt/auxiliary/math/m_stereo3d.h`
+`src/xrt/auxiliary/math/m_multiview.h`
 
 ---
 
@@ -37,7 +37,7 @@ Eye positions are in meters.
 
 ## Common Stage: Eye Factor Processing (Step 1)
 
-Both pipelines begin with `display3d_apply_eye_factors()`.  This function
+Both pipelines begin with `m_multiview_apply_eye_factors()`.  This function
 takes the raw eye positions and produces processed positions by applying two
 successive factors:
 
@@ -175,7 +175,7 @@ fov.angleUp    = atan(( halfH - ey) / ez)
 fov.angleDown  = atan((-halfH - ey) / ez)
 ```
 
-### Outputs (`Display3DStereoView` per eye)
+### Outputs (`Display3DView` per eye)
 
 | Field | Description |
 |-------|-------------|
@@ -207,7 +207,7 @@ Think *"a virtual camera whose frustum shifts with your head."*
 ### Pipeline
 
 **Step 1** — Apply IPD and parallax factors (common stage above, reuses
-`display3d_apply_eye_factors()`).
+`m_multiview_apply_eye_factors()`).
 
 **Step 2** — Compute the eye displacement from the nominal screen plane:
 
@@ -293,7 +293,7 @@ fov.angleUp    =  atan(tan_up)
 fov.angleDown  = -atan(tan_down)
 ```
 
-### Outputs (`Camera3DStereoView` per eye)
+### Outputs (`Camera3DView` per eye)
 
 | Field | Description |
 |-------|-------------|

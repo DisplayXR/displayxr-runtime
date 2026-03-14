@@ -274,6 +274,12 @@ oxr_session_populate_vk_native(struct oxr_logger *log,
 	// Set system devices for qwerty driver support
 	comp_vk_native_compositor_set_system_devices(&xcn->base, sess->sys->xsysd);
 
+	// Pass legacy app tile scaling flag so compositor can disable 1/2/3 mode keys
+	if (sess->sys->xsysc != NULL) {
+		comp_vk_native_compositor_set_legacy_app_tile_scaling(
+		    &xcn->base, sess->sys->xsysc->info.legacy_app_tile_scaling);
+	}
+
 	// Set the compositor directly — no client wrapper needed
 	// The VK native compositor creates swapchains with real VkImages
 	// that the app renders to directly (same VkDevice).

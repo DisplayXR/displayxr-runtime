@@ -195,6 +195,8 @@ struct comp_gl_compositor
 	GLuint vao_empty;         //!< Empty VAO for vertex-shader-generated fullscreen quad
 	GLuint fbo;               //!< Framebuffer for rendering into SBS texture
 	GLuint atlas_texture;    //!< Atlas stereo texture (tile_columns * view_width x tile_rows * view_height)
+	uint32_t atlas_tex_width;  //!< Atlas texture width (fixed at init)
+	uint32_t atlas_tex_height; //!< Atlas texture height (fixed at init)
 	uint32_t view_width;
 	uint32_t view_height;
 	uint32_t tile_columns;    //!< Tile columns in atlas layout (default 2 for SBS stereo)
@@ -257,6 +259,8 @@ struct comp_gl_compositor
 	struct xrt_system_devices *xsysd;
 	bool sys_info_set;
 	struct xrt_system_compositor_info sys_info;
+	uint32_t last_3d_mode_index;       //!< Last 3D mode index (for V-key toggle restore)
+	bool legacy_app_tile_scaling;      //!< True if app is legacy (gates 1/2/3 key mode selection)
 };
 
 static inline struct comp_gl_compositor *
@@ -910,6 +914,9 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 
 	GLint loc_tex = glGetUniformLocation(c->program_blit, "u_texture");
 	GLint loc_rect = glGetUniformLocation(c->program_blit, "u_src_rect");
+	// Ensure no Y-flip for atlas blit (u_flip_y may be stale from IOSurface blit)
+	GLint loc_flip_atlas = glGetUniformLocation(c->program_blit, "u_flip_y");
+	glUniform1f(loc_flip_atlas, 0.0f);
 
 	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
 		struct comp_layer *layer = &c->layer_accum.layers[i];
@@ -919,11 +926,13 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			continue;
 		}
 
-		for (uint32_t eye = 0; eye < 2; eye++) {
-			// In 2D mode, only render eye 0 at full width (skip eye 1)
-			if (!c->hardware_display_3d && eye > 0) {
-				continue;
-			}
+		// Use min of compositor's tile count and layer's actual view count
+		// (during mode transitions the app may submit fewer views than the
+		// new tile layout expects)
+		uint32_t mode_views = c->hardware_display_3d ? (c->tile_columns * c->tile_rows) : 1;
+		uint32_t view_count = (layer->data.view_count < mode_views) ? layer->data.view_count : mode_views;
+		if (view_count == 0) view_count = 1;
+		for (uint32_t eye = 0; eye < view_count; eye++) {
 
 			struct xrt_swapchain *sc = layer->sc_array[eye];
 			if (sc == NULL) {
@@ -1037,6 +1046,42 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 	}
 	} // end if (!zero_copy)
 
+	// Runtime-side 2D/3D toggle from qwerty V key
+#ifdef XRT_BUILD_DRIVER_QWERTY
+	if (c->xsysd != NULL) {
+		bool force_2d = false;
+		bool toggled = qwerty_check_display_mode_toggle(c->xsysd->xdevs, c->xsysd->xdev_count, &force_2d);
+		if (toggled) {
+			struct xrt_device *head = c->xsysd->static_roles.head;
+			if (head != NULL && head->hmd != NULL) {
+				if (force_2d) {
+					uint32_t cur = head->hmd->active_rendering_mode_index;
+					if (cur < head->rendering_mode_count &&
+					    head->rendering_modes[cur].hardware_display_3d) {
+						c->last_3d_mode_index = cur;
+					}
+					head->hmd->active_rendering_mode_index = 0;
+				} else {
+					head->hmd->active_rendering_mode_index = c->last_3d_mode_index;
+				}
+			}
+			comp_gl_compositor_request_display_mode(&c->base.base, !force_2d);
+		}
+
+		// Rendering mode change from qwerty 0/1/2/3/4 keys.
+		// Legacy apps only support V toggle — skip direct mode selection.
+		if (!c->legacy_app_tile_scaling) {
+			int render_mode = -1;
+			if (qwerty_check_rendering_mode_change(c->xsysd->xdevs, c->xsysd->xdev_count, &render_mode)) {
+				struct xrt_device *head = c->xsysd->static_roles.head;
+				if (head != NULL) {
+					xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, render_mode);
+				}
+			}
+		}
+	}
+#endif
+
 	// Sync hardware_display_3d, tile layout, and per-view dimensions
 	// from device's active rendering mode
 	if (c->xdev != NULL && c->xdev->hmd != NULL) {
@@ -1062,22 +1107,44 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 	GLuint atlas_for_present = zero_copy ? zc_texture : c->atlas_texture;
 #ifdef XRT_OS_WINDOWS
 	if (c->has_shared_texture) {
-		// Shared texture mode: blit SBS stereo texture to the DX-interop GL texture
+		// Shared texture mode: render into the DX-interop GL texture
 		if (c->pfn_wglDXLockObjectsNV(c->dx_interop_device, 1, &c->dx_interop_object)) {
 			glBindFramebuffer(GL_FRAMEBUFFER, c->fbo);
 			glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
 			                        c->shared_gl_texture, 0);
 
-			glViewport(0, 0, c->shared_width, c->shared_height);
-
-			glUseProgram(c->program_blit);
-			GLint loc_rect = glGetUniformLocation(c->program_blit, "u_src_rect");
-			glUniform4f(loc_rect, 0.0f, 0.0f, 1.0f, 1.0f);
-			glActiveTexture(GL_TEXTURE0);
-			glBindTexture(GL_TEXTURE_2D, atlas_for_present);
-			GLint loc_out_tex = glGetUniformLocation(c->program_blit, "u_texture");
-			glUniform1i(loc_out_tex, 0);
-			glDrawArrays(GL_TRIANGLES, 0, 3);
+			if (c->hardware_display_3d && c->display_processor != NULL) {
+				// Display processor handles stereo-to-display conversion
+				glViewport(0, 0, c->shared_width, c->shared_height);
+				xrt_display_processor_gl_process_atlas(
+				    c->display_processor,
+				    atlas_for_present,
+				    c->view_width,
+				    c->view_height,
+				    c->tile_columns,
+				    c->tile_rows,
+				    GL_RGBA8,
+				    c->shared_width,
+				    c->shared_height);
+			} else {
+				// 2D mode or no display processor: simple blit
+				glViewport(0, 0, c->shared_width, c->shared_height);
+				glUseProgram(c->program_blit);
+				glBindVertexArray(c->vao_empty);
+				GLint loc_rect = glGetUniformLocation(c->program_blit, "u_src_rect");
+				float sh_w = (c->atlas_tex_width > 0)
+				    ? (float)(c->tile_columns * c->view_width) / (float)c->atlas_tex_width : 1.0f;
+				float sh_h = (c->atlas_tex_height > 0)
+				    ? (float)(c->tile_rows * c->view_height) / (float)c->atlas_tex_height : 1.0f;
+				glUniform4f(loc_rect, 0.0f, 0.0f, sh_w, sh_h);
+				GLint loc_flip = glGetUniformLocation(c->program_blit, "u_flip_y");
+				glUniform1f(loc_flip, 0.0f);
+				glActiveTexture(GL_TEXTURE0);
+				glBindTexture(GL_TEXTURE_2D, atlas_for_present);
+				GLint loc_out_tex = glGetUniformLocation(c->program_blit, "u_texture");
+				glUniform1i(loc_out_tex, 0);
+				glDrawArrays(GL_TRIANGLES, 0, 3);
+			}
 
 			glFlush();
 
@@ -1091,24 +1158,45 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 #endif
 #ifdef __APPLE__
 	if (c->has_shared_iosurface) {
-		// Shared IOSurface mode: blit SBS stereo texture into the IOSurface
+		// Shared IOSurface mode: render into the IOSurface
 		glBindFramebuffer(GL_FRAMEBUFFER, c->fbo);
 		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
 		                        GL_TEXTURE_RECTANGLE, c->iosurface_gl_texture, 0);
 
-		glViewport(0, 0, c->iosurface_width, c->iosurface_height);
-
-		glUseProgram(c->program_blit);
-		GLint loc_rect = glGetUniformLocation(c->program_blit, "u_src_rect");
-		glUniform4f(loc_rect, 0.0f, 0.0f, 1.0f, 1.0f);
-		// Flip Y so IOSurface content matches Metal's top-down convention
-		GLint loc_flip = glGetUniformLocation(c->program_blit, "u_flip_y");
-		glUniform1f(loc_flip, 1.0f);
-		glActiveTexture(GL_TEXTURE0);
-		glBindTexture(GL_TEXTURE_2D, atlas_for_present);
-		GLint loc_out_tex = glGetUniformLocation(c->program_blit, "u_texture");
-		glUniform1i(loc_out_tex, 0);
-		glDrawArrays(GL_TRIANGLES, 0, 3);
+		if (c->hardware_display_3d && c->display_processor != NULL) {
+			// Display processor renders directly into the IOSurface FBO.
+			// Output is GL bottom-up; app's blit shader must NOT flip Y.
+			glViewport(0, 0, c->iosurface_width, c->iosurface_height);
+			xrt_display_processor_gl_process_atlas(
+			    c->display_processor,
+			    atlas_for_present,
+			    c->view_width,
+			    c->view_height,
+			    c->tile_columns,
+			    c->tile_rows,
+			    GL_RGBA8,
+			    c->iosurface_width,
+			    c->iosurface_height);
+		} else {
+			// 2D mode or no display processor: simple blit, no Y-flip.
+			// Content stays GL bottom-up; app's blit shader must NOT flip Y.
+			glViewport(0, 0, c->iosurface_width, c->iosurface_height);
+			glUseProgram(c->program_blit);
+			glBindVertexArray(c->vao_empty);
+			GLint loc_rect = glGetUniformLocation(c->program_blit, "u_src_rect");
+			float used_w = (c->atlas_tex_width > 0)
+			    ? (float)(c->tile_columns * c->view_width) / (float)c->atlas_tex_width : 1.0f;
+			float used_h = (c->atlas_tex_height > 0)
+			    ? (float)(c->tile_rows * c->view_height) / (float)c->atlas_tex_height : 1.0f;
+			glUniform4f(loc_rect, 0.0f, 0.0f, used_w, used_h);
+			GLint loc_flip = glGetUniformLocation(c->program_blit, "u_flip_y");
+			glUniform1f(loc_flip, 0.0f);
+			glActiveTexture(GL_TEXTURE0);
+			glBindTexture(GL_TEXTURE_2D, atlas_for_present);
+			GLint loc_out_tex = glGetUniformLocation(c->program_blit, "u_texture");
+			glUniform1i(loc_out_tex, 0);
+			glDrawArrays(GL_TRIANGLES, 0, 3);
+		}
 
 		glFlush();
 
@@ -1159,7 +1247,11 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			glViewport(0, 0, present_w, present_h);
 			glUseProgram(c->program_blit);
 			GLint loc_rect = glGetUniformLocation(c->program_blit, "u_src_rect");
-			glUniform4f(loc_rect, 0.0f, 0.0f, 1.0f, 1.0f);
+			float blit_w = (c->atlas_tex_width > 0)
+			    ? (float)(c->tile_columns * c->view_width) / (float)c->atlas_tex_width : 1.0f;
+			float blit_h = (c->atlas_tex_height > 0)
+			    ? (float)(c->tile_rows * c->view_height) / (float)c->atlas_tex_height : 1.0f;
+			glUniform4f(loc_rect, 0.0f, 0.0f, blit_w, blit_h);
 			GLint loc_flip = glGetUniformLocation(c->program_blit, "u_flip_y");
 			glUniform1f(loc_flip, 0.0f);
 
@@ -1461,9 +1553,16 @@ gl_init_resources(struct comp_gl_compositor *c, uint32_t width, uint32_t height)
 	// FBO for offscreen rendering into atlas texture
 	glGenFramebuffers(1, &c->fbo);
 
-	// Atlas stereo texture (tile_columns * view_width x tile_rows * view_height)
+	// Atlas stereo texture — worst-case size across all rendering modes
 	uint32_t atlas_width = c->tile_columns * c->view_width;
 	uint32_t atlas_height = c->tile_rows * c->view_height;
+	if (c->xdev != NULL && c->xdev->rendering_mode_count > 0) {
+		u_tiling_compute_system_atlas(c->xdev->rendering_modes,
+		                              c->xdev->rendering_mode_count,
+		                              &atlas_width, &atlas_height);
+	}
+	c->atlas_tex_width = atlas_width;
+	c->atlas_tex_height = atlas_height;
 	glGenTextures(1, &c->atlas_texture);
 	glBindTexture(GL_TEXTURE_2D, c->atlas_texture);
 	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8,
@@ -1501,6 +1600,8 @@ comp_gl_compositor_set_sys_info(struct xrt_compositor *xc, const struct xrt_syst
 	struct comp_gl_compositor *c = gl_comp(xc);
 	c->sys_info = *info;
 	c->sys_info_set = true;
+	c->legacy_app_tile_scaling = info->legacy_app_tile_scaling;
+	c->last_3d_mode_index = 1;
 }
 
 bool

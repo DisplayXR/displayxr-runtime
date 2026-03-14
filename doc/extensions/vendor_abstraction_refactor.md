@@ -47,7 +47,7 @@ needed to eliminate that requirement and discusses three open design questions.
 
 **Target**: a generic function pointer on `xrt_system_compositor` or `xrt_device`
 that any vendor populates at init.  The compositor calls
-`xsysc->get_predicted_eye_positions(xsysc, &eye_pair)` — no vendor `#ifdef`.
+`xsysc->get_predicted_eye_positions(xsysc, &eye_pos)` — no vendor `#ifdef`.
 
 **Design sketch**:
 ```c
@@ -56,7 +56,7 @@ struct xrt_eye_tracking_provider
 {
     bool (*get_predicted_eyes)(struct xrt_eye_tracking_provider *provider,
                                int64_t at_timestamp_ns,
-                               struct xrt_eye_pair *out_eyes);
+                               struct xrt_eye_positions *out_eyes);
     void (*destroy)(struct xrt_eye_tracking_provider *provider);
 };
 ```
