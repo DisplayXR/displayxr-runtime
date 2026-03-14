@@ -287,13 +287,9 @@ static void RenderOneFrame(RenderState& rs) {
             XrCompositionLayerProjectionView projectionViews[2] = {};
 
             if (frameState.shouldRender) {
-                XMMATRIX leftViewMatrix, leftProjMatrix;
-                XMMATRIX rightViewMatrix, rightProjMatrix;
-
                 if (LocateViews(xr, frameState.predictedDisplayTime,
-                    leftViewMatrix, leftProjMatrix, rightViewMatrix, rightProjMatrix,
                     g_inputState.cameraPosX, g_inputState.cameraPosY, g_inputState.cameraPosZ,
-                    g_inputState.yaw, g_inputState.pitch, g_inputState.stereo)) {
+                    g_inputState.yaw, g_inputState.pitch, g_inputState.viewParams)) {
 
                     // Raw view poses for projection views
                     XrViewLocateInfo locateInfo = {XR_TYPE_VIEW_LOCATE_INFO};
@@ -309,7 +305,7 @@ static void RenderOneFrame(RenderState& rs) {
                     uint32_t eyeRenderW = xr.swapchain.width / 2;
                     uint32_t eyeRenderH = xr.swapchain.height;
 
-                    Display3DStereoView stereoViews[2];
+                    Display3DView stereoViews[2];
                     bool appMonoMode = (xr.renderingModeCount > 0 && !xr.renderingModeDisplay3D[g_inputState.currentRenderingMode]);
                     bool useAppProjection = (xr.hasDisplayInfoExt && xr.displayWidthM > 0.0f);
                     if (useAppProjection) {
@@ -343,16 +339,17 @@ static void RenderOneFrame(RenderState& rs) {
 
                         if (g_inputState.cameraMode) {
                             Camera3DTunables camTunables;
-                            camTunables.ipd_factor = g_inputState.stereo.ipdFactor;
-                            camTunables.parallax_factor = g_inputState.stereo.parallaxFactor;
-                            camTunables.inv_convergence_distance = g_inputState.stereo.invConvergenceDistance;
-                            camTunables.half_tan_vfov = CAMERA_HALF_TAN_VFOV / g_inputState.stereo.zoomFactor;
+                            camTunables.ipd_factor = g_inputState.viewParams.ipdFactor;
+                            camTunables.parallax_factor = g_inputState.viewParams.parallaxFactor;
+                            camTunables.inv_convergence_distance = g_inputState.viewParams.invConvergenceDistance;
+                            camTunables.half_tan_vfov = CAMERA_HALF_TAN_VFOV / g_inputState.viewParams.zoomFactor;
 
-                            Camera3DStereoView camViews[2];
-                            camera3d_compute_stereo_views(
-                                &rawLeft, &rawRight, &nominalViewer,
+                            Camera3DView camViews[2];
+                            XrVector3f rawEyes[2] = {rawLeft, rawRight};
+                            camera3d_compute_views(
+                                rawEyes, 2, &nominalViewer,
                                 &screen, &camTunables, &cameraPose,
-                                0.01f, 100.0f, &camViews[0], &camViews[1]);
+                                0.01f, 100.0f, camViews);
 
                             for (int i = 0; i < 2; i++) {
                                 memcpy(stereoViews[i].view_matrix, camViews[i].view_matrix, sizeof(float) * 16);
@@ -362,15 +359,16 @@ static void RenderOneFrame(RenderState& rs) {
                             }
                         } else {
                             Display3DTunables tunables;
-                            tunables.ipd_factor = g_inputState.stereo.ipdFactor;
-                            tunables.parallax_factor = g_inputState.stereo.parallaxFactor;
-                            tunables.perspective_factor = g_inputState.stereo.perspectiveFactor;
-                            tunables.virtual_display_height = g_inputState.stereo.virtualDisplayHeight / g_inputState.stereo.scaleFactor;
+                            tunables.ipd_factor = g_inputState.viewParams.ipdFactor;
+                            tunables.parallax_factor = g_inputState.viewParams.parallaxFactor;
+                            tunables.perspective_factor = g_inputState.viewParams.perspectiveFactor;
+                            tunables.virtual_display_height = g_inputState.viewParams.virtualDisplayHeight / g_inputState.viewParams.scaleFactor;
 
-                            display3d_compute_stereo_views(
-                                &rawLeft, &rawRight, &nominalViewer,
+                            XrVector3f rawEyes[2] = {rawLeft, rawRight};
+                            display3d_compute_views(
+                                rawEyes, 2, &nominalViewer,
                                 &screen, &tunables, &cameraPose,
-                                0.01f, 100.0f, &stereoViews[0], &stereoViews[1]);
+                                0.01f, 100.0f, stereoViews);
                         }
                     }
 
@@ -432,13 +430,13 @@ static void RenderOneFrame(RenderState& rs) {
                                 viewMatrix = ColumnMajorToXMMatrix(stereoViews[vi].view_matrix);
                                 projMatrix = ColumnMajorToXMMatrix(stereoViews[vi].projection_matrix);
                             } else {
-                                viewMatrix = (eye == 0) ? leftViewMatrix : rightViewMatrix;
-                                projMatrix = (eye == 0) ? leftProjMatrix : rightProjMatrix;
+                                viewMatrix = xr.viewMatrices[eye];
+                                projMatrix = xr.projMatrices[eye];
                             }
 
                             RenderScene(renderer, rtv, rs.depthDSV.Get(),
                                 renderW, renderH, viewMatrix, projMatrix,
-                                useAppProjection ? 1.0f : g_inputState.stereo.scaleFactor, 0.03f);
+                                useAppProjection ? 1.0f : g_inputState.viewParams.scaleFactor, 0.03f);
 
                             projectionViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
                             projectionViews[eye].subImage.swapchain = xr.swapchain.swapchain;
@@ -617,7 +615,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     PerformanceStats perfStats = {};
     perfStats.lastTime = std::chrono::high_resolution_clock::now();
-    g_inputState.stereo.virtualDisplayHeight = 0.24f;
+    g_inputState.viewParams.virtualDisplayHeight = 0.24f;
     g_inputState.nominalViewerZ = xr.nominalViewerZ;
     g_inputState.renderingModeCount = xr.renderingModeCount;
 

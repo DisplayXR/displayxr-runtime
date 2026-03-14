@@ -43,7 +43,7 @@
 #include <mach-o/dyld.h>
 #include <unistd.h>
 
-#include "stereo_params.h"
+#include "view_params.h"
 #include "display3d_view.h"
 #include "camera3d_view.h"
 #include "gs_renderer.h"
@@ -86,7 +86,7 @@ struct InputState {
     bool keyE = false, keyQ = false;
     float cameraPosX = 0.0f, cameraPosY = 0.0f, cameraPosZ = 0.0f;
     bool resetViewRequested = false;
-    StereoParams stereo;
+    ViewParams viewParams;
     bool hudVisible = true;
     bool cameraMode = false;
     float nominalViewerZ = 0.5f;
@@ -228,8 +228,8 @@ static void UpdateCameraMovement(InputState& input, float dt, float displayHeigh
     if (input.resetViewRequested) {
         input.yaw = 0; input.pitch = 0;
         input.cameraPosX = input.cameraPosY = input.cameraPosZ = 0;
-        input.stereo = StereoParams();
-        input.stereo.virtualDisplayHeight = 0.24f;
+        input.viewParams = ViewParams();
+        input.viewParams.virtualDisplayHeight = 0.24f;
         input.resetViewRequested = false;
         input.teleportAnimating = false;
         return;
@@ -397,15 +397,15 @@ static void OpenLoadDialog() {
     float delta = (float)[event scrollingDeltaY] * 0.02f;
     NSUInteger flags = [event modifierFlags];
     if (flags & NSEventModifierFlagShift) {
-        g_input.stereo.ipdFactor += delta * 0.5f;
-        if (g_input.stereo.ipdFactor < 0.0f) g_input.stereo.ipdFactor = 0.0f;
-        if (g_input.stereo.ipdFactor > 1.0f) g_input.stereo.ipdFactor = 1.0f;
-        g_input.stereo.parallaxFactor += delta * 0.5f;
-        if (g_input.stereo.parallaxFactor < 0.0f) g_input.stereo.parallaxFactor = 0.0f;
-        if (g_input.stereo.parallaxFactor > 1.0f) g_input.stereo.parallaxFactor = 1.0f;
+        g_input.viewParams.ipdFactor += delta * 0.5f;
+        if (g_input.viewParams.ipdFactor < 0.0f) g_input.viewParams.ipdFactor = 0.0f;
+        if (g_input.viewParams.ipdFactor > 1.0f) g_input.viewParams.ipdFactor = 1.0f;
+        g_input.viewParams.parallaxFactor += delta * 0.5f;
+        if (g_input.viewParams.parallaxFactor < 0.0f) g_input.viewParams.parallaxFactor = 0.0f;
+        if (g_input.viewParams.parallaxFactor > 1.0f) g_input.viewParams.parallaxFactor = 1.0f;
     } else {
-        g_input.stereo.scaleFactor += delta * 0.5f;
-        if (g_input.stereo.scaleFactor < 0.1f) g_input.stereo.scaleFactor = 0.1f;
+        g_input.viewParams.scaleFactor += delta * 0.5f;
+        if (g_input.viewParams.scaleFactor < 0.1f) g_input.viewParams.scaleFactor = 0.1f;
     }
 }
 
@@ -597,8 +597,7 @@ struct AppXrSession {
     uint32_t displayPixelWidth = 0, displayPixelHeight = 0;
 
     // Eye tracking
-    float leftEyeX = 0, leftEyeY = 0, leftEyeZ = 0;
-    float rightEyeX = 0, rightEyeY = 0, rightEyeZ = 0;
+    float eyePositions[8][3] = {};  // [view][x,y,z] — raw per-eye positions in display space
     bool eyeTrackingActive = false;
     bool isEyeTracking = false;
     uint32_t activeEyeTrackingMode = 0;
@@ -1131,7 +1130,7 @@ int main() {
       ci.queueFamilyIndex = queueFamilyIndex;
       vkCreateCommandPool(vkDevice, &ci, nullptr, &cmdPool); }
 
-    g_input.stereo.virtualDisplayHeight = 0.24f;
+    g_input.viewParams.virtualDisplayHeight = 0.24f;
     g_input.nominalViewerZ = xr.nominalViewerZ;
     g_input.renderingModeCount = xr.renderingModeCount;
 
@@ -1204,8 +1203,8 @@ int main() {
                         (viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)) {
 
                         XrVector3f rawEyePos[2] = {views[0].pose.position, views[1].pose.position};
-                        xr.leftEyeX = rawEyePos[0].x; xr.leftEyeY = rawEyePos[0].y; xr.leftEyeZ = rawEyePos[0].z;
-                        xr.rightEyeX = rawEyePos[1].x; xr.rightEyeY = rawEyePos[1].y; xr.rightEyeZ = rawEyePos[1].z;
+                        xr.eyePositions[0][0] = rawEyePos[0].x; xr.eyePositions[0][1] = rawEyePos[0].y; xr.eyePositions[0][2] = rawEyePos[0].z;
+                        xr.eyePositions[1][0] = rawEyePos[1].x; xr.eyePositions[1][1] = rawEyePos[1].y; xr.eyePositions[1][2] = rawEyePos[1].z;
                         xr.isEyeTracking = (eyeTrackingState.isTracking == XR_TRUE);
                         xr.activeEyeTrackingMode = (uint32_t)eyeTrackingState.activeMode;
 
@@ -1243,7 +1242,7 @@ int main() {
                         g_renderW = renderW; g_renderH = renderH;
 
                         // Stereo views (Kooima)
-                        Display3DStereoView stereoViews[2];
+                        Display3DView stereoViews[2];
                         bool hasKooima = (xr.displayWidthM > 0 && xr.displayHeightM > 0);
                         if (hasKooima) {
                             float dispPxW = xr.displayPixelWidth > 0 ? (float)xr.displayPixelWidth : (float)xr.swapchain.width;
@@ -1261,15 +1260,15 @@ int main() {
                             // The display processor (weaver) handles cropping for SBS layout.
                             Display3DScreen screen = {screenWidthM, screenHeightM};
                             Display3DTunables tunables;
-                            tunables.ipd_factor = g_input.stereo.ipdFactor;
-                            tunables.parallax_factor = g_input.stereo.parallaxFactor;
-                            tunables.perspective_factor = g_input.stereo.perspectiveFactor;
-                            tunables.virtual_display_height = g_input.stereo.virtualDisplayHeight / g_input.stereo.scaleFactor;
+                            tunables.ipd_factor = g_input.viewParams.ipdFactor;
+                            tunables.parallax_factor = g_input.viewParams.parallaxFactor;
+                            tunables.perspective_factor = g_input.viewParams.perspectiveFactor;
+                            tunables.virtual_display_height = g_input.viewParams.virtualDisplayHeight / g_input.viewParams.scaleFactor;
 
-                            display3d_compute_stereo_views(
-                                &rawEyePos[0], &rawEyePos[1], &nominalViewer,
+                            display3d_compute_views(
+                                rawEyePos, 2, &nominalViewer,
                                 &screen, &tunables, &cameraPose,
-                                0.01f, 100.0f, &stereoViews[0], &stereoViews[1]);
+                                0.01f, 100.0f, stereoViews);
                         }
 
                         // Double-click teleport: unproject through left eye matrices
@@ -1417,14 +1416,14 @@ int main() {
                         fps, g_avgFrameTime * 1000.0,
                         g_renderW, g_renderH, g_windowW, g_windowH,
                         xr.displayWidthM, xr.displayHeightM,
-                        xr.leftEyeX, xr.leftEyeY, xr.leftEyeZ,
-                        xr.rightEyeX, xr.rightEyeY, xr.rightEyeZ,
+                        xr.eyePositions[0][0], xr.eyePositions[0][1], xr.eyePositions[0][2],
+                        xr.eyePositions[1][0], xr.eyePositions[1][1], xr.eyePositions[1][2],
                         g_input.cameraPosX, g_input.cameraPosY, g_input.cameraPosZ,
                         cosf(g_input.pitch) * sinf(g_input.yaw),
                         -sinf(g_input.pitch),
                         -cosf(g_input.pitch) * cosf(g_input.yaw),
-                        g_input.stereo.ipdFactor, g_input.stereo.parallaxFactor,
-                        g_input.stereo.scaleFactor];
+                        g_input.viewParams.ipdFactor, g_input.viewParams.parallaxFactor,
+                        g_input.viewParams.scaleFactor];
                     g_hudView.hudText = text;
                     // Auto-size HUD to fit text
                     NSDictionary *attrs = @{
