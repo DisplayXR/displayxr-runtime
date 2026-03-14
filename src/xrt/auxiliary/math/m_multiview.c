@@ -2,16 +2,16 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  Camera-centric and display-centric stereo math for 3D displays.
+ * @brief  Camera-centric and display-centric multiview math for 3D displays.
  *
  * Canonical implementation ported from test_apps/common/camera3d_view.c.
- * See m_stereo3d.h for API docs.
+ * See m_multiview.h for API docs.
  *
  * @author David Fattal
  * @ingroup aux_math
  */
 
-#include "m_stereo3d.h"
+#include "m_multiview.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -32,10 +32,10 @@ quat_rotate_vec3(struct xrt_quat q, struct xrt_vec3 v)
 	return out;
 }
 
-struct m_stereo3d_camera_tunables
-m_stereo3d_default_camera_tunables(void)
+struct m_multiview_camera_tunables
+m_multiview_default_camera_tunables(void)
 {
-	struct m_stereo3d_camera_tunables t;
+	struct m_multiview_camera_tunables t;
 	t.ipd_factor = 1.0f;
 	t.parallax_factor = 1.0f;
 	t.inv_convergence_distance = 2.0f; // 1/0.5m convergence
@@ -44,56 +44,12 @@ m_stereo3d_default_camera_tunables(void)
 }
 
 void
-m_stereo3d_apply_eye_factors(const struct xrt_vec3 *raw_left,
-                             const struct xrt_vec3 *raw_right,
-                             const struct xrt_vec3 *nominal_viewer,
-                             float ipd_factor,
-                             float parallax_factor,
-                             struct xrt_vec3 *out_left,
-                             struct xrt_vec3 *out_right)
-{
-	// Default nominal viewer if NULL (only z is used — x/y lerp toward origin)
-	float nom_z = 0.5f;
-	if (nominal_viewer) {
-		nom_z = nominal_viewer->z;
-	}
-
-	// Step 1: IPD factor -- scale inter-eye vector, keep center fixed
-	float cx = (raw_left->x + raw_right->x) * 0.5f;
-	float cy = (raw_left->y + raw_right->y) * 0.5f;
-	float cz = (raw_left->z + raw_right->z) * 0.5f;
-
-	float lvx = (raw_left->x - cx) * ipd_factor;
-	float lvy = (raw_left->y - cy) * ipd_factor;
-	float lvz = (raw_left->z - cz) * ipd_factor;
-
-	float rvx = (raw_right->x - cx) * ipd_factor;
-	float rvy = (raw_right->y - cy) * ipd_factor;
-	float rvz = (raw_right->z - cz) * ipd_factor;
-
-	// Step 2: Parallax factor -- lerp center toward (0, 0, nom_z).
-	// We use origin for x/y so that reducing parallax drives the viewpoint
-	// to the display-center axis rather than to an arbitrary nominal offset.
-	float cx2 = parallax_factor * cx;
-	float cy2 = parallax_factor * cy;
-	float cz2 = nom_z + parallax_factor * (cz - nom_z);
-
-	out_left->x = cx2 + lvx;
-	out_left->y = cy2 + lvy;
-	out_left->z = cz2 + lvz;
-
-	out_right->x = cx2 + rvx;
-	out_right->y = cy2 + rvy;
-	out_right->z = cz2 + rvz;
-}
-
-void
-m_stereo3d_apply_eye_factors_n(const struct xrt_vec3 *raw_eyes,
-                               uint32_t count,
-                               const struct xrt_vec3 *nominal_viewer,
-                               float ipd_factor,
-                               float parallax_factor,
-                               struct xrt_vec3 *out_eyes)
+m_multiview_apply_eye_factors(const struct xrt_vec3 *raw_eyes,
+                              uint32_t count,
+                              const struct xrt_vec3 *nominal_viewer,
+                              float ipd_factor,
+                              float parallax_factor,
+                              struct xrt_vec3 *out_eyes)
 {
 	if (count == 0) {
 		return;
@@ -121,7 +77,7 @@ m_stereo3d_apply_eye_factors_n(const struct xrt_vec3 *raw_eyes,
 	float cy2 = parallax_factor * cy;
 	float cz2 = nom_z + parallax_factor * (cz - nom_z);
 
-	// IPD factor: scale each eye's offset from center
+	// View spread factor: scale each eye's offset from center
 	for (uint32_t i = 0; i < count; i++) {
 		out_eyes[i].x = cx2 + (raw_eyes[i].x - cx) * ipd_factor;
 		out_eyes[i].y = cy2 + (raw_eyes[i].y - cy) * ipd_factor;
@@ -130,16 +86,16 @@ m_stereo3d_apply_eye_factors_n(const struct xrt_vec3 *raw_eyes,
 }
 
 void
-m_stereo3d_camera_compute_view(const struct xrt_vec3 *processed_eye,
-                               float nominal_z,
-                               const struct m_stereo3d_screen *screen,
-                               const struct m_stereo3d_camera_tunables *tunables,
-                               const struct xrt_pose *camera_pose,
-                               struct xrt_fov *out_fov,
-                               struct xrt_vec3 *out_eye_world)
+m_multiview_camera_compute_view(const struct xrt_vec3 *processed_eye,
+                                float nominal_z,
+                                const struct m_multiview_screen *screen,
+                                const struct m_multiview_camera_tunables *tunables,
+                                const struct xrt_pose *camera_pose,
+                                struct xrt_fov *out_fov,
+                                struct xrt_vec3 *out_eye_world)
 {
-	struct m_stereo3d_camera_tunables t =
-	    tunables ? *tunables : m_stereo3d_default_camera_tunables();
+	struct m_multiview_camera_tunables t =
+	    tunables ? *tunables : m_multiview_default_camera_tunables();
 
 	struct xrt_quat cam_ori = {0, 0, 0, 1};
 	struct xrt_vec3 cam_pos = {0, 0, 0};
@@ -186,34 +142,33 @@ m_stereo3d_camera_compute_view(const struct xrt_vec3 *processed_eye,
 }
 
 void
-m_stereo3d_camera_compute(const struct xrt_vec3 *raw_left,
-                          const struct xrt_vec3 *raw_right,
-                          const struct xrt_vec3 *nominal_viewer,
-                          const struct m_stereo3d_screen *screen,
-                          const struct m_stereo3d_camera_tunables *tunables,
-                          const struct xrt_pose *camera_pose,
-                          struct xrt_fov *out_fovs,
-                          struct xrt_vec3 *out_eye_world)
+m_multiview_camera_compute(const struct xrt_vec3 *raw_eyes,
+                           uint32_t count,
+                           const struct xrt_vec3 *nominal_viewer,
+                           const struct m_multiview_screen *screen,
+                           const struct m_multiview_camera_tunables *tunables,
+                           const struct xrt_pose *camera_pose,
+                           struct xrt_fov *out_fovs,
+                           struct xrt_vec3 *out_eye_world)
 {
-	struct m_stereo3d_camera_tunables t =
-	    tunables ? *tunables : m_stereo3d_default_camera_tunables();
+	struct m_multiview_camera_tunables t =
+	    tunables ? *tunables : m_multiview_default_camera_tunables();
 
 	float nom_z = 0.5f;
 	if (nominal_viewer) {
 		nom_z = nominal_viewer->z;
 	}
 
-	// Apply IPD and parallax factors (2-eye path)
-	struct xrt_vec3 raw[2] = {*raw_left, *raw_right};
-	struct xrt_vec3 processed[2];
-	m_stereo3d_apply_eye_factors_n(raw, 2, nominal_viewer,
-	                               t.ipd_factor, t.parallax_factor,
-	                               processed);
+	// Apply view spread and parallax factors
+	struct xrt_vec3 processed[8]; // XRT_MAX_VIEWS
+	m_multiview_apply_eye_factors(raw_eyes, count, nominal_viewer,
+	                              t.ipd_factor, t.parallax_factor,
+	                              processed);
 
-	// Compute each eye via single-eye primitive
-	for (int i = 0; i < 2; i++) {
-		m_stereo3d_camera_compute_view(&processed[i], nom_z, screen,
-		                               &t, camera_pose,
-		                               &out_fovs[i], &out_eye_world[i]);
+	// Compute each view via single-view primitive
+	for (uint32_t i = 0; i < count; i++) {
+		m_multiview_camera_compute_view(&processed[i], nom_z, screen,
+		                                &t, camera_pose,
+		                                &out_fovs[i], &out_eye_world[i]);
 	}
 }

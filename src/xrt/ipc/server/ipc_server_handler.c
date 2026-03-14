@@ -22,7 +22,7 @@
 #include "xrt/xrt_config_have.h"
 
 #include "math/m_api.h"
-#include "math/m_stereo3d.h"
+#include "math/m_multiview.h"
 
 #ifdef XRT_GRAPHICS_SYNC_HANDLE_IS_FD
 #include <unistd.h>
@@ -237,7 +237,7 @@ ipc_try_get_sr_view_poses(struct ipc_server *s,
 
 	// Query qwerty stereo state for camera-centric controls
 #ifdef XRT_BUILD_DRIVER_QWERTY
-	struct qwerty_stereo_state stereo_state = {0};
+	struct qwerty_view_state stereo_state = {0};
 	bool have_stereo_state = false;
 	{
 		// Build xrt_device* array from ipc_server idevs
@@ -245,11 +245,11 @@ ipc_try_get_sr_view_poses(struct ipc_server *s,
 		for (size_t i = 0; i < XRT_SYSTEM_MAX_DEVICES; i++) {
 			xdevs[i] = s->idevs[i].xdev;
 		}
-		have_stereo_state = qwerty_get_stereo_state(xdevs, XRT_SYSTEM_MAX_DEVICES, &stereo_state);
+		have_stereo_state = qwerty_get_view_state(xdevs, XRT_SYSTEM_MAX_DEVICES, &stereo_state);
 	}
 #else
-	struct { bool camera_mode; float cam_ipd_factor, cam_parallax_factor, cam_convergence,
-	         cam_half_tan_vfov, disp_ipd_factor, disp_parallax_factor,
+	struct { bool camera_mode; float cam_spread_factor, cam_parallax_factor, cam_convergence,
+	         cam_half_tan_vfov, disp_spread_factor, disp_parallax_factor,
 	         disp_vHeight, nominal_viewer_z, screen_height_m; } stereo_state = {0};
 	bool have_stereo_state = false;
 #endif
@@ -261,9 +261,9 @@ ipc_try_get_sr_view_poses(struct ipc_server *s,
 
 	if (have_stereo_state && stereo_state.camera_mode && compositor_owns_window) {
 		// CAMERA-CENTRIC PATH
-		struct m_stereo3d_screen scr = {screen_width_m, screen_height_m};
-		struct m_stereo3d_camera_tunables tunables = {
-		    .ipd_factor = stereo_state.cam_ipd_factor,
+		struct m_multiview_screen scr = {screen_width_m, screen_height_m};
+		struct m_multiview_camera_tunables tunables = {
+		    .ipd_factor = stereo_state.cam_spread_factor,
 		    .parallax_factor = stereo_state.cam_parallax_factor,
 		    .inv_convergence_distance = stereo_state.cam_convergence,
 		    .half_tan_vfov = stereo_state.cam_half_tan_vfov,
@@ -271,8 +271,9 @@ ipc_try_get_sr_view_poses(struct ipc_server *s,
 		struct xrt_pose camera_pose = {display_ori, display_pos};
 		struct xrt_vec3 camera_eye_world[2];
 
-		m_stereo3d_camera_compute(&left_eye, &right_eye, NULL, &scr, &tunables,
-		                          &camera_pose, out_fovs, camera_eye_world);
+		struct xrt_vec3 raw_eyes[2] = {left_eye, right_eye};
+		m_multiview_camera_compute(raw_eyes, 2, NULL, &scr, &tunables,
+		                           &camera_pose, out_fovs, camera_eye_world);
 
 		// Head = camera pose
 		out_head_relation->pose.position = display_pos;
@@ -308,10 +309,16 @@ ipc_try_get_sr_view_poses(struct ipc_server *s,
 		float kooima_w = screen_width_m;
 		float kooima_h = screen_height_m;
 		if (have_stereo_state && compositor_owns_window) {
-			m_stereo3d_apply_eye_factors(&left_eye, &right_eye, NULL,
-			                            stereo_state.disp_ipd_factor,
-			                            stereo_state.disp_parallax_factor,
-			                            &adj_left, &adj_right);
+			{
+				struct xrt_vec3 raw_eyes[2] = {left_eye, right_eye};
+				struct xrt_vec3 adj_eyes[2];
+				m_multiview_apply_eye_factors(raw_eyes, 2, NULL,
+				                             stereo_state.disp_spread_factor,
+				                             stereo_state.disp_parallax_factor,
+				                             adj_eyes);
+				adj_left = adj_eyes[0];
+				adj_right = adj_eyes[1];
+			}
 			// Scale screen by m2v (meters-to-virtual)
 			kooima_h = stereo_state.disp_vHeight;
 			kooima_w = screen_width_m * (kooima_h / screen_height_m);
