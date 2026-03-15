@@ -101,7 +101,7 @@ create_window_on_main_thread(struct comp_vk_native_window_macos *win,
 
 	// Do NOT set layer.device — MoltenVK handles this when VkSurfaceKHR is created
 	win->metal_layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
-	win->metal_layer.framebufferOnly = YES;
+	win->metal_layer.framebufferOnly = NO;
 
 	CGFloat scale = win->window.backingScaleFactor;
 	win->metal_layer.contentsScale = scale;

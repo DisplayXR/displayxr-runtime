@@ -51,6 +51,8 @@ struct u_hud_data
 	const char *rendering_mode_name;               //!< Rendering mode label from device (e.g. "Blend", "SBS", "2D")
 	uint32_t render_width;
 	uint32_t render_height;
+	uint32_t swapchain_width;                      //!< Worst-case atlas width across all modes
+	uint32_t swapchain_height;                     //!< Worst-case atlas height across all modes
 	uint32_t window_width;
 	uint32_t window_height;
 	float display_width_mm;

@@ -75,14 +75,6 @@ struct comp_metal_swapchain
 
 /*
  *
- * HUD overlay view (semi-transparent text, rendered as NSView subview)
- *
- */
-
-#import "util/comp_hud_overlay_macos.h"
-
-/*
- *
  * Metal compositor structure
  *
  */
@@ -191,11 +183,14 @@ struct comp_metal_compositor
 	//! Time of the last predicted display time.
 	uint64_t last_display_time_ns;
 
-	//! HUD overlay view (for runtime-owned windows).
-	CompHudOverlayView *hud_view;
+	//! HUD overlay (shared u_hud system).
+	struct u_hud *hud;
 
-	//! HUD update timer (seconds since last update).
-	float hud_timer;
+	//! HUD texture for GPU upload.
+	id<MTLTexture> hud_texture;
+
+	//! Render pipeline for HUD blit with alpha blending.
+	id<MTLRenderPipelineState> hud_blit_pipeline;
 
 	//! Last frame timestamp for FPS/frame time.
 	uint64_t last_frame_ns;
@@ -411,6 +406,27 @@ compile_shaders(struct comp_metal_compositor *c)
 		goto cleanup;
 	}
 
+	// HUD blit pipeline (same shaders, alpha blending enabled)
+	{
+		MTLRenderPipelineDescriptor *hud_desc = [[MTLRenderPipelineDescriptor alloc] init];
+		hud_desc.vertexFunction = blit_vs;
+		hud_desc.fragmentFunction = blit_fs;
+		hud_desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+		hud_desc.colorAttachments[0].blendingEnabled = YES;
+		hud_desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+		hud_desc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+		hud_desc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+		hud_desc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+
+		c->hud_blit_pipeline = [c->device newRenderPipelineStateWithDescriptor:hud_desc error:&error];
+		[hud_desc release];
+		if (c->hud_blit_pipeline == nil) {
+			U_LOG_E("Failed to create HUD blit pipeline: %s",
+			        error.localizedDescription.UTF8String);
+			goto cleanup;
+		}
+	}
+
 	// Projection pipeline (renders into stereo texture)
 	{
 		MTLRenderPipelineDescriptor *proj_desc = [[MTLRenderPipelineDescriptor alloc] init];
@@ -622,13 +638,7 @@ create_window_on_main_thread(struct comp_metal_compositor *c, uint32_t width, ui
 
 	c->owns_window = true;
 
-	if (!c->offscreen) {
-		// Create HUD overlay view (bottom-left, hidden initially)
-		NSRect hudFrame = NSMakeRect(10, 10, 420, 380);
-		c->hud_view = [[CompHudOverlayView alloc] initWithFrame:hudFrame];
-		[metalView addSubview:c->hud_view];
-		[c->hud_view setHidden:YES];
-	}
+	(void)0; // HUD is created later in comp_metal_compositor_create
 
 	*out_success = true;
 }
@@ -1046,49 +1056,23 @@ metal_compositor_layer_quad(struct xrt_compositor *xc,
  * Update the HUD overlay text (throttled, main-thread safe).
  */
 static void
-metal_compositor_update_hud(struct comp_metal_compositor *c, float dt)
+metal_compositor_render_hud(struct comp_metal_compositor *c, float dt,
+                            id<MTLCommandBuffer> cmd_buf, id<MTLTexture> output_texture)
 {
-	if (c->hud_view == nil) {
+	if (c->hud == NULL || !u_hud_is_visible() || output_texture == nil) {
 		return;
 	}
 
-	bool visible = u_hud_is_visible();
-	if (!visible) {
-		if (![c->hud_view isHidden]) {
-			dispatch_async(dispatch_get_main_queue(), ^{
-			    [c->hud_view setHidden:YES];
-			});
-		}
-		return;
+	// Smooth frame time (every frame for accuracy)
+	float dt_ms = dt * 1000.0f;
+	if (dt_ms > 0.0f) {
+		c->smoothed_frame_time_ms = c->smoothed_frame_time_ms * 0.9f + dt_ms * 0.1f;
 	}
+	float fps = (c->smoothed_frame_time_ms > 0.0f) ? (1000.0f / c->smoothed_frame_time_ms) : 0.0f;
 
-	// Throttle updates to every 0.5s
-	c->hud_timer += dt;
-	if (c->hud_timer < 0.5f) {
-		return;
-	}
-	c->hud_timer = 0.0f;
-
-	// Smooth frame time (exponential moving average)
-	float alpha = 0.1f;
-	c->smoothed_frame_time_ms = c->smoothed_frame_time_ms * (1.0f - alpha) + (dt * 1000.0f) * alpha;
-	float fps = (c->smoothed_frame_time_ms > 0.0f) ? 1000.0f / c->smoothed_frame_time_ms : 0.0f;
-
-	// Device name
-	const char *dev_name = (c->xdev != NULL) ? c->xdev->str : "Unknown";
-
-	// Active rendering mode name (from active_rendering_mode_index, not OUTPUT_MODE property)
-	const char *mode_name = "?";
-	if (c->xdev != NULL && c->xdev->hmd != NULL) {
-		uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
-		if (idx < c->xdev->rendering_mode_count) {
-			mode_name = c->xdev->rendering_modes[idx].mode_name;
-		}
-	}
-
-	// Display info from system compositor
+	// Display dimensions from sys_info
 	float disp_w_mm = 0, disp_h_mm = 0;
-	float nom_y = 0, nom_z = 0;
+	float nom_x = 0, nom_y = 0, nom_z = 600.0f;
 	if (c->sys_info != NULL) {
 		disp_w_mm = c->sys_info->display_width_m * 1000.0f;
 		disp_h_mm = c->sys_info->display_height_m * 1000.0f;
@@ -1096,149 +1080,145 @@ metal_compositor_update_hud(struct comp_metal_compositor *c, float dt)
 		nom_z = c->sys_info->nominal_viewer_z_m * 1000.0f;
 	}
 
-	// View count and scale from active rendering mode
-	uint32_t view_count = c->tile_columns * c->tile_rows;
-	float scale_x = 1.0f, scale_y = 1.0f;
+	// Eye positions from display processor (fallback to nominal)
+	struct xrt_vec3 left_eye = {-0.032f, nom_y / 1000.0f, nom_z / 1000.0f};
+	struct xrt_vec3 right_eye = {0.032f, nom_y / 1000.0f, nom_z / 1000.0f};
+	if (c->display_processor != NULL) {
+		struct xrt_eye_positions eye_pos = {0};
+		if (xrt_display_processor_metal_get_predicted_eye_positions(c->display_processor, &eye_pos) &&
+		    eye_pos.valid && eye_pos.count >= 2) {
+			left_eye.x = eye_pos.eyes[0].x;
+			left_eye.y = eye_pos.eyes[0].y;
+			left_eye.z = eye_pos.eyes[0].z;
+			right_eye.x = eye_pos.eyes[1].x;
+			right_eye.y = eye_pos.eyes[1].y;
+			right_eye.z = eye_pos.eyes[1].z;
+		}
+	}
+
+	// Window dimensions
+	uint32_t win_w = (uint32_t)output_texture.width;
+	uint32_t win_h = (uint32_t)output_texture.height;
+
+	// Fill HUD data
+	struct u_hud_data data = {0};
+	data.device_name = (c->xdev != NULL) ? c->xdev->str : "Unknown";
+	data.fps = fps;
+	data.frame_time_ms = c->smoothed_frame_time_ms;
+	data.mode_3d = c->hardware_display_3d;
 	if (c->xdev != NULL && c->xdev->hmd != NULL) {
 		uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
 		if (idx < c->xdev->rendering_mode_count) {
-			view_count = c->xdev->rendering_modes[idx].view_count;
-			scale_x = c->xdev->rendering_modes[idx].view_scale_x;
-			scale_y = c->xdev->rendering_modes[idx].view_scale_y;
+			data.rendering_mode_name = c->xdev->rendering_modes[idx].mode_name;
 		}
 	}
-
-	// Actual window dimensions
-	uint32_t win_w = 0, win_h = 0;
-	if (c->window != nil) {
-		NSRect backing = [c->window.contentView convertRectToBacking:c->window.contentView.bounds];
-		win_w = (uint32_t)backing.size.width;
-		win_h = (uint32_t)backing.size.height;
+	data.render_width = c->view_width;
+	data.render_height = c->view_height;
+	if (c->xdev != NULL && c->xdev->rendering_mode_count > 0) {
+		u_tiling_compute_system_atlas(c->xdev->rendering_modes, c->xdev->rendering_mode_count,
+		                              &data.swapchain_width, &data.swapchain_height);
 	}
-
-	// Eye positions from display processor
-	struct xrt_eye_positions eye_pos = {0};
-	bool have_eyes = xrt_display_processor_metal_get_predicted_eye_positions(
-	    c->display_processor, &eye_pos);
-	if (!have_eyes || !eye_pos.valid) {
-		eye_pos.count = 2;
-		eye_pos.eyes[0] = (struct xrt_eye_position){-0.032f, nom_y / 1000.0f, nom_z / 1000.0f};
-		eye_pos.eyes[1] = (struct xrt_eye_position){ 0.032f, nom_y / 1000.0f, nom_z / 1000.0f};
-		eye_pos.valid = true;
-		eye_pos.is_tracking = false;
-	}
-
-	// Format eye lines
-	char eye_buf[512] = {0};
-	int off = 0;
-	for (uint32_t e = 0; e < eye_pos.count && e < 8; e++) {
-		off += snprintf(eye_buf + off, sizeof(eye_buf) - off,
-		    "Eye[%u]: (%.0f, %.0f, %.0f) mm%s",
-		    e,
-		    eye_pos.eyes[e].x * 1000.0f,
-		    eye_pos.eyes[e].y * 1000.0f,
-		    eye_pos.eyes[e].z * 1000.0f,
-		    (e + 1 < eye_pos.count) ? "\n" : "");
-	}
-
-	const char *tracking_str = eye_pos.is_tracking ? "YES" : "NO";
-	const char *tracking_mode = have_eyes ? "SMOOTH" : "DEFAULT";
-
-	// Qwerty stereo state
-	const char *stereo_line1 = "";
-	const char *stereo_line2 = "";
-	char stereo_buf1[128] = {0};
-	char stereo_buf2[128] = {0};
-	char pos_buf[128] = {0};
-	char fwd_buf[128] = {0};
+	data.window_width = win_w;
+	data.window_height = win_h;
+	data.display_width_mm = disp_w_mm;
+	data.display_height_mm = disp_h_mm;
+	data.nominal_x = nom_x;
+	data.nominal_y = nom_y;
+	data.nominal_z = nom_z;
+	data.left_eye_x = left_eye.x * 1000.0f;
+	data.left_eye_y = left_eye.y * 1000.0f;
+	data.left_eye_z = left_eye.z * 1000.0f;
+	data.right_eye_x = right_eye.x * 1000.0f;
+	data.right_eye_y = right_eye.y * 1000.0f;
+	data.right_eye_z = right_eye.z * 1000.0f;
+	data.eye_tracking_active = (left_eye.z != 0.6f || right_eye.z != 0.6f);
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
-	struct qwerty_view_state ss = {0};
-	bool have_ss = qwerty_get_view_state(
-	    c->xsysd->xdevs, c->xsysd->xdev_count, &ss);
-
-	if (have_ss) {
-		const char *mode_label = ss.camera_mode ? "Camera [P]" : "Display [P]";
-		if (ss.camera_mode) {
-			snprintf(stereo_buf1, sizeof(stereo_buf1),
-			         "%s  IPD/Prlx:%.3f", mode_label, ss.cam_spread_factor);
-			snprintf(stereo_buf2, sizeof(stereo_buf2),
-			         "Conv:%.2f dp  vFOV:%.1f",
-			         ss.cam_convergence,
-			         atanf(ss.cam_half_tan_vfov) * 2.0f * 57.2958f);
-		} else {
-			snprintf(stereo_buf1, sizeof(stereo_buf1),
-			         "%s  IPD/Prlx:%.3f [Sh+Wh]", mode_label, ss.disp_spread_factor);
-			snprintf(stereo_buf2, sizeof(stereo_buf2),
-			         "Conv:%.2f dp [Wh]  vFOV:%.1f  Persp*:%.2f",
-			         0.0f, 0.0f, 0.0f);
+	if (c->xsysd != NULL) {
+		struct xrt_pose qwerty_pose;
+		if (qwerty_get_hmd_pose(c->xsysd->xdevs, c->xsysd->xdev_count, &qwerty_pose)) {
+			data.vdisp_x = qwerty_pose.position.x;
+			data.vdisp_y = qwerty_pose.position.y;
+			data.vdisp_z = qwerty_pose.position.z;
+			struct xrt_vec3 fwd_in = {0, 0, -1};
+			struct xrt_vec3 fwd_out;
+			math_quat_rotate_vec3(&qwerty_pose.orientation, &fwd_in, &fwd_out);
+			data.forward_x = fwd_out.x;
+			data.forward_y = fwd_out.y;
+			data.forward_z = fwd_out.z;
 		}
-		stereo_line1 = stereo_buf1;
-		stereo_line2 = stereo_buf2;
-	}
 
-	// Get virtual display/camera position from qwerty HMD
-	{
-		struct xrt_device *qwerty_hmd = NULL;
-		for (uint32_t i = 0; i < c->xsysd->xdev_count; i++) {
-			if (c->xsysd->xdevs[i] != NULL &&
-			    strstr(c->xsysd->xdevs[i]->str, "Qwerty HMD") != NULL) {
-				qwerty_hmd = c->xsysd->xdevs[i];
-				break;
-			}
-		}
-		if (qwerty_hmd != NULL) {
-			struct xrt_space_relation rel = {0};
-			xrt_device_get_tracked_pose(qwerty_hmd, XRT_INPUT_GENERIC_HEAD_POSE,
-			                            0, &rel);
-			snprintf(pos_buf, sizeof(pos_buf), "Pos  %.2f, %.2f, %.2f m",
-			         rel.pose.position.x, rel.pose.position.y, rel.pose.position.z);
-			// Forward direction from orientation
-			struct xrt_vec3 forward = {0, 0, -1};
-			struct xrt_vec3 fwd_world;
-			math_quat_rotate_vec3(&rel.pose.orientation, &forward, &fwd_world);
-			snprintf(fwd_buf, sizeof(fwd_buf), "Fwd  %.2f, %.2f, %.2f",
-			         fwd_world.x, fwd_world.y, fwd_world.z);
+		struct qwerty_view_state ss;
+		if (qwerty_get_view_state(c->xsysd->xdevs, c->xsysd->xdev_count, &ss)) {
+			data.camera_mode = ss.camera_mode;
+			data.cam_spread_factor = ss.cam_spread_factor;
+			data.cam_parallax_factor = ss.cam_parallax_factor;
+			data.cam_convergence = ss.cam_convergence;
+			data.cam_half_tan_vfov = ss.cam_half_tan_vfov;
+			data.disp_spread_factor = ss.disp_spread_factor;
+			data.disp_parallax_factor = ss.disp_parallax_factor;
+			data.disp_vHeight = ss.disp_vHeight;
+			data.nominal_viewer_z = ss.nominal_viewer_z;
+			data.screen_height_m = ss.screen_height_m;
 		}
 	}
 #endif
 
-	// Build HUD text
-	NSString *text = [NSString stringWithFormat:
-	    @"%s\n"
-	    "FPS  %.0f   (%.1f ms)\n"
-	    "Render  %u x %u   Views: %u\n"
-	    "Texture  %u x %u\n"
-	    "Window  %u x %u\n"
-	    "\n"
-	    "Display  %.0f x %.0f mm\n"
-	    "%s\n"
-	    "Tracking: %s [%s]\n"
-	    "\n"
-	    "%s\n"
-	    "%s\n"
-	    "%s\n"
-	    "%s\n"
-	    "\n"
-	    "Mode: %s (%s)  Scale: %.2f x %.2f\n"
-	    "TAB=HUD  V=Mode  P=Cam/Disp  ESC=Quit",
-	    dev_name,
-	    fps, c->smoothed_frame_time_ms,
-	    c->view_width, c->view_height, view_count,
-	    c->tile_columns * c->view_width, c->tile_rows * c->view_height,
-	    win_w, win_h,
-	    disp_w_mm, disp_h_mm,
-	    eye_buf,
-	    tracking_str, tracking_mode,
-	    pos_buf, fwd_buf,
-	    stereo_line1, stereo_line2,
-	    mode_name, c->hardware_display_3d ? "3D" : "2D", scale_x, scale_y];
+	bool dirty = u_hud_update(c->hud, &data);
 
-	dispatch_async(dispatch_get_main_queue(), ^{
-	    c->hud_view.hudText = text;
-	    [c->hud_view setNeedsDisplay:YES];
-	    [c->hud_view setHidden:NO];
-	});
+	// Lazy-create Metal texture
+	if (c->hud_texture == nil) {
+		uint32_t hud_w = u_hud_get_width(c->hud);
+		uint32_t hud_h = u_hud_get_height(c->hud);
+		MTLTextureDescriptor *desc = [MTLTextureDescriptor
+		    texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+		                                width:hud_w
+		                               height:hud_h
+		                            mipmapped:NO];
+		desc.usage = MTLTextureUsageShaderRead;
+		desc.storageMode = MTLStorageModeShared;
+		c->hud_texture = [c->device newTextureWithDescriptor:desc];
+		dirty = true;
+	}
+
+	// Upload pixels if changed
+	if (dirty && c->hud_texture != nil) {
+		uint32_t hud_w = u_hud_get_width(c->hud);
+		uint32_t hud_h = u_hud_get_height(c->hud);
+		MTLRegion region = MTLRegionMake2D(0, 0, hud_w, hud_h);
+		[c->hud_texture replaceRegion:region
+		                  mipmapLevel:0
+		                    withBytes:u_hud_get_pixels(c->hud)
+		                  bytesPerRow:hud_w * 4];
+	}
+
+	// Blit HUD to bottom-left of output with alpha blending
+	uint32_t hud_w = u_hud_get_width(c->hud);
+	uint32_t hud_h = u_hud_get_height(c->hud);
+	uint32_t out_h = (uint32_t)output_texture.height;
+	uint32_t margin = 10;
+
+	MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+	pass.colorAttachments[0].texture = output_texture;
+	pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
+	pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+
+	id<MTLRenderCommandEncoder> encoder = [cmd_buf renderCommandEncoderWithDescriptor:pass];
+	[encoder setRenderPipelineState:c->hud_blit_pipeline];
+	[encoder setFragmentTexture:c->hud_texture atIndex:0];
+	[encoder setFragmentSamplerState:c->sampler_linear atIndex:0];
+
+	MTLViewport vp;
+	vp.originX = margin;
+	vp.originY = (out_h > hud_h + margin) ? (out_h - hud_h - margin) : 0;
+	vp.width = hud_w;
+	vp.height = hud_h;
+	vp.znear = 0;
+	vp.zfar = 1;
+	[encoder setViewport:vp];
+
+	[encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+	[encoder endEncoding];
 }
 
 static xrt_result_t
@@ -1325,10 +1305,7 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 	}
 
-	// Update HUD overlay (after mode sync so dimensions are current)
-	if (c->owns_window) {
-		metal_compositor_update_hud(c, dt);
-	}
+	// HUD is rendered after weave, before present (see below)
 
 	// Zero-copy check: can we pass the app's swapchain directly to the DP?
 	bool zero_copy = false;
@@ -1550,6 +1527,11 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		[blit_encoder endEncoding];
 	}
 
+	// HUD overlay (post-weave, before present)
+	if (c->owns_window) {
+		metal_compositor_render_hud(c, dt, cmd_buf, output_texture);
+	}
+
 	// Present and commit
 	if (drawable != nil) {
 		[cmd_buf presentDrawable:drawable];
@@ -1606,7 +1588,14 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 		c->shared_iosurface = NULL;
 	}
 
-	// 5. Release Metal resources (MRR — explicit release)
+	// 5. Release HUD resources
+	u_hud_destroy(&c->hud);
+	[c->hud_texture release];
+	c->hud_texture = nil;
+	[c->hud_blit_pipeline release];
+	c->hud_blit_pipeline = nil;
+
+	// 6. Release Metal resources (MRR — explicit release)
 	[c->atlas_texture release];
 	c->atlas_texture = nil;
 	[c->depth_texture release];
@@ -1624,12 +1613,6 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 	//    NSWindow dealloc (and its frame view cascade) happens NOW,
 	//    while all backing resources are still valid.
 	if (c->owns_window && c->window != nil) {
-		// Detach custom views from hierarchy first — prevents
-		// _recursiveBreakKeyViewLoop from walking freed subviews.
-		if (c->hud_view != nil) {
-			[c->hud_view removeFromSuperview];
-			c->hud_view = nil;
-		}
 		if (c->view != nil) {
 			[c->window setContentView:[[NSView alloc] init]];
 		}
@@ -1650,18 +1633,7 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 		}
 	} else {
 		// Not our window — just detach views.
-		if (c->hud_view != nil) {
-			[c->hud_view removeFromSuperview];
-			c->hud_view = nil;
-		}
 		c->view = nil;
-
-		// Drain any pending dispatch_async blocks (HUD hide/show)
-		// that captured the raw 'c' pointer — they must complete
-		// before we free the struct.
-		if (![NSThread isMainThread]) {
-			dispatch_sync(dispatch_get_main_queue(), ^{});
-		}
 	}
 
 	// 8. Release remaining objects (MRR — explicit release required)
@@ -1897,6 +1869,11 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 		}
 	}
 	c->hardware_display_3d = true; // Start in 3D mode (session begin will confirm)
+
+	// Create HUD overlay for runtime-owned windows
+	if (c->owns_window) {
+		u_hud_create(&c->hud, pixel_width);
+	}
 
 	// Set up xrt_compositor_native vtable
 	struct xrt_compositor *xc = &c->base.base;

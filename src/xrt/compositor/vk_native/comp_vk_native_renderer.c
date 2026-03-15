@@ -200,7 +200,7 @@ comp_vk_native_renderer_create(struct comp_vk_native_compositor *c,
 	}
 
 	r->vk = vk;
-	r->format = VK_FORMAT_R8G8B8A8_UNORM;
+	r->format = VK_FORMAT_B8G8R8A8_UNORM;
 	r->tile_columns = 2;
 	r->tile_rows = 1;
 

@@ -2341,6 +2341,10 @@ d3d11_service_render_hud(struct d3d11_service_system *sys,
 	}
 	data.render_width = render_w;
 	data.render_height = render_h;
+	if (sys->xdev != NULL && sys->xdev->rendering_mode_count > 0) {
+		u_tiling_compute_system_atlas(sys->xdev->rendering_modes, sys->xdev->rendering_mode_count,
+		                              &data.swapchain_width, &data.swapchain_height);
+	}
 	data.window_width = win_w;
 	data.window_height = win_h;
 	data.display_width_mm = disp_w_mm;

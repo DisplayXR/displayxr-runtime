@@ -32,8 +32,6 @@
  *
  */
 
-#import "comp_hud_overlay_macos.h"
-
 struct comp_gl_window_macos
 {
 	//! Self-owned NSWindow (NULL if external view).
@@ -47,9 +45,6 @@ struct comp_gl_window_macos
 
 	//! True if we created the window ourselves.
 	bool owns_window;
-
-	//! HUD overlay view (for runtime-owned windows).
-	CompHudOverlayView *hud_view;
 };
 
 static void
@@ -171,13 +166,6 @@ create_window_on_main_thread(struct comp_gl_window_macos *win,
 	                                      dequeue:YES]) != nil) {
 		[NSApp sendEvent:event];
 	}
-
-	// Create HUD overlay view as sibling of glView (not subview)
-	// so HUD redraws don't interfere with GL context
-	NSRect hudFrame = NSMakeRect(10, 10, 420, 380);
-	win->hud_view = [[CompHudOverlayView alloc] initWithFrame:hudFrame];
-	[container addSubview:win->hud_view positioned:NSWindowAbove relativeTo:glView];
-	[win->hud_view setHidden:YES];
 
 	win->owns_window = true;
 	*out_success = true;
@@ -497,7 +485,6 @@ comp_gl_window_macos_destroy(struct comp_gl_window_macos **win_ptr)
 	}
 
 	win->gl_context = nil;
-	win->hud_view = nil;
 	win->window = nil;
 	win->view = nil;
 
@@ -505,27 +492,3 @@ comp_gl_window_macos_destroy(struct comp_gl_window_macos **win_ptr)
 	*win_ptr = NULL;
 }
 
-void
-comp_gl_window_macos_update_hud(struct comp_gl_window_macos *win, const char *text)
-{
-	if (win == NULL || win->hud_view == nil) return;
-
-	NSString *str = [NSString stringWithUTF8String:text];
-	dispatch_async(dispatch_get_main_queue(), ^{
-	    win->hud_view.hudText = str;
-	    [win->hud_view setNeedsDisplay:YES];
-	    [win->hud_view setHidden:NO];
-	});
-}
-
-void
-comp_gl_window_macos_hide_hud(struct comp_gl_window_macos *win)
-{
-	if (win == NULL || win->hud_view == nil) return;
-
-	if (![win->hud_view isHidden]) {
-		dispatch_async(dispatch_get_main_queue(), ^{
-		    [win->hud_view setHidden:YES];
-		});
-	}
-}

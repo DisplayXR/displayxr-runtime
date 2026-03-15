@@ -10,8 +10,6 @@ if(APPLE AND XRT_HAVE_METAL)
 		comp_metal STATIC
 		comp_metal_compositor.m
 		comp_metal_compositor.h
-		${CMAKE_CURRENT_SOURCE_DIR}/../util/comp_hud_overlay_macos.m
-		${CMAKE_CURRENT_SOURCE_DIR}/../util/comp_hud_overlay_macos.h
 		)
 
 	target_link_libraries(

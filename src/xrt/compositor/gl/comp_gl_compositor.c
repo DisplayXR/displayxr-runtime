@@ -253,7 +253,8 @@ struct comp_gl_compositor
 	// --- State ---
 	bool hardware_display_3d;  //!< True when in 3D mode, false = 2D passthrough
 	uint64_t last_frame_ns;
-	float hud_timer;            //!< HUD update throttle timer (seconds)
+	struct u_hud *hud;          //!< HUD overlay (shared u_hud system)
+	GLuint hud_texture;         //!< GL texture for HUD pixel upload
 	float smoothed_frame_time_ms; //!< Smoothed frame time for HUD FPS display
 	struct xrt_device *xdev;
 	struct xrt_system_devices *xsysd;
@@ -648,51 +649,27 @@ gl_compositor_layer_window_space(struct xrt_compositor *xc,
 
 /*
  *
- * HUD overlay update (macOS only, throttled)
+ * HUD overlay (shared u_hud system, cross-platform)
  *
  */
 
-#ifdef __APPLE__
 static void
-gl_compositor_update_hud(struct comp_gl_compositor *c, float dt)
+gl_compositor_render_hud(struct comp_gl_compositor *c, float dt, uint32_t win_w, uint32_t win_h)
 {
-	if (c->macos_window == NULL) {
+	if (c->hud == NULL || !u_hud_is_visible()) {
 		return;
 	}
 
-	bool visible = u_hud_is_visible();
-	if (!visible) {
-		comp_gl_window_macos_hide_hud(c->macos_window);
-		return;
+	// Smooth frame time (every frame for accuracy)
+	float dt_ms = dt * 1000.0f;
+	if (dt_ms > 0.0f) {
+		c->smoothed_frame_time_ms = c->smoothed_frame_time_ms * 0.9f + dt_ms * 0.1f;
 	}
+	float fps = (c->smoothed_frame_time_ms > 0.0f) ? (1000.0f / c->smoothed_frame_time_ms) : 0.0f;
 
-	// Throttle updates to every 0.5s
-	c->hud_timer += dt;
-	if (c->hud_timer < 0.5f) {
-		return;
-	}
-	c->hud_timer = 0.0f;
-
-	// Smooth frame time (exponential moving average)
-	float alpha = 0.1f;
-	c->smoothed_frame_time_ms = c->smoothed_frame_time_ms * (1.0f - alpha) + (dt * 1000.0f) * alpha;
-	float fps = (c->smoothed_frame_time_ms > 0.0f) ? 1000.0f / c->smoothed_frame_time_ms : 0.0f;
-
-	// Device name
-	const char *dev_name = (c->xdev != NULL) ? c->xdev->str : "Unknown";
-
-	// Active rendering mode name (from active_rendering_mode_index, not OUTPUT_MODE property)
-	const char *mode_name = "?";
-	if (c->xdev != NULL && c->xdev->hmd != NULL) {
-		uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
-		if (idx < c->xdev->rendering_mode_count) {
-			mode_name = c->xdev->rendering_modes[idx].mode_name;
-		}
-	}
-
-	// Display info from system compositor
+	// Display dimensions from sys_info
 	float disp_w_mm = 0, disp_h_mm = 0;
-	float nom_y = 0, nom_z = 0;
+	float nom_x = 0, nom_y = 0, nom_z = 600.0f;
 	if (c->sys_info_set) {
 		disp_w_mm = c->sys_info.display_width_m * 1000.0f;
 		disp_h_mm = c->sys_info.display_height_m * 1000.0f;
@@ -700,143 +677,138 @@ gl_compositor_update_hud(struct comp_gl_compositor *c, float dt)
 		nom_z = c->sys_info.nominal_viewer_z_m * 1000.0f;
 	}
 
-	// View count and scale from active rendering mode
-	uint32_t view_count = c->tile_columns * c->tile_rows;
-	float scale_x = 1.0f, scale_y = 1.0f;
+	// Eye positions from display processor (fallback to nominal)
+	struct xrt_vec3 left_eye = {-0.032f, nom_y / 1000.0f, nom_z / 1000.0f};
+	struct xrt_vec3 right_eye = {0.032f, nom_y / 1000.0f, nom_z / 1000.0f};
+	if (c->display_processor != NULL) {
+		struct xrt_eye_positions eye_pos = {0};
+		if (xrt_display_processor_gl_get_predicted_eye_positions(c->display_processor, &eye_pos) &&
+		    eye_pos.valid && eye_pos.count >= 2) {
+			left_eye.x = eye_pos.eyes[0].x;
+			left_eye.y = eye_pos.eyes[0].y;
+			left_eye.z = eye_pos.eyes[0].z;
+			right_eye.x = eye_pos.eyes[1].x;
+			right_eye.y = eye_pos.eyes[1].y;
+			right_eye.z = eye_pos.eyes[1].z;
+		}
+	}
+
+	// Fill HUD data
+	struct u_hud_data data = {0};
+	data.device_name = (c->xdev != NULL) ? c->xdev->str : "Unknown";
+	data.fps = fps;
+	data.frame_time_ms = c->smoothed_frame_time_ms;
+	data.mode_3d = c->hardware_display_3d;
 	if (c->xdev != NULL && c->xdev->hmd != NULL) {
 		uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
 		if (idx < c->xdev->rendering_mode_count) {
-			view_count = c->xdev->rendering_modes[idx].view_count;
-			scale_x = c->xdev->rendering_modes[idx].view_scale_x;
-			scale_y = c->xdev->rendering_modes[idx].view_scale_y;
+			data.rendering_mode_name = c->xdev->rendering_modes[idx].mode_name;
 		}
 	}
-
-	// Actual window dimensions
-	uint32_t win_w = 0, win_h = 0;
-	comp_gl_window_macos_get_dimensions(c->macos_window, &win_w, &win_h);
-
-	// Eye positions from display processor
-	struct xrt_eye_positions eye_pos = {0};
-	bool have_eyes = xrt_display_processor_gl_get_predicted_eye_positions(
-	    c->display_processor, &eye_pos);
-	if (!have_eyes || !eye_pos.valid) {
-		eye_pos.count = 2;
-		eye_pos.eyes[0] = (struct xrt_eye_position){-0.032f, nom_y / 1000.0f, nom_z / 1000.0f};
-		eye_pos.eyes[1] = (struct xrt_eye_position){ 0.032f, nom_y / 1000.0f, nom_z / 1000.0f};
-		eye_pos.valid = true;
-		eye_pos.is_tracking = false;
+	data.render_width = c->view_width;
+	data.render_height = c->view_height;
+	if (c->xdev != NULL && c->xdev->rendering_mode_count > 0) {
+		u_tiling_compute_system_atlas(c->xdev->rendering_modes, c->xdev->rendering_mode_count,
+		                              &data.swapchain_width, &data.swapchain_height);
 	}
-
-	// Format eye lines
-	char eye_buf[512] = {0};
-	int off = 0;
-	for (uint32_t e = 0; e < eye_pos.count && e < 8; e++) {
-		off += snprintf(eye_buf + off, sizeof(eye_buf) - off,
-		    "Eye[%u]: (%.0f, %.0f, %.0f) mm%s",
-		    e,
-		    eye_pos.eyes[e].x * 1000.0f,
-		    eye_pos.eyes[e].y * 1000.0f,
-		    eye_pos.eyes[e].z * 1000.0f,
-		    (e + 1 < eye_pos.count) ? "\n" : "");
-	}
-
-	const char *tracking_str = eye_pos.is_tracking ? "YES" : "NO";
-	const char *tracking_mode = have_eyes ? "SMOOTH" : "DEFAULT";
-
-	// Qwerty stereo state
-	const char *stereo_line1 = "";
-	const char *stereo_line2 = "";
-	char stereo_buf1[128] = {0};
-	char stereo_buf2[128] = {0};
-	char pos_buf[128] = {0};
-	char fwd_buf[128] = {0};
+	data.window_width = win_w;
+	data.window_height = win_h;
+	data.display_width_mm = disp_w_mm;
+	data.display_height_mm = disp_h_mm;
+	data.nominal_x = nom_x;
+	data.nominal_y = nom_y;
+	data.nominal_z = nom_z;
+	data.left_eye_x = left_eye.x * 1000.0f;
+	data.left_eye_y = left_eye.y * 1000.0f;
+	data.left_eye_z = left_eye.z * 1000.0f;
+	data.right_eye_x = right_eye.x * 1000.0f;
+	data.right_eye_y = right_eye.y * 1000.0f;
+	data.right_eye_z = right_eye.z * 1000.0f;
+	data.eye_tracking_active = (left_eye.z != 0.6f || right_eye.z != 0.6f);
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
-	struct qwerty_view_state ss = {0};
-	bool have_ss = (c->xsysd != NULL) && qwerty_get_view_state(
-	    c->xsysd->xdevs, c->xsysd->xdev_count, &ss);
-
-	if (have_ss) {
-		const char *mode_label = ss.camera_mode ? "Camera [P]" : "Display [P]";
-		if (ss.camera_mode) {
-			snprintf(stereo_buf1, sizeof(stereo_buf1),
-			         "%s  IPD/Prlx:%.3f", mode_label, ss.cam_spread_factor);
-			snprintf(stereo_buf2, sizeof(stereo_buf2),
-			         "Conv:%.2f dp  vFOV:%.1f",
-			         ss.cam_convergence,
-			         atanf(ss.cam_half_tan_vfov) * 2.0f * 57.2958f);
-		} else {
-			snprintf(stereo_buf1, sizeof(stereo_buf1),
-			         "%s  IPD/Prlx:%.3f [Sh+Wh]", mode_label, ss.disp_spread_factor);
-			snprintf(stereo_buf2, sizeof(stereo_buf2),
-			         "Conv:%.2f dp [Wh]  vFOV:%.1f  Persp*:%.2f",
-			         0.0f, 0.0f, 0.0f);
-		}
-		stereo_line1 = stereo_buf1;
-		stereo_line2 = stereo_buf2;
-	}
-
-	// Get virtual display/camera position from qwerty HMD
 	if (c->xsysd != NULL) {
-		struct xrt_device *qwerty_hmd = NULL;
-		for (uint32_t i = 0; i < c->xsysd->xdev_count; i++) {
-			if (c->xsysd->xdevs[i] != NULL &&
-			    strstr(c->xsysd->xdevs[i]->str, "Qwerty HMD") != NULL) {
-				qwerty_hmd = c->xsysd->xdevs[i];
-				break;
-			}
+		struct xrt_pose qwerty_pose;
+		if (qwerty_get_hmd_pose(c->xsysd->xdevs, c->xsysd->xdev_count, &qwerty_pose)) {
+			data.vdisp_x = qwerty_pose.position.x;
+			data.vdisp_y = qwerty_pose.position.y;
+			data.vdisp_z = qwerty_pose.position.z;
+			struct xrt_vec3 fwd_in = {0, 0, -1};
+			struct xrt_vec3 fwd_out;
+			math_quat_rotate_vec3(&qwerty_pose.orientation, &fwd_in, &fwd_out);
+			data.forward_x = fwd_out.x;
+			data.forward_y = fwd_out.y;
+			data.forward_z = fwd_out.z;
 		}
-		if (qwerty_hmd != NULL) {
-			struct xrt_space_relation rel = {0};
-			xrt_device_get_tracked_pose(qwerty_hmd, XRT_INPUT_GENERIC_HEAD_POSE,
-			                            0, &rel);
-			snprintf(pos_buf, sizeof(pos_buf), "Pos  %.2f, %.2f, %.2f m",
-			         rel.pose.position.x, rel.pose.position.y, rel.pose.position.z);
-			struct xrt_vec3 forward = {0, 0, -1};
-			struct xrt_vec3 fwd_world;
-			math_quat_rotate_vec3(&rel.pose.orientation, &forward, &fwd_world);
-			snprintf(fwd_buf, sizeof(fwd_buf), "Fwd  %.2f, %.2f, %.2f",
-			         fwd_world.x, fwd_world.y, fwd_world.z);
+
+		struct qwerty_view_state ss;
+		if (qwerty_get_view_state(c->xsysd->xdevs, c->xsysd->xdev_count, &ss)) {
+			data.camera_mode = ss.camera_mode;
+			data.cam_spread_factor = ss.cam_spread_factor;
+			data.cam_parallax_factor = ss.cam_parallax_factor;
+			data.cam_convergence = ss.cam_convergence;
+			data.cam_half_tan_vfov = ss.cam_half_tan_vfov;
+			data.disp_spread_factor = ss.disp_spread_factor;
+			data.disp_parallax_factor = ss.disp_parallax_factor;
+			data.disp_vHeight = ss.disp_vHeight;
+			data.nominal_viewer_z = ss.nominal_viewer_z;
+			data.screen_height_m = ss.screen_height_m;
 		}
 	}
 #endif
 
-	// Build HUD text
-	char hud_text[2048];
-	snprintf(hud_text, sizeof(hud_text),
-	    "%s\n"
-	    "FPS  %.0f   (%.1f ms)\n"
-	    "Render  %u x %u   Views: %u\n"
-	    "Texture  %u x %u\n"
-	    "Window  %u x %u\n"
-	    "\n"
-	    "Display  %.0f x %.0f mm\n"
-	    "%s\n"
-	    "Tracking: %s [%s]\n"
-	    "\n"
-	    "%s\n"
-	    "%s\n"
-	    "%s\n"
-	    "%s\n"
-	    "\n"
-	    "Mode: %s (%s)  Scale: %.2f x %.2f\n"
-	    "TAB=HUD  V=Mode  P=Cam/Disp  ESC=Quit",
-	    dev_name,
-	    fps, c->smoothed_frame_time_ms,
-	    c->view_width, c->view_height, view_count,
-	    c->tile_columns * c->view_width, c->tile_rows * c->view_height,
-	    win_w, win_h,
-	    disp_w_mm, disp_h_mm,
-	    eye_buf,
-	    tracking_str, tracking_mode,
-	    pos_buf, fwd_buf,
-	    stereo_line1, stereo_line2,
-	    mode_name, c->hardware_display_3d ? "3D" : "2D", scale_x, scale_y);
+	bool dirty = u_hud_update(c->hud, &data);
 
-	comp_gl_window_macos_update_hud(c->macos_window, hud_text);
+	// Lazy-create GL texture
+	if (c->hud_texture == 0) {
+		uint32_t hud_w = u_hud_get_width(c->hud);
+		uint32_t hud_h = u_hud_get_height(c->hud);
+		glGenTextures(1, &c->hud_texture);
+		glBindTexture(GL_TEXTURE_2D, c->hud_texture);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, hud_w, hud_h, 0,
+		             GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+		glBindTexture(GL_TEXTURE_2D, 0);
+		dirty = true;
+	}
+
+	// Upload pixels if changed
+	if (dirty) {
+		uint32_t hud_w = u_hud_get_width(c->hud);
+		uint32_t hud_h = u_hud_get_height(c->hud);
+		glBindTexture(GL_TEXTURE_2D, c->hud_texture);
+		glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, hud_w, hud_h,
+		                GL_RGBA, GL_UNSIGNED_BYTE, u_hud_get_pixels(c->hud));
+		glBindTexture(GL_TEXTURE_2D, 0);
+	}
+
+	// Blit HUD to bottom-left of screen with alpha blending
+	uint32_t hud_w = u_hud_get_width(c->hud);
+	uint32_t hud_h = u_hud_get_height(c->hud);
+	uint32_t margin = 10;
+
+	glEnable(GL_BLEND);
+	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+	glUseProgram(c->program_blit);
+	glBindVertexArray(c->vao_empty);
+	glViewport(margin, margin, hud_w, hud_h);
+
+	GLint loc_rect = glGetUniformLocation(c->program_blit, "u_src_rect");
+	glUniform4f(loc_rect, 0.0f, 0.0f, 1.0f, 1.0f);
+	GLint loc_flip = glGetUniformLocation(c->program_blit, "u_flip_y");
+	glUniform1f(loc_flip, 1.0f); // Flip Y: u_hud is top-down, GL is bottom-up
+
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, c->hud_texture);
+	GLint loc_tex = glGetUniformLocation(c->program_blit, "u_texture");
+	glUniform1i(loc_tex, 0);
+
+	glDrawArrays(GL_TRIANGLES, 0, 3);
+
+	glDisable(GL_BLEND);
 }
-#endif
 
 
 /*
@@ -933,12 +905,7 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 		}
 	}
 
-	// Update HUD overlay (macOS runtime-owned window only, after mode sync)
-#ifdef __APPLE__
-	if (c->owns_window) {
-		gl_compositor_update_hud(c, dt);
-	}
-#endif
+	// HUD is rendered in the window-mode present path (after weave, before swap)
 
 	// Zero-copy check: can we pass the app's swapchain directly to the DP?
 	bool zero_copy = false;
@@ -1305,6 +1272,11 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			glDrawArrays(GL_TRIANGLES, 0, 3);
 		}
 
+		// HUD overlay (post-weave, before swap)
+		if (c->owns_window) {
+			gl_compositor_render_hud(c, dt, present_w, present_h);
+		}
+
 		// Platform-specific swap
 #ifdef XRT_OS_WINDOWS
 		SwapBuffers(c->hdc);
@@ -1362,6 +1334,10 @@ gl_compositor_destroy(struct xrt_compositor *xc)
 #endif
 
 	xrt_display_processor_gl_destroy(&c->display_processor);
+
+	// Destroy HUD
+	if (c->hud_texture) glDeleteTextures(1, &c->hud_texture);
+	u_hud_destroy(&c->hud);
 
 	if (c->program_blit) glDeleteProgram(c->program_blit);
 	if (c->program_window_space) glDeleteProgram(c->program_window_space);
@@ -1994,6 +1970,11 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 			U_LOG_W("GL compositor: display processor factory returned %d, using built-in shaders", dp_ret);
 			c->display_processor = NULL;
 		}
+	}
+
+	// Create HUD overlay for runtime-owned windows
+	if (c->owns_window) {
+		u_hud_create(&c->hud, width);
 	}
 
 	// Set up compositor interface

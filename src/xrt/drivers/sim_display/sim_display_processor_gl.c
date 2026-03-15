@@ -164,6 +164,20 @@ static const char *FS_BLEND =
     "    fragColor = mix(left, right, 0.5);\n"
     "}\n";
 
+static const char *FS_PASSTHROUGH =
+    "#version 330 core\n"
+    "in vec2 v_uv;\n"
+    "out vec4 fragColor;\n"
+    "uniform sampler2D u_texture;\n"
+    "uniform float u_tile_cols_inv;\n"
+    "uniform float u_tile_rows_inv;\n"
+    "uniform float u_tile_cols;\n"
+    "uniform float u_tile_rows;\n"
+    "void main() {\n"
+    "    vec2 atlas_uv = vec2(v_uv.x * u_tile_cols_inv, v_uv.y * u_tile_rows_inv);\n"
+    "    fragColor = texture(u_texture, atlas_uv);\n"
+    "}\n";
+
 
 /*!
  * Implementation struct for the GL simulation display processor.
@@ -171,7 +185,7 @@ static const char *FS_BLEND =
 struct sim_display_processor_gl
 {
 	struct xrt_display_processor_gl base;
-	GLuint programs[5]; //!< One per output mode (SBS, anaglyph, blend, squeezed SBS, quad)
+	GLuint programs[6]; //!< One per output mode (SBS, anaglyph, blend, squeezed SBS, quad, passthrough)
 	GLuint vao_empty;   //!< Empty VAO for vertex-shader-generated fullscreen triangle
 
 	//! Nominal viewer parameters for faked eye positions.
@@ -281,7 +295,7 @@ sim_dp_gl_destroy(struct xrt_display_processor_gl *xdp)
 {
 	struct sim_display_processor_gl *sdp = sim_dp_gl(xdp);
 
-	for (int i = 0; i < 5; i++) {
+	for (int i = 0; i < 6; i++) {
 		if (sdp->programs[i] != 0) {
 			glDeleteProgram(sdp->programs[i]);
 		}
@@ -384,11 +398,11 @@ sim_display_processor_gl_create(enum sim_display_output_mode mode,
 	sdp->nominal_y_m = 0.1f;
 	sdp->nominal_z_m = debug_get_float_option_sim_display_nominal_z_m_gl();
 
-	// Compile all 5 shader programs for instant runtime switching
-	const char *fs_sources[5] = {FS_SBS, FS_ANAGLYPH, FS_BLEND, FS_SQUEEZED_SBS, FS_QUAD};
-	const char *mode_names[5] = {"SBS", "Anaglyph", "Blend", "Squeezed SBS", "Quad"};
+	// Compile all 6 shader programs for instant runtime switching
+	const char *fs_sources[6] = {FS_SBS, FS_ANAGLYPH, FS_BLEND, FS_SQUEEZED_SBS, FS_QUAD, FS_PASSTHROUGH};
+	const char *mode_names[6] = {"SBS", "Anaglyph", "Blend", "Squeezed SBS", "Quad", "Passthrough"};
 
-	for (int i = 0; i < 5; i++) {
+	for (int i = 0; i < 6; i++) {
 		sdp->programs[i] = create_program(VS_FULLSCREEN, fs_sources[i]);
 		if (sdp->programs[i] == 0) {
 			U_LOG_E("sim_display GL: failed to create %s program", mode_names[i]);
@@ -403,11 +417,12 @@ sim_display_processor_gl_create(enum sim_display_output_mode mode,
 	// Set the initial output mode (atomic global read by process_atlas each frame)
 	sim_display_set_output_mode(mode);
 
-	U_LOG_W("Created sim display GL processor (all 5 shaders), initial mode: %s",
+	U_LOG_W("Created sim display GL processor (all 6 shaders), initial mode: %s",
 	        mode == SIM_DISPLAY_OUTPUT_SBS           ? "SBS" :
 	        mode == SIM_DISPLAY_OUTPUT_ANAGLYPH       ? "Anaglyph" :
 	        mode == SIM_DISPLAY_OUTPUT_SQUEEZED_SBS   ? "Squeezed SBS" :
-	        mode == SIM_DISPLAY_OUTPUT_QUAD            ? "Quad" : "Blend");
+	        mode == SIM_DISPLAY_OUTPUT_QUAD           ? "Quad" :
+	        mode == SIM_DISPLAY_OUTPUT_PASSTHROUGH    ? "Passthrough" : "Blend");
 
 	*out_xdp = &sdp->base;
 	return XRT_SUCCESS;

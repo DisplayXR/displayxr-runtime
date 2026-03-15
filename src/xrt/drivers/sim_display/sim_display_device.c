@@ -96,7 +96,8 @@ sim_display_set_output_mode(enum sim_display_output_mode mode)
 		        mode == SIM_DISPLAY_OUTPUT_SBS           ? "SBS" :
 		        mode == SIM_DISPLAY_OUTPUT_ANAGLYPH       ? "Anaglyph" :
 		        mode == SIM_DISPLAY_OUTPUT_SQUEEZED_SBS   ? "Squeezed SBS" :
-		        mode == SIM_DISPLAY_OUTPUT_QUAD           ? "Quad" : "Blend");
+		        mode == SIM_DISPLAY_OUTPUT_QUAD           ? "Quad" :
+		        mode == SIM_DISPLAY_OUTPUT_PASSTHROUGH    ? "Passthrough" : "Blend");
 	}
 }
 
@@ -376,7 +377,8 @@ sim_display_hmd_set_property(struct xrt_device *xdev,
 		sim_display_set_view_count(xdev->rendering_modes[value].view_count);
 
 		if (value == 0) {
-			// 2D — don't change weaver, compositor bypasses it
+			// 2D — switch weaver to passthrough mode
+			sim_display_set_output_mode(SIM_DISPLAY_OUTPUT_PASSTHROUGH);
 			return XRT_SUCCESS;
 		}
 

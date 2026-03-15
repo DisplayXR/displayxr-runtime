@@ -51,6 +51,7 @@ enum sim_display_output_mode
 	SIM_DISPLAY_OUTPUT_BLEND = 2,        //!< 50/50 alpha blend
 	SIM_DISPLAY_OUTPUT_SQUEEZED_SBS = 3, //!< Squeezed SBS (no crop, tiles placed as-is)
 	SIM_DISPLAY_OUTPUT_QUAD = 4,         //!< 2x2 quad view (4 views)
+	SIM_DISPLAY_OUTPUT_PASSTHROUGH = 5,  //!< Passthrough (2D mode — first tile fills screen)
 };
 
 /*!

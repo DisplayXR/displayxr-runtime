@@ -681,6 +681,10 @@ d3d11_render_hud_overlay(struct comp_d3d11_compositor *c, bool weaving_done,
 	}
 	data.render_width = render_w;
 	data.render_height = render_h;
+	if (c->xdev != NULL && c->xdev->rendering_mode_count > 0) {
+		u_tiling_compute_system_atlas(c->xdev->rendering_modes, c->xdev->rendering_mode_count,
+		                              &data.swapchain_width, &data.swapchain_height);
+	}
 	data.window_width = win_w;
 	data.window_height = win_h;
 	data.display_width_mm = disp_w_mm;

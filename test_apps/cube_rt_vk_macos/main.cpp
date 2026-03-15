@@ -2441,8 +2441,17 @@ int main() {
                                 if (tileRows == 0) tileRows = 1;
                             }
 
-                            uint32_t eyeW = xr.swapchain.width / tileColumns;
-                            uint32_t eyeH = xr.swapchain.height / tileRows;
+                            // Per-view dimensions from scale factors (not swapchain/tiles,
+                            // which gives wrong results when swapchain is worst-case sized)
+                            uint32_t eyeW, eyeH;
+                            if (xr.renderingModeCount > 0 && xr.currentModeIndex < xr.renderingModeCount &&
+                                xr.displayPixelWidth > 0 && xr.displayPixelHeight > 0) {
+                                eyeW = (uint32_t)(xr.displayPixelWidth * xr.renderingModeScaleX[xr.currentModeIndex]);
+                                eyeH = (uint32_t)(xr.displayPixelHeight * xr.renderingModeScaleY[xr.currentModeIndex]);
+                            } else {
+                                eyeW = xr.swapchain.width / tileColumns;
+                                eyeH = xr.swapchain.height / tileRows;
+                            }
 
                             std::vector<EyeRenderParams> eyeParams(modeViewCount);
                             projectionViews.resize(modeViewCount, {});

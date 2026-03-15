@@ -1192,8 +1192,8 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 
 		bool weaving_done = false;
 
-		// Display processor weaving path
-		if (c->hardware_display_3d && c->display_processor != NULL) {
+		// Display processor path (weaving for 3D, passthrough for 2D)
+		if (c->display_processor != NULL) {
 			uint64_t src_image_u64, src_view_u64;
 			int32_t view_format;
 			uint32_t view_width, view_height, tc, tr;
@@ -1318,10 +1318,10 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			    ? xrt_display_processor_get_render_pass(c->display_processor)
 			    : VK_NULL_HANDLE;
 
-			if (c->hardware_display_3d && c->display_processor != NULL && dp_render_pass != VK_NULL_HANDLE) {
+			if (c->display_processor != NULL && dp_render_pass != VK_NULL_HANDLE) {
 				static bool dp_logged = false;
 				if (!dp_logged) {
-					U_LOG_W("VK weaving via display processor (compositor-owned swapchain)");
+					U_LOG_W("VK rendering via display processor (compositor-owned swapchain)");
 					dp_logged = true;
 				}
 
@@ -1825,10 +1825,10 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 
 	// Populate supported swapchain formats (Vulkan formats)
 	uint32_t format_count = 0;
-	c->base.base.info.formats[format_count++] = VK_FORMAT_R8G8B8A8_UNORM;
-	c->base.base.info.formats[format_count++] = VK_FORMAT_R8G8B8A8_SRGB;
 	c->base.base.info.formats[format_count++] = VK_FORMAT_B8G8R8A8_UNORM;
 	c->base.base.info.formats[format_count++] = VK_FORMAT_B8G8R8A8_SRGB;
+	c->base.base.info.formats[format_count++] = VK_FORMAT_R8G8B8A8_UNORM;
+	c->base.base.info.formats[format_count++] = VK_FORMAT_R8G8B8A8_SRGB;
 	c->base.base.info.formats[format_count++] = VK_FORMAT_R16G16B16A16_SFLOAT;
 	c->base.base.info.formats[format_count++] = VK_FORMAT_R16G16B16A16_UNORM;
 	c->base.base.info.formats[format_count++] = VK_FORMAT_A2B10G10R10_UNORM_PACK32;

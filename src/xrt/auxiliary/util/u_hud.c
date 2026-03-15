@@ -35,7 +35,7 @@
 
 #define HUD_UPDATE_INTERVAL_NS (500ULL * 1000ULL * 1000ULL)
 #define HUD_BASE_W 480
-#define HUD_BASE_H 370
+#define HUD_BASE_H 390
 #define HUD_MARGIN 10
 #define HUD_CORNER_RADIUS 8
 #define HUD_BORDER_WIDTH 1
@@ -589,6 +589,9 @@ u_hud_update(struct u_hud *hud, const struct u_hud_data *data)
 
 	snprintf(buf, sizeof(buf), "%u x %u", data->render_width, data->render_height);
 	y += draw_label_value(hud, x, y, "Render  ", buf);
+
+	snprintf(buf, sizeof(buf), "%u x %u", data->swapchain_width, data->swapchain_height);
+	y += draw_label_value(hud, x, y, "Swapchain ", buf);
 
 	snprintf(buf, sizeof(buf), "%u x %u", data->window_width, data->window_height);
 	y += draw_label_value(hud, x, y, "Window  ", buf);
