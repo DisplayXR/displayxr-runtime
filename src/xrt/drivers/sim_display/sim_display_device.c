@@ -490,10 +490,17 @@ sim_display_hmd_create(void)
 
 #ifdef XRT_OS_MACOS
 	// Physical pixel dimensions for Retina displays.
-	// display_pixel_width/height drive the render resolution via sd_scale_x,
-	// while pixel_w/pixel_h (logical points) control the NSWindow size.
+	// display_pixel_width/height drive the render resolution and swapchain/atlas
+	// sizing, while pixel_w/pixel_h (logical points) control the NSWindow size.
 	extern float sim_display_macos_get_backing_scale(void);
 	float backing_scale = sim_display_macos_get_backing_scale();
+
+	// Full display resolution (not visible frame) for swapchain/atlas sizing.
+	// The visible frame controls the initial window, but the render resolution
+	// should match the full display so content doesn't degrade when the window
+	// is resized to fill the screen.
+	size_t full_display_w = CGDisplayPixelsWide(CGMainDisplayID());
+	size_t full_display_h = CGDisplayPixelsHigh(CGMainDisplayID());
 #endif
 
 	// Eye/camera configuration.
@@ -509,8 +516,8 @@ sim_display_hmd_create(void)
 	hmd->display_width_m = display_w_m;
 	hmd->display_height_m = display_h_m;
 #ifdef XRT_OS_MACOS
-	hmd->display_pixel_width = (uint32_t)(pixel_w * backing_scale);
-	hmd->display_pixel_height = (uint32_t)(pixel_h * backing_scale);
+	hmd->display_pixel_width = (uint32_t)(full_display_w * backing_scale);
+	hmd->display_pixel_height = (uint32_t)(full_display_h * backing_scale);
 #else
 	hmd->display_pixel_width = (uint32_t)pixel_w;
 	hmd->display_pixel_height = (uint32_t)pixel_h;

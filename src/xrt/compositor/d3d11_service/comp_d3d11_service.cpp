@@ -2314,6 +2314,17 @@ d3d11_service_render_hud(struct d3d11_service_system *sys,
 	uint32_t render_h = sys->view_height;
 	uint32_t win_w = sys->output_width;
 	uint32_t win_h = sys->output_height;
+	if (res->hwnd != nullptr) {
+		RECT rc;
+		if (GetClientRect(res->hwnd, &rc)) {
+			uint32_t ww = (uint32_t)(rc.right - rc.left);
+			uint32_t wh = (uint32_t)(rc.bottom - rc.top);
+			if (ww > 0 && wh > 0) {
+				win_w = ww;
+				win_h = wh;
+			}
+		}
+	}
 
 	// Get display physical dimensions from display processor
 	float disp_w_mm = 0.0f, disp_h_mm = 0.0f;

@@ -707,6 +707,11 @@ setup_external_window(struct comp_metal_compositor *c, NSView *external_view)
 	}
 	c->metal_layer.contentsScale = scale;
 
+	// Set initial drawableSize from the view's backing dimensions
+	// so the first frame renders at the correct resolution.
+	NSRect backing = [external_view convertRectToBacking:external_view.bounds];
+	c->metal_layer.drawableSize = CGSizeMake(backing.size.width, backing.size.height);
+
 	return true;
 }
 
@@ -1096,9 +1101,14 @@ metal_compositor_render_hud(struct comp_metal_compositor *c, float dt,
 		}
 	}
 
-	// Window dimensions
+	// Window dimensions (from actual window backing, not drawable)
 	uint32_t win_w = (uint32_t)output_texture.width;
 	uint32_t win_h = (uint32_t)output_texture.height;
+	if (c->window != nil) {
+		NSRect backing = [c->window.contentView convertRectToBacking:c->window.contentView.bounds];
+		win_w = (uint32_t)backing.size.width;
+		win_h = (uint32_t)backing.size.height;
+	}
 
 	// Fill HUD data
 	struct u_hud_data data = {0};
@@ -1230,6 +1240,16 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	uint64_t now_ns = os_monotonic_get_ns();
 	float dt = (c->last_frame_ns > 0) ? (float)(now_ns - c->last_frame_ns) / 1e9f : 0.016f;
 	c->last_frame_ns = now_ns;
+
+	// Update CAMetalLayer drawable size on window resize
+	if (c->metal_layer != nil && c->view != nil) {
+		NSRect backing = [c->view convertRectToBacking:c->view.bounds];
+		CGSize newSize = CGSizeMake(backing.size.width, backing.size.height);
+		if (c->metal_layer.drawableSize.width != newSize.width ||
+		    c->metal_layer.drawableSize.height != newSize.height) {
+			c->metal_layer.drawableSize = newSize;
+		}
+	}
 
 	// Get output texture — either from shared IOSurface or CAMetalLayer drawable
 	id<MTLTexture> output_texture = nil;
