@@ -1360,11 +1360,16 @@ comp_d3d11_renderer_blit_stretch(struct comp_d3d11_renderer *renderer,
 	constants.mvp[5] = 1.0f;
 	constants.mvp[10] = 1.0f;
 	constants.mvp[15] = 1.0f;
-	// UV transform: sample only the mono-rendered portion of the atlas texture
+	// UV transform: sample only the mono-rendered portion of the atlas texture.
+	// Content occupies tile_columns*view_width x texture_height of the atlas,
+	// but the atlas physical size may be larger (e.g. 1152px wide in 3D mode).
+	// UV must be content_width / atlas_physical_width to avoid sampling black.
 	uint32_t tex_w = renderer->tile_columns * renderer->view_width;
 	uint32_t tex_h = renderer->texture_height;
-	float u_scale = (tex_w > 0) ? (std::min)((float)target_width / (float)tex_w, 1.0f) : 1.0f;
-	float v_scale = (tex_h > 0) ? (std::min)((float)target_height / (float)tex_h, 1.0f) : 1.0f;
+	D3D11_TEXTURE2D_DESC atlas_desc;
+	renderer->atlas_texture->GetDesc(&atlas_desc);
+	float u_scale = (atlas_desc.Width > 0) ? (float)tex_w / (float)atlas_desc.Width : 1.0f;
+	float v_scale = (atlas_desc.Height > 0) ? (float)tex_h / (float)atlas_desc.Height : 1.0f;
 	constants.post_transform[0] = 0.0f;    // x offset
 	constants.post_transform[1] = 0.0f;    // y offset
 	constants.post_transform[2] = u_scale;  // width scale

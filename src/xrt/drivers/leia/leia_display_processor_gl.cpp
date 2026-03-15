@@ -141,6 +141,10 @@ do_weave:
 	// Set input texture for weaving
 	leiasr_gl_set_input_texture(ldp->leiasr, weaver_texture, view_width, view_height, format);
 
+	// Restore target viewport — SR weaver reads glViewport at weave() time,
+	// but set_input_texture may have reset it to input dimensions.
+	glViewport(0, 0, target_width, target_height);
+
 	// Perform weaving to the currently bound framebuffer
 	leiasr_gl_weave(ldp->leiasr);
 }

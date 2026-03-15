@@ -1645,7 +1645,7 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			    ? xrt_display_processor_get_render_pass(c->display_processor)
 			    : VK_NULL_HANDLE;
 
-			if (c->display_processor != NULL && dp_render_pass != VK_NULL_HANDLE) {
+			if (c->display_processor != NULL) {
 				static bool dp_logged = false;
 				if (!dp_logged) {
 					U_LOG_W("VK rendering via display processor (compositor-owned swapchain)");
@@ -1669,34 +1669,38 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				comp_vk_native_renderer_get_view_dimensions(c->renderer, &view_width, &view_height);
 				comp_vk_native_renderer_get_tile_layout(c->renderer, &tc, &tr);
 
-				// Create temporary framebuffer from the target's swapchain image.
-				// Must use the DP's render pass for compatibility with vkCmdBeginRenderPass.
-				VkImageView fb_view = (VkImageView)(uintptr_t)target_view;
-				VkFramebufferCreateInfo fb_ci = {
-				    .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
-				    .renderPass = dp_render_pass,
-				    .attachmentCount = 1,
-				    .pAttachments = &fb_view,
-				    .width = tgt_width,
-				    .height = tgt_height,
-				    .layers = 1,
-				};
-				vk->vkCreateFramebuffer(vk->device, &fb_ci, NULL, &target_fb);
+				// If DP provides a render pass (sim_display), create a framebuffer
+				// from the compositor's target and do pre-weave barrier.
+				// If no render pass (SR weaver), pass VK_NULL_HANDLE — the SR
+				// weaver uses its own internal swapchain.
+				if (dp_render_pass != VK_NULL_HANDLE) {
+					VkImageView fb_view = (VkImageView)(uintptr_t)target_view;
+					VkFramebufferCreateInfo fb_ci = {
+					    .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+					    .renderPass = dp_render_pass,
+					    .attachmentCount = 1,
+					    .pAttachments = &fb_view,
+					    .width = tgt_width,
+					    .height = tgt_height,
+					    .layers = 1,
+					};
+					vk->vkCreateFramebuffer(vk->device, &fb_ci, NULL, &target_fb);
 
-				// Pre-weave barrier: target → COLOR_ATTACHMENT_OPTIMAL
-				VkImageMemoryBarrier pre_weave = {
-				    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-				    .srcAccessMask = 0,
-				    .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-				    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-				    .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-				    .image = (VkImage)(uintptr_t)target_image,
-				    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-				};
-				vk->vkCmdPipelineBarrier(cmd,
-				    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-				    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-				    0, 0, NULL, 0, NULL, 1, &pre_weave);
+					// Pre-weave barrier: target → COLOR_ATTACHMENT_OPTIMAL
+					VkImageMemoryBarrier pre_weave = {
+					    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+					    .srcAccessMask = 0,
+					    .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+					    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+					    .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+					    .image = (VkImage)(uintptr_t)target_image,
+					    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+					};
+					vk->vkCmdPipelineBarrier(cmd,
+					    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+					    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+					    0, 0, NULL, 0, NULL, 1, &pre_weave);
+				}
 
 				// Call display processor with atlas (or zero-copy swapchain) texture
 				xrt_display_processor_process_atlas(
@@ -1707,19 +1711,21 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				    view_width, view_height,
 				    tc, tr,
 				    (VkFormat_XDP)view_format,
-				    target_fb,
+				    target_fb,  // VK_NULL_HANDLE for SR weaver (uses own swapchain)
 				    tgt_width, tgt_height,
 				    (VkFormat_XDP)VK_FORMAT_B8G8R8A8_UNORM);
 
-				// Render pass finalLayout handles transition to PRESENT_SRC_KHR
+				if (dp_render_pass != VK_NULL_HANDLE) {
+					// Render pass finalLayout handles transition to PRESENT_SRC_KHR
 
-				// Post-weave: blit HUD overlays onto target (flat, not interlaced)
-				vk_compositor_blit_window_space_layers(c, cmd,
-				    (VkImage)(uintptr_t)target_image, tgt_width, tgt_height);
+					// Post-weave: blit HUD overlays onto target (flat, not interlaced)
+					vk_compositor_blit_window_space_layers(c, cmd,
+					    (VkImage)(uintptr_t)target_image, tgt_width, tgt_height);
 
-				// Diagnostic HUD overlay (TAB key toggle)
-				vk_compositor_render_hud(c, cmd,
-				    (VkImage)(uintptr_t)target_image, tgt_width, tgt_height);
+					// Diagnostic HUD overlay (TAB key toggle)
+					vk_compositor_render_hud(c, cmd,
+					    (VkImage)(uintptr_t)target_image, tgt_width, tgt_height);
+				}
 			} else {
 				// No display processor (or mono/2D mode): blit stereo texture to target
 				comp_vk_native_renderer_blit_to_target(c->renderer, cmd,
