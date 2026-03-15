@@ -274,10 +274,9 @@ oxr_session_populate_vk_native(struct oxr_logger *log,
 	// Set system devices for qwerty driver support
 	comp_vk_native_compositor_set_system_devices(&xcn->base, sess->sys->xsysd);
 
-	// Pass legacy app tile scaling flag so compositor can disable 1/2/3 mode keys
+	// Set system compositor info (display dimensions, nominal viewer, legacy flags)
 	if (sess->sys->xsysc != NULL) {
-		comp_vk_native_compositor_set_legacy_app_tile_scaling(
-		    &xcn->base, sess->sys->xsysc->info.legacy_app_tile_scaling);
+		comp_vk_native_compositor_set_sys_info(&xcn->base, &sess->sys->xsysc->info);
 	}
 
 	// Set the compositor directly — no client wrapper needed

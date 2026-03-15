@@ -125,6 +125,15 @@ comp_vk_native_compositor_set_system_devices(struct xrt_compositor *xc,
                                               struct xrt_system_devices *xsysd);
 
 /*!
+ * Set system compositor info (display dimensions, nominal viewer position, etc.).
+ *
+ * @ingroup comp_vk_native
+ */
+void
+comp_vk_native_compositor_set_sys_info(struct xrt_compositor *xc,
+                                        const struct xrt_system_compositor_info *info);
+
+/*!
  * Set legacy app tile scaling flag (gates 1/2/3 key mode selection).
  *
  * @ingroup comp_vk_native

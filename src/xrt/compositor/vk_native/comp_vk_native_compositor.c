@@ -29,6 +29,7 @@
 #include "util/u_logging.h"
 #include "util/u_misc.h"
 #include "util/u_time.h"
+#include "util/u_hud.h"
 #include "os/os_time.h"
 
 #include "math/m_api.h"
@@ -155,6 +156,25 @@ struct comp_vk_native_compositor
 
 	//! Time of the last predicted display time.
 	uint64_t last_display_time_ns;
+
+	//! System compositor info (display dimensions, nominal viewer position).
+	bool sys_info_set;
+	struct xrt_system_compositor_info sys_info;
+
+	//! HUD overlay (shared u_hud system).
+	struct u_hud *hud;
+
+	//! HUD texture (VkImage, CPU-uploadable).
+	VkImage hud_image;
+	VkDeviceMemory hud_memory;
+	uint32_t hud_width;
+	uint32_t hud_height;
+
+	//! Smoothed frame time for HUD FPS display.
+	float smoothed_frame_time_ms;
+
+	//! Last frame timestamp for dt calculation.
+	uint64_t last_frame_ns;
 };
 
 /*
@@ -1003,6 +1023,318 @@ vk_compositor_blit_window_space_layers(struct comp_vk_native_compositor *c,
 	    0, 0, NULL, 0, NULL, 1, &to_present);
 }
 
+/*
+ *
+ * HUD overlay (shared u_hud system)
+ *
+ */
+
+/*!
+ * Render the diagnostic HUD overlay onto the target image.
+ * Uses vkCmdBlitImage for an opaque blit (no alpha blending).
+ * The u_hud pixel buffer has pre-composited semi-transparent background.
+ */
+static void
+vk_compositor_render_hud(struct comp_vk_native_compositor *c,
+                          VkCommandBuffer cmd,
+                          VkImage target_image,
+                          uint32_t target_width,
+                          uint32_t target_height)
+{
+	if (c->hud == NULL || !u_hud_is_visible()) {
+		return;
+	}
+
+	struct vk_bundle *vk = &c->vk;
+
+	// Frame timing
+	uint64_t now_ns = os_monotonic_get_ns();
+	float dt = (c->last_frame_ns > 0) ? (float)(now_ns - c->last_frame_ns) / 1e9f : 0.016f;
+	c->last_frame_ns = now_ns;
+
+	float dt_ms = dt * 1000.0f;
+	if (dt_ms > 0.0f) {
+		c->smoothed_frame_time_ms = c->smoothed_frame_time_ms * 0.9f + dt_ms * 0.1f;
+	}
+	float fps = (c->smoothed_frame_time_ms > 0.0f) ? (1000.0f / c->smoothed_frame_time_ms) : 0.0f;
+
+	// Display dimensions and nominal viewer position from sys_info (fallback from DP)
+	float disp_w_mm = 0, disp_h_mm = 0;
+	float nom_x = 0, nom_y = 0, nom_z = 600.0f;
+	if (c->sys_info_set) {
+		disp_w_mm = c->sys_info.display_width_m * 1000.0f;
+		disp_h_mm = c->sys_info.display_height_m * 1000.0f;
+		nom_y = c->sys_info.nominal_viewer_y_m * 1000.0f;
+		nom_z = c->sys_info.nominal_viewer_z_m * 1000.0f;
+	} else if (c->display_processor != NULL) {
+		float dw_m = 0, dh_m = 0;
+		if (xrt_display_processor_get_display_dimensions(c->display_processor, &dw_m, &dh_m)) {
+			disp_w_mm = dw_m * 1000.0f;
+			disp_h_mm = dh_m * 1000.0f;
+		}
+	}
+
+	// Eye positions from display processor
+	struct xrt_vec3 left_eye = {-0.032f, nom_y / 1000.0f, nom_z / 1000.0f};
+	struct xrt_vec3 right_eye = {0.032f, nom_y / 1000.0f, nom_z / 1000.0f};
+	if (c->display_processor != NULL) {
+		struct xrt_eye_positions eye_pos = {0};
+		if (xrt_display_processor_get_predicted_eye_positions(c->display_processor, &eye_pos) &&
+		    eye_pos.valid && eye_pos.count >= 2) {
+			left_eye.x = eye_pos.eyes[0].x;
+			left_eye.y = eye_pos.eyes[0].y;
+			left_eye.z = eye_pos.eyes[0].z;
+			right_eye.x = eye_pos.eyes[1].x;
+			right_eye.y = eye_pos.eyes[1].y;
+			right_eye.z = eye_pos.eyes[1].z;
+		}
+	}
+
+	// Fill HUD data
+	struct u_hud_data data = {0};
+	data.device_name = (c->xdev != NULL) ? c->xdev->str : "Unknown";
+	data.fps = fps;
+	data.frame_time_ms = c->smoothed_frame_time_ms;
+	data.mode_3d = c->hardware_display_3d;
+	if (c->xdev != NULL && c->xdev->hmd != NULL) {
+		uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
+		if (idx < c->xdev->rendering_mode_count) {
+			data.rendering_mode_name = c->xdev->rendering_modes[idx].mode_name;
+		}
+	}
+	if (c->renderer != NULL) {
+		uint32_t vw, vh;
+		comp_vk_native_renderer_get_view_dimensions(c->renderer, &vw, &vh);
+		data.render_width = vw;
+		data.render_height = vh;
+	}
+	if (c->xdev != NULL && c->xdev->rendering_mode_count > 0) {
+		u_tiling_compute_system_atlas(c->xdev->rendering_modes, c->xdev->rendering_mode_count,
+		                              &data.swapchain_width, &data.swapchain_height);
+	}
+	data.window_width = target_width;
+	data.window_height = target_height;
+	data.display_width_mm = disp_w_mm;
+	data.display_height_mm = disp_h_mm;
+	data.nominal_x = nom_x;
+	data.nominal_y = nom_y;
+	data.nominal_z = nom_z;
+	data.left_eye_x = left_eye.x * 1000.0f;
+	data.left_eye_y = left_eye.y * 1000.0f;
+	data.left_eye_z = left_eye.z * 1000.0f;
+	data.right_eye_x = right_eye.x * 1000.0f;
+	data.right_eye_y = right_eye.y * 1000.0f;
+	data.right_eye_z = right_eye.z * 1000.0f;
+	data.eye_tracking_active = (left_eye.z != 0.6f || right_eye.z != 0.6f);
+
+#ifdef XRT_BUILD_DRIVER_QWERTY
+	if (c->xsysd != NULL) {
+		struct xrt_pose qwerty_pose;
+		if (qwerty_get_hmd_pose(c->xsysd->xdevs, c->xsysd->xdev_count, &qwerty_pose)) {
+			data.vdisp_x = qwerty_pose.position.x;
+			data.vdisp_y = qwerty_pose.position.y;
+			data.vdisp_z = qwerty_pose.position.z;
+			struct xrt_vec3 fwd_in = {0, 0, -1};
+			struct xrt_vec3 fwd_out;
+			math_quat_rotate_vec3(&qwerty_pose.orientation, &fwd_in, &fwd_out);
+			data.forward_x = fwd_out.x;
+			data.forward_y = fwd_out.y;
+			data.forward_z = fwd_out.z;
+		}
+
+		struct qwerty_view_state ss;
+		if (qwerty_get_view_state(c->xsysd->xdevs, c->xsysd->xdev_count, &ss)) {
+			data.camera_mode = ss.camera_mode;
+			data.cam_spread_factor = ss.cam_spread_factor;
+			data.cam_parallax_factor = ss.cam_parallax_factor;
+			data.cam_convergence = ss.cam_convergence;
+			data.cam_half_tan_vfov = ss.cam_half_tan_vfov;
+			data.disp_spread_factor = ss.disp_spread_factor;
+			data.disp_parallax_factor = ss.disp_parallax_factor;
+			data.disp_vHeight = ss.disp_vHeight;
+			data.nominal_viewer_z = ss.nominal_viewer_z;
+			data.screen_height_m = ss.screen_height_m;
+		}
+	}
+#endif
+
+	bool dirty = u_hud_update(c->hud, &data);
+
+	uint32_t hud_w = u_hud_get_width(c->hud);
+	uint32_t hud_h = u_hud_get_height(c->hud);
+
+	// Lazy-create HUD VkImage (host-visible for CPU upload)
+	if (c->hud_image == VK_NULL_HANDLE && hud_w > 0 && hud_h > 0) {
+		VkImageCreateInfo image_ci = {
+		    .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+		    .imageType = VK_IMAGE_TYPE_2D,
+		    .format = VK_FORMAT_R8G8B8A8_UNORM,
+		    .extent = {hud_w, hud_h, 1},
+		    .mipLevels = 1,
+		    .arrayLayers = 1,
+		    .samples = VK_SAMPLE_COUNT_1_BIT,
+		    .tiling = VK_IMAGE_TILING_LINEAR,
+		    .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+		    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+		    .initialLayout = VK_IMAGE_LAYOUT_PREINITIALIZED,
+		};
+		VkResult ret = vk->vkCreateImage(vk->device, &image_ci, NULL, &c->hud_image);
+		if (ret != VK_SUCCESS) {
+			U_LOG_E("Failed to create HUD VkImage: %d", ret);
+			return;
+		}
+
+		VkMemoryRequirements mem_reqs;
+		vk->vkGetImageMemoryRequirements(vk->device, c->hud_image, &mem_reqs);
+
+		// Find host-visible memory type
+		VkPhysicalDeviceMemoryProperties mem_props;
+		vk->vkGetPhysicalDeviceMemoryProperties(vk->physical_device, &mem_props);
+		uint32_t mem_type = UINT32_MAX;
+		for (uint32_t i = 0; i < mem_props.memoryTypeCount; i++) {
+			if ((mem_reqs.memoryTypeBits & (1u << i)) &&
+			    (mem_props.memoryTypes[i].propertyFlags &
+			     (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) ==
+			        (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+				mem_type = i;
+				break;
+			}
+		}
+		if (mem_type == UINT32_MAX) {
+			U_LOG_E("No host-visible memory type for HUD image");
+			vk->vkDestroyImage(vk->device, c->hud_image, NULL);
+			c->hud_image = VK_NULL_HANDLE;
+			return;
+		}
+
+		VkMemoryAllocateInfo alloc_info = {
+		    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+		    .allocationSize = mem_reqs.size,
+		    .memoryTypeIndex = mem_type,
+		};
+		ret = vk->vkAllocateMemory(vk->device, &alloc_info, NULL, &c->hud_memory);
+		if (ret != VK_SUCCESS) {
+			U_LOG_E("Failed to allocate HUD memory: %d", ret);
+			vk->vkDestroyImage(vk->device, c->hud_image, NULL);
+			c->hud_image = VK_NULL_HANDLE;
+			return;
+		}
+		vk->vkBindImageMemory(vk->device, c->hud_image, c->hud_memory, 0);
+
+		c->hud_width = hud_w;
+		c->hud_height = hud_h;
+		dirty = true;
+	}
+
+	if (c->hud_image == VK_NULL_HANDLE) {
+		return;
+	}
+
+	// Upload pixels if changed
+	if (dirty) {
+		const uint8_t *pixels = u_hud_get_pixels(c->hud);
+		void *mapped = NULL;
+
+		VkMemoryRequirements mem_reqs;
+		vk->vkGetImageMemoryRequirements(vk->device, c->hud_image, &mem_reqs);
+
+		VkResult ret = vk->vkMapMemory(vk->device, c->hud_memory, 0, mem_reqs.size, 0, &mapped);
+		if (ret == VK_SUCCESS) {
+			// Get subresource layout for proper row pitch
+			VkImageSubresource subres = {
+			    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+			    .mipLevel = 0,
+			    .arrayLayer = 0,
+			};
+			VkSubresourceLayout layout;
+			vk->vkGetImageSubresourceLayout(vk->device, c->hud_image, &subres, &layout);
+
+			uint32_t src_row_bytes = hud_w * 4;
+			uint8_t *dst = (uint8_t *)mapped + layout.offset;
+			for (uint32_t row = 0; row < hud_h; row++) {
+				memcpy(dst + row * layout.rowPitch, pixels + row * src_row_bytes, src_row_bytes);
+			}
+			vk->vkUnmapMemory(vk->device, c->hud_memory);
+		}
+	}
+
+	// Transition target from PRESENT_SRC_KHR to TRANSFER_DST
+	VkImageMemoryBarrier to_dst = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+	    .oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+	    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	    .image = target_image,
+	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	};
+	vk->vkCmdPipelineBarrier(cmd,
+	    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+	    VK_PIPELINE_STAGE_TRANSFER_BIT,
+	    0, 0, NULL, 0, NULL, 1, &to_dst);
+
+	// Transition HUD image to TRANSFER_SRC
+	VkImageMemoryBarrier hud_to_src = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT,
+	    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+	    .oldLayout = VK_IMAGE_LAYOUT_PREINITIALIZED,
+	    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	    .image = c->hud_image,
+	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	};
+	vk->vkCmdPipelineBarrier(cmd,
+	    VK_PIPELINE_STAGE_HOST_BIT,
+	    VK_PIPELINE_STAGE_TRANSFER_BIT,
+	    0, 0, NULL, 0, NULL, 1, &hud_to_src);
+
+	// Blit HUD to bottom-left corner of target
+	uint32_t margin = 10;
+	VkImageBlit blit = {
+	    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .srcOffsets = {{0, 0, 0}, {(int32_t)hud_w, (int32_t)hud_h, 1}},
+	    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .dstOffsets = {
+	        {(int32_t)margin, (int32_t)(target_height - hud_h - margin), 0},
+	        {(int32_t)(margin + hud_w), (int32_t)(target_height - margin), 1},
+	    },
+	};
+	vk->vkCmdBlitImage(cmd,
+	    c->hud_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	    target_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	    1, &blit, VK_FILTER_NEAREST);
+
+	// Transition HUD image back to PREINITIALIZED for next upload
+	VkImageMemoryBarrier hud_back = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+	    .dstAccessMask = VK_ACCESS_HOST_WRITE_BIT,
+	    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	    .newLayout = VK_IMAGE_LAYOUT_PREINITIALIZED,
+	    .image = c->hud_image,
+	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	};
+	vk->vkCmdPipelineBarrier(cmd,
+	    VK_PIPELINE_STAGE_TRANSFER_BIT,
+	    VK_PIPELINE_STAGE_HOST_BIT,
+	    0, 0, NULL, 0, NULL, 1, &hud_back);
+
+	// Transition target back to PRESENT_SRC_KHR
+	VkImageMemoryBarrier to_present = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+	    .dstAccessMask = 0,
+	    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	    .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+	    .image = target_image,
+	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	};
+	vk->vkCmdPipelineBarrier(cmd,
+	    VK_PIPELINE_STAGE_TRANSFER_BIT,
+	    VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+	    0, 0, NULL, 0, NULL, 1, &to_present);
+}
+
 static xrt_result_t
 vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
 {
@@ -1389,6 +1721,10 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				// Post-weave: blit HUD overlays onto target (flat, not interlaced)
 				vk_compositor_blit_window_space_layers(c, cmd,
 				    (VkImage)(uintptr_t)target_image, tgt_width, tgt_height);
+
+				// Diagnostic HUD overlay (TAB key toggle)
+				vk_compositor_render_hud(c, cmd,
+				    (VkImage)(uintptr_t)target_image, tgt_width, tgt_height);
 			} else {
 				// No display processor (or mono/2D mode): blit stereo texture to target
 				comp_vk_native_renderer_blit_to_target(c->renderer, cmd,
@@ -1396,6 +1732,10 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 
 				// Post-blit: HUD overlays onto target (flat 2D, same as post-weave path)
 				vk_compositor_blit_window_space_layers(c, cmd,
+				    (VkImage)(uintptr_t)target_image, tgt_width, tgt_height);
+
+				// Diagnostic HUD overlay (TAB key toggle)
+				vk_compositor_render_hud(c, cmd,
 				    (VkImage)(uintptr_t)target_image, tgt_width, tgt_height);
 			}
 
@@ -1455,6 +1795,15 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 	U_LOG_I("Destroying VK native compositor");
 
 	vk->vkDeviceWaitIdle(vk->device);
+
+	// Destroy HUD resources
+	if (c->hud_image != VK_NULL_HANDLE) {
+		vk->vkDestroyImage(vk->device, c->hud_image, NULL);
+	}
+	if (c->hud_memory != VK_NULL_HANDLE) {
+		vk->vkFreeMemory(vk->device, c->hud_memory, NULL);
+	}
+	u_hud_destroy(&c->hud);
 
 	// Destroy display processor
 	xrt_display_processor_destroy(&c->display_processor);
@@ -1820,6 +2169,13 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		}
 	}
 
+	// Create HUD overlay for runtime-owned windows
+#if defined(XRT_OS_WINDOWS) || defined(XRT_OS_MACOS)
+	if (c->owns_window) {
+		u_hud_create(&c->hud, c->settings.preferred.width);
+	}
+#endif
+
 	// Initialize layer accumulator
 	memset(&c->layer_accum, 0, sizeof(c->layer_accum));
 
@@ -1900,8 +2256,17 @@ comp_vk_native_compositor_get_display_dimensions(struct xrt_compositor *xc,
 	struct comp_vk_native_compositor *c = vk_comp(xc);
 
 	if (c->display_processor != NULL) {
-		return xrt_display_processor_get_display_dimensions(
-		    c->display_processor, out_width_m, out_height_m);
+		if (xrt_display_processor_get_display_dimensions(
+		        c->display_processor, out_width_m, out_height_m)) {
+			return true;
+		}
+	}
+
+	// Fallback to system compositor info (sim_display DP doesn't implement get_display_dimensions)
+	if (c->sys_info_set && c->sys_info.display_width_m > 0.0f && c->sys_info.display_height_m > 0.0f) {
+		*out_width_m = c->sys_info.display_width_m;
+		*out_height_m = c->sys_info.display_height_m;
+		return true;
 	}
 
 	*out_width_m = 0.3f;
@@ -2070,6 +2435,18 @@ comp_vk_native_compositor_set_system_devices(struct xrt_compositor *xc,
 		comp_d3d11_window_set_system_devices(c->own_window, xsysd);
 	}
 #endif
+}
+
+void
+comp_vk_native_compositor_set_sys_info(struct xrt_compositor *xc,
+                                        const struct xrt_system_compositor_info *info)
+{
+	if (xc == NULL || info == NULL) return;
+	struct comp_vk_native_compositor *c = vk_comp(xc);
+	c->sys_info = *info;
+	c->sys_info_set = true;
+	c->legacy_app_tile_scaling = info->legacy_app_tile_scaling;
+	c->last_3d_mode_index = 1;
 }
 
 void
