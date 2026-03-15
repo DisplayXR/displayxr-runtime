@@ -1085,20 +1085,17 @@ metal_compositor_render_hud(struct comp_metal_compositor *c, float dt,
 		nom_z = c->sys_info->nominal_viewer_z_m * 1000.0f;
 	}
 
-	// Eye positions from display processor (fallback to nominal)
-	struct xrt_vec3 left_eye = {-0.032f, nom_y / 1000.0f, nom_z / 1000.0f};
-	struct xrt_vec3 right_eye = {0.032f, nom_y / 1000.0f, nom_z / 1000.0f};
+	// Eye positions from display processor (fallback to nominal stereo)
+	struct xrt_eye_positions eye_pos = {0};
+	bool have_eyes = false;
 	if (c->display_processor != NULL) {
-		struct xrt_eye_positions eye_pos = {0};
-		if (xrt_display_processor_metal_get_predicted_eye_positions(c->display_processor, &eye_pos) &&
-		    eye_pos.valid && eye_pos.count >= 2) {
-			left_eye.x = eye_pos.eyes[0].x;
-			left_eye.y = eye_pos.eyes[0].y;
-			left_eye.z = eye_pos.eyes[0].z;
-			right_eye.x = eye_pos.eyes[1].x;
-			right_eye.y = eye_pos.eyes[1].y;
-			right_eye.z = eye_pos.eyes[1].z;
-		}
+		have_eyes = xrt_display_processor_metal_get_predicted_eye_positions(
+		    c->display_processor, &eye_pos) && eye_pos.valid;
+	}
+	if (!have_eyes) {
+		eye_pos.count = 2;
+		eye_pos.eyes[0] = (struct xrt_eye_position){-0.032f, nom_y / 1000.0f, nom_z / 1000.0f};
+		eye_pos.eyes[1] = (struct xrt_eye_position){ 0.032f, nom_y / 1000.0f, nom_z / 1000.0f};
 	}
 
 	// Window dimensions (from actual window backing, not drawable)
@@ -1135,13 +1132,21 @@ metal_compositor_render_hud(struct comp_metal_compositor *c, float dt,
 	data.nominal_x = nom_x;
 	data.nominal_y = nom_y;
 	data.nominal_z = nom_z;
-	data.left_eye_x = left_eye.x * 1000.0f;
-	data.left_eye_y = left_eye.y * 1000.0f;
-	data.left_eye_z = left_eye.z * 1000.0f;
-	data.right_eye_x = right_eye.x * 1000.0f;
-	data.right_eye_y = right_eye.y * 1000.0f;
-	data.right_eye_z = right_eye.z * 1000.0f;
-	data.eye_tracking_active = (left_eye.z != 0.6f || right_eye.z != 0.6f);
+	data.eye_count = eye_pos.count;
+	for (uint32_t e = 0; e < eye_pos.count && e < 8; e++) {
+		data.eyes[e].x = eye_pos.eyes[e].x * 1000.0f;
+		data.eyes[e].y = eye_pos.eyes[e].y * 1000.0f;
+		data.eyes[e].z = eye_pos.eyes[e].z * 1000.0f;
+	}
+	data.eye_tracking_active = eye_pos.is_tracking;
+
+	// Clamp eye count to active mode's view_count (2D=1 eye at midpoint, stereo=2, quad=4)
+	if (c->xdev != NULL && c->xdev->hmd != NULL) {
+		uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
+		if (idx < c->xdev->rendering_mode_count) {
+			u_hud_data_clamp_eyes(&data, c->xdev->rendering_modes[idx].view_count);
+		}
+	}
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
 	if (c->xsysd != NULL) {

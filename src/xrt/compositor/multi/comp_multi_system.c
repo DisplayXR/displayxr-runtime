@@ -1794,23 +1794,14 @@ session_render_hud_overlay(struct multi_compositor *mc,
 	}
 
 	// Get eye positions and display dims via display processor vtable
-	float left_x = -32.0f, left_y = 0.0f, left_z = 600.0f;
-	float right_x = 32.0f, right_y = 0.0f, right_z = 600.0f;
-	bool tracking_active = false;
+	struct xrt_eye_positions eye_pos = {0};
 	float disp_w_mm = 0.0f, disp_h_mm = 0.0f;
 	float nom_x = 0.0f, nom_y = 0.0f, nom_z = 600.0f;
 
 	if (mc->session_render.display_processor != NULL) {
-		struct xrt_eye_positions eyes;
 		if (xrt_display_processor_get_predicted_eye_positions(
-		        mc->session_render.display_processor, &eyes) && eyes.valid) {
-			left_x = eyes.eyes[0].x * 1000.0f;
-			left_y = eyes.eyes[0].y * 1000.0f;
-			left_z = eyes.eyes[0].z * 1000.0f;
-			right_x = eyes.eyes[1].x * 1000.0f;
-			right_y = eyes.eyes[1].y * 1000.0f;
-			right_z = eyes.eyes[1].z * 1000.0f;
-			tracking_active = true;
+		        mc->session_render.display_processor, &eye_pos) && eye_pos.valid) {
+			// eye_pos populated with N-view positions
 		}
 
 		float dim_w = 0.0f, dim_h = 0.0f;
@@ -1894,13 +1885,28 @@ session_render_hud_overlay(struct multi_compositor *mc,
 	data.nominal_x = nom_x;
 	data.nominal_y = nom_y;
 	data.nominal_z = nom_z;
-	data.left_eye_x = left_x;
-	data.left_eye_y = left_y;
-	data.left_eye_z = left_z;
-	data.right_eye_x = right_x;
-	data.right_eye_y = right_y;
-	data.right_eye_z = right_z;
-	data.eye_tracking_active = tracking_active;
+	if (!eye_pos.valid) {
+		// Fallback: nominal stereo (in mm)
+		eye_pos.count = 2;
+		eye_pos.eyes[0] = (struct xrt_eye_position){-0.032f, nom_y / 1000.0f, nom_z / 1000.0f};
+		eye_pos.eyes[1] = (struct xrt_eye_position){ 0.032f, nom_y / 1000.0f, nom_z / 1000.0f};
+	}
+	data.eye_count = eye_pos.count;
+	for (uint32_t e = 0; e < eye_pos.count && e < 8; e++) {
+		data.eyes[e].x = eye_pos.eyes[e].x * 1000.0f;
+		data.eyes[e].y = eye_pos.eyes[e].y * 1000.0f;
+		data.eyes[e].z = eye_pos.eyes[e].z * 1000.0f;
+	}
+	data.eye_tracking_active = eye_pos.is_tracking;
+
+	// Clamp eye count to active mode's view_count (2D=1 eye at midpoint, stereo=2, quad=4)
+	if (xdev != NULL && xdev->hmd != NULL) {
+		uint32_t idx = xdev->hmd->active_rendering_mode_index;
+		if (idx < xdev->rendering_mode_count) {
+			u_hud_data_clamp_eyes(&data, xdev->rendering_modes[idx].view_count);
+		}
+	}
+
 	data.zoom_scale = zoom_scale;
 	data.vdisp_x = vdisp_x;
 	data.vdisp_y = vdisp_y;
