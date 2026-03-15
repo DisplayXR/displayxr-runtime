@@ -705,7 +705,7 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	// Display processor path: the D3D12 weaver renders to whatever render
 	// target is bound on the command list. We bind the swapchain back buffer
 	// as RT, call weave, then present.
-	if (c->display_processor != NULL && c->target != nullptr) {
+	if (c->hardware_display_3d && c->display_processor != NULL && c->target != nullptr) {
 		static bool dp_logged = false;
 		if (!dp_logged) {
 			U_LOG_W("D3D12 weaving via display processor (swapchain RT)");
@@ -826,6 +826,97 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 
 		// Wait for frame completion (frame pacing)
 		gpu_wait_idle(c);
+
+		return XRT_SUCCESS;
+	}
+
+	// 2D fallback path: display processor exists but hardware is in 2D mode.
+	// Stretch-blit the content region of the atlas to the back buffer.
+	if (!c->hardware_display_3d && c->display_processor != NULL && c->target != nullptr) {
+		uint32_t bb_index = comp_d3d12_target_get_current_index(c->target);
+		ID3D12Resource *back_buffer = static_cast<ID3D12Resource *>(
+		    comp_d3d12_target_get_back_buffer(c->target, bb_index));
+
+		if (back_buffer != nullptr) {
+			static bool fallback_2d_logged = false;
+			if (!fallback_2d_logged) {
+				U_LOG_W("D3D12 2D mode: stretch-blit atlas content to back buffer");
+				fallback_2d_logged = true;
+			}
+
+			ID3D12Resource *atlas_resource = static_cast<ID3D12Resource *>(
+			    comp_d3d12_renderer_get_atlas_resource(c->renderer));
+
+			if (atlas_resource != nullptr) {
+				uint32_t view_width, view_height;
+				comp_d3d12_renderer_get_view_dimensions(c->renderer, &view_width, &view_height);
+				uint32_t tile_columns, tile_rows;
+				comp_d3d12_renderer_get_tile_layout(c->renderer, &tile_columns, &tile_rows);
+				uint32_t content_w = tile_columns * view_width;
+				uint32_t content_h = tile_rows * view_height;
+
+				// Barriers: back buffer PRESENT → COPY_DEST, atlas PSR → COPY_SOURCE
+				D3D12_RESOURCE_BARRIER barriers[2] = {};
+				barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+				barriers[0].Transition.pResource = back_buffer;
+				barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+				barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+				barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+				barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+				barriers[1].Transition.pResource = atlas_resource;
+				barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+				barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+				barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+				c->cmd_list->ResourceBarrier(2, barriers);
+
+				// Copy content region from atlas to back buffer (stretch via CopyTextureRegion)
+				D3D12_TEXTURE_COPY_LOCATION src_loc = {};
+				src_loc.pResource = atlas_resource;
+				src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+				src_loc.SubresourceIndex = 0;
+
+				D3D12_TEXTURE_COPY_LOCATION dst_loc = {};
+				dst_loc.pResource = back_buffer;
+				dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+				dst_loc.SubresourceIndex = 0;
+
+				D3D12_BOX src_box = {};
+				src_box.left = 0;
+				src_box.top = 0;
+				src_box.front = 0;
+				src_box.right = content_w;
+				src_box.bottom = content_h;
+				src_box.back = 1;
+
+				c->cmd_list->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, &src_box);
+
+				// Barriers: back to original states
+				barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+				barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+				barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+				barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
+				c->cmd_list->ResourceBarrier(2, barriers);
+			}
+		}
+
+		// Close and execute command list
+		c->cmd_list->Close();
+		ID3D12CommandList *lists[] = {c->cmd_list};
+		c->command_queue->ExecuteCommandLists(1, lists);
+
+		// Present with VSync
+		comp_d3d12_target_present(c->target, 1);
+
+		// Signal fence and wait for frame completion
+		c->fence_value++;
+		c->command_queue->Signal(c->fence, c->fence_value);
+		if (c->fence->GetCompletedValue() < c->fence_value) {
+			c->fence->SetEventOnCompletion(c->fence_value, c->fence_event);
+			WaitForSingleObject(c->fence_event, INFINITE);
+		}
 
 		return XRT_SUCCESS;
 	}
