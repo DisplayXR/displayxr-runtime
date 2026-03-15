@@ -6,6 +6,7 @@ Living feature and extension specifications.
 
 - [XR_EXT_display_info](specs/XR_EXT_display_info.md) — Display properties, eye tracking, rendering modes, mode enumeration
 - [XR_EXT_win32_window_binding](specs/XR_EXT_win32_window_binding.md) — App-provided Win32 HWND for windowed rendering
+- [XR_EXT_cocoa_window_binding](specs/XR_EXT_cocoa_window_binding.md) — App-provided Cocoa NSView for rendering on macOS
 - [XR_VIEW_CONFIGURATION_PRIMARY_MULTIVIEW](specs/XR_VIEW_CONFIGURATION_PRIMARY_MULTIVIEW.md) — Khronos multiview view configuration proposal
 - [Vendor Integration Guide](specs/vendor-integration.md) — How to add a new 3D display vendor
 - [Multiview Tiling](specs/multiview-tiling.md) — Atlas layout for N-view rendering
