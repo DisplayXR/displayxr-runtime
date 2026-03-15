@@ -149,6 +149,16 @@ static NSString *const shader_source = @
     "    float atlas_u = (local_u + col) * tp.tile_cols_inv;\n"
     "    float atlas_v = (local_v + row) * tp.tile_rows_inv;\n"
     "    return tex.sample(smp, float2(atlas_u, atlas_v));\n"
+    "}\n"
+    "\n"
+    "// Passthrough: first tile (view 0) fills the entire screen.\n"
+    "fragment float4 passthrough_fragment(VertexOut in [[stage_in]],\n"
+    "                                     texture2d<float> tex [[texture(0)]],\n"
+    "                                     sampler smp [[sampler(0)]],\n"
+    "                                     constant TileParams &tp [[buffer(0)]]) {\n"
+    "    float2 atlas_uv = float2(in.texCoord.x * tp.tile_cols_inv,\n"
+    "                             in.texCoord.y * tp.tile_rows_inv);\n"
+    "    return tex.sample(smp, atlas_uv);\n"
     "}\n";
 
 
@@ -159,7 +169,7 @@ struct sim_display_processor_metal
 {
 	struct xrt_display_processor_metal base;
 	id<MTLDevice> device;
-	id<MTLRenderPipelineState> pipelines[5]; //!< One per output mode (SBS, anaglyph, blend, squeezed SBS, quad)
+	id<MTLRenderPipelineState> pipelines[6]; //!< One per output mode (SBS, anaglyph, blend, squeezed SBS, quad, passthrough)
 	id<MTLSamplerState> sampler;
 
 	//! Nominal viewer parameters for faked eye positions.
@@ -297,7 +307,7 @@ sim_dp_metal_destroy(struct xrt_display_processor_metal *xdp)
 {
 	struct sim_display_processor_metal *sdp = sim_dp_metal(xdp);
 
-	for (int i = 0; i < 5; i++) {
+	for (int i = 0; i < 6; i++) {
 		sdp->pipelines[i] = nil;
 	}
 	sdp->sampler = nil;
@@ -333,10 +343,10 @@ create_pipelines(struct sim_display_processor_metal *sdp)
 		return false;
 	}
 
-	NSString *frag_names[5] = {@"sbs_fragment", @"anaglyph_fragment", @"blend_fragment", @"squeezed_sbs_fragment", @"quad_fragment"};
-	const char *mode_names[5] = {"SBS", "Anaglyph", "Blend", "Squeezed SBS", "Quad"};
+	NSString *frag_names[6] = {@"sbs_fragment", @"anaglyph_fragment", @"blend_fragment", @"squeezed_sbs_fragment", @"quad_fragment", @"passthrough_fragment"};
+	const char *mode_names[6] = {"SBS", "Anaglyph", "Blend", "Squeezed SBS", "Quad", "Passthrough"};
 
-	for (int i = 0; i < 5; i++) {
+	for (int i = 0; i < 6; i++) {
 		id<MTLFunction> frag_fn = [library newFunctionWithName:frag_names[i]];
 		if (frag_fn == nil) {
 			U_LOG_E("sim_display Metal: %s fragment function not found", mode_names[i]);
@@ -419,11 +429,12 @@ sim_display_processor_metal_create(enum sim_display_output_mode mode,
 	// Set the initial output mode (atomic global read by process_atlas each frame)
 	sim_display_set_output_mode(mode);
 
-	U_LOG_W("Created sim display Metal processor (all 5 pipelines), initial mode: %s",
+	U_LOG_W("Created sim display Metal processor (all 6 pipelines), initial mode: %s",
 	        mode == SIM_DISPLAY_OUTPUT_SBS           ? "SBS" :
 	        mode == SIM_DISPLAY_OUTPUT_ANAGLYPH       ? "Anaglyph" :
 	        mode == SIM_DISPLAY_OUTPUT_SQUEEZED_SBS   ? "Squeezed SBS" :
-	        mode == SIM_DISPLAY_OUTPUT_QUAD            ? "Quad" : "Blend");
+	        mode == SIM_DISPLAY_OUTPUT_QUAD            ? "Quad" :
+	        mode == SIM_DISPLAY_OUTPUT_PASSTHROUGH     ? "Passthrough" : "Blend");
 
 	*out_xdp = &sdp->base;
 	return XRT_SUCCESS;
