@@ -436,6 +436,9 @@ xrEndFrame(session, &endInfo);
 
 ## 4. Extension 2: XR_EXT_android_surface_binding
 
+> **Status: Planned — not yet implemented.** The extension header exists but no
+> compositor or platform code implements Android surface binding yet.
+
 ### IP Status
 
 No known IP claims.
@@ -678,7 +681,12 @@ Chained to `XrSystemProperties` to return physical display information.
 | `nominalViewerPositionInDisplaySpace` | `XrVector3f` | Design-time expected viewer position relative to display center (meters). Defines the apex of the canonical display pyramid. See [Nominal Viewer Position](#nominal-viewer-position). |
 | `recommendedViewScaleX` | `float` | Horizontal render resolution scale factor. See [Recommended View Scale](#recommended-view-scale). |
 | `recommendedViewScaleY` | `float` | Vertical render resolution scale factor. See [Recommended View Scale](#recommended-view-scale). |
-| `hardwareDisplay3D` | `XrBool32` | `XR_TRUE` if the physical display is a hardware 3D display (i.e., supports hardware-accelerated 3D rendering). See [Display Mode Switching](#display-mode-switching). |
+| `displayPixelWidth` | `uint32_t` | Native display panel width in pixels (0 if unknown). |
+| `displayPixelHeight` | `uint32_t` | Native display panel height in pixels (0 if unknown). |
+
+> **Note:** `hardwareDisplay3D` was removed from `XrDisplayInfoEXT` in v12 and is now
+> a per-mode field on `XrDisplayRenderingModeInfoEXT`. Query it via
+> `xrEnumerateDisplayRenderingModesEXT`.
 
 ```c
 typedef struct XrDisplayInfoEXT {
@@ -688,7 +696,8 @@ typedef struct XrDisplayInfoEXT {
     XrVector3f                  nominalViewerPositionInDisplaySpace;
     float                       recommendedViewScaleX;
     float                       recommendedViewScaleY;
-    XrBool32                    hardwareDisplay3D;
+    uint32_t                    displayPixelWidth;
+    uint32_t                    displayPixelHeight;
 } XrDisplayInfoEXT;
 ```
 
@@ -1327,7 +1336,7 @@ installed runtime. The `XR_EXT_display_info` extension's capability reporting
 (`XrDisplayInfoEXT`, `XrEyeTrackingModeCapabilitiesEXT`) reflects only what the device
 actually supports, not the full SDK API surface.
 
-See the **Vendor Integration Guide** (`doc/extensions/vendor_integration_guide.md` §13)
+See the **Vendor Integration Guide** (`docs/specs/vendor-integration.md` §13)
 for the complete deployment model, multi-vendor build strategy, and driver implementation
 guidelines.
 

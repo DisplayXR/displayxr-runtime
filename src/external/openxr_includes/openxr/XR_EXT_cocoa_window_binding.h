@@ -40,7 +40,7 @@ extern "C" {
 
 // Use a value in the vendor extension range (1000000000+)
 // This should be replaced with an official Khronos-assigned value if the extension is standardized
-#define XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_EXT ((XrStructureType)1000999003)
+#define XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_EXT ((XrStructureType)1000999004)
 
 // Window-space composition layer (shared with XR_EXT_win32_window_binding)
 #ifndef XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT

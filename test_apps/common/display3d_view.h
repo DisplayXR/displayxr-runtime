@@ -10,7 +10,7 @@
  * the math. Pure C, depends only on <openxr/openxr.h> and <math.h>.
  *
  * Reference: Robert Kooima, "Generalized Perspective Projection" (2009)
- * See also: doc/extensions/stereo3d_math.md for full pipeline derivation.
+ * See also: docs/architecture/stereo3d-math.md for full pipeline derivation.
  *
  * Matrix convention: all output matrices are column-major (OpenGL/Vulkan/Metal).
  * DirectX callers should transpose when loading into row-major XMMATRIX.

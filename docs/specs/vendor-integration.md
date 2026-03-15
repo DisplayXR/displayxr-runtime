@@ -37,8 +37,8 @@ OpenXR extensions, and build system registration.
  │  YOUR CODE: vendor-specific stereo → display conversion      │
  │  (interlacing, SBS, anaglyph, etc.)                          │
  │                                                              │
- │  Vulkan:  xrt_display_processor         (process_views)      │
- │  D3D11:   xrt_display_processor_d3d11   (process_stereo)     │
+ │  Vulkan:  xrt_display_processor         (process_atlas)      │
+ │  D3D11:   xrt_display_processor_d3d11   (process_atlas)      │
  └────────────────────────┬─────────────────────────────────────┘
                           │
  ┌────────────────────────▼─────────────────────────────────────┐
@@ -162,9 +162,13 @@ typedef struct XrDisplayInfoEXT {
     XrVector3f      nominalViewerPositionInDisplaySpace; // Default eye position
     float           recommendedViewScaleX;      // sr_recommended_w / display_pixel_w
     float           recommendedViewScaleY;      // sr_recommended_h / display_pixel_h
-    XrBool32        hardwareDisplay3D;           // Is a hardware 3D display?
+    uint32_t        displayPixelWidth;           // Native display panel width in pixels (0 if unknown)
+    uint32_t        displayPixelHeight;          // Native display panel height in pixels (0 if unknown)
 } XrDisplayInfoEXT;
 ```
+
+> **Note:** `hardwareDisplay3D` was moved to `XrDisplayRenderingModeInfoEXT` (per-mode)
+> in spec version 8. See the header for the current definition.
 
 **How vendor data reaches this extension:**  The vendor's device driver populates
 `xrt_system_compositor_info` fields at init time:
@@ -342,20 +346,20 @@ with which weaver.
 ```c
 struct xrt_display_processor
 {
-    // --- Required: stereo→display conversion ---
-    void (*process_views)(struct xrt_display_processor *xdp,
+    // --- Required: atlas→display conversion ---
+    void (*process_atlas)(struct xrt_display_processor *xdp,
                           VkCommandBuffer cmd_buffer,
-                          VkImageView left_view,
-                          VkImageView right_view,
+                          VkImage_XDP atlas_image,
+                          VkImageView atlas_view,
                           uint32_t view_width,
                           uint32_t view_height,
+                          uint32_t tile_columns,
+                          uint32_t tile_rows,
                           VkFormat_XDP view_format,
                           VkFramebuffer target_fb,
                           uint32_t target_width,
                           uint32_t target_height,
                           VkFormat_XDP target_format);
-
-    void (*destroy)(struct xrt_display_processor *xdp);
 
     // --- Optional: eye tracking (recommended) ---
     bool (*get_predicted_eye_positions)(struct xrt_display_processor *xdp,
@@ -364,36 +368,44 @@ struct xrt_display_processor
     // --- Optional: window/display queries ---
     bool (*get_window_metrics)(struct xrt_display_processor *xdp,
                                struct xrt_window_metrics *out_metrics);
-    bool (*get_display_dimensions)(struct xrt_display_processor *xdp,
-                                   float *out_width_m, float *out_height_m);
-    bool (*get_display_pixel_info)(struct xrt_display_processor *xdp,
-                                   uint32_t *out_width, uint32_t *out_height,
-                                   int32_t *out_screen_left, int32_t *out_screen_top);
     bool (*request_display_mode)(struct xrt_display_processor *xdp,
                                  bool enable_3d);
 
-    // --- Optional: flags ---
-    bool prefers_sbs_input;  // true if weaver expects side-by-side stereo input
+    // --- Optional: Vulkan-specific ---
+    VkRenderPass (*get_render_pass)(struct xrt_display_processor *xdp);
+
+    bool (*get_display_dimensions)(struct xrt_display_processor *xdp,
+                                   float *out_width_m, float *out_height_m);
+    bool (*get_display_pixel_info)(struct xrt_display_processor *xdp,
+                                   uint32_t *out_pixel_width,
+                                   uint32_t *out_pixel_height,
+                                   int32_t *out_screen_left,
+                                   int32_t *out_screen_top);
+
+    void (*destroy)(struct xrt_display_processor *xdp);
 };
 ```
 
 Key design points:
 - **Unified object**: One struct per session covers weaving, eye tracking,
   window metrics, and display mode — no separate "tracker" component
-- **Separate L/R views**: Input is two distinct `VkImageView` objects
+- **Atlas input**: Single texture containing all views in a tiled grid
+  (`tile_columns` × `tile_rows`), with per-view dimensions `view_width` × `view_height`
 - **Command buffer recording**: Implementation records Vulkan commands into the
   provided command buffer (deferred execution)
 - **Target framebuffer**: Output goes to the provided `VkFramebuffer`
-- **`VkFormat_XDP`**: `int32_t` alias for `VkFormat` values, avoids pulling in
-  full `vulkan.h` in this header
+- **`get_render_pass()`**: Returns the VkRenderPass the DP uses internally,
+  so the compositor can create a compatible framebuffer
+- **`VkFormat_XDP`** / **`VkImage_XDP`**: integer aliases for Vulkan types,
+  avoids pulling in full `vulkan.h` in this header
 - **Optional methods**: NULL means not supported — all helpers check for NULL
   before calling
 
 **Helper functions** for safe calling:
 
 ```c
-// Call process_views through the vtable
-xrt_display_processor_process_views(xdp, cmd_buffer, ...);
+// Call process_atlas through the vtable
+xrt_display_processor_process_atlas(xdp, cmd_buffer, ...);
 
 // Query eye positions (returns false if method is NULL or tracking unavailable)
 xrt_display_processor_get_predicted_eye_positions(xdp, &eye_pos);
@@ -409,42 +421,58 @@ xrt_display_processor_destroy(&xdp);
 ```c
 struct xrt_display_processor_d3d11
 {
-    // --- Required: stereo→display conversion ---
-    void (*process_stereo)(struct xrt_display_processor_d3d11 *xdp,
-                           void *d3d11_context,      // ID3D11DeviceContext*
-                           void *stereo_srv,          // ID3D11ShaderResourceView*
-                           uint32_t view_width,       // Width of one eye
-                           uint32_t view_height,
-                           uint32_t format,           // DXGI_FORMAT as uint32_t
-                           uint32_t target_width,
-                           uint32_t target_height);
-
-    void (*destroy)(struct xrt_display_processor_d3d11 *xdp);
+    // --- Required: atlas→display conversion ---
+    void (*process_atlas)(struct xrt_display_processor_d3d11 *xdp,
+                          void *d3d11_context,      // ID3D11DeviceContext*
+                          void *atlas_srv,           // ID3D11ShaderResourceView*
+                          uint32_t view_width,       // Width of one view tile
+                          uint32_t view_height,
+                          uint32_t tile_columns,     // Atlas tile columns
+                          uint32_t tile_rows,        // Atlas tile rows
+                          uint32_t format,           // DXGI_FORMAT as uint32_t
+                          uint32_t target_width,
+                          uint32_t target_height);
 
     // --- Optional (same as Vulkan variant) ---
     bool (*get_predicted_eye_positions)(struct xrt_display_processor_d3d11 *xdp,
                                         struct xrt_eye_positions *out_eye_pos);
     bool (*get_window_metrics)(struct xrt_display_processor_d3d11 *xdp,
                                struct xrt_window_metrics *out_metrics);
+    bool (*request_display_mode)(struct xrt_display_processor_d3d11 *xdp,
+                                 bool enable_3d);
     bool (*get_display_dimensions)(struct xrt_display_processor_d3d11 *xdp,
                                    float *out_width_m, float *out_height_m);
     bool (*get_display_pixel_info)(struct xrt_display_processor_d3d11 *xdp,
-                                   uint32_t *out_width, uint32_t *out_height,
-                                   int32_t *out_screen_left, int32_t *out_screen_top);
-    bool (*request_display_mode)(struct xrt_display_processor_d3d11 *xdp,
-                                 bool enable_3d);
+                                   uint32_t *out_pixel_width,
+                                   uint32_t *out_pixel_height,
+                                   int32_t *out_screen_left,
+                                   int32_t *out_screen_top);
+
+    void (*destroy)(struct xrt_display_processor_d3d11 *xdp);
 };
 ```
 
 Key differences from Vulkan:
-- **Side-by-side input**: Single SRV containing both eyes (left in left half,
-  right in right half)
+- **Atlas input**: Single SRV containing all views in a tiled atlas layout
+  (`tile_columns` × `tile_rows`)
 - **Immediate mode**: No command buffer — uses D3D11 device context directly
 - **Bound render target**: Output goes to the currently bound render target
   (set via `OMSetRenderTargets` before the call)
 - **`void*` types**: D3D11 types are passed as `void*` to avoid COM header deps
 - **Same optional methods**: Eye tracking, window metrics, display mode — identical
   contract to the Vulkan variant
+
+**Additional API variants** (D3D12, Metal, OpenGL) follow the same pattern with
+API-specific parameters:
+
+- **D3D12** (`xrt_display_processor_d3d12`): `process_atlas()` takes
+  `atlas_texture_resource`, `atlas_srv_gpu_handle`, `target_rtv_cpu_handle`;
+  also has `set_output_format()` for deferred pipeline state configuration
+- **Metal** (`xrt_display_processor_metal`): `process_atlas()` takes
+  `command_buffer` (MTLCommandBuffer), `atlas_texture` (MTLTexture),
+  `target_texture` (MTLTexture)
+- **OpenGL** (`xrt_display_processor_gl`): `process_atlas()` takes
+  `atlas_texture` (GLuint texture name); renders to the default framebuffer
 
 ### 4.3 Ownership Model
 
@@ -474,13 +502,18 @@ struct leia_display_processor
 };
 
 static void
-leia_dp_process_views(struct xrt_display_processor *xdp,
+leia_dp_process_atlas(struct xrt_display_processor *xdp,
                       VkCommandBuffer cmd_buffer,
-                      VkImageView left_view,
-                      VkImageView right_view, ...)
+                      VkImage_XDP atlas_image,
+                      VkImageView atlas_view,
+                      uint32_t view_width,
+                      uint32_t view_height,
+                      uint32_t tile_columns,
+                      uint32_t tile_rows, ...)
 {
     struct leia_display_processor *ldp = (struct leia_display_processor *)xdp;
-    leiasr_weave(ldp->leiasr, cmd_buffer, left_view, right_view, ...);
+    leiasr_weave(ldp->leiasr, cmd_buffer, atlas_view,
+                 view_width, view_height, tile_columns, tile_rows, ...);
 }
 
 // Eye tracking delivered through the SAME struct as weaving.
@@ -518,7 +551,7 @@ leia_display_processor_create(struct leiasr *leiasr,
 {
     struct leia_display_processor *ldp = calloc(1, sizeof(*ldp));
     // Required
-    ldp->base.process_views = leia_dp_process_views;
+    ldp->base.process_atlas = leia_dp_process_atlas;
     ldp->base.destroy = leia_dp_destroy;
     // Eye tracking + queries (all on the same unified struct)
     ldp->base.get_predicted_eye_positions = leia_dp_get_predicted_eye_positions;
@@ -526,7 +559,7 @@ leia_display_processor_create(struct leiasr *leiasr,
     ldp->base.request_display_mode = leia_dp_request_display_mode;
     ldp->base.get_display_dimensions = leia_dp_get_display_dimensions;
     ldp->base.get_display_pixel_info = leia_dp_get_display_pixel_info;
-    ldp->base.prefers_sbs_input = true;
+    ldp->base.get_render_pass = leia_dp_get_render_pass;
     ldp->leiasr = leiasr;  // Borrowed, not owned
     ldp->view_count = 2;   // Default: stereo
     *out_xdp = &ldp->base;
@@ -536,7 +569,7 @@ leia_display_processor_create(struct leiasr *leiasr,
 
 Note how the Leia SR SDK's weaver object provides both interlacing and eye
 tracking (via `LookaroundFilter`).  The display processor simply delegates
-both `process_views` and `get_predicted_eye_positions` to the same underlying
+both `process_atlas` and `get_predicted_eye_positions` to the same underlying
 `leiasr` handle.  The `view_count` field tracks the active mode so that
 `get_predicted_eye_positions` returns the correct number of eyes (see §4.6).
 
@@ -840,7 +873,7 @@ data is converted to vendor-neutral `xrt_eye_positions`.
  │         ▼                         ▼                          │
  │  ┌──────────────────────────────────────────────┐            │
  │  │  Display Processor (unified vtable)          │            │
- │  │  process_views()                → weaving    │            │
+ │  │  process_atlas()                → weaving    │            │
  │  │  get_predicted_eye_positions()  → tracking   │            │
  │  │  get_window_metrics()           → geometry   │            │
  │  └──────────────────┬───────────────────────────┘            │
@@ -1625,12 +1658,12 @@ src/xrt/drivers/leia/
  │ xrEndFrame│     │  layer submission │     │   composites layers│
  └───────────┘     └──────────────────┘     └─────────┬──────────┘
                                                        │
-                                                       │ left/right VkImageView
+                                                       │ atlas VkImageView
                                                        ▼
                                             ┌─────────────────────┐
                                             │  Display Processor  │
                                             │  (vendor Vulkan)    │
-                                            │  process_views()    │
+                                            │  process_atlas()    │
                                             │  records Vk cmds    │
                                             └─────────┬───────────┘
                                                        │
@@ -1653,12 +1686,12 @@ src/xrt/drivers/leia/
  └───────────┘     │  into SBS texture      │
                    └───────────┬────────────┘
                                │
-                               │ SBS stereo ID3D11ShaderResourceView*
+                               │ atlas ID3D11ShaderResourceView*
                                ▼
                    ┌───────────────────────┐
                    │  Display Processor    │
                    │  (vendor D3D11)       │
-                   │  process_stereo()     │
+                   │  process_atlas()      │
                    │  immediate D3D11 draw │
                    └───────────┬───────────┘
                                │

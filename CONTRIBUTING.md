@@ -26,7 +26,7 @@ git clang-format
 
 ### Vendor Integrations
 
-If you're adding support for a new display vendor, please review the [vendor integration guide](doc/extensions/vendor_integration_guide.md) first. Vendor-specific code should be isolated behind the abstraction layer described in the [vendor abstraction refactor](doc/extensions/vendor_abstraction_refactor.md).
+If you're adding support for a new display vendor, please review the [vendor integration guide](docs/specs/vendor-integration.md) first. Vendor-specific code should be isolated behind the display processor vtable abstraction (see [ADR-003](docs/adr/ADR-003-vendor-abstraction-via-display-processor-vtable.md) and [separation of concerns](docs/architecture/separation-of-concerns.md)).
 
 ---
 

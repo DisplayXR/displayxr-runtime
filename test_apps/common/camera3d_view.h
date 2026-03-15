@@ -11,7 +11,7 @@
  * Both abstractions share the same double-duty pattern: a single post-IPD/parallax
  * eye displacement feeds both the view matrix and the projection.
  *
- * See also: doc/extensions/stereo3d_math.md for full pipeline derivation.
+ * See also: docs/architecture/stereo3d-math.md for full pipeline derivation.
  *
  * The tunables struct takes half_tan_vfov = tan(vFOV/2) rather than the angle:
  *   - Zoom is trivial: half_tan_vfov / zoom_factor (no trig round-trip)

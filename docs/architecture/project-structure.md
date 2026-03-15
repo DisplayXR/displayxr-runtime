@@ -110,16 +110,18 @@ The display processor interface decouples the compositor from vendor-specific st
 ```c
 // src/xrt/include/xrt/xrt_display_processor.h
 struct xrt_display_processor {
-    void (*process_views)(
+    void (*process_atlas)(
         struct xrt_display_processor *xdp,
         VkCommandBuffer cmd_buffer,         // Records GPU commands
-        VkImageView left_view,              // Left eye texture
-        VkImageView right_view,             // Right eye texture
-        uint32_t view_width, view_height,
+        VkImage_XDP atlas_image,            // Atlas texture (all views tiled)
+        VkImageView atlas_view,             // Atlas image view
+        uint32_t view_width, view_height,   // Per-view tile dimensions
+        uint32_t tile_columns, tile_rows,   // Atlas layout
         VkFormat_XDP view_format,           // int32_t alias (no Vulkan header dep)
         VkFramebuffer target_fb,            // Output framebuffer
         uint32_t target_width, target_height,
         VkFormat_XDP target_format);
+    VkRenderPass (*get_render_pass)(struct xrt_display_processor *xdp);
     void (*destroy)(struct xrt_display_processor *xdp);
 };
 ```
@@ -131,11 +133,12 @@ Used by: `comp_renderer.c` (main compositor), `comp_multi_system.c` (multi-sessi
 ```c
 // src/xrt/include/xrt/xrt_display_processor_d3d11.h
 struct xrt_display_processor_d3d11 {
-    void (*process_stereo)(
+    void (*process_atlas)(
         struct xrt_display_processor_d3d11 *xdp,
         void *d3d11_context,                // ID3D11DeviceContext*
-        void *stereo_srv,                   // ID3D11ShaderResourceView* (SBS texture)
-        uint32_t view_width, view_height,
+        void *atlas_srv,                    // ID3D11ShaderResourceView* (atlas texture)
+        uint32_t view_width, view_height,   // Per-view tile dimensions
+        uint32_t tile_columns, tile_rows,   // Atlas layout
         uint32_t format,                    // DXGI_FORMAT as uint32_t
         uint32_t target_width, target_height);
     void (*destroy)(struct xrt_display_processor_d3d11 *xdp);
@@ -144,7 +147,7 @@ struct xrt_display_processor_d3d11 {
 
 Used by: `comp_d3d11_compositor.cpp`
 
-**Key differences from Vulkan:** Input is side-by-side stereo (not separate views). Output goes to currently bound render target (no framebuffer parameter). No command buffer — D3D11 is immediate-mode.
+**Key differences from Vulkan:** Input is a tiled atlas SRV (not separate VkImageViews). Output goes to currently bound render target (no framebuffer parameter). No command buffer — D3D11 is immediate-mode.
 
 ### Implementations
 
@@ -161,7 +164,7 @@ OpenGL/Vulkan app
   → Client compositor (API translation)
     → Null compositor (pass-through)
       → Multi compositor (session coordination)
-        → xrt_display_processor::process_views()
+        → xrt_display_processor::process_atlas()
           → Display output
 ```
 
@@ -169,7 +172,7 @@ OpenGL/Vulkan app
 ```
 D3D11 app
   → comp_d3d11 compositor (direct D3D11 rendering)
-    → xrt_display_processor_d3d11::process_stereo()
+    → xrt_display_processor_d3d11::process_atlas()
       → Display output
 ```
 

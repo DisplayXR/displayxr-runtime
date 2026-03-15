@@ -406,7 +406,7 @@ If Chrome WebXR shows a blank screen or crashes:
 
 ## Further Reading
 
-- `doc/extensions/` - Detailed extension documentation
+- `docs/` - Detailed extension and architecture documentation (see `docs/README.md`)
 - `test_apps/session_target_test/` - Example source code
 - `src/xrt/state_trackers/oxr/oxr_session.c` - Extension implementation
 - `src/xrt/compositor/d3d11_service/` - D3D11 service compositor implementation

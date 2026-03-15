@@ -220,6 +220,17 @@ Copy binaries to `_package/DisplayXR-macOS/bin/`. Run scripts exec from `$DIR/bi
 | cube_shared_vk_macos | `test_apps/cube_shared_vk_macos/build/cube_shared_vk_macos` | `_package/.../bin/cube_shared_vk_macos` | `run_cube_shared_vk.sh` |
 | gaussian_splatting_ext_vk_macos | `demos/gaussian_splatting_ext_vk_macos/build/gaussian_splatting_ext_vk_macos` | `_package/.../bin/gaussian_splatting_ext_vk_macos` | `run_gaussian_splatting_ext_vk.sh` |
 
+## Documentation
+
+- `docs/specs/` — Living feature and extension specs (XR_EXT_display_info, multiview tiling, etc.)
+- `docs/adr/` — Architecture Decision Records (native compositors, vendor abstraction, etc.)
+- `docs/architecture/` — System design docs (separation of concerns, spatial model, IPC design)
+- `docs/notes/` — Reference material (conventions, build guides, device notes)
+- `docs/legacy-monado/` — Inherited Monado docs (kept for reference, not actively maintained)
+- `doc/` — Monado build system docs (CHANGELOG, Doxygen config)
+
+See `docs/README.md` for a complete index.
+
 ## Debug Logs
 - Use U_LOG_W (WARN) only for one-off init, error, and lifecycle events
 - Use U_LOG_I (INFO) for recurring/throttled diagnostic logs (per-frame, per-keystroke, etc.)

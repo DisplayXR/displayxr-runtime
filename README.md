@@ -44,7 +44,7 @@ Test app naming follows the pattern `cube_{class}_{api}_{platform}`: `cube_ext_m
 | `XR_EXT_android_surface_binding` | App provides an Android Surface for rendering |
 | `XR_EXT_display_info` | Exposes physical display geometry, canonical viewing pyramid, nominal viewer position, and recommended render resolution scaling |
 
-See the [full extension proposal](doc/extensions/XR_EXT_tracked_3d_display_proposal.md) for the formal specification.
+See the [full extension proposal](docs/specs/XR_EXT_display_info.md) for the formal specification.
 
 ## Quick Start
 
@@ -175,15 +175,15 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for detailed guidelines.
 
 ### For Display Vendors
 
-If you're a display vendor looking to integrate your hardware with this runtime, see the [vendor integration guide](doc/extensions/vendor_integration_guide.md) and the [vendor abstraction refactor](doc/extensions/vendor_abstraction_refactor.md) design document.
+If you're a display vendor looking to integrate your hardware with this runtime, see the [vendor integration guide](docs/specs/vendor-integration.md).
 
 ## Key Documentation
 
-- [Extension Proposal](doc/extensions/XR_EXT_tracked_3d_display_proposal.md) — formal specification of the four proposed extensions
-- [Project Structure](doc/extensions/project_structure.md) — architecture and source tree reference
-- [Stereo 3D Math](doc/extensions/stereo3d_math.md) — Kooima projection and stereo math reference
-- [Vendor Integration Guide](doc/extensions/vendor_integration_guide.md) — how to add support for a new display vendor
-- [Vendor Abstraction Refactor](doc/extensions/vendor_abstraction_refactor.md) — architecture for multi-vendor support
+- [Extension Proposal](docs/specs/XR_EXT_display_info.md) — formal specification of the four proposed extensions
+- [Project Structure](docs/architecture/project-structure.md) — architecture and source tree reference
+- [Stereo 3D Math](docs/architecture/stereo3d-math.md) — Kooima projection and stereo math reference
+- [Vendor Integration Guide](docs/specs/vendor-integration.md) — how to add support for a new display vendor
+- [Documentation Index](docs/README.md) — complete documentation index
 
 ## License
 

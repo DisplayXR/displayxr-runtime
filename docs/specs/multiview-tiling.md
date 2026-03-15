@@ -1,0 +1,174 @@
+---
+status: Active
+owner: David Fattal
+updated: 2026-03-15
+issues: [77]
+code-paths: [src/xrt/compositor/, src/xrt/include/xrt/xrt_compositor.h]
+---
+
+# Multiview Tiling & Swapchain Model
+
+## Context
+
+The current rendering mode system uses `view_scale_x/y` as an overloaded concept -- it sizes viewports, derives tile layout implicitly (`cols = round(1/scale_x)`), and determines swapchain dimensions via a "min scale across modes" hack. Swapchain sizing is hardcoded to `display_pixel_width / 2` for stereo. This won't generalize to N-view displays (Looking Glass: 45 views, lightfield: 4-8 views).
+
+**Goal:** Replace the ad-hoc approach with an explicit tiling model where:
+1. The device provides per-mode `view_count` and `view_scale_x/y` (fraction of display per view)
+2. The runtime computes optimal tile layout, per-view pixel dims, and atlas (swapchain) size
+3. The app receives everything it needs -- no implicit derivation
+4. Swapchain is created once at init (worst-case across all modes), never reallocated
+5. GPU texture limits respected (near-square atlas)
+
+**Key invariant:** `hmd->view_count` is fixed at init to `max(mode.view_count)` across all modes. Never mutated at runtime.
+
+---
+
+## The Tiling Algorithm
+
+Given per mode: N views, `view_scale_x`, `view_scale_y`, display `D_w x D_h`:
+
+```
+V_w = D_w * scale_x          // per-view width in pixels
+V_h = D_h * scale_y          // per-view height in pixels
+C = ceil(sqrt(N * V_h / V_w)) // tile columns (prefer wider atlas for landscape)
+if C < 1 then C = 1
+if C > N then C = N
+R = ceil(N / C)                // tile rows
+S_w = C * V_w                 // atlas width for this mode
+S_h = R * V_h                 // atlas height for this mode
+```
+
+System swapchain (once at init): `max(S_w) x max(S_h)` across all modes.
+
+View i viewport: `x = (i % C) * V_w`, `y = (i / C) * V_h`, size `V_w x V_h`.
+
+### view_scale semantics
+
+`view_scale_x/y` is the **fraction of display resolution** occupied by one view:
+- **2D**: `view_scale_x=1.0, view_scale_y=1.0` -- single full-resolution view
+- **Stereo**: `view_scale_x=0.5, view_scale_y=0.5` -- each view is half-width, half-height (quarter of display pixels)
+- **N-view lightfield**: e.g. `view_scale_x=0.1, view_scale_y=0.1` -- each view is 10% of display in each dimension
+
+The tiling algorithm uses `ceil` (not `round`) for the column count, which biases toward wider (more columns) layouts. This ensures stereo with 0.5x0.5 scale produces horizontal SBS (C=2, R=1) rather than vertical stacking.
+
+### Worked examples
+
+| Device | Mode | N | scale_x x scale_y | V_w x V_h | C x R | Atlas | Notes |
+|--------|------|---|-------------------|---------|-------|-------|-------|
+| sim_display (1920x1080) | 2D | 1 | 1.0x1.0 | 1920x1080 | 1x1 | 1920x1080 | |
+| sim_display (1920x1080) | Stereo | 2 | 0.5x0.5 | 960x540 | 2x1 | 1920x540 | SBS (horizontal) |
+| sim_display (1920x1080) | Quad | 4 | 0.5x0.5 | 960x540 | 2x2 | 1920x1080 | 2x2 grid |
+| Looking Glass (2560x1600) | Multi | 45 | 0.1x0.1 | 256x160 | 6x8 | 1536x1280 | Near-square, well under 4096 |
+| Looking Glass (2560x1600) | 2D | 1 | 1.0x1.0 | 2560x1600 | 1x1 | 2560x1600 | |
+| Leia (3840x2160) | 2D | 1 | 1.0x1.0 | 3840x2160 | 1x1 | 3840x2160 | |
+| Leia (3840x2160) | Stereo | 2 | 0.5x0.5 | 1920x1080 | 2x1 | 3840x1080 | SBS (horizontal) |
+
+System swapchain for sim_display: max(1920,1920,1920) x max(1080,540,1080) = **1920x1080** (display res).
+System swapchain for Looking Glass: max(2560,1536) x max(1600,1280) = **2560x1600** (display res).
+System swapchain for Leia: max(3840,3840) x max(2160,1080) = **3840x2160** (display res).
+
+In all cases, the 2D mode (1 view at full display) dominates. The N-view modes tile smaller views that fit within.
+
+---
+
+## Implementation Status -- All Phases Complete
+
+### Phase A + C: Tiling utility + all compositors + all DP interfaces
+
+Commit `fc5f82ff1` + follow-up fixes (`febd2fd05`, `c4cd31b1e`, `735e6dfa8`, `91d32aff5`):
+
+**`u_tiling.h` created** -- header-only C utility with:
+- `u_tiling_compute_layout(N, V_w, V_h)` -> `(C, R)`
+- `u_tiling_compute_mode(mode, D_w, D_h)` -> fills tile_columns/rows, view/atlas pixel dims
+- `u_tiling_compute_system_atlas(modes[], count)` -> `(max_atlas_w, max_atlas_h)`
+- `u_tiling_view_origin(view_index, C, V_w, V_h)` -> `(x, y)`
+- `u_tiling_can_zero_copy(view_count, rects, swapchain_dims, mode)` -- zero-copy eligibility check
+
+**All display processor interfaces renamed `process_stereo` -> `process_atlas`** with generalized signatures:
+- **Vulkan** (`xrt_display_processor`): `process_atlas(atlas_view, view_width, view_height, tile_columns, tile_rows, ...)`
+- **D3D11** (`xrt_display_processor_d3d11`): `process_atlas(atlas_srv, view_width, view_height, tile_columns, tile_rows, ...)`
+- **D3D12** (`xrt_display_processor_d3d12`): `process_atlas(atlas_texture_resource, atlas_srv_gpu_handle, ..., tile_columns, tile_rows, ...)`
+- **OpenGL** (`xrt_display_processor_gl`): `process_atlas(atlas_texture, view_width, view_height, tile_columns, tile_rows, ...)`
+- **Metal** (`xrt_display_processor_metal`): `process_atlas(atlas_texture, view_width, view_height, tile_columns, tile_rows, ...)`
+
+**All compositors updated** (32 files, +1668 -1405 lines):
+- Metal, GL, D3D11, D3D12, Vulkan native compositors: tile-aware viewport layout
+- Multi-compositor: passes tile info through
+- All sim_display and Leia display processor implementations: updated to `process_atlas` signature
+
+### Phase B: Swapchain sizing
+
+- `oxr_system.c`: `recommendedImageRectWidth = displayPixelWidth * view_scale_x`, `recommendedImageRectHeight = displayPixelHeight * view_scale_y`
+- `recommended_view_scale_x = min(scaleX across all modes)` set in `target_instance.c`
+- Apps compute swapchain size as `max(tileColumns[i] * scaleX[i] * displayPixelWidth)` across all modes for width, similar for height
+- Legacy apps (no `XR_EXT_display_info`): max taken over modes 0 and 1 only; special compromise scale logic for `view_count == 2 && scaleX <= 0.5 && scaleY <= 0.5` -> uses 0.5x1.0
+- Zero-copy passthrough: when app's swapchain matches mode's atlas dimensions exactly, compositor skips atlas blit
+
+### Phase D: Extended `xrt_rendering_mode` struct
+
+`xrt_rendering_mode` in `xrt_device.h` now has:
+```c
+// Driver-provided:
+uint32_t tile_columns, tile_rows;
+// Runtime-computed (u_tiling_compute_mode fills these):
+uint32_t view_width_pixels, view_height_pixels;
+uint32_t atlas_width_pixels, atlas_height_pixels;
+```
+
+### Phase E: Extension struct update
+
+`XrDisplayRenderingModeInfoEXT` includes `tileColumns`, `tileRows`, `viewWidthPixels`, `viewHeightPixels`. Populated by `oxr_xrEnumerateDisplayRenderingModesEXT`.
+
+### Phase F: Runtime init computation
+
+In `target_instance.c`, after `display_pixel_width/height` are known:
+```c
+for (mi = 0; mi < head->rendering_mode_count; mi++)
+    u_tiling_compute_mode(&head->rendering_modes[mi], display_pixel_width, display_pixel_height);
+```
+
+### Phase G: Test apps use tiling info
+
+All test apps (macOS + Windows, ext/shared/rt classes):
+- Dynamic view count: `eyeCount = display3D ? modeViewCount : 1` (no cap at 2)
+- Tile-aware viewports: `vpX = (eye % tileColumns) * renderW`, `vpY = (eye / tileColumns) * renderH`
+- Dynamic `XrView` arrays (std::vector, not fixed [2])
+- Swapchain sizing: `max(cols * scaleX * displayW)` across all modes
+- HUD: dynamic `Eye[N]` display (replaces fixed "Eye L/R")
+- `xrEndFrame` validation: accepts mode's view_count (not hardcoded 1-or-2)
+- 1/2/3 key mode selection gated for legacy apps; HUD references removed
+
+### Phase H: N=4 quad test mode
+
+sim_display has quad mode (4 views, 2x2 tiling). Verified working end-to-end with ext_metal_macos. `xrLocateViews` returns 4 views, apps render 4 viewports in 2x2 grid, display processor receives 2x2 atlas.
+
+### Bug fixes during implementation
+
+- **GL compositor 2D freeze**: zero-copy path skipped VAO binding (`glBindVertexArray`), causing `GL_INVALID_OPERATION` in OpenGL 3.3 core profile. Fixed by binding VAO before present section.
+- **VK apps `XR_ERROR_SIZE_INSUFFICIENT`**: `XrView views[2]` too small for quad mode. Fixed to dynamic `std::vector<XrView>`.
+
+---
+
+## Verification
+
+| Phase | Test | Status |
+|-------|------|--------|
+| A+C | All compositors render identically -- CI green | DONE |
+| B | Swapchain sizes correct for all modes | DONE |
+| D | Struct fields populated correctly at init | DONE |
+| E | Extension enumeration returns new fields | DONE |
+| F | Computed tiling logged at init | DONE |
+| G | Test apps use new fields, correct visual output | DONE |
+| H | N=4 mode renders 2x2 grid correctly | DONE |
+
+## Current Code Patterns
+
+All compositors use the general tiling model:
+- **Atlas size**: `tile_columns * view_width` x `tile_rows * view_height`
+- **Per-view X offset**: `(view_index % tile_columns) * view_width`
+- **Per-view Y offset**: `(view_index / tile_columns) * view_height`
+- **2D mode**: `tile_columns=1, tile_rows=1`, single view at full size
+- **Stereo SBS**: `tile_columns=2, tile_rows=1` (from `view_scale 0.5x0.5` + ceil formula)
+- **Quad**: `tile_columns=2, tile_rows=2` (from `view_scale 0.5x0.5`, 4 views)
+
+No more stereo special case -- all view layouts handled through tiling.
