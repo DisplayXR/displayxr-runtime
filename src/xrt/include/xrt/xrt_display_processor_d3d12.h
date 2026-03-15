@@ -70,6 +70,7 @@ struct xrt_display_processor_d3d12
 	                       void *atlas_texture_resource,
 	                       uint64_t atlas_srv_gpu_handle,
 	                       uint64_t target_rtv_cpu_handle,
+	                       void *target_resource,
 	                       uint32_t view_width,
 	                       uint32_t view_height,
 	                       uint32_t tile_columns,
@@ -150,6 +151,7 @@ xrt_display_processor_d3d12_process_atlas(struct xrt_display_processor_d3d12 *xd
                                            void *atlas_texture_resource,
                                            uint64_t atlas_srv_gpu_handle,
                                            uint64_t target_rtv_cpu_handle,
+                                           void *target_resource,
                                            uint32_t view_width,
                                            uint32_t view_height,
                                            uint32_t tile_columns,
@@ -159,7 +161,8 @@ xrt_display_processor_d3d12_process_atlas(struct xrt_display_processor_d3d12 *xd
                                            uint32_t target_height)
 {
 	xdp->process_atlas(xdp, d3d12_command_list, atlas_texture_resource, atlas_srv_gpu_handle,
-	                    target_rtv_cpu_handle, view_width, view_height, tile_columns, tile_rows, format,
+	                    target_rtv_cpu_handle, target_resource,
+	                    view_width, view_height, tile_columns, tile_rows, format,
 	                    target_width, target_height);
 }
 

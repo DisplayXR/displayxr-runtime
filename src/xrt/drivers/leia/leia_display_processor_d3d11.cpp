@@ -142,23 +142,33 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 	struct leia_display_processor_d3d11_impl *ldp = leia_dp_d3d11(xdp);
 	ID3D11DeviceContext *ctx = static_cast<ID3D11DeviceContext *>(d3d11_context);
 
-	// 2D mode: bypass weaver, use weaver's internal blit shader (lens is off)
+	// 2D mode: bypass weaver entirely, copy atlas content to bound render target
 	if (ldp->view_count == 1) {
-		// Weaver in passthrough mode: lens is off (request_display_mode(false) already called),
-		// so canWeaveInternal() returns false and weaver uses blit shader.
-		// Pass full content dimensions so blit shader doesn't halve.
-		leiasr_d3d11_set_input_texture(ldp->leiasr, atlas_srv, view_width, view_height, format);
+		// Get the atlas texture from the SRV
+		ID3D11Resource *atlas_resource = NULL;
+		static_cast<ID3D11ShaderResourceView *>(atlas_srv)->GetResource(&atlas_resource);
 
-		D3D11_VIEWPORT viewport = {};
-		viewport.TopLeftX = 0.0f;
-		viewport.TopLeftY = 0.0f;
-		viewport.Width = static_cast<float>(target_width);
-		viewport.Height = static_cast<float>(target_height);
-		viewport.MinDepth = 0.0f;
-		viewport.MaxDepth = 1.0f;
-		ctx->RSSetViewports(1, &viewport);
+		// Get the bound render target
+		ID3D11RenderTargetView *rtv = NULL;
+		ctx->OMGetRenderTargets(1, &rtv, NULL);
 
-		leiasr_d3d11_weave(ldp->leiasr);
+		if (atlas_resource != NULL && rtv != NULL) {
+			ID3D11Resource *target_resource = NULL;
+			rtv->GetResource(&target_resource);
+
+			if (target_resource != NULL) {
+				// Copy the content region (single view tile) to the target
+				uint32_t copy_w = view_width < target_width ? view_width : target_width;
+				uint32_t copy_h = view_height < target_height ? view_height : target_height;
+				D3D11_BOX src_box = {0, 0, 0, copy_w, copy_h, 1};
+				ctx->CopySubresourceRegion(target_resource, 0, 0, 0, 0,
+				                           atlas_resource, 0, &src_box);
+				target_resource->Release();
+			}
+		}
+
+		if (rtv != NULL) rtv->Release();
+		if (atlas_resource != NULL) atlas_resource->Release();
 		return;
 	}
 

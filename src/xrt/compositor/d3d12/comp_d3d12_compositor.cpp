@@ -795,6 +795,7 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			    atlas_resource,
 			    0,  // SRV GPU handle — SR weaver uses setInputViewTexture instead
 			    rtv_handle.ptr,
+			    back_buffer,
 			    view_width, view_height,
 			    tile_columns, tile_rows,
 			    static_cast<uint32_t>(DXGI_FORMAT_R8G8B8A8_UNORM),

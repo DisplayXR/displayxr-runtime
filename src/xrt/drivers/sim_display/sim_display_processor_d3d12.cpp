@@ -209,6 +209,7 @@ sim_dp_d3d12_process_atlas(struct xrt_display_processor_d3d12 *xdp,
                              void *atlas_texture_resource,
                              uint64_t atlas_srv_gpu_handle,
                              uint64_t target_rtv_cpu_handle,
+                             void *target_resource,
                              uint32_t view_width,
                              uint32_t view_height,
                              uint32_t tile_columns,
@@ -217,6 +218,7 @@ sim_dp_d3d12_process_atlas(struct xrt_display_processor_d3d12 *xdp,
                              uint32_t target_width,
                              uint32_t target_height)
 {
+	(void)target_resource; // sim_display uses target_rtv_cpu_handle via render pass
 	struct sim_display_processor_d3d12_impl *sdp = sim_dp_d3d12(xdp);
 	ID3D12GraphicsCommandList *cmd_list = static_cast<ID3D12GraphicsCommandList *>(d3d12_command_list);
 	ID3D12Resource *atlas_res = static_cast<ID3D12Resource *>(atlas_texture_resource);

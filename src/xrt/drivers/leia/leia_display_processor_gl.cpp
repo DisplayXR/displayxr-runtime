@@ -46,6 +46,7 @@ struct leia_display_processor_gl_impl
 	GLenum sbs_format;     //!< Current staging texture format.
 	//! @}
 
+	GLuint read_fbo;     //!< Cached read FBO for 2D blit path.
 	uint32_t view_count; //!< Active mode view count (1=2D, 2=stereo).
 };
 
@@ -111,11 +112,22 @@ leia_dp_gl_process_atlas(struct xrt_display_processor_gl *xdp,
 {
 	struct leia_display_processor_gl_impl *ldp = leia_dp_gl(xdp);
 
-	// 2D mode: bypass weaver, use weaver's internal blit shader (lens is off)
+	// 2D mode: bypass weaver, blit atlas content directly via glBlitFramebuffer
 	if (ldp->view_count == 1) {
-		leiasr_gl_set_input_texture(ldp->leiasr, atlas_texture, view_width, view_height, format);
-		glViewport(0, 0, target_width, target_height);
-		leiasr_gl_weave(ldp->leiasr);
+		// Lazily create the read FBO
+		if (ldp->read_fbo == 0) {
+			glGenFramebuffers(1, &ldp->read_fbo);
+		}
+		// Bind atlas to a temporary read FBO
+		glBindFramebuffer(GL_READ_FRAMEBUFFER, ldp->read_fbo);
+		glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+		                       GL_TEXTURE_2D, atlas_texture, 0);
+		// Blit content region (single view) to full draw framebuffer
+		glBlitFramebuffer(0, 0, (GLint)view_width, (GLint)view_height,
+		                  0, 0, (GLint)target_width, (GLint)target_height,
+		                  GL_COLOR_BUFFER_BIT, GL_LINEAR);
+		// Restore read framebuffer
+		glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
 		return;
 	}
 
@@ -238,6 +250,9 @@ leia_dp_gl_destroy(struct xrt_display_processor_gl *xdp)
 {
 	struct leia_display_processor_gl_impl *ldp = leia_dp_gl(xdp);
 
+	if (ldp->read_fbo != 0) {
+		glDeleteFramebuffers(1, &ldp->read_fbo);
+	}
 	if (ldp->sbs_texture != 0) {
 		glDeleteTextures(1, &ldp->sbs_texture);
 	}
