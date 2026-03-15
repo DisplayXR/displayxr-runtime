@@ -384,8 +384,10 @@ leiasr_weave(struct leiasr *leiasr,
 	                          : leiasr->commandBuffer;
 	leiasr->weaver->setCommandBuffer(cmd);
 	leiasr->weaver->setInputViewTexture(leftImageView, rightImageView, imageWidth, imageHeight, imageFormat);
-	// Only override the output framebuffer if one is provided.
-	// VK_NULL_HANDLE means the weaver should use its own internal swapchain.
+	// Set the output framebuffer for weaving. The weaver renders to the
+	// application-provided framebuffer — it does not manage its own swapchain.
+	// VK_NULL_HANDLE is only valid if setOutputFrameBuffer was called on a
+	// prior frame and the framebuffer hasn't changed.
 	if (framebuffer != VK_NULL_HANDLE) {
 		leiasr->weaver->setOutputFrameBuffer(framebuffer, framebufferWidth, framebufferHeight, framebufferFormat);
 	}
