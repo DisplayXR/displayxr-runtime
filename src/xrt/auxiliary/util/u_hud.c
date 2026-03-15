@@ -604,11 +604,13 @@ u_hud_update(struct u_hud *hud, const struct u_hud_data *data)
 	snprintf(buf, sizeof(buf), "%.0f x %.0f mm", data->display_width_mm, data->display_height_mm);
 	y += draw_label_value(hud, x, y, "Display ", buf);
 
-	snprintf(buf, sizeof(buf), "%.0f, %.0f, %.0f mm", data->left_eye_x, data->left_eye_y, data->left_eye_z);
-	y += draw_label_value(hud, x, y, "L Eye   ", buf);
-
-	snprintf(buf, sizeof(buf), "%.0f, %.0f, %.0f mm", data->right_eye_x, data->right_eye_y, data->right_eye_z);
-	y += draw_label_value(hud, x, y, "R Eye   ", buf);
+	for (uint32_t e = 0; e < data->eye_count && e < 8; e++) {
+		char label[16];
+		snprintf(label, sizeof(label), "Eye[%u]  ", e);
+		snprintf(buf, sizeof(buf), "%.0f, %.0f, %.0f mm",
+		         data->eyes[e].x, data->eyes[e].y, data->eyes[e].z);
+		y += draw_label_value(hud, x, y, label, buf);
+	}
 
 	// --- Separator ---
 	draw_hline(hud, sep_x0, sep_x1, y - hud->font.ascent + 2 * s, COLOR_SEP);

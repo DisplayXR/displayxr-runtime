@@ -2291,8 +2291,7 @@ static void
 d3d11_service_render_hud(struct d3d11_service_system *sys,
                           struct d3d11_client_render_resources *res,
                           bool weaving_done,
-                          const struct xrt_vec3 *left_eye,
-                          const struct xrt_vec3 *right_eye)
+                          const struct xrt_eye_positions *eye_pos)
 {
 	if (!res->owns_window || res->hud == NULL || !u_hud_is_visible()) {
 		return;
@@ -2363,13 +2362,21 @@ d3d11_service_render_hud(struct d3d11_service_system *sys,
 	data.nominal_x = nom_x;
 	data.nominal_y = nom_y;
 	data.nominal_z = nom_z;
-	data.left_eye_x = left_eye->x * 1000.0f;
-	data.left_eye_y = left_eye->y * 1000.0f;
-	data.left_eye_z = left_eye->z * 1000.0f;
-	data.right_eye_x = right_eye->x * 1000.0f;
-	data.right_eye_y = right_eye->y * 1000.0f;
-	data.right_eye_z = right_eye->z * 1000.0f;
-	data.eye_tracking_active = (left_eye->z != 0.6f || right_eye->z != 0.6f);
+	data.eye_count = eye_pos->count;
+	for (uint32_t e = 0; e < eye_pos->count && e < 8; e++) {
+		data.eyes[e].x = eye_pos->eyes[e].x * 1000.0f;
+		data.eyes[e].y = eye_pos->eyes[e].y * 1000.0f;
+		data.eyes[e].z = eye_pos->eyes[e].z * 1000.0f;
+	}
+	data.eye_tracking_active = eye_pos->is_tracking;
+
+	// Clamp eye count to active mode's view_count (2D=1 eye at midpoint, stereo=2, quad=4)
+	if (sys->xdev != NULL && sys->xdev->hmd != NULL) {
+		uint32_t idx = sys->xdev->hmd->active_rendering_mode_index;
+		if (idx < sys->xdev->rendering_mode_count) {
+			u_hud_data_clamp_eyes(&data, sys->xdev->rendering_modes[idx].view_count);
+		}
+	}
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
 	if (sys->xsysd != nullptr) {
@@ -2694,22 +2701,22 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 #endif
 
 	// Get predicted eye positions (used for UI layers and HUD)
-	struct xrt_vec3 left_eye = {-0.032f, 0.0f, 0.6f};   // Default: 64mm IPD, 60cm from screen
-	struct xrt_vec3 right_eye = {0.032f, 0.0f, 0.6f};
+	struct xrt_eye_positions eye_pos = {};
 	bool weaving_done = false;
 
 	if (c->render.display_processor != nullptr) {
-		struct xrt_eye_positions eyes;
-		if (xrt_display_processor_d3d11_get_predicted_eye_positions(
-		        c->render.display_processor, &eyes) && eyes.valid) {
-			left_eye.x = eyes.eyes[0].x;
-			left_eye.y = eyes.eyes[0].y;
-			left_eye.z = eyes.eyes[0].z;
-			right_eye.x = eyes.eyes[1].x;
-			right_eye.y = eyes.eyes[1].y;
-			right_eye.z = eyes.eyes[1].z;
-		}
+		xrt_display_processor_d3d11_get_predicted_eye_positions(
+		    c->render.display_processor, &eye_pos);
 	}
+	if (!eye_pos.valid) {
+		eye_pos.count = 2;
+		eye_pos.eyes[0] = {-0.032f, 0.0f, 0.6f};
+		eye_pos.eyes[1] = { 0.032f, 0.0f, 0.6f};
+	}
+
+	// Extract stereo pair for renderer (display processor still needs L/R)
+	struct xrt_vec3 left_eye = {eye_pos.eyes[0].x, eye_pos.eyes[0].y, eye_pos.eyes[0].z};
+	struct xrt_vec3 right_eye = {eye_pos.eyes[1].x, eye_pos.eyes[1].y, eye_pos.eyes[1].z};
 
 	// Pre-compute whether there are UI overlay layers (quad/cylinder/equirect/cube).
 	// Needed to decide if same-swapchain SBS can bypass the stereo texture entirely.
@@ -3282,7 +3289,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	}
 
 	// Render HUD overlay (post-weave, pre-present)
-	d3d11_service_render_hud(sys, &c->render, weaving_done, &left_eye, &right_eye);
+	d3d11_service_render_hud(sys, &c->render, weaving_done, &eye_pos);
 
 	// Present to display
 	if (c->render.swap_chain) {

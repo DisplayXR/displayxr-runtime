@@ -58,8 +58,13 @@ struct u_hud_data
 	float display_width_mm;
 	float display_height_mm;
 	float nominal_x, nominal_y, nominal_z;         //!< Display nominal position (mm)
-	float left_eye_x, left_eye_y, left_eye_z;      //!< Left eye position (mm)
-	float right_eye_x, right_eye_y, right_eye_z;   //!< Right eye position (mm)
+
+	//! Per-view eye positions in mm (from device tracking API).
+	//! Only eye_count entries are valid; matches active rendering mode view_count.
+	struct {
+		float x, y, z;
+	} eyes[8];
+	uint32_t eye_count;                            //!< Number of valid eye positions (1, 2, 4, etc.)
 	bool eye_tracking_active;
 	float zoom_scale;                               //!< Zoom factor (1.0 = no zoom)
 	float vdisp_x, vdisp_y, vdisp_z;               //!< Virtual display position (m)
@@ -77,6 +82,25 @@ struct u_hud_data
 	float nominal_viewer_z;          //!< Hardware: nominal viewer distance (m)
 	float screen_height_m;           //!< Hardware: screen height (m)
 };
+
+/*!
+ * Clamp eye positions to match the active rendering mode's view_count.
+ * For 2D mode (view_count=1), averages L/R into a single eye.
+ * @ingroup aux_util
+ */
+static inline void
+u_hud_data_clamp_eyes(struct u_hud_data *data, uint32_t mode_view_count)
+{
+	if (data->eye_count <= mode_view_count || mode_view_count == 0) {
+		return;
+	}
+	if (mode_view_count == 1 && data->eye_count >= 2) {
+		data->eyes[0].x = (data->eyes[0].x + data->eyes[1].x) * 0.5f;
+		data->eyes[0].y = (data->eyes[0].y + data->eyes[1].y) * 0.5f;
+		data->eyes[0].z = (data->eyes[0].z + data->eyes[1].z) * 0.5f;
+	}
+	data->eye_count = mode_view_count;
+}
 
 struct u_hud;
 
