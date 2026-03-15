@@ -46,6 +46,7 @@ struct leia_display_processor
 	VkFormat sbs_format;        //!< Current staging image format.
 	//! @}
 
+	VkRenderPass render_pass;   //!< Render pass for framebuffer compatibility.
 	uint32_t view_count; //!< Active mode view count (1=2D, 2=stereo).
 };
 
@@ -328,6 +329,13 @@ leia_dp_get_display_pixel_info(struct xrt_display_processor *xdp,
 	                                     out_screen_top, &w_m, &h_m);
 }
 
+static VkRenderPass
+leia_dp_get_render_pass(struct xrt_display_processor *xdp)
+{
+	struct leia_display_processor *ldp = leia_display_processor(xdp);
+	return ldp->render_pass;
+}
+
 static void
 leia_dp_destroy(struct xrt_display_processor *xdp)
 {
@@ -335,6 +343,9 @@ leia_dp_destroy(struct xrt_display_processor *xdp)
 	struct vk_bundle *vk = ldp->vk;
 
 	if (vk != NULL) {
+		if (ldp->render_pass != VK_NULL_HANDLE) {
+			vk->vkDestroyRenderPass(vk->device, ldp->render_pass, NULL);
+		}
 		if (ldp->sbs_view != VK_NULL_HANDLE) {
 			vk->vkDestroyImageView(vk->device, ldp->sbs_view, NULL);
 		}
@@ -364,8 +375,6 @@ leia_dp_factory_vk(void *vk_bundle_ptr,
                    int32_t target_format,
                    struct xrt_display_processor **out_xdp)
 {
-	(void)target_format; // unused by SR weaver
-
 	// Extract Vulkan handles from vk_bundle.
 	struct vk_bundle *vk = (struct vk_bundle *)vk_bundle_ptr;
 
@@ -383,7 +392,47 @@ leia_dp_factory_vk(void *vk_bundle_ptr,
 		return XRT_ERROR_ALLOCATION;
 	}
 
+	// Create a render pass compatible with the SR weaver's output.
+	// The weaver renders to a single color attachment (no depth).
+	// Use the target_format passed by the compositor, or B8G8R8A8_UNORM as default.
+	VkFormat rp_format = (target_format != 0) ? (VkFormat)target_format : VK_FORMAT_B8G8R8A8_UNORM;
+	VkAttachmentDescription color_attachment = {
+	    .format = rp_format,
+	    .samples = VK_SAMPLE_COUNT_1_BIT,
+	    .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+	    .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+	    .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+	    .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+	    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+	    .finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+	};
+	VkAttachmentReference color_ref = {
+	    .attachment = 0,
+	    .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	};
+	VkSubpassDescription subpass = {
+	    .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
+	    .colorAttachmentCount = 1,
+	    .pColorAttachments = &color_ref,
+	};
+	VkRenderPassCreateInfo rp_info = {
+	    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+	    .attachmentCount = 1,
+	    .pAttachments = &color_attachment,
+	    .subpassCount = 1,
+	    .pSubpasses = &subpass,
+	};
+	VkRenderPass render_pass = VK_NULL_HANDLE;
+	VkResult vk_ret = vk->vkCreateRenderPass(vk->device, &rp_info, NULL, &render_pass);
+	if (vk_ret != VK_SUCCESS) {
+		U_LOG_E("Leia VK DP: failed to create render pass: %d", vk_ret);
+		leiasr_destroy(leiasr);
+		free(ldp);
+		return XRT_ERROR_VULKAN;
+	}
+
 	ldp->base.process_atlas = leia_dp_process_atlas;
+	ldp->base.get_render_pass = leia_dp_get_render_pass;
 	ldp->base.get_predicted_eye_positions = leia_dp_get_predicted_eye_positions;
 	ldp->base.get_window_metrics = leia_dp_get_window_metrics;
 	ldp->base.request_display_mode = leia_dp_request_display_mode;
@@ -393,11 +442,13 @@ leia_dp_factory_vk(void *vk_bundle_ptr,
 
 	ldp->leiasr = leiasr;
 	ldp->vk = vk;
+	ldp->render_pass = render_pass;
 	ldp->view_count = 2;
 
 	*out_xdp = &ldp->base;
 
-	U_LOG_W("Created Leia SR display processor (factory, owns weaver)");
+	U_LOG_W("Created Leia SR display processor (factory, owns weaver, render_pass=%p)",
+	        (void *)render_pass);
 
 	return XRT_SUCCESS;
 }
