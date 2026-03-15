@@ -150,12 +150,81 @@ leia_dp_process_atlas(struct xrt_display_processor *xdp,
                       uint32_t tile_rows,
                       VkFormat_XDP view_format,
                       VkFramebuffer target_fb,
+                      VkImage_XDP target_image,
                       uint32_t target_width,
                       uint32_t target_height,
                       VkFormat_XDP target_format)
 {
 	struct leia_display_processor *ldp = leia_display_processor(xdp);
 	struct vk_bundle *vk = ldp->vk;
+
+	// 2D mode: bypass weaver, blit atlas content directly to target
+	if (ldp->view_count == 1 && target_image != (VkImage_XDP)VK_NULL_HANDLE) {
+		// Barrier: atlas SHADER_READ → TRANSFER_SRC, target COLOR_ATTACHMENT → TRANSFER_DST
+		VkImageMemoryBarrier pre[2] = {
+		    {
+		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		        .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
+		        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+		        .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		        .image = (VkImage)atlas_image,
+		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+		    },
+		    {
+		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		        .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+		        .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+		        .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		        .image = (VkImage)target_image,
+		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+		    },
+		};
+		vk->vkCmdPipelineBarrier(cmd_buffer,
+		    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		    VK_PIPELINE_STAGE_TRANSFER_BIT,
+		    0, 0, NULL, 0, NULL, 2, pre);
+
+		// Blit atlas content region (single view) to full target
+		VkImageBlit blit = {
+		    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+		    .srcOffsets = {{0, 0, 0}, {(int32_t)view_width, (int32_t)view_height, 1}},
+		    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+		    .dstOffsets = {{0, 0, 0}, {(int32_t)target_width, (int32_t)target_height, 1}},
+		};
+		vk->vkCmdBlitImage(cmd_buffer,
+		    (VkImage)atlas_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		    (VkImage)target_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		    1, &blit, VK_FILTER_LINEAR);
+
+		// Barrier: restore atlas → SHADER_READ, target → COLOR_ATTACHMENT_OPTIMAL
+		VkImageMemoryBarrier post[2] = {
+		    {
+		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		        .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+		        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+		        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		        .image = (VkImage)atlas_image,
+		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+		    },
+		    {
+		        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+		        .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT,
+		        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		        .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		        .image = (VkImage)target_image,
+		        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+		    },
+		};
+		vk->vkCmdPipelineBarrier(cmd_buffer,
+		    VK_PIPELINE_STAGE_TRANSFER_BIT,
+		    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		    0, 0, NULL, 0, NULL, 2, post);
+		return;
+	}
 
 	VkImageView weaver_view = atlas_view;
 

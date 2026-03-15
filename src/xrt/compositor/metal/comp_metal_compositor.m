@@ -1518,9 +1518,9 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		[encoder endEncoding];
 	}
 
-	// Step 2: Blit stereo texture to drawable (or process through display processor)
+	// Step 2: Process atlas through display processor, or simple blit fallback
 	id<MTLTexture> atlas_src = zero_copy ? zc_texture : c->atlas_texture;
-	if (c->hardware_display_3d && c->display_processor != NULL && atlas_src != nil) {
+	if (c->display_processor != NULL && atlas_src != nil) {
 		xrt_display_processor_metal_process_atlas(
 		    c->display_processor,
 		    (__bridge void *)cmd_buf,
@@ -1534,7 +1534,7 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		    (uint32_t)output_texture.width,
 		    (uint32_t)output_texture.height);
 	} else {
-		// No display processor or 2D mode: simple blit passthrough.
+		// No display processor: simple blit passthrough.
 		MTLRenderPassDescriptor *blit_pass = [MTLRenderPassDescriptor renderPassDescriptor];
 		blit_pass.colorAttachments[0].texture = output_texture;
 		blit_pass.colorAttachments[0].loadAction = MTLLoadActionClear;

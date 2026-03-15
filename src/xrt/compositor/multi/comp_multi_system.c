@@ -2581,7 +2581,9 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 			    tile_columns,                       // tile layout columns
 			    tile_rows,                          // tile layout rows
 			    (VkFormat_XDP)imageFormat,
-			    framebuffer, framebufferWidth, framebufferHeight,
+			    framebuffer,
+			    (VkImage_XDP)ct->images[buffer_index].handle,
+			    framebufferWidth, framebufferHeight,
 			    (VkFormat_XDP)framebufferFormat);
 
 			// Post-weave barrier: target → PRESENT_SRC_KHR (for HUD overlay + present)

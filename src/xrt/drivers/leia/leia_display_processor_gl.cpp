@@ -111,6 +111,14 @@ leia_dp_gl_process_atlas(struct xrt_display_processor_gl *xdp,
 {
 	struct leia_display_processor_gl_impl *ldp = leia_dp_gl(xdp);
 
+	// 2D mode: bypass weaver, use weaver's internal blit shader (lens is off)
+	if (ldp->view_count == 1) {
+		leiasr_gl_set_input_texture(ldp->leiasr, atlas_texture, view_width, view_height, format);
+		glViewport(0, 0, target_width, target_height);
+		leiasr_gl_weave(ldp->leiasr);
+		return;
+	}
+
 	uint32_t weaver_texture = atlas_texture;
 
 	// If atlas is already SBS (tile_columns=2, tile_rows=1), pass directly.

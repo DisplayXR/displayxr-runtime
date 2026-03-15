@@ -91,6 +91,7 @@ struct xrt_display_processor
 	 * @param      tile_rows        Number of tile rows in the atlas layout.
 	 * @param      view_format      Vulkan format of the atlas texture.
 	 * @param      target_fb        Target framebuffer to render into.
+	 * @param      target_image     Target VkImage handle (for blit/copy ops).
 	 * @param      target_width     Width of the target framebuffer in pixels.
 	 * @param      target_height    Height of the target framebuffer in pixels.
 	 * @param      target_format    Vulkan format of the target framebuffer.
@@ -105,6 +106,7 @@ struct xrt_display_processor
 	                      uint32_t tile_rows,
 	                      VkFormat_XDP view_format,
 	                      VkFramebuffer target_fb,
+	                      VkImage_XDP target_image,
 	                      uint32_t target_width,
 	                      uint32_t target_height,
 	                      VkFormat_XDP target_format);
@@ -211,6 +213,7 @@ xrt_display_processor_process_atlas(struct xrt_display_processor *xdp,
                                     uint32_t tile_rows,
                                     VkFormat_XDP view_format,
                                     VkFramebuffer target_fb,
+                                    VkImage_XDP target_image,
                                     uint32_t target_width,
                                     uint32_t target_height,
                                     VkFormat_XDP target_format)
@@ -219,6 +222,7 @@ xrt_display_processor_process_atlas(struct xrt_display_processor *xdp,
 	                   view_width, view_height,
 	                   tile_columns, tile_rows,
 	                   view_format, target_fb,
+	                   target_image,
 	                   target_width, target_height,
 	                   target_format);
 }

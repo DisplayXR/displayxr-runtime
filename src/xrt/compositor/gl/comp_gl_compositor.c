@@ -1127,7 +1127,7 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
 			                        c->shared_gl_texture, 0);
 
-			if (c->hardware_display_3d && c->display_processor != NULL) {
+			if (c->display_processor != NULL) {
 				// Display processor handles stereo-to-display conversion
 				glViewport(0, 0, c->shared_width, c->shared_height);
 				xrt_display_processor_gl_process_atlas(
@@ -1141,7 +1141,7 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				    c->shared_width,
 				    c->shared_height);
 			} else {
-				// 2D mode or no display processor: simple blit
+				// No display processor: simple blit
 				glViewport(0, 0, c->shared_width, c->shared_height);
 				glUseProgram(c->program_blit);
 				glBindVertexArray(c->vao_empty);
@@ -1177,7 +1177,7 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
 		                        GL_TEXTURE_RECTANGLE, c->iosurface_gl_texture, 0);
 
-		if (c->hardware_display_3d && c->display_processor != NULL) {
+		if (c->display_processor != NULL) {
 			// Display processor renders directly into the IOSurface FBO.
 			// Output is GL bottom-up; app's blit shader must NOT flip Y.
 			glViewport(0, 0, c->iosurface_width, c->iosurface_height);
@@ -1192,7 +1192,7 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			    c->iosurface_width,
 			    c->iosurface_height);
 		} else {
-			// 2D mode or no display processor: simple blit, no Y-flip.
+			// No display processor: simple blit, no Y-flip.
 			// Content stays GL bottom-up; app's blit shader must NOT flip Y.
 			glViewport(0, 0, c->iosurface_width, c->iosurface_height);
 			glUseProgram(c->program_blit);
@@ -1243,7 +1243,7 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 		comp_gl_window_macos_get_dimensions(c->macos_window, &present_w, &present_h);
 #endif
 
-		if (c->hardware_display_3d && c->display_processor != NULL) {
+		if (c->display_processor != NULL) {
 			// Display processor handles the stereo-to-display conversion
 			glViewport(0, 0, present_w, present_h);
 			xrt_display_processor_gl_process_atlas(
@@ -1257,7 +1257,7 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			    present_w,
 			    present_h);
 		} else {
-			// Simple blit (2D mode or no display processor)
+			// No display processor: simple blit
 			glViewport(0, 0, present_w, present_h);
 			glUseProgram(c->program_blit);
 			GLint loc_rect = glGetUniformLocation(c->program_blit, "u_src_rect");

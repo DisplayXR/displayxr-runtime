@@ -142,6 +142,26 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 	struct leia_display_processor_d3d11_impl *ldp = leia_dp_d3d11(xdp);
 	ID3D11DeviceContext *ctx = static_cast<ID3D11DeviceContext *>(d3d11_context);
 
+	// 2D mode: bypass weaver, use weaver's internal blit shader (lens is off)
+	if (ldp->view_count == 1) {
+		// Weaver in passthrough mode: lens is off (request_display_mode(false) already called),
+		// so canWeaveInternal() returns false and weaver uses blit shader.
+		// Pass full content dimensions so blit shader doesn't halve.
+		leiasr_d3d11_set_input_texture(ldp->leiasr, atlas_srv, view_width, view_height, format);
+
+		D3D11_VIEWPORT viewport = {};
+		viewport.TopLeftX = 0.0f;
+		viewport.TopLeftY = 0.0f;
+		viewport.Width = static_cast<float>(target_width);
+		viewport.Height = static_cast<float>(target_height);
+		viewport.MinDepth = 0.0f;
+		viewport.MaxDepth = 1.0f;
+		ctx->RSSetViewports(1, &viewport);
+
+		leiasr_d3d11_weave(ldp->leiasr);
+		return;
+	}
+
 	void *weaver_srv = atlas_srv;
 	uint32_t weaver_view_width = view_width;
 

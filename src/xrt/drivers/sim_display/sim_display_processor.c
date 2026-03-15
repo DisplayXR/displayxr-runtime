@@ -96,11 +96,13 @@ sim_dp_process_atlas(struct xrt_display_processor *xdp,
                      uint32_t tile_rows,
                      VkFormat_XDP view_format,
                      VkFramebuffer target_fb,
+                     VkImage_XDP target_image,
                      uint32_t target_width,
                      uint32_t target_height,
                      VkFormat_XDP target_format)
 {
 	(void)atlas_image; // sim_display uses atlas_view via shader sampling
+	(void)target_image; // sim_display uses target_fb via render pass
 	struct sim_display_processor *sdp = sim_display_processor(xdp);
 	struct vk_bundle *vk = sdp->vk;
 

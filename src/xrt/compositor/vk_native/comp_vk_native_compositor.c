@@ -1562,6 +1562,7 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			    tc, tr,
 			    (VkFormat_XDP)view_format,
 			    shared_fb,
+			    (VkImage_XDP)c->shared_image,
 			    tgt_width, tgt_height,
 			    (VkFormat_XDP)view_format);
 
@@ -1708,6 +1709,7 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				    tc, tr,
 				    (VkFormat_XDP)view_format,
 				    target_fb,
+				    (VkImage_XDP)(uintptr_t)target_image,
 				    tgt_width, tgt_height,
 				    (VkFormat_XDP)VK_FORMAT_B8G8R8A8_UNORM);
 
