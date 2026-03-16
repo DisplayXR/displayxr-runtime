@@ -80,6 +80,10 @@ Legacy app compromise scaling is computed in `oxr_system_fill_in()` — see `doc
 - Compositor vtable has 56 methods — use `comp_base` helper for boilerplate
 - IPC/service mode (`ipc/`, `compositor/client/`, `compositor/multi/`) must be preserved for `_ipc` apps, WebXR, and multi-app spatial shell
 - `compositor/null/` — headless compositor for testing
+- Swapchain images are runtime-allocated (xrCreateSwapchain), worst-case sized at init.
+  Per-frame atlas (tile_columns * view_width × tile_rows * view_height) is smaller.
+  Compositors must crop valid region before passing to DP.
+  See docs/specs/multiview-tiling.md "Compositor-Side Contract" section.
 
 For the vendor isolation rule and layer "must NOT contain" constraints, see `docs/architecture/separation-of-concerns.md`.
 For display processor vtable design (all 5 API variants), see `docs/specs/vendor-integration.md`.

@@ -627,3 +627,50 @@ comp_d3d12_renderer_get_atlas_resource(struct comp_d3d12_renderer *renderer)
 {
 	return renderer->atlas_texture;
 }
+
+extern "C" xrt_result_t
+comp_d3d12_renderer_resize(struct comp_d3d12_renderer *renderer,
+                           uint32_t new_view_width,
+                           uint32_t new_view_height,
+                           uint32_t new_target_height)
+{
+	if (renderer == nullptr) {
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+
+	if (new_view_width < 64) {
+		new_view_width = 64;
+	}
+	if (new_view_height < 64) {
+		new_view_height = 64;
+	}
+
+	uint32_t atlas_h = renderer->tile_rows * new_view_height;
+	uint32_t min_h = (new_target_height > atlas_h) ? new_target_height : atlas_h;
+	uint32_t new_texture_height = (min_h > new_view_height) ? min_h : new_view_height;
+
+	if (new_view_width == renderer->view_width &&
+	    new_view_height == renderer->view_height &&
+	    new_texture_height == renderer->texture_height) {
+		return XRT_SUCCESS;
+	}
+
+	U_LOG_W("D3D12 renderer resize: view %ux%u -> %ux%u, tex_h %u -> %u",
+	        renderer->view_width, renderer->view_height,
+	        new_view_width, new_view_height,
+	        renderer->texture_height, new_texture_height);
+
+	// Release existing atlas texture
+	if (renderer->atlas_texture != nullptr) {
+		renderer->atlas_texture->Release();
+		renderer->atlas_texture = nullptr;
+	}
+
+	renderer->view_width = new_view_width;
+	renderer->view_height = new_view_height;
+	renderer->texture_height = new_texture_height;
+
+	// Recreate atlas texture with new dimensions
+	auto internals = get_internals(renderer->c);
+	return create_atlas_texture(renderer, internals->device, new_view_width, new_texture_height);
+}

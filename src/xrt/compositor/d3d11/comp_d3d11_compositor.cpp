@@ -895,6 +895,27 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		comp_d3d11_target_get_dimensions(c->target, &tgt_width, &tgt_height);
 	}
 
+	// Sync renderer view dims from active mode — set_tile_layout derives
+	// view dims from atlas invariance, but actual mode dims may differ
+	// (e.g. 2D mode needs full display height). Resize if needed.
+	if (c->xdev != NULL && c->xdev->hmd != NULL && c->renderer != NULL) {
+		uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
+		if (idx < c->xdev->rendering_mode_count) {
+			const struct xrt_rendering_mode *mode = &c->xdev->rendering_modes[idx];
+			if (mode->view_width_pixels > 0) {
+				uint32_t cur_vw, cur_vh;
+				comp_d3d11_renderer_get_view_dimensions(c->renderer, &cur_vw, &cur_vh);
+				if (cur_vw != mode->view_width_pixels || cur_vh != mode->view_height_pixels) {
+					comp_d3d11_renderer_resize(
+					    c->renderer,
+					    mode->view_width_pixels,
+					    mode->view_height_pixels,
+					    tgt_height);
+				}
+			}
+		}
+	}
+
 	// Zero-copy check: can we pass the app's swapchain directly to the DP?
 	bool zero_copy = false;
 	void *zc_srv = nullptr;

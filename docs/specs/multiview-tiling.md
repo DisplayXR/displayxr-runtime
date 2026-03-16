@@ -172,3 +172,41 @@ All compositors use the general tiling model:
 - **Quad**: `tile_columns=2, tile_rows=2` (from `view_scale 0.5x0.5`, 4 views)
 
 No more stereo special case -- all view layouts handled through tiling.
+
+## Compositor-Side Contract: Swapchain → Crop → Display Processor
+
+### Swapchain images are worst-case sized
+
+Swapchain images are runtime-allocated (via `xrCreateSwapchain`) and **fixed at init** to the worst-case dimensions across all rendering modes:
+
+```
+swapchain_width  = max(tile_columns[i] * view_width[i])  across all modes i
+swapchain_height = max(tile_rows[i] * view_height[i])    across all modes i
+```
+
+This is computed by `u_tiling_compute_system_atlas()`. In practice, the 2D mode (1 view at full display resolution) typically dominates, making the swapchain equal to the display resolution.
+
+### Per-frame atlas is typically smaller
+
+Each frame, the app renders into a **content region** determined by the active rendering mode:
+
+```
+content_width  = tile_columns * view_width    (for active mode)
+content_height = tile_rows * view_height      (for active mode)
+```
+
+In stereo mode (e.g., 2×1 tiles at half-height views), the content region is smaller than the swapchain. The content occupies the top-left corner of the swapchain image.
+
+### Compositors must crop before passing to the DP
+
+The display processor (DP) has **no knowledge of swapchain dimensions** — it expects a texture whose dimensions match the content exactly. Every compositor must:
+
+1. Compute `content_w = tile_columns * view_width` and `content_h = tile_rows * view_height`
+2. If `content_w == atlas_tex_width && content_h == atlas_tex_height`: pass the atlas directly (no copy needed — this is the common case for 2D mode)
+3. If content is smaller than the atlas: **blit/copy** the valid content region `(0, 0, content_w, content_h)` into a correctly-sized intermediate texture, then pass that to the DP
+
+This crop step is performed lazily — the intermediate texture is only created when content dims differ from atlas dims, and is recreated when content dims change (e.g., on mode switch).
+
+### Why the DP can't just be told the content region
+
+The DP's `process_atlas()` already receives `view_width`, `view_height`, `tile_columns`, `tile_rows` — but many DP implementations (e.g., LeiaSR weaver) use the **texture dimensions** to set up their internal rendering pipeline. If the texture is larger than the content, the DP samples padding/garbage from the unused region.

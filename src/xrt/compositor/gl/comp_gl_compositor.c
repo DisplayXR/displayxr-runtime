@@ -249,6 +249,10 @@ struct comp_gl_compositor
 
 	// --- Display processor ---
 	struct xrt_display_processor_gl *display_processor;
+	GLuint dp_crop_fbo;            //!< FBO for cropping atlas to content dims before DP
+	GLuint dp_input_texture;       //!< Intermediate texture at content dims for DP input
+	uint32_t dp_input_width;       //!< Current dp_input_texture width (0 = not allocated)
+	uint32_t dp_input_height;      //!< Current dp_input_texture height
 
 	// --- State ---
 	bool hardware_display_3d;  //!< True when in 3D mode, false = 2D passthrough
@@ -818,6 +822,89 @@ gl_compositor_render_hud(struct comp_gl_compositor *c, float dt, uint32_t win_w,
 
 /*
  *
+ * Crop atlas to content dims and pass to display processor
+ *
+ */
+
+/*!
+ * Crop the valid content region from the (potentially oversized) atlas texture
+ * and pass it to the display processor. If the atlas exactly matches the
+ * content dimensions, the atlas is passed directly (no copy).
+ *
+ * @param c           GL compositor
+ * @param atlas_tex   Source atlas texture (may be oversized)
+ * @param output_w    Output surface width (window, shared texture, IOSurface)
+ * @param output_h    Output surface height
+ */
+static void
+gl_crop_and_process_dp(struct comp_gl_compositor *c,
+                       GLuint atlas_tex,
+                       uint32_t output_w,
+                       uint32_t output_h)
+{
+	uint32_t content_w = c->tile_columns * c->view_width;
+	uint32_t content_h = c->tile_rows * c->view_height;
+
+	GLuint dp_tex = atlas_tex;
+
+	if (content_w != c->atlas_tex_width || content_h != c->atlas_tex_height) {
+		// Content is smaller than atlas — need to crop.
+		// Lazily (re)create intermediate texture at content dims.
+		if (c->dp_input_width != content_w || c->dp_input_height != content_h) {
+			if (c->dp_input_texture != 0) {
+				glDeleteTextures(1, &c->dp_input_texture);
+			}
+			glGenTextures(1, &c->dp_input_texture);
+			glBindTexture(GL_TEXTURE_2D, c->dp_input_texture);
+			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8,
+			             content_w, content_h, 0,
+			             GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+			glBindTexture(GL_TEXTURE_2D, 0);
+			c->dp_input_width = content_w;
+			c->dp_input_height = content_h;
+			U_LOG_I("GL crop: created DP input texture %ux%u (atlas %ux%u)",
+			        content_w, content_h, c->atlas_tex_width, c->atlas_tex_height);
+		}
+
+		// Blit content region from atlas into intermediate texture
+		glBindFramebuffer(GL_READ_FRAMEBUFFER, c->fbo);
+		glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+		                        GL_TEXTURE_2D, atlas_tex, 0);
+		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, c->dp_crop_fbo);
+		glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+		                        GL_TEXTURE_2D, c->dp_input_texture, 0);
+
+		glBlitFramebuffer(
+		    0, 0, content_w, content_h,   // src rect (content region)
+		    0, 0, content_w, content_h,   // dst rect (same size)
+		    GL_COLOR_BUFFER_BIT, GL_NEAREST);
+
+		// Restore FBO state
+		glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+
+		dp_tex = c->dp_input_texture;
+	}
+
+	// Pass (possibly cropped) texture to DP
+	glViewport(0, 0, output_w, output_h);
+	xrt_display_processor_gl_process_atlas(
+	    c->display_processor,
+	    dp_tex,
+	    c->view_width,
+	    c->view_height,
+	    c->tile_columns,
+	    c->tile_rows,
+	    GL_RGBA8,
+	    output_w,
+	    output_h);
+}
+
+
+/*
+ *
  * Layer commit — render SBS and present
  *
  */
@@ -903,11 +990,9 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				c->tile_columns = mode->tile_columns;
 				c->tile_rows = mode->tile_rows;
 			}
-			// When a DP is present, keep view dims at init values (matching
-			// D3D11/D3D12). The atlas was sized for the 3D mode's view dims
-			// and the 2D mode's native dims (2240x1400) would overflow it.
-			// The blit path stretches the smaller view to fill the window.
-			if (c->display_processor == NULL && mode->view_width_pixels > 0) {
+			// Sync view dims from active mode every frame — needed for
+			// correct crop before DP and correct blit UV calculation.
+			if (mode->view_width_pixels > 0) {
 				c->view_width = mode->view_width_pixels;
 				c->view_height = mode->view_height_pixels;
 			}
@@ -1132,18 +1217,9 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			                        c->shared_gl_texture, 0);
 
 			if (c->display_processor != NULL) {
-				// Display processor handles stereo-to-display conversion
-				glViewport(0, 0, c->shared_width, c->shared_height);
-				xrt_display_processor_gl_process_atlas(
-				    c->display_processor,
-				    atlas_for_present,
-				    c->view_width,
-				    c->view_height,
-				    c->tile_columns,
-				    c->tile_rows,
-				    GL_RGBA8,
-				    c->shared_width,
-				    c->shared_height);
+				// Crop atlas to content dims, then pass to DP
+				gl_crop_and_process_dp(c, atlas_for_present,
+				                       c->shared_width, c->shared_height);
 			} else {
 				// No display processor: simple blit
 				glViewport(0, 0, c->shared_width, c->shared_height);
@@ -1182,19 +1258,9 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 		                        GL_TEXTURE_RECTANGLE, c->iosurface_gl_texture, 0);
 
 		if (c->display_processor != NULL) {
-			// Display processor renders directly into the IOSurface FBO.
-			// Output is GL bottom-up; app's blit shader must NOT flip Y.
-			glViewport(0, 0, c->iosurface_width, c->iosurface_height);
-			xrt_display_processor_gl_process_atlas(
-			    c->display_processor,
-			    atlas_for_present,
-			    c->view_width,
-			    c->view_height,
-			    c->tile_columns,
-			    c->tile_rows,
-			    GL_RGBA8,
-			    c->iosurface_width,
-			    c->iosurface_height);
+			// Crop atlas to content dims, then pass to DP
+			gl_crop_and_process_dp(c, atlas_for_present,
+			                       c->iosurface_width, c->iosurface_height);
 		} else {
 			// No display processor: simple blit, no Y-flip.
 			// Content stays GL bottom-up; app's blit shader must NOT flip Y.
@@ -1247,36 +1313,10 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 		comp_gl_window_macos_get_dimensions(c->macos_window, &present_w, &present_h);
 #endif
 
-		if (c->display_processor != NULL && c->hardware_display_3d) {
-			// One-time diagnostic: log GL viewport/framebuffer dimensions
-			static bool gl_dp_dims_logged = false;
-			if (!gl_dp_dims_logged) {
-				gl_dp_dims_logged = true;
-				GLint vp[4];
-				glGetIntegerv(GL_VIEWPORT, vp);
-				GLint fb;
-				glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fb);
-				U_LOG_W("GL DP dims: viewport=%dx%d at (%d,%d), fbo=%d, "
-				        "present=%ux%u, view=%ux%u, content=%ux%u, tex=%ux%u",
-				        vp[2], vp[3], vp[0], vp[1], fb,
-				        present_w, present_h,
-				        c->view_width, c->view_height,
-				        c->tile_columns * c->view_width, c->tile_rows * c->view_height,
-				        c->atlas_tex_width, c->atlas_tex_height);
-			}
-
-			// Display processor handles the stereo-to-display conversion
-			glViewport(0, 0, present_w, present_h);
-			xrt_display_processor_gl_process_atlas(
-			    c->display_processor,
-			    atlas_for_present,
-			    c->view_width,
-			    c->view_height,
-			    c->tile_columns,
-			    c->tile_rows,
-			    GL_RGBA8,
-			    present_w,
-			    present_h);
+		if (c->display_processor != NULL) {
+			// Crop atlas to content dims, then pass to DP
+			// (DP handles both 2D and 3D modes internally)
+			gl_crop_and_process_dp(c, atlas_for_present, present_w, present_h);
 		} else {
 			// No display processor: simple blit
 			glViewport(0, 0, present_w, present_h);
@@ -1365,6 +1405,8 @@ gl_compositor_destroy(struct xrt_compositor *xc)
 	if (c->hud_texture) glDeleteTextures(1, &c->hud_texture);
 	u_hud_destroy(&c->hud);
 
+	if (c->dp_input_texture) glDeleteTextures(1, &c->dp_input_texture);
+	if (c->dp_crop_fbo) glDeleteFramebuffers(1, &c->dp_crop_fbo);
 	if (c->program_blit) glDeleteProgram(c->program_blit);
 	if (c->program_window_space) glDeleteProgram(c->program_window_space);
 	if (c->vao_empty) glDeleteVertexArrays(1, &c->vao_empty);
@@ -1597,14 +1639,14 @@ gl_init_resources(struct comp_gl_compositor *c, uint32_t width, uint32_t height)
 	// FBO for offscreen rendering into atlas texture
 	glGenFramebuffers(1, &c->fbo);
 
-	// Atlas stereo texture — when a display processor is present, the atlas
-	// must exactly match the content dimensions (tile_columns * view_width)
-	// because the weaver assumes atlas size == content size. Without a DP,
-	// use worst-case size across all rendering modes for fallback blit path.
+	// FBO for cropping atlas to content dims before DP
+	glGenFramebuffers(1, &c->dp_crop_fbo);
+
+	// Atlas stereo texture — always worst-case sized across all rendering modes.
+	// Per-frame content region may be smaller; compositor crops before DP.
 	uint32_t atlas_width = c->tile_columns * c->view_width;
 	uint32_t atlas_height = c->tile_rows * c->view_height;
-	if (c->display_processor == NULL &&
-	    c->xdev != NULL && c->xdev->rendering_mode_count > 0) {
+	if (c->xdev != NULL && c->xdev->rendering_mode_count > 0) {
 		u_tiling_compute_system_atlas(c->xdev->rendering_modes,
 		                              c->xdev->rendering_mode_count,
 		                              &atlas_width, &atlas_height);
@@ -1984,8 +2026,7 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 	}
 #endif
 
-	// Create display processor via factory BEFORE gl_init_resources so we can
-	// use its presence to control atlas sizing strategy.
+	// Create display processor via factory.
 	if (dp_factory_gl != NULL) {
 		xrt_dp_factory_gl_fn_t factory = (xrt_dp_factory_gl_fn_t)dp_factory_gl;
 		xrt_result_t dp_ret = factory(window_handle, &c->display_processor);
@@ -1997,32 +2038,7 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 		}
 	}
 
-	// When a display processor (GL weaver) is present, use the active rendering
-	// mode's view dimensions for the atlas. The GL weaver expects the atlas
-	// texture to exactly match the content (viewWidth * tileColumns × viewHeight
-	// * tileRows), and handles window scaling internally. Without this, the atlas
-	// is created at native display resolution (e.g. 2240x1400) but content fills
-	// only a portion (e.g. 2240x700), causing the weaver to sample wrong regions.
-	if (c->display_processor != NULL && xdev != NULL && xdev->hmd != NULL) {
-		uint32_t idx = xdev->hmd->active_rendering_mode_index;
-		if (idx < xdev->rendering_mode_count) {
-			const struct xrt_rendering_mode *mode = &xdev->rendering_modes[idx];
-			if (mode->view_width_pixels > 0 && mode->view_height_pixels > 0) {
-				uint32_t mode_w = mode->tile_columns * mode->view_width_pixels;
-				uint32_t mode_h = mode->tile_rows * mode->view_height_pixels;
-				U_LOG_W("GL DP: using active mode dims for atlas: %ux%u "
-				        "(view %ux%u, tiles %ux%u) instead of native %ux%u",
-				        mode_w, mode_h,
-				        mode->view_width_pixels, mode->view_height_pixels,
-				        mode->tile_columns, mode->tile_rows,
-				        width, height);
-				width = mode_w;
-				height = mode_h;
-			}
-		}
-	}
-
-	// Initialize GL resources (atlas sized to match content dims when DP present)
+	// Initialize GL resources (atlas worst-case sized, crop before DP per-frame)
 	if (!gl_init_resources(c, width, height)) {
 		free(c);
 		return XRT_ERROR_OPENGL;

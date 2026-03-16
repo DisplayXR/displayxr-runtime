@@ -162,6 +162,11 @@ struct comp_metal_compositor
 	//! Generic Metal display processor.
 	struct xrt_display_processor_metal *display_processor;
 
+	//! Intermediate texture at content dims for DP input (crop from atlas).
+	id<MTLTexture> dp_input_texture;
+	uint32_t dp_input_width;   //!< Current dp_input_texture width (0 = not allocated)
+	uint32_t dp_input_height;  //!< Current dp_input_texture height
+
 	//! True when display is in 3D mode (weaver active). False = 2D passthrough.
 	bool hardware_display_3d;
 
@@ -1521,10 +1526,46 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	// Step 2: Process atlas through display processor, or simple blit fallback
 	id<MTLTexture> atlas_src = zero_copy ? zc_texture : c->atlas_texture;
 	if (c->display_processor != NULL && atlas_src != nil) {
+		// Crop atlas to content dims before passing to DP.
+		// The DP expects texture dimensions to match content exactly.
+		uint32_t content_w = c->tile_columns * c->view_width;
+		uint32_t content_h = c->tile_rows * c->view_height;
+		id<MTLTexture> dp_src = atlas_src;
+
+		if (content_w != c->atlas_width || content_h != c->atlas_height) {
+			// Lazily (re)create intermediate texture at content dims
+			if (c->dp_input_width != content_w || c->dp_input_height != content_h) {
+				[c->dp_input_texture release];
+				MTLTextureDescriptor *desc = [MTLTextureDescriptor
+				    texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+				    width:content_w height:content_h mipmapped:NO];
+				desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+				c->dp_input_texture = [c->device newTextureWithDescriptor:desc];
+				c->dp_input_width = content_w;
+				c->dp_input_height = content_h;
+				U_LOG_I("Metal crop: created DP input texture %ux%u (atlas %ux%u)",
+				        content_w, content_h, c->atlas_width, c->atlas_height);
+			}
+
+			// Blit content region from atlas into intermediate texture
+			id<MTLBlitCommandEncoder> blit = [cmd_buf blitCommandEncoder];
+			[blit copyFromTexture:atlas_src
+			          sourceSlice:0
+			          sourceLevel:0
+			         sourceOrigin:MTLOriginMake(0, 0, 0)
+			           sourceSize:MTLSizeMake(content_w, content_h, 1)
+			            toTexture:c->dp_input_texture
+			     destinationSlice:0
+			     destinationLevel:0
+			    destinationOrigin:MTLOriginMake(0, 0, 0)];
+			[blit endEncoding];
+			dp_src = c->dp_input_texture;
+		}
+
 		xrt_display_processor_metal_process_atlas(
 		    c->display_processor,
 		    (__bridge void *)cmd_buf,
-		    (__bridge void *)atlas_src,
+		    (__bridge void *)dp_src,
 		    c->view_width,
 		    c->view_height,
 		    c->tile_columns,
@@ -1601,7 +1642,11 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 	//    acquiring new drawables during teardown.
 	c->metal_layer = nil;
 
-	// 3. Destroy display processor
+	// 3. Release DP crop texture
+	[c->dp_input_texture release];
+	c->dp_input_texture = nil;
+
+	// 4. Destroy display processor
 	if (c->display_processor != NULL) {
 		xrt_display_processor_metal_destroy(&c->display_processor);
 	}

@@ -154,6 +154,28 @@ comp_d3d12_renderer_set_tile_layout(struct comp_d3d12_renderer *renderer,
 void *
 comp_d3d12_renderer_get_atlas_resource(struct comp_d3d12_renderer *renderer);
 
+/*!
+ * Resize the renderer's atlas texture to match a new view size.
+ *
+ * Recreates the atlas texture, RTV, and SRV at the new dimensions.
+ * Shaders and pipeline state are NOT recreated.
+ * Does nothing if the dimensions are unchanged.
+ *
+ * @param renderer The renderer.
+ * @param new_view_width New width per view (clamped to minimum 64).
+ * @param new_view_height New height per view (clamped to minimum 64).
+ * @param new_target_height New render target (window) height.
+ *
+ * @return XRT_SUCCESS on success, error code otherwise.
+ *
+ * @ingroup comp_d3d12
+ */
+xrt_result_t
+comp_d3d12_renderer_resize(struct comp_d3d12_renderer *renderer,
+                           uint32_t new_view_width,
+                           uint32_t new_view_height,
+                           uint32_t new_target_height);
+
 #ifdef __cplusplus
 }
 #endif
