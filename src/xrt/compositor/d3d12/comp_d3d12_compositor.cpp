@@ -1035,12 +1035,12 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			uint32_t tc, tr;
 			comp_d3d12_renderer_get_tile_layout(c->renderer, &tc, &tr);
 			U_LOG_W("D3D12 DP dims: back_buffer=%llux%u, viewport=%ux%u, "
-			        "view=%ux%u, atlas=%ux%u (tile %ux%u)",
+			        "view=%ux%u, atlas=%ux%u (tile %ux%u), zero_copy=%d",
 			        (unsigned long long)bb_desc.Width, (unsigned)bb_desc.Height,
 			        tgt_width, tgt_height,
 			        vw, vh,
 			        tc * vw, tr * vh,
-			        tc, tr);
+			        tc, tr, (int)zero_copy);
 		}
 
 		// Transition back buffer: PRESENT → RENDER_TARGET
@@ -1062,12 +1062,17 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		    : static_cast<ID3D12Resource *>(comp_d3d12_renderer_get_atlas_resource(c->renderer));
 
 		if (diag_log) {
-			U_LOG_W("D3D12 dp path: stereo=%p, view=%ux%u, target=%ux%u, bb=%u, "
-			        "back_buffer=%p, rtv=0x%llx",
-			        (void *)atlas_resource, view_width, view_height,
+			D3D12_RESOURCE_DESC atlas_desc = atlas_resource
+			    ? atlas_resource->GetDesc() : D3D12_RESOURCE_DESC{};
+			U_LOG_W("D3D12 dp path: stereo=%p (%llux%u), view=%ux%u, target=%ux%u, bb=%u, "
+			        "back_buffer=%p, rtv=0x%llx, zc=%d",
+			        (void *)atlas_resource,
+			        (unsigned long long)atlas_desc.Width, (unsigned)atlas_desc.Height,
+			        view_width, view_height,
 			        tgt_width, tgt_height, bb_index,
 			        (void *)back_buffer,
-			        (unsigned long long)rtv_handle.ptr);
+			        (unsigned long long)rtv_handle.ptr,
+			        (int)zero_copy);
 		}
 
 		if (atlas_resource != nullptr) {
