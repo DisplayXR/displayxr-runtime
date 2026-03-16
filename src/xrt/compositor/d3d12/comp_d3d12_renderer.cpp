@@ -608,6 +608,16 @@ comp_d3d12_renderer_set_tile_layout(struct comp_d3d12_renderer *renderer,
                                     uint32_t tile_columns,
                                     uint32_t tile_rows)
 {
+	// Recompute view dimensions so the atlas logical size stays constant.
+	// E.g. stereo 2×1 (vw=1920) → 2D 1×1 (vw=3840) keeps atlas_w=3840.
+	if (tile_columns > 0 && renderer->tile_columns > 0) {
+		uint32_t atlas_w = renderer->tile_columns * renderer->view_width;
+		renderer->view_width = atlas_w / tile_columns;
+	}
+	if (tile_rows > 0 && renderer->tile_rows > 0) {
+		uint32_t atlas_h = renderer->tile_rows * renderer->view_height;
+		renderer->view_height = atlas_h / tile_rows;
+	}
 	renderer->tile_columns = tile_columns;
 	renderer->tile_rows = tile_rows;
 }
