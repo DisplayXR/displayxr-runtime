@@ -13,7 +13,7 @@ See the [milestone tracker](https://github.com/dfattal/openxr-3d-display/milesto
 - **M1: Foundation** — Done. Stripped 34 VR drivers, removed Vulkan server compositor, cleaned CMake, extracted stereo math.
 - **M2: Native Compositors** — Done. D3D11, D3D12, Metal, OpenGL, Vulkan all shipping.
 - **M3: Test Coverage** — #30, #31, #33 open.
-- **M4: Display Extensions** — Next major focus. Lock down extension API surface (#3, #5, #8, #38).
+- **M4: Display Extensions** — Next major focus. Lock down extension API surface (#3, #8, #38). #5 closed (superseded by #77).
 - **M5: Interface Standardization** — #45, #46, #47 open.
 - **M6: Spatial Shell** — #43, #44 open.
 
@@ -37,6 +37,9 @@ App (any graphics API)
 
 Each graphics API gets a native compositor — no interop, no Vulkan intermediary.
 
+For layer boundaries and what each layer owns, see `docs/architecture/separation-of-concerns.md`.
+Why each API gets its own compositor: `docs/adr/ADR-001-native-compositors-per-graphics-api.md`.
+
 ### Four App Classes
 
 | Class | Suffix | Description | Compositor path |
@@ -54,6 +57,9 @@ The first three classes all use a native compositor in-process. The `_ipc` class
 - `_ext` / `_shared` / `_rt` → `compositor/{d3d11,d3d12,metal,gl,vk_native}/` (in-process)
 - `_ipc` → `compositor/client/` → `ipc/` → `compositor/multi/` → native compositor (out-of-process)
 
+For in-process vs service details, see `docs/architecture/in-process-vs-service.md`.
+For the spatial shell multi-app vision, see `docs/architecture/spatial-os.md` and `docs/architecture/3d-shell.md`.
+
 ### Extension Apps vs Legacy Apps
 
 Orthogonal to the four app classes above, apps are either **extension apps** or **legacy apps** based on whether they enable `XR_EXT_display_info`:
@@ -65,16 +71,18 @@ Orthogonal to the four app classes above, apps are either **extension apps** or 
 
 `_ext` and `_shared` apps are always extension apps (they need the extension for window binding). `_rt` apps can be either — a DisplayXR-aware `_rt` app enables `XR_EXT_display_info`, while a generic OpenXR `_rt` app (e.g. WebXR, third-party) is legacy.
 
-**Legacy app compromise view scale** (in `oxr_system_fill_in`):
-- **Case A** — Default 3D mode has `view_count == 2` and `scaleX <= 0.5` and `scaleY <= 0.5` (typical SBS): runtime reports `recommendedViewScale = 0.5×1.0`. App renders half-width, full-height tiles. Compositor must downscale Y for 3D, stretch X for 2D.
-- **Case B** — Otherwise: runtime uses the 3D mode's actual scale. Compositor stretches for 2D.
+For the full multiview tiling algorithm and atlas layout, see `docs/specs/multiview-tiling.md`.
+For legacy app compromise scaling rationale (Case A/B), see `docs/specs/legacy-app-support.md`.
 
-The `legacy_app_tile_scaling` flag on `xrt_system_compositor_info` signals compositors to gate 1/2/3 key mode selection and (future) perform tile scaling before the display processor.
+Legacy app compromise scaling is computed in `oxr_system_fill_in()` — see `docs/specs/legacy-app-support.md` for the full algorithm. The `legacy_app_tile_scaling` flag on `xrt_system_compositor_info` disables 1/2/3 key mode selection for legacy apps (V toggle only).
 
 ### Key Architectural Notes
 - Compositor vtable has 56 methods — use `comp_base` helper for boilerplate
 - IPC/service mode (`ipc/`, `compositor/client/`, `compositor/multi/`) must be preserved for `_ipc` apps, WebXR, and multi-app spatial shell
 - `compositor/null/` — headless compositor for testing
+
+For the vendor isolation rule and layer "must NOT contain" constraints, see `docs/architecture/separation-of-concerns.md`.
+For display processor vtable design (all 5 API variants), see `docs/specs/vendor-integration.md`.
 
 ## Project Overview
 
@@ -121,21 +129,8 @@ scripts/format-project.sh   # Format all
 ### Source Tree Structure (`src/xrt/`)
 - **include/xrt/** — Core interface headers (`xrt_device.h`, `xrt_compositor.h`, `xrt_instance.h`, etc.)
 - **auxiliary/** — Shared utilities: math (`m_*`), utilities (`u_*`), OS abstraction (`os_*`), Vulkan helpers (`vk_*`)
-- **compositor/** — Native compositors
-  - `d3d11/` — D3D11 compositor (Windows)
-  - `d3d11_service/` — D3D11 service compositor
-  - `d3d12/` — D3D12 compositor (Windows)
-  - `metal/` — Metal compositor (macOS)
-  - `gl/` — OpenGL compositor (Windows + macOS)
-  - `vk_native/` — Vulkan compositor (Windows + macOS)
-  - `multi/` — Multi-client compositor (IPC/multi-app)
-  - `client/` — Client compositor bindings
-  - `null/` — Null compositor (testing)
-  - `util/` — Compositor utilities
-- **drivers/** — Hardware drivers
-  - `leia/` — LeiaSR SDK driver (Vulkan + D3D11 weavers)
-  - `sim_display/` — Simulation display driver
-  - `qwerty/` — Keyboard/mouse simulated controllers
+- **compositor/** — Native compositors (D3D11, D3D12, Metal, GL, Vulkan, multi, client, null). See `docs/architecture/project-structure.md`.
+- **drivers/** — `leia/` (LeiaSR SDK), `sim_display/` (simulation), `qwerty/` (keyboard/mouse controllers)
 - **state_trackers/oxr/** — OpenXR API implementation
 - **ipc/** — Inter-process communication for service mode
 - **targets/** — Build targets (runtime library, displayxr-cli, displayxr-service)
@@ -146,6 +141,8 @@ C interfaces with vtable-style polymorphism:
 - `struct xrt_compositor` — Graphics compositor interface
 - `struct xrt_instance` — Runtime instance
 - `struct xrt_prober` — Device discovery
+
+For the full interface catalog including display processor vtables (5 API variants), see `docs/specs/vendor-integration.md`.
 
 ### LeiaSR SDK Integration
 - `XRT_HAVE_LEIA_SR` CMake option (auto-enabled if SDK found)
@@ -161,11 +158,17 @@ Each bypasses Vulkan entirely for its graphics API:
 - **OpenGL** (`compositor/gl/`) — Shipping. Windows + macOS
 - **Vulkan** (`compositor/vk_native/`) — Shipping. Windows + macOS (MoltenVK)
 
+Why native compositors instead of Vulkan interop: `docs/adr/ADR-001-native-compositors-per-graphics-api.md`.
+Compositor never weaves — that's the DP's job: `docs/adr/ADR-007-compositor-never-weaves.md`.
+
 ### Custom OpenXR Extensions
 - `XR_EXT_win32_window_binding` — App passes HWND to runtime
 - `XR_EXT_cocoa_window_binding` — App passes NSWindow to runtime
 - `XR_EXT_display_info` — Display dimensions, eye tracking modes
 - `XR_EXT_android_surface_binding` — Android surface binding
+
+Full extension specs: `docs/specs/XR_EXT_display_info.md`, `docs/specs/XR_EXT_win32_window_binding.md`, `docs/specs/XR_EXT_cocoa_window_binding.md`.
+Eye tracking SMOOTH vs RAW contract: `docs/specs/eye-tracking-modes.md`.
 
 ## Development Notes
 
@@ -222,14 +225,20 @@ Copy binaries to `_package/DisplayXR-macOS/bin/`. Run scripts exec from `$DIR/bi
 
 ## Documentation
 
-- `docs/specs/` — Living feature and extension specs (XR_EXT_display_info, multiview tiling, etc.)
-- `docs/adr/` — Architecture Decision Records (native compositors, vendor abstraction, etc.)
-- `docs/architecture/` — System design docs (separation of concerns, spatial model, IPC design)
-- `docs/notes/` — Reference material (conventions, build guides, device notes)
-- `docs/legacy-monado/` — Inherited Monado docs (kept for reference, not actively maintained)
-- `doc/` — Monado build system docs (CHANGELOG, Doxygen config)
+See `docs/README.md` for a complete index. Key docs by task:
 
-See `docs/README.md` for a complete index.
+| When you need to... | Read |
+|---|---|
+| Understand layer boundaries (what goes where) | `docs/architecture/separation-of-concerns.md` |
+| Add a new display vendor | `docs/specs/vendor-integration.md` |
+| Understand multiview tiling / atlas layout | `docs/specs/multiview-tiling.md` |
+| Understand extension API (display_info, window bindings) | `docs/specs/XR_EXT_display_info.md` |
+| Know why an architectural decision was made | `docs/adr/` (9 ADRs) |
+| Understand legacy vs extension app differences | `docs/specs/legacy-app-support.md` |
+| Understand eye tracking SMOOTH/RAW contract | `docs/specs/eye-tracking-modes.md` |
+| Add a new OpenXR extension | `docs/notes/implementing-extension.md` |
+| Write a device driver | `docs/notes/writing-driver.md` |
+| Understand stereo math / Kooima projection | `docs/architecture/stereo3d-math.md` |
 
 ## Debug Logs
 - Use U_LOG_W (WARN) only for one-off init, error, and lifecycle events
