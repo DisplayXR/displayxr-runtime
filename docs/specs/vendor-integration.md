@@ -400,6 +400,11 @@ Key design points:
   avoids pulling in full `vulkan.h` in this header
 - **Optional methods**: NULL means not supported — all helpers check for NULL
   before calling
+- **All-modes contract**: `process_atlas()` must produce correct output for every
+  mode the DP advertises, including 2D (`view_count == 1`, `tile_columns == 1`,
+  `tile_rows == 1`).  How each vendor achieves this is implementation-defined —
+  shader pipeline, native blit API, or weaver passthrough are all valid approaches.
+  The spec mandates correct output, not a specific mechanism.
 
 **Helper functions** for safe calling:
 

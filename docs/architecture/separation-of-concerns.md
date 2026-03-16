@@ -49,7 +49,7 @@ This document defines what each architectural layer owns and what must not cross
 
 Implementations live in `src/xrt/drivers/` (vendor-specific) or `src/xrt/compositor/` (generic).
 
-- `process_atlas()` — transform tiled atlas to display-specific output (interlacing, SBS, anaglyph)
+- `process_atlas()` — transform tiled atlas to display-specific output for all advertised modes (interlacing, SBS, anaglyph, and 2D passthrough)
 - `get_predicted_eye_positions()` — N-view eye positions from vendor SDK
 - `request_display_mode()` — hardware 2D/3D switching
 - `get_display_dimensions()` — physical size for Kooima FOV
