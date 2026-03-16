@@ -147,6 +147,7 @@ if(XRT_HAVE_LEIA_SR)
 			target_link_libraries(drv_leia PRIVATE
 				${SR_PATH}/lib/SimulatedRealityDirectX.lib
 				d3d11
+				d3dcompiler
 				dxgi)
 			target_compile_definitions(drv_leia PUBLIC XRT_HAVE_LEIA_SR_D3D11)
 		endif()
@@ -158,7 +159,7 @@ if(XRT_HAVE_LEIA_SR)
 				target_link_libraries(drv_leia PRIVATE
 					${SR_PATH}/lib/SimulatedRealityDirectX.lib)
 			endif()
-			target_link_libraries(drv_leia PRIVATE d3d12)
+			target_link_libraries(drv_leia PRIVATE d3d12 d3dcompiler)
 			target_compile_definitions(drv_leia PUBLIC XRT_HAVE_LEIA_SR_D3D12)
 		endif()
 

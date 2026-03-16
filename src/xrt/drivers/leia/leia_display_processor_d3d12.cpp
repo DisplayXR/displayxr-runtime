@@ -24,7 +24,42 @@
 #include "util/u_logging.h"
 
 #include <d3d12.h>
+#include <d3dcompiler.h>
 #include <cstdlib>
+#include <cstring>
+
+
+// Fullscreen quad vertex shader (4 vertices, triangle strip via SV_VertexID)
+static const char *blit_vs_source = R"(
+struct VS_OUTPUT {
+	float4 pos : SV_Position;
+	float2 uv  : TEXCOORD0;
+};
+
+VS_OUTPUT main(uint id : SV_VertexID) {
+	VS_OUTPUT o;
+	o.uv = float2(id & 1, id >> 1);
+	o.pos = float4(o.uv * float2(2, -2) + float2(-1, 1), 0, 1);
+	return o;
+}
+)";
+
+// Passthrough pixel shader: samples first tile from atlas, stretches to fill target
+static const char *blit_ps_source = R"(
+Texture2D atlas_tex : register(t0);
+SamplerState samp : register(s0);
+
+cbuffer BlitParams : register(b0) {
+	float u_scale;
+	float v_scale;
+	float pad0;
+	float pad1;
+};
+
+float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
+	return atlas_tex.Sample(samp, float2(uv.x * u_scale, uv.y * v_scale));
+}
+)";
 
 
 /*!
@@ -42,6 +77,14 @@ struct leia_display_processor_d3d12_impl
 	uint32_t sbs_width;                //!< Current staging texture width.
 	uint32_t sbs_height;               //!< Current staging texture height.
 	DXGI_FORMAT sbs_format;            //!< Current staging texture format.
+	//! @}
+
+	//! @name 2D blit pipeline resources (passthrough stretch-blit)
+	//! @{
+	ID3D12RootSignature *blit_root_sig;
+	ID3D12PipelineState *blit_pso;
+	ID3D12DescriptorHeap *blit_srv_heap; //!< Shader-visible, 1 SRV
+	DXGI_FORMAT blit_output_format;
 	//! @}
 
 	uint32_t view_count; //!< Active mode view count (1=2D, 2=stereo).
@@ -135,14 +178,81 @@ leia_dp_d3d12_process_atlas(struct xrt_display_processor_d3d12 *xdp,
                              uint32_t target_width,
                              uint32_t target_height)
 {
-	(void)atlas_srv_gpu_handle;
-	(void)target_rtv_cpu_handle;
 	struct leia_display_processor_d3d12_impl *ldp = leia_dp_d3d12(xdp);
 
-	// 2D mode: no-op — compositor handles 2D blit via its own stretch-blit path
+	// 2D mode: passthrough stretch-blit (first tile fills target)
 	if (ldp->view_count == 1) {
+		if (ldp->blit_pso == NULL || ldp->blit_root_sig == NULL ||
+		    ldp->blit_srv_heap == NULL || atlas_texture_resource == NULL) {
+			return;
+		}
+
+		ID3D12GraphicsCommandList *cmd = static_cast<ID3D12GraphicsCommandList *>(d3d12_command_list);
+		ID3D12Resource *atlas_res = static_cast<ID3D12Resource *>(atlas_texture_resource);
+
+		// Create SRV for the atlas resource in our shader-visible heap
+		D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+		srv_desc.Format = static_cast<DXGI_FORMAT>(format);
+		srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+		srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+		srv_desc.Texture2D.MipLevels = 1;
+		ldp->device->CreateShaderResourceView(
+		    atlas_res, &srv_desc,
+		    ldp->blit_srv_heap->GetCPUDescriptorHandleForHeapStart());
+
+		// Set descriptor heap, root sig, PSO
+		ID3D12DescriptorHeap *heaps[] = {ldp->blit_srv_heap};
+		cmd->SetDescriptorHeaps(1, heaps);
+		cmd->SetGraphicsRootSignature(ldp->blit_root_sig);
+		cmd->SetPipelineState(ldp->blit_pso);
+
+		// Set render target
+		D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle;
+		rtv_handle.ptr = static_cast<SIZE_T>(target_rtv_cpu_handle);
+		cmd->OMSetRenderTargets(1, &rtv_handle, FALSE, nullptr);
+
+		// Set viewport and scissor
+		D3D12_VIEWPORT viewport = {};
+		viewport.Width = static_cast<float>(target_width);
+		viewport.Height = static_cast<float>(target_height);
+		viewport.MaxDepth = 1.0f;
+		cmd->RSSetViewports(1, &viewport);
+
+		D3D12_RECT scissor = {};
+		scissor.right = static_cast<LONG>(target_width);
+		scissor.bottom = static_cast<LONG>(target_height);
+		cmd->RSSetScissorRects(1, &scissor);
+
+		// Set SRV descriptor table
+		cmd->SetGraphicsRootDescriptorTable(
+		    0, ldp->blit_srv_heap->GetGPUDescriptorHandleForHeapStart());
+
+		// Compute UV scale: map [0,1] to first tile in atlas
+		uint32_t atlas_w = tile_columns * view_width;
+		uint32_t atlas_h = tile_rows * view_height;
+		{
+			D3D12_RESOURCE_DESC desc = atlas_res->GetDesc();
+			atlas_w = static_cast<uint32_t>(desc.Width);
+			atlas_h = static_cast<uint32_t>(desc.Height);
+		}
+		float u_scale = (atlas_w > 0) ? (float)view_width / (float)atlas_w : 1.0f;
+		float v_scale = (atlas_h > 0) ? (float)view_height / (float)atlas_h : 1.0f;
+		uint32_t constants[4];
+		memcpy(&constants[0], &u_scale, sizeof(float));
+		memcpy(&constants[1], &v_scale, sizeof(float));
+		constants[2] = 0;
+		constants[3] = 0;
+		cmd->SetGraphicsRoot32BitConstants(1, 4, constants, 0);
+
+		// Draw fullscreen quad
+		cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+		cmd->IASetVertexBuffers(0, 0, nullptr);
+		cmd->DrawInstanced(4, 1, 0, 0);
 		return;
 	}
+
+	(void)atlas_srv_gpu_handle;
+	(void)target_rtv_cpu_handle;
 
 	void *weaver_resource = atlas_texture_resource;
 
@@ -220,10 +330,82 @@ do_weave:
 }
 
 static void
+leia_dp_d3d12_ensure_blit_pso(struct leia_display_processor_d3d12_impl *ldp, DXGI_FORMAT fmt)
+{
+	if (ldp->blit_root_sig == NULL || ldp->device == NULL) {
+		return;
+	}
+	if (ldp->blit_pso != NULL && ldp->blit_output_format == fmt) {
+		return;
+	}
+
+	if (ldp->blit_pso != NULL) {
+		ldp->blit_pso->Release();
+		ldp->blit_pso = NULL;
+	}
+
+	// Compile shaders
+	ID3DBlob *vs_blob = NULL;
+	ID3DBlob *ps_blob = NULL;
+	ID3DBlob *error_blob = NULL;
+
+	HRESULT hr = D3DCompile(blit_vs_source, strlen(blit_vs_source), NULL, NULL, NULL,
+	                        "main", "vs_5_0", 0, 0, &vs_blob, &error_blob);
+	if (FAILED(hr)) {
+		if (error_blob) { error_blob->Release(); }
+		U_LOG_E("Leia D3D12 DP: blit VS compile failed: 0x%08x", (unsigned)hr);
+		return;
+	}
+
+	hr = D3DCompile(blit_ps_source, strlen(blit_ps_source), NULL, NULL, NULL,
+	                "main", "ps_5_0", 0, 0, &ps_blob, &error_blob);
+	if (FAILED(hr)) {
+		vs_blob->Release();
+		if (error_blob) { error_blob->Release(); }
+		U_LOG_E("Leia D3D12 DP: blit PS compile failed: 0x%08x", (unsigned)hr);
+		return;
+	}
+
+	D3D12_GRAPHICS_PIPELINE_STATE_DESC pso_desc = {};
+	pso_desc.pRootSignature = ldp->blit_root_sig;
+	pso_desc.VS.pShaderBytecode = vs_blob->GetBufferPointer();
+	pso_desc.VS.BytecodeLength = vs_blob->GetBufferSize();
+	pso_desc.PS.pShaderBytecode = ps_blob->GetBufferPointer();
+	pso_desc.PS.BytecodeLength = ps_blob->GetBufferSize();
+	pso_desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+	pso_desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+	pso_desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+	pso_desc.RasterizerState.DepthClipEnable = TRUE;
+	pso_desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+	pso_desc.NumRenderTargets = 1;
+	pso_desc.RTVFormats[0] = fmt;
+	pso_desc.SampleDesc.Count = 1;
+	pso_desc.SampleMask = UINT_MAX;
+
+	hr = ldp->device->CreateGraphicsPipelineState(
+	    &pso_desc, __uuidof(ID3D12PipelineState),
+	    reinterpret_cast<void **>(&ldp->blit_pso));
+
+	vs_blob->Release();
+	ps_blob->Release();
+
+	if (FAILED(hr)) {
+		U_LOG_E("Leia D3D12 DP: blit PSO creation failed: 0x%08x", (unsigned)hr);
+		return;
+	}
+
+	ldp->blit_output_format = fmt;
+	U_LOG_I("Leia D3D12 DP: created 2D blit PSO for format %u", (unsigned)fmt);
+}
+
+static void
 leia_dp_d3d12_set_output_format(struct xrt_display_processor_d3d12 *xdp, uint32_t format)
 {
 	struct leia_display_processor_d3d12_impl *ldp = leia_dp_d3d12(xdp);
 	leiasr_d3d12_set_output_format(ldp->leiasr, format);
+
+	// Create/recreate blit PSO to match the output format
+	leia_dp_d3d12_ensure_blit_pso(ldp, static_cast<DXGI_FORMAT>(format));
 }
 
 static bool
@@ -298,6 +480,16 @@ leia_dp_d3d12_destroy(struct xrt_display_processor_d3d12 *xdp)
 {
 	struct leia_display_processor_d3d12_impl *ldp = leia_dp_d3d12(xdp);
 
+	if (ldp->blit_pso != NULL) {
+		ldp->blit_pso->Release();
+	}
+	if (ldp->blit_root_sig != NULL) {
+		ldp->blit_root_sig->Release();
+	}
+	if (ldp->blit_srv_heap != NULL) {
+		ldp->blit_srv_heap->Release();
+	}
+
 	if (ldp->sbs_texture != NULL) {
 		ldp->sbs_texture->Release();
 	}
@@ -306,6 +498,92 @@ leia_dp_d3d12_destroy(struct xrt_display_processor_d3d12 *xdp)
 		leiasr_d3d12_destroy(&ldp->leiasr);
 	}
 	free(ldp);
+}
+
+
+/*
+ *
+ * Helper: create blit root signature and SRV heap for 2D passthrough mode.
+ *
+ */
+
+static bool
+leia_dp_d3d12_init_blit(struct leia_display_processor_d3d12_impl *ldp)
+{
+	if (ldp->device == NULL) {
+		return false;
+	}
+
+	// Create root signature: 1 SRV descriptor table (t0) + 4 root constants (b0) + 1 static sampler (s0)
+	D3D12_DESCRIPTOR_RANGE srv_range = {};
+	srv_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+	srv_range.NumDescriptors = 1;
+	srv_range.BaseShaderRegister = 0;
+	srv_range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+	D3D12_ROOT_PARAMETER root_params[2] = {};
+	root_params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+	root_params[0].DescriptorTable.NumDescriptorRanges = 1;
+	root_params[0].DescriptorTable.pDescriptorRanges = &srv_range;
+	root_params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+	root_params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+	root_params[1].Constants.ShaderRegister = 0;
+	root_params[1].Constants.Num32BitValues = 4;
+	root_params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+	D3D12_STATIC_SAMPLER_DESC sampler = {};
+	sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+	sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+	sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+	sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+	sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+	sampler.BorderColor = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
+	sampler.MaxLOD = D3D12_FLOAT32_MAX;
+	sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+	D3D12_ROOT_SIGNATURE_DESC rs_desc = {};
+	rs_desc.NumParameters = 2;
+	rs_desc.pParameters = root_params;
+	rs_desc.NumStaticSamplers = 1;
+	rs_desc.pStaticSamplers = &sampler;
+	rs_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+
+	ID3DBlob *sig_blob = NULL;
+	ID3DBlob *error_blob = NULL;
+	HRESULT hr = D3D12SerializeRootSignature(&rs_desc, D3D_ROOT_SIGNATURE_VERSION_1,
+	                                          &sig_blob, &error_blob);
+	if (FAILED(hr)) {
+		if (error_blob) { error_blob->Release(); }
+		U_LOG_E("Leia D3D12 DP: blit root sig serialize failed: 0x%08x", (unsigned)hr);
+		return false;
+	}
+
+	hr = ldp->device->CreateRootSignature(0, sig_blob->GetBufferPointer(), sig_blob->GetBufferSize(),
+	                                       __uuidof(ID3D12RootSignature),
+	                                       reinterpret_cast<void **>(&ldp->blit_root_sig));
+	sig_blob->Release();
+	if (FAILED(hr)) {
+		U_LOG_E("Leia D3D12 DP: blit root sig creation failed: 0x%08x", (unsigned)hr);
+		return false;
+	}
+
+	// Create shader-visible SRV heap (1 descriptor)
+	D3D12_DESCRIPTOR_HEAP_DESC heap_desc = {};
+	heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+	heap_desc.NumDescriptors = 1;
+	heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+
+	hr = ldp->device->CreateDescriptorHeap(&heap_desc, __uuidof(ID3D12DescriptorHeap),
+	                                        reinterpret_cast<void **>(&ldp->blit_srv_heap));
+	if (FAILED(hr)) {
+		U_LOG_E("Leia D3D12 DP: blit SRV heap creation failed: 0x%08x", (unsigned)hr);
+		return false;
+	}
+
+	// PSO is created lazily in set_output_format when the format is known
+	U_LOG_I("Leia D3D12 DP: initialized 2D blit root signature and SRV heap");
+	return true;
 }
 
 
@@ -349,6 +627,11 @@ leia_dp_factory_d3d12(void *d3d12_device,
 	ldp->leiasr = weaver;
 	ldp->device = static_cast<ID3D12Device *>(d3d12_device);
 	ldp->view_count = 2;
+
+	// Init blit root signature and SRV heap for 2D passthrough mode
+	if (!leia_dp_d3d12_init_blit(ldp)) {
+		U_LOG_W("Leia D3D12 DP: blit init failed — 2D mode will be unavailable");
+	}
 
 	*out_xdp = &ldp->base;
 

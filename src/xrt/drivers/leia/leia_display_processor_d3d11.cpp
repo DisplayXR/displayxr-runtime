@@ -24,7 +24,42 @@
 #include "util/u_logging.h"
 
 #include <d3d11.h>
+#include <d3dcompiler.h>
 #include <cstdlib>
+#include <cstring>
+
+
+// Fullscreen quad vertex shader (4 vertices, triangle strip via SV_VertexID)
+static const char *blit_vs_source = R"(
+struct VS_OUTPUT {
+	float4 pos : SV_Position;
+	float2 uv  : TEXCOORD0;
+};
+
+VS_OUTPUT main(uint id : SV_VertexID) {
+	VS_OUTPUT o;
+	o.uv = float2(id & 1, id >> 1);
+	o.pos = float4(o.uv * float2(2, -2) + float2(-1, 1), 0, 1);
+	return o;
+}
+)";
+
+// Passthrough pixel shader: samples first tile from atlas, stretches to fill target
+static const char *blit_ps_source = R"(
+Texture2D atlas_tex : register(t0);
+SamplerState samp : register(s0);
+
+cbuffer BlitParams : register(b0) {
+	float u_scale;
+	float v_scale;
+	float pad0;
+	float pad1;
+};
+
+float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
+	return atlas_tex.Sample(samp, float2(uv.x * u_scale, uv.y * v_scale));
+}
+)";
 
 
 /*!
@@ -43,6 +78,14 @@ struct leia_display_processor_d3d11_impl
 	uint32_t sbs_width;                //!< Current staging texture width.
 	uint32_t sbs_height;               //!< Current staging texture height.
 	DXGI_FORMAT sbs_format;            //!< Current staging texture format.
+	//! @}
+
+	//! @name 2D blit shader resources (passthrough stretch-blit)
+	//! @{
+	ID3D11VertexShader *blit_vs;
+	ID3D11PixelShader *blit_ps;
+	ID3D11SamplerState *blit_sampler;
+	ID3D11Buffer *blit_cb; //!< 16 bytes: u_scale, v_scale, pad, pad
 	//! @}
 
 	uint32_t view_count; //!< Active mode view count (1=2D, 2=stereo).
@@ -142,8 +185,64 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 	struct leia_display_processor_d3d11_impl *ldp = leia_dp_d3d11(xdp);
 	ID3D11DeviceContext *ctx = static_cast<ID3D11DeviceContext *>(d3d11_context);
 
-	// 2D mode: no-op — compositor handles 2D blit via its own stretch-blit path
+	// 2D mode: passthrough stretch-blit (first tile fills target)
 	if (ldp->view_count == 1) {
+		if (ldp->blit_vs == NULL || ldp->blit_ps == NULL) {
+			return;
+		}
+
+		ID3D11ShaderResourceView *srv = static_cast<ID3D11ShaderResourceView *>(atlas_srv);
+
+		// Get actual atlas texture dimensions for correct UV scaling
+		uint32_t atlas_w = tile_columns * view_width;
+		uint32_t atlas_h = tile_rows * view_height;
+		{
+			ID3D11Resource *res = NULL;
+			srv->GetResource(&res);
+			if (res != NULL) {
+				ID3D11Texture2D *tex = NULL;
+				if (SUCCEEDED(res->QueryInterface(__uuidof(ID3D11Texture2D),
+				                                  reinterpret_cast<void **>(&tex)))) {
+					D3D11_TEXTURE2D_DESC desc;
+					tex->GetDesc(&desc);
+					atlas_w = desc.Width;
+					atlas_h = desc.Height;
+					tex->Release();
+				}
+				res->Release();
+			}
+		}
+
+		// UV scale: map [0,1] output to the first tile in the atlas
+		struct { float u_scale; float v_scale; float pad0; float pad1; } cb_data;
+		cb_data.u_scale = (atlas_w > 0) ? (float)view_width / (float)atlas_w : 1.0f;
+		cb_data.v_scale = (atlas_h > 0) ? (float)view_height / (float)atlas_h : 1.0f;
+		cb_data.pad0 = 0.0f;
+		cb_data.pad1 = 0.0f;
+		ctx->UpdateSubresource(ldp->blit_cb, 0, NULL, &cb_data, 0, 0);
+
+		// Set viewport
+		D3D11_VIEWPORT viewport = {};
+		viewport.Width = static_cast<float>(target_width);
+		viewport.Height = static_cast<float>(target_height);
+		viewport.MaxDepth = 1.0f;
+		ctx->RSSetViewports(1, &viewport);
+
+		// Bind shaders, sampler, SRV, and constant buffer
+		ctx->VSSetShader(ldp->blit_vs, NULL, 0);
+		ctx->PSSetShader(ldp->blit_ps, NULL, 0);
+		ctx->PSSetSamplers(0, 1, &ldp->blit_sampler);
+		ctx->PSSetShaderResources(0, 1, &srv);
+		ctx->PSSetConstantBuffers(0, 1, &ldp->blit_cb);
+
+		// Draw fullscreen quad (4 vertices, triangle strip)
+		ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+		ctx->IASetInputLayout(NULL);
+		ctx->Draw(4, 0);
+
+		// Unbind SRV to prevent D3D11 hazard warnings
+		ID3D11ShaderResourceView *null_srv = NULL;
+		ctx->PSSetShaderResources(0, 1, &null_srv);
 		return;
 	}
 
@@ -288,6 +387,19 @@ leia_dp_d3d11_destroy(struct xrt_display_processor_d3d11 *xdp)
 {
 	struct leia_display_processor_d3d11_impl *ldp = leia_dp_d3d11(xdp);
 
+	if (ldp->blit_vs != NULL) {
+		ldp->blit_vs->Release();
+	}
+	if (ldp->blit_ps != NULL) {
+		ldp->blit_ps->Release();
+	}
+	if (ldp->blit_sampler != NULL) {
+		ldp->blit_sampler->Release();
+	}
+	if (ldp->blit_cb != NULL) {
+		ldp->blit_cb->Release();
+	}
+
 	if (ldp->sbs_srv != NULL) {
 		ldp->sbs_srv->Release();
 	}
@@ -318,6 +430,93 @@ leia_dp_d3d11_init_vtable(struct leia_display_processor_d3d11_impl *ldp)
 	ldp->base.get_display_dimensions = leia_dp_d3d11_get_display_dimensions;
 	ldp->base.get_display_pixel_info = leia_dp_d3d11_get_display_pixel_info;
 	ldp->base.destroy = leia_dp_d3d11_destroy;
+}
+
+
+/*
+ *
+ * Helper: compile blit shaders for 2D passthrough mode.
+ *
+ */
+
+static bool
+leia_dp_d3d11_init_blit(struct leia_display_processor_d3d11_impl *ldp)
+{
+	if (ldp->device == NULL) {
+		return false;
+	}
+
+	// Compile vertex shader
+	ID3DBlob *vs_blob = NULL;
+	ID3DBlob *error_blob = NULL;
+	HRESULT hr = D3DCompile(blit_vs_source, strlen(blit_vs_source), NULL, NULL, NULL,
+	                        "main", "vs_5_0", 0, 0, &vs_blob, &error_blob);
+	if (FAILED(hr)) {
+		if (error_blob != NULL) {
+			U_LOG_E("Leia D3D11 DP: blit VS compile error: %s",
+			        (const char *)error_blob->GetBufferPointer());
+			error_blob->Release();
+		}
+		return false;
+	}
+
+	hr = ldp->device->CreateVertexShader(vs_blob->GetBufferPointer(), vs_blob->GetBufferSize(),
+	                                     NULL, &ldp->blit_vs);
+	vs_blob->Release();
+	if (FAILED(hr)) {
+		U_LOG_E("Leia D3D11 DP: failed to create blit VS: 0x%08x", (unsigned)hr);
+		return false;
+	}
+
+	// Compile pixel shader
+	ID3DBlob *ps_blob = NULL;
+	hr = D3DCompile(blit_ps_source, strlen(blit_ps_source), NULL, NULL, NULL,
+	                "main", "ps_5_0", 0, 0, &ps_blob, &error_blob);
+	if (FAILED(hr)) {
+		if (error_blob != NULL) {
+			U_LOG_E("Leia D3D11 DP: blit PS compile error: %s",
+			        (const char *)error_blob->GetBufferPointer());
+			error_blob->Release();
+		}
+		return false;
+	}
+
+	hr = ldp->device->CreatePixelShader(ps_blob->GetBufferPointer(), ps_blob->GetBufferSize(),
+	                                    NULL, &ldp->blit_ps);
+	ps_blob->Release();
+	if (FAILED(hr)) {
+		U_LOG_E("Leia D3D11 DP: failed to create blit PS: 0x%08x", (unsigned)hr);
+		return false;
+	}
+
+	// Create sampler state (linear, clamp)
+	D3D11_SAMPLER_DESC sampler_desc = {};
+	sampler_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+	sampler_desc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+	sampler_desc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+	sampler_desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+	sampler_desc.MaxLOD = D3D11_FLOAT32_MAX;
+
+	hr = ldp->device->CreateSamplerState(&sampler_desc, &ldp->blit_sampler);
+	if (FAILED(hr)) {
+		U_LOG_E("Leia D3D11 DP: failed to create blit sampler: 0x%08x", (unsigned)hr);
+		return false;
+	}
+
+	// Create constant buffer (16 bytes: u_scale, v_scale, pad, pad)
+	D3D11_BUFFER_DESC cb_desc = {};
+	cb_desc.ByteWidth = 16;
+	cb_desc.Usage = D3D11_USAGE_DEFAULT;
+	cb_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+
+	hr = ldp->device->CreateBuffer(&cb_desc, NULL, &ldp->blit_cb);
+	if (FAILED(hr)) {
+		U_LOG_E("Leia D3D11 DP: failed to create blit CB: 0x%08x", (unsigned)hr);
+		return false;
+	}
+
+	U_LOG_I("Leia D3D11 DP: compiled 2D blit shaders");
+	return true;
 }
 
 
@@ -355,6 +554,11 @@ leia_dp_factory_d3d11(void *d3d11_device,
 	ldp->leiasr = weaver;
 	ldp->device = static_cast<ID3D11Device *>(d3d11_device);
 	ldp->view_count = 2;
+
+	// Compile blit shaders for 2D passthrough mode
+	if (!leia_dp_d3d11_init_blit(ldp)) {
+		U_LOG_W("Leia D3D11 DP: blit shader init failed — 2D mode will be unavailable");
+	}
 
 	*out_xdp = &ldp->base;
 
