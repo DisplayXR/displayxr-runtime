@@ -1591,10 +1591,14 @@ gl_init_resources(struct comp_gl_compositor *c, uint32_t width, uint32_t height)
 	// FBO for offscreen rendering into atlas texture
 	glGenFramebuffers(1, &c->fbo);
 
-	// Atlas stereo texture — worst-case size across all rendering modes
+	// Atlas stereo texture — when a display processor is present, the atlas
+	// must exactly match the content dimensions (tile_columns * view_width)
+	// because the weaver assumes atlas size == content size. Without a DP,
+	// use worst-case size across all rendering modes for fallback blit path.
 	uint32_t atlas_width = c->tile_columns * c->view_width;
 	uint32_t atlas_height = c->tile_rows * c->view_height;
-	if (c->xdev != NULL && c->xdev->rendering_mode_count > 0) {
+	if (c->display_processor == NULL &&
+	    c->xdev != NULL && c->xdev->rendering_mode_count > 0) {
 		u_tiling_compute_system_atlas(c->xdev->rendering_modes,
 		                              c->xdev->rendering_mode_count,
 		                              &atlas_width, &atlas_height);
@@ -1974,13 +1978,9 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 	}
 #endif
 
-	// Initialize GL resources
-	if (!gl_init_resources(c, width, height)) {
-		free(c);
-		return XRT_ERROR_OPENGL;
-	}
-
-	// Create display processor via factory if available
+	// Create display processor via factory BEFORE gl_init_resources so we can
+	// query display pixel info and scale view dimensions to window ratio.
+	// The atlas texture must be sized to match the scaled content dimensions.
 	if (dp_factory_gl != NULL) {
 		xrt_dp_factory_gl_fn_t factory = (xrt_dp_factory_gl_fn_t)dp_factory_gl;
 		xrt_result_t dp_ret = factory(window_handle, &c->display_processor);
@@ -1992,9 +1992,8 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 		}
 	}
 
-	// If display processor is available, scale view dimensions to window ratio
-	// (matching D3D11/D3D12 model). Without this, views use display-native dims
-	// which are larger than the window, causing partial viewport rendering.
+	// If display processor is available, scale width/height to window ratio
+	// (matching D3D11/D3D12 model) BEFORE creating GL resources.
 	if (c->display_processor != NULL) {
 		uint32_t disp_px_w = 0, disp_px_h = 0;
 		int32_t disp_left = 0, disp_top = 0;
@@ -2002,12 +2001,9 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 		        c->display_processor, &disp_px_w, &disp_px_h,
 		        &disp_left, &disp_top) &&
 		    disp_px_w > 0 && disp_px_h > 0) {
-			// Use half display width as base view dims
-			uint32_t base_vw = disp_px_w / 2;
-			uint32_t base_vh = disp_px_h;
 
 			U_LOG_W("Display pixel info: %ux%u, base view dims: %ux%u per eye",
-			        disp_px_w, disp_px_h, base_vw, base_vh);
+			        disp_px_w, disp_px_h, disp_px_w / 2, disp_px_h);
 
 			// Get actual window size for scaling
 			uint32_t win_w = width, win_h = height;
@@ -2030,18 +2026,25 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 			}
 #endif
 
-			// Scale by window/display pixel ratio (same as D3D11/D3D12)
+			// Scale display dims by window/display ratio (same as D3D11/D3D12).
+			// gl_init_resources divides by tile_columns/rows to get view dims.
 			float ratio = fminf(
 			    (float)win_w / (float)disp_px_w,
 			    (float)win_h / (float)disp_px_h);
 			if (ratio > 1.0f) {
 				ratio = 1.0f;
 			}
-			c->view_width = (uint32_t)((float)base_vw * ratio);
-			c->view_height = (uint32_t)((float)base_vh * ratio);
+			width = (uint32_t)((float)disp_px_w * ratio);
+			height = (uint32_t)((float)disp_px_h * ratio);
 			U_LOG_W("Scaled to window ratio %.3f: %ux%u per eye (window %ux%u)",
-			        ratio, c->view_width, c->view_height, win_w, win_h);
+			        ratio, width / 2, height, win_w, win_h);
 		}
+	}
+
+	// Initialize GL resources (atlas sized to match scaled content dims)
+	if (!gl_init_resources(c, width, height)) {
+		free(c);
+		return XRT_ERROR_OPENGL;
 	}
 
 	// Create HUD overlay for runtime-owned windows
