@@ -989,15 +989,7 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			xrt_display_processor_d3d11_process_atlas(
 			    c->display_processor, c->context, atlas_srv, view_width, view_height,
 			    tile_columns, tile_rows, DXGI_FORMAT_R8G8B8A8_UNORM, st_desc.Width, st_desc.Height);
-			weaving_done = c->hardware_display_3d;
-		}
-
-		if (!weaving_done) {
-			// 2D mode or no DP: stretch-blit content to shared texture
-			D3D11_TEXTURE2D_DESC st_desc2;
-			c->shared_texture->GetDesc(&st_desc2);
-			comp_d3d11_renderer_blit_stretch(c->renderer, c->shared_texture,
-			                                 st_desc2.Width, st_desc2.Height);
+			weaving_done = true;
 		}
 
 		c->context->Flush();
@@ -1034,17 +1026,7 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		xrt_display_processor_d3d11_process_atlas(
 		    c->display_processor, c->context, atlas_srv, view_width, view_height,
 		    tile_columns, tile_rows, DXGI_FORMAT_R8G8B8A8_UNORM, target_width, target_height);
-		weaving_done = c->hardware_display_3d;
-	}
-
-	// Fallback: DP was a no-op (2D mode) or no DP available — stretch-blit to target
-	if (!weaving_done) {
-		ID3D11Texture2D *back_buffer = static_cast<ID3D11Texture2D *>(
-		    comp_d3d11_target_get_back_buffer(c->target));
-		if (back_buffer != nullptr) {
-			comp_d3d11_renderer_blit_stretch(c->renderer, back_buffer,
-			                                 tgt_width, tgt_height);
-		}
+		weaving_done = true;
 	}
 
 	// HUD overlay (post-processing, always readable)
