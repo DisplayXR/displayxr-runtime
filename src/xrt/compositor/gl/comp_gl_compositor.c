@@ -903,7 +903,11 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				c->tile_columns = mode->tile_columns;
 				c->tile_rows = mode->tile_rows;
 			}
-			if (mode->view_width_pixels > 0) {
+			// When a DP is present, keep view dims at init values (matching
+			// D3D11/D3D12). The atlas was sized for the 3D mode's view dims
+			// and the 2D mode's native dims (2240x1400) would overflow it.
+			// The blit path stretches the smaller view to fill the window.
+			if (c->display_processor == NULL && mode->view_width_pixels > 0) {
 				c->view_width = mode->view_width_pixels;
 				c->view_height = mode->view_height_pixels;
 			}
@@ -1243,7 +1247,7 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 		comp_gl_window_macos_get_dimensions(c->macos_window, &present_w, &present_h);
 #endif
 
-		if (c->display_processor != NULL) {
+		if (c->display_processor != NULL && c->hardware_display_3d) {
 			// One-time diagnostic: log GL viewport/framebuffer dimensions
 			static bool gl_dp_dims_logged = false;
 			if (!gl_dp_dims_logged) {
