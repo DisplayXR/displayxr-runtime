@@ -1307,7 +1307,7 @@ oxr_xrRequestEyeTrackingModeEXT(XrSession session, XrEyeTrackingModeEXT mode)
 	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrRequestEyeTrackingModeEXT");
 
 	// Validate mode enum
-	if (mode != XR_EYE_TRACKING_MODE_SMOOTH_EXT && mode != XR_EYE_TRACKING_MODE_RAW_EXT) {
+	if (mode != XR_EYE_TRACKING_MODE_MANAGED_EXT && mode != XR_EYE_TRACKING_MODE_MANUAL_EXT) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE, "Invalid mode %d", (int)mode);
 	}
 
@@ -1315,7 +1315,7 @@ oxr_xrRequestEyeTrackingModeEXT(XrSession session, XrEyeTrackingModeEXT mode)
 	const struct xrt_system_compositor_info *info =
 	    sess->sys->xsysc ? &sess->sys->xsysc->info : NULL;
 	uint32_t supported = info ? info->supported_eye_tracking_modes : 0;
-	uint32_t bit = (mode == XR_EYE_TRACKING_MODE_RAW_EXT) ? 2 : 1;
+	uint32_t bit = (mode == XR_EYE_TRACKING_MODE_MANUAL_EXT) ? 2 : 1;
 	if (!(supported & bit)) {
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
 		                 "Eye tracking mode %d not supported by this system", (int)mode);

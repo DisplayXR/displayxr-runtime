@@ -238,9 +238,9 @@ out:
 				xsysc->info.nominal_viewer_x_m = dims.nominal_x_m;
 				xsysc->info.nominal_viewer_y_m = dims.nominal_y_m;
 				xsysc->info.nominal_viewer_z_m = dims.nominal_z_m;
-				// Leia SR: smooth eye tracking only (SDK handles grace period + smoothing)
-				xsysc->info.supported_eye_tracking_modes = 1; // SMOOTH_BIT
-				xsysc->info.default_eye_tracking_mode = 0;    // SMOOTH
+				// Leia SR: managed eye tracking only (SDK handles grace period + transitions)
+				xsysc->info.supported_eye_tracking_modes = 1; // MANAGED_BIT
+				xsysc->info.default_eye_tracking_mode = 0;    // MANAGED
 				U_LOG_W("XR_EXT_display_info: display=%.4f x %.4f m, nominal=(%.4f, %.4f, %.4f) m",
 				        dims.width_m, dims.height_m,
 				        dims.nominal_x_m, dims.nominal_y_m, dims.nominal_z_m);
@@ -310,9 +310,9 @@ out:
 				xsysc->info.recommended_view_scale_x = min_scale_x;
 				xsysc->info.recommended_view_scale_y = min_scale_y;
 
-				// Sim display: raw eye tracking only (simulated device, always "tracking")
-				xsysc->info.supported_eye_tracking_modes = 2; // RAW_BIT
-				xsysc->info.default_eye_tracking_mode = 1;    // RAW
+				// Sim display: manual eye tracking only (simulated device, always "tracking")
+				xsysc->info.supported_eye_tracking_modes = 2; // MANUAL_BIT
+				xsysc->info.default_eye_tracking_mode = 1;    // MANUAL
 				U_LOG_W("XR_EXT_display_info (sim_display): display=%.3fx%.3f m, "
 				        "nominal=(0, %.3f, %.3f) m, scale=%.2fx%.2f, atlas=%ux%u, pixels=%ux%u",
 				        sd_info.display_width_m, sd_info.display_height_m,

@@ -2872,11 +2872,11 @@ int main() {
         if (g_input.eyeTrackingModeToggleRequested) {
             g_input.eyeTrackingModeToggleRequested = false;
             if (xr.pfnRequestEyeTrackingModeEXT && xr.session != XR_NULL_HANDLE) {
-                XrEyeTrackingModeEXT newMode = (xr.activeEyeTrackingMode == XR_EYE_TRACKING_MODE_SMOOTH_EXT)
-                    ? XR_EYE_TRACKING_MODE_RAW_EXT : XR_EYE_TRACKING_MODE_SMOOTH_EXT;
+                XrEyeTrackingModeEXT newMode = (xr.activeEyeTrackingMode == XR_EYE_TRACKING_MODE_MANAGED_EXT)
+                    ? XR_EYE_TRACKING_MODE_MANUAL_EXT : XR_EYE_TRACKING_MODE_MANAGED_EXT;
                 XrResult etResult = xr.pfnRequestEyeTrackingModeEXT(xr.session, newMode);
                 LOG_INFO("Eye tracking mode -> %s (%s)",
-                    newMode == XR_EYE_TRACKING_MODE_RAW_EXT ? "RAW" : "SMOOTH",
+                    newMode == XR_EYE_TRACKING_MODE_MANUAL_EXT ? "MANUAL" : "MANAGED",
                     XR_SUCCEEDED(etResult) ? "OK" : "unsupported");
             }
         }
@@ -3157,7 +3157,7 @@ int main() {
                     }
 
                     // Eye tracking mode info
-                    const char *eyeModeName = (xr.activeEyeTrackingMode == 1) ? "RAW" : "SMOOTH";
+                    const char *eyeModeName = (xr.activeEyeTrackingMode == 1) ? "MANUAL" : "MANAGED";
                     char eyeTrackLine[80];
                     snprintf(eyeTrackLine, sizeof(eyeTrackLine), "Tracking: %s [%s] [T]",
                         xr.isEyeTracking ? "YES" : "NO", eyeModeName);

@@ -168,7 +168,7 @@ Compositor never weaves — that's the DP's job: `docs/adr/ADR-007-compositor-ne
 - `XR_EXT_android_surface_binding` — Android surface binding
 
 Full extension specs: `docs/specs/XR_EXT_display_info.md`, `docs/specs/XR_EXT_win32_window_binding.md`, `docs/specs/XR_EXT_cocoa_window_binding.md`.
-Eye tracking SMOOTH vs RAW contract: `docs/specs/eye-tracking-modes.md`.
+Eye tracking MANAGED vs MANUAL contract: `docs/specs/eye-tracking-modes.md`.
 
 ## Development Notes
 
@@ -235,7 +235,7 @@ See `docs/README.md` for a complete index. Key docs by task:
 | Understand extension API (display_info, window bindings) | `docs/specs/XR_EXT_display_info.md` |
 | Know why an architectural decision was made | `docs/adr/` (9 ADRs) |
 | Understand legacy vs extension app differences | `docs/specs/legacy-app-support.md` |
-| Understand eye tracking SMOOTH/RAW contract | `docs/specs/eye-tracking-modes.md` |
+| Understand eye tracking MANAGED/MANUAL contract | `docs/specs/eye-tracking-modes.md` |
 | Add a new OpenXR extension | `docs/notes/implementing-extension.md` |
 | Write a device driver | `docs/notes/writing-driver.md` |
 | Understand stereo math / Kooima projection | `docs/architecture/stereo3d-math.md` |

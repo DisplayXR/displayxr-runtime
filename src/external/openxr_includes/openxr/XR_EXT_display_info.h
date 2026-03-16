@@ -100,13 +100,13 @@ XRAPI_ATTR XrResult XRAPI_CALL xrRequestDisplayModeEXT(
 /*!
  * @brief Eye tracking mode enum.
  *
- * SMOOTH (0) is the default — apps that never call xrRequestEyeTrackingModeEXT
- * get current behavior (vendor SDK handles grace period + smoothing).
- * RAW (1) provides unfiltered positions + explicit isTracking flag.
+ * MANAGED (0) is the default — apps that never call xrRequestEyeTrackingModeEXT
+ * get current behavior (vendor SDK handles grace period + transitions).
+ * MANUAL (1) provides unfiltered positions + explicit isTracking flag.
  */
 typedef enum XrEyeTrackingModeEXT {
-    XR_EYE_TRACKING_MODE_SMOOTH_EXT   = 0,
-    XR_EYE_TRACKING_MODE_RAW_EXT      = 1,
+    XR_EYE_TRACKING_MODE_MANAGED_EXT  = 0,
+    XR_EYE_TRACKING_MODE_MANUAL_EXT   = 1,
     XR_EYE_TRACKING_MODE_MAX_ENUM_EXT = 0x7FFFFFFF
 } XrEyeTrackingModeEXT;
 
@@ -119,9 +119,9 @@ typedef XrFlags64 XrEyeTrackingModeCapabilityFlagsEXT;
 static const XrEyeTrackingModeCapabilityFlagsEXT
     XR_EYE_TRACKING_MODE_CAPABILITY_NONE_EXT       = 0;
 static const XrEyeTrackingModeCapabilityFlagsEXT
-    XR_EYE_TRACKING_MODE_CAPABILITY_SMOOTH_BIT_EXT = 0x00000001;
+    XR_EYE_TRACKING_MODE_CAPABILITY_MANAGED_BIT_EXT = 0x00000001;
 static const XrEyeTrackingModeCapabilityFlagsEXT
-    XR_EYE_TRACKING_MODE_CAPABILITY_RAW_BIT_EXT    = 0x00000002;
+    XR_EYE_TRACKING_MODE_CAPABILITY_MANUAL_BIT_EXT = 0x00000002;
 
 /*!
  * @brief Eye tracking mode capabilities — chained to XrSystemProperties.
@@ -167,8 +167,8 @@ typedef struct XrViewEyeTrackingStateEXT {
 /*!
  * @brief Request eye tracking mode switch.
  *
- * Switches between smooth and raw eye tracking modes. In smooth mode,
- * the vendor SDK handles grace period + smoothing internally. In raw mode,
+ * Switches between managed and manual eye tracking modes. In managed mode,
+ * the vendor SDK handles grace period + transitions internally. In manual mode,
  * the SDK provides unfiltered positions and the app uses isTracking to
  * handle tracking loss.
  *

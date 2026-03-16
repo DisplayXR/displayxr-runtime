@@ -225,13 +225,13 @@ std::wstring FormatEyeTrackingInfo(const float eyePositions[][3], uint32_t eyeCo
     }
 
     // Eye tracking mode info (v6)
-    const wchar_t* modeName = (activeMode == 1) ? L"RAW" : L"SMOOTH";
+    const wchar_t* modeName = (activeMode == 1) ? L"MANUAL" : L"MANAGED";
     oss << L"\nTracking: " << (isTracking ? L"YES" : L"NO") << L" [" << modeName << L"]";
     // Show supported modes
     oss << L"  (";
     bool first = true;
-    if (supportedModes & 0x1) { oss << L"SMOOTH"; first = false; }
-    if (supportedModes & 0x2) { if (!first) oss << L"|"; oss << L"RAW"; }
+    if (supportedModes & 0x1) { oss << L"MANAGED"; first = false; }
+    if (supportedModes & 0x2) { if (!first) oss << L"|"; oss << L"MANUAL"; }
     if (supportedModes == 0) { oss << L"none"; }
     oss << L") [T]";
     return oss.str();

@@ -99,8 +99,8 @@ struct XrSessionManager {
     PFN_xrRequestDisplayModeEXT pfnRequestDisplayModeEXT = nullptr;
 
     // Eye tracking mode control (XR_EXT_display_info v6)
-    uint32_t supportedEyeTrackingModes = 0;   // bitmask: SMOOTH_BIT=1, RAW_BIT=2
-    uint32_t defaultEyeTrackingMode = 0;      // 0=SMOOTH, 1=RAW
+    uint32_t supportedEyeTrackingModes = 0;   // bitmask: MANAGED_BIT=1, MANUAL_BIT=2
+    uint32_t defaultEyeTrackingMode = 0;      // 0=MANAGED, 1=MANUAL
     bool isEyeTracking = false;               // per-frame: true if eyes actively tracked
     uint32_t activeEyeTrackingMode = 0;       // per-frame: currently active mode
     PFN_xrRequestEyeTrackingModeEXT pfnRequestEyeTrackingModeEXT = nullptr;

@@ -838,8 +838,8 @@ float nominal_viewer_z_m;         // Nominal viewer Z (screen-centered, meters)
 float recommended_view_scale_x;   // Recommended render scale X
 float recommended_view_scale_y;   // Recommended render scale Y
 bool  hardware_display_3d;          // Is a hardware 3D display?
-uint32_t supported_eye_tracking_modes; // Bitmask: SMOOTH_BIT=1, RAW_BIT=2 (v6)
-uint32_t default_eye_tracking_mode;    // 0=SMOOTH, 1=RAW (v6)
+uint32_t supported_eye_tracking_modes; // Bitmask: MANAGED_BIT=1, MANUAL_BIT=2 (v6)
+uint32_t default_eye_tracking_mode;    // 0=MANAGED, 1=MANUAL (v6)
 ```
 
 **Coordinate system:** All positions are in display-local coordinates with
@@ -1032,7 +1032,7 @@ handles weaving and eye tracking.
 ### 6.6 Eye Tracking Mode Control (v6)
 
 Version 6 of `XR_EXT_display_info` adds eye tracking mode control, allowing apps
-to choose between smooth (SDK-filtered) and raw eye tracking.
+to choose between managed (SDK-filtered) and manual eye tracking.
 
 #### Required Internal Fields
 
@@ -1042,12 +1042,12 @@ are still valid — the vendor SDK provides reasonable fallback (last known, fil
 nominal viewer). The runtime passes vendor values through unchanged.
 
 **`xrt_system_compositor_info.supported_eye_tracking_modes`** — Bitmask set at init:
-- `1` (SMOOTH_BIT): SDK handles grace period + smoothing
-- `2` (RAW_BIT): SDK provides unfiltered positions
+- `1` (MANAGED_BIT): SDK handles grace period + smoothing
+- `2` (MANUAL_BIT): SDK provides unfiltered positions
 - `3` (both): Runtime supports both modes
 - `0`: No eye tracking (display only)
 
-**`xrt_system_compositor_info.default_eye_tracking_mode`** — `0` for SMOOTH, `1` for RAW.
+**`xrt_system_compositor_info.default_eye_tracking_mode`** — `0` for MANAGED, `1` for MANUAL.
 
 #### Capability Advertisement
 
@@ -1055,13 +1055,13 @@ Set these fields in `target_instance.c` alongside other `xrt_system_compositor_i
 fields:
 
 ```c
-// Leia SR: smooth only
-xsysc->info.supported_eye_tracking_modes = 1; // SMOOTH_BIT
-xsysc->info.default_eye_tracking_mode = 0;    // SMOOTH
+// Leia SR: managed only
+xsysc->info.supported_eye_tracking_modes = 1; // MANAGED_BIT
+xsysc->info.default_eye_tracking_mode = 0;    // MANAGED
 
-// Sim display: raw only
-xsysc->info.supported_eye_tracking_modes = 2; // RAW_BIT
-xsysc->info.default_eye_tracking_mode = 1;    // RAW
+// Sim display: manual only
+xsysc->info.supported_eye_tracking_modes = 2; // MANUAL_BIT
+xsysc->info.default_eye_tracking_mode = 1;    // MANUAL
 ```
 
 #### `is_tracking` Contract
@@ -1096,8 +1096,8 @@ returns `XR_ERROR_FEATURE_UNSUPPORTED` for any mode.
 
 | Vendor | `supported` | `default` | `is_tracking` source |
 |--------|-------------|-----------|---------------------|
-| Leia SR | `1` (SMOOTH) | `0` (SMOOTH) | Eye-distance heuristic: `dist² > 1e-6` |
-| Sim display | `2` (RAW) | `1` (RAW) | Always `true` (simulated) |
+| Leia SR | `1` (MANAGED) | `0` (MANAGED) | Eye-distance heuristic: `dist² > 1e-6` |
+| Sim display | `2` (MANUAL) | `1` (MANUAL) | Always `true` (simulated) |
 | No-tracker | `0` (NONE) | N/A | Always `false` |
 
 ### 6.7 Display Rendering Mode Control (v7)

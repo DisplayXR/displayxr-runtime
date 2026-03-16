@@ -6,11 +6,11 @@ issues: [81]
 code-paths: [src/external/openxr_includes/openxr/XR_EXT_display_info.h, src/xrt/state_trackers/oxr/]
 ---
 
-# SMOOTH vs RAW Eye Tracking Contract for Vendor-Controlled Display Transitions
+# MANAGED vs MANUAL Eye Tracking Contract for Vendor-Controlled Display Transitions
 
 ## Summary
 
-Formalize the contract between SMOOTH and RAW eye tracking modes with respect to vendor-controlled 2D/3D display transitions on tracking loss. Strategy: **SMOOTH = vendor owns all transitions, RAW = developer owns all transitions**. No new API needed -- this clarifies existing semantics and specifies vendor integration requirements.
+Formalize the contract between MANAGED and MANUAL eye tracking modes with respect to vendor-controlled 2D/3D display transitions on tracking loss. Strategy: **MANAGED = vendor SDK controls grace period, animations, auto 2D/3D switching; MANUAL = developer controls everything, SDK just reports isTracking immediately**. No new API needed -- this clarifies existing semantics and specifies vendor integration requirements.
 
 ## Background
 
@@ -18,8 +18,8 @@ Formalize the contract between SMOOTH and RAW eye tracking modes with respect to
 
 Today, `XR_EXT_display_info` v6 provides two eye tracking modes:
 
-- **SMOOTH** (`XR_EYE_TRACKING_MODE_SMOOTH_EXT = 0`): Vendor SDK handles grace period + smoothing. App sees filtered positions and an `isTracking` flag.
-- **RAW** (`XR_EYE_TRACKING_MODE_RAW_EXT = 1`): Vendor SDK provides unfiltered positions. App sees raw positions + `isTracking` flag and handles tracking loss itself.
+- **MANAGED** (`XR_EYE_TRACKING_MODE_MANAGED_EXT = 0`): Vendor SDK controls grace period, animations, and auto 2D/3D switching. App sees filtered positions and an `isTracking` flag.
+- **MANUAL** (`XR_EYE_TRACKING_MODE_MANUAL_EXT = 1`): Developer controls everything. SDK just reports `isTracking` immediately with no grace period, no animations, and no auto-switching. App handles tracking loss itself.
 
 And the rendering mode API (v7/v8) provides:
 
@@ -31,9 +31,9 @@ And the rendering mode API (v7/v8) provides:
 
 ## Contract
 
-### SMOOTH mode -- vendor controls everything
+### MANAGED mode -- vendor controls everything
 
-When the app is in SMOOTH mode (default), the vendor SDK owns the full tracking-loss lifecycle:
+When the app is in MANAGED mode (default), the vendor SDK owns the full tracking-loss lifecycle:
 
 1. **Tracking lost** -> Vendor SDK plays **collapse animation** (smoothly reduces IPD/parallax toward zero over a grace period, typically 500ms-2s)
 2. **Grace period expires** -> Vendor SDK auto-switches hardware display to 2D mode
@@ -41,21 +41,21 @@ When the app is in SMOOTH mode (default), the vendor SDK owns the full tracking-
 4. **During grace period**, if tracking resumes -> Vendor SDK plays revival animation directly, no 2D switch occurs
 
 The app receives:
-- Smooth, continuous eye positions throughout (no jumps)
+- Smoothed, continuous eye positions throughout (no jumps)
 - `isTracking` remains vendor-determined (may stay `true` during grace period, goes `false` after)
 - `XrEventDataRenderingModeChangedEXT` + `XrEventDataHardwareDisplayStateChangedEXT` when vendor auto-switches 2D<->3D
 
 The app is passive -- it does not need to call `xrRequestDisplayRenderingModeEXT` during these transitions.
 
-### RAW mode -- developer controls everything
+### MANUAL mode -- developer controls everything
 
-When the app requests RAW mode, the vendor SDK must:
+When the app requests MANUAL mode, the vendor SDK must:
 
 1. **Never play** collapse or revival animations
 2. **Never auto-switch** the display between 2D and 3D on tracking loss/recovery
 3. **Immediately report** `isTracking = false` when tracking is lost (no grace period hiding)
 4. **Immediately report** `isTracking = true` when tracking resumes
-5. **Return unfiltered** eye positions at all times
+5. **Return unprocessed** eye positions at all times
 
 The app is responsible for its own strategy:
 - Detect `isTracking` transition to `false`
@@ -77,9 +77,9 @@ bool vendor_sdk_set_tracking_loss_animation(struct vendor_sdk *sdk, bool enable)
 bool vendor_sdk_set_auto_display_mode_switch(struct vendor_sdk *sdk, bool enable);
 
 // Or combined:
-bool vendor_sdk_set_smooth_mode(struct vendor_sdk *sdk, bool enable);
-// enable=true: SDK plays animations + auto-switches 2D/3D (SMOOTH)
-// enable=false: SDK returns raw positions, no animations, no auto-switch (RAW)
+bool vendor_sdk_set_managed_mode(struct vendor_sdk *sdk, bool enable);
+// enable=true: SDK plays animations + auto-switches 2D/3D (MANAGED)
+// enable=false: SDK returns positions directly, no animations, no auto-switch (MANUAL)
 ```
 
 ### Display processor integration
@@ -87,12 +87,12 @@ bool vendor_sdk_set_smooth_mode(struct vendor_sdk *sdk, bool enable);
 The display processor must:
 
 1. **Store the active eye tracking mode** (like it now stores `view_count`)
-2. **On mode change** (`xrRequestEyeTrackingModeEXT`): call vendor SDK to enable/disable smooth behavior
-3. **In `get_predicted_eye_positions()`**: vendor SDK already behaves differently based on the mode setting -- no display processor post-processing needed for SMOOTH vs RAW (the SDK does it)
+2. **On mode change** (`xrRequestEyeTrackingModeEXT`): call vendor SDK to enable/disable managed behavior
+3. **In `get_predicted_eye_positions()`**: vendor SDK already behaves differently based on the mode setting -- no display processor post-processing needed for MANAGED vs MANUAL (the SDK does it)
 
-### Event propagation for vendor-initiated transitions (SMOOTH mode)
+### Event propagation for vendor-initiated transitions (MANAGED mode)
 
-When the vendor SDK auto-switches 2D/3D (during SMOOTH tracking loss/recovery), the runtime must fire events to the app. This requires a **callback or polling mechanism** from the vendor SDK to the display processor:
+When the vendor SDK auto-switches 2D/3D (during MANAGED tracking loss/recovery), the runtime must fire events to the app. This requires a **callback or polling mechanism** from the vendor SDK to the display processor:
 
 ```c
 // Option A: Vendor SDK callback
@@ -113,9 +113,9 @@ Vendor sets capability bits in `xrt_system_compositor_info`:
 
 | Vendor capability | `supported_eye_tracking_modes` | `default_eye_tracking_mode` |
 |---|---|---|
-| SDK has grace period + animation + auto-switch | `3` (SMOOTH \| RAW) | `0` (SMOOTH) |
-| SDK has smooth filtering only, no auto-switch control | `1` (SMOOTH only) | `0` (SMOOTH) |
-| SDK provides raw only (no filtering available) | `2` (RAW only) | `1` (RAW) |
+| SDK has grace period + animation + auto-switch | `3` (MANAGED \| MANUAL) | `0` (MANAGED) |
+| SDK has managed filtering only, no auto-switch control | `1` (MANAGED only) | `0` (MANAGED) |
+| SDK provides manual only (no filtering available) | `2` (MANUAL only) | `1` (MANUAL) |
 | No eye tracking | `0` | N/A |
 
 Ideally vendors support **both** modes (bits = 3), giving developers the choice.
@@ -128,8 +128,8 @@ Ideally vendors support **both** modes (bits = 3), giving developers the choice.
 
 ## Acceptance Criteria
 
-- [ ] Vendor integration guide updated with SMOOTH/RAW transition contract
+- [ ] Vendor integration guide updated with MANAGED/MANUAL transition contract
 - [ ] `XR_EXT_display_info.h` comments updated to document auto-switch behavior per mode
 - [ ] Leia SR display processors pass eye tracking mode to SDK wrapper when `xrRequestEyeTrackingModeEXT` is called
-- [ ] Event propagation path exists for vendor-initiated 2D/3D switches (SMOOTH mode auto-transitions fire `XrEventDataRenderingModeChangedEXT` + `XrEventDataHardwareDisplayStateChangedEXT`)
-- [ ] sim_display updated: RAW mode returns immediate `isTracking` transitions, SMOOTH mode simulates grace period (optional, for testing)
+- [ ] Event propagation path exists for vendor-initiated 2D/3D switches (MANAGED mode auto-transitions fire `XrEventDataRenderingModeChangedEXT` + `XrEventDataHardwareDisplayStateChangedEXT`)
+- [ ] sim_display updated: MANUAL mode returns immediate `isTracking` transitions, MANAGED mode simulates grace period (optional, for testing)
