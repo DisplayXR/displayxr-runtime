@@ -578,8 +578,20 @@ d3d12_render_hud_overlay(struct comp_d3d12_compositor *c,
 	data.nominal_x = nom_x;
 	data.nominal_y = nom_y;
 	data.nominal_z = nom_z;
-	data.eye_count = eye_pos->count;
-	for (uint32_t e = 0; e < eye_pos->count && e < 8; e++) {
+	// Use the active rendering mode's view_count for eye display (not eye_pos->count,
+	// which may report more eyes than the mode uses — e.g. tracker returns L/R in 2D mode).
+	uint32_t mode_eye_count = eye_pos->count;
+	if (c->xdev != NULL && c->xdev->hmd != NULL) {
+		uint32_t midx = c->xdev->hmd->active_rendering_mode_index;
+		if (midx < c->xdev->rendering_mode_count) {
+			mode_eye_count = c->xdev->rendering_modes[midx].view_count;
+		}
+	}
+	if (mode_eye_count > eye_pos->count) {
+		mode_eye_count = eye_pos->count;
+	}
+	data.eye_count = mode_eye_count;
+	for (uint32_t e = 0; e < mode_eye_count && e < 8; e++) {
 		data.eyes[e].x = eye_pos->eyes[e].x * 1000.0f;
 		data.eyes[e].y = eye_pos->eyes[e].y * 1000.0f;
 		data.eyes[e].z = eye_pos->eyes[e].z * 1000.0f;
