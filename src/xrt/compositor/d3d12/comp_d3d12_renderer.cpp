@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cmath>
 
 // Access compositor internals for the device
 extern "C" {
@@ -78,6 +79,61 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
 }
 )";
 
+// Quad vertex shader for window-space layers (MVP + UV post_transform via root constants)
+static const char *quad_vs_source = R"(
+cbuffer LayerCB : register(b0) {
+	float4x4 mvp;
+	float4 post_transform;
+	float4 color_scale;
+	float4 color_bias;
+};
+
+struct VS_OUTPUT {
+	float4 position : SV_Position;
+	float2 uv : TEXCOORD0;
+};
+
+static const float2 quad_positions[4] = {
+	float2(0.0, 0.0),
+	float2(0.0, 1.0),
+	float2(1.0, 0.0),
+	float2(1.0, 1.0),
+};
+
+VS_OUTPUT main(uint vertex_id : SV_VertexID) {
+	VS_OUTPUT output;
+	float2 in_uv = quad_positions[vertex_id % 4];
+	float2 pos = in_uv - 0.5;
+	output.position = mul(mvp, float4(pos, 0.0, 1.0));
+	output.uv = in_uv * post_transform.zw + post_transform.xy;
+	return output;
+}
+)";
+
+// Quad pixel shader with color_scale + color_bias
+static const char *quad_ps_source = R"(
+cbuffer LayerCB : register(b0) {
+	float4x4 mvp;
+	float4 post_transform;
+	float4 color_scale;
+	float4 color_bias;
+};
+
+Texture2D layer_tex : register(t0);
+SamplerState layer_samp : register(s0);
+
+struct VS_OUTPUT {
+	float4 position : SV_Position;
+	float2 uv : TEXCOORD0;
+};
+
+float4 main(VS_OUTPUT input) : SV_Target {
+	float4 color = layer_tex.Sample(layer_samp, input.uv);
+	color = color * color_scale + color_bias;
+	return color;
+}
+)";
+
 /*!
  * D3D12 renderer structure.
  */
@@ -92,7 +148,7 @@ struct comp_d3d12_renderer
 	//! RTV descriptor heap for atlas texture.
 	ID3D12DescriptorHeap *rtv_heap;
 
-	//! SRV/CBV descriptor heap (shader visible).
+	//! SRV/CBV descriptor heap (shader visible, 2 slots: atlas + window-space layer).
 	ID3D12DescriptorHeap *srv_heap;
 
 	//! Root signature for blit operations.
@@ -100,6 +156,15 @@ struct comp_d3d12_renderer
 
 	//! Blit PSO.
 	ID3D12PipelineState *blit_pso;
+
+	//! Root signature for quad (window-space layer) operations.
+	ID3D12RootSignature *quad_root_signature;
+
+	//! Quad PSO with alpha blending.
+	ID3D12PipelineState *quad_pso;
+
+	//! Quad PSO with premultiplied alpha blending.
+	ID3D12PipelineState *quad_pso_premul;
 
 	//! Descriptor sizes.
 	uint32_t rtv_descriptor_size;
@@ -167,7 +232,7 @@ create_atlas_texture(struct comp_d3d12_renderer *r, ID3D12Device *device, uint32
 	D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle = r->rtv_heap->GetCPUDescriptorHandleForHeapStart();
 	device->CreateRenderTargetView(r->atlas_texture, nullptr, rtv_handle);
 
-	// Create SRV for stereo texture
+	// Create SRV for stereo texture in slot 0
 	D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
 	srv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
 	srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -178,6 +243,176 @@ create_atlas_texture(struct comp_d3d12_renderer *r, ID3D12Device *device, uint32
 	device->CreateShaderResourceView(r->atlas_texture, &srv_desc, srv_cpu);
 
 	return XRT_SUCCESS;
+}
+
+
+static void
+get_color_scale_bias(const struct xrt_layer_data *data, float color_scale[4], float color_bias[4])
+{
+	bool has = (data->flags & XRT_LAYER_COMPOSITION_COLOR_BIAS_SCALE) != 0;
+	if (has) {
+		color_scale[0] = data->color_scale.r;
+		color_scale[1] = data->color_scale.g;
+		color_scale[2] = data->color_scale.b;
+		color_scale[3] = data->color_scale.a;
+		color_bias[0] = data->color_bias.r;
+		color_bias[1] = data->color_bias.g;
+		color_bias[2] = data->color_bias.b;
+		color_bias[3] = data->color_bias.a;
+	} else {
+		color_scale[0] = 1.0f;
+		color_scale[1] = 1.0f;
+		color_scale[2] = 1.0f;
+		color_scale[3] = 1.0f;
+		color_bias[0] = 0.0f;
+		color_bias[1] = 0.0f;
+		color_bias[2] = 0.0f;
+		color_bias[3] = 0.0f;
+	}
+}
+
+
+/*!
+ * Render a window-space layer onto the atlas for a given view.
+ * Ported from D3D11's render_window_space_layer().
+ */
+static void
+render_window_space_layer(struct comp_d3d12_renderer *r,
+                          ID3D12GraphicsCommandList *cmd_list,
+                          const struct comp_layer *layer,
+                          uint32_t view_index)
+{
+	auto internals = get_internals(r->c);
+	ID3D12Device *device = internals->device;
+	const struct xrt_layer_data *data = &layer->data;
+	const struct xrt_layer_window_space_data *ws = &data->window_space;
+
+	// Get swapchain resource
+	struct xrt_swapchain *xsc = layer->sc_array[0];
+	if (xsc == nullptr) {
+		return;
+	}
+
+	uint32_t image_index = ws->sub.image_index;
+	ID3D12Resource *src_resource = static_cast<ID3D12Resource *>(
+	    comp_d3d12_swapchain_get_resource(xsc, image_index));
+	if (src_resource == nullptr) {
+		return;
+	}
+
+	// Transition swapchain image to PIXEL_SHADER_RESOURCE for sampling
+	D3D12_RESOURCE_BARRIER src_barrier = {};
+	src_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	src_barrier.Transition.pResource = src_resource;
+	src_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+	src_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+	src_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	cmd_list->ResourceBarrier(1, &src_barrier);
+
+	// Create transient SRV for the window-space texture in slot 1
+	D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+	D3D12_RESOURCE_DESC res_desc = src_resource->GetDesc();
+	srv_desc.Format = res_desc.Format;
+	srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+	srv_desc.Texture2D.MipLevels = 1;
+	srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+
+	D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu = r->srv_heap->GetCPUDescriptorHandleForHeapStart();
+	srv_cpu.ptr += r->srv_descriptor_size; // slot 1
+	device->CreateShaderResourceView(src_resource, &srv_desc, srv_cpu);
+
+	// Compute per-eye disparity offset
+	float half_disp = ws->disparity / 2.0f;
+	float eye_shift = (view_index == 0) ? -half_disp : half_disp;
+
+	// Window-space fractional coords -> NDC [-1, 1]
+	float frac_cx = ws->x + ws->width / 2.0f + eye_shift;
+	float frac_cy = ws->y + ws->height / 2.0f;
+
+	float ndc_cx = frac_cx * 2.0f - 1.0f;
+	float ndc_cy = 1.0f - frac_cy * 2.0f;
+
+	float ndc_sx = ws->width * 2.0f;
+	float ndc_sy = -(ws->height * 2.0f);
+
+	// Build 2D orthographic MVP (column-major for HLSL float4x4)
+	// The quad VS uses a [-0.5, 0.5] unit quad
+	float mvp[16];
+	// clang-format off
+	mvp[0]  = ndc_sx; mvp[1]  = 0.0f;   mvp[2]  = 0.0f; mvp[3]  = 0.0f;
+	mvp[4]  = 0.0f;   mvp[5]  = ndc_sy;  mvp[6]  = 0.0f; mvp[7]  = 0.0f;
+	mvp[8]  = 0.0f;   mvp[9]  = 0.0f;   mvp[10] = 1.0f; mvp[11] = 0.0f;
+	mvp[12] = ndc_cx; mvp[13] = ndc_cy;  mvp[14] = 0.5f; mvp[15] = 1.0f;
+	// clang-format on
+
+	// UV post_transform for sub-image
+	float post_transform[4];
+	post_transform[0] = ws->sub.norm_rect.x;
+	post_transform[1] = ws->sub.norm_rect.y;
+	post_transform[2] = ws->sub.norm_rect.w;
+	post_transform[3] = ws->sub.norm_rect.h;
+
+	if (data->flip_y) {
+		post_transform[1] += post_transform[3];
+		post_transform[3] = -post_transform[3];
+	}
+
+	float color_scale[4];
+	float color_bias[4];
+	get_color_scale_bias(data, color_scale, color_bias);
+
+	// Set quad root signature and PSO
+	bool is_premultiplied = (data->flags & XRT_LAYER_COMPOSITION_BLEND_TEXTURE_SOURCE_ALPHA_BIT) == 0;
+	ID3D12PipelineState *pso = is_premultiplied ? r->quad_pso_premul : r->quad_pso;
+
+	cmd_list->SetGraphicsRootSignature(r->quad_root_signature);
+	cmd_list->SetPipelineState(pso);
+
+	// Set root constants (28 floats: mvp[16] + post_transform[4] + color_scale[4] + color_bias[4])
+	cmd_list->SetGraphicsRoot32BitConstants(1, 16, mvp, 0);
+	cmd_list->SetGraphicsRoot32BitConstants(1, 4, post_transform, 16);
+	cmd_list->SetGraphicsRoot32BitConstants(1, 4, color_scale, 20);
+	cmd_list->SetGraphicsRoot32BitConstants(1, 4, color_bias, 24);
+
+	// Set descriptor heap and SRV table pointing to slot 1 (window-space texture)
+	ID3D12DescriptorHeap *heaps[] = {r->srv_heap};
+	cmd_list->SetDescriptorHeaps(1, heaps);
+
+	D3D12_GPU_DESCRIPTOR_HANDLE gpu_srv = r->srv_heap->GetGPUDescriptorHandleForHeapStart();
+	gpu_srv.ptr += r->srv_descriptor_size; // slot 1
+	cmd_list->SetGraphicsRootDescriptorTable(0, gpu_srv);
+
+	// Set RTV (atlas as render target) — viewport for the current view tile
+	D3D12_CPU_DESCRIPTOR_HANDLE rtv = r->rtv_heap->GetCPUDescriptorHandleForHeapStart();
+	cmd_list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+
+	uint32_t tile_x = (view_index % r->tile_columns) * r->view_width;
+	uint32_t tile_y = (view_index / r->tile_columns) * r->view_height;
+
+	D3D12_VIEWPORT vp = {};
+	vp.TopLeftX = (float)tile_x;
+	vp.TopLeftY = (float)tile_y;
+	vp.Width = (float)r->view_width;
+	vp.Height = (float)r->view_height;
+	vp.MinDepth = 0.0f;
+	vp.MaxDepth = 1.0f;
+	cmd_list->RSSetViewports(1, &vp);
+
+	D3D12_RECT scissor = {};
+	scissor.left = tile_x;
+	scissor.top = tile_y;
+	scissor.right = tile_x + r->view_width;
+	scissor.bottom = tile_y + r->view_height;
+	cmd_list->RSSetScissorRects(1, &scissor);
+
+	// Draw quad (triangle strip, 4 vertices)
+	cmd_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+	cmd_list->DrawInstanced(4, 1, 0, 0);
+
+	// Transition swapchain image back to RENDER_TARGET
+	src_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+	src_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+	cmd_list->ResourceBarrier(1, &src_barrier);
 }
 
 
@@ -236,9 +471,9 @@ comp_d3d12_renderer_create(struct comp_d3d12_compositor *c,
 		return XRT_ERROR_D3D;
 	}
 
-	// Create SRV descriptor heap (shader visible, 1 SRV for stereo texture)
+	// Create SRV descriptor heap (shader visible, 2 SRVs: atlas + window-space layer)
 	D3D12_DESCRIPTOR_HEAP_DESC srv_heap_desc = {};
-	srv_heap_desc.NumDescriptors = 1;
+	srv_heap_desc.NumDescriptors = 2;
 	srv_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
 	srv_heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
 
@@ -365,6 +600,133 @@ comp_d3d12_renderer_create(struct comp_d3d12_compositor *c,
 		return XRT_ERROR_D3D;
 	}
 
+	// --- Quad root signature: SRV table (param 0) + 28 root constants (param 1) + static sampler ---
+	D3D12_DESCRIPTOR_RANGE quad_srv_range = {};
+	quad_srv_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+	quad_srv_range.NumDescriptors = 1;
+	quad_srv_range.BaseShaderRegister = 0;
+	quad_srv_range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+	D3D12_ROOT_PARAMETER quad_root_params[2] = {};
+
+	// Param 0: SRV descriptor table
+	quad_root_params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+	quad_root_params[0].DescriptorTable.NumDescriptorRanges = 1;
+	quad_root_params[0].DescriptorTable.pDescriptorRanges = &quad_srv_range;
+	quad_root_params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+	// Param 1: 28 root constants (mvp[16] + post_transform[4] + color_scale[4] + color_bias[4])
+	quad_root_params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+	quad_root_params[1].Constants.ShaderRegister = 0;
+	quad_root_params[1].Constants.RegisterSpace = 0;
+	quad_root_params[1].Constants.Num32BitValues = 28;
+	quad_root_params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+	D3D12_STATIC_SAMPLER_DESC quad_sampler = {};
+	quad_sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+	quad_sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+	quad_sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+	quad_sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+	quad_sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+	quad_sampler.MaxLOD = D3D12_FLOAT32_MAX;
+	quad_sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+	D3D12_ROOT_SIGNATURE_DESC quad_rs_desc = {};
+	quad_rs_desc.NumParameters = 2;
+	quad_rs_desc.pParameters = quad_root_params;
+	quad_rs_desc.NumStaticSamplers = 1;
+	quad_rs_desc.pStaticSamplers = &quad_sampler;
+	quad_rs_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+
+	sig_blob = nullptr;
+	error_blob = nullptr;
+	hr = D3D12SerializeRootSignature(&quad_rs_desc, D3D_ROOT_SIGNATURE_VERSION_1, &sig_blob, &error_blob);
+	if (FAILED(hr)) {
+		if (error_blob != nullptr) {
+			U_LOG_E("Quad root signature serialize error: %s",
+			        static_cast<const char *>(error_blob->GetBufferPointer()));
+			error_blob->Release();
+		}
+		comp_d3d12_renderer_destroy(&r);
+		return XRT_ERROR_D3D;
+	}
+
+	hr = device->CreateRootSignature(0, sig_blob->GetBufferPointer(), sig_blob->GetBufferSize(),
+	                                  __uuidof(ID3D12RootSignature),
+	                                  reinterpret_cast<void **>(&r->quad_root_signature));
+	sig_blob->Release();
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to create quad root signature: 0x%08x", hr);
+		comp_d3d12_renderer_destroy(&r);
+		return XRT_ERROR_D3D;
+	}
+
+	// --- Compile quad shaders and create alpha-blend PSO ---
+	ID3DBlob *quad_vs_blob = nullptr;
+	ID3DBlob *quad_ps_blob = nullptr;
+
+	hr = compile_shader(quad_vs_source, "main", "vs_5_0", &quad_vs_blob);
+	if (FAILED(hr)) {
+		comp_d3d12_renderer_destroy(&r);
+		return XRT_ERROR_D3D;
+	}
+
+	hr = compile_shader(quad_ps_source, "main", "ps_5_0", &quad_ps_blob);
+	if (FAILED(hr)) {
+		quad_vs_blob->Release();
+		comp_d3d12_renderer_destroy(&r);
+		return XRT_ERROR_D3D;
+	}
+
+	// Standard alpha blend PSO
+	D3D12_GRAPHICS_PIPELINE_STATE_DESC quad_pso_desc = {};
+	quad_pso_desc.pRootSignature = r->quad_root_signature;
+	quad_pso_desc.VS.pShaderBytecode = quad_vs_blob->GetBufferPointer();
+	quad_pso_desc.VS.BytecodeLength = quad_vs_blob->GetBufferSize();
+	quad_pso_desc.PS.pShaderBytecode = quad_ps_blob->GetBufferPointer();
+	quad_pso_desc.PS.BytecodeLength = quad_ps_blob->GetBufferSize();
+	quad_pso_desc.BlendState.RenderTarget[0].BlendEnable = TRUE;
+	quad_pso_desc.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
+	quad_pso_desc.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+	quad_pso_desc.BlendState.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
+	quad_pso_desc.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
+	quad_pso_desc.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_ZERO;
+	quad_pso_desc.BlendState.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
+	quad_pso_desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+	quad_pso_desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+	quad_pso_desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+	quad_pso_desc.RasterizerState.DepthClipEnable = TRUE;
+	quad_pso_desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+	quad_pso_desc.NumRenderTargets = 1;
+	quad_pso_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+	quad_pso_desc.SampleDesc.Count = 1;
+	quad_pso_desc.SampleMask = UINT_MAX;
+
+	hr = device->CreateGraphicsPipelineState(&quad_pso_desc, __uuidof(ID3D12PipelineState),
+	                                          reinterpret_cast<void **>(&r->quad_pso));
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to create quad PSO: 0x%08x", hr);
+		quad_vs_blob->Release();
+		quad_ps_blob->Release();
+		comp_d3d12_renderer_destroy(&r);
+		return XRT_ERROR_D3D;
+	}
+
+	// Premultiplied alpha blend PSO
+	quad_pso_desc.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_ONE;
+	quad_pso_desc.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+
+	hr = device->CreateGraphicsPipelineState(&quad_pso_desc, __uuidof(ID3D12PipelineState),
+	                                          reinterpret_cast<void **>(&r->quad_pso_premul));
+	quad_vs_blob->Release();
+	quad_ps_blob->Release();
+
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to create quad premul PSO: 0x%08x", hr);
+		comp_d3d12_renderer_destroy(&r);
+		return XRT_ERROR_D3D;
+	}
+
 	*out_renderer = r;
 
 	U_LOG_I("Created D3D12 renderer: %ux%u per view, atlas %ux%u (%u cols x %u rows), texture_h=%u",
@@ -385,6 +747,15 @@ comp_d3d12_renderer_destroy(struct comp_d3d12_renderer **renderer_ptr)
 
 	comp_d3d12_renderer *r = *renderer_ptr;
 
+	if (r->quad_pso_premul != nullptr) {
+		r->quad_pso_premul->Release();
+	}
+	if (r->quad_pso != nullptr) {
+		r->quad_pso->Release();
+	}
+	if (r->quad_root_signature != nullptr) {
+		r->quad_root_signature->Release();
+	}
 	if (r->blit_pso != nullptr) {
 		r->blit_pso->Release();
 	}
@@ -444,6 +815,15 @@ comp_d3d12_renderer_draw(struct comp_d3d12_renderer *renderer,
 
 	// Determine view count
 	uint32_t view_count = hardware_display_3d ? 2 : 1;
+
+	// Check if any window-space layers exist
+	bool has_window_space = false;
+	for (uint32_t li = 0; li < layers->layer_count; li++) {
+		if (layers->layers[li].data.type == XRT_LAYER_WINDOW_SPACE) {
+			has_window_space = true;
+			break;
+		}
+	}
 
 	// For each projection layer, copy swapchain images into left/right halves
 	for (uint32_t li = 0; li < layers->layer_count; li++) {
@@ -562,10 +942,32 @@ comp_d3d12_renderer_draw(struct comp_d3d12_renderer *renderer,
 		}
 	}
 
-	// Transition stereo texture back to shader resource for display processor
-	barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-	barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-	cmd_list->ResourceBarrier(1, &barrier);
+	// If window-space layers exist, transition atlas to RENDER_TARGET and draw them
+	if (has_window_space) {
+		barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+		barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+		cmd_list->ResourceBarrier(1, &barrier);
+
+		for (uint32_t vi = 0; vi < view_count; vi++) {
+			for (uint32_t li = 0; li < layers->layer_count; li++) {
+				struct comp_layer *layer = &layers->layers[li];
+				if (layer->data.type != XRT_LAYER_WINDOW_SPACE) {
+					continue;
+				}
+				render_window_space_layer(renderer, cmd_list, layer, vi);
+			}
+		}
+
+		// Transition atlas: RENDER_TARGET → PIXEL_SHADER_RESOURCE
+		barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+		barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+		cmd_list->ResourceBarrier(1, &barrier);
+	} else {
+		// No window-space layers: transition directly COPY_DEST → PIXEL_SHADER_RESOURCE
+		barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+		barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+		cmd_list->ResourceBarrier(1, &barrier);
+	}
 
 	return XRT_SUCCESS;
 }

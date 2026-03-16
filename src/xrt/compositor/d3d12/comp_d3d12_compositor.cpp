@@ -376,6 +376,32 @@ d3d12_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 					if (xret == XRT_SUCCESS) {
 						c->settings.preferred.width = new_width;
 						c->settings.preferred.height = new_height;
+
+						// Scale renderer proportionally (same as D3D11)
+						if (c->display_processor != nullptr) {
+							uint32_t disp_px_w = 0, disp_px_h = 0;
+							int32_t disp_left = 0, disp_top = 0;
+							if (xrt_display_processor_d3d12_get_display_pixel_info(
+							        c->display_processor, &disp_px_w, &disp_px_h,
+							        &disp_left, &disp_top) &&
+							    disp_px_w > 0 && disp_px_h > 0) {
+								uint32_t base_vw = disp_px_w / 2;
+								uint32_t base_vh = disp_px_h;
+								float ratio = fminf(
+								    (float)new_width / (float)disp_px_w,
+								    (float)new_height / (float)disp_px_h);
+								if (ratio > 1.0f) {
+									ratio = 1.0f;
+								}
+								uint32_t new_vw = (uint32_t)((float)base_vw * ratio);
+								uint32_t new_vh = (uint32_t)((float)base_vh * ratio);
+								comp_d3d12_renderer_resize(c->renderer, new_vw, new_vh, new_vh);
+							}
+						} else {
+							uint32_t new_vw = new_width / 2;
+							uint32_t new_vh = new_height;
+							comp_d3d12_renderer_resize(c->renderer, new_vw, new_vh, new_height);
+						}
 					}
 				}
 			}
