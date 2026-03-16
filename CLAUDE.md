@@ -80,10 +80,12 @@ Legacy app compromise scaling is computed in `oxr_system_fill_in()` — see `doc
 - Compositor vtable has 56 methods — use `comp_base` helper for boilerplate
 - IPC/service mode (`ipc/`, `compositor/client/`, `compositor/multi/`) must be preserved for `_ipc` apps, WebXR, and multi-app spatial shell
 - `compositor/null/` — headless compositor for testing
-- Swapchain images are runtime-allocated (xrCreateSwapchain), worst-case sized at init.
-  Per-frame atlas (tile_columns * view_width × tile_rows * view_height) is smaller.
-  Compositors must crop valid region before passing to DP.
-  See docs/specs/multiview-tiling.md "Compositor-Side Contract" section.
+- **Two distinct swapchains per compositor:**
+  - **App swapchain** — runtime-allocated (`xrCreateSwapchain`), worst-case sized at init. App renders atlas of tiled views into this.
+  - **Target swapchain** — compositor's output to the display, window-sized. DP writes interlaced output here.
+  - Pipeline: app swapchain → compositor crops atlas to content dims → DP interlaces → target swapchain → present.
+  - These are unrelated — the app swapchain flows in, the target swapchain flows out.
+  - See `docs/specs/multiview-tiling.md` "Compositor-Side Contract" section.
 
 - **Canvas concept:** View dimensions and Kooima projection must be based on **canvas** size (the sub-rect of the window where 3D content appears), not display size. Critical for `_shared` apps where the canvas may be smaller than the display. See `docs/specs/multiview-tiling.md` "Terminology: Display, Window, Canvas".
 

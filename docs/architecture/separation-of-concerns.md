@@ -28,7 +28,7 @@ This document defines what each architectural layer owns and what must not cross
 
 ## Layer 3: Native Compositors (`src/xrt/compositor/`)
 
-- Graphics API-specific swapchain creation and image management
+- Graphics API-specific swapchain creation (both app swapchain and target swapchain) and image management
 - Layer accumulation and atlas rendering (tile all views into one texture)
 - Display processor instantiation via factory from `xrt_system_compositor_info`
 - Calls `xdp->process_atlas()` to transform atlas → display output

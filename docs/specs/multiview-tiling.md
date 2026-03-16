@@ -203,6 +203,30 @@ No more stereo special case -- all view layouts handled through tiling.
 
 ## Compositor-Side Contract: Swapchain → Crop → Display Processor
 
+### Two Distinct Swapchains
+
+The compositor sits between two separate swapchains — they are unrelated and serve different purposes:
+
+| Swapchain | Created by | Size | Purpose |
+|---|---|---|---|
+| **App swapchain** | Runtime via `xrCreateSwapchain` | Fixed at init, worst-case across all modes | App renders atlas of tiled views into this |
+| **Target swapchain** | Compositor at init (or app-provided window) | Window/display resolution | DP writes interlaced output here; compositor presents to display |
+
+End-to-end pipeline:
+
+```
+App renders into app swapchain (fixed size, atlas of tiled views)
+        ↓
+Compositor reads atlas from app swapchain
+Compositor crops to content dims (if smaller than swapchain)
+        ↓
+DP interlaces cropped atlas → target swapchain (window-sized)
+        ↓
+Compositor presents target swapchain to display
+```
+
+The app swapchain flows **into** the compositor; the target swapchain flows **out** to the display. They never share images.
+
 ### Swapchain images are worst-case sized
 
 Swapchain images are runtime-allocated (via `xrCreateSwapchain`) and **fixed at init** to the worst-case dimensions across all rendering modes:
