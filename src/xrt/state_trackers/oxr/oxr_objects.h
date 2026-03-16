@@ -2000,7 +2000,7 @@ struct oxr_session
 	//! True if display hardware is currently in 3D mode.
 	bool hardware_display_3d;
 
-	//! Active eye tracking mode (0=SMOOTH, 1=RAW). Default: 0 (SMOOTH).
+	//! Active eye tracking mode (0=MANAGED, 1=MANUAL). Default: 0 (MANAGED).
 	uint32_t eye_tracking_mode;
 
 	//! Cached rendering mode index for detecting compositor-driven mode changes.

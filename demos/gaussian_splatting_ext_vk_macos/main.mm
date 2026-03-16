@@ -1169,8 +1169,8 @@ int main() {
         if (g_input.eyeTrackingModeToggleRequested) {
             g_input.eyeTrackingModeToggleRequested = false;
             if (xr.pfnRequestEyeTrackingModeEXT && xr.session != XR_NULL_HANDLE) {
-                XrEyeTrackingModeEXT newMode = (xr.activeEyeTrackingMode == XR_EYE_TRACKING_MODE_SMOOTH_EXT)
-                    ? XR_EYE_TRACKING_MODE_RAW_EXT : XR_EYE_TRACKING_MODE_SMOOTH_EXT;
+                XrEyeTrackingModeEXT newMode = (xr.activeEyeTrackingMode == XR_EYE_TRACKING_MODE_MANAGED_EXT)
+                    ? XR_EYE_TRACKING_MODE_MANUAL_EXT : XR_EYE_TRACKING_MODE_MANAGED_EXT;
                 xr.pfnRequestEyeTrackingModeEXT(xr.session, newMode);
             }
         }

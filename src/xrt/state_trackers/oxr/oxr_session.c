@@ -1577,7 +1577,7 @@ oxr_session_locate_views(struct oxr_logger *log,
 				ets->isTracking = eye_pos.is_tracking ? XR_TRUE : XR_FALSE;
 			} else {
 				// No eye tracking backend or invalid data.
-				// For sim_display (RAW_BIT, always "tracking"), eye positions
+				// For sim_display (MANUAL_BIT, always "tracking"), eye positions
 				// come from nominal viewer, not the eye tracking path.
 				// Report isTracking based on whether the system has tracking
 				// and the nominal path was used successfully.

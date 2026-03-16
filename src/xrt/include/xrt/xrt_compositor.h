@@ -2474,10 +2474,10 @@ struct xrt_system_compositor_info
 	//! Display top edge in OS screen coordinates. 0 if unknown.
 	int32_t display_screen_top;
 
-	//! Bitmask of supported eye tracking modes (SMOOTH_BIT=1, RAW_BIT=2). 0 = no tracking.
+	//! Bitmask of supported eye tracking modes (MANAGED_BIT=1, MANUAL_BIT=2). 0 = no tracking.
 	uint32_t supported_eye_tracking_modes;
 
-	//! Default eye tracking mode (0=SMOOTH, 1=RAW).
+	//! Default eye tracking mode (0=MANAGED, 1=MANUAL).
 	uint32_t default_eye_tracking_mode;
 
 	/*!

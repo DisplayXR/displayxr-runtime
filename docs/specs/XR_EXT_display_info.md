@@ -78,7 +78,7 @@ This proposal introduces four independent but complementary extensions:
 | `XR_EXT_win32_window_binding` | App provides a Win32 HWND for runtime rendering; enables windowed mode, multi-app, app-controlled input, and window-space overlay layers. |
 | `XR_EXT_android_surface_binding` | App provides an Android `ANativeWindow` for runtime rendering; the Android counterpart to the Win32 window binding. |
 | `XR_EXT_cocoa_window_binding` | App provides a Cocoa `NSView*` (with `CAMetalLayer` backing) for runtime rendering on macOS. |
-| `XR_EXT_display_info` | Runtime exposes physical display geometry, nominal viewer position, recommended render scale, and display mode switching capability. Provides `xrRequestDisplayModeEXT` for 2D/3D mode control, `xrRequestEyeTrackingModeEXT` for smooth/raw eye tracking selection, and `xrRequestDisplayRenderingModeEXT` for vendor-specific rendering mode switching. In RAW mode, `xrLocateViews` returns screen-centered eye positions regardless of the reference space parameter. |
+| `XR_EXT_display_info` | Runtime exposes physical display geometry, nominal viewer position, recommended render scale, and display mode switching capability. Provides `xrRequestDisplayModeEXT` for 2D/3D mode control, `xrRequestEyeTrackingModeEXT` for managed/manual eye tracking selection, and `xrRequestDisplayRenderingModeEXT` for vendor-specific rendering mode switching. In RAW mode, `xrLocateViews` returns screen-centered eye positions regardless of the reference space parameter. |
 
 Together they form a minimal, complete interface for tracked 3D display rendering through
 OpenXR across desktop, mobile, and macOS platforms.
@@ -1617,24 +1617,24 @@ tracking loss themselves (e.g., custom transition animations, UI overlays).
 
 ```c
 typedef enum XrEyeTrackingModeEXT {
-    XR_EYE_TRACKING_MODE_SMOOTH_EXT   = 0,  // default: SDK handles smoothing
-    XR_EYE_TRACKING_MODE_RAW_EXT      = 1,  // app handles tracking loss
+    XR_EYE_TRACKING_MODE_MANAGED_EXT  = 0,  // default: SDK handles smoothing
+    XR_EYE_TRACKING_MODE_MANUAL_EXT   = 1,  // app handles tracking loss
     XR_EYE_TRACKING_MODE_MAX_ENUM_EXT = 0x7FFFFFFF
 } XrEyeTrackingModeEXT;
 ```
 
-`SMOOTH = 0` ensures zero-init defaults to current behavior for legacy apps.
+`MANAGED = 0` ensures zero-init defaults to current behavior for legacy apps.
 
 #### `XrEyeTrackingModeCapabilityFlagsEXT` — Capability Bitmask
 
 ```c
 typedef XrFlags64 XrEyeTrackingModeCapabilityFlagsEXT;
 XR_EYE_TRACKING_MODE_CAPABILITY_NONE_EXT       = 0            // no tracking
-XR_EYE_TRACKING_MODE_CAPABILITY_SMOOTH_BIT_EXT = 0x00000001
-XR_EYE_TRACKING_MODE_CAPABILITY_RAW_BIT_EXT    = 0x00000002
+XR_EYE_TRACKING_MODE_CAPABILITY_MANAGED_BIT_EXT = 0x00000001
+XR_EYE_TRACKING_MODE_CAPABILITY_MANUAL_BIT_EXT  = 0x00000002
 ```
 
-A runtime that supports both modes sets `supportedModes = SMOOTH_BIT | RAW_BIT`.
+A runtime that supports both modes sets `supportedModes = MANAGED_BIT | MANUAL_BIT`.
 A display with no eye tracking sets `supportedModes = 0`.
 
 #### `XrEyeTrackingModeCapabilitiesEXT` — Extends `XrSystemProperties`
@@ -1687,12 +1687,12 @@ XrResult xrRequestEyeTrackingModeEXT(XrSession session, XrEyeTrackingModeEXT mod
 
 ### Mode Semantics
 
-**Smooth mode** (default):
+**Managed mode** (default):
 - Vendor SDK handles grace period + resume smoothing internally
 - Eye positions converge smoothly to rest position when tracking lost
 - `isTracking` reflects vendor heuristic (e.g., eye distance > threshold)
 
-**Raw mode**:
+**Manual mode**:
 - Vendor SDK provides unfiltered positions
 - Vendor still responsible for fallback positions when tracking lost
 - App uses `isTracking` to trigger its own transition animations
@@ -1700,16 +1700,16 @@ XrResult xrRequestEyeTrackingModeEXT(XrSession session, XrEyeTrackingModeEXT mod
 ### Backward Compatibility
 
 - Apps compiled against v5 are unaffected: new structs/function are opt-in
-- `SMOOTH = 0` means apps that never call `xrRequestEyeTrackingModeEXT` get unchanged behavior
+- `MANAGED = 0` means apps that never call `xrRequestEyeTrackingModeEXT` get unchanged behavior
 - `XrViewEyeTrackingStateEXT` is only populated if chained by the app
 
 ### Vendor Examples
 
 | Vendor | `supportedModes` | `defaultMode` | `isTracking` source |
 |--------|-------------------|---------------|---------------------|
-| Leia SR (current) | `SMOOTH_BIT` | `SMOOTH` | Eye-distance heuristic (collapsed = not tracking) |
-| Leia SR (future) | `SMOOTH_BIT \| RAW_BIT` | `SMOOTH` | SDK native flag |
-| Sim display | `RAW_BIT` | `RAW` | Always `XR_TRUE` (simulated) |
+| Leia SR (current) | `MANAGED_BIT` | `MANAGED` | Eye-distance heuristic (collapsed = not tracking) |
+| Leia SR (future) | `MANAGED_BIT \| MANUAL_BIT` | `MANAGED` | SDK native flag |
+| Sim display | `MANUAL_BIT` | `MANUAL` | Always `XR_TRUE` (simulated) |
 | No-tracker display | `0` (NONE) | undefined | Always `XR_FALSE` |
 
 ---
@@ -1786,7 +1786,7 @@ the property) silently ignore the call — graceful degradation.
 | 3 | 2025-06-01 | David Fattal | Changed `nominalViewerPoseInDisplaySpace` from `XrPosef` to `XrVector3f nominalViewerPositionInDisplaySpace`. Orientation was always identity; position is now populated from the SR SDK's `getDefaultViewingPosition()`. |
 | 4 | 2026-02-13 | David Fattal | Added `supportsDisplayModeSwitch` capability flag, `XrDisplayModeEXT` enum, and `xrRequestDisplayModeEXT` function for 2D/3D mode control. Added automatic lifecycle behavior (3D on session READY, 2D on session STOPPING). |
 | 5 | 2026-02-20 | David Fattal | Added `displayPixelWidth` / `displayPixelHeight` to `XrDisplayInfoEXT`. |
-| 6 | 2026-02-27 | David Fattal | Eye tracking mode control: `XrEyeTrackingModeEXT` enum, `XrEyeTrackingModeCapabilitiesEXT` (chained to `XrSystemProperties`), `XrViewEyeTrackingStateEXT` (chained to `XrViewState`), and `xrRequestEyeTrackingModeEXT` function. Allows apps to choose between smooth (SDK-filtered) and raw eye tracking, with explicit `isTracking` flag. |
+| 6 | 2026-02-27 | David Fattal | Eye tracking mode control: `XrEyeTrackingModeEXT` enum, `XrEyeTrackingModeCapabilitiesEXT` (chained to `XrSystemProperties`), `XrViewEyeTrackingStateEXT` (chained to `XrViewState`), and `xrRequestEyeTrackingModeEXT` function. Allows apps to choose between managed (SDK-filtered) and manual eye tracking, with explicit `isTracking` flag. |
 | 7 | 2026-03-04 | David Fattal | Vendor-specific display rendering mode control: `xrRequestDisplayRenderingModeEXT(session, modeIndex)` for switching between vendor-defined rendering variations (e.g., SBS stereo, anaglyph, lenticular). Mode 0 = standard (always available), mode 1+ = vendor-defined. Dispatches through `xrt_device_set_property`; no-op if driver doesn't support it. |
 | 8 | 2026-03-06 | David Fattal | Removed `XR_REFERENCE_SPACE_TYPE_DISPLAY_EXT`. In RAW mode, `xrLocateViews` returns screen-centered eye positions regardless of the reference space parameter — a dedicated DISPLAY space is unnecessary. Applications use LOCAL space for both view location and layer submission. |
 | 10 | 2026-03-12 | David Fattal | Removed `supportsDisplayModeSwitch` (derivable from mode enumeration), renamed `display3D` to `hardwareDisplay3D`, deprecated `xrRequestDisplayModeEXT` in favor of unified `xrRequestDisplayRenderingModeEXT`, added rendering mode and hardware display state change events (`XrEventDataRenderingModeChangedEXT`, `XrEventDataHardwareDisplayStateChangedEXT`). |
