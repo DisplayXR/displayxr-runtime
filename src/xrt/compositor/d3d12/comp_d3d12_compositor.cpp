@@ -802,6 +802,10 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		if (idx < c->xdev->rendering_mode_count) {
 			const struct xrt_rendering_mode *mode = &c->xdev->rendering_modes[idx];
 			c->hardware_display_3d = mode->hardware_display_3d;
+			// Clamp eye count to the active mode's view_count
+			if (eye_pos.count > mode->view_count) {
+				eye_pos.count = mode->view_count;
+			}
 			if (mode->tile_columns > 0 && c->renderer != NULL) {
 				comp_d3d12_renderer_set_tile_layout(
 				    c->renderer, mode->tile_columns, mode->tile_rows);
