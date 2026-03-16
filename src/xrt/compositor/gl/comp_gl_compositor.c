@@ -1244,6 +1244,22 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 #endif
 
 		if (c->display_processor != NULL) {
+			// One-time diagnostic: log GL viewport/framebuffer dimensions
+			static bool gl_dp_dims_logged = false;
+			if (!gl_dp_dims_logged) {
+				gl_dp_dims_logged = true;
+				GLint vp[4];
+				glGetIntegerv(GL_VIEWPORT, vp);
+				GLint fb;
+				glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fb);
+				U_LOG_W("GL DP dims: viewport=%dx%d at (%d,%d), fbo=%d, "
+				        "present=%ux%u, view=%ux%u, atlas=%ux%u",
+				        vp[2], vp[3], vp[0], vp[1], fb,
+				        present_w, present_h,
+				        c->view_width, c->view_height,
+				        c->tile_columns * c->view_width, c->tile_rows * c->view_height);
+			}
+
 			// Display processor handles the stereo-to-display conversion
 			glViewport(0, 0, present_w, present_h);
 			xrt_display_processor_gl_process_atlas(

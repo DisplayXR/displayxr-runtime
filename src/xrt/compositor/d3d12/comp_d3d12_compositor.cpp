@@ -1025,6 +1025,24 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle;
 		rtv_handle.ptr = static_cast<SIZE_T>(rtv_handle_raw);
 
+		// One-time diagnostic: log back buffer vs viewport dimensions
+		static bool dp_dims_logged = false;
+		if (!dp_dims_logged) {
+			dp_dims_logged = true;
+			D3D12_RESOURCE_DESC bb_desc = back_buffer->GetDesc();
+			uint32_t vw, vh;
+			comp_d3d12_renderer_get_view_dimensions(c->renderer, &vw, &vh);
+			uint32_t tc, tr;
+			comp_d3d12_renderer_get_tile_layout(c->renderer, &tc, &tr);
+			U_LOG_W("D3D12 DP dims: back_buffer=%llux%u, viewport=%ux%u, "
+			        "view=%ux%u, atlas=%ux%u (tile %ux%u)",
+			        (unsigned long long)bb_desc.Width, (unsigned)bb_desc.Height,
+			        tgt_width, tgt_height,
+			        vw, vh,
+			        tc * vw, tr * vh,
+			        tc, tr);
+		}
+
 		// Transition back buffer: PRESENT → RENDER_TARGET
 		D3D12_RESOURCE_BARRIER barrier = {};
 		barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
