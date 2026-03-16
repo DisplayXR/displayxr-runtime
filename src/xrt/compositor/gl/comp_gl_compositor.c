@@ -903,10 +903,9 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				c->tile_columns = mode->tile_columns;
 				c->tile_rows = mode->tile_rows;
 			}
-			if (mode->view_width_pixels > 0) {
-				c->view_width = mode->view_width_pixels;
-				c->view_height = mode->view_height_pixels;
-			}
+			// Note: view_width/height are NOT overridden per-frame from mode data.
+			// They are set once at init with window-ratio scaling (matching D3D11/D3D12).
+			// Mode switches only affect tile layout and hardware_display_3d.
 		}
 	}
 
@@ -1990,6 +1989,58 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 		} else {
 			U_LOG_W("GL compositor: display processor factory returned %d, using built-in shaders", dp_ret);
 			c->display_processor = NULL;
+		}
+	}
+
+	// If display processor is available, scale view dimensions to window ratio
+	// (matching D3D11/D3D12 model). Without this, views use display-native dims
+	// which are larger than the window, causing partial viewport rendering.
+	if (c->display_processor != NULL) {
+		uint32_t disp_px_w = 0, disp_px_h = 0;
+		int32_t disp_left = 0, disp_top = 0;
+		if (xrt_display_processor_gl_get_display_pixel_info(
+		        c->display_processor, &disp_px_w, &disp_px_h,
+		        &disp_left, &disp_top) &&
+		    disp_px_w > 0 && disp_px_h > 0) {
+			// Use half display width as base view dims
+			uint32_t base_vw = disp_px_w / 2;
+			uint32_t base_vh = disp_px_h;
+
+			U_LOG_W("Display pixel info: %ux%u, base view dims: %ux%u per eye",
+			        disp_px_w, disp_px_h, base_vw, base_vh);
+
+			// Get actual window size for scaling
+			uint32_t win_w = width, win_h = height;
+#ifdef XRT_OS_WINDOWS
+			if (c->hwnd != NULL) {
+				RECT rc;
+				if (GetClientRect(c->hwnd, &rc)) {
+					uint32_t ww = (uint32_t)(rc.right - rc.left);
+					uint32_t wh = (uint32_t)(rc.bottom - rc.top);
+					if (ww > 0 && wh > 0) {
+						win_w = ww;
+						win_h = wh;
+					}
+				}
+			}
+#elif defined(__APPLE__)
+			if (c->macos_window != NULL) {
+				comp_gl_window_macos_get_dimensions(
+				    c->macos_window, &win_w, &win_h);
+			}
+#endif
+
+			// Scale by window/display pixel ratio (same as D3D11/D3D12)
+			float ratio = fminf(
+			    (float)win_w / (float)disp_px_w,
+			    (float)win_h / (float)disp_px_h);
+			if (ratio > 1.0f) {
+				ratio = 1.0f;
+			}
+			c->view_width = (uint32_t)((float)base_vw * ratio);
+			c->view_height = (uint32_t)((float)base_vh * ratio);
+			U_LOG_W("Scaled to window ratio %.3f: %ux%u per eye (window %ux%u)",
+			        ratio, c->view_width, c->view_height, win_w, win_h);
 		}
 	}
 
