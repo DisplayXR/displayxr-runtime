@@ -496,16 +496,16 @@ comp_vk_native_target_resize(struct comp_vk_native_target *target,
 
 	destroy_swapchain_views(target);
 
-	VkSwapchainKHR old_swapchain = target->swapchain;
-	target->swapchain = VK_NULL_HANDLE;
+	// Destroy old swapchain BEFORE creating new one — only one active
+	// swapchain per surface is allowed (VK_ERROR_NATIVE_WINDOW_IN_USE_KHR).
+	// This matches the destroy-before-create pattern in target_acquire.
+	if (target->swapchain != VK_NULL_HANDLE) {
+		vk->vkDestroySwapchainKHR(vk->device, target->swapchain, NULL);
+		target->swapchain = VK_NULL_HANDLE;
+	}
+
 	target->width = width;
 	target->height = height;
 
-	xrt_result_t xret = create_swapchain(target);
-
-	if (old_swapchain != VK_NULL_HANDLE) {
-		vk->vkDestroySwapchainKHR(vk->device, old_swapchain, NULL);
-	}
-
-	return xret;
+	return create_swapchain(target);
 }

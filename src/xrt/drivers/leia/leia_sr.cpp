@@ -249,11 +249,13 @@ leiasr_create(double maxTime,
 	sr->windowHandle = (HWND)windowHandle;
 
 	// Pass the real HWND to CreateVulkanWeaver.
-	// The SR VK weaver creates its own internal VkSwapchain on this HWND.
-	// The compositor must NOT create a second VkSwapchain on the same HWND
-	// (two swapchains on one HWND violates the Vulkan spec).
-	// Instead, the compositor skips target creation when a display processor
-	// is present, and lets the weaver manage its own swapchain internally.
+	// The weaver does NOT create its own VkSwapchain — the compositor owns
+	// the entire presentation pipeline (swapchain, framebuffers, present).
+	// The HWND is used only for monitor detection, draw-region calculation,
+	// and latency tracking. The weaver receives pre-created graphics objects
+	// (command buffer, framebuffer, image views) via setCommandBuffer /
+	// setOutputFrameBuffer / setInputViewTexture and records interlacing
+	// commands into them.
 	HWND weaverHwnd = (HWND)windowHandle;
 	if (!CreateSRWeaver(sr->context, device, physicalDevice, graphicsQueue, commandPool, weaverHwnd, sr)) {
 		U_LOG_E("Failed to create SR weaver");
@@ -265,7 +267,7 @@ leiasr_create(double maxTime,
 
 	*out = sr;
 
-	U_LOG_W("Created leiasr instance with weaver for HWND %p (weaver owns VkSwapchain)", windowHandle);
+	U_LOG_W("Created leiasr instance with weaver for HWND %p", windowHandle);
 
 	return XRT_SUCCESS;
 }

@@ -2074,12 +2074,11 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	}
 
 	// Create output target (VkSwapchainKHR) for presentation.
-	// Even when a display processor (SR VK weaver) is present, we create
-	// our own swapchain target. The weaver records interlacing commands
-	// into a caller-provided command buffer + framebuffer — it does NOT
-	// manage acquire/present internally. This matches the multi-compositor
-	// approach where the compositor owns the swapchain and the weaver is
-	// just a command recorder.
+	// The compositor owns the swapchain — the weaver (display processor)
+	// records interlacing commands into a caller-provided command buffer +
+	// framebuffer via setCommandBuffer / setOutputFrameBuffer. It does NOT
+	// create its own swapchain. The HWND passed to CreateVulkanWeaver is
+	// used only for monitor detection and draw-region calculation.
 	if (hwnd != NULL
 #ifdef XRT_OS_WINDOWS
 	    || c->owns_window
