@@ -41,7 +41,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
-#include <math.h>
+
 
 // GL function loading via GLAD (cross-platform)
 #ifdef XRT_OS_WINDOWS
@@ -903,9 +903,10 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				c->tile_columns = mode->tile_columns;
 				c->tile_rows = mode->tile_rows;
 			}
-			// Note: view_width/height are NOT overridden per-frame from mode data.
-			// They are set once at init with window-ratio scaling (matching D3D11/D3D12).
-			// Mode switches only affect tile layout and hardware_display_3d.
+			if (mode->view_width_pixels > 0) {
+				c->view_width = mode->view_width_pixels;
+				c->view_height = mode->view_height_pixels;
+			}
 		}
 	}
 
@@ -1252,11 +1253,12 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				GLint fb;
 				glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fb);
 				U_LOG_W("GL DP dims: viewport=%dx%d at (%d,%d), fbo=%d, "
-				        "present=%ux%u, view=%ux%u, atlas=%ux%u",
+				        "present=%ux%u, view=%ux%u, content=%ux%u, tex=%ux%u",
 				        vp[2], vp[3], vp[0], vp[1], fb,
 				        present_w, present_h,
 				        c->view_width, c->view_height,
-				        c->tile_columns * c->view_width, c->tile_rows * c->view_height);
+				        c->tile_columns * c->view_width, c->tile_rows * c->view_height,
+				        c->atlas_tex_width, c->atlas_tex_height);
 			}
 
 			// Display processor handles the stereo-to-display conversion
@@ -1979,8 +1981,7 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 #endif
 
 	// Create display processor via factory BEFORE gl_init_resources so we can
-	// query display pixel info and scale view dimensions to window ratio.
-	// The atlas texture must be sized to match the scaled content dimensions.
+	// use its presence to control atlas sizing strategy.
 	if (dp_factory_gl != NULL) {
 		xrt_dp_factory_gl_fn_t factory = (xrt_dp_factory_gl_fn_t)dp_factory_gl;
 		xrt_result_t dp_ret = factory(window_handle, &c->display_processor);
@@ -1992,56 +1993,32 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 		}
 	}
 
-	// If display processor is available, scale width/height to window ratio
-	// (matching D3D11/D3D12 model) BEFORE creating GL resources.
-	if (c->display_processor != NULL) {
-		uint32_t disp_px_w = 0, disp_px_h = 0;
-		int32_t disp_left = 0, disp_top = 0;
-		if (xrt_display_processor_gl_get_display_pixel_info(
-		        c->display_processor, &disp_px_w, &disp_px_h,
-		        &disp_left, &disp_top) &&
-		    disp_px_w > 0 && disp_px_h > 0) {
-
-			U_LOG_W("Display pixel info: %ux%u, base view dims: %ux%u per eye",
-			        disp_px_w, disp_px_h, disp_px_w / 2, disp_px_h);
-
-			// Get actual window size for scaling
-			uint32_t win_w = width, win_h = height;
-#ifdef XRT_OS_WINDOWS
-			if (c->hwnd != NULL) {
-				RECT rc;
-				if (GetClientRect(c->hwnd, &rc)) {
-					uint32_t ww = (uint32_t)(rc.right - rc.left);
-					uint32_t wh = (uint32_t)(rc.bottom - rc.top);
-					if (ww > 0 && wh > 0) {
-						win_w = ww;
-						win_h = wh;
-					}
-				}
+	// When a display processor (GL weaver) is present, use the active rendering
+	// mode's view dimensions for the atlas. The GL weaver expects the atlas
+	// texture to exactly match the content (viewWidth * tileColumns × viewHeight
+	// * tileRows), and handles window scaling internally. Without this, the atlas
+	// is created at native display resolution (e.g. 2240x1400) but content fills
+	// only a portion (e.g. 2240x700), causing the weaver to sample wrong regions.
+	if (c->display_processor != NULL && xdev != NULL && xdev->hmd != NULL) {
+		uint32_t idx = xdev->hmd->active_rendering_mode_index;
+		if (idx < xdev->rendering_mode_count) {
+			const struct xrt_rendering_mode *mode = &xdev->rendering_modes[idx];
+			if (mode->view_width_pixels > 0 && mode->view_height_pixels > 0) {
+				uint32_t mode_w = mode->tile_columns * mode->view_width_pixels;
+				uint32_t mode_h = mode->tile_rows * mode->view_height_pixels;
+				U_LOG_W("GL DP: using active mode dims for atlas: %ux%u "
+				        "(view %ux%u, tiles %ux%u) instead of native %ux%u",
+				        mode_w, mode_h,
+				        mode->view_width_pixels, mode->view_height_pixels,
+				        mode->tile_columns, mode->tile_rows,
+				        width, height);
+				width = mode_w;
+				height = mode_h;
 			}
-#elif defined(__APPLE__)
-			if (c->macos_window != NULL) {
-				comp_gl_window_macos_get_dimensions(
-				    c->macos_window, &win_w, &win_h);
-			}
-#endif
-
-			// Scale display dims by window/display ratio (same as D3D11/D3D12).
-			// gl_init_resources divides by tile_columns/rows to get view dims.
-			float ratio = fminf(
-			    (float)win_w / (float)disp_px_w,
-			    (float)win_h / (float)disp_px_h);
-			if (ratio > 1.0f) {
-				ratio = 1.0f;
-			}
-			width = (uint32_t)((float)disp_px_w * ratio);
-			height = (uint32_t)((float)disp_px_h * ratio);
-			U_LOG_W("Scaled to window ratio %.3f: %ux%u per eye (window %ux%u)",
-			        ratio, width / 2, height, win_w, win_h);
 		}
 	}
 
-	// Initialize GL resources (atlas sized to match scaled content dims)
+	// Initialize GL resources (atlas sized to match content dims when DP present)
 	if (!gl_init_resources(c, width, height)) {
 		free(c);
 		return XRT_ERROR_OPENGL;
