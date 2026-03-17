@@ -415,45 +415,9 @@ d3d11_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 						c->settings.preferred.width = new_width;
 						c->settings.preferred.height = new_height;
 
-						// Scale renderer stereo texture proportionally to window/display ratio.
-						// Skip during drag to avoid expensive texture reallocation every pixel.
-						// The display processor handles mismatched stereo/target sizes via stretching.
-						if (c->display_processor != nullptr && !in_size_move) {
-							uint32_t disp_px_w = 0, disp_px_h = 0;
-							int32_t disp_left = 0, disp_top = 0;
-
-							if (xrt_display_processor_d3d11_get_display_pixel_info(
-							        c->display_processor, &disp_px_w, &disp_px_h,
-							        &disp_left, &disp_top) &&
-							    disp_px_w > 0 && disp_px_h > 0) {
-
-								// Use half display width as base view dims
-								// (approximation of recommended view dimensions)
-								uint32_t base_vw = disp_px_w / 2;
-								uint32_t base_vh = disp_px_h;
-
-								// Scale by window/display ratio
-								float ratio = fminf(
-								    (float)new_width / (float)disp_px_w,
-								    (float)new_height / (float)disp_px_h);
-								if (ratio > 1.0f) {
-									ratio = 1.0f;
-								}
-
-								uint32_t new_vw = (uint32_t)((float)base_vw * ratio);
-								uint32_t new_vh = (uint32_t)((float)base_vh * ratio);
-
-								uint32_t resize_target_h = new_vh;
-								comp_d3d11_renderer_resize(c->renderer, new_vw, new_vh, resize_target_h);
-							}
-						} else
-						// No display processor: resize renderer to match new window dimensions
-						if (!in_size_move) {
-							uint32_t new_vw = new_width / 2;
-							uint32_t new_vh = new_height;
-							uint32_t resize_target_h = new_height;
-							comp_d3d11_renderer_resize(c->renderer, new_vw, new_vh, resize_target_h);
-						}
+						// Renderer atlas sizing is handled in layer_commit based on
+						// the active rendering mode — no resize needed here.
+						// (Matches GL compositor's begin_frame which does nothing.)
 					}
 				}
 			}
