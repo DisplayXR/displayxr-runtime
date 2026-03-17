@@ -236,8 +236,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                         uint32_t tileRows = (xr.currentModeIndex < xr.renderingModeCount)
                             ? xr.renderingModeTileRows[xr.currentModeIndex] : ((modeViewCount + tileColumns - 1) / tileColumns);
 
-                        uint32_t tileW = xr.swapchain.width / tileColumns;
-                        uint32_t tileH = xr.swapchain.height / tileRows;
+                        uint32_t maxTileW = tileColumns > 0 ? xr.swapchain.width / tileColumns : xr.swapchain.width;
+                        uint32_t maxTileH = tileRows > 0 ? xr.swapchain.height / tileRows : xr.swapchain.height;
+                        uint32_t tileW = (xr.displayPixelWidth > 0)
+                            ? (uint32_t)(xr.displayPixelWidth * xr.recommendedViewScaleX) : maxTileW;
+                        uint32_t tileH = (xr.displayPixelHeight > 0)
+                            ? (uint32_t)(xr.displayPixelHeight * xr.recommendedViewScaleY) : maxTileH;
+                        if (tileW > maxTileW) tileW = maxTileW;
+                        if (tileH > maxTileH) tileH = maxTileH;
 
                         uint32_t imageIndex;
                         if (AcquireSwapchainImage(xr, imageIndex)) {
