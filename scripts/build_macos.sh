@@ -116,6 +116,20 @@ cmake -B "$ROOT/test_apps/cube_hosted_legacy_metal_macos/build" \
   -DCMAKE_PREFIX_PATH="$OPENXR_DIR"
 cmake --build "$ROOT/test_apps/cube_hosted_legacy_metal_macos/build"
 
+echo "=== Building cube_hosted_legacy_gl_macos ==="
+cmake -B "$ROOT/test_apps/cube_hosted_legacy_gl_macos/build" \
+  -S "$ROOT/test_apps/cube_hosted_legacy_gl_macos" -G Ninja \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_PREFIX_PATH="$OPENXR_DIR"
+cmake --build "$ROOT/test_apps/cube_hosted_legacy_gl_macos/build"
+
+echo "=== Building cube_hosted_legacy_vk_macos ==="
+cmake -B "$ROOT/test_apps/cube_hosted_legacy_vk_macos/build" \
+  -S "$ROOT/test_apps/cube_hosted_legacy_vk_macos" -G Ninja \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_PREFIX_PATH="$OPENXR_DIR"
+cmake --build "$ROOT/test_apps/cube_hosted_legacy_vk_macos/build"
+
 # Step 3d: Build 3DGS demo app
 echo "=== Building gaussian_splatting_handle_vk_macos ==="
 cmake -B "$ROOT/demos/gaussian_splatting_handle_vk_macos/build" \
@@ -156,6 +170,8 @@ cp "$ROOT/test_apps/cube_handle_gl_macos/build/cube_handle_gl_macos" "$PKG_DIR/b
 cp "$ROOT/test_apps/cube_texture_metal_macos/build/cube_texture_metal_macos" "$PKG_DIR/bin/" 2>/dev/null || true
 cp "$ROOT/test_apps/cube_hosted_metal_macos/build/cube_hosted_metal_macos" "$PKG_DIR/bin/" 2>/dev/null || true
 cp "$ROOT/test_apps/cube_hosted_legacy_metal_macos/build/cube_hosted_legacy_metal_macos" "$PKG_DIR/bin/" 2>/dev/null || true
+cp "$ROOT/test_apps/cube_hosted_legacy_gl_macos/build/cube_hosted_legacy_gl_macos" "$PKG_DIR/bin/" 2>/dev/null || true
+cp "$ROOT/test_apps/cube_hosted_legacy_vk_macos/build/cube_hosted_legacy_vk_macos" "$PKG_DIR/bin/" 2>/dev/null || true
 cp "$ROOT/demos/gaussian_splatting_handle_vk_macos/build/gaussian_splatting_handle_vk_macos" "$PKG_DIR/bin/" 2>/dev/null || true
 
 # Copy texture files for handle apps
@@ -188,6 +204,8 @@ install_name_tool -add_rpath @executable_path/../lib "$PKG_DIR/bin/cube_handle_g
 install_name_tool -add_rpath @executable_path/../lib "$PKG_DIR/bin/cube_texture_metal_macos" 2>/dev/null || true
 install_name_tool -add_rpath @executable_path/../lib "$PKG_DIR/bin/cube_hosted_metal_macos" 2>/dev/null || true
 install_name_tool -add_rpath @executable_path/../lib "$PKG_DIR/bin/cube_hosted_legacy_metal_macos" 2>/dev/null || true
+install_name_tool -add_rpath @executable_path/../lib "$PKG_DIR/bin/cube_hosted_legacy_gl_macos" 2>/dev/null || true
+install_name_tool -add_rpath @executable_path/../lib "$PKG_DIR/bin/cube_hosted_legacy_vk_macos" 2>/dev/null || true
 install_name_tool -add_rpath @executable_path/../lib "$PKG_DIR/bin/gaussian_splatting_handle_vk_macos" 2>/dev/null || true
 install_name_tool -add_rpath @loader_path "$PKG_DIR"/lib/libopenxr_loader*.dylib 2>/dev/null || true
 
@@ -294,6 +312,34 @@ exec "$DIR/bin/cube_hosted_legacy_metal_macos" "$@"
 SCRIPT
 chmod +x "$PKG_DIR/run_cube_hosted_legacy_metal.sh"
 
+# Create run script for OpenGL legacy hosted test app
+cat > "$PKG_DIR/run_cube_hosted_legacy_gl.sh" <<'SCRIPT'
+#!/bin/bash
+DIR="$(cd "$(dirname "$0")" && pwd)"
+export XR_RUNTIME_JSON="$DIR/openxr_displayxr.json"
+export DYLD_LIBRARY_PATH="$DIR/lib:${DYLD_LIBRARY_PATH:-}"
+export SIM_DISPLAY_ENABLE=1
+export SIM_DISPLAY_OUTPUT="${SIM_DISPLAY_OUTPUT:-anaglyph}"
+echo "Starting cube_hosted_legacy_gl_macos (OpenGL, legacy hosted) with $SIM_DISPLAY_OUTPUT output..."
+exec "$DIR/bin/cube_hosted_legacy_gl_macos" "$@"
+SCRIPT
+chmod +x "$PKG_DIR/run_cube_hosted_legacy_gl.sh"
+
+# Create run script for Vulkan legacy hosted test app
+cat > "$PKG_DIR/run_cube_hosted_legacy_vk.sh" <<'SCRIPT'
+#!/bin/bash
+DIR="$(cd "$(dirname "$0")" && pwd)"
+export XR_RUNTIME_JSON="$DIR/openxr_displayxr.json"
+export DYLD_LIBRARY_PATH="$DIR/lib:${DYLD_LIBRARY_PATH:-}"
+export VK_ICD_FILENAMES="$DIR/share/vulkan/icd.d/MoltenVK_icd.json"
+export VK_DRIVER_FILES="$DIR/share/vulkan/icd.d/MoltenVK_icd.json"
+export SIM_DISPLAY_ENABLE=1
+export SIM_DISPLAY_OUTPUT="${SIM_DISPLAY_OUTPUT:-anaglyph}"
+echo "Starting cube_hosted_legacy_vk_macos (Vulkan, legacy hosted) with $SIM_DISPLAY_OUTPUT output..."
+exec "$DIR/bin/cube_hosted_legacy_vk_macos" "$@"
+SCRIPT
+chmod +x "$PKG_DIR/run_cube_hosted_legacy_vk.sh"
+
 # Create run script for 3DGS demo app
 cat > "$PKG_DIR/run_gaussian_splatting_handle_vk.sh" <<'SCRIPT'
 #!/bin/bash
@@ -332,6 +378,8 @@ echo "  $PKG_DIR/run_cube_handle_gl.sh"
 echo "  $PKG_DIR/run_cube_texture_metal.sh"
 echo "  $PKG_DIR/run_cube_hosted_metal.sh"
 echo "  $PKG_DIR/run_cube_hosted_legacy_metal.sh"
+echo "  $PKG_DIR/run_cube_hosted_legacy_gl.sh"
+echo "  $PKG_DIR/run_cube_hosted_legacy_vk.sh"
 echo "  $PKG_DIR/run_gaussian_splatting_handle_vk.sh"
 echo ""
 echo "Or run manually:"

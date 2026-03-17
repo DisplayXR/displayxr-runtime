@@ -66,8 +66,13 @@ static DWORD g_savedWindowStyle = 0;
 static ComPtr<ID3D11Texture2D> g_sharedTexture;
 static ComPtr<ID3D11ShaderResourceView> g_sharedSRV;
 static HANDLE g_sharedHandle = nullptr;
-static uint32_t g_sharedWidth = 0;
+static uint32_t g_sharedWidth = 0;   // Shared texture size (= display pixels, worst case)
 static uint32_t g_sharedHeight = 0;
+
+// Canvas dimensions — the sub-rect of the window where 3D content is displayed.
+// Computed from the letterbox viewport each frame.
+static uint32_t g_canvasW = 0;
+static uint32_t g_canvasH = 0;
 
 // Blit shader resources
 static ComPtr<ID3D11VertexShader> g_blitVS;
@@ -348,6 +353,20 @@ static void RenderOneFrame(RenderState& rs) {
     UpdateScene(renderer, rs.perfStats->deltaTime);
     PollEvents(xr);
 
+    // Compute canvas dimensions from the letterbox viewport.
+    // The shared texture is display-sized; the canvas is where it actually appears.
+    if (g_sharedWidth > 0 && g_sharedHeight > 0 && g_windowWidth > 0 && g_windowHeight > 0) {
+        float srcAR = (float)g_sharedWidth / (float)g_sharedHeight;
+        float dstAR = (float)g_windowWidth / (float)g_windowHeight;
+        if (srcAR > dstAR) {
+            g_canvasW = g_windowWidth;
+            g_canvasH = (uint32_t)((float)g_windowWidth / srcAR);
+        } else {
+            g_canvasH = g_windowHeight;
+            g_canvasW = (uint32_t)((float)g_windowHeight * srcAR);
+        }
+    }
+
     if (xr.sessionRunning) {
         XrFrameState frameState;
         if (BeginFrame(xr, frameState)) {
@@ -389,10 +408,10 @@ static void RenderOneFrame(RenderState& rs) {
                     std::vector<Display3DView> stereoViews(eyeCount);
                     bool useAppProjection = (xr.hasDisplayInfoExt && xr.displayWidthM > 0.0f);
                     if (useAppProjection) {
-                        float pxSizeX = xr.displayWidthM / (float)xr.swapchain.width;
-                        float pxSizeY = xr.displayHeightM / (float)xr.swapchain.height;
-                        float winW_m = (float)g_sharedWidth * pxSizeX;
-                        float winH_m = (float)g_sharedHeight * pxSizeY;
+                        float pxSizeX = xr.displayWidthM / (float)xr.displayPixelWidth;
+                        float pxSizeY = xr.displayHeightM / (float)xr.displayPixelHeight;
+                        float winW_m = (float)g_canvasW * pxSizeX;
+                        float winH_m = (float)g_canvasH * pxSizeY;
                         float minDisp = fminf(xr.displayWidthM, xr.displayHeightM);
                         float minWin  = fminf(winW_m, winH_m);
                         float vs = minDisp / minWin;
@@ -472,13 +491,13 @@ static void RenderOneFrame(RenderState& rs) {
 
                             uint32_t dispRenderW, dispRenderH;
                             if (monoMode) {
-                                dispRenderW = g_sharedWidth;
-                                dispRenderH = g_sharedHeight;
+                                dispRenderW = g_canvasW;
+                                dispRenderH = g_canvasH;
                                 if (dispRenderW > xr.swapchain.width) dispRenderW = xr.swapchain.width;
                                 if (dispRenderH > xr.swapchain.height) dispRenderH = xr.swapchain.height;
                             } else {
-                                dispRenderW = (uint32_t)(g_sharedWidth * xr.recommendedViewScaleX);
-                                dispRenderH = (uint32_t)(g_sharedHeight * xr.recommendedViewScaleY);
+                                dispRenderW = (uint32_t)(g_canvasW * xr.recommendedViewScaleX);
+                                dispRenderH = (uint32_t)(g_canvasH * xr.recommendedViewScaleY);
                                 if (dispRenderW > maxTileW) dispRenderW = maxTileW;
                                 if (dispRenderH > maxTileH) dispRenderH = maxTileH;
                             }
@@ -590,13 +609,13 @@ static void RenderOneFrame(RenderState& rs) {
 
                         uint32_t renderW, renderH;
                         if (monoMode) {
-                            renderW = g_sharedWidth;
-                            renderH = g_sharedHeight;
+                            renderW = g_canvasW;
+                            renderH = g_canvasH;
                             if (renderW > xr.swapchain.width) renderW = xr.swapchain.width;
                             if (renderH > xr.swapchain.height) renderH = xr.swapchain.height;
                         } else {
-                            renderW = (uint32_t)(g_sharedWidth * xr.recommendedViewScaleX);
-                            renderH = (uint32_t)(g_sharedHeight * xr.recommendedViewScaleY);
+                            renderW = (uint32_t)(g_canvasW * xr.recommendedViewScaleX);
+                            renderH = (uint32_t)(g_canvasH * xr.recommendedViewScaleY);
                             if (renderW > maxTileW) renderW = maxTileW;
                             if (renderH > maxTileH) renderH = maxTileH;
                         }
@@ -818,6 +837,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             return 1;
         }
 
+        // Initialize canvas to full shared texture (updated per-frame from letterbox viewport)
+        g_canvasW = g_sharedWidth;
+        g_canvasH = g_sharedHeight;
         LOG_INFO("Created shared D3D11 texture: %ux%u, handle=%p", g_sharedWidth, g_sharedHeight, g_sharedHandle);
     }
 

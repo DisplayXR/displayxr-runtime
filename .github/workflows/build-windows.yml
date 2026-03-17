@@ -745,11 +745,182 @@ jobs:
             test_apps/cube_hosted_legacy_d3d11_win/build/*.dll
             test_apps/cube_hosted_legacy_d3d11_win/build/textures/
 
+  # D3D12 legacy hosted test app (no XR_EXT_display_info)
+  TestAppCubeHostedLegacyD3D12:
+    if: true
+    runs-on: windows-2022
+    needs: Runtime
+
+    env:
+      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
+          submodules: recursive
+
+      - name: Download runtime artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: DisplayXR
+          path: runtime
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install OpenXR loader
+        run: |
+          $openxrVersion = "1.1.38"
+          $openxrUrl = "https://github.com/KhronosGroup/OpenXR-SDK-Source/releases/download/release-$openxrVersion/openxr_loader_windows-$openxrVersion.zip"
+          Invoke-WebRequest -Uri $openxrUrl -OutFile openxr_loader.zip
+          Expand-Archive -Path openxr_loader.zip -DestinationPath openxr_sdk -Force
+
+      - name: Build legacy hosted D3D12 test app
+        run: |
+          cd test_apps/cube_hosted_legacy_d3d12_win
+          cmake -S . -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DOpenXR_ROOT="${{ github.workspace }}/openxr_sdk"
+          cmake --build build
+
+      - name: Copy required DLLs
+        run: |
+          $loaderDll = Get-ChildItem -Path openxr_sdk -Recurse -Filter "openxr_loader.dll" | Where-Object { $_.FullName -like "*x64*" } | Select-Object -First 1
+          if (-not $loaderDll) { $loaderDll = Get-ChildItem -Path openxr_sdk -Recurse -Filter "openxr_loader.dll" | Select-Object -First 1 }
+          if ($loaderDll) { Copy-Item $loaderDll.FullName -Destination test_apps/cube_hosted_legacy_d3d12_win/build/ }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CubeHostedLegacyD3D12
+          if-no-files-found: error
+          path: |
+            test_apps/cube_hosted_legacy_d3d12_win/build/cube_hosted_legacy_d3d12_win.exe
+            test_apps/cube_hosted_legacy_d3d12_win/build/*.dll
+            test_apps/cube_hosted_legacy_d3d12_win/build/textures/
+
+  # Vulkan legacy hosted test app (no XR_EXT_display_info)
+  TestAppCubeHostedLegacyVK:
+    if: true
+    runs-on: windows-2022
+    needs: Runtime
+
+    env:
+      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
+          submodules: recursive
+
+      - name: Download runtime artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: DisplayXR
+          path: runtime
+
+      - name: Install Vulkan SDK
+        uses: humbletim/install-vulkan-sdk@v1.2
+        with:
+          version: 1.3.283.0
+          cache: true
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install OpenXR loader
+        run: |
+          $openxrVersion = "1.1.38"
+          $openxrUrl = "https://github.com/KhronosGroup/OpenXR-SDK-Source/releases/download/release-$openxrVersion/openxr_loader_windows-$openxrVersion.zip"
+          Invoke-WebRequest -Uri $openxrUrl -OutFile openxr_loader.zip
+          Expand-Archive -Path openxr_loader.zip -DestinationPath openxr_sdk -Force
+
+      - name: Build legacy hosted VK test app
+        run: |
+          cd test_apps/cube_hosted_legacy_vk_win
+          cmake -S . -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DOpenXR_ROOT="${{ github.workspace }}/openxr_sdk"
+          cmake --build build
+
+      - name: Copy required DLLs
+        run: |
+          $loaderDll = Get-ChildItem -Path openxr_sdk -Recurse -Filter "openxr_loader.dll" | Where-Object { $_.FullName -like "*x64*" } | Select-Object -First 1
+          if (-not $loaderDll) { $loaderDll = Get-ChildItem -Path openxr_sdk -Recurse -Filter "openxr_loader.dll" | Select-Object -First 1 }
+          if ($loaderDll) { Copy-Item $loaderDll.FullName -Destination test_apps/cube_hosted_legacy_vk_win/build/ }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CubeHostedLegacyVK
+          if-no-files-found: error
+          path: |
+            test_apps/cube_hosted_legacy_vk_win/build/cube_hosted_legacy_vk_win.exe
+            test_apps/cube_hosted_legacy_vk_win/build/*.dll
+            test_apps/cube_hosted_legacy_vk_win/build/textures/
+
+  # OpenGL legacy hosted test app (no XR_EXT_display_info)
+  TestAppCubeHostedLegacyGL:
+    if: true
+    runs-on: windows-2022
+    needs: Runtime
+
+    env:
+      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
+          submodules: recursive
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install OpenXR loader
+        run: |
+          $openxrVersion = "1.1.38"
+          $openxrUrl = "https://github.com/KhronosGroup/OpenXR-SDK-Source/releases/download/release-$openxrVersion/openxr_loader_windows-$openxrVersion.zip"
+          Invoke-WebRequest -Uri $openxrUrl -OutFile openxr_loader.zip
+          Expand-Archive -Path openxr_loader.zip -DestinationPath openxr_sdk -Force
+
+      - name: Build legacy hosted GL test app
+        run: |
+          cd test_apps/cube_hosted_legacy_gl_win
+          cmake -S . -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DOpenXR_ROOT="${{ github.workspace }}/openxr_sdk"
+          cmake --build build
+
+      - name: Copy required DLLs
+        run: |
+          $loaderDll = Get-ChildItem -Path openxr_sdk -Recurse -Filter "openxr_loader.dll" | Where-Object { $_.FullName -like "*x64*" } | Select-Object -First 1
+          if (-not $loaderDll) { $loaderDll = Get-ChildItem -Path openxr_sdk -Recurse -Filter "openxr_loader.dll" | Select-Object -First 1 }
+          if ($loaderDll) { Copy-Item $loaderDll.FullName -Destination test_apps/cube_hosted_legacy_gl_win/build/ }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CubeHostedLegacyGL
+          if-no-files-found: error
+          path: |
+            test_apps/cube_hosted_legacy_gl_win/build/cube_hosted_legacy_gl_win.exe
+            test_apps/cube_hosted_legacy_gl_win/build/*.dll
+            test_apps/cube_hosted_legacy_gl_win/build/textures/
+
   # Bundle all test apps into a single artifact with per-app subfolders
   BundleTestApps:
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
-    needs: [TestAppCubeHandleD3D11, TestAppCubeHostedD3D11, TestAppCubeHandleD3D12, TestAppCubeHandleGL, TestAppCubeHandleVK, TestAppGaussianSplattingVK, TestAppSpatialOS, TestAppCubeTextureD3D11, TestAppCubeHostedLegacyD3D11]
+    needs: [TestAppCubeHandleD3D11, TestAppCubeHostedD3D11, TestAppCubeHandleD3D12, TestAppCubeHandleGL, TestAppCubeHandleVK, TestAppGaussianSplattingVK, TestAppSpatialOS, TestAppCubeTextureD3D11, TestAppCubeHostedLegacyD3D11, TestAppCubeHostedLegacyD3D12, TestAppCubeHostedLegacyVK, TestAppCubeHostedLegacyGL]
 
     steps:
       - name: Download cube test app artifacts
@@ -794,6 +965,9 @@ jobs:
             CubeHandleVK
             CubeTextureD3D11
             CubeHostedLegacyD3D11
+            CubeHostedLegacyD3D12
+            CubeHostedLegacyVK
+            CubeHostedLegacyGL
             GaussianSplattingVK
             SpatialOS
 
