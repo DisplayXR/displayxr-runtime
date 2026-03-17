@@ -23,6 +23,16 @@ Machine A (primary)                    Machine B (satellite)
 
 The primary's multi-compositor treats remote displays identically to local ones -- same compositing logic, different transport (network instead of shared memory).
 
+## Scope and Related Docs
+
+This doc extends multi-display compositing **across networked machines**. It assumes local multi-display routing already works.
+
+| Doc | Relationship |
+|-----|-------------|
+| [spatial-os.md](spatial-os.md) (#43) | **Single-display compositing.** Foundation pipeline. |
+| [3d-shell.md](3d-shell.md) (#44) | **Window manager.** Owns window placement and interaction. |
+| [multi-display-single-machine.md](multi-display-single-machine.md) (#69) | **Local multi-display.** This doc generalizes its routing over the network. Prerequisite. |
+
 ## Design: Hub with Remote Compositor Targets
 
 - **Primary service**: Runs the multi-compositor, owns the world model (display poses, window placement, z-ordering), makes all compositing decisions.

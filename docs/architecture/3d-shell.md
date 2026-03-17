@@ -8,6 +8,16 @@ code-paths: [src/xrt/compositor/multi/, src/xrt/targets/]
 
 # 3D Shell: Spatial Window Manager for Lightfield Displays
 
+## Scope and Related Docs
+
+This doc covers the **window manager / policy layer** — placement, interaction, chrome. It depends on the multi-compositor pipeline but does not define it.
+
+| Doc | Relationship |
+|-----|-------------|
+| [spatial-os.md](spatial-os.md) (#43) | **Compositing mechanism.** Defines the multi-compositor pipeline this shell drives. This doc depends on it. |
+| [multi-display-single-machine.md](multi-display-single-machine.md) (#69) | **Multi-display extension.** Extends shell + compositor to multiple local displays. Depends on #43 + #44. |
+| [multi-display-networked.md](multi-display-networked.md) (#70) | **Networked extension.** Extends multi-display to remote machines. Depends on #69. |
+
 ## Vision
 
 A shell application that manages windows in 3D space on a lightfield display -- the equivalent of a desktop environment / window manager, but for spatial computing on a flat display. Not a new OS, but a layer on top of Windows/macOS.
