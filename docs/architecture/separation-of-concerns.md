@@ -9,7 +9,7 @@ This document defines what each architectural layer owns and what must not cross
 
 ## Layer 1: Application
 
-- Provides window handle (`_ext`, `_shared`) or lets runtime create one (`_rt`)
+- Provides window handle (`_handle`, `_texture`) or lets runtime create one (`_hosted`)
 - Creates swapchains at recommended dimensions
 - Renders views into swapchain tiles
 - Optionally enables `XR_EXT_display_info` for mode awareness

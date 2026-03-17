@@ -112,7 +112,7 @@ The application provides no view. The runtime renders to an offscreen surface an
 The application provides an `IOSurfaceRef`. The runtime creates a Metal texture backed by the IOSurface and renders into it. The application can then use the same IOSurface to create its own Metal texture — zero-copy GPU texture sharing.
 
 Useful for:
-- Shared-texture apps (`_shared` class) where the app composites the final output
+- Texture apps (`_texture` class) where the app composites the final output
 - Multi-process compositing via IOSurface
 
 ---

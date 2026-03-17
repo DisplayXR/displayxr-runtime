@@ -44,17 +44,17 @@ Why each API gets its own compositor: `docs/adr/ADR-001-native-compositors-per-g
 
 | Class | Suffix | Description | Compositor path |
 |-------|--------|-------------|----------------|
-| **Window-handle** | `_ext` | App provides its own window via `XR_EXT_*_window_binding` | Native compositor directly in-process |
-| **Shared-texture** | `_shared` | App provides textures, runtime composites into its own window | Native compositor directly in-process |
-| **Runtime-managed** | `_rt` | Runtime creates window and rendering targets (standard OpenXR/WebXR) | Native compositor directly in-process |
+| **Handle** | `_handle` | App provides its own window handle via `XR_EXT_*_window_binding` | Native compositor directly in-process |
+| **Texture** | `_texture` | App provides textures, runtime composites into its own window | Native compositor directly in-process |
+| **Hosted** | `_hosted` | Runtime creates window and rendering targets (standard OpenXR/WebXR) | Native compositor directly in-process |
 | **IPC/Service** | `_ipc` | App runs out-of-process via client compositor → IPC → server multi-compositor | Client compositor → IPC transport → multi-compositor → native compositor in server |
 
-Test app naming: `cube_ext_metal_macos`, `cube_shared_gl_macos`, `cube_rt_vk_macos` (runtime-managed), `cube_ipc_d3d11` (service mode).
+Test app naming: `cube_handle_metal_macos`, `cube_texture_d3d11_win`, `cube_hosted_d3d11_win` (hosted), `cube_ipc_d3d11` (service mode).
 
 The first three classes all use a native compositor in-process. The `_ipc` class is fundamentally different: the app links a **client compositor** that serializes compositor calls over IPC to a **server process** running the multi-compositor (`compositor/multi/`), which fans out to native compositors. This is the multi-app path and the foundation for the spatial shell (#43, #44).
 
 **Key code paths by class:**
-- `_ext` / `_shared` / `_rt` → `compositor/{d3d11,d3d12,metal,gl,vk_native}/` (in-process)
+- `_handle` / `_texture` / `_hosted` → `compositor/{d3d11,d3d12,metal,gl,vk_native}/` (in-process)
 - `_ipc` → `compositor/client/` → `ipc/` → `compositor/multi/` → native compositor (out-of-process)
 
 For in-process vs service details, see `docs/architecture/in-process-vs-service.md`.
@@ -69,7 +69,7 @@ Orthogonal to the four app classes above, apps are either **extension apps** or 
 | **Extension app** | Enables `XR_EXT_display_info` | Enumerates all modes, handles `XrEventDataRenderingModeChangedEXT` | `max(tileColumns[i] * scaleX[i] * displayW)` across all modes | All modes: V toggle + 1/2/3 direct selection |
 | **Legacy app** | Does not enable `XR_EXT_display_info` | Unaware of modes, always renders stereo | `recommendedImageRectWidth * 2` (compromise scale) | Only V toggle between mode 0 (2D) and mode 1 (default 3D) |
 
-`_ext` and `_shared` apps are always extension apps (they need the extension for window binding). `_rt` apps can be either — a DisplayXR-aware `_rt` app enables `XR_EXT_display_info`, while a generic OpenXR `_rt` app (e.g. WebXR, third-party) is legacy.
+`_handle` and `_texture` apps are always extension apps (they need the extension for window binding). `_hosted` apps can be either — a DisplayXR-aware `_hosted` app enables `XR_EXT_display_info`, while a generic OpenXR `_hosted` app (e.g. WebXR, third-party) is legacy.
 
 For the full multiview tiling algorithm and atlas layout, see `docs/specs/multiview-tiling.md`.
 For legacy app compromise scaling rationale (Case A/B), see `docs/specs/legacy-app-support.md`.
@@ -87,7 +87,7 @@ Legacy app compromise scaling is computed in `oxr_system_fill_in()` — see `doc
   - These are unrelated — the app swapchain flows in, the target swapchain flows out.
   - See `docs/specs/multiview-tiling.md` "Compositor-Side Contract" section.
 
-- **Canvas concept:** View dimensions and Kooima projection must be based on **canvas** size (the sub-rect of the window where 3D content appears), not display size. Critical for `_shared` apps where the canvas may be smaller than the display. See `docs/specs/multiview-tiling.md` "Terminology: Display, Window, Canvas".
+- **Canvas concept:** View dimensions and Kooima projection must be based on **canvas** size (the sub-rect of the window where 3D content appears), not display size. Critical for `_texture` apps where the canvas may be smaller than the display. See `docs/specs/multiview-tiling.md` "Terminology: Display, Window, Canvas".
 
 For the vendor isolation rule and layer "must NOT contain" constraints, see `docs/architecture/separation-of-concerns.md`.
 For display processor vtable design (all 5 API variants), see `docs/specs/vendor-integration.md`.
@@ -221,15 +221,13 @@ Copy binaries to `_package/DisplayXR-macOS/bin/`. Run scripts exec from `$DIR/bi
 
 | Test App | Build Output | Package Binary | Run Script |
 |----------|-------------|---------------|------------|
-| cube_rt_vk_macos | `test_apps/cube_rt_vk_macos/build/cube_rt_vk_macos` | `_package/.../bin/cube_rt_vk_macos` | `run_cube_rt_vk.sh` |
-| cube_ext_vk_macos | `test_apps/cube_ext_vk_macos/build/cube_ext_vk_macos` | `_package/.../bin/cube_ext_vk_macos` | `run_cube_ext_vk.sh` |
-| cube_rt_gl_macos | `test_apps/cube_rt_gl_macos/build/cube_rt_gl_macos` | `_package/.../bin/cube_rt_gl_macos` | `run_cube_rt_gl.sh` |
-| cube_ext_metal_macos | `test_apps/cube_ext_metal_macos/build/cube_ext_metal_macos` | `_package/.../bin/cube_ext_metal_macos` | `run_cube_ext_metal.sh` |
-| cube_rt_metal_macos | `test_apps/cube_rt_metal_macos/build/cube_rt_metal_macos` | `_package/.../bin/cube_rt_metal_macos` | `run_cube_rt_metal.sh` |
-| cube_shared_metal_macos | `test_apps/cube_shared_metal_macos/build/cube_shared_metal_macos` | `_package/.../bin/cube_shared_metal_macos` | `run_cube_shared_metal.sh` |
-| cube_shared_gl_macos | `test_apps/cube_shared_gl_macos/build/cube_shared_gl_macos` | `_package/.../bin/cube_shared_gl_macos` | `run_cube_shared_gl.sh` |
-| cube_shared_vk_macos | `test_apps/cube_shared_vk_macos/build/cube_shared_vk_macos` | `_package/.../bin/cube_shared_vk_macos` | `run_cube_shared_vk.sh` |
-| gaussian_splatting_ext_vk_macos | `demos/gaussian_splatting_ext_vk_macos/build/gaussian_splatting_ext_vk_macos` | `_package/.../bin/gaussian_splatting_ext_vk_macos` | `run_gaussian_splatting_ext_vk.sh` |
+| cube_handle_vk_macos | `test_apps/cube_handle_vk_macos/build/cube_handle_vk_macos` | `_package/.../bin/cube_handle_vk_macos` | `run_cube_handle_vk.sh` |
+| cube_handle_metal_macos | `test_apps/cube_handle_metal_macos/build/cube_handle_metal_macos` | `_package/.../bin/cube_handle_metal_macos` | `run_cube_handle_metal.sh` |
+| cube_handle_gl_macos | `test_apps/cube_handle_gl_macos/build/cube_handle_gl_macos` | `_package/.../bin/cube_handle_gl_macos` | `run_cube_handle_gl.sh` |
+| cube_texture_metal_macos | `test_apps/cube_texture_metal_macos/build/cube_texture_metal_macos` | `_package/.../bin/cube_texture_metal_macos` | `run_cube_texture_metal.sh` |
+| cube_hosted_metal_macos | `test_apps/cube_hosted_metal_macos/build/cube_hosted_metal_macos` | `_package/.../bin/cube_hosted_metal_macos` | `run_cube_hosted_metal.sh` |
+| cube_hosted_legacy_metal_macos | `test_apps/cube_hosted_legacy_metal_macos/build/cube_hosted_legacy_metal_macos` | `_package/.../bin/cube_hosted_legacy_metal_macos` | `run_cube_hosted_legacy_metal.sh` |
+| gaussian_splatting_handle_vk_macos | `demos/gaussian_splatting_handle_vk_macos/build/gaussian_splatting_handle_vk_macos` | `_package/.../bin/gaussian_splatting_handle_vk_macos` | `run_gaussian_splatting_handle_vk.sh` |
 
 ## Documentation
 

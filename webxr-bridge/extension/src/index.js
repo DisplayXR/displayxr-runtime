@@ -103,7 +103,7 @@ Object.defineProperty(navigator.xr, 'requestSession', {
 });
 
 // --- Camera & Controller Controls ---
-// Matches EXT app (test_apps/cube_ext_vk_macos) + qwerty_macos.m pattern.
+// Matches EXT app (test_apps/cube_handle_vk_macos) + qwerty_macos.m pattern.
 // Default: WASD = move camera, LMB drag = look, Q/E = up/down, Scroll = zoom
 // CTRL held: focus LEFT controller — mouse = move, LMB = trigger, MMB = squeeze
 // ALT held: focus RIGHT controller — same

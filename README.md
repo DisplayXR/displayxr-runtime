@@ -18,12 +18,12 @@ Only what 3D displays need: 3 drivers (leia, sim_display, qwerty), native compos
 
 | Class | Suffix | Description |
 |-------|--------|-------------|
-| **Window-handle** | `_ext` | App provides its own window via `XR_EXT_*_window_binding`. Runtime composites into it. |
-| **Shared-texture** | `_shared` | App provides textures. Runtime composites into its own window. |
-| **Runtime-managed** | `_rt` | Runtime creates the window and rendering targets (standard OpenXR/WebXR path). |
+| **Handle** | `_handle` | App provides its own window handle via `XR_EXT_*_window_binding`. Runtime composites into it. |
+| **Texture** | `_texture` | App provides textures. Runtime composites into its own window. |
+| **Hosted** | `_hosted` | Runtime creates the window and rendering targets (standard OpenXR/WebXR path). |
 | **IPC/Service** | `_ipc` | App runs out-of-process via client compositor → IPC → server multi-compositor. Foundation for multi-app spatial shell. |
 
-Test app naming follows the pattern `cube_{class}_{api}_{platform}`: `cube_ext_metal_macos`, `cube_shared_gl_macos`, `cube_rt_vk_macos` (runtime-managed), `cube_ipc_d3d11` (service mode).
+Test app naming follows the pattern `cube_{class}_{api}_{platform}`: `cube_handle_metal_macos`, `cube_texture_d3d11_win`, `cube_hosted_d3d11_win` (hosted), `cube_ipc_d3d11` (service mode).
 
 ## Compositor Status
 
@@ -88,7 +88,7 @@ You don't need a 3D display to develop against this runtime. The **sim_display**
 
 ```bash
 # After building, run the test cube app
-XR_RUNTIME_JSON=./build/openxr_displayxr-dev.json ./build/test_apps/cube_rt_vk_macos/cube_rt_vk_macos
+XR_RUNTIME_JSON=./build/openxr_displayxr-dev.json ./build/test_apps/cube_handle_vk_macos/cube_handle_vk_macos
 ```
 
 Use WASD + mouse to move the simulated eye position and observe perspective-correct stereo rendering.
