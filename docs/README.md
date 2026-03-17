@@ -25,6 +25,7 @@ Living feature and extension specifications.
 - [ADR-007](adr/ADR-007-compositor-never-weaves.md) — Compositor never weaves
 - [ADR-008](adr/ADR-008-display-as-spatial-entity.md) — Display as spatial entity
 - [ADR-009](adr/ADR-009-upstream-cherry-pick-strategy.md) — Upstream cherry-pick strategy
+- [ADR-010](adr/ADR-010-shared-app-iosurface-worst-case-sized.md) — Shared app IOSurface worst-case sized
 
 ## Architecture (`architecture/`)
 

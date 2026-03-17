@@ -795,7 +795,6 @@ static uint32_t g_renderW = 0, g_renderH = 0;
 // UI layout constants
 static const float TOOLBAR_HEIGHT = 30.0f;
 static const float STATUSBAR_HEIGHT = 30.0f;
-static const float SIDE_MARGIN = 80.0f;  // Canvas inset from window edges (demo: show canvas ≠ window)
 
 static void SignalHandler(int)
 {
@@ -963,13 +962,15 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height, id<MTLDevice> dev
         g_statusBarView.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
         [container addSubview:g_statusBarView];
 
-        // Metal view (canvas — inset from all sides to clearly show canvas ≠ window)
-        float metalH = height - TOOLBAR_HEIGHT - STATUSBAR_HEIGHT;
-        float metalW = width - 2 * SIDE_MARGIN;
-        NSRect metalFrame = NSMakeRect(SIDE_MARGIN, STATUSBAR_HEIGHT, metalW, metalH);
+        // Metal view (canvas — center 50% of window to clearly show canvas ≠ window)
+        float canvasW = width * 0.5f;
+        float canvasH = height * 0.5f;
+        float canvasX = width * 0.25f;
+        float canvasY = height * 0.25f;
+        NSRect metalFrame = NSMakeRect(canvasX, canvasY, canvasW, canvasH);
         g_metalView = [[AppMetalView alloc] initWithFrame:metalFrame];
         [g_metalView setWantsLayer:YES];
-        g_metalView.autoresizingMask = NSViewHeightSizable;
+        g_metalView.autoresizingMask = 0;  // No autoresize — repositioned each frame
 
         // Set Retina scale
         CAMetalLayer *metalLayer = (CAMetalLayer *)[g_metalView layer];
@@ -1230,19 +1231,22 @@ static void PumpMacOSEvents()
             }
         }
 
-        // Update pixel sizes (Retina-aware)
-        if (g_metalView != nil) {
-            CGFloat backingScale = g_window ? [g_window backingScaleFactor] : 1.0;
-            // Canvas = Metal view area
-            NSSize viewSize = [g_metalView bounds].size;
-            g_canvasW = (uint32_t)(viewSize.width * backingScale);
-            g_canvasH = (uint32_t)(viewSize.height * backingScale);
+        // Update pixel sizes and reposition canvas at center 25%-75%
+        if (g_metalView != nil && g_window != nil) {
+            CGFloat backingScale = [g_window backingScaleFactor];
             // Full window content area
-            if (g_window) {
-                NSSize winSize = [[g_window contentView] bounds].size;
-                g_windowW = (uint32_t)(winSize.width * backingScale);
-                g_windowH = (uint32_t)(winSize.height * backingScale);
-            }
+            NSSize winSize = [[g_window contentView] bounds].size;
+            g_windowW = (uint32_t)(winSize.width * backingScale);
+            g_windowH = (uint32_t)(winSize.height * backingScale);
+            // Reposition Metal view to center 50% of content area
+            float cw = winSize.width * 0.5f;
+            float ch = winSize.height * 0.5f;
+            float cx = winSize.width * 0.25f;
+            float cy = winSize.height * 0.25f;
+            [g_metalView setFrame:NSMakeRect(cx, cy, cw, ch)];
+            // Canvas = Metal view backing pixels
+            g_canvasW = (uint32_t)(cw * backingScale);
+            g_canvasH = (uint32_t)(ch * backingScale);
         }
     }
 }
@@ -1565,15 +1569,15 @@ static bool CreateSpaces(AppXrSession &app)
 
 static bool CreateSwapchain(AppXrSession &app)
 {
-    // Size swapchain for the maximum atlas across all rendering modes.
-    // For _shared apps, use canvas dims (not display dims) — views land in the canvas.
+    // Size swapchain for worst-case atlas across all rendering modes.
+    // Use display dims (not canvas) — canvas can grow to full display on window resize.
     uint32_t w = app.configViews[0].recommendedImageRectWidth * 2;  // fallback: stereo SBS
     uint32_t h = app.configViews[0].recommendedImageRectHeight;
-    if (app.renderingModeCount > 0 && app.canvasPixelWidth > 0 && app.canvasPixelHeight > 0) {
+    if (app.renderingModeCount > 0 && app.displayPixelWidth > 0 && app.displayPixelHeight > 0) {
         w = 0; h = 0;
         for (uint32_t i = 0; i < app.renderingModeCount; i++) {
-            uint32_t mw = (uint32_t)(app.renderingModeTileColumns[i] * app.renderingModeScaleX[i] * app.canvasPixelWidth);
-            uint32_t mh = (uint32_t)(app.renderingModeTileRows[i] * app.renderingModeScaleY[i] * app.canvasPixelHeight);
+            uint32_t mw = (uint32_t)(app.renderingModeTileColumns[i] * app.renderingModeScaleX[i] * app.displayPixelWidth);
+            uint32_t mh = (uint32_t)(app.renderingModeTileRows[i] * app.renderingModeScaleY[i] * app.displayPixelHeight);
             if (mw > w) w = mw;
             if (mh > h) h = mh;
         }
@@ -1701,13 +1705,15 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    // IOSurface = canvas size (Metal view backing dimensions, not display size)
+    // IOSurface = display size (worst case). ~14 MB for a 2560x1440 display.
+    // Canvas rect communicated separately via xrSetSharedTextureOutputRectEXT.
+    // See ADR-010 for rationale.
     NSRect backing = [g_metalView convertRectToBacking:g_metalView.bounds];
-    uint32_t ioW = (uint32_t)backing.size.width;
-    uint32_t ioH = (uint32_t)backing.size.height;
-    app.canvasPixelWidth = ioW;
-    app.canvasPixelHeight = ioH;
-    LOG_INFO("IOSurface dimensions (canvas): %ux%u", ioW, ioH);
+    uint32_t ioW = app.displayPixelWidth > 0 ? app.displayPixelWidth : (uint32_t)backing.size.width;
+    uint32_t ioH = app.displayPixelHeight > 0 ? app.displayPixelHeight : (uint32_t)backing.size.height;
+    app.canvasPixelWidth = (uint32_t)backing.size.width;
+    app.canvasPixelHeight = (uint32_t)backing.size.height;
+    LOG_INFO("IOSurface dimensions (display): %ux%u", ioW, ioH);
 
     // Create the shared IOSurface
     if (!CreateIOSurface(ioW, ioH, renderer.device)) {
@@ -1724,10 +1730,13 @@ int main(int argc, char **argv)
     // Tell the compositor where the canvas is within the window client area
     if (app.pfnSetSharedTextureOutputRectEXT) {
         CGFloat backingScale = g_window ? [g_window backingScaleFactor] : 2.0;
-        int32_t canvasX = (int32_t)(SIDE_MARGIN * backingScale);
-        int32_t canvasY = (int32_t)(STATUSBAR_HEIGHT * backingScale);
-        app.pfnSetSharedTextureOutputRectEXT(app.session, canvasX, canvasY, ioW, ioH);
-        LOG_INFO("Set shared texture output rect: x=%d, y=%d, w=%u, h=%u", canvasX, canvasY, ioW, ioH);
+        NSRect mf = [g_metalView frame];
+        int32_t canvasX = (int32_t)(mf.origin.x * backingScale);
+        int32_t canvasY = (int32_t)(mf.origin.y * backingScale);
+        app.pfnSetSharedTextureOutputRectEXT(app.session, canvasX, canvasY,
+                                              app.canvasPixelWidth, app.canvasPixelHeight);
+        LOG_INFO("Set shared texture output rect: x=%d, y=%d, w=%u, h=%u",
+                 canvasX, canvasY, app.canvasPixelWidth, app.canvasPixelHeight);
     }
 
     if (!CreateSpaces(app)) {
@@ -1770,6 +1779,20 @@ int main(int argc, char **argv)
         lastTime = now;
 
         PumpMacOSEvents();
+
+        // Update canvas rect and recreate IOSurface if canvas size changed
+        if (g_metalView != nil && g_window != nil) {
+            CGFloat bs = [g_window backingScaleFactor];
+            NSRect mf = [g_metalView frame];
+
+            // Update canvas position for Kooima/weaver alignment
+            if (app.pfnSetSharedTextureOutputRectEXT) {
+                app.pfnSetSharedTextureOutputRectEXT(app.session,
+                    (int32_t)(mf.origin.x * bs), (int32_t)(mf.origin.y * bs),
+                    g_canvasW, g_canvasH);
+            }
+        }
+
         PollEvents(app);
 
         // Handle rendering mode change (V=cycle, 0-8=direct)
@@ -2049,10 +2072,12 @@ int main(int argc, char **argv)
                 if (g_toolbarView != nil) {
                     dispatch_async(dispatch_get_main_queue(), ^{
                         g_toolbarView.toolbarText = [NSString stringWithFormat:
-                            @"IOSurface Shared Texture | Mode: %s (%s) | FPS: %.0f (%.1fms) | IOSurf: %ux%u",
+                            @"Mode: %s (%s) | FPS: %.0f (%.1fms) | IOSurf: %ux%u | Swapchain: %ux%u | Canvas: %ux%u",
                             outputModeName,
                             display3D ? "3D" : "2D", fps, g_avgFrameTime * 1000.0,
-                            g_ioSurfaceWidth, g_ioSurfaceHeight];
+                            g_ioSurfaceWidth, g_ioSurfaceHeight,
+                            app.swapchain.width, app.swapchain.height,
+                            g_canvasW, g_canvasH];
                         [g_toolbarView setNeedsDisplay:YES];
                     });
                 }

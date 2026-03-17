@@ -1771,6 +1771,9 @@ comp_metal_compositor_create(struct xrt_device *xdev,
                              void *shared_iosurface,
                              struct xrt_compositor_native **out_xc)
 {
+	U_LOG_W("comp_metal_compositor_create: window_handle=%p, offscreen=%d, shared_iosurface=%p, dp_factory=%p",
+	        window_handle, offscreen, shared_iosurface, dp_factory_metal);
+
 	struct comp_metal_compositor *c = U_TYPED_CALLOC(struct comp_metal_compositor);
 	if (c == NULL) {
 		return XRT_ERROR_ALLOCATION;
@@ -1835,6 +1838,8 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 	uint32_t pixel_height = (uint32_t)(display_height * backing_scale);
 
 	// Window / headless setup
+	U_LOG_W("Window/headless decision: window_handle=%p, shared_iosurface=%p, offscreen=%d",
+	        window_handle, shared_iosurface, offscreen);
 	NSView *external_view = (__bridge NSView *)window_handle;
 	if (external_view != nil) {
 		if (!setup_external_window(c, external_view)) {

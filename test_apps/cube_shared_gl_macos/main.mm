@@ -835,7 +835,6 @@ static uint32_t g_renderW = 0, g_renderH = 0;
 // UI layout constants
 static const float TOOLBAR_HEIGHT = 30.0f;
 static const float STATUSBAR_HEIGHT = 30.0f;
-static const float SIDE_MARGIN = 80.0f;  // Canvas inset from window edges (demo: show canvas ≠ window)
 
 static void SignalHandler(int)
 {
@@ -991,10 +990,12 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height)
         g_statusBarView.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
         [container addSubview:g_statusBarView];
 
-        // OpenGL view (canvas — inset from all sides to clearly show canvas ≠ window)
-        float glH = height - TOOLBAR_HEIGHT - STATUSBAR_HEIGHT;
-        float glW = width - 2 * SIDE_MARGIN;
-        NSRect glFrame = NSMakeRect(SIDE_MARGIN, STATUSBAR_HEIGHT, glW, glH);
+        // OpenGL view (canvas — center 50% of window to clearly show canvas ≠ window)
+        float canvasW = width * 0.5f;
+        float canvasH = height * 0.5f;
+        float canvasX = width * 0.25f;
+        float canvasY = height * 0.25f;
+        NSRect glFrame = NSMakeRect(canvasX, canvasY, canvasW, canvasH);
 
         NSOpenGLPixelFormatAttribute attrs[] = {
             NSOpenGLPFAOpenGLProfile, NSOpenGLProfileVersion4_1Core,
@@ -1018,7 +1019,7 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height)
         }
 
         [g_glView setWantsBestResolutionOpenGLSurface:YES];
-        g_glView.autoresizingMask = NSViewHeightSizable;
+        g_glView.autoresizingMask = 0;  // No autoresize — repositioned each frame
         g_glContext = [g_glView openGLContext];
         [g_glContext makeCurrentContext];
 
@@ -1228,19 +1229,22 @@ static void PumpMacOSEvents()
             }
         }
 
-        // Update pixel sizes (Retina-aware)
-        if (g_glView != nil) {
-            CGFloat backingScale = g_window ? [g_window backingScaleFactor] : 1.0;
-            // Canvas = GL view area
-            NSSize viewSize = [g_glView bounds].size;
-            g_canvasW = (uint32_t)(viewSize.width * backingScale);
-            g_canvasH = (uint32_t)(viewSize.height * backingScale);
+        // Update pixel sizes and reposition canvas at center 25%-75%
+        if (g_glView != nil && g_window != nil) {
+            CGFloat backingScale = [g_window backingScaleFactor];
             // Full window content area
-            if (g_window) {
-                NSSize winSize = [[g_window contentView] bounds].size;
-                g_windowW = (uint32_t)(winSize.width * backingScale);
-                g_windowH = (uint32_t)(winSize.height * backingScale);
-            }
+            NSSize winSize = [[g_window contentView] bounds].size;
+            g_windowW = (uint32_t)(winSize.width * backingScale);
+            g_windowH = (uint32_t)(winSize.height * backingScale);
+            // Reposition GL view to center 50% of content area
+            float cw = winSize.width * 0.5f;
+            float ch = winSize.height * 0.5f;
+            float cx = winSize.width * 0.25f;
+            float cy = winSize.height * 0.25f;
+            [g_glView setFrame:NSMakeRect(cx, cy, cw, ch)];
+            // Canvas = GL view backing pixels
+            g_canvasW = (uint32_t)(cw * backingScale);
+            g_canvasH = (uint32_t)(ch * backingScale);
         }
     }
 }
@@ -1586,15 +1590,15 @@ static bool CreateSpaces(AppXrSession &app)
 
 static bool CreateSwapchain(AppXrSession &app)
 {
-    // Size swapchain for the maximum atlas across all rendering modes.
-    // For _shared apps, use canvas dims (not display dims) — views land in the canvas.
+    // Size swapchain for worst-case atlas across all rendering modes.
+    // Use display dims (not canvas) — canvas can grow to full display on window resize.
     uint32_t w = app.configViews[0].recommendedImageRectWidth * 2;  // fallback: stereo SBS
     uint32_t h = app.configViews[0].recommendedImageRectHeight;
-    if (app.renderingModeCount > 0 && app.canvasPixelWidth > 0 && app.canvasPixelHeight > 0) {
+    if (app.renderingModeCount > 0 && app.displayPixelWidth > 0 && app.displayPixelHeight > 0) {
         w = 0; h = 0;
         for (uint32_t i = 0; i < app.renderingModeCount; i++) {
-            uint32_t mw = (uint32_t)(app.renderingModeTileColumns[i] * app.renderingModeScaleX[i] * app.canvasPixelWidth);
-            uint32_t mh = (uint32_t)(app.renderingModeTileRows[i] * app.renderingModeScaleY[i] * app.canvasPixelHeight);
+            uint32_t mw = (uint32_t)(app.renderingModeTileColumns[i] * app.renderingModeScaleX[i] * app.displayPixelWidth);
+            uint32_t mh = (uint32_t)(app.renderingModeTileRows[i] * app.renderingModeScaleY[i] * app.displayPixelHeight);
             if (mw > w) w = mw;
             if (mh > h) h = mh;
         }
@@ -1727,12 +1731,14 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    // IOSurface = canvas size (GL view backing dimensions, not display size)
-    uint32_t ioW = g_canvasW;
-    uint32_t ioH = g_canvasH;
-    app.canvasPixelWidth = ioW;
-    app.canvasPixelHeight = ioH;
-    LOG_INFO("IOSurface dimensions (canvas): %ux%u", ioW, ioH);
+    // IOSurface = display size (worst case). ~14 MB for a 2560x1440 display.
+    // Canvas rect communicated separately via xrSetSharedTextureOutputRectEXT.
+    // See ADR-010 for rationale.
+    uint32_t ioW = app.displayPixelWidth > 0 ? app.displayPixelWidth : g_canvasW;
+    uint32_t ioH = app.displayPixelHeight > 0 ? app.displayPixelHeight : g_canvasH;
+    app.canvasPixelWidth = g_canvasW;
+    app.canvasPixelHeight = g_canvasH;
+    LOG_INFO("IOSurface dimensions (display): %ux%u", ioW, ioH);
 
     // Create the shared IOSurface and import as GL texture
     [g_glContext makeCurrentContext];
@@ -1750,10 +1756,13 @@ int main(int argc, char **argv)
     // Tell the compositor where the canvas is within the window client area
     if (app.pfnSetSharedTextureOutputRectEXT) {
         CGFloat backingScale = g_window ? [g_window backingScaleFactor] : 2.0;
-        int32_t canvasX = (int32_t)(SIDE_MARGIN * backingScale);
-        int32_t canvasY = (int32_t)(STATUSBAR_HEIGHT * backingScale);
-        app.pfnSetSharedTextureOutputRectEXT(app.session, canvasX, canvasY, ioW, ioH);
-        LOG_INFO("Set shared texture output rect: x=%d, y=%d, w=%u, h=%u", canvasX, canvasY, ioW, ioH);
+        NSRect gf = [g_glView frame];
+        int32_t canvasX = (int32_t)(gf.origin.x * backingScale);
+        int32_t canvasY = (int32_t)(gf.origin.y * backingScale);
+        app.pfnSetSharedTextureOutputRectEXT(app.session, canvasX, canvasY,
+                                              app.canvasPixelWidth, app.canvasPixelHeight);
+        LOG_INFO("Set shared texture output rect: x=%d, y=%d, w=%u, h=%u",
+                 canvasX, canvasY, app.canvasPixelWidth, app.canvasPixelHeight);
     }
 
     if (!CreateSpaces(app)) {
@@ -1797,6 +1806,16 @@ int main(int argc, char **argv)
         lastTime = now;
 
         PumpMacOSEvents();
+
+        // Update canvas rect each frame (canvas position changes on resize)
+        if (app.pfnSetSharedTextureOutputRectEXT && g_glView != nil && g_window != nil) {
+            CGFloat bs = [g_window backingScaleFactor];
+            NSRect gf = [g_glView frame];
+            app.pfnSetSharedTextureOutputRectEXT(app.session,
+                (int32_t)(gf.origin.x * bs), (int32_t)(gf.origin.y * bs),
+                g_canvasW, g_canvasH);
+        }
+
         PollEvents(app);
 
         // Handle rendering mode change (V=cycle, 0-8=direct)
@@ -2081,10 +2100,12 @@ int main(int argc, char **argv)
                 if (g_toolbarView != nil) {
                     dispatch_async(dispatch_get_main_queue(), ^{
                         g_toolbarView.toolbarText = [NSString stringWithFormat:
-                            @"IOSurface Shared Texture (GL) | Mode: %s (%s) | FPS: %.0f (%.1fms) | IOSurf: %ux%u",
+                            @"Mode: %s (%s) | FPS: %.0f (%.1fms) | IOSurf: %ux%u | Swapchain: %ux%u | Canvas: %ux%u",
                             outputModeName,
                             display3D ? "3D" : "2D", fps, g_avgFrameTime * 1000.0,
-                            g_ioSurfaceWidth, g_ioSurfaceHeight];
+                            g_ioSurfaceWidth, g_ioSurfaceHeight,
+                            app.swapchain.width, app.swapchain.height,
+                            g_canvasW, g_canvasH];
                         [g_toolbarView setNeedsDisplay:YES];
                     });
                 }

@@ -2447,6 +2447,10 @@ oxr_session_create(struct oxr_logger *log,
 	const XrCocoaWindowBindingCreateInfoEXT *macos_target_info = OXR_GET_INPUT_FROM_CHAIN(
 	    createInfo, XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_EXT, XrCocoaWindowBindingCreateInfoEXT);
 	if (macos_target_info) {
+		U_LOG_W("Cocoa binding parsed: viewHandle=%p, readback=%p, sharedIOSurface=%p",
+		        macos_target_info->viewHandle,
+		        (void *)macos_target_info->readbackCallback,
+		        macos_target_info->sharedIOSurface);
 		if (macos_target_info->viewHandle) {
 			xsi.external_window_handle = (void *)macos_target_info->viewHandle;
 		}
@@ -2457,8 +2461,13 @@ oxr_session_create(struct oxr_logger *log,
 		if (macos_target_info->sharedIOSurface) {
 			xsi.shared_texture_handle = macos_target_info->sharedIOSurface;
 		}
+	} else {
+		U_LOG_W("No cocoa window binding found in session create chain");
 	}
 #endif
+
+	U_LOG_W("xsi after parsing: external_window=%p, readback=%p, shared_tex=%p",
+	        xsi.external_window_handle, (void *)xsi.readback_callback, xsi.shared_texture_handle);
 
 	/* Try allocating and populating. */
 	XrResult ret = oxr_session_create_impl(log, sys, createInfo, &xsi, &sess);
