@@ -78,13 +78,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     (void)lpCmdLine;
     (void)nCmdShow;
 
+    // Force IPC mode — this app simulates a sandboxed/containerized client
+    // (like Chrome WebXR) that must communicate via IPC to displayxr-service.
+    // The runtime's hybrid mode checks XRT_FORCE_MODE before sandbox detection.
+    SetEnvironmentVariableA("XRT_FORCE_MODE", "ipc");
+
     // Initialize logging
     if (!InitializeLogging(APP_NAME)) {
         MessageBox(nullptr, L"Failed to initialize logging", L"Warning", MB_OK | MB_ICONWARNING);
     }
 
     LOG_INFO("=== SR Cube OpenXR Application (IPC Legacy) ===");
-    LOG_INFO("IPC mode — set XRT_FORCE_MODE=ipc to force IPC path");
+    LOG_INFO("XRT_FORCE_MODE=ipc set — will use IPC/service compositor");
+    LOG_INFO("Requires displayxr-service to be running");
     LOG_INFO("Legacy mode — no XR_EXT_display_info, compromise scaling");
     LOG_INFO("Input handled by DisplayXR's qwerty driver");
 
