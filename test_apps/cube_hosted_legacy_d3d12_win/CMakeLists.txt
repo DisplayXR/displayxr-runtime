@@ -70,14 +70,14 @@ add_executable(cube_hosted_legacy_d3d12_win WIN32
     main.cpp
     xr_session.cpp
     xr_session.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_ext_d3d12_win/d3d12_renderer.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_ext_d3d12_win/d3d12_renderer.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_handle_d3d12_win/d3d12_renderer.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_handle_d3d12_win/d3d12_renderer.h
     sr_cube_openxr.manifest
     resource.rc
 )
 
 target_include_directories(cube_hosted_legacy_d3d12_win PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_ext_d3d12_win
+    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_handle_d3d12_win
 )
 
 target_link_libraries(cube_hosted_legacy_d3d12_win PRIVATE

@@ -70,16 +70,16 @@ add_executable(cube_hosted_legacy_gl_win WIN32
     main.cpp
     xr_session.cpp
     xr_session.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_ext_gl_win/gl_renderer.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_ext_gl_win/gl_renderer.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_ext_gl_win/gl_functions.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_ext_gl_win/gl_functions.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_handle_gl_win/gl_renderer.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_handle_gl_win/gl_renderer.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_handle_gl_win/gl_functions.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_handle_gl_win/gl_functions.h
     sr_cube_openxr.manifest
     resource.rc
 )
 
 target_include_directories(cube_hosted_legacy_gl_win PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_ext_gl_win
+    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_handle_gl_win
 )
 
 target_link_libraries(cube_hosted_legacy_gl_win PRIVATE
