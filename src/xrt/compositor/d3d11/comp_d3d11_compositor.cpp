@@ -873,11 +873,12 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 				uint32_t cur_vw, cur_vh;
 				comp_d3d11_renderer_get_view_dimensions(c->renderer, &cur_vw, &cur_vh);
 				if (cur_vw != new_vw || cur_vh != new_vh) {
+					uint32_t resize_target_h = (c->display_processor != NULL) ? new_vh : tgt_height;
 					comp_d3d11_renderer_resize(
 					    c->renderer,
 					    new_vw,
 					    new_vh,
-					    tgt_height);
+					    resize_target_h);
 				}
 			}
 		}
@@ -1473,6 +1474,8 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	// Without a display processor, use the window height so the stereo texture is tall enough
 	// for mono fallback blitting.  Mono/2D mode uses a GPU stretch blit to fill the full
 	// window regardless of stereo texture height.
+	// NOTE: the per-frame resize path (renderer_resize) must apply the same guard —
+	// see resize_target_h in the mode-switch handler above.
 	uint32_t target_height = (c->display_processor != NULL) ? view_height : c->settings.preferred.height;
 	xrt_result_t xret = comp_d3d11_renderer_create(c, view_width, view_height, target_height, &c->renderer);
 	if (xret != XRT_SUCCESS) {
