@@ -372,6 +372,10 @@ static void RenderThreadFunc(
                 uint32_t tileRows = (xr->renderingModeCount > 0 && inputSnapshot.currentRenderingMode < xr->renderingModeCount)
                     ? xr->renderingModeTileRows[inputSnapshot.currentRenderingMode] : 1;
                 bool monoMode = (xr->renderingModeCount > 0 && !xr->renderingModeDisplay3D[inputSnapshot.currentRenderingMode]);
+                if (xr->renderingModeCount > 0 && inputSnapshot.currentRenderingMode < xr->renderingModeCount) {
+                    xr->recommendedViewScaleX = xr->renderingModeScaleX[inputSnapshot.currentRenderingMode];
+                    xr->recommendedViewScaleY = xr->renderingModeScaleY[inputSnapshot.currentRenderingMode];
+                }
                 int eyeCount = monoMode ? 1 : (int)modeViewCount;
                 std::vector<XrCompositionLayerProjectionView> projectionViews(eyeCount, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
 

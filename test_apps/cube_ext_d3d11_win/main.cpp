@@ -300,6 +300,10 @@ static void RenderOneFrame(RenderState& rs) {
                 uint32_t tileRows = (xr.renderingModeCount > 0 && g_inputState.currentRenderingMode < xr.renderingModeCount)
                     ? xr.renderingModeTileRows[g_inputState.currentRenderingMode] : 1;
                 bool monoMode = (xr.renderingModeCount > 0 && !xr.renderingModeDisplay3D[g_inputState.currentRenderingMode]);
+                if (xr.renderingModeCount > 0 && g_inputState.currentRenderingMode < xr.renderingModeCount) {
+                    xr.recommendedViewScaleX = xr.renderingModeScaleX[g_inputState.currentRenderingMode];
+                    xr.recommendedViewScaleY = xr.renderingModeScaleY[g_inputState.currentRenderingMode];
+                }
                 int eyeCount = monoMode ? 1 : (int)modeViewCount;
                 std::vector<XrCompositionLayerProjectionView> projectionViews(eyeCount, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
             bool hudSubmitted = false;

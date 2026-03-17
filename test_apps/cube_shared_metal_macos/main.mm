@@ -1882,6 +1882,8 @@ int main(int argc, char **argv)
                 ? app.renderingModeScaleX[g_input.currentRenderingMode] : 0.5f;
             float scaleY = (g_input.currentRenderingMode < app.renderingModeCount)
                 ? app.renderingModeScaleY[g_input.currentRenderingMode] : 0.5f;
+            app.recommendedViewScaleX = scaleX;
+            app.recommendedViewScaleY = scaleY;
             uint32_t maxTileW = tileColumns > 0 ? app.swapchain.width / tileColumns : app.swapchain.width;
             uint32_t maxTileH = tileRows > 0 ? app.swapchain.height / tileRows : app.swapchain.height;
             uint32_t renderW, renderH;

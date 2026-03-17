@@ -276,6 +276,10 @@ static void RenderThreadFunc(
                     frameState.shouldRender, (long long)frameState.predictedDisplayTime);
                 // Get N-view mode info from enumerated rendering modes
                 bool monoMode = (xr->renderingModeCount > 0 && !xr->renderingModeDisplay3D[inputSnapshot.currentRenderingMode]);
+                if (xr->renderingModeCount > 0 && inputSnapshot.currentRenderingMode < xr->renderingModeCount) {
+                    xr->recommendedViewScaleX = xr->renderingModeScaleX[inputSnapshot.currentRenderingMode];
+                    xr->recommendedViewScaleY = xr->renderingModeScaleY[inputSnapshot.currentRenderingMode];
+                }
                 uint32_t modeViewCount = (xr->renderingModeCount > 0 && inputSnapshot.currentRenderingMode < xr->renderingModeCount)
                     ? xr->renderingModeViewCounts[inputSnapshot.currentRenderingMode] : 2;
                 uint32_t tileColumns = (xr->renderingModeCount > 0 && inputSnapshot.currentRenderingMode < xr->renderingModeCount)
