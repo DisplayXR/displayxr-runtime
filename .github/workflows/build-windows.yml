@@ -93,49 +93,6 @@ jobs:
           if-no-files-found: error
           path: _package/DisplayXRSetup-*.exe
 
-      # - name: Create GitHub Release
-      #   if: startsWith(github.ref, 'refs/tags/')
-      #   uses: softprops/action-gh-release@v2
-      #   with:
-      #     files: Runtime/Installer/*.exe
-
-      # - name: Upload to Zealot
-      #   if: startsWith(github.ref, 'refs/tags/')
-      #   env:
-      #     ZEALOT_API_TOKEN: ${{ secrets.ZEALOT_API_TOKEN }}
-      #     ZEALOT_CHANNEL_ID: ${{ secrets.ZEALOT_CHANNEL_ID }}
-      #   run: |
-      #     $exePath = Get-ChildItem "Runtime/Installer/*.exe" | Select-Object -First 1
-      #     Write-Output "Installer file path: $exePath"
-      #     if ($exePath -and $exePath.Name -match 'DisplayXR-(\d+\.\d+\.\d+)\.([^.]+)\.exe') {
-      #         $version = $matches[1]
-      #         $fileCommit = $matches[2]
-      #         Write-Output "Parsed file version: $version"
-      #         Write-Output "Parsed file commit: $fileCommit"
-      #     } else {
-      #         Write-Output "Version or build not found in file name."
-      #     }
-      #     $token = $env:ZEALOT_API_TOKEN
-      #     $channel_key = $env:ZEALOT_CHANNEL_ID
-
-      #     # Get dynamic values
-      #     $commit=$(git rev-parse --short HEAD)
-      #     $log=Get-Content changelog.txt -Raw
-
-      #     curl.exe -X POST "https://zealot.leiapix.com/api/apps/upload" `
-      #       -F "token=$token" `
-      #       -F "file=@$($exePath.FullName)" `
-      #       -F "device_type=windows" `
-      #       -F "app_name=DisplayXR" `
-      #       -F "release_version=$version" `
-      #       -F "build_version=$commit" `
-      #       -F "branch=${{ github.ref_name }}" `
-      #       -F "git_commit=$commit" `
-      #       -F "channel_key=$channel_key" `
-      #       -F "changelog=$log"
-
-      #     Write-Output "Upload complete."
-
       - name: Setup rclone config
         shell: powershell
         run: |
@@ -195,8 +152,8 @@ jobs:
 
             ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
 
-  # D3D11 test app with XR_EXT_win32_window_binding (app creates window)
-  TestAppCubeExtD3D11:
+  # D3D11 test app with XR_EXT_win32_window_binding (app provides window handle)
+  TestAppCubeHandleD3D11:
     if: true  # <-- Change to 'false' to disable test app build
     runs-on: windows-2022
     needs: Runtime  # Wait for runtime build to get artifacts
@@ -237,9 +194,9 @@ jobs:
           Write-Host "OpenXR SDK contents:"
           Get-ChildItem -Recurse openxr_sdk | Select-Object FullName
 
-      - name: Build D3D11 test app (cube_ext_d3d11_win)
+      - name: Build D3D11 test app (cube_handle_d3d11_win)
         run: |
-          cd test_apps/cube_ext_d3d11_win
+          cd test_apps/cube_handle_d3d11_win
           cmake -S . -B build -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
             -DOpenXR_ROOT="${{ github.workspace }}/openxr_sdk"
@@ -254,7 +211,7 @@ jobs:
             $loaderDll = Get-ChildItem -Path openxr_sdk -Recurse -Filter "openxr_loader.dll" | Select-Object -First 1
           }
           if ($loaderDll) {
-            Copy-Item $loaderDll.FullName -Destination test_apps/cube_ext_d3d11_win/build/
+            Copy-Item $loaderDll.FullName -Destination test_apps/cube_handle_d3d11_win/build/
             Write-Host "Copied $($loaderDll.FullName) to test app build"
           } else {
             Write-Host "Warning: openxr_loader.dll not found"
@@ -268,8 +225,8 @@ jobs:
       - name: Verify binary architectures
         run: |
           Write-Host "=== Checking binary architectures ==="
-          $exe = "test_apps/cube_ext_d3d11_win/build/cube_ext_d3d11_win.exe"
-          $dll = "test_apps/cube_ext_d3d11_win/build/openxr_loader.dll"
+          $exe = "test_apps/cube_handle_d3d11_win/build/cube_handle_d3d11_win.exe"
+          $dll = "test_apps/cube_handle_d3d11_win/build/openxr_loader.dll"
 
           Write-Host "`nEXE architecture:"
           dumpbin /headers $exe | Select-String -Pattern "machine \(|File Type:"
@@ -284,20 +241,20 @@ jobs:
           dumpbin /dependents $dll
 
           Write-Host "`nAll DLLs in build directory:"
-          Get-ChildItem test_apps/cube_ext_d3d11_win/build/*.dll | ForEach-Object { Write-Host "  $($_.Name)" }
+          Get-ChildItem test_apps/cube_handle_d3d11_win/build/*.dll | ForEach-Object { Write-Host "  $($_.Name)" }
 
       - name: Upload test app
         uses: actions/upload-artifact@v4
         with:
-          name: CubeExtD3D11
+          name: CubeHandleD3D11
           if-no-files-found: error
           path: |
-            test_apps/cube_ext_d3d11_win/build/cube_ext_d3d11_win.exe
-            test_apps/cube_ext_d3d11_win/build/*.dll
-            test_apps/cube_ext_d3d11_win/build/textures/
+            test_apps/cube_handle_d3d11_win/build/cube_handle_d3d11_win.exe
+            test_apps/cube_handle_d3d11_win/build/*.dll
+            test_apps/cube_handle_d3d11_win/build/textures/
 
-  # D3D11 test app WITHOUT window binding extension - Standard OpenXR app
-  TestAppCubeD3D11:
+  # D3D11 hosted test app - Standard OpenXR app (runtime creates window)
+  TestAppCubeHostedD3D11:
     if: true  # <-- Change to 'false' to disable
     runs-on: windows-2022
     needs: Runtime
@@ -329,9 +286,9 @@ jobs:
           Invoke-WebRequest -Uri $openxrUrl -OutFile openxr_loader.zip
           Expand-Archive -Path openxr_loader.zip -DestinationPath openxr_sdk -Force
 
-      - name: Build D3D11 test app (cube_rt_d3d11_win)
+      - name: Build D3D11 hosted test app (cube_hosted_d3d11_win)
         run: |
-          cd test_apps/cube_rt_d3d11_win
+          cd test_apps/cube_hosted_d3d11_win
           cmake -S . -B build -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
             -DOpenXR_ROOT="${{ github.workspace }}/openxr_sdk"
@@ -344,21 +301,21 @@ jobs:
             $loaderDll = Get-ChildItem -Path openxr_sdk -Recurse -Filter "openxr_loader.dll" | Select-Object -First 1
           }
           if ($loaderDll) {
-            Copy-Item $loaderDll.FullName -Destination test_apps/cube_rt_d3d11_win/build/
+            Copy-Item $loaderDll.FullName -Destination test_apps/cube_hosted_d3d11_win/build/
           }
 
-      - name: Upload D3D11 test app (standard OpenXR)
+      - name: Upload D3D11 hosted test app
         uses: actions/upload-artifact@v4
         with:
-          name: CubeD3D11
+          name: CubeHostedD3D11
           if-no-files-found: error
           path: |
-            test_apps/cube_rt_d3d11_win/build/cube_rt_d3d11_win.exe
-            test_apps/cube_rt_d3d11_win/build/*.dll
-            test_apps/cube_rt_d3d11_win/build/textures/
+            test_apps/cube_hosted_d3d11_win/build/cube_hosted_d3d11_win.exe
+            test_apps/cube_hosted_d3d11_win/build/*.dll
+            test_apps/cube_hosted_d3d11_win/build/textures/
 
   # D3D12 test app with XR_EXT_win32_window_binding
-  TestAppCubeExtD3D12:
+  TestAppCubeHandleD3D12:
     if: true  # <-- Change to 'false' to disable
     runs-on: windows-2022
     needs: Runtime
@@ -390,9 +347,9 @@ jobs:
           Invoke-WebRequest -Uri $openxrUrl -OutFile openxr_loader.zip
           Expand-Archive -Path openxr_loader.zip -DestinationPath openxr_sdk -Force
 
-      - name: Build D3D12 test app (cube_ext_d3d12_win)
+      - name: Build D3D12 test app (cube_handle_d3d12_win)
         run: |
-          cd test_apps/cube_ext_d3d12_win
+          cd test_apps/cube_handle_d3d12_win
           cmake -S . -B build -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
             -DOpenXR_ROOT="${{ github.workspace }}/openxr_sdk"
@@ -405,21 +362,21 @@ jobs:
             $loaderDll = Get-ChildItem -Path openxr_sdk -Recurse -Filter "openxr_loader.dll" | Select-Object -First 1
           }
           if ($loaderDll) {
-            Copy-Item $loaderDll.FullName -Destination test_apps/cube_ext_d3d12_win/build/
+            Copy-Item $loaderDll.FullName -Destination test_apps/cube_handle_d3d12_win/build/
           }
 
       - name: Upload D3D12 test app
         uses: actions/upload-artifact@v4
         with:
-          name: CubeExtD3D12
+          name: CubeHandleD3D12
           if-no-files-found: error
           path: |
-            test_apps/cube_ext_d3d12_win/build/cube_ext_d3d12_win.exe
-            test_apps/cube_ext_d3d12_win/build/*.dll
-            test_apps/cube_ext_d3d12_win/build/textures/
+            test_apps/cube_handle_d3d12_win/build/cube_handle_d3d12_win.exe
+            test_apps/cube_handle_d3d12_win/build/*.dll
+            test_apps/cube_handle_d3d12_win/build/textures/
 
   # OpenGL test app with XR_EXT_win32_window_binding
-  TestAppCubeExtGL:
+  TestAppCubeHandleGL:
     if: true  # <-- Change to 'false' to disable
     runs-on: windows-2022
     needs: Runtime
@@ -451,9 +408,9 @@ jobs:
           Invoke-WebRequest -Uri $openxrUrl -OutFile openxr_loader.zip
           Expand-Archive -Path openxr_loader.zip -DestinationPath openxr_sdk -Force
 
-      - name: Build OpenGL test app (cube_ext_gl_win)
+      - name: Build OpenGL test app (cube_handle_gl_win)
         run: |
-          cd test_apps/cube_ext_gl_win
+          cd test_apps/cube_handle_gl_win
           cmake -S . -B build -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
             -DOpenXR_ROOT="${{ github.workspace }}/openxr_sdk"
@@ -466,21 +423,21 @@ jobs:
             $loaderDll = Get-ChildItem -Path openxr_sdk -Recurse -Filter "openxr_loader.dll" | Select-Object -First 1
           }
           if ($loaderDll) {
-            Copy-Item $loaderDll.FullName -Destination test_apps/cube_ext_gl_win/build/
+            Copy-Item $loaderDll.FullName -Destination test_apps/cube_handle_gl_win/build/
           }
 
       - name: Upload OpenGL test app
         uses: actions/upload-artifact@v4
         with:
-          name: CubeExtGL
+          name: CubeHandleGL
           if-no-files-found: error
           path: |
-            test_apps/cube_ext_gl_win/build/cube_ext_gl_win.exe
-            test_apps/cube_ext_gl_win/build/*.dll
-            test_apps/cube_ext_gl_win/build/textures/
+            test_apps/cube_handle_gl_win/build/cube_handle_gl_win.exe
+            test_apps/cube_handle_gl_win/build/*.dll
+            test_apps/cube_handle_gl_win/build/textures/
 
   # Vulkan test app with XR_EXT_win32_window_binding (requires Vulkan SDK)
-  TestAppCubeExtVK:
+  TestAppCubeHandleVK:
     if: true  # <-- Change to 'false' to disable
     runs-on: windows-2022
     needs: Runtime
@@ -518,9 +475,9 @@ jobs:
           Invoke-WebRequest -Uri $openxrUrl -OutFile openxr_loader.zip
           Expand-Archive -Path openxr_loader.zip -DestinationPath openxr_sdk -Force
 
-      - name: Build Vulkan test app (cube_ext_vk_win)
+      - name: Build Vulkan test app (cube_handle_vk_win)
         run: |
-          cd test_apps/cube_ext_vk_win
+          cd test_apps/cube_handle_vk_win
           cmake -S . -B build -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
             -DOpenXR_ROOT="${{ github.workspace }}/openxr_sdk"
@@ -533,18 +490,18 @@ jobs:
             $loaderDll = Get-ChildItem -Path openxr_sdk -Recurse -Filter "openxr_loader.dll" | Select-Object -First 1
           }
           if ($loaderDll) {
-            Copy-Item $loaderDll.FullName -Destination test_apps/cube_ext_vk_win/build/
+            Copy-Item $loaderDll.FullName -Destination test_apps/cube_handle_vk_win/build/
           }
 
       - name: Upload Vulkan test app
         uses: actions/upload-artifact@v4
         with:
-          name: CubeExtVK
+          name: CubeHandleVK
           if-no-files-found: error
           path: |
-            test_apps/cube_ext_vk_win/build/cube_ext_vk_win.exe
-            test_apps/cube_ext_vk_win/build/*.dll
-            test_apps/cube_ext_vk_win/build/textures/
+            test_apps/cube_handle_vk_win/build/cube_handle_vk_win.exe
+            test_apps/cube_handle_vk_win/build/*.dll
+            test_apps/cube_handle_vk_win/build/textures/
 
   # 3D Gaussian Splatting Vulkan demo (requires Vulkan SDK, uses FetchContent for 3DGS.cpp)
   TestAppGaussianSplattingVK:
@@ -585,9 +542,9 @@ jobs:
           Invoke-WebRequest -Uri $openxrUrl -OutFile openxr_loader.zip
           Expand-Archive -Path openxr_loader.zip -DestinationPath openxr_sdk -Force
 
-      - name: Build 3DGS Vulkan demo (gaussian_splatting_ext_vk_win)
+      - name: Build 3DGS Vulkan demo (gaussian_splatting_handle_vk_win)
         run: |
-          cd demos/gaussian_splatting_ext_vk_win
+          cd demos/gaussian_splatting_handle_vk_win
           cmake -S . -B build -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
             -DOpenXR_ROOT="${{ github.workspace }}/openxr_sdk"
@@ -600,7 +557,7 @@ jobs:
             $loaderDll = Get-ChildItem -Path openxr_sdk -Recurse -Filter "openxr_loader.dll" | Select-Object -First 1
           }
           if ($loaderDll) {
-            Copy-Item $loaderDll.FullName -Destination demos/gaussian_splatting_ext_vk_win/build/
+            Copy-Item $loaderDll.FullName -Destination demos/gaussian_splatting_handle_vk_win/build/
           }
 
       - name: Upload 3DGS Vulkan demo
@@ -609,8 +566,8 @@ jobs:
           name: GaussianSplattingVK
           if-no-files-found: error
           path: |
-            demos/gaussian_splatting_ext_vk_win/build/gaussian_splatting_ext_vk_win.exe
-            demos/gaussian_splatting_ext_vk_win/build/*.dll
+            demos/gaussian_splatting_handle_vk_win/build/gaussian_splatting_handle_vk_win.exe
+            demos/gaussian_splatting_handle_vk_win/build/*.dll
 
   # Spatial OS demo app (multi-layer war room)
   TestAppSpatialOS:
@@ -645,9 +602,9 @@ jobs:
           Invoke-WebRequest -Uri $openxrUrl -OutFile openxr_loader.zip
           Expand-Archive -Path openxr_loader.zip -DestinationPath openxr_sdk -Force
 
-      - name: Build Spatial OS demo (spatial_os_rt_d3d11_win)
+      - name: Build Spatial OS demo (spatial_os_hosted_d3d11_win)
         run: |
-          cd demos/spatial_os_rt_d3d11_win
+          cd demos/spatial_os_hosted_d3d11_win
           cmake -S . -B build -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
             -DOpenXR_ROOT="${{ github.workspace }}/openxr_sdk"
@@ -660,7 +617,7 @@ jobs:
             $loaderDll = Get-ChildItem -Path openxr_sdk -Recurse -Filter "openxr_loader.dll" | Select-Object -First 1
           }
           if ($loaderDll) {
-            Copy-Item $loaderDll.FullName -Destination demos/spatial_os_rt_d3d11_win/build/
+            Copy-Item $loaderDll.FullName -Destination demos/spatial_os_hosted_d3d11_win/build/
           }
 
       - name: Upload Spatial OS demo
@@ -669,12 +626,12 @@ jobs:
           name: SpatialOS
           if-no-files-found: error
           path: |
-            demos/spatial_os_rt_d3d11_win/build/spatial_os_rt_d3d11_win.exe
-            demos/spatial_os_rt_d3d11_win/build/*.dll
-            demos/spatial_os_rt_d3d11_win/build/textures/
+            demos/spatial_os_hosted_d3d11_win/build/spatial_os_hosted_d3d11_win.exe
+            demos/spatial_os_hosted_d3d11_win/build/*.dll
+            demos/spatial_os_hosted_d3d11_win/build/textures/
 
-  # D3D11 shared texture test app (offscreen mode)
-  TestAppCubeSharedD3D11:
+  # D3D11 texture test app (offscreen shared texture mode)
+  TestAppCubeTextureD3D11:
     if: true  # <-- Change to 'false' to disable
     runs-on: windows-2022
     needs: Runtime
@@ -699,9 +656,9 @@ jobs:
           Invoke-WebRequest -Uri $openxrUrl -OutFile openxr_loader.zip
           Expand-Archive -Path openxr_loader.zip -DestinationPath openxr_sdk -Force
 
-      - name: Build shared D3D11 test app (cube_shared_d3d11_win)
+      - name: Build texture D3D11 test app (cube_texture_d3d11_win)
         run: |
-          cd test_apps/cube_shared_d3d11_win
+          cd test_apps/cube_texture_d3d11_win
           cmake -S . -B build -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
             -DOpenXR_ROOT="${{ github.workspace }}/openxr_sdk"
@@ -714,137 +671,21 @@ jobs:
             $loaderDll = Get-ChildItem -Path openxr_sdk -Recurse -Filter "openxr_loader.dll" | Select-Object -First 1
           }
           if ($loaderDll) {
-            Copy-Item $loaderDll.FullName -Destination test_apps/cube_shared_d3d11_win/build/
+            Copy-Item $loaderDll.FullName -Destination test_apps/cube_texture_d3d11_win/build/
           }
 
-      - name: Upload shared D3D11 test app
+      - name: Upload texture D3D11 test app
         uses: actions/upload-artifact@v4
         with:
-          name: CubeSharedD3D11
+          name: CubeTextureD3D11
           if-no-files-found: error
           path: |
-            test_apps/cube_shared_d3d11_win/build/cube_shared_d3d11_win.exe
-            test_apps/cube_shared_d3d11_win/build/*.dll
-            test_apps/cube_shared_d3d11_win/build/textures/
+            test_apps/cube_texture_d3d11_win/build/cube_texture_d3d11_win.exe
+            test_apps/cube_texture_d3d11_win/build/*.dll
+            test_apps/cube_texture_d3d11_win/build/textures/
 
-  # OpenGL shared texture test app (offscreen mode via WGL_NV_DX_interop2)
-  TestAppCubeSharedGL:
-    if: true  # <-- Change to 'false' to disable
-    runs-on: windows-2022
-    needs: Runtime
-
-    env:
-      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
-          submodules: recursive
-
-      - uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
-
-      - name: Install OpenXR loader
-        run: |
-          $openxrVersion = "1.1.38"
-          $openxrUrl = "https://github.com/KhronosGroup/OpenXR-SDK-Source/releases/download/release-$openxrVersion/openxr_loader_windows-$openxrVersion.zip"
-          Invoke-WebRequest -Uri $openxrUrl -OutFile openxr_loader.zip
-          Expand-Archive -Path openxr_loader.zip -DestinationPath openxr_sdk -Force
-
-      - name: Build shared GL test app (cube_shared_gl_win)
-        run: |
-          cd test_apps/cube_shared_gl_win
-          cmake -S . -B build -G Ninja `
-            -DCMAKE_BUILD_TYPE=Release `
-            -DOpenXR_ROOT="${{ github.workspace }}/openxr_sdk"
-          cmake --build build
-
-      - name: Copy required DLLs
-        run: |
-          $loaderDll = Get-ChildItem -Path openxr_sdk -Recurse -Filter "openxr_loader.dll" | Where-Object { $_.FullName -like "*x64*" } | Select-Object -First 1
-          if (-not $loaderDll) {
-            $loaderDll = Get-ChildItem -Path openxr_sdk -Recurse -Filter "openxr_loader.dll" | Select-Object -First 1
-          }
-          if ($loaderDll) {
-            Copy-Item $loaderDll.FullName -Destination test_apps/cube_shared_gl_win/build/
-          }
-
-      - name: Upload shared GL test app
-        uses: actions/upload-artifact@v4
-        with:
-          name: CubeSharedGL
-          if-no-files-found: error
-          path: |
-            test_apps/cube_shared_gl_win/build/cube_shared_gl_win.exe
-            test_apps/cube_shared_gl_win/build/*.dll
-            test_apps/cube_shared_gl_win/build/textures/
-
-  # Vulkan shared texture test app (offscreen mode via VK_KHR_external_memory_win32)
-  TestAppCubeSharedVK:
-    if: true  # <-- Change to 'false' to disable
-    runs-on: windows-2022
-    needs: Runtime
-
-    env:
-      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
-          submodules: recursive
-
-      - uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
-
-      - name: Install Vulkan SDK
-        uses: humbletim/install-vulkan-sdk@v1.2
-        with:
-          version: 1.3.283.0
-          cache: true
-
-      - name: Install OpenXR loader
-        run: |
-          $openxrVersion = "1.1.38"
-          $openxrUrl = "https://github.com/KhronosGroup/OpenXR-SDK-Source/releases/download/release-$openxrVersion/openxr_loader_windows-$openxrVersion.zip"
-          Invoke-WebRequest -Uri $openxrUrl -OutFile openxr_loader.zip
-          Expand-Archive -Path openxr_loader.zip -DestinationPath openxr_sdk -Force
-
-      - name: Build shared VK test app (cube_shared_vk_win)
-        run: |
-          cd test_apps/cube_shared_vk_win
-          cmake -S . -B build -G Ninja `
-            -DCMAKE_BUILD_TYPE=Release `
-            -DOpenXR_ROOT="${{ github.workspace }}/openxr_sdk"
-          cmake --build build
-
-      - name: Copy required DLLs
-        run: |
-          $loaderDll = Get-ChildItem -Path openxr_sdk -Recurse -Filter "openxr_loader.dll" | Where-Object { $_.FullName -like "*x64*" } | Select-Object -First 1
-          if (-not $loaderDll) {
-            $loaderDll = Get-ChildItem -Path openxr_sdk -Recurse -Filter "openxr_loader.dll" | Select-Object -First 1
-          }
-          if ($loaderDll) {
-            Copy-Item $loaderDll.FullName -Destination test_apps/cube_shared_vk_win/build/
-          }
-
-      - name: Upload shared VK test app
-        uses: actions/upload-artifact@v4
-        with:
-          name: CubeSharedVK
-          if-no-files-found: error
-          path: |
-            test_apps/cube_shared_vk_win/build/cube_shared_vk_win.exe
-            test_apps/cube_shared_vk_win/build/*.dll
-            test_apps/cube_shared_vk_win/build/textures/
-
-  # Vulkan non-ext test app (runtime creates window, no window binding extension)
-  TestAppCubeVK:
+  # D3D11 legacy hosted test app (no XR_EXT_display_info)
+  TestAppCubeHostedLegacyD3D11:
     if: true  # <-- Change to 'false' to disable
     runs-on: windows-2022
     needs: Runtime
@@ -865,12 +706,6 @@ jobs:
           name: DisplayXR
           path: runtime
 
-      - name: Install Vulkan SDK
-        uses: humbletim/install-vulkan-sdk@v1.2
-        with:
-          version: 1.3.283.0
-          cache: true
-
       - uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
@@ -882,9 +717,9 @@ jobs:
           Invoke-WebRequest -Uri $openxrUrl -OutFile openxr_loader.zip
           Expand-Archive -Path openxr_loader.zip -DestinationPath openxr_sdk -Force
 
-      - name: Build Vulkan test app (cube_rt_vk_win)
+      - name: Build legacy hosted D3D11 test app (cube_hosted_legacy_d3d11_win)
         run: |
-          cd test_apps/cube_rt_vk_win
+          cd test_apps/cube_hosted_legacy_d3d11_win
           cmake -S . -B build -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
             -DOpenXR_ROOT="${{ github.workspace }}/openxr_sdk"
@@ -897,79 +732,24 @@ jobs:
             $loaderDll = Get-ChildItem -Path openxr_sdk -Recurse -Filter "openxr_loader.dll" | Select-Object -First 1
           }
           if ($loaderDll) {
-            Copy-Item $loaderDll.FullName -Destination test_apps/cube_rt_vk_win/build/
+            Copy-Item $loaderDll.FullName -Destination test_apps/cube_hosted_legacy_d3d11_win/build/
           }
 
-      - name: Upload Vulkan test app
+      - name: Upload legacy hosted D3D11 test app
         uses: actions/upload-artifact@v4
         with:
-          name: CubeVK
+          name: CubeHostedLegacyD3D11
           if-no-files-found: error
           path: |
-            test_apps/cube_rt_vk_win/build/cube_rt_vk_win.exe
-            test_apps/cube_rt_vk_win/build/*.dll
-            test_apps/cube_rt_vk_win/build/textures/
-
-  # OpenGL non-ext test app (runtime creates window, no window binding extension)
-  TestAppCubeGL:
-    if: true  # <-- Change to 'false' to disable
-    runs-on: windows-2022
-    needs: Runtime
-
-    env:
-      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
-          submodules: recursive
-
-      - uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
-
-      - name: Install OpenXR loader
-        run: |
-          $openxrVersion = "1.1.38"
-          $openxrUrl = "https://github.com/KhronosGroup/OpenXR-SDK-Source/releases/download/release-$openxrVersion/openxr_loader_windows-$openxrVersion.zip"
-          Invoke-WebRequest -Uri $openxrUrl -OutFile openxr_loader.zip
-          Expand-Archive -Path openxr_loader.zip -DestinationPath openxr_sdk -Force
-
-      - name: Build OpenGL test app (cube_rt_gl_win)
-        run: |
-          cd test_apps/cube_rt_gl_win
-          cmake -S . -B build -G Ninja `
-            -DCMAKE_BUILD_TYPE=Release `
-            -DOpenXR_ROOT="${{ github.workspace }}/openxr_sdk"
-          cmake --build build
-
-      - name: Copy required DLLs
-        run: |
-          $loaderDll = Get-ChildItem -Path openxr_sdk -Recurse -Filter "openxr_loader.dll" | Where-Object { $_.FullName -like "*x64*" } | Select-Object -First 1
-          if (-not $loaderDll) {
-            $loaderDll = Get-ChildItem -Path openxr_sdk -Recurse -Filter "openxr_loader.dll" | Select-Object -First 1
-          }
-          if ($loaderDll) {
-            Copy-Item $loaderDll.FullName -Destination test_apps/cube_rt_gl_win/build/
-          }
-
-      - name: Upload OpenGL test app
-        uses: actions/upload-artifact@v4
-        with:
-          name: CubeGL
-          if-no-files-found: error
-          path: |
-            test_apps/cube_rt_gl_win/build/cube_rt_gl_win.exe
-            test_apps/cube_rt_gl_win/build/*.dll
-            test_apps/cube_rt_gl_win/build/textures/
+            test_apps/cube_hosted_legacy_d3d11_win/build/cube_hosted_legacy_d3d11_win.exe
+            test_apps/cube_hosted_legacy_d3d11_win/build/*.dll
+            test_apps/cube_hosted_legacy_d3d11_win/build/textures/
 
   # Bundle all test apps into a single artifact with per-app subfolders
   BundleTestApps:
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
-    needs: [TestAppCubeExtD3D11, TestAppCubeD3D11, TestAppCubeExtD3D12, TestAppCubeExtGL, TestAppCubeExtVK, TestAppCubeVK, TestAppCubeGL, TestAppGaussianSplattingVK, TestAppSpatialOS, TestAppCubeSharedD3D11, TestAppCubeSharedGL, TestAppCubeSharedVK]
+    needs: [TestAppCubeHandleD3D11, TestAppCubeHostedD3D11, TestAppCubeHandleD3D12, TestAppCubeHandleGL, TestAppCubeHandleVK, TestAppGaussianSplattingVK, TestAppSpatialOS, TestAppCubeTextureD3D11, TestAppCubeHostedLegacyD3D11]
 
     steps:
       - name: Download cube test app artifacts
@@ -1007,16 +787,13 @@ jobs:
         with:
           failOnError: false
           name: |
-            CubeExtD3D11
-            CubeD3D11
-            CubeExtD3D12
-            CubeExtGL
-            CubeExtVK
-            CubeVK
-            CubeGL
-            CubeSharedD3D11
-            CubeSharedGL
-            CubeSharedVK
+            CubeHandleD3D11
+            CubeHostedD3D11
+            CubeHandleD3D12
+            CubeHandleGL
+            CubeHandleVK
+            CubeTextureD3D11
+            CubeHostedLegacyD3D11
             GaussianSplattingVK
             SpatialOS
 

@@ -41,13 +41,13 @@ Five spatial concepts matter for view sizing:
 
 | Class | Canvas definition |
 |-------|------------------|
-| `_ext` (window-handle) | Canvas = window client area. The app provides a window via `XR_EXT_*_window_binding`; the entire client area is 3D content. |
-| `_shared` (shared-texture) | Canvas = output rect — the sub-rect where the app places the shared texture in its window. May be a fraction of the window. |
-| `_rt` (runtime-managed) | Canvas = window. The runtime owns the window, so the full window is 3D content. |
+| `_handle` (handle) | Canvas = window client area. The app provides a window via `XR_EXT_*_window_binding`; the entire client area is 3D content. |
+| `_texture` (texture) | Canvas = output rect — the sub-rect where the app places the shared texture in its window. May be a fraction of the window. |
+| `_hosted` (hosted) | Canvas = window. The runtime owns the window, so the full window is 3D content. |
 
-For `_ext` and `_rt` apps, canvas and window dimensions typically match (or are trivially derived). For `_shared` apps, the canvas can be arbitrarily smaller than both the window and the display — this is the case that requires special handling.
+For `_handle` and `_hosted` apps, canvas and window dimensions typically match (or are trivially derived). For `_texture` apps, the canvas can be arbitrarily smaller than both the window and the display — this is the case that requires special handling.
 
-> **Current limitation:** `u_tiling_compute_mode()` always uses display dimensions (`D_w`, `D_h`) as the base for view sizing. For `_shared` apps, these should be canvas dimensions instead. Similarly, Kooima projection in sim_display uses full display physical size (`hmd->display_width_m / display_height_m`) — this should be canvas physical size for `_shared` apps. See the code fix tracking issue for details.
+> **Current limitation:** `u_tiling_compute_mode()` always uses display dimensions (`D_w`, `D_h`) as the base for view sizing. For `_texture` apps, these should be canvas dimensions instead. Similarly, Kooima projection in sim_display uses full display physical size (`hmd->display_width_m / display_height_m`) — this should be canvas physical size for `_texture` apps. See the code fix tracking issue for details.
 
 ---
 
@@ -157,7 +157,7 @@ for (mi = 0; mi < head->rendering_mode_count; mi++)
 
 ### Phase G: Test apps use tiling info
 
-All test apps (macOS + Windows, ext/shared/rt classes):
+All test apps (macOS + Windows, handle/texture/hosted classes):
 - Dynamic view count: `eyeCount = display3D ? modeViewCount : 1` (no cap at 2)
 - Tile-aware viewports: `vpX = (eye % tileColumns) * renderW`, `vpY = (eye / tileColumns) * renderH`
 - Dynamic `XrView` arrays (std::vector, not fixed [2])
@@ -168,7 +168,7 @@ All test apps (macOS + Windows, ext/shared/rt classes):
 
 ### Phase H: N=4 quad test mode
 
-sim_display has quad mode (4 views, 2x2 tiling). Verified working end-to-end with ext_metal_macos. `xrLocateViews` returns 4 views, apps render 4 viewports in 2x2 grid, display processor receives 2x2 atlas.
+sim_display has quad mode (4 views, 2x2 tiling). Verified working end-to-end with handle_metal_macos. `xrLocateViews` returns 4 views, apps render 4 viewports in 2x2 grid, display processor receives 2x2 atlas.
 
 ### Bug fixes during implementation
 
