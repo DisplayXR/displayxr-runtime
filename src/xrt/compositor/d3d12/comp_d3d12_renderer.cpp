@@ -280,7 +280,9 @@ static void
 render_window_space_layer(struct comp_d3d12_renderer *r,
                           ID3D12GraphicsCommandList *cmd_list,
                           const struct comp_layer *layer,
-                          uint32_t view_index)
+                          uint32_t view_index,
+                          uint32_t vp_w,
+                          uint32_t vp_h)
 {
 	auto internals = get_internals(r->c);
 	ID3D12Device *device = internals->device;
@@ -392,8 +394,8 @@ render_window_space_layer(struct comp_d3d12_renderer *r,
 	D3D12_VIEWPORT vp = {};
 	vp.TopLeftX = (float)tile_x;
 	vp.TopLeftY = (float)tile_y;
-	vp.Width = (float)r->view_width;
-	vp.Height = (float)r->view_height;
+	vp.Width = (float)vp_w;
+	vp.Height = (float)vp_h;
 	vp.MinDepth = 0.0f;
 	vp.MaxDepth = 1.0f;
 	cmd_list->RSSetViewports(1, &vp);
@@ -401,8 +403,8 @@ render_window_space_layer(struct comp_d3d12_renderer *r,
 	D3D12_RECT scissor = {};
 	scissor.left = tile_x;
 	scissor.top = tile_y;
-	scissor.right = tile_x + r->view_width;
-	scissor.bottom = tile_y + r->view_height;
+	scissor.right = tile_x + vp_w;
+	scissor.bottom = tile_y + vp_h;
 	cmd_list->RSSetScissorRects(1, &scissor);
 
 	// Draw quad (triangle strip, 4 vertices)
@@ -983,6 +985,15 @@ comp_d3d12_renderer_draw(struct comp_d3d12_renderer *renderer,
 		}
 	}
 
+	// Compute effective viewport for window-space layers (same clamp as projection)
+	uint32_t ws_vp_w = renderer->view_width;
+	uint32_t ws_vp_h = renderer->view_height;
+	if (!hardware_display_3d) {
+		uint32_t atlas_w = renderer->tile_columns * renderer->view_width;
+		if (target_width < atlas_w) ws_vp_w = target_width;
+		if (target_height < renderer->texture_height) ws_vp_h = target_height;
+	}
+
 	// Draw window-space layers (atlas is already in RENDER_TARGET state)
 	for (uint32_t vi = 0; vi < view_count; vi++) {
 		for (uint32_t li = 0; li < layers->layer_count; li++) {
@@ -990,7 +1001,7 @@ comp_d3d12_renderer_draw(struct comp_d3d12_renderer *renderer,
 			if (layer->data.type != XRT_LAYER_WINDOW_SPACE) {
 				continue;
 			}
-			render_window_space_layer(renderer, cmd_list, layer, vi);
+			render_window_space_layer(renderer, cmd_list, layer, vi, ws_vp_w, ws_vp_h);
 		}
 	}
 
