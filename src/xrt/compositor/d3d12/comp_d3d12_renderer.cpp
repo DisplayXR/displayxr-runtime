@@ -148,8 +148,15 @@ struct comp_d3d12_renderer
 	//! RTV descriptor heap for atlas texture.
 	ID3D12DescriptorHeap *rtv_heap;
 
-	//! SRV/CBV descriptor heap (shader visible, 2 slots: atlas + window-space layer).
+	//! SRV/CBV descriptor heap (shader visible, dynamically allocated slots).
+	//! Slot 0 = atlas SRV; slots 1..N allocated per-frame for layer SRVs.
 	ID3D12DescriptorHeap *srv_heap;
+
+	//! Total number of SRV slots in the heap.
+	uint32_t srv_heap_size;
+
+	//! Next available SRV slot (reset each frame, slot 0 = atlas).
+	uint32_t next_srv_slot;
 
 	//! Root signature for blit operations.
 	ID3D12RootSignature *root_signature;
@@ -311,7 +318,18 @@ render_window_space_layer(struct comp_d3d12_renderer *r,
 	src_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 	cmd_list->ResourceBarrier(1, &src_barrier);
 
-	// Create transient SRV for the window-space texture in slot 1
+	// Allocate a unique SRV slot (same reason as projection blit — D3D12
+	// descriptors are consumed at GPU execution time, not recording time).
+	uint32_t srv_slot = r->next_srv_slot++;
+	if (srv_slot >= r->srv_heap_size) {
+		U_LOG_E("D3D12 renderer: SRV heap overflow in WS layer (slot %u >= %u)",
+		        srv_slot, r->srv_heap_size);
+		src_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+		src_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+		cmd_list->ResourceBarrier(1, &src_barrier);
+		return;
+	}
+
 	D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
 	D3D12_RESOURCE_DESC res_desc = src_resource->GetDesc();
 	srv_desc.Format = res_desc.Format;
@@ -320,7 +338,7 @@ render_window_space_layer(struct comp_d3d12_renderer *r,
 	srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 
 	D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu = r->srv_heap->GetCPUDescriptorHandleForHeapStart();
-	srv_cpu.ptr += r->srv_descriptor_size; // slot 1
+	srv_cpu.ptr += r->srv_descriptor_size * srv_slot;
 	device->CreateShaderResourceView(src_resource, &srv_desc, srv_cpu);
 
 	// Compute per-eye disparity offset
@@ -376,12 +394,12 @@ render_window_space_layer(struct comp_d3d12_renderer *r,
 	cmd_list->SetGraphicsRoot32BitConstants(1, 4, color_scale, 20);
 	cmd_list->SetGraphicsRoot32BitConstants(1, 4, color_bias, 24);
 
-	// Set descriptor heap and SRV table pointing to slot 1 (window-space texture)
+	// Set descriptor heap and SRV table pointing to allocated slot
 	ID3D12DescriptorHeap *heaps[] = {r->srv_heap};
 	cmd_list->SetDescriptorHeaps(1, heaps);
 
 	D3D12_GPU_DESCRIPTOR_HANDLE gpu_srv = r->srv_heap->GetGPUDescriptorHandleForHeapStart();
-	gpu_srv.ptr += r->srv_descriptor_size; // slot 1
+	gpu_srv.ptr += r->srv_descriptor_size * srv_slot;
 	cmd_list->SetGraphicsRootDescriptorTable(0, gpu_srv);
 
 	// Set RTV (atlas as render target) — viewport for the current view tile
@@ -471,9 +489,14 @@ comp_d3d12_renderer_create(struct comp_d3d12_compositor *c,
 		return XRT_ERROR_D3D;
 	}
 
-	// Create SRV descriptor heap (shader visible, 2 SRVs: atlas + window-space layer)
+	// Create SRV descriptor heap (shader visible).
+	// Slot 0 = atlas; slots 1..N allocated per-frame for each layer draw.
+	// 16 slots is plenty for typical usage (1 atlas + up to 15 layer SRVs).
+	r->srv_heap_size = 16;
+	r->next_srv_slot = 1;
+
 	D3D12_DESCRIPTOR_HEAP_DESC srv_heap_desc = {};
-	srv_heap_desc.NumDescriptors = 2;
+	srv_heap_desc.NumDescriptors = r->srv_heap_size;
 	srv_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
 	srv_heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
 
@@ -807,6 +830,9 @@ comp_d3d12_renderer_draw(struct comp_d3d12_renderer *renderer,
 	auto internals = get_internals(renderer->c);
 	ID3D12Device *device = internals->device;
 
+	// Reset per-frame SRV slot allocator (slot 0 = atlas, slots 1+ for layers)
+	renderer->next_srv_slot = 1;
+
 	// Transition atlas to RENDER_TARGET for shader-based stretch-blit
 	D3D12_RESOURCE_BARRIER barrier = {};
 	barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -899,7 +925,16 @@ comp_d3d12_renderer_draw(struct comp_d3d12_renderer *renderer,
 			    src_h / sh,
 			};
 
-			// Create SRV for swapchain in srv_heap slot 1
+			// Allocate a unique SRV slot for this draw (D3D12 descriptors
+			// are read at GPU execution time, so reusing a slot across
+			// multiple draws causes all draws to see the last SRV written).
+			uint32_t srv_slot = renderer->next_srv_slot++;
+			if (srv_slot >= renderer->srv_heap_size) {
+				U_LOG_E("D3D12 renderer: SRV heap overflow (slot %u >= %u)",
+				        srv_slot, renderer->srv_heap_size);
+				continue;
+			}
+
 			D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
 			srv_desc.Format = src_desc.Format;
 			srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -907,11 +942,11 @@ comp_d3d12_renderer_draw(struct comp_d3d12_renderer *renderer,
 			srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 
 			D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu = renderer->srv_heap->GetCPUDescriptorHandleForHeapStart();
-			srv_cpu.ptr += renderer->srv_descriptor_size; // slot 1
+			srv_cpu.ptr += renderer->srv_descriptor_size * srv_slot;
 			device->CreateShaderResourceView(src_resource, &srv_desc, srv_cpu);
 
 			D3D12_GPU_DESCRIPTOR_HANDLE gpu_srv = renderer->srv_heap->GetGPUDescriptorHandleForHeapStart();
-			gpu_srv.ptr += renderer->srv_descriptor_size; // slot 1
+			gpu_srv.ptr += renderer->srv_descriptor_size * srv_slot;
 
 			// Tile position in atlas grid
 			uint32_t tile_idx = (layer_view_count == 1) ? 0 : vi;
