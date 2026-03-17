@@ -1108,7 +1108,21 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			atlas_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 			c->cmd_list->ResourceBarrier(1, &atlas_barrier);
 
-			// Viewport/scissor set by the weaver in leiasr_d3d12_weave() — not here.
+			D3D12_VIEWPORT viewport = {};
+			viewport.TopLeftX = 0.0f;
+			viewport.TopLeftY = 0.0f;
+			viewport.Width = static_cast<float>(tgt_width);
+			viewport.Height = static_cast<float>(tgt_height);
+			viewport.MinDepth = 0.0f;
+			viewport.MaxDepth = 1.0f;
+			c->cmd_list->RSSetViewports(1, &viewport);
+
+			D3D12_RECT scissor = {};
+			scissor.left = 0;
+			scissor.top = 0;
+			scissor.right = static_cast<LONG>(tgt_width);
+			scissor.bottom = static_cast<LONG>(tgt_height);
+			c->cmd_list->RSSetScissorRects(1, &scissor);
 
 			uint32_t tile_columns, tile_rows;
 			comp_d3d12_renderer_get_tile_layout(c->renderer, &tile_columns, &tile_rows);
