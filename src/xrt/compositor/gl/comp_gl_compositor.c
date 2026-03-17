@@ -12,6 +12,9 @@
  */
 
 #include "comp_gl_compositor.h"
+#ifdef _WIN32
+#include "d3d11/comp_d3d11_window.h"
+#endif
 
 #include "util/comp_layer_accum.h"
 
@@ -213,6 +216,7 @@ struct comp_gl_compositor
 	HGLRC hglrc;        //!< Compositor's own GL context
 	HGLRC app_hglrc;    //!< App's GL context (shared textures)
 	HDC app_hdc;        //!< App's device context (for restoring after compositor work)
+	struct comp_d3d11_window *own_window; //!< Self-owned window (hosted mode)
 	bool owns_window;
 #elif defined(XRT_OS_ANDROID)
 	void *egl_display;   //!< EGLDisplay
@@ -540,6 +544,18 @@ gl_compositor_predict_frame(struct xrt_compositor *xc,
                              int64_t *out_predicted_display_time_ns,
                              int64_t *out_predicted_display_period_ns)
 {
+#ifdef XRT_OS_WINDOWS
+	// Check if self-owned window was closed
+	{
+		struct comp_gl_compositor *c = gl_comp(xc);
+		if (c->owns_window && c->own_window != NULL &&
+		    !comp_d3d11_window_is_valid(c->own_window)) {
+			U_LOG_I("Window closed - signaling session exit");
+			return XRT_ERROR_IPC_FAILURE;
+		}
+	}
+#endif
+
 	int64_t now_ns = (int64_t)os_monotonic_get_ns();
 	int64_t period_ns = (int64_t)(1000000000.0 / 60.0); // 60 Hz
 
@@ -1354,6 +1370,9 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 		// Platform-specific swap
 #ifdef XRT_OS_WINDOWS
 		SwapBuffers(c->hdc);
+		if (c->owns_window && c->own_window != NULL) {
+			comp_d3d11_window_signal_paint_done(c->own_window);
+		}
 #elif defined(XRT_OS_ANDROID)
 		// eglSwapBuffers(c->egl_display, c->egl_surface);
 #elif defined(__APPLE__)
@@ -1448,7 +1467,9 @@ gl_compositor_destroy(struct xrt_compositor *xc)
 		wglMakeCurrent(NULL, NULL);
 		wglDeleteContext(c->hglrc);
 	}
-	if (c->owns_window && c->hwnd) {
+	if (c->owns_window && c->own_window != NULL) {
+		comp_d3d11_window_destroy(&c->own_window);
+	} else if (c->owns_window && c->hwnd) {
 		DestroyWindow(c->hwnd);
 	}
 #elif defined(__APPLE__)
@@ -1534,18 +1555,21 @@ gl_create_window_and_context(struct comp_gl_compositor *c,
 		c->hwnd = (HWND)window_handle;
 		c->owns_window = false;
 	} else {
-		c->hwnd = CreateWindowExW(
-		    0, GL_WINDOW_CLASS, L"OpenXR GL Compositor",
-		    WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-		    CW_USEDEFAULT, CW_USEDEFAULT,
-		    width > 0 ? width : GL_DEFAULT_WIDTH,
-		    height > 0 ? height : GL_DEFAULT_HEIGHT,
-		    NULL, NULL, GetModuleHandleW(NULL), NULL);
+		// Use shared window module — borderless fullscreen on Leia display,
+		// dedicated thread with message pump, QWERTY input support.
+		uint32_t win_w = width > 0 ? width : GL_DEFAULT_WIDTH;
+		uint32_t win_h = height > 0 ? height : GL_DEFAULT_HEIGHT;
+		xrt_result_t xret = comp_d3d11_window_create(win_w, win_h, &c->own_window);
+		if (xret != XRT_SUCCESS) {
+			U_LOG_E("Failed to create self-owned window for GL compositor");
+			return false;
+		}
+		c->hwnd = (HWND)comp_d3d11_window_get_hwnd(c->own_window);
 		c->owns_window = true;
 	}
 
 	if (c->hwnd == NULL) {
-		U_LOG_E("Failed to create window");
+		U_LOG_E("Failed to get window handle");
 		return false;
 	}
 
@@ -1690,6 +1714,11 @@ comp_gl_compositor_set_system_devices(struct xrt_compositor *xc, struct xrt_syst
 {
 	struct comp_gl_compositor *c = gl_comp(xc);
 	c->xsysd = xsysd;
+#ifdef XRT_OS_WINDOWS
+	if (c->own_window != NULL) {
+		comp_d3d11_window_set_system_devices(c->own_window, xsysd);
+	}
+#endif
 }
 
 void
