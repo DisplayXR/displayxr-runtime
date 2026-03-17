@@ -890,11 +890,13 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 				uint32_t cur_vw, cur_vh;
 				comp_d3d12_renderer_get_view_dimensions(c->renderer, &cur_vw, &cur_vh);
 				if (cur_vw != mode->view_width_pixels || cur_vh != mode->view_height_pixels) {
+					uint32_t resize_target_h = (c->display_processor != NULL)
+					    ? mode->view_height_pixels : tgt_height;
 					comp_d3d12_renderer_resize(
 					    c->renderer,
 					    mode->view_width_pixels,
 					    mode->view_height_pixels,
-					    tgt_height);
+					    resize_target_h);
 				}
 			}
 		}
@@ -1594,7 +1596,9 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 		}
 	}
 
-	// Create renderer
+	// Create renderer — when a DP is present, atlas height must match view height
+	// so the DP's UV 0..1 maps exactly to content. The per-frame resize path
+	// (resize_target_h above) must apply the same guard.
 	uint32_t target_height = (c->display_processor != NULL) ? view_height : c->settings.preferred.height;
 	xret = comp_d3d12_renderer_create(c, view_width, view_height, target_height, &c->renderer);
 	if (xret != XRT_SUCCESS) {
