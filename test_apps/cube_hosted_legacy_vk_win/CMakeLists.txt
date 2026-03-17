@@ -119,3 +119,14 @@ if(TEXTURE_FILES)
         COMMENT "Copying texture files to build output"
     )
 endif()
+
+# Copy bundled SimulatedRealityVulkanBeta.dll to output directory
+# (temporary: bundled until the SR SDK stabilizes and ships this DLL)
+set(VK_WEAVER_DLL "${CMAKE_CURRENT_SOURCE_DIR}/../common/SimulatedRealityVulkanBeta.dll")
+if(EXISTS "${VK_WEAVER_DLL}")
+    add_custom_command(TARGET cube_hosted_legacy_vk_win POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${VK_WEAVER_DLL}"
+            "$<TARGET_FILE_DIR:cube_hosted_legacy_vk_win>/SimulatedRealityVulkanBeta.dll"
+    )
+endif()
