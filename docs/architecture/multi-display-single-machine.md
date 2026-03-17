@@ -12,6 +12,16 @@ code-paths: [src/xrt/drivers/, src/xrt/compositor/multi/]
 
 Extend the multi-compositor to route layers to multiple physical displays connected to the same machine. Each display has a known pose in a shared room-scale coordinate system.
 
+## Scope and Related Docs
+
+This doc extends the spatial OS compositor to **multiple physical displays on one machine**. It assumes the single-display compositing pipeline and shell already work.
+
+| Doc | Relationship |
+|-----|-------------|
+| [spatial-os.md](spatial-os.md) (#43) | **Single-display compositing.** The multi-compositor pipeline this doc extends. Prerequisite. |
+| [3d-shell.md](3d-shell.md) (#44) | **Window manager.** Manages window placement; this doc adds display-routing beneath it. Prerequisite. |
+| [multi-display-networked.md](multi-display-networked.md) (#70) | **Networked extension.** Generalizes this doc's multi-display routing across machines. Depends on this doc. |
+
 ## Architecture
 
 ```

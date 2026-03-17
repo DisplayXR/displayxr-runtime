@@ -8,6 +8,16 @@ code-paths: [src/xrt/compositor/multi/, src/xrt/ipc/]
 
 # Spatial OS: Platform-Native Multi Compositor for 3D Window Management
 
+## Scope and Related Docs
+
+This doc covers the **compositing mechanism** — how N app textures become one correct lightfield output. It is agnostic to window placement policy.
+
+| Doc | Relationship |
+|-----|-------------|
+| [3d-shell.md](3d-shell.md) (#44) | **Window manager / policy layer.** Decides where windows go and how users interact. Depends on this doc. |
+| [multi-display-single-machine.md](multi-display-single-machine.md) (#69) | **Multi-display extension.** Routes this compositor's output to multiple local displays. Depends on #43 + #44. |
+| [multi-display-networked.md](multi-display-networked.md) (#70) | **Networked extension.** Extends multi-display to remote machines. Depends on #69. |
+
 ## Vision
 
 A "spatial OS" concept where multiple OpenXR apps using different graphics APIs can be composed into a single 3D scene -- windows positioned and oriented in 3D space on a lightfield display.
