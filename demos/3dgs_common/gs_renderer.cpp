@@ -1128,17 +1128,19 @@ void GsRenderer::renderEye(VkImage swapchainImage,
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &imb2);
 
-        // Copy viewport region
-        VkImageCopy region = {};
-        region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        region.srcOffset = {0, 0, 0};
-        region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        region.dstOffset = {(int32_t)viewportX, (int32_t)viewportY, 0};
-        region.extent = {viewportWidth, viewportHeight, 1};
-        vkCmdCopyImage(cmd,
+        // Blit viewport region (handles RGBA→BGRA format conversion)
+        VkImageBlit blitRegion = {};
+        blitRegion.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        blitRegion.srcOffsets[0] = {0, 0, 0};
+        blitRegion.srcOffsets[1] = {(int32_t)viewportWidth, (int32_t)viewportHeight, 1};
+        blitRegion.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        blitRegion.dstOffsets[0] = {(int32_t)viewportX, (int32_t)viewportY, 0};
+        blitRegion.dstOffsets[1] = {(int32_t)(viewportX + viewportWidth),
+                                    (int32_t)(viewportY + viewportHeight), 1};
+        vkCmdBlitImage(cmd,
             renderImage_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
             swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            1, &region);
+            1, &blitRegion, VK_FILTER_NEAREST);
 
         // Barrier: swapchain image → COLOR_ATTACHMENT_OPTIMAL
         imb2.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
