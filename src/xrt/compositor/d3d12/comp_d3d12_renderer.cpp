@@ -804,28 +804,35 @@ comp_d3d12_renderer_draw(struct comp_d3d12_renderer *renderer,
 		        target_width, target_height);
 	}
 
-	// Transition stereo texture to COPY_DEST for receiving swapchain content
+	auto internals = get_internals(renderer->c);
+	ID3D12Device *device = internals->device;
+
+	// Transition atlas to RENDER_TARGET for shader-based stretch-blit
 	D3D12_RESOURCE_BARRIER barrier = {};
 	barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
 	barrier.Transition.pResource = renderer->atlas_texture;
 	barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-	barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+	barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
 	barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 	cmd_list->ResourceBarrier(1, &barrier);
+
+	// Clear atlas to black
+	D3D12_CPU_DESCRIPTOR_HANDLE rtv = renderer->rtv_heap->GetCPUDescriptorHandleForHeapStart();
+	float clear_color[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+	cmd_list->ClearRenderTargetView(rtv, clear_color, 0, nullptr);
+
+	// Set blit pipeline (shared across all projection views)
+	cmd_list->SetGraphicsRootSignature(renderer->root_signature);
+	cmd_list->SetPipelineState(renderer->blit_pso);
+	ID3D12DescriptorHeap *heaps[] = {renderer->srv_heap};
+	cmd_list->SetDescriptorHeaps(1, heaps);
+	cmd_list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+	cmd_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
 
 	// Determine view count
 	uint32_t view_count = hardware_display_3d ? 2 : 1;
 
-	// Check if any window-space layers exist
-	bool has_window_space = false;
-	for (uint32_t li = 0; li < layers->layer_count; li++) {
-		if (layers->layers[li].data.type == XRT_LAYER_WINDOW_SPACE) {
-			has_window_space = true;
-			break;
-		}
-	}
-
-	// For each projection layer, copy swapchain images into left/right halves
+	// For each projection layer, stretch-blit swapchain images into atlas tiles
 	for (uint32_t li = 0; li < layers->layer_count; li++) {
 		struct comp_layer *layer = &layers->layers[li];
 
@@ -855,119 +862,133 @@ comp_d3d12_renderer_draw(struct comp_d3d12_renderer *renderer,
 				continue;
 			}
 
-			// Transition swapchain image: RENDER_TARGET → COPY_SOURCE
+			// Transition swapchain image: RENDER_TARGET → PIXEL_SHADER_RESOURCE
 			D3D12_RESOURCE_BARRIER src_barrier = {};
 			src_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
 			src_barrier.Transition.pResource = src_resource;
 			src_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-			src_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+			src_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 			src_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 			cmd_list->ResourceBarrier(1, &src_barrier);
 
 			// Get swapchain image dimensions
 			D3D12_RESOURCE_DESC src_desc = src_resource->GetDesc();
+			float sw = static_cast<float>(src_desc.Width);
+			float sh = static_cast<float>(src_desc.Height);
 
 			// Use image_rect from layer data to handle single-swapchain
 			// packed views (e.g., 7680x4320 with left at x=0, right at x=3840)
 			struct xrt_rect sub_rect = layer->data.proj.v[vi].sub.rect;
-			uint32_t src_x = 0;
-			uint32_t src_y = 0;
-			uint32_t src_w = static_cast<uint32_t>(src_desc.Width);
-			uint32_t src_h = static_cast<uint32_t>(src_desc.Height);
+			float src_x = 0.0f;
+			float src_y = 0.0f;
+			float src_w = sw;
+			float src_h = sh;
 
 			if (sub_rect.extent.w > 0 && sub_rect.extent.h > 0) {
-				src_x = static_cast<uint32_t>(sub_rect.offset.w);
-				src_y = static_cast<uint32_t>(sub_rect.offset.h);
-				src_w = static_cast<uint32_t>(sub_rect.extent.w);
-				src_h = static_cast<uint32_t>(sub_rect.extent.h);
+				src_x = static_cast<float>(sub_rect.offset.w);
+				src_y = static_cast<float>(sub_rect.offset.h);
+				src_w = static_cast<float>(sub_rect.extent.w);
+				src_h = static_cast<float>(sub_rect.extent.h);
 			}
 
-			uint32_t copy_w = (std::min)(src_w, renderer->view_width);
-			uint32_t copy_h = (std::min)(src_h, renderer->texture_height);
+			// Compute normalized src_rect for the blit shader UV transform
+			float blit_src_rect[4] = {
+			    src_x / sw,
+			    src_y / sh,
+			    src_w / sw,
+			    src_h / sh,
+			};
 
-			// Destination offset: tile position in atlas grid
-			uint32_t dst_x = 0;
-			uint32_t dst_y = 0;
-			if (layer_view_count == 1) {
-				// Mono: copy to first tile, will be duplicated later
-				dst_x = 0;
-				dst_y = 0;
-			} else {
-				dst_x = (vi % renderer->tile_columns) * renderer->view_width;
-				dst_y = (vi / renderer->tile_columns) * renderer->view_height;
-			}
+			// Create SRV for swapchain in srv_heap slot 1
+			D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+			srv_desc.Format = src_desc.Format;
+			srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+			srv_desc.Texture2D.MipLevels = 1;
+			srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+
+			D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu = renderer->srv_heap->GetCPUDescriptorHandleForHeapStart();
+			srv_cpu.ptr += renderer->srv_descriptor_size; // slot 1
+			device->CreateShaderResourceView(src_resource, &srv_desc, srv_cpu);
+
+			D3D12_GPU_DESCRIPTOR_HANDLE gpu_srv = renderer->srv_heap->GetGPUDescriptorHandleForHeapStart();
+			gpu_srv.ptr += renderer->srv_descriptor_size; // slot 1
+
+			// Tile position in atlas grid
+			uint32_t tile_idx = (layer_view_count == 1) ? 0 : vi;
+			uint32_t tile_x = (tile_idx % renderer->tile_columns) * renderer->view_width;
+			uint32_t tile_y = (tile_idx / renderer->tile_columns) * renderer->view_height;
 
 			if (draw_log) {
-				U_LOG_I("D3D12 renderer: copy layer=%u view=%u, src=%p (%llux%u), "
-				        "sub_rect=(%u,%u %ux%u), dst=(%u,%u), copy=%ux%u",
+				U_LOG_I("D3D12 renderer: blit layer=%u view=%u, src=%p (%llux%u), "
+				        "sub_rect=(%.0f,%.0f %.0fx%.0f), tile=(%u,%u), view=%ux%u",
 				        li, vi, (void *)src_resource,
 				        (unsigned long long)src_desc.Width, (unsigned)src_desc.Height,
 				        src_x, src_y, src_w, src_h,
-				        dst_x, dst_y, copy_w, copy_h);
+				        tile_x, tile_y, renderer->view_width, renderer->view_height);
 			}
 
-			// Copy region from swapchain to stereo texture
-			D3D12_TEXTURE_COPY_LOCATION dst_loc = {};
-			dst_loc.pResource = renderer->atlas_texture;
-			dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-			dst_loc.SubresourceIndex = 0;
+			// Set viewport and scissor to the tile rectangle
+			D3D12_VIEWPORT vp = {};
+			vp.TopLeftX = static_cast<float>(tile_x);
+			vp.TopLeftY = static_cast<float>(tile_y);
+			vp.Width = static_cast<float>(renderer->view_width);
+			vp.Height = static_cast<float>(renderer->view_height);
+			vp.MinDepth = 0.0f;
+			vp.MaxDepth = 1.0f;
+			cmd_list->RSSetViewports(1, &vp);
 
-			D3D12_TEXTURE_COPY_LOCATION src_loc = {};
-			src_loc.pResource = src_resource;
-			src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-			src_loc.SubresourceIndex = 0;
+			D3D12_RECT scissor = {};
+			scissor.left = tile_x;
+			scissor.top = tile_y;
+			scissor.right = tile_x + renderer->view_width;
+			scissor.bottom = tile_y + renderer->view_height;
+			cmd_list->RSSetScissorRects(1, &scissor);
 
-			D3D12_BOX src_box = {};
-			src_box.left = src_x;
-			src_box.top = src_y;
-			src_box.front = 0;
-			src_box.right = src_x + copy_w;
-			src_box.bottom = src_y + copy_h;
-			src_box.back = 1;
+			// Bind SRV and root constants, draw fullscreen quad
+			cmd_list->SetGraphicsRootDescriptorTable(0, gpu_srv);
+			cmd_list->SetGraphicsRoot32BitConstants(1, 4, blit_src_rect, 0);
+			cmd_list->DrawInstanced(4, 1, 0, 0);
 
-			cmd_list->CopyTextureRegion(&dst_loc, dst_x, dst_y, 0, &src_loc, &src_box);
-
-			// For mono: duplicate to second tile position
+			// For mono: draw same quad again at second tile position
 			if (layer_view_count == 1 && view_count == 2) {
 				uint32_t dup_x = (1 % renderer->tile_columns) * renderer->view_width;
 				uint32_t dup_y = (1 / renderer->tile_columns) * renderer->view_height;
-				cmd_list->CopyTextureRegion(&dst_loc, dup_x, dup_y, 0,
-				                            &src_loc, &src_box);
+
+				vp.TopLeftX = static_cast<float>(dup_x);
+				vp.TopLeftY = static_cast<float>(dup_y);
+				cmd_list->RSSetViewports(1, &vp);
+
+				scissor.left = dup_x;
+				scissor.top = dup_y;
+				scissor.right = dup_x + renderer->view_width;
+				scissor.bottom = dup_y + renderer->view_height;
+				cmd_list->RSSetScissorRects(1, &scissor);
+
+				cmd_list->DrawInstanced(4, 1, 0, 0);
 			}
 
-			// Transition swapchain image back: COPY_SOURCE → RENDER_TARGET
-			src_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+			// Transition swapchain image back: PIXEL_SHADER_RESOURCE → RENDER_TARGET
+			src_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 			src_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
 			cmd_list->ResourceBarrier(1, &src_barrier);
 		}
 	}
 
-	// If window-space layers exist, transition atlas to RENDER_TARGET and draw them
-	if (has_window_space) {
-		barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-		barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-		cmd_list->ResourceBarrier(1, &barrier);
-
-		for (uint32_t vi = 0; vi < view_count; vi++) {
-			for (uint32_t li = 0; li < layers->layer_count; li++) {
-				struct comp_layer *layer = &layers->layers[li];
-				if (layer->data.type != XRT_LAYER_WINDOW_SPACE) {
-					continue;
-				}
-				render_window_space_layer(renderer, cmd_list, layer, vi);
+	// Draw window-space layers (atlas is already in RENDER_TARGET state)
+	for (uint32_t vi = 0; vi < view_count; vi++) {
+		for (uint32_t li = 0; li < layers->layer_count; li++) {
+			struct comp_layer *layer = &layers->layers[li];
+			if (layer->data.type != XRT_LAYER_WINDOW_SPACE) {
+				continue;
 			}
+			render_window_space_layer(renderer, cmd_list, layer, vi);
 		}
-
-		// Transition atlas: RENDER_TARGET → PIXEL_SHADER_RESOURCE
-		barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-		barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-		cmd_list->ResourceBarrier(1, &barrier);
-	} else {
-		// No window-space layers: transition directly COPY_DEST → PIXEL_SHADER_RESOURCE
-		barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-		barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-		cmd_list->ResourceBarrier(1, &barrier);
 	}
+
+	// Final transition: RENDER_TARGET → PIXEL_SHADER_RESOURCE
+	barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+	barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+	cmd_list->ResourceBarrier(1, &barrier);
 
 	return XRT_SUCCESS;
 }
