@@ -376,32 +376,8 @@ d3d12_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 					if (xret == XRT_SUCCESS) {
 						c->settings.preferred.width = new_width;
 						c->settings.preferred.height = new_height;
-
-						// Scale renderer proportionally (same as D3D11)
-						if (c->display_processor != nullptr) {
-							uint32_t disp_px_w = 0, disp_px_h = 0;
-							int32_t disp_left = 0, disp_top = 0;
-							if (xrt_display_processor_d3d12_get_display_pixel_info(
-							        c->display_processor, &disp_px_w, &disp_px_h,
-							        &disp_left, &disp_top) &&
-							    disp_px_w > 0 && disp_px_h > 0) {
-								uint32_t base_vw = disp_px_w / 2;
-								uint32_t base_vh = disp_px_h;
-								float ratio = fminf(
-								    (float)new_width / (float)disp_px_w,
-								    (float)new_height / (float)disp_px_h);
-								if (ratio > 1.0f) {
-									ratio = 1.0f;
-								}
-								uint32_t new_vw = (uint32_t)((float)base_vw * ratio);
-								uint32_t new_vh = (uint32_t)((float)base_vh * ratio);
-								comp_d3d12_renderer_resize(c->renderer, new_vw, new_vh, new_vh);
-							}
-						} else {
-							uint32_t new_vw = new_width / 2;
-							uint32_t new_vh = new_height;
-							comp_d3d12_renderer_resize(c->renderer, new_vw, new_vh, new_height);
-						}
+						// Atlas (renderer) stays at mode dims — never resized on window resize.
+						// The weaver handles scaling from fixed atlas to variable output viewport.
 					}
 				}
 			}
@@ -1132,21 +1108,7 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			atlas_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 			c->cmd_list->ResourceBarrier(1, &atlas_barrier);
 
-			D3D12_VIEWPORT viewport = {};
-			viewport.TopLeftX = 0.0f;
-			viewport.TopLeftY = 0.0f;
-			viewport.Width = static_cast<float>(tgt_width);
-			viewport.Height = static_cast<float>(tgt_height);
-			viewport.MinDepth = 0.0f;
-			viewport.MaxDepth = 1.0f;
-			c->cmd_list->RSSetViewports(1, &viewport);
-
-			D3D12_RECT scissor = {};
-			scissor.left = 0;
-			scissor.top = 0;
-			scissor.right = static_cast<LONG>(tgt_width);
-			scissor.bottom = static_cast<LONG>(tgt_height);
-			c->cmd_list->RSSetScissorRects(1, &scissor);
+			// Viewport/scissor set by the weaver in leiasr_d3d12_weave() — not here.
 
 			uint32_t tile_columns, tile_rows;
 			comp_d3d12_renderer_get_tile_layout(c->renderer, &tile_columns, &tile_rows);

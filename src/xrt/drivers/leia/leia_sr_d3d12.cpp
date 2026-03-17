@@ -271,13 +271,15 @@ leiasr_d3d12_set_input_texture(struct leiasr_d3d12 *leiasr,
 		return;
 	}
 
-	// Log dimension changes
-	static uint32_t last_logged_width = 0, last_logged_height = 0;
-	if (view_width != last_logged_width || view_height != last_logged_height) {
-		U_LOG_I("SR D3D12 weaver setInputViewTexture: view=%ux%u", view_width, view_height);
-		last_logged_width = view_width;
-		last_logged_height = view_height;
+	// Skip if nothing changed — match reference pattern of calling setInputViewTexture once
+	if (leiasr->input_resource == static_cast<ID3D12Resource *>(stereo_resource) &&
+	    leiasr->view_width == view_width &&
+	    leiasr->view_height == view_height &&
+	    leiasr->input_format == static_cast<DXGI_FORMAT>(format)) {
+		return;
 	}
+
+	U_LOG_I("SR D3D12 weaver setInputViewTexture: view=%ux%u", view_width, view_height);
 
 	leiasr->input_resource = static_cast<ID3D12Resource *>(stereo_resource);
 	leiasr->view_width = view_width;
