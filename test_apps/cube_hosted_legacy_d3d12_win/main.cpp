@@ -235,6 +235,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                         if (AcquireSwapchainImage(xr, imageIndex)) {
                             ID3D12Resource* swapchainTexture = swapchainImages[imageIndex].texture;
 
+                            // Diagnostic: log resource pointer for cross-check with compositor
+                            static uint32_t renderDiagCount = 0;
+                            if (renderDiagCount < 5 || renderDiagCount % 300 == 0) {
+                                LOG_INFO("App render: swapchainTexture=%p, imageIndex=%u, tileW=%u, tileH=%u",
+                                    (void*)swapchainTexture, imageIndex, tileW, tileH);
+                            }
+                            renderDiagCount++;
+
                             // Render all views with tile layout
                             for (uint32_t eye = 0; eye < modeViewCount; eye++) {
                                 uint32_t tileX = eye % tileColumns;

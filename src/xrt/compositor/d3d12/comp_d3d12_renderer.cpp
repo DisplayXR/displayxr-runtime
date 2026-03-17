@@ -888,6 +888,11 @@ comp_d3d12_renderer_draw(struct comp_d3d12_renderer *renderer,
 				continue;
 			}
 
+			if (draw_log) {
+				U_LOG_I("D3D12 blit: compositor src_resource=%p, img_index=%u, xscn=%p",
+				        (void *)src_resource, img_index, (void *)xscn);
+			}
+
 			// Transition swapchain image: RENDER_TARGET → PIXEL_SHADER_RESOURCE
 			D3D12_RESOURCE_BARRIER src_barrier = {};
 			src_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
