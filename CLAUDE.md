@@ -49,7 +49,7 @@ Why each API gets its own compositor: `docs/adr/ADR-001-native-compositors-per-g
 | **Hosted** | `_hosted` | Runtime creates window and rendering targets (standard OpenXR/WebXR) | Native compositor directly in-process |
 | **IPC/Service** | `_ipc` | App runs out-of-process via client compositor → IPC → server multi-compositor | Client compositor → IPC transport → multi-compositor → native compositor in server |
 
-Test app naming: `cube_handle_metal_macos`, `cube_texture_d3d11_win`, `cube_hosted_d3d11_win` (hosted), `cube_ipc_d3d11` (service mode).
+Test app naming: `cube_handle_metal_macos`, `cube_texture_d3d11_win`, `cube_hosted_d3d11_win` (hosted), `cube_ipc_d3d11_win` (service mode), `cube_ipc_legacy_d3d11_win` (IPC legacy/WebXR debug proxy).
 
 The first three classes all use a native compositor in-process. The `_ipc` class is fundamentally different: the app links a **client compositor** that serializes compositor calls over IPC to a **server process** running the multi-compositor (`compositor/multi/`), which fans out to native compositors. This is the multi-app path and the foundation for the spatial shell (#43, #44).
 
