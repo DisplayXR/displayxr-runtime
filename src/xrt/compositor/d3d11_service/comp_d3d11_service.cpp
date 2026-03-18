@@ -2736,6 +2736,11 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	ID3D11Texture2D *zc_tex = nullptr;
 	uint32_t zc_view_w = 0, zc_view_h = 0;
 
+	// Actual content dimensions from submitted rects - defaults to sys values,
+	// overwritten per projection layer (may differ for legacy compromise-scale apps)
+	uint32_t content_view_w = sys->view_width;
+	uint32_t content_view_h = sys->view_height;
+
 	// Render projection layers to stereo texture (via copy)
 	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
 		struct comp_layer *layer = &c->layer_accum.layers[i];
@@ -2967,6 +2972,11 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		}
 		} // !zero_copy
 
+		// Track actual content dimensions from submitted rects (may differ from
+		// sys->view_width/height for legacy apps that render at compromise scale)
+		content_view_w = static_cast<uint32_t>(layer->data.proj.v[0].sub.rect.extent.w);
+		content_view_h = static_cast<uint32_t>(layer->data.proj.v[0].sub.rect.extent.h);
+
 		// Release KeyedMutex after reading
 		for (uint32_t eye = 0; eye < proj_view_count; eye++) {
 			if (view_mutex_acquired[eye]) {
@@ -3099,8 +3109,8 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	// Select display processor input: zero-copy from app's swapchain, or intermediate atlas_texture
 	ID3D11ShaderResourceView *input_srv = use_zero_copy
 	    ? zc_srv.get() : c->render.atlas_srv.get();
-	uint32_t input_view_w = use_zero_copy ? zc_view_w : sys->view_width;
-	uint32_t input_view_h = use_zero_copy ? zc_view_h : sys->view_height;
+	uint32_t input_view_w = use_zero_copy ? zc_view_w : content_view_w;
+	uint32_t input_view_h = use_zero_copy ? zc_view_h : content_view_h;
 
 	// Process stereo texture through display processor for display output
 	// Skip processing for mono — display is in 2D mode, no interlacing needed
@@ -3151,10 +3161,10 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 					tex_h = sys->tile_rows * zc_view_h;
 				} else if (c->render.atlas_srv) {
 					src_srv = c->render.atlas_srv.get();
-					eye_w = sys->view_width;
-					eye_h = sys->view_height;
-					tex_w = sys->tile_columns * sys->view_width;
-					tex_h = sys->tile_rows * sys->view_height;
+					eye_w = content_view_w;
+					eye_h = content_view_h;
+					tex_w = sys->tile_columns * content_view_w;
+					tex_h = sys->tile_rows * content_view_h;
 				}
 
 				if (src_srv != nullptr) {
