@@ -241,24 +241,12 @@ static void BlitSharedTextureToBackBuffer(D3D11Renderer& renderer, ID3D11RenderT
 
     renderer.context->OMSetRenderTargets(1, &backBufferRTV, nullptr);
 
-    // Compute letterbox viewport
-    float srcAR = (float)g_sharedWidth / (float)g_sharedHeight;
-    float dstAR = (float)winW / (float)winH;
-
+    // Canvas = center 50% of window (25%-75% region) to demonstrate canvas ≠ window
     D3D11_VIEWPORT vp = {};
-    if (srcAR > dstAR) {
-        // Pillarbox (source wider)
-        vp.Width = (FLOAT)winW;
-        vp.Height = (FLOAT)winW / srcAR;
-        vp.TopLeftX = 0;
-        vp.TopLeftY = ((FLOAT)winH - vp.Height) * 0.5f;
-    } else {
-        // Letterbox (source taller)
-        vp.Height = (FLOAT)winH;
-        vp.Width = (FLOAT)winH * srcAR;
-        vp.TopLeftX = ((FLOAT)winW - vp.Width) * 0.5f;
-        vp.TopLeftY = 0;
-    }
+    vp.Width = (FLOAT)winW * 0.5f;
+    vp.Height = (FLOAT)winH * 0.5f;
+    vp.TopLeftX = (FLOAT)winW * 0.25f;
+    vp.TopLeftY = (FLOAT)winH * 0.25f;
     vp.MaxDepth = 1.0f;
     renderer.context->RSSetViewports(1, &vp);
 
@@ -353,18 +341,10 @@ static void RenderOneFrame(RenderState& rs) {
     UpdateScene(renderer, rs.perfStats->deltaTime);
     PollEvents(xr);
 
-    // Compute canvas dimensions from the letterbox viewport.
-    // The shared texture is display-sized; the canvas is where it actually appears.
-    if (g_sharedWidth > 0 && g_sharedHeight > 0 && g_windowWidth > 0 && g_windowHeight > 0) {
-        float srcAR = (float)g_sharedWidth / (float)g_sharedHeight;
-        float dstAR = (float)g_windowWidth / (float)g_windowHeight;
-        if (srcAR > dstAR) {
-            g_canvasW = g_windowWidth;
-            g_canvasH = (uint32_t)((float)g_windowWidth / srcAR);
-        } else {
-            g_canvasH = g_windowHeight;
-            g_canvasW = (uint32_t)((float)g_windowHeight * srcAR);
-        }
+    // Canvas = center 50% of window (matches blit viewport)
+    if (g_windowWidth > 0 && g_windowHeight > 0) {
+        g_canvasW = g_windowWidth / 2;
+        g_canvasH = g_windowHeight / 2;
     }
 
     if (xr.sessionRunning) {
@@ -837,9 +817,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             return 1;
         }
 
-        // Initialize canvas to full shared texture (updated per-frame from letterbox viewport)
-        g_canvasW = g_sharedWidth;
-        g_canvasH = g_sharedHeight;
+        // Initialize canvas to center 50% of window (updated per-frame)
+        g_canvasW = g_windowWidth / 2;
+        g_canvasH = g_windowHeight / 2;
         LOG_INFO("Created shared D3D11 texture: %ux%u, handle=%p", g_sharedWidth, g_sharedHeight, g_sharedHandle);
     }
 
