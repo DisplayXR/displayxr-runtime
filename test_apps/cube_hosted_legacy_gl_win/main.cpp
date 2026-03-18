@@ -509,8 +509,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                                             glClearColor(0.05f, 0.05f, 0.25f, 1.0f);
                                             glClear(GL_COLOR_BUFFER_BIT);
 
-                                            // Test B: gl_renderer's cubeProgram + gl_renderer's cubeVAO
+                                            // Test B: gl_renderer's cubeProgram + cubeVAO WITH identity matrix
                                             glUseProgram_(glRenderer.cubeProgram);
+                                            GLint locTransform = glGetUniformLocation_(glRenderer.cubeProgram, "uTransform");
+                                            GLint locModel = glGetUniformLocation_(glRenderer.cubeProgram, "uModel");
+                                            GLint locUseTex = glGetUniformLocation_(glRenderer.cubeProgram, "useTextures");
+                                            // Set identity matrix for uTransform (cube verts are -0.5..0.5, will appear at center)
+                                            float identity[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+                                            if (locTransform >= 0) glUniformMatrix4fv_(locTransform, 1, GL_FALSE, identity);
+                                            if (locModel >= 0) glUniformMatrix4fv_(locModel, 1, GL_FALSE, identity);
+                                            if (locUseTex >= 0) glUniform1i_(locUseTex, 0); // no textures
                                             glBindVertexArray_(glRenderer.cubeVAO);
                                             glDrawElements(GL_TRIANGLES, 36, GL_UNSIGNED_SHORT, 0);
                                             GLenum errB = glGetError();
@@ -537,15 +545,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                                             glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &boundEBO);
 
                                             LOG_INFO("DIAG-MIX[%d]: A(inline)=(%u,%u,%u,%u) "
-                                                     "B(renderer prog+vao)=(%u,%u,%u,%u)/err=0x%x "
-                                                     "C(inline+renderer vao)=(%u,%u,%u,%u)/err=0x%x "
-                                                     "prog=%u vao=%u ebo=%u boundVAO=%d boundEBO=%d",
+                                                     "B(prog+vao+identity)=(%u,%u,%u,%u)/err=0x%x "
+                                                     "C(inline+vao)=(%u,%u,%u,%u)/err=0x%x "
+                                                     "prog=%u vao=%u ebo=%u boundEBO=%d "
+                                                     "uTransform=%d uModel=%d useTextures=%d",
                                                      diag_frame,
                                                      pxA[0], pxA[1], pxA[2], pxA[3],
                                                      pxB[0], pxB[1], pxB[2], pxB[3], errB,
                                                      pxC[0], pxC[1], pxC[2], pxC[3], errC,
                                                      glRenderer.cubeProgram, glRenderer.cubeVAO,
-                                                     glRenderer.cubeEBO, boundVAO, boundEBO);
+                                                     glRenderer.cubeEBO, boundEBO,
+                                                     locTransform, locModel, locUseTex);
                                         } else {
                                             // After first 5 frames, just draw inline triangle
                                             glUseProgram_(diag_prog);
