@@ -849,11 +849,16 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	}
 #endif
 
-	// Get target (window) dimensions for mono viewport sizing
+	// Get target (window) dimensions for mono viewport sizing.
+	// In shared texture mode (no target), use canvas dims if available —
+	// the DP weaves at canvas resolution, not full shared texture size.
 	uint32_t tgt_width = c->settings.preferred.width;
 	uint32_t tgt_height = c->settings.preferred.height;
 	if (c->target != nullptr) {
 		comp_d3d11_target_get_dimensions(c->target, &tgt_width, &tgt_height);
+	} else if (c->canvas.valid && c->canvas.w > 0 && c->canvas.h > 0) {
+		tgt_width = c->canvas.w;
+		tgt_height = c->canvas.h;
 	}
 
 	// Sync renderer view dims from active mode — set_tile_layout derives
@@ -1001,12 +1006,29 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			D3D11_TEXTURE2D_DESC st_desc;
 			c->shared_texture->GetDesc(&st_desc);
 
+			// Use canvas dimensions as DP target when available.
+			// The shared texture is display-sized (worst case), but the DP
+			// should weave at canvas resolution — the actual displayed area.
+			uint32_t dp_target_w = st_desc.Width;
+			uint32_t dp_target_h = st_desc.Height;
+			if (c->canvas.valid && c->canvas.w > 0 && c->canvas.h > 0) {
+				dp_target_w = c->canvas.w;
+				dp_target_h = c->canvas.h;
+			}
+
+			// Set viewport to canvas region within the shared texture
+			D3D11_VIEWPORT dp_vp = {};
+			dp_vp.Width = (FLOAT)dp_target_w;
+			dp_vp.Height = (FLOAT)dp_target_h;
+			dp_vp.MaxDepth = 1.0f;
+			c->context->RSSetViewports(1, &dp_vp);
+
 			// Bind shared texture as render target for the weaver
 			c->context->OMSetRenderTargets(1, &c->shared_rtv, nullptr);
 
 			xrt_display_processor_d3d11_process_atlas(
 			    c->display_processor, c->context, atlas_srv, view_width, view_height,
-			    tile_columns, tile_rows, DXGI_FORMAT_R8G8B8A8_UNORM, st_desc.Width, st_desc.Height);
+			    tile_columns, tile_rows, DXGI_FORMAT_R8G8B8A8_UNORM, dp_target_w, dp_target_h);
 			weaving_done = true;
 		}
 

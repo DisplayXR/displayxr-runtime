@@ -78,6 +78,7 @@ static uint32_t g_canvasH = 0;
 static ComPtr<ID3D11VertexShader> g_blitVS;
 static ComPtr<ID3D11PixelShader> g_blitPS;
 static ComPtr<ID3D11SamplerState> g_blitSampler;
+static ComPtr<ID3D11Buffer> g_blitParamsCB;
 
 struct RenderState;
 static RenderState* g_renderState = nullptr;
@@ -199,8 +200,9 @@ VSOut main(uint id : SV_VertexID) {
 static const char* g_blitPSSource = R"(
 Texture2D    tex : register(t0);
 SamplerState smp : register(s0);
+cbuffer BlitParams : register(b0) { float2 uvScale; };
 float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
-    return tex.Sample(smp, uv);
+    return tex.Sample(smp, uv * uvScale);
 }
 )";
 
@@ -231,6 +233,15 @@ static bool CreateBlitResources(ID3D11Device* device) {
     sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
     sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
     hr = device->CreateSamplerState(&sd, &g_blitSampler);
+    if (FAILED(hr)) return false;
+
+    // Constant buffer for UV scale (canvas/shared texture ratio)
+    D3D11_BUFFER_DESC cbd = {};
+    cbd.ByteWidth = 16;  // float2 + padding to 16-byte alignment
+    cbd.Usage = D3D11_USAGE_DYNAMIC;
+    cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    hr = device->CreateBuffer(&cbd, nullptr, &g_blitParamsCB);
     return SUCCEEDED(hr);
 }
 
@@ -258,12 +269,28 @@ static void BlitSharedTextureToBackBuffer(D3D11Renderer& renderer, ID3D11RenderT
             (uint32_t)vp.Width, (uint32_t)vp.Height);
     }
 
+    // Update UV scale constant buffer: only sample the canvas portion of the shared texture
+    if (g_blitParamsCB && g_sharedWidth > 0 && g_sharedHeight > 0) {
+        float uvScale[4] = {
+            (float)g_canvasW / (float)g_sharedWidth,
+            (float)g_canvasH / (float)g_sharedHeight,
+            0.0f, 0.0f  // padding
+        };
+        D3D11_MAPPED_SUBRESOURCE mapped;
+        if (SUCCEEDED(renderer.context->Map(g_blitParamsCB.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+            memcpy(mapped.pData, uvScale, sizeof(uvScale));
+            renderer.context->Unmap(g_blitParamsCB.Get(), 0);
+        }
+    }
+
     renderer.context->VSSetShader(g_blitVS.Get(), nullptr, 0);
     renderer.context->PSSetShader(g_blitPS.Get(), nullptr, 0);
     ID3D11ShaderResourceView* srv = g_sharedSRV.Get();
     renderer.context->PSSetShaderResources(0, 1, &srv);
     ID3D11SamplerState* smp = g_blitSampler.Get();
     renderer.context->PSSetSamplers(0, 1, &smp);
+    ID3D11Buffer* cb = g_blitParamsCB.Get();
+    renderer.context->PSSetConstantBuffers(0, 1, &cb);
     renderer.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     renderer.context->IASetInputLayout(nullptr);
     renderer.context->Draw(3, 0);
@@ -961,6 +988,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     g_blitVS.Reset();
     g_blitPS.Reset();
     g_blitSampler.Reset();
+    g_blitParamsCB.Reset();
     appBackBufferRTV.Reset();
     appSwapchain.Reset();
 
