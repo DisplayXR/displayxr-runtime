@@ -964,7 +964,26 @@ void RenderScene(
     cmdList->ResourceBarrier(1, &barrier);
 
     // Execute
-    cmdList->Close();
+    hr = cmdList->Close();
+    if (renderDiag) {
+        if (FAILED(hr)) {
+            LOG_ERROR("RenderScene: cmdList->Close() FAILED: 0x%08X", hr);
+        } else {
+            LOG_INFO("RenderScene: cmdList->Close() OK");
+        }
+        // Log swapchain resource flags
+        D3D12_RESOURCE_DESC rtDesc = renderTarget->GetDesc();
+        LOG_INFO("RenderScene: RT desc: %llux%u fmt=%u flags=0x%X dimension=%u mips=%u arrays=%u samples=%u",
+                 (unsigned long long)rtDesc.Width, rtDesc.Height,
+                 (uint32_t)rtDesc.Format, (uint32_t)rtDesc.Flags,
+                 (uint32_t)rtDesc.Dimension, rtDesc.MipLevels,
+                 rtDesc.DepthOrArraySize, rtDesc.SampleDesc.Count);
+        // Check device removed
+        hr = renderer.device->GetDeviceRemovedReason();
+        if (FAILED(hr)) {
+            LOG_ERROR("RenderScene: DEVICE REMOVED! Reason: 0x%08X", hr);
+        }
+    }
     ID3D12CommandList* lists[] = { cmdList };
     renderer.commandQueue->ExecuteCommandLists(1, lists);
 
