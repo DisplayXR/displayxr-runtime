@@ -442,6 +442,29 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                                 XMMATRIX viewMatrix = xr.viewMatrices[eye];
                                 XMMATRIX projMatrix = xr.projMatrices[eye];
 
+                                // DIAGNOSTIC: log matrices and FOV for first frame
+                                if (eye == 0) {
+                                    static int mat_log = 0;
+                                    if (mat_log < 3) {
+                                        XMFLOAT4X4 vm, pm;
+                                        XMStoreFloat4x4(&vm, viewMatrix);
+                                        XMStoreFloat4x4(&pm, projMatrix);
+                                        LOG_INFO("DIAG-MAT[%d] VIEW row0=(%.4f,%.4f,%.4f,%.4f) row3=(%.4f,%.4f,%.4f,%.4f)",
+                                                 mat_log, vm._11, vm._12, vm._13, vm._14, vm._41, vm._42, vm._43, vm._44);
+                                        LOG_INFO("DIAG-MAT[%d] PROJ row0=(%.4f,%.4f,%.4f,%.4f) row1=(%.4f,%.4f,%.4f,%.4f)",
+                                                 mat_log, pm._11, pm._12, pm._13, pm._14, pm._21, pm._22, pm._23, pm._24);
+                                        LOG_INFO("DIAG-MAT[%d] PROJ row2=(%.4f,%.4f,%.4f,%.4f) row3=(%.4f,%.4f,%.4f,%.4f)",
+                                                 mat_log, pm._31, pm._32, pm._33, pm._34, pm._41, pm._42, pm._43, pm._44);
+                                        XrView rawView = {XR_TYPE_VIEW};
+                                        // Also log the FOV from xrLocateViews
+                                        LOG_INFO("DIAG-MAT[%d] tile=%ux%u fov=(L=%.3f R=%.3f U=%.3f D=%.3f)",
+                                                 mat_log, tileW, tileH,
+                                                 xr.configViews[0].recommendedImageRectWidth > 0 ? 0.0f : 0.0f,
+                                                 0.0f, 0.0f, 0.0f); // placeholder - real FOV logged via proj matrix
+                                        mat_log++;
+                                    }
+                                }
+
                                 // Non-ext app: render with default zoom (1.0)
                                 RenderScene(glRenderer, imageIndex,
                                     tileX * tileW, tileY * tileH,
