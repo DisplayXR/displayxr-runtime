@@ -450,6 +450,24 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                                 projectionViews[eye].fov = rawViews[eye].fov;
                             }
 
+                            // DIAGNOSTIC: check GL state after render
+                            {
+                                static int diag_frame = 0;
+                                if (diag_frame < 5) {
+                                    GLenum err = glGetError();
+                                    HGLRC curCtx = wglGetCurrentContext();
+                                    HDC curDC = wglGetCurrentDC();
+                                    LOG_INFO("DIAG[%d]: after render img=%u ctx=%p dc=%p glErr=0x%x "
+                                             "tile=%ux%u sc=%ux%u views=%u",
+                                             diag_frame, imageIndex, (void*)curCtx, (void*)curDC,
+                                             err, tileW, tileH,
+                                             xr.swapchain.width, xr.swapchain.height, modeViewCount);
+                                }
+                                diag_frame++;
+                            }
+                            // DIAGNOSTIC: force GPU completion before releasing
+                            // to test cross-context sync hypothesis
+                            glFinish();
                             ReleaseSwapchainImage(xr);
                         }
                     }
