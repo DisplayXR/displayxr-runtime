@@ -449,19 +449,67 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                                     viewMatrix, projMatrix,
                                     1.0f);
 
-                                // DIAGNOSTIC: overwrite eye 0 with green to test if
-                                // FBO draws work at all (separate from VAO/shader draw)
+                                // DIAGNOSTIC: minimal inline triangle draw test
+                                // Bypasses gl_renderer entirely — own shader + VAO
                                 if (eye == 0) {
-                                    static int green_test = 0;
-                                    if (green_test < 30) {
+                                    static GLuint diag_prog = 0, diag_vao = 0;
+                                    static bool diag_init = false;
+                                    static int diag_frame = 0;
+                                    if (!diag_init) {
+                                        // Compile minimal shader
+                                        const char* dvs =
+                                            "#version 330 core\n"
+                                            "void main() {\n"
+                                            "  vec2 p[3] = vec2[](vec2(-0.8,-0.8), vec2(0.8,-0.8), vec2(0.0,0.8));\n"
+                                            "  gl_Position = vec4(p[gl_VertexID], 0.0, 1.0);\n"
+                                            "}\n";
+                                        const char* dfs =
+                                            "#version 330 core\n"
+                                            "out vec4 fragColor;\n"
+                                            "void main() { fragColor = vec4(1.0, 0.0, 0.0, 1.0); }\n";
+                                        GLuint vs = glCreateShader_(GL_VERTEX_SHADER);
+                                        glShaderSource_(vs, 1, &dvs, NULL);
+                                        glCompileShader_(vs);
+                                        GLint ok = 0;
+                                        glGetShaderiv_(vs, GL_COMPILE_STATUS, &ok);
+                                        LOG_INFO("DIAG-DRAW: VS compile=%d", ok);
+                                        GLuint fs = glCreateShader_(GL_FRAGMENT_SHADER);
+                                        glShaderSource_(fs, 1, &dfs, NULL);
+                                        glCompileShader_(fs);
+                                        glGetShaderiv_(fs, GL_COMPILE_STATUS, &ok);
+                                        LOG_INFO("DIAG-DRAW: FS compile=%d", ok);
+                                        diag_prog = glCreateProgram_();
+                                        glAttachShader_(diag_prog, vs);
+                                        glAttachShader_(diag_prog, fs);
+                                        glLinkProgram_(diag_prog);
+                                        glGetProgramiv_(diag_prog, GL_LINK_STATUS, &ok);
+                                        LOG_INFO("DIAG-DRAW: program link=%d prog=%u", ok, diag_prog);
+                                        glDeleteShader_(vs);
+                                        glDeleteShader_(fs);
+                                        glGenVertexArrays_(1, &diag_vao);
+                                        LOG_INFO("DIAG-DRAW: vao=%u err=0x%x", diag_vao, glGetError());
+                                        diag_init = true;
+                                    }
+                                    if (diag_frame < 60 && diag_prog && diag_vao) {
                                         glBindFramebuffer_(GL_FRAMEBUFFER, glRenderer.fbos[imageIndex]);
                                         glViewport(tileX * tileW, tileY * tileH, tileW, tileH);
-                                        glScissor(tileX * tileW, tileY * tileH, tileW, tileH);
-                                        glEnable(GL_SCISSOR_TEST);
-                                        glClearColor(0.0f, 1.0f, 0.0f, 1.0f); // GREEN
-                                        glClear(GL_COLOR_BUFFER_BIT);
+                                        glDisable(GL_DEPTH_TEST);
+                                        glDisable(GL_SCISSOR_TEST);
+                                        glDisable(GL_CULL_FACE);
+                                        glUseProgram_(diag_prog);
+                                        glBindVertexArray_(diag_vao);
+                                        glDrawArrays(GL_TRIANGLES, 0, 3);
+                                        GLenum derr = glGetError();
+                                        if (diag_frame < 5) {
+                                            uint8_t px[4] = {0};
+                                            glReadPixels(tileW/2, tileH/2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
+                                            LOG_INFO("DIAG-DRAW[%d]: after triangle px=(%u,%u,%u,%u) err=0x%x",
+                                                     diag_frame, px[0], px[1], px[2], px[3], derr);
+                                        }
+                                        glBindVertexArray_(0);
+                                        glUseProgram_(0);
                                         glBindFramebuffer_(GL_FRAMEBUFFER, 0);
-                                        green_test++;
+                                        diag_frame++;
                                     }
                                 }
 
