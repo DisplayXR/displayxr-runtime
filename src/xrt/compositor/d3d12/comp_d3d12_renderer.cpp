@@ -816,12 +816,12 @@ comp_d3d12_renderer_draw(struct comp_d3d12_renderer *renderer,
 		return XRT_ERROR_IPC_FAILURE;
 	}
 
-	// Diagnostic: log draw info periodically
+	// Diagnostic: log draw info (first 5 frames + every 300)
 	static uint32_t draw_counter = 0;
-	bool draw_log = (draw_counter % 60 == 0);
+	bool draw_log = (draw_counter < 5 || draw_counter % 300 == 0);
 	draw_counter++;
 	if (draw_log) {
-		U_LOG_I("D3D12 renderer draw: layers=%u, 3d=%d, view=%ux%u, target=%ux%u",
+		U_LOG_W("D3D12 renderer draw: layers=%u, 3d=%d, view=%ux%u, target=%ux%u",
 		        layers->layer_count, hardware_display_3d,
 		        renderer->view_width, renderer->view_height,
 		        target_width, target_height);
@@ -889,7 +889,7 @@ comp_d3d12_renderer_draw(struct comp_d3d12_renderer *renderer,
 			}
 
 			if (draw_log) {
-				U_LOG_I("D3D12 blit: compositor src_resource=%p, img_index=%u, xscn=%p",
+				U_LOG_W("D3D12 blit: compositor src_resource=%p, img_index=%u, xscn=%p",
 				        (void *)src_resource, img_index, (void *)xscn);
 			}
 
@@ -959,7 +959,7 @@ comp_d3d12_renderer_draw(struct comp_d3d12_renderer *renderer,
 			uint32_t tile_y = (tile_idx / renderer->tile_columns) * renderer->view_height;
 
 			if (draw_log) {
-				U_LOG_I("D3D12 renderer: blit layer=%u view=%u, src=%p (%llux%u), "
+				U_LOG_W("D3D12 renderer: blit layer=%u view=%u, src=%p (%llux%u), "
 				        "sub_rect=(%.0f,%.0f %.0fx%.0f), tile=(%u,%u), view=%ux%u",
 				        li, vi, (void *)src_resource,
 				        (unsigned long long)src_desc.Width, (unsigned)src_desc.Height,
