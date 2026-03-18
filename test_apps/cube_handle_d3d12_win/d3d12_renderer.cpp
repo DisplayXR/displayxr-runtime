@@ -634,6 +634,11 @@ bool InitializeD3D12WithLUID(D3D12Renderer& renderer, LUID adapterLuid) {
         return false;
     }
 
+    // Pre-set swapchain format to R8G8B8A8_UNORM (the format CreateResources
+    // used for PSOs). This prevents CreateSwapchainRTVs from unnecessarily
+    // recreating PSOs when the swapchain format matches.
+    renderer.swapchainFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+
     LOG_INFO("D3D12 initialization complete");
     return true;
 }
