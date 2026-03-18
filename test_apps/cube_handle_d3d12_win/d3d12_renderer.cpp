@@ -823,11 +823,34 @@ void RenderScene(
 ) {
     HRESULT hr;
 
+    // One-time diagnostic: log pipeline state validity
+    static uint32_t renderDiagCount = 0;
+    bool renderDiag = (renderDiagCount < 3);
+    renderDiagCount++;
+    if (renderDiag) {
+        LOG_INFO("RenderScene: rt=%p, rtvIdx=%d, vp=(%u,%u %ux%u), clear=%d, "
+                 "cubePSO=%p, cubePSOTex=%p, gridPSO=%p, texLoaded=%d, "
+                 "cubeVB=%llu, cubeIB=%llu, gridVB=%llu, srvHeap=%p",
+                 (void*)renderTarget, rtvIndex, viewportX, viewportY, width, height, (int)clear,
+                 (void*)renderer.cubePSO.Get(), (void*)renderer.cubePSOTextured.Get(),
+                 (void*)renderer.gridPSO.Get(), (int)renderer.texturesLoaded,
+                 (unsigned long long)renderer.cubeVBV.BufferLocation,
+                 (unsigned long long)renderer.cubeIBV.BufferLocation,
+                 (unsigned long long)renderer.gridVBV.BufferLocation,
+                 (void*)renderer.srvHeap.Get());
+    }
+
     // Reset command allocator and list
     hr = renderer.commandAllocator->Reset();
-    if (FAILED(hr)) return;
+    if (FAILED(hr)) {
+        if (renderDiag) LOG_ERROR("RenderScene: commandAllocator->Reset() FAILED: 0x%08X", hr);
+        return;
+    }
     hr = renderer.commandList->Reset(renderer.commandAllocator.Get(), nullptr);
-    if (FAILED(hr)) return;
+    if (FAILED(hr)) {
+        if (renderDiag) LOG_ERROR("RenderScene: commandList->Reset() FAILED: 0x%08X", hr);
+        return;
+    }
 
     auto cmdList = renderer.commandList.Get();
 

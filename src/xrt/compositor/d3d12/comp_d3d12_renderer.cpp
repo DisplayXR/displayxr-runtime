@@ -842,9 +842,9 @@ comp_d3d12_renderer_draw(struct comp_d3d12_renderer *renderer,
 	barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 	cmd_list->ResourceBarrier(1, &barrier);
 
-	// Clear atlas — DIAGNOSTIC: bright red to test if blit overwrites this
+	// Clear atlas to black
 	D3D12_CPU_DESCRIPTOR_HANDLE rtv = renderer->rtv_heap->GetCPUDescriptorHandleForHeapStart();
-	float clear_color[4] = {1.0f, 0.0f, 0.0f, 1.0f};
+	float clear_color[4] = {0.0f, 0.0f, 0.0f, 1.0f};
 	cmd_list->ClearRenderTargetView(rtv, clear_color, 0, nullptr);
 
 	// Set blit pipeline (shared across all projection views)
