@@ -44,6 +44,9 @@ typedef ptrdiff_t GLintptr;
 #define GL_TEXTURE_WRAP_S                 0x2802
 #define GL_TEXTURE_WRAP_T                 0x2803
 #define GL_TEXTURE0                       0x84C0
+#define GL_CURRENT_PROGRAM                0x8B8D
+#define GL_VERTEX_ARRAY_BINDING           0x85B5
+#define GL_ELEMENT_ARRAY_BUFFER_BINDING   0x8895
 #ifndef GL_LINEAR_MIPMAP_LINEAR
 #define GL_LINEAR_MIPMAP_LINEAR           0x2703
 #endif
