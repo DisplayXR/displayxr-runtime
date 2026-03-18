@@ -450,18 +450,29 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                                 projectionViews[eye].fov = rawViews[eye].fov;
                             }
 
-                            // DIAGNOSTIC: check GL state after render
+                            // DIAGNOSTIC: check GL state and readback pixel after render
                             {
                                 static int diag_frame = 0;
-                                if (diag_frame < 5) {
+                                if (diag_frame < 10) {
                                     GLenum err = glGetError();
                                     HGLRC curCtx = wglGetCurrentContext();
                                     HDC curDC = wglGetCurrentDC();
-                                    LOG_INFO("DIAG[%d]: after render img=%u ctx=%p dc=%p glErr=0x%x "
-                                             "tile=%ux%u sc=%ux%u views=%u",
-                                             diag_frame, imageIndex, (void*)curCtx, (void*)curDC,
-                                             err, tileW, tileH,
-                                             xr.swapchain.width, xr.swapchain.height, modeViewCount);
+                                    // Read pixel from the FBO we just rendered to
+                                    GLuint scTex = swapchainImages[imageIndex].image;
+                                    glBindFramebuffer_(GL_FRAMEBUFFER, glRenderer.fbos[imageIndex]);
+                                    uint8_t px_center[4] = {0}, px_quarter[4] = {0};
+                                    // Center of left eye region
+                                    glReadPixels(tileW/2, tileH/2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px_center);
+                                    // Quarter way (more likely to hit cube/grid)
+                                    glReadPixels(tileW/2, tileH/4, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px_quarter);
+                                    glBindFramebuffer_(GL_FRAMEBUFFER, 0);
+                                    GLenum err2 = glGetError();
+                                    LOG_INFO("DIAG[%d]: img=%u tex=%u ctx=%p dc=%p glErr=0x%x/0x%x "
+                                             "tile=%ux%u center=(%u,%u,%u,%u) quarter=(%u,%u,%u,%u)",
+                                             diag_frame, imageIndex, scTex, (void*)curCtx, (void*)curDC,
+                                             err, err2, tileW, tileH,
+                                             px_center[0], px_center[1], px_center[2], px_center[3],
+                                             px_quarter[0], px_quarter[1], px_quarter[2], px_quarter[3]);
                                 }
                                 diag_frame++;
                             }
