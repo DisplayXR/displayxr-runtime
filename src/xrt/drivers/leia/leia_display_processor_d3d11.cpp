@@ -254,9 +254,37 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 	void *weaver_srv = atlas_srv;
 	uint32_t weaver_view_width = view_width;
 
-	// If atlas is already SBS (tile_columns=2, tile_rows=1), pass directly.
-	// Otherwise, rearrange to SBS via CopySubresourceRegion.
-	if (tile_columns != 2 || tile_rows != 1) {
+	// Check if the atlas texture matches the expected SBS dimensions.
+	// The SR SDK weaver assumes the SBS texture is exactly 2*view_width x view_height.
+	// When the atlas is oversized (e.g. legacy apps render at compromise scale into
+	// a full-native-height atlas), we must copy to a correctly-sized staging texture.
+	bool needs_staging = (tile_columns != 2 || tile_rows != 1);
+	if (!needs_staging) {
+		// Atlas is SBS-shaped, but check if texture is oversized
+		ID3D11Resource *atlas_res = NULL;
+		static_cast<ID3D11ShaderResourceView *>(atlas_srv)->GetResource(&atlas_res);
+		if (atlas_res != NULL) {
+			ID3D11Texture2D *atlas_tex = NULL;
+			if (SUCCEEDED(atlas_res->QueryInterface(__uuidof(ID3D11Texture2D),
+			                                        reinterpret_cast<void **>(&atlas_tex)))) {
+				D3D11_TEXTURE2D_DESC desc;
+				atlas_tex->GetDesc(&desc);
+				if (desc.Width != 2 * view_width || desc.Height != view_height) {
+					needs_staging = true;
+					static bool logged = false;
+					if (!logged) {
+						U_LOG_W("Leia D3D11 DP: atlas %ux%u != expected SBS %ux%u, using staging copy",
+						        desc.Width, desc.Height, 2 * view_width, view_height);
+						logged = true;
+					}
+				}
+				atlas_tex->Release();
+			}
+			atlas_res->Release();
+		}
+	}
+
+	if (needs_staging) {
 		DXGI_FORMAT dxgi_format = static_cast<DXGI_FORMAT>(format);
 		if (!ensure_sbs_staging(ldp, view_width, view_height, dxgi_format)) {
 			// Fallback: pass atlas as-is (will look wrong but won't crash)
