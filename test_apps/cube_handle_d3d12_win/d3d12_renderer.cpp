@@ -7,6 +7,7 @@
 
 #include "d3d12_renderer.h"
 #include "logging.h"
+#include <d3d12sdklayers.h>
 #include <cmath>
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -568,16 +569,18 @@ bool InitializeD3D12WithLUID(D3D12Renderer& renderer, LUID adapterLuid) {
     LOG_INFO("Initializing D3D12 with adapter LUID: 0x%08X%08X",
              adapterLuid.HighPart, adapterLuid.LowPart);
 
-    // Create DXGI factory
+    // Enable D3D12 debug layer (always, for diagnostics)
     UINT dxgiFlags = 0;
-#ifdef _DEBUG
-    ComPtr<ID3D12Debug> debugController;
-    if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debugController)))) {
-        debugController->EnableDebugLayer();
-        dxgiFlags = DXGI_CREATE_FACTORY_DEBUG;
-        LOG_INFO("D3D12 debug layer enabled");
+    {
+        ComPtr<ID3D12Debug> debugController;
+        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debugController)))) {
+            debugController->EnableDebugLayer();
+            dxgiFlags = DXGI_CREATE_FACTORY_DEBUG;
+            LOG_INFO("D3D12 debug layer ENABLED (release build)");
+        } else {
+            LOG_INFO("D3D12 debug layer not available");
+        }
     }
-#endif
 
     HRESULT hr = CreateDXGIFactory2(dxgiFlags, IID_PPV_ARGS(&renderer.dxgiFactory));
     if (FAILED(hr)) {
@@ -633,11 +636,6 @@ bool InitializeD3D12WithLUID(D3D12Renderer& renderer, LUID adapterLuid) {
         LOG_ERROR("Failed to create D3D12 resources");
         return false;
     }
-
-    // Pre-set swapchain format to R8G8B8A8_UNORM (the format CreateResources
-    // used for PSOs). This prevents CreateSwapchainRTVs from unnecessarily
-    // recreating PSOs when the swapchain format matches.
-    renderer.swapchainFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
 
     LOG_INFO("D3D12 initialization complete");
     return true;
@@ -976,6 +974,29 @@ void RenderScene(
     if (renderer.fence->GetCompletedValue() < renderer.fenceValue) {
         renderer.fence->SetEventOnCompletion(renderer.fenceValue, renderer.fenceEvent);
         WaitForSingleObject(renderer.fenceEvent, INFINITE);
+    }
+
+    // Drain D3D12 debug messages (first 3 frames only)
+    if (renderDiag) {
+        ComPtr<ID3D12InfoQueue> infoQueue;
+        if (SUCCEEDED(renderer.device->QueryInterface(IID_PPV_ARGS(&infoQueue)))) {
+            UINT64 msgCount = infoQueue->GetNumStoredMessages();
+            if (msgCount > 0) {
+                LOG_ERROR("D3D12 InfoQueue: %llu messages!", (unsigned long long)msgCount);
+                for (UINT64 i = 0; i < msgCount && i < 10; i++) {
+                    SIZE_T msgLen = 0;
+                    infoQueue->GetMessage(i, nullptr, &msgLen);
+                    if (msgLen > 0) {
+                        auto* msg = (D3D12_MESSAGE*)malloc(msgLen);
+                        if (msg && SUCCEEDED(infoQueue->GetMessage(i, msg, &msgLen))) {
+                            LOG_ERROR("  D3D12 [%d]: %s", msg->Severity, msg->pDescription);
+                        }
+                        free(msg);
+                    }
+                }
+            }
+            infoQueue->ClearStoredMessages();
+        }
     }
 }
 
