@@ -1081,6 +1081,29 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			}
 		}
 
+		// DIAGNOSTIC (issue #91): clear atlas to RED right before DP reads it.
+		// If we see red → SRV correctly reads the atlas. Black → SRV is wrong.
+		{
+			ID3D11Texture2D *atlas_tex = static_cast<ID3D11Texture2D *>(
+			    comp_d3d11_renderer_get_atlas_texture(c->renderer));
+			if (atlas_tex != nullptr) {
+				ID3D11RenderTargetView *temp_rtv = nullptr;
+				HRESULT hr = c->device->CreateRenderTargetView(atlas_tex, nullptr, &temp_rtv);
+				if (SUCCEEDED(hr) && temp_rtv != nullptr) {
+					float red[4] = {1.0f, 0.0f, 0.0f, 1.0f};
+					c->context->ClearRenderTargetView(temp_rtv, red);
+					temp_rtv->Release();
+					// Re-bind target RTV after clearing atlas
+					comp_d3d11_target_bind(c->target);
+					static bool red_logged = false;
+					if (!red_logged) {
+						red_logged = true;
+						U_LOG_W("[diag#91] cleared atlas to RED before DP read");
+					}
+				}
+			}
+		}
+
 		xrt_display_processor_d3d11_process_atlas(
 		    c->display_processor, c->context, atlas_srv, view_width, view_height,
 		    tile_columns, tile_rows, DXGI_FORMAT_R8G8B8A8_UNORM, target_width, target_height);
