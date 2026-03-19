@@ -17,7 +17,7 @@ BEGIN
         BLOCK "040904B0"
         BEGIN
             VALUE "CompanyName",      "Leia Inc."
-            VALUE "FileDescription",  "SR Cube OpenXR GL Test Application"
+            VALUE "FileDescription",  "SR Cube OpenXR Test Application (Legacy GL)"
             VALUE "FileVersion",      "1.0.0.0"
             VALUE "InternalName",     "cube_hosted_legacy_gl_win"
             VALUE "LegalCopyright",   "Copyright 2025 Leia Inc."

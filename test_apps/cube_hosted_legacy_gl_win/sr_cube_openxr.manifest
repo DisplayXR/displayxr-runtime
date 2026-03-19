@@ -3,10 +3,10 @@
   <assemblyIdentity
     version="1.0.0.0"
     processorArchitecture="amd64"
-    name="Leia.SR.CubeGL"
+    name="Leia.SR.CubeOpenXR"
     type="win32"
   />
-  <description>Leia SR Cube OpenXR GL Test Application</description>
+  <description>Leia SR Cube OpenXR Test Application</description>
 
   <!-- Windows 10/11 compatibility -->
   <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
