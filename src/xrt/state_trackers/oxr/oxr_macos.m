@@ -49,12 +49,19 @@ extern void oxr_macos_set_window_closed(void);
  */
 void
 oxr_macos_pump_events(struct xrt_device **xdevs, uint32_t xdev_count, struct xrt_device *head,
-                      bool legacy_app)
+                      bool legacy_app, bool external_window)
 {
 	@autoreleasepool {
 		if (NSApp == nil) {
 			return;
 		}
+
+		// When running inside a host app (external_window == true),
+		// collect keyboard/mouse events so we can re-inject them
+		// after processing.  This lets the runtime see all events
+		// (Escape detection, qwerty driver) while returning
+		// keyboard/mouse events to the host app's event queue.
+		NSMutableArray<NSEvent *> *reinject = external_window ? [NSMutableArray array] : nil;
 
 		// Drain NSApp events (mouse, keyboard, window lifecycle).
 		NSEvent *event;
@@ -87,6 +94,34 @@ oxr_macos_pump_events(struct xrt_device **xdevs, uint32_t xdev_count, struct xrt
 			if (!skip_send) {
 				[NSApp sendEvent:event];
 			}
+
+			// Mark keyboard/mouse events for re-injection.
+			if (external_window) {
+				NSEventType etype = [event type];
+				switch (etype) {
+				case NSEventTypeKeyDown:
+				case NSEventTypeKeyUp:
+				case NSEventTypeFlagsChanged:
+				case NSEventTypeMouseMoved:
+				case NSEventTypeLeftMouseDown:
+				case NSEventTypeLeftMouseUp:
+				case NSEventTypeRightMouseDown:
+				case NSEventTypeRightMouseUp:
+				case NSEventTypeLeftMouseDragged:
+				case NSEventTypeRightMouseDragged:
+				case NSEventTypeScrollWheel:
+					[reinject addObject:event];
+					break;
+				default:
+					break;
+				}
+			}
+		}
+
+		// Re-inject collected keyboard/mouse events so the host
+		// app (e.g. Unity) can process them via its own input system.
+		for (NSEvent *ev in reinject) {
+			[NSApp postEvent:ev atStart:YES];
 		}
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
