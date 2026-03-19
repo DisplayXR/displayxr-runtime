@@ -945,6 +945,19 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 	}
 
+	// WORKAROUND: disable zero-copy for now — Unity D3D11 builds produce
+	// black output when the renderer is bypassed, likely because deferred
+	// context commands haven't been flushed. See issue #91.
+	{
+		static bool zc_disabled_logged = false;
+		if (zero_copy && !zc_disabled_logged) {
+			U_LOG_W("D3D11 zero-copy disabled (issue #91 workaround)");
+			zc_disabled_logged = true;
+		}
+		zero_copy = false;
+		zc_srv = nullptr;
+	}
+
 	// Render layers to side-by-side stereo texture (skip if zero-copy).
 	// Pass hardware_display_3d so the renderer knows the current display mode.
 	xrt_result_t xret = XRT_SUCCESS;
