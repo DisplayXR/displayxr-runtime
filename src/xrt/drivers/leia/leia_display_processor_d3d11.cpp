@@ -318,29 +318,50 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 	}
 
 do_weave:
-	// Diagnostic: log weaver state (issue #91 round 2)
-	{
-		static uint32_t weave_diag = 0;
-		if (weave_diag < 3) {
-			weave_diag++;
-			// Check what RTV is currently bound
-			ID3D11RenderTargetView *cur_rtv = NULL;
-			ctx->OMGetRenderTargets(1, &cur_rtv, NULL);
-			U_LOG_W("[diag#91] weave %u/3: needs_staging=%d weaver_srv=%p "
-			        "view=%ux%u target=%ux%u bound_rtv=%p",
-			        weave_diag, (int)needs_staging, weaver_srv,
-			        view_width, view_height,
-			        target_width, target_height, (void *)cur_rtv);
-			if (cur_rtv != NULL) {
-				cur_rtv->Release();
-			}
+	// DIAGNOSTIC (issue #91): bypass weaver, blit atlas directly to target.
+	// This shows what's actually in the atlas — dark blue = renderer ran but
+	// swapchains empty, content = swapchains have data, black = atlas SRV issue.
+	if (ldp->blit_vs != NULL && ldp->blit_ps != NULL) {
+		static bool bypass_logged = false;
+		if (!bypass_logged) {
+			bypass_logged = true;
+			U_LOG_W("[diag#91] BYPASSING weaver — direct atlas blit to target");
 		}
+
+		ID3D11ShaderResourceView *srv = static_cast<ID3D11ShaderResourceView *>(weaver_srv);
+
+		// UV scale: show full atlas content
+		struct { float u_scale; float v_scale; float pad0; float pad1; } cb_data;
+		cb_data.u_scale = 1.0f;
+		cb_data.v_scale = 1.0f;
+		cb_data.pad0 = 0.0f;
+		cb_data.pad1 = 0.0f;
+		ctx->UpdateSubresource(ldp->blit_cb, 0, NULL, &cb_data, 0, 0);
+
+		D3D11_VIEWPORT viewport = {};
+		viewport.Width = static_cast<float>(target_width);
+		viewport.Height = static_cast<float>(target_height);
+		viewport.MaxDepth = 1.0f;
+		ctx->RSSetViewports(1, &viewport);
+
+		ctx->VSSetShader(ldp->blit_vs, NULL, 0);
+		ctx->PSSetShader(ldp->blit_ps, NULL, 0);
+		ctx->PSSetSamplers(0, 1, &ldp->blit_sampler);
+		ctx->PSSetShaderResources(0, 1, &srv);
+		ctx->PSSetConstantBuffers(0, 1, &ldp->blit_cb);
+
+		ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+		ctx->IASetInputLayout(NULL);
+		ctx->Draw(4, 0);
+
+		ID3D11ShaderResourceView *null_srv = NULL;
+		ctx->PSSetShaderResources(0, 1, &null_srv);
+		return;
 	}
 
-	// Set input texture for weaving
+	// Original weaver path (skipped during diagnostic)
 	leiasr_d3d11_set_input_texture(ldp->leiasr, weaver_srv, view_width, view_height, format);
 
-	// Set viewport for target dimensions
 	D3D11_VIEWPORT viewport = {};
 	viewport.TopLeftX = 0.0f;
 	viewport.TopLeftY = 0.0f;
@@ -350,23 +371,7 @@ do_weave:
 	viewport.MaxDepth = 1.0f;
 	ctx->RSSetViewports(1, &viewport);
 
-	// Perform weaving to the currently bound render target
 	leiasr_d3d11_weave(ldp->leiasr);
-
-	// Diagnostic: check if the weaver changed the bound RTV
-	{
-		static uint32_t post_diag = 0;
-		if (post_diag < 3) {
-			post_diag++;
-			ID3D11RenderTargetView *post_rtv = NULL;
-			ctx->OMGetRenderTargets(1, &post_rtv, NULL);
-			U_LOG_W("[diag#91] post-weave %u/3: bound_rtv=%p (did weaver change it?)",
-			        post_diag, (void *)post_rtv);
-			if (post_rtv != NULL) {
-				post_rtv->Release();
-			}
-		}
-	}
 }
 
 static bool

@@ -1081,26 +1081,6 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			}
 		}
 
-		// Diagnostic: clear target to GREEN before weaver to test if weaver writes anything.
-		// Green visible → weaver didn't draw. Black → weaver actively wrote black.
-		// Weaved content → weaver works correctly.
-		{
-			static uint32_t pre_test = 0;
-			if (pre_test < 120) {
-				pre_test++;
-				float green[4] = {0.0f, 1.0f, 0.0f, 1.0f};
-				ID3D11RenderTargetView *bound_rtv = nullptr;
-				c->context->OMGetRenderTargets(1, &bound_rtv, nullptr);
-				if (bound_rtv != nullptr) {
-					c->context->ClearRenderTargetView(bound_rtv, green);
-					bound_rtv->Release();
-					if (pre_test == 1) {
-						U_LOG_W("[diag#91] green pre-weave test: clearing target for %u frames", 120u);
-					}
-				}
-			}
-		}
-
 		xrt_display_processor_d3d11_process_atlas(
 		    c->display_processor, c->context, atlas_srv, view_width, view_height,
 		    tile_columns, tile_rows, DXGI_FORMAT_R8G8B8A8_UNORM, target_width, target_height);
