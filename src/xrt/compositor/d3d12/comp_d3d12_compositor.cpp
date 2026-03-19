@@ -1712,6 +1712,11 @@ comp_d3d12_compositor_set_system_devices(struct xrt_compositor *xc,
 {
 	struct comp_d3d12_compositor *c = d3d12_comp(xc);
 	c->xsysd = xsysd;
+
+	// Pass xsysd to self-owned window for direct qwerty input (WASD, TAB HUD, V mode toggle)
+	if (c->owns_window && c->own_window != nullptr) {
+		comp_d3d11_window_set_system_devices(c->own_window, xsysd);
+	}
 }
 
 void
