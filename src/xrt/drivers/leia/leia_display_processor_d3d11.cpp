@@ -318,48 +318,7 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 	}
 
 do_weave:
-	// DIAGNOSTIC (issue #91): bypass weaver, blit atlas directly to target.
-	// This shows what's actually in the atlas — dark blue = renderer ran but
-	// swapchains empty, content = swapchains have data, black = atlas SRV issue.
-	if (ldp->blit_vs != NULL && ldp->blit_ps != NULL) {
-		static bool bypass_logged = false;
-		if (!bypass_logged) {
-			bypass_logged = true;
-			U_LOG_W("[diag#91] BYPASSING weaver — direct atlas blit to target");
-		}
-
-		ID3D11ShaderResourceView *srv = static_cast<ID3D11ShaderResourceView *>(weaver_srv);
-
-		// UV scale: show full atlas content
-		struct { float u_scale; float v_scale; float pad0; float pad1; } cb_data;
-		cb_data.u_scale = 1.0f;
-		cb_data.v_scale = 1.0f;
-		cb_data.pad0 = 0.0f;
-		cb_data.pad1 = 0.0f;
-		ctx->UpdateSubresource(ldp->blit_cb, 0, NULL, &cb_data, 0, 0);
-
-		D3D11_VIEWPORT viewport = {};
-		viewport.Width = static_cast<float>(target_width);
-		viewport.Height = static_cast<float>(target_height);
-		viewport.MaxDepth = 1.0f;
-		ctx->RSSetViewports(1, &viewport);
-
-		ctx->VSSetShader(ldp->blit_vs, NULL, 0);
-		ctx->PSSetShader(ldp->blit_ps, NULL, 0);
-		ctx->PSSetSamplers(0, 1, &ldp->blit_sampler);
-		ctx->PSSetShaderResources(0, 1, &srv);
-		ctx->PSSetConstantBuffers(0, 1, &ldp->blit_cb);
-
-		ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-		ctx->IASetInputLayout(NULL);
-		ctx->Draw(4, 0);
-
-		ID3D11ShaderResourceView *null_srv = NULL;
-		ctx->PSSetShaderResources(0, 1, &null_srv);
-		return;
-	}
-
-	// Original weaver path (skipped during diagnostic)
+	// Set input texture for weaving
 	leiasr_d3d11_set_input_texture(ldp->leiasr, weaver_srv, view_width, view_height, format);
 
 	D3D11_VIEWPORT viewport = {};

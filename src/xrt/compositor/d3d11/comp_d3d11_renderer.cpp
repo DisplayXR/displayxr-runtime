@@ -1005,18 +1005,6 @@ comp_d3d11_renderer_draw(struct comp_d3d11_renderer *renderer,
 	internals->context->ClearDepthStencilView(renderer->depth_dsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f,
 	                                           0);
 
-	// DIAGNOSTIC (issue #91): skip layer rendering to verify dark blue clear is visible.
-	// If dark blue appears on screen, the renderer and atlas pipeline work — the issue
-	// is that Unity's swapchain textures are empty (deferred context / sync).
-	{
-		static bool skip_logged = false;
-		if (!skip_logged) {
-			skip_logged = true;
-			U_LOG_W("[diag#91] SKIPPING layer rendering — dark blue clear only");
-		}
-		return XRT_SUCCESS;
-	}
-
 	// Set common state
 	internals->context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
 	internals->context->IASetInputLayout(nullptr); // No vertex buffer, using SV_VertexID

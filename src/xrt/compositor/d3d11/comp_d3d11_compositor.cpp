@@ -1067,20 +1067,6 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		uint32_t target_width, target_height;
 		comp_d3d11_target_get_dimensions(c->target, &target_width, &target_height);
 
-		// Diagnostic: log DP pipeline state (issue #91 round 2)
-		{
-			static uint32_t dp_diag = 0;
-			if (dp_diag < 3) {
-				dp_diag++;
-				U_LOG_W("[diag#91] dp path %u/3: zero_copy=%d atlas_srv=%p "
-				        "view=%ux%u tiles=%ux%u target=%ux%u",
-				        dp_diag, (int)zero_copy, atlas_srv,
-				        view_width, view_height,
-				        tile_columns, tile_rows,
-				        target_width, target_height);
-			}
-		}
-
 		xrt_display_processor_d3d11_process_atlas(
 		    c->display_processor, c->context, atlas_srv, view_width, view_height,
 		    tile_columns, tile_rows, DXGI_FORMAT_R8G8B8A8_UNORM, target_width, target_height);

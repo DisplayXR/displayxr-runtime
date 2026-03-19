@@ -191,11 +191,17 @@ d3d11_swapchain_wait_image(struct xrt_swapchain *xsc, int64_t timeout_ns, uint32
 static xrt_result_t
 d3d11_swapchain_barrier_image(struct xrt_swapchain *xsc, enum xrt_barrier_direction direction, uint32_t index)
 {
-	// D3D11 native compositor: app and compositor share the same D3D11 device and textures
-	// No explicit barrier/synchronization is needed - D3D11 handles this internally
-	(void)xsc;
-	(void)direction;
-	(void)index;
+	struct comp_d3d11_swapchain *sc = d3d11_sc(xsc);
+
+	// When transitioning from app to compositor, flush pending GPU commands.
+	// Multi-threaded engines (e.g. Unity) may submit draw commands from worker
+	// threads that haven't been fully processed when xrEndFrame reads the texture.
+	// Flush ensures all prior immediate-context commands are submitted to the GPU.
+	if (direction == XRT_BARRIER_TO_COMP && sc->c != nullptr) {
+		auto internals = get_internals(sc->c);
+		internals->context->Flush();
+	}
+
 	return XRT_SUCCESS;
 }
 
