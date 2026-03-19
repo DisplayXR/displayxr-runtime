@@ -1319,7 +1319,7 @@ oxr_session_locate_views(struct oxr_logger *log,
 					}
 					have_kooima_fov = true;
 
-					if (have_view_state && !sess->has_external_window && have_eyes) {
+					if (have_view_state && !sess->has_external_window) {
 						for (uint32_t ei = 0; ei < eye_count; ei++) {
 							view_eye_world[ei] = disp_views[ei].eye_world;
 						}
@@ -1357,15 +1357,10 @@ oxr_session_locate_views(struct oxr_logger *log,
 	}
 
 	// Always get view poses from device (provides T_xdev_head and poses[])
-	// Save Kooima fovs before xrt_device_get_view_poses overwrites them.
-	// Only override device FOVs when we have REAL eye tracking data
-	// (have_eyes). Without real eyes, the nominal fallback Kooima is less
-	// accurate than the device's own Kooima (which uses its own
-	// LookaroundFilter for eye tracking).
-	bool use_client_kooima = have_kooima_fov && have_view_state && have_eyes;
+	// Save Kooima fovs before xrt_device_get_view_poses overwrites them
 	{
 		struct xrt_fov kooima_fovs[XRT_MAX_VIEWS];
-		if (use_client_kooima) {
+		if (have_kooima_fov && have_view_state) {
 			for (uint32_t ei = 0; ei < view_count; ei++) {
 				kooima_fovs[ei] = fovs[ei];
 			}
@@ -1381,10 +1376,11 @@ oxr_session_locate_views(struct oxr_logger *log,
 		    poses);
 		OXR_CHECK_XRET(log, sess, xret, xrt_device_get_view_poses);
 
-		// Restore client-side Kooima FOVs only when we have real eye
-		// tracking from the compositor DP. Without real eyes (GL hosted
-		// or first frames), let the device's own Kooima FOVs pass through.
-		if (use_client_kooima) {
+		// Restore client-side Kooima FOVs only when the client has local
+		// stereo state (non-IPC mode). In IPC mode, the server already
+		// computes stereo-adjusted Kooima FOVs and returns them via
+		// get_view_poses — don't override those.
+		if (have_kooima_fov && have_view_state) {
 			for (uint32_t ei = 0; ei < view_count; ei++) {
 				fovs[ei] = kooima_fovs[ei];
 			}
