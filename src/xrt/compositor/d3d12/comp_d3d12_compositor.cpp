@@ -167,13 +167,6 @@ struct comp_d3d12_compositor
 	uint64_t last_frame_time_ns;
 	float smoothed_frame_time_ms;
 
-	//! Pending resize dimensions (0 = no pending resize).
-	uint32_t pending_resize_w;
-	uint32_t pending_resize_h;
-
-	//! Frames since dimensions last changed (for resize debounce).
-	uint32_t resize_stable_frames;
-
 	//! Thread safety.
 	std::mutex mutex;
 };
@@ -361,11 +354,12 @@ d3d12_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 
 	std::lock_guard<std::mutex> lock(c->mutex);
 
-	// Check for window resize — debounce to avoid gpu_wait_idle() stalls during drag.
-	// During continuous resizing (WM_SIZE every frame), record pending dimensions but
-	// defer the actual resize until dimensions are stable for 2 frames (~33ms at 60fps).
-	// DXGI stretches the old-size backbuffer during the drag — acceptable since the
-	// weaver keeps producing correct interlaced output, preserving the 3D effect.
+	// Check for window resize — resize immediately to keep backbuffer in sync.
+	// The GPU is already idle here: layer_commit() calls gpu_wait_idle() at
+	// the end of every frame, so no additional GPU drain is needed.
+	// Immediate resize is critical for 3D displays: the weaver outputs
+	// pixel-precise interlacing patterns, and any DXGI stretching (from a
+	// backbuffer/window size mismatch) destroys the interlacing.
 	if (c->hwnd != nullptr && c->target != nullptr) {
 		RECT rect;
 		if (GetClientRect(c->hwnd, &rect)) {
@@ -377,41 +371,15 @@ d3d12_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 				comp_d3d12_target_get_dimensions(c->target, &current_width, &current_height);
 
 				if (new_width != current_width || new_height != current_height) {
-					// Dimensions differ from target — check if still changing
-					if (new_width != c->pending_resize_w || new_height != c->pending_resize_h) {
-						// Dimensions changed again — reset debounce
-						c->pending_resize_w = new_width;
-						c->pending_resize_h = new_height;
-						c->resize_stable_frames = 0;
-					} else {
-						c->resize_stable_frames++;
+					U_LOG_I("Window resized: %ux%u -> %ux%u",
+					        current_width, current_height, new_width, new_height);
+
+					xrt_result_t xret =
+					    comp_d3d12_target_resize(c->target, new_width, new_height);
+					if (xret == XRT_SUCCESS) {
+						c->settings.preferred.width = new_width;
+						c->settings.preferred.height = new_height;
 					}
-
-					// Only resize once dimensions have been stable for 2 frames.
-					// This avoids per-frame gpu_wait_idle() stalls during window drag
-					// that break the LeiaSR 3D effect.
-					if (c->resize_stable_frames >= 2) {
-						U_LOG_I("Window resized: %ux%u -> %ux%u",
-						        current_width, current_height, new_width, new_height);
-
-						gpu_wait_idle(c);
-
-						xrt_result_t xret =
-						    comp_d3d12_target_resize(c->target, new_width, new_height);
-						if (xret == XRT_SUCCESS) {
-							c->settings.preferred.width = new_width;
-							c->settings.preferred.height = new_height;
-						}
-
-						c->pending_resize_w = 0;
-						c->pending_resize_h = 0;
-						c->resize_stable_frames = 0;
-					}
-				} else {
-					// Dimensions match target — clear any pending resize
-					c->pending_resize_w = 0;
-					c->pending_resize_h = 0;
-					c->resize_stable_frames = 0;
 				}
 			}
 		}
