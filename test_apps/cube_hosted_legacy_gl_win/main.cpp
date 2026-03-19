@@ -2,10 +2,15 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  SR Cube OpenXR GL - Legacy hosted mode (no XR_EXT_display_info)
+ * @brief  SR Cube OpenXR - Legacy hosted mode with OpenGL (no XR_EXT_display_info)
  *
- * This application demonstrates OpenXR with OpenGL without the XR_EXT_win32_window_binding
- * extension. DisplayXR will create its own window for rendering.
+ * Legacy variant: does NOT enable XR_EXT_display_info.
+ * Uses recommendedImageRectWidth * 2 (compromise scaling).
+ * Only V toggle (2D/3D) works — no 1/2/3 mode switching.
+ *
+ * Creates a hidden dummy window + GL context to satisfy the OpenXR GL binding
+ * requirement. DisplayXR creates its own presentation window via the GL
+ * compositor's own_window path.
  *
  * Input is handled by DisplayXR's qwerty driver:
  * - WASD: Move camera
@@ -17,12 +22,11 @@
 #define UNICODE
 #define _UNICODE
 #include <windows.h>
-#include <wingdi.h>
 
 #include "logging.h"
-#include "xr_session.h"
-#include "gl_functions.h"
 #include "gl_renderer.h"
+#include "gl_functions.h"
+#include "xr_session.h"
 
 #include <chrono>
 #include <vector>
@@ -62,41 +66,43 @@ static void UpdatePerformanceStats(PerformanceStats& stats) {
     }
 }
 
-// Hidden dummy window class for WGL context creation
-static const wchar_t* DUMMY_WINDOW_CLASS = L"SRCubeGLDummyClass";
-
+// Dummy window proc for the hidden GL context window
 static LRESULT CALLBACK DummyWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
-// Create a hidden dummy window + WGL core profile 3.3 context
-static bool CreateDummyOpenGLContext(HINSTANCE hInstance, HWND& hwnd, HDC& hDC, HGLRC& hGLRC) {
+// Create hidden dummy window with GL context (temp legacy → core profile 3.3)
+static HWND CreateDummyWindow(HINSTANCE hInstance) {
     WNDCLASSEX wc = {};
     wc.cbSize = sizeof(WNDCLASSEX);
     wc.style = CS_OWNDC;
     wc.lpfnWndProc = DummyWindowProc;
     wc.hInstance = hInstance;
-    wc.lpszClassName = DUMMY_WINDOW_CLASS;
+    wc.lpszClassName = L"DummyGLContextClass";
 
+    DWORD err = 0;
     if (!RegisterClassEx(&wc)) {
-        DWORD err = GetLastError();
+        err = GetLastError();
         if (err != ERROR_CLASS_ALREADY_EXISTS) {
             LOG_ERROR("Failed to register dummy window class, error: %lu", err);
-            return false;
+            return nullptr;
         }
     }
 
-    hwnd = CreateWindowEx(0, DUMMY_WINDOW_CLASS, L"DummyGL", 0,
-        0, 0, 1, 1, nullptr, nullptr, hInstance, nullptr);
+    HWND hwnd = CreateWindowEx(0, L"DummyGLContextClass", L"DummyGL",
+        0, 0, 0, 1, 1, nullptr, nullptr, hInstance, nullptr);
     if (!hwnd) {
         LOG_ERROR("Failed to create dummy window, error: %lu", GetLastError());
-        return false;
+        return nullptr;
     }
 
+    return hwnd;
+}
+
+static bool CreateOpenGLContext(HWND hwnd, HDC& hDC, HGLRC& hGLRC) {
     hDC = GetDC(hwnd);
     if (!hDC) {
-        LOG_ERROR("GetDC failed on dummy window");
-        DestroyWindow(hwnd);
+        LOG_ERROR("GetDC failed");
         return false;
     }
 
@@ -113,15 +119,11 @@ static bool CreateDummyOpenGLContext(HINSTANCE hInstance, HWND& hwnd, HDC& hDC, 
     int pixelFormat = ChoosePixelFormat(hDC, &pfd);
     if (!pixelFormat) {
         LOG_ERROR("ChoosePixelFormat failed");
-        ReleaseDC(hwnd, hDC);
-        DestroyWindow(hwnd);
         return false;
     }
 
     if (!SetPixelFormat(hDC, pixelFormat, &pfd)) {
         LOG_ERROR("SetPixelFormat failed");
-        ReleaseDC(hwnd, hDC);
-        DestroyWindow(hwnd);
         return false;
     }
 
@@ -129,30 +131,23 @@ static bool CreateDummyOpenGLContext(HINSTANCE hInstance, HWND& hwnd, HDC& hDC, 
     HGLRC tempRC = wglCreateContext(hDC);
     if (!tempRC) {
         LOG_ERROR("wglCreateContext (temp) failed");
-        ReleaseDC(hwnd, hDC);
-        DestroyWindow(hwnd);
         return false;
     }
 
     if (!wglMakeCurrent(hDC, tempRC)) {
         LOG_ERROR("wglMakeCurrent (temp) failed");
         wglDeleteContext(tempRC);
-        ReleaseDC(hwnd, hDC);
-        DestroyWindow(hwnd);
         return false;
     }
 
     // Load wglCreateContextAttribsARB
-    typedef HGLRC(APIENTRY* PFNWGLCREATECONTEXTATTRIBSARBPROC_LOCAL)(HDC hDC, HGLRC hShareContext, const int* attribList);
-    PFNWGLCREATECONTEXTATTRIBSARBPROC_LOCAL wglCreateContextAttribsARB =
-        (PFNWGLCREATECONTEXTATTRIBSARBPROC_LOCAL)wglGetProcAddress("wglCreateContextAttribsARB");
+    PFNWGLCREATECONTEXTATTRIBSARBPROC wglCreateContextAttribsARB =
+        (PFNWGLCREATECONTEXTATTRIBSARBPROC)wglGetProcAddress("wglCreateContextAttribsARB");
 
     if (!wglCreateContextAttribsARB) {
         LOG_ERROR("wglCreateContextAttribsARB not available");
         wglMakeCurrent(nullptr, nullptr);
         wglDeleteContext(tempRC);
-        ReleaseDC(hwnd, hDC);
-        DestroyWindow(hwnd);
         return false;
     }
 
@@ -171,8 +166,6 @@ static bool CreateDummyOpenGLContext(HINSTANCE hInstance, HWND& hwnd, HDC& hDC, 
 
     if (!hGLRC) {
         LOG_ERROR("wglCreateContextAttribsARB failed");
-        ReleaseDC(hwnd, hDC);
-        DestroyWindow(hwnd);
         return false;
     }
 
@@ -180,8 +173,6 @@ static bool CreateDummyOpenGLContext(HINSTANCE hInstance, HWND& hwnd, HDC& hDC, 
         LOG_ERROR("wglMakeCurrent (core profile) failed");
         wglDeleteContext(hGLRC);
         hGLRC = nullptr;
-        ReleaseDC(hwnd, hDC);
-        DestroyWindow(hwnd);
         return false;
     }
 
@@ -207,7 +198,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         MessageBox(nullptr, L"Failed to initialize logging", L"Warning", MB_OK | MB_ICONWARNING);
     }
 
-    LOG_INFO("=== SR Cube OpenXR GL Application ===");
+    LOG_INFO("=== SR Cube OpenXR Legacy GL Application ===");
     LOG_INFO("OpenXR standard mode (DisplayXR creates window)");
     LOG_INFO("Input handled by DisplayXR's qwerty driver");
 
@@ -225,13 +216,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         }
     }
 
-    // Create hidden dummy window + WGL context for OpenGL init
-    HWND dummyHwnd = nullptr;
+    // Create hidden dummy window for GL context
+    LOG_INFO("Creating dummy window for GL context...");
+    HWND dummyHwnd = CreateDummyWindow(hInstance);
+    if (!dummyHwnd) {
+        LOG_ERROR("Failed to create dummy window");
+        ShutdownLogging();
+        return 1;
+    }
+
+    // Create OpenGL context (temp → core profile 3.3)
     HDC hDC = nullptr;
     HGLRC hGLRC = nullptr;
-    if (!CreateDummyOpenGLContext(hInstance, dummyHwnd, hDC, hGLRC)) {
+    if (!CreateOpenGLContext(dummyHwnd, hDC, hGLRC)) {
         LOG_ERROR("OpenGL context creation failed");
-        MessageBox(nullptr, L"Failed to create OpenGL context", L"Error", MB_OK | MB_ICONERROR);
+        DestroyWindow(dummyHwnd);
         ShutdownLogging();
         return 1;
     }
@@ -241,7 +240,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         LOG_ERROR("Failed to load GL function pointers");
         wglMakeCurrent(nullptr, nullptr);
         wglDeleteContext(hGLRC);
-        ReleaseDC(dummyHwnd, hDC);
         DestroyWindow(dummyHwnd);
         ShutdownLogging();
         return 1;
@@ -255,7 +253,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         MessageBox(nullptr, L"Failed to initialize OpenXR", L"Error", MB_OK | MB_ICONERROR);
         wglMakeCurrent(nullptr, nullptr);
         wglDeleteContext(hGLRC);
-        ReleaseDC(dummyHwnd, hDC);
         DestroyWindow(dummyHwnd);
         ShutdownLogging();
         return 1;
@@ -267,7 +264,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         CleanupOpenXR(xr);
         wglMakeCurrent(nullptr, nullptr);
         wglDeleteContext(hGLRC);
-        ReleaseDC(dummyHwnd, hDC);
         DestroyWindow(dummyHwnd);
         ShutdownLogging();
         return 1;
@@ -281,7 +277,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         CleanupOpenXR(xr);
         wglMakeCurrent(nullptr, nullptr);
         wglDeleteContext(hGLRC);
-        ReleaseDC(dummyHwnd, hDC);
         DestroyWindow(dummyHwnd);
         ShutdownLogging();
         return 1;
@@ -293,7 +288,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         CleanupOpenXR(xr);
         wglMakeCurrent(nullptr, nullptr);
         wglDeleteContext(hGLRC);
-        ReleaseDC(dummyHwnd, hDC);
         DestroyWindow(dummyHwnd);
         ShutdownLogging();
         return 1;
@@ -305,7 +299,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         CleanupOpenXR(xr);
         wglMakeCurrent(nullptr, nullptr);
         wglDeleteContext(hGLRC);
-        ReleaseDC(dummyHwnd, hDC);
         DestroyWindow(dummyHwnd);
         ShutdownLogging();
         return 1;
@@ -321,14 +314,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         LOG_INFO("Enumerated %u OpenGL swapchain images", count);
     }
 
-    // Initialize GL renderer (shaders, geometry)
+    // Initialize GL renderer (shaders, geometry, textures)
     GLRenderer glRenderer = {};
     if (!InitializeGLRenderer(glRenderer)) {
         LOG_ERROR("GL renderer initialization failed");
         CleanupOpenXR(xr);
         wglMakeCurrent(nullptr, nullptr);
         wglDeleteContext(hGLRC);
-        ReleaseDC(dummyHwnd, hDC);
         DestroyWindow(dummyHwnd);
         ShutdownLogging();
         return 1;
@@ -349,7 +341,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             CleanupOpenXR(xr);
             wglMakeCurrent(nullptr, nullptr);
             wglDeleteContext(hGLRC);
-            ReleaseDC(dummyHwnd, hDC);
             DestroyWindow(dummyHwnd);
             ShutdownLogging();
             return 1;
@@ -366,7 +357,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     LOG_INFO("Controls: WASD=Move, QE=Up/Down, Mouse=Look, ESC=Quit");
     LOG_INFO("");
 
-    // Main loop - no window, just process OpenXR frames
+    // Main loop - no visible window, just process OpenXR frames
     // Exit when OpenXR session ends (user closes DisplayXR window or presses ESC)
     while (g_running && !xr.exitRequested) {
         // Update performance stats
@@ -420,40 +411,28 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
                         uint32_t imageIndex;
                         if (AcquireSwapchainImage(xr, imageIndex)) {
+                            // Clear entire FBO once before eye loop
+                            glBindFramebuffer_(GL_FRAMEBUFFER, glRenderer.fbos[imageIndex]);
+                            glClearColor(0.05f, 0.05f, 0.25f, 1.0f);
+                            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+                            glBindFramebuffer_(GL_FRAMEBUFFER, 0);
+
                             for (uint32_t eye = 0; eye < modeViewCount; eye++) {
                                 uint32_t tileX = eye % tileColumns;
                                 uint32_t tileY = eye / tileColumns;
 
+                                uint32_t vpX = tileX * tileW;
+                                uint32_t vpY = tileY * tileH;
+
                                 XMMATRIX viewMatrix = xr.viewMatrices[eye];
                                 XMMATRIX projMatrix = xr.projMatrices[eye];
 
-                                // Hosted legacy app: place cube at eye level, 2m in front
-                                // (matching D3D11 hosted app positioning)
+                                // Non-ext app: 0.3m cube at z=-2m, no zoom control
                                 RenderScene(glRenderer, imageIndex,
-                                    tileX * tileW, tileY * tileH,
+                                    vpX, vpY,
                                     tileW, tileH,
                                     viewMatrix, projMatrix,
                                     1.0f, 1.6f, -2.0f, 0.3f);
-
-                                // One-shot: log stereo — raw eye pos vs view matrix
-                                {
-                                    static int stereo_log = 0;
-                                    if (stereo_log < 4) {
-                                        XMFLOAT4X4 vm, pm;
-                                        XMStoreFloat4x4(&vm, viewMatrix);
-                                        XMStoreFloat4x4(&pm, projMatrix);
-                                        LOG_INFO("STEREO eye=%u rawEye=(%.4f,%.4f,%.4f) "
-                                                 "viewRow3=(%.6f,%.6f,%.6f) proj31=%.6f "
-                                                 "fov=(%.4f,%.4f,%.4f,%.4f)",
-                                                 eye,
-                                                 xr.eyePositions[eye][0], xr.eyePositions[eye][1], xr.eyePositions[eye][2],
-                                                 vm._41, vm._42, vm._43,
-                                                 pm._31,
-                                                 rawViews[eye].fov.angleLeft, rawViews[eye].fov.angleRight,
-                                                 rawViews[eye].fov.angleUp, rawViews[eye].fov.angleDown);
-                                        stereo_log++;
-                                    }
-                                }
 
                                 // Set up projection view for this eye
                                 projectionViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
@@ -495,7 +474,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     wglDeleteContext(hGLRC);
     ReleaseDC(dummyHwnd, hDC);
     DestroyWindow(dummyHwnd);
-    UnregisterClass(DUMMY_WINDOW_CLASS, hInstance);
 
     LOG_INFO("Application shutdown complete");
     ShutdownLogging();

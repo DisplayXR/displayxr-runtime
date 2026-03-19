@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  OpenXR session management for OpenGL (legacy mode — no XR_EXT_display_info)
+ * @brief  OpenXR session management (legacy mode — no XR_EXT_display_info, OpenGL)
  *
  * This is the legacy variant: does NOT enable XR_EXT_display_info.
  * Swapchain uses recommendedImageRectWidth * 2 (compromise scaling).
@@ -103,7 +103,7 @@ bool InitializeOpenXR(XrSessionManager& xr) {
 
     LOG_INFO("Creating OpenXR instance...");
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
-    strcpy_s(createInfo.applicationInfo.applicationName, "SRCubeGL_Legacy");
+    strcpy_s(createInfo.applicationInfo.applicationName, "SRCubeOpenXR_LegacyGL");
     createInfo.applicationInfo.applicationVersion = 1;
     strcpy_s(createInfo.applicationInfo.engineName, "None");
     createInfo.applicationInfo.engineVersion = 0;
@@ -147,14 +147,13 @@ bool InitializeOpenXR(XrSessionManager& xr) {
             view.maxImageRectWidth, view.maxImageRectHeight);
     }
 
-    LOG_INFO("OpenXR initialization complete (legacy mode)");
+    LOG_INFO("OpenXR initialization complete (legacy GL mode)");
     return true;
 }
 
 bool CreateSession(XrSessionManager& xr, HDC hDC, HGLRC hGLRC) {
-    LOG_INFO("Creating OpenXR session (legacy, DisplayXR creates window)...");
-    LOG_INFO("  HDC: 0x%p", hDC);
-    LOG_INFO("  HGLRC: 0x%p", hGLRC);
+    LOG_INFO("Creating OpenXR session (legacy GL, DisplayXR creates window)...");
+    LOG_INFO("  HDC: 0x%p, HGLRC: 0x%p", hDC, hGLRC);
 
     XrGraphicsBindingOpenGLWin32KHR glBinding = {XR_TYPE_GRAPHICS_BINDING_OPENGL_WIN32_KHR};
     glBinding.hDC = hDC;

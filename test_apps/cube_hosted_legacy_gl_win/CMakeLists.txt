@@ -7,6 +7,7 @@ project(cube_hosted_legacy_gl_win LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Use static CRT to avoid requiring VC++ redistributable
 if(MSVC)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
@@ -17,16 +18,21 @@ set(OPENXR_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/../../src/external/openxr_includes")
 # Find OpenXR loader - multiple strategies
 set(OPENXR_FOUND FALSE)
 
+# Strategy 1: find_package
 find_package(OpenXR QUIET CONFIG)
 if(OpenXR_FOUND)
     set(OPENXR_FOUND TRUE)
     message(STATUS "Found OpenXR via find_package")
 endif()
 
+# Strategy 2: Look in OpenXR_ROOT
 if(NOT OPENXR_FOUND AND DEFINED OpenXR_ROOT)
     find_library(OPENXR_LOADER_LIB
         NAMES openxr_loader openxr_loader-1_0
-        PATHS "${OpenXR_ROOT}/x64/lib" "${OpenXR_ROOT}/lib" "${OpenXR_ROOT}/bin"
+        PATHS
+            "${OpenXR_ROOT}/x64/lib"
+            "${OpenXR_ROOT}/lib"
+            "${OpenXR_ROOT}/bin"
         NO_DEFAULT_PATH
     )
     if(OPENXR_LOADER_LIB)
@@ -34,7 +40,9 @@ if(NOT OPENXR_FOUND AND DEFINED OpenXR_ROOT)
         add_library(OpenXR::openxr_loader SHARED IMPORTED)
         find_file(OPENXR_LOADER_DLL
             NAMES openxr_loader.dll openxr_loader-1_0.dll
-            PATHS "${OpenXR_ROOT}/x64/bin" "${OpenXR_ROOT}/bin"
+            PATHS
+                "${OpenXR_ROOT}/x64/bin"
+                "${OpenXR_ROOT}/bin"
             NO_DEFAULT_PATH
         )
         if(OPENXR_LOADER_DLL)
@@ -50,6 +58,7 @@ if(NOT OPENXR_FOUND AND DEFINED OpenXR_ROOT)
     endif()
 endif()
 
+# Strategy 3: Look in parent build directory
 if(NOT OPENXR_FOUND)
     set(PARENT_BUILD_DIR "${CMAKE_SOURCE_DIR}/../../build")
     if(EXISTS "${PARENT_BUILD_DIR}/src/external/openxr_loader/OpenXRConfig.cmake")
@@ -60,27 +69,29 @@ if(NOT OPENXR_FOUND)
 endif()
 
 if(NOT OPENXR_FOUND)
-    message(FATAL_ERROR "OpenXR not found.")
+    message(FATAL_ERROR "OpenXR not found. Options:\n"
+        "  1. Install OpenXR SDK\n"
+        "  2. Build the parent project first\n"
+        "  3. Set OpenXR_ROOT to point to directory containing openxr_loader")
 endif()
 
-# Common base library (API-agnostic)
+# Common base library (API-agnostic, no D3D11)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../common ${CMAKE_CURRENT_BINARY_DIR}/common)
 
+# Create executable
 add_executable(cube_hosted_legacy_gl_win WIN32
     main.cpp
     xr_session.cpp
     xr_session.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_handle_gl_win/gl_renderer.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_handle_gl_win/gl_renderer.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_handle_gl_win/gl_functions.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_handle_gl_win/gl_functions.h
+    gl_renderer.cpp
+    gl_renderer.h
+    gl_functions.cpp
+    gl_functions.h
     sr_cube_openxr.manifest
     resource.rc
 )
 
-target_include_directories(cube_hosted_legacy_gl_win PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../cube_handle_gl_win
-)
+# OpenXR include dir is provided by sr_common_base PUBLIC include directories
 
 target_link_libraries(cube_hosted_legacy_gl_win PRIVATE
     sr_common_base
@@ -88,12 +99,14 @@ target_link_libraries(cube_hosted_legacy_gl_win PRIVATE
     opengl32
 )
 
+# Embed manifest
 if(MSVC)
     set_target_properties(cube_hosted_legacy_gl_win PROPERTIES
         LINK_FLAGS "/MANIFEST:EMBED /MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/sr_cube_openxr.manifest"
     )
 endif()
 
+# Copy runtime DLLs
 if(TARGET OpenXR::openxr_loader)
     get_target_property(_loader_location OpenXR::openxr_loader IMPORTED_LOCATION)
     if(_loader_location)
@@ -115,5 +128,3 @@ if(TEXTURE_FILES)
         COMMENT "Copying texture files to build output"
     )
 endif()
-
-
