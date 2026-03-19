@@ -1150,6 +1150,22 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			glUniform1i(loc_tex, 0);
 			glUniform4f(loc_rect, nr.x, nr.y, nr.w, nr.h);
 
+			// One-shot diagnostic: log blit params for both eyes
+			{
+				static int blit_log = 0;
+				if (blit_log < 4) {
+					U_LOG_W("GL BLIT eye=%u tex=%u img=%u nr=(%.3f,%.3f,%.3f,%.3f) "
+					        "vp=(%u,%u,%u,%u) view_count=%u hw3d=%d",
+					        eye, gsc->textures[img_idx], img_idx,
+					        nr.x, nr.y, nr.w, nr.h,
+					        eye % c->tile_columns * c->view_width,
+					        eye / c->tile_columns * c->view_height,
+					        c->view_width, c->view_height,
+					        view_count, c->hardware_display_3d);
+					blit_log++;
+				}
+			}
+
 			// Draw fullscreen quad (3 vertices, generated in vertex shader)
 			glDrawArrays(GL_TRIANGLES, 0, 3);
 		}

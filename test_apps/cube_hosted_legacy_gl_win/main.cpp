@@ -435,6 +435,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                                     viewMatrix, projMatrix,
                                     1.0f, 1.6f, -2.0f, 0.3f);
 
+                                // One-shot: log stereo separation
+                                {
+                                    static int stereo_log = 0;
+                                    if (stereo_log < 4) {
+                                        XMFLOAT4X4 vm;
+                                        XMStoreFloat4x4(&vm, viewMatrix);
+                                        LOG_INFO("STEREO eye=%u viewX=%.6f tile=(%u,%u)+(%u,%u) rect=(%d,%d)+(%d,%d)",
+                                                 eye, vm._41, tileX, tileY, tileW, tileH,
+                                                 (int)(tileX * tileW), (int)(tileY * tileH),
+                                                 (int)tileW, (int)tileH);
+                                        stereo_log++;
+                                    }
+                                }
+
                                 // Set up projection view for this eye
                                 projectionViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
                                 projectionViews[eye].subImage.swapchain = xr.swapchain.swapchain;
