@@ -1067,10 +1067,48 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		uint32_t target_width, target_height;
 		comp_d3d11_target_get_dimensions(c->target, &target_width, &target_height);
 
+		// Diagnostic: log DP pipeline state (issue #91 round 2)
+		{
+			static uint32_t dp_diag = 0;
+			if (dp_diag < 3) {
+				dp_diag++;
+				U_LOG_W("[diag#91] dp path %u/3: zero_copy=%d atlas_srv=%p "
+				        "view=%ux%u tiles=%ux%u target=%ux%u",
+				        dp_diag, (int)zero_copy, atlas_srv,
+				        view_width, view_height,
+				        tile_columns, tile_rows,
+				        target_width, target_height);
+			}
+		}
+
 		xrt_display_processor_d3d11_process_atlas(
 		    c->display_processor, c->context, atlas_srv, view_width, view_height,
 		    tile_columns, tile_rows, DXGI_FORMAT_R8G8B8A8_UNORM, target_width, target_height);
 		weaving_done = true;
+
+		// Diagnostic: after DP, clear target to magenta to test if target present works.
+		// If magenta is visible on screen, the target pipeline works but the weaver
+		// didn't write to the target RTV. If still black, the target present itself is broken.
+		{
+			static uint32_t color_test = 0;
+			if (color_test < 120) {  // ~2 seconds at 60fps
+				color_test++;
+				// Re-bind target in case the weaver changed it
+				comp_d3d11_target_bind(c->target);
+				float magenta[4] = {1.0f, 0.0f, 1.0f, 1.0f};
+				ID3D11RenderTargetView *bound_rtv = nullptr;
+				c->context->OMGetRenderTargets(1, &bound_rtv, nullptr);
+				if (bound_rtv != nullptr) {
+					c->context->ClearRenderTargetView(bound_rtv, magenta);
+					bound_rtv->Release();
+					if (color_test == 1) {
+						U_LOG_W("[diag#91] magenta test: clearing target RTV for %u frames", 120u);
+					}
+				} else if (color_test == 1) {
+					U_LOG_W("[diag#91] magenta test: NO RTV bound after target_bind!");
+				}
+			}
+		}
 	}
 
 	// HUD overlay (post-processing, always readable)

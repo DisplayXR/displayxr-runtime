@@ -318,6 +318,25 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 	}
 
 do_weave:
+	// Diagnostic: log weaver state (issue #91 round 2)
+	{
+		static uint32_t weave_diag = 0;
+		if (weave_diag < 3) {
+			weave_diag++;
+			// Check what RTV is currently bound
+			ID3D11RenderTargetView *cur_rtv = NULL;
+			ctx->OMGetRenderTargets(1, &cur_rtv, NULL);
+			U_LOG_W("[diag#91] weave %u/3: needs_staging=%d weaver_srv=%p "
+			        "view=%ux%u target=%ux%u bound_rtv=%p",
+			        weave_diag, (int)needs_staging, weaver_srv,
+			        view_width, view_height,
+			        target_width, target_height, (void *)cur_rtv);
+			if (cur_rtv != NULL) {
+				cur_rtv->Release();
+			}
+		}
+	}
+
 	// Set input texture for weaving
 	leiasr_d3d11_set_input_texture(ldp->leiasr, weaver_srv, view_width, view_height, format);
 
@@ -333,6 +352,21 @@ do_weave:
 
 	// Perform weaving to the currently bound render target
 	leiasr_d3d11_weave(ldp->leiasr);
+
+	// Diagnostic: check if the weaver changed the bound RTV
+	{
+		static uint32_t post_diag = 0;
+		if (post_diag < 3) {
+			post_diag++;
+			ID3D11RenderTargetView *post_rtv = NULL;
+			ctx->OMGetRenderTargets(1, &post_rtv, NULL);
+			U_LOG_W("[diag#91] post-weave %u/3: bound_rtv=%p (did weaver change it?)",
+			        post_diag, (void *)post_rtv);
+			if (post_rtv != NULL) {
+				post_rtv->Release();
+			}
+		}
+	}
 }
 
 static bool
