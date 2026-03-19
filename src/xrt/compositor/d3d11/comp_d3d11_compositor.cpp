@@ -1081,26 +1081,36 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			}
 		}
 
-		// DIAGNOSTIC (issue #91): clear atlas to RED right before DP reads it.
-		// If we see red → SRV correctly reads the atlas. Black → SRV is wrong.
+		// DIAGNOSTIC (issue #91): clear atlas via renderer's OWN RTV to cyan,
+		// then via temp RTV from atlas_texture to red (half the target).
+		// Cyan visible = renderer's RTV works. Red only = RTV/SRV texture mismatch.
 		{
-			ID3D11Texture2D *atlas_tex = static_cast<ID3D11Texture2D *>(
-			    comp_d3d11_renderer_get_atlas_texture(c->renderer));
-			if (atlas_tex != nullptr) {
-				ID3D11RenderTargetView *temp_rtv = nullptr;
-				HRESULT hr = c->device->CreateRenderTargetView(atlas_tex, nullptr, &temp_rtv);
-				if (SUCCEEDED(hr) && temp_rtv != nullptr) {
-					float red[4] = {1.0f, 0.0f, 0.0f, 1.0f};
-					c->context->ClearRenderTargetView(temp_rtv, red);
-					temp_rtv->Release();
-					// Re-bind target RTV after clearing atlas
-					comp_d3d11_target_bind(c->target);
-					static bool red_logged = false;
-					if (!red_logged) {
-						red_logged = true;
-						U_LOG_W("[diag#91] cleared atlas to RED before DP read");
-					}
+			// First: clear via renderer's atlas_rtv to CYAN
+			ID3D11RenderTargetView *renderer_rtv = static_cast<ID3D11RenderTargetView *>(
+			    comp_d3d11_renderer_get_atlas_rtv(c->renderer));
+			if (renderer_rtv != nullptr) {
+				float cyan[4] = {0.0f, 1.0f, 1.0f, 1.0f};
+				c->context->ClearRenderTargetView(renderer_rtv, cyan);
+			}
+			// Re-bind target RTV
+			comp_d3d11_target_bind(c->target);
+			static bool rtv_logged = false;
+			if (!rtv_logged) {
+				rtv_logged = true;
+				// Compare underlying resources
+				ID3D11Resource *rtv_res = nullptr;
+				ID3D11Resource *srv_res = nullptr;
+				if (renderer_rtv != nullptr) {
+					renderer_rtv->GetResource(&rtv_res);
 				}
+				ID3D11ShaderResourceView *srv = static_cast<ID3D11ShaderResourceView *>(atlas_srv);
+				if (srv != nullptr) {
+					srv->GetResource(&srv_res);
+				}
+				U_LOG_W("[diag#91] atlas resource check: rtv_resource=%p srv_resource=%p match=%d",
+				        (void *)rtv_res, (void *)srv_res, (rtv_res == srv_res));
+				if (rtv_res) rtv_res->Release();
+				if (srv_res) srv_res->Release();
 			}
 		}
 

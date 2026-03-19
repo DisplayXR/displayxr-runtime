@@ -1154,6 +1154,12 @@ comp_d3d11_renderer_get_atlas_srv(struct comp_d3d11_renderer *renderer)
 	return renderer->atlas_srv;
 }
 
+extern "C" void *
+comp_d3d11_renderer_get_atlas_rtv(struct comp_d3d11_renderer *renderer)
+{
+	return renderer->atlas_rtv;
+}
+
 extern "C" void
 comp_d3d11_renderer_get_view_dimensions(struct comp_d3d11_renderer *renderer,
                                         uint32_t *out_view_width,

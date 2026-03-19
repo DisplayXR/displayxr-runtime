@@ -96,6 +96,13 @@ void *
 comp_d3d11_renderer_get_atlas_srv(struct comp_d3d11_renderer *renderer);
 
 /*!
+ * Get the atlas render target view (ID3D11RenderTargetView*).
+ * @ingroup comp_d3d11
+ */
+void *
+comp_d3d11_renderer_get_atlas_rtv(struct comp_d3d11_renderer *renderer);
+
+/*!
  * Get stereo texture dimensions.
  *
  * @param renderer The renderer.
