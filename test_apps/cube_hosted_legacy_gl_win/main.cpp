@@ -321,21 +321,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         LOG_INFO("Enumerated %u OpenGL swapchain images", count);
     }
 
-    // DIAGNOSTIC + FIX: ensure app's GL context is current before creating
-    // GL resources (VAOs, shaders, etc.). The compositor may have left its own
-    // context current after xrCreateSession/xrCreateSwapchain.
-    {
-        HGLRC curCtx = wglGetCurrentContext();
-        HDC curDC = wglGetCurrentDC();
-        LOG_INFO("PRE-INIT GL context: cur=%p (app=%p) dc=%p (app=%p) %s",
-                 (void*)curCtx, (void*)hGLRC, (void*)curDC, (void*)hDC,
-                 (curCtx == hGLRC) ? "MATCH" : "MISMATCH - forcing restore!");
-        if (curCtx != hGLRC) {
-            wglMakeCurrent(hDC, hGLRC);
-            LOG_INFO("Restored app GL context: %p on dc %p", (void*)hGLRC, (void*)hDC);
-        }
-    }
-
     // Initialize GL renderer (shaders, geometry)
     GLRenderer glRenderer = {};
     if (!InitializeGLRenderer(glRenderer)) {
@@ -442,155 +427,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                                 XMMATRIX viewMatrix = xr.viewMatrices[eye];
                                 XMMATRIX projMatrix = xr.projMatrices[eye];
 
-                                // DIAGNOSTIC: log matrices and FOV for first frame
-                                if (eye == 0) {
-                                    static int mat_log = 0;
-                                    if (mat_log < 3) {
-                                        XMFLOAT4X4 vm, pm;
-                                        XMStoreFloat4x4(&vm, viewMatrix);
-                                        XMStoreFloat4x4(&pm, projMatrix);
-                                        LOG_INFO("DIAG-MAT[%d] VIEW row0=(%.4f,%.4f,%.4f,%.4f) row3=(%.4f,%.4f,%.4f,%.4f)",
-                                                 mat_log, vm._11, vm._12, vm._13, vm._14, vm._41, vm._42, vm._43, vm._44);
-                                        LOG_INFO("DIAG-MAT[%d] PROJ row0=(%.4f,%.4f,%.4f,%.4f) row1=(%.4f,%.4f,%.4f,%.4f)",
-                                                 mat_log, pm._11, pm._12, pm._13, pm._14, pm._21, pm._22, pm._23, pm._24);
-                                        LOG_INFO("DIAG-MAT[%d] PROJ row2=(%.4f,%.4f,%.4f,%.4f) row3=(%.4f,%.4f,%.4f,%.4f)",
-                                                 mat_log, pm._31, pm._32, pm._33, pm._34, pm._41, pm._42, pm._43, pm._44);
-                                        XrView rawView = {XR_TYPE_VIEW};
-                                        // Also log the FOV from xrLocateViews
-                                        LOG_INFO("DIAG-MAT[%d] tile=%ux%u fov=(L=%.3f R=%.3f U=%.3f D=%.3f)",
-                                                 mat_log, tileW, tileH,
-                                                 xr.configViews[0].recommendedImageRectWidth > 0 ? 0.0f : 0.0f,
-                                                 0.0f, 0.0f, 0.0f); // placeholder - real FOV logged via proj matrix
-                                        mat_log++;
-                                    }
-                                }
-
-                                // Non-ext app: render with default zoom (1.0)
+                                // Hosted legacy app: place cube at eye level, 2m in front
+                                // (matching D3D11 hosted app positioning)
                                 RenderScene(glRenderer, imageIndex,
                                     tileX * tileW, tileY * tileH,
                                     tileW, tileH,
                                     viewMatrix, projMatrix,
-                                    1.0f);
-
-                                // DIAGNOSTIC: minimal inline triangle draw test
-                                // Bypasses gl_renderer entirely — own shader + VAO
-                                if (eye == 0) {
-                                    static GLuint diag_prog = 0, diag_vao = 0;
-                                    static bool diag_init = false;
-                                    static int diag_frame = 0;
-                                    if (!diag_init) {
-                                        // Compile minimal shader
-                                        const char* dvs =
-                                            "#version 330 core\n"
-                                            "void main() {\n"
-                                            "  vec2 p[3] = vec2[](vec2(-0.8,-0.8), vec2(0.8,-0.8), vec2(0.0,0.8));\n"
-                                            "  gl_Position = vec4(p[gl_VertexID], 0.0, 1.0);\n"
-                                            "}\n";
-                                        const char* dfs =
-                                            "#version 330 core\n"
-                                            "out vec4 fragColor;\n"
-                                            "void main() { fragColor = vec4(1.0, 0.0, 0.0, 1.0); }\n";
-                                        GLuint vs = glCreateShader_(GL_VERTEX_SHADER);
-                                        glShaderSource_(vs, 1, &dvs, NULL);
-                                        glCompileShader_(vs);
-                                        GLint ok = 0;
-                                        glGetShaderiv_(vs, GL_COMPILE_STATUS, &ok);
-                                        LOG_INFO("DIAG-DRAW: VS compile=%d", ok);
-                                        GLuint fs = glCreateShader_(GL_FRAGMENT_SHADER);
-                                        glShaderSource_(fs, 1, &dfs, NULL);
-                                        glCompileShader_(fs);
-                                        glGetShaderiv_(fs, GL_COMPILE_STATUS, &ok);
-                                        LOG_INFO("DIAG-DRAW: FS compile=%d", ok);
-                                        diag_prog = glCreateProgram_();
-                                        glAttachShader_(diag_prog, vs);
-                                        glAttachShader_(diag_prog, fs);
-                                        glLinkProgram_(diag_prog);
-                                        glGetProgramiv_(diag_prog, GL_LINK_STATUS, &ok);
-                                        LOG_INFO("DIAG-DRAW: program link=%d prog=%u", ok, diag_prog);
-                                        glDeleteShader_(vs);
-                                        glDeleteShader_(fs);
-                                        glGenVertexArrays_(1, &diag_vao);
-                                        LOG_INFO("DIAG-DRAW: vao=%u err=0x%x", diag_vao, glGetError());
-                                        diag_init = true;
-                                    }
-                                    if (diag_frame < 60 && diag_prog && diag_vao) {
-                                        glBindFramebuffer_(GL_FRAMEBUFFER, glRenderer.fbos[imageIndex]);
-                                        glViewport(tileX * tileW, tileY * tileH, tileW, tileH);
-                                        glDisable(GL_DEPTH_TEST);
-                                        glDisable(GL_SCISSOR_TEST);
-                                        glDisable(GL_CULL_FACE);
-
-                                        if (diag_frame < 5) {
-                                            // Test A: inline shader + inline VAO (known working)
-                                            glUseProgram_(diag_prog);
-                                            glBindVertexArray_(diag_vao);
-                                            glDrawArrays(GL_TRIANGLES, 0, 3);
-                                            uint8_t pxA[4] = {0};
-                                            glReadPixels(tileW/2, tileH/2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pxA);
-
-                                            // Clear back to blue for next test
-                                            glClearColor(0.05f, 0.05f, 0.25f, 1.0f);
-                                            glClear(GL_COLOR_BUFFER_BIT);
-
-                                            // Test B: gl_renderer's cubeProgram + cubeVAO WITH identity matrix
-                                            glUseProgram_(glRenderer.cubeProgram);
-                                            GLint locTransform = glGetUniformLocation_(glRenderer.cubeProgram, "uTransform");
-                                            GLint locModel = glGetUniformLocation_(glRenderer.cubeProgram, "uModel");
-                                            GLint locUseTex = glGetUniformLocation_(glRenderer.cubeProgram, "useTextures");
-                                            // Set identity matrix for uTransform (cube verts are -0.5..0.5, will appear at center)
-                                            float identity[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
-                                            if (locTransform >= 0) glUniformMatrix4fv_(locTransform, 1, GL_FALSE, identity);
-                                            if (locModel >= 0) glUniformMatrix4fv_(locModel, 1, GL_FALSE, identity);
-                                            if (locUseTex >= 0) glUniform1i_(locUseTex, 0); // no textures
-                                            glBindVertexArray_(glRenderer.cubeVAO);
-                                            glDrawElements(GL_TRIANGLES, 36, GL_UNSIGNED_SHORT, 0);
-                                            GLenum errB = glGetError();
-                                            uint8_t pxB[4] = {0};
-                                            glReadPixels(tileW/2, tileH/2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pxB);
-
-                                            // Clear back to blue for next test
-                                            glClearColor(0.05f, 0.05f, 0.25f, 1.0f);
-                                            glClear(GL_COLOR_BUFFER_BIT);
-
-                                            // Test C: inline shader + gl_renderer's cubeVAO
-                                            glUseProgram_(diag_prog);
-                                            glBindVertexArray_(glRenderer.cubeVAO);
-                                            glDrawElements(GL_TRIANGLES, 36, GL_UNSIGNED_SHORT, 0);
-                                            GLenum errC = glGetError();
-                                            uint8_t pxC[4] = {0};
-                                            glReadPixels(tileW/2, tileH/2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pxC);
-
-                                            // Query gl_renderer object IDs and state
-                                            GLint boundProg = 0, boundVAO = 0, boundEBO = 0;
-                                            glBindVertexArray_(glRenderer.cubeVAO);
-                                            glGetIntegerv(GL_CURRENT_PROGRAM, &boundProg);
-                                            glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &boundVAO);
-                                            glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &boundEBO);
-
-                                            LOG_INFO("DIAG-MIX[%d]: A(inline)=(%u,%u,%u,%u) "
-                                                     "B(prog+vao+identity)=(%u,%u,%u,%u)/err=0x%x "
-                                                     "C(inline+vao)=(%u,%u,%u,%u)/err=0x%x "
-                                                     "prog=%u vao=%u ebo=%u boundEBO=%d "
-                                                     "uTransform=%d uModel=%d useTextures=%d",
-                                                     diag_frame,
-                                                     pxA[0], pxA[1], pxA[2], pxA[3],
-                                                     pxB[0], pxB[1], pxB[2], pxB[3], errB,
-                                                     pxC[0], pxC[1], pxC[2], pxC[3], errC,
-                                                     glRenderer.cubeProgram, glRenderer.cubeVAO,
-                                                     glRenderer.cubeEBO, boundEBO,
-                                                     locTransform, locModel, locUseTex);
-                                        } else {
-                                            // After first 5 frames, just draw inline triangle
-                                            glUseProgram_(diag_prog);
-                                            glBindVertexArray_(diag_vao);
-                                            glDrawArrays(GL_TRIANGLES, 0, 3);
-                                        }
-                                        glBindVertexArray_(0);
-                                        glUseProgram_(0);
-                                        glBindFramebuffer_(GL_FRAMEBUFFER, 0);
-                                        diag_frame++;
-                                    }
-                                }
+                                    1.0f, 1.6f, -2.0f, 0.3f);
 
                                 // Set up projection view for this eye
                                 projectionViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
@@ -608,35 +451,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                                 projectionViews[eye].fov = rawViews[eye].fov;
                             }
 
-                            // DIAGNOSTIC: check GL state and readback pixel after render
-                            {
-                                static int diag_frame = 0;
-                                if (diag_frame < 10) {
-                                    GLenum err = glGetError();
-                                    HGLRC curCtx = wglGetCurrentContext();
-                                    HDC curDC = wglGetCurrentDC();
-                                    // Read pixel from the FBO we just rendered to
-                                    GLuint scTex = swapchainImages[imageIndex].image;
-                                    glBindFramebuffer_(GL_FRAMEBUFFER, glRenderer.fbos[imageIndex]);
-                                    uint8_t px_center[4] = {0}, px_quarter[4] = {0};
-                                    // Center of left eye region
-                                    glReadPixels(tileW/2, tileH/2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px_center);
-                                    // Quarter way (more likely to hit cube/grid)
-                                    glReadPixels(tileW/2, tileH/4, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px_quarter);
-                                    glBindFramebuffer_(GL_FRAMEBUFFER, 0);
-                                    GLenum err2 = glGetError();
-                                    LOG_INFO("DIAG[%d]: img=%u tex=%u ctx=%p dc=%p glErr=0x%x/0x%x "
-                                             "tile=%ux%u center=(%u,%u,%u,%u) quarter=(%u,%u,%u,%u)",
-                                             diag_frame, imageIndex, scTex, (void*)curCtx, (void*)curDC,
-                                             err, err2, tileW, tileH,
-                                             px_center[0], px_center[1], px_center[2], px_center[3],
-                                             px_quarter[0], px_quarter[1], px_quarter[2], px_quarter[3]);
-                                }
-                                diag_frame++;
-                            }
-                            // DIAGNOSTIC: force GPU completion before releasing
-                            // to test cross-context sync hypothesis
-                            glFinish();
                             ReleaseSwapchainImage(xr);
                         }
                     }

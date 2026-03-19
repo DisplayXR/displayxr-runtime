@@ -1150,36 +1150,6 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			glUniform1i(loc_tex, 0);
 			glUniform4f(loc_rect, nr.x, nr.y, nr.w, nr.h);
 
-			// DIAGNOSTIC: read center pixel from swapchain texture to check content
-			if (eye == 0) {
-				static int diag_count = 0;
-				if (diag_count < 10 || (diag_count % 300) == 0) {
-					// Read a pixel from center of eye 0's region
-					GLuint diag_fbo;
-					glGenFramebuffers(1, &diag_fbo);
-					glBindFramebuffer(GL_READ_FRAMEBUFFER, diag_fbo);
-					glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-					                        GL_TEXTURE_2D, gsc->textures[img_idx], 0);
-					uint8_t pixel[4] = {0};
-					// Read from center of left eye region
-					uint32_t cx = gsc->info.width / 4;  // center of left half
-					uint32_t cy = gsc->info.height / 2; // center vertically
-					glReadPixels(cx, cy, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixel);
-					glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
-					glDeleteFramebuffers(1, &diag_fbo);
-					// Re-bind the atlas FBO and swapchain texture for the blit
-					glBindFramebuffer(GL_FRAMEBUFFER, c->fbo);
-					glBindTexture(GL_TEXTURE_2D, gsc->textures[img_idx]);
-					U_LOG_W("GL DIAG[%d]: swapchain tex=%u img=%u pixel@(%u,%u)=(%u,%u,%u,%u) "
-					        "nr=(%.2f,%.2f,%.2f,%.2f) view=%ux%u err=0x%x",
-					        diag_count, gsc->textures[img_idx], img_idx, cx, cy,
-					        pixel[0], pixel[1], pixel[2], pixel[3],
-					        nr.x, nr.y, nr.w, nr.h,
-					        c->view_width, c->view_height, glGetError());
-				}
-				diag_count++;
-			}
-
 			// Draw fullscreen quad (3 vertices, generated in vertex shader)
 			glDrawArrays(GL_TRIANGLES, 0, 3);
 		}

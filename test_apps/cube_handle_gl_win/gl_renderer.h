@@ -58,7 +58,10 @@ void RenderScene(
     uint32_t width, uint32_t height,
     const DirectX::XMMATRIX& viewMatrix,
     const DirectX::XMMATRIX& projMatrix,
-    float zoomScale = 1.0f
+    float zoomScale = 1.0f,
+    float cubeY = 0.0f,      // World Y position of cube center (0 = default ground level)
+    float cubeZ = 0.0f,      // World Z position (0 = origin, negative = in front of camera)
+    float cubeSize = 0.06f   // Cube edge length in meters
 );
 
 // Cleanup

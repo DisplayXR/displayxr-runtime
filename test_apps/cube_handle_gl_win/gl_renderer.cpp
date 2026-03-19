@@ -344,7 +344,10 @@ void RenderScene(
     uint32_t width, uint32_t height,
     const XMMATRIX& viewMatrix,
     const XMMATRIX& projMatrix,
-    float zoomScale
+    float zoomScale,
+    float cubeY,
+    float cubeZ,
+    float cubeSize
 ) {
     glBindFramebuffer_(GL_FRAMEBUFFER, renderer.fbos[imageIndex]);
 
@@ -368,13 +371,12 @@ void RenderScene(
     // cancel the effect. Keeps the viewport center fixed on screen.
     XMMATRIX zoom = XMMatrixScaling(zoomScale, zoomScale, 1.0f);
 
-    // Draw cube - base rests on grid at y=0
+    // Draw cube
     {
-        const float cubeSize = 0.06f;
-        const float cubeHeight = cubeSize / 2.0f;  // Raise by half size so base is at y=0
+        const float cubeHeight = cubeY + cubeSize / 2.0f;  // Center at cubeY + half size
         XMMATRIX cubeScale = XMMatrixScaling(cubeSize, cubeSize, cubeSize);
         XMMATRIX cubeRot = XMMatrixRotationY(renderer.cubeRotation);
-        XMMATRIX cubeTrans = XMMatrixTranslation(0.0f, cubeHeight, 0.0f);
+        XMMATRIX cubeTrans = XMMatrixTranslation(0.0f, cubeHeight, cubeZ);
         XMMATRIX cubeWVP = cubeRot * cubeScale * cubeTrans * viewMatrix * zoom * projMatrix;
 
         glUseProgram_(renderer.cubeProgram);
