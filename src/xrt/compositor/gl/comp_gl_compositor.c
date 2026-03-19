@@ -259,6 +259,12 @@ struct comp_gl_compositor
 	uint32_t dp_input_width;       //!< Current dp_input_texture width (0 = not allocated)
 	uint32_t dp_input_height;      //!< Current dp_input_texture height
 
+	// --- Eye tracking cache ---
+	//! Cached eye positions from layer_commit (where SR weaver has fresh data).
+	//! Returned by get_predicted_eye_positions for xrLocateViews (called before layer_commit).
+	struct xrt_eye_positions cached_eye_pos;
+	bool have_cached_eye_pos;
+
 	// --- State ---
 	bool hardware_display_3d;  //!< True when in 3D mode, false = 2D passthrough
 	uint64_t last_frame_ns;
@@ -707,6 +713,13 @@ gl_compositor_render_hud(struct comp_gl_compositor *c, float dt, uint32_t win_w,
 	if (c->display_processor != NULL) {
 		have_eyes = xrt_display_processor_gl_get_predicted_eye_positions(
 		    c->display_processor, &eye_pos) && eye_pos.valid;
+	}
+	// Cache eye positions for get_predicted_eye_positions (called from
+	// xrLocateViews BEFORE layer_commit — SR weaver only has fresh data
+	// after process_atlas, so the cache provides one-frame-delayed tracking).
+	if (have_eyes) {
+		c->cached_eye_pos = eye_pos;
+		c->have_cached_eye_pos = true;
 	}
 	if (!have_eyes) {
 		eye_pos.count = 2;
@@ -1782,31 +1795,23 @@ comp_gl_compositor_get_predicted_eye_positions(struct xrt_compositor *xc,
 
 	struct comp_gl_compositor *c = gl_comp(xc);
 
+	// Return cached eye positions from last layer_commit.
+	// The SR GL weaver only produces real eye tracking data AFTER
+	// process_atlas runs (during layer_commit). But xrLocateViews
+	// is called BEFORE layer_commit in the frame loop, so the live
+	// query returns nominal defaults. The cache provides one-frame-
+	// delayed tracking, which is the same latency as D3D11/D3D12/VK.
+	if (c->have_cached_eye_pos) {
+		*out_eye_pos = c->cached_eye_pos;
+		return true;
+	}
+
+	// First frame fallback: no cache yet, try live query
 	if (c->display_processor != NULL) {
-		// The SR SDK's GL weaver may need the compositor's GL context current
-		// to access its eye tracker. During xrLocateViews, the app's context
-		// is current (different window in hosted mode), so we must switch.
-#ifdef XRT_OS_WINDOWS
-		HDC prev_hdc = wglGetCurrentDC();
-		HGLRC prev_hglrc = wglGetCurrentContext();
-		if (prev_hglrc != c->hglrc) {
-			wglMakeCurrent(c->hdc, c->hglrc);
+		if (xrt_display_processor_gl_get_predicted_eye_positions(
+		        c->display_processor, out_eye_pos) && out_eye_pos->valid) {
+			return true;
 		}
-#endif
-
-		bool ok = xrt_display_processor_gl_get_predicted_eye_positions(
-		    c->display_processor, out_eye_pos) && out_eye_pos->valid;
-
-#ifdef XRT_OS_WINDOWS
-		if (prev_hglrc != c->hglrc) {
-			if (prev_hglrc != NULL) {
-				wglMakeCurrent(prev_hdc, prev_hglrc);
-			} else {
-				wglMakeCurrent(NULL, NULL);
-			}
-		}
-#endif
-		if (ok) return true;
 	}
 
 	return false;
