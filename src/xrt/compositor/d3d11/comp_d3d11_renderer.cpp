@@ -548,6 +548,33 @@ render_projection_layer(struct comp_d3d11_renderer *r,
 		return;
 	}
 
+	// Diagnostic: log SRV and norm_rect details (issue #91)
+	{
+		static uint32_t rpl_diag = 0;
+		if (rpl_diag < 5) {
+			rpl_diag++;
+			// Query texture desc from the SRV to verify it has real content dimensions
+			ID3D11Resource *res = nullptr;
+			srv->GetResource(&res);
+			if (res != nullptr) {
+				ID3D11Texture2D *tex = nullptr;
+				if (SUCCEEDED(res->QueryInterface(__uuidof(ID3D11Texture2D), (void **)&tex))) {
+					D3D11_TEXTURE2D_DESC desc;
+					tex->GetDesc(&desc);
+					U_LOG_W("[diag#91 rpl %u/5] view=%u srv=%p tex=%ux%u fmt=%d "
+					        "norm_rect={%.3f,%.3f,%.3f,%.3f} flip_y=%d",
+					        rpl_diag, view_index, (void *)srv,
+					        desc.Width, desc.Height, (int)desc.Format,
+					        view_data->sub.norm_rect.x, view_data->sub.norm_rect.y,
+					        view_data->sub.norm_rect.w, view_data->sub.norm_rect.h,
+					        (int)layer->data.flip_y);
+					tex->Release();
+				}
+				res->Release();
+			}
+		}
+	}
+
 	// Set projection shaders explicitly (must be done per-draw because quad layer
 	// rendering switches to quad shaders, and those persist to the next projection layer)
 	internals->context->VSSetShader(r->projection_vs, nullptr, 0);

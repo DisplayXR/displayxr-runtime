@@ -945,6 +945,39 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 	}
 
+	// Diagnostic: log layer_commit pipeline state (issue #91)
+	{
+		static uint32_t diag_count = 0;
+		if (diag_count < 5) {
+			diag_count++;
+			U_LOG_W("[diag#91 %u/5] layer_commit: layers=%u zero_copy=%d zc_srv=%p "
+			        "has_target=%d has_dp=%d hw3d=%d",
+			        diag_count, c->layer_accum.layer_count, (int)zero_copy,
+			        zc_srv, (c->target != nullptr), (c->display_processor != NULL),
+			        (int)c->hardware_display_3d);
+			if (c->layer_accum.layer_count > 0) {
+				struct comp_layer *layer = &c->layer_accum.layers[0];
+				U_LOG_W("[diag#91 %u/5] layer[0]: type=%d view_count=%u sc[0]=%p sc[1]=%p",
+				        diag_count, (int)layer->data.type, layer->data.view_count,
+				        (void *)layer->sc_array[0], (void *)layer->sc_array[1]);
+				if (layer->data.type == XRT_LAYER_PROJECTION ||
+				    layer->data.type == XRT_LAYER_PROJECTION_DEPTH) {
+					for (uint32_t v = 0; v < layer->data.view_count && v < 2; v++) {
+						struct xrt_layer_projection_view_data *vd = &layer->data.proj.v[v];
+						U_LOG_W("[diag#91 %u/5] view[%u]: img_idx=%u "
+						        "rect={%d,%d %ux%u} "
+						        "norm_rect={%.3f,%.3f,%.3f,%.3f}",
+						        diag_count, v, vd->sub.image_index,
+						        vd->sub.rect.offset.w, vd->sub.rect.offset.h,
+						        vd->sub.rect.extent.w, vd->sub.rect.extent.h,
+						        vd->sub.norm_rect.x, vd->sub.norm_rect.y,
+						        vd->sub.norm_rect.w, vd->sub.norm_rect.h);
+					}
+				}
+			}
+		}
+	}
+
 	// Render layers to side-by-side stereo texture (skip if zero-copy).
 	// Pass hardware_display_3d so the renderer knows the current display mode.
 	xrt_result_t xret = XRT_SUCCESS;
