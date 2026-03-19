@@ -251,10 +251,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                                 XMMATRIX viewMatrix = xr.viewMatrices[eye];
                                 XMMATRIX projMatrix = xr.projMatrices[eye];
 
+                                // XR LOCAL space is head-centered. The D3D12 renderer's
+                                // cube is at (0, 0.03, 0) — at the head. Move the scene
+                                // 2m in front of the camera so content is visible.
+                                XMMATRIX worldOffset = XMMatrixTranslation(0.0f, 0.0f, -2.0f);
+                                XMMATRIX adjustedView = worldOffset * viewMatrix;
+
                                 RenderScene(renderer, swapchainTexture, (int)imageIndex,
                                     tileX * tileW, tileY * tileH,
                                     tileW, tileH,
-                                    viewMatrix, projMatrix,
+                                    adjustedView, projMatrix,
                                     1.0f, eye == 0);
 
                                 projectionViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
