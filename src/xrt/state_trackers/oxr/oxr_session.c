@@ -1148,6 +1148,22 @@ oxr_session_locate_views(struct oxr_logger *log,
 	// eye tracking via ipc_try_get_sr_view_poses.
 	bool got_eye_positions = oxr_session_get_predicted_eye_positions(sess, &eye_pos);
 
+	// One-shot diagnostic: log stereo gate values for first frames
+	{
+		static int stereo_gate_log = 0;
+		if (stereo_gate_log < 3) {
+			U_LOG_W("STEREO-GATE[%d]: got_eyes=%d valid=%d count=%d "
+			        "have_view_state=%d is_gl=%d has_ext_win=%d "
+			        "eye0=(%.4f,%.4f,%.4f) eye1=(%.4f,%.4f,%.4f)",
+			        stereo_gate_log, got_eye_positions, eye_pos.valid, eye_pos.count,
+			        have_view_state, sess->is_gl_native_compositor,
+			        sess->has_external_window,
+			        eye_pos.eyes[0].x, eye_pos.eyes[0].y, eye_pos.eyes[0].z,
+			        eye_pos.eyes[1].x, eye_pos.eyes[1].y, eye_pos.eyes[1].z);
+			stereo_gate_log++;
+		}
+	}
+
 	if (should_log) {
 		U_LOG_I("Eye tracking: got_positions=%d, valid=%d, is_d3d11=%d, is_d3d12=%d, is_metal=%d",
 		        got_eye_positions, eye_pos.valid, sess->is_d3d11_native_compositor,
