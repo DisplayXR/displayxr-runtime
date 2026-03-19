@@ -41,6 +41,7 @@
 #include "qwerty_interface.h"
 #endif
 
+#include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1800,25 +1801,24 @@ comp_gl_compositor_get_predicted_eye_positions(struct xrt_compositor *xc,
 
 	struct comp_gl_compositor *c = gl_comp(xc);
 
-	// Return cached eye positions from last layer_commit.
-	// The SR GL weaver only produces real eye tracking data AFTER
-	// process_atlas runs (during layer_commit). But xrLocateViews
-	// is called BEFORE layer_commit in the frame loop, so the live
-	// query returns nominal defaults. The cache provides one-frame-
-	// delayed tracking, which is the same latency as D3D11/D3D12/VK.
+	// Return cached eye positions from last layer_commit (AFTER process_atlas).
+	// The SR GL weaver only has real eye tracking data after process_atlas runs.
+	// xrLocateViews is called BEFORE layer_commit, so the cache provides
+	// one-frame-delayed tracking (same latency as D3D11/D3D12/VK).
 	if (c->have_cached_eye_pos) {
 		*out_eye_pos = c->cached_eye_pos;
+		// Safety net: if both eyes have identical X (no stereo separation),
+		// return false so the state tracker uses the nominal IPD fallback.
+		if (out_eye_pos->count >= 2 &&
+		    fabsf(out_eye_pos->eyes[0].x - out_eye_pos->eyes[1].x) < 0.001f) {
+			return false;
+		}
 		return true;
 	}
 
-	// First frame fallback: no cache yet, try live query
-	if (c->display_processor != NULL) {
-		if (xrt_display_processor_gl_get_predicted_eye_positions(
-		        c->display_processor, out_eye_pos) && out_eye_pos->valid) {
-			return true;
-		}
-	}
-
+	// First frame: no cache yet. Return false to trigger nominal IPD
+	// fallback in the state tracker (the live DP query would return
+	// nominal defaults without stereo separation before process_atlas).
 	return false;
 }
 
