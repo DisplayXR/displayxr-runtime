@@ -1783,10 +1783,30 @@ comp_gl_compositor_get_predicted_eye_positions(struct xrt_compositor *xc,
 	struct comp_gl_compositor *c = gl_comp(xc);
 
 	if (c->display_processor != NULL) {
-		if (xrt_display_processor_gl_get_predicted_eye_positions(c->display_processor, out_eye_pos) &&
-		    out_eye_pos->valid) {
-			return true;
+		// The SR SDK's GL weaver may need the compositor's GL context current
+		// to access its eye tracker. During xrLocateViews, the app's context
+		// is current (different window in hosted mode), so we must switch.
+#ifdef XRT_OS_WINDOWS
+		HDC prev_hdc = wglGetCurrentDC();
+		HGLRC prev_hglrc = wglGetCurrentContext();
+		if (prev_hglrc != c->hglrc) {
+			wglMakeCurrent(c->hdc, c->hglrc);
 		}
+#endif
+
+		bool ok = xrt_display_processor_gl_get_predicted_eye_positions(
+		    c->display_processor, out_eye_pos) && out_eye_pos->valid;
+
+#ifdef XRT_OS_WINDOWS
+		if (prev_hglrc != c->hglrc) {
+			if (prev_hglrc != NULL) {
+				wglMakeCurrent(prev_hdc, prev_hglrc);
+			} else {
+				wglMakeCurrent(NULL, NULL);
+			}
+		}
+#endif
+		if (ok) return true;
 	}
 
 	return false;
