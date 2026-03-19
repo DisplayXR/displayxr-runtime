@@ -715,6 +715,16 @@ gl_compositor_render_hud(struct comp_gl_compositor *c, float dt, uint32_t win_w,
 		have_eyes = xrt_display_processor_gl_get_predicted_eye_positions(
 		    c->display_processor, &eye_pos) && eye_pos.valid;
 	}
+	{
+		static int hud_eye_log = 0;
+		if (hud_eye_log < 5) {
+			U_LOG_W("EYE-HUD[%d]: have=%d e0=(%.4f,%.4f,%.4f) e1=(%.4f,%.4f,%.4f)",
+			        hud_eye_log, have_eyes,
+			        eye_pos.eyes[0].x, eye_pos.eyes[0].y, eye_pos.eyes[0].z,
+			        eye_pos.eyes[1].x, eye_pos.eyes[1].y, eye_pos.eyes[1].z);
+			hud_eye_log++;
+		}
+	}
 	if (!have_eyes) {
 		eye_pos.count = 2;
 		eye_pos.eyes[0] = (struct xrt_eye_position){-0.032f, nom_y / 1000.0f, nom_z / 1000.0f};
@@ -1390,8 +1400,18 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 		// layer_commit, so it needs cached data from the previous frame.
 		if (c->display_processor != NULL) {
 			struct xrt_eye_positions fresh_eyes = {0};
-			if (xrt_display_processor_gl_get_predicted_eye_positions(
-			        c->display_processor, &fresh_eyes) && fresh_eyes.valid) {
+			bool fresh_ok = xrt_display_processor_gl_get_predicted_eye_positions(
+			        c->display_processor, &fresh_eyes);
+			static int cache_log = 0;
+			if (cache_log < 5) {
+				U_LOG_W("EYE-CACHE[%d]: ok=%d valid=%d count=%d "
+				        "e0=(%.4f,%.4f,%.4f) e1=(%.4f,%.4f,%.4f)",
+				        cache_log, fresh_ok, fresh_eyes.valid, fresh_eyes.count,
+				        fresh_eyes.eyes[0].x, fresh_eyes.eyes[0].y, fresh_eyes.eyes[0].z,
+				        fresh_eyes.eyes[1].x, fresh_eyes.eyes[1].y, fresh_eyes.eyes[1].z);
+				cache_log++;
+			}
+			if (fresh_ok && fresh_eyes.valid) {
 				c->cached_eye_pos = fresh_eyes;
 				c->have_cached_eye_pos = true;
 			}
