@@ -714,13 +714,6 @@ gl_compositor_render_hud(struct comp_gl_compositor *c, float dt, uint32_t win_w,
 		have_eyes = xrt_display_processor_gl_get_predicted_eye_positions(
 		    c->display_processor, &eye_pos) && eye_pos.valid;
 	}
-	// Cache eye positions for get_predicted_eye_positions (called from
-	// xrLocateViews BEFORE layer_commit — SR weaver only has fresh data
-	// after process_atlas, so the cache provides one-frame-delayed tracking).
-	if (have_eyes) {
-		c->cached_eye_pos = eye_pos;
-		c->have_cached_eye_pos = true;
-	}
 	if (!have_eyes) {
 		eye_pos.count = 2;
 		eye_pos.eyes[0] = (struct xrt_eye_position){-0.032f, nom_y / 1000.0f, nom_z / 1000.0f};
@@ -1389,6 +1382,18 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			glUniform1i(loc_out_tex, 0);
 
 			glDrawArrays(GL_TRIANGLES, 0, 3);
+		}
+
+		// Cache eye positions AFTER process_atlas (which updates the SR weaver's
+		// eye tracker). xrLocateViews calls get_predicted_eye_positions BEFORE
+		// layer_commit, so it needs cached data from the previous frame.
+		if (c->display_processor != NULL) {
+			struct xrt_eye_positions fresh_eyes = {0};
+			if (xrt_display_processor_gl_get_predicted_eye_positions(
+			        c->display_processor, &fresh_eyes) && fresh_eyes.valid) {
+				c->cached_eye_pos = fresh_eyes;
+				c->have_cached_eye_pos = true;
+			}
 		}
 
 		// HUD overlay (post-weave, before swap)
