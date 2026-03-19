@@ -88,6 +88,17 @@ comp_d3d11_target_get_dimensions(struct comp_d3d11_target *target,
                                  uint32_t *out_height);
 
 /*!
+ * Re-bind the target's render target view and viewport (without clearing).
+ *
+ * Call this after operations that change the bound RTV (e.g. renderer draw)
+ * and before the display processor writes to the target.
+ *
+ * @ingroup comp_d3d11
+ */
+void
+comp_d3d11_target_bind(struct comp_d3d11_target *target);
+
+/*!
  * Get the back buffer texture (ID3D11Texture2D*) for direct pixel copy.
  *
  * @ingroup comp_d3d11

@@ -206,6 +206,24 @@ comp_d3d11_target_acquire(struct comp_d3d11_target *target, uint32_t *out_index)
 	return XRT_SUCCESS;
 }
 
+extern "C" void
+comp_d3d11_target_bind(struct comp_d3d11_target *target)
+{
+	auto internals = get_internals(target->c);
+
+	// Re-bind the render target and viewport (no clear)
+	internals->context->OMSetRenderTargets(1, &target->rtv, nullptr);
+
+	D3D11_VIEWPORT viewport = {};
+	viewport.TopLeftX = 0.0f;
+	viewport.TopLeftY = 0.0f;
+	viewport.Width = static_cast<float>(target->width);
+	viewport.Height = static_cast<float>(target->height);
+	viewport.MinDepth = 0.0f;
+	viewport.MaxDepth = 1.0f;
+	internals->context->RSSetViewports(1, &viewport);
+}
+
 extern "C" xrt_result_t
 comp_d3d11_target_present(struct comp_d3d11_target *target, uint32_t sync_interval)
 {
