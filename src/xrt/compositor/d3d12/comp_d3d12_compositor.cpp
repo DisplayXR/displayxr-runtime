@@ -1808,6 +1808,13 @@ comp_d3d12_compositor_request_display_mode(struct xrt_compositor *xc, bool enabl
 {
 	struct comp_d3d12_compositor *c = d3d12_comp(xc);
 
+	// Ensure GPU is fully idle before switching display mode.
+	// The SR SDK's lens_hint enable/disable may interact with the D3D12
+	// device internally. If the GPU has pending work (e.g. DXGI Present
+	// scan-out), this can cause DXGI_ERROR_DEVICE_REMOVED on some GPUs
+	// (observed on Intel Iris Xe with hosted D3D12 apps).
+	gpu_wait_idle(c);
+
 	return xrt_display_processor_d3d12_request_display_mode(c->display_processor, enable_3d);
 }
 
