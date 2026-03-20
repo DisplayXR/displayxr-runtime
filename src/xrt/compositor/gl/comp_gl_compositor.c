@@ -1821,19 +1821,12 @@ comp_gl_compositor_get_predicted_eye_positions(struct xrt_compositor *xc,
 
 	struct comp_gl_compositor *c = gl_comp(xc);
 
-	// The SR GL weaver's getPredictedEyePositions returns nominal/identical
-	// positions for both eyes (SR SDK limitation — the GL weaver doesn't
-	// provide real per-eye tracking unlike the D3D11/D3D12 weavers).
-	//
-	// Return false so the state tracker does NOT override the device's
-	// correct Kooima FOVs (computed by the Leia HMD driver with its own
-	// LookaroundFilter) with bad identical-eye Kooima from the compositor.
-	//
-	// This matches the GL handle app behavior: have_view_state=false there
-	// also prevents the state tracker Kooima override, letting the device's
-	// FOVs pass through.
-	(void)c;
-	return false;
+	if (c->display_processor == NULL) {
+		return false;
+	}
+
+	return xrt_display_processor_gl_get_predicted_eye_positions(
+		c->display_processor, out_eye_pos);
 }
 
 bool

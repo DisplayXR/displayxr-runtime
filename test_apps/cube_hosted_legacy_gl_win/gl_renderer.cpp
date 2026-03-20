@@ -369,10 +369,9 @@ void RenderScene(
 
     // Draw cube
     {
-        const float cubeHeight = cubeY + cubeSize / 2.0f;  // Center at cubeY + half size
         XMMATRIX cubeScale = XMMatrixScaling(cubeSize, cubeSize, cubeSize);
         XMMATRIX cubeRot = XMMatrixRotationY(renderer.cubeRotation);
-        XMMATRIX cubeTrans = XMMatrixTranslation(0.0f, cubeHeight, cubeZ);
+        XMMATRIX cubeTrans = XMMatrixTranslation(0.0f, cubeY, cubeZ);
         XMMATRIX cubeWVP = cubeRot * cubeScale * cubeTrans * viewMatrix * zoom * projMatrix;
 
         glUseProgram_(renderer.cubeProgram);
