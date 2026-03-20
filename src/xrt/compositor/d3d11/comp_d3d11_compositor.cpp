@@ -945,6 +945,25 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 	}
 
+	// Flush and wait for GPU to finish processing all prior commands.
+	// Multi-threaded engines (e.g. Unity) submit draw commands from worker threads.
+	// The GPU may still be executing those commands when we read the swapchain
+	// textures. This is the D3D11 equivalent of D3D12's gpu_wait_idle().
+	{
+		c->context->Flush();
+		ID3D11Query *event_query = nullptr;
+		D3D11_QUERY_DESC qd = {};
+		qd.Query = D3D11_QUERY_EVENT;
+		if (SUCCEEDED(c->device->CreateQuery(&qd, &event_query))) {
+			c->context->End(event_query);
+			BOOL query_done = FALSE;
+			while (c->context->GetData(event_query, &query_done, sizeof(query_done), 0) == S_FALSE) {
+				// Spin-wait for GPU to drain
+			}
+			event_query->Release();
+		}
+	}
+
 	// Render layers to side-by-side stereo texture (skip if zero-copy).
 	// Pass hardware_display_3d so the renderer knows the current display mode.
 	xrt_result_t xret = XRT_SUCCESS;
