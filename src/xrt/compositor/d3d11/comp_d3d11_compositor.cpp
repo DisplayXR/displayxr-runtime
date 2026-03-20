@@ -181,6 +181,16 @@ struct comp_d3d11_compositor
 	//! via 1/2/3 keys should be disabled.
 	bool legacy_app_tile_scaling;
 
+	//! Lazily allocated intermediate texture for cropping atlas to content dims
+	//! before passing to display processor. NULL when not needed (zero-copy case).
+	ID3D11Texture2D *dp_input_texture;
+
+	//! SRV for dp_input_texture.
+	ID3D11ShaderResourceView *dp_input_srv;
+
+	//! Cached dimensions for lazy reallocation.
+	uint32_t dp_input_width, dp_input_height;
+
 	//! Thread safety.
 	std::mutex mutex;
 };
@@ -758,6 +768,83 @@ d3d11_render_hud_overlay(struct comp_d3d11_compositor *c, bool weaving_done,
 	}
 }
 
+/*!
+ * Crop atlas to content dimensions before passing to display processor.
+ * Returns the SRV to pass to process_atlas() — either the original (zero-copy)
+ * or a cropped intermediate texture.
+ */
+static void *
+d3d11_crop_atlas_for_dp(struct comp_d3d11_compositor *c,
+                        void *atlas_srv,
+                        uint32_t content_w,
+                        uint32_t content_h)
+{
+	// Get atlas texture dimensions from the SRV's underlying resource
+	ID3D11ShaderResourceView *srv = static_cast<ID3D11ShaderResourceView *>(atlas_srv);
+	ID3D11Resource *resource = nullptr;
+	srv->GetResource(&resource);
+	ID3D11Texture2D *atlas_tex = static_cast<ID3D11Texture2D *>(resource);
+	D3D11_TEXTURE2D_DESC atlas_desc;
+	atlas_tex->GetDesc(&atlas_desc);
+
+	// Zero-copy: atlas already matches content dimensions
+	if (content_w == atlas_desc.Width && content_h == atlas_desc.Height) {
+		atlas_tex->Release();
+		return atlas_srv;
+	}
+
+	// Lazily (re)create intermediate texture at content dimensions
+	if (c->dp_input_width != content_w || c->dp_input_height != content_h) {
+		if (c->dp_input_srv != nullptr) {
+			c->dp_input_srv->Release();
+			c->dp_input_srv = nullptr;
+		}
+		if (c->dp_input_texture != nullptr) {
+			c->dp_input_texture->Release();
+			c->dp_input_texture = nullptr;
+		}
+
+		D3D11_TEXTURE2D_DESC desc = {};
+		desc.Width = content_w;
+		desc.Height = content_h;
+		desc.MipLevels = 1;
+		desc.ArraySize = 1;
+		desc.Format = atlas_desc.Format;
+		desc.SampleDesc.Count = 1;
+		desc.Usage = D3D11_USAGE_DEFAULT;
+		desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+		HRESULT hr = c->device->CreateTexture2D(&desc, nullptr, &c->dp_input_texture);
+		if (FAILED(hr)) {
+			U_LOG_E("Failed to create DP input texture %ux%u: 0x%lx", content_w, content_h, hr);
+			atlas_tex->Release();
+			return atlas_srv; // fallback to original
+		}
+
+		hr = c->device->CreateShaderResourceView(c->dp_input_texture, nullptr, &c->dp_input_srv);
+		if (FAILED(hr)) {
+			U_LOG_E("Failed to create DP input SRV: 0x%lx", hr);
+			c->dp_input_texture->Release();
+			c->dp_input_texture = nullptr;
+			atlas_tex->Release();
+			return atlas_srv;
+		}
+
+		c->dp_input_width = content_w;
+		c->dp_input_height = content_h;
+		U_LOG_I("D3D11 crop: created DP input texture %ux%u (atlas %ux%u)",
+		        content_w, content_h, atlas_desc.Width, atlas_desc.Height);
+	}
+
+	// Copy content region from atlas to intermediate
+	D3D11_BOX src_box = {0, 0, 0, content_w, content_h, 1};
+	c->context->CopySubresourceRegion(c->dp_input_texture, 0, 0, 0, 0,
+	                                   atlas_tex, 0, &src_box);
+	atlas_tex->Release();
+
+	return c->dp_input_srv;
+}
+
 static xrt_result_t
 d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
 {
@@ -1022,6 +1109,11 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			uint32_t tile_columns, tile_rows;
 			comp_d3d11_renderer_get_tile_layout(c->renderer, &tile_columns, &tile_rows);
 
+			// Crop atlas to content dimensions before passing to DP
+			uint32_t content_w = tile_columns * view_width;
+			uint32_t content_h = tile_rows * view_height;
+			atlas_srv = d3d11_crop_atlas_for_dp(c, atlas_srv, content_w, content_h);
+
 			D3D11_TEXTURE2D_DESC st_desc;
 			c->shared_texture->GetDesc(&st_desc);
 
@@ -1082,6 +1174,11 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		comp_d3d11_renderer_get_view_dimensions(c->renderer, &view_width, &view_height);
 		uint32_t tile_columns, tile_rows;
 		comp_d3d11_renderer_get_tile_layout(c->renderer, &tile_columns, &tile_rows);
+
+		// Crop atlas to content dimensions before passing to DP
+		uint32_t content_w = tile_columns * view_width;
+		uint32_t content_h = tile_rows * view_height;
+		atlas_srv = d3d11_crop_atlas_for_dp(c, atlas_srv, content_w, content_h);
 
 		uint32_t target_width, target_height;
 		comp_d3d11_target_get_dimensions(c->target, &target_width, &target_height);
@@ -1175,6 +1272,16 @@ d3d11_compositor_destroy(struct xrt_compositor *xc)
 		c->hud_texture = nullptr;
 	}
 	u_hud_destroy(&c->hud);
+
+	// Destroy DP input crop texture
+	if (c->dp_input_srv != nullptr) {
+		c->dp_input_srv->Release();
+		c->dp_input_srv = nullptr;
+	}
+	if (c->dp_input_texture != nullptr) {
+		c->dp_input_texture->Release();
+		c->dp_input_texture = nullptr;
+	}
 
 	// Destroy display processor (handles all vendor cleanup internally)
 	xrt_display_processor_d3d11_destroy(&c->display_processor);

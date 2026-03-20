@@ -65,6 +65,10 @@ struct comp_vk_native_renderer
 	//! Actual texture height (max of view_height and target_height).
 	uint32_t texture_height;
 
+	//! Atlas texture allocated dimensions (worst-case, may be > content dims).
+	uint32_t atlas_alloc_width;
+	uint32_t atlas_alloc_height;
+
 	//! Format of the stereo texture.
 	VkFormat format;
 };
@@ -100,6 +104,8 @@ create_atlas_resources(struct comp_vk_native_renderer *r,
 	r->view_width = view_width;
 	r->view_height = view_height;
 	r->texture_height = view_height;
+	r->atlas_alloc_width = atlas_width;
+	r->atlas_alloc_height = atlas_height;
 
 	VkImageCreateInfo image_ci = {
 	    .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
@@ -487,6 +493,15 @@ comp_vk_native_renderer_get_view_dimensions(struct comp_vk_native_renderer *r,
 {
 	*out_view_width = r->view_width;
 	*out_view_height = r->view_height;
+}
+
+void
+comp_vk_native_renderer_get_atlas_dimensions(struct comp_vk_native_renderer *r,
+                                              uint32_t *out_width,
+                                              uint32_t *out_height)
+{
+	*out_width = r->atlas_alloc_width;
+	*out_height = r->atlas_alloc_height;
 }
 
 int32_t

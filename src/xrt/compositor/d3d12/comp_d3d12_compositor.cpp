@@ -148,6 +148,12 @@ struct comp_d3d12_compositor
 	//! True when a legacy app is using a compromise view scale.
 	bool legacy_app_tile_scaling;
 
+	//! Lazily allocated intermediate resource for cropping atlas to content dims.
+	ID3D12Resource *dp_input_resource;
+
+	//! Cached dimensions for lazy reallocation.
+	uint32_t dp_input_width, dp_input_height;
+
 	//! HUD overlay.
 	struct u_hud *hud;
 
@@ -776,6 +782,93 @@ d3d12_render_hud_overlay(struct comp_d3d12_compositor *c,
 	}
 }
 
+/*!
+ * Crop atlas to content dimensions before passing to display processor.
+ * Called within an already-recording command list. The atlas is assumed to be
+ * in COMMON state (already transitioned by the caller).
+ *
+ * Returns the resource to pass to process_atlas().
+ */
+static ID3D12Resource *
+d3d12_crop_atlas_for_dp(struct comp_d3d12_compositor *c,
+                        ID3D12Resource *atlas_resource,
+                        uint32_t content_w,
+                        uint32_t content_h)
+{
+	D3D12_RESOURCE_DESC atlas_desc = atlas_resource->GetDesc();
+
+	if (content_w == (uint32_t)atlas_desc.Width && content_h == atlas_desc.Height) {
+		return atlas_resource;
+	}
+
+	// Lazily (re)create intermediate resource at content dimensions
+	if (c->dp_input_width != content_w || c->dp_input_height != content_h) {
+		if (c->dp_input_resource != nullptr) {
+			c->dp_input_resource->Release();
+			c->dp_input_resource = nullptr;
+		}
+
+		D3D12_RESOURCE_DESC desc = {};
+		desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+		desc.Width = content_w;
+		desc.Height = content_h;
+		desc.DepthOrArraySize = 1;
+		desc.MipLevels = 1;
+		desc.Format = atlas_desc.Format;
+		desc.SampleDesc.Count = 1;
+		desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+		D3D12_HEAP_PROPERTIES heap = {};
+		heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+		HRESULT hr = c->device->CreateCommittedResource(
+		    &heap, D3D12_HEAP_FLAG_NONE, &desc,
+		    D3D12_RESOURCE_STATE_COMMON, nullptr,
+		    IID_PPV_ARGS(&c->dp_input_resource));
+		if (FAILED(hr)) {
+			U_LOG_E("Failed to create D3D12 DP input resource %ux%u: 0x%lx",
+			        content_w, content_h, hr);
+			return atlas_resource;
+		}
+
+		c->dp_input_width = content_w;
+		c->dp_input_height = content_h;
+		U_LOG_I("D3D12 crop: created DP input resource %ux%u (atlas %llux%u)",
+		        content_w, content_h,
+		        (unsigned long long)atlas_desc.Width, (unsigned)atlas_desc.Height);
+	}
+
+	// Transition intermediate: COMMON → COPY_DEST
+	D3D12_RESOURCE_BARRIER barrier = {};
+	barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	barrier.Transition.pResource = c->dp_input_resource;
+	barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+	barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+	barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	c->cmd_list->ResourceBarrier(1, &barrier);
+
+	// Copy content region from atlas to intermediate
+	D3D12_TEXTURE_COPY_LOCATION dst_loc = {};
+	dst_loc.pResource = c->dp_input_resource;
+	dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+	dst_loc.SubresourceIndex = 0;
+
+	D3D12_TEXTURE_COPY_LOCATION src_loc = {};
+	src_loc.pResource = atlas_resource;
+	src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+	src_loc.SubresourceIndex = 0;
+
+	D3D12_BOX src_box = {0, 0, 0, content_w, content_h, 1};
+	c->cmd_list->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, &src_box);
+
+	// Transition intermediate: COPY_DEST → COMMON (for DP)
+	barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+	barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+	c->cmd_list->ResourceBarrier(1, &barrier);
+
+	return c->dp_input_resource;
+}
+
 static xrt_result_t
 d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
 {
@@ -1111,6 +1204,15 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			atlas_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 			c->cmd_list->ResourceBarrier(1, &atlas_barrier);
 
+			uint32_t tile_columns, tile_rows;
+			comp_d3d12_renderer_get_tile_layout(c->renderer, &tile_columns, &tile_rows);
+
+			// Crop atlas to content dimensions before passing to DP
+			uint32_t content_w = tile_columns * view_width;
+			uint32_t content_h = tile_rows * view_height;
+			ID3D12Resource *dp_resource = d3d12_crop_atlas_for_dp(
+			    c, atlas_resource, content_w, content_h);
+
 			D3D12_VIEWPORT viewport = {};
 			viewport.TopLeftX = 0.0f;
 			viewport.TopLeftY = 0.0f;
@@ -1127,13 +1229,10 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			scissor.bottom = static_cast<LONG>(tgt_height);
 			c->cmd_list->RSSetScissorRects(1, &scissor);
 
-			uint32_t tile_columns, tile_rows;
-			comp_d3d12_renderer_get_tile_layout(c->renderer, &tile_columns, &tile_rows);
-
 			xrt_display_processor_d3d12_process_atlas(
 			    c->display_processor,
 			    c->cmd_list,
-			    atlas_resource,
+			    dp_resource,
 			    0,  // SRV GPU handle — SR weaver uses setInputViewTexture instead
 			    rtv_handle.ptr,
 			    back_buffer,
@@ -1273,6 +1372,12 @@ d3d12_compositor_destroy(struct xrt_compositor *xc)
 	// Wait for GPU idle
 	if (c->fence != nullptr && c->command_queue != nullptr) {
 		gpu_wait_idle(c);
+	}
+
+	// Destroy DP input crop resource
+	if (c->dp_input_resource != nullptr) {
+		c->dp_input_resource->Release();
+		c->dp_input_resource = nullptr;
 	}
 
 	// Destroy display processor

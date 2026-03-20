@@ -116,6 +116,21 @@ comp_vk_native_renderer_get_view_dimensions(struct comp_vk_native_renderer *rend
                                              uint32_t *out_view_height);
 
 /*!
+ * Get the atlas texture dimensions (actual allocated size, may be larger
+ * than content dimensions if atlas is worst-case sized).
+ *
+ * @param renderer The renderer.
+ * @param out_width Atlas texture width.
+ * @param out_height Atlas texture height.
+ *
+ * @ingroup comp_vk_native
+ */
+void
+comp_vk_native_renderer_get_atlas_dimensions(struct comp_vk_native_renderer *renderer,
+                                              uint32_t *out_width,
+                                              uint32_t *out_height);
+
+/*!
  * Get the stereo texture format.
  *
  * @param renderer The renderer.

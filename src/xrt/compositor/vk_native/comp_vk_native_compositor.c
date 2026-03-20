@@ -175,6 +175,12 @@ struct comp_vk_native_compositor
 
 	//! Last frame timestamp for dt calculation.
 	uint64_t last_frame_ns;
+
+	//! Lazily allocated intermediate image for cropping atlas to content dims.
+	VkImage dp_input_image;
+	VkImageView dp_input_view;
+	VkDeviceMemory dp_input_memory;
+	uint32_t dp_input_width, dp_input_height;
 };
 
 /*
@@ -1330,6 +1336,216 @@ vk_compositor_render_hud(struct comp_vk_native_compositor *c,
 	    0, 0, NULL, 0, NULL, 1, &to_present);
 }
 
+/*!
+ * Lazily (re)create the DP input intermediate image at content dimensions.
+ * Returns true on success.
+ */
+static bool
+vk_ensure_dp_input_image(struct comp_vk_native_compositor *c,
+                          uint32_t content_w, uint32_t content_h)
+{
+	struct vk_bundle *vk = &c->vk;
+
+	if (c->dp_input_width == content_w && c->dp_input_height == content_h &&
+	    c->dp_input_image != VK_NULL_HANDLE) {
+		return true;
+	}
+
+	// Destroy old resources
+	if (c->dp_input_view != VK_NULL_HANDLE) {
+		vk->vkDestroyImageView(vk->device, c->dp_input_view, NULL);
+		c->dp_input_view = VK_NULL_HANDLE;
+	}
+	if (c->dp_input_image != VK_NULL_HANDLE) {
+		vk->vkDestroyImage(vk->device, c->dp_input_image, NULL);
+		c->dp_input_image = VK_NULL_HANDLE;
+	}
+	if (c->dp_input_memory != VK_NULL_HANDLE) {
+		vk->vkFreeMemory(vk->device, c->dp_input_memory, NULL);
+		c->dp_input_memory = VK_NULL_HANDLE;
+	}
+
+	VkImageCreateInfo image_ci = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+	    .imageType = VK_IMAGE_TYPE_2D,
+	    .format = VK_FORMAT_B8G8R8A8_UNORM,
+	    .extent = {content_w, content_h, 1},
+	    .mipLevels = 1,
+	    .arrayLayers = 1,
+	    .samples = VK_SAMPLE_COUNT_1_BIT,
+	    .tiling = VK_IMAGE_TILING_OPTIMAL,
+	    .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+	    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+	    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+	};
+
+	VkResult res = vk->vkCreateImage(vk->device, &image_ci, NULL, &c->dp_input_image);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("Failed to create VK DP input image %ux%u: %d", content_w, content_h, res);
+		return false;
+	}
+
+	VkMemoryRequirements mem_reqs;
+	vk->vkGetImageMemoryRequirements(vk->device, c->dp_input_image, &mem_reqs);
+
+	uint32_t mem_type_index = 0;
+	VkPhysicalDeviceMemoryProperties mem_props;
+	vk->vkGetPhysicalDeviceMemoryProperties(vk->physical_device, &mem_props);
+	for (uint32_t i = 0; i < mem_props.memoryTypeCount; i++) {
+		if ((mem_reqs.memoryTypeBits & (1 << i)) &&
+		    (mem_props.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+			mem_type_index = i;
+			break;
+		}
+	}
+
+	VkMemoryAllocateInfo alloc_info = {
+	    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+	    .allocationSize = mem_reqs.size,
+	    .memoryTypeIndex = mem_type_index,
+	};
+
+	res = vk->vkAllocateMemory(vk->device, &alloc_info, NULL, &c->dp_input_memory);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("Failed to allocate VK DP input memory: %d", res);
+		return false;
+	}
+
+	res = vk->vkBindImageMemory(vk->device, c->dp_input_image, c->dp_input_memory, 0);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("Failed to bind VK DP input memory: %d", res);
+		return false;
+	}
+
+	VkImageViewCreateInfo view_ci = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+	    .image = c->dp_input_image,
+	    .viewType = VK_IMAGE_VIEW_TYPE_2D,
+	    .format = VK_FORMAT_B8G8R8A8_UNORM,
+	    .subresourceRange = {
+	        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+	        .baseMipLevel = 0,
+	        .levelCount = 1,
+	        .baseArrayLayer = 0,
+	        .layerCount = 1,
+	    },
+	};
+
+	res = vk->vkCreateImageView(vk->device, &view_ci, NULL, &c->dp_input_view);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("Failed to create VK DP input view: %d", res);
+		return false;
+	}
+
+	c->dp_input_width = content_w;
+	c->dp_input_height = content_h;
+	U_LOG_I("VK crop: created DP input image %ux%u", content_w, content_h);
+
+	return true;
+}
+
+/*!
+ * Record crop-blit commands to copy the content region from an oversized atlas
+ * into the DP input intermediate image. Updates *src_image_u64 and *src_view_u64
+ * to point to the intermediate if cropping was performed.
+ */
+static void
+vk_crop_atlas_for_dp(struct comp_vk_native_compositor *c,
+                      VkCommandBuffer cmd,
+                      uint64_t *src_image_u64,
+                      uint64_t *src_view_u64,
+                      uint32_t content_w,
+                      uint32_t content_h,
+                      uint32_t atlas_w,
+                      uint32_t atlas_h)
+{
+	if (content_w == atlas_w && content_h == atlas_h) {
+		return;
+	}
+
+	if (!vk_ensure_dp_input_image(c, content_w, content_h)) {
+		return; // fallback: pass oversized atlas
+	}
+
+	struct vk_bundle *vk = &c->vk;
+	VkImage src_image = (VkImage)(uintptr_t)*src_image_u64;
+
+	// Transition src → TRANSFER_SRC
+	VkImageMemoryBarrier src_to_transfer = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
+	    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+	    .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	    .image = src_image,
+	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	};
+	vk->vkCmdPipelineBarrier(cmd,
+	    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+	    VK_PIPELINE_STAGE_TRANSFER_BIT,
+	    0, 0, NULL, 0, NULL, 1, &src_to_transfer);
+
+	// Transition intermediate → TRANSFER_DST
+	VkImageMemoryBarrier dst_to_transfer = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = 0,
+	    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+	    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+	    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	    .image = c->dp_input_image,
+	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	};
+	vk->vkCmdPipelineBarrier(cmd,
+	    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+	    VK_PIPELINE_STAGE_TRANSFER_BIT,
+	    0, 0, NULL, 0, NULL, 1, &dst_to_transfer);
+
+	// Copy content region
+	VkImageCopy region = {
+	    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .srcOffset = {0, 0, 0},
+	    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .dstOffset = {0, 0, 0},
+	    .extent = {content_w, content_h, 1},
+	};
+	vk->vkCmdCopyImage(cmd,
+	    src_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	    c->dp_input_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	    1, &region);
+
+	// Transition src back → SHADER_READ_ONLY
+	VkImageMemoryBarrier src_back = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+	    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+	    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	    .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	    .image = src_image,
+	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	};
+
+	// Transition intermediate → SHADER_READ_ONLY (for DP sampling)
+	VkImageMemoryBarrier dst_to_read = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+	    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+	    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	    .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	    .image = c->dp_input_image,
+	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	};
+
+	VkImageMemoryBarrier barriers[2] = {src_back, dst_to_read};
+	vk->vkCmdPipelineBarrier(cmd,
+	    VK_PIPELINE_STAGE_TRANSFER_BIT,
+	    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+	    0, 0, NULL, 0, NULL, 2, barriers);
+
+	// Update output pointers to intermediate
+	*src_image_u64 = (uint64_t)(uintptr_t)c->dp_input_image;
+	*src_view_u64 = (uint64_t)(uintptr_t)c->dp_input_view;
+}
+
 static xrt_result_t
 vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
 {
@@ -1424,6 +1640,7 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 	uint64_t zc_image_u64 = 0;
 	uint64_t zc_view_u64 = 0;
 	int32_t zc_format = 0;
+	uint32_t zc_width = 0, zc_height = 0;
 
 	{
 		const struct xrt_rendering_mode *mode = NULL;
@@ -1473,6 +1690,8 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 							if (zc_image_u64 != 0 && zc_view_u64 != 0) {
 								zero_copy = true;
 								zc_format = comp_vk_native_renderer_get_format(c->renderer);
+								zc_width = sw;
+								zc_height = sh;
 							}
 						}
 					}
@@ -1537,6 +1756,21 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 
 			comp_vk_native_renderer_get_view_dimensions(c->renderer, &view_width, &view_height);
 			comp_vk_native_renderer_get_tile_layout(c->renderer, &tc, &tr);
+
+			// Crop atlas to content dimensions before passing to DP
+			{
+				uint32_t content_w = tc * view_width;
+				uint32_t content_h = tr * view_height;
+				uint32_t atlas_w, atlas_h;
+				if (zero_copy) {
+					atlas_w = zc_width;
+					atlas_h = zc_height;
+				} else {
+					comp_vk_native_renderer_get_atlas_dimensions(c->renderer, &atlas_w, &atlas_h);
+				}
+				vk_crop_atlas_for_dp(c, cmd, &src_image_u64, &src_view_u64,
+				                      content_w, content_h, atlas_w, atlas_h);
+			}
 
 			VkRenderPass dp_render_pass = xrt_display_processor_get_render_pass(c->display_processor);
 			VkFramebuffer shared_fb = VK_NULL_HANDLE;
@@ -1670,6 +1904,21 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				comp_vk_native_renderer_get_view_dimensions(c->renderer, &view_width, &view_height);
 				comp_vk_native_renderer_get_tile_layout(c->renderer, &tc, &tr);
 
+				// Crop atlas to content dimensions before passing to DP
+				{
+					uint32_t content_w = tc * view_width;
+					uint32_t content_h = tr * view_height;
+					uint32_t atlas_w, atlas_h;
+					if (zero_copy) {
+						atlas_w = zc_width;
+						atlas_h = zc_height;
+					} else {
+						comp_vk_native_renderer_get_atlas_dimensions(c->renderer, &atlas_w, &atlas_h);
+					}
+					vk_crop_atlas_for_dp(c, cmd, &src_image_u64, &src_view_u64,
+					                      content_w, content_h, atlas_w, atlas_h);
+				}
+
 				// Create temporary framebuffer from the target's swapchain image.
 				// Must use the DP's render pass for compatibility with vkCmdBeginRenderPass.
 				VkImageView fb_view = (VkImageView)(uintptr_t)target_view;
@@ -1801,6 +2050,17 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 		vk->vkFreeMemory(vk->device, c->hud_memory, NULL);
 	}
 	u_hud_destroy(&c->hud);
+
+	// Destroy DP input crop image
+	if (c->dp_input_view != VK_NULL_HANDLE) {
+		vk->vkDestroyImageView(vk->device, c->dp_input_view, NULL);
+	}
+	if (c->dp_input_image != VK_NULL_HANDLE) {
+		vk->vkDestroyImage(vk->device, c->dp_input_image, NULL);
+	}
+	if (c->dp_input_memory != VK_NULL_HANDLE) {
+		vk->vkFreeMemory(vk->device, c->dp_input_memory, NULL);
+	}
 
 	// Destroy display processor
 	xrt_display_processor_destroy(&c->display_processor);
