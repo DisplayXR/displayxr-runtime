@@ -210,9 +210,7 @@ sim_display_hmd_get_tracked_pose(struct xrt_device *xdev,
 		out_relation->pose = hmd->pose;
 		out_relation->relation_flags = (enum xrt_space_relation_flags)(
 		    XRT_SPACE_RELATION_ORIENTATION_VALID_BIT |
-		    XRT_SPACE_RELATION_POSITION_VALID_BIT |
-		    XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT |
-		    XRT_SPACE_RELATION_POSITION_TRACKED_BIT);
+		    XRT_SPACE_RELATION_POSITION_VALID_BIT);
 		return XRT_SUCCESS;
 	}
 
@@ -227,9 +225,7 @@ sim_display_hmd_get_tracked_pose(struct xrt_device *xdev,
 		out_relation->pose = src_rel.pose;
 		out_relation->relation_flags = (enum xrt_space_relation_flags)(
 		    XRT_SPACE_RELATION_ORIENTATION_VALID_BIT |
-		    XRT_SPACE_RELATION_POSITION_VALID_BIT |
-		    XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT |
-		    XRT_SPACE_RELATION_POSITION_TRACKED_BIT);
+		    XRT_SPACE_RELATION_POSITION_VALID_BIT);
 
 		return XRT_SUCCESS;
 	}
@@ -238,9 +234,7 @@ sim_display_hmd_get_tracked_pose(struct xrt_device *xdev,
 	out_relation->pose = hmd->pose;
 	out_relation->relation_flags = (enum xrt_space_relation_flags)(
 	    XRT_SPACE_RELATION_ORIENTATION_VALID_BIT |
-	    XRT_SPACE_RELATION_POSITION_VALID_BIT |
-	    XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT |
-	    XRT_SPACE_RELATION_POSITION_TRACKED_BIT);
+	    XRT_SPACE_RELATION_POSITION_VALID_BIT);
 
 	return XRT_SUCCESS;
 }
