@@ -163,6 +163,8 @@ oxr_system_fill_in(
 				view_scale_x = 0.5f;
 				view_scale_y = 1.0f;
 				info->legacy_app_tile_scaling = true;
+				info->legacy_view_scale_x = 0.5f;
+				info->legacy_view_scale_y = 1.0f;
 				U_LOG_W("Legacy app (no XR_EXT_display_info): using compromise "
 				        "view scale 0.5x1.0 (3D mode '%s' is %.1fx%.1f)",
 				        mode3d->mode_name, mode3d->view_scale_x, mode3d->view_scale_y);
@@ -171,6 +173,8 @@ oxr_system_fill_in(
 				view_scale_x = mode3d->view_scale_x;
 				view_scale_y = mode3d->view_scale_y;
 				info->legacy_app_tile_scaling = true;
+				info->legacy_view_scale_x = mode3d->view_scale_x;
+				info->legacy_view_scale_y = mode3d->view_scale_y;
 				U_LOG_W("Legacy app (no XR_EXT_display_info): using 3D mode '%s' "
 				        "scale %.2fx%.2f", mode3d->mode_name,
 				        mode3d->view_scale_x, mode3d->view_scale_y);

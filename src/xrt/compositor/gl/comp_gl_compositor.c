@@ -1029,7 +1029,8 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			}
 			// Sync view dims from active mode every frame — needed for
 			// correct crop before DP and correct blit UV calculation.
-			if (mode->view_width_pixels > 0) {
+			// Legacy apps: view dims are fixed at compromise scale, skip.
+			if (!c->legacy_app_tile_scaling && mode->view_width_pixels > 0) {
 				c->view_width = mode->view_width_pixels;
 				c->view_height = mode->view_height_pixels;
 				if (c->canvas.valid) {
@@ -1784,6 +1785,13 @@ comp_gl_compositor_set_sys_info(struct xrt_compositor *xc, const struct xrt_syst
 	c->sys_info_set = true;
 	c->legacy_app_tile_scaling = info->legacy_app_tile_scaling;
 	c->last_3d_mode_index = 1;
+
+	// Legacy apps: fix view dims at compromise scale (the per-frame sync is skipped).
+	if (info->legacy_app_tile_scaling &&
+	    info->display_pixel_width > 0 && info->display_pixel_height > 0) {
+		c->view_width = (uint32_t)(info->display_pixel_width * info->legacy_view_scale_x);
+		c->view_height = (uint32_t)(info->display_pixel_height * info->legacy_view_scale_y);
+	}
 }
 
 void

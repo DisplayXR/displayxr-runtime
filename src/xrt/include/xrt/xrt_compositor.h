@@ -2468,6 +2468,11 @@ struct xrt_system_compositor_info
 	//! must scale tiles before passing to the display processor.
 	bool legacy_app_tile_scaling;
 
+	//! Compromise view scale for legacy apps. Only valid when legacy_app_tile_scaling is true.
+	//! The compositor must use these (not the active mode's native scale) for view dimensions.
+	float legacy_view_scale_x;
+	float legacy_view_scale_y;
+
 	//! Display left edge in OS screen coordinates. 0 if unknown.
 	int32_t display_screen_left;
 

@@ -104,6 +104,10 @@ struct comp_d3d11_renderer
 	//! Texture height (may be > view_height to accommodate mono/2D mode).
 	//! The atlas texture is tile_columns*view_width x texture_height.
 	uint32_t texture_height;
+
+	//! When true, view dims are fixed at legacy compromise scale and
+	//! set_tile_layout must not recompute them.
+	bool legacy_app_tile_scaling;
 };
 
 // Access compositor internals
@@ -1183,18 +1187,31 @@ comp_d3d11_renderer_set_tile_layout(struct comp_d3d11_renderer *renderer,
                                     uint32_t tile_columns,
                                     uint32_t tile_rows)
 {
-	// Recompute view dimensions so the atlas logical size stays constant.
-	// E.g. stereo 2×1 (vw=1920) → 2D 1×1 (vw=3840) keeps atlas_w=3840.
-	if (tile_columns > 0 && renderer->tile_columns > 0) {
-		uint32_t atlas_w = renderer->tile_columns * renderer->view_width;
-		renderer->view_width = atlas_w / tile_columns;
+	if (!renderer->legacy_app_tile_scaling) {
+		// Extension app: recompute view dimensions so the atlas logical size stays constant.
+		// E.g. stereo 2×1 (vw=1920) → 2D 1×1 (vw=3840) keeps atlas_w=3840.
+		if (tile_columns > 0 && renderer->tile_columns > 0) {
+			uint32_t atlas_w = renderer->tile_columns * renderer->view_width;
+			renderer->view_width = atlas_w / tile_columns;
+		}
+		if (tile_rows > 0 && renderer->tile_rows > 0) {
+			uint32_t atlas_h = renderer->tile_rows * renderer->view_height;
+			renderer->view_height = atlas_h / tile_rows;
+		}
 	}
-	if (tile_rows > 0 && renderer->tile_rows > 0) {
-		uint32_t atlas_h = renderer->tile_rows * renderer->view_height;
-		renderer->view_height = atlas_h / tile_rows;
-	}
+	// Legacy app: view dims stay fixed at compromise scale.
+	// Only update tile layout — the app always renders the same atlas.
 	renderer->tile_columns = tile_columns;
 	renderer->tile_rows = tile_rows;
+}
+
+extern "C" void
+comp_d3d11_renderer_set_legacy_app_tile_scaling(struct comp_d3d11_renderer *renderer,
+                                                 bool legacy)
+{
+	if (renderer != nullptr) {
+		renderer->legacy_app_tile_scaling = legacy;
+	}
 }
 
 extern "C" void *

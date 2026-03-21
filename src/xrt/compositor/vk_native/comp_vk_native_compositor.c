@@ -1570,24 +1570,28 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 	}
 
 	// Sync hardware_display_3d, tile layout, and per-view dimensions
-	// from device's active rendering mode
+	// from device's active rendering mode.
+	// Legacy apps: view dims are fixed at compromise scale, only update tile layout.
 	if (c->xdev != NULL && c->xdev->hmd != NULL) {
 		uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
 		if (idx < c->xdev->rendering_mode_count) {
 			const struct xrt_rendering_mode *mode = &c->xdev->rendering_modes[idx];
 			c->hardware_display_3d = mode->hardware_display_3d;
 			if (mode->tile_columns > 0 && c->renderer != NULL) {
-				// Always sync view dimensions and tile layout from active mode
-				uint32_t new_vw = mode->view_width_pixels;
-				uint32_t new_vh = mode->view_height_pixels;
-				uint32_t new_aw = mode->atlas_width_pixels;
-				uint32_t new_ah = mode->atlas_height_pixels;
-				if (new_vw > 0 && new_vh > 0) {
-					comp_vk_native_renderer_resize(
-					    c->renderer, new_vw, new_vh, new_aw, new_ah);
-					comp_vk_native_renderer_set_tile_layout(
-					    c->renderer, mode->tile_columns, mode->tile_rows);
+				if (!c->legacy_app_tile_scaling) {
+					// Extension app: sync view dimensions from active mode
+					uint32_t new_vw = mode->view_width_pixels;
+					uint32_t new_vh = mode->view_height_pixels;
+					uint32_t new_aw = mode->atlas_width_pixels;
+					uint32_t new_ah = mode->atlas_height_pixels;
+					if (new_vw > 0 && new_vh > 0) {
+						comp_vk_native_renderer_resize(
+						    c->renderer, new_vw, new_vh, new_aw, new_ah);
+					}
 				}
+				// Always update tile layout (both legacy and extension apps)
+				comp_vk_native_renderer_set_tile_layout(
+				    c->renderer, mode->tile_columns, mode->tile_rows);
 			}
 		}
 	}
@@ -2703,6 +2707,23 @@ comp_vk_native_compositor_set_sys_info(struct xrt_compositor *xc,
 	c->sys_info_set = true;
 	c->legacy_app_tile_scaling = info->legacy_app_tile_scaling;
 	c->last_3d_mode_index = 1;
+
+	// Legacy apps: fix view dims at compromise scale (the per-frame sync is skipped).
+	if (info->legacy_app_tile_scaling && c->renderer != NULL &&
+	    info->display_pixel_width > 0 && info->display_pixel_height > 0) {
+		uint32_t vw = (uint32_t)(info->display_pixel_width * info->legacy_view_scale_x);
+		uint32_t vh = (uint32_t)(info->display_pixel_height * info->legacy_view_scale_y);
+		uint32_t tc = 2, tr = 1;
+		if (c->xdev != NULL && c->xdev->hmd != NULL) {
+			uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
+			if (idx < c->xdev->rendering_mode_count &&
+			    c->xdev->rendering_modes[idx].tile_columns > 0) {
+				tc = c->xdev->rendering_modes[idx].tile_columns;
+				tr = c->xdev->rendering_modes[idx].tile_rows;
+			}
+		}
+		comp_vk_native_renderer_resize(c->renderer, vw, vh, tc * vw, tr * vh);
+	}
 }
 
 void

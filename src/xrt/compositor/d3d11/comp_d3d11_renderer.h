@@ -145,6 +145,21 @@ comp_d3d11_renderer_set_tile_layout(struct comp_d3d11_renderer *renderer,
                                     uint32_t tile_rows);
 
 /*!
+ * Set legacy app tile scaling flag on the renderer.
+ *
+ * When true, set_tile_layout will not recompute view dimensions,
+ * keeping them fixed at the legacy compromise scale.
+ *
+ * @param renderer The renderer.
+ * @param legacy true if legacy app tile scaling is active.
+ *
+ * @ingroup comp_d3d11
+ */
+void
+comp_d3d11_renderer_set_legacy_app_tile_scaling(struct comp_d3d11_renderer *renderer,
+                                                 bool legacy);
+
+/*!
  * Get the stereo texture for debug readback.
  *
  * Returns the ID3D11Texture2D of the side-by-side stereo texture.

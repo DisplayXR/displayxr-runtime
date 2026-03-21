@@ -85,3 +85,17 @@ The compositor adds a transform step between the app's submitted atlas and the d
 **Legacy app sees**: recommended 960x1080 per view -> swapchain 1920x1080
 - 3D mode: compositor downscales each 960x1080 tile to 960x540
 - 2D mode: compositor stretches left 960x1080 view to 1920x1080
+
+## Compositor Contract
+
+When `legacy_app_tile_scaling` is true on `xrt_system_compositor_info`:
+
+1. **View dimensions are fixed for the session lifetime.** The compositor MUST use `display_pixel_width * legacy_view_scale_x` and `display_pixel_height * legacy_view_scale_y` for per-view content dimensions, regardless of which rendering mode is active. The compositor MUST NOT recompute view dimensions from the active mode's native scale.
+
+2. **Only tile layout changes on mode switch.** When the user toggles modes (V key), the compositor updates `tile_columns` and `tile_rows` from the active mode but keeps view_width and view_height fixed.
+
+3. **Crop-blit delivers compromise-sized content.** The content region passed to the display processor is always `tile_columns * compromise_vw` × `tile_rows * compromise_vh`:
+   - 2D mode (1×1): content = 1 × compromise_vw × 1 × compromise_vh (left eye only, DP stretches to fill)
+   - 3D mode (2×1): content = 2 × compromise_vw × 1 × compromise_vh (full SBS atlas, DP interlaces)
+
+4. **Scale values are stored in `xrt_system_compositor_info`.** The fields `legacy_view_scale_x` and `legacy_view_scale_y` hold the compromise scale computed in `oxr_system_fill_in()`. These are propagated to each compositor via `set_sys_info` (Metal, GL, VK) or `set_legacy_app_tile_scaling` (D3D11, D3D12).

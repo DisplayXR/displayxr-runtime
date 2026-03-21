@@ -120,13 +120,20 @@ comp_d3d12_compositor_set_system_devices(struct xrt_compositor *xc,
 /*!
  * Set the legacy app tile scaling flag for the compositor.
  *
+ * When true, the compositor keeps view dimensions fixed at the compromise scale.
+ *
  * @param xc The compositor.
  * @param legacy true if legacy app tile scaling is active.
+ * @param scale_x Compromise view scale X (e.g. 0.5 for SBS).
+ * @param scale_y Compromise view scale Y (e.g. 1.0 for SBS).
  *
  * @ingroup comp_d3d12
  */
 void
-comp_d3d12_compositor_set_legacy_app_tile_scaling(struct xrt_compositor *xc, bool legacy);
+comp_d3d12_compositor_set_legacy_app_tile_scaling(struct xrt_compositor *xc,
+                                                   bool legacy,
+                                                   float scale_x,
+                                                   float scale_y);
 
 #ifdef __cplusplus
 }

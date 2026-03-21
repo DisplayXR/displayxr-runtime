@@ -1323,7 +1323,8 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 #endif
 
 	// Sync hardware_display_3d, tile layout, and per-view dimensions
-	// from device's active rendering mode
+	// from device's active rendering mode.
+	// Legacy apps: view dims are fixed at compromise scale, only update tile layout.
 	if (c->xdev != NULL && c->xdev->hmd != NULL) {
 		uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
 		if (idx < c->xdev->rendering_mode_count) {
@@ -1333,7 +1334,7 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 				c->tile_columns = mode->tile_columns;
 				c->tile_rows = mode->tile_rows;
 			}
-			if (mode->view_width_pixels > 0) {
+			if (!c->legacy_app_tile_scaling && mode->view_width_pixels > 0) {
 				c->view_width = mode->view_width_pixels;
 				c->view_height = mode->view_height_pixels;
 				if (c->canvas.valid) {
@@ -2133,6 +2134,13 @@ comp_metal_compositor_set_sys_info(struct xrt_compositor *xc,
 	c->sys_info = info;
 	c->legacy_app_tile_scaling = info->legacy_app_tile_scaling;
 	c->last_3d_mode_index = 1;
+
+	// Legacy apps: fix view dims at compromise scale (the per-frame sync is skipped).
+	if (info->legacy_app_tile_scaling &&
+	    info->display_pixel_width > 0 && info->display_pixel_height > 0) {
+		c->view_width = (uint32_t)(info->display_pixel_width * info->legacy_view_scale_x);
+		c->view_height = (uint32_t)(info->display_pixel_height * info->legacy_view_scale_y);
+	}
 }
 
 void

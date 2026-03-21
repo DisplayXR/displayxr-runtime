@@ -148,6 +148,10 @@ struct comp_d3d12_compositor
 	//! True when a legacy app is using a compromise view scale.
 	bool legacy_app_tile_scaling;
 
+	//! Compromise view scale for legacy apps. Only valid when legacy_app_tile_scaling is true.
+	float legacy_view_scale_x;
+	float legacy_view_scale_y;
+
 	//! Lazily allocated intermediate resource for cropping atlas to content dims.
 	ID3D12Resource *dp_input_resource;
 
@@ -976,7 +980,9 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	// Sync renderer view dims from active mode — set_tile_layout derives
 	// view dims from atlas invariance, but actual mode dims may differ
 	// (e.g. 2D mode needs full display height). Resize if needed.
-	if (c->xdev != NULL && c->xdev->hmd != NULL && c->renderer != NULL) {
+	// Legacy apps: view dims are fixed at compromise scale, skip mode sync.
+	if (!c->legacy_app_tile_scaling &&
+	    c->xdev != NULL && c->xdev->hmd != NULL && c->renderer != NULL) {
 		uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
 		if (idx < c->xdev->rendering_mode_count) {
 			const struct xrt_rendering_mode *mode = &c->xdev->rendering_modes[idx];
@@ -1832,11 +1838,39 @@ comp_d3d12_compositor_set_system_devices(struct xrt_compositor *xc,
 }
 
 void
-comp_d3d12_compositor_set_legacy_app_tile_scaling(struct xrt_compositor *xc, bool legacy)
+comp_d3d12_compositor_set_legacy_app_tile_scaling(struct xrt_compositor *xc,
+                                                   bool legacy,
+                                                   float scale_x,
+                                                   float scale_y)
 {
 	if (xc == nullptr) {
 		return;
 	}
 	struct comp_d3d12_compositor *c = d3d12_comp(xc);
 	c->legacy_app_tile_scaling = legacy;
+	c->legacy_view_scale_x = scale_x;
+	c->legacy_view_scale_y = scale_y;
+	if (c->renderer != nullptr) {
+		comp_d3d12_renderer_set_legacy_app_tile_scaling(c->renderer, legacy);
+	}
+
+	// Fix view dims at compromise scale (the per-frame mode sync is skipped for legacy).
+	if (legacy && c->renderer != nullptr && c->display_processor != nullptr) {
+		uint32_t disp_px_w = 0, disp_px_h = 0;
+		int32_t disp_left = 0, disp_top = 0;
+		if (xrt_display_processor_d3d12_get_display_pixel_info(
+		        c->display_processor, &disp_px_w, &disp_px_h, &disp_left, &disp_top) &&
+		    disp_px_w > 0 && disp_px_h > 0) {
+			uint32_t vw = (uint32_t)(disp_px_w * scale_x);
+			uint32_t vh = (uint32_t)(disp_px_h * scale_y);
+			float ratio = fminf(
+			    (float)c->settings.preferred.width / (float)disp_px_w,
+			    (float)c->settings.preferred.height / (float)disp_px_h);
+			if (ratio > 1.0f) ratio = 1.0f;
+			vw = (uint32_t)((float)vw * ratio);
+			vh = (uint32_t)((float)vh * ratio);
+			uint32_t target_h = vh;  // DP present: target = view height
+			comp_d3d12_renderer_resize(c->renderer, vw, vh, target_h);
+		}
+	}
 }

@@ -144,6 +144,18 @@ comp_d3d12_renderer_set_tile_layout(struct comp_d3d12_renderer *renderer,
                                     uint32_t tile_rows);
 
 /*!
+ * Set legacy app tile scaling flag on the renderer.
+ *
+ * @param renderer The renderer.
+ * @param legacy true if legacy app tile scaling is active.
+ *
+ * @ingroup comp_d3d12
+ */
+void
+comp_d3d12_renderer_set_legacy_app_tile_scaling(struct comp_d3d12_renderer *renderer,
+                                                 bool legacy);
+
+/*!
  * Get the stereo texture resource for direct copy.
  *
  * @param renderer The renderer.
