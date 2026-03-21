@@ -145,6 +145,12 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         PostQuitMessage(0);
         return 0;
 
+    case WM_SYSKEYDOWN:
+        // Prevent ALT from activating the system menu modal loop, which would
+        // freeze rendering on this single-threaded app.  The ALT key state is
+        // still readable via GetKeyState() for our input handler.
+        return 0;
+
     case WM_KEYDOWN:
         if (wParam == VK_ESCAPE) {
             PostMessage(hwnd, WM_CLOSE, 0, 0);

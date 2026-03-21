@@ -154,6 +154,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         g_running = false;
         PostQuitMessage(0);
         return 0;
+    case WM_SYSKEYDOWN:
+        // Prevent ALT from activating the system menu modal loop, which would
+        // freeze rendering on this single-threaded app.
+        return 0;
     case WM_KEYDOWN:
         if (wParam == VK_ESCAPE) {
             PostMessage(hwnd, WM_CLOSE, 0, 0);
