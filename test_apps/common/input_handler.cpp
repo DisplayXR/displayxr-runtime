@@ -109,17 +109,36 @@ bool UpdateInputState(InputState& state, UINT msg, WPARAM wParam, LPARAM lParam)
         int zDelta = GET_WHEEL_DELTA_WPARAM(wParam);
         float factor = (zDelta > 0) ? 1.1f : (1.0f / 1.1f);
         bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+        bool ctrl  = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+        bool alt   = (GetKeyState(VK_MENU) & 0x8000) != 0;
         if (shift) {
             state.viewParams.ipdFactor *= factor;
             if (state.viewParams.ipdFactor < 0.0f) state.viewParams.ipdFactor = 0.0f;
             if (state.viewParams.ipdFactor > 1.0f) state.viewParams.ipdFactor = 1.0f;
+        } else if (ctrl) {
             state.viewParams.parallaxFactor *= factor;
             if (state.viewParams.parallaxFactor < 0.0f) state.viewParams.parallaxFactor = 0.0f;
             if (state.viewParams.parallaxFactor > 1.0f) state.viewParams.parallaxFactor = 1.0f;
+        } else if (alt) {
+            if (state.cameraMode) {
+                state.viewParams.invConvergenceDistance *= factor;
+                if (state.viewParams.invConvergenceDistance < 0.1f) state.viewParams.invConvergenceDistance = 0.1f;
+                if (state.viewParams.invConvergenceDistance > 10.0f) state.viewParams.invConvergenceDistance = 10.0f;
+            } else {
+                state.viewParams.perspectiveFactor *= factor;
+                if (state.viewParams.perspectiveFactor < 0.1f) state.viewParams.perspectiveFactor = 0.1f;
+                if (state.viewParams.perspectiveFactor > 10.0f) state.viewParams.perspectiveFactor = 10.0f;
+            }
         } else {
-            state.viewParams.scaleFactor *= factor;
-            if (state.viewParams.scaleFactor < 0.1f) state.viewParams.scaleFactor = 0.1f;
-            if (state.viewParams.scaleFactor > 10.0f) state.viewParams.scaleFactor = 10.0f;
+            if (state.cameraMode) {
+                state.viewParams.zoomFactor *= factor;
+                if (state.viewParams.zoomFactor < 0.1f) state.viewParams.zoomFactor = 0.1f;
+                if (state.viewParams.zoomFactor > 10.0f) state.viewParams.zoomFactor = 10.0f;
+            } else {
+                state.viewParams.scaleFactor *= factor;
+                if (state.viewParams.scaleFactor < 0.1f) state.viewParams.scaleFactor = 0.1f;
+                if (state.viewParams.scaleFactor > 10.0f) state.viewParams.scaleFactor = 10.0f;
+            }
         }
         return true;
     }
