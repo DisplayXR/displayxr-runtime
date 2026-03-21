@@ -209,12 +209,28 @@ oxr_system_fill_in(
 		w = imin(w, w_max);
 		h = imin(h, h_max);
 
+		if (i == 0 && info->legacy_app_tile_scaling) {
+			U_LOG_W("Legacy view[0]: raw w=%u h=%u (disp=%ux%u scale=%.2fx%.2f dbg_scale=%.2f) "
+			        "w_max=%u h_max=%u -> clamped w=%u h=%u",
+			        (uint32_t)(info->display_pixel_width * view_scale_x * scale),
+			        (uint32_t)(info->display_pixel_height * view_scale_y * scale),
+			        info->display_pixel_width, info->display_pixel_height,
+			        view_scale_x, view_scale_y, scale,
+			        w_max, h_max, w, h);
+		}
+
 		sys->views[i].recommendedImageRectWidth = w;
 		sys->views[i].maxImageRectWidth = w_max;
 		sys->views[i].recommendedImageRectHeight = h;
 		sys->views[i].maxImageRectHeight = h_max;
 		sys->views[i].recommendedSwapchainSampleCount = info->views[i].recommended.sample_count;
 		sys->views[i].maxSwapchainSampleCount = info->views[i].max.sample_count;
+
+		// Store actual recommended dims for legacy apps (first view = per-eye size)
+		if (i == 0 && info->legacy_app_tile_scaling) {
+			info->legacy_view_width_pixels = w;
+			info->legacy_view_height_pixels = h;
+		}
 	}
 
 #undef imin

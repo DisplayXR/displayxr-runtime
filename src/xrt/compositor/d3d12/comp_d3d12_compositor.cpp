@@ -1062,6 +1062,36 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	c->cmd_allocator->Reset();
 	c->cmd_list->Reset(c->cmd_allocator, nullptr);
 
+	// Verify app renders at the expected resolution (not stretched)
+	{
+		static int rect_check_log = 0;
+		uint32_t expected_vw, expected_vh;
+		comp_d3d12_renderer_get_view_dimensions(c->renderer, &expected_vw, &expected_vh);
+		for (uint32_t li = 0; li < c->layer_accum.layer_count && rect_check_log < 8; li++) {
+			struct comp_layer *layer = &c->layer_accum.layers[li];
+			if (layer->data.type != XRT_LAYER_PROJECTION &&
+			    layer->data.type != XRT_LAYER_PROJECTION_DEPTH)
+				continue;
+			for (uint32_t v = 0; v < layer->data.view_count && v < XRT_MAX_VIEWS; v++) {
+				const struct xrt_rect *r = &layer->data.proj.v[v].sub.rect;
+				if ((uint32_t)r->extent.w != expected_vw || (uint32_t)r->extent.h != expected_vh) {
+					if (rect_check_log < 5) {
+						U_LOG_W("VIEW SIZE MISMATCH: view[%u] app_rect=%dx%d "
+						        "expected=%ux%u (legacy=%d)",
+						        v, r->extent.w, r->extent.h,
+						        expected_vw, expected_vh,
+						        c->legacy_app_tile_scaling);
+					}
+					rect_check_log++;
+				} else if (rect_check_log < 3) {
+					U_LOG_I("VIEW SIZE OK: view[%u] app_rect=%dx%d matches expected=%ux%u",
+					        v, r->extent.w, r->extent.h, expected_vw, expected_vh);
+					rect_check_log++;
+				}
+			}
+		}
+	}
+
 	// Render layers to SBS stereo texture (skip if zero-copy)
 	xrt_result_t xret = XRT_SUCCESS;
 	if (!zero_copy) {
@@ -1841,7 +1871,9 @@ void
 comp_d3d12_compositor_set_legacy_app_tile_scaling(struct xrt_compositor *xc,
                                                    bool legacy,
                                                    float scale_x,
-                                                   float scale_y)
+                                                   float scale_y,
+                                                   uint32_t view_w,
+                                                   uint32_t view_h)
 {
 	if (xc == nullptr) {
 		return;
@@ -1854,23 +1886,9 @@ comp_d3d12_compositor_set_legacy_app_tile_scaling(struct xrt_compositor *xc,
 		comp_d3d12_renderer_set_legacy_app_tile_scaling(c->renderer, legacy);
 	}
 
-	// Fix view dims at compromise scale (the per-frame mode sync is skipped for legacy).
-	if (legacy && c->renderer != nullptr && c->display_processor != nullptr) {
-		uint32_t disp_px_w = 0, disp_px_h = 0;
-		int32_t disp_left = 0, disp_top = 0;
-		if (xrt_display_processor_d3d12_get_display_pixel_info(
-		        c->display_processor, &disp_px_w, &disp_px_h, &disp_left, &disp_top) &&
-		    disp_px_w > 0 && disp_px_h > 0) {
-			uint32_t vw = (uint32_t)(disp_px_w * scale_x);
-			uint32_t vh = (uint32_t)(disp_px_h * scale_y);
-			float ratio = fminf(
-			    (float)c->settings.preferred.width / (float)disp_px_w,
-			    (float)c->settings.preferred.height / (float)disp_px_h);
-			if (ratio > 1.0f) ratio = 1.0f;
-			vw = (uint32_t)((float)vw * ratio);
-			vh = (uint32_t)((float)vh * ratio);
-			uint32_t target_h = vh;  // DP present: target = view height
-			comp_d3d12_renderer_resize(c->renderer, vw, vh, target_h);
-		}
+	// Fix view dims at the actual recommended size the app was told to render at.
+	if (legacy && c->renderer != nullptr && view_w > 0 && view_h > 0) {
+		uint32_t target_h = (c->display_processor != nullptr) ? view_h : c->settings.preferred.height;
+		comp_d3d12_renderer_resize(c->renderer, view_w, view_h, target_h);
 	}
 }

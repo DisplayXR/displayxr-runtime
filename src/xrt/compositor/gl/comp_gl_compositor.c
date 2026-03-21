@@ -1786,11 +1786,11 @@ comp_gl_compositor_set_sys_info(struct xrt_compositor *xc, const struct xrt_syst
 	c->legacy_app_tile_scaling = info->legacy_app_tile_scaling;
 	c->last_3d_mode_index = 1;
 
-	// Legacy apps: fix view dims at compromise scale (the per-frame sync is skipped).
+	// Legacy apps: fix view dims at the actual recommended size the app was told to render at.
 	if (info->legacy_app_tile_scaling &&
-	    info->display_pixel_width > 0 && info->display_pixel_height > 0) {
-		c->view_width = (uint32_t)(info->display_pixel_width * info->legacy_view_scale_x);
-		c->view_height = (uint32_t)(info->display_pixel_height * info->legacy_view_scale_y);
+	    info->legacy_view_width_pixels > 0 && info->legacy_view_height_pixels > 0) {
+		c->view_width = info->legacy_view_width_pixels;
+		c->view_height = info->legacy_view_height_pixels;
 	}
 }
 

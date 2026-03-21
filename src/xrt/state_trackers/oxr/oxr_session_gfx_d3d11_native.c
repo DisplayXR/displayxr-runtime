@@ -155,7 +155,9 @@ oxr_session_populate_d3d11_native(struct oxr_logger *log,
 		    &xcn->base,
 		    sess->sys->xsysc->info.legacy_app_tile_scaling,
 		    sess->sys->xsysc->info.legacy_view_scale_x,
-		    sess->sys->xsysc->info.legacy_view_scale_y);
+		    sess->sys->xsysc->info.legacy_view_scale_y,
+		    sess->sys->xsysc->info.legacy_view_width_pixels,
+		    sess->sys->xsysc->info.legacy_view_height_pixels);
 	}
 
 	// Set the compositor directly - no client wrapper needed
