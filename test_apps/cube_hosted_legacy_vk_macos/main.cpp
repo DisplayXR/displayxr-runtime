@@ -20,18 +20,8 @@
 #define XR_USE_GRAPHICS_API_VULKAN
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
-// Minimal type definitions for the rendering mode changed event handler.
-// The extension is NOT enabled, so this event will never fire, but the handler
-// is kept so the code structure matches the extension-aware variant.
-#ifndef XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_EXT
-#define XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_EXT ((XrStructureType)1000999010)
-typedef struct XrEventDataRenderingModeChangedEXT {
-    XrStructureType type;
-    const void *next;
-    uint32_t previousModeIndex;
-    uint32_t currentModeIndex;
-} XrEventDataRenderingModeChangedEXT;
-#endif
+// Legacy app: NO DisplayXR extension types needed.
+// This app uses only standard OpenXR APIs.
 
 #include <cmath>
 #include <csignal>
@@ -1703,14 +1693,9 @@ struct AppXrSession {
     bool sessionRunning = false;
     bool exitRequested = false;
 
-    // Legacy: no rendering mode enumeration (XR_EXT_display_info not enabled)
-    uint32_t renderingModeCount = 0;
-    uint32_t renderingModeTileColumns[8] = {};
-    uint32_t renderingModeTileRows[8] = {};
-    float renderingModeScaleX[8] = {};
-    float renderingModeScaleY[8] = {};
-    uint32_t renderingModeViewCounts[8] = {};
-    uint32_t currentModeIndex = 1;  // Default: mode 1 (first 3D mode, matches runtime default)
+    // Per-view dimensions from recommendedImageRectWidth/Height (set once at init)
+    uint32_t viewWidth = 0;
+    uint32_t viewHeight = 0;
 };
 
 static bool InitializeOpenXR(AppXrSession& xr) {
@@ -1767,6 +1752,10 @@ static bool InitializeOpenXR(AppXrSession& xr) {
             xr.configViews[i].recommendedImageRectWidth,
             xr.configViews[i].recommendedImageRectHeight);
     }
+
+    // Store per-view dimensions from recommended (fixed for session lifetime)
+    xr.viewWidth = xr.configViews[0].recommendedImageRectWidth;
+    xr.viewHeight = xr.configViews[0].recommendedImageRectHeight;
 
     return true;
 }
@@ -2098,13 +2087,7 @@ static bool PollEvents(AppXrSession& xr) {
         case XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING:
             xr.exitRequested = true;
             break;
-        case (XrStructureType)XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_EXT: {
-            auto* modeEvent = (XrEventDataRenderingModeChangedEXT*)&event;
-            LOG_INFO("Rendering mode changed: %u -> %u",
-                modeEvent->previousModeIndex, modeEvent->currentModeIndex);
-            xr.currentModeIndex = modeEvent->currentModeIndex;
-            break;
-        }
+        // Legacy app: no rendering mode events (XR_EXT_display_info not enabled)
         default:
             break;
         }
@@ -2384,30 +2367,18 @@ int main() {
                         if (AcquireSwapchainImage(xr, imageIndex)) {
                             rendered = true;
 
-                            // Use current mode's view count (not xrLocateViews count, which is max across all modes)
-                            uint32_t modeViewCount = viewCount;
-                            uint32_t tileColumns = viewCount;
-                            uint32_t tileRows = 1;
-                            if (xr.renderingModeCount > 0 && xr.currentModeIndex < xr.renderingModeCount) {
-                                modeViewCount = xr.renderingModeViewCounts[xr.currentModeIndex];
-                                tileColumns = xr.renderingModeTileColumns[xr.currentModeIndex];
-                                tileRows = xr.renderingModeTileRows[xr.currentModeIndex];
-                                if (tileColumns == 0) tileColumns = modeViewCount;
-                                if (tileRows == 0) tileRows = 1;
-                            }
+                            // Legacy app: always render 2 stereo views in SBS layout.
+                            // View dimensions come from recommendedImageRectWidth/Height (set at init).
+                            // The runtime handles 2D/3D mode switching — we just render the same SBS atlas.
+                            uint32_t eyeCount = 2;
+                            uint32_t eyeW = xr.viewWidth;
+                            uint32_t eyeH = xr.viewHeight;
 
-                            // Legacy: derive per-view dimensions from swapchain/tiles
-                            uint32_t eyeW = xr.swapchain.width / tileColumns;
-                            uint32_t eyeH = xr.swapchain.height / tileRows;
-
-                            std::vector<EyeRenderParams> eyeParams(modeViewCount);
-                            projectionViews.resize(modeViewCount, {});
-                            for (uint32_t i = 0; i < modeViewCount; i++) {
-                                uint32_t tileX = i % tileColumns;
-                                uint32_t tileY = i / tileColumns;
-
-                                eyeParams[i].viewportX = tileX * eyeW;
-                                eyeParams[i].viewportY = tileY * eyeH;
+                            EyeRenderParams eyeParams[2];
+                            projectionViews.resize(eyeCount, {});
+                            for (uint32_t i = 0; i < eyeCount; i++) {
+                                eyeParams[i].viewportX = i * eyeW;  // SBS: left eye at 0, right at eyeW
+                                eyeParams[i].viewportY = 0;
                                 eyeParams[i].width = eyeW;
                                 eyeParams[i].height = eyeH;
                                 mat4_view_from_xr_pose(eyeParams[i].viewMat, views[i].pose);
@@ -2415,16 +2386,14 @@ int main() {
 
                                 projectionViews[i].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
                                 projectionViews[i].subImage.swapchain = xr.swapchain.swapchain;
-                                projectionViews[i].subImage.imageRect.offset = {(int32_t)(tileX * eyeW), (int32_t)(tileY * eyeH)};
-                                projectionViews[i].subImage.imageRect.extent = {
-                                    (int32_t)eyeW, (int32_t)eyeH
-                                };
+                                projectionViews[i].subImage.imageRect.offset = {(int32_t)(i * eyeW), 0};
+                                projectionViews[i].subImage.imageRect.extent = {(int32_t)eyeW, (int32_t)eyeH};
                                 projectionViews[i].subImage.imageArrayIndex = 0;
                                 projectionViews[i].pose = views[i].pose;
                                 projectionViews[i].fov = views[i].fov;
                             }
 
-                            RenderScene(vkRenderer, imageIndex, eyeParams.data(), (int)modeViewCount);
+                            RenderScene(vkRenderer, imageIndex, eyeParams, (int)eyeCount);
                             ReleaseSwapchainImage(xr);
                         }
                     }

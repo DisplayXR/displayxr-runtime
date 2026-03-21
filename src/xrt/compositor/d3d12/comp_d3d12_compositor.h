@@ -126,6 +126,8 @@ comp_d3d12_compositor_set_system_devices(struct xrt_compositor *xc,
  * @param legacy true if legacy app tile scaling is active.
  * @param scale_x Compromise view scale X (e.g. 0.5 for SBS).
  * @param scale_y Compromise view scale Y (e.g. 1.0 for SBS).
+ * @param view_w Recommended per-view width in pixels (from oxr_system_fill_in).
+ * @param view_h Recommended per-view height in pixels (from oxr_system_fill_in).
  *
  * @ingroup comp_d3d12
  */
@@ -133,7 +135,9 @@ void
 comp_d3d12_compositor_set_legacy_app_tile_scaling(struct xrt_compositor *xc,
                                                    bool legacy,
                                                    float scale_x,
-                                                   float scale_y);
+                                                   float scale_y,
+                                                   uint32_t view_w,
+                                                   uint32_t view_h);
 
 #ifdef __cplusplus
 }

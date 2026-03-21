@@ -12,6 +12,7 @@
 
 #include "comp_layer_accum.h"
 #include "util/u_misc.h"
+#include "util/u_logging.h"
 #include "xrt/xrt_compositor.h"
 #include "xrt/xrt_limits.h"
 

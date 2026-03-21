@@ -1427,6 +1427,32 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 				continue;
 			}
 
+			// Verify app renders at the expected resolution (not stretched)
+			{
+				static int rect_check_log = 0;
+				for (uint32_t v = 0; v < layer->data.view_count && v < XRT_MAX_VIEWS; v++) {
+					const struct xrt_rect *r = &layer->data.proj.v[v].sub.rect;
+					uint32_t expected_w = c->view_width;
+					uint32_t expected_h = c->view_height;
+					if (r->extent.w != (int32_t)expected_w || r->extent.h != (int32_t)expected_h) {
+						if (rect_check_log < 5) {
+							U_LOG_W("VIEW SIZE MISMATCH: view[%u] app_rect=%ux%u "
+							        "expected=%ux%u (tiles=%ux%u legacy=%d) — "
+							        "app renders wrong resolution, will be stretched!",
+							        v, r->extent.w, r->extent.h,
+							        expected_w, expected_h,
+							        c->tile_columns, c->tile_rows,
+							        c->legacy_app_tile_scaling);
+							rect_check_log++;
+						}
+					} else if (rect_check_log < 3) {
+						U_LOG_I("VIEW SIZE OK: view[%u] app_rect=%ux%u matches expected=%ux%u",
+						        v, r->extent.w, r->extent.h, expected_w, expected_h);
+						rect_check_log++;
+					}
+				}
+			}
+
 			// Use min of compositor's tile count and layer's submitted views
 			uint32_t mode_views = c->hardware_display_3d ? (c->tile_columns * c->tile_rows) : 1;
 			uint32_t view_count = (layer->data.view_count < mode_views) ? layer->data.view_count : mode_views;
@@ -1539,6 +1565,21 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		// The DP expects texture dimensions to match content exactly.
 		uint32_t content_w = c->tile_columns * c->view_width;
 		uint32_t content_h = c->tile_rows * c->view_height;
+
+		// Verify content region fits within atlas
+		if (content_w > c->atlas_width || content_h > c->atlas_height) {
+			static int crop_err_log = 0;
+			if (crop_err_log < 3) {
+				U_LOG_W("CROP-BLIT OVERFLOW: content=%ux%u > atlas=%ux%u "
+				        "(vw=%u vh=%u tiles=%ux%u legacy=%d)",
+				        content_w, content_h,
+				        c->atlas_width, c->atlas_height,
+				        c->view_width, c->view_height,
+				        c->tile_columns, c->tile_rows,
+				        c->legacy_app_tile_scaling);
+				crop_err_log++;
+			}
+		}
 		id<MTLTexture> dp_src = atlas_src;
 
 		if (content_w != c->atlas_width || content_h != c->atlas_height) {
@@ -1922,9 +1963,19 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 	uint32_t atlas_w = pixel_width;
 	uint32_t atlas_h = pixel_height;
 	if (xdev != NULL && xdev->rendering_mode_count > 0) {
+		for (uint32_t mi = 0; mi < xdev->rendering_mode_count; mi++) {
+			const struct xrt_rendering_mode *m = &xdev->rendering_modes[mi];
+			U_LOG_W("MODE[%u] '%s': tiles=%ux%u scale=%.2fx%.2f view=%ux%u atlas=%ux%u",
+			        mi, m->mode_name, m->tile_columns, m->tile_rows,
+			        m->view_scale_x, m->view_scale_y,
+			        m->view_width_pixels, m->view_height_pixels,
+			        m->atlas_width_pixels, m->atlas_height_pixels);
+		}
 		u_tiling_compute_system_atlas(xdev->rendering_modes,
 		                              xdev->rendering_mode_count,
 		                              &atlas_w, &atlas_h);
+		U_LOG_W("System atlas worst-case: %ux%u (fallback was %ux%u)",
+		        atlas_w, atlas_h, pixel_width, pixel_height);
 	}
 
 	// Compile shaders
@@ -2135,11 +2186,11 @@ comp_metal_compositor_set_sys_info(struct xrt_compositor *xc,
 	c->legacy_app_tile_scaling = info->legacy_app_tile_scaling;
 	c->last_3d_mode_index = 1;
 
-	// Legacy apps: fix view dims at compromise scale (the per-frame sync is skipped).
+	// Legacy apps: fix view dims at the actual recommended size the app was told to render at.
 	if (info->legacy_app_tile_scaling &&
-	    info->display_pixel_width > 0 && info->display_pixel_height > 0) {
-		c->view_width = (uint32_t)(info->display_pixel_width * info->legacy_view_scale_x);
-		c->view_height = (uint32_t)(info->display_pixel_height * info->legacy_view_scale_y);
+	    info->legacy_view_width_pixels > 0 && info->legacy_view_height_pixels > 0) {
+		c->view_width = info->legacy_view_width_pixels;
+		c->view_height = info->legacy_view_height_pixels;
 	}
 }
 

@@ -2473,6 +2473,13 @@ struct xrt_system_compositor_info
 	float legacy_view_scale_x;
 	float legacy_view_scale_y;
 
+	//! Actual recommended per-view pixel dimensions for legacy apps, computed in
+	//! oxr_system_fill_in() after all scaling and clamping. The compositor must use
+	//! these directly instead of recomputing from display_pixel × scale.
+	//! Only valid when legacy_app_tile_scaling is true.
+	uint32_t legacy_view_width_pixels;
+	uint32_t legacy_view_height_pixels;
+
 	//! Display left edge in OS screen coordinates. 0 if unknown.
 	int32_t display_screen_left;
 

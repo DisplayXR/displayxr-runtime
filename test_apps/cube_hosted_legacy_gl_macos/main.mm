@@ -25,18 +25,8 @@
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 #include <openxr/XR_EXT_macos_gl_binding.h>
-// Minimal type definitions for the rendering mode changed event handler.
-// The extension is NOT enabled, so this event will never fire, but the handler
-// is kept so the code structure matches the extension-aware variant.
-#ifndef XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_EXT
-#define XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_EXT ((XrStructureType)1000999010)
-typedef struct XrEventDataRenderingModeChangedEXT {
-    XrStructureType type;
-    const void *next;
-    uint32_t previousModeIndex;
-    uint32_t currentModeIndex;
-} XrEventDataRenderingModeChangedEXT;
-#endif
+// Legacy app: NO DisplayXR extension types needed.
+// This app uses only standard OpenXR APIs.
 
 #include <cmath>
 #include <csignal>
@@ -700,14 +690,9 @@ struct AppXrSession {
     bool sessionRunning;
     bool exitRequested;
 
-    // Legacy: no rendering mode enumeration (XR_EXT_display_info not enabled)
-    uint32_t renderingModeCount = 0;
-    uint32_t renderingModeTileColumns[8] = {};
-    uint32_t renderingModeTileRows[8] = {};
-    float renderingModeScaleX[8] = {};
-    float renderingModeScaleY[8] = {};
-    uint32_t renderingModeViewCounts[8] = {};
-    uint32_t currentModeIndex = 1;  // Default: mode 1 (first 3D mode, matches runtime default)
+    // Per-view dimensions from recommendedImageRectWidth/Height (set once at init)
+    uint32_t viewWidth = 0;
+    uint32_t viewHeight = 0;
 };
 
 static volatile bool g_running = true;
@@ -777,6 +762,10 @@ static bool InitializeOpenXR(AppXrSession &app)
                  app.configViews[i].recommendedImageRectWidth,
                  app.configViews[i].recommendedImageRectHeight);
     }
+
+    // Store per-view dimensions from recommended (fixed for session lifetime)
+    app.viewWidth = app.configViews[0].recommendedImageRectWidth;
+    app.viewHeight = app.configViews[0].recommendedImageRectHeight;
 
     return true;
 }
@@ -904,12 +893,7 @@ static void PollEvents(AppXrSession &app)
             }
             break;
         }
-        case XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_EXT: {
-            auto *rmc = (XrEventDataRenderingModeChangedEXT *)&event;
-            app.currentModeIndex = rmc->currentModeIndex;
-            LOG_INFO("Rendering mode changed: %u -> %u", rmc->previousModeIndex, rmc->currentModeIndex);
-            break;
-        }
+        // Legacy app: no rendering mode events (XR_EXT_display_info not enabled)
         default: break;
         }
         event = {XR_TYPE_EVENT_DATA_BUFFER};
@@ -1072,25 +1056,17 @@ int main(int argc, char **argv)
         waitImgInfo.timeout = XR_INFINITE_DURATION;
         xrWaitSwapchainImage(app.swapchain.swapchain, &waitImgInfo);
 
-        // Use current mode's view count (not xrLocateViews count, which is max across all modes)
-        uint32_t modeViewCount = (app.currentModeIndex < app.renderingModeCount)
-            ? app.renderingModeViewCounts[app.currentModeIndex] : viewCount;
-        // Render N views into tile positions using runtime-provided tile layout.
-        // Falls back to derived layout if mode enumeration unavailable.
-        uint32_t tileColumns = (app.currentModeIndex < app.renderingModeCount)
-            ? app.renderingModeTileColumns[app.currentModeIndex] : (modeViewCount >= 2 ? 2 : 1);
-        uint32_t tileRows = (app.currentModeIndex < app.renderingModeCount)
-            ? app.renderingModeTileRows[app.currentModeIndex] : ((modeViewCount + tileColumns - 1) / tileColumns);
-        if (frameState.shouldRender && modeViewCount >= 1) {
-            uint32_t eyeW = tileColumns > 0 ? app.swapchain.width / tileColumns : app.swapchain.width;
-            uint32_t eyeH = tileRows > 0 ? app.swapchain.height / tileRows : app.swapchain.height;
-
-            std::vector<EyeRenderParams> eyeParams(modeViewCount);
-            for (uint32_t i = 0; i < modeViewCount; i++) {
-                uint32_t tileX = i % tileColumns;
-                uint32_t tileY = i / tileColumns;
-                eyeParams[i].viewportX = tileX * eyeW;
-                eyeParams[i].viewportY = tileY * eyeH;
+        // Legacy app: always render 2 stereo views in SBS layout.
+        // View dimensions come from recommendedImageRectWidth/Height (set at init).
+        // The runtime handles 2D/3D mode switching — we just render the same SBS atlas.
+        uint32_t eyeCount = 2;
+        uint32_t eyeW = app.viewWidth;
+        uint32_t eyeH = app.viewHeight;
+        if (frameState.shouldRender && viewCount >= 2) {
+            EyeRenderParams eyeParams[2];
+            for (uint32_t i = 0; i < eyeCount; i++) {
+                eyeParams[i].viewportX = i * eyeW;  // SBS: left eye at 0, right at eyeW
+                eyeParams[i].viewportY = 0;
                 eyeParams[i].width = eyeW;
                 eyeParams[i].height = eyeH;
                 mat4_view_from_xr_pose(eyeParams[i].viewMat, views[i].pose);
@@ -1098,35 +1074,31 @@ int main(int argc, char **argv)
             }
 
             RenderScene(renderer, app.swapchain.images[imageIndex],
-                        app.swapchain.width, app.swapchain.height, eyeParams.data(), (int)modeViewCount);
+                        app.swapchain.width, app.swapchain.height, eyeParams, (int)eyeCount);
         }
 
         // Release swapchain image
         XrSwapchainImageReleaseInfo relInfo = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
         xrReleaseSwapchainImage(app.swapchain.swapchain, &relInfo);
 
-        // End frame
-        std::vector<XrCompositionLayerProjectionView> projViews(modeViewCount, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
-        for (uint32_t i = 0; i < modeViewCount; i++) {
-            uint32_t tileX = i % tileColumns;
-            uint32_t tileY = i / tileColumns;
-            uint32_t eyeW = tileColumns > 0 ? app.swapchain.width / tileColumns : app.swapchain.width;
-            uint32_t eyeH = tileRows > 0 ? app.swapchain.height / tileRows : app.swapchain.height;
+        // End frame — submit 2 SBS views with recommended per-view dimensions
+        XrCompositionLayerProjectionView projViews[2] = {
+            {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},
+            {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}
+        };
+        for (uint32_t i = 0; i < eyeCount; i++) {
             projViews[i].pose = views[i].pose;
             projViews[i].fov = views[i].fov;
             projViews[i].subImage.swapchain = app.swapchain.swapchain;
-            projViews[i].subImage.imageRect.offset = {(int32_t)(tileX * eyeW), (int32_t)(tileY * eyeH)};
-            projViews[i].subImage.imageRect.extent = {
-                (int32_t)eyeW,
-                (int32_t)eyeH
-            };
+            projViews[i].subImage.imageRect.offset = {(int32_t)(i * eyeW), 0};
+            projViews[i].subImage.imageRect.extent = {(int32_t)eyeW, (int32_t)eyeH};
             projViews[i].subImage.imageArrayIndex = 0;
         }
 
         XrCompositionLayerProjection projLayer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
         projLayer.space = app.localSpace;
-        projLayer.viewCount = modeViewCount;
-        projLayer.views = projViews.data();
+        projLayer.viewCount = eyeCount;
+        projLayer.views = projViews;
 
         const XrCompositionLayerBaseHeader *layers[] = {
             (XrCompositionLayerBaseHeader *)&projLayer

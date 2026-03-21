@@ -370,8 +370,7 @@ bool CreateSession(XrSessionManager& xr, VkInstance vkInstance, VkPhysicalDevice
     XR_CHECK_LOG(xrCreateSession(xr.instance, &sessionInfo, &xr.session));
     LOG_INFO("Session created: 0x%p", (void*)xr.session);
 
-    // No rendering mode enumeration — legacy app uses compromise scaling
-    // renderingModeCount stays 0, pfnEnumerateDisplayRenderingModesEXT stays null
+    // Legacy app: no rendering mode enumeration, no display info extension
 
     return true;
 }

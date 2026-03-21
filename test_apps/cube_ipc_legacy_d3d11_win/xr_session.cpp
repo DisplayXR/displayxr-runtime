@@ -163,8 +163,7 @@ bool CreateSession(XrSessionManager& xr, ID3D11Device* d3d11Device) {
     XR_CHECK_LOG(xrCreateSession(xr.instance, &sessionInfo, &xr.session));
     LOG_INFO("Session created: 0x%p (IPC mode expected — verify with displayxr-service logs)", (void*)xr.session);
 
-    // No rendering mode enumeration — legacy app uses compromise scaling
-    // renderingModeCount stays 0, pfnEnumerateDisplayRenderingModesEXT stays null
+    // Legacy app: no rendering mode enumeration, no display info extension
 
     return true;
 }

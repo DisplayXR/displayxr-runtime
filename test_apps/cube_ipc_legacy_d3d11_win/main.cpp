@@ -223,7 +223,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         if (xr.sessionRunning) {
             XrFrameState frameState;
             if (BeginFrame(xr, frameState)) {
-                XrCompositionLayerProjectionView projectionViews[8] = {};
+                XrCompositionLayerProjectionView projectionViews[2] = {};
                 uint32_t submitViewCount = 2;
 
                 if (frameState.shouldRender) {
@@ -233,31 +233,24 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                         0.0f, 0.0f, 0.0f,  // playerPos (handled by qwerty)
                         0.0f, 0.0f)) {     // playerYaw/Pitch (handled by qwerty)
 
-                        // Use current mode's view count (not xr.viewCount which is max across all modes)
-                        uint32_t modeViewCount = (xr.currentModeIndex < xr.renderingModeCount)
-                            ? xr.renderingModeViewCounts[xr.currentModeIndex] : xr.viewCount;
-                        submitViewCount = modeViewCount;
+                        // Legacy app: always 2 SBS views at fixed dimensions
+                        submitViewCount = 2;
 
-                        // Get raw view poses (pre-player-transform) for projection views.
+                        // Get raw view poses for projection views
                         XrViewLocateInfo locateInfo = {XR_TYPE_VIEW_LOCATE_INFO};
                         locateInfo.viewConfigurationType = xr.viewConfigType;
                         locateInfo.displayTime = frameState.predictedDisplayTime;
                         locateInfo.space = xr.localSpace;
 
                         XrViewState viewState = {XR_TYPE_VIEW_STATE};
-                        uint32_t rawViewCount = 8;
-                        XrView rawViews[8];
-                        for (uint32_t i = 0; i < 8; i++) rawViews[i] = {XR_TYPE_VIEW};
-                        xrLocateViews(xr.session, &locateInfo, &viewState, 8, &rawViewCount, rawViews);
+                        uint32_t rawViewCount = 2;
+                        XrView rawViews[2];
+                        for (uint32_t i = 0; i < 2; i++) rawViews[i] = {XR_TYPE_VIEW};
+                        xrLocateViews(xr.session, &locateInfo, &viewState, 2, &rawViewCount, rawViews);
 
-                        // Get tile layout from rendering mode, with fallback
-                        uint32_t tileColumns = (xr.currentModeIndex < xr.renderingModeCount)
-                            ? xr.renderingModeTileColumns[xr.currentModeIndex] : (modeViewCount >= 2 ? 2 : 1);
-                        uint32_t tileRows = (xr.currentModeIndex < xr.renderingModeCount)
-                            ? xr.renderingModeTileRows[xr.currentModeIndex] : ((modeViewCount + tileColumns - 1) / tileColumns);
-
-                        uint32_t tileW = xr.swapchain.width / tileColumns;
-                        uint32_t tileH = xr.swapchain.height / tileRows;
+                        // Legacy SBS layout: viewWidth per eye, left at (0,0), right at (viewWidth,0)
+                        uint32_t viewWidth = xr.swapchain.width / 2;
+                        uint32_t viewHeight = xr.swapchain.height;
 
                         uint32_t imageIndex;
                         if (AcquireSwapchainImage(xr, imageIndex)) {
@@ -272,24 +265,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                             renderer.context->ClearDepthStencilView(depthDSV.Get(),
                                 D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
 
-                            for (uint32_t eye = 0; eye < modeViewCount; eye++) {
-                                uint32_t tileX = eye % tileColumns;
-                                uint32_t tileY = eye / tileColumns;
-
+                            for (uint32_t eye = 0; eye < 2; eye++) {
                                 D3D11_VIEWPORT vp = {};
-                                vp.TopLeftX = (FLOAT)(tileX * tileW);
-                                vp.TopLeftY = (FLOAT)(tileY * tileH);
-                                vp.Width = (FLOAT)tileW;
-                                vp.Height = (FLOAT)tileH;
+                                vp.TopLeftX = (FLOAT)(eye * viewWidth);
+                                vp.TopLeftY = 0.0f;
+                                vp.Width = (FLOAT)viewWidth;
+                                vp.Height = (FLOAT)viewHeight;
                                 vp.MaxDepth = 1.0f;
                                 renderer.context->RSSetViewports(1, &vp);
 
                                 XMMATRIX viewMatrix = xr.viewMatrices[eye];
                                 XMMATRIX projMatrix = xr.projMatrices[eye];
 
-                                // Non-ext app: 0.3m cube at z=-2m, no zoom control
+                                // Legacy app: 0.3m cube at z=-2m, no zoom control
                                 RenderScene(renderer, rtv, depthDSV.Get(),
-                                    tileW, tileH,
+                                    viewWidth, viewHeight,
                                     viewMatrix, projMatrix,
                                     1.0f, 1.6f, -2.0f, 0.3f);
 
@@ -297,11 +287,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                                 projectionViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
                                 projectionViews[eye].subImage.swapchain = xr.swapchain.swapchain;
                                 projectionViews[eye].subImage.imageRect.offset = {
-                                    (int32_t)(tileX * tileW), (int32_t)(tileY * tileH)
+                                    (int32_t)(eye * viewWidth), 0
                                 };
                                 projectionViews[eye].subImage.imageRect.extent = {
-                                    (int32_t)tileW,
-                                    (int32_t)tileH
+                                    (int32_t)viewWidth,
+                                    (int32_t)viewHeight
                                 };
                                 projectionViews[eye].subImage.imageArrayIndex = 0;
 
