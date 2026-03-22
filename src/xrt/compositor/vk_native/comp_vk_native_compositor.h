@@ -142,6 +142,16 @@ void
 comp_vk_native_compositor_set_legacy_app_tile_scaling(struct xrt_compositor *xc, bool legacy);
 
 /*!
+ * Set canvas output rect for shared-texture apps.
+ *
+ * @ingroup comp_vk_native
+ */
+void
+comp_vk_native_compositor_set_output_rect(struct xrt_compositor *xc,
+                                           int32_t x, int32_t y,
+                                           uint32_t w, uint32_t h);
+
+/*!
  * Get the vk_bundle from a VK native compositor (for sub-modules).
  *
  * @ingroup comp_vk_native

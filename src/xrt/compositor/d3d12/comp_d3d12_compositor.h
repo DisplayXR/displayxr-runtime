@@ -139,6 +139,16 @@ comp_d3d12_compositor_set_legacy_app_tile_scaling(struct xrt_compositor *xc,
                                                    uint32_t view_w,
                                                    uint32_t view_h);
 
+/*!
+ * Set canvas output rect for shared-texture apps.
+ *
+ * @ingroup comp_d3d12
+ */
+void
+comp_d3d12_compositor_set_output_rect(struct xrt_compositor *xc,
+                                       int32_t x, int32_t y,
+                                       uint32_t w, uint32_t h);
+
 #ifdef __cplusplus
 }
 #endif

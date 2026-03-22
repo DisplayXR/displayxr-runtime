@@ -34,6 +34,7 @@
 
 #include "math/m_api.h"
 #include "util/u_tiling.h"
+#include "util/u_canvas.h"
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
 #include "qwerty_interface.h"
@@ -181,6 +182,9 @@ struct comp_vk_native_compositor
 	VkImageView dp_input_view;
 	VkDeviceMemory dp_input_memory;
 	uint32_t dp_input_width, dp_input_height;
+
+	//! Canvas output rect for shared-texture apps.
+	struct u_canvas_rect canvas;
 };
 
 /*
@@ -1584,6 +1588,10 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 					uint32_t new_vh = mode->view_height_pixels;
 					uint32_t new_aw = mode->atlas_width_pixels;
 					uint32_t new_ah = mode->atlas_height_pixels;
+					if (c->canvas.valid) {
+						u_tiling_compute_canvas_view(mode, c->canvas.w, c->canvas.h,
+						                             &new_vw, &new_vh);
+					}
 					if (new_vw > 0 && new_vh > 0) {
 						comp_vk_native_renderer_resize(
 						    c->renderer, new_vw, new_vh, new_aw, new_ah);
@@ -1791,6 +1799,14 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				vk->vkCreateFramebuffer(vk->device, &fb_ci, NULL, &shared_fb);
 			}
 
+			// DP target: use canvas dims for texture apps
+			uint32_t dp_target_w = tgt_width;
+			uint32_t dp_target_h = tgt_height;
+			if (c->canvas.valid && c->canvas.w > 0 && c->canvas.h > 0) {
+				dp_target_w = c->canvas.w;
+				dp_target_h = c->canvas.h;
+			}
+
 			xrt_display_processor_process_atlas(
 			    c->display_processor,
 			    cmd,
@@ -1801,7 +1817,7 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			    (VkFormat_XDP)view_format,
 			    shared_fb,
 			    (VkImage_XDP)c->shared_image,
-			    tgt_width, tgt_height,
+			    dp_target_w, dp_target_h,
 			    (VkFormat_XDP)view_format);
 
 			vk->vkEndCommandBuffer(cmd);
@@ -2602,6 +2618,7 @@ comp_vk_native_compositor_get_window_metrics(struct xrt_compositor *xc,
 	out_metrics->window_center_offset_y_m = -((win_center_px_y - disp_center_px_y) * pixel_size_y);
 
 	out_metrics->valid = true;
+	u_canvas_apply_to_metrics(out_metrics, &c->canvas);
 	return true;
 #elif defined(XRT_OS_MACOS)
 	// On macOS, delegate to display processor if available
@@ -2654,6 +2671,7 @@ comp_vk_native_compositor_get_window_metrics(struct xrt_compositor *xc,
 		out_metrics->window_center_offset_y_m = -((win_center_px_y - disp_center_px_y) * pixel_size_y);
 
 		out_metrics->valid = true;
+		u_canvas_apply_to_metrics(out_metrics, &c->canvas);
 		return true;
 	}
 	return false;
@@ -2732,6 +2750,16 @@ comp_vk_native_compositor_set_legacy_app_tile_scaling(struct xrt_compositor *xc,
 	if (xc == NULL) return;
 	struct comp_vk_native_compositor *c = vk_comp(xc);
 	c->legacy_app_tile_scaling = legacy;
+}
+
+void
+comp_vk_native_compositor_set_output_rect(struct xrt_compositor *xc,
+                                           int32_t x, int32_t y,
+                                           uint32_t w, uint32_t h)
+{
+	if (xc == NULL) return;
+	struct comp_vk_native_compositor *c = vk_comp(xc);
+	c->canvas = (struct u_canvas_rect){.valid = true, .x = x, .y = y, .w = w, .h = h};
 }
 
 struct vk_bundle *

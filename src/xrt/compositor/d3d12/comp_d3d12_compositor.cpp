@@ -31,6 +31,7 @@
 
 #include "math/m_api.h"
 #include "util/u_tiling.h"
+#include "util/u_canvas.h"
 #include "util/u_hud.h"
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
@@ -151,6 +152,9 @@ struct comp_d3d12_compositor
 	//! Compromise view scale for legacy apps. Only valid when legacy_app_tile_scaling is true.
 	float legacy_view_scale_x;
 	float legacy_view_scale_y;
+
+	//! Canvas output rect for shared-texture apps.
+	struct u_canvas_rect canvas;
 
 	//! Lazily allocated intermediate resource for cropping atlas to content dims.
 	ID3D12Resource *dp_input_resource;
@@ -987,15 +991,21 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		if (idx < c->xdev->rendering_mode_count) {
 			const struct xrt_rendering_mode *mode = &c->xdev->rendering_modes[idx];
 			if (mode->view_width_pixels > 0) {
+				uint32_t new_vw = mode->view_width_pixels;
+				uint32_t new_vh = mode->view_height_pixels;
+				if (c->canvas.valid) {
+					u_tiling_compute_canvas_view(mode, c->canvas.w, c->canvas.h,
+					                             &new_vw, &new_vh);
+				}
 				uint32_t cur_vw, cur_vh;
 				comp_d3d12_renderer_get_view_dimensions(c->renderer, &cur_vw, &cur_vh);
-				if (cur_vw != mode->view_width_pixels || cur_vh != mode->view_height_pixels) {
+				if (cur_vw != new_vw || cur_vh != new_vh) {
 					uint32_t resize_target_h = (c->display_processor != NULL)
-					    ? mode->view_height_pixels : tgt_height;
+					    ? new_vh : tgt_height;
 					comp_d3d12_renderer_resize(
 					    c->renderer,
-					    mode->view_width_pixels,
-					    mode->view_height_pixels,
+					    new_vw,
+					    new_vh,
 					    resize_target_h);
 				}
 			}
@@ -1265,6 +1275,14 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			scissor.bottom = static_cast<LONG>(tgt_height);
 			c->cmd_list->RSSetScissorRects(1, &scissor);
 
+			// DP target: use canvas dims for texture apps
+			uint32_t dp_target_w = tgt_width;
+			uint32_t dp_target_h = tgt_height;
+			if (c->canvas.valid && c->canvas.w > 0 && c->canvas.h > 0) {
+				dp_target_w = c->canvas.w;
+				dp_target_h = c->canvas.h;
+			}
+
 			xrt_display_processor_d3d12_process_atlas(
 			    c->display_processor,
 			    c->cmd_list,
@@ -1275,7 +1293,7 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			    view_width, view_height,
 			    tile_columns, tile_rows,
 			    static_cast<uint32_t>(DXGI_FORMAT_R8G8B8A8_UNORM),
-			    tgt_width, tgt_height);
+			    dp_target_w, dp_target_h);
 
 			// Transition atlas back: COMMON → PIXEL_SHADER_RESOURCE
 			atlas_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
@@ -1836,7 +1854,11 @@ comp_d3d12_compositor_get_window_metrics(struct xrt_compositor *xc,
 {
 	struct comp_d3d12_compositor *c = d3d12_comp(xc);
 
-	return xrt_display_processor_d3d12_get_window_metrics(c->display_processor, out_metrics);
+	bool ok = xrt_display_processor_d3d12_get_window_metrics(c->display_processor, out_metrics);
+	if (ok) {
+		u_canvas_apply_to_metrics(out_metrics, &c->canvas);
+	}
+	return ok;
 }
 
 extern "C" bool
@@ -1891,4 +1913,14 @@ comp_d3d12_compositor_set_legacy_app_tile_scaling(struct xrt_compositor *xc,
 		uint32_t target_h = (c->display_processor != nullptr) ? view_h : c->settings.preferred.height;
 		comp_d3d12_renderer_resize(c->renderer, view_w, view_h, target_h);
 	}
+}
+
+extern "C" void
+comp_d3d12_compositor_set_output_rect(struct xrt_compositor *xc,
+                                       int32_t x, int32_t y,
+                                       uint32_t w, uint32_t h)
+{
+	if (xc == nullptr) return;
+	struct comp_d3d12_compositor *c = d3d12_comp(xc);
+	c->canvas = (struct u_canvas_rect){.valid = true, .x = x, .y = y, .w = w, .h = h};
 }
