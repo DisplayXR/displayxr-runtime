@@ -1716,15 +1716,27 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    // IOSurface = display size (worst case). ~14 MB for a 2560x1440 display.
+    // IOSurface = worst-case swapchain atlas (same computation as CreateSwapchain).
     // Canvas rect communicated separately via xrSetSharedTextureOutputRectEXT.
     // See ADR-010 for rationale.
     NSRect backing = [g_metalView convertRectToBacking:g_metalView.bounds];
-    uint32_t ioW = app.displayPixelWidth > 0 ? app.displayPixelWidth : (uint32_t)backing.size.width;
-    uint32_t ioH = app.displayPixelHeight > 0 ? app.displayPixelHeight : (uint32_t)backing.size.height;
+    uint32_t ioW = 0, ioH = 0;
+    if (app.renderingModeCount > 0 && app.displayPixelWidth > 0 && app.displayPixelHeight > 0) {
+        for (uint32_t i = 0; i < app.renderingModeCount; i++) {
+            uint32_t mw = (uint32_t)(app.renderingModeTileColumns[i] * app.renderingModeScaleX[i] * app.displayPixelWidth);
+            uint32_t mh = (uint32_t)(app.renderingModeTileRows[i] * app.renderingModeScaleY[i] * app.displayPixelHeight);
+            if (mw > ioW) ioW = mw;
+            if (mh > ioH) ioH = mh;
+        }
+    }
+    if (ioW == 0 || ioH == 0) {
+        // Fallback: display dims or canvas backing
+        ioW = app.displayPixelWidth > 0 ? app.displayPixelWidth : (uint32_t)backing.size.width;
+        ioH = app.displayPixelHeight > 0 ? app.displayPixelHeight : (uint32_t)backing.size.height;
+    }
     app.canvasPixelWidth = (uint32_t)backing.size.width;
     app.canvasPixelHeight = (uint32_t)backing.size.height;
-    LOG_INFO("IOSurface dimensions (display): %ux%u", ioW, ioH);
+    LOG_INFO("IOSurface dimensions (worst-case atlas): %ux%u", ioW, ioH);
 
     // Create the shared IOSurface
     if (!CreateIOSurface(ioW, ioH, renderer.device)) {

@@ -818,10 +818,22 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         renderer.device->CreateRenderTargetView(backBuf.Get(), nullptr, &appBackBufferRTV);
     }
 
-    // Create shared D3D11 texture
-    // Use display pixel dimensions if available, otherwise default
-    g_sharedWidth = xr.displayPixelWidth > 0 ? xr.displayPixelWidth : 1920;
-    g_sharedHeight = xr.displayPixelHeight > 0 ? xr.displayPixelHeight : 1080;
+    // Create shared D3D11 texture at worst-case swapchain atlas dims.
+    // See ADR-010 for rationale.
+    g_sharedWidth = 0;
+    g_sharedHeight = 0;
+    if (xr.renderingModeCount > 0 && xr.displayPixelWidth > 0 && xr.displayPixelHeight > 0) {
+        for (uint32_t i = 0; i < xr.renderingModeCount; i++) {
+            uint32_t mw = (uint32_t)(xr.renderingModeTileColumns[i] * xr.renderingModeScaleX[i] * xr.displayPixelWidth);
+            uint32_t mh = (uint32_t)(xr.renderingModeTileRows[i] * xr.renderingModeScaleY[i] * xr.displayPixelHeight);
+            if (mw > g_sharedWidth) g_sharedWidth = mw;
+            if (mh > g_sharedHeight) g_sharedHeight = mh;
+        }
+    }
+    if (g_sharedWidth == 0 || g_sharedHeight == 0) {
+        g_sharedWidth = xr.displayPixelWidth > 0 ? xr.displayPixelWidth : 1920;
+        g_sharedHeight = xr.displayPixelHeight > 0 ? xr.displayPixelHeight : 1080;
+    }
     {
         D3D11_TEXTURE2D_DESC desc = {};
         desc.Width = g_sharedWidth;
