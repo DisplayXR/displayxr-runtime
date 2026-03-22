@@ -15,13 +15,13 @@ We initially sized the IOSurface to match the canvas (the sub-rect of the window
 
 ## Decision
 
-**IOSurface = display size (worst case), allocated once at session creation.**
+**IOSurface = swapchain size (worst-case atlas across all rendering modes), allocated once at session creation.**
 
 The canvas rect is communicated separately via `xrSetSharedTextureOutputRectEXT`, which the compositor uses for Kooima FOV calculation and view sizing. The IOSurface itself never needs to be resized.
 
 ## Rationale
 
-1. **Negligible memory cost.** A 2560x1440 BGRA8 IOSurface is ~14 MB. Allocating at display size (worst case) wastes at most a few MB compared to canvas-sized.
+1. **Negligible memory cost.** A 2560x1440 BGRA8 IOSurface is ~14 MB. Allocating at worst-case atlas size wastes at most a few MB compared to canvas-sized.
 
 2. **Zero compute savings from smaller IOSurface.** The compositor already sizes views to the canvas rect regardless of IOSurface dimensions. The display processor renders into its own output (e.g., Leia SR's hidden HWND), decoupled from the IOSurface size. A smaller IOSurface saves no GPU work.
 
@@ -33,9 +33,30 @@ The canvas rect is communicated separately via `xrSetSharedTextureOutputRectEXT`
 
 **Dynamic IOSurface recreation on canvas resize.** This was the original implementation. It required `xrUpdateSharedSurfaceEXT`, per-frame size checks, and careful synchronization. The complexity was not justified by any measurable benefit.
 
+## Read-Back Contract
+
+The compositor writes interlaced/composited output to the **top-left corner** of the IOSurface at canvas dimensions. The remainder of the surface is undefined.
+
+```
+IOSurface (swapchain-sized, e.g. 3024×1964)
+┌──────────────┬─────────┐
+│  Valid content│         │
+│  (canvasW ×  │ unused  │
+│   canvasH)   │         │
+├──────────────┘         │
+│        unused           │
+└─────────────────────────┘
+```
+
+**App-side blit:** Sample only the valid region using UV scale `(canvasW / surfaceW, canvasH / surfaceH)`. Letterbox using the **canvas** aspect ratio, not the IOSurface aspect ratio.
+
+**The app already knows the canvas dims** — it set them via `xrSetSharedTextureOutputRectEXT`. No runtime-to-app query API is needed. The contract is symmetric: the app sends `(x, y, w, h)`, the runtime writes `(w × h)` to origin, the app reads `(w × h)` from origin.
+
+For pixel-precise interlacing (e.g., Leia SR), the absolute screen position of the canvas flows internally through `u_canvas_apply_to_metrics()` to the display processor. The app does not need to know about this.
+
 ## Consequences
 
-- IOSurface is created once at `app.displayPixelWidth x displayPixelHeight` (falling back to initial canvas size if display info is unavailable).
+- IOSurface is created once at worst-case swapchain dimensions (`max(tileColumns * viewWidth)` × `max(tileRows * viewHeight)` across all rendering modes, assuming canvas = full window = full display).
 - `xrUpdateSharedSurfaceEXT` and `comp_metal_compositor_update_shared_iosurface` are removed from the codebase.
 - `xrSetSharedTextureOutputRectEXT` remains and must be called per-frame when the canvas moves or resizes.
 - Future `_shared` apps on other platforms (Windows shared texture) should follow the same pattern: allocate at display size, communicate canvas rect separately.
