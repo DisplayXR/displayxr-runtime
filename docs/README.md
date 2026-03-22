@@ -1,5 +1,9 @@
 # DisplayXR Documentation
 
+## Product
+
+- [Spatial Desktop PRD](spatial-desktop-prd.md) — Product requirements for the spatial desktop platform (runtime + 3D shell)
+
 ## Specs (`specs/`)
 
 Living feature and extension specifications.
@@ -36,6 +40,8 @@ System design documents.
 - [Display Spatial Model](architecture/display-spatial-model.md) — Displays in the spatial graph
 - [Spatial OS](architecture/spatial-os.md) — Multi-app spatial operating system
 - [3D Shell](architecture/3d-shell.md) — Window manager for 3D displays
+- [3D Capture](architecture/3d-capture.md) — 3D capture pipeline (screenshots, recording, datasets)
+- [Shell/Runtime Contract](architecture/shell-runtime-contract.md) — IPC message set between shell and runtime
 - [Multi-Display Single Machine](architecture/multi-display-single-machine.md) — Multiple displays on one machine
 - [Multi-Display Networked](architecture/multi-display-networked.md) — Networked multi-display
 - [In-Process vs Service](architecture/in-process-vs-service.md) — Compositor deployment modes

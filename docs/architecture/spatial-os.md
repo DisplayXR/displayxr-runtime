@@ -15,6 +15,8 @@ This doc covers the **compositing mechanism** — how N app textures become one 
 | Doc | Relationship |
 |-----|-------------|
 | [3d-shell.md](3d-shell.md) (#44) | **Window manager / policy layer.** Decides where windows go and how users interact. Depends on this doc. |
+| [3d-capture.md](3d-capture.md) | **3D capture pipeline.** Taps into the multi-compositor output defined here for spatial capture. |
+| [shell-runtime-contract.md](shell-runtime-contract.md) | **Shell/runtime IPC contract.** Defines the message set between shell and runtime, including capture commands. |
 | [multi-display-single-machine.md](multi-display-single-machine.md) (#69) | **Multi-display extension.** Routes this compositor's output to multiple local displays. Depends on #43 + #44. |
 | [multi-display-networked.md](multi-display-networked.md) (#70) | **Networked extension.** Extends multi-display to remote machines. Depends on #69. |
 

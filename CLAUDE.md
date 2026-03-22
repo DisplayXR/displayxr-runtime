@@ -245,6 +245,9 @@ See `docs/README.md` for a complete index. Key docs by task:
 | Add a new OpenXR extension | `docs/notes/implementing-extension.md` |
 | Write a device driver | `docs/notes/writing-driver.md` |
 | Understand stereo math / Kooima projection | `docs/architecture/stereo3d-math.md` |
+| Understand the 3D capture pipeline | `docs/architecture/3d-capture.md` |
+| Understand shell/runtime IPC contract | `docs/architecture/shell-runtime-contract.md` |
+| Understand the overall product vision | `docs/spatial-desktop-prd.md` |
 
 ## Debug Logs
 - Use U_LOG_W (WARN) only for one-off init, error, and lifecycle events

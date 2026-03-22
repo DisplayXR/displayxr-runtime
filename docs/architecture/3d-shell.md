@@ -15,6 +15,8 @@ This doc covers the **window manager / policy layer** — placement, interaction
 | Doc | Relationship |
 |-----|-------------|
 | [spatial-os.md](spatial-os.md) (#43) | **Compositing mechanism.** Defines the multi-compositor pipeline this shell drives. This doc depends on it. |
+| [3d-capture.md](3d-capture.md) | **3D capture pipeline.** Runtime captures spatial content; shell provides capture UX (hotkeys, browse, share). |
+| [shell-runtime-contract.md](shell-runtime-contract.md) | **Shell/runtime IPC contract.** Defines the message set this shell uses to communicate with the runtime. |
 | [multi-display-single-machine.md](multi-display-single-machine.md) (#69) | **Multi-display extension.** Extends shell + compositor to multiple local displays. Depends on #43 + #44. |
 | [multi-display-networked.md](multi-display-networked.md) (#70) | **Networked extension.** Extends multi-display to remote machines. Depends on #69. |
 
