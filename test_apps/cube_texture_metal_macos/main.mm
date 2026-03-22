@@ -293,17 +293,23 @@ fragment float4 grid_fragment(GridVertexOut in [[stage_in]],
 
 // --- Blit shader (fullscreen triangle sampling IOSurface texture) ---
 
+struct BlitParams {
+    float2 uv_scale; // (canvasW/surfaceW, canvasH/surfaceH)
+};
+
 struct BlitVertexOut {
     float4 position [[position]];
     float2 uv;
 };
 
-vertex BlitVertexOut blit_vertex(uint vid [[vertex_id]])
+vertex BlitVertexOut blit_vertex(uint vid [[vertex_id]],
+                                 constant BlitParams &params [[buffer(0)]])
 {
     BlitVertexOut out;
     out.uv = float2((vid << 1) & 2, vid & 2);
     out.position = float4(out.uv * 2.0 - 1.0, 0.0, 1.0);
     out.uv.y = 1.0 - out.uv.y; // Flip Y for Metal
+    out.uv *= params.uv_scale;  // Crop to canvas portion of IOSurface
     return out;
 }
 
@@ -1071,34 +1077,39 @@ static void BlitIOSurfaceToDrawable(MetalRenderer &r, CAMetalLayer *metalLayer)
     id<MTLCommandBuffer> cmdBuf = [r.commandQueue commandBuffer];
     id<MTLRenderCommandEncoder> enc = [cmdBuf renderCommandEncoderWithDescriptor:rpd];
 
-    // Blit the IOSurface content, letterboxed into the drawable
+    // Blit the canvas portion of the IOSurface, letterboxed into the drawable
     if (g_ioSurfaceReadTexture != nil) {
         float drawW = (float)drawable.texture.width;
         float drawH = (float)drawable.texture.height;
-        float surfW = (float)g_ioSurfaceWidth;
-        float surfH = (float)g_ioSurfaceHeight;
 
-        // Compute letterbox viewport (fit IOSurface aspect ratio into drawable)
-        float surfAspect = surfW / surfH;
+        // UV scale: only sample the canvas portion of the IOSurface
+        // (compositor writes canvas-sized content to top-left corner)
+        float uvScaleX = (g_ioSurfaceWidth > 0) ? (float)g_canvasW / (float)g_ioSurfaceWidth : 1.0f;
+        float uvScaleY = (g_ioSurfaceHeight > 0) ? (float)g_canvasH / (float)g_ioSurfaceHeight : 1.0f;
+
+        // Letterbox using canvas aspect ratio (not IOSurface aspect)
+        float canvasAspect = (g_canvasH > 0) ? (float)g_canvasW / (float)g_canvasH : 1.0f;
         float drawAspect = drawW / drawH;
         float vpX, vpY, vpW, vpH;
-        if (surfAspect > drawAspect) {
-            // Wider than drawable: pillarbox vertically
+        if (canvasAspect > drawAspect) {
             vpW = drawW;
-            vpH = drawW / surfAspect;
+            vpH = drawW / canvasAspect;
             vpX = 0;
             vpY = (drawH - vpH) / 2.0f;
         } else {
-            // Taller than drawable: letterbox horizontally
             vpH = drawH;
-            vpW = drawH * surfAspect;
+            vpW = drawH * canvasAspect;
             vpX = (drawW - vpW) / 2.0f;
             vpY = 0;
         }
 
+        // Pass UV scale to blit shader
+        struct { float uv_scale[2]; } blitParams = { { uvScaleX, uvScaleY } };
+
         MTLViewport vp = {(double)vpX, (double)vpY, (double)vpW, (double)vpH, 0.0, 1.0};
         [enc setViewport:vp];
         [enc setRenderPipelineState:r.blitPipeline];
+        [enc setVertexBytes:&blitParams length:sizeof(blitParams) atIndex:0];
         [enc setFragmentTexture:g_ioSurfaceReadTexture atIndex:0];
         [enc setFragmentSamplerState:r.sampler atIndex:0];
         [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];

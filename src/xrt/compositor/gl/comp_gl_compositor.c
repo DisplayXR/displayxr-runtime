@@ -1275,9 +1275,15 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			                        c->shared_gl_texture, 0);
 
 			if (c->display_processor != NULL) {
+				// DP target: use canvas dims for texture apps
+				uint32_t dp_w = c->shared_width;
+				uint32_t dp_h = c->shared_height;
+				if (c->canvas.valid && c->canvas.w > 0 && c->canvas.h > 0) {
+					dp_w = c->canvas.w;
+					dp_h = c->canvas.h;
+				}
 				// Crop atlas to content dims, then pass to DP
-				gl_crop_and_process_dp(c, atlas_for_present,
-				                       c->shared_width, c->shared_height);
+				gl_crop_and_process_dp(c, atlas_for_present, dp_w, dp_h);
 			} else {
 				// No display processor: simple blit
 				glViewport(0, 0, c->shared_width, c->shared_height);
@@ -1316,9 +1322,15 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 		                        GL_TEXTURE_RECTANGLE, c->iosurface_gl_texture, 0);
 
 		if (c->display_processor != NULL) {
+			// DP target: use canvas dims for texture apps
+			uint32_t dp_w = c->iosurface_width;
+			uint32_t dp_h = c->iosurface_height;
+			if (c->canvas.valid && c->canvas.w > 0 && c->canvas.h > 0) {
+				dp_w = c->canvas.w;
+				dp_h = c->canvas.h;
+			}
 			// Crop atlas to content dims, then pass to DP
-			gl_crop_and_process_dp(c, atlas_for_present,
-			                       c->iosurface_width, c->iosurface_height);
+			gl_crop_and_process_dp(c, atlas_for_present, dp_w, dp_h);
 		} else {
 			// No display processor: simple blit, no Y-flip.
 			// Content stays GL bottom-up; app's blit shader must NOT flip Y.
