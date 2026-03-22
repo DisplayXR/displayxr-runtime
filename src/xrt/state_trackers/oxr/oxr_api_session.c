@@ -40,6 +40,14 @@
 #include "gl/comp_gl_compositor.h"
 #endif
 
+#ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
+#include "vk_native/comp_vk_native_compositor.h"
+#endif
+
+#ifdef XRT_HAVE_D3D12_NATIVE_COMPOSITOR
+#include "d3d12/comp_d3d12_compositor.h"
+#endif
+
 
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrCreateSession(XrInstance instance, const XrSessionCreateInfo *createInfo, XrSession *out_session)
@@ -1467,6 +1475,20 @@ oxr_xrSetSharedTextureOutputRectEXT(XrSession session,
 #ifdef XRT_HAVE_GL_NATIVE_COMPOSITOR
 	if (sess->is_gl_native_compositor && sess->xcn != NULL) {
 		comp_gl_compositor_set_output_rect(&sess->xcn->base, x, y, width, height);
+		return XR_SUCCESS;
+	}
+#endif
+
+#ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
+	if (sess->is_vk_native_compositor && sess->xcn != NULL) {
+		comp_vk_native_compositor_set_output_rect(&sess->xcn->base, x, y, width, height);
+		return XR_SUCCESS;
+	}
+#endif
+
+#ifdef XRT_HAVE_D3D12_NATIVE_COMPOSITOR
+	if (sess->is_d3d12_native_compositor && sess->xcn != NULL) {
+		comp_d3d12_compositor_set_output_rect(&sess->xcn->base, x, y, width, height);
 		return XR_SUCCESS;
 	}
 #endif
