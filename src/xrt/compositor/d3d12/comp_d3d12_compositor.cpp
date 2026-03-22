@@ -1922,5 +1922,6 @@ comp_d3d12_compositor_set_output_rect(struct xrt_compositor *xc,
 {
 	if (xc == nullptr) return;
 	struct comp_d3d12_compositor *c = d3d12_comp(xc);
-	c->canvas = (struct u_canvas_rect){.valid = true, .x = x, .y = y, .w = w, .h = h};
+	struct u_canvas_rect rect = {true, x, y, w, h};
+	c->canvas = rect;
 }
