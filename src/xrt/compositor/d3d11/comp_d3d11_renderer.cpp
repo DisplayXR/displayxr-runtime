@@ -93,11 +93,11 @@ struct comp_d3d11_renderer
 	//! Depth stencil state.
 	ID3D11DepthStencilState *depth_stencil_state;
 
-	//! View dimensions (per-eye stereo).
+	//! View dimensions (per-eye).
 	uint32_t view_width;
 	uint32_t view_height;
 
-	//! Tile layout for atlas (e.g. 2x1 for stereo SBS, 2x2 for quad).
+	//! Tile layout for atlas (e.g. 2x1 for stereo, 2x2 for quad).
 	uint32_t tile_columns;
 	uint32_t tile_rows;
 
@@ -382,7 +382,7 @@ create_resources(struct comp_d3d11_renderer *r)
 
 	HRESULT hr = internals->device->CreateTexture2D(&texDesc, nullptr, &r->atlas_texture);
 	if (FAILED(hr)) {
-		U_LOG_E("Failed to create stereo texture: 0x%08x", hr);
+		U_LOG_E("Failed to create atlas texture: 0x%08x", hr);
 		return XRT_ERROR_D3D;
 	}
 
@@ -390,7 +390,7 @@ create_resources(struct comp_d3d11_renderer *r)
 	        texDesc.Width, texDesc.Height, r->view_width, r->view_height,
 	        r->tile_columns, r->tile_rows, r->texture_height);
 
-	// Create SRV for stereo texture
+	// Create SRV for atlas texture
 	D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
 	srvDesc.Format = texDesc.Format;
 	srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
@@ -398,14 +398,14 @@ create_resources(struct comp_d3d11_renderer *r)
 
 	hr = internals->device->CreateShaderResourceView(r->atlas_texture, &srvDesc, &r->atlas_srv);
 	if (FAILED(hr)) {
-		U_LOG_E("Failed to create stereo SRV: 0x%08x", hr);
+		U_LOG_E("Failed to create atlas SRV: 0x%08x", hr);
 		return XRT_ERROR_D3D;
 	}
 
-	// Create RTV for stereo texture
+	// Create RTV for atlas texture
 	hr = internals->device->CreateRenderTargetView(r->atlas_texture, nullptr, &r->atlas_rtv);
 	if (FAILED(hr)) {
-		U_LOG_E("Failed to create stereo RTV: 0x%08x", hr);
+		U_LOG_E("Failed to create atlas RTV: 0x%08x", hr);
 		return XRT_ERROR_D3D;
 	}
 
@@ -915,7 +915,7 @@ comp_d3d11_renderer_create(struct comp_d3d11_compositor *c,
 			r->tile_rows = ci->xdev->rendering_modes[idx].tile_rows;
 		}
 	}
-	// Default to stereo side-by-side if not set
+	// Default to 2x1 (stereo) if not set
 	if (r->tile_columns == 0) {
 		r->tile_columns = 2;
 	}
@@ -1000,7 +1000,7 @@ comp_d3d11_renderer_draw(struct comp_d3d11_renderer *renderer,
 {
 	auto internals = get_internals(renderer->c);
 
-	// Set render target to stereo texture
+	// Set render target to atlas texture
 	internals->context->OMSetRenderTargets(1, &renderer->atlas_rtv, renderer->depth_dsv);
 
 	// Clear to dark blue (similar to Vulkan compositor)
@@ -1289,7 +1289,7 @@ comp_d3d11_renderer_resize(struct comp_d3d11_renderer *renderer,
 
 	HRESULT hr = internals->device->CreateTexture2D(&texDesc, nullptr, &renderer->atlas_texture);
 	if (FAILED(hr)) {
-		U_LOG_E("Failed to recreate stereo texture: 0x%08x", hr);
+		U_LOG_E("Failed to recreate atlas texture: 0x%08x", hr);
 		return XRT_ERROR_D3D;
 	}
 
@@ -1301,14 +1301,14 @@ comp_d3d11_renderer_resize(struct comp_d3d11_renderer *renderer,
 
 	hr = internals->device->CreateShaderResourceView(renderer->atlas_texture, &srvDesc, &renderer->atlas_srv);
 	if (FAILED(hr)) {
-		U_LOG_E("Failed to recreate stereo SRV: 0x%08x", hr);
+		U_LOG_E("Failed to recreate atlas SRV: 0x%08x", hr);
 		return XRT_ERROR_D3D;
 	}
 
 	// Recreate RTV
 	hr = internals->device->CreateRenderTargetView(renderer->atlas_texture, nullptr, &renderer->atlas_rtv);
 	if (FAILED(hr)) {
-		U_LOG_E("Failed to recreate stereo RTV: 0x%08x", hr);
+		U_LOG_E("Failed to recreate atlas RTV: 0x%08x", hr);
 		return XRT_ERROR_D3D;
 	}
 
@@ -1378,7 +1378,7 @@ comp_d3d11_renderer_blit_stretch(struct comp_d3d11_renderer *renderer,
 	internals->context->OMSetBlendState(renderer->blend_opaque, nullptr, 0xFFFFFFFF);
 	internals->context->PSSetSamplers(0, 1, &renderer->sampler_linear);
 
-	// Bind stereo texture SRV
+	// Bind atlas texture SRV
 	internals->context->PSSetShaderResources(0, 1, &renderer->atlas_srv);
 
 	// Set constant buffer: identity MVP, UV covers the mono-rendered region.

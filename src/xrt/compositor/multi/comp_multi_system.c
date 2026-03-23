@@ -39,7 +39,7 @@
 #include "util/comp_render_helpers.h"
 #include "util/u_tiling.h"
 
-// Vulkan helpers needed for Y-flip SBS blit (not Leia-specific)
+// Vulkan helpers needed for Y-flip atlas blit (not Leia-specific)
 #include "vk/vk_helpers.h"
 #include "vk/vk_hud_blend.h"
 
@@ -341,7 +341,7 @@ get_session_layer_view(struct multi_layer_entry *layer,
 
 /*!
  * Initialize intermediate composite resources for pre-display-processing layer compositing.
- * Creates a side-by-side stereo image, per-eye views, render pass, framebuffers,
+ * Creates a tiled atlas image, per-eye views, render pass, framebuffers,
  * pipeline, and descriptor resources.
  *
  * @param mc    The multi_compositor with per-session rendering already initialized
@@ -889,7 +889,7 @@ has_window_space_layers(struct multi_compositor *mc)
 }
 
 /*!
- * Composite all layers (projection + window-space) into the intermediate stereo
+ * Composite all layers (projection + window-space) into the intermediate atlas
  * targets before display processing. This is the pre-display-processing compositing step.
  *
  * Intel CCS workaround (Intel Iris Xe / Gen12 iGPU):
@@ -1562,7 +1562,7 @@ recreate_session_swapchain(struct multi_compositor *mc, struct vk_bundle *vk)
 
 /*!
  * Get tile layout from the active rendering mode of the head device.
- * Defaults to 2 columns, 1 row (side-by-side stereo) if not available.
+ * Defaults to 2 columns, 1 row (stereo) if not available.
  */
 static void
 get_active_tile_layout(struct multi_compositor *mc, uint32_t *out_tile_columns, uint32_t *out_tile_rows)
@@ -2215,9 +2215,9 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 		return;
 	}
 
-	// Mono (2D) path: blit single view directly to target, skip SBS and weaving.
+	// Mono (2D) path: blit single view directly to target, skip atlas and weaving.
 	// In 2D mode the app submits only one view (viewCount=1). We blit it
-	// directly to the presentation target without side-by-side packing or
+	// directly to the presentation target without atlas packing or
 	// light-field interlacing (weaving).
 	if (!mc->hardware_display_3d) {
 		// Mono + window-space overlays: composite projection + HUD overlays
@@ -2394,7 +2394,7 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 		// ATLAS INPUT PATH: blit eyes into tiled atlas image, then weave
 		// with explicit pre/post layout barriers on the target image.
 		// Tile layout comes from the active rendering mode (default 2x1
-		// for stereo side-by-side).
+		// for stereo).
 		// ================================================================
 		{
 			// Get tile layout from active rendering mode

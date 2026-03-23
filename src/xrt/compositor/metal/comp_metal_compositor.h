@@ -5,7 +5,7 @@
  * @brief  Native Metal compositor — public C header.
  *
  * Mirrors the D3D11 native compositor: creates Metal swapchains directly,
- * renders layers into a side-by-side stereo texture, optionally weaves
+ * renders layers into a tiled atlas texture, optionally weaves
  * through a display processor, and presents to a CAMetalLayer.
  *
  * @author David Fattal

@@ -1063,7 +1063,7 @@ oxr_session_locate_views(struct oxr_logger *log,
 	struct oxr_space *baseSpc = XRT_CAST_OXR_HANDLE_TO_PTR(struct oxr_space *, viewLocateInfo->space);
 	uint32_t view_count = xdev->hmd->view_count;
 
-	// Active rendering mode's view count — controls mono vs stereo eye assignment.
+	// Active rendering mode's view count — controls mono vs 3D eye assignment.
 	// view_count is the max across all modes (always returned to the app),
 	// but active_view_count reflects the current mode (e.g., 1 for 2D, 2 for stereo).
 	uint32_t active_mode_idx = xdev->hmd->active_rendering_mode_index;
@@ -1150,17 +1150,17 @@ oxr_session_locate_views(struct oxr_logger *log,
 
 	// One-shot diagnostic: log stereo gate values for first frames
 	{
-		static int stereo_gate_log = 0;
-		if (stereo_gate_log < 3) {
-			U_LOG_W("STEREO-GATE[%d]: got_eyes=%d valid=%d count=%d "
+		static int view_3d_gate_log = 0;
+		if (view_3d_gate_log < 3) {
+			U_LOG_W("3D-GATE[%d]: got_eyes=%d valid=%d count=%d "
 			        "have_view_state=%d is_gl=%d has_ext_win=%d "
 			        "eye0=(%.4f,%.4f,%.4f) eye1=(%.4f,%.4f,%.4f)",
-			        stereo_gate_log, got_eye_positions, eye_pos.valid, eye_pos.count,
+			        view_3d_gate_log, got_eye_positions, eye_pos.valid, eye_pos.count,
 			        have_view_state, sess->is_gl_native_compositor,
 			        sess->has_external_window,
 			        eye_pos.eyes[0].x, eye_pos.eyes[0].y, eye_pos.eyes[0].z,
 			        eye_pos.eyes[1].x, eye_pos.eyes[1].y, eye_pos.eyes[1].z);
-			stereo_gate_log++;
+			view_3d_gate_log++;
 		}
 	}
 
@@ -1175,7 +1175,7 @@ oxr_session_locate_views(struct oxr_logger *log,
 		}
 	}
 
-	// Get device pose for stereo world-space computation (qwerty = virtual display)
+	// Get device pose for 3D world-space computation (qwerty = virtual display)
 	if (!sess->has_external_window) {
 		struct xrt_space_relation display_relation = XRT_SPACE_RELATION_ZERO;
 		xrt_device_get_tracked_pose(xdev, XRT_INPUT_GENERIC_HEAD_POSE, xdisplay_time, &display_relation);
@@ -1401,8 +1401,8 @@ oxr_session_locate_views(struct oxr_logger *log,
 		OXR_CHECK_XRET(log, sess, xret, xrt_device_get_view_poses);
 
 		// Restore client-side Kooima FOVs only when the client has local
-		// stereo state (non-IPC mode). In IPC mode, the server already
-		// computes stereo-adjusted Kooima FOVs and returns them via
+		// 3D state (non-IPC mode). In IPC mode, the server already
+		// computes 3D-adjusted Kooima FOVs and returns them via
 		// get_view_poses — don't override those.
 		if (have_kooima_fov && have_view_state) {
 			for (uint32_t ei = 0; ei < view_count; ei++) {

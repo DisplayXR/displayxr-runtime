@@ -6,7 +6,7 @@
  *
  * Mirrors the D3D11 native compositor but uses Metal instead:
  * - Creates Metal textures as swapchain images
- * - Renders layers into SBS stereo texture using Metal shaders
+ * - Renders layers into atlas texture using Metal shaders
  * - Presents to CAMetalLayer via drawable
  * - Optionally processes through display processor (LeiaSR weaver)
  *
@@ -97,10 +97,10 @@ struct comp_metal_compositor
 	//! CAMetalLayer for presentation.
 	CAMetalLayer *metal_layer;
 
-	//! Render pipeline for SBS layer compositing.
+	//! Render pipeline for atlas layer compositing.
 	id<MTLRenderPipelineState> projection_pipeline;
 
-	//! Render pipeline for fullscreen blit (stereo→target, SBS passthrough).
+	//! Render pipeline for fullscreen blit (atlas→target passthrough).
 	id<MTLRenderPipelineState> blit_pipeline;
 
 	//! Sampler state for texture sampling.
@@ -109,10 +109,10 @@ struct comp_metal_compositor
 	//! Depth stencil state.
 	id<MTLDepthStencilState> depth_stencil_state;
 
-	//! Atlas stereo texture (tile_columns * view_width × tile_rows * view_height).
+	//! Atlas texture (tile_columns * view_width × tile_rows * view_height).
 	id<MTLTexture> atlas_texture;
 
-	//! Depth texture matching stereo texture.
+	//! Depth texture matching atlas texture.
 	id<MTLTexture> depth_texture;
 
 	//! Accumulated layers for the current frame.
@@ -124,10 +124,10 @@ struct comp_metal_compositor
 	//! Per-eye view height.
 	uint32_t view_height;
 
-	//! Number of tile columns in the atlas (default 2 for SBS stereo).
+	//! Number of tile columns in the atlas (default 2 for stereo).
 	uint32_t tile_columns;
 
-	//! Number of tile rows in the atlas (default 1 for SBS stereo).
+	//! Number of tile rows in the atlas (default 1 for stereo).
 	uint32_t tile_rows;
 
 	//! Atlas texture width (worst-case, fixed at init).
@@ -436,7 +436,7 @@ compile_shaders(struct comp_metal_compositor *c)
 		}
 	}
 
-	// Projection pipeline (renders into stereo texture)
+	// Projection pipeline (renders into atlas texture)
 	{
 		MTLRenderPipelineDescriptor *proj_desc = [[MTLRenderPipelineDescriptor alloc] init];
 		proj_desc.vertexFunction = proj_vs;
@@ -520,7 +520,7 @@ create_atlas_texture(struct comp_metal_compositor *c,
 
 	c->atlas_texture = [c->device newTextureWithDescriptor:desc];
 	if (c->atlas_texture == nil) {
-		U_LOG_E("Failed to create stereo texture");
+		U_LOG_E("Failed to create atlas texture");
 		return false;
 	}
 
@@ -1404,7 +1404,7 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 	}
 
-	// Step 1: Render layers into SBS stereo texture (skip if zero-copy)
+	// Step 1: Render layers into atlas texture (skip if zero-copy)
 	if (!zero_copy && c->atlas_texture != nil && c->layer_accum.layer_count > 0) {
 		MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
 		pass.colorAttachments[0].texture = c->atlas_texture;
@@ -1869,7 +1869,7 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 
 	// Get display dimensions from device.
 	// screens[0] holds the logical (point) size — used for NSWindow creation.
-	// The stereo texture must be at Retina (physical pixel) resolution so
+	// The atlas texture must be at Retina (physical pixel) resolution so
 	// the app's retina-resolution swapchain isn't downscaled then re-upscaled.
 	uint32_t display_width = 0;
 	uint32_t display_height = 0;
@@ -1993,7 +1993,7 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 		return XRT_ERROR_VULKAN;
 	}
 
-	// Create atlas stereo texture at worst-case Retina resolution
+	// Create atlas texture at worst-case Retina resolution
 	if (!create_atlas_texture(c, atlas_w, atlas_h, init_view_w, init_view_h)) {
 		os_mutex_destroy(&c->mutex);
 		free(c);

@@ -908,7 +908,7 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 	}
 
-	// Extract stereo pair for renderer (display processor still needs L/R)
+	// Extract eye positions for renderer (display processor still needs L/R)
 	struct xrt_vec3 left_eye = {eye_pos.eyes[0].x, eye_pos.eyes[0].y, eye_pos.eyes[0].z};
 	struct xrt_vec3 right_eye = {eye_pos.eyes[1].x, eye_pos.eyes[1].y, eye_pos.eyes[1].z};
 
@@ -1102,7 +1102,7 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 	}
 
-	// Render layers to SBS stereo texture (skip if zero-copy)
+	// Render layers to atlas texture (skip if zero-copy)
 	xrt_result_t xret = XRT_SUCCESS;
 	if (!zero_copy) {
 		xret = comp_d3d12_renderer_draw(
@@ -1113,13 +1113,13 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 	}
 
-	// Shared texture mode: copy stereo output to shared texture and skip window present
+	// Shared texture mode: copy atlas output to shared texture and skip window present
 	if (c->has_shared_texture && c->shared_texture != nullptr) {
 		ID3D12Resource *atlas_resource = static_cast<ID3D12Resource *>(
 		    comp_d3d12_renderer_get_atlas_resource(c->renderer));
 
 		if (atlas_resource != nullptr) {
-			// Barrier: shared texture to COPY_DEST, stereo to COPY_SOURCE
+			// Barrier: shared texture to COPY_DEST, atlas to COPY_SOURCE
 			D3D12_RESOURCE_BARRIER barriers[2] = {};
 			barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
 			barriers[0].Transition.pResource = c->shared_texture;
@@ -1172,7 +1172,7 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			dp_logged = true;
 		}
 
-		// Execute stereo copy so the texture is ready for the weaver
+		// Execute atlas copy so the texture is ready for the weaver
 		c->cmd_list->Close();
 		ID3D12CommandList *copy_lists[] = {c->cmd_list};
 		c->command_queue->ExecuteCommandLists(1, copy_lists);
@@ -1229,7 +1229,7 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		if (diag_log) {
 			D3D12_RESOURCE_DESC atlas_desc = atlas_resource
 			    ? atlas_resource->GetDesc() : D3D12_RESOURCE_DESC{};
-			U_LOG_W("D3D12 dp path: stereo=%p (%llux%u), view=%ux%u, target=%ux%u, bb=%u, "
+			U_LOG_W("D3D12 dp path: atlas=%p (%llux%u), view=%ux%u, target=%ux%u, bb=%u, "
 			        "back_buffer=%p, rtv=0x%llx, zc=%d",
 			        (void *)atlas_resource,
 			        (unsigned long long)atlas_desc.Width, (unsigned)atlas_desc.Height,
@@ -1313,7 +1313,7 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
 			c->cmd_list->ResourceBarrier(1, &barrier);
 		} else {
-			// No stereo resource — just transition back buffer to PRESENT
+			// No atlas resource — just transition back buffer to PRESENT
 			barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
 			barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
 			c->cmd_list->ResourceBarrier(1, &barrier);

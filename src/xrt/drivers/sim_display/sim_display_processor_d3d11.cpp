@@ -234,7 +234,7 @@ sim_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 	}
 
 	// Read the current mode (may change at runtime via 1/2/3 keys).
-	// Single-view input forces passthrough — stereo shaders need ≥2 views.
+	// Single-view input forces passthrough — 3D shaders need ≥2 views.
 	enum sim_display_output_mode mode = sim_display_get_output_mode();
 	if (tile_columns * tile_rows <= 1) {
 		mode = SIM_DISPLAY_OUTPUT_PASSTHROUGH;

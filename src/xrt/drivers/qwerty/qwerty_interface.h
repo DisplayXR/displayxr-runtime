@@ -202,7 +202,7 @@ qwerty_set_rendering_mode_silent(struct xrt_device **xdevs, size_t xdev_count, i
  *
  * @param xdevs     Array of devices to search for qwerty devices.
  * @param xdev_count Number of devices in the array.
- * @param[out] out  Receives the current stereo state.
+ * @param[out] out  Receives the current 3D state.
  * @return true if a qwerty system was found and out was set.
  *
  * @ingroup drv_qwerty

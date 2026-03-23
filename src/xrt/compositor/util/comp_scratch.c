@@ -427,12 +427,12 @@ comp_scratch_single_images_destroy(struct comp_scratch_single_images *cssi)
 
 /*
  *
- * 'Exported' stereo functions.
+ * 'Exported' atlas functions.
  *
  */
 
 void
-comp_scratch_stereo_images_init(struct comp_scratch_stereo_images *cssi)
+comp_scratch_atlas_images_init(struct comp_scratch_atlas_images *cssi)
 {
 	// Just to be sure.
 	U_ZERO(cssi);
@@ -450,7 +450,7 @@ comp_scratch_stereo_images_init(struct comp_scratch_stereo_images *cssi)
 }
 
 bool
-comp_scratch_stereo_images_ensure(struct comp_scratch_stereo_images *cssi, struct vk_bundle *vk, VkExtent2D extent)
+comp_scratch_atlas_images_ensure(struct comp_scratch_atlas_images *cssi, struct vk_bundle *vk, VkExtent2D extent)
 {
 	const VkFormat srgb_format = VK_FORMAT_R8G8B8A8_SRGB;
 	const VkFormat unorm_format = VK_FORMAT_R8G8B8A8_UNORM;
@@ -476,7 +476,7 @@ comp_scratch_stereo_images_ensure(struct comp_scratch_stereo_images *cssi, struc
 	}
 
 	// Clear old information, we haven't touched this struct yet.
-	comp_scratch_stereo_images_free(cssi, vk);
+	comp_scratch_atlas_images_free(cssi, vk);
 
 	for (uint32_t view = 0; view < 2; view++) {
 		struct render_scratch_color_image images[COMP_SCRATCH_NUM_IMAGES];
@@ -504,7 +504,7 @@ err_destroy:
 }
 
 void
-comp_scratch_stereo_images_free(struct comp_scratch_stereo_images *cssi, struct vk_bundle *vk)
+comp_scratch_atlas_images_free(struct comp_scratch_atlas_images *cssi, struct vk_bundle *vk)
 {
 	// Make sure nothing refers to the images.
 	u_native_images_debug_clear(&cssi->views[0].unid);
@@ -534,13 +534,13 @@ comp_scratch_stereo_images_free(struct comp_scratch_stereo_images *cssi, struct 
 }
 
 void
-comp_scratch_stereo_images_get(struct comp_scratch_stereo_images *cssi, uint32_t *out_index)
+comp_scratch_atlas_images_get(struct comp_scratch_atlas_images *cssi, uint32_t *out_index)
 {
 	indices_get(&cssi->indices, out_index);
 }
 
 void
-comp_scratch_stereo_images_done(struct comp_scratch_stereo_images *cssi)
+comp_scratch_atlas_images_done(struct comp_scratch_atlas_images *cssi)
 {
 	uint32_t last = indices_done(&cssi->indices);
 
@@ -560,7 +560,7 @@ comp_scratch_stereo_images_done(struct comp_scratch_stereo_images *cssi)
 }
 
 void
-comp_scratch_stereo_images_discard(struct comp_scratch_stereo_images *cssi)
+comp_scratch_atlas_images_discard(struct comp_scratch_atlas_images *cssi)
 {
 	indices_discard(&cssi->indices);
 
@@ -569,14 +569,14 @@ comp_scratch_stereo_images_discard(struct comp_scratch_stereo_images *cssi)
 }
 
 void
-comp_scratch_stereo_images_clear_debug(struct comp_scratch_stereo_images *cssi)
+comp_scratch_atlas_images_clear_debug(struct comp_scratch_atlas_images *cssi)
 {
 	u_native_images_debug_clear(&cssi->views[0].unid);
 	u_native_images_debug_clear(&cssi->views[1].unid);
 }
 
 void
-comp_scratch_stereo_images_destroy(struct comp_scratch_stereo_images *cssi)
+comp_scratch_atlas_images_destroy(struct comp_scratch_atlas_images *cssi)
 {
 	// Make sure nothing refers to the images.
 	u_native_images_debug_destroy(&cssi->views[0].unid);

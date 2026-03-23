@@ -569,8 +569,8 @@ qwerty_setup_var_tracking(struct qwerty_system *qs)
 	u_var_add_ro_text(qs, "Rotate FD", "Hold right click");
 	u_var_add_ro_text(qs, "Hold for sprint", "LSHIFT");
 	u_var_add_ro_text(qs, "HMD: Wh=Conv/vH  Sh+Wh=IPD+Prlx", "Mouse wheel");
-	u_var_add_ro_text(qs, "Toggle camera/display stereo mode", "P");
-	u_var_add_ro_text(qs, "Reset stereo to camera defaults", "Space");
+	u_var_add_ro_text(qs, "Toggle camera/display 3D mode", "P");
+	u_var_add_ro_text(qs, "Reset 3D to camera defaults", "Space");
 	u_var_add_ro_text(qs, "Modify FD movement speed", "Numpad +/-");
 	u_var_add_ro_text(qs, "Reset both or FC pose", "R");
 	u_var_add_ro_text(qs, "Toggle both or FC parenting to HMD", "C");
