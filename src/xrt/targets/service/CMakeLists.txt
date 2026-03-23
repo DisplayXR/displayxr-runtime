@@ -25,6 +25,15 @@ if(WIN32)
 		"/DELAYLOAD:SimulatedRealityVulkanBeta.dll"
 	)
 	target_link_libraries(displayxr-service PRIVATE delayimp)
+
+	# Run as GUI app (no console window) with system tray icon
+	set_target_properties(displayxr-service PROPERTIES WIN32_EXECUTABLE TRUE)
+	target_sources(displayxr-service PRIVATE
+		service_tray_win.c
+		service_tray_win.h
+		service_resources.rc
+	)
+	target_link_libraries(displayxr-service PRIVATE shell32)
 endif()
 
 install(TARGETS displayxr-service RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})

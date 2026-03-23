@@ -35,7 +35,6 @@
 // NOTE: D3D11 service compositor header was previously needed for window validity checks.
 // With per-client windows, this is no longer needed - each client manages its own window.
 
-#include <conio.h>
 #include <sddl.h>
 
 
@@ -46,6 +45,9 @@
  */
 
 #define ERROR_STR(BUF, ERR) (u_winerror(BUF, ARRAY_SIZE(BUF), ERR, true))
+
+// Shutdown flag set by the tray icon thread in main.c
+extern "C" volatile bool g_service_shutdown_requested;
 
 DEBUG_GET_ONCE_BOOL_OPTION(relaxed, "IPC_RELAXED_CONNECTION_SECURITY", false)
 
@@ -223,18 +225,11 @@ ipc_server_mainloop_poll(struct ipc_server *vs, struct ipc_server_mainloop *ml)
 {
 	IPC_TRACE_MARKER();
 
-	if (_kbhit()) {
-		U_LOG_E("console input! exiting...");
+	if (g_service_shutdown_requested) {
+		U_LOG_I("Shutdown requested via tray icon, exiting...");
 		ipc_server_handle_shutdown_signal(vs);
 		return;
 	}
-
-	// NOTE: With per-client windows, window validity is now handled per-client.
-	// Each client's window lifecycle is managed when the client connects/disconnects.
-	// The IPC service no longer maintains a global window to check.
-	// Window close events are detected in the per-client message loop and trigger
-	// session end for that specific client.
-	(void)vs;  // Suppress unused warning
 
 	if (!ml->pipe_handle) {
 		create_another_pipe_instance(vs, ml);
