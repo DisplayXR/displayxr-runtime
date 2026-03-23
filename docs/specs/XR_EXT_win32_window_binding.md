@@ -81,7 +81,33 @@ A first-person application on a 3D display needs to combine two independent pose
 
 **Locomotion** (moving through the world) is driven by app input. **Eye tracking** (stereoscopic parallax) is driven by the runtime's SR SDK. Both must compose correctly, which only works when the app receives input — which requires the app to own the window.
 
-### 2.4 Why Window-Space Layers Require Session Targeting
+### 2.4 The Phase Alignment Problem
+
+Lenticular 3D displays interlace subpixels — which subpixel is visible to which eye depends on the content's **exact screen-space position** relative to the physical lens array. Moving a window by even a single pixel can shift the interlacing phase, causing crosstalk (ghosting between left/right views).
+
+```
+Display panel (simplified — 3 subpixels per lens pitch):
+
+   Lens pitch
+ ├───────────┤
+ │ R  G  B │ R  G  B │ R  G  B │   ← Physical subpixels
+ │ L  L  R │ R  L  L │ R  R  L │   ← Eye assignment depends on
+ └─────────┘─────────┘─────────┘     screen-space position
+
+ If window shifts 1px right:
+ │ R  G  B │ R  G  B │ R  G  B │
+ │ ?  L  L │ R  R  L │ L  R  R │   ← Phase shifted → crosstalk
+```
+
+This is why the extension requires the actual **window handle** (HWND), not just a texture or screen coordinates:
+
+- The display processor needs to query the window's screen-space position each frame to compute the correct interlacing origin
+- Some advanced vendor display processors, like Leia's, go further: they hook `WM_WINDOWPOSCHANGING` on the HWND to **snap** window drag positions to phase-aligned coordinates, preventing crosstalk jitter during drag. This is an optional vendor optimization — without it, 3D quality degrades during drag but is correct at rest.
+- For `_texture` apps where the 3D canvas is a sub-rect of the window (e.g., a 3D viewport surrounded by 2D UI), the display processor computes the interlacing origin as `windowScreenPos + canvasOffset`
+
+A texture handle or screen coordinate alone would not allow the display processor to track position changes or hook window messages.
+
+### 2.5 Why Window-Space Layers Require Session Targeting
 
 In standard OpenXR, every composition layer is positioned in 3D space relative to a reference space. "Window coordinates" have no meaning because the runtime may not even have a window.
 

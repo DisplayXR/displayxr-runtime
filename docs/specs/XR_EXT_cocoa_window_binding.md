@@ -24,6 +24,8 @@ The target use case is **desktop 3D light field displays** on macOS, where the a
 
 Same as `XR_EXT_win32_window_binding` — desktop 3D displays are monitors, not headsets. The application needs to own its window for input handling, multi-app compositing, and hybrid 2D/3D UI. On macOS, the runtime uses Metal (via MoltenVK for Vulkan apps) and needs a `CAMetalLayer`-backed view to render into.
 
+**Phase alignment note:** Lenticular displays compute interlacing patterns from the content's screen-space position. The display processor needs the NSView to track its position on the physical display each frame. On Windows, advanced vendors hook `WM_WINDOWPOSCHANGING` to snap window drag to phase-aligned coordinates (see [XR_EXT_win32_window_binding §2.4](XR_EXT_win32_window_binding.md)). macOS equivalents (e.g., `NSWindowDelegate` position tracking) are a future item for vendor SDKs that support macOS.
+
 ---
 
 ## 3. New Enum Constants

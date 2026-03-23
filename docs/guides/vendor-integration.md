@@ -1159,6 +1159,60 @@ my_driver_set_property(struct xrt_device *xdev,
 
 ---
 
+## 6b. Window Handle and Phase Alignment
+
+Lenticular displays compute interlacing patterns from the content's **screen-space
+position** on the physical panel.  Which subpixel maps to which eye depends on
+position modulo the lens pitch — shifting by a single pixel changes the mapping.
+
+### Why the display processor receives the window handle
+
+The compositor passes the application's window handle (HWND on Windows, NSView on
+macOS) to the display processor factory at creation time.  The display processor
+**must** use this handle to determine the content's screen-space position each frame
+when computing the interlacing pattern.
+
+### Canvas sub-rect
+
+For `_texture` apps (shared texture), the 3D canvas may be a sub-rect of the
+window (e.g., a 3D viewport surrounded by 2D toolbars).  The compositor provides
+an optional canvas rect `(x, y, w, h)` relative to the window's client area.
+When present, the interlacing origin should be computed as:
+
+```
+interlacing_origin = window_screen_pos + canvas_offset
+```
+
+When no canvas rect is provided, the display processor should assume the full
+window client area.
+
+### Optional optimization: phase-aligned drag snapping
+
+During window drag, the OS moves the window smoothly — but each pixel shift can
+break the lenticular phase, causing visible crosstalk jitter.  Advanced vendors
+can mitigate this by hooking window position messages and snapping the drag
+destination to the nearest phase-aligned coordinate.
+
+**On Windows:** Hook `WM_WINDOWPOSCHANGING` on the HWND, compute the lenticular
+phase at the target position, and adjust `(x, y)` to the nearest position that
+preserves the original phase.  Leia's SR SDK implements this as `SnapToPhase()`.
+
+**On macOS:** Equivalent NSWindow position tracking is a future item for vendor
+SDKs that support macOS.
+
+This is **optional** — vendors that don't implement phase snapping will see
+degraded 3D quality during window drag but correct 3D when the window is at rest.
+`sim_display` does not implement phase alignment (it's a software simulation with
+no lenticular optics).
+
+### Reference
+
+- [XR_EXT_win32_window_binding §2.4](../specs/XR_EXT_win32_window_binding.md) — Phase alignment motivation for app developers
+- [ADR-003](../adr/ADR-003-vendor-abstraction-via-display-processor-vtable.md) — Vendor code isolation
+- [Issue #85](https://github.com/dfattal/openxr-3d-display/issues/85) — Canvas sub-rect support for Leia SR weaver
+
+---
+
 ## 7. Component 4: SDK Wrapper
 
 The SDK wrapper isolates vendor-specific headers from the rest of the codebase.
