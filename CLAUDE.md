@@ -186,6 +186,7 @@ XR_RUNTIME_JSON=./build/openxr_displayxr-dev.json ./your_openxr_app
 
 ### /ci-monitor - Automated Build Workflow
 Automates commit, push, GitHub Actions monitoring, auto-fix. See `.claude/skills/ci-monitor/SKILL.md`.
+**Important:** Always include the related GitHub issue number in commit messages — e.g., `Fix linker error (#93)`. Check conversation context and recent commits to determine the issue number.
 
 ### /ask-gemini - Code Analysis with Gemini
 Ask Gemini to analyze code and produce a read-only report. See `~/.claude/skills/ask-gemini/SKILL.md`.
