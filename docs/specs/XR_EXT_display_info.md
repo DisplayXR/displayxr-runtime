@@ -1336,7 +1336,7 @@ installed runtime. The `XR_EXT_display_info` extension's capability reporting
 (`XrDisplayInfoEXT`, `XrEyeTrackingModeCapabilitiesEXT`) reflects only what the device
 actually supports, not the full SDK API surface.
 
-See the **Vendor Integration Guide** (`docs/specs/vendor-integration.md` §13)
+See the **Vendor Integration Guide** (`docs/guides/vendor-integration.md` §13)
 for the complete deployment model, multi-vendor build strategy, and driver implementation
 guidelines.
 

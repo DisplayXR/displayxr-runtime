@@ -6,6 +6,8 @@ issues: [80]
 code-paths: [src/xrt/state_trackers/oxr/]
 ---
 
+> **Status: Proposal** — not yet implemented. Tracking issue: [#80](https://github.com/dfattal/openxr-3d-display/issues/80)
+
 # Khronos Proposal: XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW
 
 ## Context

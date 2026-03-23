@@ -1,24 +1,58 @@
 # DisplayXR Documentation
 
-## Product
+## For App Developers
 
-- [Spatial Desktop PRD](spatial-desktop-prd.md) — Product requirements for the spatial desktop platform (runtime + 3D shell)
+Build apps for 3D displays using the OpenXR standard.
 
-## Specs (`specs/`)
+- **[Getting Started](getting-started/overview.md)** — what is DisplayXR, architecture, sim_display
+- **[Building](getting-started/building.md)** — build instructions for Windows and macOS
+- **[App Classes](getting-started/app-classes.md)** — handle, texture, hosted, IPC — which one to use
+- **[Your First Handle App](getting-started/first-handle-app.md)** — tutorial walkthrough
 
-Living feature and extension specifications.
+### Extension Specs
 
-- [XR_EXT_display_info](specs/XR_EXT_display_info.md) — Display properties, eye tracking, rendering modes, mode enumeration
-- [XR_EXT_win32_window_binding](specs/XR_EXT_win32_window_binding.md) — App-provided Win32 HWND for windowed rendering
-- [XR_EXT_cocoa_window_binding](specs/XR_EXT_cocoa_window_binding.md) — App-provided Cocoa NSView for rendering on macOS
-- [XR_VIEW_CONFIGURATION_PRIMARY_MULTIVIEW](specs/XR_VIEW_CONFIGURATION_PRIMARY_MULTIVIEW.md) — Khronos multiview view configuration proposal
-- [Vendor Integration Guide](specs/vendor-integration.md) — How to add a new 3D display vendor
-- [Multiview Tiling](specs/multiview-tiling.md) — Atlas layout for N-view rendering
-- [Legacy App Support](specs/legacy-app-support.md) — Compromise scaling for non-extension apps
-- [Eye Tracking Modes](specs/eye-tracking-modes.md) — Smooth/raw eye tracking contract
-- [Display Processor Interface](specs/display-processor-interface.md) — Unified DP vtable design
+- [XR_EXT_display_info](specs/XR_EXT_display_info.md) — display properties, eye tracking, rendering modes
+- [XR_EXT_win32_window_binding](specs/XR_EXT_win32_window_binding.md) — app-provided Win32 HWND
+- [XR_EXT_cocoa_window_binding](specs/XR_EXT_cocoa_window_binding.md) — app-provided Cocoa NSView
+- [Kooima Projection](architecture/kooima-projection.md) — stereo math and projection pipelines
 
-## Architecture Decision Records (`adr/`)
+---
+
+## For Contributors
+
+Contribute to the DisplayXR runtime — compositors, state tracker, auxiliary code.
+
+- **[Contributing Guide](guides/contributing.md)** — workflow, code style, CI expectations
+- **[Separation of Concerns](architecture/separation-of-concerns.md)** — layer boundaries (authoritative)
+- **[Project Structure](architecture/project-structure.md)** — source tree organization
+- **[Compositor Pipeline](architecture/compositor-pipeline.md)** — end-to-end rendering pipeline
+- **[Extension vs Legacy Apps](architecture/extension-vs-legacy.md)** — how the runtime handles both app types
+- **[In-Process vs Service](architecture/in-process-vs-service.md)** — compositor deployment modes
+- **[Implementing an Extension](guides/implementing-extension.md)** — how to add OpenXR extensions
+
+### Internal Specs
+
+- [Swapchain Model](specs/swapchain-model.md) — two-swapchain architecture and canvas concept
+- [Multiview Tiling](specs/multiview-tiling.md) — atlas layout algorithm for N-view rendering
+- [Legacy App Support](specs/legacy-app-support.md) — compromise scaling for non-extension apps
+- [Eye Tracking Modes](specs/eye-tracking-modes.md) — MANAGED vs MANUAL contract
+- [Display Processor Interface](specs/display-processor-interface.md) — unified DP vtable design
+
+---
+
+## For Display Vendors
+
+Integrate your 3D display hardware into DisplayXR.
+
+- **[Vendor Integration Guide](guides/vendor-integration.md)** — comprehensive walkthrough
+- **[Writing a Driver](guides/writing-driver.md)** — driver framework basics
+- **[Display Processor Interface](specs/display-processor-interface.md)** — the DP vtable you'll implement
+- **[ADR-003: Vendor Abstraction](adr/ADR-003-vendor-abstraction-via-display-processor-vtable.md)** — why vendor code is isolated
+- **[Separation of Concerns](architecture/separation-of-concerns.md)** — what goes where
+
+---
+
+## Architecture Decision Records
 
 - [ADR-001](adr/ADR-001-native-compositors-per-graphics-api.md) — Native compositors per graphics API
 - [ADR-002](adr/ADR-002-ipc-layer-preserved-for-multi-app.md) — IPC layer preserved for multi-app
@@ -31,39 +65,44 @@ Living feature and extension specifications.
 - [ADR-009](adr/ADR-009-upstream-cherry-pick-strategy.md) — Upstream cherry-pick strategy
 - [ADR-010](adr/ADR-010-shared-app-iosurface-worst-case-sized.md) — Shared app IOSurface worst-case sized
 
-## Architecture (`architecture/`)
+---
 
-System design documents.
+## Roadmap
 
-- [Separation of Concerns](architecture/separation-of-concerns.md) — Layer boundaries: App → OXR → Compositor → Driver/DP
-- [Compositor vs Display Processor](architecture/compositor-vs-display-processor.md) — Where weaving belongs
-- [Display Spatial Model](architecture/display-spatial-model.md) — Displays in the spatial graph
-- [Spatial OS](architecture/spatial-os.md) — Multi-app spatial operating system
-- [3D Shell](architecture/3d-shell.md) — Window manager for 3D displays
-- [3D Capture](architecture/3d-capture.md) — 3D capture pipeline (screenshots, recording, datasets)
-- [Shell/Runtime Contract](architecture/shell-runtime-contract.md) — IPC message set between shell and runtime
-- [Multi-Display Single Machine](architecture/multi-display-single-machine.md) — Multiple displays on one machine
-- [Multi-Display Networked](architecture/multi-display-networked.md) — Networked multi-display
-- [In-Process vs Service](architecture/in-process-vs-service.md) — Compositor deployment modes
-- [Stereo 3D Math](architecture/stereo3d-math.md) — Kooima projection and stereo geometry
-- [Project Structure](architecture/project-structure.md) — Source tree organization
-- [IPC Design](architecture/ipc-design.md) — Inter-process communication (inherited from Monado)
-- [Design Spaces](architecture/design-spaces.md) — OpenXR reference spaces (inherited from Monado)
-- [Swapchains IPC](architecture/swapchains-ipc.md) — Swapchain handling over IPC (inherited from Monado)
+These documents describe **planned features that are not yet implemented**.
 
-## Notes (`notes/`)
+- **[Roadmap Overview](roadmap/overview.md)** — milestone status and project trajectory
+- [Spatial Desktop PRD](roadmap/spatial-desktop-prd.md) — product vision
+- [Spatial OS](roadmap/spatial-os.md) — multi-compositor architecture (#43)
+- [3D Shell](roadmap/3d-shell.md) — spatial window manager (#44)
+- [3D Capture](roadmap/3d-capture.md) — capture pipeline
+- [Shell/Runtime Contract](roadmap/shell-runtime-contract.md) — IPC between shell and runtime
+- [Display Spatial Model](roadmap/display-spatial-model.md) — displays in the spatial graph (#46)
+- [Multi-Display Single Machine](roadmap/multi-display-single-machine.md) — multiple displays, one machine (#69)
+- [Multi-Display Networked](roadmap/multi-display-networked.md) — displays across the network (#70)
+- [XR_VIEW_CONFIGURATION_PRIMARY_MULTIVIEW](roadmap/XR_VIEW_CONFIGURATION_PRIMARY_MULTIVIEW.md) — Khronos multiview proposal (#80)
 
-Reference material.
+---
 
-- [Conventions](notes/conventions.md) — Code style and naming conventions
-- [Implementing an Extension](notes/implementing-extension.md) — How to add OpenXR extensions
-- [Writing a Driver](notes/writing-driver.md) — How to add device drivers
-- [Understanding Targets](notes/understanding-targets.md) — Build target structure
-- [Windows Build](notes/winbuild.md) — Windows build instructions
-- [Qwerty Device](notes/qwerty-device.md) — Keyboard/mouse simulated controller
-- [Window Drag Rendering](notes/window-drag-rendering.md) — Rendering during window drag
+## Reference
 
-## Legacy Monado (`legacy-monado/`)
+- [Conventions](reference/conventions.md) — code style and naming conventions
+- [Understanding Targets](reference/understanding-targets.md) — build target structure
+- [Windows Build](reference/winbuild.md) — Windows build instructions
+- [Qwerty Device](reference/qwerty-device.md) — keyboard/mouse simulated controller
+- [Window Drag Rendering](reference/window-drag-rendering.md) — rendering during window drag
+- [Debug Logging](reference/debug-logging.md) — log level conventions
+
+## Archive
+
+Resolved or superseded documents — kept for historical reference.
+
+- [Compositor vs Display Processor](archive/compositor-vs-display-processor.md) — resolved by ADR-007 + process_atlas
+- [IPC Design](archive/ipc-design.md) — inherited from Monado
+- [Design Spaces](archive/design-spaces.md) — inherited from Monado
+- [Swapchains IPC](archive/swapchains-ipc.md) — inherited from Monado
+
+## Legacy Monado
 
 Inherited Monado documentation — kept for reference, not actively maintained.
 

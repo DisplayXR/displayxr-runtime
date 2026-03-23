@@ -1,6 +1,6 @@
-# Stereo 3D Math: Display-Centric and Camera-Centric Pipelines
+# Kooima Projection: Display-Centric and Camera-Centric Pipelines
 
-This document describes the two stereo projection pipelines used throughout
+This document describes the two projection pipelines used throughout
 the project for 3D (light field) displays with eye tracking.  Both pipelines
 take the same raw eye-tracking inputs and share a common first stage, then
 diverge in how they build the view and projection matrices.

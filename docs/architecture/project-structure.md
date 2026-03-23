@@ -1,4 +1,4 @@
-# CNSDK-OpenXR Project Structure
+# DisplayXR Project Structure
 
 This document describes the architecture of this Monado-based OpenXR runtime fork, extended for multi-vendor 3D display support.
 
@@ -16,19 +16,24 @@ src/xrt/
 │   ├── xrt_instance.h                  Runtime instance
 │   └── xrt_prober.h                    Device discovery
 │
-├── drivers/                   42 driver directories
+├── drivers/                   3 driver directories
 │   ├── leia/                  Leia SR SDK — real 3D display hardware
 │   ├── sim_display/           Simulation display — no hardware needed
-│   ├── qwerty/                Keyboard-based debugging device
-│   └── ...                    vive, wmr, psvr, rift_s, north_star, etc.
+│   └── qwerty/                Keyboard-based debugging device
 │
 ├── compositor/                Rendering pipeline
 │   ├── main/                  Vulkan compositor (+ display processor integration)
 │   ├── multi/                 Multi-client session coordinator
-│   ├── d3d11/                 Native D3D11 compositor (Windows)
+│   ├── d3d11/                 Native D3D11 compositor (Windows, in-process)
+│   ├── d3d11_service/         Native D3D11 compositor (Windows, service mode)
+│   ├── d3d12/                 Native D3D12 compositor (Windows)
+│   ├── metal/                 Native Metal compositor (macOS)
+│   ├── gl/                    Native OpenGL compositor (Windows + macOS)
+│   ├── vk_native/             Native Vulkan compositor (Windows + macOS)
 │   ├── client/                Client-side API glue (GL, Vulkan, D3D11, D3D12)
 │   ├── render/                Vulkan render helpers
 │   ├── shaders/               GLSL shader sources
+│   ├── mock/                  Mock compositor (testing)
 │   ├── null/                  Null compositor (no-op)
 │   └── util/                  Compositor utilities (swapchain, sync)
 │
@@ -37,7 +42,7 @@ src/xrt/
 │
 ├── targets/common/            Builder registration
 │   ├── target_lists.c         Master list of all device builders
-│   └── target_builder_*.c     14 builder implementations
+│   └── target_builder_*.c     5 builder implementations
 │
 ├── auxiliary/                 Shared utilities
 │   ├── math/                  Math (m_*), quaternions, matrices, poses
@@ -185,11 +190,9 @@ Device builders are registered in `src/xrt/targets/common/target_lists.c` and tr
 | Priority | Builder | Description |
 |----------|---------|-------------|
 | override | `qwerty` | Keyboard debugging device |
-| override | `remote` | Remote device |
-| override | `simulated` | Simulated HMD |
+| override | `qwerty_input` | Keyboard input device |
 | -15 | **`leia`** | Leia 3D display (SR SDK / CNSDK) |
 | -20 | **`sim_display`** | Simulation display |
-| 0+ | `rift_s`, `lighthouse`, `wmr`, `xreal_air`, etc. | Real VR hardware |
 | last | `legacy` | Legacy device fallback |
 
 ## Design Patterns

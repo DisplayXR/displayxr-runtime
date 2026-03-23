@@ -7,6 +7,8 @@ issues: [43, 44]
 platforms: [Windows, macOS]
 ---
 
+> **Status: Proposal** — not yet implemented. Tracking issue: [#43](https://github.com/dfattal/openxr-3d-display/issues/43), [#44](https://github.com/dfattal/openxr-3d-display/issues/44)
+
 # Spatial Desktop Platform PRD
 
 ## Runtime + 3D Shell for Spatial Workstations
@@ -125,12 +127,12 @@ Physical 3D Display
 
 | Component | Doc |
 |-----------|-----|
-| Multi-compositor pipeline | [architecture/spatial-os.md](architecture/spatial-os.md) |
-| Window manager / shell | [architecture/3d-shell.md](architecture/3d-shell.md) |
-| Shell/runtime IPC contract | [architecture/shell-runtime-contract.md](architecture/shell-runtime-contract.md) |
-| 3D capture pipeline | [architecture/3d-capture.md](architecture/3d-capture.md) |
-| Multi-display (local) | [architecture/multi-display-single-machine.md](architecture/multi-display-single-machine.md) |
-| Multi-display (networked) | [architecture/multi-display-networked.md](architecture/multi-display-networked.md) |
+| Multi-compositor pipeline | [spatial-os.md](spatial-os.md) |
+| Window manager / shell | [3d-shell.md](3d-shell.md) |
+| Shell/runtime IPC contract | [shell-runtime-contract.md](shell-runtime-contract.md) |
+| 3D capture pipeline | [3d-capture.md](3d-capture.md) |
+| Multi-display (local) | [multi-display-single-machine.md](multi-display-single-machine.md) |
+| Multi-display (networked) | [multi-display-networked.md](multi-display-networked.md) |
 
 ---
 
@@ -148,7 +150,7 @@ The platform supports two broad categories of apps:
 
 3D capture enables native capture of spatial content before display-specific weaving, so output remains reusable as stereo content, spatial replay, or dataset material.
 
-**Full specification:** [architecture/3d-capture.md](architecture/3d-capture.md)
+**Full specification:** [3d-capture.md](3d-capture.md)
 
 ---
 
@@ -156,7 +158,7 @@ The platform supports two broad categories of apps:
 
 Cross-app spatial compositing allows multiple applications to coexist in a shared 3D scene on a tracked display, with correct spatial placement and coherent viewing behavior. This is the central runtime capability that makes the rest of the platform possible.
 
-**Full specification:** [architecture/spatial-os.md](architecture/spatial-os.md)
+**Full specification:** [spatial-os.md](spatial-os.md)
 
 ---
 
@@ -165,8 +167,8 @@ Cross-app spatial compositing allows multiple applications to coexist in a share
 Multi-display extends the single-display spatial desktop into a workspace where multiple tracked 3D displays participate in one coherent spatial environment. This is a later phase than single-display compositing.
 
 **Full specifications:**
-- [architecture/multi-display-single-machine.md](architecture/multi-display-single-machine.md)
-- [architecture/multi-display-networked.md](architecture/multi-display-networked.md)
+- [multi-display-single-machine.md](multi-display-single-machine.md)
+- [multi-display-networked.md](multi-display-networked.md)
 
 ---
 
@@ -174,7 +176,7 @@ Multi-display extends the single-display spatial desktop into a workspace where 
 
 The shell/runtime contract defines the IPC message set and boundary rules between the rendering runtime and the desktop shell, ensuring clean separation of mechanism from policy.
 
-**Full specification:** [architecture/shell-runtime-contract.md](architecture/shell-runtime-contract.md)
+**Full specification:** [shell-runtime-contract.md](shell-runtime-contract.md)
 
 ---
 
@@ -182,7 +184,7 @@ The shell/runtime contract defines the IPC message set and boundary rules betwee
 
 The 3D shell provides mouse/keyboard interaction, gaze-based hover, shell chrome manipulation, and app launcher/task switching. Each managed window exposes title bar, move/resize handles, depth control, and close/minimize affordances.
 
-**Full specification:** [architecture/3d-shell.md](architecture/3d-shell.md)
+**Full specification:** [3d-shell.md](3d-shell.md)
 
 ---
 

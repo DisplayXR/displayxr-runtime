@@ -42,55 +42,30 @@ Why each API gets its own compositor: `docs/adr/ADR-001-native-compositors-per-g
 
 ### Four App Classes
 
-| Class | Suffix | Description | Compositor path |
-|-------|--------|-------------|----------------|
-| **Handle** | `_handle` | App provides its own window handle via `XR_EXT_*_window_binding` | Native compositor directly in-process |
-| **Texture** | `_texture` | App provides textures, runtime composites into its own window | Native compositor directly in-process |
-| **Hosted** | `_hosted` | Runtime creates window and rendering targets (standard OpenXR/WebXR) | Native compositor directly in-process |
-| **IPC/Service** | `_ipc` | App runs out-of-process via client compositor → IPC → server multi-compositor | Client compositor → IPC transport → multi-compositor → native compositor in server |
-
-Test app naming: `cube_handle_metal_macos`, `cube_texture_d3d11_win`, `cube_hosted_d3d11_win` (hosted), `cube_ipc_d3d11_win` (service mode), `cube_ipc_legacy_d3d11_win` (IPC legacy/WebXR debug proxy).
-
-The first three classes all use a native compositor in-process. The `_ipc` class is fundamentally different: the app links a **client compositor** that serializes compositor calls over IPC to a **server process** running the multi-compositor (`compositor/multi/`), which fans out to native compositors. This is the multi-app path and the foundation for the spatial shell (#43, #44).
+See `docs/getting-started/app-classes.md` for the full reference (handle, texture, hosted, IPC).
 
 **Key code paths by class:**
 - `_handle` / `_texture` / `_hosted` → `compositor/{d3d11,d3d12,metal,gl,vk_native}/` (in-process)
 - `_ipc` → `compositor/client/` → `ipc/` → `compositor/multi/` → native compositor (out-of-process)
 
-For in-process vs service details, see `docs/architecture/in-process-vs-service.md`.
-For the spatial shell multi-app vision, see `docs/architecture/spatial-os.md` and `docs/architecture/3d-shell.md`.
+Test app naming: `cube_{class}_{api}_{platform}` — e.g. `cube_handle_metal_macos`, `cube_texture_d3d11_win`, `cube_ipc_d3d11_win`.
 
 ### Extension Apps vs Legacy Apps
 
-Orthogonal to the four app classes above, apps are either **extension apps** or **legacy apps** based on whether they enable `XR_EXT_display_info`:
+See `docs/architecture/extension-vs-legacy.md` for the full reference.
 
-| Type | Detection | Rendering modes | Swapchain sizing | Mode switching |
-|------|-----------|----------------|-----------------|----------------|
-| **Extension app** | Enables `XR_EXT_display_info` | Enumerates all modes, handles `XrEventDataRenderingModeChangedEXT` | `max(tileColumns[i] * scaleX[i] * displayW)` across all modes | All modes: V toggle + 1/2/3 direct selection |
-| **Legacy app** | Does not enable `XR_EXT_display_info` | Unaware of modes, always renders stereo | `recommendedImageRectWidth * 2` (compromise scale) | Only V toggle between mode 0 (2D) and mode 1 (default 3D) |
-
-`_handle` and `_texture` apps are always extension apps (they need the extension for window binding). `_hosted` apps can be either — a DisplayXR-aware `_hosted` app enables `XR_EXT_display_info`, while a generic OpenXR `_hosted` app (e.g. WebXR, third-party) is legacy.
-
-For the full multiview tiling algorithm and atlas layout, see `docs/specs/multiview-tiling.md`.
-For legacy app compromise scaling rationale (Case A/B), see `docs/specs/legacy-app-support.md`.
-
-Legacy app compromise scaling is computed in `oxr_system_fill_in()` — see `docs/specs/legacy-app-support.md` for the full algorithm. The `legacy_app_tile_scaling` flag on `xrt_system_compositor_info` disables 1/2/3 key mode selection for legacy apps (V toggle only).
+Key facts for AI context: `_handle` and `_texture` are always extension apps. `_hosted` can be either. Legacy app compromise scaling is computed in `oxr_system_fill_in()`. The `legacy_app_tile_scaling` flag on `xrt_system_compositor_info` disables 1/2/3 key mode selection for legacy apps (V toggle only).
 
 ### Key Architectural Notes
 - Compositor vtable has 56 methods — use `comp_base` helper for boilerplate
 - IPC/service mode (`ipc/`, `compositor/client/`, `compositor/multi/`) must be preserved for `_ipc` apps, WebXR, and multi-app spatial shell
 - `compositor/null/` — headless compositor for testing
-- **Two distinct swapchains per compositor:**
-  - **App swapchain** — runtime-allocated (`xrCreateSwapchain`), worst-case sized at init. App renders atlas of tiled views into this.
-  - **Target swapchain** — compositor's output to the display, window-sized. DP writes interlaced output here.
-  - Pipeline: app swapchain → compositor crops atlas to content dims → DP interlaces → target swapchain → present.
-  - These are unrelated — the app swapchain flows in, the target swapchain flows out.
-  - See `docs/specs/multiview-tiling.md` "Compositor-Side Contract" section.
-
-- **Canvas concept:** View dimensions and Kooima projection must be based on **canvas** size (the sub-rect of the window where 3D content appears), not display size. Critical for `_texture` apps where the canvas may be smaller than the display. See `docs/specs/multiview-tiling.md` "Terminology: Display, Window, Canvas".
+- **Two distinct swapchains** — see `docs/specs/swapchain-model.md`
+- **Canvas concept** — view dims and Kooima projection use canvas size, not display size. See `docs/specs/swapchain-model.md`.
+- **Compositor pipeline** — see `docs/architecture/compositor-pipeline.md`
 
 For the vendor isolation rule and layer "must NOT contain" constraints, see `docs/architecture/separation-of-concerns.md`.
-For display processor vtable design (all 5 API variants), see `docs/specs/vendor-integration.md`.
+For display processor vtable design (all 5 API variants), see `docs/guides/vendor-integration.md`.
 
 ## Project Overview
 
@@ -150,7 +125,7 @@ C interfaces with vtable-style polymorphism:
 - `struct xrt_instance` — Runtime instance
 - `struct xrt_prober` — Device discovery
 
-For the full interface catalog including display processor vtables (5 API variants), see `docs/specs/vendor-integration.md`.
+For the full interface catalog including display processor vtables (5 API variants), see `docs/guides/vendor-integration.md`.
 
 ### LeiaSR SDK Integration
 - `XRT_HAVE_LEIA_SR` CMake option (auto-enabled if SDK found)
@@ -236,20 +211,24 @@ See `docs/README.md` for a complete index. Key docs by task:
 | When you need to... | Read |
 |---|---|
 | Understand layer boundaries (what goes where) | `docs/architecture/separation-of-concerns.md` |
-| Add a new display vendor | `docs/specs/vendor-integration.md` |
+| Add a new display vendor | `docs/guides/vendor-integration.md` |
 | Understand multiview tiling / atlas layout | `docs/specs/multiview-tiling.md` |
 | Understand extension API (display_info, window bindings) | `docs/specs/XR_EXT_display_info.md` |
-| Know why an architectural decision was made | `docs/adr/` (9 ADRs) |
-| Understand legacy vs extension app differences | `docs/specs/legacy-app-support.md` |
+| Know why an architectural decision was made | `docs/adr/` (10 ADRs) |
+| Understand legacy vs extension app differences | `docs/architecture/extension-vs-legacy.md` |
 | Understand eye tracking MANAGED/MANUAL contract | `docs/specs/eye-tracking-modes.md` |
-| Add a new OpenXR extension | `docs/notes/implementing-extension.md` |
-| Write a device driver | `docs/notes/writing-driver.md` |
-| Understand stereo math / Kooima projection | `docs/architecture/stereo3d-math.md` |
-| Understand the 3D capture pipeline | `docs/architecture/3d-capture.md` |
-| Understand shell/runtime IPC contract | `docs/architecture/shell-runtime-contract.md` |
-| Understand the overall product vision | `docs/spatial-desktop-prd.md` |
+| Add a new OpenXR extension | `docs/guides/implementing-extension.md` |
+| Write a device driver | `docs/guides/writing-driver.md` |
+| Understand Kooima projection math | `docs/architecture/kooima-projection.md` |
+| Understand the compositor pipeline | `docs/architecture/compositor-pipeline.md` |
+| Understand the swapchain model / canvas | `docs/specs/swapchain-model.md` |
+| Understand the 3D capture pipeline | `docs/roadmap/3d-capture.md` |
+| Understand shell/runtime IPC contract | `docs/roadmap/shell-runtime-contract.md` |
+| Understand the overall product vision | `docs/roadmap/spatial-desktop-prd.md` |
 
 ## Debug Logs
+
+See `docs/reference/debug-logging.md` for full conventions.
 - Use U_LOG_W (WARN) only for one-off init, error, and lifecycle events
 - Use U_LOG_I (INFO) for recurring/throttled diagnostic logs (per-frame, per-keystroke, etc.)
 - Never add per-frame U_LOG_W calls — they cause massive log bloat

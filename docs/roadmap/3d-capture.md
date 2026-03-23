@@ -6,6 +6,8 @@ issues: [43, 44]
 code-paths: [src/xrt/compositor/multi/]
 ---
 
+> **Status: Proposal** — not yet implemented. Tracking issue: [#43](https://github.com/dfattal/openxr-3d-display/issues/43), [#44](https://github.com/dfattal/openxr-3d-display/issues/44)
+
 # 3D Capture Pipeline
 
 ## Scope and Related Docs

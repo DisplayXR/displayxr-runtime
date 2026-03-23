@@ -6,6 +6,8 @@ issues: [44]
 code-paths: [src/xrt/compositor/multi/, src/xrt/targets/]
 ---
 
+> **Status: Proposal** — not yet implemented. Tracking issue: [#44](https://github.com/dfattal/openxr-3d-display/issues/44)
+
 # 3D Shell: Spatial Window Manager for Lightfield Displays
 
 ## Scope and Related Docs
