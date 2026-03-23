@@ -85,6 +85,10 @@ typedef struct XrCocoaWindowBindingCreateInfoEXT {
 
 Shared with `XR_EXT_win32_window_binding`. See that extension's spec for the full definition.
 
+### xrSetSharedTextureOutputRectEXT
+
+Sets the canvas sub-rect within the NSView where 3D content appears. Coordinates are relative to the view bounds. See [`XR_EXT_win32_window_binding` §3.5](XR_EXT_win32_window_binding.md) for the full API reference — the function signature and semantics are identical across platforms.
+
 ---
 
 ## 5. Rendering Modes

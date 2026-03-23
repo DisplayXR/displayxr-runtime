@@ -109,7 +109,7 @@ struct XrSessionManager {
     PFN_xrRequestDisplayRenderingModeEXT pfnRequestDisplayRenderingModeEXT = nullptr;
     PFN_xrEnumerateDisplayRenderingModesEXT pfnEnumerateDisplayRenderingModesEXT = nullptr;
 
-    // Shared texture output rect (XR_EXT_display_info v11)
+    // Canvas sub-rect (XR_EXT_win32_window_binding / XR_EXT_cocoa_window_binding)
     PFN_xrSetSharedTextureOutputRectEXT pfnSetSharedTextureOutputRectEXT = nullptr;
 
     // Enumerated rendering mode info

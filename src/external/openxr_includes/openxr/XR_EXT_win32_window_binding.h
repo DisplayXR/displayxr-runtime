@@ -111,6 +111,48 @@ typedef struct XrCompositionLayerWindowSpaceEXT {
                                             //!< 0 = screen depth, negative = toward viewer
 } XrCompositionLayerWindowSpaceEXT;
 
+// ---- Canvas Sub-Rect (Shared Texture Output Rect) ----
+
+/*!
+ * @brief Set the canvas sub-rect within the app's window where 3D content appears.
+ *
+ * For _texture apps (shared texture mode), the 3D canvas may be a sub-rect of
+ * the app's window — e.g., a 3D viewport surrounded by 2D toolbars. The runtime
+ * needs this rect to:
+ * - Compute correct interlacing alignment (screen-space position matters for
+ *   lenticular displays — see spec §2.4 "The Phase Alignment Problem")
+ * - Size views and Kooima projection based on canvas dimensions, not window size
+ *
+ * Call this whenever the canvas position or size changes (e.g., on window resize
+ * or layout change). For static layouts, call once after session creation.
+ *
+ * Coordinates are relative to the HWND client area (not screen-space).
+ * When this function is never called, the runtime assumes the full window
+ * client area is the canvas.
+ *
+ * @param session The session (must have been created with a window binding).
+ * @param x       Left edge of the canvas in client-area pixels.
+ * @param y       Top edge of the canvas in client-area pixels.
+ * @param width   Canvas width in pixels.
+ * @param height  Canvas height in pixels.
+ *
+ * @return XR_SUCCESS on success.
+ */
+#ifndef PFN_xrSetSharedTextureOutputRectEXT_DEFINED
+#define PFN_xrSetSharedTextureOutputRectEXT_DEFINED
+typedef XrResult (XRAPI_PTR *PFN_xrSetSharedTextureOutputRectEXT)(
+    XrSession session, int32_t x, int32_t y, uint32_t width, uint32_t height);
+#endif
+
+#ifndef XR_NO_PROTOTYPES
+XRAPI_ATTR XrResult XRAPI_CALL xrSetSharedTextureOutputRectEXT(
+    XrSession                           session,
+    int32_t                             x,
+    int32_t                             y,
+    uint32_t                            width,
+    uint32_t                            height);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

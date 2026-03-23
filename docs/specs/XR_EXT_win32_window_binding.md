@@ -220,6 +220,52 @@ struct xrt_layer_window_space_data
 
 **`xrt_comp_layer_window_space()`** — Inline helper (`src/xrt/include/xrt/xrt_compositor.h:1865`) that dispatches a window-space layer through the compositor's vtable.
 
+### 3.5 xrSetSharedTextureOutputRectEXT
+
+For `_texture` apps (shared texture mode), the 3D canvas may be a sub-rect of the app's window — for example, a 3D viewport surrounded by toolbars in a Unity or Unreal editor. The runtime needs this rect to compute correct interlacing alignment (see [§2.4](#24-the-phase-alignment-problem)) and to size views and Kooima projection based on canvas dimensions rather than window size.
+
+```c
+typedef XrResult (XRAPI_PTR *PFN_xrSetSharedTextureOutputRectEXT)(
+    XrSession session, int32_t x, int32_t y, uint32_t width, uint32_t height);
+```
+
+**Parameters:**
+
+| Parameter | Description |
+|-----------|-------------|
+| `session` | The session. Must have been created with a window binding. |
+| `x` | Left edge of the canvas, in HWND client-area pixels. |
+| `y` | Top edge of the canvas, in HWND client-area pixels. |
+| `width` | Canvas width in pixels. |
+| `height` | Canvas height in pixels. |
+
+**Returns:** `XR_SUCCESS` on success.
+
+**Valid Usage:**
+- The session **must** have been created with `XrWin32WindowBindingCreateInfoEXT` (or `XrCocoaWindowBindingCreateInfoEXT` on macOS).
+- Call this whenever the canvas position or size changes (e.g., on window resize, view layout change, or editor panel dock/undock).
+- For static layouts, a single call after session creation is sufficient.
+- When this function is never called, the runtime assumes the full window client area is the canvas.
+
+**Example (Unity editor with toolbar):**
+
+```c
+// Canvas is the 3D viewport, offset below a 40px toolbar
+xrSetSharedTextureOutputRectEXT(session,
+    0,       // x: flush left
+    40,      // y: below toolbar
+    1920,    // width: full window width
+    1040);   // height: window height minus toolbar
+```
+
+**Loaded at runtime via:**
+
+```c
+PFN_xrSetSharedTextureOutputRectEXT pfnSetOutputRect = NULL;
+xrGetInstanceProcAddr(instance, "xrSetSharedTextureOutputRectEXT",
+    (PFN_xrVoidFunction*)&pfnSetOutputRect);
+```
+
 ---
 
 ## 4. Usage Examples

@@ -29,7 +29,8 @@ extern "C" {
  * For _shared apps: canvas = wherever the app places the shared texture.
  * For _rt apps: canvas = window (runtime-owned).
  *
- * Set via xrSetSharedTextureOutputRectEXT.
+ * Set via xrSetSharedTextureOutputRectEXT (part of XR_EXT_win32_window_binding
+ * and XR_EXT_cocoa_window_binding).
  */
 struct u_canvas_rect
 {

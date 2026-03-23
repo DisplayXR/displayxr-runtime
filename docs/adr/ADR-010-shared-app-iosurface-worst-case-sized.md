@@ -17,7 +17,7 @@ We initially sized the IOSurface to match the canvas (the sub-rect of the window
 
 **IOSurface = swapchain size (worst-case atlas across all rendering modes), allocated once at session creation.**
 
-The canvas rect is communicated separately via `xrSetSharedTextureOutputRectEXT`, which the compositor uses for Kooima FOV calculation and view sizing. The IOSurface itself never needs to be resized.
+The canvas rect is communicated separately via `xrSetSharedTextureOutputRectEXT` (part of the [window binding extensions](../specs/XR_EXT_win32_window_binding.md#35-xrsetsharedtextureoutputrectext)), which the compositor uses for Kooima FOV calculation and view sizing. The IOSurface itself never needs to be resized.
 
 ## Rationale
 

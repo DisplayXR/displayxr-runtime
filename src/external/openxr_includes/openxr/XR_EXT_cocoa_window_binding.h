@@ -101,6 +101,41 @@ typedef struct XrCocoaWindowBindingCreateInfoEXT {
     void*                    sharedIOSurface;   //!< IOSurfaceRef for zero-copy Metal texture sharing, or NULL
 } XrCocoaWindowBindingCreateInfoEXT;
 
+// ---- Canvas Sub-Rect (Shared Texture Output Rect) ----
+
+/*!
+ * @brief Set the canvas sub-rect within the app's view where 3D content appears.
+ *
+ * macOS equivalent of the same function in XR_EXT_win32_window_binding.
+ * See the Win32 spec for full documentation.
+ *
+ * Coordinates are relative to the NSView's bounds (not screen-space).
+ * When this function is never called, the runtime assumes the full view
+ * bounds are the canvas.
+ *
+ * @param session The session (must have been created with a window binding).
+ * @param x       Left edge of the canvas in view pixels.
+ * @param y       Top edge of the canvas in view pixels.
+ * @param width   Canvas width in pixels.
+ * @param height  Canvas height in pixels.
+ *
+ * @return XR_SUCCESS on success.
+ */
+#ifndef PFN_xrSetSharedTextureOutputRectEXT_DEFINED
+#define PFN_xrSetSharedTextureOutputRectEXT_DEFINED
+typedef XrResult (XRAPI_PTR *PFN_xrSetSharedTextureOutputRectEXT)(
+    XrSession session, int32_t x, int32_t y, uint32_t width, uint32_t height);
+#endif
+
+#ifndef XR_NO_PROTOTYPES
+XRAPI_ATTR XrResult XRAPI_CALL xrSetSharedTextureOutputRectEXT(
+    XrSession                           session,
+    int32_t                             x,
+    int32_t                             y,
+    uint32_t                            width,
+    uint32_t                            height);
+#endif
+
 #ifdef __cplusplus
 }
 #endif
