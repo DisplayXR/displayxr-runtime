@@ -32,9 +32,9 @@ U_TRACE_TARGET_SETUP(U_TRACE_WHICH_SERVICE)
 
 #ifdef XRT_OS_WINDOWS
 
-// Global shutdown flag set by the tray icon's "Exit" menu item.
-// Checked by ipc_server_mainloop_poll() in ipc_server_mainloop_windows.cpp.
-volatile bool g_service_shutdown_requested = false;
+// Shutdown flag defined in ipc_server_mainloop_windows.cpp.
+// Set by the tray icon's "Exit" menu item, checked by ipc_server_mainloop_poll().
+extern volatile bool g_service_shutdown_requested;
 
 static void
 tray_shutdown_callback(void)

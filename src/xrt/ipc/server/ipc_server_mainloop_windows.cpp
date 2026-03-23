@@ -46,8 +46,9 @@
 
 #define ERROR_STR(BUF, ERR) (u_winerror(BUF, ARRAY_SIZE(BUF), ERR, true))
 
-// Shutdown flag set by the tray icon thread in main.c
-extern "C" volatile bool g_service_shutdown_requested;
+// Shutdown flag set by the tray icon thread in service/main.c.
+// Defined here so that any target linking ipc_server gets a default (false).
+extern "C" volatile bool g_service_shutdown_requested = false;
 
 DEBUG_GET_ONCE_BOOL_OPTION(relaxed, "IPC_RELAXED_CONNECTION_SECURITY", false)
 

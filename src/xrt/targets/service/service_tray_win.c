@@ -94,7 +94,7 @@ tray_thread_func(LPVOID param)
 	// Load icon from embedded resource, fall back to system default
 	s_nid.hIcon = LoadIconW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(IDI_DISPLAYXR_ICON));
 	if (!s_nid.hIcon) {
-		s_nid.hIcon = LoadIconW(NULL, IDI_APPLICATION);
+		s_nid.hIcon = LoadIconW(NULL, MAKEINTRESOURCEW(32512) /* IDI_APPLICATION */);
 	}
 
 	Shell_NotifyIconW(NIM_ADD, &s_nid);
