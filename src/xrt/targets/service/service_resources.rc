@@ -1,0 +1,9 @@
+// Copyright 2026, DisplayXR
+// SPDX-License-Identifier: BSL-1.0
+//
+// DisplayXR Service - Windows resources
+
+#include <windows.h>
+
+// Application icon (used for system tray)
+101 ICON "../../../../doc/displayxr.ico"

@@ -637,6 +637,22 @@ Section "DisplayXR Runtime" SecRuntime
 	WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXR" \
 		"EstimatedSize" "$0"
 
+	; Create a scheduled task to auto-start displayxr-service at user logon.
+	; Chrome's AppContainer sandbox blocks the OpenXR loader from launching the
+	; service on-demand (ACCESS_DENIED), so we pre-launch it at logon (issue #68).
+	; /sc onlogon = runs when any user logs on
+	; /rl highest = full user privileges (needed for GPU/display access)
+	; /f         = overwrite existing task (handles upgrade installs)
+	IfFileExists "$INSTDIR\displayxr-service.exe" 0 skip_service_task
+		DetailPrint "Creating scheduled task for DisplayXR Service..."
+		nsExec::ExecToLog 'schtasks /create /tn "DisplayXR Service" /tr "\"$INSTDIR\displayxr-service.exe\"" /sc onlogon /rl highest /f'
+		Pop $0
+		; Start the service immediately so it's available without relogon
+		DetailPrint "Starting DisplayXR Service..."
+		nsExec::ExecToLog 'schtasks /run /tn "DisplayXR Service"'
+		Pop $0
+	skip_service_task:
+
 	; Save installation log to install directory
 	StrCpy $0 "$INSTDIR\install.log"
 	Push $0
@@ -658,6 +674,13 @@ SectionEnd
 ; Uninstaller Section
 
 Section "Uninstall"
+	; Stop the displayxr-service and remove its scheduled task (issue #68)
+	; Kill any running instance first so we can delete the exe
+	DetailPrint "Stopping DisplayXR Service..."
+	nsExec::ExecToLog 'taskkill /f /im displayxr-service.exe'
+	DetailPrint "Removing DisplayXR Service scheduled task..."
+	nsExec::ExecToLog 'schtasks /delete /tn "DisplayXR Service" /f'
+
 	; Remove files
 	Delete "$INSTDIR\DisplayXRClient.dll"
 	Delete "$INSTDIR\displayxr-service.exe"
