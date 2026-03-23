@@ -637,21 +637,25 @@ Section "DisplayXR Runtime" SecRuntime
 	WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXR" \
 		"EstimatedSize" "$0"
 
-	; Create a scheduled task to auto-start displayxr-service at user logon.
+	; Auto-start displayxr-service at user logon via Run registry key.
 	; Chrome's AppContainer sandbox blocks the OpenXR loader from launching the
 	; service on-demand (ACCESS_DENIED), so we pre-launch it at logon (issue #68).
-	; /sc onlogon = runs when any user logs on
-	; /rl highest = full user privileges (needed for GPU/display access)
-	; /f         = overwrite existing task (handles upgrade installs)
-	IfFileExists "$INSTDIR\displayxr-service.exe" 0 skip_service_task
-		DetailPrint "Creating scheduled task for DisplayXR Service..."
-		nsExec::ExecToLog 'schtasks /create /tn "DisplayXR Service" /tr "\"$INSTDIR\displayxr-service.exe\"" /sc onlogon /rl highest /f'
+	; Uses HKLM Run key so it starts for all users (installer already requires admin).
+	; Also remove any legacy scheduled task from older installs.
+	IfFileExists "$INSTDIR\displayxr-service.exe" 0 skip_service_autostart
+		; Remove legacy scheduled task if it exists (from pre-v25.0.1 installs)
+		nsExec::ExecToLog 'schtasks /delete /tn "DisplayXR Service" /f'
 		Pop $0
+
+		; Register in HKLM Run key (starts in user session with GPU/tray access)
+		DetailPrint "Registering DisplayXR Service for auto-start..."
+		WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Run" \
+			"DisplayXR Service" "$\"$INSTDIR\displayxr-service.exe$\""
+
 		; Start the service immediately so it's available without relogon
 		DetailPrint "Starting DisplayXR Service..."
-		nsExec::ExecToLog 'schtasks /run /tn "DisplayXR Service"'
-		Pop $0
-	skip_service_task:
+		Exec '"$INSTDIR\displayxr-service.exe"'
+	skip_service_autostart:
 
 	; Save installation log to install directory
 	StrCpy $0 "$INSTDIR\install.log"
@@ -674,11 +678,14 @@ SectionEnd
 ; Uninstaller Section
 
 Section "Uninstall"
-	; Stop the displayxr-service and remove its scheduled task (issue #68)
+	; Stop the displayxr-service and remove auto-start registration (issue #68)
 	; Kill any running instance first so we can delete the exe
 	DetailPrint "Stopping DisplayXR Service..."
 	nsExec::ExecToLog 'taskkill /f /im displayxr-service.exe'
-	DetailPrint "Removing DisplayXR Service scheduled task..."
+	; Remove Run key auto-start
+	DetailPrint "Removing DisplayXR Service auto-start..."
+	DeleteRegValue HKLM "Software\Microsoft\Windows\CurrentVersion\Run" "DisplayXR Service"
+	; Also remove legacy scheduled task if it exists (from older installs)
 	nsExec::ExecToLog 'schtasks /delete /tn "DisplayXR Service" /f'
 
 	; Remove files
