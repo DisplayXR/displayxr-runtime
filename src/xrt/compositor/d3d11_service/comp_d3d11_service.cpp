@@ -164,10 +164,16 @@ struct d3d11_client_render_resources
 	//! Back buffer render target view
 	wil::com_ptr<ID3D11RenderTargetView> back_buffer_rtv;
 
-	//! Atlas render target (tiled views)
+	//! Atlas render target (tiled views, full native dims)
 	wil::com_ptr<ID3D11Texture2D> atlas_texture;
 	wil::com_ptr<ID3D11ShaderResourceView> atlas_srv;
 	wil::com_ptr<ID3D11RenderTargetView> atlas_rtv;
+
+	//! Content-sized crop atlas for DP input (lazy-created when content < atlas)
+	wil::com_ptr<ID3D11Texture2D> crop_texture;
+	wil::com_ptr<ID3D11ShaderResourceView> crop_srv;
+	uint32_t crop_width;   //!< Current crop texture width (0 = not created)
+	uint32_t crop_height;  //!< Current crop texture height
 
 	//! Generic D3D11 display processor (vendor-agnostic weaving)
 	struct xrt_display_processor_d3d11 *display_processor;
@@ -1230,6 +1236,10 @@ fini_client_render_resources(struct d3d11_client_render_resources *res)
 	xrt_display_processor_d3d11_destroy(&res->display_processor);
 
 	res->back_buffer_rtv.reset();
+	res->crop_srv.reset();
+	res->crop_texture.reset();
+	res->crop_width = 0;
+	res->crop_height = 0;
 	res->atlas_rtv.reset();
 	res->atlas_srv.reset();
 	res->atlas_texture.reset();
@@ -3106,11 +3116,99 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		comp_d3d11_window_wait_for_paint(c->render.window);
 	}
 
-	// Select display processor input: zero-copy from app's swapchain, or intermediate atlas_texture
-	ID3D11ShaderResourceView *input_srv = use_zero_copy
-	    ? zc_srv.get() : c->render.atlas_srv.get();
-	uint32_t input_view_w = use_zero_copy ? zc_view_w : content_view_w;
-	uint32_t input_view_h = use_zero_copy ? zc_view_h : content_view_h;
+	// Select display processor input: zero-copy from app's swapchain, or atlas.
+	// The DP expects the atlas texture to be exactly content-sized
+	// (2*view_width x view_height for SBS). When a legacy/compromise-scale app
+	// renders smaller content into a larger atlas, crop-blit to a content-sized
+	// staging texture before passing to the DP.
+	ID3D11ShaderResourceView *input_srv = nullptr;
+	uint32_t input_view_w = 0;
+	uint32_t input_view_h = 0;
+
+	if (use_zero_copy) {
+		input_srv = zc_srv.get();
+		input_view_w = zc_view_w;
+		input_view_h = zc_view_h;
+	} else {
+		uint32_t expected_w = sys->tile_columns * content_view_w;
+		uint32_t expected_h = sys->tile_rows * content_view_h;
+
+		if (expected_w == sys->display_width && expected_h == sys->display_height) {
+			// Content fills the full atlas — pass directly
+			input_srv = c->render.atlas_srv.get();
+		} else {
+			// Content is smaller than atlas (legacy compromise scale).
+			// Crop-blit: copy content regions to a content-sized texture.
+			if (c->render.crop_width != expected_w || c->render.crop_height != expected_h) {
+				c->render.crop_srv.reset();
+				c->render.crop_texture.reset();
+
+				D3D11_TEXTURE2D_DESC crop_desc = {};
+				crop_desc.Width = expected_w;
+				crop_desc.Height = expected_h;
+				crop_desc.MipLevels = 1;
+				crop_desc.ArraySize = 1;
+				crop_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+				crop_desc.SampleDesc.Count = 1;
+				crop_desc.Usage = D3D11_USAGE_DEFAULT;
+				crop_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+				HRESULT hr = sys->device->CreateTexture2D(
+				    &crop_desc, nullptr, c->render.crop_texture.put());
+				if (SUCCEEDED(hr)) {
+					sys->device->CreateShaderResourceView(
+					    c->render.crop_texture.get(), nullptr,
+					    c->render.crop_srv.put());
+					c->render.crop_width = expected_w;
+					c->render.crop_height = expected_h;
+
+					static bool logged = false;
+					if (!logged) {
+						U_LOG_W("Crop-blit: created %ux%u staging texture "
+						        "(atlas=%ux%u, content=%ux%u/view)",
+						        expected_w, expected_h,
+						        sys->display_width, sys->display_height,
+						        content_view_w, content_view_h);
+						logged = true;
+					}
+				}
+			}
+
+			if (c->render.crop_texture) {
+				// Copy each view's content region from atlas to crop texture
+				uint32_t num_views = sys->tile_columns * sys->tile_rows;
+				for (uint32_t v = 0; v < num_views && v < 2; v++) {
+					uint32_t src_tile_x, src_tile_y;
+					u_tiling_view_origin(v, sys->tile_columns,
+					                     sys->view_width, sys->view_height,
+					                     &src_tile_x, &src_tile_y);
+					uint32_t dst_tile_x, dst_tile_y;
+					u_tiling_view_origin(v, sys->tile_columns,
+					                     content_view_w, content_view_h,
+					                     &dst_tile_x, &dst_tile_y);
+
+					D3D11_BOX box = {};
+					box.left = src_tile_x;
+					box.top = src_tile_y;
+					box.right = src_tile_x + content_view_w;
+					box.bottom = src_tile_y + content_view_h;
+					box.front = 0;
+					box.back = 1;
+
+					sys->context->CopySubresourceRegion(
+					    c->render.crop_texture.get(), 0,
+					    dst_tile_x, dst_tile_y, 0,
+					    c->render.atlas_texture.get(), 0, &box);
+				}
+				input_srv = c->render.crop_srv.get();
+			} else {
+				// Fallback: pass full atlas (will look wrong but won't crash)
+				input_srv = c->render.atlas_srv.get();
+			}
+		}
+		input_view_w = content_view_w;
+		input_view_h = content_view_h;
+	}
 
 	// Process stereo texture through display processor for display output
 	// Skip processing for mono — display is in 2D mode, no interlacing needed
@@ -3159,7 +3257,15 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 					eye_h = zc_view_h;
 					tex_w = sys->tile_columns * zc_view_w;
 					tex_h = sys->tile_rows * zc_view_h;
+				} else if (c->render.crop_srv) {
+					// Use content-sized crop texture (correct UV mapping)
+					src_srv = c->render.crop_srv.get();
+					eye_w = content_view_w;
+					eye_h = content_view_h;
+					tex_w = sys->tile_columns * content_view_w;
+					tex_h = sys->tile_rows * content_view_h;
 				} else if (c->render.atlas_srv) {
+					// Atlas is content-sized (no crop needed)
 					src_srv = c->render.atlas_srv.get();
 					eye_w = content_view_w;
 					eye_h = content_view_h;
