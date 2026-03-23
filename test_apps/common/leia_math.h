@@ -221,7 +221,7 @@ struct mat4f
     }
 };
 
-// Kooima off-axis stereo projection matrix calculation
+// Kooima off-axis projection matrix calculation
 // Based on Robert Kooima's paper "Generalized Perspective Projection"
 // Screen is assumed to be at Z=0 plane, centered at origin
 // All units in millimeters

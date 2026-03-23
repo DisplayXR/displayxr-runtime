@@ -24,7 +24,7 @@ struct leiasr_d3d12;
 /*!
  * Create a D3D12 SR weaver instance.
  *
- * The weaver expects a side-by-side stereo texture where:
+ * The weaver expects a side-by-side atlas texture where:
  * - Left view is in the left half (x: 0 to view_width)
  * - Right view is in the right half (x: view_width to 2*view_width)
  *
@@ -32,7 +32,7 @@ struct leiasr_d3d12;
  * @param d3d12_device The D3D12 device (ID3D12Device*).
  * @param d3d12_command_queue The D3D12 command queue (ID3D12CommandQueue*).
  * @param hwnd Window handle (HWND), NULL for fullscreen.
- * @param view_width Width of one view (half of stereo texture width).
+ * @param view_width Width of one view (half of atlas texture width).
  * @param view_height Height of the views.
  * @param[out] out Pointer to receive the created instance.
  *
@@ -60,10 +60,10 @@ void
 leiasr_d3d12_destroy(struct leiasr_d3d12 **leiasr_ptr);
 
 /*!
- * Set the input stereo texture for weaving.
+ * Set the input atlas texture for weaving.
  *
  * @param leiasr The D3D12 weaver instance.
- * @param stereo_resource The stereo texture resource (ID3D12Resource*).
+ * @param stereo_resource The atlas texture resource (ID3D12Resource*).
  * @param view_width Width of one view.
  * @param view_height Height of the views.
  * @param format DXGI format of the texture (DXGI_FORMAT as uint32_t).
@@ -92,7 +92,7 @@ void
 leiasr_d3d12_set_output_format(struct leiasr_d3d12 *leiasr, uint32_t format);
 
 /*!
- * Perform weaving from the stereo texture to the render target.
+ * Perform weaving from the atlas texture to the render target.
  *
  * Records draw commands onto the provided command list.
  *

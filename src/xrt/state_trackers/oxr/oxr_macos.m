@@ -139,7 +139,7 @@ oxr_macos_pump_events(struct xrt_device **xdevs, uint32_t xdev_count, struct xrt
 				}
 				xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, render_mode);
 				// Note: do NOT change hmd->view_count for _rt apps.
-				// _rt apps always render stereo; the compositor/weaver
+				// _rt apps always render 3D; the compositor/weaver
 				// handles 2D by displaying one eye or blending.
 			}
 		}

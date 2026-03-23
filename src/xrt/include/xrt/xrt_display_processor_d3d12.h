@@ -54,7 +54,7 @@ struct xrt_display_processor_d3d12
 	 *
 	 * @param      xdp                   Pointer to self.
 	 * @param      d3d12_command_list     Command list (ID3D12GraphicsCommandList*).
-	 * @param      atlas_texture_resource Stereo texture resource (ID3D12Resource*), may be NULL.
+	 * @param      atlas_texture_resource Atlas texture resource (ID3D12Resource*), may be NULL.
 	 * @param      atlas_srv_gpu_handle  Atlas texture SRV (D3D12_GPU_DESCRIPTOR_HANDLE as uint64_t).
 	 * @param      target_rtv_cpu_handle  Output render target RTV (D3D12_CPU_DESCRIPTOR_HANDLE as uint64_t).
 	 * @param      view_width            Width of one eye view in pixels.

@@ -9,7 +9,7 @@
  * Creates a tiled atlas texture and copies/blits app swapchain
  * content into per-eye tile regions. The atlas texture is then consumed
  * by the display processor (weaver) or blitted to the target for 2D fallback.
- * Default layout is 2x1 (side-by-side stereo); tile_columns and tile_rows
+ * Default layout is 2x1 (stereo); tile_columns and tile_rows
  * can be changed to support arbitrary atlas layouts (e.g. 2x2 for quad views).
  *
  * Uses vkCmdBlitImage for simplicity — no render pass or pipeline needed.
@@ -41,10 +41,10 @@ struct comp_vk_native_renderer
 	//! Command pool for recording blit commands.
 	VkCommandPool cmd_pool;
 
-	//! Number of tile columns in the atlas (default 2 for SBS stereo).
+	//! Number of tile columns in the atlas (default 2 for stereo).
 	uint32_t tile_columns;
 
-	//! Number of tile rows in the atlas (default 1 for SBS stereo).
+	//! Number of tile rows in the atlas (default 1 for stereo).
 	uint32_t tile_rows;
 
 	//! Atlas texture (tile_columns * view_width x tile_rows * texture_height).
@@ -69,7 +69,7 @@ struct comp_vk_native_renderer
 	uint32_t atlas_alloc_width;
 	uint32_t atlas_alloc_height;
 
-	//! Format of the stereo texture.
+	//! Format of the atlas texture.
 	VkFormat format;
 };
 

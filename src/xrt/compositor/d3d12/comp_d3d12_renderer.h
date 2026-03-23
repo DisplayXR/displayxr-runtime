@@ -28,7 +28,7 @@ extern "C" {
  * Create a D3D12 renderer.
  *
  * @param c The D3D12 compositor.
- * @param view_width Width of one view (half of stereo texture width).
+ * @param view_width Width of one view (half of atlas texture width for stereo).
  * @param view_height Height of the views.
  * @param target_height Height of the render target (window).
  * @param out_renderer Pointer to receive the created renderer.
@@ -53,7 +53,7 @@ void
 comp_d3d12_renderer_destroy(struct comp_d3d12_renderer **renderer_ptr);
 
 /*!
- * Render all accumulated layers to the side-by-side stereo texture.
+ * Render all accumulated layers to the tiled atlas texture.
  *
  * @param renderer The renderer.
  * @param cmd_list D3D12 command list to record onto (void* = ID3D12GraphicsCommandList*).
@@ -80,7 +80,7 @@ comp_d3d12_renderer_draw(struct comp_d3d12_renderer *renderer,
                          bool hardware_display_3d);
 
 /*!
- * Get the stereo texture SRV GPU descriptor handle for weaving.
+ * Get the atlas texture SRV GPU descriptor handle for weaving.
  *
  * @param renderer The renderer.
  * @return D3D12_GPU_DESCRIPTOR_HANDLE as uint64_t.
@@ -91,7 +91,7 @@ uint64_t
 comp_d3d12_renderer_get_atlas_srv_handle(struct comp_d3d12_renderer *renderer);
 
 /*!
- * Get the stereo texture SRV CPU descriptor handle (for copying to another heap).
+ * Get the atlas texture SRV CPU descriptor handle (for copying to another heap).
  *
  * @param renderer The renderer.
  * @return D3D12_CPU_DESCRIPTOR_HANDLE as uint64_t.
@@ -102,7 +102,7 @@ uint64_t
 comp_d3d12_renderer_get_atlas_srv_cpu_handle(struct comp_d3d12_renderer *renderer);
 
 /*!
- * Get stereo texture dimensions.
+ * Get atlas texture dimensions (per-view).
  *
  * @param renderer The renderer.
  * @param out_view_width Width of one view.
@@ -119,8 +119,8 @@ comp_d3d12_renderer_get_view_dimensions(struct comp_d3d12_renderer *renderer,
  * Get the tile layout of the atlas texture.
  *
  * @param renderer The renderer.
- * @param out_tile_columns Number of tile columns (e.g. 2 for stereo SBS).
- * @param out_tile_rows Number of tile rows (e.g. 1 for stereo SBS).
+ * @param out_tile_columns Number of tile columns (e.g. 2 for stereo).
+ * @param out_tile_rows Number of tile rows (e.g. 1 for stereo).
  *
  * @ingroup comp_d3d12
  */
@@ -156,7 +156,7 @@ comp_d3d12_renderer_set_legacy_app_tile_scaling(struct comp_d3d12_renderer *rend
                                                  bool legacy);
 
 /*!
- * Get the stereo texture resource for direct copy.
+ * Get the atlas texture resource for direct copy.
  *
  * @param renderer The renderer.
  * @return Pointer to ID3D12Resource.

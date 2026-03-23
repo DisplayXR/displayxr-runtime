@@ -1712,7 +1712,7 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 		}
 	}
 
-	// Render projection layers to stereo texture (skip if zero-copy)
+	// Render projection layers to atlas texture (skip if zero-copy)
 	xrt_result_t xret = XRT_SUCCESS;
 	if (!zero_copy) {
 		xret = comp_vk_native_renderer_draw(
@@ -1838,7 +1838,7 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			}
 		}
 
-		// Fallback: blit stereo texture to shared image
+		// Fallback: blit atlas texture to shared image
 		if (!weaving_done) {
 			comp_vk_native_renderer_blit_to_shared(c->renderer, cmd,
 			    (uint64_t)(uintptr_t)c->shared_image, tgt_width, tgt_height);
@@ -1992,7 +1992,7 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				vk_compositor_render_hud(c, cmd,
 				    (VkImage)(uintptr_t)target_image, tgt_width, tgt_height);
 			} else {
-				// No display processor (or mono/2D mode): blit stereo texture to target
+				// No display processor (or mono/2D mode): blit atlas texture to target
 				comp_vk_native_renderer_blit_to_target(c->renderer, cmd,
 				                                        target_image, tgt_width, tgt_height);
 

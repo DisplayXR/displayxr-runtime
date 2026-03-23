@@ -193,7 +193,7 @@ qwerty_process_event(struct xrt_device **xdevs, size_t xdev_count, SDL_Event eve
 	if (event.type == SDL_KEYDOWN && event.key.keysym.scancode == SDL_SCANCODE_DOWN) qwerty_press_look_down(qdev);
 	if (event.type == SDL_KEYUP && event.key.keysym.scancode == SDL_SCANCODE_DOWN) qwerty_release_look_down(qdev);
 
-	// Mouse wheel: stereo controls (HMD focused) or movement speed (controller focused)
+	// Mouse wheel: 3D controls (HMD focused) or movement speed (controller focused)
 	if (event.type == SDL_MOUSEWHEEL && event.wheel.y != 0) {
 		if (qdev == qd_hmd) {
 			SDL_Keymod mod = SDL_GetModState();
@@ -250,7 +250,7 @@ qwerty_process_event(struct xrt_device **xdevs, size_t xdev_count, SDL_Event eve
 	if (event.type == SDL_KEYDOWN && event.key.keysym.scancode == SDL_SCANCODE_G) { qwerty_press_thumbstick_down(qctrl); qwerty_press_trackpad_down(qctrl); }
 	if (event.type == SDL_KEYUP && event.key.keysym.scancode == SDL_SCANCODE_G) { qwerty_release_thumbstick_down(qctrl); qwerty_release_trackpad_down(qctrl); }
 
-	// Stereo mode toggle (HMD focused, one-shot on keydown)
+	// 3D mode toggle (HMD focused, one-shot on keydown)
 	if (event.type == SDL_KEYDOWN && event.key.repeat == 0 && qdev == qd_hmd) {
 		if (event.key.keysym.scancode == SDL_SCANCODE_P) qwerty_toggle_camera_mode(qsys);
 		if (event.key.keysym.scancode == SDL_SCANCODE_SPACE) qwerty_reset_view_state(qsys);

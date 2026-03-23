@@ -28,10 +28,10 @@ extern "C" {
  * Create a D3D11 renderer.
  *
  * @param c The D3D11 compositor.
- * @param view_width Width of one view (half of stereo texture width).
+ * @param view_width Width of one view (half of atlas texture width for stereo).
  * @param view_height Height of the views.
  * @param target_height Height of the render target (window). The internal
- *        stereo texture height is max(view_height, target_height) so that
+ *        atlas texture height is max(view_height, target_height) so that
  *        mono (2D) rendering can fill the full window without cropping.
  * @param out_renderer Pointer to receive the created renderer.
  *
@@ -55,7 +55,7 @@ void
 comp_d3d11_renderer_destroy(struct comp_d3d11_renderer **renderer_ptr);
 
 /*!
- * Render all accumulated layers to the side-by-side stereo texture.
+ * Render all accumulated layers to the tiled atlas texture.
  *
  * @param renderer The renderer.
  * @param layers The accumulated layers.
@@ -81,9 +81,9 @@ comp_d3d11_renderer_draw(struct comp_d3d11_renderer *renderer,
                          bool hardware_display_3d);
 
 /*!
- * Get the stereo texture SRV for weaving.
+ * Get the atlas texture SRV for weaving.
  *
- * Returns the shader resource view of the side-by-side stereo texture
+ * Returns the shader resource view of the tiled atlas texture
  * that should be passed to the weaver.
  *
  * @param renderer The renderer.
@@ -103,7 +103,7 @@ void *
 comp_d3d11_renderer_get_atlas_rtv(struct comp_d3d11_renderer *renderer);
 
 /*!
- * Get stereo texture dimensions.
+ * Get atlas texture dimensions (per-view).
  *
  * @param renderer The renderer.
  * @param out_view_width Width of one view.
@@ -120,8 +120,8 @@ comp_d3d11_renderer_get_view_dimensions(struct comp_d3d11_renderer *renderer,
  * Get the tile layout of the atlas texture.
  *
  * @param renderer The renderer.
- * @param out_tile_columns Number of tile columns (e.g. 2 for stereo SBS).
- * @param out_tile_rows Number of tile rows (e.g. 1 for stereo SBS).
+ * @param out_tile_columns Number of tile columns (e.g. 2 for stereo).
+ * @param out_tile_rows Number of tile rows (e.g. 1 for stereo).
  *
  * @ingroup comp_d3d11
  */
@@ -160,9 +160,9 @@ comp_d3d11_renderer_set_legacy_app_tile_scaling(struct comp_d3d11_renderer *rend
                                                  bool legacy);
 
 /*!
- * Get the stereo texture for debug readback.
+ * Get the atlas texture for debug readback.
  *
- * Returns the ID3D11Texture2D of the side-by-side stereo texture.
+ * Returns the ID3D11Texture2D of the tiled atlas texture.
  *
  * @param renderer The renderer.
  *
@@ -174,9 +174,9 @@ void *
 comp_d3d11_renderer_get_atlas_texture(struct comp_d3d11_renderer *renderer);
 
 /*!
- * Resize the renderer's stereo texture to match a new view size.
+ * Resize the renderer's atlas texture to match a new view size.
  *
- * Recreates the stereo texture, SRV, RTV, depth texture, and DSV at the
+ * Recreates the atlas texture, SRV, RTV, depth texture, and DSV at the
  * new dimensions. Shaders, samplers, and pipeline state objects are NOT
  * recreated. Does nothing if the dimensions are unchanged.
  *
@@ -197,12 +197,12 @@ comp_d3d11_renderer_resize(struct comp_d3d11_renderer *renderer,
                            uint32_t new_target_height);
 
 /*!
- * Blit the stereo texture to a back buffer with GPU stretching.
+ * Blit the atlas texture to a back buffer with GPU stretching.
  *
- * Used for mono/2D fallback when the stereo texture is smaller than
+ * Used for mono/2D fallback when the atlas texture is smaller than
  * the window (e.g. display processor present → texture_height = view_height
  * which may be less than window height). Renders a fullscreen quad from
- * the stereo texture SRV to the back buffer, stretching to fill the target.
+ * the atlas texture SRV to the back buffer, stretching to fill the target.
  *
  * @param renderer The renderer.
  * @param back_buffer_texture The back buffer (ID3D11Texture2D*) to blit to.

@@ -235,15 +235,15 @@ create_atlas_texture(struct comp_d3d12_renderer *r, ID3D12Device *device, uint32
 	    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &clear_value,
 	    __uuidof(ID3D12Resource), reinterpret_cast<void **>(&r->atlas_texture));
 	if (FAILED(hr)) {
-		U_LOG_E("Failed to create stereo texture: 0x%08x", hr);
+		U_LOG_E("Failed to create atlas texture: 0x%08x", hr);
 		return XRT_ERROR_D3D;
 	}
 
-	// Create RTV for stereo texture
+	// Create RTV for atlas texture
 	D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle = r->rtv_heap->GetCPUDescriptorHandleForHeapStart();
 	device->CreateRenderTargetView(r->atlas_texture, nullptr, rtv_handle);
 
-	// Create SRV for stereo texture in slot 0
+	// Create SRV for atlas texture in slot 0
 	D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
 	srv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
 	srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -464,7 +464,7 @@ comp_d3d12_renderer_create(struct comp_d3d12_compositor *c,
 			r->tile_rows = internals->xdev->rendering_modes[idx].tile_rows;
 		}
 	}
-	// Default to stereo side-by-side if not set
+	// Default to 2x1 (stereo) if not set
 	if (r->tile_columns == 0) {
 		r->tile_columns = 2;
 	}
@@ -479,7 +479,7 @@ comp_d3d12_renderer_create(struct comp_d3d12_compositor *c,
 	r->rtv_descriptor_size = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 	r->srv_descriptor_size = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 
-	// Create RTV descriptor heap (1 for stereo texture)
+	// Create RTV descriptor heap (1 for atlas texture)
 	D3D12_DESCRIPTOR_HEAP_DESC rtv_heap_desc = {};
 	rtv_heap_desc.NumDescriptors = 1;
 	rtv_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
@@ -513,7 +513,7 @@ comp_d3d12_renderer_create(struct comp_d3d12_compositor *c,
 		return XRT_ERROR_D3D;
 	}
 
-	// Create stereo texture
+	// Create atlas texture
 	xrt_result_t xret = create_atlas_texture(r, device, view_width, view_height);
 	if (xret != XRT_SUCCESS) {
 		r->srv_heap->Release();

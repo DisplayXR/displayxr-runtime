@@ -622,7 +622,7 @@ verify_projection_layer(struct oxr_session *sess,
 			}
 		}
 		if (!valid && proj->viewCount == 2) {
-			valid = true; // default stereo always accepted
+			valid = true; // default 3D always accepted
 		}
 		if (!valid) {
 			return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,

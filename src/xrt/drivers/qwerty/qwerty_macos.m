@@ -434,7 +434,7 @@ qwerty_process_macos(struct xrt_device **xdevs,
 				qwerty_toggle_camera_mode(qsys);
 			break;
 
-		// Spacebar = reset stereo to camera defaults (HMD focused only)
+		// Spacebar = reset 3D to camera defaults (HMD focused only)
 		case kVK_Space:
 			if (is_down && ![event isARepeat] && qsys->hmd_focused)
 				qwerty_reset_view_state(qsys);
@@ -511,7 +511,7 @@ qwerty_process_macos(struct xrt_device **xdevs,
 		}
 		if (delta_y != 0) {
 			if (qsys->hmd_focused) {
-				// HMD focused: mouse wheel + modifiers for stereo controls
+				// HMD focused: mouse wheel + modifiers for 3D controls
 				NSUInteger flags = [event modifierFlags];
 				if (flags & NSEventModifierFlagShift) {
 					float mult = (delta_y > 0) ? 1.1f : (1.0f / 1.1f);

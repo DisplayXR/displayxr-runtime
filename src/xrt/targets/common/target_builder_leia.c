@@ -93,7 +93,7 @@ leia_open_system_impl(struct xrt_builder *xb,
 	if (qwerty_hmd != NULL) {
 		struct qwerty_device *qd = qwerty_device(qwerty_hmd);
 
-		// Configure stereo params from Leia display info.
+		// Configure 3D params from Leia display info.
 		struct leiasr_probe_result probe;
 		if (leiasr_get_probe_results(&probe) && probe.hw_found) {
 			qd->sys->screen_height_m = probe.display_h_m;

@@ -55,7 +55,7 @@ void
 comp_vk_native_renderer_destroy(struct comp_vk_native_renderer **renderer_ptr);
 
 /*!
- * Render all accumulated layers to the side-by-side stereo texture.
+ * Render all accumulated layers to the tiled atlas texture.
  *
  * @param renderer The renderer.
  * @param layers The accumulated layers.
@@ -102,7 +102,7 @@ uint64_t
 comp_vk_native_renderer_get_atlas_image(struct comp_vk_native_renderer *renderer);
 
 /*!
- * Get stereo texture dimensions.
+ * Get atlas texture dimensions (per-view).
  *
  * @param renderer The renderer.
  * @param out_view_width Width of one view.
@@ -131,7 +131,7 @@ comp_vk_native_renderer_get_atlas_dimensions(struct comp_vk_native_renderer *ren
                                               uint32_t *out_height);
 
 /*!
- * Get the stereo texture format.
+ * Get the atlas texture format.
  *
  * @param renderer The renderer.
  * @return VkFormat as int32_t.
@@ -142,7 +142,7 @@ int32_t
 comp_vk_native_renderer_get_format(struct comp_vk_native_renderer *renderer);
 
 /*!
- * Resize the renderer's stereo texture.
+ * Resize the renderer's atlas texture.
  *
  * @param renderer The renderer.
  * @param new_view_width New width per view.
@@ -162,7 +162,7 @@ comp_vk_native_renderer_resize(struct comp_vk_native_renderer *renderer,
                                 uint32_t new_atlas_height);
 
 /*!
- * Blit the stereo texture to a target image with stretching.
+ * Blit the atlas texture to a target image with stretching.
  * Used for mono/2D fallback.
  *
  * @param renderer The renderer.
@@ -181,7 +181,7 @@ comp_vk_native_renderer_blit_to_target(struct comp_vk_native_renderer *renderer,
                                         uint32_t dst_height);
 
 /*!
- * Blit the stereo texture to a shared (non-swapchain) image.
+ * Blit the atlas texture to a shared (non-swapchain) image.
  * Same as blit_to_target but transitions to GENERAL instead of PRESENT_SRC_KHR.
  *
  * @param renderer The renderer.

@@ -228,7 +228,7 @@ sim_dp_metal_process_atlas(struct xrt_display_processor_metal *xdp,
 
 	// Read the current mode (may change at runtime via 1/2/3 keys).
 	// Single-view input (tile_columns * tile_rows == 1) forces passthrough —
-	// stereo shaders (anaglyph, SBS, blend) need ≥2 views.
+	// 3D shaders (anaglyph, SBS, blend) need ≥2 views.
 	enum sim_display_output_mode mode = sim_display_get_output_mode();
 	if (tile_columns * tile_rows <= 1) {
 		mode = SIM_DISPLAY_OUTPUT_PASSTHROUGH;

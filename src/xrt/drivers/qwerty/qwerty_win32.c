@@ -85,7 +85,7 @@ default_qwerty_device(struct xrt_device **xdevs, size_t xdev_count, struct qwert
 	if (xd_hmd != NULL) {
 		// Qwerty HMD exists — default to it regardless of head role.
 		// When a display builder (Leia, sim_display) owns the head role,
-		// the qwerty HMD is still in the device list for pose/stereo control.
+		// the qwerty HMD is still in the device list for pose/3D control.
 		default_qdev = qwerty_device(xd_hmd);
 	} else if (right >= 0 && right < (int)xdev_count && xdevs[right] == xd_right) {
 		default_qdev = qwerty_device(xd_right);
@@ -489,7 +489,7 @@ qwerty_process_win32(struct xrt_device **xdevs,
 				qwerty_toggle_camera_mode(qsys);
 			break;
 
-		// Spacebar = reset stereo to camera defaults (HMD focused only)
+		// Spacebar = reset 3D to camera defaults (HMD focused only)
 		case VK_SPACE:
 			if (is_keydown && qsys->hmd_focused)
 				qwerty_reset_view_state(qsys);
@@ -638,7 +638,7 @@ qwerty_process_win32(struct xrt_device **xdevs,
 		int steps = delta / WHEEL_DELTA;
 		if (steps != 0) {
 			if (qsys->hmd_focused) {
-				// HMD focused: mouse wheel + modifiers for stereo controls
+				// HMD focused: mouse wheel + modifiers for 3D controls
 				bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
 				if (shift) {
 					float mult = (steps > 0) ? 1.1f : (1.0f / 1.1f);

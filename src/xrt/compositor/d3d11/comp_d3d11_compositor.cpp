@@ -398,7 +398,7 @@ d3d11_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 
 	// Check for window resize and handle it.
 	// During a modal drag/resize (in_size_move), we still resize the swapchain target
-	// to keep DXGI in sync, but defer the expensive stereo texture reallocation until
+	// to keep DXGI in sync, but defer the expensive atlas texture reallocation until
 	// the drag ends. This avoids per-pixel texture churn that causes stutter.
 	bool in_size_move = false;
 	if (c->owns_window && c->own_window != nullptr) {
@@ -880,7 +880,7 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 	}
 
-	// Extract stereo pair for renderer (display processor still needs L/R)
+	// Extract eye positions for renderer (display processor still needs L/R)
 	struct xrt_vec3 left_eye = {eye_pos.eyes[0].x, eye_pos.eyes[0].y, eye_pos.eyes[0].z};
 	struct xrt_vec3 right_eye = {eye_pos.eyes[1].x, eye_pos.eyes[1].y, eye_pos.eyes[1].z};
 
@@ -1087,7 +1087,7 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 	}
 
-	// Render layers to side-by-side stereo texture (skip if zero-copy).
+	// Render layers to atlas texture (skip if zero-copy).
 	// Pass hardware_display_3d so the renderer knows the current display mode.
 	xrt_result_t xret = XRT_SUCCESS;
 	if (!zero_copy) {
@@ -1100,7 +1100,7 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	}
 
 #ifdef XRT_FEATURE_DEBUG_GUI
-	// Update debug GUI preview with the rendered stereo texture
+	// Update debug GUI preview with the rendered atlas texture
 	if (comp_d3d11_debug_is_active(c->debug)) {
 		ID3D11Texture2D *atlas_texture =
 		    static_cast<ID3D11Texture2D *>(comp_d3d11_renderer_get_atlas_texture(c->renderer));
@@ -1601,8 +1601,8 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	}
 	U_LOG_I("Display refresh rate: %.2f Hz", c->display_refresh_rate);
 
-	// Determine view dimensions for the stereo texture.
-	// Default: derive from window size (half width for side-by-side)
+	// Determine view dimensions for the atlas texture.
+	// Default: derive from window size (half width for 2-view atlas)
 	uint32_t view_width = c->settings.preferred.width / 2;
 	uint32_t view_height = c->settings.preferred.height;
 
@@ -1657,11 +1657,11 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	}
 
 	// Create renderer with the correct view dimensions.
-	// When a display processor is present, the stereo texture height must match
+	// When a display processor is present, the atlas texture height must match
 	// view_height so the display processor's UV 0..1 maps exactly to the rendered content.
-	// Without a display processor, use the window height so the stereo texture is tall enough
+	// Without a display processor, use the window height so the atlas texture is tall enough
 	// for mono fallback blitting.  Mono/2D mode uses a GPU stretch blit to fill the full
-	// window regardless of stereo texture height.
+	// window regardless of atlas texture height.
 	// NOTE: the per-frame resize path (renderer_resize) must apply the same guard —
 	// see resize_target_h in the mode-switch handler above.
 	uint32_t target_height = (c->display_processor != NULL) ? view_height : c->settings.preferred.height;

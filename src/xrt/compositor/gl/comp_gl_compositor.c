@@ -4,7 +4,7 @@
  * @file
  * @brief  Native OpenGL compositor — direct GL rendering, no interop.
  *
- * Creates GL texture swapchains, renders SBS stereo output, presents
+ * Creates GL texture swapchains, renders atlas output, presents
  * to window. Supports Windows (WGL), Android (EGL), macOS (CGL).
  *
  * @author David Fattal
@@ -195,17 +195,17 @@ struct comp_gl_compositor
 	struct xrt_compositor_native base;
 
 	// --- GL resources ---
-	GLuint program_blit;      //!< Shader for blitting eye to SBS texture
+	GLuint program_blit;      //!< Shader for blitting eye to atlas texture
 	GLuint program_window_space; //!< Window-space layer (positioned quad)
 	GLuint vao_empty;         //!< Empty VAO for vertex-shader-generated fullscreen quad
-	GLuint fbo;               //!< Framebuffer for rendering into SBS texture
-	GLuint atlas_texture;    //!< Atlas stereo texture (tile_columns * view_width x tile_rows * view_height)
+	GLuint fbo;               //!< Framebuffer for rendering into atlas texture
+	GLuint atlas_texture;    //!< Atlas texture (tile_columns * view_width x tile_rows * view_height)
 	uint32_t atlas_tex_width;  //!< Atlas texture width (fixed at init)
 	uint32_t atlas_tex_height; //!< Atlas texture height (fixed at init)
 	uint32_t view_width;
 	uint32_t view_height;
-	uint32_t tile_columns;    //!< Tile columns in atlas layout (default 2 for SBS stereo)
-	uint32_t tile_rows;       //!< Tile rows in atlas layout (default 1 for SBS stereo)
+	uint32_t tile_columns;    //!< Tile columns in atlas layout (default 2 for stereo)
+	uint32_t tile_rows;       //!< Tile rows in atlas layout (default 1 for stereo)
 
 	// --- Layer accumulation ---
 	struct comp_layer_accum layer_accum;
@@ -942,7 +942,7 @@ gl_crop_and_process_dp(struct comp_gl_compositor *c,
 
 /*
  *
- * Layer commit — render SBS and present
+ * Layer commit — render atlas and present
  *
  */
 
@@ -1098,7 +1098,7 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 		}
 	}
 
-	// --- Step 1: Render layers into SBS stereo texture (skip if zero-copy) ---
+	// --- Step 1: Render layers into atlas texture (skip if zero-copy) ---
 	if (!zero_copy) {
 	glBindFramebuffer(GL_FRAMEBUFFER, c->fbo);
 	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
@@ -1261,7 +1261,7 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 	}
 	} // end if (!zero_copy)
 
-	// --- Step 2: Present SBS texture ---
+	// --- Step 2: Present atlas texture ---
 	// Ensure VAO is bound for present draw calls (zero-copy skips the atlas
 	// blit which normally binds it, causing GL_INVALID_OPERATION in core profile)
 	glBindVertexArray(c->vao_empty);
@@ -1715,7 +1715,7 @@ gl_init_resources(struct comp_gl_compositor *c, uint32_t width, uint32_t height)
 			c->tile_rows = c->xdev->rendering_modes[idx].tile_rows;
 		}
 	}
-	// Default to 2x1 (SBS stereo) if not set
+	// Default to 2x1 (stereo) if not set
 	if (c->tile_columns == 0) {
 		c->tile_columns = 2;
 		c->tile_rows = 1;
@@ -1742,7 +1742,7 @@ gl_init_resources(struct comp_gl_compositor *c, uint32_t width, uint32_t height)
 	// FBO for cropping atlas to content dims before DP
 	glGenFramebuffers(1, &c->dp_crop_fbo);
 
-	// Atlas stereo texture — always worst-case sized across all rendering modes.
+	// Atlas texture — always worst-case sized across all rendering modes.
 	// Per-frame content region may be smaller; compositor crops before DP.
 	uint32_t atlas_width = c->tile_columns * c->view_width;
 	uint32_t atlas_height = c->tile_rows * c->view_height;
