@@ -19,27 +19,26 @@ jobs:
     env:
       SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
       SR_TAG: 1.35.0.2011
-      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
+      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN || github.token }}
 
     steps:
 
       - name: Checkout repository and submodules
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
           submodules: recursive
           lfs: true
 
       - name: Download Simulated Reality SDK
         run: |
-          gh release download -R LeiaInc/SR-SDK-Windows-Releases-Internal-Public $env:SR_TAG -p LeiaSR-SDK-$env:SR_TAG-win64.zip -D .
+          gh release download -R ${{ github.repository }} sr-sdk-v$env:SR_TAG -p LeiaSR-SDK-$env:SR_TAG-win64.zip -D .
           tar -xf LeiaSR-SDK-$env:SR_TAG-win64.zip -C .
           Get-ChildItem -Recurse LeiaSR-SDK-$env:SR_TAG-win64
-          gh release download -R LeiaInc/SR-SDK-Windows-Releases-Internal-Public $env:SR_TAG -p SimulatedRealityVulkanBeta.lib -D LeiaSR-SDK-$env:SR_TAG-win64/lib
-          gh release download -R LeiaInc/SR-SDK-Windows-Releases-Internal-Public $env:SR_TAG -p vkweaver.h -D LeiaSR-SDK-$env:SR_TAG-win64/include/sr/weaver
+          gh release download -R ${{ github.repository }} sr-sdk-v$env:SR_TAG -p SimulatedRealityVulkanBeta.lib -D LeiaSR-SDK-$env:SR_TAG-win64/lib
+          gh release download -R ${{ github.repository }} sr-sdk-v$env:SR_TAG -p vkweaver.h -D LeiaSR-SDK-$env:SR_TAG-win64/include/sr/weaver
           # GL weaver assets not yet available in SR SDK release - uncomment when uploaded:
-          # gh release download -R LeiaInc/SR-SDK-Windows-Releases-Internal-Public $env:SR_TAG -p SimulatedRealityOpenGL.lib -D LeiaSR-SDK-$env:SR_TAG-win64/lib
-          # gh release download -R LeiaInc/SR-SDK-Windows-Releases-Internal-Public $env:SR_TAG -p glweaver.h -D LeiaSR-SDK-$env:SR_TAG-win64/include/sr/weaver
+          # gh release download -R ${{ github.repository }} sr-sdk-v$env:SR_TAG -p SimulatedRealityOpenGL.lib -D LeiaSR-SDK-$env:SR_TAG-win64/lib
+          # gh release download -R ${{ github.repository }} sr-sdk-v$env:SR_TAG -p glweaver.h -D LeiaSR-SDK-$env:SR_TAG-win64/include/sr/weaver
 
       - name: Restore from cache and setup vcpkg executable and data files.
         uses: lukka/run-vcpkg@v11
@@ -159,13 +158,12 @@ jobs:
     needs: Runtime  # Wait for runtime build to get artifacts
 
     env:
-      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
+      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN || github.token }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
           submodules: recursive
 
       - name: Download runtime artifacts
@@ -260,13 +258,12 @@ jobs:
     needs: Runtime
 
     env:
-      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
+      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN || github.token }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
           submodules: recursive
 
       - name: Download runtime artifacts
@@ -321,13 +318,12 @@ jobs:
     needs: Runtime
 
     env:
-      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
+      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN || github.token }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
           submodules: recursive
 
       - name: Download runtime artifacts
@@ -382,13 +378,12 @@ jobs:
     needs: Runtime
 
     env:
-      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
+      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN || github.token }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
           submodules: recursive
 
       - name: Download runtime artifacts
@@ -443,13 +438,12 @@ jobs:
     needs: Runtime
 
     env:
-      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
+      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN || github.token }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
           submodules: recursive
 
       - name: Download runtime artifacts
@@ -510,13 +504,12 @@ jobs:
     needs: Runtime
 
     env:
-      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
+      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN || github.token }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
           submodules: recursive
 
       - name: Download runtime artifacts
@@ -576,13 +569,12 @@ jobs:
     needs: Runtime
 
     env:
-      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
+      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN || github.token }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
           submodules: recursive
 
       - name: Download runtime artifacts
@@ -637,13 +629,11 @@ jobs:
     needs: Runtime
 
     env:
-      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
+      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN || github.token }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
 
       - uses: ilammy/msvc-dev-cmd@v1
         with:
@@ -691,13 +681,12 @@ jobs:
     needs: Runtime
 
     env:
-      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
+      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN || github.token }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
           submodules: recursive
 
       - name: Download runtime artifacts
@@ -752,13 +741,12 @@ jobs:
     needs: Runtime
 
     env:
-      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
+      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN || github.token }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
           submodules: recursive
 
       - name: Download runtime artifacts
@@ -809,13 +797,12 @@ jobs:
     needs: Runtime
 
     env:
-      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
+      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN || github.token }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
           submodules: recursive
 
       - name: Download runtime artifacts
@@ -872,13 +859,12 @@ jobs:
     needs: Runtime
 
     env:
-      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
+      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN || github.token }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
           submodules: recursive
 
       - uses: ilammy/msvc-dev-cmd@v1
@@ -923,13 +909,12 @@ jobs:
     needs: Runtime
 
     env:
-      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
+      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN || github.token }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
           submodules: recursive
 
       - name: Download runtime artifacts
@@ -980,13 +965,12 @@ jobs:
     needs: Runtime
 
     env:
-      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
+      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN || github.token }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.LEIALOFT_GITHUB_TOKEN }}
           submodules: recursive
 
       - name: Download runtime artifacts
