@@ -1,0 +1,82 @@
+name: Publish Extension Headers
+
+# Auto-publishes XR_EXT_*.h headers to DisplayXR/displayxr-extensions
+# whenever they change on main. Only runs on dfattal repo (has DISPLAYXR_TOKEN).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/external/openxr_includes/openxr/XR_EXT_*.h'
+
+jobs:
+  publish-headers:
+    if: github.repository == 'dfattal/openxr-3d-display'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout runtime repo
+        uses: actions/checkout@v4
+
+      - name: Clone extensions repo
+        run: |
+          git clone https://x-access-token:${{ secrets.DISPLAYXR_TOKEN }}@github.com/DisplayXR/displayxr-extensions.git extensions-repo
+
+      - name: Copy headers
+        run: |
+          mkdir -p extensions-repo/include/openxr
+          cp src/external/openxr_includes/openxr/XR_EXT_*.h extensions-repo/include/openxr/
+          echo "Copied headers:"
+          ls -la extensions-repo/include/openxr/
+
+      - name: Generate README
+        run: |
+          cat > extensions-repo/README.md << 'READMEEOF'
+          # DisplayXR Extensions
+
+          OpenXR extension headers for 3D display support. **Auto-published** from [`displayxr-runtime`](https://github.com/DisplayXR/displayxr-runtime).
+
+          ## Headers
+
+          | Header | Extension | Description |
+          |--------|-----------|-------------|
+          | [`XR_EXT_display_info.h`](include/openxr/XR_EXT_display_info.h) | `XR_EXT_display_info` | Display dimensions, eye tracking, rendering modes |
+          | [`XR_EXT_win32_window_binding.h`](include/openxr/XR_EXT_win32_window_binding.h) | `XR_EXT_win32_window_binding` | App-provided HWND, shared texture, canvas sub-rect |
+          | [`XR_EXT_cocoa_window_binding.h`](include/openxr/XR_EXT_cocoa_window_binding.h) | `XR_EXT_cocoa_window_binding` | App-provided NSView, IOSurface sharing |
+          | [`XR_EXT_macos_gl_binding.h`](include/openxr/XR_EXT_macos_gl_binding.h) | `XR_EXT_macos_gl_binding` | macOS OpenGL graphics binding |
+
+          ## Usage
+
+          Copy the headers into your project's OpenXR include path, or add this repo as a submodule:
+
+          ```bash
+          git submodule add https://github.com/DisplayXR/displayxr-extensions.git external/displayxr-extensions
+          # Then add external/displayxr-extensions/include to your include path
+          ```
+
+          ## Full Documentation
+
+          - [Extension Specs](https://github.com/DisplayXR/displayxr-runtime/tree/main/docs/specs) — formal specifications with examples
+          - [Getting Started](https://github.com/DisplayXR/displayxr-runtime/tree/main/docs/getting-started) — build and integrate with DisplayXR
+          - [displayxr-runtime](https://github.com/DisplayXR/displayxr-runtime) — the OpenXR runtime
+
+          ## Auto-Published
+
+          These headers are automatically synced from `displayxr-runtime/src/external/openxr_includes/openxr/XR_EXT_*.h` on every push to main. Do not edit directly — changes will be overwritten.
+          READMEEOF
+
+      - name: Commit and push if changed
+        working-directory: extensions-repo
+        run: |
+          git config user.name "DisplayXR Bot"
+          git config user.email "noreply@displayxr.org"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to publish"
+          else
+            git commit -m "Auto-publish extension headers from displayxr-runtime
+
+          Source commit: ${{ github.sha }}"
+            git push
+            echo "Published updated headers"
+          fi
