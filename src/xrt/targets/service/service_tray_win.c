@@ -11,9 +11,41 @@
 #include <windows.h>
 #include <shellapi.h>
 
-#define IDI_DISPLAYXR_ICON 101
-#define WM_TRAYICON        (WM_APP + 1)
-#define IDM_EXIT           1001
+#define IDI_DISPLAYXR_ICON_BLACK 101
+#define IDI_DISPLAYXR_ICON_WHITE 102
+#define WM_TRAYICON              (WM_APP + 1)
+#define IDM_EXIT                 1001
+
+// Detect whether the Windows taskbar is using a dark theme.
+// Returns true if dark (white icon needed), false if light (black icon needed).
+static bool
+is_taskbar_dark_theme(void)
+{
+	HKEY hKey;
+	DWORD value = 1; // default to light theme (0 = dark, 1 = light for AppsUseLightTheme)
+	DWORD size = sizeof(value);
+
+	if (RegOpenKeyExW(HKEY_CURRENT_USER,
+	                  L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+	                  0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+		RegQueryValueExW(hKey, L"SystemUsesLightTheme", NULL, NULL, (LPBYTE)&value, &size);
+		RegCloseKey(hKey);
+	}
+
+	return value == 0; // 0 = dark theme → need white icon
+}
+
+static HICON
+load_theme_icon(void)
+{
+	HINSTANCE hInst = GetModuleHandleW(NULL);
+	int resId = is_taskbar_dark_theme() ? IDI_DISPLAYXR_ICON_WHITE : IDI_DISPLAYXR_ICON_BLACK;
+	HICON icon = LoadIconW(hInst, MAKEINTRESOURCEW(resId));
+	if (!icon) {
+		icon = LoadIconW(NULL, MAKEINTRESOURCEW(32512) /* IDI_APPLICATION */);
+	}
+	return icon;
+}
 
 static HWND s_tray_hwnd = NULL;
 static HANDLE s_tray_thread = NULL;
@@ -49,6 +81,12 @@ tray_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 			}
 			PostQuitMessage(0);
 		}
+		return 0;
+
+	case WM_SETTINGCHANGE:
+		// Windows theme changed — swap tray icon to match
+		s_nid.hIcon = load_theme_icon();
+		Shell_NotifyIconW(NIM_MODIFY, &s_nid);
 		return 0;
 
 	case WM_DESTROY:
@@ -91,11 +129,8 @@ tray_thread_func(LPVOID param)
 	s_nid.uCallbackMessage = WM_TRAYICON;
 	wcscpy_s(s_nid.szTip, ARRAYSIZE(s_nid.szTip), L"DisplayXR Service");
 
-	// Load icon from embedded resource, fall back to system default
-	s_nid.hIcon = LoadIconW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(IDI_DISPLAYXR_ICON));
-	if (!s_nid.hIcon) {
-		s_nid.hIcon = LoadIconW(NULL, MAKEINTRESOURCEW(32512) /* IDI_APPLICATION */);
-	}
+	// Load theme-appropriate icon (black for light taskbar, white for dark)
+	s_nid.hIcon = load_theme_icon();
 
 	Shell_NotifyIconW(NIM_ADD, &s_nid);
 

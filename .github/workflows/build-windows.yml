@@ -74,6 +74,12 @@ jobs:
       - name: Build
         run: cmake --build build --config Release --target install
 
+      - name: Install rcedit (for installer icon swap)
+        shell: powershell
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/electron/rcedit/releases/download/v2.0.0/rcedit-x64.exe" -OutFile "rcedit.exe"
+          Copy-Item "rcedit.exe" -Destination "C:\Windows\System32\rcedit.exe"
+
       - name: Build Installer
         run: cmake --build build --config Release --target installer
 

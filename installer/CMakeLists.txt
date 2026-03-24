@@ -44,6 +44,13 @@ configure_file(
 # Paths to build artifacts (use install prefix, not build dir)
 set(DISPLAYXR_BIN_DIR "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}")
 
+# Find rcedit for post-build icon swap (installer .exe gets white icon for dark Explorer)
+find_program(RCEDIT_EXECUTABLE rcedit
+	PATHS
+		"${CMAKE_SOURCE_DIR}/tools"
+		"$ENV{PROGRAMFILES}/rcedit"
+)
+
 # Create installer target
 add_custom_target(installer
 	COMMAND "${NSIS_EXECUTABLE}"
@@ -60,6 +67,21 @@ add_custom_target(installer
 	COMMENT "Building DisplayXR installer..."
 	VERBATIM
 )
+
+# Post-build: swap the .exe icon to white (visible in dark Explorer/taskbar)
+# The wizard UI keeps the black icon (baked by NSIS via MUI_ICON).
+# rcedit replaces the .exe's main icon resource shown by Explorer.
+if(RCEDIT_EXECUTABLE)
+	add_custom_command(TARGET installer POST_BUILD
+		COMMAND "${RCEDIT_EXECUTABLE}"
+			"${CMAKE_INSTALL_PREFIX}/DisplayXRSetup-${DISPLAYXR_VERSION}.${BUILD_NUM}.exe"
+			--set-icon "${CMAKE_SOURCE_DIR}/doc/displayxr_white.ico"
+		COMMENT "Replacing installer .exe icon with white variant for dark mode Explorer"
+		VERBATIM
+	)
+else()
+	message(STATUS "rcedit not found - installer .exe will use black icon (install rcedit for dark mode support)")
+endif()
 
 # Dependencies for installer target
 if(TARGET ${RUNTIME_TARGET})
