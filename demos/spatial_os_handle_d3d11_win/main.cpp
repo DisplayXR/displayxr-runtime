@@ -45,7 +45,7 @@
 using Microsoft::WRL::ComPtr;
 using namespace DirectX;
 
-static const char* APP_NAME = "spatial_os_hosted_d3d11_win";
+static const char* APP_NAME = "spatial_os_handle_d3d11_win";
 static const wchar_t* WINDOW_CLASS = L"SpatialOSClass";
 static const wchar_t* WINDOW_TITLE = L"Spatial OS - Collaboration War Room (Tab=Select, Space=Focus, 3=Depth, ESC=Reset)";
 static const float CAMERA_HALF_TAN_VFOV = 0.32491969623f; // tan(18 deg)

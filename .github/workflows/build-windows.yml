@@ -595,9 +595,9 @@ jobs:
           Invoke-WebRequest -Uri $openxrUrl -OutFile openxr_loader.zip
           Expand-Archive -Path openxr_loader.zip -DestinationPath openxr_sdk -Force
 
-      - name: Build Spatial OS demo (spatial_os_hosted_d3d11_win)
+      - name: Build Spatial OS demo (spatial_os_handle_d3d11_win)
         run: |
-          cd demos/spatial_os_hosted_d3d11_win
+          cd demos/spatial_os_handle_d3d11_win
           cmake -S . -B build -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
             -DOpenXR_ROOT="${{ github.workspace }}/openxr_sdk"
@@ -610,7 +610,7 @@ jobs:
             $loaderDll = Get-ChildItem -Path openxr_sdk -Recurse -Filter "openxr_loader.dll" | Select-Object -First 1
           }
           if ($loaderDll) {
-            Copy-Item $loaderDll.FullName -Destination demos/spatial_os_hosted_d3d11_win/build/
+            Copy-Item $loaderDll.FullName -Destination demos/spatial_os_handle_d3d11_win/build/
           }
 
       - name: Upload Spatial OS demo
@@ -619,9 +619,9 @@ jobs:
           name: SpatialOS
           if-no-files-found: error
           path: |
-            demos/spatial_os_hosted_d3d11_win/build/spatial_os_hosted_d3d11_win.exe
-            demos/spatial_os_hosted_d3d11_win/build/*.dll
-            demos/spatial_os_hosted_d3d11_win/build/textures/
+            demos/spatial_os_handle_d3d11_win/build/spatial_os_handle_d3d11_win.exe
+            demos/spatial_os_handle_d3d11_win/build/*.dll
+            demos/spatial_os_handle_d3d11_win/build/textures/
 
   # D3D11 texture test app (offscreen shared texture mode)
   TestAppCubeTextureD3D11:

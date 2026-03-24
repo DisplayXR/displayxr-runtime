@@ -19,9 +19,9 @@ BEGIN
             VALUE "CompanyName",      "Leia Inc."
             VALUE "FileDescription",  "Spatial OS Demo - Collaboration War Room"
             VALUE "FileVersion",      "1.0.0.0"
-            VALUE "InternalName",     "spatial_os_hosted_d3d11_win"
+            VALUE "InternalName",     "spatial_os_handle_d3d11_win"
             VALUE "LegalCopyright",   "Copyright 2025 Leia Inc."
-            VALUE "OriginalFilename", "spatial_os_hosted_d3d11_win.exe"
+            VALUE "OriginalFilename", "spatial_os_handle_d3d11_win.exe"
             VALUE "ProductName",      "Leia SR Test Apps"
             VALUE "ProductVersion",   "1.0.0.0"
         END

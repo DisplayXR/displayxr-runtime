@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: BSL-1.0
 
 cmake_minimum_required(VERSION 3.21)
-project(spatial_os_hosted_d3d11_win LANGUAGES CXX)
+project(spatial_os_handle_d3d11_win LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -79,7 +79,7 @@ endif()
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../../test_apps/common ${CMAKE_CURRENT_BINARY_DIR}/common)
 
 # Create executable
-add_executable(spatial_os_hosted_d3d11_win WIN32
+add_executable(spatial_os_handle_d3d11_win WIN32
     main.cpp
     spatial_app.h
     spatial_app.cpp
@@ -92,14 +92,14 @@ add_executable(spatial_os_hosted_d3d11_win WIN32
     resource.rc
 )
 
-target_link_libraries(spatial_os_hosted_d3d11_win PRIVATE
+target_link_libraries(spatial_os_handle_d3d11_win PRIVATE
     sr_common
     OpenXR::openxr_loader
 )
 
 # Embed manifest
 if(MSVC)
-    set_target_properties(spatial_os_hosted_d3d11_win PROPERTIES
+    set_target_properties(spatial_os_handle_d3d11_win PROPERTIES
         LINK_FLAGS "/MANIFEST:EMBED /MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/spatial_os.manifest"
     )
 endif()
@@ -107,9 +107,9 @@ endif()
 # Copy texture files to build output directory
 file(GLOB TEXTURE_FILES "${CMAKE_CURRENT_SOURCE_DIR}/../../test_apps/common/textures/*.jpg")
 if(TEXTURE_FILES)
-    add_custom_command(TARGET spatial_os_hosted_d3d11_win POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:spatial_os_hosted_d3d11_win>/textures"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${TEXTURE_FILES} "$<TARGET_FILE_DIR:spatial_os_hosted_d3d11_win>/textures/"
+    add_custom_command(TARGET spatial_os_handle_d3d11_win POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:spatial_os_handle_d3d11_win>/textures"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${TEXTURE_FILES} "$<TARGET_FILE_DIR:spatial_os_handle_d3d11_win>/textures/"
         COMMENT "Copying texture files to build output"
     )
 endif()
@@ -118,10 +118,10 @@ endif()
 if(TARGET OpenXR::openxr_loader)
     get_target_property(_loader_location OpenXR::openxr_loader IMPORTED_LOCATION)
     if(_loader_location)
-        add_custom_command(TARGET spatial_os_hosted_d3d11_win POST_BUILD
+        add_custom_command(TARGET spatial_os_handle_d3d11_win POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "${_loader_location}"
-                $<TARGET_FILE_DIR:spatial_os_hosted_d3d11_win>
+                $<TARGET_FILE_DIR:spatial_os_handle_d3d11_win>
             COMMENT "Copying OpenXR loader DLL"
         )
     endif()

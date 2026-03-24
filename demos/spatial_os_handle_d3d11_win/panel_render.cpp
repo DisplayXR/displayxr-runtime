@@ -66,24 +66,39 @@ void RenderPanelContent(
 ) {
     if (!renderer.initialized || !texture) return;
 
-    // Get texture surface for D2D
-    ComPtr<IDXGISurface> surface;
-    HRESULT hr = texture->QueryInterface(__uuidof(IDXGISurface), (void**)surface.GetAddressOf());
-    if (FAILED(hr)) return;
-
-    // Create D2D render target from DXGI surface
-    D2D1_RENDER_TARGET_PROPERTIES rtProps = D2D1::RenderTargetProperties(
-        D2D1_RENDER_TARGET_TYPE_DEFAULT,
-        D2D1::PixelFormat(DXGI_FORMAT_UNKNOWN, D2D1_ALPHA_MODE_PREMULTIPLIED)
-    );
-    ComPtr<ID2D1RenderTarget> rt;
-    hr = renderer.d2dFactory->CreateDxgiSurfaceRenderTarget(surface.Get(), &rtProps, &rt);
-    if (FAILED(hr)) return;
-
     D3D11_TEXTURE2D_DESC desc;
     texture->GetDesc(&desc);
     float w = (float)desc.Width;
     float h = (float)desc.Height;
+
+    // Swapchain textures may be TYPELESS (ADR-011). D2D requires a typed surface,
+    // so render to a temporary R8G8B8A8_UNORM texture and copy back.
+    D3D11_TEXTURE2D_DESC stagingDesc = {};
+    stagingDesc.Width = desc.Width;
+    stagingDesc.Height = desc.Height;
+    stagingDesc.MipLevels = 1;
+    stagingDesc.ArraySize = 1;
+    stagingDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    stagingDesc.SampleDesc.Count = 1;
+    stagingDesc.Usage = D3D11_USAGE_DEFAULT;
+    stagingDesc.BindFlags = D3D11_BIND_RENDER_TARGET;
+
+    ComPtr<ID3D11Texture2D> stagingTex;
+    HRESULT hr = device->CreateTexture2D(&stagingDesc, nullptr, &stagingTex);
+    if (FAILED(hr)) return;
+
+    ComPtr<IDXGISurface> surface;
+    hr = stagingTex->QueryInterface(__uuidof(IDXGISurface), (void**)surface.GetAddressOf());
+    if (FAILED(hr)) return;
+
+    // Create D2D render target from typed staging surface
+    D2D1_RENDER_TARGET_PROPERTIES rtProps = D2D1::RenderTargetProperties(
+        D2D1_RENDER_TARGET_TYPE_DEFAULT,
+        D2D1::PixelFormat(DXGI_FORMAT_R8G8B8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED)
+    );
+    ComPtr<ID2D1RenderTarget> rt;
+    hr = renderer.d2dFactory->CreateDxgiSurfaceRenderTarget(surface.Get(), &rtProps, &rt);
+    if (FAILED(hr)) return;
 
     rt->BeginDraw();
 
@@ -120,6 +135,11 @@ void RenderPanelContent(
     }
 
     rt->EndDraw();
+
+    // Copy rendered content from typed staging texture to swapchain texture
+    ComPtr<ID3D11DeviceContext> ctx;
+    device->GetImmediateContext(&ctx);
+    ctx->CopyResource(texture, stagingTex.Get());
 }
 
 void CleanupPanelRenderer(PanelRenderer& renderer) {
