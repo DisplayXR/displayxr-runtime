@@ -563,7 +563,8 @@ static void RenderOneFrame(RenderState& rs) {
                         ID3D11Texture2D* swapchainTexture = (*rs.swapchainImages)[imageIndex].texture;
 
                         ID3D11RenderTargetView* rtv = nullptr;
-                        CreateRenderTargetView(renderer, swapchainTexture, &rtv);
+                        CreateRenderTargetView(renderer, swapchainTexture,
+                            static_cast<DXGI_FORMAT>(xr.swapchain.format), &rtv);
 
                         // Clear entire color+depth once before eye loop
                         float clearColor[4] = {0.05f, 0.05f, 0.25f, 1.0f};

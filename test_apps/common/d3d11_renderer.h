@@ -100,10 +100,13 @@ void RenderScene(
     float cubeSize = 0.06f
 );
 
-// Create a render target view for an OpenXR swapchain image
+// Create a render target view for an OpenXR swapchain image.
+// Format must be specified explicitly because swapchain textures use TYPELESS format
+// (required by OpenXR D3D11 spec). Pass the concrete format from xrCreateSwapchain.
 bool CreateRenderTargetView(
     D3D11Renderer& renderer,
     ID3D11Texture2D* texture,
+    DXGI_FORMAT format,
     ID3D11RenderTargetView** rtv
 );
 
