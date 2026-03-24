@@ -219,30 +219,6 @@ comp_d3d11_renderer_blit_stretch(struct comp_d3d11_renderer *renderer,
                                  uint32_t target_width,
                                  uint32_t target_height);
 
-/*!
- * Render window-space layers post-weave onto the currently bound render target.
- *
- * Window-space layers are 2D overlays positioned in fractional window
- * coordinates. They must be rendered after the display processor (weaver)
- * so they appear as clean, readable 2D content on top of the final output.
- *
- * The caller must bind the appropriate render target (back buffer RTV)
- * before calling this function.
- *
- * @param renderer The renderer.
- * @param layers The accumulated layers (only XRT_LAYER_WINDOW_SPACE processed).
- * @param target_width Width of the render target in pixels.
- * @param target_height Height of the render target in pixels.
- *
- * @return XRT_SUCCESS on success, error code otherwise.
- *
- * @ingroup comp_d3d11
- */
-xrt_result_t
-comp_d3d11_renderer_draw_window_space_layers(struct comp_d3d11_renderer *renderer,
-                                              struct comp_layer_accum *layers,
-                                              uint32_t target_width,
-                                              uint32_t target_height);
 
 #ifdef __cplusplus
 }
