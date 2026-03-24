@@ -1038,22 +1038,45 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 	}
 
-	// Flush and wait for GPU to finish processing all prior commands.
-	// Multi-threaded engines (e.g. Unity) submit draw commands from worker threads.
-	// The GPU may still be executing those commands when we read the swapchain
-	// textures. This is the D3D11 equivalent of D3D12's gpu_wait_idle().
+	// Wait for GPU completion of all projection swapchain textures before reading.
+	//
+	// barrier_image(TO_COMP) at xrReleaseSwapchainImage inserts a Flush() then
+	// signals an ID3D11Fence.  Waiting here blocks until the GPU has processed
+	// all commands up to that release point — no spinning, no per-frame allocs.
+	// Falls back to Flush+D3D11_QUERY_EVENT spin-wait on pre-D3D11.4 hardware.
+	//
+	// Deduplicates swapchains so two eyes on one swapchain only wait once.
 	{
-		c->context->Flush();
-		ID3D11Query *event_query = nullptr;
-		D3D11_QUERY_DESC qd = {};
-		qd.Query = D3D11_QUERY_EVENT;
-		if (SUCCEEDED(c->device->CreateQuery(&qd, &event_query))) {
-			c->context->End(event_query);
-			BOOL query_done = FALSE;
-			while (c->context->GetData(event_query, &query_done, sizeof(query_done), 0) == S_FALSE) {
-				// Spin-wait for GPU to drain
+		struct xrt_swapchain *waited[XRT_MAX_LAYERS * XRT_MAX_VIEWS] = {};
+		uint32_t wait_count = 0;
+
+		for (uint32_t li = 0; li < c->layer_accum.layer_count; li++) {
+			struct comp_layer *layer = &c->layer_accum.layers[li];
+			if (layer->data.type != XRT_LAYER_PROJECTION &&
+			    layer->data.type != XRT_LAYER_PROJECTION_DEPTH) {
+				continue;
 			}
-			event_query->Release();
+			uint32_t vc = layer->data.view_count < XRT_MAX_VIEWS
+			                  ? layer->data.view_count
+			                  : XRT_MAX_VIEWS;
+			for (uint32_t v = 0; v < vc; v++) {
+				struct xrt_swapchain *xsc = layer->sc_array[v];
+				if (xsc == nullptr) {
+					continue;
+				}
+				// Skip if already waited on this swapchain this frame.
+				bool seen = false;
+				for (uint32_t w = 0; w < wait_count; w++) {
+					if (waited[w] == xsc) {
+						seen = true;
+						break;
+					}
+				}
+				if (!seen && wait_count < ARRAY_SIZE(waited)) {
+					waited[wait_count++] = xsc;
+					comp_d3d11_swapchain_wait_gpu_complete(xsc, 100);
+				}
+			}
 		}
 	}
 
