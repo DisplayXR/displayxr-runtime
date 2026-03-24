@@ -13,7 +13,8 @@ env:
 jobs:
   build:
     # Temporarily disabled to save CI minutes — building locally instead
-    if: false
+    # When re-enabled, the repo guard ensures CI only runs on dfattal (Leia whitelisted)
+    if: false && github.repository == 'dfattal/openxr-3d-display'
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
