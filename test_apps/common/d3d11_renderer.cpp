@@ -693,9 +693,14 @@ void RenderScene(
 bool CreateRenderTargetView(
     D3D11Renderer& renderer,
     ID3D11Texture2D* texture,
+    DXGI_FORMAT format,
     ID3D11RenderTargetView** rtv
 ) {
-    return SUCCEEDED(renderer.device->CreateRenderTargetView(texture, nullptr, rtv));
+    D3D11_RENDER_TARGET_VIEW_DESC rtvDesc = {};
+    rtvDesc.Format = format;
+    rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+    rtvDesc.Texture2D.MipSlice = 0;
+    return SUCCEEDED(renderer.device->CreateRenderTargetView(texture, &rtvDesc, rtv));
 }
 
 bool CreateDepthStencilView(

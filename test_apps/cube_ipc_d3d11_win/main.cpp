@@ -262,7 +262,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                             ID3D11Texture2D* swapchainTexture = swapchainImages[imageIndex].texture;
 
                             ID3D11RenderTargetView* rtv = nullptr;
-                            CreateRenderTargetView(renderer, swapchainTexture, &rtv);
+                            CreateRenderTargetView(renderer, swapchainTexture,
+                                static_cast<DXGI_FORMAT>(xr.swapchain.format), &rtv);
 
                             // Clear entire color+depth once before eye loop
                             float clearColor[4] = {0.05f, 0.05f, 0.25f, 1.0f};
