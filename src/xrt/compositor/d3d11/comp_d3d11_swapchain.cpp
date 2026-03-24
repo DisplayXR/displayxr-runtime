@@ -9,6 +9,7 @@
 
 #include "comp_d3d11_swapchain.h"
 #include "comp_d3d11_compositor.h"
+#include "d3d/d3d_dxgi_formats.h"
 
 #include "xrt/xrt_handles.h"
 
@@ -360,6 +361,7 @@ comp_d3d11_swapchain_create(struct comp_d3d11_compositor *c,
 	DXGI_FORMAT texture_format = dxgi_format;
 	DXGI_FORMAT dsv_format = dxgi_format;
 	DXGI_FORMAT srv_format = dxgi_format;
+	DXGI_FORMAT rtv_format = dxgi_format;
 	bool is_depth = false;
 
 	if (bind_flags & D3D11_BIND_DEPTH_STENCIL) {
@@ -386,13 +388,23 @@ comp_d3d11_swapchain_create(struct comp_d3d11_compositor *c,
 		}
 	}
 
+	// For color textures, create with TYPELESS so apps can create their own typed views
+	// (required by OpenXR D3D11 spec; fixes Unity D3D11 black screen, issue #91).
+	if (!is_depth) {
+		DXGI_FORMAT typeless = d3d_dxgi_format_to_typeless_dxgi(dxgi_format);
+		if (typeless != dxgi_format) {
+			texture_format = typeless;
+			// srv_format and rtv_format remain as the original concrete format
+		}
+	}
+
 	// Create textures
 	D3D11_TEXTURE2D_DESC texDesc = {};
 	texDesc.Width = info->width;
 	texDesc.Height = info->height;
 	texDesc.MipLevels = info->mip_count > 0 ? info->mip_count : 1;
 	texDesc.ArraySize = info->array_size > 0 ? info->array_size : 1;
-	texDesc.Format = texture_format; // Use typeless format for depth textures
+	texDesc.Format = texture_format; // TYPELESS for both depth and color textures
 	texDesc.SampleDesc.Count = info->sample_count > 0 ? info->sample_count : 1;
 	texDesc.SampleDesc.Quality = 0;
 	texDesc.Usage = D3D11_USAGE_DEFAULT;
@@ -429,12 +441,21 @@ comp_d3d11_swapchain_create(struct comp_d3d11_compositor *c,
 			}
 		}
 
-		// Create RTV if it's a render target
+		// Create RTV if it's a render target (explicit format for TYPELESS textures)
 		if (bind_flags & D3D11_BIND_RENDER_TARGET) {
-			hr = internals->device->CreateRenderTargetView(sc->images[i], nullptr, &sc->rtvs[i]);
+			D3D11_RENDER_TARGET_VIEW_DESC rtvDesc = {};
+			rtvDesc.Format = rtv_format;
+			if (texDesc.ArraySize > 1) {
+				rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DARRAY;
+				rtvDesc.Texture2DArray.MipSlice = 0;
+				rtvDesc.Texture2DArray.ArraySize = texDesc.ArraySize;
+			} else {
+				rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+				rtvDesc.Texture2D.MipSlice = 0;
+			}
+			hr = internals->device->CreateRenderTargetView(sc->images[i], &rtvDesc, &sc->rtvs[i]);
 			if (FAILED(hr)) {
 				U_LOG_W("Failed to create RTV for swapchain texture %u: 0x%08x", i, hr);
-				// Non-fatal, continue without RTV
 			}
 		}
 
@@ -456,8 +477,8 @@ comp_d3d11_swapchain_create(struct comp_d3d11_compositor *c,
 
 	*out_xsc = &sc->base.base;
 
-	U_LOG_I("Created D3D11 swapchain: %ux%u, %u images, format %d",
-	        info->width, info->height, image_count, (int)dxgi_format);
+	U_LOG_I("Created D3D11 swapchain: %ux%u, %u images, format %d (texture: %d)",
+	        info->width, info->height, image_count, (int)dxgi_format, (int)texture_format);
 
 	return XRT_SUCCESS;
 }
