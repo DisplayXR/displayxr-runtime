@@ -223,6 +223,10 @@ d3d11_swapchain_barrier_image(struct xrt_swapchain *xsc, enum xrt_barrier_direct
 				ctx4->Signal(sc->release_fence, val);
 				sc->release_fence->SetEventOnCompletion(val, sc->release_event);
 				ctx4->Release();
+				// Signal() queues a GPU command; flush it so the GPU actually executes it
+				// and fires the event. Without this second Flush the event never fires
+				// and WaitForSingleObject always times out (100 ms penalty per frame).
+				internals->context->Flush();
 			}
 		}
 	}
