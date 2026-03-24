@@ -785,10 +785,13 @@ render_quad_layer(struct comp_d3d11_renderer *r,
  * Render a window-space layer. Positioned in fractional window coordinates
  * with per-eye disparity shift. Uses the same quad shaders.
  */
+/*!
+ * Render a window-space layer. Positioned in fractional window coordinates.
+ * Rendered post-weave onto the back buffer (no per-eye disparity).
+ */
 static void
 render_window_space_layer(struct comp_d3d11_renderer *r,
-                          const struct comp_layer *layer,
-                          uint32_t view_index)
+                          const struct comp_layer *layer)
 {
 	auto internals = get_internals(r->c);
 	const struct xrt_layer_data *data = &layer->data;
@@ -809,13 +812,9 @@ render_window_space_layer(struct comp_d3d11_renderer *r,
 		return;
 	}
 
-	// Compute per-eye disparity offset
-	float half_disp = ws->disparity / 2.0f;
-	float eye_shift = (view_index == 0) ? -half_disp : half_disp;
-
 	// Window-space fractional coords → NDC [-1, 1]
 	// Center of the quad in fractional window coords
-	float frac_cx = ws->x + ws->width / 2.0f + eye_shift;
+	float frac_cx = ws->x + ws->width / 2.0f;
 	float frac_cy = ws->y + ws->height / 2.0f;
 
 	// Convert to NDC: x: frac*2-1, y: 1-frac*2 (Y is flipped in NDC)
@@ -1139,7 +1138,7 @@ comp_d3d11_renderer_draw(struct comp_d3d11_renderer *renderer,
 			}
 
 			case XRT_LAYER_WINDOW_SPACE:
-				render_window_space_layer(renderer, layer, view_index);
+				// Rendered post-weave by compositor, not into the atlas
 				break;
 
 			default:
@@ -1430,6 +1429,55 @@ comp_d3d11_renderer_blit_stretch(struct comp_d3d11_renderer *renderer,
 	internals->context->PSSetShaderResources(0, 1, &null_srv);
 
 	rtv->Release();
+
+	return XRT_SUCCESS;
+}
+
+extern "C" xrt_result_t
+comp_d3d11_renderer_draw_window_space_layers(struct comp_d3d11_renderer *renderer,
+                                              struct comp_layer_accum *layers,
+                                              uint32_t target_width,
+                                              uint32_t target_height)
+{
+	if (renderer == nullptr || layers == nullptr) {
+		return XRT_SUCCESS;
+	}
+
+	// Check if there are any window-space layers to render
+	bool has_ws = false;
+	for (uint32_t i = 0; i < layers->layer_count; i++) {
+		if (layers->layers[i].data.type == XRT_LAYER_WINDOW_SPACE) {
+			has_ws = true;
+			break;
+		}
+	}
+	if (!has_ws) {
+		return XRT_SUCCESS;
+	}
+
+	auto internals = get_internals(renderer->c);
+
+	// Set full-target viewport (window-space layers use fractional [0,1] coords)
+	D3D11_VIEWPORT viewport = {};
+	viewport.Width = static_cast<float>(target_width);
+	viewport.Height = static_cast<float>(target_height);
+	viewport.MinDepth = 0.0f;
+	viewport.MaxDepth = 1.0f;
+	internals->context->RSSetViewports(1, &viewport);
+
+	// Restore pipeline state (may have been changed by display processor)
+	internals->context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+	internals->context->IASetInputLayout(nullptr);
+	internals->context->RSSetState(renderer->rasterizer_state);
+	internals->context->OMSetDepthStencilState(renderer->depth_stencil_state, 0);
+	internals->context->OMSetBlendState(renderer->blend_opaque, nullptr, 0xFFFFFFFF);
+
+	for (uint32_t i = 0; i < layers->layer_count; i++) {
+		struct comp_layer *layer = &layers->layers[i];
+		if (layer->data.type == XRT_LAYER_WINDOW_SPACE) {
+			render_window_space_layer(renderer, layer);
+		}
+	}
 
 	return XRT_SUCCESS;
 }

@@ -1052,14 +1052,21 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 
 		for (uint32_t li = 0; li < c->layer_accum.layer_count; li++) {
 			struct comp_layer *layer = &c->layer_accum.layers[li];
-			if (layer->data.type != XRT_LAYER_PROJECTION &&
-			    layer->data.type != XRT_LAYER_PROJECTION_DEPTH) {
+
+			// Determine which swapchains to wait on based on layer type
+			uint32_t sc_count = 0;
+			if (layer->data.type == XRT_LAYER_PROJECTION ||
+			    layer->data.type == XRT_LAYER_PROJECTION_DEPTH) {
+				sc_count = layer->data.view_count < XRT_MAX_VIEWS
+				               ? layer->data.view_count
+				               : XRT_MAX_VIEWS;
+			} else if (layer->data.type == XRT_LAYER_WINDOW_SPACE) {
+				sc_count = 1; // Window-space layers have one swapchain in sc_array[0]
+			} else {
 				continue;
 			}
-			uint32_t vc = layer->data.view_count < XRT_MAX_VIEWS
-			                  ? layer->data.view_count
-			                  : XRT_MAX_VIEWS;
-			for (uint32_t v = 0; v < vc; v++) {
+
+			for (uint32_t v = 0; v < sc_count; v++) {
 				struct xrt_swapchain *xsc = layer->sc_array[v];
 				if (xsc == nullptr) {
 					continue;
@@ -1202,6 +1209,21 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			weaving_done = true;
 		}
 
+		// Window-space layers: render post-weave onto shared texture
+		if (c->renderer != nullptr && c->shared_rtv != nullptr) {
+			D3D11_TEXTURE2D_DESC ws_desc;
+			c->shared_texture->GetDesc(&ws_desc);
+			uint32_t ws_w = ws_desc.Width;
+			uint32_t ws_h = ws_desc.Height;
+			if (c->canvas.valid && c->canvas.w > 0 && c->canvas.h > 0) {
+				ws_w = c->canvas.w;
+				ws_h = c->canvas.h;
+			}
+			c->context->OMSetRenderTargets(1, &c->shared_rtv, nullptr);
+			comp_d3d11_renderer_draw_window_space_layers(
+			    c->renderer, &c->layer_accum, ws_w, ws_h);
+		}
+
 		c->context->Flush();
 		return XRT_SUCCESS;
 	}
@@ -1246,6 +1268,15 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		    c->display_processor, c->context, atlas_srv, view_width, view_height,
 		    tile_columns, tile_rows, DXGI_FORMAT_R8G8B8A8_UNORM, target_width, target_height);
 		weaving_done = true;
+	}
+
+	// Window-space layers: render post-weave onto the back buffer
+	if (c->renderer != nullptr && c->target != nullptr) {
+		comp_d3d11_target_bind(c->target);
+		uint32_t tw, th;
+		comp_d3d11_target_get_dimensions(c->target, &tw, &th);
+		comp_d3d11_renderer_draw_window_space_layers(
+		    c->renderer, &c->layer_accum, tw, th);
 	}
 
 	// HUD overlay (post-processing, always readable)
