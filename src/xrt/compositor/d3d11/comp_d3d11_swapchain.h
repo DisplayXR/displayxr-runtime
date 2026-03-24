@@ -86,6 +86,21 @@ comp_d3d11_swapchain_get_texture(struct xrt_swapchain *xsc, uint32_t index);
 void
 comp_d3d11_swapchain_get_dimensions(struct xrt_swapchain *xsc, uint32_t *out_w, uint32_t *out_h);
 
+/*!
+ * Wait for GPU completion of all commands submitted up to the most recent
+ * xrReleaseSwapchainImage for this swapchain.
+ *
+ * Uses ID3D11Fence + WaitForSingleObject on D3D11.4 (Windows 10+),
+ * falls back to Flush + D3D11_QUERY_EVENT spin-wait on older hardware.
+ *
+ * @param xsc        The swapchain.
+ * @param timeout_ms Maximum wait in milliseconds (100 is recommended).
+ *
+ * @ingroup comp_d3d11
+ */
+void
+comp_d3d11_swapchain_wait_gpu_complete(struct xrt_swapchain *xsc, uint32_t timeout_ms);
+
 #ifdef __cplusplus
 }
 #endif

@@ -61,6 +61,16 @@ struct comp_d3d11_swapchain
 
 	//! Last released image index (for round-robin).
 	uint32_t last_released_index;
+
+	//! D3D11.4 fence for efficient GPU→CPU release notification.
+	//! Signaled at xrReleaseSwapchainImage; waited in layer_commit.
+	ID3D11Fence *release_fence;
+
+	//! Auto-reset Win32 event; fired when GPU reaches release_fence.
+	HANDLE release_event;
+
+	//! Monotonic counter; incremented on each release.
+	uint64_t release_fence_value;
 };
 
 // Access compositor internals
@@ -193,13 +203,27 @@ d3d11_swapchain_barrier_image(struct xrt_swapchain *xsc, enum xrt_barrier_direct
 {
 	struct comp_d3d11_swapchain *sc = d3d11_sc(xsc);
 
-	// When transitioning from app to compositor, flush pending GPU commands.
-	// Multi-threaded engines (e.g. Unity) may submit draw commands from worker
-	// threads that haven't been fully processed when xrEndFrame reads the texture.
-	// Flush ensures all prior immediate-context commands are submitted to the GPU.
+	// When transitioning from app to compositor, flush pending GPU commands then
+	// signal a fence so layer_commit can wait efficiently via WaitForSingleObject.
 	if (direction == XRT_BARRIER_TO_COMP && sc->c != nullptr) {
 		auto internals = get_internals(sc->c);
+
+		// Flush all pending immediate-context commands to the GPU.
 		internals->context->Flush();
+
+		// Signal fence after the flush.  When the GPU reaches this signal,
+		// release_event fires and layer_commit's WaitForSingleObject returns,
+		// guaranteeing all commands submitted up to this release are complete.
+		if (sc->release_fence != nullptr && sc->release_event != nullptr) {
+			ID3D11DeviceContext4 *ctx4 = nullptr;
+			if (SUCCEEDED(internals->context->QueryInterface(
+			        __uuidof(ID3D11DeviceContext4), (void **)&ctx4))) {
+				uint64_t val = ++sc->release_fence_value;
+				ctx4->Signal(sc->release_fence, val);
+				sc->release_fence->SetEventOnCompletion(val, sc->release_event);
+				ctx4->Release();
+			}
+		}
 	}
 
 	return XRT_SUCCESS;
@@ -244,6 +268,13 @@ d3d11_swapchain_destroy(struct xrt_swapchain *xsc)
 		}
 	}
 
+	if (sc->release_event != nullptr) {
+		CloseHandle(sc->release_event);
+	}
+	if (sc->release_fence != nullptr) {
+		sc->release_fence->Release();
+	}
+
 	delete sc;
 }
 
@@ -276,6 +307,30 @@ comp_d3d11_swapchain_create(struct comp_d3d11_compositor *c,
 	sc->acquired_index = -1;
 	sc->waited_index = -1;
 	sc->last_released_index = image_count - 1; // Start so first acquire returns index 0
+	sc->release_fence = nullptr;
+	sc->release_event = nullptr;
+	sc->release_fence_value = 0;
+
+	// Create ID3D11Fence for efficient GPU→CPU sync (D3D11.4 / Windows 10+).
+	// Falls back to D3D11_QUERY_EVENT spin-wait on older hardware.
+	{
+		ID3D11Device5 *dev5 = nullptr;
+		if (SUCCEEDED(internals->device->QueryInterface(__uuidof(ID3D11Device5), (void **)&dev5))) {
+			HRESULT fence_hr = dev5->CreateFence(
+			    0, D3D11_FENCE_FLAG_NONE, __uuidof(ID3D11Fence), (void **)&sc->release_fence);
+			if (SUCCEEDED(fence_hr)) {
+				sc->release_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+				if (sc->release_event == nullptr) {
+					sc->release_fence->Release();
+					sc->release_fence = nullptr;
+				}
+			}
+			dev5->Release();
+		}
+		if (sc->release_fence == nullptr) {
+			U_LOG_I("D3D11: ID3D11Fence unavailable — will use D3D11_QUERY_EVENT fallback");
+		}
+	}
 
 	// Convert format
 	DXGI_FORMAT dxgi_format = xrt_format_to_dxgi(info->format);
@@ -470,4 +525,48 @@ comp_d3d11_swapchain_get_dimensions(struct xrt_swapchain *xsc, uint32_t *out_w, 
 	struct comp_d3d11_swapchain *sc = d3d11_sc(xsc);
 	*out_w = sc->info.width;
 	*out_h = sc->info.height;
+}
+
+/*!
+ * Wait for GPU completion of all commands submitted up to the most recent
+ * xrReleaseSwapchainImage for this swapchain.
+ *
+ * Fast path (D3D11.4): OS-level WaitForSingleObject on an ID3D11Fence event —
+ * zero CPU spin, no per-frame allocations.
+ *
+ * Fallback (pre-D3D11.4): Flush + spin-wait on D3D11_QUERY_EVENT.
+ *
+ * @param xsc       The swapchain.
+ * @param timeout_ms Timeout in milliseconds (100 ms is recommended).
+ */
+extern "C" void
+comp_d3d11_swapchain_wait_gpu_complete(struct xrt_swapchain *xsc, uint32_t timeout_ms)
+{
+	struct comp_d3d11_swapchain *sc = d3d11_sc(xsc);
+
+	// Fast path: ID3D11Fence + Win32 auto-reset event (D3D11.4 / Windows 10+).
+	// The fence was signaled in barrier_image(TO_COMP) after Flush(), so waiting
+	// here guarantees all GPU commands up to xrReleaseSwapchainImage are done.
+	if (sc->release_fence != nullptr && sc->release_event != nullptr &&
+	    sc->release_fence_value > 0) {
+		WaitForSingleObject(sc->release_event, timeout_ms);
+		return;
+	}
+
+	// Fallback: Flush + spin-wait on D3D11_QUERY_EVENT.
+	if (sc->c != nullptr) {
+		auto internals = get_internals(sc->c);
+		internals->context->Flush();
+		ID3D11Query *eq = nullptr;
+		D3D11_QUERY_DESC qd = {};
+		qd.Query = D3D11_QUERY_EVENT;
+		if (SUCCEEDED(internals->device->CreateQuery(&qd, &eq))) {
+			internals->context->End(eq);
+			BOOL done = FALSE;
+			while (internals->context->GetData(eq, &done, sizeof(done), 0) == S_FALSE) {
+				// Spin-wait for GPU to drain
+			}
+			eq->Release();
+		}
+	}
 }
