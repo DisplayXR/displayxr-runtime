@@ -1,3 +1,9 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="doc/displayxr_white.png" width="120">
+  <source media="(prefers-color-scheme: light)" srcset="doc/displayxr.png" width="120">
+  <img alt="DisplayXR" src="doc/displayxr.png" width="120">
+</picture>
+
 # DisplayXR Runtime
 
 An open-source [OpenXR](https://www.khronos.org/openxr/) runtime for glasses-free 3D displays — autostereoscopic monitors and laptops that deliver head-tracked stereoscopic 3D without worn hardware.
