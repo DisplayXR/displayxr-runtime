@@ -14,6 +14,7 @@ permissions:
 
 jobs:
   Runtime:
+    if: github.repository == 'dfattal/openxr-3d-display'
     runs-on: windows-2022
 
     env:
@@ -153,7 +154,7 @@ jobs:
 
   # D3D11 test app with XR_EXT_win32_window_binding (app provides window handle)
   TestAppCubeHandleD3D11:
-    if: true  # <-- Change to 'false' to disable test app build
+    if: github.repository == 'dfattal/openxr-3d-display'
     runs-on: windows-2022
     needs: Runtime  # Wait for runtime build to get artifacts
 
@@ -253,7 +254,7 @@ jobs:
 
   # D3D11 hosted test app - Standard OpenXR app (runtime creates window)
   TestAppCubeHostedD3D11:
-    if: true  # <-- Change to 'false' to disable
+    if: github.repository == 'dfattal/openxr-3d-display'
     runs-on: windows-2022
     needs: Runtime
 
@@ -313,7 +314,7 @@ jobs:
 
   # D3D12 test app with XR_EXT_win32_window_binding
   TestAppCubeHandleD3D12:
-    if: true  # <-- Change to 'false' to disable
+    if: github.repository == 'dfattal/openxr-3d-display'
     runs-on: windows-2022
     needs: Runtime
 
@@ -373,7 +374,7 @@ jobs:
 
   # OpenGL test app with XR_EXT_win32_window_binding
   TestAppCubeHandleGL:
-    if: true  # <-- Change to 'false' to disable
+    if: github.repository == 'dfattal/openxr-3d-display'
     runs-on: windows-2022
     needs: Runtime
 
@@ -433,7 +434,7 @@ jobs:
 
   # Vulkan test app with XR_EXT_win32_window_binding (requires Vulkan SDK)
   TestAppCubeHandleVK:
-    if: true  # <-- Change to 'false' to disable
+    if: github.repository == 'dfattal/openxr-3d-display'
     runs-on: windows-2022
     needs: Runtime
 
@@ -499,7 +500,7 @@ jobs:
 
   # 3D Gaussian Splatting Vulkan demo (requires Vulkan SDK, uses FetchContent for 3DGS.cpp)
   TestAppGaussianSplattingVK:
-    if: true  # <-- Change to 'false' to disable
+    if: github.repository == 'dfattal/openxr-3d-display'
     runs-on: windows-2022
     needs: Runtime
 
@@ -564,7 +565,7 @@ jobs:
 
   # Spatial OS demo app (multi-layer war room)
   TestAppSpatialOS:
-    if: true  # <-- Change to 'false' to disable
+    if: github.repository == 'dfattal/openxr-3d-display'
     runs-on: windows-2022
     needs: Runtime
 
@@ -624,7 +625,7 @@ jobs:
 
   # D3D11 texture test app (offscreen shared texture mode)
   TestAppCubeTextureD3D11:
-    if: true  # <-- Change to 'false' to disable
+    if: github.repository == 'dfattal/openxr-3d-display'
     runs-on: windows-2022
     needs: Runtime
 
@@ -676,7 +677,7 @@ jobs:
 
   # D3D11 legacy hosted test app (no XR_EXT_display_info)
   TestAppCubeHostedLegacyD3D11:
-    if: true  # <-- Change to 'false' to disable
+    if: github.repository == 'dfattal/openxr-3d-display'
     runs-on: windows-2022
     needs: Runtime
 
@@ -736,7 +737,7 @@ jobs:
 
   # D3D12 legacy hosted test app (no XR_EXT_display_info)
   TestAppCubeHostedLegacyD3D12:
-    if: true
+    if: github.repository == 'dfattal/openxr-3d-display'
     runs-on: windows-2022
     needs: Runtime
 
@@ -792,7 +793,7 @@ jobs:
 
   # Vulkan legacy hosted test app (no XR_EXT_display_info)
   TestAppCubeHostedLegacyVK:
-    if: true
+    if: github.repository == 'dfattal/openxr-3d-display'
     runs-on: windows-2022
     needs: Runtime
 
@@ -854,7 +855,7 @@ jobs:
 
   # OpenGL legacy hosted test app (no XR_EXT_display_info)
   TestAppCubeHostedLegacyGL:
-    if: true
+    if: github.repository == 'dfattal/openxr-3d-display'
     runs-on: windows-2022
     needs: Runtime
 
@@ -904,7 +905,7 @@ jobs:
 
   # D3D11 IPC legacy test app (no XR_EXT_display_info, WebXR debug proxy)
   TestAppCubeIpcLegacyD3D11:
-    if: true  # <-- Change to 'false' to disable
+    if: github.repository == 'dfattal/openxr-3d-display'
     runs-on: windows-2022
     needs: Runtime
 
@@ -960,7 +961,7 @@ jobs:
 
   # D3D11 IPC test app (extension app, spatial shell foundation)
   TestAppCubeIpcD3D11:
-    if: true  # <-- Change to 'false' to disable
+    if: github.repository == 'dfattal/openxr-3d-display'
     runs-on: windows-2022
     needs: Runtime
 
@@ -1016,7 +1017,7 @@ jobs:
 
   # Bundle all test apps into a single artifact with per-app subfolders
   BundleTestApps:
-    if: ${{ !cancelled() }}
+    if: github.repository == 'dfattal/openxr-3d-display' && !cancelled()
     runs-on: ubuntu-latest
     needs: [TestAppCubeHandleD3D11, TestAppCubeHostedD3D11, TestAppCubeHandleD3D12, TestAppCubeHandleGL, TestAppCubeHandleVK, TestAppGaussianSplattingVK, TestAppSpatialOS, TestAppCubeTextureD3D11, TestAppCubeHostedLegacyD3D11, TestAppCubeHostedLegacyD3D12, TestAppCubeHostedLegacyVK, TestAppCubeHostedLegacyGL, TestAppCubeIpcLegacyD3D11, TestAppCubeIpcD3D11]
 

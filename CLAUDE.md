@@ -107,6 +107,23 @@ git clang-format    # Format only your changes (preferred)
 scripts/format-project.sh   # Format all
 ```
 
+### Publishing to DisplayXR (Public Release)
+
+The public repo `DisplayXR/displayxr-runtime` is the `displayxr` remote. Push CI-validated commits from `origin` (dfattal) when ready for a public release:
+
+```bash
+# Push current main to public repo (full commit history preserved)
+git push displayxr main
+
+# For a tagged release:
+git tag v1.x.x
+git push origin v1.x.x          # triggers Leia CI for the tag
+git push displayxr v1.x.x       # publishes tag to public repo
+git push displayxr main          # ensure main is up to date
+```
+
+CI only runs on dfattal (guarded by `github.repository` check in workflows). The public repo shows "skipped" for CI jobs — this is expected. Never push untested commits directly to displayxr. Always validate via `/ci-monitor` first.
+
 ## Architecture
 
 ### Source Tree Structure (`src/xrt/`)
