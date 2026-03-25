@@ -392,15 +392,17 @@ comp_d3d11_swapchain_create(struct comp_d3d11_compositor *c,
 		}
 	}
 
-	// For color textures, create with TYPELESS so apps can create their own typed views
-	// (required by OpenXR D3D11 spec; fixes Unity D3D11 black screen, issue #91).
-	if (!is_depth) {
-		DXGI_FORMAT typeless = d3d_dxgi_format_to_typeless_dxgi(dxgi_format);
-		if (typeless != dxgi_format) {
-			texture_format = typeless;
-			// srv_format and rtv_format remain as the original concrete format
-		}
-	}
+	// EXPERIMENT (#91): disabled TYPELESS for color textures to test if
+	// GPU sync fixes (fence + flush) alone resolve the Unity black screen.
+	// TYPELESS fixed black screen but caused vertex corruption artifacts.
+	// If concrete + sync works, we don't need TYPELESS.
+	//
+	// if (!is_depth) {
+	// 	DXGI_FORMAT typeless = d3d_dxgi_format_to_typeless_dxgi(dxgi_format);
+	// 	if (typeless != dxgi_format) {
+	// 		texture_format = typeless;
+	// 	}
+	// }
 
 	// Create textures
 	D3D11_TEXTURE2D_DESC texDesc = {};
