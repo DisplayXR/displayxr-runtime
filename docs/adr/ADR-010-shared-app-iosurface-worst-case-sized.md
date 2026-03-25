@@ -5,7 +5,7 @@
 
 ## Context
 
-In `_shared` apps, the runtime and app communicate via a shared IOSurface (macOS) or shared texture handle (Windows). The app renders into this surface; the compositor reads it, crops to the canvas rect, and feeds the display processor.
+In `_texture` apps, the runtime and app communicate via a shared IOSurface (macOS) or shared texture handle (Windows). The app renders into this surface; the compositor reads it, crops to the canvas rect, and feeds the display processor.
 
 We initially sized the IOSurface to match the canvas (the sub-rect of the window where 3D content appears) and added dynamic recreation on canvas resize:
 
@@ -25,7 +25,7 @@ The canvas rect is communicated separately via `xrSetSharedTextureOutputRectEXT`
 
 2. **Zero compute savings from smaller IOSurface.** The compositor already sizes views to the canvas rect regardless of IOSurface dimensions. The display processor renders into the target swapchain (compositor-owned), decoupled from the IOSurface size. A smaller IOSurface saves no GPU work.
 
-3. **Unnecessary API surface removed.** `xrUpdateSharedSurfaceEXT` added a new OpenXR function, a compositor method, and per-frame resize logic in every `_shared` app --- all for zero benefit.
+3. **Unnecessary API surface removed.** `xrUpdateSharedSurfaceEXT` added a new OpenXR function, a compositor method, and per-frame resize logic in every `_texture` app --- all for zero benefit.
 
 4. **Reduced fragility.** Dynamic IOSurface recreation introduces race conditions between the app's render thread and the compositor's read. A fixed-size surface eliminates this class of bugs.
 
@@ -59,4 +59,4 @@ For pixel-precise interlacing (e.g., Leia SR), the absolute screen position of t
 - IOSurface is created once at worst-case swapchain dimensions (`max(tileColumns * viewWidth)` × `max(tileRows * viewHeight)` across all rendering modes, assuming canvas = full window = full display).
 - `xrUpdateSharedSurfaceEXT` and `comp_metal_compositor_update_shared_iosurface` are removed from the codebase.
 - `xrSetSharedTextureOutputRectEXT` remains and must be called per-frame when the canvas moves or resizes.
-- Future `_shared` apps on other platforms (Windows shared texture) should follow the same pattern: allocate at display size, communicate canvas rect separately.
+- Future `_texture` apps on other platforms (Windows shared texture) should follow the same pattern: allocate at display size, communicate canvas rect separately.
