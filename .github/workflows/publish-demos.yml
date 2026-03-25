@@ -18,7 +18,7 @@ jobs:
 
       - name: Clone demo repo
         run: |
-          git clone https://x-access-token:${{ secrets.DISPLAYXR_TOKEN }}@github.com/DisplayXR/displayxr-demo.git demo-repo
+          git clone https://x-access-token:${{ secrets.DISPLAYXR_TOKEN }}@github.com/DisplayXR/displayxr-demos.git demo-repo
           cd demo-repo && git lfs install
 
       - name: Sync source files
