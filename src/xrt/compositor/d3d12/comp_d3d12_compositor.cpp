@@ -124,6 +124,9 @@ struct comp_d3d12_compositor
 	//! Shared texture resource (opened from app-provided handle).
 	ID3D12Resource *shared_texture;
 
+	//! RTV descriptor heap for shared texture (1 descriptor).
+	ID3D12DescriptorHeap *shared_texture_rtv_heap;
+
 	//! True if shared texture mode is active (offscreen rendering).
 	bool has_shared_texture;
 
@@ -1118,13 +1121,99 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 	}
 
-	// Shared texture mode: copy atlas output to shared texture and skip window present
+	// Shared texture mode: weave (or copy) atlas into shared texture, skip window present
 	if (c->has_shared_texture && c->shared_texture != nullptr) {
-		ID3D12Resource *atlas_resource = static_cast<ID3D12Resource *>(
-		    comp_d3d12_renderer_get_atlas_resource(c->renderer));
+		ID3D12Resource *atlas_resource = zero_copy
+		    ? static_cast<ID3D12Resource *>(zc_resource)
+		    : static_cast<ID3D12Resource *>(comp_d3d12_renderer_get_atlas_resource(c->renderer));
 
-		if (atlas_resource != nullptr) {
-			// Barrier: shared texture to COPY_DEST, atlas to COPY_SOURCE
+		if (atlas_resource != nullptr && c->display_processor != NULL && c->shared_texture_rtv_heap != nullptr) {
+			// DP path: weave atlas directly into shared texture
+			static bool st_dp_logged = false;
+			if (!st_dp_logged) {
+				U_LOG_W("D3D12 shared texture: weaving via display processor");
+				st_dp_logged = true;
+			}
+
+			// Execute atlas rendering commands first
+			c->cmd_list->Close();
+			ID3D12CommandList *copy_lists[] = {c->cmd_list};
+			c->command_queue->ExecuteCommandLists(1, copy_lists);
+			gpu_wait_idle(c);
+
+			// Fresh command list for weaver
+			c->cmd_allocator->Reset();
+			c->cmd_list->Reset(c->cmd_allocator, nullptr);
+
+			// Transition: shared texture COMMON→RENDER_TARGET, atlas PSR→COMMON
+			D3D12_RESOURCE_BARRIER barriers[2] = {};
+			barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+			barriers[0].Transition.pResource = c->shared_texture;
+			barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+			barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+			barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+			barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+			barriers[1].Transition.pResource = atlas_resource;
+			barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+			barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+			barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+			c->cmd_list->ResourceBarrier(2, barriers);
+
+			// Bind shared texture as render target
+			D3D12_CPU_DESCRIPTOR_HANDLE st_rtv = c->shared_texture_rtv_heap->GetCPUDescriptorHandleForHeapStart();
+			c->cmd_list->OMSetRenderTargets(1, &st_rtv, FALSE, nullptr);
+
+			uint32_t view_width, view_height;
+			comp_d3d12_renderer_get_view_dimensions(c->renderer, &view_width, &view_height);
+			uint32_t tile_columns, tile_rows;
+			comp_d3d12_renderer_get_tile_layout(c->renderer, &tile_columns, &tile_rows);
+
+			// Crop atlas to content dimensions
+			uint32_t content_w = tile_columns * view_width;
+			uint32_t content_h = tile_rows * view_height;
+			ID3D12Resource *dp_resource = d3d12_crop_atlas_for_dp(c, atlas_resource, content_w, content_h);
+
+			// DP target: use canvas dims for texture apps
+			D3D12_RESOURCE_DESC st_desc = c->shared_texture->GetDesc();
+			uint32_t dp_target_w = static_cast<uint32_t>(st_desc.Width);
+			uint32_t dp_target_h = static_cast<uint32_t>(st_desc.Height);
+			if (c->canvas.valid && c->canvas.w > 0 && c->canvas.h > 0) {
+				dp_target_w = c->canvas.w;
+				dp_target_h = c->canvas.h;
+			}
+
+			D3D12_VIEWPORT viewport = {};
+			viewport.Width = static_cast<float>(dp_target_w);
+			viewport.Height = static_cast<float>(dp_target_h);
+			viewport.MaxDepth = 1.0f;
+			c->cmd_list->RSSetViewports(1, &viewport);
+
+			D3D12_RECT scissor = {0, 0, static_cast<LONG>(dp_target_w), static_cast<LONG>(dp_target_h)};
+			c->cmd_list->RSSetScissorRects(1, &scissor);
+
+			xrt_display_processor_d3d12_process_atlas(
+			    c->display_processor,
+			    c->cmd_list,
+			    dp_resource,
+			    0,  // SRV GPU handle — SR weaver uses setInputViewTexture instead
+			    st_rtv.ptr,
+			    c->shared_texture,
+			    view_width, view_height,
+			    tile_columns, tile_rows,
+			    static_cast<uint32_t>(DXGI_FORMAT_R8G8B8A8_UNORM),
+			    dp_target_w, dp_target_h);
+
+			// Transition: atlas COMMON→PSR, shared texture RT→COMMON
+			barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+			barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+			barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+			barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+			c->cmd_list->ResourceBarrier(2, barriers);
+
+		} else if (atlas_resource != nullptr) {
+			// No DP: raw copy atlas to shared texture (2D mode fallback)
 			D3D12_RESOURCE_BARRIER barriers[2] = {};
 			barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
 			barriers[0].Transition.pResource = c->shared_texture;
@@ -1139,15 +1228,12 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 
 			c->cmd_list->ResourceBarrier(2, barriers);
-
 			c->cmd_list->CopyResource(c->shared_texture, atlas_resource);
 
-			// Barrier: back to original states
 			barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
 			barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
 			barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
 			barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-
 			c->cmd_list->ResourceBarrier(2, barriers);
 		}
 
@@ -1446,6 +1532,11 @@ d3d12_compositor_destroy(struct xrt_compositor *xc)
 		c->dp_srv_heap->Release();
 	}
 
+	if (c->shared_texture_rtv_heap != nullptr) {
+		c->shared_texture_rtv_heap->Release();
+		c->shared_texture_rtv_heap = nullptr;
+	}
+
 	if (c->shared_texture != nullptr) {
 		c->shared_texture->Release();
 		c->shared_texture = nullptr;
@@ -1625,6 +1716,7 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 
 	// Open shared texture if handle provided
 	c->shared_texture = nullptr;
+	c->shared_texture_rtv_heap = nullptr;
 	c->has_shared_texture = false;
 	if (shared_texture_handle != nullptr) {
 		HANDLE st_handle = static_cast<HANDLE>(shared_texture_handle);
@@ -1643,6 +1735,23 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 		U_LOG_W("Opened shared texture handle: %p -> resource %p (%llux%llu)",
 		        shared_texture_handle, (void *)c->shared_texture,
 		        (unsigned long long)st_desc.Width, (unsigned long long)st_desc.Height);
+
+		// Create RTV for shared texture so the display processor can weave into it
+		D3D12_DESCRIPTOR_HEAP_DESC rtv_heap_desc = {};
+		rtv_heap_desc.NumDescriptors = 1;
+		rtv_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+		hr = c->device->CreateDescriptorHeap(&rtv_heap_desc, IID_PPV_ARGS(&c->shared_texture_rtv_heap));
+		if (FAILED(hr)) {
+			U_LOG_E("Failed to create shared texture RTV heap: 0x%08x", hr);
+			d3d12_compositor_destroy(&c->base.base);
+			return XRT_ERROR_D3D;
+		}
+		D3D12_RENDER_TARGET_VIEW_DESC rtv_desc = {};
+		rtv_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+		rtv_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+		c->device->CreateRenderTargetView(c->shared_texture, &rtv_desc,
+		    c->shared_texture_rtv_heap->GetCPUDescriptorHandleForHeapStart());
+		U_LOG_I("Created RTV for shared texture (weaver target)");
 	}
 
 	// Initialize settings
