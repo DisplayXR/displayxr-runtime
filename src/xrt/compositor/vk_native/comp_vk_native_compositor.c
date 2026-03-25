@@ -1818,7 +1818,11 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 			    shared_fb,
 			    (VkImage_XDP)c->shared_image,
 			    dp_target_w, dp_target_h,
-			    (VkFormat_XDP)view_format);
+			    (VkFormat_XDP)view_format,
+			    c->canvas.valid ? c->canvas.x : 0,
+			    c->canvas.valid ? c->canvas.y : 0,
+			    c->canvas.valid ? c->canvas.w : 0,
+			    c->canvas.valid ? c->canvas.h : 0);
 
 			vk->vkEndCommandBuffer(cmd);
 
@@ -1980,7 +1984,11 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				    target_fb,
 				    (VkImage_XDP)(uintptr_t)target_image,
 				    tgt_width, tgt_height,
-				    (VkFormat_XDP)VK_FORMAT_B8G8R8A8_UNORM);
+				    (VkFormat_XDP)VK_FORMAT_B8G8R8A8_UNORM,
+				    c->canvas.valid ? c->canvas.x : 0,
+				    c->canvas.valid ? c->canvas.y : 0,
+				    c->canvas.valid ? c->canvas.w : 0,
+				    c->canvas.valid ? c->canvas.h : 0);
 
 				// Render pass finalLayout handles transition to PRESENT_SRC_KHR
 

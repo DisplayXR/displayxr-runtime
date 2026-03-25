@@ -60,6 +60,10 @@ struct xrt_display_processor_metal
 	 * @param      target_texture   Output render target (id<MTLTexture>).
 	 * @param      target_width     Width of the output render target in pixels.
 	 * @param      target_height    Height of the output render target in pixels.
+	 * @param      canvas_offset_x  Canvas left edge in window client-area pixels (0 = no offset).
+	 * @param      canvas_offset_y  Canvas top edge in window client-area pixels (0 = no offset).
+	 * @param      canvas_width     Canvas width in pixels (0 = fills full window/target).
+	 * @param      canvas_height    Canvas height in pixels (0 = fills full window/target).
 	 */
 	void (*process_atlas)(struct xrt_display_processor_metal *xdp,
 	                       void *command_buffer,
@@ -71,7 +75,11 @@ struct xrt_display_processor_metal
 	                       uint32_t format,
 	                       void *target_texture,
 	                       uint32_t target_width,
-	                       uint32_t target_height);
+	                       uint32_t target_height,
+	                       int32_t canvas_offset_x,
+	                       int32_t canvas_offset_y,
+	                       uint32_t canvas_width,
+	                       uint32_t canvas_height);
 
 	/*!
 	 * Get predicted eye positions from vendor eye tracking SDK.
@@ -138,10 +146,15 @@ xrt_display_processor_metal_process_atlas(struct xrt_display_processor_metal *xd
                                            uint32_t format,
                                            void *target_texture,
                                            uint32_t target_width,
-                                           uint32_t target_height)
+                                           uint32_t target_height,
+                                           int32_t canvas_offset_x,
+                                           int32_t canvas_offset_y,
+                                           uint32_t canvas_width,
+                                           uint32_t canvas_height)
 {
 	xdp->process_atlas(xdp, command_buffer, atlas_texture, view_width, view_height, tile_columns, tile_rows,
-	                    format, target_texture, target_width, target_height);
+	                    format, target_texture, target_width, target_height, canvas_offset_x, canvas_offset_y,
+	                    canvas_width, canvas_height);
 }
 
 /*!

@@ -2564,7 +2564,8 @@ render_session_to_own_target(struct multi_compositor *mc, struct vk_bundle *vk, 
 			    framebuffer,
 			    (VkImage_XDP)ct->images[buffer_index].handle,
 			    framebufferWidth, framebufferHeight,
-			    (VkFormat_XDP)framebufferFormat);
+			    (VkFormat_XDP)framebufferFormat,
+			    0, 0, 0, 0);
 
 			// Post-weave barrier: target → PRESENT_SRC_KHR (for HUD overlay + present)
 			VkImageMemoryBarrier post_weave = {

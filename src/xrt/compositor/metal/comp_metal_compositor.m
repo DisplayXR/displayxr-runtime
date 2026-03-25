@@ -1631,7 +1631,11 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		    (uint32_t)MTLPixelFormatBGRA8Unorm,
 		    (__bridge void *)output_texture,
 		    dp_target_w,
-		    dp_target_h);
+		    dp_target_h,
+		    c->canvas.valid ? c->canvas.x : 0,
+		    c->canvas.valid ? c->canvas.y : 0,
+		    c->canvas.valid ? c->canvas.w : 0,
+		    c->canvas.valid ? c->canvas.h : 0);
 	} else {
 		// No display processor: simple blit passthrough.
 		MTLRenderPassDescriptor *blit_pass = [MTLRenderPassDescriptor renderPassDescriptor];

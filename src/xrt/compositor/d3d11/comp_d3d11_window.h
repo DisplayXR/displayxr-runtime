@@ -51,22 +51,6 @@ xrt_result_t
 comp_d3d11_window_create(uint32_t width, uint32_t height, struct comp_d3d11_window **out);
 
 /*!
- * Create a hidden window for the SR weaver in shared-texture mode.
- *
- * Same as comp_d3d11_window_create but the window is never shown.
- * The SR weaver needs a valid HWND for interlacing alignment even
- * when rendering to a shared texture instead of a window surface.
- *
- * @param width  Requested window width
- * @param height Requested window height
- * @param out    Pointer to receive the created window handle
- *
- * @return XRT_SUCCESS on success, error code otherwise
- */
-xrt_result_t
-comp_d3d11_window_create_hidden(uint32_t width, uint32_t height, struct comp_d3d11_window **out);
-
-/*!
  * Destroy the self-owned window.
  *
  * Posts WM_CLOSE to the window thread and waits for it to exit.
@@ -143,26 +127,6 @@ comp_d3d11_window_wait_for_paint(struct comp_d3d11_window *window);
  */
 void
 comp_d3d11_window_signal_paint_done(struct comp_d3d11_window *window);
-
-/*!
- * Reposition and resize the window's client area.
- *
- * Used in shared-texture mode to keep the hidden weaver window aligned
- * with the app's actual display rect on screen. The coordinates are
- * screen-space pixels for the desired client area. For WS_POPUP windows
- * the client rect equals the window rect, so this is a direct SetWindowPos.
- *
- * Thread-safe: posts to the window thread.
- *
- * @param window The window object
- * @param x      Client area left in screen pixels
- * @param y      Client area top in screen pixels
- * @param w      Client area width in pixels
- * @param h      Client area height in pixels
- */
-void
-comp_d3d11_window_set_rect(struct comp_d3d11_window *window,
-                           int x, int y, uint32_t w, uint32_t h);
 
 /*!
  * No-op. The dedicated window thread handles its own messages.

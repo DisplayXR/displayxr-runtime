@@ -63,6 +63,10 @@ struct xrt_display_processor_d3d11
 	 * @param      format           DXGI format of the atlas texture (DXGI_FORMAT as uint32_t).
 	 * @param      target_width     Width of the output render target in pixels.
 	 * @param      target_height    Height of the output render target in pixels.
+	 * @param      canvas_offset_x  Canvas left edge in window client-area pixels (0 = no offset).
+	 * @param      canvas_offset_y  Canvas top edge in window client-area pixels (0 = no offset).
+	 * @param      canvas_width     Canvas width in pixels (0 = fills full window/target).
+	 * @param      canvas_height    Canvas height in pixels (0 = fills full window/target).
 	 */
 	void (*process_atlas)(struct xrt_display_processor_d3d11 *xdp,
 	                       void *d3d11_context,
@@ -73,7 +77,11 @@ struct xrt_display_processor_d3d11
 	                       uint32_t tile_rows,
 	                       uint32_t format,
 	                       uint32_t target_width,
-	                       uint32_t target_height);
+	                       uint32_t target_height,
+	                       int32_t canvas_offset_x,
+	                       int32_t canvas_offset_y,
+	                       uint32_t canvas_width,
+	                       uint32_t canvas_height);
 
 	/*!
 	 * Get predicted eye positions from vendor eye tracking SDK.
@@ -139,10 +147,15 @@ xrt_display_processor_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xd
                                            uint32_t tile_rows,
                                            uint32_t format,
                                            uint32_t target_width,
-                                           uint32_t target_height)
+                                           uint32_t target_height,
+                                           int32_t canvas_offset_x,
+                                           int32_t canvas_offset_y,
+                                           uint32_t canvas_width,
+                                           uint32_t canvas_height)
 {
 	xdp->process_atlas(xdp, d3d11_context, atlas_srv, view_width, view_height, tile_columns, tile_rows, format,
-	                    target_width, target_height);
+	                    target_width, target_height, canvas_offset_x, canvas_offset_y, canvas_width,
+	                    canvas_height);
 }
 
 /*!

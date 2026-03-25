@@ -67,8 +67,19 @@ leia_dp_process_atlas(struct xrt_display_processor *xdp,
                       VkImage_XDP target_image,
                       uint32_t target_width,
                       uint32_t target_height,
-                      VkFormat_XDP target_format)
+                      VkFormat_XDP target_format,
+                      int32_t canvas_offset_x,
+                      int32_t canvas_offset_y,
+                      uint32_t canvas_width,
+                      uint32_t canvas_height)
 {
+	// TODO(#85): Pass canvas_offset_x/y to vendor weaver for interlacing
+	// phase correction once Leia SR SDK supports sub-rect offset.
+	(void)canvas_offset_x;
+	(void)canvas_offset_y;
+	(void)canvas_width;
+	(void)canvas_height;
+
 	struct leia_display_processor *ldp = leia_display_processor(xdp);
 	struct vk_bundle *vk = ldp->vk;
 

@@ -936,7 +936,11 @@ gl_crop_and_process_dp(struct comp_gl_compositor *c,
 	    c->tile_rows,
 	    GL_RGBA8,
 	    output_w,
-	    output_h);
+	    output_h,
+	    c->canvas.valid ? c->canvas.x : 0,
+	    c->canvas.valid ? c->canvas.y : 0,
+	    c->canvas.valid ? c->canvas.w : 0,
+	    c->canvas.valid ? c->canvas.h : 0);
 }
 
 

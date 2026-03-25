@@ -95,6 +95,10 @@ struct xrt_display_processor
 	 * @param      target_width     Width of the target framebuffer in pixels.
 	 * @param      target_height    Height of the target framebuffer in pixels.
 	 * @param      target_format    Vulkan format of the target framebuffer.
+	 * @param      canvas_offset_x  Canvas left edge in window client-area pixels (0 = no offset).
+	 * @param      canvas_offset_y  Canvas top edge in window client-area pixels (0 = no offset).
+	 * @param      canvas_width     Canvas width in pixels (0 = fills full window/target).
+	 * @param      canvas_height    Canvas height in pixels (0 = fills full window/target).
 	 */
 	void (*process_atlas)(struct xrt_display_processor *xdp,
 	                      VkCommandBuffer cmd_buffer,
@@ -109,7 +113,11 @@ struct xrt_display_processor
 	                      VkImage_XDP target_image,
 	                      uint32_t target_width,
 	                      uint32_t target_height,
-	                      VkFormat_XDP target_format);
+	                      VkFormat_XDP target_format,
+	                      int32_t canvas_offset_x,
+	                      int32_t canvas_offset_y,
+	                      uint32_t canvas_width,
+	                      uint32_t canvas_height);
 
 	/*!
 	 * Get predicted eye positions from vendor eye tracking SDK.
@@ -216,7 +224,11 @@ xrt_display_processor_process_atlas(struct xrt_display_processor *xdp,
                                     VkImage_XDP target_image,
                                     uint32_t target_width,
                                     uint32_t target_height,
-                                    VkFormat_XDP target_format)
+                                    VkFormat_XDP target_format,
+                                    int32_t canvas_offset_x,
+                                    int32_t canvas_offset_y,
+                                    uint32_t canvas_width,
+                                    uint32_t canvas_height)
 {
 	xdp->process_atlas(xdp, cmd_buffer, atlas_image, atlas_view,
 	                   view_width, view_height,
@@ -224,7 +236,9 @@ xrt_display_processor_process_atlas(struct xrt_display_processor *xdp,
 	                   view_format, target_fb,
 	                   target_image,
 	                   target_width, target_height,
-	                   target_format);
+	                   target_format,
+	                   canvas_offset_x, canvas_offset_y,
+	                   canvas_width, canvas_height);
 }
 
 /*!

@@ -215,8 +215,19 @@ sim_dp_metal_process_atlas(struct xrt_display_processor_metal *xdp,
                             uint32_t format,
                             void *target_texture,
                             uint32_t target_width,
-                            uint32_t target_height)
+                            uint32_t target_height,
+                            int32_t canvas_offset_x,
+                            int32_t canvas_offset_y,
+                            uint32_t canvas_width,
+                            uint32_t canvas_height)
 {
+	// TODO(#85): Pass canvas_offset_x/y to vendor weaver for interlacing
+	// phase correction once Leia SR SDK supports sub-rect offset.
+	(void)canvas_offset_x;
+	(void)canvas_offset_y;
+	(void)canvas_width;
+	(void)canvas_height;
+
 	struct sim_display_processor_metal *sdp = sim_dp_metal(xdp);
 	id<MTLCommandBuffer> cmd_buf = (__bridge id<MTLCommandBuffer>)command_buffer;
 	id<MTLTexture> atlas_tex = (__bridge id<MTLTexture>)atlas_texture;

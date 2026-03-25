@@ -1203,7 +1203,11 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			    view_width, view_height,
 			    tile_columns, tile_rows,
 			    static_cast<uint32_t>(DXGI_FORMAT_R8G8B8A8_UNORM),
-			    dp_target_w, dp_target_h);
+			    dp_target_w, dp_target_h,
+			    c->canvas.valid ? c->canvas.x : 0,
+			    c->canvas.valid ? c->canvas.y : 0,
+			    c->canvas.valid ? c->canvas.w : 0,
+			    c->canvas.valid ? c->canvas.h : 0);
 
 			// Transition: atlas COMMON→PSR, shared texture RT→COMMON
 			barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
@@ -1384,7 +1388,11 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			    view_width, view_height,
 			    tile_columns, tile_rows,
 			    static_cast<uint32_t>(DXGI_FORMAT_R8G8B8A8_UNORM),
-			    dp_target_w, dp_target_h);
+			    dp_target_w, dp_target_h,
+			    c->canvas.valid ? c->canvas.x : 0,
+			    c->canvas.valid ? c->canvas.y : 0,
+			    c->canvas.valid ? c->canvas.w : 0,
+			    c->canvas.valid ? c->canvas.h : 0);
 
 			// Transition atlas back: COMMON → PIXEL_SHADER_RESOURCE
 			atlas_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;

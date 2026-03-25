@@ -359,7 +359,11 @@ struct xrt_display_processor
                           VkFramebuffer target_fb,
                           uint32_t target_width,
                           uint32_t target_height,
-                          VkFormat_XDP target_format);
+                          VkFormat_XDP target_format,
+                          int32_t canvas_offset_x,
+                          int32_t canvas_offset_y,
+                          uint32_t canvas_width,
+                          uint32_t canvas_height);
 
     // --- Optional: eye tracking (recommended) ---
     bool (*get_predicted_eye_positions)(struct xrt_display_processor *xdp,
@@ -391,6 +395,13 @@ Key design points:
   window metrics, and display mode — no separate "tracker" component
 - **Atlas input**: Single texture containing all views in a tiled grid
   (`tile_columns` × `tile_rows`), with per-view dimensions `view_width` × `view_height`
+- **Canvas sub-rect**: `canvas_offset_x/y` and `canvas_width/height` tell the DP
+  where the 3D canvas sits within the window, enabling correct phase alignment for
+  lenticular interlacing. For `_handle` and `_hosted` apps these are (0, 0, 0, 0)
+  meaning "full window". For `_texture` apps the values come from
+  `xrSetSharedTextureOutputRectEXT`. The app's real window handle (HWND / NSView)
+  is passed directly to the display processor at init time — no hidden window is
+  involved.
 - **Command buffer recording**: Implementation records Vulkan commands into the
   provided command buffer (deferred execution)
 - **Target framebuffer**: Output goes to the provided `VkFramebuffer`
@@ -443,7 +454,11 @@ struct xrt_display_processor_d3d11
                           uint32_t tile_rows,        // Atlas tile rows
                           uint32_t format,           // DXGI_FORMAT as uint32_t
                           uint32_t target_width,
-                          uint32_t target_height);
+                          uint32_t target_height,
+                          int32_t canvas_offset_x,   // Canvas left edge (0 = no offset)
+                          int32_t canvas_offset_y,   // Canvas top edge (0 = no offset)
+                          uint32_t canvas_width,     // Canvas width (0 = full target)
+                          uint32_t canvas_height);   // Canvas height (0 = full target)
 
     // --- Optional (same as Vulkan variant) ---
     bool (*get_predicted_eye_positions)(struct xrt_display_processor_d3d11 *xdp,
@@ -467,6 +482,8 @@ struct xrt_display_processor_d3d11
 Key differences from Vulkan:
 - **Atlas input**: Single SRV containing all views in a tiled atlas layout
   (`tile_columns` × `tile_rows`)
+- **Canvas sub-rect**: Same `canvas_offset_x/y` and `canvas_width/height` params
+  as the Vulkan variant (see above)
 - **Immediate mode**: No command buffer — uses D3D11 device context directly
 - **Bound render target**: Output goes to the currently bound render target
   (set via `OMSetRenderTargets` before the call)
@@ -485,6 +502,9 @@ API-specific parameters:
   `target_texture` (MTLTexture)
 - **OpenGL** (`xrt_display_processor_gl`): `process_atlas()` takes
   `atlas_texture` (GLuint texture name); renders to the default framebuffer
+
+All five API variants include the `canvas_offset_x`, `canvas_offset_y`,
+`canvas_width`, `canvas_height` parameters at the end of `process_atlas()`.
 
 ### 4.3 Ownership Model
 

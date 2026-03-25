@@ -1142,31 +1142,6 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 
 	// Offscreen shared-texture-only path: no DXGI target
 	if (c->target == nullptr) {
-		// Sync hidden weaver window position to where the shared texture
-		// will be displayed on screen. If the app set an output rect
-		// (sub-rect within its window), use that; otherwise use the
-		// full client rect.
-		if (c->app_hwnd != nullptr && c->own_window != nullptr) {
-			POINT origin = {0, 0};
-			ClientToScreen(c->app_hwnd, &origin);
-
-			if (c->canvas.valid) {
-				comp_d3d11_window_set_rect(c->own_window,
-				    origin.x + c->canvas.x,
-				    origin.y + c->canvas.y,
-				    c->canvas.w,
-				    c->canvas.h);
-			} else {
-				RECT cr;
-				if (GetClientRect(c->app_hwnd, &cr)) {
-					comp_d3d11_window_set_rect(c->own_window,
-					    origin.x, origin.y,
-					    (uint32_t)(cr.right - cr.left),
-					    (uint32_t)(cr.bottom - cr.top));
-				}
-			}
-		}
-
 		// Weave/blit directly into the shared texture
 		if (c->display_processor != NULL && c->shared_rtv != nullptr) {
 			void *atlas_srv = zero_copy ? zc_srv : comp_d3d11_renderer_get_atlas_srv(c->renderer);
@@ -1205,7 +1180,11 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 
 			xrt_display_processor_d3d11_process_atlas(
 			    c->display_processor, c->context, atlas_srv, view_width, view_height,
-			    tile_columns, tile_rows, DXGI_FORMAT_R8G8B8A8_UNORM, dp_target_w, dp_target_h);
+			    tile_columns, tile_rows, DXGI_FORMAT_R8G8B8A8_UNORM, dp_target_w, dp_target_h,
+			    c->canvas.valid ? c->canvas.x : 0,
+			    c->canvas.valid ? c->canvas.y : 0,
+			    c->canvas.valid ? c->canvas.w : 0,
+			    c->canvas.valid ? c->canvas.h : 0);
 			weaving_done = true;
 		}
 
@@ -1251,7 +1230,11 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 
 		xrt_display_processor_d3d11_process_atlas(
 		    c->display_processor, c->context, atlas_srv, view_width, view_height,
-		    tile_columns, tile_rows, DXGI_FORMAT_R8G8B8A8_UNORM, target_width, target_height);
+		    tile_columns, tile_rows, DXGI_FORMAT_R8G8B8A8_UNORM, target_width, target_height,
+		    c->canvas.valid ? c->canvas.x : 0,
+		    c->canvas.valid ? c->canvas.y : 0,
+		    c->canvas.valid ? c->canvas.w : 0,
+		    c->canvas.valid ? c->canvas.h : 0);
 		weaving_done = true;
 	}
 
@@ -1417,28 +1400,15 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 
 	// Handle window: use provided HWND, create our own, or go offscreen (shared texture)
 	if (shared_texture_handle != nullptr) {
-		// Shared texture mode: create a hidden window for SR weaver alignment.
-		// c->hwnd stays NULL so the offscreen rendering path is used.
-		// If app also provided an HWND, store it for per-frame position tracking.
+		// Shared texture mode: compositor doesn't own a swapchain.
+		// Store app HWND separately for display processor position tracking.
+		// No hidden window — the DP gets the app's real HWND directly.
 		c->hwnd = nullptr;
 		if (hwnd != nullptr) {
 			c->app_hwnd = static_cast<HWND>(hwnd);
 			U_LOG_I("Shared texture mode with app HWND for position tracking: %p", hwnd);
-		}
-		uint32_t win_w = xdev->hmd->screens[0].w_pixels;
-		uint32_t win_h = xdev->hmd->screens[0].h_pixels;
-		if (win_w == 0 || win_h == 0) {
-			win_w = 1920;
-			win_h = 1080;
-		}
-		xrt_result_t xret = comp_d3d11_window_create_hidden(win_w, win_h, &c->own_window);
-		if (xret != XRT_SUCCESS) {
-			U_LOG_W("Failed to create hidden weaver window, continuing without");
-			c->own_window = nullptr;
 		} else {
-			c->owns_window = true;
-			U_LOG_I("Shared texture mode with hidden weaver window: %p",
-			        comp_d3d11_window_get_hwnd(c->own_window));
+			U_LOG_I("Shared texture mode (offscreen) — no window");
 		}
 	} else if (hwnd != nullptr) {
 		// App provided window via XR_EXT_win32_window_binding (ext mode)
@@ -1639,13 +1609,10 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	// Create display processor via factory (set by the target builder at init time).
 	if (dp_factory_d3d11 != NULL) {
 		auto factory = (xrt_dp_factory_d3d11_fn_t)dp_factory_d3d11;
-		// Use hidden weaver window HWND if available (shared texture mode),
+		// Use app HWND for position tracking in shared texture mode,
 		// otherwise use the compositor's own HWND
-		HWND weaver_hwnd = c->hwnd;
-		if (weaver_hwnd == nullptr && c->own_window != nullptr) {
-			weaver_hwnd = static_cast<HWND>(comp_d3d11_window_get_hwnd(c->own_window));
-		}
-		xrt_result_t dp_ret = factory(c->device, c->context, weaver_hwnd, &c->display_processor);
+		HWND dp_hwnd = c->hwnd != nullptr ? c->hwnd : c->app_hwnd;
+		xrt_result_t dp_ret = factory(c->device, c->context, dp_hwnd, &c->display_processor);
 		if (dp_ret != XRT_SUCCESS) {
 			U_LOG_W("D3D11 display processor factory failed (error %d), continuing without",
 			        (int)dp_ret);

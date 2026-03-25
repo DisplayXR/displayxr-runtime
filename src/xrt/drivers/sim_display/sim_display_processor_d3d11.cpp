@@ -223,8 +223,19 @@ sim_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
                              uint32_t tile_rows,
                              uint32_t format,
                              uint32_t target_width,
-                             uint32_t target_height)
+                             uint32_t target_height,
+                             int32_t canvas_offset_x,
+                             int32_t canvas_offset_y,
+                             uint32_t canvas_width,
+                             uint32_t canvas_height)
 {
+	// TODO(#85): Pass canvas_offset_x/y to vendor weaver for interlacing
+	// phase correction once Leia SR SDK supports sub-rect offset.
+	(void)canvas_offset_x;
+	(void)canvas_offset_y;
+	(void)canvas_width;
+	(void)canvas_height;
+
 	struct sim_display_processor_d3d11_impl *sdp = sim_dp_d3d11(xdp);
 	ID3D11DeviceContext *ctx = static_cast<ID3D11DeviceContext *>(d3d11_context);
 	ID3D11ShaderResourceView *srv = static_cast<ID3D11ShaderResourceView *>(atlas_srv);

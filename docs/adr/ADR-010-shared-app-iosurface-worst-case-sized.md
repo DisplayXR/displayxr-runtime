@@ -23,7 +23,7 @@ The canvas rect is communicated separately via `xrSetSharedTextureOutputRectEXT`
 
 1. **Negligible memory cost.** A 2560x1440 BGRA8 IOSurface is ~14 MB. Allocating at worst-case atlas size wastes at most a few MB compared to canvas-sized.
 
-2. **Zero compute savings from smaller IOSurface.** The compositor already sizes views to the canvas rect regardless of IOSurface dimensions. The display processor renders into its own output (e.g., Leia SR's hidden HWND), decoupled from the IOSurface size. A smaller IOSurface saves no GPU work.
+2. **Zero compute savings from smaller IOSurface.** The compositor already sizes views to the canvas rect regardless of IOSurface dimensions. The display processor renders into the target swapchain (compositor-owned), decoupled from the IOSurface size. A smaller IOSurface saves no GPU work.
 
 3. **Unnecessary API surface removed.** `xrUpdateSharedSurfaceEXT` added a new OpenXR function, a compositor method, and per-frame resize logic in every `_shared` app --- all for zero benefit.
 

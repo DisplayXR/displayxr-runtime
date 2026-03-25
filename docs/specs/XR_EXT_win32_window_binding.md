@@ -103,7 +103,7 @@ This is why the extension requires the actual **window handle** (HWND), not just
 
 - The display processor needs to query the window's screen-space position each frame to compute the correct interlacing origin
 - Some advanced vendor display processors, like Leia's, go further: they hook `WM_WINDOWPOSCHANGING` on the HWND to **snap** window drag positions to phase-aligned coordinates, preventing crosstalk jitter during drag. This is an optional vendor optimization — without it, 3D quality degrades during drag but is correct at rest.
-- For `_texture` apps where the 3D canvas is a sub-rect of the window (e.g., a 3D viewport surrounded by 2D UI), the display processor computes the interlacing origin as `windowScreenPos + canvasOffset`
+- For `_texture` apps where the 3D canvas is a sub-rect of the window (e.g., a 3D viewport surrounded by 2D UI), the canvas offset and size from `xrSetSharedTextureOutputRectEXT` flow through the compositor to the display processor's `process_atlas()` call as `canvas_offset_x/y` and `canvas_width/height`, enabling correct phase alignment without any hidden windows. The app's real HWND is passed directly to the display processor at init time.
 
 A texture handle or screen coordinate alone would not allow the display processor to track position changes or hook window messages.
 

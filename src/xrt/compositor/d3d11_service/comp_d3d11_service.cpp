@@ -3235,7 +3235,8 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		xrt_display_processor_d3d11_process_atlas(
 		    c->render.display_processor, sys->context.get(), input_srv,
 		    input_view_w, input_view_h, sys->tile_columns, sys->tile_rows,
-		    DXGI_FORMAT_R8G8B8A8_UNORM, back_buffer_width, back_buffer_height);
+		    DXGI_FORMAT_R8G8B8A8_UNORM, back_buffer_width, back_buffer_height,
+		    0, 0, 0, 0);
 		weaving_done = true;
 	} else {
 		// No display processor or mono — copy to back buffer directly

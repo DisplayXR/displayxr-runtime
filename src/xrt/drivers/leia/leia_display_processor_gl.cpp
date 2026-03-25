@@ -64,8 +64,19 @@ leia_dp_gl_process_atlas(struct xrt_display_processor_gl *xdp,
                            uint32_t tile_rows,
                            uint32_t format,
                            uint32_t target_width,
-                           uint32_t target_height)
+                           uint32_t target_height,
+                           int32_t canvas_offset_x,
+                           int32_t canvas_offset_y,
+                           uint32_t canvas_width,
+                           uint32_t canvas_height)
 {
+	// TODO(#85): Pass canvas_offset_x/y to vendor weaver for interlacing
+	// phase correction once Leia SR SDK supports sub-rect offset.
+	(void)canvas_offset_x;
+	(void)canvas_offset_y;
+	(void)canvas_width;
+	(void)canvas_height;
+
 	struct leia_display_processor_gl_impl *ldp = leia_dp_gl(xdp);
 
 	// 2D mode: bypass weaver, blit atlas content directly via glBlitFramebuffer

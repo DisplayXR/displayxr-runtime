@@ -41,7 +41,7 @@ The **canvas** is the sub-rect of the window where 3D content appears. For `_han
 
 View dimensions and Kooima projection must be based on **canvas** size, not display size. This is critical for `_texture` apps.
 
-The canvas rect is set via `xrSetSharedTextureOutputRectEXT` — see the [window binding spec](XR_EXT_win32_window_binding.md#35-xrsetsharedtextureoutputrectext) for the full API reference.
+The canvas rect is set via `xrSetSharedTextureOutputRectEXT` — see the [window binding spec](XR_EXT_win32_window_binding.md#35-xrsetsharedtextureoutputrectext) for the full API reference. The compositor plumbs this rect through to the display processor's `process_atlas()` call as `canvas_offset_x/y` and `canvas_width/height`, enabling correct phase alignment for lenticular interlacing. The app's real window handle (HWND / NSView) is passed directly to the display processor — no hidden windows are involved.
 
 See [Multiview Tiling — Terminology: Display, Window, Canvas](multiview-tiling.md) for formal definitions.
 
