@@ -414,7 +414,7 @@ comp_d3d11_swapchain_create(struct comp_d3d11_compositor *c,
 	texDesc.Usage = D3D11_USAGE_DEFAULT;
 	texDesc.BindFlags = bind_flags;
 	texDesc.CPUAccessFlags = 0;
-	texDesc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+	texDesc.MiscFlags = 0;
 
 	for (uint32_t i = 0; i < image_count; i++) {
 		HRESULT hr = internals->device->CreateTexture2D(&texDesc, nullptr, &sc->images[i]);
