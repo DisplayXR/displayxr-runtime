@@ -77,6 +77,7 @@ These documents describe **planned features that are not yet implemented**.
 - [3D Shell](roadmap/3d-shell.md) — spatial window manager (#44)
 - [3D Capture](roadmap/3d-capture.md) — capture pipeline
 - [Shell/Runtime Contract](roadmap/shell-runtime-contract.md) — IPC between shell and runtime
+- **[Shell Implementation Tasks](roadmap/shell-tasks.md)** — phased task tracker (Phase 0–5)
 - [Display Spatial Model](roadmap/display-spatial-model.md) — displays in the spatial graph (#46)
 - [Multi-Display Single Machine](roadmap/multi-display-single-machine.md) — multiple displays, one machine (#69)
 - [Multi-Display Networked](roadmap/multi-display-networked.md) — displays across the network (#70)
