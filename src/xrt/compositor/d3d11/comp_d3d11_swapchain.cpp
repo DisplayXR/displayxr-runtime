@@ -9,7 +9,6 @@
 
 #include "comp_d3d11_swapchain.h"
 #include "comp_d3d11_compositor.h"
-#include "d3d/d3d_dxgi_formats.h"
 
 #include "xrt/xrt_handles.h"
 
@@ -399,18 +398,10 @@ comp_d3d11_swapchain_create(struct comp_d3d11_compositor *c,
 		}
 	}
 
-	// For color textures, create with TYPELESS so apps can create their own typed views
-	// (required by OpenXR D3D11 spec; fixes Unity D3D11 black screen, issue #91).
-	// Note: Unity has a vertex corruption bug with TYPELESS render targets — see
-	// unity-3d-display#36. Concrete format was tested but produces black screen
-	// even with GPU sync fixes.
-	if (!is_depth) {
-		DXGI_FORMAT typeless = d3d_dxgi_format_to_typeless_dxgi(dxgi_format);
-		if (typeless != dxgi_format) {
-			texture_format = typeless;
-			// srv_format and rtv_format remain as the original concrete format
-		}
-	}
+	// Color textures use typed format so Unity can call CreateRenderTargetView(tex, nullptr, &rtv)
+	// without specifying an explicit format. TYPELESS color breaks Unity (vertex/geometry
+	// corruption) and is not needed — typed color + D3D11_BIND_RENDER_TARGET is legal in D3D11.
+	// (Only depth textures need TYPELESS, and only when SRV is also required — handled above.)
 
 	// Create textures
 	D3D11_TEXTURE2D_DESC texDesc = {};
