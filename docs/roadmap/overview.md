@@ -52,6 +52,10 @@ Multi-app spatial window manager — the long-term vision for 3D displays as a d
 
 The long-term goal is a **spatial desktop platform** where multiple OpenXR apps render as 3D windows on a light field display, managed by a platform-native shell. See the [Spatial Desktop PRD](spatial-desktop-prd.md) for the full product vision.
 
+## Task Tracker
+
+- [Shell Implementation Tasks](shell-tasks.md) — phased task tracker for the 3D shell (Phase 0–5)
+
 ## Proposal Documents
 
 All documents in `docs/roadmap/` describe planned features that are not yet implemented:
