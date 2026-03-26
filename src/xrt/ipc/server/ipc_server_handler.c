@@ -167,25 +167,43 @@ ipc_try_get_sr_view_poses(struct ipc_server *s,
 		return false;
 	}
 
-	// Get display dimensions for Kooima FOV
+	// Get screen dimensions for Kooima FOV (prefer window metrics, fall back to display)
 	float screen_width_m, screen_height_m;
-	if (!comp_d3d11_service_get_display_dimensions(s->xsysc, &screen_width_m, &screen_height_m)) {
-		static bool logged_no_dims = false;
-		if (!logged_no_dims) {
-			logged_no_dims = true;
-			IPC_WARN(s, "ipc_try_get_sr_view_poses: get_display_dimensions FAILED, skipping SR poses");
+	float eye_offset_x = 0.0f, eye_offset_y = 0.0f;
+	{
+		struct xrt_window_metrics wm = {0};
+		if (comp_d3d11_service_get_window_metrics(s->xsysc, &wm) &&
+		    wm.valid && wm.window_width_m > 0.0f && wm.window_height_m > 0.0f) {
+			// Window-relative Kooima: use actual window dims
+			screen_width_m = wm.window_width_m;
+			screen_height_m = wm.window_height_m;
+			eye_offset_x = wm.window_center_offset_x_m;
+			eye_offset_y = wm.window_center_offset_y_m;
+		} else if (!comp_d3d11_service_get_display_dimensions(s->xsysc, &screen_width_m, &screen_height_m)) {
+			static bool logged_no_dims = false;
+			if (!logged_no_dims) {
+				logged_no_dims = true;
+				IPC_WARN(s, "ipc_try_get_sr_view_poses: get_display_dimensions FAILED, skipping SR poses");
+			}
+			return false;
 		}
-		return false;
 	}
+
+	// Shift eyes to be relative to window center (not display center)
+	left_eye.x -= eye_offset_x;
+	left_eye.y -= eye_offset_y;
+	right_eye.x -= eye_offset_x;
+	right_eye.y -= eye_offset_y;
 
 	// Log success on first successful call
 	static bool first_success = true;
 	if (first_success) {
 		first_success = false;
-		IPC_WARN(s, "ipc_try_get_sr_view_poses: SUCCESS! eye L=(%.3f,%.3f,%.3f) R=(%.3f,%.3f,%.3f) screen=%.3fx%.3fm",
+		IPC_WARN(s, "ipc_try_get_sr_view_poses: SUCCESS! eye L=(%.3f,%.3f,%.3f) R=(%.3f,%.3f,%.3f) screen=%.3fx%.3fm offset=(%.3f,%.3f)",
 		         left_eye.x, left_eye.y, left_eye.z,
 		         right_eye.x, right_eye.y, right_eye.z,
-		         screen_width_m, screen_height_m);
+		         screen_width_m, screen_height_m,
+		         eye_offset_x, eye_offset_y);
 	}
 
 	// Get qwerty device pose as "player transform"

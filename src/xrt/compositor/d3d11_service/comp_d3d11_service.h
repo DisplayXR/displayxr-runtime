@@ -18,6 +18,7 @@
 
 #include "xrt/xrt_compositor.h"
 #include "xrt/xrt_device.h"
+#include "xrt/xrt_display_metrics.h"
 #include "xrt/xrt_system.h"
 
 #ifdef __cplusplus
@@ -109,6 +110,22 @@ comp_d3d11_service_get_display_dimensions(struct xrt_system_compositor *xsysc,
  */
 bool
 comp_d3d11_service_owns_window(struct xrt_system_compositor *xsysc);
+
+/*!
+ * Get window metrics from the active D3D11 service compositor.
+ *
+ * Returns window physical dimensions and center offset from display center,
+ * used for window-relative Kooima projection in the IPC path.
+ *
+ * @param xsysc The system compositor (must be D3D11 service compositor).
+ * @param[out] out_metrics Filled with window dimensions and center offset.
+ * @return true if window metrics were obtained, false otherwise.
+ *
+ * @ingroup comp_d3d11_service
+ */
+bool
+comp_d3d11_service_get_window_metrics(struct xrt_system_compositor *xsysc,
+                                       struct xrt_window_metrics *out_metrics);
 
 /*!
  * Check if the compositor's window is still valid (not closed by user).
