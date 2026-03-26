@@ -3918,7 +3918,7 @@ comp_d3d11_service_get_window_metrics(struct xrt_system_compositor *xsysc,
 		sc = sys->active_compositor;
 	}
 
-	if (sc == nullptr || sc->hwnd == nullptr || sc->render.display_processor == nullptr) {
+	if (sc == nullptr || sc->render.hwnd == nullptr || sc->render.display_processor == nullptr) {
 		out_metrics->valid = false;
 		return false;
 	}
@@ -3948,7 +3948,7 @@ comp_d3d11_service_get_window_metrics(struct xrt_system_compositor *xsysc,
 
 	// Get window client rect
 	RECT rect;
-	if (!GetClientRect(sc->hwnd, &rect)) {
+	if (!GetClientRect(sc->render.hwnd, &rect)) {
 		out_metrics->valid = false;
 		return false;
 	}
@@ -3961,7 +3961,7 @@ comp_d3d11_service_get_window_metrics(struct xrt_system_compositor *xsysc,
 
 	// Get window screen position
 	POINT client_origin = {0, 0};
-	ClientToScreen(sc->hwnd, &client_origin);
+	ClientToScreen(sc->render.hwnd, &client_origin);
 
 	// Compute pixel size (meters per pixel)
 	float pixel_size_x = disp_w_m / (float)disp_px_w;
