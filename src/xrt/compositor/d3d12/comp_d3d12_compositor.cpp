@@ -1755,7 +1755,7 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 			return XRT_ERROR_D3D;
 		}
 		D3D12_RENDER_TARGET_VIEW_DESC rtv_desc = {};
-		rtv_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+		rtv_desc.Format = st_desc.Format;
 		rtv_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
 		c->device->CreateRenderTargetView(c->shared_texture, &rtv_desc,
 		    c->shared_texture_rtv_heap->GetCPUDescriptorHandleForHeapStart());
@@ -1833,11 +1833,16 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 			// Tell the weaver the output render target format so it can
 			// create its internal pipeline state. Without this, the weaver's
 			// pipeline state stays null and weave() silently no-ops.
+			// Use the shared texture format when available (texture apps),
+			// otherwise fall back to the swapchain format (handle apps).
+			DXGI_FORMAT output_fmt = c->has_shared_texture
+			    ? c->shared_texture->GetDesc().Format
+			    : DXGI_FORMAT_R8G8B8A8_UNORM;
 			xrt_display_processor_d3d12_set_output_format(
 			    c->display_processor,
-			    DXGI_FORMAT_R8G8B8A8_UNORM);
-			U_LOG_W("D3D12 display processor: output format set to RGBA8_UNORM (target=%p)",
-			        (void *)c->target);
+			    output_fmt);
+			U_LOG_W("D3D12 display processor: output format set to %u (target=%p)",
+			        (unsigned)output_fmt, (void *)c->target);
 		}
 	} else {
 		U_LOG_W("No D3D12 display processor factory provided");
