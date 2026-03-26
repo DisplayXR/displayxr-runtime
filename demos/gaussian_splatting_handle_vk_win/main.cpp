@@ -460,12 +460,28 @@ static void RenderThreadFunc(
                             float pxSizeY = xr->displayHeightM / dispPxH;
                             float winW_m = (float)windowW * pxSizeX;
                             float winH_m = (float)windowH * pxSizeY;
-                            float minDisp = fminf(xr->displayWidthM, xr->displayHeightM);
-                            float minWin  = fminf(winW_m, winH_m);
-                            float vs = minDisp / minWin;
+
+                            // Window-relative Kooima: compute eye offset from window center
+                            float eyeOffsetX = 0.0f, eyeOffsetY = 0.0f;
+                            {
+                                POINT clientOrigin = {0, 0};
+                                ClientToScreen(hwnd, &clientOrigin);
+                                HMONITOR hMon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+                                MONITORINFO mi = {sizeof(mi)};
+                                if (GetMonitorInfo(hMon, &mi)) {
+                                    float winCenterX = (float)(clientOrigin.x - mi.rcMonitor.left) + windowW / 2.0f;
+                                    float winCenterY = (float)(clientOrigin.y - mi.rcMonitor.top) + windowH / 2.0f;
+                                    float dispW = (float)(mi.rcMonitor.right - mi.rcMonitor.left);
+                                    float dispH = (float)(mi.rcMonitor.bottom - mi.rcMonitor.top);
+                                    eyeOffsetX = (winCenterX - dispW / 2.0f) * pxSizeX;
+                                    eyeOffsetY = -((winCenterY - dispH / 2.0f) * pxSizeY);
+                                }
+                            }
 
                             XrVector3f rawLeft = rawViews[0].pose.position;
+                            rawLeft.x -= eyeOffsetX; rawLeft.y -= eyeOffsetY;
                             XrVector3f rawRight = rawViews[1].pose.position;
+                            rawRight.x -= eyeOffsetX; rawRight.y -= eyeOffsetY;
                             if (monoMode) {
                                 XrVector3f center = {
                                     (rawLeft.x + rawRight.x) * 0.5f,
@@ -489,7 +505,7 @@ static void RenderThreadFunc(
                             displayPose.position = {inputSnapshot.cameraPosX, inputSnapshot.cameraPosY, inputSnapshot.cameraPosZ};
 
                             XrVector3f nominalViewer = {xr->nominalViewerX, xr->nominalViewerY, xr->nominalViewerZ};
-                            Display3DScreen screen = {winW_m * vs, winH_m * vs};
+                            Display3DScreen screen = {winW_m, winH_m};
 
                             XrVector3f rawEyes[2] = {rawLeft, rawRight};
                             display3d_compute_views(

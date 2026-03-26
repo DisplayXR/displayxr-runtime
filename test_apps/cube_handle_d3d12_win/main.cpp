@@ -339,14 +339,30 @@ static void RenderThreadFunc(
                             float pxSizeY = xr->displayHeightM / dispPxH;
                             float winW_m = (float)windowW * pxSizeX;
                             float winH_m = (float)windowH * pxSizeY;
-                            float minDisp = fminf(xr->displayWidthM, xr->displayHeightM);
-                            float minWin  = fminf(winW_m, winH_m);
-                            float vs = minDisp / minWin;
 
-                            // Build per-view eye positions
+                            // Window-relative Kooima: compute eye offset from window center
+                            float eyeOffsetX = 0.0f, eyeOffsetY = 0.0f;
+                            {
+                                POINT clientOrigin = {0, 0};
+                                ClientToScreen(hwnd, &clientOrigin);
+                                HMONITOR hMon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+                                MONITORINFO mi = {sizeof(mi)};
+                                if (GetMonitorInfo(hMon, &mi)) {
+                                    float winCenterX = (float)(clientOrigin.x - mi.rcMonitor.left) + windowW / 2.0f;
+                                    float winCenterY = (float)(clientOrigin.y - mi.rcMonitor.top) + windowH / 2.0f;
+                                    float dispW = (float)(mi.rcMonitor.right - mi.rcMonitor.left);
+                                    float dispH = (float)(mi.rcMonitor.bottom - mi.rcMonitor.top);
+                                    eyeOffsetX = (winCenterX - dispW / 2.0f) * pxSizeX;
+                                    eyeOffsetY = -((winCenterY - dispH / 2.0f) * pxSizeY);
+                                }
+                            }
+
+                            // Build per-view eye positions (shifted to window center)
                             std::vector<XrVector3f> rawEyes(eyeCount);
-                            for (int v = 0; v < eyeCount; v++)
-                                rawEyes[v] = (v < (int)viewCount) ? rawViews[v].pose.position : rawViews[0].pose.position;
+                            for (int v = 0; v < eyeCount; v++) {
+                                XrVector3f pos = (v < (int)viewCount) ? rawViews[v].pose.position : rawViews[0].pose.position;
+                                rawEyes[v] = {pos.x - eyeOffsetX, pos.y - eyeOffsetY, pos.z};
+                            }
 
                             // For mono: average all views to center eye
                             if (monoMode) {
@@ -365,7 +381,7 @@ static void RenderThreadFunc(
                             Display3DTunables tunables;
                             tunables.ipd_factor = inputSnapshot.viewParams.ipdFactor;
                             tunables.parallax_factor = inputSnapshot.viewParams.parallaxFactor;
-                            tunables.perspective_factor = inputSnapshot.viewParams.perspectiveFactor * vs;
+                            tunables.perspective_factor = inputSnapshot.viewParams.perspectiveFactor;
                             tunables.virtual_display_height = inputSnapshot.viewParams.virtualDisplayHeight / inputSnapshot.viewParams.scaleFactor;
 
                             XrPosef displayPose;
@@ -377,7 +393,7 @@ static void RenderThreadFunc(
                             displayPose.position = {inputSnapshot.cameraPosX, inputSnapshot.cameraPosY, inputSnapshot.cameraPosZ};
 
                             XrVector3f nominalViewer = {xr->nominalViewerX, xr->nominalViewerY, xr->nominalViewerZ};
-                            Display3DScreen screen = {winW_m * vs, winH_m * vs};
+                            Display3DScreen screen = {winW_m, winH_m};
 
                             display3d_compute_views(
                                 rawEyes.data(), eyeCount, &nominalViewer,

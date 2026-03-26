@@ -1251,14 +1251,29 @@ int main() {
                             float pxSizeY = xr.displayHeightM / dispPxH;
                             float winW_m = (float)g_windowW * pxSizeX;
                             float winH_m = (float)g_windowH * pxSizeY;
-                            float minDisp = fminf(xr.displayWidthM, xr.displayHeightM);
-                            float minWin = fminf(winW_m, winH_m);
-                            float vs = minDisp / minWin;
-                            float screenWidthM = winW_m * vs;
-                            float screenHeightM = winH_m * vs;
-                            // Kooima always uses full physical display dimensions.
-                            // The display processor (weaver) handles cropping for SBS layout.
-                            Display3DScreen screen = {screenWidthM, screenHeightM};
+
+                            // Window-relative Kooima: compute eye offset from window center
+                            float eyeOffsetX = 0.0f, eyeOffsetY = 0.0f;
+                            if (g_window != nil) {
+                                NSRect winFrame = [g_window frame];
+                                NSScreen *screen_ns = [g_window screen] ?: [NSScreen mainScreen];
+                                NSRect screenFrame = [screen_ns frame];
+                                float winCenterX = (winFrame.origin.x - screenFrame.origin.x) + winFrame.size.width / 2.0f;
+                                float winCenterY = (winFrame.origin.y - screenFrame.origin.y) + winFrame.size.height / 2.0f;
+                                float dispCenterX = screenFrame.size.width / 2.0f;
+                                float dispCenterY = screenFrame.size.height / 2.0f;
+                                CGFloat backingScale = [g_window backingScaleFactor];
+                                float pxSizeXBacking = pxSizeX / (float)backingScale;
+                                float pxSizeYBacking = pxSizeY / (float)backingScale;
+                                eyeOffsetX = (winCenterX - dispCenterX) * pxSizeXBacking;
+                                eyeOffsetY = (winCenterY - dispCenterY) * pxSizeYBacking;
+                            }
+
+                            // Apply window center offset to raw eye positions
+                            rawEyePos[0].x -= eyeOffsetX; rawEyePos[0].y -= eyeOffsetY;
+                            rawEyePos[1].x -= eyeOffsetX; rawEyePos[1].y -= eyeOffsetY;
+
+                            Display3DScreen screen = {winW_m, winH_m};
                             Display3DTunables tunables;
                             tunables.ipd_factor = g_input.viewParams.ipdFactor;
                             tunables.parallax_factor = g_input.viewParams.parallaxFactor;

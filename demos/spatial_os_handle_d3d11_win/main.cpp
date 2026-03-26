@@ -313,12 +313,28 @@ static void RenderOneFrame(RenderState& rs) {
                         float pxSizeY = xr.displayHeightM / (float)xr.swapchain.height;
                         float winW_m = (float)g_windowWidth * pxSizeX;
                         float winH_m = (float)g_windowHeight * pxSizeY;
-                        float minDisp = fminf(xr.displayWidthM, xr.displayHeightM);
-                        float minWin = fminf(winW_m, winH_m);
-                        float vs = minDisp / minWin;
+
+                        // Window-relative Kooima: compute eye offset from window center
+                        float eyeOffsetX = 0.0f, eyeOffsetY = 0.0f;
+                        {
+                            POINT clientOrigin = {0, 0};
+                            ClientToScreen(rs.hwnd, &clientOrigin);
+                            HMONITOR hMon = MonitorFromWindow(rs.hwnd, MONITOR_DEFAULTTONEAREST);
+                            MONITORINFO mi = {sizeof(mi)};
+                            if (GetMonitorInfo(hMon, &mi)) {
+                                float winCenterX = (float)(clientOrigin.x - mi.rcMonitor.left) + g_windowWidth / 2.0f;
+                                float winCenterY = (float)(clientOrigin.y - mi.rcMonitor.top) + g_windowHeight / 2.0f;
+                                float dispW = (float)(mi.rcMonitor.right - mi.rcMonitor.left);
+                                float dispH = (float)(mi.rcMonitor.bottom - mi.rcMonitor.top);
+                                eyeOffsetX = (winCenterX - dispW / 2.0f) * pxSizeX;
+                                eyeOffsetY = -((winCenterY - dispH / 2.0f) * pxSizeY);
+                            }
+                        }
 
                         XrVector3f rawLeft = rawViews[0].pose.position;
+                        rawLeft.x -= eyeOffsetX; rawLeft.y -= eyeOffsetY;
                         XrVector3f rawRight = rawViews[1].pose.position;
+                        rawRight.x -= eyeOffsetX; rawRight.y -= eyeOffsetY;
                         if (appMonoMode) {
                             XrVector3f center = {
                                 (rawLeft.x + rawRight.x) * 0.5f,
@@ -335,7 +351,7 @@ static void RenderOneFrame(RenderState& rs) {
                         cameraPose.position = {g_inputState.cameraPosX, g_inputState.cameraPosY, g_inputState.cameraPosZ};
 
                         XrVector3f nominalViewer = {xr.nominalViewerX, xr.nominalViewerY, xr.nominalViewerZ};
-                        Display3DScreen screen = {winW_m * vs, winH_m * vs};
+                        Display3DScreen screen = {winW_m, winH_m};
 
                         if (g_inputState.cameraMode) {
                             Camera3DTunables camTunables;
