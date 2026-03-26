@@ -612,13 +612,28 @@ static void RenderOneFrame(RenderState& rs) {
                         float pxSizeY = xr.displayHeightM / (float)xr.displayPixelHeight;
                         float winW_m = (float)g_canvasW * pxSizeX;
                         float winH_m = (float)g_canvasH * pxSizeY;
-                        float minDisp = fminf(xr.displayWidthM, xr.displayHeightM);
-                        float minWin  = fminf(winW_m, winH_m);
-                        float vs = minDisp / minWin;
+
+                        // Window-relative Kooima: compute eye offset from window center
+                        float eyeOffsetX = 0.0f, eyeOffsetY = 0.0f;
+                        {
+                            POINT clientOrigin = {0, 0};
+                            ClientToScreen(rs.hwnd, &clientOrigin);
+                            HMONITOR hMon = MonitorFromWindow(rs.hwnd, MONITOR_DEFAULTTONEAREST);
+                            MONITORINFO mi = {sizeof(mi)};
+                            if (GetMonitorInfo(hMon, &mi)) {
+                                float winCenterX = (float)(clientOrigin.x - mi.rcMonitor.left) + g_canvasW / 2.0f;
+                                float winCenterY = (float)(clientOrigin.y - mi.rcMonitor.top) + g_canvasH / 2.0f;
+                                float dispW = (float)(mi.rcMonitor.right - mi.rcMonitor.left);
+                                float dispH = (float)(mi.rcMonitor.bottom - mi.rcMonitor.top);
+                                eyeOffsetX = (winCenterX - dispW / 2.0f) * pxSizeX;
+                                eyeOffsetY = -((winCenterY - dispH / 2.0f) * pxSizeY);
+                            }
+                        }
 
                         std::vector<XrVector3f> rawEyes(modeViewCount);
                         for (uint32_t v = 0; v < modeViewCount; v++) {
-                            rawEyes[v] = (v < viewCount) ? rawViews[v].pose.position : rawViews[0].pose.position;
+                            XrVector3f pos = (v < viewCount) ? rawViews[v].pose.position : rawViews[0].pose.position;
+                            rawEyes[v] = {pos.x - eyeOffsetX, pos.y - eyeOffsetY, pos.z};
                         }
                         if (monoMode && modeViewCount >= 2) {
                             XrVector3f center = {0, 0, 0};
@@ -642,7 +657,7 @@ static void RenderOneFrame(RenderState& rs) {
                         cameraPose.position = {g_inputState.cameraPosX, g_inputState.cameraPosY, g_inputState.cameraPosZ};
 
                         XrVector3f nominalViewer = {xr.nominalViewerX, xr.nominalViewerY, xr.nominalViewerZ};
-                        Display3DScreen screen = {winW_m * vs, winH_m * vs};
+                        Display3DScreen screen = {winW_m, winH_m};
 
                         if (g_inputState.cameraMode) {
                             Camera3DTunables camTunables;
@@ -667,7 +682,7 @@ static void RenderOneFrame(RenderState& rs) {
                             Display3DTunables tunables;
                             tunables.ipd_factor = g_inputState.viewParams.ipdFactor;
                             tunables.parallax_factor = g_inputState.viewParams.parallaxFactor;
-                            tunables.perspective_factor = g_inputState.viewParams.perspectiveFactor * vs;
+                            tunables.perspective_factor = g_inputState.viewParams.perspectiveFactor;
                             tunables.virtual_display_height = g_inputState.viewParams.virtualDisplayHeight / g_inputState.viewParams.scaleFactor;
 
                             display3d_compute_views(

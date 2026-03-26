@@ -1643,14 +1643,34 @@ int main(int argc, char **argv)
                 float pxSizeY = app.displayHeightM / dispPxH;
                 float winW_m = (float)g_windowW * pxSizeX;
                 float winH_m = (float)g_windowH * pxSizeY;
-                float minDisp = fminf(app.displayWidthM, app.displayHeightM);
-                float minWin  = fminf(winW_m, winH_m);
-                float vs = minDisp / minWin;
-                float screenWidthM  = winW_m * vs;
-                float screenHeightM = winH_m * vs;
+
+                // Window-relative Kooima: compute eye offset from window center
+                float eyeOffsetX = 0.0f, eyeOffsetY = 0.0f;
+                if (g_window != nil) {
+                    NSRect winFrame = [g_window frame];
+                    NSScreen *screen_ns = [g_window screen] ?: [NSScreen mainScreen];
+                    NSRect screenFrame = [screen_ns frame];
+                    // macOS: origin is bottom-left, Y-up — matches eye coords
+                    float winCenterX = (winFrame.origin.x - screenFrame.origin.x) + winFrame.size.width / 2.0f;
+                    float winCenterY = (winFrame.origin.y - screenFrame.origin.y) + winFrame.size.height / 2.0f;
+                    float dispCenterX = screenFrame.size.width / 2.0f;
+                    float dispCenterY = screenFrame.size.height / 2.0f;
+                    CGFloat backingScale = [g_window backingScaleFactor];
+                    float pxSizeXBacking = pxSizeX / (float)backingScale;
+                    float pxSizeYBacking = pxSizeY / (float)backingScale;
+                    eyeOffsetX = (winCenterX - dispCenterX) * pxSizeXBacking;
+                    eyeOffsetY = (winCenterY - dispCenterY) * pxSizeYBacking;
+                }
+
+                // Apply window center offset to raw eye positions
+                for (uint32_t v = 0; v < modeViewCount; v++) {
+                    rawEyePos[v].x -= eyeOffsetX;
+                    rawEyePos[v].y -= eyeOffsetY;
+                }
+
                 Display3DScreen screen;
-                screen.width_m = screenWidthM;
-                screen.height_m = screenHeightM;
+                screen.width_m = winW_m;
+                screen.height_m = winH_m;
 
                 if (g_input.cameraMode) {
                     Camera3DTunables camTunables;
@@ -1675,7 +1695,7 @@ int main(int argc, char **argv)
                     Display3DTunables tunables;
                     tunables.ipd_factor = g_input.viewParams.ipdFactor;
                     tunables.parallax_factor = g_input.viewParams.parallaxFactor;
-                    tunables.perspective_factor = g_input.viewParams.perspectiveFactor * vs;
+                    tunables.perspective_factor = g_input.viewParams.perspectiveFactor;
                     tunables.virtual_display_height = g_input.viewParams.virtualDisplayHeight / g_input.viewParams.scaleFactor;
 
                     display3d_compute_views(

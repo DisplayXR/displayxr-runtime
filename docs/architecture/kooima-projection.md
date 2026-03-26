@@ -321,6 +321,42 @@ base FOV, not from screen geometry.
 
 ---
 
+## Windowed Mode: Window-Relative Kooima
+
+When the app runs in a window smaller than the full display, the Kooima
+inputs are adjusted so the projection matches the physical window geometry.
+See `docs/adr/ADR-012-window-relative-kooima-projection.md` for the full
+rationale.
+
+### Adjustment (applied before either pipeline)
+
+1. **Screen dimensions** = window physical size in meters (not display size).
+2. **Eye offset**: subtract the window center offset from each raw eye
+   position so eyes are relative to the window center, not the display
+   center.
+
+```
+pixel_size   = display_meters / display_pixels
+window_m     = window_pixels * pixel_size
+eye_offset   = (window_center - display_center) * pixel_size   (in meters)
+
+screen       = {window_width_m, window_height_m}
+raw_eye.xy  -= eye_offset.xy
+```
+
+The `m2v` factor (`virtual_display_height / screen_height_m`) naturally
+grows as the window shrinks, producing correct perspective scaling.  No
+artificial `vs` viewport-scale multiplication is needed.
+
+### Where the adjustment lives
+
+| Path | Location |
+|------|----------|
+| Runtime (hosted apps, FOV-only) | `oxr_session.c` — subtracts `window_center_offset_{x,y}_m` from `raw_eyes[]` |
+| App-side (handle/texture apps) | Each app's render loop — uses `ClientToScreen`/`MonitorFromWindow` (Win32) or `NSWindow.frame`/`NSScreen.frame` (macOS) |
+
+---
+
 ## Matrix Convention
 
 All output matrices are **column-major** (OpenGL / Vulkan / Metal order).
