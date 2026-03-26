@@ -3899,6 +3899,107 @@ comp_d3d11_service_get_display_dimensions(struct xrt_system_compositor *xsysc,
 }
 
 bool
+comp_d3d11_service_get_window_metrics(struct xrt_system_compositor *xsysc,
+                                       struct xrt_window_metrics *out_metrics)
+{
+	if (xsysc == nullptr || out_metrics == nullptr) {
+		if (out_metrics != nullptr) {
+			out_metrics->valid = false;
+		}
+		return false;
+	}
+
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+
+	// Get active compositor's window metrics (same as in-process path)
+	struct d3d11_service_compositor *sc = nullptr;
+	{
+		std::lock_guard<std::mutex> lock(sys->active_compositor_mutex);
+		sc = sys->active_compositor;
+	}
+
+	if (sc == nullptr || sc->hwnd == nullptr || sc->render.display_processor == nullptr) {
+		out_metrics->valid = false;
+		return false;
+	}
+
+	// Get display pixel info from display processor
+	uint32_t disp_px_w = 0, disp_px_h = 0;
+	int32_t disp_left = 0, disp_top = 0;
+	if (!xrt_display_processor_d3d11_get_display_pixel_info(
+	        sc->render.display_processor, &disp_px_w, &disp_px_h,
+	        &disp_left, &disp_top)) {
+		out_metrics->valid = false;
+		return false;
+	}
+
+	if (disp_px_w == 0 || disp_px_h == 0) {
+		out_metrics->valid = false;
+		return false;
+	}
+
+	// Get physical display dimensions
+	float disp_w_m = 0.0f, disp_h_m = 0.0f;
+	if (!xrt_display_processor_d3d11_get_display_dimensions(
+	        sc->render.display_processor, &disp_w_m, &disp_h_m)) {
+		out_metrics->valid = false;
+		return false;
+	}
+
+	// Get window client rect
+	RECT rect;
+	if (!GetClientRect(sc->hwnd, &rect)) {
+		out_metrics->valid = false;
+		return false;
+	}
+	uint32_t win_px_w = static_cast<uint32_t>(rect.right - rect.left);
+	uint32_t win_px_h = static_cast<uint32_t>(rect.bottom - rect.top);
+	if (win_px_w == 0 || win_px_h == 0) {
+		out_metrics->valid = false;
+		return false;
+	}
+
+	// Get window screen position
+	POINT client_origin = {0, 0};
+	ClientToScreen(sc->hwnd, &client_origin);
+
+	// Compute pixel size (meters per pixel)
+	float pixel_size_x = disp_w_m / (float)disp_px_w;
+	float pixel_size_y = disp_h_m / (float)disp_px_h;
+
+	// Window physical size
+	float win_w_m = (float)win_px_w * pixel_size_x;
+	float win_h_m = (float)win_px_h * pixel_size_y;
+
+	// Window center offset in meters
+	float win_center_px_x = (float)(client_origin.x - disp_left) + (float)win_px_w / 2.0f;
+	float win_center_px_y = (float)(client_origin.y - disp_top) + (float)win_px_h / 2.0f;
+	float disp_center_px_x = (float)disp_px_w / 2.0f;
+	float disp_center_px_y = (float)disp_px_h / 2.0f;
+	float offset_x_m = (win_center_px_x - disp_center_px_x) * pixel_size_x;
+	float offset_y_m = -((win_center_px_y - disp_center_px_y) * pixel_size_y);
+
+	memset(out_metrics, 0, sizeof(*out_metrics));
+	out_metrics->display_width_m = disp_w_m;
+	out_metrics->display_height_m = disp_h_m;
+	out_metrics->display_pixel_width = disp_px_w;
+	out_metrics->display_pixel_height = disp_px_h;
+	out_metrics->display_screen_left = disp_left;
+	out_metrics->display_screen_top = disp_top;
+	out_metrics->window_pixel_width = win_px_w;
+	out_metrics->window_pixel_height = win_px_h;
+	out_metrics->window_screen_left = static_cast<int32_t>(client_origin.x);
+	out_metrics->window_screen_top = static_cast<int32_t>(client_origin.y);
+	out_metrics->window_width_m = win_w_m;
+	out_metrics->window_height_m = win_h_m;
+	out_metrics->window_center_offset_x_m = offset_x_m;
+	out_metrics->window_center_offset_y_m = offset_y_m;
+	out_metrics->valid = true;
+
+	return true;
+}
+
+bool
 comp_d3d11_service_owns_window(struct xrt_system_compositor *xsysc)
 {
 	// NOTE: With per-client windows, this function now applies to the default
