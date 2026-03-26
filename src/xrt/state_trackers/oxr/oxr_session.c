@@ -1253,30 +1253,30 @@ oxr_session_locate_views(struct oxr_logger *log,
 		if (have_eye_positions) {
 			float screen_width_m = 0.0f;
 			float screen_height_m = 0.0f;
-			float vs = 1.0f; // viewport scale for non-fullscreen correction
+			float eye_offset_x = 0.0f; // window center offset from display center (meters)
+			float eye_offset_y = 0.0f;
 
 			struct xrt_window_metrics wm = {0};
 			bool have_wm = oxr_session_get_window_metrics(sess, &wm);
 
 			if (have_wm && wm.valid && wm.window_width_m > 0.0f && wm.window_height_m > 0.0f) {
-				// SRHydra viewport scale formula
-				float min_disp = fminf(wm.display_width_m, wm.display_height_m);
-				float min_win  = fminf(wm.window_width_m, wm.window_height_m);
-				vs = min_disp / min_win;
-
-				screen_width_m  = wm.window_width_m * vs;
-				screen_height_m = wm.window_height_m * vs;
+				// Window-relative Kooima: use actual window dims as screen,
+				// offset eyes to be relative to window center (not display center)
+				screen_width_m  = wm.window_width_m;
+				screen_height_m = wm.window_height_m;
+				eye_offset_x = wm.window_center_offset_x_m;
+				eye_offset_y = wm.window_center_offset_y_m;
 
 				if (should_log) {
-					U_LOG_I("Window-adaptive FOV: vs=%.3f, screen=%.4fx%.4fm, "
+					U_LOG_I("Window-relative Kooima: screen=%.4fx%.4fm, "
 					        "eye_offset=(%.4f,%.4f)m",
-					        vs, screen_width_m, screen_height_m,
-					        wm.window_center_offset_x_m, wm.window_center_offset_y_m);
+					        screen_width_m, screen_height_m,
+					        eye_offset_x, eye_offset_y);
 				}
 			} else if (oxr_session_get_display_dimensions(sess, &screen_width_m, &screen_height_m) &&
 			           screen_width_m > 0.0f && screen_height_m > 0.0f) {
 				// Fallback: full display dimensions (fullscreen or no window metrics)
-				// Kooima always uses full physical display — display processor handles cropping/layout
+				// eye_offset stays (0,0) — identity behavior
 			}
 
 			if (should_log) {
@@ -1292,7 +1292,11 @@ oxr_session_locate_views(struct oxr_logger *log,
 				struct xrt_vec3 nominal = {0, si->nominal_viewer_y_m, si->nominal_viewer_z_m};
 				struct xrt_vec3 raw_eyes[XRT_MAX_VIEWS];
 				for (uint32_t ei = 0; ei < eye_count; ei++) {
-					raw_eyes[ei] = (struct xrt_vec3){adj_eyes[ei].x, adj_eyes[ei].y, adj_eyes[ei].z};
+					// Shift eyes to be relative to window center (not display center)
+					raw_eyes[ei] = (struct xrt_vec3){
+					    adj_eyes[ei].x - eye_offset_x,
+					    adj_eyes[ei].y - eye_offset_y,
+					    adj_eyes[ei].z};
 				}
 				Display3DScreen scr = {screen_width_m, screen_height_m};
 				struct xrt_pose display_pose = {
@@ -1326,7 +1330,7 @@ oxr_session_locate_views(struct oxr_logger *log,
 					if (have_view_state && !sess->has_external_window) {
 						dt.ipd_factor = view_state.disp_spread_factor;
 						dt.parallax_factor = view_state.disp_parallax_factor;
-						dt.perspective_factor = vs;
+						dt.perspective_factor = 1.0f;
 						dt.virtual_display_height = view_state.disp_vHeight;
 					} else {
 						dt.virtual_display_height = screen_height_m; // identity m2v
