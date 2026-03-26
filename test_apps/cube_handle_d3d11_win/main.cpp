@@ -340,19 +340,36 @@ static void RenderOneFrame(RenderState& rs) {
                     std::vector<Display3DView> stereoViews(eyeCount);
                     bool useAppProjection = (xr.hasDisplayInfoExt && xr.displayWidthM > 0.0f);
                     if (useAppProjection) {
-                        // Viewport-scaled screen dims (hoisted — shared by stereo & mono)
+                        // Window-relative Kooima: use actual window physical dims as screen,
+                        // offset eyes to be relative to window center (not display center)
                         float pxSizeX = xr.displayWidthM / (float)xr.swapchain.width;
                         float pxSizeY = xr.displayHeightM / (float)xr.swapchain.height;
                         float winW_m = (float)g_windowWidth * pxSizeX;
                         float winH_m = (float)g_windowHeight * pxSizeY;
-                        float minDisp = fminf(xr.displayWidthM, xr.displayHeightM);
-                        float minWin  = fminf(winW_m, winH_m);
-                        float vs = minDisp / minWin;
 
-                        // Build per-view eye positions
+                        // Compute window center offset from display center (meters)
+                        float eyeOffsetX = 0.0f, eyeOffsetY = 0.0f;
+                        {
+                            POINT clientOrigin = {0, 0};
+                            ClientToScreen(rs.hwnd, &clientOrigin);
+                            HMONITOR hMon = MonitorFromWindow(rs.hwnd, MONITOR_DEFAULTTONEAREST);
+                            MONITORINFO mi = {sizeof(mi)};
+                            if (GetMonitorInfo(hMon, &mi)) {
+                                float winCenterX = (float)(clientOrigin.x - mi.rcMonitor.left) + g_windowWidth / 2.0f;
+                                float winCenterY = (float)(clientOrigin.y - mi.rcMonitor.top) + g_windowHeight / 2.0f;
+                                float dispW = (float)(mi.rcMonitor.right - mi.rcMonitor.left);
+                                float dispH = (float)(mi.rcMonitor.bottom - mi.rcMonitor.top);
+                                eyeOffsetX = (winCenterX - dispW / 2.0f) * pxSizeX;
+                                eyeOffsetY = -((winCenterY - dispH / 2.0f) * pxSizeY); // Y flip: screen Y-down, eye Y-up
+                            }
+                        }
+
+                        // Build per-view eye positions (shifted to window center)
                         std::vector<XrVector3f> rawEyes(eyeCount);
-                        for (int v = 0; v < eyeCount; v++)
-                            rawEyes[v] = (v < (int)viewCount) ? rawViews[v].pose.position : rawViews[0].pose.position;
+                        for (int v = 0; v < eyeCount; v++) {
+                            XrVector3f pos = (v < (int)viewCount) ? rawViews[v].pose.position : rawViews[0].pose.position;
+                            rawEyes[v] = {pos.x - eyeOffsetX, pos.y - eyeOffsetY, pos.z};
+                        }
 
                         // For mono: average all views to center eye
                         if (monoMode) {
@@ -378,7 +395,7 @@ static void RenderOneFrame(RenderState& rs) {
                         cameraPose.position = {g_inputState.cameraPosX, g_inputState.cameraPosY, g_inputState.cameraPosZ};
 
                         XrVector3f nominalViewer = {xr.nominalViewerX, xr.nominalViewerY, xr.nominalViewerZ};
-                        Display3DScreen screen = {winW_m * vs, winH_m * vs};
+                        Display3DScreen screen = {winW_m, winH_m};
 
                         if (g_inputState.cameraMode) {
                             // Camera-centric path
@@ -406,7 +423,7 @@ static void RenderOneFrame(RenderState& rs) {
                             Display3DTunables tunables;
                             tunables.ipd_factor = g_inputState.viewParams.ipdFactor;
                             tunables.parallax_factor = g_inputState.viewParams.parallaxFactor;
-                            tunables.perspective_factor = g_inputState.viewParams.perspectiveFactor * vs;
+                            tunables.perspective_factor = g_inputState.viewParams.perspectiveFactor;
                             tunables.virtual_display_height = g_inputState.viewParams.virtualDisplayHeight / g_inputState.viewParams.scaleFactor;
 
                             display3d_compute_views(
