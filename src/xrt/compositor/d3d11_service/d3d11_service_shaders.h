@@ -474,6 +474,8 @@ struct BlitConstants
 	float dst_size[2];      // destination texture size
 	float convert_srgb;     // 1.0 if source is SRGB, 0.0 otherwise
 	float padding;
+	float dst_rect_wh[2];   // destination quad width, height (0 = use src_rect.zw)
+	float padding2[2];
 };
 
 //! Vertex shader for projection blit - draws a quad at specified destination
@@ -486,6 +488,8 @@ cbuffer BlitCB : register(b0)
     float2 dst_size;      // destination texture size
     float convert_srgb;   // 1.0 if source is SRGB
     float padding;
+    float2 dst_rect_wh;   // destination quad width, height (0 = use src_rect.zw)
+    float2 padding2;
 };
 
 struct VS_OUTPUT
@@ -508,9 +512,11 @@ VS_OUTPUT VSMain(uint vertex_id : SV_VertexID)
 
     float2 uv = positions[vertex_id % 4];
 
+    // Destination quad size: use dst_rect_wh if set, else src_rect.zw (1:1)
+    float2 quad_size = (dst_rect_wh.x > 0) ? dst_rect_wh : src_rect.zw;
+
     // Calculate destination position in NDC
-    // dst_offset is where to place the quad, src_rect.zw is the size
-    float2 dst_pos = dst_offset + uv * src_rect.zw;
+    float2 dst_pos = dst_offset + uv * quad_size;
 
     // Convert to NDC [-1, 1]
     float2 ndc = (dst_pos / dst_size) * 2.0 - 1.0;
@@ -518,8 +524,7 @@ VS_OUTPUT VSMain(uint vertex_id : SV_VertexID)
 
     output.position = float4(ndc, 0.0, 1.0);
 
-    // Calculate source UV
-    // src_rect.xy is offset, src_rect.zw is extent
+    // Calculate source UV — always from src_rect (independent of dest size)
     float2 src_pos = src_rect.xy + uv * src_rect.zw;
     output.uv = src_pos / src_size;
 
@@ -537,6 +542,8 @@ cbuffer BlitCB : register(b0)
     float2 dst_size;
     float convert_srgb;
     float padding;
+    float2 dst_rect_wh;
+    float2 padding2;
 };
 
 Texture2D src_tex : register(t0);
