@@ -237,6 +237,7 @@ See `docs/README.md` for a complete index. Key docs by task:
 | Understand eye tracking MANAGED/MANUAL contract | `docs/specs/eye-tracking-modes.md` |
 | Add a new OpenXR extension | `docs/guides/implementing-extension.md` |
 | Write a device driver | `docs/guides/writing-driver.md` |
+| Understand Leia SR DX weaver internals | `docs/reference/leia-sr-dx-weaving.md` |
 | Understand Kooima projection math | `docs/architecture/kooima-projection.md` |
 | Understand the compositor pipeline | `docs/architecture/compositor-pipeline.md` |
 | Understand the swapchain model / canvas | `docs/specs/swapchain-model.md` |
