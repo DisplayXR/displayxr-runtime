@@ -417,11 +417,10 @@ static void RenderThreadFunc(
                             if (renderH > maxTileH) renderH = maxTileH;
                         }
 
-                        // Build N-view raw eye positions (shifted to window center)
+                        // Build N-view raw eye positions
                         std::vector<XrVector3f> rawEyes(eyeCount);
                         for (int v = 0; v < eyeCount; v++) {
-                            XrVector3f pos = (v < (int)viewCount) ? rawViews[v].pose.position : rawViews[0].pose.position;
-                            rawEyes[v] = {pos.x - eyeOffsetX, pos.y - eyeOffsetY, pos.z};
+                            rawEyes[v] = (v < (int)viewCount) ? rawViews[v].pose.position : rawViews[0].pose.position;
                         }
 
                         // In mono mode, average all eye positions to center
@@ -465,6 +464,12 @@ static void RenderThreadFunc(
                                     eyeOffsetX = (winCenterX - dispW / 2.0f) * pxSizeX;
                                     eyeOffsetY = -((winCenterY - dispH / 2.0f) * pxSizeY);
                                 }
+                            }
+
+                            // Apply window center offset to raw eye positions
+                            for (int v = 0; v < eyeCount; v++) {
+                                rawEyes[v].x -= eyeOffsetX;
+                                rawEyes[v].y -= eyeOffsetY;
                             }
 
                             Display3DTunables tunables;
