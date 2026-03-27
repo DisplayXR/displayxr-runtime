@@ -2938,10 +2938,14 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			                     sys->view_width, sys->view_height,
 			                     &tile_x, &tile_y);
 
-			// Destination tile dimensions — when client swapchain > atlas tile,
-			// the shader blit scales the source to fit (#102).
+			// When client swapchain > atlas tile (window resized smaller),
+			// scale source to fit tile. Otherwise use 1:1 placement and
+			// let the crop-blit handle any excess (#102).
 			float tile_w = static_cast<float>(sys->view_width);
 			float tile_h = static_cast<float>(sys->view_height);
+			bool needs_scale = (src_w > tile_w || src_h > tile_h);
+			float dst_w = needs_scale ? tile_w : 0.0f;
+			float dst_h = needs_scale ? tile_h : 0.0f;
 
 			if (view_is_srgb[eye] && sys->blit_vs && view_scs[eye]->images[view_img_indices[eye]].srv) {
 				wil::com_ptr<ID3D11ShaderResourceView> srgb_srv;
@@ -2957,33 +2961,30 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 					                       src_x, src_y, src_w, src_h,
 					                       static_cast<float>(view_descs[eye].Width), static_cast<float>(view_descs[eye].Height),
 					                       static_cast<float>(tile_x), static_cast<float>(tile_y),
-					                       tile_w, tile_h,
+					                       dst_w, dst_h,
 					                       true);  // is_srgb = true
 				} else {
 					U_LOG_W("Failed to create SRGB SRV for view %u, falling back to copy", eye);
-					// CopySubresourceRegion can't scale — clamp to tile dims
-					uint32_t copy_w = (src_w > tile_w) ? (uint32_t)tile_w : (uint32_t)src_w;
-					uint32_t copy_h = (src_h > tile_h) ? (uint32_t)tile_h : (uint32_t)src_h;
 					D3D11_BOX box = {};
 					box.left = static_cast<UINT>(src_x);
 					box.top = static_cast<UINT>(src_y);
-					box.right = static_cast<UINT>(src_x) + copy_w;
-					box.bottom = static_cast<UINT>(src_y) + copy_h;
+					box.right = static_cast<UINT>(src_x + src_w);
+					box.bottom = static_cast<UINT>(src_y + src_h);
 					box.front = 0;
 					box.back = 1;
+					// D3D11 CopySubresourceRegion silently clips to dest bounds
 					sys->context->CopySubresourceRegion(c->render.atlas_texture.get(), 0,
 					                                     tile_x, tile_y, 0,
 					                                     view_textures[eye], layer->data.proj.v[eye].sub.array_index, &box);
 				}
 			} else {
-				// Non-SRGB: use fast CopySubresourceRegion (clamp to tile dims)
-				uint32_t copy_w = (src_w > tile_w) ? (uint32_t)tile_w : (uint32_t)src_w;
-				uint32_t copy_h = (src_h > tile_h) ? (uint32_t)tile_h : (uint32_t)src_h;
+				// Non-SRGB: use fast CopySubresourceRegion
+				// D3D11 silently clips to destination bounds — no manual clamping needed
 				D3D11_BOX box = {};
 				box.left = static_cast<UINT>(src_x);
 				box.top = static_cast<UINT>(src_y);
-				box.right = static_cast<UINT>(src_x) + copy_w;
-				box.bottom = static_cast<UINT>(src_y) + copy_h;
+				box.right = static_cast<UINT>(src_x + src_w);
+				box.bottom = static_cast<UINT>(src_y + src_h);
 				box.front = 0;
 				box.back = 1;
 
