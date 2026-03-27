@@ -3307,10 +3307,26 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 					ID3D11RenderTargetView *rtvs[] = {c->render.back_buffer_rtv.get()};
 					sys->context->OMSetRenderTargets(1, rtvs, nullptr);
 
-					// Viewport fills the entire back buffer — stretches the quad
+					// Get actual back buffer size (may differ from output_width
+					// after window resize — must match render target for correct
+					// viewport-to-NDC mapping)
+					uint32_t bb_w = sys->output_width;
+					uint32_t bb_h = sys->output_height;
+					if (c->render.back_buffer_rtv) {
+						wil::com_ptr<ID3D11Resource> bb_res;
+						c->render.back_buffer_rtv->GetResource(bb_res.put());
+						wil::com_ptr<ID3D11Texture2D> bb_tex;
+						if (SUCCEEDED(bb_res->QueryInterface(IID_PPV_ARGS(bb_tex.put())))) {
+							D3D11_TEXTURE2D_DESC bb_desc = {};
+							bb_tex->GetDesc(&bb_desc);
+							bb_w = bb_desc.Width;
+							bb_h = bb_desc.Height;
+						}
+					}
+
 					D3D11_VIEWPORT vp = {};
-					vp.Width = static_cast<float>(sys->output_width);
-					vp.Height = static_cast<float>(sys->output_height);
+					vp.Width = static_cast<float>(bb_w);
+					vp.Height = static_cast<float>(bb_h);
 					vp.MaxDepth = 1.0f;
 					sys->context->RSSetViewports(1, &vp);
 
