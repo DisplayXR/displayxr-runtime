@@ -3238,9 +3238,10 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		input_view_h = content_view_h;
 	}
 
-	// Process stereo texture through display processor for display output
-	// Skip processing for mono — display is in 2D mode, no interlacing needed
-	if (sys->hardware_display_3d && c->render.display_processor != nullptr && input_srv) {
+	// Always pass through the display processor — both 3D (weaving) and 2D
+	// (stretch-blit). This matches the in-process compositor path where
+	// process_atlas() handles all display modes. No separate mono blit needed.
+	if (c->render.display_processor != nullptr && input_srv) {
 		// Bind back buffer as output
 		ID3D11RenderTargetView *rtvs[] = {c->render.back_buffer_rtv.get()};
 		sys->context->OMSetRenderTargets(1, rtvs, nullptr);
@@ -3266,128 +3267,17 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		    DXGI_FORMAT_R8G8B8A8_UNORM, back_buffer_width, back_buffer_height,
 		    0, 0, 0, 0);
 		weaving_done = true;
-	} else {
-		// No display processor or mono — copy to back buffer directly
-		if (c->render.back_buffer_rtv) {
-			wil::com_ptr<ID3D11Resource> back_buffer;
-			c->render.back_buffer_rtv->GetResource(back_buffer.put());
-
-			if (!sys->hardware_display_3d) {
-				// MONO / forced 2D: stretch-blit left eye to fill entire back buffer.
-				// The source is SBS (2*view_width x view_height); we sample only the
-				// left half and stretch it to the full back buffer via a GPU blit.
-				ID3D11ShaderResourceView *src_srv = nullptr;
-				uint32_t eye_w = 0, eye_h = 0;
-				uint32_t tex_w = 0, tex_h = 0;
-
-				if (use_zero_copy && zc_srv) {
-					src_srv = zc_srv.get();
-					eye_w = zc_view_w;
-					eye_h = zc_view_h;
-					tex_w = sys->tile_columns * zc_view_w;
-					tex_h = sys->tile_rows * zc_view_h;
-				} else if (c->render.crop_srv) {
-					// Use content-sized crop texture (correct UV mapping)
-					src_srv = c->render.crop_srv.get();
-					eye_w = content_view_w;
-					eye_h = content_view_h;
-					tex_w = sys->tile_columns * content_view_w;
-					tex_h = sys->tile_rows * content_view_h;
-				} else if (c->render.atlas_srv) {
-					// Atlas is content-sized (no crop needed)
-					src_srv = c->render.atlas_srv.get();
-					eye_w = content_view_w;
-					eye_h = content_view_h;
-					tex_w = sys->tile_columns * content_view_w;
-					tex_h = sys->tile_rows * content_view_h;
-				}
-
-				if (src_srv != nullptr) {
-					// Bind back buffer as render target
-					ID3D11RenderTargetView *rtvs[] = {c->render.back_buffer_rtv.get()};
-					sys->context->OMSetRenderTargets(1, rtvs, nullptr);
-
-					// Get actual back buffer size (may differ from output_width
-					// after window resize — must match render target for correct
-					// viewport-to-NDC mapping)
-					uint32_t bb_w = sys->output_width;
-					uint32_t bb_h = sys->output_height;
-					if (c->render.back_buffer_rtv) {
-						wil::com_ptr<ID3D11Resource> bb_res;
-						c->render.back_buffer_rtv->GetResource(bb_res.put());
-						wil::com_ptr<ID3D11Texture2D> bb_tex;
-						if (SUCCEEDED(bb_res->QueryInterface(IID_PPV_ARGS(bb_tex.put())))) {
-							D3D11_TEXTURE2D_DESC bb_desc = {};
-							bb_tex->GetDesc(&bb_desc);
-							bb_w = bb_desc.Width;
-							bb_h = bb_desc.Height;
-						}
-					}
-
-					D3D11_VIEWPORT vp = {};
-					vp.Width = static_cast<float>(bb_w);
-					vp.Height = static_cast<float>(bb_h);
-					vp.MaxDepth = 1.0f;
-					sys->context->RSSetViewports(1, &vp);
-
-					// Pipeline state
-					sys->context->IASetPrimitiveTopology(
-					    D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-					sys->context->IASetInputLayout(nullptr);
-					sys->context->VSSetShader(sys->blit_vs.get(), nullptr, 0);
-					sys->context->PSSetShader(sys->blit_ps.get(), nullptr, 0);
-					sys->context->RSSetState(sys->rasterizer_state.get());
-					sys->context->OMSetDepthStencilState(sys->depth_disabled.get(), 0);
-					sys->context->OMSetBlendState(
-					    sys->blend_opaque.get(), nullptr, 0xFFFFFFFF);
-					sys->context->PSSetSamplers(
-					    0, 1, sys->sampler_linear.addressof());
-					sys->context->PSSetShaderResources(0, 1, &src_srv);
-
-					// Blit constants: dst_size = eye dims so NDC maps fullscreen;
-					// src_size = actual SBS dims so UVs sample only the left eye.
-					BlitConstants bc = {};
-					bc.src_rect[0] = 0.0f;
-					bc.src_rect[1] = 0.0f;
-					bc.src_rect[2] = static_cast<float>(eye_w);
-					bc.src_rect[3] = static_cast<float>(eye_h);
-					bc.dst_offset[0] = 0.0f;
-					bc.dst_offset[1] = 0.0f;
-					bc.src_size[0] = static_cast<float>(tex_w);
-					bc.src_size[1] = static_cast<float>(tex_h);
-					bc.dst_size[0] = static_cast<float>(eye_w);
-					bc.dst_size[1] = static_cast<float>(eye_h);
-					bc.convert_srgb = 0.0f;
-
-					D3D11_MAPPED_SUBRESOURCE mapped;
-					HRESULT hr = sys->context->Map(
-					    sys->blit_constant_buffer.get(), 0,
-					    D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-					if (SUCCEEDED(hr)) {
-						memcpy(mapped.pData, &bc, sizeof(bc));
-						sys->context->Unmap(
-						    sys->blit_constant_buffer.get(), 0);
-					}
-					sys->context->VSSetConstantBuffers(
-					    0, 1, sys->blit_constant_buffer.addressof());
-					sys->context->PSSetConstantBuffers(
-					    0, 1, sys->blit_constant_buffer.addressof());
-
-					sys->context->Draw(4, 0);
-
-					// Unbind SRV to prevent hazard
-					ID3D11ShaderResourceView *null_srv = nullptr;
-					sys->context->PSSetShaderResources(0, 1, &null_srv);
-				}
-			} else if (use_zero_copy && zc_tex) {
-				// Zero-copy: copy app's atlas region to back buffer
-				D3D11_BOX src_box = {0, 0, 0, sys->tile_columns * input_view_w, sys->tile_rows * input_view_h, 1};
-				sys->context->CopySubresourceRegion(
-				    back_buffer.get(), 0, 0, 0, 0,
-				    zc_tex, 0, &src_box);
-			} else if (c->render.atlas_texture) {
-				sys->context->CopyResource(back_buffer.get(), c->render.atlas_texture.get());
-			}
+	} else if (c->render.back_buffer_rtv && input_srv) {
+		// Fallback: no display processor — raw copy to back buffer
+		wil::com_ptr<ID3D11Resource> back_buffer;
+		c->render.back_buffer_rtv->GetResource(back_buffer.put());
+		if (use_zero_copy && zc_tex) {
+			D3D11_BOX src_box = {0, 0, 0, sys->tile_columns * input_view_w, sys->tile_rows * input_view_h, 1};
+			sys->context->CopySubresourceRegion(
+			    back_buffer.get(), 0, 0, 0, 0,
+			    zc_tex, 0, &src_box);
+		} else if (c->render.atlas_texture) {
+			sys->context->CopyResource(back_buffer.get(), c->render.atlas_texture.get());
 		}
 	}
 
