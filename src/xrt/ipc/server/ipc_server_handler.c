@@ -33,6 +33,8 @@
 
 #if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 #include "d3d11_service/comp_d3d11_service.h"
+#include "math/m_display3d_view.h"
+#include "math/m_camera3d_view.h"
 #endif
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
@@ -76,36 +78,6 @@ validate_device_id(volatile struct ipc_client_state *ics, int64_t device_id, str
 
 #if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 /*!
- * Compute Kooima asymmetric FOV from eye position and screen dimensions.
- * This mirrors the computation in oxr_session.c but for IPC server use.
- */
-static void
-ipc_compute_kooima_fov(const struct xrt_vec3 *eye,
-                       float screen_width_m,
-                       float screen_height_m,
-                       struct xrt_fov *out_fov)
-{
-	const float half_w = screen_width_m / 2.0f;
-	const float half_h = screen_height_m / 2.0f;
-	const float distance = eye->z;
-
-	// Fallback if eye too close to screen
-	if (distance <= 0.001f) {
-		out_fov->angle_left = -0.785398f;   // -45 degrees
-		out_fov->angle_right = 0.785398f;
-		out_fov->angle_up = 0.523599f;      //  30 degrees
-		out_fov->angle_down = -0.523599f;
-		return;
-	}
-
-	// Kooima projection: compute angle from eye to each screen edge
-	out_fov->angle_left = atanf((-half_w - eye->x) / distance);
-	out_fov->angle_right = atanf((half_w - eye->x) / distance);
-	out_fov->angle_up = atanf((half_h - eye->y) / distance);
-	out_fov->angle_down = atanf((-half_h - eye->y) / distance);
-}
-
-/*!
  * Try to get SR-aware view poses for IPC clients.
  * Returns true if SR view poses were computed, false to fall back to device poses.
  */
@@ -128,11 +100,11 @@ ipc_try_get_sr_view_poses(struct ipc_server *s,
 		IPC_WARN(s, "  IPC server xdev=%p (%s)", (void*)xdev, xdev ? xdev->str : "NULL");
 	}
 
-	if (view_count != 2) {
+	if (view_count < 1 || view_count > XRT_MAX_VIEWS) {
 		static bool logged_view_count = false;
 		if (!logged_view_count) {
 			logged_view_count = true;
-			IPC_WARN(s, "ipc_try_get_sr_view_poses: view_count=%u (expected 2), skipping SR poses", view_count);
+			IPC_WARN(s, "ipc_try_get_sr_view_poses: view_count=%u out of range, skipping", view_count);
 		}
 		return false;
 	}
@@ -156,15 +128,21 @@ ipc_try_get_sr_view_poses(struct ipc_server *s,
 		return false;
 	}
 
-	// Get eye positions from SR weaver
-	struct xrt_vec3 left_eye, right_eye;
-	if (!comp_d3d11_service_get_predicted_eye_positions(s->xsysc, &left_eye, &right_eye)) {
-		static bool logged_no_eye_pos = false;
-		if (!logged_no_eye_pos) {
-			logged_no_eye_pos = true;
-			IPC_WARN(s, "ipc_try_get_sr_view_poses: get_predicted_eye_positions FAILED, skipping SR poses");
+	// Get eye positions from SR weaver (currently 2 eyes; array for future N-view)
+	struct xrt_vec3 raw_eyes[XRT_MAX_VIEWS] = {0};
+	uint32_t eye_count = (view_count < 2) ? view_count : 2; // DP currently reports max 2
+	{
+		struct xrt_vec3 left_eye, right_eye;
+		if (!comp_d3d11_service_get_predicted_eye_positions(s->xsysc, &left_eye, &right_eye)) {
+			static bool logged_no_eye_pos = false;
+			if (!logged_no_eye_pos) {
+				logged_no_eye_pos = true;
+				IPC_WARN(s, "ipc_try_get_sr_view_poses: get_predicted_eye_positions FAILED, skipping");
+			}
+			return false;
 		}
-		return false;
+		raw_eyes[0] = left_eye;
+		if (eye_count > 1) raw_eyes[1] = right_eye;
 	}
 
 	// Get screen dimensions for Kooima FOV (prefer window metrics, fall back to display)
@@ -190,19 +168,17 @@ ipc_try_get_sr_view_poses(struct ipc_server *s,
 	}
 
 	// Shift eyes to be relative to window center (not display center)
-	left_eye.x -= eye_offset_x;
-	left_eye.y -= eye_offset_y;
-	right_eye.x -= eye_offset_x;
-	right_eye.y -= eye_offset_y;
+	for (uint32_t i = 0; i < eye_count; i++) {
+		raw_eyes[i].x -= eye_offset_x;
+		raw_eyes[i].y -= eye_offset_y;
+	}
 
 	// Log success on first successful call
 	static bool first_success = true;
 	if (first_success) {
 		first_success = false;
-		IPC_WARN(s, "ipc_try_get_sr_view_poses: SUCCESS! eye L=(%.3f,%.3f,%.3f) R=(%.3f,%.3f,%.3f) screen=%.3fx%.3fm offset=(%.3f,%.3f)",
-		         left_eye.x, left_eye.y, left_eye.z,
-		         right_eye.x, right_eye.y, right_eye.z,
-		         screen_width_m, screen_height_m,
+		IPC_WARN(s, "ipc_try_get_sr_view_poses: SUCCESS! eyes=%u screen=%.3fx%.3fm offset=(%.3f,%.3f)",
+		         eye_count, screen_width_m, screen_height_m,
 		         eye_offset_x, eye_offset_y);
 	}
 
@@ -277,42 +253,41 @@ ipc_try_get_sr_view_poses(struct ipc_server *s,
 	                                    XRT_SPACE_RELATION_POSITION_TRACKED_BIT |
 	                                    XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT;
 
+	// Both paths use canonical display3d/camera3d functions from m_display3d_view.h
+	// and m_camera3d_view.h — same code as the in-process oxr_session.c path.
+	Display3DScreen scr = {screen_width_m, screen_height_m};
+	struct xrt_pose display_pose = {display_ori, display_pos};
+
 	if (have_stereo_state && stereo_state.camera_mode && compositor_owns_window) {
-		// CAMERA-CENTRIC PATH
-		struct m_multiview_screen scr = {screen_width_m, screen_height_m};
-		struct m_multiview_camera_tunables tunables = {
+		// CAMERA-CENTRIC PATH (canonical camera3d_compute_views)
+		Camera3DTunables ct = {
 		    .ipd_factor = stereo_state.cam_spread_factor,
 		    .parallax_factor = stereo_state.cam_parallax_factor,
 		    .inv_convergence_distance = stereo_state.cam_convergence,
 		    .half_tan_vfov = stereo_state.cam_half_tan_vfov,
 		};
-		struct xrt_pose camera_pose = {display_ori, display_pos};
-		struct xrt_vec3 camera_eye_world[2];
+		Camera3DView cam_views[XRT_MAX_VIEWS];
+		camera3d_compute_views(raw_eyes, eye_count, NULL, &scr, &ct,
+		                       &display_pose, 0.01f, 100.0f, cam_views);
 
-		struct xrt_vec3 raw_eyes[2] = {left_eye, right_eye};
-		m_multiview_camera_compute(raw_eyes, 2, NULL, &scr, &tunables,
-		                           &camera_pose, out_fovs, camera_eye_world);
-
-		// Head = camera pose
 		out_head_relation->pose.position = display_pos;
 		out_head_relation->pose.orientation = display_ori;
 
-		// View poses relative to head: inverse-rotate (eye_world - camera_pos)
-		// Since head_world = camera_pos + rotate(view_local, camera_ori),
-		// view_local = inverse_rotate(eye_world - camera_pos, camera_ori)
+		// Convert world-space eye positions to head-local
 		struct xrt_quat inv_ori;
 		math_quat_invert(&display_ori, &inv_ori);
-		for (int i = 0; i < 2; i++) {
+		for (uint32_t i = 0; i < eye_count; i++) {
+			out_fovs[i] = cam_views[i].fov;
 			struct xrt_vec3 diff = {
-			    camera_eye_world[i].x - display_pos.x,
-			    camera_eye_world[i].y - display_pos.y,
-			    camera_eye_world[i].z - display_pos.z,
+			    cam_views[i].eye_world.x - display_pos.x,
+			    cam_views[i].eye_world.y - display_pos.y,
+			    cam_views[i].eye_world.z - display_pos.z,
 			};
 			math_quat_rotate_vec3(&inv_ori, &diff, &out_poses[i].position);
 			out_poses[i].orientation = (struct xrt_quat)XRT_QUAT_IDENTITY;
 		}
 	} else {
-		// DISPLAY-CENTRIC PATH
+		// DISPLAY-CENTRIC PATH (canonical display3d_compute_views)
 		if (compositor_owns_window) {
 			out_head_relation->pose.position = display_pos;
 			out_head_relation->pose.orientation = display_ori;
@@ -321,41 +296,33 @@ ipc_try_get_sr_view_poses(struct ipc_server *s,
 			out_head_relation->pose.orientation = (struct xrt_quat)XRT_QUAT_IDENTITY;
 		}
 
-		// Apply eye factors if stereo state available
-		struct xrt_vec3 adj_left = left_eye;
-		struct xrt_vec3 adj_right = right_eye;
-		float kooima_w = screen_width_m;
-		float kooima_h = screen_height_m;
+		Display3DTunables dt = display3d_default_tunables();
 		if (have_stereo_state && compositor_owns_window) {
-			{
-				struct xrt_vec3 raw_eyes[2] = {left_eye, right_eye};
-				struct xrt_vec3 adj_eyes[2];
-				m_multiview_apply_eye_factors(raw_eyes, 2, NULL,
-				                             stereo_state.disp_spread_factor,
-				                             stereo_state.disp_parallax_factor,
-				                             adj_eyes);
-				adj_left = adj_eyes[0];
-				adj_right = adj_eyes[1];
-			}
-			// Scale screen by m2v (meters-to-virtual)
-			kooima_h = stereo_state.disp_vHeight;
-			kooima_w = screen_width_m * (kooima_h / screen_height_m);
-			// Scale eye by perspective_factor * m2v to match in-process path
-			// (display3d_view.c line 252). With perspective=1.0 and both eye
-			// and screen scaled by m2v, the m2v cancels in the Kooima FOV
-			// but correctly scales the head-relative view positions.
-			float m2v = kooima_h / screen_height_m;
-			adj_left.x *= m2v; adj_left.y *= m2v; adj_left.z *= m2v;
-			adj_right.x *= m2v; adj_right.y *= m2v; adj_right.z *= m2v;
+			dt.ipd_factor = stereo_state.disp_spread_factor;
+			dt.parallax_factor = stereo_state.disp_parallax_factor;
+			dt.perspective_factor = 1.0f;
+			dt.virtual_display_height = stereo_state.disp_vHeight;
+		} else {
+			dt.virtual_display_height = screen_height_m; // identity m2v
 		}
 
-		out_poses[0].position = adj_left;
-		out_poses[1].position = adj_right;
-		out_poses[0].orientation = (struct xrt_quat)XRT_QUAT_IDENTITY;
-		out_poses[1].orientation = (struct xrt_quat)XRT_QUAT_IDENTITY;
+		Display3DView disp_views[XRT_MAX_VIEWS];
+		display3d_compute_views(raw_eyes, eye_count, NULL, &scr, &dt,
+		                        &display_pose, 0.01f, 100.0f, disp_views);
 
-		ipc_compute_kooima_fov(&adj_left, kooima_w, kooima_h, &out_fovs[0]);
-		ipc_compute_kooima_fov(&adj_right, kooima_w, kooima_h, &out_fovs[1]);
+		// Convert world-space eye positions to head-local
+		struct xrt_quat inv_ori;
+		math_quat_invert(&display_ori, &inv_ori);
+		for (uint32_t i = 0; i < eye_count; i++) {
+			out_fovs[i] = disp_views[i].fov;
+			struct xrt_vec3 diff = {
+			    disp_views[i].eye_world.x - display_pos.x,
+			    disp_views[i].eye_world.y - display_pos.y,
+			    disp_views[i].eye_world.z - display_pos.z,
+			};
+			math_quat_rotate_vec3(&inv_ori, &diff, &out_poses[i].position);
+			out_poses[i].orientation = (struct xrt_quat)XRT_QUAT_IDENTITY;
+		}
 	}
 
 	// Log periodically
