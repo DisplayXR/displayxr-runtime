@@ -2514,6 +2514,21 @@ oxr_session_create(struct oxr_logger *log,
 	U_LOG_W("xsi after parsing: external_window=%p, readback=%p, shared_tex=%p",
 	        xsi.external_window_handle, (void *)xsi.readback_callback, xsi.shared_texture_handle);
 
+#ifdef XRT_OS_WINDOWS
+	// Shell mode: hide the app's HWND so it renders through the multi-comp.
+	// The app keeps its HWND for Kooima projection (GetClientRect works on hidden windows).
+	// The shell can later puppet it via SetWindowPos (resize) and PostMessage (input).
+	{
+		const char *shell_session = getenv("DISPLAYXR_SHELL_SESSION");
+		if (shell_session != NULL && strcmp(shell_session, "1") == 0 &&
+		    xsi.external_window_handle != NULL) {
+			HWND hwnd = (HWND)xsi.external_window_handle;
+			ShowWindow(hwnd, SW_HIDE);
+			U_LOG_W("Shell session: hidden app HWND %p", hwnd);
+		}
+	}
+#endif
+
 	/* Try allocating and populating. */
 	XrResult ret = oxr_session_create_impl(log, sys, createInfo, &xsi, &sess);
 	if (ret != XR_SUCCESS) {
