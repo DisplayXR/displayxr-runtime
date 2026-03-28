@@ -4112,10 +4112,15 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 	// Register with multi-compositor in shell mode
 	if (sys->shell_mode) {
 		// Ensure multi_comp struct exists for registration
-		if (sys->multi_comp == nullptr) {
-			sys->multi_comp = new d3d11_multi_compositor();
-			std::memset(sys->multi_comp, 0, sizeof(*sys->multi_comp));
-			sys->multi_comp->focused_slot = -1;
+		// Eagerly create multi-comp output (window + DP) on first client connect.
+		// This ensures the DP is available for ipc_try_get_sr_view_poses
+		// when the client calls xrLocateViews (before the first layer_commit).
+		xrt_result_t mc_ret = multi_compositor_ensure_output(sys);
+		if (mc_ret != XRT_SUCCESS) {
+			U_LOG_E("Shell mode: failed to create multi-comp output");
+			fini_client_render_resources(&c->render);
+			delete c;
+			return mc_ret;
 		}
 		int slot = multi_compositor_register_client(sys, c);
 		if (slot < 0) {
@@ -4478,9 +4483,14 @@ comp_d3d11_service_get_predicted_eye_positions(struct xrt_system_compositor *xsy
 
 	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
 
-	// Get the active compositor's display processor for eye position prediction
+	// Get display processor for eye position prediction.
+	// In shell mode, use the multi-comp's DP (per-client compositors have no DP).
+	// In normal mode, use the active compositor's DP.
 	struct xrt_display_processor_d3d11 *dp = nullptr;
-	{
+	if (sys->shell_mode && sys->multi_comp != nullptr) {
+		dp = sys->multi_comp->display_processor;
+	}
+	if (dp == nullptr) {
 		std::lock_guard<std::mutex> lock(sys->active_compositor_mutex);
 		if (sys->active_compositor != nullptr &&
 		    sys->active_compositor->render.display_processor != nullptr) {
@@ -4531,9 +4541,13 @@ comp_d3d11_service_get_display_dimensions(struct xrt_system_compositor *xsysc,
 
 	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
 
-	// Try to get display dimensions from active compositor's display processor
+	// Try to get display dimensions from display processor.
+	// In shell mode, use multi-comp's DP; in normal mode, use active compositor's DP.
 	struct xrt_display_processor_d3d11 *dp = nullptr;
-	{
+	if (sys->shell_mode && sys->multi_comp != nullptr) {
+		dp = sys->multi_comp->display_processor;
+	}
+	if (dp == nullptr) {
 		std::lock_guard<std::mutex> lock(sys->active_compositor_mutex);
 		if (sys->active_compositor != nullptr &&
 		    sys->active_compositor->render.display_processor != nullptr) {
@@ -4570,14 +4584,28 @@ comp_d3d11_service_get_window_metrics(struct xrt_system_compositor *xsysc,
 
 	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
 
-	// Get active compositor's window metrics (same as in-process path)
-	struct d3d11_service_compositor *sc = nullptr;
-	{
-		std::lock_guard<std::mutex> lock(sys->active_compositor_mutex);
-		sc = sys->active_compositor;
+	// In shell mode, use multi-comp's window and DP.
+	// In normal mode, use the active compositor's.
+	struct xrt_display_processor_d3d11 *dp = nullptr;
+	HWND metrics_hwnd = nullptr;
+
+	if (sys->shell_mode && sys->multi_comp != nullptr &&
+	    sys->multi_comp->display_processor != nullptr && sys->multi_comp->hwnd != nullptr) {
+		dp = sys->multi_comp->display_processor;
+		metrics_hwnd = sys->multi_comp->hwnd;
+	} else {
+		struct d3d11_service_compositor *sc = nullptr;
+		{
+			std::lock_guard<std::mutex> lock(sys->active_compositor_mutex);
+			sc = sys->active_compositor;
+		}
+		if (sc != nullptr && sc->render.hwnd != nullptr && sc->render.display_processor != nullptr) {
+			dp = sc->render.display_processor;
+			metrics_hwnd = sc->render.hwnd;
+		}
 	}
 
-	if (sc == nullptr || sc->render.hwnd == nullptr || sc->render.display_processor == nullptr) {
+	if (dp == nullptr || metrics_hwnd == nullptr) {
 		out_metrics->valid = false;
 		return false;
 	}
@@ -4586,7 +4614,7 @@ comp_d3d11_service_get_window_metrics(struct xrt_system_compositor *xsysc,
 	uint32_t disp_px_w = 0, disp_px_h = 0;
 	int32_t disp_left = 0, disp_top = 0;
 	if (!xrt_display_processor_d3d11_get_display_pixel_info(
-	        sc->render.display_processor, &disp_px_w, &disp_px_h,
+	        dp, &disp_px_w, &disp_px_h,
 	        &disp_left, &disp_top)) {
 		out_metrics->valid = false;
 		return false;
@@ -4599,15 +4627,14 @@ comp_d3d11_service_get_window_metrics(struct xrt_system_compositor *xsysc,
 
 	// Get physical display dimensions
 	float disp_w_m = 0.0f, disp_h_m = 0.0f;
-	if (!xrt_display_processor_d3d11_get_display_dimensions(
-	        sc->render.display_processor, &disp_w_m, &disp_h_m)) {
+	if (!xrt_display_processor_d3d11_get_display_dimensions(dp, &disp_w_m, &disp_h_m)) {
 		out_metrics->valid = false;
 		return false;
 	}
 
 	// Get window client rect
 	RECT rect;
-	if (!GetClientRect(sc->render.hwnd, &rect)) {
+	if (!GetClientRect(metrics_hwnd, &rect)) {
 		out_metrics->valid = false;
 		return false;
 	}
@@ -4620,7 +4647,7 @@ comp_d3d11_service_get_window_metrics(struct xrt_system_compositor *xsysc,
 
 	// Get window screen position
 	POINT client_origin = {0, 0};
-	ClientToScreen(sc->render.hwnd, &client_origin);
+	ClientToScreen(metrics_hwnd, &client_origin);
 
 	// Compute pixel size (meters per pixel)
 	float pixel_size_x = disp_w_m / (float)disp_px_w;
