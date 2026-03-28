@@ -1005,6 +1005,10 @@ ipc_server_main(int argc, char **argv, const struct ipc_server_main_info *ismi)
 
 	// Allocate the server itself.
 	struct ipc_server *s = U_TYPED_CALLOC(struct ipc_server);
+	s->shell_mode = ismi->shell_mode;
+	if (s->shell_mode) {
+		U_LOG_IFL_I(log_level, "Shell mode enabled (--shell)");
+	}
 
 #ifdef XRT_OS_WINDOWS
 	timeBeginPeriod(1);
@@ -1028,6 +1032,13 @@ ipc_server_main(int argc, char **argv, const struct ipc_server_main_info *ismi)
 		u_debug_gui_stop(&s->debug_gui);
 		free(s);
 		return -1;
+	}
+
+	// Propagate shell mode to system compositor (after init_all creates it,
+	// before any clients connect and create per-client compositors)
+	if (s->shell_mode && s->xsysc != NULL) {
+		s->xsysc->info.shell_mode = true;
+		U_LOG_IFL_I(log_level, "Shell mode propagated to system compositor");
 	}
 
 	// Start the debug UI now (if enabled).

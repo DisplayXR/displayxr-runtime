@@ -25,6 +25,8 @@
 
 #include "target_lists.h"
 
+#include <string.h> // strcmp for --shell flag
+
 
 // Insert the on load constructor to init trace marker.
 U_TRACE_TARGET_SETUP(U_TRACE_WHICH_SERVICE)
@@ -80,6 +82,15 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 
 	u_win_try_privilege_or_priority_from_args(U_LOGGING_INFO, argc, argv);
 
+	// Parse --shell flag for multi-compositor shell mode
+	bool shell_mode = false;
+	for (int i = 1; i < argc; i++) {
+		if (strcmp(argv[i], "--shell") == 0) {
+			shell_mode = true;
+			break;
+		}
+	}
+
 	// Start the system tray icon
 	service_tray_init(tray_shutdown_callback);
 
@@ -92,6 +103,7 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 	            .window_title = "DisplayXR Service",
 	            .open = U_DEBUG_GUI_OPEN_AUTO,
 	        },
+	    .shell_mode = shell_mode,
 	};
 
 	int ret = ipc_server_main(argc, argv, &ismi);
@@ -112,12 +124,22 @@ main(int argc, char *argv[])
 	u_trace_marker_init();
 	u_metrics_init();
 
+	// Parse --shell flag for multi-compositor shell mode
+	bool shell_mode = false;
+	for (int i = 1; i < argc; i++) {
+		if (strcmp(argv[i], "--shell") == 0) {
+			shell_mode = true;
+			break;
+		}
+	}
+
 	struct ipc_server_main_info ismi = {
 	    .udgci =
 	        {
 	            .window_title = "DisplayXR Service",
 	            .open = U_DEBUG_GUI_OPEN_AUTO,
 	        },
+	    .shell_mode = shell_mode,
 	};
 
 	int ret = ipc_server_main(argc, argv, &ismi);

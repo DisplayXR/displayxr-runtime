@@ -2486,6 +2486,10 @@ struct xrt_system_compositor_info
 	//! Display top edge in OS screen coordinates. 0 if unknown.
 	int32_t display_screen_top;
 
+	//! Shell mode: multi-compositor with shared window for all clients.
+	//! Set by the IPC server when --shell flag is used. Server-side only.
+	bool shell_mode;
+
 	//! Bitmask of supported eye tracking modes (MANAGED_BIT=1, MANUAL_BIT=2). 0 = no tracking.
 	uint32_t supported_eye_tracking_modes;
 

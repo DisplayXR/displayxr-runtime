@@ -27,6 +27,7 @@
 
 #include "math/m_api.h"
 #include "math/m_vec3.h"
+#include "math/m_display3d_view.h"
 
 #include "d3d/d3d_d3d11_fence.hpp"
 #include "d3d/d3d_dxgi_formats.h"
@@ -365,6 +366,78 @@ struct d3d11_service_system
 
 	//! Last known 3D rendering mode index (for V-key toggle restore).
 	uint32_t last_3d_mode_index;
+
+	//! Shell mode: multi-compositor with shared window for all clients.
+	//! Read from base.info.shell_mode on first client connect.
+	bool shell_mode;
+
+	//! Multi-compositor (NULL when shell_mode is false).
+	struct d3d11_multi_compositor *multi_comp;
+
+	//! Mutex for multi-compositor render (serializes D3D11 context access).
+	std::mutex render_mutex;
+};
+
+
+/*
+ *
+ * Multi-compositor structs
+ *
+ */
+
+#define D3D11_MULTI_MAX_CLIENTS 8
+
+/*!
+ * Per-client slot in the multi-compositor.
+ */
+struct d3d11_multi_client_slot
+{
+	//! The per-client compositor that owns the atlas.
+	struct d3d11_service_compositor *compositor;
+
+	//! Virtual window position in 3D space (identity = centered on display).
+	struct xrt_pose window_pose;
+
+	//! Virtual window physical dimensions (meters).
+	float window_width_m;
+	float window_height_m;
+
+	//! True when this slot has an active client.
+	bool active;
+};
+
+/*!
+ * Multi-compositor: shared window + DP that composites all client atlases.
+ *
+ * Created lazily on first client layer_commit when shell_mode is true.
+ */
+struct d3d11_multi_compositor
+{
+	//! Dedicated-thread window for display output.
+	struct comp_d3d11_window *window;
+	HWND hwnd;
+
+	//! Swap chain for display output.
+	wil::com_ptr<IDXGISwapChain1> swap_chain;
+	wil::com_ptr<ID3D11RenderTargetView> back_buffer_rtv;
+
+	//! Combined atlas (all clients composited, input to DP).
+	wil::com_ptr<ID3D11Texture2D> combined_atlas;
+	wil::com_ptr<ID3D11ShaderResourceView> combined_atlas_srv;
+	wil::com_ptr<ID3D11RenderTargetView> combined_atlas_rtv;
+
+	//! Display processor (single, shared).
+	struct xrt_display_processor_d3d11 *display_processor;
+
+	//! Per-client slots.
+	struct d3d11_multi_client_slot clients[D3D11_MULTI_MAX_CLIENTS];
+	uint32_t client_count;
+
+	//! Focused client index (-1 = none).
+	int32_t focused_slot;
+
+	//! Window dismissed by user (ESC).
+	bool window_dismissed;
 };
 
 
@@ -1285,6 +1358,32 @@ init_client_render_resources(struct d3d11_service_system *sys,
 	std::memset(res, 0, sizeof(*res));
 
 	HRESULT hr;
+
+	// Shell mode: only create atlas texture. No window, swap chain, or DP.
+	// The multi-compositor owns those shared resources.
+	if (sys->shell_mode) {
+		D3D11_TEXTURE2D_DESC atlas_desc = {};
+		atlas_desc.Width = sys->display_width;
+		atlas_desc.Height = sys->display_height;
+		atlas_desc.MipLevels = 1;
+		atlas_desc.ArraySize = 1;
+		atlas_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		atlas_desc.SampleDesc.Count = 1;
+		atlas_desc.Usage = D3D11_USAGE_DEFAULT;
+		atlas_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+
+		hr = sys->device->CreateTexture2D(&atlas_desc, nullptr, res->atlas_texture.put());
+		if (FAILED(hr)) {
+			U_LOG_E("Shell mode: failed to create atlas texture (hr=0x%08X)", hr);
+			return XRT_ERROR_D3D11;
+		}
+		sys->device->CreateShaderResourceView(res->atlas_texture.get(), nullptr, res->atlas_srv.put());
+		sys->device->CreateRenderTargetView(res->atlas_texture.get(), nullptr, res->atlas_rtv.put());
+
+		U_LOG_W("Shell mode: created atlas-only resources for client (%ux%u)",
+		        sys->display_width, sys->display_height);
+		return XRT_SUCCESS;
+	}
 
 	// Get or create window
 	if (external_hwnd != nullptr) {
@@ -2573,6 +2672,541 @@ service_crop_atlas_for_dp(struct d3d11_service_system *sys,
 	return res->crop_srv.get();
 }
 
+
+/*
+ *
+ * Multi-compositor functions
+ *
+ */
+
+/*!
+ * Register a per-client compositor with the multi-compositor.
+ * Returns slot index, or -1 if full.
+ */
+static int
+multi_compositor_register_client(struct d3d11_service_system *sys, struct d3d11_service_compositor *c)
+{
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	if (mc == nullptr) {
+		return -1;
+	}
+
+	for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
+		if (!mc->clients[i].active) {
+			mc->clients[i].compositor = c;
+			mc->clients[i].active = true;
+			mc->clients[i].window_pose = XRT_POSE_IDENTITY;
+			mc->clients[i].window_width_m = sys->base.info.display_width_m;
+			mc->clients[i].window_height_m = sys->base.info.display_height_m;
+			mc->client_count++;
+			if (mc->focused_slot < 0) {
+				mc->focused_slot = i;
+			}
+			U_LOG_W("Multi-comp: registered client in slot %d (total=%u)", i, mc->client_count);
+			return i;
+		}
+	}
+	return -1;
+}
+
+/*!
+ * Unregister a per-client compositor from the multi-compositor.
+ */
+static void
+multi_compositor_unregister_client(struct d3d11_service_system *sys, struct d3d11_service_compositor *c)
+{
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	if (mc == nullptr) {
+		return;
+	}
+
+	for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
+		if (mc->clients[i].active && mc->clients[i].compositor == c) {
+			mc->clients[i].active = false;
+			mc->clients[i].compositor = nullptr;
+			mc->client_count--;
+			if (mc->focused_slot == i) {
+				mc->focused_slot = -1;
+			}
+			U_LOG_W("Multi-comp: unregistered client from slot %d (total=%u)", i, mc->client_count);
+			break;
+		}
+	}
+}
+
+/*!
+ * Destroy the multi-compositor and all its resources.
+ */
+static void
+multi_compositor_destroy(struct d3d11_multi_compositor *mc)
+{
+	if (mc == nullptr) {
+		return;
+	}
+
+	U_LOG_W("Multi-comp: destroying");
+
+	if (mc->display_processor != nullptr) {
+		xrt_display_processor_d3d11_request_display_mode(mc->display_processor, false);
+		xrt_display_processor_d3d11_destroy(&mc->display_processor);
+	}
+
+	mc->back_buffer_rtv.reset();
+	mc->combined_atlas_rtv.reset();
+	mc->combined_atlas_srv.reset();
+	mc->combined_atlas.reset();
+	mc->swap_chain.reset();
+
+	if (mc->window != nullptr) {
+		comp_d3d11_window_destroy(&mc->window);
+	}
+	mc->hwnd = nullptr;
+
+	delete mc;
+}
+
+/*!
+ * Lazily create the multi-compositor window, swap chain, combined atlas, and DP.
+ *
+ * Called on first layer_commit in shell mode. By this time the target builder
+ * has already set dp_factory_d3d11.
+ */
+static xrt_result_t
+multi_compositor_ensure_output(struct d3d11_service_system *sys)
+{
+	if (sys->multi_comp == nullptr) {
+		sys->multi_comp = new d3d11_multi_compositor();
+		std::memset(sys->multi_comp, 0, sizeof(*sys->multi_comp));
+		sys->multi_comp->focused_slot = -1;
+	}
+
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+
+	// Already initialized?
+	if (mc->hwnd != nullptr && mc->swap_chain) {
+		return XRT_SUCCESS;
+	}
+
+	U_LOG_W("Multi-comp: creating output window and resources");
+
+	// Create window
+	xrt_result_t wret = comp_d3d11_window_create(sys->output_width, sys->output_height, &mc->window);
+	if (wret != XRT_SUCCESS || mc->window == nullptr) {
+		U_LOG_E("Multi-comp: failed to create window");
+		return XRT_ERROR_D3D11;
+	}
+	mc->hwnd = (HWND)comp_d3d11_window_get_hwnd(mc->window);
+
+	if (sys->xsysd != nullptr) {
+		comp_d3d11_window_set_system_devices(mc->window, sys->xsysd);
+	}
+
+	// Get actual window client area
+	uint32_t actual_w = sys->output_width;
+	uint32_t actual_h = sys->output_height;
+	RECT cr;
+	if (GetClientRect(mc->hwnd, &cr)) {
+		uint32_t cw = static_cast<uint32_t>(cr.right - cr.left);
+		uint32_t ch = static_cast<uint32_t>(cr.bottom - cr.top);
+		if (cw > 0 && ch > 0) {
+			actual_w = cw;
+			actual_h = ch;
+		}
+	}
+
+	// Create swap chain
+	DXGI_SWAP_CHAIN_DESC1 sc_desc = {};
+	sc_desc.Width = actual_w;
+	sc_desc.Height = actual_h;
+	sc_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	sc_desc.SampleDesc.Count = 1;
+	sc_desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+	sc_desc.BufferCount = 2;
+	sc_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+
+	HRESULT hr = sys->dxgi_factory->CreateSwapChainForHwnd(
+	    sys->device.get(), mc->hwnd, &sc_desc, nullptr, nullptr,
+	    mc->swap_chain.put());
+	if (FAILED(hr)) {
+		U_LOG_E("Multi-comp: failed to create swap chain (hr=0x%08X)", hr);
+		return XRT_ERROR_D3D11;
+	}
+
+	// Back buffer RTV
+	{
+		wil::com_ptr<ID3D11Texture2D> bb;
+		mc->swap_chain->GetBuffer(0, IID_PPV_ARGS(bb.put()));
+		sys->device->CreateRenderTargetView(bb.get(), nullptr, mc->back_buffer_rtv.put());
+	}
+
+	// Combined atlas texture (same dims as per-client atlas)
+	{
+		D3D11_TEXTURE2D_DESC atlas_desc = {};
+		atlas_desc.Width = sys->display_width;
+		atlas_desc.Height = sys->display_height;
+		atlas_desc.MipLevels = 1;
+		atlas_desc.ArraySize = 1;
+		atlas_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		atlas_desc.SampleDesc.Count = 1;
+		atlas_desc.Usage = D3D11_USAGE_DEFAULT;
+		atlas_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+
+		hr = sys->device->CreateTexture2D(&atlas_desc, nullptr, mc->combined_atlas.put());
+		if (FAILED(hr)) {
+			U_LOG_E("Multi-comp: failed to create combined atlas (hr=0x%08X)", hr);
+			return XRT_ERROR_D3D11;
+		}
+		sys->device->CreateShaderResourceView(mc->combined_atlas.get(), nullptr, mc->combined_atlas_srv.put());
+		sys->device->CreateRenderTargetView(mc->combined_atlas.get(), nullptr, mc->combined_atlas_rtv.put());
+	}
+
+	U_LOG_W("Multi-comp: combined atlas %ux%u", sys->display_width, sys->display_height);
+
+	// Create display processor via factory
+	if (sys->base.info.dp_factory_d3d11 != NULL) {
+		auto factory = (xrt_dp_factory_d3d11_fn_t)sys->base.info.dp_factory_d3d11;
+		xrt_result_t dp_ret = factory(
+		    sys->device.get(), sys->context.get(), mc->hwnd, &mc->display_processor);
+
+		if (dp_ret == XRT_SUCCESS && mc->display_processor != nullptr) {
+			U_LOG_W("Multi-comp: display processor created");
+
+			// Check if DP reports different dimensions than our window
+			uint32_t dp_px_w = 0, dp_px_h = 0;
+			int32_t dp_left = 0, dp_top = 0;
+			if (xrt_display_processor_d3d11_get_display_pixel_info(
+			        mc->display_processor, &dp_px_w, &dp_px_h, &dp_left, &dp_top) &&
+			    dp_px_w > 0 && dp_px_h > 0 &&
+			    (dp_px_w != actual_w || dp_px_h != actual_h)) {
+
+				U_LOG_W("Multi-comp: DP reports %ux%u but window is %ux%u - recreating",
+				        dp_px_w, dp_px_h, actual_w, actual_h);
+
+				// Teardown and recreate at correct size
+				xrt_display_processor_d3d11_destroy(&mc->display_processor);
+				mc->back_buffer_rtv.reset();
+				mc->swap_chain.reset();
+				comp_d3d11_window_destroy(&mc->window);
+
+				// Recreate window at DP-reported size
+				wret = comp_d3d11_window_create(dp_px_w, dp_px_h, &mc->window);
+				if (wret != XRT_SUCCESS || mc->window == nullptr) {
+					U_LOG_E("Multi-comp: failed to recreate window at %ux%u", dp_px_w, dp_px_h);
+					return XRT_ERROR_D3D11;
+				}
+				mc->hwnd = (HWND)comp_d3d11_window_get_hwnd(mc->window);
+
+				if (sys->xsysd != nullptr) {
+					comp_d3d11_window_set_system_devices(mc->window, sys->xsysd);
+				}
+
+				// Update actual dims
+				actual_w = dp_px_w;
+				actual_h = dp_px_h;
+				if (GetClientRect(mc->hwnd, &cr)) {
+					uint32_t cw2 = static_cast<uint32_t>(cr.right - cr.left);
+					uint32_t ch2 = static_cast<uint32_t>(cr.bottom - cr.top);
+					if (cw2 > 0 && ch2 > 0) {
+						actual_w = cw2;
+						actual_h = ch2;
+					}
+				}
+
+				// Update system output dims
+				sys->output_width = actual_w;
+				sys->output_height = actual_h;
+
+				// Recreate swap chain
+				sc_desc.Width = actual_w;
+				sc_desc.Height = actual_h;
+				hr = sys->dxgi_factory->CreateSwapChainForHwnd(
+				    sys->device.get(), mc->hwnd, &sc_desc, nullptr, nullptr,
+				    mc->swap_chain.put());
+				if (FAILED(hr)) {
+					U_LOG_E("Multi-comp: failed to recreate swap chain (hr=0x%08X)", hr);
+					return XRT_ERROR_D3D11;
+				}
+
+				wil::com_ptr<ID3D11Texture2D> bb;
+				mc->swap_chain->GetBuffer(0, IID_PPV_ARGS(bb.put()));
+				sys->device->CreateRenderTargetView(bb.get(), nullptr, mc->back_buffer_rtv.put());
+
+				// Recreate DP with new window
+				dp_ret = factory(sys->device.get(), sys->context.get(), mc->hwnd, &mc->display_processor);
+				if (dp_ret != XRT_SUCCESS) {
+					U_LOG_E("Multi-comp: failed to recreate DP");
+				}
+
+				U_LOG_W("Multi-comp: recreated at %ux%u", actual_w, actual_h);
+			}
+
+			// Enable 3D mode
+			if (mc->display_processor != nullptr && sys->hardware_display_3d) {
+				xrt_display_processor_d3d11_request_display_mode(mc->display_processor, true);
+			}
+		} else {
+			U_LOG_W("Multi-comp: no display processor (factory returned %d)", dp_ret);
+		}
+	}
+
+	U_LOG_W("Multi-comp: output ready (window=%p, swap_chain=%p)", mc->hwnd, mc->swap_chain.get());
+	return XRT_SUCCESS;
+}
+
+/*!
+ * Render all client atlases into the combined atlas using Level 2 Kooima,
+ * then run DP process_atlas and present.
+ *
+ * Called from compositor_layer_commit in shell mode.
+ */
+static void
+multi_compositor_render(struct d3d11_service_system *sys)
+{
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+
+	// Lazy init
+	if (mc == nullptr || mc->hwnd == nullptr) {
+		xrt_result_t ret = multi_compositor_ensure_output(sys);
+		if (ret != XRT_SUCCESS) {
+			return;
+		}
+		mc = sys->multi_comp;
+	}
+
+	if (mc->window_dismissed) {
+		return;
+	}
+
+	// Check window validity
+	if (mc->window != nullptr && !comp_d3d11_window_is_valid(mc->window)) {
+		U_LOG_W("Multi-comp: window closed - dismissing");
+		mc->window_dismissed = true;
+		return;
+	}
+
+	// Handle swap chain resize
+	if (mc->hwnd != nullptr && mc->swap_chain) {
+		RECT client_rect;
+		if (GetClientRect(mc->hwnd, &client_rect)) {
+			uint32_t cw = static_cast<uint32_t>(client_rect.right - client_rect.left);
+			uint32_t ch = static_cast<uint32_t>(client_rect.bottom - client_rect.top);
+
+			DXGI_SWAP_CHAIN_DESC1 sc_desc = {};
+			mc->swap_chain->GetDesc1(&sc_desc);
+
+			if (cw > 0 && ch > 0 && (sc_desc.Width != cw || sc_desc.Height != ch)) {
+				mc->back_buffer_rtv.reset();
+				HRESULT hr = mc->swap_chain->ResizeBuffers(0, cw, ch, DXGI_FORMAT_UNKNOWN, 0);
+				if (SUCCEEDED(hr)) {
+					wil::com_ptr<ID3D11Texture2D> bb;
+					mc->swap_chain->GetBuffer(0, IID_PPV_ARGS(bb.put()));
+					sys->device->CreateRenderTargetView(bb.get(), nullptr, mc->back_buffer_rtv.put());
+				}
+			}
+		}
+	}
+
+	// Sync tile layout (2D/3D mode may have changed)
+	sync_tile_layout(sys);
+
+	// Get eye positions from DP
+	struct xrt_eye_positions eye_pos = {};
+	if (mc->display_processor != nullptr) {
+		xrt_display_processor_d3d11_get_predicted_eye_positions(mc->display_processor, &eye_pos);
+	}
+	if (!eye_pos.valid) {
+		eye_pos.count = 2;
+		eye_pos.eyes[0] = (struct xrt_vec3){-0.032f, 0.0f, 0.6f};
+		eye_pos.eyes[1] = (struct xrt_vec3){ 0.032f, 0.0f, 0.6f};
+		eye_pos.valid = true;
+	}
+
+	// Get physical display dims
+	float screen_w_m = sys->base.info.display_width_m;
+	float screen_h_m = sys->base.info.display_height_m;
+	if (mc->display_processor != nullptr) {
+		xrt_display_processor_d3d11_get_display_dimensions(mc->display_processor, &screen_w_m, &screen_h_m);
+	}
+
+	// Clear combined atlas
+	float clear_color[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+	sys->context->ClearRenderTargetView(mc->combined_atlas_rtv.get(), clear_color);
+
+	// Bind combined atlas as render target
+	ID3D11RenderTargetView *rtvs[] = {mc->combined_atlas_rtv.get()};
+	sys->context->OMSetRenderTargets(1, rtvs, nullptr);
+
+	// Set up rendering state
+	sys->context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+	sys->context->IASetInputLayout(nullptr);
+	sys->context->RSSetState(sys->rasterizer_state.get());
+	sys->context->OMSetDepthStencilState(sys->depth_disabled.get(), 0);
+
+	// Determine view count from tile layout
+	uint32_t view_count = sys->tile_columns * sys->tile_rows;
+	if (view_count > XRT_MAX_VIEWS) {
+		view_count = XRT_MAX_VIEWS;
+	}
+	if (view_count == 0) {
+		view_count = 1;
+	}
+
+	// For each view (L/R eye): render all client quads
+	for (uint32_t view_idx = 0; view_idx < view_count; view_idx++) {
+		// Set viewport for this view tile
+		uint32_t tile_x = 0, tile_y = 0;
+		u_tiling_view_origin(view_idx, sys->tile_columns,
+		                     sys->view_width, sys->view_height,
+		                     &tile_x, &tile_y);
+
+		D3D11_VIEWPORT vp = {};
+		vp.TopLeftX = (float)tile_x;
+		vp.TopLeftY = (float)tile_y;
+		vp.Width = (float)sys->view_width;
+		vp.Height = (float)sys->view_height;
+		vp.MaxDepth = 1.0f;
+		sys->context->RSSetViewports(1, &vp);
+
+		// Eye position for this view
+		struct xrt_vec3 eye = (view_idx < eye_pos.count)
+		                          ? eye_pos.eyes[view_idx]
+		                          : eye_pos.eyes[eye_pos.count - 1];
+
+		// For each active client: render their atlas as a textured quad
+		for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
+			if (!mc->clients[s].active) {
+				continue;
+			}
+			struct d3d11_service_compositor *cc = mc->clients[s].compositor;
+			if (cc == nullptr || !cc->render.atlas_srv) {
+				continue;
+			}
+
+			// --- Level 2 Kooima MVP ---
+
+			// Kooima projection from eye to physical screen
+			struct xrt_matrix_4x4 proj_mat;
+			display3d_compute_projection(eye, screen_w_m, screen_h_m,
+			                             0.01f, 100.0f, (float *)&proj_mat);
+
+			// View matrix from eye position (identity orientation)
+			struct xrt_pose eye_pose = XRT_POSE_IDENTITY;
+			eye_pose.position = eye;
+			struct xrt_matrix_4x4 view_mat;
+			math_matrix_4x4_view_from_pose(&eye_pose, &view_mat);
+
+			// Model matrix: position + scale of virtual window
+			// Y negated to cancel shader's pos.y = -pos.y
+			struct xrt_vec3 scale = {
+			    mc->clients[s].window_width_m,
+			    -mc->clients[s].window_height_m,
+			    1.0f,
+			};
+			struct xrt_matrix_4x4 model_mat;
+			math_matrix_4x4_model(&mc->clients[s].window_pose, &scale, &model_mat);
+
+			// MVP = proj * view * model
+			struct xrt_matrix_4x4 mv, mvp;
+			math_matrix_4x4_multiply(&view_mat, &model_mat, &mv);
+			math_matrix_4x4_multiply(&proj_mat, &mv, &mvp);
+
+			// UV post_transform: select this view's tile from client atlas
+			float tile_u_scale = 1.0f / (float)sys->tile_columns;
+			float tile_v_scale = 1.0f / (float)sys->tile_rows;
+			uint32_t col = view_idx % sys->tile_columns;
+			uint32_t row = view_idx / sys->tile_columns;
+			float tile_u_offset = (float)col * tile_u_scale;
+
+			// Fill quad constants
+			QuadLayerConstants constants = {};
+			std::memcpy(constants.mvp, &mvp, sizeof(constants.mvp));
+
+			// V flip: start at bottom (1.0), scale negative
+			constants.post_transform[0] = tile_u_offset;
+			constants.post_transform[1] = 1.0f;
+			constants.post_transform[2] = tile_u_scale;
+			constants.post_transform[3] = -tile_v_scale;
+
+			constants.color_scale[0] = 1.0f;
+			constants.color_scale[1] = 1.0f;
+			constants.color_scale[2] = 1.0f;
+			constants.color_scale[3] = 1.0f;
+
+			// Update constant buffer
+			D3D11_MAPPED_SUBRESOURCE mapped;
+			sys->context->Map(sys->layer_constant_buffer.get(), 0,
+			                  D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+			std::memcpy(mapped.pData, &constants, sizeof(constants));
+			sys->context->Unmap(sys->layer_constant_buffer.get(), 0);
+
+			// Bind shaders and client atlas
+			sys->context->VSSetShader(sys->quad_vs.get(), nullptr, 0);
+			sys->context->PSSetShader(sys->quad_ps.get(), nullptr, 0);
+			ID3D11Buffer *cbs[] = {sys->layer_constant_buffer.get()};
+			sys->context->VSSetConstantBuffers(0, 1, cbs);
+			sys->context->PSSetConstantBuffers(0, 1, cbs);
+			ID3D11ShaderResourceView *srv = cc->render.atlas_srv.get();
+			sys->context->PSSetShaderResources(0, 1, &srv);
+			ID3D11SamplerState *samp[] = {sys->sampler_linear.get()};
+			sys->context->PSSetSamplers(0, 1, samp);
+
+			// Opaque blend (Phase 0A: single client fills full display)
+			float blend_factor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+			sys->context->OMSetBlendState(sys->blend_opaque.get(), blend_factor, 0xFFFFFFFF);
+
+			// Draw quad (4 vertices, triangle strip)
+			sys->context->Draw(4, 0);
+
+			// Unbind SRV to avoid resource hazards
+			ID3D11ShaderResourceView *null_srv = nullptr;
+			sys->context->PSSetShaderResources(0, 1, &null_srv);
+		}
+	}
+
+	// Run DP on combined atlas → back buffer
+	if (mc->display_processor != nullptr && mc->combined_atlas_srv && mc->back_buffer_rtv) {
+		ID3D11RenderTargetView *out_rtvs[] = {mc->back_buffer_rtv.get()};
+		sys->context->OMSetRenderTargets(1, out_rtvs, nullptr);
+
+		// Get actual back buffer dimensions
+		uint32_t bb_w = sys->output_width;
+		uint32_t bb_h = sys->output_height;
+		if (mc->back_buffer_rtv) {
+			wil::com_ptr<ID3D11Resource> bb_resource;
+			mc->back_buffer_rtv->GetResource(bb_resource.put());
+			wil::com_ptr<ID3D11Texture2D> bb_texture;
+			if (SUCCEEDED(bb_resource->QueryInterface(IID_PPV_ARGS(bb_texture.put())))) {
+				D3D11_TEXTURE2D_DESC bb_desc = {};
+				bb_texture->GetDesc(&bb_desc);
+				bb_w = bb_desc.Width;
+				bb_h = bb_desc.Height;
+			}
+		}
+
+		xrt_display_processor_d3d11_process_atlas(
+		    mc->display_processor, sys->context.get(), mc->combined_atlas_srv.get(),
+		    sys->view_width, sys->view_height, sys->tile_columns, sys->tile_rows,
+		    DXGI_FORMAT_R8G8B8A8_UNORM, bb_w, bb_h,
+		    0, 0, 0, 0);
+	} else if (mc->back_buffer_rtv && mc->combined_atlas) {
+		// Fallback: no DP — raw copy to back buffer
+		wil::com_ptr<ID3D11Resource> back_buffer;
+		mc->back_buffer_rtv->GetResource(back_buffer.put());
+		sys->context->CopyResource(back_buffer.get(), mc->combined_atlas.get());
+	}
+
+	// Present
+	if (mc->swap_chain) {
+		mc->swap_chain->Present(1, 0);
+	}
+
+	// Signal WM_PAINT done
+	if (mc->window != nullptr) {
+		comp_d3d11_window_signal_paint_done(mc->window);
+	}
+}
+
+
 static xrt_result_t
 compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
 {
@@ -2958,7 +3592,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		// Skip the blit and pass the app's texture directly to the display processor.
 		bool zero_copy = false;
 
-		if (proj_view_count > 1 && !has_ui_layers && !any_mutex_acquired) {
+		if (proj_view_count > 1 && !has_ui_layers && !any_mutex_acquired && !sys->shell_mode) {
 			// Check all views reference the same swapchain image
 			bool all_same = true;
 			for (uint32_t eye = 1; eye < proj_view_count; eye++) {
@@ -3231,6 +3865,14 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		}
 	}
 
+	// Shell mode: per-client atlas rendering is done. The multi-compositor
+	// composites all client atlases into the combined atlas and presents.
+	if (sys->shell_mode) {
+		std::lock_guard<std::mutex> render_lock(sys->render_mutex);
+		multi_compositor_render(sys);
+		return XRT_SUCCESS;
+	}
+
 	// During drag, synchronize with the window thread's WM_PAINT cycle.
 	// This ensures the window position is stable between weave() and Present(),
 	// so the interlacing pattern matches the actual displayed position.
@@ -3336,6 +3978,11 @@ compositor_destroy(struct xrt_compositor *xc)
 
 	U_LOG_W("Destroying D3D11 service compositor for client");
 
+	// Unregister from multi-compositor before cleanup
+	if (sys->shell_mode) {
+		multi_compositor_unregister_client(sys, c);
+	}
+
 	// Clear active compositor if it's this one
 	{
 		std::lock_guard<std::mutex> lock(sys->active_compositor_mutex);
@@ -3423,11 +4070,35 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 		external_hwnd = xsi->external_window_handle;
 	}
 
+	// Activate shell mode from system compositor info (set by ipc_server_process.c
+	// after init_all, before any client connects)
+	if (sys->base.info.shell_mode && !sys->shell_mode) {
+		sys->shell_mode = true;
+		U_LOG_W("Shell mode activated for D3D11 service system");
+	}
+
 	xrt_result_t res_ret = init_client_render_resources(sys, external_hwnd, sys->xsysd, &c->render);
 	if (res_ret != XRT_SUCCESS) {
 		U_LOG_E("Failed to initialize client render resources");
 		delete c;
 		return res_ret;
+	}
+
+	// Register with multi-compositor in shell mode
+	if (sys->shell_mode) {
+		// Ensure multi_comp struct exists for registration
+		if (sys->multi_comp == nullptr) {
+			sys->multi_comp = new d3d11_multi_compositor();
+			std::memset(sys->multi_comp, 0, sizeof(*sys->multi_comp));
+			sys->multi_comp->focused_slot = -1;
+		}
+		int slot = multi_compositor_register_client(sys, c);
+		if (slot < 0) {
+			U_LOG_E("Shell mode: max clients (%d) reached", D3D11_MULTI_MAX_CLIENTS);
+			fini_client_render_resources(&c->render);
+			delete c;
+			return XRT_ERROR_D3D11;
+		}
 	}
 
 	// Set up compositor vtable
@@ -3491,6 +4162,12 @@ system_destroy(struct xrt_system_compositor *xsysc)
 	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
 
 	U_LOG_I("Destroying D3D11 service system compositor");
+
+	// Clean up multi-compositor
+	if (sys->multi_comp != nullptr) {
+		multi_compositor_destroy(sys->multi_comp);
+		sys->multi_comp = nullptr;
+	}
 
 	// NOTE: Per-client display processors are cleaned up in fini_client_render_resources()
 	// when each client disconnects. System has no display processor anymore.
