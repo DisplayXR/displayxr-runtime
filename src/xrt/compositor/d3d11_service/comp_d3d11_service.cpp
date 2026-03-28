@@ -3016,8 +3016,8 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	}
 	if (!eye_pos.valid) {
 		eye_pos.count = 2;
-		eye_pos.eyes[0] = (struct xrt_vec3){-0.032f, 0.0f, 0.6f};
-		eye_pos.eyes[1] = (struct xrt_vec3){ 0.032f, 0.0f, 0.6f};
+		eye_pos.eyes[0] = {-0.032f, 0.0f, 0.6f};
+		eye_pos.eyes[1] = { 0.032f, 0.0f, 0.6f};
 		eye_pos.valid = true;
 	}
 
@@ -3068,9 +3068,10 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		sys->context->RSSetViewports(1, &vp);
 
 		// Eye position for this view
-		struct xrt_vec3 eye = (view_idx < eye_pos.count)
-		                          ? eye_pos.eyes[view_idx]
-		                          : eye_pos.eyes[eye_pos.count - 1];
+		struct xrt_eye_position ep = (view_idx < eye_pos.count)
+		                                 ? eye_pos.eyes[view_idx]
+		                                 : eye_pos.eyes[eye_pos.count - 1];
+		struct xrt_vec3 eye = {ep.x, ep.y, ep.z};
 
 		// For each active client: render their atlas as a textured quad
 		for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
