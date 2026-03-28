@@ -1,7 +1,7 @@
 ---
 status: Active
 owner: David Fattal
-updated: 2026-03-24
+updated: 2026-03-28
 issues: [43, 44, 49, 58, 60]
 platform: Windows (D3D11 first, macOS deferred)
 ---
@@ -9,6 +9,11 @@ platform: Windows (D3D11 first, macOS deferred)
 # 3D Shell Implementation Tasks
 
 Living task tracker for the spatial shell. For architecture and design rationale, see [spatial-os.md](spatial-os.md) (#43), [3d-shell.md](3d-shell.md) (#44), and [shell-runtime-contract.md](shell-runtime-contract.md).
+
+### Key Architecture Decisions (ADRs)
+
+- **ADR-012**: [Window-relative Kooima projection](../adr/ADR-012-window-relative-kooima-projection.md) — apps use window dims as screen, eyes offset to window center
+- **ADR-013**: [Universal app launch model](../adr/ADR-013-universal-app-launch-model.md) — hidden HWND proxy: one binary, standalone (own HWND) or shell (HWND hidden, shell puppets via SetWindowPos/PostMessage). No new extensions needed.
 
 ## Architecture
 
