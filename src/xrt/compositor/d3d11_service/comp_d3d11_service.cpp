@@ -3021,12 +3021,14 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		eye_pos.valid = true;
 	}
 
-	// Get physical display dims
-	float screen_w_m = sys->base.info.display_width_m;
-	float screen_h_m = sys->base.info.display_height_m;
+	// Get physical display dims (used as default virtual window size for new clients)
+	float display_w_m = sys->base.info.display_width_m;
+	float display_h_m = sys->base.info.display_height_m;
 	if (mc->display_processor != nullptr) {
-		xrt_display_processor_d3d11_get_display_dimensions(mc->display_processor, &screen_w_m, &screen_h_m);
+		xrt_display_processor_d3d11_get_display_dimensions(mc->display_processor, &display_w_m, &display_h_m);
 	}
+	(void)display_w_m;
+	(void)display_h_m;
 
 	// Clear combined atlas
 	float clear_color[4] = {0.0f, 0.0f, 0.0f, 1.0f};
@@ -3083,11 +3085,33 @@ multi_compositor_render(struct d3d11_service_system *sys)
 				continue;
 			}
 
-			// --- Level 2 Kooima MVP ---
+			// --- Window-Relative Level 2 Kooima MVP ---
+			//
+			// Each virtual window gets its own asymmetric Kooima frustum:
+			// 1. Eye offset relative to window center (not display center)
+			// 2. Kooima projection uses window dimensions (not full display)
+			// 3. Model matrix places the quad at window_pose on the display
+			//
+			// This produces correct parallax for each window independently,
+			// even when windows are off-center or smaller than the display.
 
-			// Kooima projection from eye to physical screen
+			float win_w_m = mc->clients[s].window_width_m;
+			float win_h_m = mc->clients[s].window_height_m;
+
+			// Window center in display space (from window_pose position)
+			struct xrt_vec3 win_center = mc->clients[s].window_pose.position;
+
+			// Eye position relative to window center
+			// (Kooima expects eye relative to screen center)
+			struct xrt_vec3 eye_window = {
+			    eye.x - win_center.x,
+			    eye.y - win_center.y,
+			    eye.z - win_center.z,
+			};
+
+			// Kooima projection from eye to this virtual window
 			struct xrt_matrix_4x4 proj_mat;
-			display3d_compute_projection(eye, screen_w_m, screen_h_m,
+			display3d_compute_projection(eye_window, win_w_m, win_h_m,
 			                             0.01f, 100.0f, (float *)&proj_mat);
 
 			// View matrix from eye position (identity orientation)
@@ -3099,8 +3123,8 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			// Model matrix: position + scale of virtual window
 			// Y negated to cancel shader's pos.y = -pos.y
 			struct xrt_vec3 scale = {
-			    mc->clients[s].window_width_m,
-			    -mc->clients[s].window_height_m,
+			    win_w_m,
+			    -win_h_m,
 			    1.0f,
 			};
 			struct xrt_matrix_4x4 model_mat;
