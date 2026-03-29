@@ -398,6 +398,8 @@ client_loop(volatile struct ipc_client_state *ics)
 
 	IPC_INFO(ics->server, "Client connected");
 
+	uint32_t ipc_msg_count = 0;
+
 	while (ics->server->running) {
 		uint8_t buf[IPC_BUF_SIZE] = {0};
 		DWORD len = 0;
@@ -411,28 +413,23 @@ client_loop(volatile struct ipc_client_state *ics)
 		 * to the command size, this is what we get here, variable
 		 * length data is read in the dispatch function for the command.
 		 */
-		// One-shot trace: server waiting for next message
-		{
-			static int read_trace = 0;
-			if (read_trace < 5) {
-				IPC_WARN(ics->server, "IPC-READ[%d]: waiting for next message", read_trace++);
-			}
-		}
-
 		bret = ReadFile(ics->imc.ipc_handle, buf, sizeof(buf), &len, NULL);
 		if (!bret) {
+			// Log the last command we were waiting for
+			IPC_WARN(ics->server, "IPC-READ: pipe broke after %u messages", ipc_msg_count);
 			pipe_print_get_last_error(ics, "ReadFile");
 			IPC_ERROR(ics->server, "ReadFile failed, disconnecting client.");
 			break;
 		}
 
-		// One-shot trace: message received
+		// Log every message with command ID
 		{
-			static int recv_trace = 0;
-			if (recv_trace < 5) {
-				ipc_command_t cmd = *(ipc_command_t *)buf;
-				IPC_WARN(ics->server, "IPC-READ[%d]: received cmd=%u len=%u", recv_trace++, (unsigned)cmd, (unsigned)len);
+			ipc_command_t cmd = *(ipc_command_t *)buf;
+			// Log all messages (throttled: first 10, then every 10th)
+			if (ipc_msg_count < 10 || ipc_msg_count % 10 == 0) {
+				IPC_WARN(ics->server, "IPC-READ[%u]: cmd=%u len=%u", ipc_msg_count, (unsigned)cmd, (unsigned)len);
 			}
+			ipc_msg_count++;
 		}
 
 		// All commands are at least 4 bytes.
