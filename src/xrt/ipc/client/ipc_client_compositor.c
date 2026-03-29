@@ -739,6 +739,15 @@ ipc_compositor_layer_passthrough(struct xrt_compositor *xc, struct xrt_device *x
 }
 
 static xrt_result_t
+ipc_compositor_layer_window_space(struct xrt_compositor *xc,
+                                  struct xrt_device *xdev,
+                                  struct xrt_swapchain *xsc,
+                                  const struct xrt_layer_data *data)
+{
+	return handle_layer(xc, xdev, xsc, data, XRT_LAYER_WINDOW_SPACE);
+}
+
+static xrt_result_t
 ipc_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
 {
 	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
@@ -917,6 +926,7 @@ ipc_compositor_init(struct ipc_client_compositor *icc, struct xrt_compositor_nat
 	icc->base.base.layer_equirect1 = ipc_compositor_layer_equirect1;
 	icc->base.base.layer_equirect2 = ipc_compositor_layer_equirect2;
 	icc->base.base.layer_passthrough = ipc_compositor_layer_passthrough;
+	icc->base.base.layer_window_space = ipc_compositor_layer_window_space;
 	icc->base.base.layer_commit = ipc_compositor_layer_commit;
 	icc->base.base.layer_commit_with_semaphore = ipc_compositor_layer_commit_with_semaphore;
 	icc->base.base.destroy = ipc_compositor_destroy;
