@@ -158,6 +158,15 @@ oxr_xrWaitFrame(XrSession session, const XrFrameWaitInfo *frameWaitInfo, XrFrame
 
 	U_LOG_D("[DisplayXR] oxr_xrWaitFrame: API ENTRY");
 
+	// One-shot frame pipeline trace (WARN level so it shows in logs)
+	{
+		static int trace_count = 0;
+		if (trace_count < 5) {
+			U_LOG_W("FRAME-TRACE[%d]: xrWaitFrame ENTER", trace_count);
+		}
+		trace_count++;
+	}
+
 	struct oxr_session *sess;
 	struct oxr_logger log;
 	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrWaitFrame");
@@ -171,6 +180,15 @@ oxr_xrWaitFrame(XrSession session, const XrFrameWaitInfo *frameWaitInfo, XrFrame
 
 	XrResult res = oxr_session_frame_wait(&log, sess, frameState);
 
+	// One-shot frame pipeline trace
+	{
+		static int trace_count = 0;
+		if (trace_count < 5) {
+			U_LOG_W("FRAME-TRACE[%d]: xrWaitFrame EXIT result=%d", trace_count, (int)res);
+		}
+		trace_count++;
+	}
+
 	U_LOG_D("[DisplayXR] oxr_xrWaitFrame: result=%d", (int)res);
 
 	return res;
@@ -182,6 +200,13 @@ oxr_xrBeginFrame(XrSession session, const XrFrameBeginInfo *frameBeginInfo)
 	OXR_TRACE_MARKER();
 
 	U_LOG_D("[DisplayXR] oxr_xrBeginFrame: API ENTRY");
+
+	{
+		static int trace_count = 0;
+		if (trace_count < 5) {
+			U_LOG_W("FRAME-TRACE[%d]: xrBeginFrame ENTER", trace_count++);
+		}
+	}
 
 	struct oxr_session *sess;
 	struct oxr_logger log;
@@ -212,6 +237,13 @@ oxr_xrEndFrame(XrSession session, const XrFrameEndInfo *frameEndInfo)
 	OXR_TRACE_MARKER();
 
 	U_LOG_D("[DisplayXR] oxr_xrEndFrame: API ENTRY");
+
+	{
+		static int trace_count = 0;
+		if (trace_count < 5) {
+			U_LOG_W("FRAME-TRACE[%d]: xrEndFrame ENTER", trace_count++);
+		}
+	}
 
 	struct oxr_session *sess;
 	struct oxr_logger log;
@@ -307,14 +339,25 @@ oxr_xrLocateViews(XrSession session,
 		                 viewLocateInfo->viewConfigurationType);
 	}
 
-	return oxr_session_locate_views( //
-	    &log,                        //
-	    sess,                        //
-	    viewLocateInfo,              //
-	    viewState,                   //
-	    viewCapacityInput,           //
-	    viewCountOutput,             //
-	    views);                      //
+	XrResult res = oxr_session_locate_views( //
+	    &log,                                //
+	    sess,                                //
+	    viewLocateInfo,                      //
+	    viewState,                           //
+	    viewCapacityInput,                   //
+	    viewCountOutput,                     //
+	    views);                              //
+
+	{
+		static int trace_count = 0;
+		if (trace_count < 5) {
+			U_LOG_W("FRAME-TRACE[%d]: xrLocateViews EXIT result=%d flags=0x%x",
+			        trace_count++, (int)res,
+			        viewState ? (unsigned)viewState->viewStateFlags : 0);
+		}
+	}
+
+	return res;
 }
 
 
