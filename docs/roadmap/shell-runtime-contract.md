@@ -32,6 +32,7 @@ Define a clean boundary so:
 
 - **Runtime implements rendering truth** — compositing, projection, weaving, capture, hit testing
 - **Shell implements desktop behavior** — placement policy, chrome, focus, persistence, launcher
+- **Apps require no SDK** — a normal OpenXR handle app works in the shell with zero code changes (Level 0 universal app, see [spatial-desktop-prd.md § 5.1](spatial-desktop-prd.md)). Shell-aware extensions (Level 1) and spatial UI toolkits (Level 2) are optional enhancements, never requirements.
 
 ## Shell → Runtime (Control Path)
 
@@ -44,7 +45,7 @@ The shell must be able to send:
 | **Visibility** | Show/hide a window without destroying it |
 | **Focus / activation** | Which window should receive input |
 | **Z-order hints** | Ordering preference when windows overlap |
-| **Capture commands** | Start/stop frame capture, recording, session capture |
+| **Capture commands** *(Phase 2+)* | Start/stop frame capture, recording, session capture |
 | **Layout updates** | Batch update of multiple window transforms (layout preset apply) |
 
 ## Runtime → Shell (Service Path)
