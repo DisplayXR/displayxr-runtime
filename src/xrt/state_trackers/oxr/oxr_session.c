@@ -56,11 +56,6 @@
 #include <string.h>
 #include <assert.h>
 
-#ifdef XRT_OS_WINDOWS
-#include <dwmapi.h> // DwmSetWindowAttribute for HWND cloaking
-#pragma comment(lib, "dwmapi.lib")
-#endif
-
 // Vendor-neutral display metric types (eye positions, window metrics, Kooima FOV)
 #include "xrt/xrt_display_metrics.h"
 
@@ -2535,25 +2530,11 @@ oxr_session_create(struct oxr_logger *log,
 	U_LOG_W("xsi after parsing: external_window=%p, readback=%p, shared_tex=%p",
 	        xsi.external_window_handle, (void *)xsi.readback_callback, xsi.shared_texture_handle);
 
-#ifdef XRT_OS_WINDOWS
-	// Shell mode: shrink the app's HWND to 1x1 at screen origin.
-	// The window stays visible and on a valid monitor so DXGI flip-model
-	// Present() keeps working. SW_HIDE, off-screen moves, and DWM cloaking
-	// all cause DXGI Present() to block on flip-model swap chains.
-	{
-		const char *shell_session = getenv("DISPLAYXR_SHELL_SESSION");
-		if (shell_session != NULL && strcmp(shell_session, "1") == 0 &&
-		    xsi.external_window_handle != NULL) {
-			HWND hwnd = (HWND)xsi.external_window_handle;
-			// Remove title bar and borders so 1x1 is truly 1x1
-			LONG style = GetWindowLong(hwnd, GWL_STYLE);
-			SetWindowLong(hwnd, GWL_STYLE, style & ~(WS_CAPTION | WS_THICKFRAME | WS_BORDER));
-			SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 1, 1,
-			             SWP_NOACTIVATE | SWP_FRAMECHANGED);
-			U_LOG_W("Shell session: shrunk app HWND %p to 1x1", hwnd);
-		}
-	}
-#endif
+	// Shell mode: no HWND manipulation needed. The shell's multi-comp window
+	// is fullscreen on the 3D display and naturally occludes app windows behind it.
+	// Apps keep their own windows visible and rendering — Present() works normally.
+	// When the shell window is dismissed (ESC), app windows become visible again
+	// and continue running standalone.
 
 	/* Try allocating and populating. */
 	XrResult ret = oxr_session_create_impl(log, sys, createInfo, &xsi, &sess);
