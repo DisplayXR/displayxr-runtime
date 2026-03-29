@@ -752,6 +752,14 @@ ipc_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_
 	// Last bit of data to put in the shared memory area.
 	slot->layer_count = icc->layers.layer_count;
 
+	{
+		static int trace_count = 0;
+		if (trace_count < 3) {
+			U_LOG_W("IPC-CLIENT[%d]: about to call compositor_layer_sync (slot=%u handles=%d)",
+			        trace_count++, icc->layers.slot_id, valid_sync ? 1 : 0);
+		}
+	}
+
 	xret = ipc_call_compositor_layer_sync( //
 	    icc->ipc_c,                        //
 	    icc->layers.slot_id,               //
