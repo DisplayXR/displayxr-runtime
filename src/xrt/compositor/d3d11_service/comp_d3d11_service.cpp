@@ -3238,6 +3238,15 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
 	struct d3d11_service_system *sys = c->sys;
 
+	// One-shot trace
+	{
+		static int trace_count = 0;
+		if (trace_count < 3) {
+			U_LOG_W("LAYER-COMMIT[%d]: ENTER shell=%d layers=%u", trace_count++,
+			        sys->shell_mode, c->layer_accum.layer_count);
+		}
+	}
+
 	std::lock_guard<std::mutex> lock(c->mutex);
 
 	// Check window validity - detect window close to end session

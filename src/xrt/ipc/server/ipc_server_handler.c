@@ -1661,6 +1661,15 @@ ipc_handle_compositor_layer_sync(volatile struct ipc_client_state *ics,
 
 	os_mutex_unlock(&ics->server->global_state.lock);
 
+	// One-shot trace
+	{
+		static bool first = true;
+		if (first) {
+			first = false;
+			IPC_WARN(ics->server, "LAYER-SYNC: commit done, ret=%d", commit_ret);
+		}
+	}
+
 	return commit_ret;
 }
 
@@ -1672,6 +1681,16 @@ ipc_handle_compositor_layer_sync_with_semaphore(volatile struct ipc_client_state
                                                 uint32_t *out_free_slot_id)
 {
 	IPC_TRACE_MARKER();
+
+	// One-shot trace: did the server even receive this IPC message?
+	{
+		static bool first = true;
+		if (first) {
+			first = false;
+			IPC_WARN(ics->server, "LAYER-SYNC-SEM: ENTER slot=%u sem=%u val=%llu",
+			         slot_id, semaphore_id, (unsigned long long)semaphore_value);
+		}
+	}
 
 	if (ics->xc == NULL) {
 		return XRT_ERROR_IPC_SESSION_NOT_CREATED;
