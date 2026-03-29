@@ -2515,16 +2515,18 @@ oxr_session_create(struct oxr_logger *log,
 	        xsi.external_window_handle, (void *)xsi.readback_callback, xsi.shared_texture_handle);
 
 #ifdef XRT_OS_WINDOWS
-	// Shell mode: hide the app's HWND so it renders through the multi-comp.
-	// The app keeps its HWND for Kooima projection (GetClientRect works on hidden windows).
-	// The shell can later puppet it via SetWindowPos (resize) and PostMessage (input).
+	// Shell mode: move the app's HWND off-screen so it renders through the multi-comp.
+	// We move it off-screen rather than hiding (SW_HIDE) because some apps check
+	// IsWindowVisible() or have Present() issues with hidden windows.
+	// The HWND remains valid — GetClientRect, PostMessage, etc. all still work.
 	{
 		const char *shell_session = getenv("DISPLAYXR_SHELL_SESSION");
 		if (shell_session != NULL && strcmp(shell_session, "1") == 0 &&
 		    xsi.external_window_handle != NULL) {
 			HWND hwnd = (HWND)xsi.external_window_handle;
-			ShowWindow(hwnd, SW_HIDE);
-			U_LOG_W("Shell session: hidden app HWND %p", hwnd);
+			SetWindowPos(hwnd, NULL, -32000, -32000, 0, 0,
+			             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+			U_LOG_W("Shell session: moved app HWND %p off-screen", hwnd);
 		}
 	}
 #endif
