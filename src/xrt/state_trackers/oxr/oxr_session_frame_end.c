@@ -1983,7 +1983,24 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 		}
 	}
 
+	{
+		static int trace_count = 0;
+		if (trace_count < 3) {
+			U_LOG_W("FRAME-END[%d]: about to call layer_commit (xc=%p layer_commit=%p layers=%u)",
+			        trace_count++, (void *)xc, (void *)(xc ? xc->layer_commit : NULL),
+			        frameEndInfo->layerCount);
+		}
+	}
+
 	xret = xrt_comp_layer_commit(xc, XRT_GRAPHICS_SYNC_HANDLE_INVALID);
+
+	{
+		static int trace_count = 0;
+		if (trace_count < 3) {
+			U_LOG_W("FRAME-END[%d]: layer_commit returned %d", trace_count++, (int)xret);
+		}
+	}
+
 	OXR_CHECK_XRET(log, sess, xret, xrt_comp_layer_commit);
 
 	sess->frame_id.begun = -1;
