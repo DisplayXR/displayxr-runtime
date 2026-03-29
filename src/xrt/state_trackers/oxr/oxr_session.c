@@ -53,7 +53,13 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <assert.h>
+
+#ifdef XRT_OS_WINDOWS
+#include <dwmapi.h> // DwmSetWindowAttribute for HWND cloaking
+#pragma comment(lib, "dwmapi.lib")
+#endif
 
 // Vendor-neutral display metric types (eye positions, window metrics, Kooima FOV)
 #include "xrt/xrt_display_metrics.h"
@@ -1434,13 +1440,28 @@ oxr_session_locate_views(struct oxr_logger *log,
 	    viewLocateInfo->displayTime,        //
 	    &T_base_xdev);                      //
 	if (ret != XR_SUCCESS || T_base_xdev.relation_flags == 0) {
-		if (print) {
-			oxr_slog(&slog, "\n\tReturning invalid poses");
-			oxr_log_slog(log, &slog);
+		// In IPC mode, the device tracking proxy may return zero flags on
+		// early frames before the server's tracking is ready. For handle apps
+		// with external windows (has_ext_win), use identity pose so the app
+		// can still render — it does its own Kooima projection via its HWND.
+		if (T_base_xdev.relation_flags == 0 && sess->has_external_window) {
+			T_base_xdev.pose = (struct xrt_pose)XRT_POSE_IDENTITY;
+			T_base_xdev.relation_flags =
+			    (enum xrt_space_relation_flags)(
+			        XRT_SPACE_RELATION_ORIENTATION_VALID_BIT |
+			        XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT |
+			        XRT_SPACE_RELATION_POSITION_VALID_BIT |
+			        XRT_SPACE_RELATION_POSITION_TRACKED_BIT);
+			U_LOG_W("xrLocateViews: device relation_flags=0, using identity for ext_win app");
 		} else {
-			oxr_slog_cancel(&slog);
+			if (print) {
+				oxr_slog(&slog, "\n\tReturning invalid poses");
+				oxr_log_slog(log, &slog);
+			} else {
+				oxr_slog_cancel(&slog);
+			}
+			return ret;
 		}
-		return ret;
 	}
 
 	struct xrt_space_relation T_base_head;
@@ -2515,18 +2536,24 @@ oxr_session_create(struct oxr_logger *log,
 	        xsi.external_window_handle, (void *)xsi.readback_callback, xsi.shared_texture_handle);
 
 #ifdef XRT_OS_WINDOWS
-	// Shell mode: move the app's HWND off-screen so it renders through the multi-comp.
-	// We move it off-screen rather than hiding (SW_HIDE) because some apps check
-	// IsWindowVisible() or have Present() issues with hidden windows.
-	// The HWND remains valid — GetClientRect, PostMessage, etc. all still work.
+	// Shell mode: cloak the app's HWND so it's invisible but DXGI Present() keeps working.
+	// DWM cloaking is how Windows hides windows on inactive virtual desktops —
+	// it prevents rendering to the screen while keeping the swap chain functional.
+	// SW_HIDE and off-screen moves both break DXGI flip-model swap chains.
 	{
 		const char *shell_session = getenv("DISPLAYXR_SHELL_SESSION");
 		if (shell_session != NULL && strcmp(shell_session, "1") == 0 &&
 		    xsi.external_window_handle != NULL) {
 			HWND hwnd = (HWND)xsi.external_window_handle;
-			SetWindowPos(hwnd, NULL, -32000, -32000, 0, 0,
-			             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-			U_LOG_W("Shell session: moved app HWND %p off-screen", hwnd);
+			BOOL cloak = TRUE;
+			HRESULT hr = DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &cloak, sizeof(cloak));
+			if (SUCCEEDED(hr)) {
+				U_LOG_W("Shell session: cloaked app HWND %p via DWM", hwnd);
+			} else {
+				// Fallback: minimize (less ideal but keeps Present() working)
+				ShowWindow(hwnd, SW_SHOWMINNOACTIVE);
+				U_LOG_W("Shell session: DWM cloak failed (hr=0x%08X), minimized HWND %p", hr, hwnd);
+			}
 		}
 	}
 #endif
