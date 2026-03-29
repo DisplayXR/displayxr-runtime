@@ -2536,24 +2536,21 @@ oxr_session_create(struct oxr_logger *log,
 	        xsi.external_window_handle, (void *)xsi.readback_callback, xsi.shared_texture_handle);
 
 #ifdef XRT_OS_WINDOWS
-	// Shell mode: cloak the app's HWND so it's invisible but DXGI Present() keeps working.
-	// DWM cloaking is how Windows hides windows on inactive virtual desktops —
-	// it prevents rendering to the screen while keeping the swap chain functional.
-	// SW_HIDE and off-screen moves both break DXGI flip-model swap chains.
+	// Shell mode: shrink the app's HWND to 1x1 at screen origin.
+	// The window stays visible and on a valid monitor so DXGI flip-model
+	// Present() keeps working. SW_HIDE, off-screen moves, and DWM cloaking
+	// all cause DXGI Present() to block on flip-model swap chains.
 	{
 		const char *shell_session = getenv("DISPLAYXR_SHELL_SESSION");
 		if (shell_session != NULL && strcmp(shell_session, "1") == 0 &&
 		    xsi.external_window_handle != NULL) {
 			HWND hwnd = (HWND)xsi.external_window_handle;
-			BOOL cloak = TRUE;
-			HRESULT hr = DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &cloak, sizeof(cloak));
-			if (SUCCEEDED(hr)) {
-				U_LOG_W("Shell session: cloaked app HWND %p via DWM", hwnd);
-			} else {
-				// Fallback: minimize (less ideal but keeps Present() working)
-				ShowWindow(hwnd, SW_SHOWMINNOACTIVE);
-				U_LOG_W("Shell session: DWM cloak failed (hr=0x%08X), minimized HWND %p", hr, hwnd);
-			}
+			// Remove title bar and borders so 1x1 is truly 1x1
+			LONG style = GetWindowLong(hwnd, GWL_STYLE);
+			SetWindowLong(hwnd, GWL_STYLE, style & ~(WS_CAPTION | WS_THICKFRAME | WS_BORDER));
+			SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 1, 1,
+			             SWP_NOACTIVATE | SWP_FRAMECHANGED);
+			U_LOG_W("Shell session: shrunk app HWND %p to 1x1", hwnd);
 		}
 	}
 #endif
