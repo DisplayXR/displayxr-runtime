@@ -126,3 +126,10 @@ _package/
 
 # Ignore Unity plugin build artifacts (native binaries built from native~/)
 com.monado.display3d/Runtime/Plugins/
+
+# Local build dependencies and artifacts
+LeiaSR-SDK-*/
+vcpkg/
+local_build.bat
+local_build.log
+openxr_sdk/

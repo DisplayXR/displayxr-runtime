@@ -78,7 +78,6 @@ add_executable(cube_handle_gl_win WIN32
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/hud_renderer.h
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/text_overlay.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/text_overlay.h
-    sr_cube_openxr_ext_gl.manifest
     resource.rc
 )
 
@@ -91,9 +90,11 @@ target_link_libraries(cube_handle_gl_win PRIVATE
     dwrite
 )
 
+# Embed manifest (copy to build dir; use relative path to avoid spaces-in-path linker issues)
 if(MSVC)
+    configure_file("${CMAKE_CURRENT_SOURCE_DIR}/sr_cube_openxr_ext_gl.manifest" "${CMAKE_CURRENT_BINARY_DIR}/sr_cube_openxr_ext_gl.manifest" COPYONLY)
     set_target_properties(cube_handle_gl_win PROPERTIES
-        LINK_FLAGS "/MANIFEST:EMBED /MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/sr_cube_openxr_ext_gl.manifest"
+        LINK_FLAGS "/MANIFEST:EMBED /MANIFESTINPUT:sr_cube_openxr_ext_gl.manifest"
     )
 endif()
 

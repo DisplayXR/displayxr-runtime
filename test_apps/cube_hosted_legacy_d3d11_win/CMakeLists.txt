@@ -83,7 +83,6 @@ add_executable(cube_hosted_legacy_d3d11_win WIN32
     main.cpp
     xr_session.cpp
     xr_session.h
-    sr_cube_openxr.manifest
     resource.rc
 )
 
@@ -94,10 +93,11 @@ target_link_libraries(cube_hosted_legacy_d3d11_win PRIVATE
     OpenXR::openxr_loader
 )
 
-# Embed manifest
+# Embed manifest (copy to build dir; use relative path to avoid spaces-in-path linker issues)
 if(MSVC)
+    configure_file("${CMAKE_CURRENT_SOURCE_DIR}/sr_cube_openxr.manifest" "${CMAKE_CURRENT_BINARY_DIR}/sr_cube_openxr.manifest" COPYONLY)
     set_target_properties(cube_hosted_legacy_d3d11_win PROPERTIES
-        LINK_FLAGS "/MANIFEST:EMBED /MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/sr_cube_openxr.manifest"
+        LINK_FLAGS "/MANIFEST:EMBED /MANIFESTINPUT:sr_cube_openxr.manifest"
     )
 endif()
 
