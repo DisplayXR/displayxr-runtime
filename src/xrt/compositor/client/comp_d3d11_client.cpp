@@ -860,12 +860,25 @@ client_d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_syn
 	xrt_result_t xret = XRT_SUCCESS;
 	if (c->fence) {
 		c->timeline_semaphore_value++;
-		char buf[128];
-		snprintf(buf, sizeof(buf), "[DisplayXR] xrEndFrame: Signaling fence value=%llu\n",
-		         (unsigned long long)c->timeline_semaphore_value);
-		OutputDebugStringA(buf);
+
+		{
+			static int trace_count = 0;
+			if (trace_count < 3) {
+				U_LOG_W("D3D11-CLIENT[%d]: about to Signal fence value=%llu",
+				        trace_count++, (unsigned long long)c->timeline_semaphore_value);
+			}
+		}
 
 		HRESULT hr = c->fence_context->Signal(c->fence.get(), c->timeline_semaphore_value);
+
+		{
+			static int trace_count = 0;
+			if (trace_count < 3) {
+				U_LOG_W("D3D11-CLIENT[%d]: fence Signal returned hr=0x%08X",
+				        trace_count++, (unsigned)hr);
+			}
+		}
+
 		if (!SUCCEEDED(hr)) {
 			char buf[kErrorBufSize];
 			formatMessage(hr, buf);
