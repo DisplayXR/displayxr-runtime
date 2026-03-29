@@ -425,10 +425,8 @@ client_loop(volatile struct ipc_client_state *ics)
 		// Log every message with command ID
 		{
 			ipc_command_t cmd = *(ipc_command_t *)buf;
-			// Log all messages (throttled: first 10, then every 10th)
-			if (ipc_msg_count < 10 || ipc_msg_count % 10 == 0) {
-				IPC_WARN(ics->server, "IPC-READ[%u]: cmd=%u len=%u", ipc_msg_count, (unsigned)cmd, (unsigned)len);
-			}
+			// Log all messages (only 38 total before pipe breaks)
+			IPC_WARN(ics->server, "IPC-READ[%u]: cmd=%u len=%u", ipc_msg_count, (unsigned)cmd, (unsigned)len);
 			ipc_msg_count++;
 		}
 
