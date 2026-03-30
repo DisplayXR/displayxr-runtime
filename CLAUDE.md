@@ -82,14 +82,14 @@ Builds the runtime, OpenXR loader, and test apps. The Vulkan compositor will fai
 
 ### Local Windows Build
 ```bat
-local_build.bat all        REM Full build (generate + runtime + installer + test apps)
-local_build.bat build      REM Runtime only (fastest iteration)
-local_build.bat test-apps  REM Test apps only (uses existing runtime build)
-local_build.bat generate   REM CMake generate only
+scripts\build_windows.bat all        REM Full build (generate + runtime + installer + test apps)
+scripts\build_windows.bat build      REM Runtime only (fastest iteration)
+scripts\build_windows.bat test-apps  REM Test apps only (uses existing runtime build)
+scripts\build_windows.bat generate   REM CMake generate only
 ```
 Downloads all dependencies on first run (SR SDK, vcpkg, OpenXR loader). Requires VS 2022 with C++ workload, Ninja, Vulkan SDK, and GitHub CLI. Outputs to `_package/` (runtime) and `test_apps/*/build/` (test apps).
 
-**When on a Windows machine with a Leia SR display, prefer local builds over CI** — iterate faster with `local_build.bat build` and test directly.
+**When on a Windows machine with a Leia SR display, prefer local builds over CI** — iterate faster with `scripts\build_windows.bat build` and test directly.
 
 ### CI Build (Remote)
 ```bash
