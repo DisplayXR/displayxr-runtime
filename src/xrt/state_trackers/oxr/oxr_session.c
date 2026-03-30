@@ -53,6 +53,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <assert.h>
 
 // Vendor-neutral display metric types (eye positions, window metrics, Kooima FOV)
@@ -2529,11 +2530,27 @@ oxr_session_create(struct oxr_logger *log,
 	U_LOG_W("xsi after parsing: external_window=%p, readback=%p, shared_tex=%p",
 	        xsi.external_window_handle, (void *)xsi.readback_callback, xsi.shared_texture_handle);
 
-	// Shell mode: no HWND manipulation needed. The shell's multi-comp window
-	// is fullscreen on the 3D display and naturally occludes app windows behind it.
-	// Apps keep their own windows visible and rendering — Present() works normally.
-	// When the shell window is dismissed (ESC), app windows become visible again
-	// and continue running standalone.
+#ifdef XRT_OS_WINDOWS
+	// Shell mode: resize the app's HWND to fill the display BEFORE the IPC call.
+	// This must happen client-side because SetWindowPos sends synchronous WM messages
+	// to the target window — if done server-side during session_create, the client's
+	// thread is blocked waiting for the IPC response and can't process WM, deadlocking.
+	{
+		const char *shell_session = getenv("DISPLAYXR_SHELL_SESSION");
+		if (shell_session != NULL && strcmp(shell_session, "1") == 0 &&
+		    xsi.external_window_handle != NULL && sys->xsysc != NULL) {
+			HWND hwnd = (HWND)xsi.external_window_handle;
+			uint32_t disp_px_w = sys->xsysc->info.display_pixel_width;
+			uint32_t disp_px_h = sys->xsysc->info.display_pixel_height;
+			if (disp_px_w > 0 && disp_px_h > 0) {
+				SetWindowPos(hwnd, NULL, 0, 0, (int)disp_px_w, (int)disp_px_h,
+				             SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+				U_LOG_W("Shell session: resized app HWND %p to %ux%u (display native)",
+				        hwnd, disp_px_w, disp_px_h);
+			}
+		}
+	}
+#endif
 
 	/* Try allocating and populating. */
 	XrResult ret = oxr_session_create_impl(log, sys, createInfo, &xsi, &sess);
