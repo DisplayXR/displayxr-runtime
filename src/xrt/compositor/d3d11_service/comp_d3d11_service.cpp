@@ -398,6 +398,9 @@ struct d3d11_multi_client_slot
 	//! App's HWND (from XR_EXT_win32_window_binding). Shell can resize via SetWindowPos.
 	HWND app_hwnd;
 
+	//! True when the HWND needs to be resized (deferred from session_create to first render).
+	bool needs_resize;
+
 	//! Virtual window position in 3D space (identity = centered on display).
 	struct xrt_pose window_pose;
 
@@ -3044,6 +3047,23 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		}
 	}
 
+	// Deferred HWND resize: can't do this during session_create (deadlocks).
+	// By the time layer_commit fires, the client's message pump is running.
+	for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
+		if (mc->clients[s].active && mc->clients[s].needs_resize && mc->clients[s].app_hwnd != nullptr) {
+			uint32_t disp_px_w = sys->base.info.display_pixel_width;
+			uint32_t disp_px_h = sys->base.info.display_pixel_height;
+			if (disp_px_w > 0 && disp_px_h > 0) {
+				SetWindowPos(mc->clients[s].app_hwnd, NULL, 0, 0,
+				             (int)disp_px_w, (int)disp_px_h,
+				             SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+				U_LOG_W("Shell: deferred resize of app HWND %p to %ux%u",
+				        mc->clients[s].app_hwnd, disp_px_w, disp_px_h);
+			}
+			mc->clients[s].needs_resize = false;
+		}
+	}
+
 	// Sync tile layout (2D/3D mode may have changed)
 	sync_tile_layout(sys);
 
@@ -4026,19 +4046,12 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 			return XRT_ERROR_D3D11;
 		}
 
-		// Store app's HWND and resize it to fill the display.
-		// The app receives WM_SIZE, updates its Kooima, and renders at the new size.
-		HWND app_hwnd = (HWND)external_hwnd;
-		sys->multi_comp->clients[slot].app_hwnd = app_hwnd;
-		if (app_hwnd != nullptr) {
-			uint32_t disp_px_w = sys->base.info.display_pixel_width;
-			uint32_t disp_px_h = sys->base.info.display_pixel_height;
-			if (disp_px_w > 0 && disp_px_h > 0) {
-				SetWindowPos(app_hwnd, NULL, 0, 0, (int)disp_px_w, (int)disp_px_h,
-				             SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-				U_LOG_W("Shell: resized app HWND %p to %ux%u (display native)", app_hwnd, disp_px_w, disp_px_h);
-			}
-		}
+		// Store app's HWND for deferred resize.
+		// Cannot call SetWindowPos here — the client's thread is blocked waiting
+		// for this IPC response, so cross-process SendMessage deadlocks.
+		// The resize happens in multi_compositor_render on the first frame.
+		sys->multi_comp->clients[slot].app_hwnd = (HWND)external_hwnd;
+		sys->multi_comp->clients[slot].needs_resize = true;
 	}
 
 	// Set up compositor vtable
