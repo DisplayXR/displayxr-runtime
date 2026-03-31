@@ -1372,10 +1372,11 @@ oxr_session_locate_views(struct oxr_logger *log,
 				}
 			}
 
-			// Ext apps: use raw nominal eye positions directly.
+			// Ext apps (standalone): use raw nominal eye positions directly.
 			// FOVs come from the device (sim_display Kooima), so we only
 			// need to override the view positions to bypass the LOCAL space offset.
-			if (sess->has_external_window && !have_eye_override) {
+			// Skip in IPC/shell mode: the server provides tracked eyes in view poses.
+			if (sess->has_external_window && !have_eye_override && have_eyes) {
 				for (uint32_t ei = 0; ei < eye_count; ei++) {
 					view_eye_world[ei] = (struct xrt_vec3){
 					    adj_eyes[ei].x, adj_eyes[ei].y, adj_eyes[ei].z};
@@ -1490,10 +1491,22 @@ oxr_session_locate_views(struct oxr_logger *log,
 
 		// Do the magical space relation dance here.
 		struct xrt_space_relation result = {0};
-		struct xrt_relation_chain xrc = {0};
-		m_relation_chain_push_pose_if_not_identity(&xrc, &view_pose);
-		m_relation_chain_push_relation(&xrc, &T_base_head);
-		m_relation_chain_resolve(&xrc, &result);
+
+		// Shell IPC sessions: the server already computed display-relative
+		// view poses (via display-centric Kooima with DP eye tracking).
+		// Skip the T_base_head transform which adds a spurious Y offset
+		// from the qwerty device's world-space position.
+		if (sess->has_external_window && !have_eyes && !have_eye_override) {
+			// Use server poses directly (display-relative)
+			result.pose = view_pose;
+			result.relation_flags = T_base_head.relation_flags;
+		} else {
+			// Standard path: apply space relation chain
+			struct xrt_relation_chain xrc = {0};
+			m_relation_chain_push_pose_if_not_identity(&xrc, &view_pose);
+			m_relation_chain_push_relation(&xrc, &T_base_head);
+			m_relation_chain_resolve(&xrc, &result);
+		}
 		OXR_XRT_POSE_TO_XRPOSEF(result.pose, views[i].pose);
 
 		// Override view poses for view controls or eye tracking.

@@ -26,7 +26,13 @@ Last updated: 2026-03-30 (branch `feature/shell-phase0-ci`)
 - Window-space layers handled in IPC server (NULL vtable guard — no crash, silently skipped)
 - TAB cycles focused slot, DELETE sends EXIT_REQUEST to focused client
 
-**Visual result:** Cube renders centered, correct proportions, correct 3D weaving on Leia display.
+**Visual result:** Cube renders centered, correct proportions, correct 3D weaving on Leia display. Head tracking active — scene responds to head movement via display-centric Kooima with DP eye positions.
+
+### Phase 0C.3: Live eye tracking (DONE)
+- `comp_d3d11_service_owns_window` returns false for shell mode → display-centric Kooima path
+- Server computes view poses with DP tracked eye positions, sends via IPC
+- Client bypasses T_base_head transform for ext_win IPC sessions (avoids -1.6m Y offset)
+- Nominal eye override (`have_eye_override`) gated by `have_eyes` — only fires for standalone apps with local tracking, not IPC shell sessions where server provides tracked poses
 
 ## Known Issues / Lessons Learned
 
@@ -53,8 +59,11 @@ DXGI flip-model `Present()` blocks when the window is hidden, cloaked, or off-sc
 ### DP factory timing
 `sys->base.info.dp_factory_d3d11` is NULL during `comp_d3d11_service_create_system()`. Set by target builder AFTER. Must create DP lazily in `multi_compositor_ensure_output()`.
 
-### Eye tracking not yet wired to app (Phase 0C.3)
-The DP has live eye positions (visible in server log: `IPC eye positions: L=(-0.062,0.072,0.597)`), and the weaver uses them for correct interlacing. But the IPC view pose path returns identity poses to the client → app's Kooima doesn't respond to head movement. Next task.
+### Nominal eye override must be gated by have_eyes
+`oxr_session_locate_views` has an ext_win fallback that sets `have_eye_override=true` with nominal `±IPD/2` positions. This is correct for standalone apps (which get tracked eyes via native compositor). But in IPC/shell mode, `have_eyes=false` and the fallback fires, overwriting the server's tracked poses with nominal values. Fix: add `&& have_eyes` so the override only fires when the client has local tracking data.
+
+### T_base_head offset breaks shell IPC view poses
+The standard `oxr_session_locate_views` applies `T_base_head` (which includes qwerty's Y=1.6m world position). For shell IPC sessions, the server already returns display-relative poses — applying T_base_head adds a spurious -1.6m Y offset, placing the eye below the screen. Fix: skip T_base_head for `has_external_window && !have_eyes && !have_eye_override`.
 
 ## Architecture
 

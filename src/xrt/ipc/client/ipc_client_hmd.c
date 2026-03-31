@@ -158,6 +158,7 @@ ipc_client_hmd_get_view_poses(struct xrt_device *xdev,
 			out_poses[i] = info.poses[i];
 		}
 
+
 	} else if (view_count <= IPC_MAX_RAW_VIEWS) {
 		// Artificial limit.
 		xret = call_get_view_poses_raw( //
