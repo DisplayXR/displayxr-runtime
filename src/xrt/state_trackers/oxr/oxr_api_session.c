@@ -1352,6 +1352,13 @@ oxr_xrRequestDisplayRenderingModeEXT(XrSession session, uint32_t modeIndex)
 	struct oxr_logger log;
 	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrRequestDisplayRenderingModeEXT");
 
+	// Shell/IPC mode: the shell controls rendering mode changes, not the app.
+	// The app receives mode changes via XrEventDataRenderingModeChanged events
+	// (synced from server via IPC shared memory).
+	if (sess->sys->xsysc != NULL && sess->sys->xsysc->info.is_service_mode) {
+		return XR_SUCCESS;
+	}
+
 	struct xrt_device *head = GET_XDEV_BY_ROLE(sess->sys, head);
 	if (head == NULL) {
 		return oxr_error(&log, XR_ERROR_RUNTIME_FAILURE, "No head device available");

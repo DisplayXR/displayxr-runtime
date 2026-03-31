@@ -133,16 +133,15 @@ static void set_fullscreen(HWND hWnd, bool fullscreen);
 static bool
 is_shell_reserved_key(WPARAM vk)
 {
+	// Only true shell-management keys are reserved.
+	// V, P, 0-9 are forwarded to the app (it may use them for its own purposes).
+	// The qwerty handler processes them server-side regardless; if the app also
+	// tries to change rendering mode via xrRequestDisplayRenderingModeEXT,
+	// that call is blocked in shell/IPC mode.
 	switch (vk) {
 	case VK_ESCAPE: // Close shell window
-	case VK_TAB:    // Cycle focus (handled by GetAsyncKeyState in render loop)
-	case VK_DELETE: // Close focused app (handled by GetAsyncKeyState in render loop)
-	case 'V':       // Toggle 2D/3D display mode (qwerty)
-	case 'P':       // Toggle camera mode (qwerty)
-	case '1':       // Rendering mode (qwerty)
-	case '2':
-	case '3':
-	case VK_SPACE:  // Reset view state (qwerty)
+	case VK_TAB:    // Cycle focus
+	case VK_DELETE: // Close focused app
 		return true;
 	default:
 		return false;
