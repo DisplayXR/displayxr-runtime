@@ -25,6 +25,7 @@
 #include "util/u_logging.h"
 #include "util/u_misc.h"
 #include "xrt/xrt_system.h"
+#include "xrt/xrt_display_processor_d3d11.h"
 #include "xrt/xrt_config_build.h"
 
 // Include qwerty interface for Win32 input handling (conditional on qwerty driver being built)
@@ -121,6 +122,9 @@ struct comp_d3d11_window
 	//! Target HWND for input forwarding in shell mode (NULL = disabled).
 	//! When set, non-shell keyboard and mouse input is forwarded to this HWND.
 	volatile HWND input_forward_hwnd;
+
+	//! Shell display processor for ESC/close 2D mode switch (opaque, can be NULL).
+	volatile void *shell_dp;
 };
 
 // Forward declarations
@@ -291,6 +295,18 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
 	case WM_CLOSE:
 		U_LOG_W("D3D11 window: WM_CLOSE received");
+		// Switch shell DP to 2D mode (lens off) before closing.
+		// This runs on the window thread and works even with no active clients.
+		{
+			void *dp = (void *)InterlockedCompareExchangePointer(
+			    (volatile PVOID *)&w->shell_dp, NULL, NULL);
+			if (dp != NULL) {
+				struct xrt_display_processor_d3d11 *xdp =
+				    (struct xrt_display_processor_d3d11 *)dp;
+				xrt_display_processor_d3d11_request_display_mode(xdp, false);
+				U_LOG_W("D3D11 window: switched shell DP to 2D on close");
+			}
+		}
 		InterlockedExchange(&w->should_exit, TRUE);
 		DestroyWindow(hWnd);
 		break;
@@ -755,4 +771,13 @@ comp_d3d11_window_set_input_forward_hwnd(struct comp_d3d11_window *window, void 
 	} else {
 		U_LOG_W("D3D11 window: input forwarding disabled");
 	}
+}
+
+extern "C" void
+comp_d3d11_window_set_shell_dp(struct comp_d3d11_window *window, void *dp)
+{
+	if (window == NULL) {
+		return;
+	}
+	InterlockedExchangePointer((volatile PVOID *)&window->shell_dp, (PVOID)dp);
 }

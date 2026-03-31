@@ -42,6 +42,17 @@ Last updated: 2026-03-30 (branch `feature/shell-phase0-ci`)
 - V key toggle uses multi-comp's DP (not per-client DP which is NULL in shell mode)
 - `sync_tile_layout` + `hardware_display_3d` updated immediately on toggle
 
+### Phase 0C.2: Windowed app rendering (DONE — single app)
+- Shell dictates 3D window pose/size: app HWND = visual window size, centered on display
+- App adapts Kooima and render resolution via WM_SIZE from HWND resize
+- Multi-comp shader-blit scales view content to fill window space in each atlas half
+- Combined atlas cleared to dark gray (#1a1a1a) each frame → no stale content after DELETE
+- ESC closes shell window → DP switched to 2D via `shell_dp` on window struct (works even with no clients)
+- TAB cycles focus: focused → unfocused (-1) → focused. Cyan border drawn around focused window
+- Input forwarding: only when focused (focused_slot >= 0). Unfocused = no forwarding
+- DELETE sends EXIT_REQUEST + final render clears stale content
+- Key routing: all keys go to both qwerty and app (ADR-014). Shell-reserved: ESC, TAB, DELETE only
+
 ## Known Issues / Lessons Learned
 
 ### HWND must be borderless for shell fullscreen
@@ -139,4 +150,8 @@ Logs: `%LOCALAPPDATA%\DisplayXR\*.log`
 
 ## What's Next
 
-### Phase 0E: TBD
+### Phase 0C.2: Two apps in shell
+- Second app at (55%,5%,40%,40%) — right side of display
+- TAB cycles: app 0 → app 1 → unfocused → app 0
+- DELETE closes focused app only
+- Each app gets its own HWND, Kooima, view rects, and focus border

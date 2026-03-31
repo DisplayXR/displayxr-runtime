@@ -2774,6 +2774,8 @@ multi_compositor_register_client(struct d3d11_service_system *sys, struct d3d11_
 /*!
  * Unregister a per-client compositor from the multi-compositor.
  */
+static void multi_compositor_render(struct d3d11_service_system *sys); // forward decl
+
 static void
 multi_compositor_unregister_client(struct d3d11_service_system *sys, struct d3d11_service_compositor *c)
 {
@@ -2792,6 +2794,11 @@ multi_compositor_unregister_client(struct d3d11_service_system *sys, struct d3d1
 				multi_compositor_update_input_forward(mc);
 			}
 			U_LOG_W("Multi-comp: unregistered client from slot %d (total=%u)", i, mc->client_count);
+
+			// Render one final frame to clear the stale content.
+			// Without this, the last app frame stays on screen because
+			// multi_compositor_render is only called from layer_commit.
+			multi_compositor_render(sys);
 			break;
 		}
 	}
@@ -2950,6 +2957,11 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 		if (dp_ret == XRT_SUCCESS && mc->display_processor != nullptr) {
 			U_LOG_W("Multi-comp: display processor created");
 
+			// Store DP on window for ESC/close 2D mode switch
+			if (mc->window != nullptr) {
+				comp_d3d11_window_set_shell_dp(mc->window, mc->display_processor);
+			}
+
 			// Check if DP reports different dimensions than our window
 			uint32_t dp_px_w = 0, dp_px_h = 0;
 			int32_t dp_left = 0, dp_top = 0;
@@ -3067,16 +3079,31 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		return;
 	}
 
-	// TAB: cycle focus (ready for multi-window, no-op with single client)
+	// TAB: cycle focus — includes unfocused state (-1)
+	// Cycle: slot 0 → slot 1 → ... → -1 (unfocused) → slot 0
 	if (GetAsyncKeyState(VK_TAB) & 1) {
 		if (mc->client_count > 0) {
-			mc->focused_slot = (mc->focused_slot + 1) % D3D11_MULTI_MAX_CLIENTS;
-			// Find next active slot
+			// Start from current and advance
+			int next = mc->focused_slot + 1;
+			bool found = false;
+			// Search active slots starting from next
 			for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
-				if (mc->clients[mc->focused_slot].active) break;
-				mc->focused_slot = (mc->focused_slot + 1) % D3D11_MULTI_MAX_CLIENTS;
+				int idx = (next + i) % D3D11_MULTI_MAX_CLIENTS;
+				if (idx <= mc->focused_slot && mc->focused_slot >= 0) {
+					// Wrapped around — go to unfocused
+					break;
+				}
+				if (mc->clients[idx].active) {
+					mc->focused_slot = idx;
+					found = true;
+					break;
+				}
 			}
-			U_LOG_W("Multi-comp: TAB → focused slot %d", mc->focused_slot);
+			if (!found) {
+				mc->focused_slot = -1; // unfocused
+			}
+			U_LOG_W("Multi-comp: TAB → focused slot %d%s", mc->focused_slot,
+			        mc->focused_slot < 0 ? " (unfocused)" : "");
 			multi_compositor_update_input_forward(mc);
 		}
 	}
@@ -3287,6 +3314,84 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			sys->context->Draw(4, 0);
 		}
 		break; // Phase 0C.2: single client for now
+	}
+
+	// Draw cyan focus border around the focused app's window rect
+	if (mc->focused_slot >= 0 && mc->focused_slot < D3D11_MULTI_MAX_CLIENTS &&
+	    mc->clients[mc->focused_slot].active && sys->blit_vs && sys->blit_ps) {
+		uint32_t ca_w = sys->base.info.display_pixel_width;
+		uint32_t ca_h = sys->base.info.display_pixel_height;
+		if (ca_w == 0) ca_w = 3840;
+		if (ca_h == 0) ca_h = 2160;
+		uint32_t half_w = ca_w / sys->tile_columns;
+		uint32_t half_h = ca_h / sys->tile_rows;
+
+		float fx = (float)mc->clients[mc->focused_slot].window_rect_x / ca_w;
+		float fy = (float)mc->clients[mc->focused_slot].window_rect_y / ca_h;
+		float fw = (float)mc->clients[mc->focused_slot].window_rect_w / ca_w;
+		float fh = (float)mc->clients[mc->focused_slot].window_rect_h / ca_h;
+		float bw = 3.0f; // border width in pixels
+
+		// Set up pipeline for solid-color draw (use blit shader with special flag)
+		ID3D11RenderTargetView *ca_rtvs[] = {mc->combined_atlas_rtv.get()};
+		sys->context->OMSetRenderTargets(1, ca_rtvs, nullptr);
+		sys->context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+		sys->context->IASetInputLayout(nullptr);
+		sys->context->RSSetState(sys->rasterizer_state.get());
+		sys->context->OMSetDepthStencilState(sys->depth_disabled.get(), 0);
+		sys->context->VSSetShader(sys->blit_vs.get(), nullptr, 0);
+		sys->context->PSSetShader(sys->blit_ps.get(), nullptr, 0);
+		sys->context->VSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
+		sys->context->PSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
+		sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
+
+		// Draw border edges in each atlas half
+		uint32_t nv = sys->tile_columns * sys->tile_rows;
+		for (uint32_t v = 0; v < nv && v < XRT_MAX_VIEWS; v++) {
+			uint32_t col = v % sys->tile_columns;
+			uint32_t row = v / sys->tile_columns;
+			float ox = col * half_w + fx * half_w;
+			float oy = row * half_h + fy * half_h;
+			float ew = fw * half_w;
+			float eh = fh * half_h;
+
+			// 4 border rects: top, bottom, left, right
+			struct { float x, y, w, h; } edges[4] = {
+				{ox,          oy,          ew,  bw},          // top
+				{ox,          oy + eh - bw, ew, bw},          // bottom
+				{ox,          oy + bw,      bw,  eh - 2*bw},  // left
+				{ox + ew - bw, oy + bw,     bw,  eh - 2*bw},  // right
+			};
+
+			for (int e = 0; e < 4; e++) {
+				D3D11_MAPPED_SUBRESOURCE mapped;
+				if (FAILED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
+				           D3D11_MAP_WRITE_DISCARD, 0, &mapped))) continue;
+				BlitConstants *cb = static_cast<BlitConstants *>(mapped.pData);
+				// Use convert_srgb = 2.0 as a "solid color" flag
+				// The blit PS can check this and output cyan
+				cb->src_rect[0] = 0; cb->src_rect[1] = 0;
+				cb->src_rect[2] = 1; cb->src_rect[3] = 1;
+				cb->dst_offset[0] = edges[e].x;
+				cb->dst_offset[1] = edges[e].y;
+				cb->src_size[0] = 1; cb->src_size[1] = 1;
+				cb->dst_size[0] = (float)ca_w;
+				cb->dst_size[1] = (float)ca_h;
+				cb->convert_srgb = 2.0f; // solid color mode
+				cb->padding = 0;
+				cb->dst_rect_wh[0] = edges[e].w;
+				cb->dst_rect_wh[1] = edges[e].h;
+				cb->padding2[0] = 0; cb->padding2[1] = 0;
+				sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
+
+				D3D11_VIEWPORT vp = {};
+				vp.Width = (float)ca_w;
+				vp.Height = (float)ca_h;
+				vp.MaxDepth = 1.0f;
+				sys->context->RSSetViewports(1, &vp);
+				sys->context->Draw(4, 0);
+			}
+		}
 	}
 
 	// Send full combined atlas to DP — content is placed at sub-rect positions,

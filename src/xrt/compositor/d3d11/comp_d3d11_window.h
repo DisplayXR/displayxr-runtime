@@ -184,6 +184,19 @@ comp_d3d11_window_set_system_devices(struct comp_d3d11_window *window,
 void
 comp_d3d11_window_set_input_forward_hwnd(struct comp_d3d11_window *window, void *hwnd);
 
+/*!
+ * Set the shell display processor for ESC/close handling.
+ *
+ * When the shell window is closed (ESC or WM_CLOSE), this DP is switched
+ * to 2D mode (lens off). Required because multi_compositor_render may not
+ * run again after the last client disconnects.
+ *
+ * @param window The window object
+ * @param dp     The shell's display processor (opaque pointer)
+ */
+void
+comp_d3d11_window_set_shell_dp(struct comp_d3d11_window *window, void *dp);
+
 #ifdef __cplusplus
 }
 #endif

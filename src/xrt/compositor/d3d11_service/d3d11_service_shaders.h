@@ -567,12 +567,11 @@ float3 linear_to_srgb(float3 linear_color)
 
 float4 PSMain(VS_OUTPUT input) : SV_Target
 {
+    // Solid color mode: convert_srgb == 2.0 outputs cyan (focus border)
+    if (convert_srgb > 1.5)
+        return float4(0.0, 1.0, 1.0, 1.0); // cyan
+
     float4 color = src_tex.Sample(src_samp, input.uv);
-
-    // When source is SRGB, the SRV samples as linear (GPU auto-converts).
-    // We pass through linear values - the SR weaver handles sRGB encoding.
-    // (The convert_srgb flag is kept for potential future use but not applied here)
-
     return color;
 }
 )";
