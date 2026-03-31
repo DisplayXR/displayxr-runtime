@@ -17,7 +17,7 @@ Last updated: 2026-03-30 (branch `feature/shell-phase0-ci`)
 - App's HWND flows through IPC to server via `xrt_session_info.external_window_handle`
 - Identity pose fallback for ext_win apps when relation_flags=0 on early IPC frames
 
-### Phase 0C: Rendering pipeline (DONE — rendering correct, eye tracking pending)
+### Phase 0C: Rendering pipeline (DONE)
 - App HWND resized to native display (3840×2160) borderless for correct Kooima projection
 - Shell-mode client atlas + combined atlas sized to native display resolution
 - Tile positions in `compositor_layer_commit` use actual content view dimensions (not `sys->view_width`)
@@ -97,26 +97,25 @@ Service (displayxr-service --shell)
 
 ## Test Procedure
 
-```bash
-# Terminal 1: start service
-_package\bin\displayxr-service.exe --shell
+After `scripts\build_windows.bat test-apps`, run scripts are generated in `_package/`:
 
-# Terminal 2: launch app (set XR_RUNTIME_JSON for local dev builds)
-set XR_RUNTIME_JSON=build\Release\openxr_displayxr-dev.json
-set DISPLAYXR_SHELL_SESSION=1
-test_apps\cube_handle_d3d11_win\build\cube_handle_d3d11_win.exe
+```bash
+# Terminal 1: start shell service
+_package\run_shell_service.bat
+
+# Terminal 2: launch app in shell mode
+_package\run_shell_app.bat
 ```
 
-Expected: Cube renders centered with correct proportions and 3D weaving.
+Run scripts set `XR_RUNTIME_JSON` to the dev build automatically (required to bypass the installed runtime from CI builds).
+
+Expected: Cube renders centered with correct proportions, 3D weaving, and head tracking (scene responds to head movement after ~3 second face tracking warmup).
 Logs: `%LOCALAPPDATA%\DisplayXR\*.log`
 
 ## What's Next
 
-### Phase 0C.3: Live eye tracking for shell apps
-- Wire DP eye positions through IPC `xrLocateViews` path
-- App's Kooima projection should respond to head movement
-- Server has eye data (from DP), needs to flow into view poses returned to client
-
 ### Phase 0D: Input forwarding
-- Shell forwards keyboard/mouse from multi-comp window to focused app's HWND via PostMessage
-- Mouse coordinate mapping: 3D hit-test UV → HWND client pixels
+- 0D.1: Shell captures keyboard from multi-comp window, `PostMessage(focused_hwnd, WM_KEYDOWN, ...)`
+- 0D.2: Mouse coordinate mapping: 3D hit-test UV → HWND client pixels → `PostMessage(WM_MOUSEMOVE, ...)`
+- 0D.3: WASD/mouse in focused app moves app's camera (app handles it via its own WndProc)
+- Test: Focus cube app → WASD moves camera within cube scene → works identically to standalone
