@@ -1,4 +1,8 @@
-# Fresh Start: 3D Shell Multi-Compositor
+# Fresh Start: 3D Shell Multi-Compositor — COMPLETE
+
+> **Status:** Phase 0 is fully implemented and CI-validated on branch `feature/shell-phase0-ci`.
+> See `shell-phase0-status.md` for implementation details and lessons learned.
+> See `shell-phase1-plan.md` for the next milestone.
 
 ## Context
 
