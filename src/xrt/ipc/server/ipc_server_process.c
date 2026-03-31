@@ -613,11 +613,16 @@ handle_focused_client_events(volatile struct ipc_client_state *ics, int active_i
 	bool focused = false;
 	bool visible = false;
 
-	// Set visible + focused if we are the primary application
+	// Set visible + focused if we are the primary application.
+	// In shell mode, ALL clients are visible + focused (multi-app compositor).
 	if (ics->server_thread_index == active_id) {
 		visible = true;
 		focused = true;
 		z_order = INT64_MIN;
+	}
+	if (ics->server->xsysc != NULL && ics->server->xsysc->info.shell_mode) {
+		visible = true;
+		focused = true;
 	}
 
 	// Set all overlays to always active and focused.

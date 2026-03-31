@@ -2753,7 +2753,12 @@ multi_compositor_register_client(struct d3d11_service_system *sys, struct d3d11_
 			uint32_t disp_h = sys->base.info.display_pixel_height;
 			if (disp_w == 0) disp_w = 3840;
 			if (disp_h == 0) disp_h = 2160;
-			mc->clients[i].window_rect_x = disp_w * 5 / 100;
+			// Assign window rect based on slot index:
+			// Slot 0: left window at (5%, 5%, 40%, 40%)
+			// Slot 1: right window at (55%, 5%, 40%, 40%)
+			// Future slots: could tile further
+			uint32_t slot_x_pct = (i == 0) ? 5 : 55;
+			mc->clients[i].window_rect_x = disp_w * slot_x_pct / 100;
 			mc->clients[i].window_rect_y = disp_h * 5 / 100;
 			mc->clients[i].window_rect_w = disp_w * 40 / 100;
 			mc->clients[i].window_rect_h = disp_h * 40 / 100;
@@ -3185,10 +3190,10 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			if (disp_h == 0) disp_h = 2160;
 			int hwnd_x = ((int)disp_w - (int)hwnd_w) / 2;
 			int hwnd_y = ((int)disp_h - (int)hwnd_h) / 2;
-			SetWindowPos(mc->clients[s].app_hwnd, NULL,
+			SetWindowPos(mc->clients[s].app_hwnd, HWND_BOTTOM,
 			             hwnd_x, hwnd_y,
 			             (int)hwnd_w, (int)hwnd_h,
-			             SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+			             SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
 			mc->clients[s].hwnd_resize_pending = false;
 			U_LOG_W("Multi-comp: resized app HWND %p to pos=(%d,%d) size=%ux%u (centered, visual rect=%u,%u,%u,%u)",
 			        (void*)mc->clients[s].app_hwnd,
@@ -3313,7 +3318,6 @@ multi_compositor_render(struct d3d11_service_system *sys)
 
 			sys->context->Draw(4, 0);
 		}
-		break; // Phase 0C.2: single client for now
 	}
 
 	// Draw cyan focus border around the focused app's window rect

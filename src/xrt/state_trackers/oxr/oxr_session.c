@@ -2562,8 +2562,8 @@ oxr_session_create(struct oxr_logger *log,
 				// Make borderless so client area = exact display size.
 				// The app uses client area for Kooima and viewport sizing.
 				SetWindowLongPtr(hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
-				SetWindowPos(hwnd, NULL, 0, 0, (int)disp_px_w, (int)disp_px_h,
-				             SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+				SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, (int)disp_px_w, (int)disp_px_h,
+				             SWP_NOACTIVATE | SWP_FRAMECHANGED);
 				U_LOG_W("Shell session: resized app HWND %p to %ux%u borderless (display native)",
 				        hwnd, disp_px_w, disp_px_h);
 			}

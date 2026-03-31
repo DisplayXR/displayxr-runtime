@@ -281,6 +281,19 @@ for %%A in (cube_handle_d3d11_win cube_hosted_d3d11_win cube_handle_d3d12_win cu
     echo ^)
 )
 
+:: Shell mode: two apps (three-terminal or auto workflow)
+> "%PKG%\run_shell_2apps.bat" (
+    echo @echo off
+    echo set "XR_RUNTIME_JSON=%RT_JSON%"
+    echo set "DISPLAYXR_SHELL_SESSION=1"
+    echo echo Starting two shell apps...
+    echo start "" cmd /c "set XR_RUNTIME_JSON=%RT_JSON%^&^& set DISPLAYXR_SHELL_SESSION=1^&^& "%REPO%test_apps\cube_handle_d3d11_win\build\cube_handle_d3d11_win.exe""
+    echo timeout /t 3 /nobreak ^>nul
+    echo start "" cmd /c "set XR_RUNTIME_JSON=%RT_JSON%^&^& set DISPLAYXR_SHELL_SESSION=1^&^& "%REPO%test_apps\cube_handle_d3d11_win\build\cube_handle_d3d11_win.exe""
+    echo echo Both apps launched. Press any key to exit.
+    echo pause ^>nul
+)
+
 echo Run scripts generated in %PKG%\
 
 echo.
