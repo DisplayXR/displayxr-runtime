@@ -256,6 +256,20 @@ Copy binaries to `_package/DisplayXR-macOS/bin/`. Run scripts exec from `$DIR/bi
 
 `run_shell_app.bat` accepts an optional exe path argument to launch a different app in shell mode.
 
+**Shell mode — two apps (three terminals):**
+
+| Terminal | Script | Description |
+|----------|--------|-------------|
+| 1 | `_package\run_shell_service.bat` | Starts `displayxr-service --shell` |
+| 2 | `_package\run_shell_app.bat` | First app → slot 0 (left, 5%,5%,40%,40%) |
+| 3 | `_package\run_shell_app.bat` | Second app → slot 1 (right, 55%,5%,40%,40%) |
+
+Or: Terminal 1 + `_package\run_shell_2apps.bat` (launches both with 3s delay).
+
+**Shell controls:** TAB=cycle focus, DELETE=close app, ESC=dismiss shell, V=toggle 2D/3D, WASD/mouse=app input.
+
+**When launching from Claude Code:** bash `export` doesn't propagate env vars to Windows processes. Use `cmd.exe //c "set VAR=val&& app.exe"` instead. See `docs/roadmap/shell-phase1-status.md` for the full automated test procedure.
+
 ## Documentation
 
 See `docs/README.md` for a complete index. Key docs by task:
