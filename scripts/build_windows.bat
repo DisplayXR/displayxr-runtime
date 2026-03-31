@@ -242,6 +242,47 @@ if exist "%REPO%test_apps\cube_ipc_d3d11_win\CMakeLists.txt" (
     if defined LOADER_DLL copy /Y "%LOADER_DLL%" "%REPO%test_apps\cube_ipc_d3d11_win\build\" >nul
 )
 
+:: ============================================================
+:: 7. Generate run scripts (like macOS run_*.sh pattern)
+:: ============================================================
+echo.
+echo === Generating run scripts ===
+
+set "RT_JSON=%REPO%build\Release\openxr_displayxr-dev.json"
+set "PKG=%REPO%_package"
+
+:: Run scripts for standalone test apps (each sets XR_RUNTIME_JSON to dev build)
+for %%A in (cube_handle_d3d11_win cube_hosted_d3d11_win cube_handle_d3d12_win cube_handle_gl_win cube_handle_vk_win) do (
+    if exist "%REPO%test_apps\%%A\build\%%A.exe" (
+        > "%PKG%\run_%%A.bat" (
+            echo @echo off
+            echo set "XR_RUNTIME_JSON=%RT_JSON%"
+            echo "%REPO%test_apps\%%A\build\%%A.exe" %%*
+        )
+    )
+)
+
+:: Shell mode: service + app (two-terminal workflow)
+> "%PKG%\run_shell_service.bat" (
+    echo @echo off
+    echo echo Starting displayxr-service in shell mode...
+    echo "%PKG%\bin\displayxr-service.exe" --shell
+)
+> "%PKG%\run_shell_app.bat" (
+    echo @echo off
+    echo set "XR_RUNTIME_JSON=%RT_JSON%"
+    echo set "DISPLAYXR_SHELL_SESSION=1"
+    echo echo XR_RUNTIME_JSON=%%XR_RUNTIME_JSON%%
+    echo echo DISPLAYXR_SHELL_SESSION=%%DISPLAYXR_SHELL_SESSION%%
+    echo if "%%~1"=="" (
+    echo     "%REPO%test_apps\cube_handle_d3d11_win\build\cube_handle_d3d11_win.exe"
+    echo ^) else (
+    echo     "%%~1"
+    echo ^)
+)
+
+echo Run scripts generated in %PKG%\
+
 echo.
 echo === Test apps done ===
 
