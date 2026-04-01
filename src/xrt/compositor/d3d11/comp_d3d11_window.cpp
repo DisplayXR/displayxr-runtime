@@ -37,6 +37,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <windowsx.h> // GET_X_LPARAM, GET_Y_LPARAM
 
 #include <stdlib.h>
 #include <string.h>
@@ -122,6 +123,13 @@ struct comp_d3d11_window
 	//! Target HWND for input forwarding in shell mode (NULL = disabled).
 	//! When set, non-shell keyboard and mouse input is forwarded to this HWND.
 	volatile HWND input_forward_hwnd;
+
+	//! Focused window rect in shell-window client pixels (for mouse coord remapping).
+	//! When forwarding mouse events, shell coords are remapped to app-local coords.
+	volatile LONG input_forward_rect_x;
+	volatile LONG input_forward_rect_y;
+	volatile LONG input_forward_rect_w;
+	volatile LONG input_forward_rect_h;
 
 	//! Shell display processor for ESC/close 2D mode switch (opaque, can be NULL).
 	volatile void *shell_dp;
@@ -378,8 +386,32 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	case WM_MOUSEWHEEL: {
 		HWND fwd = (HWND)InterlockedCompareExchangePointer((volatile PVOID *)&w->input_forward_hwnd, NULL, NULL);
 		if (fwd != NULL) {
-			// Shell mode: forward mouse to focused app's HWND (1:1 for fullscreen)
-			PostMessage(fwd, message, wParam, lParam);
+			// Shell mode: remap shell-window coords to app-window coords
+			LONG rx = InterlockedCompareExchange(&w->input_forward_rect_x, 0, 0);
+			LONG ry = InterlockedCompareExchange(&w->input_forward_rect_y, 0, 0);
+			LONG rw = InterlockedCompareExchange(&w->input_forward_rect_w, 0, 0);
+			LONG rh = InterlockedCompareExchange(&w->input_forward_rect_h, 0, 0);
+
+			if (message == WM_MOUSEWHEEL) {
+				// WM_MOUSEWHEEL uses screen coords — forward as-is
+				PostMessage(fwd, message, wParam, lParam);
+			} else if (rw > 0 && rh > 0) {
+				// Extract shell-window client coords
+				int shell_x = GET_X_LPARAM(lParam);
+				int shell_y = GET_Y_LPARAM(lParam);
+
+				// Only forward if inside the focused window's rect
+				if (shell_x >= rx && shell_x < rx + rw &&
+				    shell_y >= ry && shell_y < ry + rh) {
+					// Remap to app-window client coords (offset only, no scale)
+					int app_x = shell_x - rx;
+					int app_y = shell_y - ry;
+					PostMessage(fwd, message, wParam, MAKELPARAM(app_x, app_y));
+				}
+			} else {
+				// No rect set — fallback to 1:1 forwarding
+				PostMessage(fwd, message, wParam, lParam);
+			}
 			return 0;
 		}
 		// Normal mode: pass to qwerty driver
@@ -758,16 +790,27 @@ comp_d3d11_window_set_system_devices(struct comp_d3d11_window *window,
 }
 
 extern "C" void
-comp_d3d11_window_set_input_forward_hwnd(struct comp_d3d11_window *window, void *hwnd)
+comp_d3d11_window_set_input_forward(struct comp_d3d11_window *window,
+                                     void *hwnd,
+                                     int32_t rect_x,
+                                     int32_t rect_y,
+                                     int32_t rect_w,
+                                     int32_t rect_h)
 {
 	if (window == NULL) {
 		return;
 	}
 
+	// Write rect first (before HWND) so the WndProc sees consistent values
+	InterlockedExchange(&window->input_forward_rect_x, (LONG)rect_x);
+	InterlockedExchange(&window->input_forward_rect_y, (LONG)rect_y);
+	InterlockedExchange(&window->input_forward_rect_w, (LONG)rect_w);
+	InterlockedExchange(&window->input_forward_rect_h, (LONG)rect_h);
 	InterlockedExchangePointer((volatile PVOID *)&window->input_forward_hwnd, (PVOID)hwnd);
 
 	if (hwnd != NULL) {
-		U_LOG_W("D3D11 window: input forwarding enabled → HWND=%p", hwnd);
+		U_LOG_W("D3D11 window: input forwarding enabled → HWND=%p rect=(%d,%d,%d,%d)",
+		        hwnd, rect_x, rect_y, rect_w, rect_h);
 	} else {
 		U_LOG_W("D3D11 window: input forwarding disabled");
 	}

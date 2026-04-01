@@ -168,21 +168,30 @@ comp_d3d11_window_set_system_devices(struct comp_d3d11_window *window,
                                       struct xrt_system_devices *xsysd);
 
 /*!
- * Set the target HWND for input forwarding (shell mode).
+ * Set the target HWND and window rect for input forwarding (shell mode).
  *
- * When set to a non-NULL value, the window enters shell input-forwarding mode:
- * - Shell-reserved keys (ESC, V, P, 1/2/3, SPACE) go to qwerty as before
+ * When hwnd is non-NULL, the window enters shell input-forwarding mode:
+ * - Shell-reserved keys (ESC, TAB, DELETE) are consumed by the shell
  * - All other keyboard input is forwarded to the target HWND via PostMessage
- * - Mouse events are forwarded to the target HWND (1:1 coordinate mapping)
- * - TAB and DELETE are consumed by the shell (not forwarded)
+ * - Mouse events are remapped from shell-window coords to app-window coords
+ *   using the provided rect, then forwarded. Mouse outside the rect is not forwarded.
  *
- * When set to NULL, normal qwerty handling resumes.
+ * When hwnd is NULL, normal qwerty handling resumes.
  *
  * @param window The window object
  * @param hwnd   The focused app's HWND (NULL to disable forwarding)
+ * @param rect_x Virtual window left edge in shell-window client pixels
+ * @param rect_y Virtual window top edge in shell-window client pixels
+ * @param rect_w Virtual window width in shell-window client pixels
+ * @param rect_h Virtual window height in shell-window client pixels
  */
 void
-comp_d3d11_window_set_input_forward_hwnd(struct comp_d3d11_window *window, void *hwnd);
+comp_d3d11_window_set_input_forward(struct comp_d3d11_window *window,
+                                     void *hwnd,
+                                     int32_t rect_x,
+                                     int32_t rect_y,
+                                     int32_t rect_w,
+                                     int32_t rect_h);
 
 /*!
  * Set the shell display processor for ESC/close handling.

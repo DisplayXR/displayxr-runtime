@@ -104,39 +104,42 @@ Terminal 3: _package\run_shell_app.bat     (→ slot 1, right)
 
 ### Run from Claude Code (automated testing)
 
-When launching from Claude Code background commands, bash `export` does NOT propagate env vars to Windows processes. Use `cmd.exe //c "set VAR=val&& app.exe"` instead. All commands from repo root.
+Bash `export` does NOT propagate env vars to Windows processes. Use `cmd.exe //c "set VAR=val&& app.exe"` instead. **Paths with spaces** (e.g. `Sparks i7 3080`) break when embedded in `cmd.exe` set chains — use `cd` to the repo root first, then `%CD%`-relative paths so `cmd.exe` resolves them from the working directory.
+
+Each step uses a separate Bash tool call with `run_in_background: true` and `timeout: 600000`.
 
 ```bash
 # Step 1: Kill leftover processes
 taskkill //F //IM displayxr-service.exe 2>&1 || true
 taskkill //F //IM cube_handle_d3d11_win.exe 2>&1 || true
-sleep 2
 
-# Step 2: Start service (background, 10-min timeout)
-"_package/bin/displayxr-service.exe" --shell &
-# Use: run_in_background: true, timeout: 600000
+# Step 2: Start service (run_in_background: true, timeout: 600000)
+cd "/c/Users/Sparks i7 3080/Documents/GitHub/openxr-3d-display" && _package/bin/displayxr-service.exe --shell
 
-# Step 3: Start first app (5s delay, background)
-sleep 5 && cmd.exe //c "set XR_RUNTIME_JSON=C:\Users\Sparks i7 3080\Documents\GitHub\openxr-3d-display\build\Release\openxr_displayxr-dev.json&& set DISPLAYXR_SHELL_SESSION=1&& test_apps\cube_handle_d3d11_win\build\cube_handle_d3d11_win.exe"
-# Use: run_in_background: true, timeout: 600000
+# Step 3: Start first app (run_in_background: true, timeout: 600000)
+# %CD% expands inside cmd.exe to the working directory, handling spaces correctly
+sleep 5 && cd "/c/Users/Sparks i7 3080/Documents/GitHub/openxr-3d-display" && cmd.exe //c "set XR_RUNTIME_JSON=%CD%\build\Release\openxr_displayxr-dev.json&& set DISPLAYXR_SHELL_SESSION=1&& test_apps\cube_handle_d3d11_win\build\cube_handle_d3d11_win.exe"
 
-# Step 4: Start second app (same command, another 5s delay)
-# Same as Step 3 — service assigns it to slot 1 automatically
+# Step 4: Start second app (run_in_background: true, timeout: 600000)
+# Same as Step 3 with longer delay — service assigns it to slot 1 automatically
+sleep 12 && cd "/c/Users/Sparks i7 3080/Documents/GitHub/openxr-3d-display" && cmd.exe //c "set XR_RUNTIME_JSON=%CD%\build\Release\openxr_displayxr-dev.json&& set DISPLAYXR_SHELL_SESSION=1&& test_apps\cube_handle_d3d11_win\build\cube_handle_d3d11_win.exe"
 ```
 
 **Important notes:**
+- `cd` to repo root BEFORE `cmd.exe` — bash handles the spaces in the `cd` path, then `%CD%` inside cmd.exe expands to the full Windows path without quoting issues
 - No spaces between `val&&` in `cmd.exe set` — trailing spaces become part of the value
+- Do NOT use `&` to background the service — use `run_in_background: true` on the Bash tool call instead, otherwise bash kills the process when it moves on
 - `XR_RUNTIME_JSON` points to the dev build DLL, bypassing the installed runtime
 - `DISPLAYXR_SHELL_SESSION=1` forces IPC/shell mode
-- 5-second `sleep` between launches gives each process time to connect
+- 5-second `sleep` before first app, 12-second before second — gives each process time to connect
 - `timeout: 600000` (10 minutes) gives the user time to interact
 - After rebuilding `.cpp` files, delete `.obj` to force recompilation (ninja timestamp issues)
 
 **Check results:**
 ```bash
-grep -E "registered client|resized app|TAB|DELETE|display mode" \
-  "/c/Users/Sparks i7 3080/AppData/Local/DisplayXR/$(ls -t '/c/Users/Sparks i7 3080/AppData/Local/DisplayXR/' | grep service | head -1)" \
-  | head -15
+grep -E "registered client|resized app|TAB|DELETE|click|focused" \
+  "$(ls -t '/c/Users/Sparks i7 3080/AppData/Local/DisplayXR/'*service* | head -1)" \
+  | head -20
 ```
 
 **Shell controls:**

@@ -128,6 +128,48 @@ comp_d3d11_service_get_window_metrics(struct xrt_system_compositor *xsysc,
                                        struct xrt_window_metrics *out_metrics);
 
 /*!
+ * Set a client's virtual window pose and dimensions.
+ *
+ * Updates the window position, orientation, and size for the given client
+ * compositor. The multi-compositor will recompute the pixel rect and trigger
+ * a deferred HWND resize on the next render frame.
+ *
+ * @param xsysc The system compositor (must be D3D11 service compositor).
+ * @param xc The client's compositor (used to find the multi-comp slot).
+ * @param pose Window pose in display space (meters from display center).
+ * @param width_m Window physical width in meters.
+ * @param height_m Window physical height in meters.
+ * @return true if the pose was applied, false otherwise.
+ *
+ * @ingroup comp_d3d11_service
+ */
+bool
+comp_d3d11_service_set_client_window_pose(struct xrt_system_compositor *xsysc,
+                                           struct xrt_compositor *xc,
+                                           const struct xrt_pose *pose,
+                                           float width_m,
+                                           float height_m);
+
+/*!
+ * Get per-client virtual window metrics for Kooima projection.
+ *
+ * Returns window dimensions and center offset based on the client's virtual
+ * window pose, not the physical HWND position. Used by the IPC view pose
+ * computation to produce correct per-client Kooima projections.
+ *
+ * @param xsysc The system compositor (must be D3D11 service compositor).
+ * @param xc The client's compositor (used to find the multi-comp slot).
+ * @param[out] out_metrics Filled with virtual window dimensions and center offset.
+ * @return true if metrics were obtained, false otherwise.
+ *
+ * @ingroup comp_d3d11_service
+ */
+bool
+comp_d3d11_service_get_client_window_metrics(struct xrt_system_compositor *xsysc,
+                                              struct xrt_compositor *xc,
+                                              struct xrt_window_metrics *out_metrics);
+
+/*!
  * Check if the compositor's window is still valid (not closed by user).
  *
  * This should be checked periodically by the IPC server to detect when

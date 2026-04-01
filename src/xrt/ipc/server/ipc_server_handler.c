@@ -83,6 +83,7 @@ validate_device_id(volatile struct ipc_client_state *ics, int64_t device_id, str
  */
 static bool
 ipc_try_get_sr_view_poses(struct ipc_server *s,
+                          struct xrt_compositor *xc,
                           struct xrt_device *xdev,
                           const struct xrt_vec3 *fallback_eye_relation,
                           int64_t at_timestamp_ns,
@@ -145,14 +146,27 @@ ipc_try_get_sr_view_poses(struct ipc_server *s,
 		if (eye_count > 1) raw_eyes[1] = right_eye;
 	}
 
-	// Get screen dimensions for Kooima FOV (prefer window metrics, fall back to display)
+	// Get screen dimensions for Kooima FOV
+	// Try per-client window metrics first (shell mode dynamic windows),
+	// then fall back to global window metrics, then display dimensions.
 	float screen_width_m, screen_height_m;
 	float eye_offset_x = 0.0f, eye_offset_y = 0.0f;
 	{
 		struct xrt_window_metrics wm = {0};
-		if (comp_d3d11_service_get_window_metrics(s->xsysc, &wm) &&
-		    wm.valid && wm.window_width_m > 0.0f && wm.window_height_m > 0.0f) {
-			// Window-relative Kooima: use actual window dims
+		bool have_wm = false;
+
+		// Per-client metrics: virtual window size + center offset from pose
+		if (xc != NULL) {
+			have_wm = comp_d3d11_service_get_client_window_metrics(s->xsysc, xc, &wm) &&
+			          wm.valid && wm.window_width_m > 0.0f && wm.window_height_m > 0.0f;
+		}
+		// Global window metrics fallback
+		if (!have_wm) {
+			have_wm = comp_d3d11_service_get_window_metrics(s->xsysc, &wm) &&
+			          wm.valid && wm.window_width_m > 0.0f && wm.window_height_m > 0.0f;
+		}
+
+		if (have_wm) {
 			screen_width_m = wm.window_width_m;
 			screen_height_m = wm.window_height_m;
 			eye_offset_x = wm.window_center_offset_x_m;
@@ -1913,6 +1927,58 @@ ipc_handle_system_toggle_io_device(volatile struct ipc_client_state *ics, uint32
 }
 
 xrt_result_t
+ipc_handle_shell_set_window_pose(volatile struct ipc_client_state *_ics,
+                                  uint32_t client_id,
+                                  const struct xrt_pose *pose,
+                                  float width_m,
+                                  float height_m)
+{
+	struct ipc_server *s = _ics->server;
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (s->xsysc == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	IPC_INFO(s, "Shell: set_window_pose client_id=%u pos=(%.3f,%.3f,%.3f) size=%.3fx%.3f",
+	         client_id, pose->position.x, pose->position.y, pose->position.z,
+	         width_m, height_m);
+
+	// Find target client by ID
+	os_mutex_lock(&s->global_state.lock);
+
+	volatile struct ipc_client_state *target_ics = NULL;
+	for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
+		volatile struct ipc_client_state *ics = &s->threads[i].ics;
+		if (ics->client_state.id == client_id && ics->server_thread_index >= 0) {
+			target_ics = ics;
+			break;
+		}
+	}
+
+	if (target_ics == NULL || target_ics->xc == NULL) {
+		os_mutex_unlock(&s->global_state.lock);
+		IPC_WARN(s, "Shell: set_window_pose - client %u not found", client_id);
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	bool ok = comp_d3d11_service_set_client_window_pose(
+	    s->xsysc, (struct xrt_compositor *)target_ics->xc, pose, width_m, height_m);
+
+	os_mutex_unlock(&s->global_state.lock);
+
+	return ok ? XRT_SUCCESS : XRT_ERROR_IPC_FAILURE;
+#else
+	(void)s;
+	(void)client_id;
+	(void)pose;
+	(void)width_m;
+	(void)height_m;
+	return XRT_ERROR_IPC_FAILURE;
+#endif
+}
+
+xrt_result_t
 ipc_handle_swapchain_get_properties(volatile struct ipc_client_state *ics,
                                     const struct xrt_swapchain_create_info *info,
                                     struct xrt_swapchain_create_properties *xsccp)
@@ -2328,8 +2394,8 @@ ipc_handle_device_get_view_poses(volatile struct ipc_client_state *ics,
 	struct xrt_pose poses[IPC_MAX_RAW_VIEWS];
 
 #if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
-	// Try SR-aware view poses first
-	if (ipc_try_get_sr_view_poses(s, xdev, fallback_eye_relation, at_timestamp_ns,
+	// Try SR-aware view poses first (pass client compositor for per-client window metrics)
+	if (ipc_try_get_sr_view_poses(s, (struct xrt_compositor *)ics->xc, xdev, fallback_eye_relation, at_timestamp_ns,
 	                               view_count, &reply.head_relation, fovs, poses)) {
 		reply.result = XRT_SUCCESS;
 	} else
@@ -2395,8 +2461,8 @@ ipc_handle_device_get_view_poses_2(volatile struct ipc_client_state *ics,
 	GET_XDEV_OR_RETURN(ics, device_id, xdev);
 
 #if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
-	// Try SR-aware view poses first
-	if (ipc_try_get_sr_view_poses(ics->server, xdev, default_eye_relation, at_timestamp_ns,
+	// Try SR-aware view poses first (pass client compositor for per-client window metrics)
+	if (ipc_try_get_sr_view_poses(ics->server, (struct xrt_compositor *)ics->xc, xdev, default_eye_relation, at_timestamp_ns,
 	                               view_count, &out_info->head_relation, out_info->fovs, out_info->poses)) {
 		return XRT_SUCCESS;
 	}

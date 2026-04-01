@@ -56,6 +56,15 @@
 		]
 	},
 
+	"shell_set_window_pose": {
+		"in": [
+			{"name": "client_id", "type": "uint32_t"},
+			{"name": "pose", "type": "struct xrt_pose"},
+			{"name": "width_m", "type": "float"},
+			{"name": "height_m", "type": "float"}
+		]
+	},
+
 	"system_devices_get_roles": {
 		"out": [
 			{"name": "system_roles", "type": "struct xrt_system_roles"}

@@ -2720,13 +2720,25 @@ multi_compositor_update_input_forward(struct d3d11_multi_compositor *mc)
 	}
 
 	HWND target = NULL;
+	int32_t rx = 0, ry = 0, rw = 0, rh = 0;
 	if (mc->focused_slot >= 0 && mc->focused_slot < D3D11_MULTI_MAX_CLIENTS &&
 	    mc->clients[mc->focused_slot].active) {
 		target = mc->clients[mc->focused_slot].app_hwnd;
+		rx = (int32_t)mc->clients[mc->focused_slot].window_rect_x;
+		ry = (int32_t)mc->clients[mc->focused_slot].window_rect_y;
+		rw = (int32_t)mc->clients[mc->focused_slot].window_rect_w;
+		rh = (int32_t)mc->clients[mc->focused_slot].window_rect_h;
 	}
 
-	comp_d3d11_window_set_input_forward_hwnd(mc->window, (void *)target);
+	comp_d3d11_window_set_input_forward(mc->window, (void *)target, rx, ry, rw, rh);
 }
+
+// Forward declaration — defined in the external API section below.
+static void
+slot_pose_to_pixel_rect(const struct d3d11_service_system *sys,
+                        const struct d3d11_multi_client_slot *slot,
+                        uint32_t *out_x, uint32_t *out_y,
+                        uint32_t *out_w, uint32_t *out_h);
 
 /*!
  * Register a per-client compositor with the multi-compositor.
@@ -2744,24 +2756,39 @@ multi_compositor_register_client(struct d3d11_service_system *sys, struct d3d11_
 		if (!mc->clients[i].active) {
 			mc->clients[i].compositor = c;
 			mc->clients[i].active = true;
-			mc->clients[i].window_pose = XRT_POSE_IDENTITY;
-			mc->clients[i].window_width_m = sys->base.info.display_width_m;
-			mc->clients[i].window_height_m = sys->base.info.display_height_m;
 
-			// Set window rect in display pixels (5%, 5%, 40%, 40% of native)
-			uint32_t disp_w = sys->base.info.display_pixel_width;
-			uint32_t disp_h = sys->base.info.display_pixel_height;
-			if (disp_w == 0) disp_w = 3840;
-			if (disp_h == 0) disp_h = 2160;
-			// Assign window rect based on slot index:
-			// Slot 0: left window at (5%, 5%, 40%, 40%)
-			// Slot 1: right window at (55%, 5%, 40%, 40%)
-			// Future slots: could tile further
-			uint32_t slot_x_pct = (i == 0) ? 5 : 55;
-			mc->clients[i].window_rect_x = disp_w * slot_x_pct / 100;
-			mc->clients[i].window_rect_y = disp_h * 5 / 100;
-			mc->clients[i].window_rect_w = disp_w * 40 / 100;
-			mc->clients[i].window_rect_h = disp_h * 40 / 100;
+			// Default window pose: 40% of display size, placed in left/right halves.
+			// Convention: position is meters from display center, +X right, +Y up.
+			// Slot 0: left window centered at (-25%, +25%) of display
+			// Slot 1: right window centered at (+25%, +25%) of display
+			float disp_w_m = sys->base.info.display_width_m;
+			float disp_h_m = sys->base.info.display_height_m;
+			if (disp_w_m <= 0.0f) disp_w_m = 0.700f;
+			if (disp_h_m <= 0.0f) disp_h_m = 0.394f;
+
+			float win_w_m = disp_w_m * 0.40f;
+			float win_h_m = disp_h_m * 0.40f;
+			// Slot 0 center: (-0.25 * disp_w, +0.25 * disp_h) → left, upper
+			// Slot 1 center: (+0.25 * disp_w, +0.25 * disp_h) → right, upper
+			float center_x_m = (i == 0) ? (-0.25f * disp_w_m) : (+0.25f * disp_w_m);
+			float center_y_m = 0.25f * disp_h_m;  // +Y up = upper half
+
+			mc->clients[i].window_pose.orientation.x = 0.0f;
+			mc->clients[i].window_pose.orientation.y = 0.0f;
+			mc->clients[i].window_pose.orientation.z = 0.0f;
+			mc->clients[i].window_pose.orientation.w = 1.0f;
+			mc->clients[i].window_pose.position.x = center_x_m;
+			mc->clients[i].window_pose.position.y = center_y_m;
+			mc->clients[i].window_pose.position.z = 0.0f;
+			mc->clients[i].window_width_m = win_w_m;
+			mc->clients[i].window_height_m = win_h_m;
+
+			// Compute pixel rect from pose
+			slot_pose_to_pixel_rect(sys, &mc->clients[i],
+			                        &mc->clients[i].window_rect_x,
+			                        &mc->clients[i].window_rect_y,
+			                        &mc->clients[i].window_rect_w,
+			                        &mc->clients[i].window_rect_h);
 			mc->clients[i].hwnd_resize_pending = true;
 
 			mc->client_count++;
@@ -3123,6 +3150,50 @@ multi_compositor_render(struct d3d11_service_system *sys)
 				xse.type = XRT_SESSION_EVENT_EXIT_REQUEST;
 				xrt_session_event_sink_push(fc->xses, &xse);
 				U_LOG_W("Multi-comp: DELETE → exit request for slot %d", mc->focused_slot);
+			}
+		}
+	}
+
+	// Left-click: focus the window under the cursor (click-to-focus)
+	if (GetAsyncKeyState(VK_LBUTTON) & 1) {
+		POINT pt;
+		GetCursorPos(&pt);
+		ScreenToClient(mc->hwnd, &pt);
+
+		int hit_slot = -1;
+		for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
+			if (!mc->clients[i].active) {
+				continue;
+			}
+			int32_t rx = (int32_t)mc->clients[i].window_rect_x;
+			int32_t ry = (int32_t)mc->clients[i].window_rect_y;
+			int32_t rw = (int32_t)mc->clients[i].window_rect_w;
+			int32_t rh = (int32_t)mc->clients[i].window_rect_h;
+			if (pt.x >= rx && pt.x < rx + rw && pt.y >= ry && pt.y < ry + rh) {
+				hit_slot = i;
+				break; // First hit wins
+			}
+		}
+
+		if (hit_slot != mc->focused_slot) {
+			mc->focused_slot = hit_slot;
+			U_LOG_W("Multi-comp: click → focused slot %d%s", mc->focused_slot,
+			        mc->focused_slot < 0 ? " (unfocused)" : "");
+			multi_compositor_update_input_forward(mc);
+
+			// Synthesize mouse-move + click to the newly focused app so the
+			// user doesn't have to click twice (once to focus, once to interact).
+			// The WM_MOUSEMOVE primes the app's internal cursor tracker so the
+			// first drag delta is zero (no viewpoint jump).
+			if (hit_slot >= 0 && mc->clients[hit_slot].app_hwnd != nullptr) {
+				int32_t rx = (int32_t)mc->clients[hit_slot].window_rect_x;
+				int32_t ry = (int32_t)mc->clients[hit_slot].window_rect_y;
+				int app_x = pt.x - rx;
+				int app_y = pt.y - ry;
+				LPARAM lp = MAKELPARAM(app_x, app_y);
+				PostMessage(mc->clients[hit_slot].app_hwnd, WM_MOUSEMOVE, 0, lp);
+				PostMessage(mc->clients[hit_slot].app_hwnd, WM_LBUTTONDOWN,
+				            MK_LBUTTON, lp);
 			}
 		}
 	}
@@ -4992,6 +5063,207 @@ comp_d3d11_service_get_window_metrics(struct xrt_system_compositor *xsysc,
 	out_metrics->window_screen_top = static_cast<int32_t>(client_origin.y);
 	out_metrics->window_width_m = win_w_m;
 	out_metrics->window_height_m = win_h_m;
+	out_metrics->window_center_offset_x_m = offset_x_m;
+	out_metrics->window_center_offset_y_m = offset_y_m;
+	out_metrics->valid = true;
+
+	return true;
+}
+
+/*!
+ * Convert a slot's 3D window pose + dimensions to a pixel rect in the combined atlas.
+ *
+ * For Phase 1B (z=0, identity orientation) this is a direct meters-to-pixels conversion.
+ * Future phases can handle perspective projection for depth/rotation.
+ *
+ * Convention: pose.position is in meters from display center, +X right, +Y up.
+ * Pixel rect origin is top-left of display.
+ */
+static void
+slot_pose_to_pixel_rect(const struct d3d11_service_system *sys,
+                        const struct d3d11_multi_client_slot *slot,
+                        uint32_t *out_x, uint32_t *out_y,
+                        uint32_t *out_w, uint32_t *out_h)
+{
+	float disp_w_m = sys->base.info.display_width_m;
+	float disp_h_m = sys->base.info.display_height_m;
+	uint32_t disp_px_w = sys->base.info.display_pixel_width;
+	uint32_t disp_px_h = sys->base.info.display_pixel_height;
+
+	if (disp_w_m <= 0.0f || disp_h_m <= 0.0f || disp_px_w == 0 || disp_px_h == 0) {
+		// Fallback: use defaults
+		disp_px_w = 3840;
+		disp_px_h = 2160;
+		disp_w_m = 0.700f;
+		disp_h_m = 0.394f;
+	}
+
+	float px_per_m_x = (float)disp_px_w / disp_w_m;
+	float px_per_m_y = (float)disp_px_h / disp_h_m;
+
+	// Window size in pixels
+	uint32_t w_px = (uint32_t)(slot->window_width_m * px_per_m_x + 0.5f);
+	uint32_t h_px = (uint32_t)(slot->window_height_m * px_per_m_y + 0.5f);
+
+	// Window center in pixels from display top-left
+	// pose.position.x: meters from display center, +X right
+	// pose.position.y: meters from display center, +Y up (flip for pixel Y)
+	float center_px_x = (float)disp_px_w / 2.0f + slot->window_pose.position.x * px_per_m_x;
+	float center_px_y = (float)disp_px_h / 2.0f - slot->window_pose.position.y * px_per_m_y;
+
+	// Top-left corner
+	int32_t x = (int32_t)(center_px_x - (float)w_px / 2.0f + 0.5f);
+	int32_t y = (int32_t)(center_px_y - (float)h_px / 2.0f + 0.5f);
+
+	// Clamp to display bounds
+	if (x < 0) x = 0;
+	if (y < 0) y = 0;
+	if ((uint32_t)x + w_px > disp_px_w) w_px = disp_px_w - (uint32_t)x;
+	if ((uint32_t)y + h_px > disp_px_h) h_px = disp_px_h - (uint32_t)y;
+
+	*out_x = (uint32_t)x;
+	*out_y = (uint32_t)y;
+	*out_w = w_px;
+	*out_h = h_px;
+}
+
+/*!
+ * Find the multi-comp slot index for a given per-client compositor.
+ * Returns -1 if not found.
+ */
+static int
+multi_comp_find_slot(const struct d3d11_multi_compositor *mc,
+                     const struct d3d11_service_compositor *c)
+{
+	if (mc == nullptr || c == nullptr) {
+		return -1;
+	}
+	for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
+		if (mc->clients[i].active && mc->clients[i].compositor == c) {
+			return i;
+		}
+	}
+	return -1;
+}
+
+bool
+comp_d3d11_service_set_client_window_pose(struct xrt_system_compositor *xsysc,
+                                           struct xrt_compositor *xc,
+                                           const struct xrt_pose *pose,
+                                           float width_m,
+                                           float height_m)
+{
+	if (xsysc == nullptr || xc == nullptr || pose == nullptr) {
+		return false;
+	}
+
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	if (!sys->shell_mode || sys->multi_comp == nullptr) {
+		return false;
+	}
+
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+
+	// Clamp dimensions to minimum 5% of display
+	float min_dim = 0.02f; // ~2cm minimum
+	if (width_m < min_dim) width_m = min_dim;
+	if (height_m < min_dim) height_m = min_dim;
+
+	std::lock_guard<std::mutex> lock(sys->render_mutex);
+
+	int slot = multi_comp_find_slot(mc, c);
+	if (slot < 0) {
+		return false;
+	}
+
+	mc->clients[slot].window_pose = *pose;
+	mc->clients[slot].window_width_m = width_m;
+	mc->clients[slot].window_height_m = height_m;
+
+	// Recompute pixel rect from pose
+	slot_pose_to_pixel_rect(sys, &mc->clients[slot],
+	                        &mc->clients[slot].window_rect_x,
+	                        &mc->clients[slot].window_rect_y,
+	                        &mc->clients[slot].window_rect_w,
+	                        &mc->clients[slot].window_rect_h);
+
+	mc->clients[slot].hwnd_resize_pending = true;
+
+	U_LOG_W("Shell: set window pose slot %d pos=(%.3f,%.3f,%.3f) size=%.3fx%.3f → rect=(%u,%u,%u,%u)",
+	        slot, pose->position.x, pose->position.y, pose->position.z,
+	        width_m, height_m,
+	        mc->clients[slot].window_rect_x, mc->clients[slot].window_rect_y,
+	        mc->clients[slot].window_rect_w, mc->clients[slot].window_rect_h);
+
+	return true;
+}
+
+bool
+comp_d3d11_service_get_client_window_metrics(struct xrt_system_compositor *xsysc,
+                                              struct xrt_compositor *xc,
+                                              struct xrt_window_metrics *out_metrics)
+{
+	if (xsysc == nullptr || xc == nullptr || out_metrics == nullptr) {
+		if (out_metrics != nullptr) {
+			out_metrics->valid = false;
+		}
+		return false;
+	}
+
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	if (!sys->shell_mode || sys->multi_comp == nullptr) {
+		out_metrics->valid = false;
+		return false;
+	}
+
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+
+	int slot_idx = multi_comp_find_slot(mc, c);
+	if (slot_idx < 0) {
+		out_metrics->valid = false;
+		return false;
+	}
+
+	const struct d3d11_multi_client_slot *slot = &mc->clients[slot_idx];
+
+	// Get display physical dimensions
+	float disp_w_m = sys->base.info.display_width_m;
+	float disp_h_m = sys->base.info.display_height_m;
+	uint32_t disp_px_w = sys->base.info.display_pixel_width;
+	uint32_t disp_px_h = sys->base.info.display_pixel_height;
+
+	if (disp_w_m <= 0.0f || disp_h_m <= 0.0f || disp_px_w == 0 || disp_px_h == 0) {
+		out_metrics->valid = false;
+		return false;
+	}
+
+	// Get display screen position from DP (needed for display_screen_left/top)
+	int32_t disp_left = 0, disp_top = 0;
+	if (mc->display_processor != nullptr) {
+		xrt_display_processor_d3d11_get_display_pixel_info(
+		    mc->display_processor, NULL, NULL, &disp_left, &disp_top);
+	}
+
+	// Virtual window center offset from display center (directly from pose)
+	// pose.position.x: +X right (meters), pose.position.y: +Y up (meters)
+	float offset_x_m = slot->window_pose.position.x;
+	float offset_y_m = slot->window_pose.position.y;
+
+	memset(out_metrics, 0, sizeof(*out_metrics));
+	out_metrics->display_width_m = disp_w_m;
+	out_metrics->display_height_m = disp_h_m;
+	out_metrics->display_pixel_width = disp_px_w;
+	out_metrics->display_pixel_height = disp_px_h;
+	out_metrics->display_screen_left = disp_left;
+	out_metrics->display_screen_top = disp_top;
+	out_metrics->window_pixel_width = slot->window_rect_w;
+	out_metrics->window_pixel_height = slot->window_rect_h;
+	out_metrics->window_screen_left = disp_left + (int32_t)slot->window_rect_x;
+	out_metrics->window_screen_top = disp_top + (int32_t)slot->window_rect_y;
+	out_metrics->window_width_m = slot->window_width_m;
+	out_metrics->window_height_m = slot->window_height_m;
 	out_metrics->window_center_offset_x_m = offset_x_m;
 	out_metrics->window_center_offset_y_m = offset_y_m;
 	out_metrics->valid = true;
