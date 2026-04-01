@@ -38,6 +38,8 @@
 #include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #ifdef XRT_OS_WINDOWS
 #include <windows.h>
@@ -176,12 +178,27 @@ static bool
 compositor_init_vulkan(struct null_compositor *c)
 {
 #ifdef XRT_OS_WINDOWS
+	// Disable Vulkan implicit layers during internal init to prevent crashes
+	// from buggy third-party layers (e.g., FPS Monitor). The runtime's internal
+	// Vulkan instance doesn't need overlay/monitoring layers. See issue #105.
+	// Requires Vulkan loader 1.3.234+; older loaders ignore the env var harmlessly.
+	const char *orig_layers_disable = getenv("VK_LOADER_LAYERS_DISABLE");
+	char *saved_layers_disable = orig_layers_disable ? _strdup(orig_layers_disable) : NULL;
+	_putenv_s("VK_LOADER_LAYERS_DISABLE", "*");
+
 	// Probe for Vulkan availability before attempting init.
 	// With /DELAYLOAD:vulkan-1.dll, calling any Vulkan function when the
 	// DLL is missing would trigger an SEH exception. Check first.
 	HMODULE vk_mod = LoadLibraryA("vulkan-1.dll");
 	if (vk_mod == NULL) {
 		NULL_WARN(c, "vulkan-1.dll not found — Vulkan is not available on this system");
+		// Restore original env var before returning
+		if (saved_layers_disable) {
+			_putenv_s("VK_LOADER_LAYERS_DISABLE", saved_layers_disable);
+			free(saved_layers_disable);
+		} else {
+			_putenv_s("VK_LOADER_LAYERS_DISABLE", "");
+		}
 		return false;
 	}
 	FreeLibrary(vk_mod);
@@ -202,6 +219,14 @@ compositor_init_vulkan(struct null_compositor *c)
 		         vk_result_string(ret));
 		u_string_list_destroy(&required_instance_ext_list);
 		u_string_list_destroy(&optional_instance_ext_list);
+#ifdef XRT_OS_WINDOWS
+		if (saved_layers_disable) {
+			_putenv_s("VK_LOADER_LAYERS_DISABLE", saved_layers_disable);
+			free(saved_layers_disable);
+		} else {
+			_putenv_s("VK_LOADER_LAYERS_DISABLE", "");
+		}
+#endif
 		return ret;
 	}
 
@@ -227,6 +252,17 @@ compositor_init_vulkan(struct null_compositor *c)
 
 	struct comp_vulkan_results vk_res = {0};
 	bool bundle_ret = comp_vulkan_init_bundle(vk, &vk_args, &vk_res);
+
+#ifdef XRT_OS_WINDOWS
+	// Restore original VK_LOADER_LAYERS_DISABLE so that Vulkan apps' own
+	// vkCreateInstance calls get their expected implicit layers. See issue #105.
+	if (saved_layers_disable) {
+		_putenv_s("VK_LOADER_LAYERS_DISABLE", saved_layers_disable);
+		free(saved_layers_disable);
+	} else {
+		_putenv_s("VK_LOADER_LAYERS_DISABLE", "");
+	}
+#endif
 
 	u_string_list_destroy(&required_instance_ext_list);
 	u_string_list_destroy(&optional_instance_ext_list);

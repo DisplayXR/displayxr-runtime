@@ -244,7 +244,20 @@ set "RT_JSON=%REPO%build\Release\openxr_displayxr-dev.json"
 set "PKG=%REPO%_package"
 
 :: Run scripts for standalone test apps (each sets XR_RUNTIME_JSON to dev build)
-for %%A in (cube_handle_d3d11_win cube_hosted_d3d11_win cube_handle_d3d12_win cube_handle_gl_win cube_handle_vk_win) do (
+:: Non-Vulkan apps also disable Vulkan implicit layers to prevent crashes from
+:: buggy third-party layers (e.g., FPS Monitor). See issue #105.
+for %%A in (cube_handle_d3d11_win cube_hosted_d3d11_win cube_handle_d3d12_win cube_handle_gl_win) do (
+    if exist "%REPO%test_apps\%%A\build\%%A.exe" (
+        > "%PKG%\run_%%A.bat" (
+            echo @echo off
+            echo set "XR_RUNTIME_JSON=%RT_JSON%"
+            echo set "VK_LOADER_LAYERS_DISABLE=*"
+            echo "%REPO%test_apps\%%A\build\%%A.exe" %%*
+        )
+    )
+)
+:: Vulkan app — don't disable implicit layers (app needs them for its own VkInstance)
+for %%A in (cube_handle_vk_win) do (
     if exist "%REPO%test_apps\%%A\build\%%A.exe" (
         > "%PKG%\run_%%A.bat" (
             echo @echo off
