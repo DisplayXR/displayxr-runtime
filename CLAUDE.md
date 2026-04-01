@@ -297,6 +297,7 @@ See `docs/README.md` for a complete index. Key docs by task:
 | Understand the compositor pipeline | `docs/architecture/compositor-pipeline.md` |
 | Understand the swapchain model / canvas | `docs/specs/swapchain-model.md` |
 | Track shell implementation progress | `docs/roadmap/shell-tasks.md` |
+| Shell Phase 2 plan and status | `docs/roadmap/shell-phase2-plan.md`, `shell-phase2-status.md` |
 | Understand the 3D capture pipeline | `docs/roadmap/3d-capture.md` |
 | Understand shell/runtime IPC contract | `docs/roadmap/shell-runtime-contract.md` |
 | Understand the overall product vision | `docs/roadmap/spatial-desktop-prd.md` |
