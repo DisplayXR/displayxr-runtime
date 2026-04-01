@@ -56,6 +56,8 @@
 		]
 	},
 
+	"shell_activate": {},
+
 	"shell_set_window_pose": {
 		"in": [
 			{"name": "client_id", "type": "uint32_t"},

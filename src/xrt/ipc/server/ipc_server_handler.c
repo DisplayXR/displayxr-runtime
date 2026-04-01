@@ -1927,6 +1927,26 @@ ipc_handle_system_toggle_io_device(volatile struct ipc_client_state *ics, uint32
 }
 
 xrt_result_t
+ipc_handle_shell_activate(volatile struct ipc_client_state *_ics)
+{
+	struct ipc_server *s = _ics->server;
+
+	if (s->shell_mode) {
+		IPC_INFO(s, "Shell: already in shell mode");
+		return XRT_SUCCESS;
+	}
+
+	IPC_INFO(s, "Shell: activating shell mode via IPC");
+
+	s->shell_mode = true;
+	if (s->xsysc != NULL) {
+		s->xsysc->info.shell_mode = true;
+	}
+
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
 ipc_handle_shell_set_window_pose(volatile struct ipc_client_state *_ics,
                                   uint32_t client_id,
                                   const struct xrt_pose *pose,
