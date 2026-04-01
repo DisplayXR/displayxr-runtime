@@ -18,7 +18,7 @@ See `shell-phase0-status.md` for full details and lessons learned.
 ## Phase 1 Progress
 
 ### Phase 1A: IPC-to-Standalone Hot-Switch
-**Status:** Not started
+**Status:** Deferred (lowest priority, highest risk)
 
 When shell exits (ESC), apps should seamlessly switch from IPC to standalone mode.
 
@@ -57,19 +57,19 @@ Click on a 3D window to focus it. Mouse coords remapped from shell window to app
 | 1C.4 Mouse coord remapping | ✅ | `input_forward_rect` on window struct; WndProc remaps `shell_xy - rect_xy` before PostMessage |
 | 1C.5 Mouse clipping to window | ✅ | Mouse outside focused window rect is not forwarded to app |
 
-### Phase 1D: Shell App Skeleton
-**Status:** Not started
+### Phase 1D: Shell App + Window Drag/Resize
+**Status:** Done
 
-Minimal `displayxr-shell.exe` that manages window layout.
+`displayxr-shell.exe` management app + server-side right-click-drag and scroll-to-resize.
 
 | Task | Status | Notes |
 |------|--------|-------|
-| 1D.1 Privileged IPC client | | |
-| 1D.2 Auto-start service | | |
-| 1D.3 App connect/disconnect events | | |
-| 1D.4 Default window placement | | |
-| 1D.5 Mouse drag windows | | |
-| 1D.6 Scroll wheel Z depth | | |
+| 1D.1 Privileged IPC client | ✅ | `src/xrt/targets/shell/main.c` — connects via `ipc_client_connection_init`, polls `system_get_clients` |
+| 1D.2 Auto-start service | ✅ | Shell launches `displayxr-service --shell` via `CreateProcessA` if not running, retries connection |
+| 1D.3 App connect/disconnect events | ✅ | 500ms poll loop diffs client list, prints changes |
+| 1D.4 Default window placement | ✅ | Existing pose-based defaults from 1B (slot 0: left-upper, slot 1: right-upper) |
+| 1D.5 Right-click-drag windows | ✅ | Server-side drag state machine in render loop: RMB down = start, held = translate pose, up = end |
+| 1D.6 Scroll wheel resize | ✅ | Volatile scroll accumulator on window; render loop scales focused window ~5% per notch |
 
 ## Known Issues
 
@@ -143,11 +143,14 @@ grep -E "registered client|resized app|TAB|DELETE|click|focused" \
 ```
 
 **Shell controls:**
-- **TAB** — cycle focus: app 0 → app 1 → unfocused → app 0 (cyan border)
+- **Left-click** — focus window under cursor (cyan border follows)
+- **Right-click-drag** — move window in display plane
+- **Scroll wheel** — resize focused window (~5% per notch)
+- **TAB** — cycle focus: app 0 → app 1 → unfocused → app 0
 - **DELETE** — close focused app (dark gray replaces it)
 - **ESC** — dismiss shell, switch display to 2D
 - **V** — toggle 2D/3D display mode
-- **WASD/mouse** — forwarded to focused app
+- **WASD/left-click-drag** — forwarded to focused app (camera control)
 
 Logs: `%LOCALAPPDATA%\DisplayXR\*.log`
 
