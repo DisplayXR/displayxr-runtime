@@ -42,6 +42,12 @@ struct comp_d3d12_target
 	//! Window handle.
 	HWND hwnd;
 
+	//! Child window handle (non-NULL only when child window fallback is active).
+	HWND child_hwnd;
+
+	//! Parent HWND (app's original HWND, stored when child fallback activates).
+	HWND parent_hwnd;
+
 	//! Current dimensions.
 	uint32_t width;
 	uint32_t height;
@@ -73,6 +79,47 @@ release_back_buffers(struct comp_d3d12_target *target)
 			target->back_buffers[i] = nullptr;
 		}
 	}
+}
+
+static const wchar_t *CHILD_WINDOW_CLASS = L"CompD3D12ChildWindow";
+
+static bool
+ensure_child_window_class_registered()
+{
+	static bool registered = false;
+	if (registered)
+		return true;
+
+	WNDCLASSEXW wc = {};
+	wc.cbSize = sizeof(wc);
+	wc.lpfnWndProc = DefWindowProcW;
+	wc.hInstance = GetModuleHandleW(NULL);
+	wc.lpszClassName = CHILD_WINDOW_CLASS;
+
+	if (RegisterClassExW(&wc) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+		return false;
+	registered = true;
+	return true;
+}
+
+static HWND
+create_child_window(HWND parent, uint32_t width, uint32_t height)
+{
+	if (!ensure_child_window_class_registered()) {
+		U_LOG_E("Failed to register child window class");
+		return nullptr;
+	}
+
+	HWND child = CreateWindowExW(
+	    0, CHILD_WINDOW_CLASS, L"",
+	    WS_CHILD | WS_VISIBLE,
+	    0, 0, (int)width, (int)height,
+	    parent, NULL, GetModuleHandleW(NULL), NULL);
+
+	if (child == nullptr) {
+		U_LOG_E("Failed to create child window: %lu", GetLastError());
+	}
+	return child;
 }
 
 static xrt_result_t
@@ -165,15 +212,44 @@ comp_d3d12_target_create(struct comp_d3d12_compositor *c,
 
 	// Create swapchain using the command queue (D3D12 requirement)
 	IDXGISwapChain1 *swapchain1 = nullptr;
+	HWND swapchain_hwnd = target->hwnd;
+
 	hr = dxgi_factory->CreateSwapChainForHwnd(
-	    internals->command_queue, target->hwnd, &desc, &fs_desc, nullptr, &swapchain1);
+	    internals->command_queue, swapchain_hwnd, &desc, &fs_desc, nullptr, &swapchain1);
+
+	// HWND already has a swapchain — fall back to child window.
+	// DXGI enforces one swapchain per HWND for D3D12, so if the app
+	// already created a swapchain on this HWND we get E_ACCESSDENIED.
+	if (hr == E_ACCESSDENIED) {
+		U_LOG_W("HWND %p already has a swapchain (E_ACCESSDENIED). "
+		        "Creating child window fallback.",
+		        (void *)target->hwnd);
+
+		HWND child = create_child_window(target->hwnd, width, height);
+		if (child == nullptr) {
+			dxgi_factory->Release();
+			target->rtv_heap->Release();
+			delete target;
+			return XRT_ERROR_D3D;
+		}
+
+		target->parent_hwnd = target->hwnd;
+		target->child_hwnd = child;
+		swapchain_hwnd = child;
+
+		hr = dxgi_factory->CreateSwapChainForHwnd(
+		    internals->command_queue, swapchain_hwnd, &desc, &fs_desc, nullptr, &swapchain1);
+	}
 
 	// Disable Alt-Enter fullscreen toggle
-	dxgi_factory->MakeWindowAssociation(target->hwnd, DXGI_MWA_NO_ALT_ENTER);
+	dxgi_factory->MakeWindowAssociation(swapchain_hwnd, DXGI_MWA_NO_ALT_ENTER);
 	dxgi_factory->Release();
 
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create swapchain: 0x%08x", hr);
+		if (target->child_hwnd != nullptr) {
+			DestroyWindow(target->child_hwnd);
+		}
 		target->rtv_heap->Release();
 		delete target;
 		return XRT_ERROR_D3D;
@@ -185,6 +261,9 @@ comp_d3d12_target_create(struct comp_d3d12_compositor *c,
 	swapchain1->Release();
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to get IDXGISwapChain3: 0x%08x", hr);
+		if (target->child_hwnd != nullptr) {
+			DestroyWindow(target->child_hwnd);
+		}
 		target->rtv_heap->Release();
 		delete target;
 		return XRT_ERROR_D3D;
@@ -194,6 +273,9 @@ comp_d3d12_target_create(struct comp_d3d12_compositor *c,
 	xrt_result_t xret = acquire_back_buffers(target);
 	if (xret != XRT_SUCCESS) {
 		target->swapchain->Release();
+		if (target->child_hwnd != nullptr) {
+			DestroyWindow(target->child_hwnd);
+		}
 		target->rtv_heap->Release();
 		delete target;
 		return xret;
@@ -222,6 +304,11 @@ comp_d3d12_target_destroy(struct comp_d3d12_target **target_ptr)
 	}
 	if (target->swapchain != nullptr) {
 		target->swapchain->Release();
+	}
+
+	if (target->child_hwnd != nullptr) {
+		DestroyWindow(target->child_hwnd);
+		target->child_hwnd = nullptr;
 	}
 
 	delete target;
@@ -297,4 +384,21 @@ comp_d3d12_target_resize(struct comp_d3d12_target *target,
 
 	// Re-acquire back buffers
 	return acquire_back_buffers(target);
+}
+
+extern "C" bool
+comp_d3d12_target_has_child_window(struct comp_d3d12_target *target)
+{
+	return target != nullptr && target->child_hwnd != nullptr;
+}
+
+extern "C" void
+comp_d3d12_target_resize_child_window(struct comp_d3d12_target *target,
+                                      uint32_t width,
+                                      uint32_t height)
+{
+	if (target == nullptr || target->child_hwnd == nullptr) {
+		return;
+	}
+	MoveWindow(target->child_hwnd, 0, 0, (int)width, (int)height, TRUE);
 }

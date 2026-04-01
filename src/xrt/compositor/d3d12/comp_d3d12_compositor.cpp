@@ -396,6 +396,9 @@ d3d12_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 					U_LOG_I("Window resized: %ux%u -> %ux%u",
 					        current_width, current_height, new_width, new_height);
 
+					// Resize child window first if fallback is active (no-op otherwise)
+					comp_d3d12_target_resize_child_window(c->target, new_width, new_height);
+
 					xrt_result_t xret =
 					    comp_d3d12_target_resize(c->target, new_width, new_height);
 					if (xret == XRT_SUCCESS) {
@@ -1821,6 +1824,9 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 			U_LOG_E("Failed to create D3D12 target");
 			d3d12_compositor_destroy(&c->base.base);
 			return xret;
+		}
+		if (comp_d3d12_target_has_child_window(c->target)) {
+			U_LOG_I("D3D12 target using child window fallback (parent HWND: %p)", (void *)c->hwnd);
 		}
 	} else {
 		c->target = nullptr;

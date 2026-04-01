@@ -114,6 +114,29 @@ comp_d3d12_target_resize(struct comp_d3d12_target *target,
                          uint32_t width,
                          uint32_t height);
 
+/*!
+ * Check whether the target created a child window fallback.
+ *
+ * Returns true if the target had to create a WS_CHILD window because the
+ * app's HWND already had a DXGI swapchain (E_ACCESSDENIED fallback).
+ *
+ * @ingroup comp_d3d12
+ */
+bool
+comp_d3d12_target_has_child_window(struct comp_d3d12_target *target);
+
+/*!
+ * Resize the child window to match the parent's client area.
+ *
+ * No-op if the target does not have a child window fallback.
+ *
+ * @ingroup comp_d3d12
+ */
+void
+comp_d3d12_target_resize_child_window(struct comp_d3d12_target *target,
+                                      uint32_t width,
+                                      uint32_t height);
+
 #ifdef __cplusplus
 }
 #endif
