@@ -3262,6 +3262,11 @@ multi_compositor_render(struct d3d11_service_system *sys)
 					mc->drag.start_cursor = pt;
 					mc->drag.start_pos_x = mc->clients[i].window_pose.position.x;
 					mc->drag.start_pos_y = mc->clients[i].window_pose.position.y;
+					// Focus the dragged window (brings it to front)
+					if (i != mc->focused_slot) {
+						mc->focused_slot = i;
+						multi_compositor_update_input_forward(mc);
+					}
 					break;
 				}
 			}
