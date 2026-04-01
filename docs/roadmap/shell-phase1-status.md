@@ -71,6 +71,20 @@ Click on a 3D window to focus it. Mouse coords remapped from shell window to app
 | 1D.5 Right-click-drag windows | ✅ | Server-side drag state machine in render loop: RMB down = start, held = translate pose, up = end |
 | 1D.6 Scroll wheel resize | ✅ | Volatile scroll accumulator on window; render loop scales focused window ~5% per notch |
 
+## Design Decisions
+
+### Shell window revival after ESC dismiss
+When ESC dismisses the shell, the service stays running and the `window_dismissed` flag is set. If a new app connects and submits a frame while `window_dismissed` is true, the multi-compositor destroys the old window resources and recreates them via `multi_compositor_ensure_output()`. This allows the shell to reopen without restarting the service — the user presses ESC to dismiss, then launches new apps to revive.
+
+### Swapchain is never recreated on window resize
+The app's swapchain is created once at `xrCreateSwapchain` time, sized for the worst-case render mode from the DP (may be larger than fullscreen). It is never recreated. When the shell resizes a window (drag, scroll), only the HWND and the blit destination rect change. The multi-comp's shader blit reads `content_view_w/h` (actual rendered region from `layer_commit`) and scales it into the window rect via `dst_rect_wh`.
+
+### Z-ordering by focus
+The focused window always renders on top. The blit loop builds a `render_order[]` array: non-focused slots first, focused slot last. When focus changes (click, TAB), the focused window is immediately drawn on top in the next frame.
+
+### Right-click reserved for window management
+In shell mode, right-click and scroll wheel are NOT forwarded to apps — they're reserved for window drag and resize. Apps use WASD + left-click-drag for camera control instead. This is enforced in the WndProc which suppresses `WM_RBUTTONDOWN/UP` and `WM_MOUSEWHEEL` forwarding when `input_forward_hwnd` is set.
+
 ## Known Issues
 
 ### Apps don't survive shell exit

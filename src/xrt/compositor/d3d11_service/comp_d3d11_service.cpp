@@ -3112,7 +3112,31 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	}
 
 	if (mc->window_dismissed) {
-		return;
+		// Shell was dismissed (ESC), but a new client has connected and is
+		// submitting frames. Reopen the shell window.
+		if (mc->client_count > 0) {
+			U_LOG_W("Multi-comp: reopening shell window (new client after dismiss)");
+			// Destroy old window resources
+			if (mc->window != nullptr) {
+				comp_d3d11_window_destroy(&mc->window);
+			}
+			mc->hwnd = nullptr;
+			mc->swap_chain = nullptr;
+			mc->back_buffer_rtv = nullptr;
+			mc->display_processor = nullptr;
+			mc->crop_texture = nullptr;
+			mc->crop_srv = nullptr;
+			mc->window_dismissed = false;
+
+			// ensure_output will recreate everything
+			xrt_result_t ret = multi_compositor_ensure_output(sys);
+			if (ret != XRT_SUCCESS) {
+				return;
+			}
+			mc = sys->multi_comp;
+		} else {
+			return;
+		}
 	}
 
 	// Check window validity
