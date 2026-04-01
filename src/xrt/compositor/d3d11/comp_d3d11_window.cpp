@@ -131,6 +131,10 @@ struct comp_d3d11_window
 	volatile LONG input_forward_rect_w;
 	volatile LONG input_forward_rect_h;
 
+	//! Accumulated scroll wheel delta for shell window resize (positive = enlarge).
+	//! Written by WndProc, read+reset by render loop.
+	volatile LONG scroll_accum;
+
 	//! Shell display processor for ESC/close 2D mode switch (opaque, can be NULL).
 	volatile void *shell_dp;
 };
@@ -386,16 +390,26 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	case WM_MOUSEWHEEL: {
 		HWND fwd = (HWND)InterlockedCompareExchangePointer((volatile PVOID *)&w->input_forward_hwnd, NULL, NULL);
 		if (fwd != NULL) {
-			// Shell mode: remap shell-window coords to app-window coords
+			// Shell mode: right-click and scroll are reserved for window management
+			// (right-click-drag = move window, scroll = resize window).
+			// These are handled in the multi-comp render loop, not forwarded to apps.
+			if (message == WM_RBUTTONDOWN || message == WM_RBUTTONUP) {
+				return 0;
+			}
+			if (message == WM_MOUSEWHEEL) {
+				// Accumulate scroll delta for the render loop to process
+				short delta = GET_WHEEL_DELTA_WPARAM(wParam);
+				InterlockedExchangeAdd(&w->scroll_accum, (LONG)delta);
+				return 0;
+			}
+
+			// Remap shell-window coords to app-window coords
 			LONG rx = InterlockedCompareExchange(&w->input_forward_rect_x, 0, 0);
 			LONG ry = InterlockedCompareExchange(&w->input_forward_rect_y, 0, 0);
 			LONG rw = InterlockedCompareExchange(&w->input_forward_rect_w, 0, 0);
 			LONG rh = InterlockedCompareExchange(&w->input_forward_rect_h, 0, 0);
 
-			if (message == WM_MOUSEWHEEL) {
-				// WM_MOUSEWHEEL uses screen coords — forward as-is
-				PostMessage(fwd, message, wParam, lParam);
-			} else if (rw > 0 && rh > 0) {
+			if (rw > 0 && rh > 0) {
 				// Extract shell-window client coords
 				int shell_x = GET_X_LPARAM(lParam);
 				int shell_y = GET_Y_LPARAM(lParam);
@@ -814,6 +828,15 @@ comp_d3d11_window_set_input_forward(struct comp_d3d11_window *window,
 	} else {
 		U_LOG_W("D3D11 window: input forwarding disabled");
 	}
+}
+
+extern "C" int32_t
+comp_d3d11_window_consume_scroll(struct comp_d3d11_window *window)
+{
+	if (window == NULL) {
+		return 0;
+	}
+	return (int32_t)InterlockedExchange(&window->scroll_accum, 0);
 }
 
 extern "C" void

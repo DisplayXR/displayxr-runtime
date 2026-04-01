@@ -194,6 +194,15 @@ comp_d3d11_window_set_input_forward(struct comp_d3d11_window *window,
                                      int32_t rect_h);
 
 /*!
+ * Read and reset accumulated scroll wheel delta (for shell window resize).
+ *
+ * @param window The window object
+ * @return Accumulated scroll delta (positive = scroll up = enlarge), or 0
+ */
+int32_t
+comp_d3d11_window_consume_scroll(struct comp_d3d11_window *window);
+
+/*!
  * Set the shell display processor for ESC/close handling.
  *
  * When the shell window is closed (ESC or WM_CLOSE), this DP is switched

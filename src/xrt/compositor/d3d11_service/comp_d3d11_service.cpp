@@ -460,6 +460,16 @@ struct d3d11_multi_compositor
 
 	//! Window dismissed by user (ESC).
 	bool window_dismissed;
+
+	//! Right-click-drag state for window repositioning.
+	struct
+	{
+		bool active;         //!< Currently dragging?
+		int32_t slot;        //!< Which slot is being dragged (-1 = none)
+		POINT start_cursor;  //!< Cursor position at drag start (shell-window client pixels)
+		float start_pos_x;   //!< Window pose.position.x at drag start (meters)
+		float start_pos_y;   //!< Window pose.position.y at drag start (meters)
+	} drag;
 };
 
 
@@ -2825,6 +2835,11 @@ multi_compositor_unregister_client(struct d3d11_service_system *sys, struct d3d1
 				mc->focused_slot = -1;
 				multi_compositor_update_input_forward(mc);
 			}
+			// Cancel any active drag on this slot
+			if (mc->drag.active && mc->drag.slot == i) {
+				mc->drag.active = false;
+				mc->drag.slot = -1;
+			}
 			U_LOG_W("Multi-comp: unregistered client from slot %d (total=%u)", i, mc->client_count);
 
 			// Render one final frame to clear the stale content.
@@ -3198,6 +3213,118 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		}
 	}
 
+	// Right-click-drag: reposition windows in the display plane.
+	// Uses a state machine: RMB down on window = start drag, RMB held = translate, RMB up = end.
+	{
+		bool rmb_held = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
+
+		if (rmb_held && !mc->drag.active) {
+			// RMB just pressed — start drag if cursor is over a window
+			POINT pt;
+			GetCursorPos(&pt);
+			ScreenToClient(mc->hwnd, &pt);
+
+			for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
+				if (!mc->clients[i].active) {
+					continue;
+				}
+				int32_t rx = (int32_t)mc->clients[i].window_rect_x;
+				int32_t ry = (int32_t)mc->clients[i].window_rect_y;
+				int32_t rw = (int32_t)mc->clients[i].window_rect_w;
+				int32_t rh = (int32_t)mc->clients[i].window_rect_h;
+				if (pt.x >= rx && pt.x < rx + rw && pt.y >= ry && pt.y < ry + rh) {
+					mc->drag.active = true;
+					mc->drag.slot = i;
+					mc->drag.start_cursor = pt;
+					mc->drag.start_pos_x = mc->clients[i].window_pose.position.x;
+					mc->drag.start_pos_y = mc->clients[i].window_pose.position.y;
+					break;
+				}
+			}
+		} else if (rmb_held && mc->drag.active) {
+			// Dragging — update window position
+			POINT pt;
+			GetCursorPos(&pt);
+			ScreenToClient(mc->hwnd, &pt);
+
+			int s = mc->drag.slot;
+			if (s >= 0 && s < D3D11_MULTI_MAX_CLIENTS && mc->clients[s].active) {
+				// Convert pixel delta to meters
+				float disp_w_m = sys->base.info.display_width_m;
+				float disp_h_m = sys->base.info.display_height_m;
+				uint32_t disp_px_w = sys->base.info.display_pixel_width;
+				uint32_t disp_px_h = sys->base.info.display_pixel_height;
+				if (disp_px_w > 0 && disp_px_h > 0 && disp_w_m > 0.0f && disp_h_m > 0.0f) {
+					float dx_px = (float)(pt.x - mc->drag.start_cursor.x);
+					float dy_px = (float)(pt.y - mc->drag.start_cursor.y);
+					float m_per_px_x = disp_w_m / (float)disp_px_w;
+					float m_per_px_y = disp_h_m / (float)disp_px_h;
+
+					// +X right, +Y up (pixel Y is inverted)
+					mc->clients[s].window_pose.position.x = mc->drag.start_pos_x + dx_px * m_per_px_x;
+					mc->clients[s].window_pose.position.y = mc->drag.start_pos_y - dy_px * m_per_px_y;
+
+					slot_pose_to_pixel_rect(sys, &mc->clients[s],
+					                        &mc->clients[s].window_rect_x,
+					                        &mc->clients[s].window_rect_y,
+					                        &mc->clients[s].window_rect_w,
+					                        &mc->clients[s].window_rect_h);
+
+					// Update input forward rect if this is the focused slot
+					if (s == mc->focused_slot) {
+						multi_compositor_update_input_forward(mc);
+					}
+				}
+			}
+		} else if (!rmb_held && mc->drag.active) {
+			// RMB released — end drag
+			mc->drag.active = false;
+			mc->drag.slot = -1;
+		}
+	}
+
+	// Scroll wheel: resize focused window (~5% per notch).
+	if (mc->window != nullptr && mc->focused_slot >= 0) {
+		int32_t scroll = comp_d3d11_window_consume_scroll(mc->window);
+		if (scroll != 0) {
+			int s = mc->focused_slot;
+			if (s >= 0 && s < D3D11_MULTI_MAX_CLIENTS && mc->clients[s].active) {
+				// WHEEL_DELTA (120) = one notch = ~5% size change
+				float factor = 1.0f + (float)scroll / (120.0f * 20.0f); // 5% per notch
+				if (factor < 0.5f) factor = 0.5f;
+				if (factor > 2.0f) factor = 2.0f;
+
+				float new_w = mc->clients[s].window_width_m * factor;
+				float new_h = mc->clients[s].window_height_m * factor;
+
+				// Clamp to minimum 2cm and maximum 80% of display
+				// (100% would fill the entire SBS half, leaving no room for other windows)
+				float min_dim = 0.02f;
+				float max_w = sys->base.info.display_width_m * 0.8f;
+				float max_h = sys->base.info.display_height_m * 0.8f;
+				if (max_w <= 0.0f) max_w = 0.560f;
+				if (max_h <= 0.0f) max_h = 0.315f;
+
+				if (new_w < min_dim) new_w = min_dim;
+				if (new_h < min_dim) new_h = min_dim;
+				if (new_w > max_w) new_w = max_w;
+				if (new_h > max_h) new_h = max_h;
+
+				mc->clients[s].window_width_m = new_w;
+				mc->clients[s].window_height_m = new_h;
+
+				slot_pose_to_pixel_rect(sys, &mc->clients[s],
+				                        &mc->clients[s].window_rect_x,
+				                        &mc->clients[s].window_rect_y,
+				                        &mc->clients[s].window_rect_w,
+				                        &mc->clients[s].window_rect_h);
+
+				mc->clients[s].hwnd_resize_pending = true;
+				multi_compositor_update_input_forward(mc);
+			}
+		}
+	}
+
 	// Handle swap chain resize
 	if (mc->hwnd != nullptr && mc->swap_chain) {
 		RECT client_rect;
@@ -3282,12 +3409,24 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	}
 
 	// Copy client atlas → combined atlas, crop to content dims, send to DP.
+	// Render focused slot LAST so it draws on top of overlapping windows.
+	// Build a render order: non-focused first, focused last.
+	int render_order[D3D11_MULTI_MAX_CLIENTS];
+	int render_count = 0;
+	for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
+		if (mc->clients[s].active && s != mc->focused_slot) {
+			render_order[render_count++] = s;
+		}
+	}
+	if (mc->focused_slot >= 0 && mc->focused_slot < D3D11_MULTI_MAX_CLIENTS &&
+	    mc->clients[mc->focused_slot].active) {
+		render_order[render_count++] = mc->focused_slot;
+	}
+
 	uint32_t dp_view_w = sys->view_width;
 	uint32_t dp_view_h = sys->view_height;
-	for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
-		if (!mc->clients[s].active) {
-			continue;
-		}
+	for (int ri = 0; ri < render_count; ri++) {
+		int s = render_order[ri];
 		struct d3d11_service_compositor *cc = mc->clients[s].compositor;
 		if (cc == nullptr || !cc->render.atlas_texture) {
 			continue;
@@ -3340,6 +3479,15 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			float dest_px_y = src_row * half_h + win_frac_y * half_h;
 			float dest_px_w = win_frac_w * half_w;
 			float dest_px_h = win_frac_h * half_h;
+
+			// Clamp destination to stay within this SBS half (prevent cross-eye bleed)
+			float half_right = (src_col + 1) * half_w;
+			float half_bottom = (src_row + 1) * half_h;
+			if (dest_px_x + dest_px_w > half_right)
+				dest_px_w = half_right - dest_px_x;
+			if (dest_px_y + dest_px_h > half_bottom)
+				dest_px_h = half_bottom - dest_px_y;
+			if (dest_px_w <= 0.0f || dest_px_h <= 0.0f) continue;
 
 			// Update constant buffer
 			D3D11_MAPPED_SUBRESOURCE mapped;
