@@ -144,7 +144,7 @@ CI only runs on dfattal (guarded by `github.repository` check in workflows). The
 - **drivers/** — `leia/` (LeiaSR SDK), `sim_display/` (simulation), `qwerty/` (keyboard/mouse controllers)
 - **state_trackers/oxr/** — OpenXR API implementation
 - **ipc/** — Inter-process communication for service mode
-- **targets/** — Build targets (runtime library, displayxr-cli, displayxr-service)
+- **targets/** — Build targets (runtime library, displayxr-cli, displayxr-service, displayxr-shell)
 
 ### Key Interfaces
 C interfaces with vtable-style polymorphism:
@@ -247,16 +247,25 @@ Copy binaries to `_package/DisplayXR-macOS/bin/`. Run scripts exec from `$DIR/bi
 | cube_handle_gl_win | `_package\run_cube_handle_gl_win.bat` |
 | cube_handle_vk_win | `_package\run_cube_handle_vk_win.bat` |
 
-**Shell mode (two terminals):**
+**Shell mode — single command (recommended):**
 
-| Terminal | Script | Description |
-|----------|--------|-------------|
-| 1 | `_package\run_shell_service.bat` | Starts `displayxr-service --shell` |
-| 2 | `_package\run_shell_app.bat` | Launches cube_handle_d3d11_win with `DISPLAYXR_SHELL_SESSION=1` |
+`displayxr-shell.exe` auto-starts the service, activates shell mode via IPC, launches apps with correct env vars, and monitors clients.
 
-`run_shell_app.bat` accepts an optional exe path argument to launch a different app in shell mode.
+```
+_package\bin\displayxr-shell.exe app1.exe app2.exe
+```
 
-**Shell mode — two apps (three terminals):**
+Example with two cube apps:
+```
+_package\bin\displayxr-shell.exe test_apps\cube_handle_d3d11_win\build\cube_handle_d3d11_win.exe test_apps\cube_handle_d3d11_win\build\cube_handle_d3d11_win.exe
+```
+
+Optional per-app window pose (`--pose x,y,z,width_m,height_m` before each app path):
+```
+_package\bin\displayxr-shell.exe --pose -0.1,0.05,0,0.14,0.08 app1.exe --pose 0.1,0.05,0,0.14,0.08 app2.exe
+```
+
+**Shell mode — legacy multi-terminal (still works):**
 
 | Terminal | Script | Description |
 |----------|--------|-------------|
@@ -264,11 +273,9 @@ Copy binaries to `_package/DisplayXR-macOS/bin/`. Run scripts exec from `$DIR/bi
 | 2 | `_package\run_shell_app.bat` | First app → slot 0 (left-upper, 40% of display) |
 | 3 | `_package\run_shell_app.bat` | Second app → slot 1 (right-upper, 40% of display) |
 
-Or: Terminal 1 + `_package\run_shell_2apps.bat` (launches both with 3s delay).
+**Shell controls:** Left-click=focus window, Right-click-drag=move window, Scroll=resize window, TAB=cycle focus, DELETE=close app, ESC=dismiss shell, V=toggle 2D/3D, WASD/left-click-drag=app input.
 
-**Shell controls:** Click=focus window, TAB=cycle focus, DELETE=close app, ESC=dismiss shell, V=toggle 2D/3D, WASD/mouse=app input.
-
-**When launching from Claude Code:** bash `export` doesn't propagate env vars to Windows processes. Use `cmd.exe //c "set VAR=val&& app.exe"` instead. **Paths with spaces** (e.g. `Sparks i7 3080`) break inside `cmd.exe` set chains — `cd` to the repo root first in bash, then use `%CD%`-relative paths inside `cmd.exe` (e.g. `set XR_RUNTIME_JSON=%CD%\build\Release\openxr_displayxr-dev.json`). Use `run_in_background: true` on the Bash tool call (NOT `&`) to keep long-running processes alive. See `docs/roadmap/shell-phase1-status.md` for the full automated test procedure.
+**When launching from Claude Code:** Use `displayxr-shell.exe` — it handles service auto-start, `XR_RUNTIME_JSON`, and `DISPLAYXR_SHELL_SESSION=1` automatically. Use `run_in_background: true` on the Bash tool call and `timeout: 600000`. See `docs/roadmap/shell-phase1-status.md` for the full test procedure.
 
 ## Documentation
 

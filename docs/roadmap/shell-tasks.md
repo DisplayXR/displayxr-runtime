@@ -104,20 +104,23 @@ Multi compositor window is always full-screen = physical display size:
 
 **Goal:** A shell app connects via privileged IPC. Mouse-drag windows in 3D space. Two OpenXR apps running in spatially rearrangeable windows.
 
-**Test:** service + shell + 2× `cube_ipc_d3d11_win` → drag windows with mouse, correct per-window parallax.
+**Test:** `displayxr-shell.exe app1.exe app2.exe` → drag windows with mouse, correct per-window parallax.
+
+**Status:** Done (branch `feature/shell-phase1-ci`). See `shell-phase1-status.md` for full details.
 
 | | Task | Size | Repo | Description |
 |---|------|------|------|-------------|
-| [ ] | 1.1 Shell IPC protocol | M | runtime | Add to `proto.json`: `shell_set_window_pose`, `shell_get_windows`, `shell_set_visibility`, `shell_set_focus`, `shell_hit_test`. Mark as privileged. |
-| [ ] | 1.2 Dynamic window poses | M | runtime | Multi compositor stores per-client pose + scale. IPC handler updates them. Render loop uses poses for quad placement. |
-| [ ] | 1.3 Level 1 eye transform | M | runtime | Transform eye positions into each window's local frame: `eye_in_window = inverse(window_pose) * eye_in_display`. Provide to per-client compositors for app Kooima projection. |
-| [ ] | 1.4 Mouse-ray hit-test | M | runtime | Shell sends 2D cursor coords. Runtime constructs ray from cyclopean eye through cursor, intersects window quads, returns closest hit (client_id, UV, 3D point). |
-| [ ] | 1.5 Shell app skeleton | L | shell | Minimal C++ app in `src/xrt/targets/shell/`. Connects as privileged IPC client. Main loop: poll mouse, call hit-test, send window pose updates. |
-| [ ] | 1.6 App connect/disconnect | M | runtime | Runtime notifies shell when IPC clients create/destroy sessions. Shell learns about existing apps on connect. |
-| [ ] | 1.7 Window drag | M | shell | Click on quad + drag = translate in XY at current depth. Scroll wheel = adjust Z. Shell sends updated pose each frame during drag. |
-| [ ] | 1.8 Default placement | S | shell | New apps cascade: center of display with slight X/Z offset based on window count. |
-
-**Dependencies:** 1.1–1.4 parallel (runtime), 1.5 depends on 1.1, 1.7 depends on 1.4+1.5
+| [x] | 1.1 Shell IPC protocol | M | runtime | `shell_set_window_pose(client_id, xrt_pose, width_m, height_m)` and `shell_activate` in `proto.json`. |
+| [x] | 1.2 Dynamic window poses | M | runtime | Full 3D `xrt_pose` per slot. `slot_pose_to_pixel_rect()` converts to pixel coords. Blit uses per-slot rects. |
+| [x] | 1.3 Per-client eye transform | M | runtime | `comp_d3d11_service_get_client_window_metrics()` returns per-client window size + center offset from pose. `ipc_try_get_sr_view_poses` uses per-client metrics for Kooima. |
+| [x] | 1.4 Click-to-focus hit-test | M | runtime | Left-click polls cursor, tests against slot rects, sets focused_slot. Mouse coords remapped shell→app. |
+| [x] | 1.5 Shell app | L | shell | `displayxr-shell.exe` in `src/xrt/targets/shell/`. Auto-starts service, sends `shell_activate`, launches apps with env vars, polls clients. |
+| [x] | 1.6 App connect/disconnect | M | runtime+shell | Shell polls `system_get_clients`, detects changes, prints status. Server-side multi-client focus override. |
+| [x] | 1.7 Window drag + resize | M | runtime | Right-click-drag = translate in display plane (server-side state machine). Scroll wheel = resize focused window (~5%/notch). |
+| [x] | 1.8 Default placement | S | runtime | Pose-based: slot 0 left-upper, slot 1 right-upper, 40% of display. `--pose` CLI args for custom layout. |
+| [x] | 1.9 Z-order by focus | S | runtime | Focused slot rendered last (on top). `render_order[]` array. |
+| [x] | 1.10 Shell revival | S | runtime | ESC dismisses → `window_dismissed`. New client → recreate window. Service survives across dismiss/reopen cycles. |
+| [ ] | 1.A IPC-to-standalone hot-switch | L | runtime | Deferred. When shell exits, apps switch from IPC to standalone. Complex compositor swap. |
 
 ---
 
