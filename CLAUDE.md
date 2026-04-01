@@ -261,14 +261,14 @@ Copy binaries to `_package/DisplayXR-macOS/bin/`. Run scripts exec from `$DIR/bi
 | Terminal | Script | Description |
 |----------|--------|-------------|
 | 1 | `_package\run_shell_service.bat` | Starts `displayxr-service --shell` |
-| 2 | `_package\run_shell_app.bat` | First app → slot 0 (left, 5%,5%,40%,40%) |
-| 3 | `_package\run_shell_app.bat` | Second app → slot 1 (right, 55%,5%,40%,40%) |
+| 2 | `_package\run_shell_app.bat` | First app → slot 0 (left-upper, 40% of display) |
+| 3 | `_package\run_shell_app.bat` | Second app → slot 1 (right-upper, 40% of display) |
 
 Or: Terminal 1 + `_package\run_shell_2apps.bat` (launches both with 3s delay).
 
-**Shell controls:** TAB=cycle focus, DELETE=close app, ESC=dismiss shell, V=toggle 2D/3D, WASD/mouse=app input.
+**Shell controls:** Click=focus window, TAB=cycle focus, DELETE=close app, ESC=dismiss shell, V=toggle 2D/3D, WASD/mouse=app input.
 
-**When launching from Claude Code:** bash `export` doesn't propagate env vars to Windows processes. Use `cmd.exe //c "set VAR=val&& app.exe"` instead. See `docs/roadmap/shell-phase1-status.md` for the full automated test procedure.
+**When launching from Claude Code:** bash `export` doesn't propagate env vars to Windows processes. Use `cmd.exe //c "set VAR=val&& app.exe"` instead. **Paths with spaces** (e.g. `Sparks i7 3080`) break inside `cmd.exe` set chains — `cd` to the repo root first in bash, then use `%CD%`-relative paths inside `cmd.exe` (e.g. `set XR_RUNTIME_JSON=%CD%\build\Release\openxr_displayxr-dev.json`). Use `run_in_background: true` on the Bash tool call (NOT `&`) to keep long-running processes alive. See `docs/roadmap/shell-phase1-status.md` for the full automated test procedure.
 
 ## Documentation
 
