@@ -539,7 +539,7 @@ window_thread_func(LPVOID param)
 			set_fullscreen(hwnd, true);
 		}
 
-		ShowWindow(hwnd, SW_SHOWDEFAULT);
+		ShowWindow(hwnd, SW_SHOW);
 		UpdateWindow(hwnd);
 	}
 

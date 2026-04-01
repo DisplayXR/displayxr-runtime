@@ -65,11 +65,13 @@ Click on a 3D window to focus it. Mouse coords remapped from shell window to app
 | Task | Status | Notes |
 |------|--------|-------|
 | 1D.1 Privileged IPC client | ✅ | `src/xrt/targets/shell/main.c` — connects via `ipc_client_connection_init`, polls `system_get_clients` |
-| 1D.2 Auto-start service | ✅ | Shell launches `displayxr-service --shell` via `CreateProcessA` if not running, retries connection |
+| 1D.2 Auto-start service | ✅ | IPC library auto-starts service; shell sends `shell_activate` IPC to enter shell mode dynamically |
 | 1D.3 App connect/disconnect events | ✅ | 500ms poll loop diffs client list, prints changes |
 | 1D.4 Default window placement | ✅ | Existing pose-based defaults from 1B (slot 0: left-upper, slot 1: right-upper) |
 | 1D.5 Right-click-drag windows | ✅ | Server-side drag state machine in render loop: RMB down = start, held = translate pose, up = end |
 | 1D.6 Scroll wheel resize | ✅ | Volatile scroll accumulator on window; render loop scales focused window ~5% per notch |
+| 1D.7 App launcher | ✅ | Shell accepts app paths as args, launches with `DISPLAYXR_SHELL_SESSION=1` + `XR_RUNTIME_JSON` |
+| 1D.8 Per-app pose args | ✅ | `--pose x,y,z,w,h` before each app path sets window position + size via `shell_set_window_pose` |
 
 ## Design Decisions
 
@@ -82,8 +84,30 @@ The app's swapchain is created once at `xrCreateSwapchain` time, sized for the w
 ### Z-ordering by focus
 The focused window always renders on top. The blit loop builds a `render_order[]` array: non-focused slots first, focused slot last. When focus changes (click, TAB), the focused window is immediately drawn on top in the next frame.
 
+### Dynamic shell activation via IPC (shell_activate)
+The `--shell` command-line flag is no longer the only way to enter shell mode. The `shell_activate` IPC call lets a management client (like `displayxr-shell.exe`) activate shell mode dynamically after the service starts. This is the foundation for a GUI shell app that can start/stop shell mode without restarting the service.
+
+Flow: IPC library auto-starts service → shell app connects → sends `shell_activate` → service enters shell mode → shell app launches apps with `DISPLAYXR_SHELL_SESSION=1`. One command (`displayxr-shell.exe app1.exe app2.exe`) replaces the previous 3-terminal workflow.
+
+### ShowWindow must use SW_SHOW, not SW_SHOWDEFAULT
+When the service is auto-launched by the IPC client library, its `STARTUPINFO` is zeroed. `SW_SHOWDEFAULT` maps to the parent's `wShowWindow` which is 0 = `SW_HIDE`, causing the shell window to be created but invisible. Fixed by using `SW_SHOW` which always makes the window visible regardless of how the process was started.
+
 ### Right-click reserved for window management
 In shell mode, right-click and scroll wheel are NOT forwarded to apps — they're reserved for window drag and resize. Apps use WASD + left-click-drag for camera control instead. This is enforced in the WndProc which suppresses `WM_RBUTTONDOWN/UP` and `WM_MOUSEWHEEL` forwarding when `input_forward_hwnd` is set.
+
+## Path to GUI Shell
+
+Phase 1D establishes the architecture for a full GUI shell app:
+
+1. **Service lifecycle** — ✅ Done. The IPC library auto-starts the service; `shell_activate` enters shell mode dynamically. No `--shell` flag or manual terminal needed.
+
+2. **App launching** — ✅ Done. `displayxr-shell.exe` launches apps with correct env vars (`DISPLAYXR_SHELL_SESSION=1`, `XR_RUNTIME_JSON`). Currently via command-line args; future: GUI file picker or drag-and-drop.
+
+3. **Window management** — ✅ Done. `shell_set_window_pose` IPC positions windows programmatically. `--pose` CLI args set initial layout. Server-side drag/resize for interactive use. Future: GUI panel with window list, snap layouts.
+
+4. **Client monitoring** — ✅ Done. Shell polls `system_get_clients` and detects connect/disconnect. Future: GUI displays app thumbnails, status indicators.
+
+5. **Missing for GUI**: A windowed UI framework (ImGui, Qt, or native Win32) for the shell app itself. The shell currently runs as a console app with text output. The rendering surface (3D shell window) is owned by the service — the GUI shell would be a separate management window.
 
 ## Known Issues
 
@@ -101,7 +125,26 @@ scripts\build_windows.bat build       # Runtime (service + DLL)
 scripts\build_windows.bat test-apps   # Test apps + generates run scripts in _package/
 ```
 
-### Run from generated scripts (recommended for manual testing)
+### Run with displayxr-shell (recommended — single command)
+
+`displayxr-shell.exe` auto-starts the service, activates shell mode, launches apps with correct env vars, and monitors clients. No manual terminal setup needed.
+
+**Two apps (one command):**
+```
+_package\bin\displayxr-shell.exe test_apps\cube_handle_d3d11_win\build\cube_handle_d3d11_win.exe test_apps\cube_handle_d3d11_win\build\cube_handle_d3d11_win.exe
+```
+
+**Two apps with custom poses:**
+```
+_package\bin\displayxr-shell.exe --pose -0.1,0.05,0,0.14,0.08 app1.exe --pose 0.1,0.05,0,0.14,0.08 app2.exe
+```
+
+**Monitor only (no apps — connect to existing or auto-start service):**
+```
+_package\bin\displayxr-shell.exe
+```
+
+### Run from generated scripts (legacy — multiple terminals)
 
 **Single app:**
 ```
@@ -118,36 +161,23 @@ Terminal 3: _package\run_shell_app.bat     (→ slot 1, right)
 
 ### Run from Claude Code (automated testing)
 
-Bash `export` does NOT propagate env vars to Windows processes. Use `cmd.exe //c "set VAR=val&& app.exe"` instead. **Paths with spaces** (e.g. `Sparks i7 3080`) break when embedded in `cmd.exe` set chains — use `cd` to the repo root first, then `%CD%`-relative paths so `cmd.exe` resolves them from the working directory.
-
-Each step uses a separate Bash tool call with `run_in_background: true` and `timeout: 600000`.
+Use `displayxr-shell.exe` — it handles service auto-start, shell activation, env vars, and app launching.
 
 ```bash
 # Step 1: Kill leftover processes
 taskkill //F //IM displayxr-service.exe 2>&1 || true
+taskkill //F //IM displayxr-shell.exe 2>&1 || true
 taskkill //F //IM cube_handle_d3d11_win.exe 2>&1 || true
 
-# Step 2: Start service (run_in_background: true, timeout: 600000)
-cd "/c/Users/Sparks i7 3080/Documents/GitHub/openxr-3d-display" && _package/bin/displayxr-service.exe --shell
-
-# Step 3: Start first app (run_in_background: true, timeout: 600000)
-# %CD% expands inside cmd.exe to the working directory, handling spaces correctly
-sleep 5 && cd "/c/Users/Sparks i7 3080/Documents/GitHub/openxr-3d-display" && cmd.exe //c "set XR_RUNTIME_JSON=%CD%\build\Release\openxr_displayxr-dev.json&& set DISPLAYXR_SHELL_SESSION=1&& test_apps\cube_handle_d3d11_win\build\cube_handle_d3d11_win.exe"
-
-# Step 4: Start second app (run_in_background: true, timeout: 600000)
-# Same as Step 3 with longer delay — service assigns it to slot 1 automatically
-sleep 12 && cd "/c/Users/Sparks i7 3080/Documents/GitHub/openxr-3d-display" && cmd.exe //c "set XR_RUNTIME_JSON=%CD%\build\Release\openxr_displayxr-dev.json&& set DISPLAYXR_SHELL_SESSION=1&& test_apps\cube_handle_d3d11_win\build\cube_handle_d3d11_win.exe"
+# Step 2: Launch shell + apps (run_in_background: true, timeout: 600000)
+cd "/c/Users/Sparks i7 3080/Documents/GitHub/openxr-3d-display" && _package/bin/displayxr-shell.exe test_apps/cube_handle_d3d11_win/build/cube_handle_d3d11_win.exe test_apps/cube_handle_d3d11_win/build/cube_handle_d3d11_win.exe 2>&1
 ```
 
-**Important notes:**
-- `cd` to repo root BEFORE `cmd.exe` — bash handles the spaces in the `cd` path, then `%CD%` inside cmd.exe expands to the full Windows path without quoting issues
-- No spaces between `val&&` in `cmd.exe set` — trailing spaces become part of the value
-- Do NOT use `&` to background the service — use `run_in_background: true` on the Bash tool call instead, otherwise bash kills the process when it moves on
-- `XR_RUNTIME_JSON` points to the dev build DLL, bypassing the installed runtime
-- `DISPLAYXR_SHELL_SESSION=1` forces IPC/shell mode
-- 5-second `sleep` before first app, 12-second before second — gives each process time to connect
+**Notes:**
+- `displayxr-shell.exe` auto-starts the service via IPC library, sends `shell_activate`, sets `XR_RUNTIME_JSON` and `DISPLAYXR_SHELL_SESSION=1` on each app
+- 3-second delay between app launches (built into the shell)
 - `timeout: 600000` (10 minutes) gives the user time to interact
-- After rebuilding `.cpp` files, delete `.obj` to force recompilation (ninja timestamp issues)
+- The shell resolves `XR_RUNTIME_JSON` to `build/Release/openxr_displayxr-dev.json` (dev build) or `_package/DisplayXR_win64.json` (installed)
 
 **Check results:**
 ```bash
