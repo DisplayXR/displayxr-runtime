@@ -375,7 +375,8 @@ struct d3d11_service_system
 	struct d3d11_multi_compositor *multi_comp;
 
 	//! Mutex for multi-compositor render (serializes D3D11 context access).
-	std::mutex render_mutex;
+	//! Recursive because unregister_client calls render for final clear frame.
+	std::recursive_mutex render_mutex;
 };
 
 
@@ -3457,7 +3458,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	for (int ri = 0; ri < render_count; ri++) {
 		int s = render_order[ri];
 		struct d3d11_service_compositor *cc = mc->clients[s].compositor;
-		if (cc == nullptr || !cc->render.atlas_texture) {
+		if (cc == nullptr || !cc->render.atlas_texture || !cc->render.atlas_srv) {
 			continue;
 		}
 		// Copy client atlas content to the sub-rect position in combined atlas.
@@ -4446,7 +4447,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	// Shell mode: per-client atlas rendering is done. The multi-compositor
 	// composites all client atlases into the combined atlas and presents.
 	if (sys->shell_mode) {
-		std::lock_guard<std::mutex> render_lock(sys->render_mutex);
+		std::lock_guard<std::recursive_mutex> render_lock(sys->render_mutex);
 		multi_compositor_render(sys);
 		return XRT_SUCCESS;
 	}
@@ -4558,6 +4559,7 @@ compositor_destroy(struct xrt_compositor *xc)
 
 	// Unregister from multi-compositor before cleanup
 	if (sys->shell_mode) {
+		std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
 		multi_compositor_unregister_client(sys, c);
 	}
 
@@ -4675,7 +4677,11 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 			delete c;
 			return mc_ret;
 		}
-		int slot = multi_compositor_register_client(sys, c);
+		int slot;
+		{
+			std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+			slot = multi_compositor_register_client(sys, c);
+		}
 		if (slot < 0) {
 			U_LOG_E("Shell mode: max clients (%d) reached", D3D11_MULTI_MAX_CLIENTS);
 			fini_client_render_resources(&c->render);
@@ -5347,7 +5353,7 @@ comp_d3d11_service_set_client_window_pose(struct xrt_system_compositor *xsysc,
 	if (width_m < min_dim) width_m = min_dim;
 	if (height_m < min_dim) height_m = min_dim;
 
-	std::lock_guard<std::mutex> lock(sys->render_mutex);
+	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
 
 	int slot = multi_comp_find_slot(mc, c);
 	if (slot < 0) {
