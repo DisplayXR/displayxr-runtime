@@ -43,6 +43,59 @@ struct leiasr_probe_result
 };
 
 /*!
+ * EDID-based probe result for Leia/Dimenco display identification.
+ *
+ * Three-layer detection:
+ * - hw_found: EDID manufacturer+product ID matched a known display panel
+ * - sdk_installed: SR SDK registry key exists (HKLM\SOFTWARE\Dimenco\Simulated Reality)
+ * - service_running: SRService shared memory is active (Global\sharedDeviceSerialMemory)
+ *
+ * @ingroup drv_leia
+ */
+struct leia_display_probe_result
+{
+	bool hw_found;        //!< EDID matched a known Leia/Dimenco 3D display
+	bool sdk_installed;   //!< SR SDK is installed on this machine
+	bool service_running; //!< SRService is running with devices connected
+	uint16_t manufacturer_id; //!< EDID manufacturer ID of matched display
+	uint16_t product_id;      //!< EDID product ID of matched display
+	uint32_t pixel_w;     //!< Display width in pixels
+	uint32_t pixel_h;     //!< Display height in pixels
+	float refresh_hz;     //!< Display refresh rate in Hz
+	int32_t screen_left;  //!< Monitor left edge in virtual screen coords
+	int32_t screen_top;   //!< Monitor top edge in virtual screen coords
+	void *hmonitor;       //!< HMONITOR handle (Windows only, NULL elsewhere)
+};
+
+/*!
+ * Probe for Leia/Dimenco 3D displays using EDID matching.
+ *
+ * Does NOT require the SR SDK. Uses Windows SetupAPI to read EDID from
+ * the monitor registry and matches against a table of known display panels.
+ * Also checks for SR runtime availability (registry + shared memory).
+ *
+ * Results are cached for later retrieval via leia_edid_get_cached_result().
+ *
+ * @param[out] out Probe result struct to fill in.
+ * @return true if a known Leia/Dimenco 3D display was found.
+ *
+ * @ingroup drv_leia
+ */
+bool
+leia_edid_probe_display(struct leia_display_probe_result *out);
+
+/*!
+ * Retrieve cached EDID probe results from a prior leia_edid_probe_display().
+ *
+ * @param[out] out Probe result struct to fill in.
+ * @return true if cached results are available and a display was found.
+ *
+ * @ingroup drv_leia
+ */
+bool
+leia_edid_get_cached_result(struct leia_display_probe_result *out);
+
+/*!
  * Probe for SR display hardware.
  *
  * Creates a temporary SR context and checks for an active SR display.

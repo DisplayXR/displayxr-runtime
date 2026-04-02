@@ -52,12 +52,35 @@ leia_estimate_system(struct xrt_builder *xb,
                      struct xrt_prober *xp,
                      struct xrt_builder_estimate *estimate)
 {
-	bool hw_found = leiasr_probe_display(3.0);
+	bool hw_found = false;
+
+	// Try fast EDID-based detection first (no SR SDK context needed)
+	struct leia_display_probe_result edid_result;
+	if (leia_edid_probe_display(&edid_result)) {
+		if (!edid_result.sdk_installed) {
+			U_LOG_W("Leia 3D display detected (EDID) but SR SDK not installed — using sim_display");
+		} else if (!edid_result.service_running) {
+			U_LOG_W("Leia 3D display detected (EDID) but SRService not running — using sim_display");
+		} else {
+			hw_found = true;
+			U_LOG_I("Leia display detected via EDID (mfr=0x%04X prod=0x%04X) at %d,%d",
+			        edid_result.manufacturer_id, edid_result.product_id,
+			        edid_result.screen_left, edid_result.screen_top);
+		}
+	}
+
+	// Fall back to full SR context probe (slower, but handles edge cases)
+	if (!hw_found) {
+		hw_found = leiasr_probe_display(3.0);
+		if (hw_found) {
+			U_LOG_I("SR hardware detected via context probe — Leia builder claims head device");
+		} else {
+			U_LOG_I("No Leia display detected (EDID + SR) — builder will not claim head device");
+		}
+	}
+
 	if (hw_found) {
 		estimate->certain.head = true;
-		U_LOG_I("SR hardware detected — Leia builder claims head device");
-	} else {
-		U_LOG_I("No SR hardware detected — Leia builder will not claim head device");
 	}
 
 	estimate->priority = -15;

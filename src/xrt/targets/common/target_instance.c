@@ -35,6 +35,7 @@
 // SR display dimension query for proper swapchain dimensions
 #ifdef XRT_HAVE_LEIA_SR
 #include "xrt/xrt_compositor.h"
+#include "leia/leia_interface.h"
 #include "leia/leia_sr_d3d11.h"
 #include "leia/leia_display_processor.h"
 #include "leia/leia_display_processor_d3d11.h"
@@ -249,6 +250,17 @@ out:
 				        dims.width_m, dims.height_m,
 				        dims.nominal_x_m, dims.nominal_y_m, dims.nominal_z_m);
 			}
+			// Populate display screen position from EDID probe (fast, cached)
+			{
+				struct leia_display_probe_result edid;
+				if (leia_edid_get_cached_result(&edid) && edid.hw_found) {
+					xsysc->info.display_screen_left = edid.screen_left;
+					xsysc->info.display_screen_top = edid.screen_top;
+					U_LOG_I("Display screen position from EDID: %d,%d",
+					        edid.screen_left, edid.screen_top);
+				}
+			}
+
 			// Compute tiling for all modes (Leia SR path)
 			if (xsysc->info.display_pixel_width > 0 && xsysc->info.display_pixel_height > 0) {
 				for (uint32_t mi = 0; mi < head->rendering_mode_count; mi++) {

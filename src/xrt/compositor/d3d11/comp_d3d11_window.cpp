@@ -35,6 +35,11 @@
 
 #include "xrt/xrt_device.h"
 
+// EDID-based display identification for window positioning
+#ifdef XRT_HAVE_LEIA_SR
+#include "leia/leia_interface.h"
+#endif
+
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <windowsx.h> // GET_X_LPARAM, GET_Y_LPARAM
@@ -181,38 +186,28 @@ monitor_enum_proc(HMONITOR hMonitor, HDC hdcMonitor, LPRECT lprcMonitor, LPARAM 
 }
 
 /*!
- * Get the top-left coordinate of the Leia display, or secondary monitor.
+ * Get the top-left coordinate of a known 3D display, or secondary monitor.
+ *
+ * Uses EDID-based identification via the Leia driver's cached probe result
+ * (if available), falling back to secondary monitor detection.
  */
 static bool
-get_leia_display_top_left(int *x, int *y)
+get_3d_display_top_left(int *x, int *y)
 {
-	// Get connected monitor info
+	// Try cached EDID probe result from Leia driver (set during builder estimation)
+#ifdef XRT_HAVE_LEIA_SR
+	struct leia_display_probe_result edid;
+	if (leia_edid_get_cached_result(&edid) && edid.hw_found) {
+		*x = edid.screen_left;
+		*y = edid.screen_top;
+		return true;
+	}
+#endif
+
+	// Fall back to monitor enumeration + secondary monitor
 	g_monitor_info_count = 0;
 	EnumDisplayMonitors(NULL, NULL, monitor_enum_proc, 0);
 
-	// Look for Leia display by device ID
-	const char kLeiaDisplayIDPrefix[] = "\\\\?\\DISPLAY#AUO2E9A";
-	for (int iMonitor = 0; iMonitor < g_monitor_info_count; ++iMonitor) {
-		int iDevice = 0;
-		while (true) {
-			DISPLAY_DEVICE device;
-			device.cb = sizeof(device);
-			if (!EnumDisplayDevices(g_monitor_info[iMonitor].szDevice, iDevice, &device,
-			                        EDD_GET_DEVICE_INTERFACE_NAME)) {
-				break;
-			}
-
-			if (strncmp(device.DeviceID, kLeiaDisplayIDPrefix, sizeof(kLeiaDisplayIDPrefix) - 1) == 0) {
-				RECT *rect = &g_monitor_info[iMonitor].rcMonitor;
-				*x = rect->left;
-				*y = rect->top;
-				return true;
-			}
-			++iDevice;
-		}
-	}
-
-	// Fall back to secondary monitor if available
 	if (g_use_secondary_monitor) {
 		for (int i = 0; i < g_monitor_info_count; i++) {
 			if (0 == (g_monitor_info[i].dwFlags & MONITORINFOF_PRIMARY)) {
@@ -498,7 +493,7 @@ window_thread_func(LPVOID param)
 	RECT rc = {0, 0, (LONG)w->requested_width, (LONG)w->requested_height};
 	int monitor_x = 0;
 	int monitor_y = 0;
-	if (get_leia_display_top_left(&monitor_x, &monitor_y)) {
+	if (get_3d_display_top_left(&monitor_x, &monitor_y)) {
 		rc.left = monitor_x;
 		rc.top = monitor_y;
 		rc.right = monitor_x + (LONG)w->requested_width;

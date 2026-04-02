@@ -1681,6 +1681,74 @@ If your builder is **missing from the list**, check:
 - **Available drivers:** root `CMakeLists.txt` → `AVAILABLE_DRIVERS`
 - **Config headers:** `src/xrt/include/xrt/xrt_config_drivers.h.cmake_in`, `xrt_config_have.h.cmake_in`
 
+### 8.11 Display Identification and Runtime Availability
+
+A vendor's `estimate_system()` must perform a **three-layer probe** to determine
+whether its hardware is present AND its runtime can actually interlace.  This
+ensures correct fallback to sim_display when hardware is detected but the vendor
+runtime is missing or inactive.
+
+#### Layer 1: Hardware Identification (EDID)
+
+Use the generic EDID utility (`os/os_display_edid.h`) to enumerate monitors and
+match against a vendor-specific table of known (manufacturer_id, product_id) pairs.
+
+```c
+#include "os/os_display_edid.h"
+
+// Vendor's hardcoded table: {manufacturer_id, product_id} from EDID bytes 8-11
+static const uint16_t my_vendor_edid_table[][2] = {
+    {0xABCD, 0x1234},  // Model A
+    {0xABCD, 0x1235},  // Model B
+    // ...
+};
+#define MY_VENDOR_EDID_TABLE_LEN (sizeof(my_vendor_edid_table) / sizeof(my_vendor_edid_table[0]))
+
+struct os_display_edid_list edid_list;
+os_display_edid_enumerate(&edid_list);
+const struct os_display_edid_monitor *match =
+    os_display_edid_find_in_table(&edid_list, my_vendor_edid_table, MY_VENDOR_EDID_TABLE_LEN);
+```
+
+Result: HMONITOR handle, screen position, pixel dimensions of the matched display.
+
+#### Layer 2: Runtime Installed
+
+Vendor-specific check that the SDK/service software is installed.  Must be fast
+(registry read, file existence check — no network, no process launch).
+
+*Reference: Leia checks `HKLM\SOFTWARE\Dimenco\Simulated Reality` via `RegOpenKeyEx()`.*
+
+#### Layer 3: Runtime Active
+
+Vendor-specific check that the service is running and ready to weave.  Must be
+fast (shared memory open, named pipe connect — no blocking waits).
+
+*Reference: Leia checks `Global\sharedDeviceSerialMemory` via `OpenFileMapping()`.*
+
+#### Decision Matrix
+
+| HW identified | Runtime installed | Runtime active | Action |
+|---|---|---|---|
+| Yes | Yes | Yes | Use vendor DP (full 3D interlacing) |
+| Yes | Yes | No | Log warning ("start vendor service"), fall back to sim_display |
+| Yes | No | — | Log warning ("install vendor SDK"), fall back to sim_display |
+| No | — | — | Not this vendor's display → sim_display (2D default) |
+
+#### What DisplayXR Provides
+
+- `os_display_edid_enumerate()` — enumerates all monitors + reads EDID
+  (Windows: SetupDi/registry; other platforms: stubs)
+- `os_display_edid_find_in_table()` — matches EDID against a vendor's table
+- sim_display as universal fallback with 2D default mode (#112)
+- `display_screen_left/top` fields on `xrt_system_compositor_info` for window positioning
+
+#### Reference Implementation
+
+See `src/xrt/drivers/leia/leia_edid_probe.c` for the complete three-layer probe:
+EDID matching, registry check, shared memory check — all in one function,
+no SR SDK dependency.
+
 ---
 
 ## 9. Complete File Listing

@@ -194,6 +194,11 @@ if(XRT_HAVE_LEIA_SR)
 	endif()
 endif(XRT_HAVE_LEIA_SR)
 
+# EDID-based Leia display identification (no SR SDK required, Windows only)
+if(WIN32 AND TARGET drv_leia)
+	target_sources(drv_leia PRIVATE leia/leia_edid_probe.c)
+endif()
+
 # CNSDK-only build (Android) — create drv_leia if SR SDK is not available
 if(XRT_HAVE_CNSDK AND NOT TARGET drv_leia)
 	add_library(drv_leia STATIC
