@@ -32,8 +32,9 @@ struct vk_bundle;
  *
  * @brief Simulates a tracked 3D display on any 2D screen.
  *
- * Supports three output modes selected via SIM_DISPLAY_OUTPUT env var:
- * - "sbs" (default): side-by-side left/right views
+ * Supports multiple output modes selected via SIM_DISPLAY_OUTPUT env var:
+ * - "2d" (default): single-view full-resolution passthrough
+ * - "sbs": side-by-side left/right views
  * - "anaglyph": red-cyan anaglyph stereoscopy
  * - "blend": 50/50 alpha blend of both views
  *

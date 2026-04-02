@@ -44,8 +44,8 @@
  *
  */
 
-static xrt_atomic_s32_t g_sim_display_output_mode = SIM_DISPLAY_OUTPUT_SBS;
-static xrt_atomic_s32_t g_sim_display_view_count = 2;
+static xrt_atomic_s32_t g_sim_display_output_mode = SIM_DISPLAY_OUTPUT_PASSTHROUGH;
+static xrt_atomic_s32_t g_sim_display_view_count = 1;
 
 /*!
  * Cross-platform atomic load for xrt_atomic_s32_t.
@@ -93,11 +93,11 @@ sim_display_set_output_mode(enum sim_display_output_mode mode)
 	enum sim_display_output_mode old = (enum sim_display_output_mode)xrt_atomic_s32_exchange(&g_sim_display_output_mode, (int)mode);
 	if (old != mode) {
 		U_LOG_W("Sim display mode changed: %s",
-		        mode == SIM_DISPLAY_OUTPUT_SBS           ? "SBS" :
+		        mode == SIM_DISPLAY_OUTPUT_PASSTHROUGH    ? "2D" :
+		        mode == SIM_DISPLAY_OUTPUT_SBS            ? "SBS" :
 		        mode == SIM_DISPLAY_OUTPUT_ANAGLYPH       ? "Anaglyph" :
 		        mode == SIM_DISPLAY_OUTPUT_SQUEEZED_SBS   ? "Squeezed SBS" :
-		        mode == SIM_DISPLAY_OUTPUT_QUAD           ? "Quad" :
-		        mode == SIM_DISPLAY_OUTPUT_PASSTHROUGH    ? "Passthrough" : "Blend");
+		        mode == SIM_DISPLAY_OUTPUT_QUAD           ? "Quad" : "Blend");
 	}
 }
 
@@ -412,12 +412,13 @@ sim_display_hmd_get_property(struct xrt_device *xdev,
 		// Return unified mode index: internal SBS(0)→2, Anaglyph(1)→1, Blend(2)→3
 		enum sim_display_output_mode internal = sim_display_get_output_mode();
 		switch (internal) {
+		case SIM_DISPLAY_OUTPUT_PASSTHROUGH:   *out_value = 0; break;
 		case SIM_DISPLAY_OUTPUT_SBS:          *out_value = 2; break;
 		case SIM_DISPLAY_OUTPUT_ANAGLYPH:     *out_value = 1; break;
 		case SIM_DISPLAY_OUTPUT_BLEND:        *out_value = 3; break;
 		case SIM_DISPLAY_OUTPUT_SQUEEZED_SBS: *out_value = 3; break;
 		case SIM_DISPLAY_OUTPUT_QUAD:         *out_value = 4; break;
-		default:                              *out_value = 1; break;
+		default:                              *out_value = 0; break;
 		}
 		return XRT_SUCCESS;
 	}
@@ -443,12 +444,16 @@ sim_display_hmd_create(void)
 	{
 		const char *mode_str = getenv("SIM_DISPLAY_OUTPUT");
 		if (mode_str) {
-			if (strcmp(mode_str, "anaglyph") == 0)
+			if (strcmp(mode_str, "sbs") == 0)
+				sim_display_set_output_mode(SIM_DISPLAY_OUTPUT_SBS);
+			else if (strcmp(mode_str, "anaglyph") == 0)
 				sim_display_set_output_mode(SIM_DISPLAY_OUTPUT_ANAGLYPH);
 			else if (strcmp(mode_str, "blend") == 0)
 				sim_display_set_output_mode(SIM_DISPLAY_OUTPUT_BLEND);
+			else if (strcmp(mode_str, "quad") == 0)
+				sim_display_set_output_mode(SIM_DISPLAY_OUTPUT_QUAD);
 			else
-				sim_display_set_output_mode(SIM_DISPLAY_OUTPUT_SBS);
+				sim_display_set_output_mode(SIM_DISPLAY_OUTPUT_PASSTHROUGH);
 		}
 	}
 
@@ -615,13 +620,15 @@ sim_display_hmd_create(void)
 	// Set default active mode from env var
 	{
 		enum sim_display_output_mode sd_mode = sim_display_get_output_mode();
-		// Map internal mode to unified index: SBS→2, Anaglyph→1, SqueezedSBS→3
+		// Map internal mode to unified index: Passthrough→0, Anaglyph→1, SBS→2, SqueezedSBS→3, Quad→4
 		uint32_t default_mode;
 		switch (sd_mode) {
-		case SIM_DISPLAY_OUTPUT_SBS:          default_mode = 2; break;
+		case SIM_DISPLAY_OUTPUT_PASSTHROUGH:  default_mode = 0; break;
 		case SIM_DISPLAY_OUTPUT_ANAGLYPH:     default_mode = 1; break;
+		case SIM_DISPLAY_OUTPUT_SBS:          default_mode = 2; break;
 		case SIM_DISPLAY_OUTPUT_SQUEEZED_SBS: default_mode = 3; break;
-		default:                              default_mode = 1; break;
+		case SIM_DISPLAY_OUTPUT_QUAD:         default_mode = 4; break;
+		default:                              default_mode = 0; break;
 		}
 		hmd->base.hmd->active_rendering_mode_index = default_mode;
 		sim_display_set_view_count(hmd->base.rendering_modes[default_mode].view_count);
