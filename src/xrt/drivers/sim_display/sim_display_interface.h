@@ -37,7 +37,7 @@ struct vk_bundle;
  * - "anaglyph": red-cyan anaglyph stereoscopy
  * - "blend": 50/50 alpha blend of both views
  *
- * Activated via SIM_DISPLAY_ENABLE=1 env var.
+ * Always available as fallback. Use FORCE_SIM_DISPLAY=1 to override vendor drivers.
  */
 
 /*!
@@ -368,7 +368,7 @@ sim_display_dp_factory_gl(void *window_handle,
 /*!
  * Create the simulation display system builder.
  *
- * Enabled via SIM_DISPLAY_ENABLE=1 environment variable.
+ * Always available as fallback. Use FORCE_SIM_DISPLAY=1 to override vendor drivers.
  *
  * @return A new xrt_builder, or NULL on failure.
  * @ingroup drv_sim_display

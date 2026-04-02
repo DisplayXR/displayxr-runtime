@@ -1882,11 +1882,14 @@ src/xrt/drivers/leia/
 The simulation display driver runs on any GPU and provides a complete reference
 for developing and testing without vendor hardware.
 
-### 12.1 Enabling sim_display
+### 12.1 Using sim_display
+
+sim_display is always available as a fallback when no vendor driver claims hardware.
+To force it over a detected vendor driver:
 
 ```bash
-# Enable sim_display driver
-export SIM_DISPLAY_ENABLE=1
+# Force sim_display even when vendor hardware is detected
+export FORCE_SIM_DISPLAY=1
 
 # Choose output mode
 export SIM_DISPLAY_OUTPUT=sbs        # Side-by-side (default)
@@ -1914,10 +1917,9 @@ export SIM_DISPLAY_PIXEL_H=2160
 1. **Build the runtime** with sim_display enabled (it's always enabled by
    default in the build system).
 
-2. **Run your test app** with `SIM_DISPLAY_ENABLE=1`:
+2. **Run your test app** (sim_display is auto-selected when no vendor hardware is detected):
    ```bash
-   export XR_RUNTIME_JSON=./build/openxr_monado-dev.json
-   export SIM_DISPLAY_ENABLE=1
+   export XR_RUNTIME_JSON=./build/openxr_displayxr-dev.json
    export SIM_DISPLAY_OUTPUT=sbs
    ./your_openxr_app
    ```
@@ -2100,7 +2102,7 @@ For a vendor starting from scratch, here is the recommended order:
    - Add `target_sources` + `target_link_libraries` in `targets/common/CMakeLists.txt`
 8. **Add keyboard/mouse input** by calling `t_builder_add_qwerty_input()` in your builder's `open_system_impl`
 9. **Verify builder appears** in the runtime log: `Builders: ... my_vendor: MyVendor 3D Display`
-10. **Test with `SIM_DISPLAY_ENABLE=0`** and your actual hardware
+10. **Test without `FORCE_SIM_DISPLAY`** and your actual hardware
 
 **Remember:** vendor-specific code goes **only** in `src/xrt/drivers/<vendor>/`.
 No changes to runtime files (`oxr_session.c`, `comp_multi_compositor.c`, etc.)

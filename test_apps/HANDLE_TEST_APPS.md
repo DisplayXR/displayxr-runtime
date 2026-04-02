@@ -275,5 +275,5 @@ Run the test app:
 
 | Variable | Values | Description |
 |----------|--------|-------------|
-| `SIM_DISPLAY_ENABLE` | `1` | Enable the sim_display driver |
+| `FORCE_SIM_DISPLAY` | `1` | Force sim_display over vendor drivers |
 | `SIM_DISPLAY_OUTPUT` | `sbs`, `anaglyph`, `blend` | Set visualization mode (before launch) |
