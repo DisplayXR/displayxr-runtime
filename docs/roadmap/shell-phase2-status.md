@@ -1,6 +1,6 @@
 # Shell Phase 2 — Implementation Status
 
-Last updated: 2026-04-01 (branch `feature/shell-phase1-ci`)
+Last updated: 2026-04-01 (branch `feature/shell-phase2-ci`)
 
 ## What Works (from Phase 1)
 
@@ -18,16 +18,23 @@ See `shell-phase1-status.md` for design decisions and lessons learned.
 ## Phase 2 Progress
 
 ### Phase 2A: Window Chrome
-**Status:** Not started
+**Status:** Done (locally tested on Leia display, 2026-04-01)
 
 Title bars with app name and close button, rendered server-side in the compositor.
 
 | Task | Status | Notes |
 |------|--------|-------|
-| 2A.1 Title bar rendering | | Colored strip above each window's blit rect |
-| 2A.2 App name text | | Bitmap font, glyphs blit from compiled-in atlas |
-| 2A.3 Close button | | Click on X sends EXIT_REQUEST |
-| 2A.4 Title bar drag | | Right-click-drag on title bar moves window |
+| 2A.1 Title bar rendering | ✅ | 24px dark blue-gray strip above each window, solid-color blit with configurable RGB via `src_rect` |
+| 2A.2 App name text | ✅ | 8x16 bitmap font in `d3d11_bitmap_font.h` (public domain VGA font), 768x16 font atlas texture, alpha-blended glyph rendering with point sampler |
+| 2A.3 Close button | ✅ | Red rect + white X glyph at right end of title bar; click sends EXIT_REQUEST. Rising-edge LMB detection for reliable single-click. |
+| 2A.4 Title bar drag | ✅ | Left-click-drag on title bar moves window (title_drag state machine); right-click-drag also works on title bar. Fractional SBS-aware positioning. |
+
+**Key implementation details:**
+- Blit PS shader now reads solid color from `src_rect.rgb` when `convert_srgb > 1.5` (was hardcoded cyan)
+- Title bars use fractional positioning (`fx * half_w`) matching the content blit — required for correct SBS rendering
+- Focus border (cyan) encompasses title bar + content area
+- LMB click detection uses rising-edge (`lmb_held && !prev_lmb_held`) instead of `GetAsyncKeyState & 1` for reliability
+- App name populated via `GetWindowTextA()` on the app's HWND at client registration, fallback to "App N"
 
 ### Phase 2B: Layout Presets
 **Status:** Not started

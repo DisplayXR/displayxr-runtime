@@ -9,6 +9,7 @@
 
 #include "comp_d3d11_service.h"
 #include "d3d11_service_shaders.h"
+#include "d3d11_bitmap_font.h"
 
 #include "xrt/xrt_handles.h"
 #include "xrt/xrt_limits.h"
@@ -316,6 +317,9 @@ struct d3d11_service_system
 	//! Linear sampler for layer textures
 	wil::com_ptr<ID3D11SamplerState> sampler_linear;
 
+	//! Point sampler for bitmap font rendering
+	wil::com_ptr<ID3D11SamplerState> sampler_point;
+
 	//! Blend state for alpha blending
 	wil::com_ptr<ID3D11BlendState> blend_alpha;
 
@@ -388,6 +392,12 @@ struct d3d11_service_system
 
 #define D3D11_MULTI_MAX_CLIENTS 8
 
+//! Title bar height in display pixels.
+#define TITLE_BAR_HEIGHT_PX 24
+
+//! Close button width in display pixels.
+#define CLOSE_BTN_WIDTH_PX 24
+
 /*!
  * Per-client slot in the multi-compositor.
  */
@@ -421,6 +431,9 @@ struct d3d11_multi_client_slot
 
 	//! True when this slot has an active client.
 	bool active;
+
+	//! App name for title bar display (from HWND title or fallback).
+	char app_name[128];
 };
 
 /*!
@@ -471,6 +484,23 @@ struct d3d11_multi_compositor
 		float start_pos_x;   //!< Window pose.position.x at drag start (meters)
 		float start_pos_y;   //!< Window pose.position.y at drag start (meters)
 	} drag;
+
+	//! Left-click title bar drag state (parallel to right-click drag).
+	struct
+	{
+		bool active;
+		int32_t slot;
+		POINT start_cursor;
+		float start_pos_x;
+		float start_pos_y;
+	} title_drag;
+
+	//! Previous frame LMB state (for rising-edge detection).
+	bool prev_lmb_held;
+
+	//! Bitmap font atlas for title bar text (768x16, 96 ASCII glyphs).
+	wil::com_ptr<ID3D11Texture2D> font_atlas;
+	wil::com_ptr<ID3D11ShaderResourceView> font_atlas_srv;
 };
 
 
@@ -792,6 +822,19 @@ create_layer_resources(struct d3d11_service_system *sys)
 	hr = sys->device->CreateSamplerState(&samp_desc, sys->sampler_linear.put());
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create linear sampler: 0x%08lx", hr);
+		return false;
+	}
+
+	// Create point sampler (for bitmap font rendering — no filtering)
+	D3D11_SAMPLER_DESC point_samp_desc = {};
+	point_samp_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+	point_samp_desc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+	point_samp_desc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+	point_samp_desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+
+	hr = sys->device->CreateSamplerState(&point_samp_desc, sys->sampler_point.put());
+	if (FAILED(hr)) {
+		U_LOG_E("Failed to create point sampler: 0x%08lx", hr);
 		return false;
 	}
 
@@ -2873,6 +2916,8 @@ multi_compositor_destroy(struct d3d11_multi_compositor *mc)
 	mc->combined_atlas_rtv.reset();
 	mc->combined_atlas_srv.reset();
 	mc->combined_atlas.reset();
+	mc->font_atlas_srv.reset();
+	mc->font_atlas.reset();
 	mc->swap_chain.reset();
 
 	if (mc->window != nullptr) {
@@ -2995,6 +3040,51 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 	U_LOG_W("Multi-comp: combined atlas %ux%u",
 	        sys->base.info.display_pixel_width > 0 ? sys->base.info.display_pixel_width : sys->display_width,
 	        sys->base.info.display_pixel_height > 0 ? sys->base.info.display_pixel_height : sys->display_height);
+
+	// Create bitmap font atlas texture (768x16, 96 ASCII glyphs)
+	if (!mc->font_atlas) {
+		uint32_t fa_w = BITMAP_FONT_ATLAS_W;
+		uint32_t fa_h = BITMAP_FONT_ATLAS_H;
+		uint32_t *pixels = new uint32_t[fa_w * fa_h];
+		std::memset(pixels, 0, fa_w * fa_h * sizeof(uint32_t));
+
+		for (int g = 0; g < BITMAP_FONT_GLYPH_COUNT; g++) {
+			for (int row = 0; row < BITMAP_FONT_GLYPH_H; row++) {
+				uint8_t bits = bitmap_font_8x16[g][row];
+				for (int bit = 0; bit < BITMAP_FONT_GLYPH_W; bit++) {
+					if (bits & (0x80 >> bit)) {
+						uint32_t px = g * BITMAP_FONT_GLYPH_W + bit;
+						uint32_t py = row;
+						pixels[py * fa_w + px] = 0xFFFFFFFF; // white, opaque
+					}
+				}
+			}
+		}
+
+		D3D11_TEXTURE2D_DESC font_desc = {};
+		font_desc.Width = fa_w;
+		font_desc.Height = fa_h;
+		font_desc.MipLevels = 1;
+		font_desc.ArraySize = 1;
+		font_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		font_desc.SampleDesc.Count = 1;
+		font_desc.Usage = D3D11_USAGE_IMMUTABLE;
+		font_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+		D3D11_SUBRESOURCE_DATA init_data = {};
+		init_data.pSysMem = pixels;
+		init_data.SysMemPitch = fa_w * sizeof(uint32_t);
+
+		hr = sys->device->CreateTexture2D(&font_desc, &init_data, mc->font_atlas.put());
+		if (SUCCEEDED(hr)) {
+			sys->device->CreateShaderResourceView(mc->font_atlas.get(), nullptr, mc->font_atlas_srv.put());
+			U_LOG_W("Multi-comp: font atlas created (%ux%u)", fa_w, fa_h);
+		} else {
+			U_LOG_E("Multi-comp: failed to create font atlas (hr=0x%08X)", hr);
+		}
+
+		delete[] pixels;
+	}
 
 	// Create display processor via factory
 	if (sys->base.info.dp_factory_d3d11 != NULL) {
@@ -3194,47 +3284,122 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		}
 	}
 
-	// Left-click: focus the window under the cursor (click-to-focus)
-	if (GetAsyncKeyState(VK_LBUTTON) & 1) {
-		POINT pt;
-		GetCursorPos(&pt);
-		ScreenToClient(mc->hwnd, &pt);
+	// Left-click: focus window, close button, title bar drag, or content click.
+	// Title bar extends TITLE_BAR_HEIGHT_PX above the content rect.
+	{
+		bool lmb_held = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+		bool lmb_just_pressed = lmb_held && !mc->prev_lmb_held;
+		mc->prev_lmb_held = lmb_held;
 
-		int hit_slot = -1;
-		for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
-			if (!mc->clients[i].active) {
-				continue;
-			}
-			int32_t rx = (int32_t)mc->clients[i].window_rect_x;
-			int32_t ry = (int32_t)mc->clients[i].window_rect_y;
-			int32_t rw = (int32_t)mc->clients[i].window_rect_w;
-			int32_t rh = (int32_t)mc->clients[i].window_rect_h;
-			if (pt.x >= rx && pt.x < rx + rw && pt.y >= ry && pt.y < ry + rh) {
-				hit_slot = i;
-				break; // First hit wins
-			}
-		}
+		if (lmb_just_pressed && !mc->title_drag.active) {
+			POINT pt;
+			GetCursorPos(&pt);
+			ScreenToClient(mc->hwnd, &pt);
 
-		if (hit_slot != mc->focused_slot) {
-			mc->focused_slot = hit_slot;
-			U_LOG_W("Multi-comp: click → focused slot %d%s", mc->focused_slot,
-			        mc->focused_slot < 0 ? " (unfocused)" : "");
-			multi_compositor_update_input_forward(mc);
+			int hit_slot = -1;
+			bool in_title_bar = false;
+			bool in_close_btn = false;
 
-			// Synthesize mouse-move + click to the newly focused app so the
-			// user doesn't have to click twice (once to focus, once to interact).
-			// The WM_MOUSEMOVE primes the app's internal cursor tracker so the
-			// first drag delta is zero (no viewpoint jump).
-			if (hit_slot >= 0 && mc->clients[hit_slot].app_hwnd != nullptr) {
-				int32_t rx = (int32_t)mc->clients[hit_slot].window_rect_x;
-				int32_t ry = (int32_t)mc->clients[hit_slot].window_rect_y;
-				int app_x = pt.x - rx;
-				int app_y = pt.y - ry;
-				LPARAM lp = MAKELPARAM(app_x, app_y);
-				PostMessage(mc->clients[hit_slot].app_hwnd, WM_MOUSEMOVE, 0, lp);
-				PostMessage(mc->clients[hit_slot].app_hwnd, WM_LBUTTONDOWN,
-				            MK_LBUTTON, lp);
+			for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
+				if (!mc->clients[i].active) continue;
+				int32_t rx = (int32_t)mc->clients[i].window_rect_x;
+				int32_t ry = (int32_t)mc->clients[i].window_rect_y;
+				int32_t rw = (int32_t)mc->clients[i].window_rect_w;
+				int32_t rh = (int32_t)mc->clients[i].window_rect_h;
+				int32_t tb_y = ry - TITLE_BAR_HEIGHT_PX;
+				if (tb_y < 0) tb_y = 0;
+
+				// Hit-test: title bar + content area
+				if (pt.x >= rx && pt.x < rx + rw && pt.y >= tb_y && pt.y < ry + rh) {
+					hit_slot = i;
+					in_title_bar = (pt.y < ry);
+					if (in_title_bar) {
+						in_close_btn = (pt.x >= rx + rw - CLOSE_BTN_WIDTH_PX);
+					}
+					break;
+				}
 			}
+
+			U_LOG_I("Multi-comp: LMB click at (%ld,%ld) hit_slot=%d title_bar=%d close_btn=%d",
+			        pt.x, pt.y, hit_slot, in_title_bar, in_close_btn);
+
+			if (in_close_btn && hit_slot >= 0) {
+				// Close button: send EXIT_REQUEST
+				struct d3d11_service_compositor *fc = mc->clients[hit_slot].compositor;
+				if (fc != nullptr && fc->xses != nullptr) {
+					union xrt_session_event xse = XRT_STRUCT_INIT;
+					xse.type = XRT_SESSION_EVENT_EXIT_REQUEST;
+					xrt_session_event_sink_push(fc->xses, &xse);
+					U_LOG_W("Multi-comp: close button → exit request for slot %d", hit_slot);
+				}
+			} else if (in_title_bar && hit_slot >= 0) {
+				// Title bar drag: start dragging
+				mc->focused_slot = hit_slot;
+				multi_compositor_update_input_forward(mc);
+
+				mc->title_drag.active = true;
+				mc->title_drag.slot = hit_slot;
+				GetCursorPos(&mc->title_drag.start_cursor);
+				ScreenToClient(mc->hwnd, &mc->title_drag.start_cursor);
+				mc->title_drag.start_pos_x = mc->clients[hit_slot].window_pose.position.x;
+				mc->title_drag.start_pos_y = mc->clients[hit_slot].window_pose.position.y;
+			} else {
+				// Content area click: focus + forward to app
+				if (hit_slot != mc->focused_slot) {
+					mc->focused_slot = hit_slot;
+					U_LOG_W("Multi-comp: click → focused slot %d%s", mc->focused_slot,
+					        mc->focused_slot < 0 ? " (unfocused)" : "");
+					multi_compositor_update_input_forward(mc);
+				}
+
+				// Synthesize mouse-move + click to the app
+				if (hit_slot >= 0 && mc->clients[hit_slot].app_hwnd != nullptr) {
+					int32_t rx = (int32_t)mc->clients[hit_slot].window_rect_x;
+					int32_t ry = (int32_t)mc->clients[hit_slot].window_rect_y;
+					int app_x = pt.x - rx;
+					int app_y = pt.y - ry;
+					LPARAM lp = MAKELPARAM(app_x, app_y);
+					PostMessage(mc->clients[hit_slot].app_hwnd, WM_MOUSEMOVE, 0, lp);
+					PostMessage(mc->clients[hit_slot].app_hwnd, WM_LBUTTONDOWN,
+					            MK_LBUTTON, lp);
+				}
+			}
+		} else if (lmb_held && mc->title_drag.active) {
+			// Title bar dragging — update window position
+			POINT pt;
+			GetCursorPos(&pt);
+			ScreenToClient(mc->hwnd, &pt);
+
+			int s = mc->title_drag.slot;
+			if (s >= 0 && s < D3D11_MULTI_MAX_CLIENTS && mc->clients[s].active) {
+				float disp_w_m = sys->base.info.display_width_m;
+				float disp_h_m = sys->base.info.display_height_m;
+				uint32_t disp_px_w = sys->base.info.display_pixel_width;
+				uint32_t disp_px_h = sys->base.info.display_pixel_height;
+				if (disp_px_w > 0 && disp_px_h > 0 && disp_w_m > 0.0f && disp_h_m > 0.0f) {
+					float dx_px = (float)(pt.x - mc->title_drag.start_cursor.x);
+					float dy_px = (float)(pt.y - mc->title_drag.start_cursor.y);
+					float m_per_px_x = disp_w_m / (float)disp_px_w;
+					float m_per_px_y = disp_h_m / (float)disp_px_h;
+
+					mc->clients[s].window_pose.position.x = mc->title_drag.start_pos_x + dx_px * m_per_px_x;
+					mc->clients[s].window_pose.position.y = mc->title_drag.start_pos_y - dy_px * m_per_px_y;
+
+					slot_pose_to_pixel_rect(sys, &mc->clients[s],
+					                        &mc->clients[s].window_rect_x,
+					                        &mc->clients[s].window_rect_y,
+					                        &mc->clients[s].window_rect_w,
+					                        &mc->clients[s].window_rect_h);
+
+					if (s == mc->focused_slot) {
+						multi_compositor_update_input_forward(mc);
+					}
+				}
+			}
+		} else if (!lmb_held && mc->title_drag.active) {
+			// LMB released — end title drag
+			mc->title_drag.active = false;
+			mc->title_drag.slot = -1;
 		}
 	}
 
@@ -3257,7 +3422,10 @@ multi_compositor_render(struct d3d11_service_system *sys)
 				int32_t ry = (int32_t)mc->clients[i].window_rect_y;
 				int32_t rw = (int32_t)mc->clients[i].window_rect_w;
 				int32_t rh = (int32_t)mc->clients[i].window_rect_h;
-				if (pt.x >= rx && pt.x < rx + rw && pt.y >= ry && pt.y < ry + rh) {
+				// Include title bar in right-click-drag hit area
+				int32_t tb_y = ry - TITLE_BAR_HEIGHT_PX;
+				if (tb_y < 0) tb_y = 0;
+				if (pt.x >= rx && pt.x < rx + rw && pt.y >= tb_y && pt.y < ry + rh) {
 					mc->drag.active = true;
 					mc->drag.slot = i;
 					mc->drag.start_cursor = pt;
@@ -3569,6 +3737,191 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		}
 	}
 
+	// Draw title bars above each window
+	if (sys->blit_vs && sys->blit_ps) {
+		uint32_t ca_w = sys->base.info.display_pixel_width;
+		uint32_t ca_h = sys->base.info.display_pixel_height;
+		if (ca_w == 0) ca_w = 3840;
+		if (ca_h == 0) ca_h = 2160;
+		uint32_t half_w = ca_w / sys->tile_columns;
+		uint32_t half_h = ca_h / sys->tile_rows;
+
+		for (int ri = 0; ri < render_count; ri++) {
+			int s = render_order[ri];
+			uint32_t wx = mc->clients[s].window_rect_x;
+			uint32_t wy = mc->clients[s].window_rect_y;
+			uint32_t ww = mc->clients[s].window_rect_w;
+
+			// Use fractional positioning matching the content blit
+			float fx = (float)wx / (float)ca_w;
+			float fy = (float)wy / (float)ca_h;
+			float fw = (float)ww / (float)ca_w;
+
+			// Title bar sits above the content rect (in fractional space)
+			float tb_h_frac = (float)TITLE_BAR_HEIGHT_PX / (float)ca_h;
+			float tb_fy = fy - tb_h_frac;
+			if (tb_fy < 0.0f) tb_fy = 0.0f;
+			float actual_tb_h_frac = fy - tb_fy;
+			if (actual_tb_h_frac <= 0.0f) continue;
+
+			// Draw title bar in each SBS half (same as content blit)
+			uint32_t num_views = sys->tile_columns * sys->tile_rows;
+			for (uint32_t v = 0; v < num_views && v < XRT_MAX_VIEWS; v++) {
+				uint32_t col = v % sys->tile_columns;
+				uint32_t row = v / sys->tile_columns;
+				float ox = col * half_w + fx * half_w;
+				float oy = row * half_h + tb_fy * half_h;
+				float ow = fw * half_w;
+				float oh = actual_tb_h_frac * half_h;
+
+				// Clamp to this half's bounds
+				float half_right = (float)((col + 1) * half_w);
+				if (ox + ow > half_right) continue;
+
+				// Set pipeline (opaque blit, solid color)
+				sys->context->VSSetShader(sys->blit_vs.get(), nullptr, 0);
+				sys->context->PSSetShader(sys->blit_ps.get(), nullptr, 0);
+				sys->context->VSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
+				sys->context->PSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
+				ID3D11RenderTargetView *ca_rtvs[] = {mc->combined_atlas_rtv.get()};
+				sys->context->OMSetRenderTargets(1, ca_rtvs, nullptr);
+				sys->context->OMSetBlendState(sys->blend_opaque.get(), nullptr, 0xFFFFFFFF);
+				sys->context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+				sys->context->IASetInputLayout(nullptr);
+				sys->context->RSSetState(sys->rasterizer_state.get());
+				sys->context->OMSetDepthStencilState(sys->depth_disabled.get(), 0);
+
+				D3D11_VIEWPORT vp = {};
+				vp.Width = (float)ca_w;
+				vp.Height = (float)ca_h;
+				vp.MaxDepth = 1.0f;
+				sys->context->RSSetViewports(1, &vp);
+
+				// Title bar background (dark blue-gray)
+				{
+					D3D11_MAPPED_SUBRESOURCE mapped;
+					if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
+					              D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+						BlitConstants *cb = static_cast<BlitConstants *>(mapped.pData);
+						cb->src_rect[0] = 0.18f; cb->src_rect[1] = 0.20f;
+						cb->src_rect[2] = 0.25f; cb->src_rect[3] = 1.0f;
+						cb->dst_offset[0] = ox;
+						cb->dst_offset[1] = oy;
+						cb->src_size[0] = 1; cb->src_size[1] = 1;
+						cb->dst_size[0] = (float)ca_w;
+						cb->dst_size[1] = (float)ca_h;
+						cb->convert_srgb = 2.0f;
+						cb->padding = 0;
+						cb->dst_rect_wh[0] = ow;
+						cb->dst_rect_wh[1] = oh;
+						cb->padding2[0] = 0; cb->padding2[1] = 0;
+						sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
+						sys->context->Draw(4, 0);
+					}
+				}
+
+				// Close button (red) at right end of title bar
+				{
+					float btn_x = ox + ow - (float)CLOSE_BTN_WIDTH_PX;
+					if (btn_x >= (float)ox) {
+						D3D11_MAPPED_SUBRESOURCE mapped;
+						if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
+						              D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+							BlitConstants *cb = static_cast<BlitConstants *>(mapped.pData);
+							cb->src_rect[0] = 0.70f; cb->src_rect[1] = 0.15f;
+							cb->src_rect[2] = 0.15f; cb->src_rect[3] = 1.0f;
+							cb->dst_offset[0] = btn_x;
+							cb->dst_offset[1] = oy;
+							cb->src_size[0] = 1; cb->src_size[1] = 1;
+							cb->dst_size[0] = (float)ca_w;
+							cb->dst_size[1] = (float)ca_h;
+							cb->convert_srgb = 2.0f;
+							cb->padding = 0;
+							cb->dst_rect_wh[0] = (float)CLOSE_BTN_WIDTH_PX;
+							cb->dst_rect_wh[1] = oh;
+							cb->padding2[0] = 0; cb->padding2[1] = 0;
+							sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
+							sys->context->Draw(4, 0);
+						}
+					}
+				}
+
+				// App name text (rendered from font atlas with alpha blending)
+				if (mc->font_atlas_srv && mc->clients[s].app_name[0] != '\0') {
+					sys->context->OMSetBlendState(sys->blend_alpha.get(), nullptr, 0xFFFFFFFF);
+					ID3D11ShaderResourceView *font_srv = mc->font_atlas_srv.get();
+					sys->context->PSSetShaderResources(0, 1, &font_srv);
+					sys->context->PSSetSamplers(0, 1, sys->sampler_point.addressof());
+
+					const char *name = mc->clients[s].app_name;
+					int max_chars = ((int)ow - 6 - CLOSE_BTN_WIDTH_PX) / 8;
+					if (max_chars < 0) max_chars = 0;
+					if (max_chars > 30) max_chars = 30;
+
+					for (int ci = 0; ci < max_chars && name[ci] != '\0'; ci++) {
+						unsigned char ch = (unsigned char)name[ci];
+						if (ch < 0x20 || ch > 0x7E) ch = '?';
+						int glyph_idx = ch - 0x20;
+
+						D3D11_MAPPED_SUBRESOURCE mapped;
+						if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
+						              D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+							BlitConstants *cb = static_cast<BlitConstants *>(mapped.pData);
+							cb->src_rect[0] = (float)(glyph_idx * 8);
+							cb->src_rect[1] = 0;
+							cb->src_rect[2] = 8;
+							cb->src_rect[3] = 16;
+							cb->dst_offset[0] = ox + 6.0f + ci * 8.0f;
+							cb->dst_offset[1] = oy + 4.0f;
+							cb->src_size[0] = 768; cb->src_size[1] = 16;
+							cb->dst_size[0] = (float)ca_w;
+							cb->dst_size[1] = (float)ca_h;
+							cb->convert_srgb = 0.0f;
+							cb->padding = 0;
+							cb->dst_rect_wh[0] = 8;
+							cb->dst_rect_wh[1] = 16;
+							cb->padding2[0] = 0; cb->padding2[1] = 0;
+							sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
+							sys->context->Draw(4, 0);
+						}
+					}
+
+					// Render 'X' glyph on close button
+					{
+						int x_glyph = 'X' - 0x20;
+						float glyph_x = ox + ow - (float)CLOSE_BTN_WIDTH_PX + 8.0f;
+						float glyph_y = oy + 4.0f;
+						D3D11_MAPPED_SUBRESOURCE mapped;
+						if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
+						              D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+							BlitConstants *cb = static_cast<BlitConstants *>(mapped.pData);
+							cb->src_rect[0] = (float)(x_glyph * 8);
+							cb->src_rect[1] = 0;
+							cb->src_rect[2] = 8;
+							cb->src_rect[3] = 16;
+							cb->dst_offset[0] = glyph_x;
+							cb->dst_offset[1] = glyph_y;
+							cb->src_size[0] = 768; cb->src_size[1] = 16;
+							cb->dst_size[0] = (float)ca_w;
+							cb->dst_size[1] = (float)ca_h;
+							cb->convert_srgb = 0.0f;
+							cb->padding = 0;
+							cb->dst_rect_wh[0] = 8;
+							cb->dst_rect_wh[1] = 16;
+							cb->padding2[0] = 0; cb->padding2[1] = 0;
+							sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
+							sys->context->Draw(4, 0);
+						}
+					}
+
+					// Restore opaque blend + linear sampler
+					sys->context->OMSetBlendState(sys->blend_opaque.get(), nullptr, 0xFFFFFFFF);
+					sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
+				}
+			}
+		}
+	}
+
 	// Draw cyan focus border around the focused app's window rect
 	if (mc->focused_slot >= 0 && mc->focused_slot < D3D11_MULTI_MAX_CLIENTS &&
 	    mc->clients[mc->focused_slot].active && sys->blit_vs && sys->blit_ps) {
@@ -3579,10 +3932,15 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		uint32_t half_w = ca_w / sys->tile_columns;
 		uint32_t half_h = ca_h / sys->tile_rows;
 
+		// Border encompasses title bar + content area
+		int32_t border_y = (int32_t)mc->clients[mc->focused_slot].window_rect_y - TITLE_BAR_HEIGHT_PX;
+		if (border_y < 0) border_y = 0;
+		uint32_t border_h = mc->clients[mc->focused_slot].window_rect_h +
+		                     (mc->clients[mc->focused_slot].window_rect_y - (uint32_t)border_y);
 		float fx = (float)mc->clients[mc->focused_slot].window_rect_x / ca_w;
-		float fy = (float)mc->clients[mc->focused_slot].window_rect_y / ca_h;
+		float fy = (float)border_y / ca_h;
 		float fw = (float)mc->clients[mc->focused_slot].window_rect_w / ca_w;
-		float fh = (float)mc->clients[mc->focused_slot].window_rect_h / ca_h;
+		float fh = (float)border_h / ca_h;
 		float bw = 3.0f; // border width in pixels
 
 		// Set up pipeline for solid-color draw (use blit shader with special flag)
@@ -3621,10 +3979,9 @@ multi_compositor_render(struct d3d11_service_system *sys)
 				if (FAILED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
 				           D3D11_MAP_WRITE_DISCARD, 0, &mapped))) continue;
 				BlitConstants *cb = static_cast<BlitConstants *>(mapped.pData);
-				// Use convert_srgb = 2.0 as a "solid color" flag
-				// The blit PS can check this and output cyan
-				cb->src_rect[0] = 0; cb->src_rect[1] = 0;
-				cb->src_rect[2] = 1; cb->src_rect[3] = 1;
+				// Solid color mode: src_rect.rgb = color, convert_srgb = 2.0
+				cb->src_rect[0] = 0.0f; cb->src_rect[1] = 1.0f;  // R=0, G=1
+				cb->src_rect[2] = 1.0f; cb->src_rect[3] = 1.0f;  // B=1 → cyan
 				cb->dst_offset[0] = edges[e].x;
 				cb->dst_offset[1] = edges[e].y;
 				cb->src_size[0] = 1; cb->src_size[1] = 1;
@@ -4694,6 +5051,22 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 		// because cross-process SetWindowPos deadlocks when called from the IPC handler.
 		sys->multi_comp->clients[slot].app_hwnd = (HWND)external_hwnd;
 
+		// Get app name from HWND title for title bar display
+		if (external_hwnd != 0) {
+			int len = GetWindowTextA((HWND)external_hwnd,
+			                         sys->multi_comp->clients[slot].app_name,
+			                         sizeof(sys->multi_comp->clients[slot].app_name));
+			if (len <= 0) {
+				snprintf(sys->multi_comp->clients[slot].app_name,
+				         sizeof(sys->multi_comp->clients[slot].app_name),
+				         "App %d", slot);
+			}
+		} else {
+			snprintf(sys->multi_comp->clients[slot].app_name,
+			         sizeof(sys->multi_comp->clients[slot].app_name),
+			         "App %d", slot);
+		}
+
 		// Update input forwarding now that app_hwnd is stored
 		// (register_client may have set focused_slot before app_hwnd was available)
 		multi_compositor_update_input_forward(sys->multi_comp);
@@ -4777,6 +5150,7 @@ system_destroy(struct xrt_system_compositor *xsysc)
 	sys->blend_premul.reset();
 	sys->blend_alpha.reset();
 	sys->sampler_linear.reset();
+	sys->sampler_point.reset();
 	sys->layer_constant_buffer.reset();
 
 	// Clean up layer shaders
