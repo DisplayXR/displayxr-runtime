@@ -31,21 +31,34 @@ And the rendering mode API (v7/v8) provides:
 
 ## Contract
 
+### Tracking loss and eye position reporting
+
+**"Tracking lost" (`isTracking = false`)** means the viewer is outside the display's supported 3D view zone — it does **not** necessarily mean the physical tracker has lost lock on the viewer. Some vendors' trackers continue following the viewer even after `isTracking` flips to `false` (e.g., the viewer stepped too far to the side but the camera still sees them). Other vendors' trackers truly lose the viewer and can only report the last known position.
+
+**Both modes guarantee valid eye positions at all times.** When `isTracking == false`, the vendor MUST continue returning usable eye positions — never zeros or uninitialized values. The reported positions depend on vendor capability:
+
+- **Tracker still following viewer out-of-zone:** Vendor MAY report the actual (out-of-zone) tracked positions. This allows apps to maintain a coherent 3D effect even as the viewer moves away, enabling smooth developer-controlled transitions.
+- **Tracker lost viewer entirely:** Vendor MUST report the last known valid position (frozen at the point tracking was lost).
+
+This applies equally to MANAGED and MANUAL modes — the difference between modes is what the vendor *does* with those positions (animate them vs. pass them through), not whether positions are available.
+
 ### MANAGED mode -- vendor controls everything
 
 When the app is in MANAGED mode (default), the vendor SDK owns the full tracking-loss lifecycle:
 
-1. **Tracking lost** -> Vendor SDK plays **collapse animation** (smoothly reduces IPD/parallax toward zero over a grace period, typically 500ms-2s)
+1. **Tracking lost** -> Vendor SDK enters a **grace period** (typically 500ms-2s) and plays a **collapse animation** — smoothly animating eye positions toward the nominal viewer position (collapsing IPD/parallax toward zero). The vendor MAY also apply **shader-side animation** on weaved frames during this period (e.g., gradually reducing 3D depth).
 2. **Grace period expires** -> Vendor SDK auto-switches hardware display to 2D mode
-3. **Tracking resumes** -> Vendor SDK auto-switches hardware display back to 3D mode, plays **revival animation** (smoothly restores tracked IPD/parallax)
+3. **Tracking resumes** -> Vendor SDK auto-switches hardware display back to 3D mode, plays **revival animation** (smoothly restores tracked IPD/parallax from nominal back to tracked positions)
 4. **During grace period**, if tracking resumes -> Vendor SDK plays revival animation directly, no 2D switch occurs
 
 The app receives:
-- Smoothed, continuous eye positions throughout (no jumps)
+- **Animated eye positions** throughout the grace period — these are vendor-generated values (e.g., collapsing toward nominal viewpoint), **not** the raw tracked or last-known positions. This is the key difference from MANUAL mode.
 - `isTracking` remains vendor-determined (may stay `true` during grace period, goes `false` after)
 - `XrEventDataRenderingModeChangedEXT` + `XrEventDataHardwareDisplayStateChangedEXT` when vendor auto-switches 2D<->3D
 
 The app is passive -- it does not need to call `xrRequestDisplayRenderingModeEXT` during these transitions.
+
+**Recommendation (SHOULD):** In MANAGED mode, vendors SHOULD keep `isTracking = true` throughout the grace period (while the collapse animation plays) and set `isTracking = false` only when the grace period expires and the vendor switches the display to 2D. This gives apps a consistent signal: `isTracking == false` means the vendor has fully transitioned to fallback. Vendors MAY deviate if their SDK uses a different heuristic, but the timing SHOULD align with the actual 2D switch.
 
 ### MANUAL mode -- developer controls everything
 
@@ -55,15 +68,25 @@ When the app requests MANUAL mode, the vendor SDK must:
 2. **Never auto-switch** the display between 2D and 3D on tracking loss/recovery
 3. **Immediately report** `isTracking = false` when tracking is lost (no grace period hiding)
 4. **Immediately report** `isTracking = true` when tracking resumes
-5. **Return unprocessed** eye positions at all times
+5. **Continue returning valid eye positions** — if the tracker is still following the viewer out-of-zone, report those actual positions; if the tracker lost the viewer, report the last known position. No animation or smoothing applied.
 
 The app is responsible for its own strategy:
 - Detect `isTracking` transition to `false`
-- Animate convergence/IPD to zero (optional, app's choice)
+- Use the still-valid eye positions to design its own 3D-to-2D transition (e.g., animate convergence down while the 3D effect tracks the viewer's actual movement)
 - Call `xrRequestDisplayRenderingModeEXT(2D_mode)` when ready
 - Detect `isTracking` transition to `true`
 - Call `xrRequestDisplayRenderingModeEXT(3D_mode)` to resume
 - Animate convergence/IPD back to tracked values
+
+### What the app sees: MANAGED vs MANUAL comparison
+
+| Aspect | MANAGED | MANUAL |
+|---|---|---|
+| `isTracking` timing | Delayed — stays `true` during grace period | Immediate — flips as soon as out-of-zone |
+| Eye positions during transition | **Animated** by vendor (collapsing toward nominal) | **Unmodified** — actual tracked position or last known |
+| Shader effects | Vendor MAY animate weaved output | None — vendor passes frames through unchanged |
+| 2D/3D hardware switch | Automatic at end of grace period | Never — app calls `xrRequestDisplayRenderingModeEXT` |
+| App responsibility | Passive | Full control over transition strategy |
 
 ## Vendor Integration Requirements
 

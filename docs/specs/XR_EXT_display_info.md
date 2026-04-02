@@ -1680,22 +1680,34 @@ XrResult xrRequestEyeTrackingModeEXT(XrSession session, XrEyeTrackingModeEXT mod
 
 1. `xrLocateViews` **always** returns fully populated views (positions, FOVs) regardless
    of tracking capability or `isTracking` state.
-2. When `isTracking == XR_FALSE`, the vendor SDK provides fallback positions (last known,
-   filtered, nominal viewer). The runtime passes vendor values through unchanged.
+2. When `isTracking == XR_FALSE`, the vendor SDK MUST continue providing valid, usable eye
+   positions — never zeros or uninitialized values. If the tracker is still following the
+   viewer out-of-zone, the vendor MAY report those actual positions; if the tracker lost
+   the viewer entirely, the vendor MUST report the last known valid position. The runtime
+   passes vendor values through unchanged.
 3. `isTracking` is orthogonal to `XrViewState.viewStateFlags` (`POSITION_TRACKED_BIT` etc.)
    — those flags reflect head pose tracking, not eye tracking.
+4. `isTracking == XR_FALSE` means the viewer is outside the supported 3D view zone — it
+   does **not** necessarily mean the physical tracker has lost lock on the viewer.
 
 ### Mode Semantics
 
 **Managed mode** (default):
-- Vendor SDK handles grace period + resume smoothing internally
-- Eye positions converge smoothly to rest position when tracking lost
-- `isTracking` reflects vendor heuristic (e.g., eye distance > threshold)
+- Vendor SDK handles grace period, collapse/revival animations, and auto 2D/3D switching
+- Eye positions during grace period are **vendor-animated** (e.g., collapsing toward
+  nominal viewer position), not the raw tracked or last-known values
+- Vendor MAY also apply shader-side animation on weaved frames during the grace period
+- `isTracking` reflects vendor heuristic; SHOULD stay `true` during grace period and
+  flip to `false` when the vendor switches the display to 2D
 
 **Manual mode**:
-- Vendor SDK provides unfiltered positions
-- Vendor still responsible for fallback positions when tracking lost
-- App uses `isTracking` to trigger its own transition animations
+- `isTracking` flips immediately on tracking loss — no grace period hiding
+- Vendor continues returning valid eye positions without animation: actual tracked
+  positions if the tracker still sees the viewer, or last known position if not
+- No automatic 2D/3D switching — app calls `xrRequestDisplayRenderingModeEXT` explicitly
+- App uses `isTracking` + the still-valid eye positions to design its own transitions
+
+See `docs/specs/eye-tracking-modes.md` for the full MANAGED/MANUAL contract.
 
 ### Backward Compatibility
 
