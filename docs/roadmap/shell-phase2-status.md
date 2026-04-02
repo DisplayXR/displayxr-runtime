@@ -37,40 +37,54 @@ Title bars with app name and close button, rendered server-side in the composito
 - App name populated via `GetWindowTextA()` on the app's HWND at client registration, fallback to "App N"
 
 ### Phase 2B: Layout Presets
-**Status:** Not started
+**Status:** Done (locally built, 2026-04-01)
 
 One-key layout switching for common arrangements.
 
 | Task | Status | Notes |
 |------|--------|-------|
-| 2B.1 Layout algorithms | | Side-by-side, stacked, fullscreen, cascade |
-| 2B.2 Number key triggers | | 1-4 in qwerty handler |
-| 2B.3 Pose computation | | Compute poses for all active clients per layout |
-| 2B.4 Animated transitions | | Optional: lerp over ~200ms |
+| 2B.1 Layout algorithms | ✅ | `apply_layout()` with 4 modes: side-by-side, stacked, fullscreen, cascade |
+| 2B.2 Key triggers | ✅ | Ctrl+1-4 in render loop via GetAsyncKeyState. Ctrl+digit suppressed in WndProc. |
+| 2B.3 Pose computation | ✅ | Each layout computes pose + size per active non-minimized client, calls `slot_pose_to_pixel_rect` |
+| 2B.4 Animated transitions | — | Deferred (instant snap for now) |
 
 ### Phase 2C: Close / Minimize / Maximize
-**Status:** Not started
+**Status:** Done (locally built, 2026-04-01)
 
 Window management actions.
 
 | Task | Status | Notes |
 |------|--------|-------|
-| 2C.1 Close from chrome | | Same as DELETE but from title bar |
-| 2C.2 Minimize | | Hide from rendering, keep connected. `shell_set_visibility` IPC |
-| 2C.3 Maximize | | Focused fills display, others hidden |
-| 2C.4 Taskbar | | Bottom strip showing minimized app indicators |
+| 2C.1 Close from chrome | ✅ | Done in Phase 2A (title bar X button) |
+| 2C.2 Minimize | ✅ | `minimized` flag on slot. Gray minimize button (—) in title bar. Skipped in render/hit-test. Focus advances on minimize. |
+| 2C.3 Maximize | ✅ | Double-click title bar toggles maximize. Saves/restores pre_max state. |
+| 2C.4 Taskbar | ✅ | 28px dark strip at bottom when minimized windows exist. Indicators with app name (first 6 chars). Click to un-minimize. |
+| 2C.5 IPC | ✅ | `shell_set_visibility(client_id, visible)` in proto.json + handler. `comp_d3d11_service_set_client_visibility()`. |
 
 ### Phase 2D: Persistence
-**Status:** Not started
+**Status:** Done (locally built, 2026-04-01)
 
 Window layout saved to JSON, restored on restart.
 
 | Task | Status | Notes |
 |------|--------|-------|
-| 2D.1 Config file | | `%LOCALAPPDATA%\DisplayXR\shell_layout.json` |
-| 2D.2 Restore on connect | | Apply saved pose when app reconnects |
-| 2D.3 Save on change | | Update config on drag/resize/layout |
-| 2D.4 Shell reads config | | Apply saved poses via `shell_set_window_pose` |
+| 2D.1 Config file | ✅ | `%LOCALAPPDATA%\DisplayXR\shell_layout.json` via cJSON (already linked via aux_util) |
+| 2D.2 Restore on connect | ✅ | Shell detects new clients, checks config for saved pose by app name, applies via `shell_set_window_pose` |
+| 2D.3 Save on change | ✅ | Every 5 seconds, shell polls all client poses via `shell_get_window_pose` IPC, saves if changed |
+| 2D.4 Shell reads config | ✅ | `shell_config_load()` at startup, `shell_config_save()` on changes |
+| 2D.5 IPC | ✅ | `shell_get_window_pose(client_id)` → returns pose + width_m + height_m |
+
+### Phase 2E: Edge/Corner Resize + DPI Scaling
+**Status:** Done (locally tested, 2026-04-01)
+
+| Task | Status | Notes |
+|------|--------|-------|
+| 2E.1 Edge/corner resize | ✅ | Left-click-drag on window edges/corners. Asymmetric (only dragged edge moves). Resize zone DPI-scaled. |
+| 2E.2 Continuous HWND resize | ✅ | App HWND resized every frame during drag (no content distortion). `SWP_ASYNCWINDOWPOS`. |
+| 2E.3 Mouse suppression | ✅ | Mouse events not forwarded to app during resize (prevents camera animation). |
+| 2E.4 Resize cursors | ✅ | Cursor changes to resize arrows (↔ ↕ ⤡ ⤢) when hovering near edges/corners. |
+| 2E.5 DPI-aware UI | ✅ | All UI (title bars, buttons, glyphs, taskbar, resize zone) scaled via `GetDpiForWindow()`. Fallback to resolution heuristic. |
+| 2E.6 Title bar z-order | ✅ | Title bars render inside render_order loop — foreground window always covers background title bars. |
 
 ## Known Issues
 
@@ -79,6 +93,9 @@ Service crashes intermittently when two apps run simultaneously. Race condition 
 
 ### Apps don't survive shell exit (Phase 1A deferred)
 ESC dismisses shell, apps become invisible. Must relaunch apps after shell revival.
+
+### Title bar button hit-test slight offset
+The minimize button click target area is shifted a few pixels to the right of the visual button. Close button has a similar minor offset. Root cause: the visual rendering uses fractional SBS-half coordinates while the hit-test uses full-display `window_rect` coordinates. These match in tile_columns=1 (2D mode) but may drift slightly due to float→int rounding with DPI scaling. Workaround: aim slightly left of the visual button center.
 
 ## How to Launch the Shell
 

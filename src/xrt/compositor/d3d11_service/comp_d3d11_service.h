@@ -184,6 +184,24 @@ comp_d3d11_service_get_client_window_metrics(struct xrt_system_compositor *xsysc
 bool
 comp_d3d11_service_window_is_valid(struct xrt_system_compositor *xsysc);
 
+/*!
+ * Set visibility (minimize/un-minimize) for a client's window in the multi-compositor.
+ */
+bool
+comp_d3d11_service_set_client_visibility(struct xrt_system_compositor *xsysc,
+                                          struct xrt_compositor *xc,
+                                          bool visible);
+
+/*!
+ * Get the current window pose and dimensions for a client in the multi-compositor.
+ */
+bool
+comp_d3d11_service_get_client_window_pose(struct xrt_system_compositor *xsysc,
+                                           struct xrt_compositor *xc,
+                                           struct xrt_pose *out_pose,
+                                           float *out_width_m,
+                                           float *out_height_m);
+
 
 #ifdef __cplusplus
 }
