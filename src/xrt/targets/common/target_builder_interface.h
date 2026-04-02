@@ -28,7 +28,7 @@
 #define T_BUILDER_LEIA
 #endif
 
-// Always enabled — sim_display guards itself via SIM_DISPLAY_ENABLE env var
+// Always enabled as fallback — use FORCE_SIM_DISPLAY=1 to override vendor drivers
 #define T_BUILDER_SIM_DISPLAY
 
 

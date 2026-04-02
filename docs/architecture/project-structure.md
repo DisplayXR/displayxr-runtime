@@ -92,7 +92,7 @@ Pure software simulation for development and testing without hardware.
 
 **Configuration via environment variables:**
 ```
-SIM_DISPLAY_ENABLE=1                  # Enable the driver
+FORCE_SIM_DISPLAY=1                   # Force sim_display over vendor drivers
 SIM_DISPLAY_OUTPUT=sbs|anaglyph|blend # Output mode
 SIM_DISPLAY_WIDTH_M=0.344             # Physical width (meters)
 SIM_DISPLAY_HEIGHT_M=0.194            # Physical height (meters)
@@ -214,7 +214,7 @@ Platform-specific code is isolated via:
 
 ### Environment Variable Gates
 Runtime driver selection without recompilation:
-- `SIM_DISPLAY_ENABLE=1` — Enable simulation display
+- `FORCE_SIM_DISPLAY=1` — Force simulation display over vendor drivers
 - `SIM_DISPLAY_OUTPUT=sbs|anaglyph|blend` — Select output mode
 - `OXR_ENABLE_D3D11_NATIVE_COMPOSITOR=1` — Enable D3D11 compositor
 

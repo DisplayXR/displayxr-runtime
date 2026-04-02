@@ -215,7 +215,7 @@ endif()
 add_library(drv_sim_display_includes INTERFACE)
 target_include_directories(drv_sim_display_includes INTERFACE sim_display)
 
-# Simulation 3D display driver (always available, enabled by SIM_DISPLAY_ENABLE=1)
+# Simulation 3D display driver (always available as fallback, FORCE_SIM_DISPLAY=1 overrides vendor drivers)
 set(SIM_DISPLAY_SOURCES
 	sim_display/sim_display_device.c
 	sim_display/sim_display_interface.h

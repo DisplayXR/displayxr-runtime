@@ -28,7 +28,7 @@
 #include <stdlib.h>
 
 
-DEBUG_GET_ONCE_BOOL_OPTION(enable_sim_display, "SIM_DISPLAY_ENABLE", false)
+DEBUG_GET_ONCE_BOOL_OPTION(force_sim_display, "FORCE_SIM_DISPLAY", false)
 
 
 /*
@@ -53,12 +53,13 @@ sim_display_estimate_system(struct xrt_builder *xb,
                             struct xrt_prober *xp,
                             struct xrt_builder_estimate *estimate)
 {
-	if (!debug_get_bool_option_enable_sim_display()) {
-		return XRT_SUCCESS;
-	}
-
 	estimate->certain.head = true;
-	estimate->priority = -20; // Higher than qwerty fallback (-25), lower than leia (-15)
+
+	if (debug_get_bool_option_force_sim_display()) {
+		estimate->priority = -10; // Forced: override vendor drivers (leia is -15)
+	} else {
+		estimate->priority = -20; // Fallback: below vendor drivers, above qwerty (-25)
+	}
 
 	return XRT_SUCCESS;
 }
@@ -134,7 +135,7 @@ t_builder_sim_display_create(void)
 	ub->base.name = "Simulated 3D Display";
 	ub->base.driver_identifiers = driver_list;
 	ub->base.driver_identifier_count = ARRAY_SIZE(driver_list);
-	ub->base.exclude_from_automatic_discovery = !debug_get_bool_option_enable_sim_display();
+	ub->base.exclude_from_automatic_discovery = false; // Always available as fallback
 
 	// u_builder fields.
 	ub->open_system_static_roles = sim_display_open_system_impl;

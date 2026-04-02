@@ -261,7 +261,7 @@ fallback for development when no real display is available.
 | Builder | Head Claim | Priority | Use Case |
 |---------|-----------|----------|----------|
 | leia | `certain.head` | -15 | SR SDK hardware detected |
-| sim_display | `certain.head` | -20 | `SIM_DISPLAY_ENABLE=1` |
+| sim_display | `certain.head` / `maybe.head` | -10 / -20 | `FORCE_SIM_DISPLAY=1` overrides vendors; otherwise auto-fallback |
 | qwerty | `maybe.head` | -19 | No display builder active (fallback) |
 | legacy | `maybe.head` | -20 | Upstream Monado catch-all |
 

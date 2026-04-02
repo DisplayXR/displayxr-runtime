@@ -52,6 +52,7 @@
 #include "target_instance_parts.h"
 
 #include <assert.h>
+#include <string.h>
 
 #ifdef XRT_OS_ANDROID
 #include "android/android_instance_base.h"
@@ -143,6 +144,7 @@ t_instance_create_system(struct xrt_instance *xinst,
 
 #ifdef XRT_HAVE_LEIA_SR
 		// Query SR display for refresh rate only; dims come from device native resolution
+		if (strstr(head->str, "Sim 3D Display") == NULL)
 		{
 			uint32_t sr_rec_width = 0, sr_rec_height = 0;
 			uint32_t sr_native_width = 0, sr_native_height = 0;
@@ -216,6 +218,8 @@ out:
 #ifdef XRT_HAVE_LEIA_SR
 		// Populate display info for XR_EXT_display_info extension.
 		// Scale factors are static: sr_recommended / display_pixels.
+		// Skip if sim_display was explicitly selected (FORCE_SIM_DISPLAY=1).
+		if (strstr(head->str, "Sim 3D Display") == NULL)
 		{
 			uint32_t di_sr_w = 0, di_sr_h = 0, di_nat_w = 0, di_nat_h = 0;
 			float di_refresh = 0.0f;
@@ -245,32 +249,31 @@ out:
 				        dims.width_m, dims.height_m,
 				        dims.nominal_x_m, dims.nominal_y_m, dims.nominal_z_m);
 			}
-		}
-
-		// Compute tiling for all modes (Leia SR path)
-		if (xsysc->info.display_pixel_width > 0 && xsysc->info.display_pixel_height > 0) {
-			for (uint32_t mi = 0; mi < head->rendering_mode_count; mi++) {
-				u_tiling_compute_mode(&head->rendering_modes[mi],
-				                      xsysc->info.display_pixel_width,
-				                      xsysc->info.display_pixel_height);
+			// Compute tiling for all modes (Leia SR path)
+			if (xsysc->info.display_pixel_width > 0 && xsysc->info.display_pixel_height > 0) {
+				for (uint32_t mi = 0; mi < head->rendering_mode_count; mi++) {
+					u_tiling_compute_mode(&head->rendering_modes[mi],
+					                      xsysc->info.display_pixel_width,
+					                      xsysc->info.display_pixel_height);
+				}
+				u_tiling_compute_system_atlas(head->rendering_modes,
+				                              head->rendering_mode_count,
+				                              &xsysc->info.atlas_width_pixels,
+				                              &xsysc->info.atlas_height_pixels);
 			}
-			u_tiling_compute_system_atlas(head->rendering_modes,
-			                              head->rendering_mode_count,
-			                              &xsysc->info.atlas_width_pixels,
-			                              &xsysc->info.atlas_height_pixels);
-		}
 
-		// Set Leia display processor factories for vendor-agnostic compositor use.
+			// Set Leia display processor factories for vendor-agnostic compositor use.
 #ifdef XRT_HAVE_LEIA_SR_VULKAN
-		xsysc->info.dp_factory_vk = (void *)leia_dp_factory_vk;
+			xsysc->info.dp_factory_vk = (void *)leia_dp_factory_vk;
 #endif
-		xsysc->info.dp_factory_d3d11 = (void *)leia_dp_factory_d3d11;
+			xsysc->info.dp_factory_d3d11 = (void *)leia_dp_factory_d3d11;
 #ifdef XRT_HAVE_LEIA_SR_D3D12
-		xsysc->info.dp_factory_d3d12 = (void *)leia_dp_factory_d3d12;
+			xsysc->info.dp_factory_d3d12 = (void *)leia_dp_factory_d3d12;
 #endif
 #ifdef XRT_HAVE_LEIA_SR_GL
-		xsysc->info.dp_factory_gl = (void *)leia_dp_factory_gl;
+			xsysc->info.dp_factory_gl = (void *)leia_dp_factory_gl;
 #endif
+		}
 #endif
 
 		// sim_display fallback: populate display info and factory if not already set by SR SDK

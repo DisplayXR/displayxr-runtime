@@ -63,7 +63,6 @@ export XR_RUNTIME_JSON="\$DIR/openxr_displayxr.json"
 export DYLD_LIBRARY_PATH="\$DIR/lib:\${DYLD_LIBRARY_PATH:-}"
 export VK_ICD_FILENAMES="\$DIR/MoltenVK_icd.json"
 export VK_DRIVER_FILES="\$DIR/MoltenVK_icd.json"
-export SIM_DISPLAY_ENABLE=1
 export SIM_DISPLAY_OUTPUT="\${SIM_DISPLAY_OUTPUT:-anaglyph}"
 exec "\$DIR/$BINARY_NAME"
 LAUNCHER
