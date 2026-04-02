@@ -6,7 +6,7 @@ allowed-tools: Read, Grep, Glob, Bash, Task, Edit, Write
 
 # CI-Monitor Skill
 
-This skill automates the complete build workflow for Monado fork with LeiaSR SDK: commit → push → monitor → diagnose/fix errors.
+This skill automates the complete build workflow for DisplayXR: commit → push → monitor → diagnose/fix errors.
 
 ## Architecture
 
@@ -70,12 +70,12 @@ Before launching the subagent, determine the related GitHub issue number:
 Pass this complete prompt to the subagent (replace `[USER_MESSAGE]` with the user's commit message or "auto-generate", `[FILES_TO_COMMIT]` with the file list or "AUTO", and `[ISSUE_REF]` with the issue number or "NONE"):
 
 ```
-Execute the LeiaSR-OpenXR ci-monitor workflow. You have access to Edit and Write tools to fix build errors.
+Execute the DisplayXR ci-monitor workflow. You have access to Edit and Write tools to fix build errors.
 
 ## Configuration
-- Repository: LeiaSR-OpenXR (Monado fork with Leia SDK)
-- Workflow: build-windows.yml
-- Artifact Name: SRMonado
+- Repository: DisplayXR (OpenXR runtime for 3D displays)
+- Workflows: build-windows.yml, build-macos.yml
+- Artifact Names: DisplayXR (Windows), DisplayXR-macOS (macOS)
 - Build: CMake + Ninja Multi-Config (Release)
 - Max Fix Attempts: 3
 
@@ -136,8 +136,6 @@ Run:
 ```bash
 git commit -m "$(cat <<'EOF'
 [YOUR COMMIT MESSAGE HERE (with issue ref if applicable)]
-
-Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
 EOF
 )"
 ```
@@ -351,7 +349,7 @@ Fix: [brief description of what was fixed]
 
 Auto-fix attempt fix_attempt/3
 
-Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>
+Co-Authored-By: Claude <noreply@anthropic.com>
 EOF
 )"
 ```
@@ -380,7 +378,7 @@ Build completed successfully!
 - Pushed to: [branch]
 - Build: SUCCEEDED (run #RUN_ID)
 - URL: [workflow URL]
-- Artifact: Available at Actions → SRMonado
+- Artifact: Available at Actions → DisplayXR
 ```
 
 If there were fix attempts, add:
@@ -426,7 +424,7 @@ When looking for fixes, check these locations:
 - src/xrt/compositor/main/*.c - Compositor code
 - src/xrt/compositor/multi/*.c - Multi-client compositor
 - src/xrt/state_trackers/oxr/*.c - OpenXR bindings
-- src/xrt/drivers/leiasr/*.cpp - Leia SR driver
+- src/xrt/drivers/leia/*.cpp - Leia SR driver
 
 **Build configuration:**
 - src/xrt/CMakeLists.txt - Main build file
@@ -446,12 +444,12 @@ The workflow (`build-windows.yml`) does:
 4. **Install Vulkan SDK** - Version 1.3.283.0
 5. **CMake Generate** - Configures with Ninja Multi-Config
 6. **Build** - `cmake --build build --config Release --target install`
-7. **Upload Artifact** - Uploads `_package/` as SRMonado artifact
+7. **Upload Artifact** - Uploads `_package/` as DisplayXR artifact
 8. **Slack Notification** - Posts success/failure to Slack
 
 ### Triggers
 - Push to `main` branch
-- Push to branches ending in `with-ci-build`
+- Push to branches ending in `-ci`
 - All pull requests
 - Tags starting with `v`
 

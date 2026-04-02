@@ -69,7 +69,7 @@ For display processor vtable design (all 5 API variants), see `docs/guides/vendo
 
 ## Project Overview
 
-This is a fork of **Monado**, an open source OpenXR runtime for VR/AR devices. This fork integrates **Leia SR SDK** for eye tracked 3D Display support. The project implements the OpenXR API standard from Khronos and runs on Windows, macOS, and Android.
+DisplayXR is a lightweight OpenXR runtime purpose-built for 3D displays (originally forked from **Monado**). It implements the OpenXR API standard from Khronos and runs on Windows, macOS, and Android. The runtime is vendor-agnostic — any 3D display vendor can integrate their driver. **Leia SR SDK** is the first vendor integration.
 
 ## Build Commands
 
@@ -128,7 +128,7 @@ git push displayxr main
 
 # For a tagged release:
 git tag v1.x.x
-git push origin v1.x.x          # triggers Leia CI for the tag
+git push origin v1.x.x          # triggers CI for the tag
 git push displayxr v1.x.x       # publishes tag to public repo
 git push displayxr main          # ensure main is up to date
 ```
