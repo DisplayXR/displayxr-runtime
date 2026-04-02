@@ -567,9 +567,10 @@ float3 linear_to_srgb(float3 linear_color)
 
 float4 PSMain(VS_OUTPUT input) : SV_Target
 {
-    // Solid color mode: convert_srgb == 2.0 outputs cyan (focus border)
+    // Solid color mode: convert_srgb >= 2.0 outputs src_rect.rgb as solid color
+    // (src_rect is unused for texture sampling in solid mode)
     if (convert_srgb > 1.5)
-        return float4(0.0, 1.0, 1.0, 1.0); // cyan
+        return float4(src_rect.xyz, 1.0);
 
     float4 color = src_tex.Sample(src_samp, input.uv);
     return color;
