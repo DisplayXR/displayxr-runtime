@@ -24,6 +24,8 @@
 #include "xrt/xrt_defines.h"
 #include "util/u_logging.h"
 
+#include <cjson/cJSON.h>
+
 #include <stdio.h>
 #include <string.h>
 #include <signal.h>
@@ -63,6 +65,160 @@ struct app_entry
 #endif
 	bool pose_applied;
 };
+
+#define MAX_SAVED_WINDOWS 16
+
+struct saved_window
+{
+	char app_name[128];
+	float x, y, z;
+	float width_m, height_m;
+};
+
+struct shell_config
+{
+	struct saved_window windows[MAX_SAVED_WINDOWS];
+	int window_count;
+};
+
+static void
+get_config_path(char *buf, size_t buf_size)
+{
+#ifdef _WIN32
+	const char *appdata = getenv("LOCALAPPDATA");
+	if (appdata) {
+		snprintf(buf, buf_size, "%s\\DisplayXR\\shell_layout.json", appdata);
+	} else {
+		snprintf(buf, buf_size, "shell_layout.json");
+	}
+#else
+	const char *home = getenv("HOME");
+	if (home) {
+		snprintf(buf, buf_size, "%s/.displayxr/shell_layout.json", home);
+	} else {
+		snprintf(buf, buf_size, "shell_layout.json");
+	}
+#endif
+}
+
+static void
+shell_config_load(struct shell_config *cfg)
+{
+	cfg->window_count = 0;
+
+	char path[512];
+	get_config_path(path, sizeof(path));
+
+	FILE *f = fopen(path, "rb");
+	if (!f) return;
+
+	fseek(f, 0, SEEK_END);
+	long len = ftell(f);
+	fseek(f, 0, SEEK_SET);
+	if (len <= 0 || len > 64 * 1024) { fclose(f); return; }
+
+	char *data = (char *)malloc(len + 1);
+	fread(data, 1, len, f);
+	data[len] = '\0';
+	fclose(f);
+
+	cJSON *root = cJSON_Parse(data);
+	free(data);
+	if (!root) return;
+
+	cJSON *windows = cJSON_GetObjectItemCaseSensitive(root, "windows");
+	if (cJSON_IsObject(windows)) {
+		cJSON *entry = NULL;
+		cJSON_ArrayForEach(entry, windows)
+		{
+			if (cfg->window_count >= MAX_SAVED_WINDOWS) break;
+			struct saved_window *sw = &cfg->windows[cfg->window_count];
+			snprintf(sw->app_name, sizeof(sw->app_name), "%s", entry->string);
+
+			cJSON *jx = cJSON_GetObjectItemCaseSensitive(entry, "x");
+			cJSON *jy = cJSON_GetObjectItemCaseSensitive(entry, "y");
+			cJSON *jz = cJSON_GetObjectItemCaseSensitive(entry, "z");
+			cJSON *jw = cJSON_GetObjectItemCaseSensitive(entry, "w");
+			cJSON *jh = cJSON_GetObjectItemCaseSensitive(entry, "h");
+			if (cJSON_IsNumber(jx)) sw->x = (float)jx->valuedouble;
+			if (cJSON_IsNumber(jy)) sw->y = (float)jy->valuedouble;
+			if (cJSON_IsNumber(jz)) sw->z = (float)jz->valuedouble;
+			if (cJSON_IsNumber(jw)) sw->width_m = (float)jw->valuedouble;
+			if (cJSON_IsNumber(jh)) sw->height_m = (float)jh->valuedouble;
+			cfg->window_count++;
+		}
+	}
+	cJSON_Delete(root);
+	P("Loaded %d saved window poses from %s\n", cfg->window_count, path);
+}
+
+static void
+shell_config_save(const struct shell_config *cfg)
+{
+	if (cfg->window_count == 0) return;
+
+	char path[512];
+	get_config_path(path, sizeof(path));
+
+	// Ensure directory exists
+#ifdef _WIN32
+	{
+		char dir[512];
+		snprintf(dir, sizeof(dir), "%s", path);
+		char *last = strrchr(dir, '\\');
+		if (last) { *last = '\0'; CreateDirectoryA(dir, NULL); }
+	}
+#endif
+
+	cJSON *root = cJSON_CreateObject();
+	cJSON_AddNumberToObject(root, "version", 1);
+	cJSON *windows = cJSON_AddObjectToObject(root, "windows");
+
+	for (int i = 0; i < cfg->window_count; i++) {
+		const struct saved_window *sw = &cfg->windows[i];
+		cJSON *entry = cJSON_AddObjectToObject(windows, sw->app_name);
+		cJSON_AddNumberToObject(entry, "x", sw->x);
+		cJSON_AddNumberToObject(entry, "y", sw->y);
+		cJSON_AddNumberToObject(entry, "z", sw->z);
+		cJSON_AddNumberToObject(entry, "w", sw->width_m);
+		cJSON_AddNumberToObject(entry, "h", sw->height_m);
+	}
+
+	char *json_str = cJSON_Print(root);
+	cJSON_Delete(root);
+
+	FILE *f = fopen(path, "wb");
+	if (f) {
+		fwrite(json_str, 1, strlen(json_str), f);
+		fclose(f);
+	}
+	free(json_str);
+}
+
+static struct saved_window *
+shell_config_find(struct shell_config *cfg, const char *app_name)
+{
+	for (int i = 0; i < cfg->window_count; i++) {
+		if (strcmp(cfg->windows[i].app_name, app_name) == 0) {
+			return &cfg->windows[i];
+		}
+	}
+	return NULL;
+}
+
+static void
+shell_config_update(struct shell_config *cfg, const char *app_name,
+                    float x, float y, float z, float w, float h)
+{
+	struct saved_window *sw = shell_config_find(cfg, app_name);
+	if (!sw) {
+		if (cfg->window_count >= MAX_SAVED_WINDOWS) return;
+		sw = &cfg->windows[cfg->window_count++];
+		snprintf(sw->app_name, sizeof(sw->app_name), "%s", app_name);
+	}
+	sw->x = x; sw->y = y; sw->z = z;
+	sw->width_m = w; sw->height_m = h;
+}
 
 #ifdef _WIN32
 /*!
@@ -427,6 +583,12 @@ main(int argc, char *argv[])
 		}
 	}
 
+	// Load saved window config
+	struct shell_config config;
+	shell_config_load(&config);
+
+	int save_counter = 0; // Save every 5 seconds (10 polls * 500ms)
+
 	// Poll loop
 	while (g_running) {
 		// Apply pending poses when new clients appear
@@ -442,7 +604,75 @@ main(int argc, char *argv[])
 			}
 		}
 
+		// Detect new clients and restore saved poses from config
+		{
+			struct ipc_client_list clients;
+			xrt_result_t r = ipc_call_system_get_clients(&ipc_c, &clients);
+			if (r == XRT_SUCCESS) {
+				for (uint32_t c = 0; c < clients.id_count; c++) {
+					bool is_new = true;
+					for (uint32_t p = 0; p < prev_count; p++) {
+						if (clients.ids[c] == prev_ids[p]) {
+							is_new = false;
+							break;
+						}
+					}
+					if (is_new && clients.ids[c] != 0) {
+						// Get app name
+						struct ipc_app_state ias;
+						xrt_result_t ir = ipc_call_system_get_client_info(&ipc_c, clients.ids[c], &ias);
+						if (ir == XRT_SUCCESS && ias.info.application_name[0] != '\0') {
+							struct saved_window *sw = shell_config_find(&config, ias.info.application_name);
+							if (sw && sw->width_m > 0 && sw->height_m > 0) {
+								struct xrt_pose pose = XRT_POSE_IDENTITY;
+								pose.position.x = sw->x;
+								pose.position.y = sw->y;
+								pose.position.z = sw->z;
+								ipc_call_shell_set_window_pose(&ipc_c, clients.ids[c],
+								                                &pose, sw->width_m, sw->height_m);
+								P("  Restored pose for '%s' from config\n", ias.info.application_name);
+							}
+						}
+					}
+				}
+			}
+		}
+
 		print_clients(&ipc_c, prev_ids, &prev_count);
+
+		// Periodic save: query current poses and update config
+		save_counter++;
+		if (save_counter >= 10) {
+			save_counter = 0;
+			bool changed = false;
+			struct ipc_client_list clients;
+			xrt_result_t r = ipc_call_system_get_clients(&ipc_c, &clients);
+			if (r == XRT_SUCCESS) {
+				for (uint32_t c = 0; c < clients.id_count; c++) {
+					struct ipc_app_state ias;
+					if (ipc_call_system_get_client_info(&ipc_c, clients.ids[c], &ias) != XRT_SUCCESS)
+						continue;
+					if (ias.info.application_name[0] == '\0') continue;
+
+					struct xrt_pose pose;
+					float w, h;
+					if (ipc_call_shell_get_window_pose(&ipc_c, clients.ids[c],
+					                                    &pose, &w, &h) == XRT_SUCCESS) {
+						struct saved_window *sw = shell_config_find(&config, ias.info.application_name);
+						if (!sw || sw->x != pose.position.x || sw->y != pose.position.y ||
+						    sw->width_m != w || sw->height_m != h) {
+							shell_config_update(&config, ias.info.application_name,
+							                    pose.position.x, pose.position.y, pose.position.z,
+							                    w, h);
+							changed = true;
+						}
+					}
+				}
+			}
+			if (changed) {
+				shell_config_save(&config);
+			}
+		}
 
 #ifdef _WIN32
 		Sleep(500);

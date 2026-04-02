@@ -359,6 +359,11 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 				// Shell-only keys (ESC, TAB, DELETE) → don't forward to app
 				return 0;
 			}
+			// Ctrl+1-4: layout presets (handled server-side) → don't forward
+			if ((GetAsyncKeyState(VK_CONTROL) & 0x8000) &&
+			    wParam >= '1' && wParam <= '4') {
+				return 0;
+			}
 			// Forward to app's HWND
 			PostMessage(fwd, message, wParam, lParam);
 			return 0;

@@ -1999,6 +1999,94 @@ ipc_handle_shell_set_window_pose(volatile struct ipc_client_state *_ics,
 }
 
 xrt_result_t
+ipc_handle_shell_set_visibility(volatile struct ipc_client_state *_ics,
+                                 uint32_t client_id,
+                                 bool visible)
+{
+	struct ipc_server *s = _ics->server;
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (s->xsysc == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	IPC_INFO(s, "Shell: set_visibility client_id=%u visible=%d", client_id, visible);
+
+	os_mutex_lock(&s->global_state.lock);
+
+	volatile struct ipc_client_state *target_ics = NULL;
+	for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
+		volatile struct ipc_client_state *ics = &s->threads[i].ics;
+		if (ics->client_state.id == client_id && ics->server_thread_index >= 0) {
+			target_ics = ics;
+			break;
+		}
+	}
+
+	if (target_ics == NULL || target_ics->xc == NULL) {
+		os_mutex_unlock(&s->global_state.lock);
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	bool ok = comp_d3d11_service_set_client_visibility(
+	    s->xsysc, (struct xrt_compositor *)target_ics->xc, visible);
+
+	os_mutex_unlock(&s->global_state.lock);
+	return ok ? XRT_SUCCESS : XRT_ERROR_IPC_FAILURE;
+#else
+	(void)s;
+	(void)client_id;
+	(void)visible;
+	return XRT_ERROR_IPC_FAILURE;
+#endif
+}
+
+xrt_result_t
+ipc_handle_shell_get_window_pose(volatile struct ipc_client_state *_ics,
+                                  uint32_t client_id,
+                                  struct xrt_pose *out_pose,
+                                  float *out_width_m,
+                                  float *out_height_m)
+{
+	struct ipc_server *s = _ics->server;
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (s->xsysc == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	os_mutex_lock(&s->global_state.lock);
+
+	volatile struct ipc_client_state *target_ics = NULL;
+	for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
+		volatile struct ipc_client_state *ics = &s->threads[i].ics;
+		if (ics->client_state.id == client_id && ics->server_thread_index >= 0) {
+			target_ics = ics;
+			break;
+		}
+	}
+
+	if (target_ics == NULL || target_ics->xc == NULL) {
+		os_mutex_unlock(&s->global_state.lock);
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	bool ok = comp_d3d11_service_get_client_window_pose(
+	    s->xsysc, (struct xrt_compositor *)target_ics->xc, out_pose, out_width_m, out_height_m);
+
+	os_mutex_unlock(&s->global_state.lock);
+	return ok ? XRT_SUCCESS : XRT_ERROR_IPC_FAILURE;
+#else
+	(void)s;
+	(void)client_id;
+	(void)out_pose;
+	(void)out_width_m;
+	(void)out_height_m;
+	return XRT_ERROR_IPC_FAILURE;
+#endif
+}
+
+xrt_result_t
 ipc_handle_swapchain_get_properties(volatile struct ipc_client_state *ics,
                                     const struct xrt_swapchain_create_info *info,
                                     struct xrt_swapchain_create_properties *xsccp)
