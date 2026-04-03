@@ -480,6 +480,11 @@ struct BlitConstants
 	// TL = top-left, BL = bottom-left, TR = top-right, BR = bottom-right.
 	float quad_corners_01[4]; // [TL.x, TL.y, BL.x, BL.y]
 	float quad_corners_23[4]; // [TR.x, TR.y, BR.x, BR.y]
+	// Per-corner W for perspective-correct UV interpolation.
+	// W = depth from eye to corner (eye_z - corner_z). Required because
+	// projecting a 3D quad to 2D produces a trapezoid — linear UV interpolation
+	// distorts straight lines without perspective correction.
+	float quad_w[4];          // [TL_w, BL_w, TR_w, BR_w]
 };
 
 //! Vertex shader for projection blit - draws a quad at specified destination
@@ -496,6 +501,7 @@ cbuffer BlitCB : register(b0)
     float2 padding2;
     float4 quad_corners_01; // TL.xy, BL.xy (packed as float4 to avoid HLSL array padding)
     float4 quad_corners_23; // TR.xy, BR.xy
+    float4 quad_w;          // per-corner W for perspective-correct interpolation: TL, BL, TR, BR
 };
 
 struct VS_OUTPUT
@@ -520,6 +526,7 @@ VS_OUTPUT VSMain(uint vertex_id : SV_VertexID)
     uint vid = vertex_id % 4;
 
     float2 dst_pos;
+    float w = 1.0;
     if (quad_mode > 0.5) {
         // Perspective quad mode: use pre-projected corner positions.
         // Unpack from two float4s: TL=01.xy, BL=01.zw, TR=23.xy, BR=23.zw
@@ -529,7 +536,9 @@ VS_OUTPUT VSMain(uint vertex_id : SV_VertexID)
             quad_corners_23.xy,  // TR (vertex 2)
             quad_corners_23.zw   // BR (vertex 3)
         };
+        float ws[4] = { quad_w.x, quad_w.y, quad_w.z, quad_w.w };
         dst_pos = corners[vid];
+        w = ws[vid];
     } else {
         // Axis-aligned mode (existing path)
         float2 quad_size = (dst_rect_wh.x > 0) ? dst_rect_wh : src_rect.zw;
@@ -540,7 +549,10 @@ VS_OUTPUT VSMain(uint vertex_id : SV_VertexID)
     float2 ndc = (dst_pos / dst_size) * 2.0 - 1.0;
     ndc.y = -ndc.y;  // Flip Y for D3D
 
-    output.position = float4(ndc, 0.0, 1.0);
+    // Set w for perspective-correct UV interpolation.
+    // w=1 for axis-aligned (affine), w=depth for perspective quads.
+    // D3D11 rasterizer automatically divides interpolated attributes by w.
+    output.position = float4(ndc * w, 0.0, w);
 
     // Calculate source UV — always from src_rect (independent of dest size)
     float2 src_pos = src_rect.xy + uv * src_rect.zw;
@@ -564,6 +576,7 @@ cbuffer BlitCB : register(b0)
     float2 padding2;
     float4 quad_corners_01;
     float4 quad_corners_23;
+    float4 quad_w;
 };
 
 Texture2D src_tex : register(t0);

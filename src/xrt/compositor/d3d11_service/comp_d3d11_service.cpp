@@ -2913,7 +2913,7 @@ compute_projected_quad_corners(const struct d3d11_service_system *sys,
                                uint32_t tile_col, uint32_t tile_row,
                                uint32_t half_w, uint32_t half_h,
                                uint32_t ca_w, uint32_t ca_h,
-                               float out_corners[8]);
+                               float out_corners[8], float out_w[4]);
 
 static void
 project_local_rect_for_eye(const struct d3d11_service_system *sys,
@@ -2925,9 +2925,9 @@ project_local_rect_for_eye(const struct d3d11_service_system *sys,
                            uint32_t tile_col, uint32_t tile_row,
                            uint32_t half_w, uint32_t half_h,
                            uint32_t ca_w, uint32_t ca_h,
-                           float out_corners[8]);
+                           float out_corners[8], float out_w[4]);
 
-static inline void blit_set_quad_corners(BlitConstants *cb, const float corners[8]);
+static inline void blit_set_quad_corners(BlitConstants *cb, const float corners[8], const float w[4]);
 
 /*!
  * Register a per-client compositor with the multi-compositor.
@@ -4464,11 +4464,12 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			int ei_for_quad = (src_col < 2) ? (int)src_col : 0;
 			int ei_q = (ei_for_quad < (int)eye_pos.count) ? ei_for_quad : 0;
 			float quad_corners[8] = {};
+			float quad_w_vals[4] = {1, 1, 1, 1};
 			bool use_quad = compute_projected_quad_corners(
 			    sys, &mc->clients[s],
 			    eye_pos.eyes[ei_q].x, eye_pos.eyes[ei_q].y, eye_pos.eyes[ei_q].z,
 			    src_col, src_row, half_w, half_h, ca_w, ca_h,
-			    quad_corners);
+			    quad_corners, quad_w_vals);
 
 			// Update constant buffer
 			D3D11_MAPPED_SUBRESOURCE mapped;
@@ -4493,7 +4494,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			cb->padding2[0] = 0.0f;
 			cb->padding2[1] = 0.0f;
 			if (use_quad) {
-				blit_set_quad_corners(cb, quad_corners);
+				blit_set_quad_corners(cb, quad_corners, quad_w_vals);
 			} else {
 				memset(cb->quad_corners_01, 0, sizeof(cb->quad_corners_01));
 				memset(cb->quad_corners_23, 0, sizeof(cb->quad_corners_23));
@@ -4588,11 +4589,11 @@ multi_compositor_render(struct d3d11_service_system *sys)
 					#define CHROME_BLIT_POS(cb_ptr, ll, lt, lr, lb, aa_x, aa_y, aa_w, aa_h) \
 						do { \
 							if (is_rotated) { \
-								float _corners[8]; \
+								float _corners[8], _w[4]; \
 								project_local_rect_for_eye(sys, win_orient, wcx, wcy, wcz, \
 								    (ll), (lt), (lr), (lb), cur_eye_x, cur_eye_y, cur_eye_z, \
-								    col2, row2, half_w, half_h, ca_w, ca_h, _corners); \
-								blit_set_quad_corners(cb_ptr, _corners); \
+								    col2, row2, half_w, half_h, ca_w, ca_h, _corners, _w); \
+								blit_set_quad_corners(cb_ptr, _corners, _w); \
 								(cb_ptr)->dst_offset[0] = 0; (cb_ptr)->dst_offset[1] = 0; \
 								(cb_ptr)->dst_rect_wh[0] = 0; (cb_ptr)->dst_rect_wh[1] = 0; \
 							} else { \
@@ -4877,7 +4878,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 				cb->padding2[0] = 0; cb->padding2[1] = 0;
 
 				if (fb_rotated) {
-					float corners[8];
+					float corners[8], corner_w[4];
 					project_local_rect_for_eye(sys,
 					    &mc->clients[fs].window_pose.orientation,
 					    mc->clients[fs].window_pose.position.x,
@@ -4886,8 +4887,8 @@ multi_compositor_render(struct d3d11_service_system *sys)
 					    border_edges_local[e].l, border_edges_local[e].t,
 					    border_edges_local[e].r, border_edges_local[e].b,
 					    eye_pos.eyes[ei_fb].x, eye_pos.eyes[ei_fb].y, eye_pos.eyes[ei_fb].z,
-					    col, row, half_w, half_h, ca_w, ca_h, corners);
-					blit_set_quad_corners(cb, corners);
+					    col, row, half_w, half_h, ca_w, ca_h, corners, corner_w);
+					blit_set_quad_corners(cb, corners, corner_w);
 					cb->dst_offset[0] = 0; cb->dst_offset[1] = 0;
 					cb->dst_rect_wh[0] = 0; cb->dst_rect_wh[1] = 0;
 				} else {
@@ -6865,7 +6866,8 @@ compute_projected_quad_corners(const struct d3d11_service_system *sys,
                                uint32_t tile_col, uint32_t tile_row,
                                uint32_t half_w, uint32_t half_h,
                                uint32_t ca_w, uint32_t ca_h,
-                               float out_corners[8])
+                               float out_corners[8],
+                               float out_w[4])
 {
 	if (quat_is_identity(&slot->window_pose.orientation)) {
 		return false; // Use axis-aligned fast path
@@ -6899,14 +6901,17 @@ compute_projected_quad_corners(const struct d3d11_service_system *sys,
 	float wz = slot->window_pose.position.z;
 
 	for (int i = 0; i < 4; i++) {
-		// Rotate corner by orientation, then translate to world position
 		struct xrt_vec3 world;
 		math_quat_rotate_vec3(q, &local[i], &world);
 		world.x += wx;
 		world.y += wy;
 		world.z += wz;
 
-		// Project through eye to display plane (Z=0)
+		// Depth from eye to corner (for perspective-correct interpolation)
+		float depth = eye_z - world.z;
+		if (depth < 0.01f) depth = 0.01f;
+		out_w[i] = depth;
+
 		float dpx, dpy;
 		project_point_for_eye(world.x, world.y, world.z,
 		                      eye_x, eye_y, eye_z,
@@ -6914,7 +6919,6 @@ compute_projected_quad_corners(const struct d3d11_service_system *sys,
 		                      px_per_m_x, px_per_m_y,
 		                      &dpx, &dpy);
 
-		// Convert to SBS tile pixel coordinates
 		float frac_x = dpx / (float)ca_w;
 		float frac_y = dpy / (float)ca_h;
 		out_corners[i * 2 + 0] = tile_col * half_w + frac_x * half_w;
@@ -6938,7 +6942,8 @@ project_local_rect_for_eye(const struct d3d11_service_system *sys,
                            uint32_t tile_col, uint32_t tile_row,
                            uint32_t half_w, uint32_t half_h,
                            uint32_t ca_w, uint32_t ca_h,
-                           float out_corners[8])
+                           float out_corners[8],
+                           float out_w[4])
 {
 	float disp_w_m = sys->base.info.display_width_m;
 	float disp_h_m = sys->base.info.display_height_m;
@@ -6966,6 +6971,11 @@ project_local_rect_for_eye(const struct d3d11_service_system *sys,
 		world.y += win_cy;
 		world.z += win_cz;
 
+		// Depth from eye to corner (for perspective-correct interpolation)
+		float depth = eye_z - world.z;
+		if (depth < 0.01f) depth = 0.01f;
+		if (out_w) out_w[i] = depth;
+
 		float dpx, dpy;
 		project_point_for_eye(world.x, world.y, world.z,
 		                      eye_x, eye_y, eye_z,
@@ -6984,7 +6994,7 @@ project_local_rect_for_eye(const struct d3d11_service_system *sys,
  * Helper: write quad corner data into a BlitConstants struct.
  */
 static inline void
-blit_set_quad_corners(BlitConstants *cb, const float corners[8])
+blit_set_quad_corners(BlitConstants *cb, const float corners[8], const float w[4])
 {
 	cb->quad_mode = 1.0f;
 	cb->quad_corners_01[0] = corners[0]; // TL.x
@@ -6995,6 +7005,14 @@ blit_set_quad_corners(BlitConstants *cb, const float corners[8])
 	cb->quad_corners_23[1] = corners[5]; // TR.y
 	cb->quad_corners_23[2] = corners[6]; // BR.x
 	cb->quad_corners_23[3] = corners[7]; // BR.y
+	if (w) {
+		cb->quad_w[0] = w[0]; // TL
+		cb->quad_w[1] = w[1]; // BL
+		cb->quad_w[2] = w[2]; // TR
+		cb->quad_w[3] = w[3]; // BR
+	} else {
+		cb->quad_w[0] = cb->quad_w[1] = cb->quad_w[2] = cb->quad_w[3] = 1.0f;
+	}
 }
 
 /*!
