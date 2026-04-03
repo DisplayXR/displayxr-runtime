@@ -224,9 +224,9 @@ VSOut main(uint id : SV_VertexID) {
 static const char* g_blitPSSource = R"(
 Texture2D    tex : register(t0);
 SamplerState smp : register(s0);
-cbuffer BlitParams : register(b0) { float2 uvScale; };
+cbuffer BlitParams : register(b0) { float2 uvScale; float2 uvOffset; };
 float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
-    return tex.Sample(smp, uv * uvScale);
+    return tex.Sample(smp, uv * uvScale + uvOffset);
 }
 )";
 
@@ -253,11 +253,11 @@ static bool CreateBlitPipeline(ID3D12Device* device) {
     params[0].DescriptorTable.NumDescriptorRanges = 1;
     params[0].DescriptorTable.pDescriptorRanges = &srvRange;
     params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-    // Param 1: root constants (float2 uvScale = 2 floats)
+    // Param 1: root constants (float2 uvScale + float2 uvOffset = 4 floats)
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     params[1].Constants.ShaderRegister = 0;
     params[1].Constants.RegisterSpace = 0;
-    params[1].Constants.Num32BitValues = 2;
+    params[1].Constants.Num32BitValues = 4;
     params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
     D3D12_ROOT_SIGNATURE_DESC rsDesc = {};
@@ -395,12 +395,15 @@ static void BlitSharedTextureToBackBuffer(D3D12Renderer& renderer, XrSessionMana
     g_blitCmdList->SetDescriptorHeaps(1, heaps);
     g_blitCmdList->SetGraphicsRootDescriptorTable(0, g_blitSrvHeap->GetGPUDescriptorHandleForHeapStart());
 
-    // UV scale: only sample the canvas portion of the shared texture
-    float uvScale[2] = {
-        g_sharedWidth > 0 ? (float)g_canvasW / (float)g_sharedWidth : 1.0f,
-        g_sharedHeight > 0 ? (float)g_canvasH / (float)g_sharedHeight : 1.0f,
+    // UV scale+offset: sample the canvas region within the display-sized shared texture.
+    // The weaver renders at (canvas_x, canvas_y) within the shared texture.
+    float blitParams[4] = {
+        g_sharedWidth > 0 ? (float)g_canvasW / (float)g_sharedWidth : 1.0f,      // uvScale.x
+        g_sharedHeight > 0 ? (float)g_canvasH / (float)g_sharedHeight : 1.0f,    // uvScale.y
+        g_sharedWidth > 0 ? vp.TopLeftX / (float)g_sharedWidth : 0.0f,           // uvOffset.x
+        g_sharedHeight > 0 ? vp.TopLeftY / (float)g_sharedHeight : 0.0f,         // uvOffset.y
     };
-    g_blitCmdList->SetGraphicsRoot32BitConstants(1, 2, uvScale, 0);
+    g_blitCmdList->SetGraphicsRoot32BitConstants(1, 4, blitParams, 0);
 
     g_blitCmdList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     g_blitCmdList->DrawInstanced(3, 1, 0, 0);

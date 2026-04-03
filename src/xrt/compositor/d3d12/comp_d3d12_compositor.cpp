@@ -1183,17 +1183,12 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			uint32_t content_h = tile_rows * view_height;
 			ID3D12Resource *dp_resource = d3d12_crop_atlas_for_dp(c, atlas_resource, content_w, content_h);
 
-			// For shared texture mode, pass canvas dimensions as the DP target.
-			// The shared texture is an intermediate buffer — content must be at (0,0)
-			// so the app's blit shader can sample it. Viewport offset for phase
-			// correction only works on HWND-sized backbuffers (normal path).
+			// Pass actual shared texture dimensions to the DP. The DP uses
+			// canvas offset/size to set a viewport sub-rect within the shared
+			// texture for correct interlacing phase alignment.
 			D3D12_RESOURCE_DESC st_desc = c->shared_texture->GetDesc();
 			uint32_t dp_target_w = static_cast<uint32_t>(st_desc.Width);
 			uint32_t dp_target_h = static_cast<uint32_t>(st_desc.Height);
-			if (c->canvas.valid && c->canvas.w > 0 && c->canvas.h > 0) {
-				dp_target_w = c->canvas.w;
-				dp_target_h = c->canvas.h;
-			}
 
 			static uint32_t pa_log = 0;
 			if (pa_log < 5) {

@@ -1163,16 +1163,11 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			D3D11_TEXTURE2D_DESC st_desc;
 			c->shared_texture->GetDesc(&st_desc);
 
-			// For shared texture mode, pass canvas dimensions as the DP target.
-			// The shared texture is an intermediate buffer — content must be at (0,0)
-			// so the app's blit shader can sample it. Viewport offset for phase
-			// correction only works on HWND-sized backbuffers (normal path).
+			// Pass actual shared texture dimensions to the DP. The DP uses
+			// canvas offset/size to set a viewport sub-rect within the shared
+			// texture for correct interlacing phase alignment.
 			uint32_t dp_target_w = st_desc.Width;
 			uint32_t dp_target_h = st_desc.Height;
-			if (c->canvas.valid && c->canvas.w > 0 && c->canvas.h > 0) {
-				dp_target_w = c->canvas.w;
-				dp_target_h = c->canvas.h;
-			}
 
 			// Bind shared texture as render target for the weaver
 			c->context->OMSetRenderTargets(1, &c->shared_rtv, nullptr);
