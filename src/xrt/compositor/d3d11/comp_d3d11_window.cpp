@@ -131,6 +131,10 @@ struct comp_d3d11_window
 	volatile LONG input_forward_rect_w;
 	volatile LONG input_forward_rect_h;
 
+	//! Desired cursor ID (compositor thread writes, window thread reads in WM_SETCURSOR).
+	//! 0=arrow, 1=sizewe, 2=sizens, 3=sizenwse, 4=sizenesw, 5=sizeall
+	volatile LONG desired_cursor;
+
 	//! Accumulated scroll wheel delta for shell window resize (positive = enlarge).
 	//! Written by WndProc, read+reset by render loop.
 	volatile LONG scroll_accum;
@@ -282,6 +286,25 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	}
 
 	switch (message) {
+	case WM_SETCURSOR:
+		// The compositor thread sets desired_cursor via InterlockedExchange.
+		// We read it here on the window thread and apply the correct cursor.
+		if (LOWORD(lParam) == HTCLIENT) {
+			LONG cid = InterlockedCompareExchange(&w->desired_cursor, 0, 0);
+			HCURSOR cur;
+			switch (cid) {
+			case 1:  cur = LoadCursor(NULL, IDC_SIZEWE); break;
+			case 2:  cur = LoadCursor(NULL, IDC_SIZENS); break;
+			case 3:  cur = LoadCursor(NULL, IDC_SIZENWSE); break;
+			case 4:  cur = LoadCursor(NULL, IDC_SIZENESW); break;
+			case 5:  cur = LoadCursor(NULL, IDC_SIZEALL); break;
+			default: cur = LoadCursor(NULL, IDC_ARROW); break;
+			}
+			SetCursor(cur);
+			return TRUE;
+		}
+		return DefWindowProcW(hWnd, message, wParam, lParam);
+
 	case WM_ENTERSIZEMOVE:
 		InterlockedExchange(&w->in_size_move, TRUE);
 		InvalidateRect(hWnd, NULL, FALSE); // Kick off first WM_PAINT
@@ -395,12 +418,8 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	case WM_MOUSEWHEEL: {
 		HWND fwd = (HWND)InterlockedCompareExchangePointer((volatile PVOID *)&w->input_forward_hwnd, NULL, NULL);
 		if (fwd != NULL) {
-			// Shell mode: right-click and scroll are reserved for window management
-			// (right-click-drag = move window, scroll = resize window).
-			// These are handled in the multi-comp render loop, not forwarded to apps.
-			if (message == WM_RBUTTONDOWN || message == WM_RBUTTONUP) {
-				return 0;
-			}
+			// Shell mode: scroll is reserved for window resize.
+			// Right-click is forwarded to the app (focus change handled in render loop).
 			if (message == WM_MOUSEWHEEL) {
 				// Accumulate scroll delta for the render loop to process
 				short delta = GET_WHEEL_DELTA_WPARAM(wParam);
@@ -484,6 +503,7 @@ window_thread_func(LPVOID param)
 	wcex.cbClsExtra = 0;
 	wcex.cbWndExtra = 0;
 	wcex.hInstance = w->instance;
+	wcex.hCursor = LoadCursor(NULL, IDC_ARROW);
 	wcex.lpszClassName = szWindowClass;
 	wcex.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
 
@@ -842,6 +862,13 @@ comp_d3d11_window_consume_scroll(struct comp_d3d11_window *window)
 		return 0;
 	}
 	return (int32_t)InterlockedExchange(&window->scroll_accum, 0);
+}
+
+extern "C" void
+comp_d3d11_window_set_cursor(struct comp_d3d11_window *window, int cursor_id)
+{
+	if (window == NULL) return;
+	InterlockedExchange(&window->desired_cursor, (LONG)cursor_id);
 }
 
 extern "C" void

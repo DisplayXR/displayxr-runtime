@@ -203,6 +203,13 @@ int32_t
 comp_d3d11_window_consume_scroll(struct comp_d3d11_window *window);
 
 /*!
+ * Set the desired cursor shape (called from compositor thread, applied on window thread).
+ * IDs: 0=arrow, 1=sizewe, 2=sizens, 3=sizenwse, 4=sizenesw, 5=sizeall
+ */
+void
+comp_d3d11_window_set_cursor(struct comp_d3d11_window *window, int cursor_id);
+
+/*!
  * Set the shell display processor for ESC/close handling.
  *
  * When the shell window is closed (ESC or WM_CLOSE), this DP is switched
