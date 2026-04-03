@@ -62,16 +62,20 @@ Real lightfield display hardware with eye tracking.
 
 | Platform | SDK | Graphics | Eye Tracking |
 |----------|-----|----------|--------------|
-| Windows  | SR SDK | Vulkan + D3D11 weaving | LookaroundFilter |
+| Windows  | SR SDK | DX11 + DX12 + GL + Vulkan weaving | LookaroundFilter |
 | Android  | CNSDK  | Vulkan interlacing     | Not yet |
 
-**Files (13):**
+**Files:**
 - `leia_device.c` — `xrt_device` implementation (display specs, FOV, refresh rate)
 - `leia_sr.cpp/.h` — Vulkan SR SDK weaver wrapper
 - `leia_sr_d3d11.cpp/.h` — D3D11 SR SDK weaver wrapper
+- `leia_sr_d3d12.cpp/.h` — D3D12 SR SDK weaver wrapper
+- `leia_sr_gl.cpp/.h` — OpenGL SR SDK weaver wrapper
 - `leia_cnsdk.cpp/.h` — Android CNSDK integration
 - `leia_display_processor.cpp/.h` — Vulkan `xrt_display_processor` wrapping SR weaver
 - `leia_display_processor_d3d11.cpp/.h` — D3D11 `xrt_display_processor_d3d11` wrapping SR weaver
+- `leia_display_processor_d3d12.cpp/.h` — D3D12 `xrt_display_processor_d3d12` wrapping SR weaver
+- `leia_display_processor_gl.cpp/.h` — OpenGL `xrt_display_processor_gl` wrapping SR weaver
 - `leia_types.h`, `leia_interface.h`
 
 **Builder:** `target_builder_leia.c` (priority -15)

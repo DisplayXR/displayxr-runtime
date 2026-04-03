@@ -115,14 +115,22 @@ leia_dp_d3d12_process_atlas(struct xrt_display_processor_d3d12 *xdp,
                              uint32_t canvas_width,
                              uint32_t canvas_height)
 {
-	// TODO(#85): Pass canvas_offset_x/y to vendor weaver for interlacing
-	// phase correction once Leia SR SDK supports sub-rect offset.
-	(void)canvas_offset_x;
-	(void)canvas_offset_y;
-	(void)canvas_width;
-	(void)canvas_height;
-
 	struct leia_display_processor_d3d12_impl *ldp = leia_dp_d3d12(xdp);
+
+	// Compute effective viewport: canvas sub-rect when set, else full target.
+	// The SR SDK weaver uses viewport offset in its phase calculation:
+	//   xOffset = window_WeavingX + vpX
+	//   yOffset = window_WeavingY + vpY
+	int32_t vp_x = 0;
+	int32_t vp_y = 0;
+	uint32_t vp_w = target_width;
+	uint32_t vp_h = target_height;
+	if (canvas_width > 0 && canvas_height > 0) {
+		vp_x = canvas_offset_x;
+		vp_y = canvas_offset_y;
+		vp_w = canvas_width;
+		vp_h = canvas_height;
+	}
 
 	// 2D mode: passthrough stretch-blit (first tile fills target)
 	if (ldp->view_count == 1) {
@@ -155,16 +163,20 @@ leia_dp_d3d12_process_atlas(struct xrt_display_processor_d3d12 *xdp,
 		rtv_handle.ptr = static_cast<SIZE_T>(target_rtv_cpu_handle);
 		cmd->OMSetRenderTargets(1, &rtv_handle, FALSE, nullptr);
 
-		// Set viewport and scissor
+		// Set viewport and scissor to canvas sub-rect (or full target)
 		D3D12_VIEWPORT viewport = {};
-		viewport.Width = static_cast<float>(target_width);
-		viewport.Height = static_cast<float>(target_height);
+		viewport.TopLeftX = static_cast<float>(vp_x);
+		viewport.TopLeftY = static_cast<float>(vp_y);
+		viewport.Width = static_cast<float>(vp_w);
+		viewport.Height = static_cast<float>(vp_h);
 		viewport.MaxDepth = 1.0f;
 		cmd->RSSetViewports(1, &viewport);
 
 		D3D12_RECT scissor = {};
-		scissor.right = static_cast<LONG>(target_width);
-		scissor.bottom = static_cast<LONG>(target_height);
+		scissor.left = static_cast<LONG>(vp_x);
+		scissor.top = static_cast<LONG>(vp_y);
+		scissor.right = static_cast<LONG>(vp_x) + static_cast<LONG>(vp_w);
+		scissor.bottom = static_cast<LONG>(vp_y) + static_cast<LONG>(vp_h);
 		cmd->RSSetScissorRects(1, &scissor);
 
 		// Set SRV descriptor table
@@ -203,7 +215,7 @@ leia_dp_d3d12_process_atlas(struct xrt_display_processor_d3d12 *xdp,
 		                               view_width, view_height, format);
 	}
 
-	leiasr_d3d12_weave(ldp->leiasr, d3d12_command_list, target_width, target_height);
+	leiasr_d3d12_weave(ldp->leiasr, d3d12_command_list, vp_x, vp_y, vp_w, vp_h);
 }
 
 static void

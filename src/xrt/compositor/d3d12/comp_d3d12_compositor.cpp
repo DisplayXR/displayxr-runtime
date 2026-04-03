@@ -1183,36 +1183,23 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			uint32_t content_h = tile_rows * view_height;
 			ID3D12Resource *dp_resource = d3d12_crop_atlas_for_dp(c, atlas_resource, content_w, content_h);
 
-			// DP target: use canvas dims for texture apps
+			// Pass actual shared texture dimensions to the DP.
+			// Canvas offset and size are passed separately — the DP uses
+			// them to set a viewport sub-rect for correct interlacing phase.
 			D3D12_RESOURCE_DESC st_desc = c->shared_texture->GetDesc();
 			uint32_t dp_target_w = static_cast<uint32_t>(st_desc.Width);
 			uint32_t dp_target_h = static_cast<uint32_t>(st_desc.Height);
-			if (c->canvas.valid && c->canvas.w > 0 && c->canvas.h > 0) {
-				dp_target_w = c->canvas.w;
-				dp_target_h = c->canvas.h;
-			}
-
-			D3D12_VIEWPORT viewport = {};
-			viewport.Width = static_cast<float>(dp_target_w);
-			viewport.Height = static_cast<float>(dp_target_h);
-			viewport.MaxDepth = 1.0f;
-			c->cmd_list->RSSetViewports(1, &viewport);
-
-			D3D12_RECT scissor = {0, 0, static_cast<LONG>(dp_target_w), static_cast<LONG>(dp_target_h)};
-			c->cmd_list->RSSetScissorRects(1, &scissor);
 
 			static uint32_t pa_log = 0;
 			if (pa_log < 5) {
-				D3D12_RESOURCE_DESC st_desc2 = c->shared_texture->GetDesc();
 				U_LOG_W("process_atlas: view=%ux%u tiles=%ux%u dp_target=%ux%u "
-				        "canvas=(%d,%d %ux%u) shared_tex=%llux%u",
+				        "canvas=(%d,%d %ux%u)",
 				        view_width, view_height, tile_columns, tile_rows,
 				        dp_target_w, dp_target_h,
 				        c->canvas.valid ? c->canvas.x : -1,
 				        c->canvas.valid ? c->canvas.y : -1,
 				        c->canvas.valid ? c->canvas.w : 0,
-				        c->canvas.valid ? c->canvas.h : 0,
-				        (unsigned long long)st_desc2.Width, st_desc2.Height);
+				        c->canvas.valid ? c->canvas.h : 0);
 				pa_log++;
 			}
 
@@ -1393,14 +1380,9 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			scissor.bottom = static_cast<LONG>(tgt_height);
 			c->cmd_list->RSSetScissorRects(1, &scissor);
 
-			// DP target: use canvas dims for texture apps
-			uint32_t dp_target_w = tgt_width;
-			uint32_t dp_target_h = tgt_height;
-			if (c->canvas.valid && c->canvas.w > 0 && c->canvas.h > 0) {
-				dp_target_w = c->canvas.w;
-				dp_target_h = c->canvas.h;
-			}
-
+			// Pass actual backbuffer dimensions to the DP.
+			// Canvas offset and size are passed separately — the DP uses
+			// them to set a viewport sub-rect for correct interlacing phase.
 			xrt_display_processor_d3d12_process_atlas(
 			    c->display_processor,
 			    c->cmd_list,
@@ -1411,7 +1393,7 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			    view_width, view_height,
 			    tile_columns, tile_rows,
 			    static_cast<uint32_t>(DXGI_FORMAT_R8G8B8A8_UNORM),
-			    dp_target_w, dp_target_h,
+			    tgt_width, tgt_height,
 			    c->canvas.valid ? c->canvas.x : 0,
 			    c->canvas.valid ? c->canvas.y : 0,
 			    c->canvas.valid ? c->canvas.w : 0,

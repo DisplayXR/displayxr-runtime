@@ -112,15 +112,24 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
                              uint32_t canvas_width,
                              uint32_t canvas_height)
 {
-	// TODO(#85): Pass canvas_offset_x/y to vendor weaver for interlacing
-	// phase correction once Leia SR SDK supports sub-rect offset.
-	(void)canvas_offset_x;
-	(void)canvas_offset_y;
-	(void)canvas_width;
-	(void)canvas_height;
-
 	struct leia_display_processor_d3d11_impl *ldp = leia_dp_d3d11(xdp);
 	ID3D11DeviceContext *ctx = static_cast<ID3D11DeviceContext *>(d3d11_context);
+
+	// Compute effective viewport: canvas sub-rect when set, else full target.
+	// The SR SDK weaver reads the D3D11 viewport via RSGetViewports() and
+	// incorporates vpX/vpY into the phase calculation automatically:
+	//   xOffset = window_WeavingX + vpX
+	//   yOffset = window_WeavingY + vpY
+	int32_t vp_x = 0;
+	int32_t vp_y = 0;
+	uint32_t vp_w = target_width;
+	uint32_t vp_h = target_height;
+	if (canvas_width > 0 && canvas_height > 0) {
+		vp_x = canvas_offset_x;
+		vp_y = canvas_offset_y;
+		vp_w = canvas_width;
+		vp_h = canvas_height;
+	}
 
 	// 2D mode: passthrough stretch-blit (first tile fills target)
 	if (ldp->view_count == 1) {
@@ -131,11 +140,11 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 		ID3D11ShaderResourceView *srv = static_cast<ID3D11ShaderResourceView *>(atlas_srv);
 
 		// Atlas is guaranteed content-sized by compositor crop-blit.
-		// In 2D mode, content occupies min(target, atlas) of the atlas.
+		// In 2D mode, content occupies min(viewport, atlas) of the atlas.
 		uint32_t atlas_w = tile_columns * view_width;
 		uint32_t atlas_h = tile_rows * view_height;
-		uint32_t content_w = (target_width < atlas_w) ? target_width : atlas_w;
-		uint32_t content_h = (target_height < atlas_h) ? target_height : atlas_h;
+		uint32_t content_w = (vp_w < atlas_w) ? vp_w : atlas_w;
+		uint32_t content_h = (vp_h < atlas_h) ? vp_h : atlas_h;
 		struct { float u_scale; float v_scale; float pad0; float pad1; } cb_data;
 		cb_data.u_scale = (atlas_w > 0) ? (float)content_w / (float)atlas_w : 1.0f;
 		cb_data.v_scale = (atlas_h > 0) ? (float)content_h / (float)atlas_h : 1.0f;
@@ -143,10 +152,12 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 		cb_data.pad1 = 0.0f;
 		ctx->UpdateSubresource(ldp->blit_cb, 0, NULL, &cb_data, 0, 0);
 
-		// Set viewport
+		// Set viewport to canvas sub-rect (or full target if no canvas)
 		D3D11_VIEWPORT viewport = {};
-		viewport.Width = static_cast<float>(target_width);
-		viewport.Height = static_cast<float>(target_height);
+		viewport.TopLeftX = static_cast<float>(vp_x);
+		viewport.TopLeftY = static_cast<float>(vp_y);
+		viewport.Width = static_cast<float>(vp_w);
+		viewport.Height = static_cast<float>(vp_h);
 		viewport.MaxDepth = 1.0f;
 		ctx->RSSetViewports(1, &viewport);
 
@@ -172,11 +183,13 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 	// by compositor crop-blit. Pass directly to weaver.
 	leiasr_d3d11_set_input_texture(ldp->leiasr, atlas_srv, view_width, view_height, format);
 
+	// Set viewport to canvas sub-rect — the SR SDK weaver reads this
+	// and uses vpX/vpY for correct interlacing phase alignment.
 	D3D11_VIEWPORT viewport = {};
-	viewport.TopLeftX = 0.0f;
-	viewport.TopLeftY = 0.0f;
-	viewport.Width = static_cast<float>(target_width);
-	viewport.Height = static_cast<float>(target_height);
+	viewport.TopLeftX = static_cast<float>(vp_x);
+	viewport.TopLeftY = static_cast<float>(vp_y);
+	viewport.Width = static_cast<float>(vp_w);
+	viewport.Height = static_cast<float>(vp_h);
 	viewport.MinDepth = 0.0f;
 	viewport.MaxDepth = 1.0f;
 	ctx->RSSetViewports(1, &viewport);

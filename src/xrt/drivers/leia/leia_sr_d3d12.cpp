@@ -303,8 +303,10 @@ leiasr_d3d12_set_input_texture(struct leiasr_d3d12 *leiasr,
 void
 leiasr_d3d12_weave(struct leiasr_d3d12 *leiasr,
                    void *command_list,
-                   uint32_t target_width,
-                   uint32_t target_height)
+                   int32_t viewport_x,
+                   int32_t viewport_y,
+                   uint32_t viewport_width,
+                   uint32_t viewport_height)
 {
 	if (leiasr == nullptr || leiasr->weaver == nullptr) {
 		U_LOG_W("leiasr_d3d12_weave called with null instance or weaver");
@@ -318,8 +320,8 @@ leiasr_d3d12_weave(struct leiasr_d3d12 *leiasr,
 	bool weave_log = (weave_counter % 60 == 0);
 	weave_counter++;
 	if (weave_log) {
-		U_LOG_I("SR D3D12 weave: cmd_list=%p, target=%ux%u, input=%p (%ux%u fmt=%u)",
-		        (void *)cmd_list, target_width, target_height,
+		U_LOG_I("SR D3D12 weave: cmd_list=%p, viewport=(%d,%d %ux%u), input=%p (%ux%u fmt=%u)",
+		        (void *)cmd_list, viewport_x, viewport_y, viewport_width, viewport_height,
 		        (void *)leiasr->input_resource,
 		        leiasr->view_width, leiasr->view_height,
 		        (unsigned)leiasr->input_format);
@@ -328,22 +330,23 @@ leiasr_d3d12_weave(struct leiasr_d3d12 *leiasr,
 	// Set command list for the weaver to record commands onto
 	leiasr->weaver->setCommandList(cmd_list);
 
-	// Set viewport
+	// Set viewport — the SR SDK uses TopLeftX/Y in its phase calculation:
+	//   xOffset = window_WeavingX + vpX
 	D3D12_VIEWPORT viewport = {};
-	viewport.TopLeftX = 0.0f;
-	viewport.TopLeftY = 0.0f;
-	viewport.Width = static_cast<float>(target_width);
-	viewport.Height = static_cast<float>(target_height);
+	viewport.TopLeftX = static_cast<float>(viewport_x);
+	viewport.TopLeftY = static_cast<float>(viewport_y);
+	viewport.Width = static_cast<float>(viewport_width);
+	viewport.Height = static_cast<float>(viewport_height);
 	viewport.MinDepth = 0.0f;
 	viewport.MaxDepth = 1.0f;
 	leiasr->weaver->setViewport(viewport);
 
-	// Set scissor rect
+	// Set scissor rect to match viewport sub-rect
 	D3D12_RECT scissor = {};
-	scissor.left = 0;
-	scissor.top = 0;
-	scissor.right = static_cast<LONG>(target_width);
-	scissor.bottom = static_cast<LONG>(target_height);
+	scissor.left = static_cast<LONG>(viewport_x);
+	scissor.top = static_cast<LONG>(viewport_y);
+	scissor.right = static_cast<LONG>(viewport_x) + static_cast<LONG>(viewport_width);
+	scissor.bottom = static_cast<LONG>(viewport_y) + static_cast<LONG>(viewport_height);
 	leiasr->weaver->setScissorRect(scissor);
 
 	// Perform weaving — records draw commands onto the command list.

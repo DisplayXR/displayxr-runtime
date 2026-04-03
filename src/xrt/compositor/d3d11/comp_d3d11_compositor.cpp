@@ -1163,22 +1163,11 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			D3D11_TEXTURE2D_DESC st_desc;
 			c->shared_texture->GetDesc(&st_desc);
 
-			// Use canvas dimensions as DP target when available.
-			// The shared texture is display-sized (worst case), but the DP
-			// should weave at canvas resolution — the actual displayed area.
+			// Pass actual shared texture dimensions to the DP.
+			// Canvas offset and size are passed separately — the DP uses
+			// them to set a viewport sub-rect for correct interlacing phase.
 			uint32_t dp_target_w = st_desc.Width;
 			uint32_t dp_target_h = st_desc.Height;
-			if (c->canvas.valid && c->canvas.w > 0 && c->canvas.h > 0) {
-				dp_target_w = c->canvas.w;
-				dp_target_h = c->canvas.h;
-			}
-
-			// Set viewport to canvas region within the shared texture
-			D3D11_VIEWPORT dp_vp = {};
-			dp_vp.Width = (FLOAT)dp_target_w;
-			dp_vp.Height = (FLOAT)dp_target_h;
-			dp_vp.MaxDepth = 1.0f;
-			c->context->RSSetViewports(1, &dp_vp);
 
 			// Bind shared texture as render target for the weaver
 			c->context->OMSetRenderTargets(1, &c->shared_rtv, nullptr);

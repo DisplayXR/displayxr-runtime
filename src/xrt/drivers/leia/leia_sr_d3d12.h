@@ -94,20 +94,28 @@ leiasr_d3d12_set_output_format(struct leiasr_d3d12 *leiasr, uint32_t format);
 /*!
  * Perform weaving from the atlas texture to the render target.
  *
- * Records draw commands onto the provided command list.
+ * Records draw commands onto the provided command list. The viewport
+ * parameters define a sub-rect within the render target where weaving
+ * occurs. The SR SDK weaver uses viewport_x/y in its phase calculation:
+ *   xOffset = window_WeavingX + viewport_x
+ *   yOffset = window_WeavingY + viewport_y
  *
  * @param leiasr The D3D12 weaver instance.
  * @param command_list The command list (ID3D12GraphicsCommandList*).
- * @param target_width Width of the output render target.
- * @param target_height Height of the output render target.
+ * @param viewport_x Left edge of the viewport sub-rect within the render target.
+ * @param viewport_y Top edge of the viewport sub-rect within the render target.
+ * @param viewport_width Width of the viewport sub-rect.
+ * @param viewport_height Height of the viewport sub-rect.
  *
  * @ingroup drv_leia
  */
 void
 leiasr_d3d12_weave(struct leiasr_d3d12 *leiasr,
                    void *command_list,
-                   uint32_t target_width,
-                   uint32_t target_height);
+                   int32_t viewport_x,
+                   int32_t viewport_y,
+                   uint32_t viewport_width,
+                   uint32_t viewport_height);
 
 /*!
  * Get predicted eye positions from the weaver's LookaroundFilter.

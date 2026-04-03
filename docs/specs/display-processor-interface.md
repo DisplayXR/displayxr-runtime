@@ -103,19 +103,14 @@ All APIs should use **`process_views`**, not `process_stereo`:
 
 ## Implementations to Update
 
-| Vendor | Vulkan | D3D11 | D3D12 | Metal |
-|---|---|---|---|---|
-| **Leia SR** | `leia_display_processor.cpp` | `leia_display_processor_d3d11.cpp` | `leia_display_processor_d3d12.cpp` | -- |
-| **sim_display** | `sim_display_processor.c` (needs SBS input) | `sim_display_processor_d3d11.cpp` | `sim_display_processor_d3d12.cpp` | `sim_display_processor_metal.m` |
-
-## Missing: GL Display Processors
-
-No `xrt_display_processor_gl` interface or implementations exist yet. Needed for #39 and #40 (GL native compositors). Should use `process_views` from day one.
+| Vendor | Vulkan | D3D11 | D3D12 | Metal | GL |
+|---|---|---|---|---|---|
+| **Leia SR** | `leia_display_processor.cpp` | `leia_display_processor_d3d11.cpp` | `leia_display_processor_d3d12.cpp` | -- | `leia_display_processor_gl.cpp` |
+| **sim_display** | `sim_display_processor.c` (needs SBS input) | `sim_display_processor_d3d11.cpp` | `sim_display_processor_d3d12.cpp` | `sim_display_processor_metal.m` | -- |
 
 ## Related
 
 - #5 -- Multiview support (N views tiled into single texture)
-- #39, #40 -- GL native compositors (need `xrt_display_processor_gl`)
 - #43 -- Multi compositor (needs to hold display processors of any API type)
 
 ## Acceptance Criteria

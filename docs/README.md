@@ -93,6 +93,7 @@ These documents describe **planned features that are not yet implemented**.
 - [Qwerty Device](reference/qwerty-device.md) — keyboard/mouse simulated controller
 - [Window Drag Rendering](reference/window-drag-rendering.md) — rendering during window drag
 - [Debug Logging](reference/debug-logging.md) — log level conventions
+- [Leia SR Weaver](reference/LeiaWeaver.md) — DX11, DX12, OpenGL & Vulkan weaver internals
 
 ## Archive
 
