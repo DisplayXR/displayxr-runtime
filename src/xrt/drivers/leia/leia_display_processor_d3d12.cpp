@@ -121,17 +121,11 @@ leia_dp_d3d12_process_atlas(struct xrt_display_processor_d3d12 *xdp,
 	// The SR SDK weaver uses viewport offset in its phase calculation:
 	//   xOffset = window_WeavingX + vpX
 	//   yOffset = window_WeavingY + vpY
-	//
-	// Viewport offset is only applied when the render target is larger than
-	// the canvas (HWND-sized backbuffer). For shared texture mode, the
-	// compositor passes canvas dims as target — content must stay at (0,0)
-	// so the app's blit shader can sample it correctly.
 	int32_t vp_x = 0;
 	int32_t vp_y = 0;
 	uint32_t vp_w = target_width;
 	uint32_t vp_h = target_height;
-	if (canvas_width > 0 && canvas_height > 0 &&
-	    (target_width > canvas_width || target_height > canvas_height)) {
+	if (canvas_width > 0 && canvas_height > 0) {
 		vp_x = canvas_offset_x;
 		vp_y = canvas_offset_y;
 		vp_w = canvas_width;
