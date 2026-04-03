@@ -1,5 +1,8 @@
 # Shell Phase 3: 3D Window Positioning
 
+> **Status: COMPLETE** (2026-04-03). All 3A/3B/3C tasks implemented and tested on Leia display.
+> See `shell-phase3-status.md` for full implementation details and controls reference.
+
 ## Prerequisites
 
 Phase 2 is complete on branch `feature/shell-phase2-ci`. All features working:
