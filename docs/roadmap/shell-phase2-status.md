@@ -140,14 +140,40 @@ scripts\build_windows.bat test-apps   # Test apps
 
 | Input | Action |
 |-------|--------|
-| Left-click | Focus window (cyan border, z-order on top) |
-| Right-click-drag | Move window in display plane |
+| Left-click | Focus window (cyan border, z-order on top). Click title bar buttons: close (X), minimize (—) |
+| Left-click-drag title bar | Move window in display plane (move cursor shown) |
+| Left-click-drag edge/corner | Resize window (resize cursor shown, asymmetric — opposite edge fixed) |
+| Right-click | Focus window + forward to app (camera rotation etc.) |
+| Double-click title bar | Toggle maximize / restore |
 | Scroll wheel | Resize focused window (~5% per notch) |
+| Ctrl+1 | Layout: side-by-side |
+| Ctrl+2 | Layout: stacked |
+| Ctrl+3 | Layout: fullscreen (focused fills display, others minimized) |
+| Ctrl+4 | Layout: cascade |
 | TAB | Cycle focus: app 0 → app 1 → unfocused → app 0 |
 | DELETE | Close focused app |
 | ESC | Dismiss shell (2D mode). New apps reopen it. |
 | V | Toggle 2D/3D display mode |
-| WASD / left-click-drag | Forwarded to focused app (camera control) |
+| WASD / left-click-drag content | Forwarded to focused app (camera control) |
+
+### Cursor feedback
+
+| Context | Cursor |
+|---------|--------|
+| Normal hover (content/background) | Arrow |
+| Title bar hover | Move (✜) |
+| Edge/corner hover | Resize arrows (↔ ↕ ⤡ ⤢) |
+| Button hover (close/minimize) | Arrow + button highlight |
+| During title bar drag | Move (✜) |
+| During edge resize | Resize arrow (matches edge) |
+
+### Spatial hit-testing
+
+All mouse interaction uses **3D raycasting**: a ray from the user's tracked eye position through the cursor point on the display surface intersects window planes in meter space. UI dimensions (title bar, buttons, resize zone) are defined in meters — rendering converts to tile pixels, hit-testing uses meters directly. This is tiling-independent and future-proofs for angled 3D windows.
+
+### Persistence
+
+Window poses saved to `%LOCALAPPDATA%\DisplayXR\shell_layout.json` every 5 seconds. Restored on app reconnect by app name. Duplicate app instances get numbered names: "AppName", "AppName (2)".
 
 ### Key source files
 

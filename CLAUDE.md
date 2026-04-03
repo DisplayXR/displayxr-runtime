@@ -273,7 +273,7 @@ _package\bin\displayxr-shell.exe --pose -0.1,0.05,0,0.14,0.08 app1.exe --pose 0.
 | 2 | `_package\run_shell_app.bat` | First app → slot 0 (left-upper, 40% of display) |
 | 3 | `_package\run_shell_app.bat` | Second app → slot 1 (right-upper, 40% of display) |
 
-**Shell controls:** Left-click=focus window, Right-click-drag=move window, Scroll=resize window, TAB=cycle focus, DELETE=close app, ESC=dismiss shell, V=toggle 2D/3D, WASD/left-click-drag=app input.
+**Shell controls:** Left-click=focus window, title bar drag=move window, edge drag=resize, Right-click=focus+forward to app, Double-click title bar=maximize/restore, Scroll=resize window, Ctrl+1-4=layout presets, TAB=cycle focus, DELETE=close app, ESC=dismiss shell, V=toggle 2D/3D, WASD/left-click-drag=app input. Title bar buttons: close (X), minimize (—). Spatial raycasting hit-test (eye→cursor→window plane in meters).
 
 **When launching from Claude Code:** Use `displayxr-shell.exe` — it handles service auto-start, `XR_RUNTIME_JSON`, and `DISPLAYXR_SHELL_SESSION=1` automatically. Use `run_in_background: true` on the Bash tool call and `timeout: 600000`. See `docs/roadmap/shell-phase1-status.md` for the full test procedure.
 

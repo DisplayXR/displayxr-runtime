@@ -565,6 +565,11 @@ struct d3d11_multi_compositor
 	HCURSOR cursor_sizens;   // up-down
 	HCURSOR cursor_sizenwse; // NW-SE diagonal
 	HCURSOR cursor_sizenesw; // NE-SW diagonal
+	HCURSOR cursor_sizeall;  // move/grab (title drag, right-click drag)
+
+	//! Hovered button: 0=none, 1=close, 2=minimize, for the hovered slot.
+	int hover_btn;
+	int hover_btn_slot;
 
 	//! Previous frame LMB state (for rising-edge detection).
 	bool prev_lmb_held;
@@ -3260,6 +3265,7 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 	mc->cursor_sizens = LoadCursor(NULL, IDC_SIZENS);
 	mc->cursor_sizenwse = LoadCursor(NULL, IDC_SIZENWSE);
 	mc->cursor_sizenesw = LoadCursor(NULL, IDC_SIZENESW);
+	mc->cursor_sizeall = LoadCursor(NULL, IDC_SIZEALL);
 
 	U_LOG_W("Multi-comp: output ready (window=%p, swap_chain=%p)", mc->hwnd, mc->swap_chain.get());
 	return XRT_SUCCESS;
@@ -3617,22 +3623,52 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		}
 	}
 
-	// Update cursor based on spatial raycast proximity to window edges
-	if (!mc->resize.active && !mc->title_drag.active && !mc->drag.active) {
-		POINT cpt;
-		GetCursorPos(&cpt);
-		ScreenToClient(mc->hwnd, &cpt);
-		struct shell_hit_result hover = shell_raycast_hit_test(sys, mc, cpt);
-		HCURSOR cur = mc->cursor_arrow;
-		if (hover.edge_flags == (RESIZE_LEFT | RESIZE_TOP) || hover.edge_flags == (RESIZE_RIGHT | RESIZE_BOTTOM))
-			cur = mc->cursor_sizenwse;
-		else if (hover.edge_flags == (RESIZE_RIGHT | RESIZE_TOP) || hover.edge_flags == (RESIZE_LEFT | RESIZE_BOTTOM))
-			cur = mc->cursor_sizenesw;
-		else if (hover.edge_flags & (RESIZE_LEFT | RESIZE_RIGHT))
-			cur = mc->cursor_sizewe;
-		else if (hover.edge_flags & (RESIZE_TOP | RESIZE_BOTTOM))
-			cur = mc->cursor_sizens;
-		SetCursor(cur);
+	// Update cursor via window thread (compositor thread can't call SetCursor directly).
+	// Cursor IDs: 0=arrow, 1=sizewe, 2=sizens, 3=sizenwse, 4=sizenesw, 5=sizeall
+	if (mc->window != nullptr) {
+		int cursor_id = 0; // arrow
+		if (mc->resize.active) {
+			int e = mc->resize.edges;
+			if (e == (RESIZE_LEFT | RESIZE_TOP) || e == (RESIZE_RIGHT | RESIZE_BOTTOM))
+				cursor_id = 3; // sizenwse
+			else if (e == (RESIZE_RIGHT | RESIZE_TOP) || e == (RESIZE_LEFT | RESIZE_BOTTOM))
+				cursor_id = 4; // sizenesw
+			else if (e & (RESIZE_LEFT | RESIZE_RIGHT))
+				cursor_id = 1; // sizewe
+			else if (e & (RESIZE_TOP | RESIZE_BOTTOM))
+				cursor_id = 2; // sizens
+		} else if (mc->title_drag.active) {
+			cursor_id = 5; // sizeall (move during title drag)
+		} else {
+			POINT cpt;
+			GetCursorPos(&cpt);
+			ScreenToClient(mc->hwnd, &cpt);
+			struct shell_hit_result hover = shell_raycast_hit_test(sys, mc, cpt);
+
+			// Track button hover for highlight rendering
+			mc->hover_btn = 0;
+			mc->hover_btn_slot = -1;
+			if (hover.in_close_btn) { mc->hover_btn = 1; mc->hover_btn_slot = hover.slot; }
+			else if (hover.in_minimize_btn) { mc->hover_btn = 2; mc->hover_btn_slot = hover.slot; }
+
+			// Buttons get arrow cursor (no resize/drag cursor on buttons)
+			if (hover.in_close_btn || hover.in_minimize_btn) {
+				cursor_id = 0; // arrow
+			} else {
+				int ef = hover.edge_flags;
+				if (ef == (RESIZE_LEFT | RESIZE_TOP) || ef == (RESIZE_RIGHT | RESIZE_BOTTOM))
+					cursor_id = 3;
+				else if (ef == (RESIZE_RIGHT | RESIZE_TOP) || ef == (RESIZE_LEFT | RESIZE_BOTTOM))
+					cursor_id = 4;
+				else if (ef & (RESIZE_LEFT | RESIZE_RIGHT))
+					cursor_id = 1;
+				else if (ef & (RESIZE_TOP | RESIZE_BOTTOM))
+					cursor_id = 2;
+				else if (hover.in_title_bar)
+					cursor_id = 5; // move cursor on title bar hover
+			}
+		}
+		comp_d3d11_window_set_cursor(mc->window, cursor_id);
 	}
 
 	// Left-click: focus window, close button, title bar drag, or content click.
@@ -3650,9 +3686,9 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			// Spatial raycast: cast ray from eye through cursor on display surface
 			struct shell_hit_result hit = shell_raycast_hit_test(sys, mc, pt);
 
-			// Edge/corner resize takes priority
+			// Edge/corner resize takes priority (unless clicking a title bar button)
 			if (hit.slot >= 0 && hit.edge_flags != RESIZE_NONE &&
-			    !hit.in_title_bar && !hit.in_content) {
+			    !hit.in_close_btn && !hit.in_minimize_btn) {
 				mc->resize.active = true;
 				mc->resize.slot = hit.slot;
 				mc->resize.edges = hit.edge_flags;
@@ -3877,6 +3913,8 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			mc->resize.active = false;
 			mc->resize.slot = -1;
 			mc->resize.edges = RESIZE_NONE;
+			// Nudge cursor to force WM_SETCURSOR update
+			{ POINT p; GetCursorPos(&p); SetCursorPos(p.x, p.y); }
 			// Restore mouse forwarding after resize
 			multi_compositor_update_input_forward(mc);
 		} else if (lmb_held && mc->title_drag.active) {
@@ -3912,76 +3950,26 @@ multi_compositor_render(struct d3d11_service_system *sys)
 				}
 			}
 		} else if (!lmb_held && mc->title_drag.active) {
-			// LMB released — end title drag
+			// LMB released — end title drag. Nudge cursor to force WM_SETCURSOR update.
 			mc->title_drag.active = false;
 			mc->title_drag.slot = -1;
+			{
+				POINT p;
+				GetCursorPos(&p);
+				SetCursorPos(p.x, p.y);
+			}
 		}
 	}
 
-	// Right-click-drag: reposition windows in the display plane.
-	// Uses a state machine: RMB down on window = start drag, RMB held = translate, RMB up = end.
-	{
-		bool rmb_held = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
-
-		if (rmb_held && !mc->drag.active) {
-			// RMB just pressed — spatial raycast to find window under cursor
-			POINT pt;
-			GetCursorPos(&pt);
-			ScreenToClient(mc->hwnd, &pt);
-
-			struct shell_hit_result rmb_hit = shell_raycast_hit_test(sys, mc, pt);
-			if (rmb_hit.slot >= 0 && (rmb_hit.in_title_bar || rmb_hit.in_content)) {
-				int i = rmb_hit.slot;
-				mc->drag.active = true;
-				mc->drag.slot = i;
-				mc->drag.start_cursor = pt;
-				mc->drag.start_pos_x = mc->clients[i].window_pose.position.x;
-				mc->drag.start_pos_y = mc->clients[i].window_pose.position.y;
-				// Focus the dragged window (brings it to front)
-				if (i != mc->focused_slot) {
-					mc->focused_slot = i;
-					multi_compositor_update_input_forward(mc);
-				}
-			}
-		} else if (rmb_held && mc->drag.active) {
-			// Dragging — update window position
-			POINT pt;
-			GetCursorPos(&pt);
-			ScreenToClient(mc->hwnd, &pt);
-
-			int s = mc->drag.slot;
-			if (s >= 0 && s < D3D11_MULTI_MAX_CLIENTS && mc->clients[s].active) {
-				// Convert pixel delta to meters
-				float disp_w_m = sys->base.info.display_width_m;
-				float disp_h_m = sys->base.info.display_height_m;
-				uint32_t disp_px_w = sys->base.info.display_pixel_width;
-				uint32_t disp_px_h = sys->base.info.display_pixel_height;
-				if (disp_px_w > 0 && disp_px_h > 0 && disp_w_m > 0.0f && disp_h_m > 0.0f) {
-					float dx_px = (float)(pt.x - mc->drag.start_cursor.x);
-					float dy_px = (float)(pt.y - mc->drag.start_cursor.y);
-					float m_per_px_x = disp_w_m / (float)disp_px_w;
-					float m_per_px_y = disp_h_m / (float)disp_px_h;
-
-					// +X right, +Y up (pixel Y is inverted)
-					mc->clients[s].window_pose.position.x = mc->drag.start_pos_x + dx_px * m_per_px_x;
-					mc->clients[s].window_pose.position.y = mc->drag.start_pos_y - dy_px * m_per_px_y;
-
-					slot_pose_to_pixel_rect(sys, &mc->clients[s],
-					                        &mc->clients[s].window_rect_x,
-					                        &mc->clients[s].window_rect_y,
-					                        &mc->clients[s].window_rect_w,
-					                        &mc->clients[s].window_rect_h);
-
-					// Update input forward rect if this is the focused slot
-					if (s == mc->focused_slot) {
-						multi_compositor_update_input_forward(mc);
-					}
-				}
-			}
-		} else if (!rmb_held && mc->drag.active) {
-			// RMB released — end drag
-			mc->drag.active = false;
-			mc->drag.slot = -1;
+	// Right-click: focus window under cursor (RMB events forwarded to app via WndProc)
+	if (GetAsyncKeyState(VK_RBUTTON) & 1) {
+		POINT pt;
+		GetCursorPos(&pt);
+		ScreenToClient(mc->hwnd, &pt);
+		struct shell_hit_result rmb_hit = shell_raycast_hit_test(sys, mc, pt);
+		if (rmb_hit.slot >= 0 && rmb_hit.slot != mc->focused_slot) {
+			mc->focused_slot = rmb_hit.slot;
+			multi_compositor_update_input_forward(mc);
 		}
 	}
 
@@ -4305,8 +4293,11 @@ multi_compositor_render(struct d3d11_service_system *sys)
 							if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
 							              D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
 								BlitConstants *cb = static_cast<BlitConstants *>(mapped.pData);
-								cb->src_rect[0] = 0.70f; cb->src_rect[1] = 0.15f;
-								cb->src_rect[2] = 0.15f; cb->src_rect[3] = 1.0f;
+								bool close_hover = (mc->hover_btn == 1 && mc->hover_btn_slot == s);
+								cb->src_rect[0] = close_hover ? 0.90f : 0.70f;
+								cb->src_rect[1] = close_hover ? 0.25f : 0.15f;
+								cb->src_rect[2] = close_hover ? 0.25f : 0.15f;
+								cb->src_rect[3] = 1.0f;
 								cb->dst_offset[0] = btn_x; cb->dst_offset[1] = toy;
 								cb->src_size[0] = 1; cb->src_size[1] = 1;
 								cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
@@ -4326,8 +4317,11 @@ multi_compositor_render(struct d3d11_service_system *sys)
 							if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
 							              D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
 								BlitConstants *cb = static_cast<BlitConstants *>(mapped.pData);
-								cb->src_rect[0] = 0.30f; cb->src_rect[1] = 0.33f;
-								cb->src_rect[2] = 0.36f; cb->src_rect[3] = 1.0f;
+								bool min_hover = (mc->hover_btn == 2 && mc->hover_btn_slot == s);
+								cb->src_rect[0] = min_hover ? 0.45f : 0.30f;
+								cb->src_rect[1] = min_hover ? 0.48f : 0.33f;
+								cb->src_rect[2] = min_hover ? 0.50f : 0.36f;
+								cb->src_rect[3] = 1.0f;
 								cb->dst_offset[0] = min_x; cb->dst_offset[1] = toy;
 								cb->src_size[0] = 1; cb->src_size[1] = 1;
 								cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
