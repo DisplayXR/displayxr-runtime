@@ -216,8 +216,22 @@ leia_edid_probe_display(struct leia_display_probe_result *out)
 
 	// Step 1: EDID-based hardware identification
 	struct os_display_edid_list edid_list;
-	if (!os_display_edid_enumerate(&edid_list)) {
-		U_LOG_W("EDID probe: no monitors enumerated (SetupAPI failed or no monitors)");
+	bool edid_ok = os_display_edid_enumerate(&edid_list);
+
+	// Always log diagnostics
+	U_LOG_W("EDID probe: gdi_monitors=%u setupdi_devices=%u edid_reads=%u correlated=%u diag=%d win32err=%u",
+	        edid_list.diag_gdi_count, edid_list.diag_setupdi_count, edid_list.diag_edid_read_count,
+	        edid_list.count, (int)edid_list.diag_error, edid_list.diag_win32_error);
+
+	// Log GDI device IDs for debugging correlation issues
+	for (uint32_t i = 0; i < edid_list.diag_gdi_count && i < OS_DISPLAY_EDID_MAX_MONITORS; i++) {
+		if (edid_list.diag_gdi_device_ids[i][0] != '\0') {
+			U_LOG_W("EDID probe:   gdi[%u] DeviceID='%s'", i, edid_list.diag_gdi_device_ids[i]);
+		}
+	}
+
+	if (!edid_ok) {
+		U_LOG_W("EDID probe: enumeration failed (diag=%d)", (int)edid_list.diag_error);
 		goto done;
 	}
 
