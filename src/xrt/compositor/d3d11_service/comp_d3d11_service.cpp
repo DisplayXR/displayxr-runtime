@@ -392,13 +392,14 @@ struct d3d11_service_system
 
 #define D3D11_MULTI_MAX_CLIENTS 8
 
-//! Base UI dimensions at 96 DPI (100% scaling).
-#define UI_BASE_TITLE_BAR_H  24
-#define UI_BASE_CLOSE_BTN_W  24
-#define UI_BASE_TASKBAR_H    28
-#define UI_BASE_GLYPH_W       8
-#define UI_BASE_GLYPH_H      16
-#define UI_BASE_RESIZE_ZONE   6
+//! Spatial UI dimensions in METERS — the single source of truth.
+//! Both rendering and hit-testing derive from these values.
+#define UI_TITLE_BAR_H_M   0.008f   //!< Title bar height: 8mm
+#define UI_BTN_W_M          0.008f   //!< Close/minimize button width: 8mm
+#define UI_TASKBAR_H_M      0.009f   //!< Taskbar height: 9mm
+#define UI_GLYPH_W_M        0.003f   //!< Glyph width: 3mm
+#define UI_GLYPH_H_M        0.006f   //!< Glyph height: 6mm
+#define UI_RESIZE_ZONE_M    0.003f   //!< Resize detection zone: 3mm
 
 //! Resize edge/corner flags (bitfield).
 #define RESIZE_NONE   0
@@ -408,32 +409,37 @@ struct d3d11_service_system
 #define RESIZE_BOTTOM 8
 
 /*!
- * Get Windows DPI scale factor for the shell window.
- * 96 DPI = 1.0× (100%), 144 = 1.5× (150%), 192 = 2.0× (200%).
- * Falls back to display-height heuristic if no HWND available.
+ * Convert meters to pixels in the SBS tile (not full display).
+ * Each tile represents the full physical display, so m_per_px = display_m / tile_px.
  */
 static inline float
-ui_dpi_scale(HWND hwnd, uint32_t display_pixel_height)
+ui_m_to_tile_px_x(float meters, const struct d3d11_service_system *sys)
 {
-	if (hwnd != nullptr) {
-		UINT dpi = GetDpiForWindow(hwnd);
-		if (dpi > 0) return (float)dpi / 96.0f;
-	}
-	// Fallback: derive from display height (1080p=1×, 4K=2×)
-	if (display_pixel_height > 0) return (float)display_pixel_height / 1080.0f;
-	return 1.0f;
+	float disp_w_m = sys->base.info.display_width_m;
+	uint32_t tile_px_w = sys->base.info.display_pixel_width / sys->tile_columns;
+	if (disp_w_m <= 0.0f) disp_w_m = 0.700f;
+	if (tile_px_w == 0) tile_px_w = 1920;
+	return meters / disp_w_m * (float)tile_px_w;
 }
 
-//! Convenience macros — use inside functions where 'sys' is available.
-//! multi_comp may be NULL during early init, so check before accessing hwnd.
-#define UI_SCALE ui_dpi_scale(sys->multi_comp ? sys->multi_comp->hwnd : nullptr, sys->base.info.display_pixel_height)
-#define TITLE_BAR_HEIGHT_PX ((int)(UI_BASE_TITLE_BAR_H * UI_SCALE))
-#define CLOSE_BTN_WIDTH_PX  ((int)(UI_BASE_CLOSE_BTN_W * UI_SCALE))
-#define TASKBAR_HEIGHT_PX   ((int)(UI_BASE_TASKBAR_H * UI_SCALE))
-// Glyphs at 2x base size (16x32) for readability on high-res displays
-#define GLYPH_W             (UI_BASE_GLYPH_W * 2)
-#define GLYPH_H             (UI_BASE_GLYPH_H * 2)
-#define RESIZE_ZONE_PX      ((int)(UI_BASE_RESIZE_ZONE * UI_SCALE))
+static inline float
+ui_m_to_tile_px_y(float meters, const struct d3d11_service_system *sys)
+{
+	float disp_h_m = sys->base.info.display_height_m;
+	uint32_t tile_px_h = sys->base.info.display_pixel_height / sys->tile_rows;
+	if (disp_h_m <= 0.0f) disp_h_m = 0.394f;
+	if (tile_px_h == 0) tile_px_h = 1080;
+	return meters / disp_h_m * (float)tile_px_h;
+}
+
+//! Convenience macros: convert spatial meters to SBS-tile pixels for rendering.
+//! Use inside functions where 'sys' is available.
+#define TITLE_BAR_HEIGHT_PX ((int)ui_m_to_tile_px_y(UI_TITLE_BAR_H_M, sys))
+#define CLOSE_BTN_WIDTH_PX  ((int)ui_m_to_tile_px_x(UI_BTN_W_M, sys))
+#define TASKBAR_HEIGHT_PX   ((int)ui_m_to_tile_px_y(UI_TASKBAR_H_M, sys))
+#define GLYPH_W             ((int)ui_m_to_tile_px_x(UI_GLYPH_W_M, sys))
+#define GLYPH_H             ((int)ui_m_to_tile_px_y(UI_GLYPH_H_M, sys))
+#define RESIZE_ZONE_PX      ((int)ui_m_to_tile_px_x(UI_RESIZE_ZONE_M, sys))
 
 /*!
  * Per-client slot in the multi-compositor.
@@ -3260,6 +3266,160 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 }
 
 /*!
+ * Result of spatial raycasting hit-test against shell windows.
+ */
+struct shell_hit_result
+{
+	int slot;            //!< Hit window slot (-1 = no hit)
+	bool in_title_bar;   //!< Hit is in the title bar region
+	bool in_close_btn;   //!< Hit is on the close button
+	bool in_minimize_btn; //!< Hit is on the minimize button
+	bool in_content;     //!< Hit is in the content area
+	float local_x_m;    //!< Hit point in window-local meters (0 = left edge)
+	float local_y_m;    //!< Hit point in window-local meters (0 = top of title bar, positive down)
+	int edge_flags;      //!< RESIZE_LEFT|RIGHT|TOP|BOTTOM if near edge
+};
+
+/*!
+ * Spatial raycast hit-test: cast a ray from the user's eye through the mouse
+ * cursor position on the display surface, and intersect with shell window planes.
+ *
+ * Each window is a 3D rectangle defined by (pose, width_m, height_m).
+ * The display is at Z=0 with known physical dimensions.
+ * The eye position comes from the display processor's face tracking.
+ *
+ * This approach is tiling-independent and future-proofs for angled 3D windows.
+ */
+static struct shell_hit_result
+shell_raycast_hit_test(struct d3d11_service_system *sys,
+                       struct d3d11_multi_compositor *mc,
+                       POINT cursor_px)
+{
+	struct shell_hit_result result = {};
+	result.slot = -1;
+
+	float disp_w_m = sys->base.info.display_width_m;
+	float disp_h_m = sys->base.info.display_height_m;
+	uint32_t disp_px_w = sys->base.info.display_pixel_width;
+	uint32_t disp_px_h = sys->base.info.display_pixel_height;
+	if (disp_w_m <= 0.0f) disp_w_m = 0.700f;
+	if (disp_h_m <= 0.0f) disp_h_m = 0.394f;
+	if (disp_px_w == 0) disp_px_w = 3840;
+	if (disp_px_h == 0) disp_px_h = 2160;
+
+	float m_per_px_x = disp_w_m / (float)disp_px_w;
+	float m_per_px_y = disp_h_m / (float)disp_px_h;
+
+	// Step 1: Convert mouse pixel to 3D point on display surface (Z=0 plane)
+	float point_x = ((float)cursor_px.x - (float)disp_px_w / 2.0f) * m_per_px_x;
+	float point_y = ((float)disp_px_h / 2.0f - (float)cursor_px.y) * m_per_px_y;
+	float point_z = 0.0f;
+
+	// Step 2: Get eye position for ray origin
+	struct xrt_vec3 eye_left = {0, 0, 0.6f}; // Fallback: 60cm from display
+	struct xrt_vec3 eye_right = {0, 0, 0.6f};
+	comp_d3d11_service_get_predicted_eye_positions(&sys->base, &eye_left, &eye_right);
+	// Use center eye
+	float eye_x = (eye_left.x + eye_right.x) / 2.0f;
+	float eye_y = (eye_left.y + eye_right.y) / 2.0f;
+	float eye_z = (eye_left.z + eye_right.z) / 2.0f;
+	if (eye_z <= 0.001f) eye_z = 0.6f; // Safety: eye must be in front of display
+
+	// Ray: origin = eye, direction = (display_point - eye)
+	float ray_dx = point_x - eye_x;
+	float ray_dy = point_y - eye_y;
+	float ray_dz = point_z - eye_z; // Negative (toward display)
+
+	// UI dimensions in meters (spatial constants — single source of truth)
+	float title_bar_h_m = UI_TITLE_BAR_H_M;
+	float btn_w_m = UI_BTN_W_M;
+	float resize_zone_m = UI_RESIZE_ZONE_M;
+
+	// Step 3: Test each window (focused last = highest z-priority, test first)
+	// Build reverse render order: focused first, then others
+	int test_order[D3D11_MULTI_MAX_CLIENTS];
+	int test_count = 0;
+	if (mc->focused_slot >= 0 && mc->focused_slot < D3D11_MULTI_MAX_CLIENTS &&
+	    mc->clients[mc->focused_slot].active && !mc->clients[mc->focused_slot].minimized) {
+		test_order[test_count++] = mc->focused_slot;
+	}
+	for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
+		if (i == mc->focused_slot) continue;
+		if (mc->clients[i].active && !mc->clients[i].minimized) {
+			test_order[test_count++] = i;
+		}
+	}
+
+	for (int ti = 0; ti < test_count; ti++) {
+		int s = test_order[ti];
+		float win_x = mc->clients[s].window_pose.position.x;
+		float win_y = mc->clients[s].window_pose.position.y;
+		float win_z = mc->clients[s].window_pose.position.z;
+		float win_w = mc->clients[s].window_width_m;
+		float win_h = mc->clients[s].window_height_m;
+
+		// Ray-plane intersection: window plane at Z = win_z
+		if (fabsf(ray_dz) < 1e-6f) continue; // Ray parallel to plane
+		float t = (win_z - eye_z) / ray_dz;
+		if (t < 0.0f) continue; // Behind eye
+
+		float hit_x = eye_x + t * ray_dx;
+		float hit_y = eye_y + t * ray_dy;
+
+		// Window bounds (content area)
+		float win_left = win_x - win_w / 2.0f;
+		float win_right = win_x + win_w / 2.0f;
+		float win_bottom = win_y - win_h / 2.0f;
+		float win_top = win_y + win_h / 2.0f;
+
+		// Extended bounds including title bar (above content)
+		float ext_top = win_top + title_bar_h_m;
+
+		// Check if hit is within extended window bounds (including resize zone)
+		if (hit_x >= win_left - resize_zone_m && hit_x < win_right + resize_zone_m &&
+		    hit_y >= win_bottom - resize_zone_m && hit_y < ext_top + resize_zone_m) {
+
+			// Window-local coordinates: (0,0) = top of title bar, positive down/right
+			float local_x = hit_x - win_left;
+			float local_y = ext_top - hit_y; // Positive downward from title bar top
+
+			result.slot = s;
+			result.local_x_m = local_x;
+			result.local_y_m = local_y;
+
+			// Classify hit region
+			bool in_window = (hit_x >= win_left && hit_x < win_right &&
+			                  hit_y >= win_bottom && hit_y < ext_top);
+			result.in_title_bar = in_window && (local_y < title_bar_h_m);
+			result.in_content = in_window && (local_y >= title_bar_h_m);
+
+			if (result.in_title_bar) {
+				result.in_close_btn = (local_x >= win_w - btn_w_m);
+				result.in_minimize_btn = !result.in_close_btn &&
+				                         (local_x >= win_w - 2.0f * btn_w_m);
+			}
+
+			// Edge detection (resize zones)
+			result.edge_flags = RESIZE_NONE;
+			if (hit_x < win_left + resize_zone_m) result.edge_flags |= RESIZE_LEFT;
+			if (hit_x >= win_right - resize_zone_m) result.edge_flags |= RESIZE_RIGHT;
+			if (hit_y < win_bottom + resize_zone_m) result.edge_flags |= RESIZE_BOTTOM;
+			if (hit_y >= ext_top - resize_zone_m) result.edge_flags |= RESIZE_TOP;
+
+			// If we're inside the window (not just in resize zone), clear edge flags
+			// unless we're actually on the edge
+			if (in_window && result.edge_flags == RESIZE_NONE) {
+				result.edge_flags = RESIZE_NONE;
+			}
+
+			break; // First hit wins (z-priority order)
+		}
+	}
+
+	return result;
+}
+
+/*!
  * Apply a layout preset to all active (non-minimized) windows.
  * layout_id: 0=side-by-side, 1=stacked, 2=fullscreen, 3=cascade
  */
@@ -3457,36 +3617,20 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		}
 	}
 
-	// Update cursor based on proximity to window edges (resize feedback)
+	// Update cursor based on spatial raycast proximity to window edges
 	if (!mc->resize.active && !mc->title_drag.active && !mc->drag.active) {
 		POINT cpt;
 		GetCursorPos(&cpt);
 		ScreenToClient(mc->hwnd, &cpt);
-		int rz = RESIZE_ZONE_PX;
-		int hover_edges = RESIZE_NONE;
-		for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
-			if (!mc->clients[i].active || mc->clients[i].minimized) continue;
-			int32_t rx = (int32_t)mc->clients[i].window_rect_x;
-			int32_t ry = (int32_t)mc->clients[i].window_rect_y - TITLE_BAR_HEIGHT_PX;
-			int32_t rr = rx + (int32_t)mc->clients[i].window_rect_w;
-			int32_t rb = (int32_t)mc->clients[i].window_rect_y + (int32_t)mc->clients[i].window_rect_h;
-			if (ry < 0) ry = 0;
-			if (cpt.x >= rx - rz && cpt.x < rr + rz && cpt.y >= ry - rz && cpt.y < rb + rz) {
-				if (cpt.x < rx + rz) hover_edges |= RESIZE_LEFT;
-				if (cpt.x >= rr - rz) hover_edges |= RESIZE_RIGHT;
-				if (cpt.y < ry + rz) hover_edges |= RESIZE_TOP;
-				if (cpt.y >= rb - rz) hover_edges |= RESIZE_BOTTOM;
-				break;
-			}
-		}
+		struct shell_hit_result hover = shell_raycast_hit_test(sys, mc, cpt);
 		HCURSOR cur = mc->cursor_arrow;
-		if (hover_edges == (RESIZE_LEFT | RESIZE_TOP) || hover_edges == (RESIZE_RIGHT | RESIZE_BOTTOM))
+		if (hover.edge_flags == (RESIZE_LEFT | RESIZE_TOP) || hover.edge_flags == (RESIZE_RIGHT | RESIZE_BOTTOM))
 			cur = mc->cursor_sizenwse;
-		else if (hover_edges == (RESIZE_RIGHT | RESIZE_TOP) || hover_edges == (RESIZE_LEFT | RESIZE_BOTTOM))
+		else if (hover.edge_flags == (RESIZE_RIGHT | RESIZE_TOP) || hover.edge_flags == (RESIZE_LEFT | RESIZE_BOTTOM))
 			cur = mc->cursor_sizenesw;
-		else if (hover_edges & (RESIZE_LEFT | RESIZE_RIGHT))
+		else if (hover.edge_flags & (RESIZE_LEFT | RESIZE_RIGHT))
 			cur = mc->cursor_sizewe;
-		else if (hover_edges & (RESIZE_TOP | RESIZE_BOTTOM))
+		else if (hover.edge_flags & (RESIZE_TOP | RESIZE_BOTTOM))
 			cur = mc->cursor_sizens;
 		SetCursor(cur);
 	}
@@ -3503,78 +3647,32 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			GetCursorPos(&pt);
 			ScreenToClient(mc->hwnd, &pt);
 
-			// First: check if cursor is on an edge/corner for resize
-			int resize_slot = -1;
-			int resize_edges = RESIZE_NONE;
-			int rz = RESIZE_ZONE_PX;
-			for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
-				if (!mc->clients[i].active || mc->clients[i].minimized) continue;
-				int32_t rx = (int32_t)mc->clients[i].window_rect_x;
-				int32_t ry = (int32_t)mc->clients[i].window_rect_y - TITLE_BAR_HEIGHT_PX;
-				int32_t rr = rx + (int32_t)mc->clients[i].window_rect_w;
-				int32_t rb = (int32_t)mc->clients[i].window_rect_y + (int32_t)mc->clients[i].window_rect_h;
-				if (ry < 0) ry = 0;
+			// Spatial raycast: cast ray from eye through cursor on display surface
+			struct shell_hit_result hit = shell_raycast_hit_test(sys, mc, pt);
 
-				// Check if cursor is within the extended border zone of this window
-				if (pt.x >= rx - rz && pt.x < rr + rz && pt.y >= ry - rz && pt.y < rb + rz) {
-					int edges = RESIZE_NONE;
-					if (pt.x < rx + rz) edges |= RESIZE_LEFT;
-					if (pt.x >= rr - rz) edges |= RESIZE_RIGHT;
-					if (pt.y < ry + rz) edges |= RESIZE_TOP;
-					if (pt.y >= rb - rz) edges |= RESIZE_BOTTOM;
-
-					if (edges != RESIZE_NONE) {
-						resize_slot = i;
-						resize_edges = edges;
-						break;
-					}
-				}
-			}
-
-			if (resize_slot >= 0) {
+			// Edge/corner resize takes priority
+			if (hit.slot >= 0 && hit.edge_flags != RESIZE_NONE &&
+			    !hit.in_title_bar && !hit.in_content) {
 				mc->resize.active = true;
-				mc->resize.slot = resize_slot;
-				mc->resize.edges = resize_edges;
+				mc->resize.slot = hit.slot;
+				mc->resize.edges = hit.edge_flags;
 				mc->resize.start_cursor = pt;
-				mc->resize.start_pos_x = mc->clients[resize_slot].window_pose.position.x;
-				mc->resize.start_pos_y = mc->clients[resize_slot].window_pose.position.y;
-				mc->resize.start_width_m = mc->clients[resize_slot].window_width_m;
-				mc->resize.start_height_m = mc->clients[resize_slot].window_height_m;
-				if (resize_slot != mc->focused_slot) {
-					mc->focused_slot = resize_slot;
+				mc->resize.start_pos_x = mc->clients[hit.slot].window_pose.position.x;
+				mc->resize.start_pos_y = mc->clients[hit.slot].window_pose.position.y;
+				mc->resize.start_width_m = mc->clients[hit.slot].window_width_m;
+				mc->resize.start_height_m = mc->clients[hit.slot].window_height_m;
+				if (hit.slot != mc->focused_slot) {
+					mc->focused_slot = hit.slot;
 				}
-				// Suppress mouse forwarding to app during resize
 				if (mc->window != nullptr) {
 					comp_d3d11_window_set_input_forward(mc->window, NULL, 0, 0, 0, 0);
 				}
 			} else {
 
-			int hit_slot = -1;
-			bool in_title_bar = false;
-			bool in_close_btn = false;
-			bool in_minimize_btn = false;
-
-			for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
-				if (!mc->clients[i].active || mc->clients[i].minimized) continue;
-				int32_t rx = (int32_t)mc->clients[i].window_rect_x;
-				int32_t ry = (int32_t)mc->clients[i].window_rect_y;
-				int32_t rw = (int32_t)mc->clients[i].window_rect_w;
-				int32_t rh = (int32_t)mc->clients[i].window_rect_h;
-				int32_t tb_y = ry - TITLE_BAR_HEIGHT_PX;
-				if (tb_y < 0) tb_y = 0;
-
-				// Hit-test: title bar + content area (window_rect coords = cursor coords)
-				if (pt.x >= rx && pt.x < rx + rw && pt.y >= tb_y && pt.y < ry + rh) {
-					hit_slot = i;
-					in_title_bar = (pt.y < ry);
-					if (in_title_bar) {
-						in_close_btn = (pt.x >= rx + rw - CLOSE_BTN_WIDTH_PX);
-						in_minimize_btn = !in_close_btn &&
-						                  (pt.x >= rx + rw - 2 * CLOSE_BTN_WIDTH_PX);
-					}
-					break;
-				}
-			}
+			int hit_slot = hit.slot;
+			bool in_title_bar = hit.in_title_bar;
+			bool in_close_btn = hit.in_close_btn;
+			bool in_minimize_btn = hit.in_minimize_btn;
 
 			// Debug: log click coordinates and hit results
 			if (hit_slot >= 0 && in_title_bar) {
@@ -3667,16 +3765,28 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			} else {
 				// Content area click or taskbar click
 				if (hit_slot < 0) {
-					// No visible window hit — check taskbar for minimized app indicators
-					uint32_t ca_h_tb = sys->base.info.display_pixel_height;
-					if (ca_h_tb == 0) ca_h_tb = 2160;
-					if (pt.y >= (int32_t)(ca_h_tb - TASKBAR_HEIGHT_PX)) {
+					// No visible window hit — check taskbar using spatial coords.
+					// Convert cursor to display-surface meters for comparison.
+					float disp_w_tb = sys->base.info.display_width_m;
+					float disp_h_tb = sys->base.info.display_height_m;
+					if (disp_w_tb <= 0) disp_w_tb = 0.700f;
+					if (disp_h_tb <= 0) disp_h_tb = 0.394f;
+					float cursor_y_m = ((float)sys->base.info.display_pixel_height / 2.0f - (float)pt.y) *
+					                   disp_h_tb / (float)sys->base.info.display_pixel_height;
+					float cursor_x_m = ((float)pt.x - (float)sys->base.info.display_pixel_width / 2.0f) *
+					                   disp_w_tb / (float)sys->base.info.display_pixel_width;
+					// Taskbar at bottom: y from -disp_h/2 to -disp_h/2 + taskbar_h
+					float tb_bottom_m = -disp_h_tb / 2.0f;
+					float tb_top_m = tb_bottom_m + UI_TASKBAR_H_M;
+					if (cursor_y_m >= tb_bottom_m && cursor_y_m < tb_top_m) {
+						float pill_w_m = 6.0f * UI_GLYPH_W_M + 0.001f;
+						float gap_m = 0.002f;
 						int ind_idx = 0;
 						for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
 							if (!mc->clients[i].active || !mc->clients[i].minimized) continue;
-							int32_t pill_w = 6 * GLYPH_W + 4;
-							int32_t ind_x = 6 + ind_idx * (pill_w + 8);
-							if (pt.x >= ind_x && pt.x < ind_x + pill_w) {
+							float ind_left_m = -disp_w_tb / 2.0f + 0.002f + ind_idx * (pill_w_m + gap_m);
+							float ind_right_m = ind_left_m + pill_w_m;
+							if (cursor_x_m >= ind_left_m && cursor_x_m < ind_right_m) {
 								mc->clients[i].minimized = false;
 								mc->focused_slot = i;
 								multi_compositor_update_input_forward(mc);
@@ -3695,12 +3805,15 @@ multi_compositor_render(struct d3d11_service_system *sys)
 						multi_compositor_update_input_forward(mc);
 					}
 
-					// Synthesize mouse-move + click to the app
+					// Synthesize mouse-move + click to the app using spatial hit coords
 					if (mc->clients[hit_slot].app_hwnd != nullptr) {
-						int32_t rx = (int32_t)mc->clients[hit_slot].window_rect_x;
-						int32_t ry = (int32_t)mc->clients[hit_slot].window_rect_y;
-						int app_x = pt.x - rx;
-						int app_y = pt.y - ry;
+						float title_h_m = UI_TITLE_BAR_H_M;
+						float content_local_x = hit.local_x_m;
+						float content_local_y = hit.local_y_m - title_h_m;
+						float win_w = mc->clients[hit_slot].window_width_m;
+						float win_h = mc->clients[hit_slot].window_height_m;
+						int app_x = (int)(content_local_x / win_w * (float)mc->clients[hit_slot].window_rect_w);
+						int app_y = (int)(content_local_y / win_h * (float)mc->clients[hit_slot].window_rect_h);
 						LPARAM lp = MAKELPARAM(app_x, app_y);
 						PostMessage(mc->clients[hit_slot].app_hwnd, WM_MOUSEMOVE, 0, lp);
 						PostMessage(mc->clients[hit_slot].app_hwnd, WM_LBUTTONDOWN,
@@ -3811,34 +3924,23 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		bool rmb_held = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
 
 		if (rmb_held && !mc->drag.active) {
-			// RMB just pressed — start drag if cursor is over a window
+			// RMB just pressed — spatial raycast to find window under cursor
 			POINT pt;
 			GetCursorPos(&pt);
 			ScreenToClient(mc->hwnd, &pt);
 
-			for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
-				if (!mc->clients[i].active) {
-					continue;
-				}
-				int32_t rx = (int32_t)mc->clients[i].window_rect_x;
-				int32_t ry = (int32_t)mc->clients[i].window_rect_y;
-				int32_t rw = (int32_t)mc->clients[i].window_rect_w;
-				int32_t rh = (int32_t)mc->clients[i].window_rect_h;
-				// Include title bar in right-click-drag hit area
-				int32_t tb_y = ry - TITLE_BAR_HEIGHT_PX;
-				if (tb_y < 0) tb_y = 0;
-				if (pt.x >= rx && pt.x < rx + rw && pt.y >= tb_y && pt.y < ry + rh) {
-					mc->drag.active = true;
-					mc->drag.slot = i;
-					mc->drag.start_cursor = pt;
-					mc->drag.start_pos_x = mc->clients[i].window_pose.position.x;
-					mc->drag.start_pos_y = mc->clients[i].window_pose.position.y;
-					// Focus the dragged window (brings it to front)
-					if (i != mc->focused_slot) {
-						mc->focused_slot = i;
-						multi_compositor_update_input_forward(mc);
-					}
-					break;
+			struct shell_hit_result rmb_hit = shell_raycast_hit_test(sys, mc, pt);
+			if (rmb_hit.slot >= 0 && (rmb_hit.in_title_bar || rmb_hit.in_content)) {
+				int i = rmb_hit.slot;
+				mc->drag.active = true;
+				mc->drag.slot = i;
+				mc->drag.start_cursor = pt;
+				mc->drag.start_pos_x = mc->clients[i].window_pose.position.x;
+				mc->drag.start_pos_y = mc->clients[i].window_pose.position.y;
+				// Focus the dragged window (brings it to front)
+				if (i != mc->focused_slot) {
+					mc->focused_slot = i;
+					multi_compositor_update_input_forward(mc);
 				}
 			}
 		} else if (rmb_held && mc->drag.active) {
