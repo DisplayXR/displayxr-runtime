@@ -567,12 +567,26 @@ struct d3d11_multi_compositor
 	HCURSOR cursor_sizenesw; // NE-SW diagonal
 	HCURSOR cursor_sizeall;  // move/grab (title drag, right-click drag)
 
+	//! Title bar right-click drag state for window rotation.
+	struct
+	{
+		bool active;
+		int32_t slot;
+		POINT start_cursor;
+		float start_yaw;   //!< Yaw (radians) at drag start
+		float start_pitch;  //!< Pitch (radians) at drag start
+	} title_rmb_drag;
+
+	//! Current layout preset (-1=none, 0-4=preset index). Used for TAB Z-reorder in Stack.
+	int32_t current_layout;
+
 	//! Hovered button: 0=none, 1=close, 2=minimize, for the hovered slot.
 	int hover_btn;
 	int hover_btn_slot;
 
-	//! Previous frame LMB state (for rising-edge detection).
+	//! Previous frame LMB/RMB state (for rising-edge detection).
 	bool prev_lmb_held;
+	bool prev_rmb_held;
 
 	//! Double-click detection for title bar maximize toggle.
 	DWORD last_title_click_time;
@@ -1043,7 +1057,7 @@ blit_to_atlas_texture(struct d3d11_service_system *sys,
 	cb->dst_size[0] = static_cast<float>(sys->display_width);
 	cb->dst_size[1] = static_cast<float>(sys->display_height);
 	cb->convert_srgb = is_srgb ? 1.0f : 0.0f;
-	cb->padding = 0.0f;
+	cb->quad_mode = 0.0f;
 	cb->dst_rect_wh[0] = dst_w;
 	cb->dst_rect_wh[1] = dst_h;
 	cb->padding2[0] = 0.0f;
@@ -2875,6 +2889,9 @@ multi_compositor_update_input_forward(struct d3d11_multi_compositor *mc)
 	comp_d3d11_window_set_input_forward(mc->window, (void *)target, rx, ry, rw, rh);
 }
 
+// Forward declarations
+static inline bool quat_is_identity(const struct xrt_quat *q);
+
 // Forward declarations — defined in the external API section below.
 static void
 slot_pose_to_pixel_rect(const struct d3d11_service_system *sys,
@@ -2888,6 +2905,29 @@ slot_pose_to_pixel_rect_for_eye(const struct d3d11_service_system *sys,
                                 float eye_x, float eye_y, float eye_z,
                                 int32_t *out_x, int32_t *out_y,
                                 int32_t *out_w, int32_t *out_h);
+
+static bool
+compute_projected_quad_corners(const struct d3d11_service_system *sys,
+                               const struct d3d11_multi_client_slot *slot,
+                               float eye_x, float eye_y, float eye_z,
+                               uint32_t tile_col, uint32_t tile_row,
+                               uint32_t half_w, uint32_t half_h,
+                               uint32_t ca_w, uint32_t ca_h,
+                               float out_corners[8]);
+
+static void
+project_local_rect_for_eye(const struct d3d11_service_system *sys,
+                           const struct xrt_quat *orientation,
+                           float win_cx, float win_cy, float win_cz,
+                           float local_left, float local_top,
+                           float local_right, float local_bottom,
+                           float eye_x, float eye_y, float eye_z,
+                           uint32_t tile_col, uint32_t tile_row,
+                           uint32_t half_w, uint32_t half_h,
+                           uint32_t ca_w, uint32_t ca_h,
+                           float out_corners[8]);
+
+static inline void blit_set_quad_corners(BlitConstants *cb, const float corners[8]);
 
 /*!
  * Register a per-client compositor with the multi-compositor.
@@ -3377,14 +3417,42 @@ shell_raycast_hit_test(struct d3d11_service_system *sys,
 		float win_z = mc->clients[s].window_pose.position.z;
 		float win_w = mc->clients[s].window_width_m;
 		float win_h = mc->clients[s].window_height_m;
+		const struct xrt_quat *win_q = &mc->clients[s].window_pose.orientation;
+		bool rotated = !quat_is_identity(win_q);
 
-		// Ray-plane intersection: window plane at Z = win_z
-		if (fabsf(ray_dz) < 1e-6f) continue; // Ray parallel to plane
-		float t = (win_z - eye_z) / ray_dz;
-		if (t < 0.0f) continue; // Behind eye
-
-		float hit_x = eye_x + t * ray_dx;
-		float hit_y = eye_y + t * ray_dy;
+		// Ray-plane intersection
+		float t, hit_x, hit_y;
+		if (rotated) {
+			// Rotated window: compute plane normal from orientation
+			struct xrt_vec3 normal_local = {0, 0, 1};
+			struct xrt_vec3 normal;
+			math_quat_rotate_vec3(win_q, &normal_local, &normal);
+			// Plane equation: dot(normal, point - win_pos) = 0
+			float ray_dot_n = ray_dx * normal.x + ray_dy * normal.y + ray_dz * normal.z;
+			if (fabsf(ray_dot_n) < 1e-6f) continue; // Parallel
+			float d = (win_x - eye_x) * normal.x + (win_y - eye_y) * normal.y + (win_z - eye_z) * normal.z;
+			t = d / ray_dot_n;
+			if (t < 0.0f) continue; // Behind eye
+			float world_hit_x = eye_x + t * ray_dx;
+			float world_hit_y = eye_y + t * ray_dy;
+			float world_hit_z = eye_z + t * ray_dz;
+			// Convert world hit to window-local coords via inverse rotation
+			struct xrt_vec3 delta = {world_hit_x - win_x, world_hit_y - win_y, world_hit_z - win_z};
+			struct xrt_quat inv_q;
+			math_quat_invert(win_q, &inv_q);
+			struct xrt_vec3 local_hit;
+			math_quat_rotate_vec3(&inv_q, &delta, &local_hit);
+			// local_hit.x/y are window-local coords centered at window center
+			hit_x = win_x + local_hit.x; // project back to flat coords for bounds check
+			hit_y = win_y + local_hit.y;
+		} else {
+			// Flat window: simple Z-plane intersection
+			if (fabsf(ray_dz) < 1e-6f) continue;
+			t = (win_z - eye_z) / ray_dz;
+			if (t < 0.0f) continue;
+			hit_x = eye_x + t * ray_dx;
+			hit_y = eye_y + t * ray_dy;
+		}
 
 		// Window bounds (content area)
 		float win_left = win_x - win_w / 2.0f;
@@ -3440,8 +3508,49 @@ shell_raycast_hit_test(struct d3d11_service_system *sys,
 }
 
 /*!
+ * Helper: create a quaternion from yaw (Y-axis rotation) in radians.
+ */
+static inline struct xrt_quat
+quat_from_yaw(float yaw_rad)
+{
+	struct xrt_vec3 axis = {0.0f, 1.0f, 0.0f};
+	struct xrt_quat q;
+	math_quat_from_angle_vector(yaw_rad, &axis, &q);
+	return q;
+}
+
+/*!
+ * Helper: create a quaternion from yaw + pitch (Y then X axis) in radians.
+ */
+static inline struct xrt_quat
+quat_from_yaw_pitch(float yaw_rad, float pitch_rad)
+{
+	struct xrt_vec3 y_axis = {0.0f, 1.0f, 0.0f};
+	struct xrt_vec3 x_axis = {1.0f, 0.0f, 0.0f};
+	struct xrt_quat qy, qp, result;
+	math_quat_from_angle_vector(yaw_rad, &y_axis, &qy);
+	math_quat_from_angle_vector(pitch_rad, &x_axis, &qp);
+	math_quat_rotate(&qy, &qp, &result);
+	return result;
+}
+
+/*!
+ * Helper: check if a quaternion is identity (no rotation).
+ */
+static inline bool
+quat_is_identity(const struct xrt_quat *q)
+{
+	return fabsf(q->x) < 0.0001f && fabsf(q->y) < 0.0001f &&
+	       fabsf(q->z) < 0.0001f && fabsf(q->w - 1.0f) < 0.0001f;
+}
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+/*!
  * Apply a layout preset to all active (non-minimized) windows.
- * layout_id: 0=side-by-side, 1=stacked, 2=fullscreen, 3=cascade
+ * layout_id: 0=side-by-side, 1=stacked, 2=theater, 3=stack, 4=carousel
  */
 static void
 apply_layout(struct d3d11_service_system *sys, struct d3d11_multi_compositor *mc, int layout_id)
@@ -3462,12 +3571,15 @@ apply_layout(struct d3d11_service_system *sys, struct d3d11_multi_compositor *mc
 	}
 	if (n == 0) return;
 
-	const char *layout_names[] = {"side-by-side", "stacked", "fullscreen", "cascade"};
+	const char *layout_names[] = {"side-by-side", "stacked", "theater", "stack", "carousel"};
+	if (layout_id < 0 || layout_id > 4) return;
 	U_LOG_W("Multi-comp: layout %s (%d windows)", layout_names[layout_id], n);
+	mc->current_layout = layout_id;
 
 	for (int idx = 0; idx < n; idx++) {
 		int s = active[idx];
-		float new_x = 0, new_y = 0, new_w = 0, new_h = 0;
+		float new_x = 0, new_y = 0, new_z = 0, new_w = 0, new_h = 0;
+		struct xrt_quat new_orient = {0, 0, 0, 1}; // identity
 
 		switch (layout_id) {
 		case 0: // Side-by-side: split width equally
@@ -3484,33 +3596,85 @@ apply_layout(struct d3d11_service_system *sys, struct d3d11_multi_compositor *mc
 			new_y = ((n - 1) / 2.0f - idx) * (disp_h_m * 0.90f / n);
 			break;
 
-		case 2: // Fullscreen: focused fills display, others minimized
-			if (s == mc->focused_slot || (mc->focused_slot < 0 && idx == 0)) {
-				new_w = disp_w_m * 0.95f;
-				new_h = disp_h_m * 0.95f;
+		case 2: { // Theater: focused at Z=0 large, others recessed + angled inward
+			bool is_focused = (s == mc->focused_slot || (mc->focused_slot < 0 && idx == 0));
+			if (is_focused) {
+				new_w = disp_w_m * 0.60f;
+				new_h = disp_h_m * 0.60f;
 				new_x = 0;
 				new_y = 0;
-				mc->clients[s].minimized = false;
+				new_z = 0;
 			} else {
-				mc->clients[s].minimized = true;
-				continue;
+				new_w = disp_w_m * 0.40f;
+				new_h = disp_h_m * 0.40f;
+				new_z = -0.03f; // 3cm behind display
+				// Spread non-focused windows left/right
+				int side_idx = idx;
+				if (s == mc->focused_slot) side_idx = 0; // shouldn't happen
+				int side_count = n - 1;
+				if (side_count <= 0) side_count = 1;
+				float spread = (float)(side_idx - (side_count - 1) / 2.0f);
+				new_x = spread * disp_w_m * 0.35f;
+				new_y = 0;
+				// Angle inward: positive yaw for left windows, negative for right
+				float yaw = (new_x > 0) ? -(float)(15.0 * M_PI / 180.0)
+				                         : (float)(15.0 * M_PI / 180.0);
+				if (fabsf(new_x) < 0.01f) yaw = 0;
+				new_orient = quat_from_yaw(yaw);
 			}
 			break;
+		}
 
-		case 3: { // Cascade: same size, offset per slot
-			new_w = disp_w_m * 0.50f;
-			new_h = disp_h_m * 0.50f;
-			float offset_m = 0.015f; // ~30px equivalent
-			new_x = -disp_w_m * 0.15f + idx * offset_m;
-			new_y = disp_h_m * 0.15f - idx * offset_m;
+		case 3: { // Stack: card pile at varying Z, focused at front
+			new_w = disp_w_m * 0.55f;
+			new_h = disp_h_m * 0.55f;
+			// Focused window at front Z, others behind
+			bool is_focused = (s == mc->focused_slot || (mc->focused_slot < 0 && idx == 0));
+			if (is_focused) {
+				new_z = 0.02f; // 2cm in front
+				new_x = 0;
+				new_y = 0;
+			} else {
+				// Distribute behind, with XY offset for card-stack look
+				float z_step = 0.04f / (n > 1 ? (float)(n - 1) : 1.0f);
+				new_z = 0.02f - (idx + 1) * z_step;
+				if (new_z < -0.02f) new_z = -0.02f;
+				new_x = idx * 0.005f;  // 5mm right per layer
+				new_y = -idx * 0.005f; // 5mm down per layer
+			}
 			break;
 		}
+
+		case 4: { // Carousel: semicircle arrangement
+			float radius_m = 0.15f; // 15cm semicircle radius
+			new_w = disp_w_m * 0.45f;
+			new_h = disp_h_m * 0.45f;
+			if (n == 1) {
+				new_x = 0; new_y = 0; new_z = 0.01f;
+			} else {
+				// Spread across a 60-degree arc centered on 0
+				float total_arc = (float)(60.0 * M_PI / 180.0);
+				float angle_step = total_arc / (float)(n - 1);
+				float angle = -total_arc / 2.0f + idx * angle_step;
+				new_x = sinf(angle) * radius_m;
+				new_z = (cosf(angle) - 1.0f) * radius_m * 0.5f; // slight Z variation
+				new_y = 0;
+				// Center window slightly forward
+				if (idx == n / 2) new_z += 0.01f;
+				// Yaw to face center
+				new_orient = quat_from_yaw(-angle * 0.6f);
+			}
+			break;
+		}
+
 		default:
 			return;
 		}
 
 		mc->clients[s].window_pose.position.x = new_x;
 		mc->clients[s].window_pose.position.y = new_y;
+		mc->clients[s].window_pose.position.z = new_z;
+		mc->clients[s].window_pose.orientation = new_orient;
 		mc->clients[s].window_width_m = new_w;
 		mc->clients[s].window_height_m = new_h;
 
@@ -3610,6 +3774,11 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			U_LOG_W("Multi-comp: TAB → focused slot %d%s", mc->focused_slot,
 			        mc->focused_slot < 0 ? " (unfocused)" : "");
 			multi_compositor_update_input_forward(mc);
+
+			// Stack layout: TAB reorders Z — focused window to front
+			if (mc->current_layout == 3 && mc->focused_slot >= 0) {
+				apply_layout(sys, mc, 3);
+			}
 		}
 	}
 
@@ -3627,9 +3796,9 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		}
 	}
 
-	// Layout presets: Ctrl+1-4
+	// Layout presets: Ctrl+1-5 (1=SBS, 2=stacked, 3=theater, 4=stack, 5=carousel)
 	if (GetAsyncKeyState(VK_CONTROL) & 0x8000) {
-		for (int k = '1'; k <= '4'; k++) {
+		for (int k = '1'; k <= '5'; k++) {
 			if (GetAsyncKeyState(k) & 1) {
 				apply_layout(sys, mc, k - '1');
 				break;
@@ -3975,15 +4144,70 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		}
 	}
 
-	// Right-click: focus window under cursor (RMB events forwarded to app via WndProc)
-	if (GetAsyncKeyState(VK_RBUTTON) & 1) {
-		POINT pt;
-		GetCursorPos(&pt);
-		ScreenToClient(mc->hwnd, &pt);
-		struct shell_hit_result rmb_hit = shell_raycast_hit_test(sys, mc, pt);
-		if (rmb_hit.slot >= 0 && rmb_hit.slot != mc->focused_slot) {
-			mc->focused_slot = rmb_hit.slot;
-			multi_compositor_update_input_forward(mc);
+	// Right-click: title bar RMB drag = rotation, content RMB = focus + forward to app.
+	// Call GetAsyncKeyState ONCE to avoid consuming the & 1 press bit (Phase 2 lesson #4).
+	{
+		SHORT rmb_state = GetAsyncKeyState(VK_RBUTTON);
+		bool rmb_held = (rmb_state & 0x8000) != 0;
+		bool rmb_just_pressed = rmb_held && !mc->prev_rmb_held;
+		mc->prev_rmb_held = rmb_held;
+
+		if (rmb_held) {
+			if (!mc->title_rmb_drag.active && rmb_just_pressed) {
+				// RMB just pressed — check if on title bar to start rotation drag
+				POINT pt;
+				GetCursorPos(&pt);
+				ScreenToClient(mc->hwnd, &pt);
+				struct shell_hit_result rmb_hit = shell_raycast_hit_test(sys, mc, pt);
+				if (rmb_hit.slot >= 0) {
+					if (rmb_hit.slot != mc->focused_slot) {
+						mc->focused_slot = rmb_hit.slot;
+						multi_compositor_update_input_forward(mc);
+					}
+					if (rmb_hit.in_title_bar && !rmb_hit.in_close_btn && !rmb_hit.in_minimize_btn) {
+						// Start rotation drag
+						mc->title_rmb_drag.active = true;
+						mc->title_rmb_drag.slot = rmb_hit.slot;
+						mc->title_rmb_drag.start_cursor = pt;
+						// Extract current yaw/pitch from quaternion
+						struct xrt_vec3 euler;
+						math_quat_to_euler_angles(&mc->clients[rmb_hit.slot].window_pose.orientation, &euler);
+						mc->title_rmb_drag.start_yaw = euler.y;
+						mc->title_rmb_drag.start_pitch = euler.x;
+					}
+				}
+			} else if (mc->title_rmb_drag.active) {
+				// RMB held — update rotation during drag
+				POINT pt;
+				GetCursorPos(&pt);
+				ScreenToClient(mc->hwnd, &pt);
+				int s = mc->title_rmb_drag.slot;
+				if (s >= 0 && s < D3D11_MULTI_MAX_CLIENTS && mc->clients[s].active) {
+					float dx = (float)(pt.x - mc->title_rmb_drag.start_cursor.x);
+					float dy = (float)(pt.y - mc->title_rmb_drag.start_cursor.y);
+					// ~1 degree per 10 pixels
+					float deg_per_px = (float)(M_PI / 180.0) / 10.0f;
+					float yaw = mc->title_rmb_drag.start_yaw + dx * deg_per_px;
+					float pitch = mc->title_rmb_drag.start_pitch + dy * deg_per_px;
+					// Clamp: yaw ±30°, pitch ±15°
+					float max_yaw = (float)(30.0 * M_PI / 180.0);
+					float max_pitch = (float)(15.0 * M_PI / 180.0);
+					if (yaw < -max_yaw) yaw = -max_yaw;
+					if (yaw > max_yaw) yaw = max_yaw;
+					if (pitch < -max_pitch) pitch = -max_pitch;
+					if (pitch > max_pitch) pitch = max_pitch;
+
+					mc->clients[s].window_pose.orientation = quat_from_yaw_pitch(yaw, pitch);
+					mc->current_layout = -1; // Manual rotation breaks layout
+				}
+			}
+		} else {
+			if (mc->title_rmb_drag.active) {
+				mc->title_rmb_drag.active = false;
+				mc->title_rmb_drag.slot = -1;
+				// Nudge cursor to force WM_SETCURSOR update
+				POINT p; GetCursorPos(&p); SetCursorPos(p.x, p.y);
+			}
 		}
 	}
 
@@ -4236,6 +4460,16 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			scissor.bottom = (LONG)((src_row + 1) * half_h);
 			sys->context->RSSetScissorRects(1, &scissor);
 
+			// Check for rotated window → perspective quad mode
+			int ei_for_quad = (src_col < 2) ? (int)src_col : 0;
+			int ei_q = (ei_for_quad < (int)eye_pos.count) ? ei_for_quad : 0;
+			float quad_corners[8] = {};
+			bool use_quad = compute_projected_quad_corners(
+			    sys, &mc->clients[s],
+			    eye_pos.eyes[ei_q].x, eye_pos.eyes[ei_q].y, eye_pos.eyes[ei_q].z,
+			    src_col, src_row, half_w, half_h, ca_w, ca_h,
+			    quad_corners);
+
 			// Update constant buffer
 			D3D11_MAPPED_SUBRESOURCE mapped;
 			HRESULT hr = sys->context->Map(sys->blit_constant_buffer.get(), 0,
@@ -4253,11 +4487,17 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			cb->dst_size[0] = static_cast<float>(ca_w);
 			cb->dst_size[1] = static_cast<float>(ca_h);
 			cb->convert_srgb = 0.0f;
-			cb->padding = 0.0f;
+			cb->quad_mode = use_quad ? 1.0f : 0.0f;
 			cb->dst_rect_wh[0] = dest_px_w;
 			cb->dst_rect_wh[1] = dest_px_h;
 			cb->padding2[0] = 0.0f;
 			cb->padding2[1] = 0.0f;
+			if (use_quad) {
+				blit_set_quad_corners(cb, quad_corners);
+			} else {
+				memset(cb->quad_corners_01, 0, sizeof(cb->quad_corners_01));
+				memset(cb->quad_corners_23, 0, sizeof(cb->quad_corners_23));
+			}
 			sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
 
 			// Pipeline setup
@@ -4288,12 +4528,29 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		// Draw title bar for this slot (inside render_order loop for correct z-order)
 		{
 			float tb_h_frac = (float)TITLE_BAR_HEIGHT_PX / (float)ca_h;
+			// Window local-space dimensions for rotated chrome
+			bool is_rotated = !quat_is_identity(&mc->clients[s].window_pose.orientation);
+			float win_hw = mc->clients[s].window_width_m / 2.0f;
+			float win_hh = mc->clients[s].window_height_m / 2.0f;
+			float tb_h_m = UI_TITLE_BAR_H_M;
+			float btn_w_m_val = UI_BTN_W_M;
+			float glyph_w_m = UI_GLYPH_W_M;
+			float glyph_h_m = UI_GLYPH_H_M;
+			const struct xrt_quat *win_orient = &mc->clients[s].window_pose.orientation;
+			float wcx = mc->clients[s].window_pose.position.x;
+			float wcy = mc->clients[s].window_pose.position.y;
+			float wcz = mc->clients[s].window_pose.position.z;
+
 			if (tb_h_frac > 0.0f) {
 				for (uint32_t v2 = 0; v2 < num_views && v2 < XRT_MAX_VIEWS; v2++) {
 					uint32_t col2 = v2 % sys->tile_columns;
 					uint32_t row2 = v2 / sys->tile_columns;
 					// Per-eye window frac (parallax for Z != 0)
 					int eye_idx2 = (col2 < 2) ? (int)col2 : 0;
+					int ei2 = (eye_idx2 < (int)eye_pos.count) ? eye_idx2 : 0;
+					float cur_eye_x = eye_pos.eyes[ei2].x;
+					float cur_eye_y = eye_pos.eyes[ei2].y;
+					float cur_eye_z = eye_pos.eyes[ei2].z;
 					float wfx = (float)eye_rect_x[eye_idx2] / (float)ca_w;
 					float wfy = (float)eye_rect_y[eye_idx2] / (float)ca_h;
 					float wfw = (float)eye_rect_w[eye_idx2] / (float)ca_w;
@@ -4327,6 +4584,26 @@ multi_compositor_render(struct d3d11_service_system *sys)
 					tb_vp.Width = (float)ca_w; tb_vp.Height = (float)ca_h; tb_vp.MaxDepth = 1.0f;
 					sys->context->RSSetViewports(1, &tb_vp);
 
+					// Helper lambda: fill CB position fields for rotated or axis-aligned chrome blit
+					#define CHROME_BLIT_POS(cb_ptr, ll, lt, lr, lb, aa_x, aa_y, aa_w, aa_h) \
+						do { \
+							if (is_rotated) { \
+								float _corners[8]; \
+								project_local_rect_for_eye(sys, win_orient, wcx, wcy, wcz, \
+								    (ll), (lt), (lr), (lb), cur_eye_x, cur_eye_y, cur_eye_z, \
+								    col2, row2, half_w, half_h, ca_w, ca_h, _corners); \
+								blit_set_quad_corners(cb_ptr, _corners); \
+								(cb_ptr)->dst_offset[0] = 0; (cb_ptr)->dst_offset[1] = 0; \
+								(cb_ptr)->dst_rect_wh[0] = 0; (cb_ptr)->dst_rect_wh[1] = 0; \
+							} else { \
+								(cb_ptr)->quad_mode = 0; \
+								(cb_ptr)->dst_offset[0] = (aa_x); (cb_ptr)->dst_offset[1] = (aa_y); \
+								(cb_ptr)->dst_rect_wh[0] = (aa_w); (cb_ptr)->dst_rect_wh[1] = (aa_h); \
+								memset((cb_ptr)->quad_corners_01, 0, sizeof((cb_ptr)->quad_corners_01)); \
+								memset((cb_ptr)->quad_corners_23, 0, sizeof((cb_ptr)->quad_corners_23)); \
+							} \
+						} while(0)
+
 					// Title bar background
 					{
 						D3D11_MAPPED_SUBRESOURCE mapped;
@@ -4335,62 +4612,62 @@ multi_compositor_render(struct d3d11_service_system *sys)
 							BlitConstants *cb = static_cast<BlitConstants *>(mapped.pData);
 							cb->src_rect[0] = 0.18f; cb->src_rect[1] = 0.20f;
 							cb->src_rect[2] = 0.25f; cb->src_rect[3] = 1.0f;
-							cb->dst_offset[0] = tox; cb->dst_offset[1] = toy;
 							cb->src_size[0] = 1; cb->src_size[1] = 1;
 							cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
-							cb->convert_srgb = 2.0f; cb->padding = 0;
-							cb->dst_rect_wh[0] = tow; cb->dst_rect_wh[1] = toh;
+							cb->convert_srgb = 2.0f;
 							cb->padding2[0] = 0; cb->padding2[1] = 0;
+							// Title bar: full width, above content
+							CHROME_BLIT_POS(cb,
+							    -win_hw, win_hh + tb_h_m, win_hw, win_hh,
+							    tox, toy, tow, toh);
 							sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
 							sys->context->Draw(4, 0);
 						}
 					}
 					// Close button (red)
 					{
-						float btn_x = tox + tow - (float)CLOSE_BTN_WIDTH_PX;
-						if (btn_x >= tox) {
-							D3D11_MAPPED_SUBRESOURCE mapped;
-							if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
-							              D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
-								BlitConstants *cb = static_cast<BlitConstants *>(mapped.pData);
-								bool close_hover = (mc->hover_btn == 1 && mc->hover_btn_slot == s);
-								cb->src_rect[0] = close_hover ? 0.90f : 0.70f;
-								cb->src_rect[1] = close_hover ? 0.25f : 0.15f;
-								cb->src_rect[2] = close_hover ? 0.25f : 0.15f;
-								cb->src_rect[3] = 1.0f;
-								cb->dst_offset[0] = btn_x; cb->dst_offset[1] = toy;
-								cb->src_size[0] = 1; cb->src_size[1] = 1;
-								cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
-								cb->convert_srgb = 2.0f; cb->padding = 0;
-								cb->dst_rect_wh[0] = (float)CLOSE_BTN_WIDTH_PX; cb->dst_rect_wh[1] = toh;
-								cb->padding2[0] = 0; cb->padding2[1] = 0;
-								sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
-								sys->context->Draw(4, 0);
-							}
+						D3D11_MAPPED_SUBRESOURCE mapped;
+						if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
+						              D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+							BlitConstants *cb = static_cast<BlitConstants *>(mapped.pData);
+							bool close_hover = (mc->hover_btn == 1 && mc->hover_btn_slot == s);
+							cb->src_rect[0] = close_hover ? 0.90f : 0.70f;
+							cb->src_rect[1] = close_hover ? 0.25f : 0.15f;
+							cb->src_rect[2] = close_hover ? 0.25f : 0.15f;
+							cb->src_rect[3] = 1.0f;
+							cb->src_size[0] = 1; cb->src_size[1] = 1;
+							cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
+							cb->convert_srgb = 2.0f;
+							cb->padding2[0] = 0; cb->padding2[1] = 0;
+							float btn_x = tox + tow - (float)CLOSE_BTN_WIDTH_PX;
+							CHROME_BLIT_POS(cb,
+							    win_hw - btn_w_m_val, win_hh + tb_h_m, win_hw, win_hh,
+							    btn_x, toy, (float)CLOSE_BTN_WIDTH_PX, toh);
+							sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
+							sys->context->Draw(4, 0);
 						}
 					}
 					// Minimize button (gray)
 					{
-						float min_x = tox + tow - 2.0f * (float)CLOSE_BTN_WIDTH_PX;
-						if (min_x >= tox) {
-							D3D11_MAPPED_SUBRESOURCE mapped;
-							if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
-							              D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
-								BlitConstants *cb = static_cast<BlitConstants *>(mapped.pData);
-								bool min_hover = (mc->hover_btn == 2 && mc->hover_btn_slot == s);
-								cb->src_rect[0] = min_hover ? 0.45f : 0.30f;
-								cb->src_rect[1] = min_hover ? 0.48f : 0.33f;
-								cb->src_rect[2] = min_hover ? 0.50f : 0.36f;
-								cb->src_rect[3] = 1.0f;
-								cb->dst_offset[0] = min_x; cb->dst_offset[1] = toy;
-								cb->src_size[0] = 1; cb->src_size[1] = 1;
-								cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
-								cb->convert_srgb = 2.0f; cb->padding = 0;
-								cb->dst_rect_wh[0] = (float)CLOSE_BTN_WIDTH_PX; cb->dst_rect_wh[1] = toh;
-								cb->padding2[0] = 0; cb->padding2[1] = 0;
-								sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
-								sys->context->Draw(4, 0);
-							}
+						D3D11_MAPPED_SUBRESOURCE mapped;
+						if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
+						              D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+							BlitConstants *cb = static_cast<BlitConstants *>(mapped.pData);
+							bool min_hover = (mc->hover_btn == 2 && mc->hover_btn_slot == s);
+							cb->src_rect[0] = min_hover ? 0.45f : 0.30f;
+							cb->src_rect[1] = min_hover ? 0.48f : 0.33f;
+							cb->src_rect[2] = min_hover ? 0.50f : 0.36f;
+							cb->src_rect[3] = 1.0f;
+							cb->src_size[0] = 1; cb->src_size[1] = 1;
+							cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
+							cb->convert_srgb = 2.0f;
+							cb->padding2[0] = 0; cb->padding2[1] = 0;
+							float min_x = tox + tow - 2.0f * (float)CLOSE_BTN_WIDTH_PX;
+							CHROME_BLIT_POS(cb,
+							    win_hw - 2*btn_w_m_val, win_hh + tb_h_m, win_hw - btn_w_m_val, win_hh,
+							    min_x, toy, (float)CLOSE_BTN_WIDTH_PX, toh);
+							sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
+							sys->context->Draw(4, 0);
 						}
 					}
 					// Text + glyphs
@@ -4405,6 +4682,9 @@ multi_compositor_render(struct d3d11_service_system *sys)
 						float gh = (float)GLYPH_H;
 						float gpad = (toh - gh) / 2.0f; // vertical centering
 						if (gpad < 0) gpad = 0;
+						// Glyph vertical centering in meters (for rotated path)
+						float glyph_vpad_m = (tb_h_m - glyph_h_m) / 2.0f;
+						if (glyph_vpad_m < 0) glyph_vpad_m = 0;
 
 						int max_chars = ((int)tow - (int)gw - 2 * CLOSE_BTN_WIDTH_PX) / (int)gw;
 						if (max_chars < 0) max_chars = 0;
@@ -4419,13 +4699,18 @@ multi_compositor_render(struct d3d11_service_system *sys)
 								BlitConstants *cb = static_cast<BlitConstants *>(mapped.pData);
 								cb->src_rect[0] = (float)(gi * 8); cb->src_rect[1] = 0;
 								cb->src_rect[2] = 8; cb->src_rect[3] = 16;
-								cb->dst_offset[0] = tox + gw + ci * gw;
-								cb->dst_offset[1] = toy + gpad;
 								cb->src_size[0] = 768; cb->src_size[1] = 16;
 								cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
-								cb->convert_srgb = 0.0f; cb->padding = 0;
-								cb->dst_rect_wh[0] = gw; cb->dst_rect_wh[1] = gh;
+								cb->convert_srgb = 0.0f;
 								cb->padding2[0] = 0; cb->padding2[1] = 0;
+								// Glyph local rect: left edge + 1 glyph padding + ci * glyph_w
+								float gl_left = -win_hw + glyph_w_m + ci * glyph_w_m;
+								float gl_top = win_hh + tb_h_m - glyph_vpad_m;
+								float gl_right = gl_left + glyph_w_m;
+								float gl_bottom = gl_top - glyph_h_m;
+								CHROME_BLIT_POS(cb,
+								    gl_left, gl_top, gl_right, gl_bottom,
+								    tox + gw + ci * gw, toy + gpad, gw, gh);
 								sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
 								sys->context->Draw(4, 0);
 							}
@@ -4434,19 +4719,22 @@ multi_compositor_render(struct d3d11_service_system *sys)
 						{
 							int xg = 'X' - 0x20;
 							float bx = tox + tow - (float)CLOSE_BTN_WIDTH_PX + ((float)CLOSE_BTN_WIDTH_PX - gw) / 2.0f;
+							// Local: centered in close button
+							float xg_left = win_hw - btn_w_m_val + (btn_w_m_val - glyph_w_m) / 2.0f;
+							float xg_top = win_hh + tb_h_m - glyph_vpad_m;
 							D3D11_MAPPED_SUBRESOURCE mapped;
 							if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
 							              D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
 								BlitConstants *cb = static_cast<BlitConstants *>(mapped.pData);
 								cb->src_rect[0] = (float)(xg * 8); cb->src_rect[1] = 0;
 								cb->src_rect[2] = 8; cb->src_rect[3] = 16;
-								cb->dst_offset[0] = bx;
-								cb->dst_offset[1] = toy + gpad;
 								cb->src_size[0] = 768; cb->src_size[1] = 16;
 								cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
-								cb->convert_srgb = 0.0f; cb->padding = 0;
-								cb->dst_rect_wh[0] = gw; cb->dst_rect_wh[1] = gh;
+								cb->convert_srgb = 0.0f;
 								cb->padding2[0] = 0; cb->padding2[1] = 0;
+								CHROME_BLIT_POS(cb,
+								    xg_left, xg_top, xg_left + glyph_w_m, xg_top - glyph_h_m,
+								    bx, toy + gpad, gw, gh);
 								sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
 								sys->context->Draw(4, 0);
 							}
@@ -4455,19 +4743,22 @@ multi_compositor_render(struct d3d11_service_system *sys)
 						{
 							int dg = '-' - 0x20;
 							float mx = tox + tow - 2.0f * (float)CLOSE_BTN_WIDTH_PX + ((float)CLOSE_BTN_WIDTH_PX - gw) / 2.0f;
+							// Local: centered in minimize button
+							float mg_left = win_hw - 2*btn_w_m_val + (btn_w_m_val - glyph_w_m) / 2.0f;
+							float mg_top = win_hh + tb_h_m - glyph_vpad_m;
 							D3D11_MAPPED_SUBRESOURCE mapped;
 							if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
 							              D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
 								BlitConstants *cb = static_cast<BlitConstants *>(mapped.pData);
 								cb->src_rect[0] = (float)(dg * 8); cb->src_rect[1] = 0;
 								cb->src_rect[2] = 8; cb->src_rect[3] = 16;
-								cb->dst_offset[0] = mx;
-								cb->dst_offset[1] = toy + gpad;
 								cb->src_size[0] = 768; cb->src_size[1] = 16;
 								cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
-								cb->convert_srgb = 0.0f; cb->padding = 0;
-								cb->dst_rect_wh[0] = gw; cb->dst_rect_wh[1] = gh;
+								cb->convert_srgb = 0.0f;
 								cb->padding2[0] = 0; cb->padding2[1] = 0;
+								CHROME_BLIT_POS(cb,
+								    mg_left, mg_top, mg_left + glyph_w_m, mg_top - glyph_h_m,
+								    mx, toy + gpad, gw, gh);
 								sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
 								sys->context->Draw(4, 0);
 							}
@@ -4475,6 +4766,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 						sys->context->OMSetBlendState(sys->blend_opaque.get(), nullptr, 0xFFFFFFFF);
 						sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
 					}
+					#undef CHROME_BLIT_POS
 				}
 			}
 		}
@@ -4564,7 +4856,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 				cb->dst_size[0] = (float)ca_w;
 				cb->dst_size[1] = (float)ca_h;
 				cb->convert_srgb = 2.0f; // solid color mode
-				cb->padding = 0;
+				cb->quad_mode = 0;
 				cb->dst_rect_wh[0] = edges[e].w;
 				cb->dst_rect_wh[1] = edges[e].h;
 				cb->padding2[0] = 0; cb->padding2[1] = 0;
@@ -4648,7 +4940,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 					cb->dst_size[0] = (float)ca_w;
 					cb->dst_size[1] = (float)ca_h;
 					cb->convert_srgb = 2.0f;
-					cb->padding = 0;
+					cb->quad_mode = 0;
 					cb->dst_rect_wh[0] = (float)half_w;
 					cb->dst_rect_wh[1] = (float)TASKBAR_HEIGHT_PX;
 					cb->padding2[0] = 0; cb->padding2[1] = 0;
@@ -4690,7 +4982,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 								cb2->dst_size[0] = (float)ca_w;
 								cb2->dst_size[1] = (float)ca_h;
 								cb2->convert_srgb = 2.0f;
-								cb2->padding = 0;
+								cb2->quad_mode = 0;
 								cb2->dst_rect_wh[0] = pill_w;
 								cb2->dst_rect_wh[1] = pill_h;
 								cb2->padding2[0] = 0; cb2->padding2[1] = 0;
@@ -4721,7 +5013,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 								cb3->dst_size[0] = (float)ca_w;
 								cb3->dst_size[1] = (float)ca_h;
 								cb3->convert_srgb = 0.0f;
-								cb3->padding = 0;
+								cb3->quad_mode = 0;
 								cb3->dst_rect_wh[0] = tgw;
 								cb3->dst_rect_wh[1] = tgh;
 								cb3->padding2[0] = 0; cb3->padding2[1] = 0;
@@ -6502,6 +6794,174 @@ slot_pose_to_pixel_rect_for_eye(const struct d3d11_service_system *sys,
 	*out_y = (int32_t)(center_px_y - (float)h_px / 2.0f + 0.5f);
 	*out_w = w_px;
 	*out_h = h_px;
+}
+
+/*!
+ * Project a single 3D point through an eye to the display plane (Z=0),
+ * returning the result in display pixel coordinates.
+ */
+static inline void
+project_point_for_eye(float px, float py, float pz,
+                      float eye_x, float eye_y, float eye_z,
+                      float disp_px_w, float disp_px_h,
+                      float px_per_m_x, float px_per_m_y,
+                      float *out_px_x, float *out_px_y)
+{
+	if (fabsf(pz) > 0.0001f && eye_z > 0.01f) {
+		float denom = eye_z - pz;
+		if (fabsf(denom) < 0.001f) denom = (denom >= 0.0f) ? 0.001f : -0.001f;
+		float scale = eye_z / denom;
+		px = eye_x + scale * (px - eye_x);
+		py = eye_y + scale * (py - eye_y);
+	}
+	*out_px_x = disp_px_w / 2.0f + px * px_per_m_x;
+	*out_px_y = disp_px_h / 2.0f - py * px_per_m_y;
+}
+
+/*!
+ * Compute 4 projected corner positions (in SBS tile pixel coords) for a rotated window.
+ * Corners are ordered: TL(0,0), BL(0,1), TR(1,0), BR(1,1) matching the blit VS triangle strip.
+ *
+ * For identity orientation, falls back to axis-aligned rect (returns false).
+ * For non-identity, computes perspective-correct quad corners (returns true).
+ */
+static bool
+compute_projected_quad_corners(const struct d3d11_service_system *sys,
+                               const struct d3d11_multi_client_slot *slot,
+                               float eye_x, float eye_y, float eye_z,
+                               uint32_t tile_col, uint32_t tile_row,
+                               uint32_t half_w, uint32_t half_h,
+                               uint32_t ca_w, uint32_t ca_h,
+                               float out_corners[8])
+{
+	if (quat_is_identity(&slot->window_pose.orientation)) {
+		return false; // Use axis-aligned fast path
+	}
+
+	float disp_w_m = sys->base.info.display_width_m;
+	float disp_h_m = sys->base.info.display_height_m;
+	uint32_t disp_px_w = sys->base.info.display_pixel_width;
+	uint32_t disp_px_h = sys->base.info.display_pixel_height;
+	if (disp_w_m <= 0.0f || disp_h_m <= 0.0f || disp_px_w == 0 || disp_px_h == 0) {
+		disp_px_w = 3840; disp_px_h = 2160;
+		disp_w_m = 0.700f; disp_h_m = 0.394f;
+	}
+	float px_per_m_x = (float)disp_px_w / disp_w_m;
+	float px_per_m_y = (float)disp_px_h / disp_h_m;
+
+	float hw = slot->window_width_m / 2.0f;
+	float hh = slot->window_height_m / 2.0f;
+
+	// 4 corners in window-local space: TL, BL, TR, BR
+	struct xrt_vec3 local[4] = {
+		{-hw, +hh, 0}, // TL
+		{-hw, -hh, 0}, // BL
+		{+hw, +hh, 0}, // TR
+		{+hw, -hh, 0}, // BR
+	};
+
+	const struct xrt_quat *q = &slot->window_pose.orientation;
+	float wx = slot->window_pose.position.x;
+	float wy = slot->window_pose.position.y;
+	float wz = slot->window_pose.position.z;
+
+	for (int i = 0; i < 4; i++) {
+		// Rotate corner by orientation, then translate to world position
+		struct xrt_vec3 world;
+		math_quat_rotate_vec3(q, &local[i], &world);
+		world.x += wx;
+		world.y += wy;
+		world.z += wz;
+
+		// Project through eye to display plane (Z=0)
+		float dpx, dpy;
+		project_point_for_eye(world.x, world.y, world.z,
+		                      eye_x, eye_y, eye_z,
+		                      (float)disp_px_w, (float)disp_px_h,
+		                      px_per_m_x, px_per_m_y,
+		                      &dpx, &dpy);
+
+		// Convert to SBS tile pixel coordinates
+		float frac_x = dpx / (float)ca_w;
+		float frac_y = dpy / (float)ca_h;
+		out_corners[i * 2 + 0] = tile_col * half_w + frac_x * half_w;
+		out_corners[i * 2 + 1] = tile_row * half_h + frac_y * half_h;
+	}
+	return true;
+}
+
+/*!
+ * Project an arbitrary local-space rectangle through a rotated window pose + eye to SBS tile pixels.
+ * local coords: (-hw, -hh) = bottom-left, (+hw, +hh) = top-right, relative to window center.
+ * Output corners are in the same order as the blit VS: TL(0), BL(1), TR(2), BR(3).
+ */
+static void
+project_local_rect_for_eye(const struct d3d11_service_system *sys,
+                           const struct xrt_quat *orientation,
+                           float win_cx, float win_cy, float win_cz,
+                           float local_left, float local_top,
+                           float local_right, float local_bottom,
+                           float eye_x, float eye_y, float eye_z,
+                           uint32_t tile_col, uint32_t tile_row,
+                           uint32_t half_w, uint32_t half_h,
+                           uint32_t ca_w, uint32_t ca_h,
+                           float out_corners[8])
+{
+	float disp_w_m = sys->base.info.display_width_m;
+	float disp_h_m = sys->base.info.display_height_m;
+	uint32_t disp_px_w = sys->base.info.display_pixel_width;
+	uint32_t disp_px_h = sys->base.info.display_pixel_height;
+	if (disp_w_m <= 0.0f || disp_h_m <= 0.0f || disp_px_w == 0 || disp_px_h == 0) {
+		disp_px_w = 3840; disp_px_h = 2160;
+		disp_w_m = 0.700f; disp_h_m = 0.394f;
+	}
+	float px_per_m_x = (float)disp_px_w / disp_w_m;
+	float px_per_m_y = (float)disp_px_h / disp_h_m;
+
+	// 4 corners in window-local space: TL, BL, TR, BR
+	struct xrt_vec3 local[4] = {
+		{local_left,  local_top,    0},
+		{local_left,  local_bottom, 0},
+		{local_right, local_top,    0},
+		{local_right, local_bottom, 0},
+	};
+
+	for (int i = 0; i < 4; i++) {
+		struct xrt_vec3 world;
+		math_quat_rotate_vec3(orientation, &local[i], &world);
+		world.x += win_cx;
+		world.y += win_cy;
+		world.z += win_cz;
+
+		float dpx, dpy;
+		project_point_for_eye(world.x, world.y, world.z,
+		                      eye_x, eye_y, eye_z,
+		                      (float)disp_px_w, (float)disp_px_h,
+		                      px_per_m_x, px_per_m_y,
+		                      &dpx, &dpy);
+
+		float frac_x = dpx / (float)ca_w;
+		float frac_y = dpy / (float)ca_h;
+		out_corners[i * 2 + 0] = tile_col * half_w + frac_x * half_w;
+		out_corners[i * 2 + 1] = tile_row * half_h + frac_y * half_h;
+	}
+}
+
+/*!
+ * Helper: write quad corner data into a BlitConstants struct.
+ */
+static inline void
+blit_set_quad_corners(BlitConstants *cb, const float corners[8])
+{
+	cb->quad_mode = 1.0f;
+	cb->quad_corners_01[0] = corners[0]; // TL.x
+	cb->quad_corners_01[1] = corners[1]; // TL.y
+	cb->quad_corners_01[2] = corners[2]; // BL.x
+	cb->quad_corners_01[3] = corners[3]; // BL.y
+	cb->quad_corners_23[0] = corners[4]; // TR.x
+	cb->quad_corners_23[1] = corners[5]; // TR.y
+	cb->quad_corners_23[2] = corners[6]; // BR.x
+	cb->quad_corners_23[3] = corners[7]; // BR.y
 }
 
 /*!
