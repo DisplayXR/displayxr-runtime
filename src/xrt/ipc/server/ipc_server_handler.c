@@ -150,7 +150,9 @@ ipc_try_get_sr_view_poses(struct ipc_server *s,
 	// Try per-client window metrics first (shell mode dynamic windows),
 	// then fall back to global window metrics, then display dimensions.
 	float screen_width_m, screen_height_m;
-	float eye_offset_x = 0.0f, eye_offset_y = 0.0f;
+	float eye_offset_x = 0.0f, eye_offset_y = 0.0f, eye_offset_z = 0.0f;
+	struct xrt_quat win_orient = {0, 0, 0, 1};
+	bool win_has_orientation = false;
 	{
 		struct xrt_window_metrics wm = {0};
 		bool have_wm = false;
@@ -171,6 +173,12 @@ ipc_try_get_sr_view_poses(struct ipc_server *s,
 			screen_height_m = wm.window_height_m;
 			eye_offset_x = wm.window_center_offset_x_m;
 			eye_offset_y = wm.window_center_offset_y_m;
+			eye_offset_z = wm.window_center_offset_z_m;
+			win_orient = wm.window_orientation;
+			win_has_orientation = (fabsf(win_orient.x) > 0.0001f ||
+			                      fabsf(win_orient.y) > 0.0001f ||
+			                      fabsf(win_orient.z) > 0.0001f ||
+			                      fabsf(win_orient.w - 1.0f) > 0.0001f);
 		} else if (!comp_d3d11_service_get_display_dimensions(s->xsysc, &screen_width_m, &screen_height_m)) {
 			static bool logged_no_dims = false;
 			if (!logged_no_dims) {
@@ -181,10 +189,21 @@ ipc_try_get_sr_view_poses(struct ipc_server *s,
 		}
 	}
 
-	// Shift eyes to be relative to window center (not display center)
+	// Transform eyes to window-local frame:
+	// 1. Subtract window position (eye relative to window center)
+	// 2. If rotated, apply inverse rotation (eye in window's local space)
 	for (uint32_t i = 0; i < eye_count; i++) {
-		raw_eyes[i].x -= eye_offset_x;
-		raw_eyes[i].y -= eye_offset_y;
+		struct xrt_vec3 delta = {
+		    raw_eyes[i].x - eye_offset_x,
+		    raw_eyes[i].y - eye_offset_y,
+		    raw_eyes[i].z - eye_offset_z};
+		if (win_has_orientation) {
+			struct xrt_quat inv_q;
+			math_quat_invert(&win_orient, &inv_q);
+			math_quat_rotate_vec3(&inv_q, &delta, &raw_eyes[i]);
+		} else {
+			raw_eyes[i] = delta;
+		}
 	}
 
 	// Log success on first successful call
