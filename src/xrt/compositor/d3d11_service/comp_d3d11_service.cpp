@@ -487,6 +487,20 @@ struct d3d11_multi_client_slot
 
 	//! App name for title bar display (from HWND title or fallback).
 	char app_name[128];
+
+	//! Animation state for smooth pose transitions.
+	struct
+	{
+		bool active;               //!< Animation in progress
+		struct xrt_pose start_pose; //!< Pose at animation start
+		struct xrt_pose target_pose; //!< Target pose
+		float start_width_m;       //!< Width at animation start
+		float start_height_m;      //!< Height at animation start
+		float target_width_m;      //!< Target width
+		float target_height_m;     //!< Target height
+		uint64_t start_ns;         //!< Monotonic timestamp at animation start
+		uint64_t duration_ns;      //!< Animation duration in nanoseconds
+	} anim;
 };
 
 /*!
@@ -2962,17 +2976,36 @@ multi_compositor_register_client(struct d3d11_service_system *sys, struct d3d11_
 			float center_x_m = (i == 0) ? (-0.25f * disp_w_m) : (+0.25f * disp_w_m);
 			float center_y_m = 0.25f * disp_h_m;  // +Y up = upper half
 
+			// Entry animation: start from center (small), animate to target position.
+			// Set initial pose at display center, small size.
 			mc->clients[i].window_pose.orientation.x = 0.0f;
 			mc->clients[i].window_pose.orientation.y = 0.0f;
 			mc->clients[i].window_pose.orientation.z = 0.0f;
 			mc->clients[i].window_pose.orientation.w = 1.0f;
-			mc->clients[i].window_pose.position.x = center_x_m;
-			mc->clients[i].window_pose.position.y = center_y_m;
+			mc->clients[i].window_pose.position.x = 0.0f;
+			mc->clients[i].window_pose.position.y = 0.0f;
 			mc->clients[i].window_pose.position.z = 0.0f;
-			mc->clients[i].window_width_m = win_w_m;
-			mc->clients[i].window_height_m = win_h_m;
+			mc->clients[i].window_width_m = win_w_m * 0.3f; // start small
+			mc->clients[i].window_height_m = win_h_m * 0.3f;
 
-			// Compute pixel rect from pose
+			// Entry animation: grow from center to target position
+			struct xrt_pose target = {};
+			target.orientation.w = 1.0f;
+			target.position.x = center_x_m;
+			target.position.y = center_y_m;
+			target.position.z = 0.0f;
+			// Use inline animation setup (slot_animate_to is defined later in file)
+			mc->clients[i].anim.active = true;
+			mc->clients[i].anim.start_pose = mc->clients[i].window_pose;
+			mc->clients[i].anim.target_pose = target;
+			mc->clients[i].anim.start_width_m = win_w_m * 0.3f;
+			mc->clients[i].anim.start_height_m = win_h_m * 0.3f;
+			mc->clients[i].anim.target_width_m = win_w_m;
+			mc->clients[i].anim.target_height_m = win_h_m;
+			mc->clients[i].anim.start_ns = os_monotonic_get_ns();
+			mc->clients[i].anim.duration_ns = 400ULL * 1000000ULL; // 400ms
+
+			// Compute pixel rect from initial (small) pose
 			slot_pose_to_pixel_rect(sys, &mc->clients[i],
 			                        &mc->clients[i].window_rect_x,
 			                        &mc->clients[i].window_rect_y,
@@ -3548,6 +3581,73 @@ quat_is_identity(const struct xrt_quat *q)
 #define M_PI 3.14159265358979323846
 #endif
 
+//! Default animation duration for layout transitions (300ms).
+#define ANIM_DURATION_NS (300ULL * 1000000ULL)
+
+//! Animation duration for initial window entry (400ms).
+#define ANIM_ENTRY_DURATION_NS (400ULL * 1000000ULL)
+
+/*!
+ * Ease-out cubic: fast start, smooth deceleration.
+ * t in [0,1] → result in [0,1].
+ */
+static inline float
+ease_out_cubic(float t)
+{
+	float f = 1.0f - t;
+	return 1.0f - f * f * f;
+}
+
+/*!
+ * Start an animation on a slot toward a target pose + size.
+ */
+static inline void
+slot_animate_to(struct d3d11_multi_client_slot *slot,
+                const struct xrt_pose *target_pose,
+                float target_w, float target_h,
+                uint64_t now_ns, uint64_t duration_ns)
+{
+	slot->anim.active = true;
+	slot->anim.start_pose = slot->window_pose;
+	slot->anim.target_pose = *target_pose;
+	slot->anim.start_width_m = slot->window_width_m;
+	slot->anim.start_height_m = slot->window_height_m;
+	slot->anim.target_width_m = target_w;
+	slot->anim.target_height_m = target_h;
+	slot->anim.start_ns = now_ns;
+	slot->anim.duration_ns = duration_ns;
+}
+
+/*!
+ * Tick animation for a slot. Returns true if animation is still running.
+ * Updates window_pose and window_width/height_m with interpolated values.
+ */
+static inline bool
+slot_animate_tick(struct d3d11_multi_client_slot *slot, uint64_t now_ns)
+{
+	if (!slot->anim.active) return false;
+
+	uint64_t elapsed = now_ns - slot->anim.start_ns;
+	float t = (float)elapsed / (float)slot->anim.duration_ns;
+	if (t >= 1.0f) {
+		t = 1.0f;
+		slot->anim.active = false;
+	}
+	float eased = ease_out_cubic(t);
+
+	// Interpolate pose (lerp position, slerp orientation)
+	math_pose_interpolate(&slot->anim.start_pose, &slot->anim.target_pose,
+	                      eased, &slot->window_pose);
+
+	// Interpolate dimensions
+	slot->window_width_m = slot->anim.start_width_m +
+	    eased * (slot->anim.target_width_m - slot->anim.start_width_m);
+	slot->window_height_m = slot->anim.start_height_m +
+	    eased * (slot->anim.target_height_m - slot->anim.start_height_m);
+
+	return slot->anim.active; // true = still running
+}
+
 /*!
  * Apply a layout preset to all active (non-minimized) windows.
  * layout_id: 0=side-by-side, 1=stacked, 2=theater, 3=stack, 4=carousel
@@ -3671,19 +3771,16 @@ apply_layout(struct d3d11_service_system *sys, struct d3d11_multi_compositor *mc
 			return;
 		}
 
-		mc->clients[s].window_pose.position.x = new_x;
-		mc->clients[s].window_pose.position.y = new_y;
-		mc->clients[s].window_pose.position.z = new_z;
-		mc->clients[s].window_pose.orientation = new_orient;
-		mc->clients[s].window_width_m = new_w;
-		mc->clients[s].window_height_m = new_h;
+		// Animate to target pose instead of instant snap
+		struct xrt_pose target_pose;
+		target_pose.position.x = new_x;
+		target_pose.position.y = new_y;
+		target_pose.position.z = new_z;
+		target_pose.orientation = new_orient;
 
-		slot_pose_to_pixel_rect(sys, &mc->clients[s],
-		                        &mc->clients[s].window_rect_x,
-		                        &mc->clients[s].window_rect_y,
-		                        &mc->clients[s].window_rect_w,
-		                        &mc->clients[s].window_rect_h);
-		mc->clients[s].hwnd_resize_pending = true;
+		uint64_t now_ns = os_monotonic_get_ns();
+		slot_animate_to(&mc->clients[s], &target_pose, new_w, new_h,
+		                now_ns, ANIM_DURATION_NS);
 	}
 
 	multi_compositor_update_input_forward(mc);
@@ -4336,6 +4433,23 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	}
 	(void)display_w_m;
 	(void)display_h_m;
+
+	// Tick animations: smoothly interpolate window poses toward targets.
+	{
+		uint64_t anim_now = os_monotonic_get_ns();
+		for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
+			if (!mc->clients[s].active || !mc->clients[s].anim.active) continue;
+			bool still_running = slot_animate_tick(&mc->clients[s], anim_now);
+			// Recompute pixel rect from interpolated pose
+			slot_pose_to_pixel_rect(sys, &mc->clients[s],
+			                        &mc->clients[s].window_rect_x,
+			                        &mc->clients[s].window_rect_y,
+			                        &mc->clients[s].window_rect_w,
+			                        &mc->clients[s].window_rect_h);
+			mc->clients[s].hwnd_resize_pending = true;
+			(void)still_running;
+		}
+	}
 
 	// Deferred HWND resize: resize app windows to their assigned sub-rects.
 	// Uses SWP_ASYNCWINDOWPOS to avoid cross-process deadlock.
