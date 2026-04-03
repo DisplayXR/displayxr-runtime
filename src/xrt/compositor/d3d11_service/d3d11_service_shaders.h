@@ -468,28 +468,34 @@ float4 PSMain(VS_OUTPUT input) : SV_Target
 //! Constant buffer layout for projection blit (SRGB conversion)
 struct BlitConstants
 {
-	float src_rect[4];      // x, y, width, height in pixels
-	float dst_offset[2];    // x, y destination offset in pixels
-	float src_size[2];      // source texture size
-	float dst_size[2];      // destination texture size
-	float convert_srgb;     // 1.0 if source is SRGB, 0.0 otherwise
-	float padding;
+	float src_rect[4];       // x, y, width, height in pixels
+	float dst_offset[2];     // x, y destination offset in pixels
+	float src_size[2];       // source texture size
+	float dst_size[2];       // destination texture size
+	float convert_srgb;      // 1.0 if source is SRGB, 0.0 otherwise; 2.0 = solid color mode
+	float quad_mode;         // > 0.5: use quad_corners instead of dst_offset + dst_rect_wh
 	float dst_rect_wh[2];   // destination quad width, height (0 = use src_rect.zw)
 	float padding2[2];
+	// Perspective quad corners packed as two float4s (avoids HLSL array padding).
+	// TL = top-left, BL = bottom-left, TR = top-right, BR = bottom-right.
+	float quad_corners_01[4]; // [TL.x, TL.y, BL.x, BL.y]
+	float quad_corners_23[4]; // [TR.x, TR.y, BR.x, BR.y]
 };
 
 //! Vertex shader for projection blit - draws a quad at specified destination
 static const char *blit_vs_hlsl = R"(
 cbuffer BlitCB : register(b0)
 {
-    float4 src_rect;      // x, y, width, height in pixels
-    float2 dst_offset;    // x, y destination offset in pixels
-    float2 src_size;      // source texture size
-    float2 dst_size;      // destination texture size
-    float convert_srgb;   // 1.0 if source is SRGB
-    float padding;
+    float4 src_rect;       // x, y, width, height in pixels
+    float2 dst_offset;     // x, y destination offset in pixels
+    float2 src_size;       // source texture size
+    float2 dst_size;       // destination texture size
+    float convert_srgb;    // 1.0 if source is SRGB; 2.0 = solid color mode
+    float quad_mode;       // > 0.5: use quad_corners for perspective quad
     float2 dst_rect_wh;   // destination quad width, height (0 = use src_rect.zw)
     float2 padding2;
+    float4 quad_corners_01; // TL.xy, BL.xy (packed as float4 to avoid HLSL array padding)
+    float4 quad_corners_23; // TR.xy, BR.xy
 };
 
 struct VS_OUTPUT
@@ -498,7 +504,7 @@ struct VS_OUTPUT
     float2 uv : TEXCOORD0;
 };
 
-// Fullscreen quad positions
+// Quad vertex positions (also used as UV coords): TL, BL, TR, BR
 static const float2 positions[4] = {
     float2(0, 0),
     float2(0, 1),
@@ -511,12 +517,24 @@ VS_OUTPUT VSMain(uint vertex_id : SV_VertexID)
     VS_OUTPUT output;
 
     float2 uv = positions[vertex_id % 4];
+    uint vid = vertex_id % 4;
 
-    // Destination quad size: use dst_rect_wh if set, else src_rect.zw (1:1)
-    float2 quad_size = (dst_rect_wh.x > 0) ? dst_rect_wh : src_rect.zw;
-
-    // Calculate destination position in NDC
-    float2 dst_pos = dst_offset + uv * quad_size;
+    float2 dst_pos;
+    if (quad_mode > 0.5) {
+        // Perspective quad mode: use pre-projected corner positions.
+        // Unpack from two float4s: TL=01.xy, BL=01.zw, TR=23.xy, BR=23.zw
+        float2 corners[4] = {
+            quad_corners_01.xy,  // TL (vertex 0)
+            quad_corners_01.zw,  // BL (vertex 1)
+            quad_corners_23.xy,  // TR (vertex 2)
+            quad_corners_23.zw   // BR (vertex 3)
+        };
+        dst_pos = corners[vid];
+    } else {
+        // Axis-aligned mode (existing path)
+        float2 quad_size = (dst_rect_wh.x > 0) ? dst_rect_wh : src_rect.zw;
+        dst_pos = dst_offset + uv * quad_size;
+    }
 
     // Convert to NDC [-1, 1]
     float2 ndc = (dst_pos / dst_size) * 2.0 - 1.0;
@@ -541,9 +559,11 @@ cbuffer BlitCB : register(b0)
     float2 src_size;
     float2 dst_size;
     float convert_srgb;
-    float padding;
+    float quad_mode;
     float2 dst_rect_wh;
     float2 padding2;
+    float4 quad_corners_01;
+    float4 quad_corners_23;
 };
 
 Texture2D src_tex : register(t0);
