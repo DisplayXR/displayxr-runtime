@@ -76,33 +76,6 @@ read_edid_from_regkey(HKEY hKey, uint16_t *out_manufacturer_id, uint16_t *out_pr
 	return true;
 }
 
-/*!
- * Get device interface path for a GDI monitor.
- * Uses EnumDisplayDevicesA with EDD_GET_DEVICE_INTERFACE_NAME.
- * Writes a prefix (up to the '{' GUID delimiter) into out_prefix.
- */
-static bool
-get_monitor_device_prefix(const char *device_name, char *out_prefix, size_t prefix_size)
-{
-	DISPLAY_DEVICEA dd;
-	memset(&dd, 0, sizeof(dd));
-	dd.cb = sizeof(dd);
-
-	if (!EnumDisplayDevicesA(device_name, 0, &dd, EDD_GET_DEVICE_INTERFACE_NAME)) {
-		return false;
-	}
-
-	// Extract prefix before '{' (the GUID part)
-	const char *brace = strchr(dd.DeviceID, '{');
-	size_t len = brace ? (size_t)(brace - dd.DeviceID) : strlen(dd.DeviceID);
-	if (len >= prefix_size) {
-		len = prefix_size - 1;
-	}
-	memcpy(out_prefix, dd.DeviceID, len);
-	out_prefix[len] = '\0';
-	return len > 0;
-}
-
 bool
 os_display_edid_enumerate(struct os_display_edid_list *out_list)
 {
@@ -117,45 +90,52 @@ os_display_edid_enumerate(struct os_display_edid_list *out_list)
 	EnumDisplayMonitors(NULL, NULL, monitor_enum_proc, (LPARAM)&gdi_ctx);
 
 	if (gdi_ctx.count == 0) {
+		out_list->diag_gdi_count = 0;
+		out_list->diag_setupdi_count = 0;
+		out_list->diag_edid_read_count = 0;
+		out_list->diag_error = OS_EDID_DIAG_NO_GDI_MONITORS;
 		return false;
 	}
 
-	// Build device path prefixes for each GDI monitor
-	char gdi_prefixes[OS_DISPLAY_EDID_MAX_MONITORS][256];
-	bool gdi_has_prefix[OS_DISPLAY_EDID_MAX_MONITORS];
-	for (uint32_t i = 0; i < gdi_ctx.count; i++) {
-		gdi_has_prefix[i] =
-		    get_monitor_device_prefix(gdi_ctx.infos[i].szDevice, gdi_prefixes[i], sizeof(gdi_prefixes[i]));
-	}
+	out_list->diag_gdi_count = gdi_ctx.count;
 
-	// Step 2: Enumerate monitor devices via SetupAPI and read EDID
+	// Step 2: Enumerate monitor devices via SetupAPI and read EDID.
+	// Use SetupDiGetClassDevsExA with DIGCF_PRESENT to get active monitors.
 	HDEVINFO dev_info =
 	    SetupDiGetClassDevsA(&GUID_DEVINTERFACE_MONITOR_LOCAL, NULL, NULL, DIGCF_DEVICEINTERFACE | DIGCF_PRESENT);
 
 	if (dev_info == INVALID_HANDLE_VALUE) {
+		out_list->diag_error = OS_EDID_DIAG_SETUPDI_FAILED;
+		out_list->diag_win32_error = GetLastError();
 		return false;
 	}
 
-	for (DWORD idx = 0;; idx++) {
+	// First pass: read all EDID data from SetupAPI devices
+	struct
+	{
+		uint16_t mfr_id;
+		uint16_t prod_id;
+		char device_path[512];
+	} setupdi_devices[OS_DISPLAY_EDID_MAX_MONITORS];
+	uint32_t setupdi_count = 0;
+
+	for (DWORD idx = 0; idx < 64; idx++) {
 		SP_DEVICE_INTERFACE_DATA iface_data;
 		memset(&iface_data, 0, sizeof(iface_data));
 		iface_data.cbSize = sizeof(iface_data);
 
 		if (!SetupDiEnumDeviceInterfaces(dev_info, NULL, &GUID_DEVINTERFACE_MONITOR_LOCAL, idx, &iface_data)) {
-			break; // No more devices
+			break;
 		}
 
 		// Get device interface detail (variable size)
 		DWORD required_size = 0;
 		SetupDiGetDeviceInterfaceDetailA(dev_info, &iface_data, NULL, 0, &required_size, NULL);
-		if (required_size == 0) {
+		if (required_size == 0 || required_size > 512) {
 			continue;
 		}
 
 		BYTE detail_buf[512];
-		if (required_size > sizeof(detail_buf)) {
-			continue;
-		}
 		SP_DEVICE_INTERFACE_DETAIL_DATA_A *detail = (SP_DEVICE_INTERFACE_DETAIL_DATA_A *)detail_buf;
 		detail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_A);
 
@@ -182,24 +162,72 @@ os_display_edid_enumerate(struct os_display_edid_list *out_list)
 			continue;
 		}
 
-		// Step 3: Correlate with GDI monitors by matching device path prefix
-		// The SetupDi device path looks like: \\?\display#xxx#yyy#{guid}
-		// The GDI device ID looks like:       \\?\DISPLAY#xxx#yyy#{guid}
-		// Match on the prefix before '{'
-		char setup_prefix[256];
-		const char *brace = strchr(detail->DevicePath, '{');
-		size_t plen = brace ? (size_t)(brace - detail->DevicePath) : strlen(detail->DevicePath);
-		if (plen >= sizeof(setup_prefix)) {
-			plen = sizeof(setup_prefix) - 1;
+		if (setupdi_count < OS_DISPLAY_EDID_MAX_MONITORS) {
+			setupdi_devices[setupdi_count].mfr_id = mfr_id;
+			setupdi_devices[setupdi_count].prod_id = prod_id;
+			strncpy(setupdi_devices[setupdi_count].device_path, detail->DevicePath,
+			        sizeof(setupdi_devices[setupdi_count].device_path) - 1);
+			setupdi_devices[setupdi_count].device_path[sizeof(setupdi_devices[setupdi_count].device_path) - 1] =
+			    '\0';
+			setupdi_count++;
 		}
-		memcpy(setup_prefix, detail->DevicePath, plen);
-		setup_prefix[plen] = '\0';
+	}
 
-		for (uint32_t g = 0; g < gdi_ctx.count; g++) {
-			if (!gdi_has_prefix[g]) {
-				continue;
+	SetupDiDestroyDeviceInfoList(dev_info);
+
+	out_list->diag_setupdi_count = setupdi_count;
+	out_list->diag_edid_read_count = setupdi_count;
+
+	if (setupdi_count == 0) {
+		out_list->diag_error = OS_EDID_DIAG_NO_EDID_DATA;
+		return false;
+	}
+
+	// Step 3: Correlate SetupDi devices with GDI monitors.
+	// For each GDI monitor, get its device ID via EnumDisplayDevicesA.
+	// Then match the prefix (before '{') against SetupDi device paths.
+	for (uint32_t g = 0; g < gdi_ctx.count; g++) {
+		// Get device ID for this GDI adapter output
+		DISPLAY_DEVICEA dd;
+		memset(&dd, 0, sizeof(dd));
+		dd.cb = sizeof(dd);
+
+		if (!EnumDisplayDevicesA(gdi_ctx.infos[g].szDevice, 0, &dd, EDD_GET_DEVICE_INTERFACE_NAME)) {
+			continue;
+		}
+
+		// Extract prefix before '{'
+		char gdi_prefix[256];
+		const char *brace = strchr(dd.DeviceID, '{');
+		size_t gdi_len = brace ? (size_t)(brace - dd.DeviceID) : strlen(dd.DeviceID);
+		if (gdi_len >= sizeof(gdi_prefix)) {
+			gdi_len = sizeof(gdi_prefix) - 1;
+		}
+		memcpy(gdi_prefix, dd.DeviceID, gdi_len);
+		gdi_prefix[gdi_len] = '\0';
+
+		// Store GDI device ID for diagnostics
+		if (g < OS_DISPLAY_EDID_MAX_MONITORS) {
+			strncpy(out_list->diag_gdi_device_ids[g], dd.DeviceID, sizeof(out_list->diag_gdi_device_ids[g]) - 1);
+		}
+
+		if (gdi_len == 0) {
+			continue;
+		}
+
+		// Try to match against SetupDi device paths
+		for (uint32_t s = 0; s < setupdi_count; s++) {
+			char setup_prefix[256];
+			const char *sbrace = strchr(setupdi_devices[s].device_path, '{');
+			size_t slen = sbrace ? (size_t)(sbrace - setupdi_devices[s].device_path)
+			                     : strlen(setupdi_devices[s].device_path);
+			if (slen >= sizeof(setup_prefix)) {
+				slen = sizeof(setup_prefix) - 1;
 			}
-			if (_stricmp(gdi_prefixes[g], setup_prefix) != 0) {
+			memcpy(setup_prefix, setupdi_devices[s].device_path, slen);
+			setup_prefix[slen] = '\0';
+
+			if (_stricmp(gdi_prefix, setup_prefix) != 0) {
 				continue;
 			}
 
@@ -209,8 +237,8 @@ os_display_edid_enumerate(struct os_display_edid_list *out_list)
 			}
 
 			struct os_display_edid_monitor *mon = &out_list->monitors[out_list->count];
-			mon->manufacturer_id = mfr_id;
-			mon->product_id = prod_id;
+			mon->manufacturer_id = setupdi_devices[s].mfr_id;
+			mon->product_id = setupdi_devices[s].prod_id;
 			mon->screen_left = gdi_ctx.rects[g].left;
 			mon->screen_top = gdi_ctx.rects[g].top;
 			mon->pixel_width = (uint32_t)(gdi_ctx.rects[g].right - gdi_ctx.rects[g].left);
@@ -227,11 +255,14 @@ os_display_edid_enumerate(struct os_display_edid_list *out_list)
 			}
 
 			out_list->count++;
-			break; // This GDI monitor is matched, move to next SetupDi device
+			break;
 		}
 	}
 
-	SetupDiDestroyDeviceInfoList(dev_info);
+	if (out_list->count == 0) {
+		out_list->diag_error = OS_EDID_DIAG_NO_CORRELATION;
+	}
+
 	return out_list->count > 0;
 }
 

@@ -24,6 +24,19 @@ extern "C" {
 #define OS_DISPLAY_EDID_MAX_MONITORS 16
 
 /*!
+ * Diagnostic error codes for EDID enumeration.
+ * Check diag_error on the list struct to understand failures.
+ */
+enum os_edid_diag_error
+{
+	OS_EDID_DIAG_OK = 0,               //!< No error
+	OS_EDID_DIAG_NO_GDI_MONITORS = 1,  //!< EnumDisplayMonitors returned 0 monitors
+	OS_EDID_DIAG_SETUPDI_FAILED = 2,   //!< SetupDiGetClassDevs failed
+	OS_EDID_DIAG_NO_EDID_DATA = 3,     //!< SetupDi found devices but no EDID in registry
+	OS_EDID_DIAG_NO_CORRELATION = 4,   //!< Got EDID data but couldn't match to GDI monitors
+};
+
+/*!
  * EDID-derived identity for a connected monitor.
  */
 struct os_display_edid_monitor
@@ -46,6 +59,14 @@ struct os_display_edid_list
 {
 	uint32_t count;
 	struct os_display_edid_monitor monitors[OS_DISPLAY_EDID_MAX_MONITORS];
+
+	// Diagnostic fields (set on both success and failure for debugging)
+	enum os_edid_diag_error diag_error; //!< What went wrong (0 = OK)
+	uint32_t diag_gdi_count;            //!< Number of GDI monitors found
+	uint32_t diag_setupdi_count;        //!< Number of SetupDi devices with EDID
+	uint32_t diag_edid_read_count;      //!< Number of EDID blobs successfully read
+	uint32_t diag_win32_error;          //!< GetLastError() value if SetupDi failed
+	char diag_gdi_device_ids[OS_DISPLAY_EDID_MAX_MONITORS][256]; //!< GDI device ID strings
 };
 
 /*!
