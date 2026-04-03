@@ -397,8 +397,8 @@ struct d3d11_service_system
 #define UI_TITLE_BAR_H_M   0.008f   //!< Title bar height: 8mm
 #define UI_BTN_W_M          0.008f   //!< Close/minimize button width: 8mm
 #define UI_TASKBAR_H_M      0.009f   //!< Taskbar height: 9mm
-#define UI_GLYPH_W_M        0.003f   //!< Glyph width: 3mm
-#define UI_GLYPH_H_M        0.006f   //!< Glyph height: 6mm
+#define UI_GLYPH_W_M        0.0035f  //!< Glyph width: 3.5mm (balanced aspect ratio)
+#define UI_GLYPH_H_M        0.005f   //!< Glyph height: 5mm
 #define UI_RESIZE_ZONE_M    0.003f   //!< Resize detection zone: 3mm
 
 //! Resize edge/corner flags (bitfield).
@@ -966,6 +966,13 @@ create_layer_resources(struct d3d11_service_system *sys)
 	if (FAILED(hr)) {
 		U_LOG_E("Failed to create rasterizer state: 0x%08lx", hr);
 		return false;
+	}
+
+	// Set default full-viewport scissor rect so non-shell rendering isn't clipped.
+	// Shell mode overrides this per-tile in multi_compositor_render().
+	{
+		D3D11_RECT full_scissor = {0, 0, 16384, 16384}; // Large enough for any display
+		sys->context->RSSetScissorRects(1, &full_scissor);
 	}
 
 	// Create depth stencil state (disabled)
