@@ -217,15 +217,24 @@ leia_edid_probe_display(struct leia_display_probe_result *out)
 	// Step 1: EDID-based hardware identification
 	struct os_display_edid_list edid_list;
 	if (!os_display_edid_enumerate(&edid_list)) {
-		U_LOG_I("EDID probe: no monitors enumerated");
+		U_LOG_W("EDID probe: no monitors enumerated (SetupAPI failed or no monitors)");
 		goto done;
+	}
+
+	U_LOG_W("EDID probe: enumerated %u monitors", edid_list.count);
+	for (uint32_t i = 0; i < edid_list.count; i++) {
+		U_LOG_W("EDID probe:   monitor[%u] mfr=0x%04X prod=0x%04X %ux%u @%d,%d %s",
+		        i, edid_list.monitors[i].manufacturer_id, edid_list.monitors[i].product_id,
+		        edid_list.monitors[i].pixel_width, edid_list.monitors[i].pixel_height,
+		        edid_list.monitors[i].screen_left, edid_list.monitors[i].screen_top,
+		        edid_list.monitors[i].is_primary ? "(primary)" : "");
 	}
 
 	const struct os_display_edid_monitor *match =
 	    os_display_edid_find_in_table(&edid_list, leia_edid_table, LEIA_EDID_TABLE_LEN);
 
 	if (match == NULL) {
-		U_LOG_I("EDID probe: no known Leia/Dimenco display found among %u monitors", edid_list.count);
+		U_LOG_W("EDID probe: no known Leia/Dimenco display matched among %u monitors", edid_list.count);
 		goto done;
 	}
 

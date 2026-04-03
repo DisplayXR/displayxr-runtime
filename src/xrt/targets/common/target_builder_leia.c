@@ -63,7 +63,7 @@ leia_estimate_system(struct xrt_builder *xb,
 			U_LOG_W("Leia 3D display detected (EDID) but SRService not running — using sim_display");
 		} else {
 			hw_found = true;
-			U_LOG_I("Leia display detected via EDID (mfr=0x%04X prod=0x%04X) at %d,%d",
+			U_LOG_W("Leia display detected via EDID (mfr=0x%04X prod=0x%04X) at %d,%d",
 			        edid_result.manufacturer_id, edid_result.product_id,
 			        edid_result.screen_left, edid_result.screen_top);
 		}
