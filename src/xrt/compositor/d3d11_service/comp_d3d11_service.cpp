@@ -4784,18 +4784,28 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		uint32_t half_w = ca_w / sys->tile_columns;
 		uint32_t half_h = ca_h / sys->tile_rows;
 
-		// Per-eye projected rects for focused slot (parallax for Z != 0)
+		int fs = mc->focused_slot;
+		bool fb_rotated = !quat_is_identity(&mc->clients[fs].window_pose.orientation);
+		float fb_hw = mc->clients[fs].window_width_m / 2.0f;
+		float fb_hh = mc->clients[fs].window_height_m / 2.0f;
+		float fb_tb_h = UI_TITLE_BAR_H_M;
+		// Border width in meters (~0.55mm, from 3px at typical display resolution)
+		float disp_w_m_fb = sys->base.info.display_width_m;
+		if (disp_w_m_fb <= 0.0f) disp_w_m_fb = 0.700f;
+		float bw_m = 3.0f * disp_w_m_fb / (float)(ca_w > 0 ? ca_w : 3840);
+		float bw = 3.0f; // border width in pixels (for non-rotated)
+
+		// Per-eye projected rects for non-rotated fallback
 		int32_t fb_eye_x[2], fb_eye_y[2], fb_eye_w[2], fb_eye_h[2];
 		for (int eye = 0; eye < 2; eye++) {
 			int ei = (eye < (int)eye_pos.count) ? eye : 0;
-			slot_pose_to_pixel_rect_for_eye(sys, &mc->clients[mc->focused_slot],
+			slot_pose_to_pixel_rect_for_eye(sys, &mc->clients[fs],
 			    eye_pos.eyes[ei].x, eye_pos.eyes[ei].y, eye_pos.eyes[ei].z,
 			    &fb_eye_x[eye], &fb_eye_y[eye],
 			    &fb_eye_w[eye], &fb_eye_h[eye]);
 		}
-		float bw = 3.0f; // border width in pixels
 
-		// Set up pipeline for solid-color draw (use blit shader with special flag)
+		// Set up pipeline
 		ID3D11RenderTargetView *ca_rtvs[] = {mc->combined_atlas_rtv.get()};
 		sys->context->OMSetRenderTargets(1, ca_rtvs, nullptr);
 		sys->context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
@@ -4808,25 +4818,23 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		sys->context->PSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
 		sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
 
-		// Draw border edges in each atlas half
+		// Full border rect in local space: content + title bar
+		// left=-hw, right=+hw, bottom=-hh, top=+hh+tb_h
+		// 4 border edge rects in local space (thin strips)
+		struct { float l, t, r, b; } border_edges_local[4] = {
+			{-fb_hw,        fb_hh+fb_tb_h,        fb_hw,        fb_hh+fb_tb_h-bw_m}, // top
+			{-fb_hw,        -fb_hh+bw_m,           fb_hw,        -fb_hh},              // bottom
+			{-fb_hw,        fb_hh+fb_tb_h-bw_m,   -fb_hw+bw_m,  -fb_hh+bw_m},        // left
+			{fb_hw-bw_m,    fb_hh+fb_tb_h-bw_m,   fb_hw,        -fb_hh+bw_m},         // right
+		};
+
 		uint32_t nv = sys->tile_columns * sys->tile_rows;
 		for (uint32_t v = 0; v < nv && v < XRT_MAX_VIEWS; v++) {
 			uint32_t col = v % sys->tile_columns;
 			uint32_t row = v / sys->tile_columns;
-			// Per-eye border rect (parallax for Z != 0)
-			int fb_eye_idx = (col < 2) ? (int)col : 0;
-			int32_t border_y = fb_eye_y[fb_eye_idx] - TITLE_BAR_HEIGHT_PX;
-			int32_t border_h = fb_eye_h[fb_eye_idx] + (fb_eye_y[fb_eye_idx] - border_y);
-			float fx = (float)fb_eye_x[fb_eye_idx] / ca_w;
-			float fy = (float)border_y / ca_h;
-			float fw = (float)fb_eye_w[fb_eye_idx] / ca_w;
-			float fh = (float)border_h / ca_h;
-			float ox = col * half_w + fx * half_w;
-			float oy = row * half_h + fy * half_h;
-			float ew = fw * half_w;
-			float eh = fh * half_h;
+			int fb_ei = (col < 2) ? (int)col : 0;
+			int ei_fb = (fb_ei < (int)eye_pos.count) ? fb_ei : 0;
 
-			// Scissor rect clips to tile bounds — uniform overflow on all edges.
 			D3D11_RECT border_scissor;
 			border_scissor.left = (LONG)(col * half_w);
 			border_scissor.top = (LONG)(row * half_h);
@@ -4834,39 +4842,64 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			border_scissor.bottom = (LONG)((row + 1) * half_h);
 			sys->context->RSSetScissorRects(1, &border_scissor);
 
-			// 4 border rects (scissor clips overflow on all edges)
-			struct { float x, y, w, h; } edges[4] = {
-				{ox,          oy,          ew,  bw},          // top
-				{ox,          oy + eh - bw, ew, bw},          // bottom
-				{ox,          oy + bw,      bw,  eh - 2*bw},  // left
-				{ox + ew - bw, oy + bw,     bw,  eh - 2*bw},  // right
+			// Non-rotated axis-aligned edge positions (fallback)
+			int32_t border_y = fb_eye_y[fb_ei] - TITLE_BAR_HEIGHT_PX;
+			int32_t border_h = fb_eye_h[fb_ei] + (fb_eye_y[fb_ei] - border_y);
+			float fx = (float)fb_eye_x[fb_ei] / ca_w;
+			float fy = (float)border_y / ca_h;
+			float fw = (float)fb_eye_w[fb_ei] / ca_w;
+			float fh = (float)border_h / ca_h;
+			float ox = col * half_w + fx * half_w;
+			float oy = row * half_h + fy * half_h;
+			float ew = fw * half_w;
+			float eh = fh * half_h;
+			struct { float x, y, w, h; } edges_aa[4] = {
+				{ox,          oy,          ew,  bw},
+				{ox,          oy + eh - bw, ew, bw},
+				{ox,          oy + bw,      bw,  eh - 2*bw},
+				{ox + ew - bw, oy + bw,     bw,  eh - 2*bw},
 			};
+
+			D3D11_VIEWPORT vp = {};
+			vp.Width = (float)ca_w; vp.Height = (float)ca_h; vp.MaxDepth = 1.0f;
+			sys->context->RSSetViewports(1, &vp);
 
 			for (int e = 0; e < 4; e++) {
 				D3D11_MAPPED_SUBRESOURCE mapped;
 				if (FAILED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
 				           D3D11_MAP_WRITE_DISCARD, 0, &mapped))) continue;
 				BlitConstants *cb = static_cast<BlitConstants *>(mapped.pData);
-				// Solid color mode: src_rect.rgb = color, convert_srgb = 2.0
-				cb->src_rect[0] = 0.0f; cb->src_rect[1] = 1.0f;  // R=0, G=1
-				cb->src_rect[2] = 1.0f; cb->src_rect[3] = 1.0f;  // B=1 → cyan
-				cb->dst_offset[0] = edges[e].x;
-				cb->dst_offset[1] = edges[e].y;
+				cb->src_rect[0] = 0.0f; cb->src_rect[1] = 1.0f;
+				cb->src_rect[2] = 1.0f; cb->src_rect[3] = 1.0f;
 				cb->src_size[0] = 1; cb->src_size[1] = 1;
-				cb->dst_size[0] = (float)ca_w;
-				cb->dst_size[1] = (float)ca_h;
-				cb->convert_srgb = 2.0f; // solid color mode
-				cb->quad_mode = 0;
-				cb->dst_rect_wh[0] = edges[e].w;
-				cb->dst_rect_wh[1] = edges[e].h;
+				cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
+				cb->convert_srgb = 2.0f;
 				cb->padding2[0] = 0; cb->padding2[1] = 0;
-				sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
 
-				D3D11_VIEWPORT vp = {};
-				vp.Width = (float)ca_w;
-				vp.Height = (float)ca_h;
-				vp.MaxDepth = 1.0f;
-				sys->context->RSSetViewports(1, &vp);
+				if (fb_rotated) {
+					float corners[8];
+					project_local_rect_for_eye(sys,
+					    &mc->clients[fs].window_pose.orientation,
+					    mc->clients[fs].window_pose.position.x,
+					    mc->clients[fs].window_pose.position.y,
+					    mc->clients[fs].window_pose.position.z,
+					    border_edges_local[e].l, border_edges_local[e].t,
+					    border_edges_local[e].r, border_edges_local[e].b,
+					    eye_pos.eyes[ei_fb].x, eye_pos.eyes[ei_fb].y, eye_pos.eyes[ei_fb].z,
+					    col, row, half_w, half_h, ca_w, ca_h, corners);
+					blit_set_quad_corners(cb, corners);
+					cb->dst_offset[0] = 0; cb->dst_offset[1] = 0;
+					cb->dst_rect_wh[0] = 0; cb->dst_rect_wh[1] = 0;
+				} else {
+					cb->quad_mode = 0;
+					cb->dst_offset[0] = edges_aa[e].x;
+					cb->dst_offset[1] = edges_aa[e].y;
+					cb->dst_rect_wh[0] = edges_aa[e].w;
+					cb->dst_rect_wh[1] = edges_aa[e].h;
+					memset(cb->quad_corners_01, 0, sizeof(cb->quad_corners_01));
+					memset(cb->quad_corners_23, 0, sizeof(cb->quad_corners_23));
+				}
+				sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
 				sys->context->Draw(4, 0);
 			}
 		}
@@ -7147,6 +7180,7 @@ comp_d3d11_service_get_client_window_metrics(struct xrt_system_compositor *xsysc
 	// pose.position.x: +X right (meters), pose.position.y: +Y up (meters)
 	float offset_x_m = slot->window_pose.position.x;
 	float offset_y_m = slot->window_pose.position.y;
+	float offset_z_m = slot->window_pose.position.z;
 
 	memset(out_metrics, 0, sizeof(*out_metrics));
 	out_metrics->display_width_m = disp_w_m;
@@ -7163,6 +7197,8 @@ comp_d3d11_service_get_client_window_metrics(struct xrt_system_compositor *xsysc
 	out_metrics->window_height_m = slot->window_height_m;
 	out_metrics->window_center_offset_x_m = offset_x_m;
 	out_metrics->window_center_offset_y_m = offset_y_m;
+	out_metrics->window_center_offset_z_m = offset_z_m;
+	out_metrics->window_orientation = slot->window_pose.orientation;
 	out_metrics->valid = true;
 
 	return true;

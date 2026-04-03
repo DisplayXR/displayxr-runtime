@@ -16,6 +16,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include "xrt_defines.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -85,6 +86,12 @@ struct xrt_window_metrics
 	float window_height_m;          //!< Window physical height (meters)
 	float window_center_offset_x_m; //!< Window center offset from display center (meters, +right)
 	float window_center_offset_y_m; //!< Window center offset from display center (meters, +up)
+	float window_center_offset_z_m; //!< Window Z offset from display plane (meters, +toward viewer)
+
+	//! Window orientation in display space (identity = flat on display surface).
+	//! When non-identity, eye positions should be transformed to window-local frame
+	//! for correct Kooima projection: local_eye = Q_inv * (eye - window_pos).
+	struct xrt_quat window_orientation;
 
 	bool valid; //!< True if all metrics are valid
 };

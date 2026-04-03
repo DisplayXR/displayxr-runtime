@@ -1256,6 +1256,9 @@ oxr_session_locate_views(struct oxr_logger *log,
 			float screen_height_m = 0.0f;
 			float eye_offset_x = 0.0f; // window center offset from display center (meters)
 			float eye_offset_y = 0.0f;
+			float eye_offset_z = 0.0f;
+			struct xrt_quat win_orient = {0, 0, 0, 1}; // identity
+			bool win_has_orientation = false;
 
 			struct xrt_window_metrics wm = {0};
 			bool have_wm = oxr_session_get_window_metrics(sess, &wm);
@@ -1267,12 +1270,20 @@ oxr_session_locate_views(struct oxr_logger *log,
 				screen_height_m = wm.window_height_m;
 				eye_offset_x = wm.window_center_offset_x_m;
 				eye_offset_y = wm.window_center_offset_y_m;
+				eye_offset_z = wm.window_center_offset_z_m;
+				win_orient = wm.window_orientation;
+				// Check if orientation is non-identity
+				win_has_orientation = (fabsf(win_orient.x) > 0.0001f ||
+				                       fabsf(win_orient.y) > 0.0001f ||
+				                       fabsf(win_orient.z) > 0.0001f ||
+				                       fabsf(win_orient.w - 1.0f) > 0.0001f);
 
 				if (should_log) {
 					U_LOG_I("Window-relative Kooima: screen=%.4fx%.4fm, "
-					        "eye_offset=(%.4f,%.4f)m",
+					        "eye_offset=(%.4f,%.4f,%.4f)m, rotated=%d",
 					        screen_width_m, screen_height_m,
-					        eye_offset_x, eye_offset_y);
+					        eye_offset_x, eye_offset_y, eye_offset_z,
+					        win_has_orientation);
 				}
 			} else if (oxr_session_get_display_dimensions(sess, &screen_width_m, &screen_height_m) &&
 			           screen_width_m > 0.0f && screen_height_m > 0.0f) {
@@ -1293,11 +1304,20 @@ oxr_session_locate_views(struct oxr_logger *log,
 				struct xrt_vec3 nominal = {0, si->nominal_viewer_y_m, si->nominal_viewer_z_m};
 				struct xrt_vec3 raw_eyes[XRT_MAX_VIEWS];
 				for (uint32_t ei = 0; ei < eye_count; ei++) {
-					// Shift eyes to be relative to window center (not display center)
-					raw_eyes[ei] = (struct xrt_vec3){
+					// Transform eye to window-local frame:
+					// 1. Subtract window position (eye relative to window center)
+					// 2. If rotated, apply inverse rotation (eye in window's local space)
+					struct xrt_vec3 delta = {
 					    adj_eyes[ei].x - eye_offset_x,
 					    adj_eyes[ei].y - eye_offset_y,
-					    adj_eyes[ei].z};
+					    adj_eyes[ei].z - eye_offset_z};
+					if (win_has_orientation) {
+						struct xrt_quat inv_q;
+						math_quat_invert(&win_orient, &inv_q);
+						math_quat_rotate_vec3(&inv_q, &delta, &raw_eyes[ei]);
+					} else {
+						raw_eyes[ei] = delta;
+					}
 				}
 				Display3DScreen scr = {screen_width_m, screen_height_m};
 				struct xrt_pose display_pose = {
