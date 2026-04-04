@@ -346,3 +346,51 @@ See `docs/reference/debug-logging.md` for full conventions.
 - Use U_LOG_W (WARN) only for one-off init, error, and lifecycle events
 - Use U_LOG_I (INFO) for recurring/throttled diagnostic logs (per-frame, per-keystroke, etc.)
 - Never add per-frame U_LOG_W calls — they cause massive log bloat
+
+## Capturing Window Screenshots (Autonomous Testing)
+
+To visually inspect the shell or any app window without user interaction:
+
+**Step 1: Find the window HWND** by process name:
+```powershell
+powershell -Command "Get-Process displayxr-service | Select-Object Id, MainWindowTitle, MainWindowHandle"
+```
+
+**Step 2: Capture the window** using PrintWindow API (replace `HWND_VALUE` with the handle from step 1):
+```powershell
+powershell -Command "Add-Type @'
+using System;
+using System.Drawing;
+using System.Runtime.InteropServices;
+public class WC2 {
+    [DllImport(\"user32.dll\")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+    [DllImport(\"user32.dll\")] public static extern bool PrintWindow(IntPtr h, IntPtr dc, uint f);
+    [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L,T,R,B; }
+    public static void Cap(long hwnd, string p) {
+        IntPtr h = new IntPtr(hwnd);
+        RECT r; GetWindowRect(h, out r);
+        int w = r.R-r.L, ht = r.B-r.T;
+        if (w <= 0 || ht <= 0) { Console.WriteLine(\"Bad size\"); return; }
+        var b = new Bitmap(w, ht);
+        var g = Graphics.FromImage(b);
+        IntPtr dc = g.GetHdc();
+        PrintWindow(h, dc, 2);
+        g.ReleaseHdc(dc);
+        b.Save(p);
+        g.Dispose(); b.Dispose();
+        Console.WriteLine(\"OK \"+w+\"x\"+ht);
+    }
+}
+'@ -ReferencedAssemblies System.Drawing; [WC2]::Cap(HWND_VALUE, 'shell_capture.png')"
+```
+
+**Step 3: View the screenshot** with the Read tool:
+```
+Read shell_capture.png
+```
+
+**Notes:**
+- The shell compositor window is owned by `displayxr-service.exe`, not the shell launcher
+- Window title is typically `DisplayXR - D3D11 Native Compositor`
+- `FindWindow` by title may fail due to encoding — use HWND from `Get-Process` instead
+- The captured image shows the composited output (all app windows, chrome, background)

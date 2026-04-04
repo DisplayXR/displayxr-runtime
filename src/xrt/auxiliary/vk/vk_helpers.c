@@ -1299,12 +1299,13 @@ vk_create_image_from_native(struct vk_bundle *vk,
 		 */
 	} else if ((handle_type & (VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT |
 	                           VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT |
-	                           VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT)) != 0) {
+	                           VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT |
+	                           VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT)) != 0) {
 
 		/*
-		 * For VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT and friends,
-		 * the size must be queried by the implementation (See VkMemoryAllocateInfo manual page)
-		 * so skip size check
+		 * For D3D11/D3D12 texture handles and opaque Win32 handles (used by
+		 * D3D11 service compositor for cross-API shell mode), the allocation
+		 * size is determined by the importing driver. Skip size check.
 		 */
 #if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_METAL)
 	} else if (handle_type == VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLTEXTURE_BIT_EXT) {

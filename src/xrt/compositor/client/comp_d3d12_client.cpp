@@ -471,12 +471,11 @@ try {
 	uint32_t image_count = xsccp.image_count;
 
 
-	if ((info->create & XRT_SWAPCHAIN_CREATE_PROTECTED_CONTENT) != 0) {
-		D3D_WARN(c,
-		         "Swapchain info is valid but this compositor doesn't support creating protected content "
-		         "swapchains!");
-		return XRT_ERROR_SWAPCHAIN_FLAG_VALID_BUT_UNSUPPORTED;
-	}
+	// Strip protected content flag — not needed for shell/IPC mode.
+	// The D3D11 service creates shared textures without content protection.
+	struct xrt_swapchain_create_info local_info = *info;
+	local_info.create = (enum xrt_swapchain_create_flags)(local_info.create & ~XRT_SWAPCHAIN_CREATE_PROTECTED_CONTENT);
+	info = &local_info;
 
 	int64_t vk_format = d3d_dxgi_format_to_vk((DXGI_FORMAT)info->format);
 	if (vk_format == 0) {

@@ -59,7 +59,9 @@ if(XRT_HAVE_OPENGL AND WIN32)
 	target_sources(
 		comp_client PRIVATE client/comp_gl_win32_client.c client/comp_gl_win32_client.h
 				    client/comp_gl_win32_glue.c
+				    client/comp_gl_d3d11_swapchain.c client/comp_gl_d3d11_swapchain.h
 		)
+	target_link_libraries(comp_client PRIVATE d3d11 dxgi)
 endif()
 
 if(APPLE AND XRT_HAVE_OPENGL AND XRT_HAVE_METAL)

@@ -229,6 +229,9 @@ struct d3d11_service_compositor
 	//! Per-client render resources (window, swap chain, display processor)
 	struct d3d11_client_render_resources render;
 
+	//! True if the client's atlas content is Y-flipped (GL clients)
+	bool atlas_flip_y;
+
 	//! Accumulated layers for the current frame
 	struct comp_layer_accum layer_accum;
 
@@ -2065,6 +2068,12 @@ compositor_create_swapchain(struct xrt_compositor *xc,
 	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
 	struct d3d11_service_system *sys = c->sys;
 
+	// Strip protected content flag — not needed for service-side shared textures.
+	// D3D12 client rejects this flag, but it's meaningless for shell mode.
+	struct xrt_swapchain_create_info local_info = *info;
+	local_info.create = (enum xrt_swapchain_create_flags)(local_info.create & ~XRT_SWAPCHAIN_CREATE_PROTECTED_CONTENT);
+	info = &local_info;
+
 	// Use single buffer like SR Hydra for WebXR compatibility
 	uint32_t image_count = 1;
 	if (image_count > XRT_MAX_SWAPCHAIN_IMAGES) {
@@ -2172,7 +2181,12 @@ compositor_create_swapchain(struct xrt_compositor *xc,
 
 		// Store NT handle - DO NOT set bit 0, allowing IPC to DuplicateHandle to client
 		sc->base.images[i].handle = (xrt_graphics_buffer_handle_t)shared_handle;
-		sc->base.images[i].size = 0; // Unknown for D3D11
+		// Calculate texture memory size for cross-API import validation (VK needs this).
+		// VK's vkGetImageMemoryRequirements adds row pitch and page alignment padding,
+		// so we round up to 1MB to ensure our reported size >= VK's requirements.
+		uint32_t bpp = dxgi_format_bytes_per_pixel(tex_desc.Format);
+		uint64_t raw_size = (uint64_t)tex_desc.Width * tex_desc.Height * bpp * tex_desc.ArraySize;
+		sc->base.images[i].size = (raw_size + 0xFFFFF) & ~(uint64_t)0xFFFFF;
 		sc->base.images[i].use_dedicated_allocation = false;
 		sc->base.images[i].is_dxgi_handle = false; // NT handle, use OpenSharedResource1
 
@@ -5038,9 +5052,15 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			if (FAILED(hr)) continue;
 			BlitConstants *cb = static_cast<BlitConstants *>(mapped.pData);
 			cb->src_rect[0] = src_px_x;
-			cb->src_rect[1] = src_px_y;
 			cb->src_rect[2] = static_cast<float>(cvw);
-			cb->src_rect[3] = static_cast<float>(cvh);
+			// GL clients render bottom-up; flip source Y to correct orientation
+			if (cc->atlas_flip_y) {
+				cb->src_rect[1] = src_px_y + static_cast<float>(cvh);
+				cb->src_rect[3] = -static_cast<float>(cvh);
+			} else {
+				cb->src_rect[1] = src_px_y;
+				cb->src_rect[3] = static_cast<float>(cvh);
+			}
 			cb->dst_offset[0] = dest_px_x;
 			cb->dst_offset[1] = dest_px_y;
 			cb->src_size[0] = static_cast<float>(client_atlas_desc.Width);
@@ -6163,6 +6183,11 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			logged_blit_path = true;
 		}
 
+		// Record flip_y for multi-compositor render (GL clients need Y-flip)
+		if (layer->data.flip_y) {
+			c->atlas_flip_y = true;
+		}
+
 		for (uint32_t eye = 0; eye < proj_view_count; eye++) {
 			float src_x = static_cast<float>(layer->data.proj.v[eye].sub.rect.offset.w);
 			float src_y = static_cast<float>(layer->data.proj.v[eye].sub.rect.offset.h);
@@ -6188,35 +6213,6 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			float dst_h = needs_scale ? tile_h : 0.0f;
 
 			if (view_is_srgb[eye] && sys->blit_vs && view_scs[eye]->images[view_img_indices[eye]].srv) {
-				wil::com_ptr<ID3D11ShaderResourceView> srgb_srv;
-				D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
-				srv_desc.Format = get_srgb_format(view_descs[eye].Format);
-				srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-				srv_desc.Texture2D.MipLevels = 1;
-				srv_desc.Texture2D.MostDetailedMip = 0;
-
-				HRESULT hr = sys->device->CreateShaderResourceView(view_textures[eye], &srv_desc, srgb_srv.put());
-				if (SUCCEEDED(hr)) {
-					blit_to_atlas_texture(sys, &c->render, srgb_srv.get(),
-					                       src_x, src_y, src_w, src_h,
-					                       static_cast<float>(view_descs[eye].Width), static_cast<float>(view_descs[eye].Height),
-					                       static_cast<float>(tile_x), static_cast<float>(tile_y),
-					                       dst_w, dst_h,
-					                       true);  // is_srgb = true
-				} else {
-					U_LOG_W("Failed to create SRGB SRV for view %u, falling back to copy", eye);
-					D3D11_BOX box = {};
-					box.left = static_cast<UINT>(src_x);
-					box.top = static_cast<UINT>(src_y);
-					box.right = static_cast<UINT>(src_x + src_w);
-					box.bottom = static_cast<UINT>(src_y + src_h);
-					box.front = 0;
-					box.back = 1;
-					// D3D11 CopySubresourceRegion silently clips to dest bounds
-					sys->context->CopySubresourceRegion(c->render.atlas_texture.get(), 0,
-					                                     tile_x, tile_y, 0,
-					                                     view_textures[eye], layer->data.proj.v[eye].sub.array_index, &box);
-				}
 			} else {
 				// Non-SRGB: use fast CopySubresourceRegion
 				// D3D11 silently clips to destination bounds — no manual clamping needed

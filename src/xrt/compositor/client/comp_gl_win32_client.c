@@ -20,6 +20,7 @@
 
 #include "client/comp_gl_win32_client.h"
 #include "client/comp_gl_memobj_swapchain.h"
+#include "client/comp_gl_d3d11_swapchain.h"
 
 #include "ogl/ogl_api.h"
 #include "ogl/wgl_api.h"
@@ -197,19 +198,20 @@ client_gl_win32_compositor_create(struct xrt_compositor_native *xcn, void *hDC, 
 		return NULL;
 	}
 
-#define CHECK_REQUIRED_EXTENSION(EXT)                                                                                  \
-	do {                                                                                                           \
-		if (!GLAD_GL_##EXT) {                                                                                  \
-			U_LOG_E("%s - Required OpenGL extension GL_" #EXT " not available", __func__);                 \
-			FreeLibrary(opengl);                                                                           \
-			return NULL;                                                                                   \
-		}                                                                                                      \
-	} while (0)
-
-	CHECK_REQUIRED_EXTENSION(EXT_memory_object); // why is this failing? the gpuinfo.org tool says I have it.
-	CHECK_REQUIRED_EXTENSION(EXT_memory_object_win32);
-
-#undef CHECK_REQUIRED_EXTENSION
+	// Prefer WGL_NV_DX_interop2 for D3D11 shared texture import (IPC/shell mode).
+	// Fall back to GL_EXT_memory_object for VK-exported handles (in-process mode).
+	client_gl_swapchain_create_func_t swapchain_create_fn = NULL;
+	if (client_gl_d3d11_interop_available()) {
+		U_LOG_W("Using WGL_NV_DX_interop2 for swapchain import");
+		swapchain_create_fn = client_gl_d3d11_swapchain_create;
+	} else if (GLAD_GL_EXT_memory_object && GLAD_GL_EXT_memory_object_win32) {
+		U_LOG_W("Using GL_EXT_memory_object for swapchain import");
+		swapchain_create_fn = client_gl_memobj_swapchain_create;
+	} else {
+		U_LOG_E("Neither WGL_NV_DX_interop2 nor GL_EXT_memory_object available");
+		FreeLibrary(opengl);
+		return NULL;
+	}
 
 
 	/*
@@ -228,7 +230,7 @@ client_gl_win32_compositor_create(struct xrt_compositor_native *xcn, void *hDC, 
 	        xcn,                               //
 	        client_gl_context_begin_locked,    //
 	        client_gl_context_end_locked,      //
-	        client_gl_memobj_swapchain_create, //
+	        swapchain_create_fn,               //
 	        NULL)) {                           //
 		U_LOG_E("Failed to init parent GL client compositor!");
 		FreeLibrary(opengl);
