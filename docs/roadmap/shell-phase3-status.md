@@ -134,8 +134,10 @@ Shell apps connect via IPC → the Kooima eye transform runs in `ipc_server_hand
 
 ## Known Issues (Inherited)
 
-### Service crash with 3+ apps (#108) — Open
-Inter-app launch delay reduced from 3s to 100ms. **2-app launch is stable.** **3+ apps crash the service** — log ends abruptly (segfault) a few frames after clients register. The `render_mutex` from Phase 2 handles the 2-client case but there's a deeper threading/D3D11 issue with 3+ simultaneous clients. Needs debugger session with 3-app repro.
+### Service crash with 3+ apps (#108) — FIXED
+**Root cause:** D3D11 device shared across multiple IPC client threads without multithread protection. Concurrent API calls from 3+ threads corrupted internal state.
+**Fix:** `ID3D11Multithread::SetMultithreadProtected(TRUE)` after device creation. Tested stable with 4 simultaneous apps. Inter-app launch delay reduced from 3s to 100ms.
+**Remaining:** Occasional black flashes during multi-app rendering (atlas texture briefly not ready). Cosmetic, not a crash.
 
 ### Apps don't survive shell exit (Phase 1A deferred)
 ESC dismisses shell, apps become invisible. Must relaunch apps after shell revival.
