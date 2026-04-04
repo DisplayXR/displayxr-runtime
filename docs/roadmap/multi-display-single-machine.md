@@ -98,7 +98,16 @@ Camera-to-display pairing is vendor-internal (e.g., Leia's FPC bundles display +
 - [ ] Populate registry at system init: run all vendor probes, resolve claims, assign factories
 - [ ] Modify compositor creation to look up DP factory from registry by monitor (instead of scalar `xsysc->info.dp_factory_*`)
 - [ ] Per-display override configuration (force sim_display on a specific monitor)
-- [ ] **External dep**: Leia SDK EXTERNAL_ROUTING mode — disable internal monitor polling, WndProc hook, canWeave checks (#111)
+- [ ] **External dep**: Vendor DPs must accept `window_handle = NULL` (no WndProc hook, phase from canvas_offset only) (#111)
+
+**HWND ownership and phase snapping:**
+
+On Windows, DWM composites the last weaved frame at new positions during drag without re-running the shader — any sub-pixel shift breaks the interlaced 3D. Vendor SDKs handle this by hooking `WM_WINDOWPOSCHANGING` to phase-snap the window to lens-aligned positions. DisplayXR does not need to know the vendor's phase grid — it just decides which DP gets the HWND.
+
+- [ ] Primary display HWND policy: determine which display has majority of window area, pass HWND only to that DP
+- [ ] Secondary DPs created with `window_handle = NULL` — weave using `canvas_offset_x/y` only
+- [ ] Primary display hot-swap: when window moves mostly onto a different display, destroy old primary DP, create new one with HWND, demote old to NULL-HWND
+- [ ] During cross-display drag: primary DP phase-snaps to its grid, secondary displays accept imperfect phase (transient)
 
 **Split-weave for spanning windows:**
 - [ ] Detect which displays a window overlaps (monitor enumeration + window rect intersection)
@@ -112,6 +121,7 @@ Camera-to-display pairing is vendor-internal (e.g., Leia's FPC bundles display +
 - [ ] Integration test: single window spanning two displays, each weaved by correct DP
 - [ ] Integration test: Leia on monitor A + sim_display on monitor B, verify correct DP routes to each
 - [ ] Test DP hot-swap: drag window fully from one monitor to another
+- [ ] Test phase snapping: drag window on primary display, verify 3D quality maintained
 
 ## Dependencies
 
