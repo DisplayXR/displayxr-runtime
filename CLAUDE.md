@@ -394,3 +394,35 @@ Read shell_capture.png
 - Window title is typically `DisplayXR - D3D11 Native Compositor`
 - `FindWindow` by title may fail due to encoding — use HWND from `Get-Process` instead
 - The captured image shows the composited output (all app windows, chrome, background)
+
+## Debugging Crashes on Windows (procdump + cdb)
+
+For ACCESS_VIOLATION or other crashes in the runtime or test apps:
+
+**Step 1: Capture a crash dump** using procdump (download from `https://live.sysinternals.com/procdump64.exe`):
+```bash
+# Launch app under procdump — catches first-chance exception and writes full dump
+procdump64.exe -accepteula -e -ma -x . path/to/app.exe
+```
+For shell mode: start the service first (`displayxr-service.exe --shell`), set `XR_RUNTIME_JSON` and `DISPLAYXR_SHELL_SESSION=1`, then launch the app under procdump.
+
+**Step 2: Analyze the dump** with cdb (installed with WinDbg):
+```bash
+CDB="/c/Program Files/WindowsApps/Microsoft.WinDbg_1.2603.20001.0_x64__8wekyb3d8bbwe/amd64/cdb.exe"
+# Get crash stack trace
+"$CDB" -z crash.dmp -c ".ecxr; kP 15; q"
+# Disassemble around crash site (replace ADDR with return address from stack)
+"$CDB" -z crash.dmp -c ".ecxr; ub ADDR L15; q"
+# Dump memory at a pointer (e.g., vtable inspection)
+"$CDB" -z crash.dmp -c ".ecxr; dqs ADDR L20; q"
+# Check registers at crash
+"$CDB" -z crash.dmp -c ".ecxr; r; q"
+```
+
+**Step 3: Map offsets to source** — Release builds lack PDBs. Use `ub` (unassemble backwards) to find the calling instruction pattern (e.g., `mov rax,[rbx+offset]; call rax` reveals a vtable call). Cross-reference the offset with struct definitions to identify the null field.
+
+**Common patterns:**
+- `call rax` with `rax=0` → null function pointer in a vtable or dispatch table
+- VK dispatch table nulls → app's VK device missing extension functions; use `submit_fallback` path
+- `ACCESS_VIOLATION writing 0x0` at `address 0x0` → calling through null function pointer (not a data write)
+- Crash in `DisplayXRClient.dll` without symbols → use `DisplayXRClient+OFFSET` with `ub` to disassemble
