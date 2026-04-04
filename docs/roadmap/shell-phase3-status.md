@@ -2,6 +2,30 @@
 
 Last updated: 2026-04-03 (branch `feature/shell-phase3-ci`)
 
+## Phase 3+ Dynamic Spatial Layouts (Experimental)
+
+Exploratory dynamic layout system — continuously-driven window poses with auto-animation and interactive drag. These are UI experiments; the interaction model needs deeper design work before productization.
+
+### Dynamic Layouts
+| Key | Mode | Description |
+|-----|------|-------------|
+| Ctrl+5 | Carousel | Full 360° circle, auto-spins ~10°/s. Title bar drag controls rotation with momentum. Content click pauses rotation + forwards to app. TAB snaps focused to front + 5s pause. Scroll adjusts radius. |
+| Ctrl+6 | Orbital | Elliptical multi-orbit. Focused window on inner orbit (largest). Others orbit at increasing radii with different speeds. |
+| Ctrl+7 | Helix | Vertical spiral staircase. Windows rotate + move up/down cyclically. |
+| Ctrl+8 | Expose | Grid overview (Mission Control style). Click a window to select and return to previous layout. |
+
+### Architecture
+- `dynamic_layout` state on `d3d11_multi_compositor`: mode, angle_offset, angular_velocity, drag state, pause_until_ns
+- `dynamic_layout_tick()`: called every frame, computes poses from layout math, updates pixel rects
+- Per-layout compute functions: `carousel_compute_pose()`, `orbital_compute_pose()`, `helix_compute_pose()`, `expose_compute_pose()`
+- Z-depth comfort: all layouts clamp Z within ±zmax where zmax = max(display_w, display_h) / 5
+
+### Other Changes
+- **Z-depth render order**: painter's algorithm (back-to-front by Z), replaces focus-based ordering
+- **Focus border in Z-order**: drawn inside per-slot render loop, not as separate post-pass
+- **Animation system**: `slot_animate_to()` + `slot_animate_tick()` with ease-out cubic, 300ms for layout transitions, 400ms for window entry
+- **Input forwarding**: rect updated every frame in dynamic mode (windows move continuously)
+
 ## What Works (from Phase 2)
 
 All Phase 2 features are on branch `feature/shell-phase2-ci`:
