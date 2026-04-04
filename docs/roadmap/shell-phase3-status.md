@@ -134,8 +134,8 @@ Shell apps connect via IPC → the Kooima eye transform runs in `ipc_server_hand
 
 ## Known Issues (Inherited)
 
-### Intermittent crash with two apps (#108)
-Service crashes intermittently when two apps run simultaneously. Race condition or D3D11 threading issue.
+### Service crash with 3+ apps (#108) — Open
+Inter-app launch delay reduced from 3s to 100ms. **2-app launch is stable.** **3+ apps crash the service** — log ends abruptly (segfault) a few frames after clients register. The `render_mutex` from Phase 2 handles the 2-client case but there's a deeper threading/D3D11 issue with 3+ simultaneous clients. Needs debugger session with 3-app repro.
 
 ### Apps don't survive shell exit (Phase 1A deferred)
 ESC dismisses shell, apps become invisible. Must relaunch apps after shell revival.
