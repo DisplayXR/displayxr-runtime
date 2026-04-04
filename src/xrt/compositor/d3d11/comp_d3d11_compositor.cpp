@@ -1306,12 +1306,14 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 				    tile_columns, tile_rows, DXGI_FORMAT_R8G8B8A8_UNORM, hwnd_w, hwnd_h,
 				    eff_canvas_x, eff_canvas_y, eff_canvas_w, eff_canvas_h);
 
-				// Copy canvas region from intermediate to shared texture at (0,0)
+				// Copy canvas region from intermediate to shared texture at (0,0).
+				// Use eff_canvas (proportionally scaled to intermediate), not
+				// c->canvas (real HWND coords) — they differ during debounce.
 				D3D11_BOX src_box = {};
-				src_box.left = (UINT)c->canvas.x;
-				src_box.top = (UINT)c->canvas.y;
-				src_box.right = (UINT)(c->canvas.x + c->canvas.w);
-				src_box.bottom = (UINT)(c->canvas.y + c->canvas.h);
+				src_box.left = (UINT)eff_canvas_x;
+				src_box.top = (UINT)eff_canvas_y;
+				src_box.right = (UINT)(eff_canvas_x + eff_canvas_w);
+				src_box.bottom = (UINT)(eff_canvas_y + eff_canvas_h);
 				src_box.front = 0;
 				src_box.back = 1;
 				c->context->CopySubresourceRegion(

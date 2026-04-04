@@ -194,6 +194,31 @@ leia_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 	viewport.MaxDepth = 1.0f;
 	ctx->RSSetViewports(1, &viewport);
 
+	// Diagnostic: log weave params (throttled to every 60 frames + on change)
+	{
+		static uint32_t frame_ctr = 0;
+		static uint32_t last_tgt_w = 0, last_tgt_h = 0;
+		static int32_t last_vp_x = -1, last_vp_y = -1;
+		static uint32_t last_vp_w = 0, last_vp_h = 0;
+		static uint32_t last_view_w = 0, last_view_h = 0;
+		bool changed = (target_width != last_tgt_w || target_height != last_tgt_h ||
+		                vp_x != last_vp_x || vp_y != last_vp_y ||
+		                vp_w != last_vp_w || vp_h != last_vp_h ||
+		                view_width != last_view_w || view_height != last_view_h);
+		if (changed || (frame_ctr % 300 == 0)) {
+			U_LOG_W("weave: target=%ux%u vp=(%d,%d %ux%u) view=%ux%u canvas=(%d,%d %ux%u)%s",
+			        target_width, target_height, vp_x, vp_y, vp_w, vp_h,
+			        view_width, view_height,
+			        canvas_offset_x, canvas_offset_y, canvas_width, canvas_height,
+			        changed ? " [CHANGED]" : "");
+			last_tgt_w = target_width; last_tgt_h = target_height;
+			last_vp_x = vp_x; last_vp_y = vp_y;
+			last_vp_w = vp_w; last_vp_h = vp_h;
+			last_view_w = view_width; last_view_h = view_height;
+		}
+		frame_ctr++;
+	}
+
 	leiasr_d3d11_weave(ldp->leiasr);
 }
 
