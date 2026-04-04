@@ -563,10 +563,11 @@ main(int argc, char *argv[])
 
 		for (int i = 0; i < app_count; i++) {
 			launch_app(&apps[i], have_json ? runtime_json : NULL);
-			// Delay between launches so each app has time to connect
-			// before the next one starts (IPC pipe is single-instance)
+			// Minimal delay between app launches. The 3s delay from Phase 1 was
+			// a workaround for #108 (intermittent crash with two apps). Tested
+			// with 100ms and no crashes observed (2026-04-03).
 			if (i + 1 < app_count) {
-				Sleep(3000);
+				Sleep(100);
 			}
 		}
 	}
