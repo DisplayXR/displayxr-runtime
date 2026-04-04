@@ -163,18 +163,34 @@ Multi compositor window is always full-screen = physical display size:
 
 ---
 
-## Phase 4: 2D App Capture
+## Phase 4: Spatial Companion
 
-**Goal:** Non-OpenXR OS windows displayed as 2D panels in 3D space.
+**Goal:** Hotkey-summoned companion that captures all open windows into a 3D workspace. Regular apps as 2D panels, DisplayXR apps in 3D. Focus-adaptive render mode (2D for flat apps, 3D for stereo). Graceful exit restores normal desktop.
 
-**Test:** Notepad or Chrome window as 2D panel alongside OpenXR 3D apps.
+**Test:** Press Ctrl+Space → all open windows appear in spatial layout. Click Notepad → 2D mode. Click cube app → 3D mode. Press Ctrl+Space again → all windows back in original positions.
+
+**Full plan:** [shell-phase4-plan.md](shell-phase4-plan.md)
 
 | | Task | Size | Repo | Description |
 |---|------|------|------|-------------|
-| [ ] | 4.1 DXGI capture | L | shell/runtime | Capture OS window content as D3D11 texture via `IDXGIOutputDuplication` or `Windows.Graphics.Capture`. |
-| [ ] | 4.2 Virtual client | M | runtime | Captured texture rendered as a quad in multi compositor — a "virtual client" with no OpenXR session. |
-| [ ] | 4.3 Window picker | M | shell | UI showing list of OS windows. Select to capture and display in 3D scene. |
-| [ ] | 4.4 Input forwarding | L | shell | Forward mouse/keyboard to original OS window via `SendMessage`/`SendInput` when focused. |
+| [ ] | 4A.1 | L | runtime | `Windows.Graphics.Capture` integration — per-HWND capture delivering `ID3D11Texture2D` frames |
+| [ ] | 4A.2 | M | runtime | Virtual client slots in multi-compositor for captured 2D windows (no OpenXR session) |
+| [ ] | 4A.3 | M | runtime | Mono texture handling — same texture for L/R eye passes, Level 2 Kooima for spatial parallax |
+| [ ] | 4B.1 | M | shell | Window enumeration — `EnumWindows` + filter for visible top-level non-system windows |
+| [ ] | 4B.2 | M | shell | App type classification — cross-reference HWNDs with IPC clients (3D) vs rest (2D capture) |
+| [ ] | 4B.3 | M | shell+runtime | Capture startup — create capture sessions, register virtual clients, assign spatial poses |
+| [ ] | 4B.4 | M | shell | State snapshot — save `WINDOWPLACEMENT`, z-order, style for restore on exit |
+| [ ] | 4C.1 | S | runtime | App type tag in slot model (`CLIENT_TYPE_OPENXR_3D` / `CLIENT_TYPE_CAPTURED_2D`) |
+| [ ] | 4C.2 | M | runtime | Snap-to-focus — focused window animates to Z=0, grows to working size |
+| [ ] | 4C.3 | M | runtime | Auto render mode switch — 2D app focused → 2D mode, 3D app → 3D mode, no focus → 3D |
+| [ ] | 4D.1 | M | runtime | Capture teardown — stop all capture sessions, release virtual client slots |
+| [ ] | 4D.2 | S | shell | 2D window restore — `SetWindowPlacement` with saved snapshot |
+| [ ] | 4D.3 | L | runtime | OpenXR app hot-switch (Phase 1A) — per-client compositor direct/export mode toggle |
+| [ ] | 4D.4 | S | shell | Shell window hide + system tray residence |
+| [ ] | 4E.1 | M | shell | Registered apps config (JSON) + launcher panel |
+| [ ] | 4E.2 | S | shell | Auto-detect app type (IPC connect within 5s → 3D, else → 2D capture) |
+
+**Dependencies:** 4A → 4B → 4C. 4D independent (parallel with 4A). 4E after 4B.
 
 ---
 
