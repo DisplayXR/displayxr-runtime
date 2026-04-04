@@ -54,8 +54,6 @@ leia_estimate_system(struct xrt_builder *xb,
 {
 	bool hw_found = false;
 
-	U_LOG_W("Leia builder: estimate_system called, trying EDID probe...");
-
 	// Try fast EDID-based detection first (no SR SDK context needed)
 	struct leia_display_probe_result edid_result;
 	if (leia_edid_probe_display(&edid_result)) {

@@ -209,8 +209,6 @@ static bool g_leia_edid_probed = false;
 bool
 leia_edid_probe_display(struct leia_display_probe_result *out)
 {
-	U_LOG_W("EDID probe: leia_edid_probe_display() called");
-
 	if (out == NULL) {
 		return false;
 	}
@@ -218,9 +216,7 @@ leia_edid_probe_display(struct leia_display_probe_result *out)
 
 	// Step 1: EDID-based hardware identification
 	struct os_display_edid_list edid_list;
-	U_LOG_W("EDID probe: calling os_display_edid_enumerate()...");
 	bool edid_ok = os_display_edid_enumerate(&edid_list);
-	U_LOG_W("EDID probe: os_display_edid_enumerate() returned %s", edid_ok ? "true" : "false");
 
 	// Always log diagnostics
 	U_LOG_W("EDID probe: gdi_monitors=%u setupdi_devices=%u edid_reads=%u correlated=%u diag=%d win32err=%u",
