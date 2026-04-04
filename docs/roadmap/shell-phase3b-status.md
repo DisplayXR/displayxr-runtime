@@ -11,7 +11,7 @@ Phase 3 (3D window positioning) is complete and merged to main. Shell mode works
 | API | Shell Mode | Error | Fix |
 |-----|-----------|-------|-----|
 | D3D11 (1-4 apps) | ✅ Stable | — | — |
-| Vulkan | ⚠️ Partial | Swapchain import works, VK render+submit OK, but xrEndFrame crashes (null ptr in IPC layer_commit). | 3B.1: Size check fixed. Pre-existing VK IPC layer_commit bug — not Phase 3B. |
+| Vulkan | ✅ Working | Fallback submit path (vkQueueWaitIdle), HUD disabled in shell mode | 3B.1: Done. VK dispatch table fix + HUD skip in shell. |
 | D3D12 | ✅ Working | Restructured to server-creates-swapchain + OpenSharedHandle import | 3B.2: Done |
 | OpenGL | ✅ Working | WGL_NV_DX_interop2 staging texture + Y-flip in multi-comp | 3B.3: Done |
 
@@ -24,7 +24,7 @@ Phase 3 (3D window positioning) is complete and merged to main. Shell mode works
 |------|--------|-------|
 | Calculate texture memory size in compositor_create_swapchain | ✅ | 1MB-aligned size from D3D11 tex desc via `dxgi_format_bytes_per_pixel()` |
 | Skip size check for opaque Win32 handles in vk_helpers.c | ✅ | Added `VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT` to skip list |
-| Test: single VK app in shell | ⚠️ | Swapchains import OK, first frame renders + submits. Crashes in xrEndFrame on HUD window-space layer (null func ptr at 0x0). Main projection layer works. |
+| Test: single VK app in shell | ✅ | `cube_handle_vk_win.exe` renders correctly — cube visible, continuous frames |
 | Test: VK + D3D11 together | | Both visible, no crash |
 
 ### 3B.2: Fix D3D12 swapchain creation (protected content flag)
