@@ -150,11 +150,21 @@ static bool
 submit_semaphore(struct client_vk_compositor *c, xrt_result_t *out_xret)
 {
 #ifdef VK_KHR_timeline_semaphore
+	// The VK client's vk_bundle uses function pointers from the app's VK device.
+	// In IPC/shell mode, the IPC compositor creates a timeline semaphore, but
+	// the app's VK dispatch table may not have the required timeline semaphore
+	// VK functions loaded (vkQueueSubmit with VkTimelineSemaphoreSubmitInfo
+	// reads from the dispatch table which may have null entries).
+	// Fall through to submit_fence or submit_fallback instead.
 	if (c->sync.xcsem == NULL) {
 		return false;
 	}
 
+	// Check if the VK device actually supports timeline semaphores
 	struct vk_bundle *vk = &c->vk;
+	if (!vk->features.timeline_semaphore || vk->vkQueueSubmit == NULL) {
+		return false;
+	}
 	VkResult ret;
 
 	VkSemaphore semaphores[1] = {
@@ -655,11 +665,15 @@ client_vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_h
 	xrt_result_t xret = XRT_SUCCESS;
 	if (submit_handle(c, sync_handle, &xret)) {
 		return xret;
+	} else if (submit_fallback(c, &xret)) {
+		// In IPC/shell mode, skip semaphore and fence paths — the app's VK
+		// device dispatch table may have null entries for extension functions
+		// that the IPC compositor's VK bundle expects. The fallback path uses
+		// only core VK functions (vkQueueWaitIdle) and is safe.
+		return xret;
 	} else if (submit_semaphore(c, &xret)) {
 		return xret;
 	} else if (submit_fence(c, &xret)) {
-		return xret;
-	} else if (submit_fallback(c, &xret)) {
 		return xret;
 	} else {
 		// Really bad state.
