@@ -1262,19 +1262,27 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			}
 
 			if (use_intermediate && c->weave_intermediate_rtv != nullptr) {
-				// Clamp canvas to fit within the (possibly stale) intermediate
-				int32_t eff_canvas_x = c->canvas.x;
-				int32_t eff_canvas_y = c->canvas.y;
-				uint32_t eff_canvas_w = c->canvas.w;
-				uint32_t eff_canvas_h = c->canvas.h;
-				if ((uint32_t)eff_canvas_x + eff_canvas_w > hwnd_w ||
-				    (uint32_t)eff_canvas_y + eff_canvas_h > hwnd_h) {
-					// Canvas exceeds intermediate — recompute for current intermediate size
-					eff_canvas_w = hwnd_w / 2;
-					eff_canvas_h = hwnd_h / 2;
-					eff_canvas_x = (int32_t)(hwnd_w / 4);
-					eff_canvas_y = (int32_t)(hwnd_h / 4);
+				// Compute canvas relative to the intermediate's dimensions.
+				// The app's c->canvas is in real HWND coordinates, but during
+				// debounce the intermediate may be at the old HWND size.
+				// Scale the canvas proportionally: same ratio within the
+				// intermediate as the app's canvas within the real HWND.
+				RECT cur_rect = {};
+				uint32_t cur_hwnd_w = hwnd_w, cur_hwnd_h = hwnd_h;
+				if (weave_hwnd != nullptr && GetClientRect(weave_hwnd, &cur_rect)) {
+					cur_hwnd_w = (uint32_t)(cur_rect.right - cur_rect.left);
+					cur_hwnd_h = (uint32_t)(cur_rect.bottom - cur_rect.top);
 				}
+				// Canvas ratios within the real HWND
+				float rx = (cur_hwnd_w > 0) ? (float)c->canvas.x / (float)cur_hwnd_w : 0.25f;
+				float ry = (cur_hwnd_h > 0) ? (float)c->canvas.y / (float)cur_hwnd_h : 0.25f;
+				float rw = (cur_hwnd_w > 0) ? (float)c->canvas.w / (float)cur_hwnd_w : 0.5f;
+				float rh = (cur_hwnd_h > 0) ? (float)c->canvas.h / (float)cur_hwnd_h : 0.5f;
+				// Apply ratios to intermediate dimensions
+				int32_t eff_canvas_x = (int32_t)(rx * hwnd_w);
+				int32_t eff_canvas_y = (int32_t)(ry * hwnd_h);
+				uint32_t eff_canvas_w = (uint32_t)(rw * hwnd_w);
+				uint32_t eff_canvas_h = (uint32_t)(rh * hwnd_h);
 
 				// Weave into HWND-sized intermediate with viewport sub-rect
 				c->context->OMSetRenderTargets(1, &c->weave_intermediate_rtv, nullptr);
