@@ -11,7 +11,7 @@ Phase 3 (3D window positioning) is complete and merged to main. Shell mode works
 | API | Shell Mode | Error | Fix |
 |-----|-----------|-------|-----|
 | D3D11 (1-4 apps) | ✅ Stable | — | — |
-| Vulkan | ⚠️ Partial | Swapchain import works, renders frames without HUD. Window-space layers crash in IPC mode. | 3B.1: Size check fixed. HUD disabled in shell mode. Service may not restart cleanly after VK crash. |
+| Vulkan | ⚠️ Partial | Swapchain import works, VK render+submit OK, but xrEndFrame crashes (null ptr in IPC layer_commit). | 3B.1: Size check fixed. Pre-existing VK IPC layer_commit bug — not Phase 3B. |
 | D3D12 | ✅ Working | Restructured to server-creates-swapchain + OpenSharedHandle import | 3B.2: Done |
 | OpenGL | ✅ Working | WGL_NV_DX_interop2 staging texture + Y-flip in multi-comp | 3B.3: Done |
 
