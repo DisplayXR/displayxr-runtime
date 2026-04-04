@@ -594,6 +594,29 @@ struct d3d11_multi_compositor
 	//! Current layout preset (-1=none, 0-4=preset index). Used for TAB Z-reorder in Stack.
 	int32_t current_layout;
 
+	//! Dynamic layout state (carousel, orbital, helix, expose).
+	//! When mode >= 0, the layout continuously drives window poses each frame.
+	struct
+	{
+		int mode;                //!< -1=inactive, 0=carousel, 1=orbital, 2=helix, 3=expose
+		float angle_offset;      //!< Current rotation angle (radians)
+		float angular_velocity;  //!< Auto-rotation speed (rad/s)
+		bool user_dragging;      //!< Mouse is controlling rotation
+		float drag_start_angle;  //!< angle_offset when drag started
+		POINT drag_start_cursor; //!< Cursor position when drag started
+		uint64_t last_tick_ns;   //!< Last frame timestamp
+		float radius_m;          //!< Layout radius (meters)
+		float base_win_w;        //!< Base window width for this layout
+		float base_win_h;        //!< Base window height for this layout
+		int prev_layout;         //!< Layout before entering dynamic mode (for expose return)
+		// Momentum tracking for drag release
+		float prev_angle_offset; //!< Previous frame's angle_offset (for velocity calculation)
+		uint64_t prev_drag_ns;   //!< Previous frame's timestamp during drag
+		// Pause state: after TAB brings a window to front, pause auto-rotation
+		uint64_t pause_until_ns; //!< Auto-rotation paused until this timestamp (0 = not paused)
+		float target_angle;      //!< Target angle to animate toward (for TAB snap-to-front)
+	} dynamic_layout;
+
 	//! Hovered button: 0=none, 1=close, 2=minimize, for the hovered slot.
 	int hover_btn;
 	int hover_btn_slot;
@@ -3109,6 +3132,7 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 		sys->multi_comp = new d3d11_multi_compositor();
 		std::memset(sys->multi_comp, 0, sizeof(*sys->multi_comp));
 		sys->multi_comp->focused_slot = -1;
+		sys->multi_comp->dynamic_layout.mode = -1; // No dynamic layout at startup
 	}
 
 	struct d3d11_multi_compositor *mc = sys->multi_comp;
@@ -3648,9 +3672,291 @@ slot_animate_tick(struct d3d11_multi_client_slot *slot, uint64_t now_ns)
 	return slot->anim.active; // true = still running
 }
 
+//! Default auto-rotation speed for dynamic layouts (~10 deg/sec).
+#define DYNAMIC_ROTATION_SPEED 0.175f
+//! Friction coefficient for momentum deceleration after drag release.
+#define DYNAMIC_FRICTION 3.0f
+
+/*!
+ * Compute the maximum comfortable Z depth: ±1/5 of max(display_w, display_h).
+ * Windows should stay within this range for comfortable viewing on the lenticular display.
+ */
+static inline float
+compute_zmax(const struct d3d11_service_system *sys)
+{
+	float dw = sys->base.info.display_width_m;
+	float dh = sys->base.info.display_height_m;
+	if (dw <= 0.0f) dw = 0.700f;
+	if (dh <= 0.0f) dh = 0.394f;
+	return (dw > dh ? dw : dh) / 5.0f;
+}
+
+/*!
+ * Compute carousel window pose for a given window index and angle offset.
+ * Full 360° circle, front window near Z=0, back windows recede within ±zmax.
+ */
+static void
+carousel_compute_pose(int idx, int n, float angle_offset, float radius_m,
+                      float base_w, float base_h, float zmax,
+                      struct xrt_pose *out_pose, float *out_w, float *out_h)
+{
+	float base_angle = (2.0f * (float)M_PI / (float)n) * idx;
+	float world_angle = base_angle + angle_offset;
+
+	out_pose->position.x = sinf(world_angle) * radius_m;
+	// Map Z so front is at Z=0, back is at -zmax (not -2*radius)
+	float raw_depth = cosf(world_angle); // +1 = front, -1 = back
+	out_pose->position.z = (raw_depth - 1.0f) * zmax * 0.5f; // front=0, back=-zmax
+	out_pose->position.y = 0.0f;
+
+	// Depth-based scaling: front = full, back = 70%
+	float depth_t = (raw_depth + 1.0f) / 2.0f; // 0=back, 1=front
+	float scale = 0.70f + 0.30f * depth_t;
+
+	*out_w = base_w * scale;
+	*out_h = base_h * scale;
+
+	// Yaw to face center
+	out_pose->orientation = quat_from_yaw(-world_angle);
+}
+
+/*!
+ * Compute orbital window pose — elliptical orbits at different radii.
+ */
+static void
+orbital_compute_pose(int idx, int n, float angle_offset, float base_radius,
+                     float base_w, float base_h, int focused_idx, float zmax,
+                     struct xrt_pose *out_pose, float *out_w, float *out_h)
+{
+	// Focused window gets innermost orbit
+	int orbit_idx = idx;
+	if (idx == focused_idx) orbit_idx = 0;
+	else if (idx < focused_idx) orbit_idx = idx + 1;
+
+	float radius_step = 0.02f;
+	float orbit_radius = base_radius + orbit_idx * radius_step;
+	float orbit_speed = 1.0f / (1.0f + orbit_idx * 0.3f);
+	float angle = angle_offset * orbit_speed + (2.0f * (float)M_PI / (float)n) * idx;
+
+	out_pose->position.x = sinf(angle) * orbit_radius * 1.5f; // wider X
+	// Clamp Z within ±zmax
+	float raw_z = cosf(angle) * orbit_radius * 0.5f - base_radius * 0.3f;
+	if (raw_z < -zmax) raw_z = -zmax;
+	if (raw_z > zmax) raw_z = zmax;
+	out_pose->position.z = raw_z;
+	out_pose->position.y = 0.0f;
+
+	float scale = (orbit_idx == 0) ? 1.0f : (0.85f - orbit_idx * 0.05f);
+	if (scale < 0.5f) scale = 0.5f;
+	*out_w = base_w * scale;
+	*out_h = base_h * scale;
+
+	out_pose->orientation = quat_from_yaw(-angle * 0.5f);
+}
+
+/*!
+ * Compute helix window pose — vertical spiral staircase.
+ */
+static void
+helix_compute_pose(int idx, int n, float angle_offset, float radius_m,
+                   float base_w, float base_h, float zmax,
+                   struct xrt_pose *out_pose, float *out_w, float *out_h)
+{
+	float base_angle = (2.0f * (float)M_PI / (float)n) * idx;
+	float world_angle = base_angle + angle_offset;
+
+	out_pose->position.x = sinf(world_angle) * radius_m;
+	// Map Z within ±zmax like carousel
+	float raw_depth = cosf(world_angle);
+	out_pose->position.z = (raw_depth - 1.0f) * zmax * 0.5f;
+	// Vertical offset: gentle spiral pitch
+	float helix_pitch_m = 0.04f; // 4cm per revolution
+	float raw_y = helix_pitch_m * (world_angle / (2.0f * (float)M_PI));
+	float range = helix_pitch_m * 1.5f;
+	out_pose->position.y = fmodf(raw_y + range / 2.0f, range) - range / 2.0f;
+
+	// Depth-based scaling
+	float depth_t = (raw_depth + 1.0f) / 2.0f;
+	float scale = 0.65f + 0.35f * depth_t;
+	*out_w = base_w * scale;
+	*out_h = base_h * scale;
+
+	out_pose->orientation = quat_from_yaw(-world_angle);
+}
+
+/*!
+ * Compute expose (grid overview) window pose.
+ */
+static void
+expose_compute_pose(int idx, int n, float disp_w_m, float disp_h_m,
+                    struct xrt_pose *out_pose, float *out_w, float *out_h)
+{
+	int cols = (int)ceilf(sqrtf((float)n));
+	if (cols < 1) cols = 1;
+	int rows = (n + cols - 1) / cols;
+	int col = idx % cols;
+	int row = idx / cols;
+
+	float margin = 0.008f; // 8mm gap between windows
+	float total_w = disp_w_m * 0.85f;
+	float total_h = disp_h_m * 0.85f;
+	float cell_w = (total_w - (cols - 1) * margin) / cols;
+	float cell_h = (total_h - (rows - 1) * margin) / rows;
+
+	out_pose->position.x = (col - (cols - 1) / 2.0f) * (cell_w + margin);
+	out_pose->position.y = ((rows - 1) / 2.0f - row) * (cell_h + margin);
+	out_pose->position.z = -0.03f; // slightly behind display
+	out_pose->orientation.x = 0; out_pose->orientation.y = 0;
+	out_pose->orientation.z = 0; out_pose->orientation.w = 1;
+
+	*out_w = cell_w;
+	*out_h = cell_h;
+}
+
+/*!
+ * Tick the dynamic layout: update angle, compute poses, apply to all windows.
+ * Called every frame when dynamic_layout.mode >= 0.
+ */
+static void
+dynamic_layout_tick(struct d3d11_service_system *sys, struct d3d11_multi_compositor *mc, uint64_t now_ns)
+{
+	auto &dl = mc->dynamic_layout;
+	if (dl.mode < 0) return;
+
+	// Compute dt
+	float dt = 0.0f;
+	if (dl.last_tick_ns > 0) {
+		dt = (float)(now_ns - dl.last_tick_ns) / 1e9f;
+		if (dt > 0.1f) dt = 0.1f; // cap at 100ms to avoid jumps
+	}
+	dl.last_tick_ns = now_ns;
+
+	// Update angle: auto-rotation when not dragging
+	if (!dl.user_dragging && dl.mode != 3) { // expose doesn't rotate
+		bool paused = (dl.pause_until_ns > 0 && now_ns < dl.pause_until_ns);
+
+		if (paused) {
+			// Animate toward target angle (TAB snap-to-front), then hold
+			float diff = dl.target_angle - dl.angle_offset;
+			if (fabsf(diff) > 0.001f) {
+				// Ease toward target
+				float snap_speed = diff * 5.0f; // arrive quickly
+				dl.angle_offset += snap_speed * dt;
+				// Don't overshoot
+				if ((diff > 0 && dl.angle_offset > dl.target_angle) ||
+				    (diff < 0 && dl.angle_offset < dl.target_angle)) {
+					dl.angle_offset = dl.target_angle;
+				}
+			} else {
+				dl.angle_offset = dl.target_angle;
+			}
+			dl.angular_velocity = 0.0f;
+		} else {
+			dl.pause_until_ns = 0;
+			dl.angle_offset += dl.angular_velocity * dt;
+			// Apply friction (exponential decay)
+			float friction = DYNAMIC_FRICTION;
+			dl.angular_velocity *= expf(-friction * dt);
+			// Ease toward target auto-rotation speed
+			float target = DYNAMIC_ROTATION_SPEED;
+			float spd_diff = target - dl.angular_velocity;
+			dl.angular_velocity += spd_diff * (1.0f - expf(-1.0f * dt));
+		}
+	}
+
+	// Collect active windows
+	int active[D3D11_MULTI_MAX_CLIENTS];
+	int n = 0;
+	for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
+		if (mc->clients[i].active && !mc->clients[i].minimized) {
+			active[n++] = i;
+		}
+	}
+	if (n == 0) return;
+
+	float disp_w_m = sys->base.info.display_width_m;
+	float disp_h_m = sys->base.info.display_height_m;
+	if (disp_w_m <= 0.0f) disp_w_m = 0.700f;
+	if (disp_h_m <= 0.0f) disp_h_m = 0.394f;
+
+	// Compute comfortable Z range: ±1/5 of max(display_w, display_h)
+	float zmax = compute_zmax(sys);
+
+	// Compute and apply poses for each window
+	for (int idx = 0; idx < n; idx++) {
+		int s = active[idx];
+		struct xrt_pose pose = {};
+		float w_m = 0, h_m = 0;
+
+		switch (dl.mode) {
+		case 0: // Carousel
+			carousel_compute_pose(idx, n, dl.angle_offset, dl.radius_m,
+			                      dl.base_win_w, dl.base_win_h, zmax, &pose, &w_m, &h_m);
+			break;
+		case 1: // Orbital
+			orbital_compute_pose(idx, n, dl.angle_offset, dl.radius_m,
+			                     dl.base_win_w, dl.base_win_h, mc->focused_slot, zmax,
+			                     &pose, &w_m, &h_m);
+			break;
+		case 2: // Helix
+			helix_compute_pose(idx, n, dl.angle_offset, dl.radius_m,
+			                   dl.base_win_w, dl.base_win_h, zmax, &pose, &w_m, &h_m);
+			break;
+		case 3: // Expose
+			expose_compute_pose(idx, n, disp_w_m, disp_h_m, &pose, &w_m, &h_m);
+			break;
+		}
+
+		mc->clients[s].window_pose = pose;
+		mc->clients[s].window_width_m = w_m;
+		mc->clients[s].window_height_m = h_m;
+		mc->clients[s].anim.active = false; // dynamic layout overrides animation
+
+		slot_pose_to_pixel_rect(sys, &mc->clients[s],
+		                        &mc->clients[s].window_rect_x,
+		                        &mc->clients[s].window_rect_y,
+		                        &mc->clients[s].window_rect_w,
+		                        &mc->clients[s].window_rect_h);
+		mc->clients[s].hwnd_resize_pending = true;
+	}
+}
+
+/*!
+ * Enter a dynamic layout mode. Initializes state and starts transition.
+ */
+static void
+enter_dynamic_layout(struct d3d11_service_system *sys, struct d3d11_multi_compositor *mc, int mode)
+{
+	float disp_w_m = sys->base.info.display_width_m;
+	float disp_h_m = sys->base.info.display_height_m;
+	if (disp_w_m <= 0.0f) disp_w_m = 0.700f;
+	if (disp_h_m <= 0.0f) disp_h_m = 0.394f;
+
+	// Un-minimize all windows
+	for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
+		if (mc->clients[i].active) mc->clients[i].minimized = false;
+	}
+
+	mc->dynamic_layout.prev_layout = mc->current_layout;
+	mc->dynamic_layout.mode = mode;
+	mc->dynamic_layout.angle_offset = 0.0f;
+	mc->dynamic_layout.angular_velocity = (mode == 3) ? 0.0f : DYNAMIC_ROTATION_SPEED;
+	mc->dynamic_layout.user_dragging = false;
+	mc->dynamic_layout.last_tick_ns = os_monotonic_get_ns();
+	mc->dynamic_layout.radius_m = 0.12f; // 12cm default radius
+	mc->dynamic_layout.base_win_w = disp_w_m * 0.40f;
+	mc->dynamic_layout.base_win_h = disp_h_m * 0.40f;
+
+	mc->current_layout = 4 + mode; // 4=carousel, 5=orbital, 6=helix, 7=expose
+
+	const char *mode_names[] = {"carousel", "orbital", "helix", "expose"};
+	U_LOG_W("Multi-comp: dynamic layout → %s", mode_names[mode]);
+}
+
 /*!
  * Apply a layout preset to all active (non-minimized) windows.
- * layout_id: 0=side-by-side, 1=stacked, 2=theater, 3=stack, 4=carousel
+ * layout_id: 0=side-by-side, 1=stacked, 2=theater, 3=stack
+ * For dynamic layouts (carousel etc.), use enter_dynamic_layout() instead.
  */
 static void
 apply_layout(struct d3d11_service_system *sys, struct d3d11_multi_compositor *mc, int layout_id)
@@ -3675,6 +3981,7 @@ apply_layout(struct d3d11_service_system *sys, struct d3d11_multi_compositor *mc
 	if (layout_id < 0 || layout_id > 4) return;
 	U_LOG_W("Multi-comp: layout %s (%d windows)", layout_names[layout_id], n);
 	mc->current_layout = layout_id;
+	mc->dynamic_layout.mode = -1; // Exit dynamic mode when entering static layout
 
 	for (int idx = 0; idx < n; idx++) {
 		int s = active[idx];
@@ -3741,28 +4048,6 @@ apply_layout(struct d3d11_service_system *sys, struct d3d11_multi_compositor *mc
 				if (new_z < -0.02f) new_z = -0.02f;
 				new_x = idx * 0.005f;  // 5mm right per layer
 				new_y = -idx * 0.005f; // 5mm down per layer
-			}
-			break;
-		}
-
-		case 4: { // Carousel: semicircle arrangement
-			float radius_m = 0.15f; // 15cm semicircle radius
-			new_w = disp_w_m * 0.45f;
-			new_h = disp_h_m * 0.45f;
-			if (n == 1) {
-				new_x = 0; new_y = 0; new_z = 0.01f;
-			} else {
-				// Spread across a 60-degree arc centered on 0
-				float total_arc = (float)(60.0 * M_PI / 180.0);
-				float angle_step = total_arc / (float)(n - 1);
-				float angle = -total_arc / 2.0f + idx * angle_step;
-				new_x = sinf(angle) * radius_m;
-				new_z = (cosf(angle) - 1.0f) * radius_m * 0.5f; // slight Z variation
-				new_y = 0;
-				// Center window slightly forward
-				if (idx == n / 2) new_z += 0.01f;
-				// Yaw to face center
-				new_orient = quat_from_yaw(-angle * 0.6f);
 			}
 			break;
 		}
@@ -3876,6 +4161,33 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			if (mc->current_layout == 3 && mc->focused_slot >= 0) {
 				apply_layout(sys, mc, 3);
 			}
+
+			// Dynamic carousel/orbital/helix: TAB rotates to bring focused window to front + pause 5s
+			if (mc->dynamic_layout.mode >= 0 && mc->dynamic_layout.mode <= 2 && mc->focused_slot >= 0) {
+				// Find the index of the focused slot among active windows
+				int active_idx = -1;
+				int n_active = 0;
+				for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
+					if (mc->clients[i].active && !mc->clients[i].minimized) {
+						if (i == mc->focused_slot) active_idx = n_active;
+						n_active++;
+					}
+				}
+				if (active_idx >= 0 && n_active > 0) {
+					// Target angle: the angle_offset that places active_idx at the front (angle=0)
+					float base_angle = (2.0f * (float)M_PI / (float)n_active) * active_idx;
+					// We want base_angle + target_offset = 0 (mod 2π) → target_offset = -base_angle
+					float target = -base_angle;
+					// Find shortest rotation from current angle
+					float diff = target - mc->dynamic_layout.angle_offset;
+					// Normalize to [-π, π]
+					while (diff > (float)M_PI) diff -= 2.0f * (float)M_PI;
+					while (diff < -(float)M_PI) diff += 2.0f * (float)M_PI;
+					mc->dynamic_layout.target_angle = mc->dynamic_layout.angle_offset + diff;
+					mc->dynamic_layout.angular_velocity = diff * 3.0f; // arrive in ~0.33s
+					mc->dynamic_layout.pause_until_ns = os_monotonic_get_ns() + 5000000000ULL; // 5 seconds
+				}
+			}
 		}
 	}
 
@@ -3893,11 +4205,16 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		}
 	}
 
-	// Layout presets: Ctrl+1-5 (1=SBS, 2=stacked, 3=theater, 4=stack, 5=carousel)
+	// Layout presets: Ctrl+1-4 static, Ctrl+5-8 dynamic
+	// 1=SBS, 2=stacked, 3=theater, 4=stack, 5=carousel, 6=orbital, 7=helix, 8=expose
 	if (GetAsyncKeyState(VK_CONTROL) & 0x8000) {
-		for (int k = '1'; k <= '5'; k++) {
+		for (int k = '1'; k <= '8'; k++) {
 			if (GetAsyncKeyState(k) & 1) {
-				apply_layout(sys, mc, k - '1');
+				if (k <= '4') {
+					apply_layout(sys, mc, k - '1');
+				} else {
+					enter_dynamic_layout(sys, mc, k - '5'); // 0=carousel, 1=orbital, 2=helix, 3=expose
+				}
 				break;
 			}
 		}
@@ -3958,6 +4275,105 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		bool lmb_just_pressed = lmb_held && !mc->prev_lmb_held;
 		mc->prev_lmb_held = lmb_held;
 
+		// Dynamic layout drag: title bar LMB controls carousel rotation.
+		// Content clicks/drags pause rotation and forward to app normally.
+		if (mc->dynamic_layout.mode >= 0 && mc->dynamic_layout.mode != 3) {
+			if (lmb_just_pressed) {
+				POINT pt;
+				GetCursorPos(&pt);
+				ScreenToClient(mc->hwnd, &pt);
+				struct shell_hit_result hit = shell_raycast_hit_test(sys, mc, pt);
+				// Close/minimize/background/taskbar → normal handler
+				if (hit.slot < 0 || hit.in_close_btn || hit.in_minimize_btn) {
+					goto normal_lmb_handling;
+				}
+				// Content click → pause rotation, focus window.
+				// Mouse events forwarded to app via WndProc input forwarding.
+				if (hit.in_content) {
+					mc->dynamic_layout.angular_velocity = 0.0f;
+					mc->dynamic_layout.pause_until_ns = UINT64_MAX; // pause until release
+					if (hit.slot != mc->focused_slot) {
+						mc->focused_slot = hit.slot;
+						multi_compositor_update_input_forward(mc);
+					}
+				}
+				// Only title bar drag controls carousel rotation
+				if (hit.slot >= 0 && hit.in_title_bar) {
+					// Start drag: capture angle + cursor
+					mc->dynamic_layout.user_dragging = true;
+					mc->dynamic_layout.drag_start_angle = mc->dynamic_layout.angle_offset;
+					mc->dynamic_layout.drag_start_cursor = pt;
+					mc->dynamic_layout.prev_angle_offset = mc->dynamic_layout.angle_offset;
+					mc->dynamic_layout.prev_drag_ns = os_monotonic_get_ns();
+					mc->dynamic_layout.angular_velocity = 0.0f; // stop auto-rotation
+					mc->dynamic_layout.pause_until_ns = 0; // cancel any TAB pause
+					// Focus the clicked window
+					if (hit.slot != mc->focused_slot) {
+						mc->focused_slot = hit.slot;
+						multi_compositor_update_input_forward(mc);
+					}
+				}
+			} else if (lmb_held && mc->dynamic_layout.user_dragging) {
+				// Drag in progress: update angle from horizontal mouse delta
+				POINT pt;
+				GetCursorPos(&pt);
+				ScreenToClient(mc->hwnd, &pt);
+				float dx_px = (float)(pt.x - mc->dynamic_layout.drag_start_cursor.x);
+				// Sensitivity: ~1 radian per half-display-width
+				float disp_px_w = (float)sys->base.info.display_pixel_width;
+				if (disp_px_w <= 0) disp_px_w = 3840;
+				float sensitivity = 2.0f / disp_px_w; // radians per pixel
+				mc->dynamic_layout.angle_offset = mc->dynamic_layout.drag_start_angle + dx_px * sensitivity;
+				// Track velocity for momentum
+				uint64_t now = os_monotonic_get_ns();
+				float drag_dt = (float)(now - mc->dynamic_layout.prev_drag_ns) / 1e9f;
+				if (drag_dt > 0.001f) {
+					float dangle = mc->dynamic_layout.angle_offset - mc->dynamic_layout.prev_angle_offset;
+					mc->dynamic_layout.angular_velocity = dangle / drag_dt;
+					mc->dynamic_layout.prev_angle_offset = mc->dynamic_layout.angle_offset;
+					mc->dynamic_layout.prev_drag_ns = now;
+				}
+			} else if (!lmb_held && mc->dynamic_layout.user_dragging) {
+				// Release: resume with momentum (angular_velocity already set from tracking)
+				mc->dynamic_layout.user_dragging = false;
+				// Clamp momentum to reasonable range
+				if (mc->dynamic_layout.angular_velocity > 3.0f) mc->dynamic_layout.angular_velocity = 3.0f;
+				if (mc->dynamic_layout.angular_velocity < -3.0f) mc->dynamic_layout.angular_velocity = -3.0f;
+			}
+			// When LMB released in dynamic mode: resume rotation after 3s pause
+			if (!lmb_held && !mc->dynamic_layout.user_dragging &&
+			    mc->dynamic_layout.pause_until_ns == UINT64_MAX) {
+				mc->dynamic_layout.pause_until_ns = os_monotonic_get_ns() + 3000000000ULL;
+				mc->dynamic_layout.target_angle = mc->dynamic_layout.angle_offset;
+			}
+			// Only skip normal LMB handling when actively carousel-dragging
+			if (mc->dynamic_layout.user_dragging) {
+				goto after_lmb_handling;
+			}
+		}
+
+		// Expose click: click a window to select it and return to previous layout
+		if (mc->dynamic_layout.mode == 3 && lmb_just_pressed) {
+			POINT pt;
+			GetCursorPos(&pt);
+			ScreenToClient(mc->hwnd, &pt);
+			struct shell_hit_result hit = shell_raycast_hit_test(sys, mc, pt);
+			if (hit.slot >= 0) {
+				mc->focused_slot = hit.slot;
+				multi_compositor_update_input_forward(mc);
+				// Return to previous layout
+				int prev = mc->dynamic_layout.prev_layout;
+				mc->dynamic_layout.mode = -1;
+				if (prev >= 0 && prev <= 3) {
+					apply_layout(sys, mc, prev);
+				} else {
+					apply_layout(sys, mc, 0); // fallback to SBS
+				}
+			}
+			goto after_lmb_handling;
+		}
+
+		normal_lmb_handling:
 		if (lmb_just_pressed && !mc->title_drag.active && !mc->resize.active) {
 			POINT pt;
 			GetCursorPos(&pt);
@@ -4240,6 +4656,20 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			}
 		}
 	}
+	after_lmb_handling:
+
+	// Scroll in dynamic mode: adjust radius
+	if (mc->dynamic_layout.mode >= 0 && mc->dynamic_layout.mode != 3) {
+		if (mc->window != nullptr) {
+			int32_t scroll = comp_d3d11_window_consume_scroll(mc->window);
+			if (scroll != 0) {
+				float delta = (float)scroll / (120.0f * 20.0f); // ~5% per notch
+				mc->dynamic_layout.radius_m *= (1.0f + delta);
+				if (mc->dynamic_layout.radius_m < 0.05f) mc->dynamic_layout.radius_m = 0.05f;
+				if (mc->dynamic_layout.radius_m > 0.30f) mc->dynamic_layout.radius_m = 0.30f;
+			}
+		}
+	}
 
 	// Right-click: title bar RMB drag = rotation, content RMB = focus + forward to app.
 	// Call GetAsyncKeyState ONCE to avoid consuming the & 1 press bit (Phase 2 lesson #4).
@@ -4434,13 +4864,21 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	(void)display_w_m;
 	(void)display_h_m;
 
-	// Tick animations: smoothly interpolate window poses toward targets.
-	{
+	// Tick dynamic layout (carousel/orbital/helix/expose) — continuously drives window poses.
+	if (mc->dynamic_layout.mode >= 0) {
+		dynamic_layout_tick(sys, mc, os_monotonic_get_ns());
+		// Update input forwarding rect every frame — windows move continuously
+		// in dynamic mode, so the forwarding rect from focus-change is stale.
+		multi_compositor_update_input_forward(mc);
+	}
+
+	// Tick per-slot animations (for static layout transitions + entry animations).
+	// Skipped when dynamic layout is active (it drives poses directly).
+	if (mc->dynamic_layout.mode < 0) {
 		uint64_t anim_now = os_monotonic_get_ns();
 		for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
 			if (!mc->clients[s].active || !mc->clients[s].anim.active) continue;
 			bool still_running = slot_animate_tick(&mc->clients[s], anim_now);
-			// Recompute pixel rect from interpolated pose
 			slot_pose_to_pixel_rect(sys, &mc->clients[s],
 			                        &mc->clients[s].window_rect_x,
 			                        &mc->clients[s].window_rect_y,
@@ -4489,18 +4927,26 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	}
 
 	// Copy client atlas → combined atlas, crop to content dims, send to DP.
-	// Render focused slot LAST so it draws on top of overlapping windows.
-	// Build a render order: non-focused first, focused last.
+	// Render order: back-to-front by Z depth (painter's algorithm).
+	// Windows farther from viewer (lower Z) render first, closer windows on top.
 	int render_order[D3D11_MULTI_MAX_CLIENTS];
 	int render_count = 0;
 	for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
-		if (mc->clients[s].active && !mc->clients[s].minimized && s != mc->focused_slot) {
+		if (mc->clients[s].active && !mc->clients[s].minimized) {
 			render_order[render_count++] = s;
 		}
 	}
-	if (mc->focused_slot >= 0 && mc->focused_slot < D3D11_MULTI_MAX_CLIENTS &&
-	    mc->clients[mc->focused_slot].active && !mc->clients[mc->focused_slot].minimized) {
-		render_order[render_count++] = mc->focused_slot;
+	// Sort by Z ascending (farthest first → closest last = on top)
+	for (int i = 0; i < render_count - 1; i++) {
+		for (int j = i + 1; j < render_count; j++) {
+			float zi = mc->clients[render_order[i]].window_pose.position.z;
+			float zj = mc->clients[render_order[j]].window_pose.position.z;
+			if (zi > zj) {
+				int tmp = render_order[i];
+				render_order[i] = render_order[j];
+				render_order[j] = tmp;
+			}
+		}
 	}
 
 	uint32_t dp_view_w = sys->view_width;
@@ -4885,140 +5331,101 @@ multi_compositor_render(struct d3d11_service_system *sys)
 				}
 			}
 		}
-	}
 
-	// (Title bar rendering is now inside the render_order loop above for correct z-ordering)
+		// Draw cyan focus border for this slot if focused (inside render_order loop for Z-depth ordering)
+		if (s == mc->focused_slot && sys->blit_vs && sys->blit_ps) {
+			bool fb_rotated = !quat_is_identity(&mc->clients[s].window_pose.orientation);
+			float fb_hw = mc->clients[s].window_width_m / 2.0f;
+			float fb_hh = mc->clients[s].window_height_m / 2.0f;
+			float fb_tb_h = UI_TITLE_BAR_H_M;
+			float disp_w_m_fb = sys->base.info.display_width_m;
+			if (disp_w_m_fb <= 0.0f) disp_w_m_fb = 0.700f;
+			float bw_m = 3.0f * disp_w_m_fb / (float)(ca_w > 0 ? ca_w : 3840);
+			float bw = 3.0f;
 
-	// Draw cyan focus border around the focused app's window rect
-	if (mc->focused_slot >= 0 && mc->focused_slot < D3D11_MULTI_MAX_CLIENTS &&
-	    mc->clients[mc->focused_slot].active && sys->blit_vs && sys->blit_ps) {
-		uint32_t ca_w = sys->base.info.display_pixel_width;
-		uint32_t ca_h = sys->base.info.display_pixel_height;
-		if (ca_w == 0) ca_w = 3840;
-		if (ca_h == 0) ca_h = 2160;
-		uint32_t half_w = ca_w / sys->tile_columns;
-		uint32_t half_h = ca_h / sys->tile_rows;
-
-		int fs = mc->focused_slot;
-		bool fb_rotated = !quat_is_identity(&mc->clients[fs].window_pose.orientation);
-		float fb_hw = mc->clients[fs].window_width_m / 2.0f;
-		float fb_hh = mc->clients[fs].window_height_m / 2.0f;
-		float fb_tb_h = UI_TITLE_BAR_H_M;
-		// Border width in meters (~0.55mm, from 3px at typical display resolution)
-		float disp_w_m_fb = sys->base.info.display_width_m;
-		if (disp_w_m_fb <= 0.0f) disp_w_m_fb = 0.700f;
-		float bw_m = 3.0f * disp_w_m_fb / (float)(ca_w > 0 ? ca_w : 3840);
-		float bw = 3.0f; // border width in pixels (for non-rotated)
-
-		// Per-eye projected rects for non-rotated fallback
-		int32_t fb_eye_x[2], fb_eye_y[2], fb_eye_w[2], fb_eye_h[2];
-		for (int eye = 0; eye < 2; eye++) {
-			int ei = (eye < (int)eye_pos.count) ? eye : 0;
-			slot_pose_to_pixel_rect_for_eye(sys, &mc->clients[fs],
-			    eye_pos.eyes[ei].x, eye_pos.eyes[ei].y, eye_pos.eyes[ei].z,
-			    &fb_eye_x[eye], &fb_eye_y[eye],
-			    &fb_eye_w[eye], &fb_eye_h[eye]);
-		}
-
-		// Set up pipeline
-		ID3D11RenderTargetView *ca_rtvs[] = {mc->combined_atlas_rtv.get()};
-		sys->context->OMSetRenderTargets(1, ca_rtvs, nullptr);
-		sys->context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-		sys->context->IASetInputLayout(nullptr);
-		sys->context->RSSetState(sys->rasterizer_state.get());
-		sys->context->OMSetDepthStencilState(sys->depth_disabled.get(), 0);
-		sys->context->VSSetShader(sys->blit_vs.get(), nullptr, 0);
-		sys->context->PSSetShader(sys->blit_ps.get(), nullptr, 0);
-		sys->context->VSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
-		sys->context->PSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
-		sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
-
-		// Full border rect in local space: content + title bar
-		// left=-hw, right=+hw, bottom=-hh, top=+hh+tb_h
-		// 4 border edge rects in local space (thin strips)
-		struct { float l, t, r, b; } border_edges_local[4] = {
-			{-fb_hw,        fb_hh+fb_tb_h,        fb_hw,        fb_hh+fb_tb_h-bw_m}, // top
-			{-fb_hw,        -fb_hh+bw_m,           fb_hw,        -fb_hh},              // bottom
-			{-fb_hw,        fb_hh+fb_tb_h-bw_m,   -fb_hw+bw_m,  -fb_hh+bw_m},        // left
-			{fb_hw-bw_m,    fb_hh+fb_tb_h-bw_m,   fb_hw,        -fb_hh+bw_m},         // right
-		};
-
-		uint32_t nv = sys->tile_columns * sys->tile_rows;
-		for (uint32_t v = 0; v < nv && v < XRT_MAX_VIEWS; v++) {
-			uint32_t col = v % sys->tile_columns;
-			uint32_t row = v / sys->tile_columns;
-			int fb_ei = (col < 2) ? (int)col : 0;
-			int ei_fb = (fb_ei < (int)eye_pos.count) ? fb_ei : 0;
-
-			D3D11_RECT border_scissor;
-			border_scissor.left = (LONG)(col * half_w);
-			border_scissor.top = (LONG)(row * half_h);
-			border_scissor.right = (LONG)((col + 1) * half_w);
-			border_scissor.bottom = (LONG)((row + 1) * half_h);
-			sys->context->RSSetScissorRects(1, &border_scissor);
-
-			// Non-rotated axis-aligned edge positions (fallback)
-			int32_t border_y = fb_eye_y[fb_ei] - TITLE_BAR_HEIGHT_PX;
-			int32_t border_h = fb_eye_h[fb_ei] + (fb_eye_y[fb_ei] - border_y);
-			float fx = (float)fb_eye_x[fb_ei] / ca_w;
-			float fy = (float)border_y / ca_h;
-			float fw = (float)fb_eye_w[fb_ei] / ca_w;
-			float fh = (float)border_h / ca_h;
-			float ox = col * half_w + fx * half_w;
-			float oy = row * half_h + fy * half_h;
-			float ew = fw * half_w;
-			float eh = fh * half_h;
-			struct { float x, y, w, h; } edges_aa[4] = {
-				{ox,          oy,          ew,  bw},
-				{ox,          oy + eh - bw, ew, bw},
-				{ox,          oy + bw,      bw,  eh - 2*bw},
-				{ox + ew - bw, oy + bw,     bw,  eh - 2*bw},
+			struct { float l, t, r, b; } border_edges_local[4] = {
+				{-fb_hw,        fb_hh+fb_tb_h,        fb_hw,        fb_hh+fb_tb_h-bw_m},
+				{-fb_hw,        -fb_hh+bw_m,           fb_hw,        -fb_hh},
+				{-fb_hw,        fb_hh+fb_tb_h-bw_m,   -fb_hw+bw_m,  -fb_hh+bw_m},
+				{fb_hw-bw_m,    fb_hh+fb_tb_h-bw_m,   fb_hw,        -fb_hh+bw_m},
 			};
 
-			D3D11_VIEWPORT vp = {};
-			vp.Width = (float)ca_w; vp.Height = (float)ca_h; vp.MaxDepth = 1.0f;
-			sys->context->RSSetViewports(1, &vp);
+			sys->context->VSSetShader(sys->blit_vs.get(), nullptr, 0);
+			sys->context->PSSetShader(sys->blit_ps.get(), nullptr, 0);
+			sys->context->VSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
+			sys->context->PSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
+			sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
+			sys->context->OMSetBlendState(sys->blend_opaque.get(), nullptr, 0xFFFFFFFF);
 
-			for (int e = 0; e < 4; e++) {
-				D3D11_MAPPED_SUBRESOURCE mapped;
-				if (FAILED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
-				           D3D11_MAP_WRITE_DISCARD, 0, &mapped))) continue;
-				BlitConstants *cb = static_cast<BlitConstants *>(mapped.pData);
-				cb->src_rect[0] = 0.0f; cb->src_rect[1] = 1.0f;
-				cb->src_rect[2] = 1.0f; cb->src_rect[3] = 1.0f;
-				cb->src_size[0] = 1; cb->src_size[1] = 1;
-				cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
-				cb->convert_srgb = 2.0f;
-				cb->padding2[0] = 0; cb->padding2[1] = 0;
+			for (uint32_t bv = 0; bv < num_views && bv < XRT_MAX_VIEWS; bv++) {
+				uint32_t bcol = bv % sys->tile_columns;
+				uint32_t brow = bv / sys->tile_columns;
+				int bei = (bcol < 2) ? (int)bcol : 0;
+				int bei2 = (bei < (int)eye_pos.count) ? bei : 0;
 
-				if (fb_rotated) {
-					float corners[8], corner_w[4];
-					project_local_rect_for_eye(sys,
-					    &mc->clients[fs].window_pose.orientation,
-					    mc->clients[fs].window_pose.position.x,
-					    mc->clients[fs].window_pose.position.y,
-					    mc->clients[fs].window_pose.position.z,
-					    border_edges_local[e].l, border_edges_local[e].t,
-					    border_edges_local[e].r, border_edges_local[e].b,
-					    eye_pos.eyes[ei_fb].x, eye_pos.eyes[ei_fb].y, eye_pos.eyes[ei_fb].z,
-					    col, row, half_w, half_h, ca_w, ca_h, corners, corner_w);
-					blit_set_quad_corners(cb, corners, corner_w);
-					cb->dst_offset[0] = 0; cb->dst_offset[1] = 0;
-					cb->dst_rect_wh[0] = 0; cb->dst_rect_wh[1] = 0;
-				} else {
-					cb->quad_mode = 0;
-					cb->dst_offset[0] = edges_aa[e].x;
-					cb->dst_offset[1] = edges_aa[e].y;
-					cb->dst_rect_wh[0] = edges_aa[e].w;
-					cb->dst_rect_wh[1] = edges_aa[e].h;
-					memset(cb->quad_corners_01, 0, sizeof(cb->quad_corners_01));
-					memset(cb->quad_corners_23, 0, sizeof(cb->quad_corners_23));
+				D3D11_RECT bsc;
+				bsc.left = (LONG)(bcol * half_w); bsc.top = (LONG)(brow * half_h);
+				bsc.right = (LONG)((bcol+1) * half_w); bsc.bottom = (LONG)((brow+1) * half_h);
+				sys->context->RSSetScissorRects(1, &bsc);
+
+				// Non-rotated fallback positions
+				int32_t brd_y = eye_rect_y[bei] - TITLE_BAR_HEIGHT_PX;
+				int32_t brd_h = eye_rect_h[bei] + (eye_rect_y[bei] - brd_y);
+				float bfx = (float)eye_rect_x[bei] / ca_w;
+				float bfy = (float)brd_y / ca_h;
+				float bfw = (float)eye_rect_w[bei] / ca_w;
+				float bfh = (float)brd_h / ca_h;
+				float box = bcol * half_w + bfx * half_w;
+				float boy = brow * half_h + bfy * half_h;
+				float bew = bfw * half_w;
+				float beh = bfh * half_h;
+				struct { float x, y, w, h; } edges_aa[4] = {
+					{box,          boy,          bew, bw},
+					{box,          boy+beh-bw,   bew, bw},
+					{box,          boy+bw,       bw,  beh-2*bw},
+					{box+bew-bw,   boy+bw,       bw,  beh-2*bw},
+				};
+
+				D3D11_VIEWPORT bvp = {};
+				bvp.Width = (float)ca_w; bvp.Height = (float)ca_h; bvp.MaxDepth = 1.0f;
+				sys->context->RSSetViewports(1, &bvp);
+
+				for (int e = 0; e < 4; e++) {
+					D3D11_MAPPED_SUBRESOURCE mapped;
+					if (FAILED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
+					           D3D11_MAP_WRITE_DISCARD, 0, &mapped))) continue;
+					BlitConstants *cb = static_cast<BlitConstants *>(mapped.pData);
+					cb->src_rect[0] = 0; cb->src_rect[1] = 1; cb->src_rect[2] = 1; cb->src_rect[3] = 1;
+					cb->src_size[0] = 1; cb->src_size[1] = 1;
+					cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
+					cb->convert_srgb = 2.0f; cb->padding2[0] = 0; cb->padding2[1] = 0;
+					if (fb_rotated) {
+						float corners[8], cw[4];
+						project_local_rect_for_eye(sys, &mc->clients[s].window_pose.orientation,
+						    mc->clients[s].window_pose.position.x, mc->clients[s].window_pose.position.y,
+						    mc->clients[s].window_pose.position.z,
+						    border_edges_local[e].l, border_edges_local[e].t,
+						    border_edges_local[e].r, border_edges_local[e].b,
+						    eye_pos.eyes[bei2].x, eye_pos.eyes[bei2].y, eye_pos.eyes[bei2].z,
+						    bcol, brow, half_w, half_h, ca_w, ca_h, corners, cw);
+						blit_set_quad_corners(cb, corners, cw);
+						cb->dst_offset[0] = 0; cb->dst_offset[1] = 0;
+						cb->dst_rect_wh[0] = 0; cb->dst_rect_wh[1] = 0;
+					} else {
+						cb->quad_mode = 0;
+						cb->dst_offset[0] = edges_aa[e].x; cb->dst_offset[1] = edges_aa[e].y;
+						cb->dst_rect_wh[0] = edges_aa[e].w; cb->dst_rect_wh[1] = edges_aa[e].h;
+						memset(cb->quad_corners_01, 0, sizeof(cb->quad_corners_01));
+						memset(cb->quad_corners_23, 0, sizeof(cb->quad_corners_23));
+					}
+					sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
+					sys->context->Draw(4, 0);
 				}
-				sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
-				sys->context->Draw(4, 0);
 			}
 		}
 	}
+
+	// (Title bar + focus border rendering is inside the render_order loop for correct z-ordering)
 
 	// Reset scissor to full atlas for non-tiled draws (taskbar, DP processing)
 	{
