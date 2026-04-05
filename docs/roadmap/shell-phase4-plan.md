@@ -2,16 +2,18 @@
 
 ## Prerequisites
 
-Phase 3 is complete on branch `feature/shell-phase3-ci` (merged to main). All features working:
+Phase 3 and 3B are complete (merged to main). All features working:
 - Z-depth positioning with per-eye parallax (Shift+Scroll, [/] keys)
 - Perspective-correct rotated windows (RMB drag on title bar)
 - 3D layout presets: Theater (Ctrl+3), Stack (Ctrl+4), Carousel (Ctrl+5)
-- D3D11 multithread protection (stable with 4+ apps)
+- D3D11 multithread protection (stable with 4+ apps, #108 fixed)
 - Inter-app launch delay reduced to 100ms
-
-Phase 3B (cross-API shell support) is in progress on `feature/shell-phase3b-ci` — GL/VK/D3D12 apps in shell. Phase 4 can begin in parallel since it's orthogonal (new texture source, not new API import).
+- Cross-API shell: D3D11, D3D12, Vulkan, OpenGL all working in shell individually and simultaneously (#116 fixed)
+- Multi-app black frame flash fix (#121)
 
 See `shell-phase3-status.md` and `shell-phase3b-status.md` for full details.
+
+**Development branch:** `feature/shell-phase4-ci` (off main)
 
 ### Known Issues Carried Forward
 
@@ -315,7 +317,7 @@ With 10 windows (5 captured + 5 OpenXR), total compositor overhead is ~6ms — w
 | Dependency | Status | Notes |
 |------------|--------|-------|
 | Phase 3 (3D positioning) | Complete | Required for spatial layout of captured windows |
-| Phase 3B (cross-API) | In progress | Nice-to-have for GL/VK OpenXR apps in shell |
+| Phase 3B (cross-API) | Complete | GL/VK/D3D12 apps work in shell |
 | Phase 1A (hot-switch) | Deferred → resolved in 4D | Proper exit path |
 | Windows 10 2004+ | Required | For programmatic `GraphicsCaptureItem` creation |
 | D3D11 multithread protection | Complete (#108) | Required for concurrent capture + IPC clients |
