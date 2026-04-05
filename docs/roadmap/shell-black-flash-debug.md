@@ -89,7 +89,13 @@ The "one window at a time" pattern is a beat frequency between each client's bli
 - **Pro:** Reduces contention, each render sees more clients' atlases fully written
 - **Con:** Adds latency for some clients
 
-## Recommended Next Step
+## Resolution
+
+**Fixed** (commit b4c24ab4d) using a combination of:
+- **Skip per-client atlas clear in shell mode** — the blit overwrites the same tiles each frame, so clearing to black is unnecessary and creates a race window where the render reads a black atlas.
+- **Throttle renders to ~1 per VSync** — instead of rendering on every client's `layer_commit`, skip render if <16ms since last render. Reduces concurrent atlas access.
+
+## Original Recommended Next Step (for reference)
 
 **Try approach C first** (single `CopyResource` instead of per-view `CopySubresourceRegion`). This is the key insight: the per-view blit loop does 2+ separate `CopySubresourceRegion` calls to write the per-client atlas. Between these calls, another thread's render can read the partially-written atlas. A single `CopyResource` is atomic from D3D11 multithread protection's perspective — the render thread either sees the old atlas or the new one, never a partial.
 
