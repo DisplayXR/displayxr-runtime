@@ -668,6 +668,10 @@ struct d3d11_multi_compositor
 	std::atomic<bool> capture_render_running{false}; //!< Thread run flag
 	uint32_t capture_client_count{0};            //!< Number of active capture-type slots
 	//! @}
+
+	//! True when display is in 2D mode due to capture client focus.
+	//! Tracked separately from sys->hardware_display_3d to detect transitions.
+	bool capture_forced_2d;
 };
 
 
@@ -5300,6 +5304,57 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			                        &mc->clients[s].window_rect_h);
 			mc->clients[s].hwnd_resize_pending = true;
 			(void)still_running;
+		}
+	}
+
+	// 2D/3D display mode auto-switch based on focused client type.
+	// When a capture (2D) window gets focus → switch to 2D mode.
+	// When an IPC (3D) app gets focus → restore 3D mode.
+	// Uses the same mechanism as V-key toggle: changes active_rendering_mode_index,
+	// calls request_display_mode on DP, and sync_tile_layout. Extension apps
+	// receive XrEventDataRenderingModeChangedEXT + XrEventDataHardwareDisplayStateChangedEXT
+	// automatically via the OXR session's per-frame mode index polling.
+	{
+		bool want_2d = false;
+		if (mc->focused_slot >= 0 && mc->focused_slot < D3D11_MULTI_MAX_CLIENTS &&
+		    mc->clients[mc->focused_slot].active &&
+		    mc->clients[mc->focused_slot].client_type == CLIENT_TYPE_CAPTURE) {
+			want_2d = true;
+		}
+
+		if (want_2d != mc->capture_forced_2d) {
+			mc->capture_forced_2d = want_2d;
+
+			struct xrt_device *head = (sys->xsysd != nullptr)
+			    ? sys->xsysd->static_roles.head : nullptr;
+
+			if (head != nullptr && head->hmd != NULL) {
+				if (want_2d) {
+					// Save current 3D mode index before switching to 2D
+					uint32_t cur = head->hmd->active_rendering_mode_index;
+					if (cur < head->rendering_mode_count &&
+					    head->rendering_modes[cur].hardware_display_3d) {
+						sys->last_3d_mode_index = cur;
+					}
+					head->hmd->active_rendering_mode_index = 0; // Mode 0 = 2D mono
+				} else {
+					// Restore 3D mode
+					head->hmd->active_rendering_mode_index = sys->last_3d_mode_index;
+				}
+			}
+
+			// Switch display HW mode
+			if (mc->display_processor != nullptr) {
+				xrt_display_processor_d3d11_request_display_mode(
+				    mc->display_processor, !want_2d);
+			}
+
+			sync_tile_layout(sys);
+			sys->hardware_display_3d = !want_2d;
+
+			U_LOG_W("Multi-comp: auto display mode → %s (focused slot %d, type=%s)",
+			        want_2d ? "2D" : "3D", mc->focused_slot,
+			        want_2d ? "capture" : "IPC");
 		}
 	}
 
