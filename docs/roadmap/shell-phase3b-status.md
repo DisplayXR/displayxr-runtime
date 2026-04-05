@@ -1,84 +1,73 @@
 # Shell Phase 3B — Implementation Status
 
-Last updated: 2026-04-04 01:19 (branch `feature/shell-phase3b-ci`)
+Last updated: 2026-04-04 (branch `feature/shell-phase3b-ci`)
 
-## Prerequisites
+## Summary
 
-Phase 3 (3D window positioning) is complete and merged to main. Shell mode works with D3D11 apps (1-4 simultaneous). Phase 3B adds cross-API support (GL, VK, D3D12).
+**Phase 3B is complete.** All 4 graphics APIs (D3D11, D3D12, Vulkan, OpenGL) work in shell/IPC mode, both individually and simultaneously. The multi-client crash (#116) is fixed.
 
-## Current Test Matrix
+## Test Matrix
 
-| API | Shell Mode | Error | Fix |
-|-----|-----------|-------|-----|
-| D3D11 (1-4 apps) | ✅ Stable | — | — |
-| Vulkan | ✅ Working | Fallback submit path (vkQueueWaitIdle), HUD disabled in shell mode | 3B.1: Done. VK dispatch table fix + HUD skip in shell. |
-| D3D12 | ✅ Working | Restructured to server-creates-swapchain + OpenSharedHandle import | 3B.2: Done |
-| OpenGL | ✅ Working | WGL_NV_DX_interop2 staging texture + Y-flip in multi-comp | 3B.3: Done |
+| API | Single App | Multi-Client | Notes |
+|-----|-----------|-------------|-------|
+| D3D11 | ✅ | ✅ (4 apps) | Baseline, unchanged |
+| D3D12 | ✅ | ✅ (with D3D11) | Server-creates-swapchain + OpenSharedHandle |
+| Vulkan | ✅ | ✅ (with D3D11) | Fallback submit path, HUD disabled in shell |
+| OpenGL | ✅ | ✅ (with D3D11) | WGL_NV_DX_interop2 staging texture + Y-flip |
+| All 4 simultaneous | ✅ | ✅ | 5 clients (shell + 4 apps), stable |
 
-## Phase 3B Progress
+## Completed Tasks
 
-### 3B.1: Fix Vulkan swapchain import (size=0)
-**Status:** Done — tested ✅
+### 3B.1: Fix Vulkan swapchain import
+- Added `dxgi_format_bytes_per_pixel()` helper, calculate texture memory size
+- Skip VK size check for `OPAQUE_WIN32_BIT` handles in `vk_helpers.c`
+- Fix VK client dispatch table crash: use `submit_fallback` (vkQueueWaitIdle) before semaphore/fence paths — app's VK device may lack extension function pointers
+- Disable HUD (window-space layers) in shell mode — separate IPC issue
 
-| Task | Status | Notes |
-|------|--------|-------|
-| Calculate texture memory size in compositor_create_swapchain | ✅ | 1MB-aligned size from D3D11 tex desc via `dxgi_format_bytes_per_pixel()` |
-| Skip size check for opaque Win32 handles in vk_helpers.c | ✅ | Added `VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT` to skip list |
-| Test: single VK app in shell | ✅ | `cube_handle_vk_win.exe` renders correctly — cube visible, continuous frames |
-| Test: VK + D3D11 together | | Both visible, no crash |
+### 3B.2: Fix D3D12 swapchain
+- Strip `XRT_SWAPCHAIN_CREATE_PROTECTED_CONTENT` in service and D3D12 client
+- Restructured D3D12 client to server-creates-swapchain pattern (matching D3D11): service creates shared textures, client imports via `OpenSharedHandle`
 
-### 3B.2: Fix D3D12 swapchain creation (protected content flag)
-**Status:** Partial — flag stripped, but D3D12 import has deeper issue
+### 3B.3: Fix GL client import
+- New `comp_gl_d3d11_swapchain.c`: WGL_NV_DX_interop2 import path
+- Staging texture approach: shared texture has KeyedMutex (incompatible with WGL), so create a plain staging texture for WGL registration, copy between them in acquire/release
+- KeyedMutex acquire/release in copy for cross-device memory barrier
+- Y-flip: GL renders bottom-up; multi-comp blit flips source UV via `atlas_flip_y` flag
+- Auto-detects WGL_NV_DX_interop2, falls back to GL_EXT_memory_object
 
-| Task | Status | Notes |
-|------|--------|-------|
-| Strip XRT_SWAPCHAIN_CREATE_PROTECTED_CONTENT in service | ✅ | Stripped in `compositor_create_swapchain` via local_info copy |
-| Strip XRT_SWAPCHAIN_CREATE_PROTECTED_CONTENT in D3D12 client | ✅ | Stripped in `comp_d3d12_client.cpp` — Unity apps no longer rejected |
-| Test: single D3D12 app in shell | ✅ | `cube_handle_d3d12_win.exe` renders correctly — cube visible, right-side up |
-| Test: Unity D3D12 app in shell | | Needs testing |
+### 3B.4: KeyedMutex coordination — verified correct
+- Atlas textures are service-local (not cross-process shared)
+- layer_commit handles KeyedMutex on swapchain images
+- multi_compositor_render reads atlas SRVs on same D3D11 device — no mutex needed
 
-### 3B.3: Fix GL client import (WGL_NV_DX_interop)
-**Status:** Done (code complete, needs runtime test)
+### 3B.5: Multi-API smoke test — passed
+- All 4 APIs running simultaneously in shell (screenshot verified)
+- 2x2 grid default layout so apps don't overlap
 
-| Task | Status | Notes |
-|------|--------|-------|
-| Add WGL_NV_DX_interop extension loading | ✅ | `comp_gl_d3d11_swapchain.c` — cached function pointers, graceful fallback to memobj |
-| GL client: import D3D11 shared textures as GL textures | ✅ | `wglDXOpenDeviceNV` + `OpenSharedResource1` + `wglDXRegisterObjectNV` per image |
-| GL client: DX lock/unlock in acquire/release | ✅ | `wglDXLockObjectsNV` in acquire, `glFlush` + `wglDXUnlockObjectsNV` in release |
-| comp_gl_win32_client.c: prefer DX interop over memobj | ✅ | Auto-detects WGL_NV_DX_interop2, falls back to GL_EXT_memory_object |
-| CMakeLists.txt: add new files and link d3d11 dxgi | ✅ | |
-| Test: single GL app in shell | ✅ | `cube_handle_gl_win.exe` renders correctly — cube visible, right-side up |
-| Test: GL + D3D11 together | ❌ | Service crashes when GL client joins alongside D3D11 client — pre-existing #116 |
+## Bonus Fixes
 
-### 3B.4: KeyedMutex coordination
-**Status:** Verified — no code changes needed
+### #116: Multi-client crash (FIXED)
+**Root cause:** Race condition in `multi_compositor_ensure_output`. Multiple IPC client threads called it concurrently when apps connected simultaneously, causing double display processor creation and SR SDK state corruption.
+**Fix:** `std::lock_guard<std::recursive_mutex>` on `render_mutex` at the top of `ensure_output`.
 
-| Task | Status | Notes |
-|------|--------|-------|
-| Verify multi-comp acquires/releases mutex per client | ✅ | Atlas textures are service-local (not cross-process shared). layer_commit handles KeyedMutex on swapchain images. multi_compositor_render reads atlas SRVs on same D3D11 device — no mutex needed. |
-| Test: 4-API simultaneous | | D3D11 + GL + VK + D3D12 all rendering |
+### Default window layout
+Apps 3+ were placed on top of app 2 (all at top-right). Now uses 2x2 grid: top-left, top-right, bottom-left, bottom-right. Slots 5+ cascade with small offset.
 
-### 3B.5: Multi-API smoke test
-**Status:** Not started
+## Known Limitations
 
-| Task | Status | Notes |
-|------|--------|-------|
-| All 4 APIs in carousel mode | | Ctrl+5 with 4 different API apps |
+- **VK window-space layers:** HUD (XrCompositionLayerWindowSpaceEXT) disabled in shell mode due to null function pointer in VK IPC path. Standalone VK app HUD works fine.
+- **VK standalone regression:** None — VK native compositor path unaffected.
 
 ## Key Source Files
 
 | File | Role |
 |------|------|
-| `src/xrt/compositor/d3d11_service/comp_d3d11_service.cpp` | Service compositor: swapchain creation (~line 2061), multi-comp render |
-| `src/xrt/compositor/client/comp_d3d12_client.cpp` | D3D12 client: flag check (line 474-478) |
-| `src/xrt/compositor/client/comp_gl_client.c` | GL client: swapchain creation (line 456-525) |
-| `src/xrt/auxiliary/vk/vk_helpers.c` | VK import: `vk_create_image_from_native` (line 1076-1332) |
-
-## How to Build and Test
-
-```bash
-scripts\build_windows.bat build && scripts\build_windows.bat test-apps
-_package\bin\displayxr-shell.exe test_apps\cube_handle_vk_win\build\cube_handle_vk_win.exe
-```
-
-See `shell-phase3b-plan.md` for full test procedure and architecture details.
+| `src/xrt/compositor/d3d11_service/comp_d3d11_service.cpp` | Service compositor, multi-comp render, ensure_output mutex, Y-flip, grid layout |
+| `src/xrt/compositor/client/comp_gl_d3d11_swapchain.c` | NEW: GL WGL_NV_DX_interop2 swapchain import |
+| `src/xrt/compositor/client/comp_d3d12_client.cpp` | D3D12 server-creates-swapchain restructure |
+| `src/xrt/compositor/client/comp_vk_client.c` | VK fallback submit path |
+| `src/xrt/auxiliary/vk/vk_helpers.c` | VK size check skip for OPAQUE_WIN32_BIT |
+| `src/xrt/auxiliary/d3d/d3d_dxgi_formats.h` | dxgi_format_bytes_per_pixel() |
+| `src/xrt/compositor/client/comp_gl_win32_client.c` | GL interop path selection |
+| `src/xrt/compositor/CMakeLists.txt` | GL D3D11 swapchain build config |
+| `test_apps/cube_handle_vk_win/main.cpp` | VK HUD skip in shell mode |

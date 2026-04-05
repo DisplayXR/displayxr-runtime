@@ -15,7 +15,7 @@ See the [milestone tracker](https://github.com/dfattal/openxr-3d-display/milesto
 - **M3: Test Coverage** — #30, #31, #33 open.
 - **M4: Display Extensions** — Next major focus. Lock down extension API surface (#3, #8, #38). #5 closed (superseded by #77).
 - **M5: Interface Standardization** — #45, #46, #47 open.
-- **M6: Spatial Shell** — #43, #44 open.
+- **M6: Spatial Shell** — #43, #44 open. Phase 3B complete: all 4 APIs (D3D11, D3D12, GL, VK) working in shell individually and simultaneously. #116 (multi-client crash) fixed.
 
 ### Architecture
 

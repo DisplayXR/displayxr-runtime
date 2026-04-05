@@ -139,8 +139,20 @@ Shell apps connect via IPC → the Kooima eye transform runs in `ipc_server_hand
 **Fix:** `ID3D11Multithread::SetMultithreadProtected(TRUE)` after device creation. Tested stable with 4 simultaneous apps. Inter-app launch delay reduced from 3s to 100ms.
 **Remaining:** Occasional black flashes during multi-app rendering (atlas texture briefly not ready). Cosmetic, not a crash.
 
+### Multi-client crash with cross-API apps (#116) — FIXED in Phase 3B
+**Root cause:** Race condition in `multi_compositor_ensure_output` — concurrent IPC threads created the display processor twice, corrupting SR SDK state.
+**Fix:** `std::lock_guard` on `render_mutex` in `ensure_output`. All 4 APIs (D3D11, D3D12, VK, GL) now run simultaneously.
+
 ### Apps don't survive shell exit (Phase 1A deferred)
 ESC dismisses shell, apps become invisible. Must relaunch apps after shell revival.
+
+## Phase 3B: Cross-API Shell Support — COMPLETE
+
+Phase 3B extends shell mode to all graphics APIs. See `shell-phase3b-status.md` for full details.
+- **D3D12:** Server-creates-swapchain restructure + OpenSharedHandle import
+- **OpenGL:** WGL_NV_DX_interop2 staging texture + Y-flip in multi-comp blit
+- **Vulkan:** Size check fix + dispatch table fallback + HUD skip in shell mode
+- **All 4 APIs tested simultaneously** — stable, no crashes
 
 ## Key Source Files
 
