@@ -8257,13 +8257,31 @@ comp_d3d11_service_add_capture_client(struct xrt_system_compositor *xsysc,
 	}
 
 	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
-	if (!sys->shell_mode || sys->multi_comp == nullptr) {
+
+	// Activate shell_mode from base.info if not already done.
+	// Normally this happens on first IPC client connect, but capture
+	// clients may arrive before any IPC client.
+	if (!sys->shell_mode && sys->base.info.shell_mode) {
+		sys->shell_mode = true;
+		U_LOG_W("Shell mode activated for D3D11 service system (via capture client)");
+	}
+	if (!sys->shell_mode) {
+		U_LOG_E("Shell: add_capture_client — shell mode not active");
 		return -1;
 	}
 
 	HWND hwnd = (HWND)(uintptr_t)hwnd_value;
 	if (!IsWindow(hwnd)) {
 		U_LOG_E("Shell: add_capture_client — invalid HWND=0x%llx", (unsigned long long)hwnd_value);
+		return -1;
+	}
+
+	// Ensure multi-compositor is initialized (it's normally created lazily
+	// on first IPC client layer_commit, but capture clients may arrive first).
+	xrt_result_t ret = multi_compositor_ensure_output(sys);
+	if (ret != XRT_SUCCESS || sys->multi_comp == nullptr) {
+		U_LOG_E("Shell: add_capture_client — failed to init multi-compositor (ret=%d)",
+		         (int)ret);
 		return -1;
 	}
 
