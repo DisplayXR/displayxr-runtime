@@ -384,6 +384,10 @@ struct d3d11_service_system
 	//! Mutex for multi-compositor render (serializes D3D11 context access).
 	//! Recursive because unregister_client calls render for final clear frame.
 	std::recursive_mutex render_mutex;
+
+	//! Timestamp of last shell render (monotonic ns). Used to throttle renders
+	//! to ~1 per VSync, reducing torn-atlas reads from concurrent client blits.
+	uint64_t last_shell_render_ns;
 };
 
 
@@ -3257,6 +3261,7 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 		}
 		sys->device->CreateShaderResourceView(mc->combined_atlas.get(), nullptr, mc->combined_atlas_srv.put());
 		sys->device->CreateRenderTargetView(mc->combined_atlas.get(), nullptr, mc->combined_atlas_rtv.put());
+
 	}
 
 	U_LOG_W("Multi-comp: combined atlas %ux%u",
@@ -5914,8 +5919,12 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		}
 	}
 
-	// Clear stereo render target
-	if (c->render.atlas_rtv) {
+	// Clear stereo render target.
+	// In shell mode, skip the clear — the blit overwrites the same tile positions
+	// each frame, so previous content is a safe fallback. Clearing to black here
+	// creates a race: if multi_compositor_render reads this atlas between the clear
+	// and the blit, the window flashes black.
+	if (c->render.atlas_rtv && !sys->shell_mode) {
 		float clear_color[4] = {0.0f, 0.0f, 0.0f, 1.0f};
 		sys->context->ClearRenderTargetView(c->render.atlas_rtv.get(), clear_color);
 	}
@@ -6398,8 +6407,17 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	// Shell mode: per-client atlas rendering is done. The multi-compositor
 	// composites all client atlases into the combined atlas and presents.
 	if (sys->shell_mode) {
+		// Throttle renders to ~1 per VSync (~14ms). With N clients each calling
+		// layer_commit at 60fps, we'd otherwise render N times per frame cycle.
+		// Throttling reduces the chance of reading a client's atlas mid-blit.
+		uint64_t now_ns = os_monotonic_get_ns();
+		uint64_t elapsed_ns = now_ns - sys->last_shell_render_ns;
+		if (elapsed_ns < 14000000ULL && sys->last_shell_render_ns != 0) {
+			return XRT_SUCCESS; // Skip — another client will render soon
+		}
 		std::lock_guard<std::recursive_mutex> render_lock(sys->render_mutex);
 		multi_compositor_render(sys);
+		sys->last_shell_render_ns = now_ns;
 		return XRT_SUCCESS;
 	}
 
