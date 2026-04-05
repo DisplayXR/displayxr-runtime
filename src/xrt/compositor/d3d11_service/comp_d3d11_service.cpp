@@ -10,6 +10,7 @@
 #include "comp_d3d11_service.h"
 #include "d3d11_service_shaders.h"
 #include "d3d11_bitmap_font.h"
+#include "d3d11_capture.h"
 
 #include "xrt/xrt_handles.h"
 #include "xrt/xrt_limits.h"
@@ -449,12 +450,24 @@ ui_m_to_tile_px_y(float meters, const struct d3d11_service_system *sys)
 #define RESIZE_ZONE_PX      ((int)ui_m_to_tile_px_x(UI_RESIZE_ZONE_M, sys))
 
 /*!
+ * Client type for multi-compositor slots.
+ */
+enum d3d11_client_type
+{
+	CLIENT_TYPE_IPC = 0,     //!< OpenXR IPC client with compositor + atlas
+	CLIENT_TYPE_CAPTURE = 1, //!< 2D window capture (no compositor, texture from capture API)
+};
+
+/*!
  * Per-client slot in the multi-compositor.
  */
 struct d3d11_multi_client_slot
 {
-	//! The per-client compositor that owns the atlas.
+	//! The per-client compositor that owns the atlas (NULL for capture clients).
 	struct d3d11_service_compositor *compositor;
+
+	//! Client type: IPC (OpenXR app) or capture (2D window).
+	enum d3d11_client_type client_type;
 
 	//! App's HWND (from XR_EXT_win32_window_binding). Shell can resize via SetWindowPos.
 	HWND app_hwnd;
@@ -508,6 +521,15 @@ struct d3d11_multi_client_slot
 		uint64_t start_ns;         //!< Monotonic timestamp at animation start
 		uint64_t duration_ns;      //!< Animation duration in nanoseconds
 	} anim;
+
+	//! @name Capture-specific fields (only valid when client_type == CLIENT_TYPE_CAPTURE)
+	//! @{
+	struct d3d11_capture_context *capture_ctx;                //!< Opaque capture context
+	wil::com_ptr<ID3D11ShaderResourceView> capture_srv;      //!< SRV for captured texture
+	ID3D11Texture2D *capture_texture_last;                   //!< Last texture pointer (for SRV recreation)
+	uint32_t capture_width;                                  //!< Current capture texture width
+	uint32_t capture_height;                                 //!< Current capture texture height
+	//! @}
 };
 
 /*!
@@ -639,6 +661,13 @@ struct d3d11_multi_compositor
 	//! Bitmap font atlas for title bar text (768x16, 96 ASCII glyphs).
 	wil::com_ptr<ID3D11Texture2D> font_atlas;
 	wil::com_ptr<ID3D11ShaderResourceView> font_atlas_srv;
+
+	//! @name Capture client render timer
+	//! @{
+	std::thread capture_render_thread;           //!< Timer thread for capture-only rendering
+	std::atomic<bool> capture_render_running{false}; //!< Thread run flag
+	uint32_t capture_client_count{0};            //!< Number of active capture-type slots
+	//! @}
 };
 
 
@@ -2999,6 +3028,7 @@ multi_compositor_register_client(struct d3d11_service_system *sys, struct d3d11_
 	for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
 		if (!mc->clients[i].active) {
 			mc->clients[i].compositor = c;
+			mc->clients[i].client_type = CLIENT_TYPE_IPC;
 			mc->clients[i].active = true;
 
 			// Default window pose: 2x2 grid layout so new apps don't overlap.
@@ -3115,6 +3145,271 @@ multi_compositor_unregister_client(struct d3d11_service_system *sys, struct d3d1
 }
 
 /*!
+ * Render timer thread for capture clients.
+ *
+ * When capture-only clients are active (no IPC clients driving layer_commit),
+ * this thread ensures the multi-compositor renders at display refresh rate.
+ */
+static void
+capture_render_thread_func(struct d3d11_service_system *sys)
+{
+	while (sys->multi_comp && sys->multi_comp->capture_render_running.load()) {
+		uint64_t now = os_monotonic_get_ns();
+		uint64_t elapsed = now - sys->last_shell_render_ns;
+		if (elapsed >= 14000000ULL) { // ~70fps cap
+			std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+			if (sys->multi_comp && sys->multi_comp->capture_client_count > 0) {
+				multi_compositor_render(sys);
+			}
+		}
+		Sleep(8); // ~120Hz poll
+	}
+}
+
+/*!
+ * Start the capture render timer thread (if not already running).
+ */
+static void
+capture_render_thread_start(struct d3d11_service_system *sys)
+{
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	if (mc == nullptr || mc->capture_render_running.load()) {
+		return;
+	}
+	mc->capture_render_running.store(true);
+	mc->capture_render_thread = std::thread(capture_render_thread_func, sys);
+	U_LOG_W("Multi-comp: capture render timer started");
+}
+
+/*!
+ * Stop the capture render timer thread (if running).
+ */
+static void
+capture_render_thread_stop(struct d3d11_service_system *sys)
+{
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	if (mc == nullptr || !mc->capture_render_running.load()) {
+		return;
+	}
+	mc->capture_render_running.store(false);
+	if (mc->capture_render_thread.joinable()) {
+		mc->capture_render_thread.join();
+	}
+	U_LOG_W("Multi-comp: capture render timer stopped");
+}
+
+/*!
+ * Add a 2D window capture client to the multi-compositor.
+ *
+ * Starts Windows.Graphics.Capture for the given HWND and assigns a slot.
+ * The captured content will be rendered as a mono textured quad.
+ *
+ * @return Slot index (0-7), or -1 on failure.
+ */
+static int
+multi_compositor_add_capture_client(struct d3d11_service_system *sys, HWND hwnd, const char *name)
+{
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	if (mc == nullptr) {
+		return -1;
+	}
+
+	// Start capture
+	struct d3d11_capture_context *cap_ctx =
+	    d3d11_capture_start((struct ID3D11Device *)sys->device.get(), hwnd);
+	if (cap_ctx == nullptr) {
+		U_LOG_E("Multi-comp: failed to start capture for HWND=%p", (void *)hwnd);
+		return -1;
+	}
+
+	// Find first inactive slot
+	for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
+		if (!mc->clients[i].active) {
+			mc->clients[i].client_type = CLIENT_TYPE_CAPTURE;
+			mc->clients[i].compositor = nullptr;
+			mc->clients[i].capture_ctx = cap_ctx;
+			mc->clients[i].capture_srv = nullptr;
+			mc->clients[i].capture_texture_last = nullptr;
+			mc->clients[i].capture_width = 0;
+			mc->clients[i].capture_height = 0;
+			mc->clients[i].app_hwnd = hwnd;
+			mc->clients[i].active = true;
+			mc->clients[i].minimized = false;
+			mc->clients[i].maximized = false;
+			mc->clients[i].hwnd_resize_pending = false;
+
+			// App name
+			if (name && name[0]) {
+				snprintf(mc->clients[i].app_name, sizeof(mc->clients[i].app_name), "%s", name);
+			} else {
+				char title[128] = {0};
+				int len = GetWindowTextA(hwnd, title, sizeof(title));
+				if (len > 0) {
+					snprintf(mc->clients[i].app_name, sizeof(mc->clients[i].app_name), "%s", title);
+				} else {
+					snprintf(mc->clients[i].app_name, sizeof(mc->clients[i].app_name), "Capture %d", i);
+				}
+			}
+			// Replace non-ASCII characters
+			for (char *p = mc->clients[i].app_name; *p; p++) {
+				if ((unsigned char)*p < 0x20 || (unsigned char)*p > 0x7E) *p = '-';
+			}
+
+			// Compute initial size from HWND DPI
+			RECT client_rect = {};
+			GetClientRect(hwnd, &client_rect);
+			UINT dpi = GetDpiForWindow(hwnd);
+			if (dpi == 0) dpi = 96;
+			uint32_t px_w = client_rect.right - client_rect.left;
+			uint32_t px_h = client_rect.bottom - client_rect.top;
+			if (px_w == 0) px_w = 800;
+			if (px_h == 0) px_h = 600;
+
+			float width_m = ((float)px_w / (float)dpi) * 0.0254f;
+			float height_m = ((float)px_h / (float)dpi) * 0.0254f;
+
+			// Clamp to reasonable range
+			float disp_w_m = sys->base.info.display_width_m;
+			if (disp_w_m <= 0.0f) disp_w_m = 0.700f;
+			float max_w = disp_w_m * 0.6f;
+			if (width_m > max_w) {
+				float scale = max_w / width_m;
+				width_m *= scale;
+				height_m *= scale;
+			}
+			if (width_m < 0.04f) width_m = 0.04f;
+			if (height_m < 0.04f) height_m = 0.04f;
+
+			// Default pose: same 2x2 grid as IPC clients
+			float disp_h_m = sys->base.info.display_height_m;
+			if (disp_h_m <= 0.0f) disp_h_m = 0.394f;
+			float center_x_m, center_y_m;
+			if (i < 4) {
+				int col = i % 2;
+				int row = i / 2;
+				center_x_m = (col == 0 ? -0.25f : +0.25f) * disp_w_m;
+				center_y_m = (row == 0 ? +0.25f : -0.25f) * disp_h_m;
+			} else {
+				float offset = (i - 4) * 0.02f;
+				center_x_m = offset;
+				center_y_m = -offset;
+			}
+
+			// Entry animation: start from center (small), animate to target position
+			mc->clients[i].window_pose.orientation = {0, 0, 0, 1};
+			mc->clients[i].window_pose.position = {0, 0, 0};
+			mc->clients[i].window_width_m = width_m * 0.3f;
+			mc->clients[i].window_height_m = height_m * 0.3f;
+
+			struct xrt_pose target = {};
+			target.orientation.w = 1.0f;
+			target.position.x = center_x_m;
+			target.position.y = center_y_m;
+			target.position.z = 0.0f;
+			mc->clients[i].anim.active = true;
+			mc->clients[i].anim.start_pose = mc->clients[i].window_pose;
+			mc->clients[i].anim.target_pose = target;
+			mc->clients[i].anim.start_width_m = width_m * 0.3f;
+			mc->clients[i].anim.start_height_m = height_m * 0.3f;
+			mc->clients[i].anim.target_width_m = width_m;
+			mc->clients[i].anim.target_height_m = height_m;
+			mc->clients[i].anim.start_ns = os_monotonic_get_ns();
+			mc->clients[i].anim.duration_ns = 400ULL * 1000000ULL;
+
+			// Content view dimensions (will be updated on first capture frame)
+			mc->clients[i].content_view_w = px_w;
+			mc->clients[i].content_view_h = px_h;
+
+			// Compute pixel rect
+			slot_pose_to_pixel_rect(sys, &mc->clients[i],
+			    &mc->clients[i].window_rect_x,
+			    &mc->clients[i].window_rect_y,
+			    &mc->clients[i].window_rect_w,
+			    &mc->clients[i].window_rect_h);
+
+			mc->client_count++;
+			mc->capture_client_count++;
+			if (mc->focused_slot < 0) {
+				mc->focused_slot = i;
+			}
+
+			U_LOG_W("Multi-comp: added capture client in slot %d HWND=%p '%s' "
+			         "(%ux%u px, %.3fx%.3f m, total=%u, captures=%u)",
+			         i, (void *)hwnd, mc->clients[i].app_name,
+			         px_w, px_h, width_m, height_m,
+			         mc->client_count, mc->capture_client_count);
+			multi_compositor_update_input_forward(mc);
+
+			// Start render timer if this is the first capture client
+			if (mc->capture_client_count == 1) {
+				capture_render_thread_start(sys);
+			}
+
+			return i;
+		}
+	}
+
+	// No free slot
+	d3d11_capture_stop(cap_ctx);
+	U_LOG_E("Multi-comp: max clients (%d) reached, cannot add capture", D3D11_MULTI_MAX_CLIENTS);
+	return -1;
+}
+
+/*!
+ * Remove a capture client from the multi-compositor.
+ */
+static bool
+multi_compositor_remove_capture_client(struct d3d11_service_system *sys, int slot_index)
+{
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	if (mc == nullptr || slot_index < 0 || slot_index >= D3D11_MULTI_MAX_CLIENTS) {
+		return false;
+	}
+
+	struct d3d11_multi_client_slot *slot = &mc->clients[slot_index];
+	if (!slot->active || slot->client_type != CLIENT_TYPE_CAPTURE) {
+		return false;
+	}
+
+	// Stop capture
+	d3d11_capture_stop(slot->capture_ctx);
+	slot->capture_ctx = nullptr;
+	slot->capture_srv = nullptr;
+	slot->capture_texture_last = nullptr;
+	slot->capture_width = 0;
+	slot->capture_height = 0;
+
+	slot->active = false;
+	slot->compositor = nullptr;
+	slot->client_type = CLIENT_TYPE_IPC; // reset
+	mc->client_count--;
+	mc->capture_client_count--;
+
+	if (mc->focused_slot == slot_index) {
+		mc->focused_slot = -1;
+		multi_compositor_update_input_forward(mc);
+	}
+	if (mc->drag.active && mc->drag.slot == slot_index) {
+		mc->drag.active = false;
+		mc->drag.slot = -1;
+	}
+
+	U_LOG_W("Multi-comp: removed capture client from slot %d (total=%u, captures=%u)",
+	         slot_index, mc->client_count, mc->capture_client_count);
+
+	// Stop render timer if no capture clients remain
+	if (mc->capture_client_count == 0) {
+		// Don't join from render thread — stop async
+		mc->capture_render_running.store(false);
+	}
+
+	// Render one final frame to clear stale content
+	multi_compositor_render(sys);
+
+	return true;
+}
+
+/*!
  * Destroy the multi-compositor and all its resources.
  */
 static void
@@ -3125,6 +3420,22 @@ multi_compositor_destroy(struct d3d11_multi_compositor *mc)
 	}
 
 	U_LOG_W("Multi-comp: destroying");
+
+	// Stop capture render timer
+	mc->capture_render_running.store(false);
+	if (mc->capture_render_thread.joinable()) {
+		mc->capture_render_thread.join();
+	}
+
+	// Stop all capture clients
+	for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
+		if (mc->clients[i].active && mc->clients[i].client_type == CLIENT_TYPE_CAPTURE) {
+			d3d11_capture_stop(mc->clients[i].capture_ctx);
+			mc->clients[i].capture_ctx = nullptr;
+			mc->clients[i].capture_srv = nullptr;
+			mc->clients[i].active = false;
+		}
+	}
 
 	if (mc->display_processor != nullptr) {
 		xrt_display_processor_d3d11_request_display_mode(mc->display_processor, false);
@@ -4107,6 +4418,57 @@ apply_layout(struct d3d11_service_system *sys, struct d3d11_multi_compositor *mc
 }
 
 /*!
+ * Update the SRV for a capture client slot.
+ *
+ * Gets the latest captured texture and (re)creates the SRV if the
+ * texture pointer or dimensions changed. Also updates content_view_w/h
+ * and window aspect ratio on size change.
+ */
+static void
+capture_slot_update_srv(struct d3d11_service_system *sys,
+                        struct d3d11_multi_client_slot *slot)
+{
+	if (slot->capture_ctx == nullptr) return;
+
+	uint32_t w = 0, h = 0;
+	ID3D11Texture2D *tex = d3d11_capture_get_texture(slot->capture_ctx, &w, &h);
+	if (tex == nullptr || w == 0 || h == 0) return;
+
+	// Recreate SRV if texture pointer or dimensions changed
+	if (tex != slot->capture_texture_last || w != slot->capture_width || h != slot->capture_height) {
+		slot->capture_srv = nullptr; // release old SRV
+
+		D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+		srv_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+		srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+		srv_desc.Texture2D.MipLevels = 1;
+
+		HRESULT hr = sys->device->CreateShaderResourceView(tex, &srv_desc, slot->capture_srv.put());
+		if (FAILED(hr)) {
+			U_LOG_E("Capture: CreateShaderResourceView failed (hr=0x%08lx)", hr);
+			return;
+		}
+
+		// Update dimensions
+		bool size_changed = (w != slot->capture_width || h != slot->capture_height);
+		slot->capture_texture_last = tex;
+		slot->capture_width = w;
+		slot->capture_height = h;
+		slot->content_view_w = w;
+		slot->content_view_h = h;
+
+		// Update window aspect ratio if capture size changed
+		if (size_changed && slot->capture_width > 0 && slot->capture_height > 0) {
+			float aspect = (float)w / (float)h;
+			slot->window_height_m = slot->window_width_m / aspect;
+			slot_pose_to_pixel_rect(sys, slot,
+			    &slot->window_rect_x, &slot->window_rect_y,
+			    &slot->window_rect_w, &slot->window_rect_h);
+		}
+	}
+}
+
+/*!
  * Render all client atlases into the combined atlas using Level 2 Kooima,
  * then run DP process_atlas and present.
  *
@@ -4230,12 +4592,19 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	if (GetAsyncKeyState(VK_DELETE) & 1) {
 		if (mc->focused_slot >= 0 && mc->focused_slot < D3D11_MULTI_MAX_CLIENTS &&
 		    mc->clients[mc->focused_slot].active) {
-			struct d3d11_service_compositor *fc = mc->clients[mc->focused_slot].compositor;
-			if (fc != nullptr && fc->xses != nullptr) {
-				union xrt_session_event xse = XRT_STRUCT_INIT;
-				xse.type = XRT_SESSION_EVENT_EXIT_REQUEST;
-				xrt_session_event_sink_push(fc->xses, &xse);
-				U_LOG_W("Multi-comp: DELETE → exit request for slot %d", mc->focused_slot);
+			if (mc->clients[mc->focused_slot].client_type == CLIENT_TYPE_CAPTURE) {
+				// Capture client: remove directly
+				multi_compositor_remove_capture_client(sys, mc->focused_slot);
+				U_LOG_W("Multi-comp: DELETE → removed capture slot %d", mc->focused_slot);
+			} else {
+				// IPC client: send exit request
+				struct d3d11_service_compositor *fc = mc->clients[mc->focused_slot].compositor;
+				if (fc != nullptr && fc->xses != nullptr) {
+					union xrt_session_event xse = XRT_STRUCT_INIT;
+					xse.type = XRT_SESSION_EVENT_EXIT_REQUEST;
+					xrt_session_event_sink_push(fc->xses, &xse);
+					U_LOG_W("Multi-comp: DELETE → exit request for slot %d", mc->focused_slot);
+				}
 			}
 		}
 	}
@@ -4928,7 +5297,8 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	// Uses SWP_ASYNCWINDOWPOS to avoid cross-process deadlock.
 	for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
 		if (mc->clients[s].active && mc->clients[s].hwnd_resize_pending &&
-		    mc->clients[s].app_hwnd != NULL) {
+		    mc->clients[s].app_hwnd != NULL &&
+		    mc->clients[s].client_type != CLIENT_TYPE_CAPTURE) {
 			// HWND = visual 3D window size. App uses this for Kooima
 			// (physical screen dims) and render resolution (HWND * scale).
 			// Position at display center so eye offsets come from xrLocateViews.
@@ -4988,16 +5358,43 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	uint32_t dp_view_h = sys->view_height;
 	for (int ri = 0; ri < render_count; ri++) {
 		int s = render_order[ri];
-		struct d3d11_service_compositor *cc = mc->clients[s].compositor;
-		if (cc == nullptr || !cc->render.atlas_texture || !cc->render.atlas_srv) {
-			continue;
-		}
-		// Client content dimensions (source texture size, same for both eyes).
-		uint32_t cvw = mc->clients[s].content_view_w;
-		uint32_t cvh = mc->clients[s].content_view_h;
-		if (cvw == 0 || cvh == 0) {
-			cvw = dp_view_w;
-			cvh = dp_view_h;
+
+		// Determine source SRV and dimensions based on client type.
+		ID3D11ShaderResourceView *slot_srv = nullptr;
+		uint32_t cvw = 0, cvh = 0;       // content view dimensions
+		uint32_t src_tex_w = 0, src_tex_h = 0; // source texture dimensions (for UV)
+		bool slot_is_mono = false;
+		bool slot_flip_y = false;
+
+		if (mc->clients[s].client_type == CLIENT_TYPE_CAPTURE) {
+			// Capture client: get latest captured texture
+			capture_slot_update_srv(sys, &mc->clients[s]);
+			if (!mc->clients[s].capture_srv) continue;
+			slot_srv = mc->clients[s].capture_srv.get();
+			cvw = mc->clients[s].capture_width;
+			cvh = mc->clients[s].capture_height;
+			src_tex_w = cvw;
+			src_tex_h = cvh;
+			slot_is_mono = true;
+			slot_flip_y = false;
+		} else {
+			// IPC client: use compositor atlas
+			struct d3d11_service_compositor *cc = mc->clients[s].compositor;
+			if (cc == nullptr || !cc->render.atlas_texture || !cc->render.atlas_srv) {
+				continue;
+			}
+			slot_srv = cc->render.atlas_srv.get();
+			cvw = mc->clients[s].content_view_w;
+			cvh = mc->clients[s].content_view_h;
+			if (cvw == 0 || cvh == 0) {
+				cvw = dp_view_w;
+				cvh = dp_view_h;
+			}
+			D3D11_TEXTURE2D_DESC client_atlas_desc = {};
+			cc->render.atlas_texture->GetDesc(&client_atlas_desc);
+			src_tex_w = client_atlas_desc.Width;
+			src_tex_h = client_atlas_desc.Height;
+			slot_flip_y = cc->atlas_flip_y;
 		}
 
 		// Combined atlas dimensions.
@@ -5009,8 +5406,6 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		uint32_t half_h = ca_h / sys->tile_rows;
 
 		// Per-eye projected pixel rects (parallax shift for windows at Z != 0).
-		// Each eye sees the window at a different position on the display plane,
-		// creating stereo depth on the lenticular display.
 		int32_t eye_rect_x[2], eye_rect_y[2], eye_rect_w[2], eye_rect_h[2];
 		for (int eye = 0; eye < 2; eye++) {
 			int ei = (eye < (int)eye_pos.count) ? eye : 0;
@@ -5020,20 +5415,22 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			    &eye_rect_w[eye], &eye_rect_h[eye]);
 		}
 
-		// Get client atlas dimensions for SRV
-		D3D11_TEXTURE2D_DESC client_atlas_desc = {};
-		cc->render.atlas_texture->GetDesc(&client_atlas_desc);
-
-		// Shader blit each view from client atlas → combined atlas with scaling.
-		// The blit constant buffer defines source UV rect and dest pixel rect.
+		// Shader blit each view → combined atlas.
 		uint32_t num_views = sys->tile_columns * sys->tile_rows;
 		for (uint32_t v = 0; v < num_views && v < XRT_MAX_VIEWS; v++) {
 			uint32_t src_col = v % sys->tile_columns;
 			uint32_t src_row = v / sys->tile_columns;
 
-			// Source rect (pixels in client atlas)
-			float src_px_x = static_cast<float>(src_col * cvw);
-			float src_px_y = static_cast<float>(src_row * cvh);
+			// Source rect: mono clients use (0,0) for all views,
+			// IPC clients use per-eye tile offsets.
+			float src_px_x, src_px_y;
+			if (slot_is_mono) {
+				src_px_x = 0.0f;
+				src_px_y = 0.0f;
+			} else {
+				src_px_x = static_cast<float>(src_col * cvw);
+				src_px_y = static_cast<float>(src_row * cvh);
+			}
 
 			// Per-eye destination rect (parallax-shifted for Z != 0)
 			int eye_idx = (src_col < 2) ? (int)src_col : 0;
@@ -5046,8 +5443,6 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			float dest_px_w = win_frac_w * half_w;
 			float dest_px_h = win_frac_h * half_h;
 
-			// Set scissor rect to this tile's bounds — GPU clips overflow uniformly
-			// on all edges. No manual source/dest clipping needed.
 			D3D11_RECT scissor;
 			scissor.left = (LONG)(src_col * half_w);
 			scissor.top = (LONG)(src_row * half_h);
@@ -5074,8 +5469,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			BlitConstants *cb = static_cast<BlitConstants *>(mapped.pData);
 			cb->src_rect[0] = src_px_x;
 			cb->src_rect[2] = static_cast<float>(cvw);
-			// GL clients render bottom-up; flip source Y to correct orientation
-			if (cc->atlas_flip_y) {
+			if (slot_flip_y) {
 				cb->src_rect[1] = src_px_y + static_cast<float>(cvh);
 				cb->src_rect[3] = -static_cast<float>(cvh);
 			} else {
@@ -5084,8 +5478,8 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			}
 			cb->dst_offset[0] = dest_px_x;
 			cb->dst_offset[1] = dest_px_y;
-			cb->src_size[0] = static_cast<float>(client_atlas_desc.Width);
-			cb->src_size[1] = static_cast<float>(client_atlas_desc.Height);
+			cb->src_size[0] = static_cast<float>(src_tex_w);
+			cb->src_size[1] = static_cast<float>(src_tex_h);
 			cb->dst_size[0] = static_cast<float>(ca_w);
 			cb->dst_size[1] = static_cast<float>(ca_h);
 			cb->convert_srgb = 0.0f;
@@ -5107,8 +5501,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			sys->context->PSSetShader(sys->blit_ps.get(), nullptr, 0);
 			sys->context->VSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
 			sys->context->PSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
-			ID3D11ShaderResourceView *srv = cc->render.atlas_srv.get();
-			sys->context->PSSetShaderResources(0, 1, &srv);
+			sys->context->PSSetShaderResources(0, 1, &slot_srv);
 			sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
 
 			// Render to combined atlas
@@ -7809,5 +8202,131 @@ comp_d3d11_service_window_is_valid(struct xrt_system_compositor *xsysc)
 	// Each client's window lifecycle is handled when the client disconnects.
 	// Always return true - the service doesn't maintain a global window anymore.
 	(void)xsysc;
+	return true;
+}
+
+
+/*
+ *
+ * Capture client public API (Phase 4A)
+ *
+ */
+
+int
+comp_d3d11_service_add_capture_client(struct xrt_system_compositor *xsysc,
+                                       uint64_t hwnd_value,
+                                       const char *name)
+{
+	if (xsysc == nullptr) {
+		return -1;
+	}
+
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	if (!sys->shell_mode || sys->multi_comp == nullptr) {
+		return -1;
+	}
+
+	HWND hwnd = (HWND)(uintptr_t)hwnd_value;
+	if (!IsWindow(hwnd)) {
+		U_LOG_E("Shell: add_capture_client — invalid HWND=0x%llx", (unsigned long long)hwnd_value);
+		return -1;
+	}
+
+	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	return multi_compositor_add_capture_client(sys, hwnd, name);
+}
+
+bool
+comp_d3d11_service_remove_capture_client(struct xrt_system_compositor *xsysc,
+                                          int slot_index)
+{
+	if (xsysc == nullptr) {
+		return false;
+	}
+
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	if (!sys->shell_mode || sys->multi_comp == nullptr) {
+		return false;
+	}
+
+	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	return multi_compositor_remove_capture_client(sys, slot_index);
+}
+
+bool
+comp_d3d11_service_set_capture_client_window_pose(struct xrt_system_compositor *xsysc,
+                                                    int slot_index,
+                                                    const struct xrt_pose *pose,
+                                                    float width_m,
+                                                    float height_m)
+{
+	if (xsysc == nullptr || pose == nullptr) {
+		return false;
+	}
+
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	if (!sys->shell_mode || sys->multi_comp == nullptr) {
+		return false;
+	}
+
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	if (slot_index < 0 || slot_index >= D3D11_MULTI_MAX_CLIENTS) {
+		return false;
+	}
+
+	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+
+	if (!mc->clients[slot_index].active) {
+		return false;
+	}
+
+	float min_dim = 0.02f;
+	if (width_m < min_dim) width_m = min_dim;
+	if (height_m < min_dim) height_m = min_dim;
+
+	mc->clients[slot_index].window_pose = *pose;
+	mc->clients[slot_index].window_width_m = width_m;
+	mc->clients[slot_index].window_height_m = height_m;
+
+	slot_pose_to_pixel_rect(sys, &mc->clients[slot_index],
+	    &mc->clients[slot_index].window_rect_x,
+	    &mc->clients[slot_index].window_rect_y,
+	    &mc->clients[slot_index].window_rect_w,
+	    &mc->clients[slot_index].window_rect_h);
+
+	return true;
+}
+
+bool
+comp_d3d11_service_get_capture_client_window_pose(struct xrt_system_compositor *xsysc,
+                                                    int slot_index,
+                                                    struct xrt_pose *out_pose,
+                                                    float *out_width_m,
+                                                    float *out_height_m)
+{
+	if (xsysc == nullptr) {
+		return false;
+	}
+
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	if (!sys->shell_mode || sys->multi_comp == nullptr) {
+		return false;
+	}
+
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	if (slot_index < 0 || slot_index >= D3D11_MULTI_MAX_CLIENTS) {
+		return false;
+	}
+
+	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+
+	if (!mc->clients[slot_index].active) {
+		return false;
+	}
+
+	if (out_pose) *out_pose = mc->clients[slot_index].window_pose;
+	if (out_width_m) *out_width_m = mc->clients[slot_index].window_width_m;
+	if (out_height_m) *out_height_m = mc->clients[slot_index].window_height_m;
+
 	return true;
 }

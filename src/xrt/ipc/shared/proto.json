@@ -85,6 +85,21 @@
 		]
 	},
 
+	"shell_add_capture_client": {
+		"in": [
+			{"name": "hwnd", "type": "uint64_t"}
+		],
+		"out": [
+			{"name": "client_id", "type": "uint32_t"}
+		]
+	},
+
+	"shell_remove_capture_client": {
+		"in": [
+			{"name": "client_id", "type": "uint32_t"}
+		]
+	},
+
 	"system_devices_get_roles": {
 		"out": [
 			{"name": "system_roles", "type": "struct xrt_system_roles"}

@@ -43,6 +43,7 @@
 #define PE(...) fprintf(stderr, __VA_ARGS__)
 
 #define MAX_APPS 8
+#define MAX_CAPTURES 8
 
 static volatile int g_running = 1;
 
@@ -64,6 +65,14 @@ struct app_entry
 	DWORD pid;
 #endif
 	bool pose_applied;
+};
+
+struct capture_entry
+{
+	uint64_t hwnd;
+	char name[128];
+	uint32_t client_id; // filled after IPC call
+	bool added;
 };
 
 #define MAX_SAVED_WINDOWS 16
@@ -336,22 +345,26 @@ launch_app(struct app_entry *app, const char *runtime_json)
 static void
 print_usage(void)
 {
-	P("Usage: displayxr-shell [--pose x,y,z,w,h] app1.exe [--pose x,y,z,w,h] app2.exe ...\n");
+	P("Usage: displayxr-shell [options] [--pose x,y,z,w,h] app1.exe ...\n");
 	P("\n");
 	P("Options:\n");
-	P("  --pose x,y,z,w,h   Set window pose for the next app argument\n");
-	P("                      x,y,z = position (meters from display center)\n");
-	P("                      w,h = window width and height (meters)\n");
-	P("  --help              Show this help\n");
+	P("  --pose x,y,z,w,h       Set window pose for the next app argument\n");
+	P("                          x,y,z = position (meters from display center)\n");
+	P("                          w,h = window width and height (meters)\n");
+	P("  --capture-hwnd <hwnd>   Capture a 2D window by its HWND (decimal or 0x hex)\n");
+	P("                          Can be specified multiple times\n");
+	P("  --help                  Show this help\n");
 	P("\n");
 	P("If no apps are specified, runs in monitor-only mode.\n");
 	P("The service (displayxr-service --shell) is auto-started if needed.\n");
 }
 
 static int
-parse_args(int argc, char *argv[], struct app_entry *apps, int *app_count)
+parse_args(int argc, char *argv[], struct app_entry *apps, int *app_count,
+           struct capture_entry *captures, int *capture_count)
 {
 	*app_count = 0;
+	*capture_count = 0;
 	bool next_has_pose = false;
 	float px = 0, py = 0, pz = 0, pw = 0, ph = 0;
 
@@ -372,6 +385,31 @@ parse_args(int argc, char *argv[], struct app_entry *apps, int *app_count)
 				return -1;
 			}
 			next_has_pose = true;
+			continue;
+		}
+		if (strcmp(argv[i], "--capture-hwnd") == 0) {
+			if (i + 1 >= argc) {
+				PE("Error: --capture-hwnd requires HWND value\n");
+				return -1;
+			}
+			i++;
+			if (*capture_count >= MAX_CAPTURES) {
+				PE("Warning: max %d captures, ignoring %s\n", MAX_CAPTURES, argv[i]);
+				continue;
+			}
+			struct capture_entry *ce = &captures[*capture_count];
+			memset(ce, 0, sizeof(*ce));
+			ce->hwnd = (uint64_t)strtoull(argv[i], NULL, 0); // supports decimal and 0x hex
+#ifdef _WIN32
+			{
+				char title[128] = "Captured Window";
+				GetWindowTextA((HWND)(uintptr_t)ce->hwnd, title, sizeof(title));
+				snprintf(ce->name, sizeof(ce->name), "%s", title);
+			}
+#else
+			snprintf(ce->name, sizeof(ce->name), "Capture HWND %llu", (unsigned long long)ce->hwnd);
+#endif
+			(*capture_count)++;
 			continue;
 		}
 		if (strcmp(argv[i], "--") == 0) {
@@ -509,13 +547,18 @@ main(int argc, char *argv[])
 	// Parse arguments
 	struct app_entry apps[MAX_APPS];
 	int app_count = 0;
-	if (parse_args(argc, argv, apps, &app_count) < 0) {
+	struct capture_entry captures[MAX_CAPTURES];
+	int capture_count = 0;
+	if (parse_args(argc, argv, apps, &app_count, captures, &capture_count) < 0) {
 		return 1;
 	}
 
 	P("DisplayXR Shell\n");
 	if (app_count > 0) {
 		P("Will launch %d app(s)\n", app_count);
+	}
+	if (capture_count > 0) {
+		P("Will capture %d window(s)\n", capture_count);
 	}
 
 	// Connect to service. The IPC client library auto-starts displayxr-service
@@ -553,6 +596,21 @@ main(int argc, char *argv[])
 	}
 
 	P("Connected to service.\n");
+
+	// Add capture clients (2D window capture via Windows.Graphics.Capture)
+	for (int i = 0; i < capture_count; i++) {
+		uint32_t cid = 0;
+		xrt_result_t r = ipc_call_shell_add_capture_client(&ipc_c, captures[i].hwnd, &cid);
+		if (r == XRT_SUCCESS) {
+			captures[i].client_id = cid;
+			captures[i].added = true;
+			P("  Capture: HWND=0x%llx '%s' → client_id=%u\n",
+			  (unsigned long long)captures[i].hwnd, captures[i].name, cid);
+		} else {
+			PE("  Capture: failed for HWND=0x%llx '%s'\n",
+			   (unsigned long long)captures[i].hwnd, captures[i].name);
+		}
+	}
 
 	// Launch apps
 #ifdef _WIN32
@@ -722,6 +780,14 @@ main(int argc, char *argv[])
 	}
 
 	P("\nShell exiting.\n");
+
+	// Remove capture clients before disconnecting
+	for (int i = 0; i < capture_count; i++) {
+		if (captures[i].added) {
+			ipc_call_shell_remove_capture_client(&ipc_c, captures[i].client_id);
+			P("  Removed capture client_id=%u\n", captures[i].client_id);
+		}
+	}
 
 #ifdef _WIN32
 	// Close process handles

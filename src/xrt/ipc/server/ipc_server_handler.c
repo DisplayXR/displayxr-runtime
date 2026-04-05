@@ -1983,7 +1983,15 @@ ipc_handle_shell_set_window_pose(volatile struct ipc_client_state *_ics,
 	         client_id, pose->position.x, pose->position.y, pose->position.z,
 	         width_m, height_m);
 
-	// Find target client by ID
+	// Capture clients use IDs >= 1000 (slot index = client_id - 1000)
+	if (client_id >= 1000) {
+		int slot = (int)(client_id - 1000);
+		bool ok = comp_d3d11_service_set_capture_client_window_pose(
+		    s->xsysc, slot, pose, width_m, height_m);
+		return ok ? XRT_SUCCESS : XRT_ERROR_IPC_FAILURE;
+	}
+
+	// Find target IPC client by ID
 	os_mutex_lock(&s->global_state.lock);
 
 	volatile struct ipc_client_state *target_ics = NULL;
@@ -2074,6 +2082,14 @@ ipc_handle_shell_get_window_pose(volatile struct ipc_client_state *_ics,
 		return XRT_ERROR_IPC_FAILURE;
 	}
 
+	// Capture clients use IDs >= 1000
+	if (client_id >= 1000) {
+		int slot = (int)(client_id - 1000);
+		bool ok = comp_d3d11_service_get_capture_client_window_pose(
+		    s->xsysc, slot, out_pose, out_width_m, out_height_m);
+		return ok ? XRT_SUCCESS : XRT_ERROR_IPC_FAILURE;
+	}
+
 	os_mutex_lock(&s->global_state.lock);
 
 	volatile struct ipc_client_state *target_ics = NULL;
@@ -2101,6 +2117,69 @@ ipc_handle_shell_get_window_pose(volatile struct ipc_client_state *_ics,
 	(void)out_pose;
 	(void)out_width_m;
 	(void)out_height_m;
+	return XRT_ERROR_IPC_FAILURE;
+#endif
+}
+
+xrt_result_t
+ipc_handle_shell_add_capture_client(volatile struct ipc_client_state *_ics,
+                                     uint64_t hwnd,
+                                     uint32_t *out_client_id)
+{
+	struct ipc_server *s = _ics->server;
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (s->xsysc == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	IPC_INFO(s, "Shell: add_capture_client hwnd=0x%llx", (unsigned long long)hwnd);
+
+	int slot = comp_d3d11_service_add_capture_client(s->xsysc, hwnd, NULL);
+	if (slot < 0) {
+		IPC_WARN(s, "Shell: add_capture_client failed for hwnd=0x%llx",
+		         (unsigned long long)hwnd);
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	// Capture client IDs use offset 1000+ to distinguish from IPC client IDs
+	*out_client_id = 1000 + (uint32_t)slot;
+	IPC_INFO(s, "Shell: capture client added — slot=%d client_id=%u", slot, *out_client_id);
+
+	return XRT_SUCCESS;
+#else
+	(void)s;
+	(void)hwnd;
+	(void)out_client_id;
+	return XRT_ERROR_IPC_FAILURE;
+#endif
+}
+
+xrt_result_t
+ipc_handle_shell_remove_capture_client(volatile struct ipc_client_state *_ics,
+                                        uint32_t client_id)
+{
+	struct ipc_server *s = _ics->server;
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (s->xsysc == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	if (client_id < 1000) {
+		IPC_WARN(s, "Shell: remove_capture_client — invalid client_id %u (not a capture client)",
+		         client_id);
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	int slot = (int)(client_id - 1000);
+	IPC_INFO(s, "Shell: remove_capture_client client_id=%u slot=%d", client_id, slot);
+
+	bool ok = comp_d3d11_service_remove_capture_client(s->xsysc, slot);
+	return ok ? XRT_SUCCESS : XRT_ERROR_IPC_FAILURE;
+#else
+	(void)s;
+	(void)client_id;
 	return XRT_ERROR_IPC_FAILURE;
 #endif
 }
