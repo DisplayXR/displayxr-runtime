@@ -133,13 +133,15 @@ c) **VK interop on client** (if VK available):
 
 ## Task Checklist
 
-| Task | Priority | Complexity | Description |
-|------|----------|-----------|-------------|
-| 3B.1 | CRITICAL | Small | VK swapchain import: calculate texture memory size from D3D11 desc |
-| 3B.2 | CRITICAL | Small | D3D12 swapchain: strip protected content flag |
-| 3B.3 | HIGH | Medium | GL client: add D3D11 import via WGL_NV_DX_interop |
-| 3B.4 | MEDIUM | Small | Multi-comp: verify KeyedMutex coordination for cross-API clients |
-| 3B.5 | — | — | Smoke test: all 4 APIs in shell simultaneously |
+| Task | Priority | Complexity | Description | Status |
+|------|----------|-----------|-------------|--------|
+| 3B.1 | CRITICAL | Small | VK swapchain import: size check + dispatch table fix | ✅ Done |
+| 3B.2 | CRITICAL | Medium | D3D12 swapchain: server-creates-swapchain restructure | ✅ Done |
+| 3B.3 | HIGH | Medium | GL client: WGL_NV_DX_interop2 staging texture + Y-flip | ✅ Done |
+| 3B.4 | MEDIUM | Small | Multi-comp: verify KeyedMutex coordination | ✅ Verified |
+| 3B.5 | — | — | Smoke test: all 4 APIs simultaneously | ✅ Passed |
+| Bonus | — | Small | Fix #116: multi-client race in ensure_output | ✅ Fixed |
+| Bonus | — | Small | 2x2 grid default layout for 4+ apps | ✅ Done |
 
 ## Implementation Order
 
@@ -163,8 +165,8 @@ c) **VK interop on client** (if VK available):
 ## Related Issues
 
 - #108 (FIXED) — D3D11 multithread protection for 3+ apps
-- #116 — GL app crashes service in multi-client mode
-- #16 — D3D12 swapchain creation in IPC/shell mode
+- #116 (FIXED) — Multi-client crash: race condition in `multi_compositor_ensure_output`
+- #16 (FIXED) — D3D12 swapchain creation in IPC/shell mode (server-creates-swapchain)
 
 ## Test Procedure
 
