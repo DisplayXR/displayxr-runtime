@@ -5410,6 +5410,27 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			        mc->clients[s].window_rect_x, mc->clients[s].window_rect_y,
 			        mc->clients[s].window_rect_w, mc->clients[s].window_rect_h);
 		}
+
+		// Capture clients: resize the source HWND so the captured content
+		// re-renders at the new size instead of stretching.
+		if (mc->clients[s].active && mc->clients[s].hwnd_resize_pending &&
+		    mc->clients[s].app_hwnd != NULL &&
+		    mc->clients[s].client_type == CLIENT_TYPE_CAPTURE) {
+			// Convert virtual window meters → pixels using DPI
+			UINT dpi = GetDpiForWindow(mc->clients[s].app_hwnd);
+			if (dpi == 0) dpi = 96;
+			int new_w = (int)(mc->clients[s].window_width_m / 0.0254f * (float)dpi);
+			int new_h = (int)(mc->clients[s].window_height_m / 0.0254f * (float)dpi);
+			if (new_w < 200) new_w = 200;
+			if (new_h < 150) new_h = 150;
+
+			SetWindowPos(mc->clients[s].app_hwnd, NULL,
+			             0, 0, new_w, new_h,
+			             SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+			mc->clients[s].hwnd_resize_pending = false;
+			U_LOG_I("Multi-comp: resized capture HWND %p to %dx%d px",
+			        (void *)mc->clients[s].app_hwnd, new_w, new_h);
+		}
 	}
 
 	// Clear combined atlas to dark gray background each frame.

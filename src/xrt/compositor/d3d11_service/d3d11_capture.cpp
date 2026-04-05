@@ -55,8 +55,13 @@ struct d3d11_capture_context
 	// Staging texture: owned by us, safe to read from render thread.
 	// Created on first frame, recreated on size change.
 	wil::com_ptr<ID3D11Texture2D> staging_texture;
-	uint32_t width;
-	uint32_t height;
+	uint32_t width;   // staging texture width
+	uint32_t height;  // staging texture height
+
+	// Frame pool size: tracks the size the pool was last created/recreated at.
+	// Separate from staging texture size to avoid Recreate loops.
+	uint32_t pool_width;
+	uint32_t pool_height;
 
 	// Thread safety: protects staging_texture, width, height.
 	// Locked by FrameArrived callback (WinRT thread pool) and
@@ -138,10 +143,38 @@ on_frame_arrived(struct d3d11_capture_context *ctx,
 		return;
 	}
 
+	// If the captured window was resized, the frame pool's buffer size no
+	// longer matches the content. Close this frame, recreate the pool at
+	// the new size, and update the staging texture. The next FrameArrived
+	// callback will deliver a correctly-sized frame.
+	// If content size differs from frame pool size, the pool's buffers are
+	// stale. Recreate the pool at the new size. Keep the old staging texture
+	// so the render loop shows it (slightly stretched) until a new frame arrives.
+	if (ctx->pool_width != 0 && ctx->pool_height != 0 &&
+	    (new_w != ctx->pool_width || new_h != ctx->pool_height)) {
+		frame.Close();
+
+		U_LOG_I("Capture: pool resize %ux%u → %ux%u (HWND=%p)",
+		         ctx->pool_width, ctx->pool_height, new_w, new_h, (void *)ctx->hwnd);
+
+		try {
+			ctx->frame_pool.Recreate(
+			    get_winrt_device(ctx->device.get()),
+			    winrt_dx::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+			    1,
+			    {static_cast<int32_t>(new_w), static_cast<int32_t>(new_h)});
+		} catch (...) {
+			U_LOG_E("Capture: frame pool Recreate failed");
+		}
+		ctx->pool_width = new_w;
+		ctx->pool_height = new_h;
+		return; // Skip this frame — next one will be at the new size
+	}
+
 	{
 		std::lock_guard<std::mutex> lock(ctx->mutex);
 
-		// Recreate staging texture if size changed
+		// Create or recreate staging texture if needed (first frame or size change)
 		if (!ctx->staging_texture || ctx->width != new_w || ctx->height != new_h) {
 			D3D11_TEXTURE2D_DESC desc = {};
 			desc.Width = new_w;
@@ -165,7 +198,7 @@ on_frame_arrived(struct d3d11_capture_context *ctx,
 			ctx->width = new_w;
 			ctx->height = new_h;
 
-			U_LOG_W("Capture: frame size %ux%u (HWND=%p)", new_w, new_h, (void *)ctx->hwnd);
+			U_LOG_W("Capture: staging texture %ux%u (HWND=%p)", new_w, new_h, (void *)ctx->hwnd);
 		}
 
 		// Copy captured frame to our staging texture.
@@ -254,6 +287,8 @@ d3d11_capture_start(struct ID3D11Device *device, HWND hwnd)
 		    winrt_dx::DirectXPixelFormat::B8G8R8A8UIntNormalized,
 		    1,  // buffer count — latest-frame model
 		    size);
+		ctx->pool_width = static_cast<uint32_t>(size.Width);
+		ctx->pool_height = static_cast<uint32_t>(size.Height);
 
 		// Register FrameArrived callback
 		ctx->frame_arrived_revoker = ctx->frame_pool.FrameArrived(
