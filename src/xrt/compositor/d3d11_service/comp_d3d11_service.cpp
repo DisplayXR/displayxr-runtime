@@ -3054,6 +3054,10 @@ multi_compositor_register_client(struct d3d11_service_system *sys, struct d3d11_
 				int row = i / 2;
 				center_x_m = (col == 0 ? -0.25f : +0.25f) * disp_w_m;
 				center_y_m = (row == 0 ? +0.25f : -0.25f) * disp_h_m;
+				// Offset top row down by title bar height so title bar stays on-screen
+				if (row == 0) {
+					center_y_m -= UI_TITLE_BAR_H_M;
+				}
 			} else {
 				// Cascade: offset from center so each window is visible
 				float offset = (i - 4) * 0.02f;
@@ -3293,6 +3297,9 @@ multi_compositor_add_capture_client(struct d3d11_service_system *sys, HWND hwnd,
 				int row = i / 2;
 				center_x_m = (col == 0 ? -0.25f : +0.25f) * disp_w_m;
 				center_y_m = (row == 0 ? +0.25f : -0.25f) * disp_h_m;
+				if (row == 0) {
+					center_y_m -= UI_TITLE_BAR_H_M;
+				}
 			} else {
 				float offset = (i - 4) * 0.02f;
 				center_x_m = offset;
