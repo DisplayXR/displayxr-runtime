@@ -273,6 +273,14 @@ d3d11_capture_start(struct ID3D11Device *device, HWND hwnd)
 			// IsBorderRequired not available on older Windows — ignore
 		}
 
+		// Don't capture the OS cursor — the shell renders its own cursor
+		// and the captured cursor creates a confusing dual-cursor effect.
+		try {
+			ctx->session.IsCursorCaptureEnabled(false);
+		} catch (...) {
+			// IsCursorCaptureEnabled not available on older Windows — ignore
+		}
+
 		ctx->session.StartCapture();
 
 		U_LOG_W("Capture: started for HWND=%p (%dx%d)",
