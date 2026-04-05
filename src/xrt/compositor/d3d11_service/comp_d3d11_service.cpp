@@ -2997,10 +2997,11 @@ multi_compositor_register_client(struct d3d11_service_system *sys, struct d3d11_
 			mc->clients[i].compositor = c;
 			mc->clients[i].active = true;
 
-			// Default window pose: 40% of display size, placed in left/right halves.
+			// Default window pose: 2x2 grid layout so new apps don't overlap.
 			// Convention: position is meters from display center, +X right, +Y up.
-			// Slot 0: left window centered at (-25%, +25%) of display
-			// Slot 1: right window centered at (+25%, +25%) of display
+			//   Slot 0: top-left      Slot 1: top-right
+			//   Slot 2: bottom-left   Slot 3: bottom-right
+			//   Slot 4+: cascade with small offset to stay visible
 			float disp_w_m = sys->base.info.display_width_m;
 			float disp_h_m = sys->base.info.display_height_m;
 			if (disp_w_m <= 0.0f) disp_w_m = 0.700f;
@@ -3008,10 +3009,19 @@ multi_compositor_register_client(struct d3d11_service_system *sys, struct d3d11_
 
 			float win_w_m = disp_w_m * 0.40f;
 			float win_h_m = disp_h_m * 0.40f;
-			// Slot 0 center: (-0.25 * disp_w, +0.25 * disp_h) → left, upper
-			// Slot 1 center: (+0.25 * disp_w, +0.25 * disp_h) → right, upper
-			float center_x_m = (i == 0) ? (-0.25f * disp_w_m) : (+0.25f * disp_w_m);
-			float center_y_m = 0.25f * disp_h_m;  // +Y up = upper half
+			float center_x_m, center_y_m;
+			if (i < 4) {
+				// 2x2 grid: col = i%2, row = i/2
+				int col = i % 2;
+				int row = i / 2;
+				center_x_m = (col == 0 ? -0.25f : +0.25f) * disp_w_m;
+				center_y_m = (row == 0 ? +0.25f : -0.25f) * disp_h_m;
+			} else {
+				// Cascade: offset from center so each window is visible
+				float offset = (i - 4) * 0.02f;
+				center_x_m = offset;
+				center_y_m = -offset;
+			}
 
 			// Entry animation: start from center (small), animate to target position.
 			// Set initial pose at display center, small size.
