@@ -3898,9 +3898,11 @@ shell_raycast_hit_test(struct d3d11_service_system *sys,
 				result.in_title_bar = in_window && (local_y < title_bar_h_m);
 				result.in_content = in_window && (local_y >= title_bar_h_m);
 			} else {
-				// Capture clients: entire area is content (no shell title bar)
-				result.in_title_bar = false;
-				result.in_content = in_window;
+				// Capture clients: map the top strip of captured content as
+				// a drag zone (where the native title bar is). Use the same
+				// height as the shell title bar for consistency.
+				result.in_title_bar = in_window && (local_y < title_bar_h_m);
+				result.in_content = in_window && (local_y >= title_bar_h_m);
 			}
 
 			if (result.in_title_bar) {
@@ -4841,13 +4843,19 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			}
 
 			if (in_close_btn && hit_slot >= 0) {
-				// Close button: send EXIT_REQUEST
-				struct d3d11_service_compositor *fc = mc->clients[hit_slot].compositor;
-				if (fc != nullptr && fc->xses != nullptr) {
-					union xrt_session_event xse = XRT_STRUCT_INIT;
-					xse.type = XRT_SESSION_EVENT_EXIT_REQUEST;
-					xrt_session_event_sink_push(fc->xses, &xse);
-					U_LOG_W("Multi-comp: close button → exit request for slot %d", hit_slot);
+				if (mc->clients[hit_slot].client_type == CLIENT_TYPE_CAPTURE) {
+					// Capture client: remove directly
+					multi_compositor_remove_capture_client(sys, hit_slot);
+					U_LOG_W("Multi-comp: close button → removed capture slot %d", hit_slot);
+				} else {
+					// IPC client: send EXIT_REQUEST
+					struct d3d11_service_compositor *fc = mc->clients[hit_slot].compositor;
+					if (fc != nullptr && fc->xses != nullptr) {
+						union xrt_session_event xse = XRT_STRUCT_INIT;
+						xse.type = XRT_SESSION_EVENT_EXIT_REQUEST;
+						xrt_session_event_sink_push(fc->xses, &xse);
+						U_LOG_W("Multi-comp: close button → exit request for slot %d", hit_slot);
+					}
 				}
 			} else if (in_minimize_btn && hit_slot >= 0) {
 				// Minimize button: hide window
@@ -5855,7 +5863,9 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			bool fb_rotated = !quat_is_identity(&mc->clients[s].window_pose.orientation);
 			float fb_hw = mc->clients[s].window_width_m / 2.0f;
 			float fb_hh = mc->clients[s].window_height_m / 2.0f;
-			float fb_tb_h = UI_TITLE_BAR_H_M;
+			// Capture clients have no shell title bar — border wraps content only
+			float fb_tb_h = (mc->clients[s].client_type != CLIENT_TYPE_CAPTURE)
+			    ? UI_TITLE_BAR_H_M : 0.0f;
 			float disp_w_m_fb = sys->base.info.display_width_m;
 			if (disp_w_m_fb <= 0.0f) disp_w_m_fb = 0.700f;
 			float bw_m = 3.0f * disp_w_m_fb / (float)(ca_w > 0 ? ca_w : 3840);
@@ -5887,7 +5897,9 @@ multi_compositor_render(struct d3d11_service_system *sys)
 				sys->context->RSSetScissorRects(1, &bsc);
 
 				// Non-rotated fallback positions
-				int32_t brd_y = eye_rect_y[bei] - TITLE_BAR_HEIGHT_PX;
+				int32_t tb_px = (mc->clients[s].client_type != CLIENT_TYPE_CAPTURE)
+				    ? TITLE_BAR_HEIGHT_PX : 0;
+				int32_t brd_y = eye_rect_y[bei] - tb_px;
 				int32_t brd_h = eye_rect_h[bei] + (eye_rect_y[bei] - brd_y);
 				float bfx = (float)eye_rect_x[bei] / ca_w;
 				float bfy = (float)brd_y / ca_h;
