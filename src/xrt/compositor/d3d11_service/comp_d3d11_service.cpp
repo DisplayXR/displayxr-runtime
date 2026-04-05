@@ -3874,16 +3874,18 @@ shell_raycast_hit_test(struct d3d11_service_system *sys,
 		float win_bottom = win_y - win_h / 2.0f;
 		float win_top = win_y + win_h / 2.0f;
 
-		// Extended bounds including title bar (above content)
-		float ext_top = win_top + title_bar_h_m;
+		// Extended bounds including title bar (above content).
+		// Capture clients have no shell title bar — their native chrome is in the content.
+		bool has_shell_title_bar = (mc->clients[s].client_type != CLIENT_TYPE_CAPTURE);
+		float ext_top = win_top + (has_shell_title_bar ? title_bar_h_m : 0.0f);
 
 		// Check if hit is within extended window bounds (including resize zone)
 		if (hit_x >= win_left - resize_zone_m && hit_x < win_right + resize_zone_m &&
 		    hit_y >= win_bottom - resize_zone_m && hit_y < ext_top + resize_zone_m) {
 
-			// Window-local coordinates: (0,0) = top of title bar, positive down/right
+			// Window-local coordinates: (0,0) = top of title bar (or content top for capture), positive down/right
 			float local_x = hit_x - win_left;
-			float local_y = ext_top - hit_y; // Positive downward from title bar top
+			float local_y = ext_top - hit_y; // Positive downward from top
 
 			result.slot = s;
 			result.local_x_m = local_x;
@@ -3892,8 +3894,14 @@ shell_raycast_hit_test(struct d3d11_service_system *sys,
 			// Classify hit region
 			bool in_window = (hit_x >= win_left && hit_x < win_right &&
 			                  hit_y >= win_bottom && hit_y < ext_top);
-			result.in_title_bar = in_window && (local_y < title_bar_h_m);
-			result.in_content = in_window && (local_y >= title_bar_h_m);
+			if (has_shell_title_bar) {
+				result.in_title_bar = in_window && (local_y < title_bar_h_m);
+				result.in_content = in_window && (local_y >= title_bar_h_m);
+			} else {
+				// Capture clients: entire area is content (no shell title bar)
+				result.in_title_bar = false;
+				result.in_content = in_window;
+			}
 
 			if (result.in_title_bar) {
 				result.in_close_btn = (local_x >= win_w - btn_w_m);
@@ -5592,7 +5600,11 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			sys->context->Draw(4, 0);
 		}
 
-		// Draw title bar for this slot (inside render_order loop for correct z-order)
+		// Draw title bar for this slot (inside render_order loop for correct z-order).
+		// Skip for capture clients — their captured content includes the native
+		// window chrome (title bar, tabs, toolbar), so adding a shell title bar
+		// would be redundant.
+		if (mc->clients[s].client_type != CLIENT_TYPE_CAPTURE)
 		{
 			float tb_h_frac = (float)TITLE_BAR_HEIGHT_PX / (float)ca_h;
 			// Window local-space dimensions for rotated chrome
