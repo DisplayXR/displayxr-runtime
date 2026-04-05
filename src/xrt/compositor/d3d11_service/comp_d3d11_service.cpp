@@ -3142,6 +3142,12 @@ multi_compositor_destroy(struct d3d11_multi_compositor *mc)
 static xrt_result_t
 multi_compositor_ensure_output(struct d3d11_service_system *sys)
 {
+	// Serialize multi-comp init — multiple IPC client threads can call this
+	// concurrently when clients connect simultaneously (e.g., shell launching
+	// D3D11 + VK apps). Without this lock, both threads create the display
+	// processor, causing SR SDK state corruption and crash.
+	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+
 	if (sys->multi_comp == nullptr) {
 		sys->multi_comp = new d3d11_multi_compositor();
 		std::memset(sys->multi_comp, 0, sizeof(*sys->multi_comp));
