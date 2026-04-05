@@ -91,3 +91,46 @@ displayxr-shell.exe --capture-hwnd <decimal|0xhex> [--capture-hwnd ...] app1.exe
 - **Pool size tracking**: `pool_width/pool_height` tracked separately from staging texture size to prevent infinite Recreate loops on resize.
 - **No shell title bar for capture**: Captured windows include their own native chrome. Shell renders no title bar but maps the top strip of content as a drag zone.
 - **Client ID offset**: Capture client IDs start at 1000 to avoid collision with IPC client IDs from the thread pool.
+
+---
+
+# Shell Phase 4B Status: Input Forwarding & Window Adoption
+
+**Branch:** `feature/shell-phase4-ci`
+**Status:** Partial — infrastructure complete, input forwarding unsolved
+**Date:** 2026-04-05
+
+## What Was Built
+
+1. **Client capacity increase** — `D3D11_MULTI_MAX_CLIENTS` 8→24, `MAX_CAPTURES` 8→24
+2. **Input event ring buffer** — Lock-free SPSC buffer in WndProc for capture client keyboard events. `shell_input_event` struct, `consume_input_events()` and `request_foreground()` APIs.
+3. **SendInput dispatch** — Render loop drains ring buffer and calls `SendInput` with `KEYEVENTF_UNICODE` for WM_CHAR and proper scan codes for WM_KEYDOWN/UP.
+4. **Saved window placement** — `WINDOWPLACEMENT` and `saved_exstyle` stored per capture slot for future off-screen management and restore.
+5. **Window enumeration** — `EnumWindows` + filtering in shell `main.c`. Skips system windows (taskbar, desktop, WorkerW, etc.), own/service PIDs, IPC client PIDs, tiny windows, owned popups.
+6. **Auto-adoption** — When no `--capture-hwnd` args, shell auto-adopts all visible 2D windows on startup.
+7. **Dynamic window tracking** — Poll loop checks for new/closed windows every 1 second.
+
+## What Does NOT Work
+
+**Keyboard input forwarding to WinUI/XAML apps** (Notepad, Paint, Terminal, Chrome on Windows 11).
+
+### The Problem
+
+`PostMessage(WM_KEYDOWN/WM_CHAR)` is ignored by WinUI apps — they consume input from the OS hardware input queue, not from posted messages. `SendInput` injects into the hardware queue but always delivers to the **foreground window**.
+
+### Approaches Tried
+
+| Approach | Result |
+|----------|--------|
+| PostMessage | Works for Win32 apps, ignored by WinUI |
+| SendInput + SetForegroundWindow | Steals keyboard focus from shell — WndProc stops receiving keystrokes |
+| Foreground flash (set→inject→restore per frame) | Works but visible blinking, unusable UX |
+| HWND_TOPMOST + SetForegroundWindow | Swap chain creation fails (`DXGI_ERROR_NOT_CURRENTLY_AVAILABLE`); topmost-after-creation untested |
+| Off-screen HWND (-32000,-32000) | Caused partial black capture rendering |
+
+### Approaches To Investigate
+
+1. **Low-level keyboard hook (`WH_KEYBOARD_LL`)** — System-wide hook intercepts all keystrokes before delivery. Shell hook captures keystrokes, suppresses them from reaching the shell window, and injects into the foreground capture HWND via SendInput. Shell window stays topmost (applied after swap chain creation). This is the most promising approach.
+2. **Virtual HID driver** — Kernel-level input injection like RDP. Most robust, but requires driver signing.
+3. **`AttachThreadInput`** — Share input queues between shell and target window threads. May allow `SetFocus` without `SetForegroundWindow`.
+4. **UI Automation** — Fallback for text-only input (not general keyboard/mouse).
