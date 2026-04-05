@@ -28,6 +28,22 @@ struct comp_d3d11_window;
 struct xrt_system_devices;
 
 /*!
+ * Input event buffered from WndProc for capture client SendInput dispatch.
+ * The WndProc pushes these into a ring buffer instead of PostMessage for
+ * capture clients; the compositor thread drains them and calls SendInput.
+ */
+struct shell_input_event
+{
+	uint32_t message; //!< WM_KEYDOWN, WM_CHAR, WM_LBUTTONDOWN, etc.
+	uint64_t wParam;
+	int64_t lParam;
+	int32_t mapped_x; //!< Pre-remapped app coords (-1 if keyboard event)
+	int32_t mapped_y;
+};
+
+#define SHELL_INPUT_RING_SIZE 64
+
+/*!
  * Create a self-owned window for the D3D11 compositor.
  *
  * This creates a window on a **dedicated thread**. The window thread
@@ -222,6 +238,37 @@ comp_d3d11_window_set_cursor(struct comp_d3d11_window *window, int cursor_id);
  */
 void
 comp_d3d11_window_set_shell_dp(struct comp_d3d11_window *window, void *dp);
+
+/*!
+ * Consume pending input events from the WndProc ring buffer.
+ *
+ * Called from the compositor/render thread to drain buffered input events
+ * that the WndProc queued for capture clients (instead of PostMessage).
+ *
+ * @param window     The window object
+ * @param out_events Array to receive events
+ * @param max_events Maximum number of events to return
+ * @return Number of events written to out_events
+ */
+uint32_t
+comp_d3d11_window_consume_input_events(struct comp_d3d11_window *window,
+                                       struct shell_input_event *out_events,
+                                       uint32_t max_events);
+
+/*!
+ * Request SetForegroundWindow on the window thread.
+ *
+ * SetForegroundWindow must be called from the thread that owns the current
+ * foreground window. This posts the request to the window thread and waits
+ * for completion. Used to give keyboard focus to off-screen capture client
+ * HWNDs for SendInput dispatch.
+ *
+ * @param window      The window object
+ * @param target_hwnd The HWND to make foreground (NULL to restore shell window)
+ */
+void
+comp_d3d11_window_request_foreground(struct comp_d3d11_window *window,
+                                     void *target_hwnd);
 
 #ifdef __cplusplus
 }

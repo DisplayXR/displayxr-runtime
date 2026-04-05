@@ -145,10 +145,54 @@ struct comp_d3d11_window
 
 	//! Shell display processor for ESC/close 2D mode switch (opaque, can be NULL).
 	volatile void *shell_dp;
+
+	//! Ring buffer for capture client input events (WndProc writes, render thread reads).
+	//! Lock-free SPSC: WndProc is the single producer, render loop is the single consumer.
+	struct shell_input_event input_ring[SHELL_INPUT_RING_SIZE];
+	volatile LONG input_ring_write; //!< Next write index (WndProc thread)
+	volatile LONG input_ring_read;  //!< Next read index (compositor thread)
+
+	//! Target HWND for SetForegroundWindow request (compositor writes, window thread reads).
+	//! NULL means no pending request. Window thread clears after calling SetForegroundWindow.
+	volatile HWND pending_foreground_hwnd;
+
+	//! Signaled by window thread after SetForegroundWindow completes.
+	volatile LONG foreground_done;
 };
 
 // Forward declarations
 static void set_fullscreen(HWND hWnd, bool fullscreen);
+
+// Custom message ID for foreground request (posted to window thread)
+#define WM_SHELL_SET_FOREGROUND (WM_USER + 100)
+
+/*!
+ * Push an input event into the ring buffer (WndProc thread only).
+ * Drops the event if the buffer is full (bounded loss, not a hang).
+ */
+static void
+input_ring_push(struct comp_d3d11_window *w,
+                uint32_t message,
+                uint64_t wParam,
+                int64_t lParam,
+                int32_t mapped_x,
+                int32_t mapped_y)
+{
+	LONG wr = InterlockedCompareExchange(&w->input_ring_write, 0, 0);
+	LONG rd = InterlockedCompareExchange(&w->input_ring_read, 0, 0);
+	LONG next = (wr + 1) % SHELL_INPUT_RING_SIZE;
+	if (next == rd) {
+		// Buffer full — drop event
+		return;
+	}
+	w->input_ring[wr].message = message;
+	w->input_ring[wr].wParam = wParam;
+	w->input_ring[wr].lParam = lParam;
+	w->input_ring[wr].mapped_x = mapped_x;
+	w->input_ring[wr].mapped_y = mapped_y;
+	MemoryBarrier();
+	InterlockedExchange(&w->input_ring_write, next);
+}
 
 /*!
  * Check if a virtual key code is reserved for shell controls.
@@ -375,10 +419,16 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		// Qwerty processes first (mode toggles, camera controls), then
 		// the key is forwarded to the focused app's HWND.
 		HWND fwd = (HWND)InterlockedCompareExchangePointer((volatile PVOID *)&w->input_forward_hwnd, NULL, NULL);
+		LONG is_capture = InterlockedCompareExchange(&w->input_forward_is_capture, 0, 0);
 		if (fwd != NULL) {
 			// WM_CHAR/WM_SYSCHAR: forward to the target app.
 			if (message == WM_CHAR || message == WM_SYSCHAR) {
-				PostMessage(fwd, message, wParam, lParam);
+				if (is_capture) {
+					// Capture client: buffer for SendInput dispatch
+					input_ring_push(w, message, (uint64_t)wParam, (int64_t)lParam, -1, -1);
+				} else {
+					PostMessage(fwd, message, wParam, lParam);
+				}
 				return 0;
 			}
 
@@ -399,8 +449,13 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			    wParam >= '1' && wParam <= '4') {
 				return 0;
 			}
-			// Forward to IPC app's HWND via PostMessage
-			PostMessage(fwd, message, wParam, lParam);
+			if (is_capture) {
+				// Capture client: buffer for SendInput dispatch
+				input_ring_push(w, message, (uint64_t)wParam, (int64_t)lParam, -1, -1);
+			} else {
+				// IPC app: forward via PostMessage (works fine)
+				PostMessage(fwd, message, wParam, lParam);
+			}
 			return 0;
 		}
 
@@ -429,6 +484,7 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	case WM_MOUSEMOVE:
 	case WM_MOUSEWHEEL: {
 		HWND fwd = (HWND)InterlockedCompareExchangePointer((volatile PVOID *)&w->input_forward_hwnd, NULL, NULL);
+		LONG is_capture = InterlockedCompareExchange(&w->input_forward_is_capture, 0, 0);
 		if (fwd != NULL) {
 			// Shell mode: scroll is reserved for window resize.
 			// Right-click is forwarded to the app (focus change handled in render loop).
@@ -474,11 +530,22 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 						app_x = rel_x;
 						app_y = rel_y;
 					}
-					PostMessage(fwd, message, wParam, MAKELPARAM(app_x, app_y));
+					if (is_capture) {
+						// Capture client: buffer for SendInput dispatch
+						input_ring_push(w, message, (uint64_t)wParam, (int64_t)lParam, app_x, app_y);
+					} else {
+						PostMessage(fwd, message, wParam, MAKELPARAM(app_x, app_y));
+					}
 				}
 			} else {
 				// No rect set — fallback to 1:1 forwarding
-				PostMessage(fwd, message, wParam, lParam);
+				if (is_capture) {
+					int app_x = GET_X_LPARAM(lParam);
+					int app_y = GET_Y_LPARAM(lParam);
+					input_ring_push(w, message, (uint64_t)wParam, (int64_t)lParam, app_x, app_y);
+				} else {
+					PostMessage(fwd, message, wParam, lParam);
+				}
 			}
 			return 0;
 		}
@@ -504,6 +571,19 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			}
 		}
 		break;
+
+	case WM_SHELL_SET_FOREGROUND: {
+		// Cross-thread foreground request from compositor.
+		// wParam = target HWND. NULL means restore shell window.
+		HWND target = (HWND)wParam;
+		if (target != NULL) {
+			SetForegroundWindow(target);
+		} else {
+			SetForegroundWindow(hWnd);
+		}
+		InterlockedExchange(&w->foreground_done, 1);
+		return 0;
+	}
 
 	default:
 		return DefWindowProcW(hWnd, message, wParam, lParam);
@@ -910,4 +990,49 @@ comp_d3d11_window_set_shell_dp(struct comp_d3d11_window *window, void *dp)
 		return;
 	}
 	InterlockedExchangePointer((volatile PVOID *)&window->shell_dp, (PVOID)dp);
+}
+
+extern "C" uint32_t
+comp_d3d11_window_consume_input_events(struct comp_d3d11_window *window,
+                                       struct shell_input_event *out_events,
+                                       uint32_t max_events)
+{
+	if (window == NULL || out_events == NULL || max_events == 0) {
+		return 0;
+	}
+
+	uint32_t count = 0;
+	while (count < max_events) {
+		LONG rd = InterlockedCompareExchange(&window->input_ring_read, 0, 0);
+		LONG wr = InterlockedCompareExchange(&window->input_ring_write, 0, 0);
+		if (rd == wr) {
+			break; // Empty
+		}
+		MemoryBarrier();
+		out_events[count] = window->input_ring[rd];
+		InterlockedExchange(&window->input_ring_read, (rd + 1) % SHELL_INPUT_RING_SIZE);
+		count++;
+	}
+	return count;
+}
+
+extern "C" void
+comp_d3d11_window_request_foreground(struct comp_d3d11_window *window,
+                                     void *target_hwnd)
+{
+	if (window == NULL || window->hwnd == NULL) {
+		return;
+	}
+
+	InterlockedExchange(&window->foreground_done, 0);
+	// Post to window thread — it owns the current foreground window
+	PostMessageW(window->hwnd, WM_SHELL_SET_FOREGROUND, (WPARAM)target_hwnd, 0);
+
+	// Wait for completion (with timeout to avoid deadlock)
+	for (int i = 0; i < 100; i++) {
+		if (InterlockedCompareExchange(&window->foreground_done, 0, 0)) {
+			break;
+		}
+		Sleep(1);
+	}
 }

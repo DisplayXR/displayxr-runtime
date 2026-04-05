@@ -34,6 +34,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <process.h>
+#include <tlhelp32.h> // For process enumeration (service PID lookup)
 #else
 #include <unistd.h>
 #endif
@@ -43,7 +44,7 @@
 #define PE(...) fprintf(stderr, __VA_ARGS__)
 
 #define MAX_APPS 8
-#define MAX_CAPTURES 8
+#define MAX_CAPTURES 24
 
 static volatile int g_running = 1;
 
@@ -75,7 +76,7 @@ struct capture_entry
 	bool added;
 };
 
-#define MAX_SAVED_WINDOWS 16
+#define MAX_SAVED_WINDOWS 32
 
 struct saved_window
 {
@@ -534,6 +535,212 @@ print_clients(struct ipc_connection *ipc_c, uint32_t *prev_ids, uint32_t *prev_c
 	}
 }
 
+#ifdef _WIN32
+/*
+ * Window enumeration for auto-adoption of desktop windows.
+ */
+
+/*!
+ * Find the PID of displayxr-service.exe (to exclude its windows from adoption).
+ */
+static DWORD
+find_service_pid(void)
+{
+	HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+	if (snap == INVALID_HANDLE_VALUE) return 0;
+
+	PROCESSENTRY32 pe = {0};
+	pe.dwSize = sizeof(pe);
+	DWORD pid = 0;
+	if (Process32First(snap, &pe)) {
+		do {
+			if (_stricmp(pe.szExeFile, "displayxr-service.exe") == 0) {
+				pid = pe.th32ProcessID;
+				break;
+			}
+		} while (Process32Next(snap, &pe));
+	}
+	CloseHandle(snap);
+	return pid;
+}
+
+struct enum_ctx
+{
+	HWND found[MAX_CAPTURES];
+	int count;
+	DWORD shell_pid;   // our own process
+	DWORD service_pid; // displayxr-service process
+};
+
+static BOOL CALLBACK
+enum_windows_cb(HWND hwnd, LPARAM lParam)
+{
+	struct enum_ctx *ctx = (struct enum_ctx *)lParam;
+	if (ctx->count >= MAX_CAPTURES) {
+		return FALSE;
+	}
+
+	if (!IsWindowVisible(hwnd)) {
+		return TRUE;
+	}
+
+	// Skip owned popups
+	if (GetWindow(hwnd, GW_OWNER) != NULL) {
+		return TRUE;
+	}
+
+	// Skip our own process and service process windows
+	DWORD pid = 0;
+	GetWindowThreadProcessId(hwnd, &pid);
+	if (pid == ctx->shell_pid || pid == ctx->service_pid) {
+		return TRUE;
+	}
+
+	// Skip known system window classes
+	char class_name[256] = {0};
+	GetClassNameA(hwnd, class_name, sizeof(class_name));
+	if (strcmp(class_name, "Shell_TrayWnd") == 0 ||
+	    strcmp(class_name, "Progman") == 0 ||
+	    strcmp(class_name, "WorkerW") == 0 ||
+	    strcmp(class_name, "Button") == 0 ||
+	    strcmp(class_name, "NotifyIconOverflowWindow") == 0 ||
+	    strcmp(class_name, "Windows.UI.Core.CoreWindow") == 0 ||
+	    strcmp(class_name, "Shell_SecondaryTrayWnd") == 0 ||
+	    strcmp(class_name, "XamlExplorerHostIslandWindow") == 0 ||
+	    strcmp(class_name, "TopLevelWindowForOverflowXamlIsland") == 0) {
+		return TRUE;
+	}
+
+	// Skip tiny windows (tooltips, helpers, hidden overlays)
+	RECT rect;
+	GetClientRect(hwnd, &rect);
+	if ((rect.right - rect.left) < 100 || (rect.bottom - rect.top) < 100) {
+		return TRUE;
+	}
+
+	// Skip windows with WS_EX_TOOLWINDOW (already hidden from taskbar)
+	LONG_PTR exstyle = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
+	if (exstyle & WS_EX_TOOLWINDOW) {
+		return TRUE;
+	}
+
+	ctx->found[ctx->count++] = hwnd;
+	return TRUE;
+}
+
+/*!
+ * Enumerate visible desktop windows and adopt new ones as capture clients.
+ * Skips windows already tracked in the captures array and IPC clients.
+ */
+static void
+enumerate_and_adopt_windows(struct ipc_connection *ipc_c,
+                            struct capture_entry *captures,
+                            int *capture_count,
+                            DWORD service_pid)
+{
+	// Enumerate visible top-level windows
+	struct enum_ctx ctx = {0};
+	ctx.shell_pid = GetCurrentProcessId();
+	ctx.service_pid = service_pid;
+	EnumWindows(enum_windows_cb, (LPARAM)&ctx);
+
+	// Get current IPC client PIDs to skip OpenXR 3D apps
+	DWORD ipc_pids[IPC_MAX_CLIENTS] = {0};
+	int ipc_pid_count = 0;
+	{
+		struct ipc_client_list clients;
+		if (ipc_call_system_get_clients(ipc_c, &clients) == XRT_SUCCESS) {
+			for (uint32_t c = 0; c < clients.id_count; c++) {
+				if (clients.ids[c] == 0) continue;
+				struct ipc_app_state ias;
+				if (ipc_call_system_get_client_info(ipc_c, clients.ids[c], &ias) == XRT_SUCCESS) {
+					ipc_pids[ipc_pid_count++] = ias.pid;
+					if (ipc_pid_count >= IPC_MAX_CLIENTS) break;
+				}
+			}
+		}
+	}
+
+	for (int i = 0; i < ctx.count; i++) {
+		HWND hwnd = ctx.found[i];
+		uint64_t hwnd_val = (uint64_t)(uintptr_t)hwnd;
+
+		// Skip if already tracked
+		bool already_tracked = false;
+		for (int j = 0; j < *capture_count; j++) {
+			if (captures[j].hwnd == hwnd_val && captures[j].added) {
+				already_tracked = true;
+				break;
+			}
+		}
+		if (already_tracked) continue;
+
+		// Skip if this HWND belongs to an IPC client process
+		DWORD hwnd_pid = 0;
+		GetWindowThreadProcessId(hwnd, &hwnd_pid);
+		bool is_ipc = false;
+		for (int j = 0; j < ipc_pid_count; j++) {
+			if (ipc_pids[j] == hwnd_pid) {
+				is_ipc = true;
+				break;
+			}
+		}
+		if (is_ipc) continue;
+
+		// Adopt this window
+		if (*capture_count >= MAX_CAPTURES) {
+			P("  Auto-adopt: max captures (%d) reached\n", MAX_CAPTURES);
+			break;
+		}
+
+		struct capture_entry *ce = &captures[*capture_count];
+		memset(ce, 0, sizeof(*ce));
+		ce->hwnd = hwnd_val;
+		{
+			char title[128] = "Captured Window";
+			GetWindowTextA(hwnd, title, sizeof(title));
+			snprintf(ce->name, sizeof(ce->name), "%s", title);
+		}
+
+		uint32_t cid = 0;
+		xrt_result_t r = ipc_call_shell_add_capture_client(ipc_c, ce->hwnd, &cid);
+		if (r == XRT_SUCCESS) {
+			ce->client_id = cid;
+			ce->added = true;
+			(*capture_count)++;
+			P("  Auto-adopt: HWND=0x%llx '%s' → client_id=%u\n",
+			  (unsigned long long)ce->hwnd, ce->name, cid);
+		} else {
+			P("  Auto-adopt: failed for HWND=0x%llx '%s'\n",
+			  (unsigned long long)ce->hwnd, ce->name);
+		}
+	}
+}
+
+/*!
+ * Check for closed capture windows and remove their capture clients.
+ */
+static void
+cleanup_closed_captures(struct ipc_connection *ipc_c,
+                        struct capture_entry *captures,
+                        int *capture_count)
+{
+	for (int i = 0; i < *capture_count; i++) {
+		if (!captures[i].added) continue;
+		if (!IsWindow((HWND)(uintptr_t)captures[i].hwnd)) {
+			P("  Window closed: '%s' (client_id=%u)\n", captures[i].name, captures[i].client_id);
+			ipc_call_shell_remove_capture_client(ipc_c, captures[i].client_id);
+			// Shift remaining entries
+			for (int j = i; j < *capture_count - 1; j++) {
+				captures[j] = captures[j + 1];
+			}
+			(*capture_count)--;
+			i--; // Re-check this index
+		}
+	}
+}
+#endif // _WIN32
+
 int
 main(int argc, char *argv[])
 {
@@ -631,6 +838,21 @@ main(int argc, char *argv[])
 	}
 #endif
 
+#ifdef _WIN32
+	// Auto-adopt desktop windows if no explicit --capture-hwnd args were given.
+	// Wait briefly for multi-compositor to initialize.
+	bool auto_adopt = (capture_count == 0);
+	DWORD service_pid = find_service_pid();
+	if (auto_adopt) {
+		Sleep(500); // Wait for multi-comp window to appear
+		P("Auto-adopting visible desktop windows...\n");
+		enumerate_and_adopt_windows(&ipc_c, captures, &capture_count, service_pid);
+		P("Adopted %d window(s)\n", capture_count);
+	}
+#else
+	bool auto_adopt = false;
+#endif
+
 	P("Monitoring clients (Ctrl+C to exit)...\n");
 
 	uint32_t prev_ids[IPC_MAX_CLIENTS] = {0};
@@ -647,6 +869,7 @@ main(int argc, char *argv[])
 	shell_config_load(&config);
 
 	int save_counter = 0; // Save every 5 seconds (10 polls * 500ms)
+	int adopt_counter = 0; // Re-enumerate every 1 second (2 polls * 500ms)
 
 	// Client ID → numbered name mapping (for persistence with duplicate app names)
 	static struct { uint32_t id; char name[128]; } client_names[MAX_SAVED_WINDOWS];
@@ -771,6 +994,20 @@ main(int argc, char *argv[])
 				shell_config_save(&config);
 			}
 		}
+
+		// Dynamic window tracking: detect new/closed windows every ~1 second
+#ifdef _WIN32
+		if (auto_adopt) {
+			adopt_counter++;
+			if (adopt_counter >= 2) {
+				adopt_counter = 0;
+				// Remove closed windows
+				cleanup_closed_captures(&ipc_c, captures, &capture_count);
+				// Adopt new windows
+				enumerate_and_adopt_windows(&ipc_c, captures, &capture_count, service_pid);
+			}
+		}
+#endif
 
 #ifdef _WIN32
 		Sleep(500);

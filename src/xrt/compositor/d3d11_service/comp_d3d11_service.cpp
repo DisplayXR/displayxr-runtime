@@ -398,7 +398,7 @@ struct d3d11_service_system
  *
  */
 
-#define D3D11_MULTI_MAX_CLIENTS 8
+#define D3D11_MULTI_MAX_CLIENTS 24
 
 //! Spatial UI dimensions in METERS — the single source of truth.
 //! Both rendering and hit-testing derive from these values.
@@ -529,6 +529,8 @@ struct d3d11_multi_client_slot
 	ID3D11Texture2D *capture_texture_last;                   //!< Last texture pointer (for SRV recreation)
 	uint32_t capture_width;                                  //!< Current capture texture width
 	uint32_t capture_height;                                 //!< Current capture texture height
+	WINDOWPLACEMENT saved_placement;                         //!< Original window placement (for restore)
+	LONG saved_exstyle;                                      //!< Original extended window style
 	//! @}
 };
 
@@ -672,6 +674,10 @@ struct d3d11_multi_compositor
 	//! True when display is in 2D mode due to capture client focus.
 	//! Tracked separately from sys->hardware_display_3d to detect transitions.
 	bool capture_forced_2d;
+
+	//! Tracks which capture HWND currently has foreground focus for SendInput.
+	//! NULL means no capture client is foreground (shell window is foreground).
+	HWND current_foreground_capture;
 };
 
 
@@ -2955,6 +2961,9 @@ service_crop_atlas_for_dp(struct d3d11_service_system *sys,
 /*!
  * Update the multi-comp window's input forwarding target to the focused app's HWND.
  * Called whenever focused_slot changes (TAB, register, unregister).
+ *
+ * For capture clients, also manages SetForegroundWindow so SendInput reaches
+ * the correct off-screen window.
  */
 static void
 multi_compositor_update_input_forward(struct d3d11_multi_compositor *mc)
@@ -2977,6 +2986,202 @@ multi_compositor_update_input_forward(struct d3d11_multi_compositor *mc)
 	}
 
 	comp_d3d11_window_set_input_forward(mc->window, (void *)target, rx, ry, rw, rh, is_capture);
+
+	// Manage foreground window for capture client input injection.
+	// SendInput always goes to the foreground window, so we need to
+	// SetForegroundWindow on the focused capture client's HWND.
+	if (is_capture && target != NULL && target != mc->current_foreground_capture) {
+		comp_d3d11_window_request_foreground(mc->window, (void *)target);
+		mc->current_foreground_capture = target;
+		U_LOG_I("Multi-comp: set foreground → capture HWND=%p", (void *)target);
+	} else if (!is_capture && mc->current_foreground_capture != NULL) {
+		// Focus moved to IPC client or no focus — restore shell window as foreground
+		comp_d3d11_window_request_foreground(mc->window, NULL);
+		mc->current_foreground_capture = NULL;
+		U_LOG_I("Multi-comp: restored foreground → shell window");
+	}
+}
+
+/*!
+ * Dispatch buffered input events to the focused capture client via SendInput.
+ *
+ * Called from the render loop. Drains the ring buffer and converts WM_ messages
+ * to INPUT structs for SendInput, which injects into the OS input queue.
+ * The focused capture HWND must already be foreground (via update_input_forward).
+ */
+static void
+multi_compositor_dispatch_capture_input(struct d3d11_multi_compositor *mc)
+{
+	if (mc == nullptr || mc->window == nullptr) {
+		return;
+	}
+
+	struct shell_input_event events[SHELL_INPUT_RING_SIZE];
+	uint32_t count = comp_d3d11_window_consume_input_events(mc->window, events, SHELL_INPUT_RING_SIZE);
+	if (count == 0) {
+		return;
+	}
+
+	// Get the current foreground capture HWND for mouse coordinate mapping
+	HWND fg = mc->current_foreground_capture;
+	if (fg == NULL) {
+		return; // No capture client is foreground, discard events
+	}
+
+	// Get screen position of the capture HWND for absolute mouse coordinates
+	RECT fg_screen = {0};
+	GetWindowRect(fg, &fg_screen);
+	// Get client area offset within the window
+	POINT client_origin = {0, 0};
+	ClientToScreen(fg, &client_origin);
+
+	// Virtual screen dimensions for MOUSEEVENTF_ABSOLUTE normalization
+	int vs_width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+	int vs_height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+	int vs_left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+	int vs_top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+
+	INPUT inputs[SHELL_INPUT_RING_SIZE];
+	uint32_t input_count = 0;
+
+	for (uint32_t i = 0; i < count; i++) {
+		struct shell_input_event *ev = &events[i];
+		INPUT *inp = &inputs[input_count];
+		memset(inp, 0, sizeof(INPUT));
+
+		switch (ev->message) {
+		case WM_CHAR: {
+			// Unicode character input — works for all app frameworks
+			inp->type = INPUT_KEYBOARD;
+			inp->ki.wVk = 0;
+			inp->ki.wScan = (WORD)ev->wParam;
+			inp->ki.dwFlags = KEYEVENTF_UNICODE;
+			input_count++;
+			break;
+		}
+		case WM_SYSCHAR: {
+			inp->type = INPUT_KEYBOARD;
+			inp->ki.wVk = 0;
+			inp->ki.wScan = (WORD)ev->wParam;
+			inp->ki.dwFlags = KEYEVENTF_UNICODE;
+			input_count++;
+			break;
+		}
+		case WM_KEYDOWN:
+		case WM_SYSKEYDOWN: {
+			inp->type = INPUT_KEYBOARD;
+			inp->ki.wVk = (WORD)ev->wParam;
+			inp->ki.wScan = (WORD)((ev->lParam >> 16) & 0xFF);
+			inp->ki.dwFlags = (ev->lParam & (1 << 24)) ? KEYEVENTF_EXTENDEDKEY : 0;
+			input_count++;
+			break;
+		}
+		case WM_KEYUP:
+		case WM_SYSKEYUP: {
+			inp->type = INPUT_KEYBOARD;
+			inp->ki.wVk = (WORD)ev->wParam;
+			inp->ki.wScan = (WORD)((ev->lParam >> 16) & 0xFF);
+			inp->ki.dwFlags = KEYEVENTF_KEYUP |
+			                  ((ev->lParam & (1 << 24)) ? KEYEVENTF_EXTENDEDKEY : 0);
+			input_count++;
+			break;
+		}
+		case WM_MOUSEMOVE: {
+			if (ev->mapped_x < 0) break;
+			inp->type = INPUT_MOUSE;
+			// Convert app-local coords to absolute screen coords
+			int screen_x = client_origin.x + ev->mapped_x;
+			int screen_y = client_origin.y + ev->mapped_y;
+			inp->mi.dx = (int)((float)(screen_x - vs_left) * 65535.0f / (float)(vs_width - 1));
+			inp->mi.dy = (int)((float)(screen_y - vs_top) * 65535.0f / (float)(vs_height - 1));
+			inp->mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+			input_count++;
+			break;
+		}
+		case WM_LBUTTONDOWN: {
+			if (ev->mapped_x < 0) break;
+			// Move cursor first
+			inp->type = INPUT_MOUSE;
+			int screen_x = client_origin.x + ev->mapped_x;
+			int screen_y = client_origin.y + ev->mapped_y;
+			inp->mi.dx = (int)((float)(screen_x - vs_left) * 65535.0f / (float)(vs_width - 1));
+			inp->mi.dy = (int)((float)(screen_y - vs_top) * 65535.0f / (float)(vs_height - 1));
+			inp->mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK |
+			                  MOUSEEVENTF_LEFTDOWN;
+			input_count++;
+			break;
+		}
+		case WM_LBUTTONUP: {
+			inp->type = INPUT_MOUSE;
+			if (ev->mapped_x >= 0) {
+				int screen_x = client_origin.x + ev->mapped_x;
+				int screen_y = client_origin.y + ev->mapped_y;
+				inp->mi.dx = (int)((float)(screen_x - vs_left) * 65535.0f / (float)(vs_width - 1));
+				inp->mi.dy = (int)((float)(screen_y - vs_top) * 65535.0f / (float)(vs_height - 1));
+				inp->mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+			}
+			inp->mi.dwFlags |= MOUSEEVENTF_LEFTUP;
+			input_count++;
+			break;
+		}
+		case WM_RBUTTONDOWN: {
+			if (ev->mapped_x < 0) break;
+			inp->type = INPUT_MOUSE;
+			int screen_x = client_origin.x + ev->mapped_x;
+			int screen_y = client_origin.y + ev->mapped_y;
+			inp->mi.dx = (int)((float)(screen_x - vs_left) * 65535.0f / (float)(vs_width - 1));
+			inp->mi.dy = (int)((float)(screen_y - vs_top) * 65535.0f / (float)(vs_height - 1));
+			inp->mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK |
+			                  MOUSEEVENTF_RIGHTDOWN;
+			input_count++;
+			break;
+		}
+		case WM_RBUTTONUP: {
+			inp->type = INPUT_MOUSE;
+			if (ev->mapped_x >= 0) {
+				int screen_x = client_origin.x + ev->mapped_x;
+				int screen_y = client_origin.y + ev->mapped_y;
+				inp->mi.dx = (int)((float)(screen_x - vs_left) * 65535.0f / (float)(vs_width - 1));
+				inp->mi.dy = (int)((float)(screen_y - vs_top) * 65535.0f / (float)(vs_height - 1));
+				inp->mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+			}
+			inp->mi.dwFlags |= MOUSEEVENTF_RIGHTUP;
+			input_count++;
+			break;
+		}
+		case WM_MBUTTONDOWN: {
+			if (ev->mapped_x < 0) break;
+			inp->type = INPUT_MOUSE;
+			int screen_x = client_origin.x + ev->mapped_x;
+			int screen_y = client_origin.y + ev->mapped_y;
+			inp->mi.dx = (int)((float)(screen_x - vs_left) * 65535.0f / (float)(vs_width - 1));
+			inp->mi.dy = (int)((float)(screen_y - vs_top) * 65535.0f / (float)(vs_height - 1));
+			inp->mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK |
+			                  MOUSEEVENTF_MIDDLEDOWN;
+			input_count++;
+			break;
+		}
+		case WM_MBUTTONUP: {
+			inp->type = INPUT_MOUSE;
+			if (ev->mapped_x >= 0) {
+				int screen_x = client_origin.x + ev->mapped_x;
+				int screen_y = client_origin.y + ev->mapped_y;
+				inp->mi.dx = (int)((float)(screen_x - vs_left) * 65535.0f / (float)(vs_width - 1));
+				inp->mi.dy = (int)((float)(screen_y - vs_top) * 65535.0f / (float)(vs_height - 1));
+				inp->mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+			}
+			inp->mi.dwFlags |= MOUSEEVENTF_MIDDLEUP;
+			input_count++;
+			break;
+		}
+		default:
+			break;
+		}
+	}
+
+	if (input_count > 0) {
+		SendInput(input_count, inputs, sizeof(INPUT));
+	}
 }
 
 // Forward declarations
@@ -3265,6 +3470,19 @@ multi_compositor_add_capture_client(struct d3d11_service_system *sys, HWND hwnd,
 				if ((unsigned char)*p < 0x20 || (unsigned char)*p > 0x7E) *p = '-';
 			}
 
+			// Save original window placement and style (for restore on removal)
+			mc->clients[i].saved_placement.length = sizeof(WINDOWPLACEMENT);
+			GetWindowPlacement(hwnd, &mc->clients[i].saved_placement);
+			mc->clients[i].saved_exstyle = (LONG)GetWindowLongPtr(hwnd, GWL_EXSTYLE);
+
+			// Move captured HWND off-screen for SendInput dispatch.
+			// Windows.Graphics.Capture still works at any position.
+			SetWindowPos(hwnd, NULL, -32000, -32000, 0, 0,
+			             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+			// Add WS_EX_TOOLWINDOW to suppress taskbar button
+			SetWindowLongPtr(hwnd, GWL_EXSTYLE,
+			                 GetWindowLongPtr(hwnd, GWL_EXSTYLE) | WS_EX_TOOLWINDOW);
+
 			// Compute initial size from HWND DPI
 			RECT client_rect = {};
 			GetClientRect(hwnd, &client_rect);
@@ -3384,6 +3602,13 @@ multi_compositor_remove_capture_client(struct d3d11_service_system *sys, int slo
 		return false;
 	}
 
+	// Restore original window placement and style before stopping capture.
+	// This puts the HWND back where it was on the desktop.
+	if (IsWindow(slot->app_hwnd)) {
+		SetWindowLongPtr(slot->app_hwnd, GWL_EXSTYLE, (LONG_PTR)slot->saved_exstyle);
+		SetWindowPlacement(slot->app_hwnd, &slot->saved_placement);
+	}
+
 	// Stop capture
 	d3d11_capture_stop(slot->capture_ctx);
 	slot->capture_ctx = nullptr;
@@ -3440,9 +3665,15 @@ multi_compositor_destroy(struct d3d11_multi_compositor *mc)
 		mc->capture_render_thread.join();
 	}
 
-	// Stop all capture clients
+	// Restore and stop all capture clients
 	for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
 		if (mc->clients[i].active && mc->clients[i].client_type == CLIENT_TYPE_CAPTURE) {
+			// Restore original window placement before stopping capture
+			if (IsWindow(mc->clients[i].app_hwnd)) {
+				SetWindowLongPtr(mc->clients[i].app_hwnd, GWL_EXSTYLE,
+				                 (LONG_PTR)mc->clients[i].saved_exstyle);
+				SetWindowPlacement(mc->clients[i].app_hwnd, &mc->clients[i].saved_placement);
+			}
 			d3d11_capture_stop(mc->clients[i].capture_ctx);
 			mc->clients[i].capture_ctx = nullptr;
 			mc->clients[i].capture_srv = nullptr;
@@ -5451,6 +5682,10 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			        (void *)mc->clients[s].app_hwnd, new_w, new_h);
 		}
 	}
+
+	// Dispatch buffered input events to focused capture client via SendInput.
+	// Must run before rendering so input arrives promptly (~16ms latency).
+	multi_compositor_dispatch_capture_input(mc);
 
 	// Clear combined atlas to dark gray background each frame.
 	// Prevents stale images after app close and provides background for windowed rendering.
