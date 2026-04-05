@@ -337,6 +337,13 @@ leia_dp_d3d12_request_display_mode(struct xrt_display_processor_d3d12 *xdp, bool
 }
 
 static bool
+leia_dp_d3d12_get_hardware_3d_state(struct xrt_display_processor_d3d12 *xdp, bool *out_is_3d)
+{
+	struct leia_display_processor_d3d12_impl *ldp = leia_dp_d3d12(xdp);
+	return leiasr_d3d12_get_hardware_3d_state(ldp->leiasr, out_is_3d);
+}
+
+static bool
 leia_dp_d3d12_get_display_dimensions(struct xrt_display_processor_d3d12 *xdp,
                                      float *out_width_m,
                                      float *out_height_m)
@@ -506,6 +513,7 @@ leia_dp_factory_d3d12(void *d3d12_device,
 	ldp->base.get_predicted_eye_positions = leia_dp_d3d12_get_predicted_eye_positions;
 	ldp->base.get_window_metrics = NULL;
 	ldp->base.request_display_mode = leia_dp_d3d12_request_display_mode;
+	ldp->base.get_hardware_3d_state = leia_dp_d3d12_get_hardware_3d_state;
 	ldp->base.get_display_dimensions = leia_dp_d3d12_get_display_dimensions;
 	ldp->base.get_display_pixel_info = leia_dp_d3d12_get_display_pixel_info;
 	ldp->base.destroy = leia_dp_d3d12_destroy;

@@ -159,6 +159,13 @@ leia_dp_gl_request_display_mode(struct xrt_display_processor_gl *xdp, bool enabl
 }
 
 static bool
+leia_dp_gl_get_hardware_3d_state(struct xrt_display_processor_gl *xdp, bool *out_is_3d)
+{
+	struct leia_display_processor_gl_impl *ldp = leia_dp_gl(xdp);
+	return leiasr_gl_get_hardware_3d_state(ldp->leiasr, out_is_3d);
+}
+
+static bool
 leia_dp_gl_get_display_dimensions(struct xrt_display_processor_gl *xdp,
                                    float *out_width_m,
                                    float *out_height_m)
@@ -215,6 +222,7 @@ leia_dp_gl_init_vtable(struct leia_display_processor_gl_impl *ldp)
 	ldp->base.get_predicted_eye_positions = leia_dp_gl_get_predicted_eye_positions;
 	ldp->base.get_window_metrics = leia_dp_gl_get_window_metrics;
 	ldp->base.request_display_mode = leia_dp_gl_request_display_mode;
+	ldp->base.get_hardware_3d_state = leia_dp_gl_get_hardware_3d_state;
 	ldp->base.get_display_dimensions = leia_dp_gl_get_display_dimensions;
 	ldp->base.get_display_pixel_info = leia_dp_gl_get_display_pixel_info;
 	ldp->base.destroy = leia_dp_gl_destroy;

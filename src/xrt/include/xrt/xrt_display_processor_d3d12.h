@@ -121,6 +121,13 @@ struct xrt_display_processor_d3d12
 	                             bool enable_3d);
 
 	/*!
+	 * Query hardware 3D display state from vendor SDK.
+	 * Optional — NULL means not supported.
+	 */
+	bool (*get_hardware_3d_state)(struct xrt_display_processor_d3d12 *xdp,
+	                              bool *out_is_3d);
+
+	/*!
 	 * Get physical display dimensions in meters.
 	 * Optional — NULL means not supported.
 	 */
@@ -234,6 +241,21 @@ xrt_display_processor_d3d12_request_display_mode(struct xrt_display_processor_d3
 		return false;
 	}
 	return xdp->request_display_mode(xdp, enable_3d);
+}
+
+/*!
+ * @copydoc xrt_display_processor_d3d12::get_hardware_3d_state
+ * Returns false if not supported (function pointer is NULL).
+ * @public @memberof xrt_display_processor_d3d12
+ */
+static inline bool
+xrt_display_processor_d3d12_get_hardware_3d_state(struct xrt_display_processor_d3d12 *xdp,
+                                                  bool *out_is_3d)
+{
+	if (xdp == NULL || xdp->get_hardware_3d_state == NULL) {
+		return false;
+	}
+	return xdp->get_hardware_3d_state(xdp, out_is_3d);
 }
 
 /*!

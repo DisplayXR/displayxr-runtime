@@ -187,6 +187,16 @@ leiasr_request_display_mode(struct leiasr *leiasr, bool enable_3d);
 bool
 leiasr_supports_display_mode_switch(struct leiasr *leiasr);
 
+/*!
+ * Query hardware 3D display state from SR SwitchableLensHint.
+ *
+ * @param leiasr The leiasr instance.
+ * @param[out] out_is_3d true if lens is currently enabled (3D mode).
+ * @return true if query succeeded (SwitchableLensHint available).
+ */
+bool
+leiasr_get_hardware_3d_state(struct leiasr *leiasr, bool *out_is_3d);
+
 #ifdef __cplusplus
 }
 #endif

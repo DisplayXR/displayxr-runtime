@@ -153,6 +153,17 @@ struct xrt_display_processor
 	                             bool enable_3d);
 
 	/*!
+	 * Query hardware 3D display state from vendor SDK.
+	 * Optional — NULL means not supported.
+	 *
+	 * @param      xdp           Pointer to self.
+	 * @param[out] out_is_3d     true if hardware is currently in 3D mode.
+	 * @return true if query succeeded (vendor SDK available).
+	 */
+	bool (*get_hardware_3d_state)(struct xrt_display_processor *xdp,
+	                              bool *out_is_3d);
+
+	/*!
 	 * Get the Vulkan render pass used by this display processor.
 	 * Required by compositors that need to create VkFramebuffers
 	 * for the display processor's render pass.
@@ -283,6 +294,21 @@ xrt_display_processor_request_display_mode(struct xrt_display_processor *xdp, bo
 		return false;
 	}
 	return xdp->request_display_mode(xdp, enable_3d);
+}
+
+/*!
+ * @copydoc xrt_display_processor::get_hardware_3d_state
+ * Returns false if not supported (function pointer is NULL).
+ * @public @memberof xrt_display_processor
+ */
+static inline bool
+xrt_display_processor_get_hardware_3d_state(struct xrt_display_processor *xdp,
+                                            bool *out_is_3d)
+{
+	if (xdp == NULL || xdp->get_hardware_3d_state == NULL) {
+		return false;
+	}
+	return xdp->get_hardware_3d_state(xdp, out_is_3d);
 }
 
 /*!

@@ -457,4 +457,18 @@ leiasr_d3d12_request_display_mode(struct leiasr_d3d12 *leiasr, bool enable_3d)
 	}
 }
 
+bool
+leiasr_d3d12_get_hardware_3d_state(struct leiasr_d3d12 *leiasr, bool *out_is_3d)
+{
+	if (leiasr == nullptr || leiasr->lens_hint == nullptr || out_is_3d == nullptr) {
+		return false;
+	}
+	try {
+		*out_is_3d = leiasr->lens_hint->isEnabled();
+		return true;
+	} catch (...) {
+		return false;
+	}
+}
+
 } // extern "C"

@@ -154,6 +154,18 @@ leiasr_gl_get_display_pixel_info(struct leiasr_gl *leiasr,
 bool
 leiasr_gl_request_display_mode(struct leiasr_gl *leiasr, bool enable_3d);
 
+/*!
+ * Query hardware 3D display state from SR SwitchableLensHint.
+ *
+ * @param leiasr The GL weaver instance.
+ * @param[out] out_is_3d true if lens is currently enabled (3D mode).
+ * @return true if query succeeded (SwitchableLensHint available).
+ *
+ * @ingroup drv_leia
+ */
+bool
+leiasr_gl_get_hardware_3d_state(struct leiasr_gl *leiasr, bool *out_is_3d);
+
 #ifdef __cplusplus
 }
 #endif

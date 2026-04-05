@@ -5988,6 +5988,41 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	}
 #endif
 
+	// Poll vendor SDK for hardware 3D state changes (e.g., Leia SR auto-switch on tracking loss).
+	// This detects changes the vendor SDK made independently of the runtime.
+	{
+		struct xrt_display_processor_d3d11 *dp = nullptr;
+		if (sys->shell_mode && sys->multi_comp != nullptr) {
+			dp = sys->multi_comp->display_processor;
+		} else if (c->render.display_processor != nullptr) {
+			dp = c->render.display_processor;
+		}
+		bool vendor_is_3d = false;
+		if (xrt_display_processor_d3d11_get_hardware_3d_state(dp, &vendor_is_3d)) {
+			if (vendor_is_3d != sys->hardware_display_3d) {
+				U_LOG_W("Vendor SDK hardware 3D state changed: %s → %s",
+				        sys->hardware_display_3d ? "3D" : "2D",
+				        vendor_is_3d ? "3D" : "2D");
+				sys->hardware_display_3d = vendor_is_3d;
+				// Update the device's active rendering mode to match
+				struct xrt_device *head = sys->xsysd ? sys->xsysd->static_roles.head : nullptr;
+				if (head != nullptr && head->hmd != NULL) {
+					if (!vendor_is_3d) {
+						uint32_t cur = head->hmd->active_rendering_mode_index;
+						if (cur < head->rendering_mode_count &&
+						    head->rendering_modes[cur].hardware_display_3d) {
+							sys->last_3d_mode_index = cur;
+						}
+						head->hmd->active_rendering_mode_index = 0; // mode 0 = 2D
+					} else {
+						head->hmd->active_rendering_mode_index = sys->last_3d_mode_index;
+					}
+				}
+				sync_tile_layout(sys);
+			}
+		}
+	}
+
 	// Get predicted eye positions (used for UI layers and HUD)
 	struct xrt_eye_positions eye_pos = {};
 	bool weaving_done = false;

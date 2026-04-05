@@ -214,6 +214,13 @@ leia_dp_request_display_mode(struct xrt_display_processor *xdp, bool enable_3d)
 }
 
 static bool
+leia_dp_get_hardware_3d_state(struct xrt_display_processor *xdp, bool *out_is_3d)
+{
+	struct leia_display_processor *ldp = leia_display_processor(xdp);
+	return leiasr_get_hardware_3d_state(ldp->leiasr, out_is_3d);
+}
+
+static bool
 leia_dp_get_display_dimensions(struct xrt_display_processor *xdp, float *out_width_m, float *out_height_m)
 {
 	struct leia_display_processor *ldp = leia_display_processor(xdp);
@@ -337,6 +344,7 @@ leia_dp_factory_vk(void *vk_bundle_ptr,
 	ldp->base.get_predicted_eye_positions = leia_dp_get_predicted_eye_positions;
 	ldp->base.get_window_metrics = leia_dp_get_window_metrics;
 	ldp->base.request_display_mode = leia_dp_request_display_mode;
+	ldp->base.get_hardware_3d_state = leia_dp_get_hardware_3d_state;
 	ldp->base.get_display_dimensions = leia_dp_get_display_dimensions;
 	ldp->base.get_display_pixel_info = leia_dp_get_display_pixel_info;
 	ldp->base.destroy = leia_dp_destroy;
@@ -378,6 +386,7 @@ leia_display_processor_create(struct leiasr *leiasr, struct xrt_display_processo
 	ldp->base.get_predicted_eye_positions = leia_dp_get_predicted_eye_positions;
 	ldp->base.get_window_metrics = leia_dp_get_window_metrics;
 	ldp->base.request_display_mode = leia_dp_request_display_mode;
+	ldp->base.get_hardware_3d_state = leia_dp_get_hardware_3d_state;
 	ldp->base.get_display_dimensions = leia_dp_get_display_dimensions;
 	ldp->base.get_display_pixel_info = leia_dp_get_display_pixel_info;
 	// Legacy: does NOT own leiasr — use a destroy that skips leiasr_destroy.
