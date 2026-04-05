@@ -191,7 +191,8 @@ comp_d3d11_window_set_input_forward(struct comp_d3d11_window *window,
                                      int32_t rect_x,
                                      int32_t rect_y,
                                      int32_t rect_w,
-                                     int32_t rect_h);
+                                     int32_t rect_h,
+                                     bool is_capture);
 
 /*!
  * Read and reset accumulated scroll wheel delta (for shell window resize).

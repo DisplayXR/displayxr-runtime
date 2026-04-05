@@ -2965,6 +2965,7 @@ multi_compositor_update_input_forward(struct d3d11_multi_compositor *mc)
 
 	HWND target = NULL;
 	int32_t rx = 0, ry = 0, rw = 0, rh = 0;
+	bool is_capture = false;
 	if (mc->focused_slot >= 0 && mc->focused_slot < D3D11_MULTI_MAX_CLIENTS &&
 	    mc->clients[mc->focused_slot].active) {
 		target = mc->clients[mc->focused_slot].app_hwnd;
@@ -2972,9 +2973,10 @@ multi_compositor_update_input_forward(struct d3d11_multi_compositor *mc)
 		ry = (int32_t)mc->clients[mc->focused_slot].window_rect_y;
 		rw = (int32_t)mc->clients[mc->focused_slot].window_rect_w;
 		rh = (int32_t)mc->clients[mc->focused_slot].window_rect_h;
+		is_capture = (mc->clients[mc->focused_slot].client_type == CLIENT_TYPE_CAPTURE);
 	}
 
-	comp_d3d11_window_set_input_forward(mc->window, (void *)target, rx, ry, rw, rh);
+	comp_d3d11_window_set_input_forward(mc->window, (void *)target, rx, ry, rw, rh, is_capture);
 }
 
 // Forward declarations
@@ -4822,7 +4824,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 					mc->focused_slot = hit.slot;
 				}
 				if (mc->window != nullptr) {
-					comp_d3d11_window_set_input_forward(mc->window, NULL, 0, 0, 0, 0);
+					comp_d3d11_window_set_input_forward(mc->window, NULL, 0, 0, 0, 0, false);
 				}
 			} else {
 
@@ -4987,10 +4989,27 @@ multi_compositor_render(struct d3d11_service_system *sys)
 
 						int app_x = (int)(content_local_x / win_w * (float)target_w);
 						int app_y = (int)(content_local_y / win_h * (float)target_h);
+
+						// For capture clients, find the child control at the click
+						// position and forward there (sets internal focus for typing).
+						HWND click_target = mc->clients[hit_slot].app_hwnd;
+						if (mc->clients[hit_slot].client_type == CLIENT_TYPE_CAPTURE) {
+							POINT child_pt = {app_x, app_y};
+							HWND child = ChildWindowFromPointEx(
+							    click_target, child_pt,
+							    CWP_SKIPINVISIBLE | CWP_SKIPDISABLED);
+							if (child != NULL && child != click_target) {
+								MapWindowPoints(click_target, child, &child_pt, 1);
+								click_target = child;
+								app_x = child_pt.x;
+								app_y = child_pt.y;
+							}
+						}
+
 						LPARAM lp = MAKELPARAM(app_x, app_y);
-						PostMessage(mc->clients[hit_slot].app_hwnd, WM_MOUSEMOVE, 0, lp);
-						PostMessage(mc->clients[hit_slot].app_hwnd, WM_LBUTTONDOWN,
-						            MK_LBUTTON, lp);
+						PostMessage(click_target, WM_MOUSEMOVE, 0, lp);
+						PostMessage(click_target, WM_LBUTTONDOWN, MK_LBUTTON, lp);
+						PostMessage(click_target, WM_LBUTTONUP, 0, lp);
 					}
 				}
 			}

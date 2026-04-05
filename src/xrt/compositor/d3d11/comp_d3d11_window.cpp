@@ -129,6 +129,10 @@ struct comp_d3d11_window
 	//! When set, non-shell keyboard and mouse input is forwarded to this HWND.
 	volatile HWND input_forward_hwnd;
 
+	//! True when the forward target is a captured 2D window.
+	volatile LONG input_forward_is_capture;
+
+
 	//! Focused window rect in shell-window client pixels (for mouse coord remapping).
 	//! When forwarding mouse events, shell coords are remapped to app-local coords.
 	volatile LONG input_forward_rect_x;
@@ -356,16 +360,24 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			U_LOG_W("D3D11 window: F11 toggled to %s mode", fs ? "fullscreen" : "windowed");
 			return 0;
 		}
-		// FALLTHROUGH to WM_KEYUP/SYSKEYDOWN/SYSKEYUP
+		// FALLTHROUGH to WM_KEYUP/SYSKEYDOWN/SYSKEYUP/CHAR
 	case WM_KEYUP:
 	case WM_SYSKEYDOWN:
-	case WM_SYSKEYUP: {
+	case WM_SYSKEYUP:
+	case WM_CHAR:
+	case WM_SYSCHAR: {
 		// Shell input forwarding: all keys go to BOTH qwerty and the app.
 		// Qwerty processes first (mode toggles, camera controls), then
 		// the key is forwarded to the focused app's HWND.
 		HWND fwd = (HWND)InterlockedCompareExchangePointer((volatile PVOID *)&w->input_forward_hwnd, NULL, NULL);
 		if (fwd != NULL) {
-			// Process qwerty first (V toggle, WASD, etc.)
+			// WM_CHAR/WM_SYSCHAR: forward to the target app.
+			if (message == WM_CHAR || message == WM_SYSCHAR) {
+				PostMessage(fwd, message, wParam, lParam);
+				return 0;
+			}
+
+			// Process qwerty first
 #ifdef XRT_BUILD_DRIVER_QWERTY
 			if (w->qwerty_enabled && w->xsysd != NULL) {
 				bool handled = false;
@@ -382,7 +394,7 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			    wParam >= '1' && wParam <= '4') {
 				return 0;
 			}
-			// Forward to app's HWND
+			// Forward to IPC app's HWND via PostMessage
 			PostMessage(fwd, message, wParam, lParam);
 			return 0;
 		}
@@ -847,7 +859,8 @@ comp_d3d11_window_set_input_forward(struct comp_d3d11_window *window,
                                      int32_t rect_x,
                                      int32_t rect_y,
                                      int32_t rect_w,
-                                     int32_t rect_h)
+                                     int32_t rect_h,
+                                     bool is_capture)
 {
 	if (window == NULL) {
 		return;
@@ -858,11 +871,12 @@ comp_d3d11_window_set_input_forward(struct comp_d3d11_window *window,
 	InterlockedExchange(&window->input_forward_rect_y, (LONG)rect_y);
 	InterlockedExchange(&window->input_forward_rect_w, (LONG)rect_w);
 	InterlockedExchange(&window->input_forward_rect_h, (LONG)rect_h);
+	InterlockedExchange(&window->input_forward_is_capture, is_capture ? 1 : 0);
 	InterlockedExchangePointer((volatile PVOID *)&window->input_forward_hwnd, (PVOID)hwnd);
 
 	if (hwnd != NULL) {
-		U_LOG_W("D3D11 window: input forwarding enabled → HWND=%p rect=(%d,%d,%d,%d)",
-		        hwnd, rect_x, rect_y, rect_w, rect_h);
+		U_LOG_W("D3D11 window: input forwarding enabled → HWND=%p rect=(%d,%d,%d,%d) capture=%d",
+		        hwnd, rect_x, rect_y, rect_w, rect_h, is_capture);
 	} else {
 		U_LOG_W("D3D11 window: input forwarding disabled");
 	}
