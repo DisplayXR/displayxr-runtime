@@ -203,6 +203,85 @@ comp_d3d11_service_get_client_window_pose(struct xrt_system_compositor *xsysc,
                                            float *out_height_m);
 
 
+/*!
+ * @name Capture client management (Phase 4A)
+ * @{
+ */
+
+/*!
+ * Add a 2D window capture client to the multi-compositor.
+ *
+ * Starts Windows.Graphics.Capture for the given HWND and assigns a slot.
+ * The captured window is displayed as a mono textured quad with spatial parallax.
+ *
+ * @param xsysc      The system compositor (must be D3D11 service in shell mode).
+ * @param hwnd_value  Window handle as uint64_t (cast from HWND).
+ * @param name        Display name for the captured window (may be NULL).
+ * @return Slot index (0-7) on success, -1 on failure.
+ *
+ * @ingroup comp_d3d11_service
+ */
+int
+comp_d3d11_service_add_capture_client(struct xrt_system_compositor *xsysc,
+                                       uint64_t hwnd_value,
+                                       const char *name);
+
+/*!
+ * Remove a capture client from the multi-compositor.
+ *
+ * Stops capture and removes the slot.
+ *
+ * @param xsysc       The system compositor.
+ * @param slot_index   Slot index returned by comp_d3d11_service_add_capture_client().
+ * @return true on success, false if slot invalid or not a capture client.
+ *
+ * @ingroup comp_d3d11_service
+ */
+bool
+comp_d3d11_service_remove_capture_client(struct xrt_system_compositor *xsysc,
+                                          int slot_index);
+
+/*!
+ * Set window pose for a capture client by slot index.
+ *
+ * @param xsysc       The system compositor.
+ * @param slot_index   Slot index.
+ * @param pose         Window pose in display space.
+ * @param width_m      Window width in meters.
+ * @param height_m     Window height in meters.
+ * @return true on success.
+ *
+ * @ingroup comp_d3d11_service
+ */
+bool
+comp_d3d11_service_set_capture_client_window_pose(struct xrt_system_compositor *xsysc,
+                                                    int slot_index,
+                                                    const struct xrt_pose *pose,
+                                                    float width_m,
+                                                    float height_m);
+
+/*!
+ * Get window pose for a capture client by slot index.
+ *
+ * @param xsysc        The system compositor.
+ * @param slot_index    Slot index.
+ * @param[out] out_pose Window pose.
+ * @param[out] out_width_m Window width in meters.
+ * @param[out] out_height_m Window height in meters.
+ * @return true on success.
+ *
+ * @ingroup comp_d3d11_service
+ */
+bool
+comp_d3d11_service_get_capture_client_window_pose(struct xrt_system_compositor *xsysc,
+                                                    int slot_index,
+                                                    struct xrt_pose *out_pose,
+                                                    float *out_width_m,
+                                                    float *out_height_m);
+
+/*! @} */
+
+
 #ifdef __cplusplus
 }
 #endif
