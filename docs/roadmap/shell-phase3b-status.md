@@ -58,6 +58,12 @@ Apps 3+ were placed on top of app 2 (all at top-right). Now uses 2x2 grid: top-l
 - **VK window-space layers:** HUD (XrCompositionLayerWindowSpaceEXT) disabled in shell mode due to null function pointer in VK IPC path. Standalone VK app HUD works fine.
 - **VK standalone regression:** None — VK native compositor path unaffected.
 
+## Additional Fixes (post Phase 3B)
+
+### #121: Multi-app black frame flash (FIXED)
+**Root cause:** Per-client atlas was cleared to black before each blit, creating a race window where `multi_compositor_render` read a black atlas. Combined with rendering on every client commit (4x per frame cycle with 4 apps), this produced intermittent black flashes in individual windows.
+**Fix:** Skip atlas clear in shell mode (blit overwrites same tiles each frame) + throttle renders to ~1 per VSync.
+
 ## Key Source Files
 
 | File | Role |
