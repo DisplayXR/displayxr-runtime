@@ -399,16 +399,8 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		break;
 
 	case WM_KEYDOWN:
-		// F11 toggle fullscreen (always handled)
-		if (wParam == VK_F11) {
-			// Toggle fullscreen state (pure Win32, runs on window thread — safe)
-			LONG fs = InterlockedCompareExchange(&w->is_fullscreen, 0, 0);
-			fs = !fs;
-			InterlockedExchange(&w->is_fullscreen, fs);
-			set_fullscreen(hWnd, fs != 0);
-			U_LOG_W("D3D11 window: F11 toggled to %s mode", fs ? "fullscreen" : "windowed");
-			return 0;
-		}
+		// F11 is handled in the multi-compositor render loop (focused app fullscreen).
+		// It's not processed here in the WndProc.
 		// FALLTHROUGH to WM_KEYUP/SYSKEYDOWN/SYSKEYUP/CHAR
 	case WM_KEYUP:
 	case WM_SYSKEYDOWN:
@@ -511,9 +503,12 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 				int shell_x = GET_X_LPARAM(lParam);
 				int shell_y = GET_Y_LPARAM(lParam);
 
-				// Only forward if inside the focused window's rect
-				if (shell_x >= rx && shell_x < rx + rw &&
-				    shell_y >= ry && shell_y < ry + rh) {
+				// Forward if inside the focused window's rect, or if a button
+				// is held (drag in progress — cursor may leave the rect).
+				bool in_rect = (shell_x >= rx && shell_x < rx + rw &&
+				                shell_y >= ry && shell_y < ry + rh);
+				bool dragging = (wParam & (MK_LBUTTON | MK_RBUTTON | MK_MBUTTON)) != 0;
+				if (in_rect || dragging) {
 					// Remap to app-window client coords.
 					// Scale if target HWND is a different size than the
 					// virtual rect (e.g., captured 2D windows).

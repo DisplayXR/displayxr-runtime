@@ -508,12 +508,6 @@ struct d3d11_multi_client_slot
 	//! True when this window was auto-minimized by another window's fullscreen toggle.
 	bool fullscreen_minimized;
 
-	//! Saved layout pose before snap-to-focus (restored on unfocus).
-	bool has_pre_focus_pose;
-	struct xrt_pose pre_focus_pose;
-	float pre_focus_width_m;
-	float pre_focus_height_m;
-
 	//! App name for title bar display (from HWND title or fallback).
 	char app_name[128];
 
@@ -581,6 +575,13 @@ struct d3d11_multi_compositor
 
 	//! Window dismissed by user (ESC).
 	bool window_dismissed;
+
+	//! True after dismiss cleanup (EXIT_REQUEST sent, captures released).
+	bool dismiss_cleanup_done;
+
+	//! Debounced re-grid: when > 0, apply grid layout after this timestamp.
+	//! Set by client registration, consumed by render loop.
+	uint64_t regrid_pending_ns;
 
 	//! Right-click-drag state for window repositioning.
 	struct
@@ -684,9 +685,6 @@ struct d3d11_multi_compositor
 	//! Tracked separately from sys->hardware_display_3d to detect transitions.
 	bool capture_forced_2d;
 
-	//! Fade-to-black during 2D↔3D mode transitions.
-	//! When > 0 and > current time, render black instead of content.
-	uint64_t mode_fade_until_ns;
 
 	//! Tracks which capture HWND currently has foreground focus for SendInput.
 	//! NULL means no capture client is foreground (shell window is foreground).
@@ -723,6 +721,21 @@ d3d11_service_semaphore_from_xrt(struct xrt_compositor_semaphore *xcsem)
 {
 	return reinterpret_cast<struct d3d11_service_semaphore *>(xcsem);
 }
+
+// Forward declarations — defined later, used by client registration code.
+static void
+compute_grid_layout(const struct d3d11_service_system *sys,
+                    int n, int idx,
+                    float *out_x, float *out_y, float *out_z,
+                    float *out_w, float *out_h);
+
+static void
+slot_animate_to(struct d3d11_multi_client_slot *slot,
+                const struct xrt_pose *target_pose,
+                float target_w, float target_h,
+                uint64_t now_ns, uint64_t duration_ns);
+
+#define ANIM_DURATION_NS (300ULL * 1000000ULL)
 
 /*!
  * Sync tile layout from the active rendering mode of the head device.
@@ -3250,56 +3263,23 @@ multi_compositor_register_client(struct d3d11_service_system *sys, struct d3d11_
 			mc->clients[i].client_type = CLIENT_TYPE_IPC;
 			mc->clients[i].active = true;
 
-			// Default window pose: 2x2 grid layout so new apps don't overlap.
-			// Convention: position is meters from display center, +X right, +Y up.
-			//   Slot 0: top-left      Slot 1: top-right
-			//   Slot 2: bottom-left   Slot 3: bottom-right
-			//   Slot 4+: cascade with small offset to stay visible
-			float disp_w_m = sys->base.info.display_width_m;
-			float disp_h_m = sys->base.info.display_height_m;
-			if (disp_w_m <= 0.0f) disp_w_m = 0.700f;
-			if (disp_h_m <= 0.0f) disp_h_m = 0.394f;
-
-			float win_w_m = disp_w_m * 0.40f;
-			float win_h_m = disp_h_m * 0.40f;
-			float center_x_m, center_y_m, center_z_m = 0.0f;
-			if (i < 4) {
-				// 2x2 grid: col = i%2, row = i/2
-				int col = i % 2;
-				int row = i / 2;
-				center_x_m = (col == 0 ? -0.25f : +0.25f) * disp_w_m;
-				center_y_m = (row == 0 ? +0.25f : -0.25f) * disp_h_m;
-				// Offset top row down by title bar height so title bar stays on-screen
-				if (row == 0) {
-					center_y_m -= UI_TITLE_BAR_H_M;
-				}
-			} else {
-				// Layer behind the 2x2 grid with slight XYZ offset.
-				// Uses same 2x2 pattern but pushed back in Z depth.
-				int layer = (i - 4) / 4;  // which depth layer (0, 1, 2, ...)
-				int pos = (i - 4) % 4;    // position within layer
-				int col = pos % 2;
-				int row = pos / 2;
-				center_x_m = (col == 0 ? -0.25f : +0.25f) * disp_w_m;
-				center_y_m = (row == 0 ? +0.25f : -0.25f) * disp_h_m;
-				if (row == 0) center_y_m -= UI_TITLE_BAR_H_M;
-				// Push back in Z + slight offset per layer
-				center_z_m = -0.02f * (layer + 1);
-				center_x_m += 0.005f * (layer + 1);
-				center_y_m -= 0.005f * (layer + 1);
+			// Count active clients to determine grid position
+			int active_count = 0;
+			for (int j = 0; j < D3D11_MULTI_MAX_CLIENTS; j++) {
+				if (mc->clients[j].active) active_count++;
 			}
+			// Include this new client in the count
+			active_count++;
+
+			float center_x_m, center_y_m, center_z_m, grid_w, grid_h;
+			compute_grid_layout(sys, active_count, active_count - 1,
+			                    &center_x_m, &center_y_m, &center_z_m, &grid_w, &grid_h);
 
 			// Entry animation: start from center (small), animate to target position.
-			// Set initial pose at display center, small size.
-			mc->clients[i].window_pose.orientation.x = 0.0f;
-			mc->clients[i].window_pose.orientation.y = 0.0f;
-			mc->clients[i].window_pose.orientation.z = 0.0f;
-			mc->clients[i].window_pose.orientation.w = 1.0f;
-			mc->clients[i].window_pose.position.x = 0.0f;
-			mc->clients[i].window_pose.position.y = 0.0f;
-			mc->clients[i].window_pose.position.z = 0.0f;
-			mc->clients[i].window_width_m = win_w_m * 0.3f; // start small
-			mc->clients[i].window_height_m = win_h_m * 0.3f;
+			mc->clients[i].window_pose.orientation = {0, 0, 0, 1};
+			mc->clients[i].window_pose.position = {0, 0, 0};
+			mc->clients[i].window_width_m = grid_w * 0.3f; // start small
+			mc->clients[i].window_height_m = grid_h * 0.3f;
 
 			// Entry animation: grow from center to target position
 			struct xrt_pose target = {};
@@ -3311,10 +3291,10 @@ multi_compositor_register_client(struct d3d11_service_system *sys, struct d3d11_
 			mc->clients[i].anim.active = true;
 			mc->clients[i].anim.start_pose = mc->clients[i].window_pose;
 			mc->clients[i].anim.target_pose = target;
-			mc->clients[i].anim.start_width_m = win_w_m * 0.3f;
-			mc->clients[i].anim.start_height_m = win_h_m * 0.3f;
-			mc->clients[i].anim.target_width_m = win_w_m;
-			mc->clients[i].anim.target_height_m = win_h_m;
+			mc->clients[i].anim.start_width_m = grid_w * 0.3f;
+			mc->clients[i].anim.start_height_m = grid_h * 0.3f;
+			mc->clients[i].anim.target_width_m = grid_w;
+			mc->clients[i].anim.target_height_m = grid_h;
 			mc->clients[i].anim.start_ns = os_monotonic_get_ns();
 			mc->clients[i].anim.duration_ns = 400ULL * 1000000ULL; // 400ms
 
@@ -3332,6 +3312,10 @@ multi_compositor_register_client(struct d3d11_service_system *sys, struct d3d11_
 			}
 			U_LOG_W("Multi-comp: registered client in slot %d (total=%u)", i, mc->client_count);
 			multi_compositor_update_input_forward(mc);
+
+			// Schedule debounced re-grid so rapid connections settle first.
+			mc->regrid_pending_ns = os_monotonic_get_ns() + 500000000ULL;
+
 			return i;
 		}
 	}
@@ -3521,29 +3505,28 @@ multi_compositor_add_capture_client(struct d3d11_service_system *sys, HWND hwnd,
 			if (width_m < 0.04f) width_m = 0.04f;
 			if (height_m < 0.04f) height_m = 0.04f;
 
-			// Default pose: same 2x2 grid + Z-depth layers as IPC clients
-			float disp_h_m = sys->base.info.display_height_m;
-			if (disp_h_m <= 0.0f) disp_h_m = 0.394f;
-			float center_x_m, center_y_m, center_z_m = 0.0f;
-			if (i < 4) {
-				int col = i % 2;
-				int row = i / 2;
-				center_x_m = (col == 0 ? -0.25f : +0.25f) * disp_w_m;
-				center_y_m = (row == 0 ? +0.25f : -0.25f) * disp_h_m;
-				if (row == 0) {
-					center_y_m -= UI_TITLE_BAR_H_M;
-				}
+			// Count active clients to determine grid position
+			int active_count = 0;
+			for (int j = 0; j < D3D11_MULTI_MAX_CLIENTS; j++) {
+				if (mc->clients[j].active) active_count++;
+			}
+			// Include this new client in the count
+			active_count++;
+
+			float center_x_m, center_y_m, center_z_m, grid_w, grid_h;
+			compute_grid_layout(sys, active_count, active_count - 1,
+			                    &center_x_m, &center_y_m, &center_z_m, &grid_w, &grid_h);
+
+			// Maintain aspect ratio: fit within grid cell
+			float aspect = (height_m > 0.001f) ? width_m / height_m : 1.0f;
+			if (grid_w / aspect > grid_h) {
+				// Height-limited: scale by height
+				width_m = grid_h * aspect;
+				height_m = grid_h;
 			} else {
-				int layer = (i - 4) / 4;
-				int pos = (i - 4) % 4;
-				int col = pos % 2;
-				int row = pos / 2;
-				center_x_m = (col == 0 ? -0.25f : +0.25f) * disp_w_m;
-				center_y_m = (row == 0 ? +0.25f : -0.25f) * disp_h_m;
-				if (row == 0) center_y_m -= UI_TITLE_BAR_H_M;
-				center_z_m = -0.02f * (layer + 1);
-				center_x_m += 0.005f * (layer + 1);
-				center_y_m -= 0.005f * (layer + 1);
+				// Width-limited: scale by width
+				height_m = grid_w / aspect;
+				width_m = grid_w;
 			}
 
 			// Entry animation: start from center (small), animate to target position
@@ -3590,6 +3573,9 @@ multi_compositor_add_capture_client(struct d3d11_service_system *sys, HWND hwnd,
 			         px_w, px_h, width_m, height_m,
 			         mc->client_count, mc->capture_client_count);
 			multi_compositor_update_input_forward(mc);
+
+			// Schedule debounced re-grid so rapid connections settle first.
+			mc->regrid_pending_ns = os_monotonic_get_ns() + 500000000ULL;
 
 			// Start render timer if this is the first capture client
 			if (mc->capture_client_count == 1) {
@@ -4116,7 +4102,9 @@ shell_raycast_hit_test(struct d3d11_service_system *sys,
 
 		// Extended bounds including title bar (above content).
 		// Capture clients have no shell title bar — their native chrome is in the content.
-		bool has_shell_title_bar = (mc->clients[s].client_type != CLIENT_TYPE_CAPTURE);
+		// Maximized (fullscreen) windows also skip the shell title bar.
+		bool has_shell_title_bar = (mc->clients[s].client_type != CLIENT_TYPE_CAPTURE &&
+		                            !mc->clients[s].maximized);
 		float ext_top = win_top + (has_shell_title_bar ? title_bar_h_m : 0.0f);
 
 		// Check if hit is within extended window bounds (including resize zone)
@@ -4212,8 +4200,7 @@ quat_is_identity(const struct xrt_quat *q)
 #define M_PI 3.14159265358979323846
 #endif
 
-//! Default animation duration for layout transitions (300ms).
-#define ANIM_DURATION_NS (300ULL * 1000000ULL)
+// ANIM_DURATION_NS defined earlier (forward declaration section).
 
 //! Animation duration for initial window entry (400ms).
 #define ANIM_ENTRY_DURATION_NS (400ULL * 1000000ULL)
@@ -4279,95 +4266,112 @@ slot_animate_tick(struct d3d11_multi_client_slot *slot, uint64_t now_ns)
 	return slot->anim.active; // true = still running
 }
 
-//! Duration for snap-to-focus animation (focused window moves to Z=0).
-#define SNAP_FOCUS_DURATION_NS (200ULL * 1000000ULL)
-//! Duration for unfocus restore animation (window returns to layout pose).
-#define SNAP_UNFOCUS_DURATION_NS (300ULL * 1000000ULL)
-//! Focused window scales to this fraction of display width.
-#define SNAP_FOCUS_SCALE 0.60f
-
-/*!
- * Animate focus transitions: bring newly focused window to Z=0 and scale up,
- * restore previously focused window to its layout position.
- *
- * Handles overview mode (new_slot == -1): all windows return to layout.
- * Skipped in dynamic layout mode (dynamic layout drives poses directly).
- *
- * @param sys           System state (for display dimensions)
- * @param mc            Multi-compositor
- * @param old_slot      Previous focused slot (-1 if none)
- * @param new_slot      New focused slot (-1 for overview/unfocus)
- */
-static void
-snap_focused_window(struct d3d11_service_system *sys,
-                    struct d3d11_multi_compositor *mc,
-                    int old_slot, int new_slot)
-{
-	if (mc == nullptr) return;
-
-	// Don't interfere with dynamic layouts (they drive poses directly)
-	if (mc->dynamic_layout.mode >= 0) return;
-
-	uint64_t now_ns = os_monotonic_get_ns();
-
-	// Restore old focused window to its layout pose
-	if (old_slot >= 0 && old_slot < D3D11_MULTI_MAX_CLIENTS &&
-	    mc->clients[old_slot].active &&
-	    mc->clients[old_slot].has_pre_focus_pose) {
-		slot_animate_to(&mc->clients[old_slot],
-		                &mc->clients[old_slot].pre_focus_pose,
-		                mc->clients[old_slot].pre_focus_width_m,
-		                mc->clients[old_slot].pre_focus_height_m,
-		                SNAP_UNFOCUS_DURATION_NS, now_ns);
-		mc->clients[old_slot].has_pre_focus_pose = false;
-	}
-
-	// Overview mode (new_slot == -1): restore ALL windows with pre_focus state
-	if (new_slot < 0) {
-		for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
-			if (mc->clients[i].active && mc->clients[i].has_pre_focus_pose) {
-				slot_animate_to(&mc->clients[i],
-				                &mc->clients[i].pre_focus_pose,
-				                mc->clients[i].pre_focus_width_m,
-				                mc->clients[i].pre_focus_height_m,
-				                SNAP_UNFOCUS_DURATION_NS, now_ns);
-				mc->clients[i].has_pre_focus_pose = false;
-			}
-		}
-		return;
-	}
-
-	// Snap new focused window to display plane
-	if (new_slot >= 0 && new_slot < D3D11_MULTI_MAX_CLIENTS &&
-	    mc->clients[new_slot].active &&
-	    !mc->clients[new_slot].has_pre_focus_pose) {
-		// Save current layout pose
-		mc->clients[new_slot].has_pre_focus_pose = true;
-		mc->clients[new_slot].pre_focus_pose = mc->clients[new_slot].window_pose;
-		mc->clients[new_slot].pre_focus_width_m = mc->clients[new_slot].window_width_m;
-		mc->clients[new_slot].pre_focus_height_m = mc->clients[new_slot].window_height_m;
-
-		// Compute focus target: Z=0, same XY, scaled to SNAP_FOCUS_SCALE of display
-		float disp_w = sys->base.info.display_width_m;
-		if (disp_w <= 0.0f) disp_w = 0.700f;
-		float target_w = disp_w * SNAP_FOCUS_SCALE;
-		float aspect = mc->clients[new_slot].window_height_m /
-		               mc->clients[new_slot].window_width_m;
-		float target_h = target_w * aspect;
-
-		struct xrt_pose target_pose = mc->clients[new_slot].window_pose;
-		target_pose.position.z = 0.0f; // Move to display plane
-
-		slot_animate_to(&mc->clients[new_slot], &target_pose,
-		                target_w, target_h,
-		                SNAP_FOCUS_DURATION_NS, now_ns);
-	}
-}
-
 //! Default auto-rotation speed for dynamic layouts (~10 deg/sec).
 #define DYNAMIC_ROTATION_SPEED 0.175f
 //! Friction coefficient for momentum deceleration after drag release.
 #define DYNAMIC_FRICTION 3.0f
+
+/*!
+ * Toggle fullscreen for a given slot. On fullscreen: animate to fill entire
+ * display (no title bar), hide all other windows. On restore: animate back,
+ * unhide others.
+ */
+static void
+toggle_fullscreen(struct d3d11_service_system *sys,
+                  struct d3d11_multi_compositor *mc,
+                  int slot)
+{
+	if (mc == nullptr || slot < 0 || slot >= D3D11_MULTI_MAX_CLIENTS ||
+	    !mc->clients[slot].active) {
+		return;
+	}
+
+	float disp_w_m = sys->base.info.display_width_m;
+	float disp_h_m = sys->base.info.display_height_m;
+	if (disp_w_m <= 0.0f) disp_w_m = 0.700f;
+	if (disp_h_m <= 0.0f) disp_h_m = 0.394f;
+	uint64_t now_ns = os_monotonic_get_ns();
+
+	if (mc->clients[slot].maximized) {
+		// Restore from fullscreen (animated)
+		slot_animate_to(&mc->clients[slot],
+		                &mc->clients[slot].pre_max_pose,
+		                mc->clients[slot].pre_max_width_m,
+		                mc->clients[slot].pre_max_height_m,
+		                now_ns, ANIM_DURATION_NS);
+		mc->clients[slot].maximized = false;
+		// Un-hide windows that were hidden by fullscreen
+		for (int j = 0; j < D3D11_MULTI_MAX_CLIENTS; j++) {
+			if (mc->clients[j].fullscreen_minimized) {
+				mc->clients[j].minimized = false;
+				mc->clients[j].fullscreen_minimized = false;
+			}
+		}
+		U_LOG_W("Multi-comp: restore slot %d from fullscreen", slot);
+	} else {
+		// Save current state
+		mc->clients[slot].pre_max_pose = mc->clients[slot].window_pose;
+		mc->clients[slot].pre_max_width_m = mc->clients[slot].window_width_m;
+		mc->clients[slot].pre_max_height_m = mc->clients[slot].window_height_m;
+		// Animate to fill entire display (no margins, no title bar)
+		struct xrt_pose max_pose = {};
+		max_pose.orientation.w = 1.0f;
+		max_pose.position.x = 0;
+		max_pose.position.y = 0;
+		max_pose.position.z = 0;
+		slot_animate_to(&mc->clients[slot],
+		                &max_pose,
+		                disp_w_m,
+		                disp_h_m,
+		                now_ns, ANIM_DURATION_NS);
+		mc->clients[slot].maximized = true;
+		// Hide all other windows
+		for (int j = 0; j < D3D11_MULTI_MAX_CLIENTS; j++) {
+			if (j != slot && mc->clients[j].active && !mc->clients[j].minimized) {
+				mc->clients[j].minimized = true;
+				mc->clients[j].fullscreen_minimized = true;
+			}
+		}
+		U_LOG_W("Multi-comp: fullscreen slot %d", slot);
+	}
+
+	mc->focused_slot = slot;
+	multi_compositor_update_input_forward(mc);
+}
+
+/*!
+ * Compute adaptive grid position for window `idx` out of `n` active windows.
+ * Grid uses ceil(sqrt(N)) columns, fills row-first with 10% padding per cell.
+ * All windows at Z=0.
+ */
+static void
+compute_grid_layout(const struct d3d11_service_system *sys,
+                    int n, int idx,
+                    float *out_x, float *out_y, float *out_z,
+                    float *out_w, float *out_h)
+{
+	float disp_w = sys->base.info.display_width_m;
+	float disp_h = sys->base.info.display_height_m;
+	if (disp_w <= 0.0f) disp_w = 0.700f;
+	if (disp_h <= 0.0f) disp_h = 0.394f;
+
+	if (n <= 0) n = 1;
+	int cols = (int)ceilf(sqrtf((float)n));
+	int rows = (int)ceilf((float)n / (float)cols);
+
+	int col = idx % cols;
+	int row = idx / cols;
+
+	// 90% of display used, 10% is padding (5% each side per cell)
+	float cell_w = disp_w * 0.90f / (float)cols;
+	float cell_h = disp_h * 0.90f / (float)rows;
+
+	*out_w = cell_w * 0.90f;  // 90% of cell = 10% padding between windows
+	*out_h = cell_h * 0.90f;
+	*out_x = (col - (cols - 1) / 2.0f) * cell_w;
+	*out_y = ((rows - 1) / 2.0f - row) * cell_h;
+	*out_z = 0.0f;
+}
 
 /*!
  * Compute the maximum comfortable Z depth: ±1/5 of max(display_w, display_h).
@@ -4408,101 +4412,8 @@ carousel_compute_pose(int idx, int n, float angle_offset, float radius_m,
 	*out_w = base_w * scale;
 	*out_h = base_h * scale;
 
-	// Yaw to face center
-	out_pose->orientation = quat_from_yaw(-world_angle);
-}
-
-/*!
- * Compute orbital window pose — elliptical orbits at different radii.
- */
-static void
-orbital_compute_pose(int idx, int n, float angle_offset, float base_radius,
-                     float base_w, float base_h, int focused_idx, float zmax,
-                     struct xrt_pose *out_pose, float *out_w, float *out_h)
-{
-	// Focused window gets innermost orbit
-	int orbit_idx = idx;
-	if (idx == focused_idx) orbit_idx = 0;
-	else if (idx < focused_idx) orbit_idx = idx + 1;
-
-	float radius_step = 0.02f;
-	float orbit_radius = base_radius + orbit_idx * radius_step;
-	float orbit_speed = 1.0f / (1.0f + orbit_idx * 0.3f);
-	float angle = angle_offset * orbit_speed + (2.0f * (float)M_PI / (float)n) * idx;
-
-	out_pose->position.x = sinf(angle) * orbit_radius * 1.5f; // wider X
-	// Clamp Z within ±zmax
-	float raw_z = cosf(angle) * orbit_radius * 0.5f - base_radius * 0.3f;
-	if (raw_z < -zmax) raw_z = -zmax;
-	if (raw_z > zmax) raw_z = zmax;
-	out_pose->position.z = raw_z;
-	out_pose->position.y = 0.0f;
-
-	float scale = (orbit_idx == 0) ? 1.0f : (0.85f - orbit_idx * 0.05f);
-	if (scale < 0.5f) scale = 0.5f;
-	*out_w = base_w * scale;
-	*out_h = base_h * scale;
-
-	out_pose->orientation = quat_from_yaw(-angle * 0.5f);
-}
-
-/*!
- * Compute helix window pose — vertical spiral staircase.
- */
-static void
-helix_compute_pose(int idx, int n, float angle_offset, float radius_m,
-                   float base_w, float base_h, float zmax,
-                   struct xrt_pose *out_pose, float *out_w, float *out_h)
-{
-	float base_angle = (2.0f * (float)M_PI / (float)n) * idx;
-	float world_angle = base_angle + angle_offset;
-
-	out_pose->position.x = sinf(world_angle) * radius_m;
-	// Map Z within ±zmax like carousel
-	float raw_depth = cosf(world_angle);
-	out_pose->position.z = (raw_depth - 1.0f) * zmax * 0.5f;
-	// Vertical offset: gentle spiral pitch
-	float helix_pitch_m = 0.04f; // 4cm per revolution
-	float raw_y = helix_pitch_m * (world_angle / (2.0f * (float)M_PI));
-	float range = helix_pitch_m * 1.5f;
-	out_pose->position.y = fmodf(raw_y + range / 2.0f, range) - range / 2.0f;
-
-	// Depth-based scaling
-	float depth_t = (raw_depth + 1.0f) / 2.0f;
-	float scale = 0.65f + 0.35f * depth_t;
-	*out_w = base_w * scale;
-	*out_h = base_h * scale;
-
-	out_pose->orientation = quat_from_yaw(-world_angle);
-}
-
-/*!
- * Compute expose (grid overview) window pose.
- */
-static void
-expose_compute_pose(int idx, int n, float disp_w_m, float disp_h_m,
-                    struct xrt_pose *out_pose, float *out_w, float *out_h)
-{
-	int cols = (int)ceilf(sqrtf((float)n));
-	if (cols < 1) cols = 1;
-	int rows = (n + cols - 1) / cols;
-	int col = idx % cols;
-	int row = idx / cols;
-
-	float margin = 0.008f; // 8mm gap between windows
-	float total_w = disp_w_m * 0.85f;
-	float total_h = disp_h_m * 0.85f;
-	float cell_w = (total_w - (cols - 1) * margin) / cols;
-	float cell_h = (total_h - (rows - 1) * margin) / rows;
-
-	out_pose->position.x = (col - (cols - 1) / 2.0f) * (cell_w + margin);
-	out_pose->position.y = ((rows - 1) / 2.0f - row) * (cell_h + margin);
-	out_pose->position.z = -0.03f; // slightly behind display
-	out_pose->orientation.x = 0; out_pose->orientation.y = 0;
-	out_pose->orientation.z = 0; out_pose->orientation.w = 1;
-
-	*out_w = cell_w;
-	*out_h = cell_h;
+	// Identity orientation (no yaw)
+	out_pose->orientation = {0, 0, 0, 1};
 }
 
 /*!
@@ -4524,7 +4435,7 @@ dynamic_layout_tick(struct d3d11_service_system *sys, struct d3d11_multi_composi
 	dl.last_tick_ns = now_ns;
 
 	// Update angle: auto-rotation when not dragging
-	if (!dl.user_dragging && dl.mode != 3) { // expose doesn't rotate
+	if (!dl.user_dragging) { // auto-rotation when not dragging
 		bool paused = (dl.pause_until_ns > 0 && now_ns < dl.pause_until_ns);
 
 		if (paused) {
@@ -4585,18 +4496,6 @@ dynamic_layout_tick(struct d3d11_service_system *sys, struct d3d11_multi_composi
 			carousel_compute_pose(idx, n, dl.angle_offset, dl.radius_m,
 			                      dl.base_win_w, dl.base_win_h, zmax, &pose, &w_m, &h_m);
 			break;
-		case 1: // Orbital
-			orbital_compute_pose(idx, n, dl.angle_offset, dl.radius_m,
-			                     dl.base_win_w, dl.base_win_h, mc->focused_slot, zmax,
-			                     &pose, &w_m, &h_m);
-			break;
-		case 2: // Helix
-			helix_compute_pose(idx, n, dl.angle_offset, dl.radius_m,
-			                   dl.base_win_w, dl.base_win_h, zmax, &pose, &w_m, &h_m);
-			break;
-		case 3: // Expose
-			expose_compute_pose(idx, n, disp_w_m, disp_h_m, &pose, &w_m, &h_m);
-			break;
 		}
 
 		mc->clients[s].window_pose = pose;
@@ -4629,26 +4528,27 @@ enter_dynamic_layout(struct d3d11_service_system *sys, struct d3d11_multi_compos
 		if (mc->clients[i].active) mc->clients[i].minimized = false;
 	}
 
+	if (mode != 0) return; // Only carousel (mode 0) supported
+
 	mc->dynamic_layout.prev_layout = mc->current_layout;
 	mc->dynamic_layout.mode = mode;
 	mc->dynamic_layout.angle_offset = 0.0f;
-	mc->dynamic_layout.angular_velocity = (mode == 3) ? 0.0f : DYNAMIC_ROTATION_SPEED;
+	mc->dynamic_layout.angular_velocity = DYNAMIC_ROTATION_SPEED;
 	mc->dynamic_layout.user_dragging = false;
 	mc->dynamic_layout.last_tick_ns = os_monotonic_get_ns();
 	mc->dynamic_layout.radius_m = 0.12f; // 12cm default radius
 	mc->dynamic_layout.base_win_w = disp_w_m * 0.40f;
 	mc->dynamic_layout.base_win_h = disp_h_m * 0.40f;
 
-	mc->current_layout = 4 + mode; // 4=carousel, 5=orbital, 6=helix, 7=expose
+	mc->current_layout = 4; // 4=carousel
 
-	const char *mode_names[] = {"carousel", "orbital", "helix", "expose"};
-	U_LOG_W("Multi-comp: dynamic layout → %s", mode_names[mode]);
+	U_LOG_W("Multi-comp: dynamic layout → carousel");
 }
 
 /*!
  * Apply a layout preset to all active (non-minimized) windows.
- * layout_id: 0=side-by-side, 1=stacked, 2=theater, 3=stack
- * For dynamic layouts (carousel etc.), use enter_dynamic_layout() instead.
+ * layout_id: 0=grid, 1=immersive
+ * For dynamic layouts (carousel), use enter_dynamic_layout() instead.
  */
 static void
 apply_layout(struct d3d11_service_system *sys, struct d3d11_multi_compositor *mc, int layout_id)
@@ -4669,8 +4569,8 @@ apply_layout(struct d3d11_service_system *sys, struct d3d11_multi_compositor *mc
 	}
 	if (n == 0) return;
 
-	const char *layout_names[] = {"side-by-side", "stacked", "theater", "stack", "carousel"};
-	if (layout_id < 0 || layout_id > 4) return;
+	const char *layout_names[] = {"grid", "immersive"};
+	if (layout_id < 0 || layout_id > 1) return;
 	U_LOG_W("Multi-comp: layout %s (%d windows)", layout_names[layout_id], n);
 	mc->current_layout = layout_id;
 	mc->dynamic_layout.mode = -1; // Exit dynamic mode when entering static layout
@@ -4681,66 +4581,41 @@ apply_layout(struct d3d11_service_system *sys, struct d3d11_multi_compositor *mc
 		struct xrt_quat new_orient = {0, 0, 0, 1}; // identity
 
 		switch (layout_id) {
-		case 0: // Side-by-side: split width equally
-			new_w = disp_w_m * 0.90f / n;
-			new_h = disp_h_m * 0.90f;
-			new_x = (idx - (n - 1) / 2.0f) * (disp_w_m * 0.90f / n);
-			new_y = 0;
-			break;
-
-		case 1: // Stacked: split height equally
-			new_w = disp_w_m * 0.90f;
-			new_h = disp_h_m * 0.90f / n;
-			new_x = 0;
-			new_y = ((n - 1) / 2.0f - idx) * (disp_h_m * 0.90f / n);
-			break;
-
-		case 2: { // Theater: focused at Z=0 large, others recessed + angled inward
-			bool is_focused = (s == mc->focused_slot || (mc->focused_slot < 0 && idx == 0));
-			if (is_focused) {
-				new_w = disp_w_m * 0.60f;
-				new_h = disp_h_m * 0.60f;
-				new_x = 0;
-				new_y = 0;
-				new_z = 0;
-			} else {
-				new_w = disp_w_m * 0.40f;
-				new_h = disp_h_m * 0.40f;
-				new_z = -0.03f; // 3cm behind display
-				// Spread non-focused windows left/right
-				int side_idx = idx;
-				if (s == mc->focused_slot) side_idx = 0; // shouldn't happen
-				int side_count = n - 1;
-				if (side_count <= 0) side_count = 1;
-				float spread = (float)(side_idx - (side_count - 1) / 2.0f);
-				new_x = spread * disp_w_m * 0.35f;
-				new_y = 0;
-				// Angle inward: positive yaw for left windows, negative for right
-				float yaw = (new_x > 0) ? -(float)(15.0 * M_PI / 180.0)
-				                         : (float)(15.0 * M_PI / 180.0);
-				if (fabsf(new_x) < 0.01f) yaw = 0;
-				new_orient = quat_from_yaw(yaw);
-			}
+		case 0: { // Grid: adaptive grid via compute_grid_layout
+			compute_grid_layout(sys, n, idx, &new_x, &new_y, &new_z, &new_w, &new_h);
 			break;
 		}
 
-		case 3: { // Stack: card pile at varying Z, focused at front
-			new_w = disp_w_m * 0.55f;
-			new_h = disp_h_m * 0.55f;
-			// Focused window at front Z, others behind
-			bool is_focused = (s == mc->focused_slot || (mc->focused_slot < 0 && idx == 0));
-			if (is_focused) {
-				new_z = 0.02f; // 2cm in front
-				new_x = 0;
-				new_y = 0;
-			} else {
-				// Distribute behind, with XY offset for card-stack look
-				float z_step = 0.04f / (n > 1 ? (float)(n - 1) : 1.0f);
-				new_z = 0.02f - (idx + 1) * z_step;
-				if (new_z < -0.02f) new_z = -0.02f;
-				new_x = idx * 0.005f;  // 5mm right per layer
-				new_y = -idx * 0.005f; // 5mm down per layer
-			}
+		case 1: { // Immersive: grid tangent to convex paraboloid (spoon/bowl shape)
+			compute_grid_layout(sys, n, idx, &new_x, &new_y, &new_z, &new_w, &new_h);
+
+			// Paraboloid: Z = curvature * (x² + y²)
+			// Center at Z=0 (display plane), edges push forward (toward viewer).
+			// curvature chosen so max edge is at ~+0.015m.
+			float disp_w = sys->base.info.display_width_m;
+			float disp_h = sys->base.info.display_height_m;
+			if (disp_w <= 0.0f) disp_w = 0.700f;
+			if (disp_h <= 0.0f) disp_h = 0.394f;
+			float max_r_sq = (disp_w / 2) * (disp_w / 2) + (disp_h / 2) * (disp_h / 2);
+			float curvature = 0.015f / max_r_sq; // +0.015m at corners
+			float r_sq = new_x * new_x + new_y * new_y;
+			new_z = curvature * r_sq;
+
+			// Tangent to paraboloid: surface normal at (x,y) is (-dZ/dx, -dZ/dy, 1).
+			// dZ/dx = 2*c*x, dZ/dy = 2*c*y. Normal = (-2cx, -2cy, 1).
+			// Window should face along the normal (inward toward viewer).
+			// Yaw (rotation about Y): window on right edge tilts left → negative yaw.
+			// Pitch (rotation about X): window on top edge tilts down → positive pitch.
+			float dzdx = 2.0f * curvature * new_x;
+			float dzdy = 2.0f * curvature * new_y;
+			float yaw = -atanf(dzdx);   // right edge → negative yaw (face left/inward)
+			float pitch = atanf(dzdy);   // top edge → positive pitch (face down/inward)
+			float cy = cosf(yaw / 2), sy = sinf(yaw / 2);
+			float cp = cosf(pitch / 2), sp = sinf(pitch / 2);
+			new_orient.x = sp * cy;
+			new_orient.y = cp * sy;
+			new_orient.z = -sp * sy;
+			new_orient.w = cp * cy;
 			break;
 		}
 
@@ -4835,31 +4710,25 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	}
 
 	if (mc->window_dismissed) {
-		// Shell was dismissed (ESC), but a new client has connected and is
-		// submitting frames. Reopen the shell window.
-		if (mc->client_count > 0) {
-			U_LOG_W("Multi-comp: reopening shell window (new client after dismiss)");
-			// Destroy old window resources
-			if (mc->window != nullptr) {
-				comp_d3d11_window_destroy(&mc->window);
+		// Shell was dismissed (ESC). Don't reopen — stay dismissed.
+		// Send EXIT_REQUEST to all IPC clients so they exit cleanly.
+		// Release all capture clients (captured 2D windows stay alive).
+		if (!mc->dismiss_cleanup_done) {
+			mc->dismiss_cleanup_done = true;
+			for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
+				if (!mc->clients[i].active) continue;
+				if (mc->clients[i].client_type == CLIENT_TYPE_CAPTURE) {
+					multi_compositor_remove_capture_client(sys, i);
+				} else if (mc->clients[i].compositor != nullptr &&
+				           mc->clients[i].compositor->xses != nullptr) {
+					union xrt_session_event xse = XRT_STRUCT_INIT;
+					xse.type = XRT_SESSION_EVENT_EXIT_REQUEST;
+					xrt_session_event_sink_push(mc->clients[i].compositor->xses, &xse);
+				}
 			}
-			mc->hwnd = nullptr;
-			mc->swap_chain = nullptr;
-			mc->back_buffer_rtv = nullptr;
-			mc->display_processor = nullptr;
-			mc->crop_texture = nullptr;
-			mc->crop_srv = nullptr;
-			mc->window_dismissed = false;
-
-			// ensure_output will recreate everything
-			xrt_result_t ret = multi_compositor_ensure_output(sys);
-			if (ret != XRT_SUCCESS) {
-				return;
-			}
-			mc = sys->multi_comp;
-		} else {
-			return;
+			U_LOG_W("Multi-comp: shell dismissed — sent exit to IPC clients, released captures");
 		}
+		return;
 	}
 
 	// Check window validity
@@ -4878,7 +4747,6 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	// Ignore ALT+TAB (system task switcher) — only process bare TAB.
 	if ((GetAsyncKeyState(VK_TAB) & 1) && !(GetAsyncKeyState(VK_MENU) & 0x8000)) {
 		if (mc->client_count > 0) {
-			int old_focused = mc->focused_slot;
 			// Start from current and advance
 			int next = mc->focused_slot + 1;
 			bool found = false;
@@ -4901,15 +4769,10 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			U_LOG_W("Multi-comp: TAB → focused slot %d%s", mc->focused_slot,
 			        mc->focused_slot < 0 ? " (unfocused)" : "");
 			multi_compositor_update_input_forward(mc);
-			snap_focused_window(sys, mc, old_focused, mc->focused_slot);
 
-			// Stack layout: TAB reorders Z — focused window to front
-			if (mc->current_layout == 3 && mc->focused_slot >= 0) {
-				apply_layout(sys, mc, 3);
-			}
 
-			// Dynamic carousel/orbital/helix: TAB rotates to bring focused window to front + pause 5s
-			if (mc->dynamic_layout.mode >= 0 && mc->dynamic_layout.mode <= 2 && mc->focused_slot >= 0) {
+			// Dynamic carousel: TAB rotates to bring focused window to front + pause 5s
+			if (mc->dynamic_layout.mode == 0 && mc->focused_slot >= 0) {
 				// Find the index of the focused slot among active windows
 				int active_idx = -1;
 				int n_active = 0;
@@ -4958,18 +4821,21 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		}
 	}
 
-	// Layout presets: Ctrl+1-4 static, Ctrl+5-8 dynamic
-	// 1=SBS, 2=stacked, 3=theater, 4=stack, 5=carousel, 6=orbital, 7=helix, 8=expose
+	// F11: toggle fullscreen for the focused window
+	if (GetAsyncKeyState(VK_F11) & 1) {
+		if (mc->focused_slot >= 0) {
+			toggle_fullscreen(sys, mc, mc->focused_slot);
+		}
+	}
+
+	// Layout presets: Ctrl+1=grid, Ctrl+2=immersive, Ctrl+3=carousel
 	if (GetAsyncKeyState(VK_CONTROL) & 0x8000) {
-		for (int k = '1'; k <= '8'; k++) {
-			if (GetAsyncKeyState(k) & 1) {
-				if (k <= '4') {
-					apply_layout(sys, mc, k - '1');
-				} else {
-					enter_dynamic_layout(sys, mc, k - '5'); // 0=carousel, 1=orbital, 2=helix, 3=expose
-				}
-				break;
-			}
+		if (GetAsyncKeyState('1') & 1) {
+			apply_layout(sys, mc, 0); // grid
+		} else if (GetAsyncKeyState('2') & 1) {
+			apply_layout(sys, mc, 1); // immersive
+		} else if (GetAsyncKeyState('3') & 1) {
+			enter_dynamic_layout(sys, mc, 0); // carousel
 		}
 	}
 
@@ -5030,7 +4896,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 
 		// Dynamic layout drag: title bar LMB controls carousel rotation.
 		// Content clicks/drags pause rotation and forward to app normally.
-		if (mc->dynamic_layout.mode >= 0 && mc->dynamic_layout.mode != 3) {
+		if (mc->dynamic_layout.mode >= 0) {
 			if (lmb_just_pressed) {
 				POINT pt;
 				GetCursorPos(&pt);
@@ -5103,27 +4969,6 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			if (mc->dynamic_layout.user_dragging) {
 				goto after_lmb_handling;
 			}
-		}
-
-		// Expose click: click a window to select it and return to previous layout
-		if (mc->dynamic_layout.mode == 3 && lmb_just_pressed) {
-			POINT pt;
-			GetCursorPos(&pt);
-			ScreenToClient(mc->hwnd, &pt);
-			struct shell_hit_result hit = shell_raycast_hit_test(sys, mc, pt);
-			if (hit.slot >= 0) {
-				mc->focused_slot = hit.slot;
-				multi_compositor_update_input_forward(mc);
-				// Return to previous layout
-				int prev = mc->dynamic_layout.prev_layout;
-				mc->dynamic_layout.mode = -1;
-				if (prev >= 0 && prev <= 3) {
-					apply_layout(sys, mc, prev);
-				} else {
-					apply_layout(sys, mc, 0); // fallback to SBS
-				}
-			}
-			goto after_lmb_handling;
 		}
 
 		normal_lmb_handling:
@@ -5209,64 +5054,11 @@ multi_compositor_render(struct d3d11_service_system *sys)
 				mc->last_title_click_slot = hit_slot;
 
 				if (is_double_click) {
-					float disp_w_m = sys->base.info.display_width_m;
-					float disp_h_m = sys->base.info.display_height_m;
-					if (disp_w_m <= 0.0f) disp_w_m = 0.700f;
-					if (disp_h_m <= 0.0f) disp_h_m = 0.394f;
-					uint64_t now_ns = os_monotonic_get_ns();
-
-					if (mc->clients[hit_slot].maximized) {
-						// Restore from pre-max state (animated)
-						slot_animate_to(&mc->clients[hit_slot],
-						                &mc->clients[hit_slot].pre_max_pose,
-						                mc->clients[hit_slot].pre_max_width_m,
-						                mc->clients[hit_slot].pre_max_height_m,
-						                SNAP_FOCUS_DURATION_NS, now_ns);
-						mc->clients[hit_slot].maximized = false;
-						// Un-hide windows that were hidden by fullscreen
-						for (int j = 0; j < D3D11_MULTI_MAX_CLIENTS; j++) {
-							if (mc->clients[j].fullscreen_minimized) {
-								mc->clients[j].minimized = false;
-								mc->clients[j].fullscreen_minimized = false;
-							}
-						}
-						U_LOG_W("Multi-comp: restore slot %d from maximized", hit_slot);
-					} else {
-						// Save current state and maximize (animated)
-						mc->clients[hit_slot].pre_max_pose = mc->clients[hit_slot].window_pose;
-						mc->clients[hit_slot].pre_max_width_m = mc->clients[hit_slot].window_width_m;
-						mc->clients[hit_slot].pre_max_height_m = mc->clients[hit_slot].window_height_m;
-						struct xrt_pose max_pose = mc->clients[hit_slot].window_pose;
-						max_pose.position.x = 0;
-						max_pose.position.y = 0;
-						slot_animate_to(&mc->clients[hit_slot],
-						                &max_pose,
-						                disp_w_m * 0.95f,
-						                disp_h_m * 0.95f,
-						                SNAP_FOCUS_DURATION_NS, now_ns);
-						mc->clients[hit_slot].maximized = true;
-						// Hide all other windows
-						for (int j = 0; j < D3D11_MULTI_MAX_CLIENTS; j++) {
-							if (j != hit_slot && mc->clients[j].active && !mc->clients[j].minimized) {
-								mc->clients[j].minimized = true;
-								mc->clients[j].fullscreen_minimized = true;
-							}
-						}
-						U_LOG_W("Multi-comp: maximize slot %d (hiding %d others)", hit_slot,
-						        mc->client_count > 1 ? mc->client_count - 1 : 0);
-					}
-					mc->focused_slot = hit_slot;
-					multi_compositor_update_input_forward(mc);
+					toggle_fullscreen(sys, mc, hit_slot);
 				} else {
 					// Single click on title bar: start dragging
-					{
-						int old_focused = mc->focused_slot;
-						mc->focused_slot = hit_slot;
-						multi_compositor_update_input_forward(mc);
-						if (old_focused != hit_slot) {
-							snap_focused_window(sys, mc, old_focused, mc->focused_slot);
-						}
-					}
+					mc->focused_slot = hit_slot;
+					multi_compositor_update_input_forward(mc);
 
 					mc->title_drag.active = true;
 					mc->title_drag.slot = hit_slot;
@@ -5312,24 +5104,25 @@ multi_compositor_render(struct d3d11_service_system *sys)
 				} else {
 					// Content area: focus + forward to app
 					if (hit_slot != mc->focused_slot) {
-						int old_focused = mc->focused_slot;
 						mc->focused_slot = hit_slot;
 						U_LOG_W("Multi-comp: click → focused slot %d%s", mc->focused_slot,
 						        mc->focused_slot < 0 ? " (unfocused)" : "");
 						multi_compositor_update_input_forward(mc);
-						snap_focused_window(sys, mc, old_focused, mc->focused_slot);
+			
 					}
 
-					// Synthesize mouse-move + click to the app using spatial hit coords
-					if (mc->clients[hit_slot].app_hwnd != nullptr) {
+					// For capture clients, synthesize a click to route to the correct
+					// child control (sets internal focus for typing).
+					// For IPC apps, the WndProc already forwards the real mouse events
+					// — don't synthesize here or it cancels the drag (down+up).
+					if (mc->clients[hit_slot].client_type == CLIENT_TYPE_CAPTURE &&
+					    mc->clients[hit_slot].app_hwnd != nullptr) {
 						float title_h_m = UI_TITLE_BAR_H_M;
 						float content_local_x = hit.local_x_m;
 						float content_local_y = hit.local_y_m - title_h_m;
 						float win_w = mc->clients[hit_slot].window_width_m;
 						float win_h = mc->clients[hit_slot].window_height_m;
 
-						// Use actual HWND client size for coordinate mapping.
-						// For capture clients, the HWND size differs from window_rect.
 						RECT target_cr;
 						GetClientRect(mc->clients[hit_slot].app_hwnd, &target_cr);
 						int target_w = target_cr.right - target_cr.left;
@@ -5340,20 +5133,16 @@ multi_compositor_render(struct d3d11_service_system *sys)
 						int app_x = (int)(content_local_x / win_w * (float)target_w);
 						int app_y = (int)(content_local_y / win_h * (float)target_h);
 
-						// For capture clients, find the child control at the click
-						// position and forward there (sets internal focus for typing).
 						HWND click_target = mc->clients[hit_slot].app_hwnd;
-						if (mc->clients[hit_slot].client_type == CLIENT_TYPE_CAPTURE) {
-							POINT child_pt = {app_x, app_y};
-							HWND child = ChildWindowFromPointEx(
-							    click_target, child_pt,
-							    CWP_SKIPINVISIBLE | CWP_SKIPDISABLED);
-							if (child != NULL && child != click_target) {
-								MapWindowPoints(click_target, child, &child_pt, 1);
-								click_target = child;
-								app_x = child_pt.x;
-								app_y = child_pt.y;
-							}
+						POINT child_pt = {app_x, app_y};
+						HWND child = ChildWindowFromPointEx(
+						    click_target, child_pt,
+						    CWP_SKIPINVISIBLE | CWP_SKIPDISABLED);
+						if (child != NULL && child != click_target) {
+							MapWindowPoints(click_target, child, &child_pt, 1);
+							click_target = child;
+							app_x = child_pt.x;
+							app_y = child_pt.y;
 						}
 
 						LPARAM lp = MAKELPARAM(app_x, app_y);
@@ -5469,7 +5258,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	after_lmb_handling:
 
 	// Scroll in dynamic mode: adjust radius
-	if (mc->dynamic_layout.mode >= 0 && mc->dynamic_layout.mode != 3) {
+	if (mc->dynamic_layout.mode >= 0) {
 		if (mc->window != nullptr) {
 			int32_t scroll = comp_d3d11_window_consume_scroll(mc->window);
 			if (scroll != 0) {
@@ -5682,6 +5471,14 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		multi_compositor_update_input_forward(mc);
 	}
 
+	// Debounced re-grid: apply grid layout after 500ms of no new client connections.
+	if (mc->regrid_pending_ns > 0 && os_monotonic_get_ns() >= mc->regrid_pending_ns &&
+	    mc->dynamic_layout.mode < 0) {
+		mc->regrid_pending_ns = 0;
+		apply_layout(sys, mc, mc->current_layout >= 0 ? mc->current_layout : 0);
+		U_LOG_W("Multi-comp: debounced re-grid applied (%u clients)", mc->client_count);
+	}
+
 	// Tick per-slot animations (for static layout transitions + entry animations).
 	// Skipped when dynamic layout is active (it drives poses directly).
 	if (mc->dynamic_layout.mode < 0) {
@@ -5716,8 +5513,6 @@ multi_compositor_render(struct d3d11_service_system *sys)
 
 		if (want_2d != mc->capture_forced_2d) {
 			mc->capture_forced_2d = want_2d;
-			// Fade to black during mode transition to mask interlacing toggle
-			mc->mode_fade_until_ns = os_monotonic_get_ns() + 100000000ULL; // 100ms
 
 			struct xrt_device *head = (sys->xsysd != nullptr)
 			    ? sys->xsysd->static_roles.head : nullptr;
@@ -5808,17 +5603,9 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	// Must run before rendering so input arrives promptly (~16ms latency).
 	multi_compositor_dispatch_capture_input(mc);
 
-	// Fade-to-black during 2D↔3D mode transitions to mask interlacing toggle.
-	// When fading, clear to black and skip all client rendering; DP still runs.
-	bool mode_fading = (mc->mode_fade_until_ns > 0 &&
-	                    os_monotonic_get_ns() < mc->mode_fade_until_ns);
-
-	// Clear combined atlas (black during fade, dark gray normally).
+	// Clear combined atlas to dark gray background each frame.
 	{
-		float bg_color[4] = {0.0f, 0.0f, 0.0f, 1.0f};
-		if (!mode_fading) {
-			bg_color[0] = bg_color[1] = bg_color[2] = 0.102f; // #1a1a1a
-		}
+		float bg_color[4] = {0.102f, 0.102f, 0.102f, 1.0f}; // #1a1a1a
 		sys->context->ClearRenderTargetView(mc->combined_atlas_rtv.get(), bg_color);
 	}
 
@@ -5832,8 +5619,6 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			render_order[render_count++] = s;
 		}
 	}
-	// During mode fade, skip all client rendering (atlas stays black).
-	if (mode_fading) render_count = 0;
 	// Sort by Z ascending (farthest first → closest last = on top)
 	for (int i = 0; i < render_count - 1; i++) {
 		for (int j = i + 1; j < render_count; j++) {
@@ -6372,11 +6157,12 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		sys->context->RSSetScissorRects(1, &full_scissor);
 	}
 
-	// Draw taskbar at bottom if any windows are minimized
+	// Draw taskbar at bottom if any windows are user-minimized (not fullscreen-hidden)
 	{
 		bool has_minimized = false;
 		for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
-			if (mc->clients[i].active && mc->clients[i].minimized) {
+			if (mc->clients[i].active && mc->clients[i].minimized &&
+			    !mc->clients[i].fullscreen_minimized) {
 				has_minimized = true;
 				break;
 			}
