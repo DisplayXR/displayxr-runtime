@@ -1960,6 +1960,9 @@ ipc_handle_shell_activate(volatile struct ipc_client_state *_ics)
 	s->shell_mode = true;
 	if (s->xsysc != NULL) {
 		s->xsysc->info.shell_mode = true;
+
+		// Eagerly create the shell window so Ctrl+O works even with no apps.
+		comp_d3d11_service_ensure_shell_window(s->xsysc);
 	}
 
 	return XRT_SUCCESS;

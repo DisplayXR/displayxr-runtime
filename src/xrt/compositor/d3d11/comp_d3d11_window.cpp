@@ -163,8 +163,11 @@ struct comp_d3d11_window
 // Forward declarations
 static void set_fullscreen(HWND hWnd, bool fullscreen);
 
-// Custom message ID for foreground request (posted to window thread)
+// Custom message IDs (posted to window thread from compositor thread)
 #define WM_SHELL_SET_FOREGROUND (WM_USER + 100)
+#define WM_SHELL_LAUNCH_APP    (WM_USER + 101)
+
+#include <commdlg.h> // GetOpenFileNameA
 
 /*!
  * Push an input event into the ring buffer (WndProc thread only).
@@ -582,6 +585,66 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			SetForegroundWindow(hWnd);
 		}
 		InterlockedExchange(&w->foreground_done, 1);
+		return 0;
+	}
+
+	case WM_SHELL_LAUNCH_APP: {
+		// Open file dialog and launch selected app.
+		// Runs on window thread (modal dialog, blocks message pump).
+		// Compositor thread continues rendering independently.
+		char path[MAX_PATH] = {0};
+		OPENFILENAMEA ofn = {0};
+		ofn.lStructSize = sizeof(ofn);
+		ofn.hwndOwner = hWnd;
+		ofn.lpstrFilter = "Executables (*.exe)\0*.exe\0All Files (*.*)\0*.*\0";
+		ofn.lpstrFile = path;
+		ofn.nMaxFile = MAX_PATH;
+		ofn.lpstrTitle = "Launch App in Shell";
+		ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+		if (GetOpenFileNameA(&ofn)) {
+			// Set shell session env var and ensure XR_RUNTIME_JSON points to
+			// the dev build runtime (matching the running service).
+			SetEnvironmentVariableA("DISPLAYXR_SHELL_SESSION", "1");
+			if (getenv("XR_RUNTIME_JSON") == NULL) {
+				// Use dev build manifest (has absolute path to DLL).
+				// Service is at _package/bin/, dev manifest is at build/Release/.
+				char module_dir[MAX_PATH] = {0};
+				GetModuleFileNameA(NULL, module_dir, MAX_PATH);
+				char *sep = strrchr(module_dir, '\\');
+				if (sep) *sep = '\0';
+				char json_path[MAX_PATH];
+				// _package/bin/../../build/Release/openxr_displayxr-dev.json
+				snprintf(json_path, sizeof(json_path),
+				         "%s\\..\\..\\build\\Release\\openxr_displayxr-dev.json", module_dir);
+				char abs_json[MAX_PATH];
+				if (_fullpath(abs_json, json_path, MAX_PATH) &&
+				    GetFileAttributesA(abs_json) != INVALID_FILE_ATTRIBUTES) {
+					SetEnvironmentVariableA("XR_RUNTIME_JSON", abs_json);
+					U_LOG_W("D3D11 window: set XR_RUNTIME_JSON=%s", abs_json);
+				}
+			}
+
+			// Extract app directory for working directory (so it finds co-located DLLs)
+			char app_dir[MAX_PATH] = {0};
+			strncpy(app_dir, path, MAX_PATH - 1);
+			char *last_slash = strrchr(app_dir, '\\');
+			if (!last_slash) last_slash = strrchr(app_dir, '/');
+			if (last_slash) *last_slash = '\0';
+
+			char cmd[MAX_PATH + 16];
+			snprintf(cmd, sizeof(cmd), "\"%s\"", path);
+			STARTUPINFOA si = {0};
+			si.cb = sizeof(si);
+			PROCESS_INFORMATION pi = {0};
+			if (CreateProcessA(NULL, cmd, NULL, NULL, FALSE,
+			                   CREATE_NEW_CONSOLE, NULL, app_dir, &si, &pi)) {
+				U_LOG_W("D3D11 window: launched app '%s' (PID %lu)", path, pi.dwProcessId);
+				CloseHandle(pi.hProcess);
+				CloseHandle(pi.hThread);
+			} else {
+				U_LOG_E("D3D11 window: failed to launch '%s' (error %lu)", path, GetLastError());
+			}
+		}
 		return 0;
 	}
 
@@ -1035,4 +1098,13 @@ comp_d3d11_window_request_foreground(struct comp_d3d11_window *window,
 		}
 		Sleep(1);
 	}
+}
+
+extern "C" void
+comp_d3d11_window_request_app_launch(struct comp_d3d11_window *window)
+{
+	if (window == NULL || window->hwnd == NULL) {
+		return;
+	}
+	PostMessageW(window->hwnd, WM_SHELL_LAUNCH_APP, 0, 0);
 }

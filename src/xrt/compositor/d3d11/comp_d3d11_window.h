@@ -270,6 +270,18 @@ void
 comp_d3d11_window_request_foreground(struct comp_d3d11_window *window,
                                      void *target_hwnd);
 
+/*!
+ * Request the window thread to open a file dialog and launch an app.
+ *
+ * The file dialog runs on the window thread (modal, blocks message pump).
+ * On success, launches the selected .exe with DISPLAYXR_SHELL_SESSION=1
+ * and XR_RUNTIME_JSON set. The app connects via IPC automatically.
+ *
+ * @param window The window object
+ */
+void
+comp_d3d11_window_request_app_launch(struct comp_d3d11_window *window);
+
 #ifdef __cplusplus
 }
 #endif
