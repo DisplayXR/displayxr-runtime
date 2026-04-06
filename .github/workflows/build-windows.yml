@@ -81,6 +81,7 @@ jobs:
         uses: actions/upload-artifact@v4
         id: artifact-upload-step
         with:
+          retention-days: 3
           name: DisplayXR
           if-no-files-found: error
           path: _package
@@ -89,6 +90,7 @@ jobs:
         uses: actions/upload-artifact@v4
         id: installer-upload-step
         with:
+          retention-days: 3
           name: DisplayXR-Installer
           if-no-files-found: error
           path: _package/DisplayXRSetup-*.exe
@@ -245,6 +247,7 @@ jobs:
       - name: Upload test app
         uses: actions/upload-artifact@v4
         with:
+          retention-days: 3
           name: CubeHandleD3D11
           if-no-files-found: error
           path: |
@@ -305,6 +308,7 @@ jobs:
       - name: Upload D3D11 hosted test app
         uses: actions/upload-artifact@v4
         with:
+          retention-days: 3
           name: CubeHostedD3D11
           if-no-files-found: error
           path: |
@@ -365,6 +369,7 @@ jobs:
       - name: Upload D3D12 test app
         uses: actions/upload-artifact@v4
         with:
+          retention-days: 3
           name: CubeHandleD3D12
           if-no-files-found: error
           path: |
@@ -425,6 +430,7 @@ jobs:
       - name: Upload OpenGL test app
         uses: actions/upload-artifact@v4
         with:
+          retention-days: 3
           name: CubeHandleGL
           if-no-files-found: error
           path: |
@@ -491,6 +497,7 @@ jobs:
       - name: Upload Vulkan test app
         uses: actions/upload-artifact@v4
         with:
+          retention-days: 3
           name: CubeHandleVK
           if-no-files-found: error
           path: |
@@ -557,6 +564,7 @@ jobs:
       - name: Upload 3DGS Vulkan demo
         uses: actions/upload-artifact@v4
         with:
+          retention-days: 3
           name: GaussianSplattingVK
           if-no-files-found: error
           path: |
@@ -616,6 +624,7 @@ jobs:
       - name: Upload Spatial OS demo
         uses: actions/upload-artifact@v4
         with:
+          retention-days: 3
           name: SpatialOS
           if-no-files-found: error
           path: |
@@ -668,6 +677,7 @@ jobs:
       - name: Upload texture D3D11 test app
         uses: actions/upload-artifact@v4
         with:
+          retention-days: 3
           name: CubeTextureD3D11
           if-no-files-found: error
           path: |
@@ -720,6 +730,7 @@ jobs:
       - name: Upload texture D3D12 test app
         uses: actions/upload-artifact@v4
         with:
+          retention-days: 3
           name: CubeTextureD3D12
           if-no-files-found: error
           path: |
@@ -780,6 +791,7 @@ jobs:
       - name: Upload legacy hosted D3D11 test app
         uses: actions/upload-artifact@v4
         with:
+          retention-days: 3
           name: CubeHostedLegacyD3D11
           if-no-files-found: error
           path: |
@@ -836,6 +848,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
+          retention-days: 3
           name: CubeHostedLegacyD3D12
           if-no-files-found: error
           path: |
@@ -898,6 +911,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
+          retention-days: 3
           name: CubeHostedLegacyVK
           if-no-files-found: error
           path: |
@@ -948,6 +962,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
+          retention-days: 3
           name: CubeHostedLegacyGL
           if-no-files-found: error
           path: |
@@ -1004,6 +1019,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
+          retention-days: 3
           name: CubeIpcLegacyD3D11
           if-no-files-found: error
           path: |
@@ -1060,6 +1076,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
+          retention-days: 3
           name: CubeIpcD3D11
           if-no-files-found: error
           path: |
@@ -1100,6 +1117,7 @@ jobs:
       - name: Upload bundled test apps
         uses: actions/upload-artifact@v4
         with:
+          retention-days: 3
           name: TestApps-${{ github.run_number }}
           if-no-files-found: error
           path: TestApps
