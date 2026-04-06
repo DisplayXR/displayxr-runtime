@@ -8,11 +8,27 @@ Build and deploy DisplayXR on an Android device with a Leia 3D display (e.g., Nu
 
 | Tool | Version | Install |
 |------|---------|---------|
-| Android Studio | 2024.1+ | [developer.android.com](https://developer.android.com/studio) |
-| Android SDK | API 35 | Via Android Studio SDK Manager |
-| Android NDK | 26.3.11579264 | Via Android Studio SDK Manager > SDK Tools |
-| CMake (Android) | 3.22.1 | Via Android Studio SDK Manager > SDK Tools |
-| Java JDK | 17 | `brew install openjdk@17` (macOS) |
+| Android SDK command-line tools | latest | `brew install --cask android-commandlinetools` (macOS) |
+| Android SDK Platform | API 35 | `sdkmanager "platforms;android-35"` |
+| Android NDK | 26.3.11579264 | `sdkmanager "ndk;26.3.11579264"` |
+| CMake (Android) | 3.22.1 | `sdkmanager "cmake;3.22.1"` |
+| Build Tools | 34.0.0 | `sdkmanager "build-tools;34.0.0"` |
+| Platform Tools (adb) | latest | `sdkmanager "platform-tools"` |
+| Java JDK | 17+ | `brew install openjdk@17` (macOS) or any JDK 17+ |
+
+**Quick install (macOS):**
+```bash
+brew install --cask android-commandlinetools
+export ANDROID_HOME="$HOME/Library/Android/sdk"
+mkdir -p "$ANDROID_HOME"
+SDKMANAGER="/opt/homebrew/share/android-commandlinetools/cmdline-tools/latest/bin/sdkmanager"
+yes | "$SDKMANAGER" --sdk_root="$ANDROID_HOME" --licenses
+"$SDKMANAGER" --sdk_root="$ANDROID_HOME" \
+  "platforms;android-35" "ndk;26.3.11579264" "cmake;3.22.1" \
+  "build-tools;34.0.0" "platform-tools"
+```
+
+Android Studio is **not required** — the command-line tools are sufficient.
 | ADB | latest | Included with Android SDK platform-tools |
 
 ### On the device (Nubia Pad 2)

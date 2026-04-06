@@ -16,6 +16,7 @@ See the [milestone tracker](https://github.com/dfattal/openxr-3d-display/milesto
 - **M4: Display Extensions** — Next major focus. Lock down extension API surface (#3, #8, #38). #5 closed (superseded by #77).
 - **M5: Interface Standardization** — #45, #46, #47 open.
 - **M6: Spatial Shell** — #43, #44 open. Phase 3B complete: all 4 APIs (D3D11, D3D12, GL, VK) working in shell individually and simultaneously. #116 (multi-client crash) fixed.
+- **M7: Android Support** — #125-#134. Vulkan compositor + CNSDK display processor shipping. GLES compositor, IPC, CI, test app pending.
 
 ### Architecture
 
@@ -96,6 +97,29 @@ Downloads all dependencies on first run (SR SDK, vcpkg, OpenXR loader). Requires
 /ci-monitor "your commit message"
 ```
 Commits, pushes, monitors GitHub Actions (Windows + macOS), auto-fixes common build errors. Use when not on a local dev machine or for final validation before merge.
+
+### Local Android Build
+```bash
+# Prerequisites: Android SDK + NDK (via brew install --cask android-commandlinetools, then sdkmanager)
+# Required SDK components: platforms;android-35, ndk;26.3.11579264, cmake;3.22.1, build-tools;34.0.0
+
+# 1. Set up local.properties with Android SDK path
+echo "sdk.dir=$HOME/Library/Android/sdk" > local.properties
+
+# 2. Symlink or unzip CNSDK Android release package
+ln -s /path/to/cnsdk-android-x.y.z cnsdk
+# Must contain: VERSION.txt, android/sdk-{version}.aar, include/leia/, lib/arm64-v8a/, share/cmake/CNSDK/
+
+# 3. Build the in-process debug APK
+./gradlew :src:xrt:targets:openxr_android:assembleInProcessDebug
+
+# 4. Install on device
+adb install -r src/xrt/targets/openxr_android/build/outputs/apk/inProcess/debug/openxr_android-inProcess-debug.apk
+```
+
+**Build variants:** `inProcessDebug` (single app, embedded runtime), `outOfProcessDebug` (service mode, multi-app). Use in-process for initial testing.
+
+**CNSDK display processor:** Uses `CNSDK::leiaCore` for Vulkan interlacing. The DP sets `self_submitting=true` because CNSDK manages its own GPU command buffers. See `docs/getting-started/android-build-guide.md` for full guide.
 
 ### Standard CMake Build
 ```bash
@@ -193,11 +217,19 @@ C interfaces with vtable-style polymorphism:
 
 For the full interface catalog including display processor vtables (5 API variants), see `docs/guides/vendor-integration.md`.
 
-### LeiaSR SDK Integration
+### LeiaSR SDK Integration (Windows)
 - `XRT_HAVE_LEIA_SR` CMake option (auto-enabled if SDK found)
 - D3D11 weaver: `compositor/d3d11/` via `drivers/leia/leiasr_d3d11.cpp`
 - Eye tracking via SR SDK's LookaroundFilter
 - Display dimensions from SR::Display for Kooima asymmetric frustum projection
+
+### CNSDK Integration (Android)
+- `XRT_HAVE_CNSDK` CMake option (auto-enabled if CNSDK release package found via `find_package(CNSDK CONFIG)`)
+- CNSDK wrapper: `drivers/leia/leia_cnsdk.cpp` — isolates CNSDK headers, lazy interlacer creation
+- CNSDK display processor: `drivers/leia/leia_cnsdk_display_processor.cpp` — implements `xrt_display_processor` vtable
+- `self_submitting=true`: CNSDK manages its own Vulkan command buffers; compositor adapts submission flow
+- Face tracking + display config via Leia system services (pre-installed on device)
+- CNSDK release package: symlink at `cnsdk/` in repo root, linked as `CNSDK::leiaCore`
 
 ### Native Compositors
 Each bypasses Vulkan entirely for its graphics API:
@@ -205,7 +237,7 @@ Each bypasses Vulkan entirely for its graphics API:
 - **D3D12** (`compositor/d3d12/`) — Shipping. `XR_EXT_win32_window_binding`
 - **Metal** (`compositor/metal/`) — Shipping. sim_display weaver, `XR_EXT_cocoa_window_binding`
 - **OpenGL** (`compositor/gl/`) — Shipping. Windows + macOS
-- **Vulkan** (`compositor/vk_native/`) — Shipping. Windows + macOS (MoltenVK)
+- **Vulkan** (`compositor/vk_native/`) — Shipping. Windows, macOS (MoltenVK), Android (VK_KHR_android_surface)
 
 Why native compositors instead of Vulkan interop: `docs/adr/ADR-001-native-compositors-per-graphics-api.md`.
 Compositor never weaves — that's the DP's job: `docs/adr/ADR-007-compositor-never-weaves.md`.
@@ -230,8 +262,9 @@ XR_RUNTIME_JSON=./build/openxr_displayxr-dev.json ./your_openxr_app
 ```
 
 ### Key CMake Options
-- `XRT_HAVE_LEIA_SR` — LeiaSR SDK support
+- `XRT_HAVE_LEIA_SR` — LeiaSR SDK support (Windows)
 - `XRT_HAVE_LEIA_SR_VULKAN` / `XRT_HAVE_LEIA_SR_D3D11` — API-specific weavers
+- `XRT_HAVE_CNSDK` — CNSDK support (Android). Auto-enabled when `cnsdk/` package found via CMAKE_PREFIX_PATH
 - `XRT_FEATURE_SERVICE` — Out-of-process service mode
 - `BUILD_TESTING` — Test suite
 
@@ -339,6 +372,7 @@ See `docs/README.md` for a complete index. Key docs by task:
 | Understand the 3D capture pipeline | `docs/roadmap/3d-capture.md` |
 | Understand shell/runtime IPC contract | `docs/roadmap/shell-runtime-contract.md` |
 | Understand the overall product vision | `docs/roadmap/spatial-desktop-prd.md` |
+| Build and test on Android | `docs/getting-started/android-build-guide.md` |
 
 ## Debug Logs
 
