@@ -577,6 +577,9 @@ Section "DisplayXR Runtime" SecRuntime
 	; Install manifest
 	File "${OUTPUT_DIR}\DisplayXR_win64.json"
 
+	; Install shell (spatial window manager)
+	File /nonfatal "${BIN_DIR}\displayxr-shell.exe"
+
 	; Install switcher if available
 	File /nonfatal "${BIN_DIR}\DisplayXRSwitcher.exe"
 
@@ -672,6 +675,10 @@ SectionEnd
 Section "Start Menu Shortcuts" SecShortcuts
 	CreateDirectory "$SMPROGRAMS\DisplayXR"
 
+	; Add shell shortcut if installed
+	IfFileExists "$INSTDIR\displayxr-shell.exe" 0 +2
+		CreateShortCut "$SMPROGRAMS\DisplayXR\DisplayXR Shell.lnk" "$INSTDIR\displayxr-shell.exe"
+
 	; Add switcher shortcut if installed
 	IfFileExists "$INSTDIR\DisplayXRSwitcher.exe" 0 +2
 		CreateShortCut "$SMPROGRAMS\DisplayXR\DisplayXR Runtime Switcher.lnk" "$INSTDIR\DisplayXRSwitcher.exe"
@@ -693,9 +700,13 @@ Section "Uninstall"
 	; Also remove legacy scheduled task if it exists (from older installs)
 	nsExec::ExecToLog 'schtasks /delete /tn "DisplayXR Service" /f'
 
+	; Stop shell if running
+	nsExec::ExecToLog 'taskkill /f /im displayxr-shell.exe'
+
 	; Remove files
 	Delete "$INSTDIR\DisplayXRClient.dll"
 	Delete "$INSTDIR\displayxr-service.exe"
+	Delete "$INSTDIR\displayxr-shell.exe"
 	Delete "$INSTDIR\DisplayXRSwitcher.exe"
 	Delete "$INSTDIR\DisplayXR_win64.json"
 	Delete "$INSTDIR\install.log"
@@ -719,6 +730,7 @@ Section "Uninstall"
 	RMDir "$APPDATA\DisplayXR"
 
 	; Remove Start Menu shortcuts
+	Delete "$SMPROGRAMS\DisplayXR\DisplayXR Shell.lnk"
 	Delete "$SMPROGRAMS\DisplayXR\DisplayXR Runtime Switcher.lnk"
 	Delete "$SMPROGRAMS\DisplayXR\Uninstall DisplayXR.lnk"
 	RMDir "$SMPROGRAMS\DisplayXR"
