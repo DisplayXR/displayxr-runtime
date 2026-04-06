@@ -75,6 +75,36 @@ leia_cnsdk_weave(struct leia_cnsdk *cnsdk,
                  VkFramebuffer fb,
                  VkImage targetImage);
 
+/*!
+ * Perform CNSDK Vulkan interlacing from an SBS atlas texture.
+ *
+ * Like leia_cnsdk_weave() but takes a single atlas VkImageView
+ * containing side-by-side left|right views, and uses CNSDK's
+ * atlas mode for zero-copy interlacing.
+ *
+ * @param cnsdk        Opaque CNSDK handle.
+ * @param device       Vulkan logical device.
+ * @param physDev      Vulkan physical device.
+ * @param atlas_view   Image view for the SBS atlas (left|right).
+ * @param targetFmt    Format of the target / swapchain image.
+ * @param atlas_width  Full atlas width in pixels (2*view_width for SBS).
+ * @param atlas_height Full atlas height in pixels.
+ * @param view_count   Number of views in the atlas.
+ * @param fb           Target framebuffer.
+ * @param targetImage  Target VkImage (for layout transitions).
+ */
+void
+leia_cnsdk_weave_atlas(struct leia_cnsdk *cnsdk,
+                       VkDevice device,
+                       VkPhysicalDevice physDev,
+                       VkImageView atlas_view,
+                       VkFormat targetFmt,
+                       uint32_t atlas_width,
+                       uint32_t atlas_height,
+                       uint32_t view_count,
+                       VkFramebuffer fb,
+                       VkImage targetImage);
+
 #ifdef __cplusplus
 }
 #endif

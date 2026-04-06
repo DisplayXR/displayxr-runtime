@@ -69,6 +69,13 @@ struct xrt_window_metrics;
 struct xrt_display_processor
 {
 	/*!
+	 * If true, process_atlas performs its own GPU queue submission.
+	 * The compositor must end/submit its command buffer BEFORE calling
+	 * process_atlas, passing NULL as cmd_buffer.
+	 */
+	bool self_submitting;
+
+	/*!
 	 * @name Interface Methods
 	 * @{
 	 */

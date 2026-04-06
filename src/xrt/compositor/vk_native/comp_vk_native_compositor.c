@@ -1807,34 +1807,68 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				dp_target_h = c->canvas.h;
 			}
 
-			xrt_display_processor_process_atlas(
-			    c->display_processor,
-			    cmd,
-			    (VkImage_XDP)(uintptr_t)src_image_u64,
-			    (VkImageView)(uintptr_t)src_view_u64,
-			    view_width, view_height,
-			    tc, tr,
-			    (VkFormat_XDP)view_format,
-			    shared_fb,
-			    (VkImage_XDP)c->shared_image,
-			    dp_target_w, dp_target_h,
-			    (VkFormat_XDP)view_format,
-			    c->canvas.valid ? c->canvas.x : 0,
-			    c->canvas.valid ? c->canvas.y : 0,
-			    c->canvas.valid ? c->canvas.w : 0,
-			    c->canvas.valid ? c->canvas.h : 0);
+			if (c->display_processor->self_submitting) {
+				// Self-submitting DP: end/submit current cmd (barriers, crop-blit),
+				// then call process_atlas with NULL cmd_buffer.
+				vk->vkEndCommandBuffer(cmd);
+				VkSubmitInfo submit_info = {
+				    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+				    .commandBufferCount = 1,
+				    .pCommandBuffers = &cmd,
+				};
+				res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, VK_NULL_HANDLE);
+				if (res == VK_SUCCESS) {
+					vk->vkQueueWaitIdle(vk->main_queue->queue);
+				}
 
-			vk->vkEndCommandBuffer(cmd);
+				xrt_display_processor_process_atlas(
+				    c->display_processor,
+				    (VkCommandBuffer)NULL,
+				    (VkImage_XDP)(uintptr_t)src_image_u64,
+				    (VkImageView)(uintptr_t)src_view_u64,
+				    view_width, view_height,
+				    tc, tr,
+				    (VkFormat_XDP)view_format,
+				    shared_fb,
+				    (VkImage_XDP)c->shared_image,
+				    dp_target_w, dp_target_h,
+				    (VkFormat_XDP)view_format,
+				    c->canvas.valid ? c->canvas.x : 0,
+				    c->canvas.valid ? c->canvas.y : 0,
+				    c->canvas.valid ? c->canvas.w : 0,
+				    c->canvas.valid ? c->canvas.h : 0);
 
-			VkSubmitInfo submit_info = {
-			    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-			    .commandBufferCount = 1,
-			    .pCommandBuffers = &cmd,
-			};
-			res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, VK_NULL_HANDLE);
-			if (res == VK_SUCCESS) {
-				vk->vkQueueWaitIdle(vk->main_queue->queue);
 				weaving_done = true;
+			} else {
+				xrt_display_processor_process_atlas(
+				    c->display_processor,
+				    cmd,
+				    (VkImage_XDP)(uintptr_t)src_image_u64,
+				    (VkImageView)(uintptr_t)src_view_u64,
+				    view_width, view_height,
+				    tc, tr,
+				    (VkFormat_XDP)view_format,
+				    shared_fb,
+				    (VkImage_XDP)c->shared_image,
+				    dp_target_w, dp_target_h,
+				    (VkFormat_XDP)view_format,
+				    c->canvas.valid ? c->canvas.x : 0,
+				    c->canvas.valid ? c->canvas.y : 0,
+				    c->canvas.valid ? c->canvas.w : 0,
+				    c->canvas.valid ? c->canvas.h : 0);
+
+				vk->vkEndCommandBuffer(cmd);
+
+				VkSubmitInfo submit_info = {
+				    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+				    .commandBufferCount = 1,
+				    .pCommandBuffers = &cmd,
+				};
+				res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, VK_NULL_HANDLE);
+				if (res == VK_SUCCESS) {
+					vk->vkQueueWaitIdle(vk->main_queue->queue);
+					weaving_done = true;
+				}
 			}
 
 			if (shared_fb != VK_NULL_HANDLE) {
@@ -1972,33 +2006,87 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 				    0, 0, NULL, 0, NULL, 1, &pre_weave);
 
-				// Call display processor with atlas (or zero-copy swapchain) texture
-				xrt_display_processor_process_atlas(
-				    c->display_processor,
-				    cmd,
-				    (VkImage_XDP)(uintptr_t)src_image_u64,
-				    (VkImageView)(uintptr_t)src_view_u64,
-				    view_width, view_height,
-				    tc, tr,
-				    (VkFormat_XDP)view_format,
-				    target_fb,
-				    (VkImage_XDP)(uintptr_t)target_image,
-				    tgt_width, tgt_height,
-				    (VkFormat_XDP)VK_FORMAT_B8G8R8A8_UNORM,
-				    c->canvas.valid ? c->canvas.x : 0,
-				    c->canvas.valid ? c->canvas.y : 0,
-				    c->canvas.valid ? c->canvas.w : 0,
-				    c->canvas.valid ? c->canvas.h : 0);
+				if (c->display_processor->self_submitting) {
+					// Self-submitting DP: end/submit current cmd (barriers, crop-blit),
+					// then call process_atlas with NULL cmd_buffer.
+					vk->vkEndCommandBuffer(cmd);
+					VkSubmitInfo pre_submit = {
+					    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+					    .commandBufferCount = 1,
+					    .pCommandBuffers = &cmd,
+					};
+					vk->vkQueueSubmit(vk->main_queue->queue, 1, &pre_submit, VK_NULL_HANDLE);
+					vk->vkQueueWaitIdle(vk->main_queue->queue);
+					vk->vkFreeCommandBuffers(vk->device, cmd_pool, 1, &cmd);
 
-				// Render pass finalLayout handles transition to PRESENT_SRC_KHR
+					// DP does its own submission
+					xrt_display_processor_process_atlas(
+					    c->display_processor,
+					    (VkCommandBuffer)NULL,
+					    (VkImage_XDP)(uintptr_t)src_image_u64,
+					    (VkImageView)(uintptr_t)src_view_u64,
+					    view_width, view_height,
+					    tc, tr,
+					    (VkFormat_XDP)view_format,
+					    target_fb,
+					    (VkImage_XDP)(uintptr_t)target_image,
+					    tgt_width, tgt_height,
+					    (VkFormat_XDP)VK_FORMAT_B8G8R8A8_UNORM,
+					    c->canvas.valid ? c->canvas.x : 0,
+					    c->canvas.valid ? c->canvas.y : 0,
+					    c->canvas.valid ? c->canvas.w : 0,
+					    c->canvas.valid ? c->canvas.h : 0);
 
-				// Post-weave: blit HUD overlays onto target (flat, not interlaced)
-				vk_compositor_blit_window_space_layers(c, cmd,
-				    (VkImage)(uintptr_t)target_image, tgt_width, tgt_height);
+					// Allocate a fresh command buffer for post-DP work (HUD overlays)
+					VkCommandBufferAllocateInfo post_alloc = {
+					    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+					    .commandPool = cmd_pool,
+					    .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+					    .commandBufferCount = 1,
+					};
+					vk->vkAllocateCommandBuffers(vk->device, &post_alloc, &cmd);
+					VkCommandBufferBeginInfo post_begin = {
+					    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+					    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+					};
+					vk->vkBeginCommandBuffer(cmd, &post_begin);
 
-				// Diagnostic HUD overlay (TAB key toggle)
-				vk_compositor_render_hud(c, cmd,
-				    (VkImage)(uintptr_t)target_image, tgt_width, tgt_height);
+					// Post-weave: blit HUD overlays onto target (flat, not interlaced)
+					vk_compositor_blit_window_space_layers(c, cmd,
+					    (VkImage)(uintptr_t)target_image, tgt_width, tgt_height);
+
+					// Diagnostic HUD overlay (TAB key toggle)
+					vk_compositor_render_hud(c, cmd,
+					    (VkImage)(uintptr_t)target_image, tgt_width, tgt_height);
+				} else {
+					// Call display processor with atlas (or zero-copy swapchain) texture
+					xrt_display_processor_process_atlas(
+					    c->display_processor,
+					    cmd,
+					    (VkImage_XDP)(uintptr_t)src_image_u64,
+					    (VkImageView)(uintptr_t)src_view_u64,
+					    view_width, view_height,
+					    tc, tr,
+					    (VkFormat_XDP)view_format,
+					    target_fb,
+					    (VkImage_XDP)(uintptr_t)target_image,
+					    tgt_width, tgt_height,
+					    (VkFormat_XDP)VK_FORMAT_B8G8R8A8_UNORM,
+					    c->canvas.valid ? c->canvas.x : 0,
+					    c->canvas.valid ? c->canvas.y : 0,
+					    c->canvas.valid ? c->canvas.w : 0,
+					    c->canvas.valid ? c->canvas.h : 0);
+
+					// Render pass finalLayout handles transition to PRESENT_SRC_KHR
+
+					// Post-weave: blit HUD overlays onto target (flat, not interlaced)
+					vk_compositor_blit_window_space_layers(c, cmd,
+					    (VkImage)(uintptr_t)target_image, tgt_width, tgt_height);
+
+					// Diagnostic HUD overlay (TAB key toggle)
+					vk_compositor_render_hud(c, cmd,
+					    (VkImage)(uintptr_t)target_image, tgt_width, tgt_height);
+				}
 			} else {
 				// No display processor (or mono/2D mode): blit atlas texture to target
 				comp_vk_native_renderer_blit_to_target(c->renderer, cmd,

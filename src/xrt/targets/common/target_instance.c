@@ -46,6 +46,10 @@
 #endif
 #endif
 
+#ifdef XRT_HAVE_CNSDK
+#include "leia/leia_cnsdk_display_processor.h"
+#endif
+
 // sim_display display info for XR_EXT_display_info fallback
 #include "sim_display/sim_display_interface.h"
 
@@ -271,6 +275,13 @@ out:
 #ifdef XRT_HAVE_LEIA_SR_GL
 		xsysc->info.dp_factory_gl = (void *)leia_dp_factory_gl;
 #endif
+#endif
+
+#ifdef XRT_HAVE_CNSDK
+		// CNSDK factory (Android): use if SR SDK didn't already set one
+		if (xsysc->info.dp_factory_vk == NULL) {
+			xsysc->info.dp_factory_vk = (void *)leia_cnsdk_dp_factory_vk;
+		}
 #endif
 
 		// sim_display fallback: populate display info and factory if not already set by SR SDK

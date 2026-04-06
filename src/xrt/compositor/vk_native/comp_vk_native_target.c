@@ -25,6 +25,10 @@
 #include <vulkan/vulkan_metal.h>
 #endif
 
+#ifdef XRT_OS_ANDROID
+#include <android/native_window.h>
+#endif
+
 #define MAX_TARGET_IMAGES 4
 
 /*!
@@ -296,6 +300,43 @@ comp_vk_native_target_create(struct comp_vk_native_compositor *c,
 	                                          target->surface, &present_support);
 	if (!present_support) {
 		U_LOG_E("Queue family does not support presentation to Metal surface");
+		vk->vkDestroySurfaceKHR(vk->instance, target->surface, NULL);
+		free(target);
+		return XRT_ERROR_VULKAN;
+	}
+#elif defined(XRT_OS_ANDROID)
+	// Create Android surface via VK_KHR_android_surface
+	// hwnd parameter is an ANativeWindow* on Android
+	PFN_vkCreateAndroidSurfaceKHR pfnCreateAndroidSurface =
+	    (PFN_vkCreateAndroidSurfaceKHR)vk->vkGetInstanceProcAddr(
+	        vk->instance, "vkCreateAndroidSurfaceKHR");
+	if (pfnCreateAndroidSurface == NULL) {
+		U_LOG_E("vkCreateAndroidSurfaceKHR not available — VK_KHR_android_surface must be enabled");
+		free(target);
+		return XRT_ERROR_VULKAN;
+	}
+
+	U_LOG_I("Creating Android surface from ANativeWindow %p", hwnd);
+
+	VkAndroidSurfaceCreateInfoKHR surface_ci = {
+	    .sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR,
+	    .window = (struct ANativeWindow *)hwnd,
+	};
+
+	VkResult res = pfnCreateAndroidSurface(vk->instance, &surface_ci, NULL, &target->surface);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("Failed to create Android surface: %d", res);
+		free(target);
+		return XRT_ERROR_VULKAN;
+	}
+
+	// Check present support
+	VkBool32 present_support = VK_FALSE;
+	vk->vkGetPhysicalDeviceSurfaceSupportKHR(vk->physical_device,
+	                                          queue_family_index,
+	                                          target->surface, &present_support);
+	if (!present_support) {
+		U_LOG_E("Queue family does not support presentation to Android surface");
 		vk->vkDestroySurfaceKHR(vk->instance, target->surface, NULL);
 		free(target);
 		return XRT_ERROR_VULKAN;
