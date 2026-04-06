@@ -245,7 +245,7 @@ android {
             dimension 'deployment'
             applicationIdSuffix '.in_process'
             externalNativeBuild.cmake.arguments += "-DXRT_FEATURE_SERVICE=OFF"
-            externalNativeBuild.cmake.targets "openxr_monado"
+            externalNativeBuild.cmake.targets "openxr_displayxr"
 
             buildConfigField "boolean", "inProcess", "true"
             resValue "string", "app_name", "Monado In Process (Debugging)"
@@ -254,7 +254,7 @@ android {
             dimension 'deployment'
             applicationIdSuffix '.out_of_process'
             externalNativeBuild.cmake.arguments += "-DXRT_FEATURE_SERVICE=ON"
-            externalNativeBuild.cmake.targets "openxr_monado", "monado-service"
+            externalNativeBuild.cmake.targets "openxr_displayxr", "displayxr-service"
 
             buildConfigField "boolean", "inProcess", "false"
             resValue "string", "app_name", "Monado XR"
@@ -349,4 +349,9 @@ def addFileDependency(dependencies, depFile) {
     assert file(depFile).exists()
     dependencies.add('implementation', files(depFile))
 }
-addFileDependency(dependencies, "${project.cnsdkDir}/android/sdk-faceTrackingService-${project.cnsdkVersion}.aar")
+// CNSDK AAR — try face tracking variant first, fall back to main SDK AAR
+def cnsdkAar = new File("${project.cnsdkDir}/android/sdk-faceTrackingService-${project.cnsdkVersion}.aar")
+if (!cnsdkAar.exists()) {
+    cnsdkAar = new File("${project.cnsdkDir}/android/sdk-${project.cnsdkVersion}.aar")
+}
+addFileDependency(dependencies, cnsdkAar.absolutePath)

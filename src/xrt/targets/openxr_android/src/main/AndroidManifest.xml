@@ -61,7 +61,7 @@
             android:permission="android.permission.BIND_VR_LISTENER_SERVICE">
             <meta-data
                 android:name="org.khronos.openxr.OpenXRRuntime"
-                android:value="libopenxr_monado.so" />
+                android:value="libopenxr_displayxr.so" />
             <intent-filter>
                 <action android:name="android.service.vr.VrListenerService" />
             </intent-filter>
@@ -75,7 +75,7 @@
             tools:ignore="ExportedService">
             <meta-data
                 android:name="org.khronos.openxr.OpenXRRuntime.SoFilename"
-                android:value="libopenxr_monado.so" />
+                android:value="libopenxr_displayxr.so" />
             <meta-data
                 android:name="org.khronos.openxr.OpenXRRuntime.MajorVersion"
                 android:value="1" />

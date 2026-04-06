@@ -134,11 +134,13 @@ target_include_directories(target_instance_no_comp PUBLIC ${CMAKE_CURRENT_SOURCE
 # Platform
 
 if(ANDROID)
-	target_link_libraries(target_instance PRIVATE aux_android)
+	if(TARGET target_instance)
+		target_link_libraries(target_instance PRIVATE aux_android)
+	endif()
 
 	target_link_libraries(target_instance_no_comp PRIVATE aux_android)
 
-	if(XRT_FEATURE_HYBRID_MODE)
+	if(XRT_FEATURE_HYBRID_MODE AND TARGET target_instance_hybrid)
 		target_link_libraries(target_instance_hybrid PRIVATE aux_android)
 	endif()
 endif()

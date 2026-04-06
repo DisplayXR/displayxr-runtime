@@ -179,7 +179,7 @@ if(XRT_HAVE_LEIA_SR)
 			target_sources(drv_leia PRIVATE
 				leia/leia_cnsdk.cpp leia/leia_cnsdk.h
 				leia/leia_cnsdk_display_processor.cpp leia/leia_cnsdk_display_processor.h)
-			target_link_libraries(drv_leia PRIVATE CNSDK::leiaSDK)
+			target_link_libraries(drv_leia PRIVATE CNSDK::leiaCore)
 			target_compile_definitions(drv_leia PUBLIC XRT_HAVE_CNSDK)
 		endif()
 
@@ -209,7 +209,7 @@ if(XRT_HAVE_CNSDK AND NOT TARGET drv_leia)
 		leia/leia_cnsdk_display_processor.h)
 	target_link_libraries(drv_leia PRIVATE
 		xrt-interfaces aux_util aux_os aux_math
-		CNSDK::leiaSDK
+		CNSDK::leiaCore
 		PUBLIC drv_includes)
 	target_compile_definitions(drv_leia PUBLIC XRT_HAVE_CNSDK)
 	list(APPEND ENABLED_DRIVERS drv_leia)

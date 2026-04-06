@@ -2614,7 +2614,9 @@ oxr_session_create(struct oxr_logger *log,
 		if (head != NULL) {
 			xrt_device_set_property(head, XRT_DEVICE_PROPERTY_EXT_APP_MODE, 1);
 		}
+#ifdef XRT_BUILD_DRIVER_QWERTY
 		qwerty_set_process_keys(sess->sys->xsysd->xdevs, sess->sys->xsysd->xdev_count, false);
+#endif
 	}
 
 	// Track whether this is an AppContainer app (Chrome WebXR)
