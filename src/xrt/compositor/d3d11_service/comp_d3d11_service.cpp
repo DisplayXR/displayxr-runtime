@@ -3374,8 +3374,13 @@ capture_render_thread_func(struct d3d11_service_system *sys)
 		uint64_t elapsed = now - sys->last_shell_render_ns;
 		if (elapsed >= 14000000ULL) { // ~70fps cap
 			std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
-			if (sys->multi_comp && sys->multi_comp->capture_client_count > 0) {
-				multi_compositor_render(sys);
+			if (sys->multi_comp) {
+				// Render when: capture clients active, or empty shell (no IPC clients).
+				// When IPC clients are active, they drive rendering via layer_commit.
+				if (sys->multi_comp->capture_client_count > 0 ||
+				    sys->multi_comp->client_count == 0) {
+					multi_compositor_render(sys);
+				}
 			}
 		}
 		Sleep(8); // ~120Hz poll
@@ -4826,6 +4831,11 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		if (mc->focused_slot >= 0) {
 			toggle_fullscreen(sys, mc, mc->focused_slot);
 		}
+	}
+
+	// Ctrl+O: open file dialog to launch a new app
+	if ((GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState('O') & 1)) {
+		comp_d3d11_window_request_app_launch(mc->window);
 	}
 
 	// Layout presets: Ctrl+1=grid, Ctrl+2=immersive, Ctrl+3=carousel
@@ -8668,5 +8678,35 @@ comp_d3d11_service_get_capture_client_window_pose(struct xrt_system_compositor *
 	if (out_width_m) *out_width_m = mc->clients[slot_index].window_width_m;
 	if (out_height_m) *out_height_m = mc->clients[slot_index].window_height_m;
 
+	return true;
+}
+
+bool
+comp_d3d11_service_ensure_shell_window(struct xrt_system_compositor *xsysc)
+{
+	if (xsysc == nullptr) {
+		return false;
+	}
+
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	if (!sys->shell_mode) {
+		sys->shell_mode = true;
+		U_LOG_W("Shell mode activated for D3D11 service system (via ensure_shell_window)");
+	}
+
+	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	xrt_result_t ret = multi_compositor_ensure_output(sys);
+	if (ret != XRT_SUCCESS || sys->multi_comp == nullptr) {
+		U_LOG_E("Shell: failed to create shell window (ret=%d)", (int)ret);
+		return false;
+	}
+
+	// Start render timer so the empty shell window refreshes
+	// (same mechanism as capture-only rendering).
+	if (!sys->multi_comp->capture_render_running.load()) {
+		capture_render_thread_start(sys);
+	}
+
+	U_LOG_W("Shell: window created for empty shell (ready for Ctrl+O)");
 	return true;
 }

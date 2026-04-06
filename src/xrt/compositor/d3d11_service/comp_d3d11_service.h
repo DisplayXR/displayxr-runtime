@@ -279,6 +279,14 @@ comp_d3d11_service_get_capture_client_window_pose(struct xrt_system_compositor *
                                                     float *out_width_m,
                                                     float *out_height_m);
 
+/*!
+ * Eagerly create the shell compositor window (for empty shell startup).
+ * Called after shell_activate when no clients are connected yet, so the
+ * window exists to receive Ctrl+O app launch requests.
+ */
+bool
+comp_d3d11_service_ensure_shell_window(struct xrt_system_compositor *xsysc);
+
 /*! @} */
 
 
