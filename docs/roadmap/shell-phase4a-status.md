@@ -79,6 +79,14 @@ displayxr-shell.exe --capture-hwnd <decimal|0xhex> [--capture-hwnd ...] app1.exe
 - DPI-aware initial sizing (meters from pixels via DPI)
 - No duplicate cursor (IsCursorCaptureEnabled=false)
 
+### Bug Fix: SRGB Swapchain Blit (2026-04-06)
+
+The SRGB shader blit path in `compositor_layer_commit` had an empty body — apps submitting SRGB textures (e.g., Unity via `DXGI_FORMAT_R8G8B8A8_UNORM_SRGB`) had their atlas blit silently skipped, producing black content in the shell. Test apps were unaffected because they use the runtime's preferred non-SRGB format (`DXGI_FORMAT_R8G8B8A8_UNORM`).
+
+**Fix:** Removed the dead SRGB branch and use `CopySubresourceRegion` for all formats. This is correct because `CopySubresourceRegion` preserves format metadata — no gamma conversion is needed at copy time (the display processor handles color space later).
+
+This fix enables **Unity plugin apps** (built with [unity-3d-display](https://github.com/dfattal/unity-3d-display)) to run in the shell. Combined with the plugin-side fix (dfattal/unity-3d-display#43: pass main HWND instead of child overlay in shell mode), Unity apps now display correctly as shell windows.
+
 ### Known Limitations (Phase 4B)
 
 - **Keyboard/mouse input to WinUI apps**: PostMessage WM_CHAR/WM_KEYDOWN works for classic Win32 apps and DisplayXR IPC apps, but not for modern WinUI/XAML apps (Notepad, Paint, Windows Terminal). WinUI uses a different input pipeline that requires OS-level keyboard focus. Needs UI Automation, input driver, or alternative approach.
