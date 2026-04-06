@@ -858,9 +858,9 @@ main(int argc, char *argv[])
 		}
 	}
 
-	// Load saved window config
-	struct shell_config config;
-	shell_config_load(&config);
+	// Layout persistence disabled during early dev — clean grid every launch.
+	// struct shell_config config;
+	// shell_config_load(&config);
 
 	int save_counter = 0; // Save every 5 seconds (10 polls * 500ms)
 	int adopt_counter = 0; // Re-enumerate every 1 second (2 polls * 500ms)
@@ -931,17 +931,8 @@ main(int argc, char *argv[])
 								client_name_count++;
 							}
 
-							// Restore saved pose if available
-							struct saved_window *sw = shell_config_find(&config, numbered_name);
-							if (sw && sw->width_m > 0 && sw->height_m > 0) {
-								struct xrt_pose pose = XRT_POSE_IDENTITY;
-								pose.position.x = sw->x;
-								pose.position.y = sw->y;
-								pose.position.z = sw->z;
-								ipc_call_shell_set_window_pose(&ipc_c, clients.ids[c],
-								                                &pose, sw->width_m, sw->height_m);
-								P("  Restored pose for '%s' from config\n", numbered_name);
-							}
+							// Layout persistence disabled during early dev.
+							// Default grid layout is applied by the compositor.
 						}
 					}
 				}
@@ -951,43 +942,8 @@ main(int argc, char *argv[])
 		print_clients(&ipc_c, prev_ids, &prev_count);
 
 		// Periodic save: query current poses and update config
-		save_counter++;
-		if (save_counter >= 10) {
-			save_counter = 0;
-			bool changed = false;
-			struct ipc_client_list clients;
-			xrt_result_t r = ipc_call_system_get_clients(&ipc_c, &clients);
-			if (r == XRT_SUCCESS) {
-				for (uint32_t c = 0; c < clients.id_count; c++) {
-					// Look up numbered name from our mapping
-					const char *save_name = NULL;
-					for (int cn = 0; cn < client_name_count; cn++) {
-						if (client_names[cn].id == clients.ids[c]) {
-							save_name = client_names[cn].name;
-							break;
-						}
-					}
-					if (!save_name) continue;
-
-					struct xrt_pose pose;
-					float w, h;
-					if (ipc_call_shell_get_window_pose(&ipc_c, clients.ids[c],
-					                                    &pose, &w, &h) == XRT_SUCCESS) {
-						struct saved_window *sw = shell_config_find(&config, save_name);
-						if (!sw || sw->x != pose.position.x || sw->y != pose.position.y ||
-						    sw->width_m != w || sw->height_m != h) {
-							shell_config_update(&config, save_name,
-							                    pose.position.x, pose.position.y, pose.position.z,
-							                    w, h);
-							changed = true;
-						}
-					}
-				}
-			}
-			if (changed) {
-				shell_config_save(&config);
-			}
-		}
+		// Layout persistence disabled during early dev.
+		(void)save_counter;
 
 		// Dynamic window tracking: detect new/closed windows every ~1 second
 #ifdef _WIN32
