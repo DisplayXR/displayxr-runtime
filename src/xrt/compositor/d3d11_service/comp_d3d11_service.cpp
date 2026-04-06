@@ -6962,10 +6962,11 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			float dst_w = needs_scale ? tile_w : 0.0f;
 			float dst_h = needs_scale ? tile_h : 0.0f;
 
-			if (view_is_srgb[eye] && sys->blit_vs && view_scs[eye]->images[view_img_indices[eye]].srv) {
-			} else {
-				// Non-SRGB: use fast CopySubresourceRegion
-				// D3D11 silently clips to destination bounds — no manual clamping needed
+			{
+				// Copy view texture to atlas tile position.
+				// CopySubresourceRegion works for both SRGB and non-SRGB formats —
+				// it preserves the format metadata (no gamma conversion needed at copy time).
+				// D3D11 silently clips to destination bounds — no manual clamping needed.
 				D3D11_BOX box = {};
 				box.left = static_cast<UINT>(src_x);
 				box.top = static_cast<UINT>(src_y);
