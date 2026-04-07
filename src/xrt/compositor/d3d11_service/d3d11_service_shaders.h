@@ -490,6 +490,11 @@ struct BlitConstants
 	// projecting a 3D quad to 2D produces a trapezoid — linear UV interpolation
 	// distorts straight lines without perspective correction.
 	float quad_w[4];          // [TL_w, BL_w, TR_w, BR_w]
+	float edge_feather;       // feather width as fraction of quad height (0 = off)
+	float glow_intensity;     // 0 = off, 0-1 = glow strength
+	float glow_extent;        // glow margin as fraction of oversized quad
+	float glow_falloff;       // Gaussian tightness (e.g. 3.0)
+	float glow_color[4];      // RGB + unused alpha (float4 for HLSL alignment)
 };
 
 //! Vertex shader for projection blit - draws a quad at specified destination
@@ -508,6 +513,11 @@ cbuffer BlitCB : register(b0)
     float4 quad_corners_01; // TL.xy, BL.xy (packed as float4 to avoid HLSL array padding)
     float4 quad_corners_23; // TR.xy, BR.xy
     float4 quad_w;          // per-corner W for perspective-correct interpolation: TL, BL, TR, BR
+    float edge_feather;     // feather width as fraction of quad height (0 = off)
+    float glow_intensity;   // 0 = off, 0-1 = glow strength
+    float glow_extent;      // glow margin as fraction of oversized quad
+    float glow_falloff;     // Gaussian tightness
+    float4 glow_color;      // RGB + unused alpha
 };
 
 struct VS_OUTPUT
@@ -588,6 +598,11 @@ cbuffer BlitCB : register(b0)
     float4 quad_corners_01;
     float4 quad_corners_23;
     float4 quad_w;
+    float edge_feather;
+    float glow_intensity;
+    float glow_extent;
+    float glow_falloff;
+    float4 glow_color;
 };
 
 Texture2D src_tex : register(t0);
@@ -612,15 +627,31 @@ float3 linear_to_srgb(float3 linear_color)
 
 float4 PSMain(VS_OUTPUT input) : SV_Target
 {
-    // Corner rounding via discard. Uses quad_uv (0-1, perspective-correct).
+    float2 uv01 = input.quad_uv;
+
+    // --- Glow mode (convert_srgb >= 3.0): soft halo around focused window ---
+    if (convert_srgb > 2.5) {
+        float ext = glow_extent;
+        if (ext < 0.001) discard;
+        // Distance from inner window boundary (positive = outside window)
+        float dx = max(ext - uv01.x, uv01.x - (1.0 - ext));
+        float dy = max(ext - uv01.y, uv01.y - (1.0 - ext));
+        float dist;
+        if (dx > 0 && dy > 0)
+            dist = length(float2(dx, dy)) / ext;
+        else
+            dist = max(max(dx, dy), 0.0) / ext;
+        if (dist <= 0.0) discard;  // inside window area — content draws on top
+        float falloff = exp(-glow_falloff * dist * dist);
+        float a = glow_intensity * falloff;
+        return float4(glow_color.rgb * a, a);  // premultiplied alpha
+    }
+
+    // --- Corner rounding with smooth alpha falloff ---
     // corner_radius: fraction of height. >0 = top corners, <0 = bottom corners.
-    // corner_aspect: abs = w/h aspect ratio. sign selects corners:
-    //   corner_radius>0, corner_aspect>0: top-left + top-right
-    //   corner_radius>0, corner_aspect<0: top-right only
-    //   corner_radius<0, corner_aspect>0: bottom-left + bottom-right
-    //   corner_radius<0, corner_aspect<0: all four corners
+    // corner_aspect: abs = w/h aspect ratio. sign selects corners.
+    float corner_alpha = 1.0;
     if (corner_radius != 0) {
-        float2 uv01 = input.quad_uv;
         float ry = abs(corner_radius);
         float aspect = abs(corner_aspect);
         if (aspect < 0.001) aspect = 10.0;
@@ -631,34 +662,36 @@ float4 PSMain(VS_OUTPUT input) : SV_Target
         bool do_top_right = do_top;
         bool do_bottom_left = (corner_radius < 0);
         bool do_bottom_right = (corner_radius < 0);
-        // Top-left
-        if (do_top_left && uv01.x < rx && uv01.y < ry) {
-            float2 d = float2((rx - uv01.x) / rx, (ry - uv01.y) / ry);
-            if (length(d) > 1.0) discard;
-        }
-        // Top-right
-        if (do_top_right && uv01.x > 1.0 - rx && uv01.y < ry) {
-            float2 d = float2((uv01.x - (1.0 - rx)) / rx, (ry - uv01.y) / ry);
-            if (length(d) > 1.0) discard;
-        }
-        // Bottom-left
-        if (do_bottom_left && uv01.x < rx && uv01.y > 1.0 - ry) {
-            float2 d = float2((rx - uv01.x) / rx, (uv01.y - (1.0 - ry)) / ry);
-            if (length(d) > 1.0) discard;
-        }
-        // Bottom-right
-        if (do_bottom_right && uv01.x > 1.0 - rx && uv01.y > 1.0 - ry) {
-            float2 d = float2((uv01.x - (1.0 - rx)) / rx, (uv01.y - (1.0 - ry)) / ry);
-            if (length(d) > 1.0) discard;
+        float corner_dist = -1.0;  // < 0 means not in a corner region
+        if (do_top_left && uv01.x < rx && uv01.y < ry)
+            corner_dist = length(float2((rx - uv01.x) / rx, (ry - uv01.y) / ry));
+        if (do_top_right && uv01.x > 1.0 - rx && uv01.y < ry)
+            corner_dist = length(float2((uv01.x - (1.0 - rx)) / rx, (ry - uv01.y) / ry));
+        if (do_bottom_left && uv01.x < rx && uv01.y > 1.0 - ry)
+            corner_dist = length(float2((rx - uv01.x) / rx, (uv01.y - (1.0 - ry)) / ry));
+        if (do_bottom_right && uv01.x > 1.0 - rx && uv01.y > 1.0 - ry)
+            corner_dist = length(float2((uv01.x - (1.0 - rx)) / rx, (uv01.y - (1.0 - ry)) / ry));
+        if (corner_dist >= 0.0) {
+            if (corner_dist > 1.0) discard;
+            // Smooth falloff in the last pixel-equivalent of the corner
+            float feather_band = (edge_feather > 0.0) ? edge_feather / ry : 0.02;
+            corner_alpha = saturate((1.0 - corner_dist) / feather_band);
         }
     }
 
+    // --- Edge feathering: smooth alpha fade at quad boundaries ---
+    float feather_alpha = 1.0;
+    if (edge_feather > 0.0) {
+        float d = min(min(uv01.x, 1.0 - uv01.x), min(uv01.y, 1.0 - uv01.y));
+        feather_alpha = saturate(d / edge_feather);
+    }
+    float alpha = corner_alpha * feather_alpha;
+
     // Solid color mode: convert_srgb >= 2.0 outputs src_rect.rgb as solid color
-    // (src_rect is unused for texture sampling in solid mode)
     if (convert_srgb > 1.5)
-        return float4(src_rect.xyz, 1.0);
+        return float4(src_rect.xyz, alpha);
 
     float4 color = src_tex.Sample(src_samp, input.uv);
-    return color;
+    return float4(color.rgb, color.a * alpha);
 }
 )";

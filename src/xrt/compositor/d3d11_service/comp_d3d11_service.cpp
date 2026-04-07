@@ -411,6 +411,13 @@ struct d3d11_service_system
 #define UI_GLYPH_W_M        0.0035f  //!< Glyph width: 3.5mm (balanced aspect ratio)
 #define UI_GLYPH_H_M        0.005f   //!< Glyph height: 5mm
 #define UI_RESIZE_ZONE_M    0.003f   //!< Resize detection zone: 3mm
+#define UI_EDGE_FEATHER_PX  2.0f     //!< Edge feather width in pixels (all windows)
+#define UI_GLOW_MARGIN_M    0.008f   //!< Focus glow extent in meters (~8mm)
+#define UI_GLOW_INTENSITY   0.45f    //!< Focus glow opacity (0-1)
+#define UI_GLOW_FALLOFF     3.0f     //!< Focus glow Gaussian tightness
+#define UI_GLOW_R           0.35f    //!< Focus glow color R (soft blue)
+#define UI_GLOW_G           0.55f    //!< Focus glow color G
+#define UI_GLOW_B           0.95f    //!< Focus glow color B
 
 //! Resize edge/corner flags (bitfield).
 #define RESIZE_NONE   0
@@ -1179,6 +1186,8 @@ blit_to_atlas_texture(struct d3d11_service_system *sys,
 	cb->dst_rect_wh[1] = dst_h;
 	cb->corner_radius = 0.0f;
 	cb->corner_aspect = 0.0f;
+	cb->edge_feather = 0.0f;
+	cb->glow_intensity = 0.0f;
 
 	sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
 
@@ -5864,6 +5873,87 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			    src_col, src_row, half_w, half_h, ca_w, ca_h,
 			    quad_corners, quad_w_vals);
 
+			// Draw focus glow behind focused window (before content blit)
+			if (s == mc->focused_slot && sys->blit_vs && sys->blit_ps) {
+				float glow_hw = mc->clients[s].window_width_m / 2.0f + UI_GLOW_MARGIN_M;
+				float glow_hh = mc->clients[s].window_height_m / 2.0f + UI_GLOW_MARGIN_M;
+				float glow_tb_h = (mc->clients[s].client_type != CLIENT_TYPE_CAPTURE)
+				    ? UI_TITLE_BAR_H_M : 0.0f;
+				float glow_total_h = mc->clients[s].window_height_m + glow_tb_h + 2.0f * UI_GLOW_MARGIN_M;
+				float glow_ext = UI_GLOW_MARGIN_M / (glow_total_h / 2.0f);
+
+				float gl_l = -glow_hw;
+				float gl_t = mc->clients[s].window_height_m / 2.0f + glow_tb_h + UI_GLOW_MARGIN_M;
+				float gl_r = glow_hw;
+				float gl_b = -(mc->clients[s].window_height_m / 2.0f + UI_GLOW_MARGIN_M);
+
+				D3D11_MAPPED_SUBRESOURCE glow_mapped;
+				if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
+				              D3D11_MAP_WRITE_DISCARD, 0, &glow_mapped))) {
+					BlitConstants *gcb = static_cast<BlitConstants *>(glow_mapped.pData);
+					gcb->src_rect[0] = 0; gcb->src_rect[1] = 0;
+					gcb->src_rect[2] = 1; gcb->src_rect[3] = 1;
+					gcb->src_size[0] = 1; gcb->src_size[1] = 1;
+					gcb->dst_size[0] = (float)ca_w; gcb->dst_size[1] = (float)ca_h;
+					gcb->convert_srgb = 3.0f;  // glow mode
+					gcb->corner_radius = 0; gcb->corner_aspect = 0;
+					gcb->edge_feather = 0.0f;
+					gcb->glow_intensity = UI_GLOW_INTENSITY;
+					gcb->glow_extent = glow_ext;
+					gcb->glow_falloff = UI_GLOW_FALLOFF;
+					gcb->glow_color[0] = UI_GLOW_R;
+					gcb->glow_color[1] = UI_GLOW_G;
+					gcb->glow_color[2] = UI_GLOW_B;
+					gcb->glow_color[3] = 1.0f;
+
+					bool glow_rotated = !quat_is_identity(&mc->clients[s].window_pose.orientation);
+					if (glow_rotated) {
+						float gcorners[8], gw[4];
+						project_local_rect_for_eye(sys,
+						    &mc->clients[s].window_pose.orientation,
+						    mc->clients[s].window_pose.position.x,
+						    mc->clients[s].window_pose.position.y,
+						    mc->clients[s].window_pose.position.z,
+						    gl_l, gl_t, gl_r, gl_b,
+						    eye_pos.eyes[ei_q].x, eye_pos.eyes[ei_q].y, eye_pos.eyes[ei_q].z,
+						    src_col, src_row, half_w, half_h, ca_w, ca_h, gcorners, gw);
+						blit_set_quad_corners(gcb, gcorners, gw);
+						gcb->dst_offset[0] = 0; gcb->dst_offset[1] = 0;
+						gcb->dst_rect_wh[0] = 0; gcb->dst_rect_wh[1] = 0;
+					} else {
+						float margin_px_x = UI_GLOW_MARGIN_M / mc->clients[s].window_width_m * dest_px_w;
+						float margin_px_y = UI_GLOW_MARGIN_M / (mc->clients[s].window_height_m + glow_tb_h) * (dest_px_h + (float)TITLE_BAR_HEIGHT_PX);
+						float tb_px_f = (mc->clients[s].client_type != CLIENT_TYPE_CAPTURE)
+						    ? (float)TITLE_BAR_HEIGHT_PX : 0.0f;
+						gcb->quad_mode = 0;
+						gcb->dst_offset[0] = dest_px_x - margin_px_x;
+						gcb->dst_offset[1] = dest_px_y - tb_px_f - margin_px_y;
+						gcb->dst_rect_wh[0] = dest_px_w + 2.0f * margin_px_x;
+						gcb->dst_rect_wh[1] = dest_px_h + tb_px_f + 2.0f * margin_px_y;
+						memset(gcb->quad_corners_01, 0, sizeof(gcb->quad_corners_01));
+						memset(gcb->quad_corners_23, 0, sizeof(gcb->quad_corners_23));
+					}
+					sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
+
+					sys->context->VSSetShader(sys->blit_vs.get(), nullptr, 0);
+					sys->context->PSSetShader(sys->blit_ps.get(), nullptr, 0);
+					sys->context->VSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
+					sys->context->PSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
+					sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
+					ID3D11RenderTargetView *glow_rtvs[] = {mc->combined_atlas_rtv.get()};
+					sys->context->OMSetRenderTargets(1, glow_rtvs, nullptr);
+					sys->context->OMSetBlendState(sys->blend_premul.get(), nullptr, 0xFFFFFFFF);
+					sys->context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+					sys->context->IASetInputLayout(nullptr);
+					sys->context->RSSetState(sys->rasterizer_state.get());
+					sys->context->OMSetDepthStencilState(sys->depth_disabled.get(), 0);
+					D3D11_VIEWPORT gvp = {};
+					gvp.Width = (float)ca_w; gvp.Height = (float)ca_h; gvp.MaxDepth = 1.0f;
+					sys->context->RSSetViewports(1, &gvp);
+					sys->context->Draw(4, 0);
+				}
+			}
+
 			// Update constant buffer
 			D3D11_MAPPED_SUBRESOURCE mapped;
 			HRESULT hr = sys->context->Map(sys->blit_constant_buffer.get(), 0,
@@ -5892,6 +5982,8 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			// Round bottom-left + bottom-right corners of content window
 			cb->corner_radius = -0.03f;  // fraction of content height (subtle)
 			cb->corner_aspect = mc->clients[s].window_width_m / mc->clients[s].window_height_m;
+			cb->edge_feather = UI_EDGE_FEATHER_PX / dest_px_h;
+			cb->glow_intensity = 0.0f;
 			if (use_quad) {
 				blit_set_quad_corners(cb, quad_corners, quad_w_vals);
 			} else {
@@ -5920,6 +6012,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			sys->context->IASetInputLayout(nullptr);
 			sys->context->RSSetState(sys->rasterizer_state.get());
 			sys->context->OMSetDepthStencilState(sys->depth_disabled.get(), 0);
+			sys->context->OMSetBlendState(sys->blend_alpha.get(), nullptr, 0xFFFFFFFF);
 
 			sys->context->Draw(4, 0);
 		}
@@ -5978,7 +6071,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 					sys->context->PSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
 					ID3D11RenderTargetView *tb_rtvs[] = {mc->combined_atlas_rtv.get()};
 					sys->context->OMSetRenderTargets(1, tb_rtvs, nullptr);
-					sys->context->OMSetBlendState(sys->blend_opaque.get(), nullptr, 0xFFFFFFFF);
+					sys->context->OMSetBlendState(sys->blend_alpha.get(), nullptr, 0xFFFFFFFF);
 					sys->context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
 					sys->context->IASetInputLayout(nullptr);
 					sys->context->RSSetState(sys->rasterizer_state.get());
@@ -6021,6 +6114,8 @@ multi_compositor_render(struct d3d11_service_system *sys)
 							cb->corner_radius = 0.35f;
 							// Pass width/height aspect ratio for circular corners
 							cb->corner_aspect = mc->clients[s].window_width_m / UI_TITLE_BAR_H_M;
+							cb->edge_feather = UI_EDGE_FEATHER_PX / toh;
+							cb->glow_intensity = 0.0f;
 							// Title bar: full width, above content (rounded top corners)
 							CHROME_BLIT_POS(cb,
 							    -win_hw, win_hh + tb_h_m, win_hw, win_hh,
@@ -6046,6 +6141,8 @@ multi_compositor_render(struct d3d11_service_system *sys)
 							// Round close button top-right corner only (negative aspect)
 							cb->corner_radius = 0.35f;
 							cb->corner_aspect = -(UI_BTN_W_M / UI_TITLE_BAR_H_M);
+							cb->edge_feather = 0.0f;
+							cb->glow_intensity = 0.0f;
 							float btn_x = tox + tow - (float)CLOSE_BTN_WIDTH_PX;
 							CHROME_BLIT_POS(cb,
 							    win_hw - btn_w_m_val, win_hh + tb_h_m, win_hw, win_hh,
@@ -6069,6 +6166,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 							cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
 							cb->convert_srgb = 2.0f;
 							cb->corner_radius = 0; cb->corner_aspect = 0;
+							cb->edge_feather = 0.0f; cb->glow_intensity = 0.0f;
 							float min_x = tox + tow - 2.0f * (float)CLOSE_BTN_WIDTH_PX;
 							CHROME_BLIT_POS(cb,
 							    win_hw - 2*btn_w_m_val, win_hh + tb_h_m, win_hw - btn_w_m_val, win_hh,
@@ -6123,6 +6221,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 								cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
 								cb->convert_srgb = 0.0f;
 								cb->corner_radius = 0; cb->corner_aspect = 0;
+								cb->edge_feather = 0.0f; cb->glow_intensity = 0.0f;
 								// Proportional glyph positioning
 								float m_per_px = glyph_w_m / ((float)GLYPH_W > 0 ? (float)GLYPH_W : 1.0f);
 								float gl_left = -win_hw + glyph_w_m + px_cursor * m_per_px;
@@ -6165,6 +6264,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 								cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
 								cb->convert_srgb = 0.0f;
 								cb->corner_radius = 0; cb->corner_aspect = 0;
+								cb->edge_feather = 0.0f; cb->glow_intensity = 0.0f;
 								CHROME_BLIT_POS(cb,
 								    xg_left, xg_top, xg_left + glyph_w_m, xg_top - glyph_h_m,
 								    bx, toy + gpad, dst_gw, gh);
@@ -6192,6 +6292,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 								cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
 								cb->convert_srgb = 0.0f;
 								cb->corner_radius = 0; cb->corner_aspect = 0;
+								cb->edge_feather = 0.0f; cb->glow_intensity = 0.0f;
 								CHROME_BLIT_POS(cb,
 								    mg_left, mg_top, mg_left + glyph_w_m, mg_top - glyph_h_m,
 								    mx, toy + gpad, dst_gw, gh);
@@ -6199,7 +6300,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 								sys->context->Draw(4, 0);
 							}
 						}
-						sys->context->OMSetBlendState(sys->blend_opaque.get(), nullptr, 0xFFFFFFFF);
+						sys->context->OMSetBlendState(sys->blend_alpha.get(), nullptr, 0xFFFFFFFF);
 						sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
 					}
 					#undef CHROME_BLIT_POS
@@ -6207,114 +6308,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			}
 		}
 
-		// Draw cyan focus border for this slot if focused (inside render_order loop for Z-depth ordering)
-		if (s == mc->focused_slot && sys->blit_vs && sys->blit_ps) {
-			bool fb_rotated = !quat_is_identity(&mc->clients[s].window_pose.orientation);
-			float fb_hw = mc->clients[s].window_width_m / 2.0f;
-			float fb_hh = mc->clients[s].window_height_m / 2.0f;
-			// Capture clients have no shell title bar — border wraps content only
-			float fb_tb_h = (mc->clients[s].client_type != CLIENT_TYPE_CAPTURE)
-			    ? UI_TITLE_BAR_H_M : 0.0f;
-			float disp_w_m_fb = sys->base.info.display_width_m;
-			if (disp_w_m_fb <= 0.0f) disp_w_m_fb = 0.700f;
-			float bw_m = 3.0f * disp_w_m_fb / (float)(ca_w > 0 ? ca_w : 3840);
-			float bw = 3.0f;
-
-			struct { float l, t, r, b; } border_edges_local[4] = {
-				{-fb_hw,        fb_hh+fb_tb_h,        fb_hw,        fb_hh+fb_tb_h-bw_m},
-				{-fb_hw,        -fb_hh+bw_m,           fb_hw,        -fb_hh},
-				{-fb_hw,        fb_hh+fb_tb_h-bw_m,   -fb_hw+bw_m,  -fb_hh+bw_m},
-				{fb_hw-bw_m,    fb_hh+fb_tb_h-bw_m,   fb_hw,        -fb_hh+bw_m},
-			};
-
-			sys->context->VSSetShader(sys->blit_vs.get(), nullptr, 0);
-			sys->context->PSSetShader(sys->blit_ps.get(), nullptr, 0);
-			sys->context->VSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
-			sys->context->PSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
-			sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
-			sys->context->OMSetBlendState(sys->blend_opaque.get(), nullptr, 0xFFFFFFFF);
-
-			for (uint32_t bv = 0; bv < num_views && bv < XRT_MAX_VIEWS; bv++) {
-				uint32_t bcol = bv % sys->tile_columns;
-				uint32_t brow = bv / sys->tile_columns;
-				int bei = (bcol < 2) ? (int)bcol : 0;
-				int bei2 = (bei < (int)eye_pos.count) ? bei : 0;
-
-				D3D11_RECT bsc;
-				bsc.left = (LONG)(bcol * half_w); bsc.top = (LONG)(brow * half_h);
-				bsc.right = (LONG)((bcol+1) * half_w); bsc.bottom = (LONG)((brow+1) * half_h);
-				sys->context->RSSetScissorRects(1, &bsc);
-
-				// Non-rotated fallback positions
-				int32_t tb_px = (mc->clients[s].client_type != CLIENT_TYPE_CAPTURE)
-				    ? TITLE_BAR_HEIGHT_PX : 0;
-				int32_t brd_y = eye_rect_y[bei] - tb_px;
-				int32_t brd_h = eye_rect_h[bei] + (eye_rect_y[bei] - brd_y);
-				float bfx = (float)eye_rect_x[bei] / ca_w;
-				float bfy = (float)brd_y / ca_h;
-				float bfw = (float)eye_rect_w[bei] / ca_w;
-				float bfh = (float)brd_h / ca_h;
-				float box = bcol * half_w + bfx * half_w;
-				float boy = brow * half_h + bfy * half_h;
-				float bew = bfw * half_w;
-				float beh = bfh * half_h;
-				struct { float x, y, w, h; } edges_aa[4] = {
-					{box,          boy,          bew, bw},
-					{box,          boy+beh-bw,   bew, bw},
-					{box,          boy+bw,       bw,  beh-2*bw},
-					{box+bew-bw,   boy+bw,       bw,  beh-2*bw},
-				};
-
-				D3D11_VIEWPORT bvp = {};
-				bvp.Width = (float)ca_w; bvp.Height = (float)ca_h; bvp.MaxDepth = 1.0f;
-				sys->context->RSSetViewports(1, &bvp);
-
-				for (int e = 0; e < 4; e++) {
-					D3D11_MAPPED_SUBRESOURCE mapped;
-					if (FAILED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
-					           D3D11_MAP_WRITE_DISCARD, 0, &mapped))) continue;
-					BlitConstants *cb = static_cast<BlitConstants *>(mapped.pData);
-					cb->src_rect[0] = 0; cb->src_rect[1] = 1; cb->src_rect[2] = 1; cb->src_rect[3] = 1;
-					cb->src_size[0] = 1; cb->src_size[1] = 1;
-					cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
-					cb->convert_srgb = 2.0f;
-					// Round border edges: top edge = top corners, bottom edge = bottom corners
-					float border_aspect = mc->clients[s].window_width_m / bw_m;
-					if (e == 0 && fb_tb_h > 0) {
-						// Top edge: round top-left + top-right
-						cb->corner_radius = 0.35f;
-						cb->corner_aspect = border_aspect;
-					} else if (e == 1) {
-						// Bottom edge: round bottom-left + bottom-right
-						cb->corner_radius = -0.35f;
-						cb->corner_aspect = border_aspect;
-					} else {
-						cb->corner_radius = 0; cb->corner_aspect = 0;
-					}
-					if (fb_rotated) {
-						float corners[8], cw[4];
-						project_local_rect_for_eye(sys, &mc->clients[s].window_pose.orientation,
-						    mc->clients[s].window_pose.position.x, mc->clients[s].window_pose.position.y,
-						    mc->clients[s].window_pose.position.z,
-						    border_edges_local[e].l, border_edges_local[e].t,
-						    border_edges_local[e].r, border_edges_local[e].b,
-						    eye_pos.eyes[bei2].x, eye_pos.eyes[bei2].y, eye_pos.eyes[bei2].z,
-						    bcol, brow, half_w, half_h, ca_w, ca_h, corners, cw);
-						blit_set_quad_corners(cb, corners, cw);
-						cb->dst_offset[0] = 0; cb->dst_offset[1] = 0;
-						cb->dst_rect_wh[0] = 0; cb->dst_rect_wh[1] = 0;
-					} else {
-						cb->quad_mode = 0;
-						cb->dst_offset[0] = edges_aa[e].x; cb->dst_offset[1] = edges_aa[e].y;
-						cb->dst_rect_wh[0] = edges_aa[e].w; cb->dst_rect_wh[1] = edges_aa[e].h;
-						memset(cb->quad_corners_01, 0, sizeof(cb->quad_corners_01));
-						memset(cb->quad_corners_23, 0, sizeof(cb->quad_corners_23));
-					}
-					sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
-					sys->context->Draw(4, 0);
-				}
-			}
-		}
+		// (Focus glow is now drawn before content blit, inside the per-view loop above)
 	}
 
 	// (Title bar + focus border rendering is inside the render_order loop for correct z-ordering)
@@ -6392,6 +6386,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 					cb->dst_rect_wh[0] = (float)half_w;
 					cb->dst_rect_wh[1] = (float)TASKBAR_HEIGHT_PX;
 					cb->corner_radius = 0; cb->corner_aspect = 0;
+					cb->edge_feather = 0.0f; cb->glow_intensity = 0.0f;
 					sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
 					sys->context->Draw(4, 0);
 				}
@@ -6434,6 +6429,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 								cb2->dst_rect_wh[0] = pill_w;
 								cb2->dst_rect_wh[1] = pill_h;
 								cb2->corner_radius = 0; cb2->corner_aspect = 0;
+								cb2->edge_feather = 0.0f; cb2->glow_intensity = 0.0f;
 								sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
 								sys->context->Draw(4, 0);
 							}
@@ -6472,6 +6468,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 								cb3->dst_rect_wh[0] = dst_gw;
 								cb3->dst_rect_wh[1] = tgh;
 								cb3->corner_radius = 0; cb3->corner_aspect = 0;
+								cb3->edge_feather = 0.0f; cb3->glow_intensity = 0.0f;
 								sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
 								sys->context->Draw(4, 0);
 							}
