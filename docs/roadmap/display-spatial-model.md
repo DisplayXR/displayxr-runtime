@@ -6,7 +6,7 @@ issues: [46]
 code-paths: [src/xrt/auxiliary/math/, src/xrt/state_trackers/oxr/]
 ---
 
-> **Status: Proposal** — not yet implemented. Tracking issue: [#46](https://github.com/dfattal/openxr-3d-display/issues/46)
+> **Status: Proposal** — not yet implemented. Tracking issue: [#46](https://github.com/DisplayXR/displayxr-runtime-pvt/issues/46)
 
 # Display Spatial Model: Physical Displays as Spatial Objects
 

@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   DetectChanges:
-    if: github.repository == 'dfattal/openxr-3d-display'
+    if: github.repository == 'DisplayXR/displayxr-runtime-pvt'
     runs-on: ubuntu-latest
     outputs:
       test_apps_changed: ${{ steps.filter.outputs.test_apps }}
@@ -38,13 +38,13 @@ jobs:
           echo "Detected test_apps_changed=$(grep test_apps "$GITHUB_OUTPUT" | cut -d= -f2)"
 
   Runtime:
-    if: github.repository == 'dfattal/openxr-3d-display'
+    if: github.repository == 'DisplayXR/displayxr-runtime-pvt'
     runs-on: windows-2022
 
     env:
       SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
       SR_TAG: 1.35.0.2011
-      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN || github.token }}
+      GH_TOKEN: ${{ github.token }}
 
     steps:
 
@@ -182,12 +182,12 @@ jobs:
 
   # D3D11 test app with XR_EXT_win32_window_binding (app provides window handle)
   TestAppCubeHandleD3D11:
-    if: github.repository == 'dfattal/openxr-3d-display' && needs.DetectChanges.outputs.test_apps_changed == 'true'
+    if: github.repository == 'DisplayXR/displayxr-runtime-pvt' && needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
     needs: [Runtime, DetectChanges]  # Wait for runtime build to get artifacts
 
     env:
-      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN || github.token }}
+      GH_TOKEN: ${{ github.token }}
 
     steps:
       - name: Checkout repository
@@ -284,12 +284,12 @@ jobs:
 
   # D3D11 hosted test app - Standard OpenXR app (runtime creates window)
   TestAppCubeHostedD3D11:
-    if: github.repository == 'dfattal/openxr-3d-display' && needs.DetectChanges.outputs.test_apps_changed == 'true'
+    if: github.repository == 'DisplayXR/displayxr-runtime-pvt' && needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
     needs: [Runtime, DetectChanges]
 
     env:
-      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN || github.token }}
+      GH_TOKEN: ${{ github.token }}
 
     steps:
       - name: Checkout repository
@@ -346,12 +346,12 @@ jobs:
 
   # D3D12 test app with XR_EXT_win32_window_binding
   TestAppCubeHandleD3D12:
-    if: github.repository == 'dfattal/openxr-3d-display' && needs.DetectChanges.outputs.test_apps_changed == 'true'
+    if: github.repository == 'DisplayXR/displayxr-runtime-pvt' && needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
     needs: [Runtime, DetectChanges]
 
     env:
-      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN || github.token }}
+      GH_TOKEN: ${{ github.token }}
 
     steps:
       - name: Checkout repository
@@ -408,12 +408,12 @@ jobs:
 
   # OpenGL test app with XR_EXT_win32_window_binding
   TestAppCubeHandleGL:
-    if: github.repository == 'dfattal/openxr-3d-display' && needs.DetectChanges.outputs.test_apps_changed == 'true'
+    if: github.repository == 'DisplayXR/displayxr-runtime-pvt' && needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
     needs: [Runtime, DetectChanges]
 
     env:
-      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN || github.token }}
+      GH_TOKEN: ${{ github.token }}
 
     steps:
       - name: Checkout repository
@@ -470,12 +470,12 @@ jobs:
 
   # Vulkan test app with XR_EXT_win32_window_binding (requires Vulkan SDK)
   TestAppCubeHandleVK:
-    if: github.repository == 'dfattal/openxr-3d-display' && needs.DetectChanges.outputs.test_apps_changed == 'true'
+    if: github.repository == 'DisplayXR/displayxr-runtime-pvt' && needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
     needs: [Runtime, DetectChanges]
 
     env:
-      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN || github.token }}
+      GH_TOKEN: ${{ github.token }}
 
     steps:
       - name: Checkout repository
@@ -538,12 +538,12 @@ jobs:
 
   # 3D Gaussian Splatting Vulkan demo (requires Vulkan SDK, uses FetchContent for 3DGS.cpp)
   TestAppGaussianSplattingVK:
-    if: github.repository == 'dfattal/openxr-3d-display' && needs.DetectChanges.outputs.test_apps_changed == 'true'
+    if: github.repository == 'DisplayXR/displayxr-runtime-pvt' && needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
     needs: [Runtime, DetectChanges]
 
     env:
-      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN || github.token }}
+      GH_TOKEN: ${{ github.token }}
 
     steps:
       - name: Checkout repository
@@ -605,12 +605,12 @@ jobs:
 
   # Spatial OS demo app (multi-layer war room)
   TestAppSpatialOS:
-    if: github.repository == 'dfattal/openxr-3d-display' && needs.DetectChanges.outputs.test_apps_changed == 'true'
+    if: github.repository == 'DisplayXR/displayxr-runtime-pvt' && needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
     needs: [Runtime, DetectChanges]
 
     env:
-      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN || github.token }}
+      GH_TOKEN: ${{ github.token }}
 
     steps:
       - name: Checkout repository
@@ -667,12 +667,12 @@ jobs:
 
   # D3D11 texture test app (offscreen shared texture mode)
   TestAppCubeTextureD3D11:
-    if: github.repository == 'dfattal/openxr-3d-display' && needs.DetectChanges.outputs.test_apps_changed == 'true'
+    if: github.repository == 'DisplayXR/displayxr-runtime-pvt' && needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
     needs: [Runtime, DetectChanges]
 
     env:
-      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN || github.token }}
+      GH_TOKEN: ${{ github.token }}
 
     steps:
       - name: Checkout repository
@@ -721,12 +721,12 @@ jobs:
 
   # D3D12 shared texture test app
   TestAppCubeTextureD3D12:
-    if: github.repository == 'dfattal/openxr-3d-display' && needs.DetectChanges.outputs.test_apps_changed == 'true'
+    if: github.repository == 'DisplayXR/displayxr-runtime-pvt' && needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
     needs: [Runtime, DetectChanges]
 
     env:
-      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN || github.token }}
+      GH_TOKEN: ${{ github.token }}
 
     steps:
       - name: Checkout repository
@@ -775,12 +775,12 @@ jobs:
 
   # D3D11 legacy hosted test app (no XR_EXT_display_info)
   TestAppCubeHostedLegacyD3D11:
-    if: github.repository == 'dfattal/openxr-3d-display' && needs.DetectChanges.outputs.test_apps_changed == 'true'
+    if: github.repository == 'DisplayXR/displayxr-runtime-pvt' && needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
     needs: [Runtime, DetectChanges]
 
     env:
-      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN || github.token }}
+      GH_TOKEN: ${{ github.token }}
 
     steps:
       - name: Checkout repository
@@ -837,12 +837,12 @@ jobs:
 
   # D3D12 legacy hosted test app (no XR_EXT_display_info)
   TestAppCubeHostedLegacyD3D12:
-    if: github.repository == 'dfattal/openxr-3d-display' && needs.DetectChanges.outputs.test_apps_changed == 'true'
+    if: github.repository == 'DisplayXR/displayxr-runtime-pvt' && needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
     needs: [Runtime, DetectChanges]
 
     env:
-      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN || github.token }}
+      GH_TOKEN: ${{ github.token }}
 
     steps:
       - name: Checkout repository
@@ -895,12 +895,12 @@ jobs:
 
   # Vulkan legacy hosted test app (no XR_EXT_display_info)
   TestAppCubeHostedLegacyVK:
-    if: github.repository == 'dfattal/openxr-3d-display' && needs.DetectChanges.outputs.test_apps_changed == 'true'
+    if: github.repository == 'DisplayXR/displayxr-runtime-pvt' && needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
     needs: [Runtime, DetectChanges]
 
     env:
-      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN || github.token }}
+      GH_TOKEN: ${{ github.token }}
 
     steps:
       - name: Checkout repository
@@ -959,12 +959,12 @@ jobs:
 
   # OpenGL legacy hosted test app (no XR_EXT_display_info)
   TestAppCubeHostedLegacyGL:
-    if: github.repository == 'dfattal/openxr-3d-display' && needs.DetectChanges.outputs.test_apps_changed == 'true'
+    if: github.repository == 'DisplayXR/displayxr-runtime-pvt' && needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
     needs: [Runtime, DetectChanges]
 
     env:
-      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN || github.token }}
+      GH_TOKEN: ${{ github.token }}
 
     steps:
       - name: Checkout repository
@@ -1011,12 +1011,12 @@ jobs:
 
   # D3D11 IPC legacy test app (no XR_EXT_display_info, WebXR debug proxy)
   TestAppCubeIpcLegacyD3D11:
-    if: github.repository == 'dfattal/openxr-3d-display' && needs.DetectChanges.outputs.test_apps_changed == 'true'
+    if: github.repository == 'DisplayXR/displayxr-runtime-pvt' && needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
     needs: [Runtime, DetectChanges]
 
     env:
-      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN || github.token }}
+      GH_TOKEN: ${{ github.token }}
 
     steps:
       - name: Checkout repository
@@ -1069,12 +1069,12 @@ jobs:
 
   # D3D11 IPC test app (extension app, spatial shell foundation)
   TestAppCubeIpcD3D11:
-    if: github.repository == 'dfattal/openxr-3d-display' && needs.DetectChanges.outputs.test_apps_changed == 'true'
+    if: github.repository == 'DisplayXR/displayxr-runtime-pvt' && needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
     needs: [Runtime, DetectChanges]
 
     env:
-      GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN || github.token }}
+      GH_TOKEN: ${{ github.token }}
 
     steps:
       - name: Checkout repository
@@ -1127,7 +1127,7 @@ jobs:
 
   # Bundle all test apps into a single artifact with per-app subfolders
   BundleTestApps:
-    if: github.repository == 'dfattal/openxr-3d-display' && !cancelled() && needs.DetectChanges.outputs.test_apps_changed == 'true' && (github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
+    if: github.repository == 'DisplayXR/displayxr-runtime-pvt' && !cancelled() && needs.DetectChanges.outputs.test_apps_changed == 'true' && (github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
     runs-on: ubuntu-latest
     needs: [DetectChanges, TestAppCubeHandleD3D11, TestAppCubeHostedD3D11, TestAppCubeHandleD3D12, TestAppCubeHandleGL, TestAppCubeHandleVK, TestAppGaussianSplattingVK, TestAppSpatialOS, TestAppCubeTextureD3D11, TestAppCubeTextureD3D12, TestAppCubeHostedLegacyD3D11, TestAppCubeHostedLegacyD3D12, TestAppCubeHostedLegacyVK, TestAppCubeHostedLegacyGL, TestAppCubeIpcLegacyD3D11, TestAppCubeIpcD3D11]
 

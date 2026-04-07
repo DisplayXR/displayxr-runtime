@@ -6,7 +6,7 @@ issues: [43, 44]
 code-paths: [src/xrt/compositor/multi/, src/xrt/ipc/]
 ---
 
-> **Status: Proposal** — not yet implemented. Tracking issue: [#43](https://github.com/dfattal/openxr-3d-display/issues/43), [#44](https://github.com/dfattal/openxr-3d-display/issues/44)
+> **Status: Proposal** — not yet implemented. Tracking issue: [#43](https://github.com/DisplayXR/displayxr-runtime-pvt/issues/43), [#44](https://github.com/DisplayXR/displayxr-runtime-pvt/issues/44)
 
 # Shell / Runtime Contract
 

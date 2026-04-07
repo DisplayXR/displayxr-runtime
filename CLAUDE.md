@@ -8,7 +8,7 @@ DisplayXR is a lightweight standalone OpenXR runtime purpose-built for 3D displa
 
 ### Milestone Progress
 
-See the [milestone tracker](https://github.com/dfattal/openxr-3d-display/milestones) for full status.
+See the [milestone tracker](https://github.com/DisplayXR/displayxr-runtime-pvt/milestones) for full status.
 
 - **M1: Foundation** — Done. Stripped 34 VR drivers, removed Vulkan server compositor, cleaned CMake, extracted stereo math.
 - **M2: Native Compositors** — Done. D3D11, D3D12, Metal, OpenGL, Vulkan all shipping.
@@ -118,60 +118,46 @@ git clang-format    # Format only your changes (preferred)
 scripts/format-project.sh   # Format all
 ```
 
-### Publishing to DisplayXR (Public Release)
+### Publishing to Public Repos (Automated)
 
-The public repo `DisplayXR/displayxr-runtime` is the `displayxr` remote. Push CI-validated commits from `origin` (dfattal) when ready for a public release:
+On tagged releases (`v*`), the `publish-public.yml` workflow automatically:
+1. Pushes runtime code (with shell stripped) to `DisplayXR/displayxr-runtime` (public)
+2. Publishes shell binary to `DisplayXR/displayxr-shell-releases`
 
 ```bash
-# Push current main to public repo (full commit history preserved)
-git push displayxr main
-
-# For a tagged release:
+# To publish a release:
 git tag v1.x.x
-git push origin v1.x.x          # triggers CI for the tag
-git push displayxr v1.x.x       # publishes tag to public repo
-git push displayxr main          # ensure main is up to date
+git push origin v1.x.x    # triggers CI + auto-publish to public repos
 ```
 
-CI only runs on dfattal (guarded by `github.repository` check in workflows). The public repo shows "skipped" for CI jobs — this is expected. Never push untested commits directly to displayxr. Always validate via `/ci-monitor` first.
+Extension headers and demos are also auto-published by `publish-extensions.yml` and `publish-demos.yml`.
 
 ### Repository Structure
 
 | Repo | Visibility | Contents |
 |------|-----------|----------|
-| `dfattal/openxr-3d-display` | **Private** (dev) | Runtime + shell source, all dev issues, CI builds |
-| `DisplayXR/displayxr-runtime` | Public | Public mirror of runtime (push via `displayxr` remote) |
-| `DisplayXR/displayxr-shell` | Private | Shell repo (post-migration, currently empty) |
+| `DisplayXR/displayxr-runtime-pvt` | **Private** (dev) | Runtime + shell source, all dev issues, CI builds. **This repo.** |
+| `DisplayXR/displayxr-runtime` | Public | Public releases — auto-published from `-pvt` on tags, shell code stripped |
 | `DisplayXR/displayxr-shell-releases` | Public | Binary-only shell releases, user-facing bug reports |
 
-Shell code currently lives in this repo at `src/xrt/targets/shell/`. Migration to `displayxr-shell` is tracked by #120, pending SDK export (#118).
+Shell code lives in `src/xrt/targets/shell/`. It is developed alongside the runtime in this repo. The shell is proprietary; it is excluded from public releases by the publish workflow.
 
 ### Issue Management
 
-**All dev issues go to `dfattal/openxr-3d-display`** — both runtime and shell. Use the `shell` label to distinguish shell-specific issues.
+**All dev issues go to `DisplayXR/displayxr-runtime-pvt`** — both runtime and shell. Use the `shell` label to distinguish shell-specific issues.
 
 | Where | What | Who |
 |-------|------|-----|
-| `dfattal/openxr-3d-display` | All dev issues (bugs, tasks, implementation) | Developers |
+| `DisplayXR/displayxr-runtime-pvt` | All dev issues (bugs, tasks, implementation) | Developers |
 | `DisplayXR/displayxr-runtime` | Curated public milestones only (~5-10 issues) | Public / OEMs |
 | `DisplayXR/displayxr-shell-releases` | User-facing shell bug reports | Shell users |
 
 **Rules:**
 - Never dual-create issues across repos. One source of truth per issue.
-- Create dev issues on `dfattal/openxr-3d-display` only.
+- Create dev issues on `DisplayXR/displayxr-runtime-pvt` only.
 - Update public milestone issues on `DisplayXR/displayxr-runtime` at major milestones, don't create new ones for subtasks.
 - If a user files a bug on `displayxr-shell-releases`, triage it and create a dev issue on the private repo if actionable.
-- After shell migration: shell dev issues move to `DisplayXR/displayxr-shell`. Runtime dev issues stay on `dfattal/openxr-3d-display`.
-
-### Public ↔ Private Issue Cross-Reference
-
-| `DisplayXR/displayxr-runtime` | `dfattal/openxr-3d-display` | Topic |
-|-------------------------------|----------------------------|-------|
-| #1 | #43 | Spatial OS / multi-compositor |
-| #2 | #44 | 3D Shell |
-| #3 | #118 | Runtime SDK export |
-| #4 | #120 | Shell repo migration |
-| #5 | #119 | Shell Phase 4: Spatial Companion |
+- Community contributions: external contributors submit PRs to `DisplayXR/displayxr-runtime` (public). Accepted PRs are applied to `-pvt` via `scripts/apply-public-pr.sh`.
 
 ## Architecture
 

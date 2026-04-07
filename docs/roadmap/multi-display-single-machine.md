@@ -6,7 +6,7 @@ issues: [69]
 code-paths: [src/xrt/drivers/, src/xrt/compositor/multi/]
 ---
 
-> **Status: Proposal** — not yet implemented. Tracking issue: [#69](https://github.com/dfattal/openxr-3d-display/issues/69)
+> **Status: Proposal** — not yet implemented. Tracking issue: [#69](https://github.com/DisplayXR/displayxr-runtime-pvt/issues/69)
 
 # Multi-Display Compositing on a Single Machine
 

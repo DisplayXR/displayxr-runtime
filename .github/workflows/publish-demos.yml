@@ -1,7 +1,7 @@
 name: Publish Demos
 
 # Auto-syncs demo source code to DisplayXR/displayxr-demo on tagged releases.
-# Only runs on dfattal repo (has DISPLAYXR_TOKEN).
+# Only runs on pvt repo (has DISPLAYXR_TOKEN).
 
 on:
   push:
@@ -9,7 +9,7 @@ on:
 
 jobs:
   sync-demos:
-    if: github.repository == 'dfattal/openxr-3d-display'
+    if: github.repository == 'DisplayXR/displayxr-runtime-pvt'
     runs-on: ubuntu-latest
 
     steps:

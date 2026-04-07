@@ -75,7 +75,7 @@ if %ERRORLEVEL% NEQ 0 (
 :: --- Leia SR SDK ---
 if not exist "%LEIASR_SDKROOT%\lib" (
     echo === Downloading Leia SR SDK %SR_TAG% ===
-    gh release download sr-sdk-v%SR_TAG% -R dfattal/openxr-3d-display -p "LeiaSR-SDK-%SR_TAG%-win64.zip" -D "%REPO%"
+    gh release download sr-sdk-v%SR_TAG% -R DisplayXR/displayxr-runtime-pvt -p "LeiaSR-SDK-%SR_TAG%-win64.zip" -D "%REPO%"
     if %ERRORLEVEL% NEQ 0 (
         echo ERROR: Failed to download SR SDK. Run: gh auth login
         exit /b 1
@@ -84,8 +84,8 @@ if not exist "%LEIASR_SDKROOT%\lib" (
     del "%REPO%LeiaSR-SDK-%SR_TAG%-win64.zip" 2>nul
 
     echo === Downloading Vulkan weaver extras ===
-    gh release download sr-sdk-v%SR_TAG% -R dfattal/openxr-3d-display -p "SimulatedRealityVulkanBeta.lib" -D "%LEIASR_SDKROOT%\lib"
-    gh release download sr-sdk-v%SR_TAG% -R dfattal/openxr-3d-display -p "vkweaver.h" -D "%LEIASR_SDKROOT%\include\sr\weaver"
+    gh release download sr-sdk-v%SR_TAG% -R DisplayXR/displayxr-runtime-pvt -p "SimulatedRealityVulkanBeta.lib" -D "%LEIASR_SDKROOT%\lib"
+    gh release download sr-sdk-v%SR_TAG% -R DisplayXR/displayxr-runtime-pvt -p "vkweaver.h" -D "%LEIASR_SDKROOT%\include\sr\weaver"
     echo SR SDK ready.
 )
 

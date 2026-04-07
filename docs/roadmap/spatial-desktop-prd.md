@@ -7,7 +7,7 @@ issues: [43, 44]
 platforms: [Windows, macOS]
 ---
 
-> **Status: Proposal** — not yet implemented. Tracking issue: [#43](https://github.com/dfattal/openxr-3d-display/issues/43), [#44](https://github.com/dfattal/openxr-3d-display/issues/44)
+> **Status: Proposal** — not yet implemented. Tracking issue: [#43](https://github.com/DisplayXR/displayxr-runtime-pvt/issues/43), [#44](https://github.com/DisplayXR/displayxr-runtime-pvt/issues/44)
 
 # Spatial Desktop Platform PRD
 
@@ -189,11 +189,11 @@ The platform is split across three repositories, reflecting the open runtime / p
 
 ### 5.4 Issue Management
 
-All development issues live on the private dev repo (`dfattal/openxr-3d-display`). The public runtime repo (`DisplayXR/displayxr-runtime`) carries only curated milestone-level tracking issues for third-party visibility. User-facing shell bug reports go to `DisplayXR/displayxr-shell-releases`.
+All development issues live on the private dev repo (`DisplayXR/displayxr-runtime-pvt`). The public runtime repo (`DisplayXR/displayxr-runtime`) carries only curated milestone-level tracking issues for third-party visibility. User-facing shell bug reports go to `DisplayXR/displayxr-shell-releases`.
 
 | Repo | Issue type | Volume |
 |------|-----------|--------|
-| `dfattal/openxr-3d-display` (private) | All dev issues — runtime and shell. `shell` label for shell-specific. | ~100+ |
+| `DisplayXR/displayxr-runtime-pvt` (private) | All dev issues — runtime and shell. `shell` label for shell-specific. | ~100+ |
 | `DisplayXR/displayxr-runtime` (public) | Curated milestones only | ~5-10 |
 | `DisplayXR/displayxr-shell-releases` (public) | User-facing bug reports | As needed |
 

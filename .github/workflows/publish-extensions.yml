@@ -1,7 +1,7 @@
 name: Publish Extension Headers
 
 # Auto-publishes XR_EXT_*.h headers to DisplayXR/displayxr-extensions
-# whenever they change on main. Only runs on dfattal repo (has DISPLAYXR_TOKEN).
+# whenever they change on main. Only runs on pvt repo (has DISPLAYXR_TOKEN).
 
 on:
   push:
@@ -11,7 +11,7 @@ on:
 
 jobs:
   publish-headers:
-    if: github.repository == 'dfattal/openxr-3d-display'
+    if: github.repository == 'DisplayXR/displayxr-runtime-pvt'
     runs-on: ubuntu-latest
 
     steps:

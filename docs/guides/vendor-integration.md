@@ -1229,7 +1229,7 @@ no lenticular optics).
 
 - [XR_EXT_win32_window_binding §2.4](../specs/XR_EXT_win32_window_binding.md) — Phase alignment motivation for app developers
 - [ADR-003](../adr/ADR-003-vendor-abstraction-via-display-processor-vtable.md) — Vendor code isolation
-- [Issue #85](https://github.com/dfattal/openxr-3d-display/issues/85) — Canvas sub-rect support for Leia SR weaver
+- [Issue #85](https://github.com/DisplayXR/displayxr-runtime-pvt/issues/85) — Canvas sub-rect support for Leia SR weaver
 
 ---
 

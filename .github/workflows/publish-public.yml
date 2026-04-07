@@ -1,0 +1,90 @@
+name: Publish to Public Repos
+
+# On tagged releases: push runtime (sans shell) to displayxr-runtime (public),
+# and publish shell binary to displayxr-shell-releases.
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  publish-runtime:
+    if: github.repository == 'DisplayXR/displayxr-runtime-pvt'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout tagged commit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Remove shell code (proprietary)
+        run: |
+          rm -rf src/xrt/targets/shell/
+          echo "Removed src/xrt/targets/shell/"
+
+      - name: Push to public runtime repo
+        run: |
+          git config user.name "DisplayXR Bot"
+          git config user.email "noreply@displayxr.org"
+
+          # Stage the deletion
+          git add -A
+          git commit -m "Release ${{ github.ref_name }} (shell code excluded)" --allow-empty
+
+          # Push to public repo
+          git remote add public https://x-access-token:${{ secrets.DISPLAYXR_TOKEN }}@github.com/DisplayXR/displayxr-runtime.git
+          git push public HEAD:main --force
+
+          # Push the tag
+          git tag -f "${{ github.ref_name }}"
+          git push public "${{ github.ref_name }}" --force
+
+          echo "Published ${{ github.ref_name }} to DisplayXR/displayxr-runtime"
+
+  publish-shell-binary:
+    if: github.repository == 'DisplayXR/displayxr-runtime-pvt'
+    runs-on: ubuntu-latest
+    needs: []  # runs in parallel with publish-runtime
+
+    steps:
+      - name: Download shell binary from CI artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: DisplayXR
+          path: runtime
+
+      - name: Check for shell binary
+        id: check-shell
+        run: |
+          if [ -f "runtime/bin/displayxr-shell.exe" ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "Found displayxr-shell.exe"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "Shell binary not found in artifacts — skipping shell release"
+            ls -R runtime/bin/ || echo "No bin directory"
+          fi
+
+      - name: Publish shell binary to displayxr-shell-releases
+        if: steps.check-shell.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.DISPLAYXR_TOKEN }}
+        run: |
+          # Create release on displayxr-shell-releases
+          gh release create "${{ github.ref_name }}" \
+            --repo DisplayXR/displayxr-shell-releases \
+            --title "DisplayXR Shell ${{ github.ref_name }}" \
+            --notes "Shell binary for DisplayXR Runtime ${{ github.ref_name }}.
+
+          Requires [DisplayXR Runtime ${{ github.ref_name }}](https://github.com/DisplayXR/displayxr-runtime/releases/tag/${{ github.ref_name }}) to be installed.
+
+          ## Usage
+          \`\`\`
+          displayxr-shell.exe app1.exe app2.exe
+          \`\`\`
+
+          See [displayxr-runtime](https://github.com/DisplayXR/displayxr-runtime) for full documentation." \
+            runtime/bin/displayxr-shell.exe
+
+          echo "Published shell ${{ github.ref_name }} to DisplayXR/displayxr-shell-releases"
