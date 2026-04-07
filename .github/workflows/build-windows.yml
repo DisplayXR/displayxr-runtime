@@ -13,6 +13,30 @@ permissions:
   contents: write
 
 jobs:
+  DetectChanges:
+    if: github.repository == 'dfattal/openxr-3d-display'
+    runs-on: ubuntu-latest
+    outputs:
+      test_apps_changed: ${{ steps.filter.outputs.test_apps }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - id: filter
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE=${{ github.event.pull_request.base.sha }}
+          else
+            BASE=${{ github.event.before }}
+          fi
+          # Check if test_apps/ or demos/ changed
+          if git diff --name-only "$BASE" HEAD | grep -qE '^(test_apps/|demos/)'; then
+            echo "test_apps=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "test_apps=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Detected test_apps_changed=$(grep test_apps "$GITHUB_OUTPUT" | cut -d= -f2)"
+
   Runtime:
     if: github.repository == 'dfattal/openxr-3d-display'
     runs-on: windows-2022
@@ -79,6 +103,7 @@ jobs:
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
+        if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
         id: artifact-upload-step
         with:
           retention-days: 3
@@ -88,6 +113,7 @@ jobs:
 
       - name: Upload installer
         uses: actions/upload-artifact@v4
+        if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
         id: installer-upload-step
         with:
           retention-days: 3
@@ -156,9 +182,9 @@ jobs:
 
   # D3D11 test app with XR_EXT_win32_window_binding (app provides window handle)
   TestAppCubeHandleD3D11:
-    if: github.repository == 'dfattal/openxr-3d-display'
+    if: github.repository == 'dfattal/openxr-3d-display' && needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
-    needs: Runtime  # Wait for runtime build to get artifacts
+    needs: [Runtime, DetectChanges]  # Wait for runtime build to get artifacts
 
     env:
       GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN || github.token }}
@@ -246,6 +272,7 @@ jobs:
 
       - name: Upload test app
         uses: actions/upload-artifact@v4
+        if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
         with:
           retention-days: 3
           name: CubeHandleD3D11
@@ -257,9 +284,9 @@ jobs:
 
   # D3D11 hosted test app - Standard OpenXR app (runtime creates window)
   TestAppCubeHostedD3D11:
-    if: github.repository == 'dfattal/openxr-3d-display'
+    if: github.repository == 'dfattal/openxr-3d-display' && needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
-    needs: Runtime
+    needs: [Runtime, DetectChanges]
 
     env:
       GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN || github.token }}
@@ -307,6 +334,7 @@ jobs:
 
       - name: Upload D3D11 hosted test app
         uses: actions/upload-artifact@v4
+        if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
         with:
           retention-days: 3
           name: CubeHostedD3D11
@@ -318,9 +346,9 @@ jobs:
 
   # D3D12 test app with XR_EXT_win32_window_binding
   TestAppCubeHandleD3D12:
-    if: github.repository == 'dfattal/openxr-3d-display'
+    if: github.repository == 'dfattal/openxr-3d-display' && needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
-    needs: Runtime
+    needs: [Runtime, DetectChanges]
 
     env:
       GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN || github.token }}
@@ -368,6 +396,7 @@ jobs:
 
       - name: Upload D3D12 test app
         uses: actions/upload-artifact@v4
+        if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
         with:
           retention-days: 3
           name: CubeHandleD3D12
@@ -379,9 +408,9 @@ jobs:
 
   # OpenGL test app with XR_EXT_win32_window_binding
   TestAppCubeHandleGL:
-    if: github.repository == 'dfattal/openxr-3d-display'
+    if: github.repository == 'dfattal/openxr-3d-display' && needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
-    needs: Runtime
+    needs: [Runtime, DetectChanges]
 
     env:
       GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN || github.token }}
@@ -429,6 +458,7 @@ jobs:
 
       - name: Upload OpenGL test app
         uses: actions/upload-artifact@v4
+        if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
         with:
           retention-days: 3
           name: CubeHandleGL
@@ -440,9 +470,9 @@ jobs:
 
   # Vulkan test app with XR_EXT_win32_window_binding (requires Vulkan SDK)
   TestAppCubeHandleVK:
-    if: github.repository == 'dfattal/openxr-3d-display'
+    if: github.repository == 'dfattal/openxr-3d-display' && needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
-    needs: Runtime
+    needs: [Runtime, DetectChanges]
 
     env:
       GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN || github.token }}
@@ -496,6 +526,7 @@ jobs:
 
       - name: Upload Vulkan test app
         uses: actions/upload-artifact@v4
+        if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
         with:
           retention-days: 3
           name: CubeHandleVK
@@ -507,9 +538,9 @@ jobs:
 
   # 3D Gaussian Splatting Vulkan demo (requires Vulkan SDK, uses FetchContent for 3DGS.cpp)
   TestAppGaussianSplattingVK:
-    if: github.repository == 'dfattal/openxr-3d-display'
+    if: github.repository == 'dfattal/openxr-3d-display' && needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
-    needs: Runtime
+    needs: [Runtime, DetectChanges]
 
     env:
       GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN || github.token }}
@@ -563,6 +594,7 @@ jobs:
 
       - name: Upload 3DGS Vulkan demo
         uses: actions/upload-artifact@v4
+        if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
         with:
           retention-days: 3
           name: GaussianSplattingVK
@@ -573,9 +605,9 @@ jobs:
 
   # Spatial OS demo app (multi-layer war room)
   TestAppSpatialOS:
-    if: github.repository == 'dfattal/openxr-3d-display'
+    if: github.repository == 'dfattal/openxr-3d-display' && needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
-    needs: Runtime
+    needs: [Runtime, DetectChanges]
 
     env:
       GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN || github.token }}
@@ -623,6 +655,7 @@ jobs:
 
       - name: Upload Spatial OS demo
         uses: actions/upload-artifact@v4
+        if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
         with:
           retention-days: 3
           name: SpatialOS
@@ -634,9 +667,9 @@ jobs:
 
   # D3D11 texture test app (offscreen shared texture mode)
   TestAppCubeTextureD3D11:
-    if: github.repository == 'dfattal/openxr-3d-display'
+    if: github.repository == 'dfattal/openxr-3d-display' && needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
-    needs: Runtime
+    needs: [Runtime, DetectChanges]
 
     env:
       GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN || github.token }}
@@ -676,6 +709,7 @@ jobs:
 
       - name: Upload texture D3D11 test app
         uses: actions/upload-artifact@v4
+        if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
         with:
           retention-days: 3
           name: CubeTextureD3D11
@@ -687,9 +721,9 @@ jobs:
 
   # D3D12 shared texture test app
   TestAppCubeTextureD3D12:
-    if: github.repository == 'dfattal/openxr-3d-display'
+    if: github.repository == 'dfattal/openxr-3d-display' && needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
-    needs: Runtime
+    needs: [Runtime, DetectChanges]
 
     env:
       GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN || github.token }}
@@ -729,6 +763,7 @@ jobs:
 
       - name: Upload texture D3D12 test app
         uses: actions/upload-artifact@v4
+        if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
         with:
           retention-days: 3
           name: CubeTextureD3D12
@@ -740,9 +775,9 @@ jobs:
 
   # D3D11 legacy hosted test app (no XR_EXT_display_info)
   TestAppCubeHostedLegacyD3D11:
-    if: github.repository == 'dfattal/openxr-3d-display'
+    if: github.repository == 'dfattal/openxr-3d-display' && needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
-    needs: Runtime
+    needs: [Runtime, DetectChanges]
 
     env:
       GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN || github.token }}
@@ -790,6 +825,7 @@ jobs:
 
       - name: Upload legacy hosted D3D11 test app
         uses: actions/upload-artifact@v4
+        if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
         with:
           retention-days: 3
           name: CubeHostedLegacyD3D11
@@ -801,9 +837,9 @@ jobs:
 
   # D3D12 legacy hosted test app (no XR_EXT_display_info)
   TestAppCubeHostedLegacyD3D12:
-    if: github.repository == 'dfattal/openxr-3d-display'
+    if: github.repository == 'dfattal/openxr-3d-display' && needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
-    needs: Runtime
+    needs: [Runtime, DetectChanges]
 
     env:
       GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN || github.token }}
@@ -847,6 +883,7 @@ jobs:
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
+        if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
         with:
           retention-days: 3
           name: CubeHostedLegacyD3D12
@@ -858,9 +895,9 @@ jobs:
 
   # Vulkan legacy hosted test app (no XR_EXT_display_info)
   TestAppCubeHostedLegacyVK:
-    if: github.repository == 'dfattal/openxr-3d-display'
+    if: github.repository == 'dfattal/openxr-3d-display' && needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
-    needs: Runtime
+    needs: [Runtime, DetectChanges]
 
     env:
       GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN || github.token }}
@@ -910,6 +947,7 @@ jobs:
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
+        if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
         with:
           retention-days: 3
           name: CubeHostedLegacyVK
@@ -921,9 +959,9 @@ jobs:
 
   # OpenGL legacy hosted test app (no XR_EXT_display_info)
   TestAppCubeHostedLegacyGL:
-    if: github.repository == 'dfattal/openxr-3d-display'
+    if: github.repository == 'dfattal/openxr-3d-display' && needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
-    needs: Runtime
+    needs: [Runtime, DetectChanges]
 
     env:
       GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN || github.token }}
@@ -961,6 +999,7 @@ jobs:
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
+        if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
         with:
           retention-days: 3
           name: CubeHostedLegacyGL
@@ -972,9 +1011,9 @@ jobs:
 
   # D3D11 IPC legacy test app (no XR_EXT_display_info, WebXR debug proxy)
   TestAppCubeIpcLegacyD3D11:
-    if: github.repository == 'dfattal/openxr-3d-display'
+    if: github.repository == 'dfattal/openxr-3d-display' && needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
-    needs: Runtime
+    needs: [Runtime, DetectChanges]
 
     env:
       GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN || github.token }}
@@ -1018,6 +1057,7 @@ jobs:
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
+        if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
         with:
           retention-days: 3
           name: CubeIpcLegacyD3D11
@@ -1029,9 +1069,9 @@ jobs:
 
   # D3D11 IPC test app (extension app, spatial shell foundation)
   TestAppCubeIpcD3D11:
-    if: github.repository == 'dfattal/openxr-3d-display'
+    if: github.repository == 'dfattal/openxr-3d-display' && needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
-    needs: Runtime
+    needs: [Runtime, DetectChanges]
 
     env:
       GH_TOKEN: ${{ secrets.LEIALOFT_GITHUB_TOKEN || github.token }}
@@ -1075,6 +1115,7 @@ jobs:
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
+        if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
         with:
           retention-days: 3
           name: CubeIpcD3D11
@@ -1086,9 +1127,9 @@ jobs:
 
   # Bundle all test apps into a single artifact with per-app subfolders
   BundleTestApps:
-    if: github.repository == 'dfattal/openxr-3d-display' && !cancelled()
+    if: github.repository == 'dfattal/openxr-3d-display' && !cancelled() && needs.DetectChanges.outputs.test_apps_changed == 'true' && (github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
     runs-on: ubuntu-latest
-    needs: [TestAppCubeHandleD3D11, TestAppCubeHostedD3D11, TestAppCubeHandleD3D12, TestAppCubeHandleGL, TestAppCubeHandleVK, TestAppGaussianSplattingVK, TestAppSpatialOS, TestAppCubeTextureD3D11, TestAppCubeTextureD3D12, TestAppCubeHostedLegacyD3D11, TestAppCubeHostedLegacyD3D12, TestAppCubeHostedLegacyVK, TestAppCubeHostedLegacyGL, TestAppCubeIpcLegacyD3D11, TestAppCubeIpcD3D11]
+    needs: [DetectChanges, TestAppCubeHandleD3D11, TestAppCubeHostedD3D11, TestAppCubeHandleD3D12, TestAppCubeHandleGL, TestAppCubeHandleVK, TestAppGaussianSplattingVK, TestAppSpatialOS, TestAppCubeTextureD3D11, TestAppCubeTextureD3D12, TestAppCubeHostedLegacyD3D11, TestAppCubeHostedLegacyD3D12, TestAppCubeHostedLegacyVK, TestAppCubeHostedLegacyGL, TestAppCubeIpcLegacyD3D11, TestAppCubeIpcD3D11]
 
     steps:
       - name: Download cube test app artifacts
@@ -1116,6 +1157,7 @@ jobs:
 
       - name: Upload bundled test apps
         uses: actions/upload-artifact@v4
+        if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
         with:
           retention-days: 3
           name: TestApps-${{ github.run_number }}
