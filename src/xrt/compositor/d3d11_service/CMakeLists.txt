@@ -34,6 +34,8 @@ target_link_libraries(
 		${D3D11_LIBRARY}
 		${DXGI_LIBRARY}
 		d3dcompiler
+		d2d1        # Direct2D for font atlas rendering
+		dwrite      # DirectWrite for anti-aliased text
 		windowsapp  # C++/WinRT runtime for Windows.Graphics.Capture
 	)
 

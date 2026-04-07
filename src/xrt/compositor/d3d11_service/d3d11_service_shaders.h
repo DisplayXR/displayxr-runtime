@@ -475,7 +475,8 @@ struct BlitConstants
 	float convert_srgb;      // 1.0 if source is SRGB, 0.0 otherwise; 2.0 = solid color mode
 	float quad_mode;         // > 0.5: use quad_corners instead of dst_offset + dst_rect_wh
 	float dst_rect_wh[2];   // destination quad width, height (0 = use src_rect.zw)
-	float padding2[2];
+	float corner_radius;    // top corner radius in pixels (0 = sharp corners)
+	float padding_unused;
 	// Perspective quad corners packed as two float4s (avoids HLSL array padding).
 	// TL = top-left, BL = bottom-left, TR = top-right, BR = bottom-right.
 	float quad_corners_01[4]; // [TL.x, TL.y, BL.x, BL.y]
@@ -498,7 +499,8 @@ cbuffer BlitCB : register(b0)
     float convert_srgb;    // 1.0 if source is SRGB; 2.0 = solid color mode
     float quad_mode;       // > 0.5: use quad_corners for perspective quad
     float2 dst_rect_wh;   // destination quad width, height (0 = use src_rect.zw)
-    float2 padding2;
+    float corner_radius;  // top corner radius in pixels (0 = sharp)
+    float padding_unused;
     float4 quad_corners_01; // TL.xy, BL.xy (packed as float4 to avoid HLSL array padding)
     float4 quad_corners_23; // TR.xy, BR.xy
     float4 quad_w;          // per-corner W for perspective-correct interpolation: TL, BL, TR, BR
@@ -508,6 +510,7 @@ struct VS_OUTPUT
 {
     float4 position : SV_Position;
     float2 uv : TEXCOORD0;
+    float2 quad_uv : TEXCOORD1;  // 0-1 position within the quad (for corner rounding)
 };
 
 // Quad vertex positions (also used as UV coords): TL, BL, TR, BR
@@ -558,6 +561,9 @@ VS_OUTPUT VSMain(uint vertex_id : SV_VertexID)
     float2 src_pos = src_rect.xy + uv * src_rect.zw;
     output.uv = src_pos / src_size;
 
+    // Pass through raw 0-1 quad position for corner rounding
+    output.quad_uv = uv;
+
     return output;
 }
 )";
@@ -573,7 +579,8 @@ cbuffer BlitCB : register(b0)
     float convert_srgb;
     float quad_mode;
     float2 dst_rect_wh;
-    float2 padding2;
+    float corner_radius;
+    float padding_unused;
     float4 quad_corners_01;
     float4 quad_corners_23;
     float4 quad_w;
@@ -586,6 +593,7 @@ struct VS_OUTPUT
 {
     float4 position : SV_Position;
     float2 uv : TEXCOORD0;
+    float2 quad_uv : TEXCOORD1;
 };
 
 // Linear to sRGB encode (gamma compression)
@@ -600,6 +608,27 @@ float3 linear_to_srgb(float3 linear_color)
 
 float4 PSMain(VS_OUTPUT input) : SV_Target
 {
+    // Rounded top corners: discard pixels outside the corner radius.
+    // corner_radius = fraction of quad height for the Y radius.
+    // padding_unused = width/height aspect ratio, used to compute X radius
+    // so corners stay circular (not stretched on wide title bars).
+    if (corner_radius > 0) {
+        float2 uv01 = input.quad_uv;
+        float ry = corner_radius;           // fraction of height
+        float aspect = (padding_unused > 0) ? padding_unused : 10.0;
+        float rx = ry / aspect;             // scale by h/w to keep circular
+        // Top-left
+        if (uv01.x < rx && uv01.y < ry) {
+            float2 d = float2((rx - uv01.x) / rx, (ry - uv01.y) / ry);
+            if (length(d) > 1.0) discard;
+        }
+        // Top-right
+        if (uv01.x > 1.0 - rx && uv01.y < ry) {
+            float2 d = float2((uv01.x - (1.0 - rx)) / rx, (ry - uv01.y) / ry);
+            if (length(d) > 1.0) discard;
+        }
+    }
+
     // Solid color mode: convert_srgb >= 2.0 outputs src_rect.rgb as solid color
     // (src_rect is unused for texture sampling in solid mode)
     if (convert_srgb > 1.5)

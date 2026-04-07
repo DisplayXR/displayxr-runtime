@@ -50,6 +50,9 @@
 #include <wil/com.h>
 #include <wil/result.h>
 
+#include <d2d1.h>
+#include <dwrite.h>
+
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -670,9 +673,14 @@ struct d3d11_multi_compositor
 	DWORD last_title_click_time;
 	int32_t last_title_click_slot;
 
-	//! Bitmap font atlas for title bar text (768x16, 96 ASCII glyphs).
+	//! Font atlas for title bar text (DirectWrite-rendered, anti-aliased).
 	wil::com_ptr<ID3D11Texture2D> font_atlas;
 	wil::com_ptr<ID3D11ShaderResourceView> font_atlas_srv;
+	float glyph_advances[96];  //!< Per-glyph advance width in atlas pixels (proportional)
+	uint32_t font_glyph_w;     //!< Max glyph cell width in atlas pixels
+	uint32_t font_glyph_h;     //!< Glyph cell height in atlas pixels
+	uint32_t font_atlas_w;     //!< Total atlas width in pixels
+	uint32_t font_atlas_h;     //!< Total atlas height in pixels
 
 	//! @name Capture client render timer
 	//! @{
@@ -1169,8 +1177,8 @@ blit_to_atlas_texture(struct d3d11_service_system *sys,
 	cb->quad_mode = 0.0f;
 	cb->dst_rect_wh[0] = dst_w;
 	cb->dst_rect_wh[1] = dst_h;
-	cb->padding2[0] = 0.0f;
-	cb->padding2[1] = 0.0f;
+	cb->corner_radius = 0.0f;
+	cb->padding_unused = 0.0f;
 
 	sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
 
@@ -3821,49 +3829,157 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 	        sys->base.info.display_pixel_width > 0 ? sys->base.info.display_pixel_width : sys->display_width,
 	        sys->base.info.display_pixel_height > 0 ? sys->base.info.display_pixel_height : sys->display_height);
 
-	// Create bitmap font atlas texture (768x16, 96 ASCII glyphs)
+	// Create font atlas using DirectWrite (anti-aliased Segoe UI)
 	if (!mc->font_atlas) {
-		uint32_t fa_w = BITMAP_FONT_ATLAS_W;
-		uint32_t fa_h = BITMAP_FONT_ATLAS_H;
-		uint32_t *pixels = new uint32_t[fa_w * fa_h];
-		std::memset(pixels, 0, fa_w * fa_h * sizeof(uint32_t));
+		// Font size ~75% of destination GLYPH_H to avoid filling the title bar.
+		const uint32_t FONT_SIZE = 16;
+		const uint32_t CELL_H = FONT_SIZE + 6; // padding for descenders
+		const uint32_t GLYPH_COUNT = 96;
 
-		for (int g = 0; g < BITMAP_FONT_GLYPH_COUNT; g++) {
-			for (int row = 0; row < BITMAP_FONT_GLYPH_H; row++) {
-				uint8_t bits = bitmap_font_8x16[g][row];
-				for (int bit = 0; bit < BITMAP_FONT_GLYPH_W; bit++) {
-					if (bits & (0x80 >> bit)) {
-						uint32_t px = g * BITMAP_FONT_GLYPH_W + bit;
-						uint32_t py = row;
-						pixels[py * fa_w + px] = 0xFFFFFFFF; // white, opaque
-					}
-				}
+		// Measure glyph widths with DirectWrite
+		wil::com_ptr<IDWriteFactory> dwrite_factory;
+		wil::com_ptr<IDWriteTextFormat> text_format;
+		bool dwrite_ok = false;
+
+		HRESULT dw_hr = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,
+		    __uuidof(IDWriteFactory), (IUnknown **)dwrite_factory.put());
+		if (SUCCEEDED(dw_hr)) {
+			dw_hr = dwrite_factory->CreateTextFormat(
+			    L"Segoe UI", nullptr,
+			    DWRITE_FONT_WEIGHT_REGULAR, DWRITE_FONT_STYLE_NORMAL,
+			    DWRITE_FONT_STRETCH_NORMAL, (float)FONT_SIZE, L"en-us",
+			    text_format.put());
+			if (SUCCEEDED(dw_hr)) {
+				dwrite_ok = true;
 			}
 		}
 
+		// Measure each glyph and compute atlas width
+		uint32_t cell_w = FONT_SIZE; // fallback cell width
+		uint32_t atlas_w = 0;
+		if (dwrite_ok) {
+			for (int g = 0; g < (int)GLYPH_COUNT; g++) {
+				WCHAR ch = (WCHAR)(0x20 + g);
+				wil::com_ptr<IDWriteTextLayout> layout;
+				dwrite_factory->CreateTextLayout(&ch, 1, text_format.get(),
+				    1000.0f, 1000.0f, layout.put());
+				DWRITE_TEXT_METRICS metrics = {};
+				if (layout) layout->GetMetrics(&metrics);
+				float advance = (metrics.widthIncludingTrailingWhitespace > 0)
+				    ? metrics.widthIncludingTrailingWhitespace : (float)FONT_SIZE * 0.5f;
+				mc->glyph_advances[g] = advance;
+				// Use ceiling for cell width
+				uint32_t gw = (uint32_t)(advance + 1.5f);
+				if (gw > cell_w) cell_w = gw;
+				atlas_w += gw;
+			}
+		} else {
+			// Fallback: uniform width
+			atlas_w = GLYPH_COUNT * cell_w;
+			for (int g = 0; g < (int)GLYPH_COUNT; g++)
+				mc->glyph_advances[g] = (float)cell_w;
+		}
+
+		mc->font_glyph_w = cell_w;
+		mc->font_glyph_h = CELL_H;
+		mc->font_atlas_w = atlas_w;
+		mc->font_atlas_h = CELL_H;
+
+		// Create atlas texture (needs RENDER_TARGET for D2D)
 		D3D11_TEXTURE2D_DESC font_desc = {};
-		font_desc.Width = fa_w;
-		font_desc.Height = fa_h;
+		font_desc.Width = atlas_w;
+		font_desc.Height = CELL_H;
 		font_desc.MipLevels = 1;
 		font_desc.ArraySize = 1;
 		font_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
 		font_desc.SampleDesc.Count = 1;
-		font_desc.Usage = D3D11_USAGE_IMMUTABLE;
-		font_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+		font_desc.Usage = D3D11_USAGE_DEFAULT;
+		font_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
 
-		D3D11_SUBRESOURCE_DATA init_data = {};
-		init_data.pSysMem = pixels;
-		init_data.SysMemPitch = fa_w * sizeof(uint32_t);
+		hr = sys->device->CreateTexture2D(&font_desc, nullptr, mc->font_atlas.put());
+		if (SUCCEEDED(hr) && dwrite_ok) {
+			// Render glyphs via Direct2D onto the atlas texture
+			wil::com_ptr<IDXGISurface> dxgi_surface;
+			mc->font_atlas->QueryInterface(IID_PPV_ARGS(dxgi_surface.put()));
 
-		hr = sys->device->CreateTexture2D(&font_desc, &init_data, mc->font_atlas.put());
-		if (SUCCEEDED(hr)) {
-			sys->device->CreateShaderResourceView(mc->font_atlas.get(), nullptr, mc->font_atlas_srv.put());
-			U_LOG_W("Multi-comp: font atlas created (%ux%u)", fa_w, fa_h);
+			wil::com_ptr<ID2D1Factory> d2d_factory;
+			D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, d2d_factory.put());
+
+			D2D1_RENDER_TARGET_PROPERTIES rt_props = D2D1::RenderTargetProperties(
+			    D2D1_RENDER_TARGET_TYPE_DEFAULT,
+			    D2D1::PixelFormat(DXGI_FORMAT_R8G8B8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+
+			wil::com_ptr<ID2D1RenderTarget> rt;
+			d2d_factory->CreateDxgiSurfaceRenderTarget(dxgi_surface.get(), &rt_props, rt.put());
+
+			if (rt) {
+				wil::com_ptr<ID2D1SolidColorBrush> brush;
+				rt->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 1.0f), brush.put());
+
+				rt->BeginDraw();
+				rt->Clear(D2D1::ColorF(0, 0, 0, 0)); // transparent background
+
+				float x_cursor = 0;
+				for (int g = 0; g < (int)GLYPH_COUNT; g++) {
+					WCHAR ch = (WCHAR)(0x20 + g);
+					float gw = mc->glyph_advances[g];
+					D2D1_RECT_F rect = {x_cursor, 0, x_cursor + gw, (float)CELL_H};
+					wil::com_ptr<IDWriteTextLayout> layout;
+					dwrite_factory->CreateTextLayout(&ch, 1, text_format.get(),
+					    gw, (float)CELL_H, layout.put());
+					if (layout) {
+						rt->DrawTextLayout(D2D1::Point2F(x_cursor, 2.0f),
+						    layout.get(), brush.get());
+					}
+					x_cursor += gw;
+				}
+
+				rt->EndDraw();
+			}
+
+			sys->device->CreateShaderResourceView(mc->font_atlas.get(), nullptr,
+			    mc->font_atlas_srv.put());
+			U_LOG_W("Multi-comp: DirectWrite font atlas created (%ux%u, Segoe UI %upx)",
+			        atlas_w, CELL_H, FONT_SIZE);
+		} else if (SUCCEEDED(hr)) {
+			// DWrite failed — fall back to bitmap font
+			U_LOG_W("Multi-comp: DirectWrite unavailable, using bitmap font fallback");
+			mc->font_atlas_w = BITMAP_FONT_ATLAS_W;
+			mc->font_atlas_h = BITMAP_FONT_ATLAS_H;
+			mc->font_glyph_w = BITMAP_FONT_GLYPH_W;
+			mc->font_glyph_h = BITMAP_FONT_GLYPH_H;
+			for (int g = 0; g < (int)GLYPH_COUNT; g++)
+				mc->glyph_advances[g] = (float)BITMAP_FONT_GLYPH_W;
+
+			// Recreate as immutable with bitmap data
+			mc->font_atlas.reset();
+			font_desc.Usage = D3D11_USAGE_IMMUTABLE;
+			font_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+			font_desc.Width = BITMAP_FONT_ATLAS_W;
+			font_desc.Height = BITMAP_FONT_ATLAS_H;
+
+			uint32_t *pixels = new uint32_t[BITMAP_FONT_ATLAS_W * BITMAP_FONT_ATLAS_H];
+			std::memset(pixels, 0, BITMAP_FONT_ATLAS_W * BITMAP_FONT_ATLAS_H * sizeof(uint32_t));
+			for (int g = 0; g < BITMAP_FONT_GLYPH_COUNT; g++) {
+				for (int row = 0; row < BITMAP_FONT_GLYPH_H; row++) {
+					uint8_t bits = bitmap_font_8x16[g][row];
+					for (int bit = 0; bit < BITMAP_FONT_GLYPH_W; bit++) {
+						if (bits & (0x80 >> bit)) {
+							pixels[row * BITMAP_FONT_ATLAS_W + g * BITMAP_FONT_GLYPH_W + bit] = 0xFFFFFFFF;
+						}
+					}
+				}
+			}
+			D3D11_SUBRESOURCE_DATA init_data = {};
+			init_data.pSysMem = pixels;
+			init_data.SysMemPitch = BITMAP_FONT_ATLAS_W * sizeof(uint32_t);
+			sys->device->CreateTexture2D(&font_desc, &init_data, mc->font_atlas.put());
+			if (mc->font_atlas)
+				sys->device->CreateShaderResourceView(mc->font_atlas.get(), nullptr, mc->font_atlas_srv.put());
+			delete[] pixels;
 		} else {
-			U_LOG_E("Multi-comp: failed to create font atlas (hr=0x%08X)", hr);
+			U_LOG_E("Multi-comp: failed to create font atlas texture (hr=0x%08X)", hr);
 		}
-
-		delete[] pixels;
 	}
 
 	// Create display processor via factory
@@ -5774,8 +5890,8 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			cb->quad_mode = use_quad ? 1.0f : 0.0f;
 			cb->dst_rect_wh[0] = dest_px_w;
 			cb->dst_rect_wh[1] = dest_px_h;
-			cb->padding2[0] = 0.0f;
-			cb->padding2[1] = 0.0f;
+			cb->corner_radius = 0.0f;
+			cb->padding_unused = 0.0f;
 			if (use_quad) {
 				blit_set_quad_corners(cb, quad_corners, quad_w_vals);
 			} else {
@@ -5902,8 +6018,10 @@ multi_compositor_render(struct d3d11_service_system *sys)
 							cb->src_size[0] = 1; cb->src_size[1] = 1;
 							cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
 							cb->convert_srgb = 2.0f;
-							cb->padding2[0] = 0; cb->padding2[1] = 0;
-							// Title bar: full width, above content
+							cb->corner_radius = 0.35f;
+							// Pass width/height aspect ratio for circular corners
+							cb->padding_unused = mc->clients[s].window_width_m / UI_TITLE_BAR_H_M;
+							// Title bar: full width, above content (rounded top corners)
 							CHROME_BLIT_POS(cb,
 							    -win_hw, win_hh + tb_h_m, win_hw, win_hh,
 							    tox, toy, tow, toh);
@@ -5925,7 +6043,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 							cb->src_size[0] = 1; cb->src_size[1] = 1;
 							cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
 							cb->convert_srgb = 2.0f;
-							cb->padding2[0] = 0; cb->padding2[1] = 0;
+							cb->corner_radius = 0; cb->padding_unused = 0;
 							float btn_x = tox + tow - (float)CLOSE_BTN_WIDTH_PX;
 							CHROME_BLIT_POS(cb,
 							    win_hw - btn_w_m_val, win_hh + tb_h_m, win_hw, win_hh,
@@ -5948,7 +6066,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 							cb->src_size[0] = 1; cb->src_size[1] = 1;
 							cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
 							cb->convert_srgb = 2.0f;
-							cb->padding2[0] = 0; cb->padding2[1] = 0;
+							cb->corner_radius = 0; cb->padding_unused = 0;
 							float min_x = tox + tow - 2.0f * (float)CLOSE_BTN_WIDTH_PX;
 							CHROME_BLIT_POS(cb,
 							    win_hw - 2*btn_w_m_val, win_hh + tb_h_m, win_hw - btn_w_m_val, win_hh,
@@ -5962,50 +6080,75 @@ multi_compositor_render(struct d3d11_service_system *sys)
 						sys->context->OMSetBlendState(sys->blend_alpha.get(), nullptr, 0xFFFFFFFF);
 						ID3D11ShaderResourceView *font_srv = mc->font_atlas_srv.get();
 						sys->context->PSSetShaderResources(0, 1, &font_srv);
-						sys->context->PSSetSamplers(0, 1, sys->sampler_point.addressof());
+						sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
 
 						const char *name = mc->clients[s].app_name;
-						float gw = (float)GLYPH_W;
-						float gh = (float)GLYPH_H;
+						// Render glyphs at 1:1 from atlas (no vertical stretch).
+						// If atlas cell is shorter than title bar, text is vertically centered.
+						float gh = (float)mc->font_glyph_h;
+						if (gh > toh) gh = toh; // cap to title bar height
 						float gpad = (toh - gh) / 2.0f; // vertical centering
 						if (gpad < 0) gpad = 0;
 						// Glyph vertical centering in meters (for rotated path)
-						float glyph_vpad_m = (tb_h_m - glyph_h_m) / 2.0f;
+						float glyph_render_h_m = glyph_h_m * (gh / (float)GLYPH_H);
+						float glyph_vpad_m = (tb_h_m - glyph_render_h_m) / 2.0f;
 						if (glyph_vpad_m < 0) glyph_vpad_m = 0;
 
-						int max_chars = ((int)tow - (int)gw - 2 * CLOSE_BTN_WIDTH_PX) / (int)gw;
-						if (max_chars < 0) max_chars = 0;
-						if (max_chars > 30) max_chars = 30;
-						for (int ci = 0; ci < max_chars && name[ci] != '\0'; ci++) {
+						// Compute atlas x-offset for each glyph (cumulative advances)
+						float px_cursor = 0; // pixel cursor in dest
+						float avail_w = tow - (float)GLYPH_W - 2.0f * (float)CLOSE_BTN_WIDTH_PX;
+						float scale = 1.0f; // 1:1 rendering from atlas
+						for (int ci = 0; ci < 30 && name[ci] != '\0'; ci++) {
 							unsigned char ch = (unsigned char)name[ci];
 							if (ch < 0x20 || ch > 0x7E) ch = '?';
 							int gi = ch - 0x20;
+							float src_gw = mc->glyph_advances[gi];
+							// Compute atlas x for this glyph (sum of all prior advances)
+							float src_x = 0;
+							for (int p = 0; p < gi; p++) src_x += mc->glyph_advances[p];
+
+							float dst_gw = src_gw * scale;
+							if (px_cursor + dst_gw > avail_w) break;
+
 							D3D11_MAPPED_SUBRESOURCE mapped;
 							if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
 							              D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
 								BlitConstants *cb = static_cast<BlitConstants *>(mapped.pData);
-								cb->src_rect[0] = (float)(gi * 8); cb->src_rect[1] = 0;
-								cb->src_rect[2] = 8; cb->src_rect[3] = 16;
-								cb->src_size[0] = 768; cb->src_size[1] = 16;
+								cb->src_rect[0] = src_x; cb->src_rect[1] = 0;
+								cb->src_rect[2] = src_gw; cb->src_rect[3] = (float)mc->font_glyph_h;
+								cb->src_size[0] = (float)mc->font_atlas_w;
+								cb->src_size[1] = (float)mc->font_atlas_h;
 								cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
 								cb->convert_srgb = 0.0f;
-								cb->padding2[0] = 0; cb->padding2[1] = 0;
-								// Glyph local rect: left edge + 1 glyph padding + ci * glyph_w
-								float gl_left = -win_hw + glyph_w_m + ci * glyph_w_m;
+								cb->corner_radius = 0; cb->padding_unused = 0;
+								// Proportional glyph positioning
+								float m_per_px = glyph_w_m / ((float)GLYPH_W > 0 ? (float)GLYPH_W : 1.0f);
+								float gl_left = -win_hw + glyph_w_m + px_cursor * m_per_px;
 								float gl_top = win_hh + tb_h_m - glyph_vpad_m;
-								float gl_right = gl_left + glyph_w_m;
-								float gl_bottom = gl_top - glyph_h_m;
+								float gl_right = gl_left + dst_gw * m_per_px;
+								float gl_bottom = gl_top - glyph_render_h_m;
 								CHROME_BLIT_POS(cb,
 								    gl_left, gl_top, gl_right, gl_bottom,
-								    tox + gw + ci * gw, toy + gpad, gw, gh);
+								    tox + (float)GLYPH_W + px_cursor, toy + gpad, dst_gw, gh);
 								sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
 								sys->context->Draw(4, 0);
 							}
+							px_cursor += dst_gw;
 						}
+						// Helper: compute atlas x offset for glyph index
+						auto atlas_x_for = [&](int gi) -> float {
+							float x = 0;
+							for (int p = 0; p < gi && p < 96; p++) x += mc->glyph_advances[p];
+							return x;
+						};
+						float btn_scale = gh / (float)mc->font_glyph_h;
+
 						// X glyph on close button (centered in button)
 						{
 							int xg = 'X' - 0x20;
-							float bx = tox + tow - (float)CLOSE_BTN_WIDTH_PX + ((float)CLOSE_BTN_WIDTH_PX - gw) / 2.0f;
+							float src_gw = mc->glyph_advances[xg];
+							float dst_gw = src_gw * btn_scale;
+							float bx = tox + tow - (float)CLOSE_BTN_WIDTH_PX + ((float)CLOSE_BTN_WIDTH_PX - dst_gw) / 2.0f;
 							// Local: centered in close button
 							float xg_left = win_hw - btn_w_m_val + (btn_w_m_val - glyph_w_m) / 2.0f;
 							float xg_top = win_hh + tb_h_m - glyph_vpad_m;
@@ -6013,15 +6156,16 @@ multi_compositor_render(struct d3d11_service_system *sys)
 							if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
 							              D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
 								BlitConstants *cb = static_cast<BlitConstants *>(mapped.pData);
-								cb->src_rect[0] = (float)(xg * 8); cb->src_rect[1] = 0;
-								cb->src_rect[2] = 8; cb->src_rect[3] = 16;
-								cb->src_size[0] = 768; cb->src_size[1] = 16;
+								cb->src_rect[0] = atlas_x_for(xg); cb->src_rect[1] = 0;
+								cb->src_rect[2] = src_gw; cb->src_rect[3] = (float)mc->font_glyph_h;
+								cb->src_size[0] = (float)mc->font_atlas_w;
+								cb->src_size[1] = (float)mc->font_atlas_h;
 								cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
 								cb->convert_srgb = 0.0f;
-								cb->padding2[0] = 0; cb->padding2[1] = 0;
+								cb->corner_radius = 0; cb->padding_unused = 0;
 								CHROME_BLIT_POS(cb,
 								    xg_left, xg_top, xg_left + glyph_w_m, xg_top - glyph_h_m,
-								    bx, toy + gpad, gw, gh);
+								    bx, toy + gpad, dst_gw, gh);
 								sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
 								sys->context->Draw(4, 0);
 							}
@@ -6029,7 +6173,9 @@ multi_compositor_render(struct d3d11_service_system *sys)
 						// - glyph on minimize button (centered in button)
 						{
 							int dg = '-' - 0x20;
-							float mx = tox + tow - 2.0f * (float)CLOSE_BTN_WIDTH_PX + ((float)CLOSE_BTN_WIDTH_PX - gw) / 2.0f;
+							float src_gw = mc->glyph_advances[dg];
+							float dst_gw = src_gw * btn_scale;
+							float mx = tox + tow - 2.0f * (float)CLOSE_BTN_WIDTH_PX + ((float)CLOSE_BTN_WIDTH_PX - dst_gw) / 2.0f;
 							// Local: centered in minimize button
 							float mg_left = win_hw - 2*btn_w_m_val + (btn_w_m_val - glyph_w_m) / 2.0f;
 							float mg_top = win_hh + tb_h_m - glyph_vpad_m;
@@ -6037,15 +6183,16 @@ multi_compositor_render(struct d3d11_service_system *sys)
 							if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
 							              D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
 								BlitConstants *cb = static_cast<BlitConstants *>(mapped.pData);
-								cb->src_rect[0] = (float)(dg * 8); cb->src_rect[1] = 0;
-								cb->src_rect[2] = 8; cb->src_rect[3] = 16;
-								cb->src_size[0] = 768; cb->src_size[1] = 16;
+								cb->src_rect[0] = atlas_x_for(dg); cb->src_rect[1] = 0;
+								cb->src_rect[2] = src_gw; cb->src_rect[3] = (float)mc->font_glyph_h;
+								cb->src_size[0] = (float)mc->font_atlas_w;
+								cb->src_size[1] = (float)mc->font_atlas_h;
 								cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
 								cb->convert_srgb = 0.0f;
-								cb->padding2[0] = 0; cb->padding2[1] = 0;
+								cb->corner_radius = 0; cb->padding_unused = 0;
 								CHROME_BLIT_POS(cb,
 								    mg_left, mg_top, mg_left + glyph_w_m, mg_top - glyph_h_m,
-								    mx, toy + gpad, gw, gh);
+								    mx, toy + gpad, dst_gw, gh);
 								sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
 								sys->context->Draw(4, 0);
 							}
@@ -6128,7 +6275,14 @@ multi_compositor_render(struct d3d11_service_system *sys)
 					cb->src_rect[0] = 0; cb->src_rect[1] = 1; cb->src_rect[2] = 1; cb->src_rect[3] = 1;
 					cb->src_size[0] = 1; cb->src_size[1] = 1;
 					cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
-					cb->convert_srgb = 2.0f; cb->padding2[0] = 0; cb->padding2[1] = 0;
+					cb->convert_srgb = 2.0f;
+					// Round top corners of the top border edge (edge 0)
+					if (e == 0 && fb_tb_h > 0) {
+						cb->corner_radius = 0.35f;
+						cb->padding_unused = mc->clients[s].window_width_m / bw_m;
+					} else {
+						cb->corner_radius = 0; cb->padding_unused = 0;
+					}
 					if (fb_rotated) {
 						float corners[8], cw[4];
 						project_local_rect_for_eye(sys, &mc->clients[s].window_pose.orientation,
@@ -6229,7 +6383,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 					cb->quad_mode = 0;
 					cb->dst_rect_wh[0] = (float)half_w;
 					cb->dst_rect_wh[1] = (float)TASKBAR_HEIGHT_PX;
-					cb->padding2[0] = 0; cb->padding2[1] = 0;
+					cb->corner_radius = 0; cb->padding_unused = 0;
 					sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
 					sys->context->Draw(4, 0);
 				}
@@ -6239,7 +6393,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 					sys->context->OMSetBlendState(sys->blend_alpha.get(), nullptr, 0xFFFFFFFF);
 					ID3D11ShaderResourceView *font_srv = mc->font_atlas_srv.get();
 					sys->context->PSSetShaderResources(0, 1, &font_srv);
-					sys->context->PSSetSamplers(0, 1, sys->sampler_point.addressof());
+					sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
 
 					int ind_idx = 0;
 					for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
@@ -6271,7 +6425,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 								cb2->quad_mode = 0;
 								cb2->dst_rect_wh[0] = pill_w;
 								cb2->dst_rect_wh[1] = pill_h;
-								cb2->padding2[0] = 0; cb2->padding2[1] = 0;
+								cb2->corner_radius = 0; cb2->padding_unused = 0;
 								sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
 								sys->context->Draw(4, 0);
 							}
@@ -6281,31 +6435,39 @@ multi_compositor_render(struct d3d11_service_system *sys)
 						// Draw first few chars of app name
 						const char *name = mc->clients[i].app_name;
 						int max_chars = 6;
+						float tb_scale = tgh / (float)mc->font_glyph_h;
+						float tb_px_cursor = 0;
 						for (int ci = 0; ci < max_chars && name[ci] != '\0'; ci++) {
 							unsigned char ch = (unsigned char)name[ci];
 							if (ch < 0x20 || ch > 0x7E) ch = '?';
 							int glyph_idx = ch - 0x20;
+							float src_gw = mc->glyph_advances[glyph_idx];
+							float src_x = 0;
+							for (int p = 0; p < glyph_idx; p++) src_x += mc->glyph_advances[p];
+							float dst_gw = src_gw * tb_scale;
 							D3D11_MAPPED_SUBRESOURCE mapped3;
 							if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
 							              D3D11_MAP_WRITE_DISCARD, 0, &mapped3))) {
 								BlitConstants *cb3 = static_cast<BlitConstants *>(mapped3.pData);
-								cb3->src_rect[0] = (float)(glyph_idx * 8);
+								cb3->src_rect[0] = src_x;
 								cb3->src_rect[1] = 0;
-								cb3->src_rect[2] = 8;
-								cb3->src_rect[3] = 16;
-								cb3->dst_offset[0] = ind_x + 2.0f + ci * tgw;
+								cb3->src_rect[2] = src_gw;
+								cb3->src_rect[3] = (float)mc->font_glyph_h;
+								cb3->dst_offset[0] = ind_x + 2.0f + tb_px_cursor;
 								cb3->dst_offset[1] = ind_y;
-								cb3->src_size[0] = 768; cb3->src_size[1] = 16;
+								cb3->src_size[0] = (float)mc->font_atlas_w;
+								cb3->src_size[1] = (float)mc->font_atlas_h;
 								cb3->dst_size[0] = (float)ca_w;
 								cb3->dst_size[1] = (float)ca_h;
 								cb3->convert_srgb = 0.0f;
 								cb3->quad_mode = 0;
-								cb3->dst_rect_wh[0] = tgw;
+								cb3->dst_rect_wh[0] = dst_gw;
 								cb3->dst_rect_wh[1] = tgh;
-								cb3->padding2[0] = 0; cb3->padding2[1] = 0;
+								cb3->corner_radius = 0; cb3->padding_unused = 0;
 								sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
 								sys->context->Draw(4, 0);
 							}
+							tb_px_cursor += dst_gw;
 						}
 						ind_idx++;
 					}

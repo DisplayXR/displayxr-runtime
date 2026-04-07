@@ -564,9 +564,13 @@ Section "DisplayXR Runtime" SecRuntime
 
 	SetOutPath "$INSTDIR"
 
-	; Kill any running displayxr-service before overwriting (avoids write/sharing error)
-	nsExec::ExecToLog 'taskkill /f /im displayxr-service.exe'
+	; Kill any running DisplayXR processes before overwriting (avoids write/sharing error)
+	nsExec::ExecToLog 'taskkill /f /im displayxr-shell.exe'
 	Pop $0  ; Ignore exit code (may not be running)
+	nsExec::ExecToLog 'taskkill /f /im displayxr-service.exe'
+	Pop $0
+	; Wait for processes to fully exit and release pipe/file handles
+	Sleep 2000
 
 	; Install runtime files
 	File "${BIN_DIR}\DisplayXRClient.dll"
