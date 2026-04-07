@@ -45,6 +45,10 @@
 // Environment variable to start in windowed mode
 DEBUG_GET_ONCE_BOOL_OPTION(start_windowed, "XRT_COMPOSITOR_START_WINDOWED", false)
 
+// Marker for SendInput-injected mouse events — WndProc skips re-forwarding these.
+// Used to break the loop: WndProc→SendInput→WM_LBUTTONDOWN→WndProc.
+#define SHELL_SENDINPUT_MARKER 0xD15B1A7E
+
 // Qwerty input is always enabled for non-session-target apps (DisplayXR-owned window)
 // DEBUG_GET_ONCE_BOOL_OPTION(qwerty_enable, "QWERTY_ENABLE", false)
 
@@ -142,6 +146,11 @@ struct comp_d3d11_window
 	//! Accumulated scroll wheel delta for shell window resize (positive = enlarge).
 	//! Written by WndProc, read+reset by render loop.
 	volatile LONG scroll_accum;
+
+	//! True when a mouse button press originated inside the app content rect.
+	//! Used to prevent title bar clicks from being forwarded as app drags.
+	//! Set on button-down inside rect, cleared on button-up.
+	bool mouse_press_in_content;
 
 	//! Shell display processor for ESC/close 2D mode switch (opaque, can be NULL).
 	volatile void *shell_dp;
@@ -478,6 +487,12 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	case WM_MBUTTONUP:
 	case WM_MOUSEMOVE:
 	case WM_MOUSEWHEEL: {
+		// Skip re-forwarding of SendInput-injected mouse events (prevents
+		// WndProc→SendInput→WM_LBUTTONDOWN→WndProc infinite loop).
+		if (GetMessageExtraInfo() == (LPARAM)SHELL_SENDINPUT_MARKER) {
+			return DefWindowProcW(hWnd, message, wParam, lParam);
+		}
+
 		HWND fwd = (HWND)InterlockedCompareExchangePointer((volatile PVOID *)&w->input_forward_hwnd, NULL, NULL);
 		LONG is_capture = InterlockedCompareExchange(&w->input_forward_is_capture, 0, 0);
 		if (fwd != NULL) {
@@ -495,6 +510,13 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 				return 0;
 			}
 
+			// Is this a mouse button event (not movement)?
+			bool is_button = (message != WM_MOUSEMOVE);
+			bool is_button_down = (message == WM_LBUTTONDOWN || message == WM_RBUTTONDOWN ||
+			                       message == WM_MBUTTONDOWN);
+			bool is_button_up = (message == WM_LBUTTONUP || message == WM_RBUTTONUP ||
+			                     message == WM_MBUTTONUP);
+
 			// Remap shell-window coords to app-window coords
 			LONG rx = InterlockedCompareExchange(&w->input_forward_rect_x, 0, 0);
 			LONG ry = InterlockedCompareExchange(&w->input_forward_rect_y, 0, 0);
@@ -506,11 +528,22 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 				int shell_x = GET_X_LPARAM(lParam);
 				int shell_y = GET_Y_LPARAM(lParam);
 
-				// Forward if inside the focused window's rect, or if a button
-				// is held (drag in progress — cursor may leave the rect).
 				bool in_rect = (shell_x >= rx && shell_x < rx + rw &&
 				                shell_y >= ry && shell_y < ry + rh);
-				bool dragging = (wParam & (MK_LBUTTON | MK_RBUTTON | MK_MBUTTON)) != 0;
+
+				// Track whether the press originated inside the content rect.
+				// Only forward drag (button-held movement) if the press started
+				// inside content — prevents title bar clicks from being forwarded.
+				if (is_button_down) {
+					w->mouse_press_in_content = in_rect;
+				}
+				if (is_button_up) {
+					w->mouse_press_in_content = false;
+				}
+
+				// Forward if inside rect, or if dragging from an in-content press.
+				bool buttons_held = (wParam & (MK_LBUTTON | MK_RBUTTON | MK_MBUTTON)) != 0;
+				bool dragging = buttons_held && w->mouse_press_in_content;
 				if (in_rect || dragging) {
 					// Remap to app-window client coords.
 					// Scale if target HWND is a different size than the
@@ -533,22 +566,39 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 						app_x = rel_x;
 						app_y = rel_y;
 					}
-					if (is_capture) {
-						// Capture client: buffer for SendInput dispatch
-						input_ring_push(w, message, (uint64_t)wParam, (int64_t)lParam, app_x, app_y);
-					} else {
-						PostMessage(fwd, message, wParam, MAKELPARAM(app_x, app_y));
+					// PostMessage: works for classic Win32 apps (test apps)
+					PostMessage(fwd, message, wParam, MAKELPARAM(app_x, app_y));
+
+					// For mouse buttons: also inject via SendInput so apps
+					// using Raw Input (RIDEV_INPUTSINK) see the event in
+					// their WM_INPUT stream. This is needed for Unity's New
+					// Input System which reads buttons from Raw Input, not
+					// from posted WM_LBUTTONDOWN messages.
+					// Mouse movement is NOT injected — RIDEV_INPUTSINK
+					// already delivers hardware mouse moves to all sinks.
+					if (is_button) {
+						DWORD flags = 0;
+						switch (message) {
+						case WM_LBUTTONDOWN: flags = MOUSEEVENTF_LEFTDOWN; break;
+						case WM_LBUTTONUP:   flags = MOUSEEVENTF_LEFTUP; break;
+						case WM_RBUTTONDOWN: flags = MOUSEEVENTF_RIGHTDOWN; break;
+						case WM_RBUTTONUP:   flags = MOUSEEVENTF_RIGHTUP; break;
+						case WM_MBUTTONDOWN: flags = MOUSEEVENTF_MIDDLEDOWN; break;
+						case WM_MBUTTONUP:   flags = MOUSEEVENTF_MIDDLEUP; break;
+						default: break;
+						}
+						if (flags != 0) {
+							INPUT inp = {};
+							inp.type = INPUT_MOUSE;
+							inp.mi.dwFlags = flags;
+							inp.mi.dwExtraInfo = SHELL_SENDINPUT_MARKER;
+							SendInput(1, &inp, sizeof(INPUT));
+						}
 					}
 				}
 			} else {
 				// No rect set — fallback to 1:1 forwarding
-				if (is_capture) {
-					int app_x = GET_X_LPARAM(lParam);
-					int app_y = GET_Y_LPARAM(lParam);
-					input_ring_push(w, message, (uint64_t)wParam, (int64_t)lParam, app_x, app_y);
-				} else {
-					PostMessage(fwd, message, wParam, lParam);
-				}
+				PostMessage(fwd, message, wParam, lParam);
 			}
 			return 0;
 		}
