@@ -1,7 +1,7 @@
 # Copyright 2026, Leia Inc.
 # SPDX-License-Identifier: BSL-1.0
 
-add_executable(displayxr-shell main.c)
+add_executable(displayxr-shell WIN32 main.c)
 add_sanitizers(displayxr-shell)
 
 target_include_directories(displayxr-shell PRIVATE ipc)

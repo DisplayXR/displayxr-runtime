@@ -741,6 +741,20 @@ cleanup_closed_captures(struct ipc_connection *ipc_c,
 }
 #endif // _WIN32
 
+#ifdef _WIN32
+// WIN32 subsystem entry point — no console window.
+// Delegates to main() with the command line split into argc/argv.
+int WINAPI
+WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow)
+{
+	(void)hInstance;
+	(void)hPrevInstance;
+	(void)lpCmdLine;
+	(void)nCmdShow;
+	return main(__argc, __argv);
+}
+#endif
+
 int
 main(int argc, char *argv[])
 {

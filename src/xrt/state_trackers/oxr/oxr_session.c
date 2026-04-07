@@ -2584,7 +2584,12 @@ oxr_session_create(struct oxr_logger *log,
 				SetWindowLongPtr(hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
 				SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, (int)disp_px_w, (int)disp_px_h,
 				             SWP_NOACTIVATE | SWP_FRAMECHANGED);
-				U_LOG_W("Shell session: resized app HWND %p to %ux%u borderless (display native)",
+				// Hide the app window — in shell mode, content is composited
+				// by the service. The window is unnecessary and distracting.
+				// Apps keep rendering via IPC swapchains (Unity uses
+				// Application.runInBackground = true in shell mode).
+				ShowWindow(hwnd, SW_HIDE);
+				U_LOG_W("Shell session: resized+hidden app HWND %p to %ux%u (display native)",
 				        hwnd, disp_px_w, disp_px_h);
 			}
 		}
