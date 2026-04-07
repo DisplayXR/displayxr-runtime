@@ -475,8 +475,12 @@ struct BlitConstants
 	float convert_srgb;      // 1.0 if source is SRGB, 0.0 otherwise; 2.0 = solid color mode
 	float quad_mode;         // > 0.5: use quad_corners instead of dst_offset + dst_rect_wh
 	float dst_rect_wh[2];   // destination quad width, height (0 = use src_rect.zw)
-	float corner_radius;    // top corner radius in pixels (0 = sharp corners)
-	float padding_unused;
+	float corner_radius;    // corner radius as fraction of quad height (0 = sharp)
+	float corner_aspect;    // width/height aspect ratio for circular corners.
+	                        // Sign encodes which corners: >0 = top both, <0 = see corner_radius sign.
+	                        // When corner_radius > 0 && corner_aspect > 0: top-left + top-right
+	                        // When corner_radius > 0 && corner_aspect < 0: top-right only
+	                        // When corner_radius < 0: bottom-left + bottom-right (abs values used)
 	// Perspective quad corners packed as two float4s (avoids HLSL array padding).
 	// TL = top-left, BL = bottom-left, TR = top-right, BR = bottom-right.
 	float quad_corners_01[4]; // [TL.x, TL.y, BL.x, BL.y]
@@ -499,8 +503,8 @@ cbuffer BlitCB : register(b0)
     float convert_srgb;    // 1.0 if source is SRGB; 2.0 = solid color mode
     float quad_mode;       // > 0.5: use quad_corners for perspective quad
     float2 dst_rect_wh;   // destination quad width, height (0 = use src_rect.zw)
-    float corner_radius;  // top corner radius in pixels (0 = sharp)
-    float padding_unused;
+    float corner_radius;  // corner radius fraction (0=sharp, >0=top, <0=bottom)
+    float corner_aspect;  // w/h aspect (>0=both top, <0=top-right only)
     float4 quad_corners_01; // TL.xy, BL.xy (packed as float4 to avoid HLSL array padding)
     float4 quad_corners_23; // TR.xy, BR.xy
     float4 quad_w;          // per-corner W for perspective-correct interpolation: TL, BL, TR, BR
@@ -579,8 +583,8 @@ cbuffer BlitCB : register(b0)
     float convert_srgb;
     float quad_mode;
     float2 dst_rect_wh;
-    float corner_radius;
-    float padding_unused;
+    float corner_radius;  // corner radius fraction (0=sharp, >0=top, <0=bottom)
+    float corner_aspect;  // w/h aspect (>0=both top, <0=top-right only)
     float4 quad_corners_01;
     float4 quad_corners_23;
     float4 quad_w;
@@ -608,23 +612,43 @@ float3 linear_to_srgb(float3 linear_color)
 
 float4 PSMain(VS_OUTPUT input) : SV_Target
 {
-    // Rounded top corners: discard pixels outside the corner radius.
-    // corner_radius = fraction of quad height for the Y radius.
-    // padding_unused = width/height aspect ratio, used to compute X radius
-    // so corners stay circular (not stretched on wide title bars).
-    if (corner_radius > 0) {
+    // Corner rounding via discard. Uses quad_uv (0-1, perspective-correct).
+    // corner_radius: fraction of height. >0 = top corners, <0 = bottom corners.
+    // corner_aspect: abs = w/h aspect ratio. sign selects corners:
+    //   corner_radius>0, corner_aspect>0: top-left + top-right
+    //   corner_radius>0, corner_aspect<0: top-right only
+    //   corner_radius<0, corner_aspect>0: bottom-left + bottom-right
+    //   corner_radius<0, corner_aspect<0: all four corners
+    if (corner_radius != 0) {
         float2 uv01 = input.quad_uv;
-        float ry = corner_radius;           // fraction of height
-        float aspect = (padding_unused > 0) ? padding_unused : 10.0;
-        float rx = ry / aspect;             // scale by h/w to keep circular
+        float ry = abs(corner_radius);
+        float aspect = abs(corner_aspect);
+        if (aspect < 0.001) aspect = 10.0;
+        float rx = ry / aspect;
+        bool do_top = (corner_radius > 0);
+        bool do_bottom = (corner_radius < 0 || corner_aspect < 0);
+        bool do_top_left = do_top && (corner_aspect > 0);
+        bool do_top_right = do_top;
+        bool do_bottom_left = (corner_radius < 0);
+        bool do_bottom_right = (corner_radius < 0);
         // Top-left
-        if (uv01.x < rx && uv01.y < ry) {
+        if (do_top_left && uv01.x < rx && uv01.y < ry) {
             float2 d = float2((rx - uv01.x) / rx, (ry - uv01.y) / ry);
             if (length(d) > 1.0) discard;
         }
         // Top-right
-        if (uv01.x > 1.0 - rx && uv01.y < ry) {
+        if (do_top_right && uv01.x > 1.0 - rx && uv01.y < ry) {
             float2 d = float2((uv01.x - (1.0 - rx)) / rx, (ry - uv01.y) / ry);
+            if (length(d) > 1.0) discard;
+        }
+        // Bottom-left
+        if (do_bottom_left && uv01.x < rx && uv01.y > 1.0 - ry) {
+            float2 d = float2((rx - uv01.x) / rx, (uv01.y - (1.0 - ry)) / ry);
+            if (length(d) > 1.0) discard;
+        }
+        // Bottom-right
+        if (do_bottom_right && uv01.x > 1.0 - rx && uv01.y > 1.0 - ry) {
+            float2 d = float2((uv01.x - (1.0 - rx)) / rx, (uv01.y - (1.0 - ry)) / ry);
             if (length(d) > 1.0) discard;
         }
     }

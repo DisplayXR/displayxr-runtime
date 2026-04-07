@@ -1178,7 +1178,7 @@ blit_to_atlas_texture(struct d3d11_service_system *sys,
 	cb->dst_rect_wh[0] = dst_w;
 	cb->dst_rect_wh[1] = dst_h;
 	cb->corner_radius = 0.0f;
-	cb->padding_unused = 0.0f;
+	cb->corner_aspect = 0.0f;
 
 	sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
 
@@ -3831,9 +3831,8 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 
 	// Create font atlas using DirectWrite (anti-aliased Segoe UI)
 	if (!mc->font_atlas) {
-		// Font size ~75% of destination GLYPH_H to avoid filling the title bar.
-		const uint32_t FONT_SIZE = 16;
-		const uint32_t CELL_H = FONT_SIZE + 6; // padding for descenders
+		const uint32_t FONT_SIZE = 33;
+		const uint32_t CELL_H = FONT_SIZE + 8; // padding for descenders
 		const uint32_t GLYPH_COUNT = 96;
 
 		// Measure glyph widths with DirectWrite
@@ -5890,8 +5889,9 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			cb->quad_mode = use_quad ? 1.0f : 0.0f;
 			cb->dst_rect_wh[0] = dest_px_w;
 			cb->dst_rect_wh[1] = dest_px_h;
-			cb->corner_radius = 0.0f;
-			cb->padding_unused = 0.0f;
+			// Round bottom-left + bottom-right corners of content window
+			cb->corner_radius = -0.03f;  // fraction of content height (subtle)
+			cb->corner_aspect = mc->clients[s].window_width_m / mc->clients[s].window_height_m;
 			if (use_quad) {
 				blit_set_quad_corners(cb, quad_corners, quad_w_vals);
 			} else {
@@ -6020,7 +6020,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 							cb->convert_srgb = 2.0f;
 							cb->corner_radius = 0.35f;
 							// Pass width/height aspect ratio for circular corners
-							cb->padding_unused = mc->clients[s].window_width_m / UI_TITLE_BAR_H_M;
+							cb->corner_aspect = mc->clients[s].window_width_m / UI_TITLE_BAR_H_M;
 							// Title bar: full width, above content (rounded top corners)
 							CHROME_BLIT_POS(cb,
 							    -win_hw, win_hh + tb_h_m, win_hw, win_hh,
@@ -6043,7 +6043,9 @@ multi_compositor_render(struct d3d11_service_system *sys)
 							cb->src_size[0] = 1; cb->src_size[1] = 1;
 							cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
 							cb->convert_srgb = 2.0f;
-							cb->corner_radius = 0; cb->padding_unused = 0;
+							// Round close button top-right corner only (negative aspect)
+							cb->corner_radius = 0.35f;
+							cb->corner_aspect = -(UI_BTN_W_M / UI_TITLE_BAR_H_M);
 							float btn_x = tox + tow - (float)CLOSE_BTN_WIDTH_PX;
 							CHROME_BLIT_POS(cb,
 							    win_hw - btn_w_m_val, win_hh + tb_h_m, win_hw, win_hh,
@@ -6066,7 +6068,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 							cb->src_size[0] = 1; cb->src_size[1] = 1;
 							cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
 							cb->convert_srgb = 2.0f;
-							cb->corner_radius = 0; cb->padding_unused = 0;
+							cb->corner_radius = 0; cb->corner_aspect = 0;
 							float min_x = tox + tow - 2.0f * (float)CLOSE_BTN_WIDTH_PX;
 							CHROME_BLIT_POS(cb,
 							    win_hw - 2*btn_w_m_val, win_hh + tb_h_m, win_hw - btn_w_m_val, win_hh,
@@ -6120,7 +6122,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 								cb->src_size[1] = (float)mc->font_atlas_h;
 								cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
 								cb->convert_srgb = 0.0f;
-								cb->corner_radius = 0; cb->padding_unused = 0;
+								cb->corner_radius = 0; cb->corner_aspect = 0;
 								// Proportional glyph positioning
 								float m_per_px = glyph_w_m / ((float)GLYPH_W > 0 ? (float)GLYPH_W : 1.0f);
 								float gl_left = -win_hw + glyph_w_m + px_cursor * m_per_px;
@@ -6162,7 +6164,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 								cb->src_size[1] = (float)mc->font_atlas_h;
 								cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
 								cb->convert_srgb = 0.0f;
-								cb->corner_radius = 0; cb->padding_unused = 0;
+								cb->corner_radius = 0; cb->corner_aspect = 0;
 								CHROME_BLIT_POS(cb,
 								    xg_left, xg_top, xg_left + glyph_w_m, xg_top - glyph_h_m,
 								    bx, toy + gpad, dst_gw, gh);
@@ -6189,7 +6191,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 								cb->src_size[1] = (float)mc->font_atlas_h;
 								cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
 								cb->convert_srgb = 0.0f;
-								cb->corner_radius = 0; cb->padding_unused = 0;
+								cb->corner_radius = 0; cb->corner_aspect = 0;
 								CHROME_BLIT_POS(cb,
 								    mg_left, mg_top, mg_left + glyph_w_m, mg_top - glyph_h_m,
 								    mx, toy + gpad, dst_gw, gh);
@@ -6276,12 +6278,18 @@ multi_compositor_render(struct d3d11_service_system *sys)
 					cb->src_size[0] = 1; cb->src_size[1] = 1;
 					cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
 					cb->convert_srgb = 2.0f;
-					// Round top corners of the top border edge (edge 0)
+					// Round border edges: top edge = top corners, bottom edge = bottom corners
+					float border_aspect = mc->clients[s].window_width_m / bw_m;
 					if (e == 0 && fb_tb_h > 0) {
+						// Top edge: round top-left + top-right
 						cb->corner_radius = 0.35f;
-						cb->padding_unused = mc->clients[s].window_width_m / bw_m;
+						cb->corner_aspect = border_aspect;
+					} else if (e == 1) {
+						// Bottom edge: round bottom-left + bottom-right
+						cb->corner_radius = -0.35f;
+						cb->corner_aspect = border_aspect;
 					} else {
-						cb->corner_radius = 0; cb->padding_unused = 0;
+						cb->corner_radius = 0; cb->corner_aspect = 0;
 					}
 					if (fb_rotated) {
 						float corners[8], cw[4];
@@ -6383,7 +6391,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 					cb->quad_mode = 0;
 					cb->dst_rect_wh[0] = (float)half_w;
 					cb->dst_rect_wh[1] = (float)TASKBAR_HEIGHT_PX;
-					cb->corner_radius = 0; cb->padding_unused = 0;
+					cb->corner_radius = 0; cb->corner_aspect = 0;
 					sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
 					sys->context->Draw(4, 0);
 				}
@@ -6425,7 +6433,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 								cb2->quad_mode = 0;
 								cb2->dst_rect_wh[0] = pill_w;
 								cb2->dst_rect_wh[1] = pill_h;
-								cb2->corner_radius = 0; cb2->padding_unused = 0;
+								cb2->corner_radius = 0; cb2->corner_aspect = 0;
 								sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
 								sys->context->Draw(4, 0);
 							}
@@ -6463,7 +6471,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 								cb3->quad_mode = 0;
 								cb3->dst_rect_wh[0] = dst_gw;
 								cb3->dst_rect_wh[1] = tgh;
-								cb3->corner_radius = 0; cb3->padding_unused = 0;
+								cb3->corner_radius = 0; cb3->corner_aspect = 0;
 								sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
 								sys->context->Draw(4, 0);
 							}
