@@ -8661,6 +8661,32 @@ comp_d3d11_service_ensure_shell_window(struct xrt_system_compositor *xsysc)
 	}
 
 	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+
+	// If a previous shell session was dismissed (ESC), tear down its window
+	// and resources so ensure_output creates a fresh one.
+	if (sys->multi_comp != nullptr && sys->multi_comp->window_dismissed) {
+		struct d3d11_multi_compositor *mc = sys->multi_comp;
+		U_LOG_W("Shell: resetting dismissed state from previous session");
+
+		// Tear down window and GPU resources (same order as multi_compositor_destroy)
+		if (mc->display_processor != nullptr) {
+			xrt_display_processor_d3d11_destroy(&mc->display_processor);
+		}
+		mc->back_buffer_rtv.reset();
+		mc->combined_atlas_rtv.reset();
+		mc->combined_atlas_srv.reset();
+		mc->combined_atlas.reset();
+		mc->swap_chain.reset();
+		if (mc->window != nullptr) {
+			comp_d3d11_window_destroy(&mc->window);
+		}
+		mc->hwnd = nullptr;
+
+		// Reset dismiss state
+		mc->window_dismissed = false;
+		mc->dismiss_cleanup_done = false;
+	}
+
 	xrt_result_t ret = multi_compositor_ensure_output(sys);
 	if (ret != XRT_SUCCESS || sys->multi_comp == nullptr) {
 		U_LOG_E("Shell: failed to create shell window (ret=%d)", (int)ret);

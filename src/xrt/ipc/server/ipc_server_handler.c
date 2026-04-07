@@ -1951,7 +1951,13 @@ ipc_handle_shell_activate(volatile struct ipc_client_state *_ics)
 	struct ipc_server *s = _ics->server;
 
 	if (s->shell_mode) {
-		IPC_INFO(s, "Shell: already in shell mode");
+		IPC_INFO(s, "Shell: already in shell mode — ensuring window for relaunch");
+		// Re-ensure the shell window even when already in shell mode.
+		// If the previous session was dismissed (ESC), ensure_shell_window
+		// tears down the stale resources and creates a fresh window.
+		if (s->xsysc != NULL) {
+			comp_d3d11_service_ensure_shell_window(s->xsysc);
+		}
 		return XRT_SUCCESS;
 	}
 
