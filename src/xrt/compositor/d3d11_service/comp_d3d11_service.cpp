@@ -5125,6 +5125,9 @@ multi_compositor_render(struct d3d11_service_system *sys)
 				mc->resize.start_pos_y = mc->clients[hit.slot].window_pose.position.y;
 				mc->resize.start_width_m = mc->clients[hit.slot].window_width_m;
 				mc->resize.start_height_m = mc->clients[hit.slot].window_height_m;
+				// Suppress input forwarding during resize
+				if (mc->window != nullptr)
+					comp_d3d11_window_set_input_suppress(mc->window, true);
 				if (hit.slot != mc->focused_slot) {
 					mc->focused_slot = hit.slot;
 				}
@@ -5196,6 +5199,9 @@ multi_compositor_render(struct d3d11_service_system *sys)
 
 					mc->title_drag.active = true;
 					mc->title_drag.slot = hit_slot;
+					// Suppress input forwarding during drag
+					if (mc->window != nullptr)
+						comp_d3d11_window_set_input_suppress(mc->window, true);
 					GetCursorPos(&mc->title_drag.start_cursor);
 					ScreenToClient(mc->hwnd, &mc->title_drag.start_cursor);
 					mc->title_drag.start_pos_x = mc->clients[hit_slot].window_pose.position.x;
@@ -5342,6 +5348,9 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			mc->resize.active = false;
 			mc->resize.slot = -1;
 			mc->resize.edges = RESIZE_NONE;
+			// Resume input forwarding after resize
+			if (mc->window != nullptr)
+				comp_d3d11_window_set_input_suppress(mc->window, false);
 			// Nudge cursor to force WM_SETCURSOR update
 			{ POINT p; GetCursorPos(&p); SetCursorPos(p.x, p.y); }
 			// Restore mouse forwarding after resize
@@ -5379,9 +5388,12 @@ multi_compositor_render(struct d3d11_service_system *sys)
 				}
 			}
 		} else if (!lmb_held && mc->title_drag.active) {
-			// LMB released — end title drag. Nudge cursor to force WM_SETCURSOR update.
+			// LMB released — end title drag.
 			mc->title_drag.active = false;
 			mc->title_drag.slot = -1;
+			// Resume input forwarding after drag
+			if (mc->window != nullptr)
+				comp_d3d11_window_set_input_suppress(mc->window, false);
 			{
 				POINT p;
 				GetCursorPos(&p);

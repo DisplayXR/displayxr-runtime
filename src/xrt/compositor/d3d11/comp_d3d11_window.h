@@ -211,6 +211,13 @@ comp_d3d11_window_set_input_forward(struct comp_d3d11_window *window,
                                      bool is_capture);
 
 /*!
+ * Suppress or resume input forwarding (for shell drag/resize operations).
+ * When suppressed, the WndProc does not forward mouse events to the app.
+ */
+void
+comp_d3d11_window_set_input_suppress(struct comp_d3d11_window *window, bool suppress);
+
+/*!
  * Read and reset accumulated scroll wheel delta (for shell window resize).
  *
  * @param window The window object
