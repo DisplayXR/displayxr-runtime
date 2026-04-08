@@ -406,8 +406,22 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		break;
 
 	case WM_KEYDOWN:
-		// F11 is handled in the multi-compositor render loop (focused app fullscreen).
-		// It's not processed here in the WndProc.
+		// F11: toggle fullscreen for non-shell (single app) windows.
+		// In shell mode, F11 is handled in the multi-compositor render loop instead.
+		if (wParam == VK_F11) {
+			HWND fwd_check = (HWND)InterlockedCompareExchangePointer(
+			    (volatile PVOID *)&w->input_forward_hwnd, NULL, NULL);
+			if (fwd_check == NULL) {
+				// Non-shell mode: toggle fullscreen directly
+				LONG fs = InterlockedCompareExchange(&w->is_fullscreen, 0, 0);
+				fs = !fs;
+				InterlockedExchange(&w->is_fullscreen, fs);
+				set_fullscreen(hWnd, fs != 0);
+				U_LOG_W("D3D11 window: F11 toggled to %s mode", fs ? "fullscreen" : "windowed");
+				return 0;
+			}
+			// Shell mode: fall through to forwarding (handled server-side)
+		}
 		// FALLTHROUGH to WM_KEYUP/SYSKEYDOWN/SYSKEYUP/CHAR
 	case WM_KEYUP:
 	case WM_SYSKEYDOWN:
