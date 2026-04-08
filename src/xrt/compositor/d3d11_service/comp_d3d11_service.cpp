@@ -7129,11 +7129,39 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			float dst_w = needs_scale ? tile_w : 0.0f;
 			float dst_h = needs_scale ? tile_h : 0.0f;
 
-			{
-				// Copy view texture to atlas tile position.
-				// CopySubresourceRegion works for both SRGB and non-SRGB formats —
-				// it preserves the format metadata (no gamma conversion needed at copy time).
-				// D3D11 silently clips to destination bounds — no manual clamping needed.
+			if (view_is_srgb[eye] && !sys->shell_mode && sys->blit_vs &&
+			    view_scs[eye]->images[view_img_indices[eye]].srv) {
+				// Non-shell SRGB: shader blit with SRGB SRV for linearization.
+				// The GPU auto-linearizes when sampling through an SRGB SRV.
+				// The DP expects linear input — without this, colors are washed out.
+				wil::com_ptr<ID3D11ShaderResourceView> srgb_srv;
+				D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+				srv_desc.Format = get_srgb_format(view_descs[eye].Format);
+				srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+				srv_desc.Texture2D.MipLevels = 1;
+				srv_desc.Texture2D.MostDetailedMip = 0;
+				HRESULT blit_hr = sys->device->CreateShaderResourceView(
+				    view_textures[eye], &srv_desc, srgb_srv.put());
+				if (SUCCEEDED(blit_hr)) {
+					blit_to_atlas_texture(sys, &c->render, srgb_srv.get(),
+					    src_x, src_y, src_w, src_h,
+					    (float)view_descs[eye].Width, (float)view_descs[eye].Height,
+					    (float)tile_x, (float)tile_y,
+					    dst_w, dst_h, true);
+				} else {
+					// Fallback to raw copy
+					D3D11_BOX box = {};
+					box.left = (UINT)src_x; box.top = (UINT)src_y;
+					box.right = (UINT)(src_x + src_w); box.bottom = (UINT)(src_y + src_h);
+					box.front = 0; box.back = 1;
+					sys->context->CopySubresourceRegion(c->render.atlas_texture.get(), 0,
+					    tile_x, tile_y, 0, view_textures[eye],
+					    layer->data.proj.v[eye].sub.array_index, &box);
+				}
+			} else {
+				// Non-SRGB or shell mode: raw byte copy.
+				// Shell mode: multi-compositor handles color space.
+				// Non-SRGB: no conversion needed.
 				D3D11_BOX box = {};
 				box.left = static_cast<UINT>(src_x);
 				box.top = static_cast<UINT>(src_y);
