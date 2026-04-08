@@ -9,7 +9,7 @@ DisplayXR supports four ways for an application to integrate with the runtime, d
 | **Handle** | `_handle` | App provides its own window handle via `XR_EXT_*_window_binding` | Native compositor directly in-process |
 | **Texture** | `_texture` | App provides textures, runtime composites into its own window | Native compositor directly in-process |
 | **Hosted** | `_hosted` | Runtime creates window and rendering targets (standard OpenXR/WebXR) | Native compositor directly in-process |
-| **IPC/Service** | `_ipc` | App runs out-of-process via client compositor → IPC → server multi-compositor | Client compositor → IPC → multi-compositor → native compositor in server |
+| **IPC/Service** | _(internal)_ | Out-of-process via client compositor → IPC → server multi-compositor. Used internally by the shell and WebXR — apps don't need to target this directly. | Client compositor → IPC → multi-compositor → native compositor in server |
 
 ## Which Class Should I Use?
 
@@ -19,7 +19,7 @@ DisplayXR supports four ways for an application to integrate with the runtime, d
 
 - **Building a standard OpenXR app?** Use **Hosted**. The runtime creates everything — window, swapchains, rendering targets. This is the standard OpenXR path and the simplest integration. Also the path for WebXR content.
 
-- **Building a multi-app environment?** Use **IPC/Service**. The app runs out-of-process, communicating with a server that manages multiple apps. Foundation for the spatial shell.
+- **Multi-app / shell / WebXR?** The **IPC/Service** path is used internally by the [DisplayXR Shell](https://github.com/DisplayXR/displayxr-shell-releases) and WebXR browsers. Apps don't need to target IPC directly — the shell launches standard handle apps and manages multi-app compositing transparently.
 
 ## Code Paths
 
@@ -45,7 +45,6 @@ Test apps follow the pattern `cube_{class}_{api}_{platform}`:
 | `cube_texture_d3d11_win` | Texture | D3D11 | Windows |
 | `cube_hosted_metal_macos` | Hosted | Metal | macOS |
 | `cube_hosted_d3d11_win` | Hosted | D3D11 | Windows |
-| `cube_ipc_d3d11_win` | IPC | D3D11 | Windows |
 
 ## Further Reading
 

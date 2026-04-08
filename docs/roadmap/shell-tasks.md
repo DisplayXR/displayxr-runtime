@@ -81,7 +81,7 @@ Multi compositor window is always full-screen = physical display size:
 
 **Goal:** Two IPC apps rendered as textured quads in a single output window. Hardcoded layout, no shell app.
 
-**Test:** `displayxr-service` + 2× `cube_ipc_d3d11_win` → both cubes visible as quads in one window.
+**Test:** `displayxr-service` + 2× `cube_handle_d3d11_win` (via shell) → both cubes visible as quads in one window.
 
 | | Task | Size | Repo | Description |
 |---|------|------|------|-------------|
@@ -89,7 +89,7 @@ Multi compositor window is always full-screen = physical display size:
 | [ ] | 0.2 D3D11 multi compositor | L | runtime | New composition pass: imports shared textures from N clients, renders each as a textured quad with Level 2 Kooima projection (eye → physical display corners), sends combined L/R to display processor. |
 | [ ] | 0.3 Plumb into service startup | M | runtime | Wire multi compositor into `d3d11_service_system`. Per-client compositors become texture exporters. Multi compositor owns the single output window + weaver. |
 | [ ] | 0.4 Hardcoded two-window layout | S | runtime | Place window 0 at `(x=-0.05, y=0, z=0)` and window 1 at `(x=+0.05, y=0, z=0)`. Verifies end-to-end pipeline. |
-| [ ] | 0.5 Two-app test | S | runtime | Start service, launch two `cube_ipc_d3d11_win` instances, verify both cubes visible. |
+| [ ] | 0.5 Two-app test | S | runtime | Start service, launch two `cube_handle_d3d11_win` instances via shell, verify both cubes visible. |
 
 **Dependencies:** 0.1 → 0.2 → 0.3 → 0.4 → 0.5
 
@@ -147,7 +147,7 @@ Multi compositor window is always full-screen = physical display size:
 
 **Goal:** Launch OpenXR apps from within the shell.
 
-**Test:** Launch `cube_ipc_d3d11_win` from launcher panel, switch via taskbar.
+**Test:** Launch `cube_handle_d3d11_win` from launcher panel, switch via taskbar.
 
 | | Task | Size | Repo | Description |
 |---|------|------|------|-------------|

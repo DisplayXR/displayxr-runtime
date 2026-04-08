@@ -40,7 +40,7 @@ The key insight: **develop with handle apps first** (they already work), then ad
 | 0A.4 | Multi comp render: clear combined atlas → render client quads (Level 2 Kooima via `display3d_compute_projection`) → call DP → present. |
 | 0A.5 | Window lifecycle: deferred to first client, ESC dismisses (2D + stays closed), re-opens on new client. |
 
-**Test:** `displayxr-service --shell` + `set XRT_FORCE_MODE=ipc && cube_ipc_d3d11_win` → cube visible in multi-comp window. Without `--shell`, same app works as before (per-client window).
+**Test:** `displayxr-shell.exe cube_handle_d3d11_win.exe` → cube visible in multi-comp window. Without shell, same app works as before (per-client window).
 
 **Key difference from v1:** `--shell` flag instead of `XRT_MULTI_APP=1` default. WebXR never affected.
 
