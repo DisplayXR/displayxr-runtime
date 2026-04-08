@@ -54,8 +54,4 @@ if(WIN32)
 		add_subdirectory(switcher)
 	endif()
 
-	# DisplayXR spatial shell (management client)
-	if(XRT_FEATURE_SERVICE)
-		add_subdirectory(shell)
-	endif()
 endif()
