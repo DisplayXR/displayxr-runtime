@@ -152,6 +152,10 @@ struct comp_d3d11_window
 	//! Written by WndProc, read+reset by render loop.
 	volatile LONG scroll_accum;
 
+	//! When true, mouse input forwarding is suppressed (shell drag/resize active).
+	//! Set by compositor thread, read by WndProc thread.
+	volatile LONG input_suppress;
+
 	//! True when a mouse button press originated inside the app content rect.
 	//! Used to prevent title bar clicks from being forwarded as app drags.
 	//! Set on button-down inside rect, cleared on button-up.
@@ -496,6 +500,11 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	case WM_MBUTTONUP:
 	case WM_MOUSEMOVE:
 	case WM_MOUSEWHEEL: {
+		// Skip forwarding when shell drag/resize is active
+		if (InterlockedCompareExchange(&w->input_suppress, 0, 0)) {
+			break; // fall through to qwerty/default handling
+		}
+
 		// Skip re-forwarding of SendInput-injected mouse events (prevents
 		// WndProc→SendInput→WM_LBUTTONDOWN→WndProc infinite loop).
 		if (GetMessageExtraInfo() == (LPARAM)SHELL_SENDINPUT_MARKER) {
@@ -1087,6 +1096,13 @@ comp_d3d11_window_set_input_forward(struct comp_d3d11_window *window,
 	} else {
 		U_LOG_W("D3D11 window: input forwarding disabled");
 	}
+}
+
+extern "C" void
+comp_d3d11_window_set_input_suppress(struct comp_d3d11_window *window, bool suppress)
+{
+	if (window == NULL) return;
+	InterlockedExchange(&window->input_suppress, suppress ? 1 : 0);
 }
 
 extern "C" int32_t
