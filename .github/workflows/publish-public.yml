@@ -69,6 +69,9 @@ jobs:
             NOTES="Initial release"
           fi
 
+          # Delete existing release if re-running
+          gh release delete "${{ github.ref_name }}" --repo DisplayXR/displayxr-runtime --yes 2>/dev/null || true
+
           gh release create "${{ github.ref_name }}" \
             --repo DisplayXR/displayxr-runtime \
             --title "DisplayXR Runtime ${{ github.ref_name }}" \
@@ -165,6 +168,9 @@ jobs:
             echo "::error::No assets found to publish"
             exit 1
           fi
+
+          # Delete existing release if re-running
+          gh release delete "${{ github.ref_name }}" --repo DisplayXR/displayxr-shell-releases --yes 2>/dev/null || true
 
           gh release create "${{ github.ref_name }}" \
             --repo DisplayXR/displayxr-shell-releases \
