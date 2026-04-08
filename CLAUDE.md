@@ -95,7 +95,7 @@ Downloads all dependencies on first run (SR SDK, vcpkg, OpenXR loader). Requires
 ```bash
 /ci-monitor "your commit message"
 ```
-Commits, pushes, monitors GitHub Actions (Windows + macOS), auto-fixes common build errors. Use when not on a local dev machine or for final validation before merge.
+Commits, pushes, monitors GitHub Actions (Windows + macOS), auto-fixes common build errors. Use for feature branch (`**-ci`) validation when remote CI is needed before merge. **Not needed for every push** — prefer local builds for daily development.
 
 ### Standard CMake Build
 ```bash
@@ -122,10 +122,15 @@ scripts/format-project.sh   # Format all
 
 On tagged releases (`v*`), the `publish-public.yml` workflow automatically:
 1. Pushes runtime code (with shell stripped) to `DisplayXR/displayxr-runtime` (public)
-2. Publishes shell binary to `DisplayXR/displayxr-shell-releases`
+2. Publishes combined installer + shell binary to `DisplayXR/displayxr-shell-releases`
+3. Creates GitHub Releases on both public repos
 
 ```bash
-# To publish a release:
+# Preferred: use the /release skill (handles version bump, tagging, monitoring, verification)
+/release v1.0.0          # explicit version
+/release patch           # auto-bump patch
+
+# Manual alternative:
 git tag v1.x.x
 git push origin v1.x.x    # triggers CI + auto-publish to public repos
 ```
@@ -236,8 +241,18 @@ XR_RUNTIME_JSON=./build/openxr_displayxr-dev.json ./your_openxr_app
 
 ## Claude Code Skills
 
-### /ci-monitor - Automated Build Workflow
+### /release - Tagged Release Pipeline
+Creates a tagged release, monitors CI build and publish pipeline, verifies all public repos are updated. See `.claude/skills/release/SKILL.md`.
+```
+/release v1.0.0    # explicit version
+/release patch     # auto-bump: v1.0.0 → v1.0.1
+/release minor     # auto-bump: v1.0.0 → v1.1.0
+```
+Updates `CMakeLists.txt` version, creates tag, monitors `build-windows.yml` + `publish-public.yml`, verifies releases on `displayxr-runtime` and `displayxr-shell-releases`. Rolls back tag on build failure.
+
+### /ci-monitor - Feature Branch CI Validation
 Automates commit, push, GitHub Actions monitoring, auto-fix. See `.claude/skills/ci-monitor/SKILL.md`.
+Use for feature branch (`**-ci`) validation. **Not for releases** — use `/release` instead.
 **Important:** Always include the related GitHub issue number in commit messages — e.g., `Fix linker error (#93)`. Check conversation context and recent commits to determine the issue number.
 
 ### /ask-gemini - Code Analysis with Gemini
