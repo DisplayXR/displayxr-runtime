@@ -48,7 +48,7 @@ See `docs/getting-started/app-classes.md` for the full reference (handle, textur
 - `_handle` / `_texture` / `_hosted` → `compositor/{d3d11,d3d12,metal,gl,vk_native}/` (in-process)
 - `_ipc` → `compositor/client/` → `ipc/` → `compositor/multi/` → native compositor (out-of-process)
 
-Test app naming: `cube_{class}_{api}_{platform}` — e.g. `cube_handle_metal_macos`, `cube_texture_d3d11_win`, `cube_ipc_d3d11_win`.
+Test app naming: `cube_{class}_{api}_{platform}` — e.g. `cube_handle_metal_macos`, `cube_texture_d3d11_win`, `cube_hosted_d3d11_win`.
 
 ### Extension Apps vs Legacy Apps
 

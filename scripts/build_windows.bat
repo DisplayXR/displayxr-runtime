@@ -233,14 +233,6 @@ if exist "%REPO%test_apps\cube_handle_vk_win\CMakeLists.txt" (
     if defined LOADER_DLL copy /Y "%LOADER_DLL%" "%REPO%test_apps\cube_handle_vk_win\build\" >nul
 )
 
-:: cube_ipc_d3d11_win
-if exist "%REPO%test_apps\cube_ipc_d3d11_win\CMakeLists.txt" (
-    echo --- cube_ipc_d3d11_win ---
-    cmake -S "%REPO%\test_apps\cube_ipc_d3d11_win" -B "%REPO%\test_apps\cube_ipc_d3d11_win\build" -G Ninja ^
-        -DCMAKE_BUILD_TYPE=Release -DOpenXR_ROOT="%OPENXR_SDK_SHORT%"
-    cmake --build "%REPO%\test_apps\cube_ipc_d3d11_win\build"
-    if defined LOADER_DLL copy /Y "%LOADER_DLL%" "%REPO%test_apps\cube_ipc_d3d11_win\build\" >nul
-)
 
 :: ============================================================
 :: 7. Generate run scripts (like macOS run_*.sh pattern)
