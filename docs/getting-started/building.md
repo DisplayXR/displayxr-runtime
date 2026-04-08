@@ -6,7 +6,7 @@
 - Visual Studio 2022
 - CMake
 - Ninja
-- Vendor SDK (e.g., [Leia SR SDK](https://www.leiainc.com/)) — optional, sim_display works without it
+- Vendor display SDK — optional (see [Vendor SDK](#vendor-sdk) below). The **sim_display** driver works without any vendor SDK, providing a simulated 3D display with WASD + mouse eye control.
 
 ### macOS
 ```bash
@@ -39,6 +39,21 @@ mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Debug -G Ninja
 cmake --build .
 ```
+
+## Vendor SDK
+
+DisplayXR builds and runs without any vendor SDK — the **sim_display** driver simulates a tracked 3D display for development. To enable support for a specific display, obtain the SDK from the vendor and point CMake at it.
+
+### Leia SR Displays
+
+1. Get the Leia SR SDK from [Leia Inc](https://www.leiainc.com/) (requires a developer account)
+2. Set the environment variable before building:
+   ```bash
+   set LEIASR_SDKROOT=C:\path\to\LeiaSR-SDK
+   ```
+3. CMake will auto-detect the SDK via `find_package(simulatedreality)` and enable `XRT_HAVE_LEIA_SR`
+
+The SDK provides display-specific weavers (D3D11, D3D12, Vulkan) and eye tracking via LookaroundFilter. See the [Vendor Integration Guide](../guides/vendor-integration.md) for details on integrating other display hardware.
 
 ## Key CMake Options
 
