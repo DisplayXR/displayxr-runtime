@@ -48,7 +48,7 @@ build*/
 cmake-build-*/
 
 # Ignore Claude Code local files (keep skills shared)
-.claude/
+.claude/*
 !.claude/skills/
 
 # Ignore local settings
