@@ -244,6 +244,170 @@ shell_config_update(struct shell_config *cfg, const char *app_name,
 	sw->width_m = w; sw->height_m = h;
 }
 
+// --- 4C.9: Registered apps config ---
+
+#define MAX_REGISTERED_APPS 32
+
+struct registered_app
+{
+	char name[128];
+	char exe_path[MAX_PATH];
+	char type[8]; // "3d", "2d", or "" (unknown)
+};
+
+static struct registered_app g_registered_apps[MAX_REGISTERED_APPS];
+static int g_registered_app_count = 0;
+
+static void
+get_registered_apps_path(char *buf, size_t buf_size)
+{
+#ifdef _WIN32
+	const char *appdata = getenv("LOCALAPPDATA");
+	if (appdata) {
+		snprintf(buf, buf_size, "%s\\DisplayXR\\registered_apps.json", appdata);
+	} else {
+		snprintf(buf, buf_size, "registered_apps.json");
+	}
+#else
+	const char *home = getenv("HOME");
+	if (home) {
+		snprintf(buf, buf_size, "%s/.displayxr/registered_apps.json", home);
+	} else {
+		snprintf(buf, buf_size, "registered_apps.json");
+	}
+#endif
+}
+
+static void
+registered_apps_load(void)
+{
+	g_registered_app_count = 0;
+
+	char path[512];
+	get_registered_apps_path(path, sizeof(path));
+
+	FILE *f = fopen(path, "rb");
+	if (!f) {
+		// First run: create default config
+		P("No registered_apps.json found — creating defaults.\n");
+#ifdef _WIN32
+		{
+			char dir[512];
+			snprintf(dir, sizeof(dir), "%s", path);
+			char *last = strrchr(dir, '\\');
+			if (last) { *last = '\0'; CreateDirectoryA(dir, NULL); }
+		}
+#endif
+		// Add demo entries
+		snprintf(g_registered_apps[0].name, sizeof(g_registered_apps[0].name), "cube_handle_d3d11_win");
+		snprintf(g_registered_apps[0].exe_path, sizeof(g_registered_apps[0].exe_path),
+		         "test_apps\\cube_handle_d3d11_win\\build\\cube_handle_d3d11_win.exe");
+		snprintf(g_registered_apps[0].type, sizeof(g_registered_apps[0].type), "3d");
+
+		snprintf(g_registered_apps[1].name, sizeof(g_registered_apps[1].name), "Notepad");
+		snprintf(g_registered_apps[1].exe_path, sizeof(g_registered_apps[1].exe_path), "notepad.exe");
+		snprintf(g_registered_apps[1].type, sizeof(g_registered_apps[1].type), "2d");
+
+		g_registered_app_count = 2;
+		// Save to disk
+		goto save_and_return;
+	}
+
+	{
+		fseek(f, 0, SEEK_END);
+		long len = ftell(f);
+		fseek(f, 0, SEEK_SET);
+		if (len <= 0 || len > 64 * 1024) { fclose(f); return; }
+
+		char *data = (char *)malloc(len + 1);
+		fread(data, 1, len, f);
+		data[len] = '\0';
+		fclose(f);
+
+		cJSON *root = cJSON_Parse(data);
+		free(data);
+		if (!root || !cJSON_IsArray(root)) {
+			cJSON_Delete(root);
+			return;
+		}
+
+		cJSON *entry = NULL;
+		cJSON_ArrayForEach(entry, root)
+		{
+			if (g_registered_app_count >= MAX_REGISTERED_APPS) break;
+			struct registered_app *app = &g_registered_apps[g_registered_app_count];
+
+			cJSON *jname = cJSON_GetObjectItemCaseSensitive(entry, "name");
+			cJSON *jpath = cJSON_GetObjectItemCaseSensitive(entry, "exe_path");
+			cJSON *jtype = cJSON_GetObjectItemCaseSensitive(entry, "type");
+
+			if (cJSON_IsString(jname))
+				snprintf(app->name, sizeof(app->name), "%s", jname->valuestring);
+			if (cJSON_IsString(jpath))
+				snprintf(app->exe_path, sizeof(app->exe_path), "%s", jpath->valuestring);
+			if (cJSON_IsString(jtype))
+				snprintf(app->type, sizeof(app->type), "%s", jtype->valuestring);
+
+			g_registered_app_count++;
+		}
+		cJSON_Delete(root);
+	}
+
+	P("Loaded %d registered app(s).\n", g_registered_app_count);
+	return;
+
+save_and_return:
+	; // fallthrough to save
+	{
+		char spath[512];
+		get_registered_apps_path(spath, sizeof(spath));
+
+		cJSON *arr = cJSON_CreateArray();
+		for (int i = 0; i < g_registered_app_count; i++) {
+			cJSON *obj = cJSON_CreateObject();
+			cJSON_AddStringToObject(obj, "name", g_registered_apps[i].name);
+			cJSON_AddStringToObject(obj, "exe_path", g_registered_apps[i].exe_path);
+			cJSON_AddStringToObject(obj, "type", g_registered_apps[i].type);
+			cJSON_AddItemToArray(arr, obj);
+		}
+		char *json_str = cJSON_Print(arr);
+		cJSON_Delete(arr);
+
+		FILE *sf = fopen(spath, "wb");
+		if (sf) {
+			fwrite(json_str, 1, strlen(json_str), sf);
+			fclose(sf);
+			P("Created default registered_apps.json with %d entries.\n", g_registered_app_count);
+		}
+		free(json_str);
+	}
+}
+
+static void
+registered_apps_save(void)
+{
+	char path[512];
+	get_registered_apps_path(path, sizeof(path));
+
+	cJSON *arr = cJSON_CreateArray();
+	for (int i = 0; i < g_registered_app_count; i++) {
+		cJSON *obj = cJSON_CreateObject();
+		cJSON_AddStringToObject(obj, "name", g_registered_apps[i].name);
+		cJSON_AddStringToObject(obj, "exe_path", g_registered_apps[i].exe_path);
+		cJSON_AddStringToObject(obj, "type", g_registered_apps[i].type);
+		cJSON_AddItemToArray(arr, obj);
+	}
+	char *json_str = cJSON_Print(arr);
+	cJSON_Delete(arr);
+
+	FILE *f = fopen(path, "wb");
+	if (f) {
+		fwrite(json_str, 1, strlen(json_str), f);
+		fclose(f);
+	}
+	free(json_str);
+}
+
 #ifdef _WIN32
 /*!
  * Get the directory containing the shell executable.
@@ -754,6 +918,165 @@ cleanup_closed_captures(struct ipc_connection *ipc_c,
 	}
 }
 
+// --- 4C.10+4C.11: App launch from shell + auto-detect type ---
+
+/*!
+ * Launch a registered app from the shell.
+ * For "3d" type: uses launch_app() with DISPLAYXR_SHELL_SESSION env.
+ * For "2d" type: launches without shell env, then captures via IPC.
+ * For unknown type: launches as 3d, polls for IPC connect to auto-detect.
+ */
+static void
+shell_launch_registered_app(struct ipc_connection *ipc_c,
+                            struct registered_app *rapp,
+                            const char *runtime_json,
+                            struct app_entry *apps, int *app_count,
+                            struct capture_entry *captures, int *capture_count)
+{
+	P("Launching: '%s' (%s) — %s\n", rapp->name, rapp->exe_path, rapp->type);
+
+	if (strcmp(rapp->type, "2d") == 0) {
+		// 2D app: launch without shell env, then poll for HWND and capture
+		STARTUPINFOA si = {0};
+		si.cb = sizeof(si);
+		PROCESS_INFORMATION pi = {0};
+
+		char abs_path[MAX_PATH];
+		char cmd[MAX_PATH + 16];
+		if (_fullpath(abs_path, rapp->exe_path, MAX_PATH) == NULL) {
+			snprintf(abs_path, MAX_PATH, "%s", rapp->exe_path);
+		}
+		snprintf(cmd, sizeof(cmd), "\"%s\"", abs_path);
+
+		// Clear shell env vars so 2D app doesn't accidentally pick them up
+		SetEnvironmentVariableA("DISPLAYXR_SHELL_SESSION", NULL);
+
+		BOOL ok = CreateProcessA(NULL, cmd, NULL, NULL, FALSE,
+		    CREATE_NEW_CONSOLE, NULL, NULL, &si, &pi);
+		if (!ok) {
+			PE("  Failed to launch 2D app: %lu\n", GetLastError());
+			return;
+		}
+		P("  Launched 2D app PID=%lu, waiting for HWND...\n", pi.dwProcessId);
+		CloseHandle(pi.hThread);
+
+		// Poll for HWND owned by this PID (up to 5 seconds)
+		HWND found_hwnd = NULL;
+		for (int poll = 0; poll < 10 && found_hwnd == NULL; poll++) {
+			Sleep(500);
+			struct enum_ctx ectx = {0};
+			ectx.shell_pid = GetCurrentProcessId();
+			ectx.service_pid = 0;
+			EnumWindows(enum_windows_cb, (LPARAM)&ectx);
+			for (int w = 0; w < ectx.count; w++) {
+				DWORD wnd_pid = 0;
+				GetWindowThreadProcessId(ectx.found[w], &wnd_pid);
+				if (wnd_pid == pi.dwProcessId) {
+					found_hwnd = ectx.found[w];
+					break;
+				}
+			}
+		}
+
+		if (found_hwnd != NULL && *capture_count < MAX_CAPTURES) {
+			struct capture_entry *ce = &captures[*capture_count];
+			memset(ce, 0, sizeof(*ce));
+			ce->hwnd = (uint64_t)(uintptr_t)found_hwnd;
+			GetWindowTextA(found_hwnd, ce->name, sizeof(ce->name));
+
+			uint32_t cid = 0;
+			xrt_result_t r = ipc_call_shell_add_capture_client(ipc_c, ce->hwnd, &cid);
+			if (r == XRT_SUCCESS) {
+				ce->client_id = cid;
+				ce->added = true;
+				(*capture_count)++;
+				P("  Captured 2D window HWND=%p '%s' → client_id=%u\n",
+				  (void *)found_hwnd, ce->name, cid);
+			}
+		} else if (found_hwnd == NULL) {
+			PE("  2D app: no visible HWND found after 5s\n");
+		}
+		CloseHandle(pi.hProcess);
+		return;
+	}
+
+	// "3d" or unknown type: launch as shell app
+	if (*app_count >= MAX_APPS) {
+		PE("  Max apps (%d) reached\n", MAX_APPS);
+		return;
+	}
+	struct app_entry *a = &apps[*app_count];
+	memset(a, 0, sizeof(*a));
+	a->exe_path = rapp->exe_path;
+	launch_app(a, runtime_json);
+	(*app_count)++;
+
+	// 4C.11: Auto-detect type if unknown
+	if (rapp->type[0] == '\0' && a->pid != 0) {
+		P("  Unknown type — detecting (polling IPC for 5s)...\n");
+		bool found_ipc = false;
+		for (int poll = 0; poll < 10 && !found_ipc; poll++) {
+			Sleep(500);
+			struct ipc_client_list clients;
+			if (ipc_call_system_get_clients(ipc_c, &clients) == XRT_SUCCESS) {
+				for (uint32_t c = 0; c < clients.id_count; c++) {
+					struct ipc_app_state ias;
+					if (ipc_call_system_get_client_info(ipc_c, clients.ids[c], &ias) == XRT_SUCCESS) {
+						if ((DWORD)ias.pid == a->pid) {
+							found_ipc = true;
+							break;
+						}
+					}
+				}
+			}
+		}
+		if (found_ipc) {
+			snprintf(rapp->type, sizeof(rapp->type), "3d");
+			P("  Auto-detected: 3D app (IPC client connected)\n");
+		} else {
+			snprintf(rapp->type, sizeof(rapp->type), "2d");
+			P("  Auto-detected: 2D app (no IPC client after 5s)\n");
+			// TODO: find HWND by PID and capture as 2D
+		}
+		registered_apps_save();
+	}
+}
+
+/*!
+ * Show a simple app launcher dialog listing registered apps.
+ * Returns the index of the selected app, or -1 if cancelled.
+ */
+static int
+shell_show_launcher_dialog(void)
+{
+	if (g_registered_app_count == 0) {
+		P("No registered apps.\n");
+		return -1;
+	}
+
+	// Build a numbered list string for the MessageBox
+	char list[2048] = "Select an app to launch:\n\n";
+	for (int i = 0; i < g_registered_app_count; i++) {
+		char line[256];
+		snprintf(line, sizeof(line), "  %d. %s [%s]\n",
+		         i + 1, g_registered_apps[i].name,
+		         g_registered_apps[i].type[0] ? g_registered_apps[i].type : "auto");
+		strncat(list, line, sizeof(list) - strlen(list) - 1);
+	}
+	strncat(list, "\nEnter the number in the input box below:",
+	        sizeof(list) - strlen(list) - 1);
+
+	// Use a simple input loop: cycle through apps with repeated Ctrl+L
+	// For now, just launch the first app. A proper dialog is Phase 5.
+	// MessageBox to show list, then launch first unlaunched app.
+	// TODO(Phase 5): Replace with spatial launcher panel.
+
+	// Find first registered app not currently running
+	// For simplicity, just return the first one.
+	P("%s\n", list);
+	return 0; // Launch first app
+}
+
 // --- System tray icon ---
 
 static NOTIFYICONDATAA g_nid = {0};
@@ -883,6 +1206,9 @@ main(int argc, char *argv[])
 
 	P("Connected to service.\n");
 
+	// Load registered apps config (4C.9)
+	registered_apps_load();
+
 #ifdef _WIN32
 	// --- Resolve runtime JSON path (needed for app launches) ---
 	char runtime_json[MAX_PATH] = {0};
@@ -900,6 +1226,9 @@ main(int argc, char *argv[])
 	if (g_msg_hwnd != NULL) {
 		if (!RegisterHotKey(g_msg_hwnd, HOTKEY_TOGGLE, MOD_CONTROL, VK_SPACE)) {
 			PE("Warning: RegisterHotKey(Ctrl+Space) failed — hotkey unavailable\n");
+		}
+		if (!RegisterHotKey(g_msg_hwnd, HOTKEY_LAUNCH, MOD_CONTROL, 'L')) {
+			PE("Warning: RegisterHotKey(Ctrl+L) failed — launcher hotkey unavailable\n");
 		}
 	}
 
@@ -1032,6 +1361,18 @@ main(int argc, char *argv[])
 						tray_update_tooltip(true);
 						P("Shell activated — %d capture(s) adopted.\n", capture_count);
 					}
+				} else if (msg.message == WM_HOTKEY && msg.wParam == HOTKEY_LAUNCH) {
+					// --- Ctrl+L: Launch registered app ---
+					if (g_shell_active) {
+						int idx = shell_show_launcher_dialog();
+						if (idx >= 0 && idx < g_registered_app_count) {
+							shell_launch_registered_app(
+							    &ipc_c, &g_registered_apps[idx],
+							    have_json ? runtime_json : NULL,
+							    apps, &app_count,
+							    captures, &capture_count);
+						}
+					}
 				} else if (msg.message == WM_TRAYICON) {
 					if (LOWORD(msg.lParam) == WM_LBUTTONUP) {
 						// Left-click tray: activate if inactive
@@ -1144,6 +1485,7 @@ main(int argc, char *argv[])
 	// Cleanup hotkey and tray
 	if (g_msg_hwnd != NULL) {
 		UnregisterHotKey(g_msg_hwnd, HOTKEY_TOGGLE);
+		UnregisterHotKey(g_msg_hwnd, HOTKEY_LAUNCH);
 		tray_destroy();
 		DestroyWindow(g_msg_hwnd);
 	}
