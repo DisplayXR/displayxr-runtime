@@ -1975,6 +1975,30 @@ ipc_handle_shell_activate(volatile struct ipc_client_state *_ics)
 }
 
 xrt_result_t
+ipc_handle_shell_deactivate(volatile struct ipc_client_state *_ics)
+{
+	struct ipc_server *s = _ics->server;
+
+	if (!s->shell_mode) {
+		IPC_INFO(s, "Shell: already deactivated — ignoring");
+		return XRT_SUCCESS;
+	}
+
+	IPC_INFO(s, "Shell: deactivating shell mode via IPC");
+
+	s->shell_mode = false;
+	if (s->xsysc != NULL) {
+		s->xsysc->info.shell_mode = false;
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+		comp_d3d11_service_deactivate_shell(s->xsysc);
+#endif
+	}
+
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
 ipc_handle_shell_set_window_pose(volatile struct ipc_client_state *_ics,
                                   uint32_t client_id,
                                   const struct xrt_pose *pose,
