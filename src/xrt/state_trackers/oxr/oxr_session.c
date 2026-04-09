@@ -2570,8 +2570,13 @@ oxr_session_create(struct oxr_logger *log,
 	// thread is blocked waiting for the IPC response and can't process WM, deadlocking.
 	{
 		const char *shell_session = getenv("DISPLAYXR_SHELL_SESSION");
+		// Only apply borderless+hide when shell mode is currently active.
+		// After shell_deactivate, info.shell_mode is false — apps that
+		// recreate their session (e.g., after LOSS_PENDING) come up in
+		// standalone mode with a normal visible HWND.
 		if (shell_session != NULL && strcmp(shell_session, "1") == 0 &&
-		    xsi.external_window_handle != NULL && sys->xsysc != NULL) {
+		    xsi.external_window_handle != NULL && sys->xsysc != NULL &&
+		    sys->xsysc->info.shell_mode) {
 			HWND hwnd = (HWND)xsi.external_window_handle;
 			// Shell fullscreen: resize HWND to native display resolution.
 			// This gives the app correct Kooima projection (physical window matches display)

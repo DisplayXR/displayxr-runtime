@@ -9060,6 +9060,26 @@ comp_d3d11_service_deactivate_shell(struct xrt_system_compositor *xsysc)
 		mc->capture_client_count--;
 	}
 
+	// --- 4C.3: Push SESSION_LOSS_PENDING to IPC clients ---
+	// Apps receive XR_SESSION_STATE_LOSS_PENDING, destroy their session,
+	// and optionally recreate. On recreate, shell_mode will be false so
+	// they come up in standalone mode (visible HWND, own DP).
+	for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
+		struct d3d11_multi_client_slot *slot = &mc->clients[i];
+		if (!slot->active || slot->client_type != CLIENT_TYPE_IPC) {
+			continue;
+		}
+		if (slot->compositor == nullptr || slot->compositor->xses == nullptr) {
+			continue;
+		}
+		union xrt_session_event xse = XRT_STRUCT_INIT;
+		xse.loss_pending.type = XRT_SESSION_EVENT_LOSS_PENDING;
+		xse.loss_pending.loss_time_ns =
+		    (int64_t)os_monotonic_get_ns() + 500000000LL; // 500ms grace
+		xrt_session_event_sink_push(slot->compositor->xses, &xse);
+		U_LOG_W("Shell deactivate: sent LOSS_PENDING to IPC slot %d", i);
+	}
+
 	// Reset drag/focus state
 	mc->focused_slot = -1;
 	mc->drag.active = false;
