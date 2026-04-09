@@ -35,6 +35,7 @@
 #include <windows.h>
 #include <process.h>
 #include <tlhelp32.h> // For process enumeration (service PID lookup)
+#include <shellapi.h> // For Shell_NotifyIcon (system tray)
 #else
 #include <unistd.h>
 #endif
@@ -43,10 +44,23 @@
 #define P(...) fprintf(stdout, __VA_ARGS__)
 #define PE(...) fprintf(stderr, __VA_ARGS__)
 
+#ifdef _WIN32
+#define HOTKEY_TOGGLE 1
+#define HOTKEY_LAUNCH 2
+#define WM_TRAYICON (WM_USER + 1)
+#define TRAY_CMD_ACTIVATE 2001
+#define TRAY_CMD_EXIT 2002
+#define POLL_INTERVAL_MS 500
+#endif
+
 #define MAX_APPS 8
 #define MAX_CAPTURES 24
 
 static volatile int g_running = 1;
+#ifdef _WIN32
+static bool g_shell_active = false;
+static HWND g_msg_hwnd = NULL;
+#endif
 
 static void
 signal_handler(int sig)
@@ -739,6 +753,64 @@ cleanup_closed_captures(struct ipc_connection *ipc_c,
 		}
 	}
 }
+
+// --- System tray icon ---
+
+static NOTIFYICONDATAA g_nid = {0};
+
+static void
+tray_create(HWND hwnd)
+{
+	g_nid.cbSize = sizeof(NOTIFYICONDATAA);
+	g_nid.hWnd = hwnd;
+	g_nid.uID = 1;
+	g_nid.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE;
+	g_nid.uCallbackMessage = WM_TRAYICON;
+	g_nid.hIcon = LoadIcon(NULL, IDI_APPLICATION);
+	strncpy(g_nid.szTip, "DisplayXR Shell (inactive)", sizeof(g_nid.szTip) - 1);
+	Shell_NotifyIconA(NIM_ADD, &g_nid);
+}
+
+static void
+tray_update_tooltip(bool active)
+{
+	strncpy(g_nid.szTip,
+	        active ? "DisplayXR Shell (active)" : "DisplayXR Shell (inactive)",
+	        sizeof(g_nid.szTip) - 1);
+	Shell_NotifyIconA(NIM_MODIFY, &g_nid);
+}
+
+static void
+tray_destroy(void)
+{
+	Shell_NotifyIconA(NIM_DELETE, &g_nid);
+}
+
+static void
+tray_show_context_menu(HWND hwnd, bool shell_active)
+{
+	HMENU menu = CreatePopupMenu();
+	AppendMenuA(menu, MF_STRING, TRAY_CMD_ACTIVATE,
+	            shell_active ? "Deactivate" : "Activate");
+	AppendMenuA(menu, MF_SEPARATOR, 0, NULL);
+	AppendMenuA(menu, MF_STRING, TRAY_CMD_EXIT, "Exit");
+
+	POINT pt;
+	GetCursorPos(&pt);
+	SetForegroundWindow(hwnd); // Required for TrackPopupMenu to dismiss properly
+	UINT cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY,
+	                          pt.x, pt.y, 0, hwnd, NULL);
+	DestroyMenu(menu);
+	PostMessage(hwnd, WM_NULL, 0, 0); // Force dismiss
+
+	if (cmd == TRAY_CMD_ACTIVATE) {
+		// Handled by caller via return value
+		PostMessage(hwnd, WM_HOTKEY, HOTKEY_TOGGLE, 0);
+	} else if (cmd == TRAY_CMD_EXIT) {
+		g_running = 0;
+	}
+}
+
 #endif // _WIN32
 
 #ifdef _WIN32
@@ -809,55 +881,86 @@ main(int argc, char *argv[])
 		return 1;
 	}
 
-	// Activate shell mode on the service (creates multi-comp window on next client)
+	P("Connected to service.\n");
+
+#ifdef _WIN32
+	// --- Resolve runtime JSON path (needed for app launches) ---
+	char runtime_json[MAX_PATH] = {0};
+	bool have_json = get_runtime_json_path(runtime_json, sizeof(runtime_json));
+	DWORD service_pid = find_service_pid();
+
+	// --- Create message-only window for hotkey + tray ---
+	g_msg_hwnd = CreateWindowExA(0, "STATIC", "DisplayXR Shell Msg", 0,
+	    0, 0, 0, 0, HWND_MESSAGE, NULL, NULL, NULL);
+	if (g_msg_hwnd == NULL) {
+		PE("Warning: failed to create message window (hotkey/tray unavailable)\n");
+	}
+
+	// Register system-wide Ctrl+Space hotkey
+	if (g_msg_hwnd != NULL) {
+		if (!RegisterHotKey(g_msg_hwnd, HOTKEY_TOGGLE, MOD_CONTROL, VK_SPACE)) {
+			PE("Warning: RegisterHotKey(Ctrl+Space) failed — hotkey unavailable\n");
+		}
+	}
+
+	// Create system tray icon
+	if (g_msg_hwnd != NULL) {
+		tray_create(g_msg_hwnd);
+	}
+
+	// --- Decide startup mode ---
+	// If launched with apps or captures: activate immediately (current behavior).
+	// If launched with no args: start deactivated in tray, wait for Ctrl+Space.
+	bool start_active = (app_count > 0 || capture_count > 0);
+
+	if (start_active) {
+		P("Activating shell mode...\n");
+		xret = ipc_call_shell_activate(&ipc_c);
+		if (xret != XRT_SUCCESS) {
+			PE("Warning: shell_activate failed\n");
+		}
+		g_shell_active = true;
+		tray_update_tooltip(true);
+
+		// Add capture clients
+		for (int i = 0; i < capture_count; i++) {
+			uint32_t cid = 0;
+			xrt_result_t r = ipc_call_shell_add_capture_client(&ipc_c, captures[i].hwnd, &cid);
+			if (r == XRT_SUCCESS) {
+				captures[i].client_id = cid;
+				captures[i].added = true;
+				P("  Capture: HWND=0x%llx '%s' → client_id=%u\n",
+				  (unsigned long long)captures[i].hwnd, captures[i].name, cid);
+			} else {
+				PE("  Capture: failed for HWND=0x%llx '%s'\n",
+				   (unsigned long long)captures[i].hwnd, captures[i].name);
+			}
+		}
+
+		// Launch apps
+		if (app_count > 0) {
+			P("XR_RUNTIME_JSON = %s\n", have_json ? runtime_json : "(not set)");
+			for (int i = 0; i < app_count; i++) {
+				launch_app(&apps[i], have_json ? runtime_json : NULL);
+				if (i + 1 < app_count) {
+					Sleep(100);
+				}
+			}
+		}
+	} else {
+		P("Starting in system tray — press Ctrl+Space to activate.\n");
+	}
+
+	// Auto-adopt is disabled for now — use --capture-hwnd for explicit 2D windows.
+	// TODO(4C.6): re-enable on re-activate to auto-adopt desktop windows.
+	bool auto_adopt = false;
+#else
+	// Non-Windows: simple activate + poll (no hotkey/tray)
 	P("Activating shell mode...\n");
 	xret = ipc_call_shell_activate(&ipc_c);
 	if (xret != XRT_SUCCESS) {
-		PE("Warning: shell_activate failed (service may already be in shell mode)\n");
+		PE("Warning: shell_activate failed\n");
 	}
-
-	P("Connected to service.\n");
-
-	// Add capture clients (2D window capture via Windows.Graphics.Capture)
-	for (int i = 0; i < capture_count; i++) {
-		uint32_t cid = 0;
-		xrt_result_t r = ipc_call_shell_add_capture_client(&ipc_c, captures[i].hwnd, &cid);
-		if (r == XRT_SUCCESS) {
-			captures[i].client_id = cid;
-			captures[i].added = true;
-			P("  Capture: HWND=0x%llx '%s' → client_id=%u\n",
-			  (unsigned long long)captures[i].hwnd, captures[i].name, cid);
-		} else {
-			PE("  Capture: failed for HWND=0x%llx '%s'\n",
-			   (unsigned long long)captures[i].hwnd, captures[i].name);
-		}
-	}
-
-	// Launch apps
-#ifdef _WIN32
-	if (app_count > 0) {
-		char runtime_json[MAX_PATH] = {0};
-		bool have_json = get_runtime_json_path(runtime_json, sizeof(runtime_json));
-		P("XR_RUNTIME_JSON = %s\n", have_json ? runtime_json : "(not set)");
-
-		for (int i = 0; i < app_count; i++) {
-			launch_app(&apps[i], have_json ? runtime_json : NULL);
-			// Minimal delay between app launches. The 3s delay from Phase 1 was
-			// a workaround for #108 (intermittent crash with two apps). Tested
-			// with 100ms and no crashes observed (2026-04-03).
-			if (i + 1 < app_count) {
-				Sleep(100);
-			}
-		}
-	}
-#endif
-
-#ifdef _WIN32
-	// Auto-adopt is disabled for now — use --capture-hwnd for explicit 2D windows.
-	// TODO: re-enable with better filtering (skip IDE, shell, system windows).
-	bool auto_adopt = false;
-	DWORD service_pid = find_service_pid();
-#else
 	bool auto_adopt = false;
 #endif
 
@@ -872,24 +975,94 @@ main(int argc, char *argv[])
 		}
 	}
 
-	// Layout persistence disabled during early dev — clean grid every launch.
-	// struct shell_config config;
-	// shell_config_load(&config);
-
-	int save_counter = 0; // Save every 5 seconds (10 polls * 500ms)
-	int adopt_counter = 0; // Re-enumerate every 1 second (2 polls * 500ms)
+	int adopt_counter = 0;
 
 	// Client ID → numbered name mapping (for persistence with duplicate app names)
 	static struct { uint32_t id; char name[128]; } client_names[MAX_SAVED_WINDOWS];
 	static int client_name_count = 0;
 
-	// Poll loop
+	// --- Main loop: MsgWait on Windows, Sleep on other platforms ---
 	while (g_running) {
+#ifdef _WIN32
+		// Wait for either a message or the poll timeout
+		DWORD wait_result = MsgWaitForMultipleObjects(
+		    0, NULL, FALSE, POLL_INTERVAL_MS, QS_ALLINPUT);
+
+		if (wait_result == WAIT_OBJECT_0) {
+			MSG msg;
+			while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
+				if (msg.message == WM_HOTKEY && msg.wParam == HOTKEY_TOGGLE) {
+					// --- Toggle shell active/inactive ---
+					if (g_shell_active) {
+						P("Deactivating shell...\n");
+						ipc_call_shell_deactivate(&ipc_c);
+
+						// Clear local capture tracking
+						for (int i = 0; i < capture_count; i++) {
+							captures[i].added = false;
+						}
+						capture_count = 0;
+
+						// Reset pose tracking so re-activate can re-apply
+						for (int i = 0; i < app_count; i++) {
+							apps[i].pose_applied = false;
+						}
+						poses_pending = false;
+						for (int i = 0; i < app_count; i++) {
+							if (apps[i].has_pose) poses_pending = true;
+						}
+
+						// Clear client name tracking
+						client_name_count = 0;
+
+						g_shell_active = false;
+						tray_update_tooltip(false);
+						P("Shell deactivated — waiting in tray.\n");
+					} else {
+						P("Activating shell...\n");
+						xret = ipc_call_shell_activate(&ipc_c);
+						if (xret != XRT_SUCCESS) {
+							PE("Warning: shell_activate failed\n");
+						}
+
+						// Re-adopt desktop windows via auto-enumerate
+						enumerate_and_adopt_windows(&ipc_c, captures, &capture_count, service_pid);
+
+						g_shell_active = true;
+						tray_update_tooltip(true);
+						P("Shell activated — %d capture(s) adopted.\n", capture_count);
+					}
+				} else if (msg.message == WM_TRAYICON) {
+					if (LOWORD(msg.lParam) == WM_LBUTTONUP) {
+						// Left-click tray: activate if inactive
+						if (!g_shell_active) {
+							PostMessage(g_msg_hwnd, WM_HOTKEY, HOTKEY_TOGGLE, 0);
+						}
+					} else if (LOWORD(msg.lParam) == WM_RBUTTONUP) {
+						// Right-click tray: context menu
+						tray_show_context_menu(g_msg_hwnd, g_shell_active);
+					}
+				}
+				TranslateMessage(&msg);
+				DispatchMessageA(&msg);
+			}
+		}
+		// Fall through to poll work regardless of wait result
+#else
+		usleep(500000);
+#endif
+
+		// --- Poll work (only meaningful when shell is active) ---
+#ifdef _WIN32
+		if (!g_shell_active) {
+			continue;
+		}
+#endif
+
 		// Apply pending poses when new clients appear
 		if (poses_pending) {
 			try_apply_poses(&ipc_c, apps, app_count, prev_ids, prev_count);
 
-			// Check if all poses applied
 			poses_pending = false;
 			for (int i = 0; i < app_count; i++) {
 				if (apps[i].has_pose && !apps[i].pose_applied) {
@@ -898,10 +1071,8 @@ main(int argc, char *argv[])
 			}
 		}
 
-		// Detect new clients and restore saved poses from config.
-		// Use numbered names for duplicate apps (AppName, AppName-2, etc.)
+		// Detect new clients and track names
 		{
-
 			struct ipc_client_list clients;
 			xrt_result_t r = ipc_call_system_get_clients(&ipc_c, &clients);
 			if (r == XRT_SUCCESS) {
@@ -917,10 +1088,8 @@ main(int argc, char *argv[])
 						struct ipc_app_state ias;
 						xrt_result_t ir = ipc_call_system_get_client_info(&ipc_c, clients.ids[c], &ias);
 						if (ir == XRT_SUCCESS && ias.info.application_name[0] != '\0') {
-							// Count existing instances to generate numbered name
 							int instance = 1;
 							for (int cn = 0; cn < client_name_count; cn++) {
-								// Strip " (N)" suffix if present
 								char existing_base[128];
 								snprintf(existing_base, sizeof(existing_base), "%s", client_names[cn].name);
 								char *paren = strrchr(existing_base, '(');
@@ -938,15 +1107,11 @@ main(int argc, char *argv[])
 								snprintf(numbered_name, sizeof(numbered_name), "%s",
 								         ias.info.application_name);
 
-							// Track client_id → numbered_name mapping
 							if (client_name_count < MAX_SAVED_WINDOWS) {
 								client_names[client_name_count].id = clients.ids[c];
 								snprintf(client_names[client_name_count].name, 128, "%s", numbered_name);
 								client_name_count++;
 							}
-
-							// Layout persistence disabled during early dev.
-							// Default grid layout is applied by the compositor.
 						}
 					}
 				}
@@ -955,42 +1120,34 @@ main(int argc, char *argv[])
 
 		print_clients(&ipc_c, prev_ids, &prev_count);
 
-		// Periodic save: query current poses and update config
-		// Layout persistence disabled during early dev.
-		(void)save_counter;
-
-		// Dynamic window tracking: detect new/closed windows every ~1 second
 #ifdef _WIN32
+		// Dynamic window tracking: detect new/closed windows every ~1 second
 		if (auto_adopt) {
 			adopt_counter++;
 			if (adopt_counter >= 2) {
 				adopt_counter = 0;
-				// Remove closed windows
 				cleanup_closed_captures(&ipc_c, captures, &capture_count);
-				// Adopt new windows
 				enumerate_and_adopt_windows(&ipc_c, captures, &capture_count, service_pid);
 			}
 		}
-#endif
-
-#ifdef _WIN32
-		Sleep(500);
-#else
-		usleep(500000);
 #endif
 	}
 
 	P("\nShell exiting.\n");
 
-	// Remove capture clients before disconnecting
-	for (int i = 0; i < capture_count; i++) {
-		if (captures[i].added) {
-			ipc_call_shell_remove_capture_client(&ipc_c, captures[i].client_id);
-			P("  Removed capture client_id=%u\n", captures[i].client_id);
-		}
+#ifdef _WIN32
+	// Deactivate shell if still active
+	if (g_shell_active) {
+		ipc_call_shell_deactivate(&ipc_c);
 	}
 
-#ifdef _WIN32
+	// Cleanup hotkey and tray
+	if (g_msg_hwnd != NULL) {
+		UnregisterHotKey(g_msg_hwnd, HOTKEY_TOGGLE);
+		tray_destroy();
+		DestroyWindow(g_msg_hwnd);
+	}
+
 	// Close process handles
 	for (int i = 0; i < app_count; i++) {
 		if (apps[i].process != NULL) {
