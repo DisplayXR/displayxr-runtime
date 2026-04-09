@@ -287,6 +287,18 @@ comp_d3d11_service_get_capture_client_window_pose(struct xrt_system_compositor *
 bool
 comp_d3d11_service_ensure_shell_window(struct xrt_system_compositor *xsysc);
 
+/*!
+ * Deactivate the shell: stop captures and restore 2D windows, suspend
+ * multi-compositor (hide window, release DP, stop render loop).
+ * Called by ipc_handle_shell_deactivate().
+ *
+ * @param xsysc The system compositor (must be D3D11 service in shell mode).
+ *
+ * @ingroup comp_d3d11_service
+ */
+void
+comp_d3d11_service_deactivate_shell(struct xrt_system_compositor *xsysc);
+
 /*! @} */
 
 

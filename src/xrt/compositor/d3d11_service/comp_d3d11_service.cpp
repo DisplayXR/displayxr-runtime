@@ -589,6 +589,10 @@ struct d3d11_multi_compositor
 	//! True after dismiss cleanup (EXIT_REQUEST sent, captures released).
 	bool dismiss_cleanup_done;
 
+	//! Shell deactivated (Ctrl+Space): window hidden, DP released, captures stopped.
+	//! Unlike window_dismissed, the multi-comp structure stays alive for re-activation.
+	bool suspended;
+
 	//! Debounced re-grid: when > 0, apply grid layout after this timestamp.
 	//! Set by client registration, consumed by render loop.
 	uint64_t regrid_pending_ns;
@@ -4849,6 +4853,11 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		mc = sys->multi_comp;
 	}
 
+	if (mc->suspended) {
+		// Shell deactivated — don't render, wait for re-activation.
+		return;
+	}
+
 	if (mc->window_dismissed) {
 		// Shell was dismissed (ESC). Don't reopen — stay dismissed.
 		// Send EXIT_REQUEST to all IPC clients so they exit cleanly.
@@ -8915,6 +8924,45 @@ comp_d3d11_service_ensure_shell_window(struct xrt_system_compositor *xsysc)
 
 	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
 
+	// If shell was suspended (deactivated via Ctrl+Space), resume it:
+	// show window, recreate DP, restart render thread.
+	if (sys->multi_comp != nullptr && sys->multi_comp->suspended) {
+		struct d3d11_multi_compositor *mc = sys->multi_comp;
+		U_LOG_W("Shell: resuming from suspended state");
+
+		mc->suspended = false;
+
+		// Show the shell window again
+		if (mc->hwnd != nullptr) {
+			ShowWindow(mc->hwnd, SW_SHOW);
+			SetForegroundWindow(mc->hwnd);
+		}
+
+		// Recreate display processor via factory (window + swap chain still alive)
+		if (mc->display_processor == nullptr && sys->base.info.dp_factory_d3d11 != NULL) {
+			auto factory = (xrt_dp_factory_d3d11_fn_t)sys->base.info.dp_factory_d3d11;
+			xrt_result_t dp_ret = factory(
+			    sys->device.get(), sys->context.get(), mc->hwnd, &mc->display_processor);
+
+			if (dp_ret == XRT_SUCCESS && mc->display_processor != nullptr) {
+				U_LOG_W("Shell resume: display processor recreated");
+				if (mc->window != nullptr) {
+					comp_d3d11_window_set_shell_dp(mc->window, mc->display_processor);
+				}
+			} else {
+				U_LOG_E("Shell resume: failed to recreate display processor");
+			}
+		}
+
+		// Restart render thread
+		if (!mc->capture_render_running.load()) {
+			capture_render_thread_start(sys);
+		}
+
+		U_LOG_W("Shell: resumed — window shown, DP recreated, render running");
+		return true;
+	}
+
 	// If a previous shell session was dismissed (ESC), tear down its window
 	// and resources so ensure_output creates a fresh one.
 	if (sys->multi_comp != nullptr && sys->multi_comp->window_dismissed) {
@@ -8954,4 +9002,87 @@ comp_d3d11_service_ensure_shell_window(struct xrt_system_compositor *xsysc)
 
 	U_LOG_W("Shell: window created for empty shell (ready for Ctrl+O)");
 	return true;
+}
+
+void
+comp_d3d11_service_deactivate_shell(struct xrt_system_compositor *xsysc)
+{
+	if (xsysc == nullptr) {
+		return;
+	}
+
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+
+	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	if (mc == nullptr) {
+		U_LOG_W("Shell deactivate: no multi-comp — nothing to do");
+		return;
+	}
+
+	if (mc->suspended) {
+		U_LOG_W("Shell deactivate: already suspended");
+		return;
+	}
+
+	U_LOG_W("Shell deactivate: beginning teardown");
+
+	// --- 4C.2: Stop all capture sessions and restore 2D windows ---
+	for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
+		struct d3d11_multi_client_slot *slot = &mc->clients[i];
+		if (!slot->active || slot->client_type != CLIENT_TYPE_CAPTURE) {
+			continue;
+		}
+
+		// Stop capture
+		d3d11_capture_stop(slot->capture_ctx);
+		slot->capture_ctx = nullptr;
+		slot->capture_srv = nullptr;
+		slot->capture_texture_last = nullptr;
+		slot->capture_width = 0;
+		slot->capture_height = 0;
+
+		// Restore window to original desktop position and style
+		if (slot->app_hwnd != nullptr && IsWindow(slot->app_hwnd)) {
+			SetWindowPlacement(slot->app_hwnd, &slot->saved_placement);
+			SetWindowLongPtr(slot->app_hwnd, GWL_EXSTYLE, slot->saved_exstyle);
+			// Force window to repaint at restored position
+			SetWindowPos(slot->app_hwnd, HWND_TOP, 0, 0, 0, 0,
+			             SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+			U_LOG_W("Shell deactivate: restored 2D window HWND=%p", (void *)slot->app_hwnd);
+		}
+
+		slot->active = false;
+		slot->compositor = nullptr;
+		slot->client_type = CLIENT_TYPE_IPC; // reset
+		mc->client_count--;
+		mc->capture_client_count--;
+	}
+
+	// Reset drag/focus state
+	mc->focused_slot = -1;
+	mc->drag.active = false;
+	mc->title_drag.active = false;
+	mc->resize.active = false;
+
+	// --- 4C.5: Suspend multi-compositor ---
+
+	// Stop render thread
+	capture_render_thread_stop(sys);
+
+	// Switch display back to 2D before releasing DP
+	if (mc->display_processor != nullptr) {
+		xrt_display_processor_d3d11_request_display_mode(mc->display_processor, false);
+		xrt_display_processor_d3d11_destroy(&mc->display_processor);
+	}
+
+	// Hide shell window (keep HWND alive for resume)
+	if (mc->hwnd != nullptr) {
+		ShowWindow(mc->hwnd, SW_HIDE);
+	}
+
+	mc->suspended = true;
+
+	U_LOG_W("Shell deactivate: complete — captures stopped, DP released, window hidden");
 }
