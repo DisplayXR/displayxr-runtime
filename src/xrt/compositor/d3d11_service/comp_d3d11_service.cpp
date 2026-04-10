@@ -224,6 +224,9 @@ struct d3d11_service_compositor
 	//! App's HWND from XR_EXT_win32_window_binding (for lazy standalone init)
 	HWND app_hwnd;
 
+	//! Set when shell re-activates — next layer_commit tears down standalone resources
+	bool pending_shell_reentry;
+
 	//! Whether the window has been closed (triggers session exit)
 	bool window_closed;
 
@@ -6766,10 +6769,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		in_size_move = comp_d3d11_window_is_in_size_move(c->render.window);
 	}
 
-	// Skip swap chain resize for hot-switched apps: the swap chain is
-	// intentionally at display-native size (3840x2160) even though the
-	// HWND client rect may be smaller (due to decorations).
-	if (c->render.hwnd != nullptr && c->render.swap_chain && c->render.owns_window) {
+	if (c->render.hwnd != nullptr && c->render.swap_chain) {
 		RECT client_rect;
 		if (GetClientRect(c->render.hwnd, &client_rect)) {
 			uint32_t client_width = static_cast<uint32_t>(client_rect.right - client_rect.left);
@@ -7441,6 +7441,34 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 
 	// Shell mode: per-client atlas rendering is done. The multi-compositor
 	// composites all client atlases into the combined atlas and presents.
+	// --- Lazy reverse hot-switch (shell re-activated) ---
+	// Tear down per-client standalone resources on the app's own thread.
+	// Hide the HWND last (sends WM but app's main thread isn't blocked here
+	// since we're about to return from this layer_commit).
+	if (c->pending_shell_reentry) {
+		U_LOG_W("Reverse hot-switch: tearing down standalone resources");
+		c->pending_shell_reentry = false;
+
+		if (c->render.display_processor != nullptr) {
+			xrt_display_processor_d3d11_request_display_mode(c->render.display_processor, false);
+			xrt_display_processor_d3d11_destroy(&c->render.display_processor);
+		}
+		c->render.back_buffer_rtv.reset();
+		c->render.swap_chain.reset();
+		if (c->render.hud != nullptr) {
+			u_hud_destroy(&c->render.hud);
+		}
+		c->render.hwnd = nullptr;
+
+		// Hide the app's HWND — use ShowWindowAsync to avoid deadlock.
+		// Synchronous ShowWindow(SW_HIDE) sends WM to the app's main
+		// thread, which is blocked waiting for this IPC layer_commit to return.
+		if (c->app_hwnd != nullptr && IsWindow(c->app_hwnd)) {
+			ShowWindowAsync(c->app_hwnd, SW_HIDE);
+		}
+		U_LOG_W("Reverse hot-switch: done — back to export mode");
+	}
+
 	if (sys->shell_mode) {
 		// Throttle renders to ~1 per VSync (~14ms). With N clients each calling
 		// layer_commit at 60fps, we'd otherwise render N times per frame cycle.
@@ -7467,17 +7495,14 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	if (!c->render.swap_chain && c->app_hwnd != nullptr && IsWindow(c->app_hwnd)) {
 		U_LOG_W("Hot-switch: lazy standalone init for HWND=%p", (void *)c->app_hwnd);
 
-		// Use app's HWND for standalone rendering. We can't make it
-		// borderless from here (deadlock), so the DP output will be
-		// scaled by the OS into the decorated window. Not pixel-perfect
-		// weaving, but content is visible and the app survives.
-		ShowWindow(c->app_hwnd, SW_SHOWNOACTIVATE);
+		// Show the HWND with ShowWindowAsync to avoid deadlock with the
+		// app's main thread (blocked on this IPC layer_commit).
+		ShowWindowAsync(c->app_hwnd, SW_SHOWNOACTIVATE);
 
 		c->render.hwnd = c->app_hwnd;
 		c->render.owns_window = false;
 
-		// Swap chain at display-native size for correct DP output.
-		// DXGI scales to the HWND client rect on Present.
+		// Swap chain at display-native size (matches DP expectation)
 		uint32_t sc_w = sys->base.info.display_pixel_width;
 		uint32_t sc_h = sys->base.info.display_pixel_height;
 		if (sc_w == 0 || sc_h == 0) {
@@ -7688,8 +7713,12 @@ compositor_destroy(struct xrt_compositor *xc)
 
 	U_LOG_W("Destroying D3D11 service compositor for client");
 
-	// Unregister from multi-compositor before cleanup
-	if (sys->shell_mode) {
+	// Unregister from multi-compositor before cleanup.
+	// Always unregister if there's a multi_comp — the client may have been
+	// registered in shell mode but is now closing in standalone mode (after
+	// hot-switch). Without this, the slot stays stale and shows a ghost
+	// remnant on shell re-activate.
+	if (sys->multi_comp != nullptr) {
 		std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
 		multi_compositor_unregister_client(sys, c);
 	}
@@ -9126,8 +9155,10 @@ comp_d3d11_service_ensure_shell_window(struct xrt_system_compositor *xsysc)
 		mc->suspended = false;
 		sys->shell_mode = true;
 
-		// Reverse hot-switch: tear down per-client standalone resources,
-		// re-hide app HWNDs. Apps go back to exporting via multi-comp.
+		// Reverse hot-switch is LAZY: just flag each client compositor.
+		// Each client's next layer_commit will tear down its own DP and
+		// swap chain on its own thread (avoids cross-thread WM deadlock
+		// from ShowWindow/SetWindowLongPtr while app is blocked on IPC).
 		for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
 			struct d3d11_multi_client_slot *slot = &mc->clients[i];
 			if (!slot->active || slot->client_type != CLIENT_TYPE_IPC) {
@@ -9136,29 +9167,8 @@ comp_d3d11_service_ensure_shell_window(struct xrt_system_compositor *xsysc)
 			if (slot->compositor == nullptr) {
 				continue;
 			}
-
-			struct d3d11_client_render_resources *res = &slot->compositor->render;
-
-			// Destroy per-client DP
-			if (res->display_processor != nullptr) {
-				xrt_display_processor_d3d11_request_display_mode(res->display_processor, false);
-				xrt_display_processor_d3d11_destroy(&res->display_processor);
-			}
-
-			// Destroy per-client swap chain + back buffer
-			res->back_buffer_rtv.reset();
-			res->swap_chain.reset();
-			res->hwnd = nullptr;
-			if (res->hud != nullptr) {
-				u_hud_destroy(&res->hud);
-			}
-
-			// Re-hide the app's HWND (shell composites it now)
-			if (slot->app_hwnd != nullptr && IsWindow(slot->app_hwnd)) {
-				ShowWindow(slot->app_hwnd, SW_HIDE);
-			}
-
-			U_LOG_W("Shell resume: hot-switched slot %d back to export mode", i);
+			slot->compositor->pending_shell_reentry = true;
+			U_LOG_W("Shell resume: flagged slot %d for lazy reverse hot-switch", i);
 		}
 
 		// Show the shell window again

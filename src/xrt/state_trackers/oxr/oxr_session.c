@@ -2578,11 +2578,12 @@ oxr_session_create(struct oxr_logger *log,
 		    xsi.external_window_handle != NULL && sys->xsysc != NULL &&
 		    sys->xsysc->info.shell_mode) {
 			HWND hwnd = (HWND)xsi.external_window_handle;
-			// Shell mode: just hide the HWND. The lazy standalone init
-			// (in layer_commit) will make it borderless fullscreen when
-			// the shell deactivates. No style/size changes here.
+			// Shell mode: just hide the HWND, keep decorations and size
+			// intact. On hot-switch deactivate, ShowWindowAsync(SW_SHOW)
+			// reveals it as a normal decorated window. The compositor's
+			// auto-resize handler adapts the swap chain to client rect.
 			ShowWindow(hwnd, SW_HIDE);
-			U_LOG_W("Shell session: hidden app HWND %p", hwnd);
+			U_LOG_W("Shell session: HWND %p hidden (decorations preserved)", hwnd);
 		}
 	}
 #endif
