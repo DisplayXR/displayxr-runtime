@@ -6766,7 +6766,10 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		in_size_move = comp_d3d11_window_is_in_size_move(c->render.window);
 	}
 
-	if (c->render.hwnd != nullptr && c->render.swap_chain) {
+	// Skip swap chain resize for hot-switched apps: the swap chain is
+	// intentionally at display-native size (3840x2160) even though the
+	// HWND client rect may be smaller (due to decorations).
+	if (c->render.hwnd != nullptr && c->render.swap_chain && c->render.owns_window) {
 		RECT client_rect;
 		if (GetClientRect(c->render.hwnd, &client_rect)) {
 			uint32_t client_width = static_cast<uint32_t>(client_rect.right - client_rect.left);
@@ -7464,19 +7467,22 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	if (!c->render.swap_chain && c->app_hwnd != nullptr && IsWindow(c->app_hwnd)) {
 		U_LOG_W("Hot-switch: lazy standalone init for HWND=%p", (void *)c->app_hwnd);
 
-		// Show the app's HWND (hidden during shell mode).
-		// Decorations are preserved — no style changes needed.
+		// Use app's HWND for standalone rendering. We can't make it
+		// borderless from here (deadlock), so the DP output will be
+		// scaled by the OS into the decorated window. Not pixel-perfect
+		// weaving, but content is visible and the app survives.
 		ShowWindow(c->app_hwnd, SW_SHOWNOACTIVATE);
 
 		c->render.hwnd = c->app_hwnd;
 		c->render.owns_window = false;
 
-		RECT cr;
-		uint32_t sc_w = sys->output_width, sc_h = sys->output_height;
-		if (GetClientRect(c->app_hwnd, &cr)) {
-			uint32_t cw = (uint32_t)(cr.right - cr.left);
-			uint32_t ch = (uint32_t)(cr.bottom - cr.top);
-			if (cw > 0 && ch > 0) { sc_w = cw; sc_h = ch; }
+		// Swap chain at display-native size for correct DP output.
+		// DXGI scales to the HWND client rect on Present.
+		uint32_t sc_w = sys->base.info.display_pixel_width;
+		uint32_t sc_h = sys->base.info.display_pixel_height;
+		if (sc_w == 0 || sc_h == 0) {
+			sc_w = sys->output_width * 2;
+			sc_h = sys->output_height * 2;
 		}
 
 		DXGI_SWAP_CHAIN_DESC1 sc_desc = {};
@@ -7515,10 +7521,55 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			}
 		}
 
-		U_LOG_W("Hot-switch: swap_chain=%p, back_buffer_rtv=%p, dp=%p",
-		        (void *)c->render.swap_chain.get(),
-		        (void *)c->render.back_buffer_rtv.get(),
-		        (void *)c->render.display_processor);
+		// Enable HUD for standalone mode diagnostics
+		if (c->render.hud == nullptr) {
+			uint32_t hud_w = sc_w > 0 ? sc_w : sys->output_width;
+			c->render.smoothed_frame_time_ms = 16.67f;
+			u_hud_create(&c->render.hud, hud_w);
+		}
+
+		// Diagnostic dump: everything the app sees after hot-switch
+		{
+			POINT screen_pos = {0, 0};
+			ClientToScreen(c->app_hwnd, &screen_pos);
+			RECT wr;
+			GetWindowRect(c->app_hwnd, &wr);
+
+			D3D11_TEXTURE2D_DESC atlas_desc = {};
+			if (c->render.atlas_texture) {
+				c->render.atlas_texture->GetDesc(&atlas_desc);
+			}
+
+			uint32_t dp_px_w = 0, dp_px_h = 0;
+			int32_t dp_left = 0, dp_top = 0;
+			if (c->render.display_processor) {
+				xrt_display_processor_d3d11_get_display_pixel_info(
+				    c->render.display_processor, &dp_px_w, &dp_px_h, &dp_left, &dp_top);
+			}
+
+			U_LOG_W("=== HOT-SWITCH DIAGNOSTIC ===");
+			U_LOG_W("  HWND=%p, client_rect=%ux%u, screen_pos=(%d,%d)",
+			        (void *)c->app_hwnd, sc_w, sc_h,
+			        screen_pos.x, screen_pos.y);
+			U_LOG_W("  window_rect=(%d,%d)-(%d,%d) = %dx%d",
+			        wr.left, wr.top, wr.right, wr.bottom,
+			        wr.right - wr.left, wr.bottom - wr.top);
+			U_LOG_W("  atlas_texture=%ux%u",
+			        atlas_desc.Width, atlas_desc.Height);
+			U_LOG_W("  swap_chain=%ux%u (same as client_rect)", sc_w, sc_h);
+			U_LOG_W("  sys view=%ux%u, output=%ux%u, display=%ux%u",
+			        sys->view_width, sys->view_height,
+			        sys->output_width, sys->output_height,
+			        sys->display_width, sys->display_height);
+			U_LOG_W("  DP display_pixel=%ux%u at (%d,%d)",
+			        dp_px_w, dp_px_h, dp_left, dp_top);
+			U_LOG_W("  tile=%ux%u, shell_mode=%d",
+			        sys->tile_columns, sys->tile_rows, sys->shell_mode);
+			U_LOG_W("  display_phys=%.4fx%.4f m",
+			        sys->base.info.display_width_m,
+			        sys->base.info.display_height_m);
+			U_LOG_W("=============================");
+		}
 	}
 
 	// During drag, synchronize with the window thread's WM_PAINT cycle.
@@ -7569,6 +7620,17 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				bb_texture->GetDesc(&bb_desc);
 				back_buffer_width = bb_desc.Width;
 				back_buffer_height = bb_desc.Height;
+			}
+		}
+
+		// Log DP input dims periodically
+		{
+			static uint32_t dp_log_count = 0;
+			if (dp_log_count++ % 300 == 0) {
+				U_LOG_W("Standalone DP: input_view=%ux%u, back_buffer=%ux%u, tile=%ux%u",
+				        input_view_w, input_view_h,
+				        back_buffer_width, back_buffer_height,
+				        sys->tile_columns, sys->tile_rows);
 			}
 		}
 
@@ -9087,6 +9149,9 @@ comp_d3d11_service_ensure_shell_window(struct xrt_system_compositor *xsysc)
 			res->back_buffer_rtv.reset();
 			res->swap_chain.reset();
 			res->hwnd = nullptr;
+			if (res->hud != nullptr) {
+				u_hud_destroy(&res->hud);
+			}
 
 			// Re-hide the app's HWND (shell composites it now)
 			if (slot->app_hwnd != nullptr && IsWindow(slot->app_hwnd)) {
