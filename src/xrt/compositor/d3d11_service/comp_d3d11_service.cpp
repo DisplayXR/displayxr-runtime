@@ -8972,7 +8972,20 @@ comp_d3d11_service_owns_window(struct xrt_system_compositor *xsysc)
 		return false;
 	}
 
-	// Non-shell IPC clients always get Monado-owned windows.
+	// Non-shell mode: check the active compositor's actual ownership.
+	// After hot-switch, handle apps still use their external HWND
+	// (owns_window=false), not a Monado-owned one. This must return false
+	// so the IPC view pose path takes the display-centric branch.
+	struct d3d11_service_compositor *sc = nullptr;
+	{
+		std::lock_guard<std::mutex> lock(sys->active_compositor_mutex);
+		sc = sys->active_compositor;
+	}
+	if (sc != nullptr) {
+		return sc->render.owns_window;
+	}
+
+	// No active compositor — assume Monado-owned (default standalone)
 	return true;
 }
 
