@@ -9264,25 +9264,31 @@ comp_d3d11_service_deactivate_shell(struct xrt_system_compositor *xsysc)
 	}
 
 	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	struct d3d11_multi_compositor *mc = nullptr;
 
-	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	// First lock scope: do all work that needs the mutex EXCEPT stopping
+	// the render thread. Stopping the render thread joins it; if we hold
+	// the mutex during join, the render thread can deadlock waiting for
+	// the same mutex on its next iteration.
+	{
+		std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
 
-	struct d3d11_multi_compositor *mc = sys->multi_comp;
-	if (mc == nullptr) {
-		U_LOG_W("Shell deactivate: no multi-comp — nothing to do");
-		return;
-	}
+		mc = sys->multi_comp;
+		if (mc == nullptr) {
+			U_LOG_W("Shell deactivate: no multi-comp — nothing to do");
+			return;
+		}
 
-	if (mc->suspended) {
-		U_LOG_W("Shell deactivate: already suspended");
-		return;
-	}
+		if (mc->suspended) {
+			U_LOG_W("Shell deactivate: already suspended");
+			return;
+		}
 
-	U_LOG_W("Shell deactivate: beginning teardown");
+		U_LOG_W("Shell deactivate: beginning teardown");
 
-	// Clear the compositor's local shell_mode flag so layer_commit
-	// takes the standalone path instead of the (now suspended) multi-comp.
-	sys->shell_mode = false;
+		// Clear the compositor's local shell_mode flag so layer_commit
+		// takes the standalone path instead of the (now suspended) multi-comp.
+		sys->shell_mode = false;
 
 	// --- 4C.2: Stop all capture sessions and restore 2D windows ---
 	for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
@@ -9319,25 +9325,39 @@ comp_d3d11_service_deactivate_shell(struct xrt_system_compositor *xsysc)
 	// Each app's next layer_commit detects shell_mode=false and lazily creates
 	// its own swap chain + DP on its own thread (no cross-thread WM).
 
-	// Reset drag/focus state
-	mc->focused_slot = -1;
-	mc->drag.active = false;
-	mc->title_drag.active = false;
-	mc->resize.active = false;
+		// Reset drag/focus state
+		mc->focused_slot = -1;
+		mc->drag.active = false;
+		mc->title_drag.active = false;
+		mc->resize.active = false;
 
-	// --- 4C.5: Suspend multi-compositor ---
-	capture_render_thread_stop(sys);
+		// Set request flag for render thread to exit. Don't join here —
+		// joining while holding the mutex deadlocks if the render thread
+		// is currently blocked trying to acquire it.
+		mc->capture_render_running.store(false);
+	} // release render_mutex
 
-	if (mc->display_processor != nullptr) {
-		xrt_display_processor_d3d11_request_display_mode(mc->display_processor, false);
-		xrt_display_processor_d3d11_destroy(&mc->display_processor);
+	// Now safe to join the render thread (no mutex held).
+	if (mc->capture_render_thread.joinable()) {
+		mc->capture_render_thread.join();
 	}
+	U_LOG_W("Shell deactivate: render thread joined");
 
-	if (mc->hwnd != nullptr) {
-		ShowWindow(mc->hwnd, SW_HIDE);
+	// Re-acquire for final cleanup (DP destroy, hide window).
+	{
+		std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+
+		if (mc->display_processor != nullptr) {
+			xrt_display_processor_d3d11_request_display_mode(mc->display_processor, false);
+			xrt_display_processor_d3d11_destroy(&mc->display_processor);
+		}
+
+		if (mc->hwnd != nullptr) {
+			ShowWindow(mc->hwnd, SW_HIDE);
+		}
+
+		mc->suspended = true;
 	}
-
-	mc->suspended = true;
 
 	U_LOG_W("Shell deactivate: complete — captures stopped, multi-comp suspended, "
 	        "IPC clients will lazy-switch to standalone on next frame");
