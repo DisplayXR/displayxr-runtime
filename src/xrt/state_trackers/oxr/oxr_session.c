@@ -2578,25 +2578,11 @@ oxr_session_create(struct oxr_logger *log,
 		    xsi.external_window_handle != NULL && sys->xsysc != NULL &&
 		    sys->xsysc->info.shell_mode) {
 			HWND hwnd = (HWND)xsi.external_window_handle;
-			// Shell mode: resize HWND to display-native for correct Kooima
-			// projection, but keep decorations intact for hot-switch.
-			// On deactivate, ShowWindow(SW_SHOW) reveals the window with
-			// correct size — Kooima uses the client rect and screen position.
-			uint32_t disp_px_w = sys->xsysc->info.display_pixel_width;
-			uint32_t disp_px_h = sys->xsysc->info.display_pixel_height;
-			if (disp_px_w > 0 && disp_px_h > 0) {
-				// Size the window so the CLIENT rect = display-native.
-				// AdjustWindowRect accounts for title bar + borders.
-				LONG style = (LONG)GetWindowLongPtr(hwnd, GWL_STYLE);
-				RECT wr = {0, 0, (LONG)disp_px_w, (LONG)disp_px_h};
-				AdjustWindowRect(&wr, style, FALSE);
-				SetWindowPos(hwnd, HWND_TOP, 0, 0,
-				             wr.right - wr.left, wr.bottom - wr.top,
-				             SWP_NOACTIVATE);
-			}
+			// Shell mode: just hide the HWND. The lazy standalone init
+			// (in layer_commit) will make it borderless fullscreen when
+			// the shell deactivates. No style/size changes here.
 			ShowWindow(hwnd, SW_HIDE);
-			U_LOG_W("Shell session: resized+hidden app HWND %p to %ux%u (decorations preserved)",
-			        hwnd, disp_px_w, disp_px_h);
+			U_LOG_W("Shell session: hidden app HWND %p", hwnd);
 		}
 	}
 #endif
