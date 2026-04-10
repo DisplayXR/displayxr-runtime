@@ -169,6 +169,17 @@ ipc_try_get_sr_view_poses(struct ipc_server *s,
 		}
 
 		if (have_wm) {
+			static uint32_t metrics_log_count = 0;
+			if (metrics_log_count++ % 300 == 0) {
+				IPC_WARN(s, "View poses: wm win=%.4fx%.4f m, offset=(%.4f,%.4f,%.4f), "
+				         "win_px=%ux%u, disp_px=%ux%u, shell=%d",
+				         wm.window_width_m, wm.window_height_m,
+				         wm.window_center_offset_x_m, wm.window_center_offset_y_m,
+				         wm.window_center_offset_z_m,
+				         wm.window_pixel_width, wm.window_pixel_height,
+				         wm.display_pixel_width, wm.display_pixel_height,
+				         s->shell_mode);
+			}
 			screen_width_m = wm.window_width_m;
 			screen_height_m = wm.window_height_m;
 			eye_offset_x = wm.window_center_offset_x_m;

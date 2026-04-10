@@ -221,6 +221,9 @@ struct d3d11_service_compositor
 	//! Current focus state
 	bool state_focused;
 
+	//! App's HWND from XR_EXT_win32_window_binding (for lazy standalone init)
+	HWND app_hwnd;
+
 	//! Whether the window has been closed (triggers session exit)
 	bool window_closed;
 
@@ -4886,26 +4889,65 @@ multi_compositor_render(struct d3d11_service_system *sys)
 					slot->client_type = CLIENT_TYPE_IPC;
 					mc->client_count--;
 					mc->capture_client_count--;
-				} else if (slot->compositor != nullptr &&
-				           slot->compositor->xses != nullptr) {
-					// Send LOSS_PENDING so apps can recreate in standalone
-					union xrt_session_event xse = XRT_STRUCT_INIT;
-					xse.loss_pending.type = XRT_SESSION_EVENT_LOSS_PENDING;
-					xse.loss_pending.loss_time_ns =
-					    (int64_t)os_monotonic_get_ns() + 500000000LL;
-					xrt_session_event_sink_push(slot->compositor->xses, &xse);
+				} else if (slot->compositor != nullptr) {
+					// Hot-switch IPC client to standalone mode
+					struct d3d11_client_render_resources *res = &slot->compositor->render;
+					HWND app_hwnd = slot->app_hwnd;
+					if (app_hwnd != nullptr && IsWindow(app_hwnd)) {
+						ShowWindow(app_hwnd, SW_SHOW);
+						res->hwnd = app_hwnd;
+						res->owns_window = false;
+
+						RECT cr;
+						uint32_t sc_w = sys->output_width, sc_h = sys->output_height;
+						if (GetClientRect(app_hwnd, &cr)) {
+							uint32_t cw = (uint32_t)(cr.right - cr.left);
+							uint32_t ch = (uint32_t)(cr.bottom - cr.top);
+							if (cw > 0 && ch > 0) { sc_w = cw; sc_h = ch; }
+						}
+
+						DXGI_SWAP_CHAIN_DESC1 sc_desc = {};
+						sc_desc.Width = sc_w;
+						sc_desc.Height = sc_h;
+						sc_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+						sc_desc.SampleDesc.Count = 1;
+						sc_desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+						sc_desc.BufferCount = 2;
+						sc_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+
+						HRESULT hr = sys->dxgi_factory->CreateSwapChainForHwnd(
+						    sys->device.get(), app_hwnd, &sc_desc,
+						    nullptr, nullptr, res->swap_chain.put());
+						if (SUCCEEDED(hr)) {
+							wil::com_ptr<ID3D11Texture2D> bb;
+							res->swap_chain->GetBuffer(0, IID_PPV_ARGS(bb.put()));
+							sys->device->CreateRenderTargetView(
+							    bb.get(), nullptr, res->back_buffer_rtv.put());
+						}
+
+						if (sys->base.info.dp_factory_d3d11 != NULL) {
+							auto factory = (xrt_dp_factory_d3d11_fn_t)sys->base.info.dp_factory_d3d11;
+							factory(sys->device.get(), sys->context.get(),
+							        app_hwnd, &res->display_processor);
+							if (res->display_processor != nullptr && sys->hardware_display_3d) {
+								xrt_display_processor_d3d11_request_display_mode(
+								    res->display_processor, true);
+							}
+						}
+						U_LOG_W("Dismiss: hot-switched slot %d to standalone", i);
+					}
 				}
 			}
 
 			// Stop render thread
 			capture_render_thread_stop(sys);
 
-			// Release DP (display already back to 2D from the window-close handler)
+			// Release shared DP (per-client DPs now handle display)
 			if (mc->display_processor != nullptr) {
 				xrt_display_processor_d3d11_destroy(&mc->display_processor);
 			}
 
-			U_LOG_W("Multi-comp: shell dismissed (ESC) — captures restored, LOSS_PENDING sent");
+			U_LOG_W("Multi-comp: shell dismissed — captures restored, IPC clients hot-switched");
 		}
 		return;
 	}
@@ -7411,6 +7453,74 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		return XRT_SUCCESS;
 	}
 
+	// --- Lazy standalone init (hot-switch from shell → standalone) ---
+	// Shell was deactivated: shell_mode is false but this client was created
+	// in shell mode (no swap chain, no DP). Create standalone resources now,
+	// on the app's own IPC thread — safe from WM deadlocks.
+	if (!c->render.swap_chain) {
+		U_LOG_W("Hot-switch check: swap_chain=NULL, app_hwnd=%p, shell_mode=%d",
+		        (void *)c->app_hwnd, sys->shell_mode);
+	}
+	if (!c->render.swap_chain && c->app_hwnd != nullptr && IsWindow(c->app_hwnd)) {
+		U_LOG_W("Hot-switch: lazy standalone init for HWND=%p", (void *)c->app_hwnd);
+
+		// Show the app's HWND (hidden during shell mode).
+		// Decorations are preserved — no style changes needed.
+		ShowWindow(c->app_hwnd, SW_SHOWNOACTIVATE);
+
+		c->render.hwnd = c->app_hwnd;
+		c->render.owns_window = false;
+
+		RECT cr;
+		uint32_t sc_w = sys->output_width, sc_h = sys->output_height;
+		if (GetClientRect(c->app_hwnd, &cr)) {
+			uint32_t cw = (uint32_t)(cr.right - cr.left);
+			uint32_t ch = (uint32_t)(cr.bottom - cr.top);
+			if (cw > 0 && ch > 0) { sc_w = cw; sc_h = ch; }
+		}
+
+		DXGI_SWAP_CHAIN_DESC1 sc_desc = {};
+		sc_desc.Width = sc_w;
+		sc_desc.Height = sc_h;
+		sc_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		sc_desc.SampleDesc.Count = 1;
+		sc_desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+		sc_desc.BufferCount = 2;
+		sc_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+
+		HRESULT hr = sys->dxgi_factory->CreateSwapChainForHwnd(
+		    sys->device.get(), c->app_hwnd, &sc_desc,
+		    nullptr, nullptr, c->render.swap_chain.put());
+		if (SUCCEEDED(hr)) {
+			wil::com_ptr<ID3D11Texture2D> bb;
+			c->render.swap_chain->GetBuffer(0, IID_PPV_ARGS(bb.put()));
+			sys->device->CreateRenderTargetView(bb.get(), nullptr, c->render.back_buffer_rtv.put());
+			U_LOG_W("Hot-switch: swap chain created (%ux%u)", sc_w, sc_h);
+		} else {
+			U_LOG_E("Hot-switch: swap chain failed (hr=0x%08X)", hr);
+		}
+
+		if (sys->base.info.dp_factory_d3d11 != NULL) {
+			auto factory = (xrt_dp_factory_d3d11_fn_t)sys->base.info.dp_factory_d3d11;
+			factory(sys->device.get(), sys->context.get(),
+			        c->app_hwnd, &c->render.display_processor);
+			if (c->render.display_processor != nullptr) {
+				if (sys->hardware_display_3d) {
+					xrt_display_processor_d3d11_request_display_mode(
+					    c->render.display_processor, true);
+				}
+				U_LOG_W("Hot-switch: DP created — standalone rendering active");
+			} else {
+				U_LOG_W("Hot-switch: no DP (factory returned null) — raw copy fallback");
+			}
+		}
+
+		U_LOG_W("Hot-switch: swap_chain=%p, back_buffer_rtv=%p, dp=%p",
+		        (void *)c->render.swap_chain.get(),
+		        (void *)c->render.back_buffer_rtv.get(),
+		        (void *)c->render.display_processor);
+	}
+
 	// During drag, synchronize with the window thread's WM_PAINT cycle.
 	// This ensures the window position is stable between weave() and Present(),
 	// so the interlacing pattern matches the actual displayed position.
@@ -7652,6 +7762,9 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 		// HWND resize is done CLIENT-SIDE in oxr_session_create (before the IPC call)
 		// because cross-process SetWindowPos deadlocks when called from the IPC handler.
 		sys->multi_comp->clients[slot].app_hwnd = (HWND)external_hwnd;
+
+		// Also store on compositor for lazy standalone init during hot-switch
+		c->app_hwnd = (HWND)external_hwnd;
 
 		// Get app name from HWND title for title bar display.
 		// If another slot already has the same name, append "-2", "-3", etc.
@@ -8221,38 +8334,19 @@ comp_d3d11_service_get_window_metrics(struct xrt_system_compositor *xsysc,
 		return false;
 	}
 
-	// Get window client rect
-	RECT rect;
-	if (!GetClientRect(metrics_hwnd, &rect)) {
-		out_metrics->valid = false;
-		return false;
-	}
-	uint32_t win_px_w = static_cast<uint32_t>(rect.right - rect.left);
-	uint32_t win_px_h = static_cast<uint32_t>(rect.bottom - rect.top);
-	if (win_px_w == 0 || win_px_h == 0) {
-		out_metrics->valid = false;
-		return false;
-	}
-
-	// Get window screen position
-	POINT client_origin = {0, 0};
-	ClientToScreen(metrics_hwnd, &client_origin);
-
-	// Compute pixel size (meters per pixel)
-	float pixel_size_x = disp_w_m / (float)disp_px_w;
-	float pixel_size_y = disp_h_m / (float)disp_px_h;
-
-	// Window physical size
-	float win_w_m = (float)win_px_w * pixel_size_x;
-	float win_h_m = (float)win_px_h * pixel_size_y;
-
-	// Window center offset in meters
-	float win_center_px_x = (float)(client_origin.x - disp_left) + (float)win_px_w / 2.0f;
-	float win_center_px_y = (float)(client_origin.y - disp_top) + (float)win_px_h / 2.0f;
-	float disp_center_px_x = (float)disp_px_w / 2.0f;
-	float disp_center_px_y = (float)disp_px_h / 2.0f;
-	float offset_x_m = (win_center_px_x - disp_center_px_x) * pixel_size_x;
-	float offset_y_m = -((win_center_px_y - disp_center_px_y) * pixel_size_y);
+	// In non-shell standalone mode (hot-switched), the app owns the full
+	// display — use display dimensions directly. The DP renders to the full
+	// display regardless of HWND decorations.
+	// In shell mode, this function isn't called (get_client_window_metrics
+	// handles per-window Kooima).
+	uint32_t win_px_w = disp_px_w;
+	uint32_t win_px_h = disp_px_h;
+	int32_t win_screen_left = disp_left;
+	int32_t win_screen_top = disp_top;
+	float win_w_m = disp_w_m;
+	float win_h_m = disp_h_m;
+	float offset_x_m = 0.0f;
+	float offset_y_m = 0.0f;
 
 	memset(out_metrics, 0, sizeof(*out_metrics));
 	out_metrics->display_width_m = disp_w_m;
@@ -8263,8 +8357,8 @@ comp_d3d11_service_get_window_metrics(struct xrt_system_compositor *xsysc,
 	out_metrics->display_screen_top = disp_top;
 	out_metrics->window_pixel_width = win_px_w;
 	out_metrics->window_pixel_height = win_px_h;
-	out_metrics->window_screen_left = static_cast<int32_t>(client_origin.x);
-	out_metrics->window_screen_top = static_cast<int32_t>(client_origin.y);
+	out_metrics->window_screen_left = win_screen_left;
+	out_metrics->window_screen_top = win_screen_top;
 	out_metrics->window_width_m = win_w_m;
 	out_metrics->window_height_m = win_h_m;
 	out_metrics->window_center_offset_x_m = offset_x_m;
@@ -8968,6 +9062,39 @@ comp_d3d11_service_ensure_shell_window(struct xrt_system_compositor *xsysc)
 		U_LOG_W("Shell: resuming from suspended state");
 
 		mc->suspended = false;
+		sys->shell_mode = true;
+
+		// Reverse hot-switch: tear down per-client standalone resources,
+		// re-hide app HWNDs. Apps go back to exporting via multi-comp.
+		for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
+			struct d3d11_multi_client_slot *slot = &mc->clients[i];
+			if (!slot->active || slot->client_type != CLIENT_TYPE_IPC) {
+				continue;
+			}
+			if (slot->compositor == nullptr) {
+				continue;
+			}
+
+			struct d3d11_client_render_resources *res = &slot->compositor->render;
+
+			// Destroy per-client DP
+			if (res->display_processor != nullptr) {
+				xrt_display_processor_d3d11_request_display_mode(res->display_processor, false);
+				xrt_display_processor_d3d11_destroy(&res->display_processor);
+			}
+
+			// Destroy per-client swap chain + back buffer
+			res->back_buffer_rtv.reset();
+			res->swap_chain.reset();
+			res->hwnd = nullptr;
+
+			// Re-hide the app's HWND (shell composites it now)
+			if (slot->app_hwnd != nullptr && IsWindow(slot->app_hwnd)) {
+				ShowWindow(slot->app_hwnd, SW_HIDE);
+			}
+
+			U_LOG_W("Shell resume: hot-switched slot %d back to export mode", i);
+		}
 
 		// Show the shell window again
 		if (mc->hwnd != nullptr) {
@@ -9065,6 +9192,10 @@ comp_d3d11_service_deactivate_shell(struct xrt_system_compositor *xsysc)
 
 	U_LOG_W("Shell deactivate: beginning teardown");
 
+	// Clear the compositor's local shell_mode flag so layer_commit
+	// takes the standalone path instead of the (now suspended) multi-comp.
+	sys->shell_mode = false;
+
 	// --- 4C.2: Stop all capture sessions and restore 2D windows ---
 	for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
 		struct d3d11_multi_client_slot *slot = &mc->clients[i];
@@ -9072,7 +9203,6 @@ comp_d3d11_service_deactivate_shell(struct xrt_system_compositor *xsysc)
 			continue;
 		}
 
-		// Stop capture
 		d3d11_capture_stop(slot->capture_ctx);
 		slot->capture_ctx = nullptr;
 		slot->capture_srv = nullptr;
@@ -9080,11 +9210,9 @@ comp_d3d11_service_deactivate_shell(struct xrt_system_compositor *xsysc)
 		slot->capture_width = 0;
 		slot->capture_height = 0;
 
-		// Restore window to original desktop position and style
 		if (slot->app_hwnd != nullptr && IsWindow(slot->app_hwnd)) {
 			SetWindowPlacement(slot->app_hwnd, &slot->saved_placement);
 			SetWindowLongPtr(slot->app_hwnd, GWL_EXSTYLE, slot->saved_exstyle);
-			// Force window to repaint at restored position
 			SetWindowPos(slot->app_hwnd, HWND_TOP, 0, 0, 0, 0,
 			             SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
 			U_LOG_W("Shell deactivate: restored 2D window HWND=%p", (void *)slot->app_hwnd);
@@ -9092,30 +9220,16 @@ comp_d3d11_service_deactivate_shell(struct xrt_system_compositor *xsysc)
 
 		slot->active = false;
 		slot->compositor = nullptr;
-		slot->client_type = CLIENT_TYPE_IPC; // reset
+		slot->client_type = CLIENT_TYPE_IPC;
 		mc->client_count--;
 		mc->capture_client_count--;
 	}
 
-	// --- 4C.3: Push SESSION_LOSS_PENDING to IPC clients ---
-	// Apps receive XR_SESSION_STATE_LOSS_PENDING, destroy their session,
-	// and optionally recreate. On recreate, shell_mode will be false so
-	// they come up in standalone mode (visible HWND, own DP).
-	for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
-		struct d3d11_multi_client_slot *slot = &mc->clients[i];
-		if (!slot->active || slot->client_type != CLIENT_TYPE_IPC) {
-			continue;
-		}
-		if (slot->compositor == nullptr || slot->compositor->xses == nullptr) {
-			continue;
-		}
-		union xrt_session_event xse = XRT_STRUCT_INIT;
-		xse.loss_pending.type = XRT_SESSION_EVENT_LOSS_PENDING;
-		xse.loss_pending.loss_time_ns =
-		    (int64_t)os_monotonic_get_ns() + 500000000LL; // 500ms grace
-		xrt_session_event_sink_push(slot->compositor->xses, &xse);
-		U_LOG_W("Shell deactivate: sent LOSS_PENDING to IPC slot %d", i);
-	}
+	// --- 4C.3: IPC clients hot-switch to standalone (lazy) ---
+	// Don't create resources here — that deadlocks (DXGI sends WM to app thread
+	// which is blocked on IPC). Instead, just suspend the multi-comp.
+	// Each app's next layer_commit detects shell_mode=false and lazily creates
+	// its own swap chain + DP on its own thread (no cross-thread WM).
 
 	// Reset drag/focus state
 	mc->focused_slot = -1;
@@ -9124,22 +9238,19 @@ comp_d3d11_service_deactivate_shell(struct xrt_system_compositor *xsysc)
 	mc->resize.active = false;
 
 	// --- 4C.5: Suspend multi-compositor ---
-
-	// Stop render thread
 	capture_render_thread_stop(sys);
 
-	// Switch display back to 2D before releasing DP
 	if (mc->display_processor != nullptr) {
 		xrt_display_processor_d3d11_request_display_mode(mc->display_processor, false);
 		xrt_display_processor_d3d11_destroy(&mc->display_processor);
 	}
 
-	// Hide shell window (keep HWND alive for resume)
 	if (mc->hwnd != nullptr) {
 		ShowWindow(mc->hwnd, SW_HIDE);
 	}
 
 	mc->suspended = true;
 
-	U_LOG_W("Shell deactivate: complete — captures stopped, DP released, window hidden");
+	U_LOG_W("Shell deactivate: complete — captures stopped, multi-comp suspended, "
+	        "IPC clients will lazy-switch to standalone on next frame");
 }
