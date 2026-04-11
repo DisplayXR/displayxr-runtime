@@ -18,6 +18,8 @@ DisplayXR Unity and Unreal plugins are expected to generate a manifest automatic
 
 **Not every executable in a DisplayXR SDK install ships a manifest.** In particular, test-only variants (`cube_hosted_legacy_*`, `cube_texture_*`, `cube_hosted_*`, and similar) intentionally omit a sidecar so they do not appear in the launcher — they exist to exercise runtime paths that are not meaningful to end users. Only apps that a user would plausibly launch from the shell should ship a manifest. Inside this repo, only the `cube_handle_*_win` reference apps carry sidecars.
 
+**The shell ships no built-in default apps.** When `registered_apps.json` does not exist (first run), the registry starts empty. The scanner immediately populates whatever it finds via sidecars; if it finds nothing, the launcher renders the empty-state hint instead of a tile grid. There is no pre-seeded "Notepad" or other system app — the launcher is exclusively a curated DisplayXR app surface, never a generic Windows app drawer.
+
 ## 2. File location
 
 The manifest lives **next to the executable** it describes, with the filename stem matching the executable:

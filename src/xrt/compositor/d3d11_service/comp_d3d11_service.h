@@ -336,6 +336,17 @@ void
 comp_d3d11_service_add_launcher_app(struct xrt_system_compositor *xsysc,
                                     const struct ipc_launcher_app *app);
 
+/*!
+ * Phase 5.9/5.10: poll-and-clear the pending launcher tile click. Returns the
+ * tile index the user clicked since the last poll, or -1 if none. Called by
+ * the shell from its main poll loop; on a hit the shell looks up the
+ * corresponding registered app and launches it via shell_launch_registered_app.
+ *
+ * @ingroup comp_d3d11_service
+ */
+int32_t
+comp_d3d11_service_poll_launcher_click(struct xrt_system_compositor *xsysc);
+
 /*! @} */
 
 

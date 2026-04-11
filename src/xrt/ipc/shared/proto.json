@@ -96,6 +96,12 @@
 		]
 	},
 
+	"shell_poll_launcher_click": {
+		"out": [
+			{"name": "tile_index", "type": "int64_t"}
+		]
+	},
+
 	"shell_get_window_pose": {
 		"in": [
 			{"name": "client_id", "type": "uint32_t"}

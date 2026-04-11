@@ -2065,6 +2065,26 @@ ipc_handle_shell_add_launcher_app(volatile struct ipc_client_state *_ics,
 }
 
 xrt_result_t
+ipc_handle_shell_poll_launcher_click(volatile struct ipc_client_state *_ics,
+                                      int64_t *out_tile_index)
+{
+	struct ipc_server *s = _ics->server;
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (s->xsysc == NULL || out_tile_index == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	*out_tile_index = (int64_t)comp_d3d11_service_poll_launcher_click(s->xsysc);
+	return XRT_SUCCESS;
+#else
+	(void)s;
+	if (out_tile_index != NULL) *out_tile_index = -1;
+	return XRT_ERROR_IPC_FAILURE;
+#endif
+}
+
+xrt_result_t
 ipc_handle_shell_set_window_pose(volatile struct ipc_client_state *_ics,
                                   uint32_t client_id,
                                   const struct xrt_pose *pose,

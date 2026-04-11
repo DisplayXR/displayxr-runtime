@@ -297,6 +297,11 @@ struct d3d11_service_system
 	struct ipc_launcher_app launcher_apps[IPC_LAUNCHER_MAX_APPS];
 	uint32_t launcher_app_count;
 
+	//! Phase 5.9/5.10: pending launcher tile click. Set by the WM_LBUTTONDOWN
+	//! handler when the user clicks a tile, consumed by the shell via
+	//! ipc_call_shell_poll_launcher_click(). -1 means no pending click.
+	int32_t pending_launcher_click_index = -1;
+
 	//! Multi-compositor control interface for session state management
 	struct xrt_multi_compositor_control xmcc;
 
@@ -4232,6 +4237,88 @@ struct shell_hit_result
 };
 
 /*!
+ * Phase 5.9: hit test the launcher tile grid against a cursor position.
+ *
+ * The launcher panel sits at z=0 in display coordinates (zero-disparity plane),
+ * so the cursor position on the shell window converts directly to display
+ * meters — no eye-projection raycast needed. Mirrors the layout math used by
+ * the render pass so the visible tiles align with the hit boxes.
+ *
+ * Returns the tile index hit (0..launcher_app_count-1), -1 if cursor is over
+ * the panel but not on a tile (used to suppress click-through), or -2 if the
+ * cursor is outside the panel entirely (caller should dismiss the launcher).
+ */
+static int
+launcher_hit_test(struct d3d11_service_system *sys, POINT cursor_px)
+{
+	float disp_w_m = sys->base.info.display_width_m;
+	float disp_h_m = sys->base.info.display_height_m;
+	uint32_t disp_px_w = sys->base.info.display_pixel_width;
+	uint32_t disp_px_h = sys->base.info.display_pixel_height;
+	if (disp_w_m <= 0.0f) disp_w_m = 0.700f;
+	if (disp_h_m <= 0.0f) disp_h_m = 0.394f;
+	if (disp_px_w == 0) disp_px_w = 3840;
+	if (disp_px_h == 0) disp_px_h = 2160;
+
+	// Cursor → display-surface meters (origin = display center, +x right, +y up).
+	// Same formula as the existing taskbar hit-test path.
+	float cursor_x_m = ((float)cursor_px.x - (float)disp_px_w / 2.0f) *
+	                   disp_w_m / (float)disp_px_w;
+	float cursor_y_m = ((float)disp_px_h / 2.0f - (float)cursor_px.y) *
+	                   disp_h_m / (float)disp_px_h;
+
+	// Panel geometry — must mirror the render block exactly.
+	const float panel_w_frac = 0.60f;
+	const float panel_h_frac = 0.55f;
+	float panel_w_m = disp_w_m * panel_w_frac;
+	float panel_h_m = disp_h_m * panel_h_frac;
+
+	// Outside panel → caller treats as dismiss.
+	if (cursor_x_m < -panel_w_m * 0.5f || cursor_x_m > panel_w_m * 0.5f ||
+	    cursor_y_m < -panel_h_m * 0.5f || cursor_y_m > panel_h_m * 0.5f) {
+		return -2;
+	}
+
+	// Convert to panel-local meters (origin top-left).
+	float lx = cursor_x_m + panel_w_m * 0.5f;
+	float ly = panel_h_m * 0.5f - cursor_y_m;
+
+	// Tile layout — mirrors the render pass, but in meters instead of pixels.
+	// All ratios are unit-independent so the same fractions work in either.
+	const int LAUNCHER_GRID_COLS = 4;
+	float margin = panel_w_m * 0.04f;
+	float title_h = panel_h_m * 0.13f;
+	float section_h = panel_h_m * 0.07f;
+	float tile_w = (panel_w_m - (LAUNCHER_GRID_COLS + 1) * margin) /
+	               (float)LAUNCHER_GRID_COLS;
+	float tile_h = tile_w * 0.65f;
+	float section_text_h = section_h * 0.65f;
+	float section_y = title_h + margin * 0.5f;
+	float grid_top = section_y + section_text_h + margin * 0.5f;
+	// Label height = font_glyph_h * label_scale where label_scale =
+	// (section_h_px * 0.65 / font_glyph_h) * 0.85 → in meters: section_h * 0.65 * 0.85.
+	float label_h = section_text_h * 0.85f;
+
+	uint32_t n_apps = sys->launcher_app_count;
+	if (n_apps > IPC_LAUNCHER_MAX_APPS) {
+		n_apps = IPC_LAUNCHER_MAX_APPS;
+	}
+	for (uint32_t i = 0; i < n_apps; i++) {
+		int tcol = (int)(i % LAUNCHER_GRID_COLS);
+		int trow = (int)(i / LAUNCHER_GRID_COLS);
+		float tx = margin + (float)tcol * (tile_w + margin);
+		float ty = grid_top + (float)trow * (tile_h + label_h + margin);
+		if (lx >= tx && lx <= tx + tile_w &&
+		    ly >= ty && ly <= ty + tile_h) {
+			return (int)i;
+		}
+	}
+
+	// Inside panel but not on a tile (e.g. title bar, gaps).
+	return -1;
+}
+
+/*!
  * Spatial raycast hit-test: cast a ray from the user's eye through the mouse
  * cursor position on the display surface, and intersect with shell window planes.
  *
@@ -5313,6 +5400,25 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			POINT pt;
 			GetCursorPos(&pt);
 			ScreenToClient(mc->hwnd, &pt);
+
+			// Phase 5.9/5.10: launcher takes click priority when visible.
+			// Hit a tile → store the index for the shell to consume + hide
+			// the launcher. Click outside the panel → just hide (dismiss).
+			// Click inside panel but not on a tile → swallow (no dismiss,
+			// no launch).
+			if (mc->launcher_visible) {
+				int tile = launcher_hit_test(sys, pt);
+				if (tile >= 0) {
+					sys->pending_launcher_click_index = tile;
+					mc->launcher_visible = false;
+					U_LOG_W("Launcher: tile %d clicked", tile);
+				} else if (tile == -2) {
+					mc->launcher_visible = false;
+					U_LOG_W("Launcher: dismissed by click outside panel");
+				}
+				// Either way, do not propagate this click to window logic.
+				goto after_lmb_handling;
+			}
 
 			// Spatial raycast: cast ray from eye through cursor on display surface
 			struct shell_hit_result hit = shell_raycast_hit_test(sys, mc, pt);
@@ -9839,6 +9945,25 @@ comp_d3d11_service_add_launcher_app(struct xrt_system_compositor *xsysc,
 	if (mc != nullptr && mc->hwnd != nullptr && mc->launcher_visible) {
 		InvalidateRect(mc->hwnd, nullptr, FALSE);
 	}
+}
+
+// Phase 5.9/5.10: poll-and-clear the pending launcher tile click. The
+// WM_LBUTTONDOWN handler stores the tile index when the user clicks; the
+// shell calls this from its poll loop, gets the index, and dispatches a
+// CreateProcess via shell_launch_registered_app on its end.
+int32_t
+comp_d3d11_service_poll_launcher_click(struct xrt_system_compositor *xsysc)
+{
+	if (xsysc == nullptr) {
+		return -1;
+	}
+
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+
+	int32_t idx = sys->pending_launcher_click_index;
+	sys->pending_launcher_click_index = -1;
+	return idx;
 }
 
 // Phase 5.7: spatial launcher visibility toggle. Just flips the render-thread
