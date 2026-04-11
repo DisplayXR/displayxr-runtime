@@ -20,6 +20,7 @@
 
 #include "util/u_logging.h"
 #include "util/u_misc.h"
+#include "util/u_system.h"
 #include "util/u_time.h"
 #include "os/os_time.h"
 
@@ -296,6 +297,10 @@ struct d3d11_service_system
 
 	//! System devices for qwerty input support (passed to per-client windows)
 	struct xrt_system_devices *xsysd;
+
+	//! System used to fan out session events to every registered OpenXR
+	//! session (used for RENDERING_MODE_CHANGED / HARDWARE_DISPLAY_STATE).
+	struct u_system *usys;
 
 	//! D3D11 device (owned by service, not the app)
 	wil::com_ptr<ID3D11Device5> device;
@@ -794,6 +799,43 @@ sync_tile_layout(struct d3d11_service_system *sys)
 	if (sys->display_width > 0 && sys->display_height > 0) {
 		sys->view_width = sys->display_width / sys->tile_columns;
 		sys->view_height = sys->display_height / sys->tile_rows;
+	}
+}
+
+/*!
+ * Fan out a rendering-mode-change session event to every registered OpenXR
+ * session under this system. Also fans out a hardware-display-state-change
+ * event if the 3D bit flipped between prev_idx and new_idx. No-op if the
+ * index did not change.
+ */
+static void
+broadcast_rendering_mode_change(struct d3d11_service_system *sys,
+                                struct xrt_device *head,
+                                uint32_t prev_idx,
+                                uint32_t new_idx)
+{
+	if (sys == nullptr || sys->usys == nullptr || head == nullptr || head->hmd == NULL) {
+		return;
+	}
+	if (prev_idx == new_idx) {
+		return;
+	}
+
+	union xrt_session_event xse = {};
+	xse.rendering_mode_change.type = XRT_SESSION_EVENT_RENDERING_MODE_CHANGE;
+	xse.rendering_mode_change.previous_mode_index = prev_idx;
+	xse.rendering_mode_change.current_mode_index = new_idx;
+	u_system_broadcast_event(sys->usys, &xse);
+
+	if (prev_idx < head->rendering_mode_count && new_idx < head->rendering_mode_count) {
+		bool prev_3d = head->rendering_modes[prev_idx].hardware_display_3d;
+		bool new_3d = head->rendering_modes[new_idx].hardware_display_3d;
+		if (prev_3d != new_3d) {
+			union xrt_session_event xse2 = {};
+			xse2.hardware_display_state_change.type = XRT_SESSION_EVENT_HARDWARE_DISPLAY_STATE_CHANGE;
+			xse2.hardware_display_state_change.hardware_display_3d = new_3d;
+			u_system_broadcast_event(sys->usys, &xse2);
+		}
 	}
 }
 
@@ -5852,6 +5894,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			    ? sys->xsysd->static_roles.head : nullptr;
 
 			if (head != nullptr && head->hmd != NULL) {
+				uint32_t prev_idx = head->hmd->active_rendering_mode_index;
 				if (want_2d) {
 					// Save current 3D mode index before switching to 2D
 					uint32_t cur = head->hmd->active_rendering_mode_index;
@@ -5864,6 +5907,8 @@ multi_compositor_render(struct d3d11_service_system *sys)
 					// Restore 3D mode
 					head->hmd->active_rendering_mode_index = sys->last_3d_mode_index;
 				}
+				broadcast_rendering_mode_change(sys, head, prev_idx,
+				                                head->hmd->active_rendering_mode_index);
 			}
 
 			// Switch display HW mode
@@ -7004,6 +7049,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		if (toggled) {
 			struct xrt_device *head = sys->xsysd->static_roles.head;
 			if (head != nullptr && head->hmd != NULL) {
+				uint32_t prev_idx = head->hmd->active_rendering_mode_index;
 				if (force_2d) {
 					// Save current 3D mode index before switching to 2D
 					uint32_t cur = head->hmd->active_rendering_mode_index;
@@ -7016,6 +7062,8 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 					// Restore last 3D mode index
 					head->hmd->active_rendering_mode_index = sys->last_3d_mode_index;
 				}
+				broadcast_rendering_mode_change(sys, head, prev_idx,
+				                                head->hmd->active_rendering_mode_index);
 			}
 			// Switch display mode on the active DP.
 			// In shell mode, the multi-comp owns the DP (per-client has none).
@@ -7037,8 +7085,11 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			int render_mode = -1;
 			if (qwerty_check_rendering_mode_change(sys->xsysd->xdevs, sys->xsysd->xdev_count, &render_mode)) {
 				struct xrt_device *head = sys->xsysd->static_roles.head;
-				if (head != NULL) {
+				if (head != NULL && head->hmd != NULL) {
+					uint32_t prev_idx = head->hmd->active_rendering_mode_index;
 					xrt_device_set_property(head, XRT_DEVICE_PROPERTY_OUTPUT_MODE, render_mode);
+					broadcast_rendering_mode_change(sys, head, prev_idx,
+					                                head->hmd->active_rendering_mode_index);
 				}
 			}
 		}
@@ -7064,6 +7115,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				// Update the device's active rendering mode to match
 				struct xrt_device *head = sys->xsysd ? sys->xsysd->static_roles.head : nullptr;
 				if (head != nullptr && head->hmd != NULL) {
+					uint32_t prev_idx = head->hmd->active_rendering_mode_index;
 					if (!vendor_is_3d) {
 						uint32_t cur = head->hmd->active_rendering_mode_index;
 						if (cur < head->rendering_mode_count &&
@@ -7074,6 +7126,8 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 					} else {
 						head->hmd->active_rendering_mode_index = sys->last_3d_mode_index;
 					}
+					broadcast_rendering_mode_change(sys, head, prev_idx,
+					                                head->hmd->active_rendering_mode_index);
 				}
 				sync_tile_layout(sys);
 			}
@@ -8082,15 +8136,17 @@ system_destroy(struct xrt_system_compositor *xsysc)
 extern "C" xrt_result_t
 comp_d3d11_service_create_system(struct xrt_device *xdev,
                                  struct xrt_system_devices *xsysd,
+                                 struct u_system *usys,
                                  struct xrt_system_compositor **out_xsysc)
 {
-	U_LOG_W("Creating D3D11 service system compositor (xsysd=%p)", (void *)xsysd);
+	U_LOG_W("Creating D3D11 service system compositor (xsysd=%p usys=%p)", (void *)xsysd, (void *)usys);
 
 	// Allocate system compositor
 	struct d3d11_service_system *sys = new d3d11_service_system();
 	std::memset(&sys->base, 0, sizeof(sys->base));
 
 	sys->xdev = xdev;
+	sys->usys = usys;
 	sys->log_level = U_LOGGING_INFO;
 	sys->hardware_display_3d = true;
 	sys->last_3d_mode_index = 1;

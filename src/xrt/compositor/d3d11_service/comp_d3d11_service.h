@@ -25,6 +25,8 @@
 extern "C" {
 #endif
 
+struct u_system;
+
 
 /*!
  * @defgroup comp_d3d11_service D3D11 Service Compositor
@@ -44,6 +46,7 @@ extern "C" {
  *
  * @param xdev The head device to render for.
  * @param xsysd System devices for qwerty input support (may be NULL).
+ * @param usys System used to fan out session events (may be NULL).
  * @param[out] out_xsysc Pointer to receive the system compositor.
  * @return XRT_SUCCESS on success.
  *
@@ -52,6 +55,7 @@ extern "C" {
 xrt_result_t
 comp_d3d11_service_create_system(struct xrt_device *xdev,
                                  struct xrt_system_devices *xsysd,
+                                 struct u_system *usys,
                                  struct xrt_system_compositor **out_xsysc);
 
 /*!

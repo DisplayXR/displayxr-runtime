@@ -173,7 +173,7 @@ t_instance_create_system(struct xrt_instance *xinst,
 	// Try D3D11 service compositor first (preferred for Windows service mode)
 	if (xret == XRT_SUCCESS && xsysc == NULL && debug_get_bool_option_use_d3d11_service()) {
 		U_LOG_W("Using D3D11 service compositor");
-		xret = comp_d3d11_service_create_system(head, xsysd, &xsysc);
+		xret = comp_d3d11_service_create_system(head, xsysd, usys, &xsysc);
 		if (xret == XRT_SUCCESS && xsysc != NULL) {
 			U_LOG_W("Service compositor ready: D3D11 service compositor (pure D3D11, no Vulkan)");
 		}

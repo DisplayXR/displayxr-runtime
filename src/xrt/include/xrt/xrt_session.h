@@ -72,6 +72,12 @@ enum xrt_session_event_type
 	//! Triggers FOCUSED→VISIBLE→SYNCHRONIZED→STOPPING transition so
 	//! the app can call xrEndSession and continue running.
 	XRT_SESSION_EVENT_EXIT_REQUEST = 11,
+
+	//! The active rendering mode index has changed (XR_EXT_display_info).
+	XRT_SESSION_EVENT_RENDERING_MODE_CHANGE = 12,
+
+	//! The hardware display 3D state has changed (XR_EXT_display_info).
+	XRT_SESSION_EVENT_HARDWARE_DISPLAY_STATE_CHANGE = 13,
 };
 
 /*!
@@ -194,6 +200,26 @@ struct xrt_session_event_user_presence_change
 };
 
 /*!
+ * Rendering mode changed event, type @ref XRT_SESSION_EVENT_RENDERING_MODE_CHANGE.
+ */
+struct xrt_session_event_rendering_mode_change
+{
+	enum xrt_session_event_type type;
+	uint32_t previous_mode_index;
+	uint32_t current_mode_index;
+};
+
+/*!
+ * Hardware display 3D state changed event,
+ * type @ref XRT_SESSION_EVENT_HARDWARE_DISPLAY_STATE_CHANGE.
+ */
+struct xrt_session_event_hardware_display_state_change
+{
+	enum xrt_session_event_type type;
+	bool hardware_display_3d;
+};
+
+/*!
  * Union of all session events, used to return multiple events through one call.
  * Each event struct must start with a @ref xrt_session_event_type field.
  *
@@ -212,6 +238,8 @@ union xrt_session_event {
 	struct xrt_session_event_passthrough_state_change passthru;
 	struct xrt_session_event_visibility_mask_change mask_change;
 	struct xrt_session_event_user_presence_change presence_change;
+	struct xrt_session_event_rendering_mode_change rendering_mode_change;
+	struct xrt_session_event_hardware_display_state_change hardware_display_state_change;
 };
 
 /*!
