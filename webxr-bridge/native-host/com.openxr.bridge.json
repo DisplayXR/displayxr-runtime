@@ -1,9 +1,0 @@
-{
-  "name": "com.openxr.bridge",
-  "description": "WebXR-to-OpenXR bridge native host for Monado runtime",
-  "path": "/path/to/openxr_bridge_host",
-  "type": "stdio",
-  "allowed_origins": [
-    "chrome-extension://YOUR_EXTENSION_ID/"
-  ]
-}
