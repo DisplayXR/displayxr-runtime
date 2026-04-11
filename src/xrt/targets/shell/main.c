@@ -1123,6 +1123,46 @@ shell_running_set_contains(const struct shell_running_set *set, const char *app_
 	return false;
 }
 
+/*!
+ * Phase 5.8: ship the current g_registered_apps[] array to the service so
+ * the spatial launcher panel can render its tile grid. Uses a clear+add
+ * pattern (one IPC call per app) so each message stays under IPC_BUF_SIZE.
+ * The shell must re-call this whenever the registry changes (browse-for-app,
+ * remove, refresh).
+ */
+static void
+shell_push_registered_apps_to_service(struct ipc_connection *ipc_c)
+{
+	xrt_result_t r = ipc_call_shell_clear_launcher_apps(ipc_c);
+	if (r != XRT_SUCCESS) {
+		PE("ipc_call_shell_clear_launcher_apps failed: %d\n", r);
+		return;
+	}
+
+	int pushed = 0;
+	int cap = g_registered_app_count;
+	if (cap > IPC_LAUNCHER_MAX_APPS) {
+		cap = IPC_LAUNCHER_MAX_APPS;
+	}
+	for (int i = 0; i < cap; i++) {
+		const struct registered_app *src = &g_registered_apps[i];
+
+		struct ipc_launcher_app msg;
+		memset(&msg, 0, sizeof(msg));
+		snprintf(msg.name, sizeof(msg.name), "%s", src->name);
+		snprintf(msg.exe_path, sizeof(msg.exe_path), "%s", src->exe_path);
+		snprintf(msg.type, sizeof(msg.type), "%s", src->type);
+
+		r = ipc_call_shell_add_launcher_app(ipc_c, &msg);
+		if (r != XRT_SUCCESS) {
+			PE("ipc_call_shell_add_launcher_app[%d] failed: %d\n", i, r);
+			return;
+		}
+		pushed++;
+	}
+	P("Pushed %d app(s) to launcher.\n", pushed);
+}
+
 // --- 4C.10+4C.11: App launch from shell + auto-detect type ---
 
 /*!
@@ -1413,6 +1453,10 @@ main(int argc, char *argv[])
 
 	// Load registered apps config (Phase 4C.9 + Phase 5.5 scanner merge)
 	registered_apps_load();
+
+	// Phase 5.8: push the merged registry to the service so the spatial
+	// launcher panel can render its tile grid.
+	shell_push_registered_apps_to_service(&ipc_c);
 
 #ifdef _WIN32
 	// --- Resolve runtime JSON path (needed for app launches) ---

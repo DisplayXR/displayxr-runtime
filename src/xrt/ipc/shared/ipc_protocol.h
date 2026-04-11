@@ -304,6 +304,28 @@ struct ipc_client_list
 };
 
 /*!
+ * Phase 5.8: registered-app record shipped one-at-a-time from the shell
+ * process to the service for the spatial launcher panel. Sized to fit a
+ * single ipc message under IPC_BUF_SIZE — the shell calls
+ * ipc_call_shell_clear_launcher_apps then loops over its registry calling
+ * ipc_call_shell_add_launcher_app per entry whenever the registry changes.
+ *
+ * @ingroup ipc
+ */
+
+#define IPC_LAUNCHER_MAX_APPS 32
+#define IPC_LAUNCHER_NAME_MAX 96
+#define IPC_LAUNCHER_PATH_MAX 256
+#define IPC_LAUNCHER_TYPE_MAX 8
+
+struct ipc_launcher_app
+{
+	char name[IPC_LAUNCHER_NAME_MAX];
+	char exe_path[IPC_LAUNCHER_PATH_MAX];
+	char type[IPC_LAUNCHER_TYPE_MAX]; // "3d" or "2d"
+};
+
+/*!
  * State for a connected application.
  *
  * @ingroup ipc
