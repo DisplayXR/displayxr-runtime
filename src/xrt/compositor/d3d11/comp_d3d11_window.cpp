@@ -156,6 +156,13 @@ struct comp_d3d11_window
 	//! Set by compositor thread, read by WndProc thread.
 	volatile LONG input_suppress;
 
+	//! Phase 5.12: grace period for input_suppress after the launcher closes.
+	//! Holds a GetTickCount() value; while GetTickCount() < input_suppress_until_tick
+	//! the WndProc treats input as suppressed even when input_suppress=0. Prevents
+	//! the Esc-that-closes-the-launcher from leaking into the focused app on the
+	//! next message-queue drain (render thread vs window thread race).
+	volatile LONG input_suppress_until_tick;
+
 	//! True when a mouse button press originated inside the app content rect.
 	//! Used to prevent title bar clicks from being forwarded as app drags.
 	//! Set on button-down inside rect, cleared on button-up.
@@ -327,6 +334,11 @@ set_fullscreen(HWND hWnd, bool fullscreen)
 	}
 }
 
+// Forward declaration — defined later in this file alongside the suppress
+// setters so the logic lives in one place. Used by wnd_proc to gate key
+// and mouse forwarding.
+static bool input_is_suppressed(struct comp_d3d11_window *w);
+
 /*!
  * Window procedure — runs on the window thread.
  *
@@ -431,6 +443,14 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	case WM_SYSKEYUP:
 	case WM_CHAR:
 	case WM_SYSCHAR: {
+		// Phase 5.12: when the shell is suppressing input (launcher visible,
+		// resize drag, or within the post-launcher grace period) we eat the
+		// key entirely — don't forward, don't run qwerty. Otherwise the
+		// launcher's Esc / arrows / Enter leak through and close the app.
+		if (input_is_suppressed(w)) {
+			return 0;
+		}
+
 		// Shell input forwarding: all keys go to BOTH qwerty and the app.
 		// Qwerty processes first (mode toggles, camera controls), then
 		// the key is forwarded to the focused app's HWND.
@@ -499,8 +519,9 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	case WM_MBUTTONUP:
 	case WM_MOUSEMOVE:
 	case WM_MOUSEWHEEL: {
-		// Skip forwarding when shell drag/resize is active
-		if (InterlockedCompareExchange(&w->input_suppress, 0, 0)) {
+		// Skip forwarding when shell drag/resize is active or within the
+		// launcher grace period.
+		if (input_is_suppressed(w)) {
 			break; // fall through to qwerty/default handling
 		}
 
@@ -1095,6 +1116,27 @@ comp_d3d11_window_set_input_forward(struct comp_d3d11_window *window,
 	} else {
 		U_LOG_W("D3D11 window: input forwarding disabled");
 	}
+}
+
+// Returns true if input forwarding should currently be suppressed, considering
+// both the immediate flag and the tick-count grace period (Phase 5.12).
+static bool
+input_is_suppressed(struct comp_d3d11_window *w)
+{
+	if (InterlockedCompareExchange(&w->input_suppress, 0, 0)) return true;
+	LONG until = InterlockedCompareExchange(&w->input_suppress_until_tick, 0, 0);
+	if (until == 0) return false;
+	// GetTickCount() wraps every ~49 days; use signed diff for wrap-safety.
+	LONG now = (LONG)GetTickCount();
+	return (LONG)(until - now) > 0;
+}
+
+extern "C" void
+comp_d3d11_window_set_input_suppress_grace_ms(struct comp_d3d11_window *window, uint32_t ms)
+{
+	if (window == NULL) return;
+	LONG until = (LONG)(GetTickCount() + ms);
+	InterlockedExchange(&window->input_suppress_until_tick, until);
 }
 
 extern "C" void

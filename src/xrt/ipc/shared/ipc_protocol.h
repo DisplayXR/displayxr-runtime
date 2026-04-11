@@ -318,6 +318,11 @@ struct ipc_client_list
 #define IPC_LAUNCHER_PATH_MAX 256
 #define IPC_LAUNCHER_TYPE_MAX 8
 
+// Phase 5.14: sentinel returned via ipc_call_shell_poll_launcher_click to mean
+// "the user clicked the Browse-for-app virtual tile" rather than a real tile.
+// Real tile indices are >= 0; -1 means no pending action.
+#define IPC_LAUNCHER_ACTION_BROWSE (-100)
+
 struct ipc_launcher_app
 {
 	char name[IPC_LAUNCHER_NAME_MAX];

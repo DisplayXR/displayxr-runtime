@@ -307,6 +307,15 @@ struct d3d11_service_system
 	//! The render pass draws a glow border around set tiles.
 	uint64_t running_tile_mask = 0;
 
+	//! Phase 5.12: visible-space selection index for the launcher grid.
+	//! -1 = nothing selected. Reset to 0 when the launcher becomes visible.
+	int32_t launcher_selected_index = -1;
+
+	//! Phase 5.13: bitmask of tiles the user has hidden this session via
+	//! right-click → Remove. Bit i = launcher_apps[i] is hidden. Cleared on
+	//! every shell registry re-push so the state is session-only.
+	uint64_t hidden_tile_mask = 0;
+
 	//! Multi-compositor control interface for session state management
 	struct xrt_multi_compositor_control xmcc;
 
@@ -4241,20 +4250,88 @@ struct shell_hit_result
 	int edge_flags;      //!< RESIZE_LEFT|RIGHT|TOP|BOTTOM if near edge
 };
 
+// Phase 5.12: toggle launcher visibility AND the window's input-suppress
+// flag in one place. When the launcher is up we want keyboard input to
+// drive the launcher itself (arrows / Enter / Esc) rather than leaking
+// through to the focused app; mirror the existing resize/drag pattern
+// which uses `comp_d3d11_window_set_input_suppress` for the same purpose.
+static void
+launcher_set_visible(struct d3d11_service_system *sys,
+                     struct d3d11_multi_compositor *mc, bool visible)
+{
+	if (mc == nullptr) return;
+	if (mc->launcher_visible == visible) return;
+
+	mc->launcher_visible = visible;
+	if (mc->window != nullptr) {
+		if (visible) {
+			comp_d3d11_window_set_input_suppress(mc->window, true);
+		} else {
+			// Phase 5.12: set the grace-period timestamp BEFORE clearing
+			// the immediate flag. If we cleared the flag first and then
+			// set the grace, the window thread could sample between the
+			// two writes and see neither active → forward the Esc that
+			// triggered the close. 200ms covers any WM_KEYDOWN queued on
+			// the window thread before the render thread got here.
+			comp_d3d11_window_set_input_suppress_grace_ms(mc->window, 200);
+			comp_d3d11_window_set_input_suppress(mc->window, false);
+		}
+	}
+	// Phase 5.12: when opening, force keyboard focus onto the compositor
+	// window. Without this, keys still route to whichever app previously
+	// had focus (the cube) and never reach the WndProc that the launcher's
+	// input-suppress gate lives in. The shell process grants us
+	// foreground-activation permission via AllowSetForegroundWindow before
+	// firing this IPC.
+	if (visible && mc->hwnd != nullptr) {
+		SetForegroundWindow(mc->hwnd);
+		SetFocus(mc->hwnd);
+	}
+	if (visible) {
+		sys->launcher_selected_index = 0;
+	} else {
+		sys->launcher_selected_index = -1;
+	}
+}
+
+// Phase 5.12+5.13+5.14: build the compacted visible-tile remap for the
+// launcher. Walks sys->launcher_apps skipping any bit set in hidden_tile_mask
+// and writes the full-space indices into @p out. The render pass and hit
+// test share this so the grid positions agree across the frame.
+//
+// Returns the number of visible tiles written. Does NOT include the virtual
+// "Add app…" Browse tile — that gets slot [n_visible] in both the render and
+// hit-test code paths.
+static uint32_t
+launcher_build_visible_list(const struct d3d11_service_system *sys,
+                            int out_visible_to_full[IPC_LAUNCHER_MAX_APPS])
+{
+	uint32_t n_apps = sys->launcher_app_count;
+	if (n_apps > IPC_LAUNCHER_MAX_APPS) n_apps = IPC_LAUNCHER_MAX_APPS;
+	uint32_t n_visible = 0;
+	for (uint32_t i = 0; i < n_apps; i++) {
+		if ((sys->hidden_tile_mask & (1ULL << i)) != 0) continue;
+		out_visible_to_full[n_visible++] = (int)i;
+	}
+	return n_visible;
+}
+
 /*!
- * Phase 5.9: hit test the launcher tile grid against a cursor position.
+ * Phase 5.9 / 5.13 / 5.14: hit test the launcher grid against a cursor.
  *
  * The launcher panel sits at z=0 in display coordinates (zero-disparity plane),
  * so the cursor position on the shell window converts directly to display
  * meters — no eye-projection raycast needed. Mirrors the layout math used by
  * the render pass so the visible tiles align with the hit boxes.
  *
- * Returns the tile index hit (0..launcher_app_count-1), -1 if cursor is over
- * the panel but not on a tile (used to suppress click-through), or -2 if the
- * cursor is outside the panel entirely (caller should dismiss the launcher).
+ * Returns:
+ *   - 0..n_visible-1      real tile hit (visible-space index, caller maps to full)
+ *   - n_visible           the virtual "Add app…" Browse tile
+ *   - -1                  inside panel but on a gap / title / header
+ *   - -2                  outside panel entirely (caller treats as dismiss)
  */
 static int
-launcher_hit_test(struct d3d11_service_system *sys, POINT cursor_px)
+launcher_hit_test(struct d3d11_service_system *sys, POINT cursor_px, uint32_t n_visible)
 {
 	float disp_w_m = sys->base.info.display_width_m;
 	float disp_h_m = sys->base.info.display_height_m;
@@ -4304,11 +4381,10 @@ launcher_hit_test(struct d3d11_service_system *sys, POINT cursor_px)
 	// (section_h_px * 0.65 / font_glyph_h) * 0.85 → in meters: section_h * 0.65 * 0.85.
 	float label_h = section_text_h * 0.85f;
 
-	uint32_t n_apps = sys->launcher_app_count;
-	if (n_apps > IPC_LAUNCHER_MAX_APPS) {
-		n_apps = IPC_LAUNCHER_MAX_APPS;
-	}
-	for (uint32_t i = 0; i < n_apps; i++) {
+	// Walk the visible tile grid PLUS one virtual Browse tile at position n_visible.
+	uint32_t n_total = n_visible + 1;
+	if (n_total > IPC_LAUNCHER_MAX_APPS + 1) n_total = IPC_LAUNCHER_MAX_APPS + 1;
+	for (uint32_t i = 0; i < n_total; i++) {
 		int tcol = (int)(i % LAUNCHER_GRID_COLS);
 		int trow = (int)(i / LAUNCHER_GRID_COLS);
 		float tx = margin + (float)tcol * (tile_w + margin);
@@ -5166,6 +5242,64 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		return;
 	}
 
+	// Phase 5.12: launcher keyboard navigation.
+	// When the launcher is visible the arrow keys move selection, Enter
+	// fires the selected tile (or the Browse tile), and Esc dismisses the
+	// launcher. The normal TAB/DELETE/F11/Ctrl+1-3 shortcuts are gated
+	// out so e.g. Enter while launcher is open doesn't also toggle layout.
+	if (mc->launcher_visible) {
+		const int LAUNCHER_GRID_COLS = 4;
+		int visible_to_full[IPC_LAUNCHER_MAX_APPS];
+		uint32_t n_visible = launcher_build_visible_list(sys, visible_to_full);
+		// Addressable range includes the Browse tile at index n_visible.
+		int n_selectable = (int)n_visible + 1;
+
+		if (sys->launcher_selected_index < 0) sys->launcher_selected_index = 0;
+		if (sys->launcher_selected_index >= n_selectable) {
+			sys->launcher_selected_index = n_selectable - 1;
+		}
+
+		if (GetAsyncKeyState(VK_RIGHT) & 1) {
+			sys->launcher_selected_index =
+			    (sys->launcher_selected_index + 1) % n_selectable;
+		}
+		if (GetAsyncKeyState(VK_LEFT) & 1) {
+			sys->launcher_selected_index =
+			    (sys->launcher_selected_index - 1 + n_selectable) % n_selectable;
+		}
+		if (GetAsyncKeyState(VK_DOWN) & 1) {
+			int next = sys->launcher_selected_index + LAUNCHER_GRID_COLS;
+			if (next < n_selectable) {
+				sys->launcher_selected_index = next;
+			}
+		}
+		if (GetAsyncKeyState(VK_UP) & 1) {
+			int prev = sys->launcher_selected_index - LAUNCHER_GRID_COLS;
+			if (prev >= 0) {
+				sys->launcher_selected_index = prev;
+			}
+		}
+		if (GetAsyncKeyState(VK_RETURN) & 1) {
+			int sel = sys->launcher_selected_index;
+			if (sel == (int)n_visible) {
+				sys->pending_launcher_click_index = IPC_LAUNCHER_ACTION_BROWSE;
+				launcher_set_visible(sys, mc, false);
+				U_LOG_W("Launcher: Enter on Browse tile");
+			} else if (sel >= 0 && sel < (int)n_visible) {
+				sys->pending_launcher_click_index = visible_to_full[sel];
+				launcher_set_visible(sys, mc, false);
+				U_LOG_W("Launcher: Enter on tile vis=%d full=%d",
+				        sel, visible_to_full[sel]);
+			}
+		}
+		if (GetAsyncKeyState(VK_ESCAPE) & 1) {
+			launcher_set_visible(sys, mc, false);
+			U_LOG_W("Launcher: Esc dismissed");
+		}
+
+		goto after_key_shortcuts;
+	}
+
 	// TAB: cycle focus — includes unfocused state (-1)
 	// Cycle: slot 0 → slot 1 → ... → -1 (unfocused) → slot 0
 	// Ignore ALT+TAB (system task switcher) — only process bare TAB.
@@ -5267,6 +5401,9 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			enter_dynamic_layout(sys, mc, 0); // carousel
 		}
 	}
+
+after_key_shortcuts:
+	(void)0; // label target for the launcher-visible fast-path above.
 
 	// Update cursor via window thread (compositor thread can't call SetCursor directly).
 	// Cursor IDs: 0=arrow, 1=sizewe, 2=sizens, 3=sizenwse, 4=sizenesw, 5=sizeall
@@ -5406,19 +5543,26 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			GetCursorPos(&pt);
 			ScreenToClient(mc->hwnd, &pt);
 
-			// Phase 5.9/5.10: launcher takes click priority when visible.
-			// Hit a tile → store the index for the shell to consume + hide
-			// the launcher. Click outside the panel → just hide (dismiss).
-			// Click inside panel but not on a tile → swallow (no dismiss,
-			// no launch).
+			// Phase 5.9/5.10/5.14: launcher takes click priority when visible.
+			// - vis_tile in [0, n_visible-1]  → real tile, store full index
+			// - vis_tile == n_visible         → Browse-for-app virtual tile
+			// - vis_tile == -1                → gap/title/header, swallow
+			// - vis_tile == -2                → outside panel, dismiss
 			if (mc->launcher_visible) {
-				int tile = launcher_hit_test(sys, pt);
-				if (tile >= 0) {
-					sys->pending_launcher_click_index = tile;
-					mc->launcher_visible = false;
-					U_LOG_W("Launcher: tile %d clicked", tile);
-				} else if (tile == -2) {
-					mc->launcher_visible = false;
+				int visible_to_full[IPC_LAUNCHER_MAX_APPS];
+				uint32_t n_visible = launcher_build_visible_list(sys, visible_to_full);
+				int vis_tile = launcher_hit_test(sys, pt, n_visible);
+				if (vis_tile >= 0 && vis_tile < (int)n_visible) {
+					sys->pending_launcher_click_index = visible_to_full[vis_tile];
+					launcher_set_visible(sys, mc, false);
+					U_LOG_W("Launcher: tile vis=%d full=%d clicked",
+					        vis_tile, visible_to_full[vis_tile]);
+				} else if (vis_tile == (int)n_visible) {
+					sys->pending_launcher_click_index = IPC_LAUNCHER_ACTION_BROWSE;
+					launcher_set_visible(sys, mc, false);
+					U_LOG_W("Launcher: Browse tile clicked");
+				} else if (vis_tile == -2) {
+					launcher_set_visible(sys, mc, false);
 					U_LOG_W("Launcher: dismissed by click outside panel");
 				}
 				// Either way, do not propagate this click to window logic.
@@ -6861,10 +7005,9 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		// the shell completes its first registered_apps_load + push; empty-
 		// state branch below handles that.
 		const struct ipc_launcher_app *apps = sys->launcher_apps;
-		uint32_t n_apps = sys->launcher_app_count;
-		if (n_apps > IPC_LAUNCHER_MAX_APPS) {
-			n_apps = IPC_LAUNCHER_MAX_APPS;
-		}
+		int visible_to_full[IPC_LAUNCHER_MAX_APPS];
+		uint32_t n_visible = launcher_build_visible_list(sys, visible_to_full);
+		uint32_t n_apps = n_visible; // rest of this block treats the list as compacted
 
 		// Pipeline setup once — then per-eye scissor + draw. Bind the font
 		// atlas SRV for text glyph sampling; solid-color draws ignore it.
@@ -7136,89 +7279,136 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			float label_h = (float)mc->font_glyph_h * label_scale;
 			float grid_top = section_y + (float)mc->font_glyph_h * section_scale + margin * 0.5f;
 
+			// Render real tiles (compacted via visible_to_full) + the virtual
+			// "Add app…" Browse tile at position n_visible. When there are no
+			// real tiles we still draw the Browse tile plus the empty-state
+			// hint above it so the launcher is never completely blank.
 			if (n_apps == 0) {
 				const char *empty_line1 = "No apps discovered";
-				const char *empty_line2 = "Add a .displayxr.json sidecar next to your exe.";
+				const char *empty_line2 = "Add a .displayxr.json sidecar next to your exe, or use the tile below.";
 				float empty_scale_1 = section_scale * 0.95f;
-				float empty_scale_2 = section_scale * 0.65f;
+				float empty_scale_2 = section_scale * 0.60f;
 				float w1 = measure_text(empty_line1, empty_scale_1);
 				float w2 = measure_text(empty_line2, empty_scale_2);
 				float ex1 = panel_x + (panel_w_px - w1) * 0.5f;
 				float ex2 = panel_x + (panel_w_px - w2) * 0.5f;
-				float ey1 = grid_top + tile_h * 0.30f;
+				float ey1 = grid_top + tile_h * 0.15f;
 				float ey2 = ey1 + (float)mc->font_glyph_h * empty_scale_1 + margin * 0.4f;
 				draw_text(empty_line1, ex1, ey1, empty_scale_1);
 				draw_text(empty_line2, ex2, ey2, empty_scale_2);
-			} else {
-				for (uint32_t i = 0; i < n_apps; i++) {
-					int tcol = (int)(i % LAUNCHER_GRID_COLS);
-					int trow = (int)(i / LAUNCHER_GRID_COLS);
-					float tx = panel_x + margin + (float)tcol * (tile_w + margin);
-					float ty = grid_top + (float)trow * (tile_h + label_h + margin);
+			}
 
-					bool tile_running = (sys->running_tile_mask & (1ULL << i)) != 0;
+			for (uint32_t vi = 0; vi < n_apps; vi++) {
+				int full_idx = visible_to_full[vi];
+				int tcol = (int)(vi % LAUNCHER_GRID_COLS);
+				int trow = (int)(vi / LAUNCHER_GRID_COLS);
+				float tx = panel_x + margin + (float)tcol * (tile_w + margin);
+				float ty = grid_top + (float)trow * (tile_h + label_h + margin);
 
-					// Phase 5.11: glow border for running tiles. Draw an
-					// oversized quad in glow mode (convert_srgb=3.0) so the
-					// shader fades the inner rect into the surrounding margin.
-					if (tile_running) {
-						float glow_margin = tile_h * 0.18f;
-						float gx = tx - glow_margin;
-						float gy = ty - glow_margin;
-						float gw = tile_w + 2.0f * glow_margin;
-						float gh = tile_h + 2.0f * glow_margin;
-						float glow_ext = glow_margin / gh;
+				bool tile_running = (sys->running_tile_mask & (1ULL << full_idx)) != 0;
+				bool tile_selected = (sys->launcher_selected_index == (int32_t)vi);
 
-						D3D11_MAPPED_SUBRESOURCE gm;
-						if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
-						                                D3D11_MAP_WRITE_DISCARD, 0, &gm))) {
-							BlitConstants *cb = static_cast<BlitConstants *>(gm.pData);
-							cb->src_rect[0] = 0; cb->src_rect[1] = 0;
-							cb->src_rect[2] = 1; cb->src_rect[3] = 1;
-							cb->src_size[0] = 1; cb->src_size[1] = 1;
-							cb->dst_size[0] = (float)ca_w;
-							cb->dst_size[1] = (float)ca_h;
-							cb->convert_srgb = 3.0f; // glow mode
-							cb->corner_radius = 0.0f;
-							cb->corner_aspect = 0.0f;
-							cb->edge_feather = 0.0f;
-							cb->glow_intensity = 0.85f;
-							cb->glow_extent = glow_ext;
-							cb->glow_falloff = 8.0f;
-							cb->glow_color[0] = 0.30f;
-							cb->glow_color[1] = 0.85f;
-							cb->glow_color[2] = 1.00f;
-							cb->glow_color[3] = 1.0f;
-							cb->quad_mode = 0;
-							cb->dst_offset[0] = gx;
-							cb->dst_offset[1] = gy;
-							cb->dst_rect_wh[0] = gw;
-							cb->dst_rect_wh[1] = gh;
-							memset(cb->quad_corners_01, 0, sizeof(cb->quad_corners_01));
-							memset(cb->quad_corners_23, 0, sizeof(cb->quad_corners_23));
-							sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
-							// Glow mode uses premultiplied alpha — switch
-							// blend state for this draw, then restore.
-							sys->context->OMSetBlendState(sys->blend_premul.get(), nullptr, 0xFFFFFFFF);
-							sys->context->Draw(4, 0);
-							sys->context->OMSetBlendState(sys->blend_alpha.get(), nullptr, 0xFFFFFFFF);
-						}
+				// Phase 5.11: glow border for running tiles. Draw an
+				// oversized quad in glow mode (convert_srgb=3.0) so the
+				// shader fades the inner rect into the surrounding margin.
+				if (tile_running) {
+					float glow_margin = tile_h * 0.18f;
+					float gx = tx - glow_margin;
+					float gy = ty - glow_margin;
+					float gw = tile_w + 2.0f * glow_margin;
+					float gh = tile_h + 2.0f * glow_margin;
+					float glow_ext = glow_margin / gh;
+
+					D3D11_MAPPED_SUBRESOURCE gm;
+					if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
+					                                D3D11_MAP_WRITE_DISCARD, 0, &gm))) {
+						BlitConstants *cb = static_cast<BlitConstants *>(gm.pData);
+						cb->src_rect[0] = 0; cb->src_rect[1] = 0;
+						cb->src_rect[2] = 1; cb->src_rect[3] = 1;
+						cb->src_size[0] = 1; cb->src_size[1] = 1;
+						cb->dst_size[0] = (float)ca_w;
+						cb->dst_size[1] = (float)ca_h;
+						cb->convert_srgb = 3.0f; // glow mode
+						cb->corner_radius = 0.0f;
+						cb->corner_aspect = 0.0f;
+						cb->edge_feather = 0.0f;
+						cb->glow_intensity = 0.85f;
+						cb->glow_extent = glow_ext;
+						cb->glow_falloff = 8.0f;
+						cb->glow_color[0] = 0.30f;
+						cb->glow_color[1] = 0.85f;
+						cb->glow_color[2] = 1.00f;
+						cb->glow_color[3] = 1.0f;
+						cb->quad_mode = 0;
+						cb->dst_offset[0] = gx;
+						cb->dst_offset[1] = gy;
+						cb->dst_rect_wh[0] = gw;
+						cb->dst_rect_wh[1] = gh;
+						memset(cb->quad_corners_01, 0, sizeof(cb->quad_corners_01));
+						memset(cb->quad_corners_23, 0, sizeof(cb->quad_corners_23));
+						sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
+						// Glow mode uses premultiplied alpha — switch
+						// blend state for this draw, then restore.
+						sys->context->OMSetBlendState(sys->blend_premul.get(), nullptr, 0xFFFFFFFF);
+						sys->context->Draw(4, 0);
+						sys->context->OMSetBlendState(sys->blend_alpha.get(), nullptr, 0xFFFFFFFF);
 					}
-
-					// Tile background — slightly lighter than panel, rounded.
-					// Running tiles get a brighter background to reinforce the glow.
-					float bg_r = tile_running ? 0.20f : 0.16f;
-					float bg_g = tile_running ? 0.27f : 0.19f;
-					float bg_b = tile_running ? 0.36f : 0.26f;
-					draw_solid_rect(tx, ty, tile_w, tile_h,
-					                bg_r, bg_g, bg_b, 0.95f, 0.18f, 0.0f);
-
-					// Label centered horizontally below tile, ellipsis-truncated
-					// if it would overflow into the neighbouring tile.
-					const char *label = apps[i].name;
-					float label_y = ty + tile_h + margin * 0.15f;
-					draw_label_centered(label, tx, label_y, tile_w, label_scale);
 				}
+
+				// Phase 5.12: keyboard selection outline. Draw a slightly
+				// oversized white rect behind the tile; the tile background
+				// covers the middle, leaving a thin visible ring.
+				if (tile_selected) {
+					float sm = tile_h * 0.045f;
+					draw_solid_rect(tx - sm, ty - sm,
+					                tile_w + 2.0f * sm, tile_h + 2.0f * sm,
+					                1.00f, 1.00f, 1.00f, 0.90f, 0.20f, 0.0f);
+				}
+
+				// Tile background — slightly lighter than panel, rounded.
+				// Running tiles get a brighter background to reinforce the glow.
+				float bg_r = tile_running ? 0.20f : 0.16f;
+				float bg_g = tile_running ? 0.27f : 0.19f;
+				float bg_b = tile_running ? 0.36f : 0.26f;
+				draw_solid_rect(tx, ty, tile_w, tile_h,
+				                bg_r, bg_g, bg_b, 0.95f, 0.18f, 0.0f);
+
+				// Label centered horizontally below tile, ellipsis-truncated
+				// if it would overflow into the neighbouring tile.
+				const char *label = apps[full_idx].name;
+				float label_y = ty + tile_h + margin * 0.15f;
+				draw_label_centered(label, tx, label_y, tile_w, label_scale);
+			}
+
+			// Phase 5.14: virtual "Add app…" Browse tile at position n_apps.
+			// Distinct styling (lighter, more translucent) + "+" glyph +
+			// "Add app…" label. Click here → IPC_LAUNCHER_ACTION_BROWSE.
+			{
+				uint32_t vi = n_apps;
+				int tcol = (int)(vi % LAUNCHER_GRID_COLS);
+				int trow = (int)(vi / LAUNCHER_GRID_COLS);
+				float tx = panel_x + margin + (float)tcol * (tile_w + margin);
+				float ty = grid_top + (float)trow * (tile_h + label_h + margin);
+				bool browse_selected = (sys->launcher_selected_index == (int32_t)vi);
+
+				if (browse_selected) {
+					float sm = tile_h * 0.045f;
+					draw_solid_rect(tx - sm, ty - sm,
+					                tile_w + 2.0f * sm, tile_h + 2.0f * sm,
+					                1.00f, 1.00f, 1.00f, 0.90f, 0.20f, 0.0f);
+				}
+
+				draw_solid_rect(tx, ty, tile_w, tile_h,
+				                0.20f, 0.22f, 0.28f, 0.75f, 0.18f, 0.0f);
+
+				float plus_scale = section_scale * 1.6f;
+				float plus_h = (float)mc->font_glyph_h * plus_scale;
+				draw_label_centered("+", tx, ty + (tile_h - plus_h) * 0.5f,
+				                    tile_w, plus_scale);
+
+				float browse_label_y = ty + tile_h + margin * 0.15f;
+				draw_label_centered("Add app...", tx, browse_label_y,
+				                    tile_w, label_scale);
 			}
 		}
 
@@ -9974,6 +10164,11 @@ comp_d3d11_service_clear_launcher_apps(struct xrt_system_compositor *xsysc)
 	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
 
 	sys->launcher_app_count = 0;
+	// Phase 5.13: the hidden-tile state is session-only and indices refer
+	// to positions in launcher_apps, so it only makes sense while that list
+	// is stable. Wipe it whenever a fresh push starts.
+	sys->hidden_tile_mask = 0;
+	sys->launcher_selected_index = -1;
 }
 
 // Phase 5.8: append one app to the launcher's tile grid. Silently dropped if
@@ -10071,11 +10266,7 @@ comp_d3d11_service_set_launcher_visible(struct xrt_system_compositor *xsysc, boo
 		return;
 	}
 
-	if (mc->launcher_visible == visible) {
-		return;
-	}
-
-	mc->launcher_visible = visible;
+	launcher_set_visible(sys, mc, visible);
 	U_LOG_W("Launcher: %s", visible ? "shown" : "hidden");
 
 	// Wake the render thread so the next frame reflects the new state even

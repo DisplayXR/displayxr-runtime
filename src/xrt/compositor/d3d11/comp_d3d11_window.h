@@ -212,10 +212,21 @@ comp_d3d11_window_set_input_forward(struct comp_d3d11_window *window,
 
 /*!
  * Suppress or resume input forwarding (for shell drag/resize operations).
- * When suppressed, the WndProc does not forward mouse events to the app.
+ * When suppressed, the WndProc does not forward mouse or keyboard events to
+ * the app.
  */
 void
 comp_d3d11_window_set_input_suppress(struct comp_d3d11_window *window, bool suppress);
+
+/*!
+ * Phase 5.12: extend input suppression for @p ms milliseconds from now,
+ * regardless of the immediate `input_suppress` flag. Used when closing the
+ * launcher: any WM_KEYDOWN messages still sitting in the window thread's
+ * queue (e.g. the Esc that triggered the close) get swallowed instead of
+ * leaking through to the focused app.
+ */
+void
+comp_d3d11_window_set_input_suppress_grace_ms(struct comp_d3d11_window *window, uint32_t ms);
 
 /*!
  * Read and reset accumulated scroll wheel delta (for shell window resize).
