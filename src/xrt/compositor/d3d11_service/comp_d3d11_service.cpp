@@ -602,6 +602,11 @@ struct d3d11_multi_compositor
 	//! Unlike window_dismissed, the multi-comp structure stays alive for re-activation.
 	bool suspended;
 
+	//! Phase 5.7: spatial launcher panel visible.
+	//! Toggled by Ctrl+L via ipc_call_shell_set_launcher_visible. When true, the
+	//! render loop draws a rounded-corner panel at the zero-disparity plane.
+	bool launcher_visible;
+
 	//! Debounced re-grid: when > 0, apply grid layout after this timestamp.
 	//! Set by client registration, consumed by render loop.
 	uint64_t regrid_pending_ns;
@@ -6684,6 +6689,247 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		}
 	}
 
+	// Phase 5.7 + 5.8: spatial launcher panel.
+	// Drawn at (0,0,0) in display coordinates — zero-disparity plane — so it
+	// appears on the physical display surface, which maximizes viewing comfort.
+	// At z=0 there is no parallax, so the panel lands at the same pixel
+	// position for every eye; we just center-draw into each tile.
+	//
+	// Layout (5.8): title bar text "DisplayXR Launcher" → "Installed" header
+	// → tile grid (4-column, wraps to additional rows). Hard-coded placeholder
+	// app names for now; real apps come over IPC in a follow-up task.
+	if (mc->launcher_visible) {
+		uint32_t ca_w = sys->base.info.display_pixel_width;
+		uint32_t ca_h = sys->base.info.display_pixel_height;
+		if (ca_w == 0) ca_w = 3840;
+		if (ca_h == 0) ca_h = 2160;
+		uint32_t half_w = ca_w / sys->tile_columns;
+		uint32_t half_h = ca_h / sys->tile_rows;
+		uint32_t num_views = sys->tile_columns * sys->tile_rows;
+
+		// Panel size as a fraction of the physical display — resolution-
+		// and aspect-independent. Using fractions of display_{width,height}_m
+		// instead of absolute meters ensures the panel scales correctly across
+		// laptop, tablet, and desktop displays.
+		float disp_w_m = sys->base.info.display_width_m;
+		float disp_h_m = sys->base.info.display_height_m;
+		if (disp_w_m <= 0.0f) disp_w_m = 0.700f;
+		if (disp_h_m <= 0.0f) disp_h_m = 0.394f;
+
+		const float panel_w_frac = 0.60f;
+		const float panel_h_frac = 0.55f;
+		float panel_w_m = disp_w_m * panel_w_frac;
+		float panel_h_m = disp_h_m * panel_h_frac;
+
+		float panel_w_px = ui_m_to_tile_px_x(panel_w_m, sys);
+		float panel_h_px = ui_m_to_tile_px_y(panel_h_m, sys);
+
+		// Tile grid layout (panel-relative). 4 columns wraps to additional
+		// rows when more apps are present. All sizes derived from panel
+		// dimensions so the layout scales with display size.
+		const int LAUNCHER_GRID_COLS = 4;
+		float margin = panel_w_px * 0.04f;
+		float title_h = panel_h_px * 0.13f;
+		float section_h = panel_h_px * 0.07f;
+		float tile_w = (panel_w_px - (LAUNCHER_GRID_COLS + 1) * margin) /
+		               (float)LAUNCHER_GRID_COLS;
+		float tile_h = tile_w * 0.65f;
+
+		// Hard-coded placeholder apps. The real app list will arrive via IPC
+		// in a follow-up task; this proves the layout + text rendering path.
+		const char *placeholder_apps[] = {
+			"Cube D3D11", "Cube D3D12", "Cube OpenGL", "Cube Vulkan",
+		};
+		const int n_apps = (int)(sizeof(placeholder_apps) / sizeof(placeholder_apps[0]));
+
+		// Pipeline setup once — then per-eye scissor + draw. Bind the font
+		// atlas SRV for text glyph sampling; solid-color draws ignore it.
+		sys->context->VSSetShader(sys->blit_vs.get(), nullptr, 0);
+		sys->context->PSSetShader(sys->blit_ps.get(), nullptr, 0);
+		sys->context->VSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
+		sys->context->PSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
+		ID3D11RenderTargetView *launcher_rtvs[] = {mc->combined_atlas_rtv.get()};
+		sys->context->OMSetRenderTargets(1, launcher_rtvs, nullptr);
+		sys->context->OMSetBlendState(sys->blend_alpha.get(), nullptr, 0xFFFFFFFF);
+		sys->context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+		sys->context->IASetInputLayout(nullptr);
+		sys->context->RSSetState(sys->rasterizer_state.get());
+		sys->context->OMSetDepthStencilState(sys->depth_disabled.get(), 0);
+		D3D11_VIEWPORT launcher_vp = {};
+		launcher_vp.Width = (float)ca_w;
+		launcher_vp.Height = (float)ca_h;
+		launcher_vp.MaxDepth = 1.0f;
+		sys->context->RSSetViewports(1, &launcher_vp);
+		if (mc->font_atlas_srv) {
+			ID3D11ShaderResourceView *font_srv = mc->font_atlas_srv.get();
+			sys->context->PSSetShaderResources(0, 1, &font_srv);
+			sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
+		}
+
+		// Helper: draw a solid-color rounded rect at (dx,dy,dw,dh) in atlas
+		// pixels with the given RGBA. Used for the panel background and tile
+		// backgrounds. Updates the constant buffer and issues a single Draw.
+		auto draw_solid_rect = [&](float dx, float dy, float dw, float dh,
+		                           float r, float g, float b, float a,
+		                           float corner_radius, float glow_intensity) {
+			D3D11_MAPPED_SUBRESOURCE m;
+			if (FAILED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
+			                             D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+				return;
+			}
+			BlitConstants *cb = static_cast<BlitConstants *>(m.pData);
+			cb->src_rect[0] = r;
+			cb->src_rect[1] = g;
+			cb->src_rect[2] = b;
+			cb->src_rect[3] = a;
+			cb->src_size[0] = 1;
+			cb->src_size[1] = 1;
+			cb->dst_size[0] = (float)ca_w;
+			cb->dst_size[1] = (float)ca_h;
+			cb->convert_srgb = 2.0f; // solid-color mode
+			cb->corner_radius = corner_radius;
+			cb->corner_aspect = (dh > 0.0f) ? (dw / dh) : 1.0f;
+			cb->edge_feather = (dh > 0.0f) ? (2.0f / dh) : 0.0f;
+			cb->glow_intensity = glow_intensity;
+			cb->quad_mode = 0;
+			cb->dst_offset[0] = dx;
+			cb->dst_offset[1] = dy;
+			cb->dst_rect_wh[0] = dw;
+			cb->dst_rect_wh[1] = dh;
+			memset(cb->quad_corners_01, 0, sizeof(cb->quad_corners_01));
+			memset(cb->quad_corners_23, 0, sizeof(cb->quad_corners_23));
+			sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
+			sys->context->Draw(4, 0);
+		};
+
+		// Helper: width of a string in atlas pixels at the given scale.
+		auto measure_text = [&](const char *text, float scale) -> float {
+			float w = 0.0f;
+			for (const char *p = text; *p != '\0'; p++) {
+				unsigned char ch = (unsigned char)*p;
+				if (ch < 0x20 || ch > 0x7E) ch = '?';
+				int gi = ch - 0x20;
+				w += mc->glyph_advances[gi] * scale;
+			}
+			return w;
+		};
+
+		// Helper: draw a string starting at (dx, dy) (top-left, atlas px) at
+		// the given scale, sampling the font atlas. One Draw call per glyph.
+		auto draw_text = [&](const char *text, float dx, float dy, float scale) {
+			float cursor = 0.0f;
+			float dst_gh = (float)mc->font_glyph_h * scale;
+			for (const char *p = text; *p != '\0'; p++) {
+				unsigned char ch = (unsigned char)*p;
+				if (ch < 0x20 || ch > 0x7E) ch = '?';
+				int gi = ch - 0x20;
+				float src_gw = mc->glyph_advances[gi];
+				float src_x = 0.0f;
+				for (int i = 0; i < gi; i++) {
+					src_x += mc->glyph_advances[i];
+				}
+				float dst_gw = src_gw * scale;
+
+				D3D11_MAPPED_SUBRESOURCE m;
+				if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
+				                                D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+					BlitConstants *cb = static_cast<BlitConstants *>(m.pData);
+					cb->src_rect[0] = src_x;
+					cb->src_rect[1] = 0.0f;
+					cb->src_rect[2] = src_gw;
+					cb->src_rect[3] = (float)mc->font_glyph_h;
+					cb->src_size[0] = (float)mc->font_atlas_w;
+					cb->src_size[1] = (float)mc->font_atlas_h;
+					cb->dst_size[0] = (float)ca_w;
+					cb->dst_size[1] = (float)ca_h;
+					cb->convert_srgb = 0.0f; // textured (font atlas is linear)
+					cb->corner_radius = 0.0f;
+					cb->corner_aspect = 0.0f;
+					cb->edge_feather = 0.0f;
+					cb->glow_intensity = 0.0f;
+					cb->quad_mode = 0;
+					cb->dst_offset[0] = dx + cursor;
+					cb->dst_offset[1] = dy;
+					cb->dst_rect_wh[0] = dst_gw;
+					cb->dst_rect_wh[1] = dst_gh;
+					memset(cb->quad_corners_01, 0, sizeof(cb->quad_corners_01));
+					memset(cb->quad_corners_23, 0, sizeof(cb->quad_corners_23));
+					sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
+					sys->context->Draw(4, 0);
+				}
+				cursor += dst_gw;
+			}
+		};
+
+		for (uint32_t v = 0; v < num_views && v < XRT_MAX_VIEWS; v++) {
+			uint32_t col = v % sys->tile_columns;
+			uint32_t row = v / sys->tile_columns;
+
+			// Scissor clips to this tile's bounds so the solid quad cannot
+			// bleed into neighbouring eyes.
+			D3D11_RECT scissor;
+			scissor.left = (LONG)(col * half_w);
+			scissor.top = (LONG)(row * half_h);
+			scissor.right = (LONG)((col + 1) * half_w);
+			scissor.bottom = (LONG)((row + 1) * half_h);
+			sys->context->RSSetScissorRects(1, &scissor);
+
+			// Tile-local center — z=0 means no parallax, identical for both eyes.
+			float tile_cx = (float)(col * half_w) + (float)half_w * 0.5f;
+			float tile_cy = (float)(row * half_h) + (float)half_h * 0.5f;
+			float panel_x = tile_cx - panel_w_px * 0.5f;
+			float panel_y = tile_cy - panel_h_px * 0.5f;
+
+			// 1) Panel background — dark slate with ~92% alpha.
+			draw_solid_rect(panel_x, panel_y, panel_w_px, panel_h_px,
+			                0.08f, 0.10f, 0.14f, 0.92f, 0.08f, 0.0f);
+
+			// 2) Title bar text "DisplayXR Launcher", centered horizontally
+			// in the title strip.
+			const char *title_text = "DisplayXR Launcher";
+			float title_scale = (title_h * 0.55f) / (float)mc->font_glyph_h;
+			float title_w = measure_text(title_text, title_scale);
+			float title_x = panel_x + (panel_w_px - title_w) * 0.5f;
+			float title_y = panel_y + (title_h - mc->font_glyph_h * title_scale) * 0.5f;
+			draw_text(title_text, title_x, title_y, title_scale);
+
+			// 3) "Installed" section header, left-aligned with grid margin.
+			const char *installed_text = "Installed";
+			float section_scale = (section_h * 0.65f) / (float)mc->font_glyph_h;
+			float section_x = panel_x + margin;
+			float section_y = panel_y + title_h + margin * 0.5f;
+			draw_text(installed_text, section_x, section_y, section_scale);
+
+			// 4) Tile grid — 4-column wrapping. Each row also reserves space
+			// below the tile for its label.
+			float label_scale = section_scale * 0.85f;
+			float label_h = (float)mc->font_glyph_h * label_scale;
+			float grid_top = section_y + (float)mc->font_glyph_h * section_scale + margin * 0.5f;
+			for (int i = 0; i < n_apps; i++) {
+				int tcol = i % LAUNCHER_GRID_COLS;
+				int trow = i / LAUNCHER_GRID_COLS;
+				float tx = panel_x + margin + tcol * (tile_w + margin);
+				float ty = grid_top + trow * (tile_h + label_h + margin);
+
+				// Tile background — slightly lighter than panel, rounded.
+				draw_solid_rect(tx, ty, tile_w, tile_h,
+				                0.16f, 0.19f, 0.26f, 0.95f, 0.18f, 0.0f);
+
+				// Label centered horizontally below tile, clipped if too wide.
+				const char *label = placeholder_apps[i];
+				float label_w = measure_text(label, label_scale);
+				float label_x = tx + (tile_w - label_w) * 0.5f;
+				if (label_x < tx) label_x = tx;
+				float label_y = ty + tile_h + margin * 0.15f;
+				draw_text(label, label_x, label_y, label_scale);
+			}
+		}
+
+		// Clear scissor so downstream passes aren't affected.
+		D3D11_RECT full_scissor = {0, 0, (LONG)ca_w, (LONG)ca_h};
+		sys->context->RSSetScissorRects(1, &full_scissor);
+	}
+
 	// Send full combined atlas to DP — content is placed at sub-rect positions,
 	// background is dark gray. The DP interlaces the entire image.
 	// View width/height = full atlas divided by tile layout (not sub-rect).
@@ -9415,4 +9661,38 @@ comp_d3d11_service_deactivate_shell(struct xrt_system_compositor *xsysc)
 
 	U_LOG_W("Shell deactivate: complete — captures stopped, multi-comp suspended, "
 	        "IPC clients will lazy-switch to standalone on next frame");
+}
+
+// Phase 5.7: spatial launcher visibility toggle. Just flips the render-thread
+// bool; the render loop picks it up on the next frame and draws (or skips) the
+// launcher panel overlay. No-op if there's no multi-comp yet (shell not active).
+void
+comp_d3d11_service_set_launcher_visible(struct xrt_system_compositor *xsysc, bool visible)
+{
+	if (xsysc == nullptr) {
+		return;
+	}
+
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	if (mc == nullptr || mc->suspended) {
+		U_LOG_W("Launcher: set_visible %s ignored — multi-comp not active",
+		        visible ? "true" : "false");
+		return;
+	}
+
+	if (mc->launcher_visible == visible) {
+		return;
+	}
+
+	mc->launcher_visible = visible;
+	U_LOG_W("Launcher: %s", visible ? "shown" : "hidden");
+
+	// Wake the render thread so the next frame reflects the new state even
+	// if the render loop is idling on a timer.
+	if (mc->hwnd != nullptr) {
+		InvalidateRect(mc->hwnd, nullptr, FALSE);
+	}
 }

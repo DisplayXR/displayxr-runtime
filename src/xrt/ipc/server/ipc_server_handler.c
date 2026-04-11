@@ -2007,6 +2007,26 @@ ipc_handle_shell_get_state(volatile struct ipc_client_state *_ics, bool *out_act
 }
 
 xrt_result_t
+ipc_handle_shell_set_launcher_visible(volatile struct ipc_client_state *_ics, bool visible)
+{
+	struct ipc_server *s = _ics->server;
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (s->xsysc == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	IPC_INFO(s, "Shell: set_launcher_visible %s", visible ? "true" : "false");
+	comp_d3d11_service_set_launcher_visible(s->xsysc, visible);
+	return XRT_SUCCESS;
+#else
+	(void)s;
+	(void)visible;
+	return XRT_ERROR_IPC_FAILURE;
+#endif
+}
+
+xrt_result_t
 ipc_handle_shell_set_window_pose(volatile struct ipc_client_state *_ics,
                                   uint32_t client_id,
                                   const struct xrt_pose *pose,

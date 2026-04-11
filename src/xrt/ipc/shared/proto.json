@@ -82,6 +82,12 @@
 		]
 	},
 
+	"shell_set_launcher_visible": {
+		"in": [
+			{"name": "visible", "type": "bool"}
+		]
+	},
+
 	"shell_get_window_pose": {
 		"in": [
 			{"name": "client_id", "type": "uint32_t"}
