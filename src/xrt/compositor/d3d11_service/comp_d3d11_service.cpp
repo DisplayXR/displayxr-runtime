@@ -12,6 +12,8 @@
 #include "d3d11_bitmap_font.h"
 #include "d3d11_capture.h"
 
+#include "shared/ipc_protocol.h" // struct ipc_launcher_app_list
+
 #include "xrt/xrt_handles.h"
 #include "xrt/xrt_limits.h"
 #include "xrt/xrt_session.h"
@@ -287,6 +289,13 @@ struct d3d11_service_system
 {
 	//! Base system compositor - must be first!
 	struct xrt_system_compositor base;
+
+	//! Phase 5.8: spatial launcher app registry, pushed from the shell
+	//! process via clear+add IPC calls. Lives on the service (not the
+	//! multi-comp) so it survives multi-comp create/destroy cycles —
+	//! the shell can push at any time, even before shell_activate.
+	struct ipc_launcher_app launcher_apps[IPC_LAUNCHER_MAX_APPS];
+	uint32_t launcher_app_count;
 
 	//! Multi-compositor control interface for session state management
 	struct xrt_multi_compositor_control xmcc;
@@ -605,6 +614,7 @@ struct d3d11_multi_compositor
 	//! Phase 5.7: spatial launcher panel visible.
 	//! Toggled by Ctrl+L via ipc_call_shell_set_launcher_visible. When true, the
 	//! render loop draws a rounded-corner panel at the zero-disparity plane.
+	//! The app list it renders lives on d3d11_service_system (sys->launcher_apps).
 	bool launcher_visible;
 
 	//! Debounced re-grid: when > 0, apply grid layout after this timestamp.
@@ -6735,12 +6745,15 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		               (float)LAUNCHER_GRID_COLS;
 		float tile_h = tile_w * 0.65f;
 
-		// Hard-coded placeholder apps. The real app list will arrive via IPC
-		// in a follow-up task; this proves the layout + text rendering path.
-		const char *placeholder_apps[] = {
-			"Cube D3D11", "Cube D3D12", "Cube OpenGL", "Cube Vulkan",
-		};
-		const int n_apps = (int)(sizeof(placeholder_apps) / sizeof(placeholder_apps[0]));
+		// App list pushed from the shell process via clear+add IPC calls.
+		// Stored on sys so it survives multi-comp create/destroy. Empty until
+		// the shell completes its first registered_apps_load + push; empty-
+		// state branch below handles that.
+		const struct ipc_launcher_app *apps = sys->launcher_apps;
+		uint32_t n_apps = sys->launcher_app_count;
+		if (n_apps > IPC_LAUNCHER_MAX_APPS) {
+			n_apps = IPC_LAUNCHER_MAX_APPS;
+		}
 
 		// Pipeline setup once — then per-eye scissor + draw. Bind the font
 		// atlas SRV for text glyph sampling; solid-color draws ignore it.
@@ -6812,6 +6825,110 @@ multi_compositor_render(struct d3d11_service_system *sys)
 				w += mc->glyph_advances[gi] * scale;
 			}
 			return w;
+		};
+
+		// Helper: draw a label centered horizontally within a (tx, tile_w)
+		// box, ellipsis-truncated if it doesn't fit. Used for tile labels
+		// where long sidecar names like "Cube D3D11 (Handle)" would
+		// otherwise overflow into adjacent tiles.
+		auto draw_label_centered = [&](const char *text, float tx, float ty,
+		                               float box_w, float scale) {
+			float full_w = 0.0f;
+			for (const char *p = text; *p != '\0'; p++) {
+				unsigned char ch = (unsigned char)*p;
+				if (ch < 0x20 || ch > 0x7E) ch = '?';
+				full_w += mc->glyph_advances[ch - 0x20] * scale;
+			}
+			if (full_w <= box_w) {
+				float cx = tx + (box_w - full_w) * 0.5f;
+				// Inline draw to avoid the lambda forward-decl problem.
+				float cursor = 0.0f;
+				float dst_gh = (float)mc->font_glyph_h * scale;
+				for (const char *p = text; *p != '\0'; p++) {
+					unsigned char ch = (unsigned char)*p;
+					if (ch < 0x20 || ch > 0x7E) ch = '?';
+					int gi = ch - 0x20;
+					float src_gw = mc->glyph_advances[gi];
+					float src_x = 0.0f;
+					for (int j = 0; j < gi; j++) src_x += mc->glyph_advances[j];
+					float dst_gw = src_gw * scale;
+					D3D11_MAPPED_SUBRESOURCE mm;
+					if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
+					                                D3D11_MAP_WRITE_DISCARD, 0, &mm))) {
+						BlitConstants *cb = static_cast<BlitConstants *>(mm.pData);
+						cb->src_rect[0] = src_x; cb->src_rect[1] = 0.0f;
+						cb->src_rect[2] = src_gw; cb->src_rect[3] = (float)mc->font_glyph_h;
+						cb->src_size[0] = (float)mc->font_atlas_w;
+						cb->src_size[1] = (float)mc->font_atlas_h;
+						cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
+						cb->convert_srgb = 0.0f;
+						cb->corner_radius = 0.0f; cb->corner_aspect = 0.0f;
+						cb->edge_feather = 0.0f; cb->glow_intensity = 0.0f;
+						cb->quad_mode = 0;
+						cb->dst_offset[0] = cx + cursor; cb->dst_offset[1] = ty;
+						cb->dst_rect_wh[0] = dst_gw; cb->dst_rect_wh[1] = dst_gh;
+						memset(cb->quad_corners_01, 0, sizeof(cb->quad_corners_01));
+						memset(cb->quad_corners_23, 0, sizeof(cb->quad_corners_23));
+						sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
+						sys->context->Draw(4, 0);
+					}
+					cursor += dst_gw;
+				}
+				return;
+			}
+
+			// Doesn't fit — build a truncated version with trailing "..".
+			// Greedy: walk chars while (width + ".."_width) <= box_w.
+			float dot_w = mc->glyph_advances['.' - 0x20] * scale;
+			float ellipsis_w = dot_w * 2.0f;
+			char buf[160];
+			int n = 0;
+			float w = 0.0f;
+			for (const char *p = text; *p != '\0' && n < (int)sizeof(buf) - 3; p++) {
+				unsigned char ch = (unsigned char)*p;
+				if (ch < 0x20 || ch > 0x7E) ch = '?';
+				float gw = mc->glyph_advances[ch - 0x20] * scale;
+				if (w + gw + ellipsis_w > box_w) break;
+				buf[n++] = (char)ch;
+				w += gw;
+			}
+			buf[n++] = '.'; buf[n++] = '.';
+			buf[n] = '\0';
+			float total_w = w + ellipsis_w;
+			float cx = tx + (box_w - total_w) * 0.5f;
+			if (cx < tx) cx = tx;
+
+			// Draw the truncated buffer (same inline glyph loop).
+			float cursor = 0.0f;
+			float dst_gh = (float)mc->font_glyph_h * scale;
+			for (int i = 0; i < n; i++) {
+				int gi = (unsigned char)buf[i] - 0x20;
+				float src_gw = mc->glyph_advances[gi];
+				float src_x = 0.0f;
+				for (int j = 0; j < gi; j++) src_x += mc->glyph_advances[j];
+				float dst_gw = src_gw * scale;
+				D3D11_MAPPED_SUBRESOURCE mm;
+				if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
+				                                D3D11_MAP_WRITE_DISCARD, 0, &mm))) {
+					BlitConstants *cb = static_cast<BlitConstants *>(mm.pData);
+					cb->src_rect[0] = src_x; cb->src_rect[1] = 0.0f;
+					cb->src_rect[2] = src_gw; cb->src_rect[3] = (float)mc->font_glyph_h;
+					cb->src_size[0] = (float)mc->font_atlas_w;
+					cb->src_size[1] = (float)mc->font_atlas_h;
+					cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
+					cb->convert_srgb = 0.0f;
+					cb->corner_radius = 0.0f; cb->corner_aspect = 0.0f;
+					cb->edge_feather = 0.0f; cb->glow_intensity = 0.0f;
+					cb->quad_mode = 0;
+					cb->dst_offset[0] = cx + cursor; cb->dst_offset[1] = ty;
+					cb->dst_rect_wh[0] = dst_gw; cb->dst_rect_wh[1] = dst_gh;
+					memset(cb->quad_corners_01, 0, sizeof(cb->quad_corners_01));
+					memset(cb->quad_corners_23, 0, sizeof(cb->quad_corners_23));
+					sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
+					sys->context->Draw(4, 0);
+				}
+				cursor += dst_gw;
+			}
 		};
 
 		// Helper: draw a string starting at (dx, dy) (top-left, atlas px) at
@@ -6901,27 +7018,43 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			draw_text(installed_text, section_x, section_y, section_scale);
 
 			// 4) Tile grid — 4-column wrapping. Each row also reserves space
-			// below the tile for its label.
+			// below the tile for its label. If the registry is empty (e.g.
+			// scanner found no sidecars and shell hasn't pushed yet), show
+			// an empty-state hint instead of a blank grid.
 			float label_scale = section_scale * 0.85f;
 			float label_h = (float)mc->font_glyph_h * label_scale;
 			float grid_top = section_y + (float)mc->font_glyph_h * section_scale + margin * 0.5f;
-			for (int i = 0; i < n_apps; i++) {
-				int tcol = i % LAUNCHER_GRID_COLS;
-				int trow = i / LAUNCHER_GRID_COLS;
-				float tx = panel_x + margin + tcol * (tile_w + margin);
-				float ty = grid_top + trow * (tile_h + label_h + margin);
 
-				// Tile background — slightly lighter than panel, rounded.
-				draw_solid_rect(tx, ty, tile_w, tile_h,
-				                0.16f, 0.19f, 0.26f, 0.95f, 0.18f, 0.0f);
+			if (n_apps == 0) {
+				const char *empty_line1 = "No apps discovered";
+				const char *empty_line2 = "Add a .displayxr.json sidecar next to your exe.";
+				float empty_scale_1 = section_scale * 0.95f;
+				float empty_scale_2 = section_scale * 0.65f;
+				float w1 = measure_text(empty_line1, empty_scale_1);
+				float w2 = measure_text(empty_line2, empty_scale_2);
+				float ex1 = panel_x + (panel_w_px - w1) * 0.5f;
+				float ex2 = panel_x + (panel_w_px - w2) * 0.5f;
+				float ey1 = grid_top + tile_h * 0.30f;
+				float ey2 = ey1 + (float)mc->font_glyph_h * empty_scale_1 + margin * 0.4f;
+				draw_text(empty_line1, ex1, ey1, empty_scale_1);
+				draw_text(empty_line2, ex2, ey2, empty_scale_2);
+			} else {
+				for (uint32_t i = 0; i < n_apps; i++) {
+					int tcol = (int)(i % LAUNCHER_GRID_COLS);
+					int trow = (int)(i / LAUNCHER_GRID_COLS);
+					float tx = panel_x + margin + (float)tcol * (tile_w + margin);
+					float ty = grid_top + (float)trow * (tile_h + label_h + margin);
 
-				// Label centered horizontally below tile, clipped if too wide.
-				const char *label = placeholder_apps[i];
-				float label_w = measure_text(label, label_scale);
-				float label_x = tx + (tile_w - label_w) * 0.5f;
-				if (label_x < tx) label_x = tx;
-				float label_y = ty + tile_h + margin * 0.15f;
-				draw_text(label, label_x, label_y, label_scale);
+					// Tile background — slightly lighter than panel, rounded.
+					draw_solid_rect(tx, ty, tile_w, tile_h,
+					                0.16f, 0.19f, 0.26f, 0.95f, 0.18f, 0.0f);
+
+					// Label centered horizontally below tile, ellipsis-truncated
+					// if it would overflow into the neighbouring tile.
+					const char *label = apps[i].name;
+					float label_y = ty + tile_h + margin * 0.15f;
+					draw_label_centered(label, tx, label_y, tile_w, label_scale);
+				}
 			}
 		}
 
@@ -9661,6 +9794,51 @@ comp_d3d11_service_deactivate_shell(struct xrt_system_compositor *xsysc)
 
 	U_LOG_W("Shell deactivate: complete — captures stopped, multi-comp suspended, "
 	        "IPC clients will lazy-switch to standalone on next frame");
+}
+
+// Phase 5.8: empty the launcher's app list. The shell calls this before
+// pushing a fresh registry so the tile grid never carries stale entries.
+// Stored on the system (not the multi-comp) so it survives across activations.
+void
+comp_d3d11_service_clear_launcher_apps(struct xrt_system_compositor *xsysc)
+{
+	if (xsysc == nullptr) {
+		return;
+	}
+
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+
+	sys->launcher_app_count = 0;
+}
+
+// Phase 5.8: append one app to the launcher's tile grid. Silently dropped if
+// the array is already full. The shell loops over its registry calling this
+// once per entry after a clear. Lives on the system, not the multi-comp.
+void
+comp_d3d11_service_add_launcher_app(struct xrt_system_compositor *xsysc,
+                                    const struct ipc_launcher_app *app)
+{
+	if (xsysc == nullptr || app == nullptr) {
+		return;
+	}
+
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+
+	if (sys->launcher_app_count >= IPC_LAUNCHER_MAX_APPS) {
+		return;
+	}
+
+	sys->launcher_apps[sys->launcher_app_count] = *app;
+	sys->launcher_app_count++;
+
+	// Wake the compositor window if it exists and the launcher is on-screen,
+	// so the next frame picks up the new tile.
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	if (mc != nullptr && mc->hwnd != nullptr && mc->launcher_visible) {
+		InvalidateRect(mc->hwnd, nullptr, FALSE);
+	}
 }
 
 // Phase 5.7: spatial launcher visibility toggle. Just flips the render-thread

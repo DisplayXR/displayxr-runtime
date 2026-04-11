@@ -88,6 +88,14 @@
 		]
 	},
 
+	"shell_clear_launcher_apps": {},
+
+	"shell_add_launcher_app": {
+		"in": [
+			{"name": "app", "type": "struct ipc_launcher_app"}
+		]
+	},
+
 	"shell_get_window_pose": {
 		"in": [
 			{"name": "client_id", "type": "uint32_t"}

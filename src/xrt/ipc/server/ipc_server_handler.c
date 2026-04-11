@@ -2027,6 +2027,44 @@ ipc_handle_shell_set_launcher_visible(volatile struct ipc_client_state *_ics, bo
 }
 
 xrt_result_t
+ipc_handle_shell_clear_launcher_apps(volatile struct ipc_client_state *_ics)
+{
+	struct ipc_server *s = _ics->server;
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (s->xsysc == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	comp_d3d11_service_clear_launcher_apps(s->xsysc);
+	return XRT_SUCCESS;
+#else
+	(void)s;
+	return XRT_ERROR_IPC_FAILURE;
+#endif
+}
+
+xrt_result_t
+ipc_handle_shell_add_launcher_app(volatile struct ipc_client_state *_ics,
+                                   const struct ipc_launcher_app *app)
+{
+	struct ipc_server *s = _ics->server;
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (s->xsysc == NULL || app == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	comp_d3d11_service_add_launcher_app(s->xsysc, app);
+	return XRT_SUCCESS;
+#else
+	(void)s;
+	(void)app;
+	return XRT_ERROR_IPC_FAILURE;
+#endif
+}
+
+xrt_result_t
 ipc_handle_shell_set_window_pose(volatile struct ipc_client_state *_ics,
                                   uint32_t client_id,
                                   const struct xrt_pose *pose,

@@ -25,6 +25,9 @@
 extern "C" {
 #endif
 
+// Forward decl from ipc_protocol.h — full definition is included by callers.
+struct ipc_launcher_app;
+
 
 /*!
  * @defgroup comp_d3d11_service D3D11 Service Compositor
@@ -311,6 +314,27 @@ comp_d3d11_service_deactivate_shell(struct xrt_system_compositor *xsysc);
  */
 void
 comp_d3d11_service_set_launcher_visible(struct xrt_system_compositor *xsysc, bool visible);
+
+/*!
+ * Empty the spatial launcher's app list. Called by the shell at the start of
+ * each registry push (clear-then-add-N pattern keeps each IPC message under
+ * the per-message buffer cap).
+ *
+ * @ingroup comp_d3d11_service
+ */
+void
+comp_d3d11_service_clear_launcher_apps(struct xrt_system_compositor *xsysc);
+
+/*!
+ * Append one app to the spatial launcher's tile grid. Silently dropped if the
+ * list is already full (IPC_LAUNCHER_MAX_APPS). Called by the shell once per
+ * registered app after a clear.
+ *
+ * @ingroup comp_d3d11_service
+ */
+void
+comp_d3d11_service_add_launcher_app(struct xrt_system_compositor *xsysc,
+                                    const struct ipc_launcher_app *app);
 
 /*! @} */
 
