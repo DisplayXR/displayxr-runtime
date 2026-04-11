@@ -136,3 +136,7 @@ if(EXISTS "${VK_WEAVER_DLL}")
             "$<TARGET_FILE_DIR:cube_handle_vk_win>/SimulatedRealityVulkanBeta.dll"
     )
 endif()
+
+# DisplayXR shell manifest sidecar
+include(${CMAKE_CURRENT_SOURCE_DIR}/../common/displayxr_manifest.cmake)
+displayxr_install_manifest(cube_handle_vk_win "${CMAKE_CURRENT_SOURCE_DIR}/displayxr")

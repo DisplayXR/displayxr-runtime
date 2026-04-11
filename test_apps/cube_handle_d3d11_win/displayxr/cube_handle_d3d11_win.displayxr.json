@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "name": "Cube D3D11 (Handle)",
+  "type": "3d",
+  "category": "test",
+  "display_mode": "auto",
+  "description": "Reference spinning cube demonstrating XR_EXT_win32_window_binding on Direct3D 11."
+}

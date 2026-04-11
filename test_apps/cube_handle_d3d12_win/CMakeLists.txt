@@ -120,4 +120,8 @@ if(TEXTURE_FILES)
     )
 endif()
 
+# DisplayXR shell manifest sidecar
+include(${CMAKE_CURRENT_SOURCE_DIR}/../common/displayxr_manifest.cmake)
+displayxr_install_manifest(cube_handle_d3d12_win "${CMAKE_CURRENT_SOURCE_DIR}/displayxr")
+
 
