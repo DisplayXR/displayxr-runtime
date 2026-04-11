@@ -102,6 +102,12 @@
 		]
 	},
 
+	"shell_set_running_tile_mask": {
+		"in": [
+			{"name": "mask", "type": "uint64_t"}
+		]
+	},
+
 	"shell_get_window_pose": {
 		"in": [
 			{"name": "client_id", "type": "uint32_t"}

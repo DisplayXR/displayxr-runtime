@@ -1116,6 +1116,110 @@ shell_running_set_contains(const struct shell_running_set *set, const char *app_
 }
 
 /*!
+ * Phase 5.11: case-insensitive normalized exe-path equality. Treats
+ * forward slashes as backslashes so registry-stored paths match what
+ * QueryFullProcessImageNameW returns.
+ */
+static bool
+shell_exe_paths_equal(const char *a, const char *b)
+{
+	if (a == NULL || b == NULL) return a == b;
+	while (*a && *b) {
+		int ca = (unsigned char)*a;
+		int cb = (unsigned char)*b;
+		if (ca == '/') ca = '\\';
+		if (cb == '/') cb = '\\';
+		if (ca >= 'A' && ca <= 'Z') ca += 32;
+		if (cb >= 'A' && cb <= 'Z') cb += 32;
+		if (ca != cb) return false;
+		a++; b++;
+	}
+	return *a == '\0' && *b == '\0';
+}
+
+#ifdef _WIN32
+/*!
+ * Phase 5.11: resolve a PID to its absolute exe path via
+ * QueryFullProcessImageNameW. Writes a UTF-8 path into @p out, returns true
+ * on success.
+ */
+static bool
+shell_pid_to_exe_path(DWORD pid, char *out, size_t out_size)
+{
+	if (pid == 0 || out == NULL || out_size == 0) return false;
+
+	HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+	if (h == NULL) return false;
+
+	wchar_t wpath[MAX_PATH] = {0};
+	DWORD wlen = MAX_PATH;
+	BOOL ok = QueryFullProcessImageNameW(h, 0, wpath, &wlen);
+	CloseHandle(h);
+	if (!ok || wlen == 0) return false;
+
+	int n = WideCharToMultiByte(CP_UTF8, 0, wpath, (int)wlen, out, (int)out_size - 1, NULL, NULL);
+	if (n <= 0) return false;
+	out[n] = '\0';
+	return true;
+}
+#endif
+
+/*!
+ * Phase 5.11: build a bitmask of registered apps that have at least one
+ * matching IPC client currently connected. Bit @c i set means
+ * g_registered_apps[i].exe_path equals (case-insensitive, slash-normalized)
+ * the exe path of some IPC client's PID.
+ *
+ * Returns 0 on Windows if no clients are connected; non-Windows always 0.
+ */
+static uint64_t
+shell_compute_running_tile_mask(struct ipc_connection *ipc_c)
+{
+#ifdef _WIN32
+	uint64_t mask = 0;
+
+	struct ipc_client_list clients;
+	if (ipc_call_system_get_clients(ipc_c, &clients) != XRT_SUCCESS) {
+		return 0;
+	}
+
+	// Collect each connected client's exe path once.
+	char client_exes[IPC_MAX_CLIENTS][MAX_PATH];
+	int client_exe_count = 0;
+	for (uint32_t c = 0; c < clients.id_count; c++) {
+		if (clients.ids[c] == 0) continue;
+		struct ipc_app_state ias;
+		if (ipc_call_system_get_client_info(ipc_c, clients.ids[c], &ias) != XRT_SUCCESS)
+			continue;
+		if (ias.pid == 0) continue;
+		if (shell_pid_to_exe_path((DWORD)ias.pid, client_exes[client_exe_count],
+		                          sizeof(client_exes[0]))) {
+			client_exe_count++;
+			if (client_exe_count >= IPC_MAX_CLIENTS) break;
+		}
+	}
+
+	// Match each registered app against the connected exe set.
+	int cap = g_registered_app_count;
+	if (cap > 64) cap = 64; // mask is uint64_t
+	for (int i = 0; i < cap; i++) {
+		const char *reg_exe = g_registered_apps[i].exe_path;
+		for (int j = 0; j < client_exe_count; j++) {
+			if (shell_exe_paths_equal(reg_exe, client_exes[j])) {
+				mask |= (1ULL << i);
+				break;
+			}
+		}
+	}
+
+	return mask;
+#else
+	(void)ipc_c;
+	return 0;
+#endif
+}
+
+/*!
  * Phase 5.8: ship the current g_registered_apps[] array to the service so
  * the spatial launcher panel can render its tile grid. Uses a clear+add
  * pattern (one IPC call per app) so each message stays under IPC_BUF_SIZE.
@@ -1745,6 +1849,18 @@ main(int argc, char *argv[])
 			}
 		}
 
+		// Phase 5.11: refresh the running-tile mask and push to service if
+		// it has changed. Cheap to compute (one IPC list call + per-PID
+		// QueryFullProcessImageNameW), and we only push on diff.
+		if (g_shell_active) {
+			static uint64_t s_last_running_mask = (uint64_t)-1;
+			uint64_t mask = shell_compute_running_tile_mask(&ipc_c);
+			if (mask != s_last_running_mask) {
+				ipc_call_shell_set_running_tile_mask(&ipc_c, mask);
+				s_last_running_mask = mask;
+			}
+		}
+
 		// Phase 5.10: poll for launcher tile clicks. The service-side
 		// WM_LBUTTONDOWN handler stores a tile index when the user clicks
 		// inside the launcher; we look up the registered app and dispatch
@@ -1760,13 +1876,40 @@ main(int argc, char *argv[])
 				g_launcher_visible = false; // service already hid it
 				if (tile_index < (int64_t)g_registered_app_count) {
 					struct registered_app *rapp = &g_registered_apps[tile_index];
-					P("Launcher: launching tile %lld → '%s'\n",
-					  (long long)tile_index, rapp->name);
-					shell_launch_registered_app(
-					    &ipc_c, rapp,
-					    have_json ? runtime_json : NULL,
-					    apps, &app_count,
-					    captures, &capture_count);
+
+					// Phase 5.11: if a matching client is already running,
+					// focus it instead of spawning a second instance.
+					bool focused_existing = false;
+#ifdef _WIN32
+					struct ipc_client_list clist;
+					if (ipc_call_system_get_clients(&ipc_c, &clist) == XRT_SUCCESS) {
+						for (uint32_t c = 0; c < clist.id_count && !focused_existing; c++) {
+							if (clist.ids[c] == 0) continue;
+							struct ipc_app_state ias;
+							if (ipc_call_system_get_client_info(&ipc_c, clist.ids[c], &ias) != XRT_SUCCESS)
+								continue;
+							char client_exe[MAX_PATH];
+							if (!shell_pid_to_exe_path((DWORD)ias.pid, client_exe, sizeof(client_exe)))
+								continue;
+							if (shell_exe_paths_equal(client_exe, rapp->exe_path)) {
+								if (ipc_call_system_set_focused_client(&ipc_c, clist.ids[c]) == XRT_SUCCESS) {
+									P("Launcher: focused running client %u → '%s'\n",
+									  clist.ids[c], rapp->name);
+									focused_existing = true;
+								}
+							}
+						}
+					}
+#endif
+					if (!focused_existing) {
+						P("Launcher: launching tile %lld → '%s'\n",
+						  (long long)tile_index, rapp->name);
+						shell_launch_registered_app(
+						    &ipc_c, rapp,
+						    have_json ? runtime_json : NULL,
+						    apps, &app_count,
+						    captures, &capture_count);
+					}
 				} else {
 					PE("Launcher click: tile %lld out of range (count=%d)\n",
 					   (long long)tile_index, g_registered_app_count);
