@@ -302,6 +302,11 @@ struct d3d11_service_system
 	//! ipc_call_shell_poll_launcher_click(). -1 means no pending click.
 	int32_t pending_launcher_click_index = -1;
 
+	//! Phase 5.11: bitmask of running tiles (bit i = launcher_apps[i] has a
+	//! matching IPC client). Pushed by the shell from its client-poll loop.
+	//! The render pass draws a glow border around set tiles.
+	uint64_t running_tile_mask = 0;
+
 	//! Multi-compositor control interface for session state management
 	struct xrt_multi_compositor_control xmcc;
 
@@ -7151,9 +7156,62 @@ multi_compositor_render(struct d3d11_service_system *sys)
 					float tx = panel_x + margin + (float)tcol * (tile_w + margin);
 					float ty = grid_top + (float)trow * (tile_h + label_h + margin);
 
+					bool tile_running = (sys->running_tile_mask & (1ULL << i)) != 0;
+
+					// Phase 5.11: glow border for running tiles. Draw an
+					// oversized quad in glow mode (convert_srgb=3.0) so the
+					// shader fades the inner rect into the surrounding margin.
+					if (tile_running) {
+						float glow_margin = tile_h * 0.18f;
+						float gx = tx - glow_margin;
+						float gy = ty - glow_margin;
+						float gw = tile_w + 2.0f * glow_margin;
+						float gh = tile_h + 2.0f * glow_margin;
+						float glow_ext = glow_margin / gh;
+
+						D3D11_MAPPED_SUBRESOURCE gm;
+						if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
+						                                D3D11_MAP_WRITE_DISCARD, 0, &gm))) {
+							BlitConstants *cb = static_cast<BlitConstants *>(gm.pData);
+							cb->src_rect[0] = 0; cb->src_rect[1] = 0;
+							cb->src_rect[2] = 1; cb->src_rect[3] = 1;
+							cb->src_size[0] = 1; cb->src_size[1] = 1;
+							cb->dst_size[0] = (float)ca_w;
+							cb->dst_size[1] = (float)ca_h;
+							cb->convert_srgb = 3.0f; // glow mode
+							cb->corner_radius = 0.0f;
+							cb->corner_aspect = 0.0f;
+							cb->edge_feather = 0.0f;
+							cb->glow_intensity = 0.85f;
+							cb->glow_extent = glow_ext;
+							cb->glow_falloff = 8.0f;
+							cb->glow_color[0] = 0.30f;
+							cb->glow_color[1] = 0.85f;
+							cb->glow_color[2] = 1.00f;
+							cb->glow_color[3] = 1.0f;
+							cb->quad_mode = 0;
+							cb->dst_offset[0] = gx;
+							cb->dst_offset[1] = gy;
+							cb->dst_rect_wh[0] = gw;
+							cb->dst_rect_wh[1] = gh;
+							memset(cb->quad_corners_01, 0, sizeof(cb->quad_corners_01));
+							memset(cb->quad_corners_23, 0, sizeof(cb->quad_corners_23));
+							sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
+							// Glow mode uses premultiplied alpha — switch
+							// blend state for this draw, then restore.
+							sys->context->OMSetBlendState(sys->blend_premul.get(), nullptr, 0xFFFFFFFF);
+							sys->context->Draw(4, 0);
+							sys->context->OMSetBlendState(sys->blend_alpha.get(), nullptr, 0xFFFFFFFF);
+						}
+					}
+
 					// Tile background — slightly lighter than panel, rounded.
+					// Running tiles get a brighter background to reinforce the glow.
+					float bg_r = tile_running ? 0.20f : 0.16f;
+					float bg_g = tile_running ? 0.27f : 0.19f;
+					float bg_b = tile_running ? 0.36f : 0.26f;
 					draw_solid_rect(tx, ty, tile_w, tile_h,
-					                0.16f, 0.19f, 0.26f, 0.95f, 0.18f, 0.0f);
+					                bg_r, bg_g, bg_b, 0.95f, 0.18f, 0.0f);
 
 					// Label centered horizontally below tile, ellipsis-truncated
 					// if it would overflow into the neighbouring tile.
@@ -9941,6 +9999,33 @@ comp_d3d11_service_add_launcher_app(struct xrt_system_compositor *xsysc,
 
 	// Wake the compositor window if it exists and the launcher is on-screen,
 	// so the next frame picks up the new tile.
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	if (mc != nullptr && mc->hwnd != nullptr && mc->launcher_visible) {
+		InvalidateRect(mc->hwnd, nullptr, FALSE);
+	}
+}
+
+// Phase 5.11: set the running-tile bitmask. Bit i set means launcher_apps[i]
+// has at least one matching IPC client connected. The render pass draws a
+// glow border around any tile whose bit is set. Pushed by the shell from its
+// client-poll loop whenever the running set changes.
+void
+comp_d3d11_service_set_running_tile_mask(struct xrt_system_compositor *xsysc, uint64_t mask)
+{
+	if (xsysc == nullptr) {
+		return;
+	}
+
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+
+	if (sys->running_tile_mask == mask) {
+		return;
+	}
+	sys->running_tile_mask = mask;
+
+	// Wake the compositor if the launcher is on-screen so the new glow
+	// state shows up immediately.
 	struct d3d11_multi_compositor *mc = sys->multi_comp;
 	if (mc != nullptr && mc->hwnd != nullptr && mc->launcher_visible) {
 		InvalidateRect(mc->hwnd, nullptr, FALSE);

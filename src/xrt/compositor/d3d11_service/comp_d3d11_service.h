@@ -347,6 +347,20 @@ comp_d3d11_service_add_launcher_app(struct xrt_system_compositor *xsysc,
 int32_t
 comp_d3d11_service_poll_launcher_click(struct xrt_system_compositor *xsysc);
 
+/*!
+ * Phase 5.11: set the bitmask of currently-running tiles. Bit @c i set means
+ * the registered app at index @c i has at least one matching IPC client
+ * connected to the service. The launcher draws a glow border around tiles
+ * whose bit is set so the user can tell which apps are already open.
+ *
+ * Pushed by the shell whenever its computed running set changes (typically
+ * after each client connect/disconnect poll).
+ *
+ * @ingroup comp_d3d11_service
+ */
+void
+comp_d3d11_service_set_running_tile_mask(struct xrt_system_compositor *xsysc, uint64_t mask);
+
 /*! @} */
 
 
