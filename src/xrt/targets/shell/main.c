@@ -61,6 +61,7 @@
 static volatile int g_running = 1;
 #ifdef _WIN32
 static bool g_shell_active = false;
+static bool g_launcher_visible = false; // Phase 5.7: spatial launcher panel toggle (Ctrl+L)
 static HWND g_msg_hwnd = NULL;
 #endif
 
@@ -1549,6 +1550,7 @@ main(int argc, char *argv[])
 						client_name_count = 0;
 
 						g_shell_active = false;
+						g_launcher_visible = false;
 						tray_update_tooltip(false);
 						P("Shell deactivated — waiting in tray.\n");
 					} else {
@@ -1586,15 +1588,20 @@ main(int argc, char *argv[])
 						P("Shell activated.\n");
 					}
 				} else if (msg.message == WM_HOTKEY && msg.wParam == HOTKEY_LAUNCH) {
-					// --- Ctrl+L: Launch registered app ---
+					// --- Ctrl+L: Toggle spatial launcher panel (Phase 5.7) ---
+					// The Phase 4C MessageBox path is gone — the service-side
+					// multi-compositor renders the panel in its own window when
+					// launcher_visible is true. Tile grid + launch dispatch
+					// come in later Phase 5 tasks.
 					if (g_shell_active) {
-						int idx = shell_show_launcher_dialog();
-						if (idx >= 0 && idx < g_registered_app_count) {
-							shell_launch_registered_app(
-							    &ipc_c, &g_registered_apps[idx],
-							    have_json ? runtime_json : NULL,
-							    apps, &app_count,
-							    captures, &capture_count);
+						g_launcher_visible = !g_launcher_visible;
+						xrt_result_t lret = ipc_call_shell_set_launcher_visible(
+						    &ipc_c, g_launcher_visible);
+						if (lret != XRT_SUCCESS) {
+							PE("ipc_call_shell_set_launcher_visible failed: %d\n", lret);
+							g_launcher_visible = !g_launcher_visible; // roll back
+						} else {
+							P("Launcher %s\n", g_launcher_visible ? "shown" : "hidden");
 						}
 					}
 				} else if (msg.message == WM_TRAYICON) {
@@ -1696,6 +1703,7 @@ main(int argc, char *argv[])
 					capture_count = 0;
 					client_name_count = 0;
 					g_shell_active = false;
+					g_launcher_visible = false;
 					tray_update_tooltip(false);
 				}
 			}

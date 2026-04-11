@@ -299,6 +299,19 @@ comp_d3d11_service_ensure_shell_window(struct xrt_system_compositor *xsysc);
 void
 comp_d3d11_service_deactivate_shell(struct xrt_system_compositor *xsysc);
 
+/*!
+ * Show or hide the spatial launcher panel. When visible, the multi-compositor
+ * draws a rounded-corner launcher overlay at the zero-disparity plane
+ * (z = 0 in display coordinates). Called by
+ * ipc_handle_shell_set_launcher_visible() in response to Ctrl+L from the shell.
+ *
+ * No-op if the shell is not currently active.
+ *
+ * @ingroup comp_d3d11_service
+ */
+void
+comp_d3d11_service_set_launcher_visible(struct xrt_system_compositor *xsysc, bool visible);
+
 /*! @} */
 
 
