@@ -1962,6 +1962,11 @@ main(int argc, char *argv[])
 		// the click landed, so we just need to sync our local state and run
 		// the launch. Only poll while the launcher is actually visible to
 		// keep IPC traffic minimal.
+		// Poll for launcher tile clicks. Only while the launcher is visible
+		// — when hidden there can't be any clicks. This is a performance
+		// optimization (avoids 500ms-cadence IPC traffic when the launcher
+		// isn't open), not a workaround for #144 which turned out to be a
+		// stale-binary issue resolved by the Phase 6 rebuild.
 		if (g_shell_active && g_launcher_visible) {
 			int64_t tile_index = -1;
 			if (ipc_call_shell_poll_launcher_click(&ipc_c, &tile_index) == XRT_SUCCESS &&
