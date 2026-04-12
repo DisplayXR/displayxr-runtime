@@ -307,6 +307,10 @@ struct d3d11_service_system
 	//! The render pass draws a glow border around set tiles.
 	uint64_t running_tile_mask = 0;
 
+	//! Phase 6.2: visible-space hover index — tile under the mouse cursor.
+	//! -1 = cursor not on any tile. Updated every frame from GetCursorPos.
+	int32_t launcher_hover_index = -1;
+
 	//! Phase 5.12: visible-space selection index for the launcher grid.
 	//! -1 = nothing selected. Reset to 0 when the launcher becomes visible.
 	int32_t launcher_selected_index = -1;
@@ -7190,6 +7194,18 @@ after_key_shortcuts:
 		uint32_t n_visible = launcher_build_visible_list(sys, visible_to_full);
 		uint32_t n_apps = n_visible; // rest of this block treats the list as compacted
 
+		// Phase 6.2: per-frame hover detection for mouse-over highlight.
+		// Hit-test the cursor against the tile grid so the render can draw
+		// a subtle highlight on the tile under the pointer.
+		if (mc->hwnd != nullptr) {
+			POINT cpt;
+			GetCursorPos(&cpt);
+			ScreenToClient(mc->hwnd, &cpt);
+			sys->launcher_hover_index = launcher_hit_test(sys, cpt, n_visible);
+		} else {
+			sys->launcher_hover_index = -1;
+		}
+
 		// Pipeline setup once — then per-eye scissor + draw. Bind the font
 		// atlas SRV for text glyph sampling; solid-color draws ignore it.
 		sys->context->VSSetShader(sys->blit_vs.get(), nullptr, 0);
@@ -7488,6 +7504,7 @@ after_key_shortcuts:
 
 				bool tile_running = (sys->running_tile_mask & (1ULL << full_idx)) != 0;
 				bool tile_selected = (sys->launcher_selected_index == (int32_t)vi);
+				bool tile_hovered = (sys->launcher_hover_index == (int32_t)vi);
 
 				// Phase 5.11: glow border for running tiles. Draw an
 				// oversized quad in glow mode (convert_srgb=3.0) so the
@@ -7547,10 +7564,16 @@ after_key_shortcuts:
 				}
 
 				// Tile background — slightly lighter than panel, rounded.
-				// Running tiles get a brighter background to reinforce the glow.
+				// Running tiles get a brighter background; hovered tiles
+				// get a subtle extra lift for mouse-over feedback.
 				float bg_r = tile_running ? 0.20f : 0.16f;
 				float bg_g = tile_running ? 0.27f : 0.19f;
 				float bg_b = tile_running ? 0.36f : 0.26f;
+				if (tile_hovered) {
+					bg_r += 0.06f;
+					bg_g += 0.06f;
+					bg_b += 0.06f;
+				}
 				draw_solid_rect(tx, ty, tile_w, tile_h,
 				                bg_r, bg_g, bg_b, 0.95f, 0.18f, 0.0f);
 
@@ -7571,6 +7594,7 @@ after_key_shortcuts:
 				float tx = panel_x + margin + (float)tcol * (tile_w + margin);
 				float ty = grid_top + (float)trow * (tile_h + label_h + margin);
 				bool browse_selected = (sys->launcher_selected_index == (int32_t)vi);
+				bool browse_hovered = (sys->launcher_hover_index == (int32_t)vi);
 
 				if (browse_selected) {
 					float sm = tile_h * 0.045f;
@@ -7579,8 +7603,10 @@ after_key_shortcuts:
 					                1.00f, 1.00f, 1.00f, 0.90f, 0.20f, 0.0f);
 				}
 
+				float br_r = 0.20f, br_g = 0.22f, br_b = 0.28f;
+				if (browse_hovered) { br_r += 0.06f; br_g += 0.06f; br_b += 0.06f; }
 				draw_solid_rect(tx, ty, tile_w, tile_h,
-				                0.20f, 0.22f, 0.28f, 0.75f, 0.18f, 0.0f);
+				                br_r, br_g, br_b, 0.75f, 0.18f, 0.0f);
 
 				float plus_scale = section_scale * 1.6f;
 				float plus_h = (float)mc->font_glyph_h * plus_scale;
