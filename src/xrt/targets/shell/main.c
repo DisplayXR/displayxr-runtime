@@ -621,6 +621,13 @@ launch_app(struct app_entry *app, const char *runtime_json)
 
 	STARTUPINFOA si = {0};
 	si.cb = sizeof(si);
+	// Phase 6.1 (#140): start the app with its window hidden. In shell
+	// mode, the app's HWND appearing on the 3D display disrupts the SR
+	// SDK's weaver and causes a multi-second stretch artifact. The app's
+	// content is captured via shared handles into the multi-compositor
+	// atlas, so its own window doesn't need to be visible.
+	si.dwFlags = STARTF_USESHOWWINDOW;
+	si.wShowWindow = SW_HIDE;
 	PROCESS_INFORMATION pi = {0};
 
 	BOOL ok = CreateProcessA(
@@ -1687,6 +1694,7 @@ main(int argc, char *argv[])
 
 		// Launch apps
 		if (app_count > 0) {
+
 			P("XR_RUNTIME_JSON = %s\n", have_json ? runtime_json : "(not set)");
 			for (int i = 0; i < app_count; i++) {
 				launch_app(&apps[i], have_json ? runtime_json : NULL);
