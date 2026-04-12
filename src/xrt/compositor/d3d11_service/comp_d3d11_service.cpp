@@ -4374,6 +4374,9 @@ launcher_build_visible_list(const struct d3d11_service_system *sys,
 static int
 launcher_hit_test(struct d3d11_service_system *sys, POINT cursor_px, uint32_t n_visible)
 {
+	// Cursor is in compositor-window client pixels, which we map to
+	// display meters via the same formula the taskbar hit-test uses
+	// (pt.x and pt.y are assumed to span the full atlas pixel dimensions).
 	float disp_w_m = sys->base.info.display_width_m;
 	float disp_h_m = sys->base.info.display_height_m;
 	uint32_t disp_px_w = sys->base.info.display_pixel_width;
@@ -4383,14 +4386,12 @@ launcher_hit_test(struct d3d11_service_system *sys, POINT cursor_px, uint32_t n_
 	if (disp_px_w == 0) disp_px_w = 3840;
 	if (disp_px_h == 0) disp_px_h = 2160;
 
-	// Cursor → display-surface meters (origin = display center, +x right, +y up).
-	// Same formula as the existing taskbar hit-test path.
 	float cursor_x_m = ((float)cursor_px.x - (float)disp_px_w / 2.0f) *
 	                   disp_w_m / (float)disp_px_w;
 	float cursor_y_m = ((float)disp_px_h / 2.0f - (float)cursor_px.y) *
 	                   disp_h_m / (float)disp_px_h;
 
-	// Panel geometry — must mirror the render block exactly.
+	// Panel geometry — the fractions below must match the render block.
 	const float panel_w_frac = 0.60f;
 	const float panel_h_frac = 0.55f;
 	float panel_w_m = disp_w_m * panel_w_frac;
@@ -4402,25 +4403,39 @@ launcher_hit_test(struct d3d11_service_system *sys, POINT cursor_px, uint32_t n_
 		return -2;
 	}
 
-	// Convert to panel-local meters (origin top-left).
+	// Panel-local meters, origin top-left.
 	float lx = cursor_x_m + panel_w_m * 0.5f;
 	float ly = panel_h_m * 0.5f - cursor_y_m;
 
-	// Tile layout — mirrors the render pass, but in meters instead of pixels.
-	// All ratios are unit-independent so the same fractions work in either.
 	const int LAUNCHER_GRID_COLS = 4;
 	float margin = panel_w_m * 0.04f;
 	float title_h = panel_h_m * 0.13f;
 	float section_h = panel_h_m * 0.07f;
 	float tile_w = (panel_w_m - (LAUNCHER_GRID_COLS + 1) * margin) /
 	               (float)LAUNCHER_GRID_COLS;
-	float tile_h = tile_w * 0.65f;
+
+	// Phase 5.14: the render computes tile_h in render-pixel terms
+	// (`tile_h_px = tile_w_px * 0.65`). Because ui_m_to_tile_px_x and
+	// ui_m_to_tile_px_y use different px-per-meter ratios (tile_px_w =
+	// display_pixel_width/tile_columns, but tile_px_h = display_pixel_height
+	// /tile_rows), converting that back to meters requires an aspect-ratio
+	// correction or the hit test and render disagree on row positions.
+	float tile_px_w_eff = (float)(disp_px_w / (sys->tile_columns ? sys->tile_columns : 1));
+	float tile_px_h_eff = (float)(disp_px_h / (sys->tile_rows    ? sys->tile_rows    : 1));
+	float px_per_m_x = tile_px_w_eff / disp_w_m;
+	float px_per_m_y = tile_px_h_eff / disp_h_m;
+	float y_ratio = (px_per_m_y > 0.0f) ? (px_per_m_x / px_per_m_y) : 1.0f;
+	float tile_h = tile_w * 0.65f * y_ratio;
+
+	// Section header + label heights: render uses
+	// `font_glyph_h * section_scale` where section_scale = (section_h_px * 0.65)
+	// / font_glyph_h. In meters that's section_h_m * 0.65, unaffected by the
+	// X/Y ratio (section_h is panel_h-derived, so y-based).
 	float section_text_h = section_h * 0.65f;
+	float label_h = section_text_h * 0.85f;
+
 	float section_y = title_h + margin * 0.5f;
 	float grid_top = section_y + section_text_h + margin * 0.5f;
-	// Label height = font_glyph_h * label_scale where label_scale =
-	// (section_h_px * 0.65 / font_glyph_h) * 0.85 → in meters: section_h * 0.65 * 0.85.
-	float label_h = section_text_h * 0.85f;
 
 	// Walk the visible tile grid PLUS one virtual Browse tile at position n_visible.
 	uint32_t n_total = n_visible + 1;
@@ -5325,6 +5340,10 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			if (sel == (int)n_visible) {
 				sys->pending_launcher_click_index = IPC_LAUNCHER_ACTION_BROWSE;
 				launcher_set_visible(sys, mc, false);
+				// Phase 5.14: see corresponding AllowSetForegroundWindow
+				// call in the LMB click path — grants the shell's file
+				// dialog permission to pop to the front.
+				AllowSetForegroundWindow(ASFW_ANY);
 				U_LOG_W("Launcher: Enter on Browse tile");
 			} else if (sel >= 0 && sel < (int)n_visible) {
 				sys->pending_launcher_click_index = visible_to_full[sel];
@@ -5601,6 +5620,11 @@ after_key_shortcuts:
 				} else if (vis_tile == (int)n_visible) {
 					sys->pending_launcher_click_index = IPC_LAUNCHER_ACTION_BROWSE;
 					launcher_set_visible(sys, mc, false);
+					// Phase 5.14: grant any process foreground-activation
+					// permission so the shell's GetOpenFileNameA dialog can
+					// pop to the front. The service currently has foreground
+					// from the click, so it has the right to grant this.
+					AllowSetForegroundWindow(ASFW_ANY);
 					U_LOG_W("Launcher: Browse tile clicked");
 				} else if (vis_tile == -2) {
 					launcher_set_visible(sys, mc, false);
