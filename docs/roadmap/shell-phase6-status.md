@@ -17,17 +17,20 @@ Two bugs discovered during Phase 5 development:
 
 | Status | Task | Description |
 |--------|------|-------------|
-| [ ] | 6.1 | Mono fallback during eye-tracking warmup (#140) |
+| [x] | 6.1 | Fix stretched-left-eye artifact on shell startup (#140) |
 | [ ] | 6.2 | IPC rapid-poll pipe closure investigation + fix (#144) |
 
 ## Commits
 
-_(none yet)_
+- `dfd23c8c6` Shell 6: fix stretched-left-eye artifact on shell startup (#140)
+- `91e9c3c2d` Docs: add Phase 6 plan, status, and agent prompt
 
 ## Design Decisions
 
-_(to be filled in during implementation)_
+- **6.1 Root cause**: NOT eye-tracking warmup — the app's HWND appearing on the 3D display disrupts the SR SDK's weaver initialization. Confirmed by isolating: no stretch with empty shell, no stretch when launching from launcher (DP already stable), stretch only when app launches at startup.
+- **6.1 Fix**: `STARTF_USESHOWWINDOW + SW_HIDE` on app launch in shell mode. App window is never needed (content via shared handles into multi-comp atlas). Hot-switch restores via `ShowWindow(SW_SHOW)`.
+- **6.1 Bonus**: skip per-client DP in shell mode (multi-comp owns shared DP), remove `request_display_mode(true)` from init paths (avoids SR SDK recalibration), add empty-shell hint text.
 
 ## Known Issues
 
-_(to be filled in during implementation)_
+_(none)_
