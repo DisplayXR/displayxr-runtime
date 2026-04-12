@@ -323,6 +323,14 @@ struct ipc_client_list
 // Real tile indices are >= 0; -1 means no pending action.
 #define IPC_LAUNCHER_ACTION_BROWSE (-100)
 
+// Phase 6.6: sentinel base for permanent remove. Returned as
+// -(IPC_LAUNCHER_ACTION_REMOVE_BASE + full_index). Shell decodes via
+// full_index = -(value) - IPC_LAUNCHER_ACTION_REMOVE_BASE.
+#define IPC_LAUNCHER_ACTION_REMOVE_BASE 200
+
+// Phase 6.6: sentinel for "refresh app list" (re-scan sidecars).
+#define IPC_LAUNCHER_ACTION_REFRESH (-300)
+
 struct ipc_launcher_app
 {
 	char name[IPC_LAUNCHER_NAME_MAX];

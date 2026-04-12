@@ -237,8 +237,9 @@ comp_d3d11_window_set_input_suppress_grace_ms(struct comp_d3d11_window *window, 
  * @return one of LAUNCHER_CTX_MENU_RESULT_* (see below), or 0 if no
  *         selection (cancel).
  */
-#define LAUNCHER_CTX_MENU_RESULT_LAUNCH 1
-#define LAUNCHER_CTX_MENU_RESULT_REMOVE 2
+#define LAUNCHER_CTX_MENU_RESULT_LAUNCH  1
+#define LAUNCHER_CTX_MENU_RESULT_REMOVE  2
+#define LAUNCHER_CTX_MENU_RESULT_REFRESH 3
 
 uint32_t
 comp_d3d11_window_show_launcher_context_menu(struct comp_d3d11_window *window);

@@ -438,7 +438,7 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			return 0;
 		}
 		AppendMenuW(menu, MF_STRING, 1, L"Launch");
-		AppendMenuW(menu, MF_STRING, 2, L"Remove from launcher (this session)");
+		AppendMenuW(menu, MF_STRING, 2, L"Remove from launcher");
 		AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
 		AppendMenuW(menu, MF_STRING, 3, L"Cancel");
 

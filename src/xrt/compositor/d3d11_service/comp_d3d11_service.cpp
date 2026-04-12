@@ -300,7 +300,16 @@ struct d3d11_service_system
 	//! Phase 5.9/5.10: pending launcher tile click. Set by the WM_LBUTTONDOWN
 	//! handler when the user clicks a tile, consumed by the shell via
 	//! ipc_call_shell_poll_launcher_click(). -1 means no pending click.
+	//! Also carries IPC_LAUNCHER_ACTION_BROWSE for the Browse tile.
+	//! Phase 6.6: also carries IPC_LAUNCHER_ACTION_REMOVE + the removed
+	//! tile's full index in pending_launcher_remove_full_index.
 	int32_t pending_launcher_click_index = -1;
+
+	//! Phase 6.6: full-space index of the tile the user right-click-removed.
+	//! Set by launcher_show_context_menu, consumed by the shell's poll loop
+	//! which deletes the entry from g_registered_apps and re-pushes.
+	//! -1 means no pending remove.
+	int32_t pending_launcher_remove_full_index = -1;
 
 	//! Phase 5.11: bitmask of running tiles (bit i = launcher_apps[i] has a
 	//! matching IPC client). Pushed by the shell from its client-poll loop.
@@ -310,6 +319,10 @@ struct d3d11_service_system
 	//! Phase 6.2: visible-space hover index — tile under the mouse cursor.
 	//! -1 = cursor not on any tile. Updated every frame from GetCursorPos.
 	int32_t launcher_hover_index = -1;
+
+	//! Phase 6.5: scroll offset for the launcher tile grid, in rows.
+	//! 0 = top. Incremented by mouse wheel or arrow-key overflow.
+	int32_t launcher_scroll_row = 0;
 
 	//! Phase 5.12: visible-space selection index for the launcher grid.
 	//! -1 = nothing selected. Reset to 0 when the launcher becomes visible.
@@ -4292,14 +4305,13 @@ launcher_show_context_menu(struct d3d11_service_system *sys,
 		U_LOG_W("Launcher: context menu launch full=%d", full_idx);
 		break;
 	case LAUNCHER_CTX_MENU_RESULT_REMOVE:
-		sys->hidden_tile_mask |= (1ULL << full_idx);
-		U_LOG_W("Launcher: context menu remove full=%d", full_idx);
-		// Launcher stays open so the user can remove more tiles. Clamp
-		// the selection in case we just removed the selected tile from
-		// the compacted visible list — next render re-builds it.
-		if (sys->launcher_selected_index > 0) {
-			sys->launcher_selected_index = 0;
-		}
+		// Phase 6.6: signal the shell to permanently remove this app from
+		// registered_apps.json. The shell's poll loop picks up the index,
+		// deletes the entry, saves, and re-pushes the registry. The
+		// launcher hides so the re-pushed list renders cleanly.
+		sys->pending_launcher_remove_full_index = full_idx;
+		launcher_set_visible(sys, mc, false);
+		U_LOG_W("Launcher: context menu remove full=%d (permanent)", full_idx);
 		break;
 	default:
 		break;
@@ -4345,6 +4357,7 @@ launcher_set_visible(struct d3d11_service_system *sys,
 	}
 	if (visible) {
 		sys->launcher_selected_index = 0;
+		sys->launcher_scroll_row = 0;
 	} else {
 		sys->launcher_selected_index = -1;
 	}
@@ -4452,6 +4465,12 @@ launcher_hit_test(struct d3d11_service_system *sys, POINT cursor_px, uint32_t n_
 	float section_y = title_h + margin * 0.5f;
 	float grid_top = section_y + section_text_h + margin * 0.5f;
 
+	// Phase 6.5: apply scroll offset to grid_top (in meters, matching the
+	// render's pixel-based scroll). row_h uses the same y_ratio-corrected
+	// tile_h so scroll offsets agree between render and hit test.
+	float row_h_m = tile_h + label_h + margin;
+	grid_top -= (float)sys->launcher_scroll_row * row_h_m;
+
 	// Walk the visible tile grid PLUS one virtual Browse tile at position n_visible.
 	uint32_t n_total = n_visible + 1;
 	if (n_total > IPC_LAUNCHER_MAX_APPS + 1) n_total = IPC_LAUNCHER_MAX_APPS + 1;
@@ -4460,6 +4479,9 @@ launcher_hit_test(struct d3d11_service_system *sys, POINT cursor_px, uint32_t n_
 		int trow = (int)(i / LAUNCHER_GRID_COLS);
 		float tx = margin + (float)tcol * (tile_w + margin);
 		float ty = grid_top + (float)trow * (tile_h + label_h + margin);
+		// Only match tiles that are in the visible panel area.
+		if (ty + tile_h < section_y + section_text_h) continue;
+		if (ty > panel_h_m) continue;
 		if (lx >= tx && lx <= tx + tile_w &&
 		    ly >= ty && ly <= ty + tile_h) {
 			return (int)i;
@@ -5370,6 +5392,67 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		if (GetAsyncKeyState(VK_ESCAPE) & 1) {
 			launcher_set_visible(sys, mc, false);
 			U_LOG_W("Launcher: Esc dismissed");
+		}
+		// Phase 6.6: Ctrl+R = refresh app list (re-scan sidecars).
+		if ((GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState('R') & 1)) {
+			sys->pending_launcher_click_index = IPC_LAUNCHER_ACTION_REFRESH;
+			launcher_set_visible(sys, mc, false);
+			U_LOG_W("Launcher: Ctrl+R refresh");
+		}
+
+		// Phase 6.5: mouse wheel scrolls the grid. Consume scroll before
+		// the normal window-resize scroll handler below.
+		if (mc->window != nullptr) {
+			int32_t scroll = comp_d3d11_window_consume_scroll(mc->window);
+			if (scroll != 0) {
+				int total_rows = (n_selectable + LAUNCHER_GRID_COLS - 1) / LAUNCHER_GRID_COLS;
+				if (scroll < 0) {
+					sys->launcher_scroll_row++;
+				} else if (scroll > 0 && sys->launcher_scroll_row > 0) {
+					sys->launcher_scroll_row--;
+				}
+				if (sys->launcher_scroll_row > total_rows - 1) {
+					sys->launcher_scroll_row = total_rows - 1;
+				}
+				if (sys->launcher_scroll_row < 0) {
+					sys->launcher_scroll_row = 0;
+				}
+			}
+		}
+
+		// Auto-scroll to keep selected tile in view.
+		{
+			int sel_row = sys->launcher_selected_index / LAUNCHER_GRID_COLS;
+			if (sel_row < sys->launcher_scroll_row) {
+				sys->launcher_scroll_row = sel_row;
+			}
+			// Compute how many rows fit in the visible grid area (estimated).
+			// This uses pixel math matching the render block.
+			float est_panel_h = ui_m_to_tile_px_y(
+			    sys->base.info.display_height_m > 0 ? sys->base.info.display_height_m * 0.55f : 0.217f, sys);
+			float est_margin = ui_m_to_tile_px_x(
+			    (sys->base.info.display_width_m > 0 ? sys->base.info.display_width_m * 0.60f : 0.42f) * 0.04f, sys);
+			float est_title = est_panel_h * 0.13f;
+			float est_section = est_panel_h * 0.07f;
+			float est_tile_w = (ui_m_to_tile_px_x(
+			    sys->base.info.display_width_m > 0 ? sys->base.info.display_width_m * 0.60f : 0.42f, sys)
+			    - 5.0f * est_margin) / 4.0f;
+			float est_tile_h = est_tile_w * 0.65f;
+			float est_section_scale = (est_section * 0.65f) /
+			    (mc->font_glyph_h > 0 ? (float)mc->font_glyph_h : 16.0f);
+			float est_label_h = (float)(mc->font_glyph_h > 0 ? mc->font_glyph_h : 16) *
+			    est_section_scale * 0.85f;
+			float est_grid_top = est_title + est_margin +
+			    (float)(mc->font_glyph_h > 0 ? mc->font_glyph_h : 16) * est_section_scale +
+			    est_margin * 0.5f;
+			float est_row_h = est_tile_h + est_label_h + est_margin;
+			float est_avail = est_panel_h - est_grid_top - est_margin;
+			int max_vis_rows = (est_avail > 0 && est_row_h > 0) ? (int)(est_avail / est_row_h) : 3;
+			if (max_vis_rows < 1) max_vis_rows = 1;
+
+			if (sel_row >= sys->launcher_scroll_row + max_vis_rows) {
+				sys->launcher_scroll_row = sel_row - max_vis_rows + 1;
+			}
 		}
 
 		goto after_key_shortcuts;
@@ -7476,6 +7559,16 @@ after_key_shortcuts:
 			float label_h = (float)mc->font_glyph_h * label_scale;
 			float grid_top = section_y + (float)mc->font_glyph_h * section_scale + margin * 0.5f;
 
+			// Phase 6.5: apply scroll offset to grid_top. Each scroll
+			// row shifts the grid up by one row height in pixels.
+			float row_h_px = tile_h + label_h + margin;
+			float scroll_offset_px = (float)sys->launcher_scroll_row * row_h_px;
+			grid_top -= scroll_offset_px;
+
+			// Visible grid bounds (panel-local) for culling off-screen tiles.
+			float grid_visible_top = section_y + (float)mc->font_glyph_h * section_scale + margin * 0.5f;
+			float grid_visible_bottom = panel_y + panel_h_px - margin;
+
 			// Render real tiles (compacted via visible_to_full) + the virtual
 			// "Add app…" Browse tile at position n_visible. When there are no
 			// real tiles we still draw the Browse tile plus the empty-state
@@ -7501,6 +7594,11 @@ after_key_shortcuts:
 				int trow = (int)(vi / LAUNCHER_GRID_COLS);
 				float tx = panel_x + margin + (float)tcol * (tile_w + margin);
 				float ty = grid_top + (float)trow * (tile_h + label_h + margin);
+
+				// Phase 6.5: cull tiles that scrolled out of the visible grid area.
+				if (ty + tile_h + label_h < grid_visible_top || ty > grid_visible_bottom) {
+					continue;
+				}
 
 				bool tile_running = (sys->running_tile_mask & (1ULL << full_idx)) != 0;
 				bool tile_selected = (sys->launcher_selected_index == (int32_t)vi);
@@ -7593,6 +7691,10 @@ after_key_shortcuts:
 				int trow = (int)(vi / LAUNCHER_GRID_COLS);
 				float tx = panel_x + margin + (float)tcol * (tile_w + margin);
 				float ty = grid_top + (float)trow * (tile_h + label_h + margin);
+
+				// Phase 6.5: cull Browse tile if scrolled out of view.
+				if (ty + tile_h + label_h >= grid_visible_top && ty <= grid_visible_bottom) {
+
 				bool browse_selected = (sys->launcher_selected_index == (int32_t)vi);
 				bool browse_hovered = (sys->launcher_hover_index == (int32_t)vi);
 
@@ -7616,6 +7718,8 @@ after_key_shortcuts:
 				float browse_label_y = ty + tile_h + margin * 0.15f;
 				draw_label_centered("Add app...", tx, browse_label_y,
 				                    tile_w, label_scale);
+
+				} // end cull check for Browse tile
 			}
 		}
 
@@ -10412,6 +10516,14 @@ comp_d3d11_service_poll_launcher_click(struct xrt_system_compositor *xsysc)
 
 	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
 	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+
+	// Phase 6.6: check remove first — it takes priority because the
+	// launcher was hidden on remove, so no click can follow.
+	if (sys->pending_launcher_remove_full_index >= 0) {
+		int32_t full = sys->pending_launcher_remove_full_index;
+		sys->pending_launcher_remove_full_index = -1;
+		return -(IPC_LAUNCHER_ACTION_REMOVE_BASE + full);
+	}
 
 	int32_t idx = sys->pending_launcher_click_index;
 	sys->pending_launcher_click_index = -1;

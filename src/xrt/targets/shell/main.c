@@ -1971,10 +1971,50 @@ main(int argc, char *argv[])
 			int64_t tile_index = -1;
 			if (ipc_call_shell_poll_launcher_click(&ipc_c, &tile_index) == XRT_SUCCESS &&
 			    tile_index != -1) {
-				// Service already hid the launcher when the click registered.
+				// Service already hid the launcher when the action registered.
 				g_launcher_visible = false;
 
-				if (tile_index == IPC_LAUNCHER_ACTION_BROWSE) {
+				// Phase 6.6: check refresh BEFORE remove — both use negative
+				// sentinels and refresh (-300) would match the remove check
+				// (<= -200) if checked second.
+				if (tile_index == IPC_LAUNCHER_ACTION_REFRESH) {
+					P("Launcher: refreshing app list (before: %d apps)\n",
+					  g_registered_app_count);
+					registered_apps_load();
+					P("Launcher: refreshed (after: %d apps)\n",
+					  g_registered_app_count);
+					shell_push_registered_apps_to_service(&ipc_c);
+#ifdef _WIN32
+					if (service_pid != 0) {
+						AllowSetForegroundWindow(service_pid);
+					}
+#endif
+					if (ipc_call_shell_set_launcher_visible(&ipc_c, true) == XRT_SUCCESS) {
+						g_launcher_visible = true;
+					}
+				} else if (tile_index <= -(int64_t)IPC_LAUNCHER_ACTION_REMOVE_BASE) {
+					int full_idx = (int)(-(tile_index) - IPC_LAUNCHER_ACTION_REMOVE_BASE);
+					if (full_idx >= 0 && full_idx < g_registered_app_count) {
+						P("Launcher: removing '%s' permanently\n",
+						  g_registered_apps[full_idx].name);
+						// Shift remaining entries down.
+						for (int j = full_idx; j < g_registered_app_count - 1; j++) {
+							g_registered_apps[j] = g_registered_apps[j + 1];
+						}
+						g_registered_app_count--;
+						registered_apps_save();
+						shell_push_registered_apps_to_service(&ipc_c);
+					}
+					// Re-show launcher so user sees the updated grid.
+#ifdef _WIN32
+					if (service_pid != 0) {
+						AllowSetForegroundWindow(service_pid);
+					}
+#endif
+					if (ipc_call_shell_set_launcher_visible(&ipc_c, true) == XRT_SUCCESS) {
+						g_launcher_visible = true;
+					}
+				} else if (tile_index == IPC_LAUNCHER_ACTION_BROWSE) {
 					// Phase 5.14: Browse tile → open file dialog, add to
 					// registry, re-push, re-show launcher so the user sees
 					// their new tile.
