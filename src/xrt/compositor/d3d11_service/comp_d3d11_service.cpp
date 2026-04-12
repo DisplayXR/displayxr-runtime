@@ -1860,8 +1860,13 @@ init_client_render_resources(struct d3d11_service_system *sys,
 
 	U_LOG_W("Created stereo render target for client (%ux%u)", sys->display_width, sys->display_height);
 
-	// Create display processor via factory (set by the target builder at init time)
-	if (sys->base.info.dp_factory_d3d11 != NULL) {
+	// Create display processor via factory (set by the target builder at init time).
+	// Phase 6.1 (#140): skip per-client DP creation when shell mode is active.
+	// The multi-compositor already owns a shared DP for the combined atlas;
+	// creating a SECOND DP instance causes the SR SDK to recalibrate its
+	// weaver, producing a multi-second stretched-left-eye artifact. The
+	// per-client DP is only needed for standalone (non-shell) rendering.
+	if (sys->base.info.dp_factory_d3d11 != NULL && !sys->shell_mode) {
 		auto factory = (xrt_dp_factory_d3d11_fn_t)sys->base.info.dp_factory_d3d11;
 		xrt_result_t dp_ret = factory(sys->device.get(), sys->context.get(), res->hwnd, &res->display_processor);
 		if (dp_ret != XRT_SUCCESS) {
@@ -1870,11 +1875,11 @@ init_client_render_resources(struct d3d11_service_system *sys,
 			res->display_processor = nullptr;
 		} else {
 			U_LOG_W("D3D11 display processor created via factory for client");
-			// Auto-switch to 3D mode when display processor is ready
-			if (sys->hardware_display_3d) {
-				xrt_display_processor_d3d11_request_display_mode(
-				    res->display_processor, true);
-			}
+			// Phase 6.1 (#140): don't call request_display_mode(true)
+			// here — the SR SDK's recalibration cycle causes a multi-
+			// second stretched-left-eye artifact. Let the DP come up in
+			// the current mode; V key and xrRequestDisplayRenderingModeEXT
+			// remain the authoritative mode-switch triggers.
 
 			// Query display pixel info from the real (windowed) display processor.
 			// The temp DP at system init uses NULL window and may fail to return
@@ -4214,10 +4219,16 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 				U_LOG_W("Multi-comp: recreated at %ux%u", actual_w, actual_h);
 			}
 
-			// Enable 3D mode
-			if (mc->display_processor != nullptr && sys->hardware_display_3d) {
-				xrt_display_processor_d3d11_request_display_mode(mc->display_processor, true);
-			}
+			// Phase 6.1 (#140): do NOT call request_display_mode(true) here.
+			// The SR SDK's internal init cycle responds to an immediate
+			// mode switch by toggling 3D→2D→3D over several seconds,
+			// causing a stretched-left-eye artifact. Instead, let the
+			// display come up in whatever mode it's already in (typically
+			// 3D if eye tracking is running). The user can toggle via V
+			// key, and sync_tile_layout will track the actual mode each
+			// frame. The qwerty V-key handler and the
+			// xrRequestDisplayRenderingModeEXT path remain the
+			// authoritative mode-switch triggers.
 		} else {
 			U_LOG_W("Multi-comp: no display processor (factory returned %d)", dp_ret);
 		}
@@ -5257,10 +5268,10 @@ multi_compositor_render(struct d3d11_service_system *sys)
 							auto factory = (xrt_dp_factory_d3d11_fn_t)sys->base.info.dp_factory_d3d11;
 							factory(sys->device.get(), sys->context.get(),
 							        app_hwnd, &res->display_processor);
-							if (res->display_processor != nullptr && sys->hardware_display_3d) {
-								xrt_display_processor_d3d11_request_display_mode(
-								    res->display_processor, true);
-							}
+							// Phase 6.1 (#140): don't call request_display_mode
+							// here — same SR SDK recalibration issue as the
+							// shell activation path. Let the DP come up in the
+							// current mode; the V key toggle still works.
 						}
 						U_LOG_W("Dismiss: hot-switched slot %d to standalone", i);
 					}
@@ -6148,6 +6159,7 @@ after_key_shortcuts:
 		eye_pos.valid = true;
 	}
 
+
 	// Get physical display dims (used as default virtual window size for new clients)
 	float display_w_m = sys->base.info.display_width_m;
 	float display_h_m = sys->base.info.display_height_m;
@@ -6301,6 +6313,85 @@ after_key_shortcuts:
 	{
 		float bg_color[4] = {0.102f, 0.102f, 0.102f, 1.0f}; // #1a1a1a
 		sys->context->ClearRenderTargetView(mc->combined_atlas_rtv.get(), bg_color);
+	}
+
+	// Draw a hint when there are no visible clients and the launcher isn't open.
+	if (mc->client_count == 0 && !mc->launcher_visible && mc->font_atlas_srv) {
+		uint32_t ca_w = sys->base.info.display_pixel_width;
+		uint32_t ca_h = sys->base.info.display_pixel_height;
+		if (ca_w == 0) ca_w = 3840;
+		if (ca_h == 0) ca_h = 2160;
+		uint32_t num_views = sys->tile_columns * sys->tile_rows;
+		uint32_t half_w = ca_w / sys->tile_columns;
+		uint32_t half_h = ca_h / sys->tile_rows;
+		float scale = 3.0f;
+		float gh = (float)mc->font_glyph_h * scale;
+		const char *hint = "Press Ctrl+L to open launcher";
+
+		sys->context->VSSetShader(sys->blit_vs.get(), nullptr, 0);
+		sys->context->PSSetShader(sys->blit_ps.get(), nullptr, 0);
+		sys->context->VSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
+		sys->context->PSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
+		ID3D11ShaderResourceView *font_srv = mc->font_atlas_srv.get();
+		sys->context->PSSetShaderResources(0, 1, &font_srv);
+		sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
+		ID3D11RenderTargetView *rtvs[] = {mc->combined_atlas_rtv.get()};
+		sys->context->OMSetRenderTargets(1, rtvs, nullptr);
+		sys->context->OMSetBlendState(sys->blend_alpha.get(), nullptr, 0xFFFFFFFF);
+		sys->context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+		sys->context->IASetInputLayout(nullptr);
+		sys->context->RSSetState(sys->rasterizer_state.get());
+		sys->context->OMSetDepthStencilState(sys->depth_disabled.get(), 0);
+		D3D11_VIEWPORT vp = {};
+		vp.Width = (float)ca_w; vp.Height = (float)ca_h; vp.MaxDepth = 1.0f;
+		sys->context->RSSetViewports(1, &vp);
+
+		for (uint32_t v = 0; v < num_views && v < XRT_MAX_VIEWS; v++) {
+			uint32_t col = v % sys->tile_columns;
+			uint32_t row = v / sys->tile_columns;
+			float cx = (float)(col * half_w) + (float)half_w * 0.5f;
+			float cy = (float)(row * half_h) + (float)half_h * 0.5f;
+			// Measure text width
+			float tw = 0;
+			for (const char *p = hint; *p; p++) {
+				unsigned char ch = (unsigned char)*p;
+				if (ch < 0x20 || ch > 0x7E) ch = '?';
+				tw += mc->glyph_advances[ch - 0x20] * scale;
+			}
+			float tx = cx - tw * 0.5f;
+			float ty = cy - gh * 0.5f;
+			float cursor = 0;
+			for (const char *p = hint; *p; p++) {
+				unsigned char ch = (unsigned char)*p;
+				if (ch < 0x20 || ch > 0x7E) ch = '?';
+				int gi = ch - 0x20;
+				float src_gw = mc->glyph_advances[gi];
+				float src_x = 0;
+				for (int i = 0; i < gi; i++) src_x += mc->glyph_advances[i];
+				float dst_gw = src_gw * scale;
+				D3D11_MAPPED_SUBRESOURCE m;
+				if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
+				              D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+					BlitConstants *cb = static_cast<BlitConstants *>(m.pData);
+					cb->src_rect[0] = src_x; cb->src_rect[1] = 0;
+					cb->src_rect[2] = src_gw; cb->src_rect[3] = (float)mc->font_glyph_h;
+					cb->src_size[0] = (float)mc->font_atlas_w;
+					cb->src_size[1] = (float)mc->font_atlas_h;
+					cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
+					cb->convert_srgb = 0.0f;
+					cb->corner_radius = 0; cb->corner_aspect = 0;
+					cb->edge_feather = 0; cb->glow_intensity = 0;
+					cb->quad_mode = 0;
+					cb->dst_offset[0] = tx + cursor; cb->dst_offset[1] = ty;
+					cb->dst_rect_wh[0] = dst_gw; cb->dst_rect_wh[1] = gh;
+					memset(cb->quad_corners_01, 0, sizeof(cb->quad_corners_01));
+					memset(cb->quad_corners_23, 0, sizeof(cb->quad_corners_23));
+					sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
+					sys->context->Draw(4, 0);
+				}
+				cursor += dst_gw;
+			}
+		}
 	}
 
 	// Copy client atlas → combined atlas, crop to content dims, send to DP.
@@ -8456,10 +8547,9 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			factory(sys->device.get(), sys->context.get(),
 			        c->app_hwnd, &c->render.display_processor);
 			if (c->render.display_processor != nullptr) {
-				if (sys->hardware_display_3d) {
-					xrt_display_processor_d3d11_request_display_mode(
-					    c->render.display_processor, true);
-				}
+				// Phase 6.1 (#140): don't call request_display_mode(true)
+				// — same SR SDK recalibration issue. DP comes up in the
+				// current mode; V key toggle works.
 				U_LOG_W("Hot-switch: DP created — standalone rendering active");
 			} else {
 				U_LOG_W("Hot-switch: no DP (factory returned null) — raw copy fallback");
@@ -9021,40 +9111,6 @@ comp_d3d11_service_create_system(struct xrt_device *xdev,
 	// Create a temporary display processor with NULL window to query pixel info,
 	// then destroy it. Per-client display processors are created later with real windows.
 	if (sys->base.info.dp_factory_d3d11 != NULL) {
-		auto factory = (xrt_dp_factory_d3d11_fn_t)sys->base.info.dp_factory_d3d11;
-		struct xrt_display_processor_d3d11 *tmp_dp = nullptr;
-		xrt_result_t dp_ret = factory(sys->device.get(), sys->context.get(), NULL, &tmp_dp);
-		if (dp_ret == XRT_SUCCESS && tmp_dp != nullptr) {
-			uint32_t disp_px_w = 0, disp_px_h = 0;
-			int32_t disp_left = 0, disp_top = 0;
-			if (xrt_display_processor_d3d11_get_display_pixel_info(
-			        tmp_dp, &disp_px_w, &disp_px_h, &disp_left, &disp_top) &&
-			    disp_px_w > 0 && disp_px_h > 0) {
-				// Compute per-view dims using tile layout from active rendering mode
-				sys->view_width = disp_px_w / sys->tile_columns;
-				sys->view_height = disp_px_h / sys->tile_rows;
-				sys->display_width = sys->tile_columns * sys->view_width;
-				sys->display_height = sys->tile_rows * sys->view_height;
-				sys->output_width = disp_px_w;
-				sys->output_height = disp_px_h;
-				U_LOG_W("Display processor pixel info: %ux%u, view=%ux%u per eye (tiles %ux%u)",
-				        disp_px_w, disp_px_h, sys->view_width, sys->view_height,
-				        sys->tile_columns, sys->tile_rows);
-			} else {
-				U_LOG_W("Display processor created but pixel info unavailable, using defaults");
-			}
-
-			// Query display physical dimensions
-			float w_m = 0.0f, h_m = 0.0f;
-			if (xrt_display_processor_d3d11_get_display_dimensions(tmp_dp, &w_m, &h_m)) {
-				sys->base.info.display_width_m = w_m;
-				sys->base.info.display_height_m = h_m;
-			}
-
-			xrt_display_processor_d3d11_destroy(&tmp_dp);
-		} else {
-			U_LOG_W("Temporary display processor creation failed, using default dimensions");
-		}
 	}
 
 	// Create layer shaders and resources for UI layer rendering
