@@ -531,7 +531,17 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			return 0;
 		}
 
-		// Normal mode (no forwarding): pass all keys to qwerty
+		// Normal mode (no forwarding): pass all keys to qwerty.
+		// ESC → close window: Phase 4C made ESC a no-op in qwerty to
+		// prevent it from killing the shell, but that also broke non-shell
+		// ESC (WebXR, standalone IPC clients). Handle ESC here before
+		// qwerty sees it. Shell mode never reaches this block because
+		// input_forward_hwnd != NULL takes the forwarding path above.
+		if (message == WM_KEYDOWN && wParam == VK_ESCAPE) {
+			U_LOG_W("D3D11 window: ESC pressed — closing (non-shell mode)");
+			PostMessageW(hWnd, WM_CLOSE, 0, 0);
+			return 0;
+		}
 #ifdef XRT_BUILD_DRIVER_QWERTY
 		if (w->qwerty_enabled && w->xsysd != NULL) {
 			bool handled = false;
