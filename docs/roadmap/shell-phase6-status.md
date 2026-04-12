@@ -18,10 +18,14 @@ Two bugs discovered during Phase 5 development:
 | Status | Task | Description |
 |--------|------|-------------|
 | [x] | 6.1 | Fix stretched-left-eye artifact on shell startup (#140) |
-| [ ] | 6.2 | IPC rapid-poll pipe closure investigation + fix (#144) |
+| [x] | 6.2 | IPC rapid-poll pipe closure — resolved (stale binary) (#144) |
+| [x] | 6.3 | Mouse-over hover highlight on launcher tiles |
+| [x] | 6.4 | "Press Ctrl+L to open launcher" hint for empty shell |
 
 ## Commits
 
+- `db6729cde` Shell 6: resolve #144 (stale-binary) + hover highlight
+- `72354b5d5` Docs: update Phase 6 status — 6.1 complete
 - `dfd23c8c6` Shell 6: fix stretched-left-eye artifact on shell startup (#140)
 - `91e9c3c2d` Docs: add Phase 6 plan, status, and agent prompt
 
