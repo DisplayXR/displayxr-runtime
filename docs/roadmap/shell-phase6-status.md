@@ -1,7 +1,7 @@
 # Shell Phase 6 Status: Warmup + IPC Fixes
 
 **Branch:** `feature/shell-phase6`
-**Status:** In progress
+**Status:** Complete
 **Date:** 2026-04-11
 
 ## Scope
@@ -21,9 +21,12 @@ Two bugs discovered during Phase 5 development:
 | [x] | 6.2 | IPC rapid-poll pipe closure — resolved (stale binary) (#144) |
 | [x] | 6.3 | Mouse-over hover highlight on launcher tiles |
 | [x] | 6.4 | "Press Ctrl+L to open launcher" hint for empty shell |
+| [x] | 6.5 | Scrollable launcher grid (mouse wheel + arrow-key overflow) |
+| [x] | 6.6 | Permanent remove + Ctrl+R refresh (re-scan sidecars) |
 
 ## Commits
 
+- `cb935ce3e` Shell 6: scrollable grid, permanent remove, Ctrl+R refresh
 - `db6729cde` Shell 6: resolve #144 (stale-binary) + hover highlight
 - `72354b5d5` Docs: update Phase 6 status — 6.1 complete
 - `dfd23c8c6` Shell 6: fix stretched-left-eye artifact on shell startup (#140)
