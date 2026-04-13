@@ -96,8 +96,19 @@ u_sandbox_is_app_container(void)
 bool
 u_sandbox_should_use_ipc(void)
 {
-	// Check for environment variable override first
+	// Check for environment variable override first.
+	// On Windows, also check the process env block via GetEnvironmentVariableA
+	// because the host EXE (e.g. webxr bridge) may have set the var via
+	// SetEnvironmentVariableA AFTER CRT init. The CRT's getenv() misses this
+	// when host and DLL have separate static CRTs (/MT).
 	const char *force_mode = getenv("XRT_FORCE_MODE");
+#ifdef XRT_OS_WINDOWS
+	char force_mode_buf[64] = {0};
+	if (force_mode == NULL) {
+		DWORD n = GetEnvironmentVariableA("XRT_FORCE_MODE", force_mode_buf, sizeof(force_mode_buf));
+		if (n > 0) force_mode = force_mode_buf;
+	}
+#endif
 	if (force_mode != NULL) {
 		if (strcmp(force_mode, "native") == 0) {
 			U_LOG_I("XRT_FORCE_MODE=native: forcing in-process native compositor");

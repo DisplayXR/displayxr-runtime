@@ -40,6 +40,7 @@ target_include_directories(displayxr-webxr-bridge PRIVATE
 
 target_link_libraries(displayxr-webxr-bridge PRIVATE
 	OpenXR::openxr_loader
+	ws2_32
 )
 
 # Use static CRT for a self-contained exe, matching the other win32 targets.

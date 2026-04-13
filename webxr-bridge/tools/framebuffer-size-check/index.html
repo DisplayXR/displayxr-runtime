@@ -1,0 +1,380 @@
+<!doctype html>
+<!--
+  WebXR Bridge v2 Phase 2 — framebuffer-size smoke test (#139).
+
+  Purpose: determine
+    (a) whether Chrome's WebXR honours an oversized framebuffer request
+        (it does not — confirmed worst case, both paths clamp), and
+    (b) whether Chrome RE-QUERIES the runtime's view config mid-session
+        when the page constructs a fresh XRWebGLLayer — the key question
+        for the XRT_EXT_DISPLAY_INFO_IMPLICIT bypass strategy.
+
+  If (b) is yes and the runtime reports different per-view dims per active
+  rendering mode, then phase 2's mode-change handshake gives the page a
+  correctly-sized framebuffer for every mode without any legacy widening.
+
+  Run standalone, no extension, no bridge. Open against a running DisplayXR
+  service, click "Run smoke test", then Enter XR when prompted.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>DisplayXR framebuffer-size smoke test</title>
+<style>
+  body { font: 14px/1.45 ui-monospace, Consolas, monospace; max-width: 820px; margin: 24px auto; padding: 0 16px; color: #222; }
+  h1 { font-size: 18px; }
+  button { font: inherit; padding: 8px 14px; margin-right: 8px; margin-bottom: 6px; }
+  button:disabled { opacity: 0.45; }
+  #log { background: #111; color: #9fd; padding: 12px; border-radius: 6px; white-space: pre-wrap; min-height: 360px; }
+  .ok { color: #8f8; }
+  .warn { color: #fd8; }
+  .err { color: #f88; }
+  .hdr { color: #9cf; font-weight: bold; }
+  .dim { color: #888; }
+  ol.steps li { margin-bottom: 6px; }
+  code { background: #eee; padding: 1px 4px; border-radius: 3px; }
+</style>
+</head>
+<body>
+<h1>DisplayXR framebuffer-size smoke test</h1>
+<p>
+  Probes Chrome WebXR's behaviour against the DisplayXR runtime: whether oversize
+  requests clamp (Part 1), and whether mid-session layer rebuilds pick up new
+  per-view dims when the rendering mode changes (Part 2).
+</p>
+
+<h2 style="font-size:14px">Test procedure</h2>
+<ol class="steps">
+  <li>Start <code>displayxr-service.exe</code>. Make sure DisplayXR is the active OpenXR runtime.</li>
+  <li>Click <b>Run smoke test</b> and accept the XR permission. The page runs an initial clamp probe and logs per-view viewports for the mode that was active at session start.</li>
+  <li>Leave the session running. Focus the DisplayXR service compositor window and press <kbd>V</kbd> (or <kbd>1</kbd>/<kbd>2</kbd>) once to cycle to a different rendering mode. You should see <code>RENDERING_MODE_CHANGED</code> in the service logs.</li>
+  <li>Come back to this page and click <b>Probe viewports</b>. This does a single <code>requestAnimationFrame</code> and reports the current per-view viewports WITHOUT rebuilding the layer — tells us whether Chrome re-queries mid-frame, or caches dims at layer-construction time.</li>
+  <li>Click <b>Rebuild baseLayer</b>. This constructs a new <code>XRWebGLLayer</code> and calls <code>session.updateRenderState({ baseLayer })</code>, forcing Chrome to re-query <code>xrEnumerateViewConfigurationViews</code>. Log reports the new FB dims and viewports.</li>
+  <li>Cycle the mode again and repeat steps 4-5 as many times as useful.</li>
+  <li>Click <b>End session</b> when done. Copy the full log back.</li>
+</ol>
+<p class="dim">
+  Interpretation: if <b>Rebuild baseLayer</b> produces new FB dims that match the newly-active mode's atlas (e.g. 3840×1080 for a 2 × 1 LeiaSR 3D mode, or 3840×2160 for a 1-view 2D mode), then phase 2 just needs an env-var gate in <code>oxr_system.c</code> to bypass the legacy-compromise branch — no widening needed, and legacy apps stay unchanged.
+</p>
+
+<p>
+  <button id="run">Run smoke test</button>
+  <button id="probe" disabled>Probe viewports</button>
+  <button id="rebuild" disabled>Rebuild baseLayer</button>
+  <button id="end" disabled>End session</button>
+</p>
+<pre id="log"></pre>
+<script>
+const logEl = document.getElementById('log');
+function log(msg, cls) {
+  const line = document.createElement('span');
+  if (cls) line.className = cls;
+  line.textContent = msg + '\n';
+  logEl.appendChild(line);
+  console.log(msg);
+}
+function hdr(msg) { log(msg, 'hdr'); }
+function ok(msg)  { log(msg, 'ok'); }
+function warn(msg){ log(msg, 'warn'); }
+function err(msg) { log(msg, 'err'); }
+function dim(msg) { log(msg, 'dim'); }
+
+// Module-level session state so the button handlers can reach it.
+const state = {
+  session:      null,
+  gl:           null,
+  refSpace:     null,
+  currentLayer: null,
+  rebuildCount: 0,
+  frameCount:   0,
+  // Flags consumed by the rAF loop to log a probe on the next frame.
+  probeRequested: false,
+  probeLabel:   '',
+};
+
+function setButtons(opts) {
+  document.getElementById('probe').disabled   = !opts.live;
+  document.getElementById('rebuild').disabled = !opts.live;
+  document.getElementById('end').disabled     = !opts.live;
+  document.getElementById('run').disabled     = !!opts.live;
+}
+
+// Persistent rAF loop. Keeps Chrome submitting frames so the service
+// compositor doesn't stall (otherwise Windows flags the window as "not
+// responding"). Also dispatches any pending probe on the next frame.
+//
+// Draws visible per-eye content so the user can tell 2D vs 3D modes:
+//   - left eye viewport  → red background + centered white square
+//   - right eye viewport → green background + centered white square
+//     with a horizontal disparity offset
+// In 3D/LeiaSR mode the weaver produces an autostereo composite (the
+// squares float at depth, background is a red/green mix). In 2D mode you
+// see only the left (or whichever) eye's content.
+function frameLoop(time, frame) {
+  const { session, currentLayer, refSpace, gl } = state;
+  if (!session) return;
+  state.frameCount++;
+
+  if (currentLayer && gl && currentLayer.framebuffer) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, currentLayer.framebuffer);
+    // Clear the whole FB to dark so any un-covered areas are visible.
+    gl.disable(gl.SCISSOR_TEST);
+    gl.viewport(0, 0, currentLayer.framebufferWidth, currentLayer.framebufferHeight);
+    gl.clearColor(0.02, 0.02, 0.04, 1.0);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+    // Per-view draw. Need a pose to get per-view viewports.
+    let pose = null;
+    try { pose = refSpace ? frame.getViewerPose(refSpace) : null; } catch (_) {}
+    if (pose) {
+      gl.enable(gl.SCISSOR_TEST);
+      for (let i = 0; i < pose.views.length; i++) {
+        const v = pose.views[i];
+        const vp = currentLayer.getViewport(v);
+        if (!vp) continue;
+
+        // Per-eye background colour: left = red, right = green, any
+        // additional views = blue (for >2-view modes).
+        let r = 0.0, g = 0.0, b = 0.0;
+        if (i === 0) { r = 0.45; }       // left
+        else if (i === 1) { g = 0.45; }  // right
+        else { b = 0.45; }
+
+        gl.scissor(vp.x, vp.y, vp.width, vp.height);
+        gl.viewport(vp.x, vp.y, vp.width, vp.height);
+        gl.clearColor(r, g, b, 1.0);
+        gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+        // Centered white square with a horizontal parallax offset.
+        // In 3D mode the disparity makes it float at a small positive
+        // depth (in front of screen). In 2D mode the offset is irrelevant.
+        const squareSize = Math.min(vp.width, vp.height) * 0.25;
+        const cx = vp.x + vp.width  * 0.5;
+        const cy = vp.y + vp.height * 0.5;
+        const disparity = vp.width * 0.02 * (i === 0 ? -1 : +1);
+        const sx = cx - squareSize * 0.5 + disparity;
+        const sy = cy - squareSize * 0.5;
+        gl.scissor(sx, sy, squareSize, squareSize);
+        gl.clearColor(1.0, 1.0, 1.0, 1.0);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+
+        // Thin cyan crosshair at the viewport center (no disparity), so
+        // you can visually compare square offset vs absolute center.
+        const cw = Math.max(2, Math.floor(vp.width * 0.002));
+        const ch = Math.max(2, Math.floor(vp.height * 0.002));
+        gl.scissor(cx - vp.width * 0.05, cy - ch / 2, vp.width * 0.1, ch);
+        gl.clearColor(0.0, 1.0, 1.0, 1.0);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        gl.scissor(cx - cw / 2, cy - vp.height * 0.05, cw, vp.height * 0.1);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+      }
+      gl.disable(gl.SCISSOR_TEST);
+    }
+  }
+
+  if (state.probeRequested) {
+    state.probeRequested = false;
+    const label = state.probeLabel;
+    try {
+      log('  [frame #' + state.frameCount + '] ' + label);
+      if (currentLayer) {
+        log('    framebufferWidth  : ' + currentLayer.framebufferWidth);
+        log('    framebufferHeight : ' + currentLayer.framebufferHeight);
+      }
+      const pose = refSpace ? frame.getViewerPose(refSpace) : null;
+      if (!pose) {
+        warn('    no viewer pose this frame');
+      } else {
+        log('    views in pose: ' + pose.views.length);
+        for (let i = 0; i < pose.views.length; i++) {
+          const v = pose.views[i];
+          const vp = currentLayer ? currentLayer.getViewport(v) : null;
+          if (vp) {
+            log('      view[' + i + '] (' + v.eye + ') viewport: x=' + vp.x +
+                ' y=' + vp.y + ' w=' + vp.width + ' h=' + vp.height);
+          } else {
+            warn('      view[' + i + '] no viewport');
+          }
+        }
+      }
+    } catch (e) {
+      warn('    probe threw: ' + e.message);
+    }
+  }
+
+  session.requestAnimationFrame(frameLoop);
+}
+
+function requestProbe(label) {
+  if (!state.session) {
+    warn('probe: no active session');
+    return;
+  }
+  state.probeLabel = label;
+  state.probeRequested = true;
+}
+
+async function onProbe() {
+  hdr('\n--- Probe viewports (no layer rebuild) ---');
+  dim('  Expectation: dims unchanged since last rebuild unless Chrome re-queries');
+  dim('  xrEnumerateViewConfigurationViews every frame (it does not).');
+  requestProbe('probe (no rebuild)');
+}
+
+async function onRebuild() {
+  const { session, gl } = state;
+  if (!session || !gl) { warn('rebuild: no session/gl'); return; }
+  state.rebuildCount++;
+  hdr('\n--- Rebuild baseLayer #' + state.rebuildCount + ' ---');
+  try {
+    const newLayer = new XRWebGLLayer(session, gl, { framebufferScaleFactor: 1.0 });
+    log('  new XRWebGLLayer fb=' + newLayer.framebufferWidth + 'x' + newLayer.framebufferHeight);
+    await session.updateRenderState({ baseLayer: newLayer });
+    state.currentLayer = newLayer;
+    log('  updateRenderState({ baseLayer }) OK');
+    requestProbe('post-rebuild probe #' + state.rebuildCount);
+    dim('  → Compare fb dims to the previous rebuild. A CHANGE here confirms Chrome');
+    dim('    re-queries runtime view config on fresh XRWebGLLayer construction, and');
+    dim('    that the runtime driver reports different dims per active mode.');
+  } catch (e) {
+    err('rebuild failed: ' + e.message);
+  }
+}
+
+async function run() {
+  logEl.textContent = '';
+  state.rebuildCount = 0;
+  hdr('=== DisplayXR framebuffer-size smoke test ===');
+  if (!('xr' in navigator)) {
+    err('navigator.xr not present — WebXR unavailable in this browser.');
+    return;
+  }
+  const supported = await navigator.xr.isSessionSupported('immersive-vr');
+  log('isSessionSupported(immersive-vr): ' + supported);
+  if (!supported) {
+    err('immersive-vr not supported. Is displayxr-service running? Is DisplayXR the default OpenXR runtime?');
+    return;
+  }
+
+  try {
+    const session = await navigator.xr.requestSession('immersive-vr', {
+      optionalFeatures: ['layers', 'local', 'local-floor'],
+    });
+    state.session = session;
+    const grantedLayers = session.enabledFeatures &&
+                          session.enabledFeatures.indexOf('layers') !== -1;
+    log('session.enabledFeatures: ' + (session.enabledFeatures ?
+        JSON.stringify(session.enabledFeatures) : '(unknown)'));
+    log('layers feature granted: ' + grantedLayers);
+
+    session.addEventListener('end', () => {
+      state.session = null;
+      state.currentLayer = null;
+      state.refSpace = null;
+      setButtons({ live: false });
+      log('session ended');
+    });
+
+    const canvas = document.createElement('canvas');
+    const gl = canvas.getContext('webgl2', { xrCompatible: true }) ||
+               canvas.getContext('webgl',  { xrCompatible: true });
+    if (!gl) { err('failed to get xrCompatible WebGL context'); return; }
+    state.gl = gl;
+    log('WebGL context: ' + (gl instanceof WebGL2RenderingContext ? 'WebGL2' : 'WebGL1'));
+
+    hdr('\n--- Part 1a: XRWebGLLayer clamp probe ---');
+    const base = new XRWebGLLayer(session, gl, { framebufferScaleFactor: 1.0 });
+    log('XRWebGLLayer scale=1.0  fb=' + base.framebufferWidth + 'x' + base.framebufferHeight);
+
+    const big = new XRWebGLLayer(session, gl, { framebufferScaleFactor: 4.0 });
+    log('XRWebGLLayer scale=4.0  fb=' + big.framebufferWidth + 'x' + big.framebufferHeight);
+
+    const ratioX = big.framebufferWidth  / base.framebufferWidth;
+    const ratioY = big.framebufferHeight / base.framebufferHeight;
+    log('  ratio vs baseline: ' + ratioX.toFixed(2) + 'x, ' + ratioY.toFixed(2) + 'x');
+    if (ratioX >= 3.9 && ratioY >= 3.9) {
+      ok('  → framebufferScaleFactor honoured.');
+    } else if (ratioX > 1.1 || ratioY > 1.1) {
+      warn('  → partially honoured.');
+    } else {
+      err('  → framebufferScaleFactor CLAMPED (worst case).');
+    }
+
+    try {
+      state.refSpace = await session.requestReferenceSpace('local');
+      log('requestReferenceSpace(local) OK');
+    } catch (e) {
+      warn('requestReferenceSpace(local) failed: ' + e.message);
+    }
+
+    // Install the baseline as the active layer so we can probe viewports.
+    await session.updateRenderState({ baseLayer: base });
+    state.currentLayer = base;
+
+    // Start the persistent rAF loop NOW. Without continuous frame
+    // submission the service compositor stalls and its window is marked
+    // "not responding" by Windows, which prevents V-key input.
+    session.requestAnimationFrame(frameLoop);
+    log('persistent rAF loop started — service compositor should stay responsive');
+
+    hdr('\n--- Part 1b: per-view viewports (initial mode) ---');
+    requestProbe('initial probe');
+
+    hdr('\n--- Part 1c: XRProjectionLayer probe ---');
+    if (typeof XRWebGLBinding === 'undefined') {
+      warn('XRWebGLBinding not defined → unavailable in this Chrome build.');
+    } else if (!grantedLayers) {
+      err('layers feature NOT granted → createProjectionLayer will be undefined.');
+      dim('  (This is expected on desktop Chrome for custom OpenXR runtimes.)');
+    } else {
+      try {
+        const binding = new XRWebGLBinding(session, gl);
+        if (typeof binding.createProjectionLayer !== 'function') {
+          err('binding.createProjectionLayer still not a function despite layers granted.');
+        } else {
+          const baseProj = binding.createProjectionLayer({
+            textureType: 'texture',
+            colorFormat:  gl.RGBA8 || gl.RGBA,
+            depthFormat:  gl.DEPTH_COMPONENT24 || 0,
+            scaleFactor:  1.0,
+          });
+          log('baseline projLayer: ' + baseProj.textureWidth + 'x' + baseProj.textureHeight);
+          const bigProj = binding.createProjectionLayer({
+            textureType: 'texture',
+            colorFormat:  gl.RGBA8 || gl.RGBA,
+            depthFormat:  gl.DEPTH_COMPONENT24 || 0,
+            scaleFactor:  4.0,
+          });
+          log('scale=4.0 projLayer: ' + bigProj.textureWidth + 'x' + bigProj.textureHeight);
+        }
+      } catch (e) {
+        err('createProjectionLayer threw: ' + e.message);
+      }
+    }
+
+    hdr('\n--- Part 2: mid-session mode-change probes ---');
+    dim('  Now cycle the rendering mode in the service compositor window (V key)');
+    dim('  and click "Probe viewports" / "Rebuild baseLayer" to see how Chrome');
+    dim('  reacts. See the instructions at the top of the page.');
+    setButtons({ live: true });
+  } catch (e) {
+    err('requestSession or initial probe failed: ' + e.message);
+    console.error(e);
+    setButtons({ live: false });
+  }
+}
+
+async function end() {
+  if (state.session) {
+    try { await state.session.end(); } catch (_) {}
+  }
+}
+
+document.getElementById('run').addEventListener('click', run);
+document.getElementById('probe').addEventListener('click', onProbe);
+document.getElementById('rebuild').addEventListener('click', onRebuild);
+document.getElementById('end').addEventListener('click', end);
+setButtons({ live: false });
+</script>
+</body>
+</html>

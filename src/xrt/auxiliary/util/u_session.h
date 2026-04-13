@@ -46,6 +46,11 @@ struct u_session
 	//! Owning system, optional.
 	struct u_system *usys;
 
+	//! For headless sessions: compositor created solely for event registration
+	//! with the system compositor (IPC server). Destroyed when session ends.
+	//! NULL for non-headless sessions (caller owns the compositor).
+	struct xrt_compositor_native *headless_xcn;
+
 	struct
 	{
 		struct os_mutex mutex;

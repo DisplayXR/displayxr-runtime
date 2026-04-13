@@ -967,6 +967,12 @@ struct xrt_session_info
 	//! Shared GPU texture handle for zero-copy offscreen compositing.
 	//! Platform-specific: HANDLE on Windows (D3D11/D3D12), IOSurfaceRef on macOS.
 	void *shared_texture_handle;
+
+	//! True when this session is a WebXR bridge relay (XR_MND_headless +
+	//! XR_EXT_display_info). The compositor uses this to detect that a
+	//! concurrent legacy session is bridge-aware and should use mode-native
+	//! tile rects instead of legacy compromise scaling.
+	bool is_bridge_relay;
 };
 
 /*!

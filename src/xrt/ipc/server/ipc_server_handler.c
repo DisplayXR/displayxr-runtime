@@ -698,7 +698,21 @@ ipc_handle_session_create(volatile struct ipc_client_state *ics,
 		return XRT_ERROR_IPC_SESSION_ALREADY_CREATED;
 	}
 
-	xrt_result_t xret = xrt_system_create_session(ics->server->xsys, xsi, &xs, &xcn);
+	// For headless sessions (create_native_compositor=false), pass NULL
+	// for out_xcn so u_system::create_session registers the session for
+	// event broadcasting without returning a compositor to the caller.
+	{
+		FILE *dbg = fopen("C:\\bridge_debug.txt", "a");
+		if (dbg) {
+			fprintf(dbg, "ipc_handle_session_create: create_native_compositor=%d xsys=%p\n",
+			        (int)create_native_compositor, (void *)ics->server->xsys);
+			fflush(dbg);
+			fclose(dbg);
+		}
+	}
+	xrt_result_t xret = xrt_system_create_session(
+	    ics->server->xsys, xsi, &xs,
+	    create_native_compositor ? &xcn : NULL);
 	if (xret != XRT_SUCCESS) {
 		return xret;
 	}
@@ -707,7 +721,7 @@ ipc_handle_session_create(volatile struct ipc_client_state *ics,
 	ics->client_state.z_order = xsi->z_order;
 
 	ics->xs = xs;
-	ics->xc = &xcn->base;
+	ics->xc = xcn != NULL ? &xcn->base : NULL;
 
 	// Set initial state to visible and focused (matching in-process behavior).
 	// This must be called so the client's OXR layer knows to transition the
@@ -715,10 +729,11 @@ ipc_handle_session_create(volatile struct ipc_client_state *ics,
 	// to the app are deferred for AppContainer apps in oxr_session_begin().
 	ics->client_state.session_visible = true;
 	ics->client_state.session_focused = true;
-	xrt_syscomp_set_state(ics->server->xsysc, ics->xc, ics->client_state.session_visible,
-	                      ics->client_state.session_focused);
-
-	xrt_syscomp_set_z_order(ics->server->xsysc, ics->xc, ics->client_state.z_order);
+	if (ics->xc != NULL) {
+		xrt_syscomp_set_state(ics->server->xsysc, ics->xc, ics->client_state.session_visible,
+		                      ics->client_state.session_focused);
+		xrt_syscomp_set_z_order(ics->server->xsysc, ics->xc, ics->client_state.z_order);
+	}
 
 	// Return initial visibility/focus state to client (avoids race condition
 	// where client polls events after session_create but before begin_session)

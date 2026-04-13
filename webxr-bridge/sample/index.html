@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>DisplayXR WebXR Bridge v2 — three.js sample</title>
+<style>
+  body { font: 15px/1.5 system-ui, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 16px; color: #222; }
+  button { font: inherit; padding: 10px 20px; cursor: pointer; }
+  button:disabled { opacity: 0.4; cursor: default; }
+  #status { margin-top: 12px; padding: 10px; background: #f0f0f0; border-radius: 6px; white-space: pre-wrap; font: 13px/1.4 ui-monospace, monospace; min-height: 80px; }
+</style>
+</head>
+<body>
+<h1>DisplayXR WebXR Bridge v2 — three.js sample</h1>
+<p>
+  Requires: <code>displayxr-service.exe</code> + <code>displayxr-webxr-bridge.exe</code>
+  running, and the DisplayXR WebXR Bridge extension loaded in Chrome.
+</p>
+<p>
+  <button id="enter-xr">Enter XR</button>
+  <button id="exit-xr" disabled>Exit XR</button>
+</p>
+<div id="status">Waiting...</div>
+
+<script src="sample.js"></script>
+</body>
+</html>

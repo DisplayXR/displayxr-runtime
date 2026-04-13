@@ -58,6 +58,11 @@
 DEBUG_GET_ONCE_LOG_OPTION(app_frame_lag_level, "XRT_APP_FRAME_LAG_LOG_AS_LEVEL", U_LOGGING_DEBUG)
 #define LOG_FRAME_LAG(...) U_LOG_IFL(debug_get_log_option_app_frame_lag_level(), u_log_get_global_level(), __VA_ARGS__)
 
+// Global bridge-relay flag: true when a headless+display_info session is
+// connected. Read by d3d11_service compositor to switch legacy sessions
+// to mode-native tile layout instead of compromise rescaling.
+bool g_bridge_relay_active = false;
+
 /*
  *
  * Slot management functions.
@@ -1298,9 +1303,25 @@ multi_compositor_destroy(struct xrt_compositor *xc)
 	os_mutex_lock(&mc->msc->list_and_timing_lock);
 
 	// Remove it from the list of clients.
+	bool was_bridge = mc->xsi.is_bridge_relay;
 	for (size_t i = 0; i < MULTI_MAX_CLIENTS; i++) {
 		if (mc->msc->clients[i] == mc) {
 			mc->msc->clients[i] = NULL;
+		}
+	}
+
+	if (was_bridge) {
+		extern bool g_bridge_relay_active;
+		bool any_bridge = false;
+		for (size_t i = 0; i < MULTI_MAX_CLIENTS; i++) {
+			if (mc->msc->clients[i] != NULL && mc->msc->clients[i]->xsi.is_bridge_relay) {
+				any_bridge = true;
+				break;
+			}
+		}
+		g_bridge_relay_active = any_bridge;
+		if (!any_bridge) {
+			U_LOG_W("Bridge relay session disconnected — legacy sessions revert to compromise scaling");
 		}
 	}
 
@@ -1927,6 +1948,12 @@ multi_compositor_create(struct multi_system_compositor *msc,
 		}
 		mc->msc->clients[i] = mc;
 		break;
+	}
+
+	if (mc->xsi.is_bridge_relay) {
+		extern bool g_bridge_relay_active;
+		g_bridge_relay_active = true;
+		U_LOG_W("Bridge relay session connected — legacy sessions use mode-native tile layout");
 	}
 
 	u_pa_info(                                         //

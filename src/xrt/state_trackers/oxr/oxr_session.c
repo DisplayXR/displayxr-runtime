@@ -2585,6 +2585,12 @@ oxr_session_create(struct oxr_logger *log,
 	}
 #endif
 
+#ifdef OXR_HAVE_EXT_display_info
+	if (sys->inst->extensions.EXT_display_info && sys->inst->extensions.MND_headless) {
+		xsi.is_bridge_relay = true;
+	}
+#endif
+
 	/* Try allocating and populating. */
 	XrResult ret = oxr_session_create_impl(log, sys, createInfo, &xsi, &sess);
 	if (ret != XR_SUCCESS) {

@@ -9,6 +9,7 @@
 
 #include "util/u_system.h"
 #include "util/u_session.h"
+#include "xrt/xrt_compositor.h"
 
 
 /*
@@ -63,6 +64,11 @@ destroy(struct xrt_session *xs)
 	}
 
 	us->events.ptr = NULL;
+
+	// Destroy headless compositor (created for event registration only).
+	if (us->headless_xcn != NULL) {
+		xrt_comp_native_destroy(&us->headless_xcn);
+	}
 
 	if (us->usys != NULL) {
 		u_system_remove_session(us->usys, &us->base, &us->sink);

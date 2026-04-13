@@ -64,21 +64,32 @@ create_session(struct xrt_system *xsys,
 
 	struct u_session *us = u_session_create(usys);
 
-	// Skip making a native compositor if not asked for.
-	if (out_xcn == NULL) {
-		goto out_session;
+	if (out_xcn != NULL) {
+		// Normal path: create compositor for the caller.
+		xret = xrt_syscomp_create_native_compositor( //
+		    usys->xsysc,                             //
+		    xsi,                                     //
+		    &us->sink,                               //
+		    out_xcn);                                //
+		if (xret != XRT_SUCCESS) {
+			goto err;
+		}
+	} else if (usys->xsysc != NULL) {
+		// Headless path: no compositor returned to caller, but still
+		// register with the system compositor so event broadcasts
+		// (RENDERING_MODE_CHANGED, etc.) reach this session via IPC.
+		// Without this, u_system_broadcast_event on the server skips
+		// headless sessions because they have no server-side entry.
+		xret = xrt_syscomp_create_native_compositor( //
+		    usys->xsysc,                             //
+		    xsi,                                     //
+		    &us->sink,                               //
+		    &us->headless_xcn);                      //
+		if (xret != XRT_SUCCESS) {
+			goto err;
+		}
 	}
 
-	xret = xrt_syscomp_create_native_compositor( //
-	    usys->xsysc,                             //
-	    xsi,                                     //
-	    &us->sink,                               //
-	    out_xcn);                                //
-	if (xret != XRT_SUCCESS) {
-		goto err;
-	}
-
-out_session:
 	*out_xs = &us->base;
 
 	return XRT_SUCCESS;

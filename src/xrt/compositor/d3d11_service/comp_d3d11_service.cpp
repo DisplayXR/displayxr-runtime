@@ -64,6 +64,10 @@
 #include <sddl.h>
 
 
+// Bridge-relay flag: set by multi_compositor when a headless+display_info
+// session connects. Read in the blit loop to use mode-native tile rects.
+extern "C" bool g_bridge_relay_active;
+
 /*
  *
  * Helpers
@@ -7359,11 +7363,30 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			c->atlas_flip_y = true;
 		}
 
+		// Bridge-relay detection: when a headless+display_info session is
+		// connected (the WebXR bridge), legacy sessions are treated as
+		// bridge-aware. The bridge-aware page draws into mode-native
+		// sub-rects of the framebuffer; we read those directly instead of
+		// using Chrome's compromise-scaled subImage.imageRect.
+		bool bridge_aware = g_bridge_relay_active && sys->base.info.legacy_app_tile_scaling && !sys->shell_mode;
+
 		for (uint32_t eye = 0; eye < proj_view_count; eye++) {
 			float src_x = static_cast<float>(layer->data.proj.v[eye].sub.rect.offset.w);
 			float src_y = static_cast<float>(layer->data.proj.v[eye].sub.rect.offset.h);
 			float src_w = static_cast<float>(layer->data.proj.v[eye].sub.rect.extent.w);
 			float src_h = static_cast<float>(layer->data.proj.v[eye].sub.rect.extent.h);
+
+			if (bridge_aware) {
+				// Override: use mode-native tile rects from sync_tile_layout()
+				// instead of Chrome's compromise-scaled subImage.imageRect.
+				// The bridge-aware page drew content at these coords.
+				src_w = static_cast<float>(sys->view_width);
+				src_h = static_cast<float>(sys->view_height);
+				uint32_t tileX = eye % sys->tile_columns;
+				uint32_t tileY = eye / sys->tile_columns;
+				src_x = static_cast<float>(tileX * sys->view_width);
+				src_y = static_cast<float>(tileY * sys->view_height);
+			}
 
 			// In shell mode, use actual content dims for tile layout (atlas is native-sized).
 			// In non-shell mode, use sys->view_width/height (atlas is DP-sized).
@@ -7911,6 +7934,13 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 	// Initialize layer accumulator
 	std::memset(&c->layer_accum, 0, sizeof(c->layer_accum));
 
+	// Bridge relay sessions (headless + XR_EXT_display_info) only need event
+	// registration — skip window, swap chain, and display processor creation.
+	bool is_headless_relay = (xsi != nullptr && xsi->is_bridge_relay);
+	if (is_headless_relay) {
+		U_LOG_W("Bridge relay session: skipping render resources (headless, events only)");
+	}
+
 	// Initialize per-client render resources (window, swap chain, display processor)
 	// Get external window handle if app provided one via XR_EXT_win32_window_binding
 	void *external_hwnd = nullptr;
@@ -7918,18 +7948,20 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 		external_hwnd = xsi->external_window_handle;
 	}
 
-	// Activate shell mode from system compositor info (set by ipc_server_process.c
-	// after init_all, before any client connects)
-	if (sys->base.info.shell_mode && !sys->shell_mode) {
-		sys->shell_mode = true;
-		U_LOG_W("Shell mode activated for D3D11 service system");
-	}
+	if (!is_headless_relay) {
+		// Activate shell mode from system compositor info (set by ipc_server_process.c
+		// after init_all, before any client connects)
+		if (sys->base.info.shell_mode && !sys->shell_mode) {
+			sys->shell_mode = true;
+			U_LOG_W("Shell mode activated for D3D11 service system");
+		}
 
-	xrt_result_t res_ret = init_client_render_resources(sys, external_hwnd, sys->xsysd, &c->render);
-	if (res_ret != XRT_SUCCESS) {
-		U_LOG_E("Failed to initialize client render resources");
-		delete c;
-		return res_ret;
+		xrt_result_t res_ret = init_client_render_resources(sys, external_hwnd, sys->xsysd, &c->render);
+		if (res_ret != XRT_SUCCESS) {
+			U_LOG_E("Failed to initialize client render resources");
+			delete c;
+			return res_ret;
+		}
 	}
 
 	// Register with multi-compositor in shell mode
