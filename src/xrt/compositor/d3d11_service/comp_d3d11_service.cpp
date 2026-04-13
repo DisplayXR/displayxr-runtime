@@ -4466,7 +4466,7 @@ launcher_hit_test(struct d3d11_service_system *sys, POINT cursor_px, uint32_t n_
 	float px_per_m_x = tile_px_w_eff / disp_w_m;
 	float px_per_m_y = tile_px_h_eff / disp_h_m;
 	float y_ratio = (px_per_m_y > 0.0f) ? (px_per_m_x / px_per_m_y) : 1.0f;
-	float tile_h = tile_w * y_ratio;
+	float tile_h = tile_w; // square in pixel space (matches render)
 
 	// Section header + label heights: render uses
 	// `font_glyph_h * section_scale` where section_scale = (section_h_px * 0.65)
