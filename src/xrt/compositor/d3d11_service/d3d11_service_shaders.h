@@ -633,9 +633,44 @@ float4 PSMain(VS_OUTPUT input) : SV_Target
     if (convert_srgb > 2.5) {
         float ext = glow_extent;
         if (ext < 0.001) discard;
-        // Distance from inner window boundary (positive = outside window)
+        // Distance from inner window boundary (positive = outside window).
+        // When corner_radius is set, the inner boundary is a rounded rect.
         float dx = max(ext - uv01.x, uv01.x - (1.0 - ext));
         float dy = max(ext - uv01.y, uv01.y - (1.0 - ext));
+
+        // Corner rounding: if in a corner region of the inner rect,
+        // compute distance from the rounded corner arc instead.
+        float cr = abs(corner_radius);
+        if (cr > 0.001) {
+            float aspect = abs(corner_aspect);
+            if (aspect < 0.001) aspect = 1.0;
+            float ry = cr;
+            float rx = ry / aspect;
+            // Inner rect corners in UV space
+            float il = ext, ir = 1.0 - ext, it = ext, ib = 1.0 - ext;
+            // Check each corner of the inner rect
+            bool in_corner = false;
+            float2 corner_center;
+            if (uv01.x < il + rx && uv01.y < it + ry) {
+                corner_center = float2(il + rx, it + ry); in_corner = true;
+            } else if (uv01.x > ir - rx && uv01.y < it + ry) {
+                corner_center = float2(ir - rx, it + ry); in_corner = true;
+            } else if (uv01.x < il + rx && uv01.y > ib - ry) {
+                corner_center = float2(il + rx, ib - ry); in_corner = true;
+            } else if (uv01.x > ir - rx && uv01.y > ib - ry) {
+                corner_center = float2(ir - rx, ib - ry); in_corner = true;
+            }
+            if (in_corner) {
+                float cdist = length(float2((uv01.x - corner_center.x) / rx,
+                                            (uv01.y - corner_center.y) / ry));
+                if (cdist <= 1.0) discard; // inside rounded inner rect
+                float corner_overshoot = (cdist - 1.0) * max(rx, ry);
+                float falloff = exp(-glow_falloff * corner_overshoot / ext * corner_overshoot / ext);
+                float a = glow_intensity * falloff;
+                return float4(glow_color.rgb * a, a);
+            }
+        }
+
         float dist;
         if (dx > 0 && dy > 0)
             dist = length(float2(dx, dy)) / ext;
@@ -656,9 +691,14 @@ float4 PSMain(VS_OUTPUT input) : SV_Target
         float aspect = abs(corner_aspect);
         if (aspect < 0.001) aspect = 10.0;
         float rx = ry / aspect;
-        bool do_top = (corner_radius > 0);
-        bool do_bottom = (corner_radius < 0 || corner_aspect < 0);
-        bool do_top_left = do_top && (corner_aspect > 0);
+        // corner_radius > 0, corner_aspect > 0: top-left + top-right
+        // corner_radius > 0, corner_aspect < 0: top-right only
+        // corner_radius < 0, corner_aspect > 0: bottom-left + bottom-right
+        // corner_radius < 0, corner_aspect < 0: ALL four corners
+        bool all_corners = (corner_radius < 0 && corner_aspect < 0);
+        bool do_top = (corner_radius > 0 || all_corners);
+        bool do_bottom = (corner_radius < 0);
+        bool do_top_left = do_top && (corner_aspect > 0 || all_corners);
         bool do_top_right = do_top;
         bool do_bottom_left = (corner_radius < 0);
         bool do_bottom_right = (corner_radius < 0);

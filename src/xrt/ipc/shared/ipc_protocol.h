@@ -30,7 +30,7 @@
 
 
 #define IPC_CRED_SIZE 1    // auth not implemented
-#define IPC_BUF_SIZE 512   // must be >= largest message length in bytes
+#define IPC_BUF_SIZE 1024  // must be >= largest message length in bytes
 #define IPC_MAX_VIEWS 8    // max views we will return configs for
 #define IPC_MAX_FORMATS 32 // max formats our server-side compositor supports
 #define IPC_MAX_DEVICES 8  // max number of devices we will map using shared mem
@@ -336,6 +336,9 @@ struct ipc_launcher_app
 	char name[IPC_LAUNCHER_NAME_MAX];
 	char exe_path[IPC_LAUNCHER_PATH_MAX];
 	char type[IPC_LAUNCHER_TYPE_MAX]; // "3d" or "2d"
+	char icon_path[IPC_LAUNCHER_PATH_MAX];
+	char icon_3d_path[IPC_LAUNCHER_PATH_MAX];
+	char icon_3d_layout[IPC_LAUNCHER_TYPE_MAX]; // "sbs-lr" etc
 };
 
 /*!

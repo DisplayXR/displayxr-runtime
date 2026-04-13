@@ -135,3 +135,7 @@ openxr_sdk/
 
 # Shell smoke test outputs (screenshots + logs)
 scripts/test/out/
+
+# Runtime screenshot captures
+shell_screenshot.png
+shell_capture*.png

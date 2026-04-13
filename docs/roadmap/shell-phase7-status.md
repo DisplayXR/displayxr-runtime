@@ -1,7 +1,7 @@
 # Shell Phase 7 Status: 3D Icon Rendering
 
 **Branch:** `feature/shell-phase7`
-**Status:** Not started
+**Status:** In progress — all 5 tasks implemented, awaiting live verification
 **Date:** 2026-04-12
 
 ## Scope
@@ -14,11 +14,11 @@ Wire icon textures end-to-end: IPC icon path plumbing → D3D11 texture loading 
 
 | Status | Task | Description |
 |--------|------|-------------|
-| [ ] | 7.1 | Bump IPC_BUF_SIZE, extend ipc_launcher_app with icon fields |
-| [ ] | 7.2 | Per-app icon SRV storage + load on push |
-| [ ] | 7.3 | Textured tile render (fallback to solid color when no icon) |
-| [ ] | 7.4 | SBS per-eye UV sub-rect for icon_3d |
-| [ ] | 7.5 | Placeholder test icons for cube_handle apps |
+| [x] | 7.1 | Bump IPC_BUF_SIZE, extend ipc_launcher_app with icon fields |
+| [x] | 7.2 | Per-app icon SRV storage + load on push |
+| [x] | 7.3 | Textured tile render (fallback to solid color when no icon) |
+| [x] | 7.4 | SBS per-eye UV sub-rect for icon_3d |
+| [x] | 7.5 | Placeholder test icons for cube_handle apps |
 
 ## Commits
 
