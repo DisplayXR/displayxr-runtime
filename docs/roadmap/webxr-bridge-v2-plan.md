@@ -106,9 +106,14 @@ Expected: bridge logs a complete `display-info` dump. Chrome WebXR renders norma
 
 ---
 
-## Phase 2 — WebSocket metadata server, MV3 extension, three.js sample
+## Phase 2 — WebSocket metadata server, MV3 extension, bridge-relay compositor
 
-No runtime changes. Only bridge + extension + sample.
+**Status: SHIPPED** (commit `caaab165c` on `feature/webxr-bridge-v2`)
+
+Runtime changes were needed (contrary to original plan) to fix three issues discovered during implementation:
+1. **Static CRT env var isolation:** bridge EXE and DisplayXRClient.dll have separate static CRTs; `_putenv` in the bridge doesn't reach the DLL. Fixed by using `GetEnvironmentVariableA` in `u_sandbox.c` so `XRT_FORCE_MODE=ipc` set via `SetEnvironmentVariableA` crosses the boundary.
+2. **Headless IPC event delivery:** headless sessions (out_xcn=NULL) were not registered with the server's `u_system` for event broadcasts. Fixed in `u_system.c` (create a headless compositor for registration) and `ipc_server_handler.c` (honor `create_native_compositor=false` parameter).
+3. **Bridge-relay compositor detection:** auto-detect bridge presence (headless+display_info session) and override legacy tile scaling with mode-native tile rects. `is_bridge_relay` flag on `xrt_session_info`, `g_bridge_relay_active` global in multi compositor, override in D3D11 service blit loop.
 
 ### Tasks
 
