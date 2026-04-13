@@ -11,6 +11,7 @@
 #include "d3d11_service_shaders.h"
 #include "d3d11_bitmap_font.h"
 #include "d3d11_capture.h"
+#include "d3d11_icon_loader.h"
 
 #include "shared/ipc_protocol.h" // struct ipc_launcher_app_list
 
@@ -56,6 +57,9 @@
 #include <dwrite.h>
 #include <dwmapi.h>
 #pragma comment(lib, "dwmapi.lib")
+
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
 
 #include <chrono>
 #include <cstdlib>
@@ -332,6 +336,15 @@ struct d3d11_service_system
 	//! right-click → Remove. Bit i = launcher_apps[i] is hidden. Cleared on
 	//! every shell registry re-push so the state is session-only.
 	uint64_t hidden_tile_mask = 0;
+
+	//! Phase 7.2: per-app icon textures loaded from sidecar icon paths.
+	struct launcher_icon {
+		wil::com_ptr<ID3D11ShaderResourceView> srv_2d;
+		wil::com_ptr<ID3D11ShaderResourceView> srv_3d;
+		uint32_t w_2d = 0, h_2d = 0, w_3d = 0, h_3d = 0;
+		char layout_3d[8] = {};
+	};
+	struct launcher_icon launcher_icons[IPC_LAUNCHER_MAX_APPS];
 
 	//! Multi-compositor control interface for session state management
 	struct xrt_multi_compositor_control xmcc;
@@ -4453,7 +4466,7 @@ launcher_hit_test(struct d3d11_service_system *sys, POINT cursor_px, uint32_t n_
 	float px_per_m_x = tile_px_w_eff / disp_w_m;
 	float px_per_m_y = tile_px_h_eff / disp_h_m;
 	float y_ratio = (px_per_m_y > 0.0f) ? (px_per_m_x / px_per_m_y) : 1.0f;
-	float tile_h = tile_w * 0.65f * y_ratio;
+	float tile_h = tile_w * y_ratio;
 
 	// Section header + label heights: render uses
 	// `font_glyph_h * section_scale` where section_scale = (section_h_px * 0.65)
@@ -5437,7 +5450,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			float est_tile_w = (ui_m_to_tile_px_x(
 			    sys->base.info.display_width_m > 0 ? sys->base.info.display_width_m * 0.60f : 0.42f, sys)
 			    - 5.0f * est_margin) / 4.0f;
-			float est_tile_h = est_tile_w * 0.65f;
+			float est_tile_h = est_tile_w;
 			float est_section_scale = (est_section * 0.65f) /
 			    (mc->font_glyph_h > 0 ? (float)mc->font_glyph_h : 16.0f);
 			float est_label_h = (float)(mc->font_glyph_h > 0 ? mc->font_glyph_h : 16) *
@@ -5543,6 +5556,8 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			toggle_fullscreen(sys, mc, mc->focused_slot);
 		}
 	}
+
+	// Screenshot: triggered by F12 key (kept for interactive use).
 
 	// Ctrl+O: open file dialog to launch a new app
 	if ((GetAsyncKeyState(VK_CONTROL) & 0x8000) && (GetAsyncKeyState('O') & 1)) {
@@ -7266,7 +7281,7 @@ after_key_shortcuts:
 		float section_h = panel_h_px * 0.07f;
 		float tile_w = (panel_w_px - (LAUNCHER_GRID_COLS + 1) * margin) /
 		               (float)LAUNCHER_GRID_COLS;
-		float tile_h = tile_w * 0.65f;
+		float tile_h = tile_w;
 
 		// App list pushed from the shell process via clear+add IPC calls.
 		// Stored on sys so it survives multi-comp create/destroy. Empty until
@@ -7334,8 +7349,9 @@ after_key_shortcuts:
 			cb->dst_size[0] = (float)ca_w;
 			cb->dst_size[1] = (float)ca_h;
 			cb->convert_srgb = 2.0f; // solid-color mode
-			cb->corner_radius = corner_radius;
-			cb->corner_aspect = (dh > 0.0f) ? (dw / dh) : 1.0f;
+			// Negative radius + negative aspect = all four corners rounded.
+			cb->corner_radius = -fabsf(corner_radius);
+			cb->corner_aspect = (dh > 0.0f) ? -(dw / dh) : -1.0f;
 			cb->edge_feather = (dh > 0.0f) ? (2.0f / dh) : 0.0f;
 			cb->glow_intensity = glow_intensity;
 			cb->quad_mode = 0;
@@ -7625,8 +7641,11 @@ after_key_shortcuts:
 						cb->dst_size[0] = (float)ca_w;
 						cb->dst_size[1] = (float)ca_h;
 						cb->convert_srgb = 3.0f; // glow mode
-						cb->corner_radius = 0.0f;
-						cb->corner_aspect = 0.0f;
+						// Scale tile corner radius into oversized glow quad space.
+						// Negative radius + negative aspect = all four corners.
+						float glow_cr = 0.06f * tile_h / gh;
+						cb->corner_radius = -glow_cr;
+						cb->corner_aspect = -(gw / gh);
 						cb->edge_feather = 0.0f;
 						cb->glow_intensity = 0.85f;
 						cb->glow_extent = glow_ext;
@@ -7658,7 +7677,7 @@ after_key_shortcuts:
 					float sm = tile_h * 0.045f;
 					draw_solid_rect(tx - sm, ty - sm,
 					                tile_w + 2.0f * sm, tile_h + 2.0f * sm,
-					                1.00f, 1.00f, 1.00f, 0.90f, 0.20f, 0.0f);
+					                1.00f, 1.00f, 1.00f, 0.90f, 0.06f, 0.0f);
 				}
 
 				// Tile background — slightly lighter than panel, rounded.
@@ -7673,7 +7692,91 @@ after_key_shortcuts:
 					bg_b += 0.06f;
 				}
 				draw_solid_rect(tx, ty, tile_w, tile_h,
-				                bg_r, bg_g, bg_b, 0.95f, 0.18f, 0.0f);
+				                bg_r, bg_g, bg_b, 0.95f, 0.06f, 0.0f);
+
+				// Phase 7.3 + 7.4: icon texture over tile background.
+				{
+					const auto &ic = sys->launcher_icons[full_idx];
+					bool use_3d = ic.srv_3d && sys->tile_columns > 1;
+					ID3D11ShaderResourceView *icon_srv = use_3d
+						? ic.srv_3d.get()
+						: ic.srv_2d.get();
+
+					if (icon_srv != nullptr) {
+						uint32_t tex_w = use_3d ? ic.w_3d : ic.w_2d;
+						uint32_t tex_h = use_3d ? ic.h_3d : ic.h_2d;
+
+						// Compute the sub-rect of the icon texture to sample.
+						float sx = 0, sy = 0, sw = (float)tex_w, sh = (float)tex_h;
+						if (use_3d) {
+							const char *lay = ic.layout_3d;
+							bool is_sbs = (lay[0] == 's'); // sbs-lr or sbs-rl
+							bool is_lr  = is_sbs && (lay[4] == 'l');
+							bool is_tb  = (lay[0] == 't'); // tb
+							// col=0 → left eye, col=1 → right eye
+							bool right_eye = (col == 1);
+							if (is_sbs) {
+								sw = (float)(tex_w / 2);
+								sx = (is_lr == right_eye) ? sw : 0;
+							} else {
+								// tb or bt
+								sh = (float)(tex_h / 2);
+								sy = (is_tb == right_eye) ? sh : 0;
+							}
+						}
+
+						// Fill tile completely, aspect-fit and centered.
+						float icon_aspect = sw / sh;
+						float tile_aspect = tile_w / tile_h;
+						float draw_w, draw_h;
+						if (icon_aspect > tile_aspect) {
+							draw_w = tile_w;
+							draw_h = draw_w / icon_aspect;
+						} else {
+							draw_h = tile_h;
+							draw_w = draw_h * icon_aspect;
+						}
+						float draw_x = tx + (tile_w - draw_w) * 0.5f;
+						float draw_y = ty + (tile_h - draw_h) * 0.5f;
+
+						D3D11_MAPPED_SUBRESOURCE im;
+						if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
+						                                D3D11_MAP_WRITE_DISCARD, 0, &im))) {
+							BlitConstants *cb = static_cast<BlitConstants *>(im.pData);
+							cb->src_rect[0] = sx;
+							cb->src_rect[1] = sy;
+							cb->src_rect[2] = sw;
+							cb->src_rect[3] = sh;
+							cb->src_size[0] = (float)tex_w;
+							cb->src_size[1] = (float)tex_h;
+							cb->dst_size[0] = (float)ca_w;
+							cb->dst_size[1] = (float)ca_h;
+							cb->convert_srgb = 0.0f;
+							// Negative radius + negative aspect = all four corners.
+							cb->corner_radius = -0.06f;
+							cb->corner_aspect = (draw_h > 0.0f) ? -(draw_w / draw_h) : -1.0f;
+							cb->edge_feather = (draw_h > 0.0f) ? (2.0f / draw_h) : 0.0f;
+							cb->glow_intensity = 0.0f;
+							cb->quad_mode = 0;
+							cb->dst_offset[0] = draw_x;
+							cb->dst_offset[1] = draw_y;
+							cb->dst_rect_wh[0] = draw_w;
+							cb->dst_rect_wh[1] = draw_h;
+							memset(cb->quad_corners_01, 0, sizeof(cb->quad_corners_01));
+							memset(cb->quad_corners_23, 0, sizeof(cb->quad_corners_23));
+							sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
+
+							sys->context->PSSetShaderResources(0, 1, &icon_srv);
+							sys->context->Draw(4, 0);
+
+							// Re-bind font atlas for subsequent text draws.
+							if (mc->font_atlas_srv) {
+								ID3D11ShaderResourceView *font_srv = mc->font_atlas_srv.get();
+								sys->context->PSSetShaderResources(0, 1, &font_srv);
+							}
+						}
+					}
+				}
 
 				// Label centered horizontally below tile, ellipsis-truncated
 				// if it would overflow into the neighbouring tile.
@@ -7702,13 +7805,13 @@ after_key_shortcuts:
 					float sm = tile_h * 0.045f;
 					draw_solid_rect(tx - sm, ty - sm,
 					                tile_w + 2.0f * sm, tile_h + 2.0f * sm,
-					                1.00f, 1.00f, 1.00f, 0.90f, 0.20f, 0.0f);
+					                1.00f, 1.00f, 1.00f, 0.90f, 0.06f, 0.0f);
 				}
 
 				float br_r = 0.20f, br_g = 0.22f, br_b = 0.28f;
 				if (browse_hovered) { br_r += 0.06f; br_g += 0.06f; br_b += 0.06f; }
 				draw_solid_rect(tx, ty, tile_w, tile_h,
-				                br_r, br_g, br_b, 0.75f, 0.18f, 0.0f);
+				                br_r, br_g, br_b, 0.75f, 0.06f, 0.0f);
 
 				float plus_scale = section_scale * 1.6f;
 				float plus_h = (float)mc->font_glyph_h * plus_scale;
@@ -7825,6 +7928,41 @@ after_key_shortcuts:
 		wil::com_ptr<ID3D11Resource> back_buffer;
 		mc->back_buffer_rtv->GetResource(back_buffer.put());
 		sys->context->CopyResource(back_buffer.get(), mc->combined_atlas.get());
+	}
+
+	// Screenshot: file-trigger check. Runs every frame after atlas is finalized.
+	// Create %TEMP%\shell_screenshot_trigger to capture next frame.
+	{
+		static char ss_trigger[MAX_PATH] = {};
+		static char ss_output[MAX_PATH] = {};
+		if (!ss_trigger[0]) {
+			const char *tmp = getenv("TEMP");
+			if (!tmp) tmp = "C:\\Temp";
+			snprintf(ss_trigger, sizeof(ss_trigger), "%s\\shell_screenshot_trigger", tmp);
+			snprintf(ss_output, sizeof(ss_output), "%s\\shell_screenshot.png", tmp);
+		}
+		if (mc->combined_atlas &&
+		    GetFileAttributesA(ss_trigger) != INVALID_FILE_ATTRIBUTES) {
+			DeleteFileA(ss_trigger);
+			D3D11_TEXTURE2D_DESC desc;
+			mc->combined_atlas->GetDesc(&desc);
+			D3D11_TEXTURE2D_DESC sd = desc;
+			sd.Usage = D3D11_USAGE_STAGING;
+			sd.BindFlags = 0;
+			sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+			sd.MiscFlags = 0;
+			wil::com_ptr<ID3D11Texture2D> staging;
+			if (SUCCEEDED(sys->device->CreateTexture2D(&sd, nullptr, staging.put()))) {
+				sys->context->CopyResource(staging.get(), mc->combined_atlas.get());
+				D3D11_MAPPED_SUBRESOURCE m;
+				if (SUCCEEDED(sys->context->Map(staging.get(), 0, D3D11_MAP_READ, 0, &m))) {
+					stbi_write_png(ss_output,
+					               (int)desc.Width, (int)desc.Height, 4,
+					               m.pData, (int)m.RowPitch);
+					sys->context->Unmap(staging.get(), 0);
+				}
+			}
+		}
 	}
 
 	// Present
@@ -10445,6 +10583,15 @@ comp_d3d11_service_clear_launcher_apps(struct xrt_system_compositor *xsysc)
 	// is stable. Wipe it whenever a fresh push starts.
 	sys->hidden_tile_mask = 0;
 	sys->launcher_selected_index = -1;
+
+	// Phase 7.2: release all icon textures.
+	for (uint32_t i = 0; i < IPC_LAUNCHER_MAX_APPS; i++) {
+		sys->launcher_icons[i].srv_2d.reset();
+		sys->launcher_icons[i].srv_3d.reset();
+		sys->launcher_icons[i].w_2d = sys->launcher_icons[i].h_2d = 0;
+		sys->launcher_icons[i].w_3d = sys->launcher_icons[i].h_3d = 0;
+		sys->launcher_icons[i].layout_3d[0] = '\0';
+	}
 }
 
 // Phase 5.8: append one app to the launcher's tile grid. Silently dropped if
@@ -10467,6 +10614,19 @@ comp_d3d11_service_add_launcher_app(struct xrt_system_compositor *xsysc,
 
 	sys->launcher_apps[sys->launcher_app_count] = *app;
 	sys->launcher_app_count++;
+
+	// Phase 7.2: load icon textures from paths carried in the IPC message.
+	uint32_t idx = sys->launcher_app_count - 1;
+	struct d3d11_service_system::launcher_icon &icon = sys->launcher_icons[idx];
+	if (app->icon_path[0]) {
+		d3d11_icon_load_from_file(sys->device.get(), app->icon_path,
+		                          icon.srv_2d.put(), &icon.w_2d, &icon.h_2d);
+	}
+	if (app->icon_3d_path[0]) {
+		d3d11_icon_load_from_file(sys->device.get(), app->icon_3d_path,
+		                          icon.srv_3d.put(), &icon.w_3d, &icon.h_3d);
+		snprintf(icon.layout_3d, sizeof(icon.layout_3d), "%s", app->icon_3d_layout);
+	}
 
 	// Wake the compositor window if it exists and the launcher is on-screen,
 	// so the next frame picks up the new tile.

@@ -1256,6 +1256,9 @@ shell_push_registered_apps_to_service(struct ipc_connection *ipc_c)
 		snprintf(msg.name, sizeof(msg.name), "%s", src->name);
 		snprintf(msg.exe_path, sizeof(msg.exe_path), "%s", src->exe_path);
 		snprintf(msg.type, sizeof(msg.type), "%s", src->type);
+		snprintf(msg.icon_path, sizeof(msg.icon_path), "%s", src->icon_path);
+		snprintf(msg.icon_3d_path, sizeof(msg.icon_3d_path), "%s", src->icon_3d_path);
+		snprintf(msg.icon_3d_layout, sizeof(msg.icon_3d_layout), "%s", src->icon_3d_layout);
 
 		r = ipc_call_shell_add_launcher_app(ipc_c, &msg);
 		if (r != XRT_SUCCESS) {
