@@ -4466,7 +4466,7 @@ launcher_hit_test(struct d3d11_service_system *sys, POINT cursor_px, uint32_t n_
 	float px_per_m_x = tile_px_w_eff / disp_w_m;
 	float px_per_m_y = tile_px_h_eff / disp_h_m;
 	float y_ratio = (px_per_m_y > 0.0f) ? (px_per_m_x / px_per_m_y) : 1.0f;
-	float tile_h = tile_w; // square in pixel space (matches render)
+	float tile_h = tile_w * y_ratio;
 
 	// Section header + label heights: render uses
 	// `font_glyph_h * section_scale` where section_scale = (section_h_px * 0.65)
@@ -5450,7 +5450,12 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			float est_tile_w = (ui_m_to_tile_px_x(
 			    sys->base.info.display_width_m > 0 ? sys->base.info.display_width_m * 0.60f : 0.42f, sys)
 			    - 5.0f * est_margin) / 4.0f;
-			float est_tile_h = est_tile_w;
+			uint32_t etpw = sys->base.info.display_pixel_width / sys->tile_columns;
+			uint32_t etph = sys->base.info.display_pixel_height / sys->tile_rows;
+			float edwm = sys->base.info.display_width_m > 0 ? sys->base.info.display_width_m : 0.700f;
+			float edhm = sys->base.info.display_height_m > 0 ? sys->base.info.display_height_m : 0.394f;
+			float epr = (etpw > 0 && etph > 0) ? ((edwm/(float)etpw) / (edhm/(float)etph)) : 1.0f;
+			float est_tile_h = est_tile_w * epr;
 			float est_section_scale = (est_section * 0.65f) /
 			    (mc->font_glyph_h > 0 ? (float)mc->font_glyph_h : 16.0f);
 			float est_label_h = (float)(mc->font_glyph_h > 0 ? mc->font_glyph_h : 16) *
@@ -7265,7 +7270,7 @@ after_key_shortcuts:
 		if (disp_h_m <= 0.0f) disp_h_m = 0.394f;
 
 		const float panel_w_frac = 0.60f;
-		const float panel_h_frac = 0.55f;
+		const float panel_h_frac = 0.85f;
 		float panel_w_m = disp_w_m * panel_w_frac;
 		float panel_h_m = disp_h_m * panel_h_frac;
 
@@ -7281,7 +7286,15 @@ after_key_shortcuts:
 		float section_h = panel_h_px * 0.07f;
 		float tile_w = (panel_w_px - (LAUNCHER_GRID_COLS + 1) * margin) /
 		               (float)LAUNCHER_GRID_COLS;
-		float tile_h = tile_w;
+		// Physically square tiles: X pixels are wider than Y pixels in
+		// SBS mode (1920 pixels span 0.700m but 2160 span 0.394m).
+		// Scale tile_h so each tile is the same physical width and height.
+		uint32_t tpw = sys->base.info.display_pixel_width / sys->tile_columns;
+		uint32_t tph = sys->base.info.display_pixel_height / sys->tile_rows;
+		float pix_ratio = (tpw > 0 && tph > 0 && disp_w_m > 0 && disp_h_m > 0)
+		    ? ((disp_w_m / (float)tpw) / (disp_h_m / (float)tph))
+		    : 1.0f;
+		float tile_h = tile_w * pix_ratio;
 
 		// App list pushed from the shell process via clear+add IPC calls.
 		// Stored on sys so it survives multi-comp create/destroy. Empty until
@@ -7571,7 +7584,7 @@ after_key_shortcuts:
 			// below the tile for its label. If the registry is empty (e.g.
 			// scanner found no sidecars and shell hasn't pushed yet), show
 			// an empty-state hint instead of a blank grid.
-			float label_scale = section_scale * 0.85f;
+			float label_scale = section_scale * 0.425f;
 			float label_h = (float)mc->font_glyph_h * label_scale;
 			float grid_top = section_y + (float)mc->font_glyph_h * section_scale + margin * 0.5f;
 
@@ -7623,13 +7636,18 @@ after_key_shortcuts:
 				// Phase 5.11: glow border for running tiles. Draw an
 				// oversized quad in glow mode (convert_srgb=3.0) so the
 				// shader fades the inner rect into the surrounding margin.
-				if (tile_running) {
+				// Glow halo: follows keyboard selection only.
+				if (tile_selected) {
 					float glow_margin = tile_h * 0.18f;
 					float gx = tx - glow_margin;
 					float gy = ty - glow_margin;
 					float gw = tile_w + 2.0f * glow_margin;
 					float gh = tile_h + 2.0f * glow_margin;
-					float glow_ext = glow_margin / gh;
+					// Separate X/Y extents: glow_extent = X, edge_feather = Y.
+					// Inset by corner radius so glow fills under rounded corners.
+					float cr_inset = 0.06f * tile_h;
+					float glow_ext_x = (glow_margin + cr_inset) / gw;
+					float glow_ext_y = (glow_margin + cr_inset) / gh;
 
 					D3D11_MAPPED_SUBRESOURCE gm;
 					if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
@@ -7641,15 +7659,12 @@ after_key_shortcuts:
 						cb->dst_size[0] = (float)ca_w;
 						cb->dst_size[1] = (float)ca_h;
 						cb->convert_srgb = 3.0f; // glow mode
-						// Scale tile corner radius into oversized glow quad space.
-						// Negative radius + negative aspect = all four corners.
-						float glow_cr = 0.06f * tile_h / gh;
-						cb->corner_radius = -glow_cr;
-						cb->corner_aspect = -(gw / gh);
-						cb->edge_feather = 0.0f;
+						cb->corner_radius = 0.0f;
+						cb->corner_aspect = 0.0f;
+						cb->edge_feather = glow_ext_y; // Y extent (repurposed)
 						cb->glow_intensity = 0.85f;
-						cb->glow_extent = glow_ext;
-						cb->glow_falloff = 8.0f;
+						cb->glow_extent = glow_ext_x;  // X extent
+						cb->glow_falloff = 6.0f;
 						cb->glow_color[0] = 0.30f;
 						cb->glow_color[1] = 0.85f;
 						cb->glow_color[2] = 1.00f;
@@ -7662,22 +7677,10 @@ after_key_shortcuts:
 						memset(cb->quad_corners_01, 0, sizeof(cb->quad_corners_01));
 						memset(cb->quad_corners_23, 0, sizeof(cb->quad_corners_23));
 						sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
-						// Glow mode uses premultiplied alpha — switch
-						// blend state for this draw, then restore.
 						sys->context->OMSetBlendState(sys->blend_premul.get(), nullptr, 0xFFFFFFFF);
 						sys->context->Draw(4, 0);
 						sys->context->OMSetBlendState(sys->blend_alpha.get(), nullptr, 0xFFFFFFFF);
 					}
-				}
-
-				// Phase 5.12: keyboard selection outline. Draw a slightly
-				// oversized white rect behind the tile; the tile background
-				// covers the middle, leaving a thin visible ring.
-				if (tile_selected) {
-					float sm = tile_h * 0.045f;
-					draw_solid_rect(tx - sm, ty - sm,
-					                tile_w + 2.0f * sm, tile_h + 2.0f * sm,
-					                1.00f, 1.00f, 1.00f, 0.90f, 0.06f, 0.0f);
 				}
 
 				// Tile background — slightly lighter than panel, rounded.
@@ -7725,19 +7728,12 @@ after_key_shortcuts:
 							}
 						}
 
-						// Fill tile completely, aspect-fit and centered.
-						float icon_aspect = sw / sh;
-						float tile_aspect = tile_w / tile_h;
-						float draw_w, draw_h;
-						if (icon_aspect > tile_aspect) {
-							draw_w = tile_w;
-							draw_h = draw_w / icon_aspect;
-						} else {
-							draw_h = tile_h;
-							draw_w = draw_h * icon_aspect;
-						}
-						float draw_x = tx + (tile_w - draw_w) * 0.5f;
-						float draw_y = ty + (tile_h - draw_h) * 0.5f;
+						// Icons are physically square, tiles are physically square
+						// (but non-square in pixels due to SBS). Fill the tile.
+						float draw_w = tile_w;
+						float draw_h = tile_h;
+						float draw_x = tx;
+						float draw_y = ty;
 
 						D3D11_MAPPED_SUBRESOURCE im;
 						if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
