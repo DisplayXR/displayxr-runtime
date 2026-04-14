@@ -57,6 +57,12 @@ DEBUG_GET_ONCE_BOOL_OPTION(start_windowed, "XRT_COMPOSITOR_START_WINDOWED", fals
 // Qwerty input is always enabled for non-session-target apps (DisplayXR-owned window)
 // DEBUG_GET_ONCE_BOOL_OPTION(qwerty_enable, "QWERTY_ENABLE", false)
 
+// Suppress qwerty head-pose motion while a WebXR bridge session is connected.
+// The bridge delivers raw eye poses to the page; synthetic WASD/arrow motion
+// from qwerty would contaminate those and distort the page's Kooima projection.
+// Regular native apps (no bridge) continue to use qwerty normally.
+extern "C" bool g_bridge_relay_active;
+
 // Window class name
 static WCHAR szWindowClass[] = L"DisplayXRD3D11";
 static WCHAR szWindowData[] = L"DisplayXRD3D11Window";
@@ -450,7 +456,7 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
 			// Process qwerty first
 #ifdef XRT_BUILD_DRIVER_QWERTY
-			if (w->qwerty_enabled && w->xsysd != NULL) {
+			if (w->qwerty_enabled && w->xsysd != NULL && !g_bridge_relay_active) {
 				bool handled = false;
 				qwerty_process_win32(w->xsysd->xdevs, w->xsysd->xdev_count,
 				                     message, wParam, lParam, &handled);
@@ -487,7 +493,7 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			return 0;
 		}
 #ifdef XRT_BUILD_DRIVER_QWERTY
-		if (w->qwerty_enabled && w->xsysd != NULL) {
+		if (w->qwerty_enabled && w->xsysd != NULL && !g_bridge_relay_active) {
 			bool handled = false;
 			qwerty_process_win32(w->xsysd->xdevs, w->xsysd->xdev_count,
 			                     message, wParam, lParam, &handled);
@@ -631,7 +637,7 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		}
 		// Normal mode: pass to qwerty driver
 #ifdef XRT_BUILD_DRIVER_QWERTY
-		if (w->qwerty_enabled && w->xsysd != NULL) {
+		if (w->qwerty_enabled && w->xsysd != NULL && !g_bridge_relay_active) {
 			bool handled = false;
 			qwerty_process_win32(w->xsysd->xdevs, w->xsysd->xdev_count,
 			                     message, wParam, lParam, &handled);

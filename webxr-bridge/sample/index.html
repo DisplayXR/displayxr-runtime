@@ -3,6 +3,13 @@
 <head>
 <meta charset="utf-8" />
 <title>DisplayXR WebXR Bridge v2 — three.js sample</title>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js"
+  }
+}
+</script>
 <style>
   body { font: 15px/1.5 system-ui, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 16px; color: #222; }
   button { font: inherit; padding: 10px 20px; cursor: pointer; }
@@ -22,6 +29,6 @@
 </p>
 <div id="status">Waiting...</div>
 
-<script src="sample.js"></script>
+<script type="module" src="sample.js"></script>
 </body>
 </html>

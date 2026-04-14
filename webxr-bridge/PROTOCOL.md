@@ -51,9 +51,29 @@ Bridge calls `xrRequestDisplayRenderingModeEXT(session, modeIndex)`. Runtime pro
   "views": [
     { "index": 0, "recommendedImageRectWidth": 1920, "recommendedImageRectHeight": 1080, "maxImageRectWidth": 3840, "maxImageRectHeight": 2160 },
     { "index": 1, "recommendedImageRectWidth": 1920, "recommendedImageRectHeight": 1080, "maxImageRectWidth": 3840, "maxImageRectHeight": 2160 }
-  ]
+  ],
+  "windowInfo": {
+    "valid": true,
+    "windowPixelSize": [1920, 1080],
+    "windowSizeMeters": [0.172, 0.097],
+    "windowCenterOffsetMeters": [0.05, -0.02]
+  }
 }
 ```
+
+`windowInfo` is the live state of the service compositor window (Win32 client area) the bridge located via `FindWindowW("DisplayXRD3D11", ...)`. `valid` is `false` when the window can't be found (e.g. before a WebXR session is active). `windowCenterOffsetMeters` is the window center's physical offset from the display center (`+x` right, `+y` up). Pages doing window-relative Kooima should use `windowSizeMeters` as the screen and subtract `windowCenterOffsetMeters` from each eye's XY position before computing the asymmetric frustum (matches `test_apps/cube_handle_d3d11_win/main.cpp:342-433`).
+
+### `window-info`
+
+```json
+{
+  "type": "window-info",
+  "version": 1,
+  "windowInfo": { "valid": true, "windowPixelSize": [1920, 1080], "windowSizeMeters": [0.172, 0.097], "windowCenterOffsetMeters": [0.05, -0.02] }
+}
+```
+
+Pushed by the bridge when the polled window metrics change (resize, move, or window appearing/disappearing). Polled at ~4 Hz from the event loop. The extension dispatches a `windowinfochange` event on the session with `event.detail.windowInfo`.
 
 ### `mode-changed`
 

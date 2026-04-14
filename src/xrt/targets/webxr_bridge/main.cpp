@@ -20,6 +20,7 @@
 #include <windows.h>
 
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <cstdarg>
 #include <cstdlib>
@@ -380,6 +381,19 @@ struct MessageQueue {
 // Bridge state.
 // ---------------------------------------------------------------------------
 
+// Compositor window metrics (client area of the service's compositor HWND).
+// Found via FindWindowW(L"DisplayXRD3D11", ...). Values are in display-centric
+// coords — window center offset from display center (meters, +right/+up).
+struct WindowMetrics {
+	bool valid = false;
+	int pixelW = 0;
+	int pixelH = 0;
+	float sizeWm = 0.0f;
+	float sizeHm = 0.0f;
+	float centerOffsetXm = 0.0f;
+	float centerOffsetYm = 0.0f;
+};
+
 struct Bridge {
 	XrInstance instance = XR_NULL_HANDLE;
 	XrSystemId system_id = XR_NULL_SYSTEM_ID;
@@ -396,6 +410,9 @@ struct Bridge {
 	uint32_t current_mode_index = 0;
 	std::vector<XrViewConfigurationView> config_views;
 
+	// Compositor window metrics (polled from service HWND).
+	WindowMetrics window_metrics;
+
 	// Eye pose streaming.
 	bool stream_eye_poses = false;
 	bool session_begun = false;
@@ -404,6 +421,131 @@ struct Bridge {
 	MessageQueue outgoing;
 	std::atomic<bool> ws_client_connected{false};
 };
+
+// ---------------------------------------------------------------------------
+// Compositor window metrics probing.
+// ---------------------------------------------------------------------------
+//
+// Bridge runs headless — no window of its own. The service hosts the real
+// compositor window (class "DisplayXRD3D11"). We query it via Win32 so the
+// bridge can advertise window-relative Kooima inputs to the page (matches the
+// native cube_handle_d3d11_win app's approach at test_apps/cube_handle_d3d11_win/main.cpp:342-433).
+
+static bool compute_window_metrics_impl(HWND hwnd, const Bridge &b, WindowMetrics &out) {
+	if (hwnd == nullptr) return false;
+
+	RECT cr;
+	if (!GetClientRect(hwnd, &cr)) return false;
+	int winPxW = (int)(cr.right - cr.left);
+	int winPxH = (int)(cr.bottom - cr.top);
+	if (winPxW <= 0 || winPxH <= 0) return false;
+
+	POINT clientOrigin = {0, 0};
+	if (!ClientToScreen(hwnd, &clientOrigin)) return false;
+
+	HMONITOR hMon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+	MONITORINFO mi{};
+	mi.cbSize = sizeof(mi);
+	if (!GetMonitorInfoW(hMon, &mi)) return false;
+
+	uint32_t dispPxW = b.display_info.displayPixelWidth;
+	uint32_t dispPxH = b.display_info.displayPixelHeight;
+	if (dispPxW == 0 || dispPxH == 0) return false;
+
+	float pxSizeX = b.display_info.displaySizeMeters.width / (float)dispPxW;
+	float pxSizeY = b.display_info.displaySizeMeters.height / (float)dispPxH;
+
+	float winCenterX = (float)(clientOrigin.x - mi.rcMonitor.left) + (float)winPxW / 2.0f;
+	float winCenterY = (float)(clientOrigin.y - mi.rcMonitor.top) + (float)winPxH / 2.0f;
+	float dispScreenW = (float)(mi.rcMonitor.right - mi.rcMonitor.left);
+	float dispScreenH = (float)(mi.rcMonitor.bottom - mi.rcMonitor.top);
+
+	out.valid = true;
+	out.pixelW = winPxW;
+	out.pixelH = winPxH;
+	out.sizeWm = (float)winPxW * pxSizeX;
+	out.sizeHm = (float)winPxH * pxSizeY;
+	out.centerOffsetXm = (winCenterX - dispScreenW / 2.0f) * pxSizeX;
+	// Screen Y grows downward; display-centric Y grows upward. Flip sign.
+	out.centerOffsetYm = -((winCenterY - dispScreenH / 2.0f) * pxSizeY);
+	return true;
+}
+
+// Cached HWND so the WinEvent hook can filter by window without recomputing.
+static std::atomic<HWND> g_compositor_hwnd{nullptr};
+// Set by the WinEvent hook when the compositor window's geometry changes.
+// Cleared by the main loop after polling metrics.
+static std::atomic<bool> g_window_event_pending{false};
+
+// Poll current metrics and update b.window_metrics. Returns true if values
+// changed compared to the cached state (including valid↔invalid transitions).
+static bool poll_window_metrics(Bridge &b) {
+	HWND hwnd = FindWindowW(L"DisplayXRD3D11", nullptr);
+	g_compositor_hwnd.store(hwnd);
+	WindowMetrics neu;
+	bool ok = compute_window_metrics_impl(hwnd, b, neu);
+	const WindowMetrics &old = b.window_metrics;
+	const float eps = 0.0001f;
+	bool changed = false;
+	if (ok) {
+		changed = !old.valid ||
+		          old.pixelW != neu.pixelW || old.pixelH != neu.pixelH ||
+		          std::fabs(old.sizeWm - neu.sizeWm) > eps ||
+		          std::fabs(old.sizeHm - neu.sizeHm) > eps ||
+		          std::fabs(old.centerOffsetXm - neu.centerOffsetXm) > eps ||
+		          std::fabs(old.centerOffsetYm - neu.centerOffsetYm) > eps;
+		b.window_metrics = neu;
+	} else if (old.valid) {
+		changed = true;
+		b.window_metrics = WindowMetrics{};
+	}
+	return changed;
+}
+
+// ---------------------------------------------------------------------------
+// Window event hook (event-driven resize / move detection).
+// ---------------------------------------------------------------------------
+//
+// SetWinEventHook with EVENT_OBJECT_LOCATIONCHANGE fires whenever any window
+// in the system moves or resizes. We filter by HWND (cached after the first
+// successful FindWindowW call) and idObject == OBJID_WINDOW (ignore caret,
+// cursor, etc). Hook runs on a dedicated thread with a message pump.
+
+static void CALLBACK win_event_proc(HWINEVENTHOOK /*hook*/, DWORD /*event*/,
+                                    HWND hwnd, LONG idObject, LONG /*idChild*/,
+                                    DWORD /*eventThread*/, DWORD /*eventTime*/) {
+	if (idObject != OBJID_WINDOW) return;
+	HWND target = g_compositor_hwnd.load();
+	if (target != nullptr && hwnd == target) {
+		g_window_event_pending.store(true);
+	}
+}
+
+static void window_event_thread_func() {
+	HWINEVENTHOOK hook = SetWinEventHook(
+	    EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE,
+	    nullptr, win_event_proc, 0, 0,
+	    WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+	if (hook == nullptr) {
+		LOG_W("SetWinEventHook failed: %lu (window resize will fall back to polling)",
+		      GetLastError());
+		return;
+	}
+	LOG_I("Window event hook installed (EVENT_OBJECT_LOCATIONCHANGE)");
+
+	MSG msg;
+	while (g_running.load()) {
+		// PeekMessage so we can periodically check g_running and exit cleanly.
+		if (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+			TranslateMessage(&msg);
+			DispatchMessageW(&msg);
+		} else {
+			Sleep(10);
+		}
+	}
+	UnhookWinEvent(hook);
+	LOG_I("Window event hook removed");
+}
 
 // ---------------------------------------------------------------------------
 // JSON message builders.
@@ -420,6 +562,28 @@ static std::string build_views_json(const std::vector<XrViewConfigurationView> &
 		   + ",\"maxImageRectHeight\":" + json_u(views[i].maxImageRectHeight) + "}";
 	}
 	return s + "]";
+}
+
+static std::string build_window_info_fields(const WindowMetrics &w) {
+	// Inline fragment (no surrounding braces) — embedded into display-info or
+	// the standalone window-info message.
+	std::string s = ",\"windowInfo\":{\"valid\":";
+	s += (w.valid ? "true" : "false");
+	if (w.valid) {
+		s += ",\"windowPixelSize\":[" + json_u((uint32_t)w.pixelW) + "," + json_u((uint32_t)w.pixelH) + "]";
+		s += ",\"windowSizeMeters\":[" + json_f(w.sizeWm) + "," + json_f(w.sizeHm) + "]";
+		s += ",\"windowCenterOffsetMeters\":[" + json_f(w.centerOffsetXm) + "," + json_f(w.centerOffsetYm) + "]";
+	}
+	s += "}";
+	return s;
+}
+
+static std::string build_window_info_json(const WindowMetrics &w) {
+	std::string s = "{\"type\":\"window-info\",\"version\":1";
+	// Reuse the same nested object so the field shape matches display-info.
+	s += build_window_info_fields(w);
+	s += "}";
+	return s;
 }
 
 static std::string build_display_info_json(const Bridge &b) {
@@ -448,6 +612,7 @@ static std::string build_display_info_json(const Bridge &b) {
 
 	s += ",\"currentModeIndex\":" + json_u(b.current_mode_index);
 	s += ",\"views\":" + build_views_json(b.config_views);
+	s += build_window_info_fields(b.window_metrics);
 	s += "}";
 	return s;
 }
@@ -514,6 +679,8 @@ static void handle_ws_message(Bridge &b, const std::string &msg) {
 			return;
 		}
 		LOG_I("WS hello received, sending display-info");
+		// Refresh window metrics on hello so initial display-info carries them.
+		poll_window_metrics(b);
 		b.outgoing.push(build_display_info_json(b));
 	} else if (type == "request-mode") {
 		int idx = find_int("modeIndex");
@@ -961,6 +1128,7 @@ static void poll_eye_poses(Bridge &b) {
 
 static void run_event_loop(Bridge &b) {
 	LOG_I("Entering event loop. Ctrl+C to exit.");
+	int window_poll_counter = 0;
 	while (g_running.load()) {
 		XrEventDataBuffer evt{XR_TYPE_EVENT_DATA_BUFFER};
 		XrResult r = xrPollEvent(b.instance, &evt);
@@ -968,6 +1136,25 @@ static void run_event_loop(Bridge &b) {
 			handle_event(b, evt);
 		} else if (r == XR_EVENT_UNAVAILABLE) {
 			poll_eye_poses(b);
+
+			// Event-driven resize: the WinEvent hook flips this flag whenever
+			// the compositor window moves or resizes. Drain it every loop
+			// iteration (~10 ms latency to client).
+			bool window_changed = false;
+			if (g_window_event_pending.exchange(false)) {
+				window_changed = poll_window_metrics(b);
+			}
+			// Periodic safety-net poll every ~500 ms — catches window
+			// appear/disappear (FindWindow may return NULL → non-NULL when
+			// the service first creates the window) and any events the hook
+			// might miss.
+			if (++window_poll_counter >= 50) {
+				window_poll_counter = 0;
+				window_changed = poll_window_metrics(b) || window_changed;
+			}
+			if (window_changed && b.ws_client_connected.load()) {
+				b.outgoing.push(build_window_info_json(b.window_metrics));
+			}
 			Sleep(10);
 		} else {
 			LOG_W("xrPollEvent error: %s", xr_result_str(b.instance, r));
@@ -982,6 +1169,19 @@ static void run_event_loop(Bridge &b) {
 
 int main() {
 	SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
+
+	// Per-monitor DPI awareness so GetClientRect / GetMonitorInfo on the
+	// compositor's HWND return PHYSICAL pixels (matching the swap chain
+	// dimensions the runtime sees). Without this, on a system at 125% DPI,
+	// a 1920×1080 fullscreen window appears as 1536×864 → bridge's
+	// windowPixelSize would mismatch the compositor's atlas tile dims.
+	if (!SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)) {
+		// Fallback for older Windows: SetProcessDPIAware is system-wide
+		// (no per-monitor) but still gives physical pixels.
+		LOG_W("SetProcessDpiAwarenessContext failed: %lu (falling back to SetProcessDPIAware)",
+		      GetLastError());
+		SetProcessDPIAware();
+	}
 
 	WSADATA wsa;
 	if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
@@ -1014,14 +1214,17 @@ int main() {
 		return 1;
 	}
 
-	// Start WS server on its own thread.
+	// Start WS server + window-event hook on dedicated threads.
 	std::thread ws_thread(ws_thread_func, std::ref(b));
+	std::thread win_evt_thread(window_event_thread_func);
 
 	run_event_loop(b);
 
 	LOG_I("Shutting down...");
-	// Signal WS thread to stop (g_running already false).
+	// Signal worker threads to stop (g_running already false).
 	if (ws_thread.joinable()) ws_thread.join();
+	// Post a dummy message to unstick the window-event thread's PeekMessage.
+	if (win_evt_thread.joinable()) win_evt_thread.join();
 
 	if (b.local_space != XR_NULL_HANDLE) xrDestroySpace(b.local_space);
 	if (b.session != XR_NULL_HANDLE) xrDestroySession(b.session);

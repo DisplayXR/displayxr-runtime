@@ -19,6 +19,7 @@
   var latestDisplayInfo = null;
   var latestRenderingMode = null;
   var latestEyePoses = null;
+  var latestWindowInfo = null;
   var activeSessions = []; // Proxy-wrapped sessions that receive events.
 
   // --- Helper: send a message to the bridge via ISOLATED world ---
@@ -44,6 +45,14 @@
         displaySizeMeters: di.displaySizeMeters,
         nominalViewerPosition: di.nominalViewerPosition
       },
+
+      // Compositor window info — present when the bridge could locate the
+      // service compositor HWND. Updates live on resize/move via 'windowinfochange'
+      // event on the session. Pages doing window-relative Kooima should use
+      // windowSizeMeters as the screen and subtract windowCenterOffsetMeters from
+      // each eye's XY position before computing the asymmetric frustum (matches
+      // test_apps/cube_handle_d3d11_win/main.cpp:342-433).
+      windowInfo: latestWindowInfo,
 
       renderingMode: rm ? {
         index: rm.currentModeIndex !== undefined ? rm.currentModeIndex : (di.currentModeIndex || 0),
@@ -119,6 +128,16 @@
     if (msg.type === 'display-info') {
       latestDisplayInfo = msg;
       latestRenderingMode = buildRenderingModeFromDisplayInfo(msg);
+      // display-info embeds the current window-info snapshot.
+      if (msg.windowInfo) latestWindowInfo = msg.windowInfo;
+    } else if (msg.type === 'window-info') {
+      latestWindowInfo = msg.windowInfo || null;
+      var wDetail = { windowInfo: latestWindowInfo };
+      activeSessions.forEach(function (entry) {
+        try {
+          entry.session.dispatchEvent(new CustomEvent('windowinfochange', { detail: wDetail }));
+        } catch (e) {}
+      });
     } else if (msg.type === 'mode-changed') {
       // Update current mode index in display info cache.
       if (latestDisplayInfo) {
