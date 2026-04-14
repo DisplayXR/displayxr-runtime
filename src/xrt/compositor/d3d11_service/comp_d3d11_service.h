@@ -27,6 +27,7 @@ extern "C" {
 
 // Forward decl from ipc_protocol.h — full definition is included by callers.
 struct ipc_launcher_app;
+struct ipc_capture_result;
 
 
 /*!
@@ -360,6 +361,34 @@ comp_d3d11_service_poll_launcher_click(struct xrt_system_compositor *xsysc);
  */
 void
 comp_d3d11_service_set_running_tile_mask(struct xrt_system_compositor *xsysc, uint64_t mask);
+
+/*!
+ * Phase 8: capture the current pre-weave combined atlas to disk. Writes one
+ * or more PNGs (full SBS, left-eye crop, right-eye crop) depending on
+ * @p flags, and fills @p out_result with metadata for the shell's sidecar
+ * JSON file.
+ *
+ * The runtime appends @c "_sbs.png", @c "_L.png", @c "_R.png" to
+ * @p path_prefix as needed. Caller owns the prefix string and the result
+ * struct.
+ *
+ * Must be called while the multi-compositor render mutex is held by this
+ * thread, OR from a thread that does not hold the lock (this function takes
+ * the lock itself).
+ *
+ * @param xsysc       The system compositor (must be D3D11 service).
+ * @param path_prefix Filename prefix without extension.
+ * @param flags       Bitmask of IPC_CAPTURE_FLAG_* views to write.
+ * @param out_result  Filled with capture metadata. May not be NULL.
+ * @return true if at least one view was successfully written.
+ *
+ * @ingroup comp_d3d11_service
+ */
+bool
+comp_d3d11_service_capture_frame(struct xrt_system_compositor *xsysc,
+                                 const char *path_prefix,
+                                 uint32_t flags,
+                                 struct ipc_capture_result *out_result);
 
 /*! @} */
 

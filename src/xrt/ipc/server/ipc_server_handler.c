@@ -2327,6 +2327,42 @@ ipc_handle_shell_remove_capture_client(volatile struct ipc_client_state *_ics,
 }
 
 xrt_result_t
+ipc_handle_shell_capture_frame(volatile struct ipc_client_state *_ics,
+                                const struct ipc_capture_request *request,
+                                struct ipc_capture_result *out_capture_result)
+{
+	struct ipc_server *s = _ics->server;
+
+	if (out_capture_result == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	memset((void *)out_capture_result, 0, sizeof(*out_capture_result));
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (s->xsysc == NULL || request == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	IPC_INFO(s, "Shell: capture_frame prefix=%s flags=0x%x",
+	         request->path_prefix, request->flags);
+
+	// Ensure NUL terminator (defense in depth — IPC marshalling should already
+	// preserve the trailing NUL, but the buffer is fixed-size).
+	char prefix[IPC_CAPTURE_PATH_MAX];
+	memcpy(prefix, request->path_prefix, sizeof(prefix));
+	prefix[sizeof(prefix) - 1] = '\0';
+
+	bool ok = comp_d3d11_service_capture_frame(s->xsysc, prefix, request->flags,
+	                                           out_capture_result);
+	return ok ? XRT_SUCCESS : XRT_ERROR_IPC_FAILURE;
+#else
+	(void)s;
+	(void)request;
+	return XRT_ERROR_IPC_FAILURE;
+#endif
+}
+
+xrt_result_t
 ipc_handle_swapchain_get_properties(volatile struct ipc_client_state *ics,
                                     const struct xrt_swapchain_create_info *info,
                                     struct xrt_swapchain_create_properties *xsccp)
@@ -2476,6 +2512,7 @@ xrt_result_t
 ipc_handle_swapchain_acquire_image(volatile struct ipc_client_state *ics, uint32_t id, uint32_t *out_index)
 {
 	if (ics->xc == NULL) {
+		U_LOG_W("[#151] ipc server acquire_image: session not created -> IPC_SESSION_NOT_CREATED");
 		return XRT_ERROR_IPC_SESSION_NOT_CREATED;
 	}
 
@@ -2483,7 +2520,14 @@ ipc_handle_swapchain_acquire_image(volatile struct ipc_client_state *ics, uint32
 	uint32_t sc_index = id;
 	struct xrt_swapchain *xsc = ics->xscs[sc_index];
 
-	xrt_swapchain_acquire_image(xsc, out_index);
+	if (xsc == NULL) {
+		U_LOG_W("[#151] ipc server acquire_image: xsc[%u]=NULL -> IPC_FAILURE", sc_index);
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	xrt_result_t xret = xrt_swapchain_acquire_image(xsc, out_index);
+	U_LOG_W("[#151] ipc server acquire_image: sc_id=%u xret=%d out_index=%u",
+	        sc_index, (int)xret, *out_index);
 
 	return XRT_SUCCESS;
 }

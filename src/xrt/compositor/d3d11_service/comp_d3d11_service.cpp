@@ -2035,6 +2035,11 @@ swapchain_acquire_image(struct xrt_swapchain *xsc, uint32_t *out_index)
 	*out_index = next_index % sc->image_count;
 	next_index++;
 
+	U_LOG_W("[#151] d3d11_service swapchain_acquire_image: index=%u image_count=%u "
+	        "(w=%u h=%u format=%lld bits=0x%x service_created=%d)",
+	        *out_index, sc->image_count, sc->info.width, sc->info.height,
+	        (long long)sc->info.format, (unsigned)sc->info.bits, (int)sc->service_created);
+
 	return XRT_SUCCESS;
 }
 
@@ -2250,6 +2255,14 @@ compositor_create_swapchain(struct xrt_compositor *xc,
 
 	U_LOG_W("Creating swapchain: %u images, %ux%u, format=%u, usage=0x%x",
 	        image_count, info->width, info->height, info->format, info->bits);
+	U_LOG_W("[#151] d3d11_service create_swapchain: arraySize=%u mipCount=%u sampleCount=%u "
+	        "faceCount=%u create=0x%x MUTABLE_FORMAT=%s SAMPLED=%s COLOR=%s DEPTH_STENCIL=%s",
+	        info->array_size, info->mip_count, info->sample_count, info->face_count,
+	        (unsigned)info->create,
+	        (info->bits & XRT_SWAPCHAIN_USAGE_MUTABLE_FORMAT) ? "YES" : "no",
+	        (info->bits & XRT_SWAPCHAIN_USAGE_SAMPLED) ? "YES" : "no",
+	        (info->bits & XRT_SWAPCHAIN_USAGE_COLOR) ? "YES" : "no",
+	        (info->bits & XRT_SWAPCHAIN_USAGE_DEPTH_STENCIL) ? "YES" : "no");
 
 	// Allocate swapchain
 	struct d3d11_service_swapchain *sc = new d3d11_service_swapchain();
@@ -7926,38 +7939,24 @@ after_key_shortcuts:
 		sys->context->CopyResource(back_buffer.get(), mc->combined_atlas.get());
 	}
 
-	// Screenshot: file-trigger check. Runs every frame after atlas is finalized.
-	// Create %TEMP%\shell_screenshot_trigger to capture next frame.
+	// Phase 8: screenshot file-trigger now routes through the same capture path
+	// as the shell-driven Ctrl+Shift+3 IPC call. Create %TEMP%\shell_screenshot_trigger
+	// to drop %TEMP%\shell_screenshot_sbs.png on the next frame.
 	{
 		static char ss_trigger[MAX_PATH] = {};
-		static char ss_output[MAX_PATH] = {};
+		static char ss_prefix[MAX_PATH] = {};
 		if (!ss_trigger[0]) {
 			const char *tmp = getenv("TEMP");
 			if (!tmp) tmp = "C:\\Temp";
 			snprintf(ss_trigger, sizeof(ss_trigger), "%s\\shell_screenshot_trigger", tmp);
-			snprintf(ss_output, sizeof(ss_output), "%s\\shell_screenshot.png", tmp);
+			snprintf(ss_prefix, sizeof(ss_prefix), "%s\\shell_screenshot", tmp);
 		}
 		if (mc->combined_atlas &&
 		    GetFileAttributesA(ss_trigger) != INVALID_FILE_ATTRIBUTES) {
 			DeleteFileA(ss_trigger);
-			D3D11_TEXTURE2D_DESC desc;
-			mc->combined_atlas->GetDesc(&desc);
-			D3D11_TEXTURE2D_DESC sd = desc;
-			sd.Usage = D3D11_USAGE_STAGING;
-			sd.BindFlags = 0;
-			sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-			sd.MiscFlags = 0;
-			wil::com_ptr<ID3D11Texture2D> staging;
-			if (SUCCEEDED(sys->device->CreateTexture2D(&sd, nullptr, staging.put()))) {
-				sys->context->CopyResource(staging.get(), mc->combined_atlas.get());
-				D3D11_MAPPED_SUBRESOURCE m;
-				if (SUCCEEDED(sys->context->Map(staging.get(), 0, D3D11_MAP_READ, 0, &m))) {
-					stbi_write_png(ss_output,
-					               (int)desc.Width, (int)desc.Height, 4,
-					               m.pData, (int)m.RowPitch);
-					sys->context->Unmap(staging.get(), 0);
-				}
-			}
+			struct ipc_capture_result dummy = {};
+			comp_d3d11_service_capture_frame(&sys->base, ss_prefix,
+			                                 IPC_CAPTURE_FLAG_SBS, &dummy);
 		}
 	}
 
@@ -9518,6 +9517,129 @@ comp_d3d11_service_get_predicted_eye_positions(struct xrt_system_compositor *xsy
 	}
 
 	return false;
+}
+
+bool
+comp_d3d11_service_capture_frame(struct xrt_system_compositor *xsysc,
+                                 const char *path_prefix,
+                                 uint32_t flags,
+                                 struct ipc_capture_result *out_result)
+{
+	if (xsysc == nullptr || path_prefix == nullptr || out_result == nullptr || flags == 0) {
+		return false;
+	}
+
+	memset(out_result, 0, sizeof(*out_result));
+
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	struct d3d11_multi_compositor *mc = sys ? sys->multi_comp : nullptr;
+	if (mc == nullptr || !mc->combined_atlas || sys->device == nullptr || sys->context == nullptr) {
+		U_LOG_W("capture_frame: no combined atlas / device / context available");
+		return false;
+	}
+
+	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+
+	// Re-check under lock.
+	if (!mc->combined_atlas) {
+		return false;
+	}
+
+	D3D11_TEXTURE2D_DESC desc;
+	mc->combined_atlas->GetDesc(&desc);
+	const uint32_t atlas_w = desc.Width;
+	const uint32_t atlas_h = desc.Height;
+	const uint32_t tile_columns = sys->tile_columns > 0 ? sys->tile_columns : 1;
+	const uint32_t tile_rows = sys->tile_rows > 0 ? sys->tile_rows : 1;
+	const uint32_t eye_w = atlas_w / tile_columns;
+	const uint32_t eye_h = atlas_h / tile_rows;
+
+	// Create CPU-readable staging texture and copy atlas into it.
+	D3D11_TEXTURE2D_DESC sd = desc;
+	sd.Usage = D3D11_USAGE_STAGING;
+	sd.BindFlags = 0;
+	sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+	sd.MiscFlags = 0;
+	wil::com_ptr<ID3D11Texture2D> staging;
+	HRESULT hr = sys->device->CreateTexture2D(&sd, nullptr, staging.put());
+	if (FAILED(hr)) {
+		U_LOG_W("capture_frame: CreateTexture2D(staging) failed 0x%08lx", hr);
+		return false;
+	}
+	sys->context->CopyResource(staging.get(), mc->combined_atlas.get());
+
+	D3D11_MAPPED_SUBRESOURCE m;
+	hr = sys->context->Map(staging.get(), 0, D3D11_MAP_READ, 0, &m);
+	if (FAILED(hr)) {
+		U_LOG_W("capture_frame: Map(staging) failed 0x%08lx", hr);
+		return false;
+	}
+
+	uint32_t views_written = 0;
+
+	if (flags & IPC_CAPTURE_FLAG_SBS) {
+		char path[MAX_PATH];
+		snprintf(path, sizeof(path), "%s_sbs.png", path_prefix);
+		if (stbi_write_png(path, (int)atlas_w, (int)atlas_h, 4,
+		                   m.pData, (int)m.RowPitch) != 0) {
+			views_written |= IPC_CAPTURE_FLAG_SBS;
+		} else {
+			U_LOG_W("capture_frame: stbi_write_png failed for %s", path);
+		}
+	}
+
+	for (int eye = 0; eye < 2; eye++) {
+		uint32_t flag = (eye == 0) ? IPC_CAPTURE_FLAG_LEFT : IPC_CAPTURE_FLAG_RIGHT;
+		if (!(flags & flag)) {
+			continue;
+		}
+		// In mono (tile_columns == 1) both L and R map to the same full-frame.
+		const uint32_t eye_x = (tile_columns > 1 ? (uint32_t)eye : 0u) * eye_w;
+		std::vector<uint8_t> buf((size_t)eye_w * eye_h * 4u);
+		const uint8_t *src = static_cast<const uint8_t *>(m.pData);
+		for (uint32_t y = 0; y < eye_h; y++) {
+			memcpy(buf.data() + (size_t)y * eye_w * 4u,
+			       src + (size_t)y * m.RowPitch + (size_t)eye_x * 4u,
+			       (size_t)eye_w * 4u);
+		}
+		char path[MAX_PATH];
+		snprintf(path, sizeof(path), "%s_%c.png", path_prefix, eye == 0 ? 'L' : 'R');
+		if (stbi_write_png(path, (int)eye_w, (int)eye_h, 4,
+		                   buf.data(), (int)(eye_w * 4u)) != 0) {
+			views_written |= flag;
+		} else {
+			U_LOG_W("capture_frame: stbi_write_png failed for %s", path);
+		}
+	}
+
+	sys->context->Unmap(staging.get(), 0);
+
+	// Populate metadata.
+	out_result->timestamp_ns = os_monotonic_get_ns();
+	out_result->atlas_width = atlas_w;
+	out_result->atlas_height = atlas_h;
+	out_result->eye_width = eye_w;
+	out_result->eye_height = eye_h;
+	out_result->views_written = views_written;
+	out_result->tile_columns = tile_columns;
+	out_result->tile_rows = tile_rows;
+	out_result->display_width_m = sys->base.info.display_width_m;
+	out_result->display_height_m = sys->base.info.display_height_m;
+
+	struct xrt_vec3 le = {0, 0, 0}, re = {0, 0, 0};
+	if (comp_d3d11_service_get_predicted_eye_positions(xsysc, &le, &re)) {
+		out_result->eye_left_m[0] = le.x;
+		out_result->eye_left_m[1] = le.y;
+		out_result->eye_left_m[2] = le.z;
+		out_result->eye_right_m[0] = re.x;
+		out_result->eye_right_m[1] = re.y;
+		out_result->eye_right_m[2] = re.z;
+	}
+
+	U_LOG_W("capture_frame: prefix=%s flags=0x%x written=0x%x atlas=%ux%u eye=%ux%u",
+	        path_prefix, flags, views_written, atlas_w, atlas_h, eye_w, eye_h);
+
+	return views_written != 0;
 }
 
 bool
