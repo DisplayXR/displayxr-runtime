@@ -32,6 +32,7 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 static pthread_mutex_t g_sess_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -651,9 +652,26 @@ oxr_mcp_tools_set_capture_handler(oxr_mcp_capture_fn fn, void *userdata)
 	pthread_mutex_unlock(&g_capture_lock);
 }
 
+// Stat the suffixed files the compositor may have written and add each
+// one that exists to the result with its byte size.
+static void
+add_written_path(cJSON *out_paths, const char *prefix, const char *suffix)
+{
+	char path[320];
+	snprintf(path, sizeof(path), "%s%s", prefix, suffix);
+	struct stat st;
+	if (stat(path, &st) == 0 && st.st_size > 0) {
+		cJSON *e = cJSON_CreateObject();
+		cJSON_AddStringToObject(e, "path", path);
+		cJSON_AddNumberToObject(e, "size_bytes", (double)st.st_size);
+		cJSON_AddItemToArray(out_paths, e);
+	}
+}
+
 static cJSON *
 tool_capture_frame(const cJSON *params, void *userdata)
 {
+	(void)params;
 	(void)userdata;
 	pthread_mutex_lock(&g_capture_lock);
 	oxr_mcp_capture_fn fn = g_capture_fn;
@@ -665,36 +683,43 @@ tool_capture_frame(const cJSON *params, void *userdata)
 		cJSON_AddStringToObject(
 		    o, "error",
 		    "capture_frame not wired: compositor has not registered a handler. "
-		    "Metal/GL slice-6 hook and D3D11 slice-7 hook are pending.");
+		    "Rebuild with the MCP capture hooks enabled for this graphics API.");
 		cJSON_AddStringToObject(o, "hint", "run diff_projection and tail_log in the meantime");
 		return o;
 	}
 
-	char path[256];
+	char prefix[256];
 	long pid = (long)getpid();
 	struct oxr_session *sess = lock_session();
 	uint64_t seq = sess ? (uint64_t)sess->frame_id.begun : 0;
 	unlock_session();
-	snprintf(path, sizeof(path), "/tmp/displayxr-mcp-capture-%ld-%llu.png", pid, (unsigned long long)seq);
+	// No extension — compositor appends _atlas.png / _L.png / _R.png.
+	snprintf(prefix, sizeof(prefix), "/tmp/displayxr-mcp-capture-%ld-%llu", pid, (unsigned long long)seq);
 
-	if (!fn(path, ud)) {
-		cJSON *o = cJSON_CreateObject();
-		cJSON_AddStringToObject(o, "error", "compositor capture handler failed");
-		return o;
-	}
+	bool handler_ok = fn(prefix, ud);
 
 	cJSON *r = cJSON_CreateObject();
-	cJSON_AddStringToObject(r, "path", path);
 	cJSON_AddNumberToObject(r, "frame_id", (double)seq);
+	cJSON_AddStringToObject(r, "path_prefix", prefix);
+	cJSON *paths = cJSON_CreateArray();
+	add_written_path(paths, prefix, "_atlas.png");
+	add_written_path(paths, prefix, "_L.png");
+	add_written_path(paths, prefix, "_R.png");
+	cJSON_AddItemToObject(r, "files", paths);
+
+	if (!handler_ok && cJSON_GetArraySize(paths) == 0) {
+		cJSON_AddStringToObject(r, "error", "compositor capture handler reported failure");
+	}
 	return r;
 }
 
 static const struct u_mcp_tool TOOL_CAPTURE_FRAME = {
     .name = "capture_frame",
     .description =
-        "Capture the compositor's most recent atlas to a PNG and return its path. "
-        "Requires a per-API compositor hook (Metal/GL: slice 6; D3D11: slice 7). "
-        "Returns an error with diagnostics if no hook is registered.",
+        "Capture the compositor's most recent composited frame. Returns an array of PNG "
+        "file paths (_atlas.png, and when the active mode has a stereo split, _L.png and "
+        "_R.png) plus byte sizes. Requires a per-API compositor hook; returns a structured "
+        "error if none is registered.",
     .input_schema_json = "{\"type\":\"object\",\"properties\":{}}",
     .fn = tool_capture_frame,
 };
