@@ -433,6 +433,176 @@ static const struct u_mcp_tool TOOL_GET_SUBMITTED_PROJECTION = {
     .fn = tool_get_submitted_projection,
 };
 
+// ---------- diff_projection ----------
+//
+// Classifies the delta between recommended and declared per view. See
+// docs/roadmap/mcp-spec-v0.2.md §4.C for the bug-class taxonomy.
+
+#include <math.h>
+
+#define EPS_FOV_RAD 0.0005f     // ~0.03°
+#define EPS_ASPECT 0.01f        // ~1% aspect mismatch tolerance
+#define EPS_POSITION_M 0.001f   // 1 mm
+#define EPS_QUAT_DOT 0.9999f    // ≈0.8° rotation tolerance
+
+static float
+fov_aspect_wh(const struct xrt_fov *f)
+{
+	float w = tanf(f->angle_right) + tanf(-f->angle_left);
+	float h = tanf(f->angle_up) + tanf(-f->angle_down);
+	return h > 1e-6f ? (w / h) : 0.0f;
+}
+
+static bool
+fov_equal(const struct xrt_fov *a, const struct xrt_fov *b)
+{
+	return fabsf(a->angle_left - b->angle_left) < EPS_FOV_RAD &&
+	       fabsf(a->angle_right - b->angle_right) < EPS_FOV_RAD &&
+	       fabsf(a->angle_up - b->angle_up) < EPS_FOV_RAD &&
+	       fabsf(a->angle_down - b->angle_down) < EPS_FOV_RAD;
+}
+
+static float
+quat_dot(const struct xrt_quat *a, const struct xrt_quat *b)
+{
+	return a->x * b->x + a->y * b->y + a->z * b->z + a->w * b->w;
+}
+
+static float
+pos_delta(const struct xrt_vec3 *a, const struct xrt_vec3 *b)
+{
+	float dx = a->x - b->x, dy = a->y - b->y, dz = a->z - b->z;
+	return sqrtf(dx * dx + dy * dy + dz * dz);
+}
+
+static cJSON *
+tool_diff_projection(const cJSON *params, void *userdata)
+{
+	(void)params;
+	(void)userdata;
+	struct mcp_frame_snapshot snap;
+	if (!load_snapshot(&snap)) {
+		return error_object("no snapshot yet");
+	}
+	if (!snap.have_recommended || !snap.have_declared) {
+		return error_object("snapshot missing recommended or declared — call xrLocateViews + xrEndFrame first");
+	}
+
+	cJSON *r = cJSON_CreateObject();
+	cJSON_AddNumberToObject(r, "seq", (double)snap.seq);
+	cJSON_AddNumberToObject(r, "view_count", snap.view_count);
+
+	float display_aspect =
+	    (snap.display_height_m > 0.f) ? (snap.display_width_m / snap.display_height_m) : 0.f;
+
+	cJSON *views = cJSON_CreateArray();
+	cJSON *flags_set = cJSON_CreateArray();
+	bool have_any_flag = false;
+
+	for (uint32_t i = 0; i < snap.view_count && i < XRT_MAX_VIEWS; i++) {
+		const struct mcp_view_data *rec = &snap.recommended[i];
+		const struct mcp_view_data *dec = &snap.declared[i];
+		cJSON *v = cJSON_CreateObject();
+		cJSON *vflags = cJSON_CreateArray();
+
+		// (1) app_ignores_recommended: declared fov != recommended fov.
+		bool fov_differs = !fov_equal(&rec->fov, &dec->fov);
+		if (fov_differs) {
+			cJSON_AddItemToArray(vflags, cJSON_CreateString("app_ignores_recommended"));
+		}
+
+		// (2) fov_aspect_mismatch: declared fov aspect vs. subImage aspect,
+		// and vs. display aspect when available.
+		float dec_fov_aspect = fov_aspect_wh(&dec->fov);
+		float sub_aspect = 0.0f;
+		if (dec->subimage.height_pixels > 0) {
+			sub_aspect = (float)dec->subimage.width_pixels / (float)dec->subimage.height_pixels;
+		}
+		bool sub_aspect_ok =
+		    (sub_aspect > 0.f && fabsf(dec_fov_aspect - sub_aspect) < EPS_ASPECT * dec_fov_aspect);
+		bool disp_aspect_ok =
+		    (display_aspect > 0.f &&
+		     fabsf(dec_fov_aspect - display_aspect) < EPS_ASPECT * dec_fov_aspect);
+		if (sub_aspect > 0.f && !sub_aspect_ok) {
+			cJSON_AddItemToArray(vflags, cJSON_CreateString("fov_aspect_mismatch_subimage"));
+		}
+		if (display_aspect > 0.f && !disp_aspect_ok && snap.view_count == 1) {
+			// Only flag display-aspect mismatch for mono; stereo halves the fov aspect.
+			cJSON_AddItemToArray(vflags, cJSON_CreateString("fov_aspect_mismatch_display"));
+		}
+
+		// (3) stale_head_pose: declared vs. recommended pose delta.
+		float dp = pos_delta(&dec->pose.position, &rec->pose.position);
+		float qdot = quat_dot(&dec->pose.orientation, &rec->pose.orientation);
+		if (qdot < 0.f) qdot = -qdot; // double-cover
+		bool pose_stale = (dp > EPS_POSITION_M) || (qdot < EPS_QUAT_DOT);
+		if (pose_stale) {
+			cJSON_AddItemToArray(vflags, cJSON_CreateString("stale_head_pose"));
+		}
+
+		// (4) wrong_disparity: reserved for slice 6 when capture_frame lands.
+
+		cJSON_AddNumberToObject(v, "view_index", i);
+		cJSON_AddItemToObject(v, "flags", vflags);
+
+		cJSON *metrics = cJSON_CreateObject();
+		cJSON_AddNumberToObject(metrics, "declared_fov_aspect_wh", dec_fov_aspect);
+		cJSON_AddNumberToObject(metrics, "subimage_aspect_wh", sub_aspect);
+		cJSON_AddNumberToObject(metrics, "position_delta_m", dp);
+		cJSON_AddNumberToObject(metrics, "orientation_dot", qdot);
+		cJSON_AddItemToObject(v, "metrics", metrics);
+
+		cJSON *expected = cJSON_CreateObject();
+		cJSON_AddItemToObject(expected, "recommended_fov", fov_to_json(&rec->fov));
+		cJSON_AddItemToObject(expected, "declared_fov", fov_to_json(&dec->fov));
+		cJSON_AddItemToObject(v, "fovs", expected);
+
+		cJSON_AddItemToArray(views, v);
+
+		if (fov_differs || pose_stale || (sub_aspect > 0.f && !sub_aspect_ok) ||
+		    (display_aspect > 0.f && !disp_aspect_ok && snap.view_count == 1)) {
+			have_any_flag = true;
+		}
+	}
+
+	if (have_any_flag) {
+		// Unioned flag set across all views, for quick triage.
+		for (int i = 0; i < cJSON_GetArraySize(views); i++) {
+			cJSON *v = cJSON_GetArrayItem(views, i);
+			cJSON *vflags = cJSON_GetObjectItemCaseSensitive(v, "flags");
+			for (int j = 0; j < cJSON_GetArraySize(vflags); j++) {
+				const char *s = cJSON_GetArrayItem(vflags, j)->valuestring;
+				bool seen = false;
+				for (int k = 0; k < cJSON_GetArraySize(flags_set); k++) {
+					if (strcmp(cJSON_GetArrayItem(flags_set, k)->valuestring, s) == 0) {
+						seen = true;
+						break;
+					}
+				}
+				if (!seen) {
+					cJSON_AddItemToArray(flags_set, cJSON_CreateString(s));
+				}
+			}
+		}
+	}
+
+	cJSON_AddItemToObject(r, "flags", flags_set);
+	cJSON_AddItemToObject(r, "views", views);
+	cJSON_AddBoolToObject(r, "ok", !have_any_flag);
+	return r;
+}
+
+static const struct u_mcp_tool TOOL_DIFF_PROJECTION = {
+    .name = "diff_projection",
+    .description =
+        "Compare the runtime's recommended per-view projection against the app's declared "
+        "projection and flag mismatches per spec §4.C: app_ignores_recommended, "
+        "fov_aspect_mismatch_{subimage,display}, stale_head_pose. "
+        "wrong_disparity is reserved for slice 6 (capture_frame).",
+    .input_schema_json = "{\"type\":\"object\",\"properties\":{}}",
+    .fn = tool_diff_projection,
+};
+
 // ---------- Public API ----------
 
 void
@@ -443,6 +613,7 @@ oxr_mcp_tools_register_all(void)
 	u_mcp_server_register_tool(&TOOL_GET_RUNTIME_METRICS);
 	u_mcp_server_register_tool(&TOOL_GET_KOOIMA_PARAMS);
 	u_mcp_server_register_tool(&TOOL_GET_SUBMITTED_PROJECTION);
+	u_mcp_server_register_tool(&TOOL_DIFF_PROJECTION);
 }
 
 void
