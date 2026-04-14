@@ -69,6 +69,10 @@ add_library(
 	u_live_stats.h
 	u_logging.c
 	u_logging.h
+	u_mcp_server.c
+	u_mcp_server.h
+	u_mcp_transport.c
+	u_mcp_transport.h
 	u_file_logging.c
 	u_file_logging.h
 	u_metrics.c

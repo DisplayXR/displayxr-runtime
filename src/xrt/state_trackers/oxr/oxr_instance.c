@@ -21,6 +21,7 @@
 #include "util/u_debug.h"
 #include "util/u_git_tag.h"
 #include "util/u_builders.h"
+#include "util/u_mcp_server.h"
 
 #ifdef XRT_FEATURE_CLIENT_DEBUG_GUI
 #include "util/u_debug_gui.h"
@@ -116,6 +117,10 @@ static XrResult
 oxr_instance_destroy(struct oxr_logger *log, struct oxr_handle_base *hb)
 {
 	struct oxr_instance *inst = (struct oxr_instance *)hb;
+
+	// Stop the MCP server before tearing down the runtime so that no
+	// in-flight tool handler can read freed state.
+	u_mcp_server_stop();
 
 	// Does a null-ptr check.
 	xrt_syscomp_destroy(&inst->system.xsysc);
@@ -579,6 +584,10 @@ oxr_instance_create(struct oxr_logger *log,
 #endif
 
 	*out_instance = inst;
+
+	// Opt-in AI introspection surface — Phase A.  No-op when the
+	// DISPLAYXR_MCP env var is unset, so normal runtime cost is zero.
+	u_mcp_server_maybe_start();
 
 	return XR_SUCCESS;
 }
