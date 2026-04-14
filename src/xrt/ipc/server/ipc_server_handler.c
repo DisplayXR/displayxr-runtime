@@ -1956,7 +1956,9 @@ ipc_handle_shell_activate(volatile struct ipc_client_state *_ics)
 		// If the previous session was dismissed (ESC), ensure_shell_window
 		// tears down the stale resources and creates a fresh window.
 		if (s->xsysc != NULL) {
+#ifdef XRT_OS_WINDOWS
 			comp_d3d11_service_ensure_shell_window(s->xsysc);
+#endif
 		}
 		return XRT_SUCCESS;
 	}
@@ -1967,8 +1969,10 @@ ipc_handle_shell_activate(volatile struct ipc_client_state *_ics)
 	if (s->xsysc != NULL) {
 		s->xsysc->info.shell_mode = true;
 
+#ifdef XRT_OS_WINDOWS
 		// Eagerly create the shell window so Ctrl+O works even with no apps.
 		comp_d3d11_service_ensure_shell_window(s->xsysc);
+#endif
 	}
 
 	return XRT_SUCCESS;
