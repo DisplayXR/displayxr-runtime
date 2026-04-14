@@ -22,7 +22,7 @@ Opt-in in-process MCP server inside `libopenxr_displayxr`, a per-PID unix-socket
 | 3 | Snapshot API + per-view tile getters (get_kooima_params, get_submitted_projection) | Done | `tests/mcp/test_snapshot.sh` |
 | 4 | diff_projection bug classifier (3 of 4 bug classes) | Done | `tests/mcp/test_diff_projection.sh` |
 | 5 | tail_log ring buffer | Done | `tests/mcp/test_tail_log.sh` |
-| 6 | capture_frame tool + per-compositor hook API | Done (stub) | `tests/mcp/test_capture_frame.sh` |
+| 6 | capture_frame tool + per-compositor hook API (Metal + GL on mac, D3D11 on Windows) | Done (full via #153) | `tests/mcp/test_capture_frame.sh`, `tests/mcp/test_capture_frame_gl.sh` |
 | 7 | Windows named-pipe transport + portable adapter + Maya demo | Done (code) | `tests/mcp/demo_maya.sh` |
 
 ## Tools shipped
@@ -35,7 +35,7 @@ Opt-in in-process MCP server inside `libopenxr_displayxr`, a per-PID unix-socket
 | `get_kooima_params` | recommended | `oxr_mcp_tools.c` + `u_mcp_snapshot` (inline) |
 | `get_submitted_projection` | declared | `oxr_mcp_tools.c` + `u_mcp_snapshot` (inline) |
 | `diff_projection` | recommended vs declared | `oxr_mcp_tools.c` |
-| `capture_frame` | actual pixels | `oxr_mcp_tools.c` + per-compositor hooks (pending #153) |
+| `capture_frame` | actual pixels | `oxr_mcp_tools.c` + `u_mcp_capture` + per-compositor hooks in Metal / GL / D3D11 native compositors |
 | `tail_log` | — | `u_mcp_server.c` + `u_mcp_log_ring.c` |
 
 Plus `initialize`, `ping`, `tools/list`, `tools/call`, `echo` as MCP protocol scaffolding.
@@ -76,10 +76,10 @@ Plus `initialize`, `ping`, `tools/list`, `tools/call`, `echo` as MCP protocol sc
 
 ## Known follow-ups (not blocking Phase A)
 
-- **#153** — per-compositor `capture_frame` handlers (Metal, GL, D3D11). Tool infra is complete; only the GPU→CPU readback + PNG encode remains per API.
-- **Windows validation** — slice 7 code is in place but needs a run on a Leia SR display. `tests/mcp/demo_maya.sh` is portable; expect it to pass once the Windows build lands.
-- **`measure_disparity`** — deferred to Phase A.5 per the plan, pending `capture_frame`.
+- **Windows validation** — slice 7 transport + slice D D3D11 capture are code-complete but need a run on a Leia SR display. `tests/mcp/demo_maya.sh` is portable; expect it to pass once the Windows build lands.
+- **`measure_disparity`** — deferred to Phase A.5, now unblocked since `capture_frame` returns real PNGs.
 - **Biometric / viewer-pose tools** — Phase B behind a privacy gate, not in scope here.
+- **File-format alignment with shell-phase8** — our `_atlas.png / _L.png / _R.png` naming matches shell-phase8's IPC capture. A future cleanup could factor the shared stride-copy + stb_write helpers into `u_image_write.{h,c}` once both surfaces land.
 
 ## "Done" demo
 
@@ -96,9 +96,9 @@ Output on a clean mac build:
   PASS  list_sessions — api=metal
   PASS  get_kooima_params — view_count=4
   PASS  get_submitted_projection — declared=2 recommended=4
-  PASS  diff_projection — flags=['app_ignores_recommended', 'stale_head_pose'] ok=False
-  PASS  capture_frame (stub ok until #153)
+  PASS  diff_projection — pipeline_consistent=True, uses own projection math (not forwarding xrLocateViews)
+  PASS  capture_frame — wrote ['L.png', 'R.png', 'atlas.png']
   PASS  tail_log — got 8 entries
 ```
 
-Notably, `diff_projection` on the reference `cube_handle_metal_macos` correctly flags `app_ignores_recommended` + `stale_head_pose` — the test app recomputes Kooima client-side instead of forwarding `xrLocateViews`. A real finding from the first run of the tool, not a false positive.
+Notably, `diff_projection` on the reference `cube_handle_metal_macos` reports `uses own projection math` — the test app recomputes Kooima client-side instead of forwarding `xrLocateViews`. A real observation from the first run of the tool (initially classified as a bug; reframed as a neutral observation after user feedback).
