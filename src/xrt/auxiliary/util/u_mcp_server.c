@@ -8,6 +8,7 @@
 
 #include "u_mcp_server.h"
 #include "u_mcp_transport.h"
+#include "u_mcp_log_ring.h"
 
 #include "util/u_logging.h"
 
@@ -183,6 +184,71 @@ u_mcp_server_register_tool(const struct u_mcp_tool *tool)
 }
 
 // ---------- Built-in echo tool (slice 1 handshake check) ----------
+
+// ---------- Built-in tail_log tool ----------
+
+static cJSON *
+tool_tail_log(const cJSON *params, void *userdata)
+{
+	(void)userdata;
+	uint64_t since = 0;
+	size_t max_entries = 128;
+	if (params != NULL) {
+		const cJSON *s = cJSON_GetObjectItemCaseSensitive(params, "since");
+		if (cJSON_IsNumber(s)) {
+			since = (uint64_t)s->valuedouble;
+		}
+		const cJSON *m = cJSON_GetObjectItemCaseSensitive(params, "max");
+		if (cJSON_IsNumber(m)) {
+			double mv = m->valuedouble;
+			if (mv > 0 && mv <= 1024) {
+				max_entries = (size_t)mv;
+			}
+		}
+	}
+
+	struct u_mcp_log_entry *buf = calloc(max_entries, sizeof(*buf));
+	if (buf == NULL) {
+		return NULL;
+	}
+	size_t count = 0;
+	uint64_t next_cursor = since, dropped = 0;
+	u_mcp_log_ring_read(since, buf, max_entries, &count, &next_cursor, &dropped);
+
+	cJSON *r = cJSON_CreateObject();
+	cJSON_AddNumberToObject(r, "cursor", (double)next_cursor);
+	cJSON_AddNumberToObject(r, "dropped", (double)dropped);
+	cJSON *arr = cJSON_CreateArray();
+	static const char *level_names[] = {"trace", "debug", "info", "warn", "error", "raw"};
+	for (size_t i = 0; i < count; i++) {
+		cJSON *e = cJSON_CreateObject();
+		cJSON_AddNumberToObject(e, "seq", (double)buf[i].seq);
+		cJSON_AddNumberToObject(e, "ts_ns", (double)buf[i].timestamp_ns);
+		int lv = (int)buf[i].level;
+		cJSON_AddStringToObject(e, "level",
+		                        (lv >= 0 && lv < (int)(sizeof(level_names) / sizeof(level_names[0])))
+		                            ? level_names[lv]
+		                            : "unknown");
+		cJSON_AddStringToObject(e, "text", buf[i].text);
+		cJSON_AddItemToArray(arr, e);
+	}
+	cJSON_AddItemToObject(r, "entries", arr);
+	free(buf);
+	return r;
+}
+
+static const struct u_mcp_tool TAIL_LOG_TOOL = {
+    .name = "tail_log",
+    .description =
+        "Return buffered U_LOG lines with seq > `since`. Pass the returned `cursor` as `since` "
+        "on the next call to stream. `dropped` indicates how many entries were evicted before "
+        "the caller read them (ring size is fixed).",
+    .input_schema_json =
+        "{\"type\":\"object\",\"properties\":{\"since\":{\"type\":\"integer\",\"default\":0},"
+        "\"max\":{\"type\":\"integer\",\"default\":128,\"maximum\":1024}}}",
+    .fn = tool_tail_log,
+    .userdata = NULL,
+};
 
 static cJSON *
 tool_echo(const cJSON *params, void *userdata)
@@ -363,8 +429,11 @@ u_mcp_server_maybe_start(void)
 		return;
 	}
 
-	// Register built-in tools (idempotent).
+	// Start the log ring first so sink_cb captures bring-up messages,
+	// then register built-in tools.
+	u_mcp_log_ring_start();
 	u_mcp_server_register_tool(&ECHO_TOOL);
+	u_mcp_server_register_tool(&TAIL_LOG_TOOL);
 
 	g_server.listener = u_mcp_listener_open(getpid());
 	if (g_server.listener == NULL) {
@@ -392,5 +461,6 @@ u_mcp_server_stop(void)
 	g_server.listener = NULL;
 	pthread_join(g_server.thread, NULL);
 	g_server.thread_started = false;
+	u_mcp_log_ring_stop();
 	U_LOG_I(LOG_PFX "server stopped");
 }
