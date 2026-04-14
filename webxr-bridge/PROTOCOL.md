@@ -75,6 +75,32 @@ Bridge calls `xrRequestDisplayRenderingModeEXT(session, modeIndex)`. Runtime pro
 
 Pushed by the bridge when the polled window metrics change (resize, move, or window appearing/disappearing). Polled at ~4 Hz from the event loop. The extension dispatches a `windowinfochange` event on the session with `event.detail.windowInfo`.
 
+### `input`
+
+Raw Win32 input event captured from the compositor window via system-wide low-level hooks (`WH_KEYBOARD_LL` / `WH_MOUSE_LL`). Only forwarded when the compositor window has focus. Compositor-side qwerty processing is disabled when the bridge is active so there's no double-handling.
+
+```json
+{ "type": "input", "version": 1, "kind": "key",
+  "down": true, "code": 87, "repeat": false,
+  "modifiers": { "ctrl": false, "shift": false, "alt": false } }
+
+{ "type": "input", "version": 1, "kind": "mouse",
+  "event": "down" | "up" | "move",
+  "button": 0,
+  "x": 123, "y": 456,
+  "buttons": 1,
+  "modifiers": {...} }
+
+{ "type": "input", "version": 1, "kind": "wheel",
+  "deltaY": 120,
+  "x": 123, "y": 456,
+  "modifiers": {...} }
+```
+
+`code` is the Win32 virtual-key code (`'A' = 65`, `VK_LEFT = 0x25`, etc.). `button` is `0`=left, `1`=right, `2`=middle. `buttons` is the held-button bitmask (`1`=L, `2`=R, `4`=M). `x`/`y` are client-area pixels in the compositor window's coordinate space (DPI-physical, matches `windowInfo.windowPixelSize`). `deltaY` is in `WHEEL_DELTA` units (+120 = one notch up).
+
+The extension dispatches a `displayxrinput` event on the session with `event.detail` carrying the message. Pages should treat the data as the raw equivalent of cube_handle_d3d11_win's WndProc input — semantics (WASD movement, mouse look, etc.) are entirely up to the page.
+
 ### `mode-changed`
 
 ```json

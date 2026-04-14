@@ -7044,9 +7044,11 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		}
 	}
 
-	// Runtime-side 2D/3D toggle (V key) — polls qwerty driver each frame
+	// Runtime-side 2D/3D toggle (V key) — polls qwerty driver each frame.
+	// Skipped when bridge-relay is active: page owns input semantics, runtime
+	// must not synthesize mode changes from V (or 1/2/3) keys.
 #ifdef XRT_BUILD_DRIVER_QWERTY
-	if (sys->xsysd != NULL) {
+	if (sys->xsysd != NULL && !g_bridge_relay_active) {
 		bool force_2d = false;
 		bool toggled = qwerty_check_display_mode_toggle(
 		    sys->xsysd->xdevs, sys->xsysd->xdev_count, &force_2d);

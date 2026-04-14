@@ -521,21 +521,146 @@ static void CALLBACK win_event_proc(HWINEVENTHOOK /*hook*/, DWORD /*event*/,
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Raw input forwarding (keyboard + mouse) — bridge captures Win32 events
+// targeting the compositor window and relays them as WS messages so the page
+// owns input semantics. Compositor's qwerty processing is gated on
+// !g_bridge_relay_active so there's no double-handling.
+// ---------------------------------------------------------------------------
+
+struct InputEvent {
+	enum Kind { KEY, MOUSE, WHEEL };
+	Kind kind;
+	bool down;       // KEY/MOUSE: pressed vs released
+	uint32_t code;   // KEY: virtual-key code
+	bool repeat;     // KEY: auto-repeat
+	int button;      // MOUSE: 0=left,1=right,2=middle (down/up only)
+	int mevent;      // MOUSE: 0=move,1=down,2=up
+	int x, y;        // MOUSE/WHEEL: client-area pixels (DPI physical)
+	int buttons;     // MOUSE: held-button bitmask
+	int wheel_delta; // WHEEL: WHEEL_DELTA units
+	bool ctrl, shift, alt;
+};
+
+static std::mutex g_input_mtx;
+static std::vector<InputEvent> g_input_queue; // Drained by main loop.
+
+static void push_input_event(const InputEvent &e) {
+	std::lock_guard<std::mutex> lk(g_input_mtx);
+	if (g_input_queue.size() >= 256) g_input_queue.erase(g_input_queue.begin());
+	g_input_queue.push_back(e);
+}
+
+// Cached focus check — only forward events when compositor window has focus.
+static inline bool compositor_window_has_focus() {
+	HWND target = g_compositor_hwnd.load();
+	if (target == nullptr) return false;
+	HWND fg = GetForegroundWindow();
+	if (fg == target) return true;
+	// Also accept descendants (e.g., child controls) of the compositor window.
+	while (fg != nullptr) {
+		fg = GetAncestor(fg, GA_PARENT);
+		if (fg == target) return true;
+	}
+	return false;
+}
+
+static inline void fill_modifiers(InputEvent &e) {
+	e.ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+	e.shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+	e.alt = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+}
+
+static LRESULT CALLBACK keyboard_hook_proc(int nCode, WPARAM wParam, LPARAM lParam) {
+	if (nCode == HC_ACTION && compositor_window_has_focus()) {
+		KBDLLHOOKSTRUCT *kb = (KBDLLHOOKSTRUCT *)lParam;
+		bool down = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
+		bool up = (wParam == WM_KEYUP || wParam == WM_SYSKEYUP);
+		if (down || up) {
+			InputEvent e{};
+			e.kind = InputEvent::KEY;
+			e.down = down;
+			e.code = kb->vkCode;
+			e.repeat = down && (kb->flags & LLKHF_INJECTED) == 0; // best-effort
+			fill_modifiers(e);
+			push_input_event(e);
+		}
+	}
+	return CallNextHookEx(nullptr, nCode, wParam, lParam);
+}
+
+static LRESULT CALLBACK mouse_hook_proc(int nCode, WPARAM wParam, LPARAM lParam) {
+	if (nCode == HC_ACTION && compositor_window_has_focus()) {
+		MSLLHOOKSTRUCT *ms = (MSLLHOOKSTRUCT *)lParam;
+		HWND target = g_compositor_hwnd.load();
+		POINT p = ms->pt;
+		if (target != nullptr) ScreenToClient(target, &p);
+
+		InputEvent e{};
+		e.x = p.x; e.y = p.y;
+		// Compose held-button bitmask from async key state.
+		int buttons = 0;
+		if (GetAsyncKeyState(VK_LBUTTON) & 0x8000) buttons |= 1;
+		if (GetAsyncKeyState(VK_RBUTTON) & 0x8000) buttons |= 2;
+		if (GetAsyncKeyState(VK_MBUTTON) & 0x8000) buttons |= 4;
+		e.buttons = buttons;
+		fill_modifiers(e);
+
+		switch (wParam) {
+		case WM_MOUSEMOVE:
+			e.kind = InputEvent::MOUSE; e.mevent = 0;
+			push_input_event(e);
+			break;
+		case WM_LBUTTONDOWN: e.kind = InputEvent::MOUSE; e.mevent = 1; e.button = 0; e.down = true;  push_input_event(e); break;
+		case WM_LBUTTONUP:   e.kind = InputEvent::MOUSE; e.mevent = 2; e.button = 0; e.down = false; push_input_event(e); break;
+		case WM_RBUTTONDOWN: e.kind = InputEvent::MOUSE; e.mevent = 1; e.button = 1; e.down = true;  push_input_event(e); break;
+		case WM_RBUTTONUP:   e.kind = InputEvent::MOUSE; e.mevent = 2; e.button = 1; e.down = false; push_input_event(e); break;
+		case WM_MBUTTONDOWN: e.kind = InputEvent::MOUSE; e.mevent = 1; e.button = 2; e.down = true;  push_input_event(e); break;
+		case WM_MBUTTONUP:   e.kind = InputEvent::MOUSE; e.mevent = 2; e.button = 2; e.down = false; push_input_event(e); break;
+		case WM_MOUSEWHEEL: {
+			e.kind = InputEvent::WHEEL;
+			e.wheel_delta = (int)(short)HIWORD(ms->mouseData);
+			push_input_event(e);
+			break;
+		}
+		default: break;
+		}
+	}
+	return CallNextHookEx(nullptr, nCode, wParam, lParam);
+}
+
 static void window_event_thread_func() {
-	HWINEVENTHOOK hook = SetWinEventHook(
+	HWINEVENTHOOK win_hook = SetWinEventHook(
 	    EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE,
 	    nullptr, win_event_proc, 0, 0,
 	    WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
-	if (hook == nullptr) {
+	if (win_hook == nullptr) {
 		LOG_W("SetWinEventHook failed: %lu (window resize will fall back to polling)",
 		      GetLastError());
-		return;
+	} else {
+		LOG_I("Window event hook installed (EVENT_OBJECT_LOCATIONCHANGE)");
 	}
-	LOG_I("Window event hook installed (EVENT_OBJECT_LOCATIONCHANGE)");
+
+	HHOOK kbd_hook = SetWindowsHookExW(WH_KEYBOARD_LL, keyboard_hook_proc,
+	                                    GetModuleHandleW(nullptr), 0);
+	if (kbd_hook == nullptr) {
+		LOG_W("SetWindowsHookEx(WH_KEYBOARD_LL) failed: %lu (keyboard input will not forward)",
+		      GetLastError());
+	} else {
+		LOG_I("Keyboard hook installed (WH_KEYBOARD_LL)");
+	}
+
+	HHOOK mouse_hook = SetWindowsHookExW(WH_MOUSE_LL, mouse_hook_proc,
+	                                      GetModuleHandleW(nullptr), 0);
+	if (mouse_hook == nullptr) {
+		LOG_W("SetWindowsHookEx(WH_MOUSE_LL) failed: %lu (mouse input will not forward)",
+		      GetLastError());
+	} else {
+		LOG_I("Mouse hook installed (WH_MOUSE_LL)");
+	}
 
 	MSG msg;
 	while (g_running.load()) {
-		// PeekMessage so we can periodically check g_running and exit cleanly.
 		if (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
 			TranslateMessage(&msg);
 			DispatchMessageW(&msg);
@@ -543,8 +668,10 @@ static void window_event_thread_func() {
 			Sleep(10);
 		}
 	}
-	UnhookWinEvent(hook);
-	LOG_I("Window event hook removed");
+	if (mouse_hook) UnhookWindowsHookEx(mouse_hook);
+	if (kbd_hook) UnhookWindowsHookEx(kbd_hook);
+	if (win_hook) UnhookWinEvent(win_hook);
+	LOG_I("Input + window hooks removed");
 }
 
 // ---------------------------------------------------------------------------
@@ -631,6 +758,41 @@ static std::string build_mode_changed_json(uint32_t prev, uint32_t curr, bool hw
 static std::string build_hardware_state_json(bool hw3d) {
 	return "{\"type\":\"hardware-state-changed\",\"version\":1,\"hardware3D\":"
 	       + std::string(hw3d ? "true" : "false") + "}";
+}
+
+static std::string build_input_event_json(const InputEvent &e) {
+	std::string s = "{\"type\":\"input\",\"version\":1";
+	s += ",\"modifiers\":{\"ctrl\":";
+	s += (e.ctrl ? "true" : "false");
+	s += ",\"shift\":"; s += (e.shift ? "true" : "false");
+	s += ",\"alt\":";   s += (e.alt   ? "true" : "false");
+	s += "}";
+	switch (e.kind) {
+	case InputEvent::KEY:
+		s += ",\"kind\":\"key\"";
+		s += ",\"down\":"; s += (e.down ? "true" : "false");
+		s += ",\"code\":" + json_u(e.code);
+		s += ",\"repeat\":"; s += (e.repeat ? "true" : "false");
+		break;
+	case InputEvent::MOUSE:
+		s += ",\"kind\":\"mouse\"";
+		s += ",\"event\":\"";
+		s += (e.mevent == 0 ? "move" : (e.mevent == 1 ? "down" : "up"));
+		s += "\"";
+		if (e.mevent != 0) s += ",\"button\":" + json_i(e.button);
+		s += ",\"x\":" + json_i(e.x);
+		s += ",\"y\":" + json_i(e.y);
+		s += ",\"buttons\":" + json_i(e.buttons);
+		break;
+	case InputEvent::WHEEL:
+		s += ",\"kind\":\"wheel\"";
+		s += ",\"deltaY\":" + json_i(e.wheel_delta);
+		s += ",\"x\":" + json_i(e.x);
+		s += ",\"y\":" + json_i(e.y);
+		break;
+	}
+	s += "}";
+	return s;
 }
 
 static std::string build_eye_poses_json(const XrView *views, uint32_t count) {
@@ -1154,6 +1316,18 @@ static void run_event_loop(Bridge &b) {
 			}
 			if (window_changed && b.ws_client_connected.load()) {
 				b.outgoing.push(build_window_info_json(b.window_metrics));
+			}
+
+			// Drain queued input events from the hook thread.
+			if (b.ws_client_connected.load()) {
+				std::vector<InputEvent> drained;
+				{
+					std::lock_guard<std::mutex> lk(g_input_mtx);
+					drained.swap(g_input_queue);
+				}
+				for (const auto &ev : drained) {
+					b.outgoing.push(build_input_event_json(ev));
+				}
 			}
 			Sleep(10);
 		} else {

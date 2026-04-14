@@ -167,6 +167,15 @@
       });
     } else if (msg.type === 'eye-poses') {
       latestEyePoses = msg.eyes;
+    } else if (msg.type === 'input') {
+      // Raw Win32 input event captured by the bridge from the compositor
+      // window. Page implements its own semantics (WASD, mouse look, etc.)
+      // — runtime's qwerty/HUD/V-toggle are gated off when bridge is active.
+      activeSessions.forEach(function (entry) {
+        try {
+          entry.session.dispatchEvent(new CustomEvent('displayxrinput', { detail: msg }));
+        } catch (e) {}
+      });
     }
   });
 
