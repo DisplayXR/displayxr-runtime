@@ -134,6 +134,15 @@
 		]
 	},
 
+	"shell_capture_frame": {
+		"in": [
+			{"name": "request", "type": "struct ipc_capture_request"}
+		],
+		"out": [
+			{"name": "capture_result", "type": "struct ipc_capture_result"}
+		]
+	},
+
 	"system_devices_get_roles": {
 		"out": [
 			{"name": "system_roles", "type": "struct xrt_system_roles"}

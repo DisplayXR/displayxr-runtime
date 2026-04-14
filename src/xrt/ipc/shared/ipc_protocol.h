@@ -342,6 +342,56 @@ struct ipc_launcher_app
 };
 
 /*!
+ * Phase 8: 3D capture MVP. Bitmask of which views (sub-images) the shell
+ * is requesting from the service compositor's combined atlas.
+ *
+ * @ingroup ipc
+ */
+#define IPC_CAPTURE_FLAG_LEFT (1u << 0)
+#define IPC_CAPTURE_FLAG_RIGHT (1u << 1)
+#define IPC_CAPTURE_FLAG_SBS (1u << 2)
+#define IPC_CAPTURE_FLAG_ALL (IPC_CAPTURE_FLAG_LEFT | IPC_CAPTURE_FLAG_RIGHT | IPC_CAPTURE_FLAG_SBS)
+
+#define IPC_CAPTURE_PATH_MAX 256
+
+/*!
+ * Phase 8: request struct for shell_capture_frame. Wraps the path prefix
+ * (without extension — runtime appends "_sbs.png" / "_L.png" / "_R.png")
+ * because the IPC schema only supports struct/scalar parameter types.
+ *
+ * @ingroup ipc
+ */
+struct ipc_capture_request
+{
+	char path_prefix[IPC_CAPTURE_PATH_MAX];
+	uint32_t flags; // IPC_CAPTURE_FLAG_* bitmask
+};
+
+/*!
+ * Phase 8: result returned by shell_capture_frame. The runtime fills this
+ * with the metadata needed for a sidecar JSON file (timestamp, atlas/eye
+ * dimensions, stereo layout, display physical size, eye poses at capture).
+ *
+ * @ingroup ipc
+ */
+struct ipc_capture_result
+{
+	uint64_t timestamp_ns;
+	uint32_t atlas_width;
+	uint32_t atlas_height;
+	uint32_t eye_width;
+	uint32_t eye_height;
+	uint32_t views_written; // bitmask of IPC_CAPTURE_FLAG_* actually written
+	uint32_t tile_columns;
+	uint32_t tile_rows;
+	float display_width_m;
+	float display_height_m;
+	float eye_left_m[3];
+	float eye_right_m[3];
+	char _pad[16];
+};
+
+/*!
  * State for a connected application.
  *
  * @ingroup ipc
