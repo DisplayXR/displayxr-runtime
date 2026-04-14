@@ -592,6 +592,78 @@ tool_diff_projection(const cJSON *params, void *userdata)
 	return r;
 }
 
+// ---------- capture_frame ----------
+//
+// Per-API readback of the compositor's most recent submitted frame or
+// atlas, returned as a PNG (base64) or a file path in /tmp. The actual
+// GPU→CPU copy lives in the compositor that owns the swapchain; this
+// tool registers a stub path until per-compositor hooks land.
+//
+// Hook registration pattern: each compositor calls oxr_mcp_tools_set
+// _capture_handler() at creation time; the tool then dispatches to
+// whichever compositor the current session uses.
+
+static pthread_mutex_t g_capture_lock = PTHREAD_MUTEX_INITIALIZER;
+static oxr_mcp_capture_fn g_capture_fn = NULL;
+static void *g_capture_userdata = NULL;
+
+void
+oxr_mcp_tools_set_capture_handler(oxr_mcp_capture_fn fn, void *userdata)
+{
+	pthread_mutex_lock(&g_capture_lock);
+	g_capture_fn = fn;
+	g_capture_userdata = userdata;
+	pthread_mutex_unlock(&g_capture_lock);
+}
+
+static cJSON *
+tool_capture_frame(const cJSON *params, void *userdata)
+{
+	(void)userdata;
+	pthread_mutex_lock(&g_capture_lock);
+	oxr_mcp_capture_fn fn = g_capture_fn;
+	void *ud = g_capture_userdata;
+	pthread_mutex_unlock(&g_capture_lock);
+
+	if (fn == NULL) {
+		cJSON *o = cJSON_CreateObject();
+		cJSON_AddStringToObject(
+		    o, "error",
+		    "capture_frame not wired: compositor has not registered a handler. "
+		    "Metal/GL slice-6 hook and D3D11 slice-7 hook are pending.");
+		cJSON_AddStringToObject(o, "hint", "run diff_projection and tail_log in the meantime");
+		return o;
+	}
+
+	char path[256];
+	long pid = (long)getpid();
+	struct oxr_session *sess = lock_session();
+	uint64_t seq = sess ? (uint64_t)sess->frame_id.begun : 0;
+	unlock_session();
+	snprintf(path, sizeof(path), "/tmp/displayxr-mcp-capture-%ld-%llu.png", pid, (unsigned long long)seq);
+
+	if (!fn(path, ud)) {
+		cJSON *o = cJSON_CreateObject();
+		cJSON_AddStringToObject(o, "error", "compositor capture handler failed");
+		return o;
+	}
+
+	cJSON *r = cJSON_CreateObject();
+	cJSON_AddStringToObject(r, "path", path);
+	cJSON_AddNumberToObject(r, "frame_id", (double)seq);
+	return r;
+}
+
+static const struct u_mcp_tool TOOL_CAPTURE_FRAME = {
+    .name = "capture_frame",
+    .description =
+        "Capture the compositor's most recent atlas to a PNG and return its path. "
+        "Requires a per-API compositor hook (Metal/GL: slice 6; D3D11: slice 7). "
+        "Returns an error with diagnostics if no hook is registered.",
+    .input_schema_json = "{\"type\":\"object\",\"properties\":{}}",
+    .fn = tool_capture_frame,
+};
+
 static const struct u_mcp_tool TOOL_DIFF_PROJECTION = {
     .name = "diff_projection",
     .description =
@@ -614,6 +686,7 @@ oxr_mcp_tools_register_all(void)
 	u_mcp_server_register_tool(&TOOL_GET_KOOIMA_PARAMS);
 	u_mcp_server_register_tool(&TOOL_GET_SUBMITTED_PROJECTION);
 	u_mcp_server_register_tool(&TOOL_DIFF_PROJECTION);
+	u_mcp_server_register_tool(&TOOL_CAPTURE_FRAME);
 }
 
 void

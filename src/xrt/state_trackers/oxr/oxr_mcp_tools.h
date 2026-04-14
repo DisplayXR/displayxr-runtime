@@ -16,6 +16,7 @@ extern "C" {
 
 #include <openxr/openxr.h>
 
+#include <stdbool.h>
 #include <stdint.h>
 
 struct oxr_session;
@@ -59,6 +60,20 @@ oxr_mcp_tools_record_recommended(struct oxr_session *sess,
  */
 void
 oxr_mcp_tools_record_submitted(struct oxr_session *sess, const struct xrt_layer_data *data);
+
+/*!
+ * Register a per-compositor capture handler. The handler is invoked on
+ * the MCP server thread with a target path; it must write a PNG to
+ * that path (synchronously or with its own synchronization) and return
+ * true on success. The state tracker passes a stable path of the form
+ * `/tmp/displayxr-mcp-capture-<pid>-<frame>.png`.
+ *
+ * Pass NULL to unregister.
+ */
+typedef bool (*oxr_mcp_capture_fn)(const char *path, void *userdata);
+
+void
+oxr_mcp_tools_set_capture_handler(oxr_mcp_capture_fn fn, void *userdata);
 
 #ifdef __cplusplus
 }
