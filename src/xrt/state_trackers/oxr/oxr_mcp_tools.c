@@ -29,11 +29,64 @@
 #include <cjson/cJSON.h>
 
 #include <pthread.h>
+#include <stdatomic.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
 static pthread_mutex_t g_sess_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct oxr_session *g_sess = NULL;
+
+// ---------- Per-view snapshot ----------
+//
+// Three signals per spec §4.C, captured per view (1..XRT_MAX_VIEWS) so the
+// same machinery handles mono / stereo / quilted displays:
+//   recommended  = runtime's xrLocateViews output (Kooima from display geometry)
+//   declared     = app's XrCompositionLayerProjectionView at frame submit
+//   actual       = pixels (slice 6, not here)
+//
+// Published via atomic pointer swap: writer fills the off-buffer, swaps in.
+// Reader does an atomic load + memcpy, so the whole snapshot is self-consistent.
+
+struct mcp_view_data
+{
+	struct xrt_pose pose;
+	struct xrt_fov fov;
+	// subImage fields are only meaningful on declared views.
+	struct
+	{
+		uint32_t width_pixels, height_pixels;
+		int32_t x_pixels, y_pixels;
+		uint32_t array_index;
+		uint32_t image_index;
+	} subimage;
+};
+
+struct mcp_frame_snapshot
+{
+	uint64_t seq;
+	int64_t predicted_display_time_ns; //!< xrLocateViews::displayTime, monotonic ns.
+	uint64_t frame_id;                 //!< sess->frame_id.begun.
+	uint32_t view_count;
+
+	// Recommended (runtime) — written by record_recommended.
+	struct mcp_view_data recommended[XRT_MAX_VIEWS];
+	bool have_recommended;
+
+	// Declared (app) — written by record_submitted.
+	struct mcp_view_data declared[XRT_MAX_VIEWS];
+	bool have_declared;
+
+	// Display context — copied in at publish so the snapshot is self-contained.
+	float display_width_m, display_height_m;
+	uint32_t atlas_width_pixels, atlas_height_pixels;
+	uint32_t panel_width_pixels, panel_height_pixels;
+	float nominal_viewer_x_m, nominal_viewer_y_m, nominal_viewer_z_m;
+};
+
+static _Atomic(struct mcp_frame_snapshot *) g_published = NULL;
+static struct mcp_frame_snapshot g_scratch;
+static uint64_t g_next_seq = 1;
 
 static struct oxr_session *
 lock_session(void)
@@ -212,6 +265,174 @@ static const struct u_mcp_tool TOOL_GET_RUNTIME_METRICS = {
     .fn = tool_get_runtime_metrics,
 };
 
+// ---------- Snapshot helpers ----------
+
+static void
+copy_display_context(struct mcp_frame_snapshot *dst, const struct oxr_session *sess)
+{
+	if (sess->sys == NULL || sess->sys->xsysc == NULL) {
+		return;
+	}
+	const struct xrt_system_compositor_info *info = &sess->sys->xsysc->info;
+	dst->display_width_m = info->display_width_m;
+	dst->display_height_m = info->display_height_m;
+	dst->atlas_width_pixels = info->atlas_width_pixels;
+	dst->atlas_height_pixels = info->atlas_height_pixels;
+	dst->panel_width_pixels = info->display_pixel_width;
+	dst->panel_height_pixels = info->display_pixel_height;
+	dst->nominal_viewer_x_m = info->nominal_viewer_x_m;
+	dst->nominal_viewer_y_m = info->nominal_viewer_y_m;
+	dst->nominal_viewer_z_m = info->nominal_viewer_z_m;
+}
+
+static cJSON *
+pose_to_json(const struct xrt_pose *p)
+{
+	cJSON *o = cJSON_CreateObject();
+	cJSON *pos = cJSON_CreateObject();
+	cJSON_AddNumberToObject(pos, "x", p->position.x);
+	cJSON_AddNumberToObject(pos, "y", p->position.y);
+	cJSON_AddNumberToObject(pos, "z", p->position.z);
+	cJSON_AddItemToObject(o, "position", pos);
+	cJSON *q = cJSON_CreateObject();
+	cJSON_AddNumberToObject(q, "x", p->orientation.x);
+	cJSON_AddNumberToObject(q, "y", p->orientation.y);
+	cJSON_AddNumberToObject(q, "z", p->orientation.z);
+	cJSON_AddNumberToObject(q, "w", p->orientation.w);
+	cJSON_AddItemToObject(o, "orientation", q);
+	return o;
+}
+
+static cJSON *
+fov_to_json(const struct xrt_fov *f)
+{
+	cJSON *o = cJSON_CreateObject();
+	cJSON_AddNumberToObject(o, "angle_left", f->angle_left);
+	cJSON_AddNumberToObject(o, "angle_right", f->angle_right);
+	cJSON_AddNumberToObject(o, "angle_up", f->angle_up);
+	cJSON_AddNumberToObject(o, "angle_down", f->angle_down);
+	return o;
+}
+
+// Atomically load the published snapshot into @p out. Returns false if
+// no snapshot has been published yet.
+static bool
+load_snapshot(struct mcp_frame_snapshot *out)
+{
+	struct mcp_frame_snapshot *p = atomic_load_explicit(&g_published, memory_order_acquire);
+	if (p == NULL) {
+		return false;
+	}
+	*out = *p;
+	return true;
+}
+
+// ---------- get_kooima_params ----------
+//
+// Returns the runtime's recommended per-view projection + the display
+// geometry that Kooima used to derive it. Per-view arrays size to
+// view_count so mono/stereo/quilted displays all report correctly.
+
+static cJSON *
+tool_get_kooima_params(const cJSON *params, void *userdata)
+{
+	(void)params;
+	(void)userdata;
+	struct mcp_frame_snapshot snap;
+	if (!load_snapshot(&snap) || !snap.have_recommended) {
+		return error_object("no recommended views yet — ensure xrLocateViews has been called");
+	}
+
+	cJSON *r = cJSON_CreateObject();
+	cJSON_AddNumberToObject(r, "seq", (double)snap.seq);
+	cJSON_AddNumberToObject(r, "predicted_display_time_ns", (double)snap.predicted_display_time_ns);
+	cJSON_AddNumberToObject(r, "frame_id", (double)snap.frame_id);
+	cJSON_AddNumberToObject(r, "view_count", snap.view_count);
+
+	cJSON *disp = cJSON_CreateObject();
+	cJSON_AddNumberToObject(disp, "width_m", snap.display_width_m);
+	cJSON_AddNumberToObject(disp, "height_m", snap.display_height_m);
+	cJSON_AddNumberToObject(disp, "panel_width_pixels", snap.panel_width_pixels);
+	cJSON_AddNumberToObject(disp, "panel_height_pixels", snap.panel_height_pixels);
+	cJSON_AddNumberToObject(disp, "atlas_width_pixels", snap.atlas_width_pixels);
+	cJSON_AddNumberToObject(disp, "atlas_height_pixels", snap.atlas_height_pixels);
+	cJSON *nom = cJSON_CreateObject();
+	cJSON_AddNumberToObject(nom, "x_m", snap.nominal_viewer_x_m);
+	cJSON_AddNumberToObject(nom, "y_m", snap.nominal_viewer_y_m);
+	cJSON_AddNumberToObject(nom, "z_m", snap.nominal_viewer_z_m);
+	cJSON_AddItemToObject(disp, "nominal_viewer", nom);
+	cJSON_AddItemToObject(r, "display", disp);
+
+	cJSON *views = cJSON_CreateArray();
+	for (uint32_t i = 0; i < snap.view_count && i < XRT_MAX_VIEWS; i++) {
+		cJSON *v = cJSON_CreateObject();
+		cJSON_AddItemToObject(v, "recommended_pose", pose_to_json(&snap.recommended[i].pose));
+		cJSON_AddItemToObject(v, "recommended_fov", fov_to_json(&snap.recommended[i].fov));
+		cJSON_AddItemToArray(views, v);
+	}
+	cJSON_AddItemToObject(r, "views", views);
+	return r;
+}
+
+static const struct u_mcp_tool TOOL_GET_KOOIMA_PARAMS = {
+    .name = "get_kooima_params",
+    .description =
+        "Return the runtime's per-view recommended projection (pose + FoV) as computed from "
+        "display geometry and viewer pose, plus the display context used. Array sized to "
+        "view_count (1=mono, 2=stereo, 4/8=quilted).",
+    .input_schema_json = "{\"type\":\"object\",\"properties\":{}}",
+    .fn = tool_get_kooima_params,
+};
+
+// ---------- get_submitted_projection ----------
+//
+// Returns the per-view projection the app actually submitted via
+// XrCompositionLayerProjectionView at the most recent xrEndFrame.
+
+static cJSON *
+tool_get_submitted_projection(const cJSON *params, void *userdata)
+{
+	(void)params;
+	(void)userdata;
+	struct mcp_frame_snapshot snap;
+	if (!load_snapshot(&snap) || !snap.have_declared) {
+		return error_object("no submitted projection yet — waiting for xrEndFrame");
+	}
+
+	cJSON *r = cJSON_CreateObject();
+	cJSON_AddNumberToObject(r, "seq", (double)snap.seq);
+	cJSON_AddNumberToObject(r, "predicted_display_time_ns", (double)snap.predicted_display_time_ns);
+	cJSON_AddNumberToObject(r, "frame_id", (double)snap.frame_id);
+	cJSON_AddNumberToObject(r, "view_count", snap.view_count);
+
+	cJSON *views = cJSON_CreateArray();
+	for (uint32_t i = 0; i < snap.view_count && i < XRT_MAX_VIEWS; i++) {
+		cJSON *v = cJSON_CreateObject();
+		cJSON_AddItemToObject(v, "declared_pose", pose_to_json(&snap.declared[i].pose));
+		cJSON_AddItemToObject(v, "declared_fov", fov_to_json(&snap.declared[i].fov));
+		cJSON *sub = cJSON_CreateObject();
+		cJSON_AddNumberToObject(sub, "x_pixels", snap.declared[i].subimage.x_pixels);
+		cJSON_AddNumberToObject(sub, "y_pixels", snap.declared[i].subimage.y_pixels);
+		cJSON_AddNumberToObject(sub, "width_pixels", snap.declared[i].subimage.width_pixels);
+		cJSON_AddNumberToObject(sub, "height_pixels", snap.declared[i].subimage.height_pixels);
+		cJSON_AddNumberToObject(sub, "array_index", snap.declared[i].subimage.array_index);
+		cJSON_AddNumberToObject(sub, "image_index", snap.declared[i].subimage.image_index);
+		cJSON_AddItemToObject(v, "subimage", sub);
+		cJSON_AddItemToArray(views, v);
+	}
+	cJSON_AddItemToObject(r, "views", views);
+	return r;
+}
+
+static const struct u_mcp_tool TOOL_GET_SUBMITTED_PROJECTION = {
+    .name = "get_submitted_projection",
+    .description =
+        "Return the per-view projection the app submitted via XrCompositionLayerProjectionView "
+        "at the most recent xrEndFrame, plus the swapchain sub-image rect for each view.",
+    .input_schema_json = "{\"type\":\"object\",\"properties\":{}}",
+    .fn = tool_get_submitted_projection,
+};
+
 // ---------- Public API ----------
 
 void
@@ -220,6 +441,72 @@ oxr_mcp_tools_register_all(void)
 	u_mcp_server_register_tool(&TOOL_LIST_SESSIONS);
 	u_mcp_server_register_tool(&TOOL_GET_DISPLAY_INFO);
 	u_mcp_server_register_tool(&TOOL_GET_RUNTIME_METRICS);
+	u_mcp_server_register_tool(&TOOL_GET_KOOIMA_PARAMS);
+	u_mcp_server_register_tool(&TOOL_GET_SUBMITTED_PROJECTION);
+}
+
+void
+oxr_mcp_tools_record_recommended(struct oxr_session *sess,
+                                 uint32_t view_count,
+                                 const XrView *views,
+                                 uint64_t display_time_ns)
+{
+	if (sess == NULL || views == NULL || view_count == 0 || view_count > XRT_MAX_VIEWS) {
+		return;
+	}
+	g_scratch.view_count = view_count;
+	g_scratch.predicted_display_time_ns = (int64_t)display_time_ns;
+	for (uint32_t i = 0; i < view_count; i++) {
+		// XrPosef layout matches xrt_pose; same for XrFovf and xrt_fov.
+		memcpy(&g_scratch.recommended[i].pose, &views[i].pose, sizeof(struct xrt_pose));
+		memcpy(&g_scratch.recommended[i].fov, &views[i].fov, sizeof(struct xrt_fov));
+	}
+	g_scratch.have_recommended = true;
+	copy_display_context(&g_scratch, sess);
+	// Not publishing here — declared data comes from frame_end; publish there.
+	// Make recommended visible on its own so a diff can proceed even if no
+	// projection layer has been submitted yet.
+	g_scratch.seq = g_next_seq++;
+	g_scratch.frame_id = (uint64_t)sess->frame_id.begun;
+	static struct mcp_frame_snapshot a, b;
+	struct mcp_frame_snapshot *cur = atomic_load_explicit(&g_published, memory_order_relaxed);
+	struct mcp_frame_snapshot *next = (cur == &a) ? &b : &a;
+	*next = g_scratch;
+	atomic_store_explicit(&g_published, next, memory_order_release);
+}
+
+void
+oxr_mcp_tools_record_submitted(struct oxr_session *sess, const struct xrt_layer_data *data)
+{
+	if (sess == NULL || data == NULL || data->view_count == 0 || data->view_count > XRT_MAX_VIEWS) {
+		return;
+	}
+	if (data->type != XRT_LAYER_PROJECTION && data->type != XRT_LAYER_PROJECTION_DEPTH) {
+		return;
+	}
+	g_scratch.view_count = data->view_count;
+	for (uint32_t i = 0; i < data->view_count; i++) {
+		const struct xrt_layer_projection_view_data *v = &data->proj.v[i];
+		g_scratch.declared[i].pose = v->pose;
+		g_scratch.declared[i].fov = v->fov;
+		g_scratch.declared[i].subimage.x_pixels = v->sub.rect.offset.w;
+		g_scratch.declared[i].subimage.y_pixels = v->sub.rect.offset.h;
+		g_scratch.declared[i].subimage.width_pixels = v->sub.rect.extent.w;
+		g_scratch.declared[i].subimage.height_pixels = v->sub.rect.extent.h;
+		g_scratch.declared[i].subimage.array_index = v->sub.array_index;
+		g_scratch.declared[i].subimage.image_index = v->sub.image_index;
+	}
+	g_scratch.have_declared = true;
+	copy_display_context(&g_scratch, sess);
+	g_scratch.seq = g_next_seq++;
+	g_scratch.frame_id = (uint64_t)sess->frame_id.begun;
+
+	// Double-buffer publish. Two static slots alternate; we never free.
+	static struct mcp_frame_snapshot a, b;
+	struct mcp_frame_snapshot *cur = atomic_load_explicit(&g_published, memory_order_relaxed);
+	struct mcp_frame_snapshot *next = (cur == &a) ? &b : &a;
+	*next = g_scratch;
+	atomic_store_explicit(&g_published, next, memory_order_release);
 }
 
 void

@@ -27,6 +27,7 @@
 #include "oxr_api_verify.h"
 #include "oxr_handle.h"
 #include "oxr_chain.h"
+#include "oxr_mcp_tools.h"
 
 #ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
 #include "d3d11/comp_d3d11_compositor.h"
@@ -315,6 +316,17 @@ oxr_xrLocateViews(XrSession session,
 	    viewCapacityInput,                   //
 	    viewCountOutput,                     //
 	    views);                              //
+
+	// Cache recommended-view signal for MCP introspection.
+	if (res == XR_SUCCESS && viewCapacityInput > 0 && views != NULL) {
+		uint32_t n = viewCountOutput != NULL ? *viewCountOutput : viewCapacityInput;
+		if (n > viewCapacityInput) {
+			n = viewCapacityInput;
+		}
+		uint64_t t_ns = time_state_ts_to_monotonic_ns(sess->sys->inst->timekeeping,
+		                                              viewLocateInfo->displayTime);
+		oxr_mcp_tools_record_recommended(sess, n, views, t_ns);
+	}
 
 	return res;
 }
