@@ -6,6 +6,8 @@
  * @ingroup aux_util
  */
 
+#include "xrt/xrt_config_os.h"
+
 #include "u_mcp_transport.h"
 #include "util/u_logging.h"
 #include "util/u_misc.h"
@@ -14,18 +16,20 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 #ifndef XRT_OS_WINDOWS
 #include <dirent.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <unistd.h>
 #endif
 
 #define LOG_PFX "[mcp-transport] "
 #define SOCK_PREFIX "/tmp/displayxr-mcp-"
 #define SOCK_SUFFIX ".sock"
+
+#ifndef XRT_OS_WINDOWS
 
 struct u_mcp_listener
 {
@@ -43,8 +47,6 @@ build_sock_path(char *out, size_t cap, pid_t pid)
 {
 	snprintf(out, cap, "%s%ld%s", SOCK_PREFIX, (long)pid, SOCK_SUFFIX);
 }
-
-#ifndef XRT_OS_WINDOWS
 
 struct u_mcp_listener *
 u_mcp_listener_open(pid_t pid)
