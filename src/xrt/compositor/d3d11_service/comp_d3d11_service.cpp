@@ -10895,3 +10895,38 @@ comp_d3d11_service_set_launcher_visible(struct xrt_system_compositor *xsysc, boo
 		InvalidateRect(mc->hwnd, nullptr, FALSE);
 	}
 }
+
+// Apply a named layout preset. Mirrors the Ctrl+1/2/3 hotkey dispatch
+// in the event loop so MCP agents trigger the same code path a user
+// would. Returns false on unknown name or when shell mode is not active.
+bool
+comp_d3d11_service_apply_layout_preset(struct xrt_system_compositor *xsysc,
+                                        const char *preset_name)
+{
+	if (xsysc == nullptr || preset_name == nullptr) {
+		return false;
+	}
+
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	if (mc == nullptr || !sys->shell_mode) {
+		return false;
+	}
+
+	if (strcmp(preset_name, "grid") == 0) {
+		apply_layout(sys, mc, 0);
+	} else if (strcmp(preset_name, "immersive") == 0) {
+		apply_layout(sys, mc, 1);
+	} else if (strcmp(preset_name, "carousel") == 0) {
+		enter_dynamic_layout(sys, mc, 0);
+	} else {
+		return false;
+	}
+
+	if (mc->hwnd != nullptr) {
+		InvalidateRect(mc->hwnd, nullptr, FALSE);
+	}
+	return true;
+}

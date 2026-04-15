@@ -290,6 +290,60 @@ tool_set_window_pose(const cJSON *params, void *userdata)
 }
 
 
+// ---------- set_focus ----------
+
+static cJSON *
+tool_set_focus(const cJSON *params, void *userdata)
+{
+	(void)userdata;
+	struct ipc_server *s = g_ipc_server;
+	uint32_t client_id = 0;
+	if (s == NULL || !extract_client_id(params, &client_id)) {
+		return NULL;
+	}
+
+	// Route through the IPC-layer focus path. This is the same function
+	// the stub at ipc_server_handler.c:set_focused_client now delegates
+	// to, so MCP and IPC stay consistent on semantics.
+	xrt_result_t xret = ipc_server_set_active_client(s, client_id);
+
+	cJSON *r = cJSON_CreateObject();
+	cJSON_AddBoolToObject(r, "ok", xret == XRT_SUCCESS);
+	cJSON_AddNumberToObject(r, "client_id", (double)client_id);
+	return r;
+}
+
+
+// ---------- apply_layout_preset ----------
+
+static cJSON *
+tool_apply_layout_preset(const cJSON *params, void *userdata)
+{
+	(void)userdata;
+	struct ipc_server *s = g_ipc_server;
+	if (s == NULL || params == NULL) {
+		return NULL;
+	}
+	const cJSON *name = cJSON_GetObjectItemCaseSensitive(params, "preset");
+	if (!cJSON_IsString(name) || name->valuestring == NULL) {
+		return NULL;
+	}
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (s->xsysc == NULL) {
+		return NULL;
+	}
+	bool ok = comp_d3d11_service_apply_layout_preset(s->xsysc, name->valuestring);
+	cJSON *r = cJSON_CreateObject();
+	cJSON_AddBoolToObject(r, "ok", ok);
+	cJSON_AddStringToObject(r, "preset", name->valuestring);
+	return r;
+#else
+	return NULL;
+#endif
+}
+
+
 // ---------- registry ----------
 
 static const struct u_mcp_tool TOOL_LIST_WINDOWS = {
@@ -310,6 +364,31 @@ static const struct u_mcp_tool TOOL_GET_WINDOW_POSE = {
         "\"properties\":{\"client_id\":{\"type\":\"integer\"}},"
         "\"additionalProperties\":false}",
     .fn = tool_get_window_pose,
+    .userdata = NULL,
+};
+
+static const struct u_mcp_tool TOOL_SET_FOCUS = {
+    .name = "set_focus",
+    .description =
+        "Focus the specified OpenXR client (promotes to active slot).",
+    .input_schema_json =
+        "{\"type\":\"object\",\"required\":[\"client_id\"],"
+        "\"properties\":{\"client_id\":{\"type\":\"integer\"}},"
+        "\"additionalProperties\":false}",
+    .fn = tool_set_focus,
+    .userdata = NULL,
+};
+
+static const struct u_mcp_tool TOOL_APPLY_LAYOUT_PRESET = {
+    .name = "apply_layout_preset",
+    .description =
+        "Apply a named shell layout preset. Valid names: grid, immersive, carousel.",
+    .input_schema_json =
+        "{\"type\":\"object\",\"required\":[\"preset\"],"
+        "\"properties\":{\"preset\":{\"type\":\"string\","
+        "\"enum\":[\"grid\",\"immersive\",\"carousel\"]}},"
+        "\"additionalProperties\":false}",
+    .fn = tool_apply_layout_preset,
     .userdata = NULL,
 };
 
@@ -339,5 +418,7 @@ ipc_mcp_tools_register(struct ipc_server *s)
 	u_mcp_server_register_tool(&TOOL_LIST_WINDOWS);
 	u_mcp_server_register_tool(&TOOL_GET_WINDOW_POSE);
 	u_mcp_server_register_tool(&TOOL_SET_WINDOW_POSE);
+	u_mcp_server_register_tool(&TOOL_SET_FOCUS);
+	u_mcp_server_register_tool(&TOOL_APPLY_LAYOUT_PRESET);
 	U_LOG_I(LOG_PFX "registered shell tools against ipc_server %p", (void *)s);
 }

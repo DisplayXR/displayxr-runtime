@@ -1916,9 +1916,15 @@ ipc_handle_system_set_primary_client(volatile struct ipc_client_state *_ics, uin
 xrt_result_t
 ipc_handle_system_set_focused_client(volatile struct ipc_client_state *ics, uint32_t client_id)
 {
-	IPC_INFO(ics->server, "UNIMPLEMENTED: system setting focused client to %d.", client_id);
+	struct ipc_server *s = ics->server;
 
-	return XRT_SUCCESS;
+	// Promote the requested client to the active slot. This is the closest
+	// IPC-layer concept to "focused" we have today — the per-client
+	// session_focused bit is then derived by update_server_state_locked()
+	// from the active_client_index, so we reuse that code path rather than
+	// writing the flag directly and going out of sync with the dispatcher.
+	IPC_INFO(s, "System setting focused client to %u", client_id);
+	return ipc_server_set_active_client(s, client_id);
 }
 
 xrt_result_t
