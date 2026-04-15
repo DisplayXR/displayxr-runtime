@@ -1659,7 +1659,7 @@ capture_frame(struct ipc_connection *ipc_c)
 	snprintf(req.path_prefix, sizeof(req.path_prefix),
 	         "%s\\capture_%04d-%02d-%02d_%02d-%02d-%02d",
 	         dir, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
-	req.flags = IPC_CAPTURE_FLAG_ALL;
+	req.flags = IPC_CAPTURE_FLAG_SBS;
 
 	struct ipc_capture_result result = {0};
 	xrt_result_t r = ipc_call_shell_capture_frame(ipc_c, &req, &result);
@@ -1780,8 +1780,8 @@ main(int argc, char *argv[])
 		if (!RegisterHotKey(g_msg_hwnd, HOTKEY_LAUNCH, MOD_CONTROL, 'L')) {
 			PE("Warning: RegisterHotKey(Ctrl+L) failed — launcher hotkey unavailable\n");
 		}
-		if (!RegisterHotKey(g_msg_hwnd, HOTKEY_CAPTURE, MOD_CONTROL | MOD_SHIFT, '3')) {
-			PE("Warning: RegisterHotKey(Ctrl+Shift+3) failed — capture hotkey unavailable\n");
+		if (!RegisterHotKey(g_msg_hwnd, HOTKEY_CAPTURE, MOD_CONTROL | MOD_SHIFT, 'C')) {
+			PE("Warning: RegisterHotKey(Ctrl+Shift+C) failed — capture hotkey unavailable\n");
 		}
 	}
 
@@ -1965,7 +1965,7 @@ main(int argc, char *argv[])
 						}
 					}
 				} else if (msg.message == WM_HOTKEY && msg.wParam == HOTKEY_CAPTURE) {
-					// --- Ctrl+Shift+3: capture pre-weave L/R/SBS frames (Phase 8) ---
+					// --- Ctrl+Shift+C: capture pre-weave SBS frame (Phase 8) ---
 					if (g_shell_active) {
 						capture_frame(&ipc_c);
 					} else {

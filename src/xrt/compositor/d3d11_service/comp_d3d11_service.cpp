@@ -9551,6 +9551,14 @@ comp_d3d11_service_capture_frame(struct xrt_system_compositor *xsysc,
 	const uint32_t atlas_h = desc.Height;
 	const uint32_t tile_columns = sys->tile_columns > 0 ? sys->tile_columns : 1;
 	const uint32_t tile_rows = sys->tile_rows > 0 ? sys->tile_rows : 1;
+	// Dump the atlas as-is. The compositor is supposed to render each tile
+	// into (atlas_w / tile_columns) × (atlas_h / tile_rows) and leave the
+	// rest black. If it's stretching content to fill the whole atlas instead
+	// of respecting the scale hint, that bug surfaces here as a vertically
+	// distorted capture — which is the honest representation of what the
+	// display processor receives.
+	const uint32_t used_w = atlas_w;
+	const uint32_t used_h = atlas_h;
 	const uint32_t eye_w = atlas_w / tile_columns;
 	const uint32_t eye_h = atlas_h / tile_rows;
 
@@ -9578,35 +9586,21 @@ comp_d3d11_service_capture_frame(struct xrt_system_compositor *xsysc,
 	uint32_t views_written = 0;
 
 	if (flags & IPC_CAPTURE_FLAG_SBS) {
+		// Tightly-pack the active top-left region (used_w × used_h) into a
+		// contiguous RGBA8 buffer. Drops the black padding outside the tile
+		// grid and also handles staging RowPitch > used_w*4.
+		std::vector<uint8_t> buf((size_t)used_w * used_h * 4u);
+		const uint8_t *src = static_cast<const uint8_t *>(m.pData);
+		for (uint32_t y = 0; y < used_h; y++) {
+			memcpy(buf.data() + (size_t)y * used_w * 4u,
+			       src + (size_t)y * m.RowPitch,
+			       (size_t)used_w * 4u);
+		}
 		char path[MAX_PATH];
 		snprintf(path, sizeof(path), "%s_sbs.png", path_prefix);
-		if (stbi_write_png(path, (int)atlas_w, (int)atlas_h, 4,
-		                   m.pData, (int)m.RowPitch) != 0) {
+		if (stbi_write_png(path, (int)used_w, (int)used_h, 4,
+		                   buf.data(), (int)(used_w * 4u)) != 0) {
 			views_written |= IPC_CAPTURE_FLAG_SBS;
-		} else {
-			U_LOG_W("capture_frame: stbi_write_png failed for %s", path);
-		}
-	}
-
-	for (int eye = 0; eye < 2; eye++) {
-		uint32_t flag = (eye == 0) ? IPC_CAPTURE_FLAG_LEFT : IPC_CAPTURE_FLAG_RIGHT;
-		if (!(flags & flag)) {
-			continue;
-		}
-		// In mono (tile_columns == 1) both L and R map to the same full-frame.
-		const uint32_t eye_x = (tile_columns > 1 ? (uint32_t)eye : 0u) * eye_w;
-		std::vector<uint8_t> buf((size_t)eye_w * eye_h * 4u);
-		const uint8_t *src = static_cast<const uint8_t *>(m.pData);
-		for (uint32_t y = 0; y < eye_h; y++) {
-			memcpy(buf.data() + (size_t)y * eye_w * 4u,
-			       src + (size_t)y * m.RowPitch + (size_t)eye_x * 4u,
-			       (size_t)eye_w * 4u);
-		}
-		char path[MAX_PATH];
-		snprintf(path, sizeof(path), "%s_%c.png", path_prefix, eye == 0 ? 'L' : 'R');
-		if (stbi_write_png(path, (int)eye_w, (int)eye_h, 4,
-		                   buf.data(), (int)(eye_w * 4u)) != 0) {
-			views_written |= flag;
 		} else {
 			U_LOG_W("capture_frame: stbi_write_png failed for %s", path);
 		}
@@ -9614,10 +9608,11 @@ comp_d3d11_service_capture_frame(struct xrt_system_compositor *xsysc,
 
 	sys->context->Unmap(staging.get(), 0);
 
-	// Populate metadata.
+	// Populate metadata. atlas_width/height report the cropped active region
+	// (what was actually written to disk), not the full-display staging size.
 	out_result->timestamp_ns = os_monotonic_get_ns();
-	out_result->atlas_width = atlas_w;
-	out_result->atlas_height = atlas_h;
+	out_result->atlas_width = used_w;
+	out_result->atlas_height = used_h;
 	out_result->eye_width = eye_w;
 	out_result->eye_height = eye_h;
 	out_result->views_written = views_written;
@@ -9636,8 +9631,8 @@ comp_d3d11_service_capture_frame(struct xrt_system_compositor *xsysc,
 		out_result->eye_right_m[2] = re.z;
 	}
 
-	U_LOG_W("capture_frame: prefix=%s flags=0x%x written=0x%x atlas=%ux%u eye=%ux%u",
-	        path_prefix, flags, views_written, atlas_w, atlas_h, eye_w, eye_h);
+	U_LOG_W("capture_frame: prefix=%s flags=0x%x written=0x%x used=%ux%u (atlas=%ux%u) eye=%ux%u",
+	        path_prefix, flags, views_written, used_w, used_h, atlas_w, atlas_h, eye_w, eye_h);
 
 	return views_written != 0;
 }
