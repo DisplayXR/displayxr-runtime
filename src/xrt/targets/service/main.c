@@ -14,6 +14,7 @@
 #include "util/u_metrics.h"
 #include "util/u_logging.h"
 #include "util/u_trace_marker.h"
+#include "util/u_mcp_server.h"
 
 #ifdef XRT_OS_WINDOWS
 #include "util/u_windows.h"
@@ -106,7 +107,14 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 	    .shell_mode = shell_mode,
 	};
 
+	// Opt-in MCP server for agent-driven shell control / debugging.
+	// Gated on DISPLAYXR_MCP env var; binds a well-known "service"
+	// socket so the adapter can discover it by role, not PID.
+	u_mcp_server_maybe_start_named("service");
+
 	int ret = ipc_server_main(argc, argv, &ismi);
+
+	u_mcp_server_stop();
 
 	u_metrics_close();
 
@@ -142,7 +150,14 @@ main(int argc, char *argv[])
 	    .shell_mode = shell_mode,
 	};
 
+	// Opt-in MCP server for agent-driven shell control / debugging.
+	// Gated on DISPLAYXR_MCP env var; binds a well-known "service"
+	// socket so the adapter can discover it by role, not PID.
+	u_mcp_server_maybe_start_named("service");
+
 	int ret = ipc_server_main(argc, argv, &ismi);
+
+	u_mcp_server_stop();
 
 	u_metrics_close();
 

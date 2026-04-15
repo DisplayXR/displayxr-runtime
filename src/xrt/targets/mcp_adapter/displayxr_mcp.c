@@ -59,10 +59,12 @@ static void
 usage(const char *argv0)
 {
 	fprintf(stderr,
-	        "usage: %s --pid <N|auto> | --list\n"
-	        "  --pid N     attach to a specific runtime process\n"
-	        "  --pid auto  attach iff exactly one MCP session exists\n"
-	        "  --list      print discovered sessions and exit\n",
+	        "usage: %s [--target <auto|service|pid:N>] | --pid <N|auto> | --list\n"
+	        "  --target auto      try service socket, then unique PID session (default)\n"
+	        "  --target service   attach to the displayxr-service MCP endpoint\n"
+	        "  --target pid:N     attach to a specific runtime process\n"
+	        "  --pid N | auto     back-compat form of --target pid:N / --target auto\n"
+	        "  --list             print discovered sessions and exit\n",
 	        argv0);
 }
 
@@ -115,11 +117,21 @@ main(int argc, char **argv)
 	_setmode(_fileno(stdout), _O_BINARY);
 #endif
 
-	const char *pid_arg = NULL;
+	const char *target_arg = NULL; // "auto", "service", or "pid:N"
 	bool list_mode = false;
 	for (int i = 1; i < argc; i++) {
-		if (strcmp(argv[i], "--pid") == 0 && i + 1 < argc) {
-			pid_arg = argv[++i];
+		if (strcmp(argv[i], "--target") == 0 && i + 1 < argc) {
+			target_arg = argv[++i];
+		} else if (strcmp(argv[i], "--pid") == 0 && i + 1 < argc) {
+			// Back-compat: --pid N → --target pid:N ; --pid auto → --target auto.
+			const char *v = argv[++i];
+			static char buf[64];
+			if (strcmp(v, "auto") == 0) {
+				target_arg = "auto";
+			} else {
+				snprintf(buf, sizeof(buf), "pid:%s", v);
+				target_arg = buf;
+			}
 		} else if (strcmp(argv[i], "--list") == 0) {
 			list_mode = true;
 		} else {
@@ -131,41 +143,68 @@ main(int argc, char **argv)
 	if (list_mode) {
 		long pids[64];
 		size_t n = u_mcp_enumerate_sessions(pids, 64);
+		// Report the service endpoint too if the socket/pipe exists. A
+		// trial connect is the cheapest cross-platform probe.
+		struct u_mcp_conn *probe = u_mcp_conn_connect_named("service");
+		if (probe != NULL) {
+			printf("service\n");
+			u_mcp_conn_close(probe);
+		}
 		for (size_t i = 0; i < n; i++) {
 			printf("%ld\n", (long)pids[i]);
 		}
 		return 0;
 	}
 
-	if (pid_arg == NULL) {
-		usage(argv[0]);
-		return 2;
+	if (target_arg == NULL) {
+		target_arg = "auto";
 	}
 
-	long pid = 0;
-	if (strcmp(pid_arg, "auto") == 0) {
-		long pids[64];
-		size_t n = u_mcp_enumerate_sessions(pids, 64);
-		if (n == 0) {
-			fprintf(stderr, "displayxr-mcp: no running MCP sessions found\n");
-			return 1;
-		}
-		if (n > 1) {
-			fprintf(stderr, "displayxr-mcp: %zu sessions found, pass --pid <N> explicitly\n", n);
-			return 1;
-		}
-		pid = pids[0];
-	} else {
-		pid = (long)strtol(pid_arg, NULL, 10);
+	struct u_mcp_conn *conn = NULL;
+	const char *connected_label = NULL;
+
+	if (strcmp(target_arg, "service") == 0) {
+		conn = u_mcp_conn_connect_named("service");
+		connected_label = "service";
+	} else if (strncmp(target_arg, "pid:", 4) == 0) {
+		long pid = (long)strtol(target_arg + 4, NULL, 10);
 		if (pid <= 0) {
 			usage(argv[0]);
 			return 2;
 		}
+		conn = u_mcp_conn_connect(pid);
+		static char buf[32];
+		snprintf(buf, sizeof(buf), "pid %ld", pid);
+		connected_label = buf;
+	} else if (strcmp(target_arg, "auto") == 0) {
+		// Service first — covers the Phase B shell story.
+		conn = u_mcp_conn_connect_named("service");
+		if (conn != NULL) {
+			connected_label = "service";
+		} else {
+			// Fall back to a unique handle-app session.
+			long pids[64];
+			size_t n = u_mcp_enumerate_sessions(pids, 64);
+			if (n == 0) {
+				fprintf(stderr, "displayxr-mcp: no running MCP sessions found\n");
+				return 1;
+			}
+			if (n > 1) {
+				fprintf(stderr, "displayxr-mcp: %zu sessions found, pass --target pid:N explicitly\n", n);
+				return 1;
+			}
+			conn = u_mcp_conn_connect(pids[0]);
+			static char buf[32];
+			snprintf(buf, sizeof(buf), "pid %ld", pids[0]);
+			connected_label = buf;
+		}
+	} else {
+		usage(argv[0]);
+		return 2;
 	}
 
-	struct u_mcp_conn *conn = u_mcp_conn_connect(pid);
 	if (conn == NULL) {
-		fprintf(stderr, "displayxr-mcp: cannot connect to pid %ld\n", (long)pid);
+		fprintf(stderr, "displayxr-mcp: cannot connect to %s\n", connected_label ? connected_label : target_arg);
 		return 1;
 	}
 

@@ -37,6 +37,20 @@ struct u_mcp_listener *
 u_mcp_listener_open(long pid);
 
 /*!
+ * Bind a well-known named listener. Returns NULL on failure.
+ *
+ * Intended for singleton endpoints like @c "service" where the PID is
+ * not a stable identifier for adapters. On POSIX this creates
+ * `/tmp/displayxr-mcp-<role>.sock` with 0600 perms; on Windows the
+ * pipe is `\\.\pipe\displayxr-mcp-<role>`.
+ *
+ * @p role must be a short, PID-unambiguous string (non-numeric) — callers
+ * must not pass names that could collide with enumerated PID sessions.
+ */
+struct u_mcp_listener *
+u_mcp_listener_open_named(const char *role);
+
+/*!
  * Accept one connection. Blocks. Returns NULL when the listener is closed
  * (u_mcp_listener_close from another thread wakes us via shutdown()).
  */
@@ -72,6 +86,12 @@ u_mcp_conn_close(struct u_mcp_conn *conn);
  */
 struct u_mcp_conn *
 u_mcp_conn_connect(long pid);
+
+/*!
+ * Connect to a well-known named listener (e.g. @c "service").
+ */
+struct u_mcp_conn *
+u_mcp_conn_connect_named(const char *role);
 
 /*!
  * Raw fd / handle for poll()-style multiplexing by the adapter.

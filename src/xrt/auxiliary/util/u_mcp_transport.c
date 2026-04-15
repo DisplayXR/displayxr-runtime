@@ -54,14 +54,20 @@ build_sock_path(char *out, size_t cap, long pid)
 	snprintf(out, cap, "%s%ld%s", SOCK_PREFIX, (long)pid, SOCK_SUFFIX);
 }
 
-struct u_mcp_listener *
-u_mcp_listener_open(long pid)
+static void
+build_sock_path_named(char *out, size_t cap, const char *role)
+{
+	snprintf(out, cap, "%s%s%s", SOCK_PREFIX, role, SOCK_SUFFIX);
+}
+
+static struct u_mcp_listener *
+listener_open_path(const char *path)
 {
 	struct u_mcp_listener *l = U_TYPED_CALLOC(struct u_mcp_listener);
 	l->fd = -1;
-	build_sock_path(l->path, sizeof(l->path), pid);
+	snprintf(l->path, sizeof(l->path), "%s", path);
 
-	// Always unlink any stale socket; we own /tmp/displayxr-mcp-<pid>.sock.
+	// Always unlink any stale socket; we own the named path.
 	(void)unlink(l->path);
 
 	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -82,7 +88,6 @@ u_mcp_listener_open(long pid)
 		return NULL;
 	}
 
-	// Owner-only access.
 	(void)chmod(l->path, 0600);
 
 	if (listen(fd, 4) != 0) {
@@ -96,6 +101,25 @@ u_mcp_listener_open(long pid)
 	l->fd = fd;
 	U_LOG_I(LOG_PFX "listening on %s", l->path);
 	return l;
+}
+
+struct u_mcp_listener *
+u_mcp_listener_open(long pid)
+{
+	char path[128];
+	build_sock_path(path, sizeof(path), pid);
+	return listener_open_path(path);
+}
+
+struct u_mcp_listener *
+u_mcp_listener_open_named(const char *role)
+{
+	if (role == NULL || role[0] == '\0') {
+		return NULL;
+	}
+	char path[128];
+	build_sock_path_named(path, sizeof(path), role);
+	return listener_open_path(path);
 }
 
 struct u_mcp_conn *
@@ -188,8 +212,8 @@ u_mcp_conn_fd(struct u_mcp_conn *conn)
 	return conn != NULL ? conn->fd : -1;
 }
 
-struct u_mcp_conn *
-u_mcp_conn_connect(long pid)
+static struct u_mcp_conn *
+conn_connect_path(const char *path)
 {
 	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (fd < 0) {
@@ -197,7 +221,7 @@ u_mcp_conn_connect(long pid)
 	}
 	struct sockaddr_un addr = {0};
 	addr.sun_family = AF_UNIX;
-	build_sock_path(addr.sun_path, sizeof(addr.sun_path), pid);
+	snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
 	if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
 		close(fd);
 		return NULL;
@@ -205,6 +229,25 @@ u_mcp_conn_connect(long pid)
 	struct u_mcp_conn *c = U_TYPED_CALLOC(struct u_mcp_conn);
 	c->fd = fd;
 	return c;
+}
+
+struct u_mcp_conn *
+u_mcp_conn_connect(long pid)
+{
+	char path[128];
+	build_sock_path(path, sizeof(path), pid);
+	return conn_connect_path(path);
+}
+
+struct u_mcp_conn *
+u_mcp_conn_connect_named(const char *role)
+{
+	if (role == NULL || role[0] == '\0') {
+		return NULL;
+	}
+	char path[128];
+	build_sock_path_named(path, sizeof(path), role);
+	return conn_connect_path(path);
 }
 
 size_t
@@ -278,6 +321,42 @@ static void
 build_pipe_name(char *out, size_t cap, long pid)
 {
 	snprintf(out, cap, PIPE_PREFIX "%ld", (long)pid);
+}
+
+static void
+build_pipe_name_named(char *out, size_t cap, const char *role)
+{
+	snprintf(out, cap, PIPE_PREFIX "%s", role);
+}
+
+static struct u_mcp_listener *
+listener_open_pipe_name(const char *name)
+{
+	struct u_mcp_listener *l = U_TYPED_CALLOC(struct u_mcp_listener);
+	snprintf(l->name, sizeof(l->name), "%s", name);
+	l->pipe = CreateNamedPipeA(
+	    l->name,
+	    PIPE_ACCESS_DUPLEX,
+	    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+	    1, 65536, 65536, 0, NULL);
+	if (l->pipe == INVALID_HANDLE_VALUE) {
+		U_LOG_W(LOG_PFX "CreateNamedPipe(%s) failed: %lu", l->name, GetLastError());
+		free(l);
+		return NULL;
+	}
+	U_LOG_I(LOG_PFX "listening on %s", l->name);
+	return l;
+}
+
+struct u_mcp_listener *
+u_mcp_listener_open_named(const char *role)
+{
+	if (role == NULL || role[0] == '\0') {
+		return NULL;
+	}
+	char name[128];
+	build_pipe_name_named(name, sizeof(name), role);
+	return listener_open_pipe_name(name);
 }
 
 struct u_mcp_listener *
@@ -392,11 +471,9 @@ u_mcp_conn_fd(struct u_mcp_conn *conn)
 	return -1; // Windows clients cannot poll() a pipe HANDLE; adapter uses threads.
 }
 
-struct u_mcp_conn *
-u_mcp_conn_connect(long pid)
+static struct u_mcp_conn *
+conn_connect_pipe_name(const char *name)
 {
-	char name[128];
-	build_pipe_name(name, sizeof(name), pid);
 	HANDLE h = CreateFileA(name, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
 	if (h == INVALID_HANDLE_VALUE) {
 		return NULL;
@@ -407,6 +484,25 @@ u_mcp_conn_connect(long pid)
 	c->pipe = h;
 	c->owns_handle = true;
 	return c;
+}
+
+struct u_mcp_conn *
+u_mcp_conn_connect(long pid)
+{
+	char name[128];
+	build_pipe_name(name, sizeof(name), pid);
+	return conn_connect_pipe_name(name);
+}
+
+struct u_mcp_conn *
+u_mcp_conn_connect_named(const char *role)
+{
+	if (role == NULL || role[0] == '\0') {
+		return NULL;
+	}
+	char name[128];
+	build_pipe_name_named(name, sizeof(name), role);
+	return conn_connect_pipe_name(name);
 }
 
 size_t

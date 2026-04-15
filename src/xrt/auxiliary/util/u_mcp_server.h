@@ -46,12 +46,25 @@ struct u_mcp_tool
 };
 
 /*!
- * Start the server if @c DISPLAYXR_MCP is set. Idempotent no-op if
- * already running or env var unset. Best-effort: failure logs U_LOG_W
- * and returns without aborting instance creation.
+ * Start the server if @c DISPLAYXR_MCP is set, bound to a per-PID socket.
+ * Idempotent no-op if already running or env var unset. Best-effort:
+ * failure logs U_LOG_W and returns without aborting instance creation.
+ *
+ * Used by handle apps that link @c libopenxr_displayxr in-process.
  */
 void
 u_mcp_server_maybe_start(void);
+
+/*!
+ * Start the server if @c DISPLAYXR_MCP is set, bound to a well-known
+ * named socket (`/tmp/displayxr-mcp-<role>.sock` on POSIX,
+ * `\\.\pipe\displayxr-mcp-<role>` on Windows). Idempotent.
+ *
+ * Used by singleton processes like @c displayxr-service where the adapter
+ * should be able to discover the endpoint by role rather than PID.
+ */
+void
+u_mcp_server_maybe_start_named(const char *role);
 
 /*!
  * Stop the server (joins the thread, unlinks the socket). Safe to call
