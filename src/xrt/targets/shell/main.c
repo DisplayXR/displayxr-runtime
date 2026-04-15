@@ -1608,14 +1608,8 @@ capture_write_sidecar(const char *json_path, const struct ipc_capture_result *r)
 	cJSON_AddItemToArray(re, cJSON_CreateNumber(r->eye_right_m[2]));
 
 	cJSON *views = cJSON_AddArrayToObject(root, "views_written");
-	if (r->views_written & IPC_CAPTURE_FLAG_SBS) {
-		cJSON_AddItemToArray(views, cJSON_CreateString("sbs"));
-	}
-	if (r->views_written & IPC_CAPTURE_FLAG_LEFT) {
-		cJSON_AddItemToArray(views, cJSON_CreateString("L"));
-	}
-	if (r->views_written & IPC_CAPTURE_FLAG_RIGHT) {
-		cJSON_AddItemToArray(views, cJSON_CreateString("R"));
+	if (r->views_written & IPC_CAPTURE_FLAG_ATLAS) {
+		cJSON_AddItemToArray(views, cJSON_CreateString("atlas"));
 	}
 
 	char *text = cJSON_Print(root);
@@ -1659,7 +1653,7 @@ capture_frame(struct ipc_connection *ipc_c)
 	snprintf(req.path_prefix, sizeof(req.path_prefix),
 	         "%s\\capture_%04d-%02d-%02d_%02d-%02d-%02d",
 	         dir, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
-	req.flags = IPC_CAPTURE_FLAG_SBS;
+	req.flags = IPC_CAPTURE_FLAG_ATLAS;
 
 	struct ipc_capture_result result = {0};
 	xrt_result_t r = ipc_call_shell_capture_frame(ipc_c, &req, &result);

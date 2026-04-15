@@ -363,14 +363,13 @@ void
 comp_d3d11_service_set_running_tile_mask(struct xrt_system_compositor *xsysc, uint64_t mask);
 
 /*!
- * Phase 8: capture the current pre-weave combined atlas to disk. Writes one
- * or more PNGs (full SBS, left-eye crop, right-eye crop) depending on
- * @p flags, and fills @p out_result with metadata for the shell's sidecar
- * JSON file.
+ * Phase 8: capture the current pre-weave combined atlas to disk. Writes a
+ * PNG of the full multi-view atlas (cropped to the active region in non-
+ * legacy sessions) and fills @p out_result with metadata for the shell's
+ * sidecar JSON file.
  *
- * The runtime appends @c "_sbs.png", @c "_L.png", @c "_R.png" to
- * @p path_prefix as needed. Caller owns the prefix string and the result
- * struct.
+ * The runtime appends @c "_atlas.png" to @p path_prefix. Caller owns the
+ * prefix string and the result struct.
  *
  * Must be called while the multi-compositor render mutex is held by this
  * thread, OR from a thread that does not hold the lock (this function takes
