@@ -862,6 +862,39 @@ sync_tile_layout(struct d3d11_service_system *sys)
 }
 
 /*!
+ * Resolve per-view tile dimensions for layout / DP handoff / capture.
+ *
+ * Non-legacy sessions (shell + display-info-aware apps) use the true vendor
+ * scale from the active rendering mode — for stereo on 4K this is 1920×1080
+ * per view. Legacy sessions fall back to the system's compromise dims
+ * (display / tile count), preserving existing behavior for apps that aren't
+ * XR_EXT_display_info aware. Issue #158.
+ */
+static inline void
+resolve_active_view_dims(const struct d3d11_service_system *sys,
+                         uint32_t fallback_w, uint32_t fallback_h,
+                         uint32_t *out_vw, uint32_t *out_vh)
+{
+	uint32_t vw = 0, vh = 0;
+	if (!sys->base.info.legacy_app_tile_scaling &&
+	    sys->xdev != NULL && sys->xdev->hmd != NULL) {
+		uint32_t idx = sys->xdev->hmd->active_rendering_mode_index;
+		if (idx < sys->xdev->rendering_mode_count) {
+			vw = sys->xdev->rendering_modes[idx].view_width_pixels;
+			vh = sys->xdev->rendering_modes[idx].view_height_pixels;
+		}
+	}
+	if (vw == 0 || vh == 0) {
+		uint32_t tc = sys->tile_columns > 0 ? sys->tile_columns : 1;
+		uint32_t tr = sys->tile_rows > 0 ? sys->tile_rows : 1;
+		vw = fallback_w / tc;
+		vh = fallback_h / tr;
+	}
+	*out_vw = vw;
+	*out_vh = vh;
+}
+
+/*!
  * Check if a DXGI format is an SRGB format.
  */
 static inline bool
@@ -6442,8 +6475,8 @@ after_key_shortcuts:
 		if (ca_w == 0) ca_w = 3840;
 		if (ca_h == 0) ca_h = 2160;
 		uint32_t num_views = sys->tile_columns * sys->tile_rows;
-		uint32_t half_w = ca_w / sys->tile_columns;
-		uint32_t half_h = ca_h / sys->tile_rows;
+		uint32_t half_w, half_h;
+		resolve_active_view_dims(sys, ca_w, ca_h, &half_w, &half_h);
 		float scale = 3.0f;
 		float gh = (float)mc->font_glyph_h * scale;
 		const char *hint = "Press Ctrl+L to open launcher";
@@ -6585,8 +6618,11 @@ after_key_shortcuts:
 		uint32_t ca_h = sys->base.info.display_pixel_height;
 		if (ca_w == 0) ca_w = 3840;
 		if (ca_h == 0) ca_h = 2160;
-		uint32_t half_w = ca_w / sys->tile_columns;
-		uint32_t half_h = ca_h / sys->tile_rows;
+		// Tile layout dims: non-legacy sessions use the true per-view dims
+		// (e.g. 1920×1080 stereo), legacy uses the atlas-divided compromise.
+		// Issue #158.
+		uint32_t half_w, half_h;
+		resolve_active_view_dims(sys, ca_w, ca_h, &half_w, &half_h);
 
 		// Per-eye projected pixel rects (parallax shift for windows at Z != 0).
 		int32_t eye_rect_x[2], eye_rect_y[2], eye_rect_w[2], eye_rect_h[2];
@@ -7109,8 +7145,8 @@ after_key_shortcuts:
 			uint32_t ca_h = sys->base.info.display_pixel_height;
 			if (ca_w == 0) ca_w = 3840;
 			if (ca_h == 0) ca_h = 2160;
-			uint32_t half_w = ca_w / sys->tile_columns;
-			uint32_t half_h = ca_h / sys->tile_rows;
+			uint32_t half_w, half_h;
+			resolve_active_view_dims(sys, ca_w, ca_h, &half_w, &half_h);
 
 			float tb_y = (float)(ca_h - TASKBAR_HEIGHT_PX);
 
@@ -7269,8 +7305,8 @@ after_key_shortcuts:
 		uint32_t ca_h = sys->base.info.display_pixel_height;
 		if (ca_w == 0) ca_w = 3840;
 		if (ca_h == 0) ca_h = 2160;
-		uint32_t half_w = ca_w / sys->tile_columns;
-		uint32_t half_h = ca_h / sys->tile_rows;
+		uint32_t half_w, half_h;
+		resolve_active_view_dims(sys, ca_w, ca_h, &half_w, &half_h);
 		uint32_t num_views = sys->tile_columns * sys->tile_rows;
 
 		// Panel size as a fraction of the physical display — resolution-
@@ -7302,8 +7338,11 @@ after_key_shortcuts:
 		// Physically square tiles: X pixels are wider than Y pixels in
 		// SBS mode (1920 pixels span 0.700m but 2160 span 0.394m).
 		// Scale tile_h so each tile is the same physical width and height.
-		uint32_t tpw = sys->base.info.display_pixel_width / sys->tile_columns;
-		uint32_t tph = sys->base.info.display_pixel_height / sys->tile_rows;
+		uint32_t tpw, tph;
+		resolve_active_view_dims(sys,
+		                         sys->base.info.display_pixel_width,
+		                         sys->base.info.display_pixel_height,
+		                         &tpw, &tph);
 		float pix_ratio = (tpw > 0 && tph > 0 && disp_w_m > 0 && disp_h_m > 0)
 		    ? ((disp_w_m / (float)tpw) / (disp_h_m / (float)tph))
 		    : 1.0f;
@@ -7842,15 +7881,17 @@ after_key_shortcuts:
 
 	// Send full combined atlas to DP — content is placed at sub-rect positions,
 	// background is dark gray. The DP interlaces the entire image.
-	// View width/height = full atlas divided by tile layout (not sub-rect).
+	// Non-legacy sessions use true per-view dims from the active rendering mode
+	// (e.g. 1920×1080 per view in stereo SBS, not 1920×2160). Legacy sessions
+	// keep the atlas-divided size so compromise-scaled submissions aren't cropped.
+	// Issue #158.
 	ID3D11ShaderResourceView *dp_input_srv = mc->combined_atlas_srv.get();
 	{
 		uint32_t aw = sys->base.info.display_pixel_width;
 		uint32_t ah = sys->base.info.display_pixel_height;
 		if (aw == 0) aw = sys->display_width;
 		if (ah == 0) ah = sys->display_height;
-		dp_view_w = aw / sys->tile_columns;
-		dp_view_h = ah / sys->tile_rows;
+		resolve_active_view_dims(sys, aw, ah, &dp_view_w, &dp_view_h);
 	}
 	uint32_t content_w = sys->tile_columns * dp_view_w;
 	uint32_t content_h = sys->tile_rows * dp_view_h;
@@ -9551,16 +9592,16 @@ comp_d3d11_service_capture_frame(struct xrt_system_compositor *xsysc,
 	const uint32_t atlas_h = desc.Height;
 	const uint32_t tile_columns = sys->tile_columns > 0 ? sys->tile_columns : 1;
 	const uint32_t tile_rows = sys->tile_rows > 0 ? sys->tile_rows : 1;
-	// Dump the atlas as-is. The compositor is supposed to render each tile
-	// into (atlas_w / tile_columns) × (atlas_h / tile_rows) and leave the
-	// rest black. If it's stretching content to fill the whole atlas instead
-	// of respecting the scale hint, that bug surfaces here as a vertically
-	// distorted capture — which is the honest representation of what the
-	// display processor receives.
-	const uint32_t used_w = atlas_w;
-	const uint32_t used_h = atlas_h;
-	const uint32_t eye_w = atlas_w / tile_columns;
-	const uint32_t eye_h = atlas_h / tile_rows;
+	// Crop to the active region: in non-legacy sessions each view occupies
+	// view_width_pixels × view_height_pixels in the top-left of its tile
+	// (e.g. 1920×1080 per eye in stereo SBS on 4K, leaving the rest black).
+	// Legacy sessions use the full tile. Issue #158.
+	uint32_t eye_w_res, eye_h_res;
+	resolve_active_view_dims(sys, atlas_w, atlas_h, &eye_w_res, &eye_h_res);
+	const uint32_t eye_w = eye_w_res;
+	const uint32_t eye_h = eye_h_res;
+	const uint32_t used_w = eye_w * tile_columns;
+	const uint32_t used_h = eye_h * tile_rows;
 
 	// Create CPU-readable staging texture and copy atlas into it.
 	D3D11_TEXTURE2D_DESC sd = desc;
