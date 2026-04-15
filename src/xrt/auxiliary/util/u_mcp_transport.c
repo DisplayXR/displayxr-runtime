@@ -458,8 +458,16 @@ u_mcp_conn_close(struct u_mcp_conn *conn)
 	if (conn == NULL) {
 		return;
 	}
-	if (conn->owns_handle && conn->pipe != INVALID_HANDLE_VALUE) {
-		CloseHandle(conn->pipe);
+	if (conn->pipe != INVALID_HANDLE_VALUE) {
+		if (conn->owns_handle) {
+			CloseHandle(conn->pipe);
+		} else {
+			// Listener-owned pipe: reset it for the next ConnectNamedPipe.
+			// Windows requires DisconnectNamedPipe between clients when
+			// nMaxInstances=1, otherwise subsequent CreateFile calls time
+			// out with ERROR_SEM_TIMEOUT.
+			DisconnectNamedPipe(conn->pipe);
+		}
 	}
 	free(conn);
 }
