@@ -8,6 +8,7 @@
  */
 
 #include "util/u_debug.h"
+#include "util/u_logging.h"
 #include "util/u_misc.h"
 
 #include "oxr_chain.h"
@@ -184,23 +185,37 @@ oxr_swapchain_common_acquire(struct oxr_logger *log, struct oxr_swapchain *sc, u
 {
 	uint32_t index;
 
+	U_LOG_W("[#151] oxr acquire: sc=%p image_count=%u acquired.num=%u is_static=%d released.yes=%d",
+	        (void *)sc, sc->swapchain ? sc->swapchain->image_count : 0,
+	        sc->acquired.num, (int)sc->is_static, (int)sc->released.yes);
+
 	if (sc->acquired.num >= sc->swapchain->image_count) {
+		U_LOG_W("[#151] oxr acquire FAIL: all images acquired (num=%u count=%u) -> CALL_ORDER_INVALID",
+		        sc->acquired.num, sc->swapchain->image_count);
 		return oxr_error(log, XR_ERROR_CALL_ORDER_INVALID, "All images have been acquired");
 	}
 
 	if (sc->is_static && (sc->released.yes || sc->images[0].state != OXR_IMAGE_STATE_READY)) {
+		U_LOG_W("[#151] oxr acquire FAIL: static sc, released=%d state0=%d -> CALL_ORDER_INVALID",
+		        (int)sc->released.yes, (int)sc->images[0].state);
 		return oxr_error(log, XR_ERROR_CALL_ORDER_INVALID, "Can only acquire once on a static swapchain");
 	}
 
 	struct xrt_swapchain *xsc = (struct xrt_swapchain *)sc->swapchain;
 
 	xrt_result_t xret = xrt_swapchain_acquire_image(xsc, &index);
+	if (xret != XRT_SUCCESS) {
+		U_LOG_W("[#151] oxr acquire FAIL: xrt_swapchain_acquire_image xret=%d", (int)xret);
+	}
 	OXR_CHECK_XRET(log, sc->sess, xret, xrt_swapchain_acquire_image);
 
 	if (sc->images[index].state != OXR_IMAGE_STATE_READY) {
+		U_LOG_W("[#151] oxr acquire FAIL: image[%u].state=%d != READY(%d) -> RUNTIME_FAILURE",
+		        index, (int)sc->images[index].state, (int)OXR_IMAGE_STATE_READY);
 		return oxr_error(log, XR_ERROR_RUNTIME_FAILURE,
 		                 "Internal xrt_swapchain_acquire_image call returned non-ready image.");
 	}
+	U_LOG_W("[#151] oxr acquire OK: index=%u", index);
 
 	sc->acquired.num++;
 	u_index_fifo_push(&sc->acquired.fifo, index);
