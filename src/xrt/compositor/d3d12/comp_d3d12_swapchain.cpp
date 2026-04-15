@@ -47,15 +47,17 @@ struct comp_d3d12_swapchain
 	//! Creation info.
 	struct xrt_swapchain_create_info info;
 
-	//! Currently acquired image index (-1 if none).
-	int32_t acquired_index;
+	//! Per-image state for multi-acquire tracking (#151).
+	//! 0 = FREE, 1 = ACQUIRED, 2 = WAITED.
+	uint8_t img_state[MAX_SWAPCHAIN_IMAGES];
 
-	//! Currently waited image index (-1 if none).
-	int32_t waited_index;
-
-	//! Last released image index (for round-robin).
-	uint32_t last_released_index;
+	//! Round-robin hint for next acquire.
+	uint32_t next_hint;
 };
+
+static constexpr uint8_t IMG_FREE = 0;
+static constexpr uint8_t IMG_ACQUIRED = 1;
+static constexpr uint8_t IMG_WAITED = 2;
 
 // Access compositor internals
 extern "C" {
@@ -128,17 +130,19 @@ d3d12_swapchain_acquire_image(struct xrt_swapchain *xsc, uint32_t *out_index)
 {
 	struct comp_d3d12_swapchain *sc = d3d12_sc(xsc);
 
-	if (sc->acquired_index >= 0) {
-		U_LOG_E("Image already acquired");
-		return XRT_ERROR_IPC_FAILURE;
+	// Find a FREE image starting from next_hint (#151: support multiple outstanding acquires).
+	for (uint32_t offset = 0; offset < sc->image_count; offset++) {
+		uint32_t idx = (sc->next_hint + offset) % sc->image_count;
+		if (sc->img_state[idx] == IMG_FREE) {
+			sc->img_state[idx] = IMG_ACQUIRED;
+			sc->next_hint = (idx + 1) % sc->image_count;
+			*out_index = idx;
+			return XRT_SUCCESS;
+		}
 	}
 
-	uint32_t index = (sc->last_released_index + 1) % sc->image_count;
-
-	sc->acquired_index = static_cast<int32_t>(index);
-	*out_index = index;
-
-	return XRT_SUCCESS;
+	U_LOG_E("No FREE swapchain image available (all %u acquired/waited)", sc->image_count);
+	return XRT_ERROR_IPC_FAILURE;
 }
 
 static xrt_result_t
@@ -147,19 +151,13 @@ d3d12_swapchain_wait_image(struct xrt_swapchain *xsc, int64_t timeout_ns, uint32
 	struct comp_d3d12_swapchain *sc = d3d12_sc(xsc);
 	(void)timeout_ns;
 
-	if (sc->acquired_index < 0) {
-		U_LOG_E("No image acquired");
+	if (index >= sc->image_count || sc->img_state[index] != IMG_ACQUIRED) {
+		U_LOG_E("Wait on non-acquired image index %u (state=%u)", index,
+		        index < sc->image_count ? sc->img_state[index] : 0xff);
 		return XRT_ERROR_IPC_FAILURE;
 	}
 
-	if (static_cast<uint32_t>(sc->acquired_index) != index) {
-		U_LOG_E("Wait index %u doesn't match acquired index %d", index, sc->acquired_index);
-		return XRT_ERROR_IPC_FAILURE;
-	}
-
-	sc->waited_index = sc->acquired_index;
-	sc->acquired_index = -1;
-
+	sc->img_state[index] = IMG_WAITED;
 	return XRT_SUCCESS;
 }
 
@@ -179,19 +177,13 @@ d3d12_swapchain_release_image(struct xrt_swapchain *xsc, uint32_t index)
 {
 	struct comp_d3d12_swapchain *sc = d3d12_sc(xsc);
 
-	if (sc->waited_index < 0) {
-		U_LOG_E("No image to release");
+	if (index >= sc->image_count || sc->img_state[index] != IMG_WAITED) {
+		U_LOG_E("Release on non-waited image index %u (state=%u)", index,
+		        index < sc->image_count ? sc->img_state[index] : 0xff);
 		return XRT_ERROR_IPC_FAILURE;
 	}
 
-	if (static_cast<uint32_t>(sc->waited_index) != index) {
-		U_LOG_E("Release index %u doesn't match waited index %d", index, sc->waited_index);
-		return XRT_ERROR_IPC_FAILURE;
-	}
-
-	sc->last_released_index = index;
-	sc->waited_index = -1;
-
+	sc->img_state[index] = IMG_FREE;
 	return XRT_SUCCESS;
 }
 
@@ -233,9 +225,11 @@ comp_d3d12_swapchain_create(struct comp_d3d12_compositor *c,
 	sc->c = c;
 	sc->info = *info;
 	sc->image_count = image_count;
-	sc->acquired_index = -1;
-	sc->waited_index = -1;
-	sc->last_released_index = image_count - 1;
+	// All images start FREE (memset already zeroed, but explicit for clarity).
+	for (uint32_t i = 0; i < image_count; i++) {
+		sc->img_state[i] = IMG_FREE;
+	}
+	sc->next_hint = 0;
 
 	DXGI_FORMAT dxgi_format = xrt_format_to_dxgi(info->format);
 

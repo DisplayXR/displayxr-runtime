@@ -373,6 +373,12 @@ client_d3d12_swapchain_acquire_image(struct xrt_swapchain *xsc, uint32_t *out_in
 	if (xret == XRT_SUCCESS) {
 		// Set output variable
 		*out_index = index;
+		U_LOG_W("[#151] d3d12 client acquire_image: OK index=%u (image_count=%u)",
+		        index, sc->base.base.image_count);
+	} else {
+		U_LOG_W("[#151] d3d12 client acquire_image FAILED: xret=%d (XRT_ERROR) -> "
+		        "xrAcquireSwapchainImage will return XR_ERROR_RUNTIME_FAILURE",
+		        (int)xret);
 	}
 	return xret;
 }
@@ -460,6 +466,16 @@ client_d3d12_create_swapchain(struct xrt_compositor *xc,
                               struct xrt_swapchain **out_xsc)
 try {
 	struct client_d3d12_compositor *c = as_client_d3d12_compositor(xc);
+	U_LOG_W("[#151] d3d12 client create_swapchain: format=%lld (DXGI=%d) w=%u h=%u "
+	        "arraySize=%u mipCount=%u sampleCount=%u faceCount=%u bits=0x%x create=0x%x "
+	        "MUTABLE_FORMAT=%s SAMPLED=%s",
+	        (long long)info->format, (int)info->format, info->width, info->height,
+	        info->array_size, info->mip_count, info->sample_count, info->face_count,
+	        (unsigned)info->bits, (unsigned)info->create,
+	        (info->bits & XRT_SWAPCHAIN_USAGE_MUTABLE_FORMAT) ? "YES" : "no",
+	        (info->bits & XRT_SWAPCHAIN_USAGE_SAMPLED) ? "YES" : "no");
+	U_LOG_W("[#151] d3d12 client device=%p app_queue=%p",
+	        (void *)c->device.get(), (void *)c->app_queue.get());
 	xrt_result_t xret = XRT_SUCCESS;
 	xrt_swapchain_create_properties xsccp{};
 	xret = xrt_comp_get_swapchain_create_properties(xc, info, &xsccp);
@@ -499,12 +515,16 @@ try {
 	// Ask the service to create the swapchain (server-creates-swapchain model).
 	// The D3D11 service creates shared textures with NT handles that D3D12 can import.
 	D3D_INFO(c, "Requesting server to create swapchain (server-creates-swapchain model)");
+	U_LOG_W("[#151] d3d12 client -> service create_swapchain: vk_format=%lld bits=0x%x",
+	        (long long)vkinfo.format, (unsigned)vkinfo.bits);
 	xrt_swapchain *xsc_raw = nullptr;
 	xret = xrt_comp_create_swapchain(&c->xcn->base, &vkinfo, &xsc_raw);
 	if (xret != XRT_SUCCESS) {
 		D3D_ERROR(c, "Service failed to create swapchain: %d", xret);
+		U_LOG_W("[#151] d3d12 service create_swapchain FAILED: xret=%d", (int)xret);
 		return xret;
 	}
+	U_LOG_W("[#151] d3d12 service create_swapchain OK");
 	sc->xsc.reset(xsc_raw);
 
 	// Get handles from service-created swapchain
@@ -530,8 +550,12 @@ try {
 			image = xrt::auxiliary::d3d::d3d12::importImage(*(c->device), handle);
 		} catch (wil::ResultException const &e) {
 			D3D_ERROR(c, "Failed to import D3D11 texture [%u] into D3D12: %s", i, e.what());
+			U_LOG_W("[#151] d3d12 importImage FAILED [%u]: handle=%p hr=0x%08lx msg=%s",
+			        i, handle, (unsigned long)e.GetErrorCode(), e.what());
 			return XRT_ERROR_SWAPCHAIN_FLAG_VALID_BUT_UNSUPPORTED;
 		}
+		U_LOG_W("[#151] d3d12 importImage OK [%u]: handle=%p -> resource=%p",
+		        i, handle, (void *)image.get());
 
 		// Put the image where the OpenXR state tracker can get it
 		sc->base.images[i] = image.get();
@@ -570,6 +594,8 @@ try {
 				char buf[kErrorBufSize];
 				formatMessage(hr, buf);
 				D3D_ERROR(c, "Error creating command list: %s", buf);
+				U_LOG_W("[#151] d3d12 createCommandLists FAILED [%u]: hr=0x%08lx msg=%s",
+				        i, (unsigned long)hr, buf);
 				return XRT_ERROR_D3D12;
 			}
 
@@ -618,16 +644,21 @@ try {
 	xrt_swapchain_reference(out_xsc, &sc->base.base);
 	(void)sc.release();
 
+	U_LOG_W("[#151] d3d12 client create_swapchain COMPLETE: %u images imported", image_count);
 	return XRT_SUCCESS;
 
 } catch (wil::ResultException const &e) {
 	U_LOG_E("Error creating D3D12 swapchain: %s", e.what());
+	U_LOG_W("[#151] d3d12 client create_swapchain EXCEPTION (wil): hr=0x%08lx msg=%s",
+	        (unsigned long)e.GetErrorCode(), e.what());
 	return XRT_ERROR_ALLOCATION;
 } catch (std::exception const &e) {
 	U_LOG_E("Error creating D3D12 swapchain: %s", e.what());
+	U_LOG_W("[#151] d3d12 client create_swapchain EXCEPTION (std): %s", e.what());
 	return XRT_ERROR_ALLOCATION;
 } catch (...) {
 	U_LOG_E("Error creating D3D12 swapchain");
+	U_LOG_W("[#151] d3d12 client create_swapchain EXCEPTION (unknown)");
 	return XRT_ERROR_ALLOCATION;
 }
 
