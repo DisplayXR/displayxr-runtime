@@ -18,6 +18,25 @@
 
 #include <cjson/cJSON.h>
 
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+
+#ifdef XRT_OS_WINDOWS
+#include <direct.h>
+#include <shlobj.h>
+#include <windows.h>
+#define MKDIR(path) _mkdir(path)
+#define PATH_SEP "\\"
+#else
+#include <sys/types.h>
+#include <unistd.h>
+#define MKDIR(path) mkdir((path), 0700)
+#define PATH_SEP "/"
+#endif
+
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 #include "d3d11_service/comp_d3d11_service.h"
 #endif
@@ -344,6 +363,295 @@ tool_apply_layout_preset(const cJSON *params, void *userdata)
 }
 
 
+// ---------- workspace persistence ----------
+
+#define WORKSPACE_SCHEMA_VERSION 1
+#define WORKSPACE_NAME_MAX 64
+
+// Resolve the directory that holds workspace JSON files. Creates it on
+// demand (and any parent). Returns false if the path cannot be obtained
+// or the directory cannot be created.
+static bool
+workspace_dir(char *out, size_t cap)
+{
+#ifdef XRT_OS_WINDOWS
+	char appdata[MAX_PATH];
+	if (!SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_APPDATA, NULL, 0, appdata))) {
+		return false;
+	}
+	// %APPDATA%\DisplayXR\workspaces
+	char parent[MAX_PATH];
+	snprintf(parent, sizeof(parent), "%s\\DisplayXR", appdata);
+	MKDIR(parent);
+	snprintf(out, cap, "%s\\DisplayXR\\workspaces", appdata);
+	MKDIR(out);
+	return true;
+#else
+	const char *home = getenv("HOME");
+	if (home == NULL || home[0] == '\0') {
+		return false;
+	}
+	char parent[512];
+	snprintf(parent, sizeof(parent), "%s/.config", home);
+	MKDIR(parent);
+	snprintf(parent, sizeof(parent), "%s/.config/displayxr", home);
+	MKDIR(parent);
+	snprintf(out, cap, "%s/.config/displayxr/workspaces", home);
+	MKDIR(out);
+	return true;
+#endif
+}
+
+// Validate a workspace name as a safe file-system fragment: letters,
+// digits, spaces, dash, underscore, dot. Rejects slashes and backslashes
+// so a rogue name can't escape the workspaces directory.
+static bool
+valid_workspace_name(const char *name)
+{
+	if (name == NULL || name[0] == '\0') {
+		return false;
+	}
+	size_t n = strlen(name);
+	if (n >= WORKSPACE_NAME_MAX) {
+		return false;
+	}
+	for (size_t i = 0; i < n; i++) {
+		unsigned char c = (unsigned char)name[i];
+		bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+		         (c >= '0' && c <= '9') || c == '-' || c == '_' || c == ' ' || c == '.';
+		if (!ok) {
+			return false;
+		}
+	}
+	// Don't allow a leading dot (hidden files) or "..".
+	if (name[0] == '.' || strcmp(name, "..") == 0) {
+		return false;
+	}
+	return true;
+}
+
+static bool
+workspace_path(char *out, size_t cap, const char *name)
+{
+	char dir[512];
+	if (!workspace_dir(dir, sizeof(dir))) {
+		return false;
+	}
+	snprintf(out, cap, "%s" PATH_SEP "%s.json", dir, name);
+	return true;
+}
+
+// save_workspace: snapshot current list_windows to {name}.json.
+//
+// Schema:
+//   {
+//     "version": 1,
+//     "windows": [
+//       {"id": N, "name": "...", "pose": {...}, "size": {...}},
+//       ...
+//     ]
+//   }
+//
+// Windows without a pose (no shell-mode data) are skipped.
+static cJSON *
+tool_save_workspace(const cJSON *params, void *userdata)
+{
+	(void)userdata;
+	if (params == NULL) {
+		return NULL;
+	}
+	const cJSON *name_j = cJSON_GetObjectItemCaseSensitive(params, "name");
+	if (!cJSON_IsString(name_j) || !valid_workspace_name(name_j->valuestring)) {
+		return NULL;
+	}
+
+	// Reuse tool_list_windows to avoid duplicating the enumeration path.
+	cJSON *windows = tool_list_windows(NULL, NULL);
+	if (windows == NULL) {
+		return NULL;
+	}
+
+	cJSON *doc = cJSON_CreateObject();
+	cJSON_AddNumberToObject(doc, "version", WORKSPACE_SCHEMA_VERSION);
+	cJSON *arr = cJSON_CreateArray();
+	cJSON *w;
+	cJSON_ArrayForEach(w, windows)
+	{
+		const cJSON *pose = cJSON_GetObjectItemCaseSensitive(w, "pose");
+		const cJSON *size = cJSON_GetObjectItemCaseSensitive(w, "size");
+		if (!cJSON_IsObject(pose) || !cJSON_IsObject(size)) {
+			continue;
+		}
+		cJSON *entry = cJSON_CreateObject();
+		cJSON_AddNumberToObject(
+		    entry, "id",
+		    cJSON_GetObjectItemCaseSensitive(w, "id")->valuedouble);
+		const cJSON *app_name = cJSON_GetObjectItemCaseSensitive(w, "name");
+		if (cJSON_IsString(app_name)) {
+			cJSON_AddStringToObject(entry, "name", app_name->valuestring);
+		}
+		cJSON_AddItemToObject(entry, "pose", cJSON_Duplicate(pose, 1));
+		cJSON_AddItemToObject(entry, "size", cJSON_Duplicate(size, 1));
+		cJSON_AddItemToArray(arr, entry);
+	}
+	cJSON_AddItemToObject(doc, "windows", arr);
+	cJSON_Delete(windows);
+
+	char *text = cJSON_PrintUnformatted(doc);
+	size_t len = text != NULL ? strlen(text) : 0;
+	char path[1024];
+	bool wrote = false;
+	if (text != NULL && workspace_path(path, sizeof(path), name_j->valuestring)) {
+		FILE *f = fopen(path, "wb");
+		if (f != NULL) {
+			wrote = (fwrite(text, 1, len, f) == len);
+			fclose(f);
+		}
+	}
+	free(text);
+	cJSON_Delete(doc);
+
+	if (!wrote) {
+		U_LOG_W(LOG_PFX "save_workspace: failed to write %s", path);
+		return NULL;
+	}
+
+	cJSON *r = cJSON_CreateObject();
+	cJSON_AddBoolToObject(r, "ok", true);
+	cJSON_AddStringToObject(r, "name", name_j->valuestring);
+	cJSON_AddStringToObject(r, "path", path);
+	return r;
+}
+
+static char *
+slurp_file(const char *path, size_t *out_len)
+{
+	FILE *f = fopen(path, "rb");
+	if (f == NULL) {
+		return NULL;
+	}
+	fseek(f, 0, SEEK_END);
+	long n = ftell(f);
+	fseek(f, 0, SEEK_SET);
+	if (n < 0 || n > (long)(4 * 1024 * 1024)) {
+		fclose(f);
+		return NULL;
+	}
+	char *buf = (char *)malloc((size_t)n + 1);
+	if (buf == NULL) {
+		fclose(f);
+		return NULL;
+	}
+	size_t got = fread(buf, 1, (size_t)n, f);
+	fclose(f);
+	if (got != (size_t)n) {
+		free(buf);
+		return NULL;
+	}
+	buf[n] = '\0';
+	if (out_len != NULL) {
+		*out_len = (size_t)n;
+	}
+	return buf;
+}
+
+// Apply one window entry's pose+size. Reuses the existing
+// comp_d3d11_service accessor paths so semantics stay identical to
+// tool_set_window_pose.
+static bool
+apply_workspace_entry(struct ipc_server *s, const cJSON *entry)
+{
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (s->xsysc == NULL) {
+		return false;
+	}
+	const cJSON *id_j = cJSON_GetObjectItemCaseSensitive(entry, "id");
+	if (!cJSON_IsNumber(id_j)) {
+		return false;
+	}
+	uint32_t cid = (uint32_t)id_j->valuedouble;
+
+	struct xrt_pose pose = {0};
+	float w = 0.f, h = 0.f;
+	if (!extract_pose(entry, &pose, &w, &h)) {
+		return false;
+	}
+
+	if (cid >= 1000) {
+		return comp_d3d11_service_set_capture_client_window_pose(
+		    s->xsysc, (int)(cid - 1000), &pose, w, h);
+	}
+	bool ok = false;
+	os_mutex_lock(&s->global_state.lock);
+	volatile struct ipc_client_state *ics = find_client_locked(s, cid);
+	if (ics != NULL && ics->xc != NULL) {
+		ok = comp_d3d11_service_set_client_window_pose(
+		    s->xsysc, (struct xrt_compositor *)ics->xc, &pose, w, h);
+	}
+	os_mutex_unlock(&s->global_state.lock);
+	return ok;
+#else
+	(void)s;
+	(void)entry;
+	return false;
+#endif
+}
+
+static cJSON *
+tool_load_workspace(const cJSON *params, void *userdata)
+{
+	(void)userdata;
+	struct ipc_server *s = g_ipc_server;
+	if (s == NULL || params == NULL) {
+		return NULL;
+	}
+	const cJSON *name_j = cJSON_GetObjectItemCaseSensitive(params, "name");
+	if (!cJSON_IsString(name_j) || !valid_workspace_name(name_j->valuestring)) {
+		return NULL;
+	}
+
+	char path[1024];
+	if (!workspace_path(path, sizeof(path), name_j->valuestring)) {
+		return NULL;
+	}
+	char *text = slurp_file(path, NULL);
+	if (text == NULL) {
+		return NULL;
+	}
+	cJSON *doc = cJSON_Parse(text);
+	free(text);
+	if (doc == NULL) {
+		return NULL;
+	}
+
+	const cJSON *version = cJSON_GetObjectItemCaseSensitive(doc, "version");
+	if (!cJSON_IsNumber(version) || (int)version->valuedouble != WORKSPACE_SCHEMA_VERSION) {
+		cJSON_Delete(doc);
+		return NULL;
+	}
+
+	int applied = 0, missed = 0;
+	const cJSON *windows = cJSON_GetObjectItemCaseSensitive(doc, "windows");
+	const cJSON *entry;
+	cJSON_ArrayForEach(entry, windows)
+	{
+		if (apply_workspace_entry(s, entry)) {
+			applied++;
+		} else {
+			missed++;
+		}
+	}
+	cJSON_Delete(doc);
+
+	cJSON *r = cJSON_CreateObject();
+	cJSON_AddBoolToObject(r, "ok", applied > 0 || missed == 0);
+	cJSON_AddStringToObject(r, "name", name_j->valuestring);
+	cJSON_AddNumberToObject(r, "applied", applied);
+	cJSON_AddNumberToObject(r, "missed", missed);
+	return r;
+}
+
+
 // ---------- registry ----------
 
 static const struct u_mcp_tool TOOL_LIST_WINDOWS = {
@@ -376,6 +684,35 @@ static const struct u_mcp_tool TOOL_SET_FOCUS = {
         "\"properties\":{\"client_id\":{\"type\":\"integer\"}},"
         "\"additionalProperties\":false}",
     .fn = tool_set_focus,
+    .userdata = NULL,
+};
+
+static const struct u_mcp_tool TOOL_SAVE_WORKSPACE = {
+    .name = "save_workspace",
+    .description =
+        "Snapshot current window poses to a named JSON file on disk. "
+        "Stored in %APPDATA%\\DisplayXR\\workspaces (Windows) or "
+        "~/.config/displayxr/workspaces (POSIX).",
+    .input_schema_json =
+        "{\"type\":\"object\",\"required\":[\"name\"],"
+        "\"properties\":{\"name\":{\"type\":\"string\","
+        "\"pattern\":\"^[A-Za-z0-9 ._-]+$\",\"maxLength\":63}},"
+        "\"additionalProperties\":false}",
+    .fn = tool_save_workspace,
+    .userdata = NULL,
+};
+
+static const struct u_mcp_tool TOOL_LOAD_WORKSPACE = {
+    .name = "load_workspace",
+    .description =
+        "Load a named workspace and reapply every window pose via "
+        "set_window_pose. Missing clients are reported as 'missed'.",
+    .input_schema_json =
+        "{\"type\":\"object\",\"required\":[\"name\"],"
+        "\"properties\":{\"name\":{\"type\":\"string\","
+        "\"pattern\":\"^[A-Za-z0-9 ._-]+$\",\"maxLength\":63}},"
+        "\"additionalProperties\":false}",
+    .fn = tool_load_workspace,
     .userdata = NULL,
 };
 
@@ -420,5 +757,7 @@ ipc_mcp_tools_register(struct ipc_server *s)
 	u_mcp_server_register_tool(&TOOL_SET_WINDOW_POSE);
 	u_mcp_server_register_tool(&TOOL_SET_FOCUS);
 	u_mcp_server_register_tool(&TOOL_APPLY_LAYOUT_PRESET);
+	u_mcp_server_register_tool(&TOOL_SAVE_WORKSPACE);
+	u_mcp_server_register_tool(&TOOL_LOAD_WORKSPACE);
 	U_LOG_I(LOG_PFX "registered shell tools against ipc_server %p", (void *)s);
 }
