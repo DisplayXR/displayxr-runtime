@@ -9,6 +9,7 @@
 #include "u_mcp_server.h"
 #include "u_mcp_transport.h"
 #include "u_mcp_log_ring.h"
+#include "u_mcp_allowlist.h"
 
 #include "util/u_logging.h"
 
@@ -449,8 +450,10 @@ static void
 register_builtins(void)
 {
 	// Start the log ring first so sink_cb captures bring-up messages,
-	// then register built-in tools.
+	// then register built-in tools. Initialize the safety-model
+	// allowlist here too — tool handlers query it per-call.
 	u_mcp_log_ring_start();
+	u_mcp_allowlist_init();
 	u_mcp_server_register_tool(&ECHO_TOOL);
 	u_mcp_server_register_tool(&TAIL_LOG_TOOL);
 }

@@ -12,6 +12,8 @@
 #include "shared/ipc_protocol.h"
 
 #include "util/u_mcp_server.h"
+#include "util/u_mcp_audit.h"
+#include "util/u_mcp_allowlist.h"
 #include "util/u_logging.h"
 
 #include "os/os_threading.h"
@@ -48,6 +50,43 @@
 // share the same ipc_server anyway. Keeping it here avoids threading the
 // pointer through each static tool descriptor.
 static struct ipc_server *g_ipc_server = NULL;
+
+// Stable 64-bit hash (FNV-1a) of a JSON node's serialized form. Used
+// in audit entries so the log shows which arguments were seen without
+// storing potentially sensitive values. Returns 0 on NULL / OOM.
+static uint64_t
+args_hash64(const cJSON *params)
+{
+	if (params == NULL) {
+		return 0;
+	}
+	char *text = cJSON_PrintUnformatted(params);
+	if (text == NULL) {
+		return 0;
+	}
+	uint64_t h = 0xcbf29ce484222325ULL;
+	for (const unsigned char *p = (const unsigned char *)text; *p != '\0'; p++) {
+		h ^= (uint64_t)(*p);
+		h *= 0x100000001b3ULL;
+	}
+	free(text);
+	return h;
+}
+
+// Policy gate for write tools. Returns NULL (propagates to error) if the
+// allowlist denies the operation; otherwise returns a scratch result
+// object the tool can extend — or discards it and returns its own. Also
+// writes one audit entry per allowed call.
+static bool
+gate_write(const char *tool, const cJSON *params, uint32_t client_id)
+{
+	if (!u_mcp_allowlist_allows(client_id)) {
+		U_LOG_W(LOG_PFX "%s denied by allowlist for client_id=%u", tool, client_id);
+		return false;
+	}
+	u_mcp_audit_append(tool, client_id, args_hash64(params));
+	return true;
+}
 
 
 // ---------- list_windows ----------
@@ -275,6 +314,10 @@ tool_set_window_pose(const cJSON *params, void *userdata)
 		return NULL;
 	}
 
+	if (!gate_write("set_window_pose", params, client_id)) {
+		return NULL;
+	}
+
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	if (s->xsysc == NULL) {
 		return NULL;
@@ -320,6 +363,9 @@ tool_set_focus(const cJSON *params, void *userdata)
 	if (s == NULL || !extract_client_id(params, &client_id)) {
 		return NULL;
 	}
+	if (!gate_write("set_focus", params, client_id)) {
+		return NULL;
+	}
 
 	// Route through the IPC-layer focus path. This is the same function
 	// the stub at ipc_server_handler.c:set_focused_client now delegates
@@ -345,6 +391,12 @@ tool_apply_layout_preset(const cJSON *params, void *userdata)
 	}
 	const cJSON *name = cJSON_GetObjectItemCaseSensitive(params, "preset");
 	if (!cJSON_IsString(name) || name->valuestring == NULL) {
+		return NULL;
+	}
+
+	// Preset is not scoped to one client — pass client_id=0 to the gate;
+	// with an explicit allowlist, any policy blocks all layout changes.
+	if (!gate_write("apply_layout_preset", params, 0)) {
 		return NULL;
 	}
 
@@ -462,6 +514,9 @@ tool_save_workspace(const cJSON *params, void *userdata)
 	}
 	const cJSON *name_j = cJSON_GetObjectItemCaseSensitive(params, "name");
 	if (!cJSON_IsString(name_j) || !valid_workspace_name(name_j->valuestring)) {
+		return NULL;
+	}
+	if (!gate_write("save_workspace", params, 0)) {
 		return NULL;
 	}
 
@@ -607,6 +662,9 @@ tool_load_workspace(const cJSON *params, void *userdata)
 	}
 	const cJSON *name_j = cJSON_GetObjectItemCaseSensitive(params, "name");
 	if (!cJSON_IsString(name_j) || !valid_workspace_name(name_j->valuestring)) {
+		return NULL;
+	}
+	if (!gate_write("load_workspace", params, 0)) {
 		return NULL;
 	}
 

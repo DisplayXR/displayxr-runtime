@@ -69,6 +69,10 @@ add_library(
 	u_live_stats.h
 	u_logging.c
 	u_logging.h
+	u_mcp_audit.c
+	u_mcp_audit.h
+	u_mcp_allowlist.c
+	u_mcp_allowlist.h
 	u_mcp_capture.c
 	u_mcp_capture.h
 	u_mcp_log_ring.c
