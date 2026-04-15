@@ -32,7 +32,6 @@
 #include <cjson/cJSON.h>
 
 #include <pthread.h>
-#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -95,7 +94,12 @@ struct mcp_frame_snapshot
 	float nominal_viewer_x_m, nominal_viewer_y_m, nominal_viewer_z_m;
 };
 
-static _Atomic(struct mcp_frame_snapshot *) g_published = NULL;
+// Originally an _Atomic pointer swap, but MSVC's <stdatomic.h> requires
+// /experimental:c11atomics and even then doesn't accept _Atomic(T*).
+// A tiny mutex is correct everywhere and uncontended in our case
+// (single writer per frame, occasional reader on the MCP thread).
+static pthread_mutex_t g_published_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct mcp_frame_snapshot *g_published = NULL;
 static struct mcp_frame_snapshot g_scratch;
 static uint64_t g_next_seq = 1;
 
@@ -325,17 +329,20 @@ fov_to_json(const struct xrt_fov *f)
 	return o;
 }
 
-// Atomically load the published snapshot into @p out. Returns false if
-// no snapshot has been published yet.
+// Load the published snapshot into @p out. Returns false if no snapshot
+// has been published yet. Mutex-guarded; uncontended in practice (one
+// frame writer + one MCP-thread reader).
 static bool
 load_snapshot(struct mcp_frame_snapshot *out)
 {
-	struct mcp_frame_snapshot *p = atomic_load_explicit(&g_published, memory_order_acquire);
-	if (p == NULL) {
-		return false;
+	bool ok = false;
+	pthread_mutex_lock(&g_published_lock);
+	if (g_published != NULL) {
+		*out = *g_published;
+		ok = true;
 	}
-	*out = *p;
-	return true;
+	pthread_mutex_unlock(&g_published_lock);
+	return ok;
 }
 
 // ---------- get_kooima_params ----------
@@ -760,10 +767,11 @@ oxr_mcp_tools_record_recommended(struct oxr_session *sess,
 	g_scratch.seq = g_next_seq++;
 	g_scratch.frame_id = (uint64_t)sess->frame_id.begun;
 	static struct mcp_frame_snapshot a, b;
-	struct mcp_frame_snapshot *cur = atomic_load_explicit(&g_published, memory_order_relaxed);
-	struct mcp_frame_snapshot *next = (cur == &a) ? &b : &a;
+	pthread_mutex_lock(&g_published_lock);
+	struct mcp_frame_snapshot *next = (g_published == &a) ? &b : &a;
 	*next = g_scratch;
-	atomic_store_explicit(&g_published, next, memory_order_release);
+	g_published = next;
+	pthread_mutex_unlock(&g_published_lock);
 }
 
 void
@@ -794,10 +802,11 @@ oxr_mcp_tools_record_submitted(struct oxr_session *sess, const struct xrt_layer_
 
 	// Double-buffer publish. Two static slots alternate; we never free.
 	static struct mcp_frame_snapshot a, b;
-	struct mcp_frame_snapshot *cur = atomic_load_explicit(&g_published, memory_order_relaxed);
-	struct mcp_frame_snapshot *next = (cur == &a) ? &b : &a;
+	pthread_mutex_lock(&g_published_lock);
+	struct mcp_frame_snapshot *next = (g_published == &a) ? &b : &a;
 	*next = g_scratch;
-	atomic_store_explicit(&g_published, next, memory_order_release);
+	g_published = next;
+	pthread_mutex_unlock(&g_published_lock);
 }
 
 void
