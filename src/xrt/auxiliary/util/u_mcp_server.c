@@ -423,28 +423,10 @@ server_thread(void *arg)
 
 // ---------- Public start/stop ----------
 
-void
-u_mcp_server_maybe_start(void)
+static void
+start_with_listener(struct u_mcp_listener *listener, const char *endpoint_label)
 {
-	if (g_server.thread_started) {
-		return;
-	}
-	const char *flag = getenv("DISPLAYXR_MCP");
-	if (flag == NULL || flag[0] == '\0' || flag[0] == '0') {
-		return;
-	}
-
-	// Start the log ring first so sink_cb captures bring-up messages,
-	// then register built-in tools.
-	u_mcp_log_ring_start();
-	u_mcp_server_register_tool(&ECHO_TOOL);
-	u_mcp_server_register_tool(&TAIL_LOG_TOOL);
-
-	g_server.listener = u_mcp_listener_open(u_mcp_self_pid());
-	if (g_server.listener == NULL) {
-		U_LOG_W(LOG_PFX "failed to open listener; MCP disabled");
-		return;
-	}
+	g_server.listener = listener;
 	int rc = pthread_create(&g_server.thread, NULL, server_thread, NULL);
 	if (rc != 0) {
 		U_LOG_W(LOG_PFX "pthread_create failed: %s", strerror(rc));
@@ -453,7 +435,64 @@ u_mcp_server_maybe_start(void)
 		return;
 	}
 	g_server.thread_started = true;
-	U_LOG_I(LOG_PFX "server started (pid=%ld)", (long)u_mcp_self_pid());
+	U_LOG_I(LOG_PFX "server started (%s)", endpoint_label);
+}
+
+static bool
+mcp_enabled(void)
+{
+	const char *flag = getenv("DISPLAYXR_MCP");
+	return flag != NULL && flag[0] != '\0' && flag[0] != '0';
+}
+
+static void
+register_builtins(void)
+{
+	// Start the log ring first so sink_cb captures bring-up messages,
+	// then register built-in tools.
+	u_mcp_log_ring_start();
+	u_mcp_server_register_tool(&ECHO_TOOL);
+	u_mcp_server_register_tool(&TAIL_LOG_TOOL);
+}
+
+void
+u_mcp_server_maybe_start(void)
+{
+	if (g_server.thread_started || !mcp_enabled()) {
+		return;
+	}
+	register_builtins();
+
+	struct u_mcp_listener *listener = u_mcp_listener_open(u_mcp_self_pid());
+	if (listener == NULL) {
+		U_LOG_W(LOG_PFX "failed to open listener; MCP disabled");
+		return;
+	}
+	char label[64];
+	snprintf(label, sizeof(label), "pid=%ld", (long)u_mcp_self_pid());
+	start_with_listener(listener, label);
+}
+
+void
+u_mcp_server_maybe_start_named(const char *role)
+{
+	if (g_server.thread_started || !mcp_enabled()) {
+		return;
+	}
+	if (role == NULL || role[0] == '\0') {
+		U_LOG_W(LOG_PFX "named start requires a non-empty role");
+		return;
+	}
+	register_builtins();
+
+	struct u_mcp_listener *listener = u_mcp_listener_open_named(role);
+	if (listener == NULL) {
+		U_LOG_W(LOG_PFX "failed to open named listener '%s'; MCP disabled", role);
+		return;
+	}
+	char label[96];
+	snprintf(label, sizeof(label), "role=%s pid=%ld", role, (long)u_mcp_self_pid());
+	start_with_listener(listener, label);
 }
 
 void
