@@ -493,15 +493,33 @@ struct d3d11_service_system
 #define RESIZE_TOP    4
 #define RESIZE_BOTTOM 8
 
+// Forward decl — defined after sync_tile_layout (see resolve_active_view_dims
+// below). Needed here because the UI meter→pixel helpers use it to get the
+// active-region tile dims (post-#158) instead of the atlas-divided dims.
+static inline void
+resolve_active_view_dims(const struct d3d11_service_system *sys,
+                         uint32_t fallback_w, uint32_t fallback_h,
+                         uint32_t *out_vw, uint32_t *out_vh);
+
 /*!
- * Convert meters to pixels in the SBS tile (not full display).
- * Each tile represents the full physical display, so m_per_px = display_m / tile_px.
+ * Convert meters to pixels inside one per-view tile.
+ *
+ * One tile represents the full physical display area, so the conversion
+ * is m_per_px = display_m / tile_px. For the tile_px denominator use the
+ * *active* per-view dims (rendering_modes[idx].view_{width,height}_pixels)
+ * when running a non-legacy session — that way shell UI laid out in meters
+ * lands inside the active 1920×1080 region in stereo SBS instead of getting
+ * sized for the 2160-tall atlas tile and overflowing the top (#158).
  */
 static inline float
 ui_m_to_tile_px_x(float meters, const struct d3d11_service_system *sys)
 {
 	float disp_w_m = sys->base.info.display_width_m;
-	uint32_t tile_px_w = sys->base.info.display_pixel_width / sys->tile_columns;
+	uint32_t tile_px_w, tile_px_h;
+	resolve_active_view_dims(sys,
+	                         sys->base.info.display_pixel_width,
+	                         sys->base.info.display_pixel_height,
+	                         &tile_px_w, &tile_px_h);
 	if (disp_w_m <= 0.0f) disp_w_m = 0.700f;
 	if (tile_px_w == 0) tile_px_w = 1920;
 	return meters / disp_w_m * (float)tile_px_w;
@@ -511,7 +529,11 @@ static inline float
 ui_m_to_tile_px_y(float meters, const struct d3d11_service_system *sys)
 {
 	float disp_h_m = sys->base.info.display_height_m;
-	uint32_t tile_px_h = sys->base.info.display_pixel_height / sys->tile_rows;
+	uint32_t tile_px_w, tile_px_h;
+	resolve_active_view_dims(sys,
+	                         sys->base.info.display_pixel_width,
+	                         sys->base.info.display_pixel_height,
+	                         &tile_px_w, &tile_px_h);
 	if (disp_h_m <= 0.0f) disp_h_m = 0.394f;
 	if (tile_px_h == 0) tile_px_h = 1080;
 	return meters / disp_h_m * (float)tile_px_h;
@@ -7997,7 +8019,7 @@ after_key_shortcuts:
 			DeleteFileA(ss_trigger);
 			struct ipc_capture_result dummy = {};
 			comp_d3d11_service_capture_frame(&sys->base, ss_prefix,
-			                                 IPC_CAPTURE_FLAG_SBS, &dummy);
+			                                 IPC_CAPTURE_FLAG_ATLAS, &dummy);
 		}
 	}
 
@@ -9626,7 +9648,7 @@ comp_d3d11_service_capture_frame(struct xrt_system_compositor *xsysc,
 
 	uint32_t views_written = 0;
 
-	if (flags & IPC_CAPTURE_FLAG_SBS) {
+	if (flags & IPC_CAPTURE_FLAG_ATLAS) {
 		// Tightly-pack the active top-left region (used_w × used_h) into a
 		// contiguous RGBA8 buffer. Drops the black padding outside the tile
 		// grid and also handles staging RowPitch > used_w*4.
@@ -9638,10 +9660,10 @@ comp_d3d11_service_capture_frame(struct xrt_system_compositor *xsysc,
 			       (size_t)used_w * 4u);
 		}
 		char path[MAX_PATH];
-		snprintf(path, sizeof(path), "%s_sbs.png", path_prefix);
+		snprintf(path, sizeof(path), "%s_atlas.png", path_prefix);
 		if (stbi_write_png(path, (int)used_w, (int)used_h, 4,
 		                   buf.data(), (int)(used_w * 4u)) != 0) {
-			views_written |= IPC_CAPTURE_FLAG_SBS;
+			views_written |= IPC_CAPTURE_FLAG_ATLAS;
 		} else {
 			U_LOG_W("capture_frame: stbi_write_png failed for %s", path);
 		}

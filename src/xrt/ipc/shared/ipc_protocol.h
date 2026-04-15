@@ -347,17 +347,15 @@ struct ipc_launcher_app
  *
  * @ingroup ipc
  */
-#define IPC_CAPTURE_FLAG_LEFT (1u << 0)
-#define IPC_CAPTURE_FLAG_RIGHT (1u << 1)
-#define IPC_CAPTURE_FLAG_SBS (1u << 2)
-#define IPC_CAPTURE_FLAG_ALL (IPC_CAPTURE_FLAG_LEFT | IPC_CAPTURE_FLAG_RIGHT | IPC_CAPTURE_FLAG_SBS)
+#define IPC_CAPTURE_FLAG_ATLAS (1u << 0)
+#define IPC_CAPTURE_FLAG_ALL (IPC_CAPTURE_FLAG_ATLAS)
 
 #define IPC_CAPTURE_PATH_MAX 256
 
 /*!
  * Phase 8: request struct for shell_capture_frame. Wraps the path prefix
- * (without extension — runtime appends "_sbs.png" / "_L.png" / "_R.png")
- * because the IPC schema only supports struct/scalar parameter types.
+ * (without extension — runtime appends "_atlas.png") because the IPC
+ * schema only supports struct/scalar parameter types.
  *
  * @ingroup ipc
  */
