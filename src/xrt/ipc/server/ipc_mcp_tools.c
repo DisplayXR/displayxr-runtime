@@ -710,7 +710,67 @@ tool_load_workspace(const cJSON *params, void *userdata)
 }
 
 
+// ---------- list_sessions (service variant) ----------
+//
+// Phase A's list_sessions lives inside each handle-app process and
+// reports that one session. In service mode we need a global view:
+// which client_ids are alive, which PID each runs in, and what app
+// name was declared. An agent uses this to pick a PID and then
+// re-attach via `displayxr-mcp --target pid:N` to reach the Phase A
+// stereo-introspection tools (get_kooima_params, get_submitted_projection,
+// diff_projection) — those remain per-session and cannot be proxied
+// through the service without copying runtime state out of process.
+
+static cJSON *
+tool_list_sessions_service(const cJSON *params, void *userdata)
+{
+	(void)params;
+	(void)userdata;
+	struct ipc_server *s = g_ipc_server;
+	if (s == NULL) {
+		return NULL;
+	}
+
+	cJSON *arr = cJSON_CreateArray();
+	os_mutex_lock(&s->global_state.lock);
+	for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
+		volatile struct ipc_client_state *ics = &s->threads[i].ics;
+		if (ics->server_thread_index < 0) {
+			continue;
+		}
+		const struct ipc_app_state *as =
+		    (const struct ipc_app_state *)&ics->client_state;
+		if (as->id == 0) {
+			continue;
+		}
+		cJSON *o = cJSON_CreateObject();
+		cJSON_AddNumberToObject(o, "client_id", (double)as->id);
+		cJSON_AddNumberToObject(o, "pid", (double)as->pid);
+		cJSON_AddStringToObject(o, "name", as->info.application_name);
+		cJSON_AddBoolToObject(o, "session_active", as->session_active);
+		// No per-session graphics API here — that lives in the app
+		// process's Phase A server. Agents combine this with the
+		// remote list_sessions via pid-scoped attach.
+		cJSON_AddItemToArray(arr, o);
+	}
+	os_mutex_unlock(&s->global_state.lock);
+	return arr;
+}
+
+
 // ---------- registry ----------
+
+static const struct u_mcp_tool TOOL_LIST_SESSIONS_SERVICE = {
+    .name = "list_sessions",
+    .description =
+        "Service-side view of every OpenXR client attached to displayxr-service: "
+        "{client_id, pid, name, session_active}. Combine with "
+        "`displayxr-mcp --target pid:<N>` to reach Phase A per-session tools "
+        "(get_kooima_params, get_submitted_projection, diff_projection).",
+    .input_schema_json = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}",
+    .fn = tool_list_sessions_service,
+    .userdata = NULL,
+};
 
 static const struct u_mcp_tool TOOL_LIST_WINDOWS = {
     .name = "list_windows",
@@ -810,6 +870,7 @@ ipc_mcp_tools_register(struct ipc_server *s)
 		return;
 	}
 	g_ipc_server = s;
+	u_mcp_server_register_tool(&TOOL_LIST_SESSIONS_SERVICE);
 	u_mcp_server_register_tool(&TOOL_LIST_WINDOWS);
 	u_mcp_server_register_tool(&TOOL_GET_WINDOW_POSE);
 	u_mcp_server_register_tool(&TOOL_SET_WINDOW_POSE);
