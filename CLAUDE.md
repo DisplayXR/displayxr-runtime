@@ -108,6 +108,7 @@ Cross-compiles a curated subset against MinGW-w64 to catch Win32-API typos, miss
   - Use `long` instead of `pid_t` in public headers (don't include `<sys/types.h>` for it).
   - Avoid `<unistd.h>` in cross-platform code. Use `os_nanosleep()` from `aux/os/os_time.h` instead of `usleep()`. For PIDs, use a wrapper helper like `u_mcp_self_pid()` that does `getpid()` on POSIX and `GetCurrentProcessId()` on Windows.
   - Avoid C11 `<stdatomic.h>`. MSVC needs `/experimental:c11atomics` and even then `_Atomic(T*)` syntax is unreliable. Use a `pthread_mutex_t` (uncontended is essentially free), or Windows `Interlocked*` APIs behind an `#ifdef`.
+  - `strncasecmp` / `strcasecmp` are POSIX. MSVC has `_strnicmp` / `_stricmp` in `<string.h>`. Add `#ifdef _WIN32 #define strncasecmp _strnicmp #endif` at the top of the TU.
 
 What it DOES catch reliably: `windows.h` symbol resolution, missing platform-config includes (`xrt/xrt_config_os.h` so `XRT_OS_WINDOWS` is actually defined), duplicate struct definitions across `#ifdef` branches, mistakes in cross-platform pthread wrapping.
 

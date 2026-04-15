@@ -20,6 +20,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+// MSVC has no strncasecmp; the POSIX-named wrapper for _strnicmp is
+// the simplest cross-platform alias.
+#ifdef _WIN32
+#define strncasecmp _strnicmp
+#endif
+
 #define LOG_PFX "[mcp] "
 #define MAX_TOOLS 32
 #define MAX_FRAME_BYTES (4 * 1024 * 1024)
