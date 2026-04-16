@@ -668,6 +668,16 @@ ipc_handle_instance_describe_client(volatile struct ipc_client_state *ics,
 	// Log the pretty message.
 	IPC_INFO(ics->server, "%s", sink.buffer);
 
+#ifdef XRT_OS_WINDOWS
+	// Notify the orchestrator when an AppContainer client connects (Chrome WebXR).
+	// This enables auto-start of the WebXR bridge in Auto mode.
+	if (ics->client_state.info.ext_win32_appcontainer_compatible_enabled) {
+		extern void
+		service_orchestrator_on_appcontainer_client(void);
+		service_orchestrator_on_appcontainer_client();
+	}
+#endif
+
 	return XRT_SUCCESS;
 }
 
