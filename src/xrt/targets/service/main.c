@@ -18,6 +18,7 @@
 
 #ifdef XRT_OS_WINDOWS
 #include "util/u_windows.h"
+#include "service_config.h"
 #include "service_tray_win.h"
 #include <stdlib.h> // __argc, __argv
 #endif
@@ -83,7 +84,12 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 
 	u_win_try_privilege_or_priority_from_args(U_LOGGING_INFO, argc, argv);
 
-	// Parse --shell flag for multi-compositor shell mode
+	// Load orchestrator config (shell/bridge modes, start-on-login)
+	struct service_config cfg;
+	service_config_load(&cfg);
+
+	// Parse --shell flag for backwards compat (legacy multi-terminal workflow).
+	// The orchestrator will also enable shell mode when it spawns the shell.
 	bool shell_mode = false;
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--shell") == 0) {
@@ -92,8 +98,8 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 		}
 	}
 
-	// Start the system tray icon
-	service_tray_init(tray_shutdown_callback);
+	// Start the system tray icon with orchestrator menu
+	service_tray_init(tray_shutdown_callback, NULL, &cfg);
 
 	u_trace_marker_init();
 	u_metrics_init();
