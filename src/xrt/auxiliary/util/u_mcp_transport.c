@@ -424,8 +424,16 @@ u_mcp_conn_read(struct u_mcp_conn *conn, void *buf, size_t len)
 	}
 	char *p = buf;
 	while (len > 0) {
+		OVERLAPPED ov = {0};
+		ov.hEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
 		DWORD got = 0;
-		if (!ReadFile(conn->pipe, p, (DWORD)len, &got, NULL) || got == 0) {
+		BOOL ok = ReadFile(conn->pipe, p, (DWORD)len, &got, &ov);
+		if (!ok && GetLastError() == ERROR_IO_PENDING) {
+			WaitForSingleObject(ov.hEvent, INFINITE);
+			ok = GetOverlappedResult(conn->pipe, &ov, &got, FALSE);
+		}
+		CloseHandle(ov.hEvent);
+		if (!ok || got == 0) {
 			return false;
 		}
 		p += got;
@@ -442,8 +450,16 @@ u_mcp_conn_write(struct u_mcp_conn *conn, const void *buf, size_t len)
 	}
 	const char *p = buf;
 	while (len > 0) {
+		OVERLAPPED ov = {0};
+		ov.hEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
 		DWORD wrote = 0;
-		if (!WriteFile(conn->pipe, p, (DWORD)len, &wrote, NULL) || wrote == 0) {
+		BOOL ok = WriteFile(conn->pipe, p, (DWORD)len, &wrote, &ov);
+		if (!ok && GetLastError() == ERROR_IO_PENDING) {
+			WaitForSingleObject(ov.hEvent, INFINITE);
+			ok = GetOverlappedResult(conn->pipe, &ov, &wrote, FALSE);
+		}
+		CloseHandle(ov.hEvent);
+		if (!ok || wrote == 0) {
 			return false;
 		}
 		p += wrote;
@@ -459,9 +475,6 @@ u_mcp_conn_close(struct u_mcp_conn *conn)
 		return;
 	}
 	if (conn->pipe != INVALID_HANDLE_VALUE) {
-		// Unblock any read/write in progress on another thread — otherwise
-		// CloseHandle below may leave them parked on the kernel side.
-		CancelIoEx(conn->pipe, NULL);
 		if (conn->owns_handle) {
 			CloseHandle(conn->pipe);
 		} else {
@@ -485,7 +498,11 @@ u_mcp_conn_fd(struct u_mcp_conn *conn)
 static struct u_mcp_conn *
 conn_connect_pipe_name(const char *name)
 {
-	HANDLE h = CreateFileA(name, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+	if (!WaitNamedPipeA(name, 5000)) {
+		return NULL;
+	}
+	HANDLE h = CreateFileA(name, GENERIC_READ | GENERIC_WRITE, 0, NULL,
+	                       OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
 	if (h == INVALID_HANDLE_VALUE) {
 		return NULL;
 	}

@@ -109,10 +109,10 @@ try:
         # produce Z≈0, so this assertion is skipped.
         print("WARN: grid vs immersive poses identical (only one window?)")
 
-    # Unknown preset → ok=false.
+    # Unknown preset -> ok=false.
     r = call("apply_layout_preset", {"preset": "bogus"})
     assert not r.get("ok"), f"bogus preset should fail: {r}"
-    print("  PASS  apply_layout_preset bogus → ok=false")
+    print("  PASS  apply_layout_preset bogus -> ok=false")
 
     # Restore to grid so the test leaves the shell in a sane state.
     call("apply_layout_preset", {"preset": "grid"})

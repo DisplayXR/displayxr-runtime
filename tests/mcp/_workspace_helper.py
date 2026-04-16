@@ -2,7 +2,7 @@
 # Copyright 2026, DisplayXR / Leia Inc.
 # SPDX-License-Identifier: BSL-1.0
 #
-# Slice 5: save_workspace → perturb → load_workspace round-trip.
+# Slice 5: save_workspace -> perturb -> load_workspace round-trip.
 
 import json
 import subprocess
@@ -74,7 +74,7 @@ try:
 
     r = call("save_workspace", {"name": ws})
     assert r.get("ok"), f"save_workspace failed: {r}"
-    print(f"  PASS  save_workspace → {r.get('path')}")
+    print(f"  PASS  save_workspace -> {r.get('path')}")
 
     # Perturb every pose.
     for wid, pose in origin.items():
