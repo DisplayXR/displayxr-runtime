@@ -95,6 +95,14 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 	struct service_config cfg;
 	service_config_load(&cfg);
 
+	// If user disabled "Start on login" via the tray menu, exit immediately.
+	// The HKLM Run key still launches us, but we honor the config and bow out
+	// before creating any windows or tray icons. The service can still be
+	// started manually or via IPC auto-launch from an OpenXR app.
+	if (!cfg.start_on_login) {
+		ExitProcess(0);
+	}
+
 	// Parse --shell flag for backwards compat (legacy multi-terminal workflow).
 	// The orchestrator will also enable shell mode when it spawns the shell.
 	bool shell_mode = false;
