@@ -22,6 +22,7 @@ Build apps for 3D displays using the OpenXR standard.
 
 Contribute to the DisplayXR runtime — compositors, state tracker, auxiliary code.
 
+- **[Production Components](architecture/production-components.md)** — what ships, what runs, how the pieces connect (service, shell, bridge, runtime DLL)
 - **[Contributing Guide](guides/contributing.md)** — workflow, code style, CI expectations
 - **[Separation of Concerns](architecture/separation-of-concerns.md)** — layer boundaries (authoritative)
 - **[Project Structure](architecture/project-structure.md)** — source tree organization

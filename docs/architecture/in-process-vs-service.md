@@ -1,13 +1,15 @@
 # In-Process vs Service Compositor Architecture
 
-This document explains the architectural differences between the **in-process (native app)** and **service/IPC (WebXR)** compositor pipelines in the Monado OpenXR runtime with LeiaSR integration.
+This document explains the architectural differences between the **in-process (native app)** and **service/IPC (WebXR/shell)** compositor pipelines in the DisplayXR runtime.
+
+> For the high-level view of what ships, what runs, and when each path activates, see [Production Components](production-components.md). This document covers the D3D11 implementation details.
 
 ## Overview
 
 | Aspect | In-Process (Native) | Service/IPC (WebXR) |
 |--------|---------------------|---------------------|
 | **Compositor** | `comp_d3d11_compositor` | `d3d11_service_compositor` |
-| **Process Model** | Single process | Two processes (Chrome + monado-service) |
+| **Process Model** | Single process | Two processes (Chrome + displayxr-service) |
 | **D3D11 Device** | App's device (shared) | Service's own device |
 | **Swapchain Textures** | Local textures | Cross-process shared (NT handles + KeyedMutex) |
 | **View Poses** | Direct from compositor | Via IPC with SR-aware poses from server |
@@ -51,7 +53,7 @@ This document explains the architectural differences between the **in-process (n
 
 ```
 ┌─────────────────────────────────────┐     ┌─────────────────────────────────────┐
-│          Chrome Process             │     │        monado-service Process       │
+│          Chrome Process             │     │        displayxr-service Process       │
 │  ┌──────────────────────────────┐   │     │   ┌─────────────────────────────┐   │
 │  │   WebXR JavaScript API       │   │     │   │   IPC Server Handler        │   │
 │  └──────────────┬───────────────┘   │     │   └──────────────┬──────────────┘   │
