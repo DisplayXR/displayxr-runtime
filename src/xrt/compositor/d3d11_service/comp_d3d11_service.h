@@ -402,10 +402,11 @@ comp_d3d11_service_capture_frame(struct xrt_system_compositor *xsysc,
                                  struct ipc_capture_result *out_result);
 
 /*!
- * Service a pending MCP capture_frame request against the combined
- * shell atlas. Writes {base}_atlas.png, {base}_L.png, {base}_R.png,
- * plus {base}_windows.json. Called from multi_compositor_render just
- * before Present so the atlas is fully populated.
+ * Service a pending MCP capture_frame request. Delegates to
+ * comp_d3d11_service_capture_frame for the atlas, then writes
+ * {base}_windows.json with per-slot bbox metadata.
+ *
+ * Called from multi_compositor_render just before Present.
  *
  * @ingroup comp_d3d11_service
  */

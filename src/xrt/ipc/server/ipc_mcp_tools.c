@@ -948,24 +948,6 @@ tool_capture_frame_service(const cJSON *params, void *userdata)
 	cJSON_AddNumberToObject(fa, "size_bytes", (double)st_a.st_size);
 	cJSON_AddItemToArray(files, fa);
 
-	snprintf(path, sizeof(path), "%s_L.png", base);
-	struct stat st_l = {0};
-	stat(path, &st_l);
-	cJSON *fl = cJSON_CreateObject();
-	cJSON_AddStringToObject(fl, "path", path);
-	cJSON_AddStringToObject(fl, "type", "left");
-	cJSON_AddNumberToObject(fl, "size_bytes", (double)st_l.st_size);
-	cJSON_AddItemToArray(files, fl);
-
-	snprintf(path, sizeof(path), "%s_R.png", base);
-	struct stat st_r = {0};
-	stat(path, &st_r);
-	cJSON *fr = cJSON_CreateObject();
-	cJSON_AddStringToObject(fr, "path", path);
-	cJSON_AddStringToObject(fr, "type", "right");
-	cJSON_AddNumberToObject(fr, "size_bytes", (double)st_r.st_size);
-	cJSON_AddItemToArray(files, fr);
-
 	snprintf(path, sizeof(path), "%s_windows.json", base);
 	struct stat st_j = {0};
 	stat(path, &st_j);
@@ -982,9 +964,9 @@ tool_capture_frame_service(const cJSON *params, void *userdata)
 static const struct u_mcp_tool TOOL_CAPTURE_FRAME_SERVICE = {
     .name = "capture_frame",
     .description =
-        "Capture the shell compositor's combined atlas — writes four files: "
-        "{base}_atlas.png (full SBS atlas), {base}_L.png (left eye), "
-        "{base}_R.png (right eye), {base}_windows.json (per-window bboxes). "
+        "Capture the shell compositor's combined atlas — writes "
+        "{base}_atlas.png (cropped active-region atlas) and "
+        "{base}_windows.json (per-window bboxes). "
         "Returns file paths and sizes.",
     .input_schema_json = "{\"type\":\"object\",\"properties\":{}}",
     .fn = tool_capture_frame_service,
