@@ -459,6 +459,9 @@ u_mcp_conn_close(struct u_mcp_conn *conn)
 		return;
 	}
 	if (conn->pipe != INVALID_HANDLE_VALUE) {
+		// Unblock any read/write in progress on another thread — otherwise
+		// CloseHandle below may leave them parked on the kernel side.
+		CancelIoEx(conn->pipe, NULL);
 		if (conn->owns_handle) {
 			CloseHandle(conn->pipe);
 		} else {
