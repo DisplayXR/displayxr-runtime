@@ -72,6 +72,33 @@ u_mcp_capture_poll(struct u_mcp_capture_request *req, char *out_path);
 void
 u_mcp_capture_complete(struct u_mcp_capture_request *req, bool success);
 
+/*!
+ * Return the currently installed capture request, or NULL if none.
+ * Used by the service-side capture_frame tool to submit requests
+ * directly to the compositor's capture handler.
+ */
+struct u_mcp_capture_request *
+u_mcp_capture_get_installed(void);
+
+/*!
+ * Blocking handler for the Phase A per-PID capture_frame tool. Submits
+ * a capture request and waits (up to 3 s) for the compositor thread to
+ * complete it. Called from the oxr tool_capture_frame handler.
+ */
+bool
+u_mcp_capture_blocking_handler(const char *path, void *userdata);
+
+typedef void (*u_mcp_capture_notify_fn)(void *req);
+
+/*!
+ * Register optional callbacks for Phase A (per-PID) integration.
+ * Called by the oxr state tracker at startup to wire capture_frame
+ * into the per-PID MCP server. Service processes don't call this.
+ */
+void
+u_mcp_capture_set_notify(u_mcp_capture_notify_fn on_install,
+                         u_mcp_capture_notify_fn on_uninstall);
+
 #ifdef __cplusplus
 }
 #endif

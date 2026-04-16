@@ -11,15 +11,18 @@
 #include <string.h>
 #include <time.h>
 
-// Forward-decl from state_trackers/oxr/oxr_mcp_tools.h — intentionally
-// don't pull that header (which includes openxr.h) into aux_util.
-typedef bool (*oxr_mcp_capture_fn)(const char *path, void *userdata);
-extern void
-oxr_mcp_tools_set_capture_handler(oxr_mcp_capture_fn fn, void *userdata);
+// Optional callback for notifying the Phase A per-PID capture handler
+// (oxr_mcp_tools). Registered by oxr_instance_create at runtime; NULL
+// in the service process which has no state tracker.
+typedef void (*u_mcp_capture_notify_fn)(void *req);
+static u_mcp_capture_notify_fn g_notify_install = NULL;
+static u_mcp_capture_notify_fn g_notify_uninstall = NULL;
 
 /*! PNG encode of a 3024×1964 atlas is ~80–150 ms on an M1; 3 s is
  *  ample headroom while still tripping on a genuine stall. */
 #define CAPTURE_TIMEOUT_MS 3000
+
+static struct u_mcp_capture_request *g_installed_req = NULL;
 
 void
 u_mcp_capture_init(struct u_mcp_capture_request *req)
@@ -36,10 +39,8 @@ u_mcp_capture_fini(struct u_mcp_capture_request *req)
 	pthread_mutex_destroy(&req->lock);
 }
 
-// Invoked on the MCP server thread. Hands off to the compositor and
-// blocks until done or timeout.
-static bool
-handler_adapter(const char *path, void *userdata)
+bool
+u_mcp_capture_blocking_handler(const char *path, void *userdata)
 {
 	struct u_mcp_capture_request *req = userdata;
 	if (req == NULL || path == NULL) {
@@ -87,13 +88,33 @@ handler_adapter(const char *path, void *userdata)
 void
 u_mcp_capture_install(struct u_mcp_capture_request *req)
 {
-	oxr_mcp_tools_set_capture_handler(handler_adapter, req);
+	g_installed_req = req;
+	if (g_notify_install) {
+		g_notify_install(req);
+	}
 }
 
 void
 u_mcp_capture_uninstall(void)
 {
-	oxr_mcp_tools_set_capture_handler(NULL, NULL);
+	if (g_notify_uninstall) {
+		g_notify_uninstall(NULL);
+	}
+	g_installed_req = NULL;
+}
+
+void
+u_mcp_capture_set_notify(u_mcp_capture_notify_fn on_install,
+                         u_mcp_capture_notify_fn on_uninstall)
+{
+	g_notify_install = on_install;
+	g_notify_uninstall = on_uninstall;
+}
+
+struct u_mcp_capture_request *
+u_mcp_capture_get_installed(void)
+{
+	return g_installed_req;
 }
 
 bool
