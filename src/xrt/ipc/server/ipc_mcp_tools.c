@@ -14,9 +14,12 @@
 #include "util/u_mcp_server.h"
 #include "util/u_mcp_audit.h"
 #include "util/u_mcp_allowlist.h"
+#include "util/u_mcp_capture.h"
+#include "util/u_mcp_transport.h"
 #include "util/u_logging.h"
 
 #include "os/os_threading.h"
+#include "os/os_time.h"
 
 #include <cjson/cJSON.h>
 
@@ -863,6 +866,131 @@ static const struct u_mcp_tool TOOL_SET_WINDOW_POSE = {
     .userdata = NULL,
 };
 
+// ---------- capture_frame (service) ----------
+
+static cJSON *
+tool_capture_frame_service(const cJSON *params, void *userdata)
+{
+	(void)params;
+	(void)userdata;
+
+	struct u_mcp_capture_request *req = u_mcp_capture_get_installed();
+	if (req == NULL) {
+		cJSON *o = cJSON_CreateObject();
+		cJSON_AddStringToObject(o, "error",
+		    "capture_frame not available: service compositor has not installed a capture handler");
+		return o;
+	}
+
+	long pid = u_mcp_self_pid();
+	char base[U_MCP_CAPTURE_PATH_MAX];
+#ifdef XRT_OS_WINDOWS
+	char tmp[MAX_PATH];
+	if (GetTempPathA(sizeof(tmp), tmp) == 0) {
+		snprintf(tmp, sizeof(tmp), "C:\\Temp");
+	}
+	size_t tl = strlen(tmp);
+	if (tl > 0 && (tmp[tl - 1] == '\\' || tmp[tl - 1] == '/')) {
+		tmp[tl - 1] = '\0';
+	}
+	snprintf(base, sizeof(base), "%s\\displayxr-mcp-capture-%ld", tmp, pid);
+#else
+	snprintf(base, sizeof(base), "/tmp/displayxr-mcp-capture-%ld", pid);
+#endif
+
+	snprintf(req->path, sizeof(req->path), "%s", base);
+	req->success = false;
+	req->done = false;
+	req->pending = true;
+
+	// Poll for the compositor's sentinel file. The compositor writes
+	// {base}_DONE.txt after writing all four capture files and calling
+	// u_mcp_capture_complete. File-based polling avoids pthreads-win32
+	// condvar visibility issues on Windows.
+	bool ok = false;
+	char done_path[U_MCP_CAPTURE_PATH_MAX + 32];
+	snprintf(done_path, sizeof(done_path), "%s_DONE.txt", base);
+	DeleteFileA(done_path);
+	for (int i = 0; i < 2000; i++) {
+#ifdef XRT_OS_WINDOWS
+		Sleep(5);
+		if (GetFileAttributesA(done_path) != INVALID_FILE_ATTRIBUTES) {
+			ok = true;
+			req->pending = false;
+			break;
+		}
+#else
+		os_nanosleep(5 * 1000 * 1000);
+		struct stat st;
+		if (stat(done_path, &st) == 0) {
+			ok = true;
+			req->pending = false;
+			break;
+		}
+#endif
+	}
+
+	cJSON *r = cJSON_CreateObject();
+	if (!ok) {
+		cJSON_AddStringToObject(r, "error", "capture timed out or failed");
+		return r;
+	}
+
+	char path[U_MCP_CAPTURE_PATH_MAX + 32];
+	cJSON *files = cJSON_CreateArray();
+
+	snprintf(path, sizeof(path), "%s_atlas.png", base);
+	struct stat st_a = {0};
+	stat(path, &st_a);
+	cJSON *fa = cJSON_CreateObject();
+	cJSON_AddStringToObject(fa, "path", path);
+	cJSON_AddStringToObject(fa, "type", "atlas");
+	cJSON_AddNumberToObject(fa, "size_bytes", (double)st_a.st_size);
+	cJSON_AddItemToArray(files, fa);
+
+	snprintf(path, sizeof(path), "%s_L.png", base);
+	struct stat st_l = {0};
+	stat(path, &st_l);
+	cJSON *fl = cJSON_CreateObject();
+	cJSON_AddStringToObject(fl, "path", path);
+	cJSON_AddStringToObject(fl, "type", "left");
+	cJSON_AddNumberToObject(fl, "size_bytes", (double)st_l.st_size);
+	cJSON_AddItemToArray(files, fl);
+
+	snprintf(path, sizeof(path), "%s_R.png", base);
+	struct stat st_r = {0};
+	stat(path, &st_r);
+	cJSON *fr = cJSON_CreateObject();
+	cJSON_AddStringToObject(fr, "path", path);
+	cJSON_AddStringToObject(fr, "type", "right");
+	cJSON_AddNumberToObject(fr, "size_bytes", (double)st_r.st_size);
+	cJSON_AddItemToArray(files, fr);
+
+	snprintf(path, sizeof(path), "%s_windows.json", base);
+	struct stat st_j = {0};
+	stat(path, &st_j);
+	cJSON *fj = cJSON_CreateObject();
+	cJSON_AddStringToObject(fj, "path", path);
+	cJSON_AddStringToObject(fj, "type", "windows_json");
+	cJSON_AddNumberToObject(fj, "size_bytes", (double)st_j.st_size);
+	cJSON_AddItemToArray(files, fj);
+
+	cJSON_AddItemToObject(r, "files", files);
+	return r;
+}
+
+static const struct u_mcp_tool TOOL_CAPTURE_FRAME_SERVICE = {
+    .name = "capture_frame",
+    .description =
+        "Capture the shell compositor's combined atlas — writes four files: "
+        "{base}_atlas.png (full SBS atlas), {base}_L.png (left eye), "
+        "{base}_R.png (right eye), {base}_windows.json (per-window bboxes). "
+        "Returns file paths and sizes.",
+    .input_schema_json = "{\"type\":\"object\",\"properties\":{}}",
+    .fn = tool_capture_frame_service,
+    .userdata = NULL,
+};
+
 void
 ipc_mcp_tools_register(struct ipc_server *s)
 {
@@ -878,5 +1006,6 @@ ipc_mcp_tools_register(struct ipc_server *s)
 	u_mcp_server_register_tool(&TOOL_APPLY_LAYOUT_PRESET);
 	u_mcp_server_register_tool(&TOOL_SAVE_WORKSPACE);
 	u_mcp_server_register_tool(&TOOL_LOAD_WORKSPACE);
+	u_mcp_server_register_tool(&TOOL_CAPTURE_FRAME_SERVICE);
 	U_LOG_I(LOG_PFX "registered shell tools against ipc_server %p", (void *)s);
 }

@@ -39,6 +39,7 @@
 
 #include "util/u_hud.h"
 #include "util/u_tiling.h"
+#include "util/u_mcp_capture.h"
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
 #include "qwerty_interface.h"
@@ -345,6 +346,9 @@ struct d3d11_service_system
 		char layout_3d[8] = {};
 	};
 	struct launcher_icon launcher_icons[IPC_LAUNCHER_MAX_APPS];
+
+	//! MCP capture_frame cross-thread hand-off (Phase B slice 7).
+	struct u_mcp_capture_request mcp_capture;
 
 	//! Multi-compositor control interface for session state management
 	struct xrt_multi_compositor_control xmcc;
@@ -8023,6 +8027,10 @@ after_key_shortcuts:
 		}
 	}
 
+	// MCP capture_frame: service a pending request before Present
+	// so the atlas is fully populated.
+	comp_d3d11_service_poll_mcp_capture((struct xrt_system_compositor *)sys);
+
 	// Present
 	if (mc->swap_chain) {
 		mc->swap_chain->Present(1, 0);
@@ -9304,6 +9312,9 @@ system_destroy(struct xrt_system_compositor *xsysc)
 	// are cleaned up in fini_client_render_resources() when each client disconnects.
 	// System only needs to clean up shared resources (device, shaders, etc.)
 
+	u_mcp_capture_uninstall();
+	u_mcp_capture_fini(&sys->mcp_capture);
+
 	sys->dxgi_factory.reset();
 	sys->context.reset();
 	sys->device.reset();
@@ -9491,6 +9502,9 @@ comp_d3d11_service_create_system(struct xrt_device *xdev,
 	        sys->view_width, sys->view_height,
 	        sys->display_width, sys->display_height,
 	        sys->output_width, sys->output_height, sys->refresh_rate);
+
+	u_mcp_capture_init(&sys->mcp_capture);
+	u_mcp_capture_install(&sys->mcp_capture);
 
 	*out_xsysc = &sys->base;
 	return XRT_SUCCESS;
@@ -10929,4 +10943,108 @@ comp_d3d11_service_apply_layout_preset(struct xrt_system_compositor *xsysc,
 		InvalidateRect(mc->hwnd, nullptr, FALSE);
 	}
 	return true;
+}
+
+
+void
+comp_d3d11_service_poll_mcp_capture(struct xrt_system_compositor *xsysc)
+{
+	if (xsysc == nullptr) {
+		return;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	if (!sys->shell_mode || sys->multi_comp == nullptr) {
+		return;
+	}
+
+	char base[U_MCP_CAPTURE_PATH_MAX];
+	if (!u_mcp_capture_poll(&sys->mcp_capture, base)) {
+		return;
+	}
+
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	if (mc->combined_atlas == nullptr) {
+		u_mcp_capture_complete(&sys->mcp_capture, false);
+		return;
+	}
+
+	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+
+	D3D11_TEXTURE2D_DESC desc;
+	mc->combined_atlas->GetDesc(&desc);
+	uint32_t atlas_w = desc.Width, atlas_h = desc.Height;
+
+	D3D11_TEXTURE2D_DESC sd = desc;
+	sd.Usage = D3D11_USAGE_STAGING;
+	sd.BindFlags = 0;
+	sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+	sd.MiscFlags = 0;
+	wil::com_ptr<ID3D11Texture2D> staging;
+	if (FAILED(sys->device->CreateTexture2D(&sd, nullptr, staging.put()))) {
+		u_mcp_capture_complete(&sys->mcp_capture, false);
+		return;
+	}
+	sys->context->CopyResource(staging.get(), mc->combined_atlas.get());
+
+	D3D11_MAPPED_SUBRESOURCE m = {};
+	if (FAILED(sys->context->Map(staging.get(), 0, D3D11_MAP_READ, 0, &m))) {
+		u_mcp_capture_complete(&sys->mcp_capture, false);
+		return;
+	}
+
+	char path[U_MCP_CAPTURE_PATH_MAX + 32];
+	snprintf(path, sizeof(path), "%s_atlas.png", base);
+	bool ok_atlas = stbi_write_png(path, (int)atlas_w, (int)atlas_h, 4,
+	                               m.pData, (int)m.RowPitch) != 0;
+
+	uint32_t half_w = atlas_w / 2;
+	const uint8_t *rows = (const uint8_t *)m.pData;
+	snprintf(path, sizeof(path), "%s_L.png", base);
+	bool ok_L = stbi_write_png(path, (int)half_w, (int)atlas_h, 4,
+	                           rows, (int)m.RowPitch) != 0;
+	snprintf(path, sizeof(path), "%s_R.png", base);
+	bool ok_R = stbi_write_png(path, (int)half_w, (int)atlas_h, 4,
+	                           rows + half_w * 4, (int)m.RowPitch) != 0;
+
+	sys->context->Unmap(staging.get(), 0);
+
+	snprintf(path, sizeof(path), "%s_windows.json", base);
+	FILE *jf = fopen(path, "wb");
+	bool ok_json = false;
+	if (jf != nullptr) {
+		fprintf(jf, "{\n  \"atlas_width\": %u,\n  \"atlas_height\": %u,\n  \"windows\": [",
+		        atlas_w, atlas_h);
+		bool first = true;
+		for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
+			const d3d11_multi_client_slot *s = &mc->clients[i];
+			if (!s->active) {
+				continue;
+			}
+			fprintf(jf, "%s\n    {\"slot\": %d, \"name\": \"%s\", "
+			            "\"atlas_bbox\": {\"x\": %d, \"y\": %d, \"w\": %d, \"h\": %d}, "
+			            "\"content\": {\"w\": %u, \"h\": %u}}",
+			        first ? "" : ",", i, s->app_name,
+			        s->window_rect_x, s->window_rect_y,
+			        s->window_rect_w, s->window_rect_h,
+			        s->content_view_w, s->content_view_h);
+			first = false;
+		}
+		fprintf(jf, "\n  ]\n}\n");
+		fclose(jf);
+		ok_json = true;
+	}
+
+	bool all_ok = ok_atlas && ok_L && ok_R && ok_json;
+	// Write a sentinel file that the service-side MCP tool handler polls
+	// for. This avoids pthreads condvar visibility issues on Windows.
+	{
+		char sentinel[U_MCP_CAPTURE_PATH_MAX + 32];
+		snprintf(sentinel, sizeof(sentinel), "%s_DONE.txt", base);
+		FILE *f = fopen(sentinel, "w");
+		if (f) {
+			fprintf(f, "ok=%d\n", all_ok);
+			fclose(f);
+		}
+	}
+	u_mcp_capture_complete(&sys->mcp_capture, all_ok);
 }

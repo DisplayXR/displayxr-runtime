@@ -23,6 +23,7 @@
 
 #include "util/u_mcp_server.h"
 #include "util/u_mcp_transport.h"
+#include "util/u_mcp_capture.h"
 
 #include "os/os_time.h"
 
@@ -731,6 +732,20 @@ static const struct u_mcp_tool TOOL_DIFF_PROJECTION = {
 
 // ---------- Public API ----------
 
+static void
+notify_capture_install(void *req)
+{
+	oxr_mcp_tools_set_capture_handler(
+	    (oxr_mcp_capture_fn)u_mcp_capture_blocking_handler, req);
+}
+
+static void
+notify_capture_uninstall(void *req)
+{
+	(void)req;
+	oxr_mcp_tools_set_capture_handler(NULL, NULL);
+}
+
 void
 oxr_mcp_tools_register_all(void)
 {
@@ -741,6 +756,7 @@ oxr_mcp_tools_register_all(void)
 	u_mcp_server_register_tool(&TOOL_GET_SUBMITTED_PROJECTION);
 	u_mcp_server_register_tool(&TOOL_DIFF_PROJECTION);
 	u_mcp_server_register_tool(&TOOL_CAPTURE_FRAME);
+	u_mcp_capture_set_notify(notify_capture_install, notify_capture_uninstall);
 }
 
 void
