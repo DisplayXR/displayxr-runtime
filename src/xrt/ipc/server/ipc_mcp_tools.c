@@ -910,7 +910,7 @@ tool_capture_frame_service(const cJSON *params, void *userdata)
 	bool ok = false;
 	char done_path[U_MCP_CAPTURE_PATH_MAX + 32];
 	snprintf(done_path, sizeof(done_path), "%s_DONE.txt", base);
-	DeleteFileA(done_path);
+	(void)remove(done_path);
 	for (int i = 0; i < 2000; i++) {
 #ifdef XRT_OS_WINDOWS
 		Sleep(5);
