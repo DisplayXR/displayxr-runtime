@@ -18,6 +18,9 @@
 #include <stdio.h>
 #endif
 
+// Callback pointer defined in ipc_server_handler.c — we set it to our handler.
+extern void (*g_ipc_appcontainer_client_cb)(void);
+
 DEBUG_GET_ONCE_LOG_OPTION(orchestrator_log, "DISPLAYXR_ORCHESTRATOR_LOG", U_LOGGING_WARN)
 #define OL(log_level, ...) \
 	do { \
@@ -290,6 +293,9 @@ service_orchestrator_init(const struct service_config *cfg)
 	s_cfg = *cfg;
 	ZeroMemory(&s_shell_pi, sizeof(s_shell_pi));
 
+	// Set the AppContainer client callback so the IPC handler can notify us
+	g_ipc_appcontainer_client_cb = service_orchestrator_on_appcontainer_client;
+
 	// Subclass the tray HWND to intercept WM_HOTKEY
 	HWND hwnd = (HWND)service_tray_get_hwnd();
 	if (hwnd) {
@@ -327,6 +333,9 @@ service_orchestrator_on_appcontainer_client(void)
 void
 service_orchestrator_shutdown(void)
 {
+	// Clear the AppContainer callback before tearing down
+	g_ipc_appcontainer_client_cb = NULL;
+
 	HWND hwnd = (HWND)service_tray_get_hwnd();
 
 	// Unregister hotkey

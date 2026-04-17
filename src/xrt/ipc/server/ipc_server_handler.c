@@ -31,6 +31,10 @@
 #include <math.h>
 #include <string.h>
 
+// Callback for AppContainer client detection. Set by the service orchestrator
+// at startup; NULL in other targets (sdl-test, cli) that also link ipc_server.
+void (*g_ipc_appcontainer_client_cb)(void) = NULL;
+
 #if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 #include "d3d11_service/comp_d3d11_service.h"
 #include "math/m_display3d_view.h"
@@ -668,15 +672,13 @@ ipc_handle_instance_describe_client(volatile struct ipc_client_state *ics,
 	// Log the pretty message.
 	IPC_INFO(ics->server, "%s", sink.buffer);
 
-#ifdef XRT_OS_WINDOWS
 	// Notify the orchestrator when an AppContainer client connects (Chrome WebXR).
-	// This enables auto-start of the WebXR bridge in Auto mode.
-	if (ics->client_state.info.ext_win32_appcontainer_compatible_enabled) {
-		extern void
-		service_orchestrator_on_appcontainer_client(void);
-		service_orchestrator_on_appcontainer_client();
+	// Uses a callback pointer set by the service at startup — NULL in other
+	// targets (sdl-test, cli) that also link ipc_server.
+	if (ics->client_state.info.ext_win32_appcontainer_compatible_enabled &&
+	    g_ipc_appcontainer_client_cb != NULL) {
+		g_ipc_appcontainer_client_cb();
 	}
-#endif
 
 	return XRT_SUCCESS;
 }
