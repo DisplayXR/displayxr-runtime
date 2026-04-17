@@ -392,6 +392,8 @@ struct WindowMetrics {
 	float sizeHm = 0.0f;
 	float centerOffsetXm = 0.0f;
 	float centerOffsetYm = 0.0f;
+	uint32_t viewWidth = 0;   // Compositor's live per-view width (from HWND props)
+	uint32_t viewHeight = 0;  // Compositor's live per-view height (from HWND props)
 };
 
 struct Bridge {
@@ -484,6 +486,11 @@ static bool poll_window_metrics(Bridge &b) {
 	g_compositor_hwnd.store(hwnd);
 	WindowMetrics neu;
 	bool ok = compute_window_metrics_impl(hwnd, b, neu);
+	// Read compositor's live per-view dims from HWND properties.
+	if (hwnd) {
+		neu.viewWidth = (uint32_t)(uintptr_t)GetPropW(hwnd, L"DXR_ViewW");
+		neu.viewHeight = (uint32_t)(uintptr_t)GetPropW(hwnd, L"DXR_ViewH");
+	}
 	const WindowMetrics &old = b.window_metrics;
 	const float eps = 0.0001f;
 	bool changed = false;
@@ -493,7 +500,8 @@ static bool poll_window_metrics(Bridge &b) {
 		          std::fabs(old.sizeWm - neu.sizeWm) > eps ||
 		          std::fabs(old.sizeHm - neu.sizeHm) > eps ||
 		          std::fabs(old.centerOffsetXm - neu.centerOffsetXm) > eps ||
-		          std::fabs(old.centerOffsetYm - neu.centerOffsetYm) > eps;
+		          std::fabs(old.centerOffsetYm - neu.centerOffsetYm) > eps ||
+		          old.viewWidth != neu.viewWidth || old.viewHeight != neu.viewHeight;
 		b.window_metrics = neu;
 	} else if (old.valid) {
 		changed = true;
@@ -704,6 +712,10 @@ static std::string build_window_info_fields(const WindowMetrics &w) {
 		s += ",\"windowPixelSize\":[" + json_u((uint32_t)w.pixelW) + "," + json_u((uint32_t)w.pixelH) + "]";
 		s += ",\"windowSizeMeters\":[" + json_f(w.sizeWm) + "," + json_f(w.sizeHm) + "]";
 		s += ",\"windowCenterOffsetMeters\":[" + json_f(w.centerOffsetXm) + "," + json_f(w.centerOffsetYm) + "]";
+		if (w.viewWidth > 0 && w.viewHeight > 0) {
+			s += ",\"viewWidth\":" + json_u(w.viewWidth);
+			s += ",\"viewHeight\":" + json_u(w.viewHeight);
+		}
 	}
 	s += "}";
 	return s;
@@ -1310,11 +1322,11 @@ static void run_event_loop(Bridge &b) {
 			if (g_window_event_pending.exchange(false)) {
 				window_changed = poll_window_metrics(b);
 			}
-			// Periodic safety-net poll every ~500 ms — catches window
-			// appear/disappear (FindWindow may return NULL → non-NULL when
-			// the service first creates the window) and any events the hook
-			// might miss.
-			if (++window_poll_counter >= 50) {
+			// Poll for compositor window. Before the window is found, poll
+			// every frame so the sample gets window info ASAP (the sample
+			// needs windowPixelSize × viewScale to render at correct tile
+			// dims). After the window is found, fall back to ~500 ms.
+			if (!b.window_metrics.valid || ++window_poll_counter >= 50) {
 				window_poll_counter = 0;
 				window_changed = poll_window_metrics(b) || window_changed;
 			}

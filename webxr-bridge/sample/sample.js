@@ -46,6 +46,7 @@ const GRID_DIVS = 10;
 const GRID_COLOR = 0x4d4d59; // (0.3, 0.3, 0.35) gamma-corrected approx
 const BG_COLOR = 0x0d0d40;   // (0.05, 0.05, 0.25)
 const VIRTUAL_DISPLAY_HEIGHT = 0.24; // meters (4x cube height)
+const CAMERA_HALF_TAN_VFOV = 0.32491969623; // tan(18°) → 36° vFOV (matches camera3d_view.c)
 
 // --- XR state ---
 
@@ -63,6 +64,7 @@ let frameCount = 0;
 // to the rig pose; per-eye Kooima projection is unchanged.
 const VK = {
   W: 87, A: 65, S: 83, D: 68, Q: 81, E: 69,
+  C: 67, V: 86,
   SPACE: 32, R: 82,
   LEFT: 37, UP: 38, RIGHT: 39, DOWN: 40,
   SHIFT: 16,
@@ -78,6 +80,9 @@ const RIG_DEFAULTS = {
   parallaxFactor: 1.0,
   perspectiveFactor: 1.0,
   vHeight: VIRTUAL_DISPLAY_HEIGHT,
+  cameraMode: false,          // false=display-centric, true=camera-centric (C key)
+  invConvergenceDistance: 1.0, // camera-centric: 1/convergence_dist (1/meters)
+  zoomFactor: 1.0,            // camera-centric: divides half_tan_vfov
 };
 const rig = JSON.parse(JSON.stringify(RIG_DEFAULTS));
 function rigReset() {
@@ -88,6 +93,8 @@ function rigReset() {
   rig.parallaxFactor = 1.0;
   rig.perspectiveFactor = 1.0;
   rig.vHeight = VIRTUAL_DISPLAY_HEIGHT;
+  rig.invConvergenceDistance = 1.0;
+  rig.zoomFactor = 1.0;
   // Also drop any phantom held keys — bridge's hook can miss keyup events
   // during focus changes (alt-tab, menus), leaving stuck keys that drive
   // continuous motion/rotation.
@@ -225,6 +232,26 @@ function buildFallbackProjection(tileW, tileH) {
   return new THREE.Matrix4().makePerspective(-halfH, halfH, halfV, -halfV, NEAR, FAR);
 }
 
+// Camera-centric asymmetric frustum — port of camera3d_view.c:camera3d_compute_view.
+// eyeLocal = processed eye displacement from screen plane (eye - {0,0,nominal_z}).
+// Tangent-space shifts produce per-eye asymmetric frustum around the camera.
+function buildCameraProjection(eyeLocal, screenWm, screenHm, invd, halfTanVfov) {
+  const aspect = (screenHm > 0) ? screenWm / screenHm : 1.0;
+  const ro = halfTanVfov * aspect;
+  const uo = halfTanVfov;
+  const dx = eyeLocal[0] * invd;
+  const dy = eyeLocal[1] * invd;
+  const dz = eyeLocal[2] * invd;
+  const denom = 1.0 + dz;
+  const tanR = (ro - dx) / denom;
+  const tanL = (ro + dx) / denom;
+  const tanU = (uo - dy) / denom;
+  const tanD = (uo + dy) / denom;
+  const l = -tanL * NEAR, r = tanR * NEAR;
+  const b = -tanD * NEAR, t = tanU * NEAR;
+  return new THREE.Matrix4().makePerspective(l, r, t, b, NEAR, FAR);
+}
+
 // --- XR frame loop ---
 
 let prevTimeMs = 0;
@@ -308,15 +335,17 @@ function onXRFrame(time, frame) {
   const di = displayXR ? displayXR.displayInfo : null;
   const wi = displayXR ? displayXR.windowInfo : null;
 
-  // Per-tile render dims: divide the actual framebuffer by the tile grid
-  // (matches the bridge-relay compositor's mode-native tile-rect override).
-  // Note: window-aware tile sizing (renderingPx = windowPx × viewScale) was
-  // attempted but broke during compositor window resize because the compositor
-  // defers atlas resize during drag (in_size_move) — sample and compositor
-  // briefly disagree on tile rect. Proper fix needs the bridge to mirror the
-  // compositor's actual atlas dims (sys->view_width/height) via IPC.
-  const tileW = Math.floor(glLayer.framebufferWidth / tileLayout.tileColumns);
-  const tileH = Math.floor(glLayer.framebufferHeight / tileLayout.tileRows);
+  // Per-tile render dims: displayPixelSize × viewScale = active per-view area.
+  // E.g. 3840×0.5 = 1920, 2160×0.5 = 1080 for stereo SBS on 4K.
+  // Uses display info (available from frame 0 via bridge hello) rather than
+  // window info (delayed until compositor window is found by the bridge).
+  // Falls back to framebuffer / tileGrid when display info isn't available.
+  const tileW = (di && di.displayPixelSize)
+    ? Math.round(di.displayPixelSize[0] * tileLayout.viewScaleX)
+    : Math.floor(glLayer.framebufferWidth / tileLayout.tileColumns);
+  const tileH = (di && di.displayPixelSize)
+    ? Math.round(di.displayPixelSize[1] * tileLayout.viewScaleY)
+    : Math.floor(glLayer.framebufferHeight / tileLayout.tileRows);
   // Window-relative Kooima: when the bridge has located the compositor window,
   // use its physical size as the screen and subtract the window-center offset
   // from each eye position. This matches cube_handle_d3d11_win's display-centric
@@ -378,19 +407,26 @@ function onXRFrame(time, frame) {
   // Diagnostic log (once every 600 frames ~ 10s).
   if (frameCount % 600 === 1) {
     log('diag: tile=' + tileW + 'x' + tileH +
+        ((di && di.displayPixelSize) ? ' (disp*scale)' : ' (fb/grid)') +
+        ' ' + (rig.cameraMode ? 'CAM' : 'DISP') +
         ' rig=[' + rig.pos.map(v => v.toFixed(2)).join(',') + ']' +
         ' yaw=' + rig.yaw.toFixed(2) + ' pitch=' + rig.pitch.toFixed(2) +
-        ' vH=' + rig.vHeight.toFixed(3) +
         ' ipd=' + rig.ipdFactor.toFixed(2) +
         ' par=' + rig.parallaxFactor.toFixed(2) +
-        ' per=' + rig.perspectiveFactor.toFixed(2));
+        (rig.cameraMode
+          ? ' invD=' + rig.invConvergenceDistance.toFixed(2) + ' zoom=' + rig.zoomFactor.toFixed(2)
+          : ' per=' + rig.perspectiveFactor.toFixed(2) + ' vH=' + rig.vHeight.toFixed(3)));
   }
 
   for (let eye = 0; eye < tileLayout.eyeCount; eye++) {
     const tileX = tileLayout.monoMode ? 0 : (eye % tileLayout.tileColumns);
     const tileY = tileLayout.monoMode ? 0 : Math.floor(eye / tileLayout.tileColumns);
     const vpX = tileX * tileW;
-    const vpY = tileY * tileH;
+    // GL viewport Y=0 is at the BOTTOM. ANGLE maps GL coords to D3D11
+    // (Y=0 at top). To place content at the D3D11 top (where the compositor
+    // reads), set GL Y so that ANGLE's flip lands at D3D11 row 0.
+    // GL vpY = fbHeight - tileH - (tileY * tileH)
+    const vpY = glLayer.framebufferHeight - tileH - (tileY * tileH);
 
     renderer.setViewport(vpX, vpY, tileW, tileH);
     renderer.setScissor(vpX, vpY, tileW, tileH);
@@ -422,27 +458,53 @@ function onXRFrame(time, frame) {
       eyePos = [nominalPos[0] + ipdHalf - winOffX, nominalPos[1] - winOffY, nominalPos[2]];
     }
 
-    // Kooima projection: screen scaled by m2v (vHeight zoom, FOV invariant),
-    // eye scaled by perspectiveFactor (FOV change). Camera world position
-    // uses the same eye*perspFac so view and projection stay consistent.
-    if (screenHm > 0) {
-      camera.projectionMatrix.copy(
-        buildKooimaProjection(eyePos, screenWm, screenHm, m2v, rig.perspectiveFactor));
-    } else {
-      camera.projectionMatrix.copy(buildFallbackProjection(tileW, tileH));
-    }
-    camera.projectionMatrixInverse.copy(camera.projectionMatrix).invert();
+    if (rig.cameraMode) {
+      // Camera-centric: app-owned camera at rig pose, eye tracking produces
+      // per-eye asymmetric frustum shifts (matches camera3d_view.c).
+      const nomZ = nominalPos[2];
+      const eyeLocal = [eyePos[0], eyePos[1], eyePos[2] - nomZ];
+      const halfTan = CAMERA_HALF_TAN_VFOV / rig.zoomFactor;
 
-    // eye_scaled = eye * perspectiveFactor * m2v (matches display3d_view.c)
-    const es = rig.perspectiveFactor * m2v;
-    const eyeInRig = new THREE.Vector3(eyePos[0] * es, eyePos[1] * es, eyePos[2] * es);
-    eyeInRig.applyQuaternion(rigQuat);
-    camera.position.set(
-      rig.pos[0] + eyeInRig.x,
-      rig.pos[1] + eyeInRig.y,
-      rig.pos[2] + eyeInRig.z
-    );
-    camera.quaternion.copy(rigQuat);
+      if (screenHm > 0) {
+        camera.projectionMatrix.copy(
+          buildCameraProjection(eyeLocal, screenWm, screenHm, rig.invConvergenceDistance, halfTan));
+      } else {
+        camera.projectionMatrix.copy(buildFallbackProjection(tileW, tileH));
+      }
+      camera.projectionMatrixInverse.copy(camera.projectionMatrix).invert();
+
+      // Camera position = rig + eye_local rotated into rig frame
+      const eyeInRig = new THREE.Vector3(eyeLocal[0], eyeLocal[1], eyeLocal[2]);
+      eyeInRig.applyQuaternion(rigQuat);
+      camera.position.set(
+        rig.pos[0] + eyeInRig.x,
+        rig.pos[1] + eyeInRig.y,
+        rig.pos[2] + eyeInRig.z
+      );
+      camera.quaternion.copy(rigQuat);
+    } else {
+      // Display-centric Kooima: screen scaled by m2v (vHeight zoom, FOV invariant),
+      // eye scaled by perspectiveFactor (FOV change). Camera world position
+      // uses the same eye*perspFac so view and projection stay consistent.
+      if (screenHm > 0) {
+        camera.projectionMatrix.copy(
+          buildKooimaProjection(eyePos, screenWm, screenHm, m2v, rig.perspectiveFactor));
+      } else {
+        camera.projectionMatrix.copy(buildFallbackProjection(tileW, tileH));
+      }
+      camera.projectionMatrixInverse.copy(camera.projectionMatrix).invert();
+
+      // eye_scaled = eye * perspectiveFactor * m2v (matches display3d_view.c)
+      const es = rig.perspectiveFactor * m2v;
+      const eyeInRig = new THREE.Vector3(eyePos[0] * es, eyePos[1] * es, eyePos[2] * es);
+      eyeInRig.applyQuaternion(rigQuat);
+      camera.position.set(
+        rig.pos[0] + eyeInRig.x,
+        rig.pos[1] + eyeInRig.y,
+        rig.pos[2] + eyeInRig.z
+      );
+      camera.quaternion.copy(rigQuat);
+    }
 
     renderer.render(scene, camera);
   }
@@ -514,6 +576,36 @@ async function enterXR() {
         if (m.code === VK.SPACE || m.code === VK.R) {
           rigReset();
           log('rig reset');
+        } else if (m.code === VK.C) {
+          rig.cameraMode = !rig.cameraMode;
+          // Reset rig on mode switch (matches input_handler.cpp:215-232)
+          rig.pos = [0, 0, 0];
+          rig.yaw = 0;
+          rig.pitch = 0;
+          if (rig.cameraMode) {
+            const nz = (di && di.nominalViewerPosition) ? di.nominalViewerPosition[2] : 0.6;
+            if (nz > 0) rig.invConvergenceDistance = 1.0 / nz;
+            rig.zoomFactor = 1.0;
+          }
+          originOffset = null; recalibKey = '';
+          log('Kooima: ' + (rig.cameraMode ? 'camera-centric' : 'display-centric'));
+        } else if (m.code === VK.V && displayXR) {
+          // Cycle rendering mode (V key, matches cube_handle_d3d11_win)
+          const modes = displayXR.renderingModes || [];
+          if (modes.length > 0) {
+            const curr = displayXR.renderingMode ? displayXR.renderingMode.index : 0;
+            const next = (curr + 1) % modes.length;
+            displayXR.requestRenderingMode(next);
+            log('requesting mode ' + next + ' (' + (modes[next] ? modes[next].name : '?') + ')');
+          }
+        } else if (m.code >= 48 && m.code <= 56 && displayXR) {
+          // 0-8 number keys: direct mode selection (matches cube_handle_d3d11_win)
+          const idx = m.code - 48;
+          const modes = displayXR.renderingModes || [];
+          if (idx < modes.length) {
+            displayXR.requestRenderingMode(idx);
+            log('requesting mode ' + idx + ' (' + modes[idx].name + ')');
+          }
         }
       }
     } else if (m.kind === 'mouse') {
@@ -535,10 +627,24 @@ async function enterXR() {
     } else if (m.kind === 'wheel') {
       const notches = m.deltaY / 120;
       const mods = m.modifiers || {};
-      if (mods.shift)      rig.ipdFactor = Math.max(0, Math.min(1, rig.ipdFactor + notches * 0.05));
-      else if (mods.ctrl)  rig.parallaxFactor = Math.max(0, Math.min(1, rig.parallaxFactor + notches * 0.05));
-      else if (mods.alt)   rig.perspectiveFactor = Math.max(0.1, Math.min(10, rig.perspectiveFactor * (notches > 0 ? 1.1 : 1/1.1)));
-      else                  rig.vHeight = Math.max(0.05, Math.min(2.0, rig.vHeight * (notches > 0 ? 1/1.1 : 1.1)));
+      const factor = notches > 0 ? 1.1 : 1 / 1.1;
+      if (mods.shift) {
+        rig.ipdFactor = Math.max(0, Math.min(1, rig.ipdFactor + notches * 0.05));
+      } else if (mods.ctrl) {
+        rig.parallaxFactor = Math.max(0, Math.min(1, rig.parallaxFactor + notches * 0.05));
+      } else if (mods.alt) {
+        if (rig.cameraMode) {
+          rig.invConvergenceDistance = Math.max(0.1, Math.min(10, rig.invConvergenceDistance * factor));
+        } else {
+          rig.perspectiveFactor = Math.max(0.1, Math.min(10, rig.perspectiveFactor * factor));
+        }
+      } else {
+        if (rig.cameraMode) {
+          rig.zoomFactor = Math.max(0.1, Math.min(10, rig.zoomFactor * factor));
+        } else {
+          rig.vHeight = Math.max(0.05, Math.min(2.0, rig.vHeight * (notches > 0 ? 1 / 1.1 : 1.1)));
+        }
+      }
     }
   });
 
@@ -548,7 +654,8 @@ async function enterXR() {
       log('WINDOW: ' + w.windowPixelSize[0] + 'x' + w.windowPixelSize[1] + 'px ' +
           w.windowSizeMeters[0].toFixed(3) + 'x' + w.windowSizeMeters[1].toFixed(3) + 'm ' +
           'off=[' + w.windowCenterOffsetMeters[0].toFixed(3) + ',' +
-          w.windowCenterOffsetMeters[1].toFixed(3) + ']');
+          w.windowCenterOffsetMeters[1].toFixed(3) + ']' +
+          (w.viewWidth ? ' view=' + w.viewWidth + 'x' + w.viewHeight : ' view=N/A'));
     } else {
       log('WINDOW: lost');
     }

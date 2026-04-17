@@ -56,12 +56,16 @@ Bridge calls `xrRequestDisplayRenderingModeEXT(session, modeIndex)`. Runtime pro
     "valid": true,
     "windowPixelSize": [1920, 1080],
     "windowSizeMeters": [0.172, 0.097],
-    "windowCenterOffsetMeters": [0.05, -0.02]
+    "windowCenterOffsetMeters": [0.05, -0.02],
+    "viewWidth": 960,
+    "viewHeight": 540
   }
 }
 ```
 
 `windowInfo` is the live state of the service compositor window (Win32 client area) the bridge located via `FindWindowW("DisplayXRD3D11", ...)`. `valid` is `false` when the window can't be found (e.g. before a WebXR session is active). `windowCenterOffsetMeters` is the window center's physical offset from the display center (`+x` right, `+y` up). Pages doing window-relative Kooima should use `windowSizeMeters` as the screen and subtract `windowCenterOffsetMeters` from each eye's XY position before computing the asymmetric frustum (matches `test_apps/cube_handle_d3d11_win/main.cpp:342-433`).
+
+`viewWidth` and `viewHeight` are the compositor's actual per-view tile dimensions in pixels, read from the compositor's HWND properties. These are deferred-resize-aware — they don't update mid-drag, only after the compositor finishes resizing its atlas. Pages should use these for per-tile viewport sizing instead of computing from `displayPixelSize × viewScale` or dividing the framebuffer by the tile grid. Present when the compositor has published its view dims; absent on older bridges.
 
 ### `window-info`
 
@@ -69,7 +73,7 @@ Bridge calls `xrRequestDisplayRenderingModeEXT(session, modeIndex)`. Runtime pro
 {
   "type": "window-info",
   "version": 1,
-  "windowInfo": { "valid": true, "windowPixelSize": [1920, 1080], "windowSizeMeters": [0.172, 0.097], "windowCenterOffsetMeters": [0.05, -0.02] }
+  "windowInfo": { "valid": true, "windowPixelSize": [1920, 1080], "windowSizeMeters": [0.172, 0.097], "windowCenterOffsetMeters": [0.05, -0.02], "viewWidth": 960, "viewHeight": 540 }
 }
 ```
 
@@ -154,14 +158,16 @@ Streamed at ~100 Hz when `eyePoseFormat` is `"raw"`. Contains per-eye position, 
 
 ## Tile layout model
 
-The page uses `displayPixelSize × viewScale × tileColumns/tileRows` to compute the atlas framebuffer size and per-tile render rects. For a mode with `tileColumns=2, tileRows=1, viewScale=[0.5, 0.5]` on a 3840×2160 display:
+**Per-tile viewport sizing:** When `windowInfo.viewWidth` and `viewHeight` are available, use them directly as the per-tile viewport dimensions — they are the compositor's actual deferred-resize-aware view dims. Fall back to `displayPixelSize × viewScale` only when the fields are absent (older bridges).
 
-- Per-tile render rect: `3840 × 0.5 = 1920` wide, `2160 × 0.5 = 1080` tall
-- Atlas: `2 × 1920 = 3840` wide, `1 × 1080 = 1080` tall
-- Tile 0 (left eye): viewport `(0, 0, 1920, 1080)`
-- Tile 1 (right eye): viewport `(1920, 0, 1920, 1080)`
+**Atlas framebuffer size:** The page uses `displayPixelSize × viewScale × tileColumns/tileRows` to compute the atlas framebuffer size. For a mode with `tileColumns=2, tileRows=1, viewScale=[0.5, 0.5]` on a 3840×2160 display:
 
-The page sets `gl.viewport` and `gl.scissor` per tile and renders with projection matrices derived from the bridge's eye pose FOV data.
+- Per-tile render rect: `viewWidth × viewHeight` (e.g. `1920 × 1080` at fullscreen)
+- Atlas: `tileColumns × viewWidth` wide, `tileRows × viewHeight` tall
+- Tile 0 (left eye): viewport `(0, 0, viewWidth, viewHeight)`
+- Tile 1 (right eye): viewport `(viewWidth, 0, viewWidth, viewHeight)`
+
+The page sets `gl.viewport` and `gl.scissor` per tile and renders with projection matrices derived from the bridge's eye pose FOV data. The OpenXR swapchain is larger than the atlas (fixed max allocation); the compositor crops from the top-left corner.
 
 ## MV3 WebSocket permissions
 
