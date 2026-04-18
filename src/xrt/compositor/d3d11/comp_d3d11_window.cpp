@@ -493,27 +493,18 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			return 0;
 		}
 #ifdef XRT_BUILD_DRIVER_QWERTY
-		// When bridge is active, only forward V key (mode toggle) and
-		// number keys (direct mode select) to qwerty — these must happen
-		// server-side where the DP lives. All other keys (TAB, WASD, etc.)
-		// are handled by the bridge hook → sample.
+		// When bridge is active, don't forward keys to qwerty — mode
+		// changes go through the app-initiated HWND property relay.
+		// Consume all keys (return 0) so DefWindowProc doesn't process
+		// them. The bridge's LL hook captures them for the sample.
+		if (g_bridge_relay_active) {
+			return 0;
+		}
 		if (w->qwerty_enabled && w->xsysd != NULL) {
-			bool allow = !g_bridge_relay_active;
-			if (g_bridge_relay_active && (message == WM_KEYDOWN || message == WM_KEYUP)) {
-				allow = (wParam == 'V' || (wParam >= '0' && wParam <= '8'));
-			}
-			if (allow) {
-				bool handled = false;
-				qwerty_process_win32(w->xsysd->xdevs, w->xsysd->xdev_count,
-				                     message, wParam, lParam, &handled);
-				if (handled) {
-					return 0;
-				}
-			}
-			// When bridge is active, consume all keys so DefWindowProc
-			// doesn't process TAB (dialog focus), arrow keys, etc.
-			// The bridge's LL keyboard hook already captured them.
-			if (g_bridge_relay_active) {
+			bool handled = false;
+			qwerty_process_win32(w->xsysd->xdevs, w->xsysd->xdev_count,
+			                     message, wParam, lParam, &handled);
+			if (handled) {
 				return 0;
 			}
 		}

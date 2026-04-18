@@ -7135,13 +7135,44 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		}
 	}
 
+	// App-initiated mode change: bridge relays requestRenderingMode() from the
+	// WebXR sample via HWND property. Polls each frame, triggers same server-side
+	// path as qwerty V key (device update + DP toggle + broadcast).
+	if (g_bridge_relay_active && c->render.hwnd != nullptr && sys->xsysd != NULL) {
+		uint32_t req = (uint32_t)(uintptr_t)GetPropW(c->render.hwnd, L"DXR_RequestMode");
+		if (req > 0) {
+			RemovePropW(c->render.hwnd, L"DXR_RequestMode");
+			uint32_t modeIdx = req - 1; // decode +1 encoding
+			struct xrt_device *head = sys->xsysd->static_roles.head;
+			if (head != nullptr && head->hmd != NULL &&
+			    modeIdx < head->rendering_mode_count &&
+			    modeIdx != head->hmd->active_rendering_mode_index) {
+				uint32_t prev_idx = head->hmd->active_rendering_mode_index;
+				head->hmd->active_rendering_mode_index = modeIdx;
+				broadcast_rendering_mode_change(sys, head, prev_idx, modeIdx);
+
+				// Toggle DP 2D/3D
+				bool want_3d = head->rendering_modes[modeIdx].hardware_display_3d;
+				struct xrt_display_processor_d3d11 *dp = nullptr;
+				if (sys->shell_mode && sys->multi_comp != nullptr)
+					dp = sys->multi_comp->display_processor;
+				else if (c->render.display_processor != nullptr)
+					dp = c->render.display_processor;
+				if (dp != nullptr)
+					xrt_display_processor_d3d11_request_display_mode(dp, want_3d);
+
+				sync_tile_layout(sys);
+				sys->hardware_display_3d = want_3d;
+				U_LOG_W("App-initiated mode change: %u -> %u (3D=%d)", prev_idx, modeIdx, (int)want_3d);
+			}
+		}
+	}
+
 	// Runtime-side 2D/3D toggle (V key) — polls qwerty driver each frame.
-	// Allowed even when bridge-relay is active: the mode change must happen
-	// server-side where the DP lives. The bridge's xrRequestDisplayRenderingModeEXT
-	// is a no-op in IPC mode (service_mode check). The V key reaches both the
-	// compositor (WndProc → qwerty → here) and the bridge (hook → sample).
+	// Disabled when bridge is active: mode changes go through the HWND
+	// property relay above (app-initiated path).
 #ifdef XRT_BUILD_DRIVER_QWERTY
-	if (sys->xsysd != NULL) {
+	if (sys->xsysd != NULL && !g_bridge_relay_active) {
 		bool force_2d = false;
 		bool toggled = qwerty_check_display_mode_toggle(
 		    sys->xsysd->xdevs, sys->xsysd->xdev_count, &force_2d);

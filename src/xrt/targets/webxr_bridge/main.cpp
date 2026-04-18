@@ -880,9 +880,15 @@ static void handle_ws_message(Bridge &b, const std::string &msg) {
 			LOG_W("WS request-mode: invalid modeIndex %d", idx);
 			return;
 		}
-		if (b.pfnRequestDisplayRenderingMode && b.session != XR_NULL_HANDLE) {
-			XrResult r = b.pfnRequestDisplayRenderingMode(b.session, (uint32_t)idx);
-			LOG_I("WS request-mode %d: %s", idx, xr_result_str(b.instance, r));
+		// Relay to compositor via HWND property. The compositor polls this
+		// each frame and triggers the server-side mode change (DP toggle).
+		// +1 encoding: 0 means "no request", 1=mode 0, 2=mode 1, etc.
+		HWND hwnd = g_compositor_hwnd.load();
+		if (hwnd) {
+			SetPropW(hwnd, L"DXR_RequestMode", (HANDLE)(uintptr_t)(idx + 1));
+			LOG_I("WS request-mode %d: posted to compositor", idx);
+		} else {
+			LOG_W("WS request-mode %d: no compositor HWND yet", idx);
 		}
 	} else if (type == "request-eye-tracking-mode") {
 		int mode = find_int("mode");
