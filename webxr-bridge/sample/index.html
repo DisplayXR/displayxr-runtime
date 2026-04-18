@@ -41,6 +41,20 @@
   /* Log */
   #status { padding: 12px 14px; background: #1e293b; color: #e2e8f0; border-radius: 8px; white-space: pre-wrap; font: 12px/1.5 ui-monospace, 'Cascadia Code', 'Fira Code', monospace; min-height: 100px; max-height: 300px; overflow-y: auto; }
 
+  /* HUD overlay */
+  .hud { margin-top: 16px; background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%); border: 1px solid #334155; border-radius: 10px; padding: 16px 18px; font: 12px/1.6 ui-monospace, 'Cascadia Code', 'Fira Code', monospace; color: #cbd5e1; overflow: hidden; }
+  .hud.hidden { display: none; }
+  .hud-title { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.08em; color: #64748b; margin-bottom: 10px; display: flex; align-items: center; gap: 6px; }
+  .hud-title::before { content: ''; display: inline-block; width: 6px; height: 6px; background: var(--green); border-radius: 50%; box-shadow: 0 0 6px rgba(34,197,94,0.5); }
+  .hud-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 20px; }
+  .hud-section { min-width: 0; }
+  .hud-label { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: #475569; margin-bottom: 2px; }
+  .hud-value { color: #e2e8f0; word-break: break-all; }
+  .hud-value .hl { color: #38bdf8; }
+  .hud-value .dim { color: #64748b; }
+  .hud-eyes { grid-column: 1 / -1; }
+  .hud-bar { grid-column: 1 / -1; height: 1px; background: #334155; margin: 2px 0; }
+
   /* Controls help */
   .controls { margin-top: 16px; font-size: 12px; color: #64748b; border-top: 1px solid #e2e8f0; padding-top: 12px; }
   .controls h3 { font-size: 13px; margin: 0 0 6px; color: #475569; }
@@ -68,10 +82,19 @@
 
 <div id="status">Checking prerequisites...</div>
 
+<!-- HUD overlay is rendered compositor-side (u_hud) via bridge shared memory.
+<div id="hud" class="hud hidden">
+  <div class="hud-title">Live Telemetry</div>
+  <div class="hud-grid" id="hud-grid"></div>
+</div>
+-->
+
 <div class="controls">
   <h3>Controls (compositor window focused)</h3>
   <kbd>V</kbd> toggle 2D/3D &nbsp;
   <kbd>C</kbd> display/camera Kooima &nbsp;
+  <kbd>T</kbd> eye tracking mode &nbsp;
+  <kbd>TAB</kbd> HUD &nbsp;
   <kbd>WASD</kbd><kbd>QE</kbd> move &nbsp;
   <kbd>Arrows</kbd> rotate &nbsp;
   <kbd>LMB</kbd>+drag look<br>

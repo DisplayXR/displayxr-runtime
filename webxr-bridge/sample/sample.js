@@ -64,13 +64,16 @@ let frameCount = 0;
 // to the rig pose; per-eye Kooima projection is unchanged.
 const VK = {
   W: 87, A: 65, S: 83, D: 68, Q: 81, E: 69,
-  C: 67, V: 86,
+  C: 67, V: 86, T: 84, TAB: 9,
   SPACE: 32, R: 82,
   LEFT: 37, UP: 38, RIGHT: 39, DOWN: 40,
   SHIFT: 16,
 };
 const keyDown = new Set();           // VK codes currently down
 let lastRequestedMode = -1;          // V key: track locally (async mode-changed is stale)
+let eyeTrackingMode = 0;            // 0=MANAGED, 1=MANUAL (T key toggle)
+let hudVisible = false;              // TAB key toggle
+let hudJustToggled = false;          // Send one frame after toggle-off to clear
 let mouseLookDown = false;           // Left-mouse-drag for look (matches cube_handle)
 let mouseLastX = 0, mouseLastY = 0;
 const RIG_DEFAULTS = {
@@ -510,7 +513,75 @@ function onXRFrame(time, frame) {
     renderer.render(scene, camera);
   }
 
+  // Send HUD data to compositor via bridge shared memory.
+  // Send every frame when visible (eye positions are live).
+  // Send once when hidden to clear the overlay.
+  if (hudVisible || hudJustToggled) {
+    sendHUD(di, eyePoses, tileW, tileH);
+    hudJustToggled = false;
+  }
+
   activeXRFramebuffer = null;
+}
+
+// --- HUD overlay (compositor-side via shared memory) ---
+
+let lastFpsTime = 0;
+let fpsFrameCount = 0;
+let currentFps = 0;
+
+let hudSendCount = 0;
+function sendHUD(di, eyePoses, tileW, tileH) {
+  if (!displayXR) { if (hudSendCount === 0) log('sendHUD: displayXR null'); return; }
+
+  // FPS
+  const now = performance.now();
+  fpsFrameCount++;
+  if (now - lastFpsTime >= 1000) {
+    currentFps = fpsFrameCount;
+    fpsFrameCount = 0;
+    lastFpsTime = now;
+  }
+
+  const mm = (v) => (v * 1000).toFixed(0);
+  const f2 = (v) => v.toFixed(2);
+
+  const lines = [];
+
+  // Mode + tile
+  const rm = displayXR.renderingMode;
+  if (rm) {
+    const sx = rm.viewScale ? f2(rm.viewScale[0]) : '1';
+    const sy = rm.viewScale ? f2(rm.viewScale[1]) : '1';
+    lines.push({ label: 'Mode', text: rm.name + ' (' + rm.tileColumns + 'x' + rm.tileRows + ') scale=' + sx + 'x' + sy });
+  }
+  lines.push({ label: 'Tile', text: tileW + 'x' + tileH + '  ' + currentFps + ' fps' });
+
+  // Eyes
+  if (eyePoses && eyePoses.length > 0) {
+    let eyeStr = '';
+    for (let i = 0; i < eyePoses.length; i++) {
+      const p = eyePoses[i].position;
+      eyeStr += (i > 0 ? '  ' : '') + (i === 0 ? 'L' : 'R') + '=(' + mm(p[0]) + ',' + mm(p[1]) + ',' + mm(p[2]) + ')';
+    }
+    eyeStr += ' mm [' + (eyeTrackingMode === 1 ? 'MANUAL' : 'MANAGED') + ']';
+    lines.push({ label: 'Eyes', text: eyeStr });
+  }
+
+  // Kooima + params
+  if (rig.cameraMode) {
+    lines.push({ label: 'Kooima', text: 'Camera  invD=' + f2(rig.invConvergenceDistance) + ' zoom=' + f2(rig.zoomFactor) });
+  } else {
+    lines.push({ label: 'Kooima', text: 'Display  per=' + f2(rig.perspectiveFactor) + ' vH=' + rig.vHeight.toFixed(3) + 'm' });
+  }
+  lines.push({ label: 'Stereo', text: 'IPD=' + f2(rig.ipdFactor) + ' PAR=' + f2(rig.parallaxFactor) +
+    ' rig=[' + rig.pos.map(v => f2(v)).join(',') + ']' });
+
+  // Send via window.postMessage to the extension's isolated world,
+  // which forwards to the bridge WS.
+  const payload = { type: 'hud-update', version: 1, visible: hudVisible, lines: lines };
+  window.postMessage({ source: 'displayxr-bridge-req', payload: payload }, window.location.origin);
+  if (hudSendCount++ < 3) log('sendHUD: posted ' + lines.length + ' lines, visible=' + hudVisible);
 }
 
 // --- Enter/Exit XR ---
@@ -630,6 +701,15 @@ async function enterXR() {
             displayXR.requestRenderingMode(idx);
             log('requesting mode ' + idx + ' (' + modes[idx].name + ')');
           }
+        } else if (m.code === VK.T && displayXR) {
+          // Toggle eye tracking mode: MANAGED(0) ↔ MANUAL(1)
+          eyeTrackingMode = eyeTrackingMode === 1 ? 0 : 1;
+          displayXR.requestEyeTrackingMode(eyeTrackingMode);
+          log('eye tracking: ' + (eyeTrackingMode === 1 ? 'MANUAL' : 'MANAGED'));
+        } else if (m.code === VK.TAB) {
+          hudVisible = !hudVisible;
+          hudJustToggled = true;
+          log('HUD: ' + (hudVisible ? 'visible' : 'hidden'));
         }
       }
     } else if (m.kind === 'mouse') {

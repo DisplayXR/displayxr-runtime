@@ -35,6 +35,7 @@
 
 #include <openxr/openxr.h>
 #include <openxr/XR_EXT_display_info.h>
+#include "../../auxiliary/util/u_bridge_hud_shared.h"
 
 // ---------------------------------------------------------------------------
 // Logging.
@@ -405,6 +406,7 @@ struct Bridge {
 	bool has_headless_ext = false;
 	PFN_xrEnumerateDisplayRenderingModesEXT pfnEnumerateDisplayRenderingModes = nullptr;
 	PFN_xrRequestDisplayRenderingModeEXT pfnRequestDisplayRenderingMode = nullptr;
+	PFN_xrRequestEyeTrackingModeEXT pfnRequestEyeTrackingMode = nullptr;
 
 	// Cached display info for JSON serialization.
 	XrDisplayInfoEXT display_info{};
@@ -422,6 +424,10 @@ struct Bridge {
 	// WS state.
 	MessageQueue outgoing;
 	std::atomic<bool> ws_client_connected{false};
+
+	// Bridge HUD shared memory (cross-process with compositor).
+	HANDLE hud_mapping = nullptr;
+	struct bridge_hud_shared *hud_shared = nullptr;
 };
 
 // ---------------------------------------------------------------------------
@@ -850,6 +856,14 @@ static void handle_ws_message(Bridge &b, const std::string &msg) {
 
 	std::string type = find_str("type");
 
+	// Debug: log all incoming WS message types
+	if (!type.empty()) {
+		static int ws_msg_count = 0;
+		if (++ws_msg_count <= 20 || type != "configure") {
+			LOG_I("WS recv type='%s' len=%zu", type.c_str(), msg.size());
+		}
+	}
+
 	if (type == "hello") {
 		int version = find_int("version");
 		if (version != 1) {
@@ -870,6 +884,14 @@ static void handle_ws_message(Bridge &b, const std::string &msg) {
 			XrResult r = b.pfnRequestDisplayRenderingMode(b.session, (uint32_t)idx);
 			LOG_I("WS request-mode %d: %s", idx, xr_result_str(b.instance, r));
 		}
+	} else if (type == "request-eye-tracking-mode") {
+		int mode = find_int("mode");
+		if (b.pfnRequestEyeTrackingMode && b.session != XR_NULL_HANDLE) {
+			XrEyeTrackingModeEXT xr_mode = (mode == 1)
+			    ? XR_EYE_TRACKING_MODE_MANUAL_EXT : XR_EYE_TRACKING_MODE_MANAGED_EXT;
+			XrResult r = b.pfnRequestEyeTrackingMode(b.session, xr_mode);
+			LOG_I("WS request-eye-tracking-mode %d: %s", mode, xr_result_str(b.instance, r));
+		}
 	} else if (type == "configure") {
 		std::string fmt = find_str("eyePoseFormat");
 		if (fmt == "raw") {
@@ -878,6 +900,56 @@ static void handle_ws_message(Bridge &b, const std::string &msg) {
 		} else if (fmt == "none" || fmt == "render-ready") {
 			b.stream_eye_poses = false;
 			LOG_I("WS configure: eye pose streaming OFF");
+		}
+	} else if (type == "hud-update") {
+		if (b.hud_shared) {
+			// Parse "visible" and "lines" array from JSON.
+			bool vis = false;
+			{
+				auto p = msg.find("\"visible\"");
+				if (p != std::string::npos) {
+					vis = (msg.find("true", p) == p + 10); // crude but matches {"visible":true
+				}
+			}
+			b.hud_shared->visible = vis ? 1 : 0;
+			b.hud_shared->line_count = 0;
+
+			if (vis) {
+				// Parse lines array: each {"label":"...","text":"..."}
+				size_t pos = msg.find("\"lines\"");
+				if (pos != std::string::npos) {
+					uint32_t count = 0;
+					size_t search = pos;
+					while (count < BRIDGE_HUD_MAX_LINES) {
+						size_t lb = msg.find("\"label\"", search);
+						if (lb == std::string::npos) break;
+						size_t tb = msg.find("\"text\"", lb);
+						if (tb == std::string::npos) break;
+
+						auto extract = [&](size_t key_end) -> std::string {
+							size_t q1 = msg.find('"', key_end + 1);
+							if (q1 == std::string::npos) return "";
+							q1++; // skip opening quote
+							size_t q2 = msg.find('"', q1);
+							if (q2 == std::string::npos) return "";
+							return msg.substr(q1, q2 - q1);
+						};
+
+						std::string label = extract(lb + 6);
+						std::string text = extract(tb + 5);
+
+						auto &line = b.hud_shared->lines[count];
+						strncpy(line.label, label.c_str(), BRIDGE_HUD_LABEL_LEN - 1);
+						line.label[BRIDGE_HUD_LABEL_LEN - 1] = '\0';
+						strncpy(line.text, text.c_str(), BRIDGE_HUD_TEXT_LEN - 1);
+						line.text[BRIDGE_HUD_TEXT_LEN - 1] = '\0';
+
+						count++;
+						search = tb + 5;
+					}
+					b.hud_shared->line_count = count;
+				}
+			}
 		}
 	} else if (!type.empty()) {
 		LOG_I("WS unknown message type '%s'", type.c_str());
@@ -1142,6 +1214,8 @@ static bool create_session_and_enumerate_modes(Bridge &b) {
 
 	xrGetInstanceProcAddr(b.instance, "xrRequestDisplayRenderingModeEXT",
 	                      (PFN_xrVoidFunction *)&b.pfnRequestDisplayRenderingMode);
+	xrGetInstanceProcAddr(b.instance, "xrRequestEyeTrackingModeEXT",
+	                      (PFN_xrVoidFunction *)&b.pfnRequestEyeTrackingMode);
 
 	uint32_t mode_count = 0;
 	r = b.pfnEnumerateDisplayRenderingModes(b.session, 0, &mode_count, nullptr);
@@ -1314,6 +1388,34 @@ static void poll_eye_poses(Bridge &b) {
 // Main event loop.
 // ---------------------------------------------------------------------------
 
+static void bridge_hud_create(Bridge &b) {
+	b.hud_mapping = CreateFileMappingW(
+	    INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
+	    0, sizeof(struct bridge_hud_shared), BRIDGE_HUD_MAPPING_NAME);
+	if (b.hud_mapping) {
+		b.hud_shared = (struct bridge_hud_shared *)MapViewOfFile(
+		    b.hud_mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(struct bridge_hud_shared));
+		if (b.hud_shared) {
+			memset(b.hud_shared, 0, sizeof(*b.hud_shared));
+			b.hud_shared->magic = BRIDGE_HUD_MAGIC;
+			b.hud_shared->version = BRIDGE_HUD_VERSION;
+			LOG_I("Bridge HUD shared memory created");
+		}
+	}
+}
+
+static void bridge_hud_destroy(Bridge &b) {
+	if (b.hud_shared) {
+		b.hud_shared->visible = 0;
+		UnmapViewOfFile(b.hud_shared);
+		b.hud_shared = nullptr;
+	}
+	if (b.hud_mapping) {
+		CloseHandle(b.hud_mapping);
+		b.hud_mapping = nullptr;
+	}
+}
+
 static void run_event_loop(Bridge &b) {
 	LOG_I("Entering event loop. Ctrl+C to exit.");
 	int window_poll_counter = 0;
@@ -1414,6 +1516,9 @@ int main() {
 		return 1;
 	}
 
+	// Create bridge HUD shared memory for cross-process HUD overlay.
+	bridge_hud_create(b);
+
 	// Start WS server + window-event hook on dedicated threads.
 	std::thread ws_thread(ws_thread_func, std::ref(b));
 	std::thread win_evt_thread(window_event_thread_func);
@@ -1426,6 +1531,7 @@ int main() {
 	// Post a dummy message to unstick the window-event thread's PeekMessage.
 	if (win_evt_thread.joinable()) win_evt_thread.join();
 
+	bridge_hud_destroy(b);
 	if (b.local_space != XR_NULL_HANDLE) xrDestroySpace(b.local_space);
 	if (b.session != XR_NULL_HANDLE) xrDestroySession(b.session);
 	if (b.instance != XR_NULL_HANDLE) xrDestroyInstance(b.instance);

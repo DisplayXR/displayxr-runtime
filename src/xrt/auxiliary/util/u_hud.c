@@ -665,8 +665,30 @@ u_hud_update(struct u_hud *hud, const struct u_hud_data *data)
 	draw_hline(hud, sep_x0, sep_x1, y - hud->font.ascent + 2 * s, COLOR_SEP);
 	y += s * 3;
 
+	// === Bridge HUD overlay (from WebXR sample via shared memory) ===
+	if (data->bridge_hud != NULL &&
+	    data->bridge_hud->magic == BRIDGE_HUD_MAGIC &&
+	    data->bridge_hud->visible &&
+	    data->bridge_hud->line_count > 0) {
+		draw_hline(hud, sep_x0, sep_x1, y - hud->font.ascent + 2 * s, COLOR_SEP);
+		y += s * 3;
+		draw_string_aa(hud, x, y, "WebXR Bridge", COLOR_TITLE);
+		y += lh;
+		for (uint32_t i = 0; i < data->bridge_hud->line_count && i < BRIDGE_HUD_MAX_LINES; i++) {
+			snprintf(buf, sizeof(buf), "%-6s %s",
+			         data->bridge_hud->lines[i].label,
+			         data->bridge_hud->lines[i].text);
+			draw_string_aa(hud, x, y, buf, COLOR_VALUE);
+			y += lh;
+		}
+	}
+
+	// --- Separator ---
+	draw_hline(hud, sep_x0, sep_x1, y - hud->font.ascent + 2 * s, COLOR_SEP);
+	y += s * 3;
+
 	// === Key hints (dimmed) ===
-	draw_string_aa(hud, x, y, "TAB=HUD  V=Mode  P=Cam/Disp  ESC=Quit", COLOR_DIM);
+	draw_string_aa(hud, x, y, "TAB=HUD  V=Mode  C=Cam/Disp  ESC=Quit", COLOR_DIM);
 
 	hud->dirty = true;
 	return true;

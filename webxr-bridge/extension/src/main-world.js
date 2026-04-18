@@ -81,6 +81,14 @@
         sendToBridge({ type: 'request-mode', version: 1, modeIndex: modeIndex });
       },
 
+      requestEyeTrackingMode: function (mode) {
+        sendToBridge({ type: 'request-eye-tracking-mode', version: 1, mode: mode });
+      },
+
+      sendHudUpdate: function (visible, lines) {
+        sendToBridge({ type: 'hud-update', version: 1, visible: visible, lines: lines || [] });
+      },
+
       configureEyePoses: function (format) {
         sendToBridge({ type: 'configure', version: 1, eyePoseFormat: format || 'raw' });
       }

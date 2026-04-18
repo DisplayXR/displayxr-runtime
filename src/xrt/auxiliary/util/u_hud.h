@@ -18,6 +18,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include "u_bridge_hud_shared.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -81,6 +82,10 @@ struct u_hud_data
 	float disp_vHeight;              //!< Display: virtual display height (m) [0.1,10]
 	float nominal_viewer_z;          //!< Hardware: nominal viewer distance (m)
 	float screen_height_m;           //!< Hardware: screen height (m)
+
+	//! Bridge HUD overlay: when non-NULL, render these label+text lines
+	//! below the standard HUD sections. From cross-process shared memory.
+	const struct bridge_hud_shared *bridge_hud; //!< NULL or pointer to mapped shared mem
 };
 
 struct u_hud;

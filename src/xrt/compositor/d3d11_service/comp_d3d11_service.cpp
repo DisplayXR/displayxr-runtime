@@ -2858,7 +2858,30 @@ d3d11_service_render_hud(struct d3d11_service_system *sys,
                           bool weaving_done,
                           const struct xrt_eye_positions *eye_pos)
 {
-	if (!res->owns_window || res->hud == NULL || !u_hud_is_visible()) {
+	if (!res->owns_window || res->hud == NULL) {
+		return;
+	}
+	// When bridge is active, HUD visibility is controlled by the bridge's
+	// shared memory (sample's TAB key), not the qwerty driver's TAB toggle.
+	// Check bridge HUD first; fall back to u_hud_is_visible() for non-bridge.
+	static HANDLE s_bridge_hud_mapping = nullptr;
+	static struct bridge_hud_shared *s_bridge_hud = nullptr;
+	static bool s_bridge_hud_tried = false;
+	if (g_bridge_relay_active && !s_bridge_hud_tried) {
+		s_bridge_hud_tried = true;
+		s_bridge_hud_mapping = OpenFileMappingW(FILE_MAP_READ, FALSE, BRIDGE_HUD_MAPPING_NAME);
+		if (s_bridge_hud_mapping) {
+			s_bridge_hud = (struct bridge_hud_shared *)MapViewOfFile(
+			    s_bridge_hud_mapping, FILE_MAP_READ, 0, 0, sizeof(struct bridge_hud_shared));
+			if (s_bridge_hud) {
+				U_LOG_W("Bridge HUD shared memory opened by compositor");
+			}
+		}
+	}
+	bool bridge_hud_active = (s_bridge_hud != nullptr &&
+	                          s_bridge_hud->magic == BRIDGE_HUD_MAGIC &&
+	                          s_bridge_hud->visible);
+	if (!bridge_hud_active && !u_hud_is_visible()) {
 		return;
 	}
 
@@ -2976,6 +2999,8 @@ d3d11_service_render_hud(struct d3d11_service_system *sys,
 		}
 	}
 #endif
+
+	data.bridge_hud = s_bridge_hud;
 
 	bool dirty = u_hud_update(res->hud, &data);
 
