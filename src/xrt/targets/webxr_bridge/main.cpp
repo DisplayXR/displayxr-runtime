@@ -1170,6 +1170,16 @@ static bool create_session_and_enumerate_modes(Bridge &b) {
 		      m.viewScaleX, m.viewScaleY, (int)m.hardwareDisplay3D);
 	}
 
+	// Default current_mode_index to the first 3D mode (Leia device starts in 3D).
+	// XrDisplayInfoEXT doesn't expose the active mode, so infer from hardware3D.
+	for (uint32_t i = 0; i < mode_count; i++) {
+		if (b.modes[i].hardwareDisplay3D) {
+			b.current_mode_index = i;
+			break;
+		}
+	}
+	LOG_I("Initial current_mode_index: %u", b.current_mode_index);
+
 	return true;
 }
 

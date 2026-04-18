@@ -1355,7 +1355,10 @@ oxr_xrRequestDisplayRenderingModeEXT(XrSession session, uint32_t modeIndex)
 	// Shell/IPC mode: the shell controls rendering mode changes, not the app.
 	// The app receives mode changes via XrEventDataRenderingModeChanged events
 	// (synced from server via IPC shared memory).
-	if (sess->sys->xsysc != NULL && sess->sys->xsysc->info.is_service_mode) {
+	// Exception: headless sessions (bridge relay) ARE allowed to change modes —
+	// the bridge acts as the mode controller on behalf of the WebXR page.
+	if (sess->sys->xsysc != NULL && sess->sys->xsysc->info.is_service_mode &&
+	    sess->compositor != NULL) {
 		return XR_SUCCESS;
 	}
 

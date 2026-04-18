@@ -70,6 +70,7 @@ const VK = {
   SHIFT: 16,
 };
 const keyDown = new Set();           // VK codes currently down
+let lastRequestedMode = -1;          // V key: track locally (async mode-changed is stale)
 let mouseLookDown = false;           // Left-mouse-drag for look (matches cube_handle)
 let mouseLastX = 0, mouseLastY = 0;
 const RIG_DEFAULTS = {
@@ -561,6 +562,7 @@ async function enterXR() {
     log('MODE CHANGE: prev=' + event.detail.previousModeIndex +
         ' curr=' + event.detail.currentModeIndex +
         ' hw3D=' + event.detail.hardware3D);
+    lastRequestedMode = event.detail.currentModeIndex;
     updateTileLayout();
   });
 
@@ -571,30 +573,42 @@ async function enterXR() {
   xrSession.addEventListener('displayxrinput', (event) => {
     const m = event.detail;
     if (m.kind === 'key') {
+      const firstDown = m.down && !keyDown.has(m.code); // ignore repeats
       if (m.down) keyDown.add(m.code); else keyDown.delete(m.code);
-      if (m.down) {
+      if (firstDown) {
         if (m.code === VK.SPACE || m.code === VK.R) {
           rigReset();
           log('rig reset');
         } else if (m.code === VK.C) {
           rig.cameraMode = !rig.cameraMode;
           // Reset rig on mode switch (matches input_handler.cpp:215-232)
-          rig.pos = [0, 0, 0];
           rig.yaw = 0;
           rig.pitch = 0;
           if (rig.cameraMode) {
-            const nz = (di && di.nominalViewerPosition) ? di.nominalViewerPosition[2] : 0.6;
+            // Camera mode: place camera at nominalViewerZ, looking at display plane
+            const dxr = displayXR ? displayXR.displayInfo : null;
+            const nz = (dxr && dxr.nominalViewerPosition) ? dxr.nominalViewerPosition[2] : 0.6;
+            rig.pos = [0, 0, nz];
+            log('camera pos=[' + rig.pos.map(v => v.toFixed(2)).join(',') + '] nz=' + nz.toFixed(3));
             if (nz > 0) rig.invConvergenceDistance = 1.0 / nz;
             rig.zoomFactor = 1.0;
+          } else {
+            // Display-centric: rig at origin (display-anchored)
+            rig.pos = [0, 0, 0];
           }
           originOffset = null; recalibKey = '';
           log('Kooima: ' + (rig.cameraMode ? 'camera-centric' : 'display-centric'));
         } else if (m.code === VK.V && displayXR) {
-          // Cycle rendering mode (V key, matches cube_handle_d3d11_win)
+          // Cycle rendering mode (V key, matches cube_handle_d3d11_win).
+          // Use lastRequestedMode (updated immediately) instead of
+          // renderingMode.index (async — stale until mode-changed event).
           const modes = displayXR.renderingModes || [];
           if (modes.length > 0) {
-            const curr = displayXR.renderingMode ? displayXR.renderingMode.index : 0;
-            const next = (curr + 1) % modes.length;
+            if (lastRequestedMode < 0) {
+              lastRequestedMode = displayXR.renderingMode ? displayXR.renderingMode.index : 0;
+            }
+            const next = (lastRequestedMode + 1) % modes.length;
+            lastRequestedMode = next;
             displayXR.requestRenderingMode(next);
             log('requesting mode ' + next + ' (' + (modes[next] ? modes[next].name : '?') + ')');
           }

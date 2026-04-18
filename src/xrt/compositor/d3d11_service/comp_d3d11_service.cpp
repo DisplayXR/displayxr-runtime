@@ -7111,10 +7111,12 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	}
 
 	// Runtime-side 2D/3D toggle (V key) — polls qwerty driver each frame.
-	// Skipped when bridge-relay is active: page owns input semantics, runtime
-	// must not synthesize mode changes from V (or 1/2/3) keys.
+	// Allowed even when bridge-relay is active: the mode change must happen
+	// server-side where the DP lives. The bridge's xrRequestDisplayRenderingModeEXT
+	// is a no-op in IPC mode (service_mode check). The V key reaches both the
+	// compositor (WndProc → qwerty → here) and the bridge (hook → sample).
 #ifdef XRT_BUILD_DRIVER_QWERTY
-	if (sys->xsysd != NULL && !g_bridge_relay_active) {
+	if (sys->xsysd != NULL) {
 		bool force_2d = false;
 		bool toggled = qwerty_check_display_mode_toggle(
 		    sys->xsysd->xdevs, sys->xsysd->xdev_count, &force_2d);
@@ -7256,10 +7258,10 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	uint32_t content_view_h = sys->view_height;
 
 	// Bridge-relay: compute active per-view dims (display × viewScale).
-	// When viewScale shrinks the active area below the atlas tile size,
-	// the bridge sample renders smaller tiles and the compositor must
-	// read/crop at those dims instead of Chrome's compromise-scaled rect.
-	// In 2D mode (scale=1.0), active == tile == Chrome's rect — no override needed.
+	// The bridge sample renders at these dims; the compositor must read/crop
+	// at the same size instead of Chrome's compromise-scaled rect.
+	// Always override when bridge is active — Chrome's rect is always wrong
+	// (compromise-scaled, doesn't match the sample's displayPixelSize × viewScale).
 	bool bridge_override = false;
 	uint32_t active_vw = sys->view_width;
 	uint32_t active_vh = sys->view_height;
@@ -7273,9 +7275,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			if (sx > 0.0f && sy > 0.0f) {
 				uint32_t vw = (uint32_t)(sys->display_width * sx);
 				uint32_t vh = (uint32_t)(sys->display_height * sy);
-				// Only override when viewScale actually shrinks the view
-				// below the atlas tile dims. In 2D (scale=1), no override.
-				if (vw != sys->view_width || vh != sys->view_height) {
+				{
 					active_vw = vw;
 					active_vh = vh;
 					bridge_override = true;

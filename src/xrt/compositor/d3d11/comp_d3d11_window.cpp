@@ -493,7 +493,10 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			return 0;
 		}
 #ifdef XRT_BUILD_DRIVER_QWERTY
-		if (w->qwerty_enabled && w->xsysd != NULL && !g_bridge_relay_active) {
+		// Allow qwerty key processing even when bridge is active — mode
+		// toggle (V) must happen server-side where the DP lives.
+		// Pose integration is separately frozen via qwerty_set_bridge_relay_active.
+		if (w->qwerty_enabled && w->xsysd != NULL) {
 			bool handled = false;
 			qwerty_process_win32(w->xsysd->xdevs, w->xsysd->xdev_count,
 			                     message, wParam, lParam, &handled);
