@@ -6,10 +6,10 @@ This document explains the architectural differences between the **in-process (n
 
 ## Overview
 
-| Aspect | In-Process (Native) | Service/IPC (WebXR) |
-|--------|---------------------|---------------------|
+| Aspect | In-Process (Native) | Service/IPC (WebXR or Shell) |
+|--------|---------------------|------------------------------|
 | **Compositor** | `comp_d3d11_compositor` | `d3d11_service_compositor` |
-| **Process Model** | Single process | Two processes (Chrome + displayxr-service) |
+| **Process Model** | Single process | N+1 processes (one or more IPC clients — Chrome tab, shell-launched apps — plus `displayxr-service`) |
 | **D3D11 Device** | App's device (shared) | Service's own device |
 | **Swapchain Textures** | Local textures | Cross-process shared (NT handles + KeyedMutex) |
 | **View Poses** | Direct from compositor | Via IPC with SR-aware poses from server |
@@ -49,7 +49,9 @@ This document explains the architectural differences between the **in-process (n
 - Swapchain textures are local (no cross-process sharing needed)
 - Direct access to SR weaver for eye tracking
 
-### Service/IPC (WebXR via Chrome)
+### Service/IPC (WebXR or Shell)
+
+The IPC plumbing is identical whether the client is a Chrome tab or an app launched by the shell — the same `ipc_client_compositor`, the same shared-texture protocol, the same service compositor. The differences are who connects, how many, and under what security context. The Chrome case is shown first; shell-mode differences are called out below.
 
 ```
 ┌─────────────────────────────────────┐     ┌─────────────────────────────────────┐
@@ -79,6 +81,26 @@ This document explains the architectural differences between the **in-process (n
 - KeyedMutex synchronizes cross-process access
 - IPC protocol handles all communication
 
+#### Differences in shell mode
+
+```
+┌─────────────────────────┐     ┌────────────────────────────────────────────┐
+│   displayxr-shell       │─IPC─│           displayxr-service                │
+│  (privileged client)    │     │                                            │
+└─────────────────────────┘     │   d3d11_service_system                     │
+┌─────────────────────────┐     │   - Multi-compositor (N clients → 1 out)   │
+│  3D App #1 (IPC client) │─IPC─│   - Owns SR weaver                         │
+└─────────────────────────┘     │   - Renders combined output                │
+┌─────────────────────────┐     │                                            │
+│  3D App #2 (IPC client) │─IPC─│                                            │
+└─────────────────────────┘     └────────────────────────────────────────────┘
+```
+
+- **N clients, not one.** The service runs in multi-compositor mode and composites every connected client (shell plus one or more 3D apps) into a single output.
+- **Not sandboxed.** Shell-launched apps run with the user's normal token — no AppContainer. `ipc_server_mainloop_windows.cpp` still sets a named-pipe DACL that grants access to both the normal user SID and AppContainer, so the same pipe works for both clients. The shared-handle `SECURITY_ATTRIBUTES` for Chrome adds a `ALL APPLICATION PACKAGES` ACE; shell-launched apps don't need that ACE but don't reject it either.
+- **Shell is a privileged IPC client.** Beyond the standard frame path, the shell sends window pose, focus, layout, and 2D-capture commands over the shell↔service control channel (see [shell-runtime-contract.md](../roadmap/shell-runtime-contract.md)).
+- **Mode gate.** `DISPLAYXR_SHELL_SESSION=1` is the flag the shell sets in the environment of every app it launches; the runtime DLL sees it in `u_sandbox_should_use_ipc()` and routes to IPC even though the process isn't sandboxed.
+
 ---
 
 ## Swapchain Creation and Sharing
@@ -104,7 +126,7 @@ app_device->CreateTexture2D(&desc, nullptr, &texture);
 - No cross-process synchronization needed
 - App renders directly to compositor's textures
 
-### Service/IPC (WebXR)
+### Service/IPC (WebXR or Shell)
 
 ```cpp
 // comp_d3d11_service.cpp
@@ -128,10 +150,12 @@ service_device->CreateTexture2D(&desc, nullptr, &texture);
 // Get NT handle for IPC transfer
 IDXGIResource1* resource;
 resource->CreateSharedHandle(
-    &security_attrs,  // AppContainer security for Chrome
+    &security_attrs,  // DACL includes ALL APPLICATION PACKAGES so Chrome's
+                      // AppContainer can open the handle; shell-launched apps
+                      // inherit access via the user SID in the same DACL.
     DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
     nullptr,
-    &shared_handle    // This goes to Chrome via IPC
+    &shared_handle    // Sent to the IPC client (Chrome tab or shell app) via IPC
 );
 ```
 
@@ -184,7 +208,7 @@ if (c->weaver != nullptr) {
 #endif
 ```
 
-### Service/IPC (WebXR) - With SR Support
+### Service/IPC (WebXR or Shell) — With SR Support
 
 ```
 Chrome calls xrLocateViews()
@@ -292,7 +316,7 @@ xrt_session_event_sink *xses = sess->event_sink;
 // Events pushed directly to session's event queue
 ```
 
-### Service/IPC (WebXR)
+### Service/IPC (WebXR or Shell)
 
 Session state must be communicated via IPC:
 ```cpp
@@ -306,7 +330,7 @@ struct ipc_client_compositor {
 // Client polls for events in xrPollEvent()
 ```
 
-**Race Condition Fix:** The `initial_visible` and `initial_focused` fields were added to avoid the race where Chrome might miss the initial `XR_SESSION_STATE_VISIBLE/FOCUSED` events if they're sent before Chrome's event loop starts polling.
+**Race Condition Fix:** The `initial_visible` and `initial_focused` fields were added to avoid the race where the IPC client (Chrome tab or shell-launched app) might miss the initial `XR_SESSION_STATE_VISIBLE/FOCUSED` events if they're sent before its event loop starts polling.
 
 ---
 
@@ -326,13 +350,13 @@ app_device->AddRef();
 c->device = app_device;
 ```
 
-### Service/IPC (WebXR)
+### Service/IPC (WebXR or Shell)
 
 ```cpp
 struct d3d11_service_system {
     wil::com_ptr<ID3D11Device5> device;  // Service's OWN device
     wil::com_ptr<ID3D11DeviceContext4> context;
-    // Completely separate from Chrome's device
+    // Completely separate from every IPC client's device
 };
 
 // At creation:
@@ -340,10 +364,10 @@ D3D11CreateDevice(..., &device);  // New device
 ```
 
 **Why separate devices?**
-- Chrome runs in sandboxed AppContainer
-- Chrome's device may have different feature levels
-- Service needs full control for weaver integration
-- Cross-process GPU work requires separate devices anyway
+- Cross-process GPU work requires separate devices either way (the client's and the service's are in different processes)
+- The service needs a device in *its own* process to own the SR weaver and render the final composite
+- With multiple IPC clients (shell mode), a shared "app device" wouldn't make sense — there is no single app
+- Chrome adds an extra constraint: its device lives in an AppContainer with potentially different feature levels, so the service device must be independent
 
 ---
 
@@ -363,7 +387,7 @@ struct comp_d3d11_compositor {
 // 4. Swap chain resize handling
 ```
 
-### Service/IPC (WebXR)
+### Service/IPC (WebXR or Shell)
 
 ```cpp
 struct d3d11_service_system {
@@ -388,21 +412,23 @@ struct d3d11_service_system {
 | View poses source | SR weaver via compositor | SR weaver via IPC server |
 | Eye tracking | Direct compositor query | IPC server queries, sends to client |
 | FOV computation | `oxr_session_locate_views()` | `ipc_try_get_sr_view_poses()` |
-| Player transform | Qwerty device in-process | Qwerty device on server side |
+| Player transform | Qwerty device in-process | Qwerty device on server side (WebXR); shell-owned and forwarded to focused app (shell mode) |
 | Session events | Direct callback | IPC message queue |
 | Window ownership | App or compositor | Service's window |
-| Process count | 1 | 2 |
+| Process count | 1 | 2 (WebXR: Chrome + service) or N+1 (shell: shell + N apps + service) |
 | GPU sync | Local barriers | KeyedMutex (cross-process) |
 
 ---
 
-## Current Limitations (WebXR Path)
+## Current Limitations (IPC Paths)
 
-1. **Double compositing:** Chrome renders to shared textures, then service compositor re-renders to output. This adds latency vs native apps.
+1. **Double compositing:** The IPC client renders to shared textures, then the service compositor re-renders to output. This adds latency vs native in-process apps. Affects both WebXR and shell-launched apps.
 
-2. **Security constraints:** Chrome's AppContainer sandbox requires special security descriptors for shared handles.
+2. **Security constraints (WebXR only):** Chrome's AppContainer sandbox requires shared-handle `SECURITY_ATTRIBUTES` with a DACL that grants `ALL APPLICATION PACKAGES`. Shell-launched apps run under the normal user token and don't need this, but the service applies the same permissive DACL uniformly.
 
-3. **QWERTY keyboard control:** The qwerty device allows keyboard control of the viewpoint, but this requires service window focus.
+3. **QWERTY keyboard control:**
+   - **WebXR path:** the qwerty device lives in the service and drives the player transform; it requires the service window to have focus.
+   - **Shell path:** the qwerty device is owned by the shell, not by individual apps. The shell forwards input to the focused app window; apps receive window-relative eye poses but no qwerty device of their own.
 
 ---
 
