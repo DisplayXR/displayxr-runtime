@@ -1997,6 +1997,12 @@ struct oxr_session
 	//! True if session was created with an external window handle (XR_EXT_win32_window_binding).
 	bool has_external_window;
 
+	//! True if this is a headless bridge-relay session (XR_EXT_display_info +
+	//! XR_MND_headless). The bridge forwards raw DP-tracked eye positions to
+	//! a browser-side app, which renders via a separate Chrome session; treat
+	//! view poses like a handle app (display-local, no world_head_pos offset).
+	bool is_bridge_relay;
+
 	//! True if display hardware is currently in 3D mode.
 	bool hardware_display_3d;
 

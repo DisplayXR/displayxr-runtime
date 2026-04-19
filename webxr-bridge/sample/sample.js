@@ -90,24 +90,34 @@ const RIG_DEFAULTS = {
 };
 const rig = JSON.parse(JSON.stringify(RIG_DEFAULTS));
 function rigReset() {
-  rig.pos = [0, 0, 0];
+  // Matches test_apps/common/input_handler.cpp::UpdateCameraMovement reset
+  // branch: preserve virtualDisplayHeight and the current Kooima mode
+  // (camera vs display), reset everything else to defaults. Camera-mode
+  // position snaps to nominalViewerZ with matching invConvergence.
+  const savedVHeight = rig.vHeight;
+  const savedCameraMode = rig.cameraMode;
   rig.yaw = 0;
   rig.pitch = 0;
   rig.ipdFactor = 1.0;
   rig.parallaxFactor = 1.0;
   rig.perspectiveFactor = 1.0;
-  rig.vHeight = VIRTUAL_DISPLAY_HEIGHT;
   rig.invConvergenceDistance = 1.0;
   rig.zoomFactor = 1.0;
+  rig.vHeight = savedVHeight;
+  rig.cameraMode = savedCameraMode;
+  if (rig.cameraMode) {
+    const dxr = xrSession && xrSession.displayXR ? xrSession.displayXR.displayInfo : null;
+    const nz = (dxr && dxr.nominalViewerPosition) ? dxr.nominalViewerPosition[2] : 0.6;
+    rig.pos = [0, 0, nz];
+    if (nz > 0) rig.invConvergenceDistance = 1.0 / nz;
+  } else {
+    rig.pos = [0, 0, 0];
+  }
   // Also drop any phantom held keys — bridge's hook can miss keyup events
   // during focus changes (alt-tab, menus), leaving stuck keys that drive
   // continuous motion/rotation.
   keyDown.clear();
   mouseLookDown = false;
-  // Force the origin offset to re-calibrate on the next eye-pose frame, so
-  // the current head position becomes the new display-centric baseline.
-  originOffset = null;
-  recalibKey = '';
   // Also reset prevTimeMs so the next frame doesn't see a huge dt.
   prevTimeMs = 0;
   // Force three.js to re-read all GL state from the context. Our monkey-
@@ -260,13 +270,6 @@ function buildCameraProjection(eyeLocal, screenWm, screenHm, invd, halfTanVfov) 
 
 let prevTimeMs = 0;
 let cubeRotation = 0;
-// Origin offset — computed on first bridge eye-pose frame. Shifts bridge's
-// LOCAL reference space (often not display-anchored — e.g. LOCAL origin may
-// be at XR session start pose, not the display) so that the initial head
-// position maps to nominalViewerPosition. After that, head motion produces
-// parallax relative to this anchored display-centric frame.
-let originOffset = null;
-let recalibKey = '';
 
 function onXRFrame(time, frame) {
   if (!xrSession) return;
@@ -375,34 +378,15 @@ function onXRFrame(time, frame) {
   const m2v = (screenHm > 0) ? (rig.vHeight / screenHm) : 1.0;
   const nominalPos = (di && di.nominalViewerPosition) ? di.nominalViewerPosition : [0, 0.1, 0.6];
 
-  // Auto-calibrate origin offset on first valid eye-pose frame so that the
-  // initial head midpoint maps to nominalViewerPosition (display-centric).
-  if (eyePoses && eyePoses.length > 0) {
-    // Re-calibrate if mode changed (viewCount swap) or first time.
-    const key = tileLayout.monoMode + ':' + eyePoses.length;
-    if (originOffset === null || key !== recalibKey) {
-      let hx = 0, hy = 0, hz = 0;
-      for (const e of eyePoses) {
-        hx += e.position[0]; hy += e.position[1]; hz += e.position[2];
-      }
-      hx /= eyePoses.length; hy /= eyePoses.length; hz /= eyePoses.length;
-      originOffset = [nominalPos[0] - hx, nominalPos[1] - hy, nominalPos[2] - hz];
-      recalibKey = key;
-      log('calibrated origin offset: [' +
-          originOffset[0].toFixed(3) + ',' +
-          originOffset[1].toFixed(3) + ',' +
-          originOffset[2].toFixed(3) + ']');
-    }
-  }
-
-  // Compute pair midpoint (head position) for IPD/parallax tunables.
+  // Bridge forwards eye positions already in display-local coords (DP eye
+  // tracker, origin = display center). Runtime's oxr_session_locate_views
+  // returns them directly for bridge-relay sessions, same as handle apps.
+  // No client-side calibration needed.
   let headMid = nominalPos;
-  if (eyePoses && eyePoses.length > 0 && originOffset) {
+  if (eyePoses && eyePoses.length > 0) {
     let mx = 0, my = 0, mz = 0;
     for (const e of eyePoses) {
-      mx += e.position[0] + originOffset[0];
-      my += e.position[1] + originOffset[1];
-      mz += e.position[2] + originOffset[2];
+      mx += e.position[0]; my += e.position[1]; mz += e.position[2];
     }
     headMid = [mx / eyePoses.length, my / eyePoses.length, mz / eyePoses.length];
   }
@@ -454,18 +438,13 @@ function onXRFrame(time, frame) {
     // Eye position in display-centric frame, with IPD/parallax tunables.
     // Then subtract window center offset so eye XY is window-relative.
     let eyePos;
-    if (eyePoses && eyePoses.length > 0 && originOffset) {
+    if (eyePoses && eyePoses.length > 0) {
       const idx = tileLayout.monoMode ? 0 : Math.min(eye, eyePoses.length - 1);
       const p = eyePoses[idx].position;
-      const calibrated = [
-        p[0] + originOffset[0],
-        p[1] + originOffset[1],
-        p[2] + originOffset[2],
-      ];
       // Per-eye IPD offset from headMid, scaled by ipdFactor (0=mono).
-      const offX = (calibrated[0] - headMid[0]) * rig.ipdFactor;
-      const offY = (calibrated[1] - headMid[1]) * rig.ipdFactor;
-      const offZ = (calibrated[2] - headMid[2]) * rig.ipdFactor;
+      const offX = (p[0] - headMid[0]) * rig.ipdFactor;
+      const offY = (p[1] - headMid[1]) * rig.ipdFactor;
+      const offZ = (p[2] - headMid[2]) * rig.ipdFactor;
       eyePos = [
         trackedMid[0] + offX - winOffX,
         trackedMid[1] + offY - winOffY,
@@ -651,8 +630,6 @@ async function enterXR() {
     cubeMesh = null;
     prevTimeMs = 0;
     cubeRotation = 0;
-    originOffset = null;
-    recalibKey = '';
     enterBtn.disabled = false;
     exitBtn.disabled = true;
   });
@@ -722,7 +699,8 @@ async function enterXR() {
       if (firstDown) {
         if (m.code === VK.SPACE || m.code === VK.R) {
           rigReset();
-          log('rig reset');
+          log('rig reset — mode=' + (rig.cameraMode ? 'camera' : 'display') +
+              ' pos=[' + rig.pos.map(v => v.toFixed(2)).join(',') + ']');
         } else if (m.code === VK.C) {
           rig.cameraMode = !rig.cameraMode;
           // Reset rig on mode switch (matches input_handler.cpp:215-232)
@@ -740,7 +718,6 @@ async function enterXR() {
             // Display-centric: rig at origin (display-anchored)
             rig.pos = [0, 0, 0];
           }
-          originOffset = null; recalibKey = '';
           log('Kooima: ' + (rig.cameraMode ? 'camera-centric' : 'display-centric'));
         } else if (m.code === VK.V && displayXR) {
           // Cycle rendering mode (V key, matches cube_handle_d3d11_win).
