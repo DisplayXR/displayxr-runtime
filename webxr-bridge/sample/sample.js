@@ -339,20 +339,26 @@ function onXRFrame(time, frame) {
   const di = displayXR ? displayXR.displayInfo : null;
   const wi = displayXR ? displayXR.windowInfo : null;
 
-  // Per-tile render dims: windowPixelSize × viewScale = active per-view area.
-  // Matches in-process app path (renderW = g_windowWidth * viewScaleX).
-  // Falls back to displayPixelSize × viewScale (frame 0, before window info),
-  // then to framebuffer / tileGrid as last resort.
+  // Per-tile render dims: prefer the bridge-authoritative viewWidth/Height
+  // (bridge computed = windowPixelSize × viewScale and pushed to the
+  // compositor via DXR_BridgeViewW/H — same number we must render at).
+  // Fallbacks exist for the first few frames before windowInfo arrives:
+  // windowPixelSize × viewScale → displayPixelSize × viewScale → fb/grid.
+  const haveBridgeView = !!(wi && wi.valid && wi.viewWidth > 0 && wi.viewHeight > 0);
   const pixW = (wi && wi.valid && wi.windowPixelSize) ? wi.windowPixelSize[0]
              : (di && di.displayPixelSize) ? di.displayPixelSize[0] : 0;
   const pixH = (wi && wi.valid && wi.windowPixelSize) ? wi.windowPixelSize[1]
              : (di && di.displayPixelSize) ? di.displayPixelSize[1] : 0;
-  const tileW = pixW > 0
-    ? Math.round(pixW * tileLayout.viewScaleX)
-    : Math.floor(glLayer.framebufferWidth / tileLayout.tileColumns);
-  const tileH = pixH > 0
-    ? Math.round(pixH * tileLayout.viewScaleY)
-    : Math.floor(glLayer.framebufferHeight / tileLayout.tileRows);
+  const tileW = haveBridgeView
+    ? wi.viewWidth
+    : (pixW > 0
+      ? Math.round(pixW * tileLayout.viewScaleX)
+      : Math.floor(glLayer.framebufferWidth / tileLayout.tileColumns));
+  const tileH = haveBridgeView
+    ? wi.viewHeight
+    : (pixH > 0
+      ? Math.round(pixH * tileLayout.viewScaleY)
+      : Math.floor(glLayer.framebufferHeight / tileLayout.tileRows));
   // Window-relative Kooima: when the bridge has located the compositor window,
   // use its physical size as the screen and subtract the window-center offset
   // from each eye position. This matches cube_handle_d3d11_win's display-centric
@@ -413,8 +419,9 @@ function onXRFrame(time, frame) {
 
   // Diagnostic log (once every 600 frames ~ 10s).
   if (frameCount % 600 === 1) {
-    log('diag: tile=' + tileW + 'x' + tileH +
-        (pixW > 0 ? ((wi && wi.valid && wi.windowPixelSize) ? ' (win*scale)' : ' (disp*scale)') : ' (fb/grid)') +
+    const tileSrc = haveBridgeView ? ' (bridge)'
+                 : (pixW > 0 ? ((wi && wi.valid && wi.windowPixelSize) ? ' (win*scale)' : ' (disp*scale)') : ' (fb/grid)');
+    log('diag: tile=' + tileW + 'x' + tileH + tileSrc +
         ' ' + (rig.cameraMode ? 'CAM' : 'DISP') +
         ' rig=[' + rig.pos.map(v => v.toFixed(2)).join(',') + ']' +
         ' yaw=' + rig.yaw.toFixed(2) + ' pitch=' + rig.pitch.toFixed(2) +
@@ -650,22 +657,48 @@ async function enterXR() {
     log('BRIDGE: ' + (event.detail.connected ? 'connected' : 'disconnected — is displayxr-webxr-bridge running?'));
   });
 
+  // Debounce hardwarestatechange: the Leia driver briefly flaps 3D→2D→3D
+  // during fullscreen⇄windowed transitions. Acting on each event forces a
+  // real rendering-mode transition which drops eye tracking for seconds.
+  // Only auto-request after the state has been stable for ~600 ms. If the
+  // state flaps BACK to match current mode before the timer fires, cancel —
+  // otherwise we'd force a transition to a state that's no longer wanted.
+  let hwStatePendingTimer = null;
+  let hwStatePending = null;
   xrSession.addEventListener('hardwarestatechange', (event) => {
     const hw3D = event.detail.hardware3D;
     log('HW STATE: hw3D=' + hw3D);
-    // Auto-request the matching rendering mode when hardware state changes
-    // (e.g., Leia display auto-switches to 3D on window focus).
-    if (displayXR) {
+    if (!displayXR) return;
+    const cur = displayXR.renderingMode;
+    if (cur && cur.hardware3D === hw3D) {
+      // Already matches — cancel any pending transition (driver flapped back).
+      if (hwStatePendingTimer !== null) {
+        clearTimeout(hwStatePendingTimer);
+        hwStatePendingTimer = null;
+        hwStatePending = null;
+      }
+      return;
+    }
+    hwStatePending = hw3D;
+    if (hwStatePendingTimer !== null) clearTimeout(hwStatePendingTimer);
+    hwStatePendingTimer = setTimeout(() => {
+      hwStatePendingTimer = null;
+      const pending = hwStatePending;
+      hwStatePending = null;
+      if (!displayXR) return;
+      const curNow = displayXR.renderingMode;
+      if (curNow && curNow.hardware3D === pending) return;  // settled
       const modes = displayXR.renderingModes || [];
       for (let i = 0; i < modes.length; i++) {
-        if (modes[i].hardware3D === hw3D) {
+        if (modes[i].hardware3D === pending) {
           lastRequestedMode = i;
           displayXR.requestRenderingMode(i);
-          log('auto-requesting mode ' + i + ' (' + modes[i].name + ') to match hw3D=' + hw3D);
+          log('auto-requesting mode ' + i + ' (' + modes[i].name +
+              ') to match stable hw3D=' + pending);
           break;
         }
       }
-    }
+    }, 600);
   });
 
   xrSession.addEventListener('displayxrinput', (event) => {

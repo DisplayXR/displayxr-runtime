@@ -393,8 +393,8 @@ struct WindowMetrics {
 	float sizeHm = 0.0f;
 	float centerOffsetXm = 0.0f;
 	float centerOffsetYm = 0.0f;
-	uint32_t viewWidth = 0;   // Compositor's live per-view width (from HWND props)
-	uint32_t viewHeight = 0;  // Compositor's live per-view height (from HWND props)
+	uint32_t viewWidth = 0;   // Per-view tile width = pixelW × viewScaleX (bridge-computed, pushed to compositor)
+	uint32_t viewHeight = 0;  // Per-view tile height = pixelH × viewScaleY (bridge-computed, pushed to compositor)
 };
 
 struct Bridge {
@@ -485,6 +485,31 @@ static std::atomic<HWND> g_compositor_hwnd{nullptr};
 // Cleared by the main loop after polling metrics.
 static std::atomic<bool> g_window_event_pending{false};
 
+// Mirror cube_handle_d3d11_win:600 — the app (here: bridge, as the app's
+// proxy) computes per-view tile dims from its live window size and the
+// current mode's viewScale, then pushes them to the compositor so the
+// bridge_override crop matches exactly what the sample renders. Single
+// source of truth, can't drift with deferred atlas resize.
+static void compute_and_push_bridge_view_dims(Bridge &b, HWND hwnd,
+                                              WindowMetrics &neu) {
+	neu.viewWidth = 0;
+	neu.viewHeight = 0;
+	if (!neu.valid || neu.pixelW <= 0 || neu.pixelH <= 0) return;
+	if (b.current_mode_index >= b.modes.size()) return;
+	float sx = b.modes[b.current_mode_index].viewScaleX;
+	float sy = b.modes[b.current_mode_index].viewScaleY;
+	if (sx <= 0.0f || sy <= 0.0f) return;
+	uint32_t vw = (uint32_t)((float)neu.pixelW * sx + 0.5f);
+	uint32_t vh = (uint32_t)((float)neu.pixelH * sy + 0.5f);
+	if (vw == 0 || vh == 0) return;
+	neu.viewWidth = vw;
+	neu.viewHeight = vh;
+	if (hwnd) {
+		SetPropW(hwnd, L"DXR_BridgeViewW", (HANDLE)(uintptr_t)vw);
+		SetPropW(hwnd, L"DXR_BridgeViewH", (HANDLE)(uintptr_t)vh);
+	}
+}
+
 // Poll current metrics and update b.window_metrics. Returns true if values
 // changed compared to the cached state (including valid↔invalid transitions).
 static bool poll_window_metrics(Bridge &b) {
@@ -492,11 +517,10 @@ static bool poll_window_metrics(Bridge &b) {
 	g_compositor_hwnd.store(hwnd);
 	WindowMetrics neu;
 	bool ok = compute_window_metrics_impl(hwnd, b, neu);
-	// Read compositor's live per-view dims from HWND properties.
-	if (hwnd) {
-		neu.viewWidth = (uint32_t)(uintptr_t)GetPropW(hwnd, L"DXR_ViewW");
-		neu.viewHeight = (uint32_t)(uintptr_t)GetPropW(hwnd, L"DXR_ViewH");
-	}
+	// Bridge is the source of truth for per-view tile dims. Compute from
+	// live window size × current mode's viewScale, then push to compositor
+	// so bridge_override crops the exact region the sample will render.
+	compute_and_push_bridge_view_dims(b, hwnd, neu);
 	const WindowMetrics &old = b.window_metrics;
 	const float eps = 0.0001f;
 	bool changed = false;
@@ -1040,13 +1064,22 @@ static void ws_thread_func(Bridge &b) {
 					handle_ws_message(b, in_msg);
 				}
 			} else {
-				// recv returned false — check if socket is dead.
-				fd_set errfds;
-				FD_ZERO(&errfds);
-				FD_SET(client, &errfds);
-				struct timeval zero = {0, 0};
-				if (select(0, nullptr, nullptr, &errfds, &zero) > 0) {
-					LOG_I("WS client disconnected (socket error)");
+				// ws_recv_text returned false — either timeout (no data) or
+				// disconnect (FIN or error). Distinguish: MSG_PEEK of 1 byte
+				// returns 0 iff peer closed cleanly, -1+WSAEWOULDBLOCK iff no
+				// data yet, -1+other iff error. Without this, an extension
+				// reload (clean close, no error) would leave ws_client_connected
+				// stuck at true and the next connect would be rejected as a
+				// "second client".
+				char peek;
+				int r = recv(client, &peek, 1, MSG_PEEK);
+				if (r == 0) {
+					LOG_I("WS client closed");
+					b.ws_client_connected.store(false);
+					break;
+				}
+				if (r < 0 && WSAGetLastError() != WSAEWOULDBLOCK) {
+					LOG_I("WS client disconnected (socket error: %d)", WSAGetLastError());
 					b.ws_client_connected.store(false);
 					break;
 				}
@@ -1331,9 +1364,16 @@ static void handle_event(Bridge &b, const XrEventDataBuffer &evt) {
 		if (e->currentModeIndex < b.modes.size())
 			hw3d = b.modes[e->currentModeIndex].hardwareDisplay3D;
 
+		// New mode may have different viewScale → recompute bridge view dims
+		// and push to the compositor so its bridge_override crop stays in sync.
+		bool win_changed = poll_window_metrics(b);
+
 		if (b.ws_client_connected.load()) {
 			b.outgoing.push(build_mode_changed_json(
 			    e->previousModeIndex, e->currentModeIndex, hw3d, b.config_views));
+			if (win_changed) {
+				b.outgoing.push(build_window_info_json(b.window_metrics));
+			}
 		}
 	} break;
 

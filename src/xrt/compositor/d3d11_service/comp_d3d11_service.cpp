@@ -778,8 +778,6 @@ slot_animate_to(struct d3d11_multi_client_slot *slot,
 
 #define ANIM_DURATION_NS (300ULL * 1000000ULL)
 
-static void publish_view_dims_to_hwnd(const struct d3d11_service_system *sys);
-
 /*!
  * Sync tile layout from the active rendering mode of the head device.
  * Defaults to 2 columns, 1 row (side-by-side stereo) if not available.
@@ -809,54 +807,6 @@ sync_tile_layout(struct d3d11_service_system *sys)
 	if (sys->display_width > 0 && sys->display_height > 0) {
 		sys->view_width = sys->display_width / sys->tile_columns;
 		sys->view_height = sys->display_height / sys->tile_rows;
-	}
-
-	publish_view_dims_to_hwnd(sys);
-}
-
-/*!
- * Publish the active per-view pixel dimensions to HWND properties so the
- * WebXR bridge can read them cross-process via GetPropW.
- *
- * Active per-view = atlas × viewScale = sys->display_width × viewScaleX.
- * sys->display_width tracks the compositor window (deferred during drag),
- * so this is always consistent with what the compositor actually crops.
- * Falls back to sys->view_width/height when rendering mode data is unavailable.
- */
-static void
-publish_view_dims_to_hwnd(const struct d3d11_service_system *sys)
-{
-	if (!sys->compositor_hwnd)
-		return;
-
-	uint32_t vw = 0, vh = 0;
-	if (sys->xdev != NULL && sys->xdev->hmd != NULL &&
-	    sys->display_width > 0 && sys->display_height > 0) {
-		uint32_t idx = sys->xdev->hmd->active_rendering_mode_index;
-		if (idx < sys->xdev->rendering_mode_count) {
-			float sx = sys->xdev->rendering_modes[idx].view_scale_x;
-			float sy = sys->xdev->rendering_modes[idx].view_scale_y;
-			if (sx > 0.0f && sy > 0.0f) {
-				vw = (uint32_t)(sys->display_width * sx);
-				vh = (uint32_t)(sys->display_height * sy);
-			}
-		}
-	}
-	// Fallback to atlas/tileGrid if rendering mode data unavailable
-	if (vw == 0 || vh == 0) {
-		vw = sys->view_width;
-		vh = sys->view_height;
-	}
-	if (vw > 0 && vh > 0) {
-		BOOL ok_w = SetPropW(sys->compositor_hwnd, L"DXR_ViewW", (HANDLE)(uintptr_t)vw);
-		BOOL ok_h = SetPropW(sys->compositor_hwnd, L"DXR_ViewH", (HANDLE)(uintptr_t)vh);
-		static bool logged_once = false;
-		if (!logged_once) {
-			U_LOG_W("publish_view_dims: hwnd=%p vw=%u vh=%u ok=%d/%d (display=%ux%u)",
-			        sys->compositor_hwnd, vw, vh, ok_w, ok_h,
-			        sys->display_width, sys->display_height);
-			logged_once = true;
-		}
 	}
 }
 
@@ -1835,10 +1785,10 @@ init_client_render_resources(struct d3d11_service_system *sys,
 		U_LOG_W("Created window for client: hwnd=%p (%ux%u)", res->hwnd, sys->output_width, sys->output_height);
 	}
 
-	// Track compositor HWND for view-dim publishing (WebXR bridge reads via GetPropW).
+	// Track compositor HWND so the WebXR bridge can push per-view tile dims
+	// via SetPropW(DXR_BridgeViewW/H) and request mode changes via DXR_RequestMode.
 	if (res->hwnd != nullptr && sys->compositor_hwnd == nullptr) {
 		sys->compositor_hwnd = res->hwnd;
-		publish_view_dims_to_hwnd(sys);
 	}
 
 	// Get actual window client area (may differ from requested size if window
@@ -1967,7 +1917,6 @@ init_client_render_resources(struct d3d11_service_system *sys,
 				sys->view_height = dp_px_h / sys->tile_rows;
 				sys->display_width = sys->tile_columns * sys->view_width;
 				sys->display_height = sys->tile_rows * sys->view_height;
-				publish_view_dims_to_hwnd(sys);
 
 				// Recreate stereo texture at correct dimensions
 				res->atlas_rtv.reset();
@@ -4003,7 +3952,6 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 	}
 	mc->hwnd = (HWND)comp_d3d11_window_get_hwnd(mc->window);
 	sys->compositor_hwnd = mc->hwnd;
-	publish_view_dims_to_hwnd(sys);
 
 	if (sys->xsysd != nullptr) {
 		comp_d3d11_window_set_system_devices(mc->window, sys->xsysd);
@@ -4270,7 +4218,6 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 				}
 				mc->hwnd = (HWND)comp_d3d11_window_get_hwnd(mc->window);
 				sys->compositor_hwnd = mc->hwnd;
-				publish_view_dims_to_hwnd(sys);
 
 				if (sys->xsysd != nullptr) {
 					comp_d3d11_window_set_system_devices(mc->window, sys->xsysd);
@@ -7031,8 +6978,14 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 
 					// Scale stereo texture proportionally to window/display ratio.
 					// Skip during drag to avoid expensive texture reallocation every pixel.
+					// Skip for bridge mode: the WebXR client swapchain is always
+					// allocated at full-display worst-case, and the bridge pushes
+					// content dims = windowSize × viewScale via DXR_BridgeViewW/H.
+					// The conservative min-ratio shrink here can make the atlas
+					// narrower than the bridge-computed content, clipping it.
 					// The display processor handles mismatched stereo/target sizes via stretching.
-					if (c->render.display_processor != nullptr && !in_size_move) {
+					if (c->render.display_processor != nullptr && !in_size_move &&
+					    !g_bridge_relay_active) {
 						uint32_t disp_px_w = 0, disp_px_h = 0;
 						int32_t disp_left = 0, disp_top = 0;
 
@@ -7099,7 +7052,6 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 									sys->view_height = new_view_h;
 									sys->display_width = new_atlas_w;
 									sys->display_height = new_atlas_h;
-									publish_view_dims_to_hwnd(sys);
 
 									U_LOG_W("Atlas texture resized: view=%ux%u, atlas=%ux%u",
 									        new_view_w, new_view_h, new_atlas_w, new_atlas_h);
@@ -7319,32 +7271,53 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	uint32_t content_view_w = sys->view_width;
 	uint32_t content_view_h = sys->view_height;
 
-	// Bridge-relay: compute active per-view dims (display × viewScale).
-	// The bridge sample renders at these dims; the compositor must read/crop
-	// at the same size instead of Chrome's compromise-scaled rect.
-	// Always override when bridge is active — Chrome's rect is always wrong
-	// (compromise-scaled, doesn't match the sample's displayPixelSize × viewScale).
+	// Bridge-relay: read active per-view tile dims pushed by the bridge.
+	// The bridge (as the sample's proxy) owns windowSize × viewScale and
+	// writes DXR_BridgeViewW/H via SetPropW each time the window or mode
+	// changes. We crop at exactly what it pushed, guaranteeing match with
+	// the sample's render — same model as cube_handle_d3d11_win, which
+	// sets XrCompositionLayerProjectionView.subImage.imageRect directly.
+	//
+	// Fallback to display_width × viewScale when the bridge hasn't pushed
+	// yet (first few frames before poll_window_metrics runs). Without this,
+	// Chrome's compromise-scaled subImage.imageRect wins and views scramble.
 	bool bridge_override = false;
 	uint32_t active_vw = sys->view_width;
 	uint32_t active_vh = sys->view_height;
-	if (g_bridge_relay_active && !sys->shell_mode &&
-	    sys->xdev != NULL && sys->xdev->hmd != NULL &&
-	    sys->display_width > 0 && sys->display_height > 0) {
-		uint32_t mi = sys->xdev->hmd->active_rendering_mode_index;
-		if (mi < sys->xdev->rendering_mode_count) {
-			// Use sys->display_width × viewScale — tracks the compositor window
-			// (matches in-process path: u_tiling_compute_canvas_view uses
-			// actual window dims). The sample must also use windowPixelSize ×
-			// viewScale to stay in sync.
-			float sx = sys->xdev->rendering_modes[mi].view_scale_x;
-			float sy = sys->xdev->rendering_modes[mi].view_scale_y;
-			if (sx > 0.0f && sy > 0.0f) {
-				uint32_t vw = (uint32_t)(sys->display_width * sx);
-				uint32_t vh = (uint32_t)(sys->display_height * sy);
-				if (vw > 0 && vh > 0) {
-					active_vw = vw;
-					active_vh = vh;
-					bridge_override = true;
+	if (g_bridge_relay_active && !sys->shell_mode) {
+		uint32_t bvw = 0, bvh = 0;
+		if (sys->compositor_hwnd) {
+			bvw = (uint32_t)(uintptr_t)GetPropW(sys->compositor_hwnd, L"DXR_BridgeViewW");
+			bvh = (uint32_t)(uintptr_t)GetPropW(sys->compositor_hwnd, L"DXR_BridgeViewH");
+		}
+		if (bvw > 0 && bvh > 0) {
+			active_vw = bvw;
+			active_vh = bvh;
+			bridge_override = true;
+			// Log when active dims CHANGE (not just first frame) so we can
+			// see windowed-mode transitions in the log.
+			static uint32_t last_logged_vw = 0, last_logged_vh = 0;
+			if (bvw != last_logged_vw || bvh != last_logged_vh) {
+				U_LOG_W("BRIDGE DIMS: active=%ux%u sys_view=%ux%u display=%ux%u",
+				        bvw, bvh, sys->view_width, sys->view_height,
+				        sys->display_width, sys->display_height);
+				last_logged_vw = bvw;
+				last_logged_vh = bvh;
+			}
+		} else if (sys->xdev != NULL && sys->xdev->hmd != NULL &&
+		           sys->display_width > 0 && sys->display_height > 0) {
+			uint32_t mi = sys->xdev->hmd->active_rendering_mode_index;
+			if (mi < sys->xdev->rendering_mode_count) {
+				float sx = sys->xdev->rendering_modes[mi].view_scale_x;
+				float sy = sys->xdev->rendering_modes[mi].view_scale_y;
+				if (sx > 0.0f && sy > 0.0f) {
+					uint32_t vw = (uint32_t)(sys->display_width * sx);
+					uint32_t vh = (uint32_t)(sys->display_height * sy);
+					if (vw > 0 && vh > 0) {
+						active_vw = vw;
+						active_vh = vh;
+						bridge_override = true;
+					}
 				}
 			}
 		}
@@ -7562,11 +7535,15 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				src_y = static_cast<float>(tileY * active_vh);
 			}
 
-			// Tile layout for atlas placement.
-			uint32_t layout_vw = sys->shell_mode ? static_cast<uint32_t>(src_w)
-			                   : (bridge_override ? active_vw : sys->view_width);
-			uint32_t layout_vh = sys->shell_mode ? static_cast<uint32_t>(src_h)
-			                   : (bridge_override ? active_vh : sys->view_height);
+			// Tile layout for atlas placement. Atlas tiles are always laid
+			// out at sys->view_width × sys->view_height stride — that's the
+			// invariant service_crop_atlas_for_dp relies on when it reads
+			// src_tile_x = view_idx × sys->view_width from the atlas. For
+			// bridge_override the CONTENT is smaller (active_vw × active_vh)
+			// but sits in the top-left of each full-sized tile slot, just
+			// like legacy compromise-scaled apps. The crop shader handles it.
+			uint32_t layout_vw = sys->shell_mode ? static_cast<uint32_t>(src_w) : sys->view_width;
+			uint32_t layout_vh = sys->shell_mode ? static_cast<uint32_t>(src_h) : sys->view_height;
 			uint32_t tile_x, tile_y;
 			u_tiling_view_origin(eye, sys->tile_columns,
 			                     layout_vw, layout_vh,
