@@ -1,0 +1,43 @@
+# Shell Phase 6 Status: Warmup + IPC Fixes
+
+**Branch:** `feature/shell-phase6`
+**Status:** Complete
+**Date:** 2026-04-11
+
+## Scope
+
+Two bugs discovered during Phase 5 development:
+
+1. **#140** — Eye-tracking warmup shows left-eye-stretched for 3-10s after shell activation.
+2. **#144** — Rapid out-only IPC poll causes pipe-closed errors (workaround in place).
+
+**Full plan:** [shell-phase6-plan.md](shell-phase6-plan.md)
+
+## Tasks
+
+| Status | Task | Description |
+|--------|------|-------------|
+| [x] | 6.1 | Fix stretched-left-eye artifact on shell startup (#140) |
+| [x] | 6.2 | IPC rapid-poll pipe closure — resolved (stale binary) (#144) |
+| [x] | 6.3 | Mouse-over hover highlight on launcher tiles |
+| [x] | 6.4 | "Press Ctrl+L to open launcher" hint for empty shell |
+| [x] | 6.5 | Scrollable launcher grid (mouse wheel + arrow-key overflow) |
+| [x] | 6.6 | Permanent remove + Ctrl+R refresh (re-scan sidecars) |
+
+## Commits
+
+- `cb935ce3e` Shell 6: scrollable grid, permanent remove, Ctrl+R refresh
+- `db6729cde` Shell 6: resolve #144 (stale-binary) + hover highlight
+- `72354b5d5` Docs: update Phase 6 status — 6.1 complete
+- `dfd23c8c6` Shell 6: fix stretched-left-eye artifact on shell startup (#140)
+- `91e9c3c2d` Docs: add Phase 6 plan, status, and agent prompt
+
+## Design Decisions
+
+- **6.1 Root cause**: NOT eye-tracking warmup — the app's HWND appearing on the 3D display disrupts the SR SDK's weaver initialization. Confirmed by isolating: no stretch with empty shell, no stretch when launching from launcher (DP already stable), stretch only when app launches at startup.
+- **6.1 Fix**: `STARTF_USESHOWWINDOW + SW_HIDE` on app launch in shell mode. App window is never needed (content via shared handles into multi-comp atlas). Hot-switch restores via `ShowWindow(SW_SHOW)`.
+- **6.1 Bonus**: skip per-client DP in shell mode (multi-comp owns shared DP), remove `request_display_mode(true)` from init paths (avoids SR SDK recalibration), add empty-shell hint text.
+
+## Known Issues
+
+_(none)_

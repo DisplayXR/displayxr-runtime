@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "name": "Cube OpenGL (Handle)",
+  "type": "3d",
+  "category": "test",
+  "display_mode": "auto",
+  "description": "Reference spinning cube demonstrating XR_EXT_win32_window_binding on OpenGL.",
+  "icon": "icon.png"
+}

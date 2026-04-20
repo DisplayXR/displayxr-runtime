@@ -40,6 +40,15 @@
 #include "util/u_hud.h"
 #include "util/u_tiling.h"
 #include "util/u_canvas.h"
+#include "util/u_mcp_capture.h"
+
+// STB_IMAGE_WRITE_STATIC scopes all stbi_write_* to this TU so linking
+// alongside other compositors that also implement stb doesn't produce
+// duplicate symbols. STB_IMAGE_WRITE_IMPLEMENTATION still forces the
+// single-header definitions to emit here.
+#define STB_IMAGE_WRITE_STATIC
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
 #include "qwerty_interface.h"
@@ -212,6 +221,9 @@ struct comp_metal_compositor
 
 	//! Thread safety.
 	struct os_mutex mutex;
+
+	//! MCP capture request box (polled at end of layer_commit).
+	struct u_mcp_capture_request mcp_capture;
 };
 
 /*
@@ -1246,6 +1258,83 @@ metal_compositor_render_hud(struct comp_metal_compositor *c, float dt,
 	[encoder endEncoding];
 }
 
+// Service a pending MCP capture_frame request. Blits the content
+// region of c->atlas_texture (tile_columns × view_width by tile_rows
+// × view_height — what the app actually wrote, matching what the
+// compositor crops and hands to the DP) into a shared MTLBuffer,
+// swaps BGRA→RGBA, and writes a single PNG.
+static void
+metal_compositor_service_mcp_capture(struct comp_metal_compositor *c, id<MTLCommandBuffer> render_cmd_buf)
+{
+	char path[U_MCP_CAPTURE_PATH_MAX];
+	if (!u_mcp_capture_poll(&c->mcp_capture, path)) {
+		return;
+	}
+	if (c->atlas_texture == nil || c->tile_columns == 0 || c->tile_rows == 0 ||
+	    c->view_width == 0 || c->view_height == 0) {
+		u_mcp_capture_complete(&c->mcp_capture, false);
+		return;
+	}
+
+	@autoreleasepool {
+		uint32_t content_w = c->tile_columns * c->view_width;
+		uint32_t content_h = c->tile_rows * c->view_height;
+		// Clamp to the allocated atlas in case a mode switch produces
+		// a content region larger than the worst-case pre-allocation.
+		if (content_w > (uint32_t)c->atlas_texture.width) {
+			content_w = (uint32_t)c->atlas_texture.width;
+		}
+		if (content_h > (uint32_t)c->atlas_texture.height) {
+			content_h = (uint32_t)c->atlas_texture.height;
+		}
+
+		size_t row_pitch = (size_t)content_w * 4;
+		size_t buf_bytes = row_pitch * content_h;
+		id<MTLBuffer> staging = [c->device newBufferWithLength:buf_bytes
+		                                               options:MTLResourceStorageModeShared];
+		if (staging == nil) {
+			u_mcp_capture_complete(&c->mcp_capture, false);
+			return;
+		}
+
+		// Render cmd_buf was already committed; wait for it so the
+		// atlas contents are visible before we blit them out.
+		[render_cmd_buf waitUntilCompleted];
+
+		id<MTLCommandBuffer> blit_cb = [c->command_queue commandBuffer];
+		id<MTLBlitCommandEncoder> blit = [blit_cb blitCommandEncoder];
+		[blit copyFromTexture:c->atlas_texture
+		          sourceSlice:0
+		          sourceLevel:0
+		         sourceOrigin:MTLOriginMake(0, 0, 0)
+		           sourceSize:MTLSizeMake(content_w, content_h, 1)
+		             toBuffer:staging
+		    destinationOffset:0
+		destinationBytesPerRow:row_pitch
+		destinationBytesPerImage:buf_bytes];
+		[blit endEncoding];
+		[blit_cb commit];
+		[blit_cb waitUntilCompleted];
+
+		// Atlas format is BGRA8Unorm — swap into RGBA for stbi_write_png.
+		uint8_t *bgra = (uint8_t *)staging.contents;
+		uint8_t *rgba = malloc(buf_bytes);
+		if (rgba == NULL) {
+			u_mcp_capture_complete(&c->mcp_capture, false);
+			return;
+		}
+		for (size_t i = 0; i < buf_bytes; i += 4) {
+			rgba[i + 0] = bgra[i + 2];
+			rgba[i + 1] = bgra[i + 1];
+			rgba[i + 2] = bgra[i + 0];
+			rgba[i + 3] = bgra[i + 3];
+		}
+		bool ok = stbi_write_png(path, (int)content_w, (int)content_h, 4, rgba, (int)row_pitch) != 0;
+		free(rgba);
+		u_mcp_capture_complete(&c->mcp_capture, ok);
+	}
+}
+
 static xrt_result_t
 metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
 {
@@ -1680,6 +1769,11 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		[cmd_buf waitUntilCompleted];
 	}
 
+	// MCP capture_frame: if the server thread has posted a request,
+	// blit the atlas into a CPU-visible buffer, encode PNG(s), and
+	// unblock the waiter. Pays for itself only when actively capturing.
+	metal_compositor_service_mcp_capture(c, cmd_buf);
+
 	// Reset layer accumulator
 	c->layer_accum.layer_count = 0;
 
@@ -1692,6 +1786,12 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 	struct comp_metal_compositor *c = metal_comp(xc);
 
 	U_LOG_I("Destroying Metal compositor");
+
+	// Uninstall the MCP capture hook before we drop any GPU resources —
+	// the MCP thread can no longer request a readback against us after
+	// this returns.
+	u_mcp_capture_uninstall();
+	u_mcp_capture_fini(&c->mcp_capture);
 
 	// Wrap teardown in @autoreleasepool so autoreleased Metal objects
 	// (drawables, command buffers, textures) are drained immediately
@@ -1839,6 +1939,9 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 	if (c == NULL) {
 		return XRT_ERROR_ALLOCATION;
 	}
+
+	u_mcp_capture_init(&c->mcp_capture);
+	u_mcp_capture_install(&c->mcp_capture);
 
 	int ret = os_mutex_init(&c->mutex);
 	if (ret != 0) {

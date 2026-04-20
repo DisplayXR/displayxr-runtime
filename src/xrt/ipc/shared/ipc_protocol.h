@@ -30,7 +30,7 @@
 
 
 #define IPC_CRED_SIZE 1    // auth not implemented
-#define IPC_BUF_SIZE 512   // must be >= largest message length in bytes
+#define IPC_BUF_SIZE 1024  // must be >= largest message length in bytes
 #define IPC_MAX_VIEWS 8    // max views we will return configs for
 #define IPC_MAX_FORMATS 32 // max formats our server-side compositor supports
 #define IPC_MAX_DEVICES 8  // max number of devices we will map using shared mem
@@ -301,6 +301,92 @@ struct ipc_client_list
 {
 	uint32_t ids[IPC_MAX_CLIENTS];
 	uint32_t id_count;
+};
+
+/*!
+ * Phase 5.8: registered-app record shipped one-at-a-time from the shell
+ * process to the service for the spatial launcher panel. Sized to fit a
+ * single ipc message under IPC_BUF_SIZE — the shell calls
+ * ipc_call_shell_clear_launcher_apps then loops over its registry calling
+ * ipc_call_shell_add_launcher_app per entry whenever the registry changes.
+ *
+ * @ingroup ipc
+ */
+
+#define IPC_LAUNCHER_MAX_APPS 32
+#define IPC_LAUNCHER_NAME_MAX 96
+#define IPC_LAUNCHER_PATH_MAX 256
+#define IPC_LAUNCHER_TYPE_MAX 8
+
+// Phase 5.14: sentinel returned via ipc_call_shell_poll_launcher_click to mean
+// "the user clicked the Browse-for-app virtual tile" rather than a real tile.
+// Real tile indices are >= 0; -1 means no pending action.
+#define IPC_LAUNCHER_ACTION_BROWSE (-100)
+
+// Phase 6.6: sentinel base for permanent remove. Returned as
+// -(IPC_LAUNCHER_ACTION_REMOVE_BASE + full_index). Shell decodes via
+// full_index = -(value) - IPC_LAUNCHER_ACTION_REMOVE_BASE.
+#define IPC_LAUNCHER_ACTION_REMOVE_BASE 200
+
+// Phase 6.6: sentinel for "refresh app list" (re-scan sidecars).
+#define IPC_LAUNCHER_ACTION_REFRESH (-300)
+
+struct ipc_launcher_app
+{
+	char name[IPC_LAUNCHER_NAME_MAX];
+	char exe_path[IPC_LAUNCHER_PATH_MAX];
+	char type[IPC_LAUNCHER_TYPE_MAX]; // "3d" or "2d"
+	char icon_path[IPC_LAUNCHER_PATH_MAX];
+	char icon_3d_path[IPC_LAUNCHER_PATH_MAX];
+	char icon_3d_layout[IPC_LAUNCHER_TYPE_MAX]; // "sbs-lr" etc
+};
+
+/*!
+ * Phase 8: 3D capture MVP. Bitmask of which views (sub-images) the shell
+ * is requesting from the service compositor's combined atlas.
+ *
+ * @ingroup ipc
+ */
+#define IPC_CAPTURE_FLAG_ATLAS (1u << 0)
+#define IPC_CAPTURE_FLAG_ALL (IPC_CAPTURE_FLAG_ATLAS)
+
+#define IPC_CAPTURE_PATH_MAX 256
+
+/*!
+ * Phase 8: request struct for shell_capture_frame. Wraps the path prefix
+ * (without extension — runtime appends "_atlas.png") because the IPC
+ * schema only supports struct/scalar parameter types.
+ *
+ * @ingroup ipc
+ */
+struct ipc_capture_request
+{
+	char path_prefix[IPC_CAPTURE_PATH_MAX];
+	uint32_t flags; // IPC_CAPTURE_FLAG_* bitmask
+};
+
+/*!
+ * Phase 8: result returned by shell_capture_frame. The runtime fills this
+ * with the metadata needed for a sidecar JSON file (timestamp, atlas/eye
+ * dimensions, stereo layout, display physical size, eye poses at capture).
+ *
+ * @ingroup ipc
+ */
+struct ipc_capture_result
+{
+	uint64_t timestamp_ns;
+	uint32_t atlas_width;
+	uint32_t atlas_height;
+	uint32_t eye_width;
+	uint32_t eye_height;
+	uint32_t views_written; // bitmask of IPC_CAPTURE_FLAG_* actually written
+	uint32_t tile_columns;
+	uint32_t tile_rows;
+	float display_width_m;
+	float display_height_m;
+	float eye_left_m[3];
+	float eye_right_m[3];
+	char _pad[16];
 };
 
 /*!

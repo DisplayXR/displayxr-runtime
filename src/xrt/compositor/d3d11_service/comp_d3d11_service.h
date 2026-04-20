@@ -26,6 +26,9 @@ extern "C" {
 #endif
 
 struct u_system;
+// Forward decls from ipc_protocol.h — full definition is included by callers.
+struct ipc_launcher_app;
+struct ipc_capture_result;
 
 
 /*!
@@ -206,6 +209,18 @@ comp_d3d11_service_get_client_window_pose(struct xrt_system_compositor *xsysc,
                                            float *out_width_m,
                                            float *out_height_m);
 
+/*!
+ * Apply a named layout preset to all active windows. Preset names:
+ * `grid`, `immersive`, `carousel`. Mirrors the Ctrl+1/2/3 hotkeys so
+ * an MCP agent can trigger the same layouts an interactive user gets.
+ *
+ * @return true on success, false if the preset name is unknown or the
+ *         compositor is not in shell mode.
+ */
+bool
+comp_d3d11_service_apply_layout_preset(struct xrt_system_compositor *xsysc,
+                                        const char *preset_name);
+
 
 /*!
  * @name Capture client management (Phase 4A)
@@ -302,6 +317,104 @@ comp_d3d11_service_ensure_shell_window(struct xrt_system_compositor *xsysc);
  */
 void
 comp_d3d11_service_deactivate_shell(struct xrt_system_compositor *xsysc);
+
+/*!
+ * Show or hide the spatial launcher panel. When visible, the multi-compositor
+ * draws a rounded-corner launcher overlay at the zero-disparity plane
+ * (z = 0 in display coordinates). Called by
+ * ipc_handle_shell_set_launcher_visible() in response to Ctrl+L from the shell.
+ *
+ * No-op if the shell is not currently active.
+ *
+ * @ingroup comp_d3d11_service
+ */
+void
+comp_d3d11_service_set_launcher_visible(struct xrt_system_compositor *xsysc, bool visible);
+
+/*!
+ * Empty the spatial launcher's app list. Called by the shell at the start of
+ * each registry push (clear-then-add-N pattern keeps each IPC message under
+ * the per-message buffer cap).
+ *
+ * @ingroup comp_d3d11_service
+ */
+void
+comp_d3d11_service_clear_launcher_apps(struct xrt_system_compositor *xsysc);
+
+/*!
+ * Append one app to the spatial launcher's tile grid. Silently dropped if the
+ * list is already full (IPC_LAUNCHER_MAX_APPS). Called by the shell once per
+ * registered app after a clear.
+ *
+ * @ingroup comp_d3d11_service
+ */
+void
+comp_d3d11_service_add_launcher_app(struct xrt_system_compositor *xsysc,
+                                    const struct ipc_launcher_app *app);
+
+/*!
+ * Phase 5.9/5.10: poll-and-clear the pending launcher tile click. Returns the
+ * tile index the user clicked since the last poll, or -1 if none. Called by
+ * the shell from its main poll loop; on a hit the shell looks up the
+ * corresponding registered app and launches it via shell_launch_registered_app.
+ *
+ * @ingroup comp_d3d11_service
+ */
+int32_t
+comp_d3d11_service_poll_launcher_click(struct xrt_system_compositor *xsysc);
+
+/*!
+ * Phase 5.11: set the bitmask of currently-running tiles. Bit @c i set means
+ * the registered app at index @c i has at least one matching IPC client
+ * connected to the service. The launcher draws a glow border around tiles
+ * whose bit is set so the user can tell which apps are already open.
+ *
+ * Pushed by the shell whenever its computed running set changes (typically
+ * after each client connect/disconnect poll).
+ *
+ * @ingroup comp_d3d11_service
+ */
+void
+comp_d3d11_service_set_running_tile_mask(struct xrt_system_compositor *xsysc, uint64_t mask);
+
+/*!
+ * Phase 8: capture the current pre-weave combined atlas to disk. Writes a
+ * PNG of the full multi-view atlas (cropped to the active region in non-
+ * legacy sessions) and fills @p out_result with metadata for the shell's
+ * sidecar JSON file.
+ *
+ * The runtime appends @c "_atlas.png" to @p path_prefix. Caller owns the
+ * prefix string and the result struct.
+ *
+ * Must be called while the multi-compositor render mutex is held by this
+ * thread, OR from a thread that does not hold the lock (this function takes
+ * the lock itself).
+ *
+ * @param xsysc       The system compositor (must be D3D11 service).
+ * @param path_prefix Filename prefix without extension.
+ * @param flags       Bitmask of IPC_CAPTURE_FLAG_* views to write.
+ * @param out_result  Filled with capture metadata. May not be NULL.
+ * @return true if at least one view was successfully written.
+ *
+ * @ingroup comp_d3d11_service
+ */
+bool
+comp_d3d11_service_capture_frame(struct xrt_system_compositor *xsysc,
+                                 const char *path_prefix,
+                                 uint32_t flags,
+                                 struct ipc_capture_result *out_result);
+
+/*!
+ * Service a pending MCP capture_frame request. Delegates to
+ * comp_d3d11_service_capture_frame for the atlas, then writes
+ * {base}_windows.json with per-slot bbox metadata.
+ *
+ * Called from multi_compositor_render just before Present.
+ *
+ * @ingroup comp_d3d11_service
+ */
+void
+comp_d3d11_service_poll_mcp_capture(struct xrt_system_compositor *xsysc);
 
 /*! @} */
 

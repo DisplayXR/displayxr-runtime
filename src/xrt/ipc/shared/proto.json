@@ -82,6 +82,32 @@
 		]
 	},
 
+	"shell_set_launcher_visible": {
+		"in": [
+			{"name": "visible", "type": "bool"}
+		]
+	},
+
+	"shell_clear_launcher_apps": {},
+
+	"shell_add_launcher_app": {
+		"in": [
+			{"name": "app", "type": "struct ipc_launcher_app"}
+		]
+	},
+
+	"shell_poll_launcher_click": {
+		"out": [
+			{"name": "tile_index", "type": "int64_t"}
+		]
+	},
+
+	"shell_set_running_tile_mask": {
+		"in": [
+			{"name": "mask", "type": "uint64_t"}
+		]
+	},
+
 	"shell_get_window_pose": {
 		"in": [
 			{"name": "client_id", "type": "uint32_t"}
@@ -105,6 +131,15 @@
 	"shell_remove_capture_client": {
 		"in": [
 			{"name": "client_id", "type": "uint32_t"}
+		]
+	},
+
+	"shell_capture_frame": {
+		"in": [
+			{"name": "request", "type": "struct ipc_capture_request"}
+		],
+		"out": [
+			{"name": "capture_result", "type": "struct ipc_capture_result"}
 		]
 	},
 

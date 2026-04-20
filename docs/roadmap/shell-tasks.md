@@ -1,7 +1,7 @@
 ---
-status: Active
+status: Complete (Windows)
 owner: David Fattal
-updated: 2026-03-28
+updated: 2026-04-16
 issues: [43, 44, 49, 58, 60]
 platform: Windows (D3D11 first, macOS deferred)
 ---

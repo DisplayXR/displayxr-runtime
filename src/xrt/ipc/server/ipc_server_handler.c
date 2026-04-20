@@ -1960,9 +1960,15 @@ ipc_handle_system_set_primary_client(volatile struct ipc_client_state *_ics, uin
 xrt_result_t
 ipc_handle_system_set_focused_client(volatile struct ipc_client_state *ics, uint32_t client_id)
 {
-	IPC_INFO(ics->server, "UNIMPLEMENTED: system setting focused client to %d.", client_id);
+	struct ipc_server *s = ics->server;
 
-	return XRT_SUCCESS;
+	// Promote the requested client to the active slot. This is the closest
+	// IPC-layer concept to "focused" we have today — the per-client
+	// session_focused bit is then derived by update_server_state_locked()
+	// from the active_client_index, so we reuse that code path rather than
+	// writing the flag directly and going out of sync with the dispatcher.
+	IPC_INFO(s, "System setting focused client to %u", client_id);
+	return ipc_server_set_active_client(s, client_id);
 }
 
 xrt_result_t
@@ -2000,7 +2006,9 @@ ipc_handle_shell_activate(volatile struct ipc_client_state *_ics)
 		// If the previous session was dismissed (ESC), ensure_shell_window
 		// tears down the stale resources and creates a fresh window.
 		if (s->xsysc != NULL) {
+#ifdef XRT_OS_WINDOWS
 			comp_d3d11_service_ensure_shell_window(s->xsysc);
+#endif
 		}
 		return XRT_SUCCESS;
 	}
@@ -2011,8 +2019,10 @@ ipc_handle_shell_activate(volatile struct ipc_client_state *_ics)
 	if (s->xsysc != NULL) {
 		s->xsysc->info.shell_mode = true;
 
+#ifdef XRT_OS_WINDOWS
 		// Eagerly create the shell window so Ctrl+O works even with no apps.
 		comp_d3d11_service_ensure_shell_window(s->xsysc);
+#endif
 	}
 
 	return XRT_SUCCESS;
@@ -2048,6 +2058,103 @@ ipc_handle_shell_get_state(volatile struct ipc_client_state *_ics, bool *out_act
 	struct ipc_server *s = _ics->server;
 	*out_active = s->shell_mode;
 	return XRT_SUCCESS;
+}
+
+xrt_result_t
+ipc_handle_shell_set_launcher_visible(volatile struct ipc_client_state *_ics, bool visible)
+{
+	struct ipc_server *s = _ics->server;
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (s->xsysc == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	IPC_INFO(s, "Shell: set_launcher_visible %s", visible ? "true" : "false");
+	comp_d3d11_service_set_launcher_visible(s->xsysc, visible);
+	return XRT_SUCCESS;
+#else
+	(void)s;
+	(void)visible;
+	return XRT_ERROR_IPC_FAILURE;
+#endif
+}
+
+xrt_result_t
+ipc_handle_shell_clear_launcher_apps(volatile struct ipc_client_state *_ics)
+{
+	struct ipc_server *s = _ics->server;
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (s->xsysc == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	comp_d3d11_service_clear_launcher_apps(s->xsysc);
+	return XRT_SUCCESS;
+#else
+	(void)s;
+	return XRT_ERROR_IPC_FAILURE;
+#endif
+}
+
+xrt_result_t
+ipc_handle_shell_add_launcher_app(volatile struct ipc_client_state *_ics,
+                                   const struct ipc_launcher_app *app)
+{
+	struct ipc_server *s = _ics->server;
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (s->xsysc == NULL || app == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	comp_d3d11_service_add_launcher_app(s->xsysc, app);
+	return XRT_SUCCESS;
+#else
+	(void)s;
+	(void)app;
+	return XRT_ERROR_IPC_FAILURE;
+#endif
+}
+
+xrt_result_t
+ipc_handle_shell_set_running_tile_mask(volatile struct ipc_client_state *_ics, uint64_t mask)
+{
+	struct ipc_server *s = _ics->server;
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (s->xsysc == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	comp_d3d11_service_set_running_tile_mask(s->xsysc, mask);
+	return XRT_SUCCESS;
+#else
+	(void)s;
+	(void)mask;
+	return XRT_ERROR_IPC_FAILURE;
+#endif
+}
+
+xrt_result_t
+ipc_handle_shell_poll_launcher_click(volatile struct ipc_client_state *_ics,
+                                      int64_t *out_tile_index)
+{
+	struct ipc_server *s = _ics->server;
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (s->xsysc == NULL || out_tile_index == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	*out_tile_index = (int64_t)comp_d3d11_service_poll_launcher_click(s->xsysc);
+	return XRT_SUCCESS;
+#else
+	(void)s;
+	if (out_tile_index != NULL) *out_tile_index = -1;
+	return XRT_ERROR_IPC_FAILURE;
+#endif
 }
 
 xrt_result_t
@@ -2270,6 +2377,42 @@ ipc_handle_shell_remove_capture_client(volatile struct ipc_client_state *_ics,
 }
 
 xrt_result_t
+ipc_handle_shell_capture_frame(volatile struct ipc_client_state *_ics,
+                                const struct ipc_capture_request *request,
+                                struct ipc_capture_result *out_capture_result)
+{
+	struct ipc_server *s = _ics->server;
+
+	if (out_capture_result == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	memset((void *)out_capture_result, 0, sizeof(*out_capture_result));
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (s->xsysc == NULL || request == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	IPC_INFO(s, "Shell: capture_frame prefix=%s flags=0x%x",
+	         request->path_prefix, request->flags);
+
+	// Ensure NUL terminator (defense in depth — IPC marshalling should already
+	// preserve the trailing NUL, but the buffer is fixed-size).
+	char prefix[IPC_CAPTURE_PATH_MAX];
+	memcpy(prefix, request->path_prefix, sizeof(prefix));
+	prefix[sizeof(prefix) - 1] = '\0';
+
+	bool ok = comp_d3d11_service_capture_frame(s->xsysc, prefix, request->flags,
+	                                           out_capture_result);
+	return ok ? XRT_SUCCESS : XRT_ERROR_IPC_FAILURE;
+#else
+	(void)s;
+	(void)request;
+	return XRT_ERROR_IPC_FAILURE;
+#endif
+}
+
+xrt_result_t
 ipc_handle_swapchain_get_properties(volatile struct ipc_client_state *ics,
                                     const struct xrt_swapchain_create_info *info,
                                     struct xrt_swapchain_create_properties *xsccp)
@@ -2419,6 +2562,7 @@ xrt_result_t
 ipc_handle_swapchain_acquire_image(volatile struct ipc_client_state *ics, uint32_t id, uint32_t *out_index)
 {
 	if (ics->xc == NULL) {
+		U_LOG_W("[#151] ipc server acquire_image: session not created -> IPC_SESSION_NOT_CREATED");
 		return XRT_ERROR_IPC_SESSION_NOT_CREATED;
 	}
 
@@ -2426,7 +2570,14 @@ ipc_handle_swapchain_acquire_image(volatile struct ipc_client_state *ics, uint32
 	uint32_t sc_index = id;
 	struct xrt_swapchain *xsc = ics->xscs[sc_index];
 
-	xrt_swapchain_acquire_image(xsc, out_index);
+	if (xsc == NULL) {
+		U_LOG_W("[#151] ipc server acquire_image: xsc[%u]=NULL -> IPC_FAILURE", sc_index);
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	xrt_result_t xret = xrt_swapchain_acquire_image(xsc, out_index);
+	U_LOG_W("[#151] ipc server acquire_image: sc_id=%u xret=%d out_index=%u",
+	        sc_index, (int)xret, *out_index);
 
 	return XRT_SUCCESS;
 }

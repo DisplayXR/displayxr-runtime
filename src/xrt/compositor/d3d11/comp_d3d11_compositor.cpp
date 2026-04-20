@@ -35,6 +35,14 @@
 #include "xrt/xrt_display_processor_d3d11.h"
 
 #include "util/u_hud.h"
+#include "util/u_mcp_capture.h"
+
+// STB_IMAGE_WRITE_STATIC scopes stbi_write_* symbols to this TU so
+// we don't clash with comp_d3d11_service.cpp's implementation (both
+// link into ipc_server on Windows).
+#define STB_IMAGE_WRITE_STATIC
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
 
 #include "math/m_api.h"
 #include "util/u_tiling.h"
@@ -209,6 +217,9 @@ struct comp_d3d11_compositor
 
 	//! Thread safety.
 	std::mutex mutex;
+
+	//! MCP capture_frame request box (serviced at end of layer_commit).
+	struct u_mcp_capture_request mcp_capture;
 };
 
 /*
@@ -861,6 +872,77 @@ d3d11_crop_atlas_for_dp(struct comp_d3d11_compositor *c,
 	return c->dp_input_srv;
 }
 
+// Service a pending MCP capture_frame request. Copies the content
+// region of the renderer's atlas (tile_columns × view_width by
+// tile_rows × view_height — what the app actually wrote, same region
+// the compositor crops and sends to the DP) into a staging texture,
+// then writes a single PNG. D3D11 renderer uses
+// DXGI_FORMAT_R8G8B8A8_UNORM so no channel swap is needed.
+static void
+d3d11_compositor_service_mcp_capture(struct comp_d3d11_compositor *c)
+{
+	char path[U_MCP_CAPTURE_PATH_MAX];
+	if (!u_mcp_capture_poll(&c->mcp_capture, path)) {
+		return;
+	}
+
+	ID3D11Texture2D *atlas_tex = static_cast<ID3D11Texture2D *>(
+	    comp_d3d11_renderer_get_atlas_texture(c->renderer));
+	if (atlas_tex == nullptr || c->renderer == nullptr) {
+		u_mcp_capture_complete(&c->mcp_capture, false);
+		return;
+	}
+
+	uint32_t tile_columns = 1, tile_rows = 1;
+	comp_d3d11_renderer_get_tile_layout(c->renderer, &tile_columns, &tile_rows);
+	uint32_t view_w = 0, view_h = 0;
+	comp_d3d11_renderer_get_view_dimensions(c->renderer, &view_w, &view_h);
+	if (tile_columns == 0 || tile_rows == 0 || view_w == 0 || view_h == 0) {
+		u_mcp_capture_complete(&c->mcp_capture, false);
+		return;
+	}
+
+	uint32_t content_w = tile_columns * view_w;
+	uint32_t content_h = tile_rows * view_h;
+
+	D3D11_TEXTURE2D_DESC adesc;
+	atlas_tex->GetDesc(&adesc);
+	if (content_w > adesc.Width)  content_w = adesc.Width;
+	if (content_h > adesc.Height) content_h = adesc.Height;
+
+	D3D11_TEXTURE2D_DESC sd = adesc;
+	sd.Width = content_w;
+	sd.Height = content_h;
+	sd.Usage = D3D11_USAGE_STAGING;
+	sd.BindFlags = 0;
+	sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+	sd.MiscFlags = 0;
+
+	ID3D11Texture2D *staging = nullptr;
+	if (FAILED(c->device->CreateTexture2D(&sd, nullptr, &staging)) || staging == nullptr) {
+		u_mcp_capture_complete(&c->mcp_capture, false);
+		return;
+	}
+
+	D3D11_BOX src_box = {0, 0, 0, content_w, content_h, 1};
+	c->context->CopySubresourceRegion(staging, 0, 0, 0, 0, atlas_tex, 0, &src_box);
+
+	D3D11_MAPPED_SUBRESOURCE m = {};
+	if (FAILED(c->context->Map(staging, 0, D3D11_MAP_READ, 0, &m))) {
+		staging->Release();
+		u_mcp_capture_complete(&c->mcp_capture, false);
+		return;
+	}
+
+	bool ok = stbi_write_png(path, (int)content_w, (int)content_h, 4,
+	                         m.pData, (int)m.RowPitch) != 0;
+
+	c->context->Unmap(staging, 0);
+	staging->Release();
+
+	u_mcp_capture_complete(&c->mcp_capture, ok);
+}
+
 static xrt_result_t
 d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
 {
@@ -1382,6 +1464,10 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		return xret;
 	}
 
+	// Service pending MCP capture_frame after Present so the atlas
+	// we stage-copy reflects exactly what the user just saw.
+	d3d11_compositor_service_mcp_capture(c);
+
 	return XRT_SUCCESS;
 }
 
@@ -1400,6 +1486,9 @@ d3d11_compositor_destroy(struct xrt_compositor *xc)
 	struct comp_d3d11_compositor *c = d3d11_comp(xc);
 
 	U_LOG_I("Destroying D3D11 compositor");
+
+	u_mcp_capture_uninstall();
+	u_mcp_capture_fini(&c->mcp_capture);
 
 #ifdef XRT_FEATURE_DEBUG_GUI
 	// Stop debug GUI first (before destroying resources it may reference)
@@ -1507,6 +1596,9 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 	memset(&c->base, 0, sizeof(c->base));
 
 	c->xdev = xdev;
+
+	u_mcp_capture_init(&c->mcp_capture);
+	u_mcp_capture_install(&c->mcp_capture);
 	c->own_window = nullptr;
 	c->owns_window = false;
 	c->app_hwnd = nullptr;

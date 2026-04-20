@@ -162,6 +162,13 @@ struct comp_d3d11_window
 	//! Set by compositor thread, read by WndProc thread.
 	volatile LONG input_suppress;
 
+	//! Phase 5.12: grace period for input_suppress after the launcher closes.
+	//! Holds a GetTickCount() value; while GetTickCount() < input_suppress_until_tick
+	//! the WndProc treats input as suppressed even when input_suppress=0. Prevents
+	//! the Esc-that-closes-the-launcher from leaking into the focused app on the
+	//! next message-queue drain (render thread vs window thread race).
+	volatile LONG input_suppress_until_tick;
+
 	//! True when a mouse button press originated inside the app content rect.
 	//! Used to prevent title bar clicks from being forwarded as app drags.
 	//! Set on button-down inside rect, cleared on button-up.
@@ -333,6 +340,18 @@ set_fullscreen(HWND hWnd, bool fullscreen)
 	}
 }
 
+// Forward declaration — defined later in this file alongside the suppress
+// setters so the logic lives in one place. Used by wnd_proc to gate key
+// and mouse forwarding.
+static bool input_is_suppressed(struct comp_d3d11_window *w);
+
+// Phase 5.13: private message ID for "show launcher context menu". Sent by
+// the render thread via comp_d3d11_window_show_launcher_context_menu so the
+// window thread actually runs TrackPopupMenu — that API only works on the
+// thread that owns the target window. Defined up here so both wnd_proc and
+// the exported helper can reference it.
+#define WM_LAUNCHER_CTX_MENU (WM_USER + 110)
+
 /*!
  * Window procedure — runs on the window thread.
  *
@@ -418,6 +437,35 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		PostQuitMessage(0);
 		break;
 
+	case WM_LAUNCHER_CTX_MENU: {
+		// Phase 5.13: synchronously show the launcher tile context menu
+		// on THIS thread (the window thread). TrackPopupMenu only works
+		// from the thread that owns the target window — calling it from
+		// the render thread silently returns 0. Caller (render thread)
+		// uses SendMessage so we block until the user picks / cancels.
+		HMENU menu = CreatePopupMenu();
+		if (menu == NULL) {
+			return 0;
+		}
+		AppendMenuW(menu, MF_STRING, 1, L"Launch");
+		AppendMenuW(menu, MF_STRING, 2, L"Remove from launcher");
+		AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+		AppendMenuW(menu, MF_STRING, 3, L"Cancel");
+
+		POINT pt;
+		GetCursorPos(&pt);
+		SetForegroundWindow(hWnd);
+		UINT cmd = TrackPopupMenu(menu,
+		                          TPM_RETURNCMD | TPM_NONOTIFY,
+		                          pt.x, pt.y, 0, hWnd, NULL);
+		DestroyMenu(menu);
+		PostMessageW(hWnd, WM_NULL, 0, 0);
+		// Map to public result codes (1=launch, 2=remove, 0=cancel).
+		if (cmd == 1) return LAUNCHER_CTX_MENU_RESULT_LAUNCH;
+		if (cmd == 2) return LAUNCHER_CTX_MENU_RESULT_REMOVE;
+		return 0;
+	}
+
 	case WM_KEYDOWN:
 		// F11: toggle fullscreen for non-shell (single app) windows.
 		// In shell mode, F11 is handled in the multi-compositor render loop instead.
@@ -441,6 +489,14 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	case WM_SYSKEYUP:
 	case WM_CHAR:
 	case WM_SYSCHAR: {
+		// Phase 5.12: when the shell is suppressing input (launcher visible,
+		// resize drag, or within the post-launcher grace period) we eat the
+		// key entirely — don't forward, don't run qwerty. Otherwise the
+		// launcher's Esc / arrows / Enter leak through and close the app.
+		if (input_is_suppressed(w)) {
+			return 0;
+		}
+
 		// Shell input forwarding: all keys go to BOTH qwerty and the app.
 		// Qwerty processes first (mode toggles, camera controls), then
 		// the key is forwarded to the focused app's HWND.
@@ -526,8 +582,9 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	case WM_MBUTTONUP:
 	case WM_MOUSEMOVE:
 	case WM_MOUSEWHEEL: {
-		// Skip forwarding when shell drag/resize is active
-		if (InterlockedCompareExchange(&w->input_suppress, 0, 0)) {
+		// Skip forwarding when shell drag/resize is active or within the
+		// launcher grace period.
+		if (input_is_suppressed(w)) {
 			break; // fall through to qwerty/default handling
 		}
 
@@ -1122,6 +1179,35 @@ comp_d3d11_window_set_input_forward(struct comp_d3d11_window *window,
 	} else {
 		U_LOG_W("D3D11 window: input forwarding disabled");
 	}
+}
+
+// Returns true if input forwarding should currently be suppressed, considering
+// both the immediate flag and the tick-count grace period (Phase 5.12).
+static bool
+input_is_suppressed(struct comp_d3d11_window *w)
+{
+	if (InterlockedCompareExchange(&w->input_suppress, 0, 0)) return true;
+	LONG until = InterlockedCompareExchange(&w->input_suppress_until_tick, 0, 0);
+	if (until == 0) return false;
+	// GetTickCount() wraps every ~49 days; use signed diff for wrap-safety.
+	LONG now = (LONG)GetTickCount();
+	return (LONG)(until - now) > 0;
+}
+
+extern "C" void
+comp_d3d11_window_set_input_suppress_grace_ms(struct comp_d3d11_window *window, uint32_t ms)
+{
+	if (window == NULL) return;
+	LONG until = (LONG)(GetTickCount() + ms);
+	InterlockedExchange(&window->input_suppress_until_tick, until);
+}
+
+extern "C" uint32_t
+comp_d3d11_window_show_launcher_context_menu(struct comp_d3d11_window *window)
+{
+	if (window == NULL || window->hwnd == NULL) return 0;
+	LRESULT r = SendMessageW(window->hwnd, WM_LAUNCHER_CTX_MENU, 0, 0);
+	return (uint32_t)r;
 }
 
 extern "C" void

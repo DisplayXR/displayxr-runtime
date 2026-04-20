@@ -590,8 +590,10 @@ Section "DisplayXR Runtime" SecRuntime
 	; Install switcher if available
 	File /nonfatal "${BIN_DIR}\DisplayXRSwitcher.exe"
 
-	; Install runtime DLL dependencies
-	File /nonfatal "${BIN_DIR}\*.dll"
+	; Install runtime DLL dependencies (exclude vulkan-1.dll — the system copy
+	; in SYSTEM32 is sufficient, and shipping our own risks version conflicts
+	; and interaction with third-party Vulkan implicit layers. See issue #105.)
+	File /nonfatal /x "vulkan-1.dll" "${BIN_DIR}\*.dll"
 
 	; Create AppData directories
 	CreateDirectory "$APPDATA\DisplayXR"

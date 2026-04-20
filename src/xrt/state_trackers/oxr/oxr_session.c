@@ -42,6 +42,7 @@
 #include "math/m_camera3d_view.h"
 
 #include "oxr_objects.h"
+#include "oxr_mcp_tools.h"
 #include "oxr_logger.h"
 #include "oxr_two_call.h"
 #include "oxr_handle.h"
@@ -1919,6 +1920,10 @@ oxr_session_destroy(struct oxr_logger *log, struct oxr_handle_base *hb)
 {
 	struct oxr_session *sess = (struct oxr_session *)hb;
 
+	// Detach before we start tearing down the session so any in-flight
+	// MCP tool handler stops reading.
+	oxr_mcp_tools_detach_session(sess);
+
 	XrResult ret = oxr_event_remove_session_events(log, sess);
 
 	oxr_session_binding_destroy_all(log, sess);
@@ -2655,6 +2660,9 @@ oxr_session_create(struct oxr_logger *log,
 	// Everything is in order, start the state changes.
 	oxr_session_change_state(log, sess, XR_SESSION_STATE_IDLE, 0);
 	oxr_session_change_state(log, sess, XR_SESSION_STATE_READY, 0);
+
+	// Publish the session to the MCP server (no-op when MCP is disabled).
+	oxr_mcp_tools_attach_session(sess);
 
 	*out_session = sess;
 

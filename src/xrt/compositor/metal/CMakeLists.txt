@@ -20,6 +20,7 @@ if(APPLE AND XRT_HAVE_METAL)
 			aux_util
 			aux_os
 			aux_math
+			xrt-external-stb
 			"-framework Metal"
 			"-framework Cocoa"
 			"-framework QuartzCore"

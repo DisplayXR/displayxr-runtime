@@ -112,6 +112,8 @@ add_library(
 	server/ipc_server_handler.c
 	server/ipc_server_per_client_thread.c
 	server/ipc_server_process.c
+	server/ipc_mcp_tools.c
+	server/ipc_mcp_tools.h
 	)
 target_include_directories(
 	ipc_server

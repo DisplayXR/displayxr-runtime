@@ -24,6 +24,8 @@
 #include "xrt/xrt_defines.h"
 #include "util/u_logging.h"
 
+#include "shell_app_scan.h"
+
 #include <cjson/cJSON.h>
 
 #include <stdio.h>
@@ -36,6 +38,7 @@
 #include <process.h>
 #include <tlhelp32.h> // For process enumeration (service PID lookup)
 #include <shellapi.h> // For Shell_NotifyIcon (system tray)
+#include <commdlg.h>  // For GetOpenFileNameA (Phase 5.14 Browse tile)
 #else
 #include <unistd.h>
 #endif
@@ -47,6 +50,7 @@
 #ifdef _WIN32
 #define HOTKEY_TOGGLE 1
 #define HOTKEY_LAUNCH 2
+#define HOTKEY_CAPTURE 3
 #define WM_TRAYICON (WM_USER + 1)
 #define TRAY_CMD_ACTIVATE 2001
 #define TRAY_CMD_EXIT 2002
@@ -59,6 +63,7 @@
 static volatile int g_running = 1;
 #ifdef _WIN32
 static bool g_shell_active = false;
+static bool g_launcher_visible = false; // Phase 5.7: spatial launcher panel toggle (Ctrl+L)
 static HWND g_msg_hwnd = NULL;
 #endif
 
@@ -244,7 +249,7 @@ shell_config_update(struct shell_config *cfg, const char *app_name,
 	sw->width_m = w; sw->height_m = h;
 }
 
-// --- 4C.9: Registered apps config ---
+// --- 4C.9 / 5.5: Registered apps config ---
 
 #define MAX_REGISTERED_APPS 32
 
@@ -252,7 +257,14 @@ struct registered_app
 {
 	char name[128];
 	char exe_path[MAX_PATH];
-	char type[8]; // "3d", "2d", or "" (unknown)
+	char type[8];          // "3d", "2d", or "" (unknown)
+	char source[8];        // "user" | "scan"  (5.5)
+	char category[32];     // sidecar "category", default "app"
+	char description[256]; // sidecar "description"
+	char display_mode[16]; // sidecar "display_mode", default "auto"
+	char icon_path[MAX_PATH];     // resolved 2D icon (absolute) or ""
+	char icon_3d_path[MAX_PATH];  // resolved SBS icon (absolute) or ""
+	char icon_3d_layout[8];       // "sbs-lr"|"sbs-rl"|"tb"|"bt"|""
 };
 
 static struct registered_app g_registered_apps[MAX_REGISTERED_APPS];
@@ -278,6 +290,113 @@ get_registered_apps_path(char *buf, size_t buf_size)
 #endif
 }
 
+// Case-insensitive exe_path comparison. Normalizes forward slashes to
+// backslashes before comparing so "test_apps/x/build/x.exe" matches
+// "test_apps\x\build\x.exe".
+static bool
+exe_path_equal(const char *a, const char *b)
+{
+	if (a == NULL || b == NULL) return a == b;
+	while (*a && *b) {
+		int ca = (unsigned char)*a;
+		int cb = (unsigned char)*b;
+		if (ca == '/') ca = '\\';
+		if (cb == '/') cb = '\\';
+		if (ca >= 'A' && ca <= 'Z') ca += 32;
+		if (cb >= 'A' && cb <= 'Z') cb += 32;
+		if (ca != cb) return false;
+		a++; b++;
+	}
+	return *a == '\0' && *b == '\0';
+}
+
+// Read a string field from a cJSON object into a fixed buffer. If the field
+// is missing or not a string, dst is left untouched.
+static void
+json_copy_str(char *dst, size_t dst_size, const cJSON *obj, const char *key)
+{
+	const cJSON *j = cJSON_GetObjectItemCaseSensitive(obj, key);
+	if (cJSON_IsString(j) && j->valuestring != NULL) {
+		snprintf(dst, dst_size, "%s", j->valuestring);
+	}
+}
+
+static void
+registered_app_zero(struct registered_app *app)
+{
+	memset(app, 0, sizeof(*app));
+}
+
+// Merge a single scanned app into the in-memory registry. If an existing
+// entry has a matching exe_path it is replaced; otherwise the entry is
+// appended.
+static void
+merge_scanned_app(const struct shell_scanned_app *s)
+{
+	// Replace any existing entry (user or scan) with the same exe_path.
+	for (int i = 0; i < g_registered_app_count; i++) {
+		if (exe_path_equal(g_registered_apps[i].exe_path, s->exe_path)) {
+			struct registered_app *app = &g_registered_apps[i];
+			registered_app_zero(app);
+			snprintf(app->name, sizeof(app->name), "%s", s->name);
+			snprintf(app->exe_path, sizeof(app->exe_path), "%s", s->exe_path);
+			snprintf(app->type, sizeof(app->type), "%s", s->type);
+			snprintf(app->source, sizeof(app->source), "scan");
+			snprintf(app->category, sizeof(app->category), "%s", s->category);
+			snprintf(app->description, sizeof(app->description), "%s", s->description);
+			snprintf(app->display_mode, sizeof(app->display_mode), "%s", s->display_mode);
+			snprintf(app->icon_path, sizeof(app->icon_path), "%s", s->icon_path);
+			snprintf(app->icon_3d_path, sizeof(app->icon_3d_path), "%s", s->icon_3d_path);
+			snprintf(app->icon_3d_layout, sizeof(app->icon_3d_layout), "%s", s->icon_3d_layout);
+			return;
+		}
+	}
+
+	// Append as a new entry.
+	if (g_registered_app_count >= MAX_REGISTERED_APPS) {
+		PE("registry full — dropping scanned app '%s'\n", s->name);
+		return;
+	}
+	struct registered_app *app = &g_registered_apps[g_registered_app_count++];
+	registered_app_zero(app);
+	snprintf(app->name, sizeof(app->name), "%s", s->name);
+	snprintf(app->exe_path, sizeof(app->exe_path), "%s", s->exe_path);
+	snprintf(app->type, sizeof(app->type), "%s", s->type);
+	snprintf(app->source, sizeof(app->source), "scan");
+	snprintf(app->category, sizeof(app->category), "%s", s->category);
+	snprintf(app->description, sizeof(app->description), "%s", s->description);
+	snprintf(app->display_mode, sizeof(app->display_mode), "%s", s->display_mode);
+	snprintf(app->icon_path, sizeof(app->icon_path), "%s", s->icon_path);
+	snprintf(app->icon_3d_path, sizeof(app->icon_3d_path), "%s", s->icon_3d_path);
+	snprintf(app->icon_3d_layout, sizeof(app->icon_3d_layout), "%s", s->icon_3d_layout);
+}
+
+// Remove every entry whose source == "scan". Called before re-running the
+// scanner so stale scan results from previous runs don't linger.
+static void
+drop_scan_entries(void)
+{
+	int dst = 0;
+	for (int i = 0; i < g_registered_app_count; i++) {
+		if (strcmp(g_registered_apps[i].source, "scan") != 0) {
+			if (dst != i) {
+				g_registered_apps[dst] = g_registered_apps[i];
+			}
+			dst++;
+		}
+	}
+	g_registered_app_count = dst;
+}
+
+// Forward declarations — these are called from registered_apps_load but
+// defined later in this file.
+static void
+registered_apps_save(void);
+#ifdef _WIN32
+static void
+get_exe_dir(char *buf, size_t buf_size);
+#endif
+
 static void
 registered_apps_load(void)
 {
@@ -286,101 +405,99 @@ registered_apps_load(void)
 	char path[512];
 	get_registered_apps_path(path, sizeof(path));
 
-	FILE *f = fopen(path, "rb");
-	if (!f) {
-		// First run: create default config
-		P("No registered_apps.json found — creating defaults.\n");
 #ifdef _WIN32
-		{
-			char dir[512];
-			snprintf(dir, sizeof(dir), "%s", path);
-			char *last = strrchr(dir, '\\');
-			if (last) { *last = '\0'; CreateDirectoryA(dir, NULL); }
-		}
-#endif
-		// Add demo entries
-		snprintf(g_registered_apps[0].name, sizeof(g_registered_apps[0].name), "cube_handle_d3d11_win");
-		snprintf(g_registered_apps[0].exe_path, sizeof(g_registered_apps[0].exe_path),
-		         "test_apps\\cube_handle_d3d11_win\\build\\cube_handle_d3d11_win.exe");
-		snprintf(g_registered_apps[0].type, sizeof(g_registered_apps[0].type), "3d");
-
-		snprintf(g_registered_apps[1].name, sizeof(g_registered_apps[1].name), "Notepad");
-		snprintf(g_registered_apps[1].exe_path, sizeof(g_registered_apps[1].exe_path), "notepad.exe");
-		snprintf(g_registered_apps[1].type, sizeof(g_registered_apps[1].type), "2d");
-
-		g_registered_app_count = 2;
-		// Save to disk
-		goto save_and_return;
-	}
-
 	{
+		// Make sure the parent directory exists before we try to write.
+		char dir[512];
+		snprintf(dir, sizeof(dir), "%s", path);
+		char *last = strrchr(dir, '\\');
+		if (last) { *last = '\0'; CreateDirectoryA(dir, NULL); }
+	}
+#endif
+
+	// -------- 1) Load existing JSON, if present. --------
+	FILE *f = fopen(path, "rb");
+	if (f != NULL) {
 		fseek(f, 0, SEEK_END);
 		long len = ftell(f);
 		fseek(f, 0, SEEK_SET);
-		if (len <= 0 || len > 64 * 1024) { fclose(f); return; }
+		if (len > 0 && len <= 256 * 1024) {
+			char *data = (char *)malloc((size_t)len + 1);
+			if (data != NULL) {
+				fread(data, 1, (size_t)len, f);
+				data[len] = '\0';
 
-		char *data = (char *)malloc(len + 1);
-		fread(data, 1, len, f);
-		data[len] = '\0';
+				cJSON *root = cJSON_Parse(data);
+				free(data);
+				if (root && cJSON_IsArray(root)) {
+					cJSON *entry = NULL;
+					cJSON_ArrayForEach(entry, root)
+					{
+						if (g_registered_app_count >= MAX_REGISTERED_APPS) break;
+						struct registered_app *app =
+						    &g_registered_apps[g_registered_app_count];
+						registered_app_zero(app);
+
+						json_copy_str(app->name, sizeof(app->name), entry, "name");
+						json_copy_str(app->exe_path, sizeof(app->exe_path), entry, "exe_path");
+						json_copy_str(app->type, sizeof(app->type), entry, "type");
+						json_copy_str(app->source, sizeof(app->source), entry, "source");
+						json_copy_str(app->category, sizeof(app->category), entry, "category");
+						json_copy_str(app->description, sizeof(app->description), entry, "description");
+						json_copy_str(app->display_mode, sizeof(app->display_mode), entry, "display_mode");
+						json_copy_str(app->icon_path, sizeof(app->icon_path), entry, "icon_path");
+						json_copy_str(app->icon_3d_path, sizeof(app->icon_3d_path), entry, "icon_3d_path");
+						json_copy_str(app->icon_3d_layout, sizeof(app->icon_3d_layout), entry, "icon_3d_layout");
+
+						// Back-compat: a Phase 4C JSON has no `source` field.
+						// Treat pre-existing entries as user-added.
+						if (app->source[0] == '\0') {
+							snprintf(app->source, sizeof(app->source), "user");
+						}
+
+						g_registered_app_count++;
+					}
+				}
+				cJSON_Delete(root);
+			}
+		}
 		fclose(f);
-
-		cJSON *root = cJSON_Parse(data);
-		free(data);
-		if (!root || !cJSON_IsArray(root)) {
-			cJSON_Delete(root);
-			return;
-		}
-
-		cJSON *entry = NULL;
-		cJSON_ArrayForEach(entry, root)
-		{
-			if (g_registered_app_count >= MAX_REGISTERED_APPS) break;
-			struct registered_app *app = &g_registered_apps[g_registered_app_count];
-
-			cJSON *jname = cJSON_GetObjectItemCaseSensitive(entry, "name");
-			cJSON *jpath = cJSON_GetObjectItemCaseSensitive(entry, "exe_path");
-			cJSON *jtype = cJSON_GetObjectItemCaseSensitive(entry, "type");
-
-			if (cJSON_IsString(jname))
-				snprintf(app->name, sizeof(app->name), "%s", jname->valuestring);
-			if (cJSON_IsString(jpath))
-				snprintf(app->exe_path, sizeof(app->exe_path), "%s", jpath->valuestring);
-			if (cJSON_IsString(jtype))
-				snprintf(app->type, sizeof(app->type), "%s", jtype->valuestring);
-
-			g_registered_app_count++;
-		}
-		cJSON_Delete(root);
+	} else {
+		P("No registered_apps.json found — starting with empty registry.\n");
+		// Per the spec, the launcher is manifest-gated: only apps with a
+		// .displayxr.json sidecar (or apps the user explicitly adds via
+		// Browse-for-app) appear. No built-in defaults. The scanner runs
+		// next and populates anything it finds.
 	}
 
-	P("Loaded %d registered app(s).\n", g_registered_app_count);
-	return;
+	// -------- 2) Drop stale scan entries, re-run scanner, merge. --------
+	drop_scan_entries();
 
-save_and_return:
-	; // fallthrough to save
+#ifdef _WIN32
 	{
-		char spath[512];
-		get_registered_apps_path(spath, sizeof(spath));
-
-		cJSON *arr = cJSON_CreateArray();
-		for (int i = 0; i < g_registered_app_count; i++) {
-			cJSON *obj = cJSON_CreateObject();
-			cJSON_AddStringToObject(obj, "name", g_registered_apps[i].name);
-			cJSON_AddStringToObject(obj, "exe_path", g_registered_apps[i].exe_path);
-			cJSON_AddStringToObject(obj, "type", g_registered_apps[i].type);
-			cJSON_AddItemToArray(arr, obj);
+		char exe_dir[MAX_PATH] = {0};
+		get_exe_dir(exe_dir, sizeof(exe_dir));
+		size_t edl = strlen(exe_dir);
+		if (edl > 0 && (exe_dir[edl - 1] == '\\' || exe_dir[edl - 1] == '/')) {
+			exe_dir[edl - 1] = '\0';
 		}
-		char *json_str = cJSON_Print(arr);
-		cJSON_Delete(arr);
 
-		FILE *sf = fopen(spath, "wb");
-		if (sf) {
-			fwrite(json_str, 1, strlen(json_str), sf);
-			fclose(sf);
-			P("Created default registered_apps.json with %d entries.\n", g_registered_app_count);
+		struct shell_scanned_app scanned[MAX_REGISTERED_APPS];
+		int n = shell_scan_apps(exe_dir, scanned, MAX_REGISTERED_APPS);
+		for (int i = 0; i < n; i++) {
+			merge_scanned_app(&scanned[i]);
 		}
-		free(json_str);
 	}
+#endif
+
+	P("Registry: %d app(s) after merge.\n", g_registered_app_count);
+	for (int i = 0; i < g_registered_app_count; i++) {
+		P("  [%s] %s  (%s)\n", g_registered_apps[i].source, g_registered_apps[i].name,
+		  g_registered_apps[i].exe_path);
+	}
+
+	// -------- 3) Persist merged registry so users can hand-edit later. --------
+	registered_apps_save();
 }
 
 static void
@@ -392,9 +509,17 @@ registered_apps_save(void)
 	cJSON *arr = cJSON_CreateArray();
 	for (int i = 0; i < g_registered_app_count; i++) {
 		cJSON *obj = cJSON_CreateObject();
-		cJSON_AddStringToObject(obj, "name", g_registered_apps[i].name);
-		cJSON_AddStringToObject(obj, "exe_path", g_registered_apps[i].exe_path);
-		cJSON_AddStringToObject(obj, "type", g_registered_apps[i].type);
+		const struct registered_app *app = &g_registered_apps[i];
+		cJSON_AddStringToObject(obj, "name", app->name);
+		cJSON_AddStringToObject(obj, "exe_path", app->exe_path);
+		cJSON_AddStringToObject(obj, "type", app->type);
+		cJSON_AddStringToObject(obj, "source", app->source[0] ? app->source : "user");
+		if (app->category[0])       cJSON_AddStringToObject(obj, "category", app->category);
+		if (app->description[0])    cJSON_AddStringToObject(obj, "description", app->description);
+		if (app->display_mode[0])   cJSON_AddStringToObject(obj, "display_mode", app->display_mode);
+		if (app->icon_path[0])      cJSON_AddStringToObject(obj, "icon_path", app->icon_path);
+		if (app->icon_3d_path[0])   cJSON_AddStringToObject(obj, "icon_3d_path", app->icon_3d_path);
+		if (app->icon_3d_layout[0]) cJSON_AddStringToObject(obj, "icon_3d_layout", app->icon_3d_layout);
 		cJSON_AddItemToArray(arr, obj);
 	}
 	char *json_str = cJSON_Print(arr);
@@ -497,6 +622,13 @@ launch_app(struct app_entry *app, const char *runtime_json)
 
 	STARTUPINFOA si = {0};
 	si.cb = sizeof(si);
+	// Phase 6.1 (#140): start the app with its window hidden. In shell
+	// mode, the app's HWND appearing on the 3D display disrupts the SR
+	// SDK's weaver and causes a multi-second stretch artifact. The app's
+	// content is captured via shared handles into the multi-compositor
+	// atlas, so its own window doesn't need to be visible.
+	si.dwFlags = STARTF_USESHOWWINDOW;
+	si.wShowWindow = SW_HIDE;
 	PROCESS_INFORMATION pi = {0};
 
 	BOOL ok = CreateProcessA(
@@ -918,6 +1050,300 @@ cleanup_closed_captures(struct ipc_connection *ipc_c,
 	}
 }
 
+// --- 5.6: Running-app set (for launcher "running" tag) ---
+
+#define SHELL_RUNNING_NAMES_MAX 32
+
+struct shell_running_set
+{
+	int count;
+	char names[SHELL_RUNNING_NAMES_MAX][128];
+};
+
+/*!
+ * Snapshot the set of application_name strings for every IPC client currently
+ * connected to the service. Used by the launcher to highlight tiles whose app
+ * is already running.
+ *
+ * Wraps ipc_call_system_get_clients + ipc_call_system_get_client_info so the
+ * launcher UI doesn't have to speak IPC directly. Cheap enough to call every
+ * time the launcher opens; not intended for per-frame use.
+ *
+ * On IPC failure, returns an empty set — the launcher should degrade to "no
+ * running apps" rather than failing to open.
+ */
+static void
+shell_get_running_app_set(struct ipc_connection *ipc_c, struct shell_running_set *out)
+{
+	out->count = 0;
+
+	struct ipc_client_list clients;
+	xrt_result_t r = ipc_call_system_get_clients(ipc_c, &clients);
+	if (r != XRT_SUCCESS) {
+		return;
+	}
+
+	for (uint32_t c = 0; c < clients.id_count; c++) {
+		if (clients.ids[c] == 0) continue;
+		if (out->count >= SHELL_RUNNING_NAMES_MAX) break;
+
+		struct ipc_app_state ias;
+		xrt_result_t ir = ipc_call_system_get_client_info(ipc_c, clients.ids[c], &ias);
+		if (ir != XRT_SUCCESS) continue;
+		if (ias.info.application_name[0] == '\0') continue;
+
+		// Deduplicate — two instances of the same app are one tile in the
+		// launcher (for highlight purposes).
+		bool already = false;
+		for (int i = 0; i < out->count; i++) {
+			if (strcmp(out->names[i], ias.info.application_name) == 0) {
+				already = true;
+				break;
+			}
+		}
+		if (already) continue;
+
+		snprintf(out->names[out->count], sizeof(out->names[0]), "%s",
+		         ias.info.application_name);
+		out->count++;
+	}
+}
+
+/*!
+ * True if @p app_name matches any currently-running client in @p set. The
+ * comparison is case-sensitive and expects the application_name as passed to
+ * xrCreateInstance.
+ */
+static bool
+shell_running_set_contains(const struct shell_running_set *set, const char *app_name)
+{
+	if (set == NULL || app_name == NULL || !*app_name) return false;
+	for (int i = 0; i < set->count; i++) {
+		if (strcmp(set->names[i], app_name) == 0) return true;
+	}
+	return false;
+}
+
+/*!
+ * Phase 5.11: case-insensitive normalized exe-path equality. Treats
+ * forward slashes as backslashes so registry-stored paths match what
+ * QueryFullProcessImageNameW returns.
+ */
+static bool
+shell_exe_paths_equal(const char *a, const char *b)
+{
+	if (a == NULL || b == NULL) return a == b;
+	while (*a && *b) {
+		int ca = (unsigned char)*a;
+		int cb = (unsigned char)*b;
+		if (ca == '/') ca = '\\';
+		if (cb == '/') cb = '\\';
+		if (ca >= 'A' && ca <= 'Z') ca += 32;
+		if (cb >= 'A' && cb <= 'Z') cb += 32;
+		if (ca != cb) return false;
+		a++; b++;
+	}
+	return *a == '\0' && *b == '\0';
+}
+
+#ifdef _WIN32
+/*!
+ * Phase 5.11: resolve a PID to its absolute exe path via
+ * QueryFullProcessImageNameW. Writes a UTF-8 path into @p out, returns true
+ * on success.
+ */
+static bool
+shell_pid_to_exe_path(DWORD pid, char *out, size_t out_size)
+{
+	if (pid == 0 || out == NULL || out_size == 0) return false;
+
+	HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+	if (h == NULL) return false;
+
+	wchar_t wpath[MAX_PATH] = {0};
+	DWORD wlen = MAX_PATH;
+	BOOL ok = QueryFullProcessImageNameW(h, 0, wpath, &wlen);
+	CloseHandle(h);
+	if (!ok || wlen == 0) return false;
+
+	int n = WideCharToMultiByte(CP_UTF8, 0, wpath, (int)wlen, out, (int)out_size - 1, NULL, NULL);
+	if (n <= 0) return false;
+	out[n] = '\0';
+	return true;
+}
+#endif
+
+/*!
+ * Phase 5.11: build a bitmask of registered apps that have at least one
+ * matching IPC client currently connected. Bit @c i set means
+ * g_registered_apps[i].exe_path equals (case-insensitive, slash-normalized)
+ * the exe path of some IPC client's PID.
+ *
+ * Returns 0 on Windows if no clients are connected; non-Windows always 0.
+ */
+static uint64_t
+shell_compute_running_tile_mask(struct ipc_connection *ipc_c)
+{
+#ifdef _WIN32
+	uint64_t mask = 0;
+
+	struct ipc_client_list clients;
+	if (ipc_call_system_get_clients(ipc_c, &clients) != XRT_SUCCESS) {
+		return 0;
+	}
+
+	// Collect each connected client's exe path once.
+	char client_exes[IPC_MAX_CLIENTS][MAX_PATH];
+	int client_exe_count = 0;
+	for (uint32_t c = 0; c < clients.id_count; c++) {
+		if (clients.ids[c] == 0) continue;
+		struct ipc_app_state ias;
+		if (ipc_call_system_get_client_info(ipc_c, clients.ids[c], &ias) != XRT_SUCCESS)
+			continue;
+		if (ias.pid == 0) continue;
+		if (shell_pid_to_exe_path((DWORD)ias.pid, client_exes[client_exe_count],
+		                          sizeof(client_exes[0]))) {
+			client_exe_count++;
+			if (client_exe_count >= IPC_MAX_CLIENTS) break;
+		}
+	}
+
+	// Match each registered app against the connected exe set.
+	int cap = g_registered_app_count;
+	if (cap > 64) cap = 64; // mask is uint64_t
+	for (int i = 0; i < cap; i++) {
+		const char *reg_exe = g_registered_apps[i].exe_path;
+		for (int j = 0; j < client_exe_count; j++) {
+			if (shell_exe_paths_equal(reg_exe, client_exes[j])) {
+				mask |= (1ULL << i);
+				break;
+			}
+		}
+	}
+
+	return mask;
+#else
+	(void)ipc_c;
+	return 0;
+#endif
+}
+
+/*!
+ * Phase 5.8: ship the current g_registered_apps[] array to the service so
+ * the spatial launcher panel can render its tile grid. Uses a clear+add
+ * pattern (one IPC call per app) so each message stays under IPC_BUF_SIZE.
+ * The shell must re-call this whenever the registry changes (browse-for-app,
+ * remove, refresh).
+ */
+static void
+shell_push_registered_apps_to_service(struct ipc_connection *ipc_c)
+{
+	xrt_result_t r = ipc_call_shell_clear_launcher_apps(ipc_c);
+	if (r != XRT_SUCCESS) {
+		PE("ipc_call_shell_clear_launcher_apps failed: %d\n", r);
+		return;
+	}
+
+	int pushed = 0;
+	int cap = g_registered_app_count;
+	if (cap > IPC_LAUNCHER_MAX_APPS) {
+		cap = IPC_LAUNCHER_MAX_APPS;
+	}
+	for (int i = 0; i < cap; i++) {
+		const struct registered_app *src = &g_registered_apps[i];
+
+		struct ipc_launcher_app msg;
+		memset(&msg, 0, sizeof(msg));
+		snprintf(msg.name, sizeof(msg.name), "%s", src->name);
+		snprintf(msg.exe_path, sizeof(msg.exe_path), "%s", src->exe_path);
+		snprintf(msg.type, sizeof(msg.type), "%s", src->type);
+		snprintf(msg.icon_path, sizeof(msg.icon_path), "%s", src->icon_path);
+		snprintf(msg.icon_3d_path, sizeof(msg.icon_3d_path), "%s", src->icon_3d_path);
+		snprintf(msg.icon_3d_layout, sizeof(msg.icon_3d_layout), "%s", src->icon_3d_layout);
+
+		r = ipc_call_shell_add_launcher_app(ipc_c, &msg);
+		if (r != XRT_SUCCESS) {
+			PE("ipc_call_shell_add_launcher_app[%d] failed: %d\n", i, r);
+			return;
+		}
+		pushed++;
+	}
+	P("Pushed %d app(s) to launcher.\n", pushed);
+}
+
+#ifdef _WIN32
+/*!
+ * Phase 5.14: prompt the user for an executable via GetOpenFileNameA,
+ * append it to g_registered_apps as a user entry, persist to JSON, and
+ * re-push the registry to the service. Mirrors the OPENFILENAMEA idiom
+ * used by comp_d3d11_window.cpp's Ctrl+O launch flow.
+ *
+ * Called from the launcher click-poll branch when the service signals a
+ * Browse-tile hit (IPC_LAUNCHER_ACTION_BROWSE). The dialog is modal and
+ * blocks the shell's message loop; on return the launcher is re-shown so
+ * the user sees their new tile at the end of the grid.
+ */
+static void
+shell_browse_and_add_app(struct ipc_connection *ipc_c)
+{
+	// Phase 5.14: open the file dialog as a top-level window
+	// (hwndOwner=NULL). The service granted ASFW_ANY foreground permission
+	// when it processed the Browse click, so Windows lets the modal dialog
+	// activate normally. Using the hidden HWND_MESSAGE g_msg_hwnd as owner
+	// doesn't help — message-only windows can't be focused, so the dialog
+	// would still hide behind the compositor.
+	char path[MAX_PATH] = {0};
+	OPENFILENAMEA ofn = {0};
+	ofn.lStructSize = sizeof(ofn);
+	ofn.hwndOwner = NULL;
+	ofn.lpstrFilter = "Executables (*.exe)\0*.exe\0All Files (*.*)\0*.*\0";
+	ofn.lpstrFile = path;
+	ofn.nMaxFile = MAX_PATH;
+	ofn.lpstrTitle = "Add app to DisplayXR launcher";
+	ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+
+	if (!GetOpenFileNameA(&ofn)) {
+		P("Browse: canceled\n");
+		return;
+	}
+
+	if (g_registered_app_count >= MAX_REGISTERED_APPS) {
+		PE("Registry full (%d) — cannot add '%s'\n",
+		   g_registered_app_count, path);
+		return;
+	}
+
+	// Derive a display name from the exe basename (strip path and .exe).
+	const char *base = strrchr(path, '\\');
+	if (base == NULL) base = strrchr(path, '/');
+	base = base ? base + 1 : path;
+	char name[128];
+	snprintf(name, sizeof(name), "%s", base);
+	size_t nlen = strlen(name);
+	if (nlen >= 4 && _stricmp(name + nlen - 4, ".exe") == 0) {
+		name[nlen - 4] = '\0';
+	}
+
+	struct registered_app *app = &g_registered_apps[g_registered_app_count++];
+	registered_app_zero(app);
+	snprintf(app->name, sizeof(app->name), "%s", name);
+	snprintf(app->exe_path, sizeof(app->exe_path), "%s", path);
+	snprintf(app->type, sizeof(app->type), "3d");   // assume 3d; user can edit JSON
+	snprintf(app->source, sizeof(app->source), "user");
+	snprintf(app->category, sizeof(app->category), "app");
+
+	registered_apps_save();
+	shell_push_registered_apps_to_service(ipc_c);
+	P("Browse: added '%s' from %s\n", name, path);
+}
+#else
+static void
+shell_browse_and_add_app(struct ipc_connection *ipc_c)
+{
+	(void)ipc_c;
+}
+#endif
+
 // --- 4C.10+4C.11: App launch from shell + auto-detect type ---
 
 /*!
@@ -1137,6 +1563,120 @@ tray_show_context_menu(HWND hwnd, bool shell_active)
 #endif // _WIN32
 
 #ifdef _WIN32
+/*
+ * Phase 8: 3D capture MVP.
+ *
+ * Builds an output prefix under %USERPROFILE%\Pictures\DisplayXR, asks the
+ * runtime to write SBS / L / R PNGs of the current pre-weave atlas, then
+ * writes a JSON sidecar with the metadata returned by the runtime.
+ */
+static void
+capture_write_sidecar(const char *json_path, const struct ipc_capture_result *r)
+{
+	cJSON *root = cJSON_CreateObject();
+	if (root == NULL) {
+		return;
+	}
+
+	cJSON_AddNumberToObject(root, "schema_version", 1);
+	cJSON_AddNumberToObject(root, "timestamp_ns", (double)r->timestamp_ns);
+
+	cJSON *atlas = cJSON_AddObjectToObject(root, "atlas");
+	cJSON_AddNumberToObject(atlas, "width", r->atlas_width);
+	cJSON_AddNumberToObject(atlas, "height", r->atlas_height);
+
+	cJSON *eye = cJSON_AddObjectToObject(root, "eye");
+	cJSON_AddNumberToObject(eye, "width", r->eye_width);
+	cJSON_AddNumberToObject(eye, "height", r->eye_height);
+
+	cJSON *stereo = cJSON_AddObjectToObject(root, "stereo");
+	cJSON_AddNumberToObject(stereo, "tile_columns", r->tile_columns);
+	cJSON_AddNumberToObject(stereo, "tile_rows", r->tile_rows);
+
+	cJSON *disp = cJSON_AddObjectToObject(root, "display_m");
+	cJSON_AddNumberToObject(disp, "width", r->display_width_m);
+	cJSON_AddNumberToObject(disp, "height", r->display_height_m);
+
+	cJSON *le = cJSON_AddArrayToObject(root, "eye_left_m");
+	cJSON_AddItemToArray(le, cJSON_CreateNumber(r->eye_left_m[0]));
+	cJSON_AddItemToArray(le, cJSON_CreateNumber(r->eye_left_m[1]));
+	cJSON_AddItemToArray(le, cJSON_CreateNumber(r->eye_left_m[2]));
+
+	cJSON *re = cJSON_AddArrayToObject(root, "eye_right_m");
+	cJSON_AddItemToArray(re, cJSON_CreateNumber(r->eye_right_m[0]));
+	cJSON_AddItemToArray(re, cJSON_CreateNumber(r->eye_right_m[1]));
+	cJSON_AddItemToArray(re, cJSON_CreateNumber(r->eye_right_m[2]));
+
+	cJSON *views = cJSON_AddArrayToObject(root, "views_written");
+	if (r->views_written & IPC_CAPTURE_FLAG_ATLAS) {
+		cJSON_AddItemToArray(views, cJSON_CreateString("atlas"));
+	}
+
+	char *text = cJSON_Print(root);
+	if (text != NULL) {
+		FILE *f = fopen(json_path, "wb");
+		if (f != NULL) {
+			fwrite(text, 1, strlen(text), f);
+			fclose(f);
+		} else {
+			PE("capture: failed to open sidecar %s\n", json_path);
+		}
+		free(text);
+	}
+	cJSON_Delete(root);
+}
+
+static void
+capture_frame(struct ipc_connection *ipc_c)
+{
+	const char *home = getenv("USERPROFILE");
+	if (home == NULL || home[0] == '\0') {
+		home = ".";
+	}
+
+	char dir[MAX_PATH];
+	snprintf(dir, sizeof(dir), "%s\\Pictures\\DisplayXR", home);
+
+	// Best-effort: Pictures should already exist; create the DisplayXR subdir.
+	char pictures[MAX_PATH];
+	snprintf(pictures, sizeof(pictures), "%s\\Pictures", home);
+	CreateDirectoryA(pictures, NULL);
+	if (!CreateDirectoryA(dir, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) {
+		PE("capture: CreateDirectory(%s) failed: %lu\n", dir, GetLastError());
+		return;
+	}
+
+	SYSTEMTIME st;
+	GetLocalTime(&st);
+
+	struct ipc_capture_request req = {0};
+	snprintf(req.path_prefix, sizeof(req.path_prefix),
+	         "%s\\capture_%04d-%02d-%02d_%02d-%02d-%02d",
+	         dir, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+	req.flags = IPC_CAPTURE_FLAG_ATLAS;
+
+	struct ipc_capture_result result = {0};
+	xrt_result_t r = ipc_call_shell_capture_frame(ipc_c, &req, &result);
+	if (r != XRT_SUCCESS) {
+		PE("capture: shell_capture_frame failed: %d\n", r);
+		return;
+	}
+
+	if (result.views_written == 0) {
+		PE("capture: runtime returned 0 views written\n");
+		return;
+	}
+
+	char json_path[MAX_PATH];
+	snprintf(json_path, sizeof(json_path), "%s.json", req.path_prefix);
+	capture_write_sidecar(json_path, &result);
+
+	P("Capture saved: %s (views=0x%x atlas=%ux%u eye=%ux%u)\n",
+	  req.path_prefix, result.views_written,
+	  result.atlas_width, result.atlas_height,
+	  result.eye_width, result.eye_height);
+}
+
 // WIN32 subsystem entry point — no console window.
 // Delegates to main() with the command line split into argc/argv.
 int WINAPI
@@ -1206,8 +1746,12 @@ main(int argc, char *argv[])
 
 	P("Connected to service.\n");
 
-	// Load registered apps config (4C.9)
+	// Load registered apps config (Phase 4C.9 + Phase 5.5 scanner merge)
 	registered_apps_load();
+
+	// Phase 5.8: push the merged registry to the service so the spatial
+	// launcher panel can render its tile grid.
+	shell_push_registered_apps_to_service(&ipc_c);
 
 #ifdef _WIN32
 	// --- Resolve runtime JSON path (needed for app launches) ---
@@ -1229,6 +1773,9 @@ main(int argc, char *argv[])
 		}
 		if (!RegisterHotKey(g_msg_hwnd, HOTKEY_LAUNCH, MOD_CONTROL, 'L')) {
 			PE("Warning: RegisterHotKey(Ctrl+L) failed — launcher hotkey unavailable\n");
+		}
+		if (!RegisterHotKey(g_msg_hwnd, HOTKEY_CAPTURE, MOD_CONTROL | MOD_SHIFT, 'C')) {
+			PE("Warning: RegisterHotKey(Ctrl+Shift+C) failed — capture hotkey unavailable\n");
 		}
 	}
 
@@ -1268,6 +1815,7 @@ main(int argc, char *argv[])
 
 		// Launch apps
 		if (app_count > 0) {
+
 			P("XR_RUNTIME_JSON = %s\n", have_json ? runtime_json : "(not set)");
 			for (int i = 0; i < app_count; i++) {
 				launch_app(&apps[i], have_json ? runtime_json : NULL);
@@ -1345,6 +1893,7 @@ main(int argc, char *argv[])
 						client_name_count = 0;
 
 						g_shell_active = false;
+						g_launcher_visible = false;
 						tray_update_tooltip(false);
 						P("Shell deactivated — waiting in tray.\n");
 					} else {
@@ -1382,16 +1931,39 @@ main(int argc, char *argv[])
 						P("Shell activated.\n");
 					}
 				} else if (msg.message == WM_HOTKEY && msg.wParam == HOTKEY_LAUNCH) {
-					// --- Ctrl+L: Launch registered app ---
+					// --- Ctrl+L: Toggle spatial launcher panel (Phase 5.7) ---
+					// The Phase 4C MessageBox path is gone — the service-side
+					// multi-compositor renders the panel in its own window when
+					// launcher_visible is true. Tile grid + launch dispatch
+					// come in later Phase 5 tasks.
 					if (g_shell_active) {
-						int idx = shell_show_launcher_dialog();
-						if (idx >= 0 && idx < g_registered_app_count) {
-							shell_launch_registered_app(
-							    &ipc_c, &g_registered_apps[idx],
-							    have_json ? runtime_json : NULL,
-							    apps, &app_count,
-							    captures, &capture_count);
+						g_launcher_visible = !g_launcher_visible;
+
+						// Phase 5.12: when opening, hand the service process
+						// foreground-activation permission so it can pull its
+						// compositor window into focus. Otherwise keys like
+						// Esc stay routed to whichever app previously had
+						// focus and never reach the compositor WndProc that
+						// the launcher keyboard handler depends on.
+						if (g_launcher_visible && service_pid != 0) {
+							AllowSetForegroundWindow(service_pid);
 						}
+
+						xrt_result_t lret = ipc_call_shell_set_launcher_visible(
+						    &ipc_c, g_launcher_visible);
+						if (lret != XRT_SUCCESS) {
+							PE("ipc_call_shell_set_launcher_visible failed: %d\n", lret);
+							g_launcher_visible = !g_launcher_visible; // roll back
+						} else {
+							P("Launcher %s\n", g_launcher_visible ? "shown" : "hidden");
+						}
+					}
+				} else if (msg.message == WM_HOTKEY && msg.wParam == HOTKEY_CAPTURE) {
+					// --- Ctrl+Shift+C: capture pre-weave SBS frame (Phase 8) ---
+					if (g_shell_active) {
+						capture_frame(&ipc_c);
+					} else {
+						P("Capture ignored: shell not active\n");
 					}
 				} else if (msg.message == WM_TRAYICON) {
 					if (LOWORD(msg.lParam) == WM_LBUTTONUP) {
@@ -1492,7 +2064,136 @@ main(int argc, char *argv[])
 					capture_count = 0;
 					client_name_count = 0;
 					g_shell_active = false;
+					g_launcher_visible = false;
 					tray_update_tooltip(false);
+				}
+			}
+		}
+
+		// Phase 5.11: refresh the running-tile mask and push to service if
+		// it has changed. Cheap to compute (one IPC list call + per-PID
+		// QueryFullProcessImageNameW), and we only push on diff.
+		if (g_shell_active) {
+			static uint64_t s_last_running_mask = (uint64_t)-1;
+			uint64_t mask = shell_compute_running_tile_mask(&ipc_c);
+			if (mask != s_last_running_mask) {
+				ipc_call_shell_set_running_tile_mask(&ipc_c, mask);
+				s_last_running_mask = mask;
+			}
+		}
+
+		// Phase 5.10: poll for launcher tile clicks. The service-side
+		// WM_LBUTTONDOWN handler stores a tile index when the user clicks
+		// inside the launcher; we look up the registered app and dispatch
+		// the launch on this side because we own the env vars + CreateProcess
+		// path. The launcher panel was already hidden by the service when
+		// the click landed, so we just need to sync our local state and run
+		// the launch. Only poll while the launcher is actually visible to
+		// keep IPC traffic minimal.
+		// Poll for launcher tile clicks. Only while the launcher is visible
+		// — when hidden there can't be any clicks. This is a performance
+		// optimization (avoids 500ms-cadence IPC traffic when the launcher
+		// isn't open), not a workaround for #144 which turned out to be a
+		// stale-binary issue resolved by the Phase 6 rebuild.
+		if (g_shell_active && g_launcher_visible) {
+			int64_t tile_index = -1;
+			if (ipc_call_shell_poll_launcher_click(&ipc_c, &tile_index) == XRT_SUCCESS &&
+			    tile_index != -1) {
+				// Service already hid the launcher when the action registered.
+				g_launcher_visible = false;
+
+				// Phase 6.6: check refresh BEFORE remove — both use negative
+				// sentinels and refresh (-300) would match the remove check
+				// (<= -200) if checked second.
+				if (tile_index == IPC_LAUNCHER_ACTION_REFRESH) {
+					P("Launcher: refreshing app list (before: %d apps)\n",
+					  g_registered_app_count);
+					registered_apps_load();
+					P("Launcher: refreshed (after: %d apps)\n",
+					  g_registered_app_count);
+					shell_push_registered_apps_to_service(&ipc_c);
+#ifdef _WIN32
+					if (service_pid != 0) {
+						AllowSetForegroundWindow(service_pid);
+					}
+#endif
+					if (ipc_call_shell_set_launcher_visible(&ipc_c, true) == XRT_SUCCESS) {
+						g_launcher_visible = true;
+					}
+				} else if (tile_index <= -(int64_t)IPC_LAUNCHER_ACTION_REMOVE_BASE) {
+					int full_idx = (int)(-(tile_index) - IPC_LAUNCHER_ACTION_REMOVE_BASE);
+					if (full_idx >= 0 && full_idx < g_registered_app_count) {
+						P("Launcher: removing '%s' permanently\n",
+						  g_registered_apps[full_idx].name);
+						// Shift remaining entries down.
+						for (int j = full_idx; j < g_registered_app_count - 1; j++) {
+							g_registered_apps[j] = g_registered_apps[j + 1];
+						}
+						g_registered_app_count--;
+						registered_apps_save();
+						shell_push_registered_apps_to_service(&ipc_c);
+					}
+					// Re-show launcher so user sees the updated grid.
+#ifdef _WIN32
+					if (service_pid != 0) {
+						AllowSetForegroundWindow(service_pid);
+					}
+#endif
+					if (ipc_call_shell_set_launcher_visible(&ipc_c, true) == XRT_SUCCESS) {
+						g_launcher_visible = true;
+					}
+				} else if (tile_index == IPC_LAUNCHER_ACTION_BROWSE) {
+					// Phase 5.14: Browse tile → open file dialog, add to
+					// registry, re-push, re-show launcher so the user sees
+					// their new tile.
+					shell_browse_and_add_app(&ipc_c);
+#ifdef _WIN32
+					if (service_pid != 0) {
+						AllowSetForegroundWindow(service_pid);
+					}
+#endif
+					if (ipc_call_shell_set_launcher_visible(&ipc_c, true) == XRT_SUCCESS) {
+						g_launcher_visible = true;
+					}
+				} else if (tile_index >= 0 && tile_index < (int64_t)g_registered_app_count) {
+					struct registered_app *rapp = &g_registered_apps[tile_index];
+
+					// Phase 5.11: if a matching client is already running,
+					// focus it instead of spawning a second instance.
+					bool focused_existing = false;
+#ifdef _WIN32
+					struct ipc_client_list clist;
+					if (ipc_call_system_get_clients(&ipc_c, &clist) == XRT_SUCCESS) {
+						for (uint32_t c = 0; c < clist.id_count && !focused_existing; c++) {
+							if (clist.ids[c] == 0) continue;
+							struct ipc_app_state ias;
+							if (ipc_call_system_get_client_info(&ipc_c, clist.ids[c], &ias) != XRT_SUCCESS)
+								continue;
+							char client_exe[MAX_PATH];
+							if (!shell_pid_to_exe_path((DWORD)ias.pid, client_exe, sizeof(client_exe)))
+								continue;
+							if (shell_exe_paths_equal(client_exe, rapp->exe_path)) {
+								if (ipc_call_system_set_focused_client(&ipc_c, clist.ids[c]) == XRT_SUCCESS) {
+									P("Launcher: focused running client %u → '%s'\n",
+									  clist.ids[c], rapp->name);
+									focused_existing = true;
+								}
+							}
+						}
+					}
+#endif
+					if (!focused_existing) {
+						P("Launcher: launching tile %lld → '%s'\n",
+						  (long long)tile_index, rapp->name);
+						shell_launch_registered_app(
+						    &ipc_c, rapp,
+						    have_json ? runtime_json : NULL,
+						    apps, &app_count,
+						    captures, &capture_count);
+					}
+				} else {
+					PE("Launcher click: tile %lld out of range (count=%d)\n",
+					   (long long)tile_index, g_registered_app_count);
 				}
 			}
 		}

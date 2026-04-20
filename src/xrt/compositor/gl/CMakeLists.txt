@@ -22,6 +22,7 @@ target_link_libraries(
 		aux_os
 		aux_math
 		aux_ogl
+		xrt-external-stb
 	)
 
 target_include_directories(comp_gl PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)

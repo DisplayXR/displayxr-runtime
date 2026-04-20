@@ -63,6 +63,10 @@ XR_RUNTIME_JSON=./build/openxr_displayxr-dev.json ./build/test_apps/cube_handle_
 
 Use WASD + mouse to move the simulated eye position and observe perspective-correct stereo rendering.
 
+## Production Components
+
+The diagram above shows the in-process path — a single app talking directly to the display. In production, DisplayXR also includes a **service** (for multi-app and sandboxed browsers), a **spatial shell** (3D window manager), and a **WebXR bridge** (metadata sideband for Chrome). See [Production Components](../architecture/production-components.md) for how all the pieces fit together.
+
 ## Next Steps
 
 - [Building DisplayXR](building.md) — build instructions for Windows and macOS

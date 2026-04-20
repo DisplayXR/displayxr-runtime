@@ -25,6 +25,7 @@
 #include "math/m_space.h"
 
 #include "oxr_objects.h"
+#include "oxr_mcp_tools.h"
 #include "oxr_logger.h"
 #include "oxr_two_call.h"
 #include "oxr_handle.h"
@@ -1472,6 +1473,9 @@ submit_projection_layer(struct oxr_session *sess,
 		    &data);                                    // data
 		OXR_CHECK_XRET(log, sess, xret, xrt_comp_layer_projection);
 	}
+
+	// Publish the per-view declared projection for MCP introspection.
+	oxr_mcp_tools_record_submitted(sess, &data);
 
 	return XR_SUCCESS;
 }

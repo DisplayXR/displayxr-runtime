@@ -15,7 +15,8 @@ See the [milestone tracker](https://github.com/DisplayXR/displayxr-runtime-pvt/m
 - **M3: Test Coverage** — #30, #31, #33 open.
 - **M4: Display Extensions** — Done. `XR_EXT_display_info` header frozen at v12 (#114 closed). Events (#3), multiview math (#38), eye tracking modes (#81), docs (#66) all complete. Vendor-initiated transition detection (#123) shipped via `get_hardware_3d_state()` DP vtable method. Remaining vendor work (MANUAL eye tracking mode) blocked on Leia SDK.
 - **M5: Interface Standardization** — #45, #46, #47 open.
-- **M6: Spatial Shell** — #43, #44 open. Phase 3B complete: all 4 APIs (D3D11, D3D12, GL, VK) working in shell individually and simultaneously. #116 (multi-client crash) fixed. Phase 4 (Spatial Companion) planned on `feature/shell-phase4-ci`.
+- **M6: Spatial Shell** — Done (Windows). Phases 0–8 shipped: multi-compositor, spatial windowing, window chrome, layout presets, 2D app capture, focus-adaptive 2D/3D mode, app launcher, graceful exit, 3D capture (Ctrl+Shift+C). macOS port deferred.
+- **MCP (AI-Native Control)** — Phase A (handle-app introspection) and Phase B (service-mode shell tools) merged. Tools: `get_kooima_params`, `capture_frame`, `list_windows`, `get/set_window_pose`, `save/load_workspace`, `apply_layout_preset`. Spec: `docs/roadmap/mcp-spec-v0.2.md`.
 
 ### Architecture
 
@@ -90,6 +91,29 @@ scripts\build_windows.bat generate   REM CMake generate only
 Downloads all dependencies on first run (SR SDK, vcpkg, OpenXR loader). Requires VS 2022 with C++ workload, Ninja, Vulkan SDK, and GitHub CLI. Outputs to `_package/` (runtime) and `test_apps/*/build/` (test apps).
 
 **When on a Windows machine with a Leia SR display, prefer local builds over CI** — iterate faster with `scripts\build_windows.bat build` and test directly. Run scripts are generated in `_package/` (see Windows Test App section below).
+
+### Windows Compile-Check on macOS / Linux (MinGW-w64)
+```bash
+brew install mingw-w64        # one-time
+./scripts/build-mingw-check.sh                # default targets: aux_util mcp_adapter
+./scripts/build-mingw-check.sh aux_util drv_qwerty  # custom target list
+```
+Cross-compiles a curated subset against MinGW-w64 to catch Win32-API typos, missing `#ifdef XRT_OS_WINDOWS` guards, and wrong-platform symbols **before pushing to CI**. Mirrors the displayxr-unity plugin's `native~/build-win.sh` pattern.
+
+**Caveats — MinGW is NOT a full MSVC substitute:**
+- Compositors using WIL (`wil::com_ptr` in `comp_d3d11_service.cpp`) won't cross-compile. Service-side D3D11 stays MSVC-only.
+- Vulkan / vcpkg-only deps not available; targets requiring them (full openxr_displayxr.dll, comp_d3d11 native) are out of scope.
+- **MinGW ships winpthreads which adds POSIX-like extensions** (`clock_gettime`, `CLOCK_MONOTONIC`, `pid_t`, `<unistd.h>`, etc.) that **MSVC does not have**. These bugs only surface in real CI. Workarounds:
+  - Use `os_monotonic_get_ns()` from `aux/os/os_time.h` instead of `clock_gettime(CLOCK_MONOTONIC, …)`.
+  - Use C11 `timespec_get(TIME_UTC)` instead of `clock_gettime(CLOCK_REALTIME, …)`.
+  - Use `long` instead of `pid_t` in public headers (don't include `<sys/types.h>` for it).
+  - Avoid `<unistd.h>` in cross-platform code. Use `os_nanosleep()` from `aux/os/os_time.h` instead of `usleep()`. For PIDs, use a wrapper helper like `u_mcp_self_pid()` that does `getpid()` on POSIX and `GetCurrentProcessId()` on Windows.
+  - Avoid C11 `<stdatomic.h>`. MSVC needs `/experimental:c11atomics` and even then `_Atomic(T*)` syntax is unreliable. Use a `pthread_mutex_t` (uncontended is essentially free), or Windows `Interlocked*` APIs behind an `#ifdef`.
+  - `strncasecmp` / `strcasecmp` are POSIX. MSVC has `_strnicmp` / `_stricmp` in `<string.h>`. Add `#ifdef _WIN32 #define strncasecmp _strnicmp #endif` at the top of the TU.
+
+What it DOES catch reliably: `windows.h` symbol resolution, missing platform-config includes (`xrt/xrt_config_os.h` so `XRT_OS_WINDOWS` is actually defined), duplicate struct definitions across `#ifdef` branches, mistakes in cross-platform pthread wrapping.
+
+Toolchain: `cmake/toolchain-mingw-w64.cmake`. Output goes to `build-mingw/` (gitignored). Runs in ~30 s after first configure.
 
 ### CI Build (Remote)
 ```bash
@@ -348,7 +372,41 @@ See `docs/reference/debug-logging.md` for full conventions.
 - Use U_LOG_I (INFO) for recurring/throttled diagnostic logs (per-frame, per-keystroke, etc.)
 - Never add per-frame U_LOG_W calls — they cause massive log bloat
 
-## Capturing Window Screenshots (Autonomous Testing)
+## Capturing Compositor Screenshots (Preferred)
+
+The D3D11 service compositor supports file-triggered screenshots of its combined atlas (full-resolution SBS back buffer). This reads the D3D11 texture directly — no DPI issues, no PrintWindow limitations.
+
+**Trigger:** Create `%TEMP%\shell_screenshot_trigger`. The compositor checks every frame, captures the atlas, writes `%TEMP%\shell_screenshot.png`, and deletes the trigger.
+
+```bash
+# 1. Clean old capture
+rm -f "/c/Users/SPARKS~1/AppData/Local/Temp/shell_screenshot.png"
+# 2. Trigger capture
+touch "/c/Users/SPARKS~1/AppData/Local/Temp/shell_screenshot_trigger"
+# 3. Wait for compositor to process
+sleep 3
+# 4. View result (3840x2160 SBS atlas)
+```
+Then use the Read tool on `C:\Users\SPARKS~1\AppData\Local\Temp\shell_screenshot.png`.
+
+**Toggle launcher programmatically (Ctrl+L):** The shell uses RegisterHotKey with a message-only window. Toggle via PostMessage:
+```powershell
+powershell -Command "
+Add-Type @'
+using System;using System.Runtime.InteropServices;
+public class ShellMsg{
+[DllImport(\"user32.dll\",CharSet=CharSet.Ansi)] public static extern IntPtr FindWindowExA(IntPtr p,IntPtr a,string c,string t);
+[DllImport(\"user32.dll\")] public static extern bool PostMessage(IntPtr h,uint m,IntPtr w,IntPtr l);
+}
+'@
+\$h=[ShellMsg]::FindWindowExA([IntPtr]::new(-3),[IntPtr]::Zero,'Static','DisplayXR Shell Msg')
+[ShellMsg]::PostMessage(\$h,0x0312,[IntPtr]::new(2),[IntPtr]::Zero)
+"
+```
+
+**Code location:** `comp_d3d11_service.cpp`, in `multi_compositor_render()`, just before `swap_chain->Present()`.
+
+## Capturing Window Screenshots (Legacy — PrintWindow)
 
 To visually inspect the shell or any app window without user interaction:
 
