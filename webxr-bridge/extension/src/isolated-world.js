@@ -4,6 +4,14 @@
 // Relays messages between the bridge and the MAIN world script via
 // window.postMessage. Reconnects with exponential backoff on disconnect.
 //
+// Connect policy: the bridge is only needed when a page actually uses
+// session.displayXR. MAIN world only sends messages in response to
+// session.displayXR usage, so we defer WebSocket.connect() until the first
+// such message arrives. On pages where no app touches session.displayXR
+// (legacy WebXR sites, non-XR sites), the WebSocket is never opened — so
+// in Auto mode, the service's trampoline listener never sees a connection
+// and does not spawn the bridge.
+//
 // No host permissions required — MV3 allows WebSocket to localhost from
 // content scripts in ISOLATED world without explicit host_permissions.
 
@@ -19,6 +27,10 @@
   let ws = null;
   let backoffMs = BACKOFF_INITIAL_MS;
   let reconnectTimer = null;
+  // Messages from MAIN world that arrived before the WebSocket was open.
+  // Flushed in ws.onopen. Once an app has triggered a connect the queue
+  // is the only thing that guarantees bridge-attach reaches the bridge.
+  const pendingQueue = [];
 
   function connect() {
     if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) {
@@ -41,6 +53,17 @@
         version: 1,
         origin: window.location.origin || 'chrome-extension://'
       }));
+      // Flush any messages that arrived before the WS was open.
+      while (pendingQueue.length > 0) {
+        var payload = pendingQueue.shift();
+        try {
+          ws.send(JSON.stringify(payload));
+        } catch (e) {
+          // Socket died mid-flush; remaining items will be lost. Reconnect
+          // path handles the next attempt.
+          break;
+        }
+      }
     };
 
     ws.onmessage = function (event) {
@@ -59,7 +82,12 @@
     ws.onclose = function () {
       ws = null;
       postBridgeStatus();
-      scheduleReconnect();
+      // Only retry once an app has shown intent. If the queue is empty
+      // and we've never successfully opened a bridge session, stay idle —
+      // this is the common case for legacy / non-XR pages.
+      if (pendingQueue.length > 0) {
+        scheduleReconnect();
+      }
     };
 
     ws.onerror = function () {
@@ -90,16 +118,25 @@
     if (!event.data || event.data.source !== MSG_SOURCE_FROM_MAIN) return;
 
     // Status query from sample — reply with current bridge connection state.
+    // Never triggers a connect.
     if (event.data.payload && event.data.payload.type === 'status-request') {
       postBridgeStatus();
       return;
     }
 
-    if (ws && ws.readyState === WebSocket.OPEN && event.data.payload) {
+    if (!event.data.payload) return;
+
+    if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify(event.data.payload));
+      return;
     }
+
+    // Any other message from MAIN world implies the app is using
+    // session.displayXR. Queue it and kick off a connect if needed.
+    pendingQueue.push(event.data.payload);
+    connect();
   });
 
-  // Start connection immediately.
-  connect();
+  // Note: no top-level connect() call. The WS only opens when MAIN world
+  // sends its first displayXR-related message.
 })();
