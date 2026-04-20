@@ -46,6 +46,13 @@
         nominalViewerPosition: di.nominalViewerPosition
       },
 
+      // Eye-tracking capabilities advertised by the DP.
+      //   supportedModes: string[] of 'MANAGED' / 'MANUAL'
+      //   defaultMode:    'MANAGED' | 'MANUAL'
+      // Apps MUST check supportedModes before calling requestEyeTrackingMode
+      // — some devices only support one mode (e.g. Leia is MANAGED-only).
+      eyeTracking: di.eyeTracking || { supportedModes: [], defaultMode: 'MANAGED' },
+
       // Compositor window info — present when the bridge could locate the
       // service compositor HWND. Updates live on resize/move via 'windowinfochange'
       // event on the session. Pages doing window-relative Kooima should use

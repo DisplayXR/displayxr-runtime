@@ -3,6 +3,9 @@
 <head>
 <meta charset="utf-8" />
 <title>DisplayXR WebXR Bridge v2 — three.js sample</title>
+<!-- For a guide to building your own bridge-aware WebXR app, see
+     webxr-bridge/DEVELOPER.md (start here) and
+     webxr-bridge/PROTOCOL.md (wire-level reference). -->
 <script type="importmap">
 {
   "imports": {
@@ -59,6 +62,20 @@
   .controls { margin-top: 16px; font-size: 12px; color: #64748b; border-top: 1px solid #e2e8f0; padding-top: 12px; }
   .controls h3 { font-size: 13px; margin: 0 0 6px; color: #475569; }
   .controls kbd { font: 11px/1 ui-monospace, monospace; padding: 2px 5px; background: #f1f5f9; border: 1px solid #e2e8f0; border-radius: 3px; }
+
+  /* Bridge UI: mode selector, eye-tracking toggle, live state */
+  .bridge-ui { margin: 16px 0; padding: 14px 16px; background: #f1f5f9; border: 1px solid #cbd5e1; border-radius: 8px; }
+  .bridge-ui h3 { font-size: 13px; margin: 0 0 10px; color: #475569; font-weight: 600; }
+  .bridge-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; flex-wrap: wrap; font-size: 13px; }
+  .bridge-row:last-child { margin-bottom: 0; }
+  .bridge-label { color: #64748b; font-weight: 500; min-width: 90px; }
+  .mode-btn { font: 12px/1 system-ui; padding: 4px 10px; border: 1px solid #cbd5e1; border-radius: 5px; background: #fff; color: #1e293b; cursor: pointer; }
+  .mode-btn:hover:not(:disabled) { background: #e2e8f0; }
+  .mode-btn.active { background: #1e293b; color: #fff; border-color: #1e293b; }
+  .mode-btn:disabled { opacity: 0.5; cursor: default; }
+  .et-toggle { font: 12px/1 system-ui; padding: 4px 10px; border: 1px solid #cbd5e1; border-radius: 5px; background: #fff; color: #1e293b; cursor: pointer; }
+  .et-hint { color: #94a3b8; font-size: 11px; }
+  #bridge-state { margin-top: 10px; padding: 10px 12px; background: #1e293b; color: #cbd5e1; border-radius: 6px; font: 11px/1.6 ui-monospace, 'Cascadia Code', monospace; white-space: pre-wrap; }
 </style>
 </head>
 <body>
@@ -67,7 +84,12 @@
   <img src="displayxr.png" alt="DisplayXR">
   <h1>WebXR Bridge v2</h1>
 </div>
-<p class="subtitle">three.js Kooima 3D sample — reference implementation for WebXR on 3D displays</p>
+<p class="subtitle">
+  three.js Kooima 3D sample &mdash; reference implementation for WebXR on 3D displays.
+  See <a href="../DEVELOPER.md">DEVELOPER.md</a> for an integration guide,
+  <a href="../PROTOCOL.md">PROTOCOL.md</a> for the wire schema,
+  and <a href="../examples/minimal.html">examples/minimal.html</a> for a copy-paste starting point.
+</p>
 
 <div class="status-panel">
   <div class="status-item"><span id="dot-webxr" class="status-dot"></span>WebXR</div>
@@ -78,6 +100,20 @@
 <div class="btn-row">
   <button id="enter-xr" class="primary" disabled>Enter XR</button>
   <button id="exit-xr" class="danger" disabled>Exit XR</button>
+</div>
+
+<div class="bridge-ui">
+  <h3>Bridge controls</h3>
+  <div class="bridge-row">
+    <span class="bridge-label">Rendering mode:</span>
+    <div id="mode-buttons"><span class="et-hint">enter XR to populate</span></div>
+  </div>
+  <div class="bridge-row">
+    <span class="bridge-label">Eye tracking:</span>
+    <button id="et-toggle" class="et-toggle" disabled>&mdash;</button>
+    <span class="et-hint">MANAGED = driver decides; MANUAL = app calls requestEyeTrackingMode</span>
+  </div>
+  <div id="bridge-state">awaiting session…</div>
 </div>
 
 <div id="status">Checking prerequisites...</div>

@@ -1,5 +1,7 @@
 # DisplayXR WebXR Bridge v2 — JSON Protocol v1
 
+> **Building an app?** Start at [`DEVELOPER.md`](DEVELOPER.md) for the conceptual guide and a copy-paste starter. This document is a wire-level reference for the WebSocket message schema; you usually don't need to read it directly because the Chrome extension's `session.displayXR` shim wraps every message into a JS API.
+
 WebSocket transport over `ws://127.0.0.1:9014`. Single-line JSON text frames.
 Both sides check `"version": 1` on every message. Future schema changes bump the integer.
 
@@ -52,6 +54,7 @@ Bridge calls `xrRequestDisplayRenderingModeEXT(session, modeIndex)`. Runtime pro
     { "index": 0, "recommendedImageRectWidth": 1920, "recommendedImageRectHeight": 1080, "maxImageRectWidth": 3840, "maxImageRectHeight": 2160 },
     { "index": 1, "recommendedImageRectWidth": 1920, "recommendedImageRectHeight": 1080, "maxImageRectWidth": 3840, "maxImageRectHeight": 2160 }
   ],
+  "eyeTracking": { "supportedModes": ["MANAGED"], "defaultMode": "MANAGED" },
   "windowInfo": {
     "valid": true,
     "windowPixelSize": [1920, 1080],
@@ -66,6 +69,8 @@ Bridge calls `xrRequestDisplayRenderingModeEXT(session, modeIndex)`. Runtime pro
 `windowInfo` is the live state of the service compositor window (Win32 client area) the bridge located via `FindWindowW("DisplayXRD3D11", ...)`. `valid` is `false` when the window can't be found (e.g. before a WebXR session is active). `windowCenterOffsetMeters` is the window center's physical offset from the display center (`+x` right, `+y` up). Pages doing window-relative Kooima should use `windowSizeMeters` as the screen and subtract `windowCenterOffsetMeters` from each eye's XY position before computing the asymmetric frustum (matches `test_apps/cube_handle_d3d11_win/main.cpp:342-433`).
 
 `viewWidth` and `viewHeight` are the compositor's actual per-view tile dimensions in pixels, read from the compositor's HWND properties. These are deferred-resize-aware — they don't update mid-drag, only after the compositor finishes resizing its atlas. Pages should use these for per-tile viewport sizing instead of computing from `displayPixelSize × viewScale` or dividing the framebuffer by the tile grid. Present when the compositor has published its view dims; absent on older bridges.
+
+`eyeTracking.supportedModes` is an array of the eye-tracking modes the DP actually supports (currently one of `"MANAGED"`, `"MANUAL"`, or both). Apps **MUST** check membership before calling `requestEyeTrackingMode` — requesting an unsupported mode is ignored by the bridge (logged) and never reaches the DP. Leia's DP today reports `["MANAGED"]`. `eyeTracking.defaultMode` is the mode the DP uses when the app hasn't requested one.
 
 ### `window-info`
 

@@ -1,26 +1,41 @@
-// DisplayXR WebXR Bridge v2 — three.js Kooima 3D sample.
+// DisplayXR WebXR Bridge v2 — reference sample.
 //
-// Replicates cube_handle_d3d11_win's display-centric rendering:
-//  - Single Wood Crate cube at (0, 0.03, 0), size 0.06m, rotating 0.5 rad/s around Y
-//  - 10x10 gray grid floor at y = -0.05m, 0.05m spacing
-//  - Dark blue background (0.05, 0.05, 0.25)
-//  - Directional light at (0.3, 0.8, 0.5) with 0.3 ambient + 0.7 diffuse
-//  - Display-centric rig at camera origin (0, 0, 0), identity orientation
-//  - Default tunables: ipdFactor=1, parallaxFactor=1, perspectiveFactor=1,
-//    scaleFactor=1, virtualDisplayHeight=0.24m
+// Purpose: demonstrate every feature of the WebXR bridge end to end and
+// serve as a copy-paste starting point for developers writing their own
+// bridge-aware WebXR apps. See webxr-bridge/DEVELOPER.md for a prose guide
+// and webxr-bridge/PROTOCOL.md for the wire-level message schema.
 //
-// Kooima projection is built from bridge-delivered asymmetric FOV angles
-// (already Kooima-computed in the runtime). Eye positions are scaled by
-// m2v = virtualDisplayHeight / physicalDisplayHeightMeters to match the
-// cube app's perspective/scale pipeline.
+// Outline (grep for the banners to jump between sections):
+//   === 1. Constants + DOM refs ===               — boilerplate
+//   === 2. Rig + input state ===                  — demo-only: how this
+//                                                   sample chooses to
+//                                                   expose tunables
+//   === 3. Three.js scene scaffolding ===         — demo-only: cube + grid
+//   === 4. Kooima projection (bridge contract) ===— REQUIRED for proper
+//                                                   3D on Leia displays
+//   === 5. XR frame loop (bridge contract) ===    — per-eye render, tile
+//                                                   layout, GL Y-flip
+//   === 6. HUD overlay (bridge feature) ===       — optional: compositor
+//                                                   draws these lines
+//   === 7. Enter / exit XR (bridge contract) ===  — displayXR event wiring
+//   === 8. Status UI ===                          — demo-only: dots
+//
+// Replicates cube_handle_d3d11_win (native reference). See also
+// test_apps/common/display3d_view.c + .h for the canonical Kooima math.
 
 import * as THREE from 'three';
 
-// --- DOM refs & logging ---
+// =============================================================================
+// === 1. Constants + DOM refs =================================================
+// =============================================================================
+// Boilerplate. Nothing bridge-specific here.
 
 const statusEl = document.getElementById('status');
 const enterBtn = document.getElementById('enter-xr');
 const exitBtn = document.getElementById('exit-xr');
+const modeButtonsEl = document.getElementById('mode-buttons');
+const etToggleEl = document.getElementById('et-toggle');
+const bridgeStateEl = document.getElementById('bridge-state');
 
 function log(msg) {
   statusEl.textContent += msg + '\n';
@@ -32,7 +47,7 @@ function log(msg) {
   console.log('[sample]', msg);
 }
 
-// --- Constants (match cube_handle_d3d11_win) ---
+// Constants (match cube_handle_d3d11_win for visual parity)
 
 const NEAR = 0.01;
 const FAR = 100.0;
@@ -48,13 +63,25 @@ const BG_COLOR = 0x0d0d40;   // (0.05, 0.05, 0.25)
 const VIRTUAL_DISPLAY_HEIGHT = 0.24; // meters (4x cube height)
 const CAMERA_HALF_TAN_VFOV = 0.32491969623; // tan(18°) → 36° vFOV (matches camera3d_view.c)
 
-// --- XR state ---
+// =============================================================================
+// === 2. Rig + input state ====================================================
+// =============================================================================
+// Demo-only. The "rig" here holds this sample's tunables (vHeight, IPD
+// factor, parallax factor, yaw/pitch, camera-vs-display Kooima mode) and
+// per-frame pose offsets driven by WASD/arrows/mouse-look. Your own app
+// will have its own view-control conventions — this is just what the
+// sample chose to mirror cube_handle_d3d11_win.
+
+// XR state
 
 let xrSession = null;
 let gl = null;
 let xrLayer = null;
 let displayXR = null;
 let frameCount = 0;
+// Reference space used by the standard-WebXR fallback path (see onXRFrame).
+// Only populated when the DisplayXR extension/bridge isn't available.
+let fallbackRefSpace = null;
 
 // --- Input state (driven by displayxrinput events from the bridge) ---
 //
@@ -128,7 +155,13 @@ function rigReset() {
   if (renderer) renderer.resetState();
 }
 
-// --- Three.js objects ---
+// =============================================================================
+// === 3. Three.js scene scaffolding ===========================================
+// =============================================================================
+// Demo-only. Pure three.js boilerplate — scene graph, materials, grid, cube.
+// Replace this with your own scene. Nothing here touches the bridge.
+
+// Three.js objects
 
 let renderer = null;
 let scene = null;
@@ -210,7 +243,17 @@ function createScene() {
   scene.add(grid);
 }
 
-// --- Projection helpers ---
+// =============================================================================
+// === 4. Kooima projection (bridge contract) ==================================
+// =============================================================================
+// REQUIRED for proper 3D on a Leia / sim_display 3D panel. Builds an
+// asymmetric off-axis perspective frustum from the physical screen dims
+// (window or display in meters) + the tracked eye position. Ported from
+// test_apps/common/display3d_view.c / camera3d_view.c — the canonical
+// implementations. If your app uses a different 3D-math library, port
+// those C files rather than re-deriving.
+//
+// Projection helpers
 
 // Local Kooima asymmetric frustum — EXACT port of test_apps/common/display3d_view.c
 // (display3d_compute_view + display3d_compute_projection).
@@ -266,10 +309,63 @@ function buildCameraProjection(eyeLocal, screenWm, screenHm, invd, halfTanVfov) 
   return new THREE.Matrix4().makePerspective(l, r, t, b, NEAR, FAR);
 }
 
-// --- XR frame loop ---
+// =============================================================================
+// === 5. XR frame loop (bridge contract) ======================================
+// =============================================================================
+// REQUIRED pattern. Per frame: read `displayXR.windowInfo` for current
+// window size + position, compute per-tile dims (prefer bridge-pushed
+// `viewWidth/viewHeight`), place each eye's viewport in the shared
+// framebuffer, build Kooima projection from the tracked eye, render.
+// See DEVELOPER.md §"Frame loop" for the step-by-step derivation.
+
+// XR frame loop
 
 let prevTimeMs = 0;
 let cubeRotation = 0;
+
+// Standard-WebXR render — used when the bridge isn't available.
+// Uses frame.getViewerPose + XRView.projectionMatrix + XRView.transform
+// instead of displayXR.eyePoses + Kooima. This is what every other WebXR
+// app on the web does; we include it as a graceful degradation so this
+// sample still renders something without the DisplayXR extension installed.
+function renderFallbackFrame(time, frame, glLayer) {
+  const pose = frame.getViewerPose(fallbackRefSpace);
+  if (!pose) return;
+
+  // Animate cube on dt (same as bridge path).
+  const dt = prevTimeMs > 0 ? (time - prevTimeMs) * 0.001 : 0;
+  prevTimeMs = time;
+  cubeRotation = (cubeRotation + dt * CUBE_ROT_RATE) % (Math.PI * 2);
+  if (cubeMesh) cubeMesh.rotation.y = cubeRotation;
+
+  activeXRFramebuffer = glLayer.framebuffer;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, glLayer.framebuffer);
+
+  // Clear full framebuffer once.
+  renderer.setViewport(0, 0, glLayer.framebufferWidth, glLayer.framebufferHeight);
+  renderer.setScissor(0, 0, glLayer.framebufferWidth, glLayer.framebufferHeight);
+  renderer.setScissorTest(true);
+  renderer.setClearColor(BG_COLOR, 1.0);
+  renderer.clear(true, true, false);
+
+  for (const view of pose.views) {
+    const vp = glLayer.getViewport(view);
+    if (!vp) continue;
+    renderer.setViewport(vp.x, vp.y, vp.width, vp.height);
+    renderer.setScissor(vp.x, vp.y, vp.width, vp.height);
+
+    // Camera matrices directly from the XRView. three.js camera.matrix is
+    // view→world; view.transform.matrix is exactly that.
+    camera.matrixAutoUpdate = false;
+    camera.matrix.fromArray(view.transform.matrix);
+    camera.matrix.decompose(camera.position, camera.quaternion, camera.scale);
+    camera.projectionMatrix.fromArray(view.projectionMatrix);
+    camera.projectionMatrixInverse.copy(camera.projectionMatrix).invert();
+    camera.updateMatrixWorld(true);
+
+    renderer.render(scene, camera);
+  }
+}
 
 function onXRFrame(time, frame) {
   if (!xrSession) return;
@@ -279,8 +375,24 @@ function onXRFrame(time, frame) {
   // Re-read displayXR each frame for latest eye poses.
   displayXR = xrSession.displayXR;
 
+  // Refresh the on-page bridge-state panel (throttled internally to ~10 Hz).
+  updateBridgeStatePanel();
+
   const glLayer = xrSession.renderState.baseLayer;
   if (!glLayer) return;
+
+  // --- Fallback path: standard WebXR, no bridge -------------------------
+  // If the DisplayXR extension / bridge isn't present, render using the
+  // plain WebXR per-view API (getViewerPose + XRView.projectionMatrix +
+  // XRView.transform). No Kooima, no window-relative math — the
+  // compositor's legacy compromise-scale path handles display mapping.
+  // This lets the sample still work on browsers where the extension
+  // isn't installed.
+  if (!displayXR && fallbackRefSpace) {
+    renderFallbackFrame(time, frame, glLayer);
+    return;
+  }
+  // ----------------------------------------------------------------------
 
   // Animate cube: 0.5 rad/s around Y (match cube_handle_d3d11_win).
   const dt = prevTimeMs > 0 ? (time - prevTimeMs) * 0.001 : 0;
@@ -526,7 +638,16 @@ function onXRFrame(time, frame) {
   activeXRFramebuffer = null;
 }
 
-// --- HUD overlay (compositor-side via shared memory) ---
+// =============================================================================
+// === 6. HUD overlay (bridge feature, optional) ===============================
+// =============================================================================
+// Optional. The bridge provides a cross-process HUD facility: your app
+// sends lines via `displayXR.sendHudUpdate(visible, lines)`, the bridge
+// writes them to named shared memory, the compositor renders them as an
+// overlay. Use for live telemetry in windowed 3D mode where the usual
+// browser HUD isn't visible through the lenticular.
+
+// HUD overlay (compositor-side via shared memory)
 
 let lastFpsTime = 0;
 let fpsFrameCount = 0;
@@ -579,14 +700,24 @@ function sendHUD(di, eyePoses, tileW, tileH) {
   lines.push({ label: 'Stereo', text: 'IPD=' + f2(rig.ipdFactor) + ' PAR=' + f2(rig.parallaxFactor) +
     ' rig=[' + rig.pos.map(v => f2(v)).join(',') + ']' });
 
-  // Send via window.postMessage to the extension's isolated world,
-  // which forwards to the bridge WS.
-  const payload = { type: 'hud-update', version: 1, visible: hudVisible, lines: lines };
-  window.postMessage({ source: 'displayxr-bridge-req', payload: payload }, window.location.origin);
+  // Use the public bridge API. The extension's main-world shim wraps the
+  // underlying postMessage → WS hop, so apps shouldn't reach for
+  // window.postMessage directly.
+  displayXR.sendHudUpdate(hudVisible, lines);
   if (hudSendCount++ < 3) log('sendHUD: posted ' + lines.length + ' lines, visible=' + hudVisible);
 }
 
-// --- Enter/Exit XR ---
+// =============================================================================
+// === 7. Enter / exit XR (bridge contract) ====================================
+// =============================================================================
+// REQUIRED wiring. Enter XR, detect whether the bridge is available via
+// `session.displayXR`, subscribe to the five bridge events, configure
+// eye-pose streaming, start the render loop. If `displayXR` is absent
+// the sample falls back to the standard WebXR legacy path (no Kooima,
+// no window tracking) so the page still works on browsers without the
+// DisplayXR extension.
+
+// Enter/Exit XR
 
 async function enterXR() {
   if (!navigator.xr) { log('navigator.xr not available'); return; }
@@ -613,17 +744,43 @@ async function enterXR() {
     log('  renderingMode: ' + displayXR.renderingMode.name +
         ' (' + displayXR.renderingMode.tileColumns + 'x' + displayXR.renderingMode.tileRows + ')');
     displayXR.configureEyePoses('raw');
+    // Seed our local mirror of the active eye-tracking mode from the
+    // device's advertised default, so the UI matches reality even before
+    // the user touches anything.
+    if (displayXR.eyeTracking && displayXR.eyeTracking.defaultMode === 'MANUAL') {
+      eyeTrackingMode = 1;
+    } else {
+      eyeTrackingMode = 0;
+    }
+    populateModeButtons();
+    refreshEyeTrackingButton();
   } else {
+    // No bridge / no extension: fall back to the standard WebXR path.
+    // The sample still renders — it just skips Kooima, window tracking, and
+    // HUD, and lets Chrome + the compositor's legacy compromise-scale path
+    // handle tile layout + weaving.
     setDot(dotExtension, 'err');
     setDot(dotBridge, 'err');
-    log('session.displayXR NOT available — is the bridge running and extension loaded?');
-    log('  Start displayxr-webxr-bridge.exe, then reload this page.');
+    log('session.displayXR not available — running as a standard WebXR app.');
+    log('  (install the DisplayXR extension + bridge for Kooima 3D and window tracking)');
+    try {
+      fallbackRefSpace = await xrSession.requestReferenceSpace('local');
+      log('  fallback reference space: local');
+    } catch (e) {
+      try {
+        fallbackRefSpace = await xrSession.requestReferenceSpace('viewer');
+        log('  fallback reference space: viewer (local unavailable)');
+      } catch (e2) {
+        log('  failed to acquire any reference space: ' + e2.message);
+      }
+    }
   }
 
   xrSession.addEventListener('end', () => {
     log('session ended');
     xrSession = null;
     displayXR = null;
+    fallbackRefSpace = null;
     if (renderer) { renderer.dispose(); renderer = null; }
     scene = null;
     camera = null;
@@ -632,6 +789,9 @@ async function enterXR() {
     cubeRotation = 0;
     enterBtn.disabled = false;
     exitBtn.disabled = true;
+    populateModeButtons();   // resets to "no bridge" placeholder
+    refreshEyeTrackingButton();
+    bridgeStateEl.textContent = 'session ended';
   });
 
   xrSession.addEventListener('renderingmodechange', (event) => {
@@ -640,6 +800,7 @@ async function enterXR() {
         ' hw3D=' + event.detail.hardware3D);
     lastRequestedMode = event.detail.currentModeIndex;
     updateTileLayout();
+    refreshModeButtonHighlight();
   });
 
   xrSession.addEventListener('bridgestatus', (event) => {
@@ -742,10 +903,17 @@ async function enterXR() {
             log('requesting mode ' + idx + ' (' + modes[idx].name + ')');
           }
         } else if (m.code === VK.T && displayXR) {
-          // Toggle eye tracking mode: MANAGED(0) ↔ MANUAL(1)
-          eyeTrackingMode = eyeTrackingMode === 1 ? 0 : 1;
-          displayXR.requestEyeTrackingMode(eyeTrackingMode);
-          log('eye tracking: ' + (eyeTrackingMode === 1 ? 'MANUAL' : 'MANAGED'));
+          // Toggle eye tracking mode: MANAGED(0) ↔ MANUAL(1).
+          // Guard on DP capability — Leia currently advertises MANAGED-only.
+          if (!eyeTrackingCanToggle()) {
+            const modes = (displayXR.eyeTracking && displayXR.eyeTracking.supportedModes) || [];
+            log('eye tracking T ignored — DP supports only: ' + modes.join(', '));
+          } else {
+            eyeTrackingMode = eyeTrackingMode === 1 ? 0 : 1;
+            displayXR.requestEyeTrackingMode(eyeTrackingMode);
+            refreshEyeTrackingButton();
+            log('eye tracking: ' + (eyeTrackingMode === 1 ? 'MANUAL' : 'MANAGED'));
+          }
         } else if (m.code === VK.TAB) {
           hudVisible = !hudVisible;
           hudJustToggled = true;
@@ -862,7 +1030,13 @@ document.addEventListener('visibilitychange', () => {
   if (document.hidden) { keyDown.clear(); mouseLookDown = false; }
 });
 
-// --- Status indicators ---
+// =============================================================================
+// === 8. Status UI (demo-only) ================================================
+// =============================================================================
+// Helpers for the three status dots (WebXR / Extension / Bridge) shown in
+// the page header. Not bridge-specific.
+
+// Status indicators
 const dotWebXR = document.getElementById('dot-webxr');
 const dotExtension = document.getElementById('dot-extension');
 const dotBridge = document.getElementById('dot-bridge');
@@ -870,6 +1044,130 @@ const dotBridge = document.getElementById('dot-bridge');
 function setDot(dot, state) { // 'ok', 'err', or '' (gray)
   dot.classList.remove('ok', 'err');
   if (state) dot.classList.add(state);
+}
+
+// === Bridge UI helpers (mode selector, eye-tracking toggle, state panel) ===
+//
+// Demonstrates how to surface the bridge's capability metadata in the page.
+// Apps don't have to do it this way; you can drive everything from
+// keyboard shortcuts. This UI exists to make every feature visible.
+
+function populateModeButtons() {
+  modeButtonsEl.innerHTML = '';
+  if (!displayXR) {
+    modeButtonsEl.innerHTML = '<span class="et-hint">no bridge — modes unavailable</span>';
+    return;
+  }
+  const modes = displayXR.renderingModes || [];
+  const cur = displayXR.renderingMode ? displayXR.renderingMode.index : -1;
+  if (modes.length === 0) {
+    modeButtonsEl.innerHTML = '<span class="et-hint">(none reported)</span>';
+    return;
+  }
+  for (const m of modes) {
+    const btn = document.createElement('button');
+    btn.className = 'mode-btn' + (m.index === cur ? ' active' : '');
+    btn.textContent = m.name + (m.hardware3D ? '' : ' (2D)');
+    btn.title = m.tileColumns + '\u00d7' + m.tileRows + ' tiles, scale ' +
+                (m.viewScale ? m.viewScale[0].toFixed(2) + '\u00d7' + m.viewScale[1].toFixed(2) : '?');
+    btn.addEventListener('click', () => {
+      if (!displayXR) return;
+      lastRequestedMode = m.index;
+      displayXR.requestRenderingMode(m.index);
+    });
+    modeButtonsEl.appendChild(btn);
+  }
+}
+
+function refreshModeButtonHighlight() {
+  if (!displayXR) return;
+  const cur = displayXR.renderingMode ? displayXR.renderingMode.index : -1;
+  const btns = modeButtonsEl.querySelectorAll('.mode-btn');
+  const modes = displayXR.renderingModes || [];
+  btns.forEach((btn, i) => {
+    btn.classList.toggle('active', modes[i] && modes[i].index === cur);
+  });
+}
+
+// Helper: can we actually toggle between MANAGED and MANUAL on this DP?
+// Leia currently advertises MANAGED only, so the toggle must stay disabled.
+function eyeTrackingCanToggle() {
+  if (!displayXR || !displayXR.eyeTracking) return false;
+  const modes = displayXR.eyeTracking.supportedModes || [];
+  return modes.indexOf('MANAGED') !== -1 && modes.indexOf('MANUAL') !== -1;
+}
+
+function refreshEyeTrackingButton() {
+  if (!displayXR) {
+    etToggleEl.disabled = true;
+    etToggleEl.textContent = '\u2014';
+    etToggleEl.title = '';
+    return;
+  }
+  const canToggle = eyeTrackingCanToggle();
+  etToggleEl.disabled = !canToggle;
+  etToggleEl.textContent = (eyeTrackingMode === 1) ? 'MANUAL' : 'MANAGED';
+  if (!canToggle) {
+    const modes = (displayXR.eyeTracking && displayXR.eyeTracking.supportedModes) || [];
+    etToggleEl.title = 'DP advertises only: ' + (modes.length ? modes.join(', ') : '(none)');
+  } else {
+    etToggleEl.title = '';
+  }
+}
+etToggleEl.addEventListener('click', () => {
+  if (!displayXR) return;
+  if (!eyeTrackingCanToggle()) {
+    log('eye-tracking toggle ignored — DP supports only: ' +
+        ((displayXR.eyeTracking && displayXR.eyeTracking.supportedModes) || []).join(', '));
+    return;
+  }
+  eyeTrackingMode = (eyeTrackingMode === 1) ? 0 : 1;
+  displayXR.requestEyeTrackingMode(eyeTrackingMode);
+  refreshEyeTrackingButton();
+});
+
+// Live state panel: re-rendered ~10 Hz from main loop or events.
+let lastBridgePanelMs = 0;
+function updateBridgeStatePanel() {
+  const now = performance.now();
+  if (now - lastBridgePanelMs < 100) return;
+  lastBridgePanelMs = now;
+
+  if (!displayXR) {
+    bridgeStateEl.textContent = 'bridge unavailable — running standard WebXR fallback';
+    return;
+  }
+  const di = displayXR.displayInfo || {};
+  const rm = displayXR.renderingMode || {};
+  const wi = displayXR.windowInfo || {};
+  const eyes = displayXR.eyePoses || [];
+  const fmtArr = (a, p) => a ? '[' + a.map(v => v.toFixed(p)).join(', ') + ']' : 'n/a';
+  let lines = [];
+  lines.push('display : ' + (di.displayPixelSize ? di.displayPixelSize.join('\u00d7') : '?') +
+             ' px  ' + fmtArr(di.displaySizeMeters, 3) + ' m');
+  lines.push('mode    : ' + (rm.name || '?') + '  ' +
+             (rm.tileColumns || '?') + '\u00d7' + (rm.tileRows || '?') +
+             '  hw3D=' + (rm.hardware3D ? 'yes' : 'no'));
+  if (wi && wi.valid) {
+    lines.push('window  : ' + wi.windowPixelSize.join('\u00d7') + ' px  ' +
+               fmtArr(wi.windowSizeMeters, 3) + ' m  off=' + fmtArr(wi.windowCenterOffsetMeters, 3));
+    if (wi.viewWidth) lines.push('view    : ' + wi.viewWidth + '\u00d7' + wi.viewHeight + ' px per tile');
+  } else {
+    lines.push('window  : (waiting)');
+  }
+  lines.push('tracking: ' + (eyeTrackingMode === 1 ? 'MANUAL' : 'MANAGED') +
+             '  eyes=' + eyes.length);
+  if (eyes.length > 0) {
+    for (let i = 0; i < eyes.length; i++) {
+      const p = eyes[i].position;
+      lines.push('  eye[' + i + ']: ' +
+                 (p[0] * 1000).toFixed(0) + ', ' +
+                 (p[1] * 1000).toFixed(0) + ', ' +
+                 (p[2] * 1000).toFixed(0) + ' mm');
+    }
+  }
+  lines.push('hud     : ' + (hudVisible ? 'on' : 'off'));
+  bridgeStateEl.textContent = lines.join('\n');
 }
 
 // Listen for bridge-status from extension (fires before any XR session).

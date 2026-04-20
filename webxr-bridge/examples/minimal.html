@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>WebXR Bridge — minimal example</title>
+<!--
+  Minimal bridge-aware WebXR app. Single HTML file, no build step, no
+  three.js. Renders a cube using bridge-tracked eyes and Kooima
+  projection; falls back to standard WebXR view poses when the bridge
+  isn't available.
+
+  Read top-to-bottom — every line is either bridge-API usage, raw
+  WebGL boilerplate, or a comment explaining one of those two. Use as a
+  copy-paste starting point for your own bridge-aware apps.
+
+  See ../DEVELOPER.md for the prose guide and ../PROTOCOL.md for the
+  wire-level message schema.
+-->
+<style>
+  body { font: 14px/1.5 system-ui, sans-serif; max-width: 600px; margin: 32px auto; padding: 0 16px; color: #1e293b; }
+  h1 { font-size: 18px; margin: 0 0 8px; }
+  .sub { color: #64748b; font-size: 12px; margin: 0 0 16px; }
+  button { font: 500 14px/1 system-ui; padding: 9px 18px; background: #1e293b; color: #fff; border: 0; border-radius: 6px; cursor: pointer; }
+  button:disabled { opacity: 0.4; }
+  pre { background: #1e293b; color: #cbd5e1; padding: 10px 12px; border-radius: 6px; font: 11px/1.5 ui-monospace, monospace; max-height: 280px; overflow-y: auto; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h1>WebXR Bridge — minimal example</h1>
+<p class="sub">Single-file bridge-aware WebXR. ~250 lines including comments. Read alongside <code>DEVELOPER.md</code>.</p>
+<button id="enter">Enter XR</button>
+<pre id="log">awaiting WebXR check…
+</pre>
+
+<script type="module">
+'use strict';
+
+// ============================================================================
+// Logging helper (writes to the <pre> on the page).
+// ============================================================================
+const logEl = document.getElementById('log');
+const log = (m) => { logEl.textContent += m + '\n'; logEl.scrollTop = logEl.scrollHeight; };
+
+// ============================================================================
+// 1. WebXR support check.
+// ============================================================================
+const enterBtn = document.getElementById('enter');
+if (!navigator.xr) {
+  log('navigator.xr unavailable.');
+  enterBtn.disabled = true;
+} else {
+  navigator.xr.isSessionSupported('immersive-vr').then(ok => {
+    log('immersive-vr supported: ' + ok);
+    enterBtn.disabled = !ok;
+  });
+}
+
+// ============================================================================
+// 2. Kooima asymmetric off-axis projection.
+//    Direct port of test_apps/common/display3d_view.c::display3d_compute_projection.
+//    Builds a perspective projection where the near plane is the physical
+//    screen, sheared so that an eye anywhere off-axis sees a geometrically
+//    correct view of geometry behind/in-front-of the screen plane.
+// ============================================================================
+function makeKooimaProjection(eye, screenWm, screenHm, near, far) {
+  const halfW = screenWm * 0.5;
+  const halfH = screenHm * 0.5;
+  let ez = eye[2];
+  if (ez <= 0.001) ez = 0.65; // safety: behind/at the screen → fall back to nominal
+  const l = near * (-halfW - eye[0]) / ez;
+  const r = near * ( halfW - eye[0]) / ez;
+  const b = near * (-halfH - eye[1]) / ez;
+  const t = near * ( halfH - eye[1]) / ez;
+  // Column-major 4x4 OpenGL projection matrix.
+  const w = r - l, h = t - b, d = far - near;
+  return new Float32Array([
+    2 * near / w,    0,                0,                       0,
+    0,               2 * near / h,     0,                       0,
+    (r + l) / w,     (t + b) / h,      -(far + near) / d,      -1,
+    0,               0,                -(2 * far * near) / d,   0,
+  ]);
+}
+
+// View matrix: camera at eye position in world, looking toward -Z (screen plane).
+function makeViewMatrix(eye) {
+  return new Float32Array([
+    1, 0, 0, 0,
+    0, 1, 0, 0,
+    0, 0, 1, 0,
+    -eye[0], -eye[1], -eye[2], 1,
+  ]);
+}
+
+// ============================================================================
+// 3. WebGL helpers — a single colored cube. Bare minimum to put pixels
+//    on the screen for each eye. Replace with your own renderer.
+// ============================================================================
+function compileShader(gl, type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src); gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw gl.getShaderInfoLog(sh);
+  return sh;
+}
+function makeProgram(gl, vs, fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compileShader(gl, gl.VERTEX_SHADER, vs));
+  gl.attachShader(p, compileShader(gl, gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw gl.getProgramInfoLog(p);
+  return p;
+}
+const VS = `attribute vec3 a; uniform mat4 P, V; varying vec3 c;
+void main() { c = a + 0.5; gl_Position = P * V * vec4(a * 0.05, 1.0); }`;
+const FS = `precision mediump float; varying vec3 c;
+void main() { gl_FragColor = vec4(c, 1.0); }`;
+
+function setupCube(gl) {
+  // 8 corners of a cube; 12 triangles via element indices.
+  const verts = new Float32Array([
+    -1,-1,-1,  1,-1,-1,  1, 1,-1, -1, 1,-1,
+    -1,-1, 1,  1,-1, 1,  1, 1, 1, -1, 1, 1,
+  ]);
+  const idx = new Uint16Array([
+    0,1,2, 0,2,3,  4,6,5, 4,7,6,
+    0,4,5, 0,5,1,  1,5,6, 1,6,2,
+    2,6,7, 2,7,3,  3,7,4, 3,4,0,
+  ]);
+  const vbo = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+  gl.bufferData(gl.ARRAY_BUFFER, verts, gl.STATIC_DRAW);
+  const ibo = gl.createBuffer();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, idx, gl.STATIC_DRAW);
+  return { vbo, ibo, count: idx.length };
+}
+
+// ============================================================================
+// 4. Enter XR.
+// ============================================================================
+enterBtn.addEventListener('click', async () => {
+  enterBtn.disabled = true;
+  const session = await navigator.xr.requestSession('immersive-vr', {
+    optionalFeatures: ['local'],
+  });
+
+  // Attach the 'end' listener FIRST — the compositor window closing (or
+  // any other UA-initiated end) can fire before we finish setup. If we
+  // attach it later, we'd miss the event and the Enter button would
+  // stay disabled forever.
+  let sessionAlive = true;
+  session.addEventListener('end', () => {
+    sessionAlive = false;
+    log('session ended');
+    enterBtn.disabled = false;
+  });
+
+  // ---- Bridge detection. If session.displayXR is undefined, the
+  // ---- DisplayXR Chrome extension isn't installed (or the bridge
+  // ---- process isn't running). We still render — using standard WebXR.
+  const displayXR = session.displayXR;
+  log(displayXR ? 'bridge available' : 'no bridge — standard WebXR fallback');
+
+  if (displayXR) {
+    log('  display: ' + displayXR.displayInfo.displayPixelSize.join('x') + ' px, ' +
+        displayXR.displayInfo.displaySizeMeters.map(v => v.toFixed(3)).join('x') + ' m');
+    log('  current mode: ' + displayXR.renderingMode.name);
+    // ---- BRIDGE API: subscribe to streamed eye poses (raw display-local).
+    displayXR.configureEyePoses('raw');
+  }
+
+  // ---- Reference space (only used in the no-bridge fallback path).
+  const refSpace = displayXR ? null : await session.requestReferenceSpace('local');
+
+  // ---- WebGL setup.
+  const canvas = document.createElement('canvas');
+  const gl = canvas.getContext('webgl', { xrCompatible: true });
+  const layer = new XRWebGLLayer(session, gl);
+  await session.updateRenderState({ baseLayer: layer });
+  const prog = makeProgram(gl, VS, FS);
+  const cube = setupCube(gl);
+  const aLoc = gl.getAttribLocation(prog, 'a');
+  const uP = gl.getUniformLocation(prog, 'P');
+  const uV = gl.getUniformLocation(prog, 'V');
+
+  // ---- BRIDGE API: react to live events.
+  if (displayXR) {
+    session.addEventListener('renderingmodechange', e =>
+      log('mode → ' + e.detail.currentModeIndex + ' (hw3D=' + e.detail.hardware3D + ')'));
+    session.addEventListener('windowinfochange', e => {
+      const w = e.detail.windowInfo;
+      if (w && w.valid) log('window: ' + w.windowPixelSize.join('x') + ' px, off=' +
+                            w.windowCenterOffsetMeters.map(v => v.toFixed(3)).join(','));
+    });
+    session.addEventListener('hardwarestatechange', e =>
+      log('hw state: hw3D=' + e.detail.hardware3D));
+  }
+
+  // (Session-end listener was attached earlier, right after requestSession,
+  // to avoid missing early UA-initiated ends.)
+
+  // ============================================================================
+  // 5. Frame loop.
+  // ============================================================================
+  function onFrame(time, frame) {
+    if (!sessionAlive) return;
+    session.requestAnimationFrame(onFrame);
+
+    gl.bindFramebuffer(gl.FRAMEBUFFER, layer.framebuffer);
+    gl.viewport(0, 0, layer.framebufferWidth, layer.framebufferHeight);
+    gl.clearColor(0.05, 0.05, 0.25, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    gl.enable(gl.DEPTH_TEST);
+    gl.useProgram(prog);
+    gl.bindBuffer(gl.ARRAY_BUFFER, cube.vbo);
+    gl.enableVertexAttribArray(aLoc);
+    gl.vertexAttribPointer(aLoc, 3, gl.FLOAT, false, 0, 0);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, cube.ibo);
+
+    if (displayXR) {
+      // ---- Bridge path: Kooima projection per eye, screen = window.
+      const wi = displayXR.windowInfo;
+      const di = displayXR.displayInfo;
+      const eyes = displayXR.eyePoses || [];
+      const tileLayout = displayXR.renderingMode || { tileColumns: 2, tileRows: 1, viewScale: [0.5, 0.5] };
+
+      // Per-tile pixel dims: bridge pushes these for us — use directly.
+      const tileW = wi && wi.viewWidth || Math.floor(layer.framebufferWidth / tileLayout.tileColumns);
+      const tileH = wi && wi.viewHeight || Math.floor(layer.framebufferHeight / tileLayout.tileRows);
+
+      // Screen dims: window if available, else full display.
+      const screenWm = (wi && wi.valid) ? wi.windowSizeMeters[0] : (di ? di.displaySizeMeters[0] : 0.34);
+      const screenHm = (wi && wi.valid) ? wi.windowSizeMeters[1] : (di ? di.displaySizeMeters[1] : 0.19);
+      const winOffX = (wi && wi.valid) ? wi.windowCenterOffsetMeters[0] : 0;
+      const winOffY = (wi && wi.valid) ? wi.windowCenterOffsetMeters[1] : 0;
+
+      // Default eye if no tracking yet (nominal seated viewer).
+      const nominal = di && di.nominalViewerPosition || [0, 0.1, 0.6];
+
+      for (let i = 0; i < tileLayout.tileColumns * tileLayout.tileRows; i++) {
+        const tx = i % tileLayout.tileColumns;
+        const ty = Math.floor(i / tileLayout.tileColumns);
+        // GL viewport Y=0 is at bottom; ANGLE flips to D3D11 (Y=0 top).
+        const vpY = layer.framebufferHeight - tileH - ty * tileH;
+        gl.viewport(tx * tileW, vpY, tileW, tileH);
+
+        const e = eyes[i] ? eyes[i].position : nominal;
+        // Eye relative to window center (window-relative Kooima).
+        const eyeWin = [e[0] - winOffX, e[1] - winOffY, e[2]];
+        gl.uniformMatrix4fv(uP, false, makeKooimaProjection(eyeWin, screenWm, screenHm, 0.01, 100.0));
+        gl.uniformMatrix4fv(uV, false, makeViewMatrix(eyeWin));
+        gl.drawElements(gl.TRIANGLES, cube.count, gl.UNSIGNED_SHORT, 0);
+      }
+    } else {
+      // ---- Fallback path: standard WebXR. Per-view projection + transform
+      // ---- from frame.getViewerPose(). No Kooima, no window tracking.
+      const pose = frame.getViewerPose(refSpace);
+      if (!pose) return;
+      for (const view of pose.views) {
+        const vp = layer.getViewport(view);
+        gl.viewport(vp.x, vp.y, vp.width, vp.height);
+        gl.uniformMatrix4fv(uP, false, view.projectionMatrix);
+        gl.uniformMatrix4fv(uV, false, view.transform.inverse.matrix);
+        gl.drawElements(gl.TRIANGLES, cube.count, gl.UNSIGNED_SHORT, 0);
+      }
+    }
+  }
+  session.requestAnimationFrame(onFrame);
+});
+</script>
+</body>
+</html>

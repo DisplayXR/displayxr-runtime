@@ -2,6 +2,11 @@
 
 Metadata and control sideband for DisplayXR-aware WebXR pages. Gives browser-based WebXR apps access to display info, rendering modes, eye poses, and mode-change events — the same capabilities that native handle apps get via `XR_EXT_display_info`.
 
+> **App developers, start here:** [`DEVELOPER.md`](DEVELOPER.md) — integration guide.
+> **Want to copy-paste a starter?** [`examples/minimal.html`](examples/minimal.html) — single-file runnable.
+> **Wire-level reference?** [`PROTOCOL.md`](PROTOCOL.md).
+> Below is the setup procedure (build / install / launch).
+
 ## Quick Start
 
 ### 1. Build the runtime + bridge

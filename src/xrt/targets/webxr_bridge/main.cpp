@@ -432,6 +432,7 @@ struct Bridge {
 
 	// Cached display info for JSON serialization.
 	XrDisplayInfoEXT display_info{};
+	XrEyeTrackingModeCapabilitiesEXT eye_tracking_caps{};
 	std::vector<XrDisplayRenderingModeInfoEXT> modes;
 	uint32_t current_mode_index = 0;
 	std::vector<XrViewConfigurationView> config_views;
@@ -826,6 +827,21 @@ static std::string build_display_info_json(const Bridge &b) {
 
 	s += ",\"currentModeIndex\":" + json_u(b.current_mode_index);
 	s += ",\"views\":" + build_views_json(b.config_views);
+
+	// Eye-tracking capabilities: bitmask of supported modes + default.
+	// Apps must check supportedModes before requesting a mode — e.g. Leia
+	// currently reports MANAGED only; requesting MANUAL would be rejected.
+	const uint32_t mask = (uint32_t)b.eye_tracking_caps.supportedModes;
+	const bool has_managed = (mask & 0x1) != 0; // MANAGED_BIT
+	const bool has_manual  = (mask & 0x2) != 0; // MANUAL_BIT
+	s += ",\"eyeTracking\":{\"supportedModes\":[";
+	bool first = true;
+	if (has_managed) { s += "\"MANAGED\""; first = false; }
+	if (has_manual)  { if (!first) s += ","; s += "\"MANUAL\""; }
+	s += "],\"defaultMode\":\"";
+	s += (b.eye_tracking_caps.defaultMode == XR_EYE_TRACKING_MODE_MANUAL_EXT) ? "MANUAL" : "MANAGED";
+	s += "\"}";
+
 	s += build_window_info_fields(b.window_metrics);
 	s += "}";
 	return s;
@@ -957,7 +973,17 @@ static void handle_ws_message(Bridge &b, const std::string &msg) {
 		}
 	} else if (type == "request-eye-tracking-mode") {
 		int mode = find_int("mode");
-		if (b.pfnRequestEyeTrackingMode && b.session != XR_NULL_HANDLE) {
+		// Reject mode requests the DP doesn't advertise. Without this guard
+		// a sample bound to a MANAGED-only device (like Leia today) would
+		// still flip into the "MANUAL" UI state even though the runtime
+		// rejects the underlying xrRequestEyeTrackingModeEXT call.
+		const uint32_t mask = (uint32_t)b.eye_tracking_caps.supportedModes;
+		const uint32_t want_bit = (mode == 1) ? 0x2 /* MANUAL_BIT */
+		                                      : 0x1 /* MANAGED_BIT */;
+		if ((mask & want_bit) == 0) {
+			LOG_W("WS request-eye-tracking-mode %d: DP doesn't advertise that mode (supportedModes=0x%x), ignored",
+			      mode, mask);
+		} else if (b.pfnRequestEyeTrackingMode && b.session != XR_NULL_HANDLE) {
 			XrEyeTrackingModeEXT xr_mode = (mode == 1)
 			    ? XR_EYE_TRACKING_MODE_MANUAL_EXT : XR_EYE_TRACKING_MODE_MANAGED_EXT;
 			XrResult r = b.pfnRequestEyeTrackingMode(b.session, xr_mode);
@@ -1242,6 +1268,9 @@ static bool get_system_and_display_info(Bridge &b) {
 
 	XrSystemProperties sp{XR_TYPE_SYSTEM_PROPERTIES};
 	b.display_info = {(XrStructureType)XR_TYPE_DISPLAY_INFO_EXT};
+	b.eye_tracking_caps = {(XrStructureType)XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_EXT};
+	// Chain both output structs onto xrGetSystemProperties.
+	b.display_info.next = &b.eye_tracking_caps;
 	sp.next = &b.display_info;
 	XR_CHECK(b.instance, xrGetSystemProperties(b.instance, b.system_id, &sp));
 
@@ -1255,6 +1284,9 @@ static bool get_system_and_display_info(Bridge &b) {
 	      di.nominalViewerPositionInDisplaySpace.x,
 	      di.nominalViewerPositionInDisplaySpace.y,
 	      di.nominalViewerPositionInDisplaySpace.z);
+	LOG_I("  eyeTracking            : supportedModes=0x%x default=%d",
+	      (unsigned)b.eye_tracking_caps.supportedModes,
+	      (int)b.eye_tracking_caps.defaultMode);
 
 	uint32_t view_count = 0;
 	XR_CHECK(b.instance, xrEnumerateViewConfigurationViews(
