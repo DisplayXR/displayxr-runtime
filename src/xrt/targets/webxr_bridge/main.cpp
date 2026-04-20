@@ -41,36 +41,14 @@
 // Logging.
 // ---------------------------------------------------------------------------
 
-static FILE *g_logf = nullptr;
-static std::mutex g_logf_mtx;
-
 static void log_line(const char *level, const char *fmt, ...) {
-	char line[1024];
+	std::fprintf(stdout, "[webxr-bridge][%s] ", level);
 	va_list ap;
 	va_start(ap, fmt);
-	int n = std::vsnprintf(line, sizeof(line), fmt, ap);
+	std::vfprintf(stdout, fmt, ap);
 	va_end(ap);
-	if (n < 0) n = 0;
-	if ((size_t)n >= sizeof(line)) n = (int)sizeof(line) - 1;
-	line[n] = '\0';
-
-	std::fprintf(stdout, "[webxr-bridge][%s] %s\n", level, line);
+	std::fputc('\n', stdout);
 	std::fflush(stdout);
-
-	// Also mirror to a file so we can see output when launched headless.
-	std::lock_guard<std::mutex> lk(g_logf_mtx);
-	if (g_logf == nullptr) {
-		char path[512];
-		const char *appdata = std::getenv("LOCALAPPDATA");
-		if (appdata != nullptr) {
-			std::snprintf(path, sizeof(path), "%s\\DisplayXR\\bridge_debug.log", appdata);
-			g_logf = std::fopen(path, "a");
-		}
-	}
-	if (g_logf != nullptr) {
-		std::fprintf(g_logf, "[%s] %s\n", level, line);
-		std::fflush(g_logf);
-	}
 }
 
 #define LOG_I(...) log_line("info", __VA_ARGS__)
@@ -540,16 +518,6 @@ static bool poll_window_metrics(Bridge &b) {
 	g_compositor_hwnd.store(hwnd);
 	WindowMetrics neu;
 	bool ok = compute_window_metrics_impl(hwnd, b, neu);
-	// One-shot per unique (pixelW,pixelH) so we can see what GetClientRect
-	// actually returns as the user resizes.
-	static int last_px_w = -1, last_px_h = -1;
-	if (ok && (neu.pixelW != last_px_w || neu.pixelH != last_px_h)) {
-		LOG_I("poll_window_metrics: hwnd=%p pixel=%dx%d size=%.3fx%.3fm off=[%.3f,%.3f]",
-		      hwnd, neu.pixelW, neu.pixelH, neu.sizeWm, neu.sizeHm,
-		      neu.centerOffsetXm, neu.centerOffsetYm);
-		last_px_w = neu.pixelW;
-		last_px_h = neu.pixelH;
-	}
 	// Bridge is the source of truth for per-view tile dims. Compute from
 	// live window size × current mode's viewScale, then push to compositor
 	// so bridge_override crops the exact region the sample will render.
@@ -1116,14 +1084,10 @@ static void ws_thread_func(Bridge &b) {
 			// Drain outgoing queue.
 			std::string out_msg;
 			while (b.outgoing.pop(out_msg, 0)) {
-				bool is_win_info = out_msg.find("\"type\":\"window-info\"") != std::string::npos;
 				if (!ws_send_text(client, out_msg)) {
 					LOG_W("WS send failed, disconnecting client");
 					b.ws_client_connected.store(false);
 					break;
-				}
-				if (is_win_info) {
-					LOG_I("WS send SUCCESS window-info (%zu bytes)", out_msg.size());
 				}
 			}
 			if (!b.ws_client_connected.load()) break;
@@ -1575,10 +1539,6 @@ static void run_event_loop(Bridge &b) {
 				window_changed = poll_window_metrics(b) || window_changed;
 			}
 			if (window_changed && b.ws_client_connected.load()) {
-				const WindowMetrics &w = b.window_metrics;
-				LOG_I("WS send window-info: %dx%dpx %.3fx%.3fm off=[%.3f,%.3f] view=%ux%u",
-				      w.pixelW, w.pixelH, w.sizeWm, w.sizeHm,
-				      w.centerOffsetXm, w.centerOffsetYm, w.viewWidth, w.viewHeight);
 				b.outgoing.push(build_window_info_json(b.window_metrics));
 			}
 

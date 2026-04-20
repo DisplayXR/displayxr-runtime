@@ -7296,28 +7296,10 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			bvw = (uint32_t)(uintptr_t)GetPropW(prop_hwnd, L"DXR_BridgeViewW");
 			bvh = (uint32_t)(uintptr_t)GetPropW(prop_hwnd, L"DXR_BridgeViewH");
 		}
-		// Log which HWND we're querying once per unique HWND so we can
-		// compare with what the bridge found via FindWindowW.
-		static HWND last_logged_hwnd = (HWND)(uintptr_t)-1;
-		if (prop_hwnd != last_logged_hwnd) {
-			U_LOG_W("bridge_override: reading props from hwnd=%p (c->render.hwnd=%p sys->compositor_hwnd=%p)",
-			        prop_hwnd, c->render.hwnd, sys->compositor_hwnd);
-			last_logged_hwnd = prop_hwnd;
-		}
 		if (bvw > 0 && bvh > 0) {
 			active_vw = bvw;
 			active_vh = bvh;
 			bridge_override = true;
-			// Log when active dims CHANGE (not just first frame) so we can
-			// see windowed-mode transitions in the log.
-			static uint32_t last_logged_vw = 0, last_logged_vh = 0;
-			if (bvw != last_logged_vw || bvh != last_logged_vh) {
-				U_LOG_W("BRIDGE DIMS: active=%ux%u sys_view=%ux%u display=%ux%u hwnd=%p",
-				        bvw, bvh, sys->view_width, sys->view_height,
-				        sys->display_width, sys->display_height, prop_hwnd);
-				last_logged_vw = bvw;
-				last_logged_vh = bvh;
-			}
 		} else if (sys->xdev != NULL && sys->xdev->hmd != NULL &&
 		           sys->display_width > 0 && sys->display_height > 0) {
 			uint32_t mi = sys->xdev->hmd->active_rendering_mode_index;
