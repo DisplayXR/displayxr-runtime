@@ -236,6 +236,14 @@ struct d3d11_service_compositor
 	//! Current focus state
 	bool state_focused;
 
+	//! True if this client was created as a headless bridge-relay session
+	//! (XR_EXT_display_info + XR_MND_headless). Tracked on the compositor so
+	//! compositor_destroy can clear the global g_bridge_relay_active gate
+	//! when the bridge disconnects — otherwise qwerty input and a handful
+	//! of bridge-specific code paths stay disabled even after the bridge is
+	//! gone, breaking subsequent legacy/non-bridge WebXR sessions.
+	bool is_bridge_relay;
+
 	//! App's HWND from XR_EXT_win32_window_binding (for lazy standalone init)
 	HWND app_hwnd;
 
@@ -9254,6 +9262,20 @@ compositor_destroy(struct xrt_compositor *xc)
 
 	U_LOG_W("Destroying D3D11 service compositor for client");
 
+	// If this was the bridge-relay session, clear the global gate so
+	// subsequent non-bridge WebXR / legacy sessions get normal compositor
+	// behavior (qwerty input enabled, V/number keys toggle mode, the
+	// bridge_override crop path stays dormant until another bridge
+	// connects). Without this the flag stays true across session ends
+	// and poisons any later non-bridge session on the same service.
+	if (c->is_bridge_relay) {
+		U_LOG_W("Bridge relay session ending — clearing g_bridge_relay_active");
+		g_bridge_relay_active = false;
+#ifdef XRT_BUILD_DRIVER_QWERTY
+		qwerty_set_bridge_relay_active(false);
+#endif
+	}
+
 	// Unregister from multi-compositor before cleanup.
 	// Always unregister if there's a multi_comp — the client may have been
 	// registered in shell mode but is now closing in standalone mode (after
@@ -9340,6 +9362,7 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 	c->window_closed = false;
 	c->exit_request_sent = false;
 	c->window_closed_frame_count = 0;
+	c->is_bridge_relay = false;
 
 	// Initialize layer accumulator
 	std::memset(&c->layer_accum, 0, sizeof(c->layer_accum));
@@ -9351,6 +9374,7 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 		U_LOG_W("Bridge relay session: skipping render resources (headless, events only)");
 		// Flag globally visible so the bridge-aware compositor override kicks
 		// in and qwerty's pose integration freezes.
+		c->is_bridge_relay = true;
 		g_bridge_relay_active = true;
 #ifdef XRT_BUILD_DRIVER_QWERTY
 		qwerty_set_bridge_relay_active(true);
