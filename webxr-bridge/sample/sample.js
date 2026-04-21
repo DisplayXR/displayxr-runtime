@@ -758,6 +758,10 @@ async function enterXR() {
     setDot(dotExtension, 'ok');
     try {
       await displayXR.ready;
+      // Re-read — the getter builds a new surface each call, and the
+      // one we captured before `ready` is the pending snapshot with
+      // null fields. Post-ready, we need the populated snapshot.
+      displayXR = xrSession.displayXR;
       bridgeReady = true;
     } catch (e) {
       log('session.displayXR.ready timed out: ' + e.message);

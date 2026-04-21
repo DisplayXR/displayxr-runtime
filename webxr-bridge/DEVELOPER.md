@@ -72,11 +72,16 @@ Apps MUST `await session.displayXR.ready` before reading `displayInfo`, `renderi
 ```js
 const session = await navigator.xr.requestSession('immersive-vr', { optionalFeatures: ['local'] });
 
-const displayXR = session.displayXR;   // triggers bridge-attach + spawn-on-demand
+// First access triggers bridge-attach + (in Auto mode) spawn-on-demand.
+// The returned surface is a *pending* snapshot — fields like displayInfo
+// are null until ready resolves. Re-read the getter after the await to
+// get a populated snapshot.
+let displayXR = session.displayXR;
 let useBridge = false;
 if (displayXR && displayXR.ready) {
   try {
     await displayXR.ready;
+    displayXR = session.displayXR;  // re-read for populated surface
     useBridge = true;
   } catch (e) {
     console.log('bridge not available:', e.message);
