@@ -122,6 +122,8 @@ comp_d3d11_target_create(struct comp_d3d11_compositor *c,
 	desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
 	desc.BufferCount = 2;
 	desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+	// IGNORE so DWM doesn't composite the desktop through the bound HWND (#163).
+	desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
 	desc.Flags = 0;
 
 	DXGI_SWAP_CHAIN_FULLSCREEN_DESC fsDesc = {};
