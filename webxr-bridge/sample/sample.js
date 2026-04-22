@@ -543,15 +543,35 @@ function onXRFrame(time, frame) {
           : ' per=' + rig.perspectiveFactor.toFixed(2) + ' vH=' + rig.vHeight.toFixed(3)));
   }
 
+  // Per-OpenXR-view slot dims. Chrome packs views SBS horizontally:
+  //   slotW = fb.width / openxr_view_count
+  //   slotH = fb.height
+  // The OpenXR view count is a property of the runtime's view configuration
+  // (= hmd->view_count, whatever the driver declares), independent of the
+  // current DP mode's tile count. For a 5-view lightfield runtime the fb
+  // has 5 slots and the 3×2 lightfield mode fills slots 0-4; for Leia's
+  // 2-view runtime the fb has 2 slots and mono modes fill just slot 0.
+  // Placing content at the top-left of each slot is what the compositor's
+  // bridge_override crop reads (via Chrome's sub.rect.offset).
+  const openxrViewCount = (displayXR && displayXR.renderingMode &&
+                           displayXR.renderingMode.views &&
+                           displayXR.renderingMode.views.length > 0)
+    ? displayXR.renderingMode.views.length
+    : 2;
+  const slotW = Math.floor(glLayer.framebufferWidth / openxrViewCount);
+  const slotH = glLayer.framebufferHeight;
+
   for (let eye = 0; eye < tileLayout.eyeCount; eye++) {
     const tileX = tileLayout.monoMode ? 0 : (eye % tileLayout.tileColumns);
     const tileY = tileLayout.monoMode ? 0 : Math.floor(eye / tileLayout.tileColumns);
-    const vpX = tileX * tileW;
+    const vpX = tileX * slotW;
     // GL viewport Y=0 is at the BOTTOM. ANGLE maps GL coords to D3D11
-    // (Y=0 at top). To place content at the D3D11 top (where the compositor
-    // reads), set GL Y so that ANGLE's flip lands at D3D11 row 0.
-    // GL vpY = fbHeight - tileH - (tileY * tileH)
-    const vpY = glLayer.framebufferHeight - tileH - (tileY * tileH);
+    // (Y=0 at top). Place content at the D3D11 top of each tile slot:
+    //   D3D11 tile-top row = tileY * slotH
+    //   D3D11 content fills rows [tileY*slotH, tileY*slotH + tileH)
+    //   GL  y = fbHeight - (D3D11 row + 1)
+    //   GL viewport y (bottom of rect) = fbHeight - tileY*slotH - tileH
+    const vpY = glLayer.framebufferHeight - tileY * slotH - tileH;
 
     renderer.setViewport(vpX, vpY, tileW, tileH);
     renderer.setScissor(vpX, vpY, tileW, tileH);
