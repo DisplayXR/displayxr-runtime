@@ -1995,6 +1995,8 @@ init_client_render_resources(struct d3d11_service_system *sys,
 	sc_desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
 	sc_desc.BufferCount = 2;
 	sc_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+	// IGNORE so DWM doesn't composite the desktop through the bound HWND (#163).
+	sc_desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
 
 	hr = sys->dxgi_factory->CreateSwapChainForHwnd(
 	    sys->device.get(),
@@ -4169,6 +4171,8 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 	sc_desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
 	sc_desc.BufferCount = 2;
 	sc_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+	// IGNORE so DWM doesn't composite the desktop through the bound HWND (#163).
+	sc_desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
 
 	HRESULT hr = sys->dxgi_factory->CreateSwapChainForHwnd(
 	    sys->device.get(), mc->hwnd, &sc_desc, nullptr, nullptr,
@@ -9883,8 +9887,9 @@ comp_d3d11_service_create_system(struct xrt_device *xdev,
 		sys->base.info.display_pixel_height = sys->output_height;
 	}
 
-	U_LOG_W("D3D11 service system compositor created: view=%ux%u/eye, stereo=%ux%u, output=%ux%u @ %.0fHz",
-	        sys->view_width, sys->view_height,
+	U_LOG_W("D3D11 service system compositor created: view=%ux%u, view_count=%u, "
+	        "display=%ux%u, output=%ux%u @ %.0fHz",
+	        sys->view_width, sys->view_height, view_count,
 	        sys->display_width, sys->display_height,
 	        sys->output_width, sys->output_height, sys->refresh_rate);
 
