@@ -82,6 +82,24 @@ window geometry must flow from `multi_comp` up to the state tracker
 3. **No regression** to bridge-aware WebXR on the full physical display
    (the non-shell case that works today).
 4. **No regression** to in-process handle apps in the shell.
+5. **Hide the bridge console window**: when the orchestrator's
+   trampoline spawns `displayxr-webxr-bridge.exe`, a black console
+   window currently pops up. The user shouldn't see it — the bridge
+   runs headless-by-intent. Fix either by spawning with
+   `CREATE_NO_WINDOW` / `DETACHED_PROCESS` in `launch_child_with_log`,
+   or by flipping the bridge's linker subsystem to `WINDOWS` (it
+   already redirects stdout to a log file, so losing the console is
+   safe).
+6. **Alt+Tab doesn't latch the right controller**: legacy WebXR uses
+   the qwerty driver's Alt+drag to activate the right controller.
+   When the user Alt+Tabs out of the compositor window, Windows
+   swallows the Alt KEYUP (focus leaves before it arrives), so
+   qwerty's "Alt held" state stays stuck and the right controller
+   stays active on re-entry. Fix: on `WM_KILLFOCUS` /
+   `WM_ACTIVATE(WA_INACTIVE)` in the compositor WndProc, clear any
+   latched modifier state and release any active qwerty controllers.
+   Also re-sync with `GetAsyncKeyState(VK_MENU)` on
+   `WM_SETFOCUS` for safety.
 
 ## Design
 
@@ -206,6 +224,37 @@ Each stage should build + test cleanly on its own.
 - Test: a debug log prints the window info for every new IPC client
   when shell is active.
 
+### Stage 0a — hide bridge console window
+- In `src/xrt/targets/service/service_orchestrator.c`
+  `launch_child_with_log`, pass `CREATE_NO_WINDOW` (or
+  `DETACHED_PROCESS`) to `CreateProcessA` so the bridge's console
+  doesn't flash onto the desktop. Stdout/stderr already go to
+  `%LOCALAPPDATA%\DisplayXR\webxr-bridge.log`, so no diagnostics are
+  lost. Alternative: change the bridge target's linker
+  `SUBSYSTEM:WINDOWS` in its CMake target, which also hides the
+  console at launch.
+- Test: cold-start bridge (open bridge-aware page, click Enter VR);
+  no black window appears. Log file still contains bridge output.
+- Independent of the other stages — safe to ship first.
+
+### Stage 0b — don't latch right controller across Alt+Tab
+- In `src/xrt/compositor/d3d11/comp_d3d11_window.cpp` WndProc, add
+  handlers for `WM_KILLFOCUS` and `WM_ACTIVATE` (WA_INACTIVE). On
+  focus loss, clear any qwerty modifier state and release any
+  active controllers (qwerty exposes reset hooks already used by
+  the non-shell ESC close path — reuse if suitable).
+- On `WM_SETFOCUS`, re-sync by calling `GetAsyncKeyState(VK_MENU)`
+  / `VK_CONTROL` / `VK_SHIFT` and dropping any qwerty state whose
+  key is no longer held.
+- Root cause: when Alt+Tab fires, Windows delivers KEYDOWN(Alt) +
+  KEYDOWN(Tab) but may swallow the matching KEYUPs once focus moves
+  away — our qwerty "Alt held" flag then stays true.
+- Test: launch legacy WebXR in shell (or standalone), Alt+drag to
+  activate right controller (verify it moves), Alt+Tab to another
+  app, Alt+Tab back. Right controller should be idle until the
+  user Alt+drags again.
+- Independent of the other stages — can ship alongside 0a.
+
 ### Stage 1 — scale-blit fallback (optional but recommended)
 - Drop the `!sys->shell_mode` guard on `needs_scale`.
 - Ensure the SRGB shader-blit path works in shell mode for the
@@ -258,6 +307,8 @@ static server for the bridge-aware sample.
 | Stage | Test |
 |-------|------|
 | 0 | Build only. Log per-client window info on client connect. |
+| 0a | Cold-start a bridge-aware page. No console window flashes. Log still written to `%LOCALAPPDATA%\DisplayXR\webxr-bridge.log`. |
+| 0b | Legacy WebXR running. Alt+drag → right controller active. Alt+Tab away, Alt+Tab back. Right controller idle until user Alt+drags again. |
 | 1 | Open `immersive-web.github.io/webxr-samples/immersive-vr-session.html` in Chrome while shell active. Content fills the window (but perspective looks off). |
 | 2 | Same test → perspective is correct for the window's size/distance. Drag the window, exit and re-enter VR → new session uses the new window geometry. |
 | 3 | Open `http://localhost:8000/sample/` (our bridge sample) in Chrome while shell active. Content renders with window-local Kooima — visually equivalent to a handle cube app in the same slot. |
@@ -296,6 +347,9 @@ static server for the bridge-aware sample.
 |------|-----|
 | `src/xrt/compositor/d3d11_service/comp_d3d11_service.cpp` | Expose per-client window info; scale-blit fallback (Stage 1). |
 | `src/xrt/include/xrt/xrt_system.h` | New `xrt_shell_window_info` struct + accessor declaration. |
+| `src/xrt/targets/service/service_orchestrator.c` | Pass `CREATE_NO_WINDOW` when spawning the bridge (Stage 0a). |
+| `src/xrt/targets/webxr_bridge/CMakeLists.txt` | Alt for 0a: flip to `SUBSYSTEM:WINDOWS` for the bridge target. |
+| `src/xrt/compositor/d3d11/comp_d3d11_window.cpp` | Clear qwerty modifier/controller state on `WM_KILLFOCUS` / `WM_ACTIVATE` (Stage 0b). |
 | `src/xrt/state_trackers/oxr/oxr_views.c` | `xrLocateViews` override (Stage 2). |
 | `src/xrt/state_trackers/oxr/oxr_system.c` | `recommendedImageRect` override (Stage 2). |
 | `src/xrt/targets/webxr_bridge/main.cpp` | Per-session window binding, new message types (Stages 3, 4). |
