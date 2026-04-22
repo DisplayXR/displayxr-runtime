@@ -815,9 +815,12 @@ struct d3d11_multi_compositor
 
 	//! @name Capture client render timer
 	//! @{
-	std::thread capture_render_thread;           //!< Timer thread for capture-only rendering
+	std::thread capture_render_thread;              //!< Timer thread for shell rendering
 	std::atomic<bool> capture_render_running{false}; //!< Thread run flag
-	uint32_t capture_client_count{0};            //!< Number of active capture-type slots
+	uint32_t capture_client_count{0};               //!< Number of active capture-type slots
+	//! Wakeup event for the render thread: signaled on shutdown or when an
+	//! interaction (drag, rotation) needs a render sooner than the 14ms timeout.
+	HANDLE render_wakeup_event{nullptr};
 	//! @}
 
 	//! True when display is in 2D mode due to capture client focus.
@@ -3579,6 +3582,7 @@ multi_compositor_dispatch_capture_input(struct d3d11_multi_compositor *mc)
 
 // Forward declarations
 static inline bool quat_is_identity(const struct xrt_quat *q);
+static void capture_render_thread_start(struct d3d11_service_system *sys);
 
 // Forward declarations — defined in the external API section below.
 static void
@@ -3688,6 +3692,11 @@ multi_compositor_register_client(struct d3d11_service_system *sys, struct d3d11_
 			// Schedule debounced re-grid so rapid connections settle first.
 			mc->regrid_pending_ns = os_monotonic_get_ns() + 500000000ULL;
 
+			// Ensure render timer is running. Normally started on capture client
+			// connect, but pure 3D IPC sessions need it too — otherwise shell UI
+			// (drag, rotation) only repaints at the app's framerate (very slow on iGPU).
+			capture_render_thread_start(sys);
+
 			return i;
 		}
 	}
@@ -3741,21 +3750,26 @@ multi_compositor_unregister_client(struct d3d11_service_system *sys, struct d3d1
 static void
 capture_render_thread_func(struct d3d11_service_system *sys)
 {
-	while (sys->multi_comp && sys->multi_comp->capture_render_running.load()) {
-		uint64_t now = os_monotonic_get_ns();
-		uint64_t elapsed = now - sys->last_shell_render_ns;
-		if (elapsed >= 14000000ULL) { // ~70fps cap
-			std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
-			if (sys->multi_comp) {
-				// Render when: capture clients active, or empty shell (no IPC clients).
-				// When IPC clients are active, they drive rendering via layer_commit.
-				if (sys->multi_comp->capture_client_count > 0 ||
-				    sys->multi_comp->client_count == 0) {
-					multi_compositor_render(sys);
-				}
-			}
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	while (mc && mc->capture_render_running.load()) {
+		// Wait up to 14ms (~70fps). render_wakeup_event can be signaled
+		// early for instant shutdown or future drag-responsive repaints.
+		if (mc->render_wakeup_event) {
+			WaitForSingleObject(mc->render_wakeup_event, 14);
+		} else {
+			Sleep(14);
 		}
-		Sleep(8); // ~120Hz poll
+
+		if (!mc->capture_render_running.load()) break;
+
+		std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+		if (sys->multi_comp) {
+			// Always render: IPC clients drive via layer_commit too, but on
+			// slow GPUs (e.g. Intel iGPU) they run at <10fps. The 14ms
+			// throttle in layer_commit prevents double-renders, so this is safe.
+			multi_compositor_render(sys);
+			sys->last_shell_render_ns = os_monotonic_get_ns();
+		}
 	}
 }
 
@@ -3769,6 +3783,7 @@ capture_render_thread_start(struct d3d11_service_system *sys)
 	if (mc == nullptr || mc->capture_render_running.load()) {
 		return;
 	}
+	mc->render_wakeup_event = CreateEvent(nullptr, FALSE, FALSE, nullptr); // auto-reset
 	mc->capture_render_running.store(true);
 	mc->capture_render_thread = std::thread(capture_render_thread_func, sys);
 	U_LOG_W("Multi-comp: capture render timer started");
@@ -3785,8 +3800,17 @@ capture_render_thread_stop(struct d3d11_service_system *sys)
 		return;
 	}
 	mc->capture_render_running.store(false);
+	// Signal the event so the thread wakes immediately instead of waiting
+	// up to 14ms for the timeout to expire.
+	if (mc->render_wakeup_event) {
+		SetEvent(mc->render_wakeup_event);
+	}
 	if (mc->capture_render_thread.joinable()) {
 		mc->capture_render_thread.join();
+	}
+	if (mc->render_wakeup_event) {
+		CloseHandle(mc->render_wakeup_event);
+		mc->render_wakeup_event = nullptr;
 	}
 	U_LOG_W("Multi-comp: capture render timer stopped");
 }
@@ -4011,8 +4035,9 @@ multi_compositor_remove_capture_client(struct d3d11_service_system *sys, int slo
 	U_LOG_W("Multi-comp: removed capture client from slot %d (total=%u, captures=%u)",
 	         slot_index, mc->client_count, mc->capture_client_count);
 
-	// Stop render timer if no capture clients remain
-	if (mc->capture_client_count == 0) {
+	// Stop render timer only when all clients (capture and IPC) are gone.
+	// IPC-only sessions now also rely on this thread for smooth shell UI.
+	if (mc->capture_client_count == 0 && mc->client_count == 0) {
 		// Don't join from render thread — stop async
 		mc->capture_render_running.store(false);
 	}
@@ -6707,7 +6732,17 @@ after_key_shortcuts:
 			}
 		}
 	}
-
+	// Focused window always paints last (on top), regardless of Z position.
+	if (mc->focused_slot >= 0) {
+		for (int i = 0; i < render_count - 1; i++) {
+			if (render_order[i] == mc->focused_slot) {
+				int tmp = render_order[i];
+				render_order[i] = render_order[render_count - 1];
+				render_order[render_count - 1] = tmp;
+				break;
+			}
+		}
+	}
 	uint32_t dp_view_w = sys->view_width;
 	uint32_t dp_view_h = sys->view_height;
 	for (int ri = 0; ri < render_count; ri++) {
@@ -6817,87 +6852,6 @@ after_key_shortcuts:
 			    eye_pos.eyes[ei_q].x, eye_pos.eyes[ei_q].y, eye_pos.eyes[ei_q].z,
 			    src_col, src_row, half_w, half_h, ca_w, ca_h,
 			    quad_corners, quad_w_vals);
-
-			// Draw focus glow behind focused window (before content blit)
-			if (s == mc->focused_slot && sys->blit_vs && sys->blit_ps) {
-				float glow_hw = mc->clients[s].window_width_m / 2.0f + UI_GLOW_MARGIN_M;
-				float glow_hh = mc->clients[s].window_height_m / 2.0f + UI_GLOW_MARGIN_M;
-				float glow_tb_h = (mc->clients[s].client_type != CLIENT_TYPE_CAPTURE)
-				    ? UI_TITLE_BAR_H_M : 0.0f;
-				float glow_total_h = mc->clients[s].window_height_m + glow_tb_h + 2.0f * UI_GLOW_MARGIN_M;
-				float glow_ext = UI_GLOW_MARGIN_M / (glow_total_h / 2.0f);
-
-				float gl_l = -glow_hw;
-				float gl_t = mc->clients[s].window_height_m / 2.0f + glow_tb_h + UI_GLOW_MARGIN_M;
-				float gl_r = glow_hw;
-				float gl_b = -(mc->clients[s].window_height_m / 2.0f + UI_GLOW_MARGIN_M);
-
-				D3D11_MAPPED_SUBRESOURCE glow_mapped;
-				if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
-				              D3D11_MAP_WRITE_DISCARD, 0, &glow_mapped))) {
-					BlitConstants *gcb = static_cast<BlitConstants *>(glow_mapped.pData);
-					gcb->src_rect[0] = 0; gcb->src_rect[1] = 0;
-					gcb->src_rect[2] = 1; gcb->src_rect[3] = 1;
-					gcb->src_size[0] = 1; gcb->src_size[1] = 1;
-					gcb->dst_size[0] = (float)ca_w; gcb->dst_size[1] = (float)ca_h;
-					gcb->convert_srgb = 3.0f;  // glow mode
-					gcb->corner_radius = 0; gcb->corner_aspect = 0;
-					gcb->edge_feather = 0.0f;
-					gcb->glow_intensity = UI_GLOW_INTENSITY;
-					gcb->glow_extent = glow_ext;
-					gcb->glow_falloff = UI_GLOW_FALLOFF;
-					gcb->glow_color[0] = UI_GLOW_R;
-					gcb->glow_color[1] = UI_GLOW_G;
-					gcb->glow_color[2] = UI_GLOW_B;
-					gcb->glow_color[3] = 1.0f;
-
-					bool glow_rotated = !quat_is_identity(&mc->clients[s].window_pose.orientation);
-					if (glow_rotated) {
-						float gcorners[8], gw[4];
-						project_local_rect_for_eye(sys,
-						    &mc->clients[s].window_pose.orientation,
-						    mc->clients[s].window_pose.position.x,
-						    mc->clients[s].window_pose.position.y,
-						    mc->clients[s].window_pose.position.z,
-						    gl_l, gl_t, gl_r, gl_b,
-						    eye_pos.eyes[ei_q].x, eye_pos.eyes[ei_q].y, eye_pos.eyes[ei_q].z,
-						    src_col, src_row, half_w, half_h, ca_w, ca_h, gcorners, gw);
-						blit_set_quad_corners(gcb, gcorners, gw);
-						gcb->dst_offset[0] = 0; gcb->dst_offset[1] = 0;
-						gcb->dst_rect_wh[0] = 0; gcb->dst_rect_wh[1] = 0;
-					} else {
-						float margin_px_x = UI_GLOW_MARGIN_M / mc->clients[s].window_width_m * dest_px_w;
-						float margin_px_y = UI_GLOW_MARGIN_M / (mc->clients[s].window_height_m + glow_tb_h) * (dest_px_h + (float)TITLE_BAR_HEIGHT_PX);
-						float tb_px_f = (mc->clients[s].client_type != CLIENT_TYPE_CAPTURE)
-						    ? (float)TITLE_BAR_HEIGHT_PX : 0.0f;
-						gcb->quad_mode = 0;
-						gcb->dst_offset[0] = dest_px_x - margin_px_x;
-						gcb->dst_offset[1] = dest_px_y - tb_px_f - margin_px_y;
-						gcb->dst_rect_wh[0] = dest_px_w + 2.0f * margin_px_x;
-						gcb->dst_rect_wh[1] = dest_px_h + tb_px_f + 2.0f * margin_px_y;
-						memset(gcb->quad_corners_01, 0, sizeof(gcb->quad_corners_01));
-						memset(gcb->quad_corners_23, 0, sizeof(gcb->quad_corners_23));
-					}
-					sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
-
-					sys->context->VSSetShader(sys->blit_vs.get(), nullptr, 0);
-					sys->context->PSSetShader(sys->blit_ps.get(), nullptr, 0);
-					sys->context->VSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
-					sys->context->PSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
-					sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
-					ID3D11RenderTargetView *glow_rtvs[] = {mc->combined_atlas_rtv.get()};
-					sys->context->OMSetRenderTargets(1, glow_rtvs, nullptr);
-					sys->context->OMSetBlendState(sys->blend_premul.get(), nullptr, 0xFFFFFFFF);
-					sys->context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-					sys->context->IASetInputLayout(nullptr);
-					sys->context->RSSetState(sys->rasterizer_state.get());
-					sys->context->OMSetDepthStencilState(sys->depth_disabled.get(), 0);
-					D3D11_VIEWPORT gvp = {};
-					gvp.Width = (float)ca_w; gvp.Height = (float)ca_h; gvp.MaxDepth = 1.0f;
-					sys->context->RSSetViewports(1, &gvp);
-					sys->context->Draw(4, 0);
-				}
-			}
 
 			// Update constant buffer
 			D3D11_MAPPED_SUBRESOURCE mapped;
