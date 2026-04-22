@@ -815,9 +815,12 @@ struct d3d11_multi_compositor
 
 	//! @name Capture client render timer
 	//! @{
-	std::thread capture_render_thread;           //!< Timer thread for capture-only rendering
+	std::thread capture_render_thread;              //!< Timer thread for shell rendering
 	std::atomic<bool> capture_render_running{false}; //!< Thread run flag
-	uint32_t capture_client_count{0};            //!< Number of active capture-type slots
+	uint32_t capture_client_count{0};               //!< Number of active capture-type slots
+	//! Wakeup event for the render thread: signaled on shutdown or when an
+	//! interaction (drag, rotation) needs a render sooner than the 14ms timeout.
+	HANDLE render_wakeup_event{nullptr};
 	//! @}
 
 	//! True when display is in 2D mode due to capture client focus.
@@ -3601,6 +3604,7 @@ multi_compositor_dispatch_capture_input(struct d3d11_multi_compositor *mc)
 
 // Forward declarations
 static inline bool quat_is_identity(const struct xrt_quat *q);
+static void capture_render_thread_start(struct d3d11_service_system *sys);
 
 // Forward declarations — defined in the external API section below.
 static void
@@ -3710,6 +3714,11 @@ multi_compositor_register_client(struct d3d11_service_system *sys, struct d3d11_
 			// Schedule debounced re-grid so rapid connections settle first.
 			mc->regrid_pending_ns = os_monotonic_get_ns() + 500000000ULL;
 
+			// Ensure render timer is running. Normally started on capture client
+			// connect, but pure 3D IPC sessions need it too — otherwise shell UI
+			// (drag, rotation) only repaints at the app's framerate (very slow on iGPU).
+			capture_render_thread_start(sys);
+
 			return i;
 		}
 	}
@@ -3763,21 +3772,26 @@ multi_compositor_unregister_client(struct d3d11_service_system *sys, struct d3d1
 static void
 capture_render_thread_func(struct d3d11_service_system *sys)
 {
-	while (sys->multi_comp && sys->multi_comp->capture_render_running.load()) {
-		uint64_t now = os_monotonic_get_ns();
-		uint64_t elapsed = now - sys->last_shell_render_ns;
-		if (elapsed >= 14000000ULL) { // ~70fps cap
-			std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
-			if (sys->multi_comp) {
-				// Render when: capture clients active, or empty shell (no IPC clients).
-				// When IPC clients are active, they drive rendering via layer_commit.
-				if (sys->multi_comp->capture_client_count > 0 ||
-				    sys->multi_comp->client_count == 0) {
-					multi_compositor_render(sys);
-				}
-			}
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	while (mc && mc->capture_render_running.load()) {
+		// Wait up to 14ms (~70fps). render_wakeup_event can be signaled
+		// early for instant shutdown or future drag-responsive repaints.
+		if (mc->render_wakeup_event) {
+			WaitForSingleObject(mc->render_wakeup_event, 14);
+		} else {
+			Sleep(14);
 		}
-		Sleep(8); // ~120Hz poll
+
+		if (!mc->capture_render_running.load()) break;
+
+		std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+		if (sys->multi_comp) {
+			// Always render: IPC clients drive via layer_commit too, but on
+			// slow GPUs (e.g. Intel iGPU) they run at <10fps. The 14ms
+			// throttle in layer_commit prevents double-renders, so this is safe.
+			multi_compositor_render(sys);
+			sys->last_shell_render_ns = os_monotonic_get_ns();
+		}
 	}
 }
 
@@ -3791,6 +3805,7 @@ capture_render_thread_start(struct d3d11_service_system *sys)
 	if (mc == nullptr || mc->capture_render_running.load()) {
 		return;
 	}
+	mc->render_wakeup_event = CreateEvent(nullptr, FALSE, FALSE, nullptr); // auto-reset
 	mc->capture_render_running.store(true);
 	mc->capture_render_thread = std::thread(capture_render_thread_func, sys);
 	U_LOG_W("Multi-comp: capture render timer started");
@@ -3807,8 +3822,17 @@ capture_render_thread_stop(struct d3d11_service_system *sys)
 		return;
 	}
 	mc->capture_render_running.store(false);
+	// Signal the event so the thread wakes immediately instead of waiting
+	// up to 14ms for the timeout to expire.
+	if (mc->render_wakeup_event) {
+		SetEvent(mc->render_wakeup_event);
+	}
 	if (mc->capture_render_thread.joinable()) {
 		mc->capture_render_thread.join();
+	}
+	if (mc->render_wakeup_event) {
+		CloseHandle(mc->render_wakeup_event);
+		mc->render_wakeup_event = nullptr;
 	}
 	U_LOG_W("Multi-comp: capture render timer stopped");
 }
@@ -4033,8 +4057,9 @@ multi_compositor_remove_capture_client(struct d3d11_service_system *sys, int slo
 	U_LOG_W("Multi-comp: removed capture client from slot %d (total=%u, captures=%u)",
 	         slot_index, mc->client_count, mc->capture_client_count);
 
-	// Stop render timer if no capture clients remain
-	if (mc->capture_client_count == 0) {
+	// Stop render timer only when all clients (capture and IPC) are gone.
+	// IPC-only sessions now also rely on this thread for smooth shell UI.
+	if (mc->capture_client_count == 0 && mc->client_count == 0) {
 		// Don't join from render thread — stop async
 		mc->capture_render_running.store(false);
 	}
@@ -6735,7 +6760,17 @@ after_key_shortcuts:
 			}
 		}
 	}
-
+	// Focused window always paints last (on top), regardless of Z position.
+	if (mc->focused_slot >= 0) {
+		for (int i = 0; i < render_count - 1; i++) {
+			if (render_order[i] == mc->focused_slot) {
+				int tmp = render_order[i];
+				render_order[i] = render_order[render_count - 1];
+				render_order[render_count - 1] = tmp;
+				break;
+			}
+		}
+	}
 	uint32_t dp_view_w = sys->view_width;
 	uint32_t dp_view_h = sys->view_height;
 	for (int ri = 0; ri < render_count; ri++) {
