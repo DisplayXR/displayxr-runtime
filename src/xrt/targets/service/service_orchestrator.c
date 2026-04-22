@@ -149,7 +149,7 @@ launch_child_with_log(const char *exe_path, const char *args,
 		}
 	}
 
-	BOOL ok = CreateProcessA(NULL, cmd, NULL, NULL, inherit, 0, NULL, NULL, &si, pi);
+	BOOL ok = CreateProcessA(NULL, cmd, NULL, NULL, inherit, CREATE_NO_WINDOW, NULL, NULL, &si, pi);
 	if (log_h != INVALID_HANDLE_VALUE) {
 		CloseHandle(log_h); // our copy; child keeps its own
 	}
