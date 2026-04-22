@@ -1771,13 +1771,12 @@ main(int argc, char *argv[])
 		PE("Warning: failed to create message window (hotkey/tray unavailable)\n");
 	}
 
-	// Register system-wide hotkeys.
-	// In service-managed mode, Ctrl+Space is owned by the service — skip it.
+	// Register system-wide hotkeys. Ctrl+Space in service-managed mode exits
+	// the shell so the orchestrator's keyboard hook (gated on !s_shell_running)
+	// can re-spawn us on the next press.
 	if (g_msg_hwnd != NULL) {
-		if (!g_service_managed) {
-			if (!RegisterHotKey(g_msg_hwnd, HOTKEY_TOGGLE, MOD_CONTROL, VK_SPACE)) {
-				PE("Warning: RegisterHotKey(Ctrl+Space) failed — hotkey unavailable\n");
-			}
+		if (!RegisterHotKey(g_msg_hwnd, HOTKEY_TOGGLE, MOD_CONTROL, VK_SPACE)) {
+			PE("Warning: RegisterHotKey(Ctrl+Space) failed — hotkey unavailable\n");
 		}
 		if (!RegisterHotKey(g_msg_hwnd, HOTKEY_LAUNCH, MOD_CONTROL, 'L')) {
 			PE("Warning: RegisterHotKey(Ctrl+L) failed — launcher hotkey unavailable\n");
@@ -1884,6 +1883,14 @@ main(int argc, char *argv[])
 			MSG msg;
 			while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
 				if (msg.message == WM_HOTKEY && msg.wParam == HOTKEY_TOGGLE) {
+					// Service-managed shell: Ctrl+Space exits instead of
+					// toggling to tray. The orchestrator will re-spawn us
+					// on the next press via its keyboard hook.
+					if (g_service_managed) {
+						P("Ctrl+Space pressed — exiting service-managed shell.\n");
+						g_running = 0;
+						break;
+					}
 					// --- Toggle shell active/inactive ---
 					if (g_shell_active) {
 						P("Deactivating shell...\n");
@@ -1935,6 +1942,9 @@ main(int argc, char *argv[])
 								PE("Failed to reconnect to service.\n");
 								continue;
 							}
+							// Service was restarted — its in-memory launcher
+							// app list is empty. Re-push so Ctrl+L shows tiles.
+							shell_push_registered_apps_to_service(&ipc_c);
 						}
 
 						// Already-running IPC apps (OpenXR handle apps) are
@@ -2235,9 +2245,7 @@ main(int argc, char *argv[])
 
 	// Cleanup hotkey and tray
 	if (g_msg_hwnd != NULL) {
-		if (!g_service_managed) {
-			UnregisterHotKey(g_msg_hwnd, HOTKEY_TOGGLE);
-		}
+		UnregisterHotKey(g_msg_hwnd, HOTKEY_TOGGLE);
 		UnregisterHotKey(g_msg_hwnd, HOTKEY_LAUNCH);
 		tray_destroy();
 		DestroyWindow(g_msg_hwnd);
