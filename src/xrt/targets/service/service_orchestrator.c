@@ -40,6 +40,15 @@ DEBUG_GET_ONCE_LOG_OPTION(orchestrator_log, "DISPLAYXR_ORCHESTRATOR_LOG", U_LOGG
 
 #define HOTKEY_TOGGLE 1
 
+// WM_APP + N messages are user-defined; safe to use on our subclassed tray
+// HWND for cross-thread signalling from the low-level keyboard hook and for
+// install/uninstall of the hook (which must happen on the tray thread since
+// WH_KEYBOARD_LL requires a message pump on the installing thread, and our
+// main thread blocks in ipc_server_main without one).
+#define WM_ORCHESTRATOR_SPAWN_SHELL    (WM_APP + 1)
+#define WM_ORCHESTRATOR_INSTALL_HOOK   (WM_APP + 2)
+#define WM_ORCHESTRATOR_UNINSTALL_HOOK (WM_APP + 3)
+
 
 /*
  *
@@ -51,7 +60,8 @@ static struct service_config s_cfg;
 static PROCESS_INFORMATION s_shell_pi;
 static bool s_shell_running = false;
 static HANDLE s_shell_watch_thread = NULL;
-static bool s_hotkey_registered = false;
+static bool s_hotkey_registered = false; // true when WH_KEYBOARD_LL hook is active
+static HHOOK s_kbd_hook = NULL;
 
 static PROCESS_INFORMATION s_bridge_pi;
 static bool s_bridge_running = false;
@@ -210,15 +220,9 @@ shell_watch_thread_func(LPVOID param)
 
 	OW("Shell process exited");
 
-	// In Auto mode, re-register the hotkey so the user can re-summon the shell
-	if (s_cfg.shell == SERVICE_CHILD_AUTO) {
-		HWND hwnd = (HWND)service_tray_get_hwnd();
-		if (hwnd) {
-			RegisterHotKey(hwnd, HOTKEY_TOGGLE, MOD_CONTROL, VK_SPACE);
-			s_hotkey_registered = true;
-			OW("Re-registered Ctrl+Space hotkey (shell exited)");
-		}
-	}
+	// In Auto mode, nothing to re-register: the low-level keyboard hook
+	// stays installed across shell sessions, it's gated by s_shell_running
+	// in the hook proc.
 
 	// In Enable mode, restart the shell
 	if (s_cfg.shell == SERVICE_CHILD_ENABLE) {
@@ -514,29 +518,103 @@ stop_bridge_trampoline(void)
 
 /*
  *
- * Hotkey handling — called from tray window proc via WM_HOTKEY
+ * Hotkey handling — low-level keyboard hook (WH_KEYBOARD_LL).
+ *
+ * RegisterHotKey turned out unreliable on systems where Windows IME or
+ * third-party launchers already claim Ctrl+Space (error 1408 on every
+ * plausible combo). A low-level keyboard hook runs before global-hotkey
+ * dispatch, so our chord always wins.
+ *
+ * The hook proc runs on the thread that installed it (the tray thread,
+ * which has a GetMessage pump). From there we PostMessage a custom
+ * message to the subclassed tray HWND and let spawn_shell run on a
+ * normal stack — hook procs should do minimal work.
  *
  */
 
 static LRESULT CALLBACK
 orchestrator_wnd_proc_hook(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
-//! Original tray window proc — we subclass it to intercept WM_HOTKEY
+//! Original tray window proc — we subclass it to intercept our custom msg
 static WNDPROC s_original_wnd_proc = NULL;
+
+static LRESULT CALLBACK
+orchestrator_kbd_hook_proc(int nCode, WPARAM wParam, LPARAM lParam)
+{
+	if (nCode == HC_ACTION && (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN)) {
+		KBDLLHOOKSTRUCT *kbd = (KBDLLHOOKSTRUCT *)lParam;
+		if (kbd->vkCode == VK_SPACE) {
+			bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+			bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+			bool alt = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+			bool win = (GetAsyncKeyState(VK_LWIN) & 0x8000) != 0 ||
+			           (GetAsyncKeyState(VK_RWIN) & 0x8000) != 0;
+			OW("kbd hook: Space ctrl=%d shift=%d alt=%d win=%d shell_running=%d",
+			   ctrl, shift, alt, win, (int)s_shell_running);
+			// Plain Ctrl+Space only, no other modifiers.
+			if (ctrl && !shift && !alt && !win && !s_shell_running) {
+				HWND hwnd = (HWND)service_tray_get_hwnd();
+				if (hwnd) {
+					PostMessageW(hwnd, WM_ORCHESTRATOR_SPAWN_SHELL, 0, 0);
+				}
+				return 1; // swallow — don't let other handlers see Ctrl+Space
+			}
+		}
+	}
+	return CallNextHookEx(s_kbd_hook, nCode, wParam, lParam);
+}
 
 static LRESULT CALLBACK
 orchestrator_wnd_proc_hook(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
-	if (msg == WM_HOTKEY && wParam == HOTKEY_TOGGLE) {
-		// Ctrl+Space pressed — unregister hotkey and spawn shell
-		UnregisterHotKey(hwnd, HOTKEY_TOGGLE);
-		s_hotkey_registered = false;
+	if (msg == WM_ORCHESTRATOR_SPAWN_SHELL) {
 		OW("Ctrl+Space pressed — launching shell");
 		spawn_shell();
 		return 0;
 	}
-
+	if (msg == WM_ORCHESTRATOR_INSTALL_HOOK) {
+		if (s_kbd_hook == NULL) {
+			s_kbd_hook = SetWindowsHookExW(WH_KEYBOARD_LL,
+			                               orchestrator_kbd_hook_proc,
+			                               GetModuleHandleW(NULL), 0);
+			if (s_kbd_hook == NULL) {
+				OW("SetWindowsHookEx(WH_KEYBOARD_LL) failed: error %lu",
+				   (unsigned long)GetLastError());
+			} else {
+				OW("Installed Ctrl+Space keyboard hook (Auto mode)");
+			}
+		}
+		return 0;
+	}
+	if (msg == WM_ORCHESTRATOR_UNINSTALL_HOOK) {
+		if (s_kbd_hook != NULL) {
+			UnhookWindowsHookEx(s_kbd_hook);
+			s_kbd_hook = NULL;
+		}
+		return 0;
+	}
 	return CallWindowProcW(s_original_wnd_proc, hwnd, msg, wParam, lParam);
+}
+
+//! Ask the tray thread to install the low-level keyboard hook. WH_KEYBOARD_LL
+//! callbacks execute on the installing thread, which must have a message
+//! pump — the tray thread does, our main thread (blocked in ipc_server_main)
+//! doesn't. Returns true if the install request was posted successfully.
+static bool
+install_shell_hotkey(void)
+{
+	HWND hwnd = (HWND)service_tray_get_hwnd();
+	if (hwnd == NULL) return false;
+	return PostMessageW(hwnd, WM_ORCHESTRATOR_INSTALL_HOOK, 0, 0) != 0;
+}
+
+static void
+uninstall_shell_hotkey(void)
+{
+	HWND hwnd = (HWND)service_tray_get_hwnd();
+	if (hwnd != NULL) {
+		PostMessageW(hwnd, WM_ORCHESTRATOR_UNINSTALL_HOOK, 0, 0);
+	}
 }
 
 
@@ -549,13 +627,11 @@ orchestrator_wnd_proc_hook(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 static void
 apply_shell_mode(enum service_child_mode mode)
 {
-	HWND hwnd = (HWND)service_tray_get_hwnd();
-
 	switch (mode) {
 	case SERVICE_CHILD_ENABLE:
-		// Unregister hotkey if we own it
-		if (s_hotkey_registered && hwnd) {
-			UnregisterHotKey(hwnd, HOTKEY_TOGGLE);
+		// Uninstall keyboard hook if active
+		if (s_hotkey_registered) {
+			uninstall_shell_hotkey();
 			s_hotkey_registered = false;
 		}
 		// Launch shell if not running
@@ -563,9 +639,9 @@ apply_shell_mode(enum service_child_mode mode)
 		break;
 
 	case SERVICE_CHILD_DISABLE:
-		// Unregister hotkey if we own it
-		if (s_hotkey_registered && hwnd) {
-			UnregisterHotKey(hwnd, HOTKEY_TOGGLE);
+		// Uninstall keyboard hook if active
+		if (s_hotkey_registered) {
+			uninstall_shell_hotkey();
 			s_hotkey_registered = false;
 		}
 		// Terminate shell if running
@@ -576,12 +652,15 @@ apply_shell_mode(enum service_child_mode mode)
 		break;
 
 	case SERVICE_CHILD_AUTO:
-		// If shell is already running, let it be
-		if (!s_shell_running && hwnd) {
-			if (!s_hotkey_registered) {
-				RegisterHotKey(hwnd, HOTKEY_TOGGLE, MOD_CONTROL, VK_SPACE);
+		// Install low-level keyboard hook so Ctrl+Space summons the shell.
+		// The hook's proc checks s_shell_running per-keypress and passes
+		// through if the shell is already up. The actual install happens
+		// on the tray thread via PostMessage; log only on failure here.
+		if (!s_hotkey_registered) {
+			if (install_shell_hotkey()) {
 				s_hotkey_registered = true;
-				OW("Registered Ctrl+Space hotkey (Auto mode)");
+			} else {
+				OW("install_shell_hotkey: could not post to tray HWND");
 			}
 		}
 		break;
@@ -668,9 +747,9 @@ service_orchestrator_shutdown(void)
 {
 	HWND hwnd = (HWND)service_tray_get_hwnd();
 
-	// Unregister hotkey
-	if (s_hotkey_registered && hwnd) {
-		UnregisterHotKey(hwnd, HOTKEY_TOGGLE);
+	// Uninstall keyboard hook
+	if (s_hotkey_registered) {
+		uninstall_shell_hotkey();
 		s_hotkey_registered = false;
 	}
 

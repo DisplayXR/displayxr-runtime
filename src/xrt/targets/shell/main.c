@@ -1793,9 +1793,16 @@ main(int argc, char *argv[])
 	}
 
 	// --- Decide startup mode ---
-	// If launched with apps or captures: activate immediately (current behavior).
-	// If launched with no args: start deactivated in tray, wait for Ctrl+Space.
-	bool start_active = (app_count > 0 || capture_count > 0);
+	// If launched with apps or captures: activate immediately.
+	// If launched via the service orchestrator (--service-managed): also
+	// activate immediately. The orchestrator only spawns us in response to
+	// Ctrl+Space being pressed (semantically "summon shell"), so starting
+	// inactive-in-tray would need a second Ctrl+Space to activate — but
+	// with --service-managed we skip our own hotkey registration, so no
+	// one's listening for that second press.
+	// Standalone no-args launches still start in tray and wait for the
+	// shell's own Ctrl+Space to toggle active.
+	bool start_active = (app_count > 0 || capture_count > 0 || g_service_managed);
 
 	if (start_active) {
 		P("Activating shell mode...\n");
