@@ -612,6 +612,22 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 #endif
 	} break;
 
+	// Focus change: let qwerty clear any latched modifier/button state.
+	// Alt+Tab can swallow the matching KEYUP once focus leaves, leaving
+	// e.g. the right controller stuck-active on re-entry. Fall through
+	// to DefWindowProc so Windows still handles default focus behavior
+	// (repainting, activation visuals).
+	case WM_KILLFOCUS:
+	case WM_SETFOCUS:
+	case WM_ACTIVATE:
+#ifdef XRT_BUILD_DRIVER_QWERTY
+		if (w->qwerty_enabled && w->xsysd != NULL) {
+			qwerty_process_win32(w->xsysd->xdevs, w->xsysd->xdev_count,
+			                     message, wParam, lParam, NULL);
+		}
+#endif
+		return DefWindowProcW(hWnd, message, wParam, lParam);
+
 	// Mouse input: forward to app in shell mode, or to qwerty in normal mode
 	case WM_LBUTTONDOWN:
 	case WM_LBUTTONUP:
