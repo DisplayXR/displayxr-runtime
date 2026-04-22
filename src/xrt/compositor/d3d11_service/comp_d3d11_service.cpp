@@ -3722,6 +3722,16 @@ multi_compositor_register_client(struct d3d11_service_system *sys, struct d3d11_
 				mc->focused_slot = i;
 			}
 			U_LOG_W("Multi-comp: registered client in slot %d (total=%u)", i, mc->client_count);
+			U_LOG_W("  window: pose=(%.3f,%.3f,%.3f) size=%.3fx%.3fm rect=(%d,%d %dx%d px)",
+			        mc->clients[i].window_pose.position.x,
+			        mc->clients[i].window_pose.position.y,
+			        mc->clients[i].window_pose.position.z,
+			        mc->clients[i].window_width_m,
+			        mc->clients[i].window_height_m,
+			        mc->clients[i].window_rect_x,
+			        mc->clients[i].window_rect_y,
+			        mc->clients[i].window_rect_w,
+			        mc->clients[i].window_rect_h);
 			multi_compositor_update_input_forward(mc);
 
 			// Schedule debounced re-grid so rapid connections settle first.
