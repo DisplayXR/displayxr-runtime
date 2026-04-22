@@ -1293,6 +1293,19 @@ ipc_handle_compositor_get_info(volatile struct ipc_client_state *ics, struct xrt
 }
 
 xrt_result_t
+ipc_handle_compositor_get_window_metrics(volatile struct ipc_client_state *ics,
+                                         struct xrt_window_metrics *out_metrics)
+{
+	IPC_TRACE_MARKER();
+
+	// 2a.0 stub: real per-client metrics land in 2a.1.
+	struct xrt_window_metrics zero = {0};
+	*out_metrics = zero;
+
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
 ipc_handle_compositor_predict_frame(volatile struct ipc_client_state *ics,
                                     int64_t *out_frame_id,
                                     int64_t *out_wake_up_time_ns,

@@ -315,6 +315,12 @@
 		]
 	},
 
+	"compositor_get_window_metrics": {
+		"out": [
+			{"name": "metrics", "type": "struct xrt_window_metrics"}
+		]
+	},
+
 	"compositor_predict_frame": {
 		"out": [
 			{"name": "frame_id", "type": "int64_t"},
