@@ -9801,13 +9801,24 @@ comp_d3d11_service_create_system(struct xrt_device *xdev,
 	sys->xmcc.notify_display_refresh_changed = NULL;
 	sys->base.xmcc = &sys->xmcc;
 
-	// Fill system compositor info
+	// Fill system compositor info — initialize all views[0..view_count-1].
+	// These are fallback values only: oxr_system_fill_in() overrides
+	// recommended using display_pixel_width × view_scale at runtime, and
+	// bumps max to display_pixel_width if needed.  The important thing is
+	// that all view_count entries are initialized (not just [0] and [1])
+	// so future N>2-view devices don't read garbage.
 	sys->base.info.max_layers = XRT_MAX_LAYERS;
-	sys->base.info.views[0].recommended.width_pixels = sys->view_width;
-	sys->base.info.views[0].recommended.height_pixels = sys->view_height;
-	sys->base.info.views[0].max.width_pixels = sys->view_width * 2;
-	sys->base.info.views[0].max.height_pixels = sys->view_height * 2;
-	sys->base.info.views[1] = sys->base.info.views[0];
+
+	uint32_t view_count = (sys->xdev != nullptr && sys->xdev->hmd != nullptr)
+	                           ? sys->xdev->hmd->view_count : 2;
+	if (view_count == 0) view_count = 2;
+
+	for (uint32_t i = 0; i < view_count && i < XRT_MAX_VIEWS; i++) {
+		sys->base.info.views[i].recommended.width_pixels = sys->view_width;
+		sys->base.info.views[i].recommended.height_pixels = sys->view_height;
+		sys->base.info.views[i].max.width_pixels = sys->view_width;
+		sys->base.info.views[i].max.height_pixels = sys->view_height;
+	}
 
 	// Set supported blend modes (Chrome WebXR requires at least OPAQUE)
 	sys->base.info.supported_blend_modes[0] = XRT_BLEND_MODE_OPAQUE;
@@ -9822,8 +9833,9 @@ comp_d3d11_service_create_system(struct xrt_device *xdev,
 		sys->base.info.display_pixel_height = sys->output_height;
 	}
 
-	U_LOG_W("D3D11 service system compositor created: view=%ux%u/eye, stereo=%ux%u, output=%ux%u @ %.0fHz",
-	        sys->view_width, sys->view_height,
+	U_LOG_W("D3D11 service system compositor created: view=%ux%u, view_count=%u, "
+	        "display=%ux%u, output=%ux%u @ %.0fHz",
+	        sys->view_width, sys->view_height, view_count,
 	        sys->display_width, sys->display_height,
 	        sys->output_width, sys->output_height, sys->refresh_rate);
 
