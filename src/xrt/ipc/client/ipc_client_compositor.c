@@ -165,6 +165,40 @@ get_system_info(struct ipc_client_compositor *icc, struct xrt_system_compositor_
 	IPC_CHK_ALWAYS_RET(icc->ipc_c, xret, "ipc_call_system_compositor_get_info");
 }
 
+/*!
+ * Pull per-client window metrics over IPC.
+ *
+ * Used by the OpenXR state tracker for IPC-client sessions (Chrome WebXR,
+ * any sandboxed app) to drive window-scoped Kooima FOV in shell mode.
+ * Returns false if the round trip fails or the server reports no valid
+ * per-client slot (headless, shell mode off, pre-render race) — caller
+ * then falls back to display-dimension metrics.
+ *
+ * Caller MUST only invoke this on a compositor that is actually an
+ * `ipc_client_compositor`. The OpenXR state tracker gates on
+ * !is_*_native_compositor && xmcc==NULL, which is the only case where
+ * `xc` is an IPC client compositor.
+ */
+bool
+comp_ipc_client_compositor_get_window_metrics(struct xrt_compositor *xc, struct xrt_window_metrics *out_metrics)
+{
+	if (xc == NULL || out_metrics == NULL) {
+		return false;
+	}
+
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return false;
+	}
+
+	xrt_result_t xret = ipc_call_compositor_get_window_metrics(icc->ipc_c, out_metrics);
+	if (xret != XRT_SUCCESS) {
+		return false;
+	}
+
+	return out_metrics->valid;
+}
+
 
 /*
  *

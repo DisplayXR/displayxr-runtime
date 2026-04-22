@@ -89,6 +89,15 @@
 #include "vk_native/comp_vk_native_compositor.h"
 #endif
 
+// IPC-client window metrics (for Chrome WebXR in shell mode etc.).
+// Declared here rather than via ipc_client.h because st_oxr doesn't pull
+// the ipc_client include path; the runtime DLL links ipc_client so the
+// symbol resolves at link time.
+struct xrt_compositor;
+struct xrt_window_metrics;
+bool
+comp_ipc_client_compositor_get_window_metrics(struct xrt_compositor *xc, struct xrt_window_metrics *out_metrics);
+
 
 DEBUG_GET_ONCE_NUM_OPTION(ipd, "OXR_DEBUG_IPD_MM", 63)
 DEBUG_GET_ONCE_NUM_OPTION(wait_frame_sleep, "OXR_DEBUG_WAIT_FRAME_EXTRA_SLEEP_MS", 0)
@@ -288,6 +297,17 @@ oxr_session_get_window_metrics(struct oxr_session *sess,
 	if (sess->sys->xsysc->xmcc != NULL) {
 		struct multi_compositor *mc = multi_compositor(&sess->xcn->base);
 		return multi_compositor_get_window_metrics(mc, out_metrics);
+	}
+
+	// IPC-client path. When the service compositor is in shell mode the
+	// per-client window rect lives server-side; pull it over IPC so
+	// Kooima computes window-scoped FOV. Bridge-relay sessions stay on
+	// the display-dimension fallback (they forward raw eye positions to
+	// the browser, which does its own math — Stage 3 territory).
+	if (!sess->is_bridge_relay) {
+		if (comp_ipc_client_compositor_get_window_metrics(&sess->xcn->base, out_metrics)) {
+			return true;
+		}
 	}
 
 	return false;

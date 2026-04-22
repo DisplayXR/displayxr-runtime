@@ -130,3 +130,18 @@ ipc_client_system_devices_create(struct ipc_connection *ipc_c);
 
 struct xrt_session *
 ipc_client_session_create(struct ipc_connection *ipc_c);
+
+/*!
+ * Pull per-client shell window metrics over IPC.
+ *
+ * Only safe to call when `xc` is known to be an ipc_client_compositor
+ * (e.g. the OpenXR state tracker's IPC branch in
+ * `oxr_session_get_window_metrics`). Returns false if the call fails
+ * or the server reports no valid per-client slot — caller should fall
+ * back to display-dimension metrics.
+ */
+struct xrt_compositor;
+struct xrt_window_metrics;
+
+bool
+comp_ipc_client_compositor_get_window_metrics(struct xrt_compositor *xc, struct xrt_window_metrics *out_metrics);
