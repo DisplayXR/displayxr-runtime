@@ -180,6 +180,59 @@ qwerty_process_win32(struct xrt_device **xdevs,
 	struct qwerty_hmd *qhmd = using_qhmd ? qsys->hmd : NULL;
 	struct qwerty_device *qd_hmd = using_qhmd ? &qhmd->base : NULL;
 
+	// Focus loss: Windows can swallow matching KEYUPs (e.g. Alt+Tab eats
+	// Alt/Tab KEYUP once focus leaves), so modifier state latches. Clear
+	// all state and release any held buttons/triggers when the compositor
+	// window loses focus; re-sync from hardware state when it regains it.
+	bool lose_focus =
+	    (message == WM_KILLFOCUS) ||
+	    (message == WM_ACTIVATE && LOWORD((unsigned long)wParam) == WA_INACTIVE);
+	if (lose_focus) {
+		if (lmb_was_down) {
+			for (int i = 0; i < 2; i++) {
+				qwerty_release_trigger(i == 0 ? qleft : qright);
+			}
+			lmb_was_down = false;
+		}
+		if (mmb_was_down) {
+			for (int i = 0; i < 2; i++) {
+				qwerty_release_squeeze(i == 0 ? qleft : qright);
+			}
+			mmb_was_down = false;
+		}
+		if (mouse_look_active) {
+			ReleaseCapture();
+			mouse_look_active = false;
+		}
+		if (using_qhmd) {
+			qwerty_release_all(qd_hmd);
+		}
+		qwerty_release_all(qd_right);
+		qwerty_release_all(qd_left);
+		ctrl_pressed = false;
+		alt_pressed = false;
+		GetCursorPos(&last_mouse_pos);
+		return;
+	}
+	if (message == WM_SETFOCUS) {
+		// Re-sync modifier state from hardware. If CTRL/ALT are actually
+		// still held (chord into window), leave them active; otherwise
+		// make sure we're in a clean state.
+		bool ctrl_now = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+		bool alt_now = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+		if (ctrl_pressed != ctrl_now || alt_pressed != alt_now) {
+			if (using_qhmd) {
+				qwerty_release_all(qd_hmd);
+			}
+			qwerty_release_all(qd_right);
+			qwerty_release_all(qd_left);
+			ctrl_pressed = ctrl_now;
+			alt_pressed = alt_now;
+		}
+		GetCursorPos(&last_mouse_pos);
+		return;
+	}
+
 	// Check key state
 	bool is_keydown = (message == WM_KEYDOWN || message == WM_SYSKEYDOWN);
 	bool is_keyup = (message == WM_KEYUP || message == WM_SYSKEYUP);
