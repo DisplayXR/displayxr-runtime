@@ -5120,6 +5120,13 @@ toggle_fullscreen(struct d3d11_service_system *sys,
 
 	mc->focused_slot = slot;
 	multi_compositor_update_input_forward(mc);
+
+	// Update window layer's ESC-suppression flag
+	bool any_max = false;
+	for (int j = 0; j < D3D11_MULTI_MAX_CLIENTS; j++) {
+		if (mc->clients[j].active && mc->clients[j].maximized) { any_max = true; break; }
+	}
+	comp_d3d11_window_set_any_maximized(mc->window, any_max);
 }
 
 /*!
@@ -7362,30 +7369,67 @@ after_key_shortcuts:
 								sys->context->Draw(4, 0);
 							}
 						}
-						// ^ or v glyph on maximize button (^ = expand, v = restore)
+						// Hollow rounded-square icon on maximize button
 						{
-							int mg = (mc->clients[s].maximized ? 'v' : '^') - 0x20;
-							float src_gw = mc->glyph_advances[mg];
-							float dst_gw = src_gw * btn_scale;
-							float bx = tox + tow - 3.0f * (float)CLOSE_BTN_WIDTH_PX +
-							           ((float)CLOSE_BTN_WIDTH_PX - dst_gw) / 2.0f;
-							float xg_left = win_hw - 3*btn_w_m_val + (btn_w_m_val - glyph_w_m) / 2.0f;
-							float xg_top = win_hh + tb_h_m - glyph_vpad_m;
+							bool max_hover_ic = (mc->hover_btn == 3 && mc->hover_btn_slot == s);
+							float max_x_ic = tox + tow - 3.0f * (float)CLOSE_BTN_WIDTH_PX;
+							float pad_x = btn_w_m_val * 0.22f;
+							float pad_y = tb_h_m    * 0.22f;
+							float icon_l = win_hw - 3*btn_w_m_val + pad_x;
+							float icon_r = win_hw - 2*btn_w_m_val - pad_x;
+							float icon_t = win_hh + tb_h_m        - pad_y;
+							float icon_b = win_hh                 + pad_y;
+							float icon_w = icon_r - icon_l;
+							float icon_h = icon_t - icon_b;
+							float stroke_x = icon_w * 0.18f;
+							float stroke_y = icon_h * 0.18f;
+
+							float pad_x_px = (float)CLOSE_BTN_WIDTH_PX * 0.22f;
+							float pad_y_px = toh * 0.22f;
+							float ipx_l = max_x_ic + pad_x_px;
+							float ipx_t = toy   + pad_y_px;
+							float ipx_w = (float)CLOSE_BTN_WIDTH_PX - 2*pad_x_px;
+							float ipx_h = toh - 2*pad_y_px;
+							float st_px = ipx_w * 0.18f;
+							float st_py = ipx_h * 0.18f;
+
+							// Outer: white rounded rect
 							D3D11_MAPPED_SUBRESOURCE mapped;
 							if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
 							              D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
 								BlitConstants *cb = static_cast<BlitConstants *>(mapped.pData);
-								cb->src_rect[0] = atlas_x_for(mg); cb->src_rect[1] = 0;
-								cb->src_rect[2] = src_gw; cb->src_rect[3] = (float)mc->font_glyph_h;
-								cb->src_size[0] = (float)mc->font_atlas_w;
-								cb->src_size[1] = (float)mc->font_atlas_h;
+								cb->src_rect[0] = 0.90f; cb->src_rect[1] = 0.90f;
+								cb->src_rect[2] = 0.90f; cb->src_rect[3] = 1.0f;
+								cb->src_size[0] = 1; cb->src_size[1] = 1;
 								cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
-								cb->convert_srgb = 0.0f;
-								cb->corner_radius = 0; cb->corner_aspect = 0;
+								cb->convert_srgb = 2.0f;
+								cb->corner_radius = 0.28f;
+								cb->corner_aspect = icon_w / icon_h;
+								cb->edge_feather = 0.0f; cb->glow_intensity = 0.0f;
+								CHROME_BLIT_POS(cb, icon_l, icon_t, icon_r, icon_b,
+								    ipx_l, ipx_t, ipx_w, ipx_h);
+								sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
+								sys->context->Draw(4, 0);
+							}
+							// Inner: button bg color — punches out the center to make it hollow
+							if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
+							              D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+								BlitConstants *cb = static_cast<BlitConstants *>(mapped.pData);
+								cb->src_rect[0] = max_hover_ic ? 0.30f : 0.20f;
+								cb->src_rect[1] = max_hover_ic ? 0.50f : 0.35f;
+								cb->src_rect[2] = max_hover_ic ? 0.85f : 0.70f;
+								cb->src_rect[3] = 1.0f;
+								cb->src_size[0] = 1; cb->src_size[1] = 1;
+								cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
+								cb->convert_srgb = 2.0f;
+								cb->corner_radius = 0.20f;
+								float iw2 = icon_w - 2*stroke_x;
+								float ih2 = icon_h - 2*stroke_y;
+								cb->corner_aspect = (ih2 > 0) ? iw2/ih2 : 1.0f;
 								cb->edge_feather = 0.0f; cb->glow_intensity = 0.0f;
 								CHROME_BLIT_POS(cb,
-								    xg_left, xg_top, xg_left + glyph_w_m, xg_top - glyph_h_m,
-								    bx, toy + gpad, dst_gw, gh);
+								    icon_l+stroke_x, icon_t-stroke_y, icon_r-stroke_x, icon_b+stroke_y,
+								    ipx_l+st_px, ipx_t+st_py, ipx_w-2*st_px, ipx_h-2*st_py);
 								sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
 								sys->context->Draw(4, 0);
 							}

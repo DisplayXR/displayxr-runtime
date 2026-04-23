@@ -219,6 +219,14 @@ void
 comp_d3d11_window_set_shell_mode_active(struct comp_d3d11_window *window, bool active);
 
 /*!
+ * Tell the window layer whether any client is currently maximized/fullscreen.
+ * When true, ESC is consumed by the shell for fullscreen restore and not
+ * forwarded to the focused app.
+ */
+void
+comp_d3d11_window_set_any_maximized(struct comp_d3d11_window *window, bool maximized);
+
+/*!
  * Suppress or resume input forwarding (for shell drag/resize operations).
  * When suppressed, the WndProc does not forward mouse or keyboard events to
  * the app.

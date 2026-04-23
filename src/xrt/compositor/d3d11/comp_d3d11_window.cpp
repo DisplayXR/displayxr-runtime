@@ -163,6 +163,9 @@ struct comp_d3d11_window
 	//! PostMessage(WM_CLOSE) and take the service down with it.
 	volatile LONG shell_mode_active;
 
+	//! True while any shell window is maximized (fullscreen). Gates ESC suppression
+	//! so ESC only restores fullscreen and doesn't reach apps when not maximized.
+	volatile LONG any_window_maximized;
 
 	//! Focused window rect in shell-window client pixels (for mouse coord remapping).
 	//! When forwarding mouse events, shell coords are remapped to app-local coords.
@@ -262,7 +265,6 @@ is_shell_reserved_key(WPARAM vk)
 	// tries to change rendering mode via xrRequestDisplayRenderingModeEXT,
 	// that call is blocked in shell/IPC mode.
 	switch (vk) {
-	case VK_ESCAPE: // Restore fullscreen / shell dismiss
 	case VK_TAB:    // Cycle focus
 	case VK_DELETE: // Close focused app
 		return true;
@@ -545,7 +547,13 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			}
 #endif
 			if (is_shell_reserved_key(wParam)) {
-				// Shell-only keys (ESC, TAB, DELETE) → don't forward to app
+				// Shell-only keys (TAB, DELETE) → don't forward to app
+				return 0;
+			}
+			// ESC: only suppress when a window is maximized (fullscreen restore).
+			// When not maximized, let ESC through so the app can handle it.
+			if (wParam == VK_ESCAPE &&
+			    InterlockedCompareExchange(&w->any_window_maximized, 0, 0)) {
 				return 0;
 			}
 			// Ctrl+1-4: layout presets (handled server-side) → don't forward
@@ -1219,6 +1227,15 @@ comp_d3d11_window_set_shell_mode_active(struct comp_d3d11_window *window, bool a
 		return;
 	}
 	InterlockedExchange(&window->shell_mode_active, active ? 1 : 0);
+}
+
+void
+comp_d3d11_window_set_any_maximized(struct comp_d3d11_window *window, bool maximized)
+{
+	if (window == NULL) {
+		return;
+	}
+	InterlockedExchange(&window->any_window_maximized, maximized ? 1 : 0);
 }
 
 // Returns true if input forwarding should currently be suppressed, considering
