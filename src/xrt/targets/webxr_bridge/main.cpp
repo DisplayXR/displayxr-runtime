@@ -407,8 +407,21 @@ struct WindowMetrics {
 	int pixelH = 0;
 	float sizeWm = 0.0f;
 	float sizeHm = 0.0f;
+	// 3D window-center offset from display center (meters, +right/+up/+toward-viewer).
+	// Z is populated from per-client IPC metrics in shell mode; 0 for the
+	// legacy compositor-HWND path (the compositor window sits flat on the
+	// display surface, so there's no Z component to propagate).
 	float centerOffsetXm = 0.0f;
 	float centerOffsetYm = 0.0f;
+	float centerOffsetZm = 0.0f;
+	// Window orientation in display space (identity = flat on the display surface).
+	// Only the shell-mode per-client IPC path populates this; the sample
+	// applies inv(orientation) to shell-local eyes for correct Kooima when
+	// the window is tilted relative to the display plane.
+	float orientX = 0.0f;
+	float orientY = 0.0f;
+	float orientZ = 0.0f;
+	float orientW = 1.0f;
 	uint32_t viewWidth = 0;   // Per-view tile width = pixelW × viewScaleX (bridge-computed, pushed to compositor)
 	uint32_t viewHeight = 0;  // Per-view tile height = pixelH × viewScaleY (bridge-computed, pushed to compositor)
 };
@@ -540,6 +553,10 @@ static void compute_and_push_bridge_view_dims(Bridge &b, HWND hwnd,
 	}
 }
 
+// Forward decl — defined after build_window_info_fields since it uses
+// WindowMetrics + IPC calls. See 3c.
+static bool try_override_with_per_client_metrics(Bridge &b, WindowMetrics &neu);
+
 // Poll current metrics and update b.window_metrics. Returns true if values
 // changed compared to the cached state (including valid↔invalid transitions).
 static bool poll_window_metrics(Bridge &b) {
@@ -547,9 +564,22 @@ static bool poll_window_metrics(Bridge &b) {
 	g_compositor_hwnd.store(hwnd);
 	WindowMetrics neu;
 	bool ok = compute_window_metrics_impl(hwnd, b, neu);
+
+	// Stage 3: when we have a resolved Chrome client_id, the authoritative
+	// source is the per-client slot metrics from the service — not the
+	// compositor's fullscreen output window. Override neu's pixel/size/
+	// offset fields with per-client values so the HWND-property push
+	// below (DXR_BridgeViewW/H) also carries slot-sized dims. Otherwise
+	// the compositor would crop at fullscreen × viewScale while the
+	// page renders at slot × viewScale, leaving most of the slot empty.
+	if (ok) {
+		(void)try_override_with_per_client_metrics(b, neu);
+	}
+
 	// Bridge is the source of truth for per-view tile dims. Compute from
-	// live window size × current mode's viewScale, then push to compositor
-	// so bridge_override crops the exact region the sample will render.
+	// (now possibly slot-sized) window size × current mode's viewScale,
+	// then push to compositor so bridge_override crops the exact region
+	// the sample will render.
 	compute_and_push_bridge_view_dims(b, hwnd, neu);
 	const WindowMetrics &old = b.window_metrics;
 	const float eps = 0.0001f;
@@ -561,6 +591,11 @@ static bool poll_window_metrics(Bridge &b) {
 		          std::fabs(old.sizeHm - neu.sizeHm) > eps ||
 		          std::fabs(old.centerOffsetXm - neu.centerOffsetXm) > eps ||
 		          std::fabs(old.centerOffsetYm - neu.centerOffsetYm) > eps ||
+		          std::fabs(old.centerOffsetZm - neu.centerOffsetZm) > eps ||
+		          std::fabs(old.orientX - neu.orientX) > eps ||
+		          std::fabs(old.orientY - neu.orientY) > eps ||
+		          std::fabs(old.orientZ - neu.orientZ) > eps ||
+		          std::fabs(old.orientW - neu.orientW) > eps ||
 		          old.viewWidth != neu.viewWidth || old.viewHeight != neu.viewHeight;
 		b.window_metrics = neu;
 	} else if (old.valid) {
@@ -780,7 +815,19 @@ static std::string build_window_info_fields(const WindowMetrics &w) {
 	if (w.valid) {
 		s += ",\"windowPixelSize\":[" + json_u((uint32_t)w.pixelW) + "," + json_u((uint32_t)w.pixelH) + "]";
 		s += ",\"windowSizeMeters\":[" + json_f(w.sizeWm) + "," + json_f(w.sizeHm) + "]";
-		s += ",\"windowCenterOffsetMeters\":[" + json_f(w.centerOffsetXm) + "," + json_f(w.centerOffsetYm) + "]";
+		// windowCenterOffsetMeters is [x, y, z] in meters (display-centric).
+		// x,y extend the pre-Stage-3 [x, y] contract (non-shell pages that
+		// cached a length-2 array still read the first two entries); the
+		// z component enables full 3D eye-frame transform for shell mode
+		// where the slot can sit at non-zero Z relative to the display plane.
+		s += ",\"windowCenterOffsetMeters\":[" + json_f(w.centerOffsetXm) + "," + json_f(w.centerOffsetYm) + "," + json_f(w.centerOffsetZm) + "]";
+		// windowOrientation = [x, y, z, w] quaternion in display space.
+		// Identity means the window is flat on the display surface (the
+		// common case); non-identity appears when the shell allows the
+		// slot to be tilted. Apps should apply Q^-1 to (eye - offset) to
+		// get a window-local eye position before Kooima — matches the
+		// runtime's legacy-WebXR path in oxr_session.c.
+		s += ",\"windowOrientation\":[" + json_f(w.orientX) + "," + json_f(w.orientY) + "," + json_f(w.orientZ) + "," + json_f(w.orientW) + "]";
 		if (w.viewWidth > 0 && w.viewHeight > 0) {
 			s += ",\"viewWidth\":" + json_u(w.viewWidth);
 			s += ",\"viewHeight\":" + json_u(w.viewHeight);
@@ -798,13 +845,18 @@ static std::string build_window_info_json(const WindowMetrics &w) {
 	return s;
 }
 
-// Populate WindowMetrics from per-client IPC (Stage 3 path). Returns true
-// only when the bridge has a resolved Chrome id AND the service returns
-// valid metrics. Used by effective_window_metrics() to scope `windowInfo`
-// to the shell window when the page is hosted there. Falls back via the
-// caller to b.window_metrics (global poll_window_metrics) on any failure,
-// matching pre-Stage-3 behavior for the non-shell case.
-static bool fetch_per_client_window_metrics(Bridge &b, WindowMetrics &out) {
+// Override the compositor-window-scoped WindowMetrics with per-client slot
+// metrics when the bridge has a resolved Chrome client_id. Returns true when
+// the override was applied. This is the single bridging point between Stage 3's
+// IPC-sourced per-client data and the existing bridge pipeline (HWND props,
+// display-info JSON) — everything downstream just reads `neu` / b.window_metrics
+// as before.
+//
+// viewWidth/viewHeight are intentionally left untouched here; the caller
+// (poll_window_metrics) runs compute_and_push_bridge_view_dims right after
+// which recomputes them from (now-slot-sized) pixelW/pixelH × viewScale,
+// respecting the atlas stride invariant (feedback_atlas_stride_invariant).
+static bool try_override_with_per_client_metrics(Bridge &b, WindowMetrics &neu) {
 	if (!b.ipc_ready || b.chrome_client_id == 0) return false;
 
 	struct xrt_window_metrics wm = {};
@@ -814,46 +866,22 @@ static bool fetch_per_client_window_metrics(Bridge &b, WindowMetrics &out) {
 	if (wm.window_width_m <= 0.0f || wm.window_height_m <= 0.0f) return false;
 	if (wm.window_pixel_width == 0 || wm.window_pixel_height == 0) return false;
 
-	out.valid = true;
-	out.pixelW = (int)wm.window_pixel_width;
-	out.pixelH = (int)wm.window_pixel_height;
-	out.sizeWm = wm.window_width_m;
-	out.sizeHm = wm.window_height_m;
-	out.centerOffsetXm = wm.window_center_offset_x_m;
-	out.centerOffsetYm = wm.window_center_offset_y_m;
-
-	// Per-view tile dims: mirror compute_and_push_bridge_view_dims' logic
-	// against the per-client pixel size. Atlas stride invariant: we derive
-	// from the slot's actual pixel dims × current mode's viewScale, NOT
-	// sys->view_width (see feedback_atlas_stride_invariant).
-	out.viewWidth = 0;
-	out.viewHeight = 0;
-	if (b.current_mode_index < b.modes.size()) {
-		float sx = b.modes[b.current_mode_index].viewScaleX;
-		float sy = b.modes[b.current_mode_index].viewScaleY;
-		if (sx > 0.0f && sy > 0.0f) {
-			uint32_t vw = (uint32_t)((float)out.pixelW * sx + 0.5f);
-			uint32_t vh = (uint32_t)((float)out.pixelH * sy + 0.5f);
-			out.viewWidth = vw;
-			out.viewHeight = vh;
-		}
-	}
+	neu.valid = true;
+	neu.pixelW = (int)wm.window_pixel_width;
+	neu.pixelH = (int)wm.window_pixel_height;
+	neu.sizeWm = wm.window_width_m;
+	neu.sizeHm = wm.window_height_m;
+	neu.centerOffsetXm = wm.window_center_offset_x_m;
+	neu.centerOffsetYm = wm.window_center_offset_y_m;
+	neu.centerOffsetZm = wm.window_center_offset_z_m;
+	neu.orientX = wm.window_orientation.x;
+	neu.orientY = wm.window_orientation.y;
+	neu.orientZ = wm.window_orientation.z;
+	neu.orientW = wm.window_orientation.w;
 	return true;
 }
 
-// Single source of truth for window metrics the bridge sends to the page.
-// Shell mode (Chrome resolved) → per-client slot metrics from the service.
-// Non-shell (or resolver failed) → the compositor-window-scoped metrics
-// b.window_metrics maintained by poll_window_metrics.
-static WindowMetrics effective_window_metrics(Bridge &b) {
-	WindowMetrics per_client;
-	if (fetch_per_client_window_metrics(b, per_client)) {
-		return per_client;
-	}
-	return b.window_metrics;
-}
-
-static std::string build_display_info_json(const Bridge &b, const WindowMetrics &win) {
+static std::string build_display_info_json(const Bridge &b) {
 	const auto &di = b.display_info;
 	std::string s = "{\"type\":\"display-info\",\"version\":1";
 	s += ",\"displayPixelSize\":[" + json_u(di.displayPixelWidth) + "," + json_u(di.displayPixelHeight) + "]";
@@ -894,7 +922,7 @@ static std::string build_display_info_json(const Bridge &b, const WindowMetrics 
 	s += (b.eye_tracking_caps.defaultMode == XR_EYE_TRACKING_MODE_MANUAL_EXT) ? "MANUAL" : "MANAGED";
 	s += "\"}";
 
-	s += build_window_info_fields(win);
+	s += build_window_info_fields(b.window_metrics);
 	s += "}";
 	return s;
 }
@@ -1146,8 +1174,7 @@ static void handle_ws_message(Bridge &b, const std::string &msg) {
 		// (bridge-attach is where resolution happens); display-info will be
 		// re-emitted after bridge-attach with per-client values.
 		poll_window_metrics(b);
-		WindowMetrics eff = effective_window_metrics(b);
-		b.outgoing.push(build_display_info_json(b, eff));
+		b.outgoing.push(build_display_info_json(b));
 	} else if (type == "request-mode") {
 		int idx = find_int("modeIndex");
 		if (idx < 0 || (uint32_t)idx >= b.modes.size()) {
@@ -1207,16 +1234,22 @@ static void handle_ws_message(Bridge &b, const std::string &msg) {
 		if (resolved != 0) {
 			b.chrome_client_id = resolved;
 			LOG_I("bridge: resolved Chrome client_id=%u", (unsigned)resolved);
+			// Re-run the poll now, with chrome_client_id set, so the
+			// per-client override updates b.window_metrics AND pushes
+			// slot-sized DXR_BridgeViewW/H to the compositor BEFORE the
+			// display-info re-emit. Without this sync, the first frame
+			// after bridge-attach lands with the page rendering at
+			// slot-sized tiles while the compositor still crops at
+			// fullscreen-sized tiles — most of the slot stays blank.
+			poll_window_metrics(b);
 			// Re-emit display-info with per-client window scoping. The
-			// initial display-info sent on `hello` used either the global
-			// compositor-window metrics (non-shell fallback) or stale
-			// cached values (shell). This replacement carries the
-			// shell-window-scoped values the page needs for correct
-			// Kooima projection. main-world.js treats every `display-info`
-			// message as authoritative, so the update propagates without
-			// extension-side changes.
-			WindowMetrics eff = effective_window_metrics(b);
-			b.outgoing.push(build_display_info_json(b, eff));
+			// initial display-info sent on `hello` carried
+			// compositor-window metrics (pre-resolve fallback). This
+			// replacement carries the shell-window-scoped values the page
+			// needs for correct Kooima projection. main-world.js treats
+			// every `display-info` message as authoritative, so the update
+			// propagates without extension-side changes.
+			b.outgoing.push(build_display_info_json(b));
 		} else if (b.chrome_client_id != 0) {
 			LOG_W("bridge: resolver failed on bridge-attach; keeping cached id=%u",
 			      (unsigned)b.chrome_client_id);
@@ -1722,8 +1755,7 @@ static void handle_event(Bridge &b, const XrEventDataBuffer &evt) {
 			b.outgoing.push(build_mode_changed_json(
 			    e->previousModeIndex, e->currentModeIndex, hw3d, b.config_views));
 			if (win_changed) {
-				WindowMetrics eff = effective_window_metrics(b);
-				b.outgoing.push(build_window_info_json(eff));
+				b.outgoing.push(build_window_info_json(b.window_metrics));
 			}
 		}
 	} break;
@@ -1834,14 +1866,20 @@ static void run_event_loop(Bridge &b) {
 			// Poll for compositor window. Before the window is found, poll
 			// every frame so the sample gets window info ASAP (the sample
 			// needs windowPixelSize × viewScale to render at correct tile
-			// dims). After the window is found, fall back to ~500 ms.
-			if (!b.window_metrics.valid || ++window_poll_counter >= 50) {
+			// dims). After it's found, throttle — but keep the cadence
+			// fast enough that shell-slot drags (which don't fire the
+			// WinEvent hook on the fullscreen compositor HWND) show live
+			// in the page. In shell mode with a resolved Chrome client,
+			// the per-client IPC query gives us authoritative pose updates;
+			// poll ~every 60 ms (sleep-10 × 6) so drag feels smooth. Outside
+			// shell, fall back to the original ~500 ms cadence.
+			int poll_threshold = (b.chrome_client_id != 0) ? 6 : 50;
+			if (!b.window_metrics.valid || ++window_poll_counter >= poll_threshold) {
 				window_poll_counter = 0;
 				window_changed = poll_window_metrics(b) || window_changed;
 			}
 			if (window_changed && b.ws_client_connected.load()) {
-				WindowMetrics eff = effective_window_metrics(b);
-				b.outgoing.push(build_window_info_json(eff));
+				b.outgoing.push(build_window_info_json(b.window_metrics));
 			}
 
 			// Drain queued input events from the hook thread.
