@@ -828,6 +828,29 @@ ipc_server_get_client_app_state(struct ipc_server *s, uint32_t client_id, struct
 }
 
 xrt_result_t
+ipc_server_get_client_xc(struct ipc_server *s, uint32_t client_id, struct xrt_compositor **out_xc)
+{
+	*out_xc = NULL;
+
+	os_mutex_lock(&s->global_state.lock);
+
+	volatile struct ipc_client_state *ics = find_client_locked(s, client_id);
+	if (ics == NULL) {
+		os_mutex_unlock(&s->global_state.lock);
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	// Snapshot the pointer under the lock; caller uses it immediately.
+	// A volatile pointer-to-non-volatile cast is fine here — the pointer
+	// itself is stable for the duration of the handler's work.
+	*out_xc = (struct xrt_compositor *)ics->xc;
+
+	os_mutex_unlock(&s->global_state.lock);
+
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
 ipc_server_set_active_client(struct ipc_server *s, uint32_t client_id)
 {
 	os_mutex_lock(&s->global_state.lock);

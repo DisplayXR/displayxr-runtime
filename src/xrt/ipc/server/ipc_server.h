@@ -438,6 +438,22 @@ xrt_result_t
 ipc_server_get_client_app_state(struct ipc_server *s, uint32_t client_id, struct ipc_app_state *out_ias);
 
 /*!
+ * Look up a client's xrt_compositor by client_id.
+ *
+ * Used by handlers that need to query per-client compositor state for an
+ * arbitrary (non-calling) client — e.g. system_get_client_window_metrics,
+ * which the WebXR bridge calls with the target Chrome client's id.
+ *
+ * Returns XRT_SUCCESS with *out_xc == NULL if the client exists but has
+ * no session/compositor (e.g. a headless relay client).
+ * Returns XRT_ERROR_IPC_FAILURE if client_id does not resolve.
+ *
+ * @ingroup ipc_server
+ */
+xrt_result_t
+ipc_server_get_client_xc(struct ipc_server *s, uint32_t client_id, struct xrt_compositor **out_xc);
+
+/*!
  * Set the new active client.
  *
  * @ingroup ipc_server
