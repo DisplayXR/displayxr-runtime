@@ -493,8 +493,46 @@ function onXRFrame(time, frame) {
                              : (di && di.displaySizeMeters ? di.displaySizeMeters[0] : 0.344);
   const screenHm = useWindow ? wi.windowSizeMeters[1]
                              : (di && di.displaySizeMeters ? di.displaySizeMeters[1] : 0.194);
+  // Full 3D window-center offset + orientation. Pre-Stage-3 bridges only
+  // emitted [x, y]; guard against that by reading the 3rd entry lazily.
   const winOffX = useWindow ? wi.windowCenterOffsetMeters[0] : 0;
   const winOffY = useWindow ? wi.windowCenterOffsetMeters[1] : 0;
+  const winOffZ = (useWindow && wi.windowCenterOffsetMeters.length >= 3)
+    ? wi.windowCenterOffsetMeters[2] : 0;
+  // Window orientation quaternion in display space. Identity = flat on
+  // the display surface; non-identity = tilted slot. We apply its inverse
+  // to (eye - windowCenter) to express the eye in window-local frame,
+  // matching oxr_session.c:1331-1341 for legacy WebXR and the handle-app
+  // display3d_compute_views contract.
+  const winOrient = (useWindow && Array.isArray(wi.windowOrientation) && wi.windowOrientation.length === 4)
+    ? wi.windowOrientation : null;
+  const winHasRot = !!winOrient && (
+    Math.abs(winOrient[0]) > 1e-4 ||
+    Math.abs(winOrient[1]) > 1e-4 ||
+    Math.abs(winOrient[2]) > 1e-4 ||
+    Math.abs(winOrient[3] - 1.0) > 1e-4);
+  // Pre-compute inverse orientation (conjugate for unit quaternion).
+  const winInvX = winHasRot ? -winOrient[0] : 0;
+  const winInvY = winHasRot ? -winOrient[1] : 0;
+  const winInvZ = winHasRot ? -winOrient[2] : 0;
+  const winInvW = winHasRot ?  winOrient[3] : 1;
+  // Apply inverse unit quaternion to a 3D vector: v' = q⁻¹ * v * q.
+  // Uses the optimized form: v' = v + 2q.xyz × (q.xyz × v + q.w × v).
+  // Inline for perf (runs per-eye per-frame).
+  function rotateByInvWinQuat(x, y, z) {
+    if (!winHasRot) return [x, y, z];
+    const qx = winInvX, qy = winInvY, qz = winInvZ, qw = winInvW;
+    // t = 2 * cross(q.xyz, v)
+    const tx = 2 * (qy * z - qz * y);
+    const ty = 2 * (qz * x - qx * z);
+    const tz = 2 * (qx * y - qy * x);
+    // v' = v + qw * t + cross(q.xyz, t)
+    return [
+      x + qw * tx + (qy * tz - qz * ty),
+      y + qw * ty + (qz * tx - qx * tz),
+      z + qw * tz + (qx * ty - qy * tx),
+    ];
+  }
   // m2v = virtualDisplayHeight / physicalScreenHeight (window or display).
   // m2v uses the LIVE rig vHeight (wheel-adjustable), not the const.
   const m2v = (screenHm > 0) ? (rig.vHeight / screenHm) : 1.0;
@@ -577,8 +615,15 @@ function onXRFrame(time, frame) {
     renderer.setScissor(vpX, vpY, tileW, tileH);
     renderer.setScissorTest(true);
 
-    // Eye position in display-centric frame, with IPD/parallax tunables.
-    // Then subtract window center offset so eye XY is window-relative.
+    // Eye position in window-local frame, with IPD/parallax tunables.
+    // Full transform matches oxr_session.c:1331-1341 (legacy WebXR) and
+    // display3d_compute_views (handle apps):
+    //   delta   = eye_display - window_center_display
+    //   eye_win = inv(window_orientation) * delta
+    // When the slot is flat on the display, inv-rotate is a no-op and this
+    // reduces to the pre-Stage-3 subtraction. When the slot is tilted or
+    // pushed forward/back in Z, this is the correct window-local position
+    // for Kooima.
     let eyePos;
     if (eyePoses && eyePoses.length > 0) {
       const idx = tileLayout.monoMode ? 0 : Math.min(eye, eyePoses.length - 1);
@@ -587,15 +632,17 @@ function onXRFrame(time, frame) {
       const offX = (p[0] - headMid[0]) * rig.ipdFactor;
       const offY = (p[1] - headMid[1]) * rig.ipdFactor;
       const offZ = (p[2] - headMid[2]) * rig.ipdFactor;
-      eyePos = [
-        trackedMid[0] + offX - winOffX,
-        trackedMid[1] + offY - winOffY,
-        trackedMid[2] + offZ,
-      ];
+      const deltaX = trackedMid[0] + offX - winOffX;
+      const deltaY = trackedMid[1] + offY - winOffY;
+      const deltaZ = trackedMid[2] + offZ - winOffZ;
+      eyePos = rotateByInvWinQuat(deltaX, deltaY, deltaZ);
     } else {
       const ipdHalf = tileLayout.monoMode ? 0
         : (eye === 0 ? -0.0315 : 0.0315) * rig.ipdFactor;
-      eyePos = [nominalPos[0] + ipdHalf - winOffX, nominalPos[1] - winOffY, nominalPos[2]];
+      const deltaX = nominalPos[0] + ipdHalf - winOffX;
+      const deltaY = nominalPos[1] - winOffY;
+      const deltaZ = nominalPos[2] - winOffZ;
+      eyePos = rotateByInvWinQuat(deltaX, deltaY, deltaZ);
     }
 
     if (rig.cameraMode) {
