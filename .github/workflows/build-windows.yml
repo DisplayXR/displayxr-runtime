@@ -5,7 +5,14 @@ on:
     branches:
       - '**-ci'
     tags:
+      # Full-stack release.
       - 'v*'
+      # Per-component releases (see docs/roadmap/demo-distribution.md).
+      # Runtime + shell cycle: runtime/vX.Y.Z.
+      - 'runtime/v*'
+      # Per-demo cycle: demo-<name>/vX.Y.Z. Add patterns here as new
+      # demo repos are split off per docs/guides/add-new-demo-repo.md.
+      - 'demo-gaussiansplat/v*'
   pull_request:
 
 permissions:

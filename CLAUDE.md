@@ -144,24 +144,29 @@ scripts/format-project.sh   # Format all
 
 ### Publishing to Public Repos (Automated)
 
-On tagged releases (`v*`), the `publish-public.yml` workflow automatically:
-1. Pushes runtime code (with shell stripped) to `DisplayXR/displayxr-runtime` (public)
-2. Publishes combined installer + shell binary to `DisplayXR/displayxr-shell-releases`
-3. Creates GitHub Releases on both public repos
+Per-component tag scheme — each public repo versions independently. Tag pvt with:
+
+| Tag | Fires | When |
+|---|---|---|
+| `vX.Y.Z` | every `publish-*` workflow | synchronised full-stack release (default, back-compat) |
+| `runtime/vX.Y.Z` | `publish-public.yml` only | runtime or shell changed; demos unaffected |
+| `demo-<name>/vX.Y.Z` | `publish-demo-<name>.yml` only | one demo changed; runtime + other demos unaffected |
+
+Prefix is stripped when setting the public-repo tag: `runtime/v1.2.0` → `v1.2.0` on `displayxr-runtime` + `displayxr-shell-releases`. Each demo's `README.md` states its minimum compatible runtime version ("Requires DisplayXR runtime ≥ vX.Y.Z"). Details: `docs/roadmap/demo-distribution.md`.
 
 ```bash
-# Preferred: use the /release skill (handles version bump, tagging, monitoring, verification)
-/release v1.0.0          # explicit version
-/release patch           # auto-bump patch
+# Preferred: /release skill for full-stack tags (version bump, tagging, monitoring, verification)
+/release v1.0.0          # explicit vX.Y.Z → fires every publish workflow
+/release patch           # auto-bump patch from latest vX.Y.Z
 
-# Manual alternative:
-git tag v1.x.x
-git push origin v1.x.x    # triggers CI + auto-publish to public repos
+# Per-component releases (manual for now — /release skill doesn't yet grok prefixes):
+git tag runtime/v1.2.0 && git push origin runtime/v1.2.0
+git tag demo-gaussiansplat/v1.1.0 && git push origin demo-gaussiansplat/v1.1.0
 ```
 
 Extension headers auto-publish to `DisplayXR/displayxr-extensions` via `publish-extensions.yml` on every push to main.
 
-Demos publish **one repo per demo** on each `v*` tag — see `docs/roadmap/demo-distribution.md` and `docs/guides/add-new-demo-repo.md`. Each demo gets its own `publish-demo-<name>.yml` workflow that syncs source + attaches a binary Release zip. Currently the only per-demo repo is `DisplayXR/displayxr-demo-gaussiansplat`; `demos/spatial_os_handle_d3d11_win/` stays in this repo as a reference implementation (superseded by the Shell feature) and does not publish.
+Demos publish **one repo per demo** — `DisplayXR/displayxr-demo-<name>`. Each has its own `publish-demo-<name>.yml` workflow that syncs source + attaches a binary Release zip. Currently: `DisplayXR/displayxr-demo-gaussiansplat`. `demos/spatial_os_handle_d3d11_win/` stays in this repo as a reference implementation (superseded by the Shell feature) and does not publish.
 
 ### Repository Structure
 

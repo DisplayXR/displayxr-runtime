@@ -24,7 +24,7 @@ For every `CMakeLists.txt` in the demo and any shared lib it vendors (`3dgs_comm
 Also create:
 
 - `demos/<your_demo>/CMakeLists.top.txt` — the top-level orchestrator. Uses `add_subdirectory(common)` + `add_subdirectory(3dgs_common)` then platform-specific `add_subdirectory(macos|windows)`.
-- `demos/<your_demo>/README.standalone.md` — becomes the public repo's `README.md`. Must cover download, controls, build, and layout.
+- `demos/<your_demo>/README.standalone.md` — becomes the public repo's `README.md`. Must cover download, controls, build, and layout. **Include a "Requires the DisplayXR runtime ≥ vX.Y.Z" callout near the top** — this is the contract users rely on to pair versions across repos. Update it whenever the demo starts needing newer runtime behaviour.
 
 See `demos/gaussian_splatting_handle_vk_macos/` for reference files.
 
@@ -54,10 +54,13 @@ Clone it, add a placeholder `README.md`, push to `main`. This gives the publish 
 
 Copy `.github/workflows/publish-demo-gaussiansplat.yml` to `.github/workflows/publish-demo-<name>.yml` and adjust:
 
+- Trigger tag pattern: `'demo-<name>/v*'` (alongside the back-compat `'v*'`)
 - `PROJECT_NAME` references → your demo's exe name
 - Downloaded CI artifact name → whatever `build-windows.yml` calls your demo's artifact
 - Zip filename → your demo's conventional naming
 - Release title
+
+Also extend `.github/workflows/build-windows.yml`'s `on: push: tags:` list to include `'demo-<name>/v*'` so build-windows runs on demo-only tags and produces the demo's artifact.
 
 Trigger a manual dry-run:
 

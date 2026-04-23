@@ -2,10 +2,20 @@ name: Publish to Public Repos
 
 # On tagged releases: push runtime (sans shell) to displayxr-runtime (public),
 # and publish combined installer + shell binary to displayxr-shell-releases.
+#
+# Tag scheme (see docs/roadmap/demo-distribution.md):
+#   vX.Y.Z            — full-stack release (back-compat): every publish-*
+#                       workflow fires; every public repo gets a tag.
+#   runtime/vX.Y.Z    — runtime + shell only; demos unaffected.
+#
+# The trailing `vX.Y.Z` after the slash is the version that appears on the
+# public repos. Env VERSION strips any prefix once per job.
 
 on:
   push:
-    tags: ['v*']
+    tags:
+      - 'v*'
+      - 'runtime/v*'
 
 permissions:
   contents: read
@@ -17,6 +27,14 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Resolve public release version
+        run: |
+          # Strip any prefix (e.g. 'runtime/v1.2.0' -> 'v1.2.0'). Back-compat
+          # with plain 'vX.Y.Z' tags, which have no slash to strip.
+          V="${GITHUB_REF_NAME##*/}"
+          echo "VERSION=$V" >> "$GITHUB_ENV"
+          echo "Public release tag: $V (from ref_name=$GITHUB_REF_NAME)"
+
       - name: Checkout tagged commit
         uses: actions/checkout@v4
         with:
@@ -45,17 +63,17 @@ jobs:
 
           # Stage the deletion
           git add -A
-          git commit -m "Release ${{ github.ref_name }} (shell code excluded)" --allow-empty
+          git commit -m "Release ${{ env.VERSION }} (shell code excluded)" --allow-empty
 
           # Push to public repo (persist-credentials: false prevents GITHUB_TOKEN override)
           git remote add public "https://x-access-token:${DISPLAYXR_TOKEN}@github.com/DisplayXR/displayxr-runtime.git"
           git push public HEAD:main --force
 
           # Push the tag
-          git tag -f "${{ github.ref_name }}"
-          git push public "${{ github.ref_name }}" --force
+          git tag -f "${{ env.VERSION }}"
+          git push public "${{ env.VERSION }}" --force
 
-          echo "Published ${{ github.ref_name }} to DisplayXR/displayxr-runtime"
+          echo "Published ${{ env.VERSION }} to DisplayXR/displayxr-runtime"
 
       - name: Create GitHub Release on public runtime repo
         env:
@@ -64,24 +82,24 @@ jobs:
           # Generate release notes from commits since last tag
           PREV_TAG=$(git tag --sort=-v:refname | grep '^v' | sed -n '2p')
           if [ -n "$PREV_TAG" ]; then
-            NOTES=$(git log --oneline "$PREV_TAG".."${{ github.ref_name }}" --no-merges | head -50)
+            NOTES=$(git log --oneline "$PREV_TAG".."${{ env.VERSION }}" --no-merges | head -50)
           else
             NOTES="Initial release"
           fi
 
           # Delete existing release if re-running
-          gh release delete "${{ github.ref_name }}" --repo DisplayXR/displayxr-runtime --yes 2>/dev/null || true
+          gh release delete "${{ env.VERSION }}" --repo DisplayXR/displayxr-runtime --yes 2>/dev/null || true
 
-          gh release create "${{ github.ref_name }}" \
+          gh release create "${{ env.VERSION }}" \
             --repo DisplayXR/displayxr-runtime \
-            --title "DisplayXR Runtime ${{ github.ref_name }}" \
+            --title "DisplayXR Runtime ${{ env.VERSION }}" \
             --notes "## What's New
 
           $NOTES
 
           ## Installation
 
-          Download the installer from [DisplayXR Shell Releases](https://github.com/DisplayXR/displayxr-shell-releases/releases/tag/${{ github.ref_name }}) or build from source.
+          Download the installer from [DisplayXR Shell Releases](https://github.com/DisplayXR/displayxr-shell-releases/releases/tag/${{ env.VERSION }}) or build from source.
 
           ## License
 
@@ -95,12 +113,18 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Resolve public release version
+        run: |
+          V="${GITHUB_REF_NAME##*/}"
+          echo "VERSION=$V" >> "$GITHUB_ENV"
+          echo "Public release tag: $V (from ref_name=$GITHUB_REF_NAME)"
+
       - name: Wait for Windows CI build to complete
         id: wait-build
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          echo "Waiting for Build Windows workflow to complete for tag ${{ github.ref_name }}..."
+          echo "Waiting for Build Windows workflow to complete for tag ${{ env.VERSION }}..."
           RUN_ID=""
           for i in $(seq 1 60); do
             # Find successful build-windows run for this commit
@@ -170,11 +194,11 @@ jobs:
           fi
 
           # Delete existing release if re-running
-          gh release delete "${{ github.ref_name }}" --repo DisplayXR/displayxr-shell-releases --yes 2>/dev/null || true
+          gh release delete "${{ env.VERSION }}" --repo DisplayXR/displayxr-shell-releases --yes 2>/dev/null || true
 
-          gh release create "${{ github.ref_name }}" \
+          gh release create "${{ env.VERSION }}" \
             --repo DisplayXR/displayxr-shell-releases \
-            --title "DisplayXR ${{ github.ref_name }}" \
+            --title "DisplayXR ${{ env.VERSION }}" \
             --notes "## Downloads
 
           | File | Description |
@@ -189,9 +213,9 @@ jobs:
 
           ## Links
 
-          - [Runtime source & docs](https://github.com/DisplayXR/displayxr-runtime/releases/tag/${{ github.ref_name }})
+          - [Runtime source & docs](https://github.com/DisplayXR/displayxr-runtime/releases/tag/${{ env.VERSION }})
           - [Full documentation](https://github.com/DisplayXR/displayxr-runtime)" \
             --latest \
             $ASSETS
 
-          echo "Published ${{ github.ref_name }} to DisplayXR/displayxr-shell-releases"
+          echo "Published ${{ env.VERSION }} to DisplayXR/displayxr-shell-releases"

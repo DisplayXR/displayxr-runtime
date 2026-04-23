@@ -1,9 +1,18 @@
 name: Publish demo — gaussiansplat
 
+# Tag scheme (see docs/roadmap/demo-distribution.md):
+#   vX.Y.Z                      — full-stack release (back-compat): this
+#                                 workflow fires alongside publish-public.yml.
+#                                 Demo repo gets tagged `vX.Y.Z`.
+#   demo-gaussiansplat/vX.Y.Z   — demo-only release; runtime + shell
+#                                 unaffected. Demo repo gets tagged `vX.Y.Z`
+#                                 (prefix stripped).
+
 on:
   push:
     tags:
       - 'v*'
+      - 'demo-gaussiansplat/v*'
   workflow_dispatch:
     inputs:
       ref_name:
@@ -11,10 +20,10 @@ on:
         required: true
         default: 'v0.0.0-demo-test'
 
-# Source-synced to DisplayXR/displayxr-demo-gaussiansplat on every v* tag,
-# binaries attached to a GitHub Release once build-windows.yml finishes.
+# Source-synced to DisplayXR/displayxr-demo-gaussiansplat on every matching
+# tag; binaries attached to a GitHub Release once build-windows.yml finishes.
 # Replaces the monolithic .github/workflows/publish-demos.yml (one repo per
-# demo). See docs/roadmap/demo-distribution.md for rationale.
+# demo).
 
 concurrency:
   group: publish-demo-gaussiansplat-${{ github.ref }}
@@ -48,11 +57,16 @@ jobs:
       - name: Resolve tag name
         id: resolve-tag
         run: |
+          # Strip any component prefix (e.g. 'demo-gaussiansplat/v1.0.0' →
+          # 'v1.0.0'). Plain 'vX.Y.Z' tags have no slash and are unchanged.
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "tag=${{ github.event.inputs.ref_name }}" >> "$GITHUB_OUTPUT"
+            RAW="${{ github.event.inputs.ref_name }}"
           else
-            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+            RAW="$GITHUB_REF_NAME"
           fi
+          TAG="${RAW##*/}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Public demo release tag: $TAG (from ref_name=$RAW)"
 
       - name: Checkout public demo repo
         env:

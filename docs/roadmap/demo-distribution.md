@@ -50,13 +50,38 @@ displayxr-demo-gaussiansplat/
 
 ## CI workflows involved
 
-| Workflow | Runs on | Purpose |
+| Workflow | Trigger tags | Purpose |
 |---|---|---|
-| `publish-demo-<name>.yml` | `v*` tag on pvt | Sync source → demo repo + attach Release zip |
-| `build-windows.yml` | `v*` tag, PRs, `*-ci` branches | Produces `GaussianSplattingVK` artifact that the publish workflow attaches |
-| `build-macos.yml` | currently disabled | Will produce the macOS binary artifact when re-enabled |
+| `publish-public.yml` | `v*`, `runtime/v*` | Release runtime + shell to their public repos |
+| `publish-demo-<name>.yml` | `v*`, `demo-<name>/v*` | Sync demo source + attach binary Release zip |
+| `build-windows.yml` | `v*`, `runtime/v*`, `demo-<name>/v*`, PRs, `*-ci` branches | Produces `DisplayXR`, `DisplayXR-Installer`, and per-demo artifacts |
+| `build-macos.yml` | currently disabled | Will produce macOS binary artifacts when re-enabled |
 
 The `sync-source` job runs in parallel with `build-windows.yml`; `publish-binaries` waits on the Windows build and attaches the artifact to the release the tag already created.
+
+## Tag scheme — per-component release cadences
+
+Each public repo versions independently. Tag pvt with one of:
+
+| Tag pattern | Fires | Use when |
+|---|---|---|
+| `vX.Y.Z` | **every** `publish-*` workflow | Synchronised full-stack release. Back-compat with pre-split tags; fine as a default. |
+| `runtime/vX.Y.Z` | `publish-public.yml` only | Runtime or shell source changed; demos unaffected. |
+| `demo-<name>/vX.Y.Z` | `publish-demo-<name>.yml` only | Only that demo changed; runtime + shell + other demos unaffected. |
+
+**The public repo tag is derived by stripping any prefix**: `runtime/v1.2.0` → `v1.2.0` on the runtime + shell public repos; `demo-gaussiansplat/v1.0.0` → `v1.0.0` on the demo repo. Each public repo sees a clean semver lineage regardless of how many fix-forward cycles the pvt side went through.
+
+### Why not one `vX.Y.Z` for everything?
+
+Before the per-component tag scheme existed, every CI-only fix-forward (e.g. a workflow YAML typo) dragged all public repos through a meaningless release bump — users saw a v1.1.0 → v1.1.1 → v1.1.2 chain where v1.1.1/v1.1.2 had source-identical runtime+shell to v1.1.0. [#170](https://github.com/DisplayXR/displayxr-runtime-pvt/issues/170) tracked the cleanup. With per-component tags, a runtime-only fix becomes `runtime/v1.1.1` → v1.1.1 on the runtime repo only; the demo repo stays at whatever version it was.
+
+### Runtime-compatibility covenant
+
+Each demo repo's `README.md` states the minimum compatible runtime version, for example:
+
+> **Requires the DisplayXR runtime v1.1.0 or newer.** Install from [`displayxr-shell-releases`](https://github.com/DisplayXR/displayxr-shell-releases/releases).
+
+Update that line in `demos/<your_demo>/README.standalone.md` whenever the demo starts relying on new runtime behaviour. Users coordinate versions by reading the README, not by matching tags — same pattern Unity packages and npm libraries use. Keeps releases decoupled without fragmenting the UX.
 
 ## Adding a new demo
 

@@ -2,6 +2,8 @@
 
 Real-time 3D Gaussian Splatting viewer for glasses-free 3D displays, built on the DisplayXR runtime via OpenXR with Vulkan. Loads `.spz` and `.ply` files, renders with asymmetric per-eye Kooima projection for the full stereo/multiview experience.
 
+> **Requires the DisplayXR runtime v1.1.0 or newer.** Install from [`displayxr-shell-releases`](https://github.com/DisplayXR/displayxr-shell-releases/releases). Older runtimes lack the `XR_EXT_display_info` v12 fields (rendering-mode tile layout + rendering-mode-changed events) that this demo queries.
+>
 > Auto-synced from [`DisplayXR/displayxr-runtime-pvt`](https://github.com/DisplayXR/displayxr-runtime-pvt) on every tagged release. Do not edit directly — open issues on the source repo.
 
 ## Download
