@@ -1057,6 +1057,10 @@ jobs:
           path: TestApps
 
       - name: Delete individual test app artifacts
+        # Keep GaussianSplattingVK alive — publish-demo-gaussiansplat.yml
+        # downloads it by name to attach to the per-demo GitHub Release on
+        # DisplayXR/displayxr-demo-gaussiansplat. Same goes for any future
+        # per-demo workflow that needs its own demo's artifact.
         uses: geekyeggo/delete-artifact@v5
         with:
           failOnError: false
@@ -1074,7 +1078,6 @@ jobs:
             CubeHostedLegacyGL
             CubeIpcLegacyD3D11
             CubeIpcD3D11
-            GaussianSplattingVK
             SpatialOS
 
       - name: Install rclone
