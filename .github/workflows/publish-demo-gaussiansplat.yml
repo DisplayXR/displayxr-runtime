@@ -1,0 +1,137 @@
+name: Publish demo — gaussiansplat
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      ref_name:
+        description: 'Tag name to sync (e.g. v0.0.0-demo-test). Used for branch/tag on the public repo when running manually.'
+        required: true
+        default: 'v0.0.0-demo-test'
+
+# Source-synced to DisplayXR/displayxr-demo-gaussiansplat on every v* tag,
+# binaries attached to a GitHub Release once build-windows.yml finishes.
+# Replaces the monolithic .github/workflows/publish-demos.yml (one repo per
+# demo). See docs/roadmap/demo-distribution.md for rationale.
+
+concurrency:
+  group: publish-demo-gaussiansplat-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  sync-source:
+    if: github.repository == 'DisplayXR/displayxr-runtime-pvt'
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve-tag.outputs.tag }}
+
+    steps:
+      - name: Checkout source (displayxr-runtime-pvt)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Resolve tag name
+        id: resolve-tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.ref_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout public demo repo
+        env:
+          GH_TOKEN: ${{ secrets.DISPLAYXR_TOKEN }}
+        run: |
+          git clone --depth 1 \
+            "https://x-access-token:${GH_TOKEN}@github.com/DisplayXR/displayxr-demo-gaussiansplat.git" \
+            demo-repo
+
+      - name: Package standalone tree
+        run: |
+          ./scripts/publish-demo.sh gaussiansplat demo-repo
+
+      - name: Commit, tag, push
+        env:
+          GH_TOKEN: ${{ secrets.DISPLAYXR_TOKEN }}
+        run: |
+          cd demo-repo
+          git config user.name  "DisplayXR Bot"
+          git config user.email "noreply@displayxr.org"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No source changes to commit."
+          else
+            git commit -m "Sync from displayxr-runtime-pvt ${{ steps.resolve-tag.outputs.tag }}"
+            git push origin HEAD:main
+          fi
+          # Always (re)tag so the release job below can attach binaries.
+          git tag -f "${{ steps.resolve-tag.outputs.tag }}"
+          git push -f origin "${{ steps.resolve-tag.outputs.tag }}"
+
+  publish-binaries:
+    # Only on tag pushes: build-windows.yml fires on tag / PR / *-ci branches,
+    # not on workflow_dispatch, so a dispatch-based dry-run has nothing to
+    # wait on. Dry-runs exercise sync-source only.
+    if: github.repository == 'DisplayXR/displayxr-runtime-pvt' && github.event_name == 'push'
+    needs: sync-source
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Wait for Build Windows to complete
+        id: wait-build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "Waiting for build-windows.yml to finish for commit ${{ github.sha }}..."
+          RUN_ID=""
+          for i in $(seq 1 60); do
+            RUN_ID=$(gh run list --repo ${{ github.repository }} --workflow build-windows.yml \
+              --limit 10 --json databaseId,conclusion,headSha \
+              --jq "[.[] | select(.headSha == \"${{ github.sha }}\" and .conclusion == \"success\") | .databaseId] | first // empty" 2>/dev/null)
+            if [ -n "$RUN_ID" ]; then
+              echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+              break
+            fi
+            echo "  attempt $i/60 — sleeping 30s..."
+            sleep 30
+          done
+          if [ -z "$RUN_ID" ]; then
+            echo "::error::build-windows.yml did not finish within 30 minutes"
+            exit 1
+          fi
+
+      - name: Download GaussianSplattingVK artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run download "${{ steps.wait-build.outputs.run_id }}" \
+            --repo ${{ github.repository }} \
+            --name GaussianSplattingVK \
+            --dir artifact-win
+          echo "Windows artifact contents:"
+          ls -la artifact-win/
+
+      - name: Zip Windows binary + DLLs
+        id: zip
+        run: |
+          TAG="${{ needs.sync-source.outputs.tag }}"
+          ZIPNAME="gaussian_splatting_handle_vk_win-${TAG}.zip"
+          (cd artifact-win && zip -r "../${ZIPNAME}" .)
+          echo "zip=${ZIPNAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release on displayxr-demo-gaussiansplat
+        env:
+          GH_TOKEN: ${{ secrets.DISPLAYXR_TOKEN }}
+        run: |
+          TAG="${{ needs.sync-source.outputs.tag }}"
+          gh release delete "$TAG" --repo DisplayXR/displayxr-demo-gaussiansplat --yes 2>/dev/null || true
+          gh release create "$TAG" \
+            --repo DisplayXR/displayxr-demo-gaussiansplat \
+            --title "DisplayXR Demo — Gaussian Splatting ${TAG}" \
+            --generate-notes \
+            "${{ steps.zip.outputs.zip }}"
+          echo "Release created: https://github.com/DisplayXR/displayxr-demo-gaussiansplat/releases/tag/${TAG}"
