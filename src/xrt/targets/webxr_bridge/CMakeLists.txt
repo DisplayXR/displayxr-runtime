@@ -40,15 +40,16 @@ target_include_directories(displayxr-webxr-bridge PRIVATE
 
 target_link_libraries(displayxr-webxr-bridge PRIVATE
 	OpenXR::openxr_loader
+	aux_util
+	ipc_client
+	ipc_shared
 	ws2_32
 )
 
-# Use static CRT for a self-contained exe, matching the other win32 targets.
-if(MSVC)
-	set_property(TARGET displayxr-webxr-bridge PROPERTY
-		MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
-	)
-endif()
+# Default (dynamic) CRT matches the in-tree libs we now link against
+# (aux_util, ipc_client, ipc_shared). Switching to /MT here would LNK2038
+# against those libraries' /MD runtime. Matches the shell's convention
+# — displayxr-shell also uses /MD and links the same libs.
 
 install(TARGETS displayxr-webxr-bridge RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
