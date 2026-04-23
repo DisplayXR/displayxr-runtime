@@ -20,7 +20,9 @@ Creates a tagged release of DisplayXR, monitors the CI build and publish pipelin
   ├─ Monitor publish-public.yml
   │    ├─ displayxr-runtime: tag + release (no shell)
   │    └─ displayxr-shell-releases: tag + release (installer + shell exe)
-  ├─ Monitor publish-extensions.yml + publish-demos.yml
+  ├─ Monitor publish-extensions.yml
+  ├─ Monitor publish-demo-*.yml (one per demo repo)
+  │    └─ displayxr-demo-gaussiansplat: tag + release (gaussian_splatting_handle_vk_win.zip)
   ├─ Update release notes on public repos
   └─ Report
 ```
@@ -49,8 +51,9 @@ Execute the DisplayXR release workflow for version [VERSION].
 ## Configuration
 - Private repo: DisplayXR/displayxr-runtime-pvt
 - Public repos: DisplayXR/displayxr-runtime, DisplayXR/displayxr-shell-releases
-- Extension repos: DisplayXR/displayxr-extensions, DisplayXR/displayxr-demos
-- Workflows: build-windows.yml, publish-public.yml, publish-extensions.yml, publish-demos.yml
+- Extension repo: DisplayXR/displayxr-extensions
+- Per-demo repos: DisplayXR/displayxr-demo-gaussiansplat (add more as demos are split per docs/guides/add-new-demo-repo.md)
+- Workflows: build-windows.yml, publish-public.yml, publish-extensions.yml, publish-demo-gaussiansplat.yml (and any other publish-demo-*.yml)
 
 ---
 
@@ -152,6 +155,16 @@ gh release view [VERSION] --repo DisplayXR/displayxr-shell-releases --json tagNa
 ```
 - Verify tag exists, release created, installer and shell exe are attached
 
+### Step 5.2b: Verify per-demo repos
+For each `publish-demo-*.yml` workflow under `.github/workflows/`, check that the
+corresponding `DisplayXR/displayxr-demo-<name>` repo has a release for this version
+with its binary zip attached. Today that means:
+```bash
+gh release view [VERSION] --repo DisplayXR/displayxr-demo-gaussiansplat --json tagName,name,assets
+```
+- Verify tag exists, source was synced to `main`, and `gaussian_splatting_handle_vk_win-[VERSION].zip` is attached.
+- As more demos are split off per `docs/guides/add-new-demo-repo.md`, extend this step to cover each.
+
 ### Step 5.3: Generate release notes
 ```bash
 git log PREV_TAG..[VERSION] --oneline --no-merges
@@ -171,6 +184,7 @@ Build:
 Published to:
   - Runtime: https://github.com/DisplayXR/displayxr-runtime/releases/tag/[VERSION]
   - Shell + Installer: https://github.com/DisplayXR/displayxr-shell-releases/releases/tag/[VERSION]
+  - Gaussian splat demo: https://github.com/DisplayXR/displayxr-demo-gaussiansplat/releases/tag/[VERSION]
 
 Release notes:
   [generated notes summary]

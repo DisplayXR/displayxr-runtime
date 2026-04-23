@@ -159,7 +159,9 @@ git tag v1.x.x
 git push origin v1.x.x    # triggers CI + auto-publish to public repos
 ```
 
-Extension headers and demos are also auto-published by `publish-extensions.yml` and `publish-demos.yml`.
+Extension headers auto-publish to `DisplayXR/displayxr-extensions` via `publish-extensions.yml` on every push to main.
+
+Demos publish **one repo per demo** on each `v*` tag — see `docs/roadmap/demo-distribution.md` and `docs/guides/add-new-demo-repo.md`. Each demo gets its own `publish-demo-<name>.yml` workflow that syncs source + attaches a binary Release zip. Currently the only per-demo repo is `DisplayXR/displayxr-demo-gaussiansplat`; `demos/spatial_os_handle_d3d11_win/` stays in this repo as a reference implementation (superseded by the Shell feature) and does not publish.
 
 ### Repository Structure
 
@@ -168,6 +170,8 @@ Extension headers and demos are also auto-published by `publish-extensions.yml` 
 | `DisplayXR/displayxr-runtime-pvt` | **Private** (dev) | Runtime + shell source, all dev issues, CI builds. **This repo.** |
 | `DisplayXR/displayxr-runtime` | Public | Public releases — auto-published from `-pvt` on tags, shell code stripped |
 | `DisplayXR/displayxr-shell-releases` | Public | Binary-only shell releases, user-facing bug reports |
+| `DisplayXR/displayxr-extensions` | Public | OpenXR extension headers, auto-synced from `src/external/openxr_includes/` |
+| `DisplayXR/displayxr-demo-<name>` | Public | One repo per standalone demo (source + binary releases). Currently `displayxr-demo-gaussiansplat`. |
 
 Shell code lives in `src/xrt/targets/shell/`. It is developed alongside the runtime in this repo. The shell is proprietary; it is excluded from public releases by the publish workflow.
 
