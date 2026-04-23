@@ -265,3 +265,64 @@ in shell — both should respond to qwerty input independently.
 
 **Not in Stage 2 scope.** Doesn't block 2b/2c. File as its own dev issue on
 `DisplayXR/displayxr-runtime-pvt` after 2c lands.
+
+### Bridge-aware page color shift in shell mode (pre-existing)
+
+Surfaced during 2c regression sweep but **NOT introduced by Stage 2**.
+Reverted d3d11_service.cpp to pre-2b state (`4ab4f98ff`) and the shift
+persists — confirms the issue lives elsewhere in the multi-comp pipeline
+or downstream.
+
+**Symptom.** A bridge-aware sample's deep-navy background color
+(`scene.background = THREE.Color(0x0d0d40)`, ≈ linear 0.05/0.05/0.25)
+displays as a brightened indigo (~0.31/0.30/0.69) when the page is
+hosted in a shell window. Same page in non-shell mode shows the correct
+deep navy. The shift is consistent with **one extra gamma transform**
+somewhere in the shell-mode path: linear data being re-interpreted as
+gamma at one stage, then re-encoded again at display.
+
+**Path difference between modes.**
+- Non-shell (correct): `app SC → per-client atlas (raw copy) → DP weave`
+- Shell (purple):     `app SC → per-client atlas (raw copy) → multi_compositor_render shader-blit → combined atlas → service_crop_atlas_for_dp → DP weave`
+
+The extra **multi_compositor_render shader-blit step** is the most
+likely culprit. Per the diagnostic in `compositor_layer_commit`,
+bridge-aware in shell goes through raw copy at Stage 1
+(`needs_scale=0, srgb=1`) — so the per-client atlas is gamma-encoded
+correctly. The multi-comp shader (`d3d11_service_shaders.h` PSMain,
+called with `convert_srgb=0.0` at `comp_d3d11_service.cpp:6961`) samples
+via `cc->render.atlas_srv` (default UNORM SRV → no auto-linearize)
+and writes via the combined atlas RTV (default UNORM → no auto-encode).
+By inspection it should be a passthrough, but the visible result says
+otherwise.
+
+**Plausible causes to investigate:**
+1. The combined-atlas RTV / SRV is actually SRGB-typed somewhere
+   (auto-encode on write or auto-linearize on sample, undocumented).
+2. The blit shader's `OMSetBlendState(blend_alpha)` interacts with
+   pre-multiplied alpha in a way that shifts mid-tones.
+3. The DP's interpretation of combined-atlas bytes differs from
+   per-client-atlas bytes (e.g. SR weaver expects different gamma
+   when fed via the multi-comp path).
+
+**Not in Stage 2 scope.** File as its own dev issue. The bug has been
+present whenever shell mode + bridge-aware were tested simultaneously
+(no regression introduced by Stage 2). Stage 2 verification matrix
+should note "bridge-aware color in shell is pre-existing" rather than
+flagging it as a new bug.
+
+### Launcher empty-state when shell auto-spawns from IPC client
+
+User observation: when the shell is launched **automatically by the
+service** in response to an incoming IPC client (e.g. Chrome WebXR
+without prior shell), Ctrl+L doesn't bring up the launcher and the
+"press Ctrl+L" empty-state hint isn't shown. Same shell binary launched
+via Ctrl+Space (orchestrator-managed) or CLI works fine.
+
+**Hypothesis.** `displayxr-shell main.c` has a code path that's
+conditional on `--service-managed` flag or initial app count. The
+auto-spawn-from-IPC path may not pass `--service-managed`, or may
+short-circuit the hotkey RegisterHotKey + empty-state UI gate.
+
+**Not in Stage 2 scope.** ~30 min - 2 hr depending on root cause.
+File as a separate dev issue.
