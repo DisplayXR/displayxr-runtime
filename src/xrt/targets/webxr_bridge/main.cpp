@@ -47,6 +47,7 @@
 // compile.
 #include "xrt/xrt_results.h"
 #include "xrt/xrt_instance.h"
+#include "xrt/xrt_display_metrics.h"
 #include "util/u_logging.h"
 #include "shared/ipc_protocol.h"
 #include "client/ipc_client_connection.h"
@@ -797,7 +798,62 @@ static std::string build_window_info_json(const WindowMetrics &w) {
 	return s;
 }
 
-static std::string build_display_info_json(const Bridge &b) {
+// Populate WindowMetrics from per-client IPC (Stage 3 path). Returns true
+// only when the bridge has a resolved Chrome id AND the service returns
+// valid metrics. Used by effective_window_metrics() to scope `windowInfo`
+// to the shell window when the page is hosted there. Falls back via the
+// caller to b.window_metrics (global poll_window_metrics) on any failure,
+// matching pre-Stage-3 behavior for the non-shell case.
+static bool fetch_per_client_window_metrics(Bridge &b, WindowMetrics &out) {
+	if (!b.ipc_ready || b.chrome_client_id == 0) return false;
+
+	struct xrt_window_metrics wm = {};
+	xrt_result_t xret = ipc_call_system_get_client_window_metrics(
+	    &b.ipc_c, b.chrome_client_id, &wm);
+	if (xret != XRT_SUCCESS || !wm.valid) return false;
+	if (wm.window_width_m <= 0.0f || wm.window_height_m <= 0.0f) return false;
+	if (wm.window_pixel_width == 0 || wm.window_pixel_height == 0) return false;
+
+	out.valid = true;
+	out.pixelW = (int)wm.window_pixel_width;
+	out.pixelH = (int)wm.window_pixel_height;
+	out.sizeWm = wm.window_width_m;
+	out.sizeHm = wm.window_height_m;
+	out.centerOffsetXm = wm.window_center_offset_x_m;
+	out.centerOffsetYm = wm.window_center_offset_y_m;
+
+	// Per-view tile dims: mirror compute_and_push_bridge_view_dims' logic
+	// against the per-client pixel size. Atlas stride invariant: we derive
+	// from the slot's actual pixel dims × current mode's viewScale, NOT
+	// sys->view_width (see feedback_atlas_stride_invariant).
+	out.viewWidth = 0;
+	out.viewHeight = 0;
+	if (b.current_mode_index < b.modes.size()) {
+		float sx = b.modes[b.current_mode_index].viewScaleX;
+		float sy = b.modes[b.current_mode_index].viewScaleY;
+		if (sx > 0.0f && sy > 0.0f) {
+			uint32_t vw = (uint32_t)((float)out.pixelW * sx + 0.5f);
+			uint32_t vh = (uint32_t)((float)out.pixelH * sy + 0.5f);
+			out.viewWidth = vw;
+			out.viewHeight = vh;
+		}
+	}
+	return true;
+}
+
+// Single source of truth for window metrics the bridge sends to the page.
+// Shell mode (Chrome resolved) → per-client slot metrics from the service.
+// Non-shell (or resolver failed) → the compositor-window-scoped metrics
+// b.window_metrics maintained by poll_window_metrics.
+static WindowMetrics effective_window_metrics(Bridge &b) {
+	WindowMetrics per_client;
+	if (fetch_per_client_window_metrics(b, per_client)) {
+		return per_client;
+	}
+	return b.window_metrics;
+}
+
+static std::string build_display_info_json(const Bridge &b, const WindowMetrics &win) {
 	const auto &di = b.display_info;
 	std::string s = "{\"type\":\"display-info\",\"version\":1";
 	s += ",\"displayPixelSize\":[" + json_u(di.displayPixelWidth) + "," + json_u(di.displayPixelHeight) + "]";
@@ -838,7 +894,7 @@ static std::string build_display_info_json(const Bridge &b) {
 	s += (b.eye_tracking_caps.defaultMode == XR_EYE_TRACKING_MODE_MANUAL_EXT) ? "MANUAL" : "MANAGED";
 	s += "\"}";
 
-	s += build_window_info_fields(b.window_metrics);
+	s += build_window_info_fields(win);
 	s += "}";
 	return s;
 }
@@ -1086,8 +1142,12 @@ static void handle_ws_message(Bridge &b, const std::string &msg) {
 		}
 		LOG_I("WS hello received, sending display-info");
 		// Refresh window metrics on hello so initial display-info carries them.
+		// In shell mode the Chrome client may not yet be resolvable here
+		// (bridge-attach is where resolution happens); display-info will be
+		// re-emitted after bridge-attach with per-client values.
 		poll_window_metrics(b);
-		b.outgoing.push(build_display_info_json(b));
+		WindowMetrics eff = effective_window_metrics(b);
+		b.outgoing.push(build_display_info_json(b, eff));
 	} else if (type == "request-mode") {
 		int idx = find_int("modeIndex");
 		if (idx < 0 || (uint32_t)idx >= b.modes.size()) {
@@ -1147,6 +1207,16 @@ static void handle_ws_message(Bridge &b, const std::string &msg) {
 		if (resolved != 0) {
 			b.chrome_client_id = resolved;
 			LOG_I("bridge: resolved Chrome client_id=%u", (unsigned)resolved);
+			// Re-emit display-info with per-client window scoping. The
+			// initial display-info sent on `hello` used either the global
+			// compositor-window metrics (non-shell fallback) or stale
+			// cached values (shell). This replacement carries the
+			// shell-window-scoped values the page needs for correct
+			// Kooima projection. main-world.js treats every `display-info`
+			// message as authoritative, so the update propagates without
+			// extension-side changes.
+			WindowMetrics eff = effective_window_metrics(b);
+			b.outgoing.push(build_display_info_json(b, eff));
 		} else if (b.chrome_client_id != 0) {
 			LOG_W("bridge: resolver failed on bridge-attach; keeping cached id=%u",
 			      (unsigned)b.chrome_client_id);
@@ -1652,7 +1722,8 @@ static void handle_event(Bridge &b, const XrEventDataBuffer &evt) {
 			b.outgoing.push(build_mode_changed_json(
 			    e->previousModeIndex, e->currentModeIndex, hw3d, b.config_views));
 			if (win_changed) {
-				b.outgoing.push(build_window_info_json(b.window_metrics));
+				WindowMetrics eff = effective_window_metrics(b);
+				b.outgoing.push(build_window_info_json(eff));
 			}
 		}
 	} break;
@@ -1769,7 +1840,8 @@ static void run_event_loop(Bridge &b) {
 				window_changed = poll_window_metrics(b) || window_changed;
 			}
 			if (window_changed && b.ws_client_connected.load()) {
-				b.outgoing.push(build_window_info_json(b.window_metrics));
+				WindowMetrics eff = effective_window_metrics(b);
+				b.outgoing.push(build_window_info_json(eff));
 			}
 
 			// Drain queued input events from the hook thread.

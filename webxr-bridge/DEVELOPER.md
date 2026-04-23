@@ -123,6 +123,13 @@ displayXR.requestRenderingMode(1);
 
 `displayXR.windowInfo` updates **live** when the compositor window moves or resizes. `null` until the bridge locates the window.
 
+The scope of `windowInfo` depends on where the page is running:
+
+- **Full-display (shell off):** `windowInfo` describes the compositor's fullscreen output window. `windowSizeMeters` ≈ `displaySizeMeters` and `windowCenterOffsetMeters ≈ [0, 0]`. This is the pre-Stage-3 behavior and remains the default for non-shell bridge-aware pages.
+- **Shell-hosted (shell on):** `windowInfo` describes the shell window the page is drawn into. `windowSizeMeters` and `windowCenterOffsetMeters` reflect the slot's physical size and position, not the display's. The bridge identifies the target Chrome IPC client on `bridge-attach` and asks the service for per-client metrics; Kooima computed against these values lines up pixel-for-pixel with the slot and matches the perspective a native handle app would render in the same slot.
+
+The same field shape is used in both cases — apps do not need to special-case shell mode. If the bridge can't resolve a unique Chrome client (single-Chrome assumption fails, or shell is off), it falls back to full-display values.
+
 | Field | Meaning |
 |---|---|
 | `valid` | `true` once the bridge has the window. |
