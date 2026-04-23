@@ -73,7 +73,10 @@ jobs:
           git push -f origin "${{ steps.resolve-tag.outputs.tag }}"
 
   publish-binaries:
-    if: github.repository == 'DisplayXR/displayxr-runtime-pvt'
+    # Only on tag pushes: build-windows.yml fires on tag / PR / *-ci branches,
+    # not on workflow_dispatch, so a dispatch-based dry-run has nothing to
+    # wait on. Dry-runs exercise sync-source only.
+    if: github.repository == 'DisplayXR/displayxr-runtime-pvt' && github.event_name == 'push'
     needs: sync-source
     runs-on: ubuntu-latest
 
