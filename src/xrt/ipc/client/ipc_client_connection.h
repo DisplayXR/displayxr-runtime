@@ -15,6 +15,10 @@
 #include "ipc_client.h"
 
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /*!
  * Set up the basics of the client connection: socket and shared mem
  * @param ipc_c     Empty IPC connection struct
@@ -63,3 +67,7 @@ ipc_client_connection_unlock(struct ipc_connection *ipc_c)
  */
 void
 ipc_client_connection_fini(struct ipc_connection *ipc_c);
+
+#ifdef __cplusplus
+} // extern "C"
+#endif

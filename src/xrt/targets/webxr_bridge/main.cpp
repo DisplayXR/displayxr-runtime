@@ -37,6 +37,21 @@
 #include <openxr/XR_EXT_display_info.h>
 #include "../../auxiliary/util/u_bridge_hud_shared.h"
 
+// IPC client — opened as a parallel query-only channel so the bridge can
+// resolve Chrome's client_id and fetch per-client window metrics from the
+// service. Separate from the implicit IPC connection the OpenXR loader owns
+// for the bridge's own XrInstance (which we can't reach from here).
+// Each of these headers wraps its own declarations in extern "C" where
+// needed; wrapping them again here would pull C++ operator overloads from
+// transitively-included Windows SDK headers into C-linkage and fail to
+// compile.
+#include "xrt/xrt_results.h"
+#include "xrt/xrt_instance.h"
+#include "util/u_logging.h"
+#include "shared/ipc_protocol.h"
+#include "client/ipc_client_connection.h"
+#include "ipc_client_generated.h"
+
 // ---------------------------------------------------------------------------
 // Logging.
 // ---------------------------------------------------------------------------
@@ -429,6 +444,19 @@ struct Bridge {
 	// Bridge HUD shared memory (cross-process with compositor).
 	HANDLE hud_mapping = nullptr;
 	struct bridge_hud_shared *hud_shared = nullptr;
+
+	// Parallel IPC connection for client enumeration + per-client metrics.
+	// Opened after the OpenXR session is up (see init_ipc_connection). The
+	// bridge is also implicitly an IPC client through its XrInstance, but
+	// that connection is hidden inside the OpenXR loader — this one is
+	// explicit so we can call ipc_call_system_get_clients etc. directly.
+	struct ipc_connection ipc_c = {};
+	bool ipc_ready = false;
+
+	// Resolved target Chrome client_id (0 = none). Refreshed on
+	// bridge-attach (see dispatch_ws_message). 0 falls back to the global
+	// poll_window_metrics path, preserving non-shell bridge-aware behavior.
+	uint32_t chrome_client_id = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -884,6 +912,127 @@ static std::string build_eye_poses_json(const XrView *views, uint32_t count) {
 }
 
 // ---------------------------------------------------------------------------
+// Secondary IPC connection — client enumeration + per-client metrics.
+// ---------------------------------------------------------------------------
+//
+// The bridge is already an IPC client of the service through its XrInstance,
+// but that connection is private to the OpenXR loader. To resolve Chrome's
+// client_id and fetch per-client window metrics, we open a second, explicit
+// ipc_connection using the same init path the shell and monado-ctl use
+// (src/xrt/targets/ctl/main.c:307-317).
+//
+// Identity: application_name = "displayxr-webxr-bridge-ipc", distinct from
+// the OpenXR session's "displayxr-webxr-bridge", so the Chrome resolver can
+// skip both cleanly.
+
+static bool init_ipc_connection(Bridge &b) {
+	struct xrt_instance_info info = {};
+	snprintf(info.app_info.application_name,
+	         sizeof(info.app_info.application_name),
+	         "displayxr-webxr-bridge-ipc");
+
+	// The service is already up (we just created an XrInstance against it),
+	// so one attempt is enough — no retry loop like the shell uses for
+	// cold-start.
+	xrt_result_t xret = ipc_client_connection_init(&b.ipc_c, U_LOGGING_WARN, &info);
+	if (xret != XRT_SUCCESS) {
+		LOG_W("ipc_client_connection_init failed: %d (per-client window metrics unavailable, falling back to global poll_window_metrics)",
+		      (int)xret);
+		b.ipc_ready = false;
+		return false;
+	}
+
+	b.ipc_ready = true;
+	LOG_I("Secondary IPC connection opened (as 'displayxr-webxr-bridge-ipc') for client enumeration");
+	return true;
+}
+
+static void fini_ipc_connection(Bridge &b) {
+	if (!b.ipc_ready) return;
+	ipc_client_connection_fini(&b.ipc_c);
+	b.ipc_ready = false;
+}
+
+// Case-insensitive substring search.
+static bool str_contains_icase(const char *haystack, const char *needle) {
+	if (!haystack || !needle || !*needle) return false;
+	size_t nlen = strlen(needle);
+	for (const char *p = haystack; *p; p++) {
+		size_t i = 0;
+		for (; i < nlen; i++) {
+			char a = p[i];
+			if (!a) break;
+			char b_ = needle[i];
+			if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
+			if (b_ >= 'A' && b_ <= 'Z') b_ = (char)(b_ + 32);
+			if (a != b_) break;
+		}
+		if (i == nlen) return true;
+	}
+	return false;
+}
+
+// Returns the IPC client_id of the Chrome-hosted WebXR session, or 0 if none.
+// Filters out the bridge's own two client identities and prefers clients with
+// session_active = true.
+static uint32_t resolve_chrome_client_id(Bridge &b) {
+	if (!b.ipc_ready) return 0;
+
+	struct ipc_client_list clients;
+	xrt_result_t xret = ipc_call_system_get_clients(&b.ipc_c, &clients);
+	if (xret != XRT_SUCCESS) {
+		LOG_W("resolve_chrome_client_id: system_get_clients failed: %d", (int)xret);
+		return 0;
+	}
+
+	uint32_t candidate = 0;
+	uint32_t candidate_count = 0;
+	for (uint32_t i = 0; i < clients.id_count; i++) {
+		uint32_t id = clients.ids[i];
+		struct ipc_app_state ias = {};
+		xret = ipc_call_system_get_client_info(&b.ipc_c, id, &ias);
+		if (xret != XRT_SUCCESS) continue;
+
+		const char *name = ias.info.application_name;
+
+		// Skip the bridge's own two IPC identities.
+		if (strncmp(name, "displayxr-webxr-bridge", 22) == 0) continue;
+
+		// Heuristic: Chrome's OpenXR application_name is expected to contain
+		// "chrome" or "chromium" (case-insensitive). Edge / Brave / etc. are
+		// out of scope for Stage 3 — see stage3-plan.md risk §1.
+		bool looks_like_chrome = str_contains_icase(name, "chrome") ||
+		                         str_contains_icase(name, "chromium");
+		if (!looks_like_chrome) continue;
+
+		// Prefer active sessions; if there's only one Chromium-ish client
+		// at all, accept it even without session_active so the resolver
+		// succeeds during session bring-up (bridge-attach can fire before
+		// the session transitions to ACTIVE).
+		if (ias.session_active) {
+			candidate = id;
+			candidate_count = 1;
+			break;
+		}
+
+		candidate = id;
+		candidate_count++;
+	}
+
+	if (candidate_count == 0) {
+		LOG_W("resolve_chrome_client_id: no Chrome client found among %u IPC clients",
+		      (unsigned)clients.id_count);
+		return 0;
+	}
+	if (candidate_count > 1) {
+		LOG_W("resolve_chrome_client_id: %u Chrome-ish clients, ambiguous; falling back to global metrics",
+		      (unsigned)candidate_count);
+		return 0;
+	}
+	return candidate;
+}
+
+// ---------------------------------------------------------------------------
 // Parse incoming WS messages from the extension.
 // ---------------------------------------------------------------------------
 
@@ -988,6 +1137,21 @@ static void handle_ws_message(Bridge &b, const std::string &msg) {
 		// Legacy non-bridge WebXR pages never send this, so the compositor
 		// stays on its normal path even with the extension loaded.
 		HWND hwnd = g_compositor_hwnd.load();
+
+		// Resolve Chrome's IPC client_id now — not on `hello`. At `hello`
+		// time the service may not yet see Chrome as an IPC client (cold
+		// start, session not yet bound). By `bridge-attach` the page has
+		// both `displayXR.ready` and a live XRSession, so Chrome is
+		// definitely registered. See stage3-plan.md risk §2.
+		uint32_t resolved = resolve_chrome_client_id(b);
+		if (resolved != 0) {
+			b.chrome_client_id = resolved;
+			LOG_I("bridge: resolved Chrome client_id=%u", (unsigned)resolved);
+		} else if (b.chrome_client_id != 0) {
+			LOG_W("bridge: resolver failed on bridge-attach; keeping cached id=%u",
+			      (unsigned)b.chrome_client_id);
+		}
+
 		if (hwnd) {
 			SetPropW(hwnd, L"DXR_BridgeClientActive", (HANDLE)(uintptr_t)1);
 			LOG_I("WS bridge-attach: compositor gate ENGAGED");
@@ -1009,6 +1173,10 @@ static void handle_ws_message(Bridge &b, const std::string &msg) {
 			RemovePropW(hwnd, L"DXR_BridgeClientActive");
 			LOG_I("WS bridge-detach: compositor gate RELEASED");
 		}
+		// Drop the cached client_id so the next bridge-attach re-resolves.
+		// Chrome may re-create its OpenXR client on page reload or tab swap,
+		// and the old id is no longer valid.
+		b.chrome_client_id = 0;
 	} else if (type == "hud-update") {
 		if (b.hud_shared) {
 			// Parse "visible" and "lines" array from JSON.
@@ -1674,6 +1842,11 @@ int main() {
 		return 1;
 	}
 
+	// Open the query-only IPC connection for Chrome client_id resolution.
+	// Failure is non-fatal — bridge falls back to the global poll_window_metrics
+	// path, matching pre-Stage-3 behavior for the non-shell case.
+	init_ipc_connection(b);
+
 	// Create bridge HUD shared memory for cross-process HUD overlay.
 	bridge_hud_create(b);
 
@@ -1690,6 +1863,7 @@ int main() {
 	if (win_evt_thread.joinable()) win_evt_thread.join();
 
 	bridge_hud_destroy(b);
+	fini_ipc_connection(b);
 	if (b.local_space != XR_NULL_HANDLE) xrDestroySpace(b.local_space);
 	if (b.session != XR_NULL_HANDLE) xrDestroySession(b.session);
 	if (b.instance != XR_NULL_HANDLE) xrDestroyInstance(b.instance);
