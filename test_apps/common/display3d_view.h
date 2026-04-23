@@ -183,6 +183,62 @@ display3d_compute_view(const XrVector3f *processed_eye,
 Display3DTunables
 display3d_default_tunables(void);
 
+/*!
+ * Interpolate between two poses. Linear-lerps position, shortest-arc slerps
+ * orientation. t is already eased by the caller (e.g. ease-out cubic).
+ *
+ * @param from Starting pose
+ * @param to   Target pose
+ * @param t    Interpolation parameter in [0, 1]
+ * @param out  Output pose
+ */
+void
+display3d_pose_slerp(const XrPosef *from, const XrPosef *to, float t, XrPosef *out);
+
+/*!
+ * Build a pose whose local -Z points back along -ray_dir_world (display faces
+ * the ray source) and whose local +Y is closest to up_hint. Position = hit_world.
+ *
+ * Typical use: after double-click raycast picks a splat, this gives a display
+ * pose that centers on the splat and faces the viewer.
+ *
+ * @param hit_world     World-space position for the new display center
+ * @param ray_dir_world World-space ray direction (viewer -> scene), normalized
+ * @param up_hint       World-space up preference (typically {0, 1, 0})
+ * @param out           Output pose
+ */
+void
+display3d_align_pose_to_ray(XrVector3f hit_world,
+                            XrVector3f ray_dir_world,
+                            XrVector3f up_hint,
+                            XrPosef *out);
+
+/*!
+ * Unproject a normalized-device-coordinate point (ndc_x, ndc_y) through
+ * column-major view + projection matrices to a world-space ray.
+ *
+ * Uses the asymmetric Kooima-friendly shortcut:
+ *   vx = (ndc_x + P[8]) / P[0]
+ *   vy = (ndc_y + P[9]) / P[5]
+ *   vz = -1
+ * World direction = R^T * (vx, vy, vz) where R is the upper-left 3x3 of V.
+ * World origin    = eye position recovered from V.
+ *
+ * @param ndc_x            NDC x in [-1, 1]
+ * @param ndc_y            NDC y in [-1, 1] (caller is responsible for axis flip)
+ * @param view_col_major   4x4 view matrix, column-major
+ * @param proj_col_major   4x4 projection matrix, column-major
+ * @param out_origin_world Output world-space ray origin (eye position)
+ * @param out_dir_world    Output world-space ray direction (normalized)
+ */
+void
+display3d_unproject_ndc_to_ray(float ndc_x,
+                               float ndc_y,
+                               const float *view_col_major,
+                               const float *proj_col_major,
+                               XrVector3f *out_origin_world,
+                               XrVector3f *out_dir_world);
+
 #ifdef __cplusplus
 }
 #endif

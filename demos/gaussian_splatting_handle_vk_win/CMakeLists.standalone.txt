@@ -1,33 +1,31 @@
 # Copyright 2025, Leia Inc.
 # SPDX-License-Identifier: BSL-1.0
 #
-# 3D Gaussian Splatting with OpenXR (Vulkan)
-# Renders 3DGS scenes on tracked 3D displays via OpenXR and XR_EXT_win32_window_binding.
+# Standalone build — lives inside displayxr-demo-gaussiansplat repo as
+# windows/CMakeLists.txt. Assumes sibling dirs: ../common, ../3dgs_common,
+# ../openxr_includes. Top-level CMakeLists.txt is expected to have already
+# added ../common and ../3dgs_common as subdirectories, exposing
+# `sr_common_base`, `sr_common`, and `gs_renderer` targets.
 
 cmake_minimum_required(VERSION 3.21)
-project(gaussian_splatting_handle_vk_win LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
+if(NOT WIN32)
+    return()
+endif()
 
 if(MSVC)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
-# Find Vulkan SDK
 find_package(Vulkan QUIET)
 if(NOT Vulkan_FOUND)
-    message(STATUS "Vulkan SDK not found - skipping gaussian_splatting_handle_vk_win")
+    message(STATUS "Vulkan SDK not found — skipping gaussian_splatting_handle_vk_win")
     return()
 endif()
 message(STATUS "Found Vulkan: ${Vulkan_LIBRARY}")
 
-# OpenXR headers location
-set(OPENXR_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/../../src/external/openxr_includes")
-
-# Find OpenXR loader - multiple strategies
+# OpenXR loader — CONFIG pkg first, then a user-specified OpenXR_ROOT fallback.
 set(OPENXR_FOUND FALSE)
-
 find_package(OpenXR QUIET CONFIG)
 if(OpenXR_FOUND)
     set(OPENXR_FOUND TRUE)
@@ -62,38 +60,24 @@ if(NOT OPENXR_FOUND AND DEFINED OpenXR_ROOT)
 endif()
 
 if(NOT OPENXR_FOUND)
-    set(PARENT_BUILD_DIR "${CMAKE_SOURCE_DIR}/../../build")
-    if(EXISTS "${PARENT_BUILD_DIR}/src/external/openxr_loader/OpenXRConfig.cmake")
-        list(APPEND CMAKE_PREFIX_PATH "${PARENT_BUILD_DIR}/src/external/openxr_loader")
-        find_package(OpenXR REQUIRED CONFIG)
-        set(OPENXR_FOUND TRUE)
-    endif()
+    message(FATAL_ERROR "OpenXR not found. Provide -DOpenXR_ROOT=<path> or install via vcpkg.")
 endif()
-
-if(NOT OPENXR_FOUND)
-    message(FATAL_ERROR "OpenXR not found.")
-endif()
-
-# Common base library (API-agnostic)
-add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../../test_apps/common ${CMAKE_CURRENT_BINARY_DIR}/common)
-
-# 3DGS common library (FetchContent + adapter)
-add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../3dgs_common ${CMAKE_CURRENT_BINARY_DIR}/3dgs_common)
 
 add_executable(gaussian_splatting_handle_vk_win WIN32
     main.cpp
     xr_session.cpp
     xr_session.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../test_apps/common/hud_renderer.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../test_apps/common/hud_renderer.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../test_apps/common/text_overlay.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../test_apps/common/text_overlay.h
     sr_3dgs_openxr_ext_vk.manifest
     resource.rc
 )
 
+target_include_directories(gaussian_splatting_handle_vk_win PRIVATE
+    ${CMAKE_SOURCE_DIR}/openxr_includes
+)
+
 target_link_libraries(gaussian_splatting_handle_vk_win PRIVATE
     sr_common_base
+    sr_common
     gs_renderer
     OpenXR::openxr_loader
     Vulkan::Vulkan
@@ -109,6 +93,7 @@ if(MSVC)
     )
 endif()
 
+# Copy OpenXR loader DLL next to exe.
 if(TARGET OpenXR::openxr_loader)
     get_target_property(_loader_location OpenXR::openxr_loader IMPORTED_LOCATION)
     if(_loader_location)
@@ -121,8 +106,9 @@ if(TARGET OpenXR::openxr_loader)
     endif()
 endif()
 
-# Copy bundled SimulatedRealityVulkanBeta.dll to output directory
-set(VK_WEAVER_DLL "${CMAKE_CURRENT_SOURCE_DIR}/../../test_apps/common/SimulatedRealityVulkanBeta.dll")
+# Copy SimulatedRealityVulkanBeta.dll from ../common if present (vendored by
+# the publish step from the original test_apps/common/).
+set(VK_WEAVER_DLL "${CMAKE_SOURCE_DIR}/common/SimulatedRealityVulkanBeta.dll")
 if(EXISTS "${VK_WEAVER_DLL}")
     add_custom_command(TARGET gaussian_splatting_handle_vk_win POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -131,7 +117,7 @@ if(EXISTS "${VK_WEAVER_DLL}")
     )
 endif()
 
-# Copy bundled default scene next to the exe (auto-loaded at startup).
+# Copy bundled default scene next to the exe.
 set(BUNDLED_SCENE "${CMAKE_CURRENT_SOURCE_DIR}/assets/butterfly.spz")
 if(EXISTS "${BUNDLED_SCENE}")
     add_custom_command(TARGET gaussian_splatting_handle_vk_win POST_BUILD

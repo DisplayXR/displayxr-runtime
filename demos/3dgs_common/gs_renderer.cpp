@@ -1178,49 +1178,87 @@ bool GsRenderer::pickGaussian(const float rayOrigin[3], const float rayDir[3],
 {
     if (pickData_.empty()) return false;
 
-    float bestScore = 1e30f;
-    int bestIdx = -1;
+    // Front-to-back alpha accumulation pick: mimics how the renderer itself
+    // composites splats, so the returned gaussian is the one at the "first
+    // visible surface" along the ray — not a more centered but hidden one.
+    struct Hit {
+        float t;        // distance along ray to splat center projection
+        float alpha;    // 2D gaussian alpha at ray's closest approach
+        int   idx;
+    };
+    std::vector<Hit> hits;
+    hits.reserve(256);
 
     for (size_t i = 0; i < pickData_.size(); i++) {
         const auto& g = pickData_[i];
 
-        // Vector from ray origin to gaussian center
         float dx = g.px - rayOrigin[0];
         float dy = g.py - rayOrigin[1];
         float dz = g.pz - rayOrigin[2];
-
-        // Project center onto ray: t = dot(d, rayDir)
         float t = dx * rayDir[0] + dy * rayDir[1] + dz * rayDir[2];
-
-        // Reject if behind camera, too close (inside current gaussian), or beyond max distance
         if (t < 0.05f || t > maxDistance) continue;
 
-        // Perpendicular distance squared from ray to center
         float perpX = dx - t * rayDir[0];
         float perpY = dy - t * rayDir[1];
         float perpZ = dz - t * rayDir[2];
         float perpDistSq = perpX * perpX + perpY * perpY + perpZ * perpZ;
 
-        // Reject if ray misses the 3-sigma sphere
-        float radius = 3.0f * g.maxScale;
-        if (perpDistSq > radius * radius) continue;
+        // 3σ cutoff — beyond this the gaussian's contribution is negligible.
+        float sigma = g.maxScale > 1e-6f ? g.maxScale : 1e-6f;
+        float cutoff = 3.0f * sigma;
+        if (perpDistSq > cutoff * cutoff) continue;
 
-        // Score: favor close, opaque, large gaussians
-        float perpDist = sqrtf(perpDistSq);
-        float eps = 1e-6f;
-        float score = (perpDist + eps) / (g.opacity * g.maxScale + eps);
+        // 2D gaussian alpha at closest approach: α = opacity · exp(-½ · r²/σ²).
+        float alpha = g.opacity * expf(-0.5f * perpDistSq / (sigma * sigma));
+        if (alpha < 0.004f) continue;  // < 1/255; imperceptible contribution
 
-        if (score < bestScore) {
-            bestScore = score;
-            bestIdx = (int)i;
-        }
+        hits.push_back({t, alpha, (int)i});
     }
 
+    if (hits.empty()) return false;
+
+    std::sort(hits.begin(), hits.end(),
+              [](const Hit& a, const Hit& b) { return a.t < b.t; });
+
+    // Porter-Duff "over" walk front-to-back. Each splat contributes
+    // contrib_i = (1 - accum_prev) * alpha_i to the final pixel. Pick the
+    // splat with the largest individual contribution — that's the one the
+    // user perceives as "the thing at that pixel", and it naturally avoids
+    // both near-camera floaters (low opacity → tiny contrib) and fully
+    // occluded rear splats (1 - accum_prev near 0).
+    int bestIdx = -1;
+    float bestContrib = -1.0f;
+    float accum = 0.0f;
+    for (const auto& h : hits) {
+        float contrib = (1.0f - accum) * h.alpha;
+        accum += contrib;
+        if (contrib > bestContrib) {
+            bestContrib = contrib;
+            bestIdx = h.idx;
+        }
+        if (accum >= 0.99f) break;   // fully opaque, rear splats invisible
+    }
     if (bestIdx < 0) return false;
 
     hitPos[0] = pickData_[bestIdx].px;
     hitPos[1] = pickData_[bestIdx].py;
     hitPos[2] = pickData_[bestIdx].pz;
+    return true;
+}
+
+bool GsRenderer::getSceneBBox(float outMin[3], float outMax[3]) const
+{
+    if (pickData_.empty()) return false;
+    float mn[3] = { pickData_[0].px, pickData_[0].py, pickData_[0].pz };
+    float mx[3] = { mn[0], mn[1], mn[2] };
+    for (size_t i = 1; i < pickData_.size(); i++) {
+        const auto& g = pickData_[i];
+        if (g.px < mn[0]) mn[0] = g.px; else if (g.px > mx[0]) mx[0] = g.px;
+        if (g.py < mn[1]) mn[1] = g.py; else if (g.py > mx[1]) mx[1] = g.py;
+        if (g.pz < mn[2]) mn[2] = g.pz; else if (g.pz > mx[2]) mx[2] = g.pz;
+    }
+    outMin[0] = mn[0]; outMin[1] = mn[1]; outMin[2] = mn[2];
+    outMax[0] = mx[0]; outMax[1] = mx[1]; outMax[2] = mx[2];
     return true;
 }
 

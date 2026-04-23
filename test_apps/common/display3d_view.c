@@ -306,6 +306,175 @@ display3d_compute_view(const XrVector3f *processed_eye,
 }
 
 void
+display3d_pose_slerp(const XrPosef *from, const XrPosef *to, float t, XrPosef *out)
+{
+	// Linear lerp position
+	out->position.x = from->position.x + (to->position.x - from->position.x) * t;
+	out->position.y = from->position.y + (to->position.y - from->position.y) * t;
+	out->position.z = from->position.z + (to->position.z - from->position.z) * t;
+
+	// Shortest-arc slerp orientation
+	XrQuaternionf q0 = from->orientation;
+	XrQuaternionf q1 = to->orientation;
+	float dot = q0.x * q1.x + q0.y * q1.y + q0.z * q1.z + q0.w * q1.w;
+	if (dot < 0.0f) {
+		q1.x = -q1.x; q1.y = -q1.y; q1.z = -q1.z; q1.w = -q1.w;
+		dot = -dot;
+	}
+	float k0, k1;
+	if (dot > 0.9995f) {
+		// Nearly identical — fall back to linear to avoid numerical issues
+		k0 = 1.0f - t;
+		k1 = t;
+	} else {
+		float theta = acosf(dot);
+		float sin_theta = sinf(theta);
+		k0 = sinf((1.0f - t) * theta) / sin_theta;
+		k1 = sinf(t * theta) / sin_theta;
+	}
+	XrQuaternionf r;
+	r.x = k0 * q0.x + k1 * q1.x;
+	r.y = k0 * q0.y + k1 * q1.y;
+	r.z = k0 * q0.z + k1 * q1.z;
+	r.w = k0 * q0.w + k1 * q1.w;
+	float norm = sqrtf(r.x * r.x + r.y * r.y + r.z * r.z + r.w * r.w);
+	if (norm > 1e-8f) {
+		float inv = 1.0f / norm;
+		r.x *= inv; r.y *= inv; r.z *= inv; r.w *= inv;
+	} else {
+		r.w = 1.0f; r.x = r.y = r.z = 0.0f;
+	}
+	out->orientation = r;
+}
+
+static XrVector3f
+vec3_normalize(XrVector3f v)
+{
+	float n = sqrtf(v.x * v.x + v.y * v.y + v.z * v.z);
+	if (n < 1e-8f) {
+		XrVector3f z = {0, 0, 0};
+		return z;
+	}
+	float inv = 1.0f / n;
+	XrVector3f r = {v.x * inv, v.y * inv, v.z * inv};
+	return r;
+}
+
+static XrVector3f
+vec3_cross(XrVector3f a, XrVector3f b)
+{
+	XrVector3f r;
+	r.x = a.y * b.z - a.z * b.y;
+	r.y = a.z * b.x - a.x * b.z;
+	r.z = a.x * b.y - a.y * b.x;
+	return r;
+}
+
+void
+display3d_align_pose_to_ray(XrVector3f hit_world,
+                            XrVector3f ray_dir_world,
+                            XrVector3f up_hint,
+                            XrPosef *out)
+{
+	// Display convention: viewer sits at display-local +Z; eyes look toward
+	// local -Z (into the display).  For the viewer to remain approximately in
+	// place after focus, the new display's local +Z (in world) must point from
+	// the hit back toward the old viewer — i.e. opposite the click ray.
+	XrVector3f z_axis = {-ray_dir_world.x, -ray_dir_world.y, -ray_dir_world.z};
+	z_axis = vec3_normalize(z_axis);
+	if (z_axis.x == 0 && z_axis.y == 0 && z_axis.z == 0) {
+		z_axis.x = 0; z_axis.y = 0; z_axis.z = 1;
+	}
+
+	// X = normalize(cross(up_hint, Z)); fall back if parallel
+	XrVector3f x_axis = vec3_cross(up_hint, z_axis);
+	float x_len2 = x_axis.x * x_axis.x + x_axis.y * x_axis.y + x_axis.z * x_axis.z;
+	if (x_len2 < 1e-8f) {
+		XrVector3f alt = {1, 0, 0};
+		x_axis = vec3_cross(alt, z_axis);
+		x_len2 = x_axis.x * x_axis.x + x_axis.y * x_axis.y + x_axis.z * x_axis.z;
+		if (x_len2 < 1e-8f) {
+			XrVector3f alt2 = {0, 0, 1};
+			x_axis = vec3_cross(alt2, z_axis);
+		}
+	}
+	x_axis = vec3_normalize(x_axis);
+
+	// Y = cross(Z, X) — right-handed, already unit length
+	XrVector3f y_axis = vec3_cross(z_axis, x_axis);
+
+	// Rotation matrix columns = [X, Y, Z]; extract quaternion (trace method).
+	float m00 = x_axis.x, m10 = x_axis.y, m20 = x_axis.z;
+	float m01 = y_axis.x, m11 = y_axis.y, m21 = y_axis.z;
+	float m02 = z_axis.x, m12 = z_axis.y, m22 = z_axis.z;
+
+	float tr = m00 + m11 + m22;
+	XrQuaternionf q;
+	if (tr > 0.0f) {
+		float s = sqrtf(tr + 1.0f) * 2.0f;
+		q.w = 0.25f * s;
+		q.x = (m21 - m12) / s;
+		q.y = (m02 - m20) / s;
+		q.z = (m10 - m01) / s;
+	} else if (m00 > m11 && m00 > m22) {
+		float s = sqrtf(1.0f + m00 - m11 - m22) * 2.0f;
+		q.w = (m21 - m12) / s;
+		q.x = 0.25f * s;
+		q.y = (m01 + m10) / s;
+		q.z = (m02 + m20) / s;
+	} else if (m11 > m22) {
+		float s = sqrtf(1.0f + m11 - m00 - m22) * 2.0f;
+		q.w = (m02 - m20) / s;
+		q.x = (m01 + m10) / s;
+		q.y = 0.25f * s;
+		q.z = (m12 + m21) / s;
+	} else {
+		float s = sqrtf(1.0f + m22 - m00 - m11) * 2.0f;
+		q.w = (m10 - m01) / s;
+		q.x = (m02 + m20) / s;
+		q.y = (m12 + m21) / s;
+		q.z = 0.25f * s;
+	}
+
+	out->position = hit_world;
+	out->orientation = q;
+}
+
+void
+display3d_unproject_ndc_to_ray(float ndc_x,
+                               float ndc_y,
+                               const float *V,
+                               const float *P,
+                               XrVector3f *out_origin_world,
+                               XrVector3f *out_dir_world)
+{
+	// View-space direction using Kooima-friendly shortcut.
+	float vx = (ndc_x + P[8]) / P[0];
+	float vy = (ndc_y + P[9]) / P[5];
+	float vz = -1.0f;
+
+	// World direction = R^T * view_dir (R = upper-left 3x3 of V, col-major).
+	float wx = V[0] * vx + V[1] * vy + V[2] * vz;
+	float wy = V[4] * vx + V[5] * vy + V[6] * vz;
+	float wz = V[8] * vx + V[9] * vy + V[10] * vz;
+	float len = sqrtf(wx * wx + wy * wy + wz * wz);
+	if (len < 1e-8f) {
+		out_dir_world->x = 0; out_dir_world->y = 0; out_dir_world->z = -1;
+	} else {
+		float inv = 1.0f / len;
+		out_dir_world->x = wx * inv;
+		out_dir_world->y = wy * inv;
+		out_dir_world->z = wz * inv;
+	}
+
+	// World eye = -R^T * V_translation (V[12], V[13], V[14]).
+	float tx = V[12], ty = V[13], tz = V[14];
+	out_origin_world->x = -(V[0] * tx + V[1] * ty + V[2] * tz);
+	out_origin_world->y = -(V[4] * tx + V[5] * ty + V[6] * tz);
+	out_origin_world->z = -(V[8] * tx + V[9] * ty + V[10] * tz);
+}
+
+void
 display3d_compute_views(const XrVector3f *raw_eyes,
                                uint32_t count,
                                const XrVector3f *nominal_viewer,

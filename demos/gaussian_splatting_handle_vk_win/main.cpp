@@ -15,6 +15,8 @@
 #define _UNICODE
 #include <windows.h>
 #include <commdlg.h>
+#include <shlwapi.h>
+#pragma comment(lib, "shlwapi.lib")
 
 #include "logging.h"
 #include "input_handler.h"
@@ -50,6 +52,12 @@ static const float LOAD_BTN_WIDTH_FRACTION = 0.12f;
 static const float LOAD_BTN_HEIGHT_FRACTION = 0.04f;
 static const float LOAD_BTN_X_FRACTION = 0.87f;
 static const float LOAD_BTN_Y_FRACTION = 0.02f;
+
+// Auto-orbit button fractions (next to Load)
+static const float ORBIT_BTN_WIDTH_FRACTION = 0.12f;
+static const float ORBIT_BTN_HEIGHT_FRACTION = 0.04f;
+static const float ORBIT_BTN_X_FRACTION = 0.74f;
+static const float ORBIT_BTN_Y_FRACTION = 0.02f;
 
 // sim_display output mode switching (legacy — replaced by unified rendering mode)
 typedef void (*PFN_sim_display_set_output_mode)(int mode);
@@ -114,6 +122,41 @@ static bool IsClickOnLoadButton(int mouseX, int mouseY, int windowW, int windowH
             fy <= LOAD_BTN_Y_FRACTION + LOAD_BTN_HEIGHT_FRACTION);
 }
 
+static bool IsClickOnOrbitButton(int mouseX, int mouseY, int windowW, int windowH) {
+    if (windowW <= 0 || windowH <= 0) return false;
+    float fx = (float)mouseX / (float)windowW;
+    float fy = (float)mouseY / (float)windowH;
+    return (fx >= ORBIT_BTN_X_FRACTION &&
+            fx <= ORBIT_BTN_X_FRACTION + ORBIT_BTN_WIDTH_FRACTION &&
+            fy >= ORBIT_BTN_Y_FRACTION &&
+            fy <= ORBIT_BTN_Y_FRACTION + ORBIT_BTN_HEIGHT_FRACTION);
+}
+
+// Attempt to auto-load butterfly.spz from next to the exe.
+static void TryAutoLoadBundledScene() {
+    char exePath[MAX_PATH] = {0};
+    if (!GetModuleFileNameA(nullptr, exePath, MAX_PATH)) return;
+    // Strip basename
+    char *lastSlash = strrchr(exePath, '\\');
+    if (!lastSlash) lastSlash = strrchr(exePath, '/');
+    if (!lastSlash) return;
+    *(lastSlash + 1) = '\0';
+    std::string path = std::string(exePath) + "butterfly.spz";
+    if (!PathFileExistsA(path.c_str())) {
+        LOG_INFO("No bundled scene at %s (skipping auto-load)", path.c_str());
+        return;
+    }
+    if (!ValidateSceneFile(path)) return;
+    LOG_INFO("Auto-loading bundled scene: %s", path.c_str());
+    std::lock_guard<std::mutex> lock(g_sceneMutex);
+    if (g_gsRenderer.loadScene(path.c_str())) {
+        g_loadedFileName = GetPlyFilename(path);
+        LOG_INFO("Loaded %s (%s)", g_loadedFileName.c_str(), GetPlyFileSize(path).c_str());
+    } else {
+        LOG_WARN("Auto-load failed for %s", path.c_str());
+    }
+}
+
 // Open a file dialog and load a .ply or .spz scene (called from main thread)
 static void OpenLoadDialog(HWND hwnd) {
     OPENFILENAMEA ofn = {};
@@ -159,6 +202,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (IsClickOnLoadButton(mx, my, g_windowWidth, g_windowHeight)) {
             // Post to main thread — don't block WindowProc with file dialog
             PostMessage(hwnd, WM_USER + 1, 0, 0);
+            return 0;
+        }
+        if (IsClickOnOrbitButton(mx, my, g_windowWidth, g_windowHeight)) {
+            std::lock_guard<std::mutex> lock(g_inputMutex);
+            g_inputState.animateToggleRequested = true;
             return 0;
         }
         SetCapture(hwnd);
@@ -359,18 +407,33 @@ static void RenderThreadFunc(
     while (g_running.load() && !xr->exitRequested) {
         InputState inputSnapshot;
         bool resetRequested = false;
+        bool animateToggle = false;
+        bool loadReq = false;
         uint32_t windowW, windowH;
         {
             std::lock_guard<std::mutex> lock(g_inputMutex);
             inputSnapshot = g_inputState;
             resetRequested = g_inputState.resetViewRequested;
+            animateToggle = g_inputState.animateToggleRequested;
+            loadReq = g_inputState.loadRequested;
             g_inputState.resetViewRequested = false;
             g_inputState.teleportRequested = false;
             g_inputState.fullscreenToggleRequested = false;
             g_inputState.renderingModeChangeRequested = false;
             g_inputState.eyeTrackingModeToggleRequested = false;
+            g_inputState.animateToggleRequested = false;
+            g_inputState.loadRequested = false;
+            if (animateToggle) {
+                g_inputState.animateEnabled = !g_inputState.animateEnabled;
+                inputSnapshot.animateEnabled = g_inputState.animateEnabled;
+            }
             windowW = g_windowWidth;
             windowH = g_windowHeight;
+        }
+
+        // Request main thread to open file dialog when L key or Load button was pressed.
+        if (loadReq) {
+            PostMessage(hwnd, WM_USER + 1, 0, 0);
         }
 
         // Handle rendering mode change (V=cycle, 0-8=direct)
@@ -400,10 +463,16 @@ static void RenderThreadFunc(
             g_inputState.cameraPosX = inputSnapshot.cameraPosX;
             g_inputState.cameraPosY = inputSnapshot.cameraPosY;
             g_inputState.cameraPosZ = inputSnapshot.cameraPosZ;
+            // Pose slerp and auto-orbit mutate yaw/pitch each frame — copy back.
+            g_inputState.yaw = inputSnapshot.yaw;
+            g_inputState.pitch = inputSnapshot.pitch;
+            g_inputState.transitioning = inputSnapshot.transitioning;
+            g_inputState.transitionT = inputSnapshot.transitionT;
+            g_inputState.animationActive = inputSnapshot.animationActive;
             if (resetRequested) {
-                g_inputState.yaw = inputSnapshot.yaw;
-                g_inputState.pitch = inputSnapshot.pitch;
                 g_inputState.viewParams = inputSnapshot.viewParams;
+                g_inputState.animateEnabled = false;
+                g_inputState.transitioning = false;
             }
         }
 
@@ -514,43 +583,63 @@ static void RenderThreadFunc(
                                 0.01f, 100.0f, stereoViews);
                         }
 
-                        // Double-click teleport: unproject through left eye matrices
+                        // Double-click focus: center-eye ray through mouse, pick splat,
+                        // smoothly re-pose the virtual display to face back along the ray.
                         if (inputSnapshot.teleportRequested && useAppProjection) {
-                            // Mouse to NDC (Win32: Y=0 at top, NDC Y=+1 at top)
                             float ndcX = 2.0f * inputSnapshot.teleportMouseX / (float)windowW - 1.0f;
                             float ndcY = -(2.0f * inputSnapshot.teleportMouseY / (float)windowH - 1.0f);
 
-                            // Unproject NDC through left eye projection (column-major)
-                            const float *P = stereoViews[0].projection_matrix;
-                            float vx = (ndcX + P[8]) / P[0];
-                            float vy = (ndcY + P[9]) / P[5];
-                            float vz = -1.0f;
+                            float dispPxW2 = xr->displayPixelWidth > 0 ? (float)xr->displayPixelWidth : (float)xr->swapchain.width;
+                            float dispPxH2 = xr->displayPixelHeight > 0 ? (float)xr->displayPixelHeight : (float)xr->swapchain.height;
+                            float winW_m2 = (float)windowW * (xr->displayWidthM / dispPxW2);
+                            float winH_m2 = (float)windowH * (xr->displayHeightM / dispPxH2);
+                            Display3DScreen screen2 = {winW_m2, winH_m2};
+                            Display3DTunables tunables2;
+                            tunables2.ipd_factor = inputSnapshot.viewParams.ipdFactor;
+                            tunables2.parallax_factor = inputSnapshot.viewParams.parallaxFactor;
+                            tunables2.perspective_factor = inputSnapshot.viewParams.perspectiveFactor;
+                            tunables2.virtual_display_height = inputSnapshot.viewParams.virtualDisplayHeight / inputSnapshot.viewParams.scaleFactor;
 
-                            // View-space direction to world-space via inverse view rotation (transpose of 3x3)
-                            const float *V = stereoViews[0].view_matrix;
-                            float wx = V[0]*vx + V[1]*vy + V[2]*vz;
-                            float wy = V[4]*vx + V[5]*vy + V[6]*vz;
-                            float wz = V[8]*vx + V[9]*vy + V[10]*vz;
+                            // Center-eye Display3DView from averaged processed display-space eye.
+                            XrVector3f centerEyeDisp = {
+                                (stereoViews[0].eye_display.x + stereoViews[1].eye_display.x) * 0.5f,
+                                (stereoViews[0].eye_display.y + stereoViews[1].eye_display.y) * 0.5f,
+                                (stereoViews[0].eye_display.z + stereoViews[1].eye_display.z) * 0.5f};
+                            float m2v_post = tunables2.virtual_display_height / winH_m2;
+                            float es = tunables2.perspective_factor * m2v_post;
+                            XrVector3f centerEyeProcessed = (es != 0.0f)
+                                ? XrVector3f{centerEyeDisp.x / es, centerEyeDisp.y / es, centerEyeDisp.z / es}
+                                : centerEyeDisp;
+                            XrPosef displayPoseLocal;
+                            XMVECTOR pOri = XMQuaternionRotationRollPitchYaw(inputSnapshot.pitch, inputSnapshot.yaw, 0);
+                            XMFLOAT4 q;
+                            XMStoreFloat4(&q, pOri);
+                            displayPoseLocal.orientation = {q.x, q.y, q.z, q.w};
+                            displayPoseLocal.position = {inputSnapshot.cameraPosX, inputSnapshot.cameraPosY, inputSnapshot.cameraPosZ};
+                            Display3DView centerView;
+                            display3d_compute_view(&centerEyeProcessed, &screen2, &tunables2,
+                                                   &displayPoseLocal, 0.01f, 100.0f, &centerView);
 
-                            float len = sqrtf(wx*wx + wy*wy + wz*wz);
-                            if (len > 0.0f) {
-                                float rayDir[3] = {wx/len, wy/len, wz/len};
-                                float rayOrigin[3] = {
-                                    stereoViews[0].eye_world.x,
-                                    stereoViews[0].eye_world.y,
-                                    stereoViews[0].eye_world.z
-                                };
+                            XrVector3f rayOriginV, rayDirV;
+                            display3d_unproject_ndc_to_ray(ndcX, ndcY,
+                                centerView.view_matrix, centerView.projection_matrix,
+                                &rayOriginV, &rayDirV);
 
-                                float hitPos[3];
-                                std::lock_guard<std::mutex> sceneLock(g_sceneMutex);
-                                if (g_gsRenderer.pickGaussian(rayOrigin, rayDir, hitPos)) {
-                                    std::lock_guard<std::mutex> inputLock(g_inputMutex);
-                                    g_inputState.teleportAnimating = true;
-                                    g_inputState.teleportTargetX = hitPos[0];
-                                    g_inputState.teleportTargetY = hitPos[1];
-                                    g_inputState.teleportTargetZ = hitPos[2];
-                                    LOG_INFO("Teleporting to (%.3f, %.3f, %.3f)", hitPos[0], hitPos[1], hitPos[2]);
-                                }
+                            float rayOrigin[3] = {rayOriginV.x, rayOriginV.y, rayOriginV.z};
+                            float rayDir[3]    = {rayDirV.x,    rayDirV.y,    rayDirV.z};
+                            float hitPos[3];
+                            std::lock_guard<std::mutex> sceneLock(g_sceneMutex);
+                            if (g_gsRenderer.pickGaussian(rayOrigin, rayDir, hitPos)) {
+                                XrVector3f hitV = {hitPos[0], hitPos[1], hitPos[2]};
+                                XrVector3f upHint = {0, 1, 0};
+                                XrPosef target;
+                                display3d_align_pose_to_ray(hitV, rayDirV, upHint, &target);
+                                std::lock_guard<std::mutex> inputLock(g_inputMutex);
+                                g_inputState.transitionFrom = displayPoseLocal;
+                                g_inputState.transitionTo = target;
+                                g_inputState.transitionT = 0.0f;
+                                g_inputState.transitioning = true;
+                                LOG_INFO("Focus on splat (%.3f, %.3f, %.3f)", hitPos[0], hitPos[1], hitPos[2]);
                             }
                         }
 
@@ -718,13 +807,18 @@ static void RenderThreadFunc(
                                     inputSnapshot.viewParams.ipdFactor, inputSnapshot.viewParams.parallaxFactor,
                                     inputSnapshot.viewParams.perspectiveFactor, inputSnapshot.viewParams.scaleFactor);
                                 {
-                                    wchar_t vhBuf[64];
-                                    swprintf(vhBuf, 64, L"\nvHeight: %.3f  m2v: %.3f",
-                                        inputSnapshot.viewParams.virtualDisplayHeight, hudM2v);
+                                    wchar_t vhBuf[96];
+                                    int depthPct = (int)(inputSnapshot.viewParams.ipdFactor * 100.0f + 0.5f);
+                                    const wchar_t* orbitLbl = inputSnapshot.animateEnabled
+                                        ? (inputSnapshot.animationActive ? L"ON (running)" : L"ON (idle countdown)")
+                                        : L"OFF";
+                                    swprintf(vhBuf, 96, L"\nvHeight: %.3f  m2v: %.3f\nDepth/IPD: %d%%  Auto-Orbit: %s",
+                                        inputSnapshot.viewParams.virtualDisplayHeight, hudM2v, depthPct, orbitLbl);
                                     stereoText += vhBuf;
                                 }
-                                std::wstring helpText = L"[L] Load Scene | [WASD] Fly | [Tab] HUD\n"
-                                    L"[V] Cycle Mode | [F11] Fullscreen | [ESC] Quit";
+                                std::wstring helpText = L"[WASDEQ] Move | [LMB-drag] Rotate | [Scroll] Zoom\n"
+                                    L"[DblClick] Focus | [-/=] Depth | [Space] Reset\n"
+                                    L"[M] Auto-Orbit | [V] Mode | [L] Load | [Tab] HUD | [ESC] Quit";
 
                                 uint32_t srcRowPitch = 0;
                                 const void* pixels = RenderHudAndMap(*hud, &srcRowPitch, sessionText, modeText, perfText, dispText, eyeText,
@@ -1022,6 +1116,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         if (!g_gsRenderer.init(vkInstance, physDevice, vkDevice, graphicsQueue,
                                queueFamilyIndex, renderW, renderH)) {
             LOG_WARN("3DGS renderer init failed - scene rendering will not be available");
+        } else {
+            TryAutoLoadBundledScene();
         }
     }
 
@@ -1118,12 +1214,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     LOG_INFO("");
     LOG_INFO("=== Entering main loop ===");
-    LOG_INFO("Controls: L=Load Scene, WASD=Fly, QE=Up/Down, Mouse=Look, Space/DblClick=Reset");
-    LOG_INFO("          V=Cycle Modes, TAB=HUD, F11=Fullscreen, ESC=Quit");
+    LOG_INFO("Controls: WASDEQ=Move  LMB-drag=Rotate  Scroll=Zoom  DblClick=Focus");
+    LOG_INFO("          -/= Depth  Space=Reset  M=Auto-Orbit  V=Mode");
+    LOG_INFO("          L=Load  Tab=HUD  F11=Fullscreen  ESC=Quit");
     LOG_INFO("");
 
     g_inputState.viewParams.virtualDisplayHeight = 0.24f;
     g_inputState.renderingModeCount = xr.renderingModeCount;
+    {
+        using namespace std::chrono;
+        g_inputState.lastInputTimeSec = (double)duration_cast<microseconds>(
+            high_resolution_clock::now().time_since_epoch()).count() * 1e-6;
+    }
 
     std::thread renderThread(RenderThreadFunc, hwnd, &xr, vkDevice, graphicsQueue,
         queueFamilyIndex, vkInstance, physDevice,

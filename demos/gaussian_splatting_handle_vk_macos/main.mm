@@ -36,12 +36,16 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <array>
 #include <chrono>
+#include <utility>
 #include <vector>
 
 #include <dlfcn.h>
 #include <mach-o/dyld.h>
 #include <unistd.h>
+#include <libgen.h>
+#include <sys/stat.h>
 
 #include "view_params.h"
 #include "display3d_view.h"
@@ -95,15 +99,36 @@ struct InputState {
     bool teleportRequested = false;
     float teleportMouseX = 0.0f, teleportMouseY = 0.0f; // logical points
 
-    // Teleport animation
-    bool teleportAnimating = false;
-    float teleportTargetX = 0, teleportTargetY = 0, teleportTargetZ = 0;
+    // Smooth display-pose transition (double-click focus)
+    bool transitioning = false;
+    XrPosef transitionFrom = {{0,0,0,1}, {0,0,0}};
+    XrPosef transitionTo   = {{0,0,0,1}, {0,0,0}};
+    float transitionT = 0.0f;
+    float transitionDuration = 0.45f;
+
+    // Auto-orbit (turntable) mode
+    bool animateEnabled = false;
+    double lastInputTimeSec = 0.0;
+    bool animationActive = false;
+    bool animateToggleRequested = false;     // set by UI button
+
+    // Scene-flip toggle (180° about display X axis, applied post-view-matrix).
+    bool flipY = false;
+    bool flipToggleRequested = false;
+
+    // Drag-and-drop / pending file load
+    std::string pendingLoadPath;
 
     // Unified rendering mode (V key cycles, 0-8 keys select directly)
     uint32_t currentRenderingMode = 1;   // Default: mode 1 (first 3D mode)
     uint32_t renderingModeCount = 0;     // Set from xrEnumerateDisplayRenderingModesEXT
     bool renderingModeChangeRequested = false;
 };
+
+// Default virtual-display height in meters: roughly a human's height.
+// Using a constant keeps parallax / IPD behaviour consistent across scenes
+// (splat AABBs vary wildly).
+static constexpr float kDefaultVirtualDisplayHeightM = 1.5f;
 
 // ============================================================================
 // Globals
@@ -139,6 +164,15 @@ static uint32_t g_windowW = 0, g_windowH = 0;
 static void mat4_identity(float* m) {
     memset(m, 0, 16 * sizeof(float));
     m[0] = m[5] = m[10] = m[15] = 1.0f;
+}
+
+// Post-multiply the view matrix by a Y-reflection (world Y is negated):
+// view' = view * diag(1, -1, 1, 1).  Equivalent to mirroring the scene across
+// the XZ plane before viewing — exactly the fix for SPZ files whose training
+// convention inverts Y.  Not a rotation (det = -1), but preserves z ordering,
+// so depth and shader logic remain correct.
+static void view_apply_y_flip(float* view_col_major_16) {
+    for (int i = 0; i < 4; i++) view_col_major_16[4 + i] = -view_col_major_16[4 + i];
 }
 
 static void mat4_multiply(float* out, const float* a, const float* b) {
@@ -221,6 +255,52 @@ static void quat_rotate_vec3(XrQuaternionf q, float vx, float vy, float vz,
 }
 
 // ============================================================================
+// Forward decls for top-bar UI helpers (defined after CreateMacOSWindow)
+// ============================================================================
+
+struct AppXrSession;
+static void UpdateTopBarButtonTitles(AppXrSession& xr);
+static void ResetVirtualDisplayHeightForNewScene();
+
+// ============================================================================
+// Input timestamp helper
+// ============================================================================
+
+static double NowSec(void) {
+    return (double)std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::high_resolution_clock::now().time_since_epoch()).count() * 1e-6;
+}
+
+static void MarkUserInput(InputState& input) {
+    input.lastInputTimeSec = NowSec();
+    input.animationActive = false;
+}
+
+// Extract yaw/pitch from a quaternion (XYZ order, matches quat_from_yaw_pitch).
+// Only used after a smooth pose transition completes so subsequent drag rotation
+// feels natural. Ambiguous near the poles — acceptable for this demo.
+static void yaw_pitch_from_quat(XrQuaternionf q, float* yaw, float* pitch) {
+    // Forward vector in local is (0, 0, -1); rotate it by q to get world forward.
+    float fx = 2.0f * (q.x * q.z + q.y * q.w) * -1.0f + 0.0f;
+    // Reuse the cross-product form for clarity.
+    float vx = 0, vy = 0, vz = -1.0f;
+    float tx = 2.0f * (q.y * vz - q.z * vy);
+    float ty = 2.0f * (q.z * vx - q.x * vz);
+    float tz = 2.0f * (q.x * vy - q.y * vx);
+    float fwdX = vx + q.w * tx + (q.y * tz - q.z * ty);
+    float fwdY = vy + q.w * ty + (q.z * tx - q.x * tz);
+    float fwdZ = vz + q.w * tz + (q.x * ty - q.y * tx);
+    (void)fx;
+    // quat_from_yaw_pitch(y,p) rotates (0,0,-1) to (-cos(p)sin(y), sin(p), -cos(p)cos(y)).
+    // Inverting:  p = asin(fwdY),  y = atan2(-fwdX, -fwdZ).
+    *yaw = atan2f(-fwdX, -fwdZ);
+    float clampedY = fwdY;
+    if (clampedY > 1.0f) clampedY = 1.0f;
+    if (clampedY < -1.0f) clampedY = -1.0f;
+    *pitch = asinf(clampedY);
+}
+
+// ============================================================================
 // Camera movement (ported from common/input_handler)
 // ============================================================================
 
@@ -229,9 +309,34 @@ static void UpdateCameraMovement(InputState& input, float dt, float displayHeigh
         input.yaw = 0; input.pitch = 0;
         input.cameraPosX = input.cameraPosY = input.cameraPosZ = 0;
         input.viewParams = ViewParams();
-        input.viewParams.virtualDisplayHeight = 0.24f;
+        input.viewParams.virtualDisplayHeight = kDefaultVirtualDisplayHeightM;
         input.resetViewRequested = false;
-        input.teleportAnimating = false;
+        input.transitioning = false;
+        input.animateEnabled = false;
+        input.animationActive = false;
+        input.flipY = false;
+        input.lastInputTimeSec = NowSec();
+        return;
+    }
+
+    // Smooth pose transition (double-click focus). Overrides WASD while active.
+    if (input.transitioning) {
+        input.transitionT += dt;
+        float u = input.transitionT / input.transitionDuration;
+        if (u >= 1.0f) u = 1.0f;
+        // Ease-out cubic
+        float invU = 1.0f - u;
+        float eased = 1.0f - invU * invU * invU;
+        XrPosef cur;
+        display3d_pose_slerp(&input.transitionFrom, &input.transitionTo, eased, &cur);
+        input.cameraPosX = cur.position.x;
+        input.cameraPosY = cur.position.y;
+        input.cameraPosZ = cur.position.z;
+        float yaw, pitch;
+        yaw_pitch_from_quat(cur.orientation, &yaw, &pitch);
+        input.yaw = yaw;
+        input.pitch = pitch;
+        if (u >= 1.0f) input.transitioning = false;
         return;
     }
 
@@ -255,17 +360,12 @@ static void UpdateCameraMovement(InputState& input, float dt, float displayHeigh
     if (input.keyE) { input.cameraPosX += upX*d;  input.cameraPosY += upY*d;  input.cameraPosZ += upZ*d; }
     if (input.keyQ) { input.cameraPosX -= upX*d;  input.cameraPosY -= upY*d;  input.cameraPosZ -= upZ*d; }
 
-    // Teleport animation: exponential ease-out
-    if (input.teleportAnimating) {
-        float t = 1.0f - expf(-10.0f * dt); // ~90% in 0.23s
-        input.cameraPosX += (input.teleportTargetX - input.cameraPosX) * t;
-        input.cameraPosY += (input.teleportTargetY - input.cameraPosY) * t;
-        input.cameraPosZ += (input.teleportTargetZ - input.cameraPosZ) * t;
-        float dx = input.teleportTargetX - input.cameraPosX;
-        float dy = input.teleportTargetY - input.cameraPosY;
-        float dz = input.teleportTargetZ - input.cameraPosZ;
-        if (dx*dx + dy*dy + dz*dz < 1e-8f)
-            input.teleportAnimating = false;
+    // Auto-orbit: if enabled and user has been idle > 10s, slowly yaw the display.
+    double idleFor = NowSec() - input.lastInputTimeSec;
+    input.animationActive = (input.animateEnabled && idleFor > 10.0);
+    if (input.animationActive) {
+        float rate = 6.2831853f / 20.0f; // one revolution per 20 seconds
+        input.yaw += rate * dt;
     }
 }
 
@@ -282,28 +382,68 @@ static void UpdateCameraMovement(InputState& input, float dt, float displayHeigh
 - (BOOL)isFlipped { return YES; }
 
 - (void)drawRect:(NSRect)dirtyRect {
-    [[NSColor colorWithCalibratedRed:0 green:0 blue:0 alpha:0.65] set];
-    NSRectFill(self.bounds);
-
     if (!_hudText) return;
-
+    // No backdrop fill — the enclosing NSVisualEffectView provides frosted
+    // vibrancy that auto-adapts to whatever is behind the window.
     NSDictionary *attrs = @{
-        NSFontAttributeName: [NSFont monospacedSystemFontOfSize:10 weight:NSFontWeightRegular],
-        NSForegroundColorAttributeName: [NSColor colorWithCalibratedRed:0.9 green:0.95 blue:1.0 alpha:1.0]
+        NSFontAttributeName: [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular],
+        NSForegroundColorAttributeName: [NSColor labelColor]
     };
-    NSRect textRect = NSInsetRect(self.bounds, 8, 6);
+    NSRect textRect = NSInsetRect(self.bounds, 10, 8);
     [_hudText drawInRect:textRect withAttributes:attrs];
 }
 
 @end
 
-static HudOverlayView *g_hudView = nil;
+static HudOverlayView   *g_hudView = nil;      // text view
+static NSVisualEffectView *g_hudBackdrop = nil;  // frosted wrapper sized to hudView
 
 // ============================================================================
-// Load button overlay (NSButton)
+// Top-bar overlay (Open / Auto-Orbit / Mode buttons) + reticle
 // ============================================================================
 
-static NSButton *g_loadButton = nil;
+static NSView   *g_topBar = nil;
+static NSButton *g_openButton = nil;
+static NSButton *g_orbitButton = nil;
+static NSButton *g_modeButton = nil;
+static NSButton *g_flipButton = nil;
+static NSView   *g_reticleView = nil;
+
+// Translucent dark background view used behind the top bar.
+@interface TopBarBackdropView : NSView
+@end
+@implementation TopBarBackdropView
+- (BOOL)isFlipped { return NO; }
+- (void)drawRect:(NSRect)r {
+    [[NSColor colorWithCalibratedWhite:0.0 alpha:0.55] set];
+    NSRectFill(self.bounds);
+    [[NSColor colorWithCalibratedWhite:1.0 alpha:0.08] set];
+    NSRect hr = NSMakeRect(0, 0, self.bounds.size.width, 1);
+    NSRectFill(hr);
+}
+@end
+
+// Non-interactive crosshair at the center of the window (aim reference for double-click).
+// Drawn as a dark outline + bright core so it reads against any background.
+@interface ReticleView : NSView
+@end
+@implementation ReticleView
+- (BOOL)isFlipped { return NO; }
+- (NSView*)hitTest:(NSPoint)p { (void)p; return nil; } // never steal clicks
+- (void)drawRect:(NSRect)r {
+    (void)r;
+    NSRect b = self.bounds;
+    CGFloat cx = b.size.width * 0.5f, cy = b.size.height * 0.5f;
+    // Dark outline for contrast on light backgrounds
+    [[NSColor colorWithCalibratedWhite:0.0 alpha:0.75] set];
+    NSRectFill(NSMakeRect(cx - 5.5, cy - 0.75, 11, 1.5));
+    NSRectFill(NSMakeRect(cx - 0.75, cy - 5.5, 1.5, 11));
+    // Bright core for contrast on dark backgrounds
+    [[NSColor colorWithCalibratedWhite:1.0 alpha:0.95] set];
+    NSRectFill(NSMakeRect(cx - 4.5, cy, 9, 1));
+    NSRectFill(NSMakeRect(cx, cy - 4.5, 1, 9));
+}
+@end
 
 static void OpenLoadDialog() {
     @autoreleasepool {
@@ -336,6 +476,7 @@ static void OpenLoadDialog() {
                         g_loadedFileName = GetPlyFilename(pathStr);
                         LOG_INFO("Scene loaded: %s (%s)", g_loadedFileName.c_str(),
                             GetPlyFileSize(pathStr).c_str());
+                        ResetVirtualDisplayHeightForNewScene();
                     } else {
                         LOG_ERROR("Failed to load scene: %s", path);
                         NSAlert *alert = [[NSAlert alloc] init];
@@ -376,6 +517,7 @@ static void OpenLoadDialog() {
 - (BOOL)acceptsFirstResponder { return YES; }
 
 - (void)mouseDown:(NSEvent *)event {
+    MarkUserInput(g_input);
     if ([event clickCount] >= 2) {
         NSPoint loc = [event locationInWindow];
         g_input.teleportRequested = true;
@@ -386,6 +528,7 @@ static void OpenLoadDialog() {
 }
 
 - (void)mouseDragged:(NSEvent *)event {
+    MarkUserInput(g_input);
     g_input.yaw += (float)[event deltaX] * 0.005f;
     g_input.pitch += (float)[event deltaY] * 0.005f;
     float maxPitch = 1.5f;
@@ -394,22 +537,14 @@ static void OpenLoadDialog() {
 }
 
 - (void)scrollWheel:(NSEvent *)event {
+    MarkUserInput(g_input);
     float delta = (float)[event scrollingDeltaY] * 0.02f;
-    NSUInteger flags = [event modifierFlags];
-    if (flags & NSEventModifierFlagShift) {
-        g_input.viewParams.ipdFactor += delta * 0.5f;
-        if (g_input.viewParams.ipdFactor < 0.0f) g_input.viewParams.ipdFactor = 0.0f;
-        if (g_input.viewParams.ipdFactor > 1.0f) g_input.viewParams.ipdFactor = 1.0f;
-        g_input.viewParams.parallaxFactor += delta * 0.5f;
-        if (g_input.viewParams.parallaxFactor < 0.0f) g_input.viewParams.parallaxFactor = 0.0f;
-        if (g_input.viewParams.parallaxFactor > 1.0f) g_input.viewParams.parallaxFactor = 1.0f;
-    } else {
-        g_input.viewParams.scaleFactor += delta * 0.5f;
-        if (g_input.viewParams.scaleFactor < 0.1f) g_input.viewParams.scaleFactor = 0.1f;
-    }
+    g_input.viewParams.scaleFactor += delta * 0.5f;
+    if (g_input.viewParams.scaleFactor < 0.1f) g_input.viewParams.scaleFactor = 0.1f;
 }
 
 - (void)keyDown:(NSEvent *)event {
+    MarkUserInput(g_input);
     NSString *chars = [event charactersIgnoringModifiers];
     if ([chars length] == 0) return;
     unichar ch = [chars characterAtIndex:0];
@@ -427,6 +562,12 @@ static void OpenLoadDialog() {
             }
             g_input.renderingModeChangeRequested = true;
             break;
+        case 'm': case 'M':
+            g_input.animateToggleRequested = true;
+            break;
+        case 'f': case 'F':
+            g_input.flipToggleRequested = true;
+            break;
         case 'c': case 'C':
             g_input.cameraMode = !g_input.cameraMode;
             break;
@@ -436,6 +577,20 @@ static void OpenLoadDialog() {
         case 'l': case 'L':
             g_input.loadRequested = true;
             break;
+        case '-': case '_': {
+            float v = g_input.viewParams.ipdFactor - 0.1f;
+            if (v < 0.1f) v = 0.1f;
+            g_input.viewParams.ipdFactor = v;
+            g_input.viewParams.parallaxFactor = v;
+            break;
+        }
+        case '=': case '+': {
+            float v = g_input.viewParams.ipdFactor + 0.1f;
+            if (v > 1.0f) v = 1.0f;
+            g_input.viewParams.ipdFactor = v;
+            g_input.viewParams.parallaxFactor = v;
+            break;
+        }
         case ' ':
             g_input.resetViewRequested = true;
             break;
@@ -465,6 +620,7 @@ static void OpenLoadDialog() {
 }
 
 - (void)keyUp:(NSEvent *)event {
+    MarkUserInput(g_input);
     NSString *chars = [event charactersIgnoringModifiers];
     if ([chars length] == 0) return;
     unichar ch = [chars characterAtIndex:0];
@@ -476,6 +632,30 @@ static void OpenLoadDialog() {
         case 'e': case 'E': g_input.keyE = false; break;
         case 'q': case 'Q': g_input.keyQ = false; break;
     }
+}
+
+// Drag-and-drop: accept .ply and .spz files
+- (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)sender {
+    NSPasteboard *pb = [sender draggingPasteboard];
+    if ([[pb types] containsObject:NSPasteboardTypeFileURL]) {
+        return NSDragOperationCopy;
+    }
+    return NSDragOperationNone;
+}
+
+- (BOOL)performDragOperation:(id<NSDraggingInfo>)sender {
+    NSPasteboard *pb = [sender draggingPasteboard];
+    NSArray<NSURL *> *urls = [pb readObjectsForClasses:@[[NSURL class]] options:nil];
+    for (NSURL *url in urls) {
+        if (![url isFileURL]) continue;
+        NSString *path = [url path];
+        NSString *ext = [[path pathExtension] lowercaseString];
+        if ([ext isEqualToString:@"ply"] || [ext isEqualToString:@"spz"]) {
+            g_input.pendingLoadPath = std::string([path UTF8String]);
+            return YES;
+        }
+    }
+    return NO;
 }
 
 - (void)flagsChanged:(NSEvent *)event {
@@ -511,35 +691,120 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
     [g_window makeKeyAndOrderFront:nil];
     [g_window makeFirstResponder:g_metalView];
 
-    // Add HUD overlay
-    NSRect hudFrame = NSMakeRect(8, 8, 320, 520);
-    g_hudView = [[HudOverlayView alloc] initWithFrame:hudFrame];
-    [g_metalView addSubview:g_hudView];
+    // Accept drag-and-drop of .ply / .spz files
+    [g_metalView registerForDraggedTypes:@[NSPasteboardTypeFileURL]];
 
-    // Add Load button overlay (top-right)
-    g_loadButton = [[NSButton alloc] initWithFrame:NSMakeRect(width - 120, height - 40, 110, 30)];
-    [g_loadButton setTitle:@"Load Scene"];
-    [g_loadButton setBezelStyle:NSBezelStyleRounded];
-    [g_loadButton setTarget:nil];
-    [g_loadButton setAction:@selector(loadButtonClicked:)];
-    [g_metalView addSubview:g_loadButton];
+    // Add HUD overlay — frosted backdrop + text view inside
+    NSRect hudFrame = NSMakeRect(8, 8, 320, 520);
+    g_hudBackdrop = [[NSVisualEffectView alloc] initWithFrame:hudFrame];
+    [g_hudBackdrop setMaterial:NSVisualEffectMaterialHUDWindow];
+    [g_hudBackdrop setBlendingMode:NSVisualEffectBlendingModeWithinWindow];
+    [g_hudBackdrop setState:NSVisualEffectStateActive];
+    [g_hudBackdrop setWantsLayer:YES];
+    g_hudBackdrop.layer.cornerRadius = 8.0;
+    g_hudBackdrop.layer.masksToBounds = YES;
+    [g_metalView addSubview:g_hudBackdrop];
+
+    g_hudView = [[HudOverlayView alloc] initWithFrame:g_hudBackdrop.bounds];
+    [g_hudView setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
+    [g_hudBackdrop addSubview:g_hudView];
+
+    // --- Top bar (Open / Auto-Orbit / Mode / Flip) — frosted vibrancy panel ---
+    const CGFloat barH = 48.0;
+    NSRect barFrame = NSMakeRect(0, height - barH, width, barH);
+    NSVisualEffectView *topBar = [[NSVisualEffectView alloc] initWithFrame:barFrame];
+    [topBar setMaterial:NSVisualEffectMaterialHUDWindow];
+    [topBar setBlendingMode:NSVisualEffectBlendingModeWithinWindow];
+    [topBar setState:NSVisualEffectStateActive];
+    [topBar setAutoresizingMask:NSViewWidthSizable | NSViewMinYMargin];
+    g_topBar = topBar;
+    [g_metalView addSubview:g_topBar];
+
+    const CGFloat btnH = 32.0, btnY = (barH - btnH) * 0.5f;
+    const CGFloat gap = 10.0;
+    CGFloat x = 12.0;
+    CGFloat openW = 96.0, orbitW = 160.0, modeW = 220.0;
+
+    g_openButton = [[NSButton alloc] initWithFrame:NSMakeRect(x, btnY, openW, btnH)];
+    [g_openButton setTitle:@"Open…"];
+    [g_openButton setBezelStyle:NSBezelStyleRounded];
+    [g_openButton setTarget:nil];
+    [g_openButton setAction:@selector(openButtonClicked:)];
+    [g_topBar addSubview:g_openButton];
+    x += openW + gap;
+
+    g_orbitButton = [[NSButton alloc] initWithFrame:NSMakeRect(x, btnY, orbitW, btnH)];
+    [g_orbitButton setTitle:@"Auto-Orbit: Off"];
+    [g_orbitButton setBezelStyle:NSBezelStyleRounded];
+    [g_orbitButton setTarget:nil];
+    [g_orbitButton setAction:@selector(orbitButtonClicked:)];
+    [g_topBar addSubview:g_orbitButton];
+    x += orbitW + gap;
+
+    g_modeButton = [[NSButton alloc] initWithFrame:NSMakeRect(x, btnY, modeW, btnH)];
+    [g_modeButton setTitle:@"Mode: —"];
+    [g_modeButton setBezelStyle:NSBezelStyleRounded];
+    [g_modeButton setTarget:nil];
+    [g_modeButton setAction:@selector(modeButtonClicked:)];
+    [g_topBar addSubview:g_modeButton];
+    x += modeW + gap;
+
+    const CGFloat flipW = 96.0;
+    g_flipButton = [[NSButton alloc] initWithFrame:NSMakeRect(x, btnY, flipW, btnH)];
+    [g_flipButton setTitle:@"Flip: Off"];
+    [g_flipButton setBezelStyle:NSBezelStyleRounded];
+    [g_flipButton setTarget:nil];
+    [g_flipButton setAction:@selector(flipButtonClicked:)];
+    [g_topBar addSubview:g_flipButton];
+
+    // --- Reticle (non-interactive center crosshair) ---
+    const CGFloat retSize = 20.0;
+    NSRect retFrame = NSMakeRect((width - retSize) * 0.5f, (height - retSize) * 0.5f, retSize, retSize);
+    g_reticleView = [[ReticleView alloc] initWithFrame:retFrame];
+    [g_reticleView setAutoresizingMask:NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin | NSViewMaxYMargin];
+    [g_metalView addSubview:g_reticleView];
 
     [NSApp activateIgnoringOtherApps:YES];
     LOG_INFO("macOS window created (%ux%u)", width, height);
     return true;
 }
 
-// Button action handler (added as category on NSApplication)
-@interface NSApplication (LoadAction)
-- (void)loadButtonClicked:(id)sender;
+// Button action handlers (added as category on NSApplication)
+@interface NSApplication (TopBarActions)
+- (void)openButtonClicked:(id)sender;
+- (void)orbitButtonClicked:(id)sender;
+- (void)modeButtonClicked:(id)sender;
+- (void)flipButtonClicked:(id)sender;
 @end
 
-@implementation NSApplication (LoadAction)
-- (void)loadButtonClicked:(id)sender {
+@implementation NSApplication (TopBarActions)
+- (void)openButtonClicked:(id)sender {
     (void)sender;
+    MarkUserInput(g_input);
     g_input.loadRequested = true;
 }
+- (void)orbitButtonClicked:(id)sender {
+    (void)sender;
+    MarkUserInput(g_input);
+    g_input.animateToggleRequested = true;
+}
+- (void)modeButtonClicked:(id)sender {
+    (void)sender;
+    MarkUserInput(g_input);
+    if (g_input.renderingModeCount > 0) {
+        g_input.currentRenderingMode = (g_input.currentRenderingMode + 1) % g_input.renderingModeCount;
+    }
+    g_input.renderingModeChangeRequested = true;
+}
+- (void)flipButtonClicked:(id)sender {
+    (void)sender;
+    MarkUserInput(g_input);
+    g_input.flipToggleRequested = true;
+}
 @end
+
+// NOTE: UpdateTopBarButtonTitles() body lives after the AppXrSession struct
+// definition further below, since it accesses its members.
 
 static void PumpMacOSEvents() {
     @autoreleasepool {
@@ -616,9 +881,35 @@ struct AppXrSession {
     float renderingModeScaleX[8] = {};
     float renderingModeScaleY[8] = {};
     bool renderingModeDisplay3D[8] = {};
+    uint32_t renderingModeTileColumns[8] = {};  // atlas tile layout (v12)
+    uint32_t renderingModeTileRows[8] = {};
+
+    // Max views the runtime may return from xrLocateViews, taken from
+    // xrEnumerateViewConfigurationViews at session init. Some runtimes (e.g.
+    // sim_display on macOS) report the union across all rendering modes, so
+    // this is >= 2 even for PRIMARY_STEREO.
+    uint32_t maxViewCount = 2;
 
     void* windowHandle = nullptr;  // unused on macOS, kept for compatibility
 };
+
+static void UpdateTopBarButtonTitles(AppXrSession& xr) {
+    if (g_orbitButton) {
+        [g_orbitButton setTitle:(g_input.animateEnabled ? @"Auto-Orbit: On" : @"Auto-Orbit: Off")];
+    }
+    if (g_modeButton) {
+        const char *name = "Unknown";
+        if (xr.renderingModeCount > 0 &&
+            g_input.currentRenderingMode < xr.renderingModeCount &&
+            xr.renderingModeNames[g_input.currentRenderingMode][0] != '\0') {
+            name = xr.renderingModeNames[g_input.currentRenderingMode];
+        }
+        [g_modeButton setTitle:[NSString stringWithFormat:@"Mode: %s", name]];
+    }
+    if (g_flipButton) {
+        [g_flipButton setTitle:(g_input.flipY ? @"Flip: On" : @"Flip: Off")];
+    }
+}
 
 // Forward declarations for OpenXR functions (same as cube_handle_vk_macos)
 static bool InitializeOpenXR(AppXrSession& xr);
@@ -858,9 +1149,13 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
                     xr.renderingModeScaleX[i] = modes[i].viewScaleX;
                     xr.renderingModeScaleY[i] = modes[i].viewScaleY;
                     xr.renderingModeDisplay3D[i] = (modes[i].hardwareDisplay3D == XR_TRUE);
-                    LOG_INFO("  [%u] %s (views=%u, scale=%.2fx%.2f, 3D=%d)",
+                    xr.renderingModeTileColumns[i] = modes[i].tileColumns ? modes[i].tileColumns : 1;
+                    xr.renderingModeTileRows[i] = modes[i].tileRows ? modes[i].tileRows : 1;
+                    LOG_INFO("  [%u] %s (views=%u, scale=%.2fx%.2f, tiles=%ux%u, 3D=%d)",
                         modes[i].modeIndex, modes[i].modeName, modes[i].viewCount,
-                        modes[i].viewScaleX, modes[i].viewScaleY, modes[i].hardwareDisplay3D);
+                        modes[i].viewScaleX, modes[i].viewScaleY,
+                        xr.renderingModeTileColumns[i], xr.renderingModeTileRows[i],
+                        modes[i].hardwareDisplay3D);
                 }
             }
         }
@@ -883,6 +1178,8 @@ static bool CreateSwapchains(AppXrSession& xr) {
     xrEnumerateViewConfigurationViews(xr.instance, xr.systemId, xr.viewConfigType, 0, &viewCount, nullptr);
     std::vector<XrViewConfigurationView> views(viewCount, {XR_TYPE_VIEW_CONFIGURATION_VIEW});
     xrEnumerateViewConfigurationViews(xr.instance, xr.systemId, xr.viewConfigType, viewCount, &viewCount, views.data());
+    xr.maxViewCount = viewCount;
+    LOG_INFO("View config: %u views reported by runtime", viewCount);
 
     uint32_t fmtCount = 0;
     xrEnumerateSwapchainFormats(xr.session, 0, &fmtCount, nullptr);
@@ -933,6 +1230,16 @@ static void PollEvents(AppXrSession& xr) {
                 xr.sessionRunning = false;
             } else if (ssc->state == XR_SESSION_STATE_EXITING) {
                 xr.exitRequested = true;
+            }
+        } else if (event.type == (XrStructureType)XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_EXT) {
+            // Runtime (or another client / shell) switched rendering mode on us.
+            auto* rmc = (XrEventDataRenderingModeChangedEXT*)&event;
+            if (rmc->currentModeIndex < xr.renderingModeCount) {
+                g_input.currentRenderingMode = rmc->currentModeIndex;
+                UpdateTopBarButtonTitles(xr);
+                LOG_INFO("Rendering mode changed: %u -> %u (%s)",
+                    rmc->previousModeIndex, rmc->currentModeIndex,
+                    xr.renderingModeNames[rmc->currentModeIndex]);
             }
         }
         event.type = XR_TYPE_EVENT_DATA_BUFFER;
@@ -1023,6 +1330,47 @@ static void RenderPlaceholder(VkDevice dev, VkQueue queue, VkCommandPool pool,
     vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
     vkQueueWaitIdle(queue);
     vkFreeCommandBuffers(dev, pool, 1, &cmd);
+}
+
+// ============================================================================
+// Bundled-scene auto-load
+// ============================================================================
+
+static std::string ExeDir() {
+    char buf[PATH_MAX]; uint32_t sz = sizeof(buf);
+    if (_NSGetExecutablePath(buf, &sz) != 0) return "";
+    char resolved[PATH_MAX];
+    if (!realpath(buf, resolved)) return std::string(buf);
+    return std::string(dirname(resolved));
+}
+
+static bool FileExists(const std::string& p) {
+    struct stat st;
+    return stat(p.c_str(), &st) == 0 && S_ISREG(st.st_mode);
+}
+
+static void ResetVirtualDisplayHeightForNewScene() {
+    g_input.viewParams.virtualDisplayHeight = kDefaultVirtualDisplayHeightM;
+    g_input.viewParams.scaleFactor = 1.0f;
+}
+
+static void TryAutoLoadBundledScene() {
+    std::string dir = ExeDir();
+    if (dir.empty()) return;
+    std::string path = dir + "/butterfly.spz";
+    if (!FileExists(path)) {
+        LOG_INFO("No bundled scene at %s (skipping auto-load)", path.c_str());
+        return;
+    }
+    if (!ValidateSceneFile(path)) return;
+    LOG_INFO("Auto-loading bundled scene: %s", path.c_str());
+    if (g_gsRenderer.loadScene(path.c_str())) {
+        g_loadedFileName = GetPlyFilename(path);
+        LOG_INFO("Loaded %s (%s)", g_loadedFileName.c_str(), GetPlyFileSize(path).c_str());
+        ResetVirtualDisplayHeightForNewScene();
+    } else {
+        LOG_WARN("Auto-load failed for %s", path.c_str());
+    }
 }
 
 // ============================================================================
@@ -1130,13 +1478,21 @@ int main() {
       ci.queueFamilyIndex = queueFamilyIndex;
       vkCreateCommandPool(vkDevice, &ci, nullptr, &cmdPool); }
 
-    g_input.viewParams.virtualDisplayHeight = 0.24f;
+    g_input.viewParams.virtualDisplayHeight = kDefaultVirtualDisplayHeightM;
     g_input.nominalViewerZ = xr.nominalViewerZ;
     g_input.renderingModeCount = xr.renderingModeCount;
+    g_input.lastInputTimeSec = NowSec();
+
+    // Reflect initial state in top-bar buttons.
+    UpdateTopBarButtonTitles(xr);
+
+    // Try loading the bundled butterfly.spz scene (copied next to the exe by CMake).
+    TryAutoLoadBundledScene();
 
     LOG_INFO("=== Entering main loop ===");
-    LOG_INFO("Controls: L=Load Scene, WASD=Move, Drag=Look, Scroll=Scale");
-    LOG_INFO("          V=Cycle Modes, Tab=HUD, 0-3=Select Mode, ESC=Quit");
+    LOG_INFO("Controls: WASDEQ=Move  LMB-drag=Rotate  Scroll=Zoom  DblClick=Focus");
+    LOG_INFO("          -/= Depth  Space=Reset  M=Auto-Orbit  V=Mode");
+    LOG_INFO("          L/Open=Load  Tab=HUD  ESC=Quit  (.ply/.spz also accept drag-and-drop)");
 
     auto lastTime = std::chrono::high_resolution_clock::now();
 
@@ -1149,20 +1505,49 @@ int main() {
         g_frameCount++;
         g_avgFrameTime = g_avgFrameTime * 0.95 + deltaTime * 0.05;
 
-        // Handle load request (from L key or button click)
+        // Handle load request (from L key or Open button)
         if (g_input.loadRequested) {
             g_input.loadRequested = false;
             OpenLoadDialog();
         }
 
+        // Handle drag-and-drop load
+        if (!g_input.pendingLoadPath.empty()) {
+            std::string p = g_input.pendingLoadPath;
+            g_input.pendingLoadPath.clear();
+            if (ValidateSceneFile(p)) {
+                LOG_INFO("Loading dropped scene: %s", p.c_str());
+                if (g_gsRenderer.loadScene(p.c_str())) {
+                    g_loadedFileName = GetPlyFilename(p);
+                    ResetVirtualDisplayHeightForNewScene();
+                }
+            }
+        }
+
+        // Handle Auto-Orbit toggle (M key or button)
+        if (g_input.animateToggleRequested) {
+            g_input.animateToggleRequested = false;
+            g_input.animateEnabled = !g_input.animateEnabled;
+            g_input.lastInputTimeSec = NowSec(); // don't snap-start
+            UpdateTopBarButtonTitles(xr);
+        }
+
+        // Handle Flip toggle (F key or button)
+        if (g_input.flipToggleRequested) {
+            g_input.flipToggleRequested = false;
+            g_input.flipY = !g_input.flipY;
+            UpdateTopBarButtonTitles(xr);
+        }
+
         UpdateCameraMovement(g_input, deltaTime, xr.displayHeightM);
 
-        // Handle rendering mode change (V=cycle, 0-3=direct)
+        // Handle rendering mode change (V=cycle, 0-3=direct, or Mode button)
         if (g_input.renderingModeChangeRequested) {
             g_input.renderingModeChangeRequested = false;
             if (xr.pfnRequestDisplayRenderingModeEXT && xr.session != XR_NULL_HANDLE) {
                 xr.pfnRequestDisplayRenderingModeEXT(xr.session, g_input.currentRenderingMode);
             }
+            UpdateTopBarButtonTitles(xr);
         }
 
         // Handle eye tracking mode toggle
@@ -1180,7 +1565,7 @@ int main() {
         if (xr.sessionRunning) {
             XrFrameState frameState;
             if (BeginFrame(xr, frameState)) {
-                XrCompositionLayerProjectionView projectionViews[2] = {};
+                std::vector<XrCompositionLayerProjectionView> projectionViews;
                 bool rendered = false;
 
                 if (frameState.shouldRender) {
@@ -1194,28 +1579,57 @@ int main() {
                     eyeTrackingState.type = (XrStructureType)XR_TYPE_VIEW_EYE_TRACKING_STATE_EXT;
                     viewState.next = &eyeTrackingState;
 
-                    uint32_t viewCount = 2;
-                    XrView views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+                    uint32_t runtimeViewCount = xr.maxViewCount > 0 ? xr.maxViewCount : 2;
+                    if (runtimeViewCount > 8) runtimeViewCount = 8;
+                    XrView views[8] = {};
+                    for (uint32_t v = 0; v < runtimeViewCount; v++) views[v].type = XR_TYPE_VIEW;
 
-                    XrResult locResult = xrLocateViews(xr.session, &locateInfo, &viewState, 2, &viewCount, views);
+                    XrResult locResult = xrLocateViews(xr.session, &locateInfo, &viewState,
+                        runtimeViewCount, &runtimeViewCount, views);
                     if (XR_SUCCEEDED(locResult) &&
                         (viewState.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) &&
                         (viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT)) {
 
-                        XrVector3f rawEyePos[2] = {views[0].pose.position, views[1].pose.position};
-                        xr.eyePositions[0][0] = rawEyePos[0].x; xr.eyePositions[0][1] = rawEyePos[0].y; xr.eyePositions[0][2] = rawEyePos[0].z;
-                        xr.eyePositions[1][0] = rawEyePos[1].x; xr.eyePositions[1][1] = rawEyePos[1].y; xr.eyePositions[1][2] = rawEyePos[1].z;
+                        // --- Per-frame mode metadata ---
+                        uint32_t modeViewCount = (xr.renderingModeCount > 0 && g_input.currentRenderingMode < xr.renderingModeCount)
+                            ? xr.renderingModeViewCounts[g_input.currentRenderingMode] : 2u;
+                        if (modeViewCount < 1) modeViewCount = 1;
+                        if (modeViewCount > runtimeViewCount) modeViewCount = runtimeViewCount;
+                        bool display3D = (xr.renderingModeCount > 0)
+                            ? xr.renderingModeDisplay3D[g_input.currentRenderingMode] : true;
+                        bool monoMode = !display3D;
+                        uint32_t tileColumns = (xr.renderingModeCount > 0 && xr.renderingModeTileColumns[g_input.currentRenderingMode] > 0)
+                            ? xr.renderingModeTileColumns[g_input.currentRenderingMode]
+                            : (monoMode ? 1u : 2u);
+                        uint32_t tileRows = (xr.renderingModeCount > 0 && xr.renderingModeTileRows[g_input.currentRenderingMode] > 0)
+                            ? xr.renderingModeTileRows[g_input.currentRenderingMode]
+                            : 1u;
+
+                        int eyeCount = monoMode ? 1 : (int)modeViewCount;
+
+                        // Collect raw eye positions for every view this mode uses.
+                        std::vector<XrVector3f> rawEyePos(modeViewCount);
+                        for (uint32_t v = 0; v < modeViewCount; v++)
+                            rawEyePos[v] = views[v].pose.position;
+
+                        // HUD exposes the first two for display; log everything up to 8.
+                        for (uint32_t v = 0; v < modeViewCount && v < 8; v++) {
+                            xr.eyePositions[v][0] = rawEyePos[v].x;
+                            xr.eyePositions[v][1] = rawEyePos[v].y;
+                            xr.eyePositions[v][2] = rawEyePos[v].z;
+                        }
                         xr.isEyeTracking = (eyeTrackingState.isTracking == XR_TRUE);
                         xr.activeEyeTrackingMode = (uint32_t)eyeTrackingState.activeMode;
 
-                        bool monoMode = (xr.renderingModeCount > 0 && !xr.renderingModeDisplay3D[g_input.currentRenderingMode]);
-                        int eyeCount = monoMode ? 1 : 2;
+                        // Mono mode: centroid of all runtime views.
                         if (monoMode) {
-                            rawEyePos[0] = {
-                                (rawEyePos[0].x + rawEyePos[1].x) / 2.0f,
-                                (rawEyePos[0].y + rawEyePos[1].y) / 2.0f,
-                                (rawEyePos[0].z + rawEyePos[1].z) / 2.0f};
-                            rawEyePos[1] = rawEyePos[0];
+                            XrVector3f c = {0, 0, 0};
+                            for (uint32_t v = 0; v < modeViewCount; v++) {
+                                c.x += rawEyePos[v].x; c.y += rawEyePos[v].y; c.z += rawEyePos[v].z;
+                            }
+                            float inv = 1.0f / (float)modeViewCount;
+                            c.x *= inv; c.y *= inv; c.z *= inv;
+                            rawEyePos.assign(1, c);
                         }
 
                         XrPosef cameraPose;
@@ -1226,8 +1640,8 @@ int main() {
 
                         float scaleX = (xr.renderingModeCount > 0 && g_input.currentRenderingMode < xr.renderingModeCount) ? xr.renderingModeScaleX[g_input.currentRenderingMode] : 0.5f;
                         float scaleY = (xr.renderingModeCount > 0 && g_input.currentRenderingMode < xr.renderingModeCount) ? xr.renderingModeScaleY[g_input.currentRenderingMode] : 1.0f;
-                        uint32_t eyeRenderW = xr.swapchain.width / 2;
-                        uint32_t eyeRenderH = xr.swapchain.height;
+                        uint32_t tileW = xr.swapchain.width / (tileColumns ? tileColumns : 1);
+                        uint32_t tileH = xr.swapchain.height / (tileRows ? tileRows : 1);
                         uint32_t renderW, renderH;
                         if (monoMode) {
                             renderW = g_windowW; renderH = g_windowH;
@@ -1236,13 +1650,14 @@ int main() {
                         } else {
                             renderW = (uint32_t)(g_windowW * scaleX);
                             renderH = (uint32_t)(g_windowH * scaleY);
-                            if (renderW > eyeRenderW) renderW = eyeRenderW;
-                            if (renderH > eyeRenderH) renderH = eyeRenderH;
+                            if (renderW > tileW) renderW = tileW;
+                            if (renderH > tileH) renderH = tileH;
                         }
                         g_renderW = renderW; g_renderH = renderH;
 
-                        // Stereo views (Kooima)
-                        Display3DView stereoViews[2];
+                        // Per-view Kooima pose + projection — one entry per view in this
+                        // multiview mode (1 for mono, 2 for stereo, 4 for quad, etc.).
+                        std::vector<Display3DView> eyeViews((size_t)eyeCount);
                         bool hasKooima = (xr.displayWidthM > 0 && xr.displayHeightM > 0);
                         if (hasKooima) {
                             float dispPxW = xr.displayPixelWidth > 0 ? (float)xr.displayPixelWidth : (float)xr.swapchain.width;
@@ -1268,10 +1683,7 @@ int main() {
                                 eyeOffsetX = (winCenterX - dispCenterX) * pxSizeXBacking;
                                 eyeOffsetY = (winCenterY - dispCenterY) * pxSizeYBacking;
                             }
-
-                            // Apply window center offset to raw eye positions
-                            rawEyePos[0].x -= eyeOffsetX; rawEyePos[0].y -= eyeOffsetY;
-                            rawEyePos[1].x -= eyeOffsetX; rawEyePos[1].y -= eyeOffsetY;
+                            for (auto& e : rawEyePos) { e.x -= eyeOffsetX; e.y -= eyeOffsetY; }
 
                             Display3DScreen screen = {winW_m, winH_m};
                             Display3DTunables tunables;
@@ -1281,51 +1693,101 @@ int main() {
                             tunables.virtual_display_height = g_input.viewParams.virtualDisplayHeight / g_input.viewParams.scaleFactor;
 
                             display3d_compute_views(
-                                rawEyePos, 2, &nominalViewer,
+                                rawEyePos.data(), (uint32_t)eyeCount, &nominalViewer,
                                 &screen, &tunables, &cameraPose,
-                                0.01f, 100.0f, stereoViews);
+                                0.01f, 100.0f, eyeViews.data());
+
+                            if (g_input.flipY) {
+                                for (auto& v : eyeViews) view_apply_y_flip(v.view_matrix);
+                            }
                         }
 
-                        // Double-click teleport: unproject through left eye matrices
+                        // Double-click focus: ray from CENTER physical eyes through the
+                        // physical mouse location on the display surface, pick nearest splat,
+                        // then smoothly move & re-orient the virtual display to face back
+                        // along the ray.
                         if (g_input.teleportRequested && hasKooima) {
                             g_input.teleportRequested = false;
                             NSSize viewSize = [[g_window contentView] bounds].size;
-
-                            // Mouse to NDC. NSView Y=0 at bottom, but shader ndc2Pix maps
-                            // ndcY=-1 to pixel 0 (top of image), so negate Y.
                             float ndcX = 2.0f * g_input.teleportMouseX / (float)viewSize.width - 1.0f;
                             float ndcY = -(2.0f * g_input.teleportMouseY / (float)viewSize.height - 1.0f);
 
-                            // Unproject NDC through left eye projection (column-major)
-                            const float *P = stereoViews[0].projection_matrix;
-                            float vx = (ndcX + P[8]) / P[0];
-                            float vy = (ndcY + P[9]) / P[5];
-                            float vz = -1.0f;
+                            // Build a center-eye Display3DView from the averaged processed
+                            // display-space eye so unprojection is truly from the viewpoint
+                            // midpoint (not from the left eye, which is off by ~IPD/2).
+                            float dispPxW2 = xr.displayPixelWidth > 0 ? (float)xr.displayPixelWidth : (float)xr.swapchain.width;
+                            float dispPxH2 = xr.displayPixelHeight > 0 ? (float)xr.displayPixelHeight : (float)xr.swapchain.height;
+                            float winW_m2 = (float)g_windowW * (xr.displayWidthM / dispPxW2);
+                            float winH_m2 = (float)g_windowH * (xr.displayHeightM / dispPxH2);
+                            Display3DScreen screen2 = {winW_m2, winH_m2};
+                            Display3DTunables tunables2;
+                            tunables2.ipd_factor = g_input.viewParams.ipdFactor;
+                            tunables2.parallax_factor = g_input.viewParams.parallaxFactor;
+                            tunables2.perspective_factor = g_input.viewParams.perspectiveFactor;
+                            tunables2.virtual_display_height = g_input.viewParams.virtualDisplayHeight / g_input.viewParams.scaleFactor;
 
-                            // View-space direction to world-space via inverse view rotation (transpose of 3x3)
-                            const float *V = stereoViews[0].view_matrix;
-                            float wx = V[0]*vx + V[1]*vy + V[2]*vz;
-                            float wy = V[4]*vx + V[5]*vy + V[6]*vz;
-                            float wz = V[8]*vx + V[9]*vy + V[10]*vz;
+                            XrVector3f centerEyeDisp = {0, 0, 0};
+                            for (const auto& sv : eyeViews) {
+                                centerEyeDisp.x += sv.eye_display.x;
+                                centerEyeDisp.y += sv.eye_display.y;
+                                centerEyeDisp.z += sv.eye_display.z;
+                            }
+                            float invN = 1.0f / (float)eyeViews.size();
+                            centerEyeDisp.x *= invN;
+                            centerEyeDisp.y *= invN;
+                            centerEyeDisp.z *= invN;
+                            // eye_display is processed_eye * (perspective_factor * virtual_display_height / winH_m);
+                            // invert so display3d_compute_view can re-apply it consistently.
+                            float m2v_post = tunables2.virtual_display_height / winH_m2;
+                            float es = tunables2.perspective_factor * m2v_post;
+                            XrVector3f centerEyeProcessed = (es != 0.0f)
+                                ? (XrVector3f){centerEyeDisp.x / es, centerEyeDisp.y / es, centerEyeDisp.z / es}
+                                : centerEyeDisp;
+                            Display3DView centerView;
+                            display3d_compute_view(&centerEyeProcessed, &screen2, &tunables2,
+                                                   &cameraPose, 0.01f, 100.0f, &centerView);
+                            if (g_input.flipY) view_apply_y_flip(centerView.view_matrix);
 
-                            // Normalize world ray direction
-                            float len = sqrtf(wx*wx + wy*wy + wz*wz);
-                            float rayDir[3] = {wx/len, wy/len, wz/len};
+                            XrVector3f rayOriginV, rayDirV;
+                            display3d_unproject_ndc_to_ray(ndcX, ndcY,
+                                centerView.view_matrix, centerView.projection_matrix,
+                                &rayOriginV, &rayDirV);
 
-                            // Ray origin = left eye world position
-                            float rayOrigin[3] = {
-                                stereoViews[0].eye_world.x,
-                                stereoViews[0].eye_world.y,
-                                stereoViews[0].eye_world.z
-                            };
-
+                            float rayOrigin[3] = {rayOriginV.x, rayOriginV.y, rayOriginV.z};
+                            float rayDir[3]    = {rayDirV.x,    rayDirV.y,    rayDirV.z};
                             float hitPos[3];
                             if (g_gsRenderer.pickGaussian(rayOrigin, rayDir, hitPos)) {
-                                g_input.teleportAnimating = true;
-                                g_input.teleportTargetX = hitPos[0];
-                                g_input.teleportTargetY = hitPos[1];
-                                g_input.teleportTargetZ = hitPos[2];
-                                LOG_INFO("Teleporting to (%.3f, %.3f, %.3f)", hitPos[0], hitPos[1], hitPos[2]);
+                                // pickGaussian always operates on REAL splat positions, regardless
+                                // of whether the unproject used a Y-flipped view matrix. When flipY
+                                // is on, the user visually sees that splat mirrored across the XZ
+                                // plane — so the display should land at the visual location
+                                // (F_y * hitPos), not the real one. Recompute the alignment ray
+                                // from the un-flipped real eye to the visual hit.
+                                XrVector3f visualHit = {hitPos[0], hitPos[1], hitPos[2]};
+                                XrVector3f alignRayDir = rayDirV;
+                                if (g_input.flipY) {
+                                    visualHit.y = -visualHit.y;
+                                    XrVector3f realEye = {rayOriginV.x, -rayOriginV.y, rayOriginV.z};
+                                    float dx = visualHit.x - realEye.x;
+                                    float dy = visualHit.y - realEye.y;
+                                    float dz = visualHit.z - realEye.z;
+                                    float dl = sqrtf(dx*dx + dy*dy + dz*dz);
+                                    if (dl > 1e-6f) {
+                                        alignRayDir.x = dx / dl;
+                                        alignRayDir.y = dy / dl;
+                                        alignRayDir.z = dz / dl;
+                                    }
+                                }
+                                XrVector3f upHint = {0, 1, 0};
+                                XrPosef target;
+                                display3d_align_pose_to_ray(visualHit, alignRayDir, upHint, &target);
+                                g_input.transitionFrom = cameraPose;
+                                g_input.transitionTo = target;
+                                g_input.transitionT = 0.0f;
+                                g_input.transitioning = true;
+                                LOG_INFO("Focus on splat (%.3f, %.3f, %.3f)%s",
+                                    visualHit.x, visualHit.y, visualHit.z,
+                                    g_input.flipY ? " [flipped]" : "");
                             }
                         } else if (g_input.teleportRequested) {
                             g_input.teleportRequested = false; // consume without Kooima
@@ -1334,27 +1796,36 @@ int main() {
                         rendered = true;
                         uint32_t imageIndex;
                         if (AcquireSwapchainImage(xr, imageIndex)) {
-                            // Build per-eye view/proj matrices
-                            float viewMat[2][16], projMat[2][16];
+                            projectionViews.assign((size_t)eyeCount, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
+                            std::vector<std::array<float, 16>> viewMat((size_t)eyeCount);
+                            std::vector<std::array<float, 16>> projMat((size_t)eyeCount);
+                            std::vector<std::pair<uint32_t, uint32_t>> tileOffsets((size_t)eyeCount);
                             for (int eye = 0; eye < eyeCount; eye++) {
+                                int srcView = eye < (int)runtimeViewCount ? eye : 0;
                                 if (hasKooima) {
-                                    memcpy(viewMat[eye], stereoViews[eye].view_matrix, sizeof(float) * 16);
-                                    memcpy(projMat[eye], stereoViews[eye].projection_matrix, sizeof(float) * 16);
-                                    views[eye].pose.position = stereoViews[eye].eye_world;
-                                    views[eye].pose.orientation = cameraPose.orientation;
+                                    memcpy(viewMat[eye].data(), eyeViews[eye].view_matrix, sizeof(float) * 16);
+                                    memcpy(projMat[eye].data(), eyeViews[eye].projection_matrix, sizeof(float) * 16);
+                                    views[srcView].pose.position = eyeViews[eye].eye_world;
+                                    views[srcView].pose.orientation = cameraPose.orientation;
                                 } else {
-                                    mat4_view_from_xr_pose(viewMat[eye], views[eye].pose);
-                                    mat4_from_xr_fov(projMat[eye], views[eye].fov, 0.01f, 100.0f);
+                                    mat4_view_from_xr_pose(viewMat[eye].data(), views[srcView].pose);
+                                    mat4_from_xr_fov(projMat[eye].data(), views[srcView].fov, 0.01f, 100.0f);
                                 }
 
-                                uint32_t vpX = monoMode ? 0 : (eye * renderW);
+                                // Tile-aware viewport (2×2 atlas for Quad, SBS for stereo, etc.).
+                                uint32_t tileX = display3D ? (uint32_t)(eye % (int)tileColumns) : 0;
+                                uint32_t tileY = display3D ? (uint32_t)(eye / (int)tileColumns) : 0;
+                                uint32_t vpX = tileX * renderW;
+                                uint32_t vpY = tileY * renderH;
+                                tileOffsets[eye] = {vpX, vpY};
+
                                 projectionViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
                                 projectionViews[eye].subImage.swapchain = xr.swapchain.swapchain;
-                                projectionViews[eye].subImage.imageRect.offset = {(int32_t)vpX, 0};
+                                projectionViews[eye].subImage.imageRect.offset = {(int32_t)vpX, (int32_t)vpY};
                                 projectionViews[eye].subImage.imageRect.extent = {(int32_t)renderW, (int32_t)renderH};
                                 projectionViews[eye].subImage.imageArrayIndex = 0;
-                                projectionViews[eye].pose = views[eye].pose;
-                                projectionViews[eye].fov = hasKooima ? stereoViews[eye].fov : views[eye].fov;
+                                projectionViews[eye].pose = views[srcView].pose;
+                                projectionViews[eye].fov = hasKooima ? eyeViews[eye].fov : views[srcView].fov;
                             }
 
                             // Render 3DGS or placeholder
@@ -1363,12 +1834,12 @@ int main() {
 
                             if (g_gsRenderer.hasScene()) {
                                 for (int eye = 0; eye < eyeCount; eye++) {
-                                    uint32_t vpX = monoMode ? 0 : (eye * renderW);
                                     g_gsRenderer.renderEye(
                                         targetImage, swapFormat,
                                         xr.swapchain.width, xr.swapchain.height,
-                                        vpX, 0, renderW, renderH,
-                                        viewMat[eye], projMat[eye]);
+                                        tileOffsets[eye].first, tileOffsets[eye].second,
+                                        renderW, renderH,
+                                        viewMat[eye].data(), projMat[eye].data());
                                 }
                             } else {
                                 RenderPlaceholder(vkDevice, graphicsQueue, cmdPool,
@@ -1384,8 +1855,8 @@ int main() {
                 }
 
                 if (rendered) {
-                    uint32_t submitCount = (xr.renderingModeCount > 0 && g_input.currentRenderingMode < xr.renderingModeCount) ? xr.renderingModeViewCounts[g_input.currentRenderingMode] : 2u;
-                    EndFrame(xr, frameState.predictedDisplayTime, projectionViews, submitCount);
+                    EndFrame(xr, frameState.predictedDisplayTime,
+                        projectionViews.data(), (uint32_t)projectionViews.size());
                 } else {
                     XrFrameEndInfo ei = {XR_TYPE_FRAME_END_INFO};
                     ei.displayTime = frameState.predictedDisplayTime;
@@ -1409,53 +1880,59 @@ int main() {
                         ? [NSString stringWithFormat:@"Scene: %s", g_loadedFileName.c_str()]
                         : @"No scene loaded (press L)";
 
+                    int depthPct = (int)(g_input.viewParams.ipdFactor * 100.0f + 0.5f);
+                    const char *orbitLabel = g_input.animateEnabled
+                        ? (g_input.animationActive ? "ON (running)" : "ON (idle countdown)")
+                        : "OFF";
+                    const char *flipLabel = g_input.flipY ? "ON" : "OFF";
+                    uint32_t activeViewCount = (xr.renderingModeCount > 0 && g_input.currentRenderingMode < xr.renderingModeCount)
+                        ? xr.renderingModeViewCounts[g_input.currentRenderingMode] : 2u;
+                    NSMutableString *eyesStr = [NSMutableString string];
+                    for (uint32_t v = 0; v < activeViewCount && v < 8; v++) {
+                        [eyesStr appendFormat:@"View %u: (%.3f, %.3f, %.3f)\n", v,
+                            xr.eyePositions[v][0], xr.eyePositions[v][1], xr.eyePositions[v][2]];
+                    }
                     NSString *text = [NSString stringWithFormat:
                         @"%s\nSession: %d\n"
-                        "Mode: %s (%s)\n"
+                        "Mode: %s (%s, %u view%s)\n"
                         "%@\n"
+                        "Depth/IPD: %d%%  Zoom: %.2fx  Auto-Orbit: %s  Flip: %s\n"
                         "FPS: %.0f (%.1f ms)\n"
                         "Render: %ux%u  Window: %ux%u\n"
                         "Display: %.3f x %.3f m\n"
-                        "Eye L: (%.3f, %.3f, %.3f)\n"
-                        "Eye R: (%.3f, %.3f, %.3f)\n"
-                        "Camera: (%.2f, %.2f, %.2f)\n"
-                        "Fwd: (%.3f, %.3f, %.3f)\n"
-                        "IPD: %.2f  Parallax: %.2f  Scale: %.2f\n"
-                        "\nL=Load  WASD=Move  DblClick=Teleport\n"
-                        "Scroll=Scale  Shift+Scroll=IPD+Parallax\n"
-                        "V=Mode  Tab=HUD  Space=Reset  ESC=Quit",
+                        "%@"
+                        "Vdisplay: (%.2f, %.2f, %.2f)\n"
+                        "\nWASDEQ=Move  LMB-drag=Rotate  Scroll=Zoom\n"
+                        "DblClick=Focus splat  -/= Depth  Space=Reset\n"
+                        "M=Auto-Orbit  F=Flip  V=Mode  L=Load  Tab=HUD  ESC=Quit",
                         xr.systemName, (int)xr.sessionState,
                         (xr.renderingModeCount > 0 && xr.renderingModeNames[g_input.currentRenderingMode][0] != '\0') ? xr.renderingModeNames[g_input.currentRenderingMode] : "Unknown",
                         (xr.renderingModeCount > 0 ? (xr.renderingModeDisplay3D[g_input.currentRenderingMode] ? "3D" : "2D") : "3D"),
+                        activeViewCount, activeViewCount == 1 ? "" : "s",
                         sceneInfo,
+                        depthPct, g_input.viewParams.scaleFactor, orbitLabel, flipLabel,
                         fps, g_avgFrameTime * 1000.0,
                         g_renderW, g_renderH, g_windowW, g_windowH,
                         xr.displayWidthM, xr.displayHeightM,
-                        xr.eyePositions[0][0], xr.eyePositions[0][1], xr.eyePositions[0][2],
-                        xr.eyePositions[1][0], xr.eyePositions[1][1], xr.eyePositions[1][2],
-                        g_input.cameraPosX, g_input.cameraPosY, g_input.cameraPosZ,
-                        cosf(g_input.pitch) * sinf(g_input.yaw),
-                        -sinf(g_input.pitch),
-                        -cosf(g_input.pitch) * cosf(g_input.yaw),
-                        g_input.viewParams.ipdFactor, g_input.viewParams.parallaxFactor,
-                        g_input.viewParams.scaleFactor];
+                        eyesStr,
+                        g_input.cameraPosX, g_input.cameraPosY, g_input.cameraPosZ];
                     g_hudView.hudText = text;
-                    // Auto-size HUD to fit text
+                    // Auto-size the frosted backdrop to fit the text; inner view auto-resizes.
                     NSDictionary *attrs = @{
-                        NSFontAttributeName: [NSFont monospacedSystemFontOfSize:10 weight:NSFontWeightRegular]
+                        NSFontAttributeName: [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular]
                     };
-                    NSRect textBounds = [text boundingRectWithSize:NSMakeSize(400, CGFLOAT_MAX)
+                    NSRect textBounds = [text boundingRectWithSize:NSMakeSize(420, CGFLOAT_MAX)
                                          options:NSStringDrawingUsesLineFragmentOrigin
                                          attributes:attrs];
-                    CGFloat pad = 16.0;
+                    CGFloat pad = 20.0;
                     NSRect hudFrame = NSMakeRect(8, 8,
                         ceilf(textBounds.size.width + pad),
                         ceilf(textBounds.size.height + pad));
-                    [g_hudView setFrame:hudFrame];
+                    [g_hudBackdrop setFrame:hudFrame];
                     [g_hudView setNeedsDisplay:YES];
-                    [g_hudView setHidden:NO];
-                } else if (g_hudView != nil) {
-                    [g_hudView setHidden:YES];
+                    [g_hudBackdrop setHidden:NO];
+                } else if (g_hudBackdrop != nil) {
+                    [g_hudBackdrop setHidden:YES];
                 }
             }
         }

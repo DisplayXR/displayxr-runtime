@@ -13,6 +13,7 @@
 #include <windows.h>
 #include <string>
 
+#include <openxr/openxr.h>
 #include "view_params.h"
 
 struct InputState {
@@ -84,6 +85,26 @@ struct InputState {
 
     // Eye tracking mode toggle (T key)
     bool eyeTrackingModeToggleRequested = false;
+
+    // --- Gaussian-splat demo extensions (additive; unused by cube_* apps) ---
+
+    // Smooth display-pose transition (double-click focus). When active,
+    // UpdateCameraMovement interpolates pose and rewrites cameraPos + yaw/pitch.
+    bool transitioning = false;
+    XrPosef transitionFrom = {{0,0,0,1}, {0,0,0}};
+    XrPosef transitionTo   = {{0,0,0,1}, {0,0,0}};
+    float transitionT = 0.0f;
+    float transitionDuration = 0.45f;
+
+    // Auto-orbit (turntable) — idle-timer gated yaw advance.
+    bool animateEnabled = false;
+    double lastInputTimeSec = 0.0;
+    bool animationActive = false;          // derived: (animateEnabled && idle>10s)
+    bool animateToggleRequested = false;   // set by 'M' key or UI button
+
+    // File-open / drag-drop queue (app-populated, app-consumed).
+    std::string pendingLoadPath;
+    bool loadRequested = false;            // app queues; caller shows dialog
 };
 
 // Process a Win32 message and update input state

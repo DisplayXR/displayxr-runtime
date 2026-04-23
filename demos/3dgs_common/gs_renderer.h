@@ -58,6 +58,10 @@ struct GsRenderer {
     bool pickGaussian(const float rayOrigin[3], const float rayDir[3],
                       float hitPos[3], float maxDistance = 100.0f) const;
 
+    // World-space axis-aligned bounding box of loaded splat centers.
+    // Returns false if no scene is loaded; otherwise writes min/max xyz.
+    bool getSceneBBox(float outMin[3], float outMax[3]) const;
+
     // Render one eye's view to a region of a Vulkan swapchain image.
     // Manages its own command buffers internally (allocate, record, submit, wait).
     // viewMatrix and projMatrix are column-major float[16].

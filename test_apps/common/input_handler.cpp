@@ -6,8 +6,25 @@
  */
 
 #include "input_handler.h"
+#include "display3d_view.h"
 #include <DirectXMath.h>
+#include <chrono>
+#include <cmath>
 #include <sstream>
+
+using namespace DirectX;
+
+// Monotonic wall-clock seconds — matches macOS NowSec() semantics.
+static double NowSec() {
+    using namespace std::chrono;
+    return (double)duration_cast<microseconds>(
+        high_resolution_clock::now().time_since_epoch()).count() * 1e-6;
+}
+
+static void MarkUserInput(InputState& state) {
+    state.lastInputTimeSec = NowSec();
+    state.animationActive = false;
+}
 
 // Helper to get key name from virtual key code
 static std::string GetKeyName(WPARAM vk) {
@@ -56,6 +73,7 @@ bool UpdateInputState(InputState& state, UINT msg, WPARAM wParam, LPARAM lParam)
 
         // Update camera rotation if dragging
         if (state.dragging) {
+            MarkUserInput(state);
             int dx = state.mouseX - state.dragStartX;
             int dy = state.mouseY - state.dragStartY;
             state.yaw -= dx * 0.005f;
@@ -69,12 +87,14 @@ bool UpdateInputState(InputState& state, UINT msg, WPARAM wParam, LPARAM lParam)
         return true;
 
     case WM_LBUTTONDBLCLK:
+        MarkUserInput(state);
         state.teleportRequested = true;
         state.teleportMouseX = (float)LOWORD(lParam);
         state.teleportMouseY = (float)HIWORD(lParam);
         return true;
 
     case WM_LBUTTONDOWN:
+        MarkUserInput(state);
         state.leftButton = true;
         state.dragging = true;
         state.dragStartX = state.mouseX;
@@ -106,6 +126,7 @@ bool UpdateInputState(InputState& state, UINT msg, WPARAM wParam, LPARAM lParam)
         return true;
 
     case WM_MOUSEWHEEL: {
+        MarkUserInput(state);
         int zDelta = GET_WHEEL_DELTA_WPARAM(wParam);
         float factor = (zDelta > 0) ? 1.1f : (1.0f / 1.1f);
         bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
@@ -144,6 +165,7 @@ bool UpdateInputState(InputState& state, UINT msg, WPARAM wParam, LPARAM lParam)
     }
 
     case WM_KEYDOWN:
+        MarkUserInput(state);
         state.lastKey = GetKeyName(wParam);
         switch (wParam) {
         case 'W': state.keyW = true; break;
@@ -152,6 +174,23 @@ bool UpdateInputState(InputState& state, UINT msg, WPARAM wParam, LPARAM lParam)
         case 'D': state.keyD = true; break;
         case 'E': state.keyE = true; break;
         case 'Q': state.keyQ = true; break;
+        case 'M':
+            state.animateToggleRequested = true;
+            break;
+        case VK_OEM_MINUS: {
+            float v = state.viewParams.ipdFactor - 0.1f;
+            if (v < 0.1f) v = 0.1f;
+            state.viewParams.ipdFactor = v;
+            state.viewParams.parallaxFactor = v;
+            break;
+        }
+        case VK_OEM_PLUS: {
+            float v = state.viewParams.ipdFactor + 0.1f;
+            if (v > 1.0f) v = 1.0f;
+            state.viewParams.ipdFactor = v;
+            state.viewParams.parallaxFactor = v;
+            break;
+        }
         case VK_SPACE:
             state.resetViewRequested = true;
             break;
@@ -274,6 +313,38 @@ void UpdateCameraMovement(InputState& state, float deltaTime, float displayHeigh
         }
         state.resetViewRequested = false;
         state.teleportAnimating = false;
+        state.transitioning = false;
+        state.animateEnabled = false;
+        state.animationActive = false;
+        state.lastInputTimeSec = NowSec();
+        return;
+    }
+
+    // Smooth display-pose transition (slerp) — gaussian-splat demo path.
+    if (state.transitioning) {
+        state.transitionT += deltaTime;
+        float u = state.transitionT / state.transitionDuration;
+        if (u >= 1.0f) u = 1.0f;
+        float invU = 1.0f - u;
+        float eased = 1.0f - invU * invU * invU;   // ease-out cubic
+        XrPosef cur;
+        display3d_pose_slerp(&state.transitionFrom, &state.transitionTo, eased, &cur);
+        state.cameraPosX = cur.position.x;
+        state.cameraPosY = cur.position.y;
+        state.cameraPosZ = cur.position.z;
+        // Decompose quaternion back into yaw/pitch (DirectXMath RollPitchYaw convention).
+        XMVECTOR q = XMVectorSet(cur.orientation.x, cur.orientation.y, cur.orientation.z, cur.orientation.w);
+        XMVECTOR fwd = XMVector3Rotate(XMVectorSet(0, 0, -1, 0), q);
+        XMFLOAT3 f;
+        XMStoreFloat3(&f, fwd);
+        // Inverse of XMQuaternionRotationRollPitchYaw(p, y, 0): for small angles,
+        // fwd = q * (0,0,-1) ≈ (-sin(y), sin(p), -cos(y)) (same signs as macOS path).
+        state.yaw = atan2f(-f.x, -f.z);
+        float fy = f.y;
+        if (fy > 1.0f) fy = 1.0f;
+        if (fy < -1.0f) fy = -1.0f;
+        state.pitch = asinf(fy);
+        if (u >= 1.0f) state.transitioning = false;
         return;
     }
 
@@ -286,7 +357,6 @@ void UpdateCameraMovement(InputState& state, float deltaTime, float displayHeigh
 
     // Build orientation quaternion using the same function as LocateViews,
     // guaranteeing movement vectors match the view rotation exactly.
-    using namespace DirectX;
     XMVECTOR ori = XMQuaternionRotationRollPitchYaw(state.pitch, state.yaw, 0.0f);
 
     // Derive direction vectors by rotating basis vectors with the quaternion
@@ -329,7 +399,7 @@ void UpdateCameraMovement(InputState& state, float deltaTime, float displayHeigh
         state.cameraPosZ -= up.z * moveSpeed * deltaTime;
     }
 
-    // Teleport animation: exponential ease-out
+    // Teleport animation: exponential ease-out (legacy path used by cube_* apps).
     if (state.teleportAnimating) {
         float t = 1.0f - expf(-10.0f * deltaTime); // ~90% in 0.23s
         state.cameraPosX += (state.teleportTargetX - state.cameraPosX) * t;
@@ -340,6 +410,18 @@ void UpdateCameraMovement(InputState& state, float deltaTime, float displayHeigh
         float dz = state.teleportTargetZ - state.cameraPosZ;
         if (dx*dx + dy*dy + dz*dz < 1e-8f)
             state.teleportAnimating = false;
+    }
+
+    // Auto-orbit: if enabled and user idle > 10s, slowly yaw the display.
+    if (state.animateEnabled && state.lastInputTimeSec > 0.0) {
+        double idleFor = NowSec() - state.lastInputTimeSec;
+        state.animationActive = (idleFor > 10.0);
+        if (state.animationActive) {
+            float rate = 6.2831853f / 20.0f; // one revolution per 20 seconds
+            state.yaw += rate * deltaTime;
+        }
+    } else {
+        state.animationActive = false;
     }
 }
 

@@ -87,3 +87,12 @@ add_custom_command(TARGET gaussian_splatting_handle_vk_macos POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different ${TEXTURE_FILES} "$<TARGET_FILE_DIR:gaussian_splatting_handle_vk_macos>/textures/"
     COMMENT "Copying texture files to build output"
 )
+
+# Copy bundled default scene next to the exe (auto-loaded at startup).
+set(BUNDLED_SCENE "${CMAKE_CURRENT_SOURCE_DIR}/assets/butterfly.spz")
+if(EXISTS "${BUNDLED_SCENE}")
+    add_custom_command(TARGET gaussian_splatting_handle_vk_macos POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${BUNDLED_SCENE}" "$<TARGET_FILE_DIR:gaussian_splatting_handle_vk_macos>/butterfly.spz"
+        COMMENT "Copying bundled butterfly.spz next to exe"
+    )
+endif()
