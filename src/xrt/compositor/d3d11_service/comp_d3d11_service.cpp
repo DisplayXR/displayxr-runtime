@@ -792,9 +792,13 @@ struct d3d11_multi_compositor
 		float target_angle;      //!< Target angle to animate toward (for TAB snap-to-front)
 	} dynamic_layout;
 
-	//! Hovered button: 0=none, 1=close, 2=minimize, for the hovered slot.
+	//! Hovered button: 0=none, 1=close, 2=minimize, 3=maximize, for the hovered slot.
 	int hover_btn;
 	int hover_btn_slot;
+
+	//! Momentary toast notification (e.g. "how to restore after fullscreen").
+	char toast_text[256];
+	uint64_t toast_until_ns;
 
 	//! Previous frame LMB/RMB state (for rising-edge detection).
 	bool prev_lmb_held;
@@ -4529,8 +4533,9 @@ struct shell_hit_result
 {
 	int slot;            //!< Hit window slot (-1 = no hit)
 	bool in_title_bar;   //!< Hit is in the title bar region
-	bool in_close_btn;   //!< Hit is on the close button
+	bool in_close_btn;    //!< Hit is on the close button
 	bool in_minimize_btn; //!< Hit is on the minimize button
+	bool in_maximize_btn; //!< Hit is on the maximize/fullscreen button
 	bool in_content;     //!< Hit is in the content area
 	float local_x_m;    //!< Hit point in window-local meters (0 = left edge)
 	float local_y_m;    //!< Hit point in window-local meters (0 = top of title bar, positive down)
@@ -4908,6 +4913,8 @@ shell_raycast_hit_test(struct d3d11_service_system *sys,
 				result.in_close_btn = (local_x >= win_w - btn_w_m);
 				result.in_minimize_btn = !result.in_close_btn &&
 				                         (local_x >= win_w - 2.0f * btn_w_m);
+				result.in_maximize_btn = !result.in_close_btn && !result.in_minimize_btn &&
+				                         (local_x >= win_w - 3.0f * btn_w_m);
 			}
 
 			// Edge detection (resize zones)
@@ -5071,6 +5078,7 @@ toggle_fullscreen(struct d3d11_service_system *sys,
 		                mc->clients[slot].pre_max_height_m,
 		                now_ns, ANIM_DURATION_NS);
 		mc->clients[slot].maximized = false;
+		mc->toast_until_ns = 0; // dismiss restore hint
 		// Un-hide windows that were hidden by fullscreen
 		for (int j = 0; j < D3D11_MULTI_MAX_CLIENTS; j++) {
 			if (mc->clients[j].fullscreen_minimized) {
@@ -5096,6 +5104,10 @@ toggle_fullscreen(struct d3d11_service_system *sys,
 		                disp_h_m,
 		                now_ns, ANIM_DURATION_NS);
 		mc->clients[slot].maximized = true;
+		// Show restore hint toast for 3 seconds
+		snprintf(mc->toast_text, sizeof(mc->toast_text),
+		         "Click [^] button or double-click title bar to restore");
+		mc->toast_until_ns = os_monotonic_get_ns() + 3000000000ULL;
 		// Hide all other windows
 		for (int j = 0; j < D3D11_MULTI_MAX_CLIENTS; j++) {
 			if (j != slot && mc->clients[j].active && !mc->clients[j].minimized) {
@@ -5848,9 +5860,10 @@ after_key_shortcuts:
 			mc->hover_btn_slot = -1;
 			if (hover.in_close_btn) { mc->hover_btn = 1; mc->hover_btn_slot = hover.slot; }
 			else if (hover.in_minimize_btn) { mc->hover_btn = 2; mc->hover_btn_slot = hover.slot; }
+			else if (hover.in_maximize_btn) { mc->hover_btn = 3; mc->hover_btn_slot = hover.slot; }
 
 			// Buttons get arrow cursor (no resize/drag cursor on buttons)
-			if (hover.in_close_btn || hover.in_minimize_btn) {
+			if (hover.in_close_btn || hover.in_minimize_btn || hover.in_maximize_btn) {
 				cursor_id = 0; // arrow
 			} else {
 				int ef = hover.edge_flags;
@@ -5885,7 +5898,7 @@ after_key_shortcuts:
 				ScreenToClient(mc->hwnd, &pt);
 				struct shell_hit_result hit = shell_raycast_hit_test(sys, mc, pt);
 				// Close/minimize/background/taskbar → normal handler
-				if (hit.slot < 0 || hit.in_close_btn || hit.in_minimize_btn) {
+				if (hit.slot < 0 || hit.in_close_btn || hit.in_minimize_btn || hit.in_maximize_btn) {
 					goto normal_lmb_handling;
 				}
 				// Content click → pause rotation, focus window.
@@ -5995,7 +6008,7 @@ after_key_shortcuts:
 
 			// Edge/corner resize takes priority (unless clicking a title bar button)
 			if (hit.slot >= 0 && hit.edge_flags != RESIZE_NONE &&
-			    !hit.in_close_btn && !hit.in_minimize_btn) {
+			    !hit.in_close_btn && !hit.in_minimize_btn && !hit.in_maximize_btn) {
 				mc->resize.active = true;
 				mc->resize.slot = hit.slot;
 				mc->resize.edges = hit.edge_flags;
@@ -6019,6 +6032,7 @@ after_key_shortcuts:
 			bool in_title_bar = hit.in_title_bar;
 			bool in_close_btn = hit.in_close_btn;
 			bool in_minimize_btn = hit.in_minimize_btn;
+			bool in_maximize_btn = hit.in_maximize_btn;
 
 			// Debug: log click coordinates and hit results
 			if (hit_slot >= 0 && in_title_bar) {
@@ -6046,6 +6060,8 @@ after_key_shortcuts:
 						U_LOG_W("Multi-comp: close button → exit request for slot %d", hit_slot);
 					}
 				}
+			} else if (in_maximize_btn && hit_slot >= 0) {
+				toggle_fullscreen(sys, mc, hit_slot);
 			} else if (in_minimize_btn && hit_slot >= 0) {
 				// Minimize button: hide window
 				mc->clients[hit_slot].minimized = true;
@@ -7187,6 +7203,30 @@ after_key_shortcuts:
 							sys->context->Draw(4, 0);
 						}
 					}
+					// Maximize/fullscreen button (blue)
+					{
+						D3D11_MAPPED_SUBRESOURCE mapped;
+						if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
+						              D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+							BlitConstants *cb = static_cast<BlitConstants *>(mapped.pData);
+							bool max_hover = (mc->hover_btn == 3 && mc->hover_btn_slot == s);
+							cb->src_rect[0] = max_hover ? 0.30f : 0.20f;
+							cb->src_rect[1] = max_hover ? 0.50f : 0.35f;
+							cb->src_rect[2] = max_hover ? 0.85f : 0.70f;
+							cb->src_rect[3] = 1.0f;
+							cb->src_size[0] = 1; cb->src_size[1] = 1;
+							cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
+							cb->convert_srgb = 2.0f;
+							cb->corner_radius = 0; cb->corner_aspect = 0;
+							cb->edge_feather = 0.0f; cb->glow_intensity = 0.0f;
+							float max_x = tox + tow - 3.0f * (float)CLOSE_BTN_WIDTH_PX;
+							CHROME_BLIT_POS(cb,
+							    win_hw - 3*btn_w_m_val, win_hh + tb_h_m, win_hw - 2*btn_w_m_val, win_hh,
+							    max_x, toy, (float)CLOSE_BTN_WIDTH_PX, toh);
+							sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
+							sys->context->Draw(4, 0);
+						}
+					}
 					// Text + glyphs
 					if (mc->font_atlas_srv && mc->clients[s].app_name[0] != '\0') {
 						sys->context->OMSetBlendState(sys->blend_alpha.get(), nullptr, 0xFFFFFFFF);
@@ -7208,7 +7248,7 @@ after_key_shortcuts:
 
 						// Compute atlas x-offset for each glyph (cumulative advances)
 						float px_cursor = 0; // pixel cursor in dest
-						float avail_w = tow - (float)GLYPH_W - 2.0f * (float)CLOSE_BTN_WIDTH_PX;
+						float avail_w = tow - (float)GLYPH_W - 3.0f * (float)CLOSE_BTN_WIDTH_PX;
 						float scale = 1.0f; // 1:1 rendering from atlas
 						for (int ci = 0; ci < 30 && name[ci] != '\0'; ci++) {
 							unsigned char ch = (unsigned char)name[ci];
@@ -7308,6 +7348,34 @@ after_key_shortcuts:
 								CHROME_BLIT_POS(cb,
 								    mg_left, mg_top, mg_left + glyph_w_m, mg_top - glyph_h_m,
 								    mx, toy + gpad, dst_gw, gh);
+								sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
+								sys->context->Draw(4, 0);
+							}
+						}
+						// ^ or v glyph on maximize button (^ = expand, v = restore)
+						{
+							int mg = (mc->clients[s].maximized ? 'v' : '^') - 0x20;
+							float src_gw = mc->glyph_advances[mg];
+							float dst_gw = src_gw * btn_scale;
+							float bx = tox + tow - 3.0f * (float)CLOSE_BTN_WIDTH_PX +
+							           ((float)CLOSE_BTN_WIDTH_PX - dst_gw) / 2.0f;
+							float xg_left = win_hw - 3*btn_w_m_val + (btn_w_m_val - glyph_w_m) / 2.0f;
+							float xg_top = win_hh + tb_h_m - glyph_vpad_m;
+							D3D11_MAPPED_SUBRESOURCE mapped;
+							if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
+							              D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+								BlitConstants *cb = static_cast<BlitConstants *>(mapped.pData);
+								cb->src_rect[0] = atlas_x_for(mg); cb->src_rect[1] = 0;
+								cb->src_rect[2] = src_gw; cb->src_rect[3] = (float)mc->font_glyph_h;
+								cb->src_size[0] = (float)mc->font_atlas_w;
+								cb->src_size[1] = (float)mc->font_atlas_h;
+								cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
+								cb->convert_srgb = 0.0f;
+								cb->corner_radius = 0; cb->corner_aspect = 0;
+								cb->edge_feather = 0.0f; cb->glow_intensity = 0.0f;
+								CHROME_BLIT_POS(cb,
+								    xg_left, xg_top, xg_left + glyph_w_m, xg_top - glyph_h_m,
+								    bx, toy + gpad, dst_gw, gh);
 								sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
 								sys->context->Draw(4, 0);
 							}
@@ -7493,6 +7561,120 @@ after_key_shortcuts:
 					sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
 				}
 			}
+		}
+	}
+
+	// Toast notification overlay (momentary centered message).
+	if (mc->toast_until_ns > 0 && mc->font_atlas_srv && sys->blit_vs && sys->blit_ps) {
+		uint64_t now_ns = os_monotonic_get_ns();
+		if (now_ns < mc->toast_until_ns) {
+			uint32_t ca_w = sys->base.info.display_pixel_width;
+			uint32_t ca_h = sys->base.info.display_pixel_height;
+			if (ca_w == 0) ca_w = 3840;
+			if (ca_h == 0) ca_h = 2160;
+			uint32_t half_w, half_h;
+			resolve_active_view_dims(sys, ca_w, ca_h, &half_w, &half_h);
+			uint32_t num_views = sys->tile_columns * sys->tile_rows;
+
+			const float scale = 2.0f; // 2x glyph size for toast
+			float gh = (float)mc->font_glyph_h * scale;
+			float pad_px = 12.0f;
+			float toast_h = gh + pad_px * 2.0f;
+
+			// Measure total text width
+			const char *txt = mc->toast_text;
+			float total_w = 0;
+			for (int ci = 0; txt[ci] != '\0' && ci < 80; ci++) {
+				unsigned char ch = (unsigned char)txt[ci];
+				if (ch < 0x20 || ch > 0x7E) ch = '?';
+				total_w += mc->glyph_advances[ch - 0x20] * scale;
+			}
+			float toast_w = total_w + pad_px * 2.0f;
+
+			// Pipeline setup
+			sys->context->VSSetShader(sys->blit_vs.get(), nullptr, 0);
+			sys->context->PSSetShader(sys->blit_ps.get(), nullptr, 0);
+			sys->context->VSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
+			sys->context->PSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
+			ID3D11RenderTargetView *t_rtvs[] = {mc->combined_atlas_rtv.get()};
+			sys->context->OMSetRenderTargets(1, t_rtvs, nullptr);
+			sys->context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+			sys->context->IASetInputLayout(nullptr);
+			sys->context->RSSetState(sys->rasterizer_state.get());
+			sys->context->OMSetDepthStencilState(sys->depth_disabled.get(), 0);
+			D3D11_VIEWPORT t_vp = {};
+			t_vp.Width = (float)ca_w; t_vp.Height = (float)ca_h; t_vp.MaxDepth = 1.0f;
+			sys->context->RSSetViewports(1, &t_vp);
+
+			for (uint32_t v = 0; v < num_views && v < XRT_MAX_VIEWS; v++) {
+				uint32_t col = v % sys->tile_columns;
+				uint32_t row = v / sys->tile_columns;
+				float vx = (float)(col * half_w);
+				float vy = (float)(row * half_h);
+
+				float bg_x = vx + ((float)half_w - toast_w) * 0.5f;
+				float bg_y = vy + ((float)half_h - toast_h) * 0.5f;
+
+				// Semi-transparent dark background
+				sys->context->OMSetBlendState(sys->blend_alpha.get(), nullptr, 0xFFFFFFFF);
+				D3D11_MAPPED_SUBRESOURCE mapped;
+				if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
+				              D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+					BlitConstants *cb = static_cast<BlitConstants *>(mapped.pData);
+					cb->src_rect[0] = 0.08f; cb->src_rect[1] = 0.08f;
+					cb->src_rect[2] = 0.10f; cb->src_rect[3] = 0.82f;
+					cb->src_size[0] = 1; cb->src_size[1] = 1;
+					cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
+					cb->convert_srgb = 2.0f;
+					cb->quad_mode = 0;
+					cb->dst_offset[0] = bg_x; cb->dst_offset[1] = bg_y;
+					cb->dst_rect_wh[0] = toast_w; cb->dst_rect_wh[1] = toast_h;
+					cb->corner_radius = 0.3f;
+					cb->corner_aspect = toast_w / toast_h;
+					cb->edge_feather = 0.0f; cb->glow_intensity = 0.0f;
+					sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
+					sys->context->Draw(4, 0);
+				}
+
+				// Text glyphs
+				ID3D11ShaderResourceView *font_srv = mc->font_atlas_srv.get();
+				sys->context->PSSetShaderResources(0, 1, &font_srv);
+				sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
+
+				float cursor_x = bg_x + pad_px;
+				float text_y = bg_y + pad_px;
+				for (int ci = 0; txt[ci] != '\0' && ci < 80; ci++) {
+					unsigned char ch = (unsigned char)txt[ci];
+					if (ch < 0x20 || ch > 0x7E) ch = '?';
+					int gi = ch - 0x20;
+					float src_x = 0;
+					for (int p = 0; p < gi; p++) src_x += mc->glyph_advances[p];
+					float src_gw = mc->glyph_advances[gi];
+					float dst_gw = src_gw * scale;
+					if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
+					              D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+						BlitConstants *cb = static_cast<BlitConstants *>(mapped.pData);
+						cb->src_rect[0] = src_x; cb->src_rect[1] = 0;
+						cb->src_rect[2] = src_gw; cb->src_rect[3] = (float)mc->font_glyph_h;
+						cb->src_size[0] = (float)mc->font_atlas_w;
+						cb->src_size[1] = (float)mc->font_atlas_h;
+						cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
+						cb->convert_srgb = 0.0f;
+						cb->quad_mode = 0;
+						cb->dst_offset[0] = cursor_x; cb->dst_offset[1] = text_y;
+						cb->dst_rect_wh[0] = dst_gw; cb->dst_rect_wh[1] = gh;
+						cb->corner_radius = 0; cb->corner_aspect = 0;
+						cb->edge_feather = 0.0f; cb->glow_intensity = 0.0f;
+						sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
+						sys->context->Draw(4, 0);
+					}
+					cursor_x += dst_gw;
+				}
+			}
+			sys->context->OMSetBlendState(sys->blend_opaque.get(), nullptr, 0xFFFFFFFF);
+			sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
+		} else {
+			mc->toast_until_ns = 0; // expired — clear
 		}
 	}
 
