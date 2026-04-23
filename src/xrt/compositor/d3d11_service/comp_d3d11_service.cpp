@@ -8916,7 +8916,16 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	bool bridge_override = false;
 	uint32_t active_vw = sys->view_width;
 	uint32_t active_vh = sys->view_height;
-	if (bridge_live && !sys->shell_mode) {
+	// Bridge-override also runs in shell mode (Stage 3): the bridge pushes
+	// slot-sized DXR_BridgeViewW/H so the blit crops exactly what the
+	// sample rendered in each tile. Without this the non-override path
+	// uses Chrome's submitted sub.rect.extent — which is the full Chrome
+	// tile-stride (framebufferWidth / viewCount), not the bridge-authoritative
+	// slot × viewScale. Multi-comp then reads a super-set rect from the
+	// per-client atlas; only the top-left ~slot×viewScale portion is real
+	// content, the rest is clear color → scene occupies only that fraction
+	// of the shell slot after the shader's source→dest scale.
+	if (bridge_live) {
 		uint32_t bvw = 0, bvh = 0;
 		// Prefer the CURRENT frame's live HWND (c->render.hwnd) over the
 		// cached sys->compositor_hwnd. When the WebXR page is reloaded the
