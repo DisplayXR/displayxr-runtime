@@ -280,10 +280,10 @@ combined display atlas with per-window slot rects:
 App N renders into its app swapchain (fixed size, atlas of tiled views)
         ↓ Stage 1: per-client compositor_layer_commit
         ↓   - reads app's submitted sub.rect
-        ↓   - blits into per-client atlas at canonical
-        ↓     sys->view_width × sys->view_height tile stride
+        ↓   - blits into per-client atlas at slot stride =
+        ↓     atlas_width / tile_columns (atlas-derived, NOT sys->view_width)
         ↓   - stamps content_view_w/h on the multi-comp slot
-Per-client atlas N (canonical-stride tiles, content top-left in each slot)
+Per-client atlas N (atlas-derived-stride tiles, content top-left in each slot)
         ↓ Stage 2: multi_compositor_render
         ↓   - reads cvw bytes per tile from each per-client atlas
         ↓   - shader-blits to per-window slot rect in combined atlas
@@ -295,59 +295,57 @@ Combined atlas (window-laid-out, tile_columns × tile_rows tile grid)
 Display
 ```
 
-### Coupled invariants across Stages 1 and 2
+### The coupled atlas-stride invariant
 
-Both stages have a **shared, coupled** atlas-stride invariant. They MUST
-move together:
+Three callsites have a **shared, coupled** stride invariant. All three
+MUST use the SAME slot stride, derived the SAME way:
 
-| Half | Stage | Invariant |
-|------|-------|-----------|
-| (a) write-side stride | Stage 1 (`compositor_layer_commit`) | Per-tile destination origin = `(src_col × sys->view_width, src_row × sys->view_height)` — never per-mode-branched. |
-| (b) read-side content dim | Stage 2 (`multi_compositor_render`) | `content_view_w/h` ≤ `sys->view_width × sys->view_height`. The Stage 1 stamp MUST clamp to canonical tile dims; the Stage 2 read SHOULD also defensively clamp. |
+> **slot stride = `atlas_width / tile_columns`** (atlas-derived, NOT `sys->view_width`)
 
-If (a) and (b) drift, downstream readers compute per-tile source x as
-`src_col × content_view_w` and tile N reads straight into tile N+1's
-slot. The visible artifact is "tile 0 covers the whole atlas, tile 1+
-shows black." Both halves of this invariant have shipped as bugs and
-the second half was found *after* the first was patched in isolation.
+In non-shell mode the per-client atlas equals `sys->display_width ×
+sys->display_height`, so atlas/tile_columns equals `sys->view_width`
+trivially. **In shell mode the atlas is created at NATIVE display
+pixel dims** (e.g. 3840×2160 for a Leia 4K) **while `sys->view_width`
+tracks the SCALED runtime view dim** (e.g. 960 for a 1920×1080 scaled
+mode). They DIVERGE. Using `sys->view_width` as the stride forces a
+downsample of any source larger than the scaled view but smaller than
+the native slot — costing resolution and distorting aspect.
 
-**Code-review red flags:**
+The three callsites:
 
-- Any `if (sys->shell_mode)` branch around `layout_vw`, `layout_vh`,
-  `content_view_w`, `content_view_h`, atlas dims, or per-tile placement
-  in `comp_d3d11_service.cpp`. There should be **zero** such branches.
-- Any per-tile source-X/Y calculation that doesn't multiply by
-  exactly `sys->view_width` / `sys->view_height`.
-- Any new comment, log line, or variable name that bakes in stereo /
-  left+right-eye / SBS terminology — DisplayXR is multiview-first.
+| Callsite | Location | What it does with the stride |
+|---|---|---|
+| (a) write | Stage 1 (`compositor_layer_commit`, before per-tile blit) | Tile N destination origin = `(src_col × slot_w, src_row × slot_h)`. `needs_scale` fires when `src > slot_w/h`. |
+| (b) clamp | Stage 1 (after per-tile blit, before stamping multi-comp slot) | `content_view_w/h ≤ slot_w/h`. |
+| (c) read | Stage 2 (`multi_compositor_render`) | Per-tile source origin = `(src_col × slot_w_atlas, src_row × slot_h_atlas)`. Defensive `assert + clamp` on cvw/cvh. |
 
-### Per-client atlas vs combined atlas
-
-The two atlases serve different purposes and are sized differently:
-
-| Atlas | Owner | Size | Purpose |
-|---|---|---|---|
-| Per-client atlas | Each client compositor (`d3d11_service_compositor`) | `sys->display_width × sys->display_height` (worst-case tile_columns × view_width × tile_rows × view_height) | Stage 1 destination. One per IPC client. |
-| Combined atlas | Multi-compositor (`d3d11_multi_compositor`) | Display pixel size (`base.info.display_pixel_width × display_pixel_height`) | Stage 2 destination. Holds all windows laid out at their slot rects. Fed to Stage 3 / DP. |
-
-In non-shell mode there is no Stage 2 and no combined atlas — the
-per-client atlas is cropped directly and handed to the DP.
+If (a) (b) and (c) ever use different stride formulas, the visible
+artifacts are: tile-swap ("tile 0 covers the whole atlas, tile 1+ shows
+black"), or aspect distortion + downsampling for handle apps in shell.
+All three forms have shipped as bugs.
 
 ### Sizing implications for IPC clients
 
 An IPC client (Chrome WebXR, sandboxed app) may submit content at
-*headset-scale* dimensions per tile (e.g. 2160 px wide), which can
-exceed the canonical `sys->view_width` (e.g. 1920 px). Stage 1 must
-**downscale** such oversized content to the canonical tile dim during
-the per-client blit; otherwise Stage 1's per-tile destination origin
-would push tile N's content into tile N+1's slot. This downscale lives
-in `compositor_layer_commit` as the `needs_scale` shader-blit path.
+*headset-scale* dimensions per tile (e.g. 2160 px wide). If that
+exceeds the slot stride (e.g. 1920 px when atlas is 3840 wide and
+tile_columns is 2), Stage 1 **downscales** such oversized content to
+the slot dim during the per-client blit; otherwise tile N would push
+into tile N+1's slot. This downscale lives in `compositor_layer_commit`
+as the `needs_scale` shader-blit path.
 
-After the downscale, Stage 1 must also stamp
-`content_view_w = min(submitted_extent, sys->view_width)` on the
-multi-comp slot so Stage 2 reads back the correct number of pixels per
-tile. Stamping the raw submitted extent is the half-(b) violation that
-breaks the pipeline even when half (a) is correct.
+For handle apps with HWND-sized swapchains *smaller* than the slot
+(e.g. 1539 px / tile vs a 1920 px slot), Stage 1 takes the raw-copy
+path: content placed in the top-left of the slot, no downsample. The
+multi-comp's window-aspect scaling at Stage 2 handles the final fit.
+
+After whichever Stage 1 path runs, the content stamp is the
+**actual** per-tile content extent, clamped to the slot:
+
+```c
+content_view_w = min(submitted_extent_w, slot_w_atlas);
+content_view_h = min(submitted_extent_h, slot_h_atlas);
+```
 
 ### Defensive read clamp in Stage 2
 
@@ -357,13 +355,40 @@ clamps on the write side:
 
 ```c
 // In multi_compositor_render, when reading mc->clients[s]:
-cvw = mc->clients[s].content_view_w;
-cvh = mc->clients[s].content_view_h;
-assert(cvw <= sys->view_width);
-assert(cvh <= sys->view_height);
-if (cvw > sys->view_width) cvw = sys->view_width;
-if (cvh > sys->view_height) cvh = sys->view_height;
+uint32_t slot_w_atlas = src_tex_w / sys->tile_columns;
+uint32_t slot_h_atlas = src_tex_h / sys->tile_rows;
+assert(cvw <= slot_w_atlas);
+assert(cvh <= slot_h_atlas);
+if (cvw > slot_w_atlas) cvw = slot_w_atlas;
+if (cvh > slot_h_atlas) cvh = slot_h_atlas;
+src_px_x = src_col * slot_w_atlas;
+src_px_y = src_row * slot_h_atlas;
 ```
 
 This catches future Stage 1 regressions at the boundary instead of as
-visible tile-swap artifacts.
+visible tile-swap or aspect-distortion artifacts.
+
+### Per-client atlas vs combined atlas
+
+The two atlases serve different purposes and are sized differently:
+
+| Atlas | Owner | Size | Purpose |
+|---|---|---|---|
+| Per-client atlas | Each client compositor (`d3d11_service_compositor`) | Shell mode: `sys->base.info.display_pixel_width × display_pixel_height` (native pixel dims). Non-shell: `sys->display_width × sys->display_height`. | Stage 1 destination. One per IPC client. |
+| Combined atlas | Multi-compositor (`d3d11_multi_compositor`) | Display pixel size (`base.info.display_pixel_width × display_pixel_height`) | Stage 2 destination. Holds all windows laid out at their slot rects. Fed to Stage 3 / DP. |
+
+In non-shell mode there is no Stage 2 and no combined atlas — the
+per-client atlas is cropped directly and handed to the DP.
+
+### Code-review red flags
+
+- Any `if (sys->shell_mode)` branch around atlas dims, slot stride,
+  `layout_vw`/`layout_vh`, `content_view_w/h`, or per-tile placement.
+  There should be **zero** such branches.
+- Any per-tile source-X/Y calculation in `comp_d3d11_service.cpp` that
+  uses `sys->view_width`/`sys->view_height` directly. Use the
+  atlas-derived `atlas_width / tile_columns` (and `_h / tile_rows`)
+  pulled from `atlas_texture->GetDesc()` (or `src_tex_w/h` in
+  multi-comp where the SRV's source dims are already known).
+- Any new comment, log line, or variable name that bakes in stereo /
+  left+right / two-tile terminology — DisplayXR is multiview-first.

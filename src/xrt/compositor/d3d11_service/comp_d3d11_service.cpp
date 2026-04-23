@@ -6893,6 +6893,7 @@ after_key_shortcuts:
 		ID3D11ShaderResourceView *slot_srv = nullptr;
 		uint32_t cvw = 0, cvh = 0;       // content view dimensions
 		uint32_t src_tex_w = 0, src_tex_h = 0; // source texture dimensions (for UV)
+		uint32_t slot_w_atlas = 0, slot_h_atlas = 0; // atlas-derived per-tile stride
 		bool slot_is_mono = false;
 		bool slot_flip_y = false;
 
@@ -6920,24 +6921,25 @@ after_key_shortcuts:
 				cvw = dp_view_w;
 				cvh = dp_view_h;
 			}
-			// Tile-overflow guard. Per-tile source x is `src_col * cvw`
-			// (line 6826), so cvw > sys->view_width makes tile N read
-			// straight into tile N+1's slot — visible as "tile 0 shows
-			// the whole atlas, tile 1+ shows black/garbage."
-			// compositor_layer_commit clamps on the write side; assert
-			// here so a future write-side regression is caught at the
-			// boundary instead of as a tile-swap artifact
-			// (`feedback_atlas_stride_invariant`: stride and
-			// content_view_w clamp move together).
-			assert(cvw <= sys->view_width);
-			assert(cvh <= sys->view_height);
-			if (cvw > sys->view_width) cvw = sys->view_width;
-			if (cvh > sys->view_height) cvh = sys->view_height;
 			D3D11_TEXTURE2D_DESC client_atlas_desc = {};
 			cc->render.atlas_texture->GetDesc(&client_atlas_desc);
 			src_tex_w = client_atlas_desc.Width;
 			src_tex_h = client_atlas_desc.Height;
 			slot_flip_y = cc->atlas_flip_y;
+
+			// Tile-overflow guard. The per-tile source origin below is
+			// `src_col * slot_w_atlas` where `slot_w_atlas = atlas_w /
+			// tile_columns` — same stride compositor_layer_commit writes
+			// at. cvw > slot_w_atlas would make multi-comp read past the
+			// slot boundary into the neighbouring tile's content
+			// (`feedback_atlas_stride_invariant`: stride and clamp must
+			// use the SAME atlas-derived slot width).
+			slot_w_atlas = src_tex_w / sys->tile_columns;
+			slot_h_atlas = src_tex_h / sys->tile_rows;
+			assert(cvw <= slot_w_atlas);
+			assert(cvh <= slot_h_atlas);
+			if (cvw > slot_w_atlas) cvw = slot_w_atlas;
+			if (cvh > slot_h_atlas) cvh = slot_h_atlas;
 		}
 
 		// Combined atlas dimensions.
@@ -6967,15 +6969,25 @@ after_key_shortcuts:
 			uint32_t src_col = v % sys->tile_columns;
 			uint32_t src_row = v / sys->tile_columns;
 
-			// Source rect: mono clients use (0,0) for all views,
-			// IPC clients use per-eye tile offsets.
+			// Per-tile source origin in the per-client atlas.
+			// Mono clients use (0,0) for all views; IPC clients place
+			// each tile at `slot_w_atlas × slot_h_atlas` stride — same
+			// stride compositor_layer_commit writes at, derived from
+			// atlas/tile_columns NOT sys->view_width
+			// (`feedback_atlas_stride_invariant`: in shell mode the
+			// per-client atlas is created at native pixel dims while
+			// sys->view_width tracks the SCALED view dim; they diverge).
+			// Content within each tile may be smaller than the slot
+			// (top-left), and its extent is cvw × cvh; the shader's
+			// `src_rect.zw = cvw,cvh` (set below) drives sampling, the
+			// per-tile origin sets `src_rect.xy`.
 			float src_px_x, src_px_y;
 			if (slot_is_mono) {
 				src_px_x = 0.0f;
 				src_px_y = 0.0f;
 			} else {
-				src_px_x = static_cast<float>(src_col * cvw);
-				src_px_y = static_cast<float>(src_row * cvh);
+				src_px_x = static_cast<float>(src_col * slot_w_atlas);
+				src_px_y = static_cast<float>(src_row * slot_h_atlas);
 			}
 
 			// Per-eye destination rect (parallax-shifted for Z != 0)
@@ -9223,26 +9235,34 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				// sub.rect.offset above.
 			}
 
-			// Tile layout for atlas placement. Atlas tiles are always laid
-			// out at sys->view_width × sys->view_height stride — that's the
-			// invariant service_crop_atlas_for_dp and multi_compositor_render
-			// rely on. Content can be smaller than the slot (e.g. bridge_override
-			// active_vw × active_vh, or any app rendering below canonical view
-			// dims) and sits in the top-left of the slot. Content larger than
-			// the slot (e.g. Chrome's headset-scale framebuffer in shell mode)
-			// is downscaled to fit by the SRGB shader-blit path below — never
-			// branch layout_vw per-mode (`feedback_atlas_stride_invariant`).
-			uint32_t layout_vw = sys->view_width;
-			uint32_t layout_vh = sys->view_height;
+			// Tile layout for atlas placement. The slot stride is
+			// derived from the actual per-client atlas size, not from
+			// `sys->view_width` — in shell mode the per-client atlas is
+			// created at native display pixels (e.g. 3840 wide) while
+			// `sys->view_width` tracks the SCALED runtime view dim
+			// (e.g. 960). They DIVERGE in shell mode and using
+			// `sys->view_width` as the tile stride forces a downsample
+			// of any source larger than the scaled view but smaller than
+			// the native slot — costing resolution and distorting aspect.
+			//
+			// `feedback_atlas_stride_invariant`: the invariant is
+			// `slot_w = atlas_width / tile_columns`, applied identically
+			// at write (here) and at read (multi_compositor_render).
+			// Content can be smaller than the slot — sits top-left.
+			// Content larger than the slot (Chrome's headset-scale frames
+			// against a 1920-wide slot, etc.) is shader-scaled to slot.
+			D3D11_TEXTURE2D_DESC atlas_desc = {};
+			c->render.atlas_texture->GetDesc(&atlas_desc);
+			uint32_t layout_vw = atlas_desc.Width / sys->tile_columns;
+			uint32_t layout_vh = atlas_desc.Height / sys->tile_rows;
 			uint32_t tile_x, tile_y;
 			u_tiling_view_origin(eye, sys->tile_columns,
 			                     layout_vw, layout_vh,
 			                     &tile_x, &tile_y);
 
-			// When client swapchain > atlas tile (window resized smaller, or
-			// Chrome in shell mode submitting headset-scale frames), scale
-			// source to fit tile. Otherwise use 1:1 placement and let the
-			// crop-blit handle any excess (#102).
+			// Scale only when source exceeds the slot. Handle apps in
+			// shell with reasonable HWND sizes typically render below the
+			// native slot dim → raw copy at full source resolution.
 			float tile_w = static_cast<float>(layout_vw);
 			float tile_h = static_cast<float>(layout_vh);
 			bool needs_scale = (src_w > tile_w || src_h > tile_h);
@@ -9336,14 +9356,20 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			content_view_w = static_cast<uint32_t>(layer->data.proj.v[0].sub.rect.extent.w);
 			content_view_h = static_cast<uint32_t>(layer->data.proj.v[0].sub.rect.extent.h);
 		}
-		// Clamp to canonical tile dims. The blit above (scale or raw copy)
-		// places at most one tile (sys->view_width × sys->view_height) of
-		// content per eye. Without this clamp, multi_compositor_render reads
-		// past the tile boundary and into the neighbouring eye's slot
-		// (`feedback_atlas_stride_invariant` — content can be smaller than
-		// slot but never larger).
-		if (content_view_w > sys->view_width) content_view_w = sys->view_width;
-		if (content_view_h > sys->view_height) content_view_h = sys->view_height;
+		// Clamp to atlas slot dims (atlas_width / tile_columns). The blit
+		// above placed at most one slot of content per tile; without this
+		// clamp, multi_compositor_render reads past the slot boundary into
+		// the neighbouring tile's slot (`feedback_atlas_stride_invariant`:
+		// content can be smaller than slot but never larger; clamp dims
+		// must use the SAME atlas-derived slot width as the blit's stride).
+		if (c->render.atlas_texture) {
+			D3D11_TEXTURE2D_DESC clamp_atlas_desc = {};
+			c->render.atlas_texture->GetDesc(&clamp_atlas_desc);
+			uint32_t slot_w = clamp_atlas_desc.Width / sys->tile_columns;
+			uint32_t slot_h = clamp_atlas_desc.Height / sys->tile_rows;
+			if (content_view_w > slot_w) content_view_w = slot_w;
+			if (content_view_h > slot_h) content_view_h = slot_h;
+		}
 
 		// Store content dims on multi-comp slot for multi_compositor_render
 		if (sys->shell_mode && sys->multi_comp != nullptr) {
