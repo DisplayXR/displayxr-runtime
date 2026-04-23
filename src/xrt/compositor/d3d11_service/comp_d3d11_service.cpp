@@ -5106,7 +5106,7 @@ toggle_fullscreen(struct d3d11_service_system *sys,
 		mc->clients[slot].maximized = true;
 		// Show restore hint toast for 3 seconds
 		snprintf(mc->toast_text, sizeof(mc->toast_text),
-		         "Click [^] button or double-click title bar to restore");
+		         "Press F11 to restore");
 		mc->toast_until_ns = os_monotonic_get_ns() + 3000000000ULL;
 		// Hide all other windows
 		for (int j = 0; j < D3D11_MULTI_MAX_CLIENTS; j++) {
