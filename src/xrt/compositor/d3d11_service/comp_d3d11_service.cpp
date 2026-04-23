@@ -6920,6 +6920,19 @@ after_key_shortcuts:
 				cvw = dp_view_w;
 				cvh = dp_view_h;
 			}
+			// Tile-overflow guard. Per-tile source x is `src_col * cvw`
+			// (line 6826), so cvw > sys->view_width makes tile N read
+			// straight into tile N+1's slot — visible as "tile 0 shows
+			// the whole atlas, tile 1+ shows black/garbage."
+			// compositor_layer_commit clamps on the write side; assert
+			// here so a future write-side regression is caught at the
+			// boundary instead of as a tile-swap artifact
+			// (`feedback_atlas_stride_invariant`: stride and
+			// content_view_w clamp move together).
+			assert(cvw <= sys->view_width);
+			assert(cvh <= sys->view_height);
+			if (cvw > sys->view_width) cvw = sys->view_width;
+			if (cvh > sys->view_height) cvh = sys->view_height;
 			D3D11_TEXTURE2D_DESC client_atlas_desc = {};
 			cc->render.atlas_texture->GetDesc(&client_atlas_desc);
 			src_tex_w = client_atlas_desc.Width;
@@ -9313,7 +9326,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		}
 		} // !zero_copy
 
-		// Track actual content dimensions for DP crop.
+		// Track actual content dimensions for DP crop and multi-comp slot read.
 		if (bridge_override) {
 			// Bridge sample renders at active per-view dims — use those.
 			content_view_w = active_vw;
@@ -9323,12 +9336,14 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			content_view_w = static_cast<uint32_t>(layer->data.proj.v[0].sub.rect.extent.w);
 			content_view_h = static_cast<uint32_t>(layer->data.proj.v[0].sub.rect.extent.h);
 		}
-		if (!sys->shell_mode) {
-			// Clamp to atlas tile dims in case client swapchain > atlas (#102).
-			// In shell mode, atlas is native-display-sized so no clamping needed.
-			if (content_view_w > sys->view_width) content_view_w = sys->view_width;
-			if (content_view_h > sys->view_height) content_view_h = sys->view_height;
-		}
+		// Clamp to canonical tile dims. The blit above (scale or raw copy)
+		// places at most one tile (sys->view_width × sys->view_height) of
+		// content per eye. Without this clamp, multi_compositor_render reads
+		// past the tile boundary and into the neighbouring eye's slot
+		// (`feedback_atlas_stride_invariant` — content can be smaller than
+		// slot but never larger).
+		if (content_view_w > sys->view_width) content_view_w = sys->view_width;
+		if (content_view_h > sys->view_height) content_view_h = sys->view_height;
 
 		// Store content dims on multi-comp slot for multi_compositor_render
 		if (sys->shell_mode && sys->multi_comp != nullptr) {

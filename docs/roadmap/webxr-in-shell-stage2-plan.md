@@ -216,3 +216,52 @@ Test URLs:
 - Per-window eye tracking.
 - Bridge-aware session scoping (Stage 3).
 - Android / macOS.
+
+## Follow-ups (post-Stage 2)
+
+### Qwerty bridge-relay freeze leaks across sessions
+
+Surfaced during 2a.2 visual test. Pre-existing bug, not introduced by Stage 2,
+but Stage 2 made it visible because before 2a.2 the WebXR perspective was so
+wrong you couldn't tell the head pose was also frozen.
+
+**Symptom.** With a bridge-aware page open, *any concurrent legacy WebXR
+session* (and any in-shell handle app) sees a frozen head pose — qwerty WASD/
+mouse-look stops moving the viewpoint for everyone.
+
+**Root cause.** `qwerty_device.c:34,350-370` has a global
+`g_qwerty_bridge_relay_active` flag that zeroes out pose deltas when the
+bridge is alive. Flipped to true from `comp_d3d11_service.cpp:9464` and
+`comp_multi_compositor.c:1325`. Affects all callers of
+`xrt_device_get_tracked_pose` on the qwerty xdev — the whole service.
+
+**Why the freeze exists.** Prevents qwerty pose drift while the bridge has
+the session. But the bridge itself takes the `headless_client` early-return
+path in `ipc_try_get_sr_view_poses:303-316` and never queries qwerty —
+so the freeze is currently "protecting" callers that don't exist while
+breaking callers that do.
+
+**Known prior art.** Exact concern flagged in
+`docs/roadmap/webxr-bridge-v2-plan.md:181`:
+> "Calling `qwerty_set_process_keys(false)` from the bridge's session affects
+> the whole service, including any other concurrent client. That is fine for
+> the single-user / single-WebXR-app scenario but would need rethinking for
+> multi-app shell mode."
+
+**Proposed fix (1/2 day, not "dedicated qwerty per app").** Two options:
+
+1. **Per-call bypass (preferred).** Add `qwerty_get_tracked_pose_unfrozen()`.
+   `ipc_try_get_sr_view_poses` calls it for non-headless callers. Bridge-
+   relay session unaffected (already takes the headless early-return).
+   Most surgical — one new symbol, one call-site swap.
+
+2. **Remove the freeze entirely.** Only safe after auditing every caller of
+   `qwerty_get_tracked_pose` to confirm none of them rely on the freeze
+   semantics. Bigger blast radius; option 1 first.
+
+**Bisect-safe.** One commit. Verify with the same regression matrix as 2c
+plus: open a bridge-aware page **and** Chrome legacy WebXR simultaneously
+in shell — both should respond to qwerty input independently.
+
+**Not in Stage 2 scope.** Doesn't block 2b/2c. File as its own dev issue on
+`DisplayXR/displayxr-runtime-pvt` after 2c lands.

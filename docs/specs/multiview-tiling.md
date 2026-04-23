@@ -1,7 +1,7 @@
 ---
 status: Active
 owner: David Fattal
-updated: 2026-03-15
+updated: 2026-04-22
 issues: [77]
 code-paths: [src/xrt/compositor/, src/xrt/include/xrt/xrt_compositor.h]
 ---
@@ -266,3 +266,104 @@ Because the compositor crops before calling the DP, **the atlas texture dimensio
 ### Why the DP can't just be told the content region
 
 The DP's `process_atlas()` already receives `view_width`, `view_height`, `tile_columns`, `tile_rows` — but many DP implementations (e.g., LeiaSR weaver) use the **texture dimensions** to set up their internal rendering pipeline. If the texture is larger than the content, the DP samples padding/garbage from the unused region.
+
+---
+
+## Shell Mode: Two-Stage Atlas Pipeline
+
+The single-stage pipeline above (app swapchain → crop → DP) describes the
+in-process compositor case. **Shell mode adds a second stage** because
+the multi-compositor must compose N per-client atlases into a single
+combined display atlas with per-window slot rects:
+
+```
+App N renders into its app swapchain (fixed size, atlas of tiled views)
+        ↓ Stage 1: per-client compositor_layer_commit
+        ↓   - reads app's submitted sub.rect
+        ↓   - blits into per-client atlas at canonical
+        ↓     sys->view_width × sys->view_height tile stride
+        ↓   - stamps content_view_w/h on the multi-comp slot
+Per-client atlas N (canonical-stride tiles, content top-left in each slot)
+        ↓ Stage 2: multi_compositor_render
+        ↓   - reads cvw bytes per tile from each per-client atlas
+        ↓   - shader-blits to per-window slot rect in combined atlas
+        ↓   - applies window pose, focus glow, chrome, layout transforms
+Combined atlas (window-laid-out, tile_columns × tile_rows tile grid)
+        ↓ Stage 3: service_crop_atlas_for_dp + DP
+        ↓   - crops to active mode's content region
+        ↓   - DP weaves to display
+Display
+```
+
+### Coupled invariants across Stages 1 and 2
+
+Both stages have a **shared, coupled** atlas-stride invariant. They MUST
+move together:
+
+| Half | Stage | Invariant |
+|------|-------|-----------|
+| (a) write-side stride | Stage 1 (`compositor_layer_commit`) | Per-tile destination origin = `(src_col × sys->view_width, src_row × sys->view_height)` — never per-mode-branched. |
+| (b) read-side content dim | Stage 2 (`multi_compositor_render`) | `content_view_w/h` ≤ `sys->view_width × sys->view_height`. The Stage 1 stamp MUST clamp to canonical tile dims; the Stage 2 read SHOULD also defensively clamp. |
+
+If (a) and (b) drift, downstream readers compute per-tile source x as
+`src_col × content_view_w` and tile N reads straight into tile N+1's
+slot. The visible artifact is "tile 0 covers the whole atlas, tile 1+
+shows black." Both halves of this invariant have shipped as bugs and
+the second half was found *after* the first was patched in isolation.
+
+**Code-review red flags:**
+
+- Any `if (sys->shell_mode)` branch around `layout_vw`, `layout_vh`,
+  `content_view_w`, `content_view_h`, atlas dims, or per-tile placement
+  in `comp_d3d11_service.cpp`. There should be **zero** such branches.
+- Any per-tile source-X/Y calculation that doesn't multiply by
+  exactly `sys->view_width` / `sys->view_height`.
+- Any new comment, log line, or variable name that bakes in stereo /
+  left+right-eye / SBS terminology — DisplayXR is multiview-first.
+
+### Per-client atlas vs combined atlas
+
+The two atlases serve different purposes and are sized differently:
+
+| Atlas | Owner | Size | Purpose |
+|---|---|---|---|
+| Per-client atlas | Each client compositor (`d3d11_service_compositor`) | `sys->display_width × sys->display_height` (worst-case tile_columns × view_width × tile_rows × view_height) | Stage 1 destination. One per IPC client. |
+| Combined atlas | Multi-compositor (`d3d11_multi_compositor`) | Display pixel size (`base.info.display_pixel_width × display_pixel_height`) | Stage 2 destination. Holds all windows laid out at their slot rects. Fed to Stage 3 / DP. |
+
+In non-shell mode there is no Stage 2 and no combined atlas — the
+per-client atlas is cropped directly and handed to the DP.
+
+### Sizing implications for IPC clients
+
+An IPC client (Chrome WebXR, sandboxed app) may submit content at
+*headset-scale* dimensions per tile (e.g. 2160 px wide), which can
+exceed the canonical `sys->view_width` (e.g. 1920 px). Stage 1 must
+**downscale** such oversized content to the canonical tile dim during
+the per-client blit; otherwise Stage 1's per-tile destination origin
+would push tile N's content into tile N+1's slot. This downscale lives
+in `compositor_layer_commit` as the `needs_scale` shader-blit path.
+
+After the downscale, Stage 1 must also stamp
+`content_view_w = min(submitted_extent, sys->view_width)` on the
+multi-comp slot so Stage 2 reads back the correct number of pixels per
+tile. Stamping the raw submitted extent is the half-(b) violation that
+breaks the pipeline even when half (a) is correct.
+
+### Defensive read clamp in Stage 2
+
+`multi_compositor_render` should defensively clamp the per-client
+`content_view_w/h` it reads at the boundary, even though Stage 1
+clamps on the write side:
+
+```c
+// In multi_compositor_render, when reading mc->clients[s]:
+cvw = mc->clients[s].content_view_w;
+cvh = mc->clients[s].content_view_h;
+assert(cvw <= sys->view_width);
+assert(cvh <= sys->view_height);
+if (cvw > sys->view_width) cvw = sys->view_width;
+if (cvh > sys->view_height) cvh = sys->view_height;
+```
+
+This catches future Stage 1 regressions at the boundary instead of as
+visible tile-swap artifacts.
