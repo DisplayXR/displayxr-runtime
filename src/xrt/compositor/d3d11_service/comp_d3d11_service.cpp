@@ -5106,7 +5106,7 @@ toggle_fullscreen(struct d3d11_service_system *sys,
 		mc->clients[slot].maximized = true;
 		// Show restore hint toast for 3 seconds
 		snprintf(mc->toast_text, sizeof(mc->toast_text),
-		         "Press F11 to restore");
+		         "Press F11 or Esc to restore");
 		mc->toast_until_ns = os_monotonic_get_ns() + 3000000000ULL;
 		// Hide all other windows
 		for (int j = 0; j < D3D11_MULTI_MAX_CLIENTS; j++) {
@@ -5809,6 +5809,16 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	if (GetAsyncKeyState(VK_F11) & 1) {
 		if (mc->focused_slot >= 0) {
 			toggle_fullscreen(sys, mc, mc->focused_slot);
+		}
+	}
+
+	// ESC: restore maximized window (if any) before doing anything else
+	if (GetAsyncKeyState(VK_ESCAPE) & 1) {
+		for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
+			if (mc->clients[i].active && mc->clients[i].maximized) {
+				toggle_fullscreen(sys, mc, i);
+				break;
+			}
 		}
 	}
 
