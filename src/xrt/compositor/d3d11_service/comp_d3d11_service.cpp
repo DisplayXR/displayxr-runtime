@@ -9146,29 +9146,45 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 
 			// Tile layout for atlas placement. Atlas tiles are always laid
 			// out at sys->view_width × sys->view_height stride — that's the
-			// invariant service_crop_atlas_for_dp relies on when it reads
-			// src_tile_x = view_idx × sys->view_width from the atlas. For
-			// bridge_override the CONTENT is smaller (active_vw × active_vh)
-			// but sits in the top-left of each full-sized tile slot, just
-			// like legacy compromise-scaled apps. The crop shader handles it.
-			uint32_t layout_vw = sys->shell_mode ? static_cast<uint32_t>(src_w) : sys->view_width;
-			uint32_t layout_vh = sys->shell_mode ? static_cast<uint32_t>(src_h) : sys->view_height;
+			// invariant service_crop_atlas_for_dp and multi_compositor_render
+			// rely on. Content can be smaller than the slot (e.g. bridge_override
+			// active_vw × active_vh, or any app rendering below canonical view
+			// dims) and sits in the top-left of the slot. Content larger than
+			// the slot (e.g. Chrome's headset-scale framebuffer in shell mode)
+			// is downscaled to fit by the SRGB shader-blit path below — never
+			// branch layout_vw per-mode (`feedback_atlas_stride_invariant`).
+			uint32_t layout_vw = sys->view_width;
+			uint32_t layout_vh = sys->view_height;
 			uint32_t tile_x, tile_y;
 			u_tiling_view_origin(eye, sys->tile_columns,
 			                     layout_vw, layout_vh,
 			                     &tile_x, &tile_y);
 
-			// When client swapchain > atlas tile (window resized smaller),
-			// scale source to fit tile. Otherwise use 1:1 placement and
-			// let the crop-blit handle any excess (#102).
+			// When client swapchain > atlas tile (window resized smaller, or
+			// Chrome in shell mode submitting headset-scale frames), scale
+			// source to fit tile. Otherwise use 1:1 placement and let the
+			// crop-blit handle any excess (#102).
 			float tile_w = static_cast<float>(layout_vw);
 			float tile_h = static_cast<float>(layout_vh);
-			bool needs_scale = !sys->shell_mode && (src_w > tile_w || src_h > tile_h);
+			bool needs_scale = (src_w > tile_w || src_h > tile_h);
 			float dst_w = needs_scale ? tile_w : 0.0f;
 			float dst_h = needs_scale ? tile_h : 0.0f;
 
-			if (view_is_srgb[eye] && !sys->shell_mode && sys->blit_vs &&
-			    view_scs[eye]->images[view_img_indices[eye]].srv) {
+			// Color-space handling diverges between modes
+			// (`feedback_srgb_blit_paths`):
+			//   - non-shell SRGB: sample through SRGB SRV → linearize on
+			//     sample → write linear bytes to atlas. The DP expects
+			//     linear input.
+			//   - shell mode:     atlas stays gamma-encoded;
+			//     multi_compositor_render reads it as-is and the multi-comp
+			//     pipeline downstream handles color space. Linearizing here
+			//     would double-handle gamma.
+			bool can_shader_blit = sys->blit_vs &&
+			    view_scs[eye]->images[view_img_indices[eye]].srv;
+			bool use_srgb_shader = can_shader_blit && view_is_srgb[eye] && !sys->shell_mode;
+			bool use_scale_shader = can_shader_blit && needs_scale && sys->shell_mode;
+
+			if (use_srgb_shader) {
 				// Non-shell SRGB: shader blit with SRGB SRV for linearization.
 				// The GPU auto-linearizes when sampling through an SRGB SRV.
 				// The DP expects linear input — without this, colors are washed out.
@@ -9196,10 +9212,22 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 					    tile_x, tile_y, 0, view_textures[eye],
 					    layer->data.proj.v[eye].sub.array_index, &box);
 				}
+			} else if (use_scale_shader) {
+				// Shell mode + oversized client content: scale through the
+				// shader using the default (non-SRGB) SRV so sampling reads
+				// raw bytes and writes them unmodified — keeps the per-client
+				// atlas in gamma space, matching the raw-copy path that
+				// multi_compositor_render expects.
+				blit_to_atlas_texture(sys, &c->render,
+				    view_scs[eye]->images[view_img_indices[eye]].srv.get(),
+				    src_x, src_y, src_w, src_h,
+				    (float)view_descs[eye].Width, (float)view_descs[eye].Height,
+				    (float)tile_x, (float)tile_y,
+				    dst_w, dst_h, false);
 			} else {
-				// Non-SRGB or shell mode: raw byte copy.
-				// Shell mode: multi-compositor handles color space.
-				// Non-SRGB: no conversion needed.
+				// Non-SRGB, or shell mode with content already fitting the
+				// tile, or shader unavailable: raw byte copy. Multi-comp
+				// (shell) and non-SRGB DP handle the rest as today.
 				D3D11_BOX box = {};
 				box.left = static_cast<UINT>(src_x);
 				box.top = static_cast<UINT>(src_y);
