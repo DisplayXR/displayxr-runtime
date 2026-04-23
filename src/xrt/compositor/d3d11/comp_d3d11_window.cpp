@@ -262,6 +262,7 @@ is_shell_reserved_key(WPARAM vk)
 	// tries to change rendering mode via xrRequestDisplayRenderingModeEXT,
 	// that call is blocked in shell/IPC mode.
 	switch (vk) {
+	case VK_ESCAPE: // Restore fullscreen / shell dismiss
 	case VK_TAB:    // Cycle focus
 	case VK_DELETE: // Close focused app
 		return true;
