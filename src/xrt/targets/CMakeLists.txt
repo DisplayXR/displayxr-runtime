@@ -57,10 +57,6 @@ if(WIN32)
 		add_subdirectory(switcher)
 	endif()
 
-	# DisplayXR spatial shell (management client)
-	if(XRT_FEATURE_SERVICE)
-		add_subdirectory(shell)
-	endif()
 
 	# DisplayXR WebXR bridge host (metadata sideband for Chrome's native WebXR)
 	add_subdirectory(webxr_bridge)
