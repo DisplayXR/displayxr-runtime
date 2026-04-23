@@ -1999,11 +1999,46 @@ ipc_handle_system_get_client_window_metrics(volatile struct ipc_client_state *_i
 {
 	IPC_TRACE_MARKER();
 
+	struct xrt_window_metrics wm = {0};
+
+#if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	struct ipc_server *s = _ics->server;
+
+	// Per-client window metrics are only meaningful when the D3D11 service
+	// compositor is in shell mode and has assigned a slot to the target
+	// client. Resolve client_id → xc (NULL for headless relay clients such
+	// as the WebXR bridge itself) and ask the compositor.
+	struct xrt_compositor *target_xc = NULL;
+	xrt_result_t xret = ipc_server_get_client_xc(s, client_id, &target_xc);
+	if (xret == XRT_SUCCESS && s != NULL && s->xsysc != NULL && target_xc != NULL) {
+		(void)comp_d3d11_service_get_client_window_metrics(s->xsysc, target_xc, &wm);
+	}
+
+	// One-shot diagnostic per (caller_thread, target_id) so the service
+	// log shows exactly which id resolved to which metrics the first time
+	// each caller asks. Keyed on caller thread index to avoid spam from
+	// e.g. the bridge's periodic re-polls of the same id.
+	{
+		static bool logged_per_thread[IPC_MAX_CLIENTS] = {false};
+		int idx = _ics->server_thread_index;
+		if (idx >= 0 && idx < IPC_MAX_CLIENTS && !logged_per_thread[idx]) {
+			logged_per_thread[idx] = true;
+			IPC_INFO(s,
+			         "system_get_client_window_metrics: caller_thread=%d target_id=%u valid=%d "
+			         "win_px=%ux%u win_m=%.3fx%.3f offset=(%.3f,%.3f,%.3f)",
+			         idx, (unsigned)client_id, (int)wm.valid,
+			         (unsigned)wm.window_pixel_width, (unsigned)wm.window_pixel_height,
+			         (double)wm.window_width_m, (double)wm.window_height_m,
+			         (double)wm.window_center_offset_x_m,
+			         (double)wm.window_center_offset_y_m,
+			         (double)wm.window_center_offset_z_m);
+		}
+	}
+#else
 	(void)_ics;
 	(void)client_id;
+#endif
 
-	struct xrt_window_metrics wm = {0};
-	wm.valid = false;
 	*out_metrics = wm;
 
 	return XRT_SUCCESS;
