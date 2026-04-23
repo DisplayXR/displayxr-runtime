@@ -92,15 +92,21 @@ jobs:
         id: wait-build
         env:
           GH_TOKEN: ${{ github.token }}
+        # shell: bash (default) wraps the script in `bash -e {0}`, so a
+        # transiently-failing `RUN_ID=$(gh run list …)` would abort the whole
+        # step on the first iteration before the retry loop ever sleeps. The
+        # `|| echo ""` fallback turns any gh error into an empty RUN_ID so
+        # the wait loop can keep retrying until build-windows.yml finishes.
         run: |
           echo "Waiting for build-windows.yml to finish for commit ${{ github.sha }}..."
           RUN_ID=""
           for i in $(seq 1 60); do
             RUN_ID=$(gh run list --repo ${{ github.repository }} --workflow build-windows.yml \
-              --limit 10 --json databaseId,conclusion,headSha \
-              --jq "[.[] | select(.headSha == \"${{ github.sha }}\" and .conclusion == \"success\") | .databaseId] | first // empty" 2>/dev/null)
+              --event push --limit 10 --json databaseId,conclusion,headSha \
+              --jq "[.[] | select(.headSha == \"${{ github.sha }}\" and .conclusion == \"success\") | .databaseId] | first // empty" 2>/dev/null || echo "")
             if [ -n "$RUN_ID" ]; then
               echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+              echo "build-windows.yml succeeded: run $RUN_ID"
               break
             fi
             echo "  attempt $i/60 — sleeping 30s..."
