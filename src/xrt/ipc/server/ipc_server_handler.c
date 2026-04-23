@@ -1993,6 +1993,23 @@ ipc_handle_system_get_client_info(volatile struct ipc_client_state *_ics,
 }
 
 xrt_result_t
+ipc_handle_system_get_client_window_metrics(volatile struct ipc_client_state *_ics,
+                                            uint32_t client_id,
+                                            struct xrt_window_metrics *out_metrics)
+{
+	IPC_TRACE_MARKER();
+
+	(void)_ics;
+	(void)client_id;
+
+	struct xrt_window_metrics wm = {0};
+	wm.valid = false;
+	*out_metrics = wm;
+
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
 ipc_handle_system_set_primary_client(volatile struct ipc_client_state *_ics, uint32_t client_id)
 {
 	struct ipc_server *s = _ics->server;

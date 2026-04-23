@@ -26,6 +26,15 @@
 		]
 	},
 
+	"system_get_client_window_metrics": {
+		"in": [
+			{"name": "id", "type": "uint32_t"}
+		],
+		"out": [
+			{"name": "metrics", "type": "struct xrt_window_metrics"}
+		]
+	},
+
 	"system_get_clients": {
 		"out": [
 			{"name": "clients", "type": "struct ipc_client_list"}
