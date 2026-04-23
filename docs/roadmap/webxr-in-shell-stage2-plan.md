@@ -311,6 +311,25 @@ present whenever shell mode + bridge-aware were tested simultaneously
 should note "bridge-aware color in shell is pre-existing" rather than
 flagging it as a new bug.
 
+### Window pose resets on session re-create
+
+User observation during 2c regression sweep: dragging a shell window to
+a new pose, exiting VR, and re-entering creates a new immersive session
+that lands the window back at its **default slot pose** (forgetting
+the drag). The new session's FOV correctly matches the (reset) pose —
+Stage 2's per-frame metric refresh works as designed.
+
+**Root cause.** Multi-comp slots are tied to session lifetime, not
+application identity. End-session destroys the per-client compositor
+and frees the slot; re-create allocates a fresh slot at the default
+pose. The drag-customized pose lives on the freed slot, which is gone.
+
+**Not in Stage 2 scope.** Belongs in the same UX bucket as Stage 4
+(live resize during a session). Possible fix paths: persist last-known
+pose per `application_name` (or PID, or sidecar `.displayxr.json`)
+and rehydrate on slot allocation. Or hold the slot open across
+intra-app session re-creates within a short grace window.
+
 ### Launcher empty-state when shell auto-spawns from IPC client
 
 User observation: when the shell is launched **automatically by the
