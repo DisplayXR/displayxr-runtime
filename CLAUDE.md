@@ -155,14 +155,16 @@ Per-component tag scheme — each public repo versions independently. Tag pvt wi
 Prefix is stripped when setting the public-repo tag: `runtime/v1.2.0` → `v1.2.0` on `displayxr-runtime` + `displayxr-shell-releases`. Each demo's `README.md` states its minimum compatible runtime version ("Requires DisplayXR runtime ≥ vX.Y.Z"). Details: `docs/roadmap/demo-distribution.md`.
 
 ```bash
-# Preferred: /release skill for full-stack tags (version bump, tagging, monitoring, verification)
-/release v1.0.0          # explicit vX.Y.Z → fires every publish workflow
-/release patch           # auto-bump patch from latest vX.Y.Z
-
-# Per-component releases (manual for now — /release skill doesn't yet grok prefixes):
-git tag runtime/v1.2.0 && git push origin runtime/v1.2.0
-git tag demo-gaussiansplat/v1.1.0 && git push origin demo-gaussiansplat/v1.1.0
+# /release skill handles version bump, tagging, monitoring, verification.
+# First arg is the component (defaults to `all` if omitted).
+/release v1.0.0                               # full-stack, every publish workflow
+/release patch                                # full-stack, auto-bump from latest v*
+/release runtime minor                        # runtime + shell only
+/release demo-gaussiansplat patch             # one demo only
+/release demo-gaussiansplat v1.1.0            # one demo, explicit version
 ```
+
+Cross-repo pushes (runtime, shell-releases, extensions, every demo repo) are authenticated via the `displayxr-publish-bot` GitHub App. The App's installation token is minted per-job via `actions/create-github-app-token@v1`, scoped to only the one repo that job writes to. Org secrets `DISPLAYXR_APP_ID` + `DISPLAYXR_APP_PRIVATE_KEY` hold the credentials. Local `.pem` backup at `.secrets/displayxr-publish-bot.pem` (gitignored) — see `.secrets/NOTE.md` for rotation procedure.
 
 Extension headers auto-publish to `DisplayXR/displayxr-extensions` via `publish-extensions.yml` on every push to main.
 
