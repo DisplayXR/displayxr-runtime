@@ -1,7 +1,8 @@
 name: Publish Extension Headers
 
 # Auto-publishes XR_EXT_*.h headers to DisplayXR/displayxr-extensions
-# whenever they change on main. Only runs on pvt repo (has DISPLAYXR_TOKEN).
+# whenever they change on main. Authenticates via the DisplayXR Publish
+# Bot GitHub App (see org secrets DISPLAYXR_APP_ID + DISPLAYXR_APP_PRIVATE_KEY).
 
 on:
   push:
@@ -15,12 +16,23 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Mint App installation token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.DISPLAYXR_APP_ID }}
+          private-key: ${{ secrets.DISPLAYXR_APP_PRIVATE_KEY }}
+          owner: DisplayXR
+          repositories: displayxr-extensions
+
       - name: Checkout runtime repo
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Clone extensions repo
         run: |
-          git clone https://x-access-token:${{ secrets.DISPLAYXR_TOKEN }}@github.com/DisplayXR/displayxr-extensions.git extensions-repo
+          git clone "https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/DisplayXR/displayxr-extensions.git" extensions-repo
 
       - name: Copy headers
         run: |

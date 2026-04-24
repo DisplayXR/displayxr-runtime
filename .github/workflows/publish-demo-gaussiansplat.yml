@@ -45,13 +45,21 @@ jobs:
       tag: ${{ steps.resolve-tag.outputs.tag }}
 
     steps:
+      - name: Mint App installation token (write to demo repo)
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.DISPLAYXR_APP_ID }}
+          private-key: ${{ secrets.DISPLAYXR_APP_PRIVATE_KEY }}
+          owner: DisplayXR
+          repositories: displayxr-demo-gaussiansplat
+
       - name: Checkout source (displayxr-runtime-pvt)
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
           # Don't persist the default GITHUB_TOKEN credential — it would
-          # shadow the DISPLAYXR_TOKEN we bake into the demo repo's remote
-          # URL below, causing pushes to the public repo to 403.
+          # shadow the App token we bake into the demo repo's remote URL.
           persist-credentials: false
 
       - name: Resolve tag name
@@ -70,7 +78,7 @@ jobs:
 
       - name: Checkout public demo repo
         env:
-          GH_TOKEN: ${{ secrets.DISPLAYXR_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           git clone --depth 1 \
             "https://x-access-token:${GH_TOKEN}@github.com/DisplayXR/displayxr-demo-gaussiansplat.git" \
@@ -82,7 +90,7 @@ jobs:
 
       - name: Commit, tag, push
         env:
-          GH_TOKEN: ${{ secrets.DISPLAYXR_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           cd demo-repo
           git config user.name  "DisplayXR Bot"
@@ -158,9 +166,18 @@ jobs:
           (cd artifact-win && zip -r "../${ZIPNAME}" .)
           echo "zip=${ZIPNAME}" >> "$GITHUB_OUTPUT"
 
+      - name: Mint App installation token (write to demo repo)
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.DISPLAYXR_APP_ID }}
+          private-key: ${{ secrets.DISPLAYXR_APP_PRIVATE_KEY }}
+          owner: DisplayXR
+          repositories: displayxr-demo-gaussiansplat
+
       - name: Create GitHub Release on displayxr-demo-gaussiansplat
         env:
-          GH_TOKEN: ${{ secrets.DISPLAYXR_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           TAG="${{ needs.sync-source.outputs.tag }}"
           gh release delete "$TAG" --repo DisplayXR/displayxr-demo-gaussiansplat --yes 2>/dev/null || true
