@@ -82,7 +82,7 @@ validate_device_id(volatile struct ipc_client_state *ics, int64_t device_id, str
  * Returns true if SR view poses were computed, false to fall back to device poses.
  */
 static bool
-ipc_try_get_sr_view_poses(struct ipc_server *s,
+ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
                           struct xrt_compositor *xc,
                           struct xrt_device *xdev,
                           const struct xrt_vec3 *fallback_eye_relation,
@@ -92,6 +92,7 @@ ipc_try_get_sr_view_poses(struct ipc_server *s,
                           struct xrt_fov *out_fovs,
                           struct xrt_pose *out_poses)
 {
+	struct ipc_server *s = ics->server;
 	// Log that we're being called (first call only)
 	static bool first_call = true;
 	if (first_call) {
@@ -267,6 +268,24 @@ ipc_try_get_sr_view_poses(struct ipc_server *s,
 
 	bool compositor_owns_window = comp_d3d11_service_owns_window(s->xsysc);
 
+	// Shell-mode distinction: the shell compositor renders the shell itself
+	// via DP eye tracker (Kooima) with no qwerty offset — otherwise WASD
+	// would shift the entire shell UI. But apps *inside* the shell (Chrome
+	// WebXR, handle apps) are like non-shell apps on a smaller screen: they
+	// want qwerty as the player transform so WASD walks inside their scene.
+	//
+	// `comp_d3d11_service_owns_window` is false across the board in shell
+	// mode (intentional — it suppresses qwerty for shell-self rendering).
+	// Here we re-enable qwerty on a per-session basis: identify the shell's
+	// own session by application_name and leave it alone; all other IPC
+	// sessions in shell mode get qwerty-composed head poses.
+	bool shell_mode = s->xsysc != NULL && s->xsysc->info.shell_mode;
+	bool is_shell_host_session =
+	    ics->client_state.info.application_name[0] != '\0' &&
+	    strcmp((const char *)ics->client_state.info.application_name, "displayxr-shell") == 0;
+	bool use_qwerty_head = compositor_owns_window ||
+	                       (shell_mode && !is_shell_host_session);
+
 	struct xrt_vec3 display_pos = qwerty_relation.pose.position;
 	struct xrt_quat display_ori = qwerty_relation.pose.orientation;
 
@@ -350,7 +369,7 @@ ipc_try_get_sr_view_poses(struct ipc_server *s,
 		}
 	} else {
 		// DISPLAY-CENTRIC PATH (canonical display3d_compute_views)
-		if (compositor_owns_window) {
+		if (use_qwerty_head) {
 			out_head_relation->pose.position = display_pos;
 			out_head_relation->pose.orientation = display_ori;
 		} else {
@@ -394,14 +413,16 @@ ipc_try_get_sr_view_poses(struct ipc_server *s,
 		float left_h = (out_fovs[0].angle_right - out_fovs[0].angle_left) * 180.0f / 3.14159265f;
 		float left_v = (out_fovs[0].angle_up - out_fovs[0].angle_down) * 180.0f / 3.14159265f;
 		IPC_WARN(s, "IPC SR: mode=%s display=(%.2f,%.2f,%.2f) FOV H=%.1f° V=%.1f°"
-		         " pose[0]=(%.3f,%.3f,%.3f) pose[1]=(%.3f,%.3f,%.3f) owns_win=%d",
+		         " pose[0]=(%.3f,%.3f,%.3f) pose[1]=(%.3f,%.3f,%.3f)"
+		         " owns_win=%d shell=%d shell_host=%d use_qwerty=%d app='%s'",
 		         (have_stereo_state && stereo_state.camera_mode && compositor_owns_window)
 		             ? "camera" : "display",
 		         display_pos.x, display_pos.y, display_pos.z,
 		         left_h, left_v,
 		         out_poses[0].position.x, out_poses[0].position.y, out_poses[0].position.z,
 		         out_poses[1].position.x, out_poses[1].position.y, out_poses[1].position.z,
-		         compositor_owns_window);
+		         compositor_owns_window, shell_mode, is_shell_host_session, use_qwerty_head,
+		         (const char *)ics->client_state.info.application_name);
 	}
 
 	return true;
@@ -2946,7 +2967,7 @@ ipc_handle_device_get_view_poses(volatile struct ipc_client_state *ics,
 
 #if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	// Try SR-aware view poses first (pass client compositor for per-client window metrics)
-	if (ipc_try_get_sr_view_poses(s, (struct xrt_compositor *)ics->xc, xdev, fallback_eye_relation, at_timestamp_ns,
+	if (ipc_try_get_sr_view_poses(ics, (struct xrt_compositor *)ics->xc, xdev, fallback_eye_relation, at_timestamp_ns,
 	                               view_count, &reply.head_relation, fovs, poses)) {
 		reply.result = XRT_SUCCESS;
 	} else
@@ -3013,7 +3034,7 @@ ipc_handle_device_get_view_poses_2(volatile struct ipc_client_state *ics,
 
 #if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	// Try SR-aware view poses first (pass client compositor for per-client window metrics)
-	if (ipc_try_get_sr_view_poses(ics->server, (struct xrt_compositor *)ics->xc, xdev, default_eye_relation, at_timestamp_ns,
+	if (ipc_try_get_sr_view_poses(ics, (struct xrt_compositor *)ics->xc, xdev, default_eye_relation, at_timestamp_ns,
 	                               view_count, &out_info->head_relation, out_info->fovs, out_info->poses)) {
 		return XRT_SUCCESS;
 	}
