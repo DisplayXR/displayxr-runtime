@@ -200,10 +200,15 @@ The Metal compositor is the primary path on macOS. The Vulkan path works via Mol
 
 ---
 
-## 9. Revision History
+## 9. Forward Compatibility
+
+The Cocoa binding tracks `XR_EXT_win32_window_binding` for forward-compatibility intent. See [`XR_EXT_win32_window_binding §9.2`](XR_EXT_win32_window_binding.md#92-forward-compatibility-roadmap-additive-only) for the additive-only roadmap (DPI hints, async readiness, multi-canvas, vendor-private next chains) and [§9.3](XR_EXT_win32_window_binding.md#93-architectural-invariants-wont-change) for the architectural invariants apps can rely on. Any extension that lands on Win32 lands on Cocoa with parity unless explicitly noted.
+
+## 10. Revision History
 
 | Version | Date | Author | Changes |
 |---|---|---|---|
 | 1 | 2025-06-15 | David Fattal | Initial version with viewHandle |
 | 2 | 2025-09-20 | David Fattal | Added readbackCallback for offscreen mode |
 | 3 | 2026-01-10 | David Fattal | Added sharedIOSurface for zero-copy Metal texture sharing. Fixed type value collision (1000999003 → 1000999004). |
+| 4 | 2026-04-24 | David Fattal | Read-back contract clarified: runtime writes the canvas region at `(x, y)` (not origin) in the shared IOSurface, matching `xrSetSharedTextureOutputRectEXT` args. Apps must sample at `uvOffset + uv * uvScale`. See ADR-010. |

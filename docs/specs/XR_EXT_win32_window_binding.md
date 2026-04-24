@@ -844,8 +844,35 @@ The D3D11 immediate device context is **single-threaded by design**. Application
 
 ## 9. Future Directions
 
+### 9.1 In-flight or planned
+
 - **Multi-app simultaneous testing** — Validate two per-session apps rendering to different windows at the same time
 - **Async weaving** — Replace `vkQueueWaitIdle()` with fence-based synchronization for better throughput
 - **WebXR / browser integration** — Browser passes canvas backing surface as window handle via `XR_EXT_win32_window_binding`; requires browser vendor cooperation
 - **Linux / Android platform support** — Extend `windowHandle` to accept XCB/Wayland/ANativeWindow handles
 - **Khronos standardization** — Propose `XR_EXT_win32_window_binding` for inclusion in the OpenXR specification
+
+### 9.2 Forward-compatibility roadmap (additive only)
+
+The current API surface is intentionally minimal: a window handle, an optional shared texture, and a canvas rect with a symmetric read-back contract. We expect this to remain the public contract indefinitely. The items below describe **possible additive extensions** that future display vendors might motivate. None of them break existing apps; each is either a new function, a new `next`-chain struct, or a new field with a back-compatible default.
+
+- **DPI / monitor hint** — A vendor whose weaver depends on physical pixel density (beyond what `GetDpiForWindow(HWND)` already conveys) could attach an `XrDisplayMonitorHintEXT` struct to the next chain of `XrWin32WindowBindingCreateInfoEXT`. Default behaviour stays as today: runtime queries DPI from the HWND's monitor.
+
+- **Async readiness signal for shared textures** — A vendor that needs the runtime to wait on a sync primitive (fence, keyed mutex, IOSurface-style sync) before reading the shared texture could declare a sync object via a `next`-chain struct. Today's contract is "app must have finished writing before submitting the frame"; this would let vendors opt into stricter ordering. Apps that don't supply one keep working.
+
+- **Multi-canvas / picture-in-picture** — `xrSetSharedTextureOutputRectEXT` could grow a sibling that takes an array of disjoint canvas rects (e.g. `xrSetSharedTextureOutputRectsEXT`). Each rect would carry its own read-back region and per-rect Kooima parameters. Single-canvas apps unaffected.
+
+- **Per-canvas rendering hints** — Eventually we may want to mark canvases with usage hints (`PRIMARY_3D`, `OVERLAY_2D`, `READBACK_ONLY`) so the runtime can pick a fast path on a per-canvas basis. Optional, defaulted.
+
+- **Vendor-private next chains** — The OpenXR `next`-chain is the established mechanism for vendors to attach driver-specific state without polluting the core extension. New vendors with truly unusual needs (e.g. an external swapchain handle, a hardware overlay plane) hook in there.
+
+These directions are listed for transparency about where the API could evolve. **They are not commitments.** None of them require changing the existing functions or struct layouts; the current spec version (3) is intended to be stable for apps shipping today, and any future additions will appear as new spec versions and new symbols rather than as redefinitions.
+
+### 9.3 Architectural invariants (won't change)
+
+These are guarantees current apps and vendors can rely on:
+
+- The window handle / view handle is the runtime's source of truth for screen-space position. Phase, DPI, and monitor routing flow from it.
+- Canvas coordinates passed to `xrSetSharedTextureOutputRectEXT` are in HWND/NSView client-area pixels. They are never re-interpreted by the runtime as fractional, normalized, or screen coordinates.
+- The read-back contract is symmetric: the app sends `(x, y, w, h)`; the runtime writes `(w × h)` at `(x, y)` in the shared texture; the app reads `(w × h)` from `(x, y)`.
+- Vendor-specific weaving lives in the vendor's display processor (see [ADR-007](../adr/ADR-007-compositor-never-weaves.md)). Apps and runtime compositors are vendor-blind.
