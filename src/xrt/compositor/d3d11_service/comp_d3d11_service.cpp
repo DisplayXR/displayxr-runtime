@@ -800,12 +800,6 @@ struct d3d11_multi_compositor
 	char toast_text[256];
 	uint64_t toast_until_ns;
 
-	//! Empty-state "Apps" button bounds in display-space meters (for click detection).
-	//! Updated every render frame when the empty state is drawn.
-	float empty_apps_btn_cy_m;
-	float empty_apps_btn_half_w_m;
-	float empty_apps_btn_half_h_m;
-
 	//! Previous frame LMB/RMB state (for rising-edge detection).
 	bool prev_lmb_held;
 	bool prev_rmb_held;
@@ -6138,14 +6132,6 @@ after_key_shortcuts:
 					                   disp_h_tb / (float)sys->base.info.display_pixel_height;
 					float cursor_x_m = ((float)pt.x - (float)sys->base.info.display_pixel_width / 2.0f) *
 					                   disp_w_tb / (float)sys->base.info.display_pixel_width;
-					// Empty-state "Apps (Ctrl+L)" button
-					if (mc->client_count == 0 && !mc->launcher_visible &&
-					    fabsf(cursor_x_m) <= mc->empty_apps_btn_half_w_m &&
-					    fabsf(cursor_y_m - mc->empty_apps_btn_cy_m) <= mc->empty_apps_btn_half_h_m) {
-						launcher_set_visible(sys, mc, true);
-						U_LOG_W("Multi-comp: Apps button clicked → show launcher");
-					}
-
 					// Taskbar at bottom: y from -disp_h/2 to -disp_h/2 + taskbar_h
 					float tb_bottom_m = -disp_h_tb / 2.0f;
 					float tb_top_m = tb_bottom_m + UI_TASKBAR_H_M;
@@ -6710,7 +6696,7 @@ after_key_shortcuts:
 		sys->context->ClearRenderTargetView(mc->combined_atlas_rtv.get(), bg_color);
 	}
 
-	// Empty state: DisplayXR logo + "Apps (Ctrl+L)" button.
+	// Draw a hint when there are no visible clients and the launcher isn't open.
 	if (mc->client_count == 0 && !mc->launcher_visible && mc->font_atlas_srv) {
 		uint32_t ca_w = sys->base.info.display_pixel_width;
 		uint32_t ca_h = sys->base.info.display_pixel_height;
@@ -6719,44 +6705,20 @@ after_key_shortcuts:
 		uint32_t num_views = sys->tile_columns * sys->tile_rows;
 		uint32_t half_w, half_h;
 		resolve_active_view_dims(sys, ca_w, ca_h, &half_w, &half_h);
+		float scale = 3.0f;
+		float gh = (float)mc->font_glyph_h * scale;
+		const char *hint = "Press Ctrl+L to open launcher";
 
-		float disp_w_m = sys->base.info.display_width_m;
-		float disp_h_m = sys->base.info.display_height_m;
-		if (disp_w_m <= 0) disp_w_m = 0.700f;
-		if (disp_h_m <= 0) disp_h_m = 0.394f;
-
-		// Logo: "DisplayXR" large text
-		const float logo_scale = 5.0f;
-		const float logo_gh = (float)mc->font_glyph_h * logo_scale;
-		const char *logo_str = "DisplayXR";
-		float logo_w = 0;
-		for (const char *p = logo_str; *p; p++) {
-			unsigned char ch = (unsigned char)*p; if (ch < 0x20 || ch > 0x7E) ch = '?';
-			logo_w += mc->glyph_advances[ch - 0x20] * logo_scale;
-		}
-
-		// Button: "Apps (Ctrl+L)"
-		const float btn_scale = 2.0f;
-		const float btn_gh = (float)mc->font_glyph_h * btn_scale;
-		const char *btn_str = "Apps (Ctrl+L)";
-		float btn_text_w = 0;
-		for (const char *p = btn_str; *p; p++) {
-			unsigned char ch = (unsigned char)*p; if (ch < 0x20 || ch > 0x7E) ch = '?';
-			btn_text_w += mc->glyph_advances[ch - 0x20] * btn_scale;
-		}
-		const float btn_pad_x = btn_gh * 0.9f;
-		const float btn_pad_y = btn_gh * 0.35f;
-		const float btn_w = btn_text_w + 2.0f * btn_pad_x;
-		const float btn_h = btn_gh + 2.0f * btn_pad_y;
-		const float gap = logo_gh * 0.6f; // gap between logo and button
-
-		// Pipeline setup
 		sys->context->VSSetShader(sys->blit_vs.get(), nullptr, 0);
 		sys->context->PSSetShader(sys->blit_ps.get(), nullptr, 0);
 		sys->context->VSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
 		sys->context->PSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
+		ID3D11ShaderResourceView *font_srv = mc->font_atlas_srv.get();
+		sys->context->PSSetShaderResources(0, 1, &font_srv);
+		sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
 		ID3D11RenderTargetView *rtvs[] = {mc->combined_atlas_rtv.get()};
 		sys->context->OMSetRenderTargets(1, rtvs, nullptr);
+		sys->context->OMSetBlendState(sys->blend_alpha.get(), nullptr, 0xFFFFFFFF);
 		sys->context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
 		sys->context->IASetInputLayout(nullptr);
 		sys->context->RSSetState(sys->rasterizer_state.get());
@@ -6770,111 +6732,47 @@ after_key_shortcuts:
 			uint32_t row = v / sys->tile_columns;
 			float cx = (float)(col * half_w) + (float)half_w * 0.5f;
 			float cy = (float)(row * half_h) + (float)half_h * 0.5f;
-
-			float total_h = logo_gh + gap + btn_h;
-			float logo_y = cy - total_h * 0.5f;
-			float btn_y  = logo_y + logo_gh + gap;
-
-			// --- Logo text "DisplayXR" (white) ---
-			sys->context->OMSetBlendState(sys->blend_alpha.get(), nullptr, 0xFFFFFFFF);
-			ID3D11ShaderResourceView *font_srv = mc->font_atlas_srv.get();
-			sys->context->PSSetShaderResources(0, 1, &font_srv);
-			sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
-			{
-				float tx = cx - logo_w * 0.5f;
-				float cursor = 0;
-				for (const char *p = logo_str; *p; p++) {
-					unsigned char ch = (unsigned char)*p; if (ch < 0x20 || ch > 0x7E) ch = '?';
-					int gi = ch - 0x20;
-					float src_x = 0; for (int i = 0; i < gi; i++) src_x += mc->glyph_advances[i];
-					float src_gw = mc->glyph_advances[gi];
-					float dst_gw = src_gw * logo_scale;
-					D3D11_MAPPED_SUBRESOURCE m;
-					if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
-						BlitConstants *cb = static_cast<BlitConstants *>(m.pData);
-						cb->src_rect[0] = src_x; cb->src_rect[1] = 0;
-						cb->src_rect[2] = src_gw; cb->src_rect[3] = (float)mc->font_glyph_h;
-						cb->src_size[0] = (float)mc->font_atlas_w; cb->src_size[1] = (float)mc->font_atlas_h;
-						cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
-						cb->convert_srgb = 0.0f; cb->corner_radius = 0; cb->corner_aspect = 0;
-						cb->edge_feather = 0; cb->glow_intensity = 0; cb->quad_mode = 0;
-						cb->dst_offset[0] = tx + cursor; cb->dst_offset[1] = logo_y;
-						cb->dst_rect_wh[0] = dst_gw; cb->dst_rect_wh[1] = logo_gh;
-						memset(cb->quad_corners_01, 0, sizeof(cb->quad_corners_01));
-						memset(cb->quad_corners_23, 0, sizeof(cb->quad_corners_23));
-						sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
-						sys->context->Draw(4, 0);
-					}
-					cursor += dst_gw;
+			// Measure text width
+			float tw = 0;
+			for (const char *p = hint; *p; p++) {
+				unsigned char ch = (unsigned char)*p;
+				if (ch < 0x20 || ch > 0x7E) ch = '?';
+				tw += mc->glyph_advances[ch - 0x20] * scale;
+			}
+			float tx = cx - tw * 0.5f;
+			float ty = cy - gh * 0.5f;
+			float cursor = 0;
+			for (const char *p = hint; *p; p++) {
+				unsigned char ch = (unsigned char)*p;
+				if (ch < 0x20 || ch > 0x7E) ch = '?';
+				int gi = ch - 0x20;
+				float src_gw = mc->glyph_advances[gi];
+				float src_x = 0;
+				for (int i = 0; i < gi; i++) src_x += mc->glyph_advances[i];
+				float dst_gw = src_gw * scale;
+				D3D11_MAPPED_SUBRESOURCE m;
+				if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
+				              D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+					BlitConstants *cb = static_cast<BlitConstants *>(m.pData);
+					cb->src_rect[0] = src_x; cb->src_rect[1] = 0;
+					cb->src_rect[2] = src_gw; cb->src_rect[3] = (float)mc->font_glyph_h;
+					cb->src_size[0] = (float)mc->font_atlas_w;
+					cb->src_size[1] = (float)mc->font_atlas_h;
+					cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
+					cb->convert_srgb = 0.0f;
+					cb->corner_radius = 0; cb->corner_aspect = 0;
+					cb->edge_feather = 0; cb->glow_intensity = 0;
+					cb->quad_mode = 0;
+					cb->dst_offset[0] = tx + cursor; cb->dst_offset[1] = ty;
+					cb->dst_rect_wh[0] = dst_gw; cb->dst_rect_wh[1] = gh;
+					memset(cb->quad_corners_01, 0, sizeof(cb->quad_corners_01));
+					memset(cb->quad_corners_23, 0, sizeof(cb->quad_corners_23));
+					sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
+					sys->context->Draw(4, 0);
 				}
-			}
-
-			// --- "Apps (Ctrl+L)" button background (pill) ---
-			float btn_x = cx - btn_w * 0.5f;
-			sys->context->OMSetBlendState(sys->blend_alpha.get(), nullptr, 0xFFFFFFFF);
-			{
-				ID3D11ShaderResourceView *null_srv = nullptr;
-				sys->context->PSSetShaderResources(0, 1, &null_srv);
-			}
-			D3D11_MAPPED_SUBRESOURCE m;
-			if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
-				BlitConstants *cb = static_cast<BlitConstants *>(m.pData);
-				cb->src_rect[0] = 0.22f; cb->src_rect[1] = 0.22f;
-				cb->src_rect[2] = 0.28f; cb->src_rect[3] = 1.0f;
-				cb->src_size[0] = 1; cb->src_size[1] = 1;
-				cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
-				cb->convert_srgb = 2.0f; cb->quad_mode = 0;
-				cb->dst_offset[0] = btn_x; cb->dst_offset[1] = btn_y;
-				cb->dst_rect_wh[0] = btn_w; cb->dst_rect_wh[1] = btn_h;
-				cb->corner_radius = 0.5f; cb->corner_aspect = btn_w / btn_h;
-				cb->edge_feather = 0; cb->glow_intensity = 0;
-				memset(cb->quad_corners_01, 0, sizeof(cb->quad_corners_01));
-				memset(cb->quad_corners_23, 0, sizeof(cb->quad_corners_23));
-				sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
-				sys->context->Draw(4, 0);
-			}
-
-			// --- Button text ---
-			sys->context->PSSetShaderResources(0, 1, &font_srv);
-			{
-				float tx = btn_x + btn_pad_x;
-				float ty = btn_y + btn_pad_y;
-				float cursor = 0;
-				for (const char *p = btn_str; *p; p++) {
-					unsigned char ch = (unsigned char)*p; if (ch < 0x20 || ch > 0x7E) ch = '?';
-					int gi = ch - 0x20;
-					float src_x = 0; for (int i = 0; i < gi; i++) src_x += mc->glyph_advances[i];
-					float src_gw = mc->glyph_advances[gi];
-					float dst_gw = src_gw * btn_scale;
-					if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
-						BlitConstants *cb = static_cast<BlitConstants *>(m.pData);
-						cb->src_rect[0] = src_x; cb->src_rect[1] = 0;
-						cb->src_rect[2] = src_gw; cb->src_rect[3] = (float)mc->font_glyph_h;
-						cb->src_size[0] = (float)mc->font_atlas_w; cb->src_size[1] = (float)mc->font_atlas_h;
-						cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
-						cb->convert_srgb = 0.0f; cb->corner_radius = 0; cb->corner_aspect = 0;
-						cb->edge_feather = 0; cb->glow_intensity = 0; cb->quad_mode = 0;
-						cb->dst_offset[0] = tx + cursor; cb->dst_offset[1] = ty;
-						cb->dst_rect_wh[0] = dst_gw; cb->dst_rect_wh[1] = btn_gh;
-						memset(cb->quad_corners_01, 0, sizeof(cb->quad_corners_01));
-						memset(cb->quad_corners_23, 0, sizeof(cb->quad_corners_23));
-						sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
-						sys->context->Draw(4, 0);
-					}
-					cursor += dst_gw;
-				}
-			}
-
-			// Store button bounds in display-space meters for click detection (first view only)
-			if (v == 0) {
-				float btn_center_px_y = btn_y + btn_h * 0.5f;
-				mc->empty_apps_btn_cy_m     = ((float)half_h * 0.5f - btn_center_px_y) * disp_h_m / (float)half_h;
-				mc->empty_apps_btn_half_w_m = btn_w * 0.5f * disp_w_m / (float)half_w;
-				mc->empty_apps_btn_half_h_m = btn_h * 0.5f * disp_h_m / (float)half_h;
+				cursor += dst_gw;
 			}
 		}
-		sys->context->OMSetBlendState(sys->blend_opaque.get(), nullptr, 0xFFFFFFFF);
-		sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
 	}
 
 	// Copy client atlas → combined atlas, crop to content dims, send to DP.
