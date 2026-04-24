@@ -915,6 +915,39 @@ bridge_client_is_live(struct d3d11_service_system *sys, HWND live_hwnd_hint)
 	return GetPropW(hwnd, L"DXR_BridgeClientActive") != nullptr;
 }
 
+// Authoritative per-frame bridge-relay gate. Unlike bridge_client_is_live,
+// does not depend on the caller's c->render.hwnd — scans sys->compositor_hwnd
+// plus every active client's hwnd for the DXR_BridgeClientActive prop. This
+// is the gate used to drive the qwerty freeze, which is process-global and
+// must not oscillate based on which client's layer_commit ran last.
+//
+// Other callers (crop override, atlas-resize skip, vendor hw-state) keep
+// using bridge_client_is_live with the per-client hwnd — they genuinely
+// want "is this specific client the bridge client" semantics.
+static bool
+bridge_relay_is_live_authoritative(struct d3d11_service_system *sys)
+{
+	if (!g_bridge_relay_active) return false;
+	if (sys == nullptr) return false;
+
+	if (sys->compositor_hwnd != nullptr &&
+	    GetPropW(sys->compositor_hwnd, L"DXR_BridgeClientActive") != nullptr) {
+		return true;
+	}
+
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	if (mc == nullptr) return false;
+	for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
+		struct d3d11_multi_client_slot *slot = &mc->clients[i];
+		if (!slot->active) continue;
+		if (slot->compositor == nullptr) continue;
+		HWND h = slot->compositor->render.hwnd;
+		if (h == nullptr) continue;
+		if (GetPropW(h, L"DXR_BridgeClientActive") != nullptr) return true;
+	}
+	return false;
+}
+
 // Forward declarations — defined later, used by client registration code.
 static void
 compute_grid_layout(const struct d3d11_service_system *sys,
@@ -8610,26 +8643,30 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	// exists but no extension is connected, this is false and legacy
 	// behavior runs normally. Also drives qwerty relay state transitions
 	// so qwerty wakes up the moment the WS client disconnects.
+	// Per-client bridge_client_is_live is still used elsewhere in this
+	// function for "is this specific client the bridge client" semantics
+	// (crop override, atlas-resize skip, vendor hw-state forwarding).
 	bool bridge_live = bridge_client_is_live(sys, c->render.hwnd);
+
+	// Qwerty freeze gate uses the authoritative scan instead, so it is
+	// stable across clients (doesn't oscillate when legacy + bridge-aware
+	// sessions coexist, or when the bridge exe outlives its WS client).
+	bool bridge_relay_live = bridge_relay_is_live_authoritative(sys);
 	{
-		static bool s_last_bridge_live = false;
-		if (bridge_live != s_last_bridge_live) {
-			HWND caller_hwnd = c->render.hwnd;
+		static bool s_last_bridge_relay_live = false;
+		if (bridge_relay_live != s_last_bridge_relay_live) {
 			HWND sys_hwnd = sys != nullptr ? sys->compositor_hwnd : nullptr;
-			bool prop_on_caller = caller_hwnd != nullptr &&
-			                      GetPropW(caller_hwnd, L"DXR_BridgeClientActive") != nullptr;
 			bool prop_on_sys = sys_hwnd != nullptr &&
 			                   GetPropW(sys_hwnd, L"DXR_BridgeClientActive") != nullptr;
-			U_LOG_W("Bridge WS client %s — gating bridge paths %s "
-			        "(caller_hwnd=%p prop=%d, sys_hwnd=%p prop=%d, g_bridge_relay_active=%d)",
-			        bridge_live ? "connected" : "disconnected",
-			        bridge_live ? "ON" : "OFF",
-			        (void *)caller_hwnd, prop_on_caller ? 1 : 0,
+			U_LOG_W("Bridge WS client %s — qwerty relay %s "
+			        "(sys_hwnd=%p prop=%d, g_bridge_relay_active=%d)",
+			        bridge_relay_live ? "connected" : "disconnected",
+			        bridge_relay_live ? "ON" : "OFF",
 			        (void *)sys_hwnd, prop_on_sys ? 1 : 0,
 			        g_bridge_relay_active ? 1 : 0);
-			s_last_bridge_live = bridge_live;
+			s_last_bridge_relay_live = bridge_relay_live;
 #ifdef XRT_BUILD_DRIVER_QWERTY
-			qwerty_set_bridge_relay_active(bridge_live);
+			qwerty_set_bridge_relay_active(bridge_relay_live);
 #endif
 		}
 	}
