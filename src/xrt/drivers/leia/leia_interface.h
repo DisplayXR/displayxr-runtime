@@ -96,6 +96,29 @@ bool
 leia_edid_get_cached_result(struct leia_display_probe_result *out);
 
 /*!
+ * Perform a fresh EDID probe and return the current screen rectangle of the
+ * first Leia/Dimenco 3D display connected to the system.
+ *
+ * Unlike leia_edid_get_cached_result(), this re-enumerates monitors on every
+ * call, so it reflects the current monitor arrangement — useful for placing a
+ * compositor window after the user has changed their display layout without
+ * restarting the service.
+ *
+ * @param[out] out_left   Monitor left edge in virtual screen coords.
+ * @param[out] out_top    Monitor top edge in virtual screen coords.
+ * @param[out] out_width  Monitor width in pixels (optional, may be NULL).
+ * @param[out] out_height Monitor height in pixels (optional, may be NULL).
+ * @return true if a Leia 3D display was found; false otherwise.
+ *
+ * @ingroup drv_leia
+ */
+bool
+leia_edid_find_3d_display_rect(int32_t *out_left,
+                               int32_t *out_top,
+                               int32_t *out_width,
+                               int32_t *out_height);
+
+/*!
  * Probe for SR display hardware.
  *
  * Creates a temporary SR context and checks for an active SR display.

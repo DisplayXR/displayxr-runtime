@@ -307,3 +307,35 @@ leia_edid_get_cached_result(struct leia_display_probe_result *out)
 	*out = g_leia_edid_result;
 	return g_leia_edid_result.hw_found;
 }
+
+bool
+leia_edid_find_3d_display_rect(int32_t *out_left,
+                               int32_t *out_top,
+                               int32_t *out_width,
+                               int32_t *out_height)
+{
+	struct os_display_edid_list list;
+	if (!os_display_edid_enumerate(&list)) {
+		return false;
+	}
+
+	const struct os_display_edid_monitor *match =
+	    os_display_edid_find_in_table(&list, leia_edid_table, LEIA_EDID_TABLE_LEN);
+	if (match == NULL) {
+		return false;
+	}
+
+	if (out_left != NULL) {
+		*out_left = match->screen_left;
+	}
+	if (out_top != NULL) {
+		*out_top = match->screen_top;
+	}
+	if (out_width != NULL) {
+		*out_width = (int32_t)match->pixel_width;
+	}
+	if (out_height != NULL) {
+		*out_height = (int32_t)match->pixel_height;
+	}
+	return true;
+}

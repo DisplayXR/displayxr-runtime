@@ -83,11 +83,6 @@ bridge_page_attached(HWND hwnd)
 static WCHAR szWindowClass[] = L"DisplayXRD3D11";
 static WCHAR szWindowData[] = L"DisplayXRD3D11Window";
 
-// Monitor enumeration data
-static bool g_use_secondary_monitor = true;
-static int g_monitor_info_count = 0;
-static MONITORINFOEX g_monitor_info[16] = {};
-
 /*!
  * D3D11 compositor self-owned window structure.
  *
@@ -274,55 +269,29 @@ is_shell_reserved_key(WPARAM vk)
 }
 
 /*!
- * Monitor enumeration callback.
- */
-static BOOL CALLBACK
-monitor_enum_proc(HMONITOR hMonitor, HDC hdcMonitor, LPRECT lprcMonitor, LPARAM dwData)
-{
-	MONITORINFOEX info;
-	ZeroMemory(&info, sizeof(info));
-	info.cbSize = sizeof(info);
-	GetMonitorInfo(hMonitor, (LPMONITORINFO)&info);
-	if (g_monitor_info_count < 16) {
-		g_monitor_info[g_monitor_info_count++] = info;
-	}
-	return TRUE;
-}
-
-/*!
- * Get the top-left coordinate of a known 3D display, or secondary monitor.
+ * Resolve the top-left pixel coordinate of the 3D display on this machine.
  *
- * Uses EDID-based identification via the Leia driver's cached probe result
- * (if available), falling back to secondary monitor detection.
+ * Does a fresh EDID probe every call (no stale cache) so monitor rearrangements
+ * take effect without restarting the service. Falls back to primary (0, 0) when
+ * no 3D display is identified — we do NOT guess "first non-primary monitor",
+ * because on a setup where the 3D display IS primary, that guess would land
+ * the compositor on a 2D monitor.
  */
 static bool
 get_3d_display_top_left(int *x, int *y)
 {
-	// Try cached EDID probe result from Leia driver (set during builder estimation)
 #ifdef XRT_HAVE_LEIA_SR
-	struct leia_display_probe_result edid;
-	if (leia_edid_get_cached_result(&edid) && edid.hw_found) {
-		*x = edid.screen_left;
-		*y = edid.screen_top;
+	int32_t left = 0;
+	int32_t top = 0;
+	if (leia_edid_find_3d_display_rect(&left, &top, NULL, NULL)) {
+		*x = (int)left;
+		*y = (int)top;
+		U_LOG_W("3D display resolved via EDID to (%d, %d)", *x, *y);
 		return true;
 	}
+	U_LOG_W("3D display EDID probe found no known panel — defaulting to primary monitor");
 #endif
 
-	// Fall back to monitor enumeration + secondary monitor
-	g_monitor_info_count = 0;
-	EnumDisplayMonitors(NULL, NULL, monitor_enum_proc, 0);
-
-	if (g_use_secondary_monitor) {
-		for (int i = 0; i < g_monitor_info_count; i++) {
-			if (0 == (g_monitor_info[i].dwFlags & MONITORINFOF_PRIMARY)) {
-				*x = g_monitor_info[i].rcMonitor.left;
-				*y = g_monitor_info[i].rcMonitor.top;
-				return true;
-			}
-		}
-	}
-
-	// Only one display - use primary
 	*x = 0;
 	*y = 0;
 	return false;
@@ -918,6 +887,20 @@ window_thread_func(LPVOID param)
 	// Associate window data before showing
 	SetPropW(hwnd, szWindowData, w);
 	SetWindowLongPtr(hwnd, GWLP_USERDATA, (LONG_PTR)w);
+
+	// Verify the window actually landed where we asked. Win32 occasionally
+	// nudges overlapped windows at negative coordinates to the primary monitor.
+	// If that happened, force-move it back onto the 3D display.
+	{
+		RECT actual = {0};
+		if (GetWindowRect(hwnd, &actual) && (actual.left != rc.left || actual.top != rc.top)) {
+			U_LOG_W("D3D11 window: CreateWindow landed at (%d, %d), expected (%d, %d) — correcting",
+			        (int)actual.left, (int)actual.top, (int)rc.left, (int)rc.top);
+			SetWindowPos(hwnd, NULL, rc.left, rc.top,
+			             rc.right - rc.left, rc.bottom - rc.top,
+			             SWP_NOZORDER | SWP_NOACTIVATE);
+		}
+	}
 
 	if (!w->hidden) {
 		// Check if we should start fullscreen
