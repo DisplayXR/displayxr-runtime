@@ -661,6 +661,24 @@ qwerty_system_create(struct qwerty_hmd *qhmd,
 		U_LOG_W("qwerty: system_create HMD pose=(%.3f, %.3f, %.3f) nominal_viewer_z=%.3f",
 		        (double)qhmd->base.pose.position.x, (double)qhmd->base.pose.position.y,
 		        (double)qhmd->base.pose.position.z, (double)qs->nominal_viewer_z);
+
+		// Re-seed the HMD default pose from the nominal viewer distance.
+		// The raw qwerty_hmd_create default (0, 1.6, 0) places the camera
+		// at the display origin — fine for HMD-sim UIs that render inside
+		// the virtual HMD, but wrong for desktop 3D displays where the
+		// user sits ~nominal_viewer_z (positive = in front of display,
+		// matching the oxr_session fallback eye placement convention).
+		// Legacy Chrome WebXR in shell mode compounded its own scene
+		// origin with the (0, 1.6, 0) default and placed content
+		// mispositioned relative to the shell window.
+		if (qs->nominal_viewer_z > 0.0f) {
+			qhmd->base.pose.position.x = 0.0f;
+			qhmd->base.pose.position.y = 1.6f;
+			qhmd->base.pose.position.z = qs->nominal_viewer_z;
+			U_LOG_W("qwerty: HMD pose reseeded to (%.3f, %.3f, %.3f) from nominal viewer",
+			        (double)qhmd->base.pose.position.x, (double)qhmd->base.pose.position.y,
+			        (double)qhmd->base.pose.position.z);
+		}
 	}
 	qleft->base.sys = qs;
 	qright->base.sys = qs;
