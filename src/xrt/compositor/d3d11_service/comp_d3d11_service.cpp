@@ -9906,8 +9906,15 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 		}
 	}
 
-	// Register with multi-compositor in shell mode
-	if (sys->shell_mode) {
+	// Register with multi-compositor in shell mode. Skip bridge-relay
+	// sessions — they're headless metadata channels (no graphics, no
+	// content to display) and a phantom slot keeps mc->client_count > 0
+	// after Chrome's WebXR session ends, which in turn suppresses the
+	// empty-shell "Press Ctrl+L" hint (gated on client_count == 0) and
+	// can occlude the launcher when the user summons it post-exit.
+	// compositor_destroy's unregister call is already a no-op on a
+	// never-registered compositor (its loop won't find a matching slot).
+	if (sys->shell_mode && !is_headless_relay) {
 		// Ensure multi_comp struct exists for registration
 		// Eagerly create multi-comp output (window + DP) on first client connect.
 		// This ensures the DP is available for ipc_try_get_sr_view_poses
