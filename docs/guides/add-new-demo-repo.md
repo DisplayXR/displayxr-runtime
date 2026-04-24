@@ -78,7 +78,7 @@ Confirm the public repo receives a commit and a tag, and that a Release appears 
 
 ## 6. Wire up `/release`
 
-Update `.claude/skills/release/SKILL.md` Phase 4 (Monitor Publish) to include `publish-demo-<name>.yml`, and Phase 5 (Verify) to check a release exists on `DisplayXR/displayxr-demo-<name>` for the tag.
+The `/release` skill auto-discovers per-demo workflows from `.github/workflows/publish-demo-*.yml` — so once your new workflow file is committed, `/release demo-<name> patch` (and friends) should work. Smoke-test it with an explicit version first: `/release demo-<name> v0.1.0` to avoid surprises from the auto-bump path's "no previous tag" fallback. No edits to `.claude/skills/release/SKILL.md` are needed for the happy path; if the skill's component validator complains, it's likely because the `publish-demo-<name>.yml` file didn't land on main before dispatch.
 
 ## 7. Update `CLAUDE.md`
 
