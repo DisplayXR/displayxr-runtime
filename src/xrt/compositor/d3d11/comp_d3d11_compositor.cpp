@@ -193,18 +193,6 @@ struct comp_d3d11_compositor
 	float legacy_view_scale_x;
 	float legacy_view_scale_y;
 
-	//! Lazily allocated HWND-sized intermediate texture for weaving in shared
-	//! texture mode. The weaver requires backbuffer == HWND size, but the shared
-	//! texture is display-sized (worst case). We weave into this intermediate,
-	//! then copy the canvas region to the shared texture at (0,0).
-	ID3D11Texture2D *weave_intermediate;
-	ID3D11RenderTargetView *weave_intermediate_rtv;
-	uint32_t weave_intermediate_w, weave_intermediate_h;
-
-	//! True once the weave intermediate has been created. It is never
-	//! resized — the SR weaver cannot handle backbuffer changes mid-session.
-	bool weave_intermediate_created;
-
 	//! Lazily allocated intermediate texture for cropping atlas to content dims
 	//! before passing to display processor. NULL when not needed (zero-copy case).
 	ID3D11Texture2D *dp_input_texture;
@@ -1059,18 +1047,7 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 				uint32_t new_vw = mode->view_width_pixels;
 				uint32_t new_vh = mode->view_height_pixels;
 				if (c->canvas.valid) {
-					// Use the fixed intermediate dimensions for view
-					// computation when available. The intermediate never
-					// resizes, so view dims stay constant — preventing
-					// setInputViewTexture dimension changes that break
-					// the SR weaver.
-					uint32_t canvas_for_view_w = c->canvas.w;
-					uint32_t canvas_for_view_h = c->canvas.h;
-					if (c->weave_intermediate_created) {
-						canvas_for_view_w = c->weave_intermediate_w / 2;
-						canvas_for_view_h = c->weave_intermediate_h / 2;
-					}
-					u_tiling_compute_canvas_view(mode, canvas_for_view_w, canvas_for_view_h,
+					u_tiling_compute_canvas_view(mode, c->canvas.w, c->canvas.h,
 					                             &new_vw, &new_vh);
 				} else if (!c->owns_window && tgt_width > 0 && tgt_height > 0) {
 					// Handle app: window may differ from display size,
@@ -1265,114 +1242,27 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			uint32_t content_h = tile_rows * view_height;
 			atlas_srv = d3d11_crop_atlas_for_dp(c, atlas_srv, content_w, content_h);
 
-			// Get HWND client area — the weaver requires backbuffer == HWND size.
-			HWND weave_hwnd = c->app_hwnd != nullptr ? c->app_hwnd : c->hwnd;
-			RECT client_rect = {};
-			uint32_t hwnd_w = 0, hwnd_h = 0;
-			if (weave_hwnd != nullptr && GetClientRect(weave_hwnd, &client_rect)) {
-				hwnd_w = (uint32_t)(client_rect.right - client_rect.left);
-				hwnd_h = (uint32_t)(client_rect.bottom - client_rect.top);
-			}
+			// Weave directly into the shared texture at the canvas sub-rect.
+			// The SR weaver handles backbuffer > HWND correctly as long as the
+			// viewport position inside the backbuffer matches the eventual
+			// screen-space position inside the HWND (verified via Leia
+			// ST-5465-test-scenario). The app's blit reads back from
+			// (canvas.x, canvas.y) in the shared texture — see ADR-010.
+			D3D11_TEXTURE2D_DESC st_desc;
+			c->shared_texture->GetDesc(&st_desc);
+			uint32_t dp_target_w = st_desc.Width;
+			uint32_t dp_target_h = st_desc.Height;
 
-			bool use_intermediate = c->canvas.valid && c->canvas.w > 0 &&
-			                        c->canvas.h > 0 && hwnd_w > 0 && hwnd_h > 0;
+			c->context->OMSetRenderTargets(1, &c->shared_rtv, nullptr);
 
-			if (use_intermediate && !c->weave_intermediate_created) {
-				// Create intermediate once at the initial HWND size and never
-				// resize it. The SR weaver cannot handle backbuffer dimension
-				// changes mid-session (setInputViewTexture with new dims puts
-				// the weaver in a bad state). By keeping the intermediate fixed,
-				// the weaver's state stays stable across window resizes.
-				// The proportional canvas scaling below handles the mismatch
-				// between the fixed intermediate and the current HWND size.
-				D3D11_TEXTURE2D_DESC desc = {};
-				desc.Width = hwnd_w;
-				desc.Height = hwnd_h;
-				desc.MipLevels = 1;
-				desc.ArraySize = 1;
-				desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-				desc.SampleDesc.Count = 1;
-				desc.Usage = D3D11_USAGE_DEFAULT;
-				desc.BindFlags = D3D11_BIND_RENDER_TARGET;
+			xrt_display_processor_d3d11_process_atlas(
+			    c->display_processor, c->context, atlas_srv, view_width, view_height,
+			    tile_columns, tile_rows, DXGI_FORMAT_R8G8B8A8_UNORM, dp_target_w, dp_target_h,
+			    c->canvas.valid ? c->canvas.x : 0,
+			    c->canvas.valid ? c->canvas.y : 0,
+			    c->canvas.valid ? c->canvas.w : 0,
+			    c->canvas.valid ? c->canvas.h : 0);
 
-				HRESULT hr = c->device->CreateTexture2D(&desc, nullptr, &c->weave_intermediate);
-				if (SUCCEEDED(hr)) {
-					c->device->CreateRenderTargetView(c->weave_intermediate, nullptr,
-					                                  &c->weave_intermediate_rtv);
-					c->weave_intermediate_w = hwnd_w;
-					c->weave_intermediate_h = hwnd_h;
-					c->weave_intermediate_created = true;
-					U_LOG_W("Created fixed weave intermediate: %ux%u (will not resize)", hwnd_w, hwnd_h);
-				} else {
-					U_LOG_E("Failed to create weave intermediate: 0x%08x", (unsigned)hr);
-					use_intermediate = false;
-				}
-			}
-
-			if (use_intermediate) {
-				// Use the fixed intermediate dimensions
-				hwnd_w = c->weave_intermediate_w;
-				hwnd_h = c->weave_intermediate_h;
-			}
-
-			if (use_intermediate && c->weave_intermediate_rtv != nullptr) {
-				// Compute canvas relative to the intermediate's dimensions.
-				// The app's c->canvas is in real HWND coordinates, but during
-				// debounce the intermediate may be at the old HWND size.
-				// Scale the canvas proportionally: same ratio within the
-				// intermediate as the app's canvas within the real HWND.
-				RECT cur_rect = {};
-				uint32_t cur_hwnd_w = hwnd_w, cur_hwnd_h = hwnd_h;
-				if (weave_hwnd != nullptr && GetClientRect(weave_hwnd, &cur_rect)) {
-					cur_hwnd_w = (uint32_t)(cur_rect.right - cur_rect.left);
-					cur_hwnd_h = (uint32_t)(cur_rect.bottom - cur_rect.top);
-				}
-				// Canvas ratios within the real HWND
-				float rx = (cur_hwnd_w > 0) ? (float)c->canvas.x / (float)cur_hwnd_w : 0.25f;
-				float ry = (cur_hwnd_h > 0) ? (float)c->canvas.y / (float)cur_hwnd_h : 0.25f;
-				float rw = (cur_hwnd_w > 0) ? (float)c->canvas.w / (float)cur_hwnd_w : 0.5f;
-				float rh = (cur_hwnd_h > 0) ? (float)c->canvas.h / (float)cur_hwnd_h : 0.5f;
-				// Apply ratios to intermediate dimensions
-				int32_t eff_canvas_x = (int32_t)(rx * hwnd_w);
-				int32_t eff_canvas_y = (int32_t)(ry * hwnd_h);
-				uint32_t eff_canvas_w = (uint32_t)(rw * hwnd_w);
-				uint32_t eff_canvas_h = (uint32_t)(rh * hwnd_h);
-
-				// Weave into HWND-sized intermediate with viewport sub-rect
-				c->context->OMSetRenderTargets(1, &c->weave_intermediate_rtv, nullptr);
-
-				xrt_display_processor_d3d11_process_atlas(
-				    c->display_processor, c->context, atlas_srv, view_width, view_height,
-				    tile_columns, tile_rows, DXGI_FORMAT_R8G8B8A8_UNORM, hwnd_w, hwnd_h,
-				    eff_canvas_x, eff_canvas_y, eff_canvas_w, eff_canvas_h);
-
-				// Copy canvas region from intermediate to shared texture at (0,0).
-				// Use eff_canvas (proportionally scaled to intermediate), not
-				// c->canvas (real HWND coords) — they differ during debounce.
-				D3D11_BOX src_box = {};
-				src_box.left = (UINT)eff_canvas_x;
-				src_box.top = (UINT)eff_canvas_y;
-				src_box.right = (UINT)(eff_canvas_x + eff_canvas_w);
-				src_box.bottom = (UINT)(eff_canvas_y + eff_canvas_h);
-				src_box.front = 0;
-				src_box.back = 1;
-				c->context->CopySubresourceRegion(
-				    c->shared_texture, 0, 0, 0, 0,
-				    c->weave_intermediate, 0, &src_box);
-			} else {
-				// No canvas or no HWND — weave directly into shared texture
-				D3D11_TEXTURE2D_DESC st_desc;
-				c->shared_texture->GetDesc(&st_desc);
-				uint32_t dp_target_w = st_desc.Width;
-				uint32_t dp_target_h = st_desc.Height;
-
-				c->context->OMSetRenderTargets(1, &c->shared_rtv, nullptr);
-
-				xrt_display_processor_d3d11_process_atlas(
-				    c->display_processor, c->context, atlas_srv, view_width, view_height,
-				    tile_columns, tile_rows, DXGI_FORMAT_R8G8B8A8_UNORM, dp_target_w, dp_target_h,
-				    0, 0, 0, 0);
-			}
 			weaving_done = true;
 		}
 
@@ -1516,16 +1406,6 @@ d3d11_compositor_destroy(struct xrt_compositor *xc)
 		c->hud_texture = nullptr;
 	}
 	u_hud_destroy(&c->hud);
-
-	// Destroy weave intermediate texture
-	if (c->weave_intermediate_rtv != nullptr) {
-		c->weave_intermediate_rtv->Release();
-		c->weave_intermediate_rtv = nullptr;
-	}
-	if (c->weave_intermediate != nullptr) {
-		c->weave_intermediate->Release();
-		c->weave_intermediate = nullptr;
-	}
 
 	// Destroy DP input crop texture
 	if (c->dp_input_srv != nullptr) {

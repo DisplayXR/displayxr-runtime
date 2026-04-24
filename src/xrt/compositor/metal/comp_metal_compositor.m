@@ -1708,13 +1708,12 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			dp_src = c->dp_input_texture;
 		}
 
-		// DP target: use canvas dims for texture apps (canvas sub-rect of output surface)
+		// DP target: full output_texture dims. The canvas sub-rect is
+		// communicated via canvas_offset_x/y + canvas_width/height so the DP
+		// writes into the sub-rect within the shared IOSurface, matching
+		// where the app reads from (ADR-010).
 		uint32_t dp_target_w = (uint32_t)output_texture.width;
 		uint32_t dp_target_h = (uint32_t)output_texture.height;
-		if (c->canvas.valid && c->canvas.w > 0 && c->canvas.h > 0) {
-			dp_target_w = c->canvas.w;
-			dp_target_h = c->canvas.h;
-		}
 
 		xrt_display_processor_metal_process_atlas(
 		    c->display_processor,

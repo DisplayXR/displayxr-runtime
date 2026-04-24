@@ -294,7 +294,8 @@ fragment float4 grid_fragment(GridVertexOut in [[stage_in]],
 // --- Blit shader (fullscreen triangle sampling IOSurface texture) ---
 
 struct BlitParams {
-    float2 uv_scale; // (canvasW/surfaceW, canvasH/surfaceH)
+    float2 uv_scale;  // (canvasW/surfaceW, canvasH/surfaceH)
+    float2 uv_offset; // (canvasX/surfaceW, canvasY/surfaceH) — per ADR-010
 };
 
 struct BlitVertexOut {
@@ -309,7 +310,7 @@ vertex BlitVertexOut blit_vertex(uint vid [[vertex_id]],
     out.uv = float2((vid << 1) & 2, vid & 2);
     out.position = float4(out.uv * 2.0 - 1.0, 0.0, 1.0);
     out.uv.y = 1.0 - out.uv.y; // Flip Y for Metal
-    out.uv *= params.uv_scale;  // Crop to canvas portion of IOSurface
+    out.uv = params.uv_offset + out.uv * params.uv_scale;  // Sample canvas sub-rect of IOSurface
     return out;
 }
 
@@ -1082,10 +1083,20 @@ static void BlitIOSurfaceToDrawable(MetalRenderer &r, CAMetalLayer *metalLayer)
         float drawW = (float)drawable.texture.width;
         float drawH = (float)drawable.texture.height;
 
-        // UV scale: only sample the canvas portion of the IOSurface
-        // (compositor writes canvas-sized content to top-left corner)
+        // UV scale + offset: compositor writes the canvas region at
+        // (canvasX, canvasY) inside the IOSurface per ADR-010. Sample at
+        // uv_offset + uv * uv_scale.
         float uvScaleX = (g_ioSurfaceWidth > 0) ? (float)g_canvasW / (float)g_ioSurfaceWidth : 1.0f;
         float uvScaleY = (g_ioSurfaceHeight > 0) ? (float)g_canvasH / (float)g_ioSurfaceHeight : 1.0f;
+        float uvOffsetX = 0.0f, uvOffsetY = 0.0f;
+        if (g_metalView != nil && g_window != nil) {
+            CGFloat bs = [g_window backingScaleFactor];
+            NSRect mf = [g_metalView frame];
+            float canvasXpx = (float)(mf.origin.x * bs);
+            float canvasYpx = (float)(mf.origin.y * bs);
+            if (g_ioSurfaceWidth > 0) uvOffsetX = canvasXpx / (float)g_ioSurfaceWidth;
+            if (g_ioSurfaceHeight > 0) uvOffsetY = canvasYpx / (float)g_ioSurfaceHeight;
+        }
 
         // Letterbox using canvas aspect ratio (not IOSurface aspect)
         float canvasAspect = (g_canvasH > 0) ? (float)g_canvasW / (float)g_canvasH : 1.0f;
@@ -1103,8 +1114,11 @@ static void BlitIOSurfaceToDrawable(MetalRenderer &r, CAMetalLayer *metalLayer)
             vpY = 0;
         }
 
-        // Pass UV scale to blit shader
-        struct { float uv_scale[2]; } blitParams = { { uvScaleX, uvScaleY } };
+        // Pass UV scale + offset to blit shader
+        struct { float uv_scale[2]; float uv_offset[2]; } blitParams = {
+            { uvScaleX, uvScaleY },
+            { uvOffsetX, uvOffsetY }
+        };
 
         MTLViewport vp = {(double)vpX, (double)vpY, (double)vpW, (double)vpH, 0.0, 1.0};
         [enc setViewport:vp];

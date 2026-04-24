@@ -35,7 +35,7 @@ extern "C" {
 #endif
 
 #define XR_EXT_cocoa_window_binding 1
-#define XR_EXT_cocoa_window_binding_SPEC_VERSION 3
+#define XR_EXT_cocoa_window_binding_SPEC_VERSION 4
 #define XR_EXT_COCOA_WINDOW_BINDING_EXTENSION_NAME "XR_EXT_cocoa_window_binding"
 
 // Use a value in the vendor extension range (1000000000+)
