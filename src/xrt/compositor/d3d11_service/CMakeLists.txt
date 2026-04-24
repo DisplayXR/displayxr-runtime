@@ -9,6 +9,22 @@
 # DXGI shared handles and uses KeyedMutex for synchronization.
 #
 
+# Embed doc/displayxr_white.png as a byte array so the compositor can draw the
+# logo on the empty-state screen without shipping the PNG alongside the binary.
+set(DISPLAYXR_LOGO_SRC "${CMAKE_SOURCE_DIR}/doc/displayxr_white.png")
+set(DISPLAYXR_LOGO_GENERATED "${CMAKE_CURRENT_BINARY_DIR}/displayxr_logo_data.c")
+add_custom_command(
+	OUTPUT "${DISPLAYXR_LOGO_GENERATED}"
+	COMMAND ${CMAKE_COMMAND}
+		-DINPUT_FILE=${DISPLAYXR_LOGO_SRC}
+		-DOUTPUT_FILE=${DISPLAYXR_LOGO_GENERATED}
+		-DSYMBOL=displayxr_white_png
+		-P "${CMAKE_CURRENT_SOURCE_DIR}/embed_binary.cmake"
+	DEPENDS "${DISPLAYXR_LOGO_SRC}" "${CMAKE_CURRENT_SOURCE_DIR}/embed_binary.cmake"
+	VERBATIM
+	COMMENT "Embedding ${DISPLAYXR_LOGO_SRC}"
+)
+
 add_library(
 	comp_d3d11_service STATIC
 	comp_d3d11_service.cpp
@@ -18,6 +34,8 @@ add_library(
 	d3d11_capture.h
 	d3d11_icon_loader.cpp
 	d3d11_icon_loader.h
+	displayxr_logo_data.h
+	"${DISPLAYXR_LOGO_GENERATED}"
 	# Include layer accumulator directly (it has no Vulkan dependencies)
 	../util/comp_layer_accum.c
 	../util/comp_layer_accum.h

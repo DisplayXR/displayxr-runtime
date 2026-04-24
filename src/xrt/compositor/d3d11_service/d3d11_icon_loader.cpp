@@ -22,6 +22,55 @@
 #define STBI_NO_LINEAR
 #include "stb_image.h"
 
+static bool
+create_srgb_srv_from_rgba8(ID3D11Device *device,
+                           const stbi_uc *pixels,
+                           int w,
+                           int h,
+                           const char *tag,
+                           ID3D11ShaderResourceView **out_srv)
+{
+	D3D11_TEXTURE2D_DESC desc = {};
+	desc.Width = static_cast<UINT>(w);
+	desc.Height = static_cast<UINT>(h);
+	desc.MipLevels = 1;
+	desc.ArraySize = 1;
+	desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+	desc.SampleDesc.Count = 1;
+	desc.Usage = D3D11_USAGE_IMMUTABLE;
+	desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+	D3D11_SUBRESOURCE_DATA init = {};
+	init.pSysMem = pixels;
+	init.SysMemPitch = static_cast<UINT>(w) * 4u;
+
+	ID3D11Texture2D *tex = nullptr;
+	HRESULT hr = device->CreateTexture2D(&desc, &init, &tex);
+	if (FAILED(hr) || tex == nullptr) {
+		U_LOG_W("d3d11_icon_loader: CreateTexture2D failed 0x%08lX for '%s'",
+		        static_cast<unsigned long>(hr), tag);
+		return false;
+	}
+
+	D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+	srv_desc.Format = desc.Format;
+	srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+	srv_desc.Texture2D.MipLevels = 1;
+
+	ID3D11ShaderResourceView *srv = nullptr;
+	hr = device->CreateShaderResourceView(tex, &srv_desc, &srv);
+	tex->Release();
+
+	if (FAILED(hr) || srv == nullptr) {
+		U_LOG_W("d3d11_icon_loader: CreateShaderResourceView failed 0x%08lX for '%s'",
+		        static_cast<unsigned long>(hr), tag);
+		return false;
+	}
+
+	*out_srv = srv;
+	return true;
+}
+
 bool
 d3d11_icon_load_from_file(ID3D11Device *device,
                           const char *path,
@@ -59,55 +108,71 @@ d3d11_icon_load_from_file(ID3D11Device *device,
 		return false;
 	}
 
-	D3D11_TEXTURE2D_DESC desc = {};
-	desc.Width = static_cast<UINT>(w);
-	desc.Height = static_cast<UINT>(h);
-	desc.MipLevels = 1;
-	desc.ArraySize = 1;
-	desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
-	desc.SampleDesc.Count = 1;
-	desc.Usage = D3D11_USAGE_IMMUTABLE;
-	desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-	desc.CPUAccessFlags = 0;
-	desc.MiscFlags = 0;
-
-	D3D11_SUBRESOURCE_DATA init = {};
-	init.pSysMem = pixels;
-	init.SysMemPitch = static_cast<UINT>(w) * 4u;
-	init.SysMemSlicePitch = 0;
-
-	ID3D11Texture2D *tex = nullptr;
-	HRESULT hr = device->CreateTexture2D(&desc, &init, &tex);
+	bool ok = create_srgb_srv_from_rgba8(device, pixels, w, h, path, out_srv);
 	stbi_image_free(pixels);
 
-	if (FAILED(hr) || tex == nullptr) {
-		U_LOG_W("d3d11_icon_load_from_file: CreateTexture2D failed 0x%08lX for '%s'",
-		        static_cast<unsigned long>(hr), path);
-		return false;
+	if (ok) {
+		if (out_width != nullptr) {
+			*out_width = static_cast<uint32_t>(w);
+		}
+		if (out_height != nullptr) {
+			*out_height = static_cast<uint32_t>(h);
+		}
 	}
+	return ok;
+}
 
-	D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
-	srv_desc.Format = desc.Format;
-	srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-	srv_desc.Texture2D.MostDetailedMip = 0;
-	srv_desc.Texture2D.MipLevels = 1;
-
-	ID3D11ShaderResourceView *srv = nullptr;
-	hr = device->CreateShaderResourceView(tex, &srv_desc, &srv);
-	tex->Release();
-
-	if (FAILED(hr) || srv == nullptr) {
-		U_LOG_W("d3d11_icon_load_from_file: CreateShaderResourceView failed 0x%08lX for '%s'",
-		        static_cast<unsigned long>(hr), path);
-		return false;
+bool
+d3d11_icon_load_from_memory(ID3D11Device *device,
+                            const uint8_t *data,
+                            size_t size,
+                            const char *tag,
+                            ID3D11ShaderResourceView **out_srv,
+                            uint32_t *out_width,
+                            uint32_t *out_height)
+{
+	if (out_srv != nullptr) {
+		*out_srv = nullptr;
 	}
-
-	*out_srv = srv;
 	if (out_width != nullptr) {
-		*out_width = static_cast<uint32_t>(w);
+		*out_width = 0;
 	}
 	if (out_height != nullptr) {
-		*out_height = static_cast<uint32_t>(h);
+		*out_height = 0;
 	}
-	return true;
+
+	if (device == nullptr || data == nullptr || size == 0 || out_srv == nullptr) {
+		return false;
+	}
+
+	const char *log_tag = tag != nullptr ? tag : "<memory>";
+
+	int w = 0;
+	int h = 0;
+	int channels_in_file = 0;
+	stbi_uc *pixels = stbi_load_from_memory(data, static_cast<int>(size), &w, &h,
+	                                         &channels_in_file, 4);
+	if (pixels == nullptr) {
+		U_LOG_W("d3d11_icon_load_from_memory: stbi_load_from_memory failed for '%s': %s",
+		        log_tag, stbi_failure_reason());
+		return false;
+	}
+	if (w <= 0 || h <= 0) {
+		stbi_image_free(pixels);
+		U_LOG_W("d3d11_icon_load_from_memory: invalid dims for '%s'", log_tag);
+		return false;
+	}
+
+	bool ok = create_srgb_srv_from_rgba8(device, pixels, w, h, log_tag, out_srv);
+	stbi_image_free(pixels);
+
+	if (ok) {
+		if (out_width != nullptr) {
+			*out_width = static_cast<uint32_t>(w);
+		}
+		if (out_height != nullptr) {
+			*out_height = static_cast<uint32_t>(h);
+		}
+	}
+	return ok;
 }

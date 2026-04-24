@@ -12,6 +12,7 @@
 #include "d3d11_bitmap_font.h"
 #include "d3d11_capture.h"
 #include "d3d11_icon_loader.h"
+#include "displayxr_logo_data.h"
 
 #include "shared/ipc_protocol.h" // struct ipc_launcher_app_list
 
@@ -816,6 +817,14 @@ struct d3d11_multi_compositor
 	uint32_t font_glyph_h;     //!< Glyph cell height in atlas pixels
 	uint32_t font_atlas_w;     //!< Total atlas width in pixels
 	uint32_t font_atlas_h;     //!< Total atlas height in pixels
+
+	//! Embedded DisplayXR logo PNG decoded to an SRV on first use. Rendered in
+	//! the empty state (no clients, no launcher). Source bytes come from
+	//! displayxr_white_png[] which is generated from doc/displayxr_white.png.
+	wil::com_ptr<ID3D11ShaderResourceView> logo_srv;
+	uint32_t logo_w;
+	uint32_t logo_h;
+	bool logo_load_tried;
 
 	//! @name Capture client render timer
 	//! @{
@@ -4125,6 +4134,7 @@ multi_compositor_destroy(struct d3d11_multi_compositor *mc)
 	mc->combined_atlas.reset();
 	mc->font_atlas_srv.reset();
 	mc->font_atlas.reset();
+	mc->logo_srv.reset();
 	mc->swap_chain.reset();
 
 	if (mc->window != nullptr) {
@@ -6696,8 +6706,23 @@ after_key_shortcuts:
 		sys->context->ClearRenderTargetView(mc->combined_atlas_rtv.get(), bg_color);
 	}
 
-	// Draw a hint when there are no visible clients and the launcher isn't open.
+	// Empty state: DisplayXR logo + "Press Ctrl+L" hint when no clients are visible
+	// and the launcher isn't open.
 	if (mc->client_count == 0 && !mc->launcher_visible && mc->font_atlas_srv) {
+		// Lazy-load the embedded logo PNG on first entry.
+		if (!mc->logo_load_tried) {
+			mc->logo_load_tried = true;
+			ID3D11ShaderResourceView *srv = nullptr;
+			uint32_t lw = 0, lh = 0;
+			if (d3d11_icon_load_from_memory(sys->device.get(), displayxr_white_png,
+			                                 displayxr_white_png_size,
+			                                 "doc/displayxr_white.png", &srv, &lw, &lh)) {
+				mc->logo_srv.attach(srv);
+				mc->logo_w = lw;
+				mc->logo_h = lh;
+			}
+		}
+
 		uint32_t ca_w = sys->base.info.display_pixel_width;
 		uint32_t ca_h = sys->base.info.display_pixel_height;
 		if (ca_w == 0) ca_w = 3840;
@@ -6705,16 +6730,22 @@ after_key_shortcuts:
 		uint32_t num_views = sys->tile_columns * sys->tile_rows;
 		uint32_t half_w, half_h;
 		resolve_active_view_dims(sys, ca_w, ca_h, &half_w, &half_h);
-		float scale = 3.0f;
-		float gh = (float)mc->font_glyph_h * scale;
+		const float scale = 3.0f;
+		const float gh = (float)mc->font_glyph_h * scale;
 		const char *hint = "Press Ctrl+L to open launcher";
+
+		// Logo target height: 35% of view height, preserving aspect ratio.
+		float logo_dst_h = (float)half_h * 0.35f;
+		float logo_dst_w = 0.0f;
+		if (mc->logo_srv && mc->logo_h > 0) {
+			logo_dst_w = logo_dst_h * (float)mc->logo_w / (float)mc->logo_h;
+		}
+		const float gap = gh * 0.8f; // gap between logo and hint text
 
 		sys->context->VSSetShader(sys->blit_vs.get(), nullptr, 0);
 		sys->context->PSSetShader(sys->blit_ps.get(), nullptr, 0);
 		sys->context->VSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
 		sys->context->PSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
-		ID3D11ShaderResourceView *font_srv = mc->font_atlas_srv.get();
-		sys->context->PSSetShaderResources(0, 1, &font_srv);
 		sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
 		ID3D11RenderTargetView *rtvs[] = {mc->combined_atlas_rtv.get()};
 		sys->context->OMSetRenderTargets(1, rtvs, nullptr);
@@ -6732,6 +6763,42 @@ after_key_shortcuts:
 			uint32_t row = v / sys->tile_columns;
 			float cx = (float)(col * half_w) + (float)half_w * 0.5f;
 			float cy = (float)(row * half_h) + (float)half_h * 0.5f;
+
+			// Stack: [logo] [gap] [hint]. Center the whole stack vertically.
+			float block_h = (mc->logo_srv ? logo_dst_h + gap : 0.0f) + gh;
+			float logo_y = cy - block_h * 0.5f;
+			float hint_y = logo_y + (mc->logo_srv ? logo_dst_h + gap : 0.0f);
+
+			// --- Logo quad ---
+			if (mc->logo_srv) {
+				ID3D11ShaderResourceView *logo_srv = mc->logo_srv.get();
+				sys->context->PSSetShaderResources(0, 1, &logo_srv);
+				D3D11_MAPPED_SUBRESOURCE m;
+				if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
+				              D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+					BlitConstants *cb = static_cast<BlitConstants *>(m.pData);
+					cb->src_rect[0] = 0; cb->src_rect[1] = 0;
+					cb->src_rect[2] = (float)mc->logo_w; cb->src_rect[3] = (float)mc->logo_h;
+					cb->src_size[0] = (float)mc->logo_w; cb->src_size[1] = (float)mc->logo_h;
+					cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
+					cb->convert_srgb = 0.0f;
+					cb->corner_radius = 0; cb->corner_aspect = 0;
+					cb->edge_feather = 0; cb->glow_intensity = 0;
+					cb->quad_mode = 0;
+					cb->dst_offset[0] = cx - logo_dst_w * 0.5f;
+					cb->dst_offset[1] = logo_y;
+					cb->dst_rect_wh[0] = logo_dst_w;
+					cb->dst_rect_wh[1] = logo_dst_h;
+					memset(cb->quad_corners_01, 0, sizeof(cb->quad_corners_01));
+					memset(cb->quad_corners_23, 0, sizeof(cb->quad_corners_23));
+					sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
+					sys->context->Draw(4, 0);
+				}
+			}
+
+			// --- Hint text ---
+			ID3D11ShaderResourceView *font_srv = mc->font_atlas_srv.get();
+			sys->context->PSSetShaderResources(0, 1, &font_srv);
 			// Measure text width
 			float tw = 0;
 			for (const char *p = hint; *p; p++) {
@@ -6740,7 +6807,6 @@ after_key_shortcuts:
 				tw += mc->glyph_advances[ch - 0x20] * scale;
 			}
 			float tx = cx - tw * 0.5f;
-			float ty = cy - gh * 0.5f;
 			float cursor = 0;
 			for (const char *p = hint; *p; p++) {
 				unsigned char ch = (unsigned char)*p;
@@ -6763,7 +6829,7 @@ after_key_shortcuts:
 					cb->corner_radius = 0; cb->corner_aspect = 0;
 					cb->edge_feather = 0; cb->glow_intensity = 0;
 					cb->quad_mode = 0;
-					cb->dst_offset[0] = tx + cursor; cb->dst_offset[1] = ty;
+					cb->dst_offset[0] = tx + cursor; cb->dst_offset[1] = hint_y;
 					cb->dst_rect_wh[0] = dst_gw; cb->dst_rect_wh[1] = gh;
 					memset(cb->quad_corners_01, 0, sizeof(cb->quad_corners_01));
 					memset(cb->quad_corners_23, 0, sizeof(cb->quad_corners_23));

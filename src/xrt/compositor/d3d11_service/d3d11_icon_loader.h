@@ -43,3 +43,17 @@ d3d11_icon_load_from_file(ID3D11Device *device,
                           ID3D11ShaderResourceView **out_srv,
                           uint32_t *out_width,
                           uint32_t *out_height);
+
+/*!
+ * Like d3d11_icon_load_from_file() but decodes from an in-memory buffer
+ * (e.g. a PNG byte array embedded via embed_binary.cmake). @p tag is used
+ * only in log messages to identify the source.
+ */
+bool
+d3d11_icon_load_from_memory(ID3D11Device *device,
+                            const uint8_t *data,
+                            size_t size,
+                            const char *tag,
+                            ID3D11ShaderResourceView **out_srv,
+                            uint32_t *out_width,
+                            uint32_t *out_height);
