@@ -35,24 +35,37 @@ The canvas rect is communicated separately via `xrSetSharedTextureOutputRectEXT`
 
 ## Read-Back Contract
 
-The compositor writes interlaced/composited output to the **top-left corner** of the IOSurface at canvas dimensions. The remainder of the surface is undefined.
+The compositor writes interlaced/composited output at offset **`(canvasX, canvasY)`** inside the IOSurface, sized `canvasW × canvasH` — matching the rect the app passed to `xrSetSharedTextureOutputRectEXT`. The remainder of the surface is undefined.
 
 ```
 IOSurface (swapchain-sized, e.g. 3024×1964)
-┌──────────────┬─────────┐
-│  Valid content│         │
-│  (canvasW ×  │ unused  │
-│   canvasH)   │         │
-├──────────────┘         │
-│        unused           │
-└─────────────────────────┘
+┌────────────────────────────┐
+│    unused                  │
+│   ┌────────────┐           │
+│   │ Valid      │           │
+│   │ (canvasW × │  unused   │
+│   │  canvasH)  │           │
+│   │ at         │           │
+│   │ (canvasX,  │           │
+│   │  canvasY)  │           │
+│   └────────────┘           │
+│    unused                  │
+└────────────────────────────┘
 ```
 
-**App-side blit:** Sample only the valid region using UV scale `(canvasW / surfaceW, canvasH / surfaceH)`. Letterbox using the **canvas** aspect ratio, not the IOSurface aspect ratio.
+**App-side blit:** Sample the canvas sub-rect of the IOSurface. Suggested UV math:
 
-**The app already knows the canvas dims** — it set them via `xrSetSharedTextureOutputRectEXT`. No runtime-to-app query API is needed. The contract is symmetric: the app sends `(x, y, w, h)`, the runtime writes `(w × h)` to origin, the app reads `(w × h)` from origin.
+```
+uvScale  = (canvasW / surfaceW, canvasH / surfaceH)
+uvOffset = (canvasX / surfaceW, canvasY / surfaceH)
+sampled  = texture.sample(uvOffset + uv * uvScale)
+```
 
-For pixel-precise interlacing (e.g., Leia SR), the absolute screen position of the canvas flows internally through `u_canvas_apply_to_metrics()` to the display processor. The app does not need to know about this.
+Letterbox using the **canvas** aspect ratio, not the IOSurface aspect ratio.
+
+**The app already knows the canvas rect** — it set it via `xrSetSharedTextureOutputRectEXT`. No runtime-to-app query API is needed. The contract is symmetric: the app sends `(x, y, w, h)`; the runtime writes `(w × h)` at `(x, y)`; the app reads `(w × h)` from `(x, y)`.
+
+**Why `(canvasX, canvasY)` and not origin:** Vendor weavers (e.g. Leia SR) rely on the viewport position inside the backbuffer matching the eventual screen-space position within the window to compute correct interlacing phase. Writing at `(canvasX, canvasY)` keeps the on-display pixel position of the weaved output stable across backbuffer-vs-HWND size differences, and the symmetric read-back means the app's blit re-aligns the content to the same HWND client coords it passed in. This eliminates the need for an HWND-sized intermediate texture on Windows and lets drag-resize be driven purely by changing `canvas.x/y/w/h` per frame while the shared texture stays fixed.
 
 ## Consequences
 

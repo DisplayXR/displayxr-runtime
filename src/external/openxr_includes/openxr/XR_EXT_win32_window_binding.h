@@ -30,7 +30,7 @@ extern "C" {
 #endif
 
 #define XR_EXT_win32_window_binding 1
-#define XR_EXT_win32_window_binding_SPEC_VERSION 2
+#define XR_EXT_win32_window_binding_SPEC_VERSION 3
 #define XR_EXT_WIN32_WINDOW_BINDING_EXTENSION_NAME "XR_EXT_win32_window_binding"
 
 // Use a value in the vendor extension range (1000000000+)

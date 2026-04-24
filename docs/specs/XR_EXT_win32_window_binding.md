@@ -3,7 +3,7 @@
 | Property | Value |
 |----------|-------|
 | Extension Name | `XR_EXT_win32_window_binding` |
-| Spec Version | 1 |
+| Spec Version | 3 |
 | Type Values | `XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT` (1000999001), `XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT` (1000999002) |
 | Author | Leia Inc. |
 | Platform | Windows (Win32). Linux/Android reserved for future use. |
@@ -160,7 +160,7 @@ typedef struct XrWin32WindowBindingCreateInfoEXT {
 | Mode | `windowHandle` | `sharedTextureHandle` | App class | Behavior |
 |------|:-:|:-:|---|---|
 | **Handle** | HWND | NULL | `_handle` | Runtime renders directly into the app's window |
-| **Texture** | HWND | HANDLE | `_texture` | Runtime composites into the shared texture. The HWND is still required — the display processor needs it for screen-space position tracking and phase alignment. The app blits the shared texture into its window. |
+| **Texture** | HWND | HANDLE | `_texture` | Runtime composites into the shared texture at the canvas sub-rect declared via `xrSetSharedTextureOutputRectEXT` (see [§3.5](#35-xrsetsharedtextureoutputrectext) for the read-back contract). The HWND is still required — the display processor needs it for screen-space position tracking and phase alignment. The app blits the shared texture's canvas sub-rect into its window. |
 | **Offscreen** | NULL | NULL | — | `readbackCallback` receives composited pixels. No window, no phase alignment. |
 
 > **Important for `_texture` apps:** You **must** provide a valid `windowHandle` even though the runtime renders into the shared texture, not the window. Without the HWND, the display processor cannot compute correct interlacing alignment (see [§2.4](#24-the-phase-alignment-problem)). Additionally, call `xrSetSharedTextureOutputRectEXT` (see [§3.5](#35-xrsetsharedtextureoutputrectext)) to tell the runtime where within the window the 3D canvas appears.
@@ -275,6 +275,22 @@ PFN_xrSetSharedTextureOutputRectEXT pfnSetOutputRect = NULL;
 xrGetInstanceProcAddr(instance, "xrSetSharedTextureOutputRectEXT",
     (PFN_xrVoidFunction*)&pfnSetOutputRect);
 ```
+
+**Read-back contract:**
+
+The runtime writes the composited/weaved output into the shared texture at offset `(x, y)` (HWND client-area pixels, matching the call arguments), sized `width × height`. The rest of the shared texture is undefined.
+
+The app's blit must sample from that same `(x, y, width, height)` sub-rect of the shared texture. Suggested UV math:
+
+```
+uvScale  = (width  / sharedTextureW, height / sharedTextureH)
+uvOffset = (x      / sharedTextureW, y      / sharedTextureH)
+sampled  = texture.Sample(smp, uvOffset + uv * uvScale)
+```
+
+The contract is symmetric: the app sends `(x, y, w, h)`; the runtime writes `(w × h)` at `(x, y)`; the app reads `(w × h)` from `(x, y)`.
+
+This is required because vendor weavers (e.g. Leia SR) compute lenticular phase from the viewport's screen-space position. Writing at `(x, y)` keeps the on-display pixel position of the weaved output stable regardless of the shared texture's dimensions (which are typically worst-case display-sized and may differ from the HWND client area), and the symmetric read-back reproduces the same HWND coords. Apps that sample from origin will render in the wrong place and exhibit crosstalk on lenticular displays.
 
 ---
 

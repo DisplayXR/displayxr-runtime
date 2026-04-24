@@ -221,13 +221,6 @@ sim_dp_metal_process_atlas(struct xrt_display_processor_metal *xdp,
                             uint32_t canvas_width,
                             uint32_t canvas_height)
 {
-	// TODO(#85): Pass canvas_offset_x/y to vendor weaver for interlacing
-	// phase correction once Leia SR SDK supports sub-rect offset.
-	(void)canvas_offset_x;
-	(void)canvas_offset_y;
-	(void)canvas_width;
-	(void)canvas_height;
-
 	struct sim_display_processor_metal *sdp = sim_dp_metal(xdp);
 	id<MTLCommandBuffer> cmd_buf = (__bridge id<MTLCommandBuffer>)command_buffer;
 	id<MTLTexture> atlas_tex = (__bridge id<MTLTexture>)atlas_texture;
@@ -271,11 +264,16 @@ sim_dp_metal_process_atlas(struct xrt_display_processor_metal *xdp,
 	[encoder setFragmentSamplerState:sdp->sampler atIndex:0];
 	[encoder setFragmentBytes:&tp length:sizeof(tp) atIndex:0];
 
+	// Canvas sub-rect (ADR-010): when the caller provides a valid canvas,
+	// render into (canvas_offset_x, canvas_offset_y, canvas_width,
+	// canvas_height) so the output lands where the app reads from. Otherwise
+	// fill the whole target.
+	bool use_canvas = (canvas_width > 0 && canvas_height > 0);
 	MTLViewport vp = {
-	    .originX = 0,
-	    .originY = 0,
-	    .width = (double)target_width,
-	    .height = (double)target_height,
+	    .originX = use_canvas ? (double)canvas_offset_x : 0.0,
+	    .originY = use_canvas ? (double)canvas_offset_y : 0.0,
+	    .width = use_canvas ? (double)canvas_width : (double)target_width,
+	    .height = use_canvas ? (double)canvas_height : (double)target_height,
 	    .znear = 0.0,
 	    .zfar = 1.0,
 	};

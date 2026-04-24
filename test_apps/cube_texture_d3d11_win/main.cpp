@@ -214,9 +214,9 @@ VSOut main(uint id : SV_VertexID) {
 static const char* g_blitPSSource = R"(
 Texture2D    tex : register(t0);
 SamplerState smp : register(s0);
-cbuffer BlitParams : register(b0) { float2 uvScale; };
+cbuffer BlitParams : register(b0) { float2 uvScale; float2 uvOffset; };
 float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
-    return tex.Sample(smp, uv * uvScale);
+    return tex.Sample(smp, uvOffset + uv * uvScale);
 }
 )";
 
@@ -283,17 +283,19 @@ static void BlitSharedTextureToBackBuffer(D3D11Renderer& renderer, ID3D11RenderT
             (uint32_t)vp.Width, (uint32_t)vp.Height);
     }
 
-    // Update UV scale: content is at (0,0) in the shared texture (compositor copies
-    // the weaved canvas region there), so we just scale by canvas/shared ratio.
+    // Update UV scale + offset: content is at (canvasX, canvasY) in the shared
+    // texture per ADR-010 — compositor writes the weaved canvas region at that
+    // offset. Sample at uvOffset + uv * uvScale.
     if (g_blitParamsCB && g_sharedWidth > 0 && g_sharedHeight > 0) {
-        float uvScale[4] = {
+        float uvParams[4] = {
             (float)g_canvasW / (float)g_sharedWidth,
             (float)g_canvasH / (float)g_sharedHeight,
-            0.0f, 0.0f  // padding
+            vp.TopLeftX / (float)g_sharedWidth,
+            vp.TopLeftY / (float)g_sharedHeight,
         };
         D3D11_MAPPED_SUBRESOURCE mapped;
         if (SUCCEEDED(renderer.context->Map(g_blitParamsCB.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
-            memcpy(mapped.pData, uvScale, sizeof(uvScale));
+            memcpy(mapped.pData, uvParams, sizeof(uvParams));
             renderer.context->Unmap(g_blitParamsCB.Get(), 0);
         }
     }

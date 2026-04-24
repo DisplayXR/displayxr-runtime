@@ -3,7 +3,7 @@
 | Property | Value |
 |----------|-------|
 | Extension Name | `XR_EXT_cocoa_window_binding` |
-| Spec Version | 3 |
+| Spec Version | 4 |
 | Type Values | `XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_EXT` (1000999004), `XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT` (1000999002) |
 | Author | Leia Inc. |
 | Platform | macOS (Cocoa / AppKit). |
@@ -79,7 +79,7 @@ typedef struct XrCocoaWindowBindingCreateInfoEXT {
 | Mode | `viewHandle` | `sharedIOSurface` | App class | Behavior |
 |------|:-:|:-:|---|---|
 | **Handle** | NSView* | NULL | `_handle` | Runtime renders directly into the app's view |
-| **Texture** | NSView* | IOSurfaceRef | `_texture` | Runtime composites into the shared IOSurface. The NSView is still required for screen-space position tracking and phase alignment. The app blits the IOSurface into its view. |
+| **Texture** | NSView* | IOSurfaceRef | `_texture` | Runtime composites into the shared IOSurface at the canvas sub-rect declared via `xrSetSharedTextureOutputRectEXT` (see [`XR_EXT_win32_window_binding` §3.5](XR_EXT_win32_window_binding.md#35-xrsetsharedtextureoutputrectext) for the read-back contract). The NSView is still required for screen-space position tracking and phase alignment. The app blits the IOSurface's canvas sub-rect into its view. |
 | **Offscreen** | NULL | NULL | — | `readbackCallback` receives composited pixels. No view, no phase alignment. |
 
 > **Important for `_texture` apps:** You **must** provide a valid `viewHandle` even though the runtime renders into the shared IOSurface, not the view. Without it, the display processor cannot compute correct interlacing alignment (see [XR_EXT_win32_window_binding §2.4](XR_EXT_win32_window_binding.md#24-the-phase-alignment-problem)). Additionally, call `xrSetSharedTextureOutputRectEXT` to tell the runtime where within the view the 3D canvas appears.
