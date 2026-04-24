@@ -6620,6 +6620,7 @@ after_key_shortcuts:
 	// Skipped when dynamic layout is active (it drives poses directly).
 	if (mc->dynamic_layout.mode < 0) {
 		uint64_t anim_now = os_monotonic_get_ns();
+		bool focused_rect_changed = false;
 		for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
 			if (!mc->clients[s].active || !mc->clients[s].anim.active) continue;
 			bool still_running = slot_animate_tick(&mc->clients[s], anim_now);
@@ -6629,7 +6630,21 @@ after_key_shortcuts:
 			                        &mc->clients[s].window_rect_w,
 			                        &mc->clients[s].window_rect_h);
 			mc->clients[s].hwnd_resize_pending = true;
+			if (s == mc->focused_slot) focused_rect_changed = true;
 			(void)still_running;
+		}
+		// Keep the window layer's input-forward rect in sync with the
+		// focused slot's current pose. Without this, the forwarder is
+		// pinned to the rect that was valid at register_client time
+		// (initial tiny spawn at (0,0,0)), so clicks inside the
+		// actually-rendered window fall outside the forward rect and
+		// never reach the app. First click misses, then MOUSEMOVE with
+		// the button held crosses into the stale rect and gets forwarded
+		// without a paired LBUTTONDOWN — the app sees a drag with no
+		// click. Title-bar drag and apply_layout masked the bug because
+		// both call update_input_forward at the end.
+		if (focused_rect_changed) {
+			multi_compositor_update_input_forward(mc);
 		}
 	}
 
