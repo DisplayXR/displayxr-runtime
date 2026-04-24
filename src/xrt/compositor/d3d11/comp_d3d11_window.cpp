@@ -1289,6 +1289,26 @@ comp_d3d11_window_set_input_suppress(struct comp_d3d11_window *window, bool supp
 	if (window == NULL) return;
 	InterlockedExchange(&window->input_suppress, suppress ? 1 : 0);
 
+	// Publish the suppress state to the compositor HWND so cross-process
+	// consumers can mirror it. The WebXR bridge's low-level mouse hook
+	// reads DXR_InSizeMove to skip forwarding — without this extension,
+	// title-bar drags, edge resizes, and launcher-open suppress input for
+	// in-process handle apps (via input_suppress) but still forward mouse
+	// events to bridge-aware pages (Chrome interprets them as in-scene
+	// drag/rotate), so moving a WebXR window drags its content instead
+	// of the window itself. The native WM_ENTERSIZEMOVE path also sets
+	// this prop directly; reusing the prop keeps one gate on the bridge
+	// side. Semantically DXR_InSizeMove now means "compositor is in a
+	// modal-like interaction (native OR shell-virtual)" — document in
+	// webxr-bridge/DEVELOPER.md alongside the Phase-5 description.
+	if (window->hwnd != NULL) {
+		if (suppress) {
+			SetPropW(window->hwnd, L"DXR_InSizeMove", (HANDLE)(uintptr_t)1);
+		} else {
+			RemovePropW(window->hwnd, L"DXR_InSizeMove");
+		}
+	}
+
 	// When suppressing, cancel any in-progress app interaction by sending
 	// a synthetic button-up. This prevents stuck button state in the app
 	// (e.g., rotation continuing after resize because button-down was
