@@ -27,6 +27,15 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Mint App installation token (write to public runtime repo)
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.DISPLAYXR_APP_ID }}
+          private-key: ${{ secrets.DISPLAYXR_APP_PRIVATE_KEY }}
+          owner: DisplayXR
+          repositories: displayxr-runtime
+
       - name: Resolve public release version
         run: |
           # Strip any prefix (e.g. 'runtime/v1.2.0' -> 'v1.2.0'). Back-compat
@@ -50,13 +59,12 @@ jobs:
 
       - name: Push to public runtime repo
         env:
-          DISPLAYXR_TOKEN: ${{ secrets.DISPLAYXR_TOKEN }}
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
-          if [ -z "$DISPLAYXR_TOKEN" ]; then
-            echo "::error::DISPLAYXR_TOKEN secret is empty or not set"
+          if [ -z "$APP_TOKEN" ]; then
+            echo "::error::App installation token is empty — secrets DISPLAYXR_APP_ID / DISPLAYXR_APP_PRIVATE_KEY may be missing"
             exit 1
           fi
-          echo "Token is set (length: ${#DISPLAYXR_TOKEN})"
 
           git config user.name "DisplayXR Bot"
           git config user.email "noreply@displayxr.org"
@@ -66,7 +74,7 @@ jobs:
           git commit -m "Release ${{ env.VERSION }} (shell code excluded)" --allow-empty
 
           # Push to public repo (persist-credentials: false prevents GITHUB_TOKEN override)
-          git remote add public "https://x-access-token:${DISPLAYXR_TOKEN}@github.com/DisplayXR/displayxr-runtime.git"
+          git remote add public "https://x-access-token:${APP_TOKEN}@github.com/DisplayXR/displayxr-runtime.git"
           git push public HEAD:main --force
 
           # Push the tag
@@ -77,7 +85,7 @@ jobs:
 
       - name: Create GitHub Release on public runtime repo
         env:
-          GH_TOKEN: ${{ secrets.DISPLAYXR_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           # Generate release notes from commits since last tag
           PREV_TAG=$(git tag --sort=-v:refname | grep '^v' | sed -n '2p')
@@ -113,6 +121,15 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Mint App installation token (write to shell-releases repo)
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.DISPLAYXR_APP_ID }}
+          private-key: ${{ secrets.DISPLAYXR_APP_PRIVATE_KEY }}
+          owner: DisplayXR
+          repositories: displayxr-shell-releases
+
       - name: Resolve public release version
         run: |
           V="${GITHUB_REF_NAME##*/}"
@@ -177,7 +194,7 @@ jobs:
 
       - name: Create GitHub Release on displayxr-shell-releases
         env:
-          GH_TOKEN: ${{ secrets.DISPLAYXR_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           # Build asset list
           ASSETS=""
