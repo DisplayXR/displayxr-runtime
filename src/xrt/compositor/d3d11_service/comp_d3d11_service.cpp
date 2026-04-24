@@ -767,7 +767,7 @@ struct d3d11_multi_compositor
 	} title_rmb_drag;
 
 	//! Current layout preset (-1=none, 0-4=preset index). Used for TAB Z-reorder in Stack.
-	int32_t current_layout;
+	int32_t current_layout = 1; // default: immersive (Ctrl+2)
 
 	//! Dynamic layout state (carousel, orbital, helix, expose).
 	//! When mode >= 0, the layout continuously drives window poses each frame.
@@ -6559,7 +6559,7 @@ after_key_shortcuts:
 	if (mc->regrid_pending_ns > 0 && os_monotonic_get_ns() >= mc->regrid_pending_ns &&
 	    mc->dynamic_layout.mode < 0) {
 		mc->regrid_pending_ns = 0;
-		apply_layout(sys, mc, mc->current_layout >= 0 ? mc->current_layout : 0);
+		apply_layout(sys, mc, mc->current_layout >= 0 ? mc->current_layout : 1);
 		U_LOG_W("Multi-comp: debounced re-grid applied (%u clients)", mc->client_count);
 	}
 
