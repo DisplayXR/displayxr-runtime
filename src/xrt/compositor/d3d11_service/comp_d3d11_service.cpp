@@ -8614,9 +8614,19 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	{
 		static bool s_last_bridge_live = false;
 		if (bridge_live != s_last_bridge_live) {
-			U_LOG_W("Bridge WS client %s — gating bridge paths %s",
+			HWND caller_hwnd = c->render.hwnd;
+			HWND sys_hwnd = sys != nullptr ? sys->compositor_hwnd : nullptr;
+			bool prop_on_caller = caller_hwnd != nullptr &&
+			                      GetPropW(caller_hwnd, L"DXR_BridgeClientActive") != nullptr;
+			bool prop_on_sys = sys_hwnd != nullptr &&
+			                   GetPropW(sys_hwnd, L"DXR_BridgeClientActive") != nullptr;
+			U_LOG_W("Bridge WS client %s — gating bridge paths %s "
+			        "(caller_hwnd=%p prop=%d, sys_hwnd=%p prop=%d, g_bridge_relay_active=%d)",
 			        bridge_live ? "connected" : "disconnected",
-			        bridge_live ? "ON" : "OFF");
+			        bridge_live ? "ON" : "OFF",
+			        (void *)caller_hwnd, prop_on_caller ? 1 : 0,
+			        (void *)sys_hwnd, prop_on_sys ? 1 : 0,
+			        g_bridge_relay_active ? 1 : 0);
 			s_last_bridge_live = bridge_live;
 #ifdef XRT_BUILD_DRIVER_QWERTY
 			qwerty_set_bridge_relay_active(bridge_live);

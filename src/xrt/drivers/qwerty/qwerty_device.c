@@ -658,6 +658,9 @@ qwerty_system_create(struct qwerty_hmd *qhmd,
 
 	if (qhmd) {
 		qhmd->base.sys = qs;
+		U_LOG_W("qwerty: system_create HMD pose=(%.3f, %.3f, %.3f) nominal_viewer_z=%.3f",
+		        (double)qhmd->base.pose.position.x, (double)qhmd->base.pose.position.y,
+		        (double)qhmd->base.pose.position.z, (double)qs->nominal_viewer_z);
 	}
 	qleft->base.sys = qs;
 	qright->base.sys = qs;
