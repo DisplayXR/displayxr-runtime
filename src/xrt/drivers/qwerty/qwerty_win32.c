@@ -115,13 +115,20 @@ default_qwerty_controller(struct xrt_device **xdevs, size_t xdev_count, struct q
 	struct xrt_device *xd_left = &qsys->lctrl->base.base;
 	struct xrt_device *xd_right = &qsys->rctrl->base.base;
 
+	// u_device_assign_xdev_roles leaves `right` / `left` at
+	// XRT_DEVICE_ROLE_UNASSIGNED (negative sentinel) when no role is
+	// assigned. Indexing xdevs[-1] is UB — guard before touching.
+	// This was reached when a bridge-aware WebXR session closed and a
+	// mouse event triggered the first qwerty_process_win32 call in the
+	// service's lifetime after the bridge_page_attached gate released.
 	struct qwerty_controller *default_qctrl = NULL;
-	if (xdevs[right] == xd_right) {
+	if (right >= 0 && (size_t)right < xdev_count && xdevs[right] == xd_right) {
 		default_qctrl = qwerty_controller(xd_right);
-	} else if (xdevs[left] == xd_left) {
+	} else if (left >= 0 && (size_t)left < xdev_count && xdevs[left] == xd_left) {
 		default_qctrl = qwerty_controller(xd_left);
 	} else {
-		// Fallback to right controller
+		// Fallback to right controller — qsys->rctrl is asserted non-null
+		// at qwerty_system_create so this path is always safe.
 		default_qctrl = qwerty_controller(xd_right);
 	}
 
