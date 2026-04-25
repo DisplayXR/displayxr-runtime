@@ -41,7 +41,7 @@ using namespace DirectX;
 static const char* APP_NAME = "gaussian_splatting_handle_vk_win";
 
 static const wchar_t* WINDOW_CLASS = L"SR3DGSOpenXRExtVKClass";
-static const wchar_t* WINDOW_TITLE = L"SR 3DGS OpenXR Ext Vulkan (Press ESC to exit)";
+static const wchar_t* WINDOW_TITLE = L"DisplayXR Gaussian Splat Viewer Demo";
 
 // HUD overlay fractions
 static const float HUD_WIDTH_FRACTION = 0.30f;
@@ -53,11 +53,6 @@ static const float LOAD_BTN_HEIGHT_FRACTION = 0.04f;
 static const float LOAD_BTN_X_FRACTION = 0.87f;
 static const float LOAD_BTN_Y_FRACTION = 0.02f;
 
-// Auto-orbit button fractions (next to Load)
-static const float ORBIT_BTN_WIDTH_FRACTION = 0.12f;
-static const float ORBIT_BTN_HEIGHT_FRACTION = 0.04f;
-static const float ORBIT_BTN_X_FRACTION = 0.74f;
-static const float ORBIT_BTN_Y_FRACTION = 0.02f;
 
 // sim_display output mode switching (legacy — replaced by unified rendering mode)
 typedef void (*PFN_sim_display_set_output_mode)(int mode);
@@ -174,16 +169,6 @@ static bool IsClickOnLoadButton(int mouseX, int mouseY, int windowW, int windowH
             fy <= LOAD_BTN_Y_FRACTION + LOAD_BTN_HEIGHT_FRACTION);
 }
 
-static bool IsClickOnOrbitButton(int mouseX, int mouseY, int windowW, int windowH) {
-    if (windowW <= 0 || windowH <= 0) return false;
-    float fx = (float)mouseX / (float)windowW;
-    float fy = (float)mouseY / (float)windowH;
-    return (fx >= ORBIT_BTN_X_FRACTION &&
-            fx <= ORBIT_BTN_X_FRACTION + ORBIT_BTN_WIDTH_FRACTION &&
-            fy >= ORBIT_BTN_Y_FRACTION &&
-            fy <= ORBIT_BTN_Y_FRACTION + ORBIT_BTN_HEIGHT_FRACTION);
-}
-
 // Attempt to auto-load butterfly.spz from next to the exe.
 static void TryAutoLoadBundledScene() {
     char exePath[MAX_PATH] = {0};
@@ -256,11 +241,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (IsClickOnLoadButton(mx, my, g_windowWidth, g_windowHeight)) {
             // Post to main thread — don't block WindowProc with file dialog
             PostMessage(hwnd, WM_USER + 1, 0, 0);
-            return 0;
-        }
-        if (IsClickOnOrbitButton(mx, my, g_windowWidth, g_windowHeight)) {
-            std::lock_guard<std::mutex> lock(g_inputMutex);
-            g_inputState.animateToggleRequested = true;
             return 0;
         }
         SetCapture(hwnd);
@@ -535,7 +515,10 @@ static void RenderThreadFunc(
             g_inputState.animationActive = inputSnapshot.animationActive;
             if (resetRequested) {
                 g_inputState.viewParams = inputSnapshot.viewParams;
-                g_inputState.animateEnabled = false;
+                // Auto-orbit always on; reset only clears the in-flight
+                // transition. The shared UpdateCameraMovement may set
+                // animateEnabled=false on Space — re-assert true here.
+                g_inputState.animateEnabled = true;
                 g_inputState.transitioning = false;
             }
         }
@@ -1285,6 +1268,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     g_inputState.viewParams.virtualDisplayHeight = kFallbackVirtualDisplayHeightM;
     g_inputState.renderingModeCount = xr.renderingModeCount;
+    g_inputState.hudVisible = false;     // hidden by default; toggle with Tab
+    g_inputState.animateEnabled = true;  // auto-orbit always on after 10 s idle
     {
         using namespace std::chrono;
         g_inputState.lastInputTimeSec = (double)duration_cast<microseconds>(

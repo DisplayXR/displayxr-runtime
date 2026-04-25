@@ -91,7 +91,7 @@ struct InputState {
     float cameraPosX = 0.0f, cameraPosY = 0.0f, cameraPosZ = 0.0f;
     bool resetViewRequested = false;
     ViewParams viewParams;
-    bool hudVisible = true;
+    bool hudVisible = false;  // Hidden by default; toggle with Tab.
     bool cameraMode = false;
     float nominalViewerZ = 0.5f;
     bool eyeTrackingModeToggleRequested = false;
@@ -107,7 +107,7 @@ struct InputState {
     float transitionDuration = 0.45f;
 
     // Auto-orbit (turntable) mode
-    bool animateEnabled = false;
+    bool animateEnabled = true;  // Always on; auto-orbit kicks in after 10 s idle.
     double lastInputTimeSec = 0.0;
     bool animationActive = false;
     bool animateToggleRequested = false;     // set by UI button
@@ -345,7 +345,7 @@ static void UpdateCameraMovement(InputState& input, float dt, float displayHeigh
         }
         input.resetViewRequested = false;
         input.transitioning = false;
-        input.animateEnabled = false;
+        // Auto-orbit always on; resetting just resets the idle timer below.
         input.animationActive = false;
         // Preserve per-format flipY/flipX through Reset — they were set by
         // ApplyAutoFitForLoadedScene based on file extension and shouldn't
@@ -439,9 +439,7 @@ static NSVisualEffectView *g_hudBackdrop = nil;  // frosted wrapper sized to hud
 
 static NSView   *g_topBar = nil;
 static NSButton *g_openButton = nil;
-static NSButton *g_orbitButton = nil;
 static NSButton *g_modeButton = nil;
-static NSButton *g_flipButton = nil;
 static NSView   *g_reticleView = nil;
 
 // Translucent dark background view used behind the top bar.
@@ -717,7 +715,7 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
                        NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable;
     g_window = [[NSWindow alloc] initWithContentRect:frame
         styleMask:style backing:NSBackingStoreBuffered defer:NO];
-    [g_window setTitle:@"SR 3DGS OpenXR Ext macOS (Press ESC to exit)"];
+    [g_window setTitle:@"DisplayXR Gaussian Splat Viewer Demo"];
     [g_window setDelegate:delegate];
     [g_window center];
 
@@ -759,39 +757,41 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
     const CGFloat btnH = 32.0, btnY = (barH - btnH) * 0.5f;
     const CGFloat gap = 10.0;
     CGFloat x = 12.0;
-    CGFloat openW = 96.0, orbitW = 160.0, modeW = 220.0;
+    CGFloat openW = 96.0, modeW = 220.0;
 
-    g_openButton = [[NSButton alloc] initWithFrame:NSMakeRect(x, btnY, openW, btnH)];
-    [g_openButton setTitle:@"Open…"];
-    [g_openButton setBezelStyle:NSBezelStyleRounded];
-    [g_openButton setTarget:nil];
-    [g_openButton setAction:@selector(openButtonClicked:)];
-    [g_topBar addSubview:g_openButton];
+    // Helper: wrap a button in a glassy NSVisualEffectView backdrop matching
+    // the HUD's HUDWindow material so the controls have the same look.
+    NSView * (^makeGlassyButton)(NSRect, NSString*, SEL, NSButton **) =
+        ^NSView *(NSRect frame, NSString *title, SEL act, NSButton **outBtn) {
+        NSVisualEffectView *bd = [[NSVisualEffectView alloc] initWithFrame:frame];
+        [bd setMaterial:NSVisualEffectMaterialHUDWindow];
+        [bd setBlendingMode:NSVisualEffectBlendingModeWithinWindow];
+        [bd setState:NSVisualEffectStateActive];
+        [bd setWantsLayer:YES];
+        bd.layer.cornerRadius = 6.0;
+        bd.layer.masksToBounds = YES;
+        NSButton *b = [[NSButton alloc] initWithFrame:bd.bounds];
+        [b setTitle:title];
+        [b setBezelStyle:NSBezelStyleInline];
+        [b setBordered:NO];
+        [b setTarget:nil];
+        [b setAction:act];
+        [b setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
+        [bd addSubview:b];
+        if (outBtn) *outBtn = b;
+        return bd;
+    };
+
+    NSView *openBd = makeGlassyButton(NSMakeRect(x, btnY, openW, btnH),
+                                       @"Open…", @selector(openButtonClicked:),
+                                       &g_openButton);
+    [g_topBar addSubview:openBd];
     x += openW + gap;
 
-    g_orbitButton = [[NSButton alloc] initWithFrame:NSMakeRect(x, btnY, orbitW, btnH)];
-    [g_orbitButton setTitle:@"Auto-Orbit: Off"];
-    [g_orbitButton setBezelStyle:NSBezelStyleRounded];
-    [g_orbitButton setTarget:nil];
-    [g_orbitButton setAction:@selector(orbitButtonClicked:)];
-    [g_topBar addSubview:g_orbitButton];
-    x += orbitW + gap;
-
-    g_modeButton = [[NSButton alloc] initWithFrame:NSMakeRect(x, btnY, modeW, btnH)];
-    [g_modeButton setTitle:@"Mode: —"];
-    [g_modeButton setBezelStyle:NSBezelStyleRounded];
-    [g_modeButton setTarget:nil];
-    [g_modeButton setAction:@selector(modeButtonClicked:)];
-    [g_topBar addSubview:g_modeButton];
-    x += modeW + gap;
-
-    const CGFloat flipW = 96.0;
-    g_flipButton = [[NSButton alloc] initWithFrame:NSMakeRect(x, btnY, flipW, btnH)];
-    [g_flipButton setTitle:@"Flip: Off"];
-    [g_flipButton setBezelStyle:NSBezelStyleRounded];
-    [g_flipButton setTarget:nil];
-    [g_flipButton setAction:@selector(flipButtonClicked:)];
-    [g_topBar addSubview:g_flipButton];
+    NSView *modeBd = makeGlassyButton(NSMakeRect(x, btnY, modeW, btnH),
+                                       @"Mode: —", @selector(modeButtonClicked:),
+                                       &g_modeButton);
+    [g_topBar addSubview:modeBd];
 
     // --- Reticle (non-interactive center crosshair) ---
     const CGFloat retSize = 20.0;
@@ -808,9 +808,7 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
 // Button action handlers (added as category on NSApplication)
 @interface NSApplication (TopBarActions)
 - (void)openButtonClicked:(id)sender;
-- (void)orbitButtonClicked:(id)sender;
 - (void)modeButtonClicked:(id)sender;
-- (void)flipButtonClicked:(id)sender;
 @end
 
 @implementation NSApplication (TopBarActions)
@@ -819,11 +817,6 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
     MarkUserInput(g_input);
     g_input.loadRequested = true;
 }
-- (void)orbitButtonClicked:(id)sender {
-    (void)sender;
-    MarkUserInput(g_input);
-    g_input.animateToggleRequested = true;
-}
 - (void)modeButtonClicked:(id)sender {
     (void)sender;
     MarkUserInput(g_input);
@@ -831,11 +824,6 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
         g_input.currentRenderingMode = (g_input.currentRenderingMode + 1) % g_input.renderingModeCount;
     }
     g_input.renderingModeChangeRequested = true;
-}
-- (void)flipButtonClicked:(id)sender {
-    (void)sender;
-    MarkUserInput(g_input);
-    g_input.flipToggleRequested = true;
 }
 @end
 
@@ -930,9 +918,6 @@ struct AppXrSession {
 };
 
 static void UpdateTopBarButtonTitles(AppXrSession& xr) {
-    if (g_orbitButton) {
-        [g_orbitButton setTitle:(g_input.animateEnabled ? @"Auto-Orbit: On" : @"Auto-Orbit: Off")];
-    }
     if (g_modeButton) {
         const char *name = "Unknown";
         if (xr.renderingModeCount > 0 &&
@@ -941,9 +926,6 @@ static void UpdateTopBarButtonTitles(AppXrSession& xr) {
             name = xr.renderingModeNames[g_input.currentRenderingMode];
         }
         [g_modeButton setTitle:[NSString stringWithFormat:@"Mode: %s", name]];
-    }
-    if (g_flipButton) {
-        [g_flipButton setTitle:(g_input.flipY ? @"Flip: On" : @"Flip: Off")];
     }
 }
 

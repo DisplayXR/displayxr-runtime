@@ -617,6 +617,7 @@ jobs:
           path: |
             demos/gaussian_splatting_handle_vk_win/build/gaussian_splatting_handle_vk_win.exe
             demos/gaussian_splatting_handle_vk_win/build/*.dll
+            demos/gaussian_splatting_handle_vk_win/build/butterfly.spz
 
   # Spatial OS demo app (multi-layer war room)
   TestAppSpatialOS:
