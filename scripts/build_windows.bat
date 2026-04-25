@@ -234,6 +234,24 @@ if exist "%REPO%test_apps\cube_handle_gl_win\CMakeLists.txt" (
     if defined LOADER_DLL copy /Y "%LOADER_DLL%" "%REPO%test_apps\cube_handle_gl_win\build\" >nul
 )
 
+:: cube_texture_d3d11_win
+if exist "%REPO%test_apps\cube_texture_d3d11_win\CMakeLists.txt" (
+    echo --- cube_texture_d3d11_win ---
+    cmake -S "%REPO%\test_apps\cube_texture_d3d11_win" -B "%REPO%\test_apps\cube_texture_d3d11_win\build" -G Ninja ^
+        -DCMAKE_BUILD_TYPE=Release -DOpenXR_ROOT="%OPENXR_SDK_SHORT%"
+    cmake --build "%REPO%\test_apps\cube_texture_d3d11_win\build"
+    if defined LOADER_DLL copy /Y "%LOADER_DLL%" "%REPO%test_apps\cube_texture_d3d11_win\build\" >nul
+)
+
+:: cube_texture_d3d12_win
+if exist "%REPO%test_apps\cube_texture_d3d12_win\CMakeLists.txt" (
+    echo --- cube_texture_d3d12_win ---
+    cmake -S "%REPO%\test_apps\cube_texture_d3d12_win" -B "%REPO%\test_apps\cube_texture_d3d12_win\build" -G Ninja ^
+        -DCMAKE_BUILD_TYPE=Release -DOpenXR_ROOT="%OPENXR_SDK_SHORT%"
+    cmake --build "%REPO%\test_apps\cube_texture_d3d12_win\build"
+    if defined LOADER_DLL copy /Y "%LOADER_DLL%" "%REPO%test_apps\cube_texture_d3d12_win\build\" >nul
+)
+
 :: cube_handle_vk_win (needs Vulkan SDK)
 if exist "%REPO%test_apps\cube_handle_vk_win\CMakeLists.txt" (
     echo --- cube_handle_vk_win ---
@@ -256,7 +274,7 @@ set "PKG=%REPO%_package"
 :: Run scripts for standalone test apps (each sets XR_RUNTIME_JSON to dev build)
 :: Non-Vulkan apps also disable Vulkan implicit layers to prevent crashes from
 :: buggy third-party layers (e.g., FPS Monitor). See issue #105.
-for %%A in (cube_handle_d3d11_win cube_hosted_d3d11_win cube_handle_d3d12_win cube_handle_gl_win) do (
+for %%A in (cube_handle_d3d11_win cube_hosted_d3d11_win cube_handle_d3d12_win cube_handle_gl_win cube_texture_d3d11_win cube_texture_d3d12_win) do (
     if exist "%REPO%test_apps\%%A\build\%%A.exe" (
         > "%PKG%\run_%%A.bat" (
             echo @echo off
