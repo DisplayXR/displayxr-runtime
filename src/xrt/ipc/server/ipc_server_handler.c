@@ -339,8 +339,16 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 	Display3DScreen scr = {screen_width_m, screen_height_m};
 	struct xrt_pose display_pose = {display_ori, display_pos};
 
-	if (have_stereo_state && stereo_state.camera_mode && compositor_owns_window) {
+	if (have_stereo_state && stereo_state.camera_mode && use_qwerty_head) {
 		// CAMERA-CENTRIC PATH (canonical camera3d_compute_views)
+		// In shell mode, app sessions take this path with qwerty pose as
+		// the camera position. qwerty_toggle_camera_mode preserves the
+		// convergence plane across the P-key toggle: cam->disp moves the
+		// qwerty pose forward by 1/cam_convergence and sets disp_vHeight
+		// from cam_half_tan_vfov, so the screen plane in display mode and
+		// the convergence plane in camera mode coincide. Both paths must
+		// be reachable in shell for app sessions or the toggle becomes
+		// asymmetric (works in non-shell, no-op in shell).
 		Camera3DTunables ct = {
 		    .ipd_factor = stereo_state.cam_spread_factor,
 		    .parallax_factor = stereo_state.cam_parallax_factor,
@@ -378,7 +386,12 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 		}
 
 		Display3DTunables dt = display3d_default_tunables();
-		if (have_stereo_state && compositor_owns_window) {
+		if (have_stereo_state && use_qwerty_head) {
+			// Same gate as the camera-centric branch: shell apps must
+			// see disp_vHeight (the user-tuned virtual display size)
+			// rather than identity m2v, otherwise the P-key toggle from
+			// camera mode would land on a default-height display and
+			// shift the convergence plane.
 			dt.ipd_factor = stereo_state.disp_spread_factor;
 			dt.parallax_factor = stereo_state.disp_parallax_factor;
 			dt.perspective_factor = 1.0f;
@@ -415,7 +428,7 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 		IPC_WARN(s, "IPC SR: mode=%s display=(%.2f,%.2f,%.2f) FOV H=%.1f° V=%.1f°"
 		         " pose[0]=(%.3f,%.3f,%.3f) pose[1]=(%.3f,%.3f,%.3f)"
 		         " owns_win=%d shell=%d shell_host=%d use_qwerty=%d app='%s'",
-		         (have_stereo_state && stereo_state.camera_mode && compositor_owns_window)
+		         (have_stereo_state && stereo_state.camera_mode && use_qwerty_head)
 		             ? "camera" : "display",
 		         display_pos.x, display_pos.y, display_pos.z,
 		         left_h, left_v,
