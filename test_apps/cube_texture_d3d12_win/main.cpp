@@ -614,10 +614,13 @@ static void RenderOneFrame(RenderState& rs) {
                     if (useAppProjection) {
                         float pxSizeX = xr.displayWidthM / (float)xr.displayPixelWidth;
                         float pxSizeY = xr.displayHeightM / (float)xr.displayPixelHeight;
-                        float winW_m = (float)g_canvasW * pxSizeX;
-                        float winH_m = (float)g_canvasH * pxSizeY;
+                        float canvasW_m = (float)g_canvasW * pxSizeX;
+                        float canvasH_m = (float)g_canvasH * pxSizeY;
 
-                        // Window-relative Kooima: compute eye offset from window center
+                        // Canvas-relative Kooima: physical size + eye offset both anchored
+                        // on the canvas region within the window (not the window itself).
+                        float canvas_off_x = (float)g_windowWidth  / 4.0f;
+                        float canvas_off_y = (float)g_windowHeight / 4.0f;
                         float eyeOffsetX = 0.0f, eyeOffsetY = 0.0f;
                         {
                             POINT clientOrigin = {0, 0};
@@ -625,12 +628,12 @@ static void RenderOneFrame(RenderState& rs) {
                             HMONITOR hMon = MonitorFromWindow(rs.hwnd, MONITOR_DEFAULTTONEAREST);
                             MONITORINFO mi = {sizeof(mi)};
                             if (GetMonitorInfo(hMon, &mi)) {
-                                float winCenterX = (float)(clientOrigin.x - mi.rcMonitor.left) + g_canvasW / 2.0f;
-                                float winCenterY = (float)(clientOrigin.y - mi.rcMonitor.top) + g_canvasH / 2.0f;
+                                float canvasCenterX = (float)(clientOrigin.x - mi.rcMonitor.left) + canvas_off_x + g_canvasW / 2.0f;
+                                float canvasCenterY = (float)(clientOrigin.y - mi.rcMonitor.top)  + canvas_off_y + g_canvasH / 2.0f;
                                 float dispW = (float)(mi.rcMonitor.right - mi.rcMonitor.left);
                                 float dispH = (float)(mi.rcMonitor.bottom - mi.rcMonitor.top);
-                                eyeOffsetX = (winCenterX - dispW / 2.0f) * pxSizeX;
-                                eyeOffsetY = -((winCenterY - dispH / 2.0f) * pxSizeY);
+                                eyeOffsetX =  (canvasCenterX - dispW / 2.0f) * pxSizeX;
+                                eyeOffsetY = -((canvasCenterY - dispH / 2.0f) * pxSizeY);
                             }
                         }
 
@@ -661,7 +664,7 @@ static void RenderOneFrame(RenderState& rs) {
                         cameraPose.position = {g_inputState.cameraPosX, g_inputState.cameraPosY, g_inputState.cameraPosZ};
 
                         XrVector3f nominalViewer = {xr.nominalViewerX, xr.nominalViewerY, xr.nominalViewerZ};
-                        Display3DScreen screen = {winW_m, winH_m};
+                        Display3DScreen screen = {canvasW_m, canvasH_m};
 
                         if (g_inputState.cameraMode) {
                             Camera3DTunables camTunables;
