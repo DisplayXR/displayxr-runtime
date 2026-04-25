@@ -79,10 +79,10 @@ static std::mutex g_sceneMutex;
 
 // Fallback vHeight when no scene is loaded; replaced per-scene by auto-fit.
 static constexpr float kFallbackVirtualDisplayHeightM = 0.24f;
-// Multiplier on the inner-quartile (25-75) Y extent — IQR captures the
-// densest splat cluster (typically the main object); 1.4× brings ~the
-// full object into frame with margin. Walls/floor outside the IQR still
-// render but don't dominate the framing.
+// Margin on the voxel-flood-fill main-object Y extent. The flood-fill
+// already isolates the dense central object from outliers (walls/floor),
+// so we just add a small visual breathing room — 1.4 leaves the object
+// at roughly 70% of frame height with comfortable margin.
 static constexpr float kAutoFitVerticalComfort = 1.4f;
 
 // Cached auto-fit pose for the currently loaded scene. Reused by Reset
@@ -100,7 +100,8 @@ static std::atomic<bool> g_fitValid{false};
 // Caller must hold g_sceneMutex (we read pickData_ from the renderer).
 static void ApplyAutoFitForLoadedScene_locked() {
     float center[3], extent[3];
-    bool ok = g_gsRenderer.getRobustSceneBounds(0.25f, 0.75f, center, extent);
+    // Voxel-density flood-fill — see the macOS demo for rationale.
+    bool ok = g_gsRenderer.getMainObjectBounds(64u, center, extent);
     if (ok) {
         float vh = extent[1] * kAutoFitVerticalComfort;
         if (!(vh > 1e-3f)) ok = false;

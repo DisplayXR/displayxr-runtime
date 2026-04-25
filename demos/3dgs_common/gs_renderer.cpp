@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cmath>
+#include <cfloat>
 #include <algorithm>
 #include <string>
 #include <vector>
@@ -608,16 +609,6 @@ bool GsRenderer::loadScene(const char* plyPath)
 
     if (!parseOk || vertices.empty()) {
         fprintf(stderr, "GsRenderer: failed to parse scene file: %s\n", plyPath);
-        return false;
-    }
-
-    // Drop outlier gaussians before GPU upload — typical splat captures contain
-    // 1–3 % stray "floater" splats that produce huge translucent blobs at the
-    // frame edges. Done here so createBuffers() and pickData_ both see the
-    // cleaned set automatically.
-    filterFloaters(vertices);
-    if (vertices.empty()) {
-        fprintf(stderr, "GsRenderer: all gaussians filtered as floaters in %s\n", plyPath);
         return false;
     }
 
@@ -1307,79 +1298,152 @@ bool GsRenderer::getRobustSceneBounds(float loPct, float hiPct,
 }
 
 // ═════════════════════════════════════════════════════════════════════════
-// filterFloaters — drop outlier gaussians before GPU upload. Mirrors the
-// percentile-based logic in getRobustSceneBounds() but operates on the raw
-// vertex set (pickData_ doesn't exist yet at load time).
+// getMainObjectBounds — voxelize splats into an opacity-weighted density
+// grid, find the peak voxel, BFS-flood-fill at adaptive threshold, return
+// the world-space bbox of the filled region. Walls/floor are physically
+// air-separated from the figure so the flood-fill stays on the figure.
 // ═════════════════════════════════════════════════════════════════════════
 
-void GsRenderer::filterFloaters(std::vector<GsVertex>& vertices) const
+bool GsRenderer::getMainObjectBounds(uint32_t gridSize,
+                                     float outCenter[3], float outExtent[3]) const
 {
-    const size_t n = vertices.size();
-    if (n < 16) return;  // tiny scenes — nothing to do
+    if (pickData_.empty() || gridSize < 4) return false;
+    const uint32_t G = gridSize;
+    const size_t totalVoxels = (size_t)G * G * G;
 
-    // 1. Robust per-axis center + extent (5th–95th percentile per axis).
-    float center[3], extent[3];
+    // 1. Scene bounds via 5–95 percentile (ignores extreme outliers).
+    float vmin[3], vmax[3];
     {
-        std::vector<float> coord(n);
+        std::vector<float> coord(pickData_.size());
         for (int axis = 0; axis < 3; axis++) {
-            for (size_t i = 0; i < n; i++) coord[i] = vertices[i].position[axis];
-            size_t loIdx = (size_t)(0.05f * (float)(n - 1));
-            size_t hiIdx = (size_t)(0.95f * (float)(n - 1));
+            for (size_t i = 0; i < pickData_.size(); i++) {
+                const auto& g = pickData_[i];
+                coord[i] = (axis == 0) ? g.px : (axis == 1) ? g.py : g.pz;
+            }
+            size_t loIdx = (size_t)(0.05f * (float)(coord.size() - 1));
+            size_t hiIdx = (size_t)(0.95f * (float)(coord.size() - 1));
             if (hiIdx <= loIdx) hiIdx = loIdx + 1;
-            if (hiIdx >= n) hiIdx = n - 1;
             std::nth_element(coord.begin(), coord.begin() + loIdx, coord.end());
             float lo = coord[loIdx];
             std::nth_element(coord.begin() + loIdx + 1, coord.begin() + hiIdx, coord.end());
             float hi = coord[hiIdx];
-            center[axis] = 0.5f * (lo + hi);
-            extent[axis] = hi - lo;
+            vmin[axis] = lo;
+            vmax[axis] = hi;
+            if (vmax[axis] - vmin[axis] < 1e-6f) return false;
         }
     }
 
-    // 2. 99th-percentile of max(scale_xyz) — only catch the truly extreme.
-    //    Wall / background splats sit in the top few % of scales naturally
-    //    (sparse coverage of large flat surfaces); a tight threshold here
-    //    eats the room. Real floaters are 1–2 orders of magnitude over p99.
-    float scaleP99;
-    {
-        std::vector<float> maxScales(n);
-        for (size_t i = 0; i < n; i++) {
-            const auto& s = vertices[i].scale_opacity;
-            maxScales[i] = std::max({s[0], s[1], s[2]});
+    // 2. Voxelize: opacity-weighted density per cell (idx = (x*G + y)*G + z).
+    std::vector<float> density(totalVoxels, 0.0f);
+    float invSize[3];
+    for (int a = 0; a < 3; a++) invSize[a] = (float)G / (vmax[a] - vmin[a]);
+    for (const auto& g : pickData_) {
+        float p[3] = {g.px, g.py, g.pz};
+        int idx[3];
+        bool inside = true;
+        for (int a = 0; a < 3; a++) {
+            int i = (int)((p[a] - vmin[a]) * invSize[a]);
+            if (i < 0 || i >= (int)G) { inside = false; break; }
+            idx[a] = i;
         }
-        size_t p99 = (size_t)(0.99f * (float)(n - 1));
-        std::nth_element(maxScales.begin(), maxScales.begin() + p99, maxScales.end());
-        scaleP99 = maxScales[p99];
+        if (!inside) continue;
+        density[((size_t)idx[0] * G + (size_t)idx[1]) * G + (size_t)idx[2]] += g.opacity;
     }
 
-    // 3. Loose thresholds — we only want to kill obvious outliers.
-    const float distMul = 4.0f;     // 4× extent = obvious spatial floater
-    const float scaleMul = 10.0f;   // 10× p99 = bizarrely huge ellipsoid
-    float distLim[3] = { distMul * extent[0], distMul * extent[1], distMul * extent[2] };
-    float scaleLim = scaleMul * scaleP99;
+    // 3. Find peak voxel.
+    float peakDensity = 0.0f;
+    size_t peakIdx = 0;
+    for (size_t i = 0; i < totalVoxels; i++) {
+        if (density[i] > peakDensity) { peakDensity = density[i]; peakIdx = i; }
+    }
+    if (peakDensity < 1e-6f) return false;
 
-    // 4. Erase-remove pass. A gaussian is a floater only if BOTH (a) any axis
-    //    is far from centroid AND (b) its scale is huge — gating on both
-    //    avoids killing legitimate distant background splats (walls, sky)
-    //    that have normal scales.
-    auto isFloater = [&](const GsVertex& v) -> bool {
-        bool farPos = false;
-        for (int axis = 0; axis < 3; axis++) {
-            float d = std::fabs(v.position[axis] - center[axis]);
-            if (d > distLim[axis]) { farPos = true; break; }
+    // 4. Flood-fill helper: BFS from peak including 6-neighbors with
+    //    density >= absThreshold. Returns the bool grid + count.
+    auto floodFill = [&](float absThreshold, std::vector<bool>& filled) -> size_t {
+        std::fill(filled.begin(), filled.end(), false);
+        if (density[peakIdx] < absThreshold) return 0;
+        filled[peakIdx] = true;
+        std::vector<size_t> queue;
+        queue.reserve(4096);
+        queue.push_back(peakIdx);
+        size_t count = 1, head = 0;
+        const int dirs[6][3] = {{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}};
+        while (head < queue.size()) {
+            size_t idx = queue[head++];
+            int z = (int)(idx % G);
+            int y = (int)((idx / G) % G);
+            int x = (int)(idx / ((size_t)G * G));
+            for (int d = 0; d < 6; d++) {
+                int nx = x + dirs[d][0];
+                int ny = y + dirs[d][1];
+                int nz = z + dirs[d][2];
+                if (nx < 0 || nx >= (int)G || ny < 0 || ny >= (int)G ||
+                    nz < 0 || nz >= (int)G) continue;
+                size_t nidx = ((size_t)nx * G + (size_t)ny) * G + (size_t)nz;
+                if (filled[nidx] || density[nidx] < absThreshold) continue;
+                filled[nidx] = true;
+                queue.push_back(nidx);
+                count++;
+            }
         }
-        float maxS = std::max({v.scale_opacity[0], v.scale_opacity[1], v.scale_opacity[2]});
-        bool hugeScale = (maxS > scaleLim);
-        return farPos && hugeScale;
+        return count;
     };
-    size_t before = vertices.size();
-    vertices.erase(std::remove_if(vertices.begin(), vertices.end(), isFloater),
-                   vertices.end());
-    size_t after = vertices.size();
-    size_t trimmed = before - after;
-    double pct = before ? (100.0 * (double)trimmed / (double)before) : 0.0;
-    printf("GsRenderer: trimmed %zu floaters (kept %zu of %zu, %.1f%%)\n",
-           trimmed, after, before, pct);
+
+    // 5. Adaptive threshold search. Try thresholds from loose to tight; pick
+    //    the first one whose fill is in the [1 %, 30 %] range. If none fits
+    //    (e.g. tight object scene where everything connects), fall back to
+    //    the loosest-but-still-valid result.
+    const size_t minFill = std::max((size_t)16, totalVoxels / 100);
+    const size_t maxFill = totalVoxels / 3;
+    const float thresholds[] = {0.05f, 0.10f, 0.20f, 0.30f, 0.50f, 0.70f};
+
+    std::vector<bool> filled(totalVoxels, false);
+    std::vector<bool> bestFilled(totalVoxels, false);
+    size_t bestCount = 0;
+    float bestThresh = 0.30f;
+    for (float t : thresholds) {
+        size_t count = floodFill(t * peakDensity, filled);
+        if (count >= minFill && count <= maxFill) {
+            bestFilled = filled;
+            bestCount = count;
+            bestThresh = t;
+            break;
+        }
+        // Also remember the largest fill that's at most maxFill, in case
+        // nothing falls into the sweet spot.
+        if (count > bestCount && count <= maxFill) {
+            bestFilled = filled;
+            bestCount = count;
+            bestThresh = t;
+        }
+    }
+    if (bestCount == 0) return false;
+
+    // 6. Bbox of filled voxels in voxel coords, then convert to world.
+    int minVox[3] = {(int)G, (int)G, (int)G};
+    int maxVox[3] = {-1, -1, -1};
+    for (size_t idx = 0; idx < totalVoxels; idx++) {
+        if (!bestFilled[idx]) continue;
+        int z = (int)(idx % G);
+        int y = (int)((idx / G) % G);
+        int x = (int)(idx / ((size_t)G * G));
+        if (x < minVox[0]) minVox[0] = x; if (x > maxVox[0]) maxVox[0] = x;
+        if (y < minVox[1]) minVox[1] = y; if (y > maxVox[1]) maxVox[1] = y;
+        if (z < minVox[2]) minVox[2] = z; if (z > maxVox[2]) maxVox[2] = z;
+    }
+    for (int a = 0; a < 3; a++) {
+        float voxSize = (vmax[a] - vmin[a]) / (float)G;
+        float worldMin = vmin[a] + (float)minVox[a] * voxSize;
+        float worldMax = vmin[a] + (float)(maxVox[a] + 1) * voxSize;
+        outCenter[a] = 0.5f * (worldMin + worldMax);
+        outExtent[a] = worldMax - worldMin;
+    }
+
+    printf("GsRenderer: main object %zu/%zu voxels (%.2f%% of grid, threshold %.2fx peak)\n",
+           bestCount, totalVoxels,
+           100.0 * (double)bestCount / (double)totalVoxels, bestThresh);
+    return true;
 }
 
 // ═════════════════════════════════════════════════════════════════════════

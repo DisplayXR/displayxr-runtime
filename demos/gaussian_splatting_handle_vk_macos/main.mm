@@ -134,10 +134,10 @@ struct InputState {
 // percentile-based extent — see ApplyAutoFitForLoadedScene().
 static constexpr float kDefaultVirtualDisplayHeightM = 1.5f;
 
-// Multiplier on the inner-quartile (25-75) Y extent. IQR captures the
-// densest splat cluster — typically the main object. Scaling by 1.4
-// brings ~the full object into frame with a small margin; walls/floor
-// outside the IQR still render but don't dominate the framing.
+// Margin on the voxel-flood-fill main-object Y extent. The flood-fill
+// already isolates the dense central object from outliers (walls/floor),
+// so we just add a small visual breathing room — 1.4 leaves the object
+// at roughly 70% of frame height with comfortable margin.
 static constexpr float kAutoFitVerticalComfort = 1.4f;
 
 // Cached auto-fit result for the currently loaded scene. Reused by Reset
@@ -1392,7 +1392,10 @@ static bool FileExists(const std::string& p) {
 // with mouse drag from a predictable starting pose.
 static void ApplyAutoFitForLoadedScene() {
     float center[3], extent[3];
-    if (g_gsRenderer.getRobustSceneBounds(0.25f, 0.75f, center, extent)) {
+    // Voxel-density flood-fill from the peak voxel: locates the main object
+    // by spatial connectivity (figure is a contiguous 3D blob, walls/floor
+    // are separated by air gaps that the flood-fill can't cross). 64³ grid.
+    if (g_gsRenderer.getMainObjectBounds(64u, center, extent)) {
         g_fitCenter[0] = center[0];
         g_fitCenter[1] = center[1];
         g_fitCenter[2] = center[2];

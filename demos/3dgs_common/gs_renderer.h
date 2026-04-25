@@ -78,6 +78,23 @@ struct GsRenderer {
                       const float viewerOffsetLocal[3],
                       uint32_t numCandidates = 8) const;
 
+    // Locate the main object via voxel-density flood-fill from the peak
+    // voxel. Voxelizes splats into a gridSize³ grid (opacity-weighted),
+    // finds the densest voxel, BFS-fills to neighbors at ≥ threshold × peak.
+    // The threshold is auto-adapted so the filled region falls between
+    // ~1 % and ~30 % of the grid. Returns the world-space bbox of the
+    // filled region.
+    //
+    // Works because the main object occupies a contiguous 3D blob, while
+    // walls/floor/ceiling are physically separated by air gaps that the
+    // flood-fill cannot cross at typical voxel sizes (≤ object–wall gap).
+    //
+    // gridSize: voxels per axis (64 is a good default — 25 cm voxels for
+    //           a 16 m scene, well under typical room air-gap distance).
+    // Returns false if no scene loaded or peak density is zero.
+    bool getMainObjectBounds(uint32_t gridSize,
+                             float outCenter[3], float outExtent[3]) const;
+
     // Robust scene centroid + per-axis extent, excluding outlier gaussians.
     // For each axis, takes the positions at the loPct / hiPct quantiles
     // (e.g. 0.05 / 0.95) and returns center = midpoint, extent = hi − lo.
@@ -211,11 +228,6 @@ private:
     // tile fragments, and re-write the descriptor sets that bind them. Caller
     // must have wait-idled the queue. No-op if requiredCapacity fits.
     void growSortBuffers(uint32_t requiredCapacity);
-
-    // Drop outlier gaussians (positions far from robust centroid OR with max
-    // 3D scale several times the 95th-percentile scale). Mutates `vertices`
-    // in place. Conservative thresholds — typically removes 1–3 % of splats.
-    void filterFloaters(std::vector<GsVertex>& vertices) const;
     void dispatchPrecompCov3d();
     void updateUniforms(const float viewMatrix[16], const float projMatrix[16],
                         uint32_t vpWidth, uint32_t vpHeight);
