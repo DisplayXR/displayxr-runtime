@@ -300,6 +300,17 @@ leiasr_d3d12_set_input_texture(struct leiasr_d3d12 *leiasr,
 	                                     leiasr->input_format);
 }
 
+// Records SR SDK weave commands onto `command_list` constrained to
+// (viewport_x, viewport_y, viewport_width, viewport_height) of the bound RTV.
+//
+// Gotcha: the SR SDK D3D12 weaver's setViewport/setScissorRect APIs are used
+// internally for phase calculation only — they do NOT call RSSetViewports or
+// RSSetScissorRects on the cmd list. We must set both on the cmd list
+// ourselves before weave(), or the woven output lands at the cmd list's
+// default viewport (full RT) instead of the canvas sub-rect. The D3D11 path
+// gets this for free because the SDK D3D11 weaver reads RSGetViewports from
+// the immediate context. Removing the RSSetViewports/RSSetScissorRects calls
+// below will reintroduce the canvas-subrect black-screen bug.
 void
 leiasr_d3d12_weave(struct leiasr_d3d12 *leiasr,
                    void *command_list,
@@ -348,6 +359,15 @@ leiasr_d3d12_weave(struct leiasr_d3d12 *leiasr,
 	scissor.right = static_cast<LONG>(viewport_x) + static_cast<LONG>(viewport_width);
 	scissor.bottom = static_cast<LONG>(viewport_y) + static_cast<LONG>(viewport_height);
 	leiasr->weaver->setScissorRect(scissor);
+
+	// Also set viewport + scissor on the command list itself. The SR SDK
+	// weaver records draw commands but does not call RSSetViewports/Scissor
+	// on the cmd list — so without this, the canvas sub-rect is ignored
+	// and the woven output lands at the cmd list's default viewport
+	// (typically full target). D3D11 path gets this for free because
+	// the DP sets RSSetViewports on the immediate context before weave().
+	cmd_list->RSSetViewports(1, &viewport);
+	cmd_list->RSSetScissorRects(1, &scissor);
 
 	// Perform weaving — records draw commands onto the command list.
 	// Set DPI awareness so any internal GetClientRect returns physical pixels.

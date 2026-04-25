@@ -215,6 +215,10 @@ leia_dp_d3d12_process_atlas(struct xrt_display_processor_d3d12 *xdp,
 		                               view_width, view_height, format);
 	}
 
+	// vp_x/vp_y/vp_w/vp_h carry the canvas sub-rect. leiasr_d3d12_weave
+	// applies them via RSSetViewports/RSSetScissorRects on the cmd list —
+	// the weaver's setViewport/setScissorRect alone do NOT scope the draw.
+	// See gotcha at leiasr_d3d12_weave().
 	leiasr_d3d12_weave(ldp->leiasr, d3d12_command_list, vp_x, vp_y, vp_w, vp_h);
 }
 
