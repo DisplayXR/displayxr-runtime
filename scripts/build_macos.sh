@@ -165,6 +165,7 @@ cp "$ROOT/test_apps/cube_hosted_legacy_metal_macos/build/cube_hosted_legacy_meta
 cp "$ROOT/test_apps/cube_hosted_legacy_gl_macos/build/cube_hosted_legacy_gl_macos" "$PKG_DIR/bin/" 2>/dev/null || true
 cp "$ROOT/test_apps/cube_hosted_legacy_vk_macos/build/cube_hosted_legacy_vk_macos" "$PKG_DIR/bin/" 2>/dev/null || true
 cp "$ROOT/demos/gaussian_splatting_handle_vk_macos/build/gaussian_splatting_handle_vk_macos" "$PKG_DIR/bin/" 2>/dev/null || true
+cp "$ROOT/demos/gaussian_splatting_handle_vk_macos/assets/butterfly.spz" "$PKG_DIR/bin/" 2>/dev/null || true
 
 # Copy texture files for handle apps
 mkdir -p "$PKG_DIR/bin/textures"
