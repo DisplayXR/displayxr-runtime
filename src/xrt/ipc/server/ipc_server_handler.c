@@ -270,21 +270,34 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 
 	// Shell-mode distinction: the shell compositor renders the shell itself
 	// via DP eye tracker (Kooima) with no qwerty offset — otherwise WASD
-	// would shift the entire shell UI. But apps *inside* the shell (Chrome
-	// WebXR, handle apps) are like non-shell apps on a smaller screen: they
-	// want qwerty as the player transform so WASD walks inside their scene.
+	// would shift the entire shell UI. But Chrome WebXR running inside the
+	// shell is like non-shell Chrome on a smaller screen: it wants qwerty
+	// as the player transform so WASD walks inside its scene.
+	//
+	// Discriminator between Chrome and handle apps in shell:
+	// XR_EXT_win32_appcontainer_compatible. Chrome WebXR enables this
+	// extension because it's sandboxed; handle apps don't. In non-shell,
+	// Chrome runs with has_external_window=false (no HWND passed to the
+	// runtime — it renders into its WebGL canvas) and goes through the
+	// client-side Kooima path with stereo tunables. In shell, Chrome
+	// passes its tab HWND for window-metrics so has_external_window=true,
+	// dropping it onto the server's IPC view-pose path. Without this
+	// flag, server can't tell Chrome apart from a handle app and either
+	// breaks Chrome's convergence (default tunables) or breaks handle
+	// apps (stereo tunables with qwerty head). With the flag, we route
+	// each to the formulation it had in non-shell.
 	//
 	// `comp_d3d11_service_owns_window` is false across the board in shell
 	// mode (intentional — it suppresses qwerty for shell-self rendering).
-	// Here we re-enable qwerty on a per-session basis: identify the shell's
-	// own session by application_name and leave it alone; all other IPC
-	// sessions in shell mode get qwerty-composed head poses.
+	// Here we re-enable qwerty on a per-session basis.
 	bool shell_mode = s->xsysc != NULL && s->xsysc->info.shell_mode;
 	bool is_shell_host_session =
 	    ics->client_state.info.application_name[0] != '\0' &&
 	    strcmp((const char *)ics->client_state.info.application_name, "displayxr-shell") == 0;
+	bool is_appcontainer_app =
+	    ics->client_state.info.ext_win32_appcontainer_compatible_enabled;
 	bool use_qwerty_head = compositor_owns_window ||
-	                       (shell_mode && !is_shell_host_session);
+	                       (shell_mode && !is_shell_host_session && is_appcontainer_app);
 
 	struct xrt_vec3 display_pos = qwerty_relation.pose.position;
 	struct xrt_quat display_ori = qwerty_relation.pose.orientation;
@@ -427,14 +440,15 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 		float left_v = (out_fovs[0].angle_up - out_fovs[0].angle_down) * 180.0f / 3.14159265f;
 		IPC_WARN(s, "IPC SR: mode=%s display=(%.2f,%.2f,%.2f) FOV H=%.1f° V=%.1f°"
 		         " pose[0]=(%.3f,%.3f,%.3f) pose[1]=(%.3f,%.3f,%.3f)"
-		         " owns_win=%d shell=%d shell_host=%d use_qwerty=%d app='%s'",
+		         " owns_win=%d shell=%d shell_host=%d appc=%d use_qwerty=%d app='%s'",
 		         (have_stereo_state && stereo_state.camera_mode && use_qwerty_head)
 		             ? "camera" : "display",
 		         display_pos.x, display_pos.y, display_pos.z,
 		         left_h, left_v,
 		         out_poses[0].position.x, out_poses[0].position.y, out_poses[0].position.z,
 		         out_poses[1].position.x, out_poses[1].position.y, out_poses[1].position.z,
-		         compositor_owns_window, shell_mode, is_shell_host_session, use_qwerty_head,
+		         compositor_owns_window, shell_mode, is_shell_host_session,
+		         is_appcontainer_app, use_qwerty_head,
 		         (const char *)ics->client_state.info.application_name);
 	}
 
