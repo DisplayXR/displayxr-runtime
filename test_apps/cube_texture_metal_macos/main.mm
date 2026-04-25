@@ -1969,35 +1969,37 @@ int main(int argc, char **argv)
                 float dispPxH = app.displayPixelHeight > 0 ? (float)app.displayPixelHeight : (float)app.swapchain.height;
                 float pxSizeX = app.displayWidthM / dispPxW;
                 float pxSizeY = app.displayHeightM / dispPxH;
-                float winW_m = (float)g_canvasW * pxSizeX;
-                float winH_m = (float)g_canvasH * pxSizeY;
+                float canvasW_m = (float)g_canvasW * pxSizeX;
+                float canvasH_m = (float)g_canvasH * pxSizeY;
 
-                // Window-relative Kooima: compute eye offset from window center
+                // Canvas-relative Kooima: physical size + eye offset both anchored
+                // on the canvas region within the window (not the window itself).
                 float eyeOffsetX = 0.0f, eyeOffsetY = 0.0f;
-                if (g_window != nil) {
-                    NSRect winFrame = [g_window frame];
+                if (g_window != nil && g_metalView != nil) {
                     NSScreen *screen_ns = [g_window screen] ?: [NSScreen mainScreen];
                     NSRect screenFrame = [screen_ns frame];
-                    float winCenterX = (winFrame.origin.x - screenFrame.origin.x) + winFrame.size.width / 2.0f;
-                    float winCenterY = (winFrame.origin.y - screenFrame.origin.y) + winFrame.size.height / 2.0f;
+                    NSRect canvasInWindow = [g_metalView convertRect:[g_metalView bounds] toView:nil];
+                    NSRect canvasInScreen = [g_window convertRectToScreen:canvasInWindow];
+                    float canvasCenterX = (canvasInScreen.origin.x - screenFrame.origin.x) + canvasInScreen.size.width / 2.0f;
+                    float canvasCenterY = (canvasInScreen.origin.y - screenFrame.origin.y) + canvasInScreen.size.height / 2.0f;
                     float dispCenterX = screenFrame.size.width / 2.0f;
                     float dispCenterY = screenFrame.size.height / 2.0f;
                     CGFloat backingScale = [g_window backingScaleFactor];
                     float pxSizeXBacking = pxSizeX / (float)backingScale;
                     float pxSizeYBacking = pxSizeY / (float)backingScale;
-                    eyeOffsetX = (winCenterX - dispCenterX) * pxSizeXBacking;
-                    eyeOffsetY = (winCenterY - dispCenterY) * pxSizeYBacking;
+                    eyeOffsetX = (canvasCenterX - dispCenterX) * pxSizeXBacking;
+                    eyeOffsetY = (canvasCenterY - dispCenterY) * pxSizeYBacking;
                 }
 
-                // Apply window center offset to raw eye positions
+                // Apply canvas-center offset to raw eye positions
                 for (uint32_t v = 0; v < modeViewCount; v++) {
                     rawEyePos[v].x -= eyeOffsetX;
                     rawEyePos[v].y -= eyeOffsetY;
                 }
 
                 Display3DScreen screen;
-                screen.width_m = winW_m;
-                screen.height_m = winH_m;
+                screen.width_m = canvasW_m;
+                screen.height_m = canvasH_m;
 
                 if (g_input.cameraMode) {
                     Camera3DTunables camTunables;
