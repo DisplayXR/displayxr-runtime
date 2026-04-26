@@ -28,6 +28,13 @@ add_library(sr_common_base STATIC
     display3d_view.h
     camera3d_view.c
     camera3d_view.h
+    # In-app atlas capture: cross-platform filename helpers + Windows flash
+    # overlay + the single STB implementation TU for Windows-linked targets.
+    # Per-API readback (atlas_capture_{vk,d3d11,d3d12,gl}.cpp) is added to
+    # each app's own source list so this base lib stays free of graphics-
+    # API dependencies.
+    atlas_capture.h
+    atlas_capture.cpp
 )
 
 target_include_directories(sr_common_base PUBLIC
@@ -52,4 +59,11 @@ target_link_libraries(sr_common PUBLIC
     d3dcompiler
     d2d1
     dwrite
+)
+
+# D3D11 atlas readback. Pulled into sr_common (not sr_common_base) so
+# only D3D11-linking targets get it — the rest of the cube_handle apps
+# add their respective atlas_capture_<api>.cpp directly.
+target_sources(sr_common PRIVATE
+    atlas_capture_d3d11.cpp
 )

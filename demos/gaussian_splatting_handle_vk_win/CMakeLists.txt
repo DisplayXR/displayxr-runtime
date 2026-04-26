@@ -88,6 +88,8 @@ add_executable(gaussian_splatting_handle_vk_win WIN32
     ${CMAKE_CURRENT_SOURCE_DIR}/../../test_apps/common/hud_renderer.h
     ${CMAKE_CURRENT_SOURCE_DIR}/../../test_apps/common/text_overlay.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../test_apps/common/text_overlay.h
+    # 'I' key atlas capture: VK readback (filename + flash come via sr_common_base)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../test_apps/common/atlas_capture_vk.cpp
     sr_3dgs_openxr_ext_vk.manifest
     resource.rc
 )
