@@ -280,21 +280,82 @@ Hardware: Leia SR + Chrome with the DisplayXR WebXR extension.
 
 ## Definition of done
 
-- [ ] Bridge-aware WebXR in shell renders the test pixel `0x0d0d40` as
+- [x] Bridge-aware WebXR in shell renders the test pixel `0x0d0d40` as
       deep navy (within 5% of the non-shell rendering).
-- [ ] Side-by-side bridge-aware shell vs non-shell matches visually.
-- [ ] All 8 regression-matrix rows pass on the live Leia display.
-- [ ] One or two commits stacked on `feature/webxr-in-shell`. Build
-      green via `scripts\build_windows.bat build`.
-- [ ] No `feedback_srgb_blit_paths` rule violation: shell vs non-shell
+- [x] Side-by-side bridge-aware shell vs non-shell matches visually.
+- [x] All 8 regression-matrix rows pass on the live Leia display.
+- [x] Two commits stacked on `feature/webxr-in-shell` (diag-1
+      `7c0b7fc1a`, fix `48dbdc6b2`). Build green via
+      `scripts\build_windows.bat build`.
+- [x] No `feedback_srgb_blit_paths` rule violation: shell vs non-shell
       paths remain distinct.
-- [ ] Push to `origin/feature/webxr-in-shell` only after user signs
-      off (`feedback_test_before_ci`).
+- [x] Push to `origin/feature/webxr-in-shell` after user signs off
+      (`feedback_test_before_ci`).
+
+## Outcome
+
+Resolved by commit `48dbdc6b2`. The fix took **path B** in this plan's
+ranked candidates — match the DP's expectation at the multi-comp read
+boundary — but with the read-side reinterpretation done via SRV typing
+rather than a re-encode shader pass.
+
+**What landed.** The shell-mode per-client atlas storage is now
+`R8G8B8A8_TYPELESS` (was `R8G8B8A8_UNORM`). Two parallel SRVs view the
+same bytes:
+
+- `atlas_srv` (UNORM-typed) — used when the source swapchain bytes are
+  already linear (UNORM swapchain, e.g. handle apps).
+- `atlas_srv_srgb` (UNORM_SRGB-typed) — used when the source bytes are
+  gamma-encoded (SRGB swapchain, e.g. Chrome with Three.js
+  `outputColorSpace=SRGBColorSpace`).
+
+A new per-client flag `atlas_holds_srgb_bytes` is set in
+`compositor_layer_commit` from `view_is_srgb[0]` immediately after the
+swapchain → atlas blit. `multi_compositor_render` selects the SRV at
+sample time. With the SRGB SRV, the GPU auto-linearizes on sample, the
+multi-comp blit shader (passthrough at `convert_srgb=0`) writes linear
+values to the combined atlas, and the DP receives linear input as
+expected.
+
+**What stayed.** The swapchain → per-client atlas path in shell mode
+remains a raw `CopySubresourceRegion` (byte-perfect, no race against
+Chrome's keyed-mutex-protected swapchain release, no rasterizer state
+churn). The `feedback_srgb_blit_paths` invariant — shell vs non-shell
+pipelines stay distinct downstream — is preserved.
+
+**Diagnostic findings worth recording.**
+- diag-1 (one-shot per-slot DXGI_FORMAT dump) confirmed the chain is
+  structurally a UNORM passthrough: per-client atlas, combined atlas,
+  and crop staging all `R8G8B8A8_UNORM`, IPC blit shader bound with
+  `convert_srgb=0.0`. Cause #1 (hidden SRGB SRV typing) ruled out.
+- diag-2 (file-trigger combined-atlas screenshot) found the test pixel
+  at `(0x40, 0x40, 0x89)` — the linear-of-source value sRGB-encoded
+  once by Three.js's `outputColorSpace=SRGBColorSpace`. The
+  passthrough chain preserved those gamma-encoded bytes verbatim and
+  the DP weaver treated them as linear, producing the second encode at
+  output (the visible double encode → brightened indigo).
+- The `bridge_relay=no` row for the bridge-aware client surprised us:
+  the bridge child is headless and produces no frames; Chrome's normal
+  IPC compositor is what renders bridge-aware sessions, taking the
+  exact same path as legacy WebXR. The color shift therefore affected
+  legacy WebXR too — just less visibly because the legacy sample
+  doesn't have a deep-navy reference color. Fixed for both paths.
+
+**Path-A and path-C attempts (informative, not landed).** Two earlier
+attempts moved the linearization to the swapchain-input boundary
+(shader blit at `compositor_layer_commit` with the existing
+`use_srgb_shader` path enabled in shell mode). They produced clean
+colors but introduced a ghost-replicas regression: the shader blit's
+GPU work wasn't guaranteed to complete before the keyed mutex was
+released back to Chrome, leaving tile 1 stale on subsequent frames.
+Path B avoids the boundary entirely — the SRV read happens against a
+runtime-internal texture, not subject to keyed mutex or producer
+contention.
 
 ## After this ships
 
 Stage 4 (live resize during a session) is the last open item on
-`webxr-in-shell-plan.md`. After this color fix, the parent plan should
-be ready to close. There's also a known intermittent service crash on
-window-close (captured under procdump in `_dumps/`) — orthogonal, can
-be investigated independently.
+`webxr-in-shell-plan.md`. With this color fix landed, the parent plan
+is ready to close once Stage 4 ships. There's also a known
+intermittent service crash on window-close (captured under procdump in
+`_dumps/`) — orthogonal, can be investigated independently.
