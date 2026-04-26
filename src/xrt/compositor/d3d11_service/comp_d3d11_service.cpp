@@ -647,6 +647,26 @@ struct d3d11_multi_client_slot
 	//! True when this window was auto-minimized by another window's fullscreen toggle.
 	bool fullscreen_minimized;
 
+	//! True after the IPC client has committed at least one projection layer
+	//! since slot registration. Until then, multi_compositor_render skips
+	//! drawing this slot entirely — the per-client atlas is uninitialized and
+	//! `content_view_w/_h` are zero, so any draw shows undefined-memory black
+	//! at fallback dims. The entry animation start time is reset on the
+	//! false→true transition so the slot's grow-in animation plays once
+	//! content is actually available (mirrors the capture-client pattern of
+	//! gating on `capture_srv` non-null at the same render-loop site).
+	bool has_first_frame_committed;
+
+	//! Monotonic time the first projection-layer commit landed for this
+	//! slot. Used to gate slot rendering for an additional grace period
+	//! after first commit — Chrome's WebXR pipeline keeps submitting frames
+	//! at 60 Hz while Three.js's render loop is still in WebGL warmup
+	//! (texture loading, shader compile), so the atlas is filled with
+	//! Chrome's GPU-cleared (black) bytes for ~1–3 s past the first
+	//! commit. Without this grace window the user sees a chrome-bordered
+	//! window with a black interior for those seconds.
+	uint64_t first_frame_ns;
+
 	//! App name for title bar display (from HWND title or fallback).
 	char app_name[128];
 
@@ -3752,6 +3772,8 @@ multi_compositor_register_client(struct d3d11_service_system *sys, struct d3d11_
 			mc->clients[i].compositor = c;
 			mc->clients[i].client_type = CLIENT_TYPE_IPC;
 			mc->clients[i].active = true;
+			mc->clients[i].has_first_frame_committed = false;
+			mc->clients[i].first_frame_ns = 0;
 
 			// Count active clients to determine grid position
 			int active_count = 0;
@@ -6891,6 +6913,16 @@ after_key_shortcuts:
 	// Copy client atlas → combined atlas, crop to content dims, send to DP.
 	// Render order: back-to-front by Z depth (painter's algorithm).
 	// Windows farther from viewer (lower Z) render first, closer windows on top.
+	// IPC clients are excluded until they have committed at least one
+	// projection layer — their per-client atlas is uninitialized GPU memory
+	// in shell mode (see comment at the atlas-clear gate around :8845), and
+	// `content_view_w/_h` are zero until the first commit. Drawing them at
+	// intermediate entry-animation sizes during Chrome WebGL initialization
+	// produces a narrow black rectangle that jumps to full size when the
+	// first frame lands. The animation start time is reset on the
+	// false→true transition (in compositor_layer_commit) so the entry
+	// animation plays once content is actually available. Capture clients
+	// have an analogous gate via `capture_srv` non-null below.
 	int render_order[D3D11_MULTI_MAX_CLIENTS];
 	int render_count = 0;
 	for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
@@ -7014,6 +7046,48 @@ after_key_shortcuts:
 			    eye_pos.eyes[ei].x, eye_pos.eyes[ei].y, eye_pos.eyes[ei].z,
 			    &eye_rect_x[eye], &eye_rect_y[eye],
 			    &eye_rect_w[eye], &eye_rect_h[eye]);
+		}
+
+		// Show a spinner placeholder (8 dots in a ring, one bright
+		// rotating) instead of the content blit while the IPC client
+		// hasn't produced real content yet. Phase 1: pre-first-commit
+		// (per-client atlas is uninitialized GPU memory). Phase 2:
+		// post-first-commit grace window — Chrome's WebXR pipeline
+		// keeps submitting frames at 60Hz while the page's WebGL
+		// pipeline (texture loading, shader compile) is still in
+		// warmup, so the swapchain (and therefore the atlas) is
+		// GPU-cleared black for ~1–3s past first commit. The spinner
+		// keeps the slot's chrome visible from the moment of register
+		// — the user sees a loading window, not a black hole.
+		// Show the spinner placeholder while the IPC client is in its
+		// loading window. Two-phase gate:
+		//   Phase 1 (pre-first-commit): per-client atlas is uninitialized
+		//     GPU memory. The slot's content_view_w/_h are zero. Showing
+		//     Chrome's content here would render garbage / black.
+		//   Phase 2 (post-first-commit grace): Chrome's WebXR pipeline
+		//     keeps submitting frames at 60Hz while Three.js's WebGL
+		//     pipeline (texture loading, shader compile) is still in
+		//     warmup. The swapchain (and therefore the per-client atlas)
+		//     is GPU-cleared black for ~1–3 s past first commit. Without
+		//     phase 2, the moment the gate releases the slot snaps to a
+		//     black interior until WebGL produces real frames.
+		// The grace window is generous (3 s) because Chrome cold-start +
+		// Three.js init can be slow; better to over-shoot and have the
+		// spinner cross-fade into real content than under-shoot and have
+		// the user see a black flash.
+		bool show_spinner = false;
+		if (mc->clients[s].client_type == CLIENT_TYPE_IPC) {
+			if (!mc->clients[s].has_first_frame_committed) {
+				show_spinner = true;
+			} else {
+				const uint64_t POST_COMMIT_GRACE_NS =
+				    3000ULL * 1000000ULL;
+				uint64_t age = os_monotonic_get_ns() -
+				    mc->clients[s].first_frame_ns;
+				if (age < POST_COMMIT_GRACE_NS) {
+					show_spinner = true;
+				}
+			}
 		}
 
 		// Shader blit each view → combined atlas.
@@ -7153,67 +7227,175 @@ after_key_shortcuts:
 				}
 			}
 
-			// Update constant buffer
-			D3D11_MAPPED_SUBRESOURCE mapped;
-			HRESULT hr = sys->context->Map(sys->blit_constant_buffer.get(), 0,
-			                                D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-			if (FAILED(hr)) continue;
-			BlitConstants *cb = static_cast<BlitConstants *>(mapped.pData);
-			cb->src_rect[0] = src_px_x;
-			cb->src_rect[2] = static_cast<float>(cvw);
-			if (slot_flip_y) {
-				cb->src_rect[1] = src_px_y + static_cast<float>(cvh);
-				cb->src_rect[3] = -static_cast<float>(cvh);
+			if (show_spinner) {
+				// Loading placeholder: 8 small soft squares
+				// arranged in a ring around the slot center,
+				// one bright (white) and the rest dim (gray),
+				// with the bright index advancing ~4 times
+				// per second (one full revolution every 2s).
+				// Heavy edge_feather makes the small squares
+				// read as fuzzy dots — visually a spinner.
+				float slot_cx = dest_px_x + dest_px_w * 0.5f;
+				float slot_cy = dest_px_y + dest_px_h * 0.5f;
+				// Sized so the spinner reads at full-slot scale —
+				// the entry animation grows the slot from ~244px
+				// to ~1555px, and a proportionally small spinner
+				// (e.g. 0.07) becomes a tiny dot against a wide
+				// dark-gray interior at full size. ~0.18 keeps it
+				// visible across the whole animation range.
+				float ring_r =
+				    fminf(dest_px_w, dest_px_h) * 0.18f;
+				float dot_size =
+				    fminf(dest_px_w, dest_px_h) * 0.05f;
+				if (dot_size < 6.0f) dot_size = 6.0f;
+				uint64_t now_ns = os_monotonic_get_ns();
+				float now_s = (float)(now_ns / 1000000ULL) /
+				              1000.0f;
+				int active_dot = (int)(now_s * 4.0f) & 7;
+				const float TWO_PI = 6.28318530718f;
+
+				// One-time pipeline setup for the dot draws.
+				sys->context->VSSetShader(
+				    sys->blit_vs.get(), nullptr, 0);
+				sys->context->PSSetShader(
+				    sys->blit_ps.get(), nullptr, 0);
+				sys->context->VSSetConstantBuffers(
+				    0, 1, sys->blit_constant_buffer.addressof());
+				sys->context->PSSetConstantBuffers(
+				    0, 1, sys->blit_constant_buffer.addressof());
+				sys->context->PSSetSamplers(
+				    0, 1, sys->sampler_linear.addressof());
+				ID3D11RenderTargetView *spin_rtvs[] = {
+				    mc->combined_atlas_rtv.get()};
+				sys->context->OMSetRenderTargets(
+				    1, spin_rtvs, nullptr);
+				D3D11_VIEWPORT spin_vp = {};
+				spin_vp.Width = (float)ca_w;
+				spin_vp.Height = (float)ca_h;
+				spin_vp.MaxDepth = 1.0f;
+				sys->context->RSSetViewports(1, &spin_vp);
+				sys->context->IASetPrimitiveTopology(
+				    D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+				sys->context->IASetInputLayout(nullptr);
+				sys->context->RSSetState(sys->rasterizer_state.get());
+				sys->context->OMSetDepthStencilState(
+				    sys->depth_disabled.get(), 0);
+				sys->context->OMSetBlendState(
+				    sys->blend_alpha.get(), nullptr, 0xFFFFFFFF);
+
+				for (int i = 0; i < 8; i++) {
+					float a = (float)i * (TWO_PI / 8.0f);
+					float dx = slot_cx + cosf(a) * ring_r -
+					           dot_size * 0.5f;
+					float dy = slot_cy + sinf(a) * ring_r -
+					           dot_size * 0.5f;
+					// Bright leading dot, then a trailing
+					// fade so it reads as motion.
+					int trail = (active_dot - i) & 7;
+					float brightness;
+					if (trail == 0) brightness = 1.0f;
+					else if (trail == 1) brightness = 0.75f;
+					else if (trail == 2) brightness = 0.55f;
+					else if (trail == 3) brightness = 0.40f;
+					else brightness = 0.30f;
+
+					D3D11_MAPPED_SUBRESOURCE m;
+					if (FAILED(sys->context->Map(
+					    sys->blit_constant_buffer.get(), 0,
+					    D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+						continue;
+					}
+					BlitConstants *cb =
+					    static_cast<BlitConstants *>(m.pData);
+					memset(cb, 0, sizeof(*cb));
+					// Solid color mode: shader returns
+					// src_rect.xyz as RGB.
+					cb->src_rect[0] = brightness;
+					cb->src_rect[1] = brightness;
+					cb->src_rect[2] = brightness;
+					cb->src_rect[3] = 1.0f;
+					cb->src_size[0] = 1.0f;
+					cb->src_size[1] = 1.0f;
+					cb->dst_size[0] = (float)ca_w;
+					cb->dst_size[1] = (float)ca_h;
+					cb->convert_srgb = 2.0f;
+					cb->dst_offset[0] = dx;
+					cb->dst_offset[1] = dy;
+					cb->dst_rect_wh[0] = dot_size;
+					cb->dst_rect_wh[1] = dot_size;
+					cb->corner_radius = 0.0f;
+					cb->corner_aspect = 0.0f;
+					// Heavy feather softens the square
+					// edges into a fuzzy circular dot.
+					cb->edge_feather = 0.45f;
+					cb->glow_intensity = 0.0f;
+					sys->context->Unmap(
+					    sys->blit_constant_buffer.get(), 0);
+					sys->context->Draw(4, 0);
+				}
 			} else {
-				cb->src_rect[1] = src_px_y;
-				cb->src_rect[3] = static_cast<float>(cvh);
+				// Update constant buffer
+				D3D11_MAPPED_SUBRESOURCE mapped;
+				HRESULT hr = sys->context->Map(sys->blit_constant_buffer.get(), 0,
+				                                D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+				if (FAILED(hr)) continue;
+				BlitConstants *cb = static_cast<BlitConstants *>(mapped.pData);
+				cb->src_rect[0] = src_px_x;
+				cb->src_rect[2] = static_cast<float>(cvw);
+				if (slot_flip_y) {
+					cb->src_rect[1] = src_px_y + static_cast<float>(cvh);
+					cb->src_rect[3] = -static_cast<float>(cvh);
+				} else {
+					cb->src_rect[1] = src_px_y;
+					cb->src_rect[3] = static_cast<float>(cvh);
+				}
+				cb->dst_offset[0] = dest_px_x;
+				cb->dst_offset[1] = dest_px_y;
+				cb->src_size[0] = static_cast<float>(src_tex_w);
+				cb->src_size[1] = static_cast<float>(src_tex_h);
+				cb->dst_size[0] = static_cast<float>(ca_w);
+				cb->dst_size[1] = static_cast<float>(ca_h);
+				cb->convert_srgb = 0.0f;
+				cb->quad_mode = use_quad ? 1.0f : 0.0f;
+				cb->dst_rect_wh[0] = dest_px_w;
+				cb->dst_rect_wh[1] = dest_px_h;
+				// Round bottom-left + bottom-right corners of content window
+				cb->corner_radius = -0.03f;  // fraction of content height (subtle)
+				cb->corner_aspect = mc->clients[s].window_width_m / mc->clients[s].window_height_m;
+				cb->edge_feather = UI_EDGE_FEATHER_PX / dest_px_h;
+				cb->glow_intensity = 0.0f;
+				if (use_quad) {
+					blit_set_quad_corners(cb, quad_corners, quad_w_vals);
+				} else {
+					memset(cb->quad_corners_01, 0, sizeof(cb->quad_corners_01));
+					memset(cb->quad_corners_23, 0, sizeof(cb->quad_corners_23));
+				}
+				sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
+
+				// Pipeline setup
+				sys->context->VSSetShader(sys->blit_vs.get(), nullptr, 0);
+				sys->context->PSSetShader(sys->blit_ps.get(), nullptr, 0);
+				sys->context->VSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
+				sys->context->PSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
+				sys->context->PSSetShaderResources(0, 1, &slot_srv);
+				sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
+
+				// Render to combined atlas
+				ID3D11RenderTargetView *ca_rtvs[] = {mc->combined_atlas_rtv.get()};
+				sys->context->OMSetRenderTargets(1, ca_rtvs, nullptr);
+				D3D11_VIEWPORT vp = {};
+				vp.Width = static_cast<float>(ca_w);
+				vp.Height = static_cast<float>(ca_h);
+				vp.MaxDepth = 1.0f;
+				sys->context->RSSetViewports(1, &vp);
+				sys->context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+				sys->context->IASetInputLayout(nullptr);
+				sys->context->RSSetState(sys->rasterizer_state.get());
+				sys->context->OMSetDepthStencilState(sys->depth_disabled.get(), 0);
+				sys->context->OMSetBlendState(sys->blend_alpha.get(), nullptr, 0xFFFFFFFF);
+
+				sys->context->Draw(4, 0);
 			}
-			cb->dst_offset[0] = dest_px_x;
-			cb->dst_offset[1] = dest_px_y;
-			cb->src_size[0] = static_cast<float>(src_tex_w);
-			cb->src_size[1] = static_cast<float>(src_tex_h);
-			cb->dst_size[0] = static_cast<float>(ca_w);
-			cb->dst_size[1] = static_cast<float>(ca_h);
-			cb->convert_srgb = 0.0f;
-			cb->quad_mode = use_quad ? 1.0f : 0.0f;
-			cb->dst_rect_wh[0] = dest_px_w;
-			cb->dst_rect_wh[1] = dest_px_h;
-			// Round bottom-left + bottom-right corners of content window
-			cb->corner_radius = -0.03f;  // fraction of content height (subtle)
-			cb->corner_aspect = mc->clients[s].window_width_m / mc->clients[s].window_height_m;
-			cb->edge_feather = UI_EDGE_FEATHER_PX / dest_px_h;
-			cb->glow_intensity = 0.0f;
-			if (use_quad) {
-				blit_set_quad_corners(cb, quad_corners, quad_w_vals);
-			} else {
-				memset(cb->quad_corners_01, 0, sizeof(cb->quad_corners_01));
-				memset(cb->quad_corners_23, 0, sizeof(cb->quad_corners_23));
-			}
-			sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
-
-			// Pipeline setup
-			sys->context->VSSetShader(sys->blit_vs.get(), nullptr, 0);
-			sys->context->PSSetShader(sys->blit_ps.get(), nullptr, 0);
-			sys->context->VSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
-			sys->context->PSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
-			sys->context->PSSetShaderResources(0, 1, &slot_srv);
-			sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
-
-			// Render to combined atlas
-			ID3D11RenderTargetView *ca_rtvs[] = {mc->combined_atlas_rtv.get()};
-			sys->context->OMSetRenderTargets(1, ca_rtvs, nullptr);
-			D3D11_VIEWPORT vp = {};
-			vp.Width = static_cast<float>(ca_w);
-			vp.Height = static_cast<float>(ca_h);
-			vp.MaxDepth = 1.0f;
-			sys->context->RSSetViewports(1, &vp);
-			sys->context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-			sys->context->IASetInputLayout(nullptr);
-			sys->context->RSSetState(sys->rasterizer_state.get());
-			sys->context->OMSetDepthStencilState(sys->depth_disabled.get(), 0);
-			sys->context->OMSetBlendState(sys->blend_alpha.get(), nullptr, 0xFFFFFFFF);
-
-			sys->context->Draw(4, 0);
 		}
 
 		// Draw title bar for this slot (inside render_order loop for correct z-order).
@@ -9456,13 +9638,29 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		// projection layer share a swapchain format in practice; pick view 0.
 		c->atlas_holds_srgb_bytes = view_is_srgb[0];
 
-		// Store content dims on multi-comp slot for multi_compositor_render
+		// Store content dims on multi-comp slot for multi_compositor_render.
+		// Also flip `has_first_frame_committed` on the false→true transition
+		// and reset the entry animation's start time so the slot's grow-in
+		// animation plays once Chrome (or any IPC client) has actually
+		// submitted content. Without this, the multi-comp would draw the
+		// slot at intermediate animation sizes with uninitialized atlas
+		// content for the 2-3s while Chrome's WebGL is initializing —
+		// visible as a narrow black rectangle that jumps to full size when
+		// the first frame lands. Mirrors the capture-client `capture_srv`
+		// readiness gate.
 		if (sys->shell_mode && sys->multi_comp != nullptr) {
 			for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
 				if (sys->multi_comp->clients[s].active &&
 				    sys->multi_comp->clients[s].compositor == c) {
-					sys->multi_comp->clients[s].content_view_w = content_view_w;
-					sys->multi_comp->clients[s].content_view_h = content_view_h;
+					struct d3d11_multi_client_slot *slot =
+					    &sys->multi_comp->clients[s];
+					slot->content_view_w = content_view_w;
+					slot->content_view_h = content_view_h;
+					if (!slot->has_first_frame_committed) {
+						slot->has_first_frame_committed = true;
+						slot->first_frame_ns =
+						    os_monotonic_get_ns();
+					}
 					break;
 				}
 			}
