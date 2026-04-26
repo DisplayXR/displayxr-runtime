@@ -187,6 +187,13 @@ struct d3d11_client_render_resources
 	//! Atlas render target (tiled views, full native dims)
 	wil::com_ptr<ID3D11Texture2D> atlas_texture;
 	wil::com_ptr<ID3D11ShaderResourceView> atlas_srv;
+	//! Parallel SRV that reinterprets the (UNORM) atlas storage as SRGB-typed
+	//! so sampling auto-linearizes. Used by multi_compositor_render when the
+	//! client submitted an SRGB swapchain (its swapchain bytes are gamma-
+	//! encoded, and raw-copied into atlas_texture verbatim — sampling them
+	//! through this SRV is what produces the linear values the DP expects).
+	//! Lazy-created on first use; reset whenever atlas_texture is recreated.
+	wil::com_ptr<ID3D11ShaderResourceView> atlas_srv_srgb;
 	wil::com_ptr<ID3D11RenderTargetView> atlas_rtv;
 
 	//! Content-sized crop atlas for DP input (lazy-created when content < atlas)
@@ -264,6 +271,14 @@ struct d3d11_service_compositor
 
 	//! True if the client's atlas content is Y-flipped (GL clients)
 	bool atlas_flip_y;
+
+	//! True if the client's most-recent swapchain submission used an SRGB
+	//! format. Atlas storage is always UNORM, but raw-copy preserves the
+	//! source bytes verbatim — so when this is true, the bytes in the atlas
+	//! are gamma-encoded and need to be linearized on sample by reading
+	//! through render.atlas_srv_srgb. When false, the bytes are already
+	//! linear (UNORM swapchain) and the default UNORM atlas_srv is correct.
+	bool atlas_holds_srgb_bytes;
 
 	//! Accumulated layers for the current frame
 	struct comp_layer_accum layer_accum;
@@ -1909,6 +1924,7 @@ fini_client_render_resources(struct d3d11_client_render_resources *res)
 	res->crop_height = 0;
 	res->atlas_rtv.reset();
 	res->atlas_srv.reset();
+	res->atlas_srv_srgb.reset();
 	res->atlas_texture.reset();
 	res->swap_chain.reset();
 
@@ -1949,12 +1965,22 @@ init_client_render_resources(struct d3d11_service_system *sys,
 			atlas_w = sys->display_width;
 			atlas_h = sys->display_height;
 		}
+		// Storage is TYPELESS so we can create both UNORM and UNORM_SRGB
+		// SRVs onto the same bytes. The UNORM SRV is for clients whose
+		// swapchain bytes are already linear (handle apps, UNORM legacy
+		// WebXR); the SRGB SRV is for clients whose swapchain bytes are
+		// gamma-encoded (SRGB swapchains, e.g. Chrome/Three.js with
+		// outputColorSpace=SRGBColorSpace) so multi_compositor_render's
+		// passthrough-blit reads linear values. Without TYPELESS storage,
+		// CreateShaderResourceView with a different sub-format than the
+		// resource format returns E_INVALIDARG (D3D11 cross-format-view
+		// rule).
 		D3D11_TEXTURE2D_DESC atlas_desc = {};
 		atlas_desc.Width = atlas_w;
 		atlas_desc.Height = atlas_h;
 		atlas_desc.MipLevels = 1;
 		atlas_desc.ArraySize = 1;
-		atlas_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		atlas_desc.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
 		atlas_desc.SampleDesc.Count = 1;
 		atlas_desc.Usage = D3D11_USAGE_DEFAULT;
 		atlas_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
@@ -1964,8 +1990,36 @@ init_client_render_resources(struct d3d11_service_system *sys,
 			U_LOG_E("Shell mode: failed to create atlas texture (hr=0x%08X)", hr);
 			return XRT_ERROR_D3D11;
 		}
-		sys->device->CreateShaderResourceView(res->atlas_texture.get(), nullptr, res->atlas_srv.put());
-		sys->device->CreateRenderTargetView(res->atlas_texture.get(), nullptr, res->atlas_rtv.put());
+
+		// Default UNORM SRV — for linear-byte content.
+		D3D11_SHADER_RESOURCE_VIEW_DESC unorm_srv_desc = {};
+		unorm_srv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		unorm_srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+		unorm_srv_desc.Texture2D.MipLevels = 1;
+		unorm_srv_desc.Texture2D.MostDetailedMip = 0;
+		sys->device->CreateShaderResourceView(
+		    res->atlas_texture.get(), &unorm_srv_desc, res->atlas_srv.put());
+
+		// Parallel SRGB SRV — for gamma-encoded-byte content. Selected
+		// at sample time by multi_compositor_render based on the
+		// per-client `atlas_holds_srgb_bytes` flag.
+		D3D11_SHADER_RESOURCE_VIEW_DESC srgb_srv_desc = {};
+		srgb_srv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+		srgb_srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+		srgb_srv_desc.Texture2D.MipLevels = 1;
+		srgb_srv_desc.Texture2D.MostDetailedMip = 0;
+		sys->device->CreateShaderResourceView(
+		    res->atlas_texture.get(), &srgb_srv_desc, res->atlas_srv_srgb.put());
+
+		// RTV stays UNORM — runtime-side blits write raw bytes (no
+		// auto-encode); the source bytes' color space is tracked
+		// separately and resolved on read.
+		D3D11_RENDER_TARGET_VIEW_DESC unorm_rtv_desc = {};
+		unorm_rtv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		unorm_rtv_desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+		unorm_rtv_desc.Texture2D.MipSlice = 0;
+		sys->device->CreateRenderTargetView(
+		    res->atlas_texture.get(), &unorm_rtv_desc, res->atlas_rtv.put());
 
 		U_LOG_W("Shell mode: created atlas-only resources for client (%ux%u)",
 		        atlas_w, atlas_h);
@@ -2141,6 +2195,7 @@ init_client_render_resources(struct d3d11_service_system *sys,
 				// Recreate stereo texture at correct dimensions
 				res->atlas_rtv.reset();
 				res->atlas_srv.reset();
+				res->atlas_srv_srgb.reset();
 				res->atlas_texture.reset();
 
 				D3D11_TEXTURE2D_DESC atlas_desc = {};
@@ -6950,7 +7005,22 @@ after_key_shortcuts:
 				        crop_desc.Width, crop_desc.Height);
 			}
 
-			slot_srv = cc->render.atlas_srv.get();
+			// Pick UNORM vs SRGB-typed SRV onto the per-client atlas
+			// based on whether the client's most-recent swapchain was
+			// SRGB-encoded. Atlas storage is TYPELESS in shell mode (see
+			// init_client_render_resources), so both views were created
+			// up-front. The SRGB-SRV path makes the GPU auto-linearize
+			// on sample — the multi-comp shader (passthrough at
+			// convert_srgb=0) then writes linear values to the combined
+			// atlas, which is what the DP weaver expects. Falls back to
+			// the UNORM SRV if the SRGB SRV isn't available (non-shell
+			// atlas storage is UNORM and only atlas_srv exists; not
+			// expected to reach here in non-shell mode but stays robust).
+			if (cc->atlas_holds_srgb_bytes && cc->render.atlas_srv_srgb) {
+				slot_srv = cc->render.atlas_srv_srgb.get();
+			} else {
+				slot_srv = cc->render.atlas_srv.get();
+			}
 			cvw = mc->clients[s].content_view_w;
 			cvh = mc->clients[s].content_view_h;
 			if (cvw == 0 || cvh == 0) {
@@ -8774,6 +8844,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 								// Release old stereo texture resources
 								c->render.atlas_rtv.reset();
 								c->render.atlas_srv.reset();
+								c->render.atlas_srv_srgb.reset();
 								c->render.atlas_texture.reset();
 
 								// Create new atlas texture
@@ -9429,6 +9500,14 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			if (content_view_w > slot_w) content_view_w = slot_w;
 			if (content_view_h > slot_h) content_view_h = slot_h;
 		}
+
+		// Track whether the bytes the raw-copy just placed in the atlas are
+		// gamma-encoded (SRGB swapchain) or linear (UNORM swapchain).
+		// multi_compositor_render uses this to pick atlas_srv vs
+		// atlas_srv_srgb when sampling, so the DP receives linear bytes
+		// regardless of the source swapchain's color-space. Eyes within a
+		// projection layer share a swapchain format in practice; pick view 0.
+		c->atlas_holds_srgb_bytes = view_is_srgb[0];
 
 		// Store content dims on multi-comp slot for multi_compositor_render
 		if (sys->shell_mode && sys->multi_comp != nullptr) {
