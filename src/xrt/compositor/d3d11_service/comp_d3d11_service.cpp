@@ -648,10 +648,6 @@ struct d3d11_multi_client_slot
 	//! True when this window was auto-minimized by another window's fullscreen toggle.
 	bool fullscreen_minimized;
 
-	//! Diag-1 (bridge-aware color shift): one-shot per-slot DXGI_FORMAT dump
-	//! of the multi-comp chain on first render. Reset on slot (re)activation.
-	bool diag_format_dumped;
-
 	//! App name for title bar display (from HWND title or fallback).
 	char app_name[128];
 
@@ -3765,7 +3761,6 @@ multi_compositor_register_client(struct d3d11_service_system *sys, struct d3d11_
 			mc->clients[i].compositor = c;
 			mc->clients[i].client_type = CLIENT_TYPE_IPC;
 			mc->clients[i].active = true;
-			mc->clients[i].diag_format_dumped = false;
 
 			// Count active clients to determine grid position
 			int active_count = 0;
@@ -3995,7 +3990,6 @@ multi_compositor_add_capture_client(struct d3d11_service_system *sys, HWND hwnd,
 			mc->clients[i].capture_height = 0;
 			mc->clients[i].app_hwnd = hwnd;
 			mc->clients[i].active = true;
-			mc->clients[i].diag_format_dumped = false;
 			mc->clients[i].minimized = false;
 			mc->clients[i].maximized = false;
 			mc->clients[i].hwnd_resize_pending = false;
@@ -7022,53 +7016,6 @@ after_key_shortcuts:
 			struct d3d11_service_compositor *cc = mc->clients[s].compositor;
 			if (cc == nullptr || !cc->render.atlas_texture || !cc->render.atlas_srv) {
 				continue;
-			}
-
-			// Diag-1: one-shot per-slot DXGI_FORMAT dump of the multi-comp
-			// chain. Compares per-client atlas typing across bridge-aware vs
-			// legacy IPC clients to localize the bridge-aware color shift in
-			// shell mode. No behavior change. The IPC blit binds
-			// `convert_srgb=0.0` (passthrough) at the call-site below; if any
-			// surface is SRGB-typed unexpectedly, the GPU will (de)gamma at
-			// sample/write and produce one extra encode net.
-			if (!mc->clients[s].diag_format_dumped) {
-				mc->clients[s].diag_format_dumped = true;
-
-				D3D11_TEXTURE2D_DESC pca_desc = {};
-				cc->render.atlas_texture->GetDesc(&pca_desc);
-				D3D11_SHADER_RESOURCE_VIEW_DESC pca_srv_desc = {};
-				cc->render.atlas_srv->GetDesc(&pca_srv_desc);
-
-				D3D11_TEXTURE2D_DESC ca_desc = {};
-				if (mc->combined_atlas) mc->combined_atlas->GetDesc(&ca_desc);
-				D3D11_SHADER_RESOURCE_VIEW_DESC ca_srv_desc = {};
-				if (mc->combined_atlas_srv) mc->combined_atlas_srv->GetDesc(&ca_srv_desc);
-				D3D11_RENDER_TARGET_VIEW_DESC ca_rtv_desc = {};
-				if (mc->combined_atlas_rtv) mc->combined_atlas_rtv->GetDesc(&ca_rtv_desc);
-
-				D3D11_TEXTURE2D_DESC crop_desc = {};
-				D3D11_SHADER_RESOURCE_VIEW_DESC crop_srv_desc = {};
-				if (mc->crop_texture) mc->crop_texture->GetDesc(&crop_desc);
-				if (mc->crop_srv) mc->crop_srv->GetDesc(&crop_srv_desc);
-
-				U_LOG_W("DIAG-1 multi-comp formats: slot=%d bridge_relay=%s "
-				        "flip_y=%s | per_client_atlas tex_fmt=%u srv_fmt=%u "
-				        "(%ux%u) | combined_atlas tex_fmt=%u srv_fmt=%u "
-				        "rtv_fmt=%u (%ux%u) | crop tex_fmt=%u srv_fmt=%u "
-				        "(%ux%u) | ipc_blit convert_srgb=0.0",
-				        s,
-				        cc->is_bridge_relay ? "yes" : "no",
-				        cc->atlas_flip_y ? "yes" : "no",
-				        (unsigned)pca_desc.Format,
-				        (unsigned)pca_srv_desc.Format,
-				        pca_desc.Width, pca_desc.Height,
-				        (unsigned)ca_desc.Format,
-				        (unsigned)ca_srv_desc.Format,
-				        (unsigned)ca_rtv_desc.Format,
-				        ca_desc.Width, ca_desc.Height,
-				        (unsigned)crop_desc.Format,
-				        (unsigned)crop_srv_desc.Format,
-				        crop_desc.Width, crop_desc.Height);
 			}
 
 			// Pick UNORM vs SRGB-typed SRV onto the per-client atlas
