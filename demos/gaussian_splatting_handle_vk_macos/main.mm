@@ -43,6 +43,9 @@
 
 #include <dlfcn.h>
 #include <mach-o/dyld.h>
+
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
 #include <unistd.h>
 #include <libgen.h>
 #include <sys/stat.h>
@@ -123,6 +126,12 @@ struct InputState {
     // Drag-and-drop / pending file load
     std::string pendingLoadPath;
 
+    // 'I' key: capture the rendered atlas region (cols × rows × renderW × renderH)
+    // of the swapchain to <scene>_<cols>x<rows>.png in the working directory.
+    // Skipped for 1×1 (mono) layouts. Useful for grabbing the SBS image
+    // intended for shell launcher icons / 3D thumbnails.
+    bool captureAtlasRequested = false;
+
     // Unified rendering mode (V key cycles, 0-8 keys select directly)
     uint32_t currentRenderingMode = 1;   // Default: mode 1 (first 3D mode)
     uint32_t renderingModeCount = 0;     // Set from xrEnumerateDisplayRenderingModesEXT
@@ -153,6 +162,7 @@ static bool  g_fitValid     = false;
 static volatile bool g_running = true;
 static NSWindow *g_window = nil;
 static NSView *g_metalView = nil;
+static NSView *g_flashView = nil;  // white overlay for capture-success flash
 static InputState g_input;
 static const float CAMERA_HALF_TAN_VFOV = 0.32491969623f;
 
@@ -172,6 +182,226 @@ static uint64_t g_frameCount = 0;
 static float g_hudUpdateTimer = 0.0f;
 static uint32_t g_renderW = 0, g_renderH = 0;
 static uint32_t g_windowW = 0, g_windowH = 0;
+
+// ============================================================================
+// Atlas capture — read back a region of the swapchain image and write a PNG.
+// Used by the 'I' key to dump the multi-view atlas (e.g. SBS for stereo) for
+// shell launcher icons / 3D thumbnails.
+// ============================================================================
+
+// Strip extension from a filename ("butterfly.spz" → "butterfly").
+static std::string SceneStem(const std::string& name) {
+    auto dot = name.find_last_of('.');
+    return (dot == std::string::npos) ? name : name.substr(0, dot);
+}
+
+// Find the next capture number for (stem, cols, rows) in `dir`. Scans for
+// files matching "<stem>-<N>_<cols>x<rows>.png" and returns max(N)+1, or 1
+// if no matches. Lets users accumulate captures without overwriting.
+static int NextCaptureNum(const std::string& dir, const std::string& stem,
+                          uint32_t cols, uint32_t rows) {
+    char suffixBuf[64];
+    snprintf(suffixBuf, sizeof(suffixBuf), "_%ux%u.png", cols, rows);
+    std::string prefix = stem + "-";
+    std::string suffix = suffixBuf;
+    int maxNum = 0;
+    NSError *err = nil;
+    NSString *dirNs = [NSString stringWithUTF8String:dir.c_str()];
+    NSArray<NSString *> *files = [[NSFileManager defaultManager]
+        contentsOfDirectoryAtPath:dirNs error:&err];
+    if (err != nil || files == nil) return 1;
+    for (NSString *f in files) {
+        std::string fname = [f UTF8String];
+        if (fname.size() <= prefix.size() + suffix.size()) continue;
+        if (fname.compare(0, prefix.size(), prefix) != 0) continue;
+        size_t suffixStart = fname.size() - suffix.size();
+        if (fname.compare(suffixStart, suffix.size(), suffix) != 0) continue;
+        std::string numStr = fname.substr(prefix.size(),
+                                          suffixStart - prefix.size());
+        if (numStr.empty()) continue;
+        bool allDigits = true;
+        for (char c : numStr) { if (!isdigit((unsigned char)c)) { allDigits = false; break; } }
+        if (!allDigits) continue;
+        int n = std::atoi(numStr.c_str());
+        if (n > maxNum) maxNum = n;
+    }
+    return maxNum + 1;
+}
+
+// Standard capture folder: ~/Pictures/DisplayXR/ on macOS, %USERPROFILE%\Pictures\DisplayXR\
+// on Windows. Created if missing. Returns empty string on failure.
+static std::string DisplayXrPicturesDir() {
+    NSArray<NSString *> *picsArr = NSSearchPathForDirectoriesInDomains(
+        NSPicturesDirectory, NSUserDomainMask, YES);
+    NSString *pics = [picsArr firstObject];
+    if (pics == nil) return "";
+    NSString *dxrDir = [pics stringByAppendingPathComponent:@"DisplayXR"];
+    NSError *err = nil;
+    [[NSFileManager defaultManager] createDirectoryAtPath:dxrDir
+                              withIntermediateDirectories:YES
+                                               attributes:nil
+                                                    error:&err];
+    if (err != nil) {
+        LOG_WARN("Pictures/DisplayXR creation failed: %s",
+                 [[err localizedDescription] UTF8String]);
+        return "";
+    }
+    return [dxrDir UTF8String];
+}
+
+// Brief white flash overlay to confirm capture. Sized to the window content
+// view; fades from alpha 1 → 0 over ~250 ms.
+static void TriggerCaptureFlash() {
+    if (g_metalView == nil) return;
+    if (g_flashView == nil) {
+        g_flashView = [[NSView alloc] initWithFrame:[g_metalView bounds]];
+        [g_flashView setWantsLayer:YES];
+        g_flashView.layer.backgroundColor = [[NSColor whiteColor] CGColor];
+        [g_flashView setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
+        [g_metalView addSubview:g_flashView];
+    } else {
+        [g_flashView setFrame:[g_metalView bounds]];
+        [g_metalView addSubview:g_flashView positioned:NSWindowAbove relativeTo:nil];
+    }
+    g_flashView.alphaValue = 1.0;
+    [NSAnimationContext runAnimationGroup:^(NSAnimationContext *ctx) {
+        ctx.duration = 0.25;
+        ctx.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
+        g_flashView.animator.alphaValue = 0.0;
+    } completionHandler:^{
+        g_flashView.alphaValue = 0.0;
+    }];
+}
+
+// Copy a sub-rect of `srcImage` into a host-visible staging buffer, swap BGRA
+// → RGBA, and write it as a PNG. Caller passes a sane region (already inside
+// the swapchain image bounds). Blocks on queue idle for simplicity — this is
+// a one-shot user action, not a per-frame path.
+static bool CaptureAtlasRegion(VkDevice device, VkPhysicalDevice physDev,
+                               VkQueue queue, VkCommandPool cmdPool,
+                               VkImage srcImage, VkFormat srcFormat,
+                               uint32_t srcImageWidth, uint32_t srcImageHeight,
+                               uint32_t rectX, uint32_t rectY,
+                               uint32_t rectW, uint32_t rectH,
+                               const std::string& outPath)
+{
+    if (rectW == 0 || rectH == 0) return false;
+
+    // Create staging buffer (host-visible, 4 bytes/pixel RGBA-ish).
+    VkDeviceSize bufBytes = (VkDeviceSize)rectW * rectH * 4;
+    VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = bufBytes;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VkBuffer stagingBuf;
+    if (vkCreateBuffer(device, &bci, nullptr, &stagingBuf) != VK_SUCCESS) {
+        LOG_WARN("capture: vkCreateBuffer failed");
+        return false;
+    }
+    VkMemoryRequirements memReq;
+    vkGetBufferMemoryRequirements(device, stagingBuf, &memReq);
+    VkPhysicalDeviceMemoryProperties memProps;
+    vkGetPhysicalDeviceMemoryProperties(physDev, &memProps);
+    uint32_t memType = UINT32_MAX;
+    VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    for (uint32_t i = 0; i < memProps.memoryTypeCount; i++) {
+        if ((memReq.memoryTypeBits & (1u << i)) &&
+            (memProps.memoryTypes[i].propertyFlags & want) == want) {
+            memType = i; break;
+        }
+    }
+    if (memType == UINT32_MAX) {
+        vkDestroyBuffer(device, stagingBuf, nullptr);
+        LOG_WARN("capture: no host-visible memory type"); return false;
+    }
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = memReq.size;
+    ai.memoryTypeIndex = memType;
+    VkDeviceMemory stagingMem;
+    if (vkAllocateMemory(device, &ai, nullptr, &stagingMem) != VK_SUCCESS) {
+        vkDestroyBuffer(device, stagingBuf, nullptr);
+        LOG_WARN("capture: vkAllocateMemory failed"); return false;
+    }
+    vkBindBufferMemory(device, stagingBuf, stagingMem, 0);
+
+    // Record + submit: transition image to TRANSFER_SRC, copy, transition back.
+    VkCommandBufferAllocateInfo cba = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cba.commandPool = cmdPool;
+    cba.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cba.commandBufferCount = 1;
+    VkCommandBuffer cmd;
+    vkAllocateCommandBuffers(device, &cba, &cmd);
+    VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &bi);
+
+    VkImageMemoryBarrier toSrc = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    toSrc.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    toSrc.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    toSrc.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    toSrc.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    toSrc.image = srcImage;
+    toSrc.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    toSrc.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toSrc.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toSrc);
+
+    VkBufferImageCopy region = {};
+    region.bufferOffset = 0;
+    region.bufferRowLength = 0;
+    region.bufferImageHeight = 0;
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageOffset = {(int32_t)rectX, (int32_t)rectY, 0};
+    region.imageExtent = {rectW, rectH, 1};
+    vkCmdCopyImageToBuffer(cmd, srcImage,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, stagingBuf, 1, &region);
+
+    VkImageMemoryBarrier toAtt = toSrc;
+    toAtt.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    toAtt.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    toAtt.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    toAtt.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &toAtt);
+
+    vkEndCommandBuffer(cmd);
+    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
+    vkQueueWaitIdle(queue);
+    vkFreeCommandBuffers(device, cmdPool, 1, &cmd);
+
+    // Map and copy out, swapping BGRA→RGBA if needed.
+    void* mapped = nullptr;
+    vkMapMemory(device, stagingMem, 0, bufBytes, 0, &mapped);
+    std::vector<uint8_t> rgba((size_t)bufBytes);
+    memcpy(rgba.data(), mapped, (size_t)bufBytes);
+    vkUnmapMemory(device, stagingMem);
+
+    bool isBgr = (srcFormat == VK_FORMAT_B8G8R8A8_UNORM ||
+                  srcFormat == VK_FORMAT_B8G8R8A8_SRGB);
+    if (isBgr) {
+        for (size_t i = 0; i < rgba.size(); i += 4) {
+            std::swap(rgba[i + 0], rgba[i + 2]);
+        }
+    }
+
+    int ok = stbi_write_png(outPath.c_str(), (int)rectW, (int)rectH, 4,
+                            rgba.data(), (int)rectW * 4);
+    vkDestroyBuffer(device, stagingBuf, nullptr);
+    vkFreeMemory(device, stagingMem, nullptr);
+    if (!ok) {
+        LOG_WARN("capture: stbi_write_png failed for %s", outPath.c_str());
+        return false;
+    }
+    LOG_INFO("Captured atlas %ux%u → %s", rectW, rectH, outPath.c_str());
+    return true;
+}
 
 // ============================================================================
 // Inline math — column-major float[16] matrices
@@ -603,6 +833,9 @@ static void OpenLoadDialog() {
             break;
         case 'c': case 'C':
             g_input.cameraMode = !g_input.cameraMode;
+            break;
+        case 'i': case 'I':
+            g_input.captureAtlasRequested = true;
             break;
         case 't': case 'T':
             g_input.eyeTrackingModeToggleRequested = true;
@@ -1926,6 +2159,48 @@ int main() {
                                 RenderPlaceholder(vkDevice, graphicsQueue, cmdPool,
                                     targetImage, xr.swapchain.width, xr.swapchain.height,
                                     g_input.yaw, g_input.pitch);
+                            }
+
+                            // 'I' key: snapshot the multi-view atlas to a PNG.
+                            // Atlas region = (tileColumns × renderW, tileRows × renderH)
+                            // anchored at the swapchain's top-left. Skipped for
+                            // 1×1 (mono) since there's nothing interesting to dump.
+                            if (g_input.captureAtlasRequested) {
+                                g_input.captureAtlasRequested = false;
+                                if (display3D && tileColumns > 0 && tileRows > 0 &&
+                                    !(tileColumns == 1 && tileRows == 1) &&
+                                    g_gsRenderer.hasScene()) {
+                                    uint32_t atlasW = tileColumns * renderW;
+                                    uint32_t atlasH = tileRows * renderH;
+                                    if (atlasW <= xr.swapchain.width && atlasH <= xr.swapchain.height) {
+                                        std::string stem = SceneStem(g_loadedFileName);
+                                        if (stem.empty()) stem = "scene";
+                                        std::string dir = DisplayXrPicturesDir();
+                                        int n = NextCaptureNum(dir, stem,
+                                                               tileColumns, tileRows);
+                                        char tail[256];
+                                        snprintf(tail, sizeof(tail), "%s-%d_%ux%u.png",
+                                                 stem.c_str(), n,
+                                                 tileColumns, tileRows);
+                                        std::string outPath = dir.empty() ? std::string(tail)
+                                                                          : (dir + "/" + tail);
+                                        bool ok = CaptureAtlasRegion(
+                                            vkDevice, physDevice, graphicsQueue, cmdPool,
+                                            targetImage, swapFormat,
+                                            xr.swapchain.width, xr.swapchain.height,
+                                            0, 0, atlasW, atlasH, outPath);
+                                        if (ok) {
+                                            dispatch_async(dispatch_get_main_queue(), ^{
+                                                TriggerCaptureFlash();
+                                            });
+                                        }
+                                    }
+                                } else {
+                                    LOG_WARN("Capture skipped: need 3D mode + loaded scene "
+                                             "(currently mode tiles=%ux%u, scene=%s)",
+                                             tileColumns, tileRows,
+                                             g_gsRenderer.hasScene() ? "loaded" : "none");
+                                }
                             }
 
                             ReleaseSwapchainImage(xr);

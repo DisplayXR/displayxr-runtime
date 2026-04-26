@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "name": "Gaussian Splat Viewer",
+  "type": "3d",
+  "category": "demo",
+  "display_mode": "auto",
+  "description": "Interactive viewer for 3D Gaussian Splatting scenes (.spz / .ply). Drag-and-drop a scene or press L to load. Bundled with a butterfly demo scene.",
+  "icon": "icon.png",
+  "icon_3d": "icon_sbs.png",
+  "icon_3d_layout": "sbs-lr"
+}

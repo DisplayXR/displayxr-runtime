@@ -139,3 +139,9 @@ if(EXISTS "${BUNDLED_SCENE}")
         COMMENT "Copying bundled butterfly.spz next to exe"
     )
 endif()
+
+# DisplayXR shell manifest sidecar — copied next to the exe so the shell
+# launcher can discover this demo and show it in the apps list.
+include(${CMAKE_CURRENT_SOURCE_DIR}/../../test_apps/common/displayxr_manifest.cmake)
+displayxr_install_manifest(gaussian_splatting_handle_vk_win
+    "${CMAKE_CURRENT_SOURCE_DIR}/displayxr")
