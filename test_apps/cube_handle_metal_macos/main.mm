@@ -40,6 +40,7 @@
 #include "display3d_view.h"
 #include "camera3d_view.h"
 #include "view_params.h"
+#include "atlas_capture.h"
 #include <openxr/XR_EXT_display_info.h>
 
 // ============================================================================
@@ -730,6 +731,9 @@ struct InputState {
     bool renderingModeChangeRequested = false;
     bool cameraMode = false;
     float nominalViewerZ = 0.5f;
+    // 'I' key: snapshot the rendered atlas (cols × rows × renderW × renderH)
+    // to ~/Pictures/DisplayXR/<app>-<N>_<cols>x<rows>.png. Skipped for 1×1.
+    bool captureAtlasRequested = false;
 };
 static InputState g_input;
 static const float CAMERA_HALF_TAN_VFOV = 0.32491969623f; // tan(18deg) -> 36deg vFOV
@@ -937,6 +941,9 @@ static void PumpMacOSEvents()
                             g_input.currentRenderingMode = (g_input.currentRenderingMode + 1) % g_input.renderingModeCount;
                         }
                         g_input.renderingModeChangeRequested = true;
+                    }
+                    else if ((ch == 'i' || ch == 'I') && !isRepeat) {
+                        g_input.captureAtlasRequested = true;
                     }
                     else if (ch == 'c' && !isRepeat) {
                         g_input.cameraMode = !g_input.cameraMode;
@@ -1746,6 +1753,33 @@ int main(int argc, char **argv)
             }
 
             RenderScene(renderer, app.swapchain.images[imageIndex], eyeParams.data(), eyeCount);
+
+            // 'I' key: snapshot the multi-view atlas to a PNG. Skipped for
+            // mono (1×1) layouts. Filename auto-increments per (cols×rows)
+            // so existing captures aren't overwritten.
+            if (g_input.captureAtlasRequested) {
+                g_input.captureAtlasRequested = false;
+                if (display3D && (tileColumns > 1 || tileRows > 1)) {
+                    uint32_t atlasW = tileColumns * renderW;
+                    uint32_t atlasH = tileRows * renderH;
+                    if (atlasW <= app.swapchain.width && atlasH <= app.swapchain.height) {
+                        std::string outPath = dxr_capture::MakeCapturePath(
+                            "cube_handle_metal_macos", tileColumns, tileRows);
+                        bool ok = dxr_capture::CaptureAtlasRegionMetal(
+                            (__bridge void*)renderer.device,
+                            (__bridge void*)renderer.commandQueue,
+                            (__bridge void*)app.swapchain.images[imageIndex],
+                            0, 0, atlasW, atlasH, outPath);
+                        if (ok) {
+                            LOG_INFO("Captured atlas %ux%u -> %s",
+                                     atlasW, atlasH, outPath.c_str());
+                            dxr_capture::TriggerCaptureFlash((__bridge void*)g_metalView);
+                        }
+                    }
+                } else {
+                    LOG_WARN("Capture skipped: need 3D mode with cols/rows > 1");
+                }
+            }
         }
 
         // Release swapchain image

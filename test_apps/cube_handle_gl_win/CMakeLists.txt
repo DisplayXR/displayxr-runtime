@@ -78,6 +78,8 @@ add_executable(cube_handle_gl_win WIN32
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/hud_renderer.h
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/text_overlay.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/text_overlay.h
+    # 'I' key atlas capture: GL readback (filename + flash come via sr_common_base)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../common/atlas_capture_gl.cpp
     resource.rc
 )
 

@@ -212,6 +212,11 @@ bool UpdateInputState(InputState& state, UINT msg, WPARAM wParam, LPARAM lParam)
             }
             state.renderingModeChangeRequested = true;
             break;
+        case 'I':
+            // Snapshot the multi-view atlas to a PNG. Render thread
+            // consumes the flag after xrEndFrame.
+            state.captureAtlasRequested = true;
+            break;
         case '0':
             state.currentRenderingMode = 0; // 2D mode
             state.renderingModeChangeRequested = true;

@@ -60,6 +60,9 @@ add_executable(gaussian_splatting_handle_vk_macos
     main.mm
     "${CMAKE_SOURCE_DIR}/../../test_apps/common/display3d_view.c"
     "${CMAKE_SOURCE_DIR}/../../test_apps/common/camera3d_view.c"
+    # 'I' key atlas capture: filename + flash helpers + Vulkan readback
+    "${CMAKE_SOURCE_DIR}/../../test_apps/common/atlas_capture_macos.mm"
+    "${CMAKE_SOURCE_DIR}/../../test_apps/common/atlas_capture_vk.cpp"
 )
 
 target_include_directories(gaussian_splatting_handle_vk_macos PRIVATE

@@ -19,6 +19,7 @@
 #include "hud_renderer.h"
 #include "text_overlay.h"
 #include "display3d_view.h"
+#include "atlas_capture.h"
 
 #include <atomic>
 #include <chrono>
@@ -134,6 +135,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
         break;
+
+    case WM_TIMER:
+        if (wParam == dxr_capture::kFlashTimerId) {
+            dxr_capture::TickCaptureFlash(hwnd);
+            return 0;
+        }
+        break;
+
+    case dxr_capture::kFlashUserMsg:
+        dxr_capture::TriggerCaptureFlash(hwnd);
+        return 0;
     }
 
     return DefWindowProc(hwnd, msg, wParam, lParam);
@@ -492,6 +504,39 @@ static void RenderThreadFunc(
                                     stereoViews[monoMode ? 0 : eye].fov :
                                     (monoMode ? rawViews[0].fov : rawViews[rawIdx].fov);
                             }
+
+                            // 'I' key: snapshot the multi-view atlas. Skipped
+                            // for mono (1×1) layouts. RenderScene leaves the
+                            // texture in D3D12_RESOURCE_STATE_COMMON.
+                            if (inputSnapshot.captureAtlasRequested) {
+                                {
+                                    std::lock_guard<std::mutex> lk(g_inputMutex);
+                                    g_inputState.captureAtlasRequested = false;
+                                }
+                                if (!monoMode && (tileColumns > 1 || tileRows > 1)) {
+                                    uint32_t atlasW = tileColumns * renderW;
+                                    uint32_t atlasH = tileRows * renderH;
+                                    if (atlasW <= xr->swapchain.width && atlasH <= xr->swapchain.height) {
+                                        std::string outPath = dxr_capture::MakeCapturePath(
+                                            APP_NAME, tileColumns, tileRows);
+                                        bool ok = dxr_capture::CaptureAtlasRegionD3D12(
+                                            renderer->device.Get(),
+                                            renderer->commandQueue.Get(),
+                                            swapchainTexture,
+                                            xr->swapchain.width, xr->swapchain.height,
+                                            (int)D3D12_RESOURCE_STATE_COMMON,
+                                            0, 0, atlasW, atlasH, outPath);
+                                        if (ok) {
+                                            LOG_INFO("Captured atlas %ux%u -> %s",
+                                                     atlasW, atlasH, outPath.c_str());
+                                            dxr_capture::PostFlashRequest(hwnd);
+                                        }
+                                    }
+                                } else {
+                                    LOG_INFO("Capture skipped: need 3D mode with cols/rows > 1");
+                                }
+                            }
+
                             ReleaseSwapchainImage(*xr);
                         } else {
                             rendered = false;

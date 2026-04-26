@@ -86,6 +86,11 @@ struct InputState {
     // Eye tracking mode toggle (T key)
     bool eyeTrackingModeToggleRequested = false;
 
+    // 'I' key: snapshot the rendered atlas (cols × rows × renderW × renderH)
+    // to %USERPROFILE%\Pictures\DisplayXR\<app>-<N>_<cols>x<rows>.png. Skipped
+    // for 1×1 (mono) layouts. Filename auto-increments per (cols×rows).
+    bool captureAtlasRequested = false;
+
     // --- Gaussian-splat demo extensions (additive; unused by cube_* apps) ---
 
     // Smooth display-pose transition (double-click focus). When active,
