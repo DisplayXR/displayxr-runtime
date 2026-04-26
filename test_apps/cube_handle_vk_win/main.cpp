@@ -21,6 +21,7 @@
 
 #include "hud_renderer.h"
 #include "text_overlay.h"
+#include "atlas_capture.h"
 
 #include <atomic>
 #include <chrono>
@@ -48,6 +49,12 @@ static InputState g_inputState;
 static std::mutex g_inputMutex;
 static std::atomic<bool> g_running{true};
 static XrSessionManager* g_xr = nullptr;
+
+// Vulkan handles needed for the 'I'-key atlas readback (single-writer in
+// main() before the render thread launches; render thread only reads).
+static VkPhysicalDevice                            g_vkPhysDevice = VK_NULL_HANDLE;
+static const std::vector<XrSwapchainImageVulkanKHR>* g_vkSwapchainImages = nullptr;
+static VkFormat                                    g_vkColorFormat = VK_FORMAT_UNDEFINED;
 static UINT g_windowWidth = 1280;
 static UINT g_windowHeight = 720;
 
@@ -132,6 +139,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
         break;
+
+    case WM_TIMER:
+        if (wParam == dxr_capture::kFlashTimerId) {
+            dxr_capture::TickCaptureFlash(hwnd);
+            return 0;
+        }
+        break;
+
+    case dxr_capture::kFlashUserMsg:
+        dxr_capture::TriggerCaptureFlash(hwnd);
+        return 0;
     }
 
     return DefWindowProc(hwnd, msg, wParam, lParam);
@@ -534,6 +552,39 @@ static void RenderThreadFunc(
                                     stereoViews[monoMode ? 0 : eye].fov :
                                     (monoMode ? rawViews[0].fov : rawViews[eye < (int)viewCount ? eye : 0].fov);
                             }
+
+                            // 'I' key: snapshot the multi-view atlas. Skipped
+                            // for mono (1×1) layouts.
+                            if (inputSnapshot.captureAtlasRequested) {
+                                {
+                                    std::lock_guard<std::mutex> lk(g_inputMutex);
+                                    g_inputState.captureAtlasRequested = false;
+                                }
+                                if (!monoMode && (tileColumns > 1 || tileRows > 1) &&
+                                    g_vkSwapchainImages != nullptr) {
+                                    uint32_t atlasW = tileColumns * renderW;
+                                    uint32_t atlasH = tileRows * renderH;
+                                    if (atlasW <= xr->swapchain.width && atlasH <= xr->swapchain.height) {
+                                        std::string outPath = dxr_capture::MakeCapturePath(
+                                            APP_NAME, tileColumns, tileRows);
+                                        bool ok = dxr_capture::CaptureAtlasRegionVk(
+                                            renderer->device, g_vkPhysDevice,
+                                            renderer->graphicsQueue, renderer->commandPool,
+                                            (*g_vkSwapchainImages)[imageIndex].image,
+                                            (int)g_vkColorFormat,
+                                            xr->swapchain.width, xr->swapchain.height,
+                                            0, 0, atlasW, atlasH, outPath);
+                                        if (ok) {
+                                            LOG_INFO("Captured atlas %ux%u -> %s",
+                                                     atlasW, atlasH, outPath.c_str());
+                                            dxr_capture::PostFlashRequest(hwnd);
+                                        }
+                                    }
+                                } else {
+                                    LOG_INFO("Capture skipped: need 3D mode with cols/rows > 1");
+                                }
+                            }
+
                             LOG_INFO("[FRAME] ReleaseSwapchainImage...");
                             ReleaseSwapchainImage(*xr);
                             LOG_INFO("[FRAME] Released");
@@ -892,6 +943,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     // Initialize Vulkan renderer
     VkFormat colorFormat = (VkFormat)xr.swapchain.format;
+    g_vkPhysDevice = physDevice;
+    g_vkSwapchainImages = &swapchainImages;
+    g_vkColorFormat = colorFormat;
     VkRenderer vkRenderer = {};
     if (!InitializeVkRenderer(vkRenderer, vkDevice, physDevice, graphicsQueue, queueFamilyIndex, colorFormat)) {
         LOG_ERROR("Vulkan renderer initialization failed");

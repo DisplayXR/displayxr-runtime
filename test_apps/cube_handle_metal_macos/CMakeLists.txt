@@ -51,6 +51,9 @@ add_executable(cube_handle_metal_macos
     "${CMAKE_SOURCE_DIR}/../common/display3d_view.c"
     "${CMAKE_SOURCE_DIR}/../common/camera3d_view.c"
     "${CMAKE_SOURCE_DIR}/../common/hud_overlay_macos.m"
+    # 'I' key atlas capture: filename + flash helpers + Metal readback
+    "${CMAKE_SOURCE_DIR}/../common/atlas_capture_macos.mm"
+    "${CMAKE_SOURCE_DIR}/../common/atlas_capture_metal.mm"
 )
 
 target_include_directories(cube_handle_metal_macos PRIVATE

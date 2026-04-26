@@ -21,9 +21,6 @@
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "ole32.lib")
 
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-#include "stb_image_write.h"
-
 #include "logging.h"
 #include "input_handler.h"
 #include "xr_session.h"
@@ -33,6 +30,7 @@
 
 #include "hud_renderer.h"
 #include "text_overlay.h"
+#include "atlas_capture.h"
 
 #include <atomic>
 #include <chrono>
@@ -77,11 +75,8 @@ static GsRenderer g_gsRenderer;
 static std::atomic<bool> g_loadRequested{false};
 // 'I' key: capture the multi-view atlas region (cols × rows × renderW × renderH)
 // of the swapchain to a PNG in %USERPROFILE%\Pictures\DisplayXR\. Skipped for
-// 1×1 (mono) layouts. Ported from the macOS demo.
+// 1×1 (mono) layouts. Helper lives in test_apps/common/atlas_capture*.
 static std::atomic<bool> g_captureAtlasRequested{false};
-static HWND g_flashHwnd = nullptr;
-static int  g_flashAlpha = 0;
-static const UINT_PTR kFlashTimerId = 0xDF1A5;  // arbitrary unique ID
 static std::string g_loadedFileName;
 static std::mutex g_sceneMutex;
 
@@ -182,220 +177,8 @@ static bool IsClickOnLoadButton(int mouseX, int mouseY, int windowW, int windowH
             fy <= LOAD_BTN_Y_FRACTION + LOAD_BTN_HEIGHT_FRACTION);
 }
 
-// ============================================================================
-// Atlas capture helpers (ported from macOS demo)
-// ============================================================================
-
-// White layered popup that briefly overlays the parent's client area, fading
-// from alpha 255 → 0 over ~250 ms. Driven from WindowProc via WM_TIMER so all
-// HWND ops stay on the message-pump thread (the render thread just sets the
-// g_captureFlashRequested flag).
-static void StartCaptureFlash(HWND parent) {
-    if (g_flashHwnd == nullptr) {
-        g_flashHwnd = CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
-            L"STATIC", L"",
-            WS_POPUP,
-            0, 0, 100, 100,
-            parent, nullptr, GetModuleHandle(nullptr), nullptr);
-        if (g_flashHwnd == nullptr) return;
-        // White background brush stays referenced by the class — leak is OK for
-        // a one-of overlay (process lifetime).
-        HBRUSH brush = CreateSolidBrush(RGB(255, 255, 255));
-        SetClassLongPtrW(g_flashHwnd, GCLP_HBRBACKGROUND, (LONG_PTR)brush);
-    }
-    RECT cr; GetClientRect(parent, &cr);
-    POINT pt = {0, 0}; ClientToScreen(parent, &pt);
-    SetWindowPos(g_flashHwnd, HWND_TOPMOST, pt.x, pt.y,
-                 cr.right - cr.left, cr.bottom - cr.top,
-                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    g_flashAlpha = 255;
-    SetLayeredWindowAttributes(g_flashHwnd, 0, (BYTE)g_flashAlpha, LWA_ALPHA);
-    InvalidateRect(g_flashHwnd, nullptr, TRUE);
-    SetTimer(parent, kFlashTimerId, 16, nullptr);  // ~60 Hz fade
-}
-
-// Tick the fade. Called from WindowProc on WM_TIMER.
-static void TickCaptureFlash(HWND parent) {
-    g_flashAlpha -= 18;  // ~14 ticks × 16 ms ≈ 225 ms total
-    if (g_flashAlpha <= 0 || g_flashHwnd == nullptr) {
-        KillTimer(parent, kFlashTimerId);
-        if (g_flashHwnd) ShowWindow(g_flashHwnd, SW_HIDE);
-        return;
-    }
-    SetLayeredWindowAttributes(g_flashHwnd, 0, (BYTE)g_flashAlpha, LWA_ALPHA);
-}
-
-static std::string SceneStem(const std::string& name) {
-    auto dot = name.find_last_of('.');
-    return (dot == std::string::npos) ? name : name.substr(0, dot);
-}
-
-// %USERPROFILE%\Pictures\DisplayXR (created if missing). Empty on failure.
-static std::string DisplayXrPicturesDir() {
-    PWSTR picsW = nullptr;
-    HRESULT hr = SHGetKnownFolderPath(FOLDERID_Pictures, KF_FLAG_CREATE,
-                                      nullptr, &picsW);
-    if (FAILED(hr) || picsW == nullptr) return "";
-    char picsA[MAX_PATH] = {};
-    WideCharToMultiByte(CP_UTF8, 0, picsW, -1, picsA, MAX_PATH, nullptr, nullptr);
-    CoTaskMemFree(picsW);
-    std::string out = std::string(picsA) + "\\DisplayXR";
-    CreateDirectoryA(out.c_str(), nullptr);   // ignore "already exists"
-    return out;
-}
-
-// Find next "<stem>-<N>_<cols>x<rows>.png" in dir; return max(N)+1 (or 1).
-static int NextCaptureNum(const std::string& dir, const std::string& stem,
-                          uint32_t cols, uint32_t rows) {
-    char suffixBuf[64];
-    sprintf_s(suffixBuf, "_%ux%u.png", cols, rows);
-    std::string prefix = stem + "-";
-    std::string suffix = suffixBuf;
-    int maxNum = 0;
-    std::string pattern = dir + "\\" + prefix + "*" + suffix;
-    WIN32_FIND_DATAA fd;
-    HANDLE h = FindFirstFileA(pattern.c_str(), &fd);
-    if (h == INVALID_HANDLE_VALUE) return 1;
-    do {
-        std::string fname = fd.cFileName;
-        if (fname.size() <= prefix.size() + suffix.size()) continue;
-        if (fname.compare(0, prefix.size(), prefix) != 0) continue;
-        size_t suffixStart = fname.size() - suffix.size();
-        if (fname.compare(suffixStart, suffix.size(), suffix) != 0) continue;
-        std::string numStr = fname.substr(prefix.size(), suffixStart - prefix.size());
-        if (numStr.empty()) continue;
-        bool allDigits = true;
-        for (char c : numStr) {
-            if (!isdigit((unsigned char)c)) { allDigits = false; break; }
-        }
-        if (!allDigits) continue;
-        int n = atoi(numStr.c_str());
-        if (n > maxNum) maxNum = n;
-    } while (FindNextFileA(h, &fd));
-    FindClose(h);
-    return maxNum + 1;
-}
-
-// Read back a sub-rect of `srcImage` into a host-visible buffer, swap BGRA→
-// RGBA if needed, and write a PNG via stb_image_write. Blocks on queue idle.
-static bool CaptureAtlasRegion(VkDevice device, VkPhysicalDevice physDev,
-                               VkQueue queue, VkCommandPool cmdPool,
-                               VkImage srcImage, VkFormat srcFormat,
-                               uint32_t srcImageWidth, uint32_t srcImageHeight,
-                               uint32_t rectX, uint32_t rectY,
-                               uint32_t rectW, uint32_t rectH,
-                               const std::string& outPath)
-{
-    if (rectW == 0 || rectH == 0) return false;
-    VkDeviceSize bufBytes = (VkDeviceSize)rectW * rectH * 4;
-
-    VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-    bci.size = bufBytes;
-    bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    VkBuffer stagingBuf;
-    if (vkCreateBuffer(device, &bci, nullptr, &stagingBuf) != VK_SUCCESS) {
-        LOG_WARN("capture: vkCreateBuffer failed"); return false;
-    }
-    VkMemoryRequirements memReq;
-    vkGetBufferMemoryRequirements(device, stagingBuf, &memReq);
-    VkPhysicalDeviceMemoryProperties memProps;
-    vkGetPhysicalDeviceMemoryProperties(physDev, &memProps);
-    uint32_t memType = UINT32_MAX;
-    VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-    for (uint32_t i = 0; i < memProps.memoryTypeCount; i++) {
-        if ((memReq.memoryTypeBits & (1u << i)) &&
-            (memProps.memoryTypes[i].propertyFlags & want) == want) {
-            memType = i; break;
-        }
-    }
-    if (memType == UINT32_MAX) {
-        vkDestroyBuffer(device, stagingBuf, nullptr);
-        LOG_WARN("capture: no host-visible memory type"); return false;
-    }
-    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    ai.allocationSize = memReq.size;
-    ai.memoryTypeIndex = memType;
-    VkDeviceMemory stagingMem;
-    if (vkAllocateMemory(device, &ai, nullptr, &stagingMem) != VK_SUCCESS) {
-        vkDestroyBuffer(device, stagingBuf, nullptr);
-        LOG_WARN("capture: vkAllocateMemory failed"); return false;
-    }
-    vkBindBufferMemory(device, stagingBuf, stagingMem, 0);
-
-    VkCommandBufferAllocateInfo cba = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    cba.commandPool = cmdPool;
-    cba.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cba.commandBufferCount = 1;
-    VkCommandBuffer cmd;
-    vkAllocateCommandBuffers(device, &cba, &cmd);
-    VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &bi);
-
-    VkImageMemoryBarrier toSrc = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    toSrc.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    toSrc.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    toSrc.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    toSrc.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    toSrc.image = srcImage;
-    toSrc.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    toSrc.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    toSrc.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    vkCmdPipelineBarrier(cmd,
-        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toSrc);
-
-    VkBufferImageCopy region = {};
-    region.bufferOffset = 0;
-    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    region.imageOffset = {(int32_t)rectX, (int32_t)rectY, 0};
-    region.imageExtent = {rectW, rectH, 1};
-    vkCmdCopyImageToBuffer(cmd, srcImage,
-        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, stagingBuf, 1, &region);
-
-    VkImageMemoryBarrier toAtt = toSrc;
-    toAtt.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    toAtt.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    toAtt.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    toAtt.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    vkCmdPipelineBarrier(cmd,
-        VK_PIPELINE_STAGE_TRANSFER_BIT,
-        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &toAtt);
-
-    vkEndCommandBuffer(cmd);
-    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &cmd;
-    vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
-    vkQueueWaitIdle(queue);
-    vkFreeCommandBuffers(device, cmdPool, 1, &cmd);
-
-    void* mapped = nullptr;
-    vkMapMemory(device, stagingMem, 0, bufBytes, 0, &mapped);
-    std::vector<uint8_t> rgba((size_t)bufBytes);
-    memcpy(rgba.data(), mapped, (size_t)bufBytes);
-    vkUnmapMemory(device, stagingMem);
-
-    bool isBgr = (srcFormat == VK_FORMAT_B8G8R8A8_UNORM ||
-                  srcFormat == VK_FORMAT_B8G8R8A8_SRGB);
-    if (isBgr) {
-        for (size_t i = 0; i < rgba.size(); i += 4) std::swap(rgba[i + 0], rgba[i + 2]);
-    }
-
-    int ok = stbi_write_png(outPath.c_str(), (int)rectW, (int)rectH, 4,
-                            rgba.data(), (int)rectW * 4);
-    vkDestroyBuffer(device, stagingBuf, nullptr);
-    vkFreeMemory(device, stagingMem, nullptr);
-    if (!ok) {
-        LOG_WARN("capture: stbi_write_png failed for %s", outPath.c_str());
-        return false;
-    }
-    LOG_INFO("Captured atlas %ux%u -> %s", rectW, rectH, outPath.c_str());
-    return true;
-}
+// Atlas capture helpers live in test_apps/common/atlas_capture* — see
+// dxr_capture::CaptureAtlasRegionVk / TriggerCaptureFlash / MakeCapturePath.
 
 // Attempt to auto-load butterfly.spz from next to the exe.
 static void TryAutoLoadBundledScene() {
@@ -482,15 +265,15 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         OpenLoadDialog(hwnd);
         return 0;
 
-    case WM_USER + 2:
+    case dxr_capture::kFlashUserMsg:
         // Render thread requested a capture-flash; start it on this thread
         // (the message-pump thread that owns the HWND).
-        StartCaptureFlash(hwnd);
+        dxr_capture::TriggerCaptureFlash(hwnd);
         return 0;
 
     case WM_TIMER:
-        if (wParam == kFlashTimerId) {
-            TickCaptureFlash(hwnd);
+        if (wParam == dxr_capture::kFlashTimerId) {
+            dxr_capture::TickCaptureFlash(hwnd);
             return 0;
         }
         break;
@@ -1036,25 +819,29 @@ static void RenderThreadFunc(
                                             std::lock_guard<std::mutex> lock(g_sceneMutex);
                                             sceneName = g_loadedFileName;
                                         }
-                                        std::string stem = SceneStem(sceneName);
+                                        // Strip extension from scene filename
+                                        // (e.g. "butterfly.spz" → "butterfly").
+                                        auto dot = sceneName.find_last_of('.');
+                                        std::string stem = (dot == std::string::npos)
+                                            ? sceneName : sceneName.substr(0, dot);
                                         if (stem.empty()) stem = "scene";
-                                        std::string dir = DisplayXrPicturesDir();
-                                        int n = NextCaptureNum(dir, stem, cols, rows);
-                                        char tail[256];
-                                        sprintf_s(tail, "%s-%d_%ux%u.png",
-                                                  stem.c_str(), n, cols, rows);
-                                        std::string outPath = dir.empty() ? std::string(tail)
-                                                              : (dir + "\\" + tail);
-                                        bool ok = CaptureAtlasRegion(
+                                        std::string outPath = dxr_capture::MakeCapturePath(
+                                            stem, cols, rows);
+                                        // GS writes via compute imageStore — bytes are
+                                        // linear even on an sRGB swapchain; tell the helper
+                                        // to mirror the runtime's display-side decode.
+                                        bool ok = dxr_capture::CaptureAtlasRegionVk(
                                             vkDevice, physDevice,
                                             graphicsQueue, renderCmdPool,
-                                            (*swapchainVkImages)[imageIndex], colorFormat,
+                                            (*swapchainVkImages)[imageIndex],
+                                            (int)colorFormat,
                                             xr->swapchain.width, xr->swapchain.height,
-                                            0, 0, atlasW, atlasH, outPath);
+                                            0, 0, atlasW, atlasH, outPath,
+                                            /*linearBytesInSrgbImage=*/true);
                                         if (ok) {
-                                            // Defer flash to message-pump thread so
-                                            // the HWND ops happen on the correct thread.
-                                            PostMessage(hwnd, WM_USER + 2, 0, 0);
+                                            LOG_INFO("Captured atlas %ux%u -> %s",
+                                                     atlasW, atlasH, outPath.c_str());
+                                            dxr_capture::PostFlashRequest(hwnd);
                                         }
                                     }
                                 } else {
