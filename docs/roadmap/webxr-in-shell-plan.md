@@ -1,7 +1,12 @@
 # WebXR-in-Shell Plan
 
 **Branch:** `feature/webxr-in-shell` (off `main` after `#161` is merged)
-**Status:** Not started — plan only.
+**Status:** Stages 0–3 complete. Bridge-aware color shift in shell
+(documented as a Stage 2 follow-up) resolved in commit `48dbdc6b2` —
+see `webxr-bridge-color-shift-plan.md` §Outcome. **Stage 4 (live
+resize during an active session) is the only remaining open item.**
+The qwerty-freeze stack from the Stage 4c agent prompt (commits
+`0be7055f4` → `5ac8e5f2b`) landed before the color fix.
 
 ## Problem
 

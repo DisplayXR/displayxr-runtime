@@ -311,6 +311,16 @@ present whenever shell mode + bridge-aware were tested simultaneously
 should note "bridge-aware color in shell is pre-existing" rather than
 flagging it as a new bug.
 
+**Resolved.** Addressed in commit `48dbdc6b2` (with diag-1 in
+`7c0b7fc1a`). Fix takes a reinterpretation-on-read approach: shell-
+mode per-client atlas storage is now `R8G8B8A8_TYPELESS` with two
+parallel SRVs (UNORM and UNORM_SRGB); `multi_compositor_render`
+selects the SRV based on the source swapchain's color space (tracked
+in a new `atlas_holds_srgb_bytes` per-client flag). The DP now receives
+linear bytes regardless of the source. The same bug was also affecting
+legacy WebXR with SRGB swapchains and is fixed in the same change. See
+`docs/roadmap/webxr-bridge-color-shift-plan.md` §Outcome.
+
 ### Window pose resets on session re-create
 
 User observation during 2c regression sweep: dragging a shell window to
