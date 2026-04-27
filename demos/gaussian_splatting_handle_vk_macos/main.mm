@@ -1192,24 +1192,35 @@ static bool CreateSwapchains(AppXrSession& xr) {
         if (f == VK_FORMAT_B8G8R8A8_UNORM || f == VK_FORMAT_R8G8B8A8_UNORM) selectedFmt = f;
     }
 
-    // Size the swapchain to fit the largest atlas any rendering mode could
-    // produce at the current window. Atlas dims per mode are
-    //   (tile_columns × view_scale_x × window_w) × (tile_rows × view_scale_y × window_h).
-    // Falls back to recommended × (2,1) (legacy SBS sizing) if the runtime
-    // didn't advertise any modes.
+    // Size the swapchain at init from the largest atlas any rendering mode
+    // could produce when the app is running full-screen — atlas dims per
+    // mode are (cols × scaleX × displayPixelW) × (rows × scaleY × displayPixelH).
+    // For sim_display and Leia SR this collapses to the panel resolution
+    // (max(cols × scaleX) ≤ 1 across all their advertised modes). The atlas
+    // the app actually writes per frame is smaller — driven by the live
+    // window size — but the swapchain has to accommodate full-screen so the
+    // app can resize / fullscreen at any time without reallocating. Falls
+    // back to recommended × (2,1) if display info is unavailable.
     uint32_t w = views[0].recommendedImageRectWidth * 2;
     uint32_t h = views[0].recommendedImageRectHeight;
-    if (xr.renderingModeCount > 0 && g_windowW > 0 && g_windowH > 0) {
-        uint32_t maxAtlasW = 0, maxAtlasH = 0;
-        for (uint32_t i = 0; i < xr.renderingModeCount; i++) {
-            uint32_t viewW = (uint32_t)((double)g_windowW * xr.renderingModeScaleX[i]);
-            uint32_t viewH = (uint32_t)((double)g_windowH * xr.renderingModeScaleY[i]);
-            uint32_t aw = xr.renderingModeTileColumns[i] * viewW;
-            uint32_t ah = xr.renderingModeTileRows[i] * viewH;
-            if (aw > maxAtlasW) maxAtlasW = aw;
-            if (ah > maxAtlasH) maxAtlasH = ah;
+    if (xr.displayPixelWidth > 0 && xr.displayPixelHeight > 0) {
+        w = xr.displayPixelWidth;
+        h = xr.displayPixelHeight;
+        if (xr.renderingModeCount > 0) {
+            uint32_t maxAtlasW = 0, maxAtlasH = 0;
+            for (uint32_t i = 0; i < xr.renderingModeCount; i++) {
+                uint32_t aw = (uint32_t)((double)xr.renderingModeTileColumns[i] *
+                                          xr.renderingModeScaleX[i] *
+                                          (double)xr.displayPixelWidth);
+                uint32_t ah = (uint32_t)((double)xr.renderingModeTileRows[i] *
+                                          xr.renderingModeScaleY[i] *
+                                          (double)xr.displayPixelHeight);
+                if (aw > maxAtlasW) maxAtlasW = aw;
+                if (ah > maxAtlasH) maxAtlasH = ah;
+            }
+            if (maxAtlasW > w) w = maxAtlasW;
+            if (maxAtlasH > h) h = maxAtlasH;
         }
-        if (maxAtlasW > 0 && maxAtlasH > 0) { w = maxAtlasW; h = maxAtlasH; }
     }
 
     XrSwapchainCreateInfo sci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
