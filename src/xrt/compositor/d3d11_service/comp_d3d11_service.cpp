@@ -7297,13 +7297,13 @@ after_key_shortcuts:
 			}
 
 			if (show_spinner) {
-				// Loading placeholder: 8 small soft squares
-				// arranged in a ring around the slot center,
-				// one bright (white) and the rest dim (gray),
-				// with the bright index advancing ~4 times
-				// per second (one full revolution every 2s).
-				// Heavy edge_feather makes the small squares
-				// read as fuzzy dots — visually a spinner.
+				// Loading placeholder: 8 small circles arranged
+				// in a ring around the slot center, one bright
+				// (white) and the rest dim (gray), with the
+				// bright index advancing ~4 times per second
+				// (one full revolution every 2s). Circles via
+				// corner_radius=-0.5 + corner_aspect=-1.0 (all
+				// four corners rounded to half the quad height).
 				float slot_cx = dest_px_x + dest_px_w * 0.5f;
 				float slot_cy = dest_px_y + dest_px_h * 0.5f;
 				// Sized so the spinner reads at full-slot scale —
@@ -7392,11 +7392,12 @@ after_key_shortcuts:
 					cb->dst_offset[1] = dy;
 					cb->dst_rect_wh[0] = dot_size;
 					cb->dst_rect_wh[1] = dot_size;
-					cb->corner_radius = 0.0f;
-					cb->corner_aspect = 0.0f;
-					// Heavy feather softens the square
-					// edges into a fuzzy circular dot.
-					cb->edge_feather = 0.45f;
+					// All-four-corners rounded → full circle.
+					cb->corner_radius = -0.5f;
+					cb->corner_aspect = -1.0f;
+					// Light feather just for edge AA on the
+					// circle, no longer simulating a soft dot.
+					cb->edge_feather = 0.08f;
 					cb->glow_intensity = 0.0f;
 					sys->context->Unmap(
 					    sys->blit_constant_buffer.get(), 0);
