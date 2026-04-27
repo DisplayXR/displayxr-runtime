@@ -5,5 +5,7 @@
   "category": "test",
   "display_mode": "auto",
   "description": "Reference spinning cube demonstrating XR_EXT_win32_window_binding on Direct3D 12.",
-  "icon": "icon.png"
+  "icon": "icon.png",
+  "icon_3d": "icon_sbs.png",
+  "icon_3d_layout": "sbs-lr"
 }

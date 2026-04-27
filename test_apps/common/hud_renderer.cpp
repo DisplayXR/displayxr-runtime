@@ -93,7 +93,8 @@ const void* RenderHudAndMap(HudRenderer& hud, uint32_t* rowPitch,
     const std::wstring& eyeText,
     const std::wstring& cameraText,
     const std::wstring& stereoText,
-    const std::wstring& helpText)
+    const std::wstring& helpText,
+    const std::vector<HudButton>& buttons)
 {
     // Clear render texture with semi-transparent black
     ID3D11RenderTargetView* rtv = nullptr;
@@ -133,6 +134,12 @@ const void* RenderHudAndMap(HudRenderer& hud, uint32_t* rowPitch,
         RenderText(hud.overlay, hud.device.Get(), hud.renderTex.Get(),
             s.text, px, y, tw, h, s.isSmall);
         y += h + gap;
+    }
+
+    // Buttons drawn last so they sit on top of the text sections.
+    for (const auto& b : buttons) {
+        RenderButton(hud.overlay, hud.device.Get(), hud.renderTex.Get(),
+            b.label, b.x, b.y, b.width, b.height, b.hovered, /*useSmallFont=*/true);
     }
 
     // Copy render texture to staging texture, then map for CPU read

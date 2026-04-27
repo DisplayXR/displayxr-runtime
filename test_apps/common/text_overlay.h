@@ -47,6 +47,19 @@ void RenderText(
     bool useSmallFont = false
 );
 
+// Render a filled button (rounded rectangle + centered label) at the given
+// pixel rect. Used by the GS demo's HUD top-bar to draw "Open…" / "Mode: ...".
+void RenderButton(
+    TextOverlay& overlay,
+    ID3D11Device* device,
+    ID3D11Texture2D* texture,
+    const std::wstring& label,
+    float x, float y,
+    float width, float height,
+    bool hovered = false,
+    bool useSmallFont = true
+);
+
 // Helper to format various overlay texts
 std::wstring FormatSessionState(int state);
 std::wstring FormatPerformanceInfo(float fps, float frameTimeMs, uint32_t renderW, uint32_t renderH, uint32_t windowW = 0, uint32_t windowH = 0);

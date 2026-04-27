@@ -106,8 +106,16 @@ target_link_libraries(gaussian_splatting_handle_vk_win PRIVATE
 )
 
 if(MSVC)
+    # Copy manifest to build dir and reference by basename so the linker doesn't
+    # see the absolute source path. Same pattern as test_apps/cube_handle_vk_win:
+    # link.exe splits unquoted /MANIFESTINPUT: on spaces (e.g. "Sparks i7 3080"),
+    # which causes LNK1181 "cannot open input file 'i7.obj'".
+    configure_file(
+        "${CMAKE_CURRENT_SOURCE_DIR}/sr_3dgs_openxr_ext_vk.manifest"
+        "${CMAKE_CURRENT_BINARY_DIR}/sr_3dgs_openxr_ext_vk.manifest"
+        COPYONLY)
     set_target_properties(gaussian_splatting_handle_vk_win PROPERTIES
-        LINK_FLAGS "/MANIFEST:EMBED /MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/sr_3dgs_openxr_ext_vk.manifest"
+        LINK_FLAGS "/MANIFEST:EMBED /MANIFESTINPUT:sr_3dgs_openxr_ext_vk.manifest"
     )
 endif()
 

@@ -833,6 +833,17 @@ void GsRenderer::updateUniforms(const float viewMatrix[16], const float projMatr
         }
     }
 
+    // Negate row 1 (Y output) of proj_mat so this Vulkan-compute renderer
+    // matches the +Y-up convention the rest of the pipeline uses. Without
+    // this, world +Y projects to high pixel.y (bottom of swapchain image)
+    // because the compute shader writes via ndc2Pix(ndc.y) and Vulkan has
+    // no graphics-pipeline viewport flip available. Equivalent to the
+    // negative-VkViewport.height trick used by cube_handle_vk_{win,macos}.
+    ub.proj_mat[1]  = -ub.proj_mat[1];
+    ub.proj_mat[5]  = -ub.proj_mat[5];
+    ub.proj_mat[9]  = -ub.proj_mat[9];
+    ub.proj_mat[13] = -ub.proj_mat[13];
+
     // view_mat = viewMatrix with Z row negated (make positive Z = forward)
     // This is needed because the shader's Jacobian and near-plane test assume
     // positive Z for objects in front of the camera.

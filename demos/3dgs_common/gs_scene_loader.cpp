@@ -86,10 +86,15 @@ bool ParsePlyFile(const std::string& path, std::vector<GsVertex>& vertices)
         const PlyVertexStorage& s = storage[i];
         GsVertex& v = vertices[i];
 
-        // Position (w=1)
-        v.position[0] = s.x;
-        v.position[1] = s.y;
-        v.position[2] = s.z;
+        // gsplat-trainer PLY: RDF (Y-down, Z-forward) plus an X-mirror vs
+        // SuperSplat reference. Convert to canonical RUB (+X right, +Y up,
+        // +Z back) at load so the renderer / app code can stay in one
+        // consistent +Y-up convention end-to-end. Without this, runtime
+        // view-stage flips would have to compensate (and that pattern caused
+        // the eye-Y / click-NDC / teleport-target Y inconsistencies).
+        v.position[0] = -s.x;   // undo X-mirror
+        v.position[1] = -s.y;   // RDF Y-down → canonical Y-up
+        v.position[2] = -s.z;   // RDF Z-forward → canonical Z-back
         v.position[3] = 1.0f;
 
         // Scale: exp(raw), Opacity: sigmoid(raw)
@@ -105,10 +110,17 @@ bool ParsePlyFile(const std::string& path, std::vector<GsVertex>& vertices)
             float inv = 1.0f / qlen;
             qw *= inv; qx *= inv; qy *= inv; qz *= inv;
         }
+        // Quaternion under the (-X, -Y, -Z) coord-flip composition:
+        // for q = (w, x, y, z), the rotation conjugated by the -I sign flip
+        // on the imaginary axes leaves the imaginary part unchanged in a
+        // pure 180-about-anything sense; but here we're flipping all three
+        // axes, which is equivalent to negating w (or equivalently the
+        // double-cover identity gives same rotation). Empirically this
+        // pattern matches the position transform for the X+Y+Z mirror:
         v.rotation[0] = qw;  // w first (matches shader convention: q.x = w)
-        v.rotation[1] = qx;
-        v.rotation[2] = qy;
-        v.rotation[3] = qz;
+        v.rotation[1] = -qx;
+        v.rotation[2] =  qy;
+        v.rotation[3] = -qz;
 
         // SH coefficients: de-interleave from PLY layout to GPU layout.
         // PLY:  [R_dc, G_dc, B_dc, R_1..R_15, G_1..G_15, B_1..B_15]

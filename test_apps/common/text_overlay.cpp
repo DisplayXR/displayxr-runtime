@@ -158,6 +158,66 @@ void RenderText(
     d2dRenderTarget->EndDraw();
 }
 
+void RenderButton(
+    TextOverlay& overlay,
+    ID3D11Device* device,
+    ID3D11Texture2D* texture,
+    const std::wstring& label,
+    float x, float y,
+    float width, float height,
+    bool hovered,
+    bool useSmallFont
+) {
+    if (!overlay.initialized || !texture || !device) return;
+
+    ComPtr<ID3D11DeviceContext> context;
+    device->GetImmediateContext(&context);
+    if (context) context->Flush();
+
+    ComPtr<IDXGISurface> surface;
+    if (FAILED(texture->QueryInterface(IID_PPV_ARGS(&surface)))) return;
+
+    D2D1_RENDER_TARGET_PROPERTIES rtProps = D2D1::RenderTargetProperties(
+        D2D1_RENDER_TARGET_TYPE_DEFAULT,
+        D2D1::PixelFormat(DXGI_FORMAT_UNKNOWN, D2D1_ALPHA_MODE_PREMULTIPLIED));
+
+    ComPtr<ID2D1RenderTarget> rt;
+    if (FAILED(overlay.d2dFactory->CreateDxgiSurfaceRenderTarget(surface.Get(), &rtProps, &rt))) return;
+
+    // Glassy fill — translucent so the rendered scene shows through, like
+    // the macOS NSVisualEffectMaterialHUDWindow backdrop. Brighter when hovered.
+    D2D1_COLOR_F fill = hovered
+        ? D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.35f)
+        : D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.55f);
+    D2D1_COLOR_F stroke = D2D1::ColorF(1.0f, 1.0f, 1.0f, 0.25f);
+    D2D1_COLOR_F textColor = D2D1::ColorF(D2D1::ColorF::White);
+
+    ComPtr<ID2D1SolidColorBrush> fillBrush, strokeBrush, textBrush;
+    if (FAILED(rt->CreateSolidColorBrush(fill, &fillBrush))) return;
+    if (FAILED(rt->CreateSolidColorBrush(stroke, &strokeBrush))) return;
+    if (FAILED(rt->CreateSolidColorBrush(textColor, &textBrush))) return;
+
+    rt->BeginDraw();
+    D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(
+        D2D1::RectF(x, y, x + width, y + height),
+        6.0f, 6.0f);
+    rt->FillRoundedRectangle(rr, fillBrush.Get());
+    rt->DrawRoundedRectangle(rr, strokeBrush.Get(), 1.0f);
+
+    // Centered label
+    IDWriteTextFormat* fmt = useSmallFont ? overlay.smallTextFormat.Get() : overlay.textFormat.Get();
+    DWRITE_TEXT_ALIGNMENT prevTA = fmt->GetTextAlignment();
+    DWRITE_PARAGRAPH_ALIGNMENT prevPA = fmt->GetParagraphAlignment();
+    fmt->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+    fmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    rt->DrawText(label.c_str(), (UINT32)label.length(), fmt,
+        D2D1::RectF(x, y, x + width, y + height), textBrush.Get());
+    fmt->SetTextAlignment(prevTA);
+    fmt->SetParagraphAlignment(prevPA);
+
+    rt->EndDraw();
+}
+
 std::wstring FormatSessionState(int state) {
     // XrSessionState values
     const wchar_t* stateNames[] = {

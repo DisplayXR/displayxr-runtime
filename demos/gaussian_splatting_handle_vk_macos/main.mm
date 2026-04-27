@@ -114,14 +114,6 @@ struct InputState {
     bool animationActive = false;
     bool animateToggleRequested = false;     // set by UI button
 
-    // Scene-flip toggles (post-view-matrix mirror through XZ or YZ plane).
-    // Per-format defaults are set by ApplyAutoFitForLoadedScene after load:
-    //   .spz (Niantic, RUB native): flipY=true,  flipX=false
-    //   .ply (gsplat-trainer):      flipY=false, flipX=true
-    bool flipY = true;
-    bool flipX = false;
-    bool flipToggleRequested = false;
-
     // Drag-and-drop / pending file load
     std::string pendingLoadPath;
 
@@ -191,23 +183,6 @@ static uint32_t g_windowW = 0, g_windowH = 0;
 static void mat4_identity(float* m) {
     memset(m, 0, 16 * sizeof(float));
     m[0] = m[5] = m[10] = m[15] = 1.0f;
-}
-
-// Post-multiply the view matrix by a Y-reflection (world Y is negated):
-// view' = view * diag(1, -1, 1, 1).  Equivalent to mirroring the scene across
-// the XZ plane before viewing — exactly the fix for SPZ files whose training
-// convention inverts Y.  Not a rotation (det = -1), but preserves z ordering,
-// so depth and shader logic remain correct.
-static void view_apply_y_flip(float* view_col_major_16) {
-    for (int i = 0; i < 4; i++) view_col_major_16[4 + i] = -view_col_major_16[4 + i];
-}
-
-// Mirror across the YZ plane: post-multiply view by diag(-1, 1, 1, 1).
-// PLY data from gsplat-trainer comes out X-mirrored vs SuperSplat in our
-// pipeline; this view-stage flip undoes it without needing to negate
-// position data + conjugate quaternions at load.
-static void view_apply_x_flip(float* view_col_major_16) {
-    for (int i = 0; i < 4; i++) view_col_major_16[i] = -view_col_major_16[i];
 }
 
 static void mat4_multiply(float* out, const float* a, const float* b) {
@@ -358,9 +333,6 @@ static void UpdateCameraMovement(InputState& input, float dt, float displayHeigh
         input.transitioning = false;
         // Auto-orbit always on; resetting just resets the idle timer below.
         input.animationActive = false;
-        // Preserve per-format flipY/flipX through Reset — they were set by
-        // ApplyAutoFitForLoadedScene based on file extension and shouldn't
-        // be reverted by Space.
         input.lastInputTimeSec = NowSec();
         return;
     }
@@ -609,9 +581,6 @@ static void OpenLoadDialog() {
         case 'm': case 'M':
             g_input.animateToggleRequested = true;
             break;
-        case 'f': case 'F':
-            g_input.flipToggleRequested = true;
-            break;
         case 'c': case 'C':
             g_input.cameraMode = !g_input.cameraMode;
             break;
@@ -756,9 +725,8 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
     [g_hudView setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
     [g_hudBackdrop addSubview:g_hudView];
 
-    // --- Top bar (Open / Auto-Orbit / Mode / Flip) — transparent so the
-    // buttons sit directly over the rendered content (no frosted panel
-    // hiding the top of the scene).
+    // --- Top bar (Open / Mode) — transparent so the buttons sit directly
+    // over the rendered content (no frosted panel hiding the top of the scene).
     const CGFloat barH = 48.0;
     NSRect barFrame = NSMakeRect(0, height - barH, width, barH);
     NSView *topBar = [[NSView alloc] initWithFrame:barFrame];
@@ -1421,19 +1389,10 @@ static void ApplyAutoFitForLoadedScene() {
     g_input.viewParams.virtualDisplayHeight = g_fitValid ? g_fitVHeight : kDefaultVirtualDisplayHeightM;
     g_input.viewParams.scaleFactor = 1.0f;
 
-    // Per-format Y/X-flip defaults (see flipY/flipX comments). SPZ comes
-    // through Niantic's RUB convention → needs Y-mirror at view stage. PLY
-    // from gsplat-trainer needs X-mirror to match SuperSplat orientation.
-    bool isPly = false;
-    if (g_loadedFileName.size() >= 4) {
-        std::string ext = g_loadedFileName.substr(g_loadedFileName.size() - 4);
-        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-        isPly = (ext == ".ply");
-    }
-    g_input.flipY = !isPly;
-    g_input.flipX = isPly;
-    LOG_INFO("Per-format flips: flipY=%d flipX=%d (%s)",
-             g_input.flipY, g_input.flipX, isPly ? "PLY" : "SPZ");
+    // Per-format orientation correction is now done at load time (PLY loader
+    // converts RDF+X-mirror → canonical RUB; SPZ loader uses RUB natively).
+    // GsRenderer::updateUniforms negates the Y row of proj_mat to match the
+    // +Y-up convention. No runtime view-stage flips needed.
 }
 
 static void TryAutoLoadBundledScene() {
@@ -1614,13 +1573,6 @@ int main() {
             UpdateTopBarButtonTitles(xr);
         }
 
-        // Handle Flip toggle (F key or button)
-        if (g_input.flipToggleRequested) {
-            g_input.flipToggleRequested = false;
-            g_input.flipY = !g_input.flipY;
-            UpdateTopBarButtonTitles(xr);
-        }
-
         UpdateCameraMovement(g_input, deltaTime, xr.displayHeightM);
 
         // Handle rendering mode change (V=cycle, 0-3=direct, or Mode button)
@@ -1716,17 +1668,7 @@ int main() {
 
                         XrPosef cameraPose;
                         quat_from_yaw_pitch(g_input.yaw, g_input.pitch, &cameraPose.orientation);
-                        // The view-stage Y-flip (and X-flip) is post-applied to the view
-                        // matrix as view * diag(±1, ±1, 1, 1). For non-zero displayPose
-                        // axes, this leaves the display center at view-space y = -2·cy − 0.1
-                        // instead of -0.1, breaking the Kooima frustum's centering. Mirror
-                        // the corresponding axis of displayPose so the view-stage flip and
-                        // the projection stay aligned.
-                        float dispX = g_input.cameraPosX;
-                        float dispY = g_input.cameraPosY;
-                        if (g_input.flipX) dispX = -dispX;
-                        if (g_input.flipY) dispY = -dispY;
-                        cameraPose.position = {dispX, dispY, g_input.cameraPosZ};
+                        cameraPose.position = {g_input.cameraPosX, g_input.cameraPosY, g_input.cameraPosZ};
 
                         XrVector3f nominalViewer = {xr.nominalViewerX, xr.nominalViewerY, xr.nominalViewerZ};
 
@@ -1788,13 +1730,6 @@ int main() {
                                 rawEyePos.data(), (uint32_t)eyeCount, &nominalViewer,
                                 &screen, &tunables, &cameraPose,
                                 0.01f, 100.0f, eyeViews.data());
-
-                            if (g_input.flipY) {
-                                for (auto& v : eyeViews) view_apply_y_flip(v.view_matrix);
-                            }
-                            if (g_input.flipX) {
-                                for (auto& v : eyeViews) view_apply_x_flip(v.view_matrix);
-                            }
                         }
 
                         // Double-click focus: ray from CENTER physical eyes through the
@@ -1841,7 +1776,6 @@ int main() {
                             Display3DView centerView;
                             display3d_compute_view(&centerEyeProcessed, &screen2, &tunables2,
                                                    &cameraPose, 0.01f, 100.0f, &centerView);
-                            if (g_input.flipY) view_apply_y_flip(centerView.view_matrix);
 
                             XrVector3f rayOriginV, rayDirV;
                             display3d_unproject_ndc_to_ray(ndcX, ndcY,
@@ -1852,37 +1786,20 @@ int main() {
                             float rayDir[3]    = {rayDirV.x,    rayDirV.y,    rayDirV.z};
                             float hitPos[3];
                             if (g_gsRenderer.pickGaussian(rayOrigin, rayDir, hitPos)) {
-                                // pickGaussian always operates on REAL splat positions, regardless
-                                // of whether the unproject used a Y-flipped view matrix. When flipY
-                                // is on, the user visually sees that splat mirrored across the XZ
-                                // plane — so the display should land at the visual location
-                                // (F_y * hitPos), not the real one. Recompute the alignment ray
-                                // from the un-flipped real eye to the visual hit.
-                                XrVector3f visualHit = {hitPos[0], hitPos[1], hitPos[2]};
-                                XrVector3f alignRayDir = rayDirV;
-                                if (g_input.flipY) {
-                                    visualHit.y = -visualHit.y;
-                                    XrVector3f realEye = {rayOriginV.x, -rayOriginV.y, rayOriginV.z};
-                                    float dx = visualHit.x - realEye.x;
-                                    float dy = visualHit.y - realEye.y;
-                                    float dz = visualHit.z - realEye.z;
-                                    float dl = sqrtf(dx*dx + dy*dy + dz*dz);
-                                    if (dl > 1e-6f) {
-                                        alignRayDir.x = dx / dl;
-                                        alignRayDir.y = dy / dl;
-                                        alignRayDir.z = dz / dl;
-                                    }
-                                }
-                                XrVector3f upHint = {0, 1, 0};
+                                // Splats are in canonical +Y-up world after the loader
+                                // conversions; renderer Y-row negation handles screen-Y.
+                                // Translate to the hit point but preserve the current
+                                // orientation — the user wants to "fly to" the splat
+                                // without re-aiming the display.
                                 XrPosef target;
-                                display3d_align_pose_to_ray(visualHit, alignRayDir, upHint, &target);
+                                target.position = {hitPos[0], hitPos[1], hitPos[2]};
+                                target.orientation = cameraPose.orientation;
                                 g_input.transitionFrom = cameraPose;
                                 g_input.transitionTo = target;
                                 g_input.transitionT = 0.0f;
                                 g_input.transitioning = true;
-                                LOG_INFO("Focus on splat (%.3f, %.3f, %.3f)%s",
-                                    visualHit.x, visualHit.y, visualHit.z,
-                                    g_input.flipY ? " [flipped]" : "");
+                                LOG_INFO("Focus on splat (%.3f, %.3f, %.3f)",
+                                    hitPos[0], hitPos[1], hitPos[2]);
                             }
                         } else if (g_input.teleportRequested) {
                             g_input.teleportRequested = false; // consume without Kooima
@@ -2024,7 +1941,6 @@ int main() {
                     const char *orbitLabel = g_input.animateEnabled
                         ? (g_input.animationActive ? "ON (running)" : "ON (idle countdown)")
                         : "OFF";
-                    const char *flipLabel = g_input.flipY ? "ON" : "OFF";
                     uint32_t activeViewCount = (xr.renderingModeCount > 0 && g_input.currentRenderingMode < xr.renderingModeCount)
                         ? xr.renderingModeViewCounts[g_input.currentRenderingMode] : 2u;
                     NSMutableString *eyesStr = [NSMutableString string];
@@ -2036,7 +1952,7 @@ int main() {
                         @"%s\nSession: %d\n"
                         "Mode: %s (%s, %u view%s)\n"
                         "%@\n"
-                        "Depth/IPD: %d%%  Zoom: %.2fx  Auto-Orbit: %s  Flip: %s\n"
+                        "Depth/IPD: %d%%  Zoom: %.2fx  Auto-Orbit: %s\n"
                         "FPS: %.0f (%.1f ms)\n"
                         "Render: %ux%u  Window: %ux%u\n"
                         "Display: %.3f x %.3f m\n"
@@ -2044,13 +1960,13 @@ int main() {
                         "Vdisplay: (%.2f, %.2f, %.2f)\n"
                         "\nWASDEQ=Move  LMB-drag=Rotate  Scroll=Zoom\n"
                         "DblClick=Focus splat  -/= Depth  Space=Reset\n"
-                        "M=Auto-Orbit  F=Flip  V=Mode  L=Load  Tab=HUD  ESC=Quit",
+                        "M=Auto-Orbit  V=Mode  L=Load  Tab=HUD  ESC=Quit",
                         xr.systemName, (int)xr.sessionState,
                         (xr.renderingModeCount > 0 && xr.renderingModeNames[g_input.currentRenderingMode][0] != '\0') ? xr.renderingModeNames[g_input.currentRenderingMode] : "Unknown",
                         (xr.renderingModeCount > 0 ? (xr.renderingModeDisplay3D[g_input.currentRenderingMode] ? "3D" : "2D") : "3D"),
                         activeViewCount, activeViewCount == 1 ? "" : "s",
                         sceneInfo,
-                        depthPct, g_input.viewParams.scaleFactor, orbitLabel, flipLabel,
+                        depthPct, g_input.viewParams.scaleFactor, orbitLabel,
                         fps, g_avgFrameTime * 1000.0,
                         g_renderW, g_renderH, g_windowW, g_windowH,
                         xr.displayWidthM, xr.displayHeightM,

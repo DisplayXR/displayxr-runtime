@@ -22,20 +22,25 @@
 #define STBI_NO_LINEAR
 #include "stb_image.h"
 
+// PNG bytes from stb_image are already sRGB-encoded. The launcher overlay
+// shader passes sampled icon texels straight through to a UNORM swap-chain
+// that the display reads as sRGB, so the SRV must be plain UNORM (no
+// auto-linearization). Using *_UNORM_SRGB here would linearize on sample
+// and crush mid/dark tones (icons appear very dark).
 static bool
-create_srgb_srv_from_rgba8(ID3D11Device *device,
-                           const stbi_uc *pixels,
-                           int w,
-                           int h,
-                           const char *tag,
-                           ID3D11ShaderResourceView **out_srv)
+create_unorm_srv_from_rgba8(ID3D11Device *device,
+                            const stbi_uc *pixels,
+                            int w,
+                            int h,
+                            const char *tag,
+                            ID3D11ShaderResourceView **out_srv)
 {
 	D3D11_TEXTURE2D_DESC desc = {};
 	desc.Width = static_cast<UINT>(w);
 	desc.Height = static_cast<UINT>(h);
 	desc.MipLevels = 1;
 	desc.ArraySize = 1;
-	desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+	desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
 	desc.SampleDesc.Count = 1;
 	desc.Usage = D3D11_USAGE_IMMUTABLE;
 	desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
@@ -108,7 +113,7 @@ d3d11_icon_load_from_file(ID3D11Device *device,
 		return false;
 	}
 
-	bool ok = create_srgb_srv_from_rgba8(device, pixels, w, h, path, out_srv);
+	bool ok = create_unorm_srv_from_rgba8(device, pixels, w, h, path, out_srv);
 	stbi_image_free(pixels);
 
 	if (ok) {
@@ -163,7 +168,7 @@ d3d11_icon_load_from_memory(ID3D11Device *device,
 		return false;
 	}
 
-	bool ok = create_srgb_srv_from_rgba8(device, pixels, w, h, log_tag, out_srv);
+	bool ok = create_unorm_srv_from_rgba8(device, pixels, w, h, log_tag, out_srv);
 	stbi_image_free(pixels);
 
 	if (ok) {

@@ -18,10 +18,20 @@
 #include <d3d11.h>
 #include <wrl/client.h>
 #include <string>
+#include <vector>
 
 #include "text_overlay.h"
 
 using Microsoft::WRL::ComPtr;
+
+// One button drawn over the HUD overlay. Coordinates are in HUD-pixel space
+// (the HUD texture is hudWidth × hudHeight pixels).
+struct HudButton {
+    std::wstring label;
+    float x = 0, y = 0;
+    float width = 0, height = 0;
+    bool hovered = false;
+};
 
 struct HudRenderer {
     ComPtr<ID3D11Device> device;          // standalone D3D11 device (text-only)
@@ -47,7 +57,8 @@ const void* RenderHudAndMap(HudRenderer& hud, uint32_t* rowPitch,
     const std::wstring& eyeText,
     const std::wstring& cameraText = L"",
     const std::wstring& stereoText = L"",
-    const std::wstring& helpText = L"");
+    const std::wstring& helpText = L"",
+    const std::vector<HudButton>& buttons = {});
 
 // Unmap the staging texture after pixel upload
 void UnmapHud(HudRenderer& hud);

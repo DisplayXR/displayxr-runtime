@@ -261,6 +261,15 @@ if exist "%REPO%test_apps\cube_handle_vk_win\CMakeLists.txt" (
     if defined LOADER_DLL copy /Y "%LOADER_DLL%" "%REPO%test_apps\cube_handle_vk_win\build\" >nul
 )
 
+:: gaussian_splatting_handle_vk_win (demo, needs Vulkan SDK)
+if exist "%REPO%demos\gaussian_splatting_handle_vk_win\CMakeLists.txt" (
+    echo --- gaussian_splatting_handle_vk_win ---
+    cmake -S "%REPO%\demos\gaussian_splatting_handle_vk_win" -B "%REPO%\demos\gaussian_splatting_handle_vk_win\build" -G Ninja ^
+        -DCMAKE_BUILD_TYPE=Release -DOpenXR_ROOT="%OPENXR_SDK_SHORT%"
+    cmake --build "%REPO%\demos\gaussian_splatting_handle_vk_win\build"
+    if defined LOADER_DLL copy /Y "%LOADER_DLL%" "%REPO%demos\gaussian_splatting_handle_vk_win\build\" >nul
+)
+
 
 :: ============================================================
 :: 7. Generate run scripts (like macOS run_*.sh pattern)
@@ -291,6 +300,17 @@ for %%A in (cube_handle_vk_win) do (
             echo @echo off
             echo set "XR_RUNTIME_JSON=%RT_JSON%"
             echo "%REPO%test_apps\%%A\build\%%A.exe" %%*
+        )
+    )
+)
+
+:: GS demo (Vulkan) — same pattern as cube_handle_vk_win, but lives under demos\
+for %%A in (gaussian_splatting_handle_vk_win) do (
+    if exist "%REPO%demos\%%A\build\%%A.exe" (
+        > "%PKG%\run_%%A.bat" (
+            echo @echo off
+            echo set "XR_RUNTIME_JSON=%RT_JSON%"
+            echo "%REPO%demos\%%A\build\%%A.exe" %%*
         )
     )
 )

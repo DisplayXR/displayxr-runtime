@@ -33,6 +33,7 @@
 #include "atlas_capture.h"
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <mutex>
@@ -51,11 +52,19 @@ static const wchar_t* WINDOW_TITLE = L"DisplayXR Gaussian Splat Viewer Demo";
 static const float HUD_WIDTH_FRACTION = 0.30f;
 static const float HUD_HEIGHT_FRACTION = 0.50f;
 
-// Load button fractions (small button, top-right)
-static const float LOAD_BTN_WIDTH_FRACTION = 0.12f;
-static const float LOAD_BTN_HEIGHT_FRACTION = 0.04f;
-static const float LOAD_BTN_X_FRACTION = 0.87f;
-static const float LOAD_BTN_Y_FRACTION = 0.02f;
+// Top-bar buttons live inside the HUD overlay's window-space footprint
+// (top-left corner of the window, fracW × fracH ≈ 0.30 × 0.50). All values
+// are window-fractions for hit-testing; they're translated into HUD-pixel
+// coordinates when passed to RenderHudAndMap each frame.
+static const float OPEN_BTN_X_FRACTION = 0.010f;
+static const float OPEN_BTN_Y_FRACTION = 0.010f;
+static const float OPEN_BTN_WIDTH_FRACTION  = 0.060f;
+static const float OPEN_BTN_HEIGHT_FRACTION = 0.030f;
+
+static const float MODE_BTN_X_FRACTION = 0.075f;
+static const float MODE_BTN_Y_FRACTION = 0.010f;
+static const float MODE_BTN_WIDTH_FRACTION  = 0.140f;
+static const float MODE_BTN_HEIGHT_FRACTION = 0.030f;
 
 
 // sim_display output mode switching (legacy — replaced by unified rendering mode)
@@ -80,8 +89,9 @@ static std::atomic<bool> g_captureAtlasRequested{false};
 static std::string g_loadedFileName;
 static std::mutex g_sceneMutex;
 
-// Fallback vHeight when no scene is loaded; replaced per-scene by auto-fit.
-static constexpr float kFallbackVirtualDisplayHeightM = 0.24f;
+// Fallback vHeight when no scene is loaded or auto-fit hits a degenerate
+// extent. Matches macOS demo's kDefaultVirtualDisplayHeightM (1.5m).
+static constexpr float kFallbackVirtualDisplayHeightM = 1.5f;
 // Comfort margin is baked into getMainObjectBounds (which picks a different
 // multiplier for single-object vs scene-with-central-object). Keep this at
 // 1.0 to mean "no extra margin on top of what the bounds method returned".
@@ -105,20 +115,20 @@ static void ApplyAutoFitForLoadedScene_locked() {
     // Voxel-density flood-fill — see the macOS demo for rationale.
     bool ok = g_gsRenderer.getMainObjectBounds(64u, center, extent);
     if (ok) {
+        g_fitCenter[0] = center[0];
+        g_fitCenter[1] = center[1];
+        g_fitCenter[2] = center[2];
         float vh = extent[1] * kAutoFitVerticalComfort;
-        if (!(vh > 1e-3f)) ok = false;
-        if (ok) {
-            g_fitCenter[0] = center[0];
-            g_fitCenter[1] = center[1];
-            g_fitCenter[2] = center[2];
-            g_fitVHeight = vh;
-            // Search 8 yaws to face the captured side of the scene.
-            float viewerOffset[3] = {0.0f, 0.1f, 0.6f};
-            g_fitYaw = g_gsRenderer.findBestYaw(g_fitCenter, viewerOffset, 8);
-            LOG_INFO("Auto-fit: center=(%.3f, %.3f, %.3f) extent=(%.3f, %.3f, %.3f) vHeight=%.3f yaw=%.0fdeg",
-                     center[0], center[1], center[2],
-                     extent[0], extent[1], extent[2], vh, g_fitYaw * 57.2957795f);
-        }
+        // Degenerate scene (all splats in a thin slice) — fall back to a
+        // sensible vHeight rather than failing the fit. Mirrors macOS:1399.
+        if (!(vh > 1e-3f)) vh = kFallbackVirtualDisplayHeightM;
+        g_fitVHeight = vh;
+        // Search 8 yaws to face the captured side of the scene.
+        float viewerOffset[3] = {0.0f, 0.1f, 0.6f};
+        g_fitYaw = g_gsRenderer.findBestYaw(g_fitCenter, viewerOffset, 8);
+        LOG_INFO("Auto-fit: center=(%.3f, %.3f, %.3f) extent=(%.3f, %.3f, %.3f) vHeight=%.3f yaw=%.0fdeg",
+                 center[0], center[1], center[2],
+                 extent[0], extent[1], extent[2], vh, g_fitYaw * 57.2957795f);
     }
     g_fitValid.store(ok);
 
@@ -130,6 +140,16 @@ static void ApplyAutoFitForLoadedScene_locked() {
     g_inputState.pitch = 0.0f;
     g_inputState.viewParams.virtualDisplayHeight = ok ? g_fitVHeight : kFallbackVirtualDisplayHeightM;
     g_inputState.viewParams.scaleFactor = 1.0f;
+
+    // Per-format orientation correction is now done at load time (PLY loader
+    // converts RDF+X-mirror → canonical RUB; SPZ loader uses RUB natively).
+    // Renderer's GsRenderer::updateUniforms negates the Y row of proj_mat to
+    // match the +Y-up convention. No runtime view-stage flips needed.
+
+    // Route the first post-load frame through the same reset path Space uses,
+    // so app-start view params (perspectiveFactor, scaleFactor, etc.) match
+    // the Space-reset state.
+    g_inputState.resetViewRequested = true;
 }
 
 // Fullscreen state
@@ -166,15 +186,24 @@ static void ToggleFullscreen(HWND hwnd) {
     }
 }
 
-// Check if a mouse click falls within the load button region
-static bool IsClickOnLoadButton(int mouseX, int mouseY, int windowW, int windowH) {
+static bool PointInFractionRect(int mouseX, int mouseY, int windowW, int windowH,
+                                float xf, float yf, float wf, float hf) {
     if (windowW <= 0 || windowH <= 0) return false;
     float fx = (float)mouseX / (float)windowW;
     float fy = (float)mouseY / (float)windowH;
-    return (fx >= LOAD_BTN_X_FRACTION &&
-            fx <= LOAD_BTN_X_FRACTION + LOAD_BTN_WIDTH_FRACTION &&
-            fy >= LOAD_BTN_Y_FRACTION &&
-            fy <= LOAD_BTN_Y_FRACTION + LOAD_BTN_HEIGHT_FRACTION);
+    return (fx >= xf && fx <= xf + wf && fy >= yf && fy <= yf + hf);
+}
+
+static bool IsClickOnLoadButton(int mouseX, int mouseY, int windowW, int windowH) {
+    return PointInFractionRect(mouseX, mouseY, windowW, windowH,
+        OPEN_BTN_X_FRACTION, OPEN_BTN_Y_FRACTION,
+        OPEN_BTN_WIDTH_FRACTION, OPEN_BTN_HEIGHT_FRACTION);
+}
+
+static bool IsClickOnModeButton(int mouseX, int mouseY, int windowW, int windowH) {
+    return PointInFractionRect(mouseX, mouseY, windowW, windowH,
+        MODE_BTN_X_FRACTION, MODE_BTN_Y_FRACTION,
+        MODE_BTN_WIDTH_FRACTION, MODE_BTN_HEIGHT_FRACTION);
 }
 
 // Atlas capture helpers live in test_apps/common/atlas_capture* — see
@@ -252,6 +281,15 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (IsClickOnLoadButton(mx, my, g_windowWidth, g_windowHeight)) {
             // Post to main thread — don't block WindowProc with file dialog
             PostMessage(hwnd, WM_USER + 1, 0, 0);
+            return 0;
+        }
+        if (IsClickOnModeButton(mx, my, g_windowWidth, g_windowHeight)) {
+            std::lock_guard<std::mutex> lock(g_inputMutex);
+            if (g_inputState.renderingModeCount > 0) {
+                g_inputState.currentRenderingMode =
+                    (g_inputState.currentRenderingMode + 1) % g_inputState.renderingModeCount;
+            }
+            g_inputState.renderingModeChangeRequested = true;
             return 0;
         }
         SetCapture(hwnd);
@@ -705,16 +743,21 @@ static void RenderThreadFunc(
                             float hitPos[3];
                             std::lock_guard<std::mutex> sceneLock(g_sceneMutex);
                             if (g_gsRenderer.pickGaussian(rayOrigin, rayDir, hitPos)) {
-                                XrVector3f hitV = {hitPos[0], hitPos[1], hitPos[2]};
-                                XrVector3f upHint = {0, 1, 0};
+                                // Splats are in canonical +Y-up world after the loader
+                                // conversions; renderer Y-row negation handles screen-Y.
+                                // Translate the display to the hit point but preserve
+                                // the current orientation — the user wants to "fly to"
+                                // the splat without re-aiming the display.
                                 XrPosef target;
-                                display3d_align_pose_to_ray(hitV, rayDirV, upHint, &target);
+                                target.position = {hitPos[0], hitPos[1], hitPos[2]};
+                                target.orientation = displayPoseLocal.orientation;
                                 std::lock_guard<std::mutex> inputLock(g_inputMutex);
                                 g_inputState.transitionFrom = displayPoseLocal;
                                 g_inputState.transitionTo = target;
                                 g_inputState.transitionT = 0.0f;
                                 g_inputState.transitioning = true;
-                                LOG_INFO("Focus on splat (%.3f, %.3f, %.3f)", hitPos[0], hitPos[1], hitPos[2]);
+                                LOG_INFO("Focus on splat (%.3f, %.3f, %.3f)",
+                                    hitPos[0], hitPos[1], hitPos[2]);
                             }
                         }
 
@@ -944,9 +987,43 @@ static void RenderThreadFunc(
                                     L"[DblClick] Focus | [-/=] Depth | [Space] Reset\n"
                                     L"[M] Auto-Orbit | [V] Mode | [L] Load | [Tab] HUD | [ESC] Quit";
 
+                                // Top-bar buttons. Translate window-fraction click
+                                // regions into HUD-pixel coords using the HUD's
+                                // own footprint constants (the HUD covers window
+                                // fraction (0,0) → (HUD_WIDTH_FRACTION,
+                                // HUD_HEIGHT_FRACTION); inside that, pixel space
+                                // is (0,0) → (hudWidth, hudHeight)).
+                                std::vector<HudButton> buttons;
+                                {
+                                    auto toHudPx = [&](float xf, float yf, float wf, float hf, const std::wstring& label) {
+                                        HudButton b;
+                                        b.label = label;
+                                        b.x = (xf / HUD_WIDTH_FRACTION)  * (float)hudWidth;
+                                        b.y = (yf / HUD_HEIGHT_FRACTION) * (float)hudHeight;
+                                        b.width  = (wf / HUD_WIDTH_FRACTION)  * (float)hudWidth;
+                                        b.height = (hf / HUD_HEIGHT_FRACTION) * (float)hudHeight;
+                                        return b;
+                                    };
+                                    buttons.push_back(toHudPx(
+                                        OPEN_BTN_X_FRACTION, OPEN_BTN_Y_FRACTION,
+                                        OPEN_BTN_WIDTH_FRACTION, OPEN_BTN_HEIGHT_FRACTION,
+                                        L"Open…"));
+                                    std::wstring modeLabel = L"Mode";
+                                    if (xr->renderingModeCount > 0 &&
+                                        inputSnapshot.currentRenderingMode < xr->renderingModeCount &&
+                                        xr->renderingModeNames[inputSnapshot.currentRenderingMode]) {
+                                        const char* nm = xr->renderingModeNames[inputSnapshot.currentRenderingMode];
+                                        modeLabel = L"Mode: " + std::wstring(nm, nm + strlen(nm));
+                                    }
+                                    buttons.push_back(toHudPx(
+                                        MODE_BTN_X_FRACTION, MODE_BTN_Y_FRACTION,
+                                        MODE_BTN_WIDTH_FRACTION, MODE_BTN_HEIGHT_FRACTION,
+                                        modeLabel));
+                                }
+
                                 uint32_t srcRowPitch = 0;
                                 const void* pixels = RenderHudAndMap(*hud, &srcRowPitch, sessionText, modeText, perfText, dispText, eyeText,
-                                    cameraText, stereoText, helpText);
+                                    cameraText, stereoText, helpText, buttons);
                                 if (pixels) {
                                     const uint8_t* src = (const uint8_t*)pixels;
                                     uint8_t* dst = (uint8_t*)hudStagingMapped;
@@ -1017,10 +1094,6 @@ static void RenderThreadFunc(
                             }
                         }
 
-                        // Render load button to its own window-space layer
-                        // (Simple text rendered via D2D into a small swapchain)
-                        // TODO: Implement load button swapchain rendering
-                        // For now, the L key shortcut and click detection handle loading
                     }
                 }
 
