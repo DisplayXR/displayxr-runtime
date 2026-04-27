@@ -621,10 +621,38 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		HWND fwd = (HWND)InterlockedCompareExchangePointer((volatile PVOID *)&w->input_forward_hwnd, NULL, NULL);
 		LONG is_capture = InterlockedCompareExchange(&w->input_forward_is_capture, 0, 0);
 		if (fwd != NULL) {
-			// Shell mode: scroll is reserved for window resize.
+			// Shell mode wheel routing:
+			//   cursor over app content + no modifier → forward to app (e.g. 3DGS zoom)
+			//   cursor outside app content            → shell resize (no modifier needed)
+			//   Ctrl + scroll                         → shell resize (force, even over app)
+			//   Shift + scroll                        → window Z-depth
+			// Capture clients don't take wheel input, so always consume their delta.
 			if (message == WM_MOUSEWHEEL) {
-				short delta = GET_WHEEL_DELTA_WPARAM(wParam);
-				InterlockedExchangeAdd(&w->scroll_accum, (LONG)delta);
+				bool ctrl  = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+				bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+
+				// WM_MOUSEWHEEL puts SCREEN coords in lParam (unlike other
+				// mouse messages). Convert to shell-client coords for the
+				// in-rect test.
+				POINT pt;
+				pt.x = GET_X_LPARAM(lParam);
+				pt.y = GET_Y_LPARAM(lParam);
+				ScreenToClient(hWnd, &pt);
+
+				LONG rx = InterlockedCompareExchange(&w->input_forward_rect_x, 0, 0);
+				LONG ry = InterlockedCompareExchange(&w->input_forward_rect_y, 0, 0);
+				LONG rw = InterlockedCompareExchange(&w->input_forward_rect_w, 0, 0);
+				LONG rh = InterlockedCompareExchange(&w->input_forward_rect_h, 0, 0);
+				bool in_rect = (rw > 0 && rh > 0 &&
+				                pt.x >= rx && pt.x < rx + rw &&
+				                pt.y >= ry && pt.y < ry + rh);
+
+				if (in_rect && !is_capture && !ctrl && !shift) {
+					PostMessage(fwd, message, wParam, lParam);
+				} else {
+					short delta = GET_WHEEL_DELTA_WPARAM(wParam);
+					InterlockedExchangeAdd(&w->scroll_accum, (LONG)delta);
+				}
 				return 0;
 			}
 

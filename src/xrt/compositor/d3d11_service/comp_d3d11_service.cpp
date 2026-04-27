@@ -6550,7 +6550,10 @@ after_key_shortcuts:
 		(void)0; // label target for the launcher-visible fast-path above.
 	}
 
-	// Scroll wheel: Shift+Scroll = Z-depth, plain scroll = resize.
+	// Scroll wheel (shell consumes only when modifier held; plain scroll is
+	// forwarded to the focused app by the WndProc):
+	//   Shift+Scroll → Z-depth
+	//   Ctrl+Scroll  → resize
 	if (mc->window != nullptr && mc->focused_slot >= 0) {
 		int32_t scroll = comp_d3d11_window_consume_scroll(mc->window);
 		if (scroll != 0) {
