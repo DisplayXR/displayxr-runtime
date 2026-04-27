@@ -35,12 +35,27 @@ add_library(sr_common_base STATIC
     # API dependencies.
     atlas_capture.h
     atlas_capture.cpp
+    # Hybrid-GPU dGPU hint (Windows): NvOptimusEnablement / AmdPowerXpressRequestHighPerformance.
+    # Forced into the EXE via the /INCLUDE linker option below so the driver-side
+    # GPU selection lines up with the service compositor's dGPU pin.
+    optimus_dgpu_hint.c
 )
 
 target_include_directories(sr_common_base PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../../src/external/openxr_includes
 )
+
+# Force the linker to pull optimus_dgpu_hint.c into every EXE that links
+# sr_common_base, even though nothing references its symbols. /INCLUDE on
+# MSVC, --undefined on GNU-style linkers (e.g. clang on Windows).
+if(WIN32)
+    if(MSVC)
+        target_link_options(sr_common_base INTERFACE "/INCLUDE:NvOptimusEnablement")
+    else()
+        target_link_options(sr_common_base INTERFACE "-Wl,--undefined=NvOptimusEnablement")
+    endif()
+endif()
 
 # D3D11-specific library: extends base with D3D11 renderer + text overlay + HUD
 add_library(sr_common STATIC

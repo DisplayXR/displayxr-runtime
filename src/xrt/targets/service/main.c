@@ -37,6 +37,13 @@ U_TRACE_TARGET_SETUP(U_TRACE_WHICH_SERVICE)
 
 #ifdef XRT_OS_WINDOWS
 
+// Optimus / PowerXpress hints: tell hybrid-GPU drivers to put this process on
+// the discrete GPU. NVIDIA and AMD drivers look these up by name from the main
+// executable. The service compositor also explicitly picks the high-performance
+// DXGI adapter — these exports cover the rest of the driver-side selection.
+__declspec(dllexport) DWORD NvOptimusEnablement = 1;
+__declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+
 // Shutdown flag defined in ipc_server_mainloop_windows.cpp.
 // Set by the tray icon's "Exit" menu item, checked by ipc_server_mainloop_poll().
 extern volatile bool g_service_shutdown_requested;

@@ -10512,9 +10512,33 @@ comp_d3d11_service_create_system(struct xrt_device *xdev,
 	wil::com_ptr<ID3D11Device> device_base;
 	wil::com_ptr<ID3D11DeviceContext> context_base;
 
+	// Pin the service to the high-performance (discrete) GPU on hybrid laptops.
+	// IPC shared textures cannot bridge two physical adapters, so picking dGPU
+	// here keeps both the compositor and any well-behaved client (which honours
+	// the LUID we publish below) on the same GPU.
+	wil::com_ptr<IDXGIAdapter> preferred_adapter;
+	{
+		wil::com_ptr<IDXGIFactory6> factory6;
+		if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(factory6.put()))) && factory6) {
+			wil::com_ptr<IDXGIAdapter1> high_perf;
+			if (SUCCEEDED(factory6->EnumAdapterByGpuPreference(
+			        0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+			        IID_PPV_ARGS(high_perf.put())))) {
+				DXGI_ADAPTER_DESC1 desc1{};
+				if (SUCCEEDED(high_perf->GetDesc1(&desc1)) &&
+				    (desc1.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) == 0) {
+					preferred_adapter = high_perf;
+					U_LOG_W("D3D11 service: preferring high-performance adapter '%ls'",
+					        desc1.Description);
+				}
+			}
+		}
+	}
+
+	// D3D11CreateDevice requires DRIVER_TYPE_UNKNOWN when an explicit adapter is supplied.
 	HRESULT hr = D3D11CreateDevice(
-	    nullptr,                     // Default adapter
-	    D3D_DRIVER_TYPE_HARDWARE,
+	    preferred_adapter.get(),
+	    preferred_adapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE,
 	    nullptr,
 	    flags,
 	    feature_levels, ARRAYSIZE(feature_levels),
