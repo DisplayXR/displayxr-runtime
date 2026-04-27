@@ -58,6 +58,7 @@ else()
 			target_lists
 			target_instance
 			comp_client
+			ipc_client
 		)
 endif()
 

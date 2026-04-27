@@ -146,7 +146,9 @@ bool CreateSwapchain(XrSessionManager& xr) {
     const auto& view = xr.configViews[0];
 
     // If display info is available (via XR_EXT_display_info), use native display resolution.
-    // Otherwise fall back to recommended dimensions from xrEnumerateViewConfigurationViews.
+    // Otherwise fall back to recommended dimensions from xrEnumerateViewConfigurationViews,
+    // optionally upgraded to fit the largest atlas across all advertised rendering modes
+    // (atlas = tile_columns × view_scale_x × window_w × tile_rows × view_scale_y × window_h).
     uint32_t width, height;
     if (xr.displayPixelWidth > 0 && xr.displayPixelHeight > 0) {
         // Native display res — app manages viewport scaling via recommendedViewScaleX/Y
@@ -157,6 +159,31 @@ bool CreateSwapchain(XrSessionManager& xr) {
         // Fallback: use recommended from xrEnumerateViewConfigurationViews
         width = view.recommendedImageRectWidth * 2;
         height = view.recommendedImageRectHeight;
+
+#ifdef _WIN32
+        // Bump the fallback so the largest atlas across all advertised rendering
+        // modes fits. Without this, modes like Quad (2×2) or asymmetric layouts
+        // would render outside the swapchain. Window dims read from HWND; if no
+        // window or no modes were enumerated, the recommended × 2 default holds.
+        if (xr.renderingModeCount > 0 && xr.windowHandle != nullptr) {
+            RECT rc = {};
+            if (GetClientRect(xr.windowHandle, &rc)) {
+                uint32_t winW = (uint32_t)(rc.right - rc.left);
+                uint32_t winH = (uint32_t)(rc.bottom - rc.top);
+                uint32_t maxAtlasW = 0, maxAtlasH = 0;
+                for (uint32_t i = 0; i < xr.renderingModeCount; i++) {
+                    uint32_t viewW = (uint32_t)((double)winW * xr.renderingModeScaleX[i]);
+                    uint32_t viewH = (uint32_t)((double)winH * xr.renderingModeScaleY[i]);
+                    uint32_t aw = xr.renderingModeTileColumns[i] * viewW;
+                    uint32_t ah = xr.renderingModeTileRows[i] * viewH;
+                    if (aw > maxAtlasW) maxAtlasW = aw;
+                    if (ah > maxAtlasH) maxAtlasH = ah;
+                }
+                if (maxAtlasW > width)  width  = maxAtlasW;
+                if (maxAtlasH > height) height = maxAtlasH;
+            }
+        }
+#endif
         LOG_INFO("Swapchain at recommended %ux%u (no display info)", width, height);
     }
 

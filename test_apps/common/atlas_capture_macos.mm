@@ -102,24 +102,29 @@ void TriggerCaptureFlash(void* nsviewBridged) {
     if (parent == nil) return;
     // AppKit + Core Animation must run on the main queue.
     dispatch_block_t block = ^{
-        if (g_flashView == nil) {
-            g_flashView = [[NSView alloc] initWithFrame:[parent bounds]];
-            [g_flashView setWantsLayer:YES];
-            g_flashView.layer.backgroundColor = [[NSColor whiteColor] CGColor];
-            [g_flashView setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
-            [parent addSubview:g_flashView];
-        } else {
-            [g_flashView setFrame:[parent bounds]];
-            [parent addSubview:g_flashView positioned:NSWindowAbove relativeTo:nil];
+        // Recreate the flash view from scratch each time. Reusing the same
+        // NSView across multiple flashes left stale CALayer animation state
+        // around, which made every flash after the first one invisible.
+        if (g_flashView != nil) {
+            [g_flashView removeFromSuperview];
+            g_flashView = nil;
         }
+        g_flashView = [[NSView alloc] initWithFrame:[parent bounds]];
+        [g_flashView setWantsLayer:YES];
+        g_flashView.layer.backgroundColor = [[NSColor whiteColor] CGColor];
+        [g_flashView setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
         g_flashView.alphaValue = 1.0;
+        [parent addSubview:g_flashView];
+
+        NSView *fadeView = g_flashView;  // capture for completion block
         [NSAnimationContext runAnimationGroup:^(NSAnimationContext *ctx) {
             ctx.duration = 0.25;
             ctx.timingFunction = [CAMediaTimingFunction
                 functionWithName:kCAMediaTimingFunctionEaseOut];
-            g_flashView.animator.alphaValue = 0.0;
+            fadeView.animator.alphaValue = 0.0;
         } completionHandler:^{
-            g_flashView.alphaValue = 0.0;
+            [fadeView removeFromSuperview];
+            if (g_flashView == fadeView) g_flashView = nil;
         }];
     };
     if ([NSThread isMainThread]) block();

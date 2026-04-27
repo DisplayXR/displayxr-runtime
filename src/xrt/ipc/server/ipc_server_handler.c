@@ -795,7 +795,7 @@ ipc_handle_session_create(volatile struct ipc_client_state *ics,
 	// input without touching the caller's struct.
 	struct xrt_session_info xsi_local = *xsi;
 	strncpy(xsi_local.application_name,
-	        ics->client_state.info.application_name,
+	        (const char *)ics->client_state.info.application_name,
 	        sizeof(xsi_local.application_name) - 1);
 	xsi_local.application_name[sizeof(xsi_local.application_name) - 1] = '\0';
 

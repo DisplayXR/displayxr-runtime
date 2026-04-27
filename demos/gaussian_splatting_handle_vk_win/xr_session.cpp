@@ -456,9 +456,13 @@ bool CreateSession(XrSessionManager& xr, VkInstance vkInstance, VkPhysicalDevice
                     xr.renderingModeScaleX[i] = modes[i].viewScaleX;
                     xr.renderingModeScaleY[i] = modes[i].viewScaleY;
                     xr.renderingModeDisplay3D[i] = (modes[i].hardwareDisplay3D == XR_TRUE);
-                    LOG_INFO("  [%u] %s (views=%u, scale=%.2fx%.2f, 3D=%d)",
+                    xr.renderingModeTileColumns[i] = modes[i].tileColumns ? modes[i].tileColumns : 1;
+                    xr.renderingModeTileRows[i] = modes[i].tileRows ? modes[i].tileRows : 1;
+                    LOG_INFO("  [%u] %s (views=%u, scale=%.2fx%.2f, tiles=%ux%u, 3D=%d)",
                         modes[i].modeIndex, modes[i].modeName, modes[i].viewCount,
-                        modes[i].viewScaleX, modes[i].viewScaleY, modes[i].hardwareDisplay3D);
+                        modes[i].viewScaleX, modes[i].viewScaleY,
+                        xr.renderingModeTileColumns[i], xr.renderingModeTileRows[i],
+                        modes[i].hardwareDisplay3D);
                 }
             }
         }

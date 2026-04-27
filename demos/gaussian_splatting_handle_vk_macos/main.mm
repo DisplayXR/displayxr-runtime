@@ -546,7 +546,7 @@ static void OpenLoadDialog() {
 - (void)mouseDragged:(NSEvent *)event {
     MarkUserInput(g_input);
     g_input.yaw -= (float)[event deltaX] * 0.005f;
-    g_input.pitch += (float)[event deltaY] * 0.005f;
+    g_input.pitch -= (float)[event deltaY] * 0.005f;
     float maxPitch = 1.5f;
     if (g_input.pitch > maxPitch) g_input.pitch = maxPitch;
     if (g_input.pitch < -maxPitch) g_input.pitch = -maxPitch;
@@ -1192,8 +1192,25 @@ static bool CreateSwapchains(AppXrSession& xr) {
         if (f == VK_FORMAT_B8G8R8A8_UNORM || f == VK_FORMAT_R8G8B8A8_UNORM) selectedFmt = f;
     }
 
+    // Size the swapchain to fit the largest atlas any rendering mode could
+    // produce at the current window. Atlas dims per mode are
+    //   (tile_columns × view_scale_x × window_w) × (tile_rows × view_scale_y × window_h).
+    // Falls back to recommended × (2,1) (legacy SBS sizing) if the runtime
+    // didn't advertise any modes.
     uint32_t w = views[0].recommendedImageRectWidth * 2;
     uint32_t h = views[0].recommendedImageRectHeight;
+    if (xr.renderingModeCount > 0 && g_windowW > 0 && g_windowH > 0) {
+        uint32_t maxAtlasW = 0, maxAtlasH = 0;
+        for (uint32_t i = 0; i < xr.renderingModeCount; i++) {
+            uint32_t viewW = (uint32_t)((double)g_windowW * xr.renderingModeScaleX[i]);
+            uint32_t viewH = (uint32_t)((double)g_windowH * xr.renderingModeScaleY[i]);
+            uint32_t aw = xr.renderingModeTileColumns[i] * viewW;
+            uint32_t ah = xr.renderingModeTileRows[i] * viewH;
+            if (aw > maxAtlasW) maxAtlasW = aw;
+            if (ah > maxAtlasH) maxAtlasH = ah;
+        }
+        if (maxAtlasW > 0 && maxAtlasH > 0) { w = maxAtlasW; h = maxAtlasH; }
+    }
 
     XrSwapchainCreateInfo sci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
     sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
@@ -1672,21 +1689,19 @@ int main() {
 
                         XrVector3f nominalViewer = {xr.nominalViewerX, xr.nominalViewerY, xr.nominalViewerZ};
 
-                        float scaleX = (xr.renderingModeCount > 0 && g_input.currentRenderingMode < xr.renderingModeCount) ? xr.renderingModeScaleX[g_input.currentRenderingMode] : 0.5f;
+                        // Per-view extent driven entirely by the current rendering
+                        // mode's view_scale and the live window size. Atlas dims
+                        // (used for the projection viewport per eye and for the 'I'
+                        // capture region) follow as cols × renderW × rows × renderH.
+                        // The swapchain was sized at creation time to fit the
+                        // largest atlas across all advertised modes, so no clamp
+                        // is needed here.
+                        float scaleX = (xr.renderingModeCount > 0 && g_input.currentRenderingMode < xr.renderingModeCount) ? xr.renderingModeScaleX[g_input.currentRenderingMode] : 1.0f;
                         float scaleY = (xr.renderingModeCount > 0 && g_input.currentRenderingMode < xr.renderingModeCount) ? xr.renderingModeScaleY[g_input.currentRenderingMode] : 1.0f;
-                        uint32_t tileW = xr.swapchain.width / (tileColumns ? tileColumns : 1);
-                        uint32_t tileH = xr.swapchain.height / (tileRows ? tileRows : 1);
-                        uint32_t renderW, renderH;
-                        if (monoMode) {
-                            renderW = g_windowW; renderH = g_windowH;
-                            if (renderW > xr.swapchain.width) renderW = xr.swapchain.width;
-                            if (renderH > xr.swapchain.height) renderH = xr.swapchain.height;
-                        } else {
-                            renderW = (uint32_t)(g_windowW * scaleX);
-                            renderH = (uint32_t)(g_windowH * scaleY);
-                            if (renderW > tileW) renderW = tileW;
-                            if (renderH > tileH) renderH = tileH;
-                        }
+                        uint32_t renderW = (uint32_t)((double)g_windowW * scaleX);
+                        uint32_t renderH = (uint32_t)((double)g_windowH * scaleY);
+                        if (renderW == 0) renderW = 1;
+                        if (renderH == 0) renderH = 1;
                         g_renderW = renderW; g_renderH = renderH;
 
                         // Per-view Kooima pose + projection — one entry per view in this
@@ -1740,7 +1755,11 @@ int main() {
                             g_input.teleportRequested = false;
                             NSSize viewSize = [[g_window contentView] bounds].size;
                             float ndcX = 2.0f * g_input.teleportMouseX / (float)viewSize.width - 1.0f;
-                            float ndcY = -(2.0f * g_input.teleportMouseY / (float)viewSize.height - 1.0f);
+                            // Cocoa locationInWindow has y=0 at the BOTTOM of the window.
+                            // OpenGL/+Y-up NDC also has y=-1 at the bottom, so this maps
+                            // directly with no negation. (The Windows demo negates because
+                            // Win32 mouse y=0 is at the TOP.)
+                            float ndcY = 2.0f * g_input.teleportMouseY / (float)viewSize.height - 1.0f;
 
                             // Build a center-eye Display3DView from the averaged processed
                             // display-space eye so unprojection is truly from the viewpoint
@@ -1824,9 +1843,10 @@ int main() {
                                     mat4_from_xr_fov(projMat[eye].data(), views[srcView].fov, 0.01f, 100.0f);
                                 }
 
-                                // Tile-aware viewport (2×2 atlas for Quad, SBS for stereo, etc.).
-                                uint32_t tileX = display3D ? (uint32_t)(eye % (int)tileColumns) : 0;
-                                uint32_t tileY = display3D ? (uint32_t)(eye / (int)tileColumns) : 0;
+                                // Tile-aware viewport: row-major eye layout in the atlas.
+                                // For mono (cols=rows=1) this collapses to (0, 0).
+                                uint32_t tileX = (uint32_t)(eye % (int)tileColumns);
+                                uint32_t tileY = (uint32_t)(eye / (int)tileColumns);
                                 uint32_t vpX = tileX * renderW;
                                 uint32_t vpY = tileY * renderH;
                                 tileOffsets[eye] = {vpX, vpY};
@@ -1859,17 +1879,17 @@ int main() {
                                     g_input.yaw, g_input.pitch);
                             }
 
-                            // 'I' key: snapshot the multi-view atlas to a PNG.
-                            // Atlas region = (tileColumns × renderW, tileRows × renderH)
-                            // anchored at the swapchain's top-left. Skipped for
-                            // 1×1 (mono) since there's nothing interesting to dump.
+                            // 'I' key: snapshot the rendered region to a PNG.
+                            // For multi-view modes (2×1 SBS, 1×2 stacked, 2×2 quad)
+                            // this is the full atlas; for 1×1 mono it's the single
+                            // rendered view. Anchored at the swapchain's top-left.
                             if (g_input.captureAtlasRequested) {
                                 g_input.captureAtlasRequested = false;
-                                if (display3D && tileColumns > 0 && tileRows > 0 &&
-                                    !(tileColumns == 1 && tileRows == 1) &&
-                                    g_gsRenderer.hasScene()) {
-                                    uint32_t atlasW = tileColumns * renderW;
-                                    uint32_t atlasH = tileRows * renderH;
+                                if (g_gsRenderer.hasScene()) {
+                                    uint32_t cols = tileColumns > 0 ? tileColumns : 1u;
+                                    uint32_t rows = tileRows > 0 ? tileRows : 1u;
+                                    uint32_t atlasW = cols * renderW;
+                                    uint32_t atlasH = rows * renderH;
                                     if (atlasW <= xr.swapchain.width && atlasH <= xr.swapchain.height) {
                                         // Strip extension from scene filename
                                         // (e.g. "butterfly.spz" → "butterfly").
@@ -1879,7 +1899,7 @@ int main() {
                                             : g_loadedFileName.substr(0, dot);
                                         if (stem.empty()) stem = "scene";
                                         std::string outPath = dxr_capture::MakeCapturePath(
-                                            stem, tileColumns, tileRows);
+                                            stem, cols, rows);
                                         // GS writes via compute imageStore — bytes are
                                         // linear even on an sRGB swapchain; tell the helper
                                         // to mirror the runtime's display-side decode.
@@ -1890,17 +1910,17 @@ int main() {
                                             0, 0, atlasW, atlasH, outPath,
                                             /*linearBytesInSrgbImage=*/true);
                                         if (ok) {
-                                            LOG_INFO("Captured atlas %ux%u -> %s",
-                                                     atlasW, atlasH, outPath.c_str());
+                                            LOG_INFO("Captured %ux%u (%ux%u tiles) -> %s",
+                                                     atlasW, atlasH, cols, rows, outPath.c_str());
                                             dxr_capture::TriggerCaptureFlash(
                                                 (__bridge void*)g_metalView);
                                         }
+                                    } else {
+                                        LOG_WARN("Capture skipped: atlas %ux%u exceeds swapchain %ux%u",
+                                                 atlasW, atlasH, xr.swapchain.width, xr.swapchain.height);
                                     }
                                 } else {
-                                    LOG_WARN("Capture skipped: need 3D mode + loaded scene "
-                                             "(currently mode tiles=%ux%u, scene=%s)",
-                                             tileColumns, tileRows,
-                                             g_gsRenderer.hasScene() ? "loaded" : "none");
+                                    LOG_WARN("Capture skipped: no scene loaded");
                                 }
                             }
 

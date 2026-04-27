@@ -616,21 +616,33 @@ static void RenderThreadFunc(
                         xrLocateViews(xr->session, &locateInfo, &viewState, 2, &viewCount, rawViews);
 
                         bool monoMode = (xr->renderingModeCount > 0 && !xr->renderingModeDisplay3D[inputSnapshot.currentRenderingMode]);
-                        uint32_t eyeRenderW = xr->swapchain.width / 2;
-                        uint32_t eyeRenderH = xr->swapchain.height;
 
-                        uint32_t renderW, renderH;
-                        if (monoMode) {
-                            renderW = windowW;
-                            renderH = windowH;
-                            if (renderW > xr->swapchain.width) renderW = xr->swapchain.width;
-                            if (renderH > xr->swapchain.height) renderH = xr->swapchain.height;
+                        // Per-view extent driven entirely by the current rendering
+                        // mode's view_scale and the live window size. Atlas dims
+                        // (cols × renderW, rows × renderH) are what gets written to
+                        // the swapchain and snapshotted by the 'I' key. Swapchain
+                        // creation already sized for the largest atlas, so no clamp.
+                        // Falls back to the global recommendedViewScale (and 1.0 for
+                        // mono) if the runtime didn't advertise per-mode info.
+                        float scaleX, scaleY;
+                        uint32_t cols, rows;
+                        if (xr->renderingModeCount > 0) {
+                            uint32_t mode = inputSnapshot.currentRenderingMode;
+                            scaleX = xr->renderingModeScaleX[mode];
+                            scaleY = xr->renderingModeScaleY[mode];
+                            cols   = xr->renderingModeTileColumns[mode] ? xr->renderingModeTileColumns[mode] : 1u;
+                            rows   = xr->renderingModeTileRows[mode]    ? xr->renderingModeTileRows[mode]    : 1u;
+                        } else if (monoMode) {
+                            scaleX = 1.0f; scaleY = 1.0f; cols = 1u; rows = 1u;
                         } else {
-                            renderW = (uint32_t)(windowW * xr->recommendedViewScaleX);
-                            renderH = (uint32_t)(windowH * xr->recommendedViewScaleY);
-                            if (renderW > eyeRenderW) renderW = eyeRenderW;
-                            if (renderH > eyeRenderH) renderH = eyeRenderH;
+                            scaleX = xr->recommendedViewScaleX;
+                            scaleY = xr->recommendedViewScaleY;
+                            cols = 2u; rows = 1u;  // legacy SBS default
                         }
+                        uint32_t renderW = (uint32_t)((double)windowW * scaleX);
+                        uint32_t renderH = (uint32_t)((double)windowH * scaleY);
+                        if (renderW == 0) renderW = 1;
+                        if (renderH == 0) renderH = 1;
 
                         // App-side Kooima stereo projection
                         Display3DView stereoViews[2];
@@ -831,11 +843,17 @@ static void RenderThreadFunc(
 
                             if (hasGsScene) {
                                 for (int eye = 0; eye < eyeCount; eye++) {
-                                    uint32_t vpX = monoMode ? 0 : eye * renderW;
+                                    // Row-major eye placement in the atlas; for 2×1 SBS
+                                    // this is (0, renderW) at row 0; for mono (cols=1)
+                                    // it collapses to (0, 0).
+                                    uint32_t col = (uint32_t)eye % cols;
+                                    uint32_t row = (uint32_t)eye / cols;
+                                    uint32_t vpX = col * renderW;
+                                    uint32_t vpY = row * renderH;
                                     g_gsRenderer.renderEye(
                                         (*swapchainVkImages)[imageIndex], colorFormat,
                                         xr->swapchain.width, xr->swapchain.height,
-                                        vpX, 0, renderW, renderH,
+                                        vpX, vpY, renderW, renderH,
                                         viewMat[eye], projMat[eye]);
                                 }
                             } else {
@@ -843,14 +861,13 @@ static void RenderThreadFunc(
                                     (*swapchainVkImages)[imageIndex], xr->swapchain.width, xr->swapchain.height);
                             }
 
-                            // 'I' key: dump multi-view atlas (cols × rows × renderW × renderH)
+                            // 'I' key: dump the rendered atlas (cols × rows × renderW × renderH)
                             // to %USERPROFILE%\Pictures\DisplayXR\<scene>-<n>_<cols>x<rows>.png.
-                            // Skipped for mono (1×1) layouts. Filename auto-increments so
-                            // existing captures aren't overwritten.
+                            // Atlas dims come from the current rendering mode's tile layout
+                            // and view scale — works for mono (1×1), SBS (2×1), and any other
+                            // layout the runtime advertises. Filename auto-increments.
                             if (g_captureAtlasRequested.exchange(false)) {
-                                if (!monoMode && hasGsScene) {
-                                    uint32_t cols = (uint32_t)eyeCount;  // Win demo uses 2×1
-                                    uint32_t rows = 1;
+                                if (hasGsScene) {
                                     uint32_t atlasW = cols * renderW;
                                     uint32_t atlasH = rows * renderH;
                                     if (atlasW <= xr->swapchain.width &&
@@ -880,23 +897,26 @@ static void RenderThreadFunc(
                                             0, 0, atlasW, atlasH, outPath,
                                             /*linearBytesInSrgbImage=*/true);
                                         if (ok) {
-                                            LOG_INFO("Captured atlas %ux%u -> %s",
-                                                     atlasW, atlasH, outPath.c_str());
+                                            LOG_INFO("Captured %ux%u (%ux%u tiles) -> %s",
+                                                     atlasW, atlasH, cols, rows, outPath.c_str());
                                             dxr_capture::PostFlashRequest(hwnd);
                                         }
+                                    } else {
+                                        LOG_WARN("Capture skipped: atlas %ux%u exceeds swapchain %ux%u",
+                                                 atlasW, atlasH, xr->swapchain.width, xr->swapchain.height);
                                     }
                                 } else {
-                                    LOG_WARN("Capture skipped: need 3D mode + loaded scene "
-                                             "(monoMode=%d, scene=%s)",
-                                             (int)monoMode, hasGsScene ? "loaded" : "none");
+                                    LOG_WARN("Capture skipped: no scene loaded");
                                 }
                             }
 
                             for (int eye = 0; eye < eyeCount; eye++) {
+                                uint32_t col = (uint32_t)eye % cols;
+                                uint32_t row = (uint32_t)eye / cols;
                                 projectionViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
                                 projectionViews[eye].subImage.swapchain = xr->swapchain.swapchain;
                                 projectionViews[eye].subImage.imageRect.offset = {
-                                    (int32_t)(monoMode ? 0 : eye * renderW), 0};
+                                    (int32_t)(col * renderW), (int32_t)(row * renderH)};
                                 projectionViews[eye].subImage.imageRect.extent = {
                                     (int32_t)renderW, (int32_t)renderH};
                                 projectionViews[eye].subImage.imageArrayIndex = 0;
@@ -934,19 +954,21 @@ static void RenderThreadFunc(
                                 }
                                 modeText += sceneText;
 
-                                bool dispMonoMode = (xr->renderingModeCount > 0 && !xr->renderingModeDisplay3D[inputSnapshot.currentRenderingMode]);
-                                uint32_t dispRenderW, dispRenderH;
-                                if (dispMonoMode) {
-                                    dispRenderW = windowW;
-                                    dispRenderH = windowH;
-                                    if (dispRenderW > xr->swapchain.width) dispRenderW = xr->swapchain.width;
-                                    if (dispRenderH > xr->swapchain.height) dispRenderH = xr->swapchain.height;
+                                // Per-view extent for HUD display — same formula as the
+                                // render path (window × view_scale of the current mode).
+                                float dispScaleX, dispScaleY;
+                                if (xr->renderingModeCount > 0) {
+                                    uint32_t mode = inputSnapshot.currentRenderingMode;
+                                    dispScaleX = xr->renderingModeScaleX[mode];
+                                    dispScaleY = xr->renderingModeScaleY[mode];
                                 } else {
-                                    dispRenderW = (uint32_t)(windowW * xr->recommendedViewScaleX);
-                                    dispRenderH = (uint32_t)(windowH * xr->recommendedViewScaleY);
-                                    if (dispRenderW > xr->swapchain.width / 2) dispRenderW = xr->swapchain.width / 2;
-                                    if (dispRenderH > xr->swapchain.height) dispRenderH = xr->swapchain.height;
+                                    dispScaleX = xr->recommendedViewScaleX;
+                                    dispScaleY = xr->recommendedViewScaleY;
                                 }
+                                uint32_t dispRenderW = (uint32_t)((double)windowW * dispScaleX);
+                                uint32_t dispRenderH = (uint32_t)((double)windowH * dispScaleY);
+                                if (dispRenderW == 0) dispRenderW = 1;
+                                if (dispRenderH == 0) dispRenderH = 1;
                                 std::wstring perfText = FormatPerformanceInfo(perfStats.fps, perfStats.frameTimeMs,
                                     dispRenderW, dispRenderH, windowW, windowH);
                                 std::wstring dispText = FormatDisplayInfo(xr->displayWidthM, xr->displayHeightM,
