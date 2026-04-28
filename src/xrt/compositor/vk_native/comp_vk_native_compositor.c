@@ -25,6 +25,7 @@
 #include "xrt/xrt_display_processor.h"
 
 #include "vk/vk_helpers.h"
+#include "vk/vk_hud_blend.h"
 
 #include "util/u_logging.h"
 #include "util/u_misc.h"
@@ -185,6 +186,12 @@ struct comp_vk_native_compositor
 
 	//! Canvas output rect for shared-texture apps.
 	struct u_canvas_rect canvas;
+
+	//! Alpha-blend pipeline for window-space (HUD) layers. Lazy-initialized
+	//! the first frame a window-space layer is submitted (we don't know the
+	//! target format at compositor create time on all platforms).
+	struct vk_hud_blend window_space_blend;
+	bool window_space_blend_attempted;
 };
 
 /*
@@ -891,26 +898,29 @@ vk_compositor_layer_window_space(struct xrt_compositor *xc,
 }
 
 /*!
- * Blit window-space (HUD) layers onto the target image POST-WEAVE.
- * HUD must not be interlaced — it should appear flat on screen.
- * Records commands into the provided command buffer.
+ * Composite window-space (HUD) layers onto the target image POST-WEAVE
+ * with proper alpha blending — replaces the previous opaque vkCmdBlitImage
+ * path so transparent texels actually disappear and semi-transparent
+ * backdrops read as semi-transparent. HUD must not be interlaced; it
+ * appears flat on screen.
  *
- * @param c The compositor.
- * @param cmd Active command buffer to record into.
- * @param target_image Target swapchain VkImage (already in PRESENT_SRC_KHR).
- * @param target_width Target width.
+ * @param c             The compositor.
+ * @param cmd           Active command buffer to record into.
+ * @param target_image  Target swapchain VkImage (in PRESENT_SRC_KHR).
+ * @param target_view   Target swapchain VkImageView (for the framebuffer).
+ * @param target_width  Target width.
  * @param target_height Target height.
  */
 static void
 vk_compositor_blit_window_space_layers(struct comp_vk_native_compositor *c,
                                         VkCommandBuffer cmd,
                                         VkImage target_image,
+                                        VkImageView target_view,
                                         uint32_t target_width,
                                         uint32_t target_height)
 {
 	struct vk_bundle *vk = &c->vk;
 
-	// Check if there are any window-space layers
 	bool has_ws = false;
 	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
 		if (c->layer_accum.layers[i].data.type == XRT_LAYER_WINDOW_SPACE) {
@@ -922,28 +932,25 @@ vk_compositor_blit_window_space_layers(struct comp_vk_native_compositor *c,
 		return;
 	}
 
-	// Transition target from PRESENT_SRC_KHR to TRANSFER_DST for blitting
-	VkImageMemoryBarrier to_dst = {
-	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-	    .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-	    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-	    .oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-	    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-	    .image = target_image,
-	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-	};
-	vk->vkCmdPipelineBarrier(cmd,
-	    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-	    VK_PIPELINE_STAGE_TRANSFER_BIT,
-	    0, 0, NULL, 0, NULL, 1, &to_dst);
+	// Lazy-init the alpha-blend pipeline on first use (target format isn't
+	// available at compositor create time on all paths).
+	if (!c->window_space_blend.initialized && !c->window_space_blend_attempted) {
+		c->window_space_blend_attempted = true;
+		VkFormat target_fmt = comp_vk_native_target_get_format(c->target);
+		if (!vk_hud_blend_init(&c->window_space_blend, vk, target_fmt)) {
+			U_LOG_E("[VK native] window-space alpha-blend init failed; "
+			        "layers will be skipped");
+		}
+	}
+	if (!c->window_space_blend.initialized) {
+		return;
+	}
 
-	// Blit each window-space layer onto target (post-weave, flat 2D overlay)
 	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
 		struct comp_layer *layer = &c->layer_accum.layers[i];
 		if (layer->data.type != XRT_LAYER_WINDOW_SPACE) {
 			continue;
 		}
-
 		struct xrt_swapchain *xsc = layer->sc_array[0];
 		if (xsc == NULL) {
 			continue;
@@ -958,79 +965,58 @@ vk_compositor_blit_window_space_layers(struct comp_vk_native_compositor *c,
 			continue;
 		}
 
-		// Source rect from the swapchain sub-image
-		const struct xrt_rect *src_rect = &ws->sub.rect;
-		int32_t sx0 = src_rect->offset.w;
-		int32_t sy0 = src_rect->offset.h;
-		int32_t sx1 = sx0 + (int32_t)src_rect->extent.w;
-		int32_t sy1 = sy0 + (int32_t)src_rect->extent.h;
+		uint32_t src_w = ws->sub.rect.extent.w;
+		uint32_t src_h = ws->sub.rect.extent.h;
 
-		// Destination rect in full-window coordinates (fractional position)
+		// Destination rect: window-fraction → swapchain pixels.
 		int32_t dx0 = (int32_t)(ws->x * (float)target_width);
 		int32_t dy0 = (int32_t)(ws->y * (float)target_height);
 		int32_t dw = (int32_t)(ws->width * (float)target_width);
 		int32_t dh = (int32_t)(ws->height * (float)target_height);
+		if (dw <= 0 || dh <= 0) {
+			continue;
+		}
 
-		// Transition source to TRANSFER_SRC
-		VkImageMemoryBarrier src_to_transfer = {
+		// Transition source from COLOR_ATTACHMENT_OPTIMAL → SHADER_READ_ONLY_OPTIMAL.
+		VkImageMemoryBarrier src_to_sample = {
 		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
 		    .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-		    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+		    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
 		    .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-		    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		    .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
 		    .image = src_image,
 		    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1,
 		                         ws->sub.array_index, 1},
 		};
 		vk->vkCmdPipelineBarrier(cmd,
 		    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-		    VK_PIPELINE_STAGE_TRANSFER_BIT,
-		    0, 0, NULL, 0, NULL, 1, &src_to_transfer);
+		    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+		    0, 0, NULL, 0, NULL, 1, &src_to_sample);
 
-		// Blit HUD onto target (no disparity — flat 2D overlay post-weave)
-		VkImageBlit blit = {
-		    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0,
-		                       ws->sub.array_index, 1},
-		    .srcOffsets = {{sx0, sy0, 0}, {sx1, sy1, 1}},
-		    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-		    .dstOffsets = {{dx0, dy0, 0}, {dx0 + dw, dy0 + dh, 1}},
-		};
-		vk->vkCmdBlitImage(cmd,
-		    src_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-		    target_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-		    1, &blit, VK_FILTER_LINEAR);
+		vk_hud_blend_draw(&c->window_space_blend, vk, cmd,
+		                   target_view, target_image,
+		                   target_width, target_height,
+		                   src_image, src_w, src_h,
+		                   dx0, dy0, (uint32_t)dw, (uint32_t)dh);
 
-		// Transition source back to COLOR_ATTACHMENT
+		// Transition source back to COLOR_ATTACHMENT_OPTIMAL so the app
+		// can render into it on the next frame (matches what callers
+		// expect after this function returns).
 		VkImageMemoryBarrier src_back = {
 		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		    .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+		    .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
 		    .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-		    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		    .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
 		    .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
 		    .image = src_image,
 		    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1,
 		                         ws->sub.array_index, 1},
 		};
 		vk->vkCmdPipelineBarrier(cmd,
-		    VK_PIPELINE_STAGE_TRANSFER_BIT,
+		    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
 		    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 		    0, 0, NULL, 0, NULL, 1, &src_back);
 	}
-
-	// Transition target back to PRESENT_SRC_KHR
-	VkImageMemoryBarrier to_present = {
-	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-	    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-	    .dstAccessMask = 0,
-	    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-	    .newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-	    .image = target_image,
-	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-	};
-	vk->vkCmdPipelineBarrier(cmd,
-	    VK_PIPELINE_STAGE_TRANSFER_BIT,
-	    VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-	    0, 0, NULL, 0, NULL, 1, &to_present);
 }
 
 /*
@@ -1992,9 +1978,11 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 
 				// Render pass finalLayout handles transition to PRESENT_SRC_KHR
 
-				// Post-weave: blit HUD overlays onto target (flat, not interlaced)
+				// Post-weave: composite HUD overlays onto target (alpha-blended, flat 2D)
 				vk_compositor_blit_window_space_layers(c, cmd,
-				    (VkImage)(uintptr_t)target_image, tgt_width, tgt_height);
+				    (VkImage)(uintptr_t)target_image,
+				    (VkImageView)(uintptr_t)target_view,
+				    tgt_width, tgt_height);
 
 				// Diagnostic HUD overlay (TAB key toggle)
 				vk_compositor_render_hud(c, cmd,
@@ -2004,9 +1992,11 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 				comp_vk_native_renderer_blit_to_target(c->renderer, cmd,
 				                                        target_image, tgt_width, tgt_height);
 
-				// Post-blit: HUD overlays onto target (flat 2D, same as post-weave path)
+				// Post-blit: HUD overlays onto target (alpha-blended, flat 2D)
 				vk_compositor_blit_window_space_layers(c, cmd,
-				    (VkImage)(uintptr_t)target_image, tgt_width, tgt_height);
+				    (VkImage)(uintptr_t)target_image,
+				    (VkImageView)(uintptr_t)target_view,
+				    tgt_width, tgt_height);
 
 				// Diagnostic HUD overlay (TAB key toggle)
 				vk_compositor_render_hud(c, cmd,
@@ -2078,6 +2068,9 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 		vk->vkFreeMemory(vk->device, c->hud_memory, NULL);
 	}
 	u_hud_destroy(&c->hud);
+
+	// Destroy window-space (HUD) alpha-blend pipeline
+	vk_hud_blend_fini(&c->window_space_blend, vk);
 
 	// Destroy DP input crop image
 	if (c->dp_input_view != VK_NULL_HANDLE) {

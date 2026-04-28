@@ -1749,9 +1749,10 @@ session_render_hud_init_gpu(struct multi_compositor *mc, struct vk_bundle *vk)
 		return false;
 	}
 
-	// Init alpha-blend pipeline for semi-transparent HUD overlay
-	if (!vk_hud_blend_init(&mc->session_render.hud_blend, vk, mc->session_render.target->format,
-	                        mc->session_render.hud_image, hud_w, hud_h)) {
+	// Init alpha-blend pipeline for semi-transparent HUD overlay (image is
+	// passed per-draw now so the helper can be reused with rotating swapchain
+	// images and per-layer destination rects).
+	if (!vk_hud_blend_init(&mc->session_render.hud_blend, vk, mc->session_render.target->format)) {
 		U_LOG_E("[HUD] Failed to init alpha-blend pipeline");
 		return false;
 	}
@@ -1986,8 +1987,13 @@ session_render_hud_overlay(struct multi_compositor *mc,
 		        mc->session_render.hud_blend.initialized);
 		mono_hud_blend_logged = true;
 	}
+	// Bottom-left placement with a 10px margin (matches the previous behavior
+	// when destination rect was hardcoded inside vk_hud_blend_draw).
+	int32_t hud_dst_x = 10;
+	int32_t hud_dst_y = (fb_height > hud_h + 10u) ? (int32_t)(fb_height - hud_h - 10u) : 0;
 	vk_hud_blend_draw(&mc->session_render.hud_blend, vk, cmd, swapchain_view, swapchain_image, fb_width,
-	                   fb_height, hud_w, hud_h);
+	                   fb_height, mc->session_render.hud_image, hud_w, hud_h,
+	                   hud_dst_x, hud_dst_y, hud_w, hud_h);
 }
 
 /*!

@@ -98,16 +98,24 @@ const void* RenderHudAndMap(HudRenderer& hud, uint32_t* rowPitch,
     const std::wstring& stereoText,
     const std::wstring& helpText,
     const std::vector<HudButton>& buttons,
-    bool drawBody)
+    bool drawBody,
+    bool bodyAtBottom)
 {
-    // Translucent black backdrop. The vk_native compositor currently blits
-    // window-space layers without alpha blending so the layer reads opaque
-    // on screen — but the alpha is preserved for compositors that do blend
-    // (d3d11 native), and the RGB value is what matters either way.
+    // bodyAtBottom mode clears to transparent and draws a tight backdrop
+    // only behind the body region (so a full-window-height HUD layer stays
+    // mostly invisible). Legacy mode keeps the full-texture translucent
+    // clear so existing apps that fill the HUD top-down look identical.
     ID3D11RenderTargetView* rtv = nullptr;
     hud.device->CreateRenderTargetView(hud.renderTex.Get(), nullptr, &rtv);
     if (rtv) {
-        float clearColor[4] = {0.0f, 0.0f, 0.0f, 0.5f};
+        float clearColor[4];
+        if (bodyAtBottom) {
+            clearColor[0] = 0.0f; clearColor[1] = 0.0f;
+            clearColor[2] = 0.0f; clearColor[3] = 0.0f;
+        } else {
+            clearColor[0] = 0.0f; clearColor[1] = 0.0f;
+            clearColor[2] = 0.0f; clearColor[3] = drawBody ? 0.5f : 0.0f;
+        }
         hud.context->ClearRenderTargetView(rtv, clearColor);
         rtv->Release();
     }
@@ -118,6 +126,18 @@ const void* RenderHudAndMap(HudRenderer& hud, uint32_t* rowPitch,
     float tw = (float)hud.width - 2.0f * px;    // text width
     float gap = smallLineH * 0.3f;              // inter-section gap
 
+    struct Section { const std::wstring& text; bool isSmall; };
+    Section sections[] = {
+        {sessionText, false},
+        {modeText, true},
+        {perfText, true},
+        {displayInfoText, true},
+        {eyeText, true},
+        {cameraText, true},
+        {stereoText, true},
+        {helpText, true},
+    };
+
     if (drawBody) {
         // Reserve top of the texture for buttons (if any) so body text
         // doesn't overlap them. Without buttons this collapses to top padding.
@@ -126,19 +146,34 @@ const void* RenderHudAndMap(HudRenderer& hud, uint32_t* rowPitch,
             float bb = b.y + b.height;
             if (bb > buttonBandBottom) buttonBandBottom = bb;
         }
-        float y = (buttonBandBottom > 0.0f) ? (buttonBandBottom + gap) : gap;
 
-        struct Section { const std::wstring& text; bool isSmall; };
-        Section sections[] = {
-            {sessionText, false},
-            {modeText, true},
-            {perfText, true},
-            {displayInfoText, true},
-            {eyeText, true},
-            {cameraText, true},
-            {stereoText, true},
-            {helpText, true},
-        };
+        // Compute total body height (sections + inter-section gaps).
+        float bodyH = 0.0f;
+        bool firstSec = true;
+        for (const auto& s : sections) {
+            if (s.text.empty()) continue;
+            float lh = s.isSmall ? smallLineH : normalLineH;
+            bodyH += lh * countLines(s.text);
+            if (!firstSec) bodyH += gap;
+            firstSec = false;
+        }
+
+        float y;
+        if (bodyAtBottom) {
+            float bottomPad = gap * 1.5f;
+            y = (float)hud.height - bodyH - bottomPad;
+            float topLimit = (buttonBandBottom > 0.0f) ? (buttonBandBottom + gap) : gap;
+            if (y < topLimit) y = topLimit;
+            float pad = gap;
+            // 50% black backdrop behind body region only — relies on the
+            // compositor honoring source alpha for the empty regions.
+            RenderFilledRect(hud.overlay, hud.device.Get(), hud.renderTex.Get(),
+                px - pad, y - pad,
+                tw + 2.0f * pad, bodyH + 2.0f * pad,
+                0.0f, 0.0f, 0.0f, 0.5f, 8.0f);
+        } else {
+            y = (buttonBandBottom > 0.0f) ? (buttonBandBottom + gap) : gap;
+        }
 
         for (const auto& s : sections) {
             if (s.text.empty()) continue;

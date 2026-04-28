@@ -48,12 +48,15 @@ static const char* APP_NAME = "gaussian_splatting_handle_vk_win";
 static const wchar_t* WINDOW_CLASS = L"SR3DGSOpenXRExtVKClass";
 static const wchar_t* WINDOW_TITLE = L"DisplayXR Gaussian Splat Viewer Demo";
 
-// HUD overlay fractions. Top-left rect; buttons render at the very top of the
-// HUD texture, body text packs immediately below them so the opaque layer
-// stays a single contiguous region (the vk_native compositor blits this layer
-// without alpha blending — see TODO: fix native VK alpha-blended HUD).
+// HUD overlay fractions. Layer spans full window height so chrome buttons
+// can sit at the window top while the info panel anchors to the bottom-left
+// (matching the macOS demo's split). The vk_native compositor now uses an
+// alpha-blended draw pass for window-space layers, so the empty middle of
+// the texture stays invisible. Font sizing is anchored to the legacy
+// 0.5-fraction so text doesn't grow with the taller texture.
 static const float HUD_WIDTH_FRACTION = 0.30f;
-static const float HUD_HEIGHT_FRACTION = 0.50f;
+static const float HUD_HEIGHT_FRACTION = 1.0f;
+static const float HUD_FONT_BASE_FRACTION = 0.50f;
 
 // Top-bar buttons live inside the HUD overlay's window-space footprint
 // (left strip of the window, fracW × fracH = HUD_WIDTH_FRACTION × HUD_HEIGHT_FRACTION).
@@ -1116,7 +1119,8 @@ static void RenderThreadFunc(
                                 uint32_t srcRowPitch = 0;
                                 const void* pixels = RenderHudAndMap(*hud, &srcRowPitch, sessionText, modeText, perfText, dispText, eyeText,
                                     cameraText, stereoText, helpText, buttons,
-                                    /*drawBody=*/inputSnapshot.hudVisible);
+                                    /*drawBody=*/inputSnapshot.hudVisible,
+                                    /*bodyAtBottom=*/true);
                                 if (pixels) {
                                     const uint8_t* src = (const uint8_t*)pixels;
                                     uint8_t* dst = (uint8_t*)hudStagingMapped;
@@ -1193,36 +1197,12 @@ static void RenderThreadFunc(
                 // Submit frame
                 uint32_t submitViewCount = (xr->renderingModeCount > 0 && inputSnapshot.currentRenderingMode < xr->renderingModeCount) ? xr->renderingModeViewCounts[inputSnapshot.currentRenderingMode] : 2;
                 if (rendered && hudSubmitted) {
-                    // When body is hidden, shrink the layer to just the button
-                    // band: the vk_native compositor blits this layer opaquely,
-                    // so anything inside the layer rect paints solid pixels —
-                    // submitting the full HUD with mostly-empty content would
-                    // cover most of the left side of the window in black.
-                    bool bodyShown = inputSnapshot.hudVisible;
-                    int32_t srcW = (int32_t)hudWidth;
-                    int32_t srcH;
-                    float fracW = HUD_WIDTH_FRACTION;
-                    float fracH;
-                    if (bodyShown) {
-                        srcH = (int32_t)hudHeight;
-                        float hudAR = (float)srcW / (float)srcH;
-                        float windowAR = (windowW > 0 && windowH > 0) ? (float)windowW / (float)windowH : 1.0f;
-                        fracH = fracW * windowAR / hudAR;
-                        if (fracH > 1.0f) { fracH = 1.0f; fracW = hudAR / windowAR; }
-                    } else {
-                        // Match the band the HUD renderer reserves for buttons.
-                        // Extra parens defeat the windows.h `max` macro.
-                        float btnBandWindowY = (std::max)(
-                            OPEN_BTN_Y_FRACTION + OPEN_BTN_HEIGHT_FRACTION,
-                            MODE_BTN_Y_FRACTION + MODE_BTN_HEIGHT_FRACTION) + 0.005f;
-                        fracH = btnBandWindowY;
-                        srcH = (int32_t)((btnBandWindowY / HUD_HEIGHT_FRACTION) * (float)hudHeight);
-                        if (srcH < 1) srcH = 1;
-                        if (srcH > (int32_t)hudHeight) srcH = (int32_t)hudHeight;
-                    }
+                    // Layer spans the full HUD footprint (full window height
+                    // by HUD_WIDTH_FRACTION). Empty regions (alpha=0) are
+                    // invisible thanks to the alpha-blended composite path
+                    // in the vk_native compositor.
                     EndFrameWithWindowSpaceHud(*xr, frameState.predictedDisplayTime, projectionViews,
-                        0.0f, 0.0f, fracW, fracH, 0.0f, submitViewCount,
-                        0, 0, srcW, srcH);
+                        0.0f, 0.0f, HUD_WIDTH_FRACTION, HUD_HEIGHT_FRACTION, 0.0f, submitViewCount);
                 } else if (rendered) {
                     EndFrame(*xr, frameState.predictedDisplayTime, projectionViews, submitViewCount);
                 } else {
@@ -1439,7 +1419,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     uint32_t hudHeight = (uint32_t)(xr.swapchain.height * HUD_HEIGHT_FRACTION);
 
     HudRenderer hudRenderer = {};
-    bool hudOk = InitializeHudRenderer(hudRenderer, hudWidth, hudHeight);
+    uint32_t hudFontBaseHeight = (uint32_t)(xr.swapchain.height * HUD_FONT_BASE_FRACTION);
+    bool hudOk = InitializeHudRenderer(hudRenderer, hudWidth, hudHeight, hudFontBaseHeight);
     if (!hudOk) {
         LOG_WARN("HUD renderer init failed - HUD will not be displayed");
     }

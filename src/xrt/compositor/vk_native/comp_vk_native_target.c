@@ -481,6 +481,12 @@ comp_vk_native_target_get_current_image(struct comp_vk_native_target *target,
 	*out_view = (uint64_t)(uintptr_t)target->views[target->current_index];
 }
 
+VkFormat
+comp_vk_native_target_get_format(struct comp_vk_native_target *target)
+{
+	return target->format;
+}
+
 xrt_result_t
 comp_vk_native_target_resize(struct comp_vk_native_target *target,
                                uint32_t width,

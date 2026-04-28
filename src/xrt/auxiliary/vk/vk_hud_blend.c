@@ -108,10 +108,7 @@ static const uint32_t hud_frag_spv[] = {
 bool
 vk_hud_blend_init(struct vk_hud_blend *blend,
                    struct vk_bundle *vk,
-                   VkFormat target_fmt,
-                   VkImage hud_image,
-                   uint32_t hud_w,
-                   uint32_t hud_h)
+                   VkFormat target_fmt)
 {
 	VkResult ret;
 
@@ -138,31 +135,18 @@ vk_hud_blend_init(struct vk_hud_blend *blend,
 		return false;
 	}
 
-	// Sampler (nearest for crisp pixel text)
+	// Sampler — linear so the alpha-blended layer reads cleanly when the
+	// dst rect doesn't perfectly align to source pixels.
 	VkSamplerCreateInfo samp_ci = {
 	    .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
-	    .magFilter = VK_FILTER_NEAREST,
-	    .minFilter = VK_FILTER_NEAREST,
+	    .magFilter = VK_FILTER_LINEAR,
+	    .minFilter = VK_FILTER_LINEAR,
 	    .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
 	    .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
 	};
 	ret = vk->vkCreateSampler(vk->device, &samp_ci, NULL, &blend->sampler);
 	if (ret != VK_SUCCESS) {
 		U_LOG_E("[HUD blend] Failed to create sampler: %d", ret);
-		return false;
-	}
-
-	// HUD image view
-	VkImageViewCreateInfo view_ci = {
-	    .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-	    .image = hud_image,
-	    .viewType = VK_IMAGE_VIEW_TYPE_2D,
-	    .format = VK_FORMAT_R8G8B8A8_UNORM,
-	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-	};
-	ret = vk->vkCreateImageView(vk->device, &view_ci, NULL, &blend->hud_view);
-	if (ret != VK_SUCCESS) {
-		U_LOG_E("[HUD blend] Failed to create HUD image view: %d", ret);
 		return false;
 	}
 
@@ -194,11 +178,15 @@ vk_hud_blend_init(struct vk_hud_blend *blend,
 		return false;
 	}
 
-	// Descriptor pool + set
-	VkDescriptorPoolSize pool_size = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1};
+	// Descriptor pool sized for VK_HUD_BLEND_MAX_IMAGES sets — one per
+	// unique HUD source image (OpenXR HUD swapchains rotate per frame).
+	VkDescriptorPoolSize pool_size = {
+	    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+	    VK_HUD_BLEND_MAX_IMAGES,
+	};
 	VkDescriptorPoolCreateInfo dp_ci = {
 	    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-	    .maxSets = 1,
+	    .maxSets = VK_HUD_BLEND_MAX_IMAGES,
 	    .poolSizeCount = 1,
 	    .pPoolSizes = &pool_size,
 	};
@@ -206,33 +194,6 @@ vk_hud_blend_init(struct vk_hud_blend *blend,
 	if (ret != VK_SUCCESS) {
 		return false;
 	}
-
-	VkDescriptorSetAllocateInfo ds_ai = {
-	    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-	    .descriptorPool = blend->desc_pool,
-	    .descriptorSetCount = 1,
-	    .pSetLayouts = &blend->desc_layout,
-	};
-	ret = vk->vkAllocateDescriptorSets(vk->device, &ds_ai, &blend->desc_set);
-	if (ret != VK_SUCCESS) {
-		return false;
-	}
-
-	// Write descriptor set: HUD texture
-	VkDescriptorImageInfo img_info = {
-	    .sampler = blend->sampler,
-	    .imageView = blend->hud_view,
-	    .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-	};
-	VkWriteDescriptorSet write = {
-	    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-	    .dstSet = blend->desc_set,
-	    .dstBinding = 0,
-	    .descriptorCount = 1,
-	    .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-	    .pImageInfo = &img_info,
-	};
-	vk->vkUpdateDescriptorSets(vk->device, 1, &write, 0, NULL);
 
 	// Render pass: single color attachment, LOAD_OP_LOAD, STORE_OP_STORE
 	VkAttachmentDescription att = {
@@ -299,13 +260,16 @@ vk_hud_blend_init(struct vk_hud_blend *blend,
 	    .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT};
 	VkPipelineColorBlendAttachmentState blend_att = {
 	    .blendEnable = VK_TRUE,
+	    // Don't touch the framebuffer's alpha channel — leaves whatever the
+	    // present path expects intact (some compositors treat alpha as window
+	    // transparency even with COMPOSITE_ALPHA_OPAQUE_BIT).
 	    .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-	                      VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
+	                      VK_COLOR_COMPONENT_B_BIT,
 	    .srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA,
 	    .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
 	    .colorBlendOp = VK_BLEND_OP_ADD,
-	    .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
-	    .dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO,
+	    .srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO,
+	    .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
 	    .alphaBlendOp = VK_BLEND_OP_ADD};
 	VkPipelineColorBlendStateCreateInfo cb = {
 	    .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
@@ -345,6 +309,75 @@ vk_hud_blend_init(struct vk_hud_blend *blend,
 	return true;
 }
 
+/*!
+ * Look up the cached descriptor set for a HUD source image, creating
+ * (and binding) one on first sight. Returns VK_NULL_HANDLE if the cache
+ * is full.
+ */
+static VkDescriptorSet
+get_or_create_image_desc(struct vk_hud_blend *blend,
+                          struct vk_bundle *vk,
+                          VkImage hud_image)
+{
+	for (uint32_t i = 0; i < blend->image_count; i++) {
+		if (blend->cached_images[i].image == hud_image) {
+			return blend->cached_images[i].desc_set;
+		}
+	}
+
+	if (blend->image_count >= VK_HUD_BLEND_MAX_IMAGES) {
+		U_LOG_E("[HUD blend] image cache exhausted (max=%u)", VK_HUD_BLEND_MAX_IMAGES);
+		return VK_NULL_HANDLE;
+	}
+
+	VkImageViewCreateInfo view_ci = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+	    .image = hud_image,
+	    .viewType = VK_IMAGE_VIEW_TYPE_2D,
+	    .format = VK_FORMAT_R8G8B8A8_UNORM,
+	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	};
+	VkImageView view = VK_NULL_HANDLE;
+	if (vk->vkCreateImageView(vk->device, &view_ci, NULL, &view) != VK_SUCCESS) {
+		U_LOG_E("[HUD blend] CreateImageView failed");
+		return VK_NULL_HANDLE;
+	}
+
+	VkDescriptorSetAllocateInfo ds_ai = {
+	    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+	    .descriptorPool = blend->desc_pool,
+	    .descriptorSetCount = 1,
+	    .pSetLayouts = &blend->desc_layout,
+	};
+	VkDescriptorSet desc_set = VK_NULL_HANDLE;
+	if (vk->vkAllocateDescriptorSets(vk->device, &ds_ai, &desc_set) != VK_SUCCESS) {
+		vk->vkDestroyImageView(vk->device, view, NULL);
+		U_LOG_E("[HUD blend] AllocateDescriptorSets failed");
+		return VK_NULL_HANDLE;
+	}
+
+	VkDescriptorImageInfo img_info = {
+	    .sampler = blend->sampler,
+	    .imageView = view,
+	    .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	};
+	VkWriteDescriptorSet write = {
+	    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+	    .dstSet = desc_set,
+	    .dstBinding = 0,
+	    .descriptorCount = 1,
+	    .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+	    .pImageInfo = &img_info,
+	};
+	vk->vkUpdateDescriptorSets(vk->device, 1, &write, 0, NULL);
+
+	blend->cached_images[blend->image_count].image = hud_image;
+	blend->cached_images[blend->image_count].view = view;
+	blend->cached_images[blend->image_count].desc_set = desc_set;
+	blend->image_count++;
+	return desc_set;
+}
+
 void
 vk_hud_blend_draw(struct vk_hud_blend *blend,
                    struct vk_bundle *vk,
@@ -353,18 +386,26 @@ vk_hud_blend_draw(struct vk_hud_blend *blend,
                    VkImage target_image,
                    uint32_t fb_w,
                    uint32_t fb_h,
+                   VkImage hud_image,
                    uint32_t hud_w,
-                   uint32_t hud_h)
+                   uint32_t hud_h,
+                   int32_t dst_x,
+                   int32_t dst_y,
+                   uint32_t dst_w,
+                   uint32_t dst_h)
 {
-	if (!blend->initialized) {
+	if (!blend->initialized || hud_image == VK_NULL_HANDLE || dst_w == 0 || dst_h == 0) {
+		return;
+	}
+	(void)hud_w;
+	(void)hud_h;
+
+	VkDescriptorSet desc_set = get_or_create_image_desc(blend, vk, hud_image);
+	if (desc_set == VK_NULL_HANDLE) {
 		return;
 	}
 
-	// HUD position: bottom-left with 10px margin
-	uint32_t dst_x = 10;
-	uint32_t dst_y = (fb_h > hud_h + 10) ? (fb_h - hud_h - 10) : 0;
-
-	// Invalidate cache if dimensions changed (e.g. swapchain resize)
+	// Invalidate framebuffer cache if swapchain dims changed.
 	if (blend->fb_w != fb_w || blend->fb_h != fb_h) {
 		for (uint32_t i = 0; i < blend->fb_count; i++) {
 			vk->vkDestroyFramebuffer(vk->device, blend->cached_fbs[i], NULL);
@@ -374,7 +415,6 @@ vk_hud_blend_draw(struct vk_hud_blend *blend,
 		blend->fb_h = fb_h;
 	}
 
-	// Find or create cached framebuffer for this swapchain image view
 	VkFramebuffer fb = VK_NULL_HANDLE;
 	for (uint32_t i = 0; i < blend->fb_count; i++) {
 		if (blend->cached_views[i] == target_view) {
@@ -392,8 +432,7 @@ vk_hud_blend_draw(struct vk_hud_blend *blend,
 		    .height = fb_h,
 		    .layers = 1,
 		};
-		VkResult ret = vk->vkCreateFramebuffer(vk->device, &fb_ci, NULL, &fb);
-		if (ret != VK_SUCCESS) {
+		if (vk->vkCreateFramebuffer(vk->device, &fb_ci, NULL, &fb) != VK_SUCCESS) {
 			return;
 		}
 		blend->cached_views[blend->fb_count] = target_view;
@@ -404,12 +443,10 @@ vk_hud_blend_draw(struct vk_hud_blend *blend,
 		return;
 	}
 
-	// Transition swapchain: PRESENT_SRC -> COLOR_ATTACHMENT_OPTIMAL
-	// srcAccessMask must include all write types that may have touched the
-	// target before this barrier: TRANSFER_WRITE (mono blit path) and
-	// COLOR_ATTACHMENT_WRITE (stereo weaver/render pass path).  Without
-	// TRANSFER_WRITE, the mono blit data is not made available for the
-	// layout transition, causing LOAD_OP_LOAD to read stale content.
+	// Transition swapchain: PRESENT_SRC -> COLOR_ATTACHMENT_OPTIMAL.
+	// srcAccessMask covers both prior write paths (TRANSFER_WRITE for mono
+	// blit, COLOR_ATTACHMENT_WRITE for stereo weaver) — without TRANSFER_WRITE
+	// LOAD_OP_LOAD reads stale content under the mono path.
 	VkImageMemoryBarrier to_color = {
 	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
 	    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
@@ -419,10 +456,11 @@ vk_hud_blend_draw(struct vk_hud_blend *blend,
 	    .image = target_image,
 	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
 	};
-	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-	                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0, NULL, 1, &to_color);
+	vk->vkCmdPipelineBarrier(cmd,
+	    VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+	        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+	    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0, NULL, 1, &to_color);
 
-	// Begin render pass (LOAD_OP_LOAD preserves 3D content)
 	VkRenderPassBeginInfo rp_bi = {
 	    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
 	    .renderPass = blend->render_pass,
@@ -431,21 +469,20 @@ vk_hud_blend_draw(struct vk_hud_blend *blend,
 	};
 	vk->vkCmdBeginRenderPass(cmd, &rp_bi, VK_SUBPASS_CONTENTS_INLINE);
 
-	// Set viewport and scissor to HUD region only
-	VkViewport vp = {(float)dst_x, (float)dst_y, (float)hud_w, (float)hud_h, 0.0f, 1.0f};
+	// Viewport positions the fullscreen triangle's [-1,1] NDC over the
+	// destination rect; scissor clips fragments outside it.
+	VkViewport vp = {(float)dst_x, (float)dst_y, (float)dst_w, (float)dst_h, 0.0f, 1.0f};
 	vk->vkCmdSetViewport(cmd, 0, 1, &vp);
-	VkRect2D scissor = {{(int32_t)dst_x, (int32_t)dst_y}, {hud_w, hud_h}};
+	VkRect2D scissor = {{dst_x, dst_y}, {dst_w, dst_h}};
 	vk->vkCmdSetScissor(cmd, 0, 1, &scissor);
 
-	// Draw fullscreen triangle (clipped to HUD region by viewport)
 	vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, blend->pipeline);
 	vk->vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, blend->pipe_layout, 0, 1,
-	                             &blend->desc_set, 0, NULL);
+	                             &desc_set, 0, NULL);
 	vk->vkCmdDraw(cmd, 3, 1, 0, 0);
 
 	vk->vkCmdEndRenderPass(cmd);
 
-	// Transition swapchain: COLOR_ATTACHMENT_OPTIMAL -> PRESENT_SRC
 	VkImageMemoryBarrier to_present = {
 	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
 	    .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
@@ -469,6 +506,10 @@ vk_hud_blend_fini(struct vk_hud_blend *blend, struct vk_bundle *vk)
 	for (uint32_t i = 0; i < blend->fb_count; i++) {
 		vk->vkDestroyFramebuffer(vk->device, blend->cached_fbs[i], NULL);
 	}
+	for (uint32_t i = 0; i < blend->image_count; i++) {
+		vk->vkDestroyImageView(vk->device, blend->cached_images[i].view, NULL);
+		// Descriptor sets freed implicitly with the pool.
+	}
 
 	if (blend->pipeline != VK_NULL_HANDLE) {
 		vk->vkDestroyPipeline(vk->device, blend->pipeline, NULL);
@@ -487,9 +528,6 @@ vk_hud_blend_fini(struct vk_hud_blend *blend, struct vk_bundle *vk)
 	}
 	if (blend->sampler != VK_NULL_HANDLE) {
 		vk->vkDestroySampler(vk->device, blend->sampler, NULL);
-	}
-	if (blend->hud_view != VK_NULL_HANDLE) {
-		vk->vkDestroyImageView(vk->device, blend->hud_view, NULL);
 	}
 	if (blend->vert_mod != VK_NULL_HANDLE) {
 		vk->vkDestroyShaderModule(vk->device, blend->vert_mod, NULL);

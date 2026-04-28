@@ -59,6 +59,13 @@ bool InitializeHudRenderer(HudRenderer& hud, uint32_t w, uint32_t h, uint32_t fo
 // Lets a HUD-toggle key hide the info panel without losing always-visible
 // chrome buttons. When buttons are present, body text is laid out below the
 // button band so the two never overlap.
+//
+// `bodyAtBottom`: when true, anchor the body block to the bottom of the
+// texture (instead of immediately under the buttons) and clear the texture
+// to fully transparent (alpha=0) instead of a translucent black backdrop.
+// A tight semi-transparent rect is drawn behind the body region only.
+// Used when the HUD swapchain spans the full window so the empty middle
+// stays invisible (requires the compositor to honor source alpha).
 const void* RenderHudAndMap(HudRenderer& hud, uint32_t* rowPitch,
     const std::wstring& sessionText, const std::wstring& modeText,
     const std::wstring& perfText, const std::wstring& displayInfoText,
@@ -67,7 +74,8 @@ const void* RenderHudAndMap(HudRenderer& hud, uint32_t* rowPitch,
     const std::wstring& stereoText = L"",
     const std::wstring& helpText = L"",
     const std::vector<HudButton>& buttons = {},
-    bool drawBody = true);
+    bool drawBody = true,
+    bool bodyAtBottom = false);
 
 // Unmap the staging texture after pixel upload
 void UnmapHud(HudRenderer& hud);

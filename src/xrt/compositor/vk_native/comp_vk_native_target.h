@@ -11,6 +11,7 @@
 
 #include "xrt/xrt_defines.h"
 #include "xrt/xrt_results.h"
+#include "xrt/xrt_vulkan_includes.h"
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -99,6 +100,14 @@ void
 comp_vk_native_target_get_current_image(struct comp_vk_native_target *target,
                                          uint64_t *out_image,
                                          uint64_t *out_view);
+
+/*!
+ * Get the target swapchain image format.
+ *
+ * @ingroup comp_vk_native
+ */
+VkFormat
+comp_vk_native_target_get_format(struct comp_vk_native_target *target);
 
 /*!
  * Resize the target swapchain.
