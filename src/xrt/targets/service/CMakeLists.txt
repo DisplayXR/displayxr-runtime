@@ -35,6 +35,8 @@ if(WIN32)
 		service_orchestrator.h
 		service_tray_win.c
 		service_tray_win.h
+		service_workspace_manifest.c
+		service_workspace_manifest.h
 		service_resources.rc
 	)
 	target_link_libraries(displayxr-service PRIVATE shell32 ws2_32)
