@@ -1961,27 +1961,41 @@ main(int argc, char *argv[])
 					// multi-compositor renders the panel in its own window when
 					// launcher_visible is true. Tile grid + launch dispatch
 					// come in later Phase 5 tasks.
-					if (g_shell_active) {
-						g_launcher_visible = !g_launcher_visible;
 
-						// Phase 5.12: when opening, hand the service process
-						// foreground-activation permission so it can pull its
-						// compositor window into focus. Otherwise keys like
-						// Esc stay routed to whichever app previously had
-						// focus and never reach the compositor WndProc that
-						// the launcher keyboard handler depends on.
-						if (g_launcher_visible && service_pid != 0) {
-							AllowSetForegroundWindow(service_pid);
+					// Auto-activate the shell if it's currently in tray. The
+					// empty-state hint promises "Press Ctrl+L to open launcher",
+					// and after closing every app the user expects one keypress
+					// to bring the launcher back without first hitting Ctrl+Space.
+					if (!g_shell_active) {
+						xrt_result_t aret = ipc_call_shell_activate(&ipc_c);
+						if (aret != XRT_SUCCESS) {
+							PE("Ctrl+L: shell_activate failed (%d)\n", aret);
+							continue;
 						}
+						g_shell_active = true;
+						tray_update_tooltip(true);
+						P("Shell activated by Ctrl+L.\n");
+					}
 
-						xrt_result_t lret = ipc_call_shell_set_launcher_visible(
-						    &ipc_c, g_launcher_visible);
-						if (lret != XRT_SUCCESS) {
-							PE("ipc_call_shell_set_launcher_visible failed: %d\n", lret);
-							g_launcher_visible = !g_launcher_visible; // roll back
-						} else {
-							P("Launcher %s\n", g_launcher_visible ? "shown" : "hidden");
-						}
+					g_launcher_visible = !g_launcher_visible;
+
+					// Phase 5.12: when opening, hand the service process
+					// foreground-activation permission so it can pull its
+					// compositor window into focus. Otherwise keys like
+					// Esc stay routed to whichever app previously had
+					// focus and never reach the compositor WndProc that
+					// the launcher keyboard handler depends on.
+					if (g_launcher_visible && service_pid != 0) {
+						AllowSetForegroundWindow(service_pid);
+					}
+
+					xrt_result_t lret = ipc_call_shell_set_launcher_visible(
+					    &ipc_c, g_launcher_visible);
+					if (lret != XRT_SUCCESS) {
+						PE("ipc_call_shell_set_launcher_visible failed: %d\n", lret);
+						g_launcher_visible = !g_launcher_visible; // roll back
+					} else {
+						P("Launcher %s\n", g_launcher_visible ? "shown" : "hidden");
 					}
 				} else if (msg.message == WM_HOTKEY && msg.wParam == HOTKEY_CAPTURE) {
 					// --- Ctrl+Shift+C: capture pre-weave SBS frame (Phase 8) ---
