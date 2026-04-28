@@ -621,7 +621,7 @@ handle_focused_client_events(volatile struct ipc_client_state *ics, int active_i
 		focused = true;
 		z_order = INT64_MIN;
 	}
-	if (ics->server->xsysc != NULL && ics->server->xsysc->info.shell_mode) {
+	if (ics->server->xsysc != NULL && ics->server->xsysc->info.workspace_mode) {
 		visible = true;
 		focused = true;
 	}
@@ -1055,8 +1055,8 @@ ipc_server_main(int argc, char **argv, const struct ipc_server_main_info *ismi)
 
 	// Allocate the server itself.
 	struct ipc_server *s = U_TYPED_CALLOC(struct ipc_server);
-	s->shell_mode = ismi->shell_mode;
-	if (s->shell_mode) {
+	s->workspace_mode = ismi->workspace_mode;
+	if (s->workspace_mode) {
 		U_LOG_IFL_I(log_level, "Shell mode enabled (--shell)");
 	}
 
@@ -1084,10 +1084,10 @@ ipc_server_main(int argc, char **argv, const struct ipc_server_main_info *ismi)
 		return -1;
 	}
 
-	// Propagate shell mode to system compositor (after init_all creates it,
+	// Propagate workspace mode to system compositor (after init_all creates it,
 	// before any clients connect and create per-client compositors)
-	if (s->shell_mode && s->xsysc != NULL) {
-		s->xsysc->info.shell_mode = true;
+	if (s->workspace_mode && s->xsysc != NULL) {
+		s->xsysc->info.workspace_mode = true;
 		U_LOG_IFL_I(log_level, "Shell mode propagated to system compositor");
 	}
 

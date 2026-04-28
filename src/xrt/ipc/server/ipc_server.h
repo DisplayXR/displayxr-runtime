@@ -407,7 +407,7 @@ struct ipc_server
 	enum u_logging_level log_level;
 
 	//! Shell mode: multi-compositor with shared window for all clients.
-	bool shell_mode;
+	bool workspace_mode;
 
 	struct ipc_thread threads[IPC_MAX_CLIENTS];
 

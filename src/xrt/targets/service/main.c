@@ -112,10 +112,10 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 
 	// Parse --shell flag for backwards compat (legacy multi-terminal workflow).
 	// The orchestrator will also enable shell mode when it spawns the shell.
-	bool shell_mode = false;
+	bool workspace_mode = false;
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--shell") == 0) {
-			shell_mode = true;
+			workspace_mode = true;
 			break;
 		}
 	}
@@ -135,7 +135,7 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 	            .window_title = "DisplayXR Service",
 	            .open = U_DEBUG_GUI_OPEN_AUTO,
 	        },
-	    .shell_mode = shell_mode,
+	    .workspace_mode = workspace_mode,
 	};
 
 	// Opt-in MCP server for agent-driven shell control / debugging.
@@ -167,10 +167,10 @@ main(int argc, char *argv[])
 	u_metrics_init();
 
 	// Parse --shell flag for multi-compositor shell mode
-	bool shell_mode = false;
+	bool workspace_mode = false;
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--shell") == 0) {
-			shell_mode = true;
+			workspace_mode = true;
 			break;
 		}
 	}
@@ -181,7 +181,7 @@ main(int argc, char *argv[])
 	            .window_title = "DisplayXR Service",
 	            .open = U_DEBUG_GUI_OPEN_AUTO,
 	        },
-	    .shell_mode = shell_mode,
+	    .workspace_mode = workspace_mode,
 	};
 
 	// Opt-in MCP server for agent-driven shell control / debugging.

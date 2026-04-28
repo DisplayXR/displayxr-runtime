@@ -2251,7 +2251,7 @@ main(int argc, char *argv[])
 
 #ifdef _WIN32
 		// Detect server-side deactivation (ESC closed the compositor window).
-		// The compositor sets shell_mode=false — sync our state.
+		// The compositor sets workspace_mode=false — sync our state.
 		if (g_shell_active) {
 			bool server_active = false;
 			if (ipc_call_workspace_get_state(&ipc_c, &server_active) == XRT_SUCCESS) {

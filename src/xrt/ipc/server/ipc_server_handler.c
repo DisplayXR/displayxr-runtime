@@ -290,14 +290,14 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 	// `comp_d3d11_service_owns_window` is false across the board in shell
 	// mode (intentional — it suppresses qwerty for shell-self rendering).
 	// Here we re-enable qwerty on a per-session basis.
-	bool shell_mode = s->xsysc != NULL && s->xsysc->info.shell_mode;
-	bool is_shell_host_session =
+	bool workspace_mode = s->xsysc != NULL && s->xsysc->info.workspace_mode;
+	bool is_workspace_controller_session =
 	    ics->client_state.info.application_name[0] != '\0' &&
 	    strcmp((const char *)ics->client_state.info.application_name, "displayxr-shell") == 0;
 	bool is_appcontainer_app =
 	    ics->client_state.info.ext_win32_appcontainer_compatible_enabled;
 	bool use_qwerty_head = compositor_owns_window ||
-	                       (shell_mode && !is_shell_host_session && is_appcontainer_app);
+	                       (workspace_mode && !is_workspace_controller_session && is_appcontainer_app);
 
 	struct xrt_vec3 display_pos = qwerty_relation.pose.position;
 	struct xrt_quat display_ori = qwerty_relation.pose.orientation;
@@ -447,7 +447,7 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 		         left_h, left_v,
 		         out_poses[0].position.x, out_poses[0].position.y, out_poses[0].position.z,
 		         out_poses[1].position.x, out_poses[1].position.y, out_poses[1].position.z,
-		         compositor_owns_window, shell_mode, is_shell_host_session,
+		         compositor_owns_window, workspace_mode, is_workspace_controller_session,
 		         is_appcontainer_app, use_qwerty_head,
 		         (const char *)ics->client_state.info.application_name);
 	}
@@ -1362,7 +1362,7 @@ ipc_handle_compositor_get_window_metrics(volatile struct ipc_client_state *ics,
 
 #if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	// Per-client window metrics are only meaningful when the D3D11 service
-	// compositor is in shell mode and has assigned a slot to this client.
+	// compositor is in workspace mode and has assigned a slot to this client.
 	// `xc` is NULL for headless / pre-render sessions; comp_d3d11_service_*
 	// returns false in that case and we surface valid=false to the client.
 	if (ics->server != NULL && ics->server->xsysc != NULL && ics->xc != NULL) {
@@ -2065,7 +2065,7 @@ ipc_handle_system_get_client_window_metrics(volatile struct ipc_client_state *_i
 	struct ipc_server *s = _ics->server;
 
 	// Per-client window metrics are only meaningful when the D3D11 service
-	// compositor is in shell mode and has assigned a slot to the target
+	// compositor is in workspace mode and has assigned a slot to the target
 	// client. Resolve client_id → xc (NULL for headless relay clients such
 	// as the WebXR bridge itself) and ask the compositor.
 	struct xrt_compositor *target_xc = NULL;
@@ -2157,28 +2157,28 @@ ipc_handle_workspace_activate(volatile struct ipc_client_state *_ics)
 {
 	struct ipc_server *s = _ics->server;
 
-	if (s->shell_mode) {
-		IPC_INFO(s, "Shell: already in shell mode — ensuring window for relaunch");
-		// Re-ensure the shell window even when already in shell mode.
-		// If the previous session was dismissed (ESC), ensure_shell_window
+	if (s->workspace_mode) {
+		IPC_INFO(s, "Workspace: already in workspace mode — ensuring window for relaunch");
+		// Re-ensure the shell window even when already in workspace mode.
+		// If the previous session was dismissed (ESC), ensure_workspace_window
 		// tears down the stale resources and creates a fresh window.
 		if (s->xsysc != NULL) {
 #ifdef XRT_OS_WINDOWS
-			comp_d3d11_service_ensure_shell_window(s->xsysc);
+			comp_d3d11_service_ensure_workspace_window(s->xsysc);
 #endif
 		}
 		return XRT_SUCCESS;
 	}
 
-	IPC_INFO(s, "Shell: activating shell mode via IPC");
+	IPC_INFO(s, "Workspace: activating shell mode via IPC");
 
-	s->shell_mode = true;
+	s->workspace_mode = true;
 	if (s->xsysc != NULL) {
-		s->xsysc->info.shell_mode = true;
+		s->xsysc->info.workspace_mode = true;
 
 #ifdef XRT_OS_WINDOWS
 		// Eagerly create the shell window so Ctrl+O works even with no apps.
-		comp_d3d11_service_ensure_shell_window(s->xsysc);
+		comp_d3d11_service_ensure_workspace_window(s->xsysc);
 #endif
 	}
 
@@ -2190,19 +2190,19 @@ ipc_handle_workspace_deactivate(volatile struct ipc_client_state *_ics)
 {
 	struct ipc_server *s = _ics->server;
 
-	if (!s->shell_mode) {
-		IPC_INFO(s, "Shell: already deactivated — ignoring");
+	if (!s->workspace_mode) {
+		IPC_INFO(s, "Workspace: already deactivated — ignoring");
 		return XRT_SUCCESS;
 	}
 
-	IPC_INFO(s, "Shell: deactivating shell mode via IPC");
+	IPC_INFO(s, "Workspace: deactivating shell mode via IPC");
 
-	s->shell_mode = false;
+	s->workspace_mode = false;
 	if (s->xsysc != NULL) {
-		s->xsysc->info.shell_mode = false;
+		s->xsysc->info.workspace_mode = false;
 
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
-		comp_d3d11_service_deactivate_shell(s->xsysc);
+		comp_d3d11_service_deactivate_workspace(s->xsysc);
 #endif
 	}
 
@@ -2213,7 +2213,7 @@ xrt_result_t
 ipc_handle_workspace_get_state(volatile struct ipc_client_state *_ics, bool *out_active)
 {
 	struct ipc_server *s = _ics->server;
-	*out_active = s->shell_mode;
+	*out_active = s->workspace_mode;
 	return XRT_SUCCESS;
 }
 
@@ -2227,7 +2227,7 @@ ipc_handle_launcher_set_visible(volatile struct ipc_client_state *_ics, bool vis
 		return XRT_ERROR_IPC_FAILURE;
 	}
 
-	IPC_INFO(s, "Shell: set_launcher_visible %s", visible ? "true" : "false");
+	IPC_INFO(s, "Workspace: set_launcher_visible %s", visible ? "true" : "false");
 	comp_d3d11_service_set_launcher_visible(s->xsysc, visible);
 	return XRT_SUCCESS;
 #else
@@ -2328,7 +2328,7 @@ ipc_handle_workspace_set_window_pose(volatile struct ipc_client_state *_ics,
 		return XRT_ERROR_IPC_FAILURE;
 	}
 
-	IPC_INFO(s, "Shell: set_window_pose client_id=%u pos=(%.3f,%.3f,%.3f) size=%.3fx%.3f",
+	IPC_INFO(s, "Workspace: set_window_pose client_id=%u pos=(%.3f,%.3f,%.3f) size=%.3fx%.3f",
 	         client_id, pose->position.x, pose->position.y, pose->position.z,
 	         width_m, height_m);
 
@@ -2354,7 +2354,7 @@ ipc_handle_workspace_set_window_pose(volatile struct ipc_client_state *_ics,
 
 	if (target_ics == NULL || target_ics->xc == NULL) {
 		os_mutex_unlock(&s->global_state.lock);
-		IPC_WARN(s, "Shell: set_window_pose - client %u not found", client_id);
+		IPC_WARN(s, "Workspace: set_window_pose - client %u not found", client_id);
 		return XRT_ERROR_IPC_FAILURE;
 	}
 
@@ -2386,7 +2386,7 @@ ipc_handle_workspace_set_window_visibility(volatile struct ipc_client_state *_ic
 		return XRT_ERROR_IPC_FAILURE;
 	}
 
-	IPC_INFO(s, "Shell: set_visibility client_id=%u visible=%d", client_id, visible);
+	IPC_INFO(s, "Workspace: set_visibility client_id=%u visible=%d", client_id, visible);
 
 	os_mutex_lock(&s->global_state.lock);
 
@@ -2482,18 +2482,18 @@ ipc_handle_workspace_add_capture_client(volatile struct ipc_client_state *_ics,
 		return XRT_ERROR_IPC_FAILURE;
 	}
 
-	IPC_INFO(s, "Shell: add_capture_client hwnd=0x%llx", (unsigned long long)hwnd);
+	IPC_INFO(s, "Workspace: add_capture_client hwnd=0x%llx", (unsigned long long)hwnd);
 
 	int slot = comp_d3d11_service_add_capture_client(s->xsysc, hwnd, NULL);
 	if (slot < 0) {
-		IPC_WARN(s, "Shell: add_capture_client failed for hwnd=0x%llx",
+		IPC_WARN(s, "Workspace: add_capture_client failed for hwnd=0x%llx",
 		         (unsigned long long)hwnd);
 		return XRT_ERROR_IPC_FAILURE;
 	}
 
 	// Capture client IDs use offset 1000+ to distinguish from IPC client IDs
 	*out_client_id = 1000 + (uint32_t)slot;
-	IPC_INFO(s, "Shell: capture client added — slot=%d client_id=%u", slot, *out_client_id);
+	IPC_INFO(s, "Workspace: capture client added — slot=%d client_id=%u", slot, *out_client_id);
 
 	return XRT_SUCCESS;
 #else
@@ -2516,13 +2516,13 @@ ipc_handle_workspace_remove_capture_client(volatile struct ipc_client_state *_ic
 	}
 
 	if (client_id < 1000) {
-		IPC_WARN(s, "Shell: remove_capture_client — invalid client_id %u (not a capture client)",
+		IPC_WARN(s, "Workspace: remove_capture_client — invalid client_id %u (not a capture client)",
 		         client_id);
 		return XRT_ERROR_IPC_FAILURE;
 	}
 
 	int slot = (int)(client_id - 1000);
-	IPC_INFO(s, "Shell: remove_capture_client client_id=%u slot=%d", client_id, slot);
+	IPC_INFO(s, "Workspace: remove_capture_client client_id=%u slot=%d", client_id, slot);
 
 	bool ok = comp_d3d11_service_remove_capture_client(s->xsysc, slot);
 	return ok ? XRT_SUCCESS : XRT_ERROR_IPC_FAILURE;
@@ -2550,7 +2550,7 @@ ipc_handle_workspace_capture_frame(volatile struct ipc_client_state *_ics,
 		return XRT_ERROR_IPC_FAILURE;
 	}
 
-	IPC_INFO(s, "Shell: capture_frame prefix=%s flags=0x%x",
+	IPC_INFO(s, "Workspace: capture_frame prefix=%s flags=0x%x",
 	         request->path_prefix, request->flags);
 
 	// Ensure NUL terminator (defense in depth — IPC marshalling should already

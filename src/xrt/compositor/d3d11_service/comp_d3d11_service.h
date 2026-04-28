@@ -215,7 +215,7 @@ comp_d3d11_service_get_client_window_pose(struct xrt_system_compositor *xsysc,
  * an MCP agent can trigger the same layouts an interactive user gets.
  *
  * @return true on success, false if the preset name is unknown or the
- *         compositor is not in shell mode.
+ *         compositor is not in workspace mode.
  */
 bool
 comp_d3d11_service_apply_layout_preset(struct xrt_system_compositor *xsysc,
@@ -233,7 +233,7 @@ comp_d3d11_service_apply_layout_preset(struct xrt_system_compositor *xsysc,
  * Starts Windows.Graphics.Capture for the given HWND and assigns a slot.
  * The captured window is displayed as a mono textured quad with spatial parallax.
  *
- * @param xsysc      The system compositor (must be D3D11 service in shell mode).
+ * @param xsysc      The system compositor (must be D3D11 service in workspace mode).
  * @param hwnd_value  Window handle as uint64_t (cast from HWND).
  * @param name        Display name for the captured window (may be NULL).
  * @return Slot index (0-7) on success, -1 on failure.
@@ -304,19 +304,19 @@ comp_d3d11_service_get_capture_client_window_pose(struct xrt_system_compositor *
  * window exists to receive Ctrl+O app launch requests.
  */
 bool
-comp_d3d11_service_ensure_shell_window(struct xrt_system_compositor *xsysc);
+comp_d3d11_service_ensure_workspace_window(struct xrt_system_compositor *xsysc);
 
 /*!
  * Deactivate the shell: stop captures and restore 2D windows, suspend
  * multi-compositor (hide window, release DP, stop render loop).
  * Called by ipc_handle_workspace_deactivate().
  *
- * @param xsysc The system compositor (must be D3D11 service in shell mode).
+ * @param xsysc The system compositor (must be D3D11 service in workspace mode).
  *
  * @ingroup comp_d3d11_service
  */
 void
-comp_d3d11_service_deactivate_shell(struct xrt_system_compositor *xsysc);
+comp_d3d11_service_deactivate_workspace(struct xrt_system_compositor *xsysc);
 
 /*!
  * Show or hide the spatial launcher panel. When visible, the multi-compositor

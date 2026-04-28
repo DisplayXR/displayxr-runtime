@@ -487,10 +487,10 @@ struct d3d11_service_system
 	uint32_t last_3d_mode_index;
 
 	//! Shell mode: multi-compositor with shared window for all clients.
-	//! Read from base.info.shell_mode on first client connect.
-	bool shell_mode;
+	//! Read from base.info.workspace_mode on first client connect.
+	bool workspace_mode;
 
-	//! Multi-compositor (NULL when shell_mode is false).
+	//! Multi-compositor (NULL when workspace_mode is false).
 	struct d3d11_multi_compositor *multi_comp;
 
 	//! Mutex for multi-compositor render (serializes D3D11 context access).
@@ -702,7 +702,7 @@ struct d3d11_multi_client_slot
 /*!
  * Multi-compositor: shared window + DP that composites all client atlases.
  *
- * Created lazily on first client layer_commit when shell_mode is true.
+ * Created lazily on first client layer_commit when workspace_mode is true.
  */
 struct d3d11_multi_compositor
 {
@@ -914,13 +914,13 @@ d3d11_service_semaphore_from_xrt(struct xrt_compositor_semaphore *xcsem)
 	return reinterpret_cast<struct d3d11_service_semaphore *>(xcsem);
 }
 
-// Write sys->shell_mode and mirror the flag onto the multi-comp window so
+// Write sys->workspace_mode and mirror the flag onto the multi-comp window so
 // its WndProc's ESC-close path can distinguish empty-shell (no focused app)
 // from true non-shell mode — see comp_d3d11_window.cpp ESC handling.
 static inline void
-service_set_shell_mode(struct d3d11_service_system *sys, bool active)
+service_set_workspace_mode(struct d3d11_service_system *sys, bool active)
 {
-	sys->shell_mode = active;
+	sys->workspace_mode = active;
 	if (sys->multi_comp != nullptr && sys->multi_comp->window != nullptr) {
 		comp_d3d11_window_set_shell_mode_active(sys->multi_comp->window, active);
 	}
@@ -1985,7 +1985,7 @@ init_client_render_resources(struct d3d11_service_system *sys,
 	// Shell mode: only create atlas texture. No window, swap chain, or DP.
 	// The multi-compositor owns those shared resources.
 	// Atlas sized to native display (app HWND is fullscreen, renders at native * scale).
-	if (sys->shell_mode) {
+	if (sys->workspace_mode) {
 		uint32_t atlas_w = sys->base.info.display_pixel_width;
 		uint32_t atlas_h = sys->base.info.display_pixel_height;
 		if (atlas_w == 0 || atlas_h == 0) {
@@ -2184,7 +2184,7 @@ init_client_render_resources(struct d3d11_service_system *sys,
 	// creating a SECOND DP instance causes the SR SDK to recalibrate its
 	// weaver, producing a multi-second stretched-left-eye artifact. The
 	// per-client DP is only needed for standalone (non-shell) rendering.
-	if (sys->base.info.dp_factory_d3d11 != NULL && !sys->shell_mode) {
+	if (sys->base.info.dp_factory_d3d11 != NULL && !sys->workspace_mode) {
 		auto factory = (xrt_dp_factory_d3d11_fn_t)sys->base.info.dp_factory_d3d11;
 		xrt_result_t dp_ret = factory(sys->device.get(), sys->context.get(), res->hwnd, &res->display_processor);
 		if (dp_ret != XRT_SUCCESS) {
@@ -4314,9 +4314,9 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 	}
 	mc->hwnd = (HWND)comp_d3d11_window_get_hwnd(mc->window);
 	sys->compositor_hwnd = mc->hwnd;
-	// Seed the window's shell-mode flag from current sys state (service_set_shell_mode
+	// Seed the window's shell-mode flag from current sys state (service_set_workspace_mode
 	// no-ops while multi_comp is null, so earlier activation hasn't reached the window).
-	comp_d3d11_window_set_shell_mode_active(mc->window, sys->shell_mode);
+	comp_d3d11_window_set_shell_mode_active(mc->window, sys->workspace_mode);
 
 	if (sys->xsysd != nullptr) {
 		comp_d3d11_window_set_system_devices(mc->window, sys->xsysd);
@@ -4585,7 +4585,7 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 				}
 				mc->hwnd = (HWND)comp_d3d11_window_get_hwnd(mc->window);
 				sys->compositor_hwnd = mc->hwnd;
-				comp_d3d11_window_set_shell_mode_active(mc->window, sys->shell_mode);
+				comp_d3d11_window_set_shell_mode_active(mc->window, sys->workspace_mode);
 
 				if (sys->xsysd != nullptr) {
 					comp_d3d11_window_set_system_devices(mc->window, sys->xsysd);
@@ -5731,12 +5731,12 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	// not the old permanent dismiss. The shell can re-activate via Ctrl+Space.
 	if (mc->window != nullptr && !comp_d3d11_window_is_valid(mc->window)) {
 		U_LOG_W("Multi-comp: window closed (ESC) — deactivating shell");
-		// Set shell_mode flags to false so the shell process detects the change
-		service_set_shell_mode(sys, false);
-		sys->base.info.shell_mode = false;
+		// Set workspace_mode flags to false so the shell process detects the change
+		service_set_workspace_mode(sys, false);
+		sys->base.info.workspace_mode = false;
 		// Run the full deactivate path (capture teardown, DP release, etc.)
 		// We need to recreate the window on resume since it was destroyed by ESC,
-		// so use the dismissed path which ensure_shell_window handles.
+		// so use the dismissed path which ensure_workspace_window handles.
 		mc->window_dismissed = true;
 		// Switch display back to 2D (lens off)
 		if (mc->display_processor != nullptr) {
@@ -9100,7 +9100,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	// each frame, so previous content is a safe fallback. Clearing to black here
 	// creates a race: if multi_compositor_render reads this atlas between the clear
 	// and the blit, the window flashes black.
-	if (c->render.atlas_rtv && !sys->shell_mode) {
+	if (c->render.atlas_rtv && !sys->workspace_mode) {
 		float clear_color[4] = {0.0f, 0.0f, 0.0f, 1.0f};
 		sys->context->ClearRenderTargetView(c->render.atlas_rtv.get(), clear_color);
 	}
@@ -9133,7 +9133,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				// Toggle DP 2D/3D
 				bool want_3d = head->rendering_modes[modeIdx].hardware_display_3d;
 				struct xrt_display_processor_d3d11 *dp = nullptr;
-				if (sys->shell_mode && sys->multi_comp != nullptr)
+				if (sys->workspace_mode && sys->multi_comp != nullptr)
 					dp = sys->multi_comp->display_processor;
 				else if (c->render.display_processor != nullptr)
 					dp = c->render.display_processor;
@@ -9177,7 +9177,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			// Switch display mode on the active DP.
 			// In shell mode, the multi-comp owns the DP (per-client has none).
 			struct xrt_display_processor_d3d11 *dp = nullptr;
-			if (sys->shell_mode && sys->multi_comp != nullptr) {
+			if (sys->workspace_mode && sys->multi_comp != nullptr) {
 				dp = sys->multi_comp->display_processor;
 			} else if (c->render.display_processor != nullptr) {
 				dp = c->render.display_processor;
@@ -9209,7 +9209,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	// This detects changes the vendor SDK made independently of the runtime.
 	{
 		struct xrt_display_processor_d3d11 *dp = nullptr;
-		if (sys->shell_mode && sys->multi_comp != nullptr) {
+		if (sys->workspace_mode && sys->multi_comp != nullptr) {
 			dp = sys->multi_comp->display_processor;
 		} else if (c->render.display_processor != nullptr) {
 			dp = c->render.display_processor;
@@ -9454,7 +9454,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		// Skip the blit and pass the app's texture directly to the display processor.
 		bool zero_copy = false;
 
-		if (proj_view_count > 1 && !has_ui_layers && !any_mutex_acquired && !sys->shell_mode) {
+		if (proj_view_count > 1 && !has_ui_layers && !any_mutex_acquired && !sys->workspace_mode) {
 			// Check all views reference the same swapchain image
 			bool all_same = true;
 			for (uint32_t eye = 1; eye < proj_view_count; eye++) {
@@ -9618,8 +9618,8 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			//     would double-handle gamma.
 			bool can_shader_blit = sys->blit_vs &&
 			    view_scs[eye]->images[view_img_indices[eye]].srv;
-			bool use_srgb_shader = can_shader_blit && view_is_srgb[eye] && !sys->shell_mode;
-			bool use_scale_shader = can_shader_blit && needs_scale && sys->shell_mode;
+			bool use_srgb_shader = can_shader_blit && view_is_srgb[eye] && !sys->workspace_mode;
+			bool use_scale_shader = can_shader_blit && needs_scale && sys->workspace_mode;
 
 			if (use_srgb_shader) {
 				// Non-shell SRGB: shader blit with SRGB SRV for linearization.
@@ -9727,7 +9727,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		// visible as a narrow black rectangle that jumps to full size when
 		// the first frame lands. Mirrors the capture-client `capture_srv`
 		// readiness gate.
-		if (sys->shell_mode && sys->multi_comp != nullptr) {
+		if (sys->workspace_mode && sys->multi_comp != nullptr) {
 			for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
 				if (sys->multi_comp->clients[s].active &&
 				    sys->multi_comp->clients[s].compositor == c) {
@@ -9894,7 +9894,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		U_LOG_W("Reverse hot-switch: done — back to export mode");
 	}
 
-	if (sys->shell_mode) {
+	if (sys->workspace_mode) {
 		// Throttle renders to ~1 per VSync (~14ms). With N clients each calling
 		// layer_commit at 60fps, we'd otherwise render N times per frame cycle.
 		// Throttling reduces the chance of reading a client's atlas mid-blit.
@@ -9910,12 +9910,12 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	}
 
 	// --- Lazy standalone init (hot-switch from shell → standalone) ---
-	// Shell was deactivated: shell_mode is false but this client was created
+	// Shell was deactivated: workspace_mode is false but this client was created
 	// in shell mode (no swap chain, no DP). Create standalone resources now,
 	// on the app's own IPC thread — safe from WM deadlocks.
 	if (!c->render.swap_chain) {
-		U_LOG_W("Hot-switch check: swap_chain=NULL, app_hwnd=%p, shell_mode=%d",
-		        (void *)c->app_hwnd, sys->shell_mode);
+		U_LOG_W("Hot-switch check: swap_chain=NULL, app_hwnd=%p, workspace_mode=%d",
+		        (void *)c->app_hwnd, sys->workspace_mode);
 	}
 	if (!c->render.swap_chain && c->app_hwnd != nullptr && IsWindow(c->app_hwnd)) {
 		U_LOG_W("Hot-switch: lazy standalone init for HWND=%p", (void *)c->app_hwnd);
@@ -10246,8 +10246,8 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 	if (!is_headless_relay) {
 		// Activate shell mode from system compositor info (set by ipc_server_process.c
 		// after init_all, before any client connects)
-		if (sys->base.info.shell_mode && !sys->shell_mode) {
-			service_set_shell_mode(sys, true);
+		if (sys->base.info.workspace_mode && !sys->workspace_mode) {
+			service_set_workspace_mode(sys, true);
 			U_LOG_W("Shell mode activated for D3D11 service system");
 		}
 
@@ -10267,7 +10267,7 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 	// can occlude the launcher when the user summons it post-exit.
 	// compositor_destroy's unregister call is already a no-op on a
 	// never-registered compositor (its loop won't find a matching slot).
-	if (sys->shell_mode && !is_headless_relay) {
+	if (sys->workspace_mode && !is_headless_relay) {
 		// Ensure multi_comp struct exists for registration
 		// Eagerly create multi-comp output (window + DP) on first client connect.
 		// This ensures the DP is available for ipc_try_get_sr_view_poses
@@ -10765,7 +10765,7 @@ comp_d3d11_service_get_predicted_eye_positions(struct xrt_system_compositor *xsy
 	// In shell mode, use the multi-comp's DP (per-client compositors have no DP).
 	// In normal mode, use the active compositor's DP.
 	struct xrt_display_processor_d3d11 *dp = nullptr;
-	if (sys->shell_mode && sys->multi_comp != nullptr) {
+	if (sys->workspace_mode && sys->multi_comp != nullptr) {
 		dp = sys->multi_comp->display_processor;
 	}
 	if (dp == nullptr) {
@@ -10940,7 +10940,7 @@ comp_d3d11_service_get_display_dimensions(struct xrt_system_compositor *xsysc,
 	// Try to get display dimensions from display processor.
 	// In shell mode, use multi-comp's DP; in normal mode, use active compositor's DP.
 	struct xrt_display_processor_d3d11 *dp = nullptr;
-	if (sys->shell_mode && sys->multi_comp != nullptr) {
+	if (sys->workspace_mode && sys->multi_comp != nullptr) {
 		dp = sys->multi_comp->display_processor;
 	}
 	if (dp == nullptr) {
@@ -10985,7 +10985,7 @@ comp_d3d11_service_get_window_metrics(struct xrt_system_compositor *xsysc,
 	struct xrt_display_processor_d3d11 *dp = nullptr;
 	HWND metrics_hwnd = nullptr;
 
-	if (sys->shell_mode && sys->multi_comp != nullptr &&
+	if (sys->workspace_mode && sys->multi_comp != nullptr &&
 	    sys->multi_comp->display_processor != nullptr && sys->multi_comp->hwnd != nullptr) {
 		dp = sys->multi_comp->display_processor;
 		metrics_hwnd = sys->multi_comp->hwnd;
@@ -11387,7 +11387,7 @@ comp_d3d11_service_set_client_window_pose(struct xrt_system_compositor *xsysc,
 	}
 
 	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
-	if (!sys->shell_mode || sys->multi_comp == nullptr) {
+	if (!sys->workspace_mode || sys->multi_comp == nullptr) {
 		return false;
 	}
 
@@ -11436,7 +11436,7 @@ comp_d3d11_service_set_client_visibility(struct xrt_system_compositor *xsysc,
 	if (xsysc == nullptr || xc == nullptr) return false;
 
 	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
-	if (!sys->shell_mode || sys->multi_comp == nullptr) return false;
+	if (!sys->workspace_mode || sys->multi_comp == nullptr) return false;
 
 	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
 	struct d3d11_multi_compositor *mc = sys->multi_comp;
@@ -11472,7 +11472,7 @@ comp_d3d11_service_get_client_window_pose(struct xrt_system_compositor *xsysc,
 	if (xsysc == nullptr || xc == nullptr) return false;
 
 	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
-	if (!sys->shell_mode || sys->multi_comp == nullptr) return false;
+	if (!sys->workspace_mode || sys->multi_comp == nullptr) return false;
 
 	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
 	struct d3d11_multi_compositor *mc = sys->multi_comp;
@@ -11501,7 +11501,7 @@ comp_d3d11_service_get_client_window_metrics(struct xrt_system_compositor *xsysc
 	}
 
 	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
-	if (!sys->shell_mode || sys->multi_comp == nullptr) {
+	if (!sys->workspace_mode || sys->multi_comp == nullptr) {
 		out_metrics->valid = false;
 		return false;
 	}
@@ -11571,7 +11571,7 @@ comp_d3d11_service_owns_window(struct xrt_system_compositor *xsysc)
 	// Returning false ensures the IPC view pose path uses the display-centric
 	// Kooima with real DP eye tracking, not the camera-centric qwerty path.
 	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
-	if (sys->shell_mode) {
+	if (sys->workspace_mode) {
 		return false;
 	}
 
@@ -11621,14 +11621,14 @@ comp_d3d11_service_add_capture_client(struct xrt_system_compositor *xsysc,
 
 	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
 
-	// Activate shell_mode from base.info if not already done.
+	// Activate workspace_mode from base.info if not already done.
 	// Normally this happens on first IPC client connect, but capture
 	// clients may arrive before any IPC client.
-	if (!sys->shell_mode && sys->base.info.shell_mode) {
-		service_set_shell_mode(sys, true);
+	if (!sys->workspace_mode && sys->base.info.workspace_mode) {
+		service_set_workspace_mode(sys, true);
 		U_LOG_W("Shell mode activated for D3D11 service system (via capture client)");
 	}
-	if (!sys->shell_mode) {
+	if (!sys->workspace_mode) {
 		U_LOG_E("Shell: add_capture_client — shell mode not active");
 		return -1;
 	}
@@ -11661,7 +11661,7 @@ comp_d3d11_service_remove_capture_client(struct xrt_system_compositor *xsysc,
 	}
 
 	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
-	if (!sys->shell_mode || sys->multi_comp == nullptr) {
+	if (!sys->workspace_mode || sys->multi_comp == nullptr) {
 		return false;
 	}
 
@@ -11681,7 +11681,7 @@ comp_d3d11_service_set_capture_client_window_pose(struct xrt_system_compositor *
 	}
 
 	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
-	if (!sys->shell_mode || sys->multi_comp == nullptr) {
+	if (!sys->workspace_mode || sys->multi_comp == nullptr) {
 		return false;
 	}
 
@@ -11725,7 +11725,7 @@ comp_d3d11_service_get_capture_client_window_pose(struct xrt_system_compositor *
 	}
 
 	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
-	if (!sys->shell_mode || sys->multi_comp == nullptr) {
+	if (!sys->workspace_mode || sys->multi_comp == nullptr) {
 		return false;
 	}
 
@@ -11748,16 +11748,16 @@ comp_d3d11_service_get_capture_client_window_pose(struct xrt_system_compositor *
 }
 
 bool
-comp_d3d11_service_ensure_shell_window(struct xrt_system_compositor *xsysc)
+comp_d3d11_service_ensure_workspace_window(struct xrt_system_compositor *xsysc)
 {
 	if (xsysc == nullptr) {
 		return false;
 	}
 
 	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
-	if (!sys->shell_mode) {
-		service_set_shell_mode(sys, true);
-		U_LOG_W("Shell mode activated for D3D11 service system (via ensure_shell_window)");
+	if (!sys->workspace_mode) {
+		service_set_workspace_mode(sys, true);
+		U_LOG_W("Shell mode activated for D3D11 service system (via ensure_workspace_window)");
 	}
 
 	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
@@ -11769,7 +11769,7 @@ comp_d3d11_service_ensure_shell_window(struct xrt_system_compositor *xsysc)
 		U_LOG_W("Shell: resuming from suspended state");
 
 		mc->suspended = false;
-		service_set_shell_mode(sys, true);
+		service_set_workspace_mode(sys, true);
 
 		// Reverse hot-switch is LAZY: just flag each client compositor.
 		// Each client's next layer_commit will tear down its own DP and
@@ -11860,7 +11860,7 @@ comp_d3d11_service_ensure_shell_window(struct xrt_system_compositor *xsysc)
 }
 
 void
-comp_d3d11_service_deactivate_shell(struct xrt_system_compositor *xsysc)
+comp_d3d11_service_deactivate_workspace(struct xrt_system_compositor *xsysc)
 {
 	if (xsysc == nullptr) {
 		return;
@@ -11889,9 +11889,9 @@ comp_d3d11_service_deactivate_shell(struct xrt_system_compositor *xsysc)
 
 		U_LOG_W("Shell deactivate: beginning teardown");
 
-		// Clear the compositor's local shell_mode flag so layer_commit
+		// Clear the compositor's local workspace_mode flag so layer_commit
 		// takes the standalone path instead of the (now suspended) multi-comp.
-		service_set_shell_mode(sys, false);
+		service_set_workspace_mode(sys, false);
 
 	// --- 4C.2: Stop all capture sessions and restore 2D windows ---
 	for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
@@ -11925,7 +11925,7 @@ comp_d3d11_service_deactivate_shell(struct xrt_system_compositor *xsysc)
 	// --- 4C.3: IPC clients hot-switch to standalone (lazy) ---
 	// Don't create resources here — that deadlocks (DXGI sends WM to app thread
 	// which is blocked on IPC). Instead, just suspend the multi-comp.
-	// Each app's next layer_commit detects shell_mode=false and lazily creates
+	// Each app's next layer_commit detects workspace_mode=false and lazily creates
 	// its own swap chain + DP on its own thread (no cross-thread WM).
 
 		// Reset drag/focus state
@@ -12137,7 +12137,7 @@ comp_d3d11_service_apply_layout_preset(struct xrt_system_compositor *xsysc,
 	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
 
 	struct d3d11_multi_compositor *mc = sys->multi_comp;
-	if (mc == nullptr || !sys->shell_mode) {
+	if (mc == nullptr || !sys->workspace_mode) {
 		return false;
 	}
 
@@ -12165,7 +12165,7 @@ comp_d3d11_service_poll_mcp_capture(struct xrt_system_compositor *xsysc)
 		return;
 	}
 	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
-	if (!sys->shell_mode || sys->multi_comp == nullptr) {
+	if (!sys->workspace_mode || sys->multi_comp == nullptr) {
 		return;
 	}
 
