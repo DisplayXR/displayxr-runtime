@@ -45,12 +45,20 @@ struct HudRenderer {
     float smallFontSize = 0;
 };
 
-// Create a standalone D3D11 device, render + staging textures, and DirectWrite resources
-bool InitializeHudRenderer(HudRenderer& hud, uint32_t w, uint32_t h);
+// Create a standalone D3D11 device, render + staging textures, and DirectWrite resources.
+// `fontBaseHeight`: pixel height used to scale fonts. 0 = use `h` (legacy behavior).
+// Pass an explicit value when the texture is taller than the original layout target
+// (e.g. a HUD layer that spans the full window so buttons can sit at top and body at bottom).
+bool InitializeHudRenderer(HudRenderer& hud, uint32_t w, uint32_t h, uint32_t fontBaseHeight = 0);
 
 // Render text to internal textures, copy to staging, map for CPU read.
 // Returns pixel pointer (R8G8B8A8_UNORM) and row pitch in bytes.
 // Caller must call UnmapHud() after consuming the pixels.
+//
+// `drawBody`: when false, skip the text sections and emit only the buttons.
+// Lets a HUD-toggle key hide the info panel without losing always-visible
+// chrome buttons. When buttons are present, body text is laid out below the
+// button band so the two never overlap.
 const void* RenderHudAndMap(HudRenderer& hud, uint32_t* rowPitch,
     const std::wstring& sessionText, const std::wstring& modeText,
     const std::wstring& perfText, const std::wstring& displayInfoText,
@@ -58,7 +66,8 @@ const void* RenderHudAndMap(HudRenderer& hud, uint32_t* rowPitch,
     const std::wstring& cameraText = L"",
     const std::wstring& stereoText = L"",
     const std::wstring& helpText = L"",
-    const std::vector<HudButton>& buttons = {});
+    const std::vector<HudButton>& buttons = {},
+    bool drawBody = true);
 
 // Unmap the staging texture after pixel upload
 void UnmapHud(HudRenderer& hud);

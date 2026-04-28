@@ -218,6 +218,45 @@ void RenderButton(
     rt->EndDraw();
 }
 
+void RenderFilledRect(
+    TextOverlay& overlay,
+    ID3D11Device* device,
+    ID3D11Texture2D* texture,
+    float x, float y, float width, float height,
+    float r, float g, float b, float a,
+    float cornerRadius
+) {
+    if (!overlay.initialized || !texture || !device) return;
+
+    ComPtr<ID3D11DeviceContext> context;
+    device->GetImmediateContext(&context);
+    if (context) context->Flush();
+
+    ComPtr<IDXGISurface> surface;
+    if (FAILED(texture->QueryInterface(IID_PPV_ARGS(&surface)))) return;
+
+    D2D1_RENDER_TARGET_PROPERTIES rtProps = D2D1::RenderTargetProperties(
+        D2D1_RENDER_TARGET_TYPE_DEFAULT,
+        D2D1::PixelFormat(DXGI_FORMAT_UNKNOWN, D2D1_ALPHA_MODE_PREMULTIPLIED));
+
+    ComPtr<ID2D1RenderTarget> rt;
+    if (FAILED(overlay.d2dFactory->CreateDxgiSurfaceRenderTarget(surface.Get(), &rtProps, &rt))) return;
+
+    ComPtr<ID2D1SolidColorBrush> fillBrush;
+    if (FAILED(rt->CreateSolidColorBrush(D2D1::ColorF(r, g, b, a), &fillBrush))) return;
+
+    rt->BeginDraw();
+    if (cornerRadius > 0.0f) {
+        D2D1_ROUNDED_RECT rr = D2D1::RoundedRect(
+            D2D1::RectF(x, y, x + width, y + height),
+            cornerRadius, cornerRadius);
+        rt->FillRoundedRectangle(rr, fillBrush.Get());
+    } else {
+        rt->FillRectangle(D2D1::RectF(x, y, x + width, y + height), fillBrush.Get());
+    }
+    rt->EndDraw();
+}
+
 std::wstring FormatSessionState(int state) {
     // XrSessionState values
     const wchar_t* stateNames[] = {

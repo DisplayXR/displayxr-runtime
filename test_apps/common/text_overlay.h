@@ -60,6 +60,18 @@ void RenderButton(
     bool useSmallFont = true
 );
 
+// Render a filled rounded rectangle (no label, no stroke). Used by the HUD
+// renderer to draw a localized backdrop behind body text when the HUD layer
+// is mostly transparent.
+void RenderFilledRect(
+    TextOverlay& overlay,
+    ID3D11Device* device,
+    ID3D11Texture2D* texture,
+    float x, float y, float width, float height,
+    float r, float g, float b, float a,
+    float cornerRadius = 0.0f
+);
+
 // Helper to format various overlay texts
 std::wstring FormatSessionState(int state);
 std::wstring FormatPerformanceInfo(float fps, float frameTimeMs, uint32_t renderW, uint32_t renderH, uint32_t windowW = 0, uint32_t windowH = 0);

@@ -48,14 +48,17 @@ static const char* APP_NAME = "gaussian_splatting_handle_vk_win";
 static const wchar_t* WINDOW_CLASS = L"SR3DGSOpenXRExtVKClass";
 static const wchar_t* WINDOW_TITLE = L"DisplayXR Gaussian Splat Viewer Demo";
 
-// HUD overlay fractions
+// HUD overlay fractions. Top-left rect; buttons render at the very top of the
+// HUD texture, body text packs immediately below them so the opaque layer
+// stays a single contiguous region (the vk_native compositor blits this layer
+// without alpha blending — see TODO: fix native VK alpha-blended HUD).
 static const float HUD_WIDTH_FRACTION = 0.30f;
 static const float HUD_HEIGHT_FRACTION = 0.50f;
 
 // Top-bar buttons live inside the HUD overlay's window-space footprint
-// (top-left corner of the window, fracW × fracH ≈ 0.30 × 0.50). All values
-// are window-fractions for hit-testing; they're translated into HUD-pixel
-// coordinates when passed to RenderHudAndMap each frame.
+// (left strip of the window, fracW × fracH = HUD_WIDTH_FRACTION × HUD_HEIGHT_FRACTION).
+// All values are absolute window-fractions for hit-testing; they're
+// translated into HUD-pixel coordinates when passed to RenderHudAndMap.
 static const float OPEN_BTN_X_FRACTION = 0.010f;
 static const float OPEN_BTN_Y_FRACTION = 0.010f;
 static const float OPEN_BTN_WIDTH_FRACTION  = 0.060f;
@@ -288,13 +291,24 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_LBUTTONDOWN: {
         int mx = LOWORD(lParam);
         int my = HIWORD(lParam);
+        // UpdateInputState above already set leftButton/dragging=true. For
+        // button clicks (which post a message to run a modal dialog or change
+        // mode), clear that drag state — otherwise the modal eats the
+        // matching WM_LBUTTONUP and subsequent mouse motion is interpreted as
+        // a scene drag.
         if (IsClickOnLoadButton(mx, my, g_windowWidth, g_windowHeight)) {
-            // Post to main thread — don't block WindowProc with file dialog
+            {
+                std::lock_guard<std::mutex> lock(g_inputMutex);
+                g_inputState.leftButton = false;
+                g_inputState.dragging = false;
+            }
             PostMessage(hwnd, WM_USER + 1, 0, 0);
             return 0;
         }
         if (IsClickOnModeButton(mx, my, g_windowWidth, g_windowHeight)) {
             std::lock_guard<std::mutex> lock(g_inputMutex);
+            g_inputState.leftButton = false;
+            g_inputState.dragging = false;
             if (g_inputState.renderingModeCount > 0) {
                 g_inputState.currentRenderingMode =
                     (g_inputState.currentRenderingMode + 1) % g_inputState.renderingModeCount;
@@ -698,6 +712,13 @@ static void RenderThreadFunc(
                             rawLeft.x -= eyeOffsetX; rawLeft.y -= eyeOffsetY;
                             XrVector3f rawRight = rawViews[1].pose.position;
                             rawRight.x -= eyeOffsetX; rawRight.y -= eyeOffsetY;
+                            // GsRenderer::updateUniforms Y-mirrors the world; displayPose
+                            // below is fed in render frame (cameraPosY negated). The
+                            // rawEyes must live in the same render frame so the asymmetric
+                            // Kooima projection's eye-vs-display geometry stays consistent
+                            // — otherwise vertical eye parallax comes out inverted.
+                            rawLeft.y  = -rawLeft.y;
+                            rawRight.y = -rawRight.y;
                             if (monoMode) {
                                 XrVector3f center = {
                                     (rawLeft.x + rawRight.x) * 0.5f,
@@ -724,7 +745,9 @@ static void RenderThreadFunc(
                             // so negate Y here to keep the eye-vs-display geometry consistent.
                             displayPose.position = {inputSnapshot.cameraPosX, -inputSnapshot.cameraPosY, inputSnapshot.cameraPosZ};
 
-                            XrVector3f nominalViewer = {xr->nominalViewerX, xr->nominalViewerY, xr->nominalViewerZ};
+                            // nominalViewer in render frame too (Y mirrored) — used for
+                            // parallax-factor lerp, must match the eye/displayPose frame.
+                            XrVector3f nominalViewer = {xr->nominalViewerX, -xr->nominalViewerY, xr->nominalViewerZ};
                             Display3DScreen screen = {winW_m, winH_m};
 
                             XrVector3f rawEyes[2] = {rawLeft, rawRight};
@@ -788,17 +811,25 @@ static void RenderThreadFunc(
                             std::lock_guard<std::mutex> sceneLock(g_sceneMutex);
                             if (g_gsRenderer.pickGaussian(rayOrigin, rayDir, hitPos)) {
                                 // Both endpoints stored in WORLD frame (the same frame as
-                                // inputSnapshot.cameraPosX/Y/Z) so the slerp interpolates
-                                // consistently. displayPoseLocal has its Y negated for the
-                                // display3d_compute_view boundary; we mustn't store that
-                                // negated copy as the slerp's "from" pose, otherwise the
-                                // mid-transition lerp drifts vertically toward 2·cy − y.
+                                // inputSnapshot.cameraPosX/Y/Z and inputSnapshot.pitch/yaw)
+                                // so the slerp's writeback decodes back into world-frame
+                                // pitch/yaw. displayPoseLocal.orientation was built from
+                                // renderPitch (-pitch) for the click-pick centerView; we
+                                // must NOT reuse that render-frame quaternion here, else
+                                // the slerp's `state.pitch = asin(fwd.y)` decode produces
+                                // a sign-flipped pitch and the display rotates on teleport.
+                                XMVECTOR worldOriQ = XMQuaternionRotationRollPitchYaw(
+                                    inputSnapshot.pitch, inputSnapshot.yaw, 0);
+                                XMFLOAT4 wq;
+                                XMStoreFloat4(&wq, worldOriQ);
+                                XrQuaternionf worldOri = {wq.x, wq.y, wq.z, wq.w};
+
                                 XrPosef fromWorld;
-                                fromWorld.orientation = displayPoseLocal.orientation;
+                                fromWorld.orientation = worldOri;
                                 fromWorld.position = {inputSnapshot.cameraPosX, inputSnapshot.cameraPosY, inputSnapshot.cameraPosZ};
                                 XrPosef target;
                                 target.position = {hitPos[0], hitPos[1], hitPos[2]};
-                                target.orientation = displayPoseLocal.orientation;
+                                target.orientation = worldOri;  // preserve current orientation — translate-only
                                 std::lock_guard<std::mutex> inputLock(g_inputMutex);
                                 g_inputState.transitionFrom = fromWorld;
                                 g_inputState.transitionTo = target;
@@ -966,8 +997,11 @@ static void RenderThreadFunc(
                             rendered = false;
                         }
 
-                        // Render HUD to window-space layer swapchain
-                        if (rendered && inputSnapshot.hudVisible && hud && xr->hasHudSwapchain && hudSwapchainImages) {
+                        // Render HUD to window-space layer swapchain. Submitted
+                        // every frame so the chrome buttons (Open / Mode) stay
+                        // visible — the TAB toggle only hides the body backdrop
+                        // and text via the `drawBody` flag below.
+                        if (rendered && hud && xr->hasHudSwapchain && hudSwapchainImages) {
                             uint32_t hudImageIndex;
                             if (AcquireHudSwapchainImage(*xr, hudImageIndex)) {
                                 std::wstring sessionText(xr->systemName, xr->systemName + strlen(xr->systemName));
@@ -1081,7 +1115,8 @@ static void RenderThreadFunc(
 
                                 uint32_t srcRowPitch = 0;
                                 const void* pixels = RenderHudAndMap(*hud, &srcRowPitch, sessionText, modeText, perfText, dispText, eyeText,
-                                    cameraText, stereoText, helpText, buttons);
+                                    cameraText, stereoText, helpText, buttons,
+                                    /*drawBody=*/inputSnapshot.hudVisible);
                                 if (pixels) {
                                     const uint8_t* src = (const uint8_t*)pixels;
                                     uint8_t* dst = (uint8_t*)hudStagingMapped;
@@ -1158,13 +1193,36 @@ static void RenderThreadFunc(
                 // Submit frame
                 uint32_t submitViewCount = (xr->renderingModeCount > 0 && inputSnapshot.currentRenderingMode < xr->renderingModeCount) ? xr->renderingModeViewCounts[inputSnapshot.currentRenderingMode] : 2;
                 if (rendered && hudSubmitted) {
-                    float hudAR = (float)hudWidth / (float)hudHeight;
-                    float windowAR = (windowW > 0 && windowH > 0) ? (float)windowW / (float)windowH : 1.0f;
+                    // When body is hidden, shrink the layer to just the button
+                    // band: the vk_native compositor blits this layer opaquely,
+                    // so anything inside the layer rect paints solid pixels —
+                    // submitting the full HUD with mostly-empty content would
+                    // cover most of the left side of the window in black.
+                    bool bodyShown = inputSnapshot.hudVisible;
+                    int32_t srcW = (int32_t)hudWidth;
+                    int32_t srcH;
                     float fracW = HUD_WIDTH_FRACTION;
-                    float fracH = fracW * windowAR / hudAR;
-                    if (fracH > 1.0f) { fracH = 1.0f; fracW = hudAR / windowAR; }
+                    float fracH;
+                    if (bodyShown) {
+                        srcH = (int32_t)hudHeight;
+                        float hudAR = (float)srcW / (float)srcH;
+                        float windowAR = (windowW > 0 && windowH > 0) ? (float)windowW / (float)windowH : 1.0f;
+                        fracH = fracW * windowAR / hudAR;
+                        if (fracH > 1.0f) { fracH = 1.0f; fracW = hudAR / windowAR; }
+                    } else {
+                        // Match the band the HUD renderer reserves for buttons.
+                        // Extra parens defeat the windows.h `max` macro.
+                        float btnBandWindowY = (std::max)(
+                            OPEN_BTN_Y_FRACTION + OPEN_BTN_HEIGHT_FRACTION,
+                            MODE_BTN_Y_FRACTION + MODE_BTN_HEIGHT_FRACTION) + 0.005f;
+                        fracH = btnBandWindowY;
+                        srcH = (int32_t)((btnBandWindowY / HUD_HEIGHT_FRACTION) * (float)hudHeight);
+                        if (srcH < 1) srcH = 1;
+                        if (srcH > (int32_t)hudHeight) srcH = (int32_t)hudHeight;
+                    }
                     EndFrameWithWindowSpaceHud(*xr, frameState.predictedDisplayTime, projectionViews,
-                        0.0f, 0.0f, fracW, fracH, 0.0f, submitViewCount);
+                        0.0f, 0.0f, fracW, fracH, 0.0f, submitViewCount,
+                        0, 0, srcW, srcH);
                 } else if (rendered) {
                     EndFrame(*xr, frameState.predictedDisplayTime, projectionViews, submitViewCount);
                 } else {

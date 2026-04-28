@@ -220,15 +220,22 @@ bool CreateHudSwapchain(XrSessionManager& xr, uint32_t width, uint32_t height);
 bool AcquireHudSwapchainImage(XrSessionManager& xr, uint32_t& imageIndex);
 bool ReleaseHudSwapchainImage(XrSessionManager& xr);
 
-// End frame with both projection layer and window-space HUD layer
-// viewCount defaults to 2 (stereo); pass 1 for mono submission in 2D mode
+// End frame with both projection layer and window-space HUD layer.
+// viewCount defaults to 2 (stereo); pass 1 for mono submission in 2D mode.
+// `srcW`/`srcH` < 0 means "use the full HUD swapchain image"; pass a smaller
+// rect to display only a sub-region of the texture (e.g. just a top button
+// bar) — useful for shrinking the opaque footprint when the body text is
+// hidden, since the vk_native compositor blits this layer without alpha
+// blending.
 bool EndFrameWithWindowSpaceHud(
     XrSessionManager& xr,
     XrTime displayTime,
     const XrCompositionLayerProjectionView* projViews,
     float hudX, float hudY, float hudWidth, float hudHeight,
     float hudDisparity,
-    uint32_t viewCount = 2
+    uint32_t viewCount = 2,
+    int32_t srcX = 0, int32_t srcY = 0,
+    int32_t srcW = -1, int32_t srcH = -1
 );
 
 // [Commented out — will be reused for 3D-positioned HUD later]
