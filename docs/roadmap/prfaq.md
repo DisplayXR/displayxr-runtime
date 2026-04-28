@@ -12,17 +12,17 @@
 
 3D displays have spent a decade trapped in vendor silos. Every panel ships with its own runtime, its own compositor, its own windowing model — and the application developer pays for it. Building a CAD viewer or a medical-imaging app for a 3D screen has meant committing to one vendor's stack, learning their proprietary APIs, and rewriting when the next display generation lands.
 
-DisplayXR breaks that pattern. The DisplayXR runtime is a lightweight OpenXR implementation purpose-built for 3D displays — installable on its own, useful on its own, vendor-agnostic at every layer. Application developers write standard OpenXR. Display OEMs implement a documented vendor-integration interface. And on top of the runtime, an optional **workspace controller** layer adds spatial-desktop features — windowing, multi-app composition, launcher UX — through open extensions any party can implement.
+DisplayXR breaks that pattern. The DisplayXR runtime is a lightweight OpenXR implementation purpose-built for 3D displays — installable on its own, useful on its own, vendor-agnostic at every layer. Application developers write standard OpenXR. Display vendors (Leia, BOE, and others making the lightfield / autostereo panels) implement a documented integration interface. OEMs (Lenovo, Samsung, ZTE, and others integrating displays into finished laptops, monitors, tablets, phones, and TVs) ship the runtime as part of their product. And on top of the runtime, an optional **workspace controller** layer adds spatial-desktop features — windowing, multi-app composition, launcher UX — through open extensions any party can implement.
 
-The first workspace controller, **DisplayXR Shell**, is shipped by Leia Inc. as the reference implementation. It's proprietary, branded, and tightly tuned for Leia's lightfield panels. It is also entirely optional. Install the DisplayXR runtime by itself and you get a standards-compliant OpenXR + WebXR bridge for your 3D display — no shell, no spatial desktop, no Leia-specific behavior. Install a different controller (third-party, vertical integrator, your own) and the runtime treats it as a first-class citizen with the same authority as the reference shell.
+A reference workspace controller, **DisplayXR Shell**, ships alongside the runtime from the DisplayXR project as a proprietary, polished example of what's possible on the platform. It is also entirely optional. Install the DisplayXR runtime by itself and you get a standards-compliant OpenXR + WebXR bridge for your 3D display — no shell, no spatial desktop. Install a different controller (third-party, vertical integrator, your own) and the runtime treats it as a first-class citizen with the same authority as the reference shell.
 
-"We shipped our 3D-display product line in weeks, not quarters, because we didn't have to write the OpenXR layer," said a hypothetical OEM partner who has not yet given us a real quote. "Our team wrote a custom workspace controller for our vertical, and the DisplayXR runtime authenticated and composited it as if it were the reference shell. There was nothing to reverse-engineer."
+"We brought our spatial-3D laptop SKU to market in weeks, not quarters, because we didn't have to build the OpenXR layer or the windowing system from scratch," said a hypothetical OEM partner who has not yet given us a real quote. "We bundled the reference shell, dropped a sidecar manifest to brand the tray for our product, and shipped. The DisplayXR runtime authenticated and composited it without modification."
 
 The platform is built on three commitments:
 
-- **Open at the runtime layer.** OpenXR + WebXR. Standard extension headers for display-specific capabilities (`XR_EXT_display_info`, `XR_EXT_win32_window_binding`, `XR_EXT_cocoa_window_binding`). Vendor integration through a documented display-processor vtable.
+- **Open at the runtime layer.** OpenXR + WebXR. Standard extension headers for display-specific capabilities (`XR_EXT_display_info`, `XR_EXT_win32_window_binding`, `XR_EXT_cocoa_window_binding`). Display-vendor integration through a documented display-processor vtable.
 - **Open at the workspace layer.** `XR_EXT_spatial_workspace` and `XR_EXT_app_launcher` define how any controller process drives multi-app composition, hit-test, capture, and tile launching. The reference shell uses these surfaces; so does anyone else.
-- **Swappable, not coupled.** Workspace activation is gated by orchestrator-PID match — the runtime trusts the binary it was configured to spawn, not a brand string. OEMs and developers replace the controller without runtime modifications.
+- **Swappable, not coupled.** Workspace activation is gated by orchestrator-PID match — the runtime trusts the binary it was configured to spawn, not a brand string. OEMs, vertical integrators, and developers can replace the controller without runtime modifications.
 
 DisplayXR runs on Windows today, with macOS and Android in active development. The runtime ships under the Boost Software License. Extension headers are mirrored to `github.com/DisplayXR/displayxr-extensions` and version-tagged for stability. The reference shell is distributed separately from the runtime; a bare runtime install is the supported configuration for OEM and third-party deployments.
 
@@ -31,6 +31,13 @@ Get started at `github.com/DisplayXR/displayxr-runtime`.
 ---
 
 ## FAQ
+
+### Glossary (terms used below)
+
+- **Display vendor** — companies that manufacture the 3D display panel and write the display-processor (DP) integration for DisplayXR. Examples: Leia, BOE.
+- **OEM** — companies that procure 3D displays from a display vendor and integrate them into a finished consumer product (laptop, monitor, tablet, phone, TV). Examples: Lenovo, Samsung, ZTE. OEMs are *customers* of the DisplayXR runtime and (optionally) the reference shell.
+- **Vertical integrator** — companies building a focused single- or limited-purpose experience on a 3D display: CAD viewers, medical imaging, automotive HMI, retail kiosks. They consume the runtime and may write their own workspace controller.
+- **Workspace controller** — a process that adds spatial-desktop features (windowing, multi-app composition, launcher) on top of the bare runtime. The reference DisplayXR Shell is one such controller; third parties can build their own.
 
 ### For application developers
 
@@ -46,23 +53,37 @@ No. The runtime serves apps the same way whether the user is running the bare ru
 **Q: I'm using WebXR in Chrome. How does that work?**
 DisplayXR ships a WebXR bridge that connects Chrome's native WebXR implementation to the runtime. No extension to install in Chrome — the bridge runs as a separate process, started on-demand by the service when a WebXR app requests it. Standard WebXR session APIs work on a 3D display the same way they work on a headset.
 
-### For 3D display OEMs
+### For 3D display vendors
 
-**Q: I make 3D display hardware. How do I integrate?**
+**Q: I make a 3D display panel. How do I integrate with DisplayXR?**
 Implement the display-processor vtable for your weaving / depth-mapping / eye-tracking integration. The vtable has five API variants (D3D11, D3D12, Metal, Vulkan, OpenGL) so your weaver runs natively in whatever graphics API the application is using. See `docs/guides/vendor-integration.md` for the full contract. Leia SR is the first integration; it's a reference, not a precedent — there is no privileged path.
 
-**Q: Do I have to use the DisplayXR Shell?**
-No. The shell is one of two reasonable end-states for an OEM:
-- **Ship the bare runtime.** Your customers install standard OpenXR apps and use Chrome WebXR. The tray reflects what's there: WebXR Bridge + Quit. Lightweight, OEM-neutral.
-- **Ship the bare runtime plus your own workspace controller.** Build to the `XR_EXT_spatial_workspace` and `XR_EXT_app_launcher` extension surfaces. Your controller gets first-class treatment.
+**Q: Once my display is integrated, who picks DisplayXR up?**
+Two distinct downstream audiences: OEMs who ship finished products built around your display panel, and vertical integrators who build a focused experience on it. Both groups consume the runtime via standard distribution channels (your driver bundles it, an OEM bundles it, or end users install it directly). Your DP integration enables both paths simultaneously.
 
-OEMs that want to ship the Leia shell are welcome to bundle it alongside; the runtime treats it the same as any other controller.
+**Q: Do I need to ship a workspace controller alongside my DP?**
+No. The reference DisplayXR Shell works with any DP that conforms to the vtable. Most display vendors ship the DP plus the runtime and let OEMs decide whether to bundle the reference shell, a custom controller, or nothing. Display vendors who want their own branded controller can build one — see the OEM and vertical-integrator sections below for the controller story.
+
+### For OEMs (Lenovo, Samsung, ZTE, integrators of finished products)
+
+**Q: I'm shipping a 3D laptop / monitor / tablet. What do I bundle?**
+Three reasonable configurations:
+
+- **Bare runtime.** Ship the DisplayXR runtime plus the relevant display-vendor DP. End users get OpenXR + WebXR support out of the box; no spatial desktop. Lightest install. Best for products where the 3D display is one feature among many and you don't want to define a new desktop UX.
+- **Runtime + reference shell.** Bundle the DisplayXR Shell from the DisplayXR project as your spatial-desktop layer. Brand the tray label via a sidecar manifest. Quickest path to a polished spatial-desktop experience without writing UX code.
+- **Runtime + custom controller.** Write your own workspace controller against `XR_EXT_spatial_workspace` and `XR_EXT_app_launcher`. Differentiate your product line with a branded launcher, layout presets tailored to your form factor, custom chrome. Your controller gets the same first-class authentication as the reference shell.
+
+**Q: Can I bundle the DisplayXR Shell with my product?**
+Yes. The shell is distributed as a separate, redistributable binary. Bundle it with your installer or offer it as an optional download. Branding via the sidecar manifest (`display_name`, `vendor`, `icon_path`) means the tray UI carries your product name without any runtime modification.
+
+**Q: How do I brand the tray and lifecycle UI for my product?**
+Drop a `<controller-binary>.controller.json` sidecar manifest next to whichever workspace controller you ship — reference shell or custom. The runtime reads `display_name`, `vendor`, `version`, and `icon_path` and uses them in the tray submenu. No runtime rebuild required, no source access needed.
+
+**Q: My product line spans multiple SKUs. Can I ship different controllers per SKU?**
+Yes. The controller is selected via the runtime's `service.json` `workspace_binary` field. Your installer per SKU can write a different `service.json` that points at a different controller binary, or none at all. The runtime authenticates whatever it's configured to spawn.
 
 **Q: How do third-party workspace controllers prove they're trustworthy?**
-The runtime authenticates workspace activation by **orchestrator-PID match**: the controller is the binary the orchestrator was configured to spawn (via `service.json`'s `workspace_binary` field). The PID match — not the binary's `applicationName` string — is the credential. OEMs configure their installer to drop their controller into the runtime's directory and update `service.json`; the runtime trusts whatever process starts as a result.
-
-**Q: What if I want to brand the tray and lifecycle UI?**
-Drop a `<your-binary>.controller.json` sidecar manifest next to your controller binary. The runtime reads `display_name`, `vendor`, `version`, and `icon_path` and uses them in the tray submenu. No runtime rebuild required.
+The runtime authenticates workspace activation by **orchestrator-PID match**: the controller is the binary the runtime's orchestrator was configured to spawn (via `service.json`'s `workspace_binary` field). The PID match — not the binary's `applicationName` string — is the credential. Your installer drops your controller into the runtime's directory and updates `service.json`; the runtime trusts whatever process starts as a result. No code-signing handshake, no shared-secret provisioning.
 
 ### For vertical integrators (CAD, medical, automotive HMI)
 
