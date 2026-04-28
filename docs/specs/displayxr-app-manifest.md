@@ -20,21 +20,45 @@ DisplayXR Unity and Unreal plugins are expected to generate a manifest automatic
 
 **The shell ships no built-in default apps.** When `registered_apps.json` does not exist (first run), the registry starts empty. The scanner immediately populates whatever it finds via sidecars; if it finds nothing, the launcher renders the empty-state hint instead of a tile grid. There is no pre-seeded "Notepad" or other system app — the launcher is exclusively a curated DisplayXR app surface, never a generic Windows app drawer.
 
-## 2. File location
+## 2. Manifest modes and file locations
 
-The manifest lives **next to the executable** it describes, with the filename stem matching the executable:
+A manifest can live in one of two places, dispatched by whether it carries an `exe_path` field (see §3.2). The parser is the same for both modes — only the exe-resolution rule differs.
+
+### 2.1 Sidecar mode (next to the exe)
+
+The manifest sits in the same directory as its executable, with the filename stem matching the exe:
 
 ```
 my_app/
 ├── my_app.exe
-├── my_app.displayxr.json     ← manifest
+├── my_app.displayxr.json     ← manifest (no exe_path)
 ├── icon.png                  ← referenced from manifest
 └── icon_sbs.png              ← optional 3D icon
 ```
 
-- The scanner looks for `<exe_basename>.displayxr.json` in the same directory as each discovered `.exe`.
-- All paths inside the manifest are resolved **relative to the manifest file**, not the CWD.
-- The scanner never writes to the manifest. It is developer-owned.
+- The scanner looks for `<exe_basename>.displayxr.json` next to each discovered `.exe` in the dev-tree paths (see §5).
+- `exe_path` MUST be absent in sidecar mode — the exe is the sibling file.
+- Sidecar mode is the natural fit for in-tree dev (`test_apps/`, `demos/`) and for app installs that bundle the manifest into their own install directory.
+
+### 2.2 Registered mode (drop-in directory)
+
+The manifest sits in a system-known discovery directory and points at any executable on disk via an absolute `exe_path`. This is how third-party apps install themselves into the launcher without having to live under `Program Files`.
+
+```
+%LOCALAPPDATA%\DisplayXR\apps\           ← per-user installs (no elevation)
+└── my_unity_app.displayxr.json          ← exe_path points to user's build dir
+%ProgramData%\DisplayXR\apps\            ← system-wide installs (installer-elevated)
+└── vendor_app.displayxr.json
+```
+
+- The manifest filename can be anything ending in `.displayxr.json`. Recommended convention: `<sanitized_exe_basename>.displayxr.json`.
+- `exe_path` MUST be present and resolve to an existing `.exe`. Manifests whose exe no longer exists are skipped with a warning.
+- Icon paths are still resolved **relative to the manifest file**, so installers should drop icon files alongside the manifest (not next to the exe).
+
+### 2.3 Common rules
+
+- All paths inside the manifest are resolved **relative to the manifest file**, not the CWD and not the exe directory.
+- The scanner never writes to the manifest. It is owned by whoever installed it (developer, installer, or the user via Browse-for-app).
 
 ## 3. Schema (v1.0)
 
@@ -64,6 +88,7 @@ my_app/
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
+| `exe_path` | string | *none* | Absolute path to the executable. **Required in registered mode (§2.2), MUST be absent in sidecar mode (§2.1).** Forward or back slashes accepted; the scanner normalizes to backslashes. The referenced file must exist at scan time or the entry is skipped. |
 | `icon` | string | *none* | Relative path to a 2D icon image. PNG or JPEG. Recommended 512×512. When absent, the tile is rendered with the app name as a text label on a category-colored background. |
 | `icon_3d` | string | *none* | Relative path to a stereoscopic icon image. When present, the shell renders the tile stereoscopically. Resolution matches `icon` aspect but doubled along the layout axis (e.g. 1024×512 for `sbs-lr`). Requires `icon` to also be set (as the 2D fallback). |
 | `icon_3d_layout` | string | `"sbs-lr"` | How the stereo pair is packed in `icon_3d`. One of `"sbs-lr"` (left-right), `"sbs-rl"` (right-left), `"tb"` (top-bottom, left eye on top), `"bt"` (bottom-top). Ignored if `icon_3d` is absent. |
@@ -75,7 +100,7 @@ my_app/
 
 Names the shell may consume in later schema versions — do not use for custom data:
 
-`version`, `publisher`, `homepage`, `min_runtime`, `required_extensions`, `screenshots`, `trailer`, `pose`, `window_size`.
+`version`, `publisher`, `homepage`, `min_runtime`, `required_extensions`, `screenshots`, `trailer`, `pose`, `window_size`, `args`, `working_dir`.
 
 ## 4. 3D icons
 
@@ -93,8 +118,15 @@ The shell renders launcher tiles at ~40 cm in front of the viewer. Stereo icons 
 
 ## 5. Discovery behavior
 
-The shell scanner walks a fixed set of paths (see `shell-phase5-plan.md` Part 1):
+The shell scanner walks two kinds of paths in this order:
 
+**Registered-mode discovery dirs** (manifests own the exe via `exe_path`):
+```
+%LOCALAPPDATA%\DisplayXR\apps\          ← per-user, user/installer-writable
+%ProgramData%\DisplayXR\apps\           ← system-wide, installer-writable (elevated)
+```
+
+**Sidecar-mode dev paths** (manifests sit next to the exe):
 ```
 <shell-exe>/../test_apps/*/build/
 <shell-exe>/../demos/*/build/
@@ -102,12 +134,20 @@ The shell scanner walks a fixed set of paths (see `shell-phase5-plan.md` Part 1)
 %PROGRAMFILES%\DisplayXR\apps\
 ```
 
-For each `.exe` found:
+For each registered-mode dir, the scanner enumerates `*.displayxr.json` directly. For each manifest:
 
-1. Look for `<exe_basename>.displayxr.json` in the same directory.
+1. Parse + validate per §6.
+2. Read `exe_path`. If missing or the file does not exist → skip with warning.
+3. Add the entry to the registry; the manifest path is also recorded so the launcher's "remove" action can delete it.
+
+For each sidecar-mode dir, the scanner enumerates `*.exe`. For each exe:
+
+1. Look for `<exe_basename>.displayxr.json` next to it.
 2. If absent → **skip the exe entirely**.
-3. If present → parse, validate against this spec, resolve icon paths, add to the registry with `source: "scan"`.
+3. If present → parse + validate per §6, resolve icon paths.
 4. Sanity check: verify the exe imports `openxr_loader.dll` (PE import scan). If not, log a warning and still add the entry (the manifest is authoritative — a 2D `type` app wouldn't import OpenXR anyway).
+
+**Dedup**: across all dirs, entries are deduplicated by case-insensitive `exe_path`. Discovery order above defines precedence — `%LOCALAPPDATA%` wins over `%ProgramData%`, which wins over the dev/Program-Files sidecar paths. Later duplicates are dropped silently.
 
 Manifest parse errors are logged to the shell log and the entry is dropped. Malformed manifests do not crash the scanner.
 
@@ -118,6 +158,8 @@ The scanner rejects a manifest if any of the following are true:
 - `schema_version` is missing or not `1`.
 - `name` is missing, empty, or longer than 64 characters.
 - `type` is missing or not one of `"3d"` / `"2d"`.
+- `exe_path` is required (registered mode) but missing, empty, or refers to a file that does not exist.
+- `exe_path` is set but the manifest is in a sidecar location — `exe_path` is reserved for registered mode (warning only; the sibling exe still wins).
 - `icon` is specified but the referenced file does not exist or is not a readable PNG/JPEG.
 - `icon_3d` is specified but the file does not exist or is not a readable PNG/JPEG, or `icon` is not also set.
 - `icon_3d_layout` is specified but not one of the four allowed values.
@@ -152,12 +194,33 @@ This is enough for the launcher to show a named tile. Without `icon` the tile re
 }
 ```
 
-## 9. Versioning
+## 9. Reusing the 2D icon as the Windows app icon
 
-Breaking changes bump `schema_version`. The shell will refuse to parse manifests with a `schema_version` it does not understand, and log the unsupported version. Additive changes (new optional fields) keep `schema_version: 1`.
+The shell launcher renders `icon` as the tile face. The same image should also be the **embedded application icon** in the executable, so Windows uses it for the Start Menu, Desktop shortcut, and taskbar — i.e. the user sees the same icon whether they launch from the DisplayXR shell or from a regular Windows shortcut.
 
-## 10. Relationship to `registered_apps.json`
+There is no DisplayXR plumbing for this — engines already embed an icon resource into the PE during build. Authors should configure both sides from a single source asset:
 
-`registered_apps.json` at `%LOCALAPPDATA%\DisplayXR\registered_apps.json` is the shell's local registry — the cached result of scanning plus any user-added entries. Entries discovered from sidecars are written there with `source: "scan"`; entries added via **Browse for app…** get `source: "user"`. The registry is rebuilt from sidecars on each shell startup; `source: "user"` entries are preserved across rebuilds.
+- **Unity** — set the icon in *Project Settings → Player → Icon* (standalone platform). The DisplayXR Unity plugin's manifest settings asset has a separate `icon` field that should reference the **same source texture**. Mismatch produces an editor warning.
+- **Unreal** — set the icon in *Project Settings → Platforms → Windows → Game Icon*. The DisplayXR Unreal plugin's manifest settings has a separate `icon` field that should reference the **same source asset**. Mismatch produces an editor warning.
+- **Native apps** — embed an `.ico` resource in your `.rc`/manifest the way you normally would, and point `icon` in the manifest at the corresponding `.png` next to your manifest.
 
-Developers should never edit `registered_apps.json` directly — edit the sidecar next to your app and relaunch the shell.
+The shell does NOT extract icons from the PE for sidecar/registered manifests — it always reads the path in `icon`. The PE-icon-extraction path is only used by the **Browse for app…** flow when registering an arbitrary executable that does not already ship a manifest (see §11).
+
+## 10. Versioning
+
+Breaking changes bump `schema_version`. The shell will refuse to parse manifests with a `schema_version` it does not understand, and log the unsupported version. Additive changes (new optional fields) keep `schema_version: 1`. The `exe_path` field added in this revision is additive — older shells that read a registered manifest will fall back to sidecar resolution (look for sibling exe, fail, skip the entry); they will never crash. Registered-mode manifests therefore require shell ≥ the version that introduced this field.
+
+## 11. Browse-for-app and `registered_apps.json`
+
+`registered_apps.json` at `%LOCALAPPDATA%\DisplayXR\registered_apps.json` is the shell's **state cache** — saved window poses, MRU order, hide flags, and other per-tile UI state. It is **not** the source of truth for which apps exist; that role belongs entirely to manifests under §5's discovery dirs.
+
+The launcher's **Browse for app…** entry registers an arbitrary executable by **writing a manifest** into `%LOCALAPPDATA%\DisplayXR\apps\`:
+
+1. The user picks an `.exe`.
+2. The shell extracts the embedded PE icon to `<sanitized_basename>.png` next to the new manifest. If extraction fails the manifest omits `icon`.
+3. The shell writes `<sanitized_basename>.displayxr.json` with `schema_version:1`, `name` derived from the exe basename, `type:"3d"`, `category:"app"`, `exe_path` set to the picked path, and `icon` if extraction succeeded.
+4. The scanner re-runs and the new manifest is picked up like any other registered entry.
+
+The launcher's "remove" action on a tile **deletes the manifest file** when it lives under `%LOCALAPPDATA%\DisplayXR\apps\` (per-user, no elevation needed) or `%ProgramData%\DisplayXR\apps\` (system-wide, may fail without elevation — falls back to hiding the tile via state cache). Sidecar manifests in dev paths are never deleted by the launcher; they are developer-owned.
+
+Developers should never edit `registered_apps.json` directly — edit the manifest and relaunch the shell.
