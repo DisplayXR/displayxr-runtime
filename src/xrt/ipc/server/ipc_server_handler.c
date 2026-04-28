@@ -319,9 +319,10 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 	// mode (intentional — it suppresses qwerty for shell-self rendering).
 	// Here we re-enable qwerty on a per-session basis.
 	bool workspace_mode = s->xsysc != NULL && s->xsysc->info.workspace_mode;
+	unsigned long workspace_pid = get_orchestrator_workspace_pid();
 	bool is_workspace_controller_session =
-	    ics->client_state.info.application_name[0] != '\0' &&
-	    strcmp((const char *)ics->client_state.info.application_name, "displayxr-shell") == 0;
+	    workspace_pid != 0 &&
+	    (unsigned long)ics->client_state.pid == workspace_pid;
 	bool is_appcontainer_app =
 	    ics->client_state.info.ext_win32_appcontainer_compatible_enabled;
 	bool use_qwerty_head = compositor_owns_window ||
@@ -2190,29 +2191,14 @@ ipc_handle_workspace_activate(volatile struct ipc_client_state *_ics)
 	// mode. In manual mode (no orchestrator-spawned process, e.g. dev
 	// running displayxr-service --workspace and launching the shell by
 	// hand) the provider returns 0 → first-claim wins.
-	//
-	// A legacy `application_name == "displayxr-shell"` fallback is kept
-	// for one release so existing setups don't break mid-upgrade between
-	// service and shell versions. The next commit removes the fallback,
-	// making PID match strictly required in service-managed mode.
 	unsigned long expected_pid = get_orchestrator_workspace_pid();
 	unsigned long caller_pid = (unsigned long)_ics->client_state.pid;
 
 	if (expected_pid != 0 && caller_pid != expected_pid) {
-		bool legacy_match =
-		    _ics->client_state.info.application_name[0] != '\0' &&
-		    strcmp((const char *)_ics->client_state.info.application_name,
-		           "displayxr-shell") == 0;
-		if (!legacy_match) {
-			IPC_WARN(s,
-			         "workspace_activate: PID mismatch (caller=%lu, expected=%lu) — denied",
-			         caller_pid, expected_pid);
-			return XRT_ERROR_NOT_AUTHORIZED;
-		}
 		IPC_WARN(s,
-		         "workspace_activate: PID mismatch (caller=%lu, expected=%lu) but legacy "
-		         "application_name match accepted (deprecated, will be removed)",
+		         "workspace_activate: PID mismatch (caller=%lu, expected=%lu) — denied",
 		         caller_pid, expected_pid);
+		return XRT_ERROR_NOT_AUTHORIZED;
 	}
 
 	if (s->workspace_mode) {
