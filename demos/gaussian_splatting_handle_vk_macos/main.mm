@@ -1711,7 +1711,9 @@ int main() {
                         // so negate Y here to keep the eye-vs-display geometry consistent.
                         cameraPose.position = {g_input.cameraPosX, -g_input.cameraPosY, g_input.cameraPosZ};
 
-                        XrVector3f nominalViewer = {xr.nominalViewerX, xr.nominalViewerY, xr.nominalViewerZ};
+                        // nominalViewer in render frame (Y mirrored) — used for
+                        // parallax-factor lerp, must match the eye/cameraPose frame.
+                        XrVector3f nominalViewer = {xr.nominalViewerX, -xr.nominalViewerY, xr.nominalViewerZ};
 
                         // Per-view extent driven entirely by the current rendering
                         // mode's view_scale and the live window size. Atlas dims
@@ -1757,6 +1759,12 @@ int main() {
                                 eyeOffsetY = (winCenterY - dispCenterY) * pxSizeYBacking;
                             }
                             for (auto& e : rawEyePos) { e.x -= eyeOffsetX; e.y -= eyeOffsetY; }
+                            // GsRenderer Y-mirrors the world; cameraPose Y is negated
+                            // below at the display3d_compute_views boundary. Eyes must
+                            // live in the same render frame so the asymmetric Kooima
+                            // projection's eye-vs-display geometry stays consistent —
+                            // otherwise vertical eye parallax comes out inverted.
+                            for (auto& e : rawEyePos) { e.y = -e.y; }
 
                             Display3DScreen screen = {winW_m, winH_m};
                             Display3DTunables tunables;
