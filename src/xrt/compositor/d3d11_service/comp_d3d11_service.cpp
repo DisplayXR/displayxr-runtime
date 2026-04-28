@@ -515,6 +515,8 @@ struct d3d11_service_system
 //! Both rendering and hit-testing derive from these values.
 #define UI_TITLE_BAR_H_M   0.008f   //!< Title bar height: 8mm
 #define UI_BTN_W_M          0.008f   //!< Close/minimize button width: 8mm
+#define UI_MIN_WIN_W_M      (4.0f * UI_BTN_W_M)  //!< Min window width = 3 title-bar buttons + slack so they don't overflow the left edge
+#define UI_MIN_WIN_H_M      0.02f    //!< Min window height: 20mm
 #define UI_TASKBAR_H_M      0.009f   //!< Taskbar height: 9mm
 #define UI_GLYPH_W_M        0.0035f  //!< Glyph width: 3.5mm (balanced aspect ratio)
 #define UI_GLYPH_H_M        0.005f   //!< Glyph height: 5mm
@@ -6356,20 +6358,28 @@ after_key_shortcuts:
 
 					float new_w = mc->resize.start_width_m;
 					float new_h = mc->resize.start_height_m;
-					float new_x = mc->resize.start_pos_x;
-					float new_y = mc->resize.start_pos_y;
 
-					// Asymmetric: opposite edge stays fixed. Center shifts by delta/2.
-					if (mc->resize.edges & RESIZE_RIGHT)  { new_w += dx_m; new_x += dx_m / 2.0f; }
-					if (mc->resize.edges & RESIZE_LEFT)   { new_w -= dx_m; new_x += dx_m / 2.0f; }
-					if (mc->resize.edges & RESIZE_BOTTOM) { new_h += dy_m; new_y -= dy_m / 2.0f; }
-					if (mc->resize.edges & RESIZE_TOP)    { new_h -= dy_m; new_y -= dy_m / 2.0f; }
+					if (mc->resize.edges & RESIZE_RIGHT)  new_w += dx_m;
+					if (mc->resize.edges & RESIZE_LEFT)   new_w -= dx_m;
+					if (mc->resize.edges & RESIZE_BOTTOM) new_h += dy_m;
+					if (mc->resize.edges & RESIZE_TOP)    new_h -= dy_m;
 
-					float min_dim = 0.02f;
-					if (new_w < min_dim) new_w = min_dim;
-					if (new_h < min_dim) new_h = min_dim;
+					if (new_w < UI_MIN_WIN_W_M) new_w = UI_MIN_WIN_W_M;
+					if (new_h < UI_MIN_WIN_H_M) new_h = UI_MIN_WIN_H_M;
 					if (new_w > disp_w_m * 0.95f) new_w = disp_w_m * 0.95f;
 					if (new_h > disp_h_m * 0.95f) new_h = disp_h_m * 0.95f;
+
+					// Anchor the opposite edge: derive position from the *clamped*
+					// width/height delta, not raw cursor delta. Otherwise once a
+					// dimension hits its min, continued dragging slides the window.
+					float new_x = mc->resize.start_pos_x;
+					float new_y = mc->resize.start_pos_y;
+					float dw = new_w - mc->resize.start_width_m;
+					float dh = new_h - mc->resize.start_height_m;
+					if (mc->resize.edges & RESIZE_RIGHT)  new_x += dw / 2.0f;
+					if (mc->resize.edges & RESIZE_LEFT)   new_x -= dw / 2.0f;
+					if (mc->resize.edges & RESIZE_BOTTOM) new_y -= dh / 2.0f;
+					if (mc->resize.edges & RESIZE_TOP)    new_y += dh / 2.0f;
 
 					mc->clients[s].window_width_m = new_w;
 					mc->clients[s].window_height_m = new_h;
@@ -6583,15 +6593,14 @@ after_key_shortcuts:
 				float new_w = mc->clients[s].window_width_m * factor;
 				float new_h = mc->clients[s].window_height_m * factor;
 
-				// Clamp to minimum 2cm and maximum 80% of display
-				float min_dim = 0.02f;
+				// Clamp width to fit title bar buttons; height to 2cm; max 80% of display.
 				float max_w = sys->base.info.display_width_m * 0.8f;
 				float max_h = sys->base.info.display_height_m * 0.8f;
 				if (max_w <= 0.0f) max_w = 0.560f;
 				if (max_h <= 0.0f) max_h = 0.315f;
 
-				if (new_w < min_dim) new_w = min_dim;
-				if (new_h < min_dim) new_h = min_dim;
+				if (new_w < UI_MIN_WIN_W_M) new_w = UI_MIN_WIN_W_M;
+				if (new_h < UI_MIN_WIN_H_M) new_h = UI_MIN_WIN_H_M;
 				if (new_w > max_w) new_w = max_w;
 				if (new_h > max_h) new_h = max_h;
 
