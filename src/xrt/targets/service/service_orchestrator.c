@@ -45,9 +45,14 @@ DEBUG_GET_ONCE_LOG_OPTION(orchestrator_log, "DISPLAYXR_ORCHESTRATOR_LOG", U_LOGG
 // install/uninstall of the hook (which must happen on the tray thread since
 // WH_KEYBOARD_LL requires a message pump on the installing thread, and our
 // main thread blocks in ipc_server_main without one).
-#define WM_ORCHESTRATOR_SPAWN_SHELL    (WM_APP + 1)
-#define WM_ORCHESTRATOR_INSTALL_HOOK   (WM_APP + 2)
-#define WM_ORCHESTRATOR_UNINSTALL_HOOK (WM_APP + 3)
+//
+// Must NOT collide with WM_TRAYICON (WM_APP + 1) defined in service_tray_win.c
+// — every Shell_NotifyIcon notification (WM_RBUTTONUP, WM_MOUSEMOVE,
+// NIN_POPUPOPEN, …) is delivered as that message, and a clash makes this
+// orchestrator subclass eat them all before tray_wnd_proc ever sees them.
+#define WM_ORCHESTRATOR_SPAWN_SHELL    (WM_APP + 100)
+#define WM_ORCHESTRATOR_INSTALL_HOOK   (WM_APP + 101)
+#define WM_ORCHESTRATOR_UNINSTALL_HOOK (WM_APP + 102)
 
 
 /*
