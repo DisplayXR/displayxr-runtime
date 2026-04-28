@@ -668,9 +668,9 @@ qwerty_system_create(struct qwerty_hmd *qhmd,
 		// the virtual HMD, but wrong for desktop 3D displays where the
 		// user sits ~nominal_viewer_z (positive = in front of display,
 		// matching the oxr_session fallback eye placement convention).
-		// Legacy Chrome WebXR in shell mode compounded its own scene
+		// Legacy Chrome WebXR in workspace mode compounded its own scene
 		// origin with the (0, 1.6, 0) default and placed content
-		// mispositioned relative to the shell window.
+		// mispositioned relative to the workspace window.
 		if (qs->nominal_viewer_z > 0.0f) {
 			qhmd->base.pose.position.x = 0.0f;
 			qhmd->base.pose.position.y = 1.6f;

@@ -555,7 +555,7 @@ qwerty_process_win32(struct xrt_device **xdevs,
 				qwerty_reset_view_state(qsys);
 			break;
 
-		// ESC: no-op in shell mode. Shell lifecycle is controlled by
+		// ESC: no-op in workspace mode. Workspace lifecycle is controlled by
 		// Ctrl+Space (system hotkey) and the tray icon, not ESC.
 		case VK_ESCAPE:
 			break;

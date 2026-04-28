@@ -114,7 +114,7 @@ show_context_menu(HWND hwnd)
 	POINT pt;
 	GetCursorPos(&pt);
 
-	// Shell submenu (radio group: Enable, Auto, Disable)
+	// Workspace submenu (radio group: Enable, Auto, Disable)
 	HMENU workspace_sub = CreatePopupMenu();
 	AppendMenuW(workspace_sub, MF_STRING, IDM_WORKSPACE_ENABLE, L"Enable");
 	AppendMenuW(workspace_sub, MF_STRING, IDM_WORKSPACE_AUTO, L"Auto");
@@ -177,7 +177,7 @@ tray_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
 	case WM_COMMAND:
 		switch (LOWORD(wParam)) {
-		// Shell mode radio group
+		// Workspace mode radio group
 		case IDM_WORKSPACE_ENABLE:
 			s_config.workspace = SERVICE_CHILD_ENABLE;
 			config_changed();
