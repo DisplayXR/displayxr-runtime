@@ -44,6 +44,34 @@
 
 /*
  *
+ * Workspace controller authentication
+ *
+ * The standalone displayxr-service registers a provider that returns the PID
+ * of the orchestrator-spawned workspace controller. Other consumers of the
+ * IPC server (sdl_test, Android service module) leave this NULL → manual
+ * mode, where the first client to call workspace_activate wins. Calling out
+ * to a function pointer (rather than an unconditional symbol reference)
+ * keeps ipc_server independent of the service-only orchestrator code.
+ *
+ */
+
+static ipc_server_workspace_pid_provider_fn s_workspace_pid_provider = NULL;
+
+void
+ipc_server_set_workspace_pid_provider(ipc_server_workspace_pid_provider_fn fn)
+{
+	s_workspace_pid_provider = fn;
+}
+
+static unsigned long
+get_orchestrator_workspace_pid(void)
+{
+	return s_workspace_pid_provider ? s_workspace_pid_provider() : 0;
+}
+
+
+/*
+ *
  * Helper functions.
  *
  */
@@ -2156,6 +2184,36 @@ xrt_result_t
 ipc_handle_workspace_activate(volatile struct ipc_client_state *_ics)
 {
 	struct ipc_server *s = _ics->server;
+
+	// PID-match auth. In service-managed mode the orchestrator spawned a
+	// known workspace controller; only that PID may activate workspace
+	// mode. In manual mode (no orchestrator-spawned process, e.g. dev
+	// running displayxr-service --workspace and launching the shell by
+	// hand) the provider returns 0 → first-claim wins.
+	//
+	// A legacy `application_name == "displayxr-shell"` fallback is kept
+	// for one release so existing setups don't break mid-upgrade between
+	// service and shell versions. The next commit removes the fallback,
+	// making PID match strictly required in service-managed mode.
+	unsigned long expected_pid = get_orchestrator_workspace_pid();
+	unsigned long caller_pid = (unsigned long)_ics->client_state.pid;
+
+	if (expected_pid != 0 && caller_pid != expected_pid) {
+		bool legacy_match =
+		    _ics->client_state.info.application_name[0] != '\0' &&
+		    strcmp((const char *)_ics->client_state.info.application_name,
+		           "displayxr-shell") == 0;
+		if (!legacy_match) {
+			IPC_WARN(s,
+			         "workspace_activate: PID mismatch (caller=%lu, expected=%lu) — denied",
+			         caller_pid, expected_pid);
+			return XRT_ERROR_NOT_AUTHORIZED;
+		}
+		IPC_WARN(s,
+		         "workspace_activate: PID mismatch (caller=%lu, expected=%lu) but legacy "
+		         "application_name match accepted (deprecated, will be removed)",
+		         caller_pid, expected_pid);
+	}
 
 	if (s->workspace_mode) {
 		IPC_INFO(s, "Workspace: already in workspace mode — ensuring window for relaunch");

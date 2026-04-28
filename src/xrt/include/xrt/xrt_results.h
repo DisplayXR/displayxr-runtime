@@ -231,4 +231,11 @@ typedef enum xrt_result
 	 * The IPC server couldn't starts it mainloop.
 	 */
 	XRT_ERROR_IPC_MAINLOOP_FAILED_TO_INIT = -38,
+
+	/*!
+	 * The caller is not authorized to perform the requested operation. Used
+	 * for IPC requests like `workspace_activate` that are only valid for the
+	 * orchestrator-spawned workspace controller.
+	 */
+	XRT_ERROR_NOT_AUTHORIZED = -39,
 } xrt_result_t;

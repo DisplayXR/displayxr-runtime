@@ -546,6 +546,25 @@ xrt_result_t
 ipc_server_get_system_properties(struct ipc_server *vs, struct xrt_system_properties *out_properties);
 //! @}
 
+/*!
+ * Function pointer the IPC server calls to learn the PID of the
+ * orchestrator-spawned workspace controller, for `workspace_activate`
+ * authentication. Returns 0 if no orchestrator-managed workspace is
+ * running (= manual mode → first-claim wins).
+ */
+typedef unsigned long (*ipc_server_workspace_pid_provider_fn)(void);
+
+/*!
+ * Register the workspace-PID provider. The standalone service registers
+ * this from main() after orchestrator init. Other consumers of ipc_server
+ * (sdl_test, the Android service module) that don't run an orchestrator
+ * leave it unset — workspace_activate then operates in manual mode.
+ *
+ * Pass NULL to clear the registration (e.g. on shutdown).
+ */
+void
+ipc_server_set_workspace_pid_provider(ipc_server_workspace_pid_provider_fn fn);
+
 /*
  *
  * Helpers

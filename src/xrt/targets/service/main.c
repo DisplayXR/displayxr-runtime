@@ -25,6 +25,7 @@
 #endif
 
 #include "server/ipc_server_interface.h"
+#include "server/ipc_server.h"
 
 #include "target_lists.h"
 
@@ -126,6 +127,11 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 
 	// Initialize orchestrator (registers hotkeys, spawns children per config)
 	service_orchestrator_init(&cfg);
+
+	// Tell the IPC server how to look up the orchestrator-spawned workspace
+	// controller's PID, so workspace_activate can authenticate that only the
+	// controller we spawned may transition the runtime into workspace mode.
+	ipc_server_set_workspace_pid_provider(service_orchestrator_get_workspace_pid);
 
 	u_trace_marker_init();
 	u_metrics_init();
