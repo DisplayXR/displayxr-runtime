@@ -8,7 +8,7 @@
  *   displayxr-shell.exe [--pose x,y,z,w,h] app1.exe [--pose x,y,z,w,h] app2.exe ...
  *
  * - Auto-starts displayxr-service --shell if not running
- * - Launches each app with DISPLAYXR_SHELL_SESSION=1 and XR_RUNTIME_JSON set
+ * - Launches each app with DISPLAYXR_WORKSPACE_SESSION=1 and XR_RUNTIME_JSON set
  * - Optionally assigns per-app window pose via --pose x,y,z,width_m,height_m
  * - Monitors client connect/disconnect until Ctrl+C
  *
@@ -592,7 +592,7 @@ ensure_app_gpu_pref_high(const char *exe_path)
 }
 
 /*!
- * Launch an app with DISPLAYXR_SHELL_SESSION=1 and XR_RUNTIME_JSON set.
+ * Launch an app with DISPLAYXR_WORKSPACE_SESSION=1 and XR_RUNTIME_JSON set.
  */
 static bool
 launch_app(struct app_entry *app, const char *runtime_json)
@@ -603,7 +603,7 @@ launch_app(struct app_entry *app, const char *runtime_json)
 	if (runtime_json != NULL) {
 		SetEnvironmentVariableA("XR_RUNTIME_JSON", runtime_json);
 	}
-	SetEnvironmentVariableA("DISPLAYXR_SHELL_SESSION", "1");
+	SetEnvironmentVariableA("DISPLAYXR_WORKSPACE_SESSION", "1");
 
 	// Resolve to absolute path (relative paths fail with CreateProcessA)
 	char abs_path[MAX_PATH];
@@ -1517,7 +1517,7 @@ shell_browse_and_add_app(struct ipc_connection *ipc_c)
 
 /*!
  * Launch a registered app from the shell.
- * For "3d" type: uses launch_app() with DISPLAYXR_SHELL_SESSION env.
+ * For "3d" type: uses launch_app() with DISPLAYXR_WORKSPACE_SESSION env.
  * For "2d" type: launches without shell env, then captures via IPC.
  * For unknown type: launches as 3d, polls for IPC connect to auto-detect.
  */
@@ -1551,7 +1551,7 @@ shell_launch_registered_app(struct ipc_connection *ipc_c,
 		dirname_of(abs_path, exe_dir, sizeof(exe_dir));
 
 		// Clear shell env vars so 2D app doesn't accidentally pick them up
-		SetEnvironmentVariableA("DISPLAYXR_SHELL_SESSION", NULL);
+		SetEnvironmentVariableA("DISPLAYXR_WORKSPACE_SESSION", NULL);
 
 		BOOL ok = CreateProcessA(NULL, cmd, NULL, NULL, FALSE,
 		    CREATE_NEW_CONSOLE, NULL, exe_dir, &si, &pi);

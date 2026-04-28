@@ -16,9 +16,9 @@
 #define WM_TRAYICON              (WM_APP + 1)
 
 // Menu command IDs
-#define IDM_SHELL_ENABLE    1010
-#define IDM_SHELL_DISABLE   1011
-#define IDM_SHELL_AUTO      1012
+#define IDM_WORKSPACE_ENABLE    1010
+#define IDM_WORKSPACE_DISABLE   1011
+#define IDM_WORKSPACE_AUTO      1012
 #define IDM_BRIDGE_ENABLE   1020
 #define IDM_BRIDGE_DISABLE  1021
 #define IDM_BRIDGE_AUTO     1022
@@ -85,14 +85,14 @@ load_theme_icon(void)
  *
  */
 
-//! Map service_child_mode to the corresponding menu ID for the shell submenu.
+//! Map service_child_mode to the corresponding menu ID for the workspace submenu.
 static UINT
-shell_mode_to_id(enum service_child_mode m)
+workspace_mode_to_id(enum service_child_mode m)
 {
 	switch (m) {
-	case SERVICE_CHILD_ENABLE: return IDM_SHELL_ENABLE;
-	case SERVICE_CHILD_DISABLE: return IDM_SHELL_DISABLE;
-	default: return IDM_SHELL_AUTO;
+	case SERVICE_CHILD_ENABLE: return IDM_WORKSPACE_ENABLE;
+	case SERVICE_CHILD_DISABLE: return IDM_WORKSPACE_DISABLE;
+	default: return IDM_WORKSPACE_AUTO;
 	}
 }
 
@@ -115,12 +115,12 @@ show_context_menu(HWND hwnd)
 	GetCursorPos(&pt);
 
 	// Shell submenu (radio group: Enable, Auto, Disable)
-	HMENU shell_sub = CreatePopupMenu();
-	AppendMenuW(shell_sub, MF_STRING, IDM_SHELL_ENABLE, L"Enable");
-	AppendMenuW(shell_sub, MF_STRING, IDM_SHELL_AUTO, L"Auto");
-	AppendMenuW(shell_sub, MF_STRING, IDM_SHELL_DISABLE, L"Disable");
-	CheckMenuRadioItem(shell_sub, IDM_SHELL_ENABLE, IDM_SHELL_AUTO,
-	                   shell_mode_to_id(s_config.shell), MF_BYCOMMAND);
+	HMENU workspace_sub = CreatePopupMenu();
+	AppendMenuW(workspace_sub, MF_STRING, IDM_WORKSPACE_ENABLE, L"Enable");
+	AppendMenuW(workspace_sub, MF_STRING, IDM_WORKSPACE_AUTO, L"Auto");
+	AppendMenuW(workspace_sub, MF_STRING, IDM_WORKSPACE_DISABLE, L"Disable");
+	CheckMenuRadioItem(workspace_sub, IDM_WORKSPACE_ENABLE, IDM_WORKSPACE_AUTO,
+	                   workspace_mode_to_id(s_config.workspace), MF_BYCOMMAND);
 
 	// Bridge submenu (radio group: Enable, Auto, Disable)
 	HMENU bridge_sub = CreatePopupMenu();
@@ -132,7 +132,7 @@ show_context_menu(HWND hwnd)
 
 	// Main menu
 	HMENU menu = CreatePopupMenu();
-	AppendMenuW(menu, MF_POPUP, (UINT_PTR)shell_sub, L"Spatial Shell");
+	AppendMenuW(menu, MF_POPUP, (UINT_PTR)workspace_sub, L"Workspace Controller");
 	AppendMenuW(menu, MF_POPUP, (UINT_PTR)bridge_sub, L"WebXR Bridge");
 	AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
 	AppendMenuW(menu, MF_STRING | (s_config.start_on_login ? MF_CHECKED : MF_UNCHECKED),
@@ -178,16 +178,16 @@ tray_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 	case WM_COMMAND:
 		switch (LOWORD(wParam)) {
 		// Shell mode radio group
-		case IDM_SHELL_ENABLE:
-			s_config.shell = SERVICE_CHILD_ENABLE;
+		case IDM_WORKSPACE_ENABLE:
+			s_config.workspace = SERVICE_CHILD_ENABLE;
 			config_changed();
 			break;
-		case IDM_SHELL_AUTO:
-			s_config.shell = SERVICE_CHILD_AUTO;
+		case IDM_WORKSPACE_AUTO:
+			s_config.workspace = SERVICE_CHILD_AUTO;
 			config_changed();
 			break;
-		case IDM_SHELL_DISABLE:
-			s_config.shell = SERVICE_CHILD_DISABLE;
+		case IDM_WORKSPACE_DISABLE:
+			s_config.workspace = SERVICE_CHILD_DISABLE;
 			config_changed();
 			break;
 
@@ -309,7 +309,7 @@ service_tray_init(service_tray_shutdown_cb shutdown_cb,
 	if (initial_cfg) {
 		s_config = *initial_cfg;
 	} else {
-		s_config.shell = SERVICE_CHILD_AUTO;
+		s_config.workspace = SERVICE_CHILD_AUTO;
 		s_config.bridge = SERVICE_CHILD_AUTO;
 		s_config.start_on_login = true;
 	}

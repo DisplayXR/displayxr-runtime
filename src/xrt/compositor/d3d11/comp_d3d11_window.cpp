@@ -807,7 +807,7 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		if (GetOpenFileNameA(&ofn)) {
 			// Set shell session env var and ensure XR_RUNTIME_JSON points to
 			// the dev build runtime (matching the running service).
-			SetEnvironmentVariableA("DISPLAYXR_SHELL_SESSION", "1");
+			SetEnvironmentVariableA("DISPLAYXR_WORKSPACE_SESSION", "1");
 			if (getenv("XR_RUNTIME_JSON") == NULL) {
 				// Use dev build manifest (has absolute path to DLL).
 				// Service is at _package/bin/, dev manifest is at build/Release/.

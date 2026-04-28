@@ -122,10 +122,10 @@ u_sandbox_should_use_ipc(void)
 		U_LOG_W("Unknown XRT_FORCE_MODE value '%s', using automatic detection", force_mode);
 	}
 
-	// Shell session: app launched by shell with hidden HWND, route to IPC
-	const char *shell_session = getenv("DISPLAYXR_SHELL_SESSION");
-	if (shell_session != NULL && strcmp(shell_session, "1") == 0) {
-		U_LOG_I("DISPLAYXR_SHELL_SESSION=1: forcing IPC mode for shell");
+	// Workspace session: app launched by workspace controller with hidden HWND, route to IPC
+	const char *workspace_session = getenv("DISPLAYXR_WORKSPACE_SESSION");
+	if (workspace_session != NULL && strcmp(workspace_session, "1") == 0) {
+		U_LOG_I("DISPLAYXR_WORKSPACE_SESSION=1: forcing IPC mode for workspace controller");
 		return true;
 	}
 

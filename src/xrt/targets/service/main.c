@@ -28,7 +28,7 @@
 
 #include "target_lists.h"
 
-#include <string.h> // strcmp for --shell flag
+#include <string.h> // strcmp for --workspace / --shell flag
 
 
 // Insert the on load constructor to init trace marker.
@@ -98,7 +98,7 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 
 	u_win_try_privilege_or_priority_from_args(U_LOGGING_INFO, argc, argv);
 
-	// Load orchestrator config (shell/bridge modes, start-on-login)
+	// Load orchestrator config (workspace/bridge modes, start-on-login)
 	struct service_config cfg;
 	service_config_load(&cfg);
 
@@ -110,11 +110,12 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 		ExitProcess(0);
 	}
 
-	// Parse --shell flag for backwards compat (legacy multi-terminal workflow).
-	// The orchestrator will also enable shell mode when it spawns the shell.
+	// Parse --workspace (or legacy --shell alias) for the multi-terminal
+	// workflow. The orchestrator will also enable workspace mode when it
+	// spawns the workspace controller.
 	bool workspace_mode = false;
 	for (int i = 1; i < argc; i++) {
-		if (strcmp(argv[i], "--shell") == 0) {
+		if (strcmp(argv[i], "--workspace") == 0 || strcmp(argv[i], "--shell") == 0) {
 			workspace_mode = true;
 			break;
 		}
@@ -166,10 +167,10 @@ main(int argc, char *argv[])
 	u_trace_marker_init();
 	u_metrics_init();
 
-	// Parse --shell flag for multi-compositor shell mode
+	// Parse --workspace (or legacy --shell alias) for multi-compositor mode
 	bool workspace_mode = false;
 	for (int i = 1; i < argc; i++) {
-		if (strcmp(argv[i], "--shell") == 0) {
+		if (strcmp(argv[i], "--workspace") == 0 || strcmp(argv[i], "--shell") == 0) {
 			workspace_mode = true;
 			break;
 		}

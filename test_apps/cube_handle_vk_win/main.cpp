@@ -982,9 +982,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     HudRenderer hudRenderer = {};
     // Skip HUD in shell mode — window-space layers crash in VK IPC path
-    bool isShellMode = (getenv("DISPLAYXR_SHELL_SESSION") != nullptr);
-    bool hudOk = !isShellMode && InitializeHudRenderer(hudRenderer, hudWidth, hudHeight);
-    if (isShellMode) {
+    bool isWorkspaceSession = (getenv("DISPLAYXR_WORKSPACE_SESSION") != nullptr);
+    bool hudOk = !isWorkspaceSession && InitializeHudRenderer(hudRenderer, hudWidth, hudHeight);
+    if (isWorkspaceSession) {
         LOG_INFO("Shell mode detected - HUD disabled (window-space layers not supported in VK IPC)");
     } else if (!hudOk) {
         LOG_WARN("HUD renderer init failed - HUD will not be displayed");

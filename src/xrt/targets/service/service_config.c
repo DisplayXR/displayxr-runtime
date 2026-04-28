@@ -34,9 +34,11 @@
 static void
 config_defaults(struct service_config *cfg)
 {
-	cfg->shell = SERVICE_CHILD_AUTO;
+	cfg->workspace = SERVICE_CHILD_AUTO;
 	cfg->bridge = SERVICE_CHILD_AUTO;
 	cfg->start_on_login = true;
+	snprintf(cfg->workspace_binary, sizeof(cfg->workspace_binary),
+	         "displayxr-shell.exe");
 }
 
 //! Build the full path to service.json into @p buf.
@@ -176,9 +178,22 @@ service_config_load(struct service_config *cfg)
 		return;
 	}
 
-	cJSON *shell = cJSON_GetObjectItemCaseSensitive(root, "shell");
-	if (cJSON_IsString(shell)) {
-		cfg->shell = str_to_mode(shell->valuestring);
+	// Prefer the new "workspace" key; fall back to legacy "shell" key from
+	// pre-rename installs so an existing service.json keeps working.
+	cJSON *workspace = cJSON_GetObjectItemCaseSensitive(root, "workspace");
+	if (cJSON_IsString(workspace)) {
+		cfg->workspace = str_to_mode(workspace->valuestring);
+	} else {
+		cJSON *shell_legacy = cJSON_GetObjectItemCaseSensitive(root, "shell");
+		if (cJSON_IsString(shell_legacy)) {
+			cfg->workspace = str_to_mode(shell_legacy->valuestring);
+		}
+	}
+
+	cJSON *workspace_binary = cJSON_GetObjectItemCaseSensitive(root, "workspace_binary");
+	if (cJSON_IsString(workspace_binary) && workspace_binary->valuestring[0] != '\0') {
+		snprintf(cfg->workspace_binary, sizeof(cfg->workspace_binary),
+		         "%s", workspace_binary->valuestring);
 	}
 
 	cJSON *bridge = cJSON_GetObjectItemCaseSensitive(root, "bridge");
@@ -209,7 +224,8 @@ service_config_save(const struct service_config *cfg)
 		return false;
 	}
 
-	cJSON_AddStringToObject(root, "shell", mode_to_str(cfg->shell));
+	cJSON_AddStringToObject(root, "workspace", mode_to_str(cfg->workspace));
+	cJSON_AddStringToObject(root, "workspace_binary", cfg->workspace_binary);
 	cJSON_AddStringToObject(root, "bridge", mode_to_str(cfg->bridge));
 	cJSON_AddBoolToObject(root, "start_on_login", cfg->start_on_login);
 

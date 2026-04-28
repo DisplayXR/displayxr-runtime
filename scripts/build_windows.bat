@@ -333,9 +333,9 @@ if exist "%PKG%\bin\displayxr-webxr-bridge.exe" (
 > "%PKG%\run_shell_app.bat" (
     echo @echo off
     echo set "XR_RUNTIME_JSON=%RT_JSON%"
-    echo set "DISPLAYXR_SHELL_SESSION=1"
+    echo set "DISPLAYXR_WORKSPACE_SESSION=1"
     echo echo XR_RUNTIME_JSON=%%XR_RUNTIME_JSON%%
-    echo echo DISPLAYXR_SHELL_SESSION=%%DISPLAYXR_SHELL_SESSION%%
+    echo echo DISPLAYXR_WORKSPACE_SESSION=%%DISPLAYXR_WORKSPACE_SESSION%%
     echo if "%%~1"=="" (
     echo     "%REPO%test_apps\cube_handle_d3d11_win\build\cube_handle_d3d11_win.exe"
     echo ^) else (
@@ -347,11 +347,11 @@ if exist "%PKG%\bin\displayxr-webxr-bridge.exe" (
 > "%PKG%\run_shell_2apps.bat" (
     echo @echo off
     echo set "XR_RUNTIME_JSON=%RT_JSON%"
-    echo set "DISPLAYXR_SHELL_SESSION=1"
+    echo set "DISPLAYXR_WORKSPACE_SESSION=1"
     echo echo Starting two shell apps...
-    echo start "" cmd /c "set XR_RUNTIME_JSON=%RT_JSON%^&^& set DISPLAYXR_SHELL_SESSION=1^&^& "%REPO%test_apps\cube_handle_d3d11_win\build\cube_handle_d3d11_win.exe""
+    echo start "" cmd /c "set XR_RUNTIME_JSON=%RT_JSON%^&^& set DISPLAYXR_WORKSPACE_SESSION=1^&^& "%REPO%test_apps\cube_handle_d3d11_win\build\cube_handle_d3d11_win.exe""
     echo timeout /t 3 /nobreak ^>nul
-    echo start "" cmd /c "set XR_RUNTIME_JSON=%RT_JSON%^&^& set DISPLAYXR_SHELL_SESSION=1^&^& "%REPO%test_apps\cube_handle_d3d11_win\build\cube_handle_d3d11_win.exe""
+    echo start "" cmd /c "set XR_RUNTIME_JSON=%RT_JSON%^&^& set DISPLAYXR_WORKSPACE_SESSION=1^&^& "%REPO%test_apps\cube_handle_d3d11_win\build\cube_handle_d3d11_win.exe""
     echo echo Both apps launched. Press any key to exit.
     echo pause ^>nul
 )

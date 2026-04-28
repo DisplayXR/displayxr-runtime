@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  Service orchestrator — manages shell and bridge child processes.
+ * @brief  Service orchestrator — manages workspace controller and bridge child processes.
  * @ingroup ipc
  */
 
@@ -34,7 +34,7 @@ DEBUG_GET_ONCE_LOG_OPTION(orchestrator_log, "DISPLAYXR_ORCHESTRATOR_LOG", U_LOGG
 
 /*
  *
- * Hotkey ID shared with the shell (must match shell/main.c HOTKEY_TOGGLE)
+ * Hotkey ID shared with the workspace controller (must match workspace controller HOTKEY_TOGGLE)
  *
  */
 
@@ -62,9 +62,9 @@ DEBUG_GET_ONCE_LOG_OPTION(orchestrator_log, "DISPLAYXR_ORCHESTRATOR_LOG", U_LOGG
  */
 
 static struct service_config s_cfg;
-static PROCESS_INFORMATION s_shell_pi;
-static bool s_shell_running = false;
-static HANDLE s_shell_watch_thread = NULL;
+static PROCESS_INFORMATION s_workspace_pi;
+static bool s_workspace_running = false;
+static HANDLE s_workspace_watch_thread = NULL;
 static bool s_hotkey_registered = false; // true when WH_KEYBOARD_LL hook is active
 static HHOOK s_kbd_hook = NULL;
 
@@ -207,37 +207,37 @@ terminate_child(PROCESS_INFORMATION *pi, bool *running_flag)
 
 /*
  *
- * Shell watchdog thread — monitors shell process, re-registers hotkey on exit
+ * Workspace watchdog thread — monitors workspace process, re-registers hotkey on exit
  *
  */
 
 static DWORD WINAPI
-shell_watch_thread_func(LPVOID param)
+workspace_watch_thread_func(LPVOID param)
 {
 	(void)param;
 
-	// Wait for the shell process to exit
-	WaitForSingleObject(s_shell_pi.hProcess, INFINITE);
+	// Wait for the workspace process to exit
+	WaitForSingleObject(s_workspace_pi.hProcess, INFINITE);
 
-	CloseHandle(s_shell_pi.hProcess);
-	s_shell_pi.hProcess = NULL;
-	s_shell_running = false;
+	CloseHandle(s_workspace_pi.hProcess);
+	s_workspace_pi.hProcess = NULL;
+	s_workspace_running = false;
 
 	OW("Shell process exited");
 
 	// In Auto mode, nothing to re-register: the low-level keyboard hook
-	// stays installed across shell sessions, it's gated by s_shell_running
+	// stays installed across workspace sessions, it's gated by s_workspace_running
 	// in the hook proc.
 
-	// In Enable mode, restart the shell
-	if (s_cfg.shell == SERVICE_CHILD_ENABLE) {
-		char shell_path[MAX_PATH];
-		if (sibling_exe_path("displayxr-shell.exe", shell_path, sizeof(shell_path))) {
-			if (launch_child(shell_path, "--service-managed", &s_shell_pi)) {
-				s_shell_running = true;
-				OW("Restarted shell (Enable mode)");
+	// In Enable mode, restart the workspace controller
+	if (s_cfg.workspace == SERVICE_CHILD_ENABLE) {
+		char workspace_path[MAX_PATH];
+		if (sibling_exe_path(s_cfg.workspace_binary, workspace_path, sizeof(workspace_path))) {
+			if (launch_child(workspace_path, "--service-managed", &s_workspace_pi)) {
+				s_workspace_running = true;
+				OW("Restarted workspace controller (Enable mode)");
 				// Recurse — start watching the new process
-				s_shell_watch_thread = CreateThread(NULL, 0, shell_watch_thread_func, NULL, 0, NULL);
+				s_workspace_watch_thread = CreateThread(NULL, 0, workspace_watch_thread_func, NULL, 0, NULL);
 			}
 		}
 	}
@@ -245,32 +245,32 @@ shell_watch_thread_func(LPVOID param)
 	return 0;
 }
 
-//! Spawn the shell and start watching it.
+//! Spawn the workspace controller and start watching it.
 static void
-spawn_shell(void)
+spawn_workspace(void)
 {
-	if (s_shell_running) {
+	if (s_workspace_running) {
 		return;
 	}
 
-	char shell_path[MAX_PATH];
-	if (!sibling_exe_path("displayxr-shell.exe", shell_path, sizeof(shell_path))) {
-		OW("Cannot find displayxr-shell.exe next to service");
+	char workspace_path[MAX_PATH];
+	if (!sibling_exe_path(s_cfg.workspace_binary, workspace_path, sizeof(workspace_path))) {
+		OW("Cannot find workspace controller binary '%s' next to service", s_cfg.workspace_binary);
 		return;
 	}
 
-	if (!launch_child(shell_path, "--service-managed", &s_shell_pi)) {
+	if (!launch_child(workspace_path, "--service-managed", &s_workspace_pi)) {
 		return;
 	}
 
-	s_shell_running = true;
-	OW("Launched shell (PID %lu)", (unsigned long)s_shell_pi.dwProcessId);
+	s_workspace_running = true;
+	OW("Launched workspace controller (PID %lu)", (unsigned long)s_workspace_pi.dwProcessId);
 
 	// Start watchdog thread
-	if (s_shell_watch_thread) {
-		CloseHandle(s_shell_watch_thread);
+	if (s_workspace_watch_thread) {
+		CloseHandle(s_workspace_watch_thread);
 	}
-	s_shell_watch_thread = CreateThread(NULL, 0, shell_watch_thread_func, NULL, 0, NULL);
+	s_workspace_watch_thread = CreateThread(NULL, 0, workspace_watch_thread_func, NULL, 0, NULL);
 }
 
 
@@ -532,7 +532,7 @@ stop_bridge_trampoline(void)
  *
  * The hook proc runs on the thread that installed it (the tray thread,
  * which has a GetMessage pump). From there we PostMessage a custom
- * message to the subclassed tray HWND and let spawn_shell run on a
+ * message to the subclassed tray HWND and let spawn_workspace run on a
  * normal stack — hook procs should do minimal work.
  *
  */
@@ -554,10 +554,10 @@ orchestrator_kbd_hook_proc(int nCode, WPARAM wParam, LPARAM lParam)
 			bool alt = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
 			bool win = (GetAsyncKeyState(VK_LWIN) & 0x8000) != 0 ||
 			           (GetAsyncKeyState(VK_RWIN) & 0x8000) != 0;
-			OW("kbd hook: Space ctrl=%d shift=%d alt=%d win=%d shell_running=%d",
-			   ctrl, shift, alt, win, (int)s_shell_running);
+			OW("kbd hook: Space ctrl=%d shift=%d alt=%d win=%d workspace_running=%d",
+			   ctrl, shift, alt, win, (int)s_workspace_running);
 			// Plain Ctrl+Space only, no other modifiers.
-			if (ctrl && !shift && !alt && !win && !s_shell_running) {
+			if (ctrl && !shift && !alt && !win && !s_workspace_running) {
 				HWND hwnd = (HWND)service_tray_get_hwnd();
 				if (hwnd) {
 					PostMessageW(hwnd, WM_ORCHESTRATOR_SPAWN_SHELL, 0, 0);
@@ -573,8 +573,8 @@ static LRESULT CALLBACK
 orchestrator_wnd_proc_hook(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
 	if (msg == WM_ORCHESTRATOR_SPAWN_SHELL) {
-		OW("Ctrl+Space pressed — launching shell");
-		spawn_shell();
+		OW("Ctrl+Space pressed — launching workspace controller");
+		spawn_workspace();
 		return 0;
 	}
 	if (msg == WM_ORCHESTRATOR_INSTALL_HOOK) {
@@ -606,7 +606,7 @@ orchestrator_wnd_proc_hook(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 //! pump — the tray thread does, our main thread (blocked in ipc_server_main)
 //! doesn't. Returns true if the install request was posted successfully.
 static bool
-install_shell_hotkey(void)
+install_workspace_hotkey(void)
 {
 	HWND hwnd = (HWND)service_tray_get_hwnd();
 	if (hwnd == NULL) return false;
@@ -614,7 +614,7 @@ install_shell_hotkey(void)
 }
 
 static void
-uninstall_shell_hotkey(void)
+uninstall_workspace_hotkey(void)
 {
 	HWND hwnd = (HWND)service_tray_get_hwnd();
 	if (hwnd != NULL) {
@@ -630,42 +630,42 @@ uninstall_shell_hotkey(void)
  */
 
 static void
-apply_shell_mode(enum service_child_mode mode)
+apply_workspace_mode(enum service_child_mode mode)
 {
 	switch (mode) {
 	case SERVICE_CHILD_ENABLE:
 		// Uninstall keyboard hook if active
 		if (s_hotkey_registered) {
-			uninstall_shell_hotkey();
+			uninstall_workspace_hotkey();
 			s_hotkey_registered = false;
 		}
-		// Launch shell if not running
-		spawn_shell();
+		// Launch workspace controller if not running
+		spawn_workspace();
 		break;
 
 	case SERVICE_CHILD_DISABLE:
 		// Uninstall keyboard hook if active
 		if (s_hotkey_registered) {
-			uninstall_shell_hotkey();
+			uninstall_workspace_hotkey();
 			s_hotkey_registered = false;
 		}
-		// Terminate shell if running
-		if (s_shell_running) {
-			terminate_child(&s_shell_pi, &s_shell_running);
-			OW("Terminated shell (Disable mode)");
+		// Terminate workspace controller if running
+		if (s_workspace_running) {
+			terminate_child(&s_workspace_pi, &s_workspace_running);
+			OW("Terminated workspace controller (Disable mode)");
 		}
 		break;
 
 	case SERVICE_CHILD_AUTO:
-		// Install low-level keyboard hook so Ctrl+Space summons the shell.
-		// The hook's proc checks s_shell_running per-keypress and passes
-		// through if the shell is already up. The actual install happens
+		// Install low-level keyboard hook so Ctrl+Space summons the workspace controller.
+		// The hook's proc checks s_workspace_running per-keypress and passes
+		// through if the workspace is already up. The actual install happens
 		// on the tray thread via PostMessage; log only on failure here.
 		if (!s_hotkey_registered) {
-			if (install_shell_hotkey()) {
+			if (install_workspace_hotkey()) {
 				s_hotkey_registered = true;
 			} else {
-				OW("install_shell_hotkey: could not post to tray HWND");
+				OW("install_workspace_hotkey: could not post to tray HWND");
 			}
 		}
 		break;
@@ -710,7 +710,7 @@ bool
 service_orchestrator_init(const struct service_config *cfg)
 {
 	s_cfg = *cfg;
-	ZeroMemory(&s_shell_pi, sizeof(s_shell_pi));
+	ZeroMemory(&s_workspace_pi, sizeof(s_workspace_pi));
 	ZeroMemory(&s_bridge_pi, sizeof(s_bridge_pi));
 
 	if (!s_bridge_lock_inited) {
@@ -725,7 +725,7 @@ service_orchestrator_init(const struct service_config *cfg)
 		                                                  (LONG_PTR)orchestrator_wnd_proc_hook);
 	}
 
-	apply_shell_mode(cfg->shell);
+	apply_workspace_mode(cfg->workspace);
 	apply_bridge_mode(cfg->bridge);
 
 	return true;
@@ -734,12 +734,12 @@ service_orchestrator_init(const struct service_config *cfg)
 void
 service_orchestrator_apply_config(const struct service_config *cfg)
 {
-	enum service_child_mode old_shell = s_cfg.shell;
+	enum service_child_mode old_workspace = s_cfg.workspace;
 	enum service_child_mode old_bridge = s_cfg.bridge;
 	s_cfg = *cfg;
 
-	if (cfg->shell != old_shell) {
-		apply_shell_mode(cfg->shell);
+	if (cfg->workspace != old_workspace) {
+		apply_workspace_mode(cfg->workspace);
 	}
 
 	if (cfg->bridge != old_bridge) {
@@ -754,7 +754,7 @@ service_orchestrator_shutdown(void)
 
 	// Uninstall keyboard hook
 	if (s_hotkey_registered) {
-		uninstall_shell_hotkey();
+		uninstall_workspace_hotkey();
 		s_hotkey_registered = false;
 	}
 
@@ -765,15 +765,15 @@ service_orchestrator_shutdown(void)
 	}
 
 	// Terminate shell
-	if (s_shell_running) {
-		terminate_child(&s_shell_pi, &s_shell_running);
+	if (s_workspace_running) {
+		terminate_child(&s_workspace_pi, &s_workspace_running);
 	}
 
 	// Wait for watchdog thread
-	if (s_shell_watch_thread) {
-		WaitForSingleObject(s_shell_watch_thread, 3000);
-		CloseHandle(s_shell_watch_thread);
-		s_shell_watch_thread = NULL;
+	if (s_workspace_watch_thread) {
+		WaitForSingleObject(s_workspace_watch_thread, 3000);
+		CloseHandle(s_workspace_watch_thread);
+		s_workspace_watch_thread = NULL;
 	}
 
 	// Stop the trampoline and terminate the bridge. Flip mode to DISABLE
