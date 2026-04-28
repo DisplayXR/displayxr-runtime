@@ -87,7 +87,16 @@ static UINT g_windowHeight = 720;
 
 // 3DGS state
 static GsRenderer g_gsRenderer;
+// Cross-thread scene-load queue: the file dialog runs on the main (message-pump)
+// thread, but the actual GsRenderer::loadScene() submits Vulkan work on the
+// graphics queue and so MUST run on the same thread that drives per-frame
+// rendering — otherwise concurrent vkQueueSubmit/vkQueueWaitIdle from two
+// threads on a single VkQueue is undefined behaviour and crashes some drivers
+// (NVIDIA in particular). Main thread posts the picked path here; the render
+// thread picks it up between frames.
 static std::atomic<bool> g_loadRequested{false};
+static std::string g_pendingLoadPath;
+static std::mutex g_pendingLoadPathMutex;
 // 'I' key: capture the multi-view atlas region (cols × rows × renderW × renderH)
 // of the swapchain to a PNG in %USERPROFILE%\Pictures\DisplayXR\. Skipped for
 // 1×1 (mono) layouts. Helper lives in test_apps/common/atlas_capture*.
@@ -266,18 +275,15 @@ static void OpenLoadDialog(HWND hwnd) {
     if (GetOpenFileNameA(&ofn)) {
         std::string path(filePath);
         if (ValidateSceneFile(path)) {
-            LOG_INFO("Loading 3DGS scene: %s", path.c_str());
-            std::lock_guard<std::mutex> lock(g_sceneMutex);
-            if (g_gsRenderer.loadScene(path.c_str())) {
-                g_loadedFileName = GetPlyFilename(path);
-                LOG_INFO("Scene loaded: %s (%s)", g_loadedFileName.c_str(),
-                    GetPlyFileSize(path).c_str());
-                ApplyAutoFitForLoadedScene_locked();
-            } else {
-                LOG_ERROR("Failed to load scene: %s", path.c_str());
-                MessageBoxA(hwnd, "Failed to load scene file.\nThe file may be corrupt or unsupported.",
-                    "Load Error", MB_OK | MB_ICONERROR);
+            // Hand the path off to the render thread (see g_pendingLoadPath
+            // comment above). Doing the load here would race the render
+            // thread's per-frame queue submissions and crash NVIDIA drivers.
+            {
+                std::lock_guard<std::mutex> lock(g_pendingLoadPathMutex);
+                g_pendingLoadPath = path;
             }
+            g_loadRequested.store(true, std::memory_order_release);
+            LOG_INFO("Queued 3DGS scene load: %s", path.c_str());
         } else {
             MessageBoxA(hwnd, "Invalid scene file. Supported formats: .ply, .spz", "Load Error", MB_OK | MB_ICONERROR);
         }
@@ -573,6 +579,33 @@ static void RenderThreadFunc(
         // Request main thread to open file dialog when L key or Load button was pressed.
         if (loadReq) {
             PostMessage(hwnd, WM_USER + 1, 0, 0);
+        }
+
+        // Drain a queued scene load (set by OpenLoadDialog on the main
+        // thread). We must run loadScene here because it submits Vulkan work
+        // on the graphics queue, and that queue is exclusively driven by this
+        // (render) thread for per-frame submissions — see g_pendingLoadPath.
+        if (g_loadRequested.exchange(false, std::memory_order_acquire)) {
+            std::string path;
+            {
+                std::lock_guard<std::mutex> lock(g_pendingLoadPathMutex);
+                path = std::move(g_pendingLoadPath);
+                g_pendingLoadPath.clear();
+            }
+            if (!path.empty()) {
+                LOG_INFO("Loading 3DGS scene: %s", path.c_str());
+                std::lock_guard<std::mutex> lock(g_sceneMutex);
+                if (g_gsRenderer.loadScene(path.c_str())) {
+                    g_loadedFileName = GetPlyFilename(path);
+                    LOG_INFO("Scene loaded: %s (%s)", g_loadedFileName.c_str(),
+                        GetPlyFileSize(path).c_str());
+                    ApplyAutoFitForLoadedScene_locked();
+                } else {
+                    LOG_ERROR("Failed to load scene: %s", path.c_str());
+                    MessageBoxA(hwnd, "Failed to load scene file.\nThe file may be corrupt or unsupported.",
+                        "Load Error", MB_OK | MB_ICONERROR);
+                }
+            }
         }
 
         // Handle rendering mode change (V=cycle, 0-8=direct)
