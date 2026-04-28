@@ -177,7 +177,7 @@ main(int argc, char **argv)
 		snprintf(buf, sizeof(buf), "pid %ld", pid);
 		connected_label = buf;
 	} else if (strcmp(target_arg, "auto") == 0) {
-		// Service first — covers the Phase B shell story.
+		// Service first — covers the Phase B workspace story.
 		conn = u_mcp_conn_connect_named("service");
 		if (conn != NULL) {
 			connected_label = "service";

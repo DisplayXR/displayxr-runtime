@@ -50,7 +50,7 @@ DEBUG_GET_ONCE_LOG_OPTION(orchestrator_log, "DISPLAYXR_ORCHESTRATOR_LOG", U_LOGG
 // — every Shell_NotifyIcon notification (WM_RBUTTONUP, WM_MOUSEMOVE,
 // NIN_POPUPOPEN, …) is delivered as that message, and a clash makes this
 // orchestrator subclass eat them all before tray_wnd_proc ever sees them.
-#define WM_ORCHESTRATOR_SPAWN_SHELL    (WM_APP + 100)
+#define WM_ORCHESTRATOR_SPAWN_WORKSPACE    (WM_APP + 100)
 #define WM_ORCHESTRATOR_INSTALL_HOOK   (WM_APP + 101)
 #define WM_ORCHESTRATOR_UNINSTALL_HOOK (WM_APP + 102)
 
@@ -223,7 +223,7 @@ workspace_watch_thread_func(LPVOID param)
 	s_workspace_pi.hProcess = NULL;
 	s_workspace_running = false;
 
-	OW("Shell process exited");
+	OW("Workspace controller process exited");
 
 	// In Auto mode, nothing to re-register: the low-level keyboard hook
 	// stays installed across workspace sessions, it's gated by s_workspace_running
@@ -560,7 +560,7 @@ orchestrator_kbd_hook_proc(int nCode, WPARAM wParam, LPARAM lParam)
 			if (ctrl && !shift && !alt && !win && !s_workspace_running) {
 				HWND hwnd = (HWND)service_tray_get_hwnd();
 				if (hwnd) {
-					PostMessageW(hwnd, WM_ORCHESTRATOR_SPAWN_SHELL, 0, 0);
+					PostMessageW(hwnd, WM_ORCHESTRATOR_SPAWN_WORKSPACE, 0, 0);
 				}
 				return 1; // swallow — don't let other handlers see Ctrl+Space
 			}
@@ -572,7 +572,7 @@ orchestrator_kbd_hook_proc(int nCode, WPARAM wParam, LPARAM lParam)
 static LRESULT CALLBACK
 orchestrator_wnd_proc_hook(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
-	if (msg == WM_ORCHESTRATOR_SPAWN_SHELL) {
+	if (msg == WM_ORCHESTRATOR_SPAWN_WORKSPACE) {
 		OW("Ctrl+Space pressed — launching workspace controller");
 		spawn_workspace();
 		return 0;
@@ -764,7 +764,7 @@ service_orchestrator_shutdown(void)
 		s_original_wnd_proc = NULL;
 	}
 
-	// Terminate shell
+	// Terminate workspace controller
 	if (s_workspace_running) {
 		terminate_child(&s_workspace_pi, &s_workspace_running);
 	}
