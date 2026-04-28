@@ -605,12 +605,17 @@ bool EndFrameWithWindowSpaceHud(
     const XrCompositionLayerProjectionView* projViews,
     float hudX, float hudY, float hudWidth, float hudHeight,
     float hudDisparity,
-    uint32_t viewCount
+    uint32_t viewCount,
+    int32_t srcX, int32_t srcY,
+    int32_t srcW, int32_t srcH
 ) {
     XrCompositionLayerProjection projectionLayer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
     projectionLayer.space = xr.localSpace;
     projectionLayer.viewCount = viewCount;
     projectionLayer.views = projViews;
+
+    if (srcW < 0) srcW = (int32_t)xr.hudSwapchain.width;
+    if (srcH < 0) srcH = (int32_t)xr.hudSwapchain.height;
 
     // Window-space HUD layer
     XrCompositionLayerWindowSpaceEXT hudLayer = {};
@@ -618,11 +623,8 @@ bool EndFrameWithWindowSpaceHud(
     hudLayer.next = nullptr;
     hudLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
     hudLayer.subImage.swapchain = xr.hudSwapchain.swapchain;
-    hudLayer.subImage.imageRect.offset = {0, 0};
-    hudLayer.subImage.imageRect.extent = {
-        (int32_t)xr.hudSwapchain.width,
-        (int32_t)xr.hudSwapchain.height
-    };
+    hudLayer.subImage.imageRect.offset = {srcX, srcY};
+    hudLayer.subImage.imageRect.extent = {srcW, srcH};
     hudLayer.subImage.imageArrayIndex = 0;
     hudLayer.x = hudX;
     hudLayer.y = hudY;
