@@ -87,6 +87,9 @@ Design docs, status trackers, and plans — some shipped, some in progress.
 
 - **[Roadmap Overview](roadmap/overview.md)** — milestone status and project trajectory
 - [Spatial Desktop PRD](roadmap/spatial-desktop-prd.md) — product vision
+- [Spatial Workspace Extensions Plan](roadmap/spatial-workspace-extensions-plan.md) — three-phase plan to decouple the shell from the runtime: boundary rename (Phase 1, done), policy migration behind extensions (Phase 2), repo severance (Phase 3)
+- [Workspace Extensions Header Sketch](roadmap/spatial-workspace-extensions-headers-draft.md) — `XR_EXT_spatial_workspace.h` + `XR_EXT_app_launcher.h` C-level API draft, mapping table from the existing IPC RPCs, mechanism-vs-policy lists, open design questions
+- [Workspace/Runtime Contract](roadmap/workspace-runtime-contract.md) — IPC message set between a workspace controller and the runtime (the current implementation; promoted to public extensions in Phase 2)
 - [Display Spatial Model](roadmap/display-spatial-model.md) — displays in the spatial graph (#46)
 - [Multi-Display Single Machine](roadmap/multi-display-single-machine.md) — multiple displays, one machine (#69)
 - [Multi-Display Networked](roadmap/multi-display-networked.md) — displays across the network (#70)
