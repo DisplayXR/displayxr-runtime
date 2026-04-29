@@ -829,6 +829,13 @@ oxr_xrGetWorkspaceClientWindowPoseEXT(XrSession session,
 //! OpenXR API function @ep{xrSetWorkspaceClientVisibilityEXT}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrSetWorkspaceClientVisibilityEXT(XrSession session, XrWorkspaceClientId clientId, XrBool32 visible);
+//! OpenXR API function @ep{xrWorkspaceHitTestEXT}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrWorkspaceHitTestEXT(XrSession session,
+                          int32_t cursorX,
+                          int32_t cursorY,
+                          XrWorkspaceClientId *outClientId,
+                          XrVector2f *outLocalUV);
 #endif
 
 #ifdef OXR_HAVE_EXT_app_launcher

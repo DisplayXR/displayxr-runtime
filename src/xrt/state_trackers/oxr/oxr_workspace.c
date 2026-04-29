@@ -65,6 +65,13 @@ xrt_result_t
 comp_ipc_client_compositor_workspace_set_window_visibility(struct xrt_compositor *xc,
                                                            uint32_t client_id,
                                                            bool visible);
+xrt_result_t
+comp_ipc_client_compositor_workspace_hit_test(struct xrt_compositor *xc,
+                                              int32_t cursor_x,
+                                              int32_t cursor_y,
+                                              uint32_t *out_client_id,
+                                              float *out_local_u,
+                                              float *out_local_v);
 
 
 /*
@@ -386,6 +393,46 @@ oxr_xrSetWorkspaceClientVisibilityEXT(XrSession session, XrWorkspaceClientId cli
 	xrt_result_t xret = comp_ipc_client_compositor_workspace_set_window_visibility(
 	    &sess->xcn->base, (uint32_t)clientId, visible == XR_TRUE);
 	return xret_to_xr_result(&log, xret, "workspace_set_window_visibility");
+}
+
+
+/*
+ * Hit-test (spec_version 3)
+ */
+
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrWorkspaceHitTestEXT(XrSession session,
+                          int32_t cursorX,
+                          int32_t cursorY,
+                          XrWorkspaceClientId *outClientId,
+                          XrVector2f *outLocalUV)
+{
+	OXR_TRACE_MARKER();
+
+	struct oxr_session *sess = NULL;
+	struct oxr_logger log;
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrWorkspaceHitTestEXT");
+	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+	OXR_VERIFY_ARG_NOT_NULL(&log, outClientId);
+	OXR_VERIFY_ARG_NOT_NULL(&log, outLocalUV);
+
+	if (!session_is_ipc_client(sess)) {
+		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
+		                 "xrWorkspaceHitTestEXT requires an IPC-mode session");
+	}
+
+	uint32_t client_id = 0;
+	float u = 0.0f, v = 0.0f;
+	xrt_result_t xret = comp_ipc_client_compositor_workspace_hit_test(&sess->xcn->base, cursorX, cursorY,
+	                                                                  &client_id, &u, &v);
+	if (xret != XRT_SUCCESS) {
+		return xret_to_xr_result(&log, xret, "workspace_hit_test");
+	}
+	*outClientId = (XrWorkspaceClientId)client_id;
+	outLocalUV->x = u;
+	outLocalUV->y = v;
+	return XR_SUCCESS;
 }
 
 #endif // OXR_HAVE_EXT_spatial_workspace

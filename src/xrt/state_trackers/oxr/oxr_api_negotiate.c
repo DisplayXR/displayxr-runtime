@@ -448,6 +448,7 @@ handle_non_null(struct oxr_instance *inst, struct oxr_logger *log, const char *n
 	ENTRY_IF_EXT(xrSetWorkspaceClientWindowPoseEXT, EXT_spatial_workspace);
 	ENTRY_IF_EXT(xrGetWorkspaceClientWindowPoseEXT, EXT_spatial_workspace);
 	ENTRY_IF_EXT(xrSetWorkspaceClientVisibilityEXT, EXT_spatial_workspace);
+	ENTRY_IF_EXT(xrWorkspaceHitTestEXT, EXT_spatial_workspace);
 #endif
 
 #ifdef OXR_HAVE_EXT_app_launcher
