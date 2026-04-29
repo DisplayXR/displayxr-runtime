@@ -219,6 +219,16 @@ Capture:
 - `xrDisplayXRRemoveCaptureClientEXT(session, client_id)`
 - `xrDisplayXRCaptureFrameEXT(session, path_prefix, flags, out_result)` — capture pre-weave atlas to PNG. Already a runtime primitive.
 
+### `XR_DISPLAYXR_workspace_tray` (sketch)
+
+The runtime owns the system tray icon — it has to, because the icon exists before any controller is loaded. But the *content* of the workspace submenu (items, labels, handlers) and the *response* to clicks (start, suspend, "Disable", "Lock", whatever the controller chooses to expose) belong to the controller. The current `Enable / Auto / Disable` set and the orchestrator's `TerminateProcess`-on-Disable are first-party-shell defaults that this extension replaces.
+
+- `xrDisplayXRSetWorkspaceTrayMenuEXT(session, menu_descriptor)` — controller registers the tray submenu shape (radio groups, checkboxes, separators, labels, item ids).
+- `xrDisplayXRPollWorkspaceTrayClickEXT(session, out_item_id)` — poll-and-clear the most recent menu click. The controller decides what each id means; the runtime just relays.
+- `xrDisplayXRRequestControllerShutdownEXT(session)` — runtime asks the controller to exit cooperatively (system shutdown, OEM device-management agent, last-resort-before-kill). Symmetric to a third-party launcher politely asking the controller to leave.
+
+The runtime keeps a last-resort `TerminateProcess` fallback for unresponsive or unregistered controllers, but never calls it on a controller that has registered a menu and is responsive. **See ADR-016** for the architectural rationale and the current transitional state.
+
 ### `XR_DISPLAYXR_app_launcher`
 
 Optional second extension. Smaller surface; could even be merged into `spatial_workspace`. Kept separate for now because it's the one most likely to evolve as launcher UX matures.
