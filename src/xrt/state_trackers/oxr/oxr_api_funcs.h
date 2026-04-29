@@ -812,6 +812,23 @@ oxr_xrAddWorkspaceCaptureClientEXT(XrSession session,
 //! OpenXR API function @ep{xrRemoveWorkspaceCaptureClientEXT}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrRemoveWorkspaceCaptureClientEXT(XrSession session, XrWorkspaceClientId clientId);
+//! OpenXR API function @ep{xrSetWorkspaceClientWindowPoseEXT}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSetWorkspaceClientWindowPoseEXT(XrSession session,
+                                      XrWorkspaceClientId clientId,
+                                      const XrPosef *pose,
+                                      float widthMeters,
+                                      float heightMeters);
+//! OpenXR API function @ep{xrGetWorkspaceClientWindowPoseEXT}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrGetWorkspaceClientWindowPoseEXT(XrSession session,
+                                      XrWorkspaceClientId clientId,
+                                      XrPosef *outPose,
+                                      float *outWidthMeters,
+                                      float *outHeightMeters);
+//! OpenXR API function @ep{xrSetWorkspaceClientVisibilityEXT}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSetWorkspaceClientVisibilityEXT(XrSession session, XrWorkspaceClientId clientId, XrBool32 visible);
 #endif
 
 #ifdef OXR_HAVE_EXT_app_launcher
