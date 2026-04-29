@@ -171,3 +171,25 @@ comp_ipc_client_compositor_workspace_add_capture_client(struct xrt_compositor *x
 
 xrt_result_t
 comp_ipc_client_compositor_workspace_remove_capture_client(struct xrt_compositor *xc, uint32_t client_id);
+
+/*!
+ * Launcher bridges (XR_EXT_app_launcher).
+ *
+ * Same gating contract as the workspace_* family — only valid when `xc` is
+ * an ipc_client_compositor. The state tracker forward-declares these and
+ * the runtime DLL links ipc_client so symbols resolve at link time.
+ */
+xrt_result_t
+comp_ipc_client_compositor_launcher_clear_apps(struct xrt_compositor *xc);
+
+xrt_result_t
+comp_ipc_client_compositor_launcher_add_app(struct xrt_compositor *xc, const char *name, const char *icon_path);
+
+xrt_result_t
+comp_ipc_client_compositor_launcher_set_visible(struct xrt_compositor *xc, bool visible);
+
+xrt_result_t
+comp_ipc_client_compositor_launcher_poll_click(struct xrt_compositor *xc, int64_t *out_tile_index);
+
+xrt_result_t
+comp_ipc_client_compositor_launcher_set_running_tile_mask(struct xrt_compositor *xc, uint64_t mask);
