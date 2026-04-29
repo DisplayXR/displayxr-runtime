@@ -255,8 +255,8 @@ struct d3d11_service_compositor
 	//! App's HWND from XR_EXT_win32_window_binding (for lazy standalone init)
 	HWND app_hwnd;
 
-	//! Set when shell re-activates — next layer_commit tears down standalone resources
-	bool pending_shell_reentry;
+	//! Set when workspace re-activates — next layer_commit tears down standalone resources
+	bool pending_workspace_reentry;
 
 	//! Whether the window has been closed (triggers session exit)
 	bool window_closed;
@@ -499,9 +499,9 @@ struct d3d11_service_system
 	//! Recursive because unregister_client calls render for final clear frame.
 	std::recursive_mutex render_mutex;
 
-	//! Timestamp of last shell render (monotonic ns). Used to throttle renders
+	//! Timestamp of last workspace render (monotonic ns). Used to throttle renders
 	//! to ~1 per VSync, reducing torn-atlas reads from concurrent client blits.
-	uint64_t last_shell_render_ns;
+	uint64_t last_workspace_render_ns;
 };
 
 
@@ -3933,7 +3933,7 @@ capture_render_thread_func(struct d3d11_service_system *sys)
 			// slow GPUs (e.g. Intel iGPU) they run at <10fps. The 14ms
 			// throttle in layer_commit prevents double-renders, so this is safe.
 			multi_compositor_render(sys);
-			sys->last_shell_render_ns = os_monotonic_get_ns();
+			sys->last_workspace_render_ns = os_monotonic_get_ns();
 		}
 	}
 }
@@ -9874,9 +9874,9 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	// Tear down per-client standalone resources on the app's own thread.
 	// Hide the HWND last (sends WM but app's main thread isn't blocked here
 	// since we're about to return from this layer_commit).
-	if (c->pending_shell_reentry) {
+	if (c->pending_workspace_reentry) {
 		U_LOG_W("Reverse hot-switch: tearing down standalone resources");
-		c->pending_shell_reentry = false;
+		c->pending_workspace_reentry = false;
 
 		if (c->render.display_processor != nullptr) {
 			xrt_display_processor_d3d11_request_display_mode(c->render.display_processor, false);
@@ -9901,13 +9901,13 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		// layer_commit at 60fps, we'd otherwise render N times per frame cycle.
 		// Throttling reduces the chance of reading a client's atlas mid-blit.
 		uint64_t now_ns = os_monotonic_get_ns();
-		uint64_t elapsed_ns = now_ns - sys->last_shell_render_ns;
-		if (elapsed_ns < 14000000ULL && sys->last_shell_render_ns != 0) {
+		uint64_t elapsed_ns = now_ns - sys->last_workspace_render_ns;
+		if (elapsed_ns < 14000000ULL && sys->last_workspace_render_ns != 0) {
 			return XRT_SUCCESS; // Skip — another client will render soon
 		}
 		std::lock_guard<std::recursive_mutex> render_lock(sys->render_mutex);
 		multi_compositor_render(sys);
-		sys->last_shell_render_ns = now_ns;
+		sys->last_workspace_render_ns = now_ns;
 		return XRT_SUCCESS;
 	}
 
@@ -11837,7 +11837,7 @@ comp_d3d11_service_ensure_workspace_window(struct xrt_system_compositor *xsysc)
 			if (slot->compositor == nullptr) {
 				continue;
 			}
-			slot->compositor->pending_shell_reentry = true;
+			slot->compositor->pending_workspace_reentry = true;
 			U_LOG_W("Shell resume: flagged slot %d for lazy reverse hot-switch", i);
 		}
 
