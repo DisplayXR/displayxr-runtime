@@ -291,7 +291,12 @@ xrt_result_t
 comp_ipc_client_compositor_launcher_clear_apps(struct xrt_compositor *xc);
 
 xrt_result_t
-comp_ipc_client_compositor_launcher_add_app(struct xrt_compositor *xc, const char *name, const char *icon_path);
+comp_ipc_client_compositor_launcher_add_app(struct xrt_compositor *xc,
+                                            const char *name,
+                                            const char *icon_path,
+                                            const char *app_type,
+                                            const char *icon_3d_path,
+                                            const char *icon_3d_layout);
 
 xrt_result_t
 comp_ipc_client_compositor_launcher_set_visible(struct xrt_compositor *xc, bool visible);

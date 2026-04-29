@@ -652,7 +652,12 @@ comp_ipc_client_compositor_launcher_clear_apps(struct xrt_compositor *xc)
 }
 
 xrt_result_t
-comp_ipc_client_compositor_launcher_add_app(struct xrt_compositor *xc, const char *name, const char *icon_path)
+comp_ipc_client_compositor_launcher_add_app(struct xrt_compositor *xc,
+                                            const char *name,
+                                            const char *icon_path,
+                                            const char *app_type,
+                                            const char *icon_3d_path,
+                                            const char *icon_3d_layout)
 {
 	if (xc == NULL || name == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
@@ -661,13 +666,22 @@ comp_ipc_client_compositor_launcher_add_app(struct xrt_compositor *xc, const cha
 	if (icc == NULL || icc->ipc_c == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
-	// The IPC wire struct carries fields not yet exposed via the public
-	// XR_EXT_app_launcher surface (exe_path, type, icon_3d_*); zero them
-	// so the state tracker doesn't have to know about ipc_launcher_app.
+	// State tracker stays free of ipc_launcher_app — bridge fills the wire
+	// struct from the primitive parameters. exe_path is intentionally not
+	// exposed at the public surface; the runtime never launches binaries.
 	struct ipc_launcher_app app = {0};
 	snprintf(app.name, sizeof(app.name), "%s", name);
 	if (icon_path != NULL) {
 		snprintf(app.icon_path, sizeof(app.icon_path), "%s", icon_path);
+	}
+	if (app_type != NULL) {
+		snprintf(app.type, sizeof(app.type), "%s", app_type);
+	}
+	if (icon_3d_path != NULL) {
+		snprintf(app.icon_3d_path, sizeof(app.icon_3d_path), "%s", icon_3d_path);
+	}
+	if (icon_3d_layout != NULL) {
+		snprintf(app.icon_3d_layout, sizeof(app.icon_3d_layout), "%s", icon_3d_layout);
 	}
 	return ipc_call_launcher_add_app(icc->ipc_c, &app);
 }

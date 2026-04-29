@@ -27,8 +27,13 @@ extern "C" {
 #endif
 
 #define XR_EXT_app_launcher 1
-#define XR_EXT_app_launcher_SPEC_VERSION 1
+#define XR_EXT_app_launcher_SPEC_VERSION 2
 #define XR_EXT_APP_LAUNCHER_EXTENSION_NAME "XR_EXT_app_launcher"
+
+/*!
+ * @brief Maximum length for short-string fields (app type, 3D-icon layout).
+ */
+#define XR_LAUNCHER_SHORT_STR_MAX_EXT 16
 
 // Provisional XrStructureType value. Reconciles with the Khronos registry
 // before spec freeze.
@@ -85,12 +90,11 @@ extern "C" {
  * The runtime renders an icon and label. The workspace controller decides
  * what clicking means (typically: launch the named binary).
  *
- * Phase 2.B narrowing: the underlying IPC carries additional fields
- * (executable path, 3D-icon path, layout hint) that are not yet exposed
- * via this struct. A workspace controller that cares about those fields
- * still launches binaries on its own side; the runtime never executes
- * binaries on the controller's behalf. A later sub-phase promotes
- * additional fields once we settle on policy/mechanism boundaries.
+ * Promotion in spec_version 2: appType / iconPath3D / iconLayout3D are now
+ * exposed so a controller can drive 3D-icon rendering (the runtime composites
+ * them with the indicated stereo layout). The workspace controller still
+ * launches binaries on its own side; the runtime never executes binaries
+ * on the controller's behalf, so no exePath is exposed here.
  *
  * appIndex is the caller-defined slot index; it must be less than
  * XR_LAUNCHER_MAX_APPS_EXT. xrPollLauncherClickEXT echoes this value
@@ -101,8 +105,11 @@ typedef struct XrLauncherAppInfoEXT {
     XrStructureType    type;       //!< Must be XR_TYPE_LAUNCHER_APP_INFO_EXT
     void* XR_MAY_ALIAS next;
     char               name[XR_MAX_APPLICATION_NAME_SIZE]; //!< User-visible label
-    char               iconPath[XR_MAX_PATH_LENGTH];       //!< Absolute path to a PNG; runtime loads + caches
+    char               iconPath[XR_MAX_PATH_LENGTH];       //!< 2D icon (PNG); runtime loads + caches
     int32_t            appIndex;                            //!< Tile slot, [0, XR_LAUNCHER_MAX_APPS_EXT)
+    char               appType[XR_LAUNCHER_SHORT_STR_MAX_EXT];  //!< "3d" or "2d" — controls render path
+    char               iconPath3D[XR_MAX_PATH_LENGTH];          //!< Optional 3D icon (PNG); empty for 2D-only tiles
+    char               iconLayout3D[XR_LAUNCHER_SHORT_STR_MAX_EXT]; //!< 3D icon stereo layout, e.g. "sbs-lr"
 } XrLauncherAppInfoEXT;
 
 // ---- Tile registry ----

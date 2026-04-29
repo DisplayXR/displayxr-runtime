@@ -1275,32 +1275,33 @@ shell_compute_running_tile_mask(struct ipc_connection *ipc_c)
 static void
 shell_push_registered_apps_to_service(struct ipc_connection *ipc_c)
 {
-	xrt_result_t r = ipc_call_launcher_clear_apps(ipc_c);
-	if (r != XRT_SUCCESS) {
-		PE("ipc_call_launcher_clear_apps failed: %d\n", r);
+	XrResult r = g_xr->clear_launcher(g_xr->session);
+	if (r != XR_SUCCESS) {
+		PE("xrClearLauncherAppsEXT failed: %d\n", r);
 		return;
 	}
 
 	int pushed = 0;
 	int cap = g_registered_app_count;
-	if (cap > IPC_LAUNCHER_MAX_APPS) {
-		cap = IPC_LAUNCHER_MAX_APPS;
+	if (cap > XR_LAUNCHER_MAX_APPS_EXT) {
+		cap = XR_LAUNCHER_MAX_APPS_EXT;
 	}
 	for (int i = 0; i < cap; i++) {
 		const struct registered_app *src = &g_registered_apps[i];
 
-		struct ipc_launcher_app msg;
-		memset(&msg, 0, sizeof(msg));
-		snprintf(msg.name, sizeof(msg.name), "%s", src->name);
-		snprintf(msg.exe_path, sizeof(msg.exe_path), "%s", src->exe_path);
-		snprintf(msg.type, sizeof(msg.type), "%s", src->type);
-		snprintf(msg.icon_path, sizeof(msg.icon_path), "%s", src->icon_path);
-		snprintf(msg.icon_3d_path, sizeof(msg.icon_3d_path), "%s", src->icon_3d_path);
-		snprintf(msg.icon_3d_layout, sizeof(msg.icon_3d_layout), "%s", src->icon_3d_layout);
+		XrLauncherAppInfoEXT info;
+		memset(&info, 0, sizeof(info));
+		info.type = XR_TYPE_LAUNCHER_APP_INFO_EXT;
+		snprintf(info.name, sizeof(info.name), "%s", src->name);
+		snprintf(info.iconPath, sizeof(info.iconPath), "%s", src->icon_path);
+		snprintf(info.appType, sizeof(info.appType), "%s", src->type);
+		snprintf(info.iconPath3D, sizeof(info.iconPath3D), "%s", src->icon_3d_path);
+		snprintf(info.iconLayout3D, sizeof(info.iconLayout3D), "%s", src->icon_3d_layout);
+		info.appIndex = i;
 
-		r = ipc_call_launcher_add_app(ipc_c, &msg);
-		if (r != XRT_SUCCESS) {
-			PE("ipc_call_launcher_add_app[%d] failed: %d\n", i, r);
+		r = g_xr->add_launcher_app(g_xr->session, &info);
+		if (r != XR_SUCCESS) {
+			PE("xrAddLauncherAppEXT[%d] failed: %d\n", i, r);
 			return;
 		}
 		pushed++;
@@ -2188,10 +2189,10 @@ main(int argc, char *argv[])
 							AllowSetForegroundWindow(service_pid);
 						}
 
-						xrt_result_t lret = ipc_call_launcher_set_visible(
-						    &ipc_c, g_launcher_visible);
-						if (lret != XRT_SUCCESS) {
-							PE("ipc_call_launcher_set_visible failed: %d\n", lret);
+						XrResult lret = g_xr->set_launcher_visible(
+						    g_xr->session, g_launcher_visible ? XR_TRUE : XR_FALSE);
+						if (lret != XR_SUCCESS) {
+							PE("xrSetLauncherVisibleEXT failed: %d\n", lret);
 							g_launcher_visible = !g_launcher_visible; // roll back
 						} else {
 							P("Launcher %s\n", g_launcher_visible ? "shown" : "hidden");
@@ -2317,7 +2318,7 @@ main(int argc, char *argv[])
 			static uint64_t s_last_running_mask = (uint64_t)-1;
 			uint64_t mask = shell_compute_running_tile_mask(&ipc_c);
 			if (mask != s_last_running_mask) {
-				ipc_call_launcher_set_running_tile_mask(&ipc_c, mask);
+				(void)g_xr->set_running_tile_mask(g_xr->session, mask);
 				s_last_running_mask = mask;
 			}
 		}
@@ -2336,16 +2337,16 @@ main(int argc, char *argv[])
 		// isn't open), not a workaround for #144 which turned out to be a
 		// stale-binary issue resolved by the Phase 6 rebuild.
 		if (g_shell_active && g_launcher_visible) {
-			int64_t tile_index = -1;
-			if (ipc_call_launcher_poll_click(&ipc_c, &tile_index) == XRT_SUCCESS &&
-			    tile_index != -1) {
+			int32_t tile_index = XR_LAUNCHER_INVALID_APPINDEX_EXT;
+			if (g_xr->poll_launcher_click(g_xr->session, &tile_index) == XR_SUCCESS &&
+			    tile_index != XR_LAUNCHER_INVALID_APPINDEX_EXT) {
 				// Service already hid the launcher when the action registered.
 				g_launcher_visible = false;
 
 				// Phase 6.6: check refresh BEFORE remove — both use negative
 				// sentinels and refresh (-300) would match the remove check
 				// (<= -200) if checked second.
-				if (tile_index == IPC_LAUNCHER_ACTION_REFRESH) {
+				if (tile_index == XR_LAUNCHER_APPINDEX_REFRESH_EXT) {
 					P("Launcher: refreshing app list (before: %d apps)\n",
 					  g_registered_app_count);
 					registered_apps_load();
@@ -2357,11 +2358,11 @@ main(int argc, char *argv[])
 						AllowSetForegroundWindow(service_pid);
 					}
 #endif
-					if (ipc_call_launcher_set_visible(&ipc_c, true) == XRT_SUCCESS) {
+					if (g_xr->set_launcher_visible(g_xr->session, XR_TRUE) == XR_SUCCESS) {
 						g_launcher_visible = true;
 					}
-				} else if (tile_index <= -(int64_t)IPC_LAUNCHER_ACTION_REMOVE_BASE) {
-					int full_idx = (int)(-(tile_index) - IPC_LAUNCHER_ACTION_REMOVE_BASE);
+				} else if (tile_index <= -XR_LAUNCHER_APPINDEX_REMOVE_BASE_EXT) {
+					int full_idx = (int)(-(tile_index) - XR_LAUNCHER_APPINDEX_REMOVE_BASE_EXT);
 					if (full_idx >= 0 && full_idx < g_registered_app_count) {
 						struct registered_app *rm = &g_registered_apps[full_idx];
 						P("Launcher: removing '%s' permanently\n", rm->name);
@@ -2423,10 +2424,10 @@ main(int argc, char *argv[])
 						AllowSetForegroundWindow(service_pid);
 					}
 #endif
-					if (ipc_call_launcher_set_visible(&ipc_c, true) == XRT_SUCCESS) {
+					if (g_xr->set_launcher_visible(g_xr->session, XR_TRUE) == XR_SUCCESS) {
 						g_launcher_visible = true;
 					}
-				} else if (tile_index == IPC_LAUNCHER_ACTION_BROWSE) {
+				} else if (tile_index == XR_LAUNCHER_APPINDEX_BROWSE_EXT) {
 					// Phase 5.14: Browse tile → open file dialog, add to
 					// registry, re-push, re-show launcher so the user sees
 					// their new tile.
@@ -2436,10 +2437,10 @@ main(int argc, char *argv[])
 						AllowSetForegroundWindow(service_pid);
 					}
 #endif
-					if (ipc_call_launcher_set_visible(&ipc_c, true) == XRT_SUCCESS) {
+					if (g_xr->set_launcher_visible(g_xr->session, XR_TRUE) == XR_SUCCESS) {
 						g_launcher_visible = true;
 					}
-				} else if (tile_index >= 0 && tile_index < (int64_t)g_registered_app_count) {
+				} else if (tile_index >= 0 && tile_index < (int32_t)g_registered_app_count) {
 					struct registered_app *rapp = &g_registered_apps[tile_index];
 
 					// Phase 5.11: if a matching client is already running,
@@ -2467,8 +2468,8 @@ main(int argc, char *argv[])
 					}
 #endif
 					if (!focused_existing) {
-						P("Launcher: launching tile %lld → '%s'\n",
-						  (long long)tile_index, rapp->name);
+						P("Launcher: launching tile %d → '%s'\n",
+						  (int)tile_index, rapp->name);
 						shell_launch_registered_app(
 						    &ipc_c, rapp,
 						    have_json ? runtime_json : NULL,
@@ -2476,8 +2477,8 @@ main(int argc, char *argv[])
 						    captures, &capture_count);
 					}
 				} else {
-					PE("Launcher click: tile %lld out of range (count=%d)\n",
-					   (long long)tile_index, g_registered_app_count);
+					PE("Launcher click: tile %d out of range (count=%d)\n",
+					   (int)tile_index, g_registered_app_count);
 				}
 			}
 		}
