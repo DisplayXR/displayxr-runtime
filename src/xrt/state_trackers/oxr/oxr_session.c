@@ -2523,6 +2523,41 @@ oxr_session_create_impl(struct oxr_logger *log,
 		return XR_SUCCESS;
 	}
 #endif
+
+#ifdef OXR_HAVE_EXT_spatial_workspace
+	// Phase 2.I-followup: workspace controllers (e.g. displayxr-shell) need
+	// an IPC-mode session to dispatch xrActivateSpatialWorkspaceEXT etc. but
+	// never render swapchains. Allow xrCreateSession with no graphics binding
+	// when the instance enabled XR_EXT_spatial_workspace — the runtime still
+	// allocates the IPC client compositor for transport, but skips the
+	// graphics-API wrapping so no redundant client window is created.
+	if (sys->inst->extensions.EXT_spatial_workspace) {
+		OXR_CHECK_XSYSC(log, sys);
+		OXR_SESSION_ALLOCATE_AND_INIT(log, sys, OXR_SESSION_GRAPHICS_EXT_WORKSPACE_CONTROLLER, *out_session);
+		(*out_session)->compositor = NULL;
+		(*out_session)->create_swapchain = NULL;
+
+		// Mark the session so the service-side compositor skips registering
+		// it as a renderable tile in its own workspace. Otherwise the shell
+		// shows up as a slot titled "displayxr-shell" inside the workspace
+		// it is supposed to be controlling.
+		struct xrt_session_info local_xsi = *xsi;
+		local_xsi.is_workspace_controller = true;
+
+		xrt_result_t xret = xrt_system_create_session(sys->xsys, &local_xsi, &(*out_session)->xs,
+		                                              &(*out_session)->xcn);
+		if (xret == XRT_ERROR_MULTI_SESSION_NOT_IMPLEMENTED) {
+			return oxr_error(log, XR_ERROR_LIMIT_REACHED, "Per instance multi-session not supported.");
+		}
+		if (xret != XRT_SUCCESS) {
+			return oxr_error(log, XR_ERROR_RUNTIME_FAILURE,
+			                 "Failed to create workspace-controller session! '%i'", xret);
+		}
+		U_LOG_I("Created workspace-controller session (no graphics binding, no client window)");
+		return XR_SUCCESS;
+	}
+#endif
+
 	return oxr_error(log, XR_ERROR_VALIDATION_FAILURE,
 	                 "(createInfo->next->type) doesn't contain a valid "
 	                 "graphics binding structs");

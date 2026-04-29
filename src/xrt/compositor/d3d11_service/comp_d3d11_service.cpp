@@ -10239,6 +10239,17 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 		g_bridge_relay_active = true;
 	}
 
+	// Phase 2.I-followup: workspace controllers (no graphics binding) talk
+	// to the service to dispatch workspace + launcher extensions but render
+	// nothing. Skip render resource init AND multi-compositor slot
+	// registration; otherwise the controller appears as a renderable tile
+	// inside its own workspace (titled with the controller's xrInstance
+	// applicationName, e.g. "displayxr-shell").
+	bool is_workspace_controller = (xsi != nullptr && xsi->is_workspace_controller);
+	if (is_workspace_controller) {
+		U_LOG_W("Workspace-controller session: skipping render resources + slot registration");
+	}
+
 	// Initialize per-client render resources (window, swap chain, display processor)
 	// Get external window handle if app provided one via XR_EXT_win32_window_binding
 	void *external_hwnd = nullptr;
@@ -10246,7 +10257,7 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 		external_hwnd = xsi->external_window_handle;
 	}
 
-	if (!is_headless_relay) {
+	if (!is_headless_relay && !is_workspace_controller) {
 		// Activate workspace mode from system compositor info (set by ipc_server_process.c
 		// after init_all, before any client connects)
 		if (sys->base.info.workspace_mode && !sys->workspace_mode) {
@@ -10263,14 +10274,15 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 	}
 
 	// Register with multi-compositor in workspace mode. Skip bridge-relay
-	// sessions — they're headless metadata channels (no graphics, no
-	// content to display) and a phantom slot keeps mc->client_count > 0
-	// after Chrome's WebXR session ends, which in turn suppresses the
-	// empty-workspace "Press Ctrl+L" hint (gated on client_count == 0) and
-	// can occlude the launcher when the user summons it post-exit.
+	// AND workspace-controller sessions — neither has anything to render,
+	// and a phantom slot would (a) keep mc->client_count > 0 after the
+	// session ends, suppressing the empty-workspace launcher hint and
+	// occluding the launcher when summoned, and (b) for the controller
+	// specifically, surface its own xrInstance applicationName as a tile
+	// title inside the workspace it is supposed to be controlling.
 	// compositor_destroy's unregister call is already a no-op on a
 	// never-registered compositor (its loop won't find a matching slot).
-	if (sys->workspace_mode && !is_headless_relay) {
+	if (sys->workspace_mode && !is_headless_relay && !is_workspace_controller) {
 		// Ensure multi_comp struct exists for registration
 		// Eagerly create multi-comp output (window + DP) on first client connect.
 		// This ensures the DP is available for ipc_try_get_sr_view_poses

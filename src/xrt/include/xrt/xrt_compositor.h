@@ -974,6 +974,13 @@ struct xrt_session_info
 	//! tile rects instead of legacy compromise scaling.
 	bool is_bridge_relay;
 
+	//! Phase 2.I-followup: True when this session is a workspace controller
+	//! (XR_EXT_spatial_workspace enabled, no graphics binding). The
+	//! compositor skips multi-compositor slot registration so the
+	//! controller does not appear as a renderable tile in its own
+	//! workspace.
+	bool is_workspace_controller;
+
 	//! Application name from the creating OpenXR client's xrInstance info.
 	//! Populated server-side in ipc_handle_session_create from
 	//! ics->client_state.info.application_name; empty for in-process

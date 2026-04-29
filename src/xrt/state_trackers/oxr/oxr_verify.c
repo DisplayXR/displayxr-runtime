@@ -580,6 +580,16 @@ oxr_verify_XrSessionCreateInfo(struct oxr_logger *log,
 	}
 #endif // OXR_HAVE_MND_headless
 
+#ifdef OXR_HAVE_EXT_spatial_workspace
+	// Phase 2.I-followup: workspace controllers may xrCreateSession with
+	// no graphics binding — they only dispatch workspace + launcher
+	// extension functions. The runtime allocates the IPC client
+	// compositor for transport without a swapchain wrapper.
+	if (inst->extensions.EXT_spatial_workspace) {
+		return XR_SUCCESS;
+	}
+#endif
+
 	return oxr_error(log, XR_ERROR_GRAPHICS_DEVICE_INVALID,
 	                 "(createInfo->next) Argument chain does not contain "
 	                 "any known graphics bindings");

@@ -50,9 +50,9 @@ target_link_libraries(displayxr-shell PRIVATE aux_util OpenXR::openxr_loader)
 if(WIN32)
     # Dbghelp: ImageDirectoryEntryToData (PE import scan)
     # Comdlg32: GetOpenFileNameA (Phase 5.14 Browse-for-app tile)
-    # D3D11/DXGI: shell_openxr.cpp creates a minimal D3D11 device for the
-    #     graphics-binding requirement of XrSessionCreateInfo.
-    target_link_libraries(displayxr-shell PRIVATE dbghelp comdlg32 d3d11 dxgi)
+    # No D3D11/DXGI: the workspace-controller session takes no graphics
+    #     binding, so the shell never opens a D3D11 device.
+    target_link_libraries(displayxr-shell PRIVATE dbghelp comdlg32)
 endif()
 
 install(TARGETS displayxr-shell RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
