@@ -574,6 +574,18 @@
 
 
 /*
+ * XR_EXT_app_launcher
+ */
+#if defined(XR_EXT_app_launcher)
+#define OXR_HAVE_EXT_app_launcher
+#define OXR_EXTENSION_SUPPORT_EXT_app_launcher(_) \
+    _(EXT_app_launcher, EXT_APP_LAUNCHER)
+#else
+#define OXR_EXTENSION_SUPPORT_EXT_app_launcher(_)
+#endif
+
+
+/*
  * XR_BD_controller_interaction
  */
 #if defined(XR_BD_controller_interaction) && defined(XRT_FEATURE_OPENXR_INTERACTION_BYTEDANCE)
@@ -1050,6 +1062,7 @@
     OXR_EXTENSION_SUPPORT_EXT_macos_gl_binding(_) \
     OXR_EXTENSION_SUPPORT_EXT_display_info(_) \
     OXR_EXTENSION_SUPPORT_EXT_spatial_workspace(_) \
+    OXR_EXTENSION_SUPPORT_EXT_app_launcher(_) \
     OXR_EXTENSION_SUPPORT_BD_controller_interaction(_) \
     OXR_EXTENSION_SUPPORT_FB_body_tracking(_) \
     OXR_EXTENSION_SUPPORT_FB_composition_layer_alpha_blend(_) \

@@ -447,6 +447,14 @@ handle_non_null(struct oxr_instance *inst, struct oxr_logger *log, const char *n
 	ENTRY_IF_EXT(xrRemoveWorkspaceCaptureClientEXT, EXT_spatial_workspace);
 #endif
 
+#ifdef OXR_HAVE_EXT_app_launcher
+	ENTRY_IF_EXT(xrClearLauncherAppsEXT, EXT_app_launcher);
+	ENTRY_IF_EXT(xrAddLauncherAppEXT, EXT_app_launcher);
+	ENTRY_IF_EXT(xrSetLauncherVisibleEXT, EXT_app_launcher);
+	ENTRY_IF_EXT(xrPollLauncherClickEXT, EXT_app_launcher);
+	ENTRY_IF_EXT(xrSetLauncherRunningTileMaskEXT, EXT_app_launcher);
+#endif
+
 	// xrSetSharedTextureOutputRectEXT — canvas sub-rect, part of window binding extensions
 #ifdef OXR_HAVE_EXT_win32_window_binding
 	ENTRY_IF_EXT(xrSetSharedTextureOutputRectEXT, EXT_win32_window_binding);

@@ -814,6 +814,24 @@ XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrRemoveWorkspaceCaptureClientEXT(XrSession session, XrWorkspaceClientId clientId);
 #endif
 
+#ifdef OXR_HAVE_EXT_app_launcher
+//! OpenXR API function @ep{xrClearLauncherAppsEXT}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrClearLauncherAppsEXT(XrSession session);
+//! OpenXR API function @ep{xrAddLauncherAppEXT}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrAddLauncherAppEXT(XrSession session, const XrLauncherAppInfoEXT *info);
+//! OpenXR API function @ep{xrSetLauncherVisibleEXT}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSetLauncherVisibleEXT(XrSession session, XrBool32 visible);
+//! OpenXR API function @ep{xrPollLauncherClickEXT}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrPollLauncherClickEXT(XrSession session, int32_t *outAppIndex);
+//! OpenXR API function @ep{xrSetLauncherRunningTileMaskEXT}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSetLauncherRunningTileMaskEXT(XrSession session, uint64_t mask);
+#endif
+
 // xrSetSharedTextureOutputRectEXT — canvas sub-rect, part of window binding extensions
 #if defined(OXR_HAVE_EXT_win32_window_binding) || defined(OXR_HAVE_EXT_cocoa_window_binding)
 //! OpenXR API function @ep{xrSetSharedTextureOutputRectEXT}
