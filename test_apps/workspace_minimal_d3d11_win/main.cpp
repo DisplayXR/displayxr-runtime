@@ -4,12 +4,15 @@
 // workspace_minimal_d3d11_win
 //
 // Minimal validation client for XR_EXT_spatial_workspace (Phase 2.A + 2.C
-// + 2.F) and XR_EXT_app_launcher (Phase 2.B). Creates an instance +
-// session, resolves all fourteen extension PFNs, and walks through:
+// + 2.D + 2.F, v4) and XR_EXT_app_launcher (Phase 2.B). Creates an instance +
+// session, resolves all 19 extension PFNs, and walks through:
 //   activate -> get-state ->
 //     add capture client ->
 //     set/get/set client window pose + visibility ->
 //     hit-test (center + off-screen) ->
+//     set/get focused client (Phase 2.D) ->
+//     enumerate input events (count-query) (Phase 2.D) ->
+//     enable/disable pointer capture (Phase 2.D) ->
 //     remove capture client ->
 //     clear / add / set-visible / set-running-mask / poll / hide launcher ->
 //   deactivate.
@@ -125,7 +128,7 @@ run_workspace_test()
 	XrInstance instance = XR_NULL_HANDLE;
 	CHECK_XR(xrCreateInstance(&instInfo, &instance), "xrCreateInstance");
 
-	// 3. Resolve the ten extension PFNs (must be non-null when extension is enabled).
+	// 3. Resolve all 19 extension PFNs (must be non-null when the extension is enabled).
 	PFN_xrActivateSpatialWorkspaceEXT pfnActivate = nullptr;
 	PFN_xrDeactivateSpatialWorkspaceEXT pfnDeactivate = nullptr;
 	PFN_xrGetSpatialWorkspaceStateEXT pfnGetState = nullptr;
@@ -140,6 +143,11 @@ run_workspace_test()
 	PFN_xrGetWorkspaceClientWindowPoseEXT pfnGetClientPose = nullptr;
 	PFN_xrSetWorkspaceClientVisibilityEXT pfnSetClientVisibility = nullptr;
 	PFN_xrWorkspaceHitTestEXT pfnHitTest = nullptr;
+	PFN_xrSetWorkspaceFocusedClientEXT pfnSetFocused = nullptr;
+	PFN_xrGetWorkspaceFocusedClientEXT pfnGetFocused = nullptr;
+	PFN_xrEnumerateWorkspaceInputEventsEXT pfnEnumInputEvents = nullptr;
+	PFN_xrEnableWorkspacePointerCaptureEXT pfnEnableCapture = nullptr;
+	PFN_xrDisableWorkspacePointerCaptureEXT pfnDisableCapture = nullptr;
 
 	struct PfnLookup {
 		const char *name;
@@ -162,6 +170,14 @@ run_workspace_test()
 	    {"xrSetWorkspaceClientVisibilityEXT",
 	     reinterpret_cast<PFN_xrVoidFunction *>(&pfnSetClientVisibility)},
 	    {"xrWorkspaceHitTestEXT", reinterpret_cast<PFN_xrVoidFunction *>(&pfnHitTest)},
+	    {"xrSetWorkspaceFocusedClientEXT", reinterpret_cast<PFN_xrVoidFunction *>(&pfnSetFocused)},
+	    {"xrGetWorkspaceFocusedClientEXT", reinterpret_cast<PFN_xrVoidFunction *>(&pfnGetFocused)},
+	    {"xrEnumerateWorkspaceInputEventsEXT",
+	     reinterpret_cast<PFN_xrVoidFunction *>(&pfnEnumInputEvents)},
+	    {"xrEnableWorkspacePointerCaptureEXT",
+	     reinterpret_cast<PFN_xrVoidFunction *>(&pfnEnableCapture)},
+	    {"xrDisableWorkspacePointerCaptureEXT",
+	     reinterpret_cast<PFN_xrVoidFunction *>(&pfnDisableCapture)},
 	};
 	for (const auto &l : lookups) {
 		PFN_xrVoidFunction fn = nullptr;
@@ -326,6 +342,33 @@ run_workspace_test()
 			std::printf("FAIL: off-screen hit-test region=%d, expected BACKGROUND_EXT(0)\n",
 			            (int)hitRegion);
 		}
+
+		// Phase 2.D: focus + drain + pointer-capture smoke.
+		// Set focus to the captured client, then read it back and assert.
+		CHECK_XR(pfnSetFocused(session, clientId), "xrSetWorkspaceFocusedClientEXT");
+		XrWorkspaceClientId focused = XR_NULL_WORKSPACE_CLIENT_ID;
+		CHECK_XR(pfnGetFocused(session, &focused), "xrGetWorkspaceFocusedClientEXT");
+		std::printf("[xrGetWorkspaceFocusedClientEXT(roundtrip)] focused=%u expected=%u\n",
+		            (unsigned)focused, (unsigned)clientId);
+		if (focused != clientId) {
+			std::printf("FAIL: focused-client roundtrip mismatch (got %u, set %u)\n",
+			            (unsigned)focused, (unsigned)clientId);
+		}
+
+		// Drain count-query (capacity=0): expect zero events because no
+		// human has pressed anything during the smoke window.
+		uint32_t event_count = 0xFFFFFFFFu;
+		XrResult er = pfnEnumInputEvents(session, 0, &event_count, nullptr);
+		std::printf("[xrEnumerateWorkspaceInputEventsEXT(0)     ] %s count=%u\n",
+		            xr_result_str(er), (unsigned)event_count);
+
+		// Pointer-capture toggle: enable then disable. Both should succeed.
+		CHECK_XR(pfnEnableCapture(session, 1), "xrEnableWorkspacePointerCaptureEXT");
+		CHECK_XR(pfnDisableCapture(session), "xrDisableWorkspacePointerCaptureEXT");
+
+		// Clear focus before removing the captured client to keep state tidy.
+		CHECK_XR(pfnSetFocused(session, XR_NULL_WORKSPACE_CLIENT_ID),
+		         "xrSetWorkspaceFocusedClientEXT(clear)");
 	}
 
 	CHECK_XR(pfnRemoveCapture(session, clientId), "xrRemoveWorkspaceCaptureClientEXT");
