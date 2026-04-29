@@ -39,12 +39,13 @@ add_executable(displayxr-shell WIN32 ${DISPLAYXR_SHELL_SOURCES})
 add_sanitizers(displayxr-shell)
 
 target_include_directories(displayxr-shell PRIVATE
-    ipc
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../external/stb  # stb_image_write.h (Browse-for-app icon extract)
     ${CMAKE_SOURCE_DIR}/src/external/openxr_includes   # XR_EXT_spatial_workspace.h, XR_EXT_app_launcher.h
 )
 
-target_link_libraries(displayxr-shell PRIVATE aux_util ipc_client OpenXR::openxr_loader)
+# Phase 2.I C10: shell no longer links ipc_client — all service comms go
+# through the OpenXR loader + the runtime's IPC client.
+target_link_libraries(displayxr-shell PRIVATE aux_util OpenXR::openxr_loader)
 
 if(WIN32)
     # Dbghelp: ImageDirectoryEntryToData (PE import scan)

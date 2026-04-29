@@ -15,11 +15,6 @@
  * @ingroup ipc
  */
 
-#include "client/ipc_client.h"
-#include "client/ipc_client_connection.h"
-
-#include "ipc_client_generated.h"
-#include "shared/ipc_protocol.h"
 #include "xrt/xrt_results.h"
 #include "xrt/xrt_defines.h"
 #include "util/u_logging.h"
@@ -98,6 +93,39 @@ xrt_pose_to_xr_posef(const struct xrt_pose *in, XrPosef *out)
 	out->position.x = in->position.x;
 	out->position.y = in->position.y;
 	out->position.z = in->position.z;
+}
+
+// Phase 2.I C10: cap on locally-buffered enumerate. IPC_MAX_CLIENTS is 8 in
+// the wire format (struct ipc_client_list); 16 keeps headroom for a future
+// raise without touching the shell.
+#define SHELL_MAX_CLIENTS 16
+
+// Drain the workspace client id list from the runtime. Returns the number
+// of ids written; 0 on error or empty.
+static uint32_t
+shell_enumerate_clients(XrWorkspaceClientId *out_ids, uint32_t cap)
+{
+	if (g_xr == NULL || out_ids == NULL || cap == 0) {
+		return 0;
+	}
+	uint32_t count = 0;
+	if (g_xr->enumerate_clients(g_xr->session, cap, &count, out_ids) != XR_SUCCESS) {
+		return 0;
+	}
+	return count;
+}
+
+// Fetch metadata for one client. Returns true on success; @p info is
+// initialized with the required type + next NULL.
+static bool
+shell_get_client_info(XrWorkspaceClientId id, XrWorkspaceClientInfoEXT *info)
+{
+	if (g_xr == NULL || info == NULL) {
+		return false;
+	}
+	memset(info, 0, sizeof(*info));
+	info->type = XR_TYPE_WORKSPACE_CLIENT_INFO_EXT;
+	return g_xr->get_client_info(g_xr->session, id, info) == XR_SUCCESS;
 }
 
 static void
@@ -785,19 +813,19 @@ parse_args(int argc, char *argv[], struct app_entry *apps, int *app_count,
 }
 
 static void
-try_apply_poses(struct ipc_connection *ipc_c, struct app_entry *apps, int app_count,
+try_apply_poses(struct app_entry *apps, int app_count,
                 uint32_t *prev_ids, uint32_t prev_count)
 {
 	// Get current client list
-	struct ipc_client_list clients;
-	xrt_result_t r = ipc_call_system_get_clients(ipc_c, &clients);
-	if (r != XRT_SUCCESS) {
+	XrWorkspaceClientId client_ids[SHELL_MAX_CLIENTS];
+	uint32_t client_count = shell_enumerate_clients(client_ids, SHELL_MAX_CLIENTS);
+	if (client_count == 0) {
 		return;
 	}
 
 	// Find new clients (IDs not in prev_ids)
-	for (uint32_t i = 0; i < clients.id_count; i++) {
-		uint32_t id = clients.ids[i];
+	for (uint32_t i = 0; i < client_count; i++) {
+		uint32_t id = client_ids[i];
 		bool is_new = true;
 		for (uint32_t j = 0; j < prev_count; j++) {
 			if (prev_ids[j] == id) {
@@ -823,10 +851,10 @@ try_apply_poses(struct ipc_connection *ipc_c, struct app_entry *apps, int app_co
 
 				XrPosef xrpose;
 				xrt_pose_to_xr_posef(&pose, &xrpose);
-				r = (xrt_result_t)g_xr->set_pose(
+				XrResult r = g_xr->set_pose(
 				    g_xr->session, id, &xrpose,
 				    apps[a].width_m, apps[a].height_m);
-				if (r == XRT_SUCCESS) {
+				if (r == XR_SUCCESS) {
 					P("Applied pose to client %u: pos=(%.3f,%.3f,%.3f) size=%.3fx%.3f\n",
 					  id, apps[a].px, apps[a].py, apps[a].pz,
 					  apps[a].width_m, apps[a].height_m);
@@ -839,19 +867,19 @@ try_apply_poses(struct ipc_connection *ipc_c, struct app_entry *apps, int app_co
 }
 
 static void
-print_clients(struct ipc_connection *ipc_c, uint32_t *prev_ids, uint32_t *prev_count)
+print_clients(uint32_t *prev_ids, uint32_t *prev_count)
 {
-	struct ipc_client_list clients;
-	xrt_result_t r = ipc_call_system_get_clients(ipc_c, &clients);
-	if (r != XRT_SUCCESS) {
+	XrWorkspaceClientId client_ids[SHELL_MAX_CLIENTS];
+	uint32_t client_count = shell_enumerate_clients(client_ids, SHELL_MAX_CLIENTS);
+	if (client_count == 0 && *prev_count == 0) {
 		return;
 	}
 
 	// Detect changes
-	bool changed = (clients.id_count != *prev_count);
+	bool changed = (client_count != *prev_count);
 	if (!changed) {
-		for (uint32_t i = 0; i < clients.id_count; i++) {
-			if (clients.ids[i] != prev_ids[i]) {
+		for (uint32_t i = 0; i < client_count; i++) {
+			if (client_ids[i] != prev_ids[i]) {
 				changed = true;
 				break;
 			}
@@ -863,22 +891,21 @@ print_clients(struct ipc_connection *ipc_c, uint32_t *prev_ids, uint32_t *prev_c
 	}
 
 	// Print current state
-	P("\n--- %u client(s) connected ---\n", clients.id_count);
-	for (uint32_t i = 0; i < clients.id_count; i++) {
-		uint32_t id = clients.ids[i];
-		struct ipc_app_state cs;
-		r = ipc_call_system_get_client_info(ipc_c, id, &cs);
-		if (r != XRT_SUCCESS) {
-			P("  [%u] (failed to get info)\n", id);
+	P("\n--- %u client(s) connected ---\n", client_count);
+	for (uint32_t i = 0; i < client_count; i++) {
+		XrWorkspaceClientInfoEXT cinfo;
+		if (!shell_get_client_info(client_ids[i], &cinfo)) {
+			P("  [%u] (failed to get info)\n", (unsigned)client_ids[i]);
 			continue;
 		}
-		P("  [%u] %s (PID %d)\n", id, cs.info.application_name, cs.pid);
+		P("  [%u] %s (PID %llu)\n", (unsigned)client_ids[i], cinfo.name,
+		  (unsigned long long)cinfo.pid);
 	}
 
 	// Update previous state
-	*prev_count = clients.id_count;
-	for (uint32_t i = 0; i < clients.id_count; i++) {
-		prev_ids[i] = clients.ids[i];
+	*prev_count = client_count;
+	for (uint32_t i = 0; i < client_count; i++) {
+		prev_ids[i] = client_ids[i];
 	}
 }
 
@@ -980,8 +1007,7 @@ enum_windows_cb(HWND hwnd, LPARAM lParam)
  * Skips windows already tracked in the captures array and IPC clients.
  */
 static void
-enumerate_and_adopt_windows(struct ipc_connection *ipc_c,
-                            struct capture_entry *captures,
+enumerate_and_adopt_windows(struct capture_entry *captures,
                             int *capture_count,
                             DWORD service_pid)
 {
@@ -991,19 +1017,18 @@ enumerate_and_adopt_windows(struct ipc_connection *ipc_c,
 	ctx.service_pid = service_pid;
 	EnumWindows(enum_windows_cb, (LPARAM)&ctx);
 
-	// Get current IPC client PIDs to skip OpenXR 3D apps
-	DWORD ipc_pids[IPC_MAX_CLIENTS] = {0};
+	// Get current OpenXR client PIDs to skip already-attached 3D apps.
+	DWORD ipc_pids[SHELL_MAX_CLIENTS] = {0};
 	int ipc_pid_count = 0;
 	{
-		struct ipc_client_list clients;
-		if (ipc_call_system_get_clients(ipc_c, &clients) == XRT_SUCCESS) {
-			for (uint32_t c = 0; c < clients.id_count; c++) {
-				if (clients.ids[c] == 0) continue;
-				struct ipc_app_state ias;
-				if (ipc_call_system_get_client_info(ipc_c, clients.ids[c], &ias) == XRT_SUCCESS) {
-					ipc_pids[ipc_pid_count++] = ias.pid;
-					if (ipc_pid_count >= IPC_MAX_CLIENTS) break;
-				}
+		XrWorkspaceClientId client_ids[SHELL_MAX_CLIENTS];
+		uint32_t client_count = shell_enumerate_clients(client_ids, SHELL_MAX_CLIENTS);
+		for (uint32_t c = 0; c < client_count; c++) {
+			if (client_ids[c] == XR_NULL_WORKSPACE_CLIENT_ID) continue;
+			XrWorkspaceClientInfoEXT cinfo;
+			if (shell_get_client_info(client_ids[c], &cinfo)) {
+				ipc_pids[ipc_pid_count++] = (DWORD)cinfo.pid;
+				if (ipc_pid_count >= SHELL_MAX_CLIENTS) break;
 			}
 		}
 	}
@@ -1068,8 +1093,7 @@ enumerate_and_adopt_windows(struct ipc_connection *ipc_c,
  * Check for closed capture windows and remove their capture clients.
  */
 static void
-cleanup_closed_captures(struct ipc_connection *ipc_c,
-                        struct capture_entry *captures,
+cleanup_closed_captures(struct capture_entry *captures,
                         int *capture_count)
 {
 	for (int i = 0; i < *capture_count; i++) {
@@ -1098,42 +1122,38 @@ struct shell_running_set
 };
 
 /*!
- * Snapshot the set of application_name strings for every IPC client currently
- * connected to the service. Used by the launcher to highlight tiles whose app
- * is already running.
+ * Snapshot the set of application_name strings for every workspace client
+ * currently connected. Used by the launcher to highlight tiles whose app is
+ * already running. Cheap enough to call every time the launcher opens; not
+ * intended for per-frame use.
  *
- * Wraps ipc_call_system_get_clients + ipc_call_system_get_client_info so the
- * launcher UI doesn't have to speak IPC directly. Cheap enough to call every
- * time the launcher opens; not intended for per-frame use.
- *
- * On IPC failure, returns an empty set — the launcher should degrade to "no
- * running apps" rather than failing to open.
+ * On error, returns an empty set — the launcher should degrade to "no running
+ * apps" rather than failing to open.
  */
 static void
-shell_get_running_app_set(struct ipc_connection *ipc_c, struct shell_running_set *out)
+shell_get_running_app_set(struct shell_running_set *out)
 {
 	out->count = 0;
 
-	struct ipc_client_list clients;
-	xrt_result_t r = ipc_call_system_get_clients(ipc_c, &clients);
-	if (r != XRT_SUCCESS) {
+	XrWorkspaceClientId client_ids[SHELL_MAX_CLIENTS];
+	uint32_t client_count = shell_enumerate_clients(client_ids, SHELL_MAX_CLIENTS);
+	if (client_count == 0) {
 		return;
 	}
 
-	for (uint32_t c = 0; c < clients.id_count; c++) {
-		if (clients.ids[c] == 0) continue;
+	for (uint32_t c = 0; c < client_count; c++) {
+		if (client_ids[c] == XR_NULL_WORKSPACE_CLIENT_ID) continue;
 		if (out->count >= SHELL_RUNNING_NAMES_MAX) break;
 
-		struct ipc_app_state ias;
-		xrt_result_t ir = ipc_call_system_get_client_info(ipc_c, clients.ids[c], &ias);
-		if (ir != XRT_SUCCESS) continue;
-		if (ias.info.application_name[0] == '\0') continue;
+		XrWorkspaceClientInfoEXT cinfo;
+		if (!shell_get_client_info(client_ids[c], &cinfo)) continue;
+		if (cinfo.name[0] == '\0') continue;
 
 		// Deduplicate — two instances of the same app are one tile in the
 		// launcher (for highlight purposes).
 		bool already = false;
 		for (int i = 0; i < out->count; i++) {
-			if (strcmp(out->names[i], ias.info.application_name) == 0) {
+			if (strcmp(out->names[i], cinfo.name) == 0) {
 				already = true;
 				break;
 			}
@@ -1141,7 +1161,7 @@ shell_get_running_app_set(struct ipc_connection *ipc_c, struct shell_running_set
 		if (already) continue;
 
 		snprintf(out->names[out->count], sizeof(out->names[0]), "%s",
-		         ias.info.application_name);
+		         cinfo.name);
 		out->count++;
 	}
 }
@@ -1219,29 +1239,29 @@ shell_pid_to_exe_path(DWORD pid, char *out, size_t out_size)
  * Returns 0 on Windows if no clients are connected; non-Windows always 0.
  */
 static uint64_t
-shell_compute_running_tile_mask(struct ipc_connection *ipc_c)
+shell_compute_running_tile_mask(void)
 {
 #ifdef _WIN32
 	uint64_t mask = 0;
 
-	struct ipc_client_list clients;
-	if (ipc_call_system_get_clients(ipc_c, &clients) != XRT_SUCCESS) {
+	XrWorkspaceClientId client_ids[SHELL_MAX_CLIENTS];
+	uint32_t client_count = shell_enumerate_clients(client_ids, SHELL_MAX_CLIENTS);
+	if (client_count == 0) {
 		return 0;
 	}
 
 	// Collect each connected client's exe path once.
-	char client_exes[IPC_MAX_CLIENTS][MAX_PATH];
+	char client_exes[SHELL_MAX_CLIENTS][MAX_PATH];
 	int client_exe_count = 0;
-	for (uint32_t c = 0; c < clients.id_count; c++) {
-		if (clients.ids[c] == 0) continue;
-		struct ipc_app_state ias;
-		if (ipc_call_system_get_client_info(ipc_c, clients.ids[c], &ias) != XRT_SUCCESS)
-			continue;
-		if (ias.pid == 0) continue;
-		if (shell_pid_to_exe_path((DWORD)ias.pid, client_exes[client_exe_count],
+	for (uint32_t c = 0; c < client_count; c++) {
+		if (client_ids[c] == XR_NULL_WORKSPACE_CLIENT_ID) continue;
+		XrWorkspaceClientInfoEXT cinfo;
+		if (!shell_get_client_info(client_ids[c], &cinfo)) continue;
+		if (cinfo.pid == 0) continue;
+		if (shell_pid_to_exe_path((DWORD)cinfo.pid, client_exes[client_exe_count],
 		                          sizeof(client_exes[0]))) {
 			client_exe_count++;
-			if (client_exe_count >= IPC_MAX_CLIENTS) break;
+			if (client_exe_count >= SHELL_MAX_CLIENTS) break;
 		}
 	}
 
@@ -1260,7 +1280,6 @@ shell_compute_running_tile_mask(struct ipc_connection *ipc_c)
 
 	return mask;
 #else
-	(void)ipc_c;
 	return 0;
 #endif
 }
@@ -1273,7 +1292,7 @@ shell_compute_running_tile_mask(struct ipc_connection *ipc_c)
  * remove, refresh).
  */
 static void
-shell_push_registered_apps_to_service(struct ipc_connection *ipc_c)
+shell_push_registered_apps_to_service(void)
 {
 	XrResult r = g_xr->clear_launcher(g_xr->session);
 	if (r != XR_SUCCESS) {
@@ -1442,7 +1461,7 @@ extract_pe_icon_to_png(const char *exe, const char *out_png)
  * user sees their new tile.
  */
 static void
-shell_browse_and_add_app(struct ipc_connection *ipc_c)
+shell_browse_and_add_app(void)
 {
 	// Open the file dialog as a top-level window (hwndOwner=NULL). The
 	// service granted ASFW_ANY foreground permission when it processed the
@@ -1530,13 +1549,12 @@ shell_browse_and_add_app(struct ipc_connection *ipc_c)
 
 	// Re-scan + re-push so the new tile appears.
 	registered_apps_load();
-	shell_push_registered_apps_to_service(ipc_c);
+	shell_push_registered_apps_to_service();
 }
 #else
 static void
-shell_browse_and_add_app(struct ipc_connection *ipc_c)
+shell_browse_and_add_app(void)
 {
-	(void)ipc_c;
 }
 #endif
 
@@ -1549,8 +1567,7 @@ shell_browse_and_add_app(struct ipc_connection *ipc_c)
  * For unknown type: launches as 3d, polls for IPC connect to auto-detect.
  */
 static void
-shell_launch_registered_app(struct ipc_connection *ipc_c,
-                            struct registered_app *rapp,
+shell_launch_registered_app(struct registered_app *rapp,
                             const char *runtime_json,
                             struct app_entry *apps, int *app_count,
                             struct capture_entry *captures, int *capture_count)
@@ -1646,15 +1663,14 @@ shell_launch_registered_app(struct ipc_connection *ipc_c,
 		bool found_ipc = false;
 		for (int poll = 0; poll < 10 && !found_ipc; poll++) {
 			Sleep(500);
-			struct ipc_client_list clients;
-			if (ipc_call_system_get_clients(ipc_c, &clients) == XRT_SUCCESS) {
-				for (uint32_t c = 0; c < clients.id_count; c++) {
-					struct ipc_app_state ias;
-					if (ipc_call_system_get_client_info(ipc_c, clients.ids[c], &ias) == XRT_SUCCESS) {
-						if ((DWORD)ias.pid == a->pid) {
-							found_ipc = true;
-							break;
-						}
+			XrWorkspaceClientId client_ids[SHELL_MAX_CLIENTS];
+			uint32_t client_count = shell_enumerate_clients(client_ids, SHELL_MAX_CLIENTS);
+			for (uint32_t c = 0; c < client_count; c++) {
+				XrWorkspaceClientInfoEXT cinfo;
+				if (shell_get_client_info(client_ids[c], &cinfo)) {
+					if ((DWORD)cinfo.pid == a->pid) {
+						found_ipc = true;
+						break;
 					}
 				}
 			}
@@ -1833,7 +1849,7 @@ capture_write_sidecar(const char *json_path, const XrWorkspaceCaptureResultEXT *
 }
 
 static void
-capture_frame(struct ipc_connection *ipc_c)
+capture_frame(void)
 {
 	const char *home = getenv("USERPROFILE");
 	if (home == NULL || home[0] == '\0') {
@@ -1923,55 +1939,27 @@ main(int argc, char *argv[])
 		P("Will capture %d window(s)\n", capture_count);
 	}
 
-	// Connect to service. The IPC client library auto-starts displayxr-service
-	// if not running. We then send workspace_activate to enter shell mode dynamically.
-	P("Connecting to service...\n");
-
-	struct ipc_connection ipc_c = {0};
-	struct xrt_instance_info info = {0};
-	snprintf(info.app_info.application_name,
-	         sizeof(info.app_info.application_name),
-	         "displayxr-shell");
-
-	xrt_result_t xret = XRT_ERROR_IPC_FAILURE;
-	for (int attempt = 0; attempt < 10; attempt++) {
-		xret = ipc_client_connection_init(&ipc_c, U_LOGGING_WARN, &info);
-		if (xret == XRT_SUCCESS) {
-			break;
-		}
-#ifdef _WIN32
-		Sleep(1000);
-#else
-		usleep(1000000);
-#endif
-	}
-	if (xret != XRT_SUCCESS) {
-		PE("Failed to connect to service.\n");
-		return 1;
-	}
-
-	P("Connected to service.\n");
-
-	// Phase 2.I C7: bootstrap as an OpenXR client. The shell now creates an
-	// XrInstance + XrSession with the workspace + launcher extensions
-	// enabled and resolves every PFN it will dispatch through during the
-	// migration. The IPC connection above stays in place; subsequent
-	// commits (C8–C10) replace ipc_call_* sites with PFN calls one cluster
-	// at a time. After C10 the IPC connection itself goes away.
+	// Phase 2.I C10: shell connects to the service exclusively via the public
+	// OpenXR extension surface. shell_openxr_init runs the runtime DLL which
+	// internally opens the IPC connection and auto-starts displayxr-service
+	// if it isn't already running. The shell never manages an IPC connection
+	// directly anymore.
+	P("Connecting to service via OpenXR runtime...\n");
+	xrt_result_t xret = XRT_SUCCESS;
 	struct shell_openxr_state *xr = shell_openxr_init();
 	if (xr == NULL) {
 		PE("shell_openxr_init failed — workspace + launcher extensions unavailable.\n");
-		ipc_client_connection_fini(&ipc_c);
 		return 1;
 	}
 	g_xr = xr;
+	P("Connected to service.\n");
 
 	// Load registered apps config (Phase 4C.9 + Phase 5.5 scanner merge)
 	registered_apps_load();
 
 	// Phase 5.8: push the merged registry to the service so the spatial
 	// launcher panel can render its tile grid.
-	shell_push_registered_apps_to_service(&ipc_c);
+	shell_push_registered_apps_to_service();
 
 #ifdef _WIN32
 	// --- Resolve runtime JSON path (needed for app launches) ---
@@ -2072,7 +2060,7 @@ main(int argc, char *argv[])
 
 	P("Monitoring clients (Ctrl+C to exit)...\n");
 
-	uint32_t prev_ids[IPC_MAX_CLIENTS] = {0};
+	uint32_t prev_ids[SHELL_MAX_CLIENTS] = {0};
 	uint32_t prev_count = 0;
 	bool poses_pending = false;
 	for (int i = 0; i < app_count; i++) {
@@ -2137,29 +2125,17 @@ main(int argc, char *argv[])
 						P("Activating shell...\n");
 						xret = (xrt_result_t)g_xr->activate(g_xr->session);
 
-						// If IPC pipe is dead (service exited), reconnect.
-						// The IPC client lib auto-starts the service.
+						// Phase 2.I C10: the shell no longer owns its own IPC
+						// connection — the runtime DLL does, and rebuilding
+						// it requires xrDestroySession + xrCreateSession (a
+						// future improvement). On activate failure today we
+						// just bail and let the user re-trigger Ctrl+Space
+						// once the service is healthy again.
 						if (xret != XRT_SUCCESS) {
-							P("Reconnecting to service...\n");
-							ipc_client_connection_fini(&ipc_c);
-							memset(&ipc_c, 0, sizeof(ipc_c));
-							for (int attempt = 0; attempt < 10; attempt++) {
-								xret = ipc_client_connection_init(
-								    &ipc_c, U_LOGGING_WARN, &info);
-								if (xret == XRT_SUCCESS) break;
-								Sleep(1000);
-							}
-							if (xret == XRT_SUCCESS) {
-								xret = (xrt_result_t)g_xr->activate(g_xr->session);
-								service_pid = find_service_pid();
-							}
-							if (xret != XRT_SUCCESS) {
-								PE("Failed to reconnect to service.\n");
-								continue;
-							}
-							// Service was restarted — its in-memory launcher
-							// app list is empty. Re-push so Ctrl+L shows tiles.
-							shell_push_registered_apps_to_service(&ipc_c);
+							PE("workspace_activate failed (%d) — service may be down. "
+							   "Restart the service and press Ctrl+Space to retry.\n",
+							   xret);
+							continue;
 						}
 
 						// Already-running IPC apps (OpenXR handle apps) are
@@ -2201,7 +2177,7 @@ main(int argc, char *argv[])
 				} else if (msg.message == WM_HOTKEY && msg.wParam == HOTKEY_CAPTURE) {
 					// --- Ctrl+Shift+C: capture pre-weave SBS frame (Phase 8) ---
 					if (g_shell_active) {
-						capture_frame(&ipc_c);
+						capture_frame();
 					} else {
 						P("Capture ignored: shell not active\n");
 					}
@@ -2234,7 +2210,7 @@ main(int argc, char *argv[])
 
 		// Apply pending poses when new clients appear
 		if (poses_pending) {
-			try_apply_poses(&ipc_c, apps, app_count, prev_ids, prev_count);
+			try_apply_poses(apps, app_count, prev_ids, prev_count);
 
 			poses_pending = false;
 			for (int i = 0; i < app_count; i++) {
@@ -2246,52 +2222,49 @@ main(int argc, char *argv[])
 
 		// Detect new clients and track names
 		{
-			struct ipc_client_list clients;
-			xrt_result_t r = ipc_call_system_get_clients(&ipc_c, &clients);
-			if (r == XRT_SUCCESS) {
-				for (uint32_t c = 0; c < clients.id_count; c++) {
-					bool is_new = true;
-					for (uint32_t p = 0; p < prev_count; p++) {
-						if (clients.ids[c] == prev_ids[p]) {
-							is_new = false;
-							break;
-						}
+			XrWorkspaceClientId client_ids[SHELL_MAX_CLIENTS];
+			uint32_t client_count = shell_enumerate_clients(client_ids, SHELL_MAX_CLIENTS);
+			for (uint32_t c = 0; c < client_count; c++) {
+				bool is_new = true;
+				for (uint32_t p = 0; p < prev_count; p++) {
+					if (client_ids[c] == prev_ids[p]) {
+						is_new = false;
+						break;
 					}
-					if (is_new && clients.ids[c] != 0) {
-						struct ipc_app_state ias;
-						xrt_result_t ir = ipc_call_system_get_client_info(&ipc_c, clients.ids[c], &ias);
-						if (ir == XRT_SUCCESS && ias.info.application_name[0] != '\0') {
-							int instance = 1;
-							for (int cn = 0; cn < client_name_count; cn++) {
-								char existing_base[128];
-								snprintf(existing_base, sizeof(existing_base), "%s", client_names[cn].name);
-								char *paren = strrchr(existing_base, '(');
-								if (paren && paren > existing_base && *(paren - 1) == ' ')
-									*(paren - 1) = '\0';
-								if (strcmp(existing_base, ias.info.application_name) == 0)
-									instance++;
-							}
+				}
+				if (is_new && client_ids[c] != XR_NULL_WORKSPACE_CLIENT_ID) {
+					XrWorkspaceClientInfoEXT cinfo;
+					if (shell_get_client_info(client_ids[c], &cinfo) && cinfo.name[0] != '\0') {
+						int instance = 1;
+						for (int cn = 0; cn < client_name_count; cn++) {
+							char existing_base[128];
+							snprintf(existing_base, sizeof(existing_base), "%s", client_names[cn].name);
+							char *paren = strrchr(existing_base, '(');
+							if (paren && paren > existing_base && *(paren - 1) == ' ')
+								*(paren - 1) = '\0';
+							if (strcmp(existing_base, cinfo.name) == 0)
+								instance++;
+						}
 
-							char numbered_name[128];
-							if (instance > 1)
-								snprintf(numbered_name, sizeof(numbered_name), "%s (%d)",
-								         ias.info.application_name, instance);
-							else
-								snprintf(numbered_name, sizeof(numbered_name), "%s",
-								         ias.info.application_name);
+						char numbered_name[128];
+						if (instance > 1)
+							snprintf(numbered_name, sizeof(numbered_name), "%s (%d)",
+							         cinfo.name, instance);
+						else
+							snprintf(numbered_name, sizeof(numbered_name), "%s",
+							         cinfo.name);
 
-							if (client_name_count < MAX_SAVED_WINDOWS) {
-								client_names[client_name_count].id = clients.ids[c];
-								snprintf(client_names[client_name_count].name, 128, "%s", numbered_name);
-								client_name_count++;
-							}
+						if (client_name_count < MAX_SAVED_WINDOWS) {
+							client_names[client_name_count].id = client_ids[c];
+							snprintf(client_names[client_name_count].name, 128, "%s", numbered_name);
+							client_name_count++;
 						}
 					}
 				}
 			}
 		}
 
-		print_clients(&ipc_c, prev_ids, &prev_count);
+		print_clients(prev_ids, &prev_count);
 
 #ifdef _WIN32
 		// Detect server-side deactivation (ESC closed the compositor window).
@@ -2316,7 +2289,7 @@ main(int argc, char *argv[])
 		// QueryFullProcessImageNameW), and we only push on diff.
 		if (g_shell_active) {
 			static uint64_t s_last_running_mask = (uint64_t)-1;
-			uint64_t mask = shell_compute_running_tile_mask(&ipc_c);
+			uint64_t mask = shell_compute_running_tile_mask();
 			if (mask != s_last_running_mask) {
 				(void)g_xr->set_running_tile_mask(g_xr->session, mask);
 				s_last_running_mask = mask;
@@ -2352,7 +2325,7 @@ main(int argc, char *argv[])
 					registered_apps_load();
 					P("Launcher: refreshed (after: %d apps)\n",
 					  g_registered_app_count);
-					shell_push_registered_apps_to_service(&ipc_c);
+					shell_push_registered_apps_to_service();
 #ifdef _WIN32
 					if (service_pid != 0) {
 						AllowSetForegroundWindow(service_pid);
@@ -2416,7 +2389,7 @@ main(int argc, char *argv[])
 						}
 						g_registered_app_count--;
 						registered_apps_save();
-						shell_push_registered_apps_to_service(&ipc_c);
+						shell_push_registered_apps_to_service();
 					}
 					// Re-show launcher so user sees the updated grid.
 #ifdef _WIN32
@@ -2431,7 +2404,7 @@ main(int argc, char *argv[])
 					// Phase 5.14: Browse tile → open file dialog, add to
 					// registry, re-push, re-show launcher so the user sees
 					// their new tile.
-					shell_browse_and_add_app(&ipc_c);
+					shell_browse_and_add_app();
 #ifdef _WIN32
 					if (service_pid != 0) {
 						AllowSetForegroundWindow(service_pid);
@@ -2447,20 +2420,21 @@ main(int argc, char *argv[])
 					// focus it instead of spawning a second instance.
 					bool focused_existing = false;
 #ifdef _WIN32
-					struct ipc_client_list clist;
-					if (ipc_call_system_get_clients(&ipc_c, &clist) == XRT_SUCCESS) {
-						for (uint32_t c = 0; c < clist.id_count && !focused_existing; c++) {
-							if (clist.ids[c] == 0) continue;
-							struct ipc_app_state ias;
-							if (ipc_call_system_get_client_info(&ipc_c, clist.ids[c], &ias) != XRT_SUCCESS)
+					{
+						XrWorkspaceClientId clist_ids[SHELL_MAX_CLIENTS];
+						uint32_t clist_count = shell_enumerate_clients(clist_ids, SHELL_MAX_CLIENTS);
+						for (uint32_t c = 0; c < clist_count && !focused_existing; c++) {
+							if (clist_ids[c] == XR_NULL_WORKSPACE_CLIENT_ID) continue;
+							XrWorkspaceClientInfoEXT cinfo;
+							if (!shell_get_client_info(clist_ids[c], &cinfo))
 								continue;
 							char client_exe[MAX_PATH];
-							if (!shell_pid_to_exe_path((DWORD)ias.pid, client_exe, sizeof(client_exe)))
+							if (!shell_pid_to_exe_path((DWORD)cinfo.pid, client_exe, sizeof(client_exe)))
 								continue;
 							if (shell_exe_paths_equal(client_exe, rapp->exe_path)) {
-								if (ipc_call_system_set_focused_client(&ipc_c, clist.ids[c]) == XRT_SUCCESS) {
+								if (g_xr->set_focused(g_xr->session, clist_ids[c]) == XR_SUCCESS) {
 									P("Launcher: focused running client %u → '%s'\n",
-									  clist.ids[c], rapp->name);
+									  (unsigned)clist_ids[c], rapp->name);
 									focused_existing = true;
 								}
 							}
@@ -2471,7 +2445,7 @@ main(int argc, char *argv[])
 						P("Launcher: launching tile %d → '%s'\n",
 						  (int)tile_index, rapp->name);
 						shell_launch_registered_app(
-						    &ipc_c, rapp,
+						    rapp,
 						    have_json ? runtime_json : NULL,
 						    apps, &app_count,
 						    captures, &capture_count);
@@ -2488,8 +2462,8 @@ main(int argc, char *argv[])
 			adopt_counter++;
 			if (adopt_counter >= 2) {
 				adopt_counter = 0;
-				cleanup_closed_captures(&ipc_c, captures, &capture_count);
-				enumerate_and_adopt_windows(&ipc_c, captures, &capture_count, service_pid);
+				cleanup_closed_captures(captures, &capture_count);
+				enumerate_and_adopt_windows(captures, &capture_count, service_pid);
 			}
 		}
 #endif
@@ -2520,6 +2494,6 @@ main(int argc, char *argv[])
 #endif
 
 	shell_openxr_shutdown(xr);
-	ipc_client_connection_fini(&ipc_c);
+	g_xr = NULL;
 	return 0;
 }
