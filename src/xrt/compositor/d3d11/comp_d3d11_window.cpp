@@ -146,24 +146,24 @@ struct comp_d3d11_window
 	//! True if qwerty input is enabled (checked once at startup from QWERTY_ENABLE env var)
 	bool qwerty_enabled;
 
-	//! Target HWND for input forwarding in shell mode (NULL = disabled).
-	//! When set, non-shell keyboard and mouse input is forwarded to this HWND.
+	//! Target HWND for input forwarding in workspace mode (NULL = disabled).
+	//! When set, non-workspace keyboard and mouse input is forwarded to this HWND.
 	volatile HWND input_forward_hwnd;
 
 	//! True when the forward target is a captured 2D window.
 	volatile LONG input_forward_is_capture;
 
-	//! True while shell_mode is active on the service side. Gates ESC-closes-window
-	//! so an empty shell (no focused app → input_forward_hwnd == NULL) doesn't
+	//! True while workspace_mode is active on the service side. Gates ESC-closes-window
+	//! so an empty workspace (no focused app → input_forward_hwnd == NULL) doesn't
 	//! PostMessage(WM_CLOSE) and take the service down with it.
 	volatile LONG workspace_mode_active;
 
-	//! True while any shell window is maximized (fullscreen). Gates ESC suppression
+	//! True while any workspace window is maximized (fullscreen). Gates ESC suppression
 	//! so ESC only restores fullscreen and doesn't reach apps when not maximized.
 	volatile LONG any_window_maximized;
 
-	//! Focused window rect in shell-window client pixels (for mouse coord remapping).
-	//! When forwarding mouse events, shell coords are remapped to app-local coords.
+	//! Focused window rect in workspace-window client pixels (for mouse coord remapping).
+	//! When forwarding mouse events, workspace coords are remapped to app-local coords.
 	volatile LONG input_forward_rect_x;
 	volatile LONG input_forward_rect_y;
 	volatile LONG input_forward_rect_w;
@@ -173,11 +173,11 @@ struct comp_d3d11_window
 	//! 0=arrow, 1=sizewe, 2=sizens, 3=sizenwse, 4=sizenesw, 5=sizeall
 	volatile LONG desired_cursor;
 
-	//! Accumulated scroll wheel delta for shell window resize (positive = enlarge).
+	//! Accumulated scroll wheel delta for workspace window resize (positive = enlarge).
 	//! Written by WndProc, read+reset by render loop.
 	volatile LONG scroll_accum;
 
-	//! When true, mouse input forwarding is suppressed (shell drag/resize active).
+	//! When true, mouse input forwarding is suppressed (workspace drag/resize active).
 	//! Set by compositor thread, read by WndProc thread.
 	volatile LONG input_suppress;
 
@@ -193,7 +193,7 @@ struct comp_d3d11_window
 	//! Set on button-down inside rect, cleared on button-up.
 	bool mouse_press_in_content;
 
-	//! Shell display processor for ESC/close 2D mode switch (opaque, can be NULL).
+	//! Workspace display processor for ESC/close 2D mode switch (opaque, can be NULL).
 	volatile void *workspace_dp;
 
 	//! Ring buffer for capture client input events (WndProc writes, render thread reads).
@@ -248,17 +248,17 @@ input_ring_push(struct comp_d3d11_window *w,
 }
 
 /*!
- * Check if a virtual key code is reserved for shell controls.
- * These keys are NOT forwarded to the focused app in shell mode.
+ * Check if a virtual key code is reserved for workspace controls.
+ * These keys are NOT forwarded to the focused app in workspace mode.
  */
 static bool
 is_shell_reserved_key(WPARAM vk)
 {
-	// Only true shell-management keys are reserved.
+	// Only true workspace-management keys are reserved.
 	// V, P, 0-9 are forwarded to the app (it may use them for its own purposes).
 	// The qwerty handler processes them server-side regardless; if the app also
 	// tries to change rendering mode via xrRequestDisplayRenderingModeEXT,
-	// that call is blocked in shell/IPC mode.
+	// that call is blocked in workspace/IPC mode.
 	switch (vk) {
 	case VK_TAB:    // Cycle focus
 	case VK_DELETE: // Close focused app
@@ -410,7 +410,7 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
 	case WM_CLOSE:
 		U_LOG_W("D3D11 window: WM_CLOSE received");
-		// Switch shell DP to 2D mode (lens off) before closing.
+		// Switch workspace DP to 2D mode (lens off) before closing.
 		// This runs on the window thread and works even with no active clients.
 		{
 			void *dp = (void *)InterlockedCompareExchangePointer(
@@ -419,7 +419,7 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 				struct xrt_display_processor_d3d11 *xdp =
 				    (struct xrt_display_processor_d3d11 *)dp;
 				xrt_display_processor_d3d11_request_display_mode(xdp, false);
-				U_LOG_W("D3D11 window: switched shell DP to 2D on close");
+				U_LOG_W("D3D11 window: switched workspace DP to 2D on close");
 			}
 		}
 		InterlockedExchange(&w->should_exit, TRUE);
@@ -460,13 +460,13 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	}
 
 	case WM_KEYDOWN:
-		// F11: toggle fullscreen for non-shell (single app) windows.
-		// In shell mode, F11 is handled in the multi-compositor render loop instead.
+		// F11: toggle fullscreen for non-workspace (single app) windows.
+		// In workspace mode, F11 is handled in the multi-compositor render loop instead.
 		if (wParam == VK_F11) {
 			HWND fwd_check = (HWND)InterlockedCompareExchangePointer(
 			    (volatile PVOID *)&w->input_forward_hwnd, NULL, NULL);
 			if (fwd_check == NULL) {
-				// Non-shell mode: toggle fullscreen directly
+				// Non-workspace mode: toggle fullscreen directly
 				LONG fs = InterlockedCompareExchange(&w->is_fullscreen, 0, 0);
 				fs = !fs;
 				InterlockedExchange(&w->is_fullscreen, fs);
@@ -474,7 +474,7 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 				U_LOG_W("D3D11 window: F11 toggled to %s mode", fs ? "fullscreen" : "windowed");
 				return 0;
 			}
-			// Shell mode: fall through to forwarding (handled server-side)
+			// Workspace mode: fall through to forwarding (handled server-side)
 		}
 		// FALLTHROUGH to WM_KEYUP/SYSKEYDOWN/SYSKEYUP/CHAR
 	case WM_KEYUP:
@@ -482,7 +482,7 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	case WM_SYSKEYUP:
 	case WM_CHAR:
 	case WM_SYSCHAR: {
-		// Phase 5.12: when the shell is suppressing input (launcher visible,
+		// Phase 5.12: when the workspace is suppressing input (launcher visible,
 		// resize drag, or within the post-launcher grace period) we eat the
 		// key entirely — don't forward, don't run qwerty. Otherwise the
 		// launcher's Esc / arrows / Enter leak through and close the app.
@@ -490,7 +490,7 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			return 0;
 		}
 
-		// Shell input forwarding: all keys go to BOTH qwerty and the app.
+		// Workspace input forwarding: all keys go to BOTH qwerty and the app.
 		// Qwerty processes first (mode toggles, camera controls), then
 		// the key is forwarded to the focused app's HWND.
 		HWND fwd = (HWND)InterlockedCompareExchangePointer((volatile PVOID *)&w->input_forward_hwnd, NULL, NULL);
@@ -516,7 +516,7 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			}
 #endif
 			if (is_shell_reserved_key(wParam)) {
-				// Shell-only keys (TAB, DELETE) → don't forward to app
+				// Workspace-only keys (TAB, DELETE) → don't forward to app
 				return 0;
 			}
 			// ESC: only suppress when a window is maximized (fullscreen restore).
@@ -542,18 +542,18 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
 		// Normal mode (no forwarding): pass all keys to qwerty.
 		// ESC → close window: Phase 4C made ESC a no-op in qwerty to
-		// prevent it from killing the shell, but that also broke non-shell
+		// prevent it from killing the workspace, but that also broke non-workspace
 		// ESC (WebXR, standalone IPC clients). Handle ESC here before
-		// qwerty sees it. Shell mode never reaches this block because
+		// qwerty sees it. Workspace mode never reaches this block because
 		// input_forward_hwnd != NULL takes the forwarding path above.
 		if (message == WM_KEYDOWN && wParam == VK_ESCAPE) {
-			// Shell mode with no focused app: input_forward_hwnd is NULL so we
+			// Workspace mode with no focused app: input_forward_hwnd is NULL so we
 			// fall into this block, but closing the window kills the service.
 			// Swallow the key instead; user can press Ctrl+Space to dismiss.
 			if (InterlockedCompareExchange(&w->workspace_mode_active, 0, 0)) {
 				return 0;
 			}
-			U_LOG_W("D3D11 window: ESC pressed — closing (non-shell mode)");
+			U_LOG_W("D3D11 window: ESC pressed — closing (non-workspace mode)");
 			PostMessageW(hWnd, WM_CLOSE, 0, 0);
 			return 0;
 		}
@@ -597,7 +597,7 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 #endif
 		return DefWindowProcW(hWnd, message, wParam, lParam);
 
-	// Mouse input: forward to app in shell mode, or to qwerty in normal mode
+	// Mouse input: forward to app in workspace mode, or to qwerty in normal mode
 	case WM_LBUTTONDOWN:
 	case WM_LBUTTONUP:
 	case WM_RBUTTONDOWN:
@@ -606,7 +606,7 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	case WM_MBUTTONUP:
 	case WM_MOUSEMOVE:
 	case WM_MOUSEWHEEL: {
-		// Skip forwarding when shell drag/resize is active or within the
+		// Skip forwarding when workspace drag/resize is active or within the
 		// launcher grace period.
 		if (input_is_suppressed(w)) {
 			break; // fall through to qwerty/default handling
@@ -621,10 +621,10 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		HWND fwd = (HWND)InterlockedCompareExchangePointer((volatile PVOID *)&w->input_forward_hwnd, NULL, NULL);
 		LONG is_capture = InterlockedCompareExchange(&w->input_forward_is_capture, 0, 0);
 		if (fwd != NULL) {
-			// Shell mode wheel routing:
+			// Workspace mode wheel routing:
 			//   cursor over app content + no modifier → forward to app (e.g. 3DGS zoom)
-			//   cursor outside app content            → shell resize (no modifier needed)
-			//   Ctrl + scroll                         → shell resize (force, even over app)
+			//   cursor outside app content            → workspace resize (no modifier needed)
+			//   Ctrl + scroll                         → workspace resize (force, even over app)
 			//   Shift + scroll                        → window Z-depth
 			// Capture clients don't take wheel input, so always consume their delta.
 			if (message == WM_MOUSEWHEEL) {
@@ -632,7 +632,7 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 				bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
 
 				// WM_MOUSEWHEEL puts SCREEN coords in lParam (unlike other
-				// mouse messages). Convert to shell-client coords for the
+				// mouse messages). Convert to workspace-client coords for the
 				// in-rect test.
 				POINT pt;
 				pt.x = GET_X_LPARAM(lParam);
@@ -670,19 +670,19 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			bool is_button_up = (message == WM_LBUTTONUP || message == WM_RBUTTONUP ||
 			                     message == WM_MBUTTONUP);
 
-			// Remap shell-window coords to app-window coords
+			// Remap workspace-window coords to app-window coords
 			LONG rx = InterlockedCompareExchange(&w->input_forward_rect_x, 0, 0);
 			LONG ry = InterlockedCompareExchange(&w->input_forward_rect_y, 0, 0);
 			LONG rw = InterlockedCompareExchange(&w->input_forward_rect_w, 0, 0);
 			LONG rh = InterlockedCompareExchange(&w->input_forward_rect_h, 0, 0);
 
 			if (rw > 0 && rh > 0) {
-				// Extract shell-window client coords
-				int shell_x = GET_X_LPARAM(lParam);
-				int shell_y = GET_Y_LPARAM(lParam);
+				// Extract workspace-window client coords
+				int workspace_x = GET_X_LPARAM(lParam);
+				int workspace_y = GET_Y_LPARAM(lParam);
 
-				bool in_rect = (shell_x >= rx && shell_x < rx + rw &&
-				                shell_y >= ry && shell_y < ry + rh);
+				bool in_rect = (workspace_x >= rx && workspace_x < rx + rw &&
+				                workspace_y >= ry && workspace_y < ry + rh);
 
 				// Track whether the press originated inside the content rect.
 				// Only forward drag (button-held movement) if the press started
@@ -706,8 +706,8 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 					int target_w = target_cr.right - target_cr.left;
 					int target_h = target_cr.bottom - target_cr.top;
 
-					int rel_x = shell_x - rx;
-					int rel_y = shell_y - ry;
+					int rel_x = workspace_x - rx;
+					int rel_y = workspace_y - ry;
 					int app_x, app_y;
 					if (target_w > 0 && target_h > 0 &&
 					    (target_w != rw || target_h != rh)) {
@@ -780,7 +780,7 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
 	case WM_SHELL_SET_FOREGROUND: {
 		// Cross-thread foreground request from compositor.
-		// wParam = target HWND. NULL means restore shell window.
+		// wParam = target HWND. NULL means restore workspace window.
 		HWND target = (HWND)wParam;
 		if (target != NULL) {
 			SetForegroundWindow(target);
@@ -802,10 +802,10 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		ofn.lpstrFilter = "Executables (*.exe)\0*.exe\0All Files (*.*)\0*.*\0";
 		ofn.lpstrFile = path;
 		ofn.nMaxFile = MAX_PATH;
-		ofn.lpstrTitle = "Launch App in Shell";
+		ofn.lpstrTitle = "Launch App in Workspace";
 		ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
 		if (GetOpenFileNameA(&ofn)) {
-			// Set shell session env var and ensure XR_RUNTIME_JSON points to
+			// Set workspace session env var and ensure XR_RUNTIME_JSON points to
 			// the dev build runtime (matching the running service).
 			SetEnvironmentVariableA("DISPLAYXR_WORKSPACE_SESSION", "1");
 			if (getenv("XR_RUNTIME_JSON") == NULL) {
@@ -1310,7 +1310,7 @@ comp_d3d11_window_set_input_suppress(struct comp_d3d11_window *window, bool supp
 	// of the window itself. The native WM_ENTERSIZEMOVE path also sets
 	// this prop directly; reusing the prop keeps one gate on the bridge
 	// side. Semantically DXR_InSizeMove now means "compositor is in a
-	// modal-like interaction (native OR shell-virtual)" — document in
+	// modal-like interaction (native OR workspace-virtual)" — document in
 	// webxr-bridge/DEVELOPER.md alongside the Phase-5 description.
 	if (window->hwnd != NULL) {
 		if (suppress) {

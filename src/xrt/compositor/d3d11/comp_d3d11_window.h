@@ -184,22 +184,22 @@ comp_d3d11_window_set_system_devices(struct comp_d3d11_window *window,
                                       struct xrt_system_devices *xsysd);
 
 /*!
- * Set the target HWND and window rect for input forwarding (shell mode).
+ * Set the target HWND and window rect for input forwarding (workspace mode).
  *
- * When hwnd is non-NULL, the window enters shell input-forwarding mode:
- * - Shell-reserved keys (ESC, TAB, DELETE) are consumed by the shell
+ * When hwnd is non-NULL, the window enters workspace input-forwarding mode:
+ * - Workspace-reserved keys (ESC, TAB, DELETE) are consumed by the workspace
  * - All other keyboard input is forwarded to the target HWND via PostMessage
- * - Mouse events are remapped from shell-window coords to app-window coords
+ * - Mouse events are remapped from workspace-window coords to app-window coords
  *   using the provided rect, then forwarded. Mouse outside the rect is not forwarded.
  *
  * When hwnd is NULL, normal qwerty handling resumes.
  *
  * @param window The window object
  * @param hwnd   The focused app's HWND (NULL to disable forwarding)
- * @param rect_x Virtual window left edge in shell-window client pixels
- * @param rect_y Virtual window top edge in shell-window client pixels
- * @param rect_w Virtual window width in shell-window client pixels
- * @param rect_h Virtual window height in shell-window client pixels
+ * @param rect_x Virtual window left edge in workspace-window client pixels
+ * @param rect_y Virtual window top edge in workspace-window client pixels
+ * @param rect_w Virtual window width in workspace-window client pixels
+ * @param rect_h Virtual window height in workspace-window client pixels
  */
 void
 comp_d3d11_window_set_input_forward(struct comp_d3d11_window *window,
@@ -211,8 +211,8 @@ comp_d3d11_window_set_input_forward(struct comp_d3d11_window *window,
                                      bool is_capture);
 
 /*!
- * Mark shell mode as active/inactive on the window. While active, ESC on the
- * compositor window is swallowed instead of posting WM_CLOSE — an empty shell
+ * Mark workspace mode as active/inactive on the window. While active, ESC on the
+ * compositor window is swallowed instead of posting WM_CLOSE — an empty workspace
  * (no focused app) would otherwise take the service down with its own window.
  */
 void
@@ -220,14 +220,14 @@ comp_d3d11_window_set_workspace_mode_active(struct comp_d3d11_window *window, bo
 
 /*!
  * Tell the window layer whether any client is currently maximized/fullscreen.
- * When true, ESC is consumed by the shell for fullscreen restore and not
+ * When true, ESC is consumed by the workspace for fullscreen restore and not
  * forwarded to the focused app.
  */
 void
 comp_d3d11_window_set_any_maximized(struct comp_d3d11_window *window, bool maximized);
 
 /*!
- * Suppress or resume input forwarding (for shell drag/resize operations).
+ * Suppress or resume input forwarding (for workspace drag/resize operations).
  * When suppressed, the WndProc does not forward mouse or keyboard events to
  * the app.
  */
@@ -246,7 +246,7 @@ comp_d3d11_window_set_input_suppress_grace_ms(struct comp_d3d11_window *window, 
 
 /*!
  * Phase 5.13: show a Win32 popup menu for a launcher tile right-click.
- * Must be called from the shell's render thread — internally dispatches to
+ * Must be called from the workspace's render thread — internally dispatches to
  * the window thread via SendMessage since TrackPopupMenu only works from
  * the thread that owns the target window.
  *
@@ -261,7 +261,7 @@ uint32_t
 comp_d3d11_window_show_launcher_context_menu(struct comp_d3d11_window *window);
 
 /*!
- * Read and reset accumulated scroll wheel delta (for shell window resize).
+ * Read and reset accumulated scroll wheel delta (for workspace window resize).
  *
  * @param window The window object
  * @return Accumulated scroll delta (positive = scroll up = enlarge), or 0
@@ -277,14 +277,14 @@ void
 comp_d3d11_window_set_cursor(struct comp_d3d11_window *window, int cursor_id);
 
 /*!
- * Set the shell display processor for ESC/close handling.
+ * Set the workspace display processor for ESC/close handling.
  *
- * When the shell window is closed (ESC or WM_CLOSE), this DP is switched
+ * When the workspace window is closed (ESC or WM_CLOSE), this DP is switched
  * to 2D mode (lens off). Required because multi_compositor_render may not
  * run again after the last client disconnects.
  *
  * @param window The window object
- * @param dp     The shell's display processor (opaque pointer)
+ * @param dp     The workspace's display processor (opaque pointer)
  */
 void
 comp_d3d11_window_set_workspace_dp(struct comp_d3d11_window *window, void *dp);
@@ -314,7 +314,7 @@ comp_d3d11_window_consume_input_events(struct comp_d3d11_window *window,
  * HWNDs for SendInput dispatch.
  *
  * @param window      The window object
- * @param target_hwnd The HWND to make foreground (NULL to restore shell window)
+ * @param target_hwnd The HWND to make foreground (NULL to restore workspace window)
  */
 void
 comp_d3d11_window_request_foreground(struct comp_d3d11_window *window,
