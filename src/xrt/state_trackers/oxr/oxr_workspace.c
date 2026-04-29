@@ -49,6 +49,22 @@ comp_ipc_client_compositor_workspace_add_capture_client(struct xrt_compositor *x
                                                         uint32_t *out_client_id);
 xrt_result_t
 comp_ipc_client_compositor_workspace_remove_capture_client(struct xrt_compositor *xc, uint32_t client_id);
+xrt_result_t
+comp_ipc_client_compositor_workspace_set_window_pose(struct xrt_compositor *xc,
+                                                     uint32_t client_id,
+                                                     const struct xrt_pose *pose,
+                                                     float width_m,
+                                                     float height_m);
+xrt_result_t
+comp_ipc_client_compositor_workspace_get_window_pose(struct xrt_compositor *xc,
+                                                     uint32_t client_id,
+                                                     struct xrt_pose *out_pose,
+                                                     float *out_width_m,
+                                                     float *out_height_m);
+xrt_result_t
+comp_ipc_client_compositor_workspace_set_window_visibility(struct xrt_compositor *xc,
+                                                           uint32_t client_id,
+                                                           bool visible);
 
 
 /*
@@ -231,6 +247,145 @@ oxr_xrRemoveWorkspaceCaptureClientEXT(XrSession session, XrWorkspaceClientId cli
 	xrt_result_t xret = comp_ipc_client_compositor_workspace_remove_capture_client(&sess->xcn->base,
 	                                                                               (uint32_t)clientId);
 	return xret_to_xr_result(&log, xret, "workspace_remove_capture_client");
+}
+
+
+/*
+ * Window pose + visibility (spec_version 2)
+ *
+ * XrPosef and struct xrt_pose are layout-compatible (quaternion + vec3,
+ * x/y/z/w ordering on the quat, x/y/z on the vec3). The translation here
+ * is field-by-field rather than memcpy to keep the boundary explicit and
+ * survive any future divergence in either type.
+ */
+
+static void
+xr_pose_to_xrt_pose(const XrPosef *in, struct xrt_pose *out)
+{
+	out->orientation.x = in->orientation.x;
+	out->orientation.y = in->orientation.y;
+	out->orientation.z = in->orientation.z;
+	out->orientation.w = in->orientation.w;
+	out->position.x = in->position.x;
+	out->position.y = in->position.y;
+	out->position.z = in->position.z;
+}
+
+static void
+xrt_pose_to_xr_pose(const struct xrt_pose *in, XrPosef *out)
+{
+	out->orientation.x = in->orientation.x;
+	out->orientation.y = in->orientation.y;
+	out->orientation.z = in->orientation.z;
+	out->orientation.w = in->orientation.w;
+	out->position.x = in->position.x;
+	out->position.y = in->position.y;
+	out->position.z = in->position.z;
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSetWorkspaceClientWindowPoseEXT(XrSession session,
+                                      XrWorkspaceClientId clientId,
+                                      const XrPosef *pose,
+                                      float widthMeters,
+                                      float heightMeters)
+{
+	OXR_TRACE_MARKER();
+
+	struct oxr_session *sess = NULL;
+	struct oxr_logger log;
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrSetWorkspaceClientWindowPoseEXT");
+	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+	OXR_VERIFY_ARG_NOT_NULL(&log, pose);
+
+	if (clientId == XR_NULL_WORKSPACE_CLIENT_ID) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+		                 "xrSetWorkspaceClientWindowPoseEXT: clientId must not be XR_NULL_WORKSPACE_CLIENT_ID");
+	}
+	if (!(widthMeters > 0.0f) || !(heightMeters > 0.0f)) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+		                 "xrSetWorkspaceClientWindowPoseEXT: widthMeters and heightMeters must be > 0");
+	}
+
+	if (!session_is_ipc_client(sess)) {
+		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
+		                 "xrSetWorkspaceClientWindowPoseEXT requires an IPC-mode session");
+	}
+
+	struct xrt_pose xpose;
+	xr_pose_to_xrt_pose(pose, &xpose);
+
+	xrt_result_t xret = comp_ipc_client_compositor_workspace_set_window_pose(
+	    &sess->xcn->base, (uint32_t)clientId, &xpose, widthMeters, heightMeters);
+	return xret_to_xr_result(&log, xret, "workspace_set_window_pose");
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrGetWorkspaceClientWindowPoseEXT(XrSession session,
+                                      XrWorkspaceClientId clientId,
+                                      XrPosef *outPose,
+                                      float *outWidthMeters,
+                                      float *outHeightMeters)
+{
+	OXR_TRACE_MARKER();
+
+	struct oxr_session *sess = NULL;
+	struct oxr_logger log;
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrGetWorkspaceClientWindowPoseEXT");
+	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+	OXR_VERIFY_ARG_NOT_NULL(&log, outPose);
+	OXR_VERIFY_ARG_NOT_NULL(&log, outWidthMeters);
+	OXR_VERIFY_ARG_NOT_NULL(&log, outHeightMeters);
+
+	if (clientId == XR_NULL_WORKSPACE_CLIENT_ID) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+		                 "xrGetWorkspaceClientWindowPoseEXT: clientId must not be XR_NULL_WORKSPACE_CLIENT_ID");
+	}
+
+	if (!session_is_ipc_client(sess)) {
+		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
+		                 "xrGetWorkspaceClientWindowPoseEXT requires an IPC-mode session");
+	}
+
+	struct xrt_pose xpose = {0};
+	float w = 0.0f, h = 0.0f;
+	xrt_result_t xret = comp_ipc_client_compositor_workspace_get_window_pose(
+	    &sess->xcn->base, (uint32_t)clientId, &xpose, &w, &h);
+	if (xret != XRT_SUCCESS) {
+		return xret_to_xr_result(&log, xret, "workspace_get_window_pose");
+	}
+	xrt_pose_to_xr_pose(&xpose, outPose);
+	*outWidthMeters = w;
+	*outHeightMeters = h;
+	return XR_SUCCESS;
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSetWorkspaceClientVisibilityEXT(XrSession session, XrWorkspaceClientId clientId, XrBool32 visible)
+{
+	OXR_TRACE_MARKER();
+
+	struct oxr_session *sess = NULL;
+	struct oxr_logger log;
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrSetWorkspaceClientVisibilityEXT");
+	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+
+	if (clientId == XR_NULL_WORKSPACE_CLIENT_ID) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+		                 "xrSetWorkspaceClientVisibilityEXT: clientId must not be XR_NULL_WORKSPACE_CLIENT_ID");
+	}
+
+	if (!session_is_ipc_client(sess)) {
+		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
+		                 "xrSetWorkspaceClientVisibilityEXT requires an IPC-mode session");
+	}
+
+	xrt_result_t xret = comp_ipc_client_compositor_workspace_set_window_visibility(
+	    &sess->xcn->base, (uint32_t)clientId, visible == XR_TRUE);
+	return xret_to_xr_result(&log, xret, "workspace_set_window_visibility");
 }
 
 #endif // OXR_HAVE_EXT_spatial_workspace
