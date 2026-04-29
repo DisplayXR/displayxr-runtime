@@ -276,6 +276,55 @@ comp_ipc_client_compositor_workspace_remove_capture_client(struct xrt_compositor
 	return ipc_call_workspace_remove_capture_client(icc->ipc_c, client_id);
 }
 
+xrt_result_t
+comp_ipc_client_compositor_workspace_set_window_pose(struct xrt_compositor *xc,
+                                                     uint32_t client_id,
+                                                     const struct xrt_pose *pose,
+                                                     float width_m,
+                                                     float height_m)
+{
+	if (xc == NULL || pose == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_call_workspace_set_window_pose(icc->ipc_c, client_id, pose, width_m, height_m);
+}
+
+xrt_result_t
+comp_ipc_client_compositor_workspace_get_window_pose(struct xrt_compositor *xc,
+                                                     uint32_t client_id,
+                                                     struct xrt_pose *out_pose,
+                                                     float *out_width_m,
+                                                     float *out_height_m)
+{
+	if (xc == NULL || out_pose == NULL || out_width_m == NULL || out_height_m == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_call_workspace_get_window_pose(icc->ipc_c, client_id, out_pose, out_width_m, out_height_m);
+}
+
+xrt_result_t
+comp_ipc_client_compositor_workspace_set_window_visibility(struct xrt_compositor *xc,
+                                                           uint32_t client_id,
+                                                           bool visible)
+{
+	if (xc == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_call_workspace_set_window_visibility(icc->ipc_c, client_id, visible);
+}
+
 /*
  * Launcher bridges (XR_EXT_app_launcher).
  *

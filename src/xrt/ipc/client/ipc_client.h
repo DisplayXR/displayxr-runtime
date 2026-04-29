@@ -172,6 +172,27 @@ comp_ipc_client_compositor_workspace_add_capture_client(struct xrt_compositor *x
 xrt_result_t
 comp_ipc_client_compositor_workspace_remove_capture_client(struct xrt_compositor *xc, uint32_t client_id);
 
+struct xrt_pose;
+
+xrt_result_t
+comp_ipc_client_compositor_workspace_set_window_pose(struct xrt_compositor *xc,
+                                                     uint32_t client_id,
+                                                     const struct xrt_pose *pose,
+                                                     float width_m,
+                                                     float height_m);
+
+xrt_result_t
+comp_ipc_client_compositor_workspace_get_window_pose(struct xrt_compositor *xc,
+                                                     uint32_t client_id,
+                                                     struct xrt_pose *out_pose,
+                                                     float *out_width_m,
+                                                     float *out_height_m);
+
+xrt_result_t
+comp_ipc_client_compositor_workspace_set_window_visibility(struct xrt_compositor *xc,
+                                                           uint32_t client_id,
+                                                           bool visible);
+
 /*!
  * Launcher bridges (XR_EXT_app_launcher).
  *
