@@ -261,11 +261,27 @@ workspace_watch_thread_func(LPVOID param)
 {
 	(void)param;
 
-	// Wait for the workspace process to exit
-	WaitForSingleObject(s_workspace_pi.hProcess, INFINITE);
+	// Hold our own duplicated handle for the wait. terminate_child closes
+	// s_workspace_pi.hProcess on the main thread on a Disable click; the
+	// duplicate gives us an independent kernel-handle reference so we never
+	// race with that close (STATUS_INVALID_HANDLE / 0xC0000008).
+	HANDLE h = NULL;
+	if (s_workspace_pi.hProcess != NULL) {
+		if (!DuplicateHandle(GetCurrentProcess(), s_workspace_pi.hProcess,
+		                     GetCurrentProcess(), &h,
+		                     SYNCHRONIZE, FALSE, 0)) {
+			h = NULL;
+		}
+	}
+	if (h == NULL) {
+		// Either the process never started or terminate_child already cleared
+		// hProcess before we could duplicate it. Either way, nothing to watch.
+		return 0;
+	}
 
-	CloseHandle(s_workspace_pi.hProcess);
-	s_workspace_pi.hProcess = NULL;
+	WaitForSingleObject(h, INFINITE);
+	CloseHandle(h);
+
 	s_workspace_running = false;
 
 	OW("Workspace controller process exited");
