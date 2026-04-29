@@ -2738,6 +2738,59 @@ ipc_handle_workspace_pointer_capture_set(volatile struct ipc_client_state *_ics,
 }
 
 xrt_result_t
+ipc_handle_workspace_enumerate_clients(volatile struct ipc_client_state *_ics, struct ipc_client_list *list)
+{
+	struct ipc_server *s = _ics->server;
+
+	unsigned long expected_pid = get_orchestrator_workspace_pid();
+	unsigned long caller_pid = (unsigned long)_ics->client_state.pid;
+	if (expected_pid != 0 && caller_pid != expected_pid) {
+		return XRT_ERROR_NOT_AUTHORIZED;
+	}
+
+	if (list == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	// Workspace-scoped enumerate is identical in shape to the existing
+	// system enumerate — both walk the IPC thread table — but the auth
+	// model differs: only the registered workspace controller may see
+	// the full client list.
+	os_mutex_lock(&s->global_state.lock);
+	uint32_t count = 0;
+	for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
+		volatile struct ipc_client_state *ics = &s->threads[i].ics;
+		if (ics->server_thread_index < 0) {
+			continue;
+		}
+		list->ids[count++] = ics->client_state.id;
+	}
+	list->id_count = count;
+	os_mutex_unlock(&s->global_state.lock);
+
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+ipc_handle_workspace_get_client_info(volatile struct ipc_client_state *_ics,
+                                     uint32_t client_id,
+                                     struct ipc_app_state *out_state)
+{
+	struct ipc_server *s = _ics->server;
+
+	unsigned long expected_pid = get_orchestrator_workspace_pid();
+	unsigned long caller_pid = (unsigned long)_ics->client_state.pid;
+	if (expected_pid != 0 && caller_pid != expected_pid) {
+		return XRT_ERROR_NOT_AUTHORIZED;
+	}
+
+	if (out_state == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_server_get_client_app_state(s, client_id, out_state);
+}
+
+xrt_result_t
 ipc_handle_workspace_capture_frame(volatile struct ipc_client_state *_ics,
                                 const struct ipc_capture_request *request,
                                 struct ipc_capture_result *out_capture_result)

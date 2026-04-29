@@ -184,6 +184,21 @@
 		]
 	},
 
+	"workspace_enumerate_clients": {
+		"out": [
+			{"name": "clients", "type": "struct ipc_client_list"}
+		]
+	},
+
+	"workspace_get_client_info": {
+		"in": [
+			{"name": "client_id", "type": "uint32_t"}
+		],
+		"out": [
+			{"name": "client_state", "type": "struct ipc_app_state"}
+		]
+	},
+
 	"workspace_capture_frame": {
 		"in": [
 			{"name": "request", "type": "struct ipc_capture_request"}
