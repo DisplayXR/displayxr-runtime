@@ -4,8 +4,9 @@
 // workspace_minimal_d3d11_win
 //
 // Minimal validation client for XR_EXT_spatial_workspace (Phase 2.A + 2.C
-// + 2.D + 2.F, v4) and XR_EXT_app_launcher (Phase 2.B). Creates an instance +
-// session, resolves all 19 extension PFNs, and walks through:
+// + 2.D + 2.F + 2.I-prequel, v5) and XR_EXT_app_launcher (Phase 2.B).
+// Creates an instance + session, resolves all 22 extension PFNs, and walks
+// through:
 //   activate -> get-state ->
 //     add capture client ->
 //     set/get/set client window pose + visibility ->
@@ -13,6 +14,8 @@
 //     set/get focused client (Phase 2.D) ->
 //     enumerate input events (count-query) (Phase 2.D) ->
 //     enable/disable pointer capture (Phase 2.D) ->
+//     enumerate workspace clients + get client info (Phase 2.I-prequel) ->
+//     capture workspace frame (Phase 2.I-prequel) ->
 //     remove capture client ->
 //     clear / add / set-visible / set-running-mask / poll / hide launcher ->
 //   deactivate.
@@ -41,6 +44,7 @@
 #include <openxr/XR_EXT_app_launcher.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -128,7 +132,7 @@ run_workspace_test()
 	XrInstance instance = XR_NULL_HANDLE;
 	CHECK_XR(xrCreateInstance(&instInfo, &instance), "xrCreateInstance");
 
-	// 3. Resolve all 19 extension PFNs (must be non-null when the extension is enabled).
+	// 3. Resolve all 22 extension PFNs (must be non-null when the extension is enabled).
 	PFN_xrActivateSpatialWorkspaceEXT pfnActivate = nullptr;
 	PFN_xrDeactivateSpatialWorkspaceEXT pfnDeactivate = nullptr;
 	PFN_xrGetSpatialWorkspaceStateEXT pfnGetState = nullptr;
@@ -148,6 +152,9 @@ run_workspace_test()
 	PFN_xrEnumerateWorkspaceInputEventsEXT pfnEnumInputEvents = nullptr;
 	PFN_xrEnableWorkspacePointerCaptureEXT pfnEnableCapture = nullptr;
 	PFN_xrDisableWorkspacePointerCaptureEXT pfnDisableCapture = nullptr;
+	PFN_xrCaptureWorkspaceFrameEXT pfnCaptureFrame = nullptr;
+	PFN_xrEnumerateWorkspaceClientsEXT pfnEnumClients = nullptr;
+	PFN_xrGetWorkspaceClientInfoEXT pfnGetClientInfo = nullptr;
 
 	struct PfnLookup {
 		const char *name;
@@ -178,6 +185,9 @@ run_workspace_test()
 	     reinterpret_cast<PFN_xrVoidFunction *>(&pfnEnableCapture)},
 	    {"xrDisableWorkspacePointerCaptureEXT",
 	     reinterpret_cast<PFN_xrVoidFunction *>(&pfnDisableCapture)},
+	    {"xrCaptureWorkspaceFrameEXT", reinterpret_cast<PFN_xrVoidFunction *>(&pfnCaptureFrame)},
+	    {"xrEnumerateWorkspaceClientsEXT", reinterpret_cast<PFN_xrVoidFunction *>(&pfnEnumClients)},
+	    {"xrGetWorkspaceClientInfoEXT", reinterpret_cast<PFN_xrVoidFunction *>(&pfnGetClientInfo)},
 	};
 	for (const auto &l : lookups) {
 		PFN_xrVoidFunction fn = nullptr;
@@ -365,6 +375,53 @@ run_workspace_test()
 		// Pointer-capture toggle: enable then disable. Both should succeed.
 		CHECK_XR(pfnEnableCapture(session, 1), "xrEnableWorkspacePointerCaptureEXT");
 		CHECK_XR(pfnDisableCapture(session), "xrDisableWorkspacePointerCaptureEXT");
+
+		// Phase 2.I-prequel: client enumeration smoke.
+		// Count-query first, then enumerate. The smoke session is itself an
+		// OpenXR client connection so enumerate should return at least 1 id
+		// (this session). xrGetWorkspaceClientInfoEXT against the first id
+		// should succeed and return a non-empty name.
+		uint32_t client_count = 0;
+		CHECK_XR(pfnEnumClients(session, 0, &client_count, nullptr),
+		         "xrEnumerateWorkspaceClientsEXT(count)");
+		std::printf("[xrEnumerateWorkspaceClientsEXT(0)         ] count=%u\n",
+		            (unsigned)client_count);
+		if (client_count > 0 && client_count <= 8) {
+			XrWorkspaceClientId ids[8] = {};
+			uint32_t got = 0;
+			CHECK_XR(pfnEnumClients(session, client_count, &got, ids),
+			         "xrEnumerateWorkspaceClientsEXT(fill)");
+			std::printf("[xrEnumerateWorkspaceClientsEXT(fill)      ] got=%u\n",
+			            (unsigned)got);
+			if (got > 0 && ids[0] != XR_NULL_WORKSPACE_CLIENT_ID) {
+				XrWorkspaceClientInfoEXT cinfo = {XR_TYPE_WORKSPACE_CLIENT_INFO_EXT};
+				CHECK_XR(pfnGetClientInfo(session, ids[0], &cinfo),
+				         "xrGetWorkspaceClientInfoEXT");
+				std::printf("[xrGetWorkspaceClientInfoEXT(id=%u)        ] name=\"%s\" pid=%llu z=%u "
+				            "focused=%u visible=%u\n",
+				            (unsigned)ids[0], cinfo.name, (unsigned long long)cinfo.pid,
+				            (unsigned)cinfo.zOrder, (unsigned)cinfo.isFocused,
+				            (unsigned)cinfo.isVisible);
+			}
+		}
+
+		// Phase 2.I-prequel: frame-capture smoke. Write to %TEMP% so the file
+		// is easy to clean up. Validation may fail in the smoke window if the
+		// compositor isn't drawing frames yet — accept any of XR_SUCCESS or
+		// runtime-failure as a valid outcome here; the goal is to prove
+		// dispatch reached the IPC layer.
+		{
+			XrWorkspaceCaptureRequestEXT req = {XR_TYPE_WORKSPACE_CAPTURE_REQUEST_EXT};
+			std::snprintf(req.pathPrefix, sizeof(req.pathPrefix),
+			              "%s\\workspace_smoke_capture", std::getenv("TEMP") ? std::getenv("TEMP") : ".");
+			req.flags = XR_WORKSPACE_CAPTURE_FLAG_ATLAS_BIT_EXT;
+			XrWorkspaceCaptureResultEXT cres = {XR_TYPE_WORKSPACE_CAPTURE_RESULT_EXT};
+			XrResult cr = pfnCaptureFrame(session, &req, &cres);
+			std::printf("[xrCaptureWorkspaceFrameEXT(%s)] %s atlas=%ux%u eye=%ux%u\n",
+			            req.pathPrefix, xr_result_str(cr),
+			            (unsigned)cres.atlasWidth, (unsigned)cres.atlasHeight,
+			            (unsigned)cres.eyeWidth, (unsigned)cres.eyeHeight);
+		}
 
 		// Clear focus before removing the captured client to keep state tidy.
 		CHECK_XR(pfnSetFocused(session, XR_NULL_WORKSPACE_CLIENT_ID),
