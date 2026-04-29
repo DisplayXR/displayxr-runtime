@@ -4661,9 +4661,9 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 }
 
 /*!
- * Result of spatial raycasting hit-test against shell windows.
+ * Result of spatial raycasting hit-test against workspace windows.
  */
-struct shell_hit_result
+struct workspace_hit_result
 {
 	int slot;            //!< Hit window slot (-1 = no hit)
 	bool in_title_bar;   //!< Hit is in the title bar region
@@ -4900,12 +4900,12 @@ launcher_hit_test(struct d3d11_service_system *sys, POINT cursor_px, uint32_t n_
  *
  * This approach is tiling-independent and future-proofs for angled 3D windows.
  */
-static struct shell_hit_result
-shell_raycast_hit_test(struct d3d11_service_system *sys,
+static struct workspace_hit_result
+workspace_raycast_hit_test(struct d3d11_service_system *sys,
                        struct d3d11_multi_compositor *mc,
                        POINT cursor_px)
 {
-	struct shell_hit_result result = {};
+	struct workspace_hit_result result = {};
 	result.slot = -1;
 
 	float disp_w_m = sys->base.info.display_width_m;
@@ -6004,7 +6004,7 @@ after_key_shortcuts:
 			POINT cpt;
 			GetCursorPos(&cpt);
 			ScreenToClient(mc->hwnd, &cpt);
-			struct shell_hit_result hover = shell_raycast_hit_test(sys, mc, cpt);
+			struct workspace_hit_result hover = workspace_raycast_hit_test(sys, mc, cpt);
 
 			// Track button hover for highlight rendering
 			mc->hover_btn = 0;
@@ -6047,7 +6047,7 @@ after_key_shortcuts:
 				POINT pt;
 				GetCursorPos(&pt);
 				ScreenToClient(mc->hwnd, &pt);
-				struct shell_hit_result hit = shell_raycast_hit_test(sys, mc, pt);
+				struct workspace_hit_result hit = workspace_raycast_hit_test(sys, mc, pt);
 				// Close/minimize/background/taskbar → normal handler
 				if (hit.slot < 0 || hit.in_close_btn || hit.in_minimize_btn || hit.in_maximize_btn) {
 					goto normal_lmb_handling;
@@ -6155,7 +6155,7 @@ after_key_shortcuts:
 			}
 
 			// Spatial raycast: cast ray from eye through cursor on display surface
-			struct shell_hit_result hit = shell_raycast_hit_test(sys, mc, pt);
+			struct workspace_hit_result hit = workspace_raycast_hit_test(sys, mc, pt);
 
 			// Edge/corner resize takes priority (unless clicking a title bar button)
 			if (hit.slot >= 0 && hit.edge_flags != RESIZE_NONE &&
@@ -6506,7 +6506,7 @@ after_key_shortcuts:
 				POINT pt;
 				GetCursorPos(&pt);
 				ScreenToClient(mc->hwnd, &pt);
-				struct shell_hit_result rmb_hit = shell_raycast_hit_test(sys, mc, pt);
+				struct workspace_hit_result rmb_hit = workspace_raycast_hit_test(sys, mc, pt);
 				if (rmb_hit.slot >= 0) {
 					if (rmb_hit.slot != mc->focused_slot) {
 						mc->focused_slot = rmb_hit.slot;
