@@ -8,6 +8,7 @@ Build apps for 3D displays using the OpenXR standard.
 - **[Building](getting-started/building.md)** — build instructions for Windows and macOS
 - **[App Classes](getting-started/app-classes.md)** — handle, texture, hosted, IPC — which one to use
 - **[Your First Handle App](getting-started/first-handle-app.md)** — tutorial walkthrough
+- **[Ship a Manifest](getting-started/ship-a-manifest.md)** — make your app discoverable on every workspace controller, OEM shell, and showcase in the ecosystem with a 30-second JSON file + optional 3D logo
 
 ### Extension Specs
 
