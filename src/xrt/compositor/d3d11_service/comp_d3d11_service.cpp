@@ -924,7 +924,7 @@ service_set_workspace_mode(struct d3d11_service_system *sys, bool active)
 {
 	sys->workspace_mode = active;
 	if (sys->multi_comp != nullptr && sys->multi_comp->window != nullptr) {
-		comp_d3d11_window_set_shell_mode_active(sys->multi_comp->window, active);
+		comp_d3d11_window_set_workspace_mode_active(sys->multi_comp->window, active);
 	}
 }
 
@@ -4318,7 +4318,7 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 	sys->compositor_hwnd = mc->hwnd;
 	// Seed the window's workspace-mode flag from current sys state (service_set_workspace_mode
 	// no-ops while multi_comp is null, so earlier activation hasn't reached the window).
-	comp_d3d11_window_set_shell_mode_active(mc->window, sys->workspace_mode);
+	comp_d3d11_window_set_workspace_mode_active(mc->window, sys->workspace_mode);
 
 	if (sys->xsysd != nullptr) {
 		comp_d3d11_window_set_system_devices(mc->window, sys->xsysd);
@@ -4559,7 +4559,7 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 
 			// Store DP on window for ESC/close 2D mode switch
 			if (mc->window != nullptr) {
-				comp_d3d11_window_set_shell_dp(mc->window, mc->display_processor);
+				comp_d3d11_window_set_workspace_dp(mc->window, mc->display_processor);
 			}
 
 			// Check if DP reports different dimensions than our window
@@ -4587,7 +4587,7 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 				}
 				mc->hwnd = (HWND)comp_d3d11_window_get_hwnd(mc->window);
 				sys->compositor_hwnd = mc->hwnd;
-				comp_d3d11_window_set_shell_mode_active(mc->window, sys->workspace_mode);
+				comp_d3d11_window_set_workspace_mode_active(mc->window, sys->workspace_mode);
 
 				if (sys->xsysd != nullptr) {
 					comp_d3d11_window_set_system_devices(mc->window, sys->xsysd);
@@ -11857,7 +11857,7 @@ comp_d3d11_service_ensure_workspace_window(struct xrt_system_compositor *xsysc)
 			if (dp_ret == XRT_SUCCESS && mc->display_processor != nullptr) {
 				U_LOG_W("Workspace resume: display processor recreated");
 				if (mc->window != nullptr) {
-					comp_d3d11_window_set_shell_dp(mc->window, mc->display_processor);
+					comp_d3d11_window_set_workspace_dp(mc->window, mc->display_processor);
 				}
 			} else {
 				U_LOG_E("Workspace resume: failed to recreate display processor");
