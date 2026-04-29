@@ -11626,16 +11626,16 @@ comp_d3d11_service_add_capture_client(struct xrt_system_compositor *xsysc,
 	// clients may arrive before any IPC client.
 	if (!sys->workspace_mode && sys->base.info.workspace_mode) {
 		service_set_workspace_mode(sys, true);
-		U_LOG_W("Shell mode activated for D3D11 service system (via capture client)");
+		U_LOG_W("Workspace mode activated for D3D11 service system (via capture client)");
 	}
 	if (!sys->workspace_mode) {
-		U_LOG_E("Shell: add_capture_client — shell mode not active");
+		U_LOG_E("Workspace: add_capture_client — workspace mode not active");
 		return -1;
 	}
 
 	HWND hwnd = (HWND)(uintptr_t)hwnd_value;
 	if (!IsWindow(hwnd)) {
-		U_LOG_E("Shell: add_capture_client — invalid HWND=0x%llx", (unsigned long long)hwnd_value);
+		U_LOG_E("Workspace: add_capture_client — invalid HWND=0x%llx", (unsigned long long)hwnd_value);
 		return -1;
 	}
 
