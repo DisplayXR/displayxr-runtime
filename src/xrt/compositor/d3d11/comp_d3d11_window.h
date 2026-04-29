@@ -216,7 +216,7 @@ comp_d3d11_window_set_input_forward(struct comp_d3d11_window *window,
  * (no focused app) would otherwise take the service down with its own window.
  */
 void
-comp_d3d11_window_set_shell_mode_active(struct comp_d3d11_window *window, bool active);
+comp_d3d11_window_set_workspace_mode_active(struct comp_d3d11_window *window, bool active);
 
 /*!
  * Tell the window layer whether any client is currently maximized/fullscreen.
@@ -287,7 +287,7 @@ comp_d3d11_window_set_cursor(struct comp_d3d11_window *window, int cursor_id);
  * @param dp     The shell's display processor (opaque pointer)
  */
 void
-comp_d3d11_window_set_shell_dp(struct comp_d3d11_window *window, void *dp);
+comp_d3d11_window_set_workspace_dp(struct comp_d3d11_window *window, void *dp);
 
 /*!
  * Consume pending input events from the WndProc ring buffer.

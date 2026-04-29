@@ -156,7 +156,7 @@ struct comp_d3d11_window
 	//! True while shell_mode is active on the service side. Gates ESC-closes-window
 	//! so an empty shell (no focused app → input_forward_hwnd == NULL) doesn't
 	//! PostMessage(WM_CLOSE) and take the service down with it.
-	volatile LONG shell_mode_active;
+	volatile LONG workspace_mode_active;
 
 	//! True while any shell window is maximized (fullscreen). Gates ESC suppression
 	//! so ESC only restores fullscreen and doesn't reach apps when not maximized.
@@ -194,7 +194,7 @@ struct comp_d3d11_window
 	bool mouse_press_in_content;
 
 	//! Shell display processor for ESC/close 2D mode switch (opaque, can be NULL).
-	volatile void *shell_dp;
+	volatile void *workspace_dp;
 
 	//! Ring buffer for capture client input events (WndProc writes, render thread reads).
 	//! Lock-free SPSC: WndProc is the single producer, render loop is the single consumer.
@@ -414,7 +414,7 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		// This runs on the window thread and works even with no active clients.
 		{
 			void *dp = (void *)InterlockedCompareExchangePointer(
-			    (volatile PVOID *)&w->shell_dp, NULL, NULL);
+			    (volatile PVOID *)&w->workspace_dp, NULL, NULL);
 			if (dp != NULL) {
 				struct xrt_display_processor_d3d11 *xdp =
 				    (struct xrt_display_processor_d3d11 *)dp;
@@ -550,7 +550,7 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 			// Shell mode with no focused app: input_forward_hwnd is NULL so we
 			// fall into this block, but closing the window kills the service.
 			// Swallow the key instead; user can press Ctrl+Space to dismiss.
-			if (InterlockedCompareExchange(&w->shell_mode_active, 0, 0)) {
+			if (InterlockedCompareExchange(&w->workspace_mode_active, 0, 0)) {
 				return 0;
 			}
 			U_LOG_W("D3D11 window: ESC pressed — closing (non-shell mode)");
@@ -1248,12 +1248,12 @@ comp_d3d11_window_set_input_forward(struct comp_d3d11_window *window,
 }
 
 void
-comp_d3d11_window_set_shell_mode_active(struct comp_d3d11_window *window, bool active)
+comp_d3d11_window_set_workspace_mode_active(struct comp_d3d11_window *window, bool active)
 {
 	if (window == NULL) {
 		return;
 	}
-	InterlockedExchange(&window->shell_mode_active, active ? 1 : 0);
+	InterlockedExchange(&window->workspace_mode_active, active ? 1 : 0);
 }
 
 void
@@ -1351,12 +1351,12 @@ comp_d3d11_window_set_cursor(struct comp_d3d11_window *window, int cursor_id)
 }
 
 extern "C" void
-comp_d3d11_window_set_shell_dp(struct comp_d3d11_window *window, void *dp)
+comp_d3d11_window_set_workspace_dp(struct comp_d3d11_window *window, void *dp)
 {
 	if (window == NULL) {
 		return;
 	}
-	InterlockedExchangePointer((volatile PVOID *)&window->shell_dp, (PVOID)dp);
+	InterlockedExchangePointer((volatile PVOID *)&window->workspace_dp, (PVOID)dp);
 }
 
 extern "C" uint32_t
