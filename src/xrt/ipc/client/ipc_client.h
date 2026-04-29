@@ -145,3 +145,29 @@ struct xrt_window_metrics;
 
 bool
 comp_ipc_client_compositor_get_window_metrics(struct xrt_compositor *xc, struct xrt_window_metrics *out_metrics);
+
+/*!
+ * Workspace controller bridges (XR_EXT_spatial_workspace).
+ *
+ * Thin accessors used by the OpenXR state tracker to dispatch workspace
+ * extension calls over IPC. Each extracts the underlying ipc_connection from
+ * the compositor and calls the matching generated RPC. Same gating contract
+ * as comp_ipc_client_compositor_get_window_metrics — only valid when `xc` is
+ * an ipc_client_compositor.
+ */
+xrt_result_t
+comp_ipc_client_compositor_workspace_activate(struct xrt_compositor *xc);
+
+xrt_result_t
+comp_ipc_client_compositor_workspace_deactivate(struct xrt_compositor *xc);
+
+xrt_result_t
+comp_ipc_client_compositor_workspace_get_state(struct xrt_compositor *xc, bool *out_active);
+
+xrt_result_t
+comp_ipc_client_compositor_workspace_add_capture_client(struct xrt_compositor *xc,
+                                                        uint64_t hwnd,
+                                                        uint32_t *out_client_id);
+
+xrt_result_t
+comp_ipc_client_compositor_workspace_remove_capture_client(struct xrt_compositor *xc, uint32_t client_id);

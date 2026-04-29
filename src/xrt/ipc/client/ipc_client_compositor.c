@@ -199,6 +199,83 @@ comp_ipc_client_compositor_get_window_metrics(struct xrt_compositor *xc, struct 
 	return out_metrics->valid;
 }
 
+/*
+ * Workspace controller bridges — thin accessors used by the OpenXR state
+ * tracker's XR_EXT_spatial_workspace implementation. The state tracker does
+ * not pull ipc_client headers; it forward-declares these wrappers and the
+ * runtime DLL resolves the symbols at link time. Each one extracts the
+ * underlying ipc_connection and dispatches the matching generated RPC.
+ *
+ * Caller is responsible for only invoking these on an ipc_client_compositor
+ * (same gate as comp_ipc_client_compositor_get_window_metrics).
+ */
+xrt_result_t
+comp_ipc_client_compositor_workspace_activate(struct xrt_compositor *xc)
+{
+	if (xc == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_call_workspace_activate(icc->ipc_c);
+}
+
+xrt_result_t
+comp_ipc_client_compositor_workspace_deactivate(struct xrt_compositor *xc)
+{
+	if (xc == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_call_workspace_deactivate(icc->ipc_c);
+}
+
+xrt_result_t
+comp_ipc_client_compositor_workspace_get_state(struct xrt_compositor *xc, bool *out_active)
+{
+	if (xc == NULL || out_active == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_call_workspace_get_state(icc->ipc_c, out_active);
+}
+
+xrt_result_t
+comp_ipc_client_compositor_workspace_add_capture_client(struct xrt_compositor *xc,
+                                                        uint64_t hwnd,
+                                                        uint32_t *out_client_id)
+{
+	if (xc == NULL || out_client_id == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_call_workspace_add_capture_client(icc->ipc_c, hwnd, out_client_id);
+}
+
+xrt_result_t
+comp_ipc_client_compositor_workspace_remove_capture_client(struct xrt_compositor *xc, uint32_t client_id)
+{
+	if (xc == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_call_workspace_remove_capture_client(icc->ipc_c, client_id);
+}
+
 
 /*
  *
