@@ -11671,6 +11671,58 @@ comp_d3d11_service_remove_capture_client(struct xrt_system_compositor *xsysc,
 	return multi_compositor_remove_capture_client(sys, slot_index);
 }
 
+extern "C" bool
+comp_d3d11_service_workspace_hit_test(struct xrt_system_compositor *xsysc,
+                                       int32_t cursor_x,
+                                       int32_t cursor_y,
+                                       uint32_t *out_client_id,
+                                       float *out_local_u,
+                                       float *out_local_v)
+{
+	if (xsysc == nullptr || out_client_id == nullptr || out_local_u == nullptr ||
+	    out_local_v == nullptr) {
+		return false;
+	}
+	*out_client_id = 0;
+	*out_local_u = 0.0f;
+	*out_local_v = 0.0f;
+
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	if (!sys->workspace_mode || mc == nullptr) {
+		// Workspace not active — return success with miss output.
+		return true;
+	}
+
+	POINT pt = {(LONG)cursor_x, (LONG)cursor_y};
+	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+
+	struct workspace_hit_result hit = workspace_raycast_hit_test(sys, mc, pt);
+	if (hit.slot < 0 || !hit.in_content) {
+		// Miss, or hit landed in chrome / edge-resize zone — public surface
+		// reports as miss until Phase 2.C migrates chrome rendering and
+		// the controller takes over those interactions explicitly.
+		return true;
+	}
+
+	// Slot index is the workspace's view of the client. Capture clients
+	// already use slot+1000 in xrAddWorkspaceCaptureClientEXT; reuse the
+	// same scheme uniformly so XrWorkspaceClientId values are consistent
+	// regardless of client type.
+	*out_client_id = 1000u + (uint32_t)hit.slot;
+
+	float win_w = mc->clients[hit.slot].window_width_m;
+	float win_h = mc->clients[hit.slot].window_height_m;
+	if (win_w > 0.0f) {
+		*out_local_u = hit.local_x_m / win_w;
+	}
+	if (win_h > 0.0f) {
+		*out_local_v = hit.local_y_m / win_h;
+	}
+
+	return true;
+}
+
 bool
 comp_d3d11_service_set_capture_client_window_pose(struct xrt_system_compositor *xsysc,
                                                     int slot_index,
