@@ -3,11 +3,13 @@
 //
 // workspace_minimal_d3d11_win
 //
-// Minimal validation client for XR_EXT_spatial_workspace (Phase 2.A) and
-// XR_EXT_app_launcher (Phase 2.B). Creates an instance + session, resolves
-// all ten extension PFNs, and walks through:
+// Minimal validation client for XR_EXT_spatial_workspace (Phase 2.A + 2.C)
+// and XR_EXT_app_launcher (Phase 2.B). Creates an instance + session,
+// resolves all thirteen extension PFNs, and walks through:
 //   activate -> get-state ->
-//     add/remove capture client ->
+//     add capture client ->
+//     set/get/set client window pose + visibility ->
+//     remove capture client ->
 //     clear / add / set-visible / set-running-mask / poll / hide launcher ->
 //   deactivate.
 //
@@ -133,6 +135,9 @@ run_workspace_test()
 	PFN_xrSetLauncherVisibleEXT pfnSetLauncherVisible = nullptr;
 	PFN_xrPollLauncherClickEXT pfnPollLauncherClick = nullptr;
 	PFN_xrSetLauncherRunningTileMaskEXT pfnSetRunningTileMask = nullptr;
+	PFN_xrSetWorkspaceClientWindowPoseEXT pfnSetClientPose = nullptr;
+	PFN_xrGetWorkspaceClientWindowPoseEXT pfnGetClientPose = nullptr;
+	PFN_xrSetWorkspaceClientVisibilityEXT pfnSetClientVisibility = nullptr;
 
 	struct PfnLookup {
 		const char *name;
@@ -150,6 +155,10 @@ run_workspace_test()
 	    {"xrPollLauncherClickEXT", reinterpret_cast<PFN_xrVoidFunction *>(&pfnPollLauncherClick)},
 	    {"xrSetLauncherRunningTileMaskEXT",
 	     reinterpret_cast<PFN_xrVoidFunction *>(&pfnSetRunningTileMask)},
+	    {"xrSetWorkspaceClientWindowPoseEXT", reinterpret_cast<PFN_xrVoidFunction *>(&pfnSetClientPose)},
+	    {"xrGetWorkspaceClientWindowPoseEXT", reinterpret_cast<PFN_xrVoidFunction *>(&pfnGetClientPose)},
+	    {"xrSetWorkspaceClientVisibilityEXT",
+	     reinterpret_cast<PFN_xrVoidFunction *>(&pfnSetClientVisibility)},
 	};
 	for (const auto &l : lookups) {
 		PFN_xrVoidFunction fn = nullptr;
@@ -261,6 +270,34 @@ run_workspace_test()
 		return XR_ERROR_RUNTIME_FAILURE;
 	}
 	std::printf("INFO: added capture client id=%u\n", (unsigned)clientId);
+
+	// Window pose + visibility smoke (Phase 2.C). Whether the captured
+	// HWND is treated as a positionable workspace client is a runtime
+	// decision; we expect either XR_SUCCESS or a documented error code
+	// (typically XR_ERROR_VALIDATION_FAILURE if the slot isn't mapped to
+	// a positionable client). Either response proves the dispatch path
+	// reaches the IPC layer end-to-end.
+	{
+		XrPosef testPose = {};
+		testPose.orientation.w = 1.0f; // identity
+		testPose.position.z = 0.5f;     // 0.5m in front of display center
+		XrResult sr = pfnSetClientPose(session, clientId, &testPose, 0.20f, 0.15f);
+		std::printf("[xrSetWorkspaceClientWindowPoseEXT          ] %s\n", xr_result_str(sr));
+
+		XrPosef readback = {};
+		float w = 0.0f, h = 0.0f;
+		XrResult gr = pfnGetClientPose(session, clientId, &readback, &w, &h);
+		std::printf("[xrGetWorkspaceClientWindowPoseEXT          ] %s\n", xr_result_str(gr));
+		if (gr == XR_SUCCESS) {
+			std::printf("INFO: readback pos=(%.3f,%.3f,%.3f) size=%.3fx%.3f\n", readback.position.x,
+			            readback.position.y, readback.position.z, w, h);
+		}
+
+		XrResult vr = pfnSetClientVisibility(session, clientId, XR_FALSE);
+		std::printf("[xrSetWorkspaceClientVisibilityEXT(FALSE)   ] %s\n", xr_result_str(vr));
+		vr = pfnSetClientVisibility(session, clientId, XR_TRUE);
+		std::printf("[xrSetWorkspaceClientVisibilityEXT(TRUE)    ] %s\n", xr_result_str(vr));
+	}
 
 	CHECK_XR(pfnRemoveCapture(session, clientId), "xrRemoveWorkspaceCaptureClientEXT");
 
