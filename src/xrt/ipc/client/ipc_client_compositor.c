@@ -493,6 +493,69 @@ comp_ipc_client_compositor_workspace_pointer_capture_set(struct xrt_compositor *
 	return ipc_call_workspace_pointer_capture_set(icc->ipc_c, enabled, button);
 }
 
+xrt_result_t
+comp_ipc_client_compositor_workspace_capture_frame(struct xrt_compositor *xc,
+                                                   const char *path_prefix,
+                                                   uint32_t flags,
+                                                   uint64_t *out_timestamp_ns,
+                                                   uint32_t *out_atlas_w,
+                                                   uint32_t *out_atlas_h,
+                                                   uint32_t *out_eye_w,
+                                                   uint32_t *out_eye_h,
+                                                   uint32_t *out_views_written,
+                                                   uint32_t *out_tile_columns,
+                                                   uint32_t *out_tile_rows,
+                                                   float *out_display_w_m,
+                                                   float *out_display_h_m,
+                                                   float out_eye_left_m[3],
+                                                   float out_eye_right_m[3])
+{
+	if (xc == NULL || path_prefix == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	struct ipc_capture_request req = {0};
+	size_t plen = strlen(path_prefix);
+	if (plen >= sizeof(req.path_prefix)) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	memcpy(req.path_prefix, path_prefix, plen);
+	req.path_prefix[plen] = '\0';
+	req.flags = flags;
+
+	struct ipc_capture_result result = {0};
+	xrt_result_t xret = ipc_call_workspace_capture_frame(icc->ipc_c, &req, &result);
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+
+	if (out_timestamp_ns)   *out_timestamp_ns   = result.timestamp_ns;
+	if (out_atlas_w)        *out_atlas_w        = result.atlas_width;
+	if (out_atlas_h)        *out_atlas_h        = result.atlas_height;
+	if (out_eye_w)          *out_eye_w          = result.eye_width;
+	if (out_eye_h)          *out_eye_h          = result.eye_height;
+	if (out_views_written)  *out_views_written  = result.views_written;
+	if (out_tile_columns)   *out_tile_columns   = result.tile_columns;
+	if (out_tile_rows)      *out_tile_rows      = result.tile_rows;
+	if (out_display_w_m)    *out_display_w_m    = result.display_width_m;
+	if (out_display_h_m)    *out_display_h_m    = result.display_height_m;
+	if (out_eye_left_m) {
+		out_eye_left_m[0] = result.eye_left_m[0];
+		out_eye_left_m[1] = result.eye_left_m[1];
+		out_eye_left_m[2] = result.eye_left_m[2];
+	}
+	if (out_eye_right_m) {
+		out_eye_right_m[0] = result.eye_right_m[0];
+		out_eye_right_m[1] = result.eye_right_m[1];
+		out_eye_right_m[2] = result.eye_right_m[2];
+	}
+	return XRT_SUCCESS;
+}
+
 /*
  * Launcher bridges (XR_EXT_app_launcher).
  *

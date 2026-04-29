@@ -855,6 +855,11 @@ oxr_xrEnableWorkspacePointerCaptureEXT(XrSession session, uint32_t button);
 //! OpenXR API function @ep{xrDisableWorkspacePointerCaptureEXT}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrDisableWorkspacePointerCaptureEXT(XrSession session);
+//! OpenXR API function @ep{xrCaptureWorkspaceFrameEXT}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrCaptureWorkspaceFrameEXT(XrSession session,
+                               const XrWorkspaceCaptureRequestEXT *request,
+                               XrWorkspaceCaptureResultEXT *result);
 #endif
 
 #ifdef OXR_HAVE_EXT_app_launcher

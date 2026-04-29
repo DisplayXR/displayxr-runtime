@@ -231,6 +231,31 @@ comp_ipc_client_compositor_workspace_pointer_capture_set(struct xrt_compositor *
                                                          uint32_t button);
 
 /*!
+ * Phase 2.I-prequel: capture the workspace composite frame to disk.
+ *
+ * Bridge accepts raw fields (matching the wire-format struct ipc_capture_request
+ * input + ipc_capture_result output) so st_oxr does not see IPC types. The state
+ * tracker translates between public XrWorkspaceCaptureRequestEXT/ResultEXT and
+ * these primitives.
+ */
+xrt_result_t
+comp_ipc_client_compositor_workspace_capture_frame(struct xrt_compositor *xc,
+                                                   const char *path_prefix,
+                                                   uint32_t flags,
+                                                   uint64_t *out_timestamp_ns,
+                                                   uint32_t *out_atlas_w,
+                                                   uint32_t *out_atlas_h,
+                                                   uint32_t *out_eye_w,
+                                                   uint32_t *out_eye_h,
+                                                   uint32_t *out_views_written,
+                                                   uint32_t *out_tile_columns,
+                                                   uint32_t *out_tile_rows,
+                                                   float *out_display_w_m,
+                                                   float *out_display_h_m,
+                                                   float out_eye_left_m[3],
+                                                   float out_eye_right_m[3]);
+
+/*!
  * Launcher bridges (XR_EXT_app_launcher).
  *
  * Same gating contract as the workspace_* family — only valid when `xc` is

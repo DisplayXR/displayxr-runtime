@@ -89,6 +89,22 @@ xrt_result_t
 comp_ipc_client_compositor_workspace_pointer_capture_set(struct xrt_compositor *xc,
                                                          bool enabled,
                                                          uint32_t button);
+xrt_result_t
+comp_ipc_client_compositor_workspace_capture_frame(struct xrt_compositor *xc,
+                                                   const char *path_prefix,
+                                                   uint32_t flags,
+                                                   uint64_t *out_timestamp_ns,
+                                                   uint32_t *out_atlas_w,
+                                                   uint32_t *out_atlas_h,
+                                                   uint32_t *out_eye_w,
+                                                   uint32_t *out_eye_h,
+                                                   uint32_t *out_views_written,
+                                                   uint32_t *out_tile_columns,
+                                                   uint32_t *out_tile_rows,
+                                                   float *out_display_w_m,
+                                                   float *out_display_h_m,
+                                                   float out_eye_left_m[3],
+                                                   float out_eye_right_m[3]);
 
 
 /*
@@ -592,6 +608,69 @@ oxr_xrDisableWorkspacePointerCaptureEXT(XrSession session)
 
 	xrt_result_t xret = comp_ipc_client_compositor_workspace_pointer_capture_set(&sess->xcn->base, false, 0);
 	return xret_to_xr_result(&log, xret, "workspace_pointer_capture_set(disabled)");
+}
+
+
+/*
+ * Frame capture (spec_version 5)
+ */
+
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrCaptureWorkspaceFrameEXT(XrSession session,
+                               const XrWorkspaceCaptureRequestEXT *request,
+                               XrWorkspaceCaptureResultEXT *result)
+{
+	OXR_TRACE_MARKER();
+
+	struct oxr_session *sess = NULL;
+	struct oxr_logger log;
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrCaptureWorkspaceFrameEXT");
+	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+	OXR_VERIFY_ARG_NOT_NULL(&log, request);
+	OXR_VERIFY_ARG_NOT_NULL(&log, result);
+
+	if (request->type != XR_TYPE_WORKSPACE_CAPTURE_REQUEST_EXT) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+		                 "xrCaptureWorkspaceFrameEXT: request->type must be "
+		                 "XR_TYPE_WORKSPACE_CAPTURE_REQUEST_EXT");
+	}
+
+	if (!session_is_ipc_client(sess)) {
+		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
+		                 "xrCaptureWorkspaceFrameEXT requires an IPC-mode session");
+	}
+
+	uint64_t ts_ns = 0;
+	uint32_t aw = 0, ah = 0, ew = 0, eh = 0, vw = 0, tc = 0, tr = 0;
+	float dw_m = 0.0f, dh_m = 0.0f;
+	float eye_l[3] = {0}, eye_r[3] = {0};
+	xrt_result_t xret = comp_ipc_client_compositor_workspace_capture_frame(
+	    &sess->xcn->base, request->pathPrefix, (uint32_t)request->flags, &ts_ns, &aw, &ah, &ew, &eh, &vw,
+	    &tc, &tr, &dw_m, &dh_m, eye_l, eye_r);
+	if (xret != XRT_SUCCESS) {
+		return xret_to_xr_result(&log, xret, "workspace_capture_frame");
+	}
+
+	result->type = XR_TYPE_WORKSPACE_CAPTURE_RESULT_EXT;
+	result->next = NULL;
+	result->timestampNs = ts_ns;
+	result->atlasWidth = aw;
+	result->atlasHeight = ah;
+	result->eyeWidth = ew;
+	result->eyeHeight = eh;
+	result->viewsWritten = (XrWorkspaceCaptureFlagsEXT)vw;
+	result->tileColumns = tc;
+	result->tileRows = tr;
+	result->displayWidthM = dw_m;
+	result->displayHeightM = dh_m;
+	result->eyeLeftM[0] = eye_l[0];
+	result->eyeLeftM[1] = eye_l[1];
+	result->eyeLeftM[2] = eye_l[2];
+	result->eyeRightM[0] = eye_r[0];
+	result->eyeRightM[1] = eye_r[1];
+	result->eyeRightM[2] = eye_r[2];
+	return XR_SUCCESS;
 }
 
 #endif // OXR_HAVE_EXT_spatial_workspace
