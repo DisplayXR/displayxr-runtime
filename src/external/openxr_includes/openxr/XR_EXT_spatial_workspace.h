@@ -25,7 +25,7 @@ extern "C" {
 #endif
 
 #define XR_EXT_spatial_workspace 1
-#define XR_EXT_spatial_workspace_SPEC_VERSION 2
+#define XR_EXT_spatial_workspace_SPEC_VERSION 3
 #define XR_EXT_SPATIAL_WORKSPACE_EXTENSION_NAME "XR_EXT_spatial_workspace"
 
 // Provisional XrStructureType values. The 1000999100..104 range is reserved for
@@ -179,6 +179,36 @@ typedef XrResult (XRAPI_PTR *PFN_xrSetWorkspaceClientVisibilityEXT)(
     XrWorkspaceClientId  clientId,
     XrBool32             visible);
 
+// ---- Hit-test (spec_version 3) ----
+
+/*!
+ * @brief Spatial raycast hit-test against workspace windows.
+ *
+ * Translates a screen-space cursor (display pixels, origin top-left) to a
+ * client window content hit. The runtime intersects an eye→cursor ray
+ * with each workspace client's window quad; the closest content hit
+ * (excluding chrome and edge-resize zones — those stay runtime-policy
+ * until Phase 2.C migrates chrome) wins.
+ *
+ * @param session      A valid workspace session.
+ * @param cursorX      Cursor X in display pixels (origin top-left).
+ * @param cursorY      Cursor Y in display pixels.
+ * @param outClientId  Output: clientId of the hit window, or
+ *                     XR_NULL_WORKSPACE_CLIENT_ID for miss / chrome hit.
+ * @param outLocalUV   Output: U,V on the window quad in [0,1] range, origin
+ *                     top-left. Both 0,0 on miss.
+ *
+ * The workspace controller calls this from its input handler, then decides
+ * what the hit means (focus, drag, right-click forward, etc.). The runtime
+ * does NOT classify hits — that is policy.
+ */
+typedef XrResult (XRAPI_PTR *PFN_xrWorkspaceHitTestEXT)(
+    XrSession            session,
+    int32_t              cursorX,
+    int32_t              cursorY,
+    XrWorkspaceClientId *outClientId,
+    XrVector2f          *outLocalUV);
+
 #ifndef XR_NO_PROTOTYPES
 XRAPI_ATTR XrResult XRAPI_CALL xrActivateSpatialWorkspaceEXT(
     XrSession session);
@@ -218,6 +248,13 @@ XRAPI_ATTR XrResult XRAPI_CALL xrSetWorkspaceClientVisibilityEXT(
     XrSession            session,
     XrWorkspaceClientId  clientId,
     XrBool32             visible);
+
+XRAPI_ATTR XrResult XRAPI_CALL xrWorkspaceHitTestEXT(
+    XrSession            session,
+    int32_t              cursorX,
+    int32_t              cursorY,
+    XrWorkspaceClientId *outClientId,
+    XrVector2f          *outLocalUV);
 #endif
 
 #ifdef __cplusplus
