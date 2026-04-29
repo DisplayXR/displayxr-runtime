@@ -860,6 +860,17 @@ XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrCaptureWorkspaceFrameEXT(XrSession session,
                                const XrWorkspaceCaptureRequestEXT *request,
                                XrWorkspaceCaptureResultEXT *result);
+//! OpenXR API function @ep{xrEnumerateWorkspaceClientsEXT}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrEnumerateWorkspaceClientsEXT(XrSession session,
+                                   uint32_t capacityInput,
+                                   uint32_t *countOutput,
+                                   XrWorkspaceClientId *clientIds);
+//! OpenXR API function @ep{xrGetWorkspaceClientInfoEXT}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrGetWorkspaceClientInfoEXT(XrSession session,
+                                XrWorkspaceClientId clientId,
+                                XrWorkspaceClientInfoEXT *info);
 #endif
 
 #ifdef OXR_HAVE_EXT_app_launcher

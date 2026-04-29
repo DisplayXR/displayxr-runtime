@@ -256,6 +256,31 @@ comp_ipc_client_compositor_workspace_capture_frame(struct xrt_compositor *xc,
                                                    float out_eye_right_m[3]);
 
 /*!
+ * Phase 2.I-prequel: workspace client enumeration. Bridge accepts a primitive
+ * id array so st_oxr does not include IPC types.
+ */
+xrt_result_t
+comp_ipc_client_compositor_workspace_enumerate_clients(struct xrt_compositor *xc,
+                                                       uint32_t capacity,
+                                                       uint32_t *out_count,
+                                                       uint32_t *out_ids);
+
+/*!
+ * Phase 2.I-prequel: per-client metadata. Bridge unpacks struct ipc_app_state
+ * into raw out-params so st_oxr stays free of IPC types. The state tracker
+ * projects these into XrWorkspaceClientInfoEXT.
+ */
+xrt_result_t
+comp_ipc_client_compositor_workspace_get_client_info(struct xrt_compositor *xc,
+                                                     uint32_t client_id,
+                                                     char *out_name,
+                                                     size_t name_capacity,
+                                                     uint64_t *out_pid,
+                                                     uint32_t *out_z_order,
+                                                     bool *out_is_focused,
+                                                     bool *out_is_visible);
+
+/*!
  * Launcher bridges (XR_EXT_app_launcher).
  *
  * Same gating contract as the workspace_* family — only valid when `xc` is

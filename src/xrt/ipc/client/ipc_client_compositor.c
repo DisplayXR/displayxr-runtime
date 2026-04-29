@@ -556,6 +556,81 @@ comp_ipc_client_compositor_workspace_capture_frame(struct xrt_compositor *xc,
 	return XRT_SUCCESS;
 }
 
+xrt_result_t
+comp_ipc_client_compositor_workspace_enumerate_clients(struct xrt_compositor *xc,
+                                                       uint32_t capacity,
+                                                       uint32_t *out_count,
+                                                       uint32_t *out_ids)
+{
+	if (xc == NULL || out_count == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	*out_count = 0;
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	struct ipc_client_list list = {0};
+	xrt_result_t xret = ipc_call_workspace_enumerate_clients(icc->ipc_c, &list);
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+
+	uint32_t copy = list.id_count;
+	if (out_ids != NULL && capacity > 0) {
+		if (copy > capacity) {
+			copy = capacity;
+		}
+		for (uint32_t i = 0; i < copy; i++) {
+			out_ids[i] = list.ids[i];
+		}
+	} else {
+		copy = 0;
+	}
+	*out_count = (out_ids == NULL || capacity == 0) ? list.id_count : copy;
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+comp_ipc_client_compositor_workspace_get_client_info(struct xrt_compositor *xc,
+                                                     uint32_t client_id,
+                                                     char *out_name,
+                                                     size_t name_capacity,
+                                                     uint64_t *out_pid,
+                                                     uint32_t *out_z_order,
+                                                     bool *out_is_focused,
+                                                     bool *out_is_visible)
+{
+	if (xc == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	struct ipc_app_state state = {0};
+	xrt_result_t xret = ipc_call_workspace_get_client_info(icc->ipc_c, client_id, &state);
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+
+	if (out_name != NULL && name_capacity > 0) {
+		size_t copy = name_capacity - 1;
+		if (copy > sizeof(state.info.application_name) - 1) {
+			copy = sizeof(state.info.application_name) - 1;
+		}
+		memcpy(out_name, state.info.application_name, copy);
+		out_name[copy] = '\0';
+	}
+	if (out_pid)        *out_pid        = (uint64_t)state.pid;
+	if (out_z_order)    *out_z_order    = state.z_order;
+	if (out_is_focused) *out_is_focused = state.session_focused;
+	if (out_is_visible) *out_is_visible = state.session_visible;
+	return XRT_SUCCESS;
+}
+
 /*
  * Launcher bridges (XR_EXT_app_launcher).
  *

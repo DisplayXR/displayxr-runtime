@@ -105,6 +105,20 @@ comp_ipc_client_compositor_workspace_capture_frame(struct xrt_compositor *xc,
                                                    float *out_display_h_m,
                                                    float out_eye_left_m[3],
                                                    float out_eye_right_m[3]);
+xrt_result_t
+comp_ipc_client_compositor_workspace_enumerate_clients(struct xrt_compositor *xc,
+                                                       uint32_t capacity,
+                                                       uint32_t *out_count,
+                                                       uint32_t *out_ids);
+xrt_result_t
+comp_ipc_client_compositor_workspace_get_client_info(struct xrt_compositor *xc,
+                                                     uint32_t client_id,
+                                                     char *out_name,
+                                                     size_t name_capacity,
+                                                     uint64_t *out_pid,
+                                                     uint32_t *out_z_order,
+                                                     bool *out_is_focused,
+                                                     bool *out_is_visible);
 
 
 /*
@@ -670,6 +684,104 @@ oxr_xrCaptureWorkspaceFrameEXT(XrSession session,
 	result->eyeRightM[0] = eye_r[0];
 	result->eyeRightM[1] = eye_r[1];
 	result->eyeRightM[2] = eye_r[2];
+	return XR_SUCCESS;
+}
+
+
+/*
+ * Client enumeration (spec_version 5)
+ */
+
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrEnumerateWorkspaceClientsEXT(XrSession session,
+                                   uint32_t capacityInput,
+                                   uint32_t *countOutput,
+                                   XrWorkspaceClientId *clientIds)
+{
+	OXR_TRACE_MARKER();
+
+	struct oxr_session *sess = NULL;
+	struct oxr_logger log;
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrEnumerateWorkspaceClientsEXT");
+	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+	OXR_VERIFY_ARG_NOT_NULL(&log, countOutput);
+
+	if (capacityInput > 0 && clientIds == NULL) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+		                 "xrEnumerateWorkspaceClientsEXT: clientIds must not be NULL when capacityInput > 0");
+	}
+
+	if (!session_is_ipc_client(sess)) {
+		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
+		                 "xrEnumerateWorkspaceClientsEXT requires an IPC-mode session");
+	}
+
+	uint32_t count = 0;
+	// XrWorkspaceClientId == uint32_t — pass clientIds buffer through directly.
+	xrt_result_t xret = comp_ipc_client_compositor_workspace_enumerate_clients(
+	    &sess->xcn->base, capacityInput, &count, (uint32_t *)clientIds);
+	if (xret != XRT_SUCCESS) {
+		return xret_to_xr_result(&log, xret, "workspace_enumerate_clients");
+	}
+	*countOutput = count;
+	return XR_SUCCESS;
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrGetWorkspaceClientInfoEXT(XrSession session,
+                                XrWorkspaceClientId clientId,
+                                XrWorkspaceClientInfoEXT *info)
+{
+	OXR_TRACE_MARKER();
+
+	struct oxr_session *sess = NULL;
+	struct oxr_logger log;
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrGetWorkspaceClientInfoEXT");
+	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+	OXR_VERIFY_ARG_NOT_NULL(&log, info);
+
+	if (info->type != XR_TYPE_WORKSPACE_CLIENT_INFO_EXT) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+		                 "xrGetWorkspaceClientInfoEXT: info->type must be "
+		                 "XR_TYPE_WORKSPACE_CLIENT_INFO_EXT");
+	}
+
+	if (clientId == XR_NULL_WORKSPACE_CLIENT_ID) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+		                 "xrGetWorkspaceClientInfoEXT: clientId must not be XR_NULL_WORKSPACE_CLIENT_ID");
+	}
+
+	if (!session_is_ipc_client(sess)) {
+		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
+		                 "xrGetWorkspaceClientInfoEXT requires an IPC-mode session");
+	}
+
+	uint64_t pid = 0;
+	uint32_t z_order = 0;
+	bool is_focused = false;
+	bool is_visible = false;
+	char name[XR_MAX_APPLICATION_NAME_SIZE] = {0};
+	xrt_result_t xret = comp_ipc_client_compositor_workspace_get_client_info(
+	    &sess->xcn->base, (uint32_t)clientId, name, sizeof(name), &pid, &z_order, &is_focused, &is_visible);
+	if (xret != XRT_SUCCESS) {
+		return xret_to_xr_result(&log, xret, "workspace_get_client_info");
+	}
+
+	info->clientId = clientId;
+	// Capture-client ids (slot+1000) and OpenXR-client ids share the same
+	// numbering space but are issued by different code paths. Enumerate
+	// only returns OpenXR clients today, so we report OPENXR_3D here. A
+	// future workspace_get_client_info that also resolves capture-client
+	// ids would distinguish via the slot+1000 range.
+	info->clientType = XR_WORKSPACE_CLIENT_TYPE_OPENXR_3D_EXT;
+	memcpy(info->name, name, sizeof(info->name));
+	info->name[sizeof(info->name) - 1] = '\0';
+	info->pid = pid;
+	info->isFocused = is_focused ? XR_TRUE : XR_FALSE;
+	info->isVisible = is_visible ? XR_TRUE : XR_FALSE;
+	info->zOrder = z_order;
 	return XR_SUCCESS;
 }
 
