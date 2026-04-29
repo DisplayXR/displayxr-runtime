@@ -3,12 +3,13 @@
 //
 // workspace_minimal_d3d11_win
 //
-// Minimal validation client for XR_EXT_spatial_workspace (Phase 2.A + 2.C)
-// and XR_EXT_app_launcher (Phase 2.B). Creates an instance + session,
-// resolves all thirteen extension PFNs, and walks through:
+// Minimal validation client for XR_EXT_spatial_workspace (Phase 2.A + 2.C
+// + 2.F) and XR_EXT_app_launcher (Phase 2.B). Creates an instance +
+// session, resolves all fourteen extension PFNs, and walks through:
 //   activate -> get-state ->
 //     add capture client ->
 //     set/get/set client window pose + visibility ->
+//     hit-test (center + off-screen) ->
 //     remove capture client ->
 //     clear / add / set-visible / set-running-mask / poll / hide launcher ->
 //   deactivate.
@@ -138,6 +139,7 @@ run_workspace_test()
 	PFN_xrSetWorkspaceClientWindowPoseEXT pfnSetClientPose = nullptr;
 	PFN_xrGetWorkspaceClientWindowPoseEXT pfnGetClientPose = nullptr;
 	PFN_xrSetWorkspaceClientVisibilityEXT pfnSetClientVisibility = nullptr;
+	PFN_xrWorkspaceHitTestEXT pfnHitTest = nullptr;
 
 	struct PfnLookup {
 		const char *name;
@@ -159,6 +161,7 @@ run_workspace_test()
 	    {"xrGetWorkspaceClientWindowPoseEXT", reinterpret_cast<PFN_xrVoidFunction *>(&pfnGetClientPose)},
 	    {"xrSetWorkspaceClientVisibilityEXT",
 	     reinterpret_cast<PFN_xrVoidFunction *>(&pfnSetClientVisibility)},
+	    {"xrWorkspaceHitTestEXT", reinterpret_cast<PFN_xrVoidFunction *>(&pfnHitTest)},
 	};
 	for (const auto &l : lookups) {
 		PFN_xrVoidFunction fn = nullptr;
@@ -297,6 +300,27 @@ run_workspace_test()
 		std::printf("[xrSetWorkspaceClientVisibilityEXT(FALSE)   ] %s\n", xr_result_str(vr));
 		vr = pfnSetClientVisibility(session, clientId, XR_TRUE);
 		std::printf("[xrSetWorkspaceClientVisibilityEXT(TRUE)    ] %s\n", xr_result_str(vr));
+
+		// Hit-test smoke (Phase 2.F): probe two cursor positions — one
+		// near display center (likely to hit a window if any are positioned
+		// there) and one far off-screen (guaranteed miss). Whether the
+		// near-center probe lands a hit depends on runtime layout state;
+		// either response proves dispatch reached the IPC layer.
+		XrWorkspaceClientId hitId = XR_NULL_WORKSPACE_CLIENT_ID;
+		XrVector2f hitUV = {};
+		XrResult hr = pfnHitTest(session, 1920, 1080, &hitId, &hitUV);
+		std::printf("[xrWorkspaceHitTestEXT(1920,1080)           ] %s clientId=%u uv=(%.3f,%.3f)\n",
+		            xr_result_str(hr), (unsigned)hitId, hitUV.x, hitUV.y);
+
+		hitId = 0xFFFFFFFFu;
+		hitUV = {0.5f, 0.5f}; // sentinel; should be overwritten to (0,0) on miss
+		hr = pfnHitTest(session, -1, -1, &hitId, &hitUV);
+		std::printf("[xrWorkspaceHitTestEXT(-1,-1)               ] %s clientId=%u uv=(%.3f,%.3f)\n",
+		            xr_result_str(hr), (unsigned)hitId, hitUV.x, hitUV.y);
+		if (hr == XR_SUCCESS && hitId != XR_NULL_WORKSPACE_CLIENT_ID) {
+			std::printf("FAIL: off-screen hit-test reported a hit (clientId=%u)\n",
+			            (unsigned)hitId);
+		}
 	}
 
 	CHECK_XR(pfnRemoveCapture(session, clientId), "xrRemoveWorkspaceCaptureClientEXT");
