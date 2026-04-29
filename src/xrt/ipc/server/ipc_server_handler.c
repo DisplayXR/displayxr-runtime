@@ -2583,7 +2583,8 @@ ipc_handle_workspace_hit_test(volatile struct ipc_client_state *_ics,
                               int64_t cursor_y,
                               uint32_t *out_client_id,
                               float *out_local_u,
-                              float *out_local_v)
+                              float *out_local_v,
+                              uint32_t *out_hit_region)
 {
 	struct ipc_server *s = _ics->server;
 
@@ -2596,12 +2597,13 @@ ipc_handle_workspace_hit_test(volatile struct ipc_client_state *_ics,
 		return XRT_ERROR_NOT_AUTHORIZED;
 	}
 
-	if (out_client_id == NULL || out_local_u == NULL || out_local_v == NULL) {
+	if (out_client_id == NULL || out_local_u == NULL || out_local_v == NULL || out_hit_region == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
 	*out_client_id = 0;
 	*out_local_u = 0.0f;
 	*out_local_v = 0.0f;
+	*out_hit_region = 0;
 
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	if (s->xsysc == NULL) {
@@ -2610,11 +2612,11 @@ ipc_handle_workspace_hit_test(volatile struct ipc_client_state *_ics,
 
 	// Wire format is int64 (proto generator does not support int32_t).
 	// The wrapper takes int32 because that matches the OpenXR public
-	// surface (XR_EXT_spatial_workspace v3 xrWorkspaceHitTestEXT).
+	// surface (XR_EXT_spatial_workspace v4 xrWorkspaceHitTestEXT).
 	int32_t cx = (int32_t)cursor_x;
 	int32_t cy = (int32_t)cursor_y;
 	bool ok = comp_d3d11_service_workspace_hit_test(s->xsysc, cx, cy, out_client_id, out_local_u,
-	                                                out_local_v);
+	                                                out_local_v, out_hit_region);
 	return ok ? XRT_SUCCESS : XRT_ERROR_IPC_FAILURE;
 #else
 	(void)s;

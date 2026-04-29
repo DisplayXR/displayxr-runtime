@@ -331,9 +331,11 @@ comp_ipc_client_compositor_workspace_hit_test(struct xrt_compositor *xc,
                                               int32_t cursor_y,
                                               uint32_t *out_client_id,
                                               float *out_local_u,
-                                              float *out_local_v)
+                                              float *out_local_v,
+                                              uint32_t *out_hit_region)
 {
-	if (xc == NULL || out_client_id == NULL || out_local_u == NULL || out_local_v == NULL) {
+	if (xc == NULL || out_client_id == NULL || out_local_u == NULL || out_local_v == NULL ||
+	    out_hit_region == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
 	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
@@ -341,7 +343,7 @@ comp_ipc_client_compositor_workspace_hit_test(struct xrt_compositor *xc,
 		return XRT_ERROR_IPC_FAILURE;
 	}
 	return ipc_call_workspace_hit_test(icc->ipc_c, cursor_x, cursor_y, out_client_id, out_local_u,
-	                                   out_local_v);
+	                                   out_local_v, out_hit_region);
 }
 
 /*

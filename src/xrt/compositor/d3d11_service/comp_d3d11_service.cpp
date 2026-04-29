@@ -11672,21 +11672,77 @@ comp_d3d11_service_remove_capture_client(struct xrt_system_compositor *xsysc,
 	return multi_compositor_remove_capture_client(sys, slot_index);
 }
 
+// Map the internal workspace_hit_result flag set onto the public
+// XrWorkspaceHitRegionEXT enum. Chrome buttons take precedence over the
+// title-bar bit (the WndProc geometry computes both for chrome hits).
+// Compound edge flags collapse to the diagonal corners.
+static uint32_t
+hit_result_to_region(const struct workspace_hit_result &hit)
+{
+	// XrWorkspaceHitRegionEXT values — kept in sync with the public header.
+	// Using literal ints here because comp_d3d11_service does not include
+	// the OpenXR extension header (different layer).
+	enum {
+		REGION_BACKGROUND       = 0,
+		REGION_CONTENT          = 1,
+		REGION_TITLE_BAR        = 2,
+		REGION_CLOSE_BUTTON     = 3,
+		REGION_MINIMIZE_BUTTON  = 4,
+		REGION_MAXIMIZE_BUTTON  = 5,
+		REGION_EDGE_RESIZE_N    = 10,
+		REGION_EDGE_RESIZE_S    = 11,
+		REGION_EDGE_RESIZE_E    = 12,
+		REGION_EDGE_RESIZE_W    = 13,
+		REGION_EDGE_RESIZE_NE   = 14,
+		REGION_EDGE_RESIZE_NW   = 15,
+		REGION_EDGE_RESIZE_SE   = 16,
+		REGION_EDGE_RESIZE_SW   = 17,
+	};
+
+	if (hit.slot < 0) {
+		return REGION_BACKGROUND;
+	}
+	if (hit.in_close_btn)    return REGION_CLOSE_BUTTON;
+	if (hit.in_minimize_btn) return REGION_MINIMIZE_BUTTON;
+	if (hit.in_maximize_btn) return REGION_MAXIMIZE_BUTTON;
+
+	const int e = hit.edge_flags;
+	if (e != RESIZE_NONE) {
+		// Diagonals first (compound).
+		if ((e & RESIZE_TOP)    && (e & RESIZE_LEFT))  return REGION_EDGE_RESIZE_NW;
+		if ((e & RESIZE_TOP)    && (e & RESIZE_RIGHT)) return REGION_EDGE_RESIZE_NE;
+		if ((e & RESIZE_BOTTOM) && (e & RESIZE_LEFT))  return REGION_EDGE_RESIZE_SW;
+		if ((e & RESIZE_BOTTOM) && (e & RESIZE_RIGHT)) return REGION_EDGE_RESIZE_SE;
+		if (e & RESIZE_TOP)    return REGION_EDGE_RESIZE_N;
+		if (e & RESIZE_BOTTOM) return REGION_EDGE_RESIZE_S;
+		if (e & RESIZE_LEFT)   return REGION_EDGE_RESIZE_W;
+		if (e & RESIZE_RIGHT)  return REGION_EDGE_RESIZE_E;
+	}
+	if (hit.in_title_bar) return REGION_TITLE_BAR;
+	if (hit.in_content)   return REGION_CONTENT;
+
+	// In-window but no specific region matched — treat as background-equivalent
+	// rather than fabricate a category.
+	return REGION_BACKGROUND;
+}
+
 extern "C" bool
 comp_d3d11_service_workspace_hit_test(struct xrt_system_compositor *xsysc,
                                        int32_t cursor_x,
                                        int32_t cursor_y,
                                        uint32_t *out_client_id,
                                        float *out_local_u,
-                                       float *out_local_v)
+                                       float *out_local_v,
+                                       uint32_t *out_hit_region)
 {
 	if (xsysc == nullptr || out_client_id == nullptr || out_local_u == nullptr ||
-	    out_local_v == nullptr) {
+	    out_local_v == nullptr || out_hit_region == nullptr) {
 		return false;
 	}
 	*out_client_id = 0;
 	*out_local_u = 0.0f;
 	*out_local_v = 0.0f;
+	*out_hit_region = 0; // BACKGROUND
 
 	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
 	struct d3d11_multi_compositor *mc = sys->multi_comp;
@@ -11699,10 +11755,10 @@ comp_d3d11_service_workspace_hit_test(struct xrt_system_compositor *xsysc,
 	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
 
 	struct workspace_hit_result hit = workspace_raycast_hit_test(sys, mc, pt);
-	if (hit.slot < 0 || !hit.in_content) {
-		// Miss, or hit landed in chrome / edge-resize zone — public surface
-		// reports as miss until Phase 2.C migrates chrome rendering and
-		// the controller takes over those interactions explicitly.
+	*out_hit_region = hit_result_to_region(hit);
+
+	if (hit.slot < 0) {
+		// Background miss — out_client_id stays 0.
 		return true;
 	}
 
@@ -11712,13 +11768,17 @@ comp_d3d11_service_workspace_hit_test(struct xrt_system_compositor *xsysc,
 	// regardless of client type.
 	*out_client_id = 1000u + (uint32_t)hit.slot;
 
-	float win_w = mc->clients[hit.slot].window_width_m;
-	float win_h = mc->clients[hit.slot].window_height_m;
-	if (win_w > 0.0f) {
-		*out_local_u = hit.local_x_m / win_w;
-	}
-	if (win_h > 0.0f) {
-		*out_local_v = hit.local_y_m / win_h;
+	// UV only meaningful for CONTENT hits; chrome/edge use a different
+	// coordinate frame the public surface does not expose.
+	if (hit.in_content) {
+		float win_w = mc->clients[hit.slot].window_width_m;
+		float win_h = mc->clients[hit.slot].window_height_m;
+		if (win_w > 0.0f) {
+			*out_local_u = hit.local_x_m / win_w;
+		}
+		if (win_h > 0.0f) {
+			*out_local_v = hit.local_y_m / win_h;
+		}
 	}
 
 	return true;

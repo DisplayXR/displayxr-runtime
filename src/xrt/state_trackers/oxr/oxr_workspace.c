@@ -71,7 +71,8 @@ comp_ipc_client_compositor_workspace_hit_test(struct xrt_compositor *xc,
                                               int32_t cursor_y,
                                               uint32_t *out_client_id,
                                               float *out_local_u,
-                                              float *out_local_v);
+                                              float *out_local_v,
+                                              uint32_t *out_hit_region);
 
 
 /*
@@ -424,8 +425,10 @@ oxr_xrWorkspaceHitTestEXT(XrSession session,
 
 	uint32_t client_id = 0;
 	float u = 0.0f, v = 0.0f;
+	uint32_t region = 0; // discarded — Phase 2.D Commit 3 surfaces this through a
+	                     // public-API parameter; this commit only plumbs the wire.
 	xrt_result_t xret = comp_ipc_client_compositor_workspace_hit_test(&sess->xcn->base, cursorX, cursorY,
-	                                                                  &client_id, &u, &v);
+	                                                                  &client_id, &u, &v, &region);
 	if (xret != XRT_SUCCESS) {
 		return xret_to_xr_result(&log, xret, "workspace_hit_test");
 	}

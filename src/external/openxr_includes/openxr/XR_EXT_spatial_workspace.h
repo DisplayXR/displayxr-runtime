@@ -25,7 +25,7 @@ extern "C" {
 #endif
 
 #define XR_EXT_spatial_workspace 1
-#define XR_EXT_spatial_workspace_SPEC_VERSION 3
+#define XR_EXT_spatial_workspace_SPEC_VERSION 4
 #define XR_EXT_SPATIAL_WORKSPACE_EXTENSION_NAME "XR_EXT_spatial_workspace"
 
 // Provisional XrStructureType values. The 1000999100..104 range is reserved for
@@ -57,6 +57,35 @@ typedef enum XrWorkspaceClientTypeEXT {
     XR_WORKSPACE_CLIENT_TYPE_CAPTURED_2D_EXT = 1,
     XR_WORKSPACE_CLIENT_TYPE_MAX_ENUM_EXT    = 0x7FFFFFFF
 } XrWorkspaceClientTypeEXT;
+
+/*!
+ * @brief Classification of a spatial hit-test result.
+ *
+ * Phase 2.D established hit-region as the shared vocabulary between runtime
+ * and workspace controller: the runtime classifies (it has the geometry) and
+ * the controller interprets (focus, drag, close, etc.). The taskbar and
+ * launcher tile regions are produced by the launcher hit-test path; window
+ * raycasts produce the rest.
+ */
+typedef enum XrWorkspaceHitRegionEXT {
+    XR_WORKSPACE_HIT_REGION_BACKGROUND_EXT       = 0,  // miss
+    XR_WORKSPACE_HIT_REGION_CONTENT_EXT           = 1,
+    XR_WORKSPACE_HIT_REGION_TITLE_BAR_EXT         = 2,
+    XR_WORKSPACE_HIT_REGION_CLOSE_BUTTON_EXT      = 3,
+    XR_WORKSPACE_HIT_REGION_MINIMIZE_BUTTON_EXT   = 4,
+    XR_WORKSPACE_HIT_REGION_MAXIMIZE_BUTTON_EXT   = 5,
+    XR_WORKSPACE_HIT_REGION_EDGE_RESIZE_N_EXT     = 10,
+    XR_WORKSPACE_HIT_REGION_EDGE_RESIZE_S_EXT     = 11,
+    XR_WORKSPACE_HIT_REGION_EDGE_RESIZE_E_EXT     = 12,
+    XR_WORKSPACE_HIT_REGION_EDGE_RESIZE_W_EXT     = 13,
+    XR_WORKSPACE_HIT_REGION_EDGE_RESIZE_NE_EXT    = 14,
+    XR_WORKSPACE_HIT_REGION_EDGE_RESIZE_NW_EXT    = 15,
+    XR_WORKSPACE_HIT_REGION_EDGE_RESIZE_SE_EXT    = 16,
+    XR_WORKSPACE_HIT_REGION_EDGE_RESIZE_SW_EXT    = 17,
+    XR_WORKSPACE_HIT_REGION_TASKBAR_EXT           = 20,
+    XR_WORKSPACE_HIT_REGION_LAUNCHER_TILE_EXT     = 21,
+    XR_WORKSPACE_HIT_REGION_MAX_ENUM_EXT          = 0x7FFFFFFF
+} XrWorkspaceHitRegionEXT;
 
 // ---- Lifecycle ----
 

@@ -420,18 +420,18 @@ comp_d3d11_service_poll_mcp_capture(struct xrt_system_compositor *xsysc);
  * Spatial raycast hit-test against workspace windows (Phase 2.F public surface).
  *
  * Translates a screen-space cursor in display pixels (origin top-left) to a
- * client window content hit. Internally calls workspace_raycast_hit_test;
- * exposes only the content-area outcome — title-bar and edge-resize hits
- * report as "no hit" (out_client_id = 0) so the controller cannot
- * accidentally classify chrome interactions while chrome rendering still
- * lives in the runtime (until Phase 2.C).
+ * client window hit. Internally calls workspace_raycast_hit_test and maps the
+ * internal flag set onto the XrWorkspaceHitRegionEXT vocabulary the controller
+ * speaks. UV is meaningful only for CONTENT hits; chrome/edge hits set UV to 0
+ * since the chrome coordinate frame is not exposed at the public surface.
  *
- * @param xsysc          The system compositor (must be D3D11 service in workspace mode).
- * @param cursor_x       Cursor X in display pixels (origin top-left).
- * @param cursor_y       Cursor Y in display pixels.
- * @param[out] out_client_id Client id of the hit window, or 0 for miss/chrome hit.
- * @param[out] out_local_u   U coordinate of hit on content quad (0..1, origin top-left).
- * @param[out] out_local_v   V coordinate of hit on content quad (0..1, origin top-left).
+ * @param xsysc           The system compositor (must be D3D11 service in workspace mode).
+ * @param cursor_x        Cursor X in display pixels (origin top-left).
+ * @param cursor_y        Cursor Y in display pixels.
+ * @param[out] out_client_id  Client id of the hit window, or 0 for miss (background).
+ * @param[out] out_local_u    U coordinate of content hit (0..1); 0 for non-content hits.
+ * @param[out] out_local_v    V coordinate of content hit (0..1); 0 for non-content hits.
+ * @param[out] out_hit_region Classification (XrWorkspaceHitRegionEXT cast to uint32_t).
  * @return true on success (including miss); false only on usage error.
  *
  * @ingroup comp_d3d11_service
@@ -442,7 +442,8 @@ comp_d3d11_service_workspace_hit_test(struct xrt_system_compositor *xsysc,
                                        int32_t cursor_y,
                                        uint32_t *out_client_id,
                                        float *out_local_u,
-                                       float *out_local_v);
+                                       float *out_local_v,
+                                       uint32_t *out_hit_region);
 
 /*! @} */
 

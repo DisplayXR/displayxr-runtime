@@ -199,7 +199,8 @@ comp_ipc_client_compositor_workspace_hit_test(struct xrt_compositor *xc,
                                               int32_t cursor_y,
                                               uint32_t *out_client_id,
                                               float *out_local_u,
-                                              float *out_local_v);
+                                              float *out_local_v,
+                                              uint32_t *out_hit_region);
 
 /*!
  * Launcher bridges (XR_EXT_app_launcher).

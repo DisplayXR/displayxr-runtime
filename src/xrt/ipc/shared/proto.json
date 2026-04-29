@@ -151,7 +151,8 @@
 		"out": [
 			{"name": "client_id", "type": "uint32_t"},
 			{"name": "local_u", "type": "float"},
-			{"name": "local_v", "type": "float"}
+			{"name": "local_v", "type": "float"},
+			{"name": "hit_region", "type": "uint32_t"}
 		]
 	},
 
