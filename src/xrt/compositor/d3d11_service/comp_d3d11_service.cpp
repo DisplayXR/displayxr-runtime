@@ -324,30 +324,32 @@ struct d3d11_service_system
 	//! Base system compositor - must be first!
 	struct xrt_system_compositor base;
 
-	//! Phase 5.8: spatial launcher app registry, pushed from the shell
-	//! process via clear+add IPC calls. Lives on the service (not the
+	//! Phase 5.8: spatial launcher app registry, pushed from the workspace
+	//! controller via clear+add IPC calls. Lives on the service (not the
 	//! multi-comp) so it survives multi-comp create/destroy cycles —
-	//! the shell can push at any time, even before workspace_activate.
+	//! the workspace controller can push at any time, even before
+	//! workspace_activate.
 	struct ipc_launcher_app launcher_apps[IPC_LAUNCHER_MAX_APPS];
 	uint32_t launcher_app_count;
 
 	//! Phase 5.9/5.10: pending launcher tile click. Set by the WM_LBUTTONDOWN
-	//! handler when the user clicks a tile, consumed by the shell via
-	//! ipc_call_launcher_poll_click(). -1 means no pending click.
+	//! handler when the user clicks a tile, consumed by the workspace
+	//! controller via ipc_call_launcher_poll_click() (or
+	//! xrPollLauncherClickEXT). -1 means no pending click.
 	//! Also carries IPC_LAUNCHER_ACTION_BROWSE for the Browse tile.
 	//! Phase 6.6: also carries IPC_LAUNCHER_ACTION_REMOVE + the removed
 	//! tile's full index in pending_launcher_remove_full_index.
 	int32_t pending_launcher_click_index = -1;
 
 	//! Phase 6.6: full-space index of the tile the user right-click-removed.
-	//! Set by launcher_show_context_menu, consumed by the shell's poll loop
-	//! which deletes the entry from g_registered_apps and re-pushes.
-	//! -1 means no pending remove.
+	//! Set by launcher_show_context_menu, consumed by the workspace
+	//! controller's poll loop which deletes the entry from g_registered_apps
+	//! and re-pushes. -1 means no pending remove.
 	int32_t pending_launcher_remove_full_index = -1;
 
 	//! Phase 5.11: bitmask of running tiles (bit i = launcher_apps[i] has a
-	//! matching IPC client). Pushed by the shell from its client-poll loop.
-	//! The render pass draws a glow border around set tiles.
+	//! matching IPC client). Pushed by the workspace controller from its
+	//! client-poll loop. The render pass draws a glow border around set tiles.
 	uint64_t running_tile_mask = 0;
 
 	//! Phase 6.2: visible-space hover index — tile under the mouse cursor.
@@ -364,7 +366,7 @@ struct d3d11_service_system
 
 	//! Phase 5.13: bitmask of tiles the user has hidden this session via
 	//! right-click → Remove. Bit i = launcher_apps[i] is hidden. Cleared on
-	//! every shell registry re-push so the state is session-only.
+	//! every workspace registry re-push so the state is session-only.
 	uint64_t hidden_tile_mask = 0;
 
 	//! Phase 7.2: per-app icon textures loaded from sidecar icon paths.
@@ -8204,10 +8206,10 @@ after_key_shortcuts:
 		    : 1.0f;
 		float tile_h = tile_w * pix_ratio;
 
-		// App list pushed from the shell process via clear+add IPC calls.
+		// App list pushed from the workspace controller via clear+add IPC calls.
 		// Stored on sys so it survives multi-comp create/destroy. Empty until
-		// the shell completes its first registered_apps_load + push; empty-
-		// state branch below handles that.
+		// the controller completes its first registered_apps_load + push;
+		// empty-state branch below handles that.
 		const struct ipc_launcher_app *apps = sys->launcher_apps;
 		int visible_to_full[IPC_LAUNCHER_MAX_APPS];
 		uint32_t n_visible = launcher_build_visible_list(sys, visible_to_full);
@@ -11962,12 +11964,12 @@ comp_d3d11_service_deactivate_workspace(struct xrt_system_compositor *xsysc)
 		mc->suspended = true;
 	}
 
-	U_LOG_W("Shell deactivate: complete — captures stopped, multi-comp suspended, "
+	U_LOG_W("Workspace deactivate: complete — captures stopped, multi-comp suspended, "
 	        "IPC clients will lazy-switch to standalone on next frame");
 }
 
-// Phase 5.8: empty the launcher's app list. The shell calls this before
-// pushing a fresh registry so the tile grid never carries stale entries.
+// Phase 5.8: empty the launcher's app list. The workspace controller calls this
+// before pushing a fresh registry so the tile grid never carries stale entries.
 // Stored on the system (not the multi-comp) so it survives across activations.
 void
 comp_d3d11_service_clear_launcher_apps(struct xrt_system_compositor *xsysc)
@@ -11997,8 +11999,9 @@ comp_d3d11_service_clear_launcher_apps(struct xrt_system_compositor *xsysc)
 }
 
 // Phase 5.8: append one app to the launcher's tile grid. Silently dropped if
-// the array is already full. The shell loops over its registry calling this
-// once per entry after a clear. Lives on the system, not the multi-comp.
+// the array is already full. The workspace controller loops over its registry
+// calling this once per entry after a clear. Lives on the system, not the
+// multi-comp.
 void
 comp_d3d11_service_add_launcher_app(struct xrt_system_compositor *xsysc,
                                     const struct ipc_launcher_app *app)
@@ -12040,8 +12043,8 @@ comp_d3d11_service_add_launcher_app(struct xrt_system_compositor *xsysc,
 
 // Phase 5.11: set the running-tile bitmask. Bit i set means launcher_apps[i]
 // has at least one matching IPC client connected. The render pass draws a
-// glow border around any tile whose bit is set. Pushed by the shell from its
-// client-poll loop whenever the running set changes.
+// glow border around any tile whose bit is set. Pushed by the workspace
+// controller from its client-poll loop whenever the running set changes.
 void
 comp_d3d11_service_set_running_tile_mask(struct xrt_system_compositor *xsysc, uint64_t mask)
 {
@@ -12067,8 +12070,9 @@ comp_d3d11_service_set_running_tile_mask(struct xrt_system_compositor *xsysc, ui
 
 // Phase 5.9/5.10: poll-and-clear the pending launcher tile click. The
 // WM_LBUTTONDOWN handler stores the tile index when the user clicks; the
-// shell calls this from its poll loop, gets the index, and dispatches a
-// CreateProcess via shell_launch_registered_app on its end.
+// workspace controller calls this from its poll loop, gets the index, and
+// dispatches a CreateProcess on its end (the runtime never executes binaries
+// on the controller's behalf).
 int32_t
 comp_d3d11_service_poll_launcher_click(struct xrt_system_compositor *xsysc)
 {
@@ -12094,7 +12098,8 @@ comp_d3d11_service_poll_launcher_click(struct xrt_system_compositor *xsysc)
 
 // Phase 5.7: spatial launcher visibility toggle. Just flips the render-thread
 // bool; the render loop picks it up on the next frame and draws (or skips) the
-// launcher panel overlay. No-op if there's no multi-comp yet (shell not active).
+// launcher panel overlay. No-op if there's no multi-comp yet (workspace not
+// active).
 void
 comp_d3d11_service_set_launcher_visible(struct xrt_system_compositor *xsysc, bool visible)
 {
