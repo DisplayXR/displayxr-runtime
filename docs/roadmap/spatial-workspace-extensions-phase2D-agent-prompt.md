@@ -296,7 +296,128 @@ Service-side log rename pass for any leftover `Shell:` log prefixes the prior ph
 
 ## What unblocks once Phase 2.D passes
 
-- **Phase 2.I — first-party shell migrates to public extensions**. ~3-4 commits in `src/xrt/targets/shell/main.c`; replace each `ipc_call_*` invocation with `xrGetInstanceProcAddr` + PFN dispatch. Net architectural payoff: the shell's source becomes the working specification for "how to write a workspace controller against our public API." This is the validation point — if 2.I uncovers gaps in the public surface, those become high-priority follow-ups.
+- **Phase 2.I — first-party shell migrates to public extensions** (full prompt below).
 - **Phase 2.G — layout presets + ESC cleanup**. Layout-preset semantics move to the controller (which computes per-window poses and pushes via `xrSetWorkspaceClientWindowPoseEXT`); the runtime stops owning preset names. The ESC carve-out and reentry state machine simplify or delete because the runtime no longer needs an "empty workspace" mode.
 - **Phase 2.C — chrome rendering**. The heaviest remaining migration; allocate a full sub-session. Chrome (close/min/max buttons, app name, title bar) moves to controller-rendered overlays composited by the runtime. The runtime stops drawing chrome at all.
 - **macOS input routing port**. Mirror the public surface with a Cocoa-native event-source equivalent of the Win32 WndProc. The headers stay platform-neutral; only the implementation differs.
+
+---
+
+# Phase 2.I Follow-Up Prompt — Shell Migration to Public Extensions
+
+> ⚠️ **Follow-up work, NOT part of Phase 2.D.** This section is the agent prompt for Phase 2.I, which lands AFTER Phase 2.D ships. It is included here so the design intent for 2.I is captured alongside 2.D's surface (the surface 2.I depends on). When you're ready to do 2.I, drop this section into a fresh agent session as the user message after `/clear`. Do not start 2.I before 2.D is merged to `main`.
+
+## What Phase 2.I is for
+
+You're picking up Phase 2.I — the **shell migration** to public OpenXR extensions. After Phases 2.A through 2.D shipped, the runtime exposes `XR_EXT_spatial_workspace v4` and `XR_EXT_app_launcher v1` — the full public surface a workspace controller needs. Phase 2.I migrates the **first-party DisplayXR Shell** off internal IPC and onto the public extensions.
+
+**Why this is the validation point**: a third-party workspace controller can theoretically be written against the public surface. Phase 2.I proves it by switching the first-party shell — which has historically used internal `ipc_call_*` directly — to the same surface a third party would use. If the public API is insufficient anywhere, gaps surface during 2.I and become high-priority follow-up work for `XR_EXT_spatial_workspace v5+`.
+
+The shell's source becomes the **canonical reference workspace controller** — the working specification for "how to write a workspace controller against our public API."
+
+## Read these in order before touching code
+
+1. The full Phase 2.D prompt above — the public surface 2.I depends on.
+2. `docs/roadmap/spatial-workspace-extensions-headers-draft.md` lines 1-320 — the `XR_EXT_spatial_workspace` design with the v4 surface from 2.D.
+3. `git log --oneline main | grep -E 'spatial_workspace|app_launcher|workspace_minimal' | head -40` — surveys all prior phase commits. Know what's shipping before you migrate consumers of it.
+4. `test_apps/workspace_minimal_d3d11_win/main.cpp` — the validation test app from 2.A onward. Models exactly the pattern the migrated shell will follow: `xrCreateInstance` with extensions enabled, `xrCreateSession` with D3D11 binding, `xrGetInstanceProcAddr` for each extension function, dispatch via PFN.
+
+## Branch + prerequisites
+
+- Start from `main` after Phase 2.D has merged.
+- New branch: `feature/workspace-extensions-2I`.
+- Confirm `main` includes 2.D commits — `git log --oneline main | grep -E 'EnumerateWorkspaceInputEvents|WorkspaceFocusedClient|WorkspaceHitRegion'` should return ~5 hits.
+
+## Precondition: `xrCaptureWorkspaceFrameEXT` may need to land first
+
+The shell's screenshot path uses `ipc_call_workspace_capture_frame(&ipc_c, &req, &result)` (around `src/xrt/targets/shell/main.c:1840`). The matching public extension function `xrCaptureWorkspaceFrameEXT` is **sketched in the headers-draft** (around lines 268-274) but **not yet implemented**.
+
+You have three options:
+
+1. **Implement `xrCaptureWorkspaceFrameEXT` first as Phase 2.I-prequel** (1-2 commits before the migration commits). Bumps `XR_EXT_spatial_workspace` v4 → v5. Cleanest — gives the shell's migration zero internal-IPC residue.
+2. **Leave the screenshot path on internal IPC**. Shell migrates everything else but keeps `ipc_call_workspace_capture_frame` plus its `ipc_client_connection.h` includes for that one call. Cheapest but defeats the "shell becomes brand-neutral OpenXR client" payoff.
+3. **Drop screenshot capability from the shell**. Move screenshots into a separate tool that uses internal IPC, leaving the shell pure-extension. Largest scope.
+
+**Recommended**: Option 1. Implement `xrCaptureWorkspaceFrameEXT` as a 6-commit prequel matching the 2.A/2.B pattern (the IPC RPC is already shipping, so it's just the wrapping work). Then the shell migration is clean.
+
+## What ships in Phase 2.I
+
+The shell becomes a regular OpenXR client. Specifically:
+
+- `src/xrt/targets/shell/main.c` deletes its `#include "client/ipc_client.h"`, `#include "client/ipc_client_connection.h"`, `#include "ipc_client_generated.h"` lines.
+- All `ipc_call_workspace_*`, `ipc_call_launcher_*`, and `ipc_call_system_set_focused_client` invocations replace with `PFN_xr*EXT` dispatch via `xrGetInstanceProcAddr`.
+- `ipc_client_connection_init` / `ipc_client_connection_fini` calls (around lines 1913, 2482, 2105, 2108) replace with `xrCreateInstance` / `xrDestroyInstance` plus `xrCreateSession` / `xrDestroySession`.
+
+The shell's role inside the orchestrator's workspace-controller manifest (Phase 2.0) is unchanged — it's still the binary the orchestrator spawns. What changes is its **internal architecture**: from "IPC-private client" to "public-OpenXR client."
+
+### Graphics binding question
+
+OpenXR generally requires a graphics binding for `xrCreateSession`. The headers-draft notes (around line 45 of "Activation handshake") that workspace controllers don't render swapchains: "graphics binding can be `XR_NULL_HANDLE` — workspace controllers don't render swapchains; they only instruct."
+
+But our runtime's session creation path may not yet honor `XR_NULL_HANDLE` graphics binding. **Check this early.** If not honored, the shell needs a minimal D3D11 binding (mirror `test_apps/workspace_minimal_d3d11_win/main.cpp` setup) — adds ~30 lines but is a known-good pattern. If honored, the shell can use `XR_NULL_HANDLE` and avoid D3D11 dependencies entirely.
+
+If unsupported and you decide it should be supported, that's a small addition to `oxr_session.c` that's worth doing as part of 2.I — make `XR_NULL_HANDLE` graphics binding work for workspace-mode sessions only (gated on the session having `XR_EXT_spatial_workspace` enabled and being authorized).
+
+### Functions the shell will call (post-migration)
+
+| Today (internal IPC) | After 2.I (public extension) | Phase that shipped the extension |
+|---|---|---|
+| `ipc_call_workspace_activate` | `pfnActivateSpatialWorkspaceEXT(session)` | 2.A |
+| `ipc_call_workspace_deactivate` | `pfnDeactivateSpatialWorkspaceEXT(session)` | 2.A |
+| `ipc_call_workspace_get_state` | `pfnGetSpatialWorkspaceStateEXT(session, *active)` | 2.A |
+| `ipc_call_workspace_add_capture_client` | `pfnAddWorkspaceCaptureClientEXT(session, hwnd, name, *clientId)` | 2.A |
+| `ipc_call_workspace_remove_capture_client` | `pfnRemoveWorkspaceCaptureClientEXT(session, clientId)` | 2.A |
+| `ipc_call_workspace_set_window_pose` | `pfnSetWorkspaceClientWindowPoseEXT(session, clientId, &pose, w, h)` | 2.C |
+| `ipc_call_workspace_capture_frame` | `pfnCaptureWorkspaceFrameEXT(session, &req, *result)` | **2.I-prequel** (option 1 above) |
+| `ipc_call_launcher_clear_apps` | `pfnClearLauncherAppsEXT(session)` | 2.B |
+| `ipc_call_launcher_add_app` | `pfnAddLauncherAppEXT(session, &info)` | 2.B |
+| `ipc_call_launcher_set_visible` | `pfnSetLauncherVisibleEXT(session, visible)` | 2.B |
+| `ipc_call_launcher_poll_click` | `pfnPollLauncherClickEXT(session, *appIndex)` | 2.B |
+| `ipc_call_launcher_set_running_tile_mask` | `pfnSetLauncherRunningTileMaskEXT(session, mask)` | 2.B |
+| `ipc_call_system_set_focused_client` | `pfnSetWorkspaceFocusedClientEXT(session, clientId)` | 2.D |
+
+The shell will additionally consume the new 2.D input surface (`xrEnumerateWorkspaceInputEventsEXT`, `xrEnable/DisableWorkspacePointerCaptureEXT`) **only if it has a use case**. Today the shell does not consume raw input — the runtime forwards directly to focused HWNDs. Post-2.I that hasn't necessarily changed; if the shell wants to take over focus-on-click policy or window-drag gestures, it can opt in incrementally as a separate sub-task.
+
+## Recommended commit sequence (assuming prequel option 1)
+
+### Prequel (2 commits)
+
+1. **`extensions: extend XR_EXT_spatial_workspace with frame capture (v5)`** — add `XrWorkspaceCaptureRequestEXT`, `XrWorkspaceCaptureResultEXT`, `XrWorkspaceCaptureFlagsEXT` (per headers-draft lines 240-265), `xrCaptureWorkspaceFrameEXT` PFN + prototype. Bump `XR_EXT_spatial_workspace_SPEC_VERSION` 4 → 5.
+2. **`oxr/ipc: implement and dispatch xrCaptureWorkspaceFrameEXT`** — IPC bridge in `ipc_client_compositor.c`, state-tracker entry point in `oxr_workspace.c`, dispatch wiring (oxr_api_funcs.h, oxr_api_negotiate.c). The IPC RPC `workspace_capture_frame` is already shipping; just wrap it. Test app exercises the function on the success path.
+
+### Migration commits (4 commits)
+
+3. **`shell: bootstrap as OpenXR client`** — at the top of `main()`, before the existing `ipc_client_connection_init` call (~line 1913), add `xrCreateInstance` enabling both extensions, get system, create session (with D3D11 binding or `XR_NULL_HANDLE`), resolve all 13+ PFNs into a struct. Keep the existing IPC connection in place; just add the OpenXR scaffolding. Verify the shell still launches and behaves identically.
+
+4. **`shell: migrate workspace lifecycle + capture clients to extensions`** — replace the 5 workspace_* calls (activate, deactivate, get_state, add/remove capture client) and the set_window_pose / capture_frame calls with the corresponding PFN dispatch. Verify shell still works.
+
+5. **`shell: migrate launcher to extensions`** — replace the 5 launcher_* calls (clear, add, set_visible, poll_click, set_running_tile_mask) with PFNs.
+
+6. **`shell: migrate focus + drop internal-IPC includes`** — replace `ipc_call_system_set_focused_client` with `pfnSetWorkspaceFocusedClientEXT`. Delete the now-unused `#include "client/ipc_client.h"`, `#include "client/ipc_client_connection.h"`, `#include "ipc_client_generated.h"`. Delete the `ipc_client_connection_init/fini` calls. The shell is now a pure OpenXR consumer.
+
+## Acceptance criteria for the whole phase
+
+- ✅ `src/xrt/targets/shell/main.c` does not include any `client/ipc_*.h` or `ipc_client_generated.h` headers.
+- ✅ `git grep ipc_call_ src/xrt/targets/shell/` returns zero.
+- ✅ Shell launches normally as both: (a) orchestrator-spawned controller via Ctrl+Space, (b) direct `displayxr-shell.exe app1 app2` invocation.
+- ✅ All shell-mode regression tests from prior phases (capture clients, launcher, window pose, click-to-focus, TAB cycle, DELETE close, scroll-resize) pass with no behavioral change.
+- ✅ Windows MSVC CI green; macOS CI green (shell binary is Windows-only, but the public extension headers stay platform-neutral).
+- ✅ Branch is one PR, six commits total (or eight including the prequel).
+
+## Hand-off notes
+
+- **The migration is mostly mechanical** — replace a function call with a PFN call. Don't take the opportunity to refactor adjacent code; keep the diff small and reviewable.
+- **Watch the IPC connection lifecycle** — the shell currently `ipc_client_connection_init`s before any `ipc_call_*`. After migration, `xrCreateSession` does the equivalent. The order of operations matters: if the shell tries to activate workspace before the session is created, it fails. Make sure the OpenXR scaffolding lands FIRST (Commit 3) and the per-call migrations follow.
+- **`XR_NULL_HANDLE` graphics binding behavior** — verify in Commit 3 whether the runtime accepts it. If not and you decide to support it, add to `oxr_session.c` the gate "if session enables `XR_EXT_spatial_workspace` and is authorized as workspace controller, allow `XR_NULL_HANDLE` graphics binding." Document this in the commit message.
+- **Test 2 (shell-mode regression)** is the critical validation — every prior shell behavior must survive the migration. Before pushing, drive a full shell launch, click around, open the launcher, click a tile, open Notepad as a capture client, drag it, close it, deactivate and reactivate. Any single regression is a bug to fix in the same branch.
+- **If something feels broken**, suspect the `xrCreateSession` graphics binding first. Most subtle bugs in this migration land there.
+
+## Validation: did the public API turn out to be sufficient?
+
+After 2.I lands, audit which functions the shell actually calls vs which the public surface offers:
+
+- If the shell calls every public function, the surface is right-sized.
+- If the shell calls only a subset, document which extension functions are unused by the first-party shell — those become candidates for "third-party-only" markers in the spec.
+- If the shell can't accomplish something it could do before, that's a missing public function. File it as a high-priority follow-up; the surface is incomplete.
+
+The third case is the failure mode 2.I is designed to detect. If it happens, the gap goes into `XR_EXT_spatial_workspace v6+` design and ships before any third-party controller picks up the surface.
