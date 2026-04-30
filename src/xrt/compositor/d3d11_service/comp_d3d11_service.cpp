@@ -753,10 +753,6 @@ struct d3d11_multi_compositor
 	//! The app list it renders lives on d3d11_service_system (sys->launcher_apps).
 	bool launcher_visible;
 
-	//! Debounced re-grid: when > 0, apply grid layout after this timestamp.
-	//! Set by client registration, consumed by render loop.
-	uint64_t regrid_pending_ns;
-
 	//! Right-click-drag state for window repositioning.
 	struct
 	{
@@ -805,32 +801,6 @@ struct d3d11_multi_compositor
 		float start_yaw;   //!< Yaw (radians) at drag start
 		float start_pitch;  //!< Pitch (radians) at drag start
 	} title_rmb_drag;
-
-	//! Current layout preset (-1=none, 0-4=preset index). Used for TAB Z-reorder in Stack.
-	int32_t current_layout = 1; // default: immersive (Ctrl+2)
-
-	//! Dynamic layout state (carousel, orbital, helix, expose).
-	//! When mode >= 0, the layout continuously drives window poses each frame.
-	struct
-	{
-		int mode;                //!< -1=inactive, 0=carousel, 1=orbital, 2=helix, 3=expose
-		float angle_offset;      //!< Current rotation angle (radians)
-		float angular_velocity;  //!< Auto-rotation speed (rad/s)
-		bool user_dragging;      //!< Mouse is controlling rotation
-		float drag_start_angle;  //!< angle_offset when drag started
-		POINT drag_start_cursor; //!< Cursor position when drag started
-		uint64_t last_tick_ns;   //!< Last frame timestamp
-		float radius_m;          //!< Layout radius (meters)
-		float base_win_w;        //!< Base window width for this layout
-		float base_win_h;        //!< Base window height for this layout
-		int prev_layout;         //!< Layout before entering dynamic mode (for expose return)
-		// Momentum tracking for drag release
-		float prev_angle_offset; //!< Previous frame's angle_offset (for velocity calculation)
-		uint64_t prev_drag_ns;   //!< Previous frame's timestamp during drag
-		// Pause state: after TAB brings a window to front, pause auto-rotation
-		uint64_t pause_until_ns; //!< Auto-rotation paused until this timestamp (0 = not paused)
-		float target_angle;      //!< Target angle to animate toward (for TAB snap-to-front)
-	} dynamic_layout;
 
 	//! Hovered button: 0=none, 1=close, 2=minimize, 3=maximize, for the hovered slot.
 	int hover_btn;
@@ -3848,9 +3818,6 @@ multi_compositor_register_client(struct d3d11_service_system *sys, struct d3d11_
 			        mc->clients[i].window_rect_h);
 			multi_compositor_update_input_forward(mc);
 
-			// Schedule debounced re-grid so rapid connections settle first.
-			mc->regrid_pending_ns = os_monotonic_get_ns() + 500000000ULL;
-
 			// Ensure render timer is running. Normally started on capture client
 			// connect, but pure 3D IPC sessions need it too — otherwise workspace UI
 			// (drag, rotation) only repaints at the app's framerate (very slow on iGPU).
@@ -4140,9 +4107,6 @@ multi_compositor_add_capture_client(struct d3d11_service_system *sys, HWND hwnd,
 			         mc->client_count, mc->capture_client_count);
 			multi_compositor_update_input_forward(mc);
 
-			// Schedule debounced re-grid so rapid connections settle first.
-			mc->regrid_pending_ns = os_monotonic_get_ns() + 500000000ULL;
-
 			// Start render timer if this is the first capture client
 			if (mc->capture_client_count == 1) {
 				capture_render_thread_start(sys);
@@ -4288,7 +4252,6 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 		sys->multi_comp = new d3d11_multi_compositor();
 		std::memset(sys->multi_comp, 0, sizeof(*sys->multi_comp));
 		sys->multi_comp->focused_slot = -1;
-		sys->multi_comp->dynamic_layout.mode = -1; // No dynamic layout at startup
 	}
 
 	struct d3d11_multi_compositor *mc = sys->multi_comp;
@@ -5178,11 +5141,6 @@ slot_animate_tick(struct d3d11_multi_client_slot *slot, uint64_t now_ns)
 	return slot->anim.active; // true = still running
 }
 
-//! Default auto-rotation speed for dynamic layouts (~10 deg/sec).
-#define DYNAMIC_ROTATION_SPEED 0.175f
-//! Friction coefficient for momentum deceleration after drag release.
-#define DYNAMIC_FRICTION 3.0f
-
 /*!
  * Toggle fullscreen for a given slot. On fullscreen: animate to fill entire
  * display (no title bar), hide all other windows. On restore: animate back,
@@ -5295,271 +5253,6 @@ compute_grid_layout(const struct d3d11_service_system *sys,
 	*out_x = (col - (cols - 1) / 2.0f) * cell_w;
 	*out_y = ((rows - 1) / 2.0f - row) * cell_h;
 	*out_z = 0.0f;
-}
-
-/*!
- * Compute the maximum comfortable Z depth: ±1/5 of max(display_w, display_h).
- * Windows should stay within this range for comfortable viewing on the lenticular display.
- */
-static inline float
-compute_zmax(const struct d3d11_service_system *sys)
-{
-	float dw = sys->base.info.display_width_m;
-	float dh = sys->base.info.display_height_m;
-	if (dw <= 0.0f) dw = 0.700f;
-	if (dh <= 0.0f) dh = 0.394f;
-	return (dw > dh ? dw : dh) / 5.0f;
-}
-
-/*!
- * Compute carousel window pose for a given window index and angle offset.
- * Full 360° circle, front window near Z=0, back windows recede within ±zmax.
- */
-static void
-carousel_compute_pose(int idx, int n, float angle_offset, float radius_m,
-                      float base_w, float base_h, float zmax,
-                      struct xrt_pose *out_pose, float *out_w, float *out_h)
-{
-	float base_angle = (2.0f * (float)M_PI / (float)n) * idx;
-	float world_angle = base_angle + angle_offset;
-
-	out_pose->position.x = sinf(world_angle) * radius_m;
-	// Map Z so front is at Z=0, back is at -zmax (not -2*radius)
-	float raw_depth = cosf(world_angle); // +1 = front, -1 = back
-	out_pose->position.z = (raw_depth - 1.0f) * zmax * 0.5f; // front=0, back=-zmax
-	out_pose->position.y = 0.0f;
-
-	// Depth-based scaling: front = full, back = 70%
-	float depth_t = (raw_depth + 1.0f) / 2.0f; // 0=back, 1=front
-	float scale = 0.70f + 0.30f * depth_t;
-
-	*out_w = base_w * scale;
-	*out_h = base_h * scale;
-
-	// Identity orientation (no yaw)
-	out_pose->orientation = {0, 0, 0, 1};
-}
-
-/*!
- * Tick the dynamic layout: update angle, compute poses, apply to all windows.
- * Called every frame when dynamic_layout.mode >= 0.
- */
-static void
-dynamic_layout_tick(struct d3d11_service_system *sys, struct d3d11_multi_compositor *mc, uint64_t now_ns)
-{
-	auto &dl = mc->dynamic_layout;
-	if (dl.mode < 0) return;
-
-	// Compute dt
-	float dt = 0.0f;
-	if (dl.last_tick_ns > 0) {
-		dt = (float)(now_ns - dl.last_tick_ns) / 1e9f;
-		if (dt > 0.1f) dt = 0.1f; // cap at 100ms to avoid jumps
-	}
-	dl.last_tick_ns = now_ns;
-
-	// Update angle: auto-rotation when not dragging
-	if (!dl.user_dragging) { // auto-rotation when not dragging
-		bool paused = (dl.pause_until_ns > 0 && now_ns < dl.pause_until_ns);
-
-		if (paused) {
-			// Animate toward target angle (TAB snap-to-front), then hold
-			float diff = dl.target_angle - dl.angle_offset;
-			if (fabsf(diff) > 0.001f) {
-				// Ease toward target
-				float snap_speed = diff * 5.0f; // arrive quickly
-				dl.angle_offset += snap_speed * dt;
-				// Don't overshoot
-				if ((diff > 0 && dl.angle_offset > dl.target_angle) ||
-				    (diff < 0 && dl.angle_offset < dl.target_angle)) {
-					dl.angle_offset = dl.target_angle;
-				}
-			} else {
-				dl.angle_offset = dl.target_angle;
-			}
-			dl.angular_velocity = 0.0f;
-		} else {
-			dl.pause_until_ns = 0;
-			dl.angle_offset += dl.angular_velocity * dt;
-			// Apply friction (exponential decay)
-			float friction = DYNAMIC_FRICTION;
-			dl.angular_velocity *= expf(-friction * dt);
-			// Ease toward target auto-rotation speed
-			float target = DYNAMIC_ROTATION_SPEED;
-			float spd_diff = target - dl.angular_velocity;
-			dl.angular_velocity += spd_diff * (1.0f - expf(-1.0f * dt));
-		}
-	}
-
-	// Collect active windows
-	int active[D3D11_MULTI_MAX_CLIENTS];
-	int n = 0;
-	for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
-		if (mc->clients[i].active && !mc->clients[i].minimized) {
-			active[n++] = i;
-		}
-	}
-	if (n == 0) return;
-
-	float disp_w_m = sys->base.info.display_width_m;
-	float disp_h_m = sys->base.info.display_height_m;
-	if (disp_w_m <= 0.0f) disp_w_m = 0.700f;
-	if (disp_h_m <= 0.0f) disp_h_m = 0.394f;
-
-	// Compute comfortable Z range: ±1/5 of max(display_w, display_h)
-	float zmax = compute_zmax(sys);
-
-	// Compute and apply poses for each window
-	for (int idx = 0; idx < n; idx++) {
-		int s = active[idx];
-		struct xrt_pose pose = {};
-		float w_m = 0, h_m = 0;
-
-		switch (dl.mode) {
-		case 0: // Carousel
-			carousel_compute_pose(idx, n, dl.angle_offset, dl.radius_m,
-			                      dl.base_win_w, dl.base_win_h, zmax, &pose, &w_m, &h_m);
-			break;
-		}
-
-		mc->clients[s].window_pose = pose;
-		mc->clients[s].window_width_m = w_m;
-		mc->clients[s].window_height_m = h_m;
-		mc->clients[s].anim.active = false; // dynamic layout overrides animation
-
-		slot_pose_to_pixel_rect(sys, &mc->clients[s],
-		                        &mc->clients[s].window_rect_x,
-		                        &mc->clients[s].window_rect_y,
-		                        &mc->clients[s].window_rect_w,
-		                        &mc->clients[s].window_rect_h);
-		mc->clients[s].hwnd_resize_pending = true;
-	}
-}
-
-/*!
- * Enter a dynamic layout mode. Initializes state and starts transition.
- */
-static void
-enter_dynamic_layout(struct d3d11_service_system *sys, struct d3d11_multi_compositor *mc, int mode)
-{
-	float disp_w_m = sys->base.info.display_width_m;
-	float disp_h_m = sys->base.info.display_height_m;
-	if (disp_w_m <= 0.0f) disp_w_m = 0.700f;
-	if (disp_h_m <= 0.0f) disp_h_m = 0.394f;
-
-	// Un-minimize all windows
-	for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
-		if (mc->clients[i].active) mc->clients[i].minimized = false;
-	}
-
-	if (mode != 0) return; // Only carousel (mode 0) supported
-
-	mc->dynamic_layout.prev_layout = mc->current_layout;
-	mc->dynamic_layout.mode = mode;
-	mc->dynamic_layout.angle_offset = 0.0f;
-	mc->dynamic_layout.angular_velocity = DYNAMIC_ROTATION_SPEED;
-	mc->dynamic_layout.user_dragging = false;
-	mc->dynamic_layout.last_tick_ns = os_monotonic_get_ns();
-	mc->dynamic_layout.radius_m = 0.12f; // 12cm default radius
-	mc->dynamic_layout.base_win_w = disp_w_m * 0.40f;
-	mc->dynamic_layout.base_win_h = disp_h_m * 0.40f;
-
-	mc->current_layout = 4; // 4=carousel
-
-	U_LOG_W("Multi-comp: dynamic layout → carousel");
-}
-
-/*!
- * Apply a layout preset to all active (non-minimized) windows.
- * layout_id: 0=grid, 1=immersive
- * For dynamic layouts (carousel), use enter_dynamic_layout() instead.
- */
-static void
-apply_layout(struct d3d11_service_system *sys, struct d3d11_multi_compositor *mc, int layout_id)
-{
-	float disp_w_m = sys->base.info.display_width_m;
-	float disp_h_m = sys->base.info.display_height_m;
-	if (disp_w_m <= 0.0f) disp_w_m = 0.700f;
-	if (disp_h_m <= 0.0f) disp_h_m = 0.394f;
-
-	// Count ALL active clients (un-minimize them for layout)
-	int active[D3D11_MULTI_MAX_CLIENTS];
-	int n = 0;
-	for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
-		if (mc->clients[i].active) {
-			mc->clients[i].minimized = false; // Un-minimize for layout
-			active[n++] = i;
-		}
-	}
-	if (n == 0) return;
-
-	const char *layout_names[] = {"grid", "immersive"};
-	if (layout_id < 0 || layout_id > 1) return;
-	U_LOG_W("Multi-comp: layout %s (%d windows)", layout_names[layout_id], n);
-	mc->current_layout = layout_id;
-	mc->dynamic_layout.mode = -1; // Exit dynamic mode when entering static layout
-
-	for (int idx = 0; idx < n; idx++) {
-		int s = active[idx];
-		float new_x = 0, new_y = 0, new_z = 0, new_w = 0, new_h = 0;
-		struct xrt_quat new_orient = {0, 0, 0, 1}; // identity
-
-		switch (layout_id) {
-		case 0: { // Grid: adaptive grid via compute_grid_layout
-			compute_grid_layout(sys, n, idx, &new_x, &new_y, &new_z, &new_w, &new_h);
-			break;
-		}
-
-		case 1: { // Immersive: grid tangent to convex paraboloid (spoon/bowl shape)
-			compute_grid_layout(sys, n, idx, &new_x, &new_y, &new_z, &new_w, &new_h);
-
-			// Paraboloid: Z = curvature * (x² + y²)
-			// Center at Z=0 (display plane), edges push forward (toward viewer).
-			// curvature chosen so max edge is at ~+0.015m.
-			float disp_w = sys->base.info.display_width_m;
-			float disp_h = sys->base.info.display_height_m;
-			if (disp_w <= 0.0f) disp_w = 0.700f;
-			if (disp_h <= 0.0f) disp_h = 0.394f;
-			float max_r_sq = (disp_w / 2) * (disp_w / 2) + (disp_h / 2) * (disp_h / 2);
-			float curvature = 0.015f / max_r_sq; // +0.015m at corners
-			float r_sq = new_x * new_x + new_y * new_y;
-			new_z = curvature * r_sq;
-
-			// Tangent to paraboloid: surface normal at (x,y) is (-dZ/dx, -dZ/dy, 1).
-			// dZ/dx = 2*c*x, dZ/dy = 2*c*y. Normal = (-2cx, -2cy, 1).
-			// Window should face along the normal (inward toward viewer).
-			// Yaw (rotation about Y): window on right edge tilts left → negative yaw.
-			// Pitch (rotation about X): window on top edge tilts down → positive pitch.
-			float dzdx = 2.0f * curvature * new_x;
-			float dzdy = 2.0f * curvature * new_y;
-			float yaw = -atanf(dzdx);   // right edge → negative yaw (face left/inward)
-			float pitch = atanf(dzdy);   // top edge → positive pitch (face down/inward)
-			float cy = cosf(yaw / 2), sy = sinf(yaw / 2);
-			float cp = cosf(pitch / 2), sp = sinf(pitch / 2);
-			new_orient.x = sp * cy;
-			new_orient.y = cp * sy;
-			new_orient.z = -sp * sy;
-			new_orient.w = cp * cy;
-			break;
-		}
-
-		default:
-			return;
-		}
-
-		// Animate to target pose instead of instant snap
-		struct xrt_pose target_pose;
-		target_pose.position.x = new_x;
-		target_pose.position.y = new_y;
-		target_pose.position.z = new_z;
-		target_pose.orientation = new_orient;
-
-		uint64_t now_ns = os_monotonic_get_ns();
-		slot_animate_to(&mc->clients[s], &target_pose, new_w, new_h,
-		                now_ns, ANIM_DURATION_NS);
-	}
-
-	multi_compositor_update_input_forward(mc);
 }
 
 /*!
@@ -5894,34 +5587,6 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			}
 			U_LOG_W("Multi-comp: %sTAB → focused slot %d", reverse ? "Shift+" : "", mc->focused_slot);
 			multi_compositor_update_input_forward(mc);
-
-
-			// Dynamic carousel: TAB rotates to bring focused window to front + pause 5s
-			if (mc->dynamic_layout.mode == 0 && mc->focused_slot >= 0) {
-				// Find the index of the focused slot among active windows
-				int active_idx = -1;
-				int n_active = 0;
-				for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
-					if (mc->clients[i].active && !mc->clients[i].minimized) {
-						if (i == mc->focused_slot) active_idx = n_active;
-						n_active++;
-					}
-				}
-				if (active_idx >= 0 && n_active > 0) {
-					// Target angle: the angle_offset that places active_idx at the front (angle=0)
-					float base_angle = (2.0f * (float)M_PI / (float)n_active) * active_idx;
-					// We want base_angle + target_offset = 0 (mod 2π) → target_offset = -base_angle
-					float target = -base_angle;
-					// Find shortest rotation from current angle
-					float diff = target - mc->dynamic_layout.angle_offset;
-					// Normalize to [-π, π]
-					while (diff > (float)M_PI) diff -= 2.0f * (float)M_PI;
-					while (diff < -(float)M_PI) diff += 2.0f * (float)M_PI;
-					mc->dynamic_layout.target_angle = mc->dynamic_layout.angle_offset + diff;
-					mc->dynamic_layout.angular_velocity = diff * 3.0f; // arrive in ~0.33s
-					mc->dynamic_layout.pause_until_ns = os_monotonic_get_ns() + 5000000000ULL; // 5 seconds
-				}
-			}
 		}
 	}
 
@@ -5970,16 +5635,10 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		comp_d3d11_window_request_app_launch(mc->window);
 	}
 
-	// Layout presets: Ctrl+1=grid, Ctrl+2=immersive, Ctrl+3=carousel
-	if (GetAsyncKeyState(VK_CONTROL) & 0x8000) {
-		if (GetAsyncKeyState('1') & 1) {
-			apply_layout(sys, mc, 0); // grid
-		} else if (GetAsyncKeyState('2') & 1) {
-			apply_layout(sys, mc, 1); // immersive
-		} else if (GetAsyncKeyState('3') & 1) {
-			enter_dynamic_layout(sys, mc, 0); // carousel
-		}
-	}
+	// Phase 2.G: Ctrl+1..3 layout presets are owned by the workspace
+	// controller now; the runtime no longer intercepts them. Keys flow
+	// through xrEnumerateWorkspaceInputEventsEXT and the controller
+	// pushes per-client poses via xrSetWorkspaceClientWindowPoseEXT.
 
 after_key_shortcuts:
 	(void)0; // label target for the launcher-visible fast-path above.
@@ -6040,84 +5699,6 @@ after_key_shortcuts:
 		bool lmb_just_pressed = lmb_held && !mc->prev_lmb_held;
 		mc->prev_lmb_held = lmb_held;
 
-		// Dynamic layout drag: title bar LMB controls carousel rotation.
-		// Content clicks/drags pause rotation and forward to app normally.
-		if (mc->dynamic_layout.mode >= 0) {
-			if (lmb_just_pressed) {
-				POINT pt;
-				GetCursorPos(&pt);
-				ScreenToClient(mc->hwnd, &pt);
-				struct workspace_hit_result hit = workspace_raycast_hit_test(sys, mc, pt);
-				// Close/minimize/background/taskbar → normal handler
-				if (hit.slot < 0 || hit.in_close_btn || hit.in_minimize_btn || hit.in_maximize_btn) {
-					goto normal_lmb_handling;
-				}
-				// Content click → pause rotation, focus window.
-				// Mouse events forwarded to app via WndProc input forwarding.
-				if (hit.in_content) {
-					mc->dynamic_layout.angular_velocity = 0.0f;
-					mc->dynamic_layout.pause_until_ns = UINT64_MAX; // pause until release
-					if (hit.slot != mc->focused_slot) {
-						mc->focused_slot = hit.slot;
-						multi_compositor_update_input_forward(mc);
-					}
-				}
-				// Only title bar drag controls carousel rotation
-				if (hit.slot >= 0 && hit.in_title_bar) {
-					// Start drag: capture angle + cursor
-					mc->dynamic_layout.user_dragging = true;
-					mc->dynamic_layout.drag_start_angle = mc->dynamic_layout.angle_offset;
-					mc->dynamic_layout.drag_start_cursor = pt;
-					mc->dynamic_layout.prev_angle_offset = mc->dynamic_layout.angle_offset;
-					mc->dynamic_layout.prev_drag_ns = os_monotonic_get_ns();
-					mc->dynamic_layout.angular_velocity = 0.0f; // stop auto-rotation
-					mc->dynamic_layout.pause_until_ns = 0; // cancel any TAB pause
-					// Focus the clicked window
-					if (hit.slot != mc->focused_slot) {
-						mc->focused_slot = hit.slot;
-						multi_compositor_update_input_forward(mc);
-					}
-				}
-			} else if (lmb_held && mc->dynamic_layout.user_dragging) {
-				// Drag in progress: update angle from horizontal mouse delta
-				POINT pt;
-				GetCursorPos(&pt);
-				ScreenToClient(mc->hwnd, &pt);
-				float dx_px = (float)(pt.x - mc->dynamic_layout.drag_start_cursor.x);
-				// Sensitivity: ~1 radian per half-display-width
-				float disp_px_w = (float)sys->base.info.display_pixel_width;
-				if (disp_px_w <= 0) disp_px_w = 3840;
-				float sensitivity = 2.0f / disp_px_w; // radians per pixel
-				mc->dynamic_layout.angle_offset = mc->dynamic_layout.drag_start_angle + dx_px * sensitivity;
-				// Track velocity for momentum
-				uint64_t now = os_monotonic_get_ns();
-				float drag_dt = (float)(now - mc->dynamic_layout.prev_drag_ns) / 1e9f;
-				if (drag_dt > 0.001f) {
-					float dangle = mc->dynamic_layout.angle_offset - mc->dynamic_layout.prev_angle_offset;
-					mc->dynamic_layout.angular_velocity = dangle / drag_dt;
-					mc->dynamic_layout.prev_angle_offset = mc->dynamic_layout.angle_offset;
-					mc->dynamic_layout.prev_drag_ns = now;
-				}
-			} else if (!lmb_held && mc->dynamic_layout.user_dragging) {
-				// Release: resume with momentum (angular_velocity already set from tracking)
-				mc->dynamic_layout.user_dragging = false;
-				// Clamp momentum to reasonable range
-				if (mc->dynamic_layout.angular_velocity > 3.0f) mc->dynamic_layout.angular_velocity = 3.0f;
-				if (mc->dynamic_layout.angular_velocity < -3.0f) mc->dynamic_layout.angular_velocity = -3.0f;
-			}
-			// When LMB released in dynamic mode: resume rotation after 3s pause
-			if (!lmb_held && !mc->dynamic_layout.user_dragging &&
-			    mc->dynamic_layout.pause_until_ns == UINT64_MAX) {
-				mc->dynamic_layout.pause_until_ns = os_monotonic_get_ns() + 3000000000ULL;
-				mc->dynamic_layout.target_angle = mc->dynamic_layout.angle_offset;
-			}
-			// Only skip normal LMB handling when actively carousel-dragging
-			if (mc->dynamic_layout.user_dragging) {
-				goto after_lmb_handling;
-			}
-		}
-
-		normal_lmb_handling:
 		if (lmb_just_pressed && !mc->title_drag.active && !mc->resize.active) {
 			POINT pt;
 			GetCursorPos(&pt);
@@ -6457,19 +6038,6 @@ after_key_shortcuts:
 	}
 	after_lmb_handling:
 
-	// Scroll in dynamic mode: adjust radius
-	if (mc->dynamic_layout.mode >= 0) {
-		if (mc->window != nullptr) {
-			int32_t scroll = comp_d3d11_window_consume_scroll(mc->window);
-			if (scroll != 0) {
-				float delta = (float)scroll / (120.0f * 20.0f); // ~5% per notch
-				mc->dynamic_layout.radius_m *= (1.0f + delta);
-				if (mc->dynamic_layout.radius_m < 0.05f) mc->dynamic_layout.radius_m = 0.05f;
-				if (mc->dynamic_layout.radius_m > 0.30f) mc->dynamic_layout.radius_m = 0.30f;
-			}
-		}
-	}
-
 	// Right-click: title bar RMB drag = rotation, content RMB = focus + forward to app.
 	// Call GetAsyncKeyState ONCE to avoid consuming the & 1 press bit (Phase 2 lesson #4).
 	{
@@ -6546,7 +6114,6 @@ after_key_shortcuts:
 					if (pitch > max_pitch) pitch = max_pitch;
 
 					mc->clients[s].window_pose.orientation = quat_from_yaw_pitch(yaw, pitch);
-					mc->current_layout = -1; // Manual rotation breaks layout
 				}
 			}
 		} else {
@@ -6691,25 +6258,10 @@ after_key_shortcuts:
 	(void)display_w_m;
 	(void)display_h_m;
 
-	// Tick dynamic layout (carousel/orbital/helix/expose) — continuously drives window poses.
-	if (mc->dynamic_layout.mode >= 0) {
-		dynamic_layout_tick(sys, mc, os_monotonic_get_ns());
-		// Update input forwarding rect every frame — windows move continuously
-		// in dynamic mode, so the forwarding rect from focus-change is stale.
-		multi_compositor_update_input_forward(mc);
-	}
-
-	// Debounced re-grid: apply grid layout after 500ms of no new client connections.
-	if (mc->regrid_pending_ns > 0 && os_monotonic_get_ns() >= mc->regrid_pending_ns &&
-	    mc->dynamic_layout.mode < 0) {
-		mc->regrid_pending_ns = 0;
-		apply_layout(sys, mc, mc->current_layout >= 0 ? mc->current_layout : 1);
-		U_LOG_W("Multi-comp: debounced re-grid applied (%u clients)", mc->client_count);
-	}
-
 	// Tick per-slot animations (for static layout transitions + entry animations).
-	// Skipped when dynamic layout is active (it drives poses directly).
-	if (mc->dynamic_layout.mode < 0) {
+	// Phase 2.G: layout-preset state machine moved to the workspace controller,
+	// so this no longer needs to skip when a "dynamic" layout is active.
+	{
 		uint64_t anim_now = os_monotonic_get_ns();
 		bool focused_rect_changed = false;
 		for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
@@ -6732,8 +6284,8 @@ after_key_shortcuts:
 		// never reach the app. First click misses, then MOUSEMOVE with
 		// the button held crosses into the stale rect and gets forwarded
 		// without a paired LBUTTONDOWN — the app sees a drag with no
-		// click. Title-bar drag and apply_layout masked the bug because
-		// both call update_input_forward at the end.
+		// click. Title-bar drag masks the bug because it also calls
+		// update_input_forward at the end.
 		if (focused_rect_changed) {
 			multi_compositor_update_input_forward(mc);
 		}
@@ -12355,42 +11907,6 @@ comp_d3d11_service_set_launcher_visible(struct xrt_system_compositor *xsysc, boo
 		InvalidateRect(mc->hwnd, nullptr, FALSE);
 	}
 }
-
-// Apply a named layout preset. Mirrors the Ctrl+1/2/3 hotkey dispatch
-// in the event loop so MCP agents trigger the same code path a user
-// would. Returns false on unknown name or when workspace mode is not active.
-bool
-comp_d3d11_service_apply_layout_preset(struct xrt_system_compositor *xsysc,
-                                        const char *preset_name)
-{
-	if (xsysc == nullptr || preset_name == nullptr) {
-		return false;
-	}
-
-	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
-	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
-
-	struct d3d11_multi_compositor *mc = sys->multi_comp;
-	if (mc == nullptr || !sys->workspace_mode) {
-		return false;
-	}
-
-	if (strcmp(preset_name, "grid") == 0) {
-		apply_layout(sys, mc, 0);
-	} else if (strcmp(preset_name, "immersive") == 0) {
-		apply_layout(sys, mc, 1);
-	} else if (strcmp(preset_name, "carousel") == 0) {
-		enter_dynamic_layout(sys, mc, 0);
-	} else {
-		return false;
-	}
-
-	if (mc->hwnd != nullptr) {
-		InvalidateRect(mc->hwnd, nullptr, FALSE);
-	}
-	return true;
-}
-
 
 void
 comp_d3d11_service_poll_mcp_capture(struct xrt_system_compositor *xsysc)

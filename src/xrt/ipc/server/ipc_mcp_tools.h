@@ -6,7 +6,9 @@
  * @ingroup ipc_server
  *
  * These tools back Phase B of the MCP v0.2 spec: list_windows,
- * get/set_window_pose, set_focus, apply_layout_preset, save/load_workspace.
+ * get/set_window_pose, set_focus, save/load_workspace, capture_frame.
+ * (apply_layout_preset moved out in Phase 2.G — controllers now compose
+ * presets out of per-client set_window_pose calls.)
  * They run on the MCP server thread started by u_mcp_server_maybe_start_named()
  * and read/write workspace state via the same IPC paths the workspace controller uses.
  *

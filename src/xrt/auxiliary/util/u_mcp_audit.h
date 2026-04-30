@@ -31,7 +31,7 @@ extern "C" {
 
 /*!
  * Append one audit entry. @p client_id may be 0 when the tool is not
- * per-client (e.g. @c apply_layout_preset); @p args_hash should be a
+ * per-client (e.g. @c save_workspace); @p args_hash should be a
  * stable hash of the tool's parameters (callers typically feed a djb2
  * or FNV over the serialized JSON). Non-blocking best-effort; failures
  * are logged via U_LOG_W and otherwise ignored.

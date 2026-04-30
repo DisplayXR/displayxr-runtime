@@ -382,42 +382,6 @@ tool_set_focus(const cJSON *params, void *userdata)
 }
 
 
-// ---------- apply_layout_preset ----------
-
-static cJSON *
-tool_apply_layout_preset(const cJSON *params, void *userdata)
-{
-	(void)userdata;
-	struct ipc_server *s = g_ipc_server;
-	if (s == NULL || params == NULL) {
-		return NULL;
-	}
-	const cJSON *name = cJSON_GetObjectItemCaseSensitive(params, "preset");
-	if (!cJSON_IsString(name) || name->valuestring == NULL) {
-		return NULL;
-	}
-
-	// Preset is not scoped to one client — pass client_id=0 to the gate;
-	// with an explicit allowlist, any policy blocks all layout changes.
-	if (!gate_write("apply_layout_preset", params, 0)) {
-		return NULL;
-	}
-
-#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
-	if (s->xsysc == NULL) {
-		return NULL;
-	}
-	bool ok = comp_d3d11_service_apply_layout_preset(s->xsysc, name->valuestring);
-	cJSON *r = cJSON_CreateObject();
-	cJSON_AddBoolToObject(r, "ok", ok);
-	cJSON_AddStringToObject(r, "preset", name->valuestring);
-	return r;
-#else
-	return NULL;
-#endif
-}
-
-
 // ---------- workspace persistence ----------
 
 #define WORKSPACE_SCHEMA_VERSION 1
@@ -837,19 +801,6 @@ static const struct u_mcp_tool TOOL_LOAD_WORKSPACE = {
     .userdata = NULL,
 };
 
-static const struct u_mcp_tool TOOL_APPLY_LAYOUT_PRESET = {
-    .name = "apply_layout_preset",
-    .description =
-        "Apply a named workspace layout preset. Valid names: grid, immersive, carousel.",
-    .input_schema_json =
-        "{\"type\":\"object\",\"required\":[\"preset\"],"
-        "\"properties\":{\"preset\":{\"type\":\"string\","
-        "\"enum\":[\"grid\",\"immersive\",\"carousel\"]}},"
-        "\"additionalProperties\":false}",
-    .fn = tool_apply_layout_preset,
-    .userdata = NULL,
-};
-
 static const struct u_mcp_tool TOOL_SET_WINDOW_POSE = {
     .name = "set_window_pose",
     .description =
@@ -985,7 +936,6 @@ ipc_mcp_tools_register(struct ipc_server *s)
 	u_mcp_server_register_tool(&TOOL_GET_WINDOW_POSE);
 	u_mcp_server_register_tool(&TOOL_SET_WINDOW_POSE);
 	u_mcp_server_register_tool(&TOOL_SET_FOCUS);
-	u_mcp_server_register_tool(&TOOL_APPLY_LAYOUT_PRESET);
 	u_mcp_server_register_tool(&TOOL_SAVE_WORKSPACE);
 	u_mcp_server_register_tool(&TOOL_LOAD_WORKSPACE);
 	u_mcp_server_register_tool(&TOOL_CAPTURE_FRAME_SERVICE);

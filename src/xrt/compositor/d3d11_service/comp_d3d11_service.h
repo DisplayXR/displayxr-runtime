@@ -210,19 +210,6 @@ comp_d3d11_service_get_client_window_pose(struct xrt_system_compositor *xsysc,
                                            float *out_height_m);
 
 /*!
- * Apply a named layout preset to all active windows. Preset names:
- * `grid`, `immersive`, `carousel`. Mirrors the Ctrl+1/2/3 hotkeys so
- * an MCP agent can trigger the same layouts an interactive user gets.
- *
- * @return true on success, false if the preset name is unknown or the
- *         compositor is not in workspace mode.
- */
-bool
-comp_d3d11_service_apply_layout_preset(struct xrt_system_compositor *xsysc,
-                                        const char *preset_name);
-
-
-/*!
  * @name Capture client management (Phase 4A)
  * @{
  */
