@@ -466,6 +466,10 @@ comp_d3d11_service_workspace_pointer_capture_set(struct xrt_system_compositor *x
  * clients the runtime emits XRT_SESSION_EVENT_EXIT_REQUEST so the client exits
  * cleanly; for capture clients the runtime tears down the capture immediately.
  *
+ * Capture-client convenience: client_id >= 1000 is treated as slot
+ * (client_id - 1000). For OpenXR clients use the slot resolved via
+ * comp_d3d11_service_workspace_find_slot_by_xc + the _by_slot helper below.
+ *
  * @return XRT_SUCCESS on success;
  *         XRT_ERROR_IPC_FAILURE if @p xsysc is invalid or the client is unknown.
  */
@@ -475,7 +479,7 @@ comp_d3d11_service_workspace_request_client_exit(struct xrt_system_compositor *x
 /*!
  * Phase 2.K: ask the runtime to toggle fullscreen for a specific workspace
  * client. Mirrors the runtime's built-in F11 shortcut, but targeted at any
- * client.
+ * client. Same client_id encoding as request_client_exit.
  *
  * @return XRT_SUCCESS on success;
  *         XRT_ERROR_IPC_FAILURE if @p xsysc is invalid or the client is unknown.
@@ -484,6 +488,30 @@ xrt_result_t
 comp_d3d11_service_workspace_request_client_fullscreen(struct xrt_system_compositor *xsysc,
                                                        uint32_t client_id,
                                                        bool fullscreen);
+
+/*!
+ * Phase 2.K: slot-form of request_client_exit. The IPC handler resolves
+ * OpenXR client_ids to slots via find_slot_by_xc and calls this directly.
+ */
+xrt_result_t
+comp_d3d11_service_workspace_request_exit_by_slot(struct xrt_system_compositor *xsysc, int slot);
+
+/*!
+ * Phase 2.K: slot-form of request_client_fullscreen.
+ */
+xrt_result_t
+comp_d3d11_service_workspace_request_fullscreen_by_slot(struct xrt_system_compositor *xsysc,
+                                                        int slot,
+                                                        bool fullscreen);
+
+/*!
+ * Phase 2.K: resolve the multi-compositor slot bound to an xrt_compositor.
+ * Returns -1 on miss. Used by the IPC handler to translate OpenXR client_ids
+ * (looked up via the IPC thread table) to slot indices for the request_*_by_slot
+ * helpers.
+ */
+int
+comp_d3d11_service_workspace_find_slot_by_xc(struct xrt_system_compositor *xsysc, struct xrt_compositor *xc);
 
 /*! @} */
 

@@ -5608,29 +5608,23 @@ multi_compositor_render(struct d3d11_service_system *sys)
 
 	// DELETE: close focused client
 	if (GetAsyncKeyState(VK_DELETE) & 1) {
-		if (mc->focused_slot >= 0 && mc->focused_slot < D3D11_MULTI_MAX_CLIENTS &&
-		    mc->clients[mc->focused_slot].active) {
-			if (mc->clients[mc->focused_slot].client_type == CLIENT_TYPE_CAPTURE) {
-				// Capture client: remove directly
-				multi_compositor_remove_capture_client(sys, mc->focused_slot);
-				U_LOG_W("Multi-comp: DELETE → removed capture slot %d", mc->focused_slot);
-			} else {
-				// IPC client: send exit request
-				struct d3d11_service_compositor *fc = mc->clients[mc->focused_slot].compositor;
-				if (fc != nullptr && fc->xses != nullptr) {
-					union xrt_session_event xse = XRT_STRUCT_INIT;
-					xse.type = XRT_SESSION_EVENT_EXIT_REQUEST;
-					xrt_session_event_sink_push(fc->xses, &xse);
-					U_LOG_W("Multi-comp: DELETE → exit request for slot %d", mc->focused_slot);
-				}
-			}
+		// Phase 2.K: keyboard shortcut now routes through the same helper
+		// the public API uses. Behaviour is unchanged for users.
+		if (mc->focused_slot >= 0) {
+			comp_d3d11_service_workspace_request_exit_by_slot(
+			    (struct xrt_system_compositor *)sys, mc->focused_slot);
 		}
 	}
 
 	// F11: toggle fullscreen for the focused window
 	if (GetAsyncKeyState(VK_F11) & 1) {
 		if (mc->focused_slot >= 0) {
-			toggle_fullscreen(sys, mc, mc->focused_slot);
+			// Phase 2.K: keyboard shortcut routes through the helper too.
+			// Pass !maximized to flip the current state (the helper
+			// no-ops if the requested state already matches).
+			bool current_max = mc->clients[mc->focused_slot].maximized;
+			comp_d3d11_service_workspace_request_fullscreen_by_slot(
+			    (struct xrt_system_compositor *)sys, mc->focused_slot, !current_max);
 		}
 	}
 
@@ -11495,18 +11489,105 @@ comp_d3d11_service_workspace_pointer_capture_set(struct xrt_system_compositor *x
 	return true;
 }
 
-// Phase 2.K commit 1 stubs. Real implementations land in commit 3 by extracting
-// the existing DELETE-key / F11-key handlers into named helpers. Until then the
-// public surface resolves and dispatch returns success without effect so the
-// controller can wire the calls without breaking.
+// Phase 2.K: targeted exit / fullscreen requests. Mirror the existing DELETE
+// and F11 keyboard shortcuts but accept any slot (not only the focused one)
+// so a controller can drive these from chrome / overview / scripted UI.
+//
+// Two entry points: a slot-based one used by the inline DELETE/F11 handlers
+// and a client_id-based one used by the IPC handler. The IPC handler resolves
+// capture-client client_ids (>= 1000) to slots directly and OpenXR-client
+// client_ids by looking up the IPC thread table for the matching xrt_compositor
+// — same pattern as workspace_set_window_pose.
+//
+// Helpers return XRT_ERROR_IPC_FAILURE on miss so the OpenXR layer maps it to
+// XR_ERROR_HANDLE_INVALID at the API boundary.
 extern "C" xrt_result_t
-comp_d3d11_service_workspace_request_client_exit(struct xrt_system_compositor *xsysc, uint32_t client_id)
+comp_d3d11_service_workspace_request_exit_by_slot(struct xrt_system_compositor *xsysc, int slot)
 {
 	if (xsysc == nullptr) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
-	(void)client_id;
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	if (!sys->workspace_mode || mc == nullptr) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	if (slot < 0 || slot >= D3D11_MULTI_MAX_CLIENTS || !mc->clients[slot].active) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	if (mc->clients[slot].client_type == CLIENT_TYPE_CAPTURE) {
+		multi_compositor_remove_capture_client(sys, slot);
+		U_LOG_W("Workspace: request_exit → removed capture slot %d", slot);
+	} else {
+		struct d3d11_service_compositor *fc = mc->clients[slot].compositor;
+		if (fc == nullptr || fc->xses == nullptr) {
+			return XRT_ERROR_IPC_FAILURE;
+		}
+		union xrt_session_event xse = XRT_STRUCT_INIT;
+		xse.type = XRT_SESSION_EVENT_EXIT_REQUEST;
+		xrt_session_event_sink_push(fc->xses, &xse);
+		U_LOG_W("Workspace: request_exit → exit request for slot %d", slot);
+	}
 	return XRT_SUCCESS;
+}
+
+extern "C" xrt_result_t
+comp_d3d11_service_workspace_request_fullscreen_by_slot(struct xrt_system_compositor *xsysc,
+                                                        int slot,
+                                                        bool fullscreen)
+{
+	if (xsysc == nullptr) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	if (!sys->workspace_mode || mc == nullptr) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	if (slot < 0 || slot >= D3D11_MULTI_MAX_CLIENTS || !mc->clients[slot].active) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	bool currently_max = mc->clients[slot].maximized;
+	if (fullscreen != currently_max) {
+		toggle_fullscreen(sys, mc, slot);
+	}
+	return XRT_SUCCESS;
+}
+
+// Look up the slot bound to a given xrt_compositor (OpenXR client). Used by
+// the IPC handler when it has translated client_id → ics->xc and needs the
+// matching multi-compositor slot. Returns -1 on miss.
+extern "C" int
+comp_d3d11_service_workspace_find_slot_by_xc(struct xrt_system_compositor *xsysc, struct xrt_compositor *xc)
+{
+	if (xsysc == nullptr || xc == nullptr) {
+		return -1;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	if (mc == nullptr) {
+		return -1;
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	return multi_comp_find_slot(mc, c);
+}
+
+// IPC-facing wrappers (signatures from comp_d3d11_service.h). Resolve
+// capture-client ids directly; OpenXR-client ids must already be translated
+// to a slot before calling — the IPC handler in ipc_server_handler.c uses
+// comp_d3d11_service_workspace_find_slot_by_xc for that.
+extern "C" xrt_result_t
+comp_d3d11_service_workspace_request_client_exit(struct xrt_system_compositor *xsysc, uint32_t client_id)
+{
+	if (client_id >= 1000u) {
+		return comp_d3d11_service_workspace_request_exit_by_slot(xsysc, (int)(client_id - 1000u));
+	}
+	// IPC handler path goes through find_slot_by_xc + request_exit_by_slot.
+	// This entry point is a fallback that only handles capture clients.
+	return XRT_ERROR_IPC_FAILURE;
 }
 
 extern "C" xrt_result_t
@@ -11514,12 +11595,11 @@ comp_d3d11_service_workspace_request_client_fullscreen(struct xrt_system_composi
                                                        uint32_t client_id,
                                                        bool fullscreen)
 {
-	if (xsysc == nullptr) {
-		return XRT_ERROR_IPC_FAILURE;
+	if (client_id >= 1000u) {
+		return comp_d3d11_service_workspace_request_fullscreen_by_slot(
+		    xsysc, (int)(client_id - 1000u), fullscreen);
 	}
-	(void)client_id;
-	(void)fullscreen;
-	return XRT_SUCCESS;
+	return XRT_ERROR_IPC_FAILURE;
 }
 
 extern "C" bool

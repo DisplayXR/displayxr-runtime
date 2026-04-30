@@ -2752,7 +2752,34 @@ ipc_handle_workspace_request_client_exit(volatile struct ipc_client_state *_ics,
 	if (s->xsysc == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
-	return comp_d3d11_service_workspace_request_client_exit(s->xsysc, client_id);
+
+	// Capture-client ids resolve directly via the convention slot = id-1000.
+	if (client_id >= 1000) {
+		return comp_d3d11_service_workspace_request_exit_by_slot(s->xsysc,
+		                                                         (int)(client_id - 1000));
+	}
+
+	// OpenXR client: find the IPC thread by client_id, take its xrt_compositor,
+	// and ask the multi-compositor for the matching slot.
+	os_mutex_lock(&s->global_state.lock);
+	volatile struct ipc_client_state *target = NULL;
+	for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
+		volatile struct ipc_client_state *ics = &s->threads[i].ics;
+		if (ics->client_state.id == client_id && ics->server_thread_index >= 0) {
+			target = ics;
+			break;
+		}
+	}
+	if (target == NULL || target->xc == NULL) {
+		os_mutex_unlock(&s->global_state.lock);
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	int slot = comp_d3d11_service_workspace_find_slot_by_xc(s->xsysc, (struct xrt_compositor *)target->xc);
+	os_mutex_unlock(&s->global_state.lock);
+	if (slot < 0) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return comp_d3d11_service_workspace_request_exit_by_slot(s->xsysc, slot);
 #else
 	(void)s;
 	(void)client_id;
@@ -2777,7 +2804,31 @@ ipc_handle_workspace_request_client_fullscreen(volatile struct ipc_client_state 
 	if (s->xsysc == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
-	return comp_d3d11_service_workspace_request_client_fullscreen(s->xsysc, client_id, fullscreen);
+
+	if (client_id >= 1000) {
+		return comp_d3d11_service_workspace_request_fullscreen_by_slot(
+		    s->xsysc, (int)(client_id - 1000), fullscreen);
+	}
+
+	os_mutex_lock(&s->global_state.lock);
+	volatile struct ipc_client_state *target = NULL;
+	for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
+		volatile struct ipc_client_state *ics = &s->threads[i].ics;
+		if (ics->client_state.id == client_id && ics->server_thread_index >= 0) {
+			target = ics;
+			break;
+		}
+	}
+	if (target == NULL || target->xc == NULL) {
+		os_mutex_unlock(&s->global_state.lock);
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	int slot = comp_d3d11_service_workspace_find_slot_by_xc(s->xsysc, (struct xrt_compositor *)target->xc);
+	os_mutex_unlock(&s->global_state.lock);
+	if (slot < 0) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return comp_d3d11_service_workspace_request_fullscreen_by_slot(s->xsysc, slot, fullscreen);
 #else
 	(void)s;
 	(void)client_id;
