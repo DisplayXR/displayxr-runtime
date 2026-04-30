@@ -695,6 +695,20 @@ struct d3d11_multi_client_slot
 		uint64_t duration_ns;      //!< Animation duration in nanoseconds
 	} anim;
 
+	//! Phase 2.K Commit 8.C: chrome (pill) hover-fade state. Hover-enter
+	//! seeds target=1.0 over 150 ms; hover-exit seeds target=0.0 over
+	//! 300 ms. Per-frame slot_chrome_fade_tick eases alpha toward target.
+	//! The chrome render block multiplies alpha into the shader output;
+	//! when alpha < 0.01 the chrome render is skipped entirely.
+	struct
+	{
+		float    alpha;       //!< Current displayed alpha [0,1]
+		float    start_alpha; //!< Alpha when this fade started
+		float    target;      //!< Target alpha (0 = hidden, 1 = visible)
+		uint64_t start_ns;
+		uint64_t duration_ns;
+	} chrome_fade;
+
 	//! @name Capture-specific fields (only valid when client_type == CLIENT_TYPE_CAPTURE)
 	//! @{
 	struct d3d11_capture_context *capture_ctx;                //!< Opaque capture context
@@ -1520,6 +1534,7 @@ blit_to_atlas_texture(struct d3d11_service_system *sys,
 	cb->dst_size[0] = static_cast<float>(sys->display_width);
 	cb->dst_size[1] = static_cast<float>(sys->display_height);
 	cb->convert_srgb = is_srgb ? 1.0f : 0.0f;
+	cb->chrome_alpha = 0.0f; // 8.C: 0=full opacity (chrome blits override)
 	cb->quad_mode = 0.0f;
 	cb->dst_rect_wh[0] = dst_w;
 	cb->dst_rect_wh[1] = dst_h;
@@ -3462,6 +3477,7 @@ service_crop_atlas_for_dp(struct d3d11_service_system *sys,
 			cb->dst_rect_wh[0] = (float)content_view_w;
 			cb->dst_rect_wh[1] = (float)content_view_h;
 			cb->convert_srgb = 0.0f;
+			cb->chrome_alpha = 0.0f; // 8.C: 0=full opacity (chrome blits override)
 			cb->quad_mode = 0.0f;
 			cb->corner_radius = 0.0f;
 			cb->corner_aspect = 1.0f;
@@ -5178,6 +5194,49 @@ quat_is_identity(const struct xrt_quat *q)
 	       fabsf(q->z) < 0.0001f && fabsf(q->w - 1.0f) < 0.0001f;
 }
 
+// Phase 2.K Commit 8.C: chrome fade durations.
+#define WORKSPACE_CHROME_FADE_IN_NS  (150ULL * 1000000ULL)
+#define WORKSPACE_CHROME_FADE_OUT_NS (300ULL * 1000000ULL)
+
+// Seed a fade toward `target` over `duration_ns`. Reuses the current alpha as
+// the start so consecutive hover toggles pick up where they were rather than
+// snapping back to 0/1.
+static inline void
+slot_chrome_fade_to(struct d3d11_multi_client_slot *slot, float target, uint64_t duration_ns, uint64_t now_ns)
+{
+	if (slot == nullptr) return;
+	if (slot->chrome_fade.target == target && slot->chrome_fade.duration_ns != 0) {
+		return; // already heading there
+	}
+	slot->chrome_fade.start_alpha = slot->chrome_fade.alpha;
+	slot->chrome_fade.target = target;
+	slot->chrome_fade.start_ns = now_ns;
+	slot->chrome_fade.duration_ns = duration_ns;
+}
+
+// Tick the fade: ease-out cubic from start_alpha to target. Returns the
+// resolved current alpha (also written into slot->chrome_fade.alpha).
+static inline float
+slot_chrome_fade_tick(struct d3d11_multi_client_slot *slot, uint64_t now_ns)
+{
+	if (slot->chrome_fade.duration_ns == 0) {
+		return slot->chrome_fade.alpha;
+	}
+	uint64_t elapsed = (now_ns >= slot->chrome_fade.start_ns) ? now_ns - slot->chrome_fade.start_ns : 0;
+	float t = (float)((double)elapsed / (double)slot->chrome_fade.duration_ns);
+	if (t >= 1.0f) {
+		slot->chrome_fade.alpha = slot->chrome_fade.target;
+		slot->chrome_fade.duration_ns = 0;
+		return slot->chrome_fade.alpha;
+	}
+	// ease-out cubic: 1 - (1-t)^3
+	float f = 1.0f - t;
+	float eased = 1.0f - f * f * f;
+	slot->chrome_fade.alpha = slot->chrome_fade.start_alpha +
+	                          (slot->chrome_fade.target - slot->chrome_fade.start_alpha) * eased;
+	return slot->chrome_fade.alpha;
+}
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -5772,6 +5831,28 @@ after_key_shortcuts:
 			if (hover.in_close_btn) { mc->hover_btn = 1; mc->hover_btn_slot = hover.slot; }
 			else if (hover.in_minimize_btn) { mc->hover_btn = 2; mc->hover_btn_slot = hover.slot; }
 			else if (hover.in_maximize_btn) { mc->hover_btn = 3; mc->hover_btn_slot = hover.slot; }
+
+			// Phase 2.K Commit 8.C: per-slot chrome hover-fade. Hovered
+			// slot fades chrome in over 150 ms; everyone else fades out
+			// over 300 ms. Idle (cursor off any slot) → all chrome
+			// alphas head toward 0.
+			{
+				int hovered_slot = hover.slot; // -1 if no slot under cursor
+				uint64_t now_ns_chrome = os_monotonic_get_ns();
+				for (int sf = 0; sf < D3D11_MULTI_MAX_CLIENTS; sf++) {
+					if (!mc->clients[sf].active ||
+					    mc->clients[sf].client_type == CLIENT_TYPE_CAPTURE) {
+						continue;
+					}
+					if (sf == hovered_slot) {
+						slot_chrome_fade_to(&mc->clients[sf], 1.0f,
+						                    WORKSPACE_CHROME_FADE_IN_NS, now_ns_chrome);
+					} else {
+						slot_chrome_fade_to(&mc->clients[sf], 0.0f,
+						                    WORKSPACE_CHROME_FADE_OUT_NS, now_ns_chrome);
+					}
+				}
+			}
 
 			// Buttons get arrow cursor (no resize/drag cursor on buttons)
 			if (hover.in_close_btn || hover.in_minimize_btn || hover.in_maximize_btn) {
@@ -6610,6 +6691,7 @@ after_key_shortcuts:
 					cb->src_size[0] = (float)mc->logo_w; cb->src_size[1] = (float)mc->logo_h;
 					cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
 					cb->convert_srgb = 0.0f;
+					cb->chrome_alpha = 0.0f; // 8.C: 0=full opacity (chrome blits override)
 					cb->corner_radius = 0; cb->corner_aspect = 0;
 					cb->edge_feather = 0; cb->glow_intensity = 0;
 					cb->quad_mode = 0;
@@ -6654,6 +6736,7 @@ after_key_shortcuts:
 					cb->src_size[1] = (float)mc->font_atlas_h;
 					cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
 					cb->convert_srgb = 0.0f;
+					cb->chrome_alpha = 0.0f; // 8.C: 0=full opacity (chrome blits override)
 					cb->corner_radius = 0; cb->corner_aspect = 0;
 					cb->edge_feather = 0; cb->glow_intensity = 0;
 					cb->quad_mode = 0;
@@ -6924,6 +7007,7 @@ after_key_shortcuts:
 					gcb->src_size[0] = 1; gcb->src_size[1] = 1;
 					gcb->dst_size[0] = (float)ca_w; gcb->dst_size[1] = (float)ca_h;
 					gcb->convert_srgb = 3.0f;  // glow mode
+					gcb->chrome_alpha = 0.0f; // 8.C: 0=full opacity (chrome blits override)
 					gcb->corner_radius = 0; gcb->corner_aspect = 0;
 					gcb->edge_feather = 0.0f;
 					gcb->glow_intensity = UI_GLOW_INTENSITY;
@@ -7074,6 +7158,7 @@ after_key_shortcuts:
 					cb->dst_size[0] = (float)ca_w;
 					cb->dst_size[1] = (float)ca_h;
 					cb->convert_srgb = 2.0f;
+					cb->chrome_alpha = 0.0f; // 8.C: 0=full opacity (chrome blits override)
 					cb->dst_offset[0] = dx;
 					cb->dst_offset[1] = dy;
 					cb->dst_rect_wh[0] = dot_size;
@@ -7112,6 +7197,7 @@ after_key_shortcuts:
 				cb->dst_size[0] = static_cast<float>(ca_w);
 				cb->dst_size[1] = static_cast<float>(ca_h);
 				cb->convert_srgb = 0.0f;
+				cb->chrome_alpha = 0.0f; // 8.C: 0=full opacity (chrome blits override)
 				cb->quad_mode = use_quad ? 1.0f : 0.0f;
 				cb->dst_rect_wh[0] = dest_px_w;
 				cb->dst_rect_wh[1] = dest_px_h;
@@ -7199,7 +7285,17 @@ after_key_shortcuts:
 			const float pill_bot_m = win_hh + pill_gap_m;
 			const float pill_gap_frac = tb_h_frac * 0.5f; // mirrors pill_gap_m in atlas frac
 
-			if (tb_h_frac > 0.0f) {
+			// Phase 2.K Commit 8.C: tick the per-slot chrome fade and gate
+			// the entire render block on alpha. Below 1% alpha there's
+			// nothing visible so we skip the chrome blits entirely (saves
+			// ~half a dozen draw calls per faded-out window).
+			//
+			// Inverted shader semantic: cb->chrome_alpha = 1 - a_visible.
+			// 0 means "no fade" (full opacity); 1 means "fully transparent".
+			float chrome_a = slot_chrome_fade_tick(&mc->clients[s], os_monotonic_get_ns());
+			float chrome_fade_attenuation = 1.0f - chrome_a;
+
+			if (tb_h_frac > 0.0f && chrome_a >= 0.01f) {
 				for (uint32_t v2 = 0; v2 < num_views && v2 < XRT_MAX_VIEWS; v2++) {
 					uint32_t col2 = v2 % sys->tile_columns;
 					uint32_t row2 = v2 / sys->tile_columns;
@@ -7301,6 +7397,7 @@ after_key_shortcuts:
 							cb->src_size[0] = 1; cb->src_size[1] = 1;
 							cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
 							cb->convert_srgb = 2.0f;
+							cb->chrome_alpha = chrome_fade_attenuation; // 8.C: per-slot pill fade
 							// All four corners, full pill curve.
 							cb->corner_radius = -0.5f;
 							cb->corner_aspect = -((mc->clients[s].window_width_m * PILL_W_FRAC) / UI_TITLE_BAR_H_M);
@@ -7328,6 +7425,7 @@ after_key_shortcuts:
 							cb->src_size[0] = 1; cb->src_size[1] = 1;
 							cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
 							cb->convert_srgb = 2.0f;
+							cb->chrome_alpha = chrome_fade_attenuation; // 8.C: per-slot pill fade
 							// Round close button top-right corner only (negative aspect)
 							cb->corner_radius = 0.35f;
 							cb->corner_aspect = -(UI_BTN_W_M / UI_TITLE_BAR_H_M);
@@ -7355,6 +7453,7 @@ after_key_shortcuts:
 							cb->src_size[0] = 1; cb->src_size[1] = 1;
 							cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
 							cb->convert_srgb = 2.0f;
+							cb->chrome_alpha = chrome_fade_attenuation; // 8.C: per-slot pill fade
 							cb->corner_radius = 0; cb->corner_aspect = 0;
 							cb->edge_feather = 0.0f; cb->glow_intensity = 0.0f;
 							float min_x = tox + tow - 2.0f * (float)CLOSE_BTN_WIDTH_PX;
@@ -7379,6 +7478,7 @@ after_key_shortcuts:
 							cb->src_size[0] = 1; cb->src_size[1] = 1;
 							cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
 							cb->convert_srgb = 2.0f;
+							cb->chrome_alpha = chrome_fade_attenuation; // 8.C: per-slot pill fade
 							cb->corner_radius = 0; cb->corner_aspect = 0;
 							cb->edge_feather = 0.0f; cb->glow_intensity = 0.0f;
 							float max_x = tox + tow - 3.0f * (float)CLOSE_BTN_WIDTH_PX;
@@ -7434,6 +7534,7 @@ after_key_shortcuts:
 								cb->src_size[1] = (float)mc->font_atlas_h;
 								cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
 								cb->convert_srgb = 0.0f;
+								cb->chrome_alpha = chrome_fade_attenuation; // 8.C: per-slot pill fade
 								cb->corner_radius = 0; cb->corner_aspect = 0;
 								cb->edge_feather = 0.0f; cb->glow_intensity = 0.0f;
 								// Proportional glyph positioning — anchored
@@ -7478,6 +7579,7 @@ after_key_shortcuts:
 								cb->src_size[1] = (float)mc->font_atlas_h;
 								cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
 								cb->convert_srgb = 0.0f;
+								cb->chrome_alpha = chrome_fade_attenuation; // 8.C: per-slot pill fade
 								cb->corner_radius = 0; cb->corner_aspect = 0;
 								cb->edge_feather = 0.0f; cb->glow_intensity = 0.0f;
 								CHROME_BLIT_POS(cb,
@@ -7506,6 +7608,7 @@ after_key_shortcuts:
 								cb->src_size[1] = (float)mc->font_atlas_h;
 								cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
 								cb->convert_srgb = 0.0f;
+								cb->chrome_alpha = chrome_fade_attenuation; // 8.C: per-slot pill fade
 								cb->corner_radius = 0; cb->corner_aspect = 0;
 								cb->edge_feather = 0.0f; cb->glow_intensity = 0.0f;
 								CHROME_BLIT_POS(cb,
@@ -7549,6 +7652,7 @@ after_key_shortcuts:
 								cb->src_size[0] = 1; cb->src_size[1] = 1;
 								cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
 								cb->convert_srgb = 2.0f;
+								cb->chrome_alpha = chrome_fade_attenuation; // 8.C: per-slot pill fade
 								cb->corner_radius = 0.28f;
 								cb->corner_aspect = icon_w / icon_h;
 								cb->edge_feather = 0.0f; cb->glow_intensity = 0.0f;
@@ -7568,6 +7672,7 @@ after_key_shortcuts:
 								cb->src_size[0] = 1; cb->src_size[1] = 1;
 								cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
 								cb->convert_srgb = 2.0f;
+								cb->chrome_alpha = chrome_fade_attenuation; // 8.C: per-slot pill fade
 								cb->corner_radius = 0.20f;
 								float iw2 = icon_w - 2*stroke_x;
 								float ih2 = icon_h - 2*stroke_y;
@@ -7662,6 +7767,7 @@ after_key_shortcuts:
 					cb->dst_size[0] = (float)ca_w;
 					cb->dst_size[1] = (float)ca_h;
 					cb->convert_srgb = 2.0f;
+					cb->chrome_alpha = 0.0f; // 8.C: 0=full opacity (chrome blits override)
 					cb->quad_mode = 0;
 					cb->dst_rect_wh[0] = (float)half_w;
 					cb->dst_rect_wh[1] = (float)TASKBAR_HEIGHT_PX;
@@ -7705,6 +7811,7 @@ after_key_shortcuts:
 								cb2->dst_size[0] = (float)ca_w;
 								cb2->dst_size[1] = (float)ca_h;
 								cb2->convert_srgb = 2.0f;
+								cb2->chrome_alpha = 0.0f; // 8.C: 0=full opacity (chrome blits override)
 								cb2->quad_mode = 0;
 								cb2->dst_rect_wh[0] = pill_w;
 								cb2->dst_rect_wh[1] = pill_h;
@@ -7744,6 +7851,7 @@ after_key_shortcuts:
 								cb3->dst_size[0] = (float)ca_w;
 								cb3->dst_size[1] = (float)ca_h;
 								cb3->convert_srgb = 0.0f;
+								cb3->chrome_alpha = 0.0f; // 8.C: 0=full opacity (chrome blits override)
 								cb3->quad_mode = 0;
 								cb3->dst_rect_wh[0] = dst_gw;
 								cb3->dst_rect_wh[1] = tgh;
@@ -7826,6 +7934,7 @@ after_key_shortcuts:
 					cb->src_size[0] = 1; cb->src_size[1] = 1;
 					cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
 					cb->convert_srgb = 2.0f;
+					cb->chrome_alpha = 0.0f; // 8.C: 0=full opacity (chrome blits override)
 					cb->quad_mode = 0;
 					cb->dst_offset[0] = bg_x; cb->dst_offset[1] = bg_y;
 					cb->dst_rect_wh[0] = toast_w; cb->dst_rect_wh[1] = toast_h;
@@ -7860,6 +7969,7 @@ after_key_shortcuts:
 						cb->src_size[1] = (float)mc->font_atlas_h;
 						cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
 						cb->convert_srgb = 0.0f;
+						cb->chrome_alpha = 0.0f; // 8.C: 0=full opacity (chrome blits override)
 						cb->quad_mode = 0;
 						cb->dst_offset[0] = cursor_x; cb->dst_offset[1] = text_y;
 						cb->dst_rect_wh[0] = dst_gw; cb->dst_rect_wh[1] = gh;
@@ -8001,6 +8111,7 @@ after_key_shortcuts:
 			cb->dst_size[0] = (float)ca_w;
 			cb->dst_size[1] = (float)ca_h;
 			cb->convert_srgb = 2.0f; // solid-color mode
+			cb->chrome_alpha = 0.0f; // 8.C: 0=full opacity (chrome blits override)
 			// Negative radius + negative aspect = all four corners rounded.
 			cb->corner_radius = -fabsf(corner_radius);
 			cb->corner_aspect = (dh > 0.0f) ? -(dw / dh) : -1.0f;
@@ -8064,6 +8175,7 @@ after_key_shortcuts:
 						cb->src_size[1] = (float)mc->font_atlas_h;
 						cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
 						cb->convert_srgb = 0.0f;
+						cb->chrome_alpha = 0.0f; // 8.C: 0=full opacity (chrome blits override)
 						cb->corner_radius = 0.0f; cb->corner_aspect = 0.0f;
 						cb->edge_feather = 0.0f; cb->glow_intensity = 0.0f;
 						cb->quad_mode = 0;
@@ -8119,6 +8231,7 @@ after_key_shortcuts:
 					cb->src_size[1] = (float)mc->font_atlas_h;
 					cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
 					cb->convert_srgb = 0.0f;
+					cb->chrome_alpha = 0.0f; // 8.C: 0=full opacity (chrome blits override)
 					cb->corner_radius = 0.0f; cb->corner_aspect = 0.0f;
 					cb->edge_feather = 0.0f; cb->glow_intensity = 0.0f;
 					cb->quad_mode = 0;
@@ -8162,6 +8275,7 @@ after_key_shortcuts:
 					cb->dst_size[0] = (float)ca_w;
 					cb->dst_size[1] = (float)ca_h;
 					cb->convert_srgb = 0.0f; // textured (font atlas is linear)
+					cb->chrome_alpha = 0.0f; // 8.C: 0=full opacity (chrome blits override)
 					cb->corner_radius = 0.0f;
 					cb->corner_aspect = 0.0f;
 					cb->edge_feather = 0.0f;
@@ -8298,6 +8412,7 @@ after_key_shortcuts:
 						cb->dst_size[0] = (float)ca_w;
 						cb->dst_size[1] = (float)ca_h;
 						cb->convert_srgb = 3.0f; // glow mode
+						cb->chrome_alpha = 0.0f; // 8.C: 0=full opacity (chrome blits override)
 						cb->corner_radius = 0.0f;
 						cb->corner_aspect = 0.0f;
 						cb->edge_feather = glow_ext_y; // Y extent (repurposed)
@@ -8387,6 +8502,7 @@ after_key_shortcuts:
 							cb->dst_size[0] = (float)ca_w;
 							cb->dst_size[1] = (float)ca_h;
 							cb->convert_srgb = 0.0f;
+							cb->chrome_alpha = 0.0f; // 8.C: 0=full opacity (chrome blits override)
 							// Negative radius + negative aspect = all four corners.
 							cb->corner_radius = -0.06f;
 							cb->corner_aspect = (draw_h > 0.0f) ? -(draw_w / draw_h) : -1.0f;

@@ -503,6 +503,14 @@ struct BlitConstants
 	// while still depth-testing against other windows. Set to 0 (front) for
 	// passes that bind depth_disabled (background, launcher, glow halos).
 	float corner_depth_ndc[4]; // [TL_d, BL_d, TR_d, BR_d]
+	// Phase 2.K Commit 8.C: per-slot multiplier on the final fragment alpha.
+	// Used by chrome blits to fade in/out on hover. Default 1.0 = passthrough
+	// (every blit site that doesn't set this leaves the discarded-buffer
+	// memory; the shader saturates it via saturate() so values outside [0,1]
+	// don't clip the geometry). Three padding floats keep the cb 16-byte
+	// aligned for HLSL.
+	float chrome_alpha;
+	float _pad_chrome[3];
 };
 
 //! Vertex shader for projection blit - draws a quad at specified destination
@@ -527,6 +535,7 @@ cbuffer BlitCB : register(b0)
     float glow_falloff;     // Gaussian tightness
     float4 glow_color;      // RGB + unused alpha
     float4 corner_depth_ndc; // Phase 2.K: per-corner depth in [0,1] for SV_Position.z (TL,BL,TR,BR)
+    float4 chrome_alpha;     // Phase 2.K Commit 8.C: x = alpha multiplier; yzw padding
 };
 
 struct VS_OUTPUT
@@ -626,6 +635,7 @@ cbuffer BlitCB : register(b0)
     float glow_falloff;
     float4 glow_color;
     float4 corner_depth_ndc; // Phase 2.K: per-corner depth (unused in PS but keeps cb layout in sync)
+    float4 chrome_alpha;     // Phase 2.K Commit 8.C: x = alpha multiplier
 };
 
 Texture2D src_tex : register(t0);
@@ -721,11 +731,24 @@ float4 PSMain(VS_OUTPUT input) : SV_Target
     }
     float alpha = corner_alpha * feather_alpha;
 
+    // Phase 2.K Commit 8.C: optional alpha multiplier for chrome fade-in/out.
+    // Inverted semantic: chrome_alpha.x = 0 means "no fade" (full opacity).
+    // chrome_alpha.x ∈ (0, 1] means "fade by that amount" (1 - x = output
+    // alpha multiplier). This way uninit / discarded-buffer garbage in
+    // chrome_alpha.x simply lands at "≈ 0 means no fade" most of the time
+    // (negative garbage clamps to 0; positive garbage > 1 clamps to 1 →
+    // fully hidden, but those blits aren't reached because CPU skips them
+    // when alpha is fully hidden — so the bad case is rare).
+    // Chrome blits explicitly set chrome_alpha.x = 1 - actual_alpha so that
+    // 0 → no fade, 1 → fully transparent.
+    float fade = saturate(chrome_alpha.x);
+    float a_mul = 1.0 - fade;
+
     // Solid color mode: convert_srgb >= 2.0 outputs src_rect.rgb as solid color
     if (convert_srgb > 1.5)
-        return float4(src_rect.xyz, alpha);
+        return float4(src_rect.xyz, alpha * a_mul);
 
     float4 color = src_tex.Sample(src_samp, input.uv);
-    return float4(color.rgb, color.a * alpha);
+    return float4(color.rgb, color.a * alpha * a_mul);
 }
 )";
