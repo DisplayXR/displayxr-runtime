@@ -13,7 +13,15 @@ Phase 2.D was right at the time (no controller had asked for per-frame motion). 
 
 ## Goal
 
-Extend the public surface so a workspace controller can fully implement arbitrary interactive layouts — drag, momentum, animation, hover, edge-resize — without the runtime knowing what behaviour the controller is implementing. Performance must support smooth (60 Hz) interaction with no perceptible lag.
+Extend the public surface so a workspace controller can fully implement arbitrary interactive layouts — drag, momentum, animation, hover, edge-resize, **smooth transitions between presets** — without the runtime knowing what behaviour the controller is implementing. Performance must support smooth (60 Hz) interaction with no perceptible lag.
+
+Two distinct deliverables in one phase, sharing one shell-side animation framework:
+
+**(I) Smooth transitions between layout presets** — when the user presses Ctrl+1→Ctrl+2 today, windows snap from grid to immersive. The pre-Phase-2.G runtime called `slot_animate_to` (300 ms ease) so each window glided to its target. Phase 2.K replicates this in the shell: when the controller computes new target poses, it interpolates from current pose to target over a duration of its choice and pushes `xrSetWorkspaceClientWindowPoseEXT` every tick until the animation completes. **No public-surface change needed** — set_pose already exists.
+
+**(II) Interactive carousel** — drag-to-rotate, scroll-radius, TAB-snap, momentum. Needs per-frame `WM_MOUSEMOVE` on the public input drain (this is the surface change). Same animation tick consumes motion events and re-pushes poses.
+
+The first half can ship without the second; both reuse the same controller-side animation framework.
 
 ## Design
 
@@ -78,13 +86,15 @@ Pick during implementation; snapshot-at-drain is the safer first pass.
 | `src/xrt/ipc/server/comp_d3d11_service_*` (or similar) | Drain enrichment: fill `hitClientId` / `hitRegion` / `localUV` per motion event. Snapshot slot poses under a short lock. |
 | `src/xrt/ipc/shared/proto.json` | Bump the wire format if the event struct grows. |
 
-### Shell (controller) side
+### Shell (controller) side — animation framework + consumers
 
 | File | Change |
 |---|---|
-| `src/xrt/targets/shell/main.c` | Restore the carousel state machine (drag-to-rotate, scroll-radius, TAB-snap, momentum) by draining MOTION events and pushing per-client poses each tick. Mirror `dynamic_layout_tick` from the deleted runtime code. |
-| `src/xrt/targets/shell/main.c` | Implement smooth animation by lowering the poll cadence when an interactive layout is active (e.g. drop `POLL_INTERVAL_MS` from 500 to 16 ms while carousel is the active preset). |
-| `src/xrt/targets/shell/shell_openxr.{h,cpp}` | Resolve `xrEnableWorkspacePointerCaptureEXT` (already in PFN list) but extend usage: enable on Ctrl+3 dispatch so the runtime starts pushing MOTION; disable on preset switch back to grid / immersive. |
+| `src/xrt/targets/shell/main.c` | Animation framework: a per-client struct `{ start_pose, target_pose, start_w, target_w, start_h, target_h, start_ns, duration_ns, active }`. A tick function called every poll iteration interpolates per-active-client and pushes `xrSetWorkspaceClientWindowPoseEXT`. Ease-out cubic by default; controllers can swap the curve. Mirrors `slot_animate_to` / `slot_animate_tick` from the pre-Phase-2.G runtime, but lives controller-side now. |
+| `src/xrt/targets/shell/main.c` | **Smooth preset transitions:** `shell_apply_preset` no longer calls `set_pose` directly. Instead it computes target poses, then for each client snapshots the current pose (via `xrGetWorkspaceClientWindowPoseEXT`) and seeds the animation framework with start=current / target=new / duration=300 ms. The tick drives the actual set_pose calls over the next ~18 frames. |
+| `src/xrt/targets/shell/main.c` | **Variable poll cadence:** main loop drops `POLL_INTERVAL_MS` from 500 → ~16 ms while any client animation is active OR an interactive preset (carousel) is the active layout. Returns to 500 ms when idle. Keeps idle CPU low; smoothness only when needed. |
+| `src/xrt/targets/shell/main.c` | **Carousel state machine:** drag-to-rotate, scroll-radius, TAB-snap-to-front, momentum. Reads MOTION + SCROLL events from the input drain. Same tick re-computes per-window carousel poses each frame and pushes via the animation framework (with duration=0 for direct drives during drag, duration=300 ms for releases that snap to a target angle). |
+| `src/xrt/targets/shell/shell_openxr.{h,cpp}` | No new PFN resolution required — `xrEnableWorkspacePointerCaptureEXT` is already in the list. Usage change: enable on entry to interactive presets (carousel) so motion events flow; disable on exit. |
 
 ### Test app
 
@@ -98,12 +108,23 @@ Pick during implementation; snapshot-at-drain is the safer first pass.
 
 ## Acceptance criteria
 
+**Smooth transitions (deliverable I)**
+- ✅ Pressing Ctrl+1 → Ctrl+2 (or any preset switch) glides each window from its current pose to the new preset's target over ~300 ms with an ease-out curve. No snap, no popping.
+- ✅ Connect-time auto-tile (the 2.G fix that places new windows in a grid) glides the new window to its slot from the runtime's spawn position, instead of snapping.
+- ✅ `xrSetWorkspaceClientWindowPoseEXT` called at ~60 Hz during animation; no failed RPCs.
+
+**Interactive carousel (deliverable II)**
 - ✅ Carousel preset (Ctrl+3 in the shell) shows windows on a 360° ring with auto-rotation at the original ~10°/s rate.
 - ✅ Title-bar LMB drag in carousel mode rotates the ring; release continues with momentum.
 - ✅ Mouse wheel during carousel adjusts ring radius (clamped 0.05–0.30 m or display-relative equivalent).
 - ✅ TAB during carousel snaps the focused window to the front, pauses auto-rotation 5 s.
 - ✅ Drag latency: cursor → window pose update visible in next compositor frame (no perceptible lag at 60 Hz).
-- ✅ `tests_pacing` and friends still green; per-frame IPC overhead is measurably under 1 ms / second of clock time.
+- ✅ N=2 special case (the static-snap degenerate case from 2.G) goes away — carousel actually rotates so both windows are visible.
+
+**Performance**
+- ✅ Idle (no animation, no carousel, no drag): poll loop back to 500 ms cadence. CPU near 0.
+- ✅ During animation / carousel / drag: ~16 ms cadence × 4 clients × ~10 µs / RPC ≈ 2.4 ms / sec total. Well under 1% of one core.
+- ✅ `tests_pacing` and friends still green.
 
 ## Non-goals
 
