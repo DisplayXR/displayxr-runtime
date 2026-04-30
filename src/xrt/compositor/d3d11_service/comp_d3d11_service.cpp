@@ -1444,14 +1444,18 @@ create_layer_resources(struct d3d11_service_system *sys)
 		return false;
 	}
 
-	// Phase 2.K: depth-test state (LESS, depth-write enabled). The blit VS
-	// outputs SV_Position.z = corner_depth_ndc[i] * w (so after perspective
-	// divide we get the [0,1] depth value back), and this state turns the
-	// hardware depth test on for the multi-window blit pass.
+	// Phase 2.K: depth-test state (LESS_EQUAL, depth-write enabled). The
+	// blit VS outputs SV_Position.z = corner_depth_ndc[i] * w (so after
+	// perspective divide we get the [0,1] depth value back), and this
+	// state turns the hardware depth test on for the multi-window blit
+	// pass. LESS_EQUAL (vs strict LESS) lets equal-depth chrome elements
+	// drawn in order — title-bar bg, then buttons, then glyphs — paint on
+	// top of each other within a window. Inter-window occlusion is
+	// unaffected since distinct windows have distinct z values.
 	D3D11_DEPTH_STENCIL_DESC ds_test = {};
 	ds_test.DepthEnable = TRUE;
 	ds_test.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
-	ds_test.DepthFunc = D3D11_COMPARISON_LESS;
+	ds_test.DepthFunc = D3D11_COMPARISON_LESS_EQUAL;
 	ds_test.StencilEnable = FALSE;
 	hr = sys->device->CreateDepthStencilState(&ds_test, sys->depth_test_enabled.put());
 	if (FAILED(hr)) {
