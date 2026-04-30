@@ -2778,6 +2778,38 @@ main(int argc, char *argv[])
 		return 1;
 	}
 
+#ifdef _WIN32
+	// Single-instance guard — `Local\` scopes the name to the current Windows
+	// user session so it works correctly under fast-user-switching. The
+	// orchestrator's keyboard hook (service_orchestrator.c) also OpenMutex's
+	// this name to detect "shell already running" before spawning a duplicate
+	// when Ctrl+Space is pressed and our process was launched directly via
+	// command line (i.e. without going through the orchestrator's
+	// launch_child path that sets s_workspace_running).
+	//
+	// Held for process lifetime; Windows releases on process exit, abandoned
+	// state is fine for the open-only check on the orchestrator side. Don't
+	// take ownership (lpName, no acquire) — we only want the name, not the
+	// lock.
+	static HANDLE s_singleton_mutex = NULL;
+	s_singleton_mutex = CreateMutexW(NULL, FALSE, L"Local\\DisplayXR.Shell.Singleton");
+	if (s_singleton_mutex != NULL && GetLastError() == ERROR_ALREADY_EXISTS) {
+		PE("DisplayXR shell already running on this session — exiting.\n"
+		   "    (Press Ctrl+Space or click the tray icon to toggle the existing instance.)\n");
+		CloseHandle(s_singleton_mutex);
+		s_singleton_mutex = NULL;
+		return 0;
+	}
+	if (s_singleton_mutex == NULL) {
+		// CreateMutex failure is non-fatal — we just lose the duplicate-launch
+		// guard. Continue with a warning so dev launches behind sandbox/AV
+		// quirks still work.
+		PE("Warning: CreateMutex(Local\\DisplayXR.Shell.Singleton) failed (err=%lu) — "
+		   "duplicate-launch guard disabled.\n",
+		   (unsigned long)GetLastError());
+	}
+#endif
+
 	P("DisplayXR Shell\n");
 	if (app_count > 0) {
 		P("Will launch %d app(s)\n", app_count);

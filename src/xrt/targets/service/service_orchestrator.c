@@ -622,6 +622,23 @@ orchestrator_kbd_hook_proc(int nCode, WPARAM wParam, LPARAM lParam)
 			   ctrl, shift, alt, win, (int)s_workspace_running);
 			// Plain Ctrl+Space only, no other modifiers.
 			if (ctrl && !shift && !alt && !win && !s_workspace_running) {
+				// Phase 2.K: a shell launched directly via command line
+				// (rather than through our launch_child path) doesn't
+				// flip s_workspace_running, so the naive check above
+				// would spawn a duplicate. The shell holds a named
+				// singleton mutex `Local\DisplayXR.Shell.Singleton`
+				// for its lifetime — if it exists, an instance is
+				// already running and we should let its RegisterHotKey
+				// handle Ctrl+Space (toggle / deactivate). Pass the
+				// keypress through.
+				HANDLE existing = OpenMutexW(SYNCHRONIZE, FALSE,
+				    L"Local\\DisplayXR.Shell.Singleton");
+				if (existing != NULL) {
+					CloseHandle(existing);
+					OW("kbd hook: shell singleton present — passing Ctrl+Space "
+					   "to existing instance");
+					return CallNextHookEx(s_kbd_hook, nCode, wParam, lParam);
+				}
 				HWND hwnd = (HWND)service_tray_get_hwnd();
 				if (hwnd) {
 					PostMessageW(hwnd, WM_ORCHESTRATOR_SPAWN_WORKSPACE, 0, 0);
