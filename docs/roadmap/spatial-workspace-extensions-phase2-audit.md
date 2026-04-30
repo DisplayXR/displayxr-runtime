@@ -40,7 +40,7 @@ This doc walks the file cluster by cluster, labels each, and proposes a migratio
 | `add_capture_client` log strings | 11620-11641 | Mechanism — rename log prefix | Phase 2.A (capture) |
 | `ensure_workspace_window` lifecycle log strings | 11751-11849 | Mechanism — rename log prefix; some lifecycle simplifies | Phase 2 final cleanup |
 | `deactivate_workspace` lifecycle log strings | 11872-11960 | Mechanism — rename log prefix | Phase 2 final cleanup |
-| **Launcher functions** (`add/clear/poll/show/running_tile_mask` + `apply_layout_preset`) | 11960-12118 | **Policy — moves out** (and most code deletes) | Phase 2.B + Phase 2.G |
+| **Launcher functions** (`add/clear/poll/show/running_tile_mask`) + ~~`apply_layout_preset`~~ | 11960-12118 | **Policy — moves out** (and most code deletes) | Phase 2.B + ~~Phase 2.G~~ ✅ apply_layout_preset shipped |
 
 ## Counts by category
 
@@ -118,13 +118,18 @@ Below: the original 8 sub-steps, lowest-blast-radius first.
 
 **Risk:** Low. Net-add — the existing callers keep using the function internally; the extension entry point is a thin wrapper.
 
-### Phase 2.G — Layout presets + ESC/empty-workspace cleanup
+### Phase 2.G — Layout presets + ESC/empty-workspace cleanup ✅ shipped
 
-**Touches:** 12118 (`apply_layout_preset`), plus the ESC-handling carve-out in `compositor_layer_commit` (5616-5732), plus `pending_shell_reentry` lifecycle (258-259, 9866-9868, 11777).
+**Touched:** `apply_layout`, `enter_dynamic_layout`, `dynamic_layout_tick`, `carousel_compute_pose`, `compute_zmax`, the Ctrl+1..3 hotkey dispatch, the carousel LMB/scroll/TAB UI handlers, `mc->current_layout`, `mc->dynamic_layout`, `mc->regrid_pending_ns`, the debounced re-grid, and `comp_d3d11_service_apply_layout_preset` + its MCP tool. ~733 net deletions in `comp_d3d11_service.cpp` + `ipc_mcp_tools.c`. Pointer-capture follow-up #1 folded into Commit 1.
 
-**Why last:** Cleanup. Layout-preset semantics move to the workspace controller (which computes per-window poses and pushes them via `xrSetWorkspaceClientWindowPoseEXT`); the runtime stops owning preset names. The ESC carve-out and reentry state machine simplify or delete because the runtime no longer needs an "empty workspace" mode — the workspace controller handles the case where it has no client apps connected.
+**Decisions made during the migration:**
+- Layout-preset semantics moved to the controller (Option A — pure controller). The shell now ports the grid + immersive + carousel-snap math.
+- Carousel ships as a static snap on the controller side (no per-frame tick); a follow-up can add animation if the regression is felt.
+- ESC carve-out kept as a safety net (annotated in `comp_d3d11_window.cpp`). The empty-workspace launcher hint and reentry state machine stay — they're rendering hygiene, not policy.
+- `compute_grid_layout` stays in the runtime; auto-placement on client connect still uses it. Deferred as a separate slice of policy.
+- Three MCP tests removed (`tests/mcp/test_focus_preset.{sh,bat}` + `_focus_preset_helper.py`) — the tool they exercised is gone.
 
-**Risk:** Medium. The ESC / dismiss / restore flow is one of the touchier corners of the current code; simplification needs end-to-end testing.
+**Risk realized:** Lower than predicted. The ESC / dismiss / restore flow needed only a comment annotation; the workspace state machine simplification was deferred to Phase 2.C (chrome rendering migration) where it'll get a proper redesign.
 
 ### Phase 2.H (final cleanup pass)
 

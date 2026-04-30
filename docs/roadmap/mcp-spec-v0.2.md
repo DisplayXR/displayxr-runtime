@@ -128,10 +128,16 @@ Adds everything that requires multi-app or shell-owned state:
 |---|---|---|
 | `list_windows` | Shell windows with ids, titles, bounds, focus state | Shell window manager |
 | `get_window_pose` / `set_window_pose` | Read/write 6-DOF window pose in meters | Shell `--pose` plumbing |
-| `apply_layout_preset` | Trigger Ctrl+1-4 layouts | Existing hotkey IPC |
 | `set_focus` | Focus a window | Shell focus manager |
 | `save_workspace` / `load_workspace` | Named pose sets, persisted to disk | New — thin layer over `set_window_pose` |
 | `start_recording` / `stop_recording` | SBS 3D capture to MP4 | `docs/roadmap/3d-capture.md` |
+
+**Phase 2.G note:** `apply_layout_preset` shipped in the original Phase B
+slice but was removed in Phase 2.G when layout-preset semantics moved
+out of the runtime. AI agents that previously called
+`apply_layout_preset` now compose presets out of per-client
+`set_window_pose` calls. The first-party shell ships the reference
+implementation in `src/xrt/targets/shell/main.c`.
 
 Phase B's version of `capture_frame` reads the compositor atlas (via the existing `comp_d3d11_service.cpp` file-trigger path) and annotates with per-window bounding boxes.
 
