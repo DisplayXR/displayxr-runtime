@@ -2573,6 +2573,51 @@ shell_show_launcher_dialog(void)
 
 static NOTIFYICONDATAA g_nid = {0};
 
+// Forward declaration for the tray wnd_proc.
+static void tray_show_context_menu(HWND hwnd, bool shell_active);
+
+// Phase 2.K tray-fix: dedicated wnd_proc that intercepts WM_TRAYICON directly,
+// matching the service-tray pattern (service_tray_win.c). The previous design
+// used the STATIC built-in class with no wnd_proc and tried to filter
+// WM_TRAYICON inline in the main PeekMessage loop — which silently dropped
+// the right-click events on this Windows build. A registered class + WndProc
+// is the canonical Shell_NotifyIcon approach.
+static LRESULT CALLBACK
+shell_tray_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+	if (msg == WM_TRAYICON) {
+		UINT mouse_msg = LOWORD(lParam);
+		if (mouse_msg == WM_LBUTTONUP) {
+			if (!g_shell_active) {
+				PostMessage(hwnd, WM_HOTKEY, HOTKEY_TOGGLE, 0);
+			}
+			return 0;
+		}
+		if (mouse_msg == WM_RBUTTONUP || mouse_msg == WM_CONTEXTMENU) {
+			tray_show_context_menu(hwnd, g_shell_active);
+			return 0;
+		}
+		return 0;
+	}
+	return DefWindowProcA(hwnd, msg, wParam, lParam);
+}
+
+static void
+shell_register_tray_class(void)
+{
+	static bool s_registered = false;
+	if (s_registered) return;
+	WNDCLASSEXA wcex = {0};
+	wcex.cbSize = sizeof(wcex);
+	wcex.lpfnWndProc = shell_tray_wnd_proc;
+	wcex.hInstance = GetModuleHandleA(NULL);
+	wcex.lpszClassName = "DisplayXRShellTray";
+	wcex.hIcon = LoadIconA(GetModuleHandleA(NULL), MAKEINTRESOURCEA(IDI_DISPLAYXR_SHELL));
+	if (RegisterClassExA(&wcex) != 0) {
+		s_registered = true;
+	}
+}
+
 static void
 tray_create(HWND hwnd)
 {
@@ -2608,6 +2653,9 @@ static void
 tray_show_context_menu(HWND hwnd, bool shell_active)
 {
 	HMENU menu = CreatePopupMenu();
+	if (menu == NULL) {
+		return;
+	}
 	AppendMenuA(menu, MF_STRING, TRAY_CMD_ACTIVATE,
 	            shell_active ? "Deactivate" : "Activate");
 	AppendMenuA(menu, MF_SEPARATOR, 0, NULL);
@@ -2616,7 +2664,7 @@ tray_show_context_menu(HWND hwnd, bool shell_active)
 	POINT pt;
 	GetCursorPos(&pt);
 	SetForegroundWindow(hwnd); // Required for TrackPopupMenu to dismiss properly
-	UINT cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY,
+	UINT cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
 	                          pt.x, pt.y, 0, hwnd, NULL);
 	DestroyMenu(menu);
 	PostMessage(hwnd, WM_NULL, 0, 0); // Force dismiss
@@ -2846,11 +2894,20 @@ main(int argc, char *argv[])
 	bool have_json = get_runtime_json_path(runtime_json, sizeof(runtime_json));
 	DWORD service_pid = find_service_pid();
 
-	// --- Create message-only window for hotkey + tray ---
-	g_msg_hwnd = CreateWindowExA(0, "STATIC", "DisplayXR Shell Msg", 0,
-	    0, 0, 0, 0, HWND_MESSAGE, NULL, NULL, NULL);
+	// --- Create hidden top-level window for hotkeys + tray ---
+	// Uses a dedicated `DisplayXRShellTray` class with shell_tray_wnd_proc so
+	// Shell_NotifyIcon callbacks (WM_TRAYICON) get dispatched to a proper
+	// WndProc — without that, the inline PeekMessage filter we used to rely
+	// on silently dropped right-click events on some Windows builds.
+	// WS_EX_TOOLWINDOW + zero size keeps the window invisible / out of the
+	// taskbar, while still being a real top-level window so
+	// SetForegroundWindow works inside the context-menu path.
+	shell_register_tray_class();
+	g_msg_hwnd = CreateWindowExA(WS_EX_TOOLWINDOW, "DisplayXRShellTray",
+	    "DisplayXR Shell Msg", 0,
+	    0, 0, 0, 0, NULL, NULL, GetModuleHandleA(NULL), NULL);
 	if (g_msg_hwnd == NULL) {
-		PE("Warning: failed to create message window (hotkey/tray unavailable)\n");
+		PE("Warning: failed to create tray window (hotkey/tray unavailable)\n");
 	}
 
 	// Register system-wide hotkeys. Ctrl+Space in service-managed mode exits
@@ -3071,17 +3128,11 @@ main(int argc, char *argv[])
 					} else {
 						P("Capture ignored: shell not active\n");
 					}
-				} else if (msg.message == WM_TRAYICON) {
-					if (LOWORD(msg.lParam) == WM_LBUTTONUP) {
-						// Left-click tray: activate if inactive
-						if (!g_shell_active) {
-							PostMessage(g_msg_hwnd, WM_HOTKEY, HOTKEY_TOGGLE, 0);
-						}
-					} else if (LOWORD(msg.lParam) == WM_RBUTTONUP) {
-						// Right-click tray: context menu
-						tray_show_context_menu(g_msg_hwnd, g_shell_active);
-					}
 				}
+				// Phase 2.K tray-fix: WM_TRAYICON is now handled by
+				// shell_tray_wnd_proc (registered for the DisplayXRShellTray
+				// class) via DispatchMessage below. The previous inline filter
+				// silently dropped right-click events on some Windows builds.
 				TranslateMessage(&msg);
 				DispatchMessageA(&msg);
 			}
