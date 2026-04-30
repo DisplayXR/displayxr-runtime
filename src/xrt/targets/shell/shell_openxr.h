@@ -32,8 +32,8 @@ extern "C" {
 /*!
  * Bundle of session + PFNs the shell dispatches through. Populated by
  * shell_openxr_init(); fields are NULL/XR_NULL_HANDLE before init and
- * after shutdown. PFNs the shell does not call (hit-test, input drain,
- * pointer capture, etc.) are intentionally not resolved.
+ * after shutdown. PFNs the shell does not call (hit-test, pointer
+ * capture, etc.) are intentionally not resolved.
  */
 struct shell_openxr_state
 {
@@ -56,6 +56,7 @@ struct shell_openxr_state
 	PFN_xrSetWorkspaceFocusedClientEXT     set_focused;
 	PFN_xrEnumerateWorkspaceClientsEXT     enumerate_clients;
 	PFN_xrGetWorkspaceClientInfoEXT        get_client_info;
+	PFN_xrEnumerateWorkspaceInputEventsEXT enumerate_input_events;
 };
 
 /*!

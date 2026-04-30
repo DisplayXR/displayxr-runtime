@@ -24,6 +24,7 @@
 #include <string.h>
 #include <signal.h>
 #include <stdlib.h>
+#include <math.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -107,6 +108,198 @@ shell_get_client_info(XrWorkspaceClientId id, XrWorkspaceClientInfoEXT *info)
 	memset(info, 0, sizeof(*info));
 	info->type = XR_TYPE_WORKSPACE_CLIENT_INFO_EXT;
 	return g_xr->get_client_info(g_xr->session, id, info) == XR_SUCCESS;
+}
+
+// ---------- Phase 2.G: layout presets owned by the controller ----------
+//
+// The pose math here is identical to what the runtime owned in
+// comp_d3d11_service.cpp before Phase 2.G. The runtime no longer intercepts
+// Ctrl+1..3; those keys flow through xrEnumerateWorkspaceInputEventsEXT and
+// the controller dispatches them. Per-client poses are pushed via
+// xrSetWorkspaceClientWindowPoseEXT — the only public layout primitive.
+//
+// Display dimensions: hardcoded to the Leia SR LP-3D fallback (700×394 mm).
+// The runtime applied the same fallback when no real display info was
+// available. A follow-up could enable XR_EXT_display_info on the shell's
+// instance and read xrGetSystemDisplayInfoEXT for accurate dims.
+
+#define SHELL_DISPLAY_W_M 0.700f
+#define SHELL_DISPLAY_H_M 0.394f
+#define SHELL_PI_F 3.14159265358979323846f
+
+// Adaptive grid: ceil(sqrt(N)) columns, fills row-first. 90% display, 10%
+// padding per cell. All windows at Z=0. Mirrors compute_grid_layout().
+static void
+shell_compute_grid_pose(int n, int idx,
+                        float *out_x, float *out_y, float *out_z,
+                        float *out_w, float *out_h)
+{
+	if (n <= 0) n = 1;
+	int cols = (int)ceilf(sqrtf((float)n));
+	int rows = (int)ceilf((float)n / (float)cols);
+	int col = idx % cols;
+	int row = idx / cols;
+	float cell_w = SHELL_DISPLAY_W_M * 0.90f / (float)cols;
+	float cell_h = SHELL_DISPLAY_H_M * 0.90f / (float)rows;
+	*out_w = cell_w * 0.90f;
+	*out_h = cell_h * 0.90f;
+	*out_x = ((float)col - ((float)(cols - 1)) / 2.0f) * cell_w;
+	*out_y = (((float)(rows - 1)) / 2.0f - (float)row) * cell_h;
+	*out_z = 0.0f;
+}
+
+// Grid tangent to a convex paraboloid: Z curves toward viewer at the edges,
+// each window tilts to face the surface normal. Curvature is tuned so the
+// corners sit ~+0.015 m forward of the display plane.
+static void
+shell_compute_immersive_pose(int n, int idx, XrPosef *out_pose,
+                             float *out_w, float *out_h)
+{
+	float x, y, z;
+	shell_compute_grid_pose(n, idx, &x, &y, &z, out_w, out_h);
+
+	float max_r_sq = (SHELL_DISPLAY_W_M / 2) * (SHELL_DISPLAY_W_M / 2) +
+	                 (SHELL_DISPLAY_H_M / 2) * (SHELL_DISPLAY_H_M / 2);
+	float curvature = 0.015f / max_r_sq;
+	float r_sq = x * x + y * y;
+	z = curvature * r_sq;
+
+	float dzdx = 2.0f * curvature * x;
+	float dzdy = 2.0f * curvature * y;
+	float yaw = -atanf(dzdx);
+	float pitch = atanf(dzdy);
+	float cy = cosf(yaw / 2), sy = sinf(yaw / 2);
+	float cp = cosf(pitch / 2), sp = sinf(pitch / 2);
+
+	out_pose->position.x = x;
+	out_pose->position.y = y;
+	out_pose->position.z = z;
+	out_pose->orientation.x = sp * cy;
+	out_pose->orientation.y = cp * sy;
+	out_pose->orientation.z = -sp * sy;
+	out_pose->orientation.w = cp * cy;
+}
+
+// Static carousel: windows arranged on a 360° ring, front at Z=0 and back at
+// -zmax. Phase 2.G ships a snap (no per-frame rotation). The runtime used to
+// auto-rotate; the controller can add that back as a follow-up by ticking the
+// angle each frame and re-pushing poses.
+static void
+shell_compute_carousel_pose(int n, int idx, float angle_offset,
+                            XrPosef *out_pose,
+                            float *out_w, float *out_h)
+{
+	float zmax = (SHELL_DISPLAY_W_M > SHELL_DISPLAY_H_M
+	              ? SHELL_DISPLAY_W_M : SHELL_DISPLAY_H_M) / 5.0f;
+	const float radius = 0.12f;
+	float base_w = SHELL_DISPLAY_W_M * 0.40f;
+	float base_h = SHELL_DISPLAY_H_M * 0.40f;
+	if (n <= 0) n = 1;
+
+	float base_angle = (2.0f * SHELL_PI_F / (float)n) * (float)idx;
+	float world_angle = base_angle + angle_offset;
+
+	out_pose->position.x = sinf(world_angle) * radius;
+	float raw_depth = cosf(world_angle); // +1 front, -1 back
+	out_pose->position.z = (raw_depth - 1.0f) * zmax * 0.5f;
+	out_pose->position.y = 0.0f;
+
+	float depth_t = (raw_depth + 1.0f) / 2.0f;
+	float scale = 0.70f + 0.30f * depth_t;
+	*out_w = base_w * scale;
+	*out_h = base_h * scale;
+
+	out_pose->orientation.x = 0.0f;
+	out_pose->orientation.y = 0.0f;
+	out_pose->orientation.z = 0.0f;
+	out_pose->orientation.w = 1.0f;
+}
+
+// Apply a named preset to all currently-connected workspace clients.
+// Returns true if at least one pose was pushed. Unknown names are ignored.
+static bool
+shell_apply_preset(const char *name)
+{
+	if (g_xr == NULL || name == NULL) {
+		return false;
+	}
+	XrWorkspaceClientId ids[SHELL_MAX_CLIENTS];
+	uint32_t n = shell_enumerate_clients(ids, SHELL_MAX_CLIENTS);
+	if (n == 0) {
+		P("Layout '%s': no clients yet\n", name);
+		return false;
+	}
+
+	bool is_grid      = (strcmp(name, "grid") == 0);
+	bool is_immersive = (strcmp(name, "immersive") == 0);
+	bool is_carousel  = (strcmp(name, "carousel") == 0);
+	if (!is_grid && !is_immersive && !is_carousel) {
+		return false;
+	}
+
+	P("Layout '%s' (%u windows)\n", name, n);
+
+	for (uint32_t i = 0; i < n; i++) {
+		XrPosef pose;
+		pose.orientation.x = 0.0f;
+		pose.orientation.y = 0.0f;
+		pose.orientation.z = 0.0f;
+		pose.orientation.w = 1.0f;
+		pose.position.x = 0.0f;
+		pose.position.y = 0.0f;
+		pose.position.z = 0.0f;
+		float w = 0.0f, h = 0.0f;
+
+		if (is_grid) {
+			float x, y, z;
+			shell_compute_grid_pose((int)n, (int)i,
+			                        &x, &y, &z, &w, &h);
+			pose.position.x = x;
+			pose.position.y = y;
+			pose.position.z = z;
+		} else if (is_immersive) {
+			shell_compute_immersive_pose((int)n, (int)i,
+			                             &pose, &w, &h);
+		} else { // carousel
+			shell_compute_carousel_pose((int)n, (int)i, 0.0f,
+			                            &pose, &w, &h);
+		}
+
+		XrResult r = g_xr->set_pose(g_xr->session, ids[i], &pose, w, h);
+		if (r != XR_SUCCESS) {
+			PE("  set_pose(client=%u) failed: %d\n", ids[i], r);
+		}
+	}
+	return true;
+}
+
+// Drain pending workspace input events; dispatch Ctrl+1..3 to layout presets.
+// The modifier bit layout follows XR_EXT_spatial_workspace's MVP policy:
+// bit 0 SHIFT, bit 1 CTRL, bit 2 ALT.
+static void
+shell_drain_input_events(void)
+{
+	if (g_xr == NULL || g_xr->enumerate_input_events == NULL) {
+		return;
+	}
+	XrWorkspaceInputEventEXT evs[16];
+	uint32_t cnt = 0;
+	if (g_xr->enumerate_input_events(g_xr->session, 16, &cnt, evs) != XR_SUCCESS) {
+		return;
+	}
+	for (uint32_t i = 0; i < cnt; i++) {
+		const XrWorkspaceInputEventEXT *e = &evs[i];
+		if (e->eventType != XR_WORKSPACE_INPUT_EVENT_KEY_EXT) continue;
+		if (!e->key.isDown) continue;
+		if ((e->key.modifiers & 0x2u) == 0) continue; // require CTRL
+		switch (e->key.vkCode) {
+		case '1': shell_apply_preset("grid"); break;
+		case '2': shell_apply_preset("immersive"); break;
+		case '3': shell_apply_preset("carousel"); break;
+		// '4' reserved for a future preset slot.
+		default: break;
+		}
+	}
 }
 
 static void
@@ -2185,6 +2378,11 @@ main(int argc, char *argv[])
 			continue;
 		}
 #endif
+
+		// Phase 2.G: drain workspace input events. Ctrl+1..3 trigger
+		// layout presets; other key/pointer events are read here for
+		// future use (controller-driven drag, hover routing, etc.).
+		shell_drain_input_events();
 
 		// Apply pending poses when new clients appear
 		if (poses_pending) {

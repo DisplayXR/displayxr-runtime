@@ -132,6 +132,7 @@ extern "C" struct shell_openxr_state *shell_openxr_init(void)
 	    {"xrSetWorkspaceFocusedClientEXT",     reinterpret_cast<PFN_xrVoidFunction *>(&s->set_focused)},
 	    {"xrEnumerateWorkspaceClientsEXT",     reinterpret_cast<PFN_xrVoidFunction *>(&s->enumerate_clients)},
 	    {"xrGetWorkspaceClientInfoEXT",        reinterpret_cast<PFN_xrVoidFunction *>(&s->get_client_info)},
+	    {"xrEnumerateWorkspaceInputEventsEXT", reinterpret_cast<PFN_xrVoidFunction *>(&s->enumerate_input_events)},
 	};
 	for (const auto &e : entries) {
 		if (!resolve_pfn(s->instance, e.name, e.out)) {
@@ -140,7 +141,7 @@ extern "C" struct shell_openxr_state *shell_openxr_init(void)
 		}
 	}
 
-	P("shell_openxr: instance=%p session=%p (15 PFNs resolved, no graphics binding)\n",
+	P("shell_openxr: instance=%p session=%p (16 PFNs resolved, no graphics binding)\n",
 	  (void *)s->instance, (void *)s->session);
 	return s;
 }
