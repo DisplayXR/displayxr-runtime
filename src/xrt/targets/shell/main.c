@@ -55,7 +55,9 @@
 #define HOTKEY_LAUNCH 2
 #define HOTKEY_CAPTURE 3
 #define WM_TRAYICON (WM_USER + 1)
-#define TRAY_CMD_ACTIVATE 2001
+// Phase 2.K B-merged: only Exit. There's no longer a separate "deactivate"
+// path — Ctrl+Space and tray Exit both kill all apps and shut down the shell.
+// The orchestrator's keyboard hook respawns the shell on the next Ctrl+Space.
 #define TRAY_CMD_EXIT 2002
 #define POLL_INTERVAL_MS 500
 #endif
@@ -2587,13 +2589,12 @@ shell_tray_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
 	if (msg == WM_TRAYICON) {
 		UINT mouse_msg = LOWORD(lParam);
-		if (mouse_msg == WM_LBUTTONUP) {
-			if (!g_shell_active) {
-				PostMessage(hwnd, WM_HOTKEY, HOTKEY_TOGGLE, 0);
-			}
-			return 0;
-		}
-		if (mouse_msg == WM_RBUTTONUP || mouse_msg == WM_CONTEXTMENU) {
+		// Phase 2.K B-merged: shell is always active while the process is
+		// running. Left-click and right-click both surface the context menu,
+		// which only contains Exit (kills apps + shell, orchestrator
+		// re-spawns on next Ctrl+Space).
+		if (mouse_msg == WM_LBUTTONUP || mouse_msg == WM_RBUTTONUP ||
+		    mouse_msg == WM_CONTEXTMENU) {
 			tray_show_context_menu(hwnd, g_shell_active);
 			return 0;
 		}
@@ -2652,14 +2653,12 @@ tray_destroy(void)
 static void
 tray_show_context_menu(HWND hwnd, bool shell_active)
 {
+	(void)shell_active; // Phase 2.K B-merged: only "Exit" is offered.
 	HMENU menu = CreatePopupMenu();
 	if (menu == NULL) {
 		return;
 	}
-	AppendMenuA(menu, MF_STRING, TRAY_CMD_ACTIVATE,
-	            shell_active ? "Deactivate" : "Activate");
-	AppendMenuA(menu, MF_SEPARATOR, 0, NULL);
-	AppendMenuA(menu, MF_STRING, TRAY_CMD_EXIT, "Exit");
+	AppendMenuA(menu, MF_STRING, TRAY_CMD_EXIT, "Exit DisplayXR Shell");
 
 	POINT pt;
 	GetCursorPos(&pt);
@@ -2669,10 +2668,7 @@ tray_show_context_menu(HWND hwnd, bool shell_active)
 	DestroyMenu(menu);
 	PostMessage(hwnd, WM_NULL, 0, 0); // Force dismiss
 
-	if (cmd == TRAY_CMD_ACTIVATE) {
-		// Handled by caller via return value
-		PostMessage(hwnd, WM_HOTKEY, HOTKEY_TOGGLE, 0);
-	} else if (cmd == TRAY_CMD_EXIT) {
+	if (cmd == TRAY_CMD_EXIT) {
 		g_running = 0;
 	}
 }
@@ -2936,49 +2932,42 @@ main(int argc, char *argv[])
 	// activate immediately. The orchestrator only spawns us in response to
 	// Ctrl+Space being pressed (semantically "summon shell"), so starting
 	// inactive-in-tray would need a second Ctrl+Space to activate — but
-	// with --service-managed we skip our own hotkey registration, so no
-	// one's listening for that second press.
-	// Standalone no-args launches still start in tray and wait for the
-	// shell's own Ctrl+Space to toggle active.
-	bool start_active = (app_count > 0 || capture_count > 0 || g_service_managed);
+	// Phase 2.K B-merged: shell is always active while running. There is no
+	// "in-tray waiting" state — if you launched the shell, the workspace is
+	// active. Exit (Ctrl+Space, tray Exit) kills apps and the shell process;
+	// the orchestrator respawns on the next Ctrl+Space.
+	P("Activating shell mode...\n");
+	xret = g_xr->activate(g_xr->session);
+	if (xret != XR_SUCCESS) {
+		PE("Warning: workspace_activate failed\n");
+	}
+	g_shell_active = true;
+	tray_update_tooltip(true);
 
-	if (start_active) {
-		P("Activating shell mode...\n");
-		xret = g_xr->activate(g_xr->session);
-		if (xret != XR_SUCCESS) {
-			PE("Warning: workspace_activate failed\n");
+	// Add capture clients
+	for (int i = 0; i < capture_count; i++) {
+		uint32_t cid = 0;
+		XrResult r = g_xr->add_capture(g_xr->session, captures[i].hwnd, NULL, &cid);
+		if (r == XR_SUCCESS) {
+			captures[i].client_id = cid;
+			captures[i].added = true;
+			P("  Capture: HWND=0x%llx '%s' → client_id=%u\n",
+			  (unsigned long long)captures[i].hwnd, captures[i].name, cid);
+		} else {
+			PE("  Capture: failed for HWND=0x%llx '%s'\n",
+			   (unsigned long long)captures[i].hwnd, captures[i].name);
 		}
-		g_shell_active = true;
-		tray_update_tooltip(true);
+	}
 
-		// Add capture clients
-		for (int i = 0; i < capture_count; i++) {
-			uint32_t cid = 0;
-			XrResult r = g_xr->add_capture(g_xr->session, captures[i].hwnd, NULL, &cid);
-			if (r == XR_SUCCESS) {
-				captures[i].client_id = cid;
-				captures[i].added = true;
-				P("  Capture: HWND=0x%llx '%s' → client_id=%u\n",
-				  (unsigned long long)captures[i].hwnd, captures[i].name, cid);
-			} else {
-				PE("  Capture: failed for HWND=0x%llx '%s'\n",
-				   (unsigned long long)captures[i].hwnd, captures[i].name);
+	// Launch apps
+	if (app_count > 0) {
+		P("XR_RUNTIME_JSON = %s\n", have_json ? runtime_json : "(not set)");
+		for (int i = 0; i < app_count; i++) {
+			launch_app(&apps[i], have_json ? runtime_json : NULL);
+			if (i + 1 < app_count) {
+				Sleep(100);
 			}
 		}
-
-		// Launch apps
-		if (app_count > 0) {
-
-			P("XR_RUNTIME_JSON = %s\n", have_json ? runtime_json : "(not set)");
-			for (int i = 0; i < app_count; i++) {
-				launch_app(&apps[i], have_json ? runtime_json : NULL);
-				if (i + 1 < app_count) {
-					Sleep(100);
-				}
-			}
-		}
-	} else {
-		P("Starting in system tray — press Ctrl+Space to activate.\n");
 	}
 
 	// Auto-adopt is disabled for now — use --capture-hwnd for explicit 2D windows.
@@ -3033,66 +3022,15 @@ main(int argc, char *argv[])
 			MSG msg;
 			while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
 				if (msg.message == WM_HOTKEY && msg.wParam == HOTKEY_TOGGLE) {
-					// Service-managed shell: Ctrl+Space exits instead of
-					// toggling to tray. The orchestrator will re-spawn us
-					// on the next press via its keyboard hook.
-					if (g_service_managed) {
-						P("Ctrl+Space pressed — exiting service-managed shell.\n");
-						g_running = 0;
-						break;
-					}
-					// --- Toggle shell active/inactive ---
-					if (g_shell_active) {
-						P("Deactivating shell...\n");
-						(void)g_xr->deactivate(g_xr->session);
-
-						// Clear local capture tracking
-						for (int i = 0; i < capture_count; i++) {
-							captures[i].added = false;
-						}
-						capture_count = 0;
-
-						// Reset pose tracking so re-activate can re-apply
-						for (int i = 0; i < app_count; i++) {
-							apps[i].pose_applied = false;
-						}
-						poses_pending = false;
-						for (int i = 0; i < app_count; i++) {
-							if (apps[i].has_pose) poses_pending = true;
-						}
-
-						// Clear client name tracking
-						client_name_count = 0;
-
-						g_shell_active = false;
-						g_launcher_visible = false;
-						tray_update_tooltip(false);
-						P("Shell deactivated — waiting in tray.\n");
-					} else {
-						P("Activating shell...\n");
-						xret = g_xr->activate(g_xr->session);
-
-						// Phase 2.I C10: the shell no longer owns its own IPC
-						// connection — the runtime DLL does, and rebuilding
-						// it requires xrDestroySession + xrCreateSession (a
-						// future improvement). On activate failure today we
-						// just bail and let the user re-trigger Ctrl+Space
-						// once the service is healthy again.
-						if (xret != XR_SUCCESS) {
-							PE("workspace_activate failed (%d) — service may be down. "
-							   "Restart the service and press Ctrl+Space to retry.\n",
-							   xret);
-							continue;
-						}
-
-						// Already-running IPC apps (OpenXR handle apps) are
-						// automatically picked up by the multi-comp on their
-						// next layer_commit. No need to enumerate 2D windows.
-
-						g_shell_active = true;
-						tray_update_tooltip(true);
-						P("Shell activated.\n");
-					}
+					// Phase 2.K B-merged: Ctrl+Space exits the shell. There
+					// is no longer a separate "deactivate" state — apps die,
+					// the workspace is torn down, and the orchestrator's
+					// keyboard hook will respawn the shell on the next
+					// Ctrl+Space. Same path for service-managed and direct
+					// command-line launches.
+					P("Ctrl+Space pressed — exiting shell.\n");
+					g_running = 0;
+					break;
 				} else if (msg.message == WM_HOTKEY && msg.wParam == HOTKEY_LAUNCH) {
 					// --- Ctrl+L: Toggle spatial launcher panel (Phase 5.7) ---
 					// The Phase 4C MessageBox path is gone — the service-side
@@ -3509,8 +3447,56 @@ main(int argc, char *argv[])
 	P("\nShell exiting.\n");
 
 #ifdef _WIN32
-	// Deactivate shell if still active
+	// Phase 2.K B-merged: kill apps before tearing down the workspace so the
+	// runtime's lazy reverse-hot-switch never fires (apps are gone before
+	// xrDeactivate's "switch surviving IPC clients to standalone" branch
+	// would run). EXIT_REQUEST first for graceful shutdown, then a brief
+	// wait, then TerminateProcess for stragglers.
 	if (g_shell_active) {
+		uint64_t self_pid = (uint64_t)GetCurrentProcessId();
+
+		// 1. Send EXIT_REQUEST via xrRequestWorkspaceClientExitEXT to every
+		//    connected workspace client (filter our own controller session
+		//    by PID). Apps that are still binding their slot won't be in the
+		//    enumerate result yet — those get a TerminateProcess fallback
+		//    below.
+		if (g_xr->request_client_exit != NULL && g_xr->enumerate_clients != NULL) {
+			XrWorkspaceClientId raw_ids[SHELL_MAX_CLIENTS];
+			uint32_t raw_n = shell_enumerate_clients(raw_ids, SHELL_MAX_CLIENTS);
+			for (uint32_t i = 0; i < raw_n; i++) {
+				XrWorkspaceClientInfoEXT cinfo;
+				if (!shell_get_client_info(raw_ids[i], &cinfo)) continue;
+				if (cinfo.pid == self_pid) continue;
+				(void)g_xr->request_client_exit(g_xr->session, raw_ids[i]);
+			}
+		}
+
+		// 2. Wait briefly (up to 1 s) for the apps we launched to exit
+		//    cleanly via the EXIT_REQUEST signal.
+		HANDLE handles[MAX_APPS];
+		DWORD count = 0;
+		for (int i = 0; i < app_count; i++) {
+			if (apps[i].process != NULL) handles[count++] = apps[i].process;
+		}
+		if (count > 0) {
+			WaitForMultipleObjects(count, handles, TRUE, 1000);
+		}
+
+		// 3. Force-terminate any apps that didn't exit in time. Single-process
+		//    timeout, not per-process, so a single hung app doesn't stall the
+		//    whole shutdown more than 1 second.
+		for (int i = 0; i < app_count; i++) {
+			if (apps[i].process == NULL) continue;
+			DWORD code = 0;
+			if (GetExitCodeProcess(apps[i].process, &code) && code == STILL_ACTIVE) {
+				P("App %s did not exit on EXIT_REQUEST; terminating.\n",
+				  apps[i].exe_path != NULL ? apps[i].exe_path : "(unknown)");
+				TerminateProcess(apps[i].process, 0);
+			}
+		}
+
+		// 4. Now safe to deactivate the workspace. Capture clients are
+		//    restored to their 2D windows by the runtime's deactivate path.
 		(void)g_xr->deactivate(g_xr->session);
 	}
 

@@ -579,8 +579,14 @@ VS_OUTPUT VSMain(uint vertex_id : SV_VertexID)
     // CPU encodes (eye_z - corner_z) / WORKSPACE_DEPTH_FAR_M for window
     // content, with a small bias toward the eye for chrome. After
     // perspective divide the rasterizer gives SV_Position.z = corner_depth_ndc.
+    // saturate() is defense-in-depth: blit sites that don't initialize the
+    // field (most overlay / chrome paths in CPU code) leave it as whatever
+    // memory was in the discarded constant buffer. Without saturate, NaN or
+    // out-of-range values cause the viewport z-clip to drop the vertex even
+    // when depth_disabled is bound — observed as missing tiles / mismatched
+    // disparity in the empty workspace logo and standalone hot-switch.
     float depths[4] = { corner_depth_ndc.x, corner_depth_ndc.y, corner_depth_ndc.z, corner_depth_ndc.w };
-    float depth_ndc = depths[vid];
+    float depth_ndc = saturate(depths[vid]);
 
     // Set w for perspective-correct UV interpolation.
     // w=1 for axis-aligned (affine), w=depth for perspective quads.
