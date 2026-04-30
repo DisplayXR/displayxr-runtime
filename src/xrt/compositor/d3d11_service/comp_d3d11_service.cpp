@@ -11401,6 +11401,33 @@ comp_d3d11_service_workspace_pointer_capture_set(struct xrt_system_compositor *x
 	return true;
 }
 
+// Phase 2.K commit 1 stubs. Real implementations land in commit 3 by extracting
+// the existing DELETE-key / F11-key handlers into named helpers. Until then the
+// public surface resolves and dispatch returns success without effect so the
+// controller can wire the calls without breaking.
+extern "C" xrt_result_t
+comp_d3d11_service_workspace_request_client_exit(struct xrt_system_compositor *xsysc, uint32_t client_id)
+{
+	if (xsysc == nullptr) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	(void)client_id;
+	return XRT_SUCCESS;
+}
+
+extern "C" xrt_result_t
+comp_d3d11_service_workspace_request_client_fullscreen(struct xrt_system_compositor *xsysc,
+                                                       uint32_t client_id,
+                                                       bool fullscreen)
+{
+	if (xsysc == nullptr) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	(void)client_id;
+	(void)fullscreen;
+	return XRT_SUCCESS;
+}
+
 extern "C" bool
 comp_d3d11_service_workspace_hit_test(struct xrt_system_compositor *xsysc,
                                        int32_t cursor_x,

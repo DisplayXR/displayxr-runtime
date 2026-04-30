@@ -461,6 +461,30 @@ comp_d3d11_service_workspace_pointer_capture_set(struct xrt_system_compositor *x
                                                   bool enabled,
                                                   uint32_t button);
 
+/*!
+ * Phase 2.K: ask the runtime to close a specific workspace client. For OpenXR
+ * clients the runtime emits XRT_SESSION_EVENT_EXIT_REQUEST so the client exits
+ * cleanly; for capture clients the runtime tears down the capture immediately.
+ *
+ * @return XRT_SUCCESS on success;
+ *         XRT_ERROR_IPC_FAILURE if @p xsysc is invalid or the client is unknown.
+ */
+xrt_result_t
+comp_d3d11_service_workspace_request_client_exit(struct xrt_system_compositor *xsysc, uint32_t client_id);
+
+/*!
+ * Phase 2.K: ask the runtime to toggle fullscreen for a specific workspace
+ * client. Mirrors the runtime's built-in F11 shortcut, but targeted at any
+ * client.
+ *
+ * @return XRT_SUCCESS on success;
+ *         XRT_ERROR_IPC_FAILURE if @p xsysc is invalid or the client is unknown.
+ */
+xrt_result_t
+comp_d3d11_service_workspace_request_client_fullscreen(struct xrt_system_compositor *xsysc,
+                                                       uint32_t client_id,
+                                                       bool fullscreen);
+
 /*! @} */
 
 

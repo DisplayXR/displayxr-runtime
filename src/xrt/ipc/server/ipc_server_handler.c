@@ -2738,6 +2738,55 @@ ipc_handle_workspace_pointer_capture_set(volatile struct ipc_client_state *_ics,
 }
 
 xrt_result_t
+ipc_handle_workspace_request_client_exit(volatile struct ipc_client_state *_ics, uint32_t client_id)
+{
+	struct ipc_server *s = _ics->server;
+
+	unsigned long expected_pid = get_orchestrator_workspace_pid();
+	unsigned long caller_pid = (unsigned long)_ics->client_state.pid;
+	if (expected_pid != 0 && caller_pid != expected_pid) {
+		return XRT_ERROR_NOT_AUTHORIZED;
+	}
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (s->xsysc == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return comp_d3d11_service_workspace_request_client_exit(s->xsysc, client_id);
+#else
+	(void)s;
+	(void)client_id;
+	return XRT_ERROR_IPC_FAILURE;
+#endif
+}
+
+xrt_result_t
+ipc_handle_workspace_request_client_fullscreen(volatile struct ipc_client_state *_ics,
+                                               uint32_t client_id,
+                                               bool fullscreen)
+{
+	struct ipc_server *s = _ics->server;
+
+	unsigned long expected_pid = get_orchestrator_workspace_pid();
+	unsigned long caller_pid = (unsigned long)_ics->client_state.pid;
+	if (expected_pid != 0 && caller_pid != expected_pid) {
+		return XRT_ERROR_NOT_AUTHORIZED;
+	}
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (s->xsysc == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return comp_d3d11_service_workspace_request_client_fullscreen(s->xsysc, client_id, fullscreen);
+#else
+	(void)s;
+	(void)client_id;
+	(void)fullscreen;
+	return XRT_ERROR_IPC_FAILURE;
+#endif
+}
+
+xrt_result_t
 ipc_handle_workspace_enumerate_clients(volatile struct ipc_client_state *_ics, struct ipc_client_list *list)
 {
 	struct ipc_server *s = _ics->server;

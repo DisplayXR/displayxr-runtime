@@ -184,6 +184,19 @@
 		]
 	},
 
+	"workspace_request_client_exit": {
+		"in": [
+			{"name": "client_id", "type": "uint32_t"}
+		]
+	},
+
+	"workspace_request_client_fullscreen": {
+		"in": [
+			{"name": "client_id", "type": "uint32_t"},
+			{"name": "fullscreen", "type": "bool"}
+		]
+	},
+
 	"workspace_enumerate_clients": {
 		"out": [
 			{"name": "clients", "type": "struct ipc_client_list"}

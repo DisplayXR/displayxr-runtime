@@ -871,6 +871,12 @@ XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrGetWorkspaceClientInfoEXT(XrSession session,
                                 XrWorkspaceClientId clientId,
                                 XrWorkspaceClientInfoEXT *info);
+//! OpenXR API function @ep{xrRequestWorkspaceClientExitEXT}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrRequestWorkspaceClientExitEXT(XrSession session, XrWorkspaceClientId clientId);
+//! OpenXR API function @ep{xrRequestWorkspaceClientFullscreenEXT}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrRequestWorkspaceClientFullscreenEXT(XrSession session, XrWorkspaceClientId clientId, XrBool32 fullscreen);
 #endif
 
 #ifdef OXR_HAVE_EXT_app_launcher

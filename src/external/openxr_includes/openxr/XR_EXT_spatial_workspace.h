@@ -25,7 +25,7 @@ extern "C" {
 #endif
 
 #define XR_EXT_spatial_workspace 1
-#define XR_EXT_spatial_workspace_SPEC_VERSION 5
+#define XR_EXT_spatial_workspace_SPEC_VERSION 6
 #define XR_EXT_SPATIAL_WORKSPACE_EXTENSION_NAME "XR_EXT_spatial_workspace"
 
 // Provisional XrStructureType values. The 1000999100..104 range is reserved for
@@ -279,11 +279,14 @@ typedef XrResult (XRAPI_PTR *PFN_xrGetWorkspaceFocusedClientEXT)(
 // ---- Input event drain + pointer capture (spec_version 4) ----
 
 typedef enum XrWorkspaceInputEventTypeEXT {
-    XR_WORKSPACE_INPUT_EVENT_POINTER_EXT       = 0,
-    XR_WORKSPACE_INPUT_EVENT_POINTER_HOVER_EXT = 1, // reserved; not yet emitted
-    XR_WORKSPACE_INPUT_EVENT_KEY_EXT           = 2,
-    XR_WORKSPACE_INPUT_EVENT_SCROLL_EXT        = 3,
-    XR_WORKSPACE_INPUT_EVENT_TYPE_MAX_ENUM_EXT = 0x7FFFFFFF
+    XR_WORKSPACE_INPUT_EVENT_POINTER_EXT        = 0,
+    XR_WORKSPACE_INPUT_EVENT_POINTER_HOVER_EXT  = 1, // reserved; not yet emitted
+    XR_WORKSPACE_INPUT_EVENT_KEY_EXT            = 2,
+    XR_WORKSPACE_INPUT_EVENT_SCROLL_EXT         = 3,
+    XR_WORKSPACE_INPUT_EVENT_POINTER_MOTION_EXT = 4, // spec_version 6
+    XR_WORKSPACE_INPUT_EVENT_FRAME_TICK_EXT     = 5, // spec_version 6
+    XR_WORKSPACE_INPUT_EVENT_FOCUS_CHANGED_EXT  = 6, // spec_version 6
+    XR_WORKSPACE_INPUT_EVENT_TYPE_MAX_ENUM_EXT  = 0x7FFFFFFF
 } XrWorkspaceInputEventTypeEXT;
 
 /*!
@@ -301,8 +304,18 @@ typedef enum XrWorkspaceInputEventTypeEXT {
  *   - Everything else is delivered via this queue AND forwarded to the
  *     focused client's HWND.
  *
- * Per-frame mouse-move events are NOT emitted; controllers wanting hover
- * feedback poll xrWorkspaceHitTestEXT directly.
+ * Pointer motion events (spec_version 6) deliver per-frame WM_MOUSEMOVE while
+ * pointer capture is enabled. Controllers wanting hover feedback without
+ * holding a button can opt in via xrEnableWorkspacePointerCaptureEXT (any
+ * button), or poll xrWorkspaceHitTestEXT directly when capture is unset.
+ *
+ * Frame-tick events (spec_version 6) fire once per compositor frame so a
+ * controller can pace per-frame work (animation interpolation, hover effects)
+ * to display refresh without polling a timer.
+ *
+ * Focus-changed events (spec_version 6) fire when the runtime's focused client
+ * transitions (TAB cycle, click auto-focus, controller-set, client disconnect).
+ * They do NOT fire on every frame when focus is stable.
  */
 typedef struct XrWorkspaceInputEventEXT {
     XrWorkspaceInputEventTypeEXT eventType;
@@ -335,6 +348,22 @@ typedef struct XrWorkspaceInputEventEXT {
             int32_t                 cursorY;
             uint32_t                modifiers;
         } scroll;
+        struct {  // spec_version 6: per-frame mouse motion (capture-gated)
+            XrWorkspaceClientId     hitClientId;
+            XrWorkspaceHitRegionEXT hitRegion;
+            XrVector2f              localUV;
+            int32_t                 cursorX;        // display pixels, top-left origin
+            int32_t                 cursorY;
+            uint32_t                buttonMask;      // bit0=L, bit1=R, bit2=M (currently held)
+            uint32_t                modifiers;       // bit0=SHIFT, bit1=CTRL, bit2=ALT
+        } pointerMotion;
+        struct {  // spec_version 6: vsync-aligned compositor frame tick
+            uint64_t                timestampNs;     // host monotonic ns at frame compose
+        } frameTick;
+        struct {  // spec_version 6: workspace focused-client transition
+            XrWorkspaceClientId     prevClientId;
+            XrWorkspaceClientId     currentClientId;
+        } focusChanged;
     };
 } XrWorkspaceInputEventEXT;
 
@@ -375,6 +404,44 @@ typedef XrResult (XRAPI_PTR *PFN_xrEnableWorkspacePointerCaptureEXT)(
 
 typedef XrResult (XRAPI_PTR *PFN_xrDisableWorkspacePointerCaptureEXT)(
     XrSession session);
+
+// ---- Lifecycle requests (spec_version 6) ----
+
+/*!
+ * @brief Ask the runtime to close a specific workspace client.
+ *
+ * Equivalent to the runtime's built-in DELETE shortcut, but targeted at any
+ * client (not just the focused one). For OpenXR clients the runtime emits
+ * XRT_SESSION_EVENT_EXIT_REQUEST so the client exits cleanly; for capture
+ * clients the runtime tears down the capture immediately.
+ *
+ * The controller can drive this from its own chrome (a custom close button on
+ * a window decoration, an overview gesture, etc.) without the runtime needing
+ * to know about that policy.
+ *
+ * @return XR_SUCCESS on success,
+ *         XR_ERROR_HANDLE_INVALID if @p clientId is unknown,
+ *         XR_ERROR_FEATURE_UNSUPPORTED if @p session is not the active workspace.
+ */
+typedef XrResult (XRAPI_PTR *PFN_xrRequestWorkspaceClientExitEXT)(
+    XrSession            session,
+    XrWorkspaceClientId  clientId);
+
+/*!
+ * @brief Ask the runtime to toggle fullscreen for a specific workspace client.
+ *
+ * When @p fullscreen is XR_TRUE the target window animates to fill the display
+ * and other clients hide; XR_FALSE restores the prior layout. Mirrors the
+ * runtime's built-in F11 shortcut, but targeted at any client.
+ *
+ * @return XR_SUCCESS on success,
+ *         XR_ERROR_HANDLE_INVALID if @p clientId is unknown,
+ *         XR_ERROR_FEATURE_UNSUPPORTED if @p session is not the active workspace.
+ */
+typedef XrResult (XRAPI_PTR *PFN_xrRequestWorkspaceClientFullscreenEXT)(
+    XrSession            session,
+    XrWorkspaceClientId  clientId,
+    XrBool32             fullscreen);
 
 // ---- Frame capture (spec_version 5) ----
 
@@ -568,6 +635,15 @@ XRAPI_ATTR XrResult XRAPI_CALL xrEnableWorkspacePointerCaptureEXT(
 
 XRAPI_ATTR XrResult XRAPI_CALL xrDisableWorkspacePointerCaptureEXT(
     XrSession session);
+
+XRAPI_ATTR XrResult XRAPI_CALL xrRequestWorkspaceClientExitEXT(
+    XrSession            session,
+    XrWorkspaceClientId  clientId);
+
+XRAPI_ATTR XrResult XRAPI_CALL xrRequestWorkspaceClientFullscreenEXT(
+    XrSession            session,
+    XrWorkspaceClientId  clientId,
+    XrBool32             fullscreen);
 
 XRAPI_ATTR XrResult XRAPI_CALL xrCaptureWorkspaceFrameEXT(
     XrSession                            session,

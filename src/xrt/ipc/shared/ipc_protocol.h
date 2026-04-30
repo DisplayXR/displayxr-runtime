@@ -361,10 +361,13 @@ struct ipc_launcher_app
 
 enum ipc_workspace_input_event_type
 {
-	IPC_WORKSPACE_INPUT_EVENT_POINTER       = 0,
-	IPC_WORKSPACE_INPUT_EVENT_POINTER_HOVER = 1,
-	IPC_WORKSPACE_INPUT_EVENT_KEY           = 2,
-	IPC_WORKSPACE_INPUT_EVENT_SCROLL        = 3,
+	IPC_WORKSPACE_INPUT_EVENT_POINTER        = 0,
+	IPC_WORKSPACE_INPUT_EVENT_POINTER_HOVER  = 1,
+	IPC_WORKSPACE_INPUT_EVENT_KEY            = 2,
+	IPC_WORKSPACE_INPUT_EVENT_SCROLL         = 3,
+	IPC_WORKSPACE_INPUT_EVENT_POINTER_MOTION = 4, //!< spec_version 6
+	IPC_WORKSPACE_INPUT_EVENT_FRAME_TICK     = 5, //!< spec_version 6
+	IPC_WORKSPACE_INPUT_EVENT_FOCUS_CHANGED  = 6, //!< spec_version 6
 };
 
 struct ipc_workspace_input_event
@@ -406,6 +409,26 @@ struct ipc_workspace_input_event
 			int64_t  cursor_y;
 			uint32_t modifiers;
 		} scroll;
+		struct                      //!< spec_version 6: per-frame motion (capture-gated)
+		{
+			uint32_t hit_client_id;
+			uint32_t hit_region;
+			float    local_u;
+			float    local_v;
+			int64_t  cursor_x;
+			int64_t  cursor_y;
+			uint32_t button_mask;    //!< bit0=L, bit1=R, bit2=M (currently held)
+			uint32_t modifiers;
+		} pointer_motion;
+		struct                      //!< spec_version 6: vsync-aligned frame tick
+		{
+			uint64_t timestamp_ns;
+		} frame_tick;
+		struct                      //!< spec_version 6: focused-client transition
+		{
+			uint32_t prev_client_id;
+			uint32_t curr_client_id;
+		} focus_changed;
 	} u;
 };
 

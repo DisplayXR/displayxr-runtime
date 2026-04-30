@@ -119,6 +119,12 @@ comp_ipc_client_compositor_workspace_get_client_info(struct xrt_compositor *xc,
                                                      uint32_t *out_z_order,
                                                      bool *out_is_focused,
                                                      bool *out_is_visible);
+xrt_result_t
+comp_ipc_client_compositor_workspace_request_client_exit(struct xrt_compositor *xc, uint32_t client_id);
+xrt_result_t
+comp_ipc_client_compositor_workspace_request_client_fullscreen(struct xrt_compositor *xc,
+                                                               uint32_t client_id,
+                                                               bool fullscreen);
 
 
 /*
@@ -783,6 +789,64 @@ oxr_xrGetWorkspaceClientInfoEXT(XrSession session,
 	info->isVisible = is_visible ? XR_TRUE : XR_FALSE;
 	info->zOrder = z_order;
 	return XR_SUCCESS;
+}
+
+
+/*
+ * Lifecycle requests (spec_version 6)
+ */
+
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrRequestWorkspaceClientExitEXT(XrSession session, XrWorkspaceClientId clientId)
+{
+	OXR_TRACE_MARKER();
+
+	struct oxr_session *sess = NULL;
+	struct oxr_logger log;
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrRequestWorkspaceClientExitEXT");
+	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+
+	if (clientId == XR_NULL_WORKSPACE_CLIENT_ID) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+		                 "xrRequestWorkspaceClientExitEXT: clientId must not be XR_NULL_WORKSPACE_CLIENT_ID");
+	}
+
+	if (!session_is_ipc_client(sess)) {
+		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
+		                 "xrRequestWorkspaceClientExitEXT requires an IPC-mode session");
+	}
+
+	xrt_result_t xret =
+	    comp_ipc_client_compositor_workspace_request_client_exit(&sess->xcn->base, (uint32_t)clientId);
+	return xret_to_xr_result(&log, xret, "workspace_request_client_exit");
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrRequestWorkspaceClientFullscreenEXT(XrSession session, XrWorkspaceClientId clientId, XrBool32 fullscreen)
+{
+	OXR_TRACE_MARKER();
+
+	struct oxr_session *sess = NULL;
+	struct oxr_logger log;
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrRequestWorkspaceClientFullscreenEXT");
+	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+
+	if (clientId == XR_NULL_WORKSPACE_CLIENT_ID) {
+		return oxr_error(
+		    &log, XR_ERROR_VALIDATION_FAILURE,
+		    "xrRequestWorkspaceClientFullscreenEXT: clientId must not be XR_NULL_WORKSPACE_CLIENT_ID");
+	}
+
+	if (!session_is_ipc_client(sess)) {
+		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
+		                 "xrRequestWorkspaceClientFullscreenEXT requires an IPC-mode session");
+	}
+
+	xrt_result_t xret = comp_ipc_client_compositor_workspace_request_client_fullscreen(
+	    &sess->xcn->base, (uint32_t)clientId, fullscreen == XR_TRUE);
+	return xret_to_xr_result(&log, xret, "workspace_request_client_fullscreen");
 }
 
 #endif // OXR_HAVE_EXT_spatial_workspace

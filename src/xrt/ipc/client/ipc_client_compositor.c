@@ -470,6 +470,27 @@ comp_ipc_client_compositor_workspace_enumerate_input_events(struct xrt_composito
 			out->scroll.cursorY = (int32_t)src->u.scroll.cursor_y;
 			out->scroll.modifiers = src->u.scroll.modifiers;
 			break;
+		case IPC_WORKSPACE_INPUT_EVENT_POINTER_MOTION:
+			out->pointerMotion.hitClientId =
+			    (XrWorkspaceClientId)src->u.pointer_motion.hit_client_id;
+			out->pointerMotion.hitRegion =
+			    (XrWorkspaceHitRegionEXT)src->u.pointer_motion.hit_region;
+			out->pointerMotion.localUV.x = src->u.pointer_motion.local_u;
+			out->pointerMotion.localUV.y = src->u.pointer_motion.local_v;
+			out->pointerMotion.cursorX = (int32_t)src->u.pointer_motion.cursor_x;
+			out->pointerMotion.cursorY = (int32_t)src->u.pointer_motion.cursor_y;
+			out->pointerMotion.buttonMask = src->u.pointer_motion.button_mask;
+			out->pointerMotion.modifiers = src->u.pointer_motion.modifiers;
+			break;
+		case IPC_WORKSPACE_INPUT_EVENT_FRAME_TICK:
+			out->frameTick.timestampNs = src->u.frame_tick.timestamp_ns;
+			break;
+		case IPC_WORKSPACE_INPUT_EVENT_FOCUS_CHANGED:
+			out->focusChanged.prevClientId =
+			    (XrWorkspaceClientId)src->u.focus_changed.prev_client_id;
+			out->focusChanged.currentClientId =
+			    (XrWorkspaceClientId)src->u.focus_changed.curr_client_id;
+			break;
 		default:
 			break;
 		}
@@ -629,6 +650,34 @@ comp_ipc_client_compositor_workspace_get_client_info(struct xrt_compositor *xc,
 	if (out_is_focused) *out_is_focused = state.session_focused;
 	if (out_is_visible) *out_is_visible = state.session_visible;
 	return XRT_SUCCESS;
+}
+
+xrt_result_t
+comp_ipc_client_compositor_workspace_request_client_exit(struct xrt_compositor *xc, uint32_t client_id)
+{
+	if (xc == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_call_workspace_request_client_exit(icc->ipc_c, client_id);
+}
+
+xrt_result_t
+comp_ipc_client_compositor_workspace_request_client_fullscreen(struct xrt_compositor *xc,
+                                                               uint32_t client_id,
+                                                               bool fullscreen)
+{
+	if (xc == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_call_workspace_request_client_fullscreen(icc->ipc_c, client_id, fullscreen);
 }
 
 /*
