@@ -128,12 +128,16 @@ render_pill(shell_chrome *sc, chrome_slot &slot)
 		return;
 	}
 
-	// Frosted-glass pill background — matches the runtime's chrome color.
-	// The shader writes sRGB-encoded values; ClearRTV writes linear, so this
-	// color appears slightly brighter than the runtime version until C3.C
-	// ports the rounded-pill shader.
-	const float pill_color[4] = {0.20f, 0.22f, 0.28f, 0.70f};
-	sc->context->ClearRenderTargetView(slot.rtv.Get(), pill_color);
+	// C3.B verification: paint a flagrant bright red so the controller chrome
+	// is unmistakable in the atlas — the in-runtime pill (still drawing
+	// until C5) is frosted blue, so anything red is from the shell. Will
+	// be replaced with the proper frosted-glass color in C3.C.
+	const float verify_red[4] = {0.85f, 0.10f, 0.10f, 0.85f};
+	sc->context->ClearRenderTargetView(slot.rtv.Get(), verify_red);
+	// Flush so the GPU work is submitted before xrReleaseSwapchainImage
+	// signals the keyed mutex — otherwise the runtime's read on the other
+	// side of the shared NT handle samples uninitialized memory.
+	sc->context->Flush();
 }
 
 // Build the chrome layout struct: pose-in-client (above the window content),

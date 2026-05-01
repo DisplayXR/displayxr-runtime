@@ -149,6 +149,12 @@ comp_ipc_client_compositor_workspace_set_chrome_layout(struct xrt_compositor *xc
 uint32_t
 comp_ipc_client_compositor_get_swapchain_id(struct xrt_swapchain *xsc);
 
+// Forward decl from compositor/client/comp_d3d11_client.cpp. Linked into the
+// runtime DLL alongside the IPC client. Unwraps the D3D11 wrapper so the
+// chrome dispatch can read the inner ipc_client_swapchain.id.
+struct xrt_swapchain *
+comp_d3d11_client_get_inner_xrt_swapchain(struct xrt_swapchain *xsc);
+
 
 /*
  * Helpers
@@ -946,13 +952,17 @@ oxr_xrCreateWorkspaceClientChromeSwapchainEXT(XrSession session,
 		return ret;
 	}
 
-	uint32_t swapchain_id = comp_ipc_client_compositor_get_swapchain_id(sc->swapchain);
-	if (swapchain_id == 0) {
-		// Defensive: id 0 is reserved. Unwind by destroying the swapchain.
-		oxr_handle_destroy(&log, &sc->handle);
-		return oxr_error(&log, XR_ERROR_RUNTIME_FAILURE,
-		                 "xrCreateWorkspaceClientChromeSwapchainEXT: failed to resolve IPC swapchain id");
+	// sc->swapchain is the per-graphics-API wrapper around the actual IPC
+	// swapchain. For the shell (D3D11 binding) we unwrap once via the
+	// d3d11 client helper to reach the ipc_client_swapchain whose `id`
+	// field is what the runtime uses to look up the swapchain server-side.
+	// Valid IPC swapchain ids range from 0 to IPC_MAX_CLIENT_SWAPCHAINS-1
+	// (id 0 IS valid — first slot in the controller's xscs[] table).
+	struct xrt_swapchain *inner = comp_d3d11_client_get_inner_xrt_swapchain(sc->swapchain);
+	if (inner == NULL) {
+		inner = sc->swapchain; // fallback if it was already an ipc_client_swapchain
 	}
+	uint32_t swapchain_id = comp_ipc_client_compositor_get_swapchain_id(inner);
 
 	xrt_result_t xret = comp_ipc_client_compositor_workspace_register_chrome_swapchain(
 	    &sess->xcn->base, (uint32_t)clientId, swapchain_id);
@@ -979,8 +989,12 @@ oxr_xrDestroyWorkspaceClientChromeSwapchainEXT(XrSwapchain swapchain)
 	// swapchain. The runtime is tolerant of a missing entry — if the swapchain
 	// was never registered (e.g. created via xrCreateSwapchain directly), the
 	// unregister is a no-op there.
-	uint32_t swapchain_id = comp_ipc_client_compositor_get_swapchain_id(sc->swapchain);
-	if (swapchain_id != 0 && session_is_ipc_client(sc->sess)) {
+	struct xrt_swapchain *inner = comp_d3d11_client_get_inner_xrt_swapchain(sc->swapchain);
+	if (inner == NULL) {
+		inner = sc->swapchain;
+	}
+	uint32_t swapchain_id = comp_ipc_client_compositor_get_swapchain_id(inner);
+	if (session_is_ipc_client(sc->sess)) {
 		(void)comp_ipc_client_compositor_workspace_unregister_chrome_swapchain(
 		    &sc->sess->xcn->base, swapchain_id);
 	}

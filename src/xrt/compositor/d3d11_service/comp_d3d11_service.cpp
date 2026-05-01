@@ -7943,6 +7943,25 @@ after_key_shortcuts:
 			if (csc != nullptr && csc->image_count > 0 && csc->images[0].srv) {
 				ID3D11ShaderResourceView *chrome_srv = csc->images[0].srv.get();
 
+				// C3.B: bracket the chrome read with keyed-mutex acquire/release
+				// so cross-process GPU writes from the shell become visible on
+				// the runtime's D3D11 device. Service-created swapchains use a
+				// shared NT handle + KEYEDMUTEX; the shell takes key=0 in
+				// xrWaitSwapchainImage and releases it in xrReleaseSwapchainImage,
+				// but the runtime's swapchain_wait_image is a no-op for
+				// service_created swapchains (comment at line ~2419) — the
+				// runtime is expected to acquire when it actually reads. Hoisted
+				// above the per-view loop: one acquire/release per composite
+				// tick, not per view.
+				IDXGIKeyedMutex *chrome_mutex = csc->images[0].keyed_mutex.get();
+				bool chrome_mutex_held = false;
+				if (chrome_mutex != nullptr) {
+					HRESULT hr = chrome_mutex->AcquireSync(0, 4 /* ms */);
+					if (SUCCEEDED(hr)) {
+						chrome_mutex_held = true;
+					}
+				}
+
 				float chrome_cx = cs->chrome_pose_in_client.position.x;
 				float chrome_cy = cs->chrome_pose_in_client.position.y;
 				float chrome_hw = cs->chrome_size_w_m * 0.5f;
@@ -8010,10 +8029,14 @@ after_key_shortcuts:
 					              D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
 						BlitConstants *cb = static_cast<BlitConstants *>(mapped.pData);
 						memset(cb, 0, sizeof(*cb));
-						cb->src_rect[0] = 0.0f; cb->src_rect[1] = 0.0f;
-						cb->src_rect[2] = 1.0f; cb->src_rect[3] = 1.0f;
-						cb->src_size[0] = (uint32_t)chrome_desc.Width;
-						cb->src_size[1] = (uint32_t)chrome_desc.Height;
+						// src_rect is in source-texture pixels (xy=offset,
+						// zw=extent). Sample the entire chrome image.
+						cb->src_rect[0] = 0.0f;
+						cb->src_rect[1] = 0.0f;
+						cb->src_rect[2] = (float)chrome_desc.Width;
+						cb->src_rect[3] = (float)chrome_desc.Height;
+						cb->src_size[0] = (float)chrome_desc.Width;
+						cb->src_size[1] = (float)chrome_desc.Height;
 						cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
 						cb->convert_srgb = 0.0f;
 						cb->chrome_alpha = 0.0f;
@@ -8031,6 +8054,10 @@ after_key_shortcuts:
 					sys->context->PSSetShaderResources(0, 1, &chrome_srv);
 					sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
 					sys->context->Draw(4, 0);
+				}
+
+				if (chrome_mutex_held) {
+					chrome_mutex->ReleaseSync(0);
 				}
 			}
 		}
@@ -12286,7 +12313,7 @@ comp_d3d11_service_workspace_register_chrome_swapchain_by_slot(struct xrt_system
                                                                uint32_t swapchain_id,
                                                                struct xrt_swapchain *chrome_xsc)
 {
-	if (xsysc == nullptr || chrome_xsc == nullptr || swapchain_id == 0) {
+	if (xsysc == nullptr || chrome_xsc == nullptr) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
 	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
@@ -12321,7 +12348,7 @@ extern "C" xrt_result_t
 comp_d3d11_service_workspace_unregister_chrome_swapchain(struct xrt_system_compositor *xsysc,
                                                          uint32_t swapchain_id)
 {
-	if (xsysc == nullptr || swapchain_id == 0) {
+	if (xsysc == nullptr) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
 	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
@@ -12333,7 +12360,10 @@ comp_d3d11_service_workspace_unregister_chrome_swapchain(struct xrt_system_compo
 	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
 	for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
 		struct d3d11_multi_client_slot *cs = &mc->clients[s];
-		if (cs->chrome_swapchain_id == swapchain_id) {
+		// Match on chrome_xsc != null too — chrome_swapchain_id 0 is a
+		// valid IPC id (first slot in xscs[]), so unregistered slots
+		// would spuriously match swapchain_id=0 without this guard.
+		if (cs->chrome_xsc != nullptr && cs->chrome_swapchain_id == swapchain_id) {
 			xrt_swapchain_reference(&cs->chrome_xsc, NULL);
 			cs->chrome_swapchain_id = 0;
 			cs->chrome_layout_valid = false;

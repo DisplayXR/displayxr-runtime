@@ -238,6 +238,25 @@ as_client_d3d11_compositor(struct xrt_compositor *xc)
 	return (struct client_d3d11_compositor *)xc;
 }
 
+/*!
+ * Phase 2.C: unwrap a client_d3d11_swapchain to the inner xrt_swapchain that
+ * the IPC layer uses. The state-tracker chrome dispatch wrapper needs the
+ * IPC swapchain id (held on ipc_client_swapchain.id) to register the chrome
+ * with the runtime; the D3D11 client's outer wrapper does not expose the id
+ * directly. Returns NULL if @p xsc is not a client_d3d11_swapchain.
+ *
+ * Invokes from C is fine — extern "C" keeps the symbol unmangled.
+ */
+extern "C" struct xrt_swapchain *
+comp_d3d11_client_get_inner_xrt_swapchain(struct xrt_swapchain *xsc)
+{
+	if (xsc == nullptr) {
+		return nullptr;
+	}
+	struct client_d3d11_swapchain *sc = as_client_d3d11_swapchain(xsc);
+	return sc->xsc.get();
+}
+
 
 /*
  *
