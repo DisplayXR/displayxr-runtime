@@ -1,8 +1,8 @@
-# Phase 2.C Status: Controller-Owned Chrome
+# Phase 2.C Status: Controller-Owned Chrome ✅ SHIPPED
 
 **Branch:** `feature/workspace-extensions-2C` (off `feature/workspace-extensions-2K` tip)
-**Status:** C1, C2, C3.A, C3.B, C3.C-1, C3.C-2, C4, C3.C-4, C5, C3.C-3a, C3.C-3b, spec_version 8 committed. Runtime now ships with **zero default chrome** — controller-owned chrome is the only chrome path; idle CPU effectively zero (event-driven, no poll loop); pill tracks window edge in lockstep with content during resize (no IPC roundtrip per frame); per-client app name renders between icon and dots via DirectWrite, adaptive-skip when too narrow. Remaining: C6 (test app smoke + final doc pass).
-**Date:** 2026-05-01 (last updated end-of-session after C3.C-3b)
+**Status:** ✅ All sub-phases shipped. Public surface bumped 6 → 8 across spec_version 7 (chrome swapchain + layout + hit regions) and spec_version 8 (event-driven wakeup, auto-anchor flags, `WINDOW_POSE_CHANGED` event). Runtime ships with **zero default chrome** — controller-owned chrome is the only chrome path; idle CPU effectively zero (event-driven, no poll loop); pill tracks window edge in lockstep with content during resize (no IPC roundtrip per frame); per-client app name renders between icon and dots via DirectWrite, adaptive-skip when too narrow. C6 (test app chrome smoke + spec doc refresh + audit refresh) committed as the close-out.
+**Date:** 2026-05-01 (Phase 2.C ✅ shipped after C6)
 
 ## Scope
 
@@ -32,7 +32,7 @@ Lift the floating-pill chrome (pill bg, grip dots, close/min/max buttons, app ic
 | [x] | spec_v8: pose-changed | New `XR_WORKSPACE_INPUT_EVENT_WINDOW_POSE_CHANGED_EXT` event lets controllers react to runtime-driven pose / size changes (edge resize, fullscreen toggle). |
 | [x] | spec_v8: glassy polish | Lighter / more transparent pill bg (22 % alpha, edge highlight ring); semi-transparent buttons with procedural × / − / □ glyphs in PS. |
 | [x] | C3.C-3b | DirectWrite title-text atlas — per-client app name baked once via DirectWrite + D2D over a DXGI surface (R8G8B8A8_UNORM linear, 64 px tall, vertically centered Segoe UI Variable @ 28 DIP). Sampled at register t1 in the pill PS via new `over_pma()` Porter-Duff variant. Adaptive: render_pill flips `has_title=0` when the available rect (icon-right → dots-left, minus padding) can't fit the measured text, AND while a resize burst is in flight (prevents flicker on hover-fade ticks during drag). |
-| [~] | C6 | Spec + separation-of-concerns + audit + plan docs (mostly done, will need a small refresh after C3.C-3b); test app smoke deferred |
+| [x] | C6 | Test app chrome smoke (`workspace_minimal_d3d11_win`: chrome swapchain create / acquire / wait / clear-RTV / release / layout-with-auto-anchor + 2 hit regions / wakeup-event handle / destroy — 28 PFNs total) + spec doc refresh to spec_version 8 (wakeup event, auto-anchor flags, `WINDOW_POSE_CHANGED` event) + audit doc refresh to fold in C3.C-3a / C3.C-3b deliverables. |
 
 ## Commits
 
@@ -77,7 +77,11 @@ Lift the floating-pill chrome (pill bg, grip dots, close/min/max buttons, app ic
 
 ## Next-step plan
 
-**C6 — Test app smoke + final doc pass.** Chrome-swapchain smoke in `workspace_minimal_d3d11_win` (~200 lines: create chrome swapchain, fill with checkerboard, set 2 hit regions, drain events, verify chromeRegionId). Spec doc refresh to mention spec_version 8 fields + the new `WINDOW_POSE_CHANGED` event + the wakeup-event PFN. Audit entry update. Mark Phase 2.C ✅ shipped.
+Phase 2.C is shipped. Next investigations are independent of this branch:
+
+- **Window-content focus glow** (proposed) — soft inward rim on the focused client's chrome pill, controller-owned. Reuse the existing edge-highlight SDF in `shell_chrome.cpp`'s pixel shader and modulate by a new `set_focus(client_id)` API + `has_focus` cbuffer flag. ~100 lines.
+- **C3.C-3 polish carryovers** if any surface during dogfooding (the in-tree status doc's "Open issues" list captures the known ones).
+- **Phase 2.H final cleanup pass** — the rename pass over remaining `shell_*` mentions in the runtime body; tracked in `spatial-workspace-extensions-phase2-audit.md`.
 
 ## Files Touched (Phase 2.C across all sub-steps)
 

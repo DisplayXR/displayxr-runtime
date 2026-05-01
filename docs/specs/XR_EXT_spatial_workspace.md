@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | **Extension Name** | `XR_EXT_spatial_workspace` |
-| **Spec Version** | 6 |
+| **Spec Version** | 8 |
 | **Authors** | David Fattal (DisplayXR / Leia Inc.) |
 | **Status** | Provisional — published with the DisplayXR runtime; subject to revision before Khronos registry submission. |
 | **Header** | `src/external/openxr_includes/openxr/XR_EXT_spatial_workspace.h` |
@@ -20,7 +20,7 @@ A spatial workspace is the OS-level shell for a 3D display: the privileged proce
 
 ---
 
-## 2. Surface (spec_version 7)
+## 2. Surface (spec_version 8)
 
 ### Lifecycle
 
@@ -57,6 +57,7 @@ A spatial workspace is the OS-level shell for a 3D display: the privileged proce
   - **POINTER_MOTION** *(spec_version 6)* — per-frame `WM_MOUSEMOVE` while pointer capture is enabled. Hit-test enriched. Carries a `buttonMask` of currently-held buttons (bit0=L, bit1=R, bit2=M).
   - **FRAME_TICK** *(spec_version 6)* — fires once per displayed compositor frame with the host-monotonic ns at frame compose. Lets controllers pace per-frame work (animation interpolation, hover effects) to display refresh without polling.
   - **FOCUS_CHANGED** *(spec_version 6)* — fires only on focused-client transitions (TAB, click auto-focus, controller-set, client disconnect). Does **not** fire on stable frames. Carries `prevClientId` and `currentClientId`.
+  - **WINDOW_POSE_CHANGED** *(spec_version 8)* — fires when the runtime itself changes a client's window pose or size (edge-resize drag, fullscreen toggle, F11). NOT emitted for controller-driven `xrSetWorkspaceClientWindowPoseEXT` calls — the controller already knows about those. Carries `clientId`, the new `pose`, and `widthMeters` / `heightMeters`. Lets the controller respond to runtime-driven geometry changes without polling.
 - `xrEnableWorkspacePointerCaptureEXT(session, button)` — begin pointer capture. While enabled, button-up and motion events for the named button keep flowing even when the cursor leaves any window. The runtime drives Win32 SetCapture so motion outside the workspace HWND still reaches the WndProc. Used to implement controller-driven drag, carousel, and chrome highlight without the runtime knowing about drag policy.
 - `xrDisableWorkspacePointerCaptureEXT(session)` — release.
 
@@ -80,6 +81,8 @@ The runtime ships with **zero default chrome**. If a controller wants chrome (ti
 
 - `xrCreateWorkspaceClientChromeSwapchainEXT(session, clientId, &createInfo, &outSwapchain)` — mint a cross-process-shareable image-loop swapchain (D3D11 SHARED_NTHANDLE + KEYEDMUTEX texture; one image; controller-chosen format/size). The returned `XrSwapchain` is a regular OpenXR swapchain — `xrAcquireSwapchainImage` / `xrWaitSwapchainImage` / `xrReleaseSwapchainImage` work as normal. The runtime side-table records this swapchain as "chrome" for the named client.
 - `xrSetWorkspaceClientChromeLayoutEXT(session, clientId, &layout)` — attach a chrome quad to the client's window. The layout carries `poseInClient` (chrome pose relative to the window), `sizeMeters` (quad dimensions), `followsWindowOrient` (rotate with window?), `depthBiasMeters` (bias toward the eye; 0 = runtime default 1 mm), and an inline array of up to 8 `XrWorkspaceChromeHitRegionEXT` entries. Each region carries a controller-defined `id` and a UV-space rect — when the cursor hits inside one, the runtime echoes the matched id back as `chromeRegionId` on POINTER / POINTER_MOTION events.
+  - *(spec_version 8)* `anchorToWindowTopEdge` — when `XR_TRUE`, `poseInClient.position.y` is interpreted as an offset ABOVE the window's TOP edge (positive = above), not from window center. The runtime evaluates `effectiveY = window_h/2 + poseInClient.position.y` per frame using the **current** window height, so chrome stays glued to the top edge during a resize without the controller re-pushing layout.
+  - *(spec_version 8)* `widthAsFractionOfWindow` — when > 0, chrome width is computed each frame as `window_w × widthAsFractionOfWindow` (`sizeMeters.width` is ignored). 0 means "absolute size, use `sizeMeters.width`." Pairs with `anchorToWindowTopEdge` so a single layout push survives arbitrary window resizes.
 - `xrDestroyWorkspaceClientChromeSwapchainEXT(swapchain)` — tear down the chrome swapchain. The runtime drops the side-table entry and unlinks the slot.
 
 **Authoring loop.** Once per state change (hover toggle, focus change, button-hover, layout switch), the controller calls `xrAcquireSwapchainImage` → `xrWaitSwapchainImage` → renders into image[0] → `xrReleaseSwapchainImage`. The runtime composites the latest image at the layout's pose every frame; idle = zero CPU, zero GPU, zero IPC.
@@ -89,6 +92,12 @@ The runtime ships with **zero default chrome**. If a controller wants chrome (ti
 **Hover events.** `XR_WORKSPACE_INPUT_EVENT_POINTER_HOVER_EXT` fires whenever the runtime's per-frame raycast detects a hovered-slot transition (cursor enter / leave a window). Works in all layout modes, regardless of pointer-capture state — controllers use this as the trigger for chrome fade-in / fade-out animations.
 
 **New hit-region enum value.** `XR_WORKSPACE_HIT_REGION_CHROME_EXT = 6` indicates the cursor hit a controller-submitted chrome quad. (Legacy `CLOSE_BUTTON / MINIMIZE_BUTTON / MAXIMIZE_BUTTON / TITLE_BAR` enum values remain in the header for spec_version ≤ 6 controllers; the runtime still emits them for backwards compatibility while the in-runtime hit-test fields exist.)
+
+### Event-driven wakeup *(spec_version 8)*
+
+- `xrAcquireWorkspaceWakeupEventEXT(session, &outNativeHandle)` — return a platform-native event handle the controller waits on instead of polling. The runtime signals the handle whenever async workspace state changes: an input event was pushed onto the drain queue, the focused-client transitioned, the hovered-slot transitioned, or a window pose / size changed via `WINDOW_POSE_CHANGED`. On Windows, `outNativeHandle` is a Win32 `HANDLE` cast to `uint64_t`; the caller passes it to `WaitForSingleObject` / `MsgWaitForMultipleObjects` and **owns** the handle (must `CloseHandle` when done). Auto-reset semantics — the handle clears as one waiter wakes; multiple `SetEvent`s in quick succession may collapse to one wake, so the controller must drain ALL pending state on each wake. The runtime can be called multiple times to mint fresh handles (each duplicates the runtime's single source-of-truth event into the caller's process). Returns `XR_ERROR_FEATURE_UNSUPPORTED` on non-Windows platforms.
+
+The controller's idle CPU cost goes from ~0.1 % of one core (the polling baseline) to effectively 0 once this handle is wired into its wait set. The reference shell at `src/xrt/targets/shell/main.c` uses it together with the launcher's existing `MsgWaitForMultipleObjects` loop — drain on every wake, sleep otherwise.
 
 ---
 
@@ -110,7 +119,9 @@ The runtime ships with **zero default chrome**. If a controller wants chrome (ti
 
 **Spec_version 7 adds controller-owned chrome.** Three new function PFNs (`xrCreate/Destroy/SetWorkspaceClientChrome*EXT`), three new structs (`XrWorkspaceChromeSwapchainCreateInfoEXT`, `XrWorkspaceChromeLayoutEXT`, `XrWorkspaceChromeHitRegionEXT`), one new enum value (`XR_WORKSPACE_HIT_REGION_CHROME_EXT`), one new field (`chromeRegionId`) on POINTER + POINTER_MOTION event payloads, and a no-longer-reserved POINTER_HOVER event. The runtime ships with **zero default chrome**: spec_version 6 controllers that don't know about chrome swapchains see clients as bare content quads. Migrating from 6 → 7 is opt-in — controllers that want chrome submit it via the new APIs.
 
-**Architectural endpoint.** Per the architectural North Star (`feedback_controllers_own_motion`), the runtime owns mechanism, the controller owns policy + appearance. After spec_version 7, this principle holds for chrome too: the runtime owns the cross-process texture-share mechanism, the depth-pipeline composite, and the hit-test plumbing; the controller owns every pixel of chrome appearance, every region's hit-region geometry, and every animation curve.
+**Spec_version 8 closes the controller-loop.** Three additions, all additive over v7: (1) `xrAcquireWorkspaceWakeupEventEXT` returns a Win32 event handle so the controller can sleep on `MsgWaitForMultipleObjects` instead of polling — drops idle CPU from ~0.1 % to ~0. (2) `XrWorkspaceChromeLayoutEXT` gains `anchorToWindowTopEdge` + `widthAsFractionOfWindow` flags so the runtime auto-recomputes chrome anchor + width every frame from current window dims; the controller pushes layout once at create and never on resize, and the chrome stays glued to the window edge in lockstep with content (instead of lagging one frame behind). (3) `XR_WORKSPACE_INPUT_EVENT_WINDOW_POSE_CHANGED_EXT` lets controllers react to runtime-driven pose / size changes (edge-resize drag, fullscreen toggle) without a re-query. v7 controllers that don't resolve the new PFN / fields keep working — none of the v8 additions are mandatory.
+
+**Architectural endpoint.** Per the architectural North Star (`feedback_controllers_own_motion`), the runtime owns mechanism, the controller owns policy + appearance. After spec_version 8, this principle holds for chrome and for the controller's main-loop wakeup pattern: the runtime owns the cross-process texture-share mechanism, the depth-pipeline composite, the hit-test plumbing, the auto-anchor math, and the wakeup-event source-of-truth; the controller owns every pixel of chrome appearance, every region's hit-region geometry, every animation curve, and the wait primitive that drives its idle behavior.
 
 ---
 
@@ -124,6 +135,6 @@ The extension is implemented in this repository:
 - **Service compositor (Windows D3D11)**: `src/xrt/compositor/d3d11_service/comp_d3d11_service.cpp` (drain, hit-test enrichment, FRAME_TICK + FOCUS_CHANGED + POINTER_HOVER emission, controller-chrome composite, chrome quad raycast, chromeRegionId resolution, request_*_by_slot helpers); `src/xrt/compositor/d3d11/comp_d3d11_window.cpp` (WndProc, public ring, Win32 SetCapture / ReleaseCapture).
 - **Reference controller (chrome appearance)**: `src/xrt/targets/shell/shell_chrome.cpp` — owns the rounded-pill SDF shader, grip dots + close/min/max button geometry, hover-fade ease-out cubic, per-state re-render. Reads cursor-over-chrome via POINTER_HOVER events; dispatches close → exit RPC, max → fullscreen RPC.
 - **Reference controller (lifecycle)**: `src/xrt/targets/shell/main.c` (animation framework, smooth preset transitions, interactive carousel state machine, variable poll cadence, chrome lifecycle wiring).
-- **Smoke test**: `test_apps/workspace_minimal_d3d11_win/main.cpp` — resolves all PFNs, walks lifecycle + pose + visibility + hit-test + focus + drain + pointer capture + 30° yaw orientation + drain counts + lifecycle requests + client enumeration + frame capture. Chrome-swapchain smoke is a follow-up addition.
+- **Smoke test**: `test_apps/workspace_minimal_d3d11_win/main.cpp` — resolves all 28 PFNs, walks lifecycle + pose + visibility + hit-test + focus + drain + pointer capture + 30° yaw orientation + drain counts + lifecycle requests + chrome-swapchain create / acquire / wait / clear / release / layout-with-auto-anchor + wakeup-event handle + chrome destroy + client enumeration + frame capture.
 
 The Phase 2 sub-phase that landed each part of this surface is tracked in [`docs/roadmap/spatial-workspace-extensions-phase2-audit.md`](../roadmap/spatial-workspace-extensions-phase2-audit.md).

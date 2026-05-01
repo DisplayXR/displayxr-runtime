@@ -4,9 +4,9 @@
 // workspace_minimal_d3d11_win
 //
 // Minimal validation client for XR_EXT_spatial_workspace (Phase 2.A + 2.C
-// + 2.D + 2.F + 2.I-prequel, v5) and XR_EXT_app_launcher (Phase 2.B).
-// Creates an instance + session, resolves all 22 extension PFNs, and walks
-// through:
+// + 2.D + 2.F + 2.I-prequel, spec_version 8) and XR_EXT_app_launcher
+// (Phase 2.B). Creates an instance + session, resolves all 28 extension
+// PFNs, and walks through:
 //   activate -> get-state ->
 //     add capture client ->
 //     set/get/set client window pose + visibility ->
@@ -14,6 +14,10 @@
 //     set/get focused client (Phase 2.D) ->
 //     enumerate input events (count-query) (Phase 2.D) ->
 //     enable/disable pointer capture (Phase 2.D) ->
+//     create chrome swapchain + acquire/wait/clear/release one image ->
+//     set chrome layout with auto-anchor + 2 hit regions (spec_version 8) ->
+//     acquire wakeup event handle (spec_version 8) ->
+//     destroy chrome swapchain ->
 //     enumerate workspace clients + get client info (Phase 2.I-prequel) ->
 //     capture workspace frame (Phase 2.I-prequel) ->
 //     remove capture client ->
@@ -159,6 +163,12 @@ run_workspace_test()
 	// Phase 2.K additions (spec_version 6).
 	PFN_xrRequestWorkspaceClientExitEXT pfnRequestExit = nullptr;
 	PFN_xrRequestWorkspaceClientFullscreenEXT pfnRequestFullscreen = nullptr;
+	// Phase 2.C controller-owned chrome (spec_version 7) + event-driven
+	// wakeup (spec_version 8).
+	PFN_xrCreateWorkspaceClientChromeSwapchainEXT pfnCreateChromeSwapchain = nullptr;
+	PFN_xrDestroyWorkspaceClientChromeSwapchainEXT pfnDestroyChromeSwapchain = nullptr;
+	PFN_xrSetWorkspaceClientChromeLayoutEXT pfnSetChromeLayout = nullptr;
+	PFN_xrAcquireWorkspaceWakeupEventEXT pfnAcquireWakeupEvent = nullptr;
 
 	struct PfnLookup {
 		const char *name;
@@ -195,6 +205,14 @@ run_workspace_test()
 	    {"xrRequestWorkspaceClientExitEXT", reinterpret_cast<PFN_xrVoidFunction *>(&pfnRequestExit)},
 	    {"xrRequestWorkspaceClientFullscreenEXT",
 	     reinterpret_cast<PFN_xrVoidFunction *>(&pfnRequestFullscreen)},
+	    {"xrCreateWorkspaceClientChromeSwapchainEXT",
+	     reinterpret_cast<PFN_xrVoidFunction *>(&pfnCreateChromeSwapchain)},
+	    {"xrDestroyWorkspaceClientChromeSwapchainEXT",
+	     reinterpret_cast<PFN_xrVoidFunction *>(&pfnDestroyChromeSwapchain)},
+	    {"xrSetWorkspaceClientChromeLayoutEXT",
+	     reinterpret_cast<PFN_xrVoidFunction *>(&pfnSetChromeLayout)},
+	    {"xrAcquireWorkspaceWakeupEventEXT",
+	     reinterpret_cast<PFN_xrVoidFunction *>(&pfnAcquireWakeupEvent)},
 	};
 	for (const auto &l : lookups) {
 		PFN_xrVoidFunction fn = nullptr;
@@ -480,6 +498,136 @@ run_workspace_test()
 			XrResult gpr = pfnSetClientPose(session, clientId, &gridPose, gridW, gridH);
 			std::printf("[Phase 2.G grid demo via SetClientPose      ] %s "
 			            "size=%.3fx%.3f\n", xr_result_str(gpr), gridW, gridH);
+		}
+
+		// Phase 2.C controller-owned chrome smoke (spec_version 7 + 8).
+		//
+		// Mints a chrome swapchain bound to the captured client, walks the
+		// standard acquire / wait / render-into-image[index] / release
+		// loop once (clearing image to a recognizable magenta), pushes a
+		// chrome layout with two UV-space hit regions and the new
+		// auto-anchor flags (spec_version 8), acquires a wakeup event
+		// handle, then destroys. Validates dispatch reaches the runtime
+		// for every chrome path without requiring a real controller.
+		{
+			constexpr int64_t  kSrgbFormat   = 29; // DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+			constexpr uint32_t kChromeWidth  = 256;
+			constexpr uint32_t kChromeHeight = 32;
+
+			XrWorkspaceChromeSwapchainCreateInfoEXT chromeCi = {
+			    XR_TYPE_WORKSPACE_CHROME_SWAPCHAIN_CREATE_INFO_EXT};
+			chromeCi.format = kSrgbFormat;
+			chromeCi.width = kChromeWidth;
+			chromeCi.height = kChromeHeight;
+			chromeCi.sampleCount = 1;
+			chromeCi.mipCount = 1;
+			XrSwapchain chromeSwapchain = XR_NULL_HANDLE;
+			CHECK_XR(pfnCreateChromeSwapchain(session, clientId, &chromeCi, &chromeSwapchain),
+			         "xrCreateWorkspaceClientChromeSwapchainEXT");
+
+			// Enumerate images via the standard core entry point —
+			// chrome swapchains behave like normal XrSwapchains once
+			// created. Single-image loop (mipCount=1, sampleCount=1).
+			uint32_t imgCount = 0;
+			CHECK_XR(xrEnumerateSwapchainImages(chromeSwapchain, 0, &imgCount, nullptr),
+			         "xrEnumerateSwapchainImages(chrome,count)");
+			std::vector<XrSwapchainImageD3D11KHR> images(
+			    imgCount, {XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR});
+			CHECK_XR(xrEnumerateSwapchainImages(
+			             chromeSwapchain, imgCount, &imgCount,
+			             reinterpret_cast<XrSwapchainImageBaseHeader *>(images.data())),
+			         "xrEnumerateSwapchainImages(chrome,fill)");
+			std::printf("[xrEnumerateSwapchainImages(chrome)         ] count=%u\n",
+			            (unsigned)imgCount);
+
+			XrSwapchainImageAcquireInfo acqInfo = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+			uint32_t idx = 0xFFFFFFFFu;
+			CHECK_XR(xrAcquireSwapchainImage(chromeSwapchain, &acqInfo, &idx),
+			         "xrAcquireSwapchainImage(chrome)");
+
+			XrSwapchainImageWaitInfo waitInfo = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+			waitInfo.timeout = XR_INFINITE_DURATION;
+			CHECK_XR(xrWaitSwapchainImage(chromeSwapchain, &waitInfo),
+			         "xrWaitSwapchainImage(chrome)");
+
+			// Render: ClearRTV the acquired image to magenta. Best-effort
+			// — failure to create the RTV doesn't fail the smoke; the
+			// acquire/release loop itself is what's being validated.
+			if (idx < images.size() && images[idx].texture != nullptr) {
+				ComPtr<ID3D11RenderTargetView> rtv;
+				D3D11_RENDER_TARGET_VIEW_DESC rtvd = {};
+				rtvd.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+				rtvd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+				rtvd.Texture2D.MipSlice = 0;
+				HRESULT rh = device->CreateRenderTargetView(
+				    images[idx].texture, &rtvd, rtv.GetAddressOf());
+				if (SUCCEEDED(rh)) {
+					const float magenta[4] = {0.85f, 0.10f, 0.85f, 0.85f};
+					context->ClearRenderTargetView(rtv.Get(), magenta);
+					context->Flush();
+					std::printf("[Phase 2.C chrome ClearRTV(magenta)         ] OK\n");
+				} else {
+					std::printf("INFO: CreateRenderTargetView(chrome img %u) hr=0x%08lx — paint skipped\n",
+					            (unsigned)idx, (unsigned long)rh);
+				}
+			}
+
+			XrSwapchainImageReleaseInfo relInfo = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+			CHECK_XR(xrReleaseSwapchainImage(chromeSwapchain, &relInfo),
+			         "xrReleaseSwapchainImage(chrome)");
+
+			// Layout with two hit regions + spec_version 8 auto-anchor.
+			// Region IDs are controller-defined opaque uint32_t — the
+			// runtime echoes them back as `chromeRegionId` on POINTER
+			// events. We use 1=drag, 2=close as a self-documenting smoke.
+			XrWorkspaceChromeHitRegionEXT regions[2] = {};
+			regions[0].id = 1;
+			regions[0].bounds.offset = {0.0f, 0.0f};
+			regions[0].bounds.extent = {0.5f, 1.0f};
+			regions[1].id = 2;
+			regions[1].bounds.offset = {0.5f, 0.0f};
+			regions[1].bounds.extent = {0.5f, 1.0f};
+
+			XrWorkspaceChromeLayoutEXT layout = {XR_TYPE_WORKSPACE_CHROME_LAYOUT_EXT};
+			layout.poseInClient.orientation.w = 1.0f;
+			// With anchorToWindowTopEdge = XR_TRUE (spec_version 8), this
+			// y is interpreted as an offset ABOVE the window's top edge.
+			// 12 mm sits a generous gap above any reasonable window.
+			layout.poseInClient.position.y = 0.012f;
+			layout.sizeMeters = {0.20f, 0.012f};
+			layout.followsWindowOrient = XR_FALSE;
+			layout.hitRegionCount = 2;
+			layout.hitRegions = regions;
+			layout.depthBiasMeters = 0.0f; // runtime default (1 mm)
+			layout.anchorToWindowTopEdge = XR_TRUE;
+			layout.widthAsFractionOfWindow = 0.75f; // 75% of current win_w
+			CHECK_XR(pfnSetChromeLayout(session, clientId, &layout),
+			         "xrSetWorkspaceClientChromeLayoutEXT");
+			std::printf("[Phase 2.C chrome layout (auto-anchor, 2 regions)] OK\n");
+
+			// Wakeup event handle (spec_version 8). Validate the handle
+			// is non-NULL and well-formed (zero-timeout wait should
+			// succeed with WAIT_TIMEOUT or WAIT_OBJECT_0 — both prove
+			// the kernel object is reachable). We don't rely on a signal
+			// arriving inside this synchronous smoke window.
+			uint64_t wakeup = 0;
+			CHECK_XR(pfnAcquireWakeupEvent(session, &wakeup),
+			         "xrAcquireWorkspaceWakeupEventEXT");
+			if (wakeup == 0) {
+				std::printf("FAIL: wakeup handle is NULL after XR_SUCCESS return\n");
+			} else {
+				DWORD wr = WaitForSingleObject(reinterpret_cast<HANDLE>(wakeup), 0);
+				const char *wstr = (wr == WAIT_OBJECT_0)   ? "WAIT_OBJECT_0"
+				                 : (wr == WAIT_TIMEOUT)    ? "WAIT_TIMEOUT"
+				                 : (wr == WAIT_FAILED)     ? "WAIT_FAILED"
+				                                           : "<other>";
+				std::printf("[xrAcquireWorkspaceWakeupEventEXT(handle ok)] WaitForSingleObject(0ms)=%s\n",
+				            wstr);
+				CloseHandle(reinterpret_cast<HANDLE>(wakeup));
+			}
+
+			CHECK_XR(pfnDestroyChromeSwapchain(chromeSwapchain),
+			         "xrDestroyWorkspaceClientChromeSwapchainEXT");
 		}
 
 		// Phase 2.I-prequel: client enumeration smoke.
