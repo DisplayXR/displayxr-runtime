@@ -859,3 +859,23 @@ shell_chrome_tick(struct shell_chrome *sc)
 		}
 	}
 }
+
+extern "C" bool
+shell_chrome_is_animating(struct shell_chrome *sc)
+{
+	if (sc == nullptr) {
+		return false;
+	}
+	for (auto &s : sc->slots) {
+		if (s.fade_duration_ns != 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+extern "C" bool
+shell_chrome_has_any(struct shell_chrome *sc)
+{
+	return sc != nullptr && !sc->slots.empty();
+}

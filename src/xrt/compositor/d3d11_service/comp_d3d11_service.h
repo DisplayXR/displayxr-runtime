@@ -534,6 +534,7 @@ comp_d3d11_service_workspace_find_slot_by_xc(struct xrt_system_compositor *xsysc
 xrt_result_t
 comp_d3d11_service_workspace_register_chrome_swapchain_by_slot(struct xrt_system_compositor *xsysc,
                                                                int slot,
+                                                               uint32_t client_id,
                                                                uint32_t swapchain_id,
                                                                struct xrt_swapchain *chrome_xsc);
 

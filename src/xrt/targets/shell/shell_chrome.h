@@ -110,6 +110,26 @@ void shell_chrome_set_hover(struct shell_chrome *sc, XrWorkspaceClientId hover_i
  */
 void shell_chrome_tick(struct shell_chrome *sc);
 
+/*!
+ * @return true if any slot is currently mid-fade (alpha != target).
+ * Main loop reads this to drop poll cadence from 500 ms (idle) to 16 ms
+ * (60 Hz) so the fade tween is smooth — without this the fade is so
+ * short (150 / 300 ms) that the next idle-rate tick fires after it has
+ * already completed and the chrome appears to snap rather than fade.
+ */
+bool shell_chrome_is_animating(struct shell_chrome *sc);
+
+/*!
+ * @return true if any chrome swapchain is currently registered (non-empty
+ * slot list). Main loop reads this to keep the input-drain poll cadence
+ * at 60 Hz whenever chrome is alive, so POINTER_HOVER transitions reach
+ * shell_chrome_set_hover with low latency. Without this the idle 500 ms
+ * poll holds back the hover signal, and the cursor-between-windows case
+ * looks like "B waits for A to fade out" — actually just queued events
+ * draining late.
+ */
+bool shell_chrome_has_any(struct shell_chrome *sc);
+
 #ifdef __cplusplus
 }
 #endif

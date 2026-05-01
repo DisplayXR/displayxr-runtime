@@ -713,6 +713,15 @@ struct d3d11_multi_client_slot
 	float                 chrome_depth_bias_m;    //!< 0 = use WORKSPACE_CHROME_DEPTH_BIAS default
 	uint32_t              chrome_region_count;
 	struct ipc_workspace_chrome_hit_region chrome_regions[IPC_WORKSPACE_CHROME_MAX_HIT_REGIONS];
+	//! Phase 2.C C5 follow-up: OpenXR client_id (the workspace-side ID
+	//! returned by xrEnumerateWorkspaceClientsEXT) for the client that
+	//! owns this slot's chrome. Set by the IPC register_chrome_swapchain
+	//! handler when chrome is bound to a slot. Used by POINTER_HOVER
+	//! emission so controllers can look up their per-client chrome by
+	//! the same ID they used at create time. 0 = unset (no chrome
+	//! registered). Distinct from the legacy `1000 + slot_index` form
+	//! used by hit_client_id on POINTER / POINTER_MOTION events.
+	uint32_t              workspace_client_id;
 
 	//! @name Capture-specific fields (only valid when client_type == CLIENT_TYPE_CAPTURE)
 	//! @{
@@ -11496,6 +11505,12 @@ comp_d3d11_service_workspace_drain_input_events(struct xrt_system_compositor *xs
 	// cursor is over. prev/curr_region stay 0 — the controller cares
 	// about the slot transition, not the sub-region. (Sub-region is
 	// already on POINTER / POINTER_MOTION events as chromeRegionId.)
+	//
+	// Uses the slot's stored workspace_client_id (the OpenXR client id
+	// the controller used at xrCreateWorkspaceClientChromeSwapchainEXT
+	// time) so controllers can match the hover signal to their own
+	// per-client chrome bookkeeping. Falls back to 0 for slots without
+	// chrome registered.
 	if (mc->hovered_slot != mc->hovered_slot_last_emitted &&
 	    out_batch->count < IPC_WORKSPACE_INPUT_EVENT_BATCH_MAX) {
 		struct ipc_workspace_input_event *ev = &out_batch->events[out_batch->count];
@@ -11503,10 +11518,14 @@ comp_d3d11_service_workspace_drain_input_events(struct xrt_system_compositor *xs
 		ev->event_type = IPC_WORKSPACE_INPUT_EVENT_POINTER_HOVER;
 		ev->timestamp_ms = (uint32_t)GetTickCount();
 		ev->u.pointer_hover.prev_client_id =
-		    (mc->hovered_slot_last_emitted >= 0) ? (1000u + (uint32_t)mc->hovered_slot_last_emitted) : 0;
+		    (mc->hovered_slot_last_emitted >= 0)
+		        ? mc->clients[mc->hovered_slot_last_emitted].workspace_client_id
+		        : 0;
 		ev->u.pointer_hover.prev_region = 0;
 		ev->u.pointer_hover.curr_client_id =
-		    (mc->hovered_slot >= 0) ? (1000u + (uint32_t)mc->hovered_slot) : 0;
+		    (mc->hovered_slot >= 0)
+		        ? mc->clients[mc->hovered_slot].workspace_client_id
+		        : 0;
 		ev->u.pointer_hover.curr_region = 0;
 		mc->hovered_slot_last_emitted = mc->hovered_slot;
 		out_batch->count++;
@@ -11677,6 +11696,7 @@ comp_d3d11_service_workspace_request_client_fullscreen(struct xrt_system_composi
 extern "C" xrt_result_t
 comp_d3d11_service_workspace_register_chrome_swapchain_by_slot(struct xrt_system_compositor *xsysc,
                                                                int slot,
+                                                               uint32_t client_id,
                                                                uint32_t swapchain_id,
                                                                struct xrt_swapchain *chrome_xsc)
 {
@@ -11702,12 +11722,15 @@ comp_d3d11_service_workspace_register_chrome_swapchain_by_slot(struct xrt_system
 	if (cs->chrome_xsc != nullptr) {
 		xrt_swapchain_reference(&cs->chrome_xsc, NULL);
 		cs->chrome_swapchain_id = 0;
+		cs->workspace_client_id = 0;
 	}
 
 	xrt_swapchain_reference(&cs->chrome_xsc, chrome_xsc);
 	cs->chrome_swapchain_id = swapchain_id;
+	cs->workspace_client_id = client_id;
 
-	U_LOG_W("workspace: chrome swapchain registered for slot %d (id=%u)", slot, swapchain_id);
+	U_LOG_W("workspace: chrome swapchain registered for slot %d (client_id=%u, sc_id=%u)",
+	        slot, client_id, swapchain_id);
 	return XRT_SUCCESS;
 }
 
@@ -11734,6 +11757,7 @@ comp_d3d11_service_workspace_unregister_chrome_swapchain(struct xrt_system_compo
 			xrt_swapchain_reference(&cs->chrome_xsc, NULL);
 			cs->chrome_swapchain_id = 0;
 			cs->chrome_layout_valid = false;
+			cs->workspace_client_id = 0;
 			U_LOG_W("workspace: chrome swapchain unregistered (slot=%d, id=%u)", s, swapchain_id);
 			return XRT_SUCCESS;
 		}

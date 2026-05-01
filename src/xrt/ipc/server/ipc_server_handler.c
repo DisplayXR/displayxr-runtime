@@ -2986,7 +2986,7 @@ ipc_handle_workspace_register_chrome_swapchain(volatile struct ipc_client_state 
 
 	IPC_INFO(s, "Workspace: register_chrome_swapchain client_id=%u swapchain_id=%u → slot=%d",
 	         client_id, swapchain_id, slot);
-	return comp_d3d11_service_workspace_register_chrome_swapchain_by_slot(s->xsysc, slot, swapchain_id, xsc);
+	return comp_d3d11_service_workspace_register_chrome_swapchain_by_slot(s->xsysc, slot, client_id, swapchain_id, xsc);
 #else
 	(void)s;
 	(void)client_id;

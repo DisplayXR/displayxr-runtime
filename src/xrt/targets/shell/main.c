@@ -3103,7 +3103,14 @@ main(int argc, char *argv[])
 		// is correct when FRAME_TICK arrives on a different drain pass.
 		bool carousel_owning =
 		    (s_active_preset != NULL && strcmp(s_active_preset, "carousel") == 0);
-		DWORD poll_ms = (shell_slot_anim_active_count() > 0 || carousel_owning)
+		// Phase 2.C C3.C-4: stay at 60 Hz whenever any chrome is alive
+		// (not just during a fade) — POINTER_HOVER transitions need to
+		// reach shell_chrome_set_hover with low latency, otherwise the
+		// cursor-between-windows fade looks sequential ("B waits for A
+		// to vanish"). The actual cause is just queued hover events
+		// draining 500 ms late under the idle cadence.
+		bool chrome_alive = (g_chrome != NULL && shell_chrome_has_any(g_chrome));
+		DWORD poll_ms = (shell_slot_anim_active_count() > 0 || carousel_owning || chrome_alive)
 		                    ? 16u
 		                    : (DWORD)POLL_INTERVAL_MS;
 		DWORD wait_result = MsgWaitForMultipleObjects(
