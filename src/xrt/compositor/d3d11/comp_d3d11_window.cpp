@@ -213,6 +213,16 @@ struct comp_d3d11_window
 	volatile LONG workspace_pointer_capture_enabled;
 	volatile LONG workspace_pointer_capture_button;
 
+	//! Phase 2.C spec_version 8: wakeup event the controller waits on.
+	//! Window thread SetEvent's it after every workspace_public_ring_push so
+	//! the controller's MsgWaitForMultipleObjects returns promptly. NULL
+	//! until the IPC handler calls comp_d3d11_window_set_workspace_wakeup_event
+	//! with the runtime's source-of-truth handle (lazy-created on the first
+	//! xrAcquireWorkspaceWakeupEventEXT call). Read with InterlockedCompare
+	//! ExchangePointer because the handle is set from the IPC thread and
+	//! read from the WndProc thread.
+	volatile HANDLE workspace_wakeup_event;
+
 	//! Target HWND for SetForegroundWindow request (compositor writes, window thread reads).
 	//! NULL means no pending request. Window thread clears after calling SetForegroundWindow.
 	volatile HWND pending_foreground_hwnd;
@@ -291,6 +301,14 @@ workspace_public_ring_push(struct comp_d3d11_window *w,
 	ev->scroll_delta_y = scroll_delta_y;
 	MemoryBarrier();
 	InterlockedExchange(&w->workspace_public_ring_write, next);
+
+	// spec_version 8: wake the controller's event-driven wait so it drains
+	// promptly. SetEvent is a no-op when no waiter is pending; cheap.
+	HANDLE wake = (HANDLE)InterlockedCompareExchangePointer(
+	    (volatile PVOID *)&w->workspace_wakeup_event, NULL, NULL);
+	if (wake != NULL) {
+		SetEvent(wake);
+	}
 }
 
 static uint32_t
@@ -1426,6 +1444,17 @@ comp_d3d11_window_set_workspace_mode_active(struct comp_d3d11_window *window, bo
 		return;
 	}
 	InterlockedExchange(&window->workspace_mode_active, active ? 1 : 0);
+}
+
+void
+comp_d3d11_window_set_workspace_wakeup_event(struct comp_d3d11_window *window, void *handle)
+{
+	if (window == NULL) {
+		return;
+	}
+	// Window doesn't take ownership — runtime keeps the source HANDLE and
+	// closes it on workspace teardown. Set once at workspace activation.
+	InterlockedExchangePointer((volatile PVOID *)&window->workspace_wakeup_event, handle);
 }
 
 void

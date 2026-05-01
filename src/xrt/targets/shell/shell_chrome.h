@@ -66,7 +66,8 @@ void shell_chrome_destroy(struct shell_chrome *sc);
 bool shell_chrome_on_client_connected(struct shell_chrome *sc,
                                       XrWorkspaceClientId id,
                                       float win_w_m,
-                                      float win_h_m);
+                                      float win_h_m,
+                                      const char *icon_png_path);
 
 /*!
  * Call when a client disconnects. Destroys its chrome swapchain.

@@ -3060,6 +3060,52 @@ ipc_handle_workspace_set_chrome_layout(volatile struct ipc_client_state *_ics,
 }
 
 xrt_result_t
+ipc_handle_workspace_acquire_wakeup_event(volatile struct ipc_client_state *_ics,
+                                          uint32_t max_handle_count,
+                                          xrt_graphics_sync_handle_t *out_handles,
+                                          uint32_t *out_handle_count)
+{
+	struct ipc_server *s = _ics->server;
+	*out_handle_count = 0;
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR) && defined(_WIN32)
+	if (s->xsysc == NULL || max_handle_count == 0 || out_handles == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	// Auth: only the workspace controller may acquire the wakeup event.
+	unsigned long expected_pid = get_orchestrator_workspace_pid();
+	unsigned long caller_pid = (unsigned long)_ics->client_state.pid;
+	if (expected_pid != 0 && caller_pid != expected_pid) {
+		return XRT_ERROR_NOT_AUTHORIZED;
+	}
+
+	// Lazy-create the source HANDLE on the runtime side. The first call
+	// allocates; subsequent calls return the same source handle and just
+	// re-duplicate it into whatever process is asking.
+	HANDLE src = (HANDLE)comp_d3d11_service_workspace_get_wakeup_event(s->xsysc);
+	if (src == NULL) {
+		IPC_WARN(s, "Workspace: wakeup event creation failed");
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	// Duplicate into the controller's process. The IPC message-channel
+	// layer marshals xrt_graphics_sync_handle_t (= HANDLE on Win32) by
+	// duplicating into the receiving process. We just hand it the source
+	// HANDLE in our (server) process and the IPC layer takes care of the
+	// cross-process duplication transparently.
+	out_handles[0] = src;
+	*out_handle_count = 1;
+	return XRT_SUCCESS;
+#else
+	(void)s;
+	(void)max_handle_count;
+	(void)out_handles;
+	return XRT_ERROR_FEATURE_UNSUPPORTED;
+#endif
+}
+
+xrt_result_t
 ipc_handle_swapchain_get_properties(volatile struct ipc_client_state *ics,
                                     const struct xrt_swapchain_create_info *info,
                                     struct xrt_swapchain_create_properties *xsccp)

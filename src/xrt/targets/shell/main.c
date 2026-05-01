@@ -1022,6 +1022,19 @@ shell_drain_input_events(void)
 			}
 			break;
 		}
+		case XR_WORKSPACE_INPUT_EVENT_WINDOW_POSE_CHANGED_EXT: {
+			// Phase 2.C C5 follow-up: runtime resized or repositioned a
+			// window (edge drag, fullscreen toggle, etc.). Re-push chrome
+			// layout so the pill tracks the new window top edge instead
+			// of staying at the create-time dimensions.
+			if (g_chrome != NULL && e->windowPoseChanged.clientId != 0) {
+				shell_chrome_on_window_resized(g_chrome,
+				                                e->windowPoseChanged.clientId,
+				                                e->windowPoseChanged.widthMeters,
+				                                e->windowPoseChanged.heightMeters);
+			}
+			break;
+		}
 		case XR_WORKSPACE_INPUT_EVENT_POINTER_MOTION_EXT: {
 			if (!carousel_active || !s_car.dragging) break;
 			// Accumulate angle from cursor delta; sample angular velocity
@@ -1305,6 +1318,74 @@ exe_path_equal(const char *a, const char *b)
 	}
 	return *a == '\0' && *b == '\0';
 }
+
+// Phase 2.C C3.C-3a: resolve a registered_app's icon_path for a given OS
+// PID. Used by the chrome lazy-create path to pass the per-client app
+// icon to shell_chrome_on_client_connected. Returns "" if no icon is
+// resolvable. Best-effort; not fatal.
+//
+// Resolution order:
+//   1. Open the PID, get exe path via QueryFullProcessImageName.
+//   2. Match exe path against g_registered_apps; if found AND the app
+//      has a sidecar icon_path, return that.
+//   3. Else fall back to extracting the Win32 PE icon (.ico embedded in
+//      the exe) into a per-exe cached PNG under %TEMP% and return
+//      that path.
+//
+// The fallback path picks up app icons even for unregistered apps
+// (test_apps without sidecar manifests) and matches the icon Windows
+// itself uses in Explorer.
+#ifdef _WIN32
+static bool extract_pe_icon_to_png(const char *exe, const char *out_png); // fwd decl
+static void sanitize_basename(const char *src, char *dst, size_t dst_size); // fwd decl
+
+static const char *
+shell_resolve_icon_for_pid(unsigned long pid)
+{
+	static char cached_path[MAX_PATH];
+	cached_path[0] = '\0';
+
+	if (pid == 0) return "";
+	HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, (DWORD)pid);
+	if (h == NULL) return "";
+	char exe[MAX_PATH] = {0};
+	DWORD n = (DWORD)sizeof(exe);
+	BOOL ok = QueryFullProcessImageNameA(h, 0, exe, &n);
+	CloseHandle(h);
+	if (!ok || n == 0) return "";
+
+	// 1. Sidecar icon from registered_app, if available.
+	for (int i = 0; i < g_registered_app_count; i++) {
+		if (exe_path_equal(g_registered_apps[i].exe_path, exe) &&
+		    g_registered_apps[i].icon_path[0] != '\0') {
+			snprintf(cached_path, sizeof(cached_path), "%s",
+			         g_registered_apps[i].icon_path);
+			return cached_path;
+		}
+	}
+
+	// 2. Fallback: extract the PE icon to a cached PNG under %TEMP%.
+	// Cache by sanitized exe path so we don't re-extract on every call.
+	const char *tmp = getenv("TEMP");
+	if (tmp == NULL || !*tmp) return "";
+	char base[MAX_PATH];
+	const char *fname = strrchr(exe, '\\');
+	fname = fname ? fname + 1 : exe;
+	sanitize_basename(fname, base, sizeof(base));
+	snprintf(cached_path, sizeof(cached_path),
+	         "%s\\displayxr_app_icon_%s.png", tmp, base);
+	if (GetFileAttributesA(cached_path) == INVALID_FILE_ATTRIBUTES) {
+		if (!extract_pe_icon_to_png(exe, cached_path)) {
+			cached_path[0] = '\0';
+			return "";
+		}
+	}
+	return cached_path;
+}
+#else
+static const char *
+shell_resolve_icon_for_pid(unsigned long pid) { (void)pid; return ""; }
+#endif
 
 // Read a string field from a cJSON object into a fixed buffer. If the field
 // is missing or not a string, dst is left untouched.
@@ -3103,20 +3184,57 @@ main(int argc, char *argv[])
 		// is correct when FRAME_TICK arrives on a different drain pass.
 		bool carousel_owning =
 		    (s_active_preset != NULL && strcmp(s_active_preset, "carousel") == 0);
-		// Phase 2.C C3.C-4: stay at 60 Hz whenever any chrome is alive
-		// (not just during a fade) — POINTER_HOVER transitions need to
-		// reach shell_chrome_set_hover with low latency, otherwise the
-		// cursor-between-windows fade looks sequential ("B waits for A
-		// to vanish"). The actual cause is just queued hover events
-		// draining 500 ms late under the idle cadence.
-		bool chrome_alive = (g_chrome != NULL && shell_chrome_has_any(g_chrome));
-		DWORD poll_ms = (shell_slot_anim_active_count() > 0 || carousel_owning || chrome_alive)
-		                    ? 16u
-		                    : (DWORD)POLL_INTERVAL_MS;
-		DWORD wait_result = MsgWaitForMultipleObjects(
-		    0, NULL, FALSE, poll_ms, QS_ALLINPUT);
+		// Animation pacing: while any per-frame animation is active we
+		// need 60 Hz timer cadence regardless of the wakeup-event signal,
+		// because animation lerps are CPU-driven and don't fire IPC events.
+		// Idle (no animation, no carousel) → either wait forever on the
+		// wakeup event (spec_version 8) or fall back to POLL_INTERVAL_MS.
+		bool need_timer_pacing =
+		    shell_slot_anim_active_count() > 0 || carousel_owning ||
+		    (g_chrome != NULL && shell_chrome_is_animating(g_chrome));
 
-		if (wait_result == WAIT_OBJECT_0) {
+		// spec_version 8: prefer event-driven wakeup. The runtime SetEvent's
+		// the wakeup handle on every workspace input event push and on
+		// hovered/focused-slot transitions, so MsgWaitForMultipleObjects
+		// returns the moment something interesting happens — zero idle CPU
+		// + zero hover latency. The shell_chrome_has_any chrome-poll fix
+		// stays as a fallback for setups where wakeup_event_handle is NULL
+		// (older runtime / unsupported platform).
+		HANDLE wakeup = (HANDLE)g_xr->wakeup_event_handle;
+		DWORD num_handles = (wakeup != NULL) ? 1u : 0u;
+		HANDLE handles[1] = {wakeup};
+		DWORD poll_ms;
+		if (need_timer_pacing) {
+			poll_ms = 16u;
+		} else if (wakeup != NULL) {
+			// Long timeout: wakeup is event-driven. Use ~1 s as a safety
+			// net (in case we miss a SetEvent for some reason); not strict
+			// polling.
+			poll_ms = 1000u;
+		} else {
+			// Fallback: chrome alive → 60 Hz so hover transitions reach
+			// us promptly. Else idle 500 ms.
+			bool chrome_alive = (g_chrome != NULL && shell_chrome_has_any(g_chrome));
+			poll_ms = chrome_alive ? 16u : (DWORD)POLL_INTERVAL_MS;
+		}
+		DWORD wait_result = MsgWaitForMultipleObjects(
+		    num_handles, handles, FALSE, poll_ms, QS_ALLINPUT);
+		// wait_result values when num_handles == 1:
+		//   WAIT_OBJECT_0     → the wakeup event was signaled
+		//   WAIT_OBJECT_0 + 1 → Win32 messages are pending
+		//   WAIT_TIMEOUT      → poll_ms expired (animation tick, fallback poll)
+		// We treat all three the same: fall through to drain + tick + Win32
+		// message pump. The wakeup event is auto-reset; nothing to do here.
+		(void)wait_result; // existing message-pump code below handles all paths
+
+		// MsgWaitForMultipleObjects encodes "messages pending" as
+		// WAIT_OBJECT_0 + num_handles. With num_handles=0 (fallback),
+		// that's WAIT_OBJECT_0 itself; with num_handles=1 (event-driven),
+		// it's WAIT_OBJECT_0 + 1. Pump messages on either condition (and
+		// also on the wakeup event itself, since drain runs unconditionally
+		// below — no harm in checking the queue too).
+		DWORD msg_wake = WAIT_OBJECT_0 + num_handles;
+		if (wait_result == msg_wake || wait_result == WAIT_OBJECT_0) {
 			MSG msg;
 			while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
 				if (msg.message == WM_HOTKEY && msg.wParam == HOTKEY_TOGGLE) {
@@ -3385,7 +3503,10 @@ main(int argc, char *argv[])
 					w_m = anim_w;
 					h_m = anim_h;
 				}
-				(void)shell_chrome_on_client_connected(g_chrome, chr_ids[i], w_m, h_m);
+				const char *icon_path = shell_resolve_icon_for_pid(
+				    (unsigned long)cinfo.pid);
+				(void)shell_chrome_on_client_connected(
+				    g_chrome, chr_ids[i], w_m, h_m, icon_path);
 			}
 			// Drop chrome for any disconnected clients (diff against prev_ids).
 			for (uint32_t p = 0; p < prev_count; p++) {

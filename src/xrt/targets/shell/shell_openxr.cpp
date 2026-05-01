@@ -239,6 +239,7 @@ extern "C" struct shell_openxr_state *shell_openxr_init(void)
 	    {"xrCreateWorkspaceClientChromeSwapchainEXT",  reinterpret_cast<PFN_xrVoidFunction *>(&s->create_chrome_swapchain)},
 	    {"xrDestroyWorkspaceClientChromeSwapchainEXT", reinterpret_cast<PFN_xrVoidFunction *>(&s->destroy_chrome_swapchain)},
 	    {"xrSetWorkspaceClientChromeLayoutEXT",        reinterpret_cast<PFN_xrVoidFunction *>(&s->set_chrome_layout)},
+	    {"xrAcquireWorkspaceWakeupEventEXT",           reinterpret_cast<PFN_xrVoidFunction *>(&s->acquire_wakeup_event)},
 	};
 	for (const auto &e : entries) {
 		if (!resolve_pfn(s->instance, e.name, e.out)) {
@@ -247,7 +248,24 @@ extern "C" struct shell_openxr_state *shell_openxr_init(void)
 		}
 	}
 
-	P("shell_openxr: instance=%p session=%p (24 PFNs resolved, no graphics binding)\n",
+	// spec_version 8: acquire the wakeup event handle once. Stored on the
+	// state struct for main.c to add to its MsgWaitForMultipleObjects
+	// wait set. If the runtime is older / unsupported we just leave
+	// wakeup_event_handle = NULL and main.c falls back to its old polling
+	// cadence — no functional regression, just no idle-CPU optimization.
+	uint64_t handle_value = 0;
+	XrResult wr = s->acquire_wakeup_event != nullptr
+	                  ? s->acquire_wakeup_event(s->session, &handle_value)
+	                  : XR_ERROR_FUNCTION_UNSUPPORTED;
+	if (wr == XR_SUCCESS && handle_value != 0) {
+		s->wakeup_event_handle = (void *)(uintptr_t)handle_value;
+		P("shell_openxr: workspace wakeup event acquired (handle=%p)\n", s->wakeup_event_handle);
+	} else {
+		s->wakeup_event_handle = nullptr;
+		P("shell_openxr: workspace wakeup event unsupported (XrResult=%d) — falling back to polling\n", (int)wr);
+	}
+
+	P("shell_openxr: instance=%p session=%p (25 PFNs resolved, no graphics binding)\n",
 	  (void *)s->instance, (void *)s->session);
 	return s;
 }
@@ -256,6 +274,12 @@ extern "C" void shell_openxr_shutdown(struct shell_openxr_state *s)
 {
 	if (s == nullptr) {
 		return;
+	}
+	// spec_version 8: close our DuplicateHandle of the wakeup event. The
+	// runtime keeps its source HANDLE (closed on service teardown).
+	if (s->wakeup_event_handle != nullptr) {
+		CloseHandle((HANDLE)s->wakeup_event_handle);
+		s->wakeup_event_handle = nullptr;
 	}
 	if (s->session != XR_NULL_HANDLE) {
 		xrDestroySession(s->session);

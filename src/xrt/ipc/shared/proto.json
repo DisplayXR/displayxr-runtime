@@ -241,6 +241,10 @@
 		]
 	},
 
+	"workspace_acquire_wakeup_event": {
+		"out_handles": {"type": "xrt_graphics_sync_handle_t"}
+	},
+
 	"system_devices_get_roles": {
 		"out": [
 			{"name": "system_roles", "type": "struct xrt_system_roles"}

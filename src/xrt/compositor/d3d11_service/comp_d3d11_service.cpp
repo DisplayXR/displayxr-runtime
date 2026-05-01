@@ -508,6 +508,18 @@ struct d3d11_service_system
 	//! Timestamp of last workspace render (monotonic ns). Used to throttle renders
 	//! to ~1 per VSync, reducing torn-atlas reads from concurrent client blits.
 	uint64_t last_workspace_render_ns;
+
+	//! Phase 2.C spec_version 8: auto-reset Win32 event signaled whenever an
+	//! async workspace state change occurs that the controller might want to
+	//! react to (input event pushed onto the public ring, focused-slot
+	//! transition, hovered-slot transition). Created lazily on first
+	//! workspace_acquire_wakeup_event RPC; the IPC handler DuplicateHandles
+	//! it into the controller's process. Auto-reset semantics: SetEvent
+	//! wakes one waiter and immediately clears; controller is expected to
+	//! drain ALL pending state on each wake. NULL on platforms that don't
+	//! support Win32 events (currently macOS / Linux — wakeup event is a
+	//! Windows-only optimization).
+	void *workspace_wakeup_event; // HANDLE on Win32, opaque void* in header
 };
 
 
@@ -713,6 +725,8 @@ struct d3d11_multi_client_slot
 	float                 chrome_depth_bias_m;    //!< 0 = use WORKSPACE_CHROME_DEPTH_BIAS default
 	uint32_t              chrome_region_count;
 	struct ipc_workspace_chrome_hit_region chrome_regions[IPC_WORKSPACE_CHROME_MAX_HIT_REGIONS];
+	bool                  chrome_anchor_top_edge; //!< spec_version 8: pose_y is offset above window top
+	float                 chrome_width_fraction;  //!< spec_version 8: 0 = absolute, > 0 = win_w * fraction
 	//! Phase 2.C C5 follow-up: OpenXR client_id (the workspace-side ID
 	//! returned by xrEnumerateWorkspaceClientsEXT) for the client that
 	//! owns this slot's chrome. Set by the IPC register_chrome_swapchain
@@ -722,6 +736,17 @@ struct d3d11_multi_client_slot
 	//! registered). Distinct from the legacy `1000 + slot_index` form
 	//! used by hit_client_id on POINTER / POINTER_MOTION events.
 	uint32_t              workspace_client_id;
+
+	//! spec_version 8: last-emitted pose+size snapshot for this slot. The
+	//! drain compares the current window_pose / window_width_m / window_
+	//! height_m against this snapshot and emits WINDOW_POSE_CHANGED on
+	//! any difference, so controllers re-push chrome layout (and other
+	//! window-tracking UI) when the runtime resizes the window via edge
+	//! drag, fullscreen toggle, etc. Initialised to {identity, zero} so
+	//! the first valid frame always emits one transition.
+	struct xrt_pose       window_pose_last_emitted;
+	float                 window_w_last_emitted;
+	float                 window_h_last_emitted;
 
 	//! @name Capture-specific fields (only valid when client_type == CLIENT_TYPE_CAPTURE)
 	//! @{
@@ -795,6 +820,13 @@ struct d3d11_multi_compositor
 	//! Updated by render_pass; consumed by drain.
 	int32_t hovered_slot;
 	int32_t hovered_slot_last_emitted;
+
+	//! spec_version 8: last value of focused_slot we signaled the wakeup event
+	//! for. The drain emits FOCUS_CHANGED based on focused_slot_last_emitted;
+	//! this separate snapshot lives in render_pass so we can wake the
+	//! controller on every focus transition without having to instrument
+	//! every focused_slot write site individually.
+	int32_t focused_slot_signaled_value;
 
 	//! Phase 2.K: vsync-aligned frame counter. Incremented once per
 	//! `multi_compositor_render` and read by the public-API drain to emit
@@ -959,6 +991,24 @@ service_set_workspace_mode(struct d3d11_service_system *sys, bool active)
 	if (sys->multi_comp != nullptr && sys->multi_comp->window != nullptr) {
 		comp_d3d11_window_set_workspace_mode_active(sys->multi_comp->window, active);
 	}
+}
+
+// Phase 2.C spec_version 8: signal the workspace-controller wakeup event.
+// Cheap (single SetEvent on Win32; no-op when no controller has acquired the
+// handle yet). Safe to call from any thread — Win32 events are themselves
+// thread-safe. Centralized here so every call site that produces async state
+// the controller might react to (input event push, hovered/focused-slot
+// transitions, future client-connect/disconnect signals) calls one helper.
+static inline void
+service_signal_workspace_wakeup(struct d3d11_service_system *sys)
+{
+#ifdef _WIN32
+	if (sys != nullptr && sys->workspace_wakeup_event != nullptr) {
+		SetEvent((HANDLE)sys->workspace_wakeup_event);
+	}
+#else
+	(void)sys;
+#endif
 }
 
 // True iff a bridge relay session exists AND a WebSocket client is currently
@@ -4362,6 +4412,7 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 		std::memset(sys->multi_comp, 0, sizeof(*sys->multi_comp));
 		sys->multi_comp->focused_slot = -1;
 		sys->multi_comp->focused_slot_last_emitted = -1;
+		sys->multi_comp->focused_slot_signaled_value = -1;
 		sys->multi_comp->hovered_slot = -1;
 		sys->multi_comp->hovered_slot_last_emitted = -1;
 	}
@@ -4394,6 +4445,13 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 	// Seed the window's workspace-mode flag from current sys state (service_set_workspace_mode
 	// no-ops while multi_comp is null, so earlier activation hasn't reached the window).
 	comp_d3d11_window_set_workspace_mode_active(mc->window, sys->workspace_mode);
+	// spec_version 8: if the controller already acquired the wakeup event
+	// before the window existed (controller activation can race with the
+	// first client connect that creates the multi-compositor window),
+	// hand it down now so the public-ring push site has a handle to signal.
+	if (sys->workspace_wakeup_event != nullptr) {
+		comp_d3d11_window_set_workspace_wakeup_event(mc->window, sys->workspace_wakeup_event);
+	}
 
 	if (sys->xsysd != nullptr) {
 		comp_d3d11_window_set_system_devices(mc->window, sys->xsysd);
@@ -5144,7 +5202,15 @@ workspace_raycast_hit_test(struct d3d11_service_system *sys,
 		if (mc->clients[s].chrome_xsc != nullptr && mc->clients[s].chrome_layout_valid) {
 			float ch_cx = mc->clients[s].chrome_pose_in_client.position.x;
 			float ch_cy = mc->clients[s].chrome_pose_in_client.position.y;
-			float ch_hw = mc->clients[s].chrome_size_w_m * 0.5f;
+			float ch_w = mc->clients[s].chrome_size_w_m;
+			if (mc->clients[s].chrome_width_fraction > 0.0f) {
+				ch_w = mc->clients[s].window_width_m * mc->clients[s].chrome_width_fraction;
+			}
+			if (mc->clients[s].chrome_anchor_top_edge) {
+				ch_cy = mc->clients[s].window_height_m * 0.5f +
+				        mc->clients[s].chrome_pose_in_client.position.y;
+			}
+			float ch_hw = ch_w * 0.5f;
 			float ch_hh = mc->clients[s].chrome_size_h_m * 0.5f;
 			if (win_x + ch_cx - ch_hw < ext_left)   ext_left   = win_x + ch_cx - ch_hw;
 			if (win_x + ch_cx + ch_hw > ext_right)  ext_right  = win_x + ch_cx + ch_hw;
@@ -5238,7 +5304,15 @@ workspace_raycast_hit_test(struct d3d11_service_system *sys,
 			if (mc->clients[s].chrome_xsc != nullptr && mc->clients[s].chrome_layout_valid) {
 				float ch_cx = mc->clients[s].chrome_pose_in_client.position.x;
 				float ch_cy = mc->clients[s].chrome_pose_in_client.position.y;
-				float ch_hw = mc->clients[s].chrome_size_w_m * 0.5f;
+				float ch_w = mc->clients[s].chrome_size_w_m;
+				if (mc->clients[s].chrome_width_fraction > 0.0f) {
+					ch_w = mc->clients[s].window_width_m * mc->clients[s].chrome_width_fraction;
+				}
+				if (mc->clients[s].chrome_anchor_top_edge) {
+					ch_cy = mc->clients[s].window_height_m * 0.5f +
+					        mc->clients[s].chrome_pose_in_client.position.y;
+				}
+				float ch_hw = ch_w * 0.5f;
 				float ch_hh = mc->clients[s].chrome_size_h_m * 0.5f;
 				float ch_left  = win_x + ch_cx - ch_hw;
 				float ch_right = win_x + ch_cx + ch_hw;
@@ -5263,12 +5337,18 @@ workspace_raycast_hit_test(struct d3d11_service_system *sys,
 				}
 			}
 
-			// Edge detection (resize zones)
+			// Edge detection (resize zones). Phase 2.C C5 follow-up:
+			// resize handles compute from CONTENT bounds, not from the
+			// extended-with-chrome bounds — users expect to grab the
+			// content top edge for top-resize, not the imaginary chrome
+			// top above it. ext_left/right/bottom/top stay used for
+			// hit-test reach (so chrome clicks register), but the
+			// edge-handle math uses the original win_top/etc.
 			result.edge_flags = RESIZE_NONE;
 			if (hit_x < win_left + resize_zone_m) result.edge_flags |= RESIZE_LEFT;
 			if (hit_x >= win_right - resize_zone_m) result.edge_flags |= RESIZE_RIGHT;
 			if (hit_y < win_bottom + resize_zone_m) result.edge_flags |= RESIZE_BOTTOM;
-			if (hit_y >= ext_top - resize_zone_m) result.edge_flags |= RESIZE_TOP;
+			if (hit_y >= win_top - resize_zone_m && hit_y < win_top + resize_zone_m) result.edge_flags |= RESIZE_TOP;
 
 			// If we're inside the window (not just in resize zone), clear edge flags
 			// unless we're actually on the edge.
@@ -5923,7 +6003,46 @@ after_key_shortcuts:
 			// fade-seed loop that used to live here is gone with the
 			// chrome render block; this single line is the only state
 			// the per-frame hit-test still needs to publish.
-			mc->hovered_slot = hover.slot;
+			//
+			// spec_version 8: signal the wakeup event on TRANSITIONS
+			// (not on every frame), so the controller's event-driven
+			// wait wakes only when there's actually something new to
+			// drain.
+			if (mc->hovered_slot != hover.slot) {
+				mc->hovered_slot = hover.slot;
+				service_signal_workspace_wakeup(sys);
+			}
+			// Same idea for focused_slot — wakes the controller's wait
+			// when focus shifts via TAB / click / controller-set / disc
+			// onnect, so FOCUS_CHANGED reaches the shell promptly. The
+			// many write sites scattered across the file all converge
+			// here once per frame; comparing against the last per-frame
+			// snapshot catches them all without instrumenting each
+			// callsite individually.
+			if (mc->focused_slot != mc->focused_slot_signaled_value) {
+				mc->focused_slot_signaled_value = mc->focused_slot;
+				service_signal_workspace_wakeup(sys);
+			}
+			// Same idea for window pose / size — wakes the controller's
+			// wait when any chromed slot's pose or dims drift from the
+			// last value the drain emitted, so WINDOW_POSE_CHANGED
+			// reaches the shell promptly when the runtime resizes a
+			// window via edge drag. Bounded per-frame cost (~5 floats
+			// compared per active chromed slot, ≤ D3D11_MULTI_MAX_CLIENTS).
+			for (int sw = 0; sw < D3D11_MULTI_MAX_CLIENTS; sw++) {
+				struct d3d11_multi_client_slot *cs = &mc->clients[sw];
+				if (!cs->active || cs->client_type == CLIENT_TYPE_CAPTURE) continue;
+				if (cs->workspace_client_id == 0) continue;
+				const float kEps = 1e-5f;
+				if (fabsf(cs->window_width_m  - cs->window_w_last_emitted) > kEps ||
+				    fabsf(cs->window_height_m - cs->window_h_last_emitted) > kEps ||
+				    fabsf(cs->window_pose.position.x - cs->window_pose_last_emitted.position.x) > kEps ||
+				    fabsf(cs->window_pose.position.y - cs->window_pose_last_emitted.position.y) > kEps ||
+				    fabsf(cs->window_pose.position.z - cs->window_pose_last_emitted.position.z) > kEps) {
+					service_signal_workspace_wakeup(sys);
+					break; // one signal per frame is enough — drain emits per-slot
+				}
+			}
 
 			// Buttons get arrow cursor (no resize/drag cursor on buttons)
 			if (hover.in_close_btn || hover.in_minimize_btn || hover.in_maximize_btn) {
@@ -7308,7 +7427,23 @@ after_key_shortcuts:
 
 				float chrome_cx = cs->chrome_pose_in_client.position.x;
 				float chrome_cy = cs->chrome_pose_in_client.position.y;
-				float chrome_hw = cs->chrome_size_w_m * 0.5f;
+				float chrome_size_w_eff = cs->chrome_size_w_m;
+				// spec_version 8: width_fraction > 0 → auto-scale chrome
+				// width to current window width every frame. Lets the
+				// controller push layout once at create and have the
+				// pill follow window resizes without re-pushing.
+				if (cs->chrome_width_fraction > 0.0f) {
+					chrome_size_w_eff = cs->window_width_m * cs->chrome_width_fraction;
+				}
+				// spec_version 8: anchor_top_edge → pose_y is offset
+				// ABOVE the window's top edge (positive = above) using
+				// CURRENT window height. Without this the pose_y is
+				// stale (controller's last-seen win_h) and the chrome
+				// lags one frame behind the window edge during resize.
+				if (cs->chrome_anchor_top_edge) {
+					chrome_cy = cs->window_height_m * 0.5f + cs->chrome_pose_in_client.position.y;
+				}
+				float chrome_hw = chrome_size_w_eff * 0.5f;
 				float chrome_hh = cs->chrome_size_h_m * 0.5f;
 				float chrome_l = chrome_cx - chrome_hw;
 				float chrome_r = chrome_cx + chrome_hw;
@@ -10009,6 +10144,16 @@ system_destroy(struct xrt_system_compositor *xsysc)
 		sys->multi_comp = nullptr;
 	}
 
+#ifdef _WIN32
+	// spec_version 8: close the workspace wakeup event handle. Controllers
+	// hold their own DuplicateHandle ref; closing this one doesn't disturb
+	// them. They'll close their copy on shell exit.
+	if (sys->workspace_wakeup_event != nullptr) {
+		CloseHandle((HANDLE)sys->workspace_wakeup_event);
+		sys->workspace_wakeup_event = nullptr;
+	}
+#endif
+
 	// NOTE: Per-client display processors are cleaned up in fini_client_render_resources()
 	// when each client disconnects. System has no display processor anymore.
 
@@ -11531,6 +11676,56 @@ comp_d3d11_service_workspace_drain_input_events(struct xrt_system_compositor *xs
 		out_batch->count++;
 	}
 
+	// spec_version 8: WINDOW_POSE_CHANGED for any slot whose stored pose /
+	// dims have drifted since the last drain. Catches runtime-driven changes
+	// (edge resize, fullscreen toggle, etc.) so controllers can re-push
+	// chrome layout instead of leaving the pill stranded at the old size.
+	// Shell-driven set_pose RPCs also flow through this path — controllers
+	// that initiated them should dedupe (the new pose === what they pushed)
+	// or just re-push idempotently (push_layout is cheap).
+	for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS &&
+	     out_batch->count < IPC_WORKSPACE_INPUT_EVENT_BATCH_MAX; s++) {
+		struct d3d11_multi_client_slot *cs = &mc->clients[s];
+		if (!cs->active || cs->client_type == CLIENT_TYPE_CAPTURE) continue;
+		if (cs->workspace_client_id == 0) continue; // skip uninteresting (no chrome registered)
+
+		const struct xrt_pose &p = cs->window_pose;
+		const struct xrt_pose &q = cs->window_pose_last_emitted;
+		const float kEps = 1e-5f;
+		bool pose_changed =
+		    fabsf(p.position.x - q.position.x) > kEps ||
+		    fabsf(p.position.y - q.position.y) > kEps ||
+		    fabsf(p.position.z - q.position.z) > kEps ||
+		    fabsf(p.orientation.x - q.orientation.x) > kEps ||
+		    fabsf(p.orientation.y - q.orientation.y) > kEps ||
+		    fabsf(p.orientation.z - q.orientation.z) > kEps ||
+		    fabsf(p.orientation.w - q.orientation.w) > kEps;
+		bool size_changed =
+		    fabsf(cs->window_width_m - cs->window_w_last_emitted) > kEps ||
+		    fabsf(cs->window_height_m - cs->window_h_last_emitted) > kEps;
+		if (!pose_changed && !size_changed) continue;
+
+		struct ipc_workspace_input_event *ev = &out_batch->events[out_batch->count];
+		memset(ev, 0, sizeof(*ev));
+		ev->event_type = IPC_WORKSPACE_INPUT_EVENT_WINDOW_POSE_CHANGED;
+		ev->timestamp_ms = (uint32_t)GetTickCount();
+		ev->u.window_pose_changed.client_id    = cs->workspace_client_id;
+		ev->u.window_pose_changed.pose_orient_x = p.orientation.x;
+		ev->u.window_pose_changed.pose_orient_y = p.orientation.y;
+		ev->u.window_pose_changed.pose_orient_z = p.orientation.z;
+		ev->u.window_pose_changed.pose_orient_w = p.orientation.w;
+		ev->u.window_pose_changed.pose_pos_x   = p.position.x;
+		ev->u.window_pose_changed.pose_pos_y   = p.position.y;
+		ev->u.window_pose_changed.pose_pos_z   = p.position.z;
+		ev->u.window_pose_changed.width_m      = cs->window_width_m;
+		ev->u.window_pose_changed.height_m     = cs->window_height_m;
+		out_batch->count++;
+
+		cs->window_pose_last_emitted = p;
+		cs->window_w_last_emitted = cs->window_width_m;
+		cs->window_h_last_emitted = cs->window_height_m;
+	}
+
 	// FRAME_TICK: one per displayed frame since the last drain, capped at
 	// remaining batch capacity. If the controller drains faster than one
 	// frame this is a no-op; if it falls behind we cap and the timestamp on
@@ -11786,6 +11981,8 @@ comp_d3d11_service_workspace_set_chrome_layout_by_slot(struct xrt_system_composi
 	cs->chrome_size_h_m = layout->size_h_m;
 	cs->chrome_follows_orient = (layout->follows_window_orient != 0);
 	cs->chrome_depth_bias_m = layout->depth_bias_meters;
+	cs->chrome_anchor_top_edge = (layout->anchor_to_window_top_edge != 0);
+	cs->chrome_width_fraction = layout->width_as_fraction_of_window;
 	cs->chrome_region_count = layout->hit_region_count;
 	if (cs->chrome_region_count > IPC_WORKSPACE_CHROME_MAX_HIT_REGIONS) {
 		cs->chrome_region_count = IPC_WORKSPACE_CHROME_MAX_HIT_REGIONS;
@@ -11794,6 +11991,42 @@ comp_d3d11_service_workspace_set_chrome_layout_by_slot(struct xrt_system_composi
 	       cs->chrome_region_count * sizeof(struct ipc_workspace_chrome_hit_region));
 	cs->chrome_layout_valid = true;
 	return XRT_SUCCESS;
+}
+
+extern "C" void *
+comp_d3d11_service_workspace_get_wakeup_event(struct xrt_system_compositor *xsysc)
+{
+	if (xsysc == nullptr) {
+		return nullptr;
+	}
+#ifdef _WIN32
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	// Lazy-create on first call. Auto-reset (FALSE first BOOL), initial
+	// state non-signaled (FALSE second BOOL). The handle returned to the
+	// IPC layer is the runtime's source-of-truth — the IPC handler then
+	// DuplicateHandle's it into the controller process so each process
+	// has its own ref. Single Win32 event suffices for any number of
+	// controllers (only one workspace controller exists at a time per
+	// the activation auth handshake).
+	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	if (sys->workspace_wakeup_event == nullptr) {
+		HANDLE h = CreateEventA(NULL, FALSE /* auto-reset */, FALSE /* initial */, NULL);
+		if (h == NULL) {
+			U_LOG_W("workspace: CreateEventA(wakeup) failed: 0x%08lx", GetLastError());
+			return nullptr;
+		}
+		sys->workspace_wakeup_event = (void *)h;
+		// Propagate the handle to the WndProc so the public-ring push
+		// path can SetEvent without a back-reference to sys.
+		if (sys->multi_comp != nullptr && sys->multi_comp->window != nullptr) {
+			comp_d3d11_window_set_workspace_wakeup_event(sys->multi_comp->window, h);
+		}
+	}
+	return sys->workspace_wakeup_event;
+#else
+	(void)xsysc;
+	return nullptr;
+#endif
 }
 
 extern "C" bool

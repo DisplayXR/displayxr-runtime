@@ -493,6 +493,18 @@ comp_ipc_client_compositor_workspace_enumerate_input_events(struct xrt_composito
 			out->focusChanged.currentClientId =
 			    (XrWorkspaceClientId)src->u.focus_changed.curr_client_id;
 			break;
+		case IPC_WORKSPACE_INPUT_EVENT_WINDOW_POSE_CHANGED:
+			out->windowPoseChanged.clientId = (XrWorkspaceClientId)src->u.window_pose_changed.client_id;
+			out->windowPoseChanged.pose.orientation.x = src->u.window_pose_changed.pose_orient_x;
+			out->windowPoseChanged.pose.orientation.y = src->u.window_pose_changed.pose_orient_y;
+			out->windowPoseChanged.pose.orientation.z = src->u.window_pose_changed.pose_orient_z;
+			out->windowPoseChanged.pose.orientation.w = src->u.window_pose_changed.pose_orient_w;
+			out->windowPoseChanged.pose.position.x = src->u.window_pose_changed.pose_pos_x;
+			out->windowPoseChanged.pose.position.y = src->u.window_pose_changed.pose_pos_y;
+			out->windowPoseChanged.pose.position.z = src->u.window_pose_changed.pose_pos_z;
+			out->windowPoseChanged.widthMeters = src->u.window_pose_changed.width_m;
+			out->windowPoseChanged.heightMeters = src->u.window_pose_changed.height_m;
+			break;
 		default:
 			break;
 		}
@@ -742,6 +754,27 @@ comp_ipc_client_compositor_workspace_set_chrome_layout(struct xrt_compositor *xc
 		return XRT_ERROR_IPC_FAILURE;
 	}
 	return ipc_call_workspace_set_chrome_layout(icc->ipc_c, client_id, layout);
+}
+
+xrt_result_t
+comp_ipc_client_compositor_workspace_acquire_wakeup_event(struct xrt_compositor *xc,
+                                                          xrt_graphics_sync_handle_t *out_handle)
+{
+	if (xc == NULL || out_handle == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	*out_handle = XRT_GRAPHICS_SYNC_HANDLE_INVALID;
+
+	xrt_graphics_sync_handle_t handles[1] = {XRT_GRAPHICS_SYNC_HANDLE_INVALID};
+	xrt_result_t xret = ipc_call_workspace_acquire_wakeup_event(icc->ipc_c, handles, 1);
+	if (xret == XRT_SUCCESS) {
+		*out_handle = handles[0];
+	}
+	return xret;
 }
 
 /*

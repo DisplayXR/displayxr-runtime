@@ -26,6 +26,7 @@
 #include "oxr_api_verify.h"
 
 #include "xrt/xrt_results.h"
+#include "xrt/xrt_handles.h"
 
 // Phase 2.C: chrome layout marshalling. Pull the IPC POD typedef so the
 // dispatch wrapper can fill it directly. The CMake include path
@@ -146,6 +147,9 @@ xrt_result_t
 comp_ipc_client_compositor_workspace_set_chrome_layout(struct xrt_compositor *xc,
                                                        uint32_t client_id,
                                                        const struct ipc_workspace_chrome_layout *layout);
+xrt_result_t
+comp_ipc_client_compositor_workspace_acquire_wakeup_event(struct xrt_compositor *xc,
+                                                          xrt_graphics_sync_handle_t *out_handle);
 uint32_t
 comp_ipc_client_compositor_get_swapchain_id(struct xrt_swapchain *xsc);
 
@@ -1013,6 +1017,8 @@ chrome_layout_xr_to_ipc(const XrWorkspaceChromeLayoutEXT *in,
 	out->follows_window_orient = in->followsWindowOrient ? 1u : 0u;
 	out->depth_bias_meters = in->depthBiasMeters;
 	out->hit_region_count = in->hitRegionCount;
+	out->anchor_to_window_top_edge = in->anchorToWindowTopEdge ? 1u : 0u;
+	out->width_as_fraction_of_window = in->widthAsFractionOfWindow;
 	for (uint32_t i = 0; i < in->hitRegionCount && i < IPC_WORKSPACE_CHROME_MAX_HIT_REGIONS; ++i) {
 		out->hit_regions[i].id = (uint32_t)in->hitRegions[i].id;
 		out->hit_regions[i].bounds_x = in->hitRegions[i].bounds.offset.x;
@@ -1072,6 +1078,43 @@ oxr_xrSetWorkspaceClientChromeLayoutEXT(XrSession session,
 	xrt_result_t xret = comp_ipc_client_compositor_workspace_set_chrome_layout(
 	    &sess->xcn->base, (uint32_t)clientId, &ipc_layout);
 	return xret_to_xr_result(&log, xret, "workspace_set_chrome_layout");
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrAcquireWorkspaceWakeupEventEXT(XrSession session, uint64_t *outNativeHandle)
+{
+	OXR_TRACE_MARKER();
+
+	struct oxr_session *sess = NULL;
+	struct oxr_logger log;
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrAcquireWorkspaceWakeupEventEXT");
+	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+	OXR_VERIFY_ARG_NOT_NULL(&log, outNativeHandle);
+
+	*outNativeHandle = 0;
+
+	if (!session_is_ipc_client(sess)) {
+		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
+		                 "xrAcquireWorkspaceWakeupEventEXT requires an IPC-mode session");
+	}
+
+	xrt_graphics_sync_handle_t handle = XRT_GRAPHICS_SYNC_HANDLE_INVALID;
+	xrt_result_t xret = comp_ipc_client_compositor_workspace_acquire_wakeup_event(
+	    &sess->xcn->base, &handle);
+	if (xret != XRT_SUCCESS) {
+		return xret_to_xr_result(&log, xret, "workspace_acquire_wakeup_event");
+	}
+
+	// Cast the platform handle to uint64_t for the public surface.
+	// On Win32: HANDLE → uint64_t (via uintptr_t to silence the
+	// pointer-to-int warning). On POSIX: int fd → uint64_t.
+#ifdef _WIN32
+	*outNativeHandle = (uint64_t)(uintptr_t)handle;
+#else
+	*outNativeHandle = (uint64_t)handle;
+#endif
+	return XR_SUCCESS;
 }
 
 #endif // OXR_HAVE_EXT_spatial_workspace

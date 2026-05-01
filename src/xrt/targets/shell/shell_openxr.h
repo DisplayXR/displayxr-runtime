@@ -69,6 +69,11 @@ struct shell_openxr_state
 	PFN_xrCreateWorkspaceClientChromeSwapchainEXT  create_chrome_swapchain;
 	PFN_xrDestroyWorkspaceClientChromeSwapchainEXT destroy_chrome_swapchain;
 	PFN_xrSetWorkspaceClientChromeLayoutEXT        set_chrome_layout;
+	// Phase 2.C spec_version 8: event-driven wakeup so the shell sleeps
+	// instead of polling. Acquired once at startup; stored here for
+	// main.c to reference.
+	PFN_xrAcquireWorkspaceWakeupEventEXT           acquire_wakeup_event;
+	void                                          *wakeup_event_handle; // Win32 HANDLE on Windows; uint64_t cast back. NULL if unsupported.
 
 	// Physical display size in meters, pulled from XR_EXT_display_info during
 	// init. Falls back to LP-3D dims (0.700 × 0.394 m) if the extension is

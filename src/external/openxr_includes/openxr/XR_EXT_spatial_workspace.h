@@ -25,7 +25,7 @@ extern "C" {
 #endif
 
 #define XR_EXT_spatial_workspace 1
-#define XR_EXT_spatial_workspace_SPEC_VERSION 7
+#define XR_EXT_spatial_workspace_SPEC_VERSION 8
 #define XR_EXT_SPATIAL_WORKSPACE_EXTENSION_NAME "XR_EXT_spatial_workspace"
 
 // Provisional XrStructureType values. The 1000999100..104 range is reserved for
@@ -303,6 +303,7 @@ typedef enum XrWorkspaceInputEventTypeEXT {
     XR_WORKSPACE_INPUT_EVENT_POINTER_MOTION_EXT = 4, // spec_version 6
     XR_WORKSPACE_INPUT_EVENT_FRAME_TICK_EXT     = 5, // spec_version 6
     XR_WORKSPACE_INPUT_EVENT_FOCUS_CHANGED_EXT  = 6, // spec_version 6
+    XR_WORKSPACE_INPUT_EVENT_WINDOW_POSE_CHANGED_EXT = 7, // spec_version 8: runtime-driven pose / size change (edge resize, etc.)
     XR_WORKSPACE_INPUT_EVENT_TYPE_MAX_ENUM_EXT  = 0x7FFFFFFF
 } XrWorkspaceInputEventTypeEXT;
 
@@ -383,6 +384,17 @@ typedef struct XrWorkspaceInputEventEXT {
             XrWorkspaceClientId     prevClientId;
             XrWorkspaceClientId     currentClientId;
         } focusChanged;
+        struct {  // spec_version 8: window pose/size changed by the runtime
+            // (edge resize, fullscreen toggle, etc. — NOT shell-driven
+            // set_pose RPCs, which the shell already knows about).
+            // Controllers re-push chrome layout in response so chrome
+            // tracks the window's new top edge instead of staying at the
+            // old size.
+            XrWorkspaceClientId     clientId;
+            XrPosef                 pose;
+            float                   widthMeters;
+            float                   heightMeters;
+        } windowPoseChanged;
     };
 } XrWorkspaceInputEventEXT;
 
@@ -656,6 +668,22 @@ typedef struct XrWorkspaceChromeLayoutEXT {
     uint32_t         hitRegionCount;     // <= XR_WORKSPACE_CHROME_MAX_HIT_REGIONS_EXT
     const XrWorkspaceChromeHitRegionEXT* hitRegions;
     float            depthBiasMeters;    // 0 = runtime default (0.001)
+    // spec_version 8: auto-anchor flags so chrome stays attached to a window
+    // edge as the window resizes WITHOUT the controller having to re-push the
+    // layout on every WINDOW_POSE_CHANGED event. Without these the chrome
+    // appears to lag one frame behind the window edge during a resize drag,
+    // because the controller's push_layout always carries the win_h_m value
+    // from the LAST frame the controller observed.
+    //   anchorToWindowTopEdge: when XR_TRUE, poseInClient.position.y is
+    //     interpreted as an offset ABOVE the window's top edge (positive =
+    //     above) instead of from the window center. Runtime evaluates
+    //     effectiveY = window_h/2 + poseInClient.position.y per frame using
+    //     the CURRENT window height — chrome stays glued to top edge.
+    //   widthAsFractionOfWindow: when > 0, chrome width is computed each
+    //     frame as window_w * widthAsFractionOfWindow (sizeMeters.width is
+    //     ignored). 0 = absolute (use sizeMeters.width).
+    XrBool32         anchorToWindowTopEdge;
+    float            widthAsFractionOfWindow;
 } XrWorkspaceChromeLayoutEXT;
 
 /*!
@@ -714,6 +742,44 @@ typedef XrResult (XRAPI_PTR *PFN_xrSetWorkspaceClientChromeLayoutEXT)(
     XrSession                          session,
     XrWorkspaceClientId                clientId,
     const XrWorkspaceChromeLayoutEXT  *layout);
+
+// ---- Event-driven wakeup (spec_version 8) ----
+
+/*!
+ * @brief Acquire a wakeup event the controller can wait on instead of polling.
+ *
+ * Returns a platform-native event handle that the runtime signals whenever
+ * async workspace state changes (input event pushed onto the drain queue,
+ * focused-slot transition, hovered-slot transition). The controller passes
+ * the handle to a wait primitive (Win32 WaitForSingleObject /
+ * MsgWaitForMultipleObjects, or analogous on other platforms) so its main
+ * loop sleeps when nothing is happening and wakes immediately when there
+ * is something to drain.
+ *
+ * Auto-reset semantics: the handle becomes signaled on each runtime
+ * SetEvent and is cleared automatically when one waiter wakes. Multiple
+ * SetEvent calls in quick succession may collapse to a single wake — the
+ * controller is expected to drain ALL pending state on each wake (call
+ * xrEnumerateWorkspaceInputEventsEXT, re-query whatever it cares about).
+ *
+ * The handle is a Win32 HANDLE on Windows, returned as @p outNativeHandle
+ * cast to uint64_t. Caller takes ownership and must close (CloseHandle)
+ * when done. Calling this function multiple times returns fresh handles
+ * each time; the runtime keeps a single source-of-truth event internally
+ * and duplicates it to the caller's process at each call.
+ *
+ * Platforms other than Windows currently return XR_ERROR_FEATURE_UNSUPPORTED.
+ *
+ * Idle CPU cost goes from ~0.1% of one core (the polling baseline) to
+ * effectively 0 when this handle is wired into the controller's wait set.
+ *
+ * @param session            A valid workspace session.
+ * @param outNativeHandle    Output: platform-native event handle as uint64_t.
+ *                           NULL on error.
+ */
+typedef XrResult (XRAPI_PTR *PFN_xrAcquireWorkspaceWakeupEventEXT)(
+    XrSession  session,
+    uint64_t  *outNativeHandle);
 
 #ifndef XR_NO_PROTOTYPES
 XRAPI_ATTR XrResult XRAPI_CALL xrActivateSpatialWorkspaceEXT(
@@ -822,6 +888,10 @@ XRAPI_ATTR XrResult XRAPI_CALL xrSetWorkspaceClientChromeLayoutEXT(
     XrSession                          session,
     XrWorkspaceClientId                clientId,
     const XrWorkspaceChromeLayoutEXT  *layout);
+
+XRAPI_ATTR XrResult XRAPI_CALL xrAcquireWorkspaceWakeupEventEXT(
+    XrSession  session,
+    uint64_t  *outNativeHandle);
 #endif
 
 #ifdef __cplusplus

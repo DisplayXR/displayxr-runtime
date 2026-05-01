@@ -557,6 +557,20 @@ comp_d3d11_service_workspace_set_chrome_layout_by_slot(struct xrt_system_composi
                                                        int slot,
                                                        const struct ipc_workspace_chrome_layout *layout);
 
+/*!
+ * Phase 2.C spec_version 8: lazy-create + return the workspace wakeup
+ * event handle (Win32 HANDLE on Windows). The IPC handler then DuplicateHandle's
+ * it into the controller process so the controller can wait on it instead
+ * of polling. Returns NULL on platforms that don't support Win32 events.
+ *
+ * The runtime owns the source HANDLE and signals it (SetEvent) on every
+ * async state change the controller might react to (input event push,
+ * focused/hovered slot transition). Auto-reset semantics: SetEvent wakes
+ * one waiter and clears immediately.
+ */
+void *
+comp_d3d11_service_workspace_get_wakeup_event(struct xrt_system_compositor *xsysc);
+
 /*! @} */
 
 

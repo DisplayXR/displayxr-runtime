@@ -368,6 +368,7 @@ enum ipc_workspace_input_event_type
 	IPC_WORKSPACE_INPUT_EVENT_POINTER_MOTION = 4, //!< spec_version 6
 	IPC_WORKSPACE_INPUT_EVENT_FRAME_TICK     = 5, //!< spec_version 6
 	IPC_WORKSPACE_INPUT_EVENT_FOCUS_CHANGED  = 6, //!< spec_version 6
+	IPC_WORKSPACE_INPUT_EVENT_WINDOW_POSE_CHANGED = 7, //!< spec_version 8: runtime-driven pose/size change
 };
 
 struct ipc_workspace_input_event
@@ -431,6 +432,19 @@ struct ipc_workspace_input_event
 			uint32_t prev_client_id;
 			uint32_t curr_client_id;
 		} focus_changed;
+		struct                      //!< spec_version 8: runtime-driven pose/size change
+		{
+			uint32_t client_id;
+			float    pose_orient_x;
+			float    pose_orient_y;
+			float    pose_orient_z;
+			float    pose_orient_w;
+			float    pose_pos_x;
+			float    pose_pos_y;
+			float    pose_pos_z;
+			float    width_m;
+			float    height_m;
+		} window_pose_changed;
 	} u;
 };
 
@@ -528,6 +542,8 @@ struct ipc_workspace_chrome_layout
 	float    depth_bias_meters;       //!< Bias toward eye; 0 = runtime default (0.001)
 	uint32_t hit_region_count;        //!< <= IPC_WORKSPACE_CHROME_MAX_HIT_REGIONS
 	struct ipc_workspace_chrome_hit_region hit_regions[IPC_WORKSPACE_CHROME_MAX_HIT_REGIONS];
+	uint32_t anchor_to_window_top_edge; //!< spec_version 8: pose.y = offset above window top
+	float    width_as_fraction_of_window; //!< spec_version 8: 0 = absolute, > 0 = win_w * frac
 };
 
 /*!

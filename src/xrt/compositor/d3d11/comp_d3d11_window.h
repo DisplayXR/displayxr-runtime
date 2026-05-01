@@ -252,6 +252,15 @@ void
 comp_d3d11_window_set_workspace_mode_active(struct comp_d3d11_window *window, bool active);
 
 /*!
+ * Phase 2.C spec_version 8: hand the window the workspace wakeup event handle.
+ * Window thread SetEvent's it after every public-event ring push so the
+ * controller's event-driven wait wakes promptly. Pass NULL to clear.
+ * Window does NOT take ownership — runtime owns the source HANDLE.
+ */
+void
+comp_d3d11_window_set_workspace_wakeup_event(struct comp_d3d11_window *window, void *handle);
+
+/*!
  * Tell the window layer whether any client is currently maximized/fullscreen.
  * When true, ESC is consumed by the workspace for fullscreen restore and not
  * forwarded to the focused app.

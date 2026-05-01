@@ -891,6 +891,9 @@ XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrSetWorkspaceClientChromeLayoutEXT(XrSession session,
                                         XrWorkspaceClientId clientId,
                                         const XrWorkspaceChromeLayoutEXT *layout);
+//! OpenXR API function @ep{xrAcquireWorkspaceWakeupEventEXT}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrAcquireWorkspaceWakeupEventEXT(XrSession session, uint64_t *outNativeHandle);
 #endif
 
 #ifdef OXR_HAVE_EXT_app_launcher

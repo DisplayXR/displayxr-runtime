@@ -21,6 +21,19 @@
 #include <d3dcompiler.h>
 #include <wrl/client.h>
 
+// stb_image for PNG decode of per-app icons. The shell already includes
+// stb headers via the launcher path — re-use here, header-only impl is
+// disabled (defined elsewhere). If stb_image isn't already linked, fall
+// back to the alternative decoder below (TODO).
+#define STB_IMAGE_IMPLEMENTATION
+#define STBI_NO_HDR
+#define STBI_NO_LINEAR
+#define STBI_NO_GIF
+#define STBI_NO_PIC
+#define STBI_NO_PNM
+#define STBI_ONLY_PNG
+#include "stb_image.h"
+
 #define XR_USE_GRAPHICS_API_D3D11
 #define XR_USE_PLATFORM_WIN32
 
@@ -40,6 +53,13 @@
 using Microsoft::WRL::ComPtr;
 
 namespace {
+
+// Forward decls for helpers defined in the lower anonymous namespace —
+// shell_chrome_on_window_resized (defined as extern "C" between the two
+// namespaces) needs to call them.
+struct chrome_slot;
+uint64_t shell_chrome_now_ns();
+void seed_fade(chrome_slot &slot, float target, uint64_t duration_ns);
 
 // Pill geometry constants — mirror the runtime's in-process pill so the
 // controller-rendered pill lands at the same place + size as the existing
@@ -81,6 +101,25 @@ struct chrome_slot
 	float    fade_start_alpha;
 	uint64_t fade_start_ns;
 	uint64_t fade_duration_ns;
+
+	// Phase 2.C C5 follow-up: hide-during-resize. WINDOW_POSE_CHANGED
+	// can fire at ~60 Hz while the user drags an edge handle; re-rendering
+	// the chrome image on every event is laggy + wastes IPC. Instead we
+	// fade the pill out fast on the first event of a burst, defer the
+	// (cheap) chrome image re-render until the burst settles, then fade
+	// back in. resize_pending_until_ns is the deadline by which "no more
+	// pose-change events for X ms" qualifies as resize-done; reset on
+	// every event.
+	uint64_t resize_pending_until_ns; // 0 = not in a resize burst
+
+	// Phase 2.C C3.C-3a: per-app icon. Loaded from the registered_app's
+	// icon_path PNG via stb_image and uploaded into a D3D11 texture +
+	// SRV at chrome-create time. NULL if the app has no resolvable
+	// icon (test apps without sidecar manifests). The pill shader
+	// samples icon_srv at register t0 and skips the icon draw when
+	// has_icon = 0 in the cbuffer.
+	ComPtr<ID3D11Texture2D>        icon_texture;
+	ComPtr<ID3D11ShaderResourceView> icon_srv;
 };
 
 } // namespace
@@ -112,9 +151,17 @@ struct PillCB
 	float close_color[4];
 	float btn_color[4];
 	float dot_color[4];
+
+	// Register 6: app icon control. has_icon = 1 enables the icon sample
+	// at left of the pill; 0 disables (skips the texture sample so apps
+	// without a resolvable icon don't render garbage). icon_size_m is
+	// the visible icon's square half-extent in pill-space meters.
+	float has_icon;
+	float icon_size_m;
+	float _pad1[2];
 };
 static_assert(sizeof(PillCB) % 16 == 0, "PillCB must be 16-byte aligned");
-static_assert(sizeof(PillCB) == 96, "PillCB layout drift");
+static_assert(sizeof(PillCB) == 112, "PillCB layout drift");
 
 struct shell_chrome
 {
@@ -123,6 +170,13 @@ struct shell_chrome
 	ID3D11DeviceContext       *context;         // not owned
 
 	std::vector<chrome_slot> slots;
+
+	// Phase 2.C C5 follow-up: cached most-recent hover transition target.
+	// Lets the resize-end handler restore the right post-resize alpha
+	// (fade in if currently hovered, stay hidden if not) without waiting
+	// for the next POINTER_HOVER event — which won't fire if the cursor
+	// is already over the slot at resize-end.
+	XrWorkspaceClientId current_hover_id;
 
 	// Resolved at create.
 	PFN_xrEnumerateSwapchainImages enum_images;
@@ -134,6 +188,7 @@ struct shell_chrome
 	ComPtr<ID3D11RasterizerState> rs_state;
 	ComPtr<ID3D11BlendState>     bs_passthrough;  // overwrite RTV — controller owns the chrome image
 	ComPtr<ID3D11DepthStencilState> dss_disabled;
+	ComPtr<ID3D11SamplerState>   icon_sampler; // linear-clamp; sampled by the pill shader for per-app icons
 };
 
 namespace {
@@ -211,7 +266,14 @@ cbuffer PillCB : register(b0)
     float4 close_color;
     float4 btn_color;
     float4 dot_color;
+
+    float  has_icon;
+    float  icon_size_m;
+    float2 _pad1;
 };
+
+Texture2D    icon_tex  : register(t0);
+SamplerState icon_samp : register(s0);
 
 // Signed distance to a rounded rectangle centered at origin with half-extents
 // `b` (full width/height = 2b) and corner radius `r`.
@@ -283,13 +345,81 @@ float4 PS(VSOut input) : SV_Target
     float aa_btn   = fwidth(close_dist);
     float aa_dot   = fwidth(dot_dist);
 
-    // Compose back-to-front: pill bg, then dots, then buttons.
+    // Compose back-to-front: pill bg, then icon, then dots, then buttons.
     float4 result = float4(0, 0, 0, 0);
     result = over(float4(pill_color.rgb,  pill_color.a  * cov(pill_dist,  aa_pill)), result);
+
+    // App icon at the left of the pill, mirroring the close button at the
+    // right. Sampled from icon_tex (loaded by the shell from the
+    // registered_app's icon_path PNG) when has_icon = 1. Rounded-square
+    // mask (corner radius 25% of icon half-extent) keeps the icon from
+    // looking like a pixelated square against the glassy pill — matches
+    // the soft folder-icon styling in the concept art.
+    if (has_icon > 0.5) {
+        float2 icon_center = float2(btn_width_m * 0.5, pill_size_m.y * 0.5);
+        float2 icon_pos = p - icon_center;
+        float icon_corner_r = icon_size_m * 0.40;
+        float2 icon_d = abs(icon_pos) - (icon_size_m - icon_corner_r);
+        float icon_dist = length(max(icon_d, 0.0)) +
+                          min(max(icon_d.x, icon_d.y), 0.0) - icon_corner_r;
+        if (icon_dist < 0.0) {
+            // Map [-icon_size_m, +icon_size_m] → [0, 1]. Both pill-space
+            // (p.y) and stb_image rows are top-down, so no y-flip needed.
+            float2 icon_uv = float2(
+                (icon_pos.x + icon_size_m) / (2.0 * icon_size_m),
+                (icon_pos.y + icon_size_m) / (2.0 * icon_size_m));
+            float4 icon_sample = icon_tex.Sample(icon_samp, icon_uv);
+            float icon_cov = saturate(0.5 - icon_dist / max(fwidth(icon_dist), 1e-6));
+            result = over(float4(icon_sample.rgb, icon_sample.a * icon_cov), result);
+        }
+    }
+
+    // Pill edge highlight — thin bright rim along the perimeter, falls off
+    // a few pixels each way. Reads as the "frosted glass refraction" cue
+    // in the concept art (bright outer edge, soft body).
+    float pill_edge = abs(pill_dist);
+    float pill_edge_aa = max(fwidth(pill_dist), 1e-6);
+    float pill_edge_glow = saturate(1.0 - pill_edge / (pill_edge_aa * 2.0));
+    result.rgb = lerp(result.rgb, float3(1.0, 1.0, 1.0), pill_edge_glow * 0.35 * cov(pill_dist - aa_pill, aa_pill));
+
     result = over(float4(dot_color.rgb,   dot_color.a   * cov(dot_dist,   aa_dot)),  result);
     result = over(float4(btn_color.rgb,   btn_color.a   * cov(max_dist,   aa_btn)),  result);
     result = over(float4(btn_color.rgb,   btn_color.a   * cov(min_dist,   aa_btn)),  result);
     result = over(float4(close_color.rgb, close_color.a * cov(close_dist, aa_btn)),  result);
+
+    // Procedural button glyphs (placeholder until DirectWrite atlas lands):
+    //   close   = × (two diagonals)
+    //   min     = − (horizontal bar)
+    //   max     = □ (hollow square outline)
+    // Rasterized in pill-space via SDF, masked to the visible-button circle
+    // so they don't bleed onto the pill bg between buttons.
+    float btn_y2 = pill_size_m.y * 0.5;
+    float glyph_w_m = btn_r_m * 0.085; // stroke half-width in pill-space meters
+    float glyph_size_m = btn_r_m * 0.55; // half-extent of the glyph bounding box
+    float4 glyph_col = float4(0.97, 0.98, 1.0, 0.95); // bright white tint
+
+    // Close (×): two diagonal capsules, length = glyph_size, half-width = glyph_w_m
+    float2 cp = p - float2(pill_size_m.x - btn_width_m * 0.5, btn_y2);
+    float close_diag1 = abs(cp.x + cp.y) * 0.7071 - glyph_w_m;
+    float close_diag2 = abs(cp.x - cp.y) * 0.7071 - glyph_w_m;
+    // Limit each diagonal's length by clipping outside the button-radius circle
+    float close_mask = sdCircle(cp, glyph_size_m);
+    float close_glyph = max(min(close_diag1, close_diag2), close_mask);
+    result = over(float4(glyph_col.rgb, glyph_col.a * cov(close_glyph, fwidth(close_glyph))), result);
+
+    // Minimize (−): horizontal capsule centered on the button
+    float2 mp = p - float2(pill_size_m.x - btn_width_m * 1.5, btn_y2);
+    float2 min_d = abs(mp) - float2(glyph_size_m, glyph_w_m);
+    float min_glyph = length(max(min_d, 0.0)) + min(max(min_d.x, min_d.y), 0.0);
+    result = over(float4(glyph_col.rgb, glyph_col.a * cov(min_glyph, fwidth(min_glyph))), result);
+
+    // Maximize (□): hollow square outline (rounded rect minus inner rect)
+    float2 xp = p - float2(pill_size_m.x - btn_width_m * 2.5, btn_y2);
+    float2 max_outer_d = abs(xp) - float2(glyph_size_m, glyph_size_m);
+    float max_outer = length(max(max_outer_d, 0.0)) + min(max(max_outer_d.x, max_outer_d.y), 0.0);
+    float max_inner = max_outer + glyph_w_m * 1.4; // ring thickness
+    float max_outline = max(max_outer, -max_inner);
+    result = over(float4(glyph_col.rgb, glyph_col.a * cov(max_outline, fwidth(max_outline))), result);
 
     // C3.C-4 hover-fade: global alpha multiplier on the final RGBA.
     return float4(result.rgb, result.a * saturate(fade_alpha));
@@ -361,6 +491,61 @@ init_shader_pipeline(shell_chrome *sc)
 	hr = sc->device->CreateDepthStencilState(&dsd, sc->dss_disabled.GetAddressOf());
 	if (FAILED(hr)) { PE("shell_chrome: CreateDepthStencilState failed: 0x%08lx\n", hr); return false; }
 
+	// Linear-clamp sampler for app icons. Linear filter keeps the icon
+	// crisp at varying display scales; clamp address mode prevents tiling
+	// artifacts when the shader's UV math drifts off the [0,1] range.
+	D3D11_SAMPLER_DESC ssd = {};
+	ssd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+	ssd.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+	ssd.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+	ssd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+	ssd.MaxLOD = D3D11_FLOAT32_MAX;
+	hr = sc->device->CreateSamplerState(&ssd, sc->icon_sampler.GetAddressOf());
+	if (FAILED(hr)) { PE("shell_chrome: CreateSamplerState(icon) failed: 0x%08lx\n", hr); return false; }
+
+	return true;
+}
+
+// Load a PNG from disk and create an immutable D3D11 texture + SRV. Returns
+// true on success; on failure logs and leaves the slot's icon_* fields
+// unmodified. Format is forced to R8G8B8A8_UNORM_SRGB so the icon is
+// gamma-correct when sampled by the chrome shader.
+bool
+load_icon_png(shell_chrome *sc, chrome_slot &slot, const char *png_path)
+{
+	if (sc == nullptr || png_path == nullptr || png_path[0] == '\0') {
+		return false;
+	}
+	int w = 0, h = 0, n = 0;
+	stbi_uc *pixels = stbi_load(png_path, &w, &h, &n, 4);
+	if (pixels == nullptr) {
+		PE("shell_chrome: stbi_load failed for '%s': %s\n", png_path, stbi_failure_reason());
+		return false;
+	}
+	D3D11_TEXTURE2D_DESC td = {};
+	td.Width = (UINT)w;
+	td.Height = (UINT)h;
+	td.MipLevels = 1;
+	td.ArraySize = 1;
+	td.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+	td.SampleDesc.Count = 1;
+	td.Usage = D3D11_USAGE_IMMUTABLE;
+	td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+	D3D11_SUBRESOURCE_DATA sd = {};
+	sd.pSysMem = pixels;
+	sd.SysMemPitch = (UINT)(w * 4);
+	HRESULT hr = sc->device->CreateTexture2D(&td, &sd, slot.icon_texture.GetAddressOf());
+	stbi_image_free(pixels);
+	if (FAILED(hr)) {
+		PE("shell_chrome: CreateTexture2D(icon) failed for '%s': 0x%08lx\n", png_path, hr);
+		return false;
+	}
+	hr = sc->device->CreateShaderResourceView(slot.icon_texture.Get(), nullptr, slot.icon_srv.GetAddressOf());
+	if (FAILED(hr)) {
+		PE("shell_chrome: CreateShaderResourceView(icon) failed for '%s': 0x%08lx\n", png_path, hr);
+		slot.icon_texture.Reset();
+		return false;
+	}
 	return true;
 }
 
@@ -400,22 +585,34 @@ render_pill(shell_chrome *sc, chrome_slot &slot)
 	// steady state); fade_alpha=1 shows it fully (cursor over chrome).
 	cb->fade_alpha = slot.alpha;
 
-	// Frosted blue pill bg.
-	cb->pill_color[0] = 0.20f; cb->pill_color[1] = 0.22f;
-	cb->pill_color[2] = 0.28f; cb->pill_color[3] = 0.70f;
+	// Glassy / frosted pill bg — light cool tint, mostly transparent so
+	// content shows through. Edge highlight (in the shader) gives the
+	// "frosted glass refraction" cue at the perimeter. Matches the
+	// concept-art direction (semi-transparent capsule, brighter rim).
+	cb->pill_color[0] = 0.78f; cb->pill_color[1] = 0.84f;
+	cb->pill_color[2] = 0.92f; cb->pill_color[3] = 0.22f;
 
-	// Close button — red, opaque.
-	cb->close_color[0] = 0.85f; cb->close_color[1] = 0.18f;
-	cb->close_color[2] = 0.20f; cb->close_color[3] = 1.00f;
+	// Close button — coral red, semi-transparent so the pill bg shows
+	// through and the white × glyph reads cleanly on top.
+	cb->close_color[0] = 0.92f; cb->close_color[1] = 0.32f;
+	cb->close_color[2] = 0.36f; cb->close_color[3] = 0.65f;
 
-	// Min/max buttons — neutral gray, opaque.
-	cb->btn_color[0] = 0.48f; cb->btn_color[1] = 0.50f;
-	cb->btn_color[2] = 0.54f; cb->btn_color[3] = 1.00f;
+	// Min/max buttons — light cool gray, semi-transparent.
+	cb->btn_color[0] = 0.78f; cb->btn_color[1] = 0.82f;
+	cb->btn_color[2] = 0.88f; cb->btn_color[3] = 0.45f;
 
-	// Grip dots — light gray, slightly translucent so they sit naturally
-	// on the frosted bg.
-	cb->dot_color[0] = 0.80f; cb->dot_color[1] = 0.82f;
-	cb->dot_color[2] = 0.85f; cb->dot_color[3] = 0.85f;
+	// Grip dots — bright white tint, low opacity so the cluster reads as
+	// a subtle drag affordance not a bold visual block.
+	cb->dot_color[0] = 0.95f; cb->dot_color[1] = 0.97f;
+	cb->dot_color[2] = 1.00f; cb->dot_color[3] = 0.55f;
+
+	// App icon: visible at the left of the pill. Square half-extent ≈
+	// 70% of pill half-height (mirroring the visible button radius after
+	// the BTN_INSET_FRAC inset). Skipped when no icon was resolvable.
+	cb->has_icon = (slot.icon_srv != nullptr) ? 1.0f : 0.0f;
+	cb->icon_size_m = pill_h_m * 0.5f * (1.0f - 2.0f * BTN_INSET_FRAC);
+	cb->_pad1[0] = 0.0f;
+	cb->_pad1[1] = 0.0f;
 
 	sc->context->Unmap(sc->cb_pill.Get(), 0);
 
@@ -448,6 +645,14 @@ render_pill(shell_chrome *sc, chrome_slot &slot)
 	sc->context->VSSetConstantBuffers(0, 1, sc->cb_pill.GetAddressOf());
 	sc->context->PSSetConstantBuffers(0, 1, sc->cb_pill.GetAddressOf());
 
+	// Bind the icon SRV at register t0 (pill shader samples it iff
+	// has_icon = 1) and a linear-clamp sampler at s0. When has_icon = 0
+	// we still bind a NULL SRV so the previous slot's icon doesn't leak
+	// across draws.
+	ID3D11ShaderResourceView *icon_srv = slot.icon_srv ? slot.icon_srv.Get() : nullptr;
+	sc->context->PSSetShaderResources(0, 1, &icon_srv);
+	sc->context->PSSetSamplers(0, 1, sc->icon_sampler.GetAddressOf());
+
 	sc->context->Draw(4, 0);
 
 	// Flush so the GPU work is submitted before xrReleaseSwapchainImage
@@ -472,7 +677,14 @@ push_layout(shell_chrome *sc, chrome_slot &slot)
 	const float pill_w_m = slot.win_w_m * PILL_W_FRAC;
 	const float pill_h_m = PILL_HEIGHT_M;
 	const float gap_m    = pill_h_m * PILL_GAP_FRAC;
-	const float pill_cy  = (slot.win_h_m * 0.5f) + gap_m + (pill_h_m * 0.5f);
+	// spec_version 8: with anchorToWindowTopEdge = XR_TRUE, position.y is
+	// interpreted as the offset ABOVE the window's TOP edge — not from
+	// window center. The runtime auto-recomputes effective position each
+	// frame from the current window height, so the chrome stays glued to
+	// the top edge during a resize without the controller having to
+	// re-push layout (which lagged one frame behind the runtime). The
+	// offset (gap + pill_h/2) is invariant to win_h_m.
+	const float pill_offset_above_top = gap_m + (pill_h_m * 0.5f);
 
 	// Per-button slot in chrome-UV: each slot is UI_BTN_W_M wide. Mirrors
 	// the shader's pill-space layout (close on right, then min, then max).
@@ -517,14 +729,19 @@ push_layout(shell_chrome *sc, chrome_slot &slot)
 	layout.poseInClient.orientation.z = 0.0f;
 	layout.poseInClient.orientation.w = 1.0f;
 	layout.poseInClient.position.x = 0.0f;
-	layout.poseInClient.position.y = pill_cy;
+	layout.poseInClient.position.y = pill_offset_above_top;
 	layout.poseInClient.position.z = 0.0f;
+	// sizeMeters.width is ignored when widthAsFractionOfWindow > 0 (the
+	// runtime auto-scales to win_w * fraction every frame). Set both
+	// anyway in case some path falls back to absolute width.
 	layout.sizeMeters.width = pill_w_m;
 	layout.sizeMeters.height = pill_h_m;
 	layout.followsWindowOrient = XR_TRUE;
 	layout.hitRegionCount = 4;
 	layout.hitRegions = regions;
 	layout.depthBiasMeters = 0.0f; // 0 = use runtime default
+	layout.anchorToWindowTopEdge = XR_TRUE;
+	layout.widthAsFractionOfWindow = PILL_W_FRAC;
 
 	XrResult r = sc->xr->set_chrome_layout(sc->xr->session, slot.id, &layout);
 	if (XR_FAILED(r)) {
@@ -649,7 +866,8 @@ extern "C" bool
 shell_chrome_on_client_connected(struct shell_chrome *sc,
                                  XrWorkspaceClientId id,
                                  float win_w_m,
-                                 float win_h_m)
+                                 float win_h_m,
+                                 const char *icon_png_path)
 {
 	if (sc == nullptr || id == XR_NULL_WORKSPACE_CLIENT_ID) {
 		return false;
@@ -707,6 +925,13 @@ shell_chrome_on_client_connected(struct shell_chrome *sc,
 		return false;
 	}
 
+	// Phase 2.C C3.C-3a: load app icon BEFORE first render so it's part
+	// of the initial pill image. Best-effort — apps without an icon path
+	// (test apps, unregistered apps) just render iconless pills.
+	if (icon_png_path != nullptr && icon_png_path[0] != '\0') {
+		(void)load_icon_png(sc, slot, icon_png_path);
+	}
+
 	if (!acquire_render_release(sc, slot)) {
 		release_slot_resources(slot, sc);
 		return false;
@@ -716,8 +941,9 @@ shell_chrome_on_client_connected(struct shell_chrome *sc,
 	sc->slots.push_back(std::move(slot));
 	push_layout(sc, sc->slots.back());
 
-	P("shell_chrome: chrome ready for client %u (window %.3f×%.3f m, pill %.3f×%.3f m)\n",
-	  id, win_w_m, win_h_m, win_w_m * PILL_W_FRAC, PILL_HEIGHT_M);
+	P("shell_chrome: chrome ready for client %u (window %.3f×%.3f m, pill %.3f×%.3f m, icon=%s)\n",
+	  id, win_w_m, win_h_m, win_w_m * PILL_W_FRAC, PILL_HEIGHT_M,
+	  (icon_png_path && icon_png_path[0]) ? icon_png_path : "(none)");
 	return true;
 }
 
@@ -750,9 +976,34 @@ shell_chrome_on_window_resized(struct shell_chrome *sc,
 	if (slot == nullptr) {
 		return;
 	}
+	const float kEps = 1e-5f;
+	bool size_changed =
+	    fabsf(slot->win_w_m - win_w_m) > kEps ||
+	    fabsf(slot->win_h_m - win_h_m) > kEps;
+	if (!size_changed) {
+		return;
+	}
 	slot->win_w_m = win_w_m;
 	slot->win_h_m = win_h_m;
-	push_layout(sc, *slot);
+
+	// spec_version 8 win: the layout was pushed once at chrome-create with
+	// anchorToWindowTopEdge=true and widthAsFractionOfWindow=PILL_W_FRAC,
+	// so the runtime auto-tracks the window edge every frame using the
+	// CURRENT window dims. NO push_layout is needed here — that call was
+	// the source of the visible resize lag (controller's pose was based
+	// on stale win_h, runtime composited the result one frame behind).
+	// The only deferred work is the chrome IMAGE re-render: the pill
+	// shape (rounded SDF + button glyphs) is rasterized in pill-space
+	// meters, and a width change scales pill_w_m which scales the SDF.
+	// We let that re-render happen at burst end so the rounded ends and
+	// dot/button positions snap to crisp final geometry.
+	//
+	// 100 ms debounce balances "snap quickly after release" (≤ 1 perceived
+	// frame at 60 Hz feels instant) against re-rendering during a long
+	// drag. Shorter would re-render more often during resize; longer
+	// leaves the pill visibly distorted for longer after release.
+	constexpr uint64_t RESIZE_DEBOUNCE_NS = 100ULL * 1000000ULL;
+	slot->resize_pending_until_ns = shell_chrome_now_ns() + RESIZE_DEBOUNCE_NS;
 }
 
 extern "C" bool
@@ -840,6 +1091,7 @@ shell_chrome_set_hover(struct shell_chrome *sc, XrWorkspaceClientId hover_id)
 	if (sc == nullptr) {
 		return;
 	}
+	sc->current_hover_id = hover_id;
 	for (auto &s : sc->slots) {
 		float target = (s.id == hover_id) ? 1.0f : 0.0f;
 		uint64_t dur = (s.id == hover_id) ? FADE_IN_NS : FADE_OUT_NS;
@@ -853,7 +1105,19 @@ shell_chrome_tick(struct shell_chrome *sc)
 	if (sc == nullptr) {
 		return;
 	}
+	uint64_t now = shell_chrome_now_ns();
 	for (auto &s : sc->slots) {
+		// Phase 2.C C5 follow-up: detect resize-end. resize_pending_until_ns
+		// is set on every WINDOW_POSE_CHANGED to (now + 250 ms); when the
+		// burst stops, re-render the image once at the final dims so the
+		// rounded ends + grip dots + buttons + icon snap to crisp
+		// geometry (during the burst they were sampled from an image
+		// rendered at the burst-start aspect). Layout was kept in sync
+		// per event; only the image bake was deferred.
+		if (s.resize_pending_until_ns != 0 && now >= s.resize_pending_until_ns) {
+			s.resize_pending_until_ns = 0;
+			rerender_only(sc, s); // bake new pill geometry at final aspect
+		}
 		if (tick_fade(s)) {
 			rerender_only(sc, s);
 		}
@@ -868,6 +1132,12 @@ shell_chrome_is_animating(struct shell_chrome *sc)
 	}
 	for (auto &s : sc->slots) {
 		if (s.fade_duration_ns != 0) {
+			return true;
+		}
+		// Resize-pending counts as "animating" so the main loop keeps
+		// the 16 ms tick cadence and shell_chrome_tick fires in time
+		// to detect the debounce expiry.
+		if (s.resize_pending_until_ns != 0) {
 			return true;
 		}
 	}
