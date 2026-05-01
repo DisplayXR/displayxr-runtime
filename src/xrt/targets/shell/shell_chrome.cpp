@@ -48,6 +48,10 @@ namespace {
 constexpr float PILL_W_FRAC      = 0.75f;   // pill width as a fraction of window width
 constexpr float PILL_HEIGHT_M    = 0.008f;  // 8 mm tall — UI_TITLE_BAR_H_M default
 constexpr float PILL_GAP_FRAC    = 0.5f;    // gap above content = pill height * gap_frac
+constexpr float UI_BTN_W_M       = 0.008f;  // per-button slot width — matches runtime UI_BTN_W_M
+constexpr float DOT_SIZE_M       = 0.001f;  // grip-dot diameter (1 mm)
+constexpr float DOT_GAP_M        = 0.001f;  // grip-dot spacing (1 mm)
+constexpr float BTN_INSET_FRAC   = 0.18f;   // visible-circle inset within button slot
 constexpr uint32_t CHROME_TEX_W  = 512;     // 512×64 sRGB image for the pill
 constexpr uint32_t CHROME_TEX_H  = 64;
 
@@ -71,14 +75,32 @@ struct chrome_slot
 
 // Constant buffer for the rounded-pill shader. Layout matches the HLSL cbuffer
 // at register b0. Sized to a multiple of 16 bytes for D3D11.
+//
+// All sizes/positions are in PILL-SPACE METERS so the SDFs stay correct
+// regardless of how the chrome image gets stretched onto the pill quad
+// at composite time.
 struct PillCB
 {
-	float pill_size_m[2];     // pill width/height in METERS (used as SDF space)
-	float corner_radius_m;    // corner radius in METERS (full pill = pill_h_m * 0.5)
+	// Register 0: pill geometry
+	float pill_size_m[2];     // pill width/height in METERS
+	float corner_radius_m;    // pill corner radius in METERS (full pill = pill_h_m * 0.5)
+	float btn_inset_frac;     // button visible-circle inset, 0.18 in the runtime
+
+	// Register 1: button + grip-dot geometry
+	float btn_width_m;        // per-button slot width (UI_BTN_W_M = 0.008)
+	float dot_size_m;         // grip-dot diameter (0.001)
+	float dot_gap_m;          // grip-dot spacing (0.001)
 	float _pad0;
-	float fill_color[4];      // straight RGBA — alpha is the base pill opacity
+
+	// Register 2-5: colors (alpha = base opacity; modulated for hover/fade
+	// in C3.C-4). Pill bg = frosted blue, close = red, btn = gray, dot = light gray.
+	float pill_color[4];
+	float close_color[4];
+	float btn_color[4];
+	float dot_color[4];
 };
 static_assert(sizeof(PillCB) % 16 == 0, "PillCB must be 16-byte aligned");
+static_assert(sizeof(PillCB) == 96, "PillCB layout drift");
 
 struct shell_chrome
 {
@@ -138,12 +160,11 @@ release_slot_resources(chrome_slot &slot, shell_chrome *sc)
 	slot.texture.Reset();
 }
 
-// SDF-based rounded-pill HLSL. Vertex shader emits a unit quad from
-// SV_VertexID (4-vertex triangle strip). Pixel shader rasterizes the
-// rounded rectangle in PILL-SPACE METERS (passed via cbuffer) so the
-// corner ends are circular regardless of how the chrome image is
-// stretched onto the pill quad. fwidth() gives derivative-based 1-pixel
-// AA at whatever the actual rasterization scale is.
+// SDF-based pill chrome HLSL. Renders pill bg + 8-dot grip handle + 3
+// circular buttons (close/min/max) into a single shader pass. All shape
+// math is done in PILL-SPACE METERS (cbuffer-supplied) so corners stay
+// circular regardless of image-to-quad stretch. Coverage is derived
+// per-pixel via fwidth() so AA matches actual rasterization scale.
 const char *PILL_SHADER_HLSL = R"(
 struct VSOut
 {
@@ -163,26 +184,99 @@ VSOut VS(uint vid : SV_VertexID)
 
 cbuffer PillCB : register(b0)
 {
-    float2 pill_size_m;     // pill width/height in METERS
-    float  corner_radius_m; // corner radius in METERS
+    float2 pill_size_m;
+    float  corner_radius_m;
+    float  btn_inset_frac;
+
+    float  btn_width_m;
+    float  dot_size_m;
+    float  dot_gap_m;
     float  _pad0;
-    float4 fill_color;      // straight RGBA
+
+    float4 pill_color;
+    float4 close_color;
+    float4 btn_color;
+    float4 dot_color;
 };
+
+// Signed distance to a rounded rectangle centered at origin with half-extents
+// `b` (full width/height = 2b) and corner radius `r`.
+float sdRoundedBox(float2 p, float2 b, float r)
+{
+    float2 d = abs(p) - (b - r);
+    return length(max(d, 0.0)) + min(max(d.x, d.y), 0.0) - r;
+}
+
+float sdCircle(float2 p, float r)
+{
+    return length(p) - r;
+}
+
+// Standard "src over dst" Porter-Duff: composite `src` on top of `dst`.
+// Both inputs use straight (non-premultiplied) alpha; output is straight too.
+float4 over(float4 src, float4 dst)
+{
+    float a = src.a + dst.a * (1.0 - src.a);
+    if (a <= 1e-6) return float4(0, 0, 0, 0);
+    float3 c = (src.rgb * src.a + dst.rgb * dst.a * (1.0 - src.a)) / a;
+    return float4(c, a);
+}
+
+// Convert an SDF distance into a coverage value (1 inside, 0 outside, smooth
+// 1-pixel transition at the boundary). `aa` is the derivative-based pixel
+// width measured in the same units as `dist`.
+float cov(float dist, float aa)
+{
+    return saturate(0.5 - dist / max(aa, 1e-6));
+}
 
 float4 PS(VSOut input) : SV_Target
 {
-    // Map UV to pill-space meters so the SDF is correct under arbitrary
-    // image-to-quad stretch.
-    float2 p = input.uv * pill_size_m;
+    float2 p = input.uv * pill_size_m;          // pill-space meters
     float2 center = pill_size_m * 0.5;
-    float2 half_dim = pill_size_m * 0.5 - corner_radius_m;
-    float2 d = abs(p - center) - half_dim;
-    float dist = length(max(d, 0.0)) + min(max(d.x, d.y), 0.0) - corner_radius_m;
 
-    // Derivative-based 1-pixel AA at the actual rasterization density.
-    float aa = max(fwidth(dist), 1e-6);
-    float coverage = saturate(0.5 - dist / aa);
-    return float4(fill_color.rgb, fill_color.a * coverage);
+    // Per-shape SDFs (all in pill-space meters).
+    float pill_dist = sdRoundedBox(p - center, pill_size_m * 0.5, corner_radius_m);
+
+    // Buttons: 3 circles inset within their UI_BTN_W_M slot at the right edge.
+    // Visible radius = (slot/2) * (1 - 2*inset).
+    float btn_r_m = (btn_width_m * 0.5) * (1.0 - 2.0 * btn_inset_frac);
+    float btn_y   = pill_size_m.y * 0.5;
+    float close_dist = sdCircle(p - float2(pill_size_m.x - btn_width_m * 0.5, btn_y), btn_r_m);
+    float min_dist   = sdCircle(p - float2(pill_size_m.x - btn_width_m * 1.5, btn_y), btn_r_m);
+    float max_dist   = sdCircle(p - float2(pill_size_m.x - btn_width_m * 2.5, btn_y), btn_r_m);
+
+    // Grip dots: 4×2 grid centered in the pill, dots are circles of dot_size/2.
+    float dot_r_m = dot_size_m * 0.5;
+    float grid_w  = 4.0 * dot_size_m + 3.0 * dot_gap_m;
+    float grid_h  = 2.0 * dot_size_m + 1.0 * dot_gap_m;
+    float2 grid_origin = center - float2(grid_w * 0.5, grid_h * 0.5);
+    float dot_dist = 1e6;
+    [unroll] for (int gr = 0; gr < 2; gr++) {
+        [unroll] for (int gc = 0; gc < 4; gc++) {
+            float2 dc = grid_origin + float2(
+                (float)gc * (dot_size_m + dot_gap_m) + dot_size_m * 0.5,
+                (float)gr * (dot_size_m + dot_gap_m) + dot_size_m * 0.5);
+            dot_dist = min(dot_dist, sdCircle(p - dc, dot_r_m));
+        }
+    }
+
+    // Per-shape AA scale — fwidth on each so each shape's edge gets 1-pixel
+    // smoothing at its own scale (small shapes share the same image-space
+    // pixel grid so they all give the same fwidth value, but keep the calls
+    // explicit for clarity).
+    float aa_pill  = fwidth(pill_dist);
+    float aa_btn   = fwidth(close_dist);
+    float aa_dot   = fwidth(dot_dist);
+
+    // Compose back-to-front: pill bg, then dots, then buttons.
+    float4 result = float4(0, 0, 0, 0);
+    result = over(float4(pill_color.rgb,  pill_color.a  * cov(pill_dist,  aa_pill)), result);
+    result = over(float4(dot_color.rgb,   dot_color.a   * cov(dot_dist,   aa_dot)),  result);
+    result = over(float4(btn_color.rgb,   btn_color.a   * cov(max_dist,   aa_btn)),  result);
+    result = over(float4(btn_color.rgb,   btn_color.a   * cov(min_dist,   aa_btn)),  result);
+    result = over(float4(close_color.rgb, close_color.a * cov(close_dist, aa_btn)),  result);
+    return result;
 }
 )";
 
@@ -264,10 +358,9 @@ render_pill(shell_chrome *sc, chrome_slot &slot)
 		return;
 	}
 
-	// Frosted-blue pill — matches the in-runtime chrome's color so the
-	// controller-rendered version is visually consistent at the C3.C-1
-	// checkpoint. Alpha 0.7 = semi-transparent so workspace content shows
-	// through the pill.
+	// Match the in-runtime chrome geometry + colors so C3.C-2 lands at
+	// visual parity. Hover state and per-button color modulation arrive
+	// in C3.C-4 — for now buttons are static (no hover).
 	const float pill_w_m = slot.win_w_m * PILL_W_FRAC;
 	const float pill_h_m = PILL_HEIGHT_M;
 	const float corner_r = pill_h_m * 0.5f; // full pill — half-circle ends
@@ -280,11 +373,30 @@ render_pill(shell_chrome *sc, chrome_slot &slot)
 	cb->pill_size_m[0] = pill_w_m;
 	cb->pill_size_m[1] = pill_h_m;
 	cb->corner_radius_m = corner_r;
+	cb->btn_inset_frac = BTN_INSET_FRAC;
+
+	cb->btn_width_m = UI_BTN_W_M;
+	cb->dot_size_m = DOT_SIZE_M;
+	cb->dot_gap_m  = DOT_GAP_M;
 	cb->_pad0 = 0.0f;
-	cb->fill_color[0] = 0.20f;
-	cb->fill_color[1] = 0.22f;
-	cb->fill_color[2] = 0.28f;
-	cb->fill_color[3] = 0.70f;
+
+	// Frosted blue pill bg.
+	cb->pill_color[0] = 0.20f; cb->pill_color[1] = 0.22f;
+	cb->pill_color[2] = 0.28f; cb->pill_color[3] = 0.70f;
+
+	// Close button — red, opaque.
+	cb->close_color[0] = 0.85f; cb->close_color[1] = 0.18f;
+	cb->close_color[2] = 0.20f; cb->close_color[3] = 1.00f;
+
+	// Min/max buttons — neutral gray, opaque.
+	cb->btn_color[0] = 0.48f; cb->btn_color[1] = 0.50f;
+	cb->btn_color[2] = 0.54f; cb->btn_color[3] = 1.00f;
+
+	// Grip dots — light gray, slightly translucent so they sit naturally
+	// on the frosted bg.
+	cb->dot_color[0] = 0.80f; cb->dot_color[1] = 0.82f;
+	cb->dot_color[2] = 0.85f; cb->dot_color[3] = 0.85f;
+
 	sc->context->Unmap(sc->cb_pill.Get(), 0);
 
 	// Clear to fully transparent so the SDF coverage outside the pill
