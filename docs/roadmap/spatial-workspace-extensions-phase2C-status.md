@@ -1,7 +1,7 @@
 # Phase 2.C Status: Controller-Owned Chrome
 
 **Branch:** `feature/workspace-extensions-2C` (off `feature/workspace-extensions-2K` tip)
-**Status:** C1, C2, C3.A, C3.B (visual fixed), C3.C-1 (rounded pill bg), C3.C-2 (grip dots + 3 buttons), C4 (chrome hit-test plumbing — `chromeRegionId` on POINTER events; shell dispatches close/max), C3.C-4 (hover-fade — per-slot fade alpha, ease-out cubic, re-render-on-state-change) committed. Next: C5 (delete in-runtime chrome render block) → C3.C-3 (icons + glyphs, deferred polish) → C6 (docs).
+**Status:** C1, C2, C3.A, C3.B (visual fixed), C3.C-1, C3.C-2, C4, C3.C-4, C5 committed. Runtime now ships with **zero default chrome** — controller-owned chrome is the only chrome path. Remaining: C3.C-3 (icons + glyphs, deferred polish) → C6 (docs in progress; test app smoke deferred).
 **Date:** 2026-05-01
 
 ## Scope
@@ -25,9 +25,9 @@ Lift the floating-pill chrome (pill bg, grip dots, close/min/max buttons, app ic
 | [x] | C3.C-2 | Grip dots (4×2) + 3 circular buttons (red close, gray min, gray max) in same SDF pass |
 | [x] | C4 | Hit-test plumbing — chrome quad raycast, `chromeRegionId` on POINTER / POINTER_MOTION events; shell dispatches close → exit RPC, max → fullscreen RPC |
 | [x] | C3.C-4 | Hover-fade ease-out cubic + state-change re-render — per-slot fade alpha baked into chrome image, 150 ms hover-in / 300 ms hover-out, idle = zero GPU work |
-| [ ] | C5 | Delete in-runtime chrome render block, hit-test fields, fade machinery (**next**) |
+| [x] | C5 | Delete in-runtime chrome render block, focus-rim glow, fade machinery (~700 lines net deletion). Runtime ships with zero default chrome. |
 | [ ] | C3.C-3 | App icon (per-client PNG load + texture) + DirectWrite glyph atlas — **deferred polish** |
-| [ ] | C6 | Test app smoke + spec/audit docs |
+| [~] | C6 | Spec + separation-of-concerns + audit + plan docs (in progress); test app smoke deferred |
 
 ## Commits
 
@@ -42,6 +42,7 @@ Lift the floating-pill chrome (pill bg, grip dots, close/min/max buttons, app ic
 - `722fbcd7e` runtime + shell: Phase 2.C C4 — chrome hit-test plumbing
 - `3264496bf` shell: Phase 2.C C3.C-4 — chrome hover-fade + state-change re-render
 - `522db1ad5` runtime + shell: Phase 2.C C3.C-4 follow-up — POINTER_HOVER + RMB pitch fix
+- `0160c1567` runtime: Phase 2.C C5 — delete in-runtime chrome render block
 
 ## Design Decisions
 

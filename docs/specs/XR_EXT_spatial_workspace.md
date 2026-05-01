@@ -20,7 +20,7 @@ A spatial workspace is the OS-level shell for a 3D display: the privileged proce
 
 ---
 
-## 2. Surface (spec_version 6)
+## 2. Surface (spec_version 7)
 
 ### Lifecycle
 
@@ -74,6 +74,22 @@ A spatial workspace is the OS-level shell for a 3D display: the privileged proce
 - `xrEnumerateWorkspaceClientsEXT(session, capacity, &countOutput, clientIds)` — two-call enumerate of OpenXR clients connected to the workspace.
 - `xrGetWorkspaceClientInfoEXT(session, clientId, &info)` — per-client metadata (name, PID, focus state, visibility, z-order).
 
+### Controller-owned chrome *(spec_version 7)*
+
+The runtime ships with **zero default chrome**. If a controller wants chrome (title bars, buttons, grip handles, focus glow) around its workspace clients, it submits a per-client chrome image as an OpenXR swapchain and tells the runtime where to composite it.
+
+- `xrCreateWorkspaceClientChromeSwapchainEXT(session, clientId, &createInfo, &outSwapchain)` — mint a cross-process-shareable image-loop swapchain (D3D11 SHARED_NTHANDLE + KEYEDMUTEX texture; one image; controller-chosen format/size). The returned `XrSwapchain` is a regular OpenXR swapchain — `xrAcquireSwapchainImage` / `xrWaitSwapchainImage` / `xrReleaseSwapchainImage` work as normal. The runtime side-table records this swapchain as "chrome" for the named client.
+- `xrSetWorkspaceClientChromeLayoutEXT(session, clientId, &layout)` — attach a chrome quad to the client's window. The layout carries `poseInClient` (chrome pose relative to the window), `sizeMeters` (quad dimensions), `followsWindowOrient` (rotate with window?), `depthBiasMeters` (bias toward the eye; 0 = runtime default 1 mm), and an inline array of up to 8 `XrWorkspaceChromeHitRegionEXT` entries. Each region carries a controller-defined `id` and a UV-space rect — when the cursor hits inside one, the runtime echoes the matched id back as `chromeRegionId` on POINTER / POINTER_MOTION events.
+- `xrDestroyWorkspaceClientChromeSwapchainEXT(swapchain)` — tear down the chrome swapchain. The runtime drops the side-table entry and unlinks the slot.
+
+**Authoring loop.** Once per state change (hover toggle, focus change, button-hover, layout switch), the controller calls `xrAcquireSwapchainImage` → `xrWaitSwapchainImage` → renders into image[0] → `xrReleaseSwapchainImage`. The runtime composites the latest image at the layout's pose every frame; idle = zero CPU, zero GPU, zero IPC.
+
+**Hit-region semantics.** `chromeRegionId` is opaque to the runtime — the controller decides what each id means (1 = grip, 2 = close, 3 = minimize, 4 = maximize, etc.). Region 0 is reserved as `XR_NULL_WORKSPACE_CHROME_REGION_ID` (no region matched / no hit).
+
+**Hover events.** `XR_WORKSPACE_INPUT_EVENT_POINTER_HOVER_EXT` fires whenever the runtime's per-frame raycast detects a hovered-slot transition (cursor enter / leave a window). Works in all layout modes, regardless of pointer-capture state — controllers use this as the trigger for chrome fade-in / fade-out animations.
+
+**New hit-region enum value.** `XR_WORKSPACE_HIT_REGION_CHROME_EXT = 6` indicates the cursor hit a controller-submitted chrome quad. (Legacy `CLOSE_BUTTON / MINIMIZE_BUTTON / MAXIMIZE_BUTTON / TITLE_BAR` enum values remain in the header for spec_version ≤ 6 controllers; the runtime still emits them for backwards compatibility while the in-runtime hit-test fields exist.)
+
 ---
 
 ## 3. Design notes
@@ -92,6 +108,10 @@ A spatial workspace is the OS-level shell for a 3D display: the privileged proce
 
 **Wire-format compatibility.** Spec_version 6 strictly extends spec_version 5 by adding new enum values and new event-union members; old controllers that don't know the new variants see them as "unknown" and skip them via the existing `default:` case in their drain switch. The two new request PFNs are additive — controllers that don't resolve them are unaffected.
 
+**Spec_version 7 adds controller-owned chrome.** Three new function PFNs (`xrCreate/Destroy/SetWorkspaceClientChrome*EXT`), three new structs (`XrWorkspaceChromeSwapchainCreateInfoEXT`, `XrWorkspaceChromeLayoutEXT`, `XrWorkspaceChromeHitRegionEXT`), one new enum value (`XR_WORKSPACE_HIT_REGION_CHROME_EXT`), one new field (`chromeRegionId`) on POINTER + POINTER_MOTION event payloads, and a no-longer-reserved POINTER_HOVER event. The runtime ships with **zero default chrome**: spec_version 6 controllers that don't know about chrome swapchains see clients as bare content quads. Migrating from 6 → 7 is opt-in — controllers that want chrome submit it via the new APIs.
+
+**Architectural endpoint.** Per the architectural North Star (`feedback_controllers_own_motion`), the runtime owns mechanism, the controller owns policy + appearance. After spec_version 7, this principle holds for chrome too: the runtime owns the cross-process texture-share mechanism, the depth-pipeline composite, and the hit-test plumbing; the controller owns every pixel of chrome appearance, every region's hit-region geometry, and every animation curve.
+
 ---
 
 ## 4. Implementation
@@ -101,8 +121,9 @@ The extension is implemented in this repository:
 - **Header**: `src/external/openxr_includes/openxr/XR_EXT_spatial_workspace.h` (frozen for the runtime ABI, auto-published to `DisplayXR/displayxr-extensions` on each push to main).
 - **State tracker**: `src/xrt/state_trackers/oxr/oxr_workspace.c` (dispatch wrappers); `src/xrt/state_trackers/oxr/oxr_api_negotiate.c` (PFN entries).
 - **IPC**: `src/xrt/ipc/shared/proto.json` (RPC definitions); `src/xrt/ipc/shared/ipc_protocol.h` (event wire format); `src/xrt/ipc/client/ipc_client_compositor.c` (bridge); `src/xrt/ipc/server/ipc_server_handler.c` (server handlers).
-- **Service compositor (Windows D3D11)**: `src/xrt/compositor/d3d11_service/comp_d3d11_service.cpp` (drain, hit-test enrichment, FRAME_TICK + FOCUS_CHANGED emission, request_*_by_slot helpers); `src/xrt/compositor/d3d11/comp_d3d11_window.cpp` (WndProc, public ring, Win32 SetCapture / ReleaseCapture).
-- **Reference controller**: `src/xrt/targets/shell/main.c` (animation framework, smooth preset transitions, interactive carousel state machine, variable poll cadence).
-- **Smoke test**: `test_apps/workspace_minimal_d3d11_win/main.cpp` — resolves all 24 PFNs, walks lifecycle + pose + visibility + hit-test + focus + drain + pointer capture + 30° yaw orientation + drain counts + lifecycle requests + client enumeration + frame capture.
+- **Service compositor (Windows D3D11)**: `src/xrt/compositor/d3d11_service/comp_d3d11_service.cpp` (drain, hit-test enrichment, FRAME_TICK + FOCUS_CHANGED + POINTER_HOVER emission, controller-chrome composite, chrome quad raycast, chromeRegionId resolution, request_*_by_slot helpers); `src/xrt/compositor/d3d11/comp_d3d11_window.cpp` (WndProc, public ring, Win32 SetCapture / ReleaseCapture).
+- **Reference controller (chrome appearance)**: `src/xrt/targets/shell/shell_chrome.cpp` — owns the rounded-pill SDF shader, grip dots + close/min/max button geometry, hover-fade ease-out cubic, per-state re-render. Reads cursor-over-chrome via POINTER_HOVER events; dispatches close → exit RPC, max → fullscreen RPC.
+- **Reference controller (lifecycle)**: `src/xrt/targets/shell/main.c` (animation framework, smooth preset transitions, interactive carousel state machine, variable poll cadence, chrome lifecycle wiring).
+- **Smoke test**: `test_apps/workspace_minimal_d3d11_win/main.cpp` — resolves all PFNs, walks lifecycle + pose + visibility + hit-test + focus + drain + pointer capture + 30° yaw orientation + drain counts + lifecycle requests + client enumeration + frame capture. Chrome-swapchain smoke is a follow-up addition.
 
 The Phase 2 sub-phase that landed each part of this surface is tracked in [`docs/roadmap/spatial-workspace-extensions-phase2-audit.md`](../roadmap/spatial-workspace-extensions-phase2-audit.md).

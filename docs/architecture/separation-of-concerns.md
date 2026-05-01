@@ -1,7 +1,7 @@
 ---
 status: Active
 owner: David Fattal
-updated: 2026-03-15
+updated: 2026-05-01
 ---
 # Separation of Concerns: App → OXR → Compositor → Driver/DP
 
@@ -77,6 +77,17 @@ Implementations live in `src/xrt/drivers/` (vendor-specific) or `src/xrt/composi
 ## Vendor Isolation Rule
 
 > A new vendor integrates by adding files **only** under `src/xrt/drivers/<vendor>/` and `src/xrt/targets/common/`. Zero changes to compositor or state tracker code.
+
+## Workspace Controller / Runtime Boundary
+
+The spatial-workspace surface (`XR_EXT_spatial_workspace`, spec_version 7) splits responsibility between the runtime and a separate **workspace controller** process (the DisplayXR Shell is the reference implementation):
+
+- **Runtime owns mechanism**: cross-process texture sharing, atlas composition at controller-specified poses, depth pipeline, hit-test plumbing (chrome quad raycast → `chromeRegionId`), input-event drain, lifecycle dispatch (close / fullscreen RPCs).
+- **Controller owns policy + appearance**: every pixel of chrome (pill background, grip dots, buttons, icons, glyphs, focus glow), every region's hit-region geometry, every animation curve (hover-fade, slot-anim transitions, carousel rotation), every layout preset.
+
+After Phase 2.C the runtime ships with **zero default chrome**. Workspace clients render as bare content quads unless a controller submits a chrome swapchain via `xrCreateWorkspaceClientChromeSwapchainEXT`. This means controllers (third-party shells, accessibility overlays, OEM skins) can change chrome appearance, geometry, and behavior without forking the runtime.
+
+**Reference**: `feedback_controllers_own_motion` for the architectural North Star; `docs/specs/XR_EXT_spatial_workspace.md` for the surface; `src/xrt/targets/shell/shell_chrome.cpp` for the reference chrome implementation.
 
 ## Data Flow Examples
 

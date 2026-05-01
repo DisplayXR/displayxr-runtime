@@ -83,16 +83,22 @@ Below: the original 8 sub-steps, lowest-blast-radius first.
 
 **Risk:** Medium. The "empty workspace shows registered apps before any client connects" UX needs careful handling — runtime can render the tile grid while the workspace controller is connected even with zero app clients, but the controller can't push tiles before it itself connects, so there's a chicken-and-egg moment to handle. Open question: should the runtime cache the last-pushed registry across deactivate/activate cycles, or does the controller re-push on every activate? Recommend the latter (simpler runtime, controller already does this).
 
-### Phase 2.C — Title-bar chrome rendering
+### Phase 2.C — Controller-owned chrome ✅ shipped
 
-**Touches:** 5010-5037, 7473, plus the workspace-controller side (controller draws chrome into its own client window which the runtime composites).
+**Touched:** Public surface bumped 6 → 7 (3 new function PFNs, 3 new structs, 1 new enum value, 1 new event field, 1 reserved-→-emitted event). Runtime composite path extended with chrome-quad blit + keyed-mutex acquire on the read side. Hit-test extended to ray-cast chrome quads and stamp `chromeRegionId` on POINTER events. POINTER_HOVER emission added so controllers can detect cursor enter/leave on hovered slots regardless of pointer-capture state. Shell ports the floating-pill design (rounded SDF shader, grip dots, 3 buttons, hover-fade ease-out cubic, click → exit/fullscreen RPC dispatch). Final commit (C5) deletes the entire in-runtime chrome render block + focus-rim glow + fade machinery — ~700 lines net deletion in `comp_d3d11_service.cpp`. Runtime ships with **zero default chrome**.
 
-**Why third:** Most invasive. Today the runtime draws title bars over the app's atlas as a separate composite pass. Moving chrome to a workspace-rendered layer requires:
-- The workspace controller renders chrome (close button, app name) into one of its own swapchain images.
-- The runtime composites that swapchain alongside the app's, at a slightly higher Z (or as an overlay layer).
-- The runtime stops drawing title bars at all — the chrome-rendering code path deletes.
+**Decisions made during the migration:**
+- Chrome image is just a regular `XrSwapchain`. `xrAcquireSwapchainImage` / `xrWaitSwapchainImage` / `xrReleaseSwapchainImage` work as standard. The chrome swapchain is a SHARED_NTHANDLE + KEYEDMUTEX texture — controller writes via shell's D3D11 device, runtime reads via service's D3D11 device.
+- Runtime acquires the keyed mutex on the read side (`swapchain_wait_image` is a no-op for service-created swapchains; the runtime is the reader). Was the C3.B "visual not appearing" root cause — fixed by adding `IDXGIKeyedMutex::AcquireSync(0, 4ms)` around the chrome blit.
+- Chrome SDF rasterized in pill-space meters so corners stay round under arbitrary image-to-quad stretch. Single-pass shader composes pill bg + grip dots + 3 buttons via Porter-Duff "src over dst".
+- Hover signal: runtime emits `POINTER_HOVER` events on every per-frame raycast that detects a hovered-slot transition. Lets the shell drive its fade in grid/immersive modes where pointer capture is OFF and per-frame `MOTION` events don't flow.
+- Hover-fade animation lives controller-side. Shell re-renders chrome SRV at varying alpha during a tween (~30 Hz during fade, idle = 0 GPU work).
+- App icon + DirectWrite glyphs (the title text on each pill) deferred as polish to a follow-up session. Pill + dots + buttons + hover-fade is enough to demonstrate the architecture.
+- Focus-rim glow deleted with the chrome render block. Was rectangular (followed content quad's corners, not the rounded controller pill) — pre-existing polish item resolved by removal. Controllers can render their own focus glow as a separate chrome layer if needed.
+- Hit-test fields (`in_close_btn` / `in_minimize_btn` / `in_maximize_btn` / `in_grip_handle` / `in_title_bar`) on `workspace_hit_result` kept — runtime cursor + LMB/RMB drag handlers still consume them. Migrating those to `chromeRegionId` is a future cleanup.
+- RMB drag extracted pitch from the wrong euler component (Eigen Z-Y-X decomposition writes pitch to `.z`, not `.x`) — long-standing bug fixed in the C3.C-4 follow-up. First RMB-down no longer snaps accumulated pitch to 0.
 
-**Risk:** High. Affects the composite pipeline and the input pipeline (title-bar drag is a common case). Allocate a full sub-session.
+**Risk realized:** As predicted — high. Cross-process texture sharing surfaced a subtle keyed-mutex bug. Two-pill overlap during the additive period (C2 → C5) confused live testing until the fade signal was wired in C3.C-4 follow-up. Total: 11 commits across the sub-phase.
 
 ### Phase 2.D — Input routing (focus + raw event forwarding)
 
