@@ -1,7 +1,7 @@
 # Phase 2.C Status: Controller-Owned Chrome
 
 **Branch:** `feature/workspace-extensions-2C` (off `feature/workspace-extensions-2K` tip)
-**Status:** C1, C2, C3.A, C3.B committed. C3.B visual blocked on cross-process texture-sharing bug — controller's red verify color does not appear in the atlas despite the runtime composite path entering with a valid SRV. Pause for fresh eyes before C3.C.
+**Status:** C1, C2, C3.A, C3.B (visual fixed), C3.C-1 (rounded pill bg), C3.C-2 (grip dots + 3 buttons) committed. Next: C4 (hit-test plumbing) → C3.C-4 (hover-fade in shell) → C3.C-3 (icons + glyphs, deferred polish) → C5 (delete in-runtime chrome) → C6 (docs).
 **Date:** 2026-04-30
 
 ## Scope
@@ -19,10 +19,14 @@ Lift the floating-pill chrome (pill bg, grip dots, close/min/max buttons, app ic
 | [x] | C1 | Public surface bump 6→7 — header, IPC schema, dispatch stubs, shell PFN resolution |
 | [x] | C2 | Runtime imports + composites chrome swapchain (additive — old chrome still draws) |
 | [x] | C3.A | Shell adds D3D11 graphics binding so chrome swapchain create works |
-| [~] | C3.B | Controller-rendered chrome via swapchain — pipeline working, **visual not appearing** |
-| [ ] | C3.C | Port full pill visual — rounded shader, grip dots, buttons, icon, glyphs, focus rim, hover-fade |
-| [ ] | C4 | Hit-test plumbing — `chromeRegionId` on POINTER events; controller drives chrome region semantics |
-| [ ] | C5 | Delete in-runtime chrome render block + animation machinery |
+| [x] | C3.B | Controller-rendered chrome via swapchain (initial pipeline) |
+| [x] | C3.B-debug | Cross-process keyed-mutex acquire on read; src_rect=pixels; id=0 sentinel removal; D3D11 wrapper unwrap helper; shell Flush() after ClearRTV |
+| [x] | C3.C-1 | Rounded pill bg via SDF shader, pill-space-meters geometry, anim-target initial-layout fix |
+| [x] | C3.C-2 | Grip dots (4×2) + 3 circular buttons (red close, gray min, gray max) in same SDF pass |
+| [ ] | C4 | Hit-test plumbing — chrome quad raycast, `chromeRegionId` on POINTER / POINTER_MOTION events (**next**) |
+| [ ] | C3.C-4 | Hover-fade ease-out cubic + state-change re-render in shell (consumes `chromeRegionId`) |
+| [ ] | C3.C-3 | App icon (per-client PNG load + texture) + DirectWrite glyph atlas — **deferred as polish** |
+| [ ] | C5 | Delete in-runtime chrome render block, hit-test fields, fade machinery |
 | [ ] | C6 | Test app smoke + spec/audit docs |
 
 ## Commits
@@ -31,7 +35,10 @@ Lift the floating-pill chrome (pill bg, grip dots, close/min/max buttons, app ic
 - `b9f073195` runtime: Phase 2.C C2 — wire chrome swapchain composite path
 - `f24ac89d6` shell: Phase 2.C C3.A — D3D11 graphics binding for chrome rendering
 - `e2984065f` shell: Phase 2.C C3.B — controller-rendered chrome via swapchain
-- (uncommitted, debugging C3.B visual) — id=0 fix, src_rect=pixels fix, d3d11 unwrap helper, Flush() in shell, debug logging, red verify color
+- `3c09adcfb` runtime + shell: Phase 2.C C3.B-debug — chrome visual fix
+- `24187fa99` client D3D12: log adapter LUID + name at create — #184 diag
+- `6755dacfc` shell: Phase 2.C C3.C-1 — rounded-pill chrome shader + initial-layout fix
+- `1a68c81c5` shell: Phase 2.C C3.C-2 — grip dots + close/min/max buttons
 
 ## Design Decisions
 
@@ -41,31 +48,28 @@ Lift the floating-pill chrome (pill bg, grip dots, close/min/max buttons, app ic
 - **D3D11 wrapper unwrap.** `sc->swapchain` for a D3D11-binding session is a `client_d3d11_swapchain` wrapping an `ipc_client_swapchain`. Direct cast to `ipc_client_swapchain*` returns garbage. Added `comp_d3d11_client_get_inner_xrt_swapchain` to unwrap before reading the IPC id.
 - **`src_rect` is in source-texture pixels, not normalized.** Shader does `src_pos = src_rect.xy + uv * src_rect.zw; output.uv = src_pos / src_size`. C2's chrome blit set `src_rect = (0,0,1,1)`, sampling a 1-pixel corner of the 512×64 chrome image. Fixed.
 - **Per-tick chrome work skipped when slot already chromed.** `shell_chrome_has(id)` short-circuits the lazy retry loop in `main.c`, and `shell_chrome_on_client_connected` fast-paths existing slots (only re-pushes layout if window size changed). Slot-anim transitions stay smooth — no per-tick `get_pose` + `set_chrome_layout` IPC traffic competing with `set_pose`.
+- **Runtime acquires the keyed mutex when reading the chrome SRV.** Service-created swapchains' `swapchain_wait_image` is a no-op server-side; the runtime is the reader and must `IDXGIKeyedMutex::AcquireSync(0)` itself before `PSSetShaderResources` + `Draw`. Hoisted above the per-view loop — one acquire/release per composite tick. Without this, cross-process GPU writes from the shell's D3D11 device are not visible on the runtime's D3D11 device. Was the C3.B "visual not appearing" root cause.
+- **Pill SDF in pill-space meters.** Chrome image is fixed 512×64 px sRGB. The pill quad it composites onto can be any aspect (typical: 16:1). Rasterizing the SDF in pill-space meters (passed via cbuffer) keeps corners + button circles geometrically correct under arbitrary stretch. Single-pass shader composes pill bg, grip dots, and 3 buttons via Porter-Duff "src over" — back-to-front, straight-alpha.
+- **Anim-target dims for initial chrome layout.** When chrome is created in the lazy retry loop while a slot animation is still in flight (e.g. the auto grid preset just seeded but hasn't settled), `shell_slot_anim_get_target` returns the animation's destination dims. Without this the chrome locked in mid-glide / pre-preset dims and rendered at the wrong size for a different window. Closes the C3.B-debug position artifact.
 
-## Open Bug — C3.B Visual
+## Open issues
 
-**Symptom:** controller's `ClearRenderTargetView(rtv, verify_red)` (in `shell_chrome.cpp:render_pill`) does not appear in the atlas. The in-runtime chrome (still drawing until C5) is visible; the controller's red rectangle that should overlay it is not.
+- **C3.B-debug commit left a behavior change in the keyed-mutex AcquireSync timeout** (currently 4 ms). If the shell's GPU is slow to flush its writes, the runtime's acquire could time out and the chrome blit silently uses stale texture content. Worth instrumenting with a one-shot warn-log if the acquire ever fails. Not yet observed.
+- **In-runtime chrome still draws** (additive composite). The runtime currently renders BOTH the in-runtime pill AND the controller-submitted pill. The depth bias + draw order means the controller pill wins where it overlaps. C5 deletes the in-runtime path entirely. Until then, the visual atlas screenshot can show two slightly-different pills if positions don't match exactly.
 
-**Confirmed working from logs:**
-- `shell_chrome: chrome ready for client 2 (window 0.139×0.156 m, pill 0.104×0.008 m)` — swapchain created.
-- Server: `Workspace: register_chrome_swapchain client_id=2 swapchain_id=0 → slot=0` — registration succeeded.
-- Server: `chrome composite check slot=0: xsc=…550 layout_valid=1 type=0` — slot has chrome.
-- Server: `chrome composite slot=0 csc=…550 image_count=1 srv=…A28` — SRV is non-null, Draw is issued.
+## Next-step plan (session order)
 
-**Already tried:**
-- Fixed id=0 sentinel guards in dispatch + runtime.
-- Fixed `src_rect` to be in source-texture pixels.
-- Added `ID3D11DeviceContext::Flush()` after `ClearRTV` so GPU work is submitted before `xrReleaseSwapchainImage` signals the keyed mutex.
+**C4 — Hit-test plumbing** (additive). Extend `workspace_raycast_hit_test` to ray-cast each chromed slot's chrome quad in addition to its content quad. On chrome hit, populate `chrome_region_id` from `slot->chrome_layout.hitRegions[]` by UV bounds. Fill `chromeRegionId` on POINTER + POINTER_MOTION events in `workspace_drain_input_events`. **Keep the in-runtime chrome hit-test fields in place** — the runtime's existing cursor + drag logic still uses them while the in-runtime pill is drawing. C5 deletes them together with the in-runtime render block.
 
-**Hypotheses for next session:**
-1. **Cross-process texture sync.** The controller's writes via the shell's D3D11 device aren't visible on the runtime's D3D11 device despite SHARED_NTHANDLE + KEYEDMUTEX. Possible the keyed-mutex acquire/release dance during `xrWaitSwapchainImage` / `xrReleaseSwapchainImage` isn't completing the way the runtime expects.
-2. **Geometry / depth.** Chrome quad ends up outside the visible atlas region or is depth-tested out by the in-runtime chrome (which should NOT happen given LESS_EQUAL + same depth bias, but worth verifying).
-3. **In-runtime chrome paints over.** The runtime's existing chrome block runs BEFORE the new controller composite (line 7297 vs 7930), so this should not happen — but worth confirming with a hardcoded-color override.
+Shell side of C4: define region IDs (`SHELL_REGION_GRIP`, `SHELL_REGION_CLOSE`, `SHELL_REGION_MIN`, `SHELL_REGION_MAX`), populate `hitRegions[]` in the chrome layout, dispatch `chromeRegionId` from POINTER LMB events to the matching action (close → exit RPC, grip → start window-drag, etc.).
 
-**Bisect plan for next session:**
-- Override the runtime's chrome blit shader to ignore the SRV and emit a hardcoded color when chrome is registered. If hardcoded color appears at the chrome quad position → SRV/sampling bug. If it doesn't appear → geometry/depth/visibility bug.
-- If SRV-side: take a RenderDoc capture of the runtime, inspect the chrome SRV contents — confirm the controller's red bytes actually landed in the shared texture.
-- If geometry-side: log the cc_corners[] values and verify they fall within the atlas's expected tile bounds.
+**C3.C-4 — Hover-fade ease-out cubic + state-change re-render.** Once the shell receives POINTER_MOTION events with `chromeRegionId`, it can track per-slot hover state (over chrome / over button N / over grip). State change → re-render the chrome SRV with the appropriate alpha multiplier (or button color modulation). Tween via 300 ms ease-out cubic on entry, 150 ms on exit. Idle = no GPU work.
+
+**C3.C-3 — App icon + DirectWrite glyphs (deferred polish).** App icon: per-client PID → exe → registered-app icon_path lookup, PNG decode via stb_image, D3D11 texture + SRV, shader extension to sample. Glyphs: heavy infra (DirectWrite atlas baking, ~400–600 lines port from runtime). Both are pure visual polish — not architectural — and the existing pill+dots+buttons is enough to demonstrate the controller-owned chrome architecture works end-to-end. Land in a follow-up session.
+
+**C5 — Delete in-runtime chrome render block + animation machinery.** ~600 lines of deletions in `comp_d3d11_service.cpp`. Validates the architecture: runtime ships with zero default chrome, only the controller-submitted version remains. Without a controller, clients show as bare quads.
+
+**C6 — Test app smoke + spec/audit docs.** chrome smoke in `workspace_minimal_d3d11_win`; spec doc update for `XR_EXT_spatial_workspace` v7; separation-of-concerns doc update; audit entry; mark Phase 2.C ✅ shipped.
 
 ## Files Touched (Phase 2.C across all sub-steps)
 
@@ -97,5 +101,6 @@ Shell:
 ## Hand-off
 
 - Branch sequence (`2G → 2K → 2C`) stays in flight. Don't merge to main.
-- C3.B chrome rendering bug needs fresh eyes — see "Bisect plan" above. Once C3.B's visual works, C3.C ports the full visual (~800–1200 lines of D3D11/HLSL) for the rounded pill, grip dots, button geometry, app icon, DirectWrite glyphs, focus rim glow, hover-fade ease-out cubic.
+- C3.B visual is fixed (verified via atlas screenshot). C3.C-1 and C3.C-2 land the rounded pill + grip dots + 3 buttons. Glyphs and per-app icons are deferred to a polish-pass session — pill + dots + buttons is sufficient to demonstrate the controller-owned chrome architecture.
+- Resuming session continues with **C4 (hit-test plumbing)** then **C3.C-4 (hover-fade)**. Hover-fade depends on C4's `chromeRegionId` events; without it, the shell has no way to detect cursor-over-chrome state.
 - Per `feedback_test_before_ci.md`: any new agent / session continuing here must build + smoke locally before pushing.
