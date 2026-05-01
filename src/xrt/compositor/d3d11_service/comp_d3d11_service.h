@@ -29,6 +29,7 @@ struct u_system;
 // Forward decls from ipc_protocol.h — full definition is included by callers.
 struct ipc_launcher_app;
 struct ipc_capture_result;
+struct ipc_workspace_chrome_layout;
 
 
 /*!
@@ -512,6 +513,48 @@ comp_d3d11_service_workspace_request_fullscreen_by_slot(struct xrt_system_compos
  */
 int
 comp_d3d11_service_workspace_find_slot_by_xc(struct xrt_system_compositor *xsysc, struct xrt_compositor *xc);
+
+/*!
+ * Phase 2.C: register a controller-minted swapchain as the chrome image for
+ * a workspace slot. The runtime keeps a strong ref to @p chrome_xsc and
+ * composites its first image every render at the pose previously set via
+ * comp_d3d11_service_workspace_set_chrome_layout_by_slot (or as a placeholder
+ * until layout lands).
+ *
+ * The IPC handler resolves the controller-supplied (client_id, swapchain_id)
+ * pair to (slot, xrt_swapchain*) before calling — same pattern as
+ * comp_d3d11_service_set_client_window_pose's IPC-side resolution.
+ *
+ * @return XRT_SUCCESS on success;
+ *         XRT_ERROR_IPC_FAILURE if @p xsysc is invalid, slot is out of range,
+ *         or the swapchain is not a d3d11_service_swapchain.
+ *
+ * @ingroup comp_d3d11_service
+ */
+xrt_result_t
+comp_d3d11_service_workspace_register_chrome_swapchain_by_slot(struct xrt_system_compositor *xsysc,
+                                                               int slot,
+                                                               uint32_t swapchain_id,
+                                                               struct xrt_swapchain *chrome_xsc);
+
+/*!
+ * Phase 2.C: drop the chrome registration for whichever slot owns the
+ * controller-side @p swapchain_id. Idempotent — no-op if no slot has it.
+ */
+xrt_result_t
+comp_d3d11_service_workspace_unregister_chrome_swapchain(struct xrt_system_compositor *xsysc,
+                                                         uint32_t swapchain_id);
+
+/*!
+ * Phase 2.C: set / update the chrome quad layout for the slot. Layout is
+ * cached and re-applied every render. Stored even if the slot has no chrome
+ * swapchain registered yet — the layout takes effect when one is later
+ * registered.
+ */
+xrt_result_t
+comp_d3d11_service_workspace_set_chrome_layout_by_slot(struct xrt_system_compositor *xsysc,
+                                                       int slot,
+                                                       const struct ipc_workspace_chrome_layout *layout);
 
 /*! @} */
 

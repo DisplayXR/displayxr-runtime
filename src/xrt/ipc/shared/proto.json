@@ -230,7 +230,6 @@
 
 	"workspace_unregister_chrome_swapchain": {
 		"in": [
-			{"name": "client_id", "type": "uint32_t"},
 			{"name": "swapchain_id", "type": "uint32_t"}
 		]
 	},

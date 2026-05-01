@@ -222,5 +222,8 @@ target_include_directories(
 		${CMAKE_CURRENT_BINARY_DIR}
 		# multi/comp_multi_private.h is used for qwerty input device support
 		${CMAKE_CURRENT_SOURCE_DIR}/../../compositor
+		# Phase 2.C: oxr_workspace.c needs ipc_workspace_chrome_layout to
+		# marshal the chrome layout struct to the IPC bridge.
+		${CMAKE_CURRENT_SOURCE_DIR}/../../ipc
 	INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/..
 	)

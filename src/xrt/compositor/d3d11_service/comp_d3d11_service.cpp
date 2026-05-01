@@ -709,6 +709,29 @@ struct d3d11_multi_client_slot
 		uint64_t duration_ns;
 	} chrome_fade;
 
+	//! Phase 2.C: controller-submitted chrome swapchain. The runtime composites
+	//! the swapchain image at the controller-specified pose every render, with
+	//! controller-defined hit regions and depth bias.
+	//!
+	//! NULL until xrCreateWorkspaceClientChromeSwapchainEXT is called for this
+	//! client. C5 will gate the in-runtime chrome render block on
+	//! `chrome_xsc != nullptr` so default chrome only draws when the controller
+	//! has not submitted its own.
+	//!
+	//! Refcounted via xrt_swapchain_reference. The IPC layer owns the lifetime
+	//! of the underlying d3d11_service_swapchain — we just hold a strong ref
+	//! to keep the SRV+texture alive as long as the slot composites it.
+	struct xrt_swapchain *chrome_xsc;
+	uint32_t              chrome_swapchain_id; //!< IPC swapchain id, 0 if no chrome registered
+	bool                  chrome_layout_valid;
+	struct xrt_pose       chrome_pose_in_client;  //!< Pose of chrome quad in client-window-local space
+	float                 chrome_size_w_m;
+	float                 chrome_size_h_m;
+	bool                  chrome_follows_orient;  //!< If true, chrome rotates with window
+	float                 chrome_depth_bias_m;    //!< 0 = use WORKSPACE_CHROME_DEPTH_BIAS default
+	uint32_t              chrome_region_count;
+	struct ipc_workspace_chrome_hit_region chrome_regions[IPC_WORKSPACE_CHROME_MAX_HIT_REGIONS];
+
 	//! @name Capture-specific fields (only valid when client_type == CLIENT_TYPE_CAPTURE)
 	//! @{
 	struct d3d11_capture_context *capture_ctx;                //!< Opaque capture context
@@ -3831,6 +3854,14 @@ multi_compositor_register_client(struct d3d11_service_system *sys, struct d3d11_
 			mc->clients[i].active = true;
 			mc->clients[i].has_first_frame_committed = false;
 			mc->clients[i].first_frame_ns = 0;
+			// Phase 2.C: drop any leftover chrome registration from a
+			// prior tenant so the new client starts with no chrome.
+			if (mc->clients[i].chrome_xsc != nullptr) {
+				xrt_swapchain_reference(&mc->clients[i].chrome_xsc, NULL);
+			}
+			mc->clients[i].chrome_swapchain_id = 0;
+			mc->clients[i].chrome_layout_valid = false;
+			mc->clients[i].chrome_region_count = 0;
 
 			// Count active clients to determine grid position
 			int active_count = 0;
@@ -4282,6 +4313,12 @@ multi_compositor_destroy(struct d3d11_multi_compositor *mc)
 			mc->clients[i].capture_ctx = nullptr;
 			mc->clients[i].capture_srv = nullptr;
 			mc->clients[i].active = false;
+		}
+		// Phase 2.C: drop chrome refs across all slots on shutdown.
+		if (mc->clients[i].chrome_xsc != nullptr) {
+			xrt_swapchain_reference(&mc->clients[i].chrome_xsc, NULL);
+			mc->clients[i].chrome_swapchain_id = 0;
+			mc->clients[i].chrome_layout_valid = false;
 		}
 	}
 
@@ -7886,6 +7923,114 @@ after_key_shortcuts:
 						sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
 					}
 					#undef CHROME_BLIT_POS
+				}
+			}
+		}
+
+		// Phase 2.C: controller-submitted chrome composite. Reads the chrome
+		// swapchain's image[0] SRV (single-image swapchain) and blits it at
+		// the controller-specified pose in window-local meters, biased toward
+		// the eye by chrome_depth_bias_m so it occludes the window's own
+		// content while still depth-testing against other windows.
+		//
+		// C5 will gate the in-runtime chrome render block on
+		// `chrome_xsc == nullptr` so the two paths don't double-render — for
+		// C2 they coexist additively.
+		if (mc->clients[s].chrome_xsc != nullptr && mc->clients[s].chrome_layout_valid &&
+		    mc->clients[s].client_type != CLIENT_TYPE_CAPTURE) {
+			struct d3d11_multi_client_slot *cs = &mc->clients[s];
+			struct d3d11_service_swapchain *csc = d3d11_service_swapchain_from_xrt(cs->chrome_xsc);
+			if (csc != nullptr && csc->image_count > 0 && csc->images[0].srv) {
+				ID3D11ShaderResourceView *chrome_srv = csc->images[0].srv.get();
+
+				float chrome_cx = cs->chrome_pose_in_client.position.x;
+				float chrome_cy = cs->chrome_pose_in_client.position.y;
+				float chrome_hw = cs->chrome_size_w_m * 0.5f;
+				float chrome_hh = cs->chrome_size_h_m * 0.5f;
+				float chrome_l = chrome_cx - chrome_hw;
+				float chrome_r = chrome_cx + chrome_hw;
+				float chrome_t = chrome_cy + chrome_hh;
+				float chrome_b = chrome_cy - chrome_hh;
+				float depth_bias = (cs->chrome_depth_bias_m > 0.0f) ?
+				    cs->chrome_depth_bias_m : WORKSPACE_CHROME_DEPTH_BIAS;
+
+				const struct xrt_quat *chrome_orient = &cs->window_pose.orientation;
+				static const struct xrt_quat identity_quat = {0, 0, 0, 1};
+				if (!cs->chrome_follows_orient) {
+					chrome_orient = &identity_quat;
+				}
+				float wcx = cs->window_pose.position.x;
+				float wcy = cs->window_pose.position.y;
+				float wcz = cs->window_pose.position.z;
+
+				D3D11_TEXTURE2D_DESC chrome_desc = {};
+				csc->images[0].texture->GetDesc(&chrome_desc);
+
+				for (uint32_t v3 = 0; v3 < num_views && v3 < XRT_MAX_VIEWS; v3++) {
+					uint32_t col3 = v3 % sys->tile_columns;
+					uint32_t row3 = v3 / sys->tile_columns;
+					int eye_idx3 = (col3 < 2) ? (int)col3 : 0;
+					int ei3 = (eye_idx3 < (int)eye_pos.count) ? eye_idx3 : 0;
+					float cur_eye_x = eye_pos.eyes[ei3].x;
+					float cur_eye_y = eye_pos.eyes[ei3].y;
+					float cur_eye_z = eye_pos.eyes[ei3].z;
+
+					float cc_corners[8], cc_w[4];
+					project_local_rect_for_eye(sys, chrome_orient,
+					    wcx, wcy, wcz,
+					    chrome_l, chrome_t, chrome_r, chrome_b,
+					    cur_eye_x, cur_eye_y, cur_eye_z,
+					    col3, row3, half_w, half_h, ca_w, ca_h,
+					    cc_corners, cc_w);
+
+					D3D11_RECT cc_scissor;
+					cc_scissor.left = (LONG)(col3 * half_w);
+					cc_scissor.top = (LONG)(row3 * half_h);
+					cc_scissor.right = (LONG)((col3 + 1) * half_w);
+					cc_scissor.bottom = (LONG)((row3 + 1) * half_h);
+					sys->context->RSSetScissorRects(1, &cc_scissor);
+
+					sys->context->VSSetShader(sys->blit_vs.get(), nullptr, 0);
+					sys->context->PSSetShader(sys->blit_ps.get(), nullptr, 0);
+					sys->context->VSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
+					sys->context->PSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
+					ID3D11RenderTargetView *cc_rtvs[] = {mc->combined_atlas_rtv.get()};
+					sys->context->OMSetRenderTargets(1, cc_rtvs, mc->combined_atlas_dsv.get());
+					sys->context->OMSetBlendState(sys->blend_alpha.get(), nullptr, 0xFFFFFFFF);
+					sys->context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+					sys->context->IASetInputLayout(nullptr);
+					sys->context->RSSetState(sys->rasterizer_state.get());
+					sys->context->OMSetDepthStencilState(sys->depth_test_enabled.get(), 0);
+					D3D11_VIEWPORT cc_vp = {};
+					cc_vp.Width = (float)ca_w; cc_vp.Height = (float)ca_h; cc_vp.MaxDepth = 1.0f;
+					sys->context->RSSetViewports(1, &cc_vp);
+
+					D3D11_MAPPED_SUBRESOURCE mapped;
+					if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
+					              D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+						BlitConstants *cb = static_cast<BlitConstants *>(mapped.pData);
+						memset(cb, 0, sizeof(*cb));
+						cb->src_rect[0] = 0.0f; cb->src_rect[1] = 0.0f;
+						cb->src_rect[2] = 1.0f; cb->src_rect[3] = 1.0f;
+						cb->src_size[0] = (uint32_t)chrome_desc.Width;
+						cb->src_size[1] = (uint32_t)chrome_desc.Height;
+						cb->dst_size[0] = (float)ca_w; cb->dst_size[1] = (float)ca_h;
+						cb->convert_srgb = 0.0f;
+						cb->chrome_alpha = 0.0f;
+						cb->corner_radius = 0.0f;
+						cb->corner_aspect = 0.0f;
+						cb->edge_feather = 0.0f;
+						cb->glow_intensity = 0.0f;
+						blit_set_quad_corners(cb, cc_corners, cc_w);
+						cb->dst_offset[0] = 0; cb->dst_offset[1] = 0;
+						cb->dst_rect_wh[0] = 0; cb->dst_rect_wh[1] = 0;
+						blit_set_perspective_depth(cb, cc_w, depth_bias);
+						sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
+					}
+
+					sys->context->PSSetShaderResources(0, 1, &chrome_srv);
+					sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
+					sys->context->Draw(4, 0);
 				}
 			}
 		}
@@ -12128,6 +12273,106 @@ comp_d3d11_service_workspace_request_client_fullscreen(struct xrt_system_composi
 		    xsysc, (int)(client_id - 1000u), fullscreen);
 	}
 	return XRT_ERROR_IPC_FAILURE;
+}
+
+// Phase 2.C: chrome swapchain registration + layout setter.
+// The IPC handler resolves (client_id, controller-side swapchain_id) → (slot,
+// xrt_swapchain*) and calls these by-slot helpers. The runtime stores a
+// strong ref to the swapchain and reads its image[0] SRV every render.
+
+extern "C" xrt_result_t
+comp_d3d11_service_workspace_register_chrome_swapchain_by_slot(struct xrt_system_compositor *xsysc,
+                                                               int slot,
+                                                               uint32_t swapchain_id,
+                                                               struct xrt_swapchain *chrome_xsc)
+{
+	if (xsysc == nullptr || chrome_xsc == nullptr || swapchain_id == 0) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	if (mc == nullptr || slot < 0 || slot >= D3D11_MULTI_MAX_CLIENTS) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	struct d3d11_multi_client_slot *cs = &mc->clients[slot];
+	if (!cs->active) {
+		// Slot may bind a few ticks after the controller calls the create
+		// RPC. The shell retries on XR_ERROR_HANDLE_INVALID; for now we
+		// just refuse and let it retry.
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	// Drop any prior registration on this slot (replaces, doesn't stack).
+	if (cs->chrome_xsc != nullptr) {
+		xrt_swapchain_reference(&cs->chrome_xsc, NULL);
+		cs->chrome_swapchain_id = 0;
+	}
+
+	xrt_swapchain_reference(&cs->chrome_xsc, chrome_xsc);
+	cs->chrome_swapchain_id = swapchain_id;
+
+	U_LOG_W("workspace: chrome swapchain registered for slot %d (id=%u)", slot, swapchain_id);
+	return XRT_SUCCESS;
+}
+
+extern "C" xrt_result_t
+comp_d3d11_service_workspace_unregister_chrome_swapchain(struct xrt_system_compositor *xsysc,
+                                                         uint32_t swapchain_id)
+{
+	if (xsysc == nullptr || swapchain_id == 0) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	if (mc == nullptr) {
+		return XRT_SUCCESS; // workspace inactive — nothing to unregister
+	}
+
+	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
+		struct d3d11_multi_client_slot *cs = &mc->clients[s];
+		if (cs->chrome_swapchain_id == swapchain_id) {
+			xrt_swapchain_reference(&cs->chrome_xsc, NULL);
+			cs->chrome_swapchain_id = 0;
+			cs->chrome_layout_valid = false;
+			U_LOG_W("workspace: chrome swapchain unregistered (slot=%d, id=%u)", s, swapchain_id);
+			return XRT_SUCCESS;
+		}
+	}
+	return XRT_SUCCESS; // not registered — idempotent
+}
+
+extern "C" xrt_result_t
+comp_d3d11_service_workspace_set_chrome_layout_by_slot(struct xrt_system_compositor *xsysc,
+                                                       int slot,
+                                                       const struct ipc_workspace_chrome_layout *layout)
+{
+	if (xsysc == nullptr || layout == nullptr) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	if (mc == nullptr || slot < 0 || slot >= D3D11_MULTI_MAX_CLIENTS) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	struct d3d11_multi_client_slot *cs = &mc->clients[slot];
+	cs->chrome_pose_in_client = layout->pose_in_client;
+	cs->chrome_size_w_m = layout->size_w_m;
+	cs->chrome_size_h_m = layout->size_h_m;
+	cs->chrome_follows_orient = (layout->follows_window_orient != 0);
+	cs->chrome_depth_bias_m = layout->depth_bias_meters;
+	cs->chrome_region_count = layout->hit_region_count;
+	if (cs->chrome_region_count > IPC_WORKSPACE_CHROME_MAX_HIT_REGIONS) {
+		cs->chrome_region_count = IPC_WORKSPACE_CHROME_MAX_HIT_REGIONS;
+	}
+	memcpy(cs->chrome_regions, layout->hit_regions,
+	       cs->chrome_region_count * sizeof(struct ipc_workspace_chrome_hit_region));
+	cs->chrome_layout_valid = true;
+	return XRT_SUCCESS;
 }
 
 extern "C" bool

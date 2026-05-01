@@ -700,7 +700,6 @@ comp_ipc_client_compositor_workspace_register_chrome_swapchain(struct xrt_compos
 
 xrt_result_t
 comp_ipc_client_compositor_workspace_unregister_chrome_swapchain(struct xrt_compositor *xc,
-                                                                 uint32_t client_id,
                                                                  uint32_t swapchain_id)
 {
 	if (xc == NULL) {
@@ -710,7 +709,22 @@ comp_ipc_client_compositor_workspace_unregister_chrome_swapchain(struct xrt_comp
 	if (icc == NULL || icc->ipc_c == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
-	return ipc_call_workspace_unregister_chrome_swapchain(icc->ipc_c, client_id, swapchain_id);
+	return ipc_call_workspace_unregister_chrome_swapchain(icc->ipc_c, swapchain_id);
+}
+
+/*!
+ * Phase 2.C: helper to extract the IPC swapchain id from an xrt_swapchain.
+ * Used by the state-tracker dispatch wrappers to register/unregister chrome
+ * swapchains without pulling IPC headers into oxr_workspace.c.
+ */
+uint32_t
+comp_ipc_client_compositor_get_swapchain_id(struct xrt_swapchain *xsc)
+{
+	if (xsc == NULL) {
+		return 0;
+	}
+	struct ipc_client_swapchain *ics = ipc_client_swapchain(xsc);
+	return ics->id;
 }
 
 xrt_result_t

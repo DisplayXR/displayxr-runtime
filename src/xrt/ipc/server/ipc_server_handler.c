@@ -2926,29 +2926,91 @@ ipc_handle_workspace_capture_frame(volatile struct ipc_client_state *_ics,
 #endif
 }
 
-// Phase 2.C: controller-owned chrome RPCs. C1 lands these as stubs; C2 wires
-// them to the d3d11_service multi-compositor's chrome side-table.
+// Phase 2.C: controller-owned chrome RPCs. The IPC handler resolves the
+// controller-supplied client_id + swapchain_id pair to a target slot + the
+// corresponding xrt_swapchain (held in the controller's xscs table), then
+// dispatches to comp_d3d11_service. Layout has the same client_id→slot
+// resolution.
 
 xrt_result_t
 ipc_handle_workspace_register_chrome_swapchain(volatile struct ipc_client_state *_ics,
                                                uint32_t client_id,
                                                uint32_t swapchain_id)
 {
-	(void)_ics;
+	struct ipc_server *s = _ics->server;
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (s->xsysc == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	// Resolve the controller-side swapchain via the calling client's xscs[].
+	if (swapchain_id >= IPC_MAX_CLIENT_SWAPCHAINS) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct xrt_swapchain *xsc = (struct xrt_swapchain *)_ics->xscs[swapchain_id];
+	if (xsc == NULL) {
+		IPC_WARN(s, "Workspace: register_chrome_swapchain - swapchain %u not bound", swapchain_id);
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	int slot = -1;
+	if (client_id >= 1000u) {
+		// Capture clients aren't decorated with chrome — reject for now.
+		IPC_WARN(s, "Workspace: register_chrome_swapchain - capture clients (id=%u) not supported", client_id);
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	os_mutex_lock(&s->global_state.lock);
+	volatile struct ipc_client_state *target_ics = NULL;
+	for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
+		volatile struct ipc_client_state *ics = &s->threads[i].ics;
+		if (ics->client_state.id == client_id && ics->server_thread_index >= 0) {
+			target_ics = ics;
+			break;
+		}
+	}
+	if (target_ics == NULL || target_ics->xc == NULL) {
+		os_mutex_unlock(&s->global_state.lock);
+		IPC_WARN(s, "Workspace: register_chrome_swapchain - client %u not found", client_id);
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	slot = comp_d3d11_service_workspace_find_slot_by_xc(s->xsysc, (struct xrt_compositor *)target_ics->xc);
+	os_mutex_unlock(&s->global_state.lock);
+
+	if (slot < 0) {
+		// Slot may not be bound yet — controller retries.
+		IPC_WARN(s, "Workspace: register_chrome_swapchain - slot for client %u not bound yet", client_id);
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	IPC_INFO(s, "Workspace: register_chrome_swapchain client_id=%u swapchain_id=%u → slot=%d",
+	         client_id, swapchain_id, slot);
+	return comp_d3d11_service_workspace_register_chrome_swapchain_by_slot(s->xsysc, slot, swapchain_id, xsc);
+#else
+	(void)s;
 	(void)client_id;
 	(void)swapchain_id;
-	return XRT_SUCCESS;
+	return XRT_ERROR_IPC_FAILURE;
+#endif
 }
 
 xrt_result_t
 ipc_handle_workspace_unregister_chrome_swapchain(volatile struct ipc_client_state *_ics,
-                                                 uint32_t client_id,
                                                  uint32_t swapchain_id)
 {
-	(void)_ics;
-	(void)client_id;
+	struct ipc_server *s = _ics->server;
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (s->xsysc == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	IPC_INFO(s, "Workspace: unregister_chrome_swapchain swapchain_id=%u", swapchain_id);
+	return comp_d3d11_service_workspace_unregister_chrome_swapchain(s->xsysc, swapchain_id);
+#else
+	(void)s;
 	(void)swapchain_id;
 	return XRT_SUCCESS;
+#endif
 }
 
 xrt_result_t
@@ -2956,10 +3018,45 @@ ipc_handle_workspace_set_chrome_layout(volatile struct ipc_client_state *_ics,
                                        uint32_t client_id,
                                        const struct ipc_workspace_chrome_layout *layout)
 {
-	(void)_ics;
+	struct ipc_server *s = _ics->server;
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (s->xsysc == NULL || layout == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	int slot = -1;
+	if (client_id >= 1000u) {
+		IPC_WARN(s, "Workspace: set_chrome_layout - capture clients (id=%u) not supported", client_id);
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	os_mutex_lock(&s->global_state.lock);
+	volatile struct ipc_client_state *target_ics = NULL;
+	for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
+		volatile struct ipc_client_state *ics = &s->threads[i].ics;
+		if (ics->client_state.id == client_id && ics->server_thread_index >= 0) {
+			target_ics = ics;
+			break;
+		}
+	}
+	if (target_ics == NULL || target_ics->xc == NULL) {
+		os_mutex_unlock(&s->global_state.lock);
+		IPC_WARN(s, "Workspace: set_chrome_layout - client %u not found", client_id);
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	slot = comp_d3d11_service_workspace_find_slot_by_xc(s->xsysc, (struct xrt_compositor *)target_ics->xc);
+	os_mutex_unlock(&s->global_state.lock);
+	if (slot < 0) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	return comp_d3d11_service_workspace_set_chrome_layout_by_slot(s->xsysc, slot, layout);
+#else
+	(void)s;
 	(void)client_id;
 	(void)layout;
-	return XRT_SUCCESS;
+	return XRT_ERROR_IPC_FAILURE;
+#endif
 }
 
 xrt_result_t

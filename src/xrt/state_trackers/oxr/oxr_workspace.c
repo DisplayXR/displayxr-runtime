@@ -27,11 +27,17 @@
 
 #include "xrt/xrt_results.h"
 
+// Phase 2.C: chrome layout marshalling. Pull the IPC POD typedef so the
+// dispatch wrapper can fill it directly. The CMake include path
+// (state_trackers/oxr/../../ipc) lets us write this as "shared/...".
+#include "shared/ipc_protocol.h"
+
 #include <openxr/XR_EXT_spatial_workspace.h>
 
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #ifdef OXR_HAVE_EXT_spatial_workspace
 
@@ -128,18 +134,20 @@ comp_ipc_client_compositor_workspace_request_client_fullscreen(struct xrt_compos
 // Phase 2.C: chrome swapchain bridges. Forward-declared with the IPC POD layout
 // type from ipc_protocol.h.
 struct ipc_workspace_chrome_layout;
+struct xrt_swapchain;
 xrt_result_t
 comp_ipc_client_compositor_workspace_register_chrome_swapchain(struct xrt_compositor *xc,
                                                                uint32_t client_id,
                                                                uint32_t swapchain_id);
 xrt_result_t
 comp_ipc_client_compositor_workspace_unregister_chrome_swapchain(struct xrt_compositor *xc,
-                                                                 uint32_t client_id,
                                                                  uint32_t swapchain_id);
 xrt_result_t
 comp_ipc_client_compositor_workspace_set_chrome_layout(struct xrt_compositor *xc,
                                                        uint32_t client_id,
                                                        const struct ipc_workspace_chrome_layout *layout);
+uint32_t
+comp_ipc_client_compositor_get_swapchain_id(struct xrt_swapchain *xsc);
 
 
 /*
@@ -909,12 +917,52 @@ oxr_xrCreateWorkspaceClientChromeSwapchainEXT(XrSession session,
 		                 "xrCreateWorkspaceClientChromeSwapchainEXT requires an IPC-mode session");
 	}
 
-	// C1 stub: real swapchain creation lands in C2. Returning a NULL handle here
-	// would leave the controller with an unusable XrSwapchain — flag this clearly
-	// instead so C1 callers get a recognizable "not yet implemented" signal.
-	*swapchain = XR_NULL_HANDLE;
-	return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
-	                 "xrCreateWorkspaceClientChromeSwapchainEXT: not implemented yet (Phase 2.C C1 stub)");
+	if (sess->compositor == NULL) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+		                 "xrCreateWorkspaceClientChromeSwapchainEXT: session has no compositor");
+	}
+
+	// Mint a regular OpenXR swapchain. Chrome is just a single-image color
+	// swapchain — controllers Acquire/Wait/Release through standard image-loop
+	// entry points. The runtime side-table tags this swapchain id as chrome
+	// for `clientId` so the per-render path knows to composite it at the
+	// layout-specified pose.
+	XrSwapchainCreateInfo sci = {0};
+	sci.type = XR_TYPE_SWAPCHAIN_CREATE_INFO;
+	sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
+	                 XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT |
+	                 XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+	sci.format = createInfo->format;
+	sci.sampleCount = createInfo->sampleCount > 0 ? createInfo->sampleCount : 1;
+	sci.width = createInfo->width;
+	sci.height = createInfo->height;
+	sci.faceCount = 1;
+	sci.arraySize = 1;
+	sci.mipCount = createInfo->mipCount > 0 ? createInfo->mipCount : 1;
+
+	struct oxr_swapchain *sc = NULL;
+	XrResult ret = sess->create_swapchain(&log, sess, &sci, &sc);
+	if (ret != XR_SUCCESS) {
+		return ret;
+	}
+
+	uint32_t swapchain_id = comp_ipc_client_compositor_get_swapchain_id(sc->swapchain);
+	if (swapchain_id == 0) {
+		// Defensive: id 0 is reserved. Unwind by destroying the swapchain.
+		oxr_handle_destroy(&log, &sc->handle);
+		return oxr_error(&log, XR_ERROR_RUNTIME_FAILURE,
+		                 "xrCreateWorkspaceClientChromeSwapchainEXT: failed to resolve IPC swapchain id");
+	}
+
+	xrt_result_t xret = comp_ipc_client_compositor_workspace_register_chrome_swapchain(
+	    &sess->xcn->base, (uint32_t)clientId, swapchain_id);
+	if (xret != XRT_SUCCESS) {
+		oxr_handle_destroy(&log, &sc->handle);
+		return xret_to_xr_result(&log, xret, "workspace_register_chrome_swapchain");
+	}
+
+	*swapchain = oxr_swapchain_to_openxr(sc);
+	return XR_SUCCESS;
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
@@ -927,8 +975,37 @@ oxr_xrDestroyWorkspaceClientChromeSwapchainEXT(XrSwapchain swapchain)
 	OXR_VERIFY_SWAPCHAIN_AND_INIT_LOG(&log, swapchain, sc, "xrDestroyWorkspaceClientChromeSwapchainEXT");
 	OXR_VERIFY_EXTENSION(&log, sc->sess->sys->inst, EXT_spatial_workspace);
 
-	// C1 stub: no chrome side-table to clean up yet. C2 wires the real path.
-	return XR_SUCCESS;
+	// Drop the runtime-side chrome registration before destroying the
+	// swapchain. The runtime is tolerant of a missing entry — if the swapchain
+	// was never registered (e.g. created via xrCreateSwapchain directly), the
+	// unregister is a no-op there.
+	uint32_t swapchain_id = comp_ipc_client_compositor_get_swapchain_id(sc->swapchain);
+	if (swapchain_id != 0 && session_is_ipc_client(sc->sess)) {
+		(void)comp_ipc_client_compositor_workspace_unregister_chrome_swapchain(
+		    &sc->sess->xcn->base, swapchain_id);
+	}
+
+	return oxr_handle_destroy(&log, &sc->handle);
+}
+
+static void
+chrome_layout_xr_to_ipc(const XrWorkspaceChromeLayoutEXT *in,
+                        struct ipc_workspace_chrome_layout *out)
+{
+	memset(out, 0, sizeof(*out));
+	xr_pose_to_xrt_pose(&in->poseInClient, &out->pose_in_client);
+	out->size_w_m = in->sizeMeters.width;
+	out->size_h_m = in->sizeMeters.height;
+	out->follows_window_orient = in->followsWindowOrient ? 1u : 0u;
+	out->depth_bias_meters = in->depthBiasMeters;
+	out->hit_region_count = in->hitRegionCount;
+	for (uint32_t i = 0; i < in->hitRegionCount && i < IPC_WORKSPACE_CHROME_MAX_HIT_REGIONS; ++i) {
+		out->hit_regions[i].id = (uint32_t)in->hitRegions[i].id;
+		out->hit_regions[i].bounds_x = in->hitRegions[i].bounds.offset.x;
+		out->hit_regions[i].bounds_y = in->hitRegions[i].bounds.offset.y;
+		out->hit_regions[i].bounds_w = in->hitRegions[i].bounds.extent.width;
+		out->hit_regions[i].bounds_h = in->hitRegions[i].bounds.extent.height;
+	}
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
@@ -975,9 +1052,12 @@ oxr_xrSetWorkspaceClientChromeLayoutEXT(XrSession session,
 		                 "xrSetWorkspaceClientChromeLayoutEXT requires an IPC-mode session");
 	}
 
-	// C1 stub: layout cache wired up in C2.
-	(void)layout;
-	return XR_SUCCESS;
+	struct ipc_workspace_chrome_layout ipc_layout;
+	chrome_layout_xr_to_ipc(layout, &ipc_layout);
+
+	xrt_result_t xret = comp_ipc_client_compositor_workspace_set_chrome_layout(
+	    &sess->xcn->base, (uint32_t)clientId, &ipc_layout);
+	return xret_to_xr_result(&log, xret, "workspace_set_chrome_layout");
 }
 
 #endif // OXR_HAVE_EXT_spatial_workspace
