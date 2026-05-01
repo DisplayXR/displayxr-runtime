@@ -662,6 +662,32 @@ float4 PSMain(VS_OUTPUT input) : SV_Target
 {
     float2 uv01 = input.quad_uv;
 
+    // --- Phase 2.K Commit 8.G: inner-edge rim glow (convert_srgb >= 4.0). ---
+    // Drawn AFTER content blit on the same content quad — so the rim follows
+    // the window's projected shape under tilt automatically (the rotated path
+    // populates quad_corners via project_local_rect_for_eye, axis-aligned uses
+    // dst_rect; uv01 is in [0,1] across whichever shape the vertex shader
+    // produced). No separate "halo" quad — the rim sits exactly at the
+    // content edge.
+    if (convert_srgb > 3.5) {
+        float ext_x = glow_extent;
+        float ext_y = (edge_feather > 0.001) ? edge_feather : ext_x;
+        if (ext_x < 0.001) discard;
+        // Distance from nearest edge in normalized [0,1] coords, per-axis.
+        float dx = min(uv01.x, 1.0 - uv01.x);
+        float dy = min(uv01.y, 1.0 - uv01.y);
+        float ndx = dx / ext_x;
+        float ndy = dy / ext_y;
+        // Inside the inner rect: discard so content shows through.
+        if (ndx > 1.0 && ndy > 1.0) discard;
+        // Combined distance: 0 at edge, 1 at the inner rim boundary.
+        float dist = min(min(ndx, ndy), 1.0);
+        // Falloff peaks at edge (dist=0), fades inward.
+        float falloff = exp(-glow_falloff * dist * dist);
+        float a = glow_intensity * falloff;
+        return float4(glow_color.rgb * a, a);  // premultiplied alpha
+    }
+
     // --- Glow mode (convert_srgb >= 3.0): soft halo around focused window ---
     if (convert_srgb > 2.5) {
         // Separate X/Y extents: glow_extent = X fraction, edge_feather = Y fraction.

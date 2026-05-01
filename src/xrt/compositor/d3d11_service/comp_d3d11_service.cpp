@@ -7014,89 +7014,12 @@ after_key_shortcuts:
 			    src_col, src_row, half_w, half_h, ca_w, ca_h,
 			    quad_corners, quad_w_vals);
 
-			// Draw focus glow behind focused window (before content blit).
-			// Phase 2.K Commit 8 tweak 2: glow wraps the CONTENT quad only.
-			// The pill floats above with a visible gap; previously the glow
-			// extended UP by UI_TITLE_BAR_H_M to where the legacy attached
-			// title bar lived, which now overlaps the gap and the pill bottom
-			// — making the chrome appear taller when focus changes on click.
-			if (s == mc->focused_slot && sys->blit_vs && sys->blit_ps) {
-				float glow_hw = mc->clients[s].window_width_m / 2.0f + UI_GLOW_MARGIN_M;
-				float glow_hh = mc->clients[s].window_height_m / 2.0f + UI_GLOW_MARGIN_M;
-				(void)glow_hh;
-				float glow_total_h = mc->clients[s].window_height_m + 2.0f * UI_GLOW_MARGIN_M;
-				float glow_ext = UI_GLOW_MARGIN_M / (glow_total_h / 2.0f);
-
-				float gl_l = -glow_hw;
-				float gl_t = mc->clients[s].window_height_m / 2.0f + UI_GLOW_MARGIN_M;
-				float gl_r = glow_hw;
-				float gl_b = -(mc->clients[s].window_height_m / 2.0f + UI_GLOW_MARGIN_M);
-
-				D3D11_MAPPED_SUBRESOURCE glow_mapped;
-				if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
-				              D3D11_MAP_WRITE_DISCARD, 0, &glow_mapped))) {
-					BlitConstants *gcb = static_cast<BlitConstants *>(glow_mapped.pData);
-					gcb->src_rect[0] = 0; gcb->src_rect[1] = 0;
-					gcb->src_rect[2] = 1; gcb->src_rect[3] = 1;
-					gcb->src_size[0] = 1; gcb->src_size[1] = 1;
-					gcb->dst_size[0] = (float)ca_w; gcb->dst_size[1] = (float)ca_h;
-					gcb->convert_srgb = 3.0f;  // glow mode
-					gcb->chrome_alpha = 0.0f; // 8.C: 0=full opacity (chrome blits override)
-					gcb->corner_radius = 0; gcb->corner_aspect = 0;
-					gcb->edge_feather = 0.0f;
-					gcb->glow_intensity = UI_GLOW_INTENSITY;
-					gcb->glow_extent = glow_ext;
-					gcb->glow_falloff = UI_GLOW_FALLOFF;
-					gcb->glow_color[0] = UI_GLOW_R;
-					gcb->glow_color[1] = UI_GLOW_G;
-					gcb->glow_color[2] = UI_GLOW_B;
-					gcb->glow_color[3] = 1.0f;
-
-					bool glow_rotated = !quat_is_identity(&mc->clients[s].window_pose.orientation);
-					if (glow_rotated) {
-						float gcorners[8], gw[4];
-						project_local_rect_for_eye(sys,
-						    &mc->clients[s].window_pose.orientation,
-						    mc->clients[s].window_pose.position.x,
-						    mc->clients[s].window_pose.position.y,
-						    mc->clients[s].window_pose.position.z,
-						    gl_l, gl_t, gl_r, gl_b,
-						    eye_pos.eyes[ei_q].x, eye_pos.eyes[ei_q].y, eye_pos.eyes[ei_q].z,
-						    src_col, src_row, half_w, half_h, ca_w, ca_h, gcorners, gw);
-						blit_set_quad_corners(gcb, gcorners, gw);
-						gcb->dst_offset[0] = 0; gcb->dst_offset[1] = 0;
-						gcb->dst_rect_wh[0] = 0; gcb->dst_rect_wh[1] = 0;
-					} else {
-						float margin_px_x = UI_GLOW_MARGIN_M / mc->clients[s].window_width_m * dest_px_w;
-						float margin_px_y = UI_GLOW_MARGIN_M / mc->clients[s].window_height_m * dest_px_h;
-						gcb->quad_mode = 0;
-						gcb->dst_offset[0] = dest_px_x - margin_px_x;
-						gcb->dst_offset[1] = dest_px_y - margin_px_y;
-						gcb->dst_rect_wh[0] = dest_px_w + 2.0f * margin_px_x;
-						gcb->dst_rect_wh[1] = dest_px_h + 2.0f * margin_px_y;
-						memset(gcb->quad_corners_01, 0, sizeof(gcb->quad_corners_01));
-						memset(gcb->quad_corners_23, 0, sizeof(gcb->quad_corners_23));
-					}
-					sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
-
-					sys->context->VSSetShader(sys->blit_vs.get(), nullptr, 0);
-					sys->context->PSSetShader(sys->blit_ps.get(), nullptr, 0);
-					sys->context->VSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
-					sys->context->PSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
-					sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
-					ID3D11RenderTargetView *glow_rtvs[] = {mc->combined_atlas_rtv.get()};
-					sys->context->OMSetRenderTargets(1, glow_rtvs, nullptr);
-					sys->context->OMSetBlendState(sys->blend_premul.get(), nullptr, 0xFFFFFFFF);
-					sys->context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-					sys->context->IASetInputLayout(nullptr);
-					sys->context->RSSetState(sys->rasterizer_state.get());
-					sys->context->OMSetDepthStencilState(sys->depth_disabled.get(), 0);
-					D3D11_VIEWPORT gvp = {};
-					gvp.Width = (float)ca_w; gvp.Height = (float)ca_h; gvp.MaxDepth = 1.0f;
-					sys->context->RSSetViewports(1, &gvp);
-					sys->context->Draw(4, 0);
-				}
-			}
+			// Phase 2.K Commit 8.G: focus rim glow now drawn AFTER content
+			// blit (see end of v-loop) so the rim overlays the window edge
+			// rather than peeking out from behind. The rim uses the content
+			// quad's own corners — under tilt, project_local_rect_for_eye
+			// has already projected those corners, so the rim follows the
+			// window's orientation automatically with no extra plumbing.
 
 			if (show_spinner) {
 				// Loading placeholder: 8 small circles arranged
@@ -7282,6 +7205,63 @@ after_key_shortcuts:
 				sys->context->OMSetBlendState(sys->blend_alpha.get(), nullptr, 0xFFFFFFFF);
 
 				sys->context->Draw(4, 0);
+
+				// Phase 2.K Commit 8.G: inner-edge rim glow for the focused
+				// window, drawn AFTER content so the rim sits on the visible
+				// edge. Reuses the same projected quad (rotated) or axis-
+				// aligned dst rect as the content blit, so the rim follows
+				// the window's tilt naturally — uv01 in the rim shader is
+				// across whichever shape the vertex shader produced.
+				if (s == mc->focused_slot && sys->blit_vs && sys->blit_ps) {
+					D3D11_MAPPED_SUBRESOURCE rim_mapped;
+					if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
+					              D3D11_MAP_WRITE_DISCARD, 0, &rim_mapped))) {
+						BlitConstants *rcb = static_cast<BlitConstants *>(rim_mapped.pData);
+						rcb->src_rect[0] = 0; rcb->src_rect[1] = 0;
+						rcb->src_rect[2] = 1; rcb->src_rect[3] = 1;
+						rcb->src_size[0] = 1; rcb->src_size[1] = 1;
+						rcb->dst_size[0] = (float)ca_w;
+						rcb->dst_size[1] = (float)ca_h;
+						rcb->convert_srgb = 4.0f;  // inner-rim mode
+						rcb->chrome_alpha = 0.0f;
+						rcb->corner_radius = 0; rcb->corner_aspect = 0;
+						// Per-axis rim band width (uv01-fraction). Glow_extent
+						// in X, edge_feather in Y so the rim has uniform
+						// physical thickness on non-square windows.
+						float win_w_m_local = mc->clients[s].window_width_m;
+						float win_h_m_local = mc->clients[s].window_height_m;
+						float rim_m = UI_GLOW_MARGIN_M * 0.6f; // narrower than the legacy halo
+						rcb->glow_extent = rim_m / win_w_m_local;
+						rcb->edge_feather = rim_m / win_h_m_local;
+						rcb->glow_intensity = UI_GLOW_INTENSITY;
+						rcb->glow_falloff = UI_GLOW_FALLOFF;
+						rcb->glow_color[0] = UI_GLOW_R;
+						rcb->glow_color[1] = UI_GLOW_G;
+						rcb->glow_color[2] = UI_GLOW_B;
+						rcb->glow_color[3] = 1.0f;
+						if (use_quad) {
+							blit_set_quad_corners(rcb, quad_corners, quad_w_vals);
+							rcb->dst_offset[0] = 0; rcb->dst_offset[1] = 0;
+							rcb->dst_rect_wh[0] = 0; rcb->dst_rect_wh[1] = 0;
+						} else {
+							rcb->quad_mode = 0;
+							rcb->dst_offset[0] = dest_px_x;
+							rcb->dst_offset[1] = dest_px_y;
+							rcb->dst_rect_wh[0] = dest_px_w;
+							rcb->dst_rect_wh[1] = dest_px_h;
+							memset(rcb->quad_corners_01, 0, sizeof(rcb->quad_corners_01));
+							memset(rcb->quad_corners_23, 0, sizeof(rcb->quad_corners_23));
+						}
+						sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
+						sys->context->OMSetBlendState(sys->blend_premul.get(), nullptr, 0xFFFFFFFF);
+						sys->context->OMSetDepthStencilState(sys->depth_disabled.get(), 0);
+						sys->context->Draw(4, 0);
+						// Restore alpha blend + depth-test for next iteration
+						// in case more content is drawn this loop.
+						sys->context->OMSetBlendState(sys->blend_alpha.get(), nullptr, 0xFFFFFFFF);
+						sys->context->OMSetDepthStencilState(sys->depth_test_enabled.get(), 0);
+					}
+				}
 			}
 		}
 
@@ -7513,6 +7493,40 @@ after_key_shortcuts:
 							}
 						}
 					}
+					// Phase 2.K Commit 8.E: app icon at pill left, mirror-inset
+					// vs the close button at pill right. Reuses the launcher's
+					// loaded SRVs (matched by app name, ignoring the " (N)"
+					// duplicate-instance suffix). No icon → leave blank.
+					//
+					// Limitation: the running client's app_name is its OpenXR
+					// applicationName (e.g. "SRCubeOpenXRExt") while the
+					// launcher's entry name is the sidecar's friendly name
+					// ("Cube D3D11 (Handle)"). Test apps don't match. Phase
+					// 2.C lifts chrome into the controller, where the
+					// controller already knows the exe path it launched and
+					// can hand the runtime a pre-resolved icon directly.
+					ID3D11ShaderResourceView *app_icon_srv = nullptr;
+					uint32_t app_icon_w = 0, app_icon_h = 0;
+					{
+						char base_name[128];
+						snprintf(base_name, sizeof(base_name), "%s",
+						         mc->clients[s].app_name);
+						char *paren = strrchr(base_name, '(');
+						if (paren && paren > base_name && *(paren - 1) == ' ') {
+							*(paren - 1) = '\0';
+						}
+						uint32_t n_apps = sys->launcher_app_count;
+						if (n_apps > IPC_LAUNCHER_MAX_APPS) n_apps = IPC_LAUNCHER_MAX_APPS;
+						for (uint32_t li = 0; li < n_apps; li++) {
+							if (strcmp(sys->launcher_apps[li].name, base_name) == 0) {
+								app_icon_srv = sys->launcher_icons[li].srv_2d.get();
+								app_icon_w = sys->launcher_icons[li].w_2d;
+								app_icon_h = sys->launcher_icons[li].h_2d;
+								break;
+							}
+						}
+					}
+
 					// Phase 2.K Commit 8 tweak 3: buttons drawn as circles
 					// inset within their 8mm × 8mm slot so they read as
 					// distinct controls rather than connected rectangles
@@ -7522,6 +7536,42 @@ after_key_shortcuts:
 					float btn_inset_y = tb_h_m * BTN_INSET_FRAC;
 					float btn_inset_px_x = (float)CLOSE_BTN_WIDTH_PX * BTN_INSET_FRAC;
 					float btn_inset_px_y = toh * BTN_INSET_FRAC;
+
+					// 8.E: blit the app icon (if any) at the pill's left edge.
+					// Sized to match the round buttons' visible square (post-inset)
+					// so icon and buttons share visual weight.
+					if (app_icon_srv != nullptr) {
+						D3D11_MAPPED_SUBRESOURCE mapped;
+						if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
+						              D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+							BlitConstants *cb = static_cast<BlitConstants *>(mapped.pData);
+							cb->src_rect[0] = 0;
+							cb->src_rect[1] = 0;
+							cb->src_rect[2] = (float)app_icon_w;
+							cb->src_rect[3] = (float)app_icon_h;
+							cb->src_size[0] = (float)app_icon_w;
+							cb->src_size[1] = (float)app_icon_h;
+							cb->dst_size[0] = (float)ca_w;
+							cb->dst_size[1] = (float)ca_h;
+							cb->convert_srgb = 0.0f;  // icon SRV is already _SRGB-typed
+							cb->chrome_alpha = chrome_fade_attenuation;
+							cb->corner_radius = -0.20f;
+							cb->corner_aspect = -1.0f;
+							cb->edge_feather = 0.05f;
+							cb->glow_intensity = 0.0f;
+							float icon_x_px = tox + btn_inset_px_x;
+							float icon_w_px = (float)CLOSE_BTN_WIDTH_PX - 2.0f * btn_inset_px_x;
+							float icon_h_px = toh - 2.0f * btn_inset_px_y;
+							float icon_y_px = toy + btn_inset_px_y;
+							sys->context->PSSetShaderResources(0, 1, &app_icon_srv);
+							CHROME_BLIT_POS(cb,
+							    -pill_hw + btn_inset_m, pill_top_m - btn_inset_y,
+							    -pill_hw + btn_w_m_val - btn_inset_m, pill_bot_m + btn_inset_y,
+							    icon_x_px, icon_y_px, icon_w_px, icon_h_px);
+							sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
+							sys->context->Draw(4, 0);
+						}
+					}
 					// Close button (red circle)
 					{
 						D3D11_MAPPED_SUBRESOURCE mapped;
@@ -7730,7 +7780,7 @@ after_key_shortcuts:
 								cb->corner_radius = 0; cb->corner_aspect = 0;
 								cb->edge_feather = 0.0f; cb->glow_intensity = 0.0f;
 								CHROME_BLIT_POS(cb,
-								    xg_left, xg_top, xg_left + glyph_w_m, xg_top - glyph_h_m,
+								    xg_left, xg_top, xg_left + glyph_w_m, xg_top - glyph_render_h_m,
 								    bx, toy + gpad + GLYPH_Y_BIAS_PX, dst_gw, gh);
 								sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
 								sys->context->Draw(4, 0);
@@ -7759,7 +7809,7 @@ after_key_shortcuts:
 								cb->corner_radius = 0; cb->corner_aspect = 0;
 								cb->edge_feather = 0.0f; cb->glow_intensity = 0.0f;
 								CHROME_BLIT_POS(cb,
-								    mg_left, mg_top, mg_left + glyph_w_m, mg_top - glyph_h_m,
+								    mg_left, mg_top, mg_left + glyph_w_m, mg_top - glyph_render_h_m,
 								    mx, toy + gpad + GLYPH_Y_BIAS_PX, dst_gw, gh);
 								sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
 								sys->context->Draw(4, 0);
