@@ -1,8 +1,8 @@
 # Phase 2.C Status: Controller-Owned Chrome
 
 **Branch:** `feature/workspace-extensions-2C` (off `feature/workspace-extensions-2K` tip)
-**Status:** C1, C2, C3.A, C3.B (visual fixed), C3.C-1, C3.C-2, C4, C3.C-4, C5 committed. Runtime now ships with **zero default chrome** — controller-owned chrome is the only chrome path. Remaining: C3.C-3 (icons + glyphs, deferred polish) → C6 (docs in progress; test app smoke deferred).
-**Date:** 2026-05-01
+**Status:** C1, C2, C3.A, C3.B, C3.C-1, C3.C-2, C4, C3.C-4, C5, C3.C-3a (icon + glassy polish), spec_version 8 (event-driven wakeup + auto-anchor chrome layout) committed. Runtime now ships with **zero default chrome** — controller-owned chrome is the only chrome path; idle CPU effectively zero (event-driven, no poll loop); pill tracks window edge in lockstep with content during resize (no IPC roundtrip per frame). Remaining: C3.C-3b (DirectWrite title-text atlas) → C6 (test app smoke + final doc pass).
+**Date:** 2026-05-01 (last updated end-of-session after spec_version 8 + C3.C-3a)
 
 ## Scope
 
@@ -26,8 +26,13 @@ Lift the floating-pill chrome (pill bg, grip dots, close/min/max buttons, app ic
 | [x] | C4 | Hit-test plumbing — chrome quad raycast, `chromeRegionId` on POINTER / POINTER_MOTION events; shell dispatches close → exit RPC, max → fullscreen RPC |
 | [x] | C3.C-4 | Hover-fade ease-out cubic + state-change re-render — per-slot fade alpha baked into chrome image, 150 ms hover-in / 300 ms hover-out, idle = zero GPU work |
 | [x] | C5 | Delete in-runtime chrome render block, focus-rim glow, fade machinery (~700 lines net deletion). Runtime ships with zero default chrome. |
-| [ ] | C3.C-3 | App icon (per-client PNG load + texture) + DirectWrite glyph atlas — **deferred polish** |
-| [~] | C6 | Spec + separation-of-concerns + audit + plan docs (in progress); test app smoke deferred |
+| [x] | C3.C-3a | Per-client app icon (PID → exe → registered_app icon_path; .ico extraction fallback via PrivateExtractIconsA + cached PNG under %TEMP%; stb_image decode; D3D11 texture + SRV; rounded-square mask in PS) |
+| [x] | spec_v8: wakeup | Event-driven shell wakeup — `xrAcquireWorkspaceWakeupEventEXT` returns a Win32 HANDLE; runtime SetEvents on input event push + hovered/focused-slot transitions; shell's `MsgWaitForMultipleObjects` waits on it. Idle CPU drops from ~0.1 % → 0; hover transitions reach the shell with zero latency. |
+| [x] | spec_v8: auto-anchor | `XrWorkspaceChromeLayoutEXT.anchorToWindowTopEdge` + `widthAsFractionOfWindow` flags. Runtime auto-recomputes chrome center/width every frame from CURRENT window dims; shell pushes layout once at create and never on resize. Pill tracks window edge in lockstep with content. |
+| [x] | spec_v8: pose-changed | New `XR_WORKSPACE_INPUT_EVENT_WINDOW_POSE_CHANGED_EXT` event lets controllers react to runtime-driven pose / size changes (edge resize, fullscreen toggle). |
+| [x] | spec_v8: glassy polish | Lighter / more transparent pill bg (22 % alpha, edge highlight ring); semi-transparent buttons with procedural × / − / □ glyphs in PS. |
+| [ ] | C3.C-3b | DirectWrite title-text atlas — render the per-client app name between icon and grip dots. Adaptive width: skip text when the pill is too narrow. (next session) |
+| [~] | C6 | Spec + separation-of-concerns + audit + plan docs (mostly done, will need a small refresh after C3.C-3b); test app smoke deferred |
 
 ## Commits
 
@@ -43,6 +48,9 @@ Lift the floating-pill chrome (pill bg, grip dots, close/min/max buttons, app ic
 - `3264496bf` shell: Phase 2.C C3.C-4 — chrome hover-fade + state-change re-render
 - `522db1ad5` runtime + shell: Phase 2.C C3.C-4 follow-up — POINTER_HOVER + RMB pitch fix
 - `0160c1567` runtime: Phase 2.C C5 — delete in-runtime chrome render block
+- `dd8e16747` docs: Phase 2.C C6 — spec_version 7 + audit + plan + separation-of-concerns
+- `2b8a853b9` runtime + shell: Phase 2.C C3.C-4 polish — chrome hover-fade visible (POINTER_HOVER client_id; poll-while-chrome-alive)
+- `bb601f938` Phase 2.C C3.C-3a + spec_version 8 — event wakeup, auto-anchor, glassy polish
 
 ## Design Decisions
 
@@ -55,22 +63,23 @@ Lift the floating-pill chrome (pill bg, grip dots, close/min/max buttons, app ic
 - **Runtime acquires the keyed mutex when reading the chrome SRV.** Service-created swapchains' `swapchain_wait_image` is a no-op server-side; the runtime is the reader and must `IDXGIKeyedMutex::AcquireSync(0)` itself before `PSSetShaderResources` + `Draw`. Hoisted above the per-view loop — one acquire/release per composite tick. Without this, cross-process GPU writes from the shell's D3D11 device are not visible on the runtime's D3D11 device. Was the C3.B "visual not appearing" root cause.
 - **Pill SDF in pill-space meters.** Chrome image is fixed 512×64 px sRGB. The pill quad it composites onto can be any aspect (typical: 16:1). Rasterizing the SDF in pill-space meters (passed via cbuffer) keeps corners + button circles geometrically correct under arbitrary stretch. Single-pass shader composes pill bg, grip dots, and 3 buttons via Porter-Duff "src over" — back-to-front, straight-alpha.
 - **Anim-target dims for initial chrome layout.** When chrome is created in the lazy retry loop while a slot animation is still in flight (e.g. the auto grid preset just seeded but hasn't settled), `shell_slot_anim_get_target` returns the animation's destination dims. Without this the chrome locked in mid-glide / pre-preset dims and rendered at the wrong size for a different window. Closes the C3.B-debug position artifact.
+- **POINTER_HOVER carries the OpenXR client_id, not `1000 + slot_index`.** Slots store the OpenXR client_id at chrome registration time (`workspace_client_id`) and the drain emits it. Lets the shell match hover events to its chrome by the same id it used at create time, instead of the runtime's internal slot-index convention.
+- **Event-driven wakeup, not polling.** `xrAcquireWorkspaceWakeupEventEXT` (spec_version 8) returns a Win32 HANDLE the shell waits on. Runtime SetEvents it on every public-event ring push (POINTER / KEY / SCROLL / MOTION) and on hovered/focused-slot transitions detected per-frame in `render_pass`. Auto-reset semantics; controller drains all pending state on each wake. Replaces a 60 Hz polling loop while chrome was alive — idle CPU drops to effectively 0; hover transitions reach the shell with zero perceptible latency.
+- **Chrome layout is invariant under window resize via auto-anchor.** `anchorToWindowTopEdge` + `widthAsFractionOfWindow` (spec_version 8) tell the runtime to recompute chrome center y / width every frame from CURRENT `window_height_m` / `window_width_m`. Without this, the controller's per-event push_layout always carried stale dims (the controller observed last-frame state) and the pill visibly lagged one frame behind the window edge during a drag. With auto-anchor the shell pushes layout ONCE at create and never on resize — runtime keeps chrome glued to the window edge in real time.
+- **Edge-resize handles use CONTENT bounds, not extended-with-chrome bounds.** C4 originally extended `ext_top` to include the chrome quad so chrome hits would register; that also moved the resize handle ABOVE the visual content top. Decoupled: outer hover bounds still extend (so chrome hits work), but `RESIZE_TOP` is computed from `win_top` ± `resize_zone_m` so the user grabs at the visible content top edge.
+- **RMB drag pitch reads from `euler.z` (X-axis rotation), not `euler.x`.** `math_quat_to_euler_angles` uses Eigen's Z-Y-X decomposition and writes `(.x = roll, .y = yaw, .z = pitch)`. Long-standing first-RMB-down pitch-snap bug was reading the roll component as pitch.
 
 ## Open issues
 
-- **C3.B-debug commit left a behavior change in the keyed-mutex AcquireSync timeout** (currently 4 ms). If the shell's GPU is slow to flush its writes, the runtime's acquire could time out and the chrome blit silently uses stale texture content. Worth instrumenting with a one-shot warn-log if the acquire ever fails. Not yet observed.
-- **In-runtime chrome still draws** (additive composite). The runtime currently renders BOTH the in-runtime pill AND the controller-submitted pill. The depth bias + draw order means the controller pill wins where it overlaps. Both pills now fade in/out together (since C3.C-4 follow-up routed the same hover signal to both). C5 deletes the in-runtime path entirely.
-- **Focus-rim glow is rectangular** — pre-existing runtime-side polish item (visible since Phase 2.K). The blue inward halo around the focused window's content quad doesn't follow the rounded corners. Lives in the runtime's render block (not in the controller chrome). Address as a runtime polish pass independent of Phase 2.C, or fold into C5 when the in-runtime chrome render block is being touched anyway.
+- **Pill image stretches during horizontal resize until 100 ms after release.** The chrome IMAGE has button slots and dot circles baked in pill-space-meters of the LAST render. Width changes scale `pill_w_m` but the runtime composites the cached image stretched onto the new quad — buttons/dots momentarily look elongated until the debounced post-resize re-render fires. Vertical resize is unaffected (pill width unchanged). Documented; could be mitigated by image-pixel-space SDF (always slight elongation, never wobble) but trade-off was not deemed worth it.
+- **Keyed-mutex AcquireSync timeout is 4 ms.** If the shell's GPU is slow to flush its writes, the runtime's acquire could time out and the chrome blit silently uses stale texture content. Worth instrumenting with a one-shot warn-log if the acquire ever fails. Not yet observed in practice.
+- **Test apps have no app-name string.** `XrWorkspaceClientInfoEXT.name` is the OpenXR `applicationName` (e.g. `SRCubeOpenXRExt`). Registered_app `name` is the friendly sidecar name (e.g. `Cube D3D11 (Handle)`). They don't match for test apps. C3.C-3b will need a PID-based lookup for the title text, mirroring the icon resolution.
 
-## Next-step plan (session order)
+## Next-step plan
 
-**C5 — Delete in-runtime chrome render block + animation machinery.** ~600 lines of deletions in `comp_d3d11_service.cpp`: the chrome render block (~7297–7889), `slot_chrome_fade_*` machinery (5327–5368), `chrome_alpha` cbuffer field, and the in-runtime hit-test fields on `workspace_hit_result` (in_close_btn, in_minimize_btn, in_maximize_btn, in_grip_handle, in_title_bar) once the runtime's cursor + drag logic that consumes them is migrated to the shell or deleted. Validates the architecture: runtime ships with zero default chrome, only the controller-submitted version remains. Without a controller, clients show as bare quads.
+**C3.C-3b — Title text via DirectWrite glyph atlas.** Render the per-client app name between the icon and grip dots in the pill. Fresh-session work, ~300–500 lines. See [`spatial-workspace-extensions-phase2C-c3c3b-agent-prompt.md`](spatial-workspace-extensions-phase2C-c3c3b-agent-prompt.md) for the focused agent prompt.
 
-After C5: `hit_result_to_region` returns `XR_WORKSPACE_HIT_REGION_CHROME_EXT` (= 6) for chrome-quad hits, dropping the legacy CLOSE_BUTTON / MIN / MAX / TITLE_BAR codes. Controllers disambiguate via `chromeRegionId`.
-
-**C3.C-3 — App icon + DirectWrite glyphs (deferred polish).** App icon: per-client PID → exe → registered-app icon_path lookup, PNG decode via stb_image, D3D11 texture + SRV, shader extension to sample. Glyphs: heavy infra (DirectWrite atlas baking, ~400–600 lines port from runtime). Both are pure visual polish — not architectural — and the existing pill + dots + buttons is enough to demonstrate the controller-owned chrome architecture works end-to-end. Land in a follow-up session.
-
-**C6 — Test app smoke + spec/audit docs.** chrome smoke in `workspace_minimal_d3d11_win`; spec doc update for `XR_EXT_spatial_workspace` v7; separation-of-concerns doc update; audit entry; mark Phase 2.C ✅ shipped.
+**C6 — Test app smoke + final doc pass.** Chrome-swapchain smoke in `workspace_minimal_d3d11_win` (~200 lines: create chrome swapchain, fill with checkerboard, set 2 hit regions, drain events, verify chromeRegionId). Spec doc refresh to mention spec_version 8 fields + the new `WINDOW_POSE_CHANGED` event + the wakeup-event PFN. Audit entry update. Mark Phase 2.C ✅ shipped.
 
 ## Files Touched (Phase 2.C across all sub-steps)
 
@@ -102,6 +111,7 @@ Shell:
 ## Hand-off
 
 - Branch sequence (`2G → 2K → 2C`) stays in flight. Don't merge to main.
-- All major architectural pieces are in place: chrome image authored controller-side, runtime composites it via cross-process keyed-mutex, hit-test fills `chromeRegionId`, shell handles close + max + hover-fade. The remaining work (C5, C3.C-3, C6) is cleanup + polish + docs.
-- **Verification before C5**: live-test on the LP-3D unit. Move cursor over a window's chrome → that pill should fade IN to full opacity (~150 ms); other windows' chromes should fade OUT (~300 ms). Click close button → window should exit. Click max button → window toggles fullscreen. Once verified, C5 deletes the in-runtime chrome path and only the controller path remains.
-- Per `feedback_test_before_ci.md`: any new agent / session continuing here must build + smoke locally before pushing.
+- Phase 2.C is **architecturally complete and visually production-ready** save for the title text. The runtime owns zero pixels of UI policy. The controller-side chrome is fully interactive (hit-test, click dispatch, hover-fade, drag/resize tracking, app icons), event-driven (zero idle CPU), and visually polished (glassy frosted-blue pill matching the concept art).
+- C3.C-3b (title text) is the only remaining visual polish. Plan + scope + heuristics live in [`spatial-workspace-extensions-phase2C-c3c3b-agent-prompt.md`](spatial-workspace-extensions-phase2C-c3c3b-agent-prompt.md).
+- C6 (test app smoke + final doc refresh) closes Phase 2.C.
+- Per `feedback_test_before_ci.md`: any continuing session must build + smoke locally before pushing.
