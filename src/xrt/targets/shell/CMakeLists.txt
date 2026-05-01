@@ -61,7 +61,8 @@ if(WIN32)
     # Comdlg32: GetOpenFileNameA (Phase 5.14 Browse-for-app tile)
     # D3D11/DXGI: Phase 2.C — shell creates an ID3D11Device on the runtime's
     #     adapter to author chrome swapchain images.
-    target_link_libraries(displayxr-shell PRIVATE dbghelp comdlg32 d3d11 dxgi)
+    # D3DCompiler: Phase 2.C C3.C — runtime HLSL compile for chrome shaders.
+    target_link_libraries(displayxr-shell PRIVATE dbghelp comdlg32 d3d11 dxgi d3dcompiler)
 endif()
 
 install(TARGETS displayxr-shell RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})

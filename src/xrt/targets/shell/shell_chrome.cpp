@@ -18,6 +18,7 @@
 #include <windows.h>
 
 #include <d3d11.h>
+#include <d3dcompiler.h>
 #include <wrl/client.h>
 
 #define XR_USE_GRAPHICS_API_D3D11
@@ -68,6 +69,17 @@ struct chrome_slot
 
 } // namespace
 
+// Constant buffer for the rounded-pill shader. Layout matches the HLSL cbuffer
+// at register b0. Sized to a multiple of 16 bytes for D3D11.
+struct PillCB
+{
+	float pill_size_m[2];     // pill width/height in METERS (used as SDF space)
+	float corner_radius_m;    // corner radius in METERS (full pill = pill_h_m * 0.5)
+	float _pad0;
+	float fill_color[4];      // straight RGBA — alpha is the base pill opacity
+};
+static_assert(sizeof(PillCB) % 16 == 0, "PillCB must be 16-byte aligned");
+
 struct shell_chrome
 {
 	struct shell_openxr_state *xr;
@@ -78,6 +90,14 @@ struct shell_chrome
 
 	// Resolved at create.
 	PFN_xrEnumerateSwapchainImages enum_images;
+
+	// Shader pipeline for the rounded-pill render. Compiled once at create.
+	ComPtr<ID3D11VertexShader>   vs_pill;
+	ComPtr<ID3D11PixelShader>    ps_pill;
+	ComPtr<ID3D11Buffer>         cb_pill;
+	ComPtr<ID3D11RasterizerState> rs_state;
+	ComPtr<ID3D11BlendState>     bs_passthrough;  // overwrite RTV — controller owns the chrome image
+	ComPtr<ID3D11DepthStencilState> dss_disabled;
 };
 
 namespace {
@@ -118,25 +138,190 @@ release_slot_resources(chrome_slot &slot, shell_chrome *sc)
 	slot.texture.Reset();
 }
 
-// Render the floating-pill design into the chrome image[0]. C3.B initial:
-// solid frosted-glass color clear. C3.C will add grip dots, buttons, icon,
-// glyphs, focus rim, hover-fade.
+// SDF-based rounded-pill HLSL. Vertex shader emits a unit quad from
+// SV_VertexID (4-vertex triangle strip). Pixel shader rasterizes the
+// rounded rectangle in PILL-SPACE METERS (passed via cbuffer) so the
+// corner ends are circular regardless of how the chrome image is
+// stretched onto the pill quad. fwidth() gives derivative-based 1-pixel
+// AA at whatever the actual rasterization scale is.
+const char *PILL_SHADER_HLSL = R"(
+struct VSOut
+{
+    float4 pos : SV_Position;
+    float2 uv  : TEXCOORD0;
+};
+
+VSOut VS(uint vid : SV_VertexID)
+{
+    // 4-vertex triangle strip:  (0,1) (0,0) (1,1) (1,0)  → covers [0,1]^2 UV
+    float2 uvs[4] = { float2(0,1), float2(0,0), float2(1,1), float2(1,0) };
+    VSOut o;
+    o.uv  = uvs[vid];
+    o.pos = float4(o.uv.x * 2.0 - 1.0, 1.0 - o.uv.y * 2.0, 0.0, 1.0);
+    return o;
+}
+
+cbuffer PillCB : register(b0)
+{
+    float2 pill_size_m;     // pill width/height in METERS
+    float  corner_radius_m; // corner radius in METERS
+    float  _pad0;
+    float4 fill_color;      // straight RGBA
+};
+
+float4 PS(VSOut input) : SV_Target
+{
+    // Map UV to pill-space meters so the SDF is correct under arbitrary
+    // image-to-quad stretch.
+    float2 p = input.uv * pill_size_m;
+    float2 center = pill_size_m * 0.5;
+    float2 half_dim = pill_size_m * 0.5 - corner_radius_m;
+    float2 d = abs(p - center) - half_dim;
+    float dist = length(max(d, 0.0)) + min(max(d.x, d.y), 0.0) - corner_radius_m;
+
+    // Derivative-based 1-pixel AA at the actual rasterization density.
+    float aa = max(fwidth(dist), 1e-6);
+    float coverage = saturate(0.5 - dist / aa);
+    return float4(fill_color.rgb, fill_color.a * coverage);
+}
+)";
+
+bool
+compile_shader_blob(const char *src, const char *entry, const char *target,
+                    ComPtr<ID3DBlob> &out_blob)
+{
+	ComPtr<ID3DBlob> err;
+	HRESULT hr = D3DCompile(src, std::strlen(src), nullptr, nullptr, nullptr,
+	                        entry, target,
+	                        D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
+	                        out_blob.GetAddressOf(), err.GetAddressOf());
+	if (FAILED(hr)) {
+		PE("shell_chrome: shader compile (%s/%s) failed: 0x%08lx — %s\n",
+		   entry, target, hr, err ? (const char *)err->GetBufferPointer() : "(no log)");
+		return false;
+	}
+	return true;
+}
+
+bool
+init_shader_pipeline(shell_chrome *sc)
+{
+	ComPtr<ID3DBlob> vs_blob, ps_blob;
+	if (!compile_shader_blob(PILL_SHADER_HLSL, "VS", "vs_5_0", vs_blob)) return false;
+	if (!compile_shader_blob(PILL_SHADER_HLSL, "PS", "ps_5_0", ps_blob)) return false;
+
+	HRESULT hr = sc->device->CreateVertexShader(vs_blob->GetBufferPointer(),
+	                                            vs_blob->GetBufferSize(),
+	                                            nullptr, sc->vs_pill.GetAddressOf());
+	if (FAILED(hr)) { PE("shell_chrome: CreateVertexShader failed: 0x%08lx\n", hr); return false; }
+
+	hr = sc->device->CreatePixelShader(ps_blob->GetBufferPointer(),
+	                                    ps_blob->GetBufferSize(),
+	                                    nullptr, sc->ps_pill.GetAddressOf());
+	if (FAILED(hr)) { PE("shell_chrome: CreatePixelShader failed: 0x%08lx\n", hr); return false; }
+
+	D3D11_BUFFER_DESC bd = {};
+	bd.ByteWidth = sizeof(PillCB);
+	bd.Usage = D3D11_USAGE_DYNAMIC;
+	bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+	bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+	hr = sc->device->CreateBuffer(&bd, nullptr, sc->cb_pill.GetAddressOf());
+	if (FAILED(hr)) { PE("shell_chrome: CreateBuffer(cb_pill) failed: 0x%08lx\n", hr); return false; }
+
+	D3D11_RASTERIZER_DESC rsd = {};
+	rsd.FillMode = D3D11_FILL_SOLID;
+	rsd.CullMode = D3D11_CULL_NONE;
+	rsd.DepthClipEnable = TRUE;
+	hr = sc->device->CreateRasterizerState(&rsd, sc->rs_state.GetAddressOf());
+	if (FAILED(hr)) { PE("shell_chrome: CreateRasterizerState failed: 0x%08lx\n", hr); return false; }
+
+	// Passthrough blend: overwrite the chrome image. The controller owns
+	// every pixel of the chrome image; the runtime composites the image
+	// over the atlas with its own alpha blend. We don't want any blending
+	// inside the chrome image authoring step.
+	D3D11_BLEND_DESC bsd = {};
+	bsd.RenderTarget[0].BlendEnable = FALSE;
+	bsd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+	hr = sc->device->CreateBlendState(&bsd, sc->bs_passthrough.GetAddressOf());
+	if (FAILED(hr)) { PE("shell_chrome: CreateBlendState failed: 0x%08lx\n", hr); return false; }
+
+	D3D11_DEPTH_STENCIL_DESC dsd = {};
+	dsd.DepthEnable = FALSE;
+	dsd.StencilEnable = FALSE;
+	hr = sc->device->CreateDepthStencilState(&dsd, sc->dss_disabled.GetAddressOf());
+	if (FAILED(hr)) { PE("shell_chrome: CreateDepthStencilState failed: 0x%08lx\n", hr); return false; }
+
+	return true;
+}
+
+// Render the floating-pill design into the chrome image[0]. C3.C-1: rounded
+// frosted-blue pill via SDF pixel shader. Subsequent C3.C steps add grip
+// dots, buttons, icon, glyphs, focus rim, hover-fade.
 void
 render_pill(shell_chrome *sc, chrome_slot &slot)
 {
-	if (!slot.rtv) {
+	if (!slot.rtv || !sc->vs_pill || !sc->ps_pill) {
 		return;
 	}
 
-	// C3.B verification: paint a flagrant bright red so the controller chrome
-	// is unmistakable in the atlas — the in-runtime pill (still drawing
-	// until C5) is frosted blue, so anything red is from the shell. Will
-	// be replaced with the proper frosted-glass color in C3.C.
-	const float verify_red[4] = {0.85f, 0.10f, 0.10f, 0.85f};
-	sc->context->ClearRenderTargetView(slot.rtv.Get(), verify_red);
+	// Frosted-blue pill — matches the in-runtime chrome's color so the
+	// controller-rendered version is visually consistent at the C3.C-1
+	// checkpoint. Alpha 0.7 = semi-transparent so workspace content shows
+	// through the pill.
+	const float pill_w_m = slot.win_w_m * PILL_W_FRAC;
+	const float pill_h_m = PILL_HEIGHT_M;
+	const float corner_r = pill_h_m * 0.5f; // full pill — half-circle ends
+
+	D3D11_MAPPED_SUBRESOURCE mapped;
+	if (FAILED(sc->context->Map(sc->cb_pill.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+		return;
+	}
+	auto *cb = static_cast<PillCB *>(mapped.pData);
+	cb->pill_size_m[0] = pill_w_m;
+	cb->pill_size_m[1] = pill_h_m;
+	cb->corner_radius_m = corner_r;
+	cb->_pad0 = 0.0f;
+	cb->fill_color[0] = 0.20f;
+	cb->fill_color[1] = 0.22f;
+	cb->fill_color[2] = 0.28f;
+	cb->fill_color[3] = 0.70f;
+	sc->context->Unmap(sc->cb_pill.Get(), 0);
+
+	// Clear to fully transparent so the SDF coverage outside the pill
+	// leaves transparent pixels (the runtime composites the chrome image
+	// with alpha blending — transparent regions show the underlying
+	// content quad).
+	const float clear_transparent[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+	sc->context->ClearRenderTargetView(slot.rtv.Get(), clear_transparent);
+
+	ID3D11RenderTargetView *rtvs[] = {slot.rtv.Get()};
+	sc->context->OMSetRenderTargets(1, rtvs, nullptr);
+	sc->context->OMSetBlendState(sc->bs_passthrough.Get(), nullptr, 0xFFFFFFFF);
+	sc->context->OMSetDepthStencilState(sc->dss_disabled.Get(), 0);
+	sc->context->RSSetState(sc->rs_state.Get());
+
+	D3D11_VIEWPORT vp = {};
+	vp.Width = (float)CHROME_TEX_W;
+	vp.Height = (float)CHROME_TEX_H;
+	vp.MaxDepth = 1.0f;
+	sc->context->RSSetViewports(1, &vp);
+
+	D3D11_RECT scissor = {0, 0, (LONG)CHROME_TEX_W, (LONG)CHROME_TEX_H};
+	sc->context->RSSetScissorRects(1, &scissor);
+
+	sc->context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+	sc->context->IASetInputLayout(nullptr);
+	sc->context->VSSetShader(sc->vs_pill.Get(), nullptr, 0);
+	sc->context->PSSetShader(sc->ps_pill.Get(), nullptr, 0);
+	sc->context->VSSetConstantBuffers(0, 1, sc->cb_pill.GetAddressOf());
+	sc->context->PSSetConstantBuffers(0, 1, sc->cb_pill.GetAddressOf());
+
+	sc->context->Draw(4, 0);
+
 	// Flush so the GPU work is submitted before xrReleaseSwapchainImage
-	// signals the keyed mutex — otherwise the runtime's read on the other
-	// side of the shared NT handle samples uninitialized memory.
+	// releases the keyed mutex — the runtime's chrome composite (on a
+	// different D3D11 device) reads via the shared NT handle and would
+	// otherwise sample stale or uninitialized memory.
 	sc->context->Flush();
 }
 
@@ -261,7 +446,14 @@ shell_chrome_create(struct shell_openxr_state *xr)
 		return nullptr;
 	}
 
-	P("shell_chrome: ready (device=%p, context=%p)\n", (void *)sc->device, (void *)sc->context);
+	if (!init_shader_pipeline(sc)) {
+		PE("shell_chrome_create: shader pipeline init failed\n");
+		delete sc;
+		return nullptr;
+	}
+
+	P("shell_chrome: ready (device=%p, context=%p, pill shader compiled)\n",
+	  (void *)sc->device, (void *)sc->context);
 	return sc;
 }
 

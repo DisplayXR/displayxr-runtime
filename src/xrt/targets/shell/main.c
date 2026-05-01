@@ -371,6 +371,26 @@ shell_slot_anim_active_count(void)
 	return n;
 }
 
+// Read out the target window dims for an in-flight slot animation. Returns
+// true if an animation for `id` is currently active and writes target_w/h.
+// Used by the chrome create path so the very first chrome layout is sized
+// for the animation's destination rather than the mid-glide current dims —
+// otherwise the chrome stays at stale (often display-sized) dims because
+// `shell_chrome_on_window_resized` was a no-op when the preset apply ran
+// before the chrome existed.
+static bool
+shell_slot_anim_get_target(XrWorkspaceClientId id, float *target_w, float *target_h)
+{
+	for (int i = 0; i < SHELL_ANIM_MAX; i++) {
+		if (s_anims[i].active && s_anims[i].id == id) {
+			if (target_w) *target_w = s_anims[i].target_w;
+			if (target_h) *target_h = s_anims[i].target_h;
+			return true;
+		}
+	}
+	return false;
+}
+
 // Cancel any pending animation for `id`. Used when a client disconnects so we
 // don't keep pushing set_pose on a dead slot.
 static void
@@ -3291,6 +3311,17 @@ main(int argc, char *argv[])
 					continue;
 				}
 				if (!(w_m > 0.0f) || !(h_m > 0.0f)) continue;
+				// If an animation is in flight (e.g. the auto grid preset
+				// just seeded but hasn't settled), prefer the animation's
+				// target dims for the initial chrome layout. Otherwise the
+				// chrome locks in the mid-glide / pre-preset dims and the
+				// pill ends up sized + positioned for a different window.
+				float anim_w = 0.0f, anim_h = 0.0f;
+				if (shell_slot_anim_get_target(chr_ids[i], &anim_w, &anim_h) &&
+				    anim_w > 0.0f && anim_h > 0.0f) {
+					w_m = anim_w;
+					h_m = anim_h;
+				}
 				(void)shell_chrome_on_client_connected(g_chrome, chr_ids[i], w_m, h_m);
 			}
 			// Drop chrome for any disconnected clients (diff against prev_ids).
