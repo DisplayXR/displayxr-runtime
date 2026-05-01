@@ -41,6 +41,7 @@ Lift the floating-pill chrome (pill bg, grip dots, close/min/max buttons, app ic
 - `1a68c81c5` shell: Phase 2.C C3.C-2 — grip dots + close/min/max buttons
 - `722fbcd7e` runtime + shell: Phase 2.C C4 — chrome hit-test plumbing
 - `3264496bf` shell: Phase 2.C C3.C-4 — chrome hover-fade + state-change re-render
+- `522db1ad5` runtime + shell: Phase 2.C C3.C-4 follow-up — POINTER_HOVER + RMB pitch fix
 
 ## Design Decisions
 
@@ -57,7 +58,8 @@ Lift the floating-pill chrome (pill bg, grip dots, close/min/max buttons, app ic
 ## Open issues
 
 - **C3.B-debug commit left a behavior change in the keyed-mutex AcquireSync timeout** (currently 4 ms). If the shell's GPU is slow to flush its writes, the runtime's acquire could time out and the chrome blit silently uses stale texture content. Worth instrumenting with a one-shot warn-log if the acquire ever fails. Not yet observed.
-- **In-runtime chrome still draws** (additive composite). The runtime currently renders BOTH the in-runtime pill AND the controller-submitted pill. The depth bias + draw order means the controller pill wins where it overlaps. C5 deletes the in-runtime path entirely. Until then, the visual atlas screenshot can show two slightly-different pills if positions don't match exactly.
+- **In-runtime chrome still draws** (additive composite). The runtime currently renders BOTH the in-runtime pill AND the controller-submitted pill. The depth bias + draw order means the controller pill wins where it overlaps. Both pills now fade in/out together (since C3.C-4 follow-up routed the same hover signal to both). C5 deletes the in-runtime path entirely.
+- **Focus-rim glow is rectangular** — pre-existing runtime-side polish item (visible since Phase 2.K). The blue inward halo around the focused window's content quad doesn't follow the rounded corners. Lives in the runtime's render block (not in the controller chrome). Address as a runtime polish pass independent of Phase 2.C, or fold into C5 when the in-runtime chrome render block is being touched anyway.
 
 ## Next-step plan (session order)
 
