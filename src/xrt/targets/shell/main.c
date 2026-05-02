@@ -1718,6 +1718,52 @@ ensure_app_gpu_pref_high(const char *exe_path)
 	RegCloseKey(hkey);
 }
 
+// Find a top-level main window owned by the given PID. Used to apply alpha=0
+// to Unity's HWND after launch — Unity must think its window is visible (so
+// its render loop runs) but the user shouldn't see it.
+struct find_pid_hwnd_ctx {
+	DWORD pid;
+	HWND hwnd;
+};
+
+static BOOL CALLBACK
+find_pid_hwnd_proc(HWND hwnd, LPARAM lparam)
+{
+	struct find_pid_hwnd_ctx *c = (struct find_pid_hwnd_ctx *)lparam;
+	DWORD wpid = 0;
+	GetWindowThreadProcessId(hwnd, &wpid);
+	if (wpid != c->pid)
+		return TRUE;
+	if (GetWindow(hwnd, GW_OWNER) != NULL)
+		return TRUE; // skip child/owned windows
+	if (!IsWindowVisible(hwnd))
+		return TRUE;
+	RECT rc;
+	if (!GetClientRect(hwnd, &rc))
+		return TRUE;
+	if ((rc.right - rc.left) < 100)
+		return TRUE; // skip tiny helper windows
+	c->hwnd = hwnd;
+	return FALSE;
+}
+
+static HWND
+wait_for_main_hwnd(DWORD pid, int timeout_ms)
+{
+	struct find_pid_hwnd_ctx ctx = {0};
+	ctx.pid = pid;
+	int elapsed = 0;
+	while (elapsed < timeout_ms) {
+		ctx.hwnd = NULL;
+		EnumWindows(find_pid_hwnd_proc, (LPARAM)&ctx);
+		if (ctx.hwnd != NULL)
+			return ctx.hwnd;
+		Sleep(50);
+		elapsed += 50;
+	}
+	return NULL;
+}
+
 /*!
  * Launch an app with DISPLAYXR_WORKSPACE_SESSION=1 and XR_RUNTIME_JSON set.
  */
@@ -1754,15 +1800,26 @@ launch_app(struct app_entry *app, const char *runtime_json)
 	char cmd[MAX_PATH + 16];
 	snprintf(cmd, sizeof(cmd), "\"%s\"", abs_path);
 
+	// Phase 6.1 (#140): start the app with its window hidden by default. In
+	// shell mode the app's HWND on the 3D display disrupts the SR weaver and
+	// causes a multi-second stretch artifact. The app's content is captured
+	// via shared handles into the multi-compositor atlas, so its own window
+	// doesn't need to be visible.
+	//
+	// Exception — Unity: Unity's render loop is gated on Win32 visibility
+	// regardless of Application.runInBackground; with SW_HIDE Unity stops
+	// calling xrEndFrame and the shell tile gets no content. Detect Unity by
+	// the presence of UnityPlayer.dll next to the exe (ships with every Unity
+	// standalone build) and show those windows un-activated instead so they
+	// keep rendering while the shell stays in the foreground.
+	char unity_marker[MAX_PATH];
+	snprintf(unity_marker, sizeof(unity_marker), "%s\\UnityPlayer.dll", exe_dir);
+	BOOL is_unity = (GetFileAttributesA(unity_marker) != INVALID_FILE_ATTRIBUTES);
+
 	STARTUPINFOA si = {0};
 	si.cb = sizeof(si);
-	// Phase 6.1 (#140): start the app with its window hidden. In shell
-	// mode, the app's HWND appearing on the 3D display disrupts the SR
-	// SDK's weaver and causes a multi-second stretch artifact. The app's
-	// content is captured via shared handles into the multi-compositor
-	// atlas, so its own window doesn't need to be visible.
 	si.dwFlags = STARTF_USESHOWWINDOW;
-	si.wShowWindow = SW_HIDE;
+	si.wShowWindow = is_unity ? SW_SHOWNOACTIVATE : SW_HIDE;
 	PROCESS_INFORMATION pi = {0};
 
 	BOOL ok = CreateProcessA(
@@ -1779,6 +1836,24 @@ launch_app(struct app_entry *app, const char *runtime_json)
 		app->pid = pi.dwProcessId;
 		P("Launched: %s (PID %lu)\n", app->exe_path, pi.dwProcessId);
 		CloseHandle(pi.hThread);
+
+		// Unity needs its window to stay "visible" to keep rendering, but
+		// the user shouldn't see it on the desktop. Mark the main HWND as a
+		// layered window with alpha=0 once Unity has created it.
+		if (is_unity) {
+			HWND hwnd = wait_for_main_hwnd(pi.dwProcessId, 5000);
+			if (hwnd != NULL) {
+				LONG_PTR ex = GetWindowLongPtrA(hwnd, GWL_EXSTYLE);
+				SetWindowLongPtrA(hwnd, GWL_EXSTYLE,
+				                  ex | WS_EX_LAYERED | WS_EX_TRANSPARENT);
+				SetLayeredWindowAttributes(hwnd, 0, 0, LWA_ALPHA);
+				P("Unity main HWND %p marked alpha=0 (kept rendering, hidden from view)\n",
+				  (void *)hwnd);
+			} else {
+				PE("Unity main HWND not found within 5s for PID %lu — window will stay visible\n",
+				   pi.dwProcessId);
+			}
+		}
 		return true;
 	} else {
 		PE("Failed to launch %s: error %lu\n", app->exe_path, GetLastError());
