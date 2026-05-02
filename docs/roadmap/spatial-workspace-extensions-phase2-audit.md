@@ -157,7 +157,12 @@ Below: the original 8 sub-steps, lowest-blast-radius first.
 
 See `spatial-workspace-extensions-phase2K-plan.md` for the full design and `spatial-workspace-extensions-phase2K-agent-prompt.md` for the per-commit hand-off.
 
-### Phase 2.J — Per-client visual style ✅ shipped (spec_version 9)
+### Phase 2.L — Per-client visual style ✅ shipped (spec_version 9)
+
+> Originally tagged "Phase 2.J" in the commit messages; renumbered to 2.L
+> after the fact because the followups doc reserves Phase 2.J for shell
+> repo extraction. The visual-style work is additive (a new EXT, not a
+> migration step), so a non-sequential letter is fine.
 
 **Touched:** Public surface bumped 8 → 9. New struct `XrWorkspaceClientStyleEXT` (cornerRadius, edgeFeatherMeters, focusGlowColor, focusGlowIntensity, focusGlowFalloffMeters) + new function `xrSetWorkspaceClientStyleEXT`. Wire form `ipc_workspace_client_style` in `ipc_protocol.h`. New RPC `workspace_set_client_style` in `proto.json`. State-tracker dispatch in `oxr_workspace.c` validates the struct and forwards. Compositor: per-slot `style_*` fields on `d3d11_multi_client_slot`, `comp_d3d11_service_set_client_style_by_slot` + `_set_capture_client_style` setters, `_set_focused_slot` helper so the IPC `xrSetWorkspaceFocusedClientEXT` path mirrors focus into the compositor's `mc->focused_slot` (so the focus glow tracks controller-set focus, not just click-driven). Workspace client content blit at `comp_d3d11_service.cpp:7340` reads slot style, applies cornerRadius + edge feather every frame, and emits an axis-aligned focus-glow pre-pass (existing `convert_srgb=3.0` glow shader path) for the focused slot. Reference shell pushes a default style on chrome lazy-create — 5 % rounded corners, 3 mm edge feather, 12 mm cyan-blue focus halo (matches the existing launcher-hover glow color).
 
@@ -169,11 +174,22 @@ See `spatial-workspace-extensions-phase2K-plan.md` for the full design and `spat
 
 **Risk realized:** Low. The IPC ↔ compositor focus-state mismatch (compositor's `mc->focused_slot` only updated on click/fullscreen, not on `xrSetWorkspaceFocusedClientEXT`) was a pre-existing latent issue surfaced by the focus-glow gating. Fixed by adding `comp_d3d11_service_set_focused_slot` and calling it from `ipc_handle_workspace_set_focused_client`.
 
-### Phase 2.H (final cleanup pass)
+### Phase 2.H — Final cleanup pass ✅ shipped
 
-**Touches:** All remaining mechanism mentions (~115 across 25+ clusters). Pure rename pass: `shell` → `workspace` in comments and log prefixes; `pending_shell_reentry` → `pending_workspace_reentry`; `last_shell_render_ns` → `last_workspace_render_ns`; `shell_input_event` → `workspace_input_event`; `shell_screenshot_*` filenames → `workspace_screenshot_*`; etc.
+**Touched:** All remaining mechanism mentions (~115 across 25+ clusters). Pure rename pass: `shell` → `workspace` in comments and log prefixes; `pending_shell_reentry` → `pending_workspace_reentry`; `last_shell_render_ns` → `last_workspace_render_ns`; `shell_input_event` → `workspace_input_event`; `shell_screenshot_*` filenames → `workspace_screenshot_*`; etc. After 2.H the runtime body has zero `shell_*` references that aren't legitimate references to the binary's literal name; all internal mechanism-level naming reads as `workspace_*`.
 
-**Risk:** Trivial — same perl-rename pattern Phase 1 used, with the lessons-learned-the-hard-way from `feedback_perl_rename_gotchas.md` (drop left `\b`, inline file lists).
+**Risk realized:** Trivial — same perl-rename pattern Phase 1 used, with the lessons-learned-the-hard-way from `feedback_perl_rename_gotchas.md` (drop left `\b`, inline file lists).
+
+### Phase 2.J — Shell repo extraction (NOT YET SHIPPED)
+
+**Outstanding** — see `spatial-workspace-extensions-followups.md` items #3, #4, #5, #6 for the full punch list. High-level:
+
+- **Prerequisite (followup #4):** runtime auto-detects workspace-controller sessions (sessions with `XR_EXT_spatial_workspace` enabled) and forces IPC mode in `u_sandbox.c::u_sandbox_should_use_ipc`. Once shipped, the shell drops the `SetEnvironmentVariableA("XRT_FORCE_MODE", "ipc")` hack from `shell_openxr.cpp::shell_openxr_init` and becomes genuinely runtime-agnostic.
+- **The extraction itself:** create new repo `DisplayXR/displayxr-shell-pvt` (mirroring the runtime's pvt/public split, since shell currently has private and public pieces); move `src/xrt/targets/shell/` to its own repo; mirror the build via `scripts/build_windows.bat`-style scripts; add a publish-public workflow (the shell can stay private until proven; public consumers depend on the API surface, not the implementation).
+- **Runtime-side cleanup:** drop `add_subdirectory(shell)` from `src/xrt/targets/CMakeLists.txt`; update `service_config.c`'s default binary literal from `"displayxr-shell.exe"` to either a config-only value or NULL (orchestrator no longer auto-spawns); delete the residual transitional `"shell"` JSON-key comments (`service_config.{c,h}`).
+- **UX regression to fix in the same window (followup #3):** post-2.I the shell can no longer auto-reconnect on service crash because the runtime DLL holds the IPC connection. Once the shell is in its own repo, wrap the `xrCreateInstance` activate-failure path with `xrDestroyInstance` + `xrCreateInstance` retry so service-crash recovery returns.
+
+**Risk:** Medium — touches CI workflows, repo creation, multi-repo coordination. The CODE move itself is mostly a `git mv` plus build scripts; the friction is in setting up the new repo's CI, secrets, and publish pipeline (DisplayXR has app-token-based cross-repo pushes already documented in CLAUDE.md, so this should follow the same pattern).
 
 ## Specific issues called out for Phase 2 sessions
 
