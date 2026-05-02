@@ -437,20 +437,17 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
 	switch (message) {
 	case WM_SETCURSOR:
-		// The compositor thread sets desired_cursor via InterlockedExchange.
-		// We read it here on the window thread and apply the correct cursor.
+		// Phase 2.J / 3D cursor: hide the OS cursor over the workspace
+		// window's client area. The runtime renders its own cursor sprite
+		// into the atlas at the per-frame raycast hit's z-depth (with
+		// per-eye disparity), so the OS cursor at z=0 would either fight
+		// with it or appear at a different perceived depth. SetCursor(NULL)
+		// hides the OS arrow but Win32 keeps tracking the cursor position
+		// for hit-test, drag operations, and event delivery — only the
+		// visual is suppressed. desired_cursor is still tracked (used by
+		// the runtime to pick which sprite to render).
 		if (LOWORD(lParam) == HTCLIENT) {
-			LONG cid = InterlockedCompareExchange(&w->desired_cursor, 0, 0);
-			HCURSOR cur;
-			switch (cid) {
-			case 1:  cur = LoadCursor(NULL, IDC_SIZEWE); break;
-			case 2:  cur = LoadCursor(NULL, IDC_SIZENS); break;
-			case 3:  cur = LoadCursor(NULL, IDC_SIZENWSE); break;
-			case 4:  cur = LoadCursor(NULL, IDC_SIZENESW); break;
-			case 5:  cur = LoadCursor(NULL, IDC_SIZEALL); break;
-			default: cur = LoadCursor(NULL, IDC_ARROW); break;
-			}
-			SetCursor(cur);
+			SetCursor(NULL);
 			return TRUE;
 		}
 		return DefWindowProcW(hWnd, message, wParam, lParam);

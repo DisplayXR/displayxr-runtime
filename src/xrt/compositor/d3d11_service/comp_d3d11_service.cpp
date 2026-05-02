@@ -378,6 +378,21 @@ struct d3d11_service_system
 	};
 	struct launcher_icon launcher_icons[IPC_LAUNCHER_MAX_APPS];
 
+	//! Phase 2.J / 3D cursor: Win32 system cursors (IDC_ARROW etc.) loaded
+	//! into D3D11 textures so the runtime can render them at the per-frame
+	//! ray-cast hit's z-depth with proper per-eye disparity. Indexed by the
+	//! same cursor_id 0..5 the OS-cursor-swap path uses (0=arrow, 1=sizewe,
+	//! 2=sizens, 3=sizenwse, 4=sizenesw, 5=sizeall). Hot spots stored too
+	//! so the rendered cursor's "click point" lands at the actual mouse
+	//! pixel instead of the bitmap's top-left.
+	struct cursor_image {
+		wil::com_ptr<ID3D11ShaderResourceView> srv;
+		uint32_t w = 0, h = 0;
+		int hot_x = 0, hot_y = 0;
+	};
+	struct cursor_image cursor_images[6];
+	bool cursor_images_loaded = false;
+
 	//! MCP capture_frame cross-thread hand-off (Phase B slice 7).
 	struct u_mcp_capture_request mcp_capture;
 
@@ -868,6 +883,19 @@ struct d3d11_multi_compositor
 	//! Workspace deactivated (Ctrl+Space): window hidden, DP released, captures stopped.
 	//! Unlike window_dismissed, the multi-comp structure stays alive for re-activation.
 	bool suspended;
+
+	//! Phase 2.J / 3D cursor: render state published by render_pass and consumed
+	//! by the cursor render pass after all atlas content. The cursor is drawn
+	//! at (cursor_panel_x, cursor_panel_y) in panel pixels; per-eye disparity
+	//! is derived from cursor_hit_z_m so the cursor floats at the same depth
+	//! as whatever the user is pointing at (0 = panel plane, no disparity).
+	//! cursor_id 0..5 picks one of sys->cursor_images; cursor_visible gates
+	//! the entire pass (false during suspend/dismiss).
+	int32_t cursor_id;
+	int32_t cursor_panel_x;
+	int32_t cursor_panel_y;
+	float   cursor_hit_z_m;
+	bool    cursor_visible;
 
 	//! Phase 5.7: spatial launcher panel visible.
 	//! Toggled by Ctrl+L via ipc_call_launcher_set_visible. When true, the
@@ -2103,6 +2131,7 @@ fini_client_render_resources(struct d3d11_client_render_resources *res)
 static xrt_result_t
 init_client_render_resources(struct d3d11_service_system *sys,
                               void *external_hwnd,
+                              bool transparent_hwnd,
                               struct xrt_system_devices *xsysd,
                               struct d3d11_client_render_resources *res)
 {
@@ -4860,10 +4889,23 @@ struct workspace_hit_result
 	uint32_t chrome_region_id;   //!< Matched region id from slot->chrome_regions[]; 0 if no region or no hit
 	float    chrome_local_u;     //!< Hit point in chrome-UV [0,1] (0 = left edge of chrome image)
 	float    chrome_local_v;     //!< Hit point in chrome-UV [0,1] (0 = top of chrome image)
+
+	//! Phase 2.J / 3D cursor: world-space z of the ray-plane intersection on
+	//! the hit window (display-space meters; 0 = panel plane, positive = in
+	//! front of panel toward viewer). Populated for any slot hit (content,
+	//! chrome, edges); 0 when no slot hit. Drives the runtime-rendered
+	//! cursor's per-eye disparity so it floats at the same depth as the
+	//! window the user is pointing at.
+	float    hit_z_m;
 };
 
 static void launcher_set_visible(struct d3d11_service_system *sys,
                                  struct d3d11_multi_compositor *mc, bool visible);
+
+// Phase 2.J / 3D cursor: forward decl. Defined near the create_system block
+// further down. Lazy-loads Win32 cursor bitmaps into D3D11 textures the first
+// time the runtime needs to render a cursor sprite.
+static void ensure_cursor_images_loaded(struct d3d11_service_system *sys);
 
 // Phase 5.13: pop a Win32 context menu at the cursor for a launcher tile.
 // Launch fires the tile like a click; Remove sets hidden_tile_mask so the
@@ -5158,6 +5200,7 @@ workspace_raycast_hit_test(struct d3d11_service_system *sys,
 
 		// Ray-plane intersection
 		float t, hit_x, hit_y;
+		float world_hit_z; // 3D cursor uses this for per-eye disparity
 		if (rotated) {
 			// Rotated window: compute plane normal from orientation
 			struct xrt_vec3 normal_local = {0, 0, 1};
@@ -5171,7 +5214,7 @@ workspace_raycast_hit_test(struct d3d11_service_system *sys,
 			if (t < 0.0f) continue; // Behind eye
 			float world_hit_x = eye_x + t * ray_dx;
 			float world_hit_y = eye_y + t * ray_dy;
-			float world_hit_z = eye_z + t * ray_dz;
+			world_hit_z = eye_z + t * ray_dz;
 			// Convert world hit to window-local coords via inverse rotation
 			struct xrt_vec3 delta = {world_hit_x - win_x, world_hit_y - win_y, world_hit_z - win_z};
 			struct xrt_quat inv_q;
@@ -5188,6 +5231,7 @@ workspace_raycast_hit_test(struct d3d11_service_system *sys,
 			if (t < 0.0f) continue;
 			hit_x = eye_x + t * ray_dx;
 			hit_y = eye_y + t * ray_dy;
+			world_hit_z = win_z;
 		}
 
 		// Window bounds (content area)
@@ -5253,6 +5297,11 @@ workspace_raycast_hit_test(struct d3d11_service_system *sys,
 			result.slot = s;
 			result.local_x_m = local_x;
 			result.local_y_m = local_y;
+			// 3D cursor: ray-plane intersection's z (rotated window) or
+			// the slot's z (flat window). The cursor render pass uses
+			// this for per-eye disparity so the cursor floats at the
+			// same depth as whatever the user is pointing at.
+			result.hit_z_m = world_hit_z;
 
 			// Classify hit region.
 			if (has_workspace_title_bar) {
@@ -5998,7 +6047,18 @@ after_key_shortcuts:
 
 	// Update cursor via window thread (compositor thread can't call SetCursor directly).
 	// Cursor IDs: 0=arrow, 1=sizewe, 2=sizens, 3=sizenwse, 4=sizenesw, 5=sizeall
+	//
+	// Phase 2.J / 3D cursor: also publishes (cursor_id, cursor_panel_x, cursor_panel_y,
+	// cursor_hit_z_m) onto mc so the cursor render pass can draw a 3D-disparity
+	// cursor sprite at the hit's z-depth. We hoist GetCursorPos + raycast to
+	// the top of the block so all branches (drag/resize/hover) feed the same
+	// publish step.
 	if (mc->window != nullptr) {
+		POINT cpt = {0, 0};
+		GetCursorPos(&cpt);
+		ScreenToClient(mc->hwnd, &cpt);
+		struct workspace_hit_result cursor_hover = workspace_raycast_hit_test(sys, mc, cpt);
+
 		int cursor_id = 0; // arrow
 		if (mc->resize.active) {
 			int e = mc->resize.edges;
@@ -6013,10 +6073,7 @@ after_key_shortcuts:
 		} else if (mc->title_drag.active) {
 			cursor_id = 5; // sizeall (move during title drag)
 		} else {
-			POINT cpt;
-			GetCursorPos(&cpt);
-			ScreenToClient(mc->hwnd, &cpt);
-			struct workspace_hit_result hover = workspace_raycast_hit_test(sys, mc, cpt);
+			struct workspace_hit_result &hover = cursor_hover;
 
 			// Phase 2.C C3.C-4: publish per-frame hovered slot so
 			// workspace_drain_input_events can emit POINTER_HOVER on
@@ -6096,6 +6153,19 @@ after_key_shortcuts:
 			}
 		}
 		comp_d3d11_window_set_cursor(mc->window, cursor_id);
+
+		// Phase 2.J / 3D cursor: publish state for the runtime-rendered
+		// cursor sprite (drawn after all atlas content with per-eye
+		// disparity). cursor_hit_z_m = 0 when the ray missed all slots,
+		// so the cursor falls back to the panel plane (zero disparity).
+		mc->cursor_id = cursor_id;
+		mc->cursor_panel_x = cpt.x;
+		mc->cursor_panel_y = cpt.y;
+		mc->cursor_hit_z_m = (cursor_hover.slot >= 0) ? cursor_hover.hit_z_m : 0.0f;
+		mc->cursor_visible = true;
+	} else {
+		// No window — no cursor to render.
+		mc->cursor_visible = false;
 	}
 
 	// Left-click: focus window, close button, title bar drag, or content click.
@@ -8509,6 +8579,172 @@ after_key_shortcuts:
 		sys->context->RSSetScissorRects(1, &full_scissor);
 	}
 
+	// Phase 2.J / 3D cursor: render the OS-style cursor sprite at the per-
+	// frame raycast hit's z-depth so the cursor floats at the same depth as
+	// whatever the user is pointing at. When hit_z = 0 (no slot hit) the
+	// cursor falls back to the panel plane (zero disparity). Renders into
+	// every tile of the atlas (tile_columns × tile_rows) so multi-view
+	// layouts (SBS 2×1, quad 2×2, dense multiview, etc.) all work — the
+	// DP weaves all tiles into the final display so the cursor reads as a
+	// single 3D-positioned point regardless of how the panel multiplexes
+	// views. Per-tile X disparity is keyed off col % 2 (eye index).
+	if (mc->cursor_visible) {
+		uint32_t ca_w = sys->base.info.display_pixel_width;
+		uint32_t ca_h = sys->base.info.display_pixel_height;
+		if (ca_w == 0) ca_w = 3840;
+		if (ca_h == 0) ca_h = 2160;
+		ensure_cursor_images_loaded(sys);
+		int cid = mc->cursor_id;
+		if (cid < 0 || cid >= 6) cid = 0; // fallback to arrow
+		auto &ci = sys->cursor_images[cid];
+		if (ci.srv && ci.w > 0 && ci.h > 0) {
+			// Eye positions: prefer the runtime's predicted eye positions
+			// (Leia SR provides head-tracked values); fall back to fixed
+			// 64 mm IPD at 60 cm if unavailable.
+			struct xrt_vec3 eye_l = {-0.032f, 0.0f, 0.6f};
+			struct xrt_vec3 eye_r = {+0.032f, 0.0f, 0.6f};
+			(void)comp_d3d11_service_get_predicted_eye_positions(&sys->base, &eye_l, &eye_r);
+
+			float disp_w_m = sys->base.info.display_width_m;
+			if (disp_w_m <= 0.0f) disp_w_m = 0.700f;
+			uint32_t panel_w = sys->base.info.display_pixel_width;
+			if (panel_w == 0) panel_w = ca_w;
+			uint32_t panel_h = sys->base.info.display_pixel_height;
+			if (panel_h == 0) panel_h = ca_h;
+
+			// Per-tile atlas region size from the active rendering mode.
+			// For SBS 2×1 fullsize: tile = (ca_w/2, ca_h). For LeiaSR 3D
+			// half-active mode: tile = (ca_w/4, ca_h/2) and the tiles
+			// occupy only the top-left quadrant of the swapchain — the
+			// DP later upscales that sub-rect to the full panel. We
+			// MUST use the per-mode view_width_pixels / view_height_pixels
+			// (via resolve_active_view_dims) instead of ca_w/n_cols, or
+			// the cursor renders at the wrong proportional position when
+			// the active area isn't the full atlas.
+			const uint32_t n_cols = sys->tile_columns > 0 ? sys->tile_columns : 1;
+			const uint32_t n_rows = sys->tile_rows > 0 ? sys->tile_rows : 1;
+			uint32_t tile_w_v = 0, tile_h_v = 0;
+			resolve_active_view_dims(sys, ca_w, ca_h, &tile_w_v, &tile_h_v);
+			const uint32_t tile_w = tile_w_v;
+			const uint32_t tile_h = tile_h_v;
+
+			// Half-disparity in atlas pixels. Sign convention: positive
+			// half_disp_atlas_px = cursor in front of panel (crossed
+			// disparity), so the LEFT eye's view shifts the cursor to
+			// the right and the RIGHT eye's view shifts it left.
+			//   t = eye_z / (eye_z - hit_z),  per-eye-screen-shift = ipd/2 * (t - 1)
+			// = ipd/2 * hit_z / (eye_z - hit_z)
+			float ipd_half_m = (eye_r.x - eye_l.x) * 0.5f;
+			float eye_z_m = (eye_l.z + eye_r.z) * 0.5f;
+			float hit_z = mc->cursor_hit_z_m;
+			float half_disp_panel_m = 0.0f;
+			if (eye_z_m > hit_z + 0.001f) {
+				half_disp_panel_m = ipd_half_m * hit_z / (eye_z_m - hit_z);
+			}
+			float half_disp_tile_px =
+			    half_disp_panel_m / disp_w_m * (float)tile_w;
+
+			// Base cursor POSITION within one tile (panel pixel → tile-
+			// local atlas pixel: panel coords get scaled by tile_w/panel_w
+			// and tile_h/panel_h). NOT used for cursor SIZE — atlas pixels
+			// map 1:1 to perceived panel pixels post-DP-weave, so the
+			// sprite renders at native dimensions.
+			const float scale_x = (float)tile_w / (float)panel_w;
+			const float scale_y = (float)tile_h / (float)panel_h;
+			float base_tile_x = (float)mc->cursor_panel_x * scale_x;
+			float base_tile_y = (float)mc->cursor_panel_y * scale_y;
+
+			// Cursor sprite size + hot spot in NATIVE atlas pixels — no
+			// scaling, since 1 atlas pixel = 1 perceived panel pixel
+			// after the DP weave. A 32×32 cursor texture renders as a
+			// 32×32 perceived sprite, matching the OS cursor's visual
+			// size and aspect ratio.
+			float cursor_w_atlas = (float)ci.w;
+			float cursor_h_atlas = (float)ci.h;
+			float hot_x_atlas    = (float)ci.hot_x;
+			float hot_y_atlas    = (float)ci.hot_y;
+
+			// Common pipeline state
+			ID3D11RenderTargetView *crtvs[] = {mc->combined_atlas_rtv.get()};
+			sys->context->OMSetRenderTargets(1, crtvs, nullptr);
+			sys->context->OMSetBlendState(sys->blend_alpha.get(), nullptr, 0xFFFFFFFF);
+			sys->context->OMSetDepthStencilState(sys->depth_disabled.get(), 0);
+			sys->context->RSSetState(sys->rasterizer_state.get());
+			sys->context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+			sys->context->IASetInputLayout(nullptr);
+			D3D11_VIEWPORT cvp = {};
+			cvp.Width = (float)ca_w;
+			cvp.Height = (float)ca_h;
+			cvp.MaxDepth = 1.0f;
+			sys->context->RSSetViewports(1, &cvp);
+			sys->context->VSSetShader(sys->blit_vs.get(), nullptr, 0);
+			sys->context->PSSetShader(sys->blit_ps.get(), nullptr, 0);
+			sys->context->VSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
+			sys->context->PSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
+
+			ID3D11ShaderResourceView *srv = ci.srv.get();
+			sys->context->PSSetShaderResources(0, 1, &srv);
+			sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
+
+			// Iterate every (col, row) tile in the atlas. Each tile gets
+			// one cursor draw at the proportional in-tile position with
+			// per-eye disparity offset. eye_idx = col % 2 matches the
+			// existing window-blit eye-mapping convention; multiview
+			// layouts (col > 1) collapse to one of the two tracked eye
+			// positions the same way windows do.
+			for (uint32_t row = 0; row < n_rows; row++) {
+				for (uint32_t col = 0; col < n_cols; col++) {
+					int eye_idx = (int)(col % 2);
+					float disp_off = (eye_idx == 0) ? +half_disp_tile_px
+					                                : -half_disp_tile_px;
+					float dest_x = (float)(col * tile_w)
+					             + base_tile_x - hot_x_atlas + disp_off;
+					float dest_y = (float)(row * tile_h)
+					             + base_tile_y - hot_y_atlas;
+
+					D3D11_MAPPED_SUBRESOURCE m;
+					if (FAILED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
+					                              D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+						continue;
+					}
+					BlitConstants *cb = static_cast<BlitConstants *>(m.pData);
+					memset(cb, 0, sizeof(*cb));
+					cb->src_rect[0] = 0;
+					cb->src_rect[1] = 0;
+					cb->src_rect[2] = (float)ci.w;
+					cb->src_rect[3] = (float)ci.h;
+					cb->src_size[0] = (float)ci.w;
+					cb->src_size[1] = (float)ci.h;
+					cb->dst_size[0] = (float)ca_w;
+					cb->dst_size[1] = (float)ca_h;
+					cb->dst_offset[0] = dest_x;
+					cb->dst_offset[1] = dest_y;
+					cb->dst_rect_wh[0] = cursor_w_atlas;
+					cb->dst_rect_wh[1] = cursor_h_atlas;
+					cb->convert_srgb = 0.0f;
+					cb->chrome_alpha = 0.0f;
+					cb->quad_mode = 0.0f;
+					sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
+
+					// Tile-local scissor — keeps a left-tile cursor with
+					// positive disparity from spilling into the right tile.
+					D3D11_RECT cscissor;
+					cscissor.left   = (LONG)(col * tile_w);
+					cscissor.top    = (LONG)(row * tile_h);
+					cscissor.right  = (LONG)((col + 1) * tile_w);
+					cscissor.bottom = (LONG)((row + 1) * tile_h);
+					sys->context->RSSetScissorRects(1, &cscissor);
+
+					sys->context->Draw(4, 0);
+				}
+			}
+
+			// Restore full-atlas scissor for downstream passes (DP, etc.).
+			D3D11_RECT cfull = {0, 0, (LONG)ca_w, (LONG)ca_h};
+			sys->context->RSSetScissorRects(1, &cfull);
+		}
+	}
+
 	// Send full combined atlas to DP — content is placed at sub-rect positions,
 	// background is dark gray. The DP interlaces the entire image.
 	// Non-legacy sessions use true per-view dims from the active rendering mode
@@ -10274,6 +10510,187 @@ system_destroy(struct xrt_system_compositor *xsysc)
 	sys->device.reset();
 
 	delete sys;
+}
+
+
+/*
+ * Phase 2.J / 3D cursor: load a Win32 OS cursor (HCURSOR from
+ * LoadCursor(NULL, IDC_*)) into a D3D11 R8G8B8A8_UNORM SRV.
+ *
+ * Modern Win11 cursors are color cursors with proper alpha; older mono
+ * cursors use a 1-bit AND/XOR mask. We handle the color case via
+ * GetDIBits on hbmColor; transparency comes from hbmMask (mask bit set
+ * = transparent pixel). Mono cursors fall back to the AND/XOR pattern.
+ *
+ * Hot spot is read from ICONINFO so the cursor's "click point" lands
+ * at the actual mouse pixel when rendered.
+ */
+static bool
+load_win32_cursor_to_srv(ID3D11Device *device,
+                         HCURSOR hcur,
+                         wil::com_ptr<ID3D11ShaderResourceView> &out_srv,
+                         uint32_t &out_w, uint32_t &out_h,
+                         int &out_hot_x, int &out_hot_y)
+{
+	if (device == nullptr || hcur == NULL) return false;
+
+	ICONINFO ii = {};
+	if (!GetIconInfo(hcur, &ii)) return false;
+
+	BITMAP bm_color = {};
+	BITMAP bm_mask = {};
+	if (ii.hbmColor != NULL) GetObject(ii.hbmColor, sizeof(bm_color), &bm_color);
+	if (ii.hbmMask != NULL)  GetObject(ii.hbmMask,  sizeof(bm_mask),  &bm_mask);
+
+	int width = (bm_color.bmWidth > 0) ? bm_color.bmWidth : bm_mask.bmWidth;
+	// Mono cursor (no color bitmap): mask is 2× height (top half AND, bottom half XOR).
+	int height = (bm_color.bmHeight > 0) ? bm_color.bmHeight : (bm_mask.bmHeight / 2);
+	if (width <= 0 || height <= 0) {
+		if (ii.hbmColor) DeleteObject(ii.hbmColor);
+		if (ii.hbmMask)  DeleteObject(ii.hbmMask);
+		return false;
+	}
+
+	HDC hdc_screen = GetDC(NULL);
+	HDC hdc_mem = CreateCompatibleDC(hdc_screen);
+
+	BITMAPINFO bmi = {};
+	bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+	bmi.bmiHeader.biWidth = width;
+	bmi.bmiHeader.biHeight = -height; // top-down
+	bmi.bmiHeader.biPlanes = 1;
+	bmi.bmiHeader.biBitCount = 32;
+	bmi.bmiHeader.biCompression = BI_RGB;
+
+	std::vector<uint8_t> pixels((size_t)width * height * 4, 0);
+
+	if (ii.hbmColor != NULL) {
+		// Color cursor: extract BGRA color and combine with mask.
+		std::vector<uint8_t> color_px((size_t)width * height * 4, 0);
+		std::vector<uint8_t> mask_px((size_t)width * height * 4, 0);
+		GetDIBits(hdc_mem, ii.hbmColor, 0, (UINT)height, color_px.data(), &bmi, DIB_RGB_COLORS);
+		GetDIBits(hdc_mem, ii.hbmMask,  0, (UINT)height, mask_px.data(),  &bmi, DIB_RGB_COLORS);
+
+		bool color_has_alpha = false;
+		for (int i = 0; i < width * height; i++) {
+			if (color_px[i * 4 + 3] != 0) { color_has_alpha = true; break; }
+		}
+
+		for (int i = 0; i < width * height; i++) {
+			uint8_t b = color_px[i * 4 + 0];
+			uint8_t g = color_px[i * 4 + 1];
+			uint8_t r = color_px[i * 4 + 2];
+			uint8_t a = color_px[i * 4 + 3];
+			if (!color_has_alpha) {
+				// Color bitmap is RGB-only; derive alpha from mask
+				// (mask bit set = transparent in cursor convention).
+				uint8_t m = mask_px[i * 4 + 0];
+				a = (m == 0) ? 255 : 0;
+			}
+			// Output is R8G8B8A8 (R first), so swap R/B from BGRA.
+			pixels[i * 4 + 0] = r;
+			pixels[i * 4 + 1] = g;
+			pixels[i * 4 + 2] = b;
+			pixels[i * 4 + 3] = a;
+		}
+	} else {
+		// Mono cursor: extract AND mask (top half) + XOR mask (bottom).
+		// AND=1 → transparent; AND=0 XOR=0 → black; AND=0 XOR=1 → white;
+		// AND=1 XOR=1 → invert (rare; treat as white).
+		bmi.bmiHeader.biHeight = -(height * 2);
+		std::vector<uint8_t> mask_px((size_t)width * height * 2 * 4, 0);
+		GetDIBits(hdc_mem, ii.hbmMask, 0, (UINT)(height * 2), mask_px.data(), &bmi, DIB_RGB_COLORS);
+		for (int y = 0; y < height; y++) {
+			for (int x = 0; x < width; x++) {
+				int and_idx = (y * width + x) * 4;
+				int xor_idx = ((height + y) * width + x) * 4;
+				uint8_t and_v = mask_px[and_idx + 0];
+				uint8_t xor_v = mask_px[xor_idx + 0];
+				int dst = (y * width + x) * 4;
+				if (and_v != 0) {
+					pixels[dst + 0] = 0;
+					pixels[dst + 1] = 0;
+					pixels[dst + 2] = 0;
+					pixels[dst + 3] = 0;
+				} else {
+					uint8_t c = (xor_v != 0) ? 255 : 0;
+					pixels[dst + 0] = c;
+					pixels[dst + 1] = c;
+					pixels[dst + 2] = c;
+					pixels[dst + 3] = 255;
+				}
+			}
+		}
+	}
+
+	DeleteDC(hdc_mem);
+	ReleaseDC(NULL, hdc_screen);
+
+	D3D11_TEXTURE2D_DESC td = {};
+	td.Width = (UINT)width;
+	td.Height = (UINT)height;
+	td.MipLevels = 1;
+	td.ArraySize = 1;
+	td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	td.SampleDesc.Count = 1;
+	td.Usage = D3D11_USAGE_IMMUTABLE;
+	td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+	D3D11_SUBRESOURCE_DATA sd = {};
+	sd.pSysMem = pixels.data();
+	sd.SysMemPitch = (UINT)(width * 4);
+
+	wil::com_ptr<ID3D11Texture2D> tex;
+	HRESULT hr = device->CreateTexture2D(&td, &sd, tex.put());
+	if (SUCCEEDED(hr)) {
+		hr = device->CreateShaderResourceView(tex.get(), nullptr, out_srv.put());
+	}
+
+	out_w = (uint32_t)width;
+	out_h = (uint32_t)height;
+	out_hot_x = (int)ii.xHotspot;
+	out_hot_y = (int)ii.yHotspot;
+
+	if (ii.hbmColor) DeleteObject(ii.hbmColor);
+	if (ii.hbmMask)  DeleteObject(ii.hbmMask);
+
+	return SUCCEEDED(hr);
+}
+
+// Phase 2.J / 3D cursor: lazily load all 6 cursor types on first render.
+// Idempotent — returns immediately once cursor_images_loaded is set.
+static void
+ensure_cursor_images_loaded(struct d3d11_service_system *sys)
+{
+	if (sys->cursor_images_loaded) return;
+
+	struct {
+		LPCSTR id;
+	} cursor_specs[6] = {
+		{IDC_ARROW},     // 0 = arrow (default)
+		{IDC_SIZEWE},    // 1 = horizontal resize
+		{IDC_SIZENS},    // 2 = vertical resize
+		{IDC_SIZENWSE},  // 3 = NW-SE diagonal resize
+		{IDC_SIZENESW},  // 4 = NE-SW diagonal resize
+		{IDC_SIZEALL},   // 5 = move (4-way arrow)
+	};
+
+	const char *names[6] = {"arrow", "sizewe", "sizens", "sizenwse", "sizenesw", "sizeall"};
+	for (int i = 0; i < 6; i++) {
+		HCURSOR hcur = LoadCursorA(NULL, cursor_specs[i].id);
+		if (hcur == NULL) continue;
+		auto &ci = sys->cursor_images[i];
+		bool ok = load_win32_cursor_to_srv(sys->device.get(), hcur,
+		                                   ci.srv, ci.w, ci.h,
+		                                   ci.hot_x, ci.hot_y);
+		if (!ok) {
+			U_LOG_W("3D cursor: failed to load cursor id=%d", i);
+		} else {
+			U_LOG_W("3D cursor: %s w=%u h=%u hot=(%d,%d)",
+			        names[i], ci.w, ci.h, ci.hot_x, ci.hot_y);
+		}
+	}
+	sys->cursor_images_loaded = true;
 }
 
 
