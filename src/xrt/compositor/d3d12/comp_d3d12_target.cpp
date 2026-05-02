@@ -16,6 +16,7 @@
 #include <windows.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
+#include <dcomp.h>
 
 #define BACK_BUFFER_COUNT 3
 
@@ -48,6 +49,14 @@ struct comp_d3d12_target
 	//! Current dimensions.
 	uint32_t width;
 	uint32_t height;
+
+	//! DirectComposition resources (transparent path only — null on default path).
+	//! D3D12 forbids DXGI_SWAP_EFFECT_DISCARD, so the transparent path uses
+	//! CreateSwapChainForComposition + flip-model + DXGI_ALPHA_MODE_PREMULTIPLIED
+	//! and binds the swapchain to the HWND through DComp instead of via DXGI.
+	IDCompositionDevice *dcomp_device;
+	IDCompositionTarget *dcomp_target;
+	IDCompositionVisual *dcomp_visual;
 };
 
 // Access compositor internals
@@ -281,6 +290,7 @@ comp_d3d12_target_create(struct comp_d3d12_compositor *c,
                          void *hwnd,
                          uint32_t width,
                          uint32_t height,
+                         bool transparent,
                          struct comp_d3d12_target **out_target)
 {
 	auto internals = get_internals(c);
@@ -291,6 +301,14 @@ comp_d3d12_target_create(struct comp_d3d12_compositor *c,
 	target->hwnd = static_cast<HWND>(hwnd);
 	target->width = width;
 	target->height = height;
+
+	// Default: flip-model + ALPHA_MODE_IGNORE (#163) — opaque present, no DWM bleed-through.
+	// Transparent opt-in (only when an HWND was provided): DXGI forbids
+	// DXGI_SWAP_EFFECT_DISCARD for D3D12 at validation time, so we use
+	// DirectComposition + flip-model + DXGI_ALPHA_MODE_PREMULTIPLIED.
+	// CreateSwapChainForComposition produces an HWND-less swapchain that DComp
+	// binds to the app's HWND via IDCompositionTarget — DWM blends per-pixel.
+	const bool use_transparent = transparent && hwnd != nullptr;
 
 	// Create RTV descriptor heap
 	D3D12_DESCRIPTOR_HEAP_DESC rtv_heap_desc = {};
@@ -320,8 +338,12 @@ comp_d3d12_target_create(struct comp_d3d12_compositor *c,
 	desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
 	desc.BufferCount = BACK_BUFFER_COUNT;
 	desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-	// IGNORE so DWM doesn't composite the desktop through the bound HWND (#163).
-	desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+	if (use_transparent) {
+		desc.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
+	} else {
+		// IGNORE so DWM doesn't composite the desktop through the bound HWND (#163).
+		desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+	}
 	desc.Flags = 0;
 
 	DXGI_SWAP_CHAIN_FULLSCREEN_DESC fs_desc = {};
@@ -342,37 +364,47 @@ comp_d3d12_target_create(struct comp_d3d12_compositor *c,
 		}
 	}
 
-	// Create swapchain using the command queue (D3D12 requirement)
+	// Create swapchain. Default: bound to the app's HWND via CreateSwapChainForHwnd
+	// (with the existing E_ACCESSDENIED -> child-window fallback).
+	// Transparent: HWND-less via CreateSwapChainForComposition; DComp binds it below.
 	IDXGISwapChain1 *swapchain1 = nullptr;
 	HWND swapchain_hwnd = target->hwnd;
 
-	hr = dxgi_factory->CreateSwapChainForHwnd(
-	    internals->command_queue, swapchain_hwnd, &desc, &fs_desc, nullptr, &swapchain1);
-
-	// HWND already has a swapchain — fall back to child window.
-	// DXGI enforces one swapchain per HWND for D3D12, so if the app
-	// already created a swapchain on this HWND we get E_ACCESSDENIED.
-	if (hr == E_ACCESSDENIED) {
-		U_LOG_W("HWND %p already has a swapchain (E_ACCESSDENIED). "
-		        "Creating child window on dedicated thread.",
-		        (void *)target->hwnd);
-
-		target->child_ctx = create_child_window_threaded(target->hwnd, width, height);
-		if (target->child_ctx == nullptr) {
-			dxgi_factory->Release();
-			target->rtv_heap->Release();
-			delete target;
-			return XRT_ERROR_D3D;
-		}
-
-		swapchain_hwnd = target->child_ctx->child_hwnd;
-
+	if (use_transparent) {
+		hr = dxgi_factory->CreateSwapChainForComposition(
+		    internals->command_queue, &desc, nullptr, &swapchain1);
+		U_LOG_W("Transparent HWND opt-in: DComp + flip-model swapchain "
+		        "(FLIP_DISCARD + PREMULTIPLIED, bc=%u)",
+		        (unsigned)BACK_BUFFER_COUNT);
+	} else {
 		hr = dxgi_factory->CreateSwapChainForHwnd(
 		    internals->command_queue, swapchain_hwnd, &desc, &fs_desc, nullptr, &swapchain1);
-	}
 
-	// Disable Alt-Enter fullscreen toggle
-	dxgi_factory->MakeWindowAssociation(swapchain_hwnd, DXGI_MWA_NO_ALT_ENTER);
+		// HWND already has a swapchain — fall back to child window.
+		// DXGI enforces one swapchain per HWND for D3D12, so if the app
+		// already created a swapchain on this HWND we get E_ACCESSDENIED.
+		if (hr == E_ACCESSDENIED) {
+			U_LOG_W("HWND %p already has a swapchain (E_ACCESSDENIED). "
+			        "Creating child window on dedicated thread.",
+			        (void *)target->hwnd);
+
+			target->child_ctx = create_child_window_threaded(target->hwnd, width, height);
+			if (target->child_ctx == nullptr) {
+				dxgi_factory->Release();
+				target->rtv_heap->Release();
+				delete target;
+				return XRT_ERROR_D3D;
+			}
+
+			swapchain_hwnd = target->child_ctx->child_hwnd;
+
+			hr = dxgi_factory->CreateSwapChainForHwnd(
+			    internals->command_queue, swapchain_hwnd, &desc, &fs_desc, nullptr, &swapchain1);
+		}
+
+		// Disable Alt-Enter fullscreen toggle (HWND-bound only).
+		dxgi_factory->MakeWindowAssociation(swapchain_hwnd, DXGI_MWA_NO_ALT_ENTER);
+	}
 	dxgi_factory->Release();
 
 	if (FAILED(hr)) {
@@ -395,9 +427,68 @@ comp_d3d12_target_create(struct comp_d3d12_compositor *c,
 		return XRT_ERROR_D3D;
 	}
 
+	// Transparent path: bind the composition swapchain to the HWND through DComp.
+	// Create device → target-for-HWND → visual → SetContent(swapchain) → SetRoot → Commit.
+	if (use_transparent) {
+		hr = DCompositionCreateDevice2(
+		    /*renderingDevice*/ nullptr,
+		    __uuidof(IDCompositionDevice),
+		    reinterpret_cast<void **>(&target->dcomp_device));
+		if (FAILED(hr) || target->dcomp_device == nullptr) {
+			U_LOG_E("DCompositionCreateDevice2 failed: 0x%08x", hr);
+			target->swapchain->Release();
+			target->rtv_heap->Release();
+			delete target;
+			return XRT_ERROR_D3D;
+		}
+
+		hr = target->dcomp_device->CreateTargetForHwnd(
+		    target->hwnd, /*topmost*/ TRUE, &target->dcomp_target);
+		if (FAILED(hr) || target->dcomp_target == nullptr) {
+			U_LOG_E("IDCompositionDevice::CreateTargetForHwnd failed: 0x%08x", hr);
+			target->dcomp_device->Release();
+			target->swapchain->Release();
+			target->rtv_heap->Release();
+			delete target;
+			return XRT_ERROR_D3D;
+		}
+
+		hr = target->dcomp_device->CreateVisual(&target->dcomp_visual);
+		if (FAILED(hr) || target->dcomp_visual == nullptr) {
+			U_LOG_E("IDCompositionDevice::CreateVisual failed: 0x%08x", hr);
+			target->dcomp_target->Release();
+			target->dcomp_device->Release();
+			target->swapchain->Release();
+			target->rtv_heap->Release();
+			delete target;
+			return XRT_ERROR_D3D;
+		}
+
+		hr = target->dcomp_visual->SetContent(target->swapchain);
+		if (SUCCEEDED(hr)) {
+			hr = target->dcomp_target->SetRoot(target->dcomp_visual);
+		}
+		if (SUCCEEDED(hr)) {
+			hr = target->dcomp_device->Commit();
+		}
+		if (FAILED(hr)) {
+			U_LOG_E("DComp visual setup failed: 0x%08x", hr);
+			target->dcomp_visual->Release();
+			target->dcomp_target->Release();
+			target->dcomp_device->Release();
+			target->swapchain->Release();
+			target->rtv_heap->Release();
+			delete target;
+			return XRT_ERROR_D3D;
+		}
+	}
+
 	// Acquire back buffers and create RTVs
 	xrt_result_t xret = acquire_back_buffers(target);
 	if (xret != XRT_SUCCESS) {
+		if (target->dcomp_visual != nullptr) target->dcomp_visual->Release();
+		if (target->dcomp_target != nullptr) target->dcomp_target->Release();
+		if (target->dcomp_device != nullptr) target->dcomp_device->Release();
 		target->swapchain->Release();
 		destroy_child_window_threaded(&target->child_ctx);
 		target->rtv_heap->Release();
@@ -426,6 +517,20 @@ comp_d3d12_target_destroy(struct comp_d3d12_target **target_ptr)
 	if (target->rtv_heap != nullptr) {
 		target->rtv_heap->Release();
 	}
+
+	// Release DComp resources before the swapchain (visual holds a swapchain reference;
+	// target holds the visual). DWM tears down the on-screen content when the target
+	// releases.
+	if (target->dcomp_visual != nullptr) {
+		target->dcomp_visual->Release();
+	}
+	if (target->dcomp_target != nullptr) {
+		target->dcomp_target->Release();
+	}
+	if (target->dcomp_device != nullptr) {
+		target->dcomp_device->Release();
+	}
+
 	if (target->swapchain != nullptr) {
 		target->swapchain->Release();
 	}
@@ -443,6 +548,11 @@ comp_d3d12_target_present(struct comp_d3d12_target *target, uint32_t sync_interv
 	if (FAILED(hr)) {
 		U_LOG_E("Present failed: 0x%08x", hr);
 		return XRT_ERROR_D3D;
+	}
+
+	// DComp path: publish the new frame to dwm.exe. Cheap — IPC of delta state, no GPU work.
+	if (target->dcomp_device != nullptr) {
+		target->dcomp_device->Commit();
 	}
 
 	return XRT_SUCCESS;

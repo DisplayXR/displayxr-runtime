@@ -30,6 +30,7 @@ if(WIN32 AND XRT_HAVE_D3D12)
 			d3d12
 			dxgi
 			d3dcompiler
+			dcomp
 		)
 
 	target_include_directories(comp_d3d12 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)

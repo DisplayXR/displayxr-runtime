@@ -31,6 +31,7 @@ if(WIN32 AND XRT_HAVE_D3D11)
 			d3d11
 			dxgi
 			d3dcompiler
+			dcomp
 		)
 
 	target_include_directories(comp_d3d11 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)

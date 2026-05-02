@@ -57,6 +57,7 @@ target_link_libraries(
 		d2d1        # Direct2D for font atlas rendering
 		dwrite      # DirectWrite for anti-aliased text
 		windowsapp  # C++/WinRT runtime for Windows.Graphics.Capture
+		dcomp       # DirectComposition for transparent HWND-bound presentation
 	)
 
 target_include_directories(comp_d3d11_service PRIVATE

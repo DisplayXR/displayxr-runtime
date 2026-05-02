@@ -2379,7 +2379,9 @@ oxr_session_create_impl(struct oxr_logger *log,
 			}
 			// Use D3D11 native compositor - no Vulkan involvement
 			return oxr_session_populate_d3d11_native(log, sys, d3d11, xsi->external_window_handle,
-			                                          xsi->shared_texture_handle, *out_session);
+			                                          xsi->shared_texture_handle,
+			                                          xsi->transparent_background_enabled,
+			                                          xsi->chroma_key_color, *out_session);
 		}
 #else
 		U_LOG_IFL_I(U_LOGGING_INFO, "D3D11 native compositor NOT compiled in (XRT_HAVE_D3D11_NATIVE_COMPOSITOR not defined)");
@@ -2425,7 +2427,9 @@ oxr_session_create_impl(struct oxr_logger *log,
 				return oxr_error(log, XR_ERROR_RUNTIME_FAILURE, "Failed to create xrt_session! '%i'", xret);
 			}
 			return oxr_session_populate_d3d12_native(log, sys, d3d12, xsi->external_window_handle,
-			                                         xsi->shared_texture_handle, *out_session);
+			                                         xsi->shared_texture_handle,
+			                                         xsi->transparent_background_enabled,
+			                                         xsi->chroma_key_color, *out_session);
 		}
 #else
 		U_LOG_IFL_I(U_LOGGING_INFO, "D3D12 native compositor NOT compiled in");
@@ -2595,6 +2599,12 @@ oxr_session_create(struct oxr_logger *log,
 		}
 		if (target_info->sharedTextureHandle) {
 			xsi.shared_texture_handle = target_info->sharedTextureHandle;
+		}
+		if (target_info->transparentBackgroundEnabled) {
+			xsi.transparent_background_enabled = true;
+		}
+		if (target_info->chromaKeyColor != 0) {
+			xsi.chroma_key_color = target_info->chromaKeyColor;
 		}
 	}
 #endif

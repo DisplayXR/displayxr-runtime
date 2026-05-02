@@ -30,6 +30,9 @@ extern "C" {
  * @param hwnd The window handle to present to.
  * @param width Preferred width.
  * @param height Preferred height.
+ * @param transparent When true (and hwnd != NULL), use BitBlt swap effect so DWM
+ *                    consults WS_EX_LAYERED + LWA_COLORKEY on the bound HWND.
+ *                    Otherwise use flip-model + ALPHA_MODE_IGNORE (#163 default).
  * @param out_target Pointer to receive the created target.
  *
  * @return XRT_SUCCESS on success, error code otherwise.
@@ -41,6 +44,7 @@ comp_d3d12_target_create(struct comp_d3d12_compositor *c,
                          void *hwnd,
                          uint32_t width,
                          uint32_t height,
+                         bool transparent,
                          struct comp_d3d12_target **out_target);
 
 /*!

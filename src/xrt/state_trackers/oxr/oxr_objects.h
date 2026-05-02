@@ -1487,6 +1487,8 @@ oxr_session_populate_d3d11_native(struct oxr_logger *log,
                                    XrGraphicsBindingD3D11KHR const *next,
                                    void *window_handle,
                                    void *shared_texture_handle,
+                                   bool transparent_background,
+                                   uint32_t chroma_key_color,
                                    struct oxr_session *sess);
 #endif
 
@@ -1511,6 +1513,8 @@ oxr_session_populate_d3d12_native(struct oxr_logger *log,
                                    XrGraphicsBindingD3D12KHR const *next,
                                    void *window_handle,
                                    void *shared_texture_handle,
+                                   bool transparent_background,
+                                   uint32_t chroma_key_color,
                                    struct oxr_session *sess);
 #endif
 

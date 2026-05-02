@@ -34,6 +34,13 @@ extern "C" {
  * @param d3d12_device The D3D12 device from the application's graphics binding (ID3D12Device*).
  * @param d3d12_command_queue The D3D12 command queue from the graphics binding (ID3D12CommandQueue*).
  * @param dp_factory_d3d12 Display processor factory (xrt_dp_factory_d3d12_fn_t), or NULL.
+ * @param transparent_background When true (and hwnd != NULL), bind the swapchain via
+ *                               DirectComposition with ALPHA_MODE_PREMULTIPLIED for
+ *                               desktop transparency. Otherwise opaque (#163 default).
+ * @param chroma_key_color When non-zero (and transparent_background is true), enable
+ *                         a post-weave shader pass that converts pixels matching this
+ *                         RGB (0x00BBGGRR / Win32 COLORREF) to alpha=0. Required when
+ *                         the bound display processor strips alpha during weaving.
  * @param out_xc Pointer to receive the created compositor.
  *
  * @return XRT_SUCCESS on success, error code otherwise.
@@ -47,6 +54,8 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
                              void *d3d12_device,
                              void *d3d12_command_queue,
                              void *dp_factory_d3d12,
+                             bool transparent_background,
+                             uint32_t chroma_key_color,
                              struct xrt_compositor_native **out_xc);
 
 /*!

@@ -30,7 +30,7 @@ extern "C" {
 #endif
 
 #define XR_EXT_win32_window_binding 1
-#define XR_EXT_win32_window_binding_SPEC_VERSION 3
+#define XR_EXT_win32_window_binding_SPEC_VERSION 5
 #define XR_EXT_WIN32_WINDOW_BINDING_EXTENSION_NAME "XR_EXT_win32_window_binding"
 
 // Use a value in the vendor extension range (1000000000+)
@@ -80,6 +80,24 @@ typedef struct XrWin32WindowBindingCreateInfoEXT {
     PFN_xrReadbackCallback      readbackCallback;      //!< Offscreen readback callback (CPU fallback), or NULL
     void*                       readbackUserdata;      //!< Passed to readbackCallback
     void*                       sharedTextureHandle;   //!< Shared D3D11/D3D12 texture HANDLE for zero-copy, or NULL
+    //! When XR_TRUE, the runtime configures the bound HWND for transparent desktop
+    //! composition: pixels written by the app with full opacity appear opaque on screen,
+    //! and pixels written transparent (alpha = 0, or matching a chroma key set by the
+    //! app via SetLayeredWindowAttributes) compose through to the desktop underneath.
+    //! The runtime picks the appropriate DXGI / Windows mechanism per graphics API;
+    //! apps should not depend on which one. Only honored when windowHandle is non-NULL
+    //! and the session is standalone — ignored in workspace/shell mode.
+    XrBool32                    transparentBackgroundEnabled;
+    //! Optional chroma-key color used by the runtime's post-weave alpha-conversion pass
+    //! when transparentBackgroundEnabled = XR_TRUE. Format: 0x00BBGGRR (Win32 COLORREF).
+    //! When non-zero, the runtime samples the post-weave swapchain image and writes
+    //! alpha = 0 for pixels whose RGB exactly matches this color (alpha = 1 otherwise),
+    //! so the bound display processor's weaver — which strips per-pixel alpha during
+    //! interlacing — does not block transparency. The application is responsible for
+    //! clearing eye views to the same color in transparent regions.
+    //! Set to 0 to disable the post-weave pass (relies entirely on the swapchain's
+    //! per-pixel alpha; usable with alpha-respecting display processors only).
+    uint32_t                    chromaKeyColor;
 } XrWin32WindowBindingCreateInfoEXT;
 
 /*!

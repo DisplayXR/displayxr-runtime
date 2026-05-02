@@ -34,6 +34,13 @@ extern "C" {
  * @param hwnd The window handle from XR_EXT_win32_window_binding (or NULL for fullscreen).
  * @param d3d11_device The D3D11 device from the application's graphics binding.
  * @param dp_factory_d3d11 Display processor factory (xrt_dp_factory_d3d11_fn_t), or NULL.
+ * @param transparent_background When true (and hwnd != NULL), bind the swapchain via
+ *                               DirectComposition with ALPHA_MODE_PREMULTIPLIED for
+ *                               desktop transparency. Otherwise opaque (#163 default).
+ * @param chroma_key_color When non-zero (and transparent_background is true), enable
+ *                         a post-weave shader pass that converts pixels matching this
+ *                         RGB (0x00BBGGRR / Win32 COLORREF) to alpha=0. Required when
+ *                         the bound display processor strips alpha during weaving.
  * @param out_xc Pointer to receive the created compositor.
  *
  * @return XRT_SUCCESS on success, error code otherwise.
@@ -46,6 +53,8 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
                              void *d3d11_device,
                              void *dp_factory_d3d11,
                              void *shared_texture_handle,
+                             bool transparent_background,
+                             uint32_t chroma_key_color,
                              struct xrt_compositor_native **out_xc);
 
 /*!

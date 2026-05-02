@@ -959,6 +959,18 @@ struct xrt_session_info
 	//! External window handle for session target extension (HWND on Windows)
 	void *external_window_handle;
 
+	//! When external_window_handle != NULL, request a swapchain config eligible
+	//! for WS_EX_LAYERED + LWA_COLORKEY desktop composition (BitBlt swap effect
+	//! on Windows D3D11). Standalone-only; ignored in workspace/shell mode and
+	//! on other graphics APIs. Set via XrWin32WindowBindingCreateInfoEXT::transparentBackgroundEnabled.
+	bool transparent_background_enabled;
+
+	//! Optional chroma-key color (0x00BBGGRR) used by the runtime's post-weave
+	//! alpha-conversion shader pass when transparent_background_enabled is true.
+	//! Set via XrWin32WindowBindingCreateInfoEXT::chromaKeyColor. Zero disables
+	//! the pass.
+	uint32_t chroma_key_color;
+
 	//! Readback callback for offscreen compositing (called with composited RGBA pixels)
 	void (*readback_callback)(const uint8_t *pixels, uint32_t w, uint32_t h, void *userdata);
 	//! Userdata passed to readback_callback
