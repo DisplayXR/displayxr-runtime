@@ -3562,6 +3562,29 @@ main(int argc, char *argv[])
 				    (unsigned long)cinfo.pid, cinfo.name);
 				(void)shell_chrome_on_client_connected(
 				    g_chrome, chr_ids[i], w_m, h_m, icon_path, title_text);
+
+				// Phase 2.C spec_version 9: push the default per-client
+				// visual style. Universal soft edge feather (~3 mm) on every
+				// window for a subtle ambient softening; cyan-blue focus
+				// halo on whichever client is focused (the runtime gates
+				// the glow to the focused slot at blit time, so unfocused
+				// clients see the feather only). Color matches the runtime's
+				// existing launcher-hover glow for visual consistency. The
+				// shell is the only authority that pushes per-client style
+				// — third-party controllers can override with their own
+				// theme via the same xrSetWorkspaceClientStyleEXT entry.
+				if (g_xr->set_client_style != NULL) {
+					XrWorkspaceClientStyleEXT style = {XR_TYPE_WORKSPACE_CLIENT_STYLE_EXT};
+					style.cornerRadius = 0.05f;       // 5% of window height — matches prior runtime default
+					style.edgeFeatherMeters = 0.003f; // 3 mm soft falloff
+					style.focusGlowColor[0] = 0.30f;  // cyan-blue (RGB)
+					style.focusGlowColor[1] = 0.55f;
+					style.focusGlowColor[2] = 1.00f;
+					style.focusGlowColor[3] = 1.00f;
+					style.focusGlowIntensity = 0.85f;
+					style.focusGlowFalloffMeters = 0.012f; // 12 mm halo extent
+					(void)g_xr->set_client_style(g_xr->session, chr_ids[i], &style);
+				}
 			}
 			// Drop chrome for any disconnected clients (diff against prev_ids).
 			for (uint32_t p = 0; p < prev_count; p++) {

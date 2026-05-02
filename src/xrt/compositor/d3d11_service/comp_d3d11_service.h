@@ -571,6 +571,40 @@ comp_d3d11_service_workspace_set_chrome_layout_by_slot(struct xrt_system_composi
 void *
 comp_d3d11_service_workspace_get_wakeup_event(struct xrt_system_compositor *xsysc);
 
+/*!
+ * Phase 2.C spec_version 9: set / update per-client visual style applied
+ * at workspace content blit time. Style is cached per-slot and applied
+ * every render. The style covers corner radius, edge alpha feather, and
+ * focus-glow color/intensity/falloff (the focus glow is gated to the
+ * currently focused slot at blit time).
+ *
+ * Returns true on success; false if @p slot is out of range.
+ */
+struct ipc_workspace_client_style;
+bool
+comp_d3d11_service_set_client_style_by_slot(struct xrt_system_compositor *xsysc,
+                                            int slot,
+                                            const struct ipc_workspace_client_style *style);
+
+/*!
+ * Phase 2.C spec_version 9: mark slot @p slot as focused (for focus-glow
+ * gating at blit time). Mirrors the IPC layer's active_client_index for
+ * the compositor's separate `focused_slot` view, so xrSetWorkspaceFocusedClientEXT
+ * driven focus changes update the visual state too. @p slot = -1 clears.
+ */
+void
+comp_d3d11_service_set_focused_slot(struct xrt_system_compositor *xsysc, int slot);
+
+/*!
+ * Phase 2.C spec_version 9: set per-capture-client style. @p slot_index is
+ * the same convention as comp_d3d11_service_set_capture_client_window_pose
+ * (client_id - 1000 from the IPC layer).
+ */
+bool
+comp_d3d11_service_set_capture_client_style(struct xrt_system_compositor *xsysc,
+                                            int slot_index,
+                                            const struct ipc_workspace_client_style *style);
+
 /*! @} */
 
 

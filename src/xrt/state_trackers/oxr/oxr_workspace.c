@@ -35,6 +35,7 @@
 
 #include <openxr/XR_EXT_spatial_workspace.h>
 
+#include <math.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -150,6 +151,12 @@ comp_ipc_client_compositor_workspace_set_chrome_layout(struct xrt_compositor *xc
 xrt_result_t
 comp_ipc_client_compositor_workspace_acquire_wakeup_event(struct xrt_compositor *xc,
                                                           xrt_graphics_sync_handle_t *out_handle);
+// Phase 2.C spec_version 9: per-client visual style.
+struct ipc_workspace_client_style;
+xrt_result_t
+comp_ipc_client_compositor_workspace_set_client_style(struct xrt_compositor *xc,
+                                                      uint32_t client_id,
+                                                      const struct ipc_workspace_client_style *style);
 uint32_t
 comp_ipc_client_compositor_get_swapchain_id(struct xrt_swapchain *xsc);
 
@@ -1115,6 +1122,79 @@ oxr_xrAcquireWorkspaceWakeupEventEXT(XrSession session, uint64_t *outNativeHandl
 	*outNativeHandle = (uint64_t)handle;
 #endif
 	return XR_SUCCESS;
+}
+
+// Phase 2.C spec_version 9: copy XrWorkspaceClientStyleEXT into the IPC POD
+// form. Validates basic numeric sanity (no NaN, no negatives where the field
+// requires non-negative); leaves the runtime to clamp / interpret further.
+static bool
+client_style_xr_to_ipc(const XrWorkspaceClientStyleEXT *xr, struct ipc_workspace_client_style *ipc)
+{
+	if (xr == NULL || ipc == NULL) {
+		return false;
+	}
+	if (!isfinite(xr->cornerRadius) || xr->cornerRadius < 0.0f) return false;
+	if (!isfinite(xr->edgeFeatherMeters) || xr->edgeFeatherMeters < 0.0f) return false;
+	if (!isfinite(xr->focusGlowIntensity) || xr->focusGlowIntensity < 0.0f) return false;
+	if (!isfinite(xr->focusGlowFalloffMeters) || xr->focusGlowFalloffMeters < 0.0f) return false;
+	for (int i = 0; i < 4; i++) {
+		if (!isfinite(xr->focusGlowColor[i])) return false;
+	}
+	ipc->corner_radius = xr->cornerRadius;
+	ipc->edge_feather_meters = xr->edgeFeatherMeters;
+	ipc->focus_glow_color[0] = xr->focusGlowColor[0];
+	ipc->focus_glow_color[1] = xr->focusGlowColor[1];
+	ipc->focus_glow_color[2] = xr->focusGlowColor[2];
+	ipc->focus_glow_color[3] = xr->focusGlowColor[3];
+	ipc->focus_glow_intensity = xr->focusGlowIntensity;
+	ipc->focus_glow_falloff_meters = xr->focusGlowFalloffMeters;
+	return true;
+}
+
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSetWorkspaceClientStyleEXT(XrSession session,
+                                 XrWorkspaceClientId clientId,
+                                 const XrWorkspaceClientStyleEXT *style)
+{
+	OXR_TRACE_MARKER();
+
+	struct oxr_session *sess = NULL;
+	struct oxr_logger log;
+	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrSetWorkspaceClientStyleEXT");
+	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
+	OXR_VERIFY_EXTENSION(&log, sess->sys->inst, EXT_spatial_workspace);
+
+	if (clientId == XR_NULL_WORKSPACE_CLIENT_ID) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+		                 "xrSetWorkspaceClientStyleEXT: clientId must not be XR_NULL_WORKSPACE_CLIENT_ID");
+	}
+
+	struct ipc_workspace_client_style ipc_style;
+	if (style != NULL) {
+		if (style->type != XR_TYPE_WORKSPACE_CLIENT_STYLE_EXT) {
+			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+			                 "xrSetWorkspaceClientStyleEXT: style->type must be "
+			                 "XR_TYPE_WORKSPACE_CLIENT_STYLE_EXT");
+		}
+		if (!client_style_xr_to_ipc(style, &ipc_style)) {
+			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+			                 "xrSetWorkspaceClientStyleEXT: style fields must be finite and "
+			                 "non-negative where required");
+		}
+	} else {
+		// NULL style → reset to runtime defaults (zero-init: no rounding,
+		// no feather, no glow).
+		memset(&ipc_style, 0, sizeof(ipc_style));
+	}
+
+	if (!session_is_ipc_client(sess)) {
+		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
+		                 "xrSetWorkspaceClientStyleEXT requires an IPC-mode session");
+	}
+
+	xrt_result_t xret = comp_ipc_client_compositor_workspace_set_client_style(
+	    &sess->xcn->base, (uint32_t)clientId, &ipc_style);
+	return xret_to_xr_result(&log, xret, "workspace_set_client_style");
 }
 
 #endif // OXR_HAVE_EXT_spatial_workspace

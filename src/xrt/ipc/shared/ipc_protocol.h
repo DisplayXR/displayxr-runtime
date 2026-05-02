@@ -547,6 +547,22 @@ struct ipc_workspace_chrome_layout
 };
 
 /*!
+ * Phase 2.C spec_version 9: per-client visual style applied at workspace
+ * content blit time. POD mirror of XrWorkspaceClientStyleEXT — the wire
+ * form for xrSetWorkspaceClientStyleEXT.
+ *
+ * @ingroup ipc
+ */
+struct ipc_workspace_client_style
+{
+	float corner_radius;            //!< Fraction of window height; 0 = sharp
+	float edge_feather_meters;      //!< Soft alpha falloff width in meters; 0 = crisp
+	float focus_glow_color[4];      //!< RGBA, applied only when client is focused
+	float focus_glow_intensity;     //!< Multiplier on color.a; 0 disables
+	float focus_glow_falloff_meters;//!< Halo extent in meters from rounded perimeter
+};
+
+/*!
  * State for a connected application.
  *
  * @ingroup ipc

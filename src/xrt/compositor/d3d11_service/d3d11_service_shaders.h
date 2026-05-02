@@ -716,6 +716,7 @@ float4 PSMain(VS_OUTPUT input) : SV_Target
     // corner_radius: fraction of height. >0 = top corners, <0 = bottom corners.
     // corner_aspect: abs = w/h aspect ratio. sign selects corners.
     float corner_alpha = 1.0;
+    bool in_corner = false;
     if (corner_radius != 0) {
         float ry = abs(corner_radius);
         float aspect = abs(corner_aspect);
@@ -742,6 +743,7 @@ float4 PSMain(VS_OUTPUT input) : SV_Target
         if (do_bottom_right && uv01.x > 1.0 - rx && uv01.y > 1.0 - ry)
             corner_dist = length(float2((uv01.x - (1.0 - rx)) / rx, (uv01.y - (1.0 - ry)) / ry));
         if (corner_dist >= 0.0) {
+            in_corner = true;
             if (corner_dist > 1.0) discard;
             // Smooth falloff in the last pixel-equivalent of the corner
             float feather_band = (edge_feather > 0.0) ? edge_feather / ry : 0.02;
@@ -750,12 +752,22 @@ float4 PSMain(VS_OUTPUT input) : SV_Target
     }
 
     // --- Edge feathering: smooth alpha fade at quad boundaries ---
+    // Phase 2.C spec_version 9: skip the straight-edge feather when this
+    // pixel is inside a corner region — the corner has its own elliptical
+    // falloff via corner_alpha, and stacking the straight-edge metric on
+    // top doubly-reduces alpha in corners (visible discontinuity where
+    // the corner curve meets the straight edge, especially when a focus
+    // tint amplifies the falloff into a colored band).
     float feather_alpha = 1.0;
-    if (edge_feather > 0.0) {
+    if (!in_corner && edge_feather > 0.0) {
         float d = min(min(uv01.x, 1.0 - uv01.x), min(uv01.y, 1.0 - uv01.y));
         feather_alpha = saturate(d / edge_feather);
     }
-    float alpha = corner_alpha * feather_alpha;
+    // One of corner_alpha / feather_alpha is always 1 by construction —
+    // multiplying them gives the unified coverage value usable for both
+    // alpha output and focus-tint amount below.
+    float coverage = corner_alpha * feather_alpha;
+    float alpha = coverage;
 
     // Phase 2.K Commit 8.C: optional alpha multiplier for chrome fade-in/out.
     // Inverted semantic: chrome_alpha.x = 0 means "no fade" (full opacity).
@@ -775,6 +787,23 @@ float4 PSMain(VS_OUTPUT input) : SV_Target
         return float4(src_rect.xyz, alpha * a_mul);
 
     float4 color = src_tex.Sample(src_samp, input.uv);
+
+    // Phase 2.C spec_version 9: focus tint. When this content blit is for the
+    // focused workspace client AND a glow color/intensity is supplied (set by
+    // the workspace controller via XrWorkspaceClientStyleEXT, gated on focus
+    // by the runtime), blend color.rgb toward glow_color.rgb across the same
+    // feather band that softens unfocused windows. The shape of the falloff
+    // is identical (same edge_feather metric, same alpha falloff); only the
+    // END color differs — unfocused fades to transparent, focused fades to
+    // the controller's chosen color (typically a deep cyan-blue). Reuses
+    // glow_color + glow_intensity (unused in the non-glow content path
+    // before now). Tint is keyed off `coverage` rather than feather_alpha
+    // so the band wraps cleanly around rounded corners.
+    if (edge_feather > 0.0 && glow_intensity > 0.0) {
+        float tint_amount = (1.0 - coverage) * glow_intensity * glow_color.a;
+        color.rgb = lerp(color.rgb, glow_color.rgb, saturate(tint_amount));
+    }
+
     return float4(color.rgb, color.a * alpha * a_mul);
 }
 )";

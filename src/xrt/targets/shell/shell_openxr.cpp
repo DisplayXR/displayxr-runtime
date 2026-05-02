@@ -240,6 +240,8 @@ extern "C" struct shell_openxr_state *shell_openxr_init(void)
 	    {"xrDestroyWorkspaceClientChromeSwapchainEXT", reinterpret_cast<PFN_xrVoidFunction *>(&s->destroy_chrome_swapchain)},
 	    {"xrSetWorkspaceClientChromeLayoutEXT",        reinterpret_cast<PFN_xrVoidFunction *>(&s->set_chrome_layout)},
 	    {"xrAcquireWorkspaceWakeupEventEXT",           reinterpret_cast<PFN_xrVoidFunction *>(&s->acquire_wakeup_event)},
+	    // Phase 2.C spec_version 9
+	    {"xrSetWorkspaceClientStyleEXT",               reinterpret_cast<PFN_xrVoidFunction *>(&s->set_client_style)},
 	};
 	for (const auto &e : entries) {
 		if (!resolve_pfn(s->instance, e.name, e.out)) {

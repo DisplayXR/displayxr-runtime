@@ -894,6 +894,11 @@ oxr_xrSetWorkspaceClientChromeLayoutEXT(XrSession session,
 //! OpenXR API function @ep{xrAcquireWorkspaceWakeupEventEXT}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrAcquireWorkspaceWakeupEventEXT(XrSession session, uint64_t *outNativeHandle);
+//! OpenXR API function @ep{xrSetWorkspaceClientStyleEXT}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSetWorkspaceClientStyleEXT(XrSession session,
+                                 XrWorkspaceClientId clientId,
+                                 const XrWorkspaceClientStyleEXT *style);
 #endif
 
 #ifdef OXR_HAVE_EXT_app_launcher

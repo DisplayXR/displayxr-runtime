@@ -3,7 +3,7 @@
 | Field | Value |
 |---|---|
 | **Extension Name** | `XR_EXT_spatial_workspace` |
-| **Spec Version** | 8 |
+| **Spec Version** | 9 |
 | **Authors** | David Fattal (DisplayXR / Leia Inc.) |
 | **Status** | Provisional — published with the DisplayXR runtime; subject to revision before Khronos registry submission. |
 | **Header** | `src/external/openxr_includes/openxr/XR_EXT_spatial_workspace.h` |
@@ -20,7 +20,7 @@ A spatial workspace is the OS-level shell for a 3D display: the privileged proce
 
 ---
 
-## 2. Surface (spec_version 8)
+## 2. Surface (spec_version 9)
 
 ### Lifecycle
 
@@ -99,6 +99,19 @@ The runtime ships with **zero default chrome**. If a controller wants chrome (ti
 
 The controller's idle CPU cost goes from ~0.1 % of one core (the polling baseline) to effectively 0 once this handle is wired into its wait set. The reference shell at `src/xrt/targets/shell/main.c` uses it together with the launcher's existing `MsgWaitForMultipleObjects` loop — drain on every wake, sleep otherwise.
 
+### Per-client visual style *(spec_version 9)*
+
+The runtime is the compositor — it samples each client's swapchain texture and applies the alpha mask, rounded corners, edge feathering, and focus glow that determine how the window's content appears on the panel. The controller cannot access the client texture, so anything affecting how content composites (corners, edges, focus indication) must live behind a runtime API. Rather than enumerate ad-hoc fields per visual treatment, the runtime exposes a single per-client "style" struct the controller pushes; new visual treatments arrive as additive style fields over time without rewriting the composite pipeline.
+
+- `xrSetWorkspaceClientStyleEXT(session, clientId, &style)` — set / update the per-client visual style. Cached per client and applied every render. Pass `style = NULL` to reset to runtime defaults. The struct fields:
+  - **cornerRadius** — fraction of window height. 0 = sharp; typical 0.02..0.08 = soft / deliberate rounding.
+  - **edgeFeatherMeters** — soft alpha falloff width at the perimeter, in physical display meters. 0 = crisp pixel-perfect edge; positive values fade alpha to 0 over this physical width. Always applied (focused or not), so all windows share an ambient softening at edges.
+  - **focusGlowColor / focusGlowIntensity / focusGlowFalloffMeters** — colored halo extending outward from the rounded perimeter when the client is focused (per `xrSetWorkspaceFocusedClientEXT`). Ignored when not focused. `intensity = 0` or `falloffMeters = 0` disables the glow even when focused. Falloff is in physical meters from the perimeter where the glow's alpha falls off.
+
+The architectural principle: the runtime owns mechanism (alpha sampling, depth pipeline, gamma correctness), the controller owns appearance (every numeric value above). When a future visual treatment arrives — drop shadow, vibrancy, dimming when unfocused, color tint — it becomes a new field on this struct, leaving the architecture intact.
+
+Implementation note: today the focus glow renders as an oversized pre-pass behind axis-aligned content quads (matching the existing launcher hover-glow path). Perspective / tilted windows render the content edge feather but skip the halo for now; they rely on the chrome pill's own focus indication. This is a v9 implementation detail, not a spec constraint — future runtime work can extend the glow path to follow tilted quads.
+
 ---
 
 ## 3. Design notes
@@ -121,7 +134,9 @@ The controller's idle CPU cost goes from ~0.1 % of one core (the polling baselin
 
 **Spec_version 8 closes the controller-loop.** Three additions, all additive over v7: (1) `xrAcquireWorkspaceWakeupEventEXT` returns a Win32 event handle so the controller can sleep on `MsgWaitForMultipleObjects` instead of polling — drops idle CPU from ~0.1 % to ~0. (2) `XrWorkspaceChromeLayoutEXT` gains `anchorToWindowTopEdge` + `widthAsFractionOfWindow` flags so the runtime auto-recomputes chrome anchor + width every frame from current window dims; the controller pushes layout once at create and never on resize, and the chrome stays glued to the window edge in lockstep with content (instead of lagging one frame behind). (3) `XR_WORKSPACE_INPUT_EVENT_WINDOW_POSE_CHANGED_EXT` lets controllers react to runtime-driven pose / size changes (edge-resize drag, fullscreen toggle) without a re-query. v7 controllers that don't resolve the new PFN / fields keep working — none of the v8 additions are mandatory.
 
-**Architectural endpoint.** Per the architectural North Star (`feedback_controllers_own_motion`), the runtime owns mechanism, the controller owns policy + appearance. After spec_version 8, this principle holds for chrome and for the controller's main-loop wakeup pattern: the runtime owns the cross-process texture-share mechanism, the depth-pipeline composite, the hit-test plumbing, the auto-anchor math, and the wakeup-event source-of-truth; the controller owns every pixel of chrome appearance, every region's hit-region geometry, every animation curve, and the wait primitive that drives its idle behavior.
+**Spec_version 9 makes the runtime a parameterized composite engine.** Adds `XrWorkspaceClientStyleEXT` + `xrSetWorkspaceClientStyleEXT` — the controller's surface for adjusting how the runtime samples / masks / shades each client's content (corner radius, edge alpha feather, focus-glow color/intensity/falloff). The architectural rationale: chrome (the decoration controllers paint via chrome swapchains) is fully controller-owned, but how the *content itself* composites — its corners, its edge softening, its focused-state appearance — is fundamentally a property of the compositor and only the runtime can express it. Rather than wire ad-hoc shader knobs through one-off APIs, the style struct is the canonical extension point: new visual treatments (drop shadow, vibrancy, dimming when unfocused, color tint) arrive as additive fields on this struct over time, with controllers that don't know about them seeing runtime-defined defaults. v8 controllers that don't resolve the new PFN see the runtime's prior default style.
+
+**Architectural endpoint.** Per the architectural North Star (`feedback_controllers_own_motion`), the runtime owns mechanism, the controller owns policy + appearance. After spec_version 9, this principle holds for chrome, for the wakeup pattern, and for the parameterized composite knobs: the runtime owns the cross-process texture-share mechanism, the depth-pipeline composite, the hit-test plumbing, the auto-anchor math, the wakeup-event source-of-truth, and the alpha-mask shader; the controller owns every pixel of chrome appearance, every region's hit-region geometry, every animation curve, the wait primitive that drives its idle behavior, AND the per-client style values that drive the runtime's compositor knobs.
 
 ---
 
@@ -135,6 +150,6 @@ The extension is implemented in this repository:
 - **Service compositor (Windows D3D11)**: `src/xrt/compositor/d3d11_service/comp_d3d11_service.cpp` (drain, hit-test enrichment, FRAME_TICK + FOCUS_CHANGED + POINTER_HOVER emission, controller-chrome composite, chrome quad raycast, chromeRegionId resolution, request_*_by_slot helpers); `src/xrt/compositor/d3d11/comp_d3d11_window.cpp` (WndProc, public ring, Win32 SetCapture / ReleaseCapture).
 - **Reference controller (chrome appearance)**: `src/xrt/targets/shell/shell_chrome.cpp` — owns the rounded-pill SDF shader, grip dots + close/min/max button geometry, hover-fade ease-out cubic, per-state re-render. Reads cursor-over-chrome via POINTER_HOVER events; dispatches close → exit RPC, max → fullscreen RPC.
 - **Reference controller (lifecycle)**: `src/xrt/targets/shell/main.c` (animation framework, smooth preset transitions, interactive carousel state machine, variable poll cadence, chrome lifecycle wiring).
-- **Smoke test**: `test_apps/workspace_minimal_d3d11_win/main.cpp` — resolves all 28 PFNs, walks lifecycle + pose + visibility + hit-test + focus + drain + pointer capture + 30° yaw orientation + drain counts + lifecycle requests + chrome-swapchain create / acquire / wait / clear / release / layout-with-auto-anchor + wakeup-event handle + chrome destroy + client enumeration + frame capture.
+- **Smoke test**: `test_apps/workspace_minimal_d3d11_win/main.cpp` — resolves all 29 PFNs, walks lifecycle + pose + visibility + hit-test + focus + drain + pointer capture + 30° yaw orientation + drain counts + lifecycle requests + chrome-swapchain create / acquire / wait / clear / release / layout-with-auto-anchor + wakeup-event handle + chrome destroy + per-client style push / NULL reset / validation + client enumeration + frame capture.
 
 The Phase 2 sub-phase that landed each part of this surface is tracked in [`docs/roadmap/spatial-workspace-extensions-phase2-audit.md`](../roadmap/spatial-workspace-extensions-phase2-audit.md).

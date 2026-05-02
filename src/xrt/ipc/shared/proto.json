@@ -245,6 +245,13 @@
 		"out_handles": {"type": "xrt_graphics_sync_handle_t"}
 	},
 
+	"workspace_set_client_style": {
+		"in": [
+			{"name": "client_id", "type": "uint32_t"},
+			{"name": "style", "type": "struct ipc_workspace_client_style"}
+		]
+	},
+
 	"system_devices_get_roles": {
 		"out": [
 			{"name": "system_roles", "type": "struct xrt_system_roles"}

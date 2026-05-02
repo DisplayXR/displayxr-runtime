@@ -4,8 +4,8 @@
 // workspace_minimal_d3d11_win
 //
 // Minimal validation client for XR_EXT_spatial_workspace (Phase 2.A + 2.C
-// + 2.D + 2.F + 2.I-prequel, spec_version 8) and XR_EXT_app_launcher
-// (Phase 2.B). Creates an instance + session, resolves all 28 extension
+// + 2.D + 2.F + 2.I-prequel, spec_version 9) and XR_EXT_app_launcher
+// (Phase 2.B). Creates an instance + session, resolves all 29 extension
 // PFNs, and walks through:
 //   activate -> get-state ->
 //     add capture client ->
@@ -164,11 +164,12 @@ run_workspace_test()
 	PFN_xrRequestWorkspaceClientExitEXT pfnRequestExit = nullptr;
 	PFN_xrRequestWorkspaceClientFullscreenEXT pfnRequestFullscreen = nullptr;
 	// Phase 2.C controller-owned chrome (spec_version 7) + event-driven
-	// wakeup (spec_version 8).
+	// wakeup (spec_version 8) + per-client style (spec_version 9).
 	PFN_xrCreateWorkspaceClientChromeSwapchainEXT pfnCreateChromeSwapchain = nullptr;
 	PFN_xrDestroyWorkspaceClientChromeSwapchainEXT pfnDestroyChromeSwapchain = nullptr;
 	PFN_xrSetWorkspaceClientChromeLayoutEXT pfnSetChromeLayout = nullptr;
 	PFN_xrAcquireWorkspaceWakeupEventEXT pfnAcquireWakeupEvent = nullptr;
+	PFN_xrSetWorkspaceClientStyleEXT pfnSetClientStyle = nullptr;
 
 	struct PfnLookup {
 		const char *name;
@@ -213,6 +214,8 @@ run_workspace_test()
 	     reinterpret_cast<PFN_xrVoidFunction *>(&pfnSetChromeLayout)},
 	    {"xrAcquireWorkspaceWakeupEventEXT",
 	     reinterpret_cast<PFN_xrVoidFunction *>(&pfnAcquireWakeupEvent)},
+	    {"xrSetWorkspaceClientStyleEXT",
+	     reinterpret_cast<PFN_xrVoidFunction *>(&pfnSetClientStyle)},
 	};
 	for (const auto &l : lookups) {
 		PFN_xrVoidFunction fn = nullptr;
@@ -628,6 +631,32 @@ run_workspace_test()
 
 			CHECK_XR(pfnDestroyChromeSwapchain(chromeSwapchain),
 			         "xrDestroyWorkspaceClientChromeSwapchainEXT");
+		}
+
+		// Phase 2.C spec_version 9: per-client visual style smoke. Push a
+		// sample style with edge feather + focus glow, then a NULL reset.
+		// All three calls should return XR_SUCCESS.
+		{
+			XrWorkspaceClientStyleEXT style = {XR_TYPE_WORKSPACE_CLIENT_STYLE_EXT};
+			style.cornerRadius = 0.06f;
+			style.edgeFeatherMeters = 0.003f;
+			style.focusGlowColor[0] = 0.30f;
+			style.focusGlowColor[1] = 0.55f;
+			style.focusGlowColor[2] = 1.00f;
+			style.focusGlowColor[3] = 1.00f;
+			style.focusGlowIntensity = 0.85f;
+			style.focusGlowFalloffMeters = 0.012f;
+			XrResult sr1 = pfnSetClientStyle(session, clientId, &style);
+			std::printf("[xrSetWorkspaceClientStyleEXT(sample)       ] %s\n", xr_result_str(sr1));
+
+			// NULL style → reset to runtime defaults.
+			XrResult sr2 = pfnSetClientStyle(session, clientId, nullptr);
+			std::printf("[xrSetWorkspaceClientStyleEXT(NULL=reset)   ] %s\n", xr_result_str(sr2));
+
+			// Validation: NULL clientId must be rejected.
+			XrResult sr3 = pfnSetClientStyle(session, XR_NULL_WORKSPACE_CLIENT_ID, &style);
+			std::printf("[xrSetWorkspaceClientStyleEXT(NULL clientId)] %s (expect VALIDATION_FAILURE)\n",
+			            xr_result_str(sr3));
 		}
 
 		// Phase 2.I-prequel: client enumeration smoke.

@@ -25,10 +25,10 @@ extern "C" {
 #endif
 
 #define XR_EXT_spatial_workspace 1
-#define XR_EXT_spatial_workspace_SPEC_VERSION 8
+#define XR_EXT_spatial_workspace_SPEC_VERSION 9
 #define XR_EXT_SPATIAL_WORKSPACE_EXTENSION_NAME "XR_EXT_spatial_workspace"
 
-// Provisional XrStructureType values. The 1000999100..104 range is reserved for
+// Provisional XrStructureType values. The 1000999100..105 range is reserved for
 // this extension; final values reconcile with the Khronos registry before spec
 // freeze.
 #define XR_TYPE_WORKSPACE_CLIENT_INFO_EXT                  ((XrStructureType)1000999100)
@@ -36,6 +36,7 @@ extern "C" {
 #define XR_TYPE_WORKSPACE_CAPTURE_RESULT_EXT               ((XrStructureType)1000999102)
 #define XR_TYPE_WORKSPACE_CHROME_SWAPCHAIN_CREATE_INFO_EXT ((XrStructureType)1000999103)
 #define XR_TYPE_WORKSPACE_CHROME_LAYOUT_EXT                ((XrStructureType)1000999104)
+#define XR_TYPE_WORKSPACE_CLIENT_STYLE_EXT                 ((XrStructureType)1000999105)
 
 /*!
  * @brief Workspace-local identifier for a client.
@@ -781,6 +782,89 @@ typedef XrResult (XRAPI_PTR *PFN_xrAcquireWorkspaceWakeupEventEXT)(
     XrSession  session,
     uint64_t  *outNativeHandle);
 
+// ---- Per-client visual style (spec_version 9) ----
+
+/*!
+ * @brief Per-client visual style applied at workspace content blit time.
+ *
+ * The runtime is a parameterized composite engine; this struct is the
+ * controller's surface for adjusting the existing shader knobs (corner
+ * radius, edge feather, focus glow). The runtime owns mechanism (sampling
+ * the client's swapchain, applying the alpha mask, compositing onto the
+ * atlas); the controller owns appearance by pushing values into this
+ * struct. New visual treatments add new fields here additively over time
+ * — controllers that don't know about a new field see it default to a
+ * runtime-defined sane value.
+ *
+ * Coordinate system: @c edgeFeatherMeters and @c focusGlowFalloffMeters
+ * are measured in physical display space — independent of window size.
+ * The same 3 mm feather reads identically on a small or large window.
+ *
+ * Set per-client via xrSetWorkspaceClientStyleEXT. Runtime caches the
+ * style per client and applies every render. Pass a zero-initialized
+ * style (or NULL) to reset to runtime defaults.
+ */
+typedef struct XrWorkspaceClientStyleEXT {
+    XrStructureType       type;        // XR_TYPE_WORKSPACE_CLIENT_STYLE_EXT
+    const void* XR_MAY_ALIAS next;
+
+    // Edge geometry. cornerRadius is a fraction of window HEIGHT (0..1).
+    // 0 = sharp corners. Typical values 0.02..0.08 read as soft / deliberate
+    // rounding. Always rounds all four corners. Negative values reserved
+    // for future "top-only" / "bottom-only" semantics; treat as 0 today.
+    float cornerRadius;
+
+    // Soft alpha falloff at the perimeter (rounded square + edges) in
+    // METERS. 0 = crisp pixel-perfect edge. Positive values fade the
+    // alpha toward 0 over this physical width — reads as a subtle
+    // ambient softening on every window. Always applied (focused or
+    // not). Typical values 0.001..0.004 m (1-4 mm).
+    float edgeFeatherMeters;
+
+    // Focus glow. Active only when this client is the focused workspace
+    // client (per xrSetWorkspaceFocusedClientEXT). Ignored when the
+    // client is not focused — no effect on unfocused windows.
+    //
+    //   focusGlowColor       RGBA. Alpha is the peak opacity at the
+    //                        inner edge of the glow band. Premultiplied
+    //                        is fine; the runtime composites linearly.
+    //   focusGlowIntensity   Scalar multiplier on color.a. 0 disables
+    //                        the glow even when focused; ~0.6..1.0
+    //                        reads as a clear focus indicator.
+    //   focusGlowFalloffMeters
+    //                        Distance from the rounded-square perimeter
+    //                        where the glow's alpha falls off. ~5-15
+    //                        mm reads as a soft halo. 0 disables.
+    float focusGlowColor[4];
+    float focusGlowIntensity;
+    float focusGlowFalloffMeters;
+} XrWorkspaceClientStyleEXT;
+
+/*!
+ * @brief Set / update the per-client visual style.
+ *
+ * Cached per client; applied every render. Call once on connect after
+ * adding the client to the workspace, and again whenever the controller
+ * changes the visual treatment (preset switch, theme change, focus
+ * indicator scheme). Calling with a clientId that has no live slot
+ * stores the style for later — when the slot binds, the cached style
+ * takes effect.
+ *
+ * Pass @p style = NULL to reset that client's style to runtime defaults.
+ *
+ * @return XR_SUCCESS on success,
+ *         XR_ERROR_HANDLE_INVALID if @p clientId is unknown,
+ *         XR_ERROR_VALIDATION_FAILURE if any numeric field is non-finite
+ *         or negative where required (cornerRadius, edgeFeatherMeters,
+ *         focusGlowIntensity, focusGlowFalloffMeters all >= 0),
+ *         XR_ERROR_FEATURE_UNSUPPORTED if @p session is not the active
+ *         workspace.
+ */
+typedef XrResult (XRAPI_PTR *PFN_xrSetWorkspaceClientStyleEXT)(
+    XrSession                              session,
+    XrWorkspaceClientId                    clientId,
+    const XrWorkspaceClientStyleEXT       *style);
+
 #ifndef XR_NO_PROTOTYPES
 XRAPI_ATTR XrResult XRAPI_CALL xrActivateSpatialWorkspaceEXT(
     XrSession session);
@@ -892,6 +976,11 @@ XRAPI_ATTR XrResult XRAPI_CALL xrSetWorkspaceClientChromeLayoutEXT(
 XRAPI_ATTR XrResult XRAPI_CALL xrAcquireWorkspaceWakeupEventEXT(
     XrSession  session,
     uint64_t  *outNativeHandle);
+
+XRAPI_ATTR XrResult XRAPI_CALL xrSetWorkspaceClientStyleEXT(
+    XrSession                              session,
+    XrWorkspaceClientId                    clientId,
+    const XrWorkspaceClientStyleEXT       *style);
 #endif
 
 #ifdef __cplusplus

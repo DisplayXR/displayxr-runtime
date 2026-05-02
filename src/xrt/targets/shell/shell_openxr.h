@@ -74,6 +74,9 @@ struct shell_openxr_state
 	// main.c to reference.
 	PFN_xrAcquireWorkspaceWakeupEventEXT           acquire_wakeup_event;
 	void                                          *wakeup_event_handle; // Win32 HANDLE on Windows; uint64_t cast back. NULL if unsupported.
+	// Phase 2.C spec_version 9: per-client visual style (corner radius,
+	// edge feather, focus glow) — controller-driven runtime composite knobs.
+	PFN_xrSetWorkspaceClientStyleEXT               set_client_style;
 
 	// Physical display size in meters, pulled from XR_EXT_display_info during
 	// init. Falls back to LP-3D dims (0.700 × 0.394 m) if the extension is

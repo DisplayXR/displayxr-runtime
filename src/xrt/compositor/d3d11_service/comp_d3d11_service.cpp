@@ -758,6 +758,20 @@ struct d3d11_multi_client_slot
 	WINDOWPLACEMENT saved_placement;                         //!< Original window placement (for restore)
 	LONG saved_exstyle;                                      //!< Original extended window style
 	//! @}
+
+	//! Phase 2.C spec_version 9: per-client visual style pushed by the
+	//! workspace controller via xrSetWorkspaceClientStyleEXT. Cached
+	//! per-slot and applied at content blit time. Zero-init = runtime
+	//! defaults (no rounding, no feather, no glow). The focus glow
+	//! fields are only consulted when this slot equals mc->focused_slot.
+	//! Distinct from the chrome layout (which positions the chrome quad);
+	//! this struct shapes how the client's CONTENT itself composites.
+	bool style_pushed;                                       //!< false until controller pushes a style; defaults active until then
+	float style_corner_radius;                               //!< fraction of window height; 0 = sharp
+	float style_edge_feather_meters;                         //!< soft alpha falloff width in meters
+	float style_focus_glow_color[4];                         //!< RGBA, gated on focus
+	float style_focus_glow_intensity;                        //!< 0 disables even when focused
+	float style_focus_glow_falloff_meters;                   //!< halo extent in meters
 };
 
 /*!
@@ -7303,6 +7317,43 @@ after_key_shortcuts:
 					sys->context->Draw(4, 0);
 				}
 			} else {
+				// Phase 2.C spec_version 9: resolve per-client visual style.
+				// Default values (when controller hasn't pushed a style)
+				// preserve the prior look: 5 % rounded corners, 2 px feather.
+				const struct d3d11_multi_client_slot &cs = mc->clients[s];
+				const bool style_active = cs.style_pushed;
+				const float win_h_m = cs.window_height_m > 0.0f ? cs.window_height_m : 0.001f;
+
+				// Sign convention: corner_radius < 0 with corner_aspect < 0
+				// rounds all four corners (see d3d11_service_shaders.h:716).
+				const float style_corner_r =
+				    style_active
+				        ? (cs.style_corner_radius > 0.0f ? -cs.style_corner_radius : 0.0f)
+				        : -0.05f;
+				// edge_feather is sent as fraction of destination pixel height.
+				// Convert meters → fraction-of-window-height (same physical
+				// dimension): meters / window_height_m. Always-on (focused or
+				// not) so all windows soften at the perimeter.
+				const float style_feather_frac =
+				    style_active
+				        ? (cs.style_edge_feather_meters > 0.0f
+				               ? cs.style_edge_feather_meters / win_h_m
+				               : 0.0f)
+				        : (UI_EDGE_FEATHER_PX / dest_px_h);
+
+				// Phase 2.C spec_version 9: focus tint. When this slot is
+				// the focused workspace client AND the controller's pushed
+				// style enables a glow, write the focus color/intensity
+				// into the content blit's cbuffer. The shader blends color
+				// toward this tint inside the existing edge_feather band
+				// (same falloff geometry; just ends in the controller's
+				// color instead of transparent). Works on both axis-aligned
+				// and perspective/tilted clients — no separate pre-pass.
+				const bool focus_tint_enabled =
+				    s == mc->focused_slot
+				    && style_active
+				    && cs.style_focus_glow_intensity > 0.0f;
+
 				// Update constant buffer
 				D3D11_MAPPED_SUBRESOURCE mapped;
 				HRESULT hr = sys->context->Map(sys->blit_constant_buffer.get(), 0,
@@ -7329,15 +7380,23 @@ after_key_shortcuts:
 				cb->quad_mode = use_quad ? 1.0f : 0.0f;
 				cb->dst_rect_wh[0] = dest_px_w;
 				cb->dst_rect_wh[1] = dest_px_h;
-				// Phase 2.K Commit 8.B: round all four corners of the
-				// content quad to coordinate with the new floating pill
-				// chrome. Shader sign convention: corner_radius < 0 with
-				// corner_aspect < 0 means all-four. Radius is fraction of
-				// content height — 5% reads as a soft, deliberate corner.
-				cb->corner_radius = -0.05f;
-				cb->corner_aspect = -(mc->clients[s].window_width_m / mc->clients[s].window_height_m);
-				cb->edge_feather = UI_EDGE_FEATHER_PX / dest_px_h;
-				cb->glow_intensity = 0.0f;
+				// Phase 2.C spec_version 9: corner radius + edge feather come
+				// from the slot's per-client style (defaults preserve the
+				// prior 5 % rounding + 2 px feather when no style is pushed).
+				// Aspect sign convention: negative + negative aspect = all
+				// four corners (see d3d11_service_shaders.h:716).
+				cb->corner_radius = style_corner_r;
+				cb->corner_aspect = -(cs.window_width_m / win_h_m);
+				cb->edge_feather = style_feather_frac;
+				if (focus_tint_enabled) {
+					cb->glow_intensity = cs.style_focus_glow_intensity;
+					cb->glow_color[0] = cs.style_focus_glow_color[0];
+					cb->glow_color[1] = cs.style_focus_glow_color[1];
+					cb->glow_color[2] = cs.style_focus_glow_color[2];
+					cb->glow_color[3] = cs.style_focus_glow_color[3];
+				} else {
+					cb->glow_intensity = 0.0f;
+				}
 				if (use_quad) {
 					blit_set_quad_corners(cb, quad_corners, quad_w_vals);
 					// Phase 2.K: per-corner depth from quad_w_vals (which
@@ -11991,6 +12050,88 @@ comp_d3d11_service_workspace_set_chrome_layout_by_slot(struct xrt_system_composi
 	       cs->chrome_region_count * sizeof(struct ipc_workspace_chrome_hit_region));
 	cs->chrome_layout_valid = true;
 	return XRT_SUCCESS;
+}
+
+// Phase 2.C spec_version 9: shared body for both IPC and capture client style
+// pushes. Copies fields; does NOT validate (state tracker already validated).
+static void
+apply_workspace_style_to_slot(struct d3d11_multi_client_slot *cs,
+                              const struct ipc_workspace_client_style *style)
+{
+	cs->style_pushed = true;
+	cs->style_corner_radius = style->corner_radius;
+	cs->style_edge_feather_meters = style->edge_feather_meters;
+	cs->style_focus_glow_color[0] = style->focus_glow_color[0];
+	cs->style_focus_glow_color[1] = style->focus_glow_color[1];
+	cs->style_focus_glow_color[2] = style->focus_glow_color[2];
+	cs->style_focus_glow_color[3] = style->focus_glow_color[3];
+	cs->style_focus_glow_intensity = style->focus_glow_intensity;
+	cs->style_focus_glow_falloff_meters = style->focus_glow_falloff_meters;
+}
+
+extern "C" bool
+comp_d3d11_service_set_client_style_by_slot(struct xrt_system_compositor *xsysc,
+                                            int slot,
+                                            const struct ipc_workspace_client_style *style)
+{
+	if (xsysc == nullptr || style == nullptr) {
+		return false;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	if (mc == nullptr || slot < 0 || slot >= D3D11_MULTI_MAX_CLIENTS) {
+		return false;
+	}
+	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	apply_workspace_style_to_slot(&mc->clients[slot], style);
+	return true;
+}
+
+extern "C" bool
+comp_d3d11_service_set_capture_client_style(struct xrt_system_compositor *xsysc,
+                                            int slot_index,
+                                            const struct ipc_workspace_client_style *style)
+{
+	// Capture clients live in the same mc->clients[] array as IPC clients
+	// (they distinguish via client_type). The IPC handler maps client_id
+	// >= 1000 to slot = client_id - 1000 directly — that lands at the
+	// same slot index used here.
+	if (xsysc == nullptr || style == nullptr) {
+		return false;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	if (mc == nullptr || slot_index < 0 || slot_index >= D3D11_MULTI_MAX_CLIENTS) {
+		return false;
+	}
+	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	apply_workspace_style_to_slot(&mc->clients[slot_index], style);
+	return true;
+}
+
+extern "C" void
+comp_d3d11_service_set_focused_slot(struct xrt_system_compositor *xsysc, int slot)
+{
+	// Phase 2.C spec_version 9: explicit setter so the IPC layer's
+	// xrSetWorkspaceFocusedClientEXT path can update the compositor's
+	// focused_slot (used by the per-client focus-glow gate at blit
+	// time). Validates range — out-of-range slots clamp to -1 (no
+	// focus). Holding render_mutex matches the existing register /
+	// unregister focus-update sites.
+	if (xsysc == nullptr) {
+		return;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	if (mc == nullptr) {
+		return;
+	}
+	std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+	if (slot < 0 || slot >= D3D11_MULTI_MAX_CLIENTS || !mc->clients[slot].active) {
+		mc->focused_slot = -1;
+	} else {
+		mc->focused_slot = slot;
+	}
 }
 
 extern "C" void *

@@ -2648,10 +2648,50 @@ ipc_handle_workspace_set_focused_client(volatile struct ipc_client_state *_ics, 
 		s->global_state.active_client_index = -1;
 		s->global_state.last_active_client_index = -1;
 		os_mutex_unlock(&s->global_state.lock);
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+		// Phase 2.C spec_version 9: also clear the compositor's
+		// focused_slot view so the focus glow disappears.
+		if (s->xsysc != NULL) {
+			comp_d3d11_service_set_focused_slot(s->xsysc, -1);
+		}
+#endif
 		return XRT_SUCCESS;
 	}
 
-	return ipc_server_set_active_client(s, client_id);
+	xrt_result_t xret = ipc_server_set_active_client(s, client_id);
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	// Phase 2.C spec_version 9: mirror the focus change into the
+	// compositor's focused_slot. The IPC layer's active_client_index
+	// is keyed by ipc thread index; the compositor needs the slot
+	// index in mc->clients[]. Map via find_slot_by_xc — same lookup
+	// the chrome layout setter uses.
+	if (xret == XRT_SUCCESS && s->xsysc != NULL) {
+		// Capture clients (id >= 1000) map straight to slot.
+		if (client_id >= 1000u) {
+			comp_d3d11_service_set_focused_slot(s->xsysc, (int)(client_id - 1000u));
+		} else {
+			os_mutex_lock(&s->global_state.lock);
+			volatile struct ipc_client_state *target_ics = NULL;
+			for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
+				volatile struct ipc_client_state *ics = &s->threads[i].ics;
+				if (ics->client_state.id == client_id && ics->server_thread_index >= 0) {
+					target_ics = ics;
+					break;
+				}
+			}
+			int mc_slot = -1;
+			if (target_ics != NULL && target_ics->xc != NULL) {
+				mc_slot = comp_d3d11_service_workspace_find_slot_by_xc(
+				    s->xsysc, (struct xrt_compositor *)target_ics->xc);
+			}
+			os_mutex_unlock(&s->global_state.lock);
+			comp_d3d11_service_set_focused_slot(s->xsysc, mc_slot);
+		}
+	}
+#endif
+
+	return xret;
 }
 
 xrt_result_t
@@ -3055,6 +3095,70 @@ ipc_handle_workspace_set_chrome_layout(volatile struct ipc_client_state *_ics,
 	(void)s;
 	(void)client_id;
 	(void)layout;
+	return XRT_ERROR_IPC_FAILURE;
+#endif
+}
+
+xrt_result_t
+ipc_handle_workspace_set_client_style(volatile struct ipc_client_state *_ics,
+                                      uint32_t client_id,
+                                      const struct ipc_workspace_client_style *style)
+{
+	struct ipc_server *s = _ics->server;
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (s->xsysc == NULL || style == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	// Auth: only the workspace controller may push per-client style.
+	unsigned long expected_pid = get_orchestrator_workspace_pid();
+	unsigned long caller_pid = (unsigned long)_ics->client_state.pid;
+	if (expected_pid != 0 && caller_pid != expected_pid) {
+		return XRT_ERROR_NOT_AUTHORIZED;
+	}
+
+	IPC_INFO(s,
+	         "Workspace: set_client_style client_id=%u corner=%.3f feather=%.4fm glow=(%.2f,%.2f,%.2f,%.2f) "
+	         "intensity=%.2f falloff=%.4fm",
+	         client_id, style->corner_radius, style->edge_feather_meters, style->focus_glow_color[0],
+	         style->focus_glow_color[1], style->focus_glow_color[2], style->focus_glow_color[3],
+	         style->focus_glow_intensity, style->focus_glow_falloff_meters);
+
+	// Capture clients use IDs >= 1000 (slot index = client_id - 1000)
+	if (client_id >= 1000u) {
+		int slot = (int)(client_id - 1000u);
+		bool ok = comp_d3d11_service_set_capture_client_style(s->xsysc, slot, style);
+		return ok ? XRT_SUCCESS : XRT_ERROR_IPC_FAILURE;
+	}
+
+	// IPC client lookup by ID, then map to compositor slot.
+	os_mutex_lock(&s->global_state.lock);
+	volatile struct ipc_client_state *target_ics = NULL;
+	for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
+		volatile struct ipc_client_state *ics = &s->threads[i].ics;
+		if (ics->client_state.id == client_id && ics->server_thread_index >= 0) {
+			target_ics = ics;
+			break;
+		}
+	}
+	if (target_ics == NULL || target_ics->xc == NULL) {
+		os_mutex_unlock(&s->global_state.lock);
+		IPC_WARN(s, "Workspace: set_client_style - client %u not found", client_id);
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	int slot = comp_d3d11_service_workspace_find_slot_by_xc(s->xsysc, (struct xrt_compositor *)target_ics->xc);
+	os_mutex_unlock(&s->global_state.lock);
+	if (slot < 0) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	return comp_d3d11_service_set_client_style_by_slot(s->xsysc, slot, style)
+	           ? XRT_SUCCESS
+	           : XRT_ERROR_IPC_FAILURE;
+#else
+	(void)s;
+	(void)client_id;
+	(void)style;
 	return XRT_ERROR_IPC_FAILURE;
 #endif
 }

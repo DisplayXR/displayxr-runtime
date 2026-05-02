@@ -463,6 +463,7 @@ handle_non_null(struct oxr_instance *inst, struct oxr_logger *log, const char *n
 	ENTRY_IF_EXT(xrDestroyWorkspaceClientChromeSwapchainEXT, EXT_spatial_workspace);
 	ENTRY_IF_EXT(xrSetWorkspaceClientChromeLayoutEXT, EXT_spatial_workspace);
 	ENTRY_IF_EXT(xrAcquireWorkspaceWakeupEventEXT, EXT_spatial_workspace);
+	ENTRY_IF_EXT(xrSetWorkspaceClientStyleEXT, EXT_spatial_workspace);
 #endif
 
 #ifdef OXR_HAVE_EXT_app_launcher

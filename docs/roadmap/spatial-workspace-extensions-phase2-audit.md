@@ -157,6 +157,18 @@ Below: the original 8 sub-steps, lowest-blast-radius first.
 
 See `spatial-workspace-extensions-phase2K-plan.md` for the full design and `spatial-workspace-extensions-phase2K-agent-prompt.md` for the per-commit hand-off.
 
+### Phase 2.J — Per-client visual style ✅ shipped (spec_version 9)
+
+**Touched:** Public surface bumped 8 → 9. New struct `XrWorkspaceClientStyleEXT` (cornerRadius, edgeFeatherMeters, focusGlowColor, focusGlowIntensity, focusGlowFalloffMeters) + new function `xrSetWorkspaceClientStyleEXT`. Wire form `ipc_workspace_client_style` in `ipc_protocol.h`. New RPC `workspace_set_client_style` in `proto.json`. State-tracker dispatch in `oxr_workspace.c` validates the struct and forwards. Compositor: per-slot `style_*` fields on `d3d11_multi_client_slot`, `comp_d3d11_service_set_client_style_by_slot` + `_set_capture_client_style` setters, `_set_focused_slot` helper so the IPC `xrSetWorkspaceFocusedClientEXT` path mirrors focus into the compositor's `mc->focused_slot` (so the focus glow tracks controller-set focus, not just click-driven). Workspace client content blit at `comp_d3d11_service.cpp:7340` reads slot style, applies cornerRadius + edge feather every frame, and emits an axis-aligned focus-glow pre-pass (existing `convert_srgb=3.0` glow shader path) for the focused slot. Reference shell pushes a default style on chrome lazy-create — 5 % rounded corners, 3 mm edge feather, 12 mm cyan-blue focus halo (matches the existing launcher-hover glow color).
+
+**Decisions made during the migration:**
+- The runtime owns the compositor → only the runtime can soften content edges or paint a focus glow over content. Tried positioning the style on the controller side (halo chrome quad) but rejected: an overlay can't fade an opaque content edge to transparent, and duplicating the runtime's rounded-square SDF in the controller would mean re-implementing the shader. The runtime exposes the shader knobs; the controller drives them.
+- Single struct rather than ad-hoc fields. Future visual treatments (drop shadow, vibrancy, dimming when unfocused, color tint) become new fields on the same struct, not new RPCs. Controllers that don't know about new fields see runtime defaults.
+- Focus glow is an axis-aligned pre-pass (oversized quad with the existing glow-shader path). Perspective / tilted windows skip the halo for now and rely on the chrome pill's own focus indication. Future work can extend the glow path to follow tilted quads if needed.
+- Edge feather is universal (always applied, all windows) and lives on the standard content blit. Idle-CPU cost is zero — the existing per-slot blit already runs every frame; we just write different cbuffer values.
+
+**Risk realized:** Low. The IPC ↔ compositor focus-state mismatch (compositor's `mc->focused_slot` only updated on click/fullscreen, not on `xrSetWorkspaceFocusedClientEXT`) was a pre-existing latent issue surfaced by the focus-glow gating. Fixed by adding `comp_d3d11_service_set_focused_slot` and calling it from `ipc_handle_workspace_set_focused_client`.
+
 ### Phase 2.H (final cleanup pass)
 
 **Touches:** All remaining mechanism mentions (~115 across 25+ clusters). Pure rename pass: `shell` → `workspace` in comments and log prefixes; `pending_shell_reentry` → `pending_workspace_reentry`; `last_shell_render_ns` → `last_workspace_render_ns`; `shell_input_event` → `workspace_input_event`; `shell_screenshot_*` filenames → `workspace_screenshot_*`; etc.

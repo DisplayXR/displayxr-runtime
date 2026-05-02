@@ -777,6 +777,21 @@ comp_ipc_client_compositor_workspace_acquire_wakeup_event(struct xrt_compositor 
 	return xret;
 }
 
+xrt_result_t
+comp_ipc_client_compositor_workspace_set_client_style(struct xrt_compositor *xc,
+                                                      uint32_t client_id,
+                                                      const struct ipc_workspace_client_style *style)
+{
+	if (xc == NULL || style == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_call_workspace_set_client_style(icc->ipc_c, client_id, style);
+}
+
 /*
  * Launcher bridges (XR_EXT_app_launcher).
  *
