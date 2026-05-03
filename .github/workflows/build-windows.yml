@@ -32,7 +32,7 @@ permissions:
 
 jobs:
   DetectChanges:
-    if: github.repository == 'DisplayXR/displayxr-runtime' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
+    if: (github.event_name != 'pull_request' || !github.event.pull_request.draft)
     runs-on: ubuntu-latest
     outputs:
       test_apps_changed: ${{ steps.filter.outputs.test_apps }}
@@ -65,7 +65,9 @@ jobs:
           echo "Detected test_apps_changed=$(grep test_apps "$GITHUB_OUTPUT" | cut -d= -f2)"
 
   Runtime:
-    if: github.repository == 'DisplayXR/displayxr-runtime' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
+    # Drafts skip CI; non-draft fork PRs run the build (SR SDK is fetched from
+    # upstream's release page — see the Download SR SDK step).
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: windows-2022
 
     env:
@@ -82,14 +84,14 @@ jobs:
 
       - name: Download Simulated Reality SDK
         run: |
-          gh release download -R ${{ github.repository }} sr-sdk-v$env:SR_TAG -p LeiaSR-SDK-$env:SR_TAG-win64.zip -D .
+          gh release download -R DisplayXR/displayxr-runtime sr-sdk-v$env:SR_TAG -p LeiaSR-SDK-$env:SR_TAG-win64.zip -D .
           tar -xf LeiaSR-SDK-$env:SR_TAG-win64.zip -C .
           Get-ChildItem -Recurse LeiaSR-SDK-$env:SR_TAG-win64
-          gh release download -R ${{ github.repository }} sr-sdk-v$env:SR_TAG -p SimulatedRealityVulkanBeta.lib -D LeiaSR-SDK-$env:SR_TAG-win64/lib
-          gh release download -R ${{ github.repository }} sr-sdk-v$env:SR_TAG -p vkweaver.h -D LeiaSR-SDK-$env:SR_TAG-win64/include/sr/weaver
+          gh release download -R DisplayXR/displayxr-runtime sr-sdk-v$env:SR_TAG -p SimulatedRealityVulkanBeta.lib -D LeiaSR-SDK-$env:SR_TAG-win64/lib
+          gh release download -R DisplayXR/displayxr-runtime sr-sdk-v$env:SR_TAG -p vkweaver.h -D LeiaSR-SDK-$env:SR_TAG-win64/include/sr/weaver
           # GL weaver assets not yet available in SR SDK release - uncomment when uploaded:
-          # gh release download -R ${{ github.repository }} sr-sdk-v$env:SR_TAG -p SimulatedRealityOpenGL.lib -D LeiaSR-SDK-$env:SR_TAG-win64/lib
-          # gh release download -R ${{ github.repository }} sr-sdk-v$env:SR_TAG -p glweaver.h -D LeiaSR-SDK-$env:SR_TAG-win64/include/sr/weaver
+          # gh release download -R DisplayXR/displayxr-runtime sr-sdk-v$env:SR_TAG -p SimulatedRealityOpenGL.lib -D LeiaSR-SDK-$env:SR_TAG-win64/lib
+          # gh release download -R DisplayXR/displayxr-runtime sr-sdk-v$env:SR_TAG -p glweaver.h -D LeiaSR-SDK-$env:SR_TAG-win64/include/sr/weaver
 
       - name: Restore from cache and setup vcpkg executable and data files.
         uses: lukka/run-vcpkg@v11
@@ -147,7 +149,11 @@ jobs:
           if-no-files-found: error
           path: _package/DisplayXRSetup-*.exe
 
+      # OneDrive upload uses RCLONE_CONFIG, which is null on fork PRs. Skip
+      # the whole rclone group on forks; the artifact-upload steps above
+      # already give reviewers the installer.
       - name: Setup rclone config
+        if: github.repository == 'DisplayXR/displayxr-runtime'
         shell: powershell
         run: |
           $rcloneDir = "$env:USERPROFILE\.config\rclone"
@@ -161,6 +167,7 @@ jobs:
           Write-Host "rclone config written to $rcloneDir\rclone.conf"
 
       - name: Install rclone (if not present)
+        if: github.repository == 'DisplayXR/displayxr-runtime'
         shell: powershell
         run: |
           if (-not (Get-Command rclone -ErrorAction SilentlyContinue)) {
@@ -175,6 +182,7 @@ jobs:
           }
 
       - name: Upload installer to OneDrive
+        if: github.repository == 'DisplayXR/displayxr-runtime'
         shell: powershell
         run: |
           $installer = Get-ChildItem -Path "_package/DisplayXRSetup-*.exe" | Select-Object -First 1
@@ -185,7 +193,7 @@ jobs:
 
   # D3D11 test app with XR_EXT_win32_window_binding (app provides window handle)
   TestAppCubeHandleD3D11:
-    if: github.repository == 'DisplayXR/displayxr-runtime' && (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.DetectChanges.outputs.test_apps_changed == 'true'
+    if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
     needs: [Runtime, DetectChanges]  # Wait for runtime build to get artifacts
 
@@ -287,7 +295,7 @@ jobs:
 
   # D3D11 hosted test app - Standard OpenXR app (runtime creates window)
   TestAppCubeHostedD3D11:
-    if: github.repository == 'DisplayXR/displayxr-runtime' && (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.DetectChanges.outputs.test_apps_changed == 'true'
+    if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
     needs: [Runtime, DetectChanges]
 
@@ -349,7 +357,7 @@ jobs:
 
   # D3D12 test app with XR_EXT_win32_window_binding
   TestAppCubeHandleD3D12:
-    if: github.repository == 'DisplayXR/displayxr-runtime' && (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.DetectChanges.outputs.test_apps_changed == 'true'
+    if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
     needs: [Runtime, DetectChanges]
 
@@ -411,7 +419,7 @@ jobs:
 
   # OpenGL test app with XR_EXT_win32_window_binding
   TestAppCubeHandleGL:
-    if: github.repository == 'DisplayXR/displayxr-runtime' && (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.DetectChanges.outputs.test_apps_changed == 'true'
+    if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
     needs: [Runtime, DetectChanges]
 
@@ -473,7 +481,7 @@ jobs:
 
   # Vulkan test app with XR_EXT_win32_window_binding (requires Vulkan SDK)
   TestAppCubeHandleVK:
-    if: github.repository == 'DisplayXR/displayxr-runtime' && (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.DetectChanges.outputs.test_apps_changed == 'true'
+    if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
     needs: [Runtime, DetectChanges]
 
@@ -541,7 +549,7 @@ jobs:
 
   # 3D Gaussian Splatting Vulkan demo (requires Vulkan SDK, uses FetchContent for 3DGS.cpp)
   TestAppGaussianSplattingVK:
-    if: github.repository == 'DisplayXR/displayxr-runtime' && (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.DetectChanges.outputs.test_apps_changed == 'true'
+    if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
     needs: [Runtime, DetectChanges]
 
@@ -611,7 +619,7 @@ jobs:
 
   # Spatial OS demo app (multi-layer war room)
   TestAppSpatialOS:
-    if: github.repository == 'DisplayXR/displayxr-runtime' && (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.DetectChanges.outputs.test_apps_changed == 'true'
+    if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
     needs: [Runtime, DetectChanges]
 
@@ -673,7 +681,7 @@ jobs:
 
   # D3D11 texture test app (offscreen shared texture mode)
   TestAppCubeTextureD3D11:
-    if: github.repository == 'DisplayXR/displayxr-runtime' && (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.DetectChanges.outputs.test_apps_changed == 'true'
+    if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
     needs: [Runtime, DetectChanges]
 
@@ -727,7 +735,7 @@ jobs:
 
   # D3D12 shared texture test app
   TestAppCubeTextureD3D12:
-    if: github.repository == 'DisplayXR/displayxr-runtime' && (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.DetectChanges.outputs.test_apps_changed == 'true'
+    if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
     needs: [Runtime, DetectChanges]
 
@@ -781,7 +789,7 @@ jobs:
 
   # D3D11 legacy hosted test app (no XR_EXT_display_info)
   TestAppCubeHostedLegacyD3D11:
-    if: github.repository == 'DisplayXR/displayxr-runtime' && (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.DetectChanges.outputs.test_apps_changed == 'true'
+    if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
     needs: [Runtime, DetectChanges]
 
@@ -843,7 +851,7 @@ jobs:
 
   # D3D12 legacy hosted test app (no XR_EXT_display_info)
   TestAppCubeHostedLegacyD3D12:
-    if: github.repository == 'DisplayXR/displayxr-runtime' && (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.DetectChanges.outputs.test_apps_changed == 'true'
+    if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
     needs: [Runtime, DetectChanges]
 
@@ -901,7 +909,7 @@ jobs:
 
   # Vulkan legacy hosted test app (no XR_EXT_display_info)
   TestAppCubeHostedLegacyVK:
-    if: github.repository == 'DisplayXR/displayxr-runtime' && (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.DetectChanges.outputs.test_apps_changed == 'true'
+    if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
     needs: [Runtime, DetectChanges]
 
@@ -965,7 +973,7 @@ jobs:
 
   # OpenGL legacy hosted test app (no XR_EXT_display_info)
   TestAppCubeHostedLegacyGL:
-    if: github.repository == 'DisplayXR/displayxr-runtime' && (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.DetectChanges.outputs.test_apps_changed == 'true'
+    if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
     needs: [Runtime, DetectChanges]
 
@@ -1017,7 +1025,7 @@ jobs:
 
   # Bundle all test apps into a single artifact with per-app subfolders
   BundleTestApps:
-    if: github.repository == 'DisplayXR/displayxr-runtime' && (github.event_name != 'pull_request' || !github.event.pull_request.draft) && !cancelled() && needs.DetectChanges.outputs.test_apps_changed == 'true' && (github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
+    if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && !cancelled() && needs.DetectChanges.outputs.test_apps_changed == 'true' && (github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
     runs-on: ubuntu-latest
     needs: [DetectChanges, TestAppCubeHandleD3D11, TestAppCubeHostedD3D11, TestAppCubeHandleD3D12, TestAppCubeHandleGL, TestAppCubeHandleVK, TestAppGaussianSplattingVK, TestAppSpatialOS, TestAppCubeTextureD3D11, TestAppCubeTextureD3D12, TestAppCubeHostedLegacyD3D11, TestAppCubeHostedLegacyD3D12, TestAppCubeHostedLegacyVK, TestAppCubeHostedLegacyGL]
 
@@ -1078,7 +1086,10 @@ jobs:
             CubeIpcD3D11
             SpatialOS
 
+      # OneDrive upload uses RCLONE_CONFIG; skip on forks (the bundled
+      # artifact upload above already exposes the test apps to reviewers).
       - name: Install rclone
+        if: github.repository == 'DisplayXR/displayxr-runtime'
         run: |
           curl -O https://downloads.rclone.org/rclone-current-linux-amd64.zip
           unzip rclone-current-linux-amd64.zip
@@ -1086,6 +1097,7 @@ jobs:
           rclone --version
 
       - name: Setup rclone config
+        if: github.repository == 'DisplayXR/displayxr-runtime'
         env:
           RCLONE_CONFIG_CONTENTS: ${{ secrets.RCLONE_CONFIG }}
         run: |
@@ -1093,6 +1105,7 @@ jobs:
           echo "$RCLONE_CONFIG_CONTENTS" > ~/.config/rclone/rclone.conf
 
       - name: Zip test apps
+        if: github.repository == 'DisplayXR/displayxr-runtime'
         run: |
           cd TestApps
           zip -r ../TestApps-${{ github.run_number }}.zip .
@@ -1100,6 +1113,7 @@ jobs:
           ls -lh TestApps-${{ github.run_number }}.zip
 
       - name: Upload test apps zip to OneDrive
+        if: github.repository == 'DisplayXR/displayxr-runtime'
         run: |
           destPath="SANDBOX/RUNTIMES + SDK + PLUGINS/OpenXR"
           echo "Uploading TestApps-${{ github.run_number }}.zip to OneDrive: $destPath"
