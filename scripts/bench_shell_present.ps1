@@ -165,6 +165,11 @@ $reFence   = [regex]'\[FENCE\]\s+client=(?<c>\S+)\s+waits_queued=(?<wq>\d+)\s+st
 # sys->context GPU serialization) / (throttle reverberation) /
 # (mutex contention) dominates the 4-cube workspace per-cube fps deficit.
 $reRender  = [regex]'\[RENDER\]\s+capture_renders=(?<cr>\d+)\s+capture_avg_us=(?<ca>\d+)\s+client_renders=(?<cli_r>\d+)\s+client_skips=(?<cli_s>\d+)\s+client_avg_us=(?<cli_a>\d+)\s+wait_avg_us=(?<wait>\d+)\s+window_s=(?<ws>\d+)'
+# Phase 5a - [COMMIT_PROFILE_*] is per-frame per-stage breakdown of
+# compositor_layer_commit on both client and service sides. Env-gated by
+# DISPLAYXR_LOG_PRESENT_NS (same as [CLIENT_FRAME_NS]).
+$reCommitProfileClient = [regex]'\[COMMIT_PROFILE_CLIENT\]\s+client=(?<c>\S+)\s+signal_ns=(?<sig>\d+)\s+pre_ipc_ns=(?<pre>\d+)\s+ipc_ns=(?<ipc>\d+)\s+post_ipc_ns=(?<post>\d+)\s+total_ns=(?<tot>\d+)'
+$reCommitProfileSvc    = [regex]'\[COMMIT_PROFILE_SVC\]\s+client=(?<c>\S+)\s+setup_pre_ns=(?<sp>\d+)\s+setup_3dstate_ns=(?<s3d>\d+)\s+setup_eyepos_ns=(?<sep>\d+)\s+setup_post_ns=(?<spost>\d+)\s+proj_ns=(?<proj>\d+)\s+ui_ns=(?<ui>\d+)\s+post_ns=(?<post>\d+)\s+total_ns=(?<tot>\d+)'
 
 # Per-client per-source samples.
 $presentByClient = @{}
@@ -173,6 +178,21 @@ $mutexEvents     = New-Object 'System.Collections.Generic.List[psobject]'
 $zcEvents        = New-Object 'System.Collections.Generic.List[psobject]'
 $fenceEvents     = New-Object 'System.Collections.Generic.List[psobject]'
 $renderEvents    = New-Object 'System.Collections.Generic.List[psobject]'
+
+# Phase 5a - per-stage profile sample lists (aggregated across all clients).
+$cpClientSignal  = New-Object 'System.Collections.Generic.List[int64]'
+$cpClientPreIpc  = New-Object 'System.Collections.Generic.List[int64]'
+$cpClientIpc     = New-Object 'System.Collections.Generic.List[int64]'
+$cpClientPostIpc = New-Object 'System.Collections.Generic.List[int64]'
+$cpClientTotal   = New-Object 'System.Collections.Generic.List[int64]'
+$cpSvcSetupPre   = New-Object 'System.Collections.Generic.List[int64]'
+$cpSvcSetup3D    = New-Object 'System.Collections.Generic.List[int64]'
+$cpSvcSetupEye   = New-Object 'System.Collections.Generic.List[int64]'
+$cpSvcSetupPost  = New-Object 'System.Collections.Generic.List[int64]'
+$cpSvcProj       = New-Object 'System.Collections.Generic.List[int64]'
+$cpSvcUi         = New-Object 'System.Collections.Generic.List[int64]'
+$cpSvcPost       = New-Object 'System.Collections.Generic.List[int64]'
+$cpSvcTotal      = New-Object 'System.Collections.Generic.List[int64]'
 
 function Add-Sample {
     param([hashtable] $bag, [string] $client, [int64] $dt)
@@ -220,7 +240,25 @@ foreach ($f in $runLogs) {
                 client_avg_us   = [int]$m.Groups['cli_a'].Value
                 wait_avg_us     = [int]$m.Groups['wait'].Value
                 window_s        = [int]$m.Groups['ws'].Value
-            })
+            }); return
+        }
+        $m = $reCommitProfileClient.Match($line); if ($m.Success) {
+            [void]$cpClientSignal.Add([int64]$m.Groups['sig'].Value)
+            [void]$cpClientPreIpc.Add([int64]$m.Groups['pre'].Value)
+            [void]$cpClientIpc.Add([int64]$m.Groups['ipc'].Value)
+            [void]$cpClientPostIpc.Add([int64]$m.Groups['post'].Value)
+            [void]$cpClientTotal.Add([int64]$m.Groups['tot'].Value)
+            return
+        }
+        $m = $reCommitProfileSvc.Match($line); if ($m.Success) {
+            [void]$cpSvcSetupPre.Add([int64]$m.Groups['sp'].Value)
+            [void]$cpSvcSetup3D.Add([int64]$m.Groups['s3d'].Value)
+            [void]$cpSvcSetupEye.Add([int64]$m.Groups['sep'].Value)
+            [void]$cpSvcSetupPost.Add([int64]$m.Groups['spost'].Value)
+            [void]$cpSvcProj.Add([int64]$m.Groups['proj'].Value)
+            [void]$cpSvcUi.Add([int64]$m.Groups['ui'].Value)
+            [void]$cpSvcPost.Add([int64]$m.Groups['post'].Value)
+            [void]$cpSvcTotal.Add([int64]$m.Groups['tot'].Value)
         }
     }
 }
@@ -412,6 +450,35 @@ Write-Host ("[bench]   fence waits queued  = {0} (stale_views = {1}, fence-capab
 Write-Host ("[bench]   render capture/cli  = {0}/{1} renders, {2} client_skips ({3} windows)" -f $totalCaptureRenders, $totalClientRenders, $totalClientSkips, $renderWindows)
 Write-Host ("[bench]   render avg us       = capture={0} client={1} mutex_wait={2}" -f $avgCaptureUs, $avgClientUs, $avgWaitUs)
 Write-Host ("[bench]   zc per client       = {0}" -f ($lastZc -join "; "))
+
+# Phase 5a — per-stage commit profile p50 summary.
+function Median-Ms {
+    param([System.Collections.Generic.List[int64]] $samples)
+    if ($samples.Count -eq 0) { return "n/a" }
+    $sorted = New-Object 'System.Collections.Generic.List[int64]'
+    $sorted.AddRange([int64[]]@($samples))
+    $sorted.Sort()
+    $idx = [int][math]::Round(0.5 * ($sorted.Count - 1))
+    return ("{0:N2}ms" -f ($sorted[$idx] / 1e6))
+}
+if ($cpClientTotal.Count -gt 0 -or $cpSvcTotal.Count -gt 0) {
+    Write-Host ""
+    Write-Host ("[bench] === commit profile (p50, samples: client={0} svc={1}) ===" -f $cpClientTotal.Count, $cpSvcTotal.Count)
+    Write-Host ("[bench]   CLIENT  signal={0,-9} pre_ipc={1,-9} ipc={2,-9} post_ipc={3,-9} total={4}" -f `
+        (Median-Ms $cpClientSignal), (Median-Ms $cpClientPreIpc), (Median-Ms $cpClientIpc), (Median-Ms $cpClientPostIpc), (Median-Ms $cpClientTotal))
+    Write-Host ("[bench]   SERVICE pre={0,-9}    3dstate={1,-9}  eyepos={2,-9}  setup_post={3,-9}  proj={4,-9}    ui={5,-9}  post={6,-9}     total={7}" -f `
+        (Median-Ms $cpSvcSetupPre), (Median-Ms $cpSvcSetup3D), (Median-Ms $cpSvcSetupEye), (Median-Ms $cpSvcSetupPost), `
+        (Median-Ms $cpSvcProj), (Median-Ms $cpSvcUi), (Median-Ms $cpSvcPost), (Median-Ms $cpSvcTotal))
+    if ($cpClientIpc.Count -gt 0 -and $cpSvcTotal.Count -gt 0) {
+        $sortClientIpc = New-Object 'System.Collections.Generic.List[int64]'; $sortClientIpc.AddRange([int64[]]@($cpClientIpc)); $sortClientIpc.Sort()
+        $sortSvcTotal  = New-Object 'System.Collections.Generic.List[int64]'; $sortSvcTotal.AddRange([int64[]]@($cpSvcTotal));  $sortSvcTotal.Sort()
+        $clientIpcP50  = $sortClientIpc[[int][math]::Round(0.5 * ($sortClientIpc.Count - 1))]
+        $svcTotalP50   = $sortSvcTotal[[int][math]::Round(0.5 * ($sortSvcTotal.Count - 1))]
+        $ipcOverhead   = $clientIpcP50 - $svcTotalP50
+        Write-Host ("[bench]   IPC overhead    = client_ipc - svc_total = {0:N2}ms (positive = pure IPC marshal/dispatch)" -f ($ipcOverhead / 1e6))
+    }
+}
+
 Write-Host ""
 Write-Host "[bench] per-source stats:"
 $summaryRows | ForEach-Object {

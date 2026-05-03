@@ -28,6 +28,7 @@
 #include "util/u_time.h"
 #include "util/u_logging.h"
 #include "util/u_debug.h"
+#include "os/os_time.h" // os_monotonic_get_ns — Phase 5a [COMMIT_PROFILE_CLIENT]
 #include "util/u_handles.h"
 #include "util/u_win32_com_guard.hpp"
 
@@ -904,6 +905,12 @@ client_d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_syn
 
 	OutputDebugStringA("[DisplayXR] xrEndFrame (layer_commit): ENTER\n");
 
+	// Phase 5a — per-stage profile of the IPC client side of xrEndFrame.
+	// Stack-local timestamps; emitted as one [COMMIT_PROFILE_CLIENT] line on
+	// the common (timeline-semaphore) success path. Same env gate as the
+	// service side. ~100 ns per os_monotonic_get_ns() on Windows.
+	int64_t profile_t0 = os_monotonic_get_ns();
+
 	// We make the sync object, not st/oxr which is our user.
 	assert(!xrt_graphics_sync_handle_is_valid(sync_handle));
 
@@ -953,13 +960,36 @@ client_d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_syn
 	if (c->timeline_semaphore) {
 		// We got this from the native compositor, so we can pass it back
 		OutputDebugStringA("[DisplayXR] xrEndFrame: Using timeline semaphore commit\n");
+		int64_t profile_t1 = os_monotonic_get_ns();
 		xret = xrt_comp_layer_commit_with_semaphore( //
 		    &c->xcn->base,                           //
 		    c->timeline_semaphore.get(),             //
 		    c->timeline_semaphore_value);            //
+		int64_t profile_t2 = os_monotonic_get_ns();
 		char buf[128];
 		snprintf(buf, sizeof(buf), "[DisplayXR] xrEndFrame: commit_with_semaphore result=%d\n", (int)xret);
 		OutputDebugStringA(buf);
+
+		// Phase 5a — emit per-stage [COMMIT_PROFILE_CLIENT]. Env-gated by
+		// DISPLAYXR_LOG_PRESENT_NS=1 (same gate as the service side and
+		// the existing per-frame [CLIENT_FRAME_NS]).
+		int64_t profile_t3 = os_monotonic_get_ns();
+		{
+			static int log_commit_profile = -1;
+			if (log_commit_profile < 0) {
+				const char *e = getenv("DISPLAYXR_LOG_PRESENT_NS");
+				log_commit_profile = (e != nullptr && e[0] == '1') ? 1 : 0;
+			}
+			if (log_commit_profile) {
+				U_LOG_W("[COMMIT_PROFILE_CLIENT] client=%p signal_ns=%lld pre_ipc_ns=%lld ipc_ns=%lld post_ipc_ns=%lld total_ns=%lld",
+				        (void *)c,
+				        (long long)(profile_t1 - profile_t0),
+				        (long long)0, // pre_ipc work is folded into signal_ns above
+				        (long long)(profile_t2 - profile_t1),
+				        (long long)(profile_t3 - profile_t2),
+				        (long long)(profile_t3 - profile_t0));
+			}
+		}
 		return xret;
 	}
 

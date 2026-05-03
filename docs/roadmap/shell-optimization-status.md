@@ -191,10 +191,65 @@ A reduced-scope follow-up was attempted: move the per-client `CopySubresourceReg
 
 **The lazy-copy code was reverted.** Bench artifacts kept as evidence for future work. Conclusion: **closing the per-cube 60 fps gap requires eliminating the per-client `CopySubresourceRegion` entirely** (true workspace zero-copy), not relocating it.
 
-## Phase 4 — True workspace zero-copy (next session)
+## Phase 4 — True workspace zero-copy (attempted, reverted, informative)
 
-Goal: per-cube fps = desktop standalone fps (60 Hz). Re-architecting the d3d11_service compositor is in-bounds per `project_workspace_must_equal_desktop_fps.md`.
+Implemented per the Phase 4 handoff: per-client commit publishes `(sc, img_idx, sub_rect, fence_value)` and skips per-client `CopySubresourceRegion`; capture thread shader-blits directly from cube swapchain image SRVs. Bench (4-cube, 30 s, dev box):
 
-**Approach (untried, design only):** `multi_compositor_render`'s per-client read pipeline (around lines 7682–8045) reads from the per-client atlas SRV (`cc->render.atlas_srv`). Replace this with per-view sampling **directly from cube swapchain image SRVs** (`sc->images[img_idx].srv`, already exist). Per-client commit publishes per-view `(sc, img_idx, sub_rect, fence_value)` and skips both atlas write AND `CopySubresourceRegion`.
+| metric | Phase 3 baseline (today rerun) | Phase 4 zero-copy | verdict |
+|---|---|---|---|
+| per-cube p50 | 26.9 ms (37.1 fps) | 24.1 ms (41.5 fps) | +12% |
+| atlas Present p50 | 16.5 ms (60.7 fps) | 23.0 ms (43.5 fps) | **−28% regression** |
+| capture cycle | 2.95 ms | 8.9 ms | 3× longer |
+| `[ZCOPY]` | n/a | zero_copy=5792, fallback=0 | functional |
 
-See `docs/roadmap/shell-optimization-phase4-handoff.md` for the full design context, known correctness pitfalls (cross-device GPU sync race, swapchain buffer-cycle race), file:line citations, and `docs/roadmap/shell-optimization-phase4-agent-prompt.md` for the next agent's onboarding.
+**Conclusion: Phase 4 reverted.** The handoff's hypothesis (per-client `CopySubresourceRegion` is the bottleneck) was wrong. Real bottleneck: D3D11 cross-process `SHARED_NTHANDLE | SHARED_KEYEDMUTEX` textures have inherent per-sample driver overhead. Replacing the Copy with capture-thread direct-sample of the same shared texture trades ~3 ms of Copy GPU work for ~6 ms of cross-process keyed-mutex `AcquireSync(0,0)` + Wait + ReleaseSync per capture cycle.
+
+Empirical findings during Phase 4 (saved to memory `feedback_acquiresync_load_bearing.md`):
+
+* **`AcquireSync(0,0)` is load-bearing as the cross-process cache barrier** — `Wait(fence)` alone produces blank cubes on the live Leia SR display. Confirmed by skip-AcquireSync experiment.
+* **`SHARED_NTHANDLE` requires `SHARED_KEYEDMUTEX` on D3D11** — D3D11 spec; confirmed via `E_INVALIDARG` on `CreateTexture2D` when omitted. So "Option C: drop SHARED_KEYEDMUTEX" from the handoff is not viable on D3D11. Future paths to eliminate the cross-process texture overhead require D3D12 fence + heap sharing, DComp visual handoff, or in-process DLL injection.
+
+Bench artifacts kept under `docs/roadmap/bench/phase4-*` for evidence; commit history preserves the implementation in case a future D3D12-share path wants to reuse the publish-struct + capture-thread per-view bind code.
+
+## Phase 5a — Per-stage commit profiling (instrumentation, retained)
+
+Phase 4 didn't move the needle, but it raised the question: **where do Phase 3's 22 ms per-cube go?** Per-cube `[CLIENT_FRAME_NS]` p50 = 27 ms (37 fps) but service-side `compositor_layer_commit` CPU work appeared to be ~5 ms. Phase 5a added per-frame env-gated per-stage timing on both client and service sides.
+
+New diagnostic family (env-gated by `DISPLAYXR_LOG_PRESENT_NS=1`, same gate as `[CLIENT_FRAME_NS]`):
+
+```
+[COMMIT_PROFILE_CLIENT] client=<ptr> signal_ns=<u> pre_ipc_ns=<u> ipc_ns=<u> post_ipc_ns=<u> total_ns=<u>
+[COMMIT_PROFILE_SVC]    client=<ptr> setup_pre_ns=<u> setup_3dstate_ns=<u> setup_eyepos_ns=<u> setup_post_ns=<u> proj_ns=<u> ui_ns=<u> post_ns=<u> total_ns=<u>
+```
+
+`scripts/bench_shell_present.ps1` extended with per-stage p50 aggregation. Instrumentation is permanent (zero cost when env not set).
+
+## Phase 5b — Cache + rate-limit `get_hardware_3d_state` poll (shipped, 60 fps target hit)
+
+Phase 5a immediately surfaced the bottleneck: **`xrt_display_processor_d3d11_get_hardware_3d_state` (vendor SDK call to detect Leia SR hardware mode changes) blocks ~10.7 ms per invocation**, called from every per-cube `compositor_layer_commit`. Cube `xrEndFrame` perceives an 11.5 ms IPC roundtrip (~99% of which is this single vendor poll); cube can't keep up with vsync (16.6 ms budget) and ends up at every-other-vsync = 30 fps.
+
+Fix: 100 ms-TTL cache + CAS-protected once-per-window slow path on `d3d11_service_system`. Three new atomic fields (`last_3d_state_poll_ns`, `cached_3d_state`, `cached_3d_state_valid`); the ~30 lines around `comp_d3d11_service.cpp:9876+` now read the cache atomically on the fast path and only one cube per 100 ms window pays the vendor-poll cost. State-change broadcast logic at lines ~9938–9967 stays exactly where it was, just acting on cached/freshly-polled value. Hardware mode changes happen at human-interaction speed (sub-Hz) so 10 Hz polling is overkill but cheap.
+
+### Phase 5b benchmark (4-cube workspace, 30 s, dev box)
+
+| metric | Phase 3 baseline | Phase 5b cached poll | delta |
+|---|---|---|---|
+| per-cube p50 | 26.9 ms (37.1 fps) | **17.0 ms (58.7 fps)** | **+58% fps** |
+| per-cube fps spread | uniform ~37 | **58.3 / 59.2 / 58.7 / 58.7** | uniform near-vsync |
+| atlas Present p50 | 16.5 ms (60.7 fps) | **16.4 ms (60.9 fps)** | unchanged ✓ |
+| service-side commit total p50 | 11.1 ms | **0.20 ms** | 55× faster |
+| `setup_3dstate` (vendor poll) p50 | 10.7 ms | **0.00 ms** | eliminated |
+| `[FENCE] waits_queued` (cube frames produced) | 1,863 | **4,285** | 2.3× more |
+| `capture_avg_us` | 3,397 | 2,850 | small improvement |
+| `[MUTEX] timeouts` | 0 | 0 | invariant ✓ |
+| `client_renders` | 0 | 0 | Phase 3 invariant ✓ |
+
+### Phase 5 acceptance criteria
+
+* ✅ Per-cube `[CLIENT_FRAME_NS]` p50 ≤ 18 ms → ≥ 55 fps in 4-cube workspace. Achieved 58–59 fps uniformly.
+* ✅ Atlas `[PRESENT_NS] client=workspace` stays at 60 Hz vsync. 60.9 fps.
+* ✅ Phase 1+2+3 acceptance criteria still hold (`[MUTEX] timeouts=0`, `[FENCE] stale_views=0`, `client_renders=0`).
+* ✅ `[COMMIT_PROFILE_SVC] setup_3dstate_ns` near-zero in steady state (0.00 ms p50).
+* ⏳ User confirms visual smoothness on the live Leia SR display (per `feedback_shell_screenshot_reliability.md`).
+
+`project_workspace_must_equal_desktop_fps.md` P0 product blocker is **resolved** for cube_handle on D3D11.

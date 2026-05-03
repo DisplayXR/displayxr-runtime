@@ -625,6 +625,20 @@ struct d3d11_service_system
 	std::atomic<uint32_t> render_diag_mutex_wait_count{0};
 	/*! @} */
 
+	//! Phase 5b — rate-limited cache of `xrt_display_processor_d3d11_get_hardware_3d_state`.
+	//! The vendor SDK call is synchronous and blocks ~10 ms per invocation
+	//! (measured on Leia SR dev box). Calling it per-cube-per-frame from
+	//! `compositor_layer_commit` saturated the IPC-side hot path with 4 cubes
+	//! at workspace cadence and pinned per-cube fps to ~30 fps. The fix:
+	//! a CAS-protected once-per-window poll caches the result; all subsequent
+	//! commits within the window read the cache atomically. The state-change
+	//! broadcast logic (line ~9886) acts on the cached/freshly-polled value
+	//! exactly as before. 100 ms TTL gives 10 Hz polling — way more than
+	//! enough for hardware-mode-switch detection.
+	std::atomic<int64_t> last_3d_state_poll_ns{0};
+	std::atomic<bool>    cached_3d_state{false};
+	std::atomic<bool>    cached_3d_state_valid{false};
+
 	//! Phase 2.C spec_version 8: auto-reset Win32 event signaled whenever an
 	//! async workspace state change occurs that the controller might want to
 	//! react to (input event pushed onto the public ring, focused-slot
@@ -9519,6 +9533,14 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 
 	std::lock_guard<std::mutex> lock(c->mutex);
 
+	// Phase 5a — per-stage profile of compositor_layer_commit. Stack-local
+	// timestamps; emitted as one [COMMIT_PROFILE_SVC] line at the workspace
+	// branch return, env-gated by DISPLAYXR_LOG_PRESENT_NS=1 (same gate as
+	// [CLIENT_FRAME_NS]). Capturing 5 os_monotonic_get_ns() per commit is
+	// ~100 ns each on Windows; cheap enough to leave unconditional.
+	int64_t profile_s0 = os_monotonic_get_ns();
+	int64_t profile_s1 = 0, profile_s2 = 0, profile_s3 = 0, profile_s4 = 0;
+
 	// Phase 1 diagnostic — env-gated per-client commit interval. One
 	// line per client per xrEndFrame; tagged by client struct pointer so
 	// multi-client runs can be split out. Cheap (one getenv on first
@@ -9531,13 +9553,12 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			log_client_frame_ns = (e != nullptr && e[0] == '1') ? 1 : 0;
 		}
 		if (log_client_frame_ns) {
-			int64_t now_ns = os_monotonic_get_ns();
 			if (c->last_commit_ns != 0) {
 				U_LOG_W("[CLIENT_FRAME_NS] client=%p dt_ns=%lld",
 				        (void *)c,
-				        (long long)(now_ns - c->last_commit_ns));
+				        (long long)(profile_s0 - c->last_commit_ns));
 			}
-			c->last_commit_ns = now_ns;
+			c->last_commit_ns = profile_s0;
 		}
 	}
 
@@ -9865,17 +9886,55 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	}
 #endif
 
+	int64_t profile_s0a = os_monotonic_get_ns(); // Phase 5a — pre vendor 3d-state poll.
+
 	// Poll vendor SDK for hardware 3D state changes (e.g., Leia SR auto-switch on tracking loss).
 	// This detects changes the vendor SDK made independently of the runtime.
+	//
+	// Phase 5b — rate-limited cache. The raw vendor call blocks ~10 ms (Leia
+	// SR dev box). At 4 cubes × 60 Hz = 240 commits/sec, calling per-frame
+	// saturated the IPC hot path. CAS-protected once-per-100ms slow path:
+	// only one cube poll per window does the vendor call; everyone else
+	// reads the cached state. Hardware mode changes happen at human-
+	// interaction speed (sub-Hz), so 10 Hz polling is overkill but cheap.
 	{
-		struct xrt_display_processor_d3d11 *dp = nullptr;
-		if (sys->workspace_mode && sys->multi_comp != nullptr) {
-			dp = sys->multi_comp->display_processor;
-		} else if (c->render.display_processor != nullptr) {
-			dp = c->render.display_processor;
-		}
 		bool vendor_is_3d = false;
-		if (xrt_display_processor_d3d11_get_hardware_3d_state(dp, &vendor_is_3d)) {
+		bool got_state = false;
+
+		const int64_t kPollIntervalNs = 100LL * 1000000LL; // 100 ms
+		int64_t now_ns = profile_s0a;
+		int64_t last_poll = sys->last_3d_state_poll_ns.load(std::memory_order_acquire);
+		bool cache_valid = sys->cached_3d_state_valid.load(std::memory_order_acquire);
+
+		bool need_fresh_poll = !cache_valid || (now_ns - last_poll) >= kPollIntervalNs;
+		bool won_poll_race = false;
+		if (need_fresh_poll) {
+			// CAS guards against multiple cubes simultaneously deciding
+			// to refresh the cache. Only one wins; others fall through
+			// to read whatever the winner publishes (or the prior cache
+			// if not yet published — minor staleness, no correctness issue).
+			won_poll_race = sys->last_3d_state_poll_ns.compare_exchange_strong(
+			    last_poll, now_ns, std::memory_order_acq_rel, std::memory_order_acquire);
+		}
+
+		if (won_poll_race) {
+			struct xrt_display_processor_d3d11 *dp = nullptr;
+			if (sys->workspace_mode && sys->multi_comp != nullptr) {
+				dp = sys->multi_comp->display_processor;
+			} else if (c->render.display_processor != nullptr) {
+				dp = c->render.display_processor;
+			}
+			if (xrt_display_processor_d3d11_get_hardware_3d_state(dp, &vendor_is_3d)) {
+				sys->cached_3d_state.store(vendor_is_3d, std::memory_order_relaxed);
+				sys->cached_3d_state_valid.store(true, std::memory_order_release);
+				got_state = true;
+			}
+		} else if (cache_valid) {
+			vendor_is_3d = sys->cached_3d_state.load(std::memory_order_relaxed);
+			got_state = true;
+		}
+
+		if (got_state) {
 			if (vendor_is_3d != sys->hardware_display_3d) {
 				U_LOG_W("Vendor SDK hardware 3D state changed: %s → %s",
 				        sys->hardware_display_3d ? "3D" : "2D",
@@ -9909,6 +9968,8 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		}
 	}
 
+	int64_t profile_s0b = os_monotonic_get_ns(); // Phase 5a — post vendor 3d-state poll.
+
 	// Get predicted eye positions (used for UI layers and HUD)
 	struct xrt_eye_positions eye_pos = {};
 	bool weaving_done = false;
@@ -9917,6 +9978,8 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		xrt_display_processor_d3d11_get_predicted_eye_positions(
 		    c->render.display_processor, &eye_pos);
 	}
+
+	int64_t profile_s0c = os_monotonic_get_ns(); // Phase 5a — post vendor eye-pos poll.
 	if (!eye_pos.valid) {
 		eye_pos.count = 2;
 		eye_pos.eyes[0] = {-0.032f, 0.0f, 0.6f};
@@ -10014,6 +10077,8 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			}
 		}
 	}
+
+	profile_s1 = os_monotonic_get_ns(); // Phase 5a — end of pre-loop setup.
 
 	// Render projection layers to stereo texture (via copy)
 	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
@@ -10649,6 +10714,8 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		U_LOG_T("Rendered projection layer %u", i);
 	}
 
+	profile_s2 = os_monotonic_get_ns(); // Phase 5a — end of projection-layer loop.
+
 	// Render UI layers if any exist and shaders are ready
 	if (has_ui_layers && sys->quad_vs) {
 		// Bind per-client stereo render target
@@ -10760,6 +10827,8 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		}
 	}
 
+	profile_s3 = os_monotonic_get_ns(); // Phase 5a — end of UI-layers block.
+
 	// Workspace mode: per-client atlas rendering is done. The multi-compositor
 	// composites all client atlases into the combined atlas and presents.
 	// --- Lazy reverse hot-switch (workspace re-activated) ---
@@ -10809,6 +10878,34 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		// observe per-client commit volume (no client_renders should fire
 		// in workspace mode now).
 		sys->render_diag_client_skips.fetch_add(1, std::memory_order_relaxed);
+
+		// Phase 5a — emit per-stage [COMMIT_PROFILE_SVC] line. Same env
+		// gate as [CLIENT_FRAME_NS]. Captures the four stages of service-
+		// side commit work to attribute the per-cube xrEndFrame cost.
+		// Sub-stages of "setup" attribute time to vendor-SDK polls
+		// (`get_hardware_3d_state`, `get_predicted_eye_positions`) — both
+		// suspect for blocking-on-vendor behavior.
+		profile_s4 = os_monotonic_get_ns();
+		if (profile_s3 == 0) profile_s3 = profile_s4; // No UI layers branch ran.
+		{
+			static int log_commit_profile = -1;
+			if (log_commit_profile < 0) {
+				const char *e = getenv("DISPLAYXR_LOG_PRESENT_NS");
+				log_commit_profile = (e != nullptr && e[0] == '1') ? 1 : 0;
+			}
+			if (log_commit_profile) {
+				U_LOG_W("[COMMIT_PROFILE_SVC] client=%p setup_pre_ns=%lld setup_3dstate_ns=%lld setup_eyepos_ns=%lld setup_post_ns=%lld proj_ns=%lld ui_ns=%lld post_ns=%lld total_ns=%lld",
+				        (void *)c,
+				        (long long)(profile_s0a - profile_s0),
+				        (long long)(profile_s0b - profile_s0a),
+				        (long long)(profile_s0c - profile_s0b),
+				        (long long)(profile_s1 - profile_s0c),
+				        (long long)(profile_s2 - profile_s1),
+				        (long long)(profile_s3 - profile_s2),
+				        (long long)(profile_s4 - profile_s3),
+				        (long long)(profile_s4 - profile_s0));
+			}
+		}
 		return XRT_SUCCESS;
 	}
 
