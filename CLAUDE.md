@@ -129,7 +129,17 @@ Toolchain: `cmake/toolchain-mingw-w64.cmake`. Output goes to `build-mingw/` (git
 
 ### CI Build (Remote)
 
-**CI policy: PR-only.** `build-windows.yml` triggers on **pull requests** and **`v*` tag pushes** — nothing else. Pushes to feature branches do NOT trigger CI; iterate locally and open a draft PR if you want CI feedback before review. macOS CI is currently disabled.
+**CI policy: PR-only, with cost-saver guards.** `build-windows.yml` triggers on **pull requests** and **`v*` tag pushes** — nothing else. Pushes to feature branches do NOT trigger CI; iterate locally and open a PR when ready.
+
+Three guards keep CI minutes low without breaking contributor expectations:
+
+| Guard | Effect |
+|---|---|
+| **Drafts skip CI** | A draft PR doesn't run CI. Mark Ready for review when you want CI feedback. Job-level: `(github.event_name != 'pull_request' \|\| !github.event.pull_request.draft)`. |
+| **Doc-only PRs skip CI** | `paths-ignore: ['**.md', 'docs/**', '.github/ISSUE_TEMPLATE/**', 'LICENSE']` on the `pull_request:` trigger. |
+| **Cancel-in-progress** | Rapid pushes to a PR cancel the in-progress CI run; only the latest commit's CI completes. `concurrency: group: ${{ workflow }}-${{ pr.number || ref }}, cancel-in-progress: true`. |
+
+Net: for a 5-iteration PR with code changes, expect ~1-2 CI runs (draft iterations free; one or two ready-for-review pushes after concurrency-cancel folding). Doc-only PRs cost nothing. macOS CI is currently disabled.
 
 For tagged releases, use the `/release` skill (see below) — it's the official release path. Don't tag manually.
 
