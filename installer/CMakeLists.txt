@@ -74,34 +74,9 @@ if(TARGET DisplayXRSwitcher)
 	add_dependencies(installer DisplayXRSwitcher)
 endif()
 # Workspace controllers (the DisplayXR shell, third-party verticals, …)
-# ship as their own products with their own installers. The runtime
-# installer no longer depends on or bundles displayxr-shell.
-
-# ---------------------------------------------------------------------
-# Dedicated shell installer
-#
-# Builds DisplayXRShellSetup-${VERSION}.${BUILD_NUM}.exe — a standalone
-# installer that requires the runtime as a hard prereq, installs the
-# shell binary into the runtime's install tree, and registers the shell
-# at HKLM\Software\DisplayXR\WorkspaceControllers\shell. See
-# docs/specs/workspace-controller-registration.md.
-# ---------------------------------------------------------------------
-add_custom_target(shell_installer
-	COMMAND "${NSIS_EXECUTABLE}"
-		"/DVERSION=${DISPLAYXR_VERSION}"
-		"/DVERSION_MAJOR=${DISPLAYXR_VERSION_MAJOR}"
-		"/DVERSION_MINOR=${DISPLAYXR_VERSION_MINOR}"
-		"/DVERSION_PATCH=${DISPLAYXR_VERSION_PATCH}"
-		"/DBUILD_NUM=${BUILD_NUM}"
-		"/DBIN_DIR=${DISPLAYXR_BIN_DIR}"
-		"/DSOURCE_DIR=${CMAKE_SOURCE_DIR}"
-		"/DOUTPUT_DIR=${CMAKE_INSTALL_PREFIX}"
-		"${CMAKE_CURRENT_SOURCE_DIR}/DisplayXRShellInstaller.nsi"
-	WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-	COMMENT "Building DisplayXR Shell installer..."
-	VERBATIM
-)
-
-if(TARGET displayxr-shell)
-	add_dependencies(shell_installer displayxr-shell)
-endif()
+# ship as their own products with their own installers — the runtime
+# installer does not bundle them. The DisplayXR Shell ships from
+# DisplayXR/displayxr-shell-pvt with its own installer/CMakeLists.txt
+# (publishes to displayxr-shell-releases). See
+# docs/specs/workspace-controller-registration.md for the
+# self-registration contract any workspace app uses.

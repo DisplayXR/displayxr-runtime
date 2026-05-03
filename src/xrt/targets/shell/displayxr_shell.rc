@@ -1,6 +1,0 @@
-// Copyright 2026, Leia Inc.
-// SPDX-License-Identifier: BSL-1.0
-
-#include "displayxr_shell_resource.h"
-
-IDI_DISPLAYXR_SHELL ICON "assets/displayxr-shell.ico"

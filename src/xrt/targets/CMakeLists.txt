@@ -57,11 +57,10 @@ if(WIN32)
 		add_subdirectory(switcher)
 	endif()
 
-	# DisplayXR workspace controller (management client) — directory is
-	# the legacy name `shell/`; the binary will move out of this repo soon.
-	if(XRT_FEATURE_SERVICE)
-		add_subdirectory(shell)
-	endif()
+	# DisplayXR Shell (workspace controller) source has moved to
+	# DisplayXR/displayxr-shell-pvt and ships from there. The runtime
+	# discovers any installed workspace controller via the registry
+	# contract; see docs/specs/workspace-controller-registration.md.
 
 	# DisplayXR WebXR bridge host (metadata sideband for Chrome's native WebXR)
 	add_subdirectory(webxr_bridge)

@@ -1,15 +1,18 @@
-name: Publish to Public Repos
+name: Publish Runtime to Public Repo
 
-# On tagged releases: push runtime (sans shell) to displayxr-runtime (public),
-# and publish combined installer + shell binary to displayxr-shell-releases.
+# On tagged releases: push runtime to DisplayXR/displayxr-runtime (public)
+# and create a GitHub Release. The DisplayXR Shell ships from
+# DisplayXR/displayxr-shell-pvt → displayxr-shell-releases via that
+# repo's own publish-shell-releases.yml workflow.
 #
 # Tag scheme (see docs/roadmap/demo-distribution.md):
-#   vX.Y.Z            — full-stack release (back-compat): every publish-*
-#                       workflow fires; every public repo gets a tag.
-#   runtime/vX.Y.Z    — runtime + shell only; demos unaffected.
+#   vX.Y.Z            — full-stack release (back-compat). Both runtime
+#                       AND shell get tagged independently with the
+#                       same version.
+#   runtime/vX.Y.Z    — runtime only; demos unaffected.
 #
-# The trailing `vX.Y.Z` after the slash is the version that appears on the
-# public repos. Env VERSION strips any prefix once per job.
+# The trailing `vX.Y.Z` after the slash is the version that appears on
+# the public repos. Env VERSION strips any prefix once per job.
 
 on:
   push:
@@ -50,12 +53,10 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Remove shell code (proprietary)
-        run: |
-          rm -rf src/xrt/targets/shell/
-          # Remove CMake reference to shell subdirectory
-          sed -i '/# DisplayXR spatial shell/,/endif()/d' src/xrt/targets/CMakeLists.txt
-          echo "Removed src/xrt/targets/shell/ and CMake reference"
+      # Shell source extraction (Phase 2.J Step 1, 2026-05) moved
+      # src/xrt/targets/shell/ to DisplayXR/displayxr-shell-pvt. The
+      # runtime repo no longer carries any shell code; the previous
+      # "Remove shell code" strip step is now a no-op and removed.
 
       - name: Push to public runtime repo
         env:
@@ -107,7 +108,10 @@ jobs:
 
           ## Installation
 
-          Download the installer from [DisplayXR Shell Releases](https://github.com/DisplayXR/displayxr-shell-releases/releases/tag/${{ env.VERSION }}) or build from source.
+          The runtime alone provides OpenXR + WebXR Bridge support.
+          For the spatial shell experience, also install the
+          [DisplayXR Shell](https://github.com/DisplayXR/displayxr-shell-releases/releases)
+          (separate installer; ships from DisplayXR/displayxr-shell-pvt).
 
           ## License
 
@@ -115,124 +119,3 @@ jobs:
             --latest
 
           echo "Created release on DisplayXR/displayxr-runtime"
-
-  publish-shell-releases:
-    if: github.repository == 'DisplayXR/displayxr-runtime-pvt'
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Mint App installation token (write to shell-releases repo)
-        id: app-token
-        uses: actions/create-github-app-token@v1
-        with:
-          app-id: ${{ secrets.DISPLAYXR_APP_ID }}
-          private-key: ${{ secrets.DISPLAYXR_APP_PRIVATE_KEY }}
-          owner: DisplayXR
-          repositories: displayxr-shell-releases
-
-      - name: Resolve public release version
-        run: |
-          V="${GITHUB_REF_NAME##*/}"
-          echo "VERSION=$V" >> "$GITHUB_ENV"
-          echo "Public release tag: $V (from ref_name=$GITHUB_REF_NAME)"
-
-      - name: Wait for Windows CI build to complete
-        id: wait-build
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          echo "Waiting for Build Windows workflow to complete for tag ${{ env.VERSION }}..."
-          RUN_ID=""
-          for i in $(seq 1 60); do
-            # Find successful build-windows run for this commit
-            RUN_ID=$(gh run list --repo ${{ github.repository }} --workflow build-windows.yml \
-              --event push --limit 10 --json databaseId,conclusion,headSha \
-              --jq "[.[] | select(.headSha == \"${{ github.sha }}\" and .conclusion == \"success\") | .databaseId] | first // empty" 2>/dev/null)
-            if [ -n "$RUN_ID" ]; then
-              echo "Build Windows completed successfully: run $RUN_ID"
-              echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
-              break
-            fi
-            echo "  Attempt $i/60 — waiting 30s..."
-            sleep 30
-          done
-
-          if [ -z "$RUN_ID" ]; then
-            echo "::error::Build Windows did not complete successfully within 30 minutes"
-            exit 1
-          fi
-
-      - name: Download DisplayXR artifact from Windows CI
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh run download "${{ steps.wait-build.outputs.run_id }}" --repo ${{ github.repository }} --name DisplayXR --dir runtime
-          echo "Downloaded DisplayXR artifact"
-          ls -la runtime/bin/ || echo "No bin directory"
-          ls -la runtime/ | head -20
-
-      - name: Find installer and shell binary
-        id: find-files
-        run: |
-          # Find installer
-          INSTALLER=$(find runtime -name "DisplayXRSetup-*.exe" -type f | head -1)
-          if [ -n "$INSTALLER" ]; then
-            echo "installer=$INSTALLER" >> "$GITHUB_OUTPUT"
-            echo "Found installer: $INSTALLER"
-          else
-            echo "::warning::Installer not found in artifacts"
-          fi
-
-          # Find shell binary
-          SHELL_EXE=$(find runtime -name "displayxr-shell.exe" -type f | head -1)
-          if [ -n "$SHELL_EXE" ]; then
-            echo "shell=$SHELL_EXE" >> "$GITHUB_OUTPUT"
-            echo "Found shell: $SHELL_EXE"
-          else
-            echo "::warning::Shell binary not found in artifacts"
-          fi
-
-      - name: Create GitHub Release on displayxr-shell-releases
-        env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-        run: |
-          # Build asset list
-          ASSETS=""
-          if [ -n "${{ steps.find-files.outputs.installer }}" ]; then
-            ASSETS="$ASSETS ${{ steps.find-files.outputs.installer }}"
-          fi
-          if [ -n "${{ steps.find-files.outputs.shell }}" ]; then
-            ASSETS="$ASSETS ${{ steps.find-files.outputs.shell }}"
-          fi
-
-          if [ -z "$ASSETS" ]; then
-            echo "::error::No assets found to publish"
-            exit 1
-          fi
-
-          # Delete existing release if re-running
-          gh release delete "${{ env.VERSION }}" --repo DisplayXR/displayxr-shell-releases --yes 2>/dev/null || true
-
-          gh release create "${{ env.VERSION }}" \
-            --repo DisplayXR/displayxr-shell-releases \
-            --title "DisplayXR ${{ env.VERSION }}" \
-            --notes "## Downloads
-
-          | File | Description |
-          |------|-------------|
-          | \`DisplayXRSetup-*.exe\` | **Installer** — installs runtime + shell + service. Recommended for most users. |
-          | \`displayxr-shell.exe\` | **Standalone shell** — for manual updates. Requires runtime already installed. |
-
-          ## License
-
-          - **DisplayXR Runtime** (DLLs, service): [Boost Software License 1.0](https://github.com/DisplayXR/displayxr-runtime/blob/main/LICENSE)
-          - **DisplayXR Shell** (shell exe): Proprietary — free for personal/non-commercial use
-
-          ## Links
-
-          - [Runtime source & docs](https://github.com/DisplayXR/displayxr-runtime/releases/tag/${{ env.VERSION }})
-          - [Full documentation](https://github.com/DisplayXR/displayxr-runtime)" \
-            --latest \
-            $ASSETS
-
-          echo "Published ${{ env.VERSION }} to DisplayXR/displayxr-shell-releases"

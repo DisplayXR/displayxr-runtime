@@ -83,21 +83,20 @@ Builds the runtime, OpenXR loader, and test apps. The Vulkan compositor will fai
 
 ### Local Windows Build
 ```bat
-scripts\build_windows.bat all              REM Full build (generate + runtime + both installers + test apps)
-scripts\build_windows.bat build            REM Runtime only (fastest iteration)
-scripts\build_windows.bat installer        REM Runtime installer only
-scripts\build_windows.bat shell_installer  REM Dedicated shell installer only
-scripts\build_windows.bat test-apps        REM Test apps only (uses existing runtime build)
-scripts\build_windows.bat generate         REM CMake generate only
+scripts\build_windows.bat all        REM Full build (generate + runtime + installer + test apps)
+scripts\build_windows.bat build      REM Runtime only (fastest iteration)
+scripts\build_windows.bat installer  REM Runtime installer only
+scripts\build_windows.bat test-apps  REM Test apps only (uses existing runtime build)
+scripts\build_windows.bat generate   REM CMake generate only
 ```
 Downloads all dependencies on first run (SR SDK, vcpkg, OpenXR loader). Requires VS 2022 with C++ workload, Ninja, Vulkan SDK, and GitHub CLI. Outputs to `_package/` (runtime) and `test_apps/*/build/` (test apps).
 
-**Two installers, separate products.** The runtime installer
-(`DisplayXRSetup-*.exe`) and the dedicated shell installer
-(`DisplayXRShellSetup-*.exe`) build independently and ship
-independently. The shell installer requires the runtime as a hard
-prereq (reads `HKLM\Software\DisplayXR\Runtime\InstallPath`), installs
-into the runtime's tree, and registers itself at
+**The DisplayXR Shell ships from a separate repo
+([displayxr-shell-pvt](https://github.com/DisplayXR/displayxr-shell-pvt))**
+with its own installer (`DisplayXRShellSetup-*.exe`). The shell
+installer requires the runtime as a hard prereq (reads
+`HKLM\Software\DisplayXR\Runtime\InstallPath`), installs into the
+runtime's tree, and registers itself at
 `HKLM\Software\DisplayXR\WorkspaceControllers\shell` for the service
 orchestrator to discover. The runtime owns no specific workspace app
 — third-party verticals follow the same registration contract. See
@@ -187,22 +186,24 @@ Demos publish **one repo per demo** — `DisplayXR/displayxr-demo-<name>`. Each 
 
 | Repo | Visibility | Contents |
 |------|-----------|----------|
-| `DisplayXR/displayxr-runtime-pvt` | **Private** (dev) | Runtime + shell source, all dev issues, CI builds. **This repo.** |
-| `DisplayXR/displayxr-runtime` | Public | Public releases — auto-published from `-pvt` on tags, shell code stripped |
-| `DisplayXR/displayxr-shell-releases` | Public | Binary-only shell releases, user-facing bug reports |
-| `DisplayXR/displayxr-extensions` | Public | OpenXR extension headers, auto-synced from `src/external/openxr_includes/` |
+| `DisplayXR/displayxr-runtime-pvt` | **Private** (dev) | Runtime source, all runtime dev issues, CI builds. **This repo.** |
+| `DisplayXR/displayxr-runtime` | Public | Public runtime releases — auto-published from `-pvt` on tags |
+| `DisplayXR/displayxr-shell-pvt` | **Private** (dev) | DisplayXR Shell source, dev issues, CI |
+| `DisplayXR/displayxr-shell-releases` | Public | DisplayXR Shell installer releases (auto-published from `displayxr-shell-pvt` on tags), user-facing bug reports |
+| `DisplayXR/displayxr-extensions` | Public | OpenXR extension headers, auto-synced from this repo's `src/external/openxr_includes/` (consumed by shell-pvt + 3rd-party workspace apps) |
 | `DisplayXR/displayxr-demo-<name>` | Public | One repo per standalone demo (source + binary releases). Currently `displayxr-demo-gaussiansplat`. |
 
-Shell code lives in `src/xrt/targets/shell/`. It is developed alongside the runtime in this repo. The shell is proprietary; it is excluded from public releases by the publish workflow.
+Shell source moved to `displayxr-shell-pvt` in 2026-05 (Phase 2.J Step 1). The runtime no longer carries any shell code; the discovery contract is documented at `docs/specs/workspace-controller-registration.md`.
 
 ### Issue Management
 
-**All dev issues go to `DisplayXR/displayxr-runtime-pvt`** — both runtime and shell. Use the `shell` label to distinguish shell-specific issues.
+**Runtime dev issues** → `DisplayXR/displayxr-runtime-pvt` (this repo). **Shell dev issues** → `DisplayXR/displayxr-shell-pvt`. User-facing shell bug reports stay on the public `displayxr-shell-releases`.
 
 | Where | What | Who |
 |-------|------|-----|
-| `DisplayXR/displayxr-runtime-pvt` | All dev issues (bugs, tasks, implementation) | Developers |
-| `DisplayXR/displayxr-runtime` | Curated public milestones only (~5-10 issues) | Public / OEMs |
+| `DisplayXR/displayxr-runtime-pvt` | Runtime dev issues (bugs, tasks, implementation) | Developers |
+| `DisplayXR/displayxr-shell-pvt` | Shell dev issues | Developers |
+| `DisplayXR/displayxr-runtime` | Curated public runtime milestones only (~5-10 issues) | Public / OEMs |
 | `DisplayXR/displayxr-shell-releases` | User-facing shell bug reports | Shell users |
 
 **Rules:**

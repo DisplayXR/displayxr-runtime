@@ -20,7 +20,7 @@ The shell side ports the deleted runtime carousel into a controller-owned state 
 
 See `spatial-workspace-extensions-phase2K-plan.md` for the full design and `spatial-workspace-extensions-phase2-audit.md` for the per-commit summary.
 
-### 3. Shell activate-failure no longer auto-reconnects
+### 3. Shell activate-failure no longer auto-reconnects (open — now lives in `displayxr-shell-pvt`)
 
 **State:** Before Phase 2.I C10 the shell maintained its own IPC connection and could tear it down + recreate it when activate failed (service died). After C10 the shell has no IPC connection of its own — the runtime DLL holds it. Activate failure now just bails with a "restart the service and press Ctrl+Space" message.
 
@@ -28,7 +28,10 @@ See `spatial-workspace-extensions-phase2K-plan.md` for the full design and `spat
 
 **Where to fix:** Shell-side. The reconnect path now requires `xrDestroySession` + `xrCreateSession` (and probably `xrDestroyInstance` + `xrCreateInstance` since the runtime DLL holds connection state on the instance, not the session). Wrap the existing activate-failure path with that recreate logic.
 
-**Suggested phase:** Phase 2.J (shell repo extraction) — the cleanup naturally happens when the shell is its own repo and can iterate freely. Until then, it's a known UX regression.
+**New tracking location:** This issue now belongs to
+`DisplayXR/displayxr-shell-pvt` (Phase 2.J Step 1 moved the shell
+source there in 2026-05). Re-file it as a shell-pvt issue when
+prioritized.
 
 ### 4. `XRT_FORCE_MODE=ipc` shell workaround ✅ shipped (2.J prequel)
 
@@ -38,11 +41,15 @@ See `spatial-workspace-extensions-phase2K-plan.md` for the full design and `spat
 
 These three documented spots in the runtime still mention the shell app by name. They were intentionally left during the Phase 2.I-followup decoupling because the shell directory hasn't physically moved yet. They go away in Phase 2.J.
 
-### 5. `targets/CMakeLists.txt` `add_subdirectory(shell)`
+### 5. `targets/CMakeLists.txt` `add_subdirectory(shell)` ✅ shipped (Phase 2.J Step 1 — shell source extraction)
 
-**State:** A comment marks it as the "legacy name" with a TODO to remove when the binary moves. The line itself stays as long as `src/xrt/targets/shell/` exists in this repo.
-
-**Where to fix:** Phase 2.J commit that removes `src/xrt/targets/shell/` entirely.
+**Resolution:** Shell source moved to
+[DisplayXR/displayxr-shell-pvt](https://github.com/DisplayXR/displayxr-shell-pvt).
+`src/xrt/targets/CMakeLists.txt`'s `add_subdirectory(shell)` block
+deleted. `installer/DisplayXRShellInstaller.nsi` and the
+`shell_installer` CMake target also removed (the shell repo owns its
+own installer build now). The runtime side is genuinely
+shell-source-free and unblocks the master plan's privacy-collapse step.
 
 ### 6. `service_config.c` default binary literal `"displayxr-shell.exe"` ✅ shipped (workspace-controller registry)
 
@@ -60,6 +67,6 @@ These three documented spots in the runtime still mention the shell app by name.
 | **2.K** | ~~#2 (per-frame motion events + interactive carousel / drag in the shell)~~ ✅ shipped |
 | **2.J prequel** | ~~#4 (XRT_FORCE_MODE workaround)~~ ✅ shipped |
 | **2.J — installer split** | ~~#6 (default-binary literal), #7 (transitional comments)~~ ✅ shipped via workspace-controller registry |
-| **2.J — source-tree move** | #3 (shell auto-reconnect on activate-failure), #5 (CMake `add_subdirectory(shell)`) — pending shell repo extraction |
+| **2.J — source-tree move** | ~~#5 (CMake `add_subdirectory(shell)`)~~ ✅ shipped — shell source moved to `displayxr-shell-pvt`. #3 (shell auto-reconnect on activate-failure) lives there now. |
 
 If you're picking up a phase listed above, check this doc and decide whether to fold the relevant item in or defer further. Update this doc when an item lands so the list stays current.
