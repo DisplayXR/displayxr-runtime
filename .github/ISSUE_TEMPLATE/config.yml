@@ -4,5 +4,5 @@ contact_links:
     url: https://github.com/DisplayXR/displayxr-runtime/blob/main/docs/specs/XR_EXT_display_info.md
     about: Read the formal extension proposal before asking design questions
   - name: Vendor Integration Guide
-    url: https://github.com/DisplayXR/displayxr-runtime/blob/main/docs/specs/vendor-integration.md
+    url: https://github.com/DisplayXR/displayxr-runtime/blob/main/docs/guides/vendor-integration.md
     about: Guide for display vendors looking to integrate their hardware

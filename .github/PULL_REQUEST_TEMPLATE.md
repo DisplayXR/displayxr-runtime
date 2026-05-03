@@ -9,7 +9,7 @@
 ## Checklist
 
 - [ ] Target branch is `main`
-- [ ] CI passes (Windows + macOS builds)
+- [ ] Windows CI passes (macOS verified locally; macOS CI is currently disabled)
 - [ ] Code formatted with `git clang-format`
 - [ ] Tested on: <!-- e.g., Windows 11 with LeiaSR SDK, macOS with sim_display -->
 
