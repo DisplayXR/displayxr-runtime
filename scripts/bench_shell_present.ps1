@@ -5,12 +5,18 @@
     cube_handle apps run inside the shell.
 
 .DESCRIPTION
-    Phase 1 (shell-optimization branch) added two greppable breadcrumbs
-    to the service log under %LOCALAPPDATA%\DisplayXR:
+    Phase 1 (shell-optimization branch) added greppable breadcrumbs to
+    the service log under %LOCALAPPDATA%\DisplayXR:
 
-        [PRESENT_NS] dt_ns=<int>           — env-gated by DISPLAYXR_LOG_PRESENT_NS=1
-        [MUTEX] client=<hwnd> timeouts=<u> acquires=<u> avg_acquire_us=<u> window_s=<int>
-        [ZC] client=<hwnd> views=<u> zero_copy=<Y|N> reason=<str>
+        [PRESENT_NS] client=<ptr|workspace> dt_ns=<int>   — env-gated by DISPLAYXR_LOG_PRESENT_NS=1
+        [CLIENT_FRAME_NS] client=<ptr> dt_ns=<int>        — env-gated by DISPLAYXR_LOG_PRESENT_NS=1
+        [MUTEX] client=<ptr> timeouts=<u> acquires=<u> avg_acquire_us=<u> window_s=<int>
+        [ZC] client=<ptr> views=<u> zero_copy=<Y|N> reason=<str>
+
+    `client=workspace` tags the multi_compositor_render combined-atlas
+    Present (only present in workspace mode). `client=<ptr>` is the
+    per-client `d3d11_service_compositor*` for service-mode clients,
+    or the per-process in-process compositor for standalone runs.
 
     This script:
       1. Launches displayxr-shell.exe with two cube_handle_d3d11_win
@@ -131,11 +137,12 @@ if ($runLogs.Count -eq 0) {
 
 Write-Host "[bench] parsing $($runLogs.Count) service log file(s)..."
 
-# Parse breadcrumbs. New shapes after Phase 1.5:
-#   [PRESENT_NS] client=<hwnd|shell> dt_ns=<int>     # per-swapchain present
-#   [CLIENT_FRAME_NS] client=<hwnd> dt_ns=<int>      # per-client xrEndFrame interval
-#   [MUTEX] client=<hwnd> timeouts=... acquires=... avg_acquire_us=... window_s=...
-#   [ZC] client=<hwnd> views=... zero_copy=Y|N reason=...
+# Parse breadcrumbs. Shapes after Phase 1:
+#   [PRESENT_NS] client=<ptr|workspace> dt_ns=<int>  # per-swapchain present
+#                                                    #   (workspace = multi_compositor_render's combined-atlas Present)
+#   [CLIENT_FRAME_NS] client=<ptr> dt_ns=<int>       # per-client xrEndFrame interval
+#   [MUTEX] client=<ptr> timeouts=... acquires=... avg_acquire_us=... window_s=...
+#   [ZC] client=<ptr> views=... zero_copy=Y|N reason=...
 $rePresent = [regex]'\[PRESENT_NS\]\s+client=(?<c>\S+)\s+dt_ns=(?<dt>\d+)'
 $reFrame   = [regex]'\[CLIENT_FRAME_NS\]\s+client=(?<c>\S+)\s+dt_ns=(?<dt>\d+)'
 $reMutex   = [regex]'\[MUTEX\]\s+client=(?<c>\S+)\s+timeouts=(?<to>\d+)\s+acquires=(?<aq>\d+)\s+avg_acquire_us=(?<avg>\d+)\s+window_s=(?<ws>\d+)'

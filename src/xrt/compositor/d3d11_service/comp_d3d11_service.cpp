@@ -334,7 +334,7 @@ struct d3d11_service_compositor
 	//! Phase 1 diagnostic — `[CLIENT_FRAME_NS]` env-gated per-client
 	//! commit-to-commit interval. Measures the rate at which THIS client
 	//! is actually submitting frames (its `xrEndFrame` cadence as seen on
-	//! the service side). Works in both shell and standalone modes —
+	//! the service side). Works in both workspace and standalone modes —
 	//! diff the same client's number across the two for an apples-to-
 	//! apples per-app frame-rate comparison.
 	int64_t last_commit_ns;
@@ -9353,9 +9353,10 @@ after_key_shortcuts:
 	comp_d3d11_service_poll_mcp_capture((struct xrt_system_compositor *)sys);
 
 	// Phase 1 Task 1.4 — env-gated Present-to-Present interval log for the
-	// shell-mode service swapchain. Production builds pay nothing (one
-	// getenv on first frame, then a static-cached 0/1 branch). Bench
-	// harness flips DISPLAYXR_LOG_PRESENT_NS=1 to enable. Greppable.
+	// workspace-mode multi-compositor swap chain. Production builds pay
+	// nothing (one getenv on first frame, then a static-cached 0/1
+	// branch). Bench harness flips DISPLAYXR_LOG_PRESENT_NS=1 to enable.
+	// Greppable.
 	{
 		static int log_present_ns = -1;
 		if (log_present_ns < 0) {
@@ -9366,7 +9367,7 @@ after_key_shortcuts:
 			static int64_t last_present_ns = 0;
 			int64_t now_ns = os_monotonic_get_ns();
 			if (last_present_ns != 0) {
-				U_LOG_W("[PRESENT_NS] client=shell dt_ns=%lld",
+				U_LOG_W("[PRESENT_NS] client=workspace dt_ns=%lld",
 				        (long long)(now_ns - last_present_ns));
 			}
 			last_present_ns = now_ns;
@@ -9400,10 +9401,10 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	std::lock_guard<std::mutex> lock(c->mutex);
 
 	// Phase 1 diagnostic — env-gated per-client commit interval. One
-	// line per client per xrEndFrame; tagged by HWND so multi-client
-	// runs can be split out. Cheap (one getenv on first frame, then a
-	// static-cached branch), and works in BOTH shell and standalone
-	// modes for direct comparison.
+	// line per client per xrEndFrame; tagged by client struct pointer so
+	// multi-client runs can be split out. Cheap (one getenv on first
+	// frame, then a static-cached branch), and works in BOTH workspace
+	// and standalone modes for direct comparison.
 	{
 		static int log_client_frame_ns = -1;
 		if (log_client_frame_ns < 0) {
@@ -10747,10 +10748,12 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	svc_chroma_key_pass_execute(sys, &c->render);
 
 	// Phase 1 diagnostic — same env-gated [PRESENT_NS] used for the
-	// shell swapchain. In standalone mode this fires per client per
-	// frame against THIS client's own swap chain. Tagged with HWND so
-	// shell mode (multi_compositor_render's Present) and standalone
-	// (here) can be told apart by grep.
+	// workspace multi-comp swap chain. In standalone mode this fires
+	// per client per frame against THIS client's own swap chain. Tagged
+	// with the client struct pointer so workspace mode
+	// (multi_compositor_render's Present, tagged client=workspace) and
+	// standalone (here, tagged client=<client ptr>) can be told apart
+	// by grep.
 	{
 		static int log_present_ns = -1;
 		if (log_present_ns < 0) {

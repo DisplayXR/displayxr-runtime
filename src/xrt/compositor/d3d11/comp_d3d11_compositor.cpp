@@ -962,7 +962,7 @@ d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	// Phase 1 diagnostic — env-gated per-client commit interval. Mirrors
 	// the same `[CLIENT_FRAME_NS]` line emitted by the SERVICE compositor's
 	// `compositor_layer_commit` so per-app frame rates are directly
-	// comparable across shell mode (service compositor) and standalone
+	// comparable across workspace mode (service compositor) and standalone
 	// (this in-process compositor). One client per process here so a
 	// static cache is fine; HWND tags the line for log demuxing.
 	{

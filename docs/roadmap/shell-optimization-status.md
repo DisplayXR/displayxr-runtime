@@ -35,7 +35,7 @@ All Phase 1 changes live in `src/xrt/compositor/d3d11_service/comp_d3d11_service
 
 ### Benchmark results
 
-Run on the dev box (Sparks i7 + 3080 + Leia SR), 30 s windows, `DISPLAYXR_LOG_PRESENT_NS=1`, all on `shell/optimization` after Phase 1 + per-client diagnostic instrumentation. `[CLIENT_FRAME_NS]` is per-client `xrEndFrame` interval at the service compositor; `[PRESENT_NS] client=shell` is the multi-comp shell swapchain interval. `client=<ptr>` is the `d3d11_service_compositor*` (stable per-client ID).
+Run on the dev box (Sparks i7 + 3080 + Leia SR), 30 s windows, `DISPLAYXR_LOG_PRESENT_NS=1`, all on `shell/optimization` after Phase 1 + per-client diagnostic instrumentation. `[CLIENT_FRAME_NS]` is per-client `xrEndFrame` interval at the service compositor; `[PRESENT_NS] client=workspace` is the multi-comp combined-atlas swapchain interval. `client=<ptr>` is the `d3d11_service_compositor*` (stable per-client ID).
 
 #### Standalone — 1× `cube_handle_d3d11_win` (in-process compositor, no shell)
 
@@ -59,7 +59,7 @@ Per-client `[CLIENT_FRAME_NS]`:
 | 0x1FCCFDA0120 | 445 | 64.11 ms | 87.33 ms | 101.65 ms | 110.42 ms | 37.54 ms | **15.6** |
 | 0x1FCCFDD2120 | 449 | 57.19 ms | 87.96 ms | 104.09 ms | 118.57 ms | 46.91 ms | **17.5** |
 
-Shell combined-atlas swapchain `[PRESENT_NS] client=shell`: p50 = 16.65 ms (**60.1 fps**), p99 = 20.74 ms, jitter 4.10 ms — display refresh is rock-solid at vsync.
+Workspace combined-atlas swapchain `[PRESENT_NS] client=workspace`: p50 = 16.65 ms (**60.1 fps**), p99 = 20.74 ms, jitter 4.10 ms — display refresh is rock-solid at vsync.
 
 `[ZC]` (all clients): `zero_copy=N reason=view_ineligible` (each client's view took the cross-process keyed mutex, so the existing per-view eligibility check correctly disqualifies). `view_ineligible` is the reason because in workspace mode the views are still service-created shared images and the mutex acquire flips eligibility off — same as the pre-Phase-1 `any_mutex_acquired` semantics, just at finer granularity.
 
