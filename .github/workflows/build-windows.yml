@@ -153,7 +153,7 @@ jobs:
       # the whole rclone group on forks; the artifact-upload steps above
       # already give reviewers the installer.
       - name: Setup rclone config
-        if: github.repository == 'DisplayXR/displayxr-runtime'
+        if: github.repository == 'DisplayXR/displayxr-runtime' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         shell: powershell
         run: |
           $rcloneDir = "$env:USERPROFILE\.config\rclone"
@@ -167,7 +167,7 @@ jobs:
           Write-Host "rclone config written to $rcloneDir\rclone.conf"
 
       - name: Install rclone (if not present)
-        if: github.repository == 'DisplayXR/displayxr-runtime'
+        if: github.repository == 'DisplayXR/displayxr-runtime' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         shell: powershell
         run: |
           if (-not (Get-Command rclone -ErrorAction SilentlyContinue)) {
@@ -182,7 +182,7 @@ jobs:
           }
 
       - name: Upload installer to OneDrive
-        if: github.repository == 'DisplayXR/displayxr-runtime'
+        if: github.repository == 'DisplayXR/displayxr-runtime' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         shell: powershell
         run: |
           $installer = Get-ChildItem -Path "_package/DisplayXRSetup-*.exe" | Select-Object -First 1
@@ -1089,7 +1089,7 @@ jobs:
       # OneDrive upload uses RCLONE_CONFIG; skip on forks (the bundled
       # artifact upload above already exposes the test apps to reviewers).
       - name: Install rclone
-        if: github.repository == 'DisplayXR/displayxr-runtime'
+        if: github.repository == 'DisplayXR/displayxr-runtime' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         run: |
           curl -O https://downloads.rclone.org/rclone-current-linux-amd64.zip
           unzip rclone-current-linux-amd64.zip
@@ -1097,7 +1097,7 @@ jobs:
           rclone --version
 
       - name: Setup rclone config
-        if: github.repository == 'DisplayXR/displayxr-runtime'
+        if: github.repository == 'DisplayXR/displayxr-runtime' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         env:
           RCLONE_CONFIG_CONTENTS: ${{ secrets.RCLONE_CONFIG }}
         run: |
@@ -1105,7 +1105,7 @@ jobs:
           echo "$RCLONE_CONFIG_CONTENTS" > ~/.config/rclone/rclone.conf
 
       - name: Zip test apps
-        if: github.repository == 'DisplayXR/displayxr-runtime'
+        if: github.repository == 'DisplayXR/displayxr-runtime' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         run: |
           cd TestApps
           zip -r ../TestApps-${{ github.run_number }}.zip .
@@ -1113,7 +1113,7 @@ jobs:
           ls -lh TestApps-${{ github.run_number }}.zip
 
       - name: Upload test apps zip to OneDrive
-        if: github.repository == 'DisplayXR/displayxr-runtime'
+        if: github.repository == 'DisplayXR/displayxr-runtime' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         run: |
           destPath="SANDBOX/RUNTIMES + SDK + PLUGINS/OpenXR"
           echo "Uploading TestApps-${{ github.run_number }}.zip to OneDrive: $destPath"
