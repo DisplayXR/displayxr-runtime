@@ -157,6 +157,14 @@ $reZc      = [regex]'\[ZC\]\s+client=(?<c>\S+)\s+views=(?<v>\d+)\s+zero_copy=(?<
 # stale_views > 0. Legacy KeyedMutex clients emit no [FENCE] (the field
 # stays absent and the mutex line is the authoritative signal).
 $reFence   = [regex]'\[FENCE\]\s+client=(?<c>\S+)\s+waits_queued=(?<wq>\d+)\s+stale_views=(?<sv>\d+)\s+last_value=(?<lv>\d+)\s+window_s=(?<ws>\d+)'
+# Phase 3 - [RENDER] is system-wide (not per-client). One emission per
+# 10s window from capture_render_thread_func. Splits multi_compositor_render
+# call counts by driver thread (capture vs per-client commit), reports
+# average render duration per driver, throttle-skip count, and average
+# sys->render_mutex acquire latency. Used to identify which of (shared
+# sys->context GPU serialization) / (throttle reverberation) /
+# (mutex contention) dominates the 4-cube workspace per-cube fps deficit.
+$reRender  = [regex]'\[RENDER\]\s+capture_renders=(?<cr>\d+)\s+capture_avg_us=(?<ca>\d+)\s+client_renders=(?<cli_r>\d+)\s+client_skips=(?<cli_s>\d+)\s+client_avg_us=(?<cli_a>\d+)\s+wait_avg_us=(?<wait>\d+)\s+window_s=(?<ws>\d+)'
 
 # Per-client per-source samples.
 $presentByClient = @{}
@@ -164,6 +172,7 @@ $frameByClient   = @{}
 $mutexEvents     = New-Object 'System.Collections.Generic.List[psobject]'
 $zcEvents        = New-Object 'System.Collections.Generic.List[psobject]'
 $fenceEvents     = New-Object 'System.Collections.Generic.List[psobject]'
+$renderEvents    = New-Object 'System.Collections.Generic.List[psobject]'
 
 function Add-Sample {
     param([hashtable] $bag, [string] $client, [int64] $dt)
@@ -200,6 +209,17 @@ foreach ($f in $runLogs) {
                 stale_views = [int]$m.Groups['sv'].Value
                 last_value  = [uint64]$m.Groups['lv'].Value
                 window_s    = [int]$m.Groups['ws'].Value
+            }); return
+        }
+        $m = $reRender.Match($line);  if ($m.Success) {
+            [void]$renderEvents.Add([pscustomobject]@{
+                capture_renders = [int]$m.Groups['cr'].Value
+                capture_avg_us  = [int]$m.Groups['ca'].Value
+                client_renders  = [int]$m.Groups['cli_r'].Value
+                client_skips    = [int]$m.Groups['cli_s'].Value
+                client_avg_us   = [int]$m.Groups['cli_a'].Value
+                wait_avg_us     = [int]$m.Groups['wait'].Value
+                window_s        = [int]$m.Groups['ws'].Value
             })
         }
     }
@@ -297,6 +317,24 @@ $totalFenceWaits = ($fenceEvents | Measure-Object -Property waits_queued -Sum).S
 $totalFenceStale = ($fenceEvents | Measure-Object -Property stale_views -Sum).Sum
 $fenceClients    = ($fenceEvents | Group-Object client | Measure-Object).Count
 
+# Phase 3 - render diagnostic aggregates. Each render event is a 10s
+# window summary from capture_render_thread_func. Sums roll up to total
+# renders/skips over the run; averages are per-window means (each window
+# already averages its samples internally).
+$totalCaptureRenders = ($renderEvents | Measure-Object -Property capture_renders -Sum).Sum
+$totalClientRenders  = ($renderEvents | Measure-Object -Property client_renders  -Sum).Sum
+$totalClientSkips    = ($renderEvents | Measure-Object -Property client_skips    -Sum).Sum
+$avgCaptureUs        = if ($renderEvents.Count -gt 0) {
+    [math]::Round((($renderEvents | Measure-Object -Property capture_avg_us -Average).Average), 2)
+} else { 0 }
+$avgClientUs         = if ($renderEvents.Count -gt 0) {
+    [math]::Round((($renderEvents | Measure-Object -Property client_avg_us -Average).Average), 2)
+} else { 0 }
+$avgWaitUs           = if ($renderEvents.Count -gt 0) {
+    [math]::Round((($renderEvents | Measure-Object -Property wait_avg_us -Average).Average), 2)
+} else { 0 }
+$renderWindows       = $renderEvents.Count
+
 # Last [ZC] decision per client (most recent transition).
 $lastZc = $zcEvents | Group-Object client | ForEach-Object {
     $last = $_.Group | Select-Object -Last 1
@@ -324,6 +362,13 @@ $header = [pscustomobject]@{
     fence_total_waits    = $totalFenceWaits
     fence_total_stale    = $totalFenceStale
     fence_clients        = $fenceClients
+    render_windows         = $renderWindows
+    render_capture_renders = $totalCaptureRenders
+    render_client_renders  = $totalClientRenders
+    render_client_skips    = $totalClientSkips
+    render_capture_avg_us  = $avgCaptureUs
+    render_client_avg_us   = $avgClientUs
+    render_wait_avg_us     = $avgWaitUs
 }
 # Re-wrap stat rows so they share columns with the header.
 $enrichedSummary = New-Object 'System.Collections.Generic.List[psobject]'
@@ -349,6 +394,13 @@ foreach ($r in $summaryRows) {
         fence_total_waits    = ""
         fence_total_stale    = ""
         fence_clients        = ""
+        render_windows         = ""
+        render_capture_renders = ""
+        render_client_renders  = ""
+        render_client_skips    = ""
+        render_capture_avg_us  = ""
+        render_client_avg_us   = ""
+        render_wait_avg_us     = ""
     })
 }
 $enrichedSummary | Export-Csv -LiteralPath $summaryCsv -NoTypeInformation
@@ -357,6 +409,8 @@ Write-Host ""
 Write-Host "[bench] === summary ($Tag, ${Seconds}s) ==="
 Write-Host ("[bench]   mutex timeouts      = {0} / {1} acquires (avg {2} us)" -f $totalTimeouts, $totalAcquires, $avgAcquireUs)
 Write-Host ("[bench]   fence waits queued  = {0} (stale_views = {1}, fence-capable clients = {2})" -f $totalFenceWaits, $totalFenceStale, $fenceClients)
+Write-Host ("[bench]   render capture/cli  = {0}/{1} renders, {2} client_skips ({3} windows)" -f $totalCaptureRenders, $totalClientRenders, $totalClientSkips, $renderWindows)
+Write-Host ("[bench]   render avg us       = capture={0} client={1} mutex_wait={2}" -f $avgCaptureUs, $avgClientUs, $avgWaitUs)
 Write-Host ("[bench]   zc per client       = {0}" -f ($lastZc -join "; "))
 Write-Host ""
 Write-Host "[bench] per-source stats:"

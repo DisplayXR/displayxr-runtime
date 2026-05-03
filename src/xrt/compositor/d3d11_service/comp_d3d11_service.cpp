@@ -595,6 +595,36 @@ struct d3d11_service_system
 	//! to ~1 per VSync, reducing torn-atlas reads from concurrent client blits.
 	uint64_t last_workspace_render_ns;
 
+	/*!
+	 * @name Phase 3 — `[RENDER]` diagnostic.
+	 *
+	 * Per-render measurement of the workspace-mode render-loop machinery.
+	 * Emitted 1×/10 s from `capture_render_thread_func`. Atomics because the
+	 * counters are touched from both the capture thread and per-client
+	 * `compositor_layer_commit` threads (one per IPC client).
+	 *
+	 * Fields are reset (atomic exchange) at each window emission. Inline
+	 * `{0}` initializers keep them well-defined across `new d3d11_service_system()`.
+	 *
+	 * Format: `[RENDER] capture_renders=N capture_avg_us=R client_renders=K
+	 *          client_skips=S client_avg_us=R wait_avg_us=W window_s=10`
+	 *  - `capture_*` come from `capture_render_thread_func`
+	 *  - `client_*` come from `compositor_layer_commit` workspace path
+	 *  - `client_skips` is the 14ms throttle-skip count
+	 *  - `wait_avg_us` is `sys->render_mutex` acquire latency, averaged across
+	 *    both drivers
+	 * @{
+	 */
+	std::atomic<int64_t> render_diag_window_start_ns{0};
+	std::atomic<uint32_t> render_diag_capture_renders{0};
+	std::atomic<int64_t> render_diag_capture_render_total_ns{0};
+	std::atomic<uint32_t> render_diag_client_renders{0};
+	std::atomic<uint32_t> render_diag_client_skips{0};
+	std::atomic<int64_t> render_diag_client_render_total_ns{0};
+	std::atomic<int64_t> render_diag_mutex_wait_total_ns{0};
+	std::atomic<uint32_t> render_diag_mutex_wait_count{0};
+	/*! @} */
+
 	//! Phase 2.C spec_version 8: auto-reset Win32 event signaled whenever an
 	//! async workspace state change occurs that the controller might want to
 	//! react to (input event pushed onto the public ring, focused-slot
@@ -4420,6 +4450,50 @@ multi_compositor_unregister_client(struct d3d11_service_system *sys, struct d3d1
 }
 
 /*!
+ * Phase 3 — emit `[RENDER]` once per 10s window from the capture thread (the
+ * only single-reader site so no exchange race). Resets all counters at emit.
+ */
+static void
+emit_render_diag_if_window_elapsed(struct d3d11_service_system *sys)
+{
+	int64_t now_ns = (int64_t)os_monotonic_get_ns();
+	int64_t window_start = sys->render_diag_window_start_ns.load(std::memory_order_relaxed);
+	if (window_start == 0) {
+		sys->render_diag_window_start_ns.store(now_ns, std::memory_order_relaxed);
+		return;
+	}
+	int64_t window_ns = now_ns - window_start;
+	if (window_ns < 10LL * U_TIME_1S_IN_NS) {
+		return;
+	}
+
+	uint32_t cap_r =
+	    sys->render_diag_capture_renders.exchange(0, std::memory_order_relaxed);
+	int64_t cap_total =
+	    sys->render_diag_capture_render_total_ns.exchange(0, std::memory_order_relaxed);
+	uint32_t cli_r =
+	    sys->render_diag_client_renders.exchange(0, std::memory_order_relaxed);
+	uint32_t cli_s =
+	    sys->render_diag_client_skips.exchange(0, std::memory_order_relaxed);
+	int64_t cli_total =
+	    sys->render_diag_client_render_total_ns.exchange(0, std::memory_order_relaxed);
+	int64_t wait_total =
+	    sys->render_diag_mutex_wait_total_ns.exchange(0, std::memory_order_relaxed);
+	uint32_t wait_count =
+	    sys->render_diag_mutex_wait_count.exchange(0, std::memory_order_relaxed);
+
+	uint32_t cap_avg_us = (cap_r > 0) ? (uint32_t)(cap_total / 1000 / cap_r) : 0u;
+	uint32_t cli_avg_us = (cli_r > 0) ? (uint32_t)(cli_total / 1000 / cli_r) : 0u;
+	uint32_t wait_avg_us = (wait_count > 0) ? (uint32_t)(wait_total / 1000 / wait_count) : 0u;
+
+	U_LOG_W(
+	    "[RENDER] capture_renders=%u capture_avg_us=%u client_renders=%u client_skips=%u client_avg_us=%u wait_avg_us=%u window_s=10",
+	    cap_r, cap_avg_us, cli_r, cli_s, cli_avg_us, wait_avg_us);
+
+	sys->render_diag_window_start_ns.store(now_ns, std::memory_order_relaxed);
+}
+
+/*!
  * Render timer thread for capture clients.
  *
  * When capture-only clients are active (no IPC clients driving layer_commit),
@@ -4440,14 +4514,34 @@ capture_render_thread_func(struct d3d11_service_system *sys)
 
 		if (!mc->capture_render_running.load()) break;
 
-		std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
-		if (sys->multi_comp) {
-			// Always render: IPC clients drive via layer_commit too, but on
-			// slow GPUs (e.g. Intel iGPU) they run at <10fps. The 14ms
-			// throttle in layer_commit prevents double-renders, so this is safe.
-			multi_compositor_render(sys);
-			sys->last_workspace_render_ns = os_monotonic_get_ns();
+		// Phase 3 [RENDER] — measure render_mutex acquire latency and
+		// multi_compositor_render duration. Both atomics are touched from
+		// capture_render_thread_func and from compositor_layer_commit.
+		int64_t t_before_lock = (int64_t)os_monotonic_get_ns();
+		{
+			std::lock_guard<std::recursive_mutex> lock(sys->render_mutex);
+			int64_t t_after_lock = (int64_t)os_monotonic_get_ns();
+			sys->render_diag_mutex_wait_total_ns.fetch_add(
+			    t_after_lock - t_before_lock, std::memory_order_relaxed);
+			sys->render_diag_mutex_wait_count.fetch_add(1, std::memory_order_relaxed);
+
+			if (sys->multi_comp) {
+				// Always render: IPC clients drive via layer_commit too, but on
+				// slow GPUs (e.g. Intel iGPU) they run at <10fps. The 14ms
+				// throttle in layer_commit prevents double-renders, so this is safe.
+				int64_t t_before_render = (int64_t)os_monotonic_get_ns();
+				multi_compositor_render(sys);
+				int64_t t_after_render = (int64_t)os_monotonic_get_ns();
+				sys->render_diag_capture_renders.fetch_add(
+				    1, std::memory_order_relaxed);
+				sys->render_diag_capture_render_total_ns.fetch_add(
+				    t_after_render - t_before_render,
+				    std::memory_order_relaxed);
+				sys->last_workspace_render_ns = os_monotonic_get_ns();
+			}
 		}
+
+		emit_render_diag_if_window_elapsed(sys);
 	}
 }
 
@@ -10695,17 +10789,26 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	}
 
 	if (sys->workspace_mode) {
-		// Throttle renders to ~1 per VSync (~14ms). With N clients each calling
-		// layer_commit at 60fps, we'd otherwise render N times per frame cycle.
-		// Throttling reduces the chance of reading a client's atlas mid-blit.
-		uint64_t now_ns = os_monotonic_get_ns();
-		uint64_t elapsed_ns = now_ns - sys->last_workspace_render_ns;
-		if (elapsed_ns < 14000000ULL && sys->last_workspace_render_ns != 0) {
-			return XRT_SUCCESS; // Skip — another client will render soon
-		}
-		std::lock_guard<std::recursive_mutex> render_lock(sys->render_mutex);
-		multi_compositor_render(sys);
-		sys->last_workspace_render_ns = now_ns;
+		// Phase 3 — per-client commits no longer drive multi_compositor_render.
+		// `capture_render_thread_func` is the sole driver of the workspace
+		// atlas render at ~70 Hz. Per-client tile-blit work above (lines
+		// ~9700–10485) already wrote this client's tile into the shared
+		// atlas; that work is GPU-async on `sys->context` and returns
+		// immediately. The capture thread later samples the atlas and
+		// composes; Phase 2's per-client `workspace_sync_fence` queues a
+		// GPU `Wait()` ensuring the capture thread does not read a
+		// half-written tile.
+		//
+		// Pre-Phase-3 the per-client render trigger added ~25 ms of
+		// `sys->render_mutex` wait per `xrEndFrame` (4 clients all queued
+		// on one mutex), capping per-cube cadence at ~12 fps with 4 cubes.
+		// The 14 ms throttle that gated this path was aspirational
+		// torn-atlas protection; real protection lives in the fence path.
+		//
+		// `client_skips` is still incremented so the bench harness can
+		// observe per-client commit volume (no client_renders should fire
+		// in workspace mode now).
+		sys->render_diag_client_skips.fetch_add(1, std::memory_order_relaxed);
 		return XRT_SUCCESS;
 	}
 
