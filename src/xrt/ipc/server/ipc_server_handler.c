@@ -2214,9 +2214,11 @@ ipc_handle_workspace_activate(volatile struct ipc_client_state *_ics)
 		return XRT_SUCCESS;
 	}
 
-	IPC_INFO(s, "Workspace: activating workspace mode via IPC");
+	IPC_INFO(s, "Workspace: activating workspace mode via IPC (controller PID %lu)",
+	         caller_pid);
 
 	s->workspace_mode = true;
+	s->workspace_controller_pid = caller_pid;
 	if (s->xsysc != NULL) {
 		s->xsysc->info.workspace_mode = true;
 
@@ -2242,6 +2244,7 @@ ipc_handle_workspace_deactivate(volatile struct ipc_client_state *_ics)
 	IPC_INFO(s, "Workspace: deactivating workspace mode via IPC");
 
 	s->workspace_mode = false;
+	s->workspace_controller_pid = 0;
 	if (s->xsysc != NULL) {
 		s->xsysc->info.workspace_mode = false;
 

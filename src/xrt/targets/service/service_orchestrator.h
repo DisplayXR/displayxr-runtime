@@ -16,6 +16,9 @@
 extern "C" {
 #endif
 
+// Forward declaration; full definition in service_workspace_registry.h.
+struct workspace_controller_entry;
+
 /*!
  * Initialize the orchestrator. Registers hotkeys and/or spawns children
  * based on the config. Must be called after service_tray_init().
@@ -54,16 +57,41 @@ bool
 service_orchestrator_is_workspace_available(void);
 
 /*!
- * Display name for the installed workspace controller, suitable for tray UI.
- * Reads from the controller's `<binary>.controller.json` sidecar manifest if
- * present; falls back to "Workspace Controller" when the manifest is absent
- * or malformed. Returns an empty string if no controller is installed.
+ * Display name for the active workspace controller, suitable for tray UI.
+ * Sourced from the controller's `DisplayName` registry value at
+ * `HKLM\Software\DisplayXR\WorkspaceControllers\<id>`. Returns an empty
+ * string if no controller is registered.
  *
  * The returned pointer is owned by the orchestrator and remains valid for
  * the service's lifetime.
  */
 const char *
 service_orchestrator_get_workspace_display_name(void);
+
+/*!
+ * Returns a const pointer to the active workspace controller entry, so
+ * callers (the tray) can read DisplayName, the published Actions list,
+ * etc. without re-enumerating the registry. Returns NULL when no
+ * controller is available.
+ *
+ * The returned pointer is owned by the orchestrator and remains valid
+ * for the service's lifetime.
+ */
+const struct workspace_controller_entry *
+service_orchestrator_get_workspace_entry(void);
+
+/*!
+ * Fire-and-forget invocation of the registered workspace controller
+ * with `--workspace-action <action_name>` args. The controller is
+ * responsible for singleton-aware forwarding (if an instance is
+ * already running, the new process hands the action off to it and
+ * exits). No-op if no controller is registered.
+ *
+ * See `docs/specs/workspace-controller-registration.md` for the
+ * `--workspace-action` command-line contract.
+ */
+void
+service_orchestrator_dispatch_controller_action(const char *action_name);
 
 /*!
  * PID of the workspace controller process spawned by this orchestrator, or 0

@@ -48,6 +48,108 @@ A workspace app's installer:
 
 The runtime never writes any of these keys.
 
+## Optional: published menu actions
+
+The service tray's workspace submenu (parented under the controller's
+`DisplayName`) is rendered from a list of actions the controller
+publishes. **The runtime does not hardcode menu items for any
+controller.** A controller chooses what items to surface and what each
+one does.
+
+Schema — under the controller's `WorkspaceControllers\<id>` key:
+
+```
+Actions\
+    <ordering>\
+        Label = REG_SZ
+        Type  = REG_SZ
+```
+
+`<ordering>` is the subkey name. The service enumerates via
+`RegEnumKeyEx`, which returns subkeys in alphabetical order — use
+sortable names like `01-enable`, `02-auto`, `03-disable` to control
+menu ordering.
+
+### Supported `Type` values
+
+| Type | Meaning |
+|---|---|
+| `lifecycle:enable` | Service applies `SERVICE_CHILD_ENABLE` — controller is always running. |
+| `lifecycle:auto` | Service applies `SERVICE_CHILD_AUTO` — Ctrl+Space spawns on demand. |
+| `lifecycle:disable` | Service applies `SERVICE_CHILD_DISABLE` — controller never auto-spawns. |
+| `separator` | Renders an `MF_SEPARATOR`. Not a click target. `Label` is ignored. |
+| `controller:<action-name>` | Service runs `CreateProcess` of `Binary` with `--workspace-action <action-name>`. The controller is responsible for singleton-aware forwarding (see below). |
+
+The currently-active lifecycle mode is rendered with `MF_CHECKED` in
+the tray submenu.
+
+Unknown `Type` values are skipped silently — forward-compat for
+future types like `ipc:<name>` (over the OpenXR session event drain)
+or `exec:<cmd>` (raw shell-out without the singleton convention).
+Don't invent a new prefix without coordinating with the runtime
+maintainers.
+
+### `--workspace-action <name>` command-line contract
+
+When a `controller:<name>` action is clicked, the service runs the
+controller binary as if it were:
+
+```
+"<Binary>" --workspace-action <name>
+```
+
+Controllers MUST honor this convention:
+
+- On invocation with `--workspace-action`, look up an existing
+  singleton (e.g., a named mutex). The DisplayXR Shell uses
+  `Local\DisplayXR.Shell.Singleton` — third-party controllers should
+  use a vendor-namespaced equivalent.
+- **If the singleton exists**, forward the action to the running
+  instance over a controller-internal channel — `WM_COPYDATA` to a
+  known message-only HWND, a named pipe, a file marker, etc. (the
+  author's choice). Then exit.
+- **If no instance is running**, become the singleton and handle the
+  action — typically by spawning the full controller (loading the
+  same code paths used in normal startup) and dispatching to the
+  newly-loaded handler.
+
+The service does not wait on the spawned process and does not
+inspect its exit code. Fire-and-forget.
+
+### Example registrations
+
+**DisplayXR Shell (default install):**
+
+| Subkey | Label | Type |
+|---|---|---|
+| `Actions\01-enable` | Enable | `lifecycle:enable` |
+| `Actions\02-auto` | Auto | `lifecycle:auto` |
+| `Actions\03-disable` | Disable | `lifecycle:disable` |
+
+**Hypothetical kiosk-mode controller** (only "Always On" needed):
+
+| Subkey | Label | Type |
+|---|---|---|
+| `Actions\01-on` | Always On | `lifecycle:enable` |
+
+**Future shell extension** (lifecycle + custom actions):
+
+| Subkey | Label | Type |
+|---|---|---|
+| `Actions\01-enable` | Enable | `lifecycle:enable` |
+| `Actions\02-auto` | Auto | `lifecycle:auto` |
+| `Actions\03-disable` | Disable | `lifecycle:disable` |
+| `Actions\04-sep` | — | `separator` |
+| `Actions\05-launcher` | Show Launcher | `controller:show-launcher` |
+| `Actions\06-save` | Save Workspace... | `controller:save-workspace` |
+
+### Fallback
+
+If `Actions\` is **absent** or **empty**, the service falls back to
+its hardcoded default workspace submenu — `Enable / Auto / Disable`,
+all `lifecycle:*` semantics. This preserves the menu for any
+controller that hasn't yet adopted the `Actions` contract.
+
 ## Cascade uninstall
 
 When the user uninstalls the runtime via Add/Remove Programs:

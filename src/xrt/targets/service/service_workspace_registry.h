@@ -24,6 +24,33 @@ extern "C" {
 #endif
 
 /*!
+ * Single tray-menu action published by a workspace controller.
+ * Populated from
+ * `HKLM\Software\DisplayXR\WorkspaceControllers\<id>\Actions\<ordering>\`.
+ * See `docs/specs/workspace-controller-registration.md` for the schema.
+ */
+struct workspace_controller_action
+{
+	//! Display label for the menu item (UTF-8). Empty entries are
+	//! skipped during registry enumeration.
+	char label[128];
+
+	//! Action type. Recognized values:
+	//!   "lifecycle:enable" / "lifecycle:auto" / "lifecycle:disable"
+	//!     — apply the corresponding orchestrator mode.
+	//!   "separator"
+	//!     — render an `MF_SEPARATOR` and skip the click handler.
+	//!   "controller:<action-name>"
+	//!     — fire-and-forget `CreateProcess` of the controller binary
+	//!       with `--workspace-action <action-name>` args. Controller
+	//!       handles singleton-aware forwarding internally.
+	//! Unknown types are skipped with a debug log (forward-compat).
+	char type[32];
+};
+
+#define WORKSPACE_REGISTRY_MAX_ACTIONS 16
+
+/*!
  * Registered workspace controller. Populated from a subkey of
  * `HKLM\Software\DisplayXR\WorkspaceControllers\<id>`. Workspace apps
  * (the DisplayXR shell, third-party verticals, etc.) write these keys
@@ -37,6 +64,13 @@ struct workspace_controller_entry
 	char vendor[64];                   //!< Optional publisher.
 	char version[32];                  //!< Optional free-form version.
 	char uninstall_string[MAX_PATH];   //!< Used by runtime uninstaller for cascade.
+
+	//! Optional published tray menu actions. `n_actions == 0` means
+	//! the tray falls back to its hardcoded Enable/Auto/Disable
+	//! defaults (back-compat for controllers that haven't adopted the
+	//! Actions contract yet).
+	int n_actions;
+	struct workspace_controller_action actions[WORKSPACE_REGISTRY_MAX_ACTIONS];
 };
 
 #define WORKSPACE_REGISTRY_MAX_ENTRIES 16

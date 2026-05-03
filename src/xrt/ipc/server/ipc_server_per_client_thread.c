@@ -16,6 +16,11 @@
 #include "shared/ipc_utils.h"
 #include "server/ipc_server.h"
 #include "ipc_server_generated.h"
+#include "xrt/xrt_config_have.h"
+
+#if defined(XRT_HAVE_LEIA_SR_D3D11) && defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+#include "d3d11_service/comp_d3d11_service.h"
+#endif
 
 #ifndef XRT_OS_WINDOWS
 
@@ -68,6 +73,11 @@ delayed_exit_thread(void *_server)
 static void
 common_shutdown(volatile struct ipc_client_state *ics)
 {
+	// Capture this client's PID before client_state is zeroed below — we
+	// need it after the lock is released to detect whether this was the
+	// workspace-mode controller and tear down workspace overlay state.
+	unsigned long this_client_pid = (unsigned long)ics->client_state.pid;
+
 	/*
 	 * Remove the thread from the server.
 	 */
@@ -163,6 +173,28 @@ common_shutdown(volatile struct ipc_client_state *ics)
 
 
 	ipc_server_deactivate_session(ics);
+
+	// If this client was the workspace-mode controller, the runtime needs
+	// to tear down workspace overlay state — chrome window list, launcher
+	// visibility, multi-compositor render loop. Without this, the
+	// compositor keeps rendering its last workspace snapshot indefinitely
+	// after the controller process dies (e.g. orchestrator killing the
+	// shell on Disable).
+	if (ics->server->workspace_mode &&
+	    ics->server->workspace_controller_pid != 0 &&
+	    this_client_pid == ics->server->workspace_controller_pid) {
+		IPC_WARN(ics->server,
+		         "Workspace controller (PID %lu) disconnected — deactivating workspace",
+		         this_client_pid);
+		ics->server->workspace_mode = false;
+		ics->server->workspace_controller_pid = 0;
+		if (ics->server->xsysc != NULL) {
+			ics->server->xsysc->info.workspace_mode = false;
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+			comp_d3d11_service_deactivate_workspace(ics->server->xsysc);
+#endif
+		}
+	}
 }
 
 

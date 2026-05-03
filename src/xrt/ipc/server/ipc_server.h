@@ -409,6 +409,13 @@ struct ipc_server
 	//! Workspace mode: multi-compositor with shared window for all clients.
 	bool workspace_mode;
 
+	//! PID of the IPC client that activated workspace mode. Captured at
+	//! ipc_handle_workspace_activate; checked in common_shutdown so that
+	//! abrupt controller-process death (e.g. orchestrator killing the
+	//! shell on Disable) tears down workspace state. Zero when no
+	//! controller is active.
+	unsigned long workspace_controller_pid;
+
 	struct ipc_thread threads[IPC_MAX_CLIENTS];
 
 	volatile uint32_t current_slot_index;

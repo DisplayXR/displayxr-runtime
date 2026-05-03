@@ -118,6 +118,23 @@ Section "DisplayXR Shell" SecShell
 	WriteRegStr HKLM "Software\DisplayXR\WorkspaceControllers\shell" \
 		"UninstallString" "$\"$INSTDIR\Uninstall-Shell.exe$\""
 
+	; Publish tray-menu actions for the service orchestrator. Service
+	; reads HKLM\Software\DisplayXR\WorkspaceControllers\shell\Actions\*
+	; (alphabetical by subkey name) and renders the workspace submenu
+	; from this list. See docs/specs/workspace-controller-registration.md.
+	WriteRegStr HKLM "Software\DisplayXR\WorkspaceControllers\shell\Actions\01-enable" \
+		"Label" "Enable"
+	WriteRegStr HKLM "Software\DisplayXR\WorkspaceControllers\shell\Actions\01-enable" \
+		"Type" "lifecycle:enable"
+	WriteRegStr HKLM "Software\DisplayXR\WorkspaceControllers\shell\Actions\02-auto" \
+		"Label" "Auto"
+	WriteRegStr HKLM "Software\DisplayXR\WorkspaceControllers\shell\Actions\02-auto" \
+		"Type" "lifecycle:auto"
+	WriteRegStr HKLM "Software\DisplayXR\WorkspaceControllers\shell\Actions\03-disable" \
+		"Label" "Disable"
+	WriteRegStr HKLM "Software\DisplayXR\WorkspaceControllers\shell\Actions\03-disable" \
+		"Type" "lifecycle:disable"
+
 	; Add/Remove Programs entry so the user can uninstall the shell on its own.
 	WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRShell" \
 		"DisplayName" "DisplayXR Shell"

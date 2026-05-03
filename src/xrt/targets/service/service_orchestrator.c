@@ -785,10 +785,36 @@ apply_workspace_mode(enum service_child_mode mode)
 			uninstall_workspace_hotkey();
 			s_hotkey_registered = false;
 		}
-		// Terminate workspace controller if running
+		// Terminate workspace controller if running.
 		if (s_workspace_running) {
 			terminate_child(&s_workspace_pi, &s_workspace_running);
 			OW("Terminated workspace controller (Disable mode)");
+		}
+		// Belt-and-suspenders: also taskkill any stray instance of the
+		// controller binary by image name. Covers the case where the
+		// orchestrator-tracked handle is stale (e.g., a fresh
+		// launch_child returned after the shell singleton-detected and
+		// exited the launcher, leaving the original instance running).
+		// No-op when no controller is registered or no process matches.
+		if (s_workspace_available && s_workspace_active.binary[0] != '\0') {
+			const char *image = strrchr(s_workspace_active.binary, '\\');
+			image = image ? image + 1 : s_workspace_active.binary;
+			char cmd[256];
+			if (snprintf(cmd, sizeof(cmd), "taskkill /f /im \"%s\"", image)
+			    < (int)sizeof(cmd)) {
+				STARTUPINFOA si;
+				PROCESS_INFORMATION pi;
+				ZeroMemory(&si, sizeof(si));
+				si.cb = sizeof(si);
+				ZeroMemory(&pi, sizeof(pi));
+				if (CreateProcessA(NULL, cmd, NULL, NULL, FALSE,
+				                   CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+					WaitForSingleObject(pi.hProcess, 3000);
+					CloseHandle(pi.hProcess);
+					CloseHandle(pi.hThread);
+					OW("taskkill swept stray '%s' instances (Disable mode)", image);
+				}
+			}
 		}
 		break;
 
@@ -882,6 +908,55 @@ const char *
 service_orchestrator_get_workspace_display_name(void)
 {
 	return s_workspace_active.display_name;
+}
+
+const struct workspace_controller_entry *
+service_orchestrator_get_workspace_entry(void)
+{
+	return s_workspace_available ? &s_workspace_active : NULL;
+}
+
+void
+service_orchestrator_dispatch_controller_action(const char *action_name)
+{
+	if (!s_workspace_available) {
+		OW("dispatch_controller_action: no workspace controller registered");
+		return;
+	}
+	if (action_name == NULL || action_name[0] == '\0') {
+		OW("dispatch_controller_action: empty action name");
+		return;
+	}
+
+	char cmd[1024];
+	int written = snprintf(cmd, sizeof(cmd), "\"%s\" --workspace-action %s",
+	                       s_workspace_active.binary, action_name);
+	if (written < 0 || (size_t)written >= sizeof(cmd)) {
+		OW("dispatch_controller_action: command line too long");
+		return;
+	}
+
+	STARTUPINFOA si;
+	ZeroMemory(&si, sizeof(si));
+	si.cb = sizeof(si);
+	PROCESS_INFORMATION pi;
+	ZeroMemory(&pi, sizeof(pi));
+
+	BOOL ok = CreateProcessA(NULL, cmd, NULL, NULL, FALSE,
+	                         CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+	if (!ok) {
+		OW("dispatch_controller_action: CreateProcess failed for '%s' (error %lu)",
+		   cmd, (unsigned long)GetLastError());
+		return;
+	}
+
+	// Fire-and-forget — the controller is responsible for singleton
+	// forwarding. We don't wait, don't track exit code.
+	CloseHandle(pi.hProcess);
+	CloseHandle(pi.hThread);
+
+	OW("Dispatched controller action: %s --workspace-action %s",
+	   s_workspace_active.binary, action_name);
 }
 
 unsigned long
@@ -1011,6 +1086,18 @@ const char *
 service_orchestrator_get_workspace_display_name(void)
 {
 	return "";
+}
+
+const struct workspace_controller_entry *
+service_orchestrator_get_workspace_entry(void)
+{
+	return NULL;
+}
+
+void
+service_orchestrator_dispatch_controller_action(const char *action_name)
+{
+	(void)action_name;
 }
 
 unsigned long

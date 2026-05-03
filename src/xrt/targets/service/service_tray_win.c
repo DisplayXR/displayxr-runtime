@@ -8,9 +8,11 @@
 
 #include "service_tray_win.h"
 #include "service_orchestrator.h"
+#include "service_workspace_registry.h"
 
 #include <windows.h>
 #include <shellapi.h>
+#include <string.h>
 
 #define IDI_DISPLAYXR_ICON_WHITE 101
 #define IDI_DISPLAYXR_ICON_BLACK 102
@@ -25,6 +27,11 @@
 #define IDM_BRIDGE_AUTO     1022
 #define IDM_START_ON_LOGIN  1030
 #define IDM_EXIT            1001
+
+// Workspace published-action IDs. Range matches
+// WORKSPACE_REGISTRY_MAX_ACTIONS (16) with a small margin for growth.
+#define IDM_WORKSPACE_ACTION_BASE 1040
+#define IDM_WORKSPACE_ACTION_END  1059
 
 
 /*
@@ -97,6 +104,71 @@ workspace_mode_to_id(enum service_child_mode m)
 	}
 }
 
+//! Map a published "lifecycle:*" action type to its service_child_mode.
+//! Returns true on match.
+static bool
+lifecycle_type_to_mode(const char *type, enum service_child_mode *out)
+{
+	if (strcmp(type, "lifecycle:enable") == 0) {
+		*out = SERVICE_CHILD_ENABLE;
+		return true;
+	}
+	if (strcmp(type, "lifecycle:auto") == 0) {
+		*out = SERVICE_CHILD_AUTO;
+		return true;
+	}
+	if (strcmp(type, "lifecycle:disable") == 0) {
+		*out = SERVICE_CHILD_DISABLE;
+		return true;
+	}
+	return false;
+}
+
+//! Append a workspace-controller-published Actions list to @p sub. Returns
+//! true if at least one menu item was appended (caller can decide whether
+//! to fall back to hardcoded defaults). Marks the active lifecycle mode
+//! with MF_CHECKED.
+static bool
+append_published_actions(HMENU sub, const struct workspace_controller_entry *entry)
+{
+	if (entry == NULL || entry->n_actions <= 0) {
+		return false;
+	}
+
+	int appended = 0;
+	for (int i = 0; i < entry->n_actions; i++) {
+		const struct workspace_controller_action *a = &entry->actions[i];
+
+		if (strcmp(a->type, "separator") == 0) {
+			AppendMenuW(sub, MF_SEPARATOR, 0, NULL);
+			appended++;
+			continue;
+		}
+
+		// Convert UTF-8 label to wide for the menu API.
+		wchar_t label_wide[256];
+		if (MultiByteToWideChar(CP_UTF8, 0, a->label, -1,
+		                        label_wide, ARRAYSIZE(label_wide)) == 0) {
+			// Skip unrenderable labels rather than crashing.
+			continue;
+		}
+
+		UINT id = IDM_WORKSPACE_ACTION_BASE + i;
+		UINT flags = MF_STRING;
+
+		// Mark the active lifecycle mode with a checkmark.
+		enum service_child_mode mode;
+		if (lifecycle_type_to_mode(a->type, &mode) && mode == s_config.workspace) {
+			flags |= MF_CHECKED;
+		}
+
+		AppendMenuW(sub, flags, id, label_wide);
+		appended++;
+	}
+
+	return appended > 0;
+}
+
 //! Map service_child_mode to the corresponding menu ID for the bridge submenu.
 static UINT
 bridge_mode_to_id(enum service_child_mode m)
@@ -126,19 +198,29 @@ show_context_menu(HWND hwnd)
 	// Main menu
 	HMENU menu = CreatePopupMenu();
 
-	// Workspace submenu — only built when a controller binary is detected next
-	// to the service. Bare runtime (no controller installed) gets just the
-	// Bridge entry, which is the honest reflection of what the runtime can
-	// do on its own.
+	// Workspace submenu — only built when a controller binary is detected.
+	// Bare runtime (no controller installed) gets just the Bridge entry,
+	// which is the honest reflection of what the runtime can do on its own.
+	//
+	// The submenu items themselves come from the controller's published
+	// `Actions\*` registry subkeys when present (V2.J Part 2). If the
+	// controller has not adopted that contract yet, fall back to the
+	// hardcoded Enable / Auto / Disable defaults — preserves UX for any
+	// controller not shipping `Actions`.
 	if (service_orchestrator_is_workspace_available()) {
-		HMENU workspace_sub = CreatePopupMenu();
-		AppendMenuW(workspace_sub, MF_STRING, IDM_WORKSPACE_ENABLE, L"Enable");
-		AppendMenuW(workspace_sub, MF_STRING, IDM_WORKSPACE_AUTO, L"Auto");
-		AppendMenuW(workspace_sub, MF_STRING, IDM_WORKSPACE_DISABLE, L"Disable");
-		CheckMenuRadioItem(workspace_sub, IDM_WORKSPACE_ENABLE, IDM_WORKSPACE_AUTO,
-		                   workspace_mode_to_id(s_config.workspace), MF_BYCOMMAND);
+		const struct workspace_controller_entry *entry =
+		    service_orchestrator_get_workspace_entry();
 
-		// Convert UTF-8 manifest display name to wide for the menu item.
+		HMENU workspace_sub = CreatePopupMenu();
+		if (!append_published_actions(workspace_sub, entry)) {
+			AppendMenuW(workspace_sub, MF_STRING, IDM_WORKSPACE_ENABLE, L"Enable");
+			AppendMenuW(workspace_sub, MF_STRING, IDM_WORKSPACE_AUTO, L"Auto");
+			AppendMenuW(workspace_sub, MF_STRING, IDM_WORKSPACE_DISABLE, L"Disable");
+			CheckMenuRadioItem(workspace_sub, IDM_WORKSPACE_ENABLE, IDM_WORKSPACE_AUTO,
+			                   workspace_mode_to_id(s_config.workspace), MF_BYCOMMAND);
+		}
+
+		// Convert UTF-8 display name to wide for the parent menu item.
 		const char *name_utf8 = service_orchestrator_get_workspace_display_name();
 		wchar_t name_wide[256];
 		if (name_utf8 == NULL || name_utf8[0] == '\0' ||
@@ -191,9 +273,35 @@ tray_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		}
 		return 0;
 
-	case WM_COMMAND:
-		switch (LOWORD(wParam)) {
-		// Workspace mode radio group
+	case WM_COMMAND: {
+		UINT cmd_id = LOWORD(wParam);
+
+		// Published-action range — controller defined the menu via
+		// HKLM\Software\DisplayXR\WorkspaceControllers\<id>\Actions\*.
+		if (cmd_id >= IDM_WORKSPACE_ACTION_BASE && cmd_id <= IDM_WORKSPACE_ACTION_END) {
+			const struct workspace_controller_entry *entry =
+			    service_orchestrator_get_workspace_entry();
+			int idx = (int)(cmd_id - IDM_WORKSPACE_ACTION_BASE);
+			if (entry == NULL || idx < 0 || idx >= entry->n_actions) {
+				return 0;
+			}
+			const struct workspace_controller_action *a = &entry->actions[idx];
+
+			enum service_child_mode mode;
+			if (lifecycle_type_to_mode(a->type, &mode)) {
+				s_config.workspace = mode;
+				config_changed();
+			} else if (strncmp(a->type, "controller:", 11) == 0) {
+				service_orchestrator_dispatch_controller_action(a->type + 11);
+			}
+			// Unknown / "separator" types: silent no-op (separators are
+			// not click targets; unknowns are forward-compat for V2.x).
+			return 0;
+		}
+
+		switch (cmd_id) {
+		// Workspace mode radio group — fallback path when the active
+		// controller did not publish an Actions list.
 		case IDM_WORKSPACE_ENABLE:
 			s_config.workspace = SERVICE_CHILD_ENABLE;
 			config_changed();
@@ -236,6 +344,7 @@ tray_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 			break;
 		}
 		return 0;
+	}
 
 	case WM_SETTINGCHANGE:
 		// Windows theme changed — swap tray icon to match

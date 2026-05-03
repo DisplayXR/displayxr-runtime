@@ -53,6 +53,70 @@ read_reg_string(HKEY key, const char *value_name, char *buf, size_t buf_size)
 	return buf[0] != '\0';
 }
 
+//! Walk the optional `<id>\Actions\*` sub-subkeys (alphabetical order
+//! via RegEnumKeyEx) and populate entry->actions[]. Skips entries
+//! where the Label value is missing/empty. Caps at
+//! WORKSPACE_REGISTRY_MAX_ACTIONS.
+static void
+populate_actions(HKEY parent_subkey, struct workspace_controller_entry *entry)
+{
+	HKEY actions_key = NULL;
+	if (RegOpenKeyExA(parent_subkey, "Actions", 0,
+	                  KEY_READ | KEY_WOW64_64KEY, &actions_key) != ERROR_SUCCESS) {
+		return; // Optional subkey absent; tray falls back to hardcoded defaults.
+	}
+
+	for (DWORD index = 0;; index++) {
+		if (entry->n_actions >= WORKSPACE_REGISTRY_MAX_ACTIONS) {
+			U_LOG_W("workspace registry: '%s' has more than %d actions; truncating",
+			        entry->id, WORKSPACE_REGISTRY_MAX_ACTIONS);
+			break;
+		}
+
+		char ordering[64];
+		DWORD ordering_size = sizeof(ordering);
+		LSTATUS rc = RegEnumKeyExA(actions_key, index, ordering, &ordering_size,
+		                           NULL, NULL, NULL, NULL);
+		if (rc == ERROR_NO_MORE_ITEMS) {
+			break;
+		}
+		if (rc != ERROR_SUCCESS) {
+			break;
+		}
+
+		HKEY action_key = NULL;
+		if (RegOpenKeyExA(actions_key, ordering, 0,
+		                  KEY_READ | KEY_WOW64_64KEY,
+		                  &action_key) != ERROR_SUCCESS) {
+			continue;
+		}
+
+		struct workspace_controller_action *action =
+		    &entry->actions[entry->n_actions];
+		memset(action, 0, sizeof(*action));
+
+		read_reg_string(action_key, "Label", action->label, sizeof(action->label));
+		read_reg_string(action_key, "Type", action->type, sizeof(action->type));
+
+		// "separator" type is allowed without a label (it's a divider);
+		// every other type needs a label or it's silently skipped.
+		bool keep = false;
+		if (strcmp(action->type, "separator") == 0) {
+			keep = true;
+		} else if (action->label[0] != '\0' && action->type[0] != '\0') {
+			keep = true;
+		}
+
+		if (keep) {
+			entry->n_actions++;
+		}
+
+		RegCloseKey(action_key);
+	}
+
+	RegCloseKey(actions_key);
+}
+
 //! Populate @p entry from one subkey. Returns true if Binary exists
 //! on disk.
 static bool
@@ -82,6 +146,8 @@ populate_from_subkey(const char *id, HKEY subkey,
 	read_reg_string(subkey, "Version", entry->version, sizeof(entry->version));
 	read_reg_string(subkey, "UninstallString", entry->uninstall_string,
 	                sizeof(entry->uninstall_string));
+
+	populate_actions(subkey, entry);
 
 	return true;
 }
