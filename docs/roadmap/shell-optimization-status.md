@@ -138,10 +138,63 @@ Workspace combined-atlas `[PRESENT_NS] client=workspace`: p50 = 16.68 ms (**60.0
 - **Jitter went up** (Phase 1: 24–47 ms p99-p50; Phase 2: 60–66 ms p99-p50). Likely because the GPU-side sync allows more frame-to-frame variance now that clients aren't tightly coupled by the mutex serialization. Worth re-checking after Phase 3 introduces explicit per-client pacing.
 - **Cache-barrier gotcha (`[ZC] acquires=0` vs reality):** the `[MUTEX] acquires` counter only tracks the legacy 4 ms-timeout path; the fence path's `AcquireSync(0, 0)` is **not** counted by design (the goal of the metric is to measure the *legacy* path's residual cost). The first Phase 2 run rendered empty cubes because we had skipped `AcquireSync` entirely; D3D11 requires it for `SHARED_KEYEDMUTEX` textures to issue the cross-process GPU memory barrier. The 0-timeout acquire is the cheapest way to keep the contract while still moving the wait off the render thread.
 
-## Phase 3 — Per-client frame pacing (deferred)
+## Phase 3 — Sole-driver render loop (shipped)
 
-Not started. Highest-risk phase; touches `comp_multi_system.c` render loop.
+The Phase 3 spec (`shell-optimization-plan.md` and the Phase 3 agent prompt) targeted `src/xrt/compositor/multi/comp_multi_*` files for "per-client pacing." **That spec was wrong about file paths for DisplayXR's architecture.** Workspace mode bypasses the canonical Monado `comp_multi` path entirely — every IPC client gets a `d3d11_service_compositor` directly via `comp_d3d11_service.cpp:11079::system_create_native_compositor`, and multi-client orchestration lives in `d3d11_multi_compositor` inside the same TU. `comp_multi` is reachable only via `null_compositor.c` (testing) and `sdl_test/sdl_compositor.c` (dev harness).
 
-## Phase 4 — Opportunistic cleanup (deferred)
+Phase 3 was retargeted to the actual workspace-mode code path. Two changes shipped:
 
-Not started. Damage tracking, retire wait-thread if vestigial post-Phase-2, D3D12 service compositor parity.
+1. **`runtime: flag comp_multi as Monado-legacy, point to d3d11_service`** (commit `b271f73e8`) — added `@note` to each of the four `comp_multi_*` files so the next agent does not repeat the spec mis-targeting.
+
+2. **`runtime + bench: Phase 3 — capture thread is sole workspace-render driver (3.2x per-cube fps)`** (commit `b32fd91bc`) — surgery in `compositor_layer_commit` workspace path:
+   - Pre-Phase-3: workspace-mode commits ran a 14 ms throttle gate, then took `sys->render_mutex` and called `multi_compositor_render` inline on the IPC client thread. With 4 cubes all queued on one mutex, each `xrEndFrame` paid ~25 ms of contention wait + ~17 ms of render time, capping per-cube at ~12 fps.
+   - Post-Phase-3: per-client commits do the per-view tile-blit and return immediately. `capture_render_thread_func` is the sole driver of `multi_compositor_render` (already runs at ~70 Hz; atlas Present locks at 60 Hz vsync). Phase 2's per-client `workspace_sync_fence` provides the GPU-side torn-atlas protection that the throttle's CPU-side comment claimed but didn't actually deliver.
+   - New `[RENDER]` diagnostic family (eight `std::atomic` counters on `d3d11_service_system`, emitted 1×/10s, mirrors `[MUTEX]`/`[FENCE]`): `capture_renders / capture_avg_us / client_renders / client_skips / client_avg_us / wait_avg_us`. Bench parser extended.
+
+### Phase 3 benchmark (4-cube workspace, 30 s, dev box)
+
+| metric | pre-surgery | post-surgery | delta |
+|---|---|---|---|
+| per-cube p50 | 82.2 ms (**12.2 fps**) | 25.5 ms (**39.2 fps**) | **3.2× faster** |
+| atlas Present p50 | 16.7 ms (60.0 fps) | 16.5 ms (60.6 fps) | unchanged ✓ |
+| `wait_avg_us` (mutex) | 24,894 µs | **4 µs** | 6,224× less contention |
+| `capture_avg_us` | 13,405 µs | 2,921 µs | 4.6× faster (no contention) |
+| `capture_renders`/sec | 24.5 | 59.5 | hits vsync target |
+| `client_renders`/sec | 35 | **0** | capture is sole driver ✓ |
+| `fence_waits_queued` | 1,219 | 2,893 | 2.4× more cube frames produced |
+
+Per-cube fps for all four cubes was uniform (39.2 / 39.2 / 38.9 / 39.3 fps); jitter rose vs pre-surgery (35 ms p99-p50) which is expected when removing the mutex serialization.
+
+### Phase 3 acceptance criteria — partial
+
+- ✅ Eliminate render-mutex contention: `wait_avg_us` 6,224× lower; `client_renders` = 0; capture is sole driver.
+- ✅ Atlas Present remains rock-solid 60 Hz under 4-cube load.
+- ✅ Phase 1+2 acceptance criteria still hold (`[MUTEX] timeouts=0`, `[FENCE] stale_views=0`).
+- ❌ **Per-cube fps target (60 fps) NOT met.** 39 fps vs 60 fps standalone. Workspace mode is still not at desktop parity.
+
+Per `project_workspace_must_equal_desktop_fps.md`, this is a P0 product blocker. Closing the 60 fps gap is **Phase 4** scope and may require service-compositor re-architecture.
+
+## Phase 3.B — Lazy-copy experiment (reverted, but informative)
+
+A reduced-scope follow-up was attempted: move the per-client `CopySubresourceRegion` from per-client thread to capture thread (per-client commit publishes copy params, capture thread issues the Copy). The hypothesis was that per-client D3D11 immediate-context API contention was the remaining bottleneck.
+
+**Result: regression.** Bench numbers (`docs/roadmap/bench/phase3b-lazy-copy_*.csv`):
+
+| metric | Phase 3 | Phase 3.B lazy-copy | verdict |
+|---|---|---|---|
+| atlas Present p50 | 16.5 ms (60.6 fps) | 23.0 ms (**43.5 fps**) | **regressed** |
+| per-cube p50 | 25.5 ms (39.2 fps) | 24.6 ms (40.6 fps) | within noise |
+| `capture_avg_us` | 2,921 µs | 8,868 µs | 3× longer |
+| `capture_renders`/sec | 59.5 | 44.4 | dropped 25% |
+
+**What this proves:** the bottleneck is **GPU work itself, not CPU thread contention.** Total per-cycle GPU work is unchanged when you move 4 clients' Copies onto the capture thread; the work just gets serialized in one place instead of four. Capture thread cycle balloons from 3 ms → 8.8 ms, dragging atlas Present below 60 Hz.
+
+**The lazy-copy code was reverted.** Bench artifacts kept as evidence for future work. Conclusion: **closing the per-cube 60 fps gap requires eliminating the per-client `CopySubresourceRegion` entirely** (true workspace zero-copy), not relocating it.
+
+## Phase 4 — True workspace zero-copy (next session)
+
+Goal: per-cube fps = desktop standalone fps (60 Hz). Re-architecting the d3d11_service compositor is in-bounds per `project_workspace_must_equal_desktop_fps.md`.
+
+**Approach (untried, design only):** `multi_compositor_render`'s per-client read pipeline (around lines 7682–8045) reads from the per-client atlas SRV (`cc->render.atlas_srv`). Replace this with per-view sampling **directly from cube swapchain image SRVs** (`sc->images[img_idx].srv`, already exist). Per-client commit publishes per-view `(sc, img_idx, sub_rect, fence_value)` and skips both atlas write AND `CopySubresourceRegion`.
+
+See `docs/roadmap/shell-optimization-phase4-handoff.md` for the full design context, known correctness pitfalls (cross-device GPU sync race, swapchain buffer-cycle race), file:line citations, and `docs/roadmap/shell-optimization-phase4-agent-prompt.md` for the next agent's onboarding.
