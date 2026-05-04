@@ -1,0 +1,45 @@
+name: lint
+
+# Fast checks that run on every PR. Cheap to run, catch class-of-bug
+# things that are easy to fix immediately:
+#
+# - Shell-source guard: this repo MUST NOT contain any files under
+#   `src/xrt/targets/shell/` or the deleted `installer/DisplayXRShellInstaller.nsi`.
+#   Those moved to DisplayXR/displayxr-shell-pvt during the privacy
+#   collapse (commit 7826a97c1, May 2026). Reintroducing them on a
+#   feature branch would expose shell source in a public repo. See
+#   reference_org_protection_state.md.
+#
+# Add other lightweight lint jobs here as needed (yaml validity,
+# CLAUDE.md presence, etc.).
+
+on:
+  pull_request: {}
+  push:
+    branches: [main]
+
+jobs:
+  shell-path-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: No shell source in runtime tree
+        run: |
+          # Both paths are forbidden. The shell now lives in
+          # DisplayXR/displayxr-shell-pvt; the runtime owns no
+          # workspace controller of its own.
+          MATCHES=$(git ls-files | grep -E '^(src/xrt/targets/shell/|installer/DisplayXRShellInstaller\.nsi$)' || true)
+          if [ -n "$MATCHES" ]; then
+            echo "::error::Shell source files detected in runtime tree:"
+            echo "$MATCHES"
+            echo ""
+            echo "These belong in DisplayXR/displayxr-shell-pvt, not here."
+            echo "If you accidentally branched off pre-extraction main, rebase onto"
+            echo "current main or run:"
+            echo ""
+            echo "  git filter-repo --invert-paths --path src/xrt/targets/shell --path installer/DisplayXRShellInstaller.nsi --refs <branch>"
+            echo ""
+            exit 1
+          fi
+          echo "Runtime tree is shell-source-free. ✓"
