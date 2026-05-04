@@ -76,17 +76,25 @@ If those lines are missing, MCP is not enabled in the runtime — verify `DISPLA
 
 ```bash
 # terminal 2 — Git Bash, from displayxr-runtime repo root
-bash tests/mcp/test_handshake.sh
-bash tests/mcp/test_core_tools.sh
-bash tests/mcp/test_diff_projection.sh
-bash tests/mcp/test_capture_frame.sh   # may be skipped on D3D11 — see script
+bash tests/mcp/test_phase_a_win.sh
 ```
+
+`test_phase_a_win.sh` auto-launches `cube_handle_d3d11_win.exe`, waits
+for the per-PID MCP server to bind, drives `initialize` + `tools/list`
++ several `tools/call` round-trips, and tears the cube down on exit.
+You can skip Phase 2.1 (manual cube launch) when running this script —
+it manages the cube itself.
+
+The other `test_*.sh` scripts under `tests/mcp/` (`test_handshake.sh`,
+`test_core_tools.sh`, `test_diff_projection.sh`, `test_capture_frame.sh`)
+are macOS-only — they target `cube_handle_metal_macos` and Unix domain
+sockets and skip cleanly on Windows. Run them on the macOS validation pass.
 
 **PASS criteria:**
 
-- Each script prints `PASS` lines and exits 0.
+- `test_phase_a_win.sh` prints `PASS` lines and exits 0.
 - No crashes / access violations in the cube app's console during or after the test.
-- `tools/list` (in `test_handshake.sh`) returns at least: `echo`, `tail_log`, `list_sessions`, `get_display_info`, `get_runtime_metrics`, `get_kooima_params`, `get_submitted_projection`, `diff_projection`, `capture_frame`.
+- `tools/list` returns at least: `echo`, `tail_log`, `list_sessions`, `get_display_info`, `get_runtime_metrics`, `get_kooima_params`, `get_submitted_projection`, `diff_projection`, `capture_frame`.
 
 **FAIL — capture for triage:**
 
