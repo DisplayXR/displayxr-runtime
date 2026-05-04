@@ -16,6 +16,18 @@
 
 #include "comp_vk_client.h"
 
+#include "util/u_logging.h"
+
+// Phase 2 — forward decls of the IPC client compositor bridges. Mirrors the
+// pair the D3D11 client uses (see comp_d3d11_client.cpp). Resolved at link
+// time so this TU does not pull the IPC client headers.
+extern xrt_result_t
+comp_ipc_client_compositor_get_workspace_sync_fence(struct xrt_compositor *xc,
+                                                    bool *out_have_fence,
+                                                    xrt_graphics_sync_handle_t *out_handle);
+extern void
+comp_ipc_client_compositor_set_workspace_sync_fence_value(struct xrt_compositor *xc, uint64_t value);
+
 // Prefixed with OXR since the only user right now is the OpenXR state tracker.
 DEBUG_GET_ONCE_LOG_OPTION(vulkan_log, "OXR_VULKAN_LOG", U_LOGGING_INFO)
 
@@ -265,6 +277,37 @@ submit_fallback(struct client_vk_compositor *c, xrt_result_t *out_xret)
 		vk_queue_unlock(vk->main_queue);
 	}
 
+	// Phase 2 — once the queue is idle, host-signal the workspace_sync
+	// semaphore and ship the new value to the service before the IPC commit.
+	// The service's per-view loop reads `last_signaled_fence_value` and
+	// queues an `ID3D11DeviceContext4::Wait` on it; without this advance the
+	// service treats every view as stale and skips the blit (manifests as
+	// black gauss-splat windows in shell mode). Mirrors the D3D11 client's
+	// signal in `client_d3d11_compositor_layer_commit`. No-op when
+	// `workspace_sync_semaphore` is null (legacy KeyedMutex path stays in
+	// effect — same fallback as the D3D11 client).
+#ifdef VK_KHR_timeline_semaphore
+	if (c->workspace_sync_semaphore != VK_NULL_HANDLE && vk->vkSignalSemaphore != NULL) {
+		c->workspace_sync_fence_value++;
+		VkSemaphoreSignalInfoKHR sig_info = {
+		    .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO_KHR,
+		    .semaphore = c->workspace_sync_semaphore,
+		    .value = c->workspace_sync_fence_value,
+		};
+		VkResult sig_ret = vk->vkSignalSemaphore(vk->device, &sig_info);
+		if (sig_ret != VK_SUCCESS) {
+			VK_WARN(vk,
+			        "Phase 2: vkSignalSemaphore(workspace_sync_semaphore) failed: %s; "
+			        "service will treat this frame as stale.",
+			        vk_result_string(sig_ret));
+			c->workspace_sync_fence_value--;
+		} else {
+			comp_ipc_client_compositor_set_workspace_sync_fence_value(
+			    &c->xcn->base, c->workspace_sync_fence_value);
+		}
+	}
+#endif
+
 	*out_xret = xrt_comp_layer_commit(&c->xcn->base, XRT_GRAPHICS_SYNC_HANDLE_INVALID);
 	return true;
 }
@@ -421,6 +464,11 @@ client_vk_compositor_destroy(struct xrt_compositor *xc)
 		c->sync.semaphore = VK_NULL_HANDLE;
 	}
 	xrt_compositor_semaphore_reference(&c->sync.xcsem, NULL);
+
+	if (c->workspace_sync_semaphore != VK_NULL_HANDLE) {
+		vk->vkDestroySemaphore(vk->device, c->workspace_sync_semaphore, NULL);
+		c->workspace_sync_semaphore = VK_NULL_HANDLE;
+	}
 
 	// Now safe to free the pool.
 	vk_cmd_pool_destroy(vk, &c->pool);
@@ -957,6 +1005,52 @@ client_vk_compositor_create(struct xrt_compositor_native *xcn,
 		if (xret != XRT_SUCCESS) {
 			goto err_pool;
 		}
+	}
+#endif
+
+	// Phase 2 — fetch the per-IPC-client workspace_sync_fence from the
+	// service and import it as a VK timeline semaphore. Mirrors the D3D11
+	// client's setup in `client_d3d11_compositor_create`. Failure leaves
+	// `workspace_sync_semaphore` null and the legacy vkQueueWaitIdle-only
+	// path stays in effect for this client.
+#ifdef VK_KHR_timeline_semaphore
+	c->workspace_sync_semaphore = VK_NULL_HANDLE;
+	c->workspace_sync_fence_value = 0;
+	if (vk_can_import_and_export_timeline_semaphore(&c->vk)) {
+		bool have_fence = false;
+		xrt_graphics_sync_handle_t fence_handle = XRT_GRAPHICS_SYNC_HANDLE_INVALID;
+		xrt_result_t fxret =
+		    comp_ipc_client_compositor_get_workspace_sync_fence(&xcn->base, &have_fence, &fence_handle);
+		if (fxret == XRT_SUCCESS && have_fence && xrt_graphics_sync_handle_is_valid(fence_handle)) {
+			VkSemaphore wsf_sem = VK_NULL_HANDLE;
+			VkResult vret = vk_create_timeline_semaphore_from_native(&c->vk, fence_handle, &wsf_sem);
+			if (vret == VK_SUCCESS && wsf_sem != VK_NULL_HANDLE) {
+				c->workspace_sync_semaphore = wsf_sem;
+				U_LOG_W("[FENCE] client=%p workspace_sync_semaphore imported "
+				        "(VK GPU-side wait path active)",
+				        (void *)c);
+			} else {
+				U_LOG_W("Phase 2 (VK): vk_create_timeline_semaphore_from_native failed (%s); "
+				        "falling back to vkQueueWaitIdle-only path.",
+				        vk_result_string(vret));
+				// Importing took ownership of the handle on success;
+				// on failure the helper does NOT consume it, so close.
+				u_graphics_sync_unref(&fence_handle);
+			}
+		} else if (fxret != XRT_SUCCESS) {
+			U_LOG_W("Phase 2 (VK): get_workspace_sync_fence RPC failed (xret=%d); "
+			        "vkQueueWaitIdle path stays in effect.",
+			        (int)fxret);
+		} else {
+			U_LOG_W("Phase 2 (VK): server reported no workspace_sync_fence "
+			        "(have=%d valid_handle=%d); vkQueueWaitIdle path stays in effect.",
+			        (int)have_fence, (int)xrt_graphics_sync_handle_is_valid(fence_handle));
+		}
+	} else {
+		U_LOG_W("Phase 2 (VK): VkDevice does not support timeline semaphore import/export "
+		        "(d3d12_fence=%d opaque_win32=%d); vkQueueWaitIdle path stays in effect.",
+		        (int)c->vk.external.timeline_semaphore_d3d12_fence,
+		        (int)c->vk.external.timeline_semaphore_win32_handle);
 	}
 #endif
 

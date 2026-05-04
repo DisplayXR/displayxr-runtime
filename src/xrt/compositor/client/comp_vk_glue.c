@@ -65,17 +65,25 @@ const char *xrt_gfx_vk_device_extensions = VK_KHR_DEDICATED_ALLOCATION_EXTENSION
 #error "Need port!"
 #endif
 
-// Platform version of "external_fence" and "external_semaphore"
+// Platform version of "external_fence" and "external_semaphore". The
+// timeline_semaphore extension is required so the IPC client can import the
+// service's per-client cross-process workspace_sync_fence as a VK timeline
+// semaphore (Phase 2 — see comp_vk_client.c::client_vk_compositor_create).
+// Without it the IPC client falls back to vkQueueWaitIdle-only sync, which
+// produces black gauss-splat / VK windows because the service treats every
+// view as stale.
 #if defined(XRT_GRAPHICS_SYNC_HANDLE_IS_FD)
 #if !defined(XRT_OS_MACOS)
     // FD sync extensions are optional on macOS — MoltenVK may not support them.
     // They're handled as optional by oxr_vulkan.c's optional_device_extensions[].
     " " VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME " " VK_KHR_EXTERNAL_FENCE_FD_EXTENSION_NAME
+    " " VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME
 #endif
     ;
 
 #elif defined(XRT_GRAPHICS_SYNC_HANDLE_IS_WIN32_HANDLE)
-    " " VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME " " VK_KHR_EXTERNAL_FENCE_WIN32_EXTENSION_NAME;
+    " " VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME " " VK_KHR_EXTERNAL_FENCE_WIN32_EXTENSION_NAME
+    " " VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME;
 
 #else
 #error "Need port!"

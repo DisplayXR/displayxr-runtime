@@ -76,6 +76,24 @@ struct client_vk_compositor
 		uint64_t value;
 	} sync;
 
+	/*!
+	 * Phase 2 — workspace_sync_fence imported from the IPC service. Mirrors
+	 * the D3D11 client's @ref client_d3d11_compositor::workspace_sync_fence.
+	 * Imported as a VK timeline semaphore (D3D12_FENCE handle type when the
+	 * driver supports it). Signaled on the app's queue once per
+	 * @ref client_vk_compositor_layer_commit AFTER the app's render
+	 * submission; the new value is shipped to the service via
+	 * @ref comp_ipc_client_compositor_set_workspace_sync_fence_value so the
+	 * service per-view loop can `ID3D11DeviceContext4::Wait` on it instead of
+	 * reading a half-rendered shared texture.
+	 *
+	 * VK_NULL_HANDLE ⇒ either we are not in workspace mode, the service is
+	 * not D3D11-backed, or the import failed; in that case the legacy
+	 * vkQueueWaitIdle path stays in effect.
+	 */
+	VkSemaphore workspace_sync_semaphore;
+	uint64_t workspace_sync_fence_value;
+
 	struct vk_bundle vk;
 
 	struct vk_cmd_pool pool;

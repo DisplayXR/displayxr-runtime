@@ -94,8 +94,12 @@ if(XRT_HAVE_D3D12)
 endif()
 
 if(XRT_HAVE_VULKAN)
+	# Phase 2 — comp_vk_client.c references the
+	# comp_ipc_client_compositor_{get,set}_workspace_sync_fence{,_value}
+	# bridge symbols defined in ipc_client_compositor.c (same setup as
+	# tests_comp_client_d3d11 above).
 	target_link_libraries(
-		tests_comp_client_vulkan PRIVATE comp_client comp_mock comp_util aux_vk
+		tests_comp_client_vulkan PRIVATE comp_client comp_mock comp_util aux_vk ipc_client
 		)
 	target_link_libraries(tests_uv_to_tangent PRIVATE comp_render)
 endif()

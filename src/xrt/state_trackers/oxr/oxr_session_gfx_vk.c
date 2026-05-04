@@ -115,6 +115,20 @@ oxr_session_populate_vk(struct oxr_logger *log,
 		timeline_semaphore_enabled = true;
 	}
 
+	// In workspace / IPC mode, force timeline semaphores on. The runtime
+	// requires VK_KHR_timeline_semaphore via xrGetVulkanDeviceExtensionsKHR
+	// (see xrt_gfx_vk_device_extensions in comp_vk_glue.c), and the IPC
+	// client compositor needs it to import the service's per-client
+	// cross-process workspace_sync_fence as a VK timeline semaphore. Apps
+	// that follow the runtime's required-extension list will have enabled
+	// the feature; if they didn't, vkSignalSemaphore returns an error and
+	// the IPC client falls back to vkQueueWaitIdle-only sync — same
+	// behaviour as before this change.
+	if (!timeline_semaphore_enabled && sys->xsysc != NULL && sys->xsysc->info.is_service_mode) {
+		oxr_log(log, "Workspace/IPC mode: forcing timeline semaphores on (runtime-required extension).");
+		timeline_semaphore_enabled = true;
+	}
+
 #ifdef OXR_HAVE_KHR_vulkan_enable2
 	if (sys->inst->extensions.KHR_vulkan_enable2) {
 		debug_utils_enabled = sess->sys->vk.debug_utils_enabled;

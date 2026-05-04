@@ -124,6 +124,14 @@ u_sandbox_should_use_ipc(void)
 
 	// Workspace session: app launched by workspace controller with hidden HWND, route to IPC
 	const char *workspace_session = getenv("DISPLAYXR_WORKSPACE_SESSION");
+#ifdef XRT_OS_WINDOWS
+	char workspace_session_buf[16] = {0};
+	if (workspace_session == NULL) {
+		DWORD n = GetEnvironmentVariableA("DISPLAYXR_WORKSPACE_SESSION", workspace_session_buf,
+		                                   sizeof(workspace_session_buf));
+		if (n > 0) workspace_session = workspace_session_buf;
+	}
+#endif
 	if (workspace_session != NULL && strcmp(workspace_session, "1") == 0) {
 		U_LOG_I("DISPLAYXR_WORKSPACE_SESSION=1: forcing IPC mode for workspace controller");
 		return true;

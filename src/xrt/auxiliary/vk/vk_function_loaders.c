@@ -260,9 +260,23 @@ vk_get_device_functions(struct vk_bundle *vk)
 
 	vk->vkCreateSemaphore                           = GET_DEV_PROC(vk, vkCreateSemaphore);
 #if defined(VK_KHR_timeline_semaphore)
+	// VK 1.2 promoted timeline semaphores to core. Some drivers only expose
+	// the core (no-KHR-suffix) entrypoints when the device is created at
+	// API >= 1.2 (NVIDIA on Windows behaves this way). Fall back to the
+	// core name when the KHR alias is not loaded so the IPC client's
+	// workspace_sync_semaphore signal actually reaches the service.
 	vk->vkSignalSemaphore                           = GET_DEV_PROC(vk, vkSignalSemaphoreKHR);
+	if (vk->vkSignalSemaphore == NULL) {
+		vk->vkSignalSemaphore                   = GET_DEV_PROC(vk, vkSignalSemaphore);
+	}
 	vk->vkWaitSemaphores                            = GET_DEV_PROC(vk, vkWaitSemaphoresKHR);
+	if (vk->vkWaitSemaphores == NULL) {
+		vk->vkWaitSemaphores                    = GET_DEV_PROC(vk, vkWaitSemaphores);
+	}
 	vk->vkGetSemaphoreCounterValue                  = GET_DEV_PROC(vk, vkGetSemaphoreCounterValueKHR);
+	if (vk->vkGetSemaphoreCounterValue == NULL) {
+		vk->vkGetSemaphoreCounterValue          = GET_DEV_PROC(vk, vkGetSemaphoreCounterValue);
+	}
 #endif // defined(VK_KHR_timeline_semaphore)
 
 	vk->vkDestroySemaphore                          = GET_DEV_PROC(vk, vkDestroySemaphore);
