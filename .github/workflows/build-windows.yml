@@ -1,23 +1,22 @@
 name: Build Windows
 
 on:
-  # CI cost policy: ONLY fires on pull requests + tag pushes.
-  # No branch-push trigger — local builds for iteration; open a draft
-  # PR to get CI feedback before review.
-  #
-  # Cost-saver combo (see CLAUDE.md):
-  # - Drafts skip CI (job-level `!github.event.pull_request.draft` guard).
-  #   Iterate as a draft; CI fires when you mark Ready for review.
+  # Public-repo CI policy: fire freely. CI is free for public repos on
+  # GitHub-hosted runners, so we optimize for contributor experience
+  # rather than minute-burn:
+  # - Drafts run CI too. Contributors get fast feedback without the
+  #   Ready-for-review handshake.
+  # - Push to main fires the workflow as a sanity check (catches the
+  #   rare admin-bypass merge that lands red).
   # - Doc-only PRs are detected by DetectChanges (`docs_only` output);
-  #   the heavy steps inside Runtime + test-app jobs skip when true,
-  #   but the workflow still fires + Runtime still reports a status so
-  #   branch protection's required-status-check on `Runtime` is
-  #   satisfied. (The naive trigger-level `paths-ignore` would block
-  #   doc-only PRs forever once the check is required — see
-  #   reference_org_protection_state.md.)
+  #   the heavy steps skip when true, but the workflow still fires and
+  #   Runtime still reports a status so branch protection's required-
+  #   status-check on `Runtime` is satisfied. Saves wall-clock time +
+  #   keeps logs clean even if not money.
   # - Rapid pushes to a PR cancel the in-progress run; only the latest
   #   commit's CI completes (concurrency group below).
   push:
+    branches: [main]
     tags:
       - 'v*'
   pull_request: {}
@@ -33,7 +32,6 @@ permissions:
 
 jobs:
   DetectChanges:
-    if: (github.event_name != 'pull_request' || !github.event.pull_request.draft)
     runs-on: ubuntu-latest
     outputs:
       test_apps_changed: ${{ steps.filter.outputs.test_apps }}
@@ -79,13 +77,10 @@ jobs:
           echo "Detected test_apps_changed=$(grep ^test_apps= "$GITHUB_OUTPUT" | cut -d= -f2) docs_only=$(grep ^docs_only= "$GITHUB_OUTPUT" | cut -d= -f2)"
 
   Runtime:
-    # Drafts skip CI; non-draft fork PRs run the build (SR SDK is fetched from
-    # upstream's release page — see the Download SR SDK step).
-    # Always runs on non-draft PRs so it can report a status check
-    # (branch protection requires this); heavy steps below skip when
-    # DetectChanges flagged the PR as docs_only.
+    # Always runs on PRs (drafts included) and main pushes so it can
+    # report a status check; heavy steps below skip when DetectChanges
+    # flagged the PR as docs_only. Free CI for public repos.
     needs: DetectChanges
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: windows-2022
 
     env:
@@ -223,7 +218,7 @@ jobs:
 
   # D3D11 test app with XR_EXT_win32_window_binding (app provides window handle)
   TestAppCubeHandleD3D11:
-    if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.DetectChanges.outputs.test_apps_changed == 'true'
+    if: needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
     needs: [Runtime, DetectChanges]  # Wait for runtime build to get artifacts
 
@@ -325,7 +320,7 @@ jobs:
 
   # D3D11 hosted test app - Standard OpenXR app (runtime creates window)
   TestAppCubeHostedD3D11:
-    if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.DetectChanges.outputs.test_apps_changed == 'true'
+    if: needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
     needs: [Runtime, DetectChanges]
 
@@ -387,7 +382,7 @@ jobs:
 
   # D3D12 test app with XR_EXT_win32_window_binding
   TestAppCubeHandleD3D12:
-    if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.DetectChanges.outputs.test_apps_changed == 'true'
+    if: needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
     needs: [Runtime, DetectChanges]
 
@@ -449,7 +444,7 @@ jobs:
 
   # OpenGL test app with XR_EXT_win32_window_binding
   TestAppCubeHandleGL:
-    if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.DetectChanges.outputs.test_apps_changed == 'true'
+    if: needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
     needs: [Runtime, DetectChanges]
 
@@ -511,7 +506,7 @@ jobs:
 
   # Vulkan test app with XR_EXT_win32_window_binding (requires Vulkan SDK)
   TestAppCubeHandleVK:
-    if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.DetectChanges.outputs.test_apps_changed == 'true'
+    if: needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
     needs: [Runtime, DetectChanges]
 
@@ -579,7 +574,7 @@ jobs:
 
   # 3D Gaussian Splatting Vulkan demo (requires Vulkan SDK, uses FetchContent for 3DGS.cpp)
   TestAppGaussianSplattingVK:
-    if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.DetectChanges.outputs.test_apps_changed == 'true'
+    if: needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
     needs: [Runtime, DetectChanges]
 
@@ -649,7 +644,7 @@ jobs:
 
   # Spatial OS demo app (multi-layer war room)
   TestAppSpatialOS:
-    if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.DetectChanges.outputs.test_apps_changed == 'true'
+    if: needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
     needs: [Runtime, DetectChanges]
 
@@ -711,7 +706,7 @@ jobs:
 
   # D3D11 texture test app (offscreen shared texture mode)
   TestAppCubeTextureD3D11:
-    if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.DetectChanges.outputs.test_apps_changed == 'true'
+    if: needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
     needs: [Runtime, DetectChanges]
 
@@ -765,7 +760,7 @@ jobs:
 
   # D3D12 shared texture test app
   TestAppCubeTextureD3D12:
-    if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.DetectChanges.outputs.test_apps_changed == 'true'
+    if: needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
     needs: [Runtime, DetectChanges]
 
@@ -819,7 +814,7 @@ jobs:
 
   # D3D11 legacy hosted test app (no XR_EXT_display_info)
   TestAppCubeHostedLegacyD3D11:
-    if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.DetectChanges.outputs.test_apps_changed == 'true'
+    if: needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
     needs: [Runtime, DetectChanges]
 
@@ -881,7 +876,7 @@ jobs:
 
   # D3D12 legacy hosted test app (no XR_EXT_display_info)
   TestAppCubeHostedLegacyD3D12:
-    if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.DetectChanges.outputs.test_apps_changed == 'true'
+    if: needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
     needs: [Runtime, DetectChanges]
 
@@ -939,7 +934,7 @@ jobs:
 
   # Vulkan legacy hosted test app (no XR_EXT_display_info)
   TestAppCubeHostedLegacyVK:
-    if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.DetectChanges.outputs.test_apps_changed == 'true'
+    if: needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
     needs: [Runtime, DetectChanges]
 
@@ -1003,7 +998,7 @@ jobs:
 
   # OpenGL legacy hosted test app (no XR_EXT_display_info)
   TestAppCubeHostedLegacyGL:
-    if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.DetectChanges.outputs.test_apps_changed == 'true'
+    if: needs.DetectChanges.outputs.test_apps_changed == 'true'
     runs-on: windows-2022
     needs: [Runtime, DetectChanges]
 
@@ -1055,7 +1050,7 @@ jobs:
 
   # Bundle all test apps into a single artifact with per-app subfolders
   BundleTestApps:
-    if: (github.event_name != 'pull_request' || !github.event.pull_request.draft) && !cancelled() && needs.DetectChanges.outputs.test_apps_changed == 'true' && (github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
+    if: ${{ !cancelled() && needs.DetectChanges.outputs.test_apps_changed == 'true' && (github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')) }}
     runs-on: ubuntu-latest
     needs: [DetectChanges, TestAppCubeHandleD3D11, TestAppCubeHostedD3D11, TestAppCubeHandleD3D12, TestAppCubeHandleGL, TestAppCubeHandleVK, TestAppGaussianSplattingVK, TestAppSpatialOS, TestAppCubeTextureD3D11, TestAppCubeTextureD3D12, TestAppCubeHostedLegacyD3D11, TestAppCubeHostedLegacyD3D12, TestAppCubeHostedLegacyVK, TestAppCubeHostedLegacyGL]
 

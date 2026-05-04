@@ -6,6 +6,10 @@
 
 # DisplayXR Runtime
 
+[![Build Windows](https://github.com/DisplayXR/displayxr-runtime/actions/workflows/build-windows.yml/badge.svg)](https://github.com/DisplayXR/displayxr-runtime/actions/workflows/build-windows.yml)
+[![Build macOS](https://github.com/DisplayXR/displayxr-runtime/actions/workflows/build-macos.yml/badge.svg)](https://github.com/DisplayXR/displayxr-runtime/actions/workflows/build-macos.yml)
+[![License: BSL-1.0](https://img.shields.io/badge/License-BSL--1.0-blue.svg)](LICENSE)
+
 An open-source [OpenXR](https://www.khronos.org/openxr/) runtime for spatial displays — 3D monitors and laptops with tracked stereo and multiview lightfield display technology.
 
 Built on [Monado](https://monado.freedesktop.org/) by Collabora, DisplayXR strips away headset-centric infrastructure (34 VR drivers, Vulkan server compositor, tracking subsystems) and replaces it with a lightweight runtime purpose-built for 3D displays: ~150 files, 3 drivers, native compositors for every graphics API.

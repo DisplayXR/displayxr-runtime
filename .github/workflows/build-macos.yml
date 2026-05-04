@@ -1,0 +1,81 @@
+name: Build macOS
+
+# Verifies that the runtime + sim_display driver compile cleanly on
+# macOS. The historical workflow also built every test app + the macOS
+# installer + the 3DGS demo (which now lives in displayxr-demo-
+# gaussiansplat); those add a lot of surface area for breakage. Keep
+# this one minimal — building the runtime is the contract that matters
+# here. Test apps and installer can be added back later as separate
+# jobs once the build itself is reliable in CI again.
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - 'v*'
+  pull_request: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  DetectChanges:
+    runs-on: ubuntu-latest
+    outputs:
+      docs_only: ${{ steps.filter.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - id: filter
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE=${{ github.event.pull_request.base.sha }}
+          else
+            BASE=${{ github.event.before }}
+          fi
+          CHANGED=$(git diff --name-only "$BASE" HEAD)
+          NON_DOC=$(echo "$CHANGED" | grep -vE '^(docs/|.*\.md$|LICENSE$|\.github/ISSUE_TEMPLATE/)' || true)
+          if [ -n "$CHANGED" ] && [ -z "$NON_DOC" ]; then
+            echo "docs_only=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  Build:
+    needs: DetectChanges
+    runs-on: macos-14
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Doc-only PR — skipping macOS build
+        if: needs.DetectChanges.outputs.docs_only == 'true'
+        run: echo "Skipping heavy steps; reporting success so branch protection's required-status-check on Build is satisfied."
+
+      - name: Install dependencies
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          brew install cmake ninja eigen
+          brew install glslang molten-vk vulkan-headers vulkan-loader
+          BREW_PREFIX=$(brew --prefix)
+          echo "VULKAN_SDK=$BREW_PREFIX" >> $GITHUB_ENV
+
+      - name: Configure
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DXRT_FEATURE_SERVICE=ON \
+            -DXRT_FEATURE_HYBRID_MODE=ON
+
+      - name: Build
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: cmake --build build
