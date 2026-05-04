@@ -21,9 +21,12 @@
 #include "oxr_mcp_tools.h"
 #include "oxr_objects.h"
 
-#include "util/u_mcp_server.h"
-#include "util/u_mcp_transport.h"
-#include "util/u_mcp_capture.h"
+#include <displayxr_mcp/mcp_server.h>
+#include <displayxr_mcp/mcp_transport.h>
+#include <displayxr_mcp/mcp_capture.h>
+#include <displayxr_mcp/mcp_log_ring.h>
+
+#include "util/u_logging.h"
 
 #include "os/os_time.h"
 
@@ -154,7 +157,7 @@ tool_list_sessions(const cJSON *params, void *userdata)
 	struct oxr_session *sess = lock_session();
 	if (sess != NULL) {
 		cJSON *e = cJSON_CreateObject();
-		cJSON_AddNumberToObject(e, "pid", (double)u_mcp_self_pid());
+		cJSON_AddNumberToObject(e, "pid", (double)mcp_self_pid());
 		// Phase A is single-session; display_id is 0.
 		cJSON_AddNumberToObject(e, "display_id", 0);
 		cJSON_AddStringToObject(e, "api", gfx_api_name(sess));
@@ -168,7 +171,7 @@ tool_list_sessions(const cJSON *params, void *userdata)
 	return result;
 }
 
-static const struct u_mcp_tool TOOL_LIST_SESSIONS = {
+static const struct mcp_tool TOOL_LIST_SESSIONS = {
     .name = "list_sessions",
     .description = "List MCP-introspectable DisplayXR sessions visible from this process.",
     .input_schema_json = "{\"type\":\"object\",\"properties\":{}}",
@@ -237,7 +240,7 @@ tool_get_display_info(const cJSON *params, void *userdata)
 	return r;
 }
 
-static const struct u_mcp_tool TOOL_GET_DISPLAY_INFO = {
+static const struct mcp_tool TOOL_GET_DISPLAY_INFO = {
     .name = "get_display_info",
     .description =
         "Return the DisplayXR display dimensions, panel size, atlas size, nominal viewer position, "
@@ -272,7 +275,7 @@ tool_get_runtime_metrics(const cJSON *params, void *userdata)
 	return r;
 }
 
-static const struct u_mcp_tool TOOL_GET_RUNTIME_METRICS = {
+static const struct mcp_tool TOOL_GET_RUNTIME_METRICS = {
     .name = "get_runtime_metrics",
     .description =
         "Return cheap runtime counters: frames begun/waited, compositor visibility/focus, "
@@ -393,7 +396,7 @@ tool_get_kooima_params(const cJSON *params, void *userdata)
 	return r;
 }
 
-static const struct u_mcp_tool TOOL_GET_KOOIMA_PARAMS = {
+static const struct mcp_tool TOOL_GET_KOOIMA_PARAMS = {
     .name = "get_kooima_params",
     .description =
         "Return the runtime's per-view recommended projection (pose + FoV) as computed from "
@@ -443,7 +446,7 @@ tool_get_submitted_projection(const cJSON *params, void *userdata)
 	return r;
 }
 
-static const struct u_mcp_tool TOOL_GET_SUBMITTED_PROJECTION = {
+static const struct mcp_tool TOOL_GET_SUBMITTED_PROJECTION = {
     .name = "get_submitted_projection",
     .description =
         "Return the per-view projection the app submitted via XrCompositionLayerProjectionView "
@@ -682,7 +685,7 @@ tool_capture_frame(const cJSON *params, void *userdata)
 	}
 
 	char path[256];
-	long pid = (long)u_mcp_self_pid();
+	long pid = (long)mcp_self_pid();
 	struct oxr_session *sess = lock_session();
 	int64_t begun = sess ? sess->frame_id.begun : 0;
 	uint64_t seq = begun >= 0 ? (uint64_t)begun : 0;
@@ -709,7 +712,7 @@ tool_capture_frame(const cJSON *params, void *userdata)
 	return r;
 }
 
-static const struct u_mcp_tool TOOL_CAPTURE_FRAME = {
+static const struct mcp_tool TOOL_CAPTURE_FRAME = {
     .name = "capture_frame",
     .description =
         "Capture the compositor's most recent composited frame — the content region of the "
@@ -719,7 +722,7 @@ static const struct u_mcp_tool TOOL_CAPTURE_FRAME = {
     .fn = tool_capture_frame,
 };
 
-static const struct u_mcp_tool TOOL_DIFF_PROJECTION = {
+static const struct mcp_tool TOOL_DIFF_PROJECTION = {
     .name = "diff_projection",
     .description =
         "Compare the runtime's recommended per-view projection against the app's declared "
@@ -736,7 +739,7 @@ static void
 notify_capture_install(void *req)
 {
 	oxr_mcp_tools_set_capture_handler(
-	    (oxr_mcp_capture_fn)u_mcp_capture_blocking_handler, req);
+	    (oxr_mcp_capture_fn)mcp_capture_blocking_handler, req);
 }
 
 static void
@@ -746,17 +749,51 @@ notify_capture_uninstall(void *req)
 	oxr_mcp_tools_set_capture_handler(NULL, NULL);
 }
 
+// Bridge u_logging → mcp_log_ring. The displayxr_mcp framework owns the
+// ring buffer but does not hook any logging system itself — embedders
+// install a sink that pushes lines into it. tail_log readers see what
+// the runtime's U_LOG_* macros emit.
+static enum mcp_log_level
+xlate_log_level(enum u_logging_level level)
+{
+	switch (level) {
+	case U_LOGGING_TRACE: return MCP_LOG_LEVEL_TRACE;
+	case U_LOGGING_DEBUG: return MCP_LOG_LEVEL_DEBUG;
+	case U_LOGGING_INFO: return MCP_LOG_LEVEL_INFO;
+	case U_LOGGING_WARN: return MCP_LOG_LEVEL_WARN;
+	case U_LOGGING_ERROR: return MCP_LOG_LEVEL_ERROR;
+	default: return MCP_LOG_LEVEL_RAW;
+	}
+}
+
+static void
+oxr_mcp_log_sink(const char *file,
+                 int line,
+                 const char *func,
+                 enum u_logging_level level,
+                 const char *fmt,
+                 va_list args,
+                 void *data)
+{
+	(void)file;
+	(void)line;
+	(void)func;
+	(void)data;
+	mcp_log_ring_append(xlate_log_level(level), fmt, args);
+}
+
 void
 oxr_mcp_tools_register_all(void)
 {
-	u_mcp_server_register_tool(&TOOL_LIST_SESSIONS);
-	u_mcp_server_register_tool(&TOOL_GET_DISPLAY_INFO);
-	u_mcp_server_register_tool(&TOOL_GET_RUNTIME_METRICS);
-	u_mcp_server_register_tool(&TOOL_GET_KOOIMA_PARAMS);
-	u_mcp_server_register_tool(&TOOL_GET_SUBMITTED_PROJECTION);
-	u_mcp_server_register_tool(&TOOL_DIFF_PROJECTION);
-	u_mcp_server_register_tool(&TOOL_CAPTURE_FRAME);
-	u_mcp_capture_set_notify(notify_capture_install, notify_capture_uninstall);
+	mcp_server_register_tool(&TOOL_LIST_SESSIONS);
+	mcp_server_register_tool(&TOOL_GET_DISPLAY_INFO);
+	mcp_server_register_tool(&TOOL_GET_RUNTIME_METRICS);
+	mcp_server_register_tool(&TOOL_GET_KOOIMA_PARAMS);
+	mcp_server_register_tool(&TOOL_GET_SUBMITTED_PROJECTION);
+	mcp_server_register_tool(&TOOL_DIFF_PROJECTION);
+	mcp_server_register_tool(&TOOL_CAPTURE_FRAME);
+	mcp_capture_set_notify(notify_capture_install, notify_capture_uninstall);
+	u_log_set_sink(oxr_mcp_log_sink, NULL);
 }
 
 void

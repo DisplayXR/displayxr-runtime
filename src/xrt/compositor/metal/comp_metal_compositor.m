@@ -40,7 +40,7 @@
 #include "util/u_hud.h"
 #include "util/u_tiling.h"
 #include "util/u_canvas.h"
-#include "util/u_mcp_capture.h"
+#include <displayxr_mcp/mcp_capture.h>
 
 // STB_IMAGE_WRITE_STATIC scopes all stbi_write_* to this TU so linking
 // alongside other compositors that also implement stb doesn't produce
@@ -223,7 +223,7 @@ struct comp_metal_compositor
 	struct os_mutex mutex;
 
 	//! MCP capture request box (polled at end of layer_commit).
-	struct u_mcp_capture_request mcp_capture;
+	struct mcp_capture_request mcp_capture;
 };
 
 /*
@@ -1266,13 +1266,13 @@ metal_compositor_render_hud(struct comp_metal_compositor *c, float dt,
 static void
 metal_compositor_service_mcp_capture(struct comp_metal_compositor *c, id<MTLCommandBuffer> render_cmd_buf)
 {
-	char path[U_MCP_CAPTURE_PATH_MAX];
-	if (!u_mcp_capture_poll(&c->mcp_capture, path)) {
+	char path[MCP_CAPTURE_PATH_MAX];
+	if (!mcp_capture_poll(&c->mcp_capture, path)) {
 		return;
 	}
 	if (c->atlas_texture == nil || c->tile_columns == 0 || c->tile_rows == 0 ||
 	    c->view_width == 0 || c->view_height == 0) {
-		u_mcp_capture_complete(&c->mcp_capture, false);
+		mcp_capture_complete(&c->mcp_capture, false);
 		return;
 	}
 
@@ -1293,7 +1293,7 @@ metal_compositor_service_mcp_capture(struct comp_metal_compositor *c, id<MTLComm
 		id<MTLBuffer> staging = [c->device newBufferWithLength:buf_bytes
 		                                               options:MTLResourceStorageModeShared];
 		if (staging == nil) {
-			u_mcp_capture_complete(&c->mcp_capture, false);
+			mcp_capture_complete(&c->mcp_capture, false);
 			return;
 		}
 
@@ -1320,7 +1320,7 @@ metal_compositor_service_mcp_capture(struct comp_metal_compositor *c, id<MTLComm
 		uint8_t *bgra = (uint8_t *)staging.contents;
 		uint8_t *rgba = malloc(buf_bytes);
 		if (rgba == NULL) {
-			u_mcp_capture_complete(&c->mcp_capture, false);
+			mcp_capture_complete(&c->mcp_capture, false);
 			return;
 		}
 		for (size_t i = 0; i < buf_bytes; i += 4) {
@@ -1331,7 +1331,7 @@ metal_compositor_service_mcp_capture(struct comp_metal_compositor *c, id<MTLComm
 		}
 		bool ok = stbi_write_png(path, (int)content_w, (int)content_h, 4, rgba, (int)row_pitch) != 0;
 		free(rgba);
-		u_mcp_capture_complete(&c->mcp_capture, ok);
+		mcp_capture_complete(&c->mcp_capture, ok);
 	}
 }
 
@@ -1789,8 +1789,8 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 	// Uninstall the MCP capture hook before we drop any GPU resources —
 	// the MCP thread can no longer request a readback against us after
 	// this returns.
-	u_mcp_capture_uninstall();
-	u_mcp_capture_fini(&c->mcp_capture);
+	mcp_capture_uninstall();
+	mcp_capture_fini(&c->mcp_capture);
 
 	// Wrap teardown in @autoreleasepool so autoreleased Metal objects
 	// (drawables, command buffers, textures) are drained immediately
@@ -1939,8 +1939,8 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 		return XRT_ERROR_ALLOCATION;
 	}
 
-	u_mcp_capture_init(&c->mcp_capture);
-	u_mcp_capture_install(&c->mcp_capture);
+	mcp_capture_init(&c->mcp_capture);
+	mcp_capture_install(&c->mcp_capture);
 
 	int ret = os_mutex_init(&c->mutex);
 	if (ret != 0) {

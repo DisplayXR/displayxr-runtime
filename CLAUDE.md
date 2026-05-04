@@ -16,7 +16,7 @@ See the [milestone tracker](https://github.com/DisplayXR/displayxr-runtime/miles
 - **M4: Display Extensions** — Done. `XR_EXT_display_info` header frozen at v12 (#114 closed). Events (#3), multiview math (#38), eye tracking modes (#81), docs (#66) all complete. Vendor-initiated transition detection (#123) shipped via `get_hardware_3d_state()` DP vtable method. Remaining vendor work (MANUAL eye tracking mode) blocked on Leia SDK.
 - **M5: Interface Standardization** — #45, #46, #47 open.
 - **M6: Spatial Shell** — Done (Windows). Phases 0–8 shipped: multi-compositor, spatial windowing, window chrome, layout presets, 2D app capture, focus-adaptive 2D/3D mode, app launcher, graceful exit, 3D capture (Ctrl+Shift+C). macOS port deferred.
-- **MCP (AI-Native Control)** — Phase A (handle-app introspection) and Phase B (service-mode shell tools) merged. Tools: `get_kooima_params`, `capture_frame`, `list_windows`, `get/set_window_pose`, `save/load_workspace`. (Phase 2.G removed `apply_layout_preset` from the runtime — controllers now express layouts as a sequence of per-client `set_window_pose` calls.) Spec: `docs/roadmap/mcp-spec-v0.2.md`.
+- **MCP (AI-Native Control)** — Framework lives in [`DisplayXR/displayxr-mcp`](https://github.com/DisplayXR/displayxr-mcp) (extracted 2026-05). The runtime consumes it via CMake `FetchContent` (pinned at `v0.2.0`) and registers Phase A handle-app introspection tools (`list_sessions`, `get_display_info`, `get_runtime_metrics`, `get_kooima_params`, `get_submitted_projection`, `diff_projection`, `capture_frame`, `tail_log`) inside each app's `libopenxr_displayxr` process. Phase B (workspace control: `list_windows`, `get/set_window_pose`, `set_focus`, `save/load_workspace`, `request_client_exit`) moved to `displayxr-shell-pvt`, which hosts an MCP server inside `displayxr-shell.exe` and wraps the public OpenXR workspace extension calls. The runtime no longer hosts an MCP endpoint in `displayxr-service`. Spec: [`displayxr-mcp/docs/mcp-spec.md`](https://github.com/DisplayXR/displayxr-mcp/blob/main/docs/mcp-spec.md).
 
 ### Architecture
 
@@ -107,7 +107,7 @@ orchestrator to discover. The runtime owns no specific workspace app
 ### Windows Compile-Check on macOS / Linux (MinGW-w64)
 ```bash
 brew install mingw-w64        # one-time
-./scripts/build-mingw-check.sh                # default targets: aux_util mcp_adapter
+./scripts/build-mingw-check.sh                # default targets: aux_util displayxr_mcp
 ./scripts/build-mingw-check.sh aux_util drv_qwerty  # custom target list
 ```
 Cross-compiles a curated subset against MinGW-w64 to catch Win32-API typos, missing `#ifdef XRT_OS_WINDOWS` guards, and wrong-platform symbols **before pushing to CI**. Mirrors the displayxr-unity plugin's `native~/build-win.sh` pattern.

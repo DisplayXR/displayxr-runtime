@@ -33,7 +33,7 @@
 #include "util/u_canvas.h"
 #include "util/u_time.h"
 #include "util/u_hud.h"
-#include "util/u_mcp_capture.h"
+#include <displayxr_mcp/mcp_capture.h>
 
 // STB_IMAGE_WRITE_STATIC scopes the stbi_write_* symbols to this TU so
 // we can safely implement stb in multiple compositors that link into
@@ -291,7 +291,7 @@ struct comp_gl_compositor
 	struct u_canvas_rect canvas;
 
 	//! MCP capture_frame request box (serviced at end of layer_commit).
-	struct u_mcp_capture_request mcp_capture;
+	struct mcp_capture_request mcp_capture;
 };
 
 static inline struct comp_gl_compositor *
@@ -968,13 +968,13 @@ gl_crop_and_process_dp(struct comp_gl_compositor *c,
 static void
 gl_compositor_service_mcp_capture(struct comp_gl_compositor *c)
 {
-	char path[U_MCP_CAPTURE_PATH_MAX];
-	if (!u_mcp_capture_poll(&c->mcp_capture, path)) {
+	char path[MCP_CAPTURE_PATH_MAX];
+	if (!mcp_capture_poll(&c->mcp_capture, path)) {
 		return;
 	}
 	if (c->atlas_texture == 0 || c->tile_columns == 0 || c->tile_rows == 0 ||
 	    c->view_width == 0 || c->view_height == 0) {
-		u_mcp_capture_complete(&c->mcp_capture, false);
+		mcp_capture_complete(&c->mcp_capture, false);
 		return;
 	}
 
@@ -990,7 +990,7 @@ gl_compositor_service_mcp_capture(struct comp_gl_compositor *c)
 	if (bottom_up == NULL || top_down == NULL) {
 		free(bottom_up);
 		free(top_down);
-		u_mcp_capture_complete(&c->mcp_capture, false);
+		mcp_capture_complete(&c->mcp_capture, false);
 		return;
 	}
 
@@ -1020,7 +1020,7 @@ gl_compositor_service_mcp_capture(struct comp_gl_compositor *c)
 
 	bool ok = stbi_write_png(path, (int)content_w, (int)content_h, 4, top_down, (int)row_pitch) != 0;
 	free(top_down);
-	u_mcp_capture_complete(&c->mcp_capture, ok);
+	mcp_capture_complete(&c->mcp_capture, ok);
 }
 
 
@@ -1576,8 +1576,8 @@ gl_compositor_destroy(struct xrt_compositor *xc)
 {
 	struct comp_gl_compositor *c = gl_comp(xc);
 
-	u_mcp_capture_uninstall();
-	u_mcp_capture_fini(&c->mcp_capture);
+	mcp_capture_uninstall();
+	mcp_capture_fini(&c->mcp_capture);
 
 #ifdef XRT_OS_WINDOWS
 	// Make compositor context current for GL resource cleanup
@@ -2074,8 +2074,8 @@ comp_gl_compositor_create(struct xrt_device *xdev,
 	struct comp_gl_compositor *c = U_TYPED_CALLOC(struct comp_gl_compositor);
 	c->xdev = xdev;
 
-	u_mcp_capture_init(&c->mcp_capture);
-	u_mcp_capture_install(&c->mcp_capture);
+	mcp_capture_init(&c->mcp_capture);
+	mcp_capture_install(&c->mcp_capture);
 
 	// Get window dimensions
 	uint32_t width = GL_DEFAULT_WIDTH;

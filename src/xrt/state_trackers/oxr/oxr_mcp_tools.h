@@ -4,7 +4,7 @@
  * @file
  * @brief  MCP tool implementations that read OpenXR state tracker state.
  *         Registered from @ref oxr_instance_create alongside
- *         @ref u_mcp_server_maybe_start.
+ *         @ref mcp_server_maybe_start.
  * @ingroup oxr_main
  */
 

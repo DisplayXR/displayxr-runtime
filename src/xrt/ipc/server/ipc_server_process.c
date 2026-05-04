@@ -34,7 +34,6 @@
 #include "shared/ipc_shmem.h"
 #include "server/ipc_server.h"
 #include "server/ipc_server_interface.h"
-#include "server/ipc_mcp_tools.h"
 
 #include <stdlib.h>
 #include <stdbool.h>
@@ -1091,10 +1090,9 @@ ipc_server_main(int argc, char **argv, const struct ipc_server_main_info *ismi)
 		U_LOG_IFL_I(log_level, "Workspace mode propagated to system compositor");
 	}
 
-	// Register MCP workspace-scope tools against the already-running server
-	// (started from service/main.c before ipc_server_main). If
-	// DISPLAYXR_MCP was unset, the tool registry is harmless scaffolding.
-	ipc_mcp_tools_register(s);
+	// Phase B (workspace MCP tools) moved to displayxr-shell-pvt in
+	// 2026-05 — the shell hosts the MCP server itself and calls back
+	// into the runtime via the public OpenXR workspace extensions.
 
 	// Start the debug UI now (if enabled).
 	u_debug_gui_start(s->debug_gui, s->xinst, s->xsysd);

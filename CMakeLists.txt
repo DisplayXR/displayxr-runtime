@@ -110,6 +110,24 @@ find_package(JPEG MODULE)
 find_package(SDL2 CONFIG)
 find_package(ZLIB MODULE)
 find_package(cJSON MODULE)
+
+# displayxr_mcp — MCP server framework + stdio↔socket adapter. Lives in
+# its own repo so the spec, transport, and tool registry version
+# independently from the runtime, and so workspace controllers (incl.
+# displayxr-shell) can pick up the same surface without re-vendoring.
+include(FetchContent)
+FetchContent_Declare(displayxr_mcp
+    GIT_REPOSITORY https://github.com/DisplayXR/displayxr-mcp.git
+    GIT_TAG v0.2.0)
+# Build the stdio↔socket adapter alongside the lib so the Phase A test
+# scripts under tests/mcp/ can find a binary at a known path during dev
+# (build/_deps/displayxr_mcp-build/displayxr-mcp). Production
+# installations get the adapter from the separate displayxr-mcp package
+# instead, so suppress install rules here.
+set(DISPLAYXR_MCP_BUILD_ADAPTER ON CACHE BOOL "" FORCE)
+set(DISPLAYXR_MCP_INSTALL OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(displayxr_mcp)
+
 if(NOT WIN32)
 	find_package(EGL MODULE)
 	find_package(Systemd MODULE)

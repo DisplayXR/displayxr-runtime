@@ -69,18 +69,6 @@ add_library(
 	u_live_stats.h
 	u_logging.c
 	u_logging.h
-	u_mcp_audit.c
-	u_mcp_audit.h
-	u_mcp_allowlist.c
-	u_mcp_allowlist.h
-	u_mcp_capture.c
-	u_mcp_capture.h
-	u_mcp_log_ring.c
-	u_mcp_log_ring.h
-	u_mcp_server.c
-	u_mcp_server.h
-	u_mcp_transport.c
-	u_mcp_transport.h
 	u_file_logging.c
 	u_file_logging.h
 	u_metrics.c
@@ -166,6 +154,10 @@ endif()
 if(XRT_HAVE_LINUX OR ANDROID)
 	target_sources(aux_util PRIVATE u_linux.c u_linux.h)
 endif()
+
+# Make the displayxr_mcp framework available to every aux_util consumer
+# (compositors use mcp_capture, oxr uses mcp_server / mcp_log_ring).
+target_link_libraries(aux_util PUBLIC displayxr_mcp::mcp)
 
 # CoreFoundation needed for CFRetain/CFRelease in u_handles.c (Metal handle ref counting).
 if(APPLE)

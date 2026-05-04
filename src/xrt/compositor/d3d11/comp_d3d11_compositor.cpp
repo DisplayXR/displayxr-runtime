@@ -35,7 +35,7 @@
 #include "xrt/xrt_display_processor_d3d11.h"
 
 #include "util/u_hud.h"
-#include "util/u_mcp_capture.h"
+#include <displayxr_mcp/mcp_capture.h>
 
 // STB_IMAGE_WRITE_STATIC scopes stbi_write_* symbols to this TU so
 // we don't clash with comp_d3d11_service.cpp's implementation (both
@@ -228,7 +228,7 @@ struct comp_d3d11_compositor
 	std::mutex mutex;
 
 	//! MCP capture_frame request box (serviced at end of layer_commit).
-	struct u_mcp_capture_request mcp_capture;
+	struct mcp_capture_request mcp_capture;
 };
 
 /*
@@ -890,15 +890,15 @@ d3d11_crop_atlas_for_dp(struct comp_d3d11_compositor *c,
 static void
 d3d11_compositor_service_mcp_capture(struct comp_d3d11_compositor *c)
 {
-	char path[U_MCP_CAPTURE_PATH_MAX];
-	if (!u_mcp_capture_poll(&c->mcp_capture, path)) {
+	char path[MCP_CAPTURE_PATH_MAX];
+	if (!mcp_capture_poll(&c->mcp_capture, path)) {
 		return;
 	}
 
 	ID3D11Texture2D *atlas_tex = static_cast<ID3D11Texture2D *>(
 	    comp_d3d11_renderer_get_atlas_texture(c->renderer));
 	if (atlas_tex == nullptr || c->renderer == nullptr) {
-		u_mcp_capture_complete(&c->mcp_capture, false);
+		mcp_capture_complete(&c->mcp_capture, false);
 		return;
 	}
 
@@ -907,7 +907,7 @@ d3d11_compositor_service_mcp_capture(struct comp_d3d11_compositor *c)
 	uint32_t view_w = 0, view_h = 0;
 	comp_d3d11_renderer_get_view_dimensions(c->renderer, &view_w, &view_h);
 	if (tile_columns == 0 || tile_rows == 0 || view_w == 0 || view_h == 0) {
-		u_mcp_capture_complete(&c->mcp_capture, false);
+		mcp_capture_complete(&c->mcp_capture, false);
 		return;
 	}
 
@@ -929,7 +929,7 @@ d3d11_compositor_service_mcp_capture(struct comp_d3d11_compositor *c)
 
 	ID3D11Texture2D *staging = nullptr;
 	if (FAILED(c->device->CreateTexture2D(&sd, nullptr, &staging)) || staging == nullptr) {
-		u_mcp_capture_complete(&c->mcp_capture, false);
+		mcp_capture_complete(&c->mcp_capture, false);
 		return;
 	}
 
@@ -939,7 +939,7 @@ d3d11_compositor_service_mcp_capture(struct comp_d3d11_compositor *c)
 	D3D11_MAPPED_SUBRESOURCE m = {};
 	if (FAILED(c->context->Map(staging, 0, D3D11_MAP_READ, 0, &m))) {
 		staging->Release();
-		u_mcp_capture_complete(&c->mcp_capture, false);
+		mcp_capture_complete(&c->mcp_capture, false);
 		return;
 	}
 
@@ -949,7 +949,7 @@ d3d11_compositor_service_mcp_capture(struct comp_d3d11_compositor *c)
 	c->context->Unmap(staging, 0);
 	staging->Release();
 
-	u_mcp_capture_complete(&c->mcp_capture, ok);
+	mcp_capture_complete(&c->mcp_capture, ok);
 }
 
 static xrt_result_t
@@ -1631,8 +1631,8 @@ d3d11_compositor_destroy(struct xrt_compositor *xc)
 
 	U_LOG_I("Destroying D3D11 compositor");
 
-	u_mcp_capture_uninstall();
-	u_mcp_capture_fini(&c->mcp_capture);
+	mcp_capture_uninstall();
+	mcp_capture_fini(&c->mcp_capture);
 
 #ifdef XRT_FEATURE_DEBUG_GUI
 	// Stop debug GUI first (before destroying resources it may reference)
@@ -1736,8 +1736,8 @@ comp_d3d11_compositor_create(struct xrt_device *xdev,
 
 	c->xdev = xdev;
 
-	u_mcp_capture_init(&c->mcp_capture);
-	u_mcp_capture_install(&c->mcp_capture);
+	mcp_capture_init(&c->mcp_capture);
+	mcp_capture_install(&c->mcp_capture);
 	c->own_window = nullptr;
 	c->owns_window = false;
 	c->app_hwnd = nullptr;

@@ -20,9 +20,6 @@ if(XRT_MODULE_MONADO_CLI)
 	add_subdirectory(cli)
 endif()
 
-# MCP adapter (Phase A): stdio ↔ per-PID-socket/pipe bridge.
-add_subdirectory(mcp_adapter)
-
 if(XRT_MODULE_MONADO_GUI)
 	add_subdirectory(gui)
 endif()

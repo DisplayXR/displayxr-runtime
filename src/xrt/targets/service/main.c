@@ -14,7 +14,7 @@
 #include "util/u_metrics.h"
 #include "util/u_logging.h"
 #include "util/u_trace_marker.h"
-#include "util/u_mcp_server.h"
+#include <displayxr_mcp/mcp_server.h>
 
 #ifdef XRT_OS_WINDOWS
 #include "util/u_windows.h"
@@ -145,14 +145,12 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 	    .workspace_mode = workspace_mode,
 	};
 
-	// Opt-in MCP server for agent-driven workspace control / debugging.
-	// Gated on DISPLAYXR_MCP env var; binds a well-known "service"
-	// socket so the adapter can discover it by role, not PID.
-	u_mcp_server_maybe_start_named("service");
+	// MCP server moved out of the runtime in 2026-05 — workspace
+	// control surfaces now live in the shell process (or whichever
+	// workspace controller is registered). The service no longer hosts
+	// any MCP endpoint.
 
 	int ret = ipc_server_main(argc, argv, &ismi);
-
-	u_mcp_server_stop();
 
 	u_metrics_close();
 
@@ -191,14 +189,12 @@ main(int argc, char *argv[])
 	    .workspace_mode = workspace_mode,
 	};
 
-	// Opt-in MCP server for agent-driven workspace control / debugging.
-	// Gated on DISPLAYXR_MCP env var; binds a well-known "service"
-	// socket so the adapter can discover it by role, not PID.
-	u_mcp_server_maybe_start_named("service");
+	// MCP server moved out of the runtime in 2026-05 — workspace
+	// control surfaces now live in the shell process (or whichever
+	// workspace controller is registered). The service no longer hosts
+	// any MCP endpoint.
 
 	int ret = ipc_server_main(argc, argv, &ismi);
-
-	u_mcp_server_stop();
 
 	u_metrics_close();
 

@@ -9,7 +9,9 @@
 # under MinGW. Builds a curated subset of targets known to be portable.
 #
 # Usage:  scripts/build-mingw-check.sh [target...]
-# Default targets: aux_util mcp_adapter
+# Default targets: aux_util displayxr_mcp
+# (mcp_adapter moved to the displayxr-mcp repo in 2026-05; the lib
+# itself is fetched via CMake FetchContent and built as displayxr_mcp.)
 
 set -u
 set -o pipefail
@@ -26,7 +28,7 @@ fi
 
 TARGETS=("$@")
 if [[ ${#TARGETS[@]} -eq 0 ]]; then
-	TARGETS=(aux_util mcp_adapter)
+	TARGETS=(aux_util displayxr_mcp)
 fi
 
 echo "=== MinGW-w64 compile check ==="
@@ -37,7 +39,7 @@ if [[ ! -f "$BUILD/CMakeCache.txt" ]]; then
 	# Minimal config — we only need the targets to *compile*, not link.
 	# OpenXR / compositors / IPC require Vulkan + vcpkg deps that aren't
 	# available under MinGW; turn them off and let CMake skip those
-	# subdirectories. Anything we left on (aux_util, mcp_adapter, comp_d3d11)
+	# subdirectories. Anything we left on (aux_util, displayxr_mcp, comp_d3d11)
 	# either has no external deps or is what we want to verify.
 	cmake -B "$BUILD" -G Ninja \
 	    -DCMAKE_TOOLCHAIN_FILE="$ROOT/cmake/toolchain-mingw-w64.cmake" \

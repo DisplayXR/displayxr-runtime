@@ -21,7 +21,7 @@ fi
 cd "$(dirname "$0")/../.."
 ROOT="$(pwd)"
 
-ADAPTER="$ROOT/build/src/xrt/targets/mcp_adapter/displayxr-mcp"
+ADAPTER="$ROOT/build/_deps/displayxr_mcp-build/displayxr-mcp"
 APP="$ROOT/test_apps/cube_handle_metal_macos/build/cube_handle_metal_macos"
 RUNTIME_JSON="$ROOT/build/openxr_displayxr-dev.json"
 

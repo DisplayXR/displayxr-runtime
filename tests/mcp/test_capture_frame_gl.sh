@@ -11,7 +11,7 @@ if [[ "$(uname)" != "Darwin" ]]; then exit 0; fi
 
 cd "$(dirname "$0")/../.."
 ROOT="$(pwd)"
-ADAPTER="$ROOT/build/src/xrt/targets/mcp_adapter/displayxr-mcp"
+ADAPTER="$ROOT/build/_deps/displayxr_mcp-build/displayxr-mcp"
 APP="$ROOT/test_apps/cube_handle_gl_macos/build/cube_handle_gl_macos"
 RUNTIME_JSON="$ROOT/build/openxr_displayxr-dev.json"
 for f in "$ADAPTER" "$APP" "$RUNTIME_JSON"; do

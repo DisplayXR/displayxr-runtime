@@ -41,7 +41,7 @@
 
 #include "util/u_hud.h"
 #include "util/u_tiling.h"
-#include "util/u_mcp_capture.h"
+#include <displayxr_mcp/mcp_capture.h>
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
 #include "qwerty_interface.h"
@@ -465,7 +465,7 @@ struct d3d11_service_system
 	bool cursor_images_loaded = false;
 
 	//! MCP capture_frame cross-thread hand-off (Phase B slice 7).
-	struct u_mcp_capture_request mcp_capture;
+	struct mcp_capture_request mcp_capture;
 
 	//! Multi-compositor control interface for session state management
 	struct xrt_multi_compositor_control xmcc;
@@ -11624,8 +11624,8 @@ system_destroy(struct xrt_system_compositor *xsysc)
 	// are cleaned up in fini_client_render_resources() when each client disconnects.
 	// System only needs to clean up shared resources (device, shaders, etc.)
 
-	u_mcp_capture_uninstall();
-	u_mcp_capture_fini(&sys->mcp_capture);
+	mcp_capture_uninstall();
+	mcp_capture_fini(&sys->mcp_capture);
 
 	sys->dxgi_factory.reset();
 	sys->context.reset();
@@ -12058,8 +12058,8 @@ comp_d3d11_service_create_system(struct xrt_device *xdev,
 	        sys->display_width, sys->display_height,
 	        sys->output_width, sys->output_height, sys->refresh_rate);
 
-	u_mcp_capture_init(&sys->mcp_capture);
-	u_mcp_capture_install(&sys->mcp_capture);
+	mcp_capture_init(&sys->mcp_capture);
+	mcp_capture_install(&sys->mcp_capture);
 
 	*out_xsysc = &sys->base;
 	return XRT_SUCCESS;
@@ -14266,8 +14266,8 @@ comp_d3d11_service_poll_mcp_capture(struct xrt_system_compositor *xsysc)
 		return;
 	}
 
-	char base[U_MCP_CAPTURE_PATH_MAX];
-	if (!u_mcp_capture_poll(&sys->mcp_capture, base)) {
+	char base[MCP_CAPTURE_PATH_MAX];
+	if (!mcp_capture_poll(&sys->mcp_capture, base)) {
 		return;
 	}
 
@@ -14278,7 +14278,7 @@ comp_d3d11_service_poll_mcp_capture(struct xrt_system_compositor *xsysc)
 	// Write per-window metadata JSON.
 	struct d3d11_multi_compositor *mc = sys->multi_comp;
 	if (ok && mc != nullptr) {
-		char path[U_MCP_CAPTURE_PATH_MAX + 32];
+		char path[MCP_CAPTURE_PATH_MAX + 32];
 		snprintf(path, sizeof(path), "%s_windows.json", base);
 		FILE *jf = fopen(path, "wb");
 		if (jf != nullptr) {
@@ -14306,7 +14306,7 @@ comp_d3d11_service_poll_mcp_capture(struct xrt_system_compositor *xsysc)
 
 	// Write sentinel for the MCP tool handler's file-based poll.
 	{
-		char sentinel[U_MCP_CAPTURE_PATH_MAX + 32];
+		char sentinel[MCP_CAPTURE_PATH_MAX + 32];
 		snprintf(sentinel, sizeof(sentinel), "%s_DONE.txt", base);
 		FILE *f = fopen(sentinel, "w");
 		if (f) {
@@ -14314,5 +14314,5 @@ comp_d3d11_service_poll_mcp_capture(struct xrt_system_compositor *xsysc)
 			fclose(f);
 		}
 	}
-	u_mcp_capture_complete(&sys->mcp_capture, ok);
+	mcp_capture_complete(&sys->mcp_capture, ok);
 }
