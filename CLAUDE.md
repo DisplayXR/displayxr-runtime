@@ -129,17 +129,15 @@ Toolchain: `cmake/toolchain-mingw-w64.cmake`. Output goes to `build-mingw/` (git
 
 ### CI Build (Remote)
 
-**CI policy: PR-only, with cost-saver guards.** `build-windows.yml` triggers on **pull requests** and **`v*` tag pushes** — nothing else. Pushes to feature branches do NOT trigger CI; iterate locally and open a PR when ready.
-
-Three guards keep CI minutes low without breaking contributor expectations:
+**CI policy: contributor-friendly.** Public-repo CI is free on GitHub-hosted runners, so `build-windows.yml` and `build-macos.yml` fire on every PR (drafts included), every push to `main`, and every `v*` tag — favoring fast contributor feedback over minute-burn. (`displayxr-shell-pvt` is private and still uses the cost-saver draft-skip pattern; minutes there are billed.)
 
 | Guard | Effect |
 |---|---|
-| **Drafts skip CI** | A draft PR doesn't run CI. Mark Ready for review when you want CI feedback. Job-level: `(github.event_name != 'pull_request' \|\| !github.event.pull_request.draft)`. |
-| **Doc-only PRs skip CI** | `paths-ignore: ['**.md', 'docs/**', '.github/ISSUE_TEMPLATE/**', 'LICENSE']` on the `pull_request:` trigger. |
+| **Doc-only PRs run a sentinel** | The workflow always fires, but `DetectChanges.outputs.docs_only` short-circuits the heavy steps. Runtime + Build (macOS) report success in ~30s on doc-only PRs without running the actual build. This pattern lets `Runtime` / `Build` / `shell-path-guard` be required-status-checks on branch protection without blocking doc-only PRs. |
 | **Cancel-in-progress** | Rapid pushes to a PR cancel the in-progress CI run; only the latest commit's CI completes. `concurrency: group: ${{ workflow }}-${{ pr.number || ref }}, cancel-in-progress: true`. |
+| **`shell-path-guard` (lint workflow)** | Fails any push or PR that reintroduces `src/xrt/targets/shell/*` or `installer/DisplayXRShellInstaller.nsi` — those moved to `displayxr-shell-pvt` during the privacy collapse and must not return to the public runtime tree. |
 
-Net: for a 5-iteration PR with code changes, expect ~1-2 CI runs (draft iterations free; one or two ready-for-review pushes after concurrency-cancel folding). Doc-only PRs cost nothing. macOS CI is currently disabled.
+Net: doc-only PRs cost ~30s of CI. Code PRs run the full Windows + macOS build (free on public-repo runners).
 
 For tagged releases, use the `/release` skill (see below) — it's the official release path. Don't tag manually.
 
