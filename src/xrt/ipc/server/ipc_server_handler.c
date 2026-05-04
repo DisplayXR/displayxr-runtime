@@ -3230,7 +3230,7 @@ ipc_handle_workspace_acquire_wakeup_event(volatile struct ipc_client_state *_ics
 	(void)s;
 	(void)max_handle_count;
 	(void)out_handles;
-	return XRT_ERROR_FEATURE_UNSUPPORTED;
+	return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 #endif
 }
 
