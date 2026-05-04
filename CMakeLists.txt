@@ -118,7 +118,7 @@ find_package(cJSON MODULE)
 include(FetchContent)
 FetchContent_Declare(displayxr_mcp
     GIT_REPOSITORY https://github.com/DisplayXR/displayxr-mcp.git
-    GIT_TAG v0.2.1)
+    GIT_TAG v0.2.2)
 # Build the stdio↔socket adapter alongside the lib so the Phase A test
 # scripts under tests/mcp/ can find a binary at a known path during dev
 # (build/_deps/displayxr_mcp-build/displayxr-mcp). Production
