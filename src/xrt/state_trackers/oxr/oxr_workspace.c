@@ -161,10 +161,14 @@ uint32_t
 comp_ipc_client_compositor_get_swapchain_id(struct xrt_swapchain *xsc);
 
 // Forward decl from compositor/client/comp_d3d11_client.cpp. Linked into the
-// runtime DLL alongside the IPC client. Unwraps the D3D11 wrapper so the
-// chrome dispatch can read the inner ipc_client_swapchain.id.
+// runtime DLL alongside the IPC client on Windows only. Unwraps the D3D11
+// wrapper so the chrome dispatch can read the inner ipc_client_swapchain.id.
+// On non-Windows the swapchain is already an ipc_client_swapchain (no D3D11
+// wrapper exists) — see the call sites below for the gated unwrap.
+#ifdef _WIN32
 struct xrt_swapchain *
 comp_d3d11_client_get_inner_xrt_swapchain(struct xrt_swapchain *xsc);
+#endif
 
 
 /*
@@ -968,11 +972,16 @@ oxr_xrCreateWorkspaceClientChromeSwapchainEXT(XrSession session,
 	// d3d11 client helper to reach the ipc_client_swapchain whose `id`
 	// field is what the runtime uses to look up the swapchain server-side.
 	// Valid IPC swapchain ids range from 0 to IPC_MAX_CLIENT_SWAPCHAINS-1
-	// (id 0 IS valid — first slot in the controller's xscs[] table).
-	struct xrt_swapchain *inner = comp_d3d11_client_get_inner_xrt_swapchain(sc->swapchain);
-	if (inner == NULL) {
-		inner = sc->swapchain; // fallback if it was already an ipc_client_swapchain
+	// (id 0 IS valid — first slot in the controller's xscs[] table). On
+	// non-Windows there's no D3D11 wrapper to unwrap, so the swapchain is
+	// already the ipc_client form.
+	struct xrt_swapchain *inner = sc->swapchain;
+#ifdef _WIN32
+	struct xrt_swapchain *unwrapped = comp_d3d11_client_get_inner_xrt_swapchain(inner);
+	if (unwrapped != NULL) {
+		inner = unwrapped;
 	}
+#endif
 	uint32_t swapchain_id = comp_ipc_client_compositor_get_swapchain_id(inner);
 
 	xrt_result_t xret = comp_ipc_client_compositor_workspace_register_chrome_swapchain(
@@ -999,11 +1008,14 @@ oxr_xrDestroyWorkspaceClientChromeSwapchainEXT(XrSwapchain swapchain)
 	// Drop the runtime-side chrome registration before destroying the
 	// swapchain. The runtime is tolerant of a missing entry — if the swapchain
 	// was never registered (e.g. created via xrCreateSwapchain directly), the
-	// unregister is a no-op there.
-	struct xrt_swapchain *inner = comp_d3d11_client_get_inner_xrt_swapchain(sc->swapchain);
-	if (inner == NULL) {
-		inner = sc->swapchain;
+	// unregister is a no-op there. Same _WIN32 gate as the create path.
+	struct xrt_swapchain *inner = sc->swapchain;
+#ifdef _WIN32
+	struct xrt_swapchain *unwrapped = comp_d3d11_client_get_inner_xrt_swapchain(inner);
+	if (unwrapped != NULL) {
+		inner = unwrapped;
 	}
+#endif
 	uint32_t swapchain_id = comp_ipc_client_compositor_get_swapchain_id(inner);
 	if (session_is_ipc_client(sc->sess)) {
 		(void)comp_ipc_client_compositor_workspace_unregister_chrome_swapchain(
