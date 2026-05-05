@@ -826,7 +826,15 @@ oxr_mcp_tools_register_all(void)
 	mcp_server_register_tool(&TOOL_DIFF_PROJECTION);
 	mcp_server_register_tool(&TOOL_CAPTURE_FRAME);
 	mcp_capture_set_notify(notify_capture_install, notify_capture_uninstall);
-	u_log_set_sink(oxr_mcp_log_sink, NULL);
+	// Only hijack the global log sink when MCP is actually enabled; otherwise
+	// leave whatever sink the runtime had already installed (typically
+	// `file_logging_sink` so per-process .log files keep growing past
+	// xrCreateInstance). Without this gate the MCP ring sink silently swallows
+	// every U_LOG_* call once the OXR instance is created, even with MCP off,
+	// breaking standalone diagnostics like [CLIENT_FRAME_NS].
+	if (mcp_check_env_or(oxr_mcp_capability_enabled())) {
+		u_log_set_sink(oxr_mcp_log_sink, NULL);
+	}
 }
 
 void

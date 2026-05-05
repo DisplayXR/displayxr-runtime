@@ -1542,6 +1542,29 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 	struct comp_vk_native_compositor *c = vk_comp(xc);
 	struct vk_bundle *vk = &c->vk;
 
+	// Phase 1 diagnostic — env-gated per-client commit interval. Mirrors
+	// the same `[CLIENT_FRAME_NS]` line emitted by the D3D11 in-process and
+	// service compositors so per-app frame rates are directly comparable
+	// across graphics APIs in standalone runs. One client per process here
+	// so a static cache is fine; the compositor pointer tags the line.
+	{
+		static int log_client_frame_ns = -1;
+		if (log_client_frame_ns < 0) {
+			const char *e = getenv("DISPLAYXR_LOG_PRESENT_NS");
+			log_client_frame_ns = (e != NULL && e[0] == '1') ? 1 : 0;
+		}
+		if (log_client_frame_ns) {
+			static int64_t last_commit_ns = 0;
+			int64_t now_ns = (int64_t)os_monotonic_get_ns();
+			if (last_commit_ns != 0) {
+				U_LOG_W("[CLIENT_FRAME_NS] client=%p dt_ns=%lld",
+				        (void *)c,
+				        (long long)(now_ns - last_commit_ns));
+			}
+			last_commit_ns = now_ns;
+		}
+	}
+
 	// Get predicted eye positions
 	struct xrt_vec3 left_eye = {-0.032f, 0.0f, 0.6f};
 	struct xrt_vec3 right_eye = {0.032f, 0.0f, 0.6f};
