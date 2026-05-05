@@ -393,10 +393,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                         locateInfo.space = xr.localSpace;
 
                         XrViewState viewState = {XR_TYPE_VIEW_STATE};
-                        uint32_t rawViewCount = 2;
-                        XrView rawViews[2];
-                        for (uint32_t i = 0; i < 2; i++) rawViews[i] = {XR_TYPE_VIEW};
-                        xrLocateViews(xr.session, &locateInfo, &viewState, 2, &rawViewCount, rawViews);
+                        // Over-allocate to the runtime's max view_count (sim_display reports 4
+                        // for Quad mode). Legacy app still renders only the first 2 (SBS).
+                        uint32_t rawViewCount = 8;
+                        XrView rawViews[8];
+                        for (uint32_t i = 0; i < 8; i++) rawViews[i] = {XR_TYPE_VIEW};
+                        xrLocateViews(xr.session, &locateInfo, &viewState, 8, &rawViewCount, rawViews);
 
                         // Legacy SBS layout: viewWidth per eye, left at (0,0), right at (viewWidth,0)
                         uint32_t viewWidth = xr.swapchain.width / 2;
