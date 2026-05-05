@@ -84,7 +84,7 @@ XR_RUNTIME_JSON=./build/openxr_displayxr-dev.json ./build/test_apps/cube_handle_
 - [XR_EXT_display_info](docs/specs/XR_EXT_display_info.md) — display properties and rendering mode extension
 - [Kooima Projection](docs/architecture/kooima-projection.md) — stereo math and projection pipelines
 - [Separation of Concerns](docs/architecture/separation-of-concerns.md) — layer boundaries
-- [displayxr-mcp](https://github.com/DisplayXR/displayxr-mcp) — embeddable MCP server framework. Runtime registers Phase A handle-app introspection tools (`list_sessions`, `get_display_info`, `capture_frame`, `tail_log`, …) per app process; the reference shell hosts Phase B workspace tools. Spec at [`displayxr-mcp/docs/mcp-spec.md`](https://github.com/DisplayXR/displayxr-mcp/blob/main/docs/mcp-spec.md).
+- [displayxr-mcp](https://github.com/DisplayXR/displayxr-mcp) — embeddable MCP server framework. End users opt in to AI-agent / voice control by installing **DisplayXR MCP Tools** ([releases](https://github.com/DisplayXR/displayxr-mcp/releases)), which writes `HKLM\Software\DisplayXR\Capabilities\MCP\Enabled=1`; the runtime reads this at startup and spawns a per-app MCP server. `DISPLAYXR_MCP=1` (or `=0`) is still supported as a process-local override for CI / dev. Runtime registers Phase A handle-app introspection tools (`list_sessions`, `get_display_info`, `capture_frame`, `tail_log`, …) per app process; the reference shell hosts Phase B workspace tools. Spec at [`displayxr-mcp/docs/mcp-spec.md`](https://github.com/DisplayXR/displayxr-mcp/blob/main/docs/mcp-spec.md).
 
 ## Related Repos
 
@@ -92,7 +92,7 @@ XR_RUNTIME_JSON=./build/openxr_displayxr-dev.json ./build/test_apps/cube_handle_
 |------|-------------|
 | [displayxr-shell-releases](https://github.com/DisplayXR/displayxr-shell-releases) | DisplayXR Shell — spatial workspace controller (installer + bug reports) |
 | [displayxr-extensions](https://github.com/DisplayXR/displayxr-extensions) | OpenXR extension specs and headers |
-| [displayxr-mcp](https://github.com/DisplayXR/displayxr-mcp) | Embeddable MCP server framework — exposes runtime + workspace state to AI agents |
+| [displayxr-mcp](https://github.com/DisplayXR/displayxr-mcp) | Embeddable MCP server framework + **DisplayXR MCP Tools** installer (end-user opt-in for agent / voice control) |
 | [displayxr-demo-gaussiansplat](https://github.com/DisplayXR/displayxr-demo-gaussiansplat) | 3D Gaussian Splatting reference demo |
 | [displayxr-unity](https://github.com/DisplayXR/displayxr-unity) | Unity engine plugin (UPM package) |
 | [displayxr-unreal](https://github.com/DisplayXR/displayxr-unreal) | Unreal Engine plugin |
