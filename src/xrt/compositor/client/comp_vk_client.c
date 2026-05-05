@@ -1047,10 +1047,17 @@ client_vk_compositor_create(struct xrt_compositor_native *xcn,
 			        (int)have_fence, (int)xrt_graphics_sync_handle_is_valid(fence_handle));
 		}
 	} else {
+#if defined(XRT_GRAPHICS_SYNC_HANDLE_IS_WIN32_HANDLE)
 		U_LOG_W("Phase 2 (VK): VkDevice does not support timeline semaphore import/export "
 		        "(d3d12_fence=%d opaque_win32=%d); vkQueueWaitIdle path stays in effect.",
 		        (int)c->vk.external.timeline_semaphore_d3d12_fence,
 		        (int)c->vk.external.timeline_semaphore_win32_handle);
+#else
+		U_LOG_W("Phase 2 (VK): VkDevice does not support timeline semaphore import/export "
+		        "(sync_fd=%d opaque_fd=%d); vkQueueWaitIdle path stays in effect.",
+		        (int)c->vk.external.timeline_semaphore_sync_fd,
+		        (int)c->vk.external.timeline_semaphore_opaque_fd);
+#endif
 	}
 #endif
 
