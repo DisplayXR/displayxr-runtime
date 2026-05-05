@@ -17,6 +17,9 @@
 #include "comp_vk_client.h"
 
 #include "util/u_logging.h"
+#include "os/os_time.h" // os_monotonic_get_ns — VK [COMMIT_PROFILE_CLIENT]
+
+#include <stdlib.h> // getenv
 
 // Phase 2 — forward decls of the IPC client compositor bridges. Mirrors the
 // pair the D3D11 client uses (see comp_d3d11_client.cpp). Resolved at link
@@ -263,6 +266,10 @@ submit_fallback(struct client_vk_compositor *c, xrt_result_t *out_xret)
 {
 	struct vk_bundle *vk = &c->vk;
 
+	// Per-stage timestamps for [COMMIT_PROFILE_CLIENT]. Same shape as the
+	// d3d11 client emit so the bench script parser doesn't need a new branch.
+	int64_t profile_t0 = os_monotonic_get_ns();
+
 	// Wait for the app's GPU work to complete before notifying the compositor.
 	// With cross-device external memory sharing (null compositor on Device A,
 	// VK app on Device B), the compositor will read the shared images on Device A.
@@ -276,6 +283,8 @@ submit_fallback(struct client_vk_compositor *c, xrt_result_t *out_xret)
 		vk->vkQueueWaitIdle(vk->main_queue->queue);
 		vk_queue_unlock(vk->main_queue);
 	}
+
+	int64_t profile_t1 = os_monotonic_get_ns();
 
 	// Phase 2 — once the queue is idle, host-signal the workspace_sync
 	// semaphore and ship the new value to the service before the IPC commit.
@@ -308,7 +317,39 @@ submit_fallback(struct client_vk_compositor *c, xrt_result_t *out_xret)
 	}
 #endif
 
+	int64_t profile_t2 = os_monotonic_get_ns();
+
 	*out_xret = xrt_comp_layer_commit(&c->xcn->base, XRT_GRAPHICS_SYNC_HANDLE_INVALID);
+
+	int64_t profile_t3 = os_monotonic_get_ns();
+
+	// Emit per-stage [COMMIT_PROFILE_CLIENT]. Env-gated by DISPLAYXR_LOG_PRESENT_NS=1
+	// (same gate as the existing service-side and d3d11-client emits, so
+	// the bench parser picks it up directly).
+	// Field mapping for the VK fallback path:
+	//   signal_ns    = vkQueueWaitIdle (the dominant cost; analogous to the
+	//                  d3d11 client's fence Signal — both ensure GPU work
+	//                  is visible before notifying the service)
+	//   pre_ipc_ns   = workspace_sync semaphore signal + set-fence-value RPC
+	//   ipc_ns       = the layer_commit RPC roundtrip
+	//   post_ipc_ns  = 0 (nothing happens after layer_commit returns)
+	{
+		static int log_commit_profile = -1;
+		if (log_commit_profile < 0) {
+			const char *e = getenv("DISPLAYXR_LOG_PRESENT_NS");
+			log_commit_profile = (e != NULL && e[0] == '1') ? 1 : 0;
+		}
+		if (log_commit_profile) {
+			U_LOG_W("[COMMIT_PROFILE_CLIENT] client=%p signal_ns=%lld pre_ipc_ns=%lld ipc_ns=%lld post_ipc_ns=%lld total_ns=%lld",
+			        (void *)c,
+			        (long long)(profile_t1 - profile_t0),
+			        (long long)(profile_t2 - profile_t1),
+			        (long long)(profile_t3 - profile_t2),
+			        (long long)0,
+			        (long long)(profile_t3 - profile_t0));
+		}
+	}
+
 	return true;
 }
 
