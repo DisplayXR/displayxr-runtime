@@ -1079,6 +1079,24 @@ metal_compositor_layer_quad(struct xrt_compositor *xc,
 }
 
 /*!
+ * Window-space layer (XR_EXT_win32_window_binding). Positioned in fractional
+ * window coordinates with per-eye horizontal disparity shift. Mirrors
+ * d3d11_compositor_layer_window_space — here we just accumulate; rendering
+ * happens later in the per-tile pass (search for `XRT_LAYER_WINDOW_SPACE`
+ * in this file).
+ */
+static xrt_result_t
+metal_compositor_layer_window_space(struct xrt_compositor *xc,
+                                     struct xrt_device *xdev,
+                                     struct xrt_swapchain *xsc,
+                                     const struct xrt_layer_data *data)
+{
+	struct comp_metal_compositor *c = metal_comp(xc);
+	comp_layer_accum_window_space(&c->layer_accum, xsc, data);
+	return XRT_SUCCESS;
+}
+
+/*!
  * Update the HUD overlay text (throttled, main-thread safe).
  */
 static void
@@ -1651,6 +1669,141 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			}
 		}
 
+		// Window-space layers (XR_EXT_win32_window_binding) — drawn into
+		// each per-eye tile of the atlas with horizontal disparity shift,
+		// so the display processor weaves them in stereo just like projection
+		// content. Mirrors d3d11_compositor_layer_window_space + the renderer
+		// window-space pass.
+		uint32_t mode_views_ws = c->hardware_display_3d ? (c->tile_columns * c->tile_rows) : 1;
+		static int s_ws_log_count = 0;
+		for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+			struct comp_layer *layer = &c->layer_accum.layers[i];
+			if (layer->data.type != XRT_LAYER_WINDOW_SPACE) {
+				continue;
+			}
+			const struct xrt_layer_window_space_data *ws = &layer->data.window_space;
+			struct xrt_swapchain *sc = layer->sc_array[0];
+			if (sc == NULL) {
+				if (s_ws_log_count < 5) {
+					U_LOG_W("ws-layer[%u]: sc NULL (skip)", i);
+					s_ws_log_count++;
+				}
+				continue;
+			}
+			struct comp_metal_swapchain *msc = metal_swapchain(sc);
+			uint32_t img_idx = ws->sub.image_index;
+			if (img_idx >= msc->image_count) {
+				if (s_ws_log_count < 5) {
+					U_LOG_W("ws-layer[%u]: img_idx %u >= image_count %u (skip)",
+					        i, img_idx, msc->image_count);
+					s_ws_log_count++;
+				}
+				continue;
+			}
+			id<MTLTexture> src_tex = msc->images[img_idx];
+			if (src_tex == nil) {
+				if (s_ws_log_count < 5) {
+					U_LOG_W("ws-layer[%u]: src_tex nil (skip)", i);
+					s_ws_log_count++;
+				}
+				continue;
+			}
+			if (s_ws_log_count < 5) {
+				U_LOG_W("ws-layer[%u]: rendering rect=(%.3f,%.3f %.3fx%.3f) disp=%.4f "
+				        "src=%lux%lu views=%u (hw3d=%d tiles=%ux%u view=%ux%u)",
+				        i, ws->x, ws->y, ws->width, ws->height, ws->disparity,
+				        (unsigned long)src_tex.width, (unsigned long)src_tex.height,
+				        mode_views_ws, c->hardware_display_3d,
+				        c->tile_columns, c->tile_rows,
+				        c->view_width, c->view_height);
+				s_ws_log_count++;
+			}
+
+			// Source UV sub-rect (default to full texture if not specified)
+			struct xrt_normalized_rect nr = ws->sub.norm_rect;
+			if (nr.w <= 0.0f || nr.h <= 0.0f) {
+				nr.x = 0.0f; nr.y = 0.0f; nr.w = 1.0f; nr.h = 1.0f;
+			}
+
+			for (uint32_t eye = 0; eye < mode_views_ws; eye++) {
+				uint32_t tile_x = eye % c->tile_columns;
+				uint32_t tile_y = eye / c->tile_columns;
+
+				// Per-eye horizontal disparity (eye 0 shifts left).
+				float half_disp = ws->disparity / 2.0f;
+				float eye_shift = (eye == 0) ? -half_disp : half_disp;
+
+				// Per-eye sub-rect within the atlas, in atlas pixels. The
+				// projection_pipeline shader expects viewport=(0,0,1,1) and
+				// emits a fullscreen triangle in NDC; the MTLViewport
+				// clamps that to the sub-rect we want filled. This way we
+				// reuse the existing shader without per-quad geometry.
+				float tile_origin_x = c->hardware_display_3d ? (float)(tile_x * c->view_width) : 0.0f;
+				float tile_origin_y = c->hardware_display_3d ? (float)(tile_y * c->view_height) : 0.0f;
+				float tile_w = c->hardware_display_3d ? (float)c->view_width
+				                                       : (float)(c->tile_columns * c->view_width);
+				float tile_h = c->hardware_display_3d ? (float)c->view_height
+				                                       : (float)(c->tile_rows * c->view_height);
+
+				MTLViewport vp;
+				vp.originX = tile_origin_x + (ws->x + eye_shift) * tile_w;
+				vp.originY = tile_origin_y + ws->y * tile_h;
+				vp.width = ws->width * tile_w;
+				vp.height = ws->height * tile_h;
+				vp.znear = 0.0;
+				vp.zfar = 1.0;
+				if (vp.width <= 0.0 || vp.height <= 0.0) {
+					continue;
+				}
+				[encoder setViewport:vp];
+
+				[encoder setRenderPipelineState:c->projection_pipeline];
+				[encoder setDepthStencilState:c->depth_stencil_state];
+				[encoder setFragmentTexture:src_tex atIndex:0];
+				[encoder setFragmentSamplerState:c->sampler_linear atIndex:0];
+
+				struct {
+					float viewport[4];
+					float src_rect[4];
+					float color_scale[4];
+					float color_bias[4];
+					float swizzle_rb;
+					float _pad[3];
+				} constants;
+
+				// Fullscreen-triangle settings — MTLViewport already does
+				// the sub-rect clamp.
+				constants.viewport[0] = 0.0f;
+				constants.viewport[1] = 0.0f;
+				constants.viewport[2] = 1.0f;
+				constants.viewport[3] = 1.0f;
+
+				constants.src_rect[0] = nr.x;
+				constants.src_rect[1] = nr.y;
+				constants.src_rect[2] = nr.w;
+				constants.src_rect[3] = nr.h;
+				if (layer->data.flip_y) {
+					constants.src_rect[1] = nr.y + nr.h;
+					constants.src_rect[3] = -nr.h;
+				}
+
+				constants.color_scale[0] = 1.0f;
+				constants.color_scale[1] = 1.0f;
+				constants.color_scale[2] = 1.0f;
+				constants.color_scale[3] = 1.0f;
+				constants.color_bias[0] = 0.0f;
+				constants.color_bias[1] = 0.0f;
+				constants.color_bias[2] = 0.0f;
+				constants.color_bias[3] = 0.0f;
+				constants.swizzle_rb = 0.0f;
+				constants._pad[0] = constants._pad[1] = constants._pad[2] = 0.0f;
+
+				[encoder setVertexBytes:&constants length:sizeof(constants) atIndex:0];
+				[encoder setFragmentBytes:&constants length:sizeof(constants) atIndex:0];
+				[encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+			}
+		}
+
 		[encoder endEncoding];
 	}
 
@@ -1754,6 +1907,31 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	// HUD overlay (post-weave, before present)
 	if (c->owns_window) {
 		metal_compositor_render_hud(c, dt, cmd_buf, output_texture);
+	}
+
+	// Mirror the IOSurface output into the external window's CAMetalLayer
+	// drawable so the native window actually shows content (otherwise it's
+	// just whatever the AppKit background draws — i.e. solid grey).
+	// Only relevant when both a shared IOSurface AND an external view are
+	// present (the editor preview / Unity standalone path).
+	if (c->shared_texture != nil && c->metal_layer != nil && !c->owns_window) {
+		id<CAMetalDrawable> mirror = [c->metal_layer nextDrawable];
+		if (mirror != nil) {
+			id<MTLBlitCommandEncoder> blit = [cmd_buf blitCommandEncoder];
+			NSUInteger w = MIN(output_texture.width, mirror.texture.width);
+			NSUInteger h = MIN(output_texture.height, mirror.texture.height);
+			[blit copyFromTexture:output_texture
+			          sourceSlice:0
+			          sourceLevel:0
+			         sourceOrigin:MTLOriginMake(0, 0, 0)
+			           sourceSize:MTLSizeMake(w, h, 1)
+			            toTexture:mirror.texture
+			     destinationSlice:0
+			     destinationLevel:0
+			    destinationOrigin:MTLOriginMake(0, 0, 0)];
+			[blit endEncoding];
+			[cmd_buf presentDrawable:mirror];
+		}
 	}
 
 	// Present and commit
@@ -2151,6 +2329,7 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 	xc->layer_projection = metal_compositor_layer_projection;
 	xc->layer_projection_depth = metal_compositor_layer_projection_depth;
 	xc->layer_quad = metal_compositor_layer_quad;
+	xc->layer_window_space = metal_compositor_layer_window_space;
 	xc->layer_commit = metal_compositor_layer_commit;
 	xc->destroy = metal_compositor_destroy;
 
