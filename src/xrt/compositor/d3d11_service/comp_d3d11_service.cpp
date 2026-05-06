@@ -1986,6 +1986,147 @@ render_quad_layer(struct d3d11_service_system *sys,
 	sys->context->PSSetShaderResources(0, 1, &null_srv);
 }
 
+// Window-space layers (XR_EXT_window_space_layer) are flat 2D overlays drawn
+// into the per-client atlas in the same per-view tile as the projection
+// content. Per-eye disparity is applied as a horizontal shift in window-
+// fractional coordinates; the multi-compositor's later 3D projection of the
+// per-client atlas onto the slot's window plane turns that shift into
+// stereo parallax — i.e. the HUD appears to float in front of the window.
+//
+// Mirrors the standalone Vulkan path at comp_multi_system.c:1276-1310.
+// In workspace mode the d3d11_service per-client atlas pass is the only
+// place app window-space layers reach the screen — the multi-compositor
+// reads this atlas to populate the combined output.
+static void
+render_window_space_layer(struct d3d11_service_system *sys,
+                          const struct comp_layer *layer,
+                          uint32_t view_index)
+{
+	const struct xrt_layer_data *data = &layer->data;
+	const struct xrt_layer_window_space_data *ws = &data->window_space;
+
+	struct xrt_swapchain *xsc = layer->sc_array[0];
+	if (xsc == nullptr) {
+		return;
+	}
+	struct d3d11_service_swapchain *sc = d3d11_service_swapchain_from_xrt(xsc);
+	uint32_t image_index = ws->sub.image_index;
+	if (image_index >= sc->image_count) {
+		return;
+	}
+	ID3D11ShaderResourceView *srv = sc->images[image_index].srv.get();
+	if (srv == nullptr) {
+		return;
+	}
+
+	D3D11_TEXTURE2D_DESC tex_desc = {};
+	sc->images[image_index].texture->GetDesc(&tex_desc);
+
+	// Cross-process visibility for service-created swapchains (mirrors the
+	// chrome blit pattern at line ~8142). App-created swapchains skip this
+	// — their content is on the runtime's device already.
+	IDXGIKeyedMutex *mutex = sc->images[image_index].keyed_mutex.get();
+	bool mutex_held = false;
+	if (sc->service_created && mutex != nullptr && !sc->images[image_index].mutex_acquired) {
+		HRESULT hr = mutex->AcquireSync(0, 4 /* ms */);
+		if (SUCCEEDED(hr)) {
+			mutex_held = true;
+		}
+	}
+
+	// Per-eye horizontal shift. View 0 = left eye, view 1 = right eye for
+	// stereo. Mono renders without disparity. Matches comp_multi_system.c:1299.
+	float eye_shift = 0.0f;
+	if (sys->hardware_display_3d) {
+		eye_shift = (view_index == 0) ? -ws->disparity / 2.0f : +ws->disparity / 2.0f;
+	}
+
+	// Tile origin in atlas pixels. Mono fills the visible output region.
+	uint32_t tile_x = 0, tile_y = 0;
+	uint32_t tile_w = sys->view_width;
+	uint32_t tile_h = sys->view_height;
+	if (sys->hardware_display_3d) {
+		u_tiling_view_origin(view_index, sys->tile_columns,
+		                     sys->view_width, sys->view_height,
+		                     &tile_x, &tile_y);
+	} else {
+		tile_w = (sys->output_width < sys->display_width) ? sys->output_width : sys->display_width;
+		tile_h = (sys->output_height < sys->display_height) ? sys->output_height : sys->display_height;
+	}
+
+	// Window-fractional → tile-pixel destination rect.
+	float dst_x = (float)tile_x + (ws->x + eye_shift) * (float)tile_w;
+	float dst_y = (float)tile_y + ws->y * (float)tile_h;
+	float dst_w = ws->width * (float)tile_w;
+	float dst_h = ws->height * (float)tile_h;
+
+	// Source rect — sub.norm_rect is normalized [0..1]; blit shader needs pixels.
+	float src_x = ws->sub.norm_rect.x * (float)tex_desc.Width;
+	float src_y = ws->sub.norm_rect.y * (float)tex_desc.Height;
+	float src_w = ws->sub.norm_rect.w * (float)tex_desc.Width;
+	float src_h = ws->sub.norm_rect.h * (float)tex_desc.Height;
+	if (data->flip_y) {
+		src_y += src_h;
+		src_h = -src_h;
+	}
+
+	uint32_t atlas_w = sys->base.info.display_pixel_width;
+	uint32_t atlas_h = sys->base.info.display_pixel_height;
+	if (atlas_w == 0 || atlas_h == 0) {
+		atlas_w = sys->display_width;
+		atlas_h = sys->display_height;
+	}
+
+	sys->context->VSSetShader(sys->blit_vs.get(), nullptr, 0);
+	sys->context->PSSetShader(sys->blit_ps.get(), nullptr, 0);
+	sys->context->VSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
+	sys->context->PSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
+	sys->context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+	sys->context->IASetInputLayout(nullptr);
+	sys->context->RSSetState(sys->rasterizer_state.get());
+	sys->context->OMSetDepthStencilState(sys->depth_disabled.get(), 0);
+	set_blend_state(sys, data);
+
+	D3D11_MAPPED_SUBRESOURCE mapped;
+	if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
+	                                D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+		BlitConstants *cb = static_cast<BlitConstants *>(mapped.pData);
+		memset(cb, 0, sizeof(*cb));
+		cb->src_rect[0] = src_x;
+		cb->src_rect[1] = src_y;
+		cb->src_rect[2] = src_w;
+		cb->src_rect[3] = src_h;
+		cb->src_size[0] = (float)tex_desc.Width;
+		cb->src_size[1] = (float)tex_desc.Height;
+		cb->dst_offset[0] = dst_x;
+		cb->dst_offset[1] = dst_y;
+		cb->dst_size[0] = (float)atlas_w;
+		cb->dst_size[1] = (float)atlas_h;
+		cb->dst_rect_wh[0] = dst_w;
+		cb->dst_rect_wh[1] = dst_h;
+		cb->convert_srgb = 0.0f;
+		cb->quad_mode = 0.0f; // axis-aligned (dst_offset + dst_rect_wh)
+		cb->corner_radius = 0.0f;
+		cb->corner_aspect = 0.0f;
+		cb->edge_feather = 0.0f;
+		cb->glow_intensity = 0.0f;
+		cb->chrome_alpha = 0.0f; // 0 = no fade (full opacity), per shader semantic
+		// corner_depth_ndc left at 0 (front; depth_disabled bound below)
+		sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
+	}
+
+	sys->context->PSSetShaderResources(0, 1, &srv);
+	sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
+	sys->context->Draw(4, 0);
+
+	ID3D11ShaderResourceView *null_srv = nullptr;
+	sys->context->PSSetShaderResources(0, 1, &null_srv);
+
+	if (mutex_held) {
+		mutex->ReleaseSync(0);
+	}
+}
+
 static void
 render_cylinder_layer(struct d3d11_service_system *sys,
                       const struct comp_layer *layer,
@@ -3460,6 +3601,20 @@ compositor_layer_equirect2(struct xrt_compositor *xc,
 
 	std::lock_guard<std::mutex> lock(c->mutex);
 	comp_layer_accum_equirect2(&c->layer_accum, xsc, data);
+
+	return XRT_SUCCESS;
+}
+
+static xrt_result_t
+compositor_layer_window_space(struct xrt_compositor *xc,
+                               struct xrt_device *xdev,
+                               struct xrt_swapchain *xsc,
+                               const struct xrt_layer_data *data)
+{
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+
+	std::lock_guard<std::mutex> lock(c->mutex);
+	comp_layer_accum_window_space(&c->layer_accum, xsc, data);
 
 	return XRT_SUCCESS;
 }
@@ -9990,9 +10145,11 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	struct xrt_vec3 left_eye = {eye_pos.eyes[0].x, eye_pos.eyes[0].y, eye_pos.eyes[0].z};
 	struct xrt_vec3 right_eye = {eye_pos.eyes[1].x, eye_pos.eyes[1].y, eye_pos.eyes[1].z};
 
-	// Pre-compute whether there are UI overlay layers (quad/cylinder/equirect/cube).
-	// Needed to decide if same-swapchain SBS can bypass the stereo texture entirely.
+	// Pre-compute whether there are UI overlay layers (quad/cylinder/equirect/cube)
+	// or window-space layers. Either disables zero-copy because we must blit on
+	// top of the projection content.
 	bool has_ui_layers = false;
+	bool has_window_space_layers = false;
 	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
 		switch (c->layer_accum.layers[i].data.type) {
 		case XRT_LAYER_QUAD:
@@ -10002,10 +10159,13 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		case XRT_LAYER_CUBE:
 			has_ui_layers = true;
 			break;
+		case XRT_LAYER_WINDOW_SPACE:
+			has_window_space_layers = true;
+			break;
 		default:
 			break;
 		}
-		if (has_ui_layers) break;
+		if (has_ui_layers && has_window_space_layers) break;
 	}
 
 	// Track zero-copy optimization: when all views are rendered into the same
@@ -10379,10 +10539,11 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		}
 		if (proj_view_count <= 1) zc_reason = "single_view";
 		else if (has_ui_layers) zc_reason = "ui_layers";
+		else if (has_window_space_layers) zc_reason = "window_space_layers";
 		else if (!all_views_zc_eligible) zc_reason = "view_ineligible";
 		else if (sys->workspace_mode) zc_reason = "workspace_mode";
 
-		if (proj_view_count > 1 && !has_ui_layers && all_views_zc_eligible && !sys->workspace_mode) {
+		if (proj_view_count > 1 && !has_ui_layers && !has_window_space_layers && all_views_zc_eligible && !sys->workspace_mode) {
 			// Check all views reference the same swapchain image
 			bool all_same = true;
 			for (uint32_t eye = 1; eye < proj_view_count; eye++) {
@@ -10822,6 +10983,72 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 						                  &view_poses[view_index],
 						                  &fovs[view_index]);
 					}
+				}
+			}
+		}
+	}
+
+	// Window-space layers (XR_EXT_window_space_layer). Drawn after the
+	// projection-space UI layers so they sit on top in submission order, and
+	// before the per-client atlas is composited into the combined output by
+	// the workspace multi-compositor (or scanned out directly in standalone).
+	// Uses the blit pipeline (blit_vs/blit_ps) — the QUAD pipeline is for
+	// world-space quads with a 3D MVP, but window-space layers are flat
+	// 2D-in-tile blits with a per-eye horizontal disparity shift.
+	//
+	// Viewport set to full atlas so dst_offset is interpreted in absolute
+	// atlas pixels (matches chrome's blit pattern); scissor restricts each
+	// per-view draw to its tile.
+	if (has_window_space_layers && sys->blit_vs && sys->blit_ps) {
+		ID3D11RenderTargetView *ws_rtvs[] = {c->render.atlas_rtv.get()};
+		sys->context->OMSetRenderTargets(1, ws_rtvs, nullptr);
+
+		uint32_t ws_atlas_w = sys->base.info.display_pixel_width;
+		uint32_t ws_atlas_h = sys->base.info.display_pixel_height;
+		if (ws_atlas_w == 0 || ws_atlas_h == 0) {
+			ws_atlas_w = sys->display_width;
+			ws_atlas_h = sys->display_height;
+		}
+		D3D11_VIEWPORT ws_vp = {};
+		ws_vp.Width = (float)ws_atlas_w;
+		ws_vp.Height = (float)ws_atlas_h;
+		ws_vp.MaxDepth = 1.0f;
+		sys->context->RSSetViewports(1, &ws_vp);
+
+		uint32_t ws_view_count = sys->hardware_display_3d
+		                             ? (sys->tile_columns * sys->tile_rows)
+		                             : 1;
+		if (ws_view_count > XRT_MAX_VIEWS) {
+			ws_view_count = XRT_MAX_VIEWS;
+		}
+
+		for (uint32_t ws_view = 0; ws_view < ws_view_count; ws_view++) {
+			D3D11_RECT ws_scissor = {};
+			if (sys->hardware_display_3d) {
+				uint32_t tile_x = 0, tile_y = 0;
+				u_tiling_view_origin(ws_view, sys->tile_columns,
+				                     sys->view_width, sys->view_height,
+				                     &tile_x, &tile_y);
+				ws_scissor.left = (LONG)tile_x;
+				ws_scissor.top = (LONG)tile_y;
+				ws_scissor.right = (LONG)(tile_x + sys->view_width);
+				ws_scissor.bottom = (LONG)(tile_y + sys->view_height);
+			} else {
+				uint32_t mono_w = (sys->output_width < sys->display_width)
+				                      ? sys->output_width : sys->display_width;
+				uint32_t mono_h = (sys->output_height < sys->display_height)
+				                      ? sys->output_height : sys->display_height;
+				ws_scissor.left = 0;
+				ws_scissor.top = 0;
+				ws_scissor.right = (LONG)mono_w;
+				ws_scissor.bottom = (LONG)mono_h;
+			}
+			sys->context->RSSetScissorRects(1, &ws_scissor);
+
+			for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+				struct comp_layer *layer = &c->layer_accum.layers[i];
+				if (layer->data.type == XRT_LAYER_WINDOW_SPACE) {
+					render_window_space_layer(sys, layer, ws_view);
 				}
 			}
 		}
@@ -11534,6 +11761,7 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 	c->base.base.layer_cylinder = compositor_layer_cylinder;
 	c->base.base.layer_equirect1 = compositor_layer_equirect1;
 	c->base.base.layer_equirect2 = compositor_layer_equirect2;
+	c->base.base.layer_window_space = compositor_layer_window_space;
 	c->base.base.layer_passthrough = compositor_layer_passthrough;
 	c->base.base.layer_commit = compositor_layer_commit;
 	c->base.base.layer_commit_with_semaphore = compositor_layer_commit_with_semaphore;
