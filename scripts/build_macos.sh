@@ -54,15 +54,35 @@ cmake -B "$BUILD_DIR" -S "$ROOT" -G Ninja \
 cmake --build "$BUILD_DIR"
 
 # Step 2: Build OpenXR loader (if not already cached)
+#
+# BUILD_WITH_SYSTEM_JSONCPP=OFF forces the OpenXR loader to compile its
+# vendored jsoncpp sources (src/external/jsoncpp/) directly into
+# libopenxr_loader.dylib. Otherwise the SDK's CMake auto-detects Homebrew
+# jsoncpp via find_package and produces a dylib with a hardcoded
+# /opt/homebrew/opt/jsoncpp/lib/libjsoncpp.26.dylib dependency, which
+# breaks redistribution (Unity/Unreal apps that bundle the loader fail
+# on end-user machines without Homebrew jsoncpp). See issue #205.
 if [ ! -f "$OPENXR_DIR/lib/libopenxr_loader.dylib" ]; then
   echo "=== Building OpenXR loader ==="
   rm -rf /tmp/openxr-sdk
   git clone --depth 1 --branch "release-$OPENXR_VERSION" \
     https://github.com/KhronosGroup/OpenXR-SDK-Source.git /tmp/openxr-sdk
+
+  # Patch the loader's CMakeLists.txt so the vendored jsoncpp include
+  # path is prepended (BEFORE) instead of appended. Without this, the
+  # Vulkan include path Vulkan_INCLUDE_DIR=/opt/homebrew/include is
+  # listed first and the vendored jsoncpp .cpp files end up including
+  # Homebrew's /opt/homebrew/include/json/*.h (different ABI), which
+  # fails to compile.
+  /usr/bin/sed -i '' \
+    's|PRIVATE "${PROJECT_SOURCE_DIR}/src/external/jsoncpp/include"|BEFORE PRIVATE "${PROJECT_SOURCE_DIR}/src/external/jsoncpp/include"|' \
+    /tmp/openxr-sdk/src/loader/CMakeLists.txt
+
   cmake -B /tmp/openxr-sdk/build -S /tmp/openxr-sdk -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX="$OPENXR_DIR" \
     -DBUILD_TESTS=OFF -DBUILD_CONFORMANCE_TESTS=OFF \
+    -DBUILD_WITH_SYSTEM_JSONCPP=OFF \
     -DCMAKE_MAP_IMPORTED_CONFIG_RELEASE="Release;None;"
   cmake --build /tmp/openxr-sdk/build
   cmake --install /tmp/openxr-sdk/build
