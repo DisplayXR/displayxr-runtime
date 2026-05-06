@@ -1675,7 +1675,6 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		// content. Mirrors d3d11_compositor_layer_window_space + the renderer
 		// window-space pass.
 		uint32_t mode_views_ws = c->hardware_display_3d ? (c->tile_columns * c->tile_rows) : 1;
-		static int s_ws_log_count = 0;
 		for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
 			struct comp_layer *layer = &c->layer_accum.layers[i];
 			if (layer->data.type != XRT_LAYER_WINDOW_SPACE) {
@@ -1684,39 +1683,16 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			const struct xrt_layer_window_space_data *ws = &layer->data.window_space;
 			struct xrt_swapchain *sc = layer->sc_array[0];
 			if (sc == NULL) {
-				if (s_ws_log_count < 5) {
-					U_LOG_W("ws-layer[%u]: sc NULL (skip)", i);
-					s_ws_log_count++;
-				}
 				continue;
 			}
 			struct comp_metal_swapchain *msc = metal_swapchain(sc);
 			uint32_t img_idx = ws->sub.image_index;
 			if (img_idx >= msc->image_count) {
-				if (s_ws_log_count < 5) {
-					U_LOG_W("ws-layer[%u]: img_idx %u >= image_count %u (skip)",
-					        i, img_idx, msc->image_count);
-					s_ws_log_count++;
-				}
 				continue;
 			}
 			id<MTLTexture> src_tex = msc->images[img_idx];
 			if (src_tex == nil) {
-				if (s_ws_log_count < 5) {
-					U_LOG_W("ws-layer[%u]: src_tex nil (skip)", i);
-					s_ws_log_count++;
-				}
 				continue;
-			}
-			if (s_ws_log_count < 5) {
-				U_LOG_W("ws-layer[%u]: rendering rect=(%.3f,%.3f %.3fx%.3f) disp=%.4f "
-				        "src=%lux%lu views=%u (hw3d=%d tiles=%ux%u view=%ux%u)",
-				        i, ws->x, ws->y, ws->width, ws->height, ws->disparity,
-				        (unsigned long)src_tex.width, (unsigned long)src_tex.height,
-				        mode_views_ws, c->hardware_display_3d,
-				        c->tile_columns, c->tile_rows,
-				        c->view_width, c->view_height);
-				s_ws_log_count++;
 			}
 
 			// Source UV sub-rect (default to full texture if not specified)
