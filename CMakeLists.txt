@@ -126,6 +126,24 @@ FetchContent_Declare(displayxr_mcp
 # instead, so suppress install rules here.
 set(DISPLAYXR_MCP_BUILD_ADAPTER ON CACHE BOOL "" FORCE)
 set(DISPLAYXR_MCP_INSTALL OFF CACHE BOOL "" FORCE)
+
+# xrt-pthreads must exist before FetchContent_MakeAvailable processes
+# displayxr_mcp's CMakeLists.txt — its check at line 87 picks up the
+# parent project's `xrt-pthreads` target via the first branch when
+# present, otherwise falls back to vcpkg `PThreads4W`. Without this
+# ordering, MinGW cross-compile fails configure (no vcpkg, no
+# xrt-pthreads yet defined). See #208.
+add_library(xrt-pthreads INTERFACE)
+if(WIN32 AND NOT MINGW)
+	find_package(pthreads_windows REQUIRED)
+	target_link_libraries(xrt-pthreads INTERFACE PThreads4W::PThreads4W_CXXEXC)
+else()
+	set(CMAKE_THREAD_PREFER_PTHREAD ON)
+	find_package(Threads)
+	target_link_libraries(xrt-pthreads INTERFACE Threads::Threads)
+	target_compile_definitions(xrt-pthreads INTERFACE _GNU_SOURCE)
+endif()
+
 FetchContent_MakeAvailable(displayxr_mcp)
 
 if(NOT WIN32)
@@ -168,16 +186,9 @@ endif()
 #https://github.com/arsenm/sanitizers-cmake
 find_package(Sanitizers MODULE)
 
-add_library(xrt-pthreads INTERFACE)
-if(WIN32 AND NOT MINGW)
-	find_package(pthreads_windows REQUIRED)
-	target_link_libraries(xrt-pthreads INTERFACE PThreads4W::PThreads4W_CXXEXC)
-else()
-	set(CMAKE_THREAD_PREFER_PTHREAD ON)
-	find_package(Threads)
-	target_link_libraries(xrt-pthreads INTERFACE Threads::Threads)
-	target_compile_definitions(xrt-pthreads INTERFACE _GNU_SOURCE)
-endif()
+# xrt-pthreads is now defined above, just before
+# FetchContent_MakeAvailable(displayxr_mcp), so its target check
+# resolves on every platform including MinGW. See #208.
 
 find_package(OpenGL)
 set(OPENGL_WITHOUT_GLX_FOUND ${OPENGL_FOUND})
