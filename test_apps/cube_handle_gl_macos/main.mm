@@ -733,7 +733,7 @@ static const float CAMERA_HALF_TAN_VFOV = 0.32491969623f; // tan(18deg) -> 36deg
 // path on macOS. Same constants as the other macOS test apps.
 static const uint32_t HUD_PIXEL_WIDTH = 380;
 static const uint32_t HUD_PIXEL_HEIGHT = 470;
-static const float HUD_WIDTH_FRACTION = 0.95f;
+static const float HUD_WIDTH_FRACTION = 0.20f;
 
 // Performance stats
 static double g_avgFrameTime = 0.0;
@@ -931,10 +931,12 @@ static void PumpMacOSEvents()
                     else if (ch == 'e') { g_input.keyE = true; }
                     else if (ch == 'q') { g_input.keyQ = true; }
                     else if (ch == ' ') { g_input.resetViewRequested = true; }
-                    else if (ch == '\t' && !isRepeat &&
+                    else if ([event keyCode] == 48 /* kVK_Tab */ && !isRepeat &&
                              ([event modifierFlags] & NSEventModifierFlagShift)) {
                         // SHIFT+TAB so bare TAB stays free for the workspace shell's
                         // focus-cycle binding (matches the Windows test apps).
+                        // NSEvent.characters returns 0x19 (NSBackTabCharacter) for
+                        // SHIFT+TAB, not '\t' — gate on the hardware keyCode.
                         g_input.hudVisible = !g_input.hudVisible;
                     }
                     else if (ch == 'v' && !isRepeat) {

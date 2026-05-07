@@ -57,6 +57,8 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 /*
  *
@@ -1781,6 +1783,56 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 
 		[encoder endEncoding];
+	}
+
+	// File-triggered atlas dump for autonomous screenshot verification.
+	// `touch /tmp/dxr_atlas_trigger` and the next frame writes the
+	// composited content region (post WS-layer pass, pre display
+	// processor) to /tmp/dxr_atlas.png. Mirrors the Windows D3D11-
+	// service screenshot trigger pattern; lets Claude Code inspect
+	// composited output without TCC permissions for screencapture.
+	{
+		const char *trigger = "/tmp/dxr_atlas_trigger";
+		struct stat st;
+		if (c->atlas_texture != nil && c->tile_columns > 0 && c->tile_rows > 0 &&
+		    c->view_width > 0 && c->view_height > 0 && stat(trigger, &st) == 0) {
+			unlink(trigger);
+			uint32_t cw = c->tile_columns * c->view_width;
+			uint32_t ch = c->tile_rows * c->view_height;
+			if (cw > (uint32_t)c->atlas_texture.width)  cw = (uint32_t)c->atlas_texture.width;
+			if (ch > (uint32_t)c->atlas_texture.height) ch = (uint32_t)c->atlas_texture.height;
+			size_t pitch = (size_t)cw * 4;
+			size_t bytes = pitch * ch;
+			id<MTLBuffer> stg = [c->device newBufferWithLength:bytes
+			                                           options:MTLResourceStorageModeShared];
+			if (stg != nil) {
+				[cmd_buf commit];
+				[cmd_buf waitUntilCompleted];
+				id<MTLCommandBuffer> bcb = [c->command_queue commandBuffer];
+				id<MTLBlitCommandEncoder> bl = [bcb blitCommandEncoder];
+				[bl copyFromTexture:c->atlas_texture
+				        sourceSlice:0 sourceLevel:0
+				       sourceOrigin:MTLOriginMake(0, 0, 0)
+				         sourceSize:MTLSizeMake(cw, ch, 1)
+				           toBuffer:stg destinationOffset:0
+				 destinationBytesPerRow:pitch
+				destinationBytesPerImage:bytes];
+				[bl endEncoding];
+				[bcb commit];
+				[bcb waitUntilCompleted];
+				uint8_t *src = (uint8_t *)stg.contents;
+				uint8_t *out = malloc(bytes);
+				if (out != NULL) {
+					for (size_t i = 0; i < bytes; i += 4) {
+						out[i+0] = src[i+2]; out[i+1] = src[i+1];
+						out[i+2] = src[i+0]; out[i+3] = src[i+3];
+					}
+					stbi_write_png("/tmp/dxr_atlas.png", (int)cw, (int)ch, 4, out, (int)pitch);
+					free(out);
+				}
+				cmd_buf = [c->command_queue commandBuffer];
+			}
+		}
 	}
 
 	// Step 2: Process atlas through display processor, or simple blit fallback

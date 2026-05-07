@@ -83,7 +83,14 @@ static void DrawAttributedTextBox(CGContextRef ctx, CTFontRef font,
     CGMutablePathRef path = CGPathCreateMutable();
     CGPathAddRect(path, NULL, rect);
     CTFrameRef frame = CTFramesetterCreateFrame(fs, CFRangeMake(0, attr.length), path, NULL);
+    // The caller flips Y on the CTM for top-down layout; CT rasterizes
+    // glyphs through the text matrix × CTM, so an identity text matrix
+    // would render each glyph upside-down. Pre-flip the text matrix on Y
+    // so the two cancel and glyphs come out upright.
+    CGAffineTransform savedTextMatrix = CGContextGetTextMatrix(ctx);
+    CGContextSetTextMatrix(ctx, CGAffineTransformMakeScale(1.0, -1.0));
     CTFrameDraw(frame, ctx);
+    CGContextSetTextMatrix(ctx, savedTextMatrix);
     CFRelease(frame);
     CGPathRelease(path);
     CFRelease(fs);
