@@ -50,7 +50,8 @@ add_executable(cube_texture_metal_macos
     main.mm
     "${CMAKE_SOURCE_DIR}/../common/display3d_view.c"
     "${CMAKE_SOURCE_DIR}/../common/camera3d_view.c"
-    "${CMAKE_SOURCE_DIR}/../common/hud_overlay_macos.m"
+    "${CMAKE_SOURCE_DIR}/../common/hud_renderer_macos.mm"
+    "${CMAKE_SOURCE_DIR}/../common/xr_window_space_hud.cpp"
 )
 
 target_include_directories(cube_texture_metal_macos PRIVATE
@@ -75,4 +76,6 @@ target_link_libraries(cube_texture_metal_macos PRIVATE
     "-framework Cocoa"
     "-framework QuartzCore"
     "-framework IOSurface"
+    "-framework CoreText"
+    "-framework CoreGraphics"
 )

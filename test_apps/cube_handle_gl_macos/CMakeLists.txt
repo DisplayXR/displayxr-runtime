@@ -50,7 +50,8 @@ add_executable(cube_handle_gl_macos
     main.mm
     "${CMAKE_SOURCE_DIR}/../common/display3d_view.c"
     "${CMAKE_SOURCE_DIR}/../common/camera3d_view.c"
-    "${CMAKE_SOURCE_DIR}/../common/hud_overlay_macos.m"
+    "${CMAKE_SOURCE_DIR}/../common/hud_renderer_macos.mm"
+    "${CMAKE_SOURCE_DIR}/../common/xr_window_space_hud.cpp"
     # 'I' key atlas capture: filename + flash helpers + GL readback
     "${CMAKE_SOURCE_DIR}/../common/atlas_capture_macos.mm"
     "${CMAKE_SOURCE_DIR}/../common/atlas_capture_gl.cpp"
@@ -82,4 +83,6 @@ target_link_libraries(cube_handle_gl_macos PRIVATE
     "-framework Cocoa"
     "-framework IOSurface"
     "-framework QuartzCore"  # CAMediaTimingFunction (atlas_capture_macos.mm flash)
+    "-framework CoreText"
+    "-framework CoreGraphics"
 )
