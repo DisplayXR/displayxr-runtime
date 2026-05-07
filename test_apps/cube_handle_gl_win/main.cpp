@@ -696,15 +696,20 @@ static void RenderThreadFunc(
 
                                     GLuint hudTexId = (*hudSwapchainImages)[hudImageIndex].image;
                                     glBindTexture(GL_TEXTURE_2D, hudTexId);
-                                    // Upload with Y-flip: HUD pixels are D3D11 top-down, but GL
-                                    // textures have bottom-up origin. Flipping rows here ensures
-                                    // the GL client compositor's flip_y correctly un-flips them.
-                                    {
+                                    // GL native compositor's window-space vertex shader already
+                                    // flips UV.y because it expects HUD pixels in top-down
+                                    // (D2D/CG bitmap) order — match the macOS GL cube and
+                                    // upload straight without a manual row-flip.
+                                    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+                                    if (srcRowPitch == hudWidth * 4) {
+                                        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, hudWidth, hudHeight,
+                                            GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+                                    } else {
                                         const uint8_t* src = (const uint8_t*)pixels;
                                         for (uint32_t row = 0; row < hudHeight; row++) {
                                             glTexSubImage2D(GL_TEXTURE_2D, 0, 0, row, hudWidth, 1,
                                                 GL_RGBA, GL_UNSIGNED_BYTE,
-                                                src + (hudHeight - 1 - row) * srcRowPitch);
+                                                src + row * srcRowPitch);
                                         }
                                     }
                                     // Force GL to flush and check for errors
