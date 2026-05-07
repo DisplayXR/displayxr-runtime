@@ -2,11 +2,22 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  In-app multi-view atlas capture (the 'I' key feature).
+ * @brief  In-app per-projection-layer atlas capture (the 'I' key feature).
  *
  * Reads back a sub-rect of an OpenXR swapchain image to host memory and
  * writes a PNG via stb_image_write. Captures land in the user's Pictures
  * folder and auto-increment as `<stem>-<N>_<cols>x<rows>.png`.
+ *
+ * **What this captures**: the *app's primary projection swapchain* —
+ * the per-tile multi-view atlas the app rendered, *before* the runtime
+ * composites any other layers. So one projection layer, no HUD / quad /
+ * window-space overlays, no per-eye disparity, no compose-time blending.
+ * Useful for debugging an app's own tile-aware rendering.
+ *
+ * **For "what the DP weaves" (post-compose, all layers)**: use the
+ * runtime-side trigger-file at `${TMPDIR:-/tmp}/displayxr_atlas_trigger`
+ * (POSIX) or `%TEMP%\displayxr_atlas_trigger` (Windows). See issue #210
+ * and `comp_*_compositor.{c,cpp,m}::*_service_trigger_file`.
  *
  * Each backend (D3D11/D3D12/GL/Metal/Vulkan) lives in its own `.cpp`/`.mm`
  * and is only compiled in by apps that need it. Filename helpers and the

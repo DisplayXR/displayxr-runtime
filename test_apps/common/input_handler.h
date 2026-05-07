@@ -86,9 +86,15 @@ struct InputState {
     // Eye tracking mode toggle (T key)
     bool eyeTrackingModeToggleRequested = false;
 
-    // 'I' key: snapshot the rendered atlas (cols × rows × renderW × renderH)
-    // to %USERPROFILE%\Pictures\DisplayXR\<app>-<N>_<cols>x<rows>.png. Skipped
-    // for 1×1 (mono) layouts. Filename auto-increments per (cols×rows).
+    // 'I' key: snapshot the **app's projection-layer atlas only** (cols ×
+    // rows × renderW × renderH) to %USERPROFILE%\Pictures\DisplayXR\
+    // <app>-<N>_<cols>x<rows>.png. One projection layer; HUD / window-space
+    // / quad layers and per-eye disparity are NOT included. Skipped for 1×1
+    // (mono) layouts. Filename auto-increments per (cols×rows).
+    //
+    // For the runtime's full post-compose atlas (all layers + DP-bound
+    // pixels), use the trigger file `displayxr_atlas_trigger` instead;
+    // see issue #210.
     bool captureAtlasRequested = false;
 
     // --- Gaussian-splat demo extensions (additive; unused by cube_* apps) ---
