@@ -625,7 +625,16 @@ static void RenderScene(MetalRenderer &r, id<MTLTexture> target,
     rpd.colorAttachments[0].texture = target;
     rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
     rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
-    rpd.colorAttachments[0].clearColor = MTLClearColorMake(0.05, 0.05, 0.08, 1.0);
+    // Transparent-background mode (DISPLAYXR_TRANSPARENT_BG=1) clears RGBA(0,0,0,0)
+    // so the desktop shows through everywhere the cube isn't drawn. Pairs with
+    // XrCocoaWindowBindingCreateInfoEXT.transparentBackgroundEnabled = XR_TRUE.
+    static const bool transparent_bg = []() {
+        const char *e = getenv("DISPLAYXR_TRANSPARENT_BG");
+        return e != nullptr && *e != '\0' && *e != '0';
+    }();
+    rpd.colorAttachments[0].clearColor = transparent_bg
+        ? MTLClearColorMake(0.0, 0.0, 0.0, 0.0)
+        : MTLClearColorMake(0.05, 0.05, 0.08, 1.0);
     rpd.depthAttachment.texture = r.depthTexture;
     rpd.depthAttachment.loadAction = MTLLoadActionClear;
     rpd.depthAttachment.storeAction = MTLStoreActionDontCare;
@@ -1257,6 +1266,22 @@ static bool CreateSession(AppXrSession &app, MetalRenderer &r)
     cocoaBinding.type = XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_EXT;
     cocoaBinding.next = nullptr;
     cocoaBinding.viewHandle = (__bridge void *)g_metalView;
+
+    // Optional transparent-background mode (spec v5).
+    {
+        const char *e = getenv("DISPLAYXR_TRANSPARENT_BG");
+        if (e != nullptr && *e != '\0' && *e != '0') {
+            cocoaBinding.transparentBackgroundEnabled = XR_TRUE;
+            // Make our app-owned NSWindow non-opaque too — the runtime only
+            // configures the CAMetalLayer it presents into for app-provided
+            // views; the NSWindow alpha is the app's responsibility.
+            if (g_metalView != nil && g_metalView.window != nil) {
+                [g_metalView.window setOpaque:NO];
+                [g_metalView.window setBackgroundColor:[NSColor clearColor]];
+            }
+            LOG_INFO("Transparent background ENABLED (DISPLAYXR_TRANSPARENT_BG=1)");
+        }
+    }
 
     if (app.hasCocoaWindowBinding) {
         metalBinding.next = &cocoaBinding;
