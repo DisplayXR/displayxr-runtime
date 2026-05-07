@@ -118,10 +118,7 @@ find_package(cJSON MODULE)
 include(FetchContent)
 FetchContent_Declare(displayxr_mcp
     GIT_REPOSITORY https://github.com/DisplayXR/displayxr-mcp.git
-    # TODO: bump back to a tagged release once feat/capture-mode is
-    # merged + tagged as v0.3.1. Pinned to the branch SHA in the meantime
-    # so the runtime can iterate against the new mode plumbing.
-    GIT_TAG 0c06c59)
+    GIT_TAG v0.3.1)
 # Build the stdio↔socket adapter alongside the lib so the Phase A test
 # scripts under tests/mcp/ can find a binary at a known path during dev
 # (build/_deps/displayxr_mcp-build/displayxr-mcp). Production
