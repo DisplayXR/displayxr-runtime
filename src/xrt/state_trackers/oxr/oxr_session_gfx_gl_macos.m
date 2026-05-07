@@ -38,9 +38,20 @@ oxr_session_populate_gl_macos(struct oxr_logger *log,
                                const void *next_ptr,
                                void *window_handle,
                                void *shared_iosurface,
+                               bool transparent_background,
                                struct oxr_session *sess)
 {
 	const XrGraphicsBindingOpenGLMacOSEXT *next = (const XrGraphicsBindingOpenGLMacOSEXT *)next_ptr;
+
+	// TODO: plumb transparent_background through comp_gl_compositor_create.
+	// The GL native macOS compositor uses NSOpenGLView, which would need
+	// setOpaque:NO + clear pixel-format alpha to match the Metal path. Not
+	// implemented in PR #4 — request via XR_EXT_cocoa_window_binding will
+	// be a no-op on the GL native path until then.
+	if (transparent_background) {
+		U_LOG_W("oxr_session_populate_gl_macos: transparentBackgroundEnabled requested but "
+		        "GL native compositor doesn't yet implement NSOpenGLView alpha — ignoring");
+	}
 
 	// Both windowed and shared IOSurface modes use the GL native compositor
 	struct xrt_device *xdev = get_role_head(sess->sys);
@@ -122,7 +133,7 @@ oxr_session_populate_gl_macos(struct oxr_logger *log,
 
 	xrt_result_t xret = comp_metal_compositor_create(
 	    xdev, window_handle, NULL, dp_factory_metal,
-	    offscreen, shared_iosurface, &xcn);
+	    offscreen, shared_iosurface, transparent_background, &xcn);
 	if (xret != XRT_SUCCESS) {
 		return oxr_error(log, XR_ERROR_INITIALIZATION_FAILED,
 		                 "Failed to create Metal native compositor for GL app: %d", xret);

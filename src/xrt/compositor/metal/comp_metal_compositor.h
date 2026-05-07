@@ -41,6 +41,13 @@ extern "C" {
  * @param shared_iosurface  IOSurfaceRef for shared texture output, or NULL.
  *                        When non-NULL, the compositor renders into this
  *                        IOSurface instead of the CAMetalLayer drawable.
+ * @param transparent_background When true, configures the NSWindow (if owned)
+ *                        and CAMetalLayer with isOpaque=NO so the desktop
+ *                        shows through alpha < 1 regions of the composited
+ *                        output. Per-pixel alpha flows through sim_display's
+ *                        alpha-native output stage; no chroma-key trick on
+ *                        macOS. (Sourced from
+ *                        XR_EXT_cocoa_window_binding.transparentBackgroundEnabled.)
  * @param[out] out_xc     Created compositor on success.
  * @return XRT_SUCCESS on success.
  *
@@ -53,6 +60,7 @@ comp_metal_compositor_create(struct xrt_device *xdev,
                              void *dp_factory_metal,
                              bool offscreen,
                              void *shared_iosurface,
+                             bool transparent_background,
                              struct xrt_compositor_native **out_xc);
 
 /*!

@@ -63,6 +63,7 @@ oxr_session_populate_vk_with_metal_native(struct oxr_logger *log,
                                            XrGraphicsBindingVulkanKHR const *next,
                                            void *window_handle,
                                            void *shared_iosurface,
+                                           bool transparent_background,
                                            struct oxr_session *sess)
 {
 	struct xrt_device *xdev = get_role_head(sess->sys);
@@ -85,6 +86,7 @@ oxr_session_populate_vk_with_metal_native(struct oxr_logger *log,
 	    dp_factory_metal,
 	    offscreen,
 	    shared_iosurface,
+	    transparent_background,
 	    &xcn);
 	if (xret != XRT_SUCCESS) {
 		return oxr_error(log, XR_ERROR_INITIALIZATION_FAILED,
@@ -246,6 +248,7 @@ oxr_session_populate_vk_native(struct oxr_logger *log,
                                 XrGraphicsBindingVulkanKHR const *next,
                                 void *window_handle,
                                 void *shared_texture_handle,
+                                bool transparent_background,
                                 struct oxr_session *sess)
 {
 	struct xrt_device *xdev = get_role_head(sess->sys);

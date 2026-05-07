@@ -605,7 +605,8 @@ ensure_ns_app(void)
 }
 
 static void
-create_window_on_main_thread(struct comp_metal_compositor *c, uint32_t width, uint32_t height, bool *out_success)
+create_window_on_main_thread(struct comp_metal_compositor *c, uint32_t width, uint32_t height,
+                             bool transparent_background, bool *out_success)
 {
 	ensure_ns_app();
 	NSRect frame = NSMakeRect(100, 100, width, height);
@@ -637,6 +638,17 @@ create_window_on_main_thread(struct comp_metal_compositor *c, uint32_t width, ui
 	c->metal_layer.device = c->device;
 	c->metal_layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
 	c->metal_layer.framebufferOnly = YES;
+
+	if (transparent_background) {
+		// macOS native transparency: NSWindow non-opaque + clear background +
+		// CAMetalLayer non-opaque lets the desktop show through any pixels
+		// the compositor writes with alpha < 1. sim_display preserves alpha
+		// natively to the drawable; no chroma-key trick.
+		[c->window setOpaque:NO];
+		[c->window setBackgroundColor:[NSColor clearColor]];
+		c->metal_layer.opaque = NO;
+		U_LOG_W("Transparent background enabled: NSWindow + CAMetalLayer set isOpaque=NO");
+	}
 
 	CGFloat scale = c->window.backingScaleFactor;
 	c->metal_layer.contentsScale = scale;
@@ -671,16 +683,17 @@ create_window_on_main_thread(struct comp_metal_compositor *c, uint32_t width, ui
 }
 
 static bool
-create_window(struct comp_metal_compositor *c, uint32_t width, uint32_t height)
+create_window(struct comp_metal_compositor *c, uint32_t width, uint32_t height,
+              bool transparent_background)
 {
 	__block bool success = false;
 
 	if ([NSThread isMainThread]) {
 		// Already on main thread — call directly to avoid deadlock
-		create_window_on_main_thread(c, width, height, &success);
+		create_window_on_main_thread(c, width, height, transparent_background, &success);
 	} else {
 		dispatch_sync(dispatch_get_main_queue(), ^{
-			create_window_on_main_thread(c, width, height, &success);
+			create_window_on_main_thread(c, width, height, transparent_background, &success);
 		});
 	}
 
@@ -688,7 +701,8 @@ create_window(struct comp_metal_compositor *c, uint32_t width, uint32_t height)
 }
 
 static bool
-setup_external_window(struct comp_metal_compositor *c, NSView *external_view)
+setup_external_window(struct comp_metal_compositor *c, NSView *external_view,
+                      bool transparent_background)
 {
 	c->view = external_view;
 	c->owns_window = false;
@@ -724,6 +738,14 @@ setup_external_window(struct comp_metal_compositor *c, NSView *external_view)
 	c->metal_layer.device = c->device;
 	c->metal_layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
 	c->metal_layer.framebufferOnly = NO; // Need shader read for blit
+
+	if (transparent_background) {
+		// External NSWindow is owned by the app — they're responsible for
+		// setOpaque:NO + clear background. We only configure the layer the
+		// compositor presents into.
+		c->metal_layer.opaque = NO;
+		U_LOG_W("Transparent background enabled: external CAMetalLayer set isOpaque=NO");
+	}
 
 	// Ensure Retina backing scale is applied so drawables are at physical resolution
 	CGFloat scale = 1.0;
@@ -2187,10 +2209,11 @@ comp_metal_compositor_create(struct xrt_device *xdev,
                              void *dp_factory_metal,
                              bool offscreen,
                              void *shared_iosurface,
+                             bool transparent_background,
                              struct xrt_compositor_native **out_xc)
 {
-	U_LOG_W("comp_metal_compositor_create: window_handle=%p, offscreen=%d, shared_iosurface=%p, dp_factory=%p",
-	        window_handle, offscreen, shared_iosurface, dp_factory_metal);
+	U_LOG_W("comp_metal_compositor_create: window_handle=%p, offscreen=%d, shared_iosurface=%p, dp_factory=%p, transparent_background=%d",
+	        window_handle, offscreen, shared_iosurface, dp_factory_metal, (int)transparent_background);
 
 	struct comp_metal_compositor *c = U_TYPED_CALLOC(struct comp_metal_compositor);
 	if (c == NULL) {
@@ -2263,7 +2286,7 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 	        window_handle, shared_iosurface, offscreen);
 	NSView *external_view = (__bridge NSView *)window_handle;
 	if (external_view != nil) {
-		if (!setup_external_window(c, external_view)) {
+		if (!setup_external_window(c, external_view, transparent_background)) {
 			os_mutex_destroy(&c->mutex);
 			free(c);
 			return XRT_ERROR_VULKAN;
@@ -2271,7 +2294,7 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 	} else if (shared_iosurface == NULL) {
 		// Only create a window when there's no shared IOSurface.
 		// With IOSurface, we render headless — no window needed.
-		if (!create_window(c, display_width, display_height)) {
+		if (!create_window(c, display_width, display_height, transparent_background)) {
 			os_mutex_destroy(&c->mutex);
 			free(c);
 			return XRT_ERROR_VULKAN;
