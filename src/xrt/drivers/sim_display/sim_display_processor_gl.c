@@ -381,6 +381,31 @@ create_program(const char *vs_source, const char *fs_source)
 
 
 /*
+ * sim_display GL preserves alpha to the default framebuffer — the blend /
+ * anaglyph / SBS fragment shaders write atlas alpha straight through.
+ * Declare alpha-native so callers can route transparency requests
+ * directly without chroma-key fallback.
+ */
+static bool
+sim_dp_gl_is_alpha_native(struct xrt_display_processor_gl *xdp)
+{
+	(void)xdp;
+	return true;
+}
+
+static void
+sim_dp_gl_set_chroma_key(struct xrt_display_processor_gl *xdp,
+                         uint32_t key_color,
+                         bool transparent_bg_enabled)
+{
+	(void)xdp;
+	(void)key_color;
+	(void)transparent_bg_enabled;
+	// Alpha-native — no chroma-key fill/strip required.
+}
+
+
+/*
  *
  * Exported creation function.
  *
@@ -402,6 +427,8 @@ sim_display_processor_gl_create(enum sim_display_output_mode mode,
 	sdp->base.destroy = sim_dp_gl_destroy;
 	sdp->base.process_atlas = sim_dp_gl_process_atlas;
 	sdp->base.get_predicted_eye_positions = sim_dp_gl_get_predicted_eye_positions;
+	sdp->base.is_alpha_native = sim_dp_gl_is_alpha_native;
+	sdp->base.set_chroma_key = sim_dp_gl_set_chroma_key;
 
 	// Nominal viewer parameters (same defaults as sim_display_hmd_create)
 	sdp->ipd_m = 0.06f;
