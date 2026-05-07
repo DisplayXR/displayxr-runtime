@@ -50,7 +50,8 @@ add_executable(cube_handle_metal_macos
     main.mm
     "${CMAKE_SOURCE_DIR}/../common/display3d_view.c"
     "${CMAKE_SOURCE_DIR}/../common/camera3d_view.c"
-    "${CMAKE_SOURCE_DIR}/../common/hud_overlay_macos.m"
+    "${CMAKE_SOURCE_DIR}/../common/hud_renderer_macos.mm"
+    "${CMAKE_SOURCE_DIR}/../common/xr_window_space_hud.cpp"
     # 'I' key atlas capture: filename + flash helpers + Metal readback
     "${CMAKE_SOURCE_DIR}/../common/atlas_capture_macos.mm"
     "${CMAKE_SOURCE_DIR}/../common/atlas_capture_metal.mm"
@@ -77,4 +78,6 @@ target_link_libraries(cube_handle_metal_macos PRIVATE
     "-framework Foundation"
     "-framework Cocoa"
     "-framework QuartzCore"
+    "-framework CoreText"
+    "-framework CoreGraphics"
 )

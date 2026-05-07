@@ -43,6 +43,8 @@
 #include "camera3d_view.h"
 #include "view_params.h"
 #include "atlas_capture.h"
+#include "xr_window_space_hud.h"
+#include "hud_renderer_macos.h"
 #include <openxr/XR_EXT_display_info.h>
 
 // ============================================================================
@@ -726,24 +728,28 @@ struct InputState {
 static InputState g_input;
 static const float CAMERA_HALF_TAN_VFOV = 0.32491969623f; // tan(18deg) -> 36deg vFOV
 
+// HUD window-space layer (XR_EXT_window_space_layer): replaces the legacy
+// NSView overlay so the runtime composes the HUD via the proper extension
+// path on macOS. Same constants as the other macOS test apps.
+static const uint32_t HUD_PIXEL_WIDTH = 380;
+static const uint32_t HUD_PIXEL_HEIGHT = 470;
+static const float HUD_WIDTH_FRACTION = 0.95f;
+
 // Performance stats
 static double g_avgFrameTime = 0.0;
 static float g_hudUpdateTimer = 0.0f;
 static uint32_t g_windowW = 1512, g_windowH = 823;
 static uint32_t g_renderW = 0, g_renderH = 0;
 
+// Cached HUD section strings, refreshed at HUD throttle rate (~2 Hz).
+static std::wstring g_hudSessionText, g_hudModeText, g_hudPerfText;
+static std::wstring g_hudDisplayText, g_hudEyeText, g_hudCameraText;
+static std::wstring g_hudStereoText, g_hudHelpText;
+
 static void SignalHandler(int)
 {
     g_running = false;
 }
-
-// ============================================================================
-// HUD overlay (semi-transparent text, rendered as NSView subview)
-// ============================================================================
-
-#import "hud_overlay_macos.h"
-
-static HudOverlayView *g_hudView = nil;
 
 // ============================================================================
 // macOS window creation (NSOpenGLView-backed)
@@ -831,10 +837,7 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height)
         [g_window makeKeyAndOrderFront:nil];
         [NSApp activateIgnoringOtherApps:YES];
 
-        // HUD overlay
-        NSRect hudFrame = NSMakeRect(10, 10, 420, 380);
-        g_hudView = [[HudOverlayView alloc] initWithFrame:hudFrame];
-        [g_glView addSubview:g_hudView];
+        // HUD now lives as an XR_EXT_window_space_layer composed by the runtime.
 
         // Pump events so the window appears
         NSEvent *event;
@@ -928,7 +931,12 @@ static void PumpMacOSEvents()
                     else if (ch == 'e') { g_input.keyE = true; }
                     else if (ch == 'q') { g_input.keyQ = true; }
                     else if (ch == ' ') { g_input.resetViewRequested = true; }
-                    else if (ch == '\t' && !isRepeat) { g_input.hudVisible = !g_input.hudVisible; }
+                    else if (ch == '\t' && !isRepeat &&
+                             ([event modifierFlags] & NSEventModifierFlagShift)) {
+                        // SHIFT+TAB so bare TAB stays free for the workspace shell's
+                        // focus-cycle binding (matches the Windows test apps).
+                        g_input.hudVisible = !g_input.hudVisible;
+                    }
                     else if (ch == 'v' && !isRepeat) {
                         if (g_input.renderingModeCount > 0) {
                             g_input.currentRenderingMode = (g_input.currentRenderingMode + 1) % g_input.renderingModeCount;
@@ -1483,6 +1491,54 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    // HUD window-space layer swapchain (XR_EXT_window_space_layer).
+    // GL on macOS routes through the Metal native compositor with IOSurface-
+    // backed textures, so the HUD swapchain images may be GL_TEXTURE_RECTANGLE
+    // instead of GL_TEXTURE_2D. Detect once at init time (same trick the main
+    // swapchain uses).
+    XrHudSwapchain hudSwapchain;
+    HudRendererMacOS hudRenderer = {};
+    std::vector<GLuint> hudGLTextures;
+    GLenum hudTexTarget = GL_TEXTURE_2D;
+    bool hudReady = false;
+    if (CreateHudSwapchain(app.session, HUD_PIXEL_WIDTH, HUD_PIXEL_HEIGHT, hudSwapchain)) {
+        std::vector<XrSwapchainImageOpenGLKHR> hudGL(hudSwapchain.imageCount,
+            {XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_KHR});
+        if (XR_SUCCEEDED(xrEnumerateSwapchainImages(hudSwapchain.swapchain,
+                hudSwapchain.imageCount, &hudSwapchain.imageCount,
+                (XrSwapchainImageBaseHeader*)hudGL.data()))) {
+            hudGLTextures.resize(hudSwapchain.imageCount);
+            for (uint32_t i = 0; i < hudSwapchain.imageCount; i++) {
+                hudGLTextures[i] = hudGL[i].image;
+            }
+            // Detect target: bind as 2D and ask for width — 0 means it's
+            // actually a rectangle texture (matches the pattern used for
+            // the main swapchain at line ~605).
+            if (!hudGLTextures.empty()) {
+                GLint prev = 0;
+                glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev);
+                glBindTexture(GL_TEXTURE_2D, hudGLTextures[0]);
+                GLint w = 0;
+                glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w);
+                glBindTexture(GL_TEXTURE_2D, prev);
+                hudTexTarget = (w > 0) ? GL_TEXTURE_2D : GL_TEXTURE_RECTANGLE;
+            }
+            if (InitializeHudRenderer(hudRenderer, HUD_PIXEL_WIDTH, HUD_PIXEL_HEIGHT)) {
+                hudReady = true;
+                LOG_INFO("HUD window-space layer ready (%ux%u, %u images, format %lld, target %s)",
+                    HUD_PIXEL_WIDTH, HUD_PIXEL_HEIGHT, hudSwapchain.imageCount,
+                    (long long)hudSwapchain.format,
+                    hudTexTarget == GL_TEXTURE_2D ? "GL_TEXTURE_2D" : "GL_TEXTURE_RECTANGLE");
+            } else {
+                LOG_WARN("HudRendererMacOS init failed - HUD disabled");
+            }
+        } else {
+            LOG_WARN("Failed to enumerate HUD swapchain images - HUD disabled");
+        }
+    } else {
+        LOG_WARN("Failed to create HUD swapchain - HUD disabled");
+    }
+
     // Initialize output mode from env var
     {
         const char *mode_str = getenv("SIM_DISPLAY_OUTPUT");
@@ -1504,7 +1560,7 @@ int main(int argc, char **argv)
     g_input.nominalViewerZ = app.nominalViewerZ;
 
     LOG_INFO("Entering main loop... (ESC to quit, drag to rotate, WASD to move, Space to reset)");
-    LOG_INFO("Controls: WASD/QE=Move, Drag=Look, Scroll=Scale, Space=Reset, V=Mode, Tab=HUD, ESC=Quit");
+    LOG_INFO("Controls: WASD/QE=Move, Drag=Look, Scroll=Scale, Space=Reset, V=Mode, Shift+Tab=HUD, ESC=Quit");
 
     auto lastTime = std::chrono::high_resolution_clock::now();
 
@@ -1795,8 +1851,49 @@ int main(int argc, char **argv)
         XrSwapchainImageReleaseInfo relInfo = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
         xrReleaseSwapchainImage(app.swapchain.swapchain, &relInfo);
 
-        // End frame
-        {
+        // Render HUD into the window-space layer swapchain (when visible).
+        bool hudSubmitted = false;
+        if (hudReady && g_input.hudVisible && rendered && frameState.shouldRender) {
+            uint32_t hudIndex = 0;
+            if (AcquireHudSwapchainImage(hudSwapchain, hudIndex)) {
+                uint32_t rowPitch = 0;
+                const void* pixels = RenderHudAndMap(hudRenderer, &rowPitch,
+                    g_hudSessionText, g_hudModeText, g_hudPerfText, g_hudDisplayText,
+                    g_hudEyeText, g_hudCameraText, g_hudStereoText, g_hudHelpText);
+                if (pixels) {
+                    GLint prev = 0;
+                    if (hudTexTarget == GL_TEXTURE_2D) {
+                        glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev);
+                    } else {
+                        glGetIntegerv(GL_TEXTURE_BINDING_RECTANGLE, &prev);
+                    }
+                    glBindTexture(hudTexTarget, hudGLTextures[hudIndex]);
+                    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+                    glTexSubImage2D(hudTexTarget, 0, 0, 0,
+                        (GLsizei)HUD_PIXEL_WIDTH, (GLsizei)HUD_PIXEL_HEIGHT,
+                        GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+                    glBindTexture(hudTexTarget, prev);
+                    UnmapHud(hudRenderer);
+                    hudSubmitted = true;
+                }
+                ReleaseHudSwapchainImage(hudSwapchain);
+            }
+        }
+
+        // End frame: projection-only when HUD hidden; projection + window-space HUD otherwise.
+        if (hudSubmitted) {
+            float hudAR = (float)HUD_PIXEL_WIDTH / (float)HUD_PIXEL_HEIGHT;
+            float windowAR = (g_windowW > 0 && g_windowH > 0)
+                ? (float)g_windowW / (float)g_windowH : 1.0f;
+            float fracW = HUD_WIDTH_FRACTION;
+            float fracH = fracW * windowAR / hudAR;
+            if (fracH > 1.0f) { fracH = 1.0f; fracW = hudAR / windowAR; }
+            SubmitWindowSpaceHudFrame(
+                app.session, app.localSpace, frameState.predictedDisplayTime,
+                XR_ENVIRONMENT_BLEND_MODE_OPAQUE,
+                projViews.data(), (uint32_t)eyeCount,
+                hudSwapchain, 0.0f, 0.0f, fracW, fracH, 0.0f);
+        } else {
             XrCompositionLayerProjection projLayer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
             projLayer.space = app.localSpace;
             projLayer.viewCount = (uint32_t)eyeCount;
@@ -1818,105 +1915,114 @@ int main(int argc, char **argv)
         // FPS tracking
         g_avgFrameTime = g_avgFrameTime * 0.95 + dt * 0.05;
 
-        // Update HUD overlay (throttled)
+        // Refresh cached HUD section strings (consumed each frame by RenderHudAndMap).
         g_hudUpdateTimer += dt;
         if (g_hudUpdateTimer >= 0.5f) {
             g_hudUpdateTimer = 0.0f;
-            @autoreleasepool {
-                if (g_input.hudVisible && g_hudView != nil) {
-                    double fps = (g_avgFrameTime > 0) ? 1.0 / g_avgFrameTime : 0;
-                    const char *sessionStateNames[] = {
-                        "UNKNOWN", "IDLE", "READY", "SYNCHRONIZED",
-                        "VISIBLE", "FOCUSED", "STOPPING", "LOSS_PENDING", "EXITING"};
-                    int stateIdx = (int)app.sessionState;
-                    const char *sessionStateName = (stateIdx >= 0 && stateIdx < 9)
-                        ? sessionStateNames[stateIdx] : "INVALID";
 
-                    const char *poseLabel = g_input.cameraMode ? "Virtual Camera" : "Virtual Display";
-                    const char *param1Label = g_input.cameraMode ? "Conv" : "Persp";
-                    const char *param2Label = g_input.cameraMode ? "Zoom" : "Scale";
-                    const char *kooimaMode = g_input.cameraMode ? "Camera-Centric [C=Toggle]" : "Display-Centric [C=Toggle]";
-                    const char *scrollHint = g_input.cameraMode ? "Scroll=Zoom" : "Scroll=Scale";
-                    const char *perspHint = g_input.cameraMode ? "Opt=Conv" : "Opt=Persp";
+            auto utf8ToW = [](const char* s) -> std::wstring {
+                NSString* ns = [NSString stringWithUTF8String:(s ? s : "")];
+                NSData* d = [ns dataUsingEncoding:NSUTF32LittleEndianStringEncoding];
+                size_t n = d.length / sizeof(wchar_t);
+                std::wstring w(n, L'\0');
+                if (n) memcpy((void*)w.data(), d.bytes, d.length);
+                return w;
+            };
 
-                    char valueLine[64];
-                    if (g_input.cameraMode) {
-                        float tanHFOV = CAMERA_HALF_TAN_VFOV / g_input.viewParams.zoomFactor;
-                        snprintf(valueLine, sizeof(valueLine), "tanHFOV: %.3f", tanHFOV);
-                    } else {
-                        float m2v = (g_input.viewParams.virtualDisplayHeight > 0.0f && app.displayHeightM > 0.0f)
-                            ? g_input.viewParams.virtualDisplayHeight / app.displayHeightM : 1.0f;
-                        snprintf(valueLine, sizeof(valueLine), "vHeight: %.3f  m2v: %.3f",
-                            g_input.viewParams.virtualDisplayHeight, m2v);
-                    }
+            const char* sessionStateNames[] = {
+                "UNKNOWN", "IDLE", "READY", "SYNCHRONIZED",
+                "VISIBLE", "FOCUSED", "STOPPING", "LOSS_PENDING", "EXITING"};
+            int stateIdx = (int)app.sessionState;
+            const char* sessionStateName = (stateIdx >= 0 && stateIdx < 9)
+                ? sessionStateNames[stateIdx] : "INVALID";
 
-                    const char *outputModeName = (g_input.currentRenderingMode < app.renderingModeCount)
-                        ? app.renderingModeNames[g_input.currentRenderingMode] : "?";
+            char buf[512];
+            snprintf(buf, sizeof(buf), "%s (OpenGL)\nSession: %s",
+                app.systemName, sessionStateName);
+            g_hudSessionText = utf8ToW(buf);
 
-                    // Build output mode hint: "1-N=Output" if >1 mode, empty if single
-                    NSString *outputHintStr = @"";
-                    if (app.renderingModeCount > 1) {
-                        outputHintStr = [NSString stringWithFormat:@"  0-%u=Mode", app.renderingModeCount - 1];
-                    }
+            const char* outputModeName = (g_input.currentRenderingMode < app.renderingModeCount)
+                ? app.renderingModeNames[g_input.currentRenderingMode] : "?";
+            const char* kooimaMode = g_input.cameraMode
+                ? "Camera-Centric [C=Toggle]" : "Display-Centric [C=Toggle]";
+            snprintf(buf, sizeof(buf),
+                "XR_EXT_cocoa_window_binding: %s (OpenGL)\nMode: %s (%s)\nKooima: %s",
+                app.hasCocoaWindowBinding ? "ACTIVE" : "NOT AVAILABLE",
+                outputModeName, display3D ? "3D" : "2D", kooimaMode);
+            g_hudModeText = utf8ToW(buf);
 
-                    // Build dynamic eye position lines based on active view count
-                    NSMutableString *eyeLines = [NSMutableString string];
-                    for (uint32_t e = 0; e < app.eyeCount && e < 8; e++) {
-                        [eyeLines appendFormat:@"Eye[%u]: (%.3f, %.3f, %.3f)\n",
-                            e, app.eyePositions[e][0], app.eyePositions[e][1], app.eyePositions[e][2]];
-                    }
+            double fps = (g_avgFrameTime > 0) ? 1.0 / g_avgFrameTime : 0;
+            snprintf(buf, sizeof(buf), "FPS: %.0f  (%.1f ms)\nRender: %ux%u  Window: %ux%u",
+                fps, g_avgFrameTime * 1000.0,
+                g_renderW, g_renderH, g_windowW, g_windowH);
+            g_hudPerfText = utf8ToW(buf);
 
-                    NSString *text = [NSString stringWithFormat:
-                        @"%s (OpenGL)\n"
-                        "Session: %s\n"
-                        "Mode: %s (%s)\n"
-                        "Kooima: %s\n"
-                        "FPS: %.0f  (%.1f ms)\n"
-                        "Render: %ux%u  Window: %ux%u\n"
-                        "Display: %.3f x %.3f m\n"
-                        "Scale: %.2f x %.2f\n"
-                        "Nominal: (%.3f, %.3f, %.3f)\n"
-                        "%@"
-                        "%s: (%.2f, %.2f, %.2f)\n"
-                        "IPD: %.2f  Parallax: %.2f\n"
-                        "%s: %.2f  %s: %.2f\n"
-                        "%s\n"
-                        "\n"
-                        "WASD/QE=Move  Drag=Look  Space=Reset\n"
-                        "%s  Shift=IPD  Ctrl=Parallax  %s\n"
-                        "V=Mode%@  Tab=HUD  ESC=Quit",
-                        app.systemName,
-                        sessionStateName,
-                        outputModeName,
-                        display3D ? "3D" : "2D",
-                        kooimaMode,
-                        fps, g_avgFrameTime * 1000.0,
-                        g_renderW, g_renderH,
-                        g_windowW, g_windowH,
-                        app.displayWidthM, app.displayHeightM,
-                        app.recommendedViewScaleX, app.recommendedViewScaleY,
-                        app.nominalViewerX, app.nominalViewerY, app.nominalViewerZ,
-                        eyeLines,
-                        poseLabel,
-                        g_input.cameraPosX, g_input.cameraPosY, g_input.cameraPosZ,
-                        g_input.viewParams.ipdFactor, g_input.viewParams.parallaxFactor,
-                        param1Label, g_input.cameraMode ? g_input.viewParams.invConvergenceDistance : g_input.viewParams.perspectiveFactor,
-                        param2Label, g_input.cameraMode ? g_input.viewParams.zoomFactor : g_input.viewParams.scaleFactor,
-                        valueLine,
-                        scrollHint, perspHint,
-                        outputHintStr];
-                    g_hudView.hudText = text;
-                    [g_hudView setNeedsDisplay:YES];
-                    [g_hudView setHidden:NO];
-                } else if (g_hudView != nil) {
-                    [g_hudView setHidden:YES];
-                }
+            snprintf(buf, sizeof(buf),
+                "Display: %.3f x %.3f m\nScale: %.2f x %.2f\nNominal: (%.3f, %.3f, %.3f)",
+                app.displayWidthM, app.displayHeightM,
+                app.recommendedViewScaleX, app.recommendedViewScaleY,
+                app.nominalViewerX, app.nominalViewerY, app.nominalViewerZ);
+            g_hudDisplayText = utf8ToW(buf);
+
+            std::string eyeLines;
+            for (uint32_t e = 0; e < app.eyeCount && e < 8; e++) {
+                char line[128];
+                snprintf(line, sizeof(line), "Eye[%u]: (%.3f, %.3f, %.3f)%s",
+                    e, app.eyePositions[e][0], app.eyePositions[e][1], app.eyePositions[e][2],
+                    (e + 1 < app.eyeCount && e + 1 < 8) ? "\n" : "");
+                eyeLines += line;
             }
+            g_hudEyeText = utf8ToW(eyeLines.c_str());
+
+            const char* poseLabel = g_input.cameraMode ? "Virtual Camera" : "Virtual Display";
+            snprintf(buf, sizeof(buf), "%s: (%.2f, %.2f, %.2f)",
+                poseLabel, g_input.cameraPosX, g_input.cameraPosY, g_input.cameraPosZ);
+            g_hudCameraText = utf8ToW(buf);
+
+            const char* param1Label = g_input.cameraMode ? "Conv" : "Persp";
+            const char* param2Label = g_input.cameraMode ? "Zoom" : "Scale";
+            float param1Val = g_input.cameraMode
+                ? g_input.viewParams.invConvergenceDistance : g_input.viewParams.perspectiveFactor;
+            float param2Val = g_input.cameraMode
+                ? g_input.viewParams.zoomFactor : g_input.viewParams.scaleFactor;
+            char valueLine[96];
+            if (g_input.cameraMode) {
+                float tanHFOV = CAMERA_HALF_TAN_VFOV / g_input.viewParams.zoomFactor;
+                snprintf(valueLine, sizeof(valueLine), "tanHFOV: %.3f", tanHFOV);
+            } else {
+                float m2v = (g_input.viewParams.virtualDisplayHeight > 0.0f && app.displayHeightM > 0.0f)
+                    ? g_input.viewParams.virtualDisplayHeight / app.displayHeightM : 1.0f;
+                snprintf(valueLine, sizeof(valueLine), "vHeight: %.3f  m2v: %.3f",
+                    g_input.viewParams.virtualDisplayHeight, m2v);
+            }
+            snprintf(buf, sizeof(buf), "IPD: %.2f  Parallax: %.2f\n%s: %.2f  %s: %.2f\n%s",
+                g_input.viewParams.ipdFactor, g_input.viewParams.parallaxFactor,
+                param1Label, param1Val, param2Label, param2Val, valueLine);
+            g_hudStereoText = utf8ToW(buf);
+
+            const char* scrollHint = g_input.cameraMode ? "Scroll=Zoom" : "Scroll=Scale";
+            const char* perspHint = g_input.cameraMode ? "Opt=Conv" : "Opt=Persp";
+            char outputHint[32] = "";
+            if (app.renderingModeCount > 1) {
+                snprintf(outputHint, sizeof(outputHint), "  0-%u=Mode", app.renderingModeCount - 1);
+            }
+            snprintf(buf, sizeof(buf),
+                "WASD/QE=Move  Drag=Look  Space=Reset\n"
+                "%s  Shift=IPD  Ctrl=Parallax  %s\n"
+                "V=Mode%s  Shift+Tab=HUD  ESC=Quit",
+                scrollHint, perspHint, outputHint);
+            g_hudHelpText = utf8ToW(buf);
         }
     }
 
     LOG_INFO("Shutting down...");
 
+    if (hudReady) {
+        CleanupHudRenderer(hudRenderer);
+    }
+    if (hudSwapchain.swapchain != XR_NULL_HANDLE) {
+        xrDestroySwapchain(hudSwapchain.swapchain);
+    }
     if (app.swapchain.swapchain)
         xrDestroySwapchain(app.swapchain.swapchain);
     if (app.localSpace)
