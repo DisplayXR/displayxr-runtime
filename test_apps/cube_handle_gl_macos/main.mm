@@ -721,8 +721,12 @@ struct InputState {
     bool renderingModeChangeRequested = false;
     bool cameraMode = false;
     float nominalViewerZ = 0.5f;
-    // 'I' key: snapshot the rendered atlas (cols × rows × renderW × renderH)
-    // to ~/Pictures/DisplayXR/<app>-<N>_<cols>x<rows>.png. Skipped for 1×1.
+    // 'I' key: snapshot the **app's projection-layer atlas only** (cols ×
+    // rows × renderW × renderH) to ~/Pictures/DisplayXR/<app>-<N>_
+    // <cols>x<rows>.png. One projection layer; HUD / window-space layers
+    // and per-eye disparity are NOT included. Skipped for 1×1. For the
+    // runtime's full post-compose atlas use the trigger file
+    // $TMPDIR/displayxr_atlas_trigger (see issue #210).
     bool captureAtlasRequested = false;
 };
 static InputState g_input;
