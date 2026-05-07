@@ -1075,7 +1075,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     LOG_INFO("");
     LOG_INFO("=== Entering main loop ===");
-    LOG_INFO("Controls: WASD=Fly, QE=Up/Down, Mouse=Look, Space/DblClick=Reset, V=Mode, TAB=HUD, F11=Fullscreen, ESC=Quit");
+    LOG_INFO("Controls: WASD=Fly, QE=Up/Down, Mouse=Look, Space/DblClick=Reset, V=Mode, SHIFT+TAB=HUD, F11=Fullscreen, ESC=Quit");
     LOG_INFO("");
 
     // Set virtual display height (app units). 0.24 = 4x the 0.06m cube height.

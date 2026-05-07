@@ -50,7 +50,7 @@ static bool g_inSizeMove = false;  // True while user is dragging/resizing the w
 static const uint32_t HUD_PIXEL_WIDTH = 380;
 static const uint32_t HUD_PIXEL_HEIGHT = 470;
 static const float CAMERA_HALF_TAN_VFOV = 0.32491969623f; // tan(18°) → 36° vFOV
-static const float HUD_WIDTH_FRACTION = 0.30f;
+static const float HUD_WIDTH_FRACTION = 0.95f;
 
 // Fullscreen state
 static bool g_fullscreen = false;
@@ -883,7 +883,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     LOG_INFO("=== Entering main loop ===");
     LOG_INFO("XR rendering happens in the application window (XR_EXT_win32_window_binding)");
     LOG_INFO("Single-threaded: message pump + render on the main thread (WM_PAINT during drag/resize)");
-    LOG_INFO("Controls: WASD=Fly, QE=Up/Down, Mouse=Look, Space/DblClick=Reset, P=Parallax, V=Mode, TAB=HUD, F11=Fullscreen, ESC=Quit");
+    LOG_INFO("Controls: WASD=Fly, QE=Up/Down, Mouse=Look, Space/DblClick=Reset, P=Parallax, V=Mode, SHIFT+TAB=HUD, F11=Fullscreen, ESC=Quit");
     LOG_INFO("");
 
     PerformanceStats perfStats = {};
