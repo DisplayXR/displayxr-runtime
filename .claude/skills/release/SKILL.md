@@ -192,6 +192,13 @@ Verify:
 - Tag matches [FULL_TAG]
 - Asset list contains DisplayXRSetup-*.exe with non-zero size
 
+### Step 5.1: Cleanup staging dir
+Only after the verification above passes. If verification fails, leave the dir for inspection.
+```bash
+rm -rf _release_assets/
+```
+Phase 4.1a does not create this dir, so the `rm -rf` is a no-op there — safe to run unconditionally.
+
 ### Notes template
 Group commits from `git log $PREV_TAG..[FULL_TAG] --oneline --no-merges` by prefix:
 - **Highlights** — 1-3 line summary of the release's main change (manually written, not auto-grouped)
