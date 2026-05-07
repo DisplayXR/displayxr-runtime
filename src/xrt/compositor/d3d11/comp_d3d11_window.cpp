@@ -324,9 +324,12 @@ workspace_compute_modifiers(void)
 /*!
  * Check if a virtual key code is reserved for workspace controls.
  * These keys are NOT forwarded to the focused app in workspace mode.
+ *
+ * SHIFT+TAB is forwarded (apps use it as a HUD toggle); only bare TAB
+ * is reserved for workspace focus cycling.
  */
 static bool
-is_workspace_reserved_key(WPARAM vk)
+is_workspace_reserved_key(WPARAM vk, bool shift)
 {
 	// Only true workspace-management keys are reserved.
 	// V, P, 0-9 are forwarded to the app (it may use them for its own purposes).
@@ -334,11 +337,9 @@ is_workspace_reserved_key(WPARAM vk)
 	// tries to change rendering mode via xrRequestDisplayRenderingModeEXT,
 	// that call is blocked in workspace/IPC mode.
 	switch (vk) {
-	case VK_TAB:    // Cycle focus
-	case VK_DELETE: // Close focused app
-		return true;
-	default:
-		return false;
+	case VK_TAB:    return !shift;  // bare TAB cycles focus; Shift+TAB → app
+	case VK_DELETE: return true;    // Close focused app
+	default:        return false;
 	}
 }
 
@@ -600,8 +601,10 @@ wnd_proc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 				                     message, wParam, lParam, &handled);
 			}
 #endif
-			if (is_workspace_reserved_key(wParam)) {
-				// Workspace-only keys (TAB, DELETE) → don't forward to app
+			bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+			if (is_workspace_reserved_key(wParam, shift)) {
+				// Workspace-only keys (bare TAB, DELETE) → don't forward to app.
+				// SHIFT+TAB falls through and gets PostMessage'd below.
 				return 0;
 			}
 			// ESC: only suppress when a window is maximized (fullscreen restore).
