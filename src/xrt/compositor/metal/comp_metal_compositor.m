@@ -1278,24 +1278,22 @@ metal_compositor_render_hud(struct comp_metal_compositor *c, float dt,
 	[encoder endEncoding];
 }
 
-// Service a pending MCP capture_frame request. Blits the content
-// region of c->atlas_texture (tile_columns × view_width by tile_rows
-// × view_height — what the app actually wrote, matching what the
-// compositor crops and hands to the DP) into a shared MTLBuffer,
-// swaps BGRA→RGBA, and writes a single PNG.
-static void
-metal_compositor_service_mcp_capture(struct comp_metal_compositor *c, id<MTLCommandBuffer> render_cmd_buf)
+// Blit the content region of c->atlas_texture (tile_columns × view_width
+// by tile_rows × view_height — what the app actually wrote, matching what
+// the compositor crops and hands to the DP) into a shared MTLBuffer, swap
+// BGRA→RGBA, and write @p path as PNG. Caller must have already committed
+// @p render_cmd_buf — we waitUntilCompleted on it for sync.
+static bool
+metal_compositor_capture_atlas_to_png(struct comp_metal_compositor *c,
+                                      id<MTLCommandBuffer> render_cmd_buf,
+                                      const char *path)
 {
-	char path[MCP_CAPTURE_PATH_MAX];
-	if (!mcp_capture_poll(&c->mcp_capture, path)) {
-		return;
-	}
 	if (c->atlas_texture == nil || c->tile_columns == 0 || c->tile_rows == 0 ||
 	    c->view_width == 0 || c->view_height == 0) {
-		mcp_capture_complete(&c->mcp_capture, false);
-		return;
+		return false;
 	}
 
+	bool ok = false;
 	@autoreleasepool {
 		uint32_t content_w = c->tile_columns * c->view_width;
 		uint32_t content_h = c->tile_rows * c->view_height;
@@ -1313,8 +1311,7 @@ metal_compositor_service_mcp_capture(struct comp_metal_compositor *c, id<MTLComm
 		id<MTLBuffer> staging = [c->device newBufferWithLength:buf_bytes
 		                                               options:MTLResourceStorageModeShared];
 		if (staging == nil) {
-			mcp_capture_complete(&c->mcp_capture, false);
-			return;
+			return false;
 		}
 
 		// Render cmd_buf was already committed; wait for it so the
@@ -1339,19 +1336,75 @@ metal_compositor_service_mcp_capture(struct comp_metal_compositor *c, id<MTLComm
 		// Atlas format is BGRA8Unorm — swap into RGBA for stbi_write_png.
 		uint8_t *bgra = (uint8_t *)staging.contents;
 		uint8_t *rgba = malloc(buf_bytes);
-		if (rgba == NULL) {
-			mcp_capture_complete(&c->mcp_capture, false);
-			return;
+		if (rgba != NULL) {
+			for (size_t i = 0; i < buf_bytes; i += 4) {
+				rgba[i + 0] = bgra[i + 2];
+				rgba[i + 1] = bgra[i + 1];
+				rgba[i + 2] = bgra[i + 0];
+				rgba[i + 3] = bgra[i + 3];
+			}
+			ok = stbi_write_png(path, (int)content_w, (int)content_h, 4, rgba, (int)row_pitch) != 0;
+			free(rgba);
 		}
-		for (size_t i = 0; i < buf_bytes; i += 4) {
-			rgba[i + 0] = bgra[i + 2];
-			rgba[i + 1] = bgra[i + 1];
-			rgba[i + 2] = bgra[i + 0];
-			rgba[i + 3] = bgra[i + 3];
+	}
+	return ok;
+}
+
+// Service a pending MCP capture_frame request — thin wrapper around
+// metal_compositor_capture_atlas_to_png that handles the cross-thread
+// hand-off with the MCP server.
+static void
+metal_compositor_service_mcp_capture(struct comp_metal_compositor *c, id<MTLCommandBuffer> render_cmd_buf)
+{
+	char path[MCP_CAPTURE_PATH_MAX];
+	if (!mcp_capture_poll(&c->mcp_capture, path)) {
+		return;
+	}
+	bool ok = metal_compositor_capture_atlas_to_png(c, render_cmd_buf, path);
+	mcp_capture_complete(&c->mcp_capture, ok);
+}
+
+// Trigger-file capture path — same readback as the MCP path, but driven
+// by the existence of $TMPDIR/displayxr_atlas_trigger. Lets developers
+// snapshot the post-compose atlas without an MCP client. Mirrors the
+// service-mode `workspace_screenshot_trigger` path in comp_d3d11_service.cpp.
+static void
+metal_compositor_service_trigger_file(struct comp_metal_compositor *c,
+                                      id<MTLCommandBuffer> render_cmd_buf)
+{
+	static char trigger_path[MCP_CAPTURE_PATH_MAX] = {0};
+	static char out_path[MCP_CAPTURE_PATH_MAX] = {0};
+	if (trigger_path[0] == '\0') {
+		const char *tmp = getenv("TMPDIR");
+		if (tmp == NULL || tmp[0] == '\0') {
+			tmp = "/tmp";
 		}
-		bool ok = stbi_write_png(path, (int)content_w, (int)content_h, 4, rgba, (int)row_pitch) != 0;
-		free(rgba);
-		mcp_capture_complete(&c->mcp_capture, ok);
+		// Strip trailing slash so the format string below stays stable.
+		size_t tlen = strlen(tmp);
+		char tmp_clean[MCP_CAPTURE_PATH_MAX];
+		if (tlen > 0 && tmp[tlen - 1] == '/') {
+			tlen = tlen - 1;
+		}
+		if (tlen >= sizeof(tmp_clean)) {
+			tlen = sizeof(tmp_clean) - 1;
+		}
+		memcpy(tmp_clean, tmp, tlen);
+		tmp_clean[tlen] = '\0';
+		snprintf(trigger_path, sizeof(trigger_path), "%s/displayxr_atlas_trigger", tmp_clean);
+		snprintf(out_path, sizeof(out_path), "%s/displayxr_atlas.png", tmp_clean);
+	}
+
+	struct stat st;
+	if (stat(trigger_path, &st) != 0) {
+		return;
+	}
+	unlink(trigger_path);
+
+	bool ok = metal_compositor_capture_atlas_to_png(c, render_cmd_buf, out_path);
+	if (ok) {
+		U_LOG_I("Atlas captured to %s", out_path);
+	} else {
+		U_LOG_W("Atlas capture failed (trigger %s)", trigger_path);
 	}
 }
 
@@ -1978,6 +2031,11 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	// blit the atlas into a CPU-visible buffer, encode PNG(s), and
 	// unblock the waiter. Pays for itself only when actively capturing.
 	metal_compositor_service_mcp_capture(c, cmd_buf);
+
+	// Same readback, but driven by a trigger file
+	// ($TMPDIR/displayxr_atlas_trigger) so devs can snapshot the
+	// post-compose atlas without an MCP client. See issue #210.
+	metal_compositor_service_trigger_file(c, cmd_buf);
 
 	// Reset layer accumulator
 	c->layer_accum.layer_count = 0;

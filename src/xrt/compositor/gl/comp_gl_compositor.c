@@ -59,6 +59,13 @@
 #include <string.h>
 #include <assert.h>
 
+#ifdef XRT_OS_WINDOWS
+#include <windows.h>
+#else
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
 
 // GL function loading via GLAD (cross-platform)
 #ifdef XRT_OS_WINDOWS
@@ -971,21 +978,16 @@ gl_crop_and_process_dp(struct comp_gl_compositor *c,
  *
  */
 
-// Service a pending MCP capture_frame request. Reads the content
-// region of atlas_texture (tile_columns × view_width by tile_rows ×
-// view_height — what actually got composited, matching what the
-// compositor crops and sends to the DP), flips Y, and writes one PNG.
-static void
-gl_compositor_service_mcp_capture(struct comp_gl_compositor *c)
+// Read the content region of atlas_texture (tile_columns × view_width by
+// tile_rows × view_height — what actually got composited, matching what
+// the compositor crops and sends to the DP), flip Y, and write @p path
+// as PNG. Caller must have a current GL context.
+static bool
+gl_compositor_capture_atlas_to_png(struct comp_gl_compositor *c, const char *path)
 {
-	char path[MCP_CAPTURE_PATH_MAX];
-	if (!mcp_capture_poll(&c->mcp_capture, path)) {
-		return;
-	}
 	if (c->atlas_texture == 0 || c->tile_columns == 0 || c->tile_rows == 0 ||
 	    c->view_width == 0 || c->view_height == 0) {
-		mcp_capture_complete(&c->mcp_capture, false);
-		return;
+		return false;
 	}
 
 	uint32_t content_w = c->tile_columns * c->view_width;
@@ -1000,8 +1002,7 @@ gl_compositor_service_mcp_capture(struct comp_gl_compositor *c)
 	if (bottom_up == NULL || top_down == NULL) {
 		free(bottom_up);
 		free(top_down);
-		mcp_capture_complete(&c->mcp_capture, false);
-		return;
+		return false;
 	}
 
 	// Attach atlas to a temporary read FBO; glReadPixels returns origin-
@@ -1030,7 +1031,73 @@ gl_compositor_service_mcp_capture(struct comp_gl_compositor *c)
 
 	bool ok = stbi_write_png(path, (int)content_w, (int)content_h, 4, top_down, (int)row_pitch) != 0;
 	free(top_down);
+	return ok;
+}
+
+// Service a pending MCP capture_frame request — thin wrapper around
+// gl_compositor_capture_atlas_to_png that handles the cross-thread
+// hand-off with the MCP server.
+static void
+gl_compositor_service_mcp_capture(struct comp_gl_compositor *c)
+{
+	char path[MCP_CAPTURE_PATH_MAX];
+	if (!mcp_capture_poll(&c->mcp_capture, path)) {
+		return;
+	}
+	bool ok = gl_compositor_capture_atlas_to_png(c, path);
 	mcp_capture_complete(&c->mcp_capture, ok);
+}
+
+// Trigger-file capture path — same readback as the MCP path, driven
+// by the existence of a trigger file so devs can snapshot the post-
+// compose atlas without an MCP client. POSIX side uses
+// $TMPDIR/displayxr_atlas_trigger; Windows side (XRT_OS_WINDOWS) uses
+// %TEMP%\displayxr_atlas_trigger to mirror the d3d11_service path.
+// See issue #210.
+static void
+gl_compositor_service_trigger_file(struct comp_gl_compositor *c)
+{
+	static char trigger_path[MCP_CAPTURE_PATH_MAX] = {0};
+	static char out_path[MCP_CAPTURE_PATH_MAX] = {0};
+	if (trigger_path[0] == '\0') {
+#ifdef XRT_OS_WINDOWS
+		const char *tmp = getenv("TEMP");
+		if (tmp == NULL || tmp[0] == '\0') tmp = "C:\\Temp";
+		snprintf(trigger_path, sizeof(trigger_path), "%s\\displayxr_atlas_trigger", tmp);
+		snprintf(out_path, sizeof(out_path), "%s\\displayxr_atlas.png", tmp);
+#else
+		const char *tmp = getenv("TMPDIR");
+		if (tmp == NULL || tmp[0] == '\0') tmp = "/tmp";
+		size_t tlen = strlen(tmp);
+		if (tlen > 0 && tmp[tlen - 1] == '/') tlen = tlen - 1;
+		char tmp_clean[MCP_CAPTURE_PATH_MAX];
+		if (tlen >= sizeof(tmp_clean)) tlen = sizeof(tmp_clean) - 1;
+		memcpy(tmp_clean, tmp, tlen);
+		tmp_clean[tlen] = '\0';
+		snprintf(trigger_path, sizeof(trigger_path), "%s/displayxr_atlas_trigger", tmp_clean);
+		snprintf(out_path, sizeof(out_path), "%s/displayxr_atlas.png", tmp_clean);
+#endif
+	}
+
+#ifdef XRT_OS_WINDOWS
+	if (GetFileAttributesA(trigger_path) == INVALID_FILE_ATTRIBUTES) {
+		return;
+	}
+	DeleteFileA(trigger_path);
+#else
+	struct stat st;
+	if (stat(trigger_path, &st) != 0) {
+		return;
+	}
+	unlink(trigger_path);
+#endif
+
+	bool ok = gl_compositor_capture_atlas_to_png(c, out_path);
+	if (ok) {
+		U_LOG_I("Atlas captured to %s", out_path);
+	} else {
+		U_LOG_W("Atlas capture failed (trigger %s)", trigger_path);
+	}
 }
 
 
@@ -1592,6 +1659,10 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 	// glReadPixels from atlas_texture is valid. Early-returns when no
 	// request is pending.
 	gl_compositor_service_mcp_capture(c);
+
+	// Same readback driven by a trigger file (no MCP client required).
+	// See issue #210.
+	gl_compositor_service_trigger_file(c);
 
 	// Restore previous GL context (critical for shared texture mode where
 	// app has its own context and needs it back after compositor work)
