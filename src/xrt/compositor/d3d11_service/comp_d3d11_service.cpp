@@ -765,6 +765,33 @@ struct d3d11_multi_client_slot
 	uint32_t content_view_w;
 	uint32_t content_view_h;
 
+	//! Window-space layer snapshot for `multi_compositor_render`'s WS pass.
+	//! Updated under `ws_snapshot_mutex` at the end of compositor_layer_commit
+	//! (after all layers for this frame have been added and processed),
+	//! read by multi-comp under the same mutex. Decouples multi-comp from
+	//! the per-client layer accumulator's mid-frame transitions
+	//! (`compositor_layer_begin` resets `layer_count=0`; a read between
+	//! that reset and the add of the WS layer would see no HUD →
+	//! per-frame HUD flicker).
+	std::mutex ws_snapshot_mutex;
+	struct comp_layer ws_snapshot[XRT_MAX_LAYERS];
+	uint32_t ws_snapshot_count;
+
+	//! Runtime-side cache of the WS layer's source texture, populated by
+	//! GPU `CopyResource` from the app's HUD swapchain whenever
+	//! multi_compositor_render successfully `AcquireSync`s the cross-process
+	//! keyed mutex. Multi-comp always blits from THIS cache (not the live
+	//! HUD swapchain) — when an `AcquireSync` fails (cube is mid-write
+	//! holding the mutex past our timeout), the previous tick's content
+	//! is still here, so the HUD does not flicker out for one frame.
+	//! One cache per WS layer index (matches `ws_snapshot[i]`); recreated
+	//! lazily when the source dim changes.
+	wil::com_ptr<ID3D11Texture2D> hud_cache_tex[XRT_MAX_LAYERS];
+	wil::com_ptr<ID3D11ShaderResourceView> hud_cache_srv[XRT_MAX_LAYERS];
+	uint32_t hud_cache_w[XRT_MAX_LAYERS];
+	uint32_t hud_cache_h[XRT_MAX_LAYERS];
+	bool hud_cache_valid[XRT_MAX_LAYERS]; // true once at least one acquire succeeded
+
 	//! Virtual window position in 3D space (identity = centered on display).
 	struct xrt_pose window_pose;
 
@@ -1986,146 +2013,13 @@ render_quad_layer(struct d3d11_service_system *sys,
 	sys->context->PSSetShaderResources(0, 1, &null_srv);
 }
 
-// Window-space layers (XR_EXT_window_space_layer) are flat 2D overlays drawn
-// into the per-client atlas in the same per-view tile as the projection
-// content. Per-eye disparity is applied as a horizontal shift in window-
-// fractional coordinates; the multi-compositor's later 3D projection of the
-// per-client atlas onto the slot's window plane turns that shift into
-// stereo parallax — i.e. the HUD appears to float in front of the window.
-//
-// Mirrors the standalone Vulkan path at comp_multi_system.c:1276-1310.
-// In workspace mode the d3d11_service per-client atlas pass is the only
-// place app window-space layers reach the screen — the multi-compositor
-// reads this atlas to populate the combined output.
-static void
-render_window_space_layer(struct d3d11_service_system *sys,
-                          const struct comp_layer *layer,
-                          uint32_t view_index)
-{
-	const struct xrt_layer_data *data = &layer->data;
-	const struct xrt_layer_window_space_data *ws = &data->window_space;
-
-	struct xrt_swapchain *xsc = layer->sc_array[0];
-	if (xsc == nullptr) {
-		return;
-	}
-	struct d3d11_service_swapchain *sc = d3d11_service_swapchain_from_xrt(xsc);
-	uint32_t image_index = ws->sub.image_index;
-	if (image_index >= sc->image_count) {
-		return;
-	}
-	ID3D11ShaderResourceView *srv = sc->images[image_index].srv.get();
-	if (srv == nullptr) {
-		return;
-	}
-
-	D3D11_TEXTURE2D_DESC tex_desc = {};
-	sc->images[image_index].texture->GetDesc(&tex_desc);
-
-	// Cross-process visibility for service-created swapchains (mirrors the
-	// chrome blit pattern at line ~8142). App-created swapchains skip this
-	// — their content is on the runtime's device already.
-	IDXGIKeyedMutex *mutex = sc->images[image_index].keyed_mutex.get();
-	bool mutex_held = false;
-	if (sc->service_created && mutex != nullptr && !sc->images[image_index].mutex_acquired) {
-		HRESULT hr = mutex->AcquireSync(0, 4 /* ms */);
-		if (SUCCEEDED(hr)) {
-			mutex_held = true;
-		}
-	}
-
-	// Per-eye horizontal shift. View 0 = left eye, view 1 = right eye for
-	// stereo. Mono renders without disparity. Matches comp_multi_system.c:1299.
-	float eye_shift = 0.0f;
-	if (sys->hardware_display_3d) {
-		eye_shift = (view_index == 0) ? -ws->disparity / 2.0f : +ws->disparity / 2.0f;
-	}
-
-	// Tile origin in atlas pixels. Mono fills the visible output region.
-	uint32_t tile_x = 0, tile_y = 0;
-	uint32_t tile_w = sys->view_width;
-	uint32_t tile_h = sys->view_height;
-	if (sys->hardware_display_3d) {
-		u_tiling_view_origin(view_index, sys->tile_columns,
-		                     sys->view_width, sys->view_height,
-		                     &tile_x, &tile_y);
-	} else {
-		tile_w = (sys->output_width < sys->display_width) ? sys->output_width : sys->display_width;
-		tile_h = (sys->output_height < sys->display_height) ? sys->output_height : sys->display_height;
-	}
-
-	// Window-fractional → tile-pixel destination rect.
-	float dst_x = (float)tile_x + (ws->x + eye_shift) * (float)tile_w;
-	float dst_y = (float)tile_y + ws->y * (float)tile_h;
-	float dst_w = ws->width * (float)tile_w;
-	float dst_h = ws->height * (float)tile_h;
-
-	// Source rect — sub.norm_rect is normalized [0..1]; blit shader needs pixels.
-	float src_x = ws->sub.norm_rect.x * (float)tex_desc.Width;
-	float src_y = ws->sub.norm_rect.y * (float)tex_desc.Height;
-	float src_w = ws->sub.norm_rect.w * (float)tex_desc.Width;
-	float src_h = ws->sub.norm_rect.h * (float)tex_desc.Height;
-	if (data->flip_y) {
-		src_y += src_h;
-		src_h = -src_h;
-	}
-
-	uint32_t atlas_w = sys->base.info.display_pixel_width;
-	uint32_t atlas_h = sys->base.info.display_pixel_height;
-	if (atlas_w == 0 || atlas_h == 0) {
-		atlas_w = sys->display_width;
-		atlas_h = sys->display_height;
-	}
-
-	sys->context->VSSetShader(sys->blit_vs.get(), nullptr, 0);
-	sys->context->PSSetShader(sys->blit_ps.get(), nullptr, 0);
-	sys->context->VSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
-	sys->context->PSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
-	sys->context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-	sys->context->IASetInputLayout(nullptr);
-	sys->context->RSSetState(sys->rasterizer_state.get());
-	sys->context->OMSetDepthStencilState(sys->depth_disabled.get(), 0);
-	set_blend_state(sys, data);
-
-	D3D11_MAPPED_SUBRESOURCE mapped;
-	if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
-	                                D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
-		BlitConstants *cb = static_cast<BlitConstants *>(mapped.pData);
-		memset(cb, 0, sizeof(*cb));
-		cb->src_rect[0] = src_x;
-		cb->src_rect[1] = src_y;
-		cb->src_rect[2] = src_w;
-		cb->src_rect[3] = src_h;
-		cb->src_size[0] = (float)tex_desc.Width;
-		cb->src_size[1] = (float)tex_desc.Height;
-		cb->dst_offset[0] = dst_x;
-		cb->dst_offset[1] = dst_y;
-		cb->dst_size[0] = (float)atlas_w;
-		cb->dst_size[1] = (float)atlas_h;
-		cb->dst_rect_wh[0] = dst_w;
-		cb->dst_rect_wh[1] = dst_h;
-		cb->convert_srgb = 0.0f;
-		cb->quad_mode = 0.0f; // axis-aligned (dst_offset + dst_rect_wh)
-		cb->corner_radius = 0.0f;
-		cb->corner_aspect = 0.0f;
-		cb->edge_feather = 0.0f;
-		cb->glow_intensity = 0.0f;
-		cb->chrome_alpha = 0.0f; // 0 = no fade (full opacity), per shader semantic
-		// corner_depth_ndc left at 0 (front; depth_disabled bound below)
-		sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
-	}
-
-	sys->context->PSSetShaderResources(0, 1, &srv);
-	sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
-	sys->context->Draw(4, 0);
-
-	ID3D11ShaderResourceView *null_srv = nullptr;
-	sys->context->PSSetShaderResources(0, 1, &null_srv);
-
-	if (mutex_held) {
-		mutex->ReleaseSync(0);
-	}
-}
+// Window-space layer (XR_EXT_window_space_layer) rendering is now inline
+// in `multi_compositor_render` (search for "Window-space layer pass") —
+// the HUD blits onto the combined atlas alongside chrome rather than into
+// the per-client atlas, so all WS GPU work runs on the capture-render
+// thread under `sys->render_mutex` and avoids the cross-thread D3D11
+// immediate-context contention that destabilised rendering when WS draws
+// were issued from `compositor_layer_commit`.
 
 static void
 render_cylinder_layer(struct d3d11_service_system *sys,
@@ -8420,6 +8314,260 @@ after_key_shortcuts:
 		}
 
 		// (Focus glow is now drawn before content blit, inside the per-view loop above)
+
+		// Window-space layer pass (XR_EXT_window_space_layer). The HUD blit
+		// runs HERE, on the capture-render thread under `sys->render_mutex`,
+		// not from the per-client commit thread. The previous design drew
+		// into the per-client atlas from `compositor_layer_commit`; even
+		// briefly taking `render_mutex` on the commit thread destabilised
+		// rendering (asymmetric left-eye flicker on one of two cubes),
+		// likely D3D11 immediate-context contention with chrome's in-flight
+		// work. Drawing into the combined atlas alongside chrome keeps all
+		// WS GPU work on the same thread that owns the combined atlas.
+		//
+		// Per-eye HUD pixel rect = window's projected rect (`eye_rect_*`,
+		// already computed above for the content blit) shifted by HUD's
+		// window-fractional `(ws->x, ws->y)` and an extra disparity-driven
+		// shift along X for forward-depth parallax. ws->disparity is in
+		// window-fractional coords; multiplied by `eye_rect_w` it becomes a
+		// pixel shift on the combined atlas. With disparity == 0 the HUD
+		// sits at the window plane (zero parallax between eyes).
+		//
+		// AcquireSync is hoisted above the per-view loop (one acquire per
+		// HUD layer per multi-comp tick), matching the chrome blit pattern.
+		// The cube's `xrReleaseSwapchainImage` already released key=0 on
+		// its side; we acquire/release on the runtime device once per tick
+		// to flush cross-process GPU caches.
+		//
+		// Capture clients have no layer accumulator → skipped. We read from
+		// the slot's `ws_snapshot` (populated under `ws_snapshot_mutex` at
+		// the end of `compositor_layer_commit`) rather than the live
+		// `layer_accum` — the live accumulator would race with the cube's
+		// `xrBeginFrame` reset, causing per-frame HUD flicker.
+		if (mc->clients[s].client_type != CLIENT_TYPE_CAPTURE) {
+			// Local copy so the AcquireSync/Draw work below runs without
+			// holding `ws_snapshot_mutex` (would otherwise serialize with
+			// `compositor_layer_commit`'s snapshot write).
+			struct comp_layer ws_layers_local[XRT_MAX_LAYERS];
+			uint32_t ws_layers_local_count = 0;
+			{
+				std::lock_guard<std::mutex> snap_lock(mc->clients[s].ws_snapshot_mutex);
+				ws_layers_local_count = mc->clients[s].ws_snapshot_count;
+				for (uint32_t i = 0; i < ws_layers_local_count; i++) {
+					ws_layers_local[i] = mc->clients[s].ws_snapshot[i];
+				}
+			}
+			for (uint32_t li = 0; li < ws_layers_local_count && li < XRT_MAX_LAYERS; li++) {
+				struct comp_layer *layer = &ws_layers_local[li];
+				if (layer->data.type != XRT_LAYER_WINDOW_SPACE) {
+					continue;
+				}
+				const struct xrt_layer_window_space_data *ws = &layer->data.window_space;
+
+					struct xrt_swapchain *xsc = layer->sc_array[0];
+					if (xsc == nullptr) {
+						continue;
+					}
+					struct d3d11_service_swapchain *sc = d3d11_service_swapchain_from_xrt(xsc);
+					uint32_t img_idx = ws->sub.image_index;
+					if (img_idx >= sc->image_count) {
+						continue;
+					}
+
+					D3D11_TEXTURE2D_DESC hud_desc = {};
+					sc->images[img_idx].texture->GetDesc(&hud_desc);
+
+					// Maintain a runtime-side cache of the HUD content
+					// (`hud_cache_tex[li]`). The cache shields the per-frame
+					// blit from the cube's keyed-mutex hold window: the
+					// cube acquires the HUD swapchain mutex while doing
+					// CPU formatting + `UpdateSubresource` (often 5-10 ms),
+					// frequently exceeding any reasonable `AcquireSync`
+					// timeout from this thread. A miss here would leave
+					// the combined-atlas HUD region undrawn for one tick
+					// — visible as flicker. With the cache, a missed
+					// `AcquireSync` simply re-uses last tick's content;
+					// the cube's next successful release refreshes the
+					// cache transparently.
+					struct d3d11_multi_client_slot *slot = &mc->clients[s];
+					if (!slot->hud_cache_tex[li] ||
+					    slot->hud_cache_w[li] != hud_desc.Width ||
+					    slot->hud_cache_h[li] != hud_desc.Height) {
+						slot->hud_cache_tex[li].reset();
+						slot->hud_cache_srv[li].reset();
+						D3D11_TEXTURE2D_DESC cache_desc = {};
+						cache_desc.Width = hud_desc.Width;
+						cache_desc.Height = hud_desc.Height;
+						cache_desc.MipLevels = 1;
+						cache_desc.ArraySize = 1;
+						cache_desc.Format = (hud_desc.Format == DXGI_FORMAT_UNKNOWN)
+						                        ? DXGI_FORMAT_R8G8B8A8_UNORM
+						                        : hud_desc.Format;
+						cache_desc.SampleDesc.Count = 1;
+						cache_desc.Usage = D3D11_USAGE_DEFAULT;
+						cache_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+						HRESULT hr_c = sys->device->CreateTexture2D(
+						    &cache_desc, nullptr, slot->hud_cache_tex[li].put());
+						if (SUCCEEDED(hr_c)) {
+							sys->device->CreateShaderResourceView(
+							    slot->hud_cache_tex[li].get(), nullptr,
+							    slot->hud_cache_srv[li].put());
+							slot->hud_cache_w[li] = hud_desc.Width;
+							slot->hud_cache_h[li] = hud_desc.Height;
+							slot->hud_cache_valid[li] = false;
+						}
+					}
+
+					// Try to acquire the cube's HUD swapchain keyed mutex.
+					// 0-timeout (non-blocking) — matches the projection-blit
+					// fast path at line ~10395. With the runtime-side cache
+					// shielding the per-eye blit, a failed acquire just
+					// re-uses last tick's content; we do NOT need to wait
+					// for the cube's writer here. Waiting (e.g. 4 ms) added
+					// ~7 ms per multi-comp render with 4 cubes' HUDs and
+					// drove the shell-composite frame rate from ~60 fps to
+					// ~41 fps. With non-blocking acquire the HUD pass costs
+					// drop to near-zero on misses.
+					IDXGIKeyedMutex *hud_mutex = sc->images[img_idx].keyed_mutex.get();
+					bool hud_mutex_held = false;
+					if (sc->service_created && hud_mutex != nullptr) {
+						HRESULT hr = hud_mutex->AcquireSync(0, 0 /* non-blocking */);
+						if (SUCCEEDED(hr)) {
+							hud_mutex_held = true;
+						}
+					}
+					if (hud_mutex_held && slot->hud_cache_tex[li]) {
+						sys->context->CopyResource(slot->hud_cache_tex[li].get(),
+						                           sc->images[img_idx].texture.get());
+						slot->hud_cache_valid[li] = true;
+					}
+
+					// Skip the per-view blit if we have nothing cached yet
+					// (first frame before any successful acquire).
+					if (!slot->hud_cache_valid[li] || !slot->hud_cache_srv[li]) {
+						if (hud_mutex_held) {
+							hud_mutex->ReleaseSync(0);
+						}
+						continue;
+					}
+					ID3D11ShaderResourceView *hud_srv = slot->hud_cache_srv[li].get();
+
+					for (uint32_t v_ws = 0; v_ws < num_views && v_ws < XRT_MAX_VIEWS; v_ws++) {
+						uint32_t col_ws = v_ws % sys->tile_columns;
+						uint32_t row_ws = v_ws / sys->tile_columns;
+						int eye_idx_ws = (col_ws < 2) ? (int)col_ws : 0;
+
+						float eye_shift_frac = 0.0f;
+						if (sys->hardware_display_3d) {
+							eye_shift_frac = (eye_idx_ws == 0)
+							                     ? -ws->disparity / 2.0f
+							                     : +ws->disparity / 2.0f;
+						}
+
+						// Map the window's per-eye projected rect from
+						// combined-atlas coords (`eye_rect_*`) into the
+						// destination tile (col_ws, row_ws) on the combined
+						// atlas. Mirrors the chrome content-blit pattern at
+						// line ~7967: `eye_rect / ca` → fraction; multiply by
+						// `half_w/h` (tile dim) and add the tile origin to
+						// get per-tile pixel coords. Using `eye_rect` as an
+						// absolute combined-atlas coord here would land the
+						// HUD outside the eye's scissor for one eye/cube
+						// combination (left-eye-clipped or right-eye-clipped
+						// depending on window position).
+						float win_frac_x = (float)eye_rect_x[eye_idx_ws] / (float)ca_w;
+						float win_frac_y = (float)eye_rect_y[eye_idx_ws] / (float)ca_h;
+						float win_frac_w = (float)eye_rect_w[eye_idx_ws] / (float)ca_w;
+						float win_frac_h = (float)eye_rect_h[eye_idx_ws] / (float)ca_h;
+						float win_dest_x = (float)col_ws * (float)half_w + win_frac_x * (float)half_w;
+						float win_dest_y = (float)row_ws * (float)half_h + win_frac_y * (float)half_h;
+						float win_dest_w = win_frac_w * (float)half_w;
+						float win_dest_h = win_frac_h * (float)half_h;
+
+						float hud_x_px = win_dest_x + (ws->x + eye_shift_frac) * win_dest_w;
+						float hud_y_px = win_dest_y + ws->y * win_dest_h;
+						float hud_w_px = ws->width * win_dest_w;
+						float hud_h_px = ws->height * win_dest_h;
+
+						float src_x_px = ws->sub.norm_rect.x * (float)hud_desc.Width;
+						float src_y_px = ws->sub.norm_rect.y * (float)hud_desc.Height;
+						float src_w_px = ws->sub.norm_rect.w * (float)hud_desc.Width;
+						float src_h_px = ws->sub.norm_rect.h * (float)hud_desc.Height;
+						if (layer->data.flip_y) {
+							src_y_px += src_h_px;
+							src_h_px = -src_h_px;
+						}
+
+						D3D11_RECT ws_scissor;
+						ws_scissor.left = (LONG)(col_ws * half_w);
+						ws_scissor.top = (LONG)(row_ws * half_h);
+						ws_scissor.right = (LONG)((col_ws + 1) * half_w);
+						ws_scissor.bottom = (LONG)((row_ws + 1) * half_h);
+						sys->context->RSSetScissorRects(1, &ws_scissor);
+
+						sys->context->VSSetShader(sys->blit_vs.get(), nullptr, 0);
+						sys->context->PSSetShader(sys->blit_ps.get(), nullptr, 0);
+						sys->context->VSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
+						sys->context->PSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
+						ID3D11RenderTargetView *ws_rtvs[] = {mc->combined_atlas_rtv.get()};
+						sys->context->OMSetRenderTargets(1, ws_rtvs, nullptr);
+						bool use_premul =
+						    (layer->data.flags &
+						     XRT_LAYER_COMPOSITION_BLEND_TEXTURE_SOURCE_ALPHA_BIT) == 0;
+						sys->context->OMSetBlendState(
+						    (use_premul ? sys->blend_premul : sys->blend_alpha).get(),
+						    nullptr, 0xFFFFFFFF);
+						sys->context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+						sys->context->IASetInputLayout(nullptr);
+						sys->context->RSSetState(sys->rasterizer_state.get());
+						sys->context->OMSetDepthStencilState(sys->depth_disabled.get(), 0);
+
+						D3D11_VIEWPORT ws_vp = {};
+						ws_vp.Width = (float)ca_w;
+						ws_vp.Height = (float)ca_h;
+						ws_vp.MaxDepth = 1.0f;
+						sys->context->RSSetViewports(1, &ws_vp);
+
+						D3D11_MAPPED_SUBRESOURCE mapped;
+						if (SUCCEEDED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
+						                                D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+							BlitConstants *cb = static_cast<BlitConstants *>(mapped.pData);
+							memset(cb, 0, sizeof(*cb));
+							cb->src_rect[0] = src_x_px;
+							cb->src_rect[1] = src_y_px;
+							cb->src_rect[2] = src_w_px;
+							cb->src_rect[3] = src_h_px;
+							cb->src_size[0] = (float)hud_desc.Width;
+							cb->src_size[1] = (float)hud_desc.Height;
+							cb->dst_offset[0] = hud_x_px;
+							cb->dst_offset[1] = hud_y_px;
+							cb->dst_size[0] = (float)ca_w;
+							cb->dst_size[1] = (float)ca_h;
+							cb->dst_rect_wh[0] = hud_w_px;
+							cb->dst_rect_wh[1] = hud_h_px;
+							cb->convert_srgb = 0.0f;
+							cb->quad_mode = 0.0f;
+							cb->corner_radius = 0.0f;
+							cb->corner_aspect = 0.0f;
+							cb->edge_feather = 0.0f;
+							cb->glow_intensity = 0.0f;
+							cb->chrome_alpha = 0.0f;
+							sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
+						}
+
+						sys->context->PSSetShaderResources(0, 1, &hud_srv);
+						sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
+						sys->context->Draw(4, 0);
+
+						ID3D11ShaderResourceView *null_srv = nullptr;
+						sys->context->PSSetShaderResources(0, 1, &null_srv);
+					}
+
+					if (hud_mutex_held) {
+						hud_mutex->ReleaseSync(0);
+					}
+				}
+		}
 	}
 
 	// (Title bar + focus border rendering is inside the render_order loop for correct z-ordering)
@@ -10988,69 +11136,49 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		}
 	}
 
-	// Window-space layers (XR_EXT_window_space_layer). Drawn after the
-	// projection-space UI layers so they sit on top in submission order, and
-	// before the per-client atlas is composited into the combined output by
-	// the workspace multi-compositor (or scanned out directly in standalone).
-	// Uses the blit pipeline (blit_vs/blit_ps) — the QUAD pipeline is for
-	// world-space quads with a 3D MVP, but window-space layers are flat
-	// 2D-in-tile blits with a per-eye horizontal disparity shift.
+	// Window-space layers (XR_EXT_window_space_layer) are NOT drawn here in
+	// workspace mode — they are blitted onto the combined atlas at per-eye
+	// window pixel coords inside `multi_compositor_render`, alongside the
+	// chrome blit (which already runs there under `sys->render_mutex`).
+	// Drawing on the per-client atlas from this commit-thread context
+	// destabilised rendering (asymmetric left-eye flicker on one of two
+	// cubes) because of D3D11 immediate-context contention with the
+	// capture-render thread's in-flight chrome work. The combined-atlas
+	// pass in multi_compositor_render keeps all WS GPU work on the same
+	// thread that owns the combined atlas, eliminating the contention.
 	//
-	// Viewport set to full atlas so dst_offset is interpreted in absolute
-	// atlas pixels (matches chrome's blit pattern); scissor restricts each
-	// per-view draw to its tile.
-	if (has_window_space_layers && sys->blit_vs && sys->blit_ps) {
-		ID3D11RenderTargetView *ws_rtvs[] = {c->render.atlas_rtv.get()};
-		sys->context->OMSetRenderTargets(1, ws_rtvs, nullptr);
-
-		uint32_t ws_atlas_w = sys->base.info.display_pixel_width;
-		uint32_t ws_atlas_h = sys->base.info.display_pixel_height;
-		if (ws_atlas_w == 0 || ws_atlas_h == 0) {
-			ws_atlas_w = sys->display_width;
-			ws_atlas_h = sys->display_height;
-		}
-		D3D11_VIEWPORT ws_vp = {};
-		ws_vp.Width = (float)ws_atlas_w;
-		ws_vp.Height = (float)ws_atlas_h;
-		ws_vp.MaxDepth = 1.0f;
-		sys->context->RSSetViewports(1, &ws_vp);
-
-		uint32_t ws_view_count = sys->hardware_display_3d
-		                             ? (sys->tile_columns * sys->tile_rows)
-		                             : 1;
-		if (ws_view_count > XRT_MAX_VIEWS) {
-			ws_view_count = XRT_MAX_VIEWS;
-		}
-
-		for (uint32_t ws_view = 0; ws_view < ws_view_count; ws_view++) {
-			D3D11_RECT ws_scissor = {};
-			if (sys->hardware_display_3d) {
-				uint32_t tile_x = 0, tile_y = 0;
-				u_tiling_view_origin(ws_view, sys->tile_columns,
-				                     sys->view_width, sys->view_height,
-				                     &tile_x, &tile_y);
-				ws_scissor.left = (LONG)tile_x;
-				ws_scissor.top = (LONG)tile_y;
-				ws_scissor.right = (LONG)(tile_x + sys->view_width);
-				ws_scissor.bottom = (LONG)(tile_y + sys->view_height);
-			} else {
-				uint32_t mono_w = (sys->output_width < sys->display_width)
-				                      ? sys->output_width : sys->display_width;
-				uint32_t mono_h = (sys->output_height < sys->display_height)
-				                      ? sys->output_height : sys->display_height;
-				ws_scissor.left = 0;
-				ws_scissor.top = 0;
-				ws_scissor.right = (LONG)mono_w;
-				ws_scissor.bottom = (LONG)mono_h;
+	// Snapshot the WS layers into the slot's `ws_snapshot` so multi-comp
+	// reads a stable post-commit state. Reading `c->layer_accum` directly
+	// from multi-comp races with the cube's `xrBeginFrame` reset
+	// (`layer_count = 0`) and per-call adds — manifesting as per-frame HUD
+	// flicker (multi-comp ticks at ~70 Hz, cube xrEndFrame at ~60 Hz, ~50%
+	// of multi-comp ticks fall inside the cube's begin→add window and see
+	// no/partial WS layers).
+	//
+	// Standalone mode (no workspace_mode, single client renders directly
+	// to its swap-chain back buffer) is not yet wired to render WS layers
+	// — the legacy per-client-atlas path was removed with this change to
+	// keep the single-source-of-truth invariant. If a standalone-mode
+	// HUD is needed, follow the chrome-style pattern in this file.
+	if (sys->workspace_mode && sys->multi_comp != nullptr) {
+		for (int s_snap = 0; s_snap < D3D11_MULTI_MAX_CLIENTS; s_snap++) {
+			struct d3d11_multi_client_slot *slot_snap = &sys->multi_comp->clients[s_snap];
+			if (!slot_snap->active || slot_snap->compositor != c) {
+				continue;
 			}
-			sys->context->RSSetScissorRects(1, &ws_scissor);
-
-			for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
-				struct comp_layer *layer = &c->layer_accum.layers[i];
-				if (layer->data.type == XRT_LAYER_WINDOW_SPACE) {
-					render_window_space_layer(sys, layer, ws_view);
+			std::lock_guard<std::mutex> snap_lock(slot_snap->ws_snapshot_mutex);
+			uint32_t snap_n = 0;
+			for (uint32_t i = 0;
+			     i < c->layer_accum.layer_count && snap_n < XRT_MAX_LAYERS;
+			     i++) {
+				if (c->layer_accum.layers[i].data.type != XRT_LAYER_WINDOW_SPACE) {
+					continue;
 				}
+				slot_snap->ws_snapshot[snap_n] = c->layer_accum.layers[i];
+				snap_n++;
 			}
+			slot_snap->ws_snapshot_count = snap_n;
+			break;
 		}
 	}
 
