@@ -42,6 +42,10 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 #include "os/os_time.h"
+#include <sys/stat.h>
+#ifndef XRT_OS_WINDOWS
+#include <unistd.h>
+#endif
 #include "os/os_threading.h"
 #include "math/m_api.h"
 
@@ -166,6 +170,12 @@ static const char *FS_BLIT =
 
 //! Vertex shader: positioned quad for window-space layers.
 //! Takes uniform position/size in NDC.
+//! v_uv.y is flipped: top of NDC rect samples UV.y=0 (top of texture),
+//! bottom samples UV.y=1. WS-layer source textures land in GL via
+//! glTexSubImage2D in top-down memory order (CG/D2D bitmap layout, row 0 =
+//! top of image), so UV.y=0 is the top. Without the flip the HUD renders
+//! upside-down on the atlas (then sim_display passes that inversion straight
+//! through to screen).
 static const char *VS_WINDOW_SPACE =
     "#version 330 core\n"
     "out vec2 v_uv;\n"
@@ -173,7 +183,7 @@ static const char *VS_WINDOW_SPACE =
     "void main() {\n"
     "    float x = float((gl_VertexID & 1) << 1) - 1.0;\n" // -1 or 1
     "    float y = float((gl_VertexID & 2)) - 1.0;\n"       // -1 or 1
-    "    v_uv = vec2((x + 1.0) * 0.5, (y + 1.0) * 0.5);\n"
+    "    v_uv = vec2((x + 1.0) * 0.5, (1.0 - y) * 0.5);\n"
     "    gl_Position = vec4(u_rect.x + (x * 0.5 + 0.5) * u_rect.z,\n"
     "                       u_rect.y + (y * 0.5 + 0.5) * u_rect.w,\n"
     "                       0.0, 1.0);\n"
@@ -1342,6 +1352,42 @@ gl_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 		}
 
 		glDisable(GL_BLEND);
+	}
+
+	// File-triggered atlas dump for autonomous screenshot verification.
+	// `touch /tmp/dxr_atlas_trigger` and the next frame writes the
+	// composited content region to /tmp/dxr_atlas.png. Mirrors the
+	// Windows D3D11-service screenshot trigger pattern. Runs while
+	// c->fbo is still bound with atlas as the color attachment, after
+	// both projection and WS-layer passes have completed.
+	{
+		struct stat _st;
+		if (c->atlas_texture != 0 && c->tile_columns > 0 && c->tile_rows > 0 &&
+		    c->view_width > 0 && c->view_height > 0 &&
+		    stat("/tmp/dxr_atlas_trigger", &_st) == 0) {
+			unlink("/tmp/dxr_atlas_trigger");
+			uint32_t cw = c->tile_columns * c->view_width;
+			uint32_t ch = c->tile_rows * c->view_height;
+			if (cw > c->atlas_tex_width)  cw = c->atlas_tex_width;
+			if (ch > c->atlas_tex_height) ch = c->atlas_tex_height;
+			size_t row_pitch = (size_t)cw * 4;
+			size_t bytes = row_pitch * ch;
+			uint8_t *bu = malloc(bytes);
+			uint8_t *td = malloc(bytes);
+			if (bu != NULL && td != NULL) {
+				glReadBuffer(GL_COLOR_ATTACHMENT0);
+				GLint sy = (GLint)c->atlas_tex_height - (GLint)ch;
+				if (sy < 0) sy = 0;
+				glReadPixels(0, sy, (GLsizei)cw, (GLsizei)ch, GL_RGBA, GL_UNSIGNED_BYTE, bu);
+				glFinish();
+				for (uint32_t y = 0; y < ch; y++) {
+					memcpy(td + (size_t)y * row_pitch,
+					       bu + (size_t)(ch - 1 - y) * row_pitch, row_pitch);
+				}
+				stbi_write_png("/tmp/dxr_atlas.png", (int)cw, (int)ch, 4, td, (int)row_pitch);
+			}
+			free(bu); free(td);
+		}
 	}
 	} // end if (!zero_copy)
 

@@ -394,6 +394,65 @@ See `docs/reference/debug-logging.md` for full conventions.
 - Use U_LOG_I (INFO) for recurring/throttled diagnostic logs (per-frame, per-keystroke, etc.)
 - Never add per-frame U_LOG_W calls — they cause massive log bloat
 
+## Capturing macOS Test-App Pixels Autonomously
+
+`screencapture`, `CGWindowListCreateImage` (obsoleted in macOS 15), and
+`osascript ... keystroke` all need TCC permissions Claude Code's parent
+process doesn't have. They fail silently or with a generic "could not
+create image" error.
+
+Workaround: dump pixels from inside the test app via `stbi_write_png`.
+`stb_image_write.h` already lives in `test_apps/common/` and
+`_stbi_write_png` is linked into every macOS test app via the
+`atlas_capture_*.mm` siblings, so just forward-declare with C linkage at
+file scope of the `.mm` you want to instrument:
+
+```cpp
+extern "C" int stbi_write_png(char const*, int, int, int, void const*, int);
+```
+
+Then dump from the render loop, gated on a frame counter:
+
+```cpp
+static int n = 0;
+if (n++ == 120) {  // ~2 s in, after throttled HUD section strings populate
+    stbi_write_png("/tmp/hud_source.png", W, H, 4, pixels, rowPitch);
+}
+```
+
+Run: `_package/DisplayXR-macOS/run_cube_handle_metal.sh > /tmp/log 2>&1 &`,
+sleep ~6 s, `pkill -f cube_handle_metal_macos`, then `Read /tmp/hud_source.png`
+— the Read tool renders the PNG inline.
+
+Caveat: HUD section strings (`g_hudSessionText` etc.) are throttled to
+~2 Hz, so frame-0 dumps are blank. Wait for frame ~120 or later.
+
+For the rendered per-eye atlas (after compositor blit, before weaver) the
+existing 'I' key path writes to
+`~/Pictures/DisplayXR/<stem>-N_<cols>x<rows>.png` via
+`dxr_capture::CaptureAtlasRegionMetal`. You can't trigger the 'I' key via
+osascript without Accessibility, so the same in-app dump trick works —
+call `CaptureAtlasRegionMetal` directly from a frame-counter gate.
+
+**Compositor-side composited atlas (preferred):** the metal and GL native
+compositors poll `/tmp/dxr_atlas_trigger` each frame. Touch the trigger
+and the next frame writes the composited content region (cube + WS HUD
+layers, post per-tile pass, pre display processor) to `/tmp/dxr_atlas.png`,
+then unlinks the trigger.
+
+```bash
+rm -f /tmp/dxr_atlas.png /tmp/dxr_atlas_trigger
+_package/DisplayXR-macOS/run_cube_handle_metal.sh > /tmp/log 2>&1 &
+sleep 4 && touch /tmp/dxr_atlas_trigger && sleep 2
+pkill -f cube_handle_metal_macos
+# Read /tmp/dxr_atlas.png inline.
+```
+
+This shows the composited atlas (what would go to the SR weaver / sim_display)
+which is what you want for verifying WS-layer composition. The vk_native
+compositor doesn't have a trigger yet; for cube_handle_vk_macos rely on
+visual inspection or the in-app `stbi_write_png` trick.
+
 ## Capturing Compositor Screenshots (Preferred)
 
 The D3D11 service compositor supports file-triggered screenshots of its combined atlas (full-resolution SBS back buffer). This reads the D3D11 texture directly — no DPI issues, no PrintWindow limitations.
