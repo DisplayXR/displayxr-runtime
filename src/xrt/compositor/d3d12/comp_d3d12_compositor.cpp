@@ -49,22 +49,11 @@
 #include <windows.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
-#include <d3dcompiler.h>
-
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <mutex>
 #include <cmath>
-
-// Forward declarations for chroma-key post-weave alpha-conversion pass (defined further down)
-struct comp_d3d12_compositor;
-static bool chroma_key_pass_execute(struct comp_d3d12_compositor *c,
-                                     ID3D12GraphicsCommandList *cmd_list,
-                                     ID3D12Resource *back_buffer,
-                                     D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle,
-                                     UINT width, UINT height);
-static void chroma_key_destroy(struct comp_d3d12_compositor *c);
 
 /*!
  * Minimal settings struct for D3D12 compositor.
@@ -127,20 +116,6 @@ struct comp_d3d12_compositor
 	//! Window handle (either from app or self-created).
 	//! NULL in shared texture mode — compositor doesn't own a swapchain.
 	HWND hwnd;
-
-	//! Optional chroma-key color (0x00BBGGRR / Win32 COLORREF) for the post-weave
-	//! alpha-conversion shader pass. Zero disables the pass. Only meaningful when
-	//! the compositor was created with transparent_background = true.
-	uint32_t chroma_key_color;
-	//! Lazy-initialized resources for the chroma-key shader pass; allocated on
-	//! the first frame the pass runs. See chroma_key_pass_*() below.
-	ID3D12RootSignature *ck_root_signature;
-	ID3D12PipelineState *ck_pipeline_state;
-	ID3D12Resource      *ck_intermediate;     //!< swap-chain-sized R8G8B8A8_UNORM, COPY_DEST/PIXEL_SHADER_RESOURCE
-	ID3D12DescriptorHeap *ck_srv_heap;        //!< Single SRV slot for ck_intermediate
-	UINT                 ck_intermediate_w;
-	UINT                 ck_intermediate_h;
-	D3D12_RESOURCE_STATES ck_intermediate_state;  //!< Current state of ck_intermediate
 
 	//! App HWND for position tracking in shared texture mode.
 	//! The display processor uses this for weaver alignment.
@@ -1651,21 +1626,13 @@ d3d12_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			// HUD overlay
 			d3d12_render_hud_overlay(c, c->cmd_list, back_buffer, tgt_width, tgt_height, &eye_pos);
 
-			// Chroma-key post-weave pass (only when transparent + chroma_key_color != 0).
-			// Converts pixels matching the chroma key to alpha=0 so DComp passes
-			// them through to the desktop. Leaves back buffer in RENDER_TARGET on
-			// success; we transition to PRESENT below.
-			bool ck_ran = false;
-			if (c->chroma_key_color != 0) {
-				ck_ran = chroma_key_pass_execute(c, c->cmd_list, back_buffer,
-				                                  rtv_handle, tgt_width, tgt_height);
-			}
-
-			// Transition back buffer to PRESENT. Source state depends on whether the
-			// chroma-key pass ran (RENDER_TARGET) or not (COPY_DEST from HUD).
-			barrier.Transition.StateBefore = ck_ran
-			    ? D3D12_RESOURCE_STATE_RENDER_TARGET
-			    : D3D12_RESOURCE_STATE_COPY_DEST;
+			// Transition back buffer COPY_DEST -> PRESENT. The chroma-key
+			// post-weave alpha conversion (when needed) runs inside the Leia
+			// D3D12 display processor's process_atlas, which leaves the back
+			// buffer in RENDER_TARGET. The D3D12 weaver however leaves the
+			// back buffer in RENDER_TARGET pre-HUD; the HUD path puts it in
+			// COPY_DEST here. So source state matches the HUD's exit state.
+			barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
 			barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
 			c->cmd_list->ResourceBarrier(1, &barrier);
 		} else {
@@ -1782,317 +1749,6 @@ d3d12_compositor_layer_commit_with_semaphore(struct xrt_compositor *xc,
 	return d3d12_compositor_layer_commit(xc, XRT_GRAPHICS_SYNC_HANDLE_INVALID);
 }
 
-/*
- *
- * Chroma-key post-weave alpha-conversion pass (D3D12)
- *
- * The Leia weaver writes opaque RGB into the swapchain back buffer (alpha=1
- * everywhere). With DComp + per-pixel alpha presentation, that means DWM has
- * nothing to make transparent. This pass samples the post-weave back buffer
- * and rewrites it with alpha=0 wherever RGB exactly matches a chroma-key
- * color, alpha=1 otherwise.
- *
- * Inserted between the HUD overlay and the final PRESENT transition.
- *
- */
-
-static const char *kChromaKeyVS = R"(
-struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
-VSOut main(uint vid : SV_VertexID) {
-    VSOut o;
-    o.uv = float2((vid << 1) & 2, vid & 2);
-    o.pos = float4(o.uv * float2(2, -2) + float2(-1, 1), 0, 1);
-    return o;
-}
-)";
-
-static const char *kChromaKeyPS = R"(
-struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
-Texture2D<float4> src : register(t0);
-SamplerState samp : register(s0);
-cbuffer Constants : register(b0) { float3 chroma_rgb; float pad; };
-float4 main(VSOut i) : SV_Target {
-    float3 c = src.Sample(samp, i.uv).rgb;
-    float3 d = abs(c - chroma_rgb);
-    bool match = max(max(d.r, d.g), d.b) < (1.0/512.0);
-    // Swapchain is DXGI_ALPHA_MODE_PREMULTIPLIED — RGB must already be * alpha.
-    // For transparent (alpha=0) pixels RGB MUST be (0,0,0); otherwise DWM's
-    // src.rgb + (1-alpha)*dst.rgb blend adds the matched chroma color to the
-    // desktop and saturates to white instead of showing through.
-    float a = match ? 0.0 : 1.0;
-    return float4(c * a, a);
-}
-)";
-
-/*!
- * Lazy-initialize PSO + root signature for the chroma-key pass.
- * Called once per compositor (resources outlive frames).
- */
-static bool
-chroma_key_init_pipeline(struct comp_d3d12_compositor *c)
-{
-	if (c->ck_pipeline_state != nullptr) {
-		return true;
-	}
-
-	HRESULT hr;
-
-	// Root signature: 32-bit root constants (4 floats — 3 for chroma BGR + pad),
-	// descriptor table for SRV (1 entry), static sampler.
-	D3D12_ROOT_PARAMETER root_params[2] = {};
-	root_params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-	root_params[0].Constants.ShaderRegister = 0;
-	root_params[0].Constants.RegisterSpace = 0;
-	root_params[0].Constants.Num32BitValues = 4;
-	root_params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-
-	D3D12_DESCRIPTOR_RANGE srv_range = {};
-	srv_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-	srv_range.NumDescriptors = 1;
-	srv_range.BaseShaderRegister = 0;
-	srv_range.RegisterSpace = 0;
-	srv_range.OffsetInDescriptorsFromTableStart = 0;
-	root_params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-	root_params[1].DescriptorTable.NumDescriptorRanges = 1;
-	root_params[1].DescriptorTable.pDescriptorRanges = &srv_range;
-	root_params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-
-	D3D12_STATIC_SAMPLER_DESC sampler = {};
-	sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
-	sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-	sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-	sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-	sampler.MaxLOD = D3D12_FLOAT32_MAX;
-	sampler.ShaderRegister = 0;
-	sampler.RegisterSpace = 0;
-	sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-
-	D3D12_ROOT_SIGNATURE_DESC rs_desc = {};
-	rs_desc.NumParameters = 2;
-	rs_desc.pParameters = root_params;
-	rs_desc.NumStaticSamplers = 1;
-	rs_desc.pStaticSamplers = &sampler;
-	rs_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_DENY_VERTEX_SHADER_ROOT_ACCESS;
-
-	ID3DBlob *rs_blob = nullptr;
-	ID3DBlob *err_blob = nullptr;
-	hr = D3D12SerializeRootSignature(&rs_desc, D3D_ROOT_SIGNATURE_VERSION_1,
-	                                  &rs_blob, &err_blob);
-	if (FAILED(hr)) {
-		U_LOG_E("Chroma-key root sig serialize failed: 0x%08x %s", hr,
-		        err_blob ? (const char *)err_blob->GetBufferPointer() : "");
-		if (err_blob) err_blob->Release();
-		return false;
-	}
-	if (err_blob) err_blob->Release();
-
-	hr = c->device->CreateRootSignature(0, rs_blob->GetBufferPointer(), rs_blob->GetBufferSize(),
-	                                     __uuidof(ID3D12RootSignature),
-	                                     reinterpret_cast<void **>(&c->ck_root_signature));
-	rs_blob->Release();
-	if (FAILED(hr)) {
-		U_LOG_E("Chroma-key CreateRootSignature failed: 0x%08x", hr);
-		return false;
-	}
-
-	// Compile shaders
-	ID3DBlob *vs_blob = nullptr;
-	hr = D3DCompile(kChromaKeyVS, strlen(kChromaKeyVS), nullptr, nullptr, nullptr,
-	                "main", "vs_5_0", 0, 0, &vs_blob, &err_blob);
-	if (FAILED(hr)) {
-		U_LOG_E("Chroma-key VS compile failed: 0x%08x %s", hr,
-		        err_blob ? (const char *)err_blob->GetBufferPointer() : "");
-		if (err_blob) err_blob->Release();
-		return false;
-	}
-	if (err_blob) { err_blob->Release(); err_blob = nullptr; }
-
-	ID3DBlob *ps_blob = nullptr;
-	hr = D3DCompile(kChromaKeyPS, strlen(kChromaKeyPS), nullptr, nullptr, nullptr,
-	                "main", "ps_5_0", 0, 0, &ps_blob, &err_blob);
-	if (FAILED(hr)) {
-		U_LOG_E("Chroma-key PS compile failed: 0x%08x %s", hr,
-		        err_blob ? (const char *)err_blob->GetBufferPointer() : "");
-		vs_blob->Release();
-		if (err_blob) err_blob->Release();
-		return false;
-	}
-	if (err_blob) err_blob->Release();
-
-	// PSO
-	D3D12_GRAPHICS_PIPELINE_STATE_DESC pso_desc = {};
-	pso_desc.pRootSignature = c->ck_root_signature;
-	pso_desc.VS = {vs_blob->GetBufferPointer(), vs_blob->GetBufferSize()};
-	pso_desc.PS = {ps_blob->GetBufferPointer(), ps_blob->GetBufferSize()};
-	pso_desc.BlendState.RenderTarget[0].BlendEnable = FALSE;
-	pso_desc.BlendState.RenderTarget[0].LogicOpEnable = FALSE;
-	pso_desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-	pso_desc.SampleMask = UINT_MAX;
-	pso_desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-	pso_desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-	pso_desc.RasterizerState.FrontCounterClockwise = FALSE;
-	pso_desc.RasterizerState.DepthClipEnable = TRUE;
-	pso_desc.DepthStencilState.DepthEnable = FALSE;
-	pso_desc.DepthStencilState.StencilEnable = FALSE;
-	pso_desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-	pso_desc.NumRenderTargets = 1;
-	pso_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-	pso_desc.SampleDesc.Count = 1;
-
-	hr = c->device->CreateGraphicsPipelineState(&pso_desc, __uuidof(ID3D12PipelineState),
-	                                             reinterpret_cast<void **>(&c->ck_pipeline_state));
-	vs_blob->Release();
-	ps_blob->Release();
-	if (FAILED(hr)) {
-		U_LOG_E("Chroma-key CreateGraphicsPipelineState failed: 0x%08x", hr);
-		return false;
-	}
-
-	// Descriptor heap for the SRV (single shader-visible slot)
-	D3D12_DESCRIPTOR_HEAP_DESC heap_desc = {};
-	heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-	heap_desc.NumDescriptors = 1;
-	heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-	hr = c->device->CreateDescriptorHeap(&heap_desc, __uuidof(ID3D12DescriptorHeap),
-	                                      reinterpret_cast<void **>(&c->ck_srv_heap));
-	if (FAILED(hr)) {
-		U_LOG_E("Chroma-key CreateDescriptorHeap failed: 0x%08x", hr);
-		return false;
-	}
-
-	U_LOG_W("Post-weave chroma-key conversion enabled: 0x%08X", c->chroma_key_color);
-	return true;
-}
-
-/*!
- * Allocate (or reallocate on resize) the intermediate texture sized to the back buffer.
- */
-static bool
-chroma_key_ensure_intermediate(struct comp_d3d12_compositor *c, UINT width, UINT height)
-{
-	if (c->ck_intermediate != nullptr &&
-	    c->ck_intermediate_w == width && c->ck_intermediate_h == height) {
-		return true;
-	}
-	if (c->ck_intermediate != nullptr) {
-		c->ck_intermediate->Release();
-		c->ck_intermediate = nullptr;
-	}
-
-	D3D12_HEAP_PROPERTIES heap_props = {};
-	heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
-	D3D12_RESOURCE_DESC tex_desc = {};
-	tex_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-	tex_desc.Width = width;
-	tex_desc.Height = height;
-	tex_desc.DepthOrArraySize = 1;
-	tex_desc.MipLevels = 1;
-	tex_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-	tex_desc.SampleDesc.Count = 1;
-	tex_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-	tex_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
-
-	HRESULT hr = c->device->CreateCommittedResource(
-	    &heap_props, D3D12_HEAP_FLAG_NONE, &tex_desc,
-	    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-	    nullptr, __uuidof(ID3D12Resource),
-	    reinterpret_cast<void **>(&c->ck_intermediate));
-	if (FAILED(hr)) {
-		U_LOG_E("Chroma-key intermediate texture create failed: 0x%08x", hr);
-		return false;
-	}
-	c->ck_intermediate_w = width;
-	c->ck_intermediate_h = height;
-	c->ck_intermediate_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-
-	// Create SRV at slot 0 of the descriptor heap.
-	D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
-	srv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-	srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-	srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-	srv_desc.Texture2D.MipLevels = 1;
-	D3D12_CPU_DESCRIPTOR_HANDLE cpu_handle = c->ck_srv_heap->GetCPUDescriptorHandleForHeapStart();
-	c->device->CreateShaderResourceView(c->ck_intermediate, &srv_desc, cpu_handle);
-	return true;
-}
-
-/*!
- * Run the post-weave chroma-key pass. Called when the back buffer is in
- * D3D12_RESOURCE_STATE_COPY_DEST (post-HUD). On success, leaves back buffer
- * in D3D12_RESOURCE_STATE_RENDER_TARGET (caller transitions to PRESENT).
- *
- * Returns false on failure; caller should fall back to skipping the pass.
- */
-static bool
-chroma_key_pass_execute(struct comp_d3d12_compositor *c,
-                         ID3D12GraphicsCommandList *cmd_list,
-                         ID3D12Resource *back_buffer,
-                         D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle,
-                         UINT width, UINT height)
-{
-	if (!chroma_key_init_pipeline(c)) return false;
-	if (!chroma_key_ensure_intermediate(c, width, height)) return false;
-
-	// Pack chroma color (0x00BBGGRR) → float3 RGB in [0,1].
-	uint32_t k = c->chroma_key_color;
-	float chroma_r = ((k >>  0) & 0xFF) / 255.0f;
-	float chroma_g = ((k >>  8) & 0xFF) / 255.0f;
-	float chroma_b = ((k >> 16) & 0xFF) / 255.0f;
-	float root_consts[4] = { chroma_r, chroma_g, chroma_b, 0.0f };
-
-	// Transition back_buffer COPY_DEST → COPY_SOURCE; intermediate (PIXEL_SHADER_RESOURCE) → COPY_DEST.
-	D3D12_RESOURCE_BARRIER barriers[2] = {};
-	barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-	barriers[0].Transition.pResource = back_buffer;
-	barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-	barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-	barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-	barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-	barriers[1].Transition.pResource = c->ck_intermediate;
-	barriers[1].Transition.StateBefore = c->ck_intermediate_state;
-	barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-	barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-	cmd_list->ResourceBarrier(2, barriers);
-	c->ck_intermediate_state = D3D12_RESOURCE_STATE_COPY_DEST;
-
-	cmd_list->CopyResource(c->ck_intermediate, back_buffer);
-
-	// Transition back_buffer COPY_SOURCE → RENDER_TARGET; intermediate COPY_DEST → PIXEL_SHADER_RESOURCE.
-	barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-	barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-	barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-	barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-	cmd_list->ResourceBarrier(2, barriers);
-	c->ck_intermediate_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-
-	// Bind pipeline + draw fullscreen triangle (3 verts via SV_VertexID).
-	cmd_list->SetPipelineState(c->ck_pipeline_state);
-	cmd_list->SetGraphicsRootSignature(c->ck_root_signature);
-	ID3D12DescriptorHeap *heaps[] = { c->ck_srv_heap };
-	cmd_list->SetDescriptorHeaps(1, heaps);
-	cmd_list->SetGraphicsRoot32BitConstants(0, 4, root_consts, 0);
-	cmd_list->SetGraphicsRootDescriptorTable(1, c->ck_srv_heap->GetGPUDescriptorHandleForHeapStart());
-
-	D3D12_VIEWPORT vp = { 0.0f, 0.0f, (float)width, (float)height, 0.0f, 1.0f };
-	D3D12_RECT scissor = { 0, 0, (LONG)width, (LONG)height };
-	cmd_list->RSSetViewports(1, &vp);
-	cmd_list->RSSetScissorRects(1, &scissor);
-	cmd_list->OMSetRenderTargets(1, &rtv_handle, FALSE, nullptr);
-	cmd_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-	cmd_list->IASetVertexBuffers(0, 0, nullptr);
-	cmd_list->IASetIndexBuffer(nullptr);
-	cmd_list->DrawInstanced(3, 1, 0, 0);
-	return true;
-}
-
-static void
-chroma_key_destroy(struct comp_d3d12_compositor *c)
-{
-	if (c->ck_intermediate)    { c->ck_intermediate->Release();    c->ck_intermediate = nullptr; }
-	if (c->ck_srv_heap)        { c->ck_srv_heap->Release();        c->ck_srv_heap = nullptr; }
-	if (c->ck_pipeline_state)  { c->ck_pipeline_state->Release();  c->ck_pipeline_state = nullptr; }
-	if (c->ck_root_signature)  { c->ck_root_signature->Release();  c->ck_root_signature = nullptr; }
-}
 
 static void
 d3d12_compositor_destroy(struct xrt_compositor *xc)
@@ -2109,9 +1765,6 @@ d3d12_compositor_destroy(struct xrt_compositor *xc)
 	if (c->fence != nullptr && c->command_queue != nullptr) {
 		gpu_wait_idle(c);
 	}
-
-	// Destroy chroma-key pass resources
-	chroma_key_destroy(c);
 
 	// Destroy DP input crop resource
 	if (c->dp_input_resource != nullptr) {
@@ -2227,15 +1880,6 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 	c->hud_initialized = false;
 	c->last_frame_time_ns = 0;
 	c->smoothed_frame_time_ms = 16.67f;
-
-	// Chroma-key pass state (lazy-allocated on first use)
-	c->chroma_key_color = chroma_key_color;
-	c->ck_root_signature = nullptr;
-	c->ck_pipeline_state = nullptr;
-	c->ck_intermediate = nullptr;
-	c->ck_srv_heap = nullptr;
-	c->ck_intermediate_w = 0;
-	c->ck_intermediate_h = 0;
 
 	// Handle window
 	c->app_hwnd = nullptr;
@@ -2444,6 +2088,12 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 			    output_fmt);
 			U_LOG_W("D3D12 display processor: output format set to %u (target=%p)",
 			        (unsigned)output_fmt, (void *)c->target);
+
+			// Forward session-level transparency config. The DP runs the
+			// chroma-key fill+strip internally when transparent_background
+			// is set; chroma_key_color=0 means the DP picks its own key.
+			xrt_display_processor_d3d12_set_chroma_key(
+			    c->display_processor, chroma_key_color, transparent_background);
 		}
 	} else {
 		U_LOG_W("No D3D12 display processor factory provided");

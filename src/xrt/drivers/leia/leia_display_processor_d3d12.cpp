@@ -61,6 +61,67 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
 }
 )";
 
+/*
+ * Chroma-key shaders — same algorithm as the D3D11 DP, retargeted to D3D12.
+ * The fill pass replaces alpha=0 atlas pixels with the chroma key so the SR
+ * weaver (opaque RGB only) can run. The strip pass examines the woven back
+ * buffer and rewrites RGB-matching pixels to alpha=0 (with RGB premultiplied
+ * for DWM's premultiplied alpha mode).
+ *
+ * Both shaders share a fullscreen-triangle VS (3 verts via SV_VertexID).
+ * Root signature: b0 = 32-bit constants (chroma_rgb + pad), t0 = SRV
+ * descriptor table, s0 = static sampler (point filter).
+ */
+static const char *ck_vs_source = R"(
+struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+VSOut main(uint vid : SV_VertexID) {
+    VSOut o;
+    o.uv = float2((vid << 1) & 2, vid & 2);
+    o.pos = float4(o.uv * float2(2, -2) + float2(-1, 1), 0, 1);
+    return o;
+}
+)";
+
+// Pre-weave fill: atlas RGBA → opaque RGB with alpha=0 regions filled
+// by chroma_rgb. lerp(key, src.rgb, src.a) is no-op for alpha=1 (legacy
+// app-pre-filled flow) and full key for alpha=0 (true-alpha flow).
+static const char *ck_fill_ps_source = R"(
+struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+Texture2D<float4> src : register(t0);
+SamplerState samp : register(s0);
+cbuffer Constants : register(b0) { float3 chroma_rgb; float pad; };
+float4 main(VSOut i) : SV_Target {
+    float4 c = src.Sample(samp, i.uv);
+    float3 rgb = lerp(chroma_rgb, c.rgb, c.a);
+    return float4(rgb, 1.0);
+}
+)";
+
+// Post-weave strip: woven RGB → alpha=0 where RGB exact-matches chroma_rgb,
+// alpha=1 elsewhere with RGB premultiplied so DWM's
+//     src.rgb + (1-alpha)*dst.rgb
+// blend doesn't add the matched chroma color to the desktop and saturate.
+static const char *ck_strip_ps_source = R"(
+struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
+Texture2D<float4> src : register(t0);
+SamplerState samp : register(s0);
+cbuffer Constants : register(b0) { float3 chroma_rgb; float pad; };
+float4 main(VSOut i) : SV_Target {
+    float3 c = src.Sample(samp, i.uv).rgb;
+    float3 d = abs(c - chroma_rgb);
+    bool match = max(max(d.r, d.g), d.b) < (1.0/512.0);
+    float a = match ? 0.0 : 1.0;
+    return float4(c * a, a);
+}
+)";
+
+/*
+ * Default chroma key when the app didn't supply one (set_chroma_key key=0).
+ * Magenta — matches the D3D11 DP's kDefaultChromaKey for cross-API parity.
+ * 0x00BBGGRR layout: R=0xFF, G=0x00, B=0xFF.
+ */
+static constexpr uint32_t kDefaultChromaKey = 0x00FF00FF;
+
 
 /*!
  * Implementation struct wrapping leiasr_d3d12 as xrt_display_processor_d3d12.
@@ -81,12 +142,529 @@ struct leia_display_processor_d3d12_impl
 	//! @}
 
 	uint32_t view_count; //!< Active mode view count (1=2D, 2=stereo).
+
+	//! @name Chroma-key transparency support (lazy-allocated on first frame)
+	//!
+	//! When @ref ck_enabled and @ref ck_color != 0, process_atlas() does:
+	//!   1. Pre-weave fill: atlas RGBA → ck_fill_tex (alpha=0 → chroma_rgb,
+	//!      output alpha=1) so the SR weaver receives opaque RGB.
+	//!   2. Pass ck_fill_tex (resource pointer) to the weaver instead of the
+	//!      original atlas via leiasr_d3d12_set_input_texture.
+	//!   3. Post-weave strip: copy back buffer → ck_strip_tex, then run strip
+	//!      shader back to back-buffer RTV (chroma match → alpha=0, RGB
+	//!      premultiplied for DWM).
+	//! @{
+	bool ck_enabled;
+	uint32_t ck_color;                       //!< 0x00BBGGRR; effective key.
+	ID3D12RootSignature *ck_root_sig;        //!< Shared by fill + strip PSOs.
+	ID3D12PipelineState *ck_fill_pso;
+	ID3D12PipelineState *ck_strip_pso;
+	ID3D12DescriptorHeap *ck_srv_heap_fill;  //!< Shader-visible, 1 SRV (atlas).
+	ID3D12DescriptorHeap *ck_srv_heap_strip; //!< Shader-visible, 1 SRV (strip_tex).
+	ID3D12DescriptorHeap *ck_rtv_heap_fill;  //!< Non-shader-visible, 1 RTV (fill_tex).
+	// Pre-weave fill target — RT-bindable + SRV-readable; the weaver samples
+	// this resource directly via leiasr_d3d12_set_input_texture.
+	ID3D12Resource *ck_fill_tex;
+	uint32_t ck_fill_w, ck_fill_h;
+	D3D12_RESOURCE_STATES ck_fill_state;
+	// Post-weave strip source — copy of the back buffer for the strip pass
+	// to sample.
+	ID3D12Resource *ck_strip_tex;
+	uint32_t ck_strip_w, ck_strip_h;
+	D3D12_RESOURCE_STATES ck_strip_state;
+	//! @}
 };
 
 static inline struct leia_display_processor_d3d12_impl *
 leia_dp_d3d12(struct xrt_display_processor_d3d12 *xdp)
 {
 	return (struct leia_display_processor_d3d12_impl *)xdp;
+}
+
+
+/*
+ *
+ * Chroma-key fill/strip helpers (transparency support).
+ *
+ * Lazy-allocated on first frame the pass runs. ck_should_run() gates the
+ * whole flow — when false (the common case) none of these execute and
+ * process_atlas behaves identically to the pre-transparency path.
+ *
+ */
+
+static bool
+ck_should_run(struct leia_display_processor_d3d12_impl *ldp)
+{
+	return ldp->ck_enabled && ldp->ck_color != 0;
+}
+
+// Compile a single shader source via D3DCompile. Returns owning blob (caller releases).
+static ID3DBlob *
+ck_compile_shader(const char *src, const char *entry, const char *target)
+{
+	ID3DBlob *blob = nullptr;
+	ID3DBlob *err = nullptr;
+	HRESULT hr = D3DCompile(src, strlen(src), nullptr, nullptr, nullptr,
+	                        entry, target, 0, 0, &blob, &err);
+	if (FAILED(hr)) {
+		U_LOG_E("Leia D3D12 DP: ck shader compile (%s) failed: 0x%08x %s",
+		        target, (unsigned)hr,
+		        err ? (const char *)err->GetBufferPointer() : "");
+		if (err) err->Release();
+		return nullptr;
+	}
+	if (err) err->Release();
+	return blob;
+}
+
+// Build the shared root signature: 32-bit constants for chroma_rgb (b0) +
+// SRV descriptor table (t0) + static point sampler (s0).
+static bool
+ck_build_root_sig(struct leia_display_processor_d3d12_impl *ldp)
+{
+	D3D12_DESCRIPTOR_RANGE srv_range = {};
+	srv_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+	srv_range.NumDescriptors = 1;
+	srv_range.BaseShaderRegister = 0;
+	srv_range.OffsetInDescriptorsFromTableStart = 0;
+
+	D3D12_ROOT_PARAMETER root_params[2] = {};
+	root_params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+	root_params[0].Constants.ShaderRegister = 0;
+	root_params[0].Constants.RegisterSpace = 0;
+	root_params[0].Constants.Num32BitValues = 4;
+	root_params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+	root_params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+	root_params[1].DescriptorTable.NumDescriptorRanges = 1;
+	root_params[1].DescriptorTable.pDescriptorRanges = &srv_range;
+	root_params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+	D3D12_STATIC_SAMPLER_DESC sampler = {};
+	// Point filter — strip's RGB exact-equality test would smear with linear.
+	sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+	sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+	sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+	sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+	sampler.MaxLOD = D3D12_FLOAT32_MAX;
+	sampler.ShaderRegister = 0;
+	sampler.RegisterSpace = 0;
+	sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+	D3D12_ROOT_SIGNATURE_DESC rs_desc = {};
+	rs_desc.NumParameters = 2;
+	rs_desc.pParameters = root_params;
+	rs_desc.NumStaticSamplers = 1;
+	rs_desc.pStaticSamplers = &sampler;
+	rs_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_DENY_VERTEX_SHADER_ROOT_ACCESS;
+
+	ID3DBlob *rs_blob = nullptr;
+	ID3DBlob *err = nullptr;
+	HRESULT hr = D3D12SerializeRootSignature(&rs_desc, D3D_ROOT_SIGNATURE_VERSION_1,
+	                                          &rs_blob, &err);
+	if (FAILED(hr)) {
+		U_LOG_E("Leia D3D12 DP: ck root sig serialize failed: 0x%08x %s",
+		        (unsigned)hr, err ? (const char *)err->GetBufferPointer() : "");
+		if (err) err->Release();
+		return false;
+	}
+	if (err) err->Release();
+
+	hr = ldp->device->CreateRootSignature(0, rs_blob->GetBufferPointer(),
+	                                       rs_blob->GetBufferSize(),
+	                                       __uuidof(ID3D12RootSignature),
+	                                       reinterpret_cast<void **>(&ldp->ck_root_sig));
+	rs_blob->Release();
+	if (FAILED(hr)) {
+		U_LOG_E("Leia D3D12 DP: ck root sig create failed: 0x%08x", (unsigned)hr);
+		return false;
+	}
+	return true;
+}
+
+// Build a chroma-key PSO for the given pixel-shader source. RTV format is
+// R8G8B8A8_UNORM in both passes (fill_tex format and back-buffer format).
+static bool
+ck_build_pso(struct leia_display_processor_d3d12_impl *ldp,
+             const char *ps_source,
+             ID3D12PipelineState **out_pso)
+{
+	ID3DBlob *vs_blob = ck_compile_shader(ck_vs_source, "main", "vs_5_0");
+	if (vs_blob == nullptr) return false;
+	ID3DBlob *ps_blob = ck_compile_shader(ps_source, "main", "ps_5_0");
+	if (ps_blob == nullptr) {
+		vs_blob->Release();
+		return false;
+	}
+
+	D3D12_GRAPHICS_PIPELINE_STATE_DESC pso_desc = {};
+	pso_desc.pRootSignature = ldp->ck_root_sig;
+	pso_desc.VS = {vs_blob->GetBufferPointer(), vs_blob->GetBufferSize()};
+	pso_desc.PS = {ps_blob->GetBufferPointer(), ps_blob->GetBufferSize()};
+	pso_desc.BlendState.RenderTarget[0].BlendEnable = FALSE;
+	pso_desc.BlendState.RenderTarget[0].LogicOpEnable = FALSE;
+	pso_desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+	pso_desc.SampleMask = UINT_MAX;
+	pso_desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+	pso_desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+	pso_desc.RasterizerState.DepthClipEnable = TRUE;
+	pso_desc.DepthStencilState.DepthEnable = FALSE;
+	pso_desc.DepthStencilState.StencilEnable = FALSE;
+	pso_desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+	pso_desc.NumRenderTargets = 1;
+	pso_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+	pso_desc.SampleDesc.Count = 1;
+
+	HRESULT hr = ldp->device->CreateGraphicsPipelineState(
+	    &pso_desc, __uuidof(ID3D12PipelineState),
+	    reinterpret_cast<void **>(out_pso));
+	vs_blob->Release();
+	ps_blob->Release();
+	if (FAILED(hr)) {
+		U_LOG_E("Leia D3D12 DP: ck PSO create failed: 0x%08x", (unsigned)hr);
+		return false;
+	}
+	return true;
+}
+
+// Lazy init root sig + 2 PSOs + 2 shader-visible SRV heaps + 1 RTV heap.
+static bool
+ck_init_pipeline(struct leia_display_processor_d3d12_impl *ldp)
+{
+	if (ldp->ck_fill_pso != nullptr && ldp->ck_strip_pso != nullptr) {
+		return true;
+	}
+	if (ldp->device == nullptr) {
+		return false;
+	}
+
+	if (ldp->ck_root_sig == nullptr && !ck_build_root_sig(ldp)) {
+		return false;
+	}
+	if (ldp->ck_fill_pso == nullptr && !ck_build_pso(ldp, ck_fill_ps_source, &ldp->ck_fill_pso)) {
+		return false;
+	}
+	if (ldp->ck_strip_pso == nullptr && !ck_build_pso(ldp, ck_strip_ps_source, &ldp->ck_strip_pso)) {
+		return false;
+	}
+
+	if (ldp->ck_srv_heap_fill == nullptr) {
+		D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+		hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+		hd.NumDescriptors = 1;
+		hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+		HRESULT hr = ldp->device->CreateDescriptorHeap(
+		    &hd, __uuidof(ID3D12DescriptorHeap),
+		    reinterpret_cast<void **>(&ldp->ck_srv_heap_fill));
+		if (FAILED(hr)) {
+			U_LOG_E("Leia D3D12 DP: ck fill SRV heap create failed: 0x%08x", (unsigned)hr);
+			return false;
+		}
+	}
+	if (ldp->ck_srv_heap_strip == nullptr) {
+		D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+		hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+		hd.NumDescriptors = 1;
+		hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+		HRESULT hr = ldp->device->CreateDescriptorHeap(
+		    &hd, __uuidof(ID3D12DescriptorHeap),
+		    reinterpret_cast<void **>(&ldp->ck_srv_heap_strip));
+		if (FAILED(hr)) {
+			U_LOG_E("Leia D3D12 DP: ck strip SRV heap create failed: 0x%08x", (unsigned)hr);
+			return false;
+		}
+	}
+	if (ldp->ck_rtv_heap_fill == nullptr) {
+		D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+		hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+		hd.NumDescriptors = 1;
+		hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+		HRESULT hr = ldp->device->CreateDescriptorHeap(
+		    &hd, __uuidof(ID3D12DescriptorHeap),
+		    reinterpret_cast<void **>(&ldp->ck_rtv_heap_fill));
+		if (FAILED(hr)) {
+			U_LOG_E("Leia D3D12 DP: ck fill RTV heap create failed: 0x%08x", (unsigned)hr);
+			return false;
+		}
+	}
+
+	U_LOG_W("Leia D3D12 DP: chroma-key pipeline ready (key=0x%08X)", ldp->ck_color);
+	return true;
+}
+
+// Allocate ck_fill_tex sized to the atlas. State at exit: PIXEL_SHADER_RESOURCE
+// (so the weaver, which samples it next, sees it ready). Recreates RTV + SRV
+// descriptors on every (re)alloc.
+static bool
+ck_ensure_fill_target(struct leia_display_processor_d3d12_impl *ldp,
+                       uint32_t w, uint32_t h)
+{
+	if (ldp->ck_fill_tex != nullptr && ldp->ck_fill_w == w && ldp->ck_fill_h == h) {
+		return true;
+	}
+	if (ldp->ck_fill_tex != nullptr) {
+		ldp->ck_fill_tex->Release();
+		ldp->ck_fill_tex = nullptr;
+	}
+
+	D3D12_HEAP_PROPERTIES heap_props = {};
+	heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+	D3D12_RESOURCE_DESC td = {};
+	td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+	td.Width = w;
+	td.Height = h;
+	td.DepthOrArraySize = 1;
+	td.MipLevels = 1;
+	td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	td.SampleDesc.Count = 1;
+	td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+	td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+	HRESULT hr = ldp->device->CreateCommittedResource(
+	    &heap_props, D3D12_HEAP_FLAG_NONE, &td,
+	    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
+	    __uuidof(ID3D12Resource),
+	    reinterpret_cast<void **>(&ldp->ck_fill_tex));
+	if (FAILED(hr)) {
+		U_LOG_E("Leia D3D12 DP: ck fill tex create (%ux%u) failed: 0x%08x",
+		        w, h, (unsigned)hr);
+		return false;
+	}
+	ldp->ck_fill_w = w;
+	ldp->ck_fill_h = h;
+	ldp->ck_fill_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
+	D3D12_RENDER_TARGET_VIEW_DESC rtv_desc = {};
+	rtv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	rtv_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+	ldp->device->CreateRenderTargetView(
+	    ldp->ck_fill_tex, &rtv_desc,
+	    ldp->ck_rtv_heap_fill->GetCPUDescriptorHandleForHeapStart());
+	return true;
+}
+
+// Allocate ck_strip_tex sized to the back buffer. State at exit:
+// PIXEL_SHADER_RESOURCE.
+static bool
+ck_ensure_strip_source(struct leia_display_processor_d3d12_impl *ldp,
+                        uint32_t w, uint32_t h)
+{
+	if (ldp->ck_strip_tex != nullptr && ldp->ck_strip_w == w && ldp->ck_strip_h == h) {
+		return true;
+	}
+	if (ldp->ck_strip_tex != nullptr) {
+		ldp->ck_strip_tex->Release();
+		ldp->ck_strip_tex = nullptr;
+	}
+
+	D3D12_HEAP_PROPERTIES heap_props = {};
+	heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+	D3D12_RESOURCE_DESC td = {};
+	td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+	td.Width = w;
+	td.Height = h;
+	td.DepthOrArraySize = 1;
+	td.MipLevels = 1;
+	td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	td.SampleDesc.Count = 1;
+	td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+	td.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+	HRESULT hr = ldp->device->CreateCommittedResource(
+	    &heap_props, D3D12_HEAP_FLAG_NONE, &td,
+	    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
+	    __uuidof(ID3D12Resource),
+	    reinterpret_cast<void **>(&ldp->ck_strip_tex));
+	if (FAILED(hr)) {
+		U_LOG_E("Leia D3D12 DP: ck strip tex create (%ux%u) failed: 0x%08x",
+		        w, h, (unsigned)hr);
+		return false;
+	}
+	ldp->ck_strip_w = w;
+	ldp->ck_strip_h = h;
+	ldp->ck_strip_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
+	D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+	srv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+	srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+	srv_desc.Texture2D.MipLevels = 1;
+	ldp->device->CreateShaderResourceView(
+	    ldp->ck_strip_tex, &srv_desc,
+	    ldp->ck_srv_heap_strip->GetCPUDescriptorHandleForHeapStart());
+	return true;
+}
+
+// Pack ck_color (0x00BBGGRR) → 4 root constants (R, G, B, pad).
+static void
+ck_root_constants(struct leia_display_processor_d3d12_impl *ldp, float out[4])
+{
+	uint32_t k = ldp->ck_color;
+	out[0] = ((k >>  0) & 0xFF) / 255.0f; // R
+	out[1] = ((k >>  8) & 0xFF) / 255.0f; // G
+	out[2] = ((k >> 16) & 0xFF) / 255.0f; // B
+	out[3] = 0.0f;
+}
+
+/*
+ * Pre-weave fill: read RGBA atlas, write opaque RGB to ck_fill_tex with
+ * alpha=0 regions filled by chroma_rgb. Returns the resource the weaver
+ * should sample (ck_fill_tex on success, original atlas on fallback).
+ *
+ * The caller (process_atlas) has already set viewport+scissor and bound
+ * the back-buffer RTV. This pass switches the RT binding to ck_fill_tex,
+ * draws, then restores the caller's RTV via prev_rtv so the subsequent
+ * weaver call writes to the right back buffer (D3D11's analog uses
+ * OMGetRenderTargets to save+restore; D3D12 has no Getter on command
+ * lists so prev_rtv is passed in explicitly).
+ */
+static ID3D12Resource *
+ck_run_pre_weave_fill(struct leia_display_processor_d3d12_impl *ldp,
+                       ID3D12GraphicsCommandList *cmd,
+                       ID3D12Resource *atlas_resource,
+                       uint32_t atlas_w, uint32_t atlas_h,
+                       DXGI_FORMAT atlas_format,
+                       D3D12_CPU_DESCRIPTOR_HANDLE prev_rtv)
+{
+	if (!ck_init_pipeline(ldp) || !ck_ensure_fill_target(ldp, atlas_w, atlas_h)) {
+		return atlas_resource;
+	}
+
+	// Create SRV on the atlas resource in the fill heap (slot 0).
+	D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+	srv_desc.Format = atlas_format;
+	srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+	srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+	srv_desc.Texture2D.MipLevels = 1;
+	ldp->device->CreateShaderResourceView(
+	    atlas_resource, &srv_desc,
+	    ldp->ck_srv_heap_fill->GetCPUDescriptorHandleForHeapStart());
+
+	// fill_tex PIXEL_SHADER_RESOURCE → RENDER_TARGET
+	D3D12_RESOURCE_BARRIER barrier = {};
+	barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	barrier.Transition.pResource = ldp->ck_fill_tex;
+	barrier.Transition.StateBefore = ldp->ck_fill_state;
+	barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+	barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	cmd->ResourceBarrier(1, &barrier);
+	ldp->ck_fill_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+
+	// Bind PSO + root sig + descriptor heap + chroma constants.
+	cmd->SetPipelineState(ldp->ck_fill_pso);
+	cmd->SetGraphicsRootSignature(ldp->ck_root_sig);
+	ID3D12DescriptorHeap *heaps[] = {ldp->ck_srv_heap_fill};
+	cmd->SetDescriptorHeaps(1, heaps);
+	float root_consts[4];
+	ck_root_constants(ldp, root_consts);
+	cmd->SetGraphicsRoot32BitConstants(0, 4, root_consts, 0);
+	cmd->SetGraphicsRootDescriptorTable(
+	    1, ldp->ck_srv_heap_fill->GetGPUDescriptorHandleForHeapStart());
+
+	D3D12_VIEWPORT vp = {0.0f, 0.0f, (float)atlas_w, (float)atlas_h, 0.0f, 1.0f};
+	D3D12_RECT scissor = {0, 0, (LONG)atlas_w, (LONG)atlas_h};
+	cmd->RSSetViewports(1, &vp);
+	cmd->RSSetScissorRects(1, &scissor);
+
+	D3D12_CPU_DESCRIPTOR_HANDLE rtv =
+	    ldp->ck_rtv_heap_fill->GetCPUDescriptorHandleForHeapStart();
+	cmd->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+	cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+	cmd->IASetVertexBuffers(0, 0, nullptr);
+	cmd->IASetIndexBuffer(nullptr);
+	cmd->DrawInstanced(3, 1, 0, 0);
+
+	// fill_tex RENDER_TARGET → PIXEL_SHADER_RESOURCE (so weaver can sample).
+	barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+	barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+	cmd->ResourceBarrier(1, &barrier);
+	ldp->ck_fill_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
+	// Restore the back-buffer RTV so the subsequent weave writes to the
+	// right target. D3D11's analog uses OMGetRenderTargets to save/restore;
+	// D3D12 has no Get on the command list so the caller passes prev_rtv in.
+	cmd->OMSetRenderTargets(1, &prev_rtv, FALSE, nullptr);
+
+	return ldp->ck_fill_tex;
+}
+
+/*
+ * Post-weave strip: copy back buffer → ck_strip_tex, then sample strip_tex
+ * back to back-buffer RTV with alpha=0 where RGB matches chroma_rgb. Caller
+ * passes back_buffer in RENDER_TARGET state; we transition through
+ * COPY_SOURCE and back to RENDER_TARGET.
+ */
+static void
+ck_run_post_weave_strip(struct leia_display_processor_d3d12_impl *ldp,
+                         ID3D12GraphicsCommandList *cmd,
+                         ID3D12Resource *back_buffer,
+                         D3D12_CPU_DESCRIPTOR_HANDLE back_buffer_rtv,
+                         uint32_t bb_w, uint32_t bb_h)
+{
+	if (!ck_init_pipeline(ldp) || !ck_ensure_strip_source(ldp, bb_w, bb_h)) {
+		return;
+	}
+
+	// back_buffer RENDER_TARGET → COPY_SOURCE; strip_tex
+	// PIXEL_SHADER_RESOURCE → COPY_DEST.
+	D3D12_RESOURCE_BARRIER barriers[2] = {};
+	barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	barriers[0].Transition.pResource = back_buffer;
+	barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+	barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+	barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	barriers[1].Transition.pResource = ldp->ck_strip_tex;
+	barriers[1].Transition.StateBefore = ldp->ck_strip_state;
+	barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+	barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	cmd->ResourceBarrier(2, barriers);
+	ldp->ck_strip_state = D3D12_RESOURCE_STATE_COPY_DEST;
+
+	cmd->CopyResource(ldp->ck_strip_tex, back_buffer);
+
+	// back_buffer COPY_SOURCE → RENDER_TARGET; strip_tex COPY_DEST →
+	// PIXEL_SHADER_RESOURCE.
+	barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+	barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+	barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+	barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+	cmd->ResourceBarrier(2, barriers);
+	ldp->ck_strip_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
+	// Bind strip PSO + descriptors + chroma constants.
+	cmd->SetPipelineState(ldp->ck_strip_pso);
+	cmd->SetGraphicsRootSignature(ldp->ck_root_sig);
+	ID3D12DescriptorHeap *heaps[] = {ldp->ck_srv_heap_strip};
+	cmd->SetDescriptorHeaps(1, heaps);
+	float root_consts[4];
+	ck_root_constants(ldp, root_consts);
+	cmd->SetGraphicsRoot32BitConstants(0, 4, root_consts, 0);
+	cmd->SetGraphicsRootDescriptorTable(
+	    1, ldp->ck_srv_heap_strip->GetGPUDescriptorHandleForHeapStart());
+
+	D3D12_VIEWPORT vp = {0.0f, 0.0f, (float)bb_w, (float)bb_h, 0.0f, 1.0f};
+	D3D12_RECT scissor = {0, 0, (LONG)bb_w, (LONG)bb_h};
+	cmd->RSSetViewports(1, &vp);
+	cmd->RSSetScissorRects(1, &scissor);
+
+	cmd->OMSetRenderTargets(1, &back_buffer_rtv, FALSE, nullptr);
+	cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+	cmd->IASetVertexBuffers(0, 0, nullptr);
+	cmd->IASetIndexBuffer(nullptr);
+	cmd->DrawInstanced(3, 1, 0, 0);
+}
+
+static void
+ck_release_resources(struct leia_display_processor_d3d12_impl *ldp)
+{
+	if (ldp->ck_fill_tex)        { ldp->ck_fill_tex->Release();        ldp->ck_fill_tex = nullptr; }
+	if (ldp->ck_strip_tex)       { ldp->ck_strip_tex->Release();       ldp->ck_strip_tex = nullptr; }
+	if (ldp->ck_rtv_heap_fill)   { ldp->ck_rtv_heap_fill->Release();   ldp->ck_rtv_heap_fill = nullptr; }
+	if (ldp->ck_srv_heap_strip)  { ldp->ck_srv_heap_strip->Release();  ldp->ck_srv_heap_strip = nullptr; }
+	if (ldp->ck_srv_heap_fill)   { ldp->ck_srv_heap_fill->Release();   ldp->ck_srv_heap_fill = nullptr; }
+	if (ldp->ck_strip_pso)       { ldp->ck_strip_pso->Release();       ldp->ck_strip_pso = nullptr; }
+	if (ldp->ck_fill_pso)        { ldp->ck_fill_pso->Release();        ldp->ck_fill_pso = nullptr; }
+	if (ldp->ck_root_sig)        { ldp->ck_root_sig->Release();        ldp->ck_root_sig = nullptr; }
 }
 
 
@@ -202,16 +780,50 @@ leia_dp_d3d12_process_atlas(struct xrt_display_processor_d3d12 *xdp,
 		cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
 		cmd->IASetVertexBuffers(0, 0, nullptr);
 		cmd->DrawInstanced(4, 1, 0, 0);
+
+		// 2D mode has no weaver, but if chroma-key is enabled the legacy
+		// flow (app pre-fills with key RGB on alpha=1 surface) still needs
+		// the strip pass to recover alpha=0 for DWM. The new flow (true
+		// alpha through the blit) works without it; running strip in that
+		// case is a no-op for non-key pixels (RGB=0 doesn't match magenta).
+		if (ck_should_run(ldp) && target_resource != NULL) {
+			D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv;
+			bb_rtv.ptr = static_cast<SIZE_T>(target_rtv_cpu_handle);
+			ck_run_post_weave_strip(
+			    ldp, cmd,
+			    static_cast<ID3D12Resource *>(target_resource),
+			    bb_rtv, target_width, target_height);
+		}
 		return;
 	}
 
 	(void)atlas_srv_gpu_handle;
-	(void)target_rtv_cpu_handle;
+
+	ID3D12GraphicsCommandList *cmd_3d =
+	    static_cast<ID3D12GraphicsCommandList *>(d3d12_command_list);
 
 	// Atlas is guaranteed content-sized SBS (2*view_width x view_height)
-	// by compositor crop-blit. Pass directly to weaver.
-	if (atlas_texture_resource != NULL) {
-		leiasr_d3d12_set_input_texture(ldp->leiasr, atlas_texture_resource,
+	// by compositor crop-blit.
+	//
+	// When chroma-key is enabled, run the pre-weave fill: replace alpha=0
+	// atlas pixels with the key color so the SR weaver (opaque RGB only)
+	// can process them, then pass the filled resource to the weaver instead
+	// of the original atlas. For legacy apps that pre-filled with the key
+	// color on alpha=1, the fill is a no-op (lerp(key, src.rgb, 1.0) ==
+	// src.rgb) — backward-compatible.
+	ID3D12Resource *weaver_input = static_cast<ID3D12Resource *>(atlas_texture_resource);
+	if (ck_should_run(ldp) && weaver_input != NULL) {
+		uint32_t atlas_w = tile_columns * view_width;
+		uint32_t atlas_h = tile_rows * view_height;
+		D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv;
+		bb_rtv.ptr = static_cast<SIZE_T>(target_rtv_cpu_handle);
+		weaver_input = ck_run_pre_weave_fill(
+		    ldp, cmd_3d, weaver_input, atlas_w, atlas_h,
+		    static_cast<DXGI_FORMAT>(format), bb_rtv);
+	}
+
+	if (weaver_input != NULL) {
+		leiasr_d3d12_set_input_texture(ldp->leiasr, weaver_input,
 		                               view_width, view_height, format);
 	}
 
@@ -220,6 +832,18 @@ leia_dp_d3d12_process_atlas(struct xrt_display_processor_d3d12 *xdp,
 	// the weaver's setViewport/setScissorRect alone do NOT scope the draw.
 	// See gotcha at leiasr_d3d12_weave().
 	leiasr_d3d12_weave(ldp->leiasr, d3d12_command_list, vp_x, vp_y, vp_w, vp_h);
+
+	// Post-weave chroma-key strip: convert key-color RGB pixels in the woven
+	// back buffer to alpha=0 with RGB premultiplied for DWM. No-op when
+	// disabled.
+	if (ck_should_run(ldp) && target_resource != NULL) {
+		D3D12_CPU_DESCRIPTOR_HANDLE bb_rtv;
+		bb_rtv.ptr = static_cast<SIZE_T>(target_rtv_cpu_handle);
+		ck_run_post_weave_strip(
+		    ldp, cmd_3d,
+		    static_cast<ID3D12Resource *>(target_resource),
+		    bb_rtv, target_width, target_height);
+	}
 }
 
 static void
@@ -375,10 +999,39 @@ leia_dp_d3d12_get_display_pixel_info(struct xrt_display_processor_d3d12 *xdp,
 	                                           out_screen_left, out_screen_top, &w_m, &h_m);
 }
 
+static bool
+leia_dp_d3d12_is_alpha_native(struct xrt_display_processor_d3d12 *xdp)
+{
+	(void)xdp;
+	// SR SDK D3D12 weaver interlaces into opaque RGB — alpha is destroyed.
+	// Transparency is recovered via the chroma-key trick (see set_chroma_key).
+	return false;
+}
+
+static void
+leia_dp_d3d12_set_chroma_key(struct xrt_display_processor_d3d12 *xdp,
+                              uint32_t key_color,
+                              bool transparent_bg_enabled)
+{
+	struct leia_display_processor_d3d12_impl *ldp = leia_dp_d3d12(xdp);
+	ldp->ck_enabled = transparent_bg_enabled;
+	// App-supplied override (non-zero) wins over DP-picked default. Matches
+	// the legacy XR_EXT_win32_window_binding.chromaKeyColor behavior so
+	// v1.2.9 Unity plugins and any third-party app that integrated the v5
+	// extension keep working unchanged.
+	ldp->ck_color = (key_color != 0) ? key_color : kDefaultChromaKey;
+	U_LOG_W("Leia D3D12 DP: chroma-key %s (key=0x%08X%s)",
+	        ldp->ck_enabled ? "ENABLED" : "disabled",
+	        ldp->ck_color,
+	        (key_color == 0) ? " — DP default" : " — app override");
+}
+
 static void
 leia_dp_d3d12_destroy(struct xrt_display_processor_d3d12 *xdp)
 {
 	struct leia_display_processor_d3d12_impl *ldp = leia_dp_d3d12(xdp);
+
+	ck_release_resources(ldp);
 
 	if (ldp->blit_pso != NULL) {
 		ldp->blit_pso->Release();
@@ -520,6 +1173,8 @@ leia_dp_factory_d3d12(void *d3d12_device,
 	ldp->base.get_hardware_3d_state = leia_dp_d3d12_get_hardware_3d_state;
 	ldp->base.get_display_dimensions = leia_dp_d3d12_get_display_dimensions;
 	ldp->base.get_display_pixel_info = leia_dp_d3d12_get_display_pixel_info;
+	ldp->base.is_alpha_native = leia_dp_d3d12_is_alpha_native;
+	ldp->base.set_chroma_key = leia_dp_d3d12_set_chroma_key;
 	ldp->base.destroy = leia_dp_d3d12_destroy;
 	ldp->leiasr = weaver;
 	ldp->device = static_cast<ID3D12Device *>(d3d12_device);
